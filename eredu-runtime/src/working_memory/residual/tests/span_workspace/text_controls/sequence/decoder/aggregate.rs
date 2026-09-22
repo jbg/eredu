@@ -2,11 +2,11 @@ use super::*;
 use crate::working_memory::{AggregateGenerationDecoderInput, OriginalTokenizer};
 use eredu_text::tokenizer_storage::TokenizerPlan;
 const AGGREGATE_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"added_tokens":[{"id":4,"content":"<S>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"model":{"type":"BPE","vocab":{"h":0,"i":1,"hi":2,"Ġ":3},"merges":[["h","i"]]}}"#;
-fn aggregate(pool: &WorkingMemoryPool) -> OriginalTokenizer {
+fn aggregate(pool: &MemoryLedger) -> OriginalTokenizer {
     pool.compile_tokenizer(TokenizerPlan::prepare_json(AGGREGATE_JSON.as_bytes()).unwrap())
         .unwrap()
 }
-fn aggregate_file(pool: &WorkingMemoryPool) -> OriginalTokenizer {
+fn aggregate_file(pool: &MemoryLedger) -> OriginalTokenizer {
     use std::io::Write as _;
     let mut file = tempfile::tempfile().unwrap();
     file.write_all(AGGREGATE_JSON.as_bytes()).unwrap();
@@ -56,7 +56,11 @@ fn two_successive_requests(from_file: bool, profile: u8) {
                 audit_decoder: true,
                 ..Mode::default()
             },
-            WorkingMemoryPool::new(if regex { u64::MAX } else { 1_000_000 }, 0).unwrap(),
+            crate::working_memory::memory_fixture::host_ledger(
+                if regex { u64::MAX } else { 1_000_000 },
+                0,
+            )
+            .unwrap(),
         );
         let pool = state.borrow().pool.clone();
         let source = if regex {
@@ -112,7 +116,7 @@ fn two_successive_requests(from_file: bool, profile: u8) {
         let cold = source.original_bytes();
         if profile >= 4 {
             // The harness already owns its 64-byte model root before E.
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.payload_used_bytes().unwrap();
             assert_eq!(baseline, cold + 64);
             let ids = pool
                 .encode_tokenizer_ids(
@@ -134,9 +138,12 @@ fn two_successive_requests(from_file: bool, profile: u8) {
                 }
             );
             assert!(ids.matches_source(&source));
-            assert_eq!(pool.used_bytes().unwrap(), baseline + ids.original_bytes());
+            assert_eq!(
+                pool.payload_used_bytes().unwrap(),
+                baseline + ids.original_bytes()
+            );
             drop(ids);
-            assert_eq!(pool.used_bytes().unwrap(), baseline);
+            assert_eq!(pool.payload_used_bytes().unwrap(), baseline);
         }
 
         state.borrow_mut().loaded_bytes = source.original_bytes();
@@ -175,22 +182,22 @@ fn two_successive_requests(from_file: bool, profile: u8) {
             previous_r = Some(r);
             let (_, held) = retire_request(&state);
             drop((input, foreign_header, opposite));
-            assert_eq!(pool.used_bytes().unwrap(), cold + held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
             let tokens = sequence.into_token_ids();
             assert_eq!(tokens.as_ptr(), ptr);
             assert_eq!(tokens.as_ref(), [2, 3, 4, 0, 1]);
-            assert_eq!(pool.used_bytes().unwrap(), cold + held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
             drop(tokens);
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold);
             if run == 0 {
-                state.borrow_mut().root = Some(pool.register_storage([(1u32, 64)]).unwrap());
+                state.borrow_mut().root = Some(pool.register_host_storage([(1u32, 64)]).unwrap());
             }
         }
         assert_eq!(state.borrow().decoder_takes, 2);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.payload_used_bytes().unwrap(), cold);
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -222,7 +229,7 @@ fn shared_preflight_foreign_pool_wrong_n_replay_and_one_short_preserve_cold_owne
     assert_eq!(state.borrow().decoder_takes, 0);
     state.borrow_mut().mode.short = true;
     assert!(extract_decoder(&mut runtime, 0, 3, &input, &consumer(), None).is_err());
-    assert_eq!(pool.used_bytes().unwrap(), cold + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + 64);
     state.borrow_mut().mode.short = false;
     let failures: Vec<_> = (0..32)
         .map(|_| extract_decoder(&mut runtime, 0, 3, &input, &consumer(), None).unwrap_err())
@@ -241,7 +248,7 @@ fn shared_preflight_foreign_pool_wrong_n_replay_and_one_short_preserve_cold_owne
     retire_request(&state);
     retire_request(&foreign_state);
     drop((runtime, foreign, input, next, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(failures);
 }
 #[test]
@@ -267,17 +274,17 @@ fn shared_source_survives_model_and_consuming_provider_failure_without_repricing
     let (_, held) = retire_request(&state);
     drop((runtime, input, source));
     let failure = sequence.prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), cold + held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held + 64);
     assert!(failure.cause().source().unwrap().is::<WorkingMemoryError>());
     let sequence = failure.into_sequence();
     let failure = sequence.prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), cold + held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held + 64);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn two_concurrent_genuine_claims_take_one_atomic_header_lease() {
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     let source = aggregate(&pool);
     let input = AggregateGenerationDecoderInput::new(&source, 3, true).unwrap();
     let cold = source.original_bytes();
@@ -287,10 +294,11 @@ fn two_concurrent_genuine_claims_take_one_atomic_header_lease() {
         for _ in 0..2 {
             let (pool, input, barrier) = (pool.clone(), &input, &barrier);
             workers.push(threads.spawn(move || {
-                // No fallible fixture construction precedes this rendezvous.
-                barrier.wait();
                 let (mut runtime, state) = harness::runtime_with_pool(Mode::default(), pool);
                 state.borrow_mut().loaded_bytes = input.source().original_bytes();
+                // Both runtimes own their registry storage before either
+                // request installs its exact live account ceiling.
+                barrier.wait();
                 let result = extract_decoder(&mut runtime, 0, 3, input, &consumer(), None);
                 let success = result.is_ok();
                 if let Err(error) = &result {
@@ -314,9 +322,9 @@ fn two_concurrent_genuine_claims_take_one_atomic_header_lease() {
             .collect::<Vec<_>>()
     });
     assert_eq!(outcomes.iter().filter(|x| **x).count(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), cold);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold);
     drop((input, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -327,7 +335,8 @@ fn aggregate_plain_requests_bind_actual_stop_overrides_and_empty_cancel_without_
         let (mut runtime, state) = runtime(Mode::default());
         let pool = state.borrow().pool.clone();
         let source = aggregate(&pool);
-        let foreign_pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+        let foreign_pool =
+            crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
         let foreign = foreign_pool
             .compile_stop_source(StopCompilePlan::prepare_refs(&["hi"]).unwrap())
             .unwrap();
@@ -374,18 +383,21 @@ fn aggregate_plain_requests_bind_actual_stop_overrides_and_empty_cancel_without_
             }
             let (_, held) = retire_request(&state);
             drop((input, stops));
-            assert_eq!(pool.used_bytes().unwrap(), cold + held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
             let tokens = sequence.into_token_ids();
-            assert_eq!(pool.used_bytes().unwrap(), source.original_bytes() + held);
+            assert_eq!(
+                pool.payload_used_bytes().unwrap(),
+                source.original_bytes() + held
+            );
             drop(tokens);
-            assert_eq!(pool.used_bytes().unwrap(), source.original_bytes());
+            assert_eq!(pool.payload_used_bytes().unwrap(), source.original_bytes());
             if run == 0 {
-                state.borrow_mut().root = Some(pool.register_storage([(1u32, 64)]).unwrap());
+                state.borrow_mut().root = Some(pool.register_host_storage([(1u32, 64)]).unwrap());
             }
         }
         drop((runtime, source, foreign));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(foreign_pool.payload_used_bytes().unwrap(), 0);
     }
 }
 

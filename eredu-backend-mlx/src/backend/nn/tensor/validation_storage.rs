@@ -1,4 +1,4 @@
-//! Original validation storage is derived only from the retained native recipe.
+//! Validation and grouped-output storage retain their admitted metadata owner.
 use super::*;
 use crate::backend::{
     error::Error,
@@ -14,6 +14,7 @@ use std::{alloc::Layout, mem::size_of};
 // array keeps only the account alias installed by the native buffer producer.
 #[derive(Clone, Debug)]
 pub(super) enum TokenValidationCustody {
+    Ordinary(eredu_core::HostPreparationAuthority),
     Operation(eredu_runtime::working_memory::OriginalOperationMetadataCustody),
     Text(OriginalTextMetadataCustody),
     Speculative(OriginalSpeculativeRole),
@@ -39,20 +40,34 @@ pub(crate) enum TokenValidationIngress {
     Original(Option<PreparedTokenValidations>),
 }
 impl TokenValidationIngress {
-    pub(crate) fn realtime_control_bytes(recipe:crate::backend::nn::workspace::ResidentCompletionRecipe)
-        ->Result<u64,Error> {Self::speculative_completion_control_bytes(recipe)}
+    pub(crate) fn realtime_control_bytes(
+        recipe: crate::backend::nn::workspace::ResidentCompletionRecipe,
+    ) -> Result<u64, Error> {
+        Self::speculative_completion_control_bytes(recipe)
+    }
     /// Finite root collector for one original frame. The accepted native scope
     /// is still required by begin; custody alone cannot enter or replace it.
-    pub(crate) fn prepare_realtime(recipe:crate::backend::nn::workspace::ResidentCompletionRecipe,
-        custody:eredu_runtime::working_memory::OriginalRealtimeBudgetCustody,
-        funding:&eredu_nn::workspace::HostMetadataFunding)->Result<Self,Error> {
-        funding.reserve_metadata(usize::try_from(Self::realtime_control_bytes(recipe)?)
-            .map_err(|_|Error::PrefillControl(WorkingMemoryError::Overflow))?)
+    pub(crate) fn prepare_realtime(
+        recipe: crate::backend::nn::workspace::ResidentCompletionRecipe,
+        custody: eredu_runtime::working_memory::OriginalRealtimeBudgetCustody,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<Self, Error> {
+        funding
+            .reserve_metadata(
+                usize::try_from(Self::realtime_control_bytes(recipe)?)
+                    .map_err(|_| Error::PrefillControl(WorkingMemoryError::Overflow))?,
+            )
             .map_err(Error::WorkspacePlanning)?;
-        let source:eredu_runtime::working_memory::OriginalHostSourceCustody=custody.clone().into();
-        source.validate_account(None).map_err(Error::PrefillControl)?;
-        Self::prepare_limits(recipe.validation_roots,recipe.grouped_outputs,
-            TokenValidationCustody::Operation(custody.into()))
+        let source: eredu_runtime::working_memory::OriginalHostSourceCustody =
+            custody.clone().into();
+        source
+            .validate_account(None)
+            .map_err(Error::PrefillControl)?;
+        Self::prepare_limits(
+            recipe.validation_roots,
+            recipe.grouped_outputs,
+            TokenValidationCustody::Operation(custody.into()),
+        )
     }
 
     pub(crate) fn prepare(
@@ -65,11 +80,7 @@ impl TokenValidationIngress {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
         }
         controls
-            .validate_reservation(
-                step.request()
-                    .memory_reservation()
-                    .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?,
-            )
+            .validate_reservation(step.request().memory_reservation())
             .map_err(Error::PrefillControl)?;
         let capacity = if prefill {
             prefill_capacity(recipe)?
@@ -130,8 +141,11 @@ impl TokenValidationIngress {
         recipe: &AutoregressiveEquationRecipe,
         span: &eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
     ) -> Result<Self, Error> {
-        span.validate_plan(recipe.plan()).map_err(Error::PrefillControl)?;
-        span.role().validate_invocation(recipe.invocation()).map_err(Error::PrefillControl)?;
+        span.validate_plan(recipe.plan())
+            .map_err(Error::PrefillControl)?;
+        span.role()
+            .validate_invocation(recipe.invocation())
+            .map_err(Error::PrefillControl)?;
         Self::speculative_span_control_bytes(recipe, span.ordinal())?;
         let completion = recipe.equation_completion(span.ordinal())?;
         Self::prepare_limits(
@@ -140,17 +154,17 @@ impl TokenValidationIngress {
             TokenValidationCustody::Speculative(span.role().clone()),
         )
     }
-    pub(crate) fn embedded_control_bytes(
-        recipe: &EmbeddedEquationRecipe,
-    ) -> Result<u64, Error> {
+    pub(crate) fn embedded_control_bytes(recipe: &EmbeddedEquationRecipe) -> Result<u64, Error> {
         Self::speculative_completion_control_bytes(recipe.equation_completion()?)
     }
     pub(crate) fn prepare_embedded(
         recipe: &EmbeddedEquationRecipe,
         role: &eredu_runtime::working_memory::OriginalEmbeddedSpeculativeRole,
     ) -> Result<Self, Error> {
-        role.validate_plan(recipe.plan()).map_err(Error::PrefillControl)?;
-        role.validate_invocation(recipe.workspace().invocation()).map_err(Error::PrefillControl)?;
+        role.validate_plan(recipe.plan())
+            .map_err(Error::PrefillControl)?;
+        role.validate_invocation(recipe.workspace().invocation())
+            .map_err(Error::PrefillControl)?;
         Self::embedded_control_bytes(recipe)?;
         let completion = recipe.equation_completion()?;
         Self::prepare_limits(
@@ -160,17 +174,24 @@ impl TokenValidationIngress {
         )
     }
     pub(crate) fn external_control_bytes(recipe: &ResidentNativeRecipe) -> Result<u64, Error> {
-        if recipe.records().len() != 1 { return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)); }
+        if recipe.records().len() != 1 {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
         Self::speculative_completion_control_bytes(recipe.external_equation_completion()?)
     }
-    pub(crate) fn prepare_external(recipe: &ResidentNativeRecipe,
+    pub(crate) fn prepare_external(
+        recipe: &ResidentNativeRecipe,
         role: &eredu_runtime::working_memory::OriginalExternalSpeculativeRole,
     ) -> Result<Self, Error> {
-        role.validate_plan(recipe.plan()).map_err(Error::PrefillControl)?;
+        role.validate_plan(recipe.plan())
+            .map_err(Error::PrefillControl)?;
         Self::external_control_bytes(recipe)?;
         let completion = recipe.external_equation_completion()?;
-        Self::prepare_limits(completion.validation_roots, completion.grouped_outputs,
-            TokenValidationCustody::External(role.clone()))
+        Self::prepare_limits(
+            completion.validation_roots,
+            completion.grouped_outputs,
+            TokenValidationCustody::External(role.clone()),
+        )
     }
     fn prepare_limits(
         capacity: usize,
@@ -190,8 +211,11 @@ impl TokenValidationIngress {
         }
         Self::prepare_storage(capacity, grouped, custody)
     }
-    pub(super) fn prepare_storage(capacity: usize, grouped: GroupedOutputStorage,
-        custody: TokenValidationCustody) -> Result<Self, Error> {
+    pub(super) fn prepare_storage(
+        capacity: usize,
+        grouped: GroupedOutputStorage,
+        custody: TokenValidationCustody,
+    ) -> Result<Self, Error> {
         if control_bytes(capacity).is_none() {
             return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
         }
@@ -200,7 +224,8 @@ impl TokenValidationIngress {
             Error::PrefillControl(WorkingMemoryError::ControlStorageReserve(cause))
         })?;
         if validations.capacity() != capacity {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch).at_speculative_stage("token validation destination capacity"));
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
+                .at_speculative_stage("token validation destination capacity"));
         }
         let grouped = PreparedGroupedOutputs::prepare(grouped, custody.clone())?;
         Ok(Self::Original(Some(PreparedTokenValidations(

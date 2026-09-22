@@ -1,5 +1,5 @@
 use super::*;
-use eredu::api::{TextInspectionOptions, TextModelError, TextModelOptions, inspect_text_model};
+use eredu::api::{inspect_text_model, TextInspectionOptions, TextModelError, TextModelOptions};
 use eredu_core::{
     InspectionIssueCode, InspectionReadiness, InspectionSeverity, ModelInspectionReport,
 };
@@ -118,14 +118,16 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
             let request = request();
             let cancellation = eredu_core::GenerationCancellationToken::new();
             let source = model
-                .chat_source(
-                    !request.tools.is_empty(),
-                    &cancellation,
-                )
+                .chat_source(!request.tools.is_empty(), &cancellation)
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         };
@@ -173,14 +175,16 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
             let request = request();
             let cancellation = eredu_core::GenerationCancellationToken::new();
             let source = loaded
-                .chat_source(
-                    !request.tools.is_empty(),
-                    &cancellation,
-                )
+                .chat_source(!request.tools.is_empty(), &cancellation)
                 .unwrap()
                 .unwrap();
             loaded
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         }
@@ -224,14 +228,16 @@ fn missing_template_requires_explicit_choice_and_keeps_raw_generation_available(
                 let request = request();
                 let cancellation = eredu_core::GenerationCancellationToken::new();
                 let source = model
-                    .chat_source(
-                        !request.tools.is_empty(),
-                        &cancellation,
-                    )
+                    .chat_source(!request.tools.is_empty(), &cancellation)
                     .unwrap()
                     .unwrap();
                 model
-                    .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                    .prepare_chat(
+                        &source,
+                        &request,
+                        &crate::memory::limits(original_sources::CAPACITY),
+                        &cancellation,
+                    )
                     .unwrap()
                     .unwrap()
             }
@@ -248,14 +254,16 @@ fn replacement_updates_named_selection_kwargs_and_protocol_preparation() {
         let request = request();
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let source = model
-            .chat_source(
-                !request.tools.is_empty(),
-                &cancellation,
-            )
+            .chat_source(!request.tools.is_empty(), &cancellation)
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -286,14 +294,16 @@ fn replacement_updates_named_selection_kwargs_and_protocol_preparation() {
         let request = request();
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let source = model
-            .chat_source(
-                !request.tools.is_empty(),
-                &cancellation,
-            )
+            .chat_source(!request.tools.is_empty(), &cancellation)
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -313,14 +323,16 @@ fn replacement_updates_named_selection_kwargs_and_protocol_preparation() {
             let request = request();
             let cancellation = eredu_core::GenerationCancellationToken::new();
             let source = model
-                .chat_source(
-                    !request.tools.is_empty(),
-                    &cancellation,
-                )
+                .chat_source(!request.tools.is_empty(), &cancellation)
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         }
@@ -334,14 +346,16 @@ fn replacement_updates_named_selection_kwargs_and_protocol_preparation() {
         let request = request();
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let source = model
-            .chat_source(
-                !request.tools.is_empty(),
-                &cancellation,
-            )
+            .chat_source(!request.tools.is_empty(), &cancellation)
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -446,14 +460,16 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
                     let request = request();
                     let cancellation = eredu_core::GenerationCancellationToken::new();
                     let source = model
-                        .chat_source(
-                            !request.tools.is_empty(),
-                            &cancellation,
-                        )
+                        .chat_source(!request.tools.is_empty(), &cancellation)
                         .unwrap()
                         .unwrap();
                     model
-                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                        .prepare_chat(
+                            &source,
+                            &request,
+                            &crate::memory::limits(original_sources::CAPACITY),
+                            &cancellation,
+                        )
                         .unwrap()
                         .unwrap()
                 }
@@ -489,14 +505,16 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
                 let request = request();
                 let cancellation = eredu_core::GenerationCancellationToken::new();
                 let source = overridden
-                    .chat_source(
-                        !request.tools.is_empty(),
-                        &cancellation,
-                    )
+                    .chat_source(!request.tools.is_empty(), &cancellation)
                     .unwrap()
                     .unwrap();
                 overridden
-                    .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                    .prepare_chat(
+                        &source,
+                        &request,
+                        &crate::memory::limits(original_sources::CAPACITY),
+                        &cancellation,
+                    )
                     .unwrap()
                     .unwrap()
             }
@@ -524,14 +542,16 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
             let request = request();
             let cancellation = eredu_core::GenerationCancellationToken::new();
             let source = loaded
-                .chat_source(
-                    !request.tools.is_empty(),
-                    &cancellation,
-                )
+                .chat_source(!request.tools.is_empty(), &cancellation)
                 .unwrap()
                 .unwrap();
             loaded
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         }
@@ -655,14 +675,16 @@ fn text_inspection_uses_template_overrides_for_both_artifact_formats() {
                     let request = request();
                     let cancellation = eredu_core::GenerationCancellationToken::new();
                     let source = loaded
-                        .chat_source(
-                            !request.tools.is_empty(),
-                            &cancellation,
-                        )
+                        .chat_source(!request.tools.is_empty(), &cancellation)
                         .unwrap()
                         .unwrap();
                     loaded
-                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                        .prepare_chat(
+                            &source,
+                            &request,
+                            &crate::memory::limits(original_sources::CAPACITY),
+                            &cancellation,
+                        )
                         .unwrap()
                         .unwrap()
                 };

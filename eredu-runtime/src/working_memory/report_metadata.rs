@@ -1,13 +1,13 @@
 //! Construction destinations for existing workspace diagnostic reports.
 use eredu_core::{
     Admission, AdmissionPolicyError, AdmissionRequest, AdmissionRequirements, AdmissionResult,
-    AvailableMemory, BorrowedAdmissionResult, CapabilityError, ExecutionWorkspaceEstimate,
-    ModelCapabilities, RuntimeStateEstimate, RuntimeStateFacts, SelectedStateBacking,
-    StateMemoryAssumptions, WorkspaceBound,
+    BorrowedAdmissionResult, CapabilityError, ExecutionWorkspaceEstimate, ModelCapabilities,
+    RuntimeStateEstimate, RuntimeStateFacts, SelectedStateBacking, StateMemoryAssumptions,
+    WorkspaceBound,
 };
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
+    workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError},
 };
 use std::{
     fmt,
@@ -17,6 +17,9 @@ use std::{
 /// A fixed composition refusal or an error owned by the participating Context.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceReportError {
+    /// Physical placement, identity or checked per-domain arithmetic failed.
+    #[error(transparent)]
+    Domain(#[from] eredu_core::MemoryDomainError),
     /// The shared geometry/arithmetic worker rejected the report.
     #[error(transparent)]
     Policy(#[from] AdmissionPolicyError),
@@ -31,6 +34,7 @@ impl WorkspaceReportError {
     pub fn into_capability(self) -> CapabilityError {
         match self {
             Self::Policy(error) => error.into(),
+            Self::Domain(error) => error.into(),
             Self::Metadata(error) => CapabilityError::InvalidConfiguration {
                 field: "workspace_report",
                 detail: error.to_string(),
@@ -120,6 +124,7 @@ impl<'a> WorkspaceReportMetadata<'a> {
     pub fn error(self, error: WorkspaceReportError) -> Error {
         match error {
             WorkspaceReportError::Metadata(error) => error,
+            WorkspaceReportError::Domain(error) => self.source(error),
             WorkspaceReportError::Policy(error) => match self.0 {
                 Some(context) => context.metadata_source(error),
                 None => Error::backend_retained_source(CapabilityError::from(error)),
@@ -175,6 +180,16 @@ impl<'a> WorkspaceReportMetadata<'a> {
         self.admit::<WorkspaceBound>()?;
         Ok(WorkspaceBound::bounded(bytes, self.text(text)?))
     }
+    /// Complete attributed requirements with no representable scalar total.
+    pub fn per_domain(
+        self,
+        text: fmt::Arguments<'_>,
+    ) -> Result<WorkspaceBound, WorkspaceReportError> {
+        self.admit::<WorkspaceBound>()?;
+        Ok(WorkspaceBound::PerDomain {
+            assumptions: self.text(text)?,
+        })
+    }
     /// Constructs the existing missing-bound variant; absence remains explicit.
     pub fn unknown(self, text: fmt::Arguments<'_>) -> Result<WorkspaceBound, WorkspaceReportError> {
         self.admit::<WorkspaceBound>()?;
@@ -195,6 +210,9 @@ impl<'a> WorkspaceReportMetadata<'a> {
                 self.bounded(*bytes, format_args!("{assumptions}"))
             }
             WorkspaceBound::Unknown { reason } => self.unknown(format_args!("{reason}")),
+            WorkspaceBound::PerDomain { assumptions } => {
+                self.per_domain(format_args!("{assumptions}"))
+            }
         }
     }
     /// Copies all six existing mandatory domains through counted destinations.
@@ -207,6 +225,11 @@ impl<'a> WorkspaceReportMetadata<'a> {
         }
         self.admit::<ExecutionWorkspaceEstimate>()?;
         Ok(ExecutionWorkspaceEstimate {
+            physical_domains: source
+                .physical_domains
+                .as_ref()
+                .map(|value| self.clone_domain_execution(value))
+                .transpose()?,
             geometry: source.geometry,
             activations: self.clone_bound(&source.activations)?,
             attention: self.clone_bound(&source.attention)?,
@@ -244,10 +267,11 @@ impl<'a> WorkspaceReportMetadata<'a> {
         }
         self.admit::<Admission>()?;
         Ok(Admission {
+            memory_limits: source.memory_limits.clone(),
+            additional_headroom: source.additional_headroom.clone(),
             requested_positions: source.requested_positions,
             state: self.clone_state(&source.state)?,
             incremental_required_bytes: source.incremental_required_bytes,
-            available_memory_bytes: source.available_memory_bytes,
         })
     }
     /// Runs the shared admission policy over borrowed reports, then constructs
@@ -259,20 +283,20 @@ impl<'a> WorkspaceReportMetadata<'a> {
         request: AdmissionRequest,
         state: &RuntimeStateEstimate,
         incremental: &WorkspaceBound,
-        available: Option<&AvailableMemory>,
     ) -> Result<AdmissionResult, WorkspaceReportError> {
         self.admit::<AdmissionResult>()?;
         match eredu_core::apply_admission_requirements(
-            request,
-            AdmissionRequirements::from_reports(capabilities, state, Some(incremental), available),
+            request.clone(),
+            AdmissionRequirements::from_reports(capabilities, state, Some(incremental)),
         )? {
             BorrowedAdmissionResult::Admitted(decision) => {
                 self.admit::<Admission>()?;
                 Ok(AdmissionResult::Admitted(Admission {
+                    memory_limits: request.memory_limits,
+                    additional_headroom: request.additional_headroom,
                     requested_positions: decision.requested_positions,
                     state: self.clone_state(state)?,
                     incremental_required_bytes: decision.incremental_required_bytes,
-                    available_memory_bytes: decision.available_memory_bytes,
                 }))
             }
             BorrowedAdmissionResult::Rejected(rejection) => {
@@ -293,6 +317,11 @@ impl<'a> WorkspaceReportMetadata<'a> {
         }
         self.admit::<RuntimeStateEstimate>()?;
         Ok(RuntimeStateEstimate {
+            physical_domains: source
+                .physical_domains
+                .as_ref()
+                .map(|value| self.clone_domain_state(value))
+                .transpose()?,
             fixed_state_bytes: source.fixed_state_bytes,
             bytes_per_position_per_batch: source.bytes_per_position_per_batch,
             context_state_bytes: source.context_state_bytes,
@@ -324,6 +353,119 @@ impl<'a> WorkspaceReportMetadata<'a> {
                 allocation_granularity: source.assumptions.allocation_granularity,
             },
             completeness: source.completeness,
+        })
+    }
+}
+
+impl WorkspaceReportMetadata<'_> {
+    /// Funds explicit placement for one producer's complete allocation envelope.
+    /// The producer supplies the mechanism fact; this performs no placement inference.
+    pub fn placed_requirements(
+        self,
+        topology: &eredu_core::MemoryTopology,
+        bytes: u64,
+        placement: &eredu_core::MemoryPlacement,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkspaceReportError> {
+        placement.validate(topology)?;
+        self.admit::<eredu_core::DomainMemoryRequirements>()?;
+        let count = usize::from(
+            matches!(
+                placement.kind(),
+                eredu_core::MemoryPlacementKind::Possible { .. }
+            ) && bytes != 0,
+        );
+        let backing =
+            eredu_core::DomainMemoryRequirements::construction_backing_bytes(topology, count)?
+                .checked_add(if count == 0 {
+                    0
+                } else {
+                    placement.backing_bytes()?
+                })
+                .ok_or_else(|| Error::from(WorkspaceMetadataError::Overflow))?;
+        self.charge(
+            usize::try_from(backing).map_err(|_| Error::from(WorkspaceMetadataError::Overflow))?,
+        )?;
+        let mut requirements =
+            eredu_core::DomainMemoryRequirements::zero_with_allowance_capacity(topology, count);
+        if bytes != 0 {
+            requirements.add_allocation(bytes, placement)?;
+        }
+        Ok(requirements)
+    }
+    /// Funds the actual cloned dense counters, candidate lists and derivations.
+    pub fn clone_domain_requirements(
+        self,
+        source: &eredu_core::DomainMemoryRequirements,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkspaceReportError> {
+        self.admit::<eredu_core::DomainMemoryRequirements>()?;
+        self.charge(
+            usize::try_from(source.backing_bytes()?)
+                .map_err(|_| Error::from(WorkspaceMetadataError::Overflow))?,
+        )?;
+        Ok(source.clone())
+    }
+
+    /// Funds and constructs either a simultaneous sum or a completed-span peak.
+    pub fn combine_domain_requirements(
+        self,
+        left: &eredu_core::DomainMemoryRequirements,
+        right: &eredu_core::DomainMemoryRequirements,
+        simultaneous: bool,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkspaceReportError> {
+        self.admit::<eredu_core::DomainMemoryRequirements>()?;
+        let bytes = left
+            .backing_bytes()?
+            .checked_add(right.backing_bytes()?)
+            .ok_or_else(|| Error::from(WorkspaceMetadataError::Overflow))?;
+        self.charge(
+            usize::try_from(bytes).map_err(|_| Error::from(WorkspaceMetadataError::Overflow))?,
+        )?;
+        Ok(if simultaneous {
+            left.checked_add(right)
+        } else {
+            left.checked_peak(right)
+        }?)
+    }
+
+    /// Funds an explicit zero in the same topology without inventing placement.
+    pub fn empty_domain_requirements(
+        self,
+        source: &eredu_core::DomainMemoryRequirements,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkspaceReportError> {
+        self.admit::<eredu_core::DomainMemoryRequirements>()?;
+        self.charge(
+            std::alloc::Layout::array::<eredu_core::DomainMemoryCharge>(source.iter().len())
+                .map_err(|_| Error::from(WorkspaceMetadataError::Overflow))?
+                .size(),
+        )?;
+        Ok(source.empty_like())
+    }
+
+    fn clone_domain_execution(
+        self,
+        source: &eredu_core::DomainExecutionWorkspaceEstimate,
+    ) -> Result<eredu_core::DomainExecutionWorkspaceEstimate, WorkspaceReportError> {
+        self.admit::<eredu_core::DomainExecutionWorkspaceEstimate>()?;
+        Ok(eredu_core::DomainExecutionWorkspaceEstimate {
+            geometry: source.geometry,
+            activations: self.clone_domain_requirements(&source.activations)?,
+            attention: self.clone_domain_requirements(&source.attention)?,
+            vocabulary: self.clone_domain_requirements(&source.vocabulary)?,
+            state_update: self.clone_domain_requirements(&source.state_update)?,
+            materialization: self.clone_domain_requirements(&source.materialization)?,
+            retained: self.clone_domain_requirements(&source.retained)?,
+        })
+    }
+    fn clone_domain_state(
+        self,
+        source: &eredu_core::DomainRuntimeStateEstimate,
+    ) -> Result<eredu_core::DomainRuntimeStateEstimate, WorkspaceReportError> {
+        self.admit::<eredu_core::DomainRuntimeStateEstimate>()?;
+        Ok(eredu_core::DomainRuntimeStateEstimate {
+            geometry: source.geometry,
+            decoder_state: self.clone_domain_requirements(&source.decoder_state)?,
+            media_embeddings: self.clone_domain_requirements(&source.media_embeddings)?,
+            media_workspace: self.clone_domain_requirements(&source.media_workspace)?,
         })
     }
 }

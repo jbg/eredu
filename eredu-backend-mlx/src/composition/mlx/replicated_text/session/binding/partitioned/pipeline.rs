@@ -18,7 +18,7 @@ pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, 
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    construction_sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -45,7 +45,7 @@ where
         .into_iter()
         .collect::<Vec<_>>();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
-    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
+    mechanisms.set_prepared_construction_sources(construction_sources);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);
@@ -172,7 +172,7 @@ pub(crate) fn bind_partitioned_pipeline<A, G, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    construction_sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -195,7 +195,7 @@ where
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
-    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
+    mechanisms.set_prepared_construction_sources(construction_sources);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);

@@ -213,6 +213,14 @@ impl StateLayout {
         Ok(self.clone())
     }
 
+    pub(crate) fn schedule_clone_metadata_bytes(
+        source: &eredu_core::LayerSchedule<LayerCachePolicy>,
+    ) -> Result<usize, WorkspaceMetadataError> {
+        owned_clone_bytes::<eredu_core::LayerSchedule<LayerCachePolicy>>(clone_layer_payload_bytes(
+            source,
+        )?)
+    }
+
     /// Copies only the actual policy schedule used by persistence identity.
     pub(crate) fn clone_layers_workspace(
         &self,

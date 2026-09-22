@@ -13,7 +13,7 @@ pub(super) fn validate_capture_binding(
         (false, None) => Ok(()),
         (true, Some(capture)) => {
             quote.validate_capture_source(runtime.session(), capture.source())?;
-            capture.validate_sources(&runtime.session().payload.memory_pool)?;
+            capture.validate_sources(&runtime.session().payload.memory_ledger)?;
             if capture.collector().has_pending_step() {
                 return Err(Error::Other(Box::new(
                     eredu_runtime::capture::CaptureProtocolError::Undrained,

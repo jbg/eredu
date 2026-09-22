@@ -1,7 +1,7 @@
 //! One process Scheduler constructor charged to the actual managed domain.
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     InitializedScheduler, PreparedScheduler, SchedulerCause, SchedulerError, SchedulerLayout,
@@ -93,7 +93,7 @@ impl std::error::Error for MlxSchedulerInitializationError {
 }
 fn borrow(
     owner: &InitializedSharedNative<InitializedScheduler>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<(), MlxSchedulerInitializationError> {
     owner
         .validate_pool(pool)
@@ -107,10 +107,8 @@ fn borrow(
 /// inspection. No worker/stream is initialized and no ordinary fallback runs.
 /// Native success retains its account permanently, including after a later
 /// allocator/source stage fails. Repeated borrowers add no constructor charge.
-pub(super) fn prepare_admitted(
-    pool: &WorkingMemoryPool,
-) -> Result<(), MlxSchedulerInitializationError> {
-    if !pool.same_domain(&super::domain()) {
+pub(super) fn prepare_admitted(pool: &MemoryLedger) -> Result<(), MlxSchedulerInitializationError> {
+    if !pool.same_ledger(&super::ledger()) {
         return Err(MlxSchedulerInitializationError(Failure::Policy(
             WorkingMemoryError::IdentityMismatch,
         )));
@@ -147,7 +145,7 @@ pub(super) fn prepare_admitted(
 // Test-only observation of the actual retained account; no raw native identity
 // or allocation authority is exposed.
 #[cfg(test)]
-pub(super) fn initialized_original_bytes(pool: &WorkingMemoryPool) -> Option<u64> {
+pub(super) fn initialized_original_bytes(pool: &MemoryLedger) -> Option<u64> {
     let owner = INITIALIZED.get()?;
     owner.validate_pool(pool).ok()?;
     Some(owner.original_bytes())
@@ -158,7 +156,7 @@ mod tests;
 /// Borrow only an already admitted process Scheduler from the exact source pool.
 /// This never creates a singleton or promotes an ordinary predecessor.
 pub(crate) fn admitted_owner(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<&'static InitializedScheduler, MlxSchedulerInitializationError> {
     let owner = INITIALIZED.get().ok_or_else(|| {
         MlxSchedulerInitializationError(Failure::Native(SchedulerCause::IdentityMismatch))

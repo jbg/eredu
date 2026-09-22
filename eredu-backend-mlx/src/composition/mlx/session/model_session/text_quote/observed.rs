@@ -11,12 +11,15 @@ use eredu_runtime::working_memory::{
 /// Quote-stage diagnostics preserve the actual native cause, classification,
 /// and planning-account custody for both token and completed-media sources.
 #[derive(Debug, thiserror::Error)]
-#[error("workspace quote {stage}: {cause}; missing equation {equation:?}")]
+#[error(
+    "workspace quote {stage}: {cause}; missing equation {equation:?}; components {components:?}"
+)]
 struct WorkspaceQuoteFailure {
     stage: &'static str,
     #[source]
     cause: Error,
     equation: Option<(usize, usize, Option<String>)>,
+    components: Option<crate::backend::error::WorkspaceQuoteComponents>,
 }
 fn workspace_quote_failure(
     context: Option<&WorkspaceContext>,
@@ -24,14 +27,22 @@ fn workspace_quote_failure(
     cause: Error,
     equation: Option<(usize, usize, Option<String>)>,
 ) -> Error {
+    workspace_quote_failure_with_components(context, stage, cause, equation, None)
+}
+fn workspace_quote_failure_with_components(
+    context: Option<&WorkspaceContext>,
+    stage: &'static str,
+    cause: Error,
+    equation: Option<(usize, usize, Option<String>)>,
+    components: Option<crate::backend::error::WorkspaceQuoteComponents>,
+) -> Error {
     if matches!(
         cause,
         Error::PrefillControl(
             WorkingMemoryError::SubmissionTrackingCapacity { .. }
                 | WorkingMemoryError::GraphMetadataCapacity { .. }
         )
-    )
-    {
+    ) {
         return cause;
     }
     let Some(funding) = context.and_then(WorkspaceContext::metadata_funding) else {
@@ -42,7 +53,12 @@ fn workspace_quote_failure(
         .unwrap_or(BackendFailureKind::Other);
     let preserved = cause.model_state_preserved();
     crate::composition::mlx::model::retain_planning_error_with_kind(
-        WorkspaceQuoteFailure { stage, cause, equation },
+        WorkspaceQuoteFailure {
+            stage,
+            cause,
+            equation,
+            components,
+        },
         funding,
         kind,
         preserved,
@@ -91,6 +107,7 @@ pub(super) fn quote_observed_with_sequence(
     retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
     context: Option<&WorkspaceContext>,
     paged_sources: Option<&crate::backend::nn::workspace::ProjectedPagedSources>,
+    ordinary_publication: Option<&super::super::text_funding::OrdinaryPublicationPlan>,
 ) -> Result<Result<IncrementalInferenceQuote, IncompleteWorkspace>, Error> {
     let ObservedWorkspace {
         equations,
@@ -120,12 +137,17 @@ pub(super) fn quote_observed_with_sequence(
             Option<eredu_runtime::working_memory::TextPrefillScopeFacts>,
         )>()
         .map_err(report_error)?;
-    report_metadata.admit::<(
-        crate::backend::error::WorkspaceQuoteComponents,
-        Option<crate::backend::error::WorkspaceQuoteComponents>,
-        crate::backend::error::WorkspaceCandidateRefusal,
-        Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
-    )>().map_err(report_error)?;
+    report_metadata
+        .admit::<(
+            crate::backend::error::WorkspaceQuoteComponents,
+            Option<crate::backend::error::WorkspaceQuoteComponents>,
+            crate::backend::error::WorkspaceCandidateRefusal,
+            Option<(
+                InferenceGeometry,
+                crate::backend::error::WorkspaceQuoteComponents,
+            )>,
+        )>()
+        .map_err(report_error)?;
     let mut components = crate::backend::error::WorkspaceQuoteComponents::default();
     if let Some(recipe) = native_recipe.as_mut() {
         session
@@ -133,7 +155,7 @@ pub(super) fn quote_observed_with_sequence(
             .model
             .erased()
             .bind_layerwise_neural_recipe(
-                &session.payload.memory_pool,
+                &session.payload.memory_ledger,
                 recipe,
                 context
                     .and_then(WorkspaceContext::metadata_funding)
@@ -149,22 +171,33 @@ pub(super) fn quote_observed_with_sequence(
     let requested_tracking = config.inference_policy().submission_tracking_capacity_bytes;
     let selected_tracking = match native_recipe.as_mut() {
         Some(recipe) => {
-            let requirement = recipe.record_storage_requirement().map_err(|cause| {
-                match recipe.take_first_missing_equation() {
-                    Ok(equation) => workspace_quote_failure(context, "submission records", cause, equation),
+            let requirement = recipe
+                .record_storage_requirement()
+                .map_err(|cause| match recipe.take_first_missing_equation() {
+                    Ok(equation) => {
+                        workspace_quote_failure(context, "submission records", cause, equation)
+                    }
                     Err(refusal) => refusal,
-                }
-            })?;
-            Some(requirement.select_for_policy(requested_tracking).map_err(|cause| {
-                // A configured-capacity refusal keeps its direct public form.
-                if !matches!(cause, WorkingMemoryError::UnknownBound) {
-                    return at("submission record capacity", Error::PrefillControl(cause));
-                }
-                match recipe.take_first_missing_equation() {
-                    Ok(equation) => workspace_quote_failure(context, "submission record capacity", Error::PrefillControl(cause), equation),
-                    Err(refusal) => refusal,
-                }
-            })?)
+                })?;
+            Some(
+                requirement
+                    .select_for_policy(requested_tracking)
+                    .map_err(|cause| {
+                        // A configured-capacity refusal keeps its direct public form.
+                        if !matches!(cause, WorkingMemoryError::UnknownBound) {
+                            return at("submission record capacity", Error::PrefillControl(cause));
+                        }
+                        match recipe.take_first_missing_equation() {
+                            Ok(equation) => workspace_quote_failure(
+                                context,
+                                "submission record capacity",
+                                Error::PrefillControl(cause),
+                                equation,
+                            ),
+                            Err(refusal) => refusal,
+                        }
+                    })?,
+            )
         }
         None => requested_tracking,
     };
@@ -217,6 +250,33 @@ pub(super) fn quote_observed_with_sequence(
         state_input,
     )
     .map_err(|cause| at("enclosing state and source controls", cause))?;
+    if let Some(plan) = ordinary_publication {
+        add_retained_host(
+            &mut outside,
+            &session.payload.memory_ledger,
+            plan.additional_bytes(),
+            "finite ordinary collector destinations and generic publication controls from traced closing allocations and actual opening source rows",
+            report_metadata,
+        )?;
+        if let Some(requirements) = plan.native_requirements() {
+            let domains = outside
+                .physical_domains
+                .as_mut()
+                .ok_or_else(|| memory(WorkingMemoryError::UnknownBound))?;
+            domains.retained = report_metadata
+                .combine_domain_requirements(&domains.retained, requirements, true)
+                .map_err(report_error)?;
+            if let WorkspaceBound::Bounded { assumptions, .. }
+            | WorkspaceBound::PerDomain { assumptions } = &outside.retained
+            {
+                outside.retained = report_metadata
+                    .per_domain(format_args!(
+                    "{assumptions}; ordinary native controls and actual indexed transfer placements"
+                ))
+                    .map_err(report_error)?;
+            }
+        }
+    }
     if let Some(capture) = capture {
         capture.add_enclosing_metadata(&mut outside, report_metadata)?;
     }
@@ -238,12 +298,13 @@ pub(super) fn quote_observed_with_sequence(
                     let controls = controls
                         .checked_add(validation_controls)
                         .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-                    if let WorkspaceBound::Bounded { bytes, assumptions } = &mut outside.retained {
-                        *bytes = bytes
-                            .checked_add(controls)
-                            .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-                        report_metadata.append(assumptions, "; exact resident native recipe, query controls and retained validation batches").map_err(report_error)?;
-                    }
+                    add_retained_host(
+                        &mut outside,
+                        &session.payload.memory_ledger,
+                        controls,
+                        "exact resident native recipe, query controls and retained validation batches",
+                        report_metadata,
+                    )?;
                 }
                 None => {
                     outside.retained = report_metadata
@@ -267,8 +328,6 @@ pub(super) fn quote_observed_with_sequence(
                 .is_some())
     {
         session
-            .payload
-            .model
             .native_storage_mechanism()
             .map_err(|cause| at("selected native storage mechanism", cause))?
     } else {
@@ -278,11 +337,8 @@ pub(super) fn quote_observed_with_sequence(
         match pipeline_cache::control_bytes(recipe).map_err(|cause| at("pipeline cache controls", cause))? {
         Some(controls) => {
             components.pipeline = Some(controls);
-            if let WorkspaceBound::Bounded { bytes, assumptions } = &mut outside.retained {
-                *bytes = bytes.checked_add(controls)
-                    .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-                report_metadata.append(assumptions, "; exact request-owned precompiled pipeline destinations and selector controls").map_err(report_error)?;
-            }
+            add_retained_host(&mut outside, &session.payload.memory_ledger, controls,
+                "exact request-owned precompiled pipeline destinations and selector controls", report_metadata)?;
         }
         None => outside.retained = report_metadata.unknown(format_args!("selected precompiled kernel coverage, lookup population or selector controls are unknown")).map_err(report_error)?,
     }
@@ -315,7 +371,8 @@ pub(super) fn quote_observed_with_sequence(
                             .prompt_input_facts(geometry)
                             .map_err(|cause| Error::Other(Box::new(cause)))?
                             .ok_or_else(unknown)?;
-                        recipe.graph_storage_requirement(prompt_facts)
+                        recipe
+                            .graph_storage_requirement(prompt_facts)
                             .map_err(|cause| at("prompt graph requirement", cause))?
                     }
                 };
@@ -343,7 +400,7 @@ pub(super) fn quote_observed_with_sequence(
             if !matches!(storage, ObservedStorage::Unregistered)
                 && (input_layout.is_some() || completed_source.is_some()) =>
         {
-            let pool = &session.payload.memory_pool;
+            let pool = &session.payload.memory_ledger;
             let mut nonstate =
                 crate::backend::runtime::residency::storage::RetainedStorage::original_census(pool);
             let mut decoder =
@@ -351,28 +408,42 @@ pub(super) fn quote_observed_with_sequence(
             session
                 .payload
                 .collect_retained_idle_storage(&mut nonstate, &mut decoder)?;
-            let opening_rows = match (
-                nonstate.original_publication_rows(pool)?,
-                decoder.original_publication_rows(pool)?,
-            ) {
-                (Some(nonstate), Some(decoder)) => Some(
-                    nonstate
-                        .checked_add(decoder)
-                        .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
-                ),
-                _ => None,
-            };
+            let nonstate_rows = nonstate.original_publication_rows(pool)?.ok_or_else(|| {
+                at(
+                    "opening nonstate storage census",
+                    memory(WorkingMemoryError::UnknownBound),
+                )
+            })?;
+            let decoder_rows = decoder.original_publication_rows(pool)?.ok_or_else(|| {
+                at(
+                    "opening decoder storage census",
+                    memory(WorkingMemoryError::UnknownBound),
+                )
+            })?;
+            let opening_rows = Some(
+                nonstate_rows
+                    .checked_add(decoder_rows)
+                    .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
+            );
             match completed_source {
                 Some(source) => mechanism
-                    .completed_input_program(recipe, source, sampling, opening_rows, paged_sources.is_some())
+                    .completed_input_program(
+                        recipe,
+                        source,
+                        sampling,
+                        opening_rows,
+                        paged_sources.is_some(),
+                    )
                     .map_err(|cause| at("completed input native population", cause))?,
-                None => mechanism.resident_program(
-                    recipe,
-                    prompt.as_ref().ok_or_else(unknown)?,
-                    sampling,
-                    opening_rows,
-                    paged_sources.is_some(),
-                ).map_err(|cause| at("token input native population", cause))?,
+                None => mechanism
+                    .resident_program(
+                        recipe,
+                        prompt.as_ref().ok_or_else(unknown)?,
+                        sampling,
+                        opening_rows,
+                        paged_sources.is_some(),
+                    )
+                    .map_err(|cause| at("token input native population", cause))?,
             }
         }
         _ => None,
@@ -395,7 +466,8 @@ pub(super) fn quote_observed_with_sequence(
         )
         .map_err(report_error)?;
     if let Some(program) = &native_program {
-        program.replace_enclosing_metadata(&mut outside, report_metadata)
+        program
+            .replace_enclosing_metadata(&mut outside, prompt.as_ref(), sampling, report_metadata)
             .map_err(|cause| at("native enclosing storage replacement", cause))?;
     }
     let tracking = tracking::selected_facts(requested_tracking, selected_tracking)?;
@@ -410,12 +482,16 @@ pub(super) fn quote_observed_with_sequence(
                 .model
                 .erased()
                 .prefill_control_facts(
-                    &session.payload.memory_pool,
+                    &session.payload.memory_ledger,
                     geometry,
                     graph.capacity(),
                     native_recipe
                         .as_ref()
-                        .map(|recipe| recipe.maximum_roots().map_err(|cause| at("native root population", cause)))
+                        .map(|recipe| {
+                            recipe
+                                .maximum_roots()
+                                .map_err(|cause| at("native root population", cause))
+                        })
                         .transpose()?,
                     retained_sources,
                     native_recipe.as_ref(),
@@ -427,41 +503,79 @@ pub(super) fn quote_observed_with_sequence(
         })
         .transpose()?
         .flatten();
-    let paged = paged_sources.map(|paged|paged.host_source_facts())
-        .transpose().map_err(|cause|Error::Neural(report_metadata.source(cause)))?.flatten();
+    let paged = paged_sources
+        .map(|paged| paged.host_source_facts())
+        .transpose()
+        .map_err(|cause| Error::Neural(report_metadata.source(cause)))?
+        .flatten();
     let prefill = match prefill {
-        Some(prefill)=>{
-            let target=prefill.source_construction_facts();
-            let compound=match native_recipe.as_ref(){
-                Some(recipe)=>match report_metadata.funding(){Some(funding)=>recipe.prepare_addressable_source_program(target,paged,&funding)
-                    .map_err(|cause| at("addressable source program", cause))?,
-                    None=>{if recipe.records().iter().any(|row|row.addressable().is_some()){return Err(memory(WorkingMemoryError::IdentityMismatch));}None}},
-                None=>None,
+        Some(prefill) => {
+            let target = prefill.source_construction_facts();
+            let compound = match native_recipe.as_ref() {
+                Some(recipe) => match report_metadata.funding() {
+                    Some(funding) => recipe
+                        .prepare_addressable_source_program(target, paged, &funding)
+                        .map_err(|cause| at("addressable source program", cause))?,
+                    None => {
+                        if recipe
+                            .records()
+                            .iter()
+                            .any(|row| row.addressable().is_some())
+                        {
+                            return Err(memory(WorkingMemoryError::IdentityMismatch));
+                        }
+                        None
+                    }
+                },
+                None => None,
             };
             if compound.is_none() && target.is_some() && paged.is_some() {
                 return Err(memory(WorkingMemoryError::UnknownBound));
             }
-            let sources=compound.or(paged);
-            if let Some(sources)=sources {
-                let host=match prefill.host_destination_facts(){
-                    Some(host)=>host,
-                    None=>eredu_runtime::working_memory::HostDestinationFacts::new(0,0).map_err(memory)?,
-                }.replace_source_constructions(target,sources).map_err(memory)?;
-                Some(prefill.with_source_constructions(Some(sources)).with_host_destinations(Some(host)))
-            }else{Some(prefill)}
-        },None=>None,
-    };
-    if let Some(recipe)=native_recipe.as_ref(){
-        let controls=recipe.addressable_request_control_bytes()
-            .map_err(|cause| at("addressable request controls", cause))?;
-        if let WorkspaceBound::Bounded{bytes,assumptions}=&mut outside.retained{
-            *bytes=bytes.checked_add(controls).ok_or_else(||memory(WorkingMemoryError::Overflow))?;
-            if controls!=0{report_metadata.append(assumptions,"; exact addressable request source program and independent native graph/record roles").map_err(report_error)?;}
+            let sources = compound.or(paged);
+            if let Some(sources) = sources {
+                let host = match prefill.host_destination_facts() {
+                    Some(host) => host,
+                    None => eredu_runtime::working_memory::HostDestinationFacts::new(0, 0)
+                        .map_err(memory)?,
+                }
+                .replace_source_constructions(target, sources)
+                .map_err(memory)?;
+                Some(
+                    prefill
+                        .with_source_constructions(Some(sources))
+                        .with_host_destinations(Some(host)),
+                )
+            } else {
+                Some(prefill)
+            }
         }
+        None => None,
+    };
+    if let Some(recipe) = native_recipe.as_ref() {
+        let controls = recipe
+            .addressable_request_control_bytes()
+            .map_err(|cause| at("addressable request controls", cause))?;
+        add_retained_host(
+            &mut outside,
+            &session.payload.memory_ledger,
+            controls,
+            "exact addressable request source program and independent native graph/record roles",
+            report_metadata,
+        )?;
     }
-    let prefill = match (prefill, native_recipe.as_ref().map(|recipe|
-        recipe.initialized_input_source_facts(geometry.max_output_tokens)
-            .map_err(|cause| at("initialized parallel input sources", cause))).transpose()?.flatten()) {
+    let prefill = match (
+        prefill,
+        native_recipe
+            .as_ref()
+            .map(|recipe| {
+                recipe
+                    .initialized_input_source_facts(geometry.max_output_tokens)
+                    .map_err(|cause| at("initialized parallel input sources", cause))
+            })
+            .transpose()?
+            .flatten(),
+    ) {
         (Some(prefill), Some(facts)) => Some(prefill.with_output_source_constructions(facts)),
         (prefill, _) => prefill,
     };
@@ -470,7 +584,7 @@ pub(super) fn quote_observed_with_sequence(
         controller,
         sampling.output_width,
         storage_contract,
-        &session.payload.memory_pool,
+        &session.payload.memory_ledger,
         registered_controller,
         report_metadata,
     )
@@ -502,7 +616,7 @@ pub(super) fn quote_observed_with_sequence(
     };
     let quote = match quote {
         Ok(quote) => {
-            components.before_seal = Some(quote.incremental_bytes());
+            components.before_seal = quote.incremental_bytes();
             // This is request quotation after native model selection, not
             // portable artifact inspection. Only payload-free selected facts
             // enter the neutral plan. Missing provider decomposition stays
@@ -523,9 +637,11 @@ pub(super) fn quote_observed_with_sequence(
                 native_mechanism
                     .as_ref()
                     .map(|mechanism| {
-                        components.direct_controls = native_program.as_ref()
+                        components.direct_controls = native_program
+                            .as_ref()
                             .map(|program| program.direct_control_bytes(mechanism, report_metadata))
-                            .transpose()?.flatten();
+                            .transpose()?
+                            .flatten();
                         mechanism
                             .selected_plan(
                                 quote.span_workspace(),
@@ -540,15 +656,31 @@ pub(super) fn quote_observed_with_sequence(
                 None
             };
             components.native_controls = native.as_ref().and_then(|plan| plan.control_bytes());
+            components.state = Some(quote.state().requested_state_bytes);
+            if let Some(workspace) = &quote.state().execution_workspace {
+                components.activations = workspace.activations.bytes();
+                components.vocabulary = workspace.vocabulary.bytes();
+                components.retained = workspace.retained.bytes();
+            }
             Ok(match capture {
-                Some(capture) => capture.seal_controls_with_sequence(
-                    quote,
-                    sequence_claim,
-                    tracking,
-                    graph,
-                    prefill,
-                    native,
-                )?,
+                Some(capture) => capture
+                    .seal_controls_with_sequence(
+                        quote,
+                        sequence_claim,
+                        tracking,
+                        graph,
+                        prefill,
+                        native,
+                    )
+                    .map_err(|cause| {
+                        workspace_quote_failure_with_components(
+                            context,
+                            "capture control seal",
+                            cause,
+                            None,
+                            Some(components),
+                        )
+                    })?,
                 None => {
                     if sequence_claim.is_some()
                         || tracking.is_some()
@@ -569,7 +701,23 @@ pub(super) fn quote_observed_with_sequence(
         Err(error) => return Err(Error::Neural(error.into_workspace(report_metadata))),
     };
     if let Ok(quote) = &quote {
-        components.after_seal = Some(quote.incremental_bytes());
+        report_metadata
+            .admit::<(
+                &IncrementalInferenceQuote,
+                Option<&eredu_core::DomainMemoryRequirements>,
+                Result<Option<u64>, eredu_core::MemoryDomainError>,
+            )>()
+            .map_err(report_error)?;
+        components.after_seal = quote.incremental_bytes();
+        components.after_seal_host = quote
+            .incremental_requirements()
+            .map(|requirements| {
+                requirements
+                    .get(session.payload.memory_ledger.topology().host_domain())?
+                    .total()
+            })
+            .transpose()
+            .map_err(|cause| Error::PrefillControl(cause.into()))?;
         components.state = Some(quote.state().requested_state_bytes);
         if let Some(workspace) = &quote.state().execution_workspace {
             components.activations = workspace.activations.bytes();
@@ -578,6 +726,15 @@ pub(super) fn quote_observed_with_sequence(
         }
         if let Some(recipe) = native_recipe {
             recipe.record_quote_components(components)?;
+        }
+        if let Some(ordinary) = ordinary_publication {
+            report_metadata
+                .admit::<(
+                    &super::super::text_funding::OrdinaryPublicationPlan,
+                    [crate::backend::error::WorkspaceQuoteComponents; 3],
+                )>()
+                .map_err(report_error)?;
+            ordinary.record_quote_components(components);
         }
     }
     Ok(quote)
@@ -625,5 +782,39 @@ pub(in crate::composition::mlx::session::model_session) fn quote_completed_input
         retained_sources,
         Some(context),
         paged_sources,
+        None,
     )
+}
+
+/// Adds a known host producer to both admission requirements and diagnostics.
+pub(super) fn add_retained_host(
+    outside: &mut ExecutionWorkspaceEstimate,
+    ledger: &eredu_runtime::working_memory::MemoryLedger,
+    controls: u64,
+    reason: &str,
+    metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
+) -> Result<(), Error> {
+    if let Some(domains) = &mut outside.physical_domains {
+        domains
+            .retained
+            .add_allocation(controls, ledger.host_placement())
+            .map_err(|cause| memory(cause.into()))?;
+    }
+    let error = |cause| Error::Neural(metadata.error(cause));
+    outside.retained = match &outside.retained {
+        WorkspaceBound::Bounded { bytes, assumptions } => match bytes.checked_add(controls) {
+            Some(bytes) => metadata
+                .bounded(bytes, format_args!("{assumptions}; {reason}"))
+                .map_err(error)?,
+            None if outside.physical_domains.is_some() => metadata
+                .per_domain(format_args!("{assumptions}; {reason}"))
+                .map_err(error)?,
+            None => return Err(memory(WorkingMemoryError::Overflow)),
+        },
+        WorkspaceBound::PerDomain { assumptions } => metadata
+            .per_domain(format_args!("{assumptions}; {reason}"))
+            .map_err(error)?,
+        WorkspaceBound::Unknown { .. } => return Ok(()),
+    };
+    Ok(())
 }

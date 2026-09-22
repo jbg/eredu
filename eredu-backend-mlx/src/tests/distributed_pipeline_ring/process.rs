@@ -757,6 +757,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WorkerMode {
     Standard,
+    OriginalAutoregressiveCapture(&'static str),
     FinalOutputIntervention,
     AddressableParameterBank,
     AddressableParameterBankRequantize,
@@ -1422,6 +1423,11 @@ fn run_ring_pipeline_processes(
                     command.env(COMPONENT_CAPTURE_MEDIA, "1");
                 }
             }
+            WorkerMode::OriginalAutoregressiveCapture(device) => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(ORIGINAL_AR_CAPTURE, "1");
+                command.env("EREDU_TEST_RING_DEVICE", device);
+            }
             WorkerMode::OpaqueComponentCapture => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_COMPONENT_CAPTURE, "1");
@@ -1596,7 +1602,10 @@ fn run_ring_pipeline_processes(
         8 => 180,
         4 => 90,
         _ => 45,
-    } * if mode.is_component_capture() || mode.runs_prediction_components() {
+    } * if mode.is_component_capture()
+        || mode.runs_prediction_components()
+        || matches!(mode, WorkerMode::OriginalAutoregressiveCapture(_))
+    {
         4
     } else {
         1
@@ -1657,5 +1666,39 @@ fn run_ring_pipeline_processes(
         } else {
             failures.join("\n\n")
         }
+    );
+}
+
+/// Actual two-rank provider source; child processes own the real Ring groups.
+pub(crate) fn run_original_autoregressive_capture(device: DeviceType) {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = crate::composition::mlx::replicated_text::tests::tiny_heterogeneous_artifact(
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64,
+            "max_position_embeddings": 32,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": true
+        }),
+    );
+    let path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OriginalAutoregressiveCapture(if device == DeviceType::Cpu {
+            "cpu"
+        } else {
+            "gpu"
+        }),
+        checkpoint,
+        path,
+        Some("tp"),
     );
 }

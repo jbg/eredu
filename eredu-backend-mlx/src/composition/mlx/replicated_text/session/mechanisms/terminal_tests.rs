@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::submission_recovery::{prefill::PrefillRequestRetention, RecoveryBeginError};
+use crate::backend::submission_recovery::{RecoveryBeginError, prefill::PrefillRequestRetention};
 use eredu_core::{InferenceGeometry, OutputDemand};
 use eredu_runtime::working_memory::{InferenceExecutionIdentity, InferenceRequest};
 use safemlx::{Device, DeviceType, SubmissionScopeBeginError};
@@ -28,7 +28,7 @@ fn actual_mechanism_try_entry_returns_typed_busy_and_exact_request_without_house
     .unwrap();
     // This bridge checks the real method and exact owner. Charged request/array
     // lifetime is covered separately by the recovery tests; no byte proof here.
-    let request = InferenceRequest::without_memory_budget(
+    let request = crate::memory_fixture::empty_admitted_request(
         &InferenceExecutionIdentity::default(),
         InferenceGeometry {
             batch_size: 1,
@@ -123,7 +123,7 @@ fn coordinated_ordinary_entry_waits_then_releases_the_runtime_before_returning()
                 &stream,
             )
             .unwrap();
-            let request = InferenceRequest::without_memory_budget(
+            let request = crate::memory_fixture::empty_admitted_request(
                 &InferenceExecutionIdentity::default(),
                 InferenceGeometry {
                     batch_size: 1,

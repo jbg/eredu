@@ -305,6 +305,45 @@ impl PromptCacheDescriptor {
         Ok(descriptor)
     }
 
+    /// Moves the validated identity and already-constructed payload declarations
+    /// into their persistent manifest without cloning their owned allocations.
+    /// The caller owns validation, allocation funding and publication authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_manifest(
+        self,
+        block_size_tokens: i32,
+        total_prefix_tokens: usize,
+        prefix_sha256: String,
+        application_namespace: Option<String>,
+        blocks: Vec<PromptCacheBlock>,
+        state_tensors: Vec<PromptCacheStateTensor>,
+    ) -> PromptCacheManifest {
+        PromptCacheManifest {
+            schema_version: PROMPT_CACHE_SCHEMA_VERSION,
+            model_family: self.model_family,
+            effective_model_type: self.effective_model_type,
+            checkpoint_fingerprint: self.checkpoint_fingerprint,
+            prefix_content_fingerprint: self.prefix_content_fingerprint,
+            architecture_fingerprint: self.architecture_fingerprint,
+            layer_count: self.layer_count,
+            global_layer_start: self.global_layer_start,
+            global_layer_end: self.global_layer_end,
+            block_size_tokens,
+            batch_size: self.batch_size,
+            total_prefix_tokens,
+            prefix_sha256,
+            layer_layout: self.layer_layout,
+            layer_prefix_offsets: self.layer_prefix_offsets,
+            state_segments: self.state_segments,
+            sink_tokens: self.sink_tokens,
+            topology: self.topology,
+            distributed_commit: self.distributed_commit,
+            application_namespace,
+            blocks,
+            state_tensors,
+        }
+    }
+
     /// Validates the complete portable identity and cache geometry.
     pub fn validate(&self) -> Result<(), PromptCacheError> {
         IdentityLayout {
@@ -971,6 +1010,12 @@ pub struct PromptCacheBlock {
     pub payload_sha256: String,
 }
 
+impl AsRef<PromptCacheManifest> for PromptCacheManifest {
+    fn as_ref(&self) -> &PromptCacheManifest {
+        self
+    }
+}
+
 impl PromptCacheManifest {
     /// Validates all backend-independent schema, geometry, and coverage rules.
     pub fn validate(&self) -> Result<(), PromptCacheError> {
@@ -1472,6 +1517,15 @@ fn append_hex(digest: impl AsRef<[u8]>, encoded: &mut String) {
 /// Invalid reusable prompt-cache identity, schema, or catalog.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum PromptCacheError {
+    /// The cache operation requires the exact prepared or committed input identity.
+    #[error("prompt-cache operation requires the prepared-input semantic identity")]
+    PreparedInputIdentityRequired,
+    /// Loading requires paged state selected during model preparation.
+    #[error("prompt-cache loading requires paged state selected during preparation")]
+    PagedStateRequired,
+    /// The selected local partition contains no cache state to persist or restore.
+    #[error("this partition rank owns no prompt-cache state")]
+    RankHasNoState,
     /// A layer or state policy is invalid.
     #[error(transparent)]
     Policy(#[from] CachePolicyError),
@@ -1548,6 +1602,70 @@ mod tests {
         let restored: PromptCacheManifest = serde_json::from_str(&json).unwrap();
         restored.validate().unwrap();
         assert_eq!(restored, manifest);
+    }
+
+    #[test]
+    fn shared_manifest_aliases_preserve_payload_and_both_metadata_accounts() {
+        use crate::cache::PreparedPromptCacheManifest;
+        use crate::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        #[derive(Debug)]
+        struct Account {
+            spent: Arc<AtomicUsize>,
+            retired: Arc<AtomicBool>,
+        }
+        impl HostMetadataAccount for Account {
+            fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
+                self.spent.fetch_add(bytes, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        impl Drop for Account {
+            fn drop(&mut self) {
+                self.retired.store(true, Ordering::SeqCst);
+            }
+        }
+        let spent = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicBool::new(false));
+        let dependency_retired = Arc::new(AtomicBool::new(false));
+        let funding = HostMetadataFunding::new(Account {
+            spent: spent.clone(),
+            retired: retired.clone(),
+        })
+        .unwrap();
+        let dependency = HostMetadataFunding::new(Account {
+            spent: Arc::new(AtomicUsize::new(0)),
+            retired: dependency_retired.clone(),
+        })
+        .unwrap();
+        let before = spent.load(Ordering::SeqCst);
+        let prepared =
+            PreparedPromptCacheManifest::prepare_with_dependency(funding, dependency).unwrap();
+        assert_eq!(
+            spent.load(Ordering::SeqCst) - before,
+            PreparedPromptCacheManifest::control_bytes().unwrap()
+        );
+        let original = manifest();
+        let blocks = original.blocks.as_ptr();
+        let encoded = serde_json::to_string(&original).unwrap();
+        let owner = prepared.publish(original);
+        let alias = owner.clone();
+        assert!(owner.same_storage(&alias));
+        assert_eq!(alias.blocks.as_ptr(), blocks);
+        assert_eq!(serde_json::to_string(&alias).unwrap(), encoded);
+        assert_eq!(
+            spent.load(Ordering::SeqCst) - before,
+            PreparedPromptCacheManifest::control_bytes().unwrap()
+        );
+        drop(owner);
+        assert!(!retired.load(Ordering::SeqCst));
+        assert!(!dependency_retired.load(Ordering::SeqCst));
+        drop(alias);
+        assert!(retired.load(Ordering::SeqCst));
+        assert!(dependency_retired.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1672,11 +1790,9 @@ mod tests {
         manifest
             .validate_compatibility(&descriptor, &[7, 8])
             .unwrap();
-        assert!(
-            manifest
-                .validate_compatibility(&descriptor, &[8, 7])
-                .is_err()
-        );
+        assert!(manifest
+            .validate_compatibility(&descriptor, &[8, 7])
+            .is_err());
         let mut renamed = descriptor.clone();
         renamed.state_segments = vec![PromptCacheStateSegment::new("renamed", 0..1).unwrap()];
         assert!(matches!(

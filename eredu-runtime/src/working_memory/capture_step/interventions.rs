@@ -6,8 +6,12 @@ pub(in crate::working_memory) mod evidence;
 impl<'a> PreparedCaptureStep<'a> {
     pub(super) fn validate_interventions_complete(&self) -> Result<(), CaptureStepError> {
         for (index, record) in self.frame.interventions.iter().enumerate() {
-            if self.intervention_evidence.get(index).and_then(Option::as_ref)
-                .is_some_and(|child| child.frame.is_none()) {
+            if self
+                .intervention_evidence
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|child| child.frame.is_none())
+            {
                 return Err(CaptureStepError::InterventionState { index });
             }
             if !crate::intervention::routed::progress::successful(record) {
@@ -76,8 +80,8 @@ impl<'a> PreparedCaptureStep<'a> {
                             plan.prediction,
                             plan.invocation,
                             plan.window,
-                            plan.selected.is_none_or(|mask|mask[index]),
-                            plan.evidence_skips.map(|rows|&rows[index]),
+                            plan.selected.is_none_or(|mask| mask[index]),
+                            plan.evidence_skips.map(|rows| &rows[index]),
                             self.custody.share_scheduled(),
                         )
                     })
@@ -94,13 +98,28 @@ impl<'a> PreparedCaptureStep<'a> {
     pub fn interventions(&self) -> &[InterventionRecord] {
         &self.frame.interventions
     }
-    pub(in crate::working_memory) fn begin_routed_intervention(&mut self,index:usize,source_tokens:u64)->Result<(),CaptureStepError>{
+    pub(in crate::working_memory) fn begin_routed_intervention(
+        &mut self,
+        index: usize,
+        source_tokens: u64,
+    ) -> Result<(), CaptureStepError> {
         self.custody.validate()?;
-        let record=self.frame.interventions.get_mut(index).ok_or(CaptureStepError::InterventionState{index})?;
-        if record.outcome!=InterventionOutcome::Missing || record.routed_units.is_some() || source_tokens==0 {
-            return Err(CaptureStepError::InterventionState{index});
+        let record = self
+            .frame
+            .interventions
+            .get_mut(index)
+            .ok_or(CaptureStepError::InterventionState { index })?;
+        if record.outcome != InterventionOutcome::Missing
+            || record.routed_units.is_some()
+            || source_tokens == 0
+        {
+            return Err(CaptureStepError::InterventionState { index });
         }
-        record.routed_units=Some(RoutedUnitInterventionReceipt{source_tokens,completed_tokens:0,affected_values:0});
+        record.routed_units = Some(RoutedUnitInterventionReceipt {
+            source_tokens,
+            completed_tokens: 0,
+            affected_values: 0,
+        });
         Ok(())
     }
     pub(in crate::working_memory) fn record_intervention(
@@ -108,10 +127,15 @@ impl<'a> PreparedCaptureStep<'a> {
         index: usize,
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
-        self.record_intervention_result(index,additional,None)
+        self.record_intervention_result(index, additional, None, false)
     }
-    pub(in crate::working_memory) fn record_intervention_result(&mut self,index:usize,additional:CaptureUsage,
-        routed:Option<RoutedUnitInterventionReceipt>)->Result<(),CaptureStepError>{
+    pub(in crate::working_memory) fn record_intervention_result(
+        &mut self,
+        index: usize,
+        additional: CaptureUsage,
+        routed: Option<RoutedUnitInterventionReceipt>,
+        unmatched: bool,
+    ) -> Result<(), CaptureStepError> {
         self.custody.validate()?;
         let record = self
             .frame
@@ -121,30 +145,49 @@ impl<'a> PreparedCaptureStep<'a> {
         if record.outcome != InterventionOutcome::Missing {
             return Err(CaptureStepError::InterventionState { index });
         }
-        let outcome=match (record.routed_units,routed) {
-            (None,None)=>InterventionOutcome::Applied,
-            (Some(initial),Some(complete)) if initial.source_tokens==complete.source_tokens
-                && initial.completed_tokens==0 && initial.affected_values==0 =>
-                crate::intervention::routed::progress::outcome(complete).map_err(|_|CaptureStepError::InterventionState{index})?,
-            _=>return Err(CaptureStepError::InterventionState{index}),
+        let outcome = match (record.routed_units, routed) {
+            (None, None) if unmatched => InterventionOutcome::Unmatched,
+            (None, None) => InterventionOutcome::Applied,
+            (Some(initial), Some(complete))
+                if !unmatched
+                    && initial.source_tokens == complete.source_tokens
+                    && initial.completed_tokens == 0
+                    && initial.affected_values == 0 =>
+            {
+                crate::intervention::routed::progress::outcome(complete)
+                    .map_err(|_| CaptureStepError::InterventionState { index })?
+            }
+            _ => return Err(CaptureStepError::InterventionState { index }),
         };
         let charged = record.charged.checked_add(additional)?;
         record.charged = charged;
-        record.routed_units=routed;
+        record.routed_units = routed;
         record.outcome = outcome;
         Ok(())
     }
     /// Replace only the verified provisional local charge after the original
     /// world receipt; outcome and the consumed claim remain unchanged.
-    pub(in crate::working_memory) fn reconcile_partition_intervention(&mut self,index:usize,
-        expected:CaptureUsage,global:CaptureUsage)->Result<(),CaptureStepError> {
+    pub(in crate::working_memory) fn reconcile_partition_intervention(
+        &mut self,
+        index: usize,
+        expected: CaptureUsage,
+        global: CaptureUsage,
+    ) -> Result<(), CaptureStepError> {
         self.custody.validate()?;
-        let record=self.frame.interventions.get_mut(index).ok_or(CaptureStepError::InterventionState{index})?;
-        if record.outcome!=InterventionOutcome::Applied||record.routed_units.is_some()
-            ||record.charged!=expected||expected.exceeded(global).is_some() {
-            return Err(CaptureStepError::InterventionState{index});
+        let record = self
+            .frame
+            .interventions
+            .get_mut(index)
+            .ok_or(CaptureStepError::InterventionState { index })?;
+        if record.outcome != InterventionOutcome::Applied
+            || record.routed_units.is_some()
+            || record.charged != expected
+            || expected.exceeded(global).is_some()
+        {
+            return Err(CaptureStepError::InterventionState { index });
         }
-        record.charged=global;Ok(())
+        record.charged = global;
+        Ok(())
     }
     pub(in crate::working_memory) fn record_intervention_failure(
         &mut self,

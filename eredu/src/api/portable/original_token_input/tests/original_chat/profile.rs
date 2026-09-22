@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 const INKLING: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/chat_templates/inkling-small-8cc5877b.jinja"
@@ -63,7 +64,12 @@ fn explicit_profile_uses_actual_named_effort_and_retires_after_shared_chat_execu
             .pop()
             .unwrap();
         let prepared = model
-            .prepare_chat(&source, &request, u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(prepared.rendered_prompt(), expected);
@@ -109,9 +115,9 @@ fn explicit_profile_uses_actual_named_effort_and_retires_after_shared_chat_execu
             prepared, request, ordinary, raw, json, source, tokenizer, model,
         ));
         assert_eq!(escaped.prompt(true), expected);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         drop((escaped, output));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -195,20 +201,28 @@ fn default_profile_without_controls_preserves_generation_policy_and_shared_curso
             .compile_managed_chat_source(&tokenizer, file, false, &cancellation)
             .unwrap()
             .unwrap();
-        let cold = pool.used_bytes().unwrap();
+        let cold = pool.live_charge_bytes().unwrap();
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(3),
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(u64::MAX),
+                memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(u64::MAX),
+                )]),
                 ..Default::default()
             },
             ..Default::default()
         };
         let prepared = model
-            .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &chat,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(prepared.rendered_prompt(), prompt);
@@ -217,16 +231,17 @@ fn default_profile_without_controls_preserves_generation_policy_and_shared_curso
             prepared.tokenizer_source().generation_domain().unwrap(),
             "loaded and original generation domains"
         );
-        let prepared_bytes = pool.used_bytes().unwrap();
+        let prepared_bytes = pool.live_charge_bytes().unwrap();
         facts.borrow_mut().short = true;
-        let error =
-            match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation) {
-                Err(error) => error,
-                Ok(_) => panic!("short source must refuse"),
-            };
-        assert!(pool.used_bytes().unwrap() > cold);
+        let error = match model
+            .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("short source must refuse"),
+        };
+        assert!(pool.live_charge_bytes().unwrap() > cold);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+        assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
         facts.borrow_mut().short = false;
         facts.borrow_mut().ids.clear();
         let mut visible = String::new();
@@ -237,7 +252,7 @@ fn default_profile_without_controls_preserves_generation_policy_and_shared_curso
         };
         let output = if manual {
             let mut session = model
-                .start_prepared_chat(literal_request(&prepared, settings), &cancellation)
+                .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
                 .unwrap()
                 .unwrap();
             while session.finish_reason().is_none() {
@@ -248,7 +263,7 @@ fn default_profile_without_controls_preserves_generation_policy_and_shared_curso
                 .unwrap_or_else(|_| panic!("terminal default-profile chat"))
         } else {
             model
-                .start_prepared_chat(literal_request(&prepared, settings), &cancellation)
+                .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
                 .unwrap()
                 .unwrap()
                 .run(&cancellation, &mut emit)
@@ -261,9 +276,9 @@ fn default_profile_without_controls_preserves_generation_policy_and_shared_curso
         drop((
             output, prepared, source, tokenizer, model, ordinary, raw, json, chat,
         ));
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         assert_eq!(escaped.as_ref(), &[0, 8, 0]);
         drop(escaped);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

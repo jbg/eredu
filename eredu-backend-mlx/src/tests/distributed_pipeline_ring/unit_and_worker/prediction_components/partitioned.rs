@@ -255,7 +255,6 @@ pub(super) fn verify_partitioned(
                     limits: CaptureLimits {
                         per_step: allowance,
                         cumulative: allowance.checked_mul(32).unwrap(),
-                        physical_native_bytes: None,
                         on_limit: CaptureLimitPolicy::Fail,
                     },
                 },

@@ -2,7 +2,7 @@ use super::*;
 use eredu_runtime::{
     prefill::{PrefillDriver, PrefillOutcome, PrefillProgress},
     replicated_session::{PreparedPrefillSource, SessionPrefill},
-    working_memory::{InferenceRequest, WorkingMemoryPool},
+    working_memory::{InferenceRequest, MemoryLedger},
     PreparedInputCacheIdentity, SharedPreparedInputCacheIdentity,
 };
 
@@ -50,7 +50,7 @@ fn session() -> (Session, Rc<Cell<bool>>) {
     )
 }
 
-fn charged_identity(pool: &WorkingMemoryPool, label: &str) -> SharedPreparedInputCacheIdentity {
+fn charged_identity(pool: &MemoryLedger, label: &str) -> SharedPreparedInputCacheIdentity {
     let description =
         eredu_core::PreparedInputIdentity::new(vec![eredu_core::InputPartDescriptor::new(
             InputModality::Text,
@@ -68,8 +68,8 @@ fn charged_identity(pool: &WorkingMemoryPool, label: &str) -> SharedPreparedInpu
     let bytes = owner.capacity_bytes().unwrap();
     let identity = owner.identity().clone();
     owner
-        .try_attach(&eredu_core::SharedStorageDomain::default(), || {
-            pool.register_storage([(identity, bytes)])
+        .try_attach(&eredu_core::SharedStorageAccountingId::default(), || {
+            pool.register_host_storage([(identity, bytes)])
                 .map(|charge| Box::new(charge) as Box<dyn Send + Sync>)
         })
         .unwrap();
@@ -78,7 +78,7 @@ fn charged_identity(pool: &WorkingMemoryPool, label: &str) -> SharedPreparedInpu
 
 #[test]
 fn shared_identity_survives_prefill_rollback_checkpoint_and_independent_snapshots() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
     let first = charged_identity(&pool, "first prompt");
     let first_bytes = first.capacity_bytes().unwrap();
     let original_key = first.identity().clone();
@@ -109,7 +109,7 @@ fn shared_identity_survives_prefill_rollback_checkpoint_and_independent_snapshot
         .shared_prompt_input_identity()
         .unwrap()
         .same_storage(&first));
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
 
     let rejected = charged_identity(&pool, "failed prompt");
     fail_completion.set(true);
@@ -128,7 +128,7 @@ fn shared_identity_survives_prefill_rollback_checkpoint_and_independent_snapshot
         .unwrap()
         .same_storage(&first));
     drop(rejected);
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
 
     let second = charged_identity(&pool, "second prompt");
     let second_bytes = second.capacity_bytes().unwrap();
@@ -151,7 +151,7 @@ fn shared_identity_survives_prefill_rollback_checkpoint_and_independent_snapshot
         .same_storage(&first));
     assert_eq!(session.report().unwrap().state_report(), &[1]);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
     assert!(second_bytes > 0);
 
     // The independent slot shares immutable metadata while its state advances
@@ -168,20 +168,20 @@ fn shared_identity_survives_prefill_rollback_checkpoint_and_independent_snapshot
     );
     drop(first);
     drop(session);
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
     drop(saved);
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
     drop(branch);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(original_key);
 }
 
 #[test]
 fn distributed_complete_checkpoint_and_parameter_exchange_keep_identity_custody() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
     let first = charged_identity(&pool, "distributed first");
     let first_bytes = first.capacity_bytes().unwrap();
-    let (mut session, _, _, _, _) = partitioned_cache_control_session(
+    let (mut session, _, _, _, _) = partitioned_parameter_control_session(
         0,
         DistributedExecutionPhase::PromptCacheLoadPreflight,
         None,
@@ -215,16 +215,21 @@ fn distributed_complete_checkpoint_and_parameter_exchange_keep_identity_custody(
         .same_storage(&first));
     assert_eq!(session.report().unwrap().state_report(), &[1]);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
-    let mut empty = session.prepare_parameter_reset_state(&()).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
+    let (installation, custody) =
+        super::original_resident_reset::publication::construct_reset(&session, &pool);
+    let mut empty = session
+        .prepare_parameter_state_reset(installation)
+        .map_err(|(cause, _)| cause)
+        .unwrap();
     assert!(empty.shared_prompt_input_identity().is_none());
-    session.exchange_parameter_reset_state(&mut empty).unwrap();
+    session.exchange_parameter_state_reset(&mut empty).unwrap();
     assert!(session.committed_shared_prompt_input_identity().is_none());
     assert!(empty
         .shared_prompt_input_identity()
         .unwrap()
         .same_storage(&first));
-    session.exchange_parameter_reset_state(&mut empty).unwrap();
+    session.exchange_parameter_state_reset(&mut empty).unwrap();
     assert!(session
         .committed_shared_prompt_input_identity()
         .unwrap()
@@ -232,9 +237,10 @@ fn distributed_complete_checkpoint_and_parameter_exchange_keep_identity_custody(
     assert!(empty.shared_prompt_input_identity().is_none());
     drop(first);
     drop(empty);
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes);
+    drop(custody);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first_bytes);
     drop(session);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 struct SharedSource {
@@ -277,7 +283,7 @@ impl
 #[test]
 fn scheduled_prefill_uses_shared_source_only_at_final_commit_and_retires_failed_candidate() {
     for fail_final in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
         let identity = charged_identity(&pool, "scheduled shared prompt");
         let bytes = identity.capacity_bytes().unwrap();
         let key = identity.identity().clone();
@@ -291,9 +297,10 @@ fn scheduled_prefill_uses_shared_source_only_at_final_commit_and_retires_failed_
             output: eredu_core::OutputDemand::LastPosition,
         };
         let execution = session.inference_execution_identity().clone();
-        // Scheduling/completion evidence only: this fixture makes no numerical
-        // or whole-snapshot memory admission claim.
-        let request = InferenceRequest::without_memory_budget(&execution, geometry).unwrap();
+        let request: InferenceRequest = pool
+            .reserve(&execution, &mock_inference_admission(geometry))
+            .unwrap()
+            .into();
         let shared_calls = Rc::new(Cell::new(0));
         let source = SharedSource {
             geometry,
@@ -316,7 +323,7 @@ fn scheduled_prefill_uses_shared_source_only_at_final_commit_and_retires_failed_
             PrefillProgress::Chunk { output: None, .. }
         ));
         assert_eq!(shared_calls.get(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes + 384);
         let result = driver.run(&mut executor, |_, output| {
             if let Some(output) = output {
                 assert_eq!(output, FakeTensor(vec![7, 11, 5]));
@@ -333,7 +340,7 @@ fn scheduled_prefill_uses_shared_source_only_at_final_commit_and_retires_failed_
         if fail_final {
             assert!(session.committed_shared_prompt_input_identity().is_none());
             assert_eq!(session.report().unwrap().state_report(), &[1]);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), mock_reservation_bytes());
         } else {
             assert_eq!(
                 session
@@ -343,9 +350,9 @@ fn scheduled_prefill_uses_shared_source_only_at_final_commit_and_retires_failed_
                 &key
             );
             assert_eq!(session.report().unwrap().state_report(), &[2]);
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), bytes + 384);
         }
         drop((session, request));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

@@ -17,69 +17,143 @@ impl<'a> GroupCpuLayoutStorage<'a> {
         let (group, _, _, _) = self.source_parts();
         // SAFETY: retained actual native group; this query only reads source facts.
         let native = unsafe {
-            safemlx_sys::mlx_distributed_cpu_completion_layout_storage_controls(group.native.c_group)
+            safemlx_sys::mlx_distributed_cpu_completion_layout_storage_controls(
+                group.native.c_group,
+            )
         };
-        if native == usize::MAX { return None; }
-        let frames = [size_of::<GroupCpuCompletionLayoutStorage<'a>>(),
-            size_of::<std::result::Result<GroupCpuCompletionLayoutStorage<'a>, GroupStorageUnavailable>>(),
-            size_of::<(&Group, &[i32], crate::Dtype, crate::distributed::GroupWorkerOperation)>(),
-            size_of::<(u32, i32)>(), size_of::<OperationEvalTraversalLayout>(),
+        if native == usize::MAX {
+            return None;
+        }
+        let frames = [
+            size_of::<GroupCpuCompletionLayoutStorage<'a>>(),
+            size_of::<
+                std::result::Result<GroupCpuCompletionLayoutStorage<'a>, GroupStorageUnavailable>,
+            >(),
+            size_of::<(
+                &Group,
+                &[i32],
+                crate::Dtype,
+                crate::distributed::GroupWorkerOperation,
+            )>(),
+            size_of::<(u32, i32)>(),
+            size_of::<OperationEvalTraversalLayout>(),
             size_of::<OperationEvalTraversalLimits>(),
             size_of::<Option<OperationEvalTraversalLayout>>(),
-            size_of::<safemlx_sys::mlx_distributed_cpu_completion_storage>(),size_of::<bool>()];
-        frames.into_iter().try_fold(native.checked_add(size_of_val(&frames))?, usize::checked_add)
+            size_of::<safemlx_sys::mlx_distributed_cpu_completion_storage>(),
+            size_of::<bool>(),
+        ];
+        frames.into_iter().try_fold(
+            native.checked_add(size_of_val(&frames))?,
+            usize::checked_add,
+        )
     }
     /// Runs the ordinary single-operation completion census against the actual
     /// Group and immutable input equation. This creates no placeholder Array.
-    pub fn with_completion_layout(self)
-        -> std::result::Result<GroupCpuCompletionLayoutStorage<'a>, GroupStorageUnavailable>
-    {
+    pub fn with_completion_layout(
+        self,
+    ) -> std::result::Result<GroupCpuCompletionLayoutStorage<'a>, GroupStorageUnavailable> {
         let (group, shape, dtype, operation) = self.source_parts();
         let (code, peer) = operation.native();
         let mut native = safemlx_sys::mlx_distributed_cpu_completion_storage::default();
         // SAFETY: exact source loans and initialized output; native validates all
         // extents and scalar types before using the shared completion worker.
-        if !unsafe { safemlx_sys::mlx_distributed_query_cpu_completion_layout_storage(
-            &mut native, group.native.c_group, shape.as_ptr(), shape.len(), dtype.into(), code, peer)
-        } { return Err(GroupStorageUnavailable); }
+        if !unsafe {
+            safemlx_sys::mlx_distributed_query_cpu_completion_layout_storage(
+                &mut native,
+                group.native.c_group,
+                shape.as_ptr(),
+                shape.len(),
+                dtype.into(),
+                code,
+                peer,
+            )
+        } {
+            return Err(GroupStorageUnavailable);
+        }
         let n = native.traversal.limits;
         let traversal = OperationEvent::eval_traversal_layout(OperationEvalTraversalLimits {
-            roots:n.root_count,arrays:n.array_nodes,tape_entries:n.tape_entries,input_edges:n.input_edges,
-            output_slots:n.output_slots,streams:n.stream_count,captures:n.capture_slots,
-        }).ok_or(GroupStorageUnavailable)?;
-        Ok(GroupCpuCompletionLayoutStorage { operation:self, traversal, native })
+            roots: n.root_count,
+            arrays: n.array_nodes,
+            tape_entries: n.tape_entries,
+            input_edges: n.input_edges,
+            output_slots: n.output_slots,
+            streams: n.stream_count,
+            captures: n.capture_slots,
+        })
+        .ok_or(GroupStorageUnavailable)?;
+        Ok(GroupCpuCompletionLayoutStorage {
+            operation: self,
+            traversal,
+            native,
+        })
     }
 }
-fn matches(actual:&GroupCpuCompletionStorage<'_>, traversal:OperationEvalTraversalLayout,
-    native:&safemlx_sys::mlx_distributed_cpu_completion_storage) -> bool {
-    actual.traversal==traversal && actual.native.graph_allocation_extents==native.graph_allocation_extents
-        && actual.native.graph_capacity==native.graph_capacity
-        && actual.native.record_allocation_extents==native.record_allocation_extents
-        && actual.native.record_capacity==native.record_capacity
-        && actual.native.synchronizer_graph_extent==native.synchronizer_graph_extent
-        && actual.native.signal_graph_extent==native.signal_graph_extent
-        && actual.native.platform_events==native.platform_events
+fn matches(
+    actual: &GroupCpuCompletionStorage<'_>,
+    traversal: OperationEvalTraversalLayout,
+    native: &safemlx_sys::mlx_distributed_cpu_completion_storage,
+) -> bool {
+    actual.traversal == traversal
+        && actual.native.graph_allocation_extents == native.graph_allocation_extents
+        && actual.native.graph_capacity == native.graph_capacity
+        && actual.native.record_allocation_extents == native.record_allocation_extents
+        && actual.native.record_capacity == native.record_capacity
+        && actual.native.synchronizer_graph_extent == native.synchronizer_graph_extent
+        && actual.native.signal_graph_extent == native.signal_graph_extent
+        && actual.native.platform_events == native.platform_events
 }
 impl GroupCpuCompletionLayoutStorage<'_> {
+    /// Ordinary allocation sources and the retained one-root completion frontier.
+    pub fn ordinary_controls(&self) -> Option<crate::distributed::OrdinaryGroupControls> {
+        self.operation
+            .ordinary_controls()?
+            .completion(self.traversal.limits())
+    }
     /// Exact original constructor/Eval source used by this complete recipe.
-    pub fn operation(&self)->&GroupCpuLayoutStorage<'_> { &self.operation }
+    pub fn operation(&self) -> &GroupCpuLayoutStorage<'_> {
+        &self.operation
+    }
     /// Complete native Graph arena requirement; no arena is granted here.
-    pub fn graph_capacity(&self)->usize { self.native.graph_capacity }
+    pub fn graph_capacity(&self) -> usize {
+        self.native.graph_capacity
+    }
     /// Complete Record arena requirement for the same traversal.
-    pub fn record_capacity(&self)->usize { self.native.record_capacity }
+    pub fn record_capacity(&self) -> usize {
+        self.native.record_capacity
+    }
     /// Exact shared one-root traversal including its Synchronizer.
-    pub fn traversal(&self)->OperationEvalTraversalLayout { self.traversal }
+    pub fn traversal(&self) -> OperationEvalTraversalLayout {
+        self.traversal
+    }
+    /// Host controls of the corresponding actual input-bound completed worker.
+    /// The same helpers serve native construction after real source rebinding.
+    pub fn execution_control_bytes(&self) -> Option<usize> {
+        super::completed_control_bytes(
+            self.operation.input_completion_control_bytes()?,
+            self.traversal.query_control_bytes()?,
+            self.operation.execution_control_bytes()?,
+        )
+    }
     /// Shape destination, retained group handle and fixed owning transports.
-    pub fn ownership_control_bytes(&self)->Option<usize> {
-        let frames=[size_of::<Self>(),size_of::<OwnedGroupCpuCompletionLayoutStorage>(),
-            size_of::<std::result::Result<OwnedGroupCpuCompletionLayoutStorage,TryReserveError>>()];
-        frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)?
+    pub fn ownership_control_bytes(&self) -> Option<usize> {
+        let frames = [
+            size_of::<Self>(),
+            size_of::<OwnedGroupCpuCompletionLayoutStorage>(),
+            size_of::<std::result::Result<OwnedGroupCpuCompletionLayoutStorage, TryReserveError>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)?
             .checked_add(self.operation.ownership_control_bytes()?)
     }
     /// Retain the same group and completion facts in the paid shape destination.
-    pub fn try_into_owned(self)->std::result::Result<OwnedGroupCpuCompletionLayoutStorage,TryReserveError> {
+    pub fn try_into_owned(
+        self,
+    ) -> std::result::Result<OwnedGroupCpuCompletionLayoutStorage, TryReserveError> {
         Ok(OwnedGroupCpuCompletionLayoutStorage {
-            operation:self.operation.try_into_owned()?,traversal:self.traversal,native:self.native,
+            operation: self.operation.try_into_owned()?,
+            traversal: self.traversal,
+            native: self.native,
         })
     }
 }
@@ -92,41 +166,94 @@ pub struct OwnedGroupCpuCompletionLayoutStorage {
     native: safemlx_sys::mlx_distributed_cpu_completion_storage,
 }
 impl OwnedGroupCpuCompletionLayoutStorage {
+    /// Selected ordinary constructor, CPU worker and one-root completion.
+    pub fn ordinary_controls(&self) -> Option<crate::distributed::OrdinaryGroupControls> {
+        self.operation
+            .ordinary_controls()?
+            .completion(self.traversal.limits())
+    }
     /// Exact retained constructor/Eval source.
-    pub fn operation(&self)->&OwnedGroupCpuLayoutStorage { &self.operation }
+    pub fn operation(&self) -> &OwnedGroupCpuLayoutStorage {
+        &self.operation
+    }
     /// Complete native Graph requirement from the shared completion worker.
-    pub fn graph_capacity(&self)->usize { self.native.graph_capacity }
+    pub fn graph_capacity(&self) -> usize {
+        self.native.graph_capacity
+    }
     /// Complete Record requirement from that same worker.
-    pub fn record_capacity(&self)->usize { self.native.record_capacity }
+    pub fn record_capacity(&self) -> usize {
+        self.native.record_capacity
+    }
     /// Exact one-root completion traversal.
-    pub fn traversal(&self)->OperationEvalTraversalLayout { self.traversal }
+    pub fn traversal(&self) -> OperationEvalTraversalLayout {
+        self.traversal
+    }
+    /// Host controls of the same input-bound completed worker. This descriptive
+    /// owner borrows its exact retained layout; no input or authority is created.
+    pub fn execution_control_bytes(&self) -> Option<usize> {
+        GroupCpuCompletionLayoutStorage {
+            operation: self.operation.view(),
+            traversal: self.traversal,
+            native: self.native,
+        }
+        .execution_control_bytes()
+    }
     /// Fixed query and comparison transports before actual leaf rebinding.
-    pub fn binding_control_bytes(&self)->Option<usize> {
-        let view=self.operation.view();
-        let (group,_,_,_)=view.source_parts();
+    pub fn binding_control_bytes(&self) -> Option<usize> {
+        let view = self.operation.view();
+        let (group, _, _, _) = view.source_parts();
         // SAFETY: actual retained group selects a pure source-query population.
-        let native=unsafe{safemlx_sys::mlx_distributed_cpu_completion_storage_controls(group.native.c_group)};
-        if native==usize::MAX {return None;}
-        let frames=[size_of::<Self>(),size_of::<GroupCpuLayoutStorage<'_>>(),
-            size_of::<GroupCpuOperationStorage<'_>>(),size_of::<GroupCpuCompletionStorage<'_>>(),
-            size_of::<std::result::Result<GroupCpuCompletionStorage<'_>,GroupStorageUnavailable>>(),
-            size_of::<(&Self,&Group,&Array)>(),size_of::<OperationEvalTraversalLayout>(),
-            size_of::<OperationEvalTraversalLimits>(),size_of::<Option<OperationEvalTraversalLayout>>(),
+        let native = unsafe {
+            safemlx_sys::mlx_distributed_cpu_completion_storage_controls(group.native.c_group)
+        };
+        if native == usize::MAX {
+            return None;
+        }
+        let frames = [
+            size_of::<Self>(),
+            size_of::<GroupCpuLayoutStorage<'_>>(),
+            size_of::<GroupCpuOperationStorage<'_>>(),
+            size_of::<GroupCpuCompletionStorage<'_>>(),
+            size_of::<std::result::Result<GroupCpuCompletionStorage<'_>, GroupStorageUnavailable>>(
+            ),
+            size_of::<(&Self, &Group, &Array)>(),
+            size_of::<OperationEvalTraversalLayout>(),
+            size_of::<OperationEvalTraversalLimits>(),
+            size_of::<Option<OperationEvalTraversalLayout>>(),
             size_of::<safemlx_sys::mlx_distributed_cpu_completion_storage>(),
-            size_of::<(&GroupCpuCompletionStorage<'_>,OperationEvalTraversalLayout,
-                &safemlx_sys::mlx_distributed_cpu_completion_storage)>(),size_of::<bool>()];
-        frames.into_iter().try_fold(native.checked_add(size_of_val(&frames))?,usize::checked_add)?
+            size_of::<(
+                &GroupCpuCompletionStorage<'_>,
+                OperationEvalTraversalLayout,
+                &safemlx_sys::mlx_distributed_cpu_completion_storage,
+            )>(),
+            size_of::<bool>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(
+                native.checked_add(size_of_val(&frames))?,
+                usize::checked_add,
+            )?
             .checked_add(self.operation.binding_control_bytes()?)?
             .checked_add(self.operation.execution_control_bytes()?)
     }
     /// Bind the actual selected group wrapper and detached input. The group must
     /// retain this exact native incarnation; the completed-source worker then
     /// recomputes every constructor/Eval and completion population before use.
-    pub fn bind_actual_in_group<'a>(&'a self,group:&'a Group,input:&'a Array)
-        ->std::result::Result<GroupCpuCompletionStorage<'a>,GroupStorageUnavailable> {
-        let operation=self.operation.view_with_group(group)?.bind_actual(input).map_err(|_|GroupStorageUnavailable)?;
-        let actual=operation.with_completion_storage()?;
-        if !matches(&actual,self.traversal,&self.native) {return Err(GroupStorageUnavailable);}
+    pub fn bind_actual_in_group<'a>(
+        &'a self,
+        group: &'a Group,
+        input: &'a Array,
+    ) -> std::result::Result<GroupCpuCompletionStorage<'a>, GroupStorageUnavailable> {
+        let operation = self
+            .operation
+            .view_with_group(group)?
+            .bind_actual(input)
+            .map_err(|_| GroupStorageUnavailable)?;
+        let actual = operation.with_completion_storage()?;
+        if !matches(&actual, self.traversal, &self.native) {
+            return Err(GroupStorageUnavailable);
+        }
         Ok(actual)
     }
 }

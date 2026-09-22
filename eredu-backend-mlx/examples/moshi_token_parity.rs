@@ -105,7 +105,7 @@ fn insert_tokens(
     let value = MlxTensor::from_array(value.clone());
     observations.insert(
         path,
-        ObservationValue::Tensor(observe_i32_tensor(&value, stream)?),
+        ObservationValue::Tensor((observe_i32_tensor(&value, stream)?).into()),
     )?;
     Ok(())
 }

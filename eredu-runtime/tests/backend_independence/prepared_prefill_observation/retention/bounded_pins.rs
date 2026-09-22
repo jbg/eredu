@@ -15,8 +15,7 @@ use std::{
 #[derive(Debug)]
 struct Probe {
     panic_after: std::sync::atomic::AtomicUsize,
-    checker:
-        std::sync::Weak<std::sync::OnceLock<(WorkingMemoryPool, BoundedRegisteredStorage<Key>)>>,
+    checker: std::sync::Weak<std::sync::OnceLock<(MemoryLedger, BoundedRegisteredStorage<Key>)>>,
     drop_checks: std::sync::atomic::AtomicUsize,
     drop_saw_busy: AtomicBool,
 }
@@ -111,8 +110,9 @@ struct Contention {
     key: HoldKey,
     entered: std::sync::mpsc::Receiver<()>,
     release: std::sync::mpsc::Sender<()>,
+    publication: std::sync::Mutex<Option<PreparedStoragePublication<HoldKey>>>,
 }
-fn contention() -> Contention {
+fn contention(pool: &MemoryLedger) -> Contention {
     let (etx, erx) = std::sync::mpsc::channel();
     let (rtx, rrx) = std::sync::mpsc::channel();
     Contention {
@@ -123,11 +123,34 @@ fn contention() -> Contention {
         })),
         entered: erx,
         release: rtx,
+        publication: std::sync::Mutex::new(Some(
+            StoragePublicationLayout::new(1)
+                .unwrap()
+                .fund(pool)
+                .unwrap(),
+        )),
     }
 }
 #[derive(Debug)]
 struct Facts;
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory::topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+
     fn operation_bound(
         &self,
         op: &WorkspaceOperation,
@@ -197,14 +220,19 @@ fn source(g: InferenceGeometry) -> SharedCapturePlan {
     )
 }
 fn quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &SharedCapturePlan,
     root: &Key,
     g: InferenceGeometry,
     slots: usize,
 ) -> IncrementalInferenceQuote {
     let context = WorkspaceContext::new(Facts);
-    let backing = WorkspaceExistingStorage::new(Some(64), &context);
+    let backing = WorkspaceExistingStorage::try_new_placed(
+        Some(64),
+        crate::memory::placement_ref(),
+        &context,
+    )
+    .unwrap();
     let tensor = WorkspaceTensor::existing_with_storage(
         WorkspaceLayout::new(&[1], WorkspaceDtype::Float32).unwrap(),
         &backing,
@@ -222,7 +250,8 @@ fn quote(
         .unwrap()
         .initialization_peak_bytes();
     let b = |n| WorkspaceBound::bounded(n, "actual scalar retention fixture enclosing owner");
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: b(384),
         attention: b(0),
@@ -230,7 +259,7 @@ fn quote(
         state_update: b(0),
         materialization: b(0),
         retained: b(h),
-    };
+    });
     let q = ResidualInferenceQuote::compose(
         &report,
         mock_inference_admission(g).state,
@@ -279,7 +308,7 @@ struct Backend {
     mode: Mode,
     retired: usize,
     contention: Option<Contention>,
-    drop_checker: Arc<std::sync::OnceLock<(WorkingMemoryPool, BoundedRegisteredStorage<Key>)>>,
+    drop_checker: Arc<std::sync::OnceLock<(MemoryLedger, BoundedRegisteredStorage<Key>)>>,
     opening_mode: Option<OpeningMode>,
     opening_failure_identity: Arc<()>,
     opening_pending: Option<BoundedRegisteredStorage<Key>>,
@@ -311,7 +340,11 @@ impl ScheduledCaptureBackend for Backend {
         }
         let mut attempt = match self.slots.begin(context, scope, segment) {
             Ok(value) => value,
-            Err(error) => return Err(FundedCaptureError::Backend(Error::backend_retained_source(error))),
+            Err(error) => {
+                return Err(FundedCaptureError::Backend(Error::backend_retained_source(
+                    error,
+                )))
+            }
         };
         let empty_probe = self.mode == Mode::RegistryPanic && context.chunk().input.start == 0;
         if self.mode != Mode::Empty && !empty_probe {
@@ -355,9 +388,10 @@ impl ScheduledCaptureBackend for Backend {
             .map(|c| {
                 c.key.0.armed.store(true, AtomicOrdering::SeqCst);
                 let key = c.key.clone();
-                let pool = scope.pool().clone();
-                let worker =
-                    std::thread::spawn(move || pool.pin_registered_storage([(key, 1)]).unwrap());
+                let prepared = c.publication.lock().unwrap().take().unwrap();
+                let worker = std::thread::spawn(move || {
+                    prepared.pin_registered_storage([(key, 1)]).unwrap()
+                });
                 c.entered
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
@@ -373,11 +407,11 @@ impl ScheduledCaptureBackend for Backend {
                 group.validate_source(scope.pool()).unwrap();
                 assert_eq!(
                     group.bytes(),
-                    if self.mode == Mode::Empty || empty_probe {
+                    Some(if self.mode == Mode::Empty || empty_probe {
                         0
                     } else {
                         96
-                    }
+                    })
                 );
                 if empty_probe {
                     self.drop_checker
@@ -509,32 +543,55 @@ fn exercise_pins_retirement(
     let paths = runtime.prepare_observation_paths().unwrap();
     let selected = paths.source().prepare_capture_selection(&source).unwrap();
     let bound = selected.bind_geometry(g).unwrap();
-    let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
+    let pool = crate::memory::host_ledger(4_000_000, 0).unwrap();
     let mut keys = vec![key(1, 64), key(2, 32), key(3, 0)];
     let drop_checker = Arc::new(std::sync::OnceLock::new());
     if mode == Mode::RegistryPanic {
         Arc::get_mut(&mut keys[0].probe).unwrap().checker = Arc::downgrade(&drop_checker);
     }
     let contention =
-        (mode == Mode::Busy || opening_mode == Some(OpeningMode::Busy)).then(contention);
+        (mode == Mode::Busy || opening_mode == Some(OpeningMode::Busy)).then(|| contention(&pool));
     let hold_registration = contention
         .as_ref()
-        .map(|c| pool.register_storage([(c.key.clone(), 1)]).unwrap());
+        .map(|c| pool.register_host_storage([(c.key.clone(), 1)]).unwrap());
     let weak_payload = Arc::downgrade(&keys[0].payload);
     let root = pool
-        .register_storage([(keys[0].clone(), 64), (keys[2].clone(), 0)])
+        .register_host_storage([(keys[0].clone(), 64), (keys[2].clone(), 0)])
         .unwrap();
+    let mut origin_admission = mock_inference_admission(g);
+    let publication_controls = MemoryLedger::storage_metadata_control_bytes().unwrap()
+        + StoragePublicationLayout::<Key>::new(1)
+            .unwrap()
+            .requested_bytes();
+    origin_admission
+        .state
+        .execution_workspace
+        .as_mut()
+        .unwrap()
+        .physical_domains
+        .as_mut()
+        .unwrap()
+        .retained
+        .add_allocation(publication_controls, pool.host_placement())
+        .unwrap();
+    origin_admission
+        .state
+        .execution_workspace
+        .as_mut()
+        .unwrap()
+        .retained = eredu_core::WorkspaceBound::bounded(
+        64 + publication_controls,
+        "publication descriptors and owner controls",
+    );
+    origin_admission.incremental_required_bytes = Some(384 + publication_controls);
     let (origin_r, origin_run) = pool
-        .reserve(
-            session.inference_execution_identity(),
-            &mock_inference_admission(g),
-        )
+        .reserve(session.inference_execution_identity(), &origin_admission)
         .unwrap()
         .into_funding()
         .unwrap();
     let origin = origin_run.scope().unwrap();
     let second = origin
-        .adopt_storage_individually([(keys[1].clone(), 32)])
+        .adopt_host_storage_individually([(keys[1].clone(), 32)])
         .unwrap();
     let quote_source = if mode == Mode::OtherSource {
         SharedCapturePlan::new(source.admission().clone())
@@ -548,7 +605,7 @@ fn exercise_pins_retirement(
         g,
         if mode == Mode::Empty { 0 } else { 4 },
     );
-    let exact = pool.used_bytes().unwrap() + q.incremental_bytes();
+    let exact = pool.live_charge_bytes().unwrap() + incremental_reservation_bytes(&pool, &q);
     let caps = ModelCapabilities {
         effective_model_type: "ordinary-text-fixture".into(),
         native_max_context: Observed::exact(128, "fixture"),
@@ -561,17 +618,16 @@ fn exercise_pins_retirement(
         input: InputTokenCount::text(rows),
         max_output_tokens: 1,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
     };
     assert!(plan_prefill_incremental_with_capacity(
         session.inference_execution_identity(),
         &pool,
         &caps,
-        request_shape,
+        request_shape.clone(),
         g,
-        exact - 1,
+        crate::memory::resolved_limits(exact - 1),
         |_| Ok(q.clone())
     )
     .is_err());
@@ -579,9 +635,9 @@ fn exercise_pins_retirement(
         session.inference_execution_identity(),
         &pool,
         &caps,
-        request_shape,
+        request_shape.clone(),
         g,
-        exact,
+        crate::memory::resolved_limits(exact),
         |_| Ok(q.clone()),
     )
     .unwrap();
@@ -656,11 +712,11 @@ fn exercise_pins_retirement(
             backend.opening_pending.is_some(),
             "caller owner survives provider panic"
         );
-        assert_eq!(backend.opening_pending.as_ref().unwrap().bytes(), 96);
+        assert_eq!(backend.opening_pending.as_ref().unwrap().bytes(), Some(96));
         assert_eq!(backend.slots.spent_rows(), 1);
         assert_eq!(backend.retired, 0);
         assert!(matches!(
-            pool.used_bytes(),
+            pool.payload_used_bytes(),
             Err(WorkingMemoryError::Poisoned)
         ));
         INFERENCE_SCOPE_TRACE.with(|s| *s.borrow_mut() = InferenceScopeTrace::default());
@@ -670,7 +726,7 @@ fn exercise_pins_retirement(
         assert!(result.is_err());
         assert_eq!(backend.slots.spent_rows(), 2);
         assert!(matches!(
-            pool.used_bytes(),
+            pool.payload_used_bytes(),
             Err(WorkingMemoryError::Poisoned)
         ));
         assert!(
@@ -762,7 +818,7 @@ fn exercise_pins_retirement(
         assert_eq!(backend.slots.spent_rows(), 1);
         // The comparison is during bounded dedup before Usage, so the pool
         // remains usable and no registered owner was incremented.
-        assert!(pool.used_bytes().is_ok());
+        assert!(pool.payload_used_bytes().is_ok());
     } else if matches!(
         mode,
         Mode::Missing
@@ -835,11 +891,13 @@ fn exercise_pins_retirement(
     ));
     if mode == Mode::LateHealth || quarantine {
         assert!(
-            pool.used_bytes().unwrap() > 0,
+            pool.payload_used_bytes().unwrap() > 0,
             "original source account remains quarantined"
         );
     } else if !aliases.is_empty() {
-        assert!(pool.used_bytes().unwrap() >= pqs + if mode == Mode::Empty { 0 } else { 96 });
+        assert!(
+            pool.payload_used_bytes().unwrap() >= pqs + if mode == Mode::Empty { 0 } else { 96 }
+        );
         if mode != Mode::Empty {
             let payload = weak_payload
                 .upgrade()
@@ -849,10 +907,13 @@ fn exercise_pins_retirement(
         for alias in &aliases {
             alias.validate_source(&pool).unwrap();
         }
-        assert_eq!(aliases[0].bytes(), if mode == Mode::Empty { 0 } else { 96 });
+        assert_eq!(
+            aliases[0].bytes(),
+            Some(if mode == Mode::Empty { 0 } else { 96 })
+        );
     } else if failed.is_some() {
         assert!(
-            pool.used_bytes().unwrap() >= pqs,
+            pool.payload_used_bytes().unwrap() >= pqs,
             "terminal failure owns the actual controls"
         );
     }
@@ -867,7 +928,7 @@ fn exercise_pins_retirement(
             &pool,
             pqs + if mode == Mode::Empty { 0 } else { 96 },
         );
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert!(weak_payload.upgrade().is_none());
         return;
     }
@@ -877,11 +938,11 @@ fn exercise_pins_retirement(
             .upgrade()
             .expect("parcel alone retains original physical source");
         assert_eq!(&*payload, &[1u8; 64]);
-        let held = pool.used_bytes().unwrap();
+        let held = pool.payload_used_bytes().unwrap();
         assert!(held >= pqs + 96);
         // A real independent payload alias retires before the final pin parcel.
         drop(payload);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
     }
     drop(parcels);
     if matches!(
@@ -892,10 +953,10 @@ fn exercise_pins_retirement(
             weak_payload.upgrade().is_some(),
             "quarantine owns installed group after all caller aliases drop"
         );
-        assert!(pool.used_bytes().unwrap() >= pqs + 96);
+        assert!(pool.payload_used_bytes().unwrap() >= pqs + 96);
     }
     if mode != Mode::LateHealth && !quarantine {
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert!(weak_payload.upgrade().is_none());
     }
 }

@@ -1,8 +1,7 @@
 //! Fresh prediction-lane state from the actual loaded extension and source H.
+use super::original_copy::{copy_erased, CopyErased, OriginalPredictionCopyContext};
 use super::{MlxEmbeddedPredictionMaterializer, OwnedPredictionCache};
-use super::original_copy::{OriginalPredictionCopyContext, CopyErased, copy_erased};
 use crate::backend::{
-    OriginalCopyEnvironment, OriginalCopyEnvironmentError, PreparedOriginalCopyEnvironmentError,
     error::Error,
     managed_memory::NativeMemoryRetention,
     nn::{shared::MlxNeuralBackend, workspace::MlxMetalWorkspaceMechanisms},
@@ -10,11 +9,12 @@ use crate::backend::{
         copy_original_pooling,
         kv::CompressedLatentCache,
         state::{
-            MlxHybridState, MlxPoolingAttentionCache, OriginalResidentState,
-            PreparedPoolingAttentionCopy, PreparedResidentDecoderCopy,
-            ResidentDecoderPreparationError, copy_original_resident_state,
+            copy_original_resident_state, MlxHybridState, MlxPoolingAttentionCache,
+            OriginalResidentState, PreparedPoolingAttentionCopy, PreparedResidentDecoderCopy,
+            ResidentDecoderPreparationError,
         },
     },
+    OriginalCopyEnvironment, OriginalCopyEnvironmentError, PreparedOriginalCopyEnvironmentError,
 };
 use eredu_architectures::prediction_extension::{
     MaterializedPredictionExecutor, PredictionExtensionMaterializer, PredictionStateStartupFactory,
@@ -22,11 +22,11 @@ use eredu_architectures::prediction_extension::{
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
-    SelectedSpeculativeRealization, SpeculativeStrategyClass,
     replicated_session::{PreparedControlBindingError, ReplicatedTextControlOrigin},
     working_memory::{PreparedSemanticSource, WorkingMemoryError},
+    SelectedSpeculativeRealization, SpeculativeStrategyClass,
 };
-use safemlx::{PrefillRootsRuntime, Stream, StreamCopyCause, StreamCopyPlan, StreamCopyError};
+use safemlx::{PrefillRootsRuntime, Stream, StreamCopyCause, StreamCopyError, StreamCopyPlan};
 use std::{
     any::Any,
     collections::TryReserveError,
@@ -158,10 +158,16 @@ impl<'a> OriginalPredictionStartupContext<'a> {
             .try_fold(size_of_val(&frames), usize::checked_add)
     }
     pub(crate) fn copy_error_control_bytes() -> Option<usize> {
-        let parts = [size_of::<StartupCause>(), size_of::<Failure>(),
-            size_of::<Error>(), size_of::<HostMetadataFunding>(),
-            BackendFailure::source_retention_peak_bytes::<Failure>()?];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        let parts = [
+            size_of::<StartupCause>(),
+            size_of::<Failure>(),
+            size_of::<Error>(),
+            size_of::<HostMetadataFunding>(),
+            BackendFailure::source_retention_peak_bytes::<Failure>()?,
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Caller has already paid control_bytes and authenticated this header/source.
@@ -179,10 +185,7 @@ impl<'a> OriginalPredictionStartupContext<'a> {
             host: HostPreparationAuthority::retain(preparation.metadata_funding().clone()),
         }
     }
-    pub(crate) fn failure(
-        preparation: &PreparedSemanticSource,
-        cause: StartupCause,
-    ) -> Error {
+    pub(crate) fn failure(preparation: &PreparedSemanticSource, cause: StartupCause) -> Error {
         Error::StorageSource(BackendFailure::from_error(Failure {
             cause,
             _funding: preparation.metadata_funding().clone(),
@@ -256,12 +259,22 @@ impl<'a> OriginalPredictionStartupContext<'a> {
             size_of::<&SelectedSpeculativeRealization>(),
         ];
         self.reserve(frames.into_iter().try_fold(size_of_val(&frames), add)?)?;
-        let shape = extension.occurrence_shape().ok_or_else(|| memory(WorkingMemoryError::UnknownBound))?;
+        let shape = extension
+            .occurrence_shape()
+            .ok_or_else(|| memory(WorkingMemoryError::UnknownBound))?;
         let alignment = extension.prefill_alignment();
-        let copy = OriginalPredictionCopyContext::prepare(self.environment, &self.initialized,
-            self.mechanisms, self.preparation, &origin, &self.host)?;
+        let copy = OriginalPredictionCopyContext::prepare(
+            self.environment,
+            &self.initialized,
+            self.mechanisms,
+            self.preparation,
+            &origin,
+            &self.host,
+        )?;
         let mut prepared = extension.prepare_new_state(self)?;
-        let initial_frontier = extension.prefill_frontier(&mut prepared.value).map_err(Error::from)?;
+        let initial_frontier = extension
+            .prefill_frontier(&mut prepared.value)
+            .map_err(Error::from)?;
         Ok(OriginalPredictionLane {
             state: Box::new(prepared.value),
             origin,
@@ -269,7 +282,11 @@ impl<'a> OriginalPredictionStartupContext<'a> {
             class: strategy.class(),
             proposal_capacity: strategy.proposal_capacity().get(),
             preparation: self.preparation.clone(),
-            shape, alignment, initial_frontier, copy, copy_erased: copy_erased::<A, P>,
+            shape,
+            alignment,
+            initial_frontier,
+            copy,
+            copy_erased: copy_erased::<A, P>,
             _host: prepared.host,
         })
     }
@@ -338,7 +355,7 @@ impl PredictionStateStartupFactory<MlxNeuralBackend, MlxEmbeddedPredictionMateri
                 &self.initialized,
                 self.mechanisms,
                 self.preparation.metadata_funding(),
-                self.preparation.capacity_bytes(),
+                self.preparation.limits(),
             )?
             .into_parts();
             rows.value.push(OwnedPredictionCache::new(
@@ -376,7 +393,7 @@ impl PredictionStateStartupFactory<MlxNeuralBackend, MlxEmbeddedPredictionMateri
             self.mechanisms,
             self.preparation.metadata_funding(),
             &self.host,
-            self.preparation.capacity_bytes(),
+            self.preparation.limits(),
         )?;
         let OriginalResidentState::Hybrid(value) = copied else {
             return Err(memory(WorkingMemoryError::IdentityMismatch));

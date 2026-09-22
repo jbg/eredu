@@ -1,17 +1,19 @@
 //! Native tool calling through the public semantic API.
 //!
 //! Run with a target checkpoint and, optionally, an external Gemma 4 assistant:
-//! `cargo run -p eredu --example native_tool_calling -- TARGET CAPACITY_BYTES [DRAFTER]`.
+//! `cargo run -p eredu --example native_tool_calling -- TARGET MEMORY_LIMITS [DRAFTER]`.
 
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use eredu_backend_mlx::MlxBackendFactory;
 use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings,
-        PreparedChatRequest, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeRequest, TokenizerSourceInput, default_local_device,
-        local_device_plan,
+        default_local_device, local_device_plan, ChatSourceInput, LoadedModel, LocalDevice,
+        PreparedChatGenerationSettings, PreparedChatRequest,
+        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeRequest,
+        TokenizerSourceInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
 };
@@ -25,8 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     let target_path = arguments
         .next()
-        .ok_or("usage: native_tool_calling TARGET CAPACITY_BYTES [DRAFTER]")?;
-    let capacity: u64 = arguments.next().ok_or("missing CAPACITY_BYTES")?.parse()?;
+        .ok_or("usage: native_tool_calling TARGET MEMORY_LIMITS [DRAFTER]")?;
+    let capacity = physical_memory::parse(&arguments.next().ok_or("missing MEMORY_LIMITS")?)?;
     let drafter_path = arguments.next();
 
     let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
@@ -81,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 add_generation_prompt: true,
                 ..ChatTemplateRequest::default()
             },
-            capacity,
+            &capacity,
             &cancellation,
         )?
         .ok_or("cancelled before chat preparation")?;
@@ -104,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: capacity.clone(),
             ..Default::default()
         },
         ..PreparedChatGenerationSettings::default()
@@ -142,7 +144,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .finish_reason()
     } else {
         model
-            .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)?
+            .start_prepared_chat(
+                PreparedChatRequest::new(&prepared, settings.clone()),
+                &cancellation,
+            )?
             .ok_or("cancelled before generation")?
             .run(&cancellation, &mut |event| events.push(event))?
             .finish_reason

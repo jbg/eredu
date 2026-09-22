@@ -1,6 +1,6 @@
 //! Existing immutable Host allocation aliases, without source or birth authority.
 use super::{OriginalBufferCause, OriginalBufferError, PreparedAllocationOwner};
-use crate::{AllocationInfo, Array, utils::runtime_lock};
+use crate::{utils::runtime_lock, AllocationInfo, Array};
 use std::{
     fmt,
     mem::{size_of, size_of_val},
@@ -21,13 +21,14 @@ impl fmt::Debug for HostTransferArrayAliasWitness<'_> {
     }
 }
 impl HostTransferArrayAliasWitness<'_> {
-    /// Actual full capacity and opaque identity in the Host-transfer namespace.
+    /// Actual full capacity and opaque identity of the shared native backing.
     pub fn allocation(&self) -> AllocationInfo {
         AllocationInfo::from_native(
             self.facts.backing.identity,
             self.facts.backing.charged_bytes,
-            true,
+            self.facts.backing.placement,
         )
+        .with_host_controls(self.facts.backing.host_control_bytes)
     }
     /// Positive provenance shared with the immutable Host buffer witness.
     pub fn is_prepared_source(&self) -> bool {
@@ -74,9 +75,15 @@ impl Array {
             runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
         let mut source = safemlx_sys::mlx_immutable_host_transfer_info {
             backing: safemlx_sys::mlx_original_buffer_info {
+                host_control_bytes: 0,
                 known: false,
                 identity: 0,
                 charged_bytes: 0,
+                placement: safemlx_sys::mlx_memory_placement {
+                    kind: 0,
+                    device: -1,
+                    device_count: 0,
+                },
             },
             prepared_source: false,
         };
@@ -146,9 +153,15 @@ impl Array {
             runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
         let mut facts = safemlx_sys::mlx_host_transfer_view_info {
             backing: safemlx_sys::mlx_original_buffer_info {
+                host_control_bytes: 0,
                 known: false,
                 identity: 0,
                 charged_bytes: 0,
+                placement: safemlx_sys::mlx_memory_placement {
+                    kind: 0,
+                    device: -1,
+                    device_count: 0,
+                },
             },
             view_identity: 0,
         };

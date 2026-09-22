@@ -174,6 +174,22 @@ unsafe extern "C" {
         source: mlx_array,
     ) -> u32;
     pub fn mlx_array_clone_storage_control_bytes() -> usize;
+    pub fn mlx_array_clone_storage_arena_capacity(capacity: *mut usize) -> u32;
+    pub fn mlx_array_clone_storage_new_in(
+        storage: *mut *mut ::std::os::raw::c_void,
+        quota: mlx_submission_graph_quota,
+    ) -> u32;
+    pub fn mlx_array_clone_storage_free_in(
+        storage: *mut ::std::os::raw::c_void,
+        quota: mlx_submission_graph_quota,
+    );
+    pub fn mlx_array_clone_storage_fill_in(
+        output: *mut mlx_array,
+        storage: *mut *mut ::std::os::raw::c_void,
+        source: mlx_array,
+        quota: mlx_submission_graph_quota,
+    ) -> u32;
+    pub fn mlx_array_clone_storage_arena_control_bytes() -> usize;
 }
 extern "C" {
     #[doc = " Set array to a bool scalar."]
@@ -233,6 +249,31 @@ extern "C" {
     pub fn mlx_array_nbytes(arr: mlx_array) -> usize;
 }
 #[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct mlx_memory_placement {
+    pub kind: u32,
+    pub device: i32,
+    pub device_count: u32,
+}
+pub type mlx_physical_backing_publish = Option<unsafe extern "C" fn(
+    *mut ::std::ffi::c_void, *mut *mut ::std::ffi::c_void,
+    *mut Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>) -> bool>;
+extern "C" {
+    pub fn mlx_default_memory_placement(out: *mut mlx_memory_placement) -> i32;
+    pub fn mlx_gpu_allocation_placement(out: *mut mlx_memory_placement) -> i32;
+    pub fn mlx_error_physical_backing_failure() -> *mut ::std::ffi::c_void;
+    pub fn mlx_physical_backing_control_bytes() -> usize;
+    pub fn mlx_physical_backing_static_bytes() -> usize;
+    pub fn mlx_observe_physical_backings(context: *mut ::std::ffi::c_void,
+        observer: Option<unsafe extern "C" fn(*mut ::std::ffi::c_void, u64, usize, usize,
+            mlx_memory_placement, *mut *mut ::std::ffi::c_void,
+            *mut Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>,
+            *mut mlx_physical_backing_publish) -> bool>) -> i32;
+    pub fn mlx_memory_device_count(count: *mut ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+    pub fn mlx_memory_device_shares_host(shared: *mut bool, device: i32) -> i32;
+    pub fn mlx_prepared_input_leaf_placement(out: *mut mlx_memory_placement, value: mlx_prepared_input_leaf) -> i32;
+}
+#[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct mlx_array_descriptor_ {
     pub descriptor: usize,
@@ -249,6 +290,8 @@ pub struct mlx_array_descriptor_ {
     pub host_transfer: bool,
     pub identity: u64,
     pub allocation_bytes: usize,
+    pub placement: mlx_memory_placement,
+    pub host_control_bytes: usize,
 }
 pub type mlx_array_descriptor = mlx_array_descriptor_;
 extern "C" {
@@ -1943,6 +1986,20 @@ extern "C" {
         nbytes: usize,
         policy: mlx_host_transfer_policy,
     ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_ordinary_host_buffer_capacity(
+        capacity: *mut usize,
+        placement: *mut mlx_memory_placement,
+        runtime: mlx_prepared_input_runtime,
+        bytes: usize,
+    ) -> ::std::os::raw::c_uint;
+    pub fn mlx_ordinary_host_buffer_observed_controls(out: *mut usize, runtime: mlx_prepared_input_runtime, rank: usize) -> bool;
+    pub fn mlx_ordinary_host_buffer_wrapper_controls(rank: usize) -> usize;
+    pub fn mlx_ordinary_host_copy_wrapper_controls() -> usize;
+    pub fn mlx_ordinary_array_to_host_wrapper_controls() -> usize;
+    pub fn mlx_ordinary_event_wrapper_controls() -> usize;
+    pub fn mlx_ordinary_stream_clone_wrapper_controls() -> usize;
 }
 extern "C" {
     #[doc = " Allocate an uninitialized typed host transfer buffer."]
@@ -5124,6 +5181,7 @@ extern "C" {
         payload: *mut ::std::os::raw::c_void,
         release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
     ) -> ::std::os::raw::c_int;
+    pub fn mlx_host_transfer_buffer_prepared_owner_control_bytes() -> usize;
     pub fn mlx_host_transfer_buffer_attach_prepared_allocation_owner(
         outcome: *mut ::std::os::raw::c_int,
         buffer: mlx_host_transfer_buffer,
@@ -5247,6 +5305,7 @@ pub struct mlx_prepared_input_runtime {
     pub maximum: usize,
     pub storage_kind: ::std::os::raw::c_uint,
     pub controls: usize,
+    pub placement: mlx_memory_placement,
 }
 
 pub const MLX_ORIGINAL_BUFFER_OK: u32 = 0;
@@ -5287,6 +5346,8 @@ pub struct mlx_original_buffer_info {
     pub known: bool,
     pub identity: u64,
     pub charged_bytes: usize,
+    pub placement: mlx_memory_placement,
+    pub host_control_bytes: usize,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -5359,9 +5420,12 @@ extern "C" {
         capacity: usize,
         owner: *mut ::std::os::raw::c_void,
         retire: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
+        closed_occupancy: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void, usize)>,
     ) -> u32;
     pub fn mlx_original_buffer_budget_retain(value: mlx_original_buffer_budget);
     pub fn mlx_original_buffer_budget_release(value: mlx_original_buffer_budget);
+    pub fn mlx_original_buffer_inspection_retain(value: mlx_original_buffer_budget);
+    pub fn mlx_original_buffer_inspection_release(value: mlx_original_buffer_budget);
     pub fn mlx_original_buffer_budget_capacity(value: mlx_original_buffer_budget) -> usize;
     pub fn mlx_original_buffer_budget_occupied(value: mlx_original_buffer_budget) -> usize;
     pub fn mlx_original_buffer_budget_bind(
@@ -7295,6 +7359,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn mlx_operation_event_cpu_tiled_matmul_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         rank: usize, m: usize, n: usize, k: usize, batches: usize, tracer: bool) -> bool;
+    pub fn mlx_operation_event_cpu_tiled_addmm_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
+        rank: usize, m: usize, n: usize, k: usize, batches: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_tiled_matmul_copy_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         rank: usize, m: usize, n: usize, k: usize, batches: usize, copies: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_bf16_matmul_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
@@ -7311,6 +7377,8 @@ unsafe extern "C" {
     pub fn mlx_operation_event_cpu_scatter_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         source: mlx_dtype, index: mlx_dtype, rank: usize, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_scatter_add_rows_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
+        index: mlx_dtype, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
+    pub fn mlx_operation_event_cpu_int32_histogram_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         index: mlx_dtype, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_scatter_axis_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         index: mlx_dtype, rank: usize, output_elements: usize, update_elements: usize, tracer: bool) -> bool;
@@ -7335,6 +7403,8 @@ unsafe extern "C" {
     pub fn mlx_operation_event_cpu_concatenate_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         dtype: mlx_dtype, rank: usize, left_elements: usize, right_elements: usize, tracer: bool) -> bool;
     pub fn mlx_operation_event_cpu_rms_fallback_control_bytes(out: *mut usize,
+        dtype: mlx_dtype, rank: usize, width: usize, rows: usize) -> bool;
+    pub fn mlx_operation_event_cpu_layer_norm_fallback_control_bytes(out: *mut usize,
         dtype: mlx_dtype, rank: usize, width: usize, rows: usize) -> bool;
     pub fn mlx_operation_event_cpu_select_broadcast_eval_layout(out: *mut mlx_cpu_copy_eval_layout,
         rank: usize, elements: usize, tracer: bool) -> bool;
@@ -7495,4 +7565,107 @@ unsafe extern "C" {
     pub fn mlx_operation_event_cpu_mxfp4_quantize_payload_layout(
         out: *mut mlx_cpu_mxfp4_quantize_payload_layout, dtype: mlx_dtype,
         rows: usize, columns: usize) -> bool;
+}
+
+extern "C" {
+    pub fn mlx_array_copy_completed_data(arr: mlx_array, destination: *mut ::std::os::raw::c_void, bytes: usize) -> ::std::os::raw::c_int;
+    pub fn mlx_array_completed_readback_control_bytes() -> usize;
+    pub fn _mlx_array_is_available(ready: *mut bool, arr: mlx_array) -> ::std::os::raw::c_int;
+    pub fn mlx_array_availability_control_bytes() -> usize;
+}
+
+extern "C" {
+    pub fn mlx_array_copy_completed_element(arr: mlx_array, index: usize, destination: *mut ::std::os::raw::c_void, bytes: usize) -> ::std::os::raw::c_int;
+}
+
+unsafe extern "C" {
+    pub fn mlx_operation_event_cpu_depthwise_convolution_eval_layout(
+        out: *mut mlx_cpu_copy_eval_layout,
+        dtype: mlx_dtype,
+        tracer: bool,
+    ) -> bool;
+    pub fn mlx_operation_event_cpu_constant_pad_eval_layout(
+        out: *mut mlx_cpu_copy_eval_layout,
+        rank: usize,
+        elements: usize,
+        input_elements: usize,
+        tracer: bool,
+    ) -> bool;
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_scoped_physical_observer {
+    pub ctx: *mut ::std::os::raw::c_void,
+}
+unsafe extern "C" {
+    pub fn mlx_submission_scope_physical_observer_control_bytes() -> usize;
+    pub fn mlx_scoped_physical_observer_new(
+        out: *mut mlx_scoped_physical_observer,
+        context: *mut ::std::os::raw::c_void,
+        callback: Option<unsafe extern "C" fn(*mut ::std::ffi::c_void, u64, usize, usize,
+            mlx_memory_placement, *mut *mut ::std::ffi::c_void,
+            *mut Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>,
+            *mut mlx_physical_backing_publish) -> bool>,
+        release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_scoped_physical_observer_new_uncached(
+        out: *mut mlx_scoped_physical_observer,
+        context: *mut ::std::os::raw::c_void,
+        callback: Option<unsafe extern "C" fn(*mut ::std::ffi::c_void, u64, usize, usize,
+            mlx_memory_placement, *mut *mut ::std::ffi::c_void,
+            *mut Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>,
+            *mut mlx_physical_backing_publish) -> bool>,
+        release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_scoped_physical_observer_new_fresh(
+        out: *mut mlx_scoped_physical_observer,
+        context: *mut ::std::os::raw::c_void,
+        callback: Option<unsafe extern "C" fn(*mut ::std::ffi::c_void, u64, usize, usize,
+            mlx_memory_placement, *mut *mut ::std::ffi::c_void,
+            *mut Option<unsafe extern "C" fn(*mut ::std::ffi::c_void)>,
+            *mut mlx_physical_backing_publish) -> bool>,
+        release: Option<unsafe extern "C" fn(*mut ::std::os::raw::c_void)>,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_scoped_physical_observer_retain(value: mlx_scoped_physical_observer);
+    pub fn mlx_scoped_physical_observer_free(value: mlx_scoped_physical_observer);
+    pub fn mlx_scoped_physical_observer_is_current(value: mlx_scoped_physical_observer) -> bool;
+    pub fn mlx_scoped_physical_observer_has_current() -> bool;
+    pub fn mlx_submission_scope_bind_physical_observer(
+        scope: mlx_submission_scope,
+        value: mlx_scoped_physical_observer,
+    ) -> ::std::os::raw::c_int;
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_ordinary_control_population {
+    pub observed_host_controls: usize,
+    pub control_allocations: usize,
+    pub platform_events: usize,
+}
+extern "C" {
+    pub fn mlx_ordinary_frontend_control_layout(out: *mut mlx_ordinary_control_population,
+        entries: usize, seeds: usize, rank: usize, operands: usize) -> bool;
+    pub fn mlx_ordinary_cpu_eval_control_layout(out: *mut mlx_ordinary_control_population,
+        roots: usize, arrays: usize, tape: usize, edges: usize, outputs: usize,
+        streams: usize, captures: usize) -> bool;
+    pub fn mlx_ordinary_metal_eval_control_layout(out: *mut mlx_ordinary_control_population,
+        roots: usize, arrays: usize, tape: usize, edges: usize, outputs: usize,
+        streams: usize, captures: usize) -> bool;
+    pub fn mlx_ordinary_metal_router_eval_control_layout(out: *mut mlx_ordinary_control_population,
+        roots: usize, arrays: usize, tape: usize, edges: usize, outputs: usize,
+        streams: usize, captures: usize) -> bool;
+    pub fn mlx_ordinary_cpu_dispatch_envelope(out: *mut mlx_ordinary_control_population,
+        extents: usize) -> bool;
+    pub fn mlx_ordinary_reserved_array_vector_control_layout(out: *mut mlx_ordinary_control_population, elements: usize) -> bool;
+    pub fn mlx_ordinary_array_vector_control_layout(out: *mut mlx_ordinary_control_population,
+        elements: usize) -> bool;
+    pub fn mlx_ordinary_metal_wait_record_control_layout(out: *mut mlx_ordinary_control_population) -> bool;
+    pub fn mlx_ordinary_cpu_wait_control_layout(out: *mut mlx_ordinary_control_population) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_ordinary_array_wrapper_controls(out: *mut usize, kind: ::std::os::raw::c_uint, rank: usize) -> bool;
+    pub fn mlx_ordinary_fast_wrapper_controls(out: *mut usize, kind: ::std::os::raw::c_uint) -> bool;
 }

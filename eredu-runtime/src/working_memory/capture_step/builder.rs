@@ -1,6 +1,6 @@
 use super::*;
-mod pending;
 mod partition;
+mod pending;
 pub use pending::{PendingCaptureDelivery, PendingCaptureDeliveryError};
 
 mod delivery;
@@ -120,8 +120,7 @@ pub(in crate::working_memory) fn allocate<'a>(
                 CaptureOutcome::Skipped {
                     reason: plan
                         .skipped
-                        .and_then(|rows| rows[index].as_ref())
-                        .cloned()
+                        .and_then(|rows| rows.reason(index))
                         .unwrap_or(CaptureSkipReason::NotInvoked),
                 }
             } else {
@@ -174,7 +173,8 @@ pub struct PreparedCaptureStep<'a> {
         Vec<Option<super::interventions::evidence::PreparedInterventionEvidence<'a>>>,
     pub(in crate::working_memory) prefill:
         Option<crate::working_memory::capture_tensor::prefill::PrefillTargets>,
-    pub(in crate::working_memory) partition_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
+    pub(in crate::working_memory) partition_metadata:
+        Option<eredu_nn::workspace::HostMetadataFunding>,
     pub(super) plan: CaptureStepHostPlan<'a>,
     pub(super) custody: CaptureTensorCustody,
 }
@@ -185,15 +185,24 @@ impl PreparedCaptureStep<'_> {
         &self.frame.records
     }
     pub(in crate::working_memory) fn routed_target(
-        &self, index: usize,
+        &self,
+        index: usize,
     ) -> Option<&crate::working_memory::capture_run::RoutedInvocationTarget> {
-        self.buffers.get(index).and_then(|buffer| buffer.routed.as_ref())
+        self.buffers
+            .get(index)
+            .and_then(|buffer| buffer.routed.as_ref())
     }
     pub(in crate::working_memory) fn routed_target_mut(
-        &mut self, index: usize,
-    ) -> Result<&mut Option<crate::working_memory::capture_run::RoutedInvocationTarget>, CaptureStepError> {
+        &mut self,
+        index: usize,
+    ) -> Result<
+        &mut Option<crate::working_memory::capture_run::RoutedInvocationTarget>,
+        CaptureStepError,
+    > {
         self.custody.validate()?;
-        self.buffers.get_mut(index).map(|buffer| &mut buffer.routed)
+        self.buffers
+            .get_mut(index)
+            .map(|buffer| &mut buffer.routed)
             .ok_or(CaptureStepError::RecordNotPending { index })
     }
     /// Fixed selection count, including skips and missing records.
@@ -233,7 +242,7 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
-        Self::dtype(index, &dtype)?;
+        self.dtype(index, &dtype)?;
         let geometry = self
             .plan
             .candidate_geometry(index)?
@@ -268,7 +277,7 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
-        Self::dtype(index, &dtype)?;
+        self.dtype(index, &dtype)?;
         let geometry = self
             .plan
             .token_score_geometry(index)?
@@ -303,7 +312,7 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
-        Self::dtype(index, &dtype)?;
+        self.dtype(index, &dtype)?;
         let geometry = self
             .plan
             .summary_geometry(index)?
@@ -325,7 +334,7 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
-        Self::dtype(index, &dtype)?;
+        self.dtype(index, &dtype)?;
         let geometry = self
             .plan
             .histogram_geometry(index)?
@@ -362,11 +371,25 @@ impl PreparedCaptureStep<'_> {
             .ok_or(CaptureStepError::RecordNotPending { index })?;
         Ok((geometry, record.charged.checked_add(additional)?))
     }
-    fn dtype(index: usize, dtype: &TensorDtype) -> Result<(), CaptureStepError> {
-        if !matches!(
-            dtype,
-            TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16
-        ) {
+    fn dtype(&self, index: usize, dtype: &TensorDtype) -> Result<(), CaptureStepError> {
+        let semantic = self
+            .plan
+            .source
+            .points()
+            .get(index)
+            .map(|point| point.dtype);
+        let supported = match semantic {
+            Some(ObservationDtype::Floating) => matches!(
+                dtype,
+                TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16
+            ),
+            Some(ObservationDtype::Integer) => matches!(
+                dtype,
+                TensorDtype::U8 | TensorDtype::U16 | TensorDtype::U32 | TensorDtype::U64
+            ),
+            _ => false,
+        };
+        if !supported {
             return Err(CaptureStepError::TensorMismatch { index });
         }
         Ok(())
@@ -386,7 +409,7 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
-        Self::dtype(index, &dtype)?;
+        self.dtype(index, &dtype)?;
         // Shape sidecars remain unused until final success/failure; no duplicate move.
         self.frame.records[index].charged = charged;
         Ok(())
@@ -399,9 +422,9 @@ impl PreparedCaptureStep<'_> {
         }
         Ok(())
     }
-    /// Attach an existing protected F32 tensor without copying its values.
+    /// Attach an existing protected typed tensor without copying its values.
     ///
-    /// Exact output shape and floating source precision are checked. SharedTensor
+    /// Exact output shape and declared native scalar category are checked. SharedTensor
     /// alone cannot authenticate which source/selection/invocation produced it;
     /// that is the enclosing closed backend worker's semantic obligation. It must
     /// also supply genuinely charged logical usage and separately fund/settle
@@ -414,9 +437,13 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let (geometry, charged) = self.pending(index, additional)?;
-        Self::dtype(index, &source_dtype)?;
+        self.dtype(index, &source_dtype)?;
         if tensor.shape() != geometry.shape()
-            || !matches!(tensor.data(), TensorObservationData::F32(_))
+            || !matches!(
+                (geometry.value_dtype(), tensor.data()),
+                (ObservationDtype::Floating, TensorObservationData::F32(_))
+                    | (ObservationDtype::Integer, TensorObservationData::U64(_))
+            )
         {
             return Err(CaptureStepError::TensorMismatch { index });
         }
@@ -455,7 +482,7 @@ impl PreparedCaptureStep<'_> {
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
         if let Some(dtype) = &source_dtype {
-            Self::dtype(index, dtype)?;
+            self.dtype(index, dtype)?;
         }
         let mut end = diagnostic.len().min(plan::DIAGNOSTIC_BYTES);
         while !diagnostic.is_char_boundary(end) {
@@ -483,7 +510,7 @@ impl PreparedCaptureStep<'_> {
         additional: CaptureUsage,
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
-        Self::dtype(index, &dtype)?;
+        self.dtype(index, &dtype)?;
         if self.plan.window.is_none() || !self.buffers[index].selected.contains(&0) {
             return Err(CaptureStepError::InvalidCompletion);
         }
@@ -507,7 +534,7 @@ impl PreparedCaptureStep<'_> {
     ) -> Result<(), CaptureStepError> {
         let charged = self.pending_charge(index, additional)?;
         if let Some(dtype) = &source_dtype {
-            Self::dtype(index, dtype)?;
+            self.dtype(index, dtype)?;
         }
         self.observed(index, source_dtype);
         let record = &mut self.frame.records[index];
@@ -579,7 +606,10 @@ impl<'a> PreparedCaptureStep<'a> {
         drop(intervention_evidence);
         drop(intervention_buffers);
         drop(buffers); // Unused payload retires before the shared custody move.
-        Ok(SharedCapturedStep::retain(frame, (custody, partition_metadata)))
+        Ok(SharedCapturedStep::retain(
+            frame,
+            (custody, partition_metadata),
+        ))
     }
 }
 impl fmt::Debug for PreparedCaptureStep<'_> {
@@ -627,36 +657,70 @@ impl std::error::Error for CaptureStepFinishError<'_> {
     }
 }
 
-
 impl PreparedCaptureStep<'_> {
     pub(in crate::working_memory) fn record_routed_units(
-        &mut self,index:usize,dtype:TensorDtype,value:RoutedUnitCapture,
-        slice:&ResolvedCaptureSlice,scratch:&mut [RoutedUnitRowIdentity],additional:CaptureUsage,
-    )->Result<(),CaptureStepError>{
-        self.record_routed_kind(index,dtype,value,slice,scratch,additional,false)
+        &mut self,
+        index: usize,
+        dtype: TensorDtype,
+        value: RoutedUnitCapture,
+        slice: &ResolvedCaptureSlice,
+        scratch: &mut [RoutedUnitRowIdentity],
+        additional: CaptureUsage,
+    ) -> Result<(), CaptureStepError> {
+        self.record_routed_kind(index, dtype, value, slice, scratch, additional, false)
     }
-    pub(in crate::working_memory) fn record_partition_routed_units(&mut self,index:usize,dtype:TensorDtype,value:RoutedUnitCapture,
-        slice:&ResolvedCaptureSlice,scratch:&mut [RoutedUnitRowIdentity],additional:CaptureUsage)->Result<(),CaptureStepError>{
-        self.record_routed_kind(index,dtype,value,slice,scratch,additional,true)
+    pub(in crate::working_memory) fn record_partition_routed_units(
+        &mut self,
+        index: usize,
+        dtype: TensorDtype,
+        value: RoutedUnitCapture,
+        slice: &ResolvedCaptureSlice,
+        scratch: &mut [RoutedUnitRowIdentity],
+        additional: CaptureUsage,
+    ) -> Result<(), CaptureStepError> {
+        self.record_routed_kind(index, dtype, value, slice, scratch, additional, true)
     }
-    fn record_routed_kind(&mut self,index:usize,dtype:TensorDtype,mut value:RoutedUnitCapture,
-        slice:&ResolvedCaptureSlice,scratch:&mut [RoutedUnitRowIdentity],additional:CaptureUsage,partition:bool)->Result<(),CaptureStepError>{
-        let charged=self.pending_charge(index,additional)?;
-        if !partition||dtype!=TensorDtype::F64{Self::dtype(index,&dtype)?;}
-        let geometry=self.plan.routed_geometry(index)?.ok_or(CaptureStepError::RecordNotPending{index})?;
-        if value.geometry!=geometry.bank() || slice.starts!=geometry.starts()
-            || slice.ends!=geometry.ends() || slice.strides!=geometry.strides()
-            || slice.shape.iter().copied().ne(geometry.shape().iter().map(|n|*n as u64)){
+    fn record_routed_kind(
+        &mut self,
+        index: usize,
+        dtype: TensorDtype,
+        mut value: RoutedUnitCapture,
+        slice: &ResolvedCaptureSlice,
+        scratch: &mut [RoutedUnitRowIdentity],
+        additional: CaptureUsage,
+        partition: bool,
+    ) -> Result<(), CaptureStepError> {
+        let charged = self.pending_charge(index, additional)?;
+        if !partition || dtype != TensorDtype::F64 {
+            self.dtype(index, &dtype)?;
+        }
+        let geometry = self
+            .plan
+            .routed_geometry(index)?
+            .ok_or(CaptureStepError::RecordNotPending { index })?;
+        if value.geometry != geometry.bank()
+            || slice.starts != geometry.starts()
+            || slice.ends != geometry.ends()
+            || slice.strides != geometry.strides()
+            || slice
+                .shape
+                .iter()
+                .copied()
+                .ne(geometry.shape().iter().map(|n| *n as u64))
+        {
             return Err(CaptureStepError::InvalidCompletion);
         }
-        if partition {value.finish_partition_with_scratch(slice,scratch)}
-        else{value.finish_ordinary_with_scratch(slice,geometry.source_shape()[0] as u64,scratch)}
-            .map_err(|_|CaptureStepError::InvalidCompletion)?;
-        self.observed(index,Some(dtype));
-        let record=&mut self.frame.records[index];
-        record.payload=Some(CapturePayload::RoutedUnits(value));
-        record.outcome=CaptureOutcome::Captured;
-        record.charged=charged;
+        if partition {
+            value.finish_partition_with_scratch(slice, scratch)
+        } else {
+            value.finish_ordinary_with_scratch(slice, geometry.source_shape()[0] as u64, scratch)
+        }
+        .map_err(|_| CaptureStepError::InvalidCompletion)?;
+        self.observed(index, Some(dtype));
+        let record = &mut self.frame.records[index];
+        record.payload = Some(CapturePayload::RoutedUnits(value));
+        record.outcome = CaptureOutcome::Captured;
+        record.charged = charged;
         Ok(())
     }
 }

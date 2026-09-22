@@ -1,6 +1,7 @@
 //! Actual private LoadedModel cold composition. Request/driver behavior is
 //! independently exercised through genuine runtime and native request fixtures.
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use eredu_core::{
     BackendDescriptor, BackendFailure, BackendProvider, BackendSession, Completion,
     DeviceCapabilities, DeviceDescriptor, ObservationSet, PendingTextInput, PreparedModel,
@@ -8,12 +9,12 @@ use eredu_core::{
     TokenFilterController,
 };
 use eredu_runtime::working_memory::{
-    LoadedDecodeSource, LoadedDecodeSourceBackend, WorkingMemoryError, WorkingMemoryPool,
+    LoadedDecodeSource, LoadedDecodeSourceBackend, MemoryLedger, WorkingMemoryError,
 };
 use eredu_text::decoder_storage::DecodeCompilePlan;
 use std::{cell::Cell, rc::Rc};
 struct Backend {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     compiles: Rc<Cell<usize>>,
 }
 struct Session;
@@ -163,11 +164,11 @@ impl LoadedDecodeSourceBackend for Backend {
 fn tokenizer() -> ChatTokenizer {
     ChatTokenizer::from_bytes(r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"é":8,"[UNK]":1},"unk_token":"[UNK]"}}"#.as_bytes()).unwrap()
 }
-fn model(pool: &WorkingMemoryPool) -> (LoadedModel<Backend>, Rc<Cell<usize>>) {
+fn model(pool: &MemoryLedger) -> (LoadedModel<Backend>, Rc<Cell<usize>>) {
     model_with_tokenizer(pool, tokenizer())
 }
 fn model_with_tokenizer(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     tokenizer: ChatTokenizer,
 ) -> (LoadedModel<Backend>, Rc<Cell<usize>>) {
     let compiles = Rc::new(Cell::new(0));
@@ -196,12 +197,12 @@ fn model_with_tokenizer(
 }
 #[test]
 fn private_loaded_composition_compiles_once_and_request_headers_outlive_the_model() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let (mut model, compiles) = model(&pool);
     assert!(model.compiled_decoder_input(3, true).unwrap().is_none());
     let legacy = model.text_decoder(true);
     model.prepare_compiled_decoder().unwrap();
-    let held = pool.used_bytes().unwrap();
+    let held = pool.live_charge_bytes().unwrap();
     assert!(held > 0);
     model.prepare_compiled_decoder().unwrap();
     assert_eq!(compiles.get(), 1);
@@ -210,23 +211,22 @@ fn private_loaded_composition_compiles_once_and_request_headers_outlive_the_mode
     assert!(first.source().same_source(second.source()));
     assert_eq!(held, first.source().original_bytes());
     drop(model);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.live_charge_bytes().unwrap(), held);
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.live_charge_bytes().unwrap(), held);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     // Existing raw HF aliases are an explicitly separate resident obligation.
     assert_eq!(legacy.tokenizer.decode(&[0, 8], true).unwrap(), "hello é");
 }
 #[test]
 fn private_loaded_compilation_one_short_rejects_before_source_installation() {
     let snapshot = tokenizer().snapshot();
-    let required = WorkingMemoryPool::decode_source_required_bytes(
-        &DecodeCompilePlan::prepare(&snapshot).unwrap(),
-    )
-    .unwrap();
+    let required =
+        MemoryLedger::decode_source_required_bytes(&DecodeCompilePlan::prepare(&snapshot).unwrap())
+            .unwrap();
     for bytes in [required - 1, required] {
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let pool = crate::memory_fixture::host_ledger(bytes, 0).unwrap();
         let (mut model, compiles) = model(&pool);
         let result = model.prepare_compiled_decoder();
         assert_eq!(compiles.get(), 1);
@@ -238,13 +238,13 @@ fn private_loaded_compilation_one_short_rejects_before_source_installation() {
                 .unwrap();
             assert_eq!(original.retained_bytes(), 0);
             assert!(model.compiled_decoder_input(3, true).unwrap().is_none());
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         } else {
             result.unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_eq!(pool.live_charge_bytes().unwrap(), required);
         }
         drop(model);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -264,7 +264,7 @@ impl eredu_runtime::working_memory::OriginalStopSourceBackend for Backend {
 }
 #[test]
 fn private_plain_requests_use_actual_overrides_and_share_only_selected_original_sources() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let (mut model, compiles) = model(&pool);
     model.prepare_compiled_decoder().unwrap();
     let first_strings = vec![String::from("halt"), String::from(""), String::from("halt")];
@@ -281,22 +281,20 @@ fn private_plain_requests_use_actual_overrides_and_share_only_selected_original_
         .unwrap()
         .unwrap();
     assert!(a.source().same_source(b.source()));
-    assert!(
-        a.stop_source()
-            .unwrap()
-            .same_source(b.stop_source().unwrap())
-    );
+    assert!(a
+        .stop_source()
+        .unwrap()
+        .same_source(b.stop_source().unwrap()));
     let override_strings = vec![String::from("é!"), String::from("halt")];
     let changed = model.compile_request_stops(&override_strings).unwrap();
     let c = model
         .compiled_plain_decoder_input(&changed, 3, true)
         .unwrap()
         .unwrap();
-    assert!(
-        !a.stop_source()
-            .unwrap()
-            .same_source(c.stop_source().unwrap())
-    );
+    assert!(!a
+        .stop_source()
+        .unwrap()
+        .same_source(c.stop_source().unwrap()));
     assert_eq!(
         c.stop_source()
             .unwrap()
@@ -325,32 +323,31 @@ fn private_plain_requests_use_actual_overrides_and_share_only_selected_original_
         first_strings,
         override_strings,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.live_charge_bytes().unwrap(), held);
     drop(a);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.live_charge_bytes().unwrap(), held);
     drop(b);
-    assert_eq!(pool.used_bytes().unwrap(), held - cold_first);
+    assert_eq!(pool.live_charge_bytes().unwrap(), held - cold_first);
     drop(c);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.live_charge_bytes().unwrap(),
         cold_decoder + d.stop_source().unwrap().original_bytes()
     );
     drop(d);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 #[test]
 fn private_stop_override_short_or_foreign_source_preserves_existing_compiled_decoder() {
     let snapshot = tokenizer().snapshot();
-    let decoder_bytes = WorkingMemoryPool::decode_source_required_bytes(
-        &DecodeCompilePlan::prepare(&snapshot).unwrap(),
-    )
-    .unwrap();
+    let decoder_bytes =
+        MemoryLedger::decode_source_required_bytes(&DecodeCompilePlan::prepare(&snapshot).unwrap())
+            .unwrap();
     let strings = vec![String::from("stop")];
-    let stop_bytes = WorkingMemoryPool::stop_source_required_bytes(
+    let stop_bytes = MemoryLedger::stop_source_required_bytes(
         &eredu_text::stop_storage::StopCompilePlan::prepare(&strings).unwrap(),
     )
     .unwrap();
-    let pool = WorkingMemoryPool::new(decoder_bytes + stop_bytes - 1, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(decoder_bytes + stop_bytes - 1, 0).unwrap();
     let (mut model, _) = model(&pool);
     model.prepare_compiled_decoder().unwrap();
     let error = model.compile_request_stops(&strings).unwrap_err();
@@ -359,8 +356,8 @@ fn private_stop_override_short_or_foreign_source_preserves_existing_compiled_dec
         .downcast_ref::<eredu_runtime::working_memory::OriginalStopSourceError>()
         .unwrap();
     assert_eq!(source.retained_bytes(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), decoder_bytes);
-    let foreign = WorkingMemoryPool::new(stop_bytes, 0).unwrap();
+    assert_eq!(pool.live_charge_bytes().unwrap(), decoder_bytes);
+    let foreign = crate::memory_fixture::host_ledger(stop_bytes, 0).unwrap();
     let stops = foreign
         .compile_stop_source(eredu_text::stop_storage::StopCompilePlan::prepare(&strings).unwrap())
         .unwrap();
@@ -370,8 +367,8 @@ fn private_stop_override_short_or_foreign_source_preserves_existing_compiled_dec
     ));
     assert!(model.compiled_decoder_input(3, true).unwrap().is_some());
     drop((model, stops));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
+    assert_eq!(foreign.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -380,7 +377,7 @@ fn actual_text_decoder_aliases_keep_cache_policy_after_loaded_model_drop() {
     let json = br#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[["a","b"]]},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}}"#;
     let source =
         ChatTokenizer::from_bytes_with_cache_policy(json, ModelCachePolicy::disabled()).unwrap();
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let (model, compiles) = model_with_tokenizer(&pool, source);
     let mut decoder = model.text_decoder(false);
     assert_eq!(decoder.step(0).unwrap().as_deref(), Some("a"));
@@ -437,16 +434,16 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for Backend {
     }
 }
 #[test]
-fn private_fresh_tokenizer_producer_uses_actual_pool_and_rejects_malformed_json_under_original_admission()
- {
+fn private_fresh_tokenizer_producer_uses_actual_pool_and_rejects_malformed_json_under_original_admission(
+) {
     use eredu_text::tokenizer_storage::TokenizerPlan;
     let input=r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"added_tokens":[],"model":{"type":"BPE","vocab":{"h":0,"i":1,"hi":2},"merges":[["h","i"]]}}"#.to_owned();
-    let bytes = WorkingMemoryPool::tokenizer_required_bytes(
+    let bytes = MemoryLedger::tokenizer_required_bytes(
         &TokenizerPlan::prepare_json(input.as_bytes()).unwrap(),
     )
     .unwrap();
     for short in [true, false] {
-        let pool = WorkingMemoryPool::new(bytes - u64::from(short), 0).unwrap();
+        let pool = crate::memory_fixture::host_ledger(bytes - u64::from(short), 0).unwrap();
         let compiles = Rc::new(Cell::new(0));
         // This producer needs the real runtime/pool, not a previously built ChatTokenizer.
         let runtime = ModelRuntime::prepare(
@@ -460,26 +457,26 @@ fn private_fresh_tokenizer_producer_uses_actual_pool_and_rejects_malformed_json_
         let malformed = &input.as_bytes()[..input.len() - 1];
         assert!(crate::api::tokenizer::compile_original_tokenizer(&runtime, malformed).is_err());
         assert_eq!(compiles.get(), 1);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         let result = crate::api::tokenizer::compile_original_tokenizer(&runtime, input.as_bytes());
         assert_eq!(compiles.get(), 2);
         drop(runtime);
         if short {
             assert!(result.is_err());
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         } else {
             let source = result.unwrap();
             assert_eq!(source.token_id("hi"), Some(2));
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.live_charge_bytes().unwrap(), bytes);
             let header = eredu_runtime::working_memory::AggregateGenerationDecoderInput::new(
                 &source, 3, false,
             )
             .unwrap();
             assert!(header.source().same_source(&source));
             drop(source);
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.live_charge_bytes().unwrap(), bytes);
             drop(header);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         }
     }
 }
@@ -496,16 +493,16 @@ fn private_consumed_file_producer_admits_i_then_c_and_preserves_borrowed_source_
         file.write_all(input.as_bytes()).unwrap();
         file
     };
-    let i = WorkingMemoryPool::tokenizer_file_required_bytes(
+    let i = MemoryLedger::tokenizer_file_required_bytes(
         &PreparedArtifactFileRead::new(make_file()).unwrap(),
     )
     .unwrap();
-    let c = WorkingMemoryPool::tokenizer_required_bytes(
+    let c = MemoryLedger::tokenizer_required_bytes(
         &TokenizerPlan::prepare_json(input.as_bytes()).unwrap(),
     )
     .unwrap();
     for capacity in [i - 1, i + c - 1, i + c] {
-        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let pool = crate::memory_fixture::host_ledger(capacity, 0).unwrap();
         let compiles = Rc::new(Cell::new(0));
         let runtime = ModelRuntime::prepare(
             Backend {
@@ -527,13 +524,13 @@ fn private_consumed_file_producer_admits_i_then_c_and_preserves_borrowed_source_
                 .downcast_ref::<eredu_runtime::working_memory::OriginalTokenizerInputError>()
                 .unwrap();
             assert_eq!(source.input_bytes(), if capacity < i { 0 } else { i });
-            assert_eq!(pool.used_bytes().unwrap(), source.input_bytes());
+            assert_eq!(pool.live_charge_bytes().unwrap(), source.input_bytes());
             drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         } else {
             let source = result.unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), c);
-            let comparison = WorkingMemoryPool::new(c, 0).unwrap();
+            assert_eq!(pool.live_charge_bytes().unwrap(), c);
+            let comparison = crate::memory_fixture::host_ledger(c, 0).unwrap();
             let borrowed = comparison
                 .compile_tokenizer(TokenizerPlan::prepare_json(input.as_bytes()).unwrap())
                 .unwrap();
@@ -549,12 +546,12 @@ fn private_consumed_file_producer_admits_i_then_c_and_preserves_borrowed_source_
             )
             .unwrap();
             drop(source);
-            assert_eq!(pool.used_bytes().unwrap(), c);
+            assert_eq!(pool.live_charge_bytes().unwrap(), c);
             assert_eq!(request.source().token_id("hi"), Some(2));
             drop(request);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
             drop(borrowed);
-            assert_eq!(comparison.used_bytes().unwrap(), 0);
+            assert_eq!(comparison.live_charge_bytes().unwrap(), 0);
         }
     }
 }
@@ -562,7 +559,7 @@ fn private_consumed_file_producer_admits_i_then_c_and_preserves_borrowed_source_
 #[test]
 fn private_identity_encode_producer_retains_source_and_only_admits_actual_operation_destinations() {
     let input = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"added_tokens":[],"model":{"type":"BPE","vocab":{"h":0,"i":1,"hi":2},"merges":[["h","i"]]}}"#;
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     let compiles = Rc::new(Cell::new(0));
     let runtime = ModelRuntime::prepare(
         Backend {
@@ -575,8 +572,7 @@ fn private_identity_encode_producer_retains_source_and_only_admits_actual_operat
     let source =
         crate::api::tokenizer::compile_original_tokenizer(&runtime, input.as_bytes()).unwrap();
     let c = source.original_bytes();
-    let expected =
-        WorkingMemoryPool::tokenizer_encode_required_bytes(&source, "hihi", true).unwrap();
+    let expected = MemoryLedger::tokenizer_encode_required_bytes(&source, "hihi", true).unwrap();
     let ids = crate::api::tokenizer::encode_original_tokenizer_ids(&runtime, &source, "hihi", true)
         .unwrap();
     assert_eq!(ids.ids(), [2, 2]);
@@ -584,11 +580,11 @@ fn private_identity_encode_producer_retains_source_and_only_admits_actual_operat
     assert!(ids.matches_source(&source));
     assert_eq!(compiles.get(), 1, "encoding never reconstructs its source");
     drop((runtime, source));
-    assert_eq!(pool.used_bytes().unwrap(), c + expected);
+    assert_eq!(pool.live_charge_bytes().unwrap(), c + expected);
     let plan = eredu_core::TokenIdsInputPlan::new(ids.ids()).unwrap();
     assert_eq!(plan.tokens(), [2, 2]);
     drop(ids);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[cfg(unix)]
@@ -599,7 +595,7 @@ fn original_text_default_adapters_reject_by_value_before_source_operations() {
     use eredu_runtime::working_memory::{
         OriginalTextSourceError, OriginalTokenizerBackend, OriginalTokenizerSourceError,
     };
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     let compiles = Rc::new(Cell::new(0));
     let runtime = ModelRuntime::prepare(
         Backend {
@@ -647,7 +643,7 @@ fn original_text_default_adapters_reject_by_value_before_source_operations() {
         ))
     ));
     assert_eq!(compiles.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), c);
+    assert_eq!(pool.live_charge_bytes().unwrap(), c);
     drop((source, runtime));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

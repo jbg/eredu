@@ -106,7 +106,7 @@ fn original_estimates_bypass_ordinary_hooks_and_keep_budget_admission_order() {
                 &mut boundary.snapshot_source(),
                 &budget,
                 RefusingHost(&called),
-                WorkspaceCopyLimits::new(1 << 20),
+                WorkspaceCopyLimits::new(crate::memory::limits(1 << 20)),
             )
         };
         assert_eq!(COLD_CALLS.with(Cell::get), 1);

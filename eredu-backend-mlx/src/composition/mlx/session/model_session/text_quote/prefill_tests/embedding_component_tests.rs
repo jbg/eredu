@@ -50,7 +50,11 @@ struct Bind<'a> {
     biases: Option<&'a MlxTensor>,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         *value = match metadata.id().as_str() {
             "embedding.weight" => self.weight,
             "embedding.scales" => self.scales,

@@ -4,13 +4,13 @@ use eredu_collections::ordered_map::Map as SourceMap;
 use std::collections::BTreeMap;
 
 use eredu_core::{
-    ArchitectureDescriptor,
     capture::PartitionCaptureCombination,
     component::{ComponentCoordinateMap, ComponentGroup, ComponentWritePartition},
+    ArchitectureDescriptor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, LocalModelLayout, LocalTensorLayout, TensorPlacement,
-    inspection::ObservationHookSite,
+    inspection::ObservationHookSite, ArchitectureParameterDescription, LocalModelLayout,
+    LocalTensorLayout, TensorPlacement,
 };
 
 pub(crate) mod construction;
@@ -34,8 +34,8 @@ pub use routed_capture::{
 };
 mod streams;
 mod transforms;
-pub use routed::{PartitionedRoutedObservation, derive_routed_component_coordinates};
 pub(crate) use routed::{derive_bank_unit_coordinates, derive_coordinates_for_experts};
+pub use routed::{derive_routed_component_coordinates, PartitionedRoutedObservation};
 
 /// One invocation's local scalar coordinates. Absence of coordinates means that
 /// this partition does not execute the invocation, even if it stores shared weights.
@@ -229,7 +229,7 @@ impl ComponentPartitionLayout {
         invocation: Option<eredu_core::capture::CaptureInvocationShape>,
         max_fragments: usize,
     ) -> Result<Option<eredu_core::capture::CaptureSlicePartition>, ComponentPartitionError> {
-        use eredu_core::capture::{CaptureError, CaptureSlicePartition, resolve_slice};
+        use eredu_core::capture::{resolve_slice, CaptureError, CaptureSlicePartition};
         let selection =
             plan.plan().selections.get(selection_index).ok_or_else(|| {
                 CaptureError::Invalid("unknown component capture selection".into())
@@ -1157,19 +1157,30 @@ pub struct ComponentPartitionLayouts {
 }
 
 impl ComponentPartitionLayouts {
-    pub(crate) fn new(topology:eredu_core::ParallelTopology,layouts:Vec<ComponentPartitionLayout>)->Result<Self,ComponentPartitionError>{Self::new_worker(topology,layouts,Destination(None))}
+    pub(crate) fn new(
+        topology: eredu_core::ParallelTopology,
+        layouts: Vec<ComponentPartitionLayout>,
+    ) -> Result<Self, ComponentPartitionError> {
+        Self::new_worker(topology, layouts, Destination(None))
+    }
     pub(crate) fn new_worker(
         topology: eredu_core::ParallelTopology,
         layouts: Vec<ComponentPartitionLayout>,
-        allocation:Destination<'_>,
+        allocation: Destination<'_>,
     ) -> Result<Self, ComponentPartitionError> {
-        allocation.controls::<(eredu_core::ParallelTopology,Vec<ComponentPartitionLayout>,Self)>()?;
+        allocation.controls::<(
+            eredu_core::ParallelTopology,
+            Vec<ComponentPartitionLayout>,
+            Self,
+        )>()?;
         if layouts.len() != topology.world_size()
             || layouts.iter().enumerate().any(|(rank, layout)| {
                 layout.topology.global_rank() != rank || layout.topology.topology() != topology
             })
         {
-            return Err(allocation.capture_invalid(format_args!("component layouts do not match the complete rank topology")));
+            return Err(allocation.capture_invalid(format_args!(
+                "component layouts do not match the complete rank topology"
+            )));
         }
         Ok(Self { topology, layouts })
     }
@@ -1219,23 +1230,34 @@ impl ComponentPartitionLayouts {
         path: &str,
         hooks: eredu_runtime::inspection::ObservationHookSupport,
     ) -> eredu_core::ObservationSupportStatus {
-        self.capture_hook_support_source(path, hooks,
-            eredu_core::capture::CaptureSourceConstruction::new(None))
-            .expect("ordinary capture hook support")
+        self.capture_hook_support_source(
+            path,
+            hooks,
+            eredu_core::capture::CaptureSourceConstruction::new(None),
+        )
+        .expect("ordinary capture hook support")
     }
 
     /// Same hook predicate with prospective diagnostic construction. The caller
     /// retains the construction account around the enclosing source and errors.
     pub fn capture_hook_support_source(
-        &self, path: &str, hooks: eredu_runtime::inspection::ObservationHookSupport,
+        &self,
+        path: &str,
+        hooks: eredu_runtime::inspection::ObservationHookSupport,
         construction: eredu_core::capture::CaptureSourceConstruction<'_>,
     ) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
         use eredu_core::ObservationSupportStatus as S;
-        construction.controls(std::mem::size_of::<(&Self, &str,
-            eredu_runtime::inspection::ObservationHookSupport, Option<ObservationHookSite>, S)>())?;
+        construction.controls(std::mem::size_of::<(
+            &Self,
+            &str,
+            eredu_runtime::inspection::ObservationHookSupport,
+            Option<ObservationHookSite>,
+            S,
+        )>())?;
         let Some(site) = self.observation_site(path) else {
             return Ok(S::Unverified(construction.text(
-                "global observation ownership is not yet implemented for this point")?));
+                "global observation ownership is not yet implemented for this point",
+            )?));
         };
         if !hooks.supports(site) {
             return Ok(S::Unverified(construction.text(
@@ -1336,23 +1358,42 @@ impl ComponentPartitionLayouts {
     /// All ranks that execute a declared component observation, including
     /// replicas. Unknown observation axes have no component placement.
     pub fn capture_hook_members(&self, path: &str) -> Option<Vec<usize>> {
-        self.capture_hook_members_source(path, eredu_core::capture::CaptureSourceConstruction::new(None))
-            .expect("ordinary capture hook members")
+        self.capture_hook_members_source(
+            path,
+            eredu_core::capture::CaptureSourceConstruction::new(None),
+        )
+        .expect("ordinary capture hook members")
     }
 
     /// Same retained membership selection with exact prospective destination.
-    pub fn capture_hook_members_source(&self, path: &str,
+    pub fn capture_hook_members_source(
+        &self,
+        path: &str,
         construction: eredu_core::capture::CaptureSourceConstruction<'_>,
     ) -> Result<Option<Vec<usize>>, eredu_core::capture::CaptureError> {
-        construction.controls(std::mem::size_of::<(&Self, &str, Option<ObservationHookSite>, Vec<usize>)>())?;
-        if self.observation_site(path).is_none() { return Ok(None); }
+        construction.controls(std::mem::size_of::<(
+            &Self,
+            &str,
+            Option<ObservationHookSite>,
+            Vec<usize>,
+        )>())?;
+        if self.observation_site(path).is_none() {
+            return Ok(None);
+        }
         let local = |layout: &ComponentPartitionLayout| {
-            layout.observation(path).is_some_and(|point| point.coordinates().is_some())
-                || layout.routed_observation(path).is_some_and(|point| point.ownership().is_some())
+            layout
+                .observation(path)
+                .is_some_and(|point| point.coordinates().is_some())
+                || layout
+                    .routed_observation(path)
+                    .is_some_and(|point| point.ownership().is_some())
         };
-        let mut result = construction.vector(self.layouts.iter().filter(|layout| local(layout)).count())?;
+        let mut result =
+            construction.vector(self.layouts.iter().filter(|layout| local(layout)).count())?;
         for (rank, layout) in self.layouts.iter().enumerate() {
-            if local(layout) { result.push(rank); }
+            if local(layout) {
+                result.push(rank);
+            }
         }
         Ok(Some(result))
     }
@@ -1629,7 +1670,9 @@ pub enum ComponentPartitionError {
     #[error("{0}")]
     Capture(#[from] eredu_core::capture::CaptureError),
     /// A logical invocation has no declared output projection.
-    #[error("component projection weight {0:?} is absent from the parameter description or layout")]
+    #[error(
+        "component projection weight {0:?} is absent from the parameter description or layout"
+    )]
     MissingWeight(String),
     /// A group or observation path is declared more than once.
     #[error("component identity {0:?} is repeated")]
@@ -1996,12 +2039,10 @@ mod tests {
                 publication.activation_region_bound(&plan, 0, 4, 4).unwrap(),
                 1
             );
-            assert!(
-                publication
-                    .complete_capture_source("units")
-                    .unwrap()
-                    .has_world_hooks()
-            );
+            assert!(publication
+                .complete_capture_source("units")
+                .unwrap()
+                .has_world_hooks());
             for layout in &mut publication.layouts {
                 layout.observations.get_mut("units").unwrap().site = ObservationHookSite::Unit;
             }
@@ -2041,17 +2082,13 @@ mod tests {
                     .activation_members_at(&scoped, 0, CapturePhase::Decode, 4, invocation, 4, 4)
                     .unwrap();
                 assert_eq!(members.len(), 4);
-                assert!(
-                    members
-                        .iter()
-                        .all(|member| member.projection.local_shape() == [rows, 128])
-                );
+                assert!(members
+                    .iter()
+                    .all(|member| member.projection.local_shape() == [rows, 128]));
             }
-            assert!(
-                layouts
-                    .activation_members(&scoped, 0, CapturePhase::Decode, 4, 4, 4)
-                    .is_err()
-            );
+            assert!(layouts
+                .activation_members(&scoped, 0, CapturePhase::Decode, 4, 4, 4)
+                .is_err());
             let mut additive = layouts.clone();
             for layout in &mut additive.layouts {
                 let point = layout.observations.get_mut("units").unwrap();
@@ -2106,11 +2143,9 @@ mod tests {
                 .get_mut("units")
                 .unwrap()
                 .coordinates = None;
-            assert!(
-                additive
-                    .activation_members(&add_plan, 0, CapturePhase::Prefill, 0, 4, 4)
-                    .is_err()
-            );
+            assert!(additive
+                .activation_members(&add_plan, 0, CapturePhase::Prefill, 0, 4, 4)
+                .is_err());
             for (phase, prediction, rows) in
                 [(CapturePhase::Prefill, 0, 2), (CapturePhase::Decode, 1, 1)]
             {
@@ -2125,16 +2160,12 @@ mod tests {
                     assert_eq!(member.projection.local_shape(), [rows, 128]);
                     assert_eq!(member.projection.region_count(), 1);
                 }
-                assert!(
-                    layouts
-                        .activation_members(&plan, 0, phase, prediction, 3, 4)
-                        .is_err()
-                );
-                assert!(
-                    layouts
-                        .activation_members(&plan, 0, phase, prediction, 4, 3)
-                        .is_err()
-                );
+                assert!(layouts
+                    .activation_members(&plan, 0, phase, prediction, 3, 4)
+                    .is_err());
+                assert!(layouts
+                    .activation_members(&plan, 0, phase, prediction, 4, 3)
+                    .is_err());
                 let mut replicas = layouts.clone();
                 for rank in &mut replicas.layouts {
                     rank.observations.get_mut("units").unwrap().exports = false;
@@ -2161,22 +2192,18 @@ mod tests {
                         .collect::<Vec<_>>(),
                     [0, 2, 3]
                 );
-                assert!(
-                    replicas
-                        .rank(1)
-                        .unwrap()
-                        .project_intervention(&plan, 0, phase, prediction, 4)
-                        .unwrap()
-                        .is_none()
-                );
+                assert!(replicas
+                    .rank(1)
+                    .unwrap()
+                    .project_intervention(&plan, 0, phase, prediction, 4)
+                    .unwrap()
+                    .is_none());
                 for rank in &mut replicas.layouts {
                     rank.observations.get_mut("units").unwrap().coordinates = None;
                 }
-                assert!(
-                    replicas
-                        .activation_members(&plan, 0, phase, prediction, 4, 4)
-                        .is_err()
-                );
+                assert!(replicas
+                    .activation_members(&plan, 0, phase, prediction, 4, 4)
+                    .is_err());
             }
         }
         // Complete geometric ownership alone cannot enable a callback that the
@@ -2224,7 +2251,6 @@ mod tests {
             let capabilities = CaptureCapabilities {
                 transformations: vec![CaptureTransformKind::Slice],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             };
             let support = ObservationSupportReport {
@@ -2260,7 +2286,6 @@ mod tests {
                 limits: CaptureLimits {
                     per_step: usage,
                     cumulative: usage,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             }
@@ -2313,36 +2338,21 @@ mod tests {
                     .capture_placement_at(&scoped, 0, CapturePhase::Decode, 4, invocation, limits)
                     .unwrap();
                 assert_eq!(projected.hook_members, [0, 1, 2, 3]);
-                assert!(
-                    projected
-                        .source_shapes
-                        .iter()
-                        .all(|shape| shape == &[rows, 128])
-                );
-                assert!(
-                    projected
-                        .producers
-                        .iter()
-                        .all(|producer| producer.projection.global_shape() == [rows, 256])
-                );
-                assert!(
-                    layouts
-                        .capture_placement_at(
-                            &plan,
-                            0,
-                            CapturePhase::Prefill,
-                            0,
-                            invocation,
-                            limits
-                        )
-                        .is_err()
-                );
+                assert!(projected
+                    .source_shapes
+                    .iter()
+                    .all(|shape| shape == &[rows, 128]));
+                assert!(projected
+                    .producers
+                    .iter()
+                    .all(|producer| producer.projection.global_shape() == [rows, 256]));
+                assert!(layouts
+                    .capture_placement_at(&plan, 0, CapturePhase::Prefill, 0, invocation, limits)
+                    .is_err());
             }
-            assert!(
-                layouts
-                    .capture_placement(&scoped, 0, CapturePhase::Decode, 4, limits)
-                    .is_err()
-            );
+            assert!(layouts
+                .capture_placement(&scoped, 0, CapturePhase::Decode, 4, limits)
+                .is_err());
             let request = |max_producers, max_fragments| ComponentCaptureProjectionRequest {
                 invocation: None,
                 plan: &plan,
@@ -2402,11 +2412,9 @@ mod tests {
                 [0, 2],
                 "retain every TP term but eliminate EP replicas"
             );
-            assert!(
-                terms
-                    .iter()
-                    .all(|term| term.projection.local_shape() == [2, 256])
-            );
+            assert!(terms
+                .iter()
+                .all(|term| term.projection.local_shape() == [2, 256]));
             let source = additive.contiguous_capture_source("units").unwrap();
             assert_eq!(
                 source.combination(),
@@ -2524,6 +2532,7 @@ mod tests {
             let mut ledger = CaptureLedger::new(&plan);
             let context = PartitionCaptureContext {
                 invocation: None,
+                invocation_window: None,
                 artifact_identity: "source".into(),
                 execution_identity: "selected-world".into(),
                 run_identity: "run".into(),

@@ -10,6 +10,7 @@ use crate::backend::{
     nn::workspace::{ExistingArrayProjection, MlxMetalWorkspaceMechanisms},
     runtime::residency::storage::RetainedStorage,
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{
     cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
     InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig,
@@ -30,12 +31,7 @@ use std::num::NonZeroU32;
 
 // Actual fresh, zero-output prompt authority. Every requested byte comes from
 // the concrete P+N program above, not from a synthetic forward/state estimate.
-fn fresh(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
-    capacity: u64,
-) -> Result<(InferenceTextPreparation, WorkingMemoryFundingRun), WorkingMemoryError> {
-    let execution = InferenceExecutionIdentity::default();
+fn fresh_admission(bytes: u64) -> Admission {
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -64,6 +60,7 @@ fn fresh(
         |n| WorkspaceBound::bounded(n, "actual dense initialization and isolated native copy");
     let state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: bound(bytes),
             attention: bound(0),
@@ -73,15 +70,40 @@ fn fresh(
             retained: bound(0),
         })
         .unwrap();
+    crate::memory_fixture::admission(Admission {
+        requested_positions: 1,
+        state,
+        incremental_required_bytes: Some(bytes),
+        memory_limits: Default::default(),
+        additional_headroom: Default::default(),
+    })
+}
+
+fn fresh_requirements(pool: &MemoryLedger, bytes: u64) -> u64 {
+    crate::memory_fixture::host_total(
+        &pool
+            .reservation_requirements(&fresh_admission(bytes), None)
+            .unwrap(),
+    )
+}
+
+fn fresh(
+    pool: &MemoryLedger,
+    bytes: u64,
+    capacity: u64,
+) -> Result<(InferenceTextPreparation, WorkingMemoryFundingRun), WorkingMemoryError> {
+    let execution = InferenceExecutionIdentity::default();
+    let admission = fresh_admission(bytes);
+    let geometry = admission
+        .state
+        .execution_workspace
+        .as_ref()
+        .unwrap()
+        .geometry;
     let reservation = pool.reserve_with_capacity(
         &execution,
-        &Admission {
-            requested_positions: 1,
-            state,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        capacity,
+        &admission,
+        crate::memory_fixture::physical_host_limits(pool, capacity),
     )?;
     let (reservation, run) = reservation.into_funding()?;
     // The low-level preparation contract accepts zero outputs; no application
@@ -103,11 +125,17 @@ fn fresh(
     Ok((preparation, run))
 }
 
-struct Quote {
+struct Quote<'a> {
+    host: eredu_runtime::working_memory::RegisteredDenseDecoderInitialization<
+        'a,
+        MlxPoolingAttentionCache,
+        MlxPoolingAttentionCache,
+        StorageIdentity,
+    >,
     bytes: u64,
     complete: WorkingMemoryStorage<StorageIdentity>,
 }
-fn quote(plan: &PreparedResidentPoolingCopy<'_>, pool: &WorkingMemoryPool) -> Quote {
+fn quote<'a>(plan: &PreparedResidentPoolingCopy<'a>, pool: &MemoryLedger) -> Quote<'a> {
     let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
     let mut projection = ExistingArrayProjection::new(&context);
     let inputs = operands(plan)
@@ -120,7 +148,7 @@ fn quote(plan: &PreparedResidentPoolingCopy<'_>, pool: &WorkingMemoryPool) -> Qu
         &context,
         storage
             .iter()
-            .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+            .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root)),
     )
     .unwrap();
     let program =
@@ -135,12 +163,18 @@ fn quote(plan: &PreparedResidentPoolingCopy<'_>, pool: &WorkingMemoryPool) -> Qu
         .unwrap();
     let complete = complete.pin_registered(pool).unwrap();
     Quote {
+        host: plan.dense_host_copy(pool).unwrap(),
         bytes: n
             .checked_add(
                 plan.dense_initialization()
                     .unwrap()
                     .initialization_peak_bytes(),
             )
+            .and_then(|n| {
+                n.checked_add(crate::memory_fixture::publication_control_bytes(
+                    inputs.len().checked_mul(2).unwrap(),
+                ))
+            })
             .unwrap(),
         complete,
     }
@@ -169,7 +203,7 @@ fn positions(plan: &PreparedResidentPoolingCopy<'_>) -> Vec<i32> {
 #[test]
 fn pooling_dense_prompt_preserves_real_slots_controls_and_fresh_retention() {
     for populated in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         let stream = metal();
         let mut source = state(&stream, populated);
@@ -187,22 +221,39 @@ fn pooling_dense_prompt_preserves_real_slots_controls_and_fresh_retention() {
             .into_iter()
             .map(|a| a.allocation_info().unwrap().unwrap().identity())
             .collect::<Vec<_>>();
-        let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+        let before = (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
         let quoted = quote(&plan, &pool);
-        let cap = before.0.checked_add(quoted.bytes).unwrap();
+        assert_eq!(pool.fixture_funded_charge().unwrap(), before.0);
+        let before = (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
+        let cap = pool
+            .fixture_host_current()
+            .unwrap()
+            .checked_add(fresh_requirements(&pool, quoted.bytes))
+            .unwrap();
         assert!(matches!(
             fresh(&pool, quoted.bytes, cap - 1),
-            Err(WorkingMemoryError::BudgetExceeded { .. })
+            Err(WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
         ));
         assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+            (
+                pool.fixture_funded_charge().unwrap(),
+                pool.fixture_host_peak().unwrap()
+            ),
             before
         );
         let (preparation, run) = fresh(&pool, quoted.bytes, cap).unwrap();
         let (slots, native) = preparation
             .claim_prompt()
             .unwrap()
-            .construct_dense_decoder(plan.dense_host_copy(&pool).unwrap(), &run, quoted.complete)
+            .construct_dense_decoder(quoted.host, &run, quoted.complete)
             .unwrap();
         let roots = RefCell::new(Vec::with_capacity(original_ids.len() * 2));
         let completed = plan.copy_dense_retained(slots, &stream, &roots).unwrap();
@@ -211,10 +262,10 @@ fn pooling_dense_prompt_preserves_real_slots_controls_and_fresh_retention() {
         let token = completed.slot_metadata().clone();
         let d = completed.retained_slot_bytes();
         publish_arrays(&completed, &native, &roots);
-        let before_publish = pool.used_bytes().unwrap();
+        let before_publish = pool.fixture_funded_charge().unwrap();
         let (published, completion) = completed.publish_for_control().unwrap();
         let destination = published.into_state();
-        assert_eq!(pool.used_bytes().unwrap(), before_publish);
+        assert_eq!(pool.fixture_funded_charge().unwrap(), before_publish);
         assert_eq!(destination.as_ref().as_ptr(), pointer);
         assert!(destination
             .layer_slot_metadata()
@@ -252,10 +303,14 @@ fn pooling_dense_prompt_preserves_real_slots_controls_and_fresh_retention() {
             ids.len()
         );
         let raw = operands(&copied).first().map(|a| Array::clone(a));
-        let raw_bytes = raw
-            .as_ref()
-            .map_or(0, |a| a.allocation_info().unwrap().unwrap().bytes() as u64);
+        let raw_bytes = raw.as_ref().map_or(0, |a| {
+            let info = a.allocation_info().unwrap().unwrap();
+            (info.bytes() as u64)
+                .checked_add(info.host_control_bytes() as u64)
+                .unwrap()
+        });
         drop(copied);
+        let account_controls = crate::memory_fixture::request_control_bytes(preparation.request());
         drop((
             source,
             destination,
@@ -265,9 +320,9 @@ fn pooling_dense_prompt_preserves_real_slots_controls_and_fresh_retention() {
             preparation,
             run,
         ));
-        settle(&pool, d + raw_bytes);
+        settle(&pool, d + raw_bytes + account_controls);
         drop(raw);
-        settle(&pool, d);
+        settle(&pool, d + account_controls);
         drop(token);
         settle(&pool, 0);
     }
@@ -399,7 +454,7 @@ fn copied_pooling_projection_tracks_fresh_buffers_and_preserves_unknown_sources(
 
 #[test]
 fn saved_pooling_source_builds_fresh_dense_state_after_original_retirement() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let stream = metal();
     let source = state(&stream, true);
@@ -414,7 +469,10 @@ fn saved_pooling_source_builds_fresh_dense_state_after_original_retirement() {
         .with_decoder_slots(plan.host_copy(&pool).unwrap(), complete)
         .unwrap();
     let (saved_sampler, slots, native) = pool
-        .copy_text_components(joined, WorkspaceCopyLimits::new(u64::MAX))
+        .copy_text_components(
+            joined,
+            crate::memory_fixture::publication_copy_limits(&pool, operands(&plan).len(), u64::MAX),
+        )
         .unwrap();
     let (custody, native) = native.into_parts();
     let roots = RefCell::new(Vec::new());
@@ -423,20 +481,36 @@ fn saved_pooling_source_builds_fresh_dense_state_after_original_retirement() {
     drop((source, sampler, old_preparation, old_run));
     settle(
         &pool,
-        custody.bytes() + saved.shared_layout().capacity_bytes().unwrap(),
+        custody
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap()
+            .checked_sub(crate::memory_fixture::publication_control_bytes(
+                operands(&saved.prepare_copy().unwrap())
+                    .len()
+                    .checked_mul(2)
+                    .unwrap(),
+            ))
+            .unwrap()
+            + saved.shared_layout().capacity_bytes().unwrap(),
     );
     let plan = saved.prepare_copy().unwrap();
     let quoted = quote(&plan, &pool);
     let (preparation, run) = fresh(
         &pool,
         quoted.bytes,
-        pool.used_bytes().unwrap() + quoted.bytes,
+        pool.fixture_host_current()
+            .unwrap()
+            .checked_add(fresh_requirements(&pool, quoted.bytes))
+            .unwrap(),
     )
     .unwrap();
     let (slots, native) = preparation
         .claim_prompt()
         .unwrap()
-        .construct_dense_decoder(plan.dense_host_copy(&pool).unwrap(), &run, quoted.complete)
+        .construct_dense_decoder(quoted.host, &run, quoted.complete)
         .unwrap();
     let completed = plan.copy_dense_retained(slots, &stream, &roots).unwrap();
     publish_arrays(&completed, &native, &roots);
@@ -459,7 +533,7 @@ fn saved_pooling_source_builds_fresh_dense_state_after_original_retirement() {
 #[test]
 fn pooling_dense_wrong_source_and_partial_failure_preserve_actual_recovery_roots() {
     for late in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         let stream = metal();
         let source = state(&stream, true);
@@ -473,13 +547,16 @@ fn pooling_dense_wrong_source_and_partial_failure_preserve_actual_recovery_roots
         let (preparation, run) = fresh(
             &pool,
             quoted.bytes,
-            pool.used_bytes().unwrap() + quoted.bytes,
+            pool.fixture_host_current()
+                .unwrap()
+                .checked_add(fresh_requirements(&pool, quoted.bytes))
+                .unwrap(),
         )
         .unwrap();
         let (slots, native) = preparation
             .claim_prompt()
             .unwrap()
-            .construct_dense_decoder(plan.dense_host_copy(&pool).unwrap(), &run, quoted.complete)
+            .construct_dense_decoder(quoted.host, &run, quoted.complete)
             .unwrap();
         let roots = RefCell::new(Vec::new());
         if late {

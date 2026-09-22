@@ -31,7 +31,7 @@ fn explicit_original_invocation_preserves_phase_shape_scope_and_single_use() {
     ));
     assert_eq!(make().claim_slots(), 4);
     let h = make().initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (short_r, short_run) = fresh(&pool, h - 1);
     let before = ledger(&pool);
     let allocations = CLAIM_ALLOCATIONS.get();
@@ -124,14 +124,14 @@ fn explicit_original_invocation_preserves_phase_shape_scope_and_single_use() {
     drop(funded);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     let TensorObservationData::F32(values) = payload.data() else {
         panic!("F32 payload")
     };
     assert_eq!(values[0], -1.125);
     assert_eq!(values[17], 5.25);
     drop(payload);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn explicit_funded_observer_readout_uses_the_actual_scope_mask() {
     )
     .unwrap();
     let h = plan.initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (reservation, run) = fresh(&pool, h);
     let mut funded = run
         .prepare_capture_run(&reservation, plan)
@@ -337,7 +337,7 @@ fn original_window_claims_match_ordinary_global_slices_and_empty_fragment_delive
             .unwrap()
         };
         let h = make().initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (short_r, short_run) = fresh(&pool, h - 1);
         let before = ledger(&pool);
         let allocations = CLAIM_ALLOCATIONS.get();
@@ -444,9 +444,9 @@ fn original_window_claims_match_ordinary_global_slices_and_empty_fragment_delive
         drop(funded);
         drop(r);
         drop(run);
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         drop(actual);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -478,7 +478,7 @@ fn original_logical_skip_preserves_limit_reason_without_a_tensor_claim() {
             .is_err()
     );
     let h = plan.initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (reservation, run) = fresh(&pool, h);
     let mut funded = run
         .prepare_capture_run(&reservation, plan)
@@ -533,7 +533,7 @@ fn original_logical_skip_preserves_limit_reason_without_a_tensor_claim() {
     drop(funded);
     drop(reservation);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(payload);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

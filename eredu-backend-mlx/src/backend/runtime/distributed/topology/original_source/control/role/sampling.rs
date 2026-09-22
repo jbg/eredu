@@ -30,7 +30,7 @@ impl OriginalParallelControlOwner {
             size_of::<Result<OriginalSamplingSource,Error>>(),size_of::<Self>(),
             size_of::<(&Self,&eredu_runtime::working_memory::InferenceTextStep)>(),
             failure_control_bytes().ok_or_else(overflow)?])?;
-        owner.execution.validate_same_request(step.request()).map_err(|cause|
+        owner.native.text_execution()?.validate_same_request(step.request()).map_err(|cause|
             control_error(ControlCause::WorkingMemory(cause),&owner.custody.source,&owner.custody.funding))?;
         Ok(OriginalSamplingSource{attempt:step.attempt(),owner:Self(self.0.clone())})
     }
@@ -126,7 +126,7 @@ impl BoundSamplingSource {
             drop(source);
             let invocation=Invocation{input,claim,order:self.order,capacity,
                 owner:OriginalParallelControlOwner(self.source.owner.0.clone())};
-            run_native_role(invocation,capacity,&owner.bank,&owner.controls,c,|invocation,observer|{
+            run_native_role(invocation,capacity,&owner.native,c,|invocation,observer|{
                 Ok(invocation.run(observer))
             }).map_err(|cause|Error::with_original_control_source(cause,false))?
         })();

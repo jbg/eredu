@@ -34,9 +34,8 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
     // Taking from the scale table with rank-2 indices creates rank-3 Gather.
     value.intermediate_rank = 3;
     value.backend_shells = 4; // retained scale and quantized/output handoffs
-    value.unqualified_kernel_owner =
-        (!crate::backend::nn::fp8::kernel::source_qualified())
-            .then_some(CustomKernelOwner::BlockFp8);
+    value.unqualified_kernel_owner = (!crate::backend::nn::fp8::kernel::source_qualified())
+        .then_some(CustomKernelOwner::BlockFp8);
     if bf16_grouped_width(*input.shape().last()?) {
         value.bf16_projection_calls = 1;
         if value.unqualified_kernel_owner.is_none() {
@@ -117,9 +116,8 @@ pub(super) fn observed(operation: WorkspaceOperationView<'_>) -> Option<Lowering
         v
     };
     value.intermediate_rank = if prepare { 3 } else { 2 };
-    value.unqualified_kernel_owner =
-        (!crate::backend::nn::fp8::kernel::source_qualified())
-            .then_some(CustomKernelOwner::BlockFp8);
+    value.unqualified_kernel_owner = (!crate::backend::nn::fp8::kernel::source_qualified())
+        .then_some(CustomKernelOwner::BlockFp8);
     if value.bf16_projection_calls != 0 && value.unqualified_kernel_owner.is_none() {
         value.unqualified_kernel_owner = bf16_projection_source_requirement();
     }
@@ -219,11 +217,10 @@ pub(super) fn grouped_linear(operation: WorkspaceOperationView<'_>) -> Option<Lo
     value.validations = 1; // selected IDs; no BF16 grouped-row validation
     value.maximum_operands = 5;
     value.backend_shells = 3; // decoded scale alias and quantizer handoffs
-    // Rank-3 scale indices create a rank-4 Gather before its axis squeeze.
+                              // Rank-3 scale indices create a rank-4 Gather before its axis squeeze.
     value.intermediate_rank = 4;
-    value.unqualified_kernel_owner =
-        (!crate::backend::nn::fp8::kernel::source_qualified())
-            .then_some(CustomKernelOwner::BlockFp8);
+    value.unqualified_kernel_owner = (!crate::backend::nn::fp8::kernel::source_qualified())
+        .then_some(CustomKernelOwner::BlockFp8);
     Some(value)
 }
 pub(super) fn grouped_control_bytes() -> Option<usize> {

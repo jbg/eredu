@@ -13,7 +13,11 @@ pub(crate) struct ResidentRecordStorage {
     pub(crate) full_capacity: Option<u64>,
 }
 impl ResidentRecordStorage {
-    fn include_sampling(&mut self, rows: &[ResidentSamplingRecipe], extents: &mut usize) -> Result<bool, crate::backend::error::Error> {
+    fn include_sampling(
+        &mut self,
+        rows: &[ResidentSamplingRecipe],
+        extents: &mut usize,
+    ) -> Result<bool, crate::backend::error::Error> {
         let error = crate::backend::error::Error::PrefillControl;
         let mut complete = true;
         for row in rows {
@@ -25,16 +29,16 @@ impl ResidentRecordStorage {
                 }
                 SamplingWorkspacePhase::Step { .. } => match row.completion() {
                     Some(completion) => {
-                        self
-                            .include(completion.traversal, extents)
-                            .map_err(error)?;
-                        self
-                            .include_nested(
-                                completion.traversal,
-                                NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
-                                extents,
-                            )
-                            .map_err(error)?;
+                        self.include(completion.traversal, extents).map_err(error)?;
+                        self.include_nested(
+                            completion.traversal,
+                            NestedCompletionRoots::uniform(
+                                completion.nested_completions,
+                                completion.nested_root_capacity.max(3),
+                            ),
+                            extents,
+                        )
+                        .map_err(error)?;
                     }
                     None => complete = false,
                 },
@@ -42,69 +46,112 @@ impl ResidentRecordStorage {
         }
         Ok(complete)
     }
-    fn finish_capacity(&mut self, complete: bool, extents: usize) -> Result<(), crate::backend::error::Error> {
+    fn finish_capacity(
+        &mut self,
+        complete: bool,
+        extents: usize,
+    ) -> Result<(), crate::backend::error::Error> {
         if complete {
             let capacity = safemlx::SubmissionRecordQuota::fresh_capacity_for_extents(extents)
-                .ok_or(crate::backend::error::Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
-            self.full_capacity = Some(u64::try_from(capacity)
-                .map_err(|_| crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow))?);
+                .ok_or(crate::backend::error::Error::PrefillControl(
+                    WorkingMemoryError::UnknownBound,
+                ))?;
+            self.full_capacity = Some(u64::try_from(capacity).map_err(|_| {
+                crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow)
+            })?);
         }
         Ok(())
     }
-    fn include_source_copies(&mut self, copies: host_copies::HostCopies,
-        transfers: host_copies::HostTransfers, forwards: usize, extents: &mut usize)
-        -> Result<(), WorkingMemoryError> {
+    fn include_source_copies(
+        &mut self,
+        copies: host_copies::HostCopies,
+        transfers: host_copies::HostTransfers,
+        forwards: usize,
+        extents: &mut usize,
+    ) -> Result<(), WorkingMemoryError> {
         let overflow = || WorkingMemoryError::Overflow;
-        for (traversal, attempts) in [(copies.traversal, copies.per_forward),
-            (copies.aggregate_traversal, transfers.per_forward)] {
+        for (traversal, attempts) in [
+            (copies.traversal, copies.per_forward),
+            (copies.aggregate_traversal, transfers.per_forward),
+        ] {
             let attempts = attempts.checked_mul(forwards).ok_or_else(overflow)?;
             let mut one = Self::default();
             let mut one_extent = 0;
             one.include(traversal, &mut one_extent)?;
             self.minimum_capacity = self.minimum_capacity.max(one.minimum_capacity);
-            self.known_constructor_bytes = self.known_constructor_bytes.checked_add(
-                one.known_constructor_bytes.checked_mul(u64::try_from(attempts).map_err(|_|overflow())?)
-                    .ok_or_else(overflow)?).ok_or_else(overflow)?;
-            *extents = extents.checked_add(one_extent.checked_mul(attempts).ok_or_else(overflow)?)
+            self.known_constructor_bytes = self
+                .known_constructor_bytes
+                .checked_add(
+                    one.known_constructor_bytes
+                        .checked_mul(u64::try_from(attempts).map_err(|_| overflow())?)
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+            *extents = extents
+                .checked_add(one_extent.checked_mul(attempts).ok_or_else(overflow)?)
                 .ok_or_else(overflow)?;
         }
         let waits = safemlx::OperationEvent::wait_record_layout(
-            transfers.waits_per_forward.checked_mul(forwards).ok_or_else(overflow)?)
-            .ok_or(WorkingMemoryError::UnknownBound)?;
-        *extents = extents.checked_add(waits.record_allocation_extents()
-            .ok_or(WorkingMemoryError::UnknownBound)?).ok_or_else(overflow)?;
-        self.known_constructor_bytes = self.known_constructor_bytes.checked_add(
-            u64::try_from(waits.total_record_requested_bytes()).map_err(|_|overflow())?)
+            transfers
+                .waits_per_forward
+                .checked_mul(forwards)
+                .ok_or_else(overflow)?,
+        )
+        .ok_or(WorkingMemoryError::UnknownBound)?;
+        *extents = extents
+            .checked_add(
+                waits
+                    .record_allocation_extents()
+                    .ok_or(WorkingMemoryError::UnknownBound)?,
+            )
+            .ok_or_else(overflow)?;
+        self.known_constructor_bytes = self
+            .known_constructor_bytes
+            .checked_add(
+                u64::try_from(waits.total_record_requested_bytes()).map_err(|_| overflow())?,
+            )
             .ok_or_else(overflow)?;
         Ok(())
     }
     /// Same fixed Eval constructors for one non-text numerical cut.
     pub(super) fn for_completion(completion: ResidentCompletionRecipe) -> Option<Self> {
-        Self::for_completion_with_waits(completion,0)
+        Self::for_completion_with_waits(completion, 0)
     }
-    pub(super) fn for_completion_with_waits(completion:ResidentCompletionRecipe,waits:usize)->Option<Self> {
+    pub(super) fn for_completion_with_waits(
+        completion: ResidentCompletionRecipe,
+        waits: usize,
+    ) -> Option<Self> {
         Self::for_completion_sources(completion, waits, None)
     }
-    pub(super) fn for_completion_sources(completion: ResidentCompletionRecipe, waits: usize,
-        sources: Option<host_copies::PreparedSourceCopies>) -> Option<Self> {
+    pub(super) fn for_completion_sources(
+        completion: ResidentCompletionRecipe,
+        waits: usize,
+        sources: Option<host_copies::PreparedSourceCopies>,
+    ) -> Option<Self> {
         let mut value = Self::default();
         let mut extents = 0;
         value.include(completion.traversal, &mut extents).ok()?;
         value
             .include_nested(
                 completion.traversal,
-                NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
+                NestedCompletionRoots::uniform(
+                    completion.nested_completions,
+                    completion.nested_root_capacity.max(3),
+                ),
                 &mut extents,
             )
             .ok()?;
-        if waits!=0 {
-            let source=safemlx::OperationEvent::wait_record_layout(waits)?;
-            extents=extents.checked_add(source.record_allocation_extents()?)?;
-            value.known_constructor_bytes=value.known_constructor_bytes.checked_add(
-                u64::try_from(source.total_record_requested_bytes()).ok()?)?;
+        if waits != 0 {
+            let source = safemlx::OperationEvent::wait_record_layout(waits)?;
+            extents = extents.checked_add(source.record_allocation_extents()?)?;
+            value.known_constructor_bytes = value
+                .known_constructor_bytes
+                .checked_add(u64::try_from(source.total_record_requested_bytes()).ok()?)?;
         }
         if let Some(source) = sources {
-            value.include_source_copies(source.copies, source.transfers, 1, &mut extents).ok()?;
+            value
+                .include_source_copies(source.copies, source.transfers, 1, &mut extents)
+                .ok()?;
         }
         value.full_capacity = Some(
             u64::try_from(safemlx::SubmissionRecordQuota::fresh_capacity_for_extents(
@@ -138,8 +185,10 @@ impl ResidentRecordStorage {
         Ok(())
     }
     fn include_nested(
-        &mut self, traversal: safemlx::OperationEvalTraversalLayout,
-        roots: NestedCompletionRoots<'_>, extents: &mut usize,
+        &mut self,
+        traversal: safemlx::OperationEvalTraversalLayout,
+        roots: NestedCompletionRoots<'_>,
+        extents: &mut usize,
     ) -> Result<(), WorkingMemoryError> {
         for count in roots.iter() {
             self.include(
@@ -220,16 +269,26 @@ impl ResidentNativeRecipe {
                         .include(traversal, &mut extents)
                         .map_err(error)?;
                     requirement
-                        .include_nested(traversal, NestedCompletionRoots::for_row(row), &mut extents)
+                        .include_nested(
+                            traversal,
+                            NestedCompletionRoots::for_row(row),
+                            &mut extents,
+                        )
                         .map_err(error)?;
                 }
                 None => complete = false,
             }
         }
         if let Some(copies) = self.host_copies {
-            requirement.include_source_copies(copies,
-                self.host_transfers.ok_or_else(|| error(WorkingMemoryError::UnknownBound))?,
-                records.len(), &mut extents).map_err(error)?;
+            requirement
+                .include_source_copies(
+                    copies,
+                    self.host_transfers
+                        .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?,
+                    records.len(),
+                    &mut extents,
+                )
+                .map_err(error)?;
         }
         // The accepted group bank owns a finite consumer population in each
         // equation role. Each wait allocates the owning native WaitRecord and
@@ -260,24 +319,26 @@ impl ResidentNativeRecipe {
         // finish() already authenticates the exact plan, every equation row,
         // and Preparation followed by one sampling row per output attempt.
         complete &= requirement.include_sampling(self.sampling_records(), &mut extents)?;
-            // Each Roots/ModelExecution collector is consumed once, even on
-            // constructor failure. SamplingEvent has the same submitted-once
-            // guard. Sum all attempted constructors: cancellation/failed prefixes
-            // can only remove suffixes, and no early retirement credit is used.
-            // A true nested block has its own fixed Eval attempt. Its enclosing
-            // row ceiling is repeated conservatively for each configured call;
-            // actual per-block retirement still occurs in the shared worker.
-            // Resident completion and scalar reads query/yield existing records;
-            // bounded-policy consumer WaitRecords were added separately above.
-            // Cross-stream Event/Fence
-            // operations execute inside the counted Fixed Eval Record.
+        // Each Roots/ModelExecution collector is consumed once, even on
+        // constructor failure. SamplingEvent has the same submitted-once
+        // guard. Sum all attempted constructors: cancellation/failed prefixes
+        // can only remove suffixes, and no early retirement credit is used.
+        // A true nested block has its own fixed Eval attempt. Its enclosing
+        // row ceiling is repeated conservatively for each configured call;
+        // actual per-block retirement still occurs in the shared worker.
+        // Resident completion and scalar reads query/yield existing records;
+        // bounded-policy consumer WaitRecords were added separately above.
+        // Cross-stream Event/Fence
+        // operations execute inside the counted Fixed Eval Record.
         requirement.finish_capacity(complete, extents)?;
         Ok(requirement)
     }
 }
 
 impl ResidentSamplingProgram {
-    pub(crate) fn record_storage_requirement(&self) -> Result<ResidentRecordStorage, crate::backend::error::Error> {
+    pub(crate) fn record_storage_requirement(
+        &self,
+    ) -> Result<ResidentRecordStorage, crate::backend::error::Error> {
         let mut required = ResidentRecordStorage::default();
         let mut extents = 0;
         let complete = required.include_sampling(self.rows(), &mut extents)?;

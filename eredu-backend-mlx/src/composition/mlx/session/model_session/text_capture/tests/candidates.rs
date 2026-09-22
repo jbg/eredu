@@ -1,10 +1,12 @@
 //! Genuine original producer/consumer through shared ordinary and controlled drivers.
 use super::*;
 use crate::backend::array_copy::CandidateExtraction;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     ControlledTextGeneration, GenerationCancellationToken, TextGeneration, TextPreparationOptions,
 };
-fn load(stream: &Stream, pool: &WorkingMemoryPool, route: usize) -> (Runtime, tempfile::TempDir) {
+fn load(stream: &Stream, pool: &MemoryLedger, route: usize) -> (Runtime, tempfile::TempDir) {
     match route {
         0 => host::runtime(stream, pool, None),
         1 => host::runtime(stream, pool, Some(1)),
@@ -106,7 +108,8 @@ fn observed(
             disk::config(0.0, chunk, capacity),
             controller.clone(),
             TextPreparationOptions {
-                interventions: None, capture: Some(source.clone()),
+                interventions: None,
+                capture: Some(source.clone()),
             },
         )
         .unwrap();
@@ -131,7 +134,8 @@ fn observed(
             ids,
             disk::config(0.0, chunk, capacity),
             TextPreparationOptions {
-                interventions: None, capture: Some(source.clone()),
+                interventions: None,
+                capture: Some(source.clone()),
             },
         )
         .unwrap();
@@ -172,7 +176,7 @@ fn original_terminal_candidates_match_full_readout_and_every_kv_value_across_all
     let stream = stream();
     for prompt in [5usize, 6] {
         let ids: Vec<_> = (1..=prompt as u32).collect();
-        let reference_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let reference_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut reference, _artifact) = load(&stream, &reference_pool, 0);
         let reference_source = candidate_source(&reference, prompt as u64);
         let (expected_ids, expected_frames, reference_quote) = observed(
@@ -190,7 +194,7 @@ fn original_terminal_candidates_match_full_readout_and_every_kv_value_across_all
             .any(|v| *v != 0.0));
         for route in 0..3 {
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                 let (mut runtime, _artifact) = load(&stream, &pool, route);
                 let source = candidate_source(&runtime, prompt as u64);
                 let (tokens, frames, quote) =
@@ -217,7 +221,7 @@ fn original_terminal_candidates_match_full_readout_and_every_kv_value_across_all
                 let pointer = alias.records().as_ptr();
                 drop(frames);
                 assert_eq!(alias.records().as_ptr(), pointer);
-                assert_eq!(pool.used_bytes().unwrap(), h + quote.source_tail());
+                assert_eq!(pool.fixture_host_charge().unwrap(), h + quote.source_tail());
                 drop(alias);
                 settle_terminal(&pool, quote.source_tail());
                 drop(source);
@@ -234,11 +238,11 @@ fn original_terminal_candidates_match_full_readout_and_every_kv_value_across_all
 #[test]
 fn original_candidate_one_short_rejects_before_native_work_then_exact_runs_without_refill() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let source = candidate_source(&runtime, 6);
     let ids = vec![1, 2, 3, 4, 5, 6];
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let probe = CaptureFundingProbe::new(&source);
     // Quote the smallest valid chunk: larger requested chunks may legitimately
     // fit a short budget by shrinking through the shared planner.
@@ -260,7 +264,7 @@ fn original_candidate_one_short_rejects_before_native_work_then_exact_runs_witho
     let controller = disk::Controller::default();
     let paths_before = paths::snapshot();
     let inputs_before = paths::session_input_creation_attempts();
-    let used_before = pool.used_bytes().unwrap();
+    let used_before = pool.fixture_host_charge().unwrap();
     let probe = CaptureFundingProbe::new(&source);
     CandidateExtraction::reset_test_counts();
     let error = ControlledTextGeneration::new_with_options(
@@ -269,26 +273,27 @@ fn original_candidate_one_short_rejects_before_native_work_then_exact_runs_witho
         disk::config(0.0, 1, exact - 1),
         controller.clone(),
         TextPreparationOptions {
-            interventions: None, capture: Some(source.clone()),
+            interventions: None,
+            capture: Some(source.clone()),
         },
     )
     .err()
     .unwrap();
     assert!(matches!(
         cause::<WorkingMemoryError>(&error),
-        WorkingMemoryError::BudgetExceeded { .. }
+        WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
     ));
     assert_eq!(CandidateExtraction::test_counts(), (0, 0));
     assert_eq!(paths::snapshot(), paths_before);
     assert_eq!(controller.0.get(), (0, 0));
     assert_eq!(paths::session_input_creation_attempts(), inputs_before);
-    assert_eq!(pool.used_bytes().unwrap(), used_before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used_before);
     assert!(probe.is_empty(), "short admission cannot publish an owner");
     drop(probe);
     drop(error);
     let (_, frames, accepted) = observed(&mut runtime, &source, ids, 1, true, exact);
     assert_eq!(accepted.reservation, required);
-    assert!(pool.peak_bytes().unwrap() <= exact);
+    assert!(pool.fixture_host_peak().unwrap() <= exact);
     drop(frames);
     finish_runtime(runtime, &stream);
     settle_terminal(&pool, original.source_tail());
@@ -298,7 +303,7 @@ fn original_candidate_one_short_rejects_before_native_work_then_exact_runs_witho
 #[test]
 fn cancelled_original_candidates_execute_no_extraction_or_sampling_and_issue_no_frame() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let source = candidate_source(&runtime, 6);
     let probe = CaptureFundingProbe::new(&source);
@@ -307,7 +312,8 @@ fn cancelled_original_candidates_execute_no_extraction_or_sampling_and_issue_no_
         vec![1, 2, 3, 4, 5, 6],
         disk::config(0.0, 2, u64::MAX),
         TextPreparationOptions {
-            interventions: None, capture: Some(source.clone()),
+            interventions: None,
+            capture: Some(source.clone()),
         },
     )
     .unwrap();
@@ -331,7 +337,7 @@ fn cancelled_original_candidates_execute_no_extraction_or_sampling_and_issue_no_
 #[test]
 fn original_candidates_share_sequence_spans_with_full_tensor_without_extra_extraction() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let discovery = MlxBackend::capture_discovery(&runtime).unwrap();
     let source = candidate_source(&runtime, 6);
@@ -366,7 +372,8 @@ fn original_candidates_share_sequence_spans_with_full_tensor_without_extra_extra
         disk::config(0.0, 2, u64::MAX),
         controller.clone(),
         TextPreparationOptions {
-            interventions: None, capture: Some(source.clone()),
+            interventions: None,
+            capture: Some(source.clone()),
         },
     )
     .unwrap();

@@ -54,6 +54,8 @@ impl PrefillControlProjection {
 pub(crate) enum NativeReservationGuard {
     Prefill(PrefillGuard),
     Model(model_execution::ModelReservationGuard),
+    SpeculativeSchedule(eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority,
+        Option<crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeControlActivation>),
 }
 pub(crate) struct ReservationGuard {
     // Lexical TLS authority must retire before asynchronous native recovery.
@@ -61,9 +63,13 @@ pub(crate) struct ReservationGuard {
     native: NativeReservationGuard,
 }
 impl ReservationGuard {
-    pub(crate) fn new(native: NativeReservationGuard,
-        parent: Option<crate::backend::nn::tensor::TokenValidationParent>) -> Result<Self, Error> {
-        let validation = parent.map(crate::backend::nn::tensor::TokenValidationParent::bind).transpose()?;
+    pub(crate) fn new(
+        native: NativeReservationGuard,
+        parent: Option<crate::backend::nn::tensor::TokenValidationParent>,
+    ) -> Result<Self, Error> {
+        let validation = parent
+            .map(crate::backend::nn::tensor::TokenValidationParent::bind)
+            .transpose()?;
         Ok(Self { validation, native })
     }
     pub(crate) fn into_native(self) -> NativeReservationGuard {
@@ -88,7 +94,11 @@ pub(crate) struct PrefillRetention {
     custody: Option<OriginalPrefillRecoveryCustody>,
 }
 impl Retention for PrefillRetention {
-    fn observe(&self, status: Status) { if let Some(paged) = &self.paged { paged.observe(status); } }
+    fn observe(&self, status: Status) {
+        if let Some(paged) = &self.paged {
+            paged.observe(status);
+        }
+    }
 }
 pub(crate) type PrefillGuard = Recovery<PrefillRetention>;
 
@@ -198,8 +208,15 @@ impl PrefillBankOwner {
         };
         projection.capture_observer()
     }
-    pub(crate) fn with_paged_sources(self, paged: Option<crate::backend::nn::workspace::ProjectedPagedSources>) -> Self {
-        self.0.as_ref().expect("owned prefill bank").borrow_mut().paged = paged;
+    pub(crate) fn with_paged_sources(
+        self,
+        paged: Option<crate::backend::nn::workspace::ProjectedPagedSources>,
+    ) -> Self {
+        self.0
+            .as_ref()
+            .expect("owned prefill bank")
+            .borrow_mut()
+            .paged = paged;
         self
     }
     pub(crate) fn with_native_storage(
@@ -246,7 +263,9 @@ impl PrefillBankOwner {
         controls: OriginalTextControlGuard,
         recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
     ) -> Result<(Self, PrefillBankProjection), Error> {
-        Self::new_with_resident_sources(original, request, runtime, record, graph, controls, recipe, None)
+        Self::new_with_resident_sources(
+            original, request, runtime, record, graph, controls, recipe, None,
+        )
     }
     pub(crate) fn new_with_resident_sources(
         mut original: OriginalTextPrefillScopeSet,
@@ -256,19 +275,19 @@ impl PrefillBankOwner {
         graph: &SubmissionGraphQuota,
         controls: OriginalTextControlGuard,
         recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
-        addressable: Option<&crate::backend::submission_recovery::addressable::AddressableRequestOwner>,
+        addressable: Option<
+            &crate::backend::submission_recovery::addressable::AddressableRequestOwner,
+        >,
     ) -> Result<(Self, PrefillBankProjection), Error> {
-        if let Some(addressable) = addressable { addressable.validate_request(request)?; }
+        if let Some(addressable) = addressable {
+            addressable.validate_request(request)?;
+        }
         if recipe.is_some_and(|recipe| recipe.plan().geometry() != request.geometry()) {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
         original.validate_request(request).map_err(memory)?;
         controls
-            .validate_reservation(
-                request
-                    .memory_reservation()
-                    .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?,
-            )
+            .validate_reservation(request.memory_reservation())
             .map_err(memory)?;
         if record.is_none() {
             return Err(safemlx::OriginalNativeControlError::MissingRecord.into());
@@ -297,11 +316,24 @@ impl PrefillBankOwner {
                 let traversal = recipe
                     .map(|recipe| recipe.completion_for_prefill(descriptor))
                     .transpose()?;
-                let parallel=recipe.map(|recipe|recipe.parallel_for_prefill(descriptor)).transpose()?.flatten();
-                let row = recipe.map(|recipe| recipe.addressable_for_prefill(descriptor)).transpose()?.flatten()
-                    .map(|(row, invocation)| addressable.ok_or(Error::PrefillScopeUnavailable)?
-                        .row(row, 0, invocation)).transpose()?;
-                let owner = owner.with_traversal(traversal)?.with_parallel(parallel)?.with_addressable(row)?;
+                let parallel = recipe
+                    .map(|recipe| recipe.parallel_for_prefill(descriptor))
+                    .transpose()?
+                    .flatten();
+                let row = recipe
+                    .map(|recipe| recipe.addressable_for_prefill(descriptor))
+                    .transpose()?
+                    .flatten()
+                    .map(|(row, invocation)| {
+                        addressable
+                            .ok_or(Error::PrefillScopeUnavailable)?
+                            .row(row, 0, invocation)
+                    })
+                    .transpose()?;
+                let owner = owner
+                    .with_traversal(traversal)?
+                    .with_parallel(parallel)?
+                    .with_addressable(row)?;
                 (Some(owner), Some(projection))
             } else {
                 let prepared =
@@ -417,11 +449,7 @@ impl PrefillBankProjection {
                 .map_err(|_| Error::PrefillScopeReentrant)?;
             bank.original.validate_request(request).map_err(memory)?;
             self.controls
-                .validate_reservation(
-                    request
-                        .memory_reservation()
-                        .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?,
-                )
+                .validate_reservation(request.memory_reservation())
                 .map_err(memory)?;
             if bank.failed {
                 return Err(Error::PrefillScopeUnavailable);
@@ -500,10 +528,20 @@ impl PrefillBankProjection {
                     None
                 };
                 if completion_role(role) {
-                    let paged = cell.try_borrow().map_err(|_| Error::PrefillScopeReentrant)?.paged.clone();
+                    let paged = cell
+                        .try_borrow()
+                        .map_err(|_| Error::PrefillScopeReentrant)?
+                        .paged
+                        .clone();
                     if let Some(paged) = paged {
-                        let transient = node.retention.roots.as_ref().ok_or(Error::PrefillScopeUnavailable)?.transient_projection()?;
-                        node.retention.paged = Some(paged.enter_prefill(request, role, scope, transient)?);
+                        let transient = node
+                            .retention
+                            .roots
+                            .as_ref()
+                            .ok_or(Error::PrefillScopeUnavailable)?
+                            .transient_projection()?;
+                        node.retention.paged =
+                            Some(paged.enter_prefill(request, role, scope, transient)?);
                     }
                 }
                 let projection = {
@@ -546,12 +584,7 @@ pub(crate) fn begin_ordinary(
     // Existing reserved components without C1 keep their existing completion
     // mechanism. They neither obtain C1 authority nor allocate a null-domain
     // collector while another original arena is active.
-    let (roots, projection) = if request.memory_reservation().is_some() {
-        (None, None)
-    } else {
-        let (roots, projection) = RootsOwner::ordinary();
-        (Some(roots), Some(projection))
-    };
+    let (roots, projection) = (None, None);
     let guard = Recovery::try_begin(PrefillRetention {
         request,
         paged: None,
@@ -766,4 +799,4 @@ pub(crate) mod test_trace {
 
 pub(crate) mod nested;
 
-pub(crate) use roots::TransientRootsProjection;
+pub(crate) use roots::{InvocationRootSource, TransientRootsProjection};

@@ -76,32 +76,51 @@ fn component_capture_prompt(runtime: &ModelRuntime<MlxBackend<'_>>) -> MlxModelI
 fn component_capture_generation<'a, 'world>(
     runtime: &'a mut ModelRuntime<MlxBackend<'world>>,
     sampling: eredu_core::ResolvedGenerationConfig,
-) -> eredu_core::ControlledTextGeneration<'a, MlxBackend<'world>, ComponentCaptureController> {
-    let prompt = component_capture_prompt(runtime);
-    eredu_core::ControlledTextGeneration::from_prompt(
+    options: Option<eredu_core::TextPreparationOptions>,
+) -> Result<ComponentState<'a, 'world>, ComponentPreparationError> {
+    component_generation_start_with_tokens(
         runtime,
-        prompt,
+        options,
         TextGenerationConfig::new(sampling),
-        ComponentCaptureController::default(),
+        &component_capture_prompt_tokens(),
+        std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some(),
     )
-    .unwrap()
 }
 
 fn verify_loaded_component_capture(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
-    checkpoint: &Path,
+    reference: &mut ModelRuntime<MlxBackend<'_>>,
     stream: &Stream,
-    reference_load_options: &eredu_runtime::NormalizedLoadRequest,
     loop_normalization: Option<(&str, &str)>,
     required_unit_points: &[&str],
     stream_readout: Option<&eredu_core::component::ComponentReadout>,
 ) {
-    use eredu_core::{capture::*, ObservationSupportStatus, TextGenerationBackend as _};
-    let count = <MlxBackend as eredu_core::ModelCapabilityBackend>::count_prepared_input(
-        runtime,
-        &component_capture_prompt(runtime),
-    )
-    .unwrap();
+    use eredu_core::{ObservationSupportStatus, TextGenerationBackend as _, capture::*};
+    runtime.synchronize().unwrap();
+    let count = if std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some() {
+        <MlxBackend as eredu_core::ModelCapabilityBackend>::count_prepared_input(
+            runtime,
+            &component_capture_prompt(runtime),
+        )
+        .unwrap()
+    } else {
+        use eredu_runtime::working_memory::OriginalTokenizerBackend;
+        let tokens = component_capture_prompt_tokens();
+        let model = runtime.session().original_model_source().unwrap();
+        let (_tokenizer, prepared) = crate::tests::support::plain_controller::source(
+            runtime.backend().memory_ledger(),
+            model.erased().inference_execution_identity(),
+        );
+        let prompt = MlxBackend::prepare_semantic_prompt(
+            runtime,
+            &prepared,
+            &eredu_core::TokenIdsInputPlan::new(&tokens).unwrap(),
+            None,
+        )
+        .unwrap();
+        <MlxBackend as eredu_core::ModelCapabilityBackend>::count_prepared_input(runtime, &prompt)
+            .unwrap()
+    };
     assert_eq!(count.text_tokens, 2);
     assert_eq!(
         count.model_positions,
@@ -257,7 +276,6 @@ fn verify_loaded_component_capture(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage.checked_mul(8).unwrap(),
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -284,17 +302,10 @@ fn verify_loaded_component_capture(
         )
         .unwrap();
     MlxBackend::validate_text_capture(runtime, &skip).unwrap();
-    // A local ordinary session supplies actual component tensors for comparison;
-    // no partition or native observer internals are used to obtain either result.
-    let weights_stream = fixture_weights_stream(stream);
-    let backend = MlxBackend::new(stream, &weights_stream);
-    let prepared = eredu_core::prepare_inspected_model(
-        &backend,
-        component_fixture_inspection(checkpoint),
-        MlxLoadRequest::from_normalized(reference_load_options.clone()),
-    )
-    .unwrap();
-    let mut reference = ModelRuntime::from_prepared(backend, prepared).unwrap();
+    // The independently loaded oracle keeps its completed parameter custody
+    // through capture; reset only its mutable generation state.
+    reference.reset().unwrap();
+    reference.synchronize().unwrap();
     let sampling = eredu_core::resolve_generation_config(
         None,
         eredu_core::GenerationConfigOverrides {
@@ -305,8 +316,15 @@ fn verify_loaded_component_capture(
     )
     .unwrap();
     let run = |runtime: &mut ModelRuntime<MlxBackend<'_>>, plan: &AdmittedCapturePlan| {
-        let mut generation = component_capture_generation(runtime, sampling);
-        generation.enable_capture(plan.clone()).unwrap();
+        let mut generation = component_capture_generation(
+            runtime,
+            sampling,
+            Some(eredu_core::TextPreparationOptions {
+                capture: Some(SharedCapturePlan::new(plan.clone())),
+                interventions: None,
+            }),
+        )
+        .unwrap();
         let mut tokens = Vec::new();
         let mut steps = Vec::new();
         for _ in 0..3 {
@@ -315,7 +333,7 @@ fn verify_loaded_component_capture(
         }
         (tokens, steps)
     };
-    let expected = run(&mut reference, &plan);
+    let expected = run(reference, &plan);
     if std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some() {
         verify_component_prefill_geometry_rejection(runtime, &plan, sampling);
     }
@@ -350,7 +368,8 @@ fn verify_loaded_component_capture(
                     .iter()
                     .find(|record| record.path == path)
                     .unwrap();
-                let Some(CapturePayload::Tensor(value)) = &record.payload else {
+                let Some(value) = record.payload.as_ref().and_then(CapturePayload::as_tensor)
+                else {
                     panic!("loop normalization tensor")
                 };
                 let eredu_core::TensorObservationData::F32(values) = value.data() else {
@@ -399,9 +418,13 @@ fn verify_loaded_component_capture(
                 continue;
             }
             assert_eq!(actual.outcome, CaptureOutcome::Captured);
-            let (Some(CapturePayload::Tensor(actual)), Some(CapturePayload::Tensor(expected))) =
-                (&actual.payload, &expected.payload)
-            else {
+            let (Some(actual), Some(expected)) = (
+                actual.payload.as_ref().and_then(CapturePayload::as_tensor),
+                expected
+                    .payload
+                    .as_ref()
+                    .and_then(CapturePayload::as_tensor),
+            ) else {
                 panic!("component capture must produce global tensors")
             };
             assert_eq!(actual.shape(), expected.shape());
@@ -458,9 +481,16 @@ fn verify_loaded_component_capture(
             .iter()
             .find(|record| record.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
             .unwrap();
-        let (Some(CapturePayload::Tensor(actual)), Some(CapturePayload::Tensor(expected))) =
-            (&actual.records[0].payload, &expected.payload)
-        else {
+        let (Some(actual), Some(expected)) = (
+            actual.records[0]
+                .payload
+                .as_ref()
+                .and_then(CapturePayload::as_tensor),
+            expected
+                .payload
+                .as_ref()
+                .and_then(CapturePayload::as_tensor),
+        ) else {
             panic!("final logits")
         };
         assert_eq!(actual.shape(), expected.shape());
@@ -500,7 +530,11 @@ fn verify_loaded_component_capture(
         for (step, raw) in reduced.1.iter().zip(&logits_only.1) {
             assert_eq!(step.partitions[0].producers.len(), 1);
             assert_eq!(step.records[0].outcome, CaptureOutcome::Captured);
-            let Some(CapturePayload::Tensor(raw)) = &raw.records[0].payload else {
+            let Some(raw) = raw.records[0]
+                .payload
+                .as_ref()
+                .and_then(CapturePayload::as_tensor)
+            else {
                 panic!("raw final scores")
             };
             let eredu_core::TensorObservationData::F32(values) = raw.data() else {
@@ -555,9 +589,11 @@ fn verify_loaded_component_capture(
                     for (index, candidate) in value.candidates.iter().enumerate() {
                         assert!((candidate.score - ordered[index]).abs() < 2e-5);
                         assert!((candidate.score - row[candidate.token_id as usize]).abs() < 2e-5);
-                        assert!(value.candidates[..index]
-                            .iter()
-                            .all(|other| other.token_id != candidate.token_id));
+                        assert!(
+                            value.candidates[..index]
+                                .iter()
+                                .all(|other| other.token_id != candidate.token_id)
+                        );
                     }
                 }
                 _ => panic!("bounded vocabulary reduction"),
@@ -594,9 +630,13 @@ fn verify_loaded_component_capture(
                 assert!(preview.payload.is_none() && complete.payload.is_none());
                 continue;
             }
-            let (Some(CapturePayload::Tensor(prefix)), Some(CapturePayload::Tensor(full))) =
-                (&preview.payload, &complete.payload)
-            else {
+            let (Some(prefix), Some(full)) = (
+                preview.payload.as_ref().and_then(CapturePayload::as_tensor),
+                complete
+                    .payload
+                    .as_ref()
+                    .and_then(CapturePayload::as_tensor),
+            ) else {
                 panic!("preview tensors")
             };
             let (
@@ -629,25 +669,13 @@ fn verify_loaded_component_capture(
     verify_component_capture_branches(runtime, &plan, sampling);
     verify_loaded_component_interventions(
         runtime,
-        &mut reference,
+        reference,
         &plan,
         sampling,
         required_unit_points,
     );
-    verify_additive_component_interventions(
-        runtime,
-        &mut reference,
-        &plan,
-        sampling,
-        &additive_targets,
-    );
-    verify_additive_component_transforms(
-        runtime,
-        &mut reference,
-        &plan,
-        sampling,
-        &additive_targets,
-    );
+    verify_additive_component_interventions(runtime, reference, &plan, sampling, &additive_targets);
+    verify_additive_component_transforms(runtime, reference, &plan, sampling, &additive_targets);
     runtime.reset().unwrap();
     let skipped = run(runtime, &skip);
     assert_eq!(
@@ -672,7 +700,7 @@ fn verify_loaded_component_capture(
             "mandatory coordination and completed preparation remain charged"
         );
     }
-    verify_loaded_routed_capture(runtime, &mut reference, &plan, sampling);
+    verify_loaded_routed_capture(runtime, reference, &plan, sampling);
     verify_cold_preparation_fencing(runtime);
 }
 
@@ -681,7 +709,7 @@ fn verify_component_prefill_geometry_rejection(
     plan: &eredu_core::capture::AdmittedCapturePlan,
     sampling: eredu_core::ResolvedGenerationConfig,
 ) {
-    use eredu_core::{capture::CaptureError, TextGenerationBackend as _};
+    use eredu_core::{TextGenerationBackend as _, capture::CaptureError};
     let discovery = MlxBackend::capture_discovery(runtime).unwrap();
     let mut wrong = plan.request();
     wrong.prompt_tokens -= 1;
@@ -696,17 +724,26 @@ fn verify_component_prefill_geometry_rejection(
         )
         .unwrap();
     let before = runtime
-        .session_mut()
-        .neutral_prediction_target_mut()
+        .session()
+        .original_model_source()
         .unwrap()
+        .erased()
         .fixed_numeric_state_snapshot()
         .unwrap();
     {
-        let mut generation = component_capture_generation(runtime, sampling);
-        generation.enable_capture(wrong).unwrap();
-        let error = match generation.next().unwrap() {
-            Ok(_) => panic!("mismatched media capture input entered model execution"),
+        let error = match component_capture_generation(
+            runtime,
+            sampling,
+            Some(eredu_core::TextPreparationOptions {
+                capture: Some(eredu_core::capture::SharedCapturePlan::new(wrong)),
+                interventions: None,
+            }),
+        ) {
             Err(error) => error,
+            Ok(mut generation) => match generation.next().unwrap() {
+                Ok(_) => panic!("mismatched media capture input entered model execution"),
+                Err(error) => error,
+            },
         };
         let mut source: &(dyn std::error::Error + 'static) = &error;
         loop {
@@ -721,14 +758,14 @@ fn verify_component_prefill_geometry_rejection(
                 .source()
                 .expect("prefill rejection retains its neutral geometry cause");
         }
-        let _ = generation.take_captured_delivery();
     }
     runtime.synchronize().unwrap();
     assert_eq!(
         runtime
-            .session_mut()
-            .neutral_prediction_target_mut()
+            .session()
+            .original_model_source()
             .unwrap()
+            .erased()
             .fixed_numeric_state_snapshot()
             .unwrap(),
         before
@@ -762,9 +799,11 @@ fn verify_cold_preparation_fencing(runtime: &mut ModelRuntime<MlxBackend<'_>>) {
     }
     let after = runtime.text_preparation_usage().unwrap();
     assert_eq!(after.attempts, before.attempts + 1);
-    assert!(runtime
-        .agree_text_preparation(TextPreparationStage::Request, TextPreparationStatus::Ready)
-        .is_err());
+    assert!(
+        runtime
+            .agree_text_preparation(TextPreparationStage::Request, TextPreparationStatus::Ready)
+            .is_err()
+    );
     assert_eq!(runtime.text_preparation_usage().unwrap(), after);
     assert!(
         runtime.synchronize().is_err(),
@@ -782,35 +821,53 @@ fn verify_cold_component_preparation(
     sampling: eredu_core::generation::ResolvedGenerationConfig,
     stream: &Stream,
 ) {
-    use eredu_core::{capture::*, run_preparation::*, TextGenerationBackend as _};
+    use eredu_core::{TextGenerationBackend as _, capture::*, run_preparation::*};
     let rank = eredu_core::DistributedSession::descriptor(
         <MlxBackend<'_> as eredu_core::DistributedBackend>::distributed_session(runtime.session())
             .unwrap(),
     )
     .rank();
-    let before = runtime
-        .session_mut()
-        .neutral_prediction_target_mut()
+    let cached_positions = runtime
+        .session()
+        .original_model_source()
         .unwrap()
-        .state_snapshot();
-    let numeric = runtime
-        .session_mut()
-        .neutral_prediction_target_mut()
+        .erased()
+        .retained_inference_authority()
         .unwrap()
-        .fixed_numeric_state_snapshot()
-        .unwrap();
-    let initial_usage = runtime.text_preparation_usage().unwrap();
+        .admission()
+        .map_or(0, |admission| admission.position());
     let discovery = MlxBackend::capture_discovery(runtime).unwrap();
-    let mut rejected_plan = plan.plan().clone();
-    rejected_plan.limits.per_step.retained_bytes = 0;
-    let rejected_plan = rejected_plan
-        .admit(
+    let plan = plan
+        .plan()
+        .clone()
+        .admit_with_text_origin(
             &discovery.catalog,
             &discovery.support,
             &discovery.support.capture,
             plan.request(),
+            CaptureTextOrigin { cached_positions },
         )
         .unwrap();
+    let before = runtime
+        .session()
+        .original_model_source()
+        .unwrap()
+        .erased()
+        .state_snapshot();
+    let numeric = runtime
+        .session()
+        .original_model_source()
+        .unwrap()
+        .erased()
+        .fixed_numeric_state_snapshot()
+        .unwrap();
+    let initial_usage = runtime.text_preparation_usage().unwrap();
+    // Empty token geometry is rejected before any distributed admission. The
+    // phase-agreement checks below use valid source-bound input on every rank.
+    assert!(matches!(
+        eredu_core::TokenIdsInputPlan::new(&[]),
+        Err(eredu_core::TokenInputRejection::Empty),
+    ));
     let mut expected_attempts = 0;
     // The shared startup driver agrees admission before prompt construction.
     // Every failed phase retains all preceding agreement attempts.
@@ -819,38 +876,54 @@ fn verify_cold_component_preparation(
         (TextPreparationStage::Sampling, 3),
         (TextPreparationStage::Instrumentation, 4),
     ] {
-        let ids = if stage == TextPreparationStage::Prompt && rank == 0 {
-            vec![]
-        } else {
-            component_capture_prompt_tokens()
-        };
+        let ids = component_capture_prompt_tokens();
         let mut expected_native = None;
-        let _failure = if stage == TextPreparationStage::Sampling && rank == 0 {
+        let (_prompt_failure, _sampling_failure) = if rank == 0
+            && matches!(
+                stage,
+                TextPreparationStage::Prompt | TextPreparationStage::Sampling
+            ) {
             let original = Array::from_slice(&[1.0_f32, 2.0], &[2])
                 .reshape(&[3], stream)
                 .unwrap_err();
             expected_native = Some((original.what().to_owned(), original.location()));
-            Some(MlxBackend::fail_next_sampling_for_test(original.into()))
+            if stage == TextPreparationStage::Prompt {
+                (
+                    Some(MlxBackend::fail_next_prompt_for_test(original.into())),
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    Some(MlxBackend::fail_next_sampling_for_test(original.into())),
+                )
+            }
         } else {
-            None
+            (None, None)
         };
+        let _instrumentation_failure =
+            (rank == 0 && stage == TextPreparationStage::Instrumentation).then(|| {
+                MlxBackend::fail_next_instrumentation_for_test(CaptureError::Limit {
+                    budget: CaptureBudget::Retention,
+                    cumulative: false,
+                })
+            });
+        let options = (stage == TextPreparationStage::Instrumentation).then(|| {
+            eredu_core::TextPreparationOptions {
+                capture: Some(SharedCapturePlan::new(plan.clone())),
+                interventions: None,
+            }
+        });
         let error: Box<dyn std::error::Error> = {
-            match eredu_core::ControlledTextGeneration::new(
+            match component_generation_start_with_tokens(
                 runtime,
-                ids,
+                options,
                 TextGenerationConfig::new(sampling),
-                ComponentCaptureController::default(),
+                &ids,
+                false,
             ) {
                 Err(error) => Box::new(error),
-                Ok(mut generation) => {
-                    assert_eq!(stage, TextPreparationStage::Instrumentation);
-                    let plan = if rank == 0 {
-                        rejected_plan.clone()
-                    } else {
-                        plan.clone()
-                    };
-                    Box::new(generation.enable_capture(plan).unwrap_err())
-                }
+                Ok(_) => panic!("rejected {stage:?} entered generation"),
             }
         };
         if rank != 0 {
@@ -860,21 +933,28 @@ fn verify_cold_component_preparation(
                     assert_eq!((rejected.stage, rejected.rank), (stage, 0));
                     break;
                 }
-                source = source.source().expect("peer rejection retains typed cause");
+                source = source.source().unwrap_or_else(|| {
+                    panic!("peer {stage:?} rejection retains typed cause: {error:?}")
+                });
             }
         } else {
             match stage {
-                TextPreparationStage::Prompt => {
-                    assert!(error.to_string().contains("at least one prompt token"))
+                TextPreparationStage::Instrumentation => {
+                    let mut source = error.as_ref();
+                    loop {
+                        if let Some(CaptureError::Limit {
+                            budget: CaptureBudget::Retention,
+                            cumulative: false,
+                        }) = source.downcast_ref::<CaptureError>()
+                        {
+                            break;
+                        }
+                        source = source.source().unwrap_or_else(|| {
+                            panic!("instrumentation rejection retains retention cause: {error:?}")
+                        });
+                    }
                 }
-                TextPreparationStage::Instrumentation => assert!(matches!(
-                    error.downcast_ref::<TextCaptureSetupError>(),
-                    Some(TextCaptureSetupError::Capture(CaptureError::Limit {
-                        budget: CaptureBudget::Retention,
-                        cumulative: false
-                    })),
-                )),
-                TextPreparationStage::Sampling => {
+                TextPreparationStage::Prompt | TextPreparationStage::Sampling => {
                     let mut source = error.as_ref();
                     loop {
                         if let Some(crate::backend::error::Error::Exception(native)) =
@@ -885,7 +965,9 @@ fn verify_cold_component_preparation(
                             assert_eq!(native.location(), expected.1);
                             break;
                         }
-                        source = source.source().expect("original native sampler cause");
+                        source = source.source().unwrap_or_else(|| {
+                            panic!("original native {stage:?} cause: {error:?}")
+                        });
                     }
                 }
                 _ => unreachable!(),
@@ -894,24 +976,28 @@ fn verify_cold_component_preparation(
         runtime.synchronize().unwrap();
         assert_eq!(
             runtime
-                .session_mut()
-                .neutral_prediction_target_mut()
+                .session()
+                .original_model_source()
                 .unwrap()
+                .erased()
                 .state_snapshot(),
             before
         );
         assert_eq!(
             runtime
-                .session_mut()
-                .neutral_prediction_target_mut()
+                .session()
+                .original_model_source()
                 .unwrap()
+                .erased()
                 .fixed_numeric_state_snapshot()
                 .unwrap(),
             numeric
         );
         expected_attempts += attempts;
-        assert_eq!(runtime.text_preparation_usage().unwrap().attempts
-            - initial_usage.attempts, expected_attempts);
+        assert_eq!(
+            runtime.text_preparation_usage().unwrap().attempts - initial_usage.attempts,
+            expected_attempts
+        );
     }
     let usage = runtime.text_preparation_usage().unwrap();
     assert_eq!(usage.attempts - initial_usage.attempts, expected_attempts);
@@ -920,14 +1006,27 @@ fn verify_cold_component_preparation(
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-struct ComponentCaptureController(Vec<u32>);
+struct ComponentCaptureController {
+    tokens: [u32; 32],
+    committed: usize,
+}
 impl eredu_core::TokenFilterController for ComponentCaptureController {
     type Error = std::convert::Infallible;
+    fn inference_workspace_is_run_owned(&self) -> bool {
+        true
+    }
+    fn inference_workspace(&self, _: u64) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+        Some(eredu_core::TextControllerWorkspace {
+            filter: eredu_core::TextFilterWorkspace::Exact(&TokenFilter::All),
+            additional_host_bytes: 0,
+        })
+    }
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
         Ok(TokenFilter::All)
     }
     fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
-        self.0.push(token);
+        self.tokens[self.committed] = token;
+        self.committed += 1;
         Ok(())
     }
     fn is_complete(&mut self) -> Result<bool, Self::Error> {
@@ -936,23 +1035,257 @@ impl eredu_core::TokenFilterController for ComponentCaptureController {
 }
 impl eredu_runtime::execution_control::SnapshotTokenController for ComponentCaptureController {
     fn snapshot_storage_bytes(&self) -> Option<u64> {
-        (std::mem::size_of::<Self>() as u64).checked_add((self.0.len() as u64).checked_mul(4)?)
+        Some(std::mem::size_of::<Self>() as u64)
     }
     fn fork_snapshot(&self) -> Result<Self, String> {
         Ok(self.clone())
     }
+    fn original_snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_storage_bytes()
+    }
+    fn fork_original_snapshot(&self) -> Option<Self> {
+        Some(self.clone())
+    }
 }
-
-fn component_capture_step<'a>(
-    driver: &mut eredu_core::TextGenerationDriver<'_, MlxBackend<'a>>,
-    state: &mut eredu_runtime::execution_control::ManagedTextContinuation<
-        MlxBackend<'a>,
+type ComponentState<'run, 'model> =
+    eredu_core::ControlledTextGeneration<'run, MlxBackend<'model>, ComponentCaptureController>;
+type ComponentSnapshot<'model> = (
+    eredu_runtime::execution_control::TextContinuationSnapshot<
+        MlxBackend<'model>,
         ComponentCaptureController,
     >,
+    (eredu_core::RetainedGenerationSequence, f32),
+);
+type ComponentBranch<'model> = (
+    eredu_core::TextGenerationBranch<MlxBackend<'model>, ComponentCaptureController>,
+    (eredu_core::RetainedGenerationSequence, f32),
+);
+type ComponentProvider = crate::tests::support::original_snapshot::NativeSnapshotProvider;
+use eredu_evaluation::execution_control::ContinuationSnapshotProvider as _;
+fn component_capture_start<'run, 'model>(
+    runtime: &'run mut ModelRuntime<MlxBackend<'model>>,
+    plan: &eredu_core::capture::AdmittedCapturePlan,
+    sampling: eredu_core::ResolvedGenerationConfig,
+) -> (ComponentState<'run, 'model>, ComponentProvider) {
+    runtime.reset().unwrap();
+    component_state_start(runtime, Some(plan), sampling)
+}
+fn component_snapshot_limits() -> eredu_core::execution_control::SnapshotLimits {
+    eredu_core::execution_control::SnapshotLimits {
+        max_snapshots: 8,
+        max_branches: 8,
+        retained_bytes: 512 << 20,
+        cumulative_copy_bytes: 4 << 30,
+    }
+}
+fn component_snapshot_budget() -> eredu_runtime::execution_control::SnapshotBudget {
+    eredu_runtime::execution_control::SnapshotBudget::new(component_snapshot_limits())
+}
+fn component_snapshot_sampling() -> eredu_core::ResolvedGenerationConfig {
+    eredu_core::resolve_generation_config(
+        None,
+        eredu_core::GenerationConfigOverrides {
+            max_new_tokens: Some(20),
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+// Retain the real installed prefix, pending source, sampler and host sequence;
+// source preparation and copying do not execute or reset the model frontier.
+#[track_caller]
+fn component_compatibility_snapshot<'model>(
+    runtime: &mut ModelRuntime<MlxBackend<'model>>,
+) -> ComponentSnapshot<'model> {
+    let (mut state, mut provider) =
+        component_state_start(runtime, None, component_snapshot_sampling());
+    component_capture_snapshot(&mut state, &mut provider, &component_snapshot_budget())
+}
+fn component_snapshot_compatible<'model>(
+    runtime: &ModelRuntime<MlxBackend<'model>>,
+    saved: &ComponentSnapshot<'model>,
+) -> bool {
+    saved
+        .0
+        .native_continuation_growth(runtime, saved.0.next_prediction())
+        .is_ok()
+}
+fn component_exchange_same_frontier(runtime: &mut ModelRuntime<MlxBackend<'_>>) {
+    let (mut state, mut provider) =
+        component_state_start(runtime, None, component_snapshot_sampling());
+    let saved = component_capture_snapshot(&mut state, &mut provider, &component_snapshot_budget());
+    let mut child = component_capture_fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Branch),
+    );
+    component_capture_exchange(&mut state, &mut provider, &mut child);
+}
+#[track_caller]
+fn component_state_start<'run, 'model>(
+    runtime: &'run mut ModelRuntime<MlxBackend<'model>>,
+    plan: Option<&eredu_core::capture::AdmittedCapturePlan>,
+    sampling: eredu_core::ResolvedGenerationConfig,
+) -> (ComponentState<'run, 'model>, ComponentProvider) {
+    component_state_start_with_tokens(
+        runtime,
+        plan,
+        sampling,
+        &component_capture_prompt_tokens(),
+        std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some(),
+    )
+}
+#[track_caller]
+fn component_state_start_with_tokens<'run, 'model>(
+    runtime: &'run mut ModelRuntime<MlxBackend<'model>>,
+    plan: Option<&eredu_core::capture::AdmittedCapturePlan>,
+    sampling: eredu_core::ResolvedGenerationConfig,
+    tokens: &[u32],
+    media: bool,
+) -> (ComponentState<'run, 'model>, ComponentProvider) {
+    let pool = runtime.backend().memory_ledger().clone();
+    let config = TextGenerationConfig::new(sampling);
+    let options = plan.map(|plan| eredu_core::TextPreparationOptions {
+        capture: Some(eredu_core::capture::SharedCapturePlan::new(plan.clone())),
+        interventions: None,
+    });
+    let mut state =
+        component_generation_start_with_tokens(runtime, options, config.clone(), tokens, media)
+            .unwrap();
+    let sequence = state
+        .take_prepared_sequence()
+        .unwrap()
+        .prepare_storage()
+        .unwrap();
+    (state, ComponentProvider::new(sequence, config, pool))
+}
+
+type ComponentPreparationError = eredu_core::ControlledTextGenerationError<
+    crate::backend::error::Error,
+    std::convert::Infallible,
+>;
+
+fn component_generation_start_with_tokens<'run, 'model>(
+    runtime: &'run mut ModelRuntime<MlxBackend<'model>>,
+    options: Option<eredu_core::TextPreparationOptions>,
+    config: TextGenerationConfig,
+    tokens: &[u32],
+    media: bool,
+) -> Result<ComponentState<'run, 'model>, ComponentPreparationError> {
+    runtime.synchronize().unwrap();
+    let pool = runtime.backend().memory_ledger();
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        safemlx::reclaim_allocation_owners();
+        pool.unquoted_owner_count().unwrap() == 0
+    });
+    let max = config
+        .sampling()
+        .max_new_tokens
+        .expect("bounded component fixture");
+    let consumer = eredu_core::GenerationSequenceConsumerLayout::for_driver_types::<
+        ComponentProvider,
+        crate::backend::error::Error,
+        crate::backend::error::Error,
+    >()
+    .unwrap();
+    let sequence = eredu_core::GenerationSequenceRequest::new(max, &[]).with_consumer(&consumer);
+    if media {
+        let prompt = component_capture_prompt(runtime);
+        let (prompt, _custody, _) = crate::tests::support::original_input::prepare(runtime, prompt);
+        eredu_core::ControlledTextGeneration::from_input_with_sequence(
+            runtime,
+            eredu_core::TextGenerationInput::OriginalPrepared(prompt),
+            config,
+            ComponentCaptureController::default(),
+            options,
+            sequence,
+        )
+    } else {
+        eredu_core::ControlledTextGeneration::from_token_ids_with_sequence(
+            runtime,
+            eredu_core::TokenIdsInputPlan::new(tokens).unwrap(),
+            config,
+            ComponentCaptureController::default(),
+            options,
+            sequence,
+        )
+    }
+}
+
+#[track_caller]
+fn component_capture_step<'model>(
+    state: &mut ComponentState<'_, 'model>,
+    provider: &mut ComponentProvider,
 ) -> (u32, eredu_core::capture::SharedCapturedStep) {
-    let token = state.advance(driver).unwrap().unwrap().token_id();
-    let capture = state.take_completed_delivery(driver).unwrap().unwrap();
+    let token = state.next().unwrap().unwrap().token_id();
+    let capture = state.take_captured_delivery().unwrap().unwrap();
+    provider.observe_token(token);
     (token, capture)
+}
+fn component_capture_snapshot<'model>(
+    state: &mut ComponentState<'_, 'model>,
+    provider: &mut ComponentProvider,
+    budget: &eredu_runtime::execution_control::SnapshotBudget,
+) -> ComponentSnapshot<'model> {
+    provider
+        .capture(&mut state.snapshot_source().unwrap(), budget, Some(4096))
+        .unwrap()
+}
+fn component_capture_fork<'model>(
+    state: &mut ComponentState<'_, 'model>,
+    provider: &mut ComponentProvider,
+    saved: &ComponentSnapshot<'model>,
+    options: &eredu_core::OriginalTextResumeOptions<'_>,
+) -> ComponentBranch<'model> {
+    state
+        .fork_completed(
+            |runtime| provider.resume(runtime, &saved.0, &saved.1, options),
+            |error| panic!("component fork boundary: {error:?}"),
+        )
+        .unwrap()
+        .unwrap()
+}
+fn component_capture_restore<'model>(
+    state: &mut ComponentState<'_, 'model>,
+    provider: &mut ComponentProvider,
+    saved: &ComponentSnapshot<'model>,
+) {
+    let mut host = state
+        .replace_completed(
+            |runtime| {
+                provider
+                    .resume(
+                        runtime,
+                        &saved.0,
+                        &saved.1,
+                        &eredu_core::OriginalTextResumeOptions::new(
+                            eredu_core::OriginalTextResumeKind::Restore,
+                        ),
+                    )
+                    .map(|result| {
+                        result.map(|(state, displaced, host)| {
+                            drop(displaced);
+                            (state, host)
+                        })
+                    })
+            },
+            |error| panic!("component restore boundary: {error:?}"),
+        )
+        .unwrap()
+        .unwrap();
+    provider.exchange_host(&mut host);
+}
+fn component_capture_exchange<'model>(
+    state: &mut ComponentState<'_, 'model>,
+    provider: &mut ComponentProvider,
+    branch: &mut ComponentBranch<'model>,
+) {
+    state.exchange_branch(&mut branch.0).unwrap();
+    provider.exchange_host(&mut branch.1);
 }
 
 fn same_component_values(
@@ -974,101 +1307,67 @@ fn verify_component_capture_branches(
     plan: &eredu_core::capture::AdmittedCapturePlan,
     sampling: eredu_core::ResolvedGenerationConfig,
 ) {
-    use eredu_core::{execution_control::SnapshotLimits, TextGenerationDriver};
-    use eredu_runtime::execution_control::{
-        ManagedTextContinuation, SnapshotBudget, TextBranchRequest, TextContinuationSnapshot,
+    use eredu_core::{
+        OriginalTextResumeKind, OriginalTextResumeOptions, execution_control::SnapshotLimits,
     };
-    runtime.reset().unwrap();
-    let prompt = component_capture_prompt(runtime);
-    let mut driver = TextGenerationDriver::new(runtime);
-    let mut continuation = driver
-        .start(
-            prompt,
-            TextGenerationConfig::new(sampling),
-            ComponentCaptureController::default(),
-        )
-        .unwrap();
-    driver
-        .enable_capture(&mut continuation, plan.clone())
-        .unwrap();
-    let mut state = ManagedTextContinuation::root(continuation);
-    eprintln!("component snapshot step: prefix");
-    let prefix = component_capture_step(&mut driver, &mut state);
+    use eredu_runtime::execution_control::SnapshotBudget;
+    let (mut state, mut provider) = component_capture_start(runtime, plan, sampling);
+    let prefix = component_capture_step(&mut state, &mut provider);
     let budget = SnapshotBudget::new(SnapshotLimits {
         max_snapshots: 2,
         max_branches: 3,
         retained_bytes: 64 << 20,
         cumulative_copy_bytes: 512 << 20,
     });
-    let saved = TextContinuationSnapshot::capture(
-        &mut state.boundary(&mut driver).unwrap(),
-        &budget,
-        Some(4096),
-    )
-    .unwrap();
-    let growth = saved
-        .native_continuation_growth(driver.runtime(), 3)
-        .unwrap();
-    let request = |session_id| TextBranchRequest {
-        session_id,
-        max_predictions: 3,
-        capture_limits: Some(plan.plan().limits.clone()),
-        intervention: None,
-        host_bytes: Some(4096),
-        continuation_growth_bytes: Some(growth + (1 << 20)),
+    let saved = component_capture_snapshot(&mut state, &mut provider, &budget);
+    let request = |session_id| {
+        let mut options = OriginalTextResumeOptions::new(OriginalTextResumeKind::Branch);
+        options.session_id = Some(session_id);
+        options.capture_limits = Some(&plan.plan().limits);
+        options
     };
-    let mut left = saved
-        .fork(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            request("component-left"),
-        )
-        .unwrap();
-    let mut right = saved
-        .fork(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            request("component-right"),
-        )
-        .unwrap();
+    let mut left = component_capture_fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &request("component-left"),
+    );
+    let mut right = component_capture_fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &request("component-right"),
+    );
+    let mut skipped_limits = plan.plan().limits.clone();
+    skipped_limits.on_limit = eredu_core::capture::CaptureLimitPolicy::Skip;
+    skipped_limits.per_step.captures = 0;
     let mut skip_request = request("component-skipped");
-    let limits = skip_request.capture_limits.as_mut().unwrap();
-    limits.on_limit = eredu_core::capture::CaptureLimitPolicy::Skip;
-    limits.per_step.captures = 0;
-    let mut skipped_child = saved
-        .fork(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            skip_request,
-        )
-        .unwrap();
-    eprintln!("component snapshot step: baseline");
-    let baseline = component_capture_step(&mut driver, &mut state);
+    skip_request.capture_limits = Some(&skipped_limits);
+    let mut skipped_child =
+        component_capture_fork(&mut state, &mut provider, &saved, &skip_request);
+    let baseline = component_capture_step(&mut state, &mut provider);
     assert_eq!(
         baseline.1.partitions[0].context.run_identity,
         prefix.1.partitions[0].context.run_identity
     );
-    left.exchange(&mut driver, &mut state).unwrap();
-    eprintln!("component snapshot step: first_left");
-    let first_left = component_capture_step(&mut driver, &mut state);
+    component_capture_exchange(&mut state, &mut provider, &mut left);
+    let first_left = component_capture_step(&mut state, &mut provider);
     same_component_values(&first_left, &baseline);
     assert_ne!(
         first_left.1.partitions[0].context.run_identity,
         baseline.1.partitions[0].context.run_identity
     );
-    left.exchange(&mut driver, &mut state).unwrap();
-    right.exchange(&mut driver, &mut state).unwrap();
-    eprintln!("component snapshot step: first_right");
-    let first_right = component_capture_step(&mut driver, &mut state);
+    component_capture_exchange(&mut state, &mut provider, &mut left);
+    component_capture_exchange(&mut state, &mut provider, &mut right);
+    let first_right = component_capture_step(&mut state, &mut provider);
     same_component_values(&first_right, &baseline);
     assert_ne!(
         first_right.1.partitions[0].context.run_identity,
         first_left.1.partitions[0].context.run_identity
     );
-    right.exchange(&mut driver, &mut state).unwrap();
-    skipped_child.exchange(&mut driver, &mut state).unwrap();
-    eprintln!("component snapshot step: skipped");
-    let skipped = component_capture_step(&mut driver, &mut state);
+    component_capture_exchange(&mut state, &mut provider, &mut right);
+    component_capture_exchange(&mut state, &mut provider, &mut skipped_child);
+    let skipped = component_capture_step(&mut state, &mut provider);
     assert_eq!(skipped.0, baseline.0);
     assert!(skipped.1.partitions.is_empty());
     assert_eq!(skipped.1.records.len(), baseline.1.records.len());
@@ -1092,14 +1391,12 @@ fn verify_component_capture_branches(
         };
         assert_eq!(record.outcome, CaptureOutcome::Skipped { reason });
     }
-    skipped_child.exchange(&mut driver, &mut state).unwrap();
+    component_capture_exchange(&mut state, &mut provider, &mut skipped_child);
     let copy_before = budget.usage().cumulative_copy_bytes;
-    saved
-        .restore(&mut state.boundary(&mut driver).unwrap(), &budget)
-        .unwrap();
-    eprintln!("component snapshot step: replay");
-    let replay = component_capture_step(&mut driver, &mut state);
+    component_capture_restore(&mut state, &mut provider, &saved);
+    let replay = component_capture_step(&mut state, &mut provider);
     same_component_values(&replay, &baseline);
+    // Restoration keeps the capture run while consuming a later forward epoch.
     assert_eq!(
         replay.1.partitions[0].context.run_identity,
         baseline.1.partitions[0].context.run_identity
@@ -1120,7 +1417,7 @@ fn verify_loaded_component_interventions(
     required_points: &[&str],
 ) {
     use eredu_core::{
-        capture::*, intervention::*, ObservationSupportStatus, TextGenerationBackend as _,
+        ObservationSupportStatus, TextGenerationBackend as _, capture::*, intervention::*,
     };
     let discovery = MlxBackend::intervention_discovery(runtime).unwrap();
     let targets = discovery
@@ -1268,10 +1565,25 @@ fn verify_loaded_component_interventions(
                     "native-component-trial",
                 )
                 .unwrap();
-            let mut generation = component_capture_generation(runtime, sampling);
-            generation
-                .enable_interventions(capture.clone(), admitted)
-                .unwrap();
+            let interventions = runtime
+                .backend()
+                .memory_ledger()
+                .compile_intervention_source(
+                    eredu_core::intervention::PreparedInterventionPlanCopy::inspect(&admitted)
+                        .unwrap(),
+                )
+                .unwrap()
+                .plan()
+                .clone();
+            let mut generation = component_capture_generation(
+                runtime,
+                sampling,
+                Some(eredu_core::TextPreparationOptions {
+                    capture: Some(eredu_core::capture::SharedCapturePlan::new(capture.clone())),
+                    interventions: Some(interventions),
+                }),
+            )
+            .unwrap();
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
@@ -1291,7 +1603,9 @@ fn verify_loaded_component_interventions(
             assert_eq!(actual.outcome, expected.outcome);
             match (&actual.payload, &expected.payload) {
                 (None, None) => (),
-                (Some(CapturePayload::Tensor(actual)), Some(CapturePayload::Tensor(expected))) => {
+                (Some(actual), Some(expected)) => {
+                    let actual = actual.as_tensor().expect("actual tensor evidence");
+                    let expected = expected.as_tensor().expect("expected tensor evidence");
                     assert_eq!(actual.shape(), expected.shape());
                     let (
                         eredu_core::TensorObservationData::F32(actual),
@@ -1335,40 +1649,20 @@ fn verify_component_intervention_branches(
     plan: &eredu_core::intervention::InterventionPlan,
     sampling: eredu_core::ResolvedGenerationConfig,
 ) {
-    use eredu_core::{execution_control::SnapshotLimits, intervention::*, TextGenerationDriver};
-    use eredu_runtime::execution_control::{
-        ManagedTextContinuation, SnapshotBudget, TextBranchRequest, TextContinuationSnapshot,
+    use eredu_core::{
+        OriginalTextResumeKind, OriginalTextResumeOptions, execution_control::SnapshotLimits,
+        intervention::*,
     };
-    runtime.reset().unwrap();
-    let prompt = component_capture_prompt(runtime);
-    let mut driver = TextGenerationDriver::new(runtime);
-    let mut continuation = driver
-        .start(
-            prompt,
-            TextGenerationConfig::new(sampling),
-            ComponentCaptureController::default(),
-        )
-        .unwrap();
-    driver
-        .enable_capture(&mut continuation, capture.clone())
-        .unwrap();
-    let mut state = ManagedTextContinuation::root(continuation);
-    component_capture_step(&mut driver, &mut state);
+    use eredu_runtime::execution_control::SnapshotBudget;
+    let (mut state, mut provider) = component_capture_start(runtime, capture, sampling);
+    let _prefix = component_capture_step(&mut state, &mut provider);
     let budget = SnapshotBudget::new(SnapshotLimits {
         max_snapshots: 3,
         max_branches: 2,
         retained_bytes: 128 << 20,
         cumulative_copy_bytes: 1 << 30,
     });
-    let saved = TextContinuationSnapshot::capture(
-        &mut state.boundary(&mut driver).unwrap(),
-        &budget,
-        Some(4096),
-    )
-    .unwrap();
-    let growth = saved
-        .native_continuation_growth(driver.runtime(), 3)
-        .unwrap();
+    let saved = component_capture_snapshot(&mut state, &mut provider, &budget);
     let mut future = plan.clone();
     future
         .operations
@@ -1383,46 +1677,38 @@ fn verify_component_intervention_branches(
             *keep_selected = !*keep_selected;
         }
     }
-    let request = |session_id, intervention| TextBranchRequest {
-        session_id,
-        max_predictions: 3,
-        capture_limits: Some(capture.plan().limits.clone()),
-        intervention: Some(intervention),
-        host_bytes: Some(4096),
-        continuation_growth_bytes: Some(growth + (1 << 20)),
+    let request = |session_id, intervention| {
+        let mut options = OriginalTextResumeOptions::new(OriginalTextResumeKind::Branch);
+        options.session_id = Some(session_id);
+        options.capture_limits = Some(&capture.plan().limits);
+        options.intervention = Some(intervention);
+        options
     };
-    let mut left = saved
-        .fork(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            request("intervention-left", future),
-        )
-        .unwrap();
-    let mut right = saved
-        .fork(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            request("intervention-right", alternate),
-        )
-        .unwrap();
-    let baseline = component_capture_step(&mut driver, &mut state);
-    left.exchange(&mut driver, &mut state).unwrap();
-    let left_saved = TextContinuationSnapshot::capture(
-        &mut state.boundary(&mut driver).unwrap(),
-        &budget,
-        Some(4096),
-    )
-    .unwrap();
-    let first_left = component_capture_step(&mut driver, &mut state);
-    assert!(first_left
-        .1
-        .interventions
-        .iter()
-        .all(|record| record.outcome == InterventionOutcome::Applied));
-    left_saved
-        .restore(&mut state.boundary(&mut driver).unwrap(), &budget)
-        .unwrap();
-    let replay_left = component_capture_step(&mut driver, &mut state);
+    let mut left = component_capture_fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &request("intervention-left", &future),
+    );
+    let mut right = component_capture_fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &request("intervention-right", &alternate),
+    );
+    let baseline = component_capture_step(&mut state, &mut provider);
+    component_capture_exchange(&mut state, &mut provider, &mut left);
+    let left_saved = component_capture_snapshot(&mut state, &mut provider, &budget);
+    let first_left = component_capture_step(&mut state, &mut provider);
+    assert!(
+        first_left
+            .1
+            .interventions
+            .iter()
+            .all(|record| record.outcome == InterventionOutcome::Applied)
+    );
+    component_capture_restore(&mut state, &mut provider, &left_saved);
+    let replay_left = component_capture_step(&mut state, &mut provider);
     same_component_values(&replay_left, &first_left);
     for (actual, expected) in replay_left
         .1
@@ -1436,14 +1722,16 @@ fn verify_component_intervention_branches(
         }
     }
     assert!(replay_left.1.cumulative_usage.host_bytes > first_left.1.cumulative_usage.host_bytes);
-    left.exchange(&mut driver, &mut state).unwrap();
-    right.exchange(&mut driver, &mut state).unwrap();
-    let first_right = component_capture_step(&mut driver, &mut state);
-    assert!(first_right
-        .1
-        .interventions
-        .iter()
-        .all(|record| record.outcome == InterventionOutcome::Applied));
+    component_capture_exchange(&mut state, &mut provider, &mut left);
+    component_capture_exchange(&mut state, &mut provider, &mut right);
+    let first_right = component_capture_step(&mut state, &mut provider);
+    assert!(
+        first_right
+            .1
+            .interventions
+            .iter()
+            .all(|record| record.outcome == InterventionOutcome::Applied)
+    );
     assert_ne!(
         first_right.1.records[0].payload, first_left.1.records[0].payload,
         "different masks recompute the prediction"
@@ -1452,11 +1740,9 @@ fn verify_component_intervention_branches(
         first_right.1.partitions[0].context.run_identity,
         first_left.1.partitions[0].context.run_identity
     );
-    right.exchange(&mut driver, &mut state).unwrap();
-    saved
-        .restore(&mut state.boundary(&mut driver).unwrap(), &budget)
-        .unwrap();
-    let replay = component_capture_step(&mut driver, &mut state);
+    component_capture_exchange(&mut state, &mut provider, &mut right);
+    component_capture_restore(&mut state, &mut provider, &saved);
+    let replay = component_capture_step(&mut state, &mut provider);
     same_component_values(&replay, &baseline);
     assert!(
         replay.1.interventions.is_empty(),

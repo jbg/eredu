@@ -102,7 +102,6 @@ fn preview_prefill_matches_full_scores_and_controlled_on_real_residencies() {
                             limits: CaptureLimits {
                                 per_step: usage,
                                 cumulative: usage,
-                                physical_native_bytes: None,
                                 on_limit: CaptureLimitPolicy::Fail,
                             },
                         },
@@ -136,7 +135,7 @@ fn preview_prefill_matches_full_scores_and_controlled_on_real_residencies() {
                                 prefill_chunk_positions: chunk,
                                 ..Default::default()
                             },
-                            ..settings
+                            ..settings.clone()
                         },
                     ),
                     options: generation.clone(),
@@ -146,7 +145,7 @@ fn preview_prefill_matches_full_scores_and_controlled_on_real_residencies() {
                 };
                 let sampling = model
                     .prepare_speculative_capture(
-                        settings,
+                        settings.clone(),
                         CapturePlan {
                             schema_version: CAPTURE_SCHEMA_VERSION,
                             selections: vec![CaptureSelection {
@@ -159,7 +158,6 @@ fn preview_prefill_matches_full_scores_and_controlled_on_real_residencies() {
                             limits: CaptureLimits {
                                 per_step: usage,
                                 cumulative: usage,
-                                physical_native_bytes: None,
                                 on_limit: CaptureLimitPolicy::Fail,
                             },
                         },
@@ -255,15 +253,13 @@ fn preview_prefill_matches_full_scores_and_controlled_on_real_residencies() {
                 }
                 for physical in records.iter().filter(|r| r.prefill_span.is_some()) {
                     assert!(physical.captures.as_step().invocation.unwrap().sequence <= 2);
-                    assert!(
-                        physical
-                            .captures
-                            .as_step()
-                            .records
-                            .iter()
-                            .filter(|r| r.payload.is_some())
-                            .all(|r| r.source_shape.as_ref().unwrap()[1] <= 2)
-                    );
+                    assert!(physical
+                        .captures
+                        .as_step()
+                        .records
+                        .iter()
+                        .filter(|r| r.payload.is_some())
+                        .all(|r| r.source_shape.as_ref().unwrap()[1] <= 2));
                 }
                 let widths = records
                     .iter()
@@ -280,14 +276,13 @@ fn preview_prefill_matches_full_scores_and_controlled_on_real_residencies() {
                     })
                     .last()
                     .unwrap();
-                assert!(
-                    last.captures
-                        .as_step()
-                        .records
-                        .iter()
-                        .filter(|r| r.payload.is_some())
-                        .all(|r| r.source_shape.as_ref().unwrap()[1] == total - 4)
-                );
+                assert!(last
+                    .captures
+                    .as_step()
+                    .records
+                    .iter()
+                    .filter(|r| r.payload.is_some())
+                    .all(|r| r.source_shape.as_ref().unwrap()[1] == total - 4));
                 let mut controlled_records = Vec::new();
                 let mut controlled_scores = Vec::new();
                 let controlled = model

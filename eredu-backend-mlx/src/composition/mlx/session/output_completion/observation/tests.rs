@@ -101,7 +101,7 @@ fn interrupted_observation_releases_its_loan_without_allowing_another_attempt() 
 
 #[test]
 fn ordinary_cached_observation_errors_keep_actual_host_after_completion_state_drops() {
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let host = eredu_core::HostPreparationAuthority::retain(pool.acquire_unquoted().unwrap());
     let state = Observation::<u32>::with_ordinary_capture(Some(host));
     let loan = state.enter().unwrap();
@@ -123,7 +123,7 @@ fn ordinary_cached_observation_errors_keep_actual_host_after_completion_state_dr
 }
 #[test]
 fn attaching_ordinary_observation_custody_preserves_cached_success_and_first_failure() {
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let mut state = Observation::<u32>::new();
     {
         let loan = state.enter().unwrap();

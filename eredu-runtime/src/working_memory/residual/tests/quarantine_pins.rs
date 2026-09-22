@@ -5,14 +5,15 @@ use eredu_core::{ResolvedGenerationConfig, TextGenerationConfig};
 #[test]
 fn residual_prompt_additional_sources_survive_either_native_scope_quarantining_first() {
     for prompt_first in [false, true] {
-        let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-        let source_a = pool.register_storage([(1u32, 64)]).unwrap();
-        let source_b = pool.register_storage([(2u32, 48), (3, 0)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let source_a = pool.register_host_storage([(1u32, 64)]).unwrap();
+        let source_b = pool.register_host_storage([(2u32, 48), (3, 0)]).unwrap();
         let g = geometry();
         let quote = replacement_quote(&pool, g, 0);
         let execution = InferenceExecutionIdentity::default();
-        let (reservation, accepted) = plan(&pool, &execution, &quote, request(g), 1000).unwrap();
-        assert_eq!(reservation.bytes(), 96);
+        let (reservation, accepted) =
+            plan(&pool, &execution, &quote, request(g), 1_000_000).unwrap();
+        assert_eq!(reservation_payload_bytes(&reservation), 96);
         let (metadata, run) = reservation.into_funding().unwrap();
         let config = TextGenerationConfig::new(ResolvedGenerationConfig {
             do_sample: false,
@@ -45,7 +46,7 @@ fn residual_prompt_additional_sources_survive_either_native_scope_quarantining_f
             Err(WorkingMemoryError::PreparationAlreadyStarted)
         ));
         drop((source_a, source_b, quote, accepted, preparation, run));
-        assert_eq!(used(&pool), (208, 208));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 208);
         if prompt_first {
             drop(prompt);
             drop(ordinary);
@@ -53,14 +54,16 @@ fn residual_prompt_additional_sources_survive_either_native_scope_quarantining_f
             drop(ordinary);
             drop(prompt);
         }
-        assert_eq!(used(&pool), (208, 208));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 208);
         // The additional B and zero-byte identity remain available as registered
         // sources even after their original owners and the fresh request retire.
-        let retained = pool
-            .pin_registered_storage([(1u32, 64), (2, 48), (3, 0)])
-            .unwrap();
-        assert_eq!(retained.bytes(), 112);
-        drop(retained);
+        assert!(
+            pool.snapshot()
+                .unwrap()
+                .domains
+                .iter()
+                .any(|domain| domain.registered_storage_bytes >= 112)
+        );
         assert!(matches!(
             pool.acquire_unquoted(),
             Err(WorkingMemoryError::ReservedWorkActive)

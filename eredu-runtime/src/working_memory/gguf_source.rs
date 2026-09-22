@@ -1,5 +1,5 @@
 //! Finite source reader/materializer construction, separate from request fit.
-use super::{qualified_storage, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError, qualified_storage};
 use eredu_checkpoint::gguf_store::{
     GgufSourceStorageRequest, GgufWeightStore, PreparedGgufCatalog, PreparedGgufSourceFailure,
 };
@@ -7,8 +7,8 @@ use std::{
     fmt,
     mem::{size_of, size_of_val},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -52,7 +52,7 @@ impl SourceAccount {
     pub(super) fn storage_bytes() -> Result<u64, WorkingMemoryError> {
         qualified_storage::shared_bytes::<SourceAccountInner>()
     }
-    pub(super) fn new_unarmed(pool: &WorkingMemoryPool, bytes: u64) -> Self {
+    pub(super) fn new_unarmed(pool: &MemoryLedger, bytes: u64) -> Self {
         Self(Some(Arc::new(SourceAccountInner {
             pool: Arc::downgrade(&pool.0),
             bytes: AtomicU64::new(bytes),
@@ -69,25 +69,38 @@ impl SourceAccount {
     pub(super) fn share(&self) -> Self {
         Self(self.0.clone())
     }
-    pub(super) fn matches_pool(&self, pool: &WorkingMemoryPool) -> bool {
+    pub(super) fn matches_pool(&self, pool: &MemoryLedger) -> bool {
         Weak::ptr_eq(&self.inner().pool, &Arc::downgrade(&pool.0))
     }
     /// Extend only active source construction, atomically with the pool ledger.
     /// All aliases retain the complete accepted contribution through retirement.
     pub(super) fn reserve_more(&self, bytes: u64) -> Result<(), WorkingMemoryError> {
         let inner = self.inner();
-        let pool = inner.pool.upgrade().ok_or(WorkingMemoryError::IdentityMismatch)?;
-        let mut usage = pool.usage.lock().map_err(|_| WorkingMemoryError::Poisoned)?;
+        let pool = inner
+            .pool
+            .upgrade()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let mut usage = pool
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
         if !inner.active.load(Ordering::Relaxed) || !inner.compiling.load(Ordering::Relaxed) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let available = pool.available(&usage, None)?;
-        if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded { required_bytes: bytes, available_bytes: available });
-        }
-        let total = inner.bytes.load(Ordering::Relaxed).checked_add(bytes).ok_or(WorkingMemoryError::Overflow)?;
-        let reserved = usage.reserved.checked_add(bytes).ok_or(WorkingMemoryError::Overflow)?;
-        let used = pool.existing.checked_add(usage.registered).and_then(|n| n.checked_add(reserved))
+        pool.check_host_increment(&usage, bytes)?;
+        let total = inner
+            .bytes
+            .load(Ordering::Relaxed)
+            .checked_add(bytes)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let reserved = usage
+            .reserved
+            .checked_add(bytes)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let used = pool
+            .existing
+            .checked_add(usage.registered)
+            .and_then(|n| n.checked_add(reserved))
             .ok_or(WorkingMemoryError::Overflow)?;
         inner.bytes.store(total, Ordering::Relaxed);
         usage.reserved = reserved;
@@ -165,13 +178,15 @@ impl SourceInventoryOrigin {
     pub(in crate::working_memory) fn has_original_constructor(
         identity: &eredu_checkpoint::store::SourceStorageIdentity,
     ) -> bool {
-        identity.constructor_control_owner::<SourcePayloadCustody>().is_some()
+        identity
+            .constructor_control_owner::<SourcePayloadCustody>()
+            .is_some()
     }
 
     pub(in crate::working_memory) fn inspect(
         identity: &eredu_checkpoint::store::SourceStorageIdentity,
         bytes: u64,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Option<Self>, WorkingMemoryError> {
         let Some(custody) = identity.constructor_control_owner::<SourcePayloadCustody>() else {
             return Ok(None);
@@ -208,7 +223,7 @@ impl SourceInventoryOrigin {
     }
     pub(in crate::working_memory) fn validate_pool(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.validate()?;
         if self.account.matches_pool(pool) {
@@ -280,7 +295,7 @@ struct GgufSourceQuoteParts {
     mutexes: u64,
     controls: u64,
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Validate this exact existing source's already admitted constructor
     /// custody in this pool. No registration, clone, credit or allowance is
     /// created; ordinary and foreign-pool sources remain unqualified.

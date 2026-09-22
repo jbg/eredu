@@ -1,5 +1,7 @@
 use super::*;
-use crate::backend::submission_recovery::prefill::{NativeReservationGuard, PrefillControlProjection, ReservationGuard};
+use crate::backend::submission_recovery::prefill::{
+    NativeReservationGuard, PrefillControlProjection, ReservationGuard,
+};
 use eredu_runtime::{prefill::PrefillControlRole, working_memory::InferenceRequest};
 
 impl<A, S> MlxReplicatedTextMechanisms<A, S>

@@ -1,8 +1,9 @@
 //! One recipe worker with caller-owned host metadata admission.
 use super::{Error, Executable, StorageIdentity};
 use crate::backend::nn::workspace::{
-    ResidentExecutionMechanisms, MlxParallelWorkspace, MlxParallelWorkspaceMechanisms,
-    ProjectedPagedSources, ResidentNativeRecipe, ResidentRecipeRecorder, AddressableSources, MlxAddressableWorkspaceMechanisms,
+    AddressableSources, MlxAddressableWorkspaceMechanisms, MlxParallelWorkspace,
+    MlxParallelWorkspaceMechanisms, OrdinaryAddressableSources, ProjectedPagedSources,
+    ResidentExecutionMechanisms, ResidentNativeRecipe, ResidentRecipeRecorder,
 };
 use crate::backend::runtime::distributed::topology::original_source::parallel::OriginalParallelSource;
 use eredu_architectures::prepared_execution::{
@@ -12,12 +13,9 @@ use eredu_core::{
     BackendFailure, BackendFailureKind, InferenceGeometry, OutputDemand, SharedBackendFailure,
     TextFilterWorkspace, TextGenerationConfig,
 };
-use eredu_nn::workspace::{
-    WorkspaceContext, HostMetadataFunding, HostMetadataFundingError,
-};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError, WorkspaceContext};
 use eredu_runtime::working_memory::{
-    RegisteredWorkspaceStorage, RegisteredWorkspaceStorageLayout, WorkingMemoryError,
-    WorkingMemoryPool,
+    MemoryLedger, RegisteredWorkspaceStorage, RegisteredWorkspaceStorageLayout, WorkingMemoryError,
 };
 use std::{
     error::Error as StdError,
@@ -25,8 +23,8 @@ use std::{
     num::NonZeroU32,
 };
 
-pub(super) mod capture;
 mod addressable;
+pub(super) mod capture;
 use crate::composition::mlx::session::intervention::TextInterventionQuote;
 use eredu_runtime::layered::{BoundCaptureSelection, PreparedCaptureSelection};
 
@@ -51,6 +49,7 @@ impl RecipeWorkspace {
     pub(in crate::composition::mlx) fn prepare(
         facts: ResidentExecutionMechanisms,
         addressable: Option<&AddressableSources>,
+        ordinary_addressable: Option<&OrdinaryAddressableSources>,
         source: Option<OriginalParallelSource>,
         funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
@@ -58,11 +57,24 @@ impl RecipeWorkspace {
             size_of::<Self>(),
             size_of::<ResidentExecutionMechanisms>(),
             size_of::<Option<&AddressableSources>>(),
+            size_of::<Option<&OrdinaryAddressableSources>>(),
             size_of::<Option<OriginalParallelSource>>(),
             size_of::<&HostMetadataFunding>(),
             size_of::<MlxParallelWorkspaceMechanisms>(),
             size_of::<MlxAddressableWorkspaceMechanisms<ResidentExecutionMechanisms>>(),
             size_of::<MlxAddressableWorkspaceMechanisms<MlxParallelWorkspaceMechanisms>>(),
+            size_of::<
+                MlxAddressableWorkspaceMechanisms<
+                    ResidentExecutionMechanisms,
+                    OrdinaryAddressableSources,
+                >,
+            >(),
+            size_of::<
+                MlxAddressableWorkspaceMechanisms<
+                    MlxParallelWorkspaceMechanisms,
+                    OrdinaryAddressableSources,
+                >,
+            >(),
             size_of::<AddressableSources>(),
             size_of::<HostMetadataFunding>(),
             size_of::<MlxParallelWorkspace>(),
@@ -71,30 +83,60 @@ impl RecipeWorkspace {
             size_of::<Result<Self, Error>>(),
             size_of::<bool>(),
         ];
-        let bytes = controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
+        let bytes = controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
             .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
-        funding.reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
-        if addressable.is_some_and(|source| !source.funding().same_account(funding)) {
-            return Err(retain_planning_error(WorkingMemoryError::IdentityMismatch, funding.clone()));
+        funding
+            .reserve_metadata(bytes)
+            .map_err(Error::WorkspacePlanning)?;
+        if addressable.is_some_and(|source| !source.funding().same_account(funding))
+            || ordinary_addressable.is_some_and(|source| !source.funding().same_account(funding))
+            || (addressable.is_some() && ordinary_addressable.is_some())
+        {
+            return Err(retain_planning_error(
+                WorkingMemoryError::IdentityMismatch,
+                funding.clone(),
+            ));
         }
         match source {
             Some(source) => {
                 if !source.funding().same_account(funding) {
-                    return Err(retain_planning_error(WorkingMemoryError::IdentityMismatch, funding.clone()));
+                    return Err(retain_planning_error(
+                        WorkingMemoryError::IdentityMismatch,
+                        funding.clone(),
+                    ));
                 }
                 let mechanism = MlxParallelWorkspaceMechanisms::new(facts, source);
-                let workspace = match addressable {
-                    Some(source) => mechanism.prepare_workspace_with_addressable(source.clone()),
-                    None => mechanism.prepare_workspace(),
-                }.map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                let workspace = match (addressable, ordinary_addressable) {
+                    (Some(source), None) => {
+                        mechanism.prepare_workspace_with_addressable(source.clone())
+                    }
+                    (None, Some(source)) => {
+                        mechanism.prepare_workspace_with_ordinary_addressable(source.clone())
+                    }
+                    (None, None) => mechanism.prepare_workspace(),
+                    (Some(_), Some(_)) => unreachable!("validated source selection"),
+                }
+                .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
                 Ok(Self::Parallel(workspace))
             }
             None => {
-                let context = match addressable {
-                    Some(source) => WorkspaceContext::new_with_metadata_funding(
-                        MlxAddressableWorkspaceMechanisms::new(facts, source.clone()), funding.clone()),
-                    None => WorkspaceContext::new_with_metadata_funding(facts, funding.clone()),
-                }.map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                let context = match (addressable, ordinary_addressable) {
+                    (Some(source), None) => WorkspaceContext::new_with_metadata_funding(
+                        MlxAddressableWorkspaceMechanisms::new(facts, source.clone()),
+                        funding.clone(),
+                    ),
+                    (None, Some(source)) => WorkspaceContext::new_with_metadata_funding(
+                        MlxAddressableWorkspaceMechanisms::new(facts, source.clone()),
+                        funding.clone(),
+                    ),
+                    (None, None) => {
+                        WorkspaceContext::new_with_metadata_funding(facts, funding.clone())
+                    }
+                    (Some(_), Some(_)) => unreachable!("validated source selection"),
+                }
+                .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
                 Ok(Self::Resident(context))
             }
         }
@@ -294,7 +336,7 @@ impl Executable {
         geometry: InferenceGeometry,
         config: TextGenerationConfig,
         filter: impl Into<TextFilterWorkspace<'a>>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<RecipeParts, Error> {
         let inputs = self
             .resident_recipe_inputs(geometry)
@@ -314,13 +356,14 @@ impl Executable {
             None,
             None,
             None,
+            None,
         )
         .map(|(parts, _paged_sources)| parts)
     }
 
-    /// Actual initial planning account, separate from later tensor/execution
-    /// admission. Each participating constructor reserves before allocating;
-    /// completed spans never refund this cumulative host metadata account.
+    /// Cold tracing and source preparation use the same prospective metadata
+    /// account for ordinary allocations and explicitly prepared native arenas.
+    /// The selected mechanism supplies allocation facts without execution authority.
     pub(in crate::composition::mlx) fn quote_registered_resident_text_with_sampling_recipe_funded<
         'a,
     >(
@@ -328,36 +371,12 @@ impl Executable {
         geometry: InferenceGeometry,
         config: TextGenerationConfig,
         filter: impl Into<TextFilterWorkspace<'a>>,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
-        layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-    ) -> Result<FundedResidentRecipePlanning, Error> {
-        self.resident_recipe_funded(
-            geometry,
-            config,
-            filter.into(),
-            pool,
-            capacity,
-            None,
-            None,
-            None,
-            layerwise,
-            |_| Ok(None),
-        )
-    }
-
-    pub(in crate::composition::mlx) fn quote_registered_resident_text_with_sampling_capture_recipe_funded<
-        'a,
-    >(
-        &self,
-        geometry: InferenceGeometry,
-        config: TextGenerationConfig,
-        filter: impl Into<TextFilterWorkspace<'a>>,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
-        capture: &PreparedCaptureSelection,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
+        capture: Option<&PreparedCaptureSelection>,
         interventions: Option<TextInterventionQuote<'_>>,
         layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        ordinary_allocations: bool,
     ) -> Result<FundedResidentRecipePlanning, Error> {
         self.resident_recipe_funded(
             geometry,
@@ -365,10 +384,11 @@ impl Executable {
             filter.into(),
             pool,
             capacity,
-            Some(capture),
+            capture,
             interventions,
             None,
             layerwise,
+            ordinary_allocations,
             |_| Ok(None),
         )
     }
@@ -384,12 +404,16 @@ impl Executable {
         geometry: InferenceGeometry,
         config: TextGenerationConfig,
         filter: impl Into<TextFilterWorkspace<'a>>,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
         capture: Option<&PreparedCaptureSelection>,
         interventions: Option<TextInterventionQuote<'_>>,
-        capture_placement: Option<(&eredu_architectures::component_partition::ComponentPartitionLayouts, usize)>,
+        capture_placement: Option<(
+            &eredu_architectures::component_partition::ComponentPartitionLayouts,
+            usize,
+        )>,
         layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        ordinary_allocations: bool,
         prepare_source: F,
     ) -> Result<FundedResidentRecipePlanning, Error>
     where
@@ -405,6 +429,7 @@ impl Executable {
             interventions,
             capture_placement,
             layerwise,
+            ordinary_allocations,
             |funding| prepare_source(funding).map(Some),
         )
     }
@@ -414,12 +439,16 @@ impl Executable {
         geometry: InferenceGeometry,
         config: TextGenerationConfig,
         filter: TextFilterWorkspace<'_>,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
         capture: Option<&PreparedCaptureSelection>,
         interventions: Option<TextInterventionQuote<'_>>,
-        capture_placement: Option<(&eredu_architectures::component_partition::ComponentPartitionLayouts, usize)>,
+        capture_placement: Option<(
+            &eredu_architectures::component_partition::ComponentPartitionLayouts,
+            usize,
+        )>,
         layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        ordinary_allocations: bool,
         prepare_parallel: F,
     ) -> Result<FundedResidentRecipePlanning, Error>
     where
@@ -433,20 +462,54 @@ impl Executable {
             .and_then(|bytes| {
                 bytes.checked_add(size_of::<Result<Option<OriginalParallelSource>, Error>>())
             })
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         funding
             .reserve_metadata(controls)
             .map_err(Error::WorkspacePlanning)?;
-        let inputs = self
+        let mut inputs = self
             .resident_recipe_inputs(geometry)
             .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
-        let addressable=self.prepare_addressable_workspace_sources(inputs.facts,pool,&funding)?;
+        if ordinary_allocations {
+            inputs.facts = inputs.facts.ordinary_storage();
+        }
+        let mut addressable =
+            self.prepare_addressable_workspace_sources(inputs.facts, pool, &funding)?;
+        let ordinary_addressable = if ordinary_allocations {
+            addressable
+                .take()
+                .map(OrdinaryAddressableSources::new)
+                .transpose()
+                .map_err(|cause| retain_planning_error(cause, funding.clone()))?
+        } else {
+            None
+        };
         let parallel = prepare_parallel(&funding)
             .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
-        let workspace = RecipeWorkspace::prepare(inputs.facts, addressable.as_ref(), parallel, &funding)?;
+        let workspace = RecipeWorkspace::prepare(
+            inputs.facts,
+            addressable.as_ref(),
+            ordinary_addressable.as_ref(),
+            parallel,
+            &funding,
+        )?;
         let context = workspace.context();
+        // Ordinary callers retain their actual source inventory under this same
+        // paid context. They have no original-input source loan to substitute.
+        let ordinary_layerwise = if ordinary_allocations
+            && layerwise.is_none()
+            && !matches!(
+                inputs.blueprint.selected().text_realization().residency(),
+                eredu_runtime::LayerWeightResidency::FullyResident
+            ) {
+            Some(
+                self.erased()
+                    .prepared_layerwise_workspace(inputs.facts.allocation(), context)?,
+            )
+        } else {
+            None
+        };
+        let layerwise = layerwise.or(ordinary_layerwise.as_ref());
+
         // The shared architecture entry has this exact validation before its
         // worker. Preserve it here without constructing an uncharged String.
         if capture.is_none()
@@ -481,6 +544,7 @@ impl Executable {
             layerwise,
             capture_placement,
             addressable.as_ref(),
+            ordinary_addressable.as_ref(),
         )?;
         Ok(FundedResidentRecipePlanning {
             generation,
@@ -498,32 +562,26 @@ impl Executable {
         geometry: InferenceGeometry,
         config: TextGenerationConfig,
         filter: impl Into<TextFilterWorkspace<'a>>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
         capture: Option<BoundCaptureSelection<'_>>,
         interventions: Option<TextInterventionQuote<'_>>,
         diagnostics: Diagnostics<'_>,
         parallel: Option<&MlxParallelWorkspace>,
         layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-        capture_placement: Option<(&eredu_architectures::component_partition::ComponentPartitionLayouts, usize)>,
-        addressable:Option<&AddressableSources>,
+        capture_placement: Option<(
+            &eredu_architectures::component_partition::ComponentPartitionLayouts,
+            usize,
+        )>,
+        addressable: Option<&AddressableSources>,
+        ordinary_addressable: Option<&OrdinaryAddressableSources>,
     ) -> Result<ScopedRecipeParts, Error> {
         // The same immutable executable supplies these descriptive rows and
         // the source projection below. The enclosing text quote captures and
         // revalidates its actual parameter epoch before native execution.
-        self.erased()
-            .install_workspace_parameter_representations(context)
+        let parameter_backings = self
+            .install_parameter_source(context, layerwise)
             .map_err(|cause| diagnostics.source(cause))?;
-        // Unobserved bounded equations retain the ordinary resident-shaped trace;
-        // their unit parameters still come from this exact prepared copy/read
-        // source. Install those facts before any state or module construction.
-        // Observed/parallel paths already bind these rows at their checked acquire.
-        if capture.is_none() && parallel.is_none() {
-            if let Some(source) = layerwise {
-                source.extend_workspace_parameter_representations(context)
-                    .map_err(|cause| diagnostics.source(cause))?;
-            }
-        }
         let mut projected = self
             .erased()
             .project_resident_workspace_with_storage(inputs.batch, context)
@@ -536,20 +594,40 @@ impl Executable {
                 .storage
                 .iter()
                 .filter(|(_, bytes, _)| *bytes != 0)
-                .map(|(identity, _, root)| (StorageIdentity::Native(identity), root.clone()))
+                .map(|(identity, _, root)| {
+                    crate::backend::nn::workspace::registered_storage_row(identity, root)
+                })
+                .chain(parameter_backings.roots())
         };
-        let storage = if diagnostics.0.is_some() {
+        let completed_parameters = parameter_backings
+            .completed_source(context)
+            .map_err(|cause| diagnostics.source(cause))?;
+        let storage = if diagnostics.0.is_some() || completed_parameters.is_some() {
             let count = projected
                 .storage
                 .iter()
                 .filter(|(_, bytes, _)| *bytes != 0)
-                .count();
-            let layout = RegisteredWorkspaceStorageLayout::<StorageIdentity>::new(count)
-                .map_err(|cause| diagnostics.source(cause))?;
+                .count()
+                .checked_add(parameter_backings.len())
+                .ok_or_else(|| diagnostics.source(WorkingMemoryError::Overflow))?;
+            let layout = match &completed_parameters {
+                Some(source) => {
+                    RegisteredWorkspaceStorageLayout::<StorageIdentity>::new_with_completed_source(
+                        count, source,
+                    )
+                }
+                None => RegisteredWorkspaceStorageLayout::<StorageIdentity>::new(count),
+            }
+            .map_err(|cause| diagnostics.source(cause))?;
             context
                 .charge_metadata(layout.requested_bytes())
                 .map_err(|cause| diagnostics.source(cause))?;
-            layout.construct(pool, context, roots())
+            match completed_parameters {
+                Some(source) => {
+                    layout.construct_with_completed_source(pool, context, roots(), source)
+                }
+                None => layout.construct(pool, context, roots()),
+            }
         } else {
             RegisteredWorkspaceStorage::bind(pool, context, roots())
         }
@@ -563,54 +641,105 @@ impl Executable {
             let mut recorder = parallel
                 .recorder(geometry)
                 .map_err(|cause| diagnostics.source(cause))?;
-            context.charge_metadata(size_of::<(
-                Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-                super::NativeLayerwiseParameters<'_>,
-                Option<super::NativeLayerwiseParameters<'_>>,
-                Result<PreparedTextGenerationWorkspace,eredu_architectures::prepared_execution::PreparedExecutionError<eredu_nn::Error>>,
-            )>()).map_err(|cause|diagnostics.source(cause))?;
+            context
+                .charge_metadata(size_of::<(
+                    Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+                    super::NativeLayerwiseParameters<'_>,
+                    Option<super::NativeLayerwiseParameters<'_>>,
+                    Result<
+                        PreparedTextGenerationWorkspace,
+                        eredu_architectures::prepared_execution::PreparedExecutionError<
+                            eredu_nn::Error,
+                        >,
+                    >,
+                )>())
+                .map_err(|cause| diagnostics.source(cause))?;
             if let Some(source) = layerwise {
-                recorder.bind_layerwise_constructor_source(source)
+                recorder
+                    .bind_layerwise_span_constructor_source(source)
                     .map_err(|cause| diagnostics.source(cause))?;
             }
             let parameters = layerwise.map(super::NativeLayerwiseParameters);
             let quote = match capture {
-                Some(bound) => capture::quote_partitioned(inputs.blueprint,geometry,&projected.state,
-                    context,config,filter.into(),bound,interventions,&mut recorder,parallel.declaration_source(),
-                    capture_placement.ok_or_else(|| diagnostics.source(WorkingMemoryError::UnknownBound))?,
-                    parameters.as_ref().map(|source| source as
-                        &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters)),
+                Some(bound) => capture::quote_partitioned(
+                    inputs.blueprint,
+                    geometry,
+                    &projected.state,
+                    context,
+                    config,
+                    filter.into(),
+                    bound,
+                    interventions,
+                    &mut recorder,
+                    parallel.declaration_source(),
+                    capture_placement
+                        .ok_or_else(|| diagnostics.source(WorkingMemoryError::UnknownBound))?,
+                    parameters.as_ref().map(|source| {
+                        source as
+                        &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
+                    }),
+                ),
                 None => match layerwise {
-                    Some(source) => inputs.blueprint.quote_partitioned_layerwise_text_with_sampling_and_trace(
-                        geometry,&projected.state,context,config,filter,&mut recorder,
-                        Some(parallel.declaration_source()),&super::NativeLayerwiseParameters(source),
-                    ),
-                    None => inputs.blueprint.quote_partitioned_text_with_sampling_and_trace(
-                        geometry,&projected.state,context,config,filter,&mut recorder,
-                        Some(parallel.declaration_source()),
-                    ),
+                    Some(source) => inputs
+                        .blueprint
+                        .quote_partitioned_layerwise_text_with_sampling_and_trace(
+                            geometry,
+                            &projected.state,
+                            context,
+                            config,
+                            filter,
+                            &mut recorder,
+                            Some(parallel.declaration_source()),
+                            &super::NativeLayerwiseParameters(source),
+                        ),
+                    None => inputs
+                        .blueprint
+                        .quote_partitioned_text_with_sampling_and_trace(
+                            geometry,
+                            &projected.state,
+                            context,
+                            config,
+                            filter,
+                            &mut recorder,
+                            Some(parallel.declaration_source()),
+                        ),
                 },
-            }.map_err(|cause|diagnostics.source(cause))?;
+            }
+            .map_err(|cause| diagnostics.source(cause))?;
             let recipe = recorder
                 .finish(quote.equations.span_workspace_plan())
                 .map_err(|cause| diagnostics.source(cause))?;
             (quote, recipe)
         } else {
-            let mut recorder =
-                inputs.facts.recorder(geometry, context)
-                    .map_err(|cause| diagnostics.source(cause))?;
-            if let Some(source)=addressable{recorder.bind_addressable_sources(source.clone()).map_err(|cause|diagnostics.source(cause))?;}
-            context.charge_metadata(size_of::<(
-                Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-                Option<super::NativeLayerwiseParameters<'_>>,
-                Option<&dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>,
-            )>()).map_err(|cause| diagnostics.source(cause))?;
-            let observed_source = layerwise.filter(|_| capture.is_some());
-            if let Some(source) = observed_source {
-                recorder.bind_layerwise_constructor_source(source)
+            let mut recorder = inputs
+                .facts
+                .recorder(geometry, context)
+                .map_err(|cause| diagnostics.source(cause))?;
+            if let Some(source) = addressable {
+                recorder
+                    .bind_addressable_sources(source.clone())
                     .map_err(|cause| diagnostics.source(cause))?;
             }
-            let parameters = observed_source.map(super::NativeLayerwiseParameters);
+            if let Some(source) = ordinary_addressable {
+                recorder
+                    .bind_ordinary_addressable_sources(source.clone())
+                    .map_err(|cause| diagnostics.source(cause))?;
+            }
+            context
+                .charge_metadata(size_of::<(
+                    Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+                    Option<super::NativeLayerwiseParameters<'_>>,
+                    Option<
+                        &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters,
+                    >,
+                )>())
+                .map_err(|cause| diagnostics.source(cause))?;
+            if let Some(source) = layerwise {
+                recorder
+                    .bind_layerwise_span_constructor_source(source)
+                    .map_err(|cause| diagnostics.source(cause))?;
+            }
+            let parameters = layerwise.map(super::NativeLayerwiseParameters);
             let quote = match capture {
                 Some(bound) => capture::quote(
                     inputs.blueprint,
@@ -627,12 +756,14 @@ impl Executable {
                 ),
                 None => inputs
                     .blueprint
-                    .quote_replicated_resident_text_with_sampling_and_trace(
+                    .quote_replicated_text_with_sampling_and_trace(
                         geometry,
                         &projected.state,
                         context,
                         config,
                         filter,
+                        parameters.as_ref().map(|source| source as
+                            &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters),
                         &mut recorder,
                     ),
             }
@@ -649,13 +780,15 @@ impl Executable {
         // The source now owns canonical pins. Retire this inspection's native
         // aliases before a later metadata failure can retire those pins.
         drop(projected);
-        if let Some(source) = &mut paged_sources {
-            source
-                .prepare_catalogs(quote.equations.span_workspace_plan(), context)
-                .map_err(|cause| diagnostics.source(cause))?;
-            source
-                .prepare_host_program(pool, context)
-                .map_err(|cause| diagnostics.source(cause))?;
+        if inputs.facts.uses_original_storage() {
+            if let Some(source) = &mut paged_sources {
+                source
+                    .prepare_catalogs(quote.equations.span_workspace_plan(), context)
+                    .map_err(|cause| diagnostics.source(cause))?;
+                source
+                    .prepare_host_program(pool, context)
+                    .map_err(|cause| diagnostics.source(cause))?;
+            }
         }
         Ok(((quote, storage, recipe), paged_sources))
     }
@@ -698,7 +831,12 @@ fn planning_control_bytes() -> Option<usize> {
         // loan may overlap while the actual selection is bound to this context.
         size_of::<[Option<&PreparedCaptureSelection>; 3]>(),
         size_of::<[Option<TextInterventionQuote<'_>>; 5]>(),
-        size_of::<[Option<(&eredu_architectures::component_partition::ComponentPartitionLayouts, usize)>; 5]>(),
+        size_of::<
+            [Option<(
+                &eredu_architectures::component_partition::ComponentPartitionLayouts,
+                usize,
+            )>; 5],
+        >(),
         size_of::<Option<BoundCaptureSelection<'_>>>(),
         size_of::<BoundCaptureSelection<'_>>(),
         size_of::<Diagnostics<'_>>(),
@@ -709,7 +847,7 @@ fn planning_control_bytes() -> Option<usize> {
             InferenceGeometry,
             TextGenerationConfig,
             TextFilterWorkspace<'_>,
-            &WorkingMemoryPool,
+            &MemoryLedger,
             &WorkspaceContext,
             usize,
             u64,

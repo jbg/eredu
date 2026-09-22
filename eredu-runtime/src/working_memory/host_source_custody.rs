@@ -1,8 +1,8 @@
 //! Exact accepted source account, separate from finite construction authority.
 use super::{
-    OriginalRealtimeBudgetCustody, OriginalHostMetadataCustody, OriginalOperationMetadataCustody,
-    OriginalSpeculativeBudgetCustody, OriginalTextControlGuard, Usage, WorkingMemoryError,
-    WorkingMemoryFundingScope, WorkingMemoryPool, WorkingMemoryReservation,
+    MemoryLedger, OriginalHostMetadataCustody, OriginalOperationMetadataCustody,
+    OriginalRealtimeBudgetCustody, OriginalSpeculativeBudgetCustody, OriginalTextControlGuard,
+    Usage, WorkingMemoryError, WorkingMemoryFundingScope, WorkingMemoryReservation,
 };
 
 /// Retains the actual source publisher. This alias cannot create a bank, debit
@@ -14,6 +14,7 @@ enum Custody {
     Text(OriginalTextControlGuard),
     Speculative(OriginalSpeculativeBudgetCustody),
     Realtime(OriginalRealtimeBudgetCustody),
+    Numerical(super::OriginalNumericalBudgetCustody),
 }
 impl From<OriginalTextControlGuard> for OriginalHostSourceCustody {
     fn from(value: OriginalTextControlGuard) -> Self {
@@ -26,11 +27,20 @@ impl From<OriginalSpeculativeBudgetCustody> for OriginalHostSourceCustody {
     }
 }
 impl From<OriginalRealtimeBudgetCustody> for OriginalHostSourceCustody {
-    fn from(value:OriginalRealtimeBudgetCustody)->Self {Self(Custody::Realtime(value))}
+    fn from(value: OriginalRealtimeBudgetCustody) -> Self {
+        Self(Custody::Realtime(value))
+    }
+}
+impl From<super::OriginalNumericalBudgetCustody> for OriginalHostSourceCustody {
+    fn from(value: super::OriginalNumericalBudgetCustody) -> Self {
+        Self(Custody::Numerical(value))
+    }
 }
 impl OriginalHostSourceCustody {
     /// Borrow the already accepted origin; callers still validate under Usage.
-    pub(in crate::working_memory) fn origin(&self) -> (&WorkingMemoryPool, &super::InferenceExecutionIdentity, u64) {
+    pub(in crate::working_memory) fn origin(
+        &self,
+    ) -> (&MemoryLedger, &super::InferenceExecutionIdentity, u64) {
         match &self.0 {
             Custody::Text(value) => {
                 let raw = value.custody.raw();
@@ -38,6 +48,7 @@ impl OriginalHostSourceCustody {
             }
             Custody::Speculative(value) => (value.pool(), value.execution(), value.account_id()),
             Custody::Realtime(value) => (value.pool(), value.execution(), value.account_id()),
+            Custody::Numerical(value) => (value.pool(), value.execution(), value.account_id()),
         }
     }
 
@@ -47,6 +58,7 @@ impl OriginalHostSourceCustody {
             (Custody::Text(a), Custody::Text(b)) => a.custody.same(&b.custody),
             (Custody::Speculative(a), Custody::Speculative(b)) => a.same_account(b),
             (Custody::Realtime(a), Custody::Realtime(b)) => a.same_account(b),
+            (Custody::Numerical(a), Custody::Numerical(b)) => a.same_account(b),
             _ => false,
         }
     }
@@ -56,6 +68,7 @@ impl OriginalHostSourceCustody {
             Custody::Text(value) => value.metadata_custody().into(),
             Custody::Speculative(value) => value.clone().into(),
             Custody::Realtime(value) => value.clone().into(),
+            Custody::Numerical(value) => value.clone().into(),
         }
     }
     pub(in crate::working_memory) fn accounting(&self) -> OriginalHostMetadataCustody {
@@ -63,6 +76,7 @@ impl OriginalHostSourceCustody {
             Custody::Text(value) => OriginalHostMetadataCustody::from_guard(value),
             Custody::Speculative(value) => OriginalHostMetadataCustody::from_budget(value.clone()),
             Custody::Realtime(value) => OriginalHostMetadataCustody::from_realtime(value.clone()),
+            Custody::Numerical(value) => OriginalHostMetadataCustody::from_numerical(value.clone()),
         }
     }
     /// Revalidate the original accepted account. Text requires its exact
@@ -84,8 +98,22 @@ impl OriginalHostSourceCustody {
                 value.validate_copy_source(value.pool(), &usage)
             }
             (Custody::Realtime(value), None) => {
-                let usage=value.pool().0.usage.lock().map_err(|_|WorkingMemoryError::Poisoned)?;
-                value.validate_copy_source(value.pool(),&usage)
+                let usage = value
+                    .pool()
+                    .0
+                    .usage
+                    .lock()
+                    .map_err(|_| WorkingMemoryError::Poisoned)?;
+                value.validate_copy_source(value.pool(), &usage)
+            }
+            (Custody::Numerical(value), None) => {
+                let usage = value
+                    .pool()
+                    .0
+                    .usage
+                    .lock()
+                    .map_err(|_| WorkingMemoryError::Poisoned)?;
+                value.validate_copy_source(value.pool(), &usage)
             }
             _ => Err(WorkingMemoryError::IdentityMismatch),
         }
@@ -93,7 +121,7 @@ impl OriginalHostSourceCustody {
     pub(in crate::working_memory) fn validate_publication_locked(
         &self,
         reservation: Option<&WorkingMemoryReservation>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         match (&self.0, reservation) {
@@ -105,6 +133,7 @@ impl OriginalHostSourceCustody {
             }
             (Custody::Speculative(value), None) => value.validate_copy_source(pool, usage),
             (Custody::Realtime(value), None) => value.validate_copy_source(pool, usage),
+            (Custody::Numerical(value), None) => value.validate_copy_source(pool, usage),
             _ => Err(WorkingMemoryError::IdentityMismatch),
         }
     }
@@ -115,7 +144,7 @@ impl OriginalHostSourceCustody {
     pub(in crate::working_memory) fn funded_registration_account(&self) -> Option<u64> {
         match &self.0 {
             Custody::Text(value) => Some(value.custody.raw().account()),
-            Custody::Speculative(_) | Custody::Realtime(_) => None,
+            Custody::Speculative(_) | Custody::Realtime(_) | Custody::Numerical(_) => None,
         }
     }
     pub(in crate::working_memory) fn text_scope(
@@ -123,7 +152,7 @@ impl OriginalHostSourceCustody {
     ) -> Result<Option<&WorkingMemoryFundingScope>, WorkingMemoryError> {
         match &self.0 {
             Custody::Text(value) => value.custody.source_scope().map(Some),
-            Custody::Speculative(_) | Custody::Realtime(_) => Ok(None),
+            Custody::Speculative(_) | Custody::Realtime(_) | Custody::Numerical(_) => Ok(None),
         }
     }
 }

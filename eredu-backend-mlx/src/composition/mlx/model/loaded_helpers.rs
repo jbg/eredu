@@ -1,7 +1,7 @@
 //! Explicit numerical realization at the already-authorized loading boundary.
 
 use super::Executable;
-use crate::backend::{error::Error, managed_memory::NativeMemoryOwner, MlxCompletion};
+use crate::backend::{MlxCompletion, error::Error, managed_memory::NativeMemoryOwner};
 use eredu_core::Completion;
 
 impl Executable {

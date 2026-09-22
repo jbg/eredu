@@ -90,7 +90,7 @@ impl std::error::Error for OriginalChatFileError {
         })
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Exact original config-file I population before the real byte reserve.
     /// This admits only I; its retained charge still constrains subsequent J.
     pub fn chat_template_file_required_bytes(

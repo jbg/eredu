@@ -53,6 +53,7 @@ impl ProjectedPagedSource {
             .checked_add(size_of::<(
                 std::slice::Iter<'_, RetainedPagedDisk>,
                 &CacheBlockSourceLoan<'_>,
+                Option<crate::backend::runtime::cache::residency::CacheFileSource>,
             )>())?
             .checked_add(size_of::<
                 Result<[PagedCacheArrayGeometry; 2], CacheSourceError>,
@@ -146,8 +147,8 @@ impl LayerProjection<'_, '_> {
                 context,
             ));
         }
-        // Retain every actual own-writer file/version, including backings of
-        // presently hot rows. Pending or external shards do not substitute.
+        // Retain every authenticated file/version, including backings of hot
+        // rows. A path without a live or persistent source cannot substitute.
         let mut files = context
             .metadata_vec(
                 source
@@ -272,7 +273,7 @@ impl LayerProjection<'_, '_> {
                 WorkspacePagedBlock::host(id.start, id.end, values, types)
             } else {
                 if block.phase() != CacheStoragePhase::DiskReady
-                    || block.disk().and_then(|disk| disk.live_file()).is_none()
+                    || block.disk().and_then(|disk| disk.file_source()).is_none()
                 {
                     return Err(CacheSourceFailure::source(
                         CacheSourceError::PendingStorage,
@@ -412,6 +413,7 @@ fn project_owned_pair(
 fn layer_control_bytes() -> Option<usize> {
     let controls = [
         size_of::<Vec<RetainedPagedDisk>>(),
+        size_of::<Option<crate::backend::runtime::cache::residency::CacheFileSource>>(),
         size_of::<[eredu_nn::workspace::WorkspaceHostReadValue; 2]>(),
         size_of::<Result<eredu_nn::workspace::WorkspaceHostReadValue, eredu_nn::Error>>(),
         size_of::<[PagedCacheArrayGeometry; 2]>(),

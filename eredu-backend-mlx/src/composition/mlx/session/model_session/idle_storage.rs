@@ -112,7 +112,7 @@ impl SessionPayload {
             _retirement_probe,
             _memory_owner: _,
             state_memory: _,
-            memory_pool: _,
+            memory_ledger: _,
             operation_memory: _,
             nonstate_publication: _,
         } = self;
@@ -122,14 +122,18 @@ impl SessionPayload {
         // those descriptors without native queries, payload copies or inferred
         // zero coverage from a missing outer wrapper.
         target.collect_retained_buffer(enclosing)?;
-        if let Some(distributed)=distributed {distributed.collect_retained_buffers(enclosing)?;}
+        if let Some(distributed) = distributed {
+            distributed.collect_retained_buffers(enclosing)?;
+        }
         // Consume the actual architecture-owned declaration. Inline policy is
         // already part of this enclosing metadata object; media inputs, feature
         // buffers and native conversion results have independent request owners.
         #[cfg(any(feature = "image", feature = "audio"))]
         if let Some(processor) = processor {
             match processor.retained_storage() {
-                eredu_architectures::processor_execution::PreparedProcessorStorage::Inline { .. } => {}
+                eredu_architectures::processor_execution::PreparedProcessorStorage::Inline {
+                    ..
+                } => {}
             }
         }
         #[cfg(test)]
@@ -138,7 +142,7 @@ impl SessionPayload {
             enclosing.mark_incomplete();
         }
 
-        // NativeMemoryOwner, NativeMemoryRetention and WorkingMemoryPool retain
+        // NativeMemoryOwner, NativeMemoryRetention and MemoryLedger retain
         // accounting authority, not an additional tensor/source payload owned by
         // this session. Their handles and bookkeeping are metadata; the actual
         // model and state allocations are traversed by the executable below.
@@ -149,13 +153,14 @@ impl SessionPayload {
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::memory_fixture::LedgerFixture as _;
     use crate::tests::support::path_instrumentation as paths;
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
 
     fn fixture() -> (Stream, ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let backend = MlxBackend::new(&stream, &stream)
-            .with_memory_pool(WorkingMemoryPool::new(u64::MAX, 0).unwrap());
+            .with_memory_ledger(crate::memory_fixture::ledger(u64::MAX, 0).unwrap());
         let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
         let model = eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
             .unwrap();
@@ -169,9 +174,9 @@ mod tests {
         let payload = &runtime.session().payload;
         let before_state = payload.model.erased().state_snapshot();
         let before_paths = paths::snapshot();
-        let before_owners = payload.memory_pool.unquoted_owner_count().unwrap();
-        let before_used = payload.memory_pool.used_bytes().unwrap();
-        let before_peak = payload.memory_pool.peak_bytes().unwrap();
+        let before_owners = payload.memory_ledger.unquoted_owner_count().unwrap();
+        let before_used = payload.memory_ledger.fixture_host_charge().unwrap();
+        let before_peak = payload.memory_ledger.fixture_host_peak().unwrap();
         assert_eq!(
             payload
                 .retained_enclosing_storage()
@@ -188,11 +193,17 @@ mod tests {
         assert_eq!(payload.model.erased().state_snapshot(), before_state);
         assert_eq!(paths::snapshot(), before_paths);
         assert_eq!(
-            payload.memory_pool.unquoted_owner_count().unwrap(),
+            payload.memory_ledger.unquoted_owner_count().unwrap(),
             before_owners
         );
-        assert_eq!(payload.memory_pool.used_bytes().unwrap(), before_used);
-        assert_eq!(payload.memory_pool.peak_bytes().unwrap(), before_peak);
+        assert_eq!(
+            payload.memory_ledger.fixture_host_charge().unwrap(),
+            before_used
+        );
+        assert_eq!(
+            payload.memory_ledger.fixture_host_peak().unwrap(),
+            before_peak
+        );
         drop(empty);
 
         let prompt = MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2, 3]).unwrap();
@@ -252,7 +263,11 @@ mod tests {
                 .unwrap(),
             Some(0)
         );
-        let baseline=payload.retained_idle_storage().unwrap().nonstate_bytes().unwrap();
+        let baseline = payload
+            .retained_idle_storage()
+            .unwrap()
+            .nonstate_bytes()
+            .unwrap();
         payload.distributed = Some(communication.clone());
         assert_eq!(
             payload
@@ -306,3 +321,7 @@ mod tests {
         assert_eq!(storage.decoder_state_bytes().unwrap(), Some(0));
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

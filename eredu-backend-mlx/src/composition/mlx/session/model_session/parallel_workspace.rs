@@ -37,7 +37,7 @@ impl MlxModelSession {
                         .execution()
                         .partitioned_output_publication()
                         .ok_or_else(missing)?,
-                    &self.payload.memory_pool,
+                    &self.payload.memory_ledger,
                 )
                 .map(Some)
         })();

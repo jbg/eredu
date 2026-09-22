@@ -2,32 +2,37 @@
 use super::*;
 use crate::backend::runtime::generation::MlxSamplingBackend;
 use crate::composition::mlx::{
-    MlxPreparedInputMaterializer,
     speculative::{
         autoregressive::MlxAutoregressiveMechanisms as Mechanisms,
         sampling::logits::IndependentLogits,
     },
+    MlxPreparedInputMaterializer,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{GenerationCancellationToken, SpeculativePrefillOutcome};
 use eredu_runtime::{
-    DefaultSampler, SamplingBackend,
     generation::SpeculativeSampler,
     speculative::autoregressive::{AutoregressiveMechanisms, AutoregressivePass},
+    DefaultSampler, SamplingBackend,
 };
 const TEMPERATURE: f32 = 0.7;
 
 #[test]
 #[ignore = "requires native Metal execution"]
 fn original_categorical_uses_funded_target_prefill_and_preserves_key_advancement() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let backend = admitted_backend(&pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let mut target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
-    let loaded = pool.used_bytes().unwrap();
+    let loaded = pool.fixture_host_charge().unwrap();
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let config = SpeculativeConfig {
         max_tokens: 2,
@@ -92,7 +97,7 @@ fn original_categorical_uses_funded_target_prefill_and_preserves_key_advancement
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let environment = backend.original_copy_environment().unwrap();
@@ -107,17 +112,15 @@ fn original_categorical_uses_funded_target_prefill_and_preserves_key_advancement
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
             pair.metadata_funding().clone(),
         )
         .unwrap();
         assert_eq!(pair.schedule_identity(), foreign.schedule_identity());
-        assert!(
-            !pair
-                .request()
-                .source_identity()
-                .belongs_to_request(foreign.request())
-        );
+        assert!(!pair
+            .request()
+            .source_identity()
+            .belongs_to_request(foreign.request()));
         let foreign_context = SpeculativeExecutionStreams::single(backend.stream())
             .with_original_sources(&foreign, &environment)
             .unwrap();
@@ -153,7 +156,7 @@ fn original_categorical_uses_funded_target_prefill_and_preserves_key_advancement
         // work; the same snapshot still restores through its original request.
         let saved = Mechanisms::checkpoint(&cache).unwrap();
         let saved_estimate = Mechanisms::estimate(&saved);
-        let before_refusal = pool.used_bytes().unwrap();
+        let before_refusal = pool.fixture_host_charge().unwrap();
         let refused = Mechanisms::restore(&saved, foreign_context)
             .err()
             .expect("same-header foreign request must not restore state");
@@ -163,7 +166,7 @@ fn original_categorical_uses_funded_target_prefill_and_preserves_key_advancement
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch
             )
         ));
-        assert_eq!(pool.used_bytes().unwrap(), before_refusal);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before_refusal);
         assert_eq!(Mechanisms::estimate(&saved), saved_estimate);
         let restored = Mechanisms::restore(&saved, context).unwrap();
         assert_eq!(Mechanisms::estimate_state(&restored), saved_estimate);

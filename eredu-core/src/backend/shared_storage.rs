@@ -1,16 +1,19 @@
-//! Closed immutable sources and their per-domain accounting custody.
+//! Closed immutable sources and their per-accounting-owner custody.
 
 use super::{HostPreparationAuthority, SharedTokenFilter};
 use std::{
     cmp::Ordering,
-    collections::TryReserveError,
     fmt,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
 };
 
+mod attachments;
 mod declaration;
 mod owned;
+pub use attachments::{
+    SharedStorageAttachmentLayout, SharedStorageAttachmentTable, SharedStorageAttachments,
+};
 pub use declaration::{ControllerDeclarationData, SharedControllerDeclaration};
 pub use owned::{ErasedSharedStorageOwner, SharedStorageOwner, SharedStorageRetirement};
 
@@ -25,20 +28,28 @@ impl SharedStorageIdentity {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
-            .expect("process-local source identity space exhausted"))
+        Self(
+            NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("process-local source identity space exhausted"),
+        )
     }
     /// Identity keys have no independently allocated shell.
-    pub const fn source_shell_bytes() -> Option<usize> { Some(0) }
+    pub const fn source_shell_bytes() -> Option<usize> {
+        Some(0)
+    }
 }
 
-/// Process-local identity of one accounting domain.
+/// Process-local identity of one storage accounting owner.
 ///
-/// A new default value creates a different domain. This payload-free key
-/// retains no runtime pool or native resources.
+/// A ledger uses one identity for attachments to shared backing allocations.
+/// This is distinct from physical placement (`MemoryDomainId`): one ledger may
+/// coordinate several physical domains. A new default value creates a distinct
+/// accounting identity. This key retains no ledger or native resources.
 #[derive(Clone, Default)]
-pub struct SharedStorageDomain(Arc<DomainPayload>);
-type DomainPayload = ();
+pub struct SharedStorageAccountingId(Arc<AccountingIdentityPayload>);
+type AccountingIdentityPayload = ();
 
 macro_rules! identity_traits {
     ($identity:ty) => {
@@ -72,18 +83,20 @@ macro_rules! identity_traits {
         }
     };
 }
-identity_traits!(SharedStorageDomain);
+identity_traits!(SharedStorageAccountingId);
 
-impl SharedStorageDomain {
-    fn as_ptr(&self) -> *const DomainPayload { Arc::as_ptr(&self.0) }
+impl SharedStorageAccountingId {
+    fn as_ptr(&self) -> *const AccountingIdentityPayload {
+        Arc::as_ptr(&self.0)
+    }
     /// Layout of the payload in this identity's one shared allocation.
     /// The caller must separately qualify and include its Arc header. This
     /// creates no identity and grants no storage or execution authority.
     pub fn shared_payload_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<DomainPayload>()
+        std::alloc::Layout::new::<AccountingIdentityPayload>()
     }
 
-    /// Whether two keys identify exactly the same accounting domain.
+    /// Whether two keys identify exactly the same accounting owner.
     pub fn same_identity(&self, other: &Self) -> bool {
         self == other
     }
@@ -92,7 +105,7 @@ impl SharedStorageDomain {
 /// Failure to attach accounting custody to an immutable shared source.
 #[derive(Debug, thiserror::Error)]
 pub enum SharedStorageAttachmentError<E> {
-    /// The domain already has opaque custody or a different typed owner.
+    /// The accounting identity already has opaque custody or a different typed owner.
     #[error("shared storage accounting attachment type does not match")]
     AttachmentMismatch,
     /// A nonblocking attachment found an acquisition already in progress.
@@ -101,186 +114,74 @@ pub enum SharedStorageAttachmentError<E> {
     /// An earlier accounting acquisition panicked while holding custody.
     #[error("shared storage accounting custody is poisoned")]
     Poisoned,
-    /// Custody metadata could not reserve a slot before provider acquisition.
-    #[error("shared storage accounting metadata allocation failed: {0}")]
-    Allocation(#[source] TryReserveError),
+    /// Attachment population or its exact construction layout overflowed.
+    #[error("shared storage attachment layout overflowed")]
+    Overflow,
     /// The accounting provider rejected the attachment, preserving its cause.
     #[error("shared storage accounting provider rejected attachment: {0}")]
     Provider(#[source] E),
 }
 
-pub(super) struct Attachment {
-    domain: SharedStorageDomain,
-    _custody: AttachmentCustody,
-}
 enum AttachmentCustody {
     Opaque(#[allow(dead_code)] Box<dyn Send + Sync>),
     Typed(Arc<dyn std::any::Any + Send + Sync>),
     Owned(ErasedSharedStorageOwner),
 }
 
-/// Private shared mechanism. Each closed payload owner destroys its numerical
-/// allocation before this field drops. No public arbitrary-payload promise is
-/// exposed by this mechanism: filters, bytes, independently constructed immutable
-/// declarations and admitted capture-plan owners use this custody.
+/// Source identity and its closed per-accounting-owner attachments.
 pub(crate) struct SharedStorageCustody {
     identity: SharedStorageIdentity,
-    pub(super) attachments: Mutex<Vec<Attachment>>,
+    pub(super) attachments: SharedStorageAttachments,
 }
-
 impl SharedStorageCustody {
     pub(crate) fn new() -> Self {
         Self {
             identity: SharedStorageIdentity::new(),
-            attachments: Mutex::new(Vec::new()),
+            attachments: SharedStorageAttachments::new(),
         }
     }
-
     pub(crate) fn identity(&self) -> &SharedStorageIdentity {
         &self.identity
     }
-
     pub(crate) fn has_accounting_custody(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {
-        let custody = self.attachments.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => SharedStorageAttachmentError::Busy,
-            std::sync::TryLockError::Poisoned(_) => SharedStorageAttachmentError::Poisoned,
-        })?;
-        Ok(custody.iter().any(|entry| entry.domain == *domain))
+        self.attachments.has_accounting_custody(domain)
     }
-
     pub(crate) fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
-        let mut custody = self
-            .attachments
-            .lock()
-            .map_err(|_| SharedStorageAttachmentError::Poisoned)?;
-        Self::attach_locked(&mut custody, domain, acquire)
+        self.attachments.try_attach(domain, |_| acquire())
     }
-
     pub(crate) fn try_attach_nonblocking<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
-        let mut custody = self.attachments.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => SharedStorageAttachmentError::Busy,
-            std::sync::TryLockError::Poisoned(_) => SharedStorageAttachmentError::Poisoned,
-        })?;
-        Self::attach_locked(&mut custody, domain, acquire)
+        self.attachments
+            .try_attach_nonblocking(domain, |_| acquire())
     }
-
     pub(crate) fn try_attach_typed_nonblocking<T: Send + Sync + 'static, E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Arc<T>, E>,
     ) -> Result<Arc<T>, SharedStorageAttachmentError<E>> {
-        let mut custody = self.attachments.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => SharedStorageAttachmentError::Busy,
-            std::sync::TryLockError::Poisoned(_) => SharedStorageAttachmentError::Poisoned,
-        })?;
-        if let Some(entry) = custody.iter().find(|entry| entry.domain == *domain) {
-            let AttachmentCustody::Typed(owner) = &entry._custody else {
-                return Err(SharedStorageAttachmentError::AttachmentMismatch);
-            };
-            if !owner.is::<T>() {
-                return Err(SharedStorageAttachmentError::AttachmentMismatch);
-            }
-            // Cloning/downcasting the existing Arc allocates nothing. The
-            // attachment remains an owner throughout this borrowed lookup.
-            return Ok(owner
-                .clone()
-                .downcast::<T>()
-                .unwrap_or_else(|_| unreachable!("checked attachment type")));
-        }
-        custody
-            .try_reserve(1)
-            .map_err(SharedStorageAttachmentError::Allocation)?;
-        let owner = acquire().map_err(SharedStorageAttachmentError::Provider)?;
-        custody.push(Attachment {
-            domain: domain.clone(),
-            _custody: AttachmentCustody::Typed(owner.clone()),
-        });
-        Ok(owner)
+        self.attachments
+            .try_attach_typed_nonblocking(domain, |_| acquire())
     }
-
-    pub(crate) fn owned_attachment_control_bytes<T: SharedStorageRetirement>() -> Option<usize> {
-        owned::attachment_control_bytes::<T>()
+    pub(crate) fn owned_attachment_control_bytes<T: SharedStorageRetirement, E>() -> Option<usize> {
+        owned::attachment_control_bytes::<T, E>()
     }
-
     pub(crate) fn try_attach_owned_nonblocking<T: SharedStorageRetirement, E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<SharedStorageOwner<T>, E>,
     ) -> Result<SharedStorageOwner<T>, SharedStorageAttachmentError<E>> {
-        // Keep an unused provider in this outer frame: early reuse/mismatch or
-        // lock failure must drop captures only after the local guard is gone.
-        let mut acquire = Some(acquire);
-        let result = (|| {
-            let mut custody = self.attachments.try_lock().map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => SharedStorageAttachmentError::Busy,
-                std::sync::TryLockError::Poisoned(_) => SharedStorageAttachmentError::Poisoned,
-            })?;
-            if let Some(entry) = custody.iter().find(|entry| entry.domain == *domain) {
-                let AttachmentCustody::Owned(owner) = &entry._custody else {
-                    return Err(SharedStorageAttachmentError::AttachmentMismatch);
-                };
-                return owner
-                    .clone_typed::<T>()
-                    .ok_or(SharedStorageAttachmentError::AttachmentMismatch);
-            }
-            // Preserved source metadata allocation, before provider acquisition.
-            // This is not an allocation-free custody Vec redesign.
-            custody
-                .try_reserve(1)
-                .map_err(SharedStorageAttachmentError::Allocation)?;
-            let owner = acquire.take().expect("single acquisition")()
-                .map_err(SharedStorageAttachmentError::Provider)?;
-            custody.push(Attachment {
-                domain: domain.clone(),
-                _custody: AttachmentCustody::Owned(owner.clone().erase()),
-            });
-            Ok(owner)
-        })();
-        drop(acquire);
-        result
-    }
-
-    fn attach_locked<E>(
-        custody: &mut Vec<Attachment>,
-        domain: &SharedStorageDomain,
-        acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
-    ) -> Result<bool, SharedStorageAttachmentError<E>> {
-        if custody.iter().any(|entry| entry.domain == *domain) {
-            return Ok(false);
-        }
-        custody
-            .try_reserve(1)
-            .map_err(SharedStorageAttachmentError::Allocation)?;
-        let handle = acquire().map_err(SharedStorageAttachmentError::Provider)?;
-        custody.push(Attachment {
-            domain: domain.clone(),
-            _custody: AttachmentCustody::Opaque(handle),
-        });
-        Ok(true)
-    }
-}
-
-impl Drop for SharedStorageCustody {
-    fn drop(&mut self) {
-        // Exclusive final access needs no lock. Provider destructors can reenter
-        // accounting, including after a poisoned acquisition. No user-defined
-        // destructor runs while the owner mutex is held.
-        let attachments = self
-            .attachments
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner());
-        drop(std::mem::take(attachments));
+        self.attachments
+            .try_attach_owned_nonblocking(domain, |_| acquire())
     }
 }
 
@@ -292,7 +193,9 @@ struct BytesInner {
     payload_retired: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 impl SharedStorageRetirement for BytesInner {
-    fn retire(self: Arc<Self>) { drop(Arc::into_inner(self)); }
+    fn retire(self: Arc<Self>) {
+        drop(Arc::into_inner(self));
+    }
 }
 
 impl Drop for BytesInner {
@@ -318,11 +221,16 @@ pub struct SharedControllerBytes(SharedStorageOwner<BytesInner>);
 
 impl SharedControllerBytes {
     /// Exact source-owner and identity allocation requests, excluding the byte
-    /// destination and later domain attachments. This grants no permission.
+    /// destination and later accounting attachments. This grants no permission.
     pub fn source_shell_bytes() -> Option<usize> {
         use std::{alloc::Layout, sync::atomic::AtomicUsize};
-        Layout::new::<[AtomicUsize; 2]>().extend(Layout::new::<BytesInner>()).ok()?
-            .0.pad_to_align().size().checked_add(SharedStorageIdentity::source_shell_bytes()?)
+        Layout::new::<[AtomicUsize; 2]>()
+            .extend(Layout::new::<BytesInner>())
+            .ok()?
+            .0
+            .pad_to_align()
+            .size()
+            .checked_add(SharedStorageIdentity::source_shell_bytes()?)
     }
     /// Transfers the vector and retains its existing construction authority.
     /// The caller must pay for the destination and source shells before this
@@ -364,21 +272,36 @@ impl SharedControllerBytes {
         self.0.authority.is_funded_by(funding)
     }
 
-    /// Attaches one accounting handle per domain, including to earlier clones.
+    /// Attaches a concrete owner after admitting its prospective node layout.
+    /// Reuse preserves the same closed owner; a different owner type rejects.
+    pub fn try_attach_owned_prepared<T: super::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            super::SharedStorageAttachmentLayout,
+        ) -> Result<super::SharedStorageOwner<T>, E>,
+    ) -> Result<super::SharedStorageOwner<T>, SharedStorageAttachmentError<E>> {
+        self.0
+            .custody
+            .attachments
+            .try_attach_owned_nonblocking(owner, acquire)
+    }
+
+    /// Attaches one handle per accounting owner, including to earlier clones.
     ///
     /// Returns false without invoking the provider for an already attached
-    /// domain. A slot is reserved before acquisition, so publishing a successful
+    /// accounting identity. A prepaid node is allocated after acquisition, so publishing a successful
     /// handle cannot fail. Rejection preserves all earlier attachments.
     ///
     /// The provider runs under owner custody and may perform only closed
     /// accounting operations: no owner reentry, other source locks, native work
     /// or user callbacks. Its handle must not retain this owner indirectly or
-    /// directly. Register only payload-free identity/domain keys. Provider
+    /// directly. Register only payload-free storage/accounting keys. Provider
     /// handles and errors retire outside the custody lock; attached handles
     /// outlive the byte allocation.
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.0.custody.try_attach(domain, acquire)
@@ -417,8 +340,10 @@ pub enum SharedControllerSource<'a> {
 
 impl SharedControllerSource<'_> {
     /// Reads the exact existing attachment without registering or adopting data.
-    pub fn has_accounting_custody(&self, domain: &SharedStorageDomain)
-        -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {
+    pub fn has_accounting_custody(
+        &self,
+        domain: &SharedStorageAccountingId,
+    ) -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {
         match self {
             Self::Filter(value) => value.has_accounting_custody(domain),
             Self::Bytes(value) => value.0.custody.has_accounting_custody(domain),
@@ -453,11 +378,31 @@ impl SharedControllerSource<'_> {
         }
     }
 
-    /// Uses the closed owner's accounting protocol. The provider restrictions
-    /// and destruction guarantees of `SharedControllerBytes::try_attach` apply.
+    /// Node backing and addressable insertion/retirement controls for a concrete
+    /// attached owner and provider refusal type. Payload/header is separate.
+    pub fn owned_attachment_control_bytes<T: SharedStorageRetirement, E>() -> Option<usize> {
+        SharedStorageCustody::owned_attachment_control_bytes::<T, E>()
+    }
+
+    /// Attaches a concrete owner after its provider admits the supplied node
+    /// layout and owner construction. An existing matching owner is reused.
+    pub fn try_attach_owned_prepared<T: SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(SharedStorageAttachmentLayout) -> Result<SharedStorageOwner<T>, E>,
+    ) -> Result<SharedStorageOwner<T>, SharedStorageAttachmentError<E>> {
+        match self {
+            Self::Filter(value) => value.try_attach_owned_prepared(owner, acquire),
+            Self::Bytes(value) => value.try_attach_owned_prepared(owner, acquire),
+            Self::Declaration(value) => value.try_attach_owned_prepared(owner, acquire),
+        }
+    }
+
+    /// Attaches externally owned custody once per accounting owner. This API
+    /// supplies no admission; funded producers use `try_attach_owned_prepared`.
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         match self {

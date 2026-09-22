@@ -18,7 +18,7 @@ pub(super) struct TransferPublication {
     ids: Vec<IdDestinations>,
     // Local rows can outlive the recovery variable on failure. No bare Vec
     // extraction exposes them without the actual prepaid storage custody.
-    custody: Option<OriginalOperationMetadataCustody>,
+    custody: Option<ResidencyControlCustody>,
 }
 impl TransferPublication {
     pub(super) fn ordinary() -> Self {
@@ -29,10 +29,13 @@ impl TransferPublication {
         }
     }
     pub(super) fn original(controls: &OriginalOperationMetadataCustody) -> Self {
+        Self::with_custody(controls.clone().into())
+    }
+    pub(super) fn with_custody(custody: ResidencyControlCustody) -> Self {
         Self {
             values: Vec::new(),
             ids: Vec::new(),
-            custody: Some(controls.clone()),
+            custody: Some(custody),
         }
     }
     pub(super) fn prepare(

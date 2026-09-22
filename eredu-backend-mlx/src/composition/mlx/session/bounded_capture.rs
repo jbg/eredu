@@ -14,8 +14,12 @@ const CHUNK: u64 = 1024;
 #[cfg(test)]
 mod tests;
 
-mod routed;
 mod original_speculative;
+mod scheduled;
+pub(in crate::composition::mlx) mod partition;
+pub(in crate::composition::mlx) mod funded_model;
+pub(in crate::composition::mlx) use scheduled::ScheduledNativeCapture;
+mod routed;
 pub(in crate::composition::mlx) use original_speculative::prepare as original_speculative_capture_with_error;
 mod token_scores;
 
@@ -53,15 +57,27 @@ pub(in crate::composition::mlx) fn speculative_capture(
     Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Exception>>>,
     eredu_core::speculative::SpeculativeControlError,
 > {
-    speculative_capture_with_error(plan,request,stream,
-        |error:&eredu_runtime::capture::CaptureExecutionError<Error>|Exception::custom(error.to_string()))
+    speculative_capture_with_error(
+        plan,
+        request,
+        stream,
+        |error: &eredu_runtime::capture::CaptureExecutionError<Error>| {
+            Exception::custom(error.to_string())
+        },
+    )
 }
 
-pub(in crate::composition::mlx) fn speculative_capture_with_error<E:'static,F>(
-    plan:&eredu_core::speculative::AdmittedSpeculativeActivations,
-    request:eredu_core::SpeculativeRequestId,stream:&Stream,map_error:F,
-)->Result<Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor,E>>>,eredu_core::speculative::SpeculativeControlError>
-where F:eredu_runtime::capture::SpeculativeCaptureErrorTransport<Error,E>+'static,
+pub(in crate::composition::mlx) fn speculative_capture_with_error<E: 'static, F>(
+    plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+    request: eredu_core::SpeculativeRequestId,
+    stream: &Stream,
+    map_error: F,
+) -> Result<
+    Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, E>>>,
+    eredu_core::speculative::SpeculativeControlError,
+>
+where
+    F: eredu_runtime::capture::SpeculativeCaptureErrorTransport<Error, E> + 'static,
 {
     Ok(
         eredu_runtime::capture::SpeculativeCaptureObserver::from_admitted(
@@ -73,12 +89,7 @@ where F:eredu_runtime::capture::SpeculativeCaptureErrorTransport<Error,E>+'stati
         )?
         .map(|observer| {
             Box::new(observer)
-                as Box<
-                    dyn eredu_runtime::inspection::SpeculativeActivationObserver<
-                            MlxTensor,
-                            E,
-                        >,
-                >
+                as Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, E>>
         }),
     )
 }
@@ -163,7 +174,6 @@ pub(crate) fn capabilities() -> CaptureCapabilities {
         transformations: vec![CaptureTransformKind::RoutedUnits, CaptureTransformKind::Preview, CaptureTransformKind::Slice,
             CaptureTransformKind::FullTensor, CaptureTransformKind::Summary, CaptureTransformKind::Histogram, CaptureTransformKind::TopCandidates, CaptureTransformKind::TokenScores],
         max_histogram_bins: 128,
-        physical_native_limit: false,
         conditions: vec![
             "Scoped speculative activations require complete selected hooks and phase-aware invocation admission; distributed execution also requires retained producer layouts and transport".into(),
             "Logical capture storage is bounded; inference allocations and native private allocator/workspace are excluded".into(),
@@ -407,9 +417,13 @@ pub(in crate::composition::mlx) fn estimate_tensor_geometry(
         source[i] = u64::try_from(extent).map_err(|_| CaptureError::Overflow)?;
         let stride = geometry.strides()[i];
         wide_stride |= stride > i32::MAX as u64;
-        if stride == 0 { return Err(CaptureError::Overflow); }
-        selected[i] = geometry.ends()[i].checked_sub(geometry.starts()[i])
-            .ok_or(CaptureError::Overflow)?.div_ceil(stride);
+        if stride == 0 {
+            return Err(CaptureError::Overflow);
+        }
+        selected[i] = geometry.ends()[i]
+            .checked_sub(geometry.starts()[i])
+            .ok_or(CaptureError::Overflow)?
+            .div_ceil(stride);
     }
     let source_elements = elements(&source[..rank])?;
     let selected_elements = elements(&selected[..rank])?;
@@ -421,9 +435,10 @@ pub(in crate::composition::mlx) fn estimate_tensor_geometry(
             "MLX capture shape/index exceeds signed 32-bit indexing".into(),
         ));
     }
-    let output = raw_tensor_output(geometry.native_transform(), selected_elements).ok_or_else(|| {
-        CaptureError::Unsupported("capture requires a raw tensor transform".into())
-    })?;
+    let output =
+        raw_tensor_output(geometry.native_transform(), selected_elements).ok_or_else(|| {
+            CaptureError::Unsupported("capture requires a raw tensor transform".into())
+        })?;
     estimate_raw_tensor_counts(source_elements, selected_elements, output)
 }
 
@@ -1022,8 +1037,10 @@ pub(in crate::composition::mlx::session) fn estimate_partition_routed_geometry(
 
 /// Shared source dependency quota for the existing original partition worker.
 /// The enclosing caller separately proves its retained partition and completion owner.
-pub(crate) fn estimate_partition_source(shape: &[u64], wait: eredu_core::BoundedCompletionWait)
-    -> Result<CaptureUsage, CaptureError> {
+pub(crate) fn estimate_partition_source(
+    shape: &[u64],
+    wait: eredu_core::BoundedCompletionWait,
+) -> Result<CaptureUsage, CaptureError> {
     if wait.cancellation() != eredu_core::CompletionCancellationMode::QuarantineUntilComplete {
         return Err(CaptureError::Unsupported(
             "MLX capture source requires selected bounded partition completion".into(),

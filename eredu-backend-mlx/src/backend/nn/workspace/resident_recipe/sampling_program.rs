@@ -20,8 +20,10 @@ impl ResidentSamplingProgram {
     pub(crate) fn planning_metadata(&self) -> Option<&eredu_core::HostMetadataFunding> {
         self._planning.as_ref()
     }
-    pub(crate) fn input(&self) -> Option<eredu_runtime::working_memory::SamplingWorkspaceInputPlan> {
-        self.input
+    pub(crate) fn input(
+        &self,
+    ) -> Option<eredu_runtime::working_memory::SamplingWorkspaceInputPlan> {
+        self.input.clone()
     }
     pub(crate) fn kernel_attempts(&self) -> Option<usize> {
         self.rows.iter().try_fold(0usize, |n, row| {
@@ -59,7 +61,10 @@ impl ResidentSamplingProgram {
     }
 }
 impl ResidentRecipeRecorder {
-    pub(super) fn record_sampling_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+    pub(super) fn record_sampling_input(
+        &mut self,
+        input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan,
+    ) -> Result<(), Error> {
         if self.sampling_input.is_some() || !self.sampling.is_empty() {
             return Err(self.metadata_error("sampling source was already recorded"));
         }
@@ -74,9 +79,11 @@ impl ResidentRecipeRecorder {
         steps: u64,
         context: &WorkspaceContext,
     ) -> Result<SamplingRecipeCollector<'_>, Error> {
-        context.charge_metadata(size_of::<SamplingRecipeCollector<'_>>()
-            .checked_add(size_of::<Result<SamplingRecipeCollector<'_>, Error>>())
-            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
+        context.charge_metadata(
+            size_of::<SamplingRecipeCollector<'_>>()
+                .checked_add(size_of::<Result<SamplingRecipeCollector<'_>, Error>>())
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
+        )?;
         let portable = SamplingWorkspacePlanCollector::new(self.geometry, steps, context)?;
         Ok(SamplingRecipeCollector {
             native: self,
@@ -106,7 +113,7 @@ impl ResidentRecipeRecorder {
         }
         Ok(ResidentSamplingProgram {
             rows: std::mem::take(&mut self.sampling),
-            input: self.sampling_input,
+            input: self.sampling_input.take(),
             _planning: self
                 .context
                 .as_ref()
@@ -149,8 +156,11 @@ impl SamplingRecipeCollector<'_> {
     }
 }
 impl SamplingWorkspaceObserver for SamplingRecipeCollector<'_> {
-    fn observe_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
-        self.portable.observe_input(input)?;
+    fn observe_input(
+        &mut self,
+        input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan,
+    ) -> Result<(), Error> {
+        self.portable.observe_input(input.clone())?;
         self.native.record_sampling_input(input)
     }
     fn observe(
@@ -172,7 +182,10 @@ impl SamplingWorkspaceObserver for SamplingRecipeCollector<'_> {
     }
 }
 impl SamplingWorkspaceObserver for ResidentRecipeRecorder {
-    fn observe_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+    fn observe_input(
+        &mut self,
+        input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan,
+    ) -> Result<(), Error> {
         self.record_sampling_input(input)
     }
     fn observe(

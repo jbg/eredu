@@ -1,8 +1,8 @@
 //! Existing-only grouped pins with original, finite control custody.
 use super::*;
 use crate::working_memory::{
-    funding::CapturePinIdentity, residual::RegisteredStoragePin, CaptureSourceSegment,
-    InferenceSpanWorkspacePlan, InferenceWorkspaceSpan, OriginalTextControlGuard, Usage,
+    CaptureSourceSegment, InferenceSpanWorkspacePlan, InferenceWorkspaceSpan,
+    OriginalTextControlGuard, Usage, funding::CapturePinIdentity, residual::RegisteredStoragePin,
 };
 use crate::{inspection::PrefillChunkRetentionContext, prefill::PrefillChunk};
 use std::{marker::PhantomData, mem::size_of, sync::TryLockError};
@@ -315,14 +315,13 @@ impl<K: Ord + Send + 'static> BoundedPinAttempt<K> {
             } else {
                 registration.bytes = registration
                     .bytes
-                    .checked_add(*bytes)
-                    .ok_or(WorkingMemoryError::Overflow)?;
+                    .and_then(|total| total.checked_add(*bytes));
                 registration
                     .keys
                     .push(input.take().ok_or(WorkingMemoryError::IdentityMismatch)?);
                 self.ordinals.push(PinOrdinal {
                     bytes: *bytes,
-                    ordinal: EntryLocator::Legacy(0),
+                    ordinal: EntryLocator::Fixed { batch: 0, slot: 0 },
                 });
             }
         }
@@ -470,12 +469,12 @@ impl<K: Ord + Send + 'static> BoundedRegisteredStorage<K> {
     }
 
     /// Unique physical capacity pinned, not a new charge or scalar allowance.
-    pub fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> Option<u64> {
         self.core().storage.bytes()
     }
     /// Same namespace and every existing allocation origin's current health.
     /// Closing the original run alone does not invalidate healthy source pins.
-    pub fn validate_source(&self, pool: &WorkingMemoryPool) -> Result<(), BoundedPinError> {
+    pub fn validate_source(&self, pool: &MemoryLedger) -> Result<(), BoundedPinError> {
         let usage = pool.0.usage.try_lock().map_err(lock_error)?;
         self.core()
             .controls
@@ -491,7 +490,7 @@ impl<K: Ord + Send + 'static> BoundedRegisteredStorage<K> {
 pub(in crate::working_memory) trait OpeningPinGroup: Send + Sync {
     fn validate_origins(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError>;
     fn validate_activation(
@@ -507,7 +506,7 @@ pub(in crate::working_memory) trait OpeningPinGroup: Send + Sync {
 impl<K: Ord + Send + Sync + 'static> OpeningPinGroup for BoundedPinCore<K> {
     fn validate_origins(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.controls

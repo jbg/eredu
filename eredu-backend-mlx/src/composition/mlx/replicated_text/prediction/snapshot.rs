@@ -4,7 +4,6 @@ use super::{owned_cache::OwnedPredictionCache, SpeculativeExecutionStreams};
 use crate::backend::{managed_memory::NativeMemoryOwner, submission_recovery};
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use safemlx::{error::Exception, Array, Stream};
-use std::sync::Arc;
 
 pub(super) fn with_cache_ownership<C>(
     mut estimate: SnapshotEstimate,
@@ -36,9 +35,31 @@ pub(super) fn copy_cache<C>(
     snapshot: fn(&C, &Stream) -> Result<C, Exception>,
 ) -> Result<OwnedPredictionCache<C>, BackendFailure> {
     let owner =
-        NativeMemoryOwner::acquire(&context.memory_pool()).map_err(BackendFailure::from_error)?;
+        NativeMemoryOwner::acquire(&context.memory_ledger()).map_err(BackendFailure::from_error)?;
     let memory = state.memory_for_copy(&owner);
-    let allocation_memory = Arc::new(memory.clone());
+    let controls = eredu_core::HostPreparationAuthority::retention_bytes::<(
+        crate::backend::managed_memory::NativeMemoryRetention,
+        eredu_core::HostPreparationAuthority,
+    )>()
+    .and_then(|n| {
+        memory
+            .owners()
+            .len()
+            .checked_mul(std::mem::size_of::<NativeMemoryOwner>())
+            .and_then(|b| n.checked_add(b))
+    })
+    .ok_or_else(|| {
+        BackendFailure::from_error(eredu_runtime::working_memory::WorkingMemoryError::Overflow)
+    })?;
+    let metadata = owner
+        .pool()
+        .prepare_storage_metadata()
+        .map_err(BackendFailure::from_error)?;
+    let host = metadata
+        .prepare_host_owner(controls)
+        .map_err(BackendFailure::from_error)?;
+    // This shared token's shell retires before its paid metadata authority.
+    let allocation_memory = eredu_core::HostPreparationAuthority::retain((memory.clone(), host));
     submission_recovery::detached_retained(memory.clone(), || {
         super::super::super::speculative::state_snapshot::settle(arrays(state.inner()))?;
         let copy = snapshot(state.inner(), context.target())?;
@@ -52,9 +73,9 @@ pub(super) fn copy_cache<C>(
             {
                 continue;
             }
-            array
-                .retain_allocation_owner(Arc::clone(&allocation_memory))
-                .map_err(|failure| failure.into_parts().0)?;
+            crate::backend::managed_memory::OrdinaryArrayAttachment::prepare(owner.pool(), 0)
+                .and_then(|prepared| prepared.attach(array, allocation_memory.clone()))
+                .map_err(Exception::from_source)?;
         }
         Ok(OwnedPredictionCache::new(copy, memory))
     })

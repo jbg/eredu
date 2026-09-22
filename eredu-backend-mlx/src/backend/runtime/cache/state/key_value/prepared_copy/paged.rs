@@ -47,6 +47,16 @@ pub(crate) struct SavedPagedKvCopy {
     inner: SavedResidentKvCopy,
 }
 impl<'a> PreparedPagedKvCopy<'a> {
+    /// The exact live table behind this inspected source. A saved slot table
+    /// is not a runnable state and cannot supply this constructor loan.
+    pub(in crate::backend::runtime::cache::state) fn live_source(
+        &self,
+    ) -> Option<&'a MlxKeyValueState> {
+        match self.source {
+            KvCopySource::Live(source) => Some(source),
+            KvCopySource::Saved(_) => None,
+        }
+    }
     pub(crate) fn prepare_live(
         source: &'a MlxKeyValueState,
     ) -> Result<Option<Self>, PagedKvPreparationError> {
@@ -152,7 +162,7 @@ impl<'a> PreparedPagedKvCopy<'a> {
     }
     pub(crate) fn host_copy(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         host: &HostPreparationAuthority,
     ) -> Result<PreparedPagedKvHostCopy<'a>, Error> {
         let result = (|| {
@@ -245,7 +255,7 @@ impl<'a> PreparedPagedKvHostCopy<'a> {
     }
     pub(crate) fn admit(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         sampling: eredu_runtime::working_memory::RegisteredSamplingCopy<'a, StorageIdentity>,
         complete: eredu_runtime::working_memory::WorkingMemoryStorage<StorageIdentity>,
         limits: eredu_runtime::working_memory::WorkspaceCopyLimits,
@@ -277,9 +287,14 @@ impl<'a> PreparedPagedKvHostCopy<'a> {
     }
 }
 impl SavedPagedKvCopy {
+    pub(crate) fn continuation_bounds(&self, additional: u64) -> Option<(u64, u64)> {
+        self.inner.continuation_bounds(additional)
+    }
+
     pub(crate) fn prepare_copy(&self) -> Result<PreparedPagedKvCopy<'_>, PagedKvPreparationError> {
-        PreparedPagedKvCopy::prepare(KvCopySource::Saved(&self.inner))?
-            .ok_or_else(|| SnapshotProjectionCause::ChangedAt("saved paged owner has no paged layers").into())
+        PreparedPagedKvCopy::prepare(KvCopySource::Saved(&self.inner))?.ok_or_else(|| {
+            SnapshotProjectionCause::ChangedAt("saved paged owner has no paged layers").into()
+        })
     }
     pub(crate) fn shared_layout(&self) -> &SharedStateLayout {
         self.inner.shared_layout()

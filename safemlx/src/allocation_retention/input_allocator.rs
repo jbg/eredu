@@ -125,6 +125,11 @@ fn empty_runtime() -> safemlx_sys::mlx_prepared_input_runtime {
         maximum: 0,
         storage_kind: 0,
         controls: 0,
+        placement: safemlx_sys::mlx_memory_placement {
+            kind: 0,
+            device: -1,
+            device_count: 0,
+        },
     }
 }
 

@@ -22,8 +22,8 @@ fn assert_records(
 #[test]
 fn original_plan_concurrent_final_aliases_keep_records_and_one_original_hold() {
     for _ in 0..4 {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let source = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let source = pool.register_host_storage([(1u32, 64)]).unwrap();
         let (reservation, run, quote) = accepted(&pool);
         let held = quote.span_workspace().retention_peak_bytes().unwrap();
         let plan = quote.span_workspace().plan().clone();
@@ -39,7 +39,7 @@ fn original_plan_concurrent_final_aliases_keep_records_and_one_original_hold() {
         assert_eq!(account(&pool, &reservation).2, 1);
         drop((owner, reservation, run, source));
         assert_eq!(plan.strong_owner_count(), 1);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         let ready = Arc::new(Barrier::new(5));
         let release = Arc::new(Barrier::new(5));
         std::thread::scope(|scope| {
@@ -66,7 +66,7 @@ fn original_plan_concurrent_final_aliases_keep_records_and_one_original_hold() {
                 .collect::<Vec<_>>();
             drop(plan);
             ready.wait();
-            let observed_held = pool.used_bytes();
+            let observed_held = pool.payload_used_bytes();
             release.wait();
             for worker in workers {
                 let (same, before, after, expected) = worker.join().unwrap();
@@ -78,14 +78,14 @@ fn original_plan_concurrent_final_aliases_keep_records_and_one_original_hold() {
             }
             assert_eq!(observed_held.unwrap(), held);
         });
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn original_plan_alias_survives_promoted_owner_unwind_with_exact_records_and_charge() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let source = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let source = pool.register_host_storage([(1u32, 64)]).unwrap();
     let (reservation, run, quote) = accepted(&pool);
     let held = quote.span_workspace().retention_peak_bytes().unwrap();
     let plan = quote.span_workspace().plan().clone();
@@ -110,24 +110,25 @@ fn original_plan_alias_survives_promoted_owner_unwind_with_exact_records_and_cha
     assert_eq!(account(&pool, &reservation).2, 1);
     drop((reservation, run, source));
     assert_eq!(plan.strong_owner_count(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     assert_eq!(plan.geometry(), geometry);
     assert_eq!(plan.records().as_ptr(), pointer);
     assert_records(&plan, &expected);
     drop(plan);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_plan_late_source_failure_keeps_readable_records_and_original_hold() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
-    let source_quote = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let source_quote =
+        replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let (source_reservation, _) = sealed_plan(&pool, &source_quote, 1_000_000).unwrap();
     let (source_reservation, source_run) = source_reservation.into_funding().unwrap();
     let source_scope = source_run.scope().unwrap();
     let registered = source_scope
-        .adopt_storage_individually([(30u32, 24)])
+        .adopt_host_storage_individually([(30u32, 24)])
         .unwrap()
         .into_values()
         .next()
@@ -162,12 +163,12 @@ fn original_plan_late_source_failure_keeps_readable_records_and_original_hold() 
     assert_records(quote.span_workspace().plan(), &expected);
     drop((quote, reservation, run));
     assert_eq!(plan.strong_owner_count(), 1);
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert!(before >= held);
     assert_eq!(plan.records().as_ptr(), pointer);
     assert_records(&plan, &expected);
     drop(plan);
-    assert_eq!(pool.used_bytes().unwrap(), before - held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before - held);
     drop((
         registered,
         source_reservation,
@@ -176,7 +177,7 @@ fn original_plan_late_source_failure_keeps_readable_records_and_original_hold() 
         root,
     ));
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "original source quarantine survives"
     );
 }

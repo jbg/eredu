@@ -2,9 +2,13 @@
 //! Immediate completion means only that descriptors were recorded. The selected
 //! native source must independently provide every transfer and control bound.
 use crate::*;
-use eredu_core::{checkpoint::TensorDtype, BackendFailure, Submission};
-use eredu_nn::{workspace::*, DistributedNeuralBackend, Error, Tensor};
+use eredu_core::{BackendFailure, Submission, checkpoint::TensorDtype};
+use eredu_nn::{DistributedNeuralBackend, Error, Tensor, workspace::*};
 use std::mem::size_of;
+
+#[cfg(test)]
+#[path = "communication_completion_tests.rs"]
+mod completion_tests;
 
 /// One actual retained group declaration, lent to the metadata traversal.
 #[derive(Debug, Clone)]
@@ -156,6 +160,9 @@ fn completed<T>(
         completion: super::WorkspaceCompletion::recorded(context)?,
     })
 }
+fn enclosing_submission(context: &WorkspaceContext) -> bool {
+    context.completion_strategy() == WorkspaceCompletionStrategy::EnclosingSubmission
+}
 #[derive(Debug, thiserror::Error)]
 enum SourceCause {
     #[error("cold boundary control context differs from its retained world")]
@@ -177,61 +184,134 @@ impl TerminalCommunicationBackend for WorkspaceBackend {
     }
 }
 impl CommunicationBackend for WorkspaceBackend {
+    fn record_model_control_phase(
+        group_id: eredu_core::CollectiveGroupId,
+        group: &WorkspaceCommunicationGroup,
+        phase: DistributedExecutionPhase,
+        executor: &WorkspaceContext,
+    ) -> Result<(), Error> {
+        let selected = group.select(CommunicationOperation::FailureAgreement, executor)?;
+        if selected.id() != group_id {
+            return Err(WorkspaceMetadataError::Unqualified.into());
+        }
+        if let DistributedExecutionPhase::BoundarySourceCompletion(route)
+        | DistributedExecutionPhase::BoundarySourceReady(route) = phase
+        {
+            if !group
+                .source
+                .manifest()
+                .routes()
+                .iter()
+                .any(|row| row.id() == route)
+            {
+                return Err(WorkspaceMetadataError::Unqualified.into());
+            }
+        }
+        let phase = match phase {
+            DistributedExecutionPhase::Execution => WorkspaceModelControlPhase::Execution,
+            DistributedExecutionPhase::BoundarySourceCompletion(route) => {
+                WorkspaceModelControlPhase::BoundarySourceCompletion {
+                    route: route.value(),
+                }
+            }
+            DistributedExecutionPhase::BoundarySourceReady(route) => {
+                WorkspaceModelControlPhase::BoundarySourceReady {
+                    route: route.value(),
+                }
+            }
+            _ => return Err(WorkspaceMetadataError::Unqualified.into()),
+        };
+        executor.record_model_control(WorkspaceModelControl {
+            group: selected.id(),
+            phase,
+        })
+    }
+
     type CommunicationGroup = WorkspaceCommunicationGroup;
     type CommunicationRoute = WorkspaceCommunicationRoute;
     type CommunicationCompletion = super::WorkspaceCompletion;
     type CommunicationError = Error;
 
-    fn with_expert_inactive_wave<E,F>(source:Option<eredu_nn::workspace::WorkspaceExpertInactiveWave>,
-        _context:Option<&WorkspaceParallelContext>,executor:&WorkspaceContext,_run:F)
-        ->Result<Result<(),E>,Error>
-    where F:FnOnce()->Result<(),E>{
-        eredu_nn::workspace::record_expert_inactive_wave(source.ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)?,executor)?;Ok(Ok(()))
+    fn with_expert_inactive_wave<E, F>(
+        source: Option<eredu_nn::workspace::WorkspaceExpertInactiveWave>,
+        _context: Option<&WorkspaceParallelContext>,
+        executor: &WorkspaceContext,
+        _run: F,
+    ) -> Result<Result<(), E>, Error>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        eredu_nn::workspace::record_expert_inactive_wave(
+            source.ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)?,
+            executor,
+        )?;
+        Ok(Ok(()))
     }
-    fn with_expert_provider_wave<E,F>(source:eredu_nn::workspace::WorkspaceExpertProviderWave,
-        _context:Option<&WorkspaceParallelContext>,executor:&WorkspaceContext,_run:F)
-        ->Result<Result<(),E>,Error>
-    where F:FnOnce()->Result<(),E>{
-        eredu_nn::workspace::record_expert_provider_wave(source,executor)?;Ok(Ok(()))
+    fn with_expert_provider_wave<E, F>(
+        source: eredu_nn::workspace::WorkspaceExpertProviderWave,
+        _context: Option<&WorkspaceParallelContext>,
+        executor: &WorkspaceContext,
+        _run: F,
+    ) -> Result<Result<(), E>, Error>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        eredu_nn::workspace::record_expert_provider_wave(source, executor)?;
+        Ok(Ok(()))
     }
 
     fn with_expert_route_region<P, E, F>(
         source: eredu_nn::workspace::WorkspaceExpertRegionView<'_>,
-        bank: &mut P, input: &WorkspaceTensor,
+        bank: &mut P,
+        input: &WorkspaceTensor,
         routes: &eredu_nn::GroupSelection<WorkspaceTensor>,
-        _context: Option<&WorkspaceParallelContext>, executor: &WorkspaceContext, _run: F,
+        _context: Option<&WorkspaceParallelContext>,
+        executor: &WorkspaceContext,
+        _run: F,
     ) -> Result<Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>, Error>
-    where P: eredu_nn::Parameterized<WorkspaceTensor>,
-        F: FnOnce(&mut P, Option<crate::PreparedExpertMovementLoan<'_>>) -> Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>,
+    where
+        P: eredu_nn::Parameterized<WorkspaceTensor>,
+        F: FnOnce(
+            &mut P,
+            Option<crate::PreparedExpertMovementLoan<'_>>,
+        ) -> Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>,
     {
-        let output = eredu_nn::workspace::record_expert_region(source, bank, input, routes, executor)?;
+        let output =
+            eredu_nn::workspace::record_expert_region(source, bank, input, routes, executor)?;
         Ok(Ok(if source.tensor_partitions.is_some() {
             crate::RoutedExpertTensorParallelOutput::Partial(output)
         } else {
             let (value, bias) = output.into_parts();
-            if bias.is_some() { return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into()); }
+            if bias.is_some() {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
             crate::RoutedExpertTensorParallelOutput::Complete(value)
         }))
     }
 
-
     fn with_observed_expert_route_region<'observer, P, E, F>(
         source: eredu_nn::workspace::WorkspaceExpertRegionView<'_>,
-        bank: &mut P, input: &WorkspaceTensor,
+        bank: &mut P,
+        input: &WorkspaceTensor,
         routes: &eredu_nn::GroupSelection<WorkspaceTensor>,
-        _context: Option<&WorkspaceParallelContext>, executor: &WorkspaceContext,
+        _context: Option<&WorkspaceParallelContext>,
+        executor: &WorkspaceContext,
         mut observer: Option<&'observer mut dyn crate::RoutedUnitObserver<WorkspaceTensor>>,
         run: F,
     ) -> Result<Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>, Error>
-    where P: eredu_nn::Parameterized<WorkspaceTensor>,
-        F: FnOnce(&mut P, Option<crate::PreparedExpertMovementLoan<'_>>,
-            Option<&'observer mut dyn crate::RoutedUnitObserver<WorkspaceTensor>>)
-            -> Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>,
+    where
+        P: eredu_nn::Parameterized<WorkspaceTensor>,
+        F: FnOnce(
+            &mut P,
+            Option<crate::PreparedExpertMovementLoan<'_>>,
+            Option<&'observer mut dyn crate::RoutedUnitObserver<WorkspaceTensor>>,
+        ) -> Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>,
     {
         let interested = observer.is_some();
         let mut observe = |source: eredu_nn::workspace::WorkspaceExpertObservationView<'_>| {
-            observer.as_deref_mut().ok_or_else(||
-                executor.metadata_source(eredu_nn::GroupedUnitError::Unavailable))?
+            observer
+                .as_deref_mut()
+                .ok_or_else(|| executor.metadata_source(eredu_nn::GroupedUnitError::Unavailable))?
                 .observe_region_source(source)
         };
         // The shared constructor gives the exact native forwarding closure
@@ -239,21 +319,37 @@ impl CommunicationBackend for WorkspaceBackend {
         // The actual observer loan is used solely by the cold source callback.
         let argument_bytes = size_of_val(&run);
         let native_body = crate::backend::observed_expert_region_body(run, None);
-        executor.charge_metadata(argument_bytes
-            .checked_add(size_of_val(&observe))
-            .and_then(|n|n.checked_add(size_of_val(&native_body)))
-            .and_then(|n|n.checked_add(size_of::<(
-                bool, Result<eredu_nn::workspace::WorkspaceExpertObservationSource, Error>,
-                Result<Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>, Error>,
-            )>())).ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
+        executor.charge_metadata(
+            argument_bytes
+                .checked_add(size_of_val(&observe))
+                .and_then(|n| n.checked_add(size_of_val(&native_body)))
+                .and_then(|n| {
+                    n.checked_add(size_of::<(
+                        bool,
+                        Result<eredu_nn::workspace::WorkspaceExpertObservationSource, Error>,
+                        Result<
+                            Result<crate::RoutedExpertTensorParallelOutput<WorkspaceTensor>, E>,
+                            Error,
+                        >,
+                    )>())
+                })
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
+        )?;
         let output = eredu_nn::workspace::record_expert_region_with_observation(
-            source, bank, input, routes, executor, interested.then_some(&mut observe),
+            source,
+            bank,
+            input,
+            routes,
+            executor,
+            interested.then_some(&mut observe),
         )?;
         Ok(Ok(if source.tensor_partitions.is_some() {
             crate::RoutedExpertTensorParallelOutput::Partial(output)
         } else {
             let (value, bias) = output.into_parts();
-            if bias.is_some() { return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into()); }
+            if bias.is_some() {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
             crate::RoutedExpertTensorParallelOutput::Complete(value)
         }))
     }
@@ -295,6 +391,9 @@ impl CommunicationBackend for WorkspaceBackend {
         context: &WorkspaceParallelContext,
         route: &WorkspaceCommunicationRoute,
     ) -> Result<Option<PreparedBoundarySource>, BackendFailure> {
+        if !enclosing_submission(&route.context) {
+            return Ok(None);
+        }
         let funding = route
             .context
             .metadata_funding()
@@ -344,8 +443,14 @@ impl CommunicationBackend for WorkspaceBackend {
         }
         completed((), executor).map(Some)
     }
-    fn complete_model_dependencies(values:&[&WorkspaceTensor],_context:&WorkspaceParallelContext,
-        executor:&WorkspaceContext)->Result<Option<()>,Error>{
+    fn complete_model_dependencies(
+        values: &[&WorkspaceTensor],
+        _context: &WorkspaceParallelContext,
+        executor: &WorkspaceContext,
+    ) -> Result<Option<()>, Error> {
+        if !enclosing_submission(executor) {
+            return Ok(None);
+        }
         executor.complete_values(values)?;
         Ok(Some(()))
     }
@@ -356,7 +461,25 @@ impl CommunicationBackend for WorkspaceBackend {
     where
         I: IntoIterator<Item = &'a WorkspaceTensor>,
     {
-        executor.validate_values(values)?;
+        // A model-scope dependency needs the source-bearing prepared hook.
+        // The direct worker owns a separate submission; an enclosing-scope
+        // selection does not supply its native constructor/completion facts.
+        if enclosing_submission(executor) {
+            return Err(WorkspaceMetadataError::Unqualified.into());
+        }
+        executor.charge_metadata(size_of::<(
+            I,
+            I::IntoIter,
+            Vec<&'a WorkspaceTensor>,
+            &WorkspaceContext,
+            Result<(), Error>,
+        )>())?;
+        let mut roots = executor.metadata_vec(0)?;
+        for value in values {
+            executor.reserve_metadata_vec(&mut roots, 1)?;
+            roots.push(value);
+        }
+        executor.complete_communication_dependencies(&roots)?;
         completed((), executor)
     }
 }
@@ -376,41 +499,93 @@ struct WaveFailure<E: std::error::Error + 'static> {
     funding: HostMetadataFunding,
 }
 impl SumReductionBackend for WorkspaceBackend {
-    fn complete_model_sum_wave<E,V>(values:&[WorkspaceTensor],group:&WorkspaceCommunicationGroup,
-        _context:&WorkspaceParallelContext,executor:&WorkspaceContext,mut validate:V)
-        ->Result<Option<Vec<WorkspaceTensor>>,BackendFailure>
-    where E: std::error::Error + Send + Sync + 'static,
-          V:FnMut(&[WorkspaceTensor],&HostMetadataFunding,bool)->Result<(),E> {
-        let funding=executor.metadata_funding().ok_or_else(||HostMetadataFundingError::Unavailable.into_backend_failure())?;
-        let frames=std::mem::size_of::<(
-            &[WorkspaceTensor], &WorkspaceCommunicationGroup, &WorkspaceParallelContext,
-            &WorkspaceContext, Vec<WorkspaceTensor>, Vec<&WorkspaceTensor>, V,
-            std::slice::Iter<'_, WorkspaceTensor>, Result<Vec<WorkspaceTensor>, WaveCause<E>>,
-            Result<(),E>, HostMetadataFunding, Option<HostMetadataFunding>, WaveFailure<E>, WaveCause<E>,
-        )>().checked_add(BackendFailure::source_retention_peak_bytes::<WaveFailure<E>>()
-            .ok_or_else(||HostMetadataFundingError::Overflow.into_backend_failure())?)
-            .ok_or_else(||HostMetadataFundingError::Overflow.into_backend_failure())?;
-        funding.reserve_metadata(frames).map_err(HostMetadataFundingError::into_backend_failure)?;
-        let run=(|| ->Result<Vec<WorkspaceTensor>,WaveCause<E>> {
+    fn complete_model_sum_wave<E, V>(
+        values: &[WorkspaceTensor],
+        group: &WorkspaceCommunicationGroup,
+        _context: &WorkspaceParallelContext,
+        executor: &WorkspaceContext,
+        mut validate: V,
+    ) -> Result<Option<Vec<WorkspaceTensor>>, BackendFailure>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+        V: FnMut(&[WorkspaceTensor], &HostMetadataFunding, bool) -> Result<(), E>,
+    {
+        if !enclosing_submission(executor) {
+            return Ok(None);
+        }
+        let funding = executor
+            .metadata_funding()
+            .ok_or_else(|| HostMetadataFundingError::Unavailable.into_backend_failure())?;
+        let frames = std::mem::size_of::<(
+            &[WorkspaceTensor],
+            &WorkspaceCommunicationGroup,
+            &WorkspaceParallelContext,
+            &WorkspaceContext,
+            Vec<WorkspaceTensor>,
+            Vec<&WorkspaceTensor>,
+            V,
+            std::slice::Iter<'_, WorkspaceTensor>,
+            Result<Vec<WorkspaceTensor>, WaveCause<E>>,
+            Result<(), E>,
+            HostMetadataFunding,
+            Option<HostMetadataFunding>,
+            WaveFailure<E>,
+            WaveCause<E>,
+        )>()
+        .checked_add(
+            BackendFailure::source_retention_peak_bytes::<WaveFailure<E>>()
+                .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?,
+        )
+        .ok_or_else(|| HostMetadataFundingError::Overflow.into_backend_failure())?;
+        funding
+            .reserve_metadata(frames)
+            .map_err(HostMetadataFundingError::into_backend_failure)?;
+        let run = (|| -> Result<Vec<WorkspaceTensor>, WaveCause<E>> {
             // Validate source identity even for an empty wave.
-            group.select(CommunicationOperation::AllReduceSum,executor).map_err(WaveCause::Operation)?;
-            validate(values,&funding,false).map_err(WaveCause::Validation)?;
-            let mut outputs=executor.metadata_vec(values.len()).map_err(WaveCause::Operation)?;
-            for value in values { outputs.push(Self::all_reduce_sum(value.clone(),group,executor).map_err(WaveCause::Operation)?.output); }
-            let mut roots=executor.metadata_vec(outputs.len()).map_err(WaveCause::Operation)?;
+            group
+                .select(CommunicationOperation::AllReduceSum, executor)
+                .map_err(WaveCause::Operation)?;
+            validate(values, &funding, false).map_err(WaveCause::Validation)?;
+            let mut outputs = executor
+                .metadata_vec(values.len())
+                .map_err(WaveCause::Operation)?;
+            for value in values {
+                outputs.push(
+                    Self::all_reduce_sum(value.clone(), group, executor)
+                        .map_err(WaveCause::Operation)?
+                        .output,
+                );
+            }
+            let mut roots = executor
+                .metadata_vec(outputs.len())
+                .map_err(WaveCause::Operation)?;
             roots.extend(outputs.iter());
-            if !roots.is_empty() { executor.complete_values(&roots).map_err(WaveCause::Operation)?; }
-            validate(&outputs,&funding,true).map_err(WaveCause::Validation)?;
+            if !roots.is_empty() {
+                executor
+                    .complete_values(&roots)
+                    .map_err(WaveCause::Operation)?;
+            }
+            validate(&outputs, &funding, true).map_err(WaveCause::Validation)?;
             Ok(outputs)
         })();
-        run.map(Some).map_err(|cause|BackendFailure::from_error(WaveFailure {
-            cause,source:group.source.clone(),funding:funding.clone(),
-        }))
+        run.map(Some).map_err(|cause| {
+            BackendFailure::from_error(WaveFailure {
+                cause,
+                source: group.source.clone(),
+                funding: funding.clone(),
+            })
+        })
     }
-    fn complete_model_sum(value:&WorkspaceTensor, group:&WorkspaceCommunicationGroup,
-        _context:&WorkspaceParallelContext, executor:&WorkspaceContext)
-        ->Result<Option<WorkspaceTensor>,Error>{
-        let submission=Self::all_reduce_sum(value.clone(),group,executor)?;
+    fn complete_model_sum(
+        value: &WorkspaceTensor,
+        group: &WorkspaceCommunicationGroup,
+        _context: &WorkspaceParallelContext,
+        executor: &WorkspaceContext,
+    ) -> Result<Option<WorkspaceTensor>, Error> {
+        if !enclosing_submission(executor) {
+            return Ok(None);
+        }
+        let submission = Self::all_reduce_sum(value.clone(), group, executor)?;
         executor.complete_values(&[&submission.output])?;
         Ok(Some(submission.output))
     }
@@ -434,26 +609,39 @@ impl SumReductionBackend for WorkspaceBackend {
 // inventing counts or recording a second transport graph.
 impl EvenGatherBackend for WorkspaceBackend {
     fn all_gather_even(
-        _value:WorkspaceTensor, _axis:usize, _group:&WorkspaceCommunicationGroup,
-        _executor:&WorkspaceContext,
-    )->Result<Submission<WorkspaceTensor,Self::CommunicationCompletion>,Error> {
+        _value: WorkspaceTensor,
+        _axis: usize,
+        _group: &WorkspaceCommunicationGroup,
+        _executor: &WorkspaceContext,
+    ) -> Result<Submission<WorkspaceTensor, Self::CommunicationCompletion>, Error> {
         Err(WorkspaceMetadataError::Unqualified.into())
     }
 }
 impl VariableAllToAllBackend for WorkspaceBackend {
     fn variable_all_to_all(
-        _value:WorkspaceTensor, _counts:&CommunicationPeerCounts, _axis:usize,
-        _group:&WorkspaceCommunicationGroup, _executor:&WorkspaceContext,
-    )->Result<Submission<WorkspaceTensor,Self::CommunicationCompletion>,Error> {
+        _value: WorkspaceTensor,
+        _counts: &CommunicationPeerCounts,
+        _axis: usize,
+        _group: &WorkspaceCommunicationGroup,
+        _executor: &WorkspaceContext,
+    ) -> Result<Submission<WorkspaceTensor, Self::CommunicationCompletion>, Error> {
         Err(WorkspaceMetadataError::Unqualified.into())
     }
 }
 
 impl UnevenGatherBackend for WorkspaceBackend {
-    fn complete_model_gather(value:&WorkspaceTensor,counts:&[usize],axis:usize,
-        group:&WorkspaceCommunicationGroup,_context:&WorkspaceParallelContext,executor:&WorkspaceContext)
-        ->Result<Option<WorkspaceTensor>,Error>{
-        let submission=Self::all_gather_uneven(value.clone(),counts,axis,group,executor)?;
+    fn complete_model_gather(
+        value: &WorkspaceTensor,
+        counts: &[usize],
+        axis: usize,
+        group: &WorkspaceCommunicationGroup,
+        _context: &WorkspaceParallelContext,
+        executor: &WorkspaceContext,
+    ) -> Result<Option<WorkspaceTensor>, Error> {
+        if !enclosing_submission(executor) {
+            return Ok(None);
+        }
+        let submission = Self::all_gather_uneven(value.clone(), counts, axis, group, executor)?;
         executor.complete_values(&[&submission.output])?;
         Ok(Some(submission.output))
     }
@@ -573,13 +761,16 @@ fn record_frames(
         usize,
         usize,
     )>())?;
-    if route.descriptor().destination()==route.source.manifest().rank() {
-        // The ordinary paired transport sends a real receiver placeholder.
-        // Its native worker settles those inputs once before frame encoding;
-        // record the same model-root boundary before the child transfer roles.
-        let mut roots=context.metadata_vec(values.len())?;
-        roots.extend(values.iter().map(|value|value.tensor()));
-        if !roots.is_empty(){context.complete_values(&roots)?;}
+    if enclosing_submission(context)
+        && route.descriptor().destination() == route.source.manifest().rank()
+    {
+        // The enclosing-scope worker settles receiver roots before frame
+        // encoding. Ordinary transfer owns them through its final submission.
+        let mut roots = context.metadata_vec(values.len())?;
+        roots.extend(values.iter().map(|value| value.tensor()));
+        if !roots.is_empty() {
+            context.complete_values(&roots)?;
+        }
     }
     let mut outputs = context.metadata_vec(values.len())?;
     for (ordinal, framed) in values.into_iter().enumerate() {

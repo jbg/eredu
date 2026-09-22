@@ -7,6 +7,7 @@ struct NativeUnitObserver<'a> {
     failure: Option<ComputeError>,
     shape_error: Option<PreparedGroupedUnitError>,
     original: bool,
+    ordinary: Option<eredu_core::HostPreparationAuthority>,
 }
 
 impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
@@ -30,16 +31,31 @@ impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
                     Some(prepared) => prepared
                         .shape(batch.values.shape(), effective.shape())
                         .map_err(observation_transport::native)?,
-                    None => ComputeError::backend_retained_source(GroupedUnitError::ReplacementShape {
-                        expected: batch.values.shape().to_vec(),
-                        actual: effective.shape().to_vec(),
-                    }),
+                    None if self.ordinary.is_some() => {
+                        ComputeError::backend_retained_source(OrdinaryGroupedShapeFailure {
+                            expected: OrdinaryShape::new(batch.values.shape()),
+                            actual: OrdinaryShape::new(effective.shape()),
+                            _host: self
+                                .ordinary
+                                .as_ref()
+                                .expect("checked ordinary custody")
+                                .clone(),
+                        })
+                    }
+                    None => {
+                        ComputeError::backend_retained_source(GroupedUnitError::ReplacementShape {
+                            expected: batch.values.shape().to_vec(),
+                            actual: effective.shape().to_vec(),
+                        })
+                    }
                 });
             }
             if effective.as_array().dtype() != batch.values.as_array().dtype() {
                 return Err(match self.shape_error.take() {
                     Some(prepared) => prepared.dtype(),
-                    None => ComputeError::backend_retained_source(GroupedUnitError::ReplacementDtype),
+                    None => {
+                        ComputeError::backend_retained_source(GroupedUnitError::ReplacementDtype)
+                    }
                 });
             }
             self.inner
@@ -55,6 +71,15 @@ impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
             let (error, native) = if self.original {
                 let error = observation_transport::callback(error);
                 let native = observation_transport::signal(&error);
+                (error, native)
+            } else if let Some(host) = &self.ordinary {
+                let native = Exception::from_retained_source(OrdinaryGroupedSignal {
+                    _host: host.clone(),
+                });
+                let error = ComputeError::backend_retained_source(OrdinaryGroupedFailure {
+                    cause: error,
+                    _host: host.clone(),
+                });
                 (error, native)
             } else {
                 let native = Exception::custom(error.to_string());
@@ -76,8 +101,16 @@ fn with_observer<R>(
         Some(inner) => {
             let shape_error =
                 PreparedGroupedUnitError::take_current().map_err(observation_transport::native)?;
+            let ordinary = if shape_error.is_none() {
+                crate::backend::nn::shared::current_ordinary_execution_owner()
+                    .map_err(ComputeError::backend_retained_source)?
+                    .map(|owner| owner.host().clone())
+            } else {
+                None
+            };
             Some(NativeUnitObserver {
                 inner,
+                ordinary,
                 failure: None,
                 original: shape_error.is_some(),
                 shape_error,
@@ -115,7 +148,9 @@ impl MlxGroupedGatedProduct {
             size_of::<(&MlxTensor, &GroupSelection<MlxTensor>, usize, &Stream)>(),
             size_of::<(&[i32], &Stream)>(),
         ];
-        controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
+        controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
     }
     pub(crate) fn original_unit_observation_control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};
@@ -252,8 +287,12 @@ impl MlxGroupedRelu2 {
                 observer,
             )
         })?;
-        reshape_partial(output, input.shape(), context,
-            &super::super::selected_linear::original::Transport::new(false))
+        reshape_partial(
+            output,
+            input.shape(),
+            context,
+            &super::super::selected_linear::original::Transport::new(false),
+        )
     }
 }
 
@@ -270,4 +309,128 @@ fn reshape_partial(
             .map(|bias| transport.tensor(bias.reshape(shape, context)))
             .transpose()?,
     ))
+}
+
+/// A malformed replacement can carry an arbitrary rank. The funded error keeps
+/// complete small shapes and a fixed prefix plus full rank for larger ones.
+#[derive(Debug)]
+struct OrdinaryShape {
+    axes: [i32; 4],
+    rank: usize,
+}
+impl OrdinaryShape {
+    fn new(shape: &[i32]) -> Self {
+        let mut axes = [0; 4];
+        let count = shape.len().min(axes.len());
+        axes[..count].copy_from_slice(&shape[..count]);
+        Self {
+            axes,
+            rank: shape.len(),
+        }
+    }
+}
+impl std::fmt::Display for OrdinaryShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.axes[..self.rank.min(4)], f)?;
+        if self.rank > 4 {
+            write!(f, " (first 4 axes of rank {})", self.rank)?;
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("grouped unit replacement shape differs: expected {expected}, actual {actual}")]
+struct OrdinaryGroupedShapeFailure {
+    expected: OrdinaryShape,
+    actual: OrdinaryShape,
+    _host: eredu_core::HostPreparationAuthority,
+}
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+struct OrdinaryGroupedFailure {
+    #[source]
+    cause: ComputeError,
+    _host: eredu_core::HostPreparationAuthority,
+}
+#[derive(Debug, thiserror::Error)]
+#[error("grouped unit observer failed; the enclosing adapter retains its cause")]
+struct OrdinaryGroupedSignal {
+    _host: eredu_core::HostPreparationAuthority,
+}
+
+impl MlxGroupedGatedProduct {
+    /// Fixed controls of the actual ordinary callback adapter. Callback-owned
+    /// observation/replacement payloads are separate producers. The bounded
+    /// replacement-shape error never formats or copies an arbitrary-rank Vec.
+    pub(crate) fn ordinary_unit_observation_control_bytes(rank: usize) -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        if rank > 4 {
+            return None;
+        }
+        let controls = [
+            Self::ordinary_tensor_parallel_control_bytes()?,
+            Array::ordinary_clone_control_bytes()?,
+            ComputeError::retained_source_construction_bytes::<OrdinaryGroupedShapeFailure>()?,
+            ComputeError::retained_source_construction_bytes::<GroupedUnitError>()?,
+            ComputeError::retained_source_construction_bytes::<OrdinaryGroupedFailure>()?,
+            Exception::retained_source_control_bytes::<OrdinaryGroupedSignal>()?,
+            size_of::<NativeUnitObserver<'_>>(),
+            size_of::<Option<NativeUnitObserver<'_>>>(),
+            size_of::<GroupedUnitBatch<'_, MlxTensor>>().checked_mul(2)?,
+            size_of::<GroupedUnitBatch<'_, Array>>(),
+            size_of::<Option<MlxTensor>>(),
+            size_of::<Result<Option<MlxTensor>, ComputeError>>(),
+            size_of::<Result<Array, ComputeError>>(),
+            size_of::<Result<Array, Exception>>(),
+            size_of::<Option<ComputeError>>(),
+            size_of::<Option<&Array>>(),
+            size_of::<&mut dyn GroupedUnitObserver<MlxTensor>>(),
+            size_of::<Option<&mut dyn common::grouped::NativeGroupedUnitObserver>>(),
+            size_of::<Option<crate::backend::nn::shared::OrdinaryExecutionOwner>>(),
+            size_of::<OrdinaryShape>().checked_mul(2)?,
+        ];
+        controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
+    }
+    /// Ordinary TP/result transports of the existing selected-linear wrapper.
+    /// Its Original observer lookup returns None; no Original guard is created.
+    pub(crate) fn ordinary_tensor_parallel_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let controls = [
+            ComputeError::retained_source_construction_bytes::<Exception>()?,
+            size_of::<super::super::selected_linear::original::Transport>(),
+            size_of::<Result<Option<safemlx::OriginalScopeObserver>, Exception>>(),
+            size_of::<Option<Exception>>(),
+            // The try_current C out-record is one opaque pointer; no observer
+            // owner is constructed on the authenticated ordinary branch.
+            size_of::<*const ()>(),
+            size_of::<[Array; 4]>(),
+            size_of::<TensorParallelGroupedOutput<Array>>(),
+            size_of::<TensorParallelGroupedOutput<MlxTensor>>(),
+            size_of::<Result<TensorParallelGroupedOutput<Array>, Exception>>(),
+            size_of::<Result<TensorParallelGroupedOutput<Array>, ComputeError>>(),
+            size_of::<Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError>>(),
+            size_of::<(Array, Option<Array>)>(),
+            size_of::<Result<Option<MlxTensor>, ComputeError>>(),
+            size_of::<Option<&mut dyn common::grouped::NativeGroupedUnitObserver>>(),
+            size_of::<(&MlxTensor, &GroupSelection<MlxTensor>, usize, &Stream)>(),
+            size_of::<(&[i32], &Stream)>(),
+        ];
+        controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
+    }
+}
+
+#[cfg(test)]
+impl MlxGroupedGatedProduct {
+    pub(crate) fn test_ordinary_unit_observer(
+        observer: &mut dyn GroupedUnitObserver<MlxTensor>,
+        batch: &GroupedUnitBatch<'_, Array>,
+    ) -> Result<Array, ComputeError> {
+        with_observer(Some(observer), |adapter| {
+            adapter.expect("supplied observer").apply(batch)
+        })
+    }
 }

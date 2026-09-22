@@ -10,10 +10,19 @@ use eredu_core::{SharedTensorObservation, capture::*, checkpoint::TensorDtype};
 use std::{fmt, marker::PhantomData, mem::size_of};
 
 pub(in crate::working_memory) mod interventions;
-pub use interventions::{CaptureInterventionClaim, ClaimedIntervention, RoutedInterventionCursor, RoutedInterventionBatch, InterventionPrefillCursor, InterventionPrefillFragment};
+pub use interventions::{
+    CaptureInterventionClaim, ClaimedIntervention, InterventionPrefillCursor,
+    InterventionPrefillFragment, RoutedInterventionBatch, RoutedInterventionCursor,
+};
+mod autoregressive;
 pub(in crate::working_memory) mod embedded;
+pub use autoregressive::{
+    AutoregressiveCaptureFrameHostPlan, AutoregressiveCaptureHostPlan,
+    FundedAutoregressiveCaptureBank, PreparedAutoregressiveCapture,
+};
 pub use embedded::{
-    EmbeddedCaptureHostPlan, EmbeddedCapturePreparationError, PreparedEmbeddedCapture,
+    EmbeddedCaptureHostPlan, EmbeddedCapturePreparationError, ModelCapturePreparationCause,
+    ModelCapturePreparationError, PreparedEmbeddedCapture,
 };
 mod speculative;
 pub(in crate::working_memory) use speculative::SpeculativeCaptureBinding;
@@ -30,8 +39,8 @@ pub(in crate::working_memory) use plan::prefill_target_bytes;
 mod candidates;
 pub use candidates::*;
 mod routed;
-pub use routed::*;
 pub(in crate::working_memory) use routed::RoutedInvocationTarget;
+pub use routed::*;
 mod histogram;
 pub use histogram::*;
 mod summary;
@@ -99,7 +108,7 @@ pub struct PreparedCaptureRun {
     source: SharedCapturePlan,
     interventions: Option<super::OriginalInterventionSource>,
     intervention_selected: Option<Box<[bool]>>,
-    intervention_evidence_skips: Option<Box<[[Option<CaptureSkipReason>;2]]>>,
+    intervention_evidence_skips: Option<Box<[[Option<CaptureSkipReason>; 2]]>>,
     claims: Box<[ClaimState]>,
     invocation: Option<OwnedInvocation>,
     continuation: bool,
@@ -157,13 +166,19 @@ fn construct(
     if retained.is_some() && interventions.is_some() {
         return Err(WorkingMemoryError::IdentityMismatch.into());
     }
-    construct_selected(plan, retained.as_ref().or(interventions), None, None, custody)
+    construct_selected(
+        plan,
+        retained.as_ref().or(interventions),
+        None,
+        None,
+        custody,
+    )
 }
 fn construct_selected(
     plan: CaptureRunHostPlan<'_>,
     interventions: Option<&super::OriginalInterventionSource>,
     intervention_selected: Option<&[bool]>,
-    intervention_evidence_skips: Option<&[[Option<CaptureSkipReason>;2]]>,
+    intervention_evidence_skips: Option<&[[Option<CaptureSkipReason>; 2]]>,
     custody: CaptureTensorCustody,
 ) -> Result<PreparedCaptureRun, CaptureRunHostError> {
     custody.validate()?;
@@ -259,9 +274,11 @@ fn construct_selected(
         debug_assert_eq!(selected.capacity(), mask.len());
         selected.into_boxed_slice()
     });
-    let intervention_evidence_skips=intervention_evidence_skips.map(|rows| {
-        let mut copied=Vec::with_capacity(rows.len());copied.extend_from_slice(rows);
-        debug_assert_eq!(copied.capacity(),rows.len());copied.into_boxed_slice()
+    let intervention_evidence_skips = intervention_evidence_skips.map(|rows| {
+        let mut copied = Vec::with_capacity(rows.len());
+        copied.extend_from_slice(rows);
+        debug_assert_eq!(copied.capacity(), rows.len());
+        copied.into_boxed_slice()
     });
     custody.validate()?;
     Ok(PreparedCaptureRun {
@@ -366,8 +383,11 @@ impl PreparedCaptureRun {
             _ => false,
         }
     }
-    pub(crate) fn matches_intervention_evidence_skips(&self,expected:Option<&[[Option<CaptureSkipReason>;2]]>)->bool {
-        self.intervention_evidence_skips.as_deref()==expected
+    pub(crate) fn matches_intervention_evidence_skips(
+        &self,
+        expected: Option<&[[Option<CaptureSkipReason>; 2]]>,
+    ) -> bool {
+        self.intervention_evidence_skips.as_deref() == expected
     }
     /// Exact shared source, without another admission or owning DTO copy.
     pub fn source(&self) -> &SharedCapturePlan {
@@ -452,8 +472,8 @@ impl PreparedCaptureRun {
         Ok(CaptureStepClaim {
             source: &self.source,
             interventions: self.interventions.as_ref(),
-            routed_interventions:Vec::new(),
-            prefill_interventions:Vec::new(),
+            routed_interventions: Vec::new(),
+            prefill_interventions: Vec::new(),
             intervention_selected: self.intervention_selected.as_deref(),
             intervention_evidence_skips: self.intervention_evidence_skips.as_deref(),
             row: claims::CaptureClaimRow::Run(row),

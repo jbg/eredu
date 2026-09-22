@@ -1,10 +1,10 @@
 //! Dynamic expert-row receipts under the ordinary partition delivery protocol.
+use super::receipt::RoutedOwnership;
 use super::*;
 use eredu_core::{
-    component::ComponentCoordinateMap, ObservationPoint, ObservationValueType, TensorObservation,
-    TensorObservationData,
+    ObservationPoint, ObservationValueType, TensorObservation, TensorObservationData,
+    component::ComponentCoordinateMap,
 };
-use super::receipt::RoutedOwnership;
 use std::collections::BTreeMap;
 
 /// One expected sparse producer. The unit projection is rectangular; expert
@@ -94,11 +94,7 @@ pub(in crate::capture::partition) fn maps_overlap(
             .is_some()
     })
 }
-pub(super) fn owners_overlap(
-    owners: &RoutedOwnership,
-    a: usize,
-    b: usize,
-) -> bool {
+pub(super) fn owners_overlap(owners: &RoutedOwnership, a: usize, b: usize) -> bool {
     match (owners.get(&a), owners.get(&b)) {
         (Some(a), Some(b)) => maps_overlap(a.coordinates.experts(), b.coordinates.experts()),
         _ => true,
@@ -161,9 +157,13 @@ pub(super) fn global_fragment_slice(
     projection: &CaptureSlicePartition,
     index: usize,
 ) -> Result<ResolvedCaptureSlice, CaptureError> {
-    let [starts, ends, strides, shape] = CaptureRoutedUnitsGeometry::fragment_axes(projection, index)?;
+    let [starts, ends, strides, shape] =
+        CaptureRoutedUnitsGeometry::fragment_axes(projection, index)?;
     Ok(ResolvedCaptureSlice {
-        starts: starts.to_vec(), ends: ends.to_vec(), strides: strides.to_vec(), shape: shape.to_vec(),
+        starts: starts.to_vec(),
+        ends: ends.to_vec(),
+        strides: strides.to_vec(),
+        shape: shape.to_vec(),
     })
 }
 
@@ -186,7 +186,8 @@ pub(super) fn validate_payload(
         return Err(invalid("sparse receipt changed bank geometry"));
     }
     let slice = global_fragment_slice(projection, index)?;
-    let mut scratch = vec![eredu_core::capture::RoutedUnitRowIdentity::default(); payload.rows.len()];
+    let mut scratch =
+        vec![eredu_core::capture::RoutedUnitRowIdentity::default(); payload.rows.len()];
     payload.validate_partition_with_scratch(&slice, owned, plan.global_shape[0], &mut scratch)?;
     Ok(())
 }
@@ -209,7 +210,8 @@ pub(super) fn assemble(
     let ObservationValueType::RoutedUnits { geometry, .. } = point.value_type else {
         return Err(invalid("sparse assembly has no bank geometry").into());
     };
-    let slice = resolve_slice(point, selection, &plan.global_shape)?;
+    let slice =
+        super::receipt::geometry::source_slice(&plan.plan, &plan.context, &plan.global_shape)?;
     let values = elements(&slice.shape)?;
     let expected_rows = if values == 0 {
         0
@@ -269,14 +271,32 @@ pub(super) fn assemble(
                 seen: vec![false; units],
                 filled: 0,
             });
-            merged.filled=merged.filled.checked_add(row.merge_partition_values(merged.expert,merged.coefficient,
-                destination,&mut merged.values,&mut merged.seen).map_err(|cause|match cause {
-                    RoutedUnitAssemblyError::Overlap=>PartitionCaptureMergeError::Overlap,
-                    RoutedUnitAssemblyError::Overflow=>CaptureError::Overflow.into(),
-                    RoutedUnitAssemblyError::Identity=>invalid("sparse unit fragments disagree on expert or coefficient").into(),
-                    RoutedUnitAssemblyError::Values=>invalid("sparse receipt has non-floating values").into(),
-                    RoutedUnitAssemblyError::Destination=>invalid("sparse unit destination exceeds selection").into(),
-                })?).ok_or(CaptureError::Overflow)?;
+            merged.filled = merged
+                .filled
+                .checked_add(
+                    row.merge_partition_values(
+                        merged.expert,
+                        merged.coefficient,
+                        destination,
+                        &mut merged.values,
+                        &mut merged.seen,
+                    )
+                    .map_err(|cause| match cause {
+                        RoutedUnitAssemblyError::Overlap => PartitionCaptureMergeError::Overlap,
+                        RoutedUnitAssemblyError::Overflow => CaptureError::Overflow.into(),
+                        RoutedUnitAssemblyError::Identity => {
+                            invalid("sparse unit fragments disagree on expert or coefficient")
+                                .into()
+                        }
+                        RoutedUnitAssemblyError::Values => {
+                            invalid("sparse receipt has non-floating values").into()
+                        }
+                        RoutedUnitAssemblyError::Destination => {
+                            invalid("sparse unit destination exceeds selection").into()
+                        }
+                    })?,
+                )
+                .ok_or(CaptureError::Overflow)?;
         }
     }
     let received = rows
@@ -307,8 +327,10 @@ pub(super) fn assemble(
         source_token_ranges: vec![],
         rows,
     };
-    let mut scratch=vec![RoutedUnitRowIdentity::default();payload.rows.len()];
-    payload.finish_partition_with_scratch(&slice,&mut scratch).map_err(CaptureError::from)?;
+    let mut scratch = vec![RoutedUnitRowIdentity::default(); payload.rows.len()];
+    payload
+        .finish_partition_with_scratch(&slice, &mut scratch)
+        .map_err(CaptureError::from)?;
     let contributions = fragments
         .into_iter()
         .map(|fragment| {
@@ -320,7 +342,11 @@ pub(super) fn assemble(
                 geometry: fragment.geometry,
                 charged: fragment.record.charged,
                 routed: Some(RoutedUnitCaptureProvenance {
-                    ownership: plan.routed.get(&fragment.producer_rank).expect("validated sparse producer").clone(),
+                    ownership: plan
+                        .routed
+                        .get(&fragment.producer_rank)
+                        .expect("validated sparse producer")
+                        .clone(),
                     source_token_ranges: payload.source_token_ranges,
                 }),
             }

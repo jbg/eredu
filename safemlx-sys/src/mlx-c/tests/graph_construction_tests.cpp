@@ -1,12 +1,44 @@
 #include "prepared_metal_fixture.h"
 #include "mlx/backend/cpu/sampling_storage.h"
 #include "mlx/backend/cpu/alias_storage.h"
+#include "mlx/backend/cpu/simd/simd.h"
 #include "mlx/c/original_buffer.h"
 #include "empty_buffer_fixture.h"
 #include <numeric>
 // Included after the prepared Eval fixtures. Only changed host construction and
 // its transition into the existing real Eval/worker path are exercised here.
 #include "mlx/graph_construction.h"
+namespace wide_trigonometry_tests {
+template<int N>
+void compare() {
+  using namespace mlx::core;
+  const float values[] = {-2147483648.f,2147483648.f,1073741824.f,1073741952.f,
+      -9.f,-1.f,0.f,0.5f,1.f,7.f,187.f,8191.f,8192.f,1048576.f,16777216.f,
+      std::numeric_limits<float>::max(),
+      std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::quiet_NaN()};
+  for(size_t start=0; start<std::size(values); start+=N) {
+    mlx::core::simd::Simd<float,N> input;
+    for(int lane=0;lane!=N;++lane) input[lane]=values[(start+lane)%std::size(values)];
+    const auto sine=mlx::core::simd::sin(input), cosine=mlx::core::simd::cos(input);
+    for(int lane=0;lane!=N;++lane) {
+      const double value=input[lane];
+      if(!std::isfinite(value)) {
+        CHECK(std::isnan(sine[lane]));
+        CHECK(std::isnan(cosine[lane]));
+      } else {
+        CHECK(std::abs(double(sine[lane])-std::sin(value))<=1e-5);
+        CHECK(std::abs(double(cosine[lane])-std::cos(value))<=1e-5);
+      }
+    }
+  }
+}
+}
+TEST_CASE("CPU shared trigonometry preserves wide finite coordinates and nonfinite lanes") {
+  wide_trigonometry_tests::compare<1>();
+  wide_trigonometry_tests::compare<mlx::core::simd::max_size<float>>();
+}
 namespace pointwise_graph_tests {
 using namespace eval_record_facts;
 using submission::GraphConstruction;
@@ -74,7 +106,7 @@ void numerical(Device device, bool expect_cpu_source_refusal = false) {
     }
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime,
         capacity, &physical_retired,
-        [](void* owner) { ++*static_cast<unsigned*>(owner); }) == 0);
+        [](void* owner) { ++*static_cast<unsigned*>(owner); }, nullptr) == 0);
   }
   Role role;
   if (expect_cpu_source_refusal)
@@ -837,7 +869,7 @@ TEST_CASE("CPU copy Eval executes the existing nonzero strided worker under orig
     ~Budget() { mlx_original_buffer_budget_release(value); }
   } budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20,
-      &retired, [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      &retired, [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   const int values[] = {7, -11, 23, 13, 17, -19};
   array base(values, Shape{2, 3}, int32);
   auto source = transpose(base, stream);
@@ -938,7 +970,7 @@ TEST_CASE("CPU unary Eval preserves nonzero strided output and escaped original 
     ~Budget() { mlx_original_buffer_budget_release(value); }
   } budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20,
-      &retired, [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      &retired, [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   const int values[] = {7,99,-11,99,23,99,13,99,17,99,-19,99};
   Shape shape(14,1); shape[12]=2; shape[13]=6;
   Shape starts(14,0), steps(14,1); steps[13]=2;
@@ -1047,7 +1079,7 @@ TEST_CASE("CPU binary Eval preserves repeated strided inputs and escaped origina
   struct Budget {mlx_original_buffer_budget value{};
     ~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,
-      &retired,[](void* p){++*static_cast<unsigned*>(p);})==0);
+      &retired,[](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const int values[]={7,99,-11,99,23,99,13,99,17,99,-19,99};
   Shape shape(14,1);shape[12]=2;shape[13]=6;
   Shape starts(14,0),steps(14,1);steps[13]=2;
@@ -1136,7 +1168,7 @@ TEST_CASE("CPU cast Eval preserves nonzero strided conversion and escaped origin
   struct Budget { mlx_original_buffer_budget value{};
     ~Budget(){mlx_original_buffer_budget_release(value);} } budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,
-      &retired,[](void* p){++*static_cast<unsigned*>(p);})==0);
+      &retired,[](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const int values[]={7,99,-11,99,23,99,13,99,17,99,-19,99};
   Shape shape(14,1);shape[12]=2;shape[13]=6;
   Shape starts(14,0),steps(14,1);steps[13]=2;
@@ -1215,7 +1247,7 @@ TEST_CASE("CPU Slice aliases exact original backing through escaped view retirem
   struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   unsigned retired=0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void* p){++*static_cast<unsigned*>(p);})==0);
+      [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const int values[]={7,99,-11,99,23,99,13,99,17,99,-19,99};
   array base(values,Shape{2,6},int32);
   auto strided=slice(base,Shape{0,0},Shape{2,6},Shape{1,2},stream);eval(strided);
@@ -1288,7 +1320,7 @@ TEST_CASE("CPU Softmax preserves ordinary nonzero strided numerics and escaped o
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const float data[]={-2.5f,99,0.25f,99,3.75f,99,-0.125f,99,1.5f,99,-3.0f,99,0.75f,99,2.0f,99};
   array base(data,Shape{2,8},float32);auto source=slice(base,Shape{0,0},Shape{2,8},Shape{1,2},stream);eval(source);
   REQUIRE_FALSE(source.flags().contiguous);auto ordinary=softmax(source,-1,true,stream);eval(ordinary);
@@ -1357,7 +1389,7 @@ TEST_CASE("CPU greedy preserves first ties and escaped original U32 output for s
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const float data[]={-2.5f,99,3.75f,99,3.75f,99,-0.125f,99,1.5f,99,-3.0f,99,2.0f,99,2.0f,99};
   array base(data,Shape{2,8},float32);auto source=slice(base,Shape{0,0},Shape{2,8},Shape{1,2},stream);eval(source);
   REQUIRE_FALSE(source.flags().contiguous);auto ordinary=argmax(source,-1,false,stream);eval(ordinary);
@@ -1417,7 +1449,7 @@ TEST_CASE("CPU probability alias preserves offset and actual original backing th
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const float data[]={7,99,-11,99,23,99,13,99,17,99,-19,99};array base(data,Shape{1,1,12},float32);
   auto strided=slice(base,Shape{0,0,0},Shape{1,1,12},Shape{1,1,2},stream);eval(strided);
   std::optional<array> source,escaped;uint64_t identity=0;
@@ -1481,7 +1513,7 @@ TEST_CASE("CPU RandomBits preserves ordinary strided-key words and escaped origi
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const uint32_t words[]={0x12345678,99,0x9abcdef0,99};array base(words,Shape{4},uint32);
   auto key=slice(base,Shape{0},Shape{4},Shape{2},stream);eval(key);REQUIRE_FALSE(key.flags().contiguous);
   auto ordinary=random::bits(Shape{5},4,key,stream);eval(ordinary);
@@ -1554,7 +1586,7 @@ TEST_CASE("CPU BF16 Matmul preserves nonzero row results and escaped original ba
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const mlx::core::bfloat16_t ad[]={1,2,-1,3,0.5f,-2},bd[]={2,1,-3,4,0.5f,2};
   array a(ad,Shape{2,3},bfloat16),b(bd,Shape{3,2},bfloat16);
   auto ordinary=matmul(a,b,stream);eval(ordinary);
@@ -1636,14 +1668,14 @@ TEST_CASE("CPU selected tiled Matmul matches shared ordinary tails transpose bat
   auto batched_b=broadcast_to(reshape(b,Shape{1,k,n},selected),Shape{2,k,n},selected);
   auto batched=matmul(batched_a,batched_b,selected);eval(batched);
   for(size_t i=0;i!=size_t(2*m*n);++i)CHECK(batched.data<float>()[i]==ordinary.data<float>()[i%(m*n)]);
-  // AddMM uses the same retained choice and shared alpha/beta worker; its
-  // original Eval source remains separately unqualified in this increment.
+  // AddMM uses the same retained choice and shared alpha/beta worker.
+  // Its three-operand Eval source is qualified independently below.
   auto c=array(0.25f,float32);auto sum=addmm(c,a,b,0.75f,-0.5f,selected);eval(sum);
   for(size_t i=0;i!=size_t(m*n);++i)CHECK(sum.data<float>()[i]==0.75f*ordinary.data<float>()[i]-0.125f);
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -1724,7 +1756,7 @@ TEST_CASE("CPU aliases preserve nonzero strided views and exact original backing
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const float data[]={-3,99,0.5f,99,7,99,2,99,-1.25f,99,11,99};array base(data,Shape{2,6},float32);
   auto strided=slice(base,Shape{0,0},Shape{2,6},Shape{1,2},stream);eval(strided);
   std::optional<array> source,escaped;uint64_t identity=0;
@@ -1772,7 +1804,7 @@ TEST_CASE("CPU selected dense frontend preserves nonzero flattened projection bi
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -1805,7 +1837,7 @@ TEST_CASE("CPU selected BF16 dense frontend preserves row rounding aliases bias 
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -1868,7 +1900,7 @@ TEST_CASE("CPU residual pointwise chain preserves nonzero ordinary values and es
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -1951,7 +1983,7 @@ TEST_CASE("CPU Gather and floating Squeeze preserve strided negative-index rows 
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2033,7 +2065,7 @@ TEST_CASE("CPU boolean validation reductions preserve SIMD tails aliases and esc
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2062,7 +2094,7 @@ TEST_CASE("CPU F32 row sums keep the existing cascade and exact original result 
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2142,7 +2174,7 @@ TEST_CASE("CPU strict lookup retains its real validation root safe indices and c
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2206,7 +2238,7 @@ void run(Dtype dtype) {
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2263,7 +2295,7 @@ TEST_CASE("CPU activation sources retain F32 intermediates and original escaped 
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2316,7 +2348,7 @@ TEST_CASE("CPU row views retain the exact original backing through every escaped
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> first,second;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2390,7 +2422,7 @@ TEST_CASE("CPU Gemma entrance concatenation preserves row order and escaped back
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2451,7 +2483,7 @@ TEST_CASE("CPU Gemma rotary fallback preserves nonzero offsets ranges and escape
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2482,7 +2514,7 @@ TEST_CASE("CPU supplied rotary frequencies preserve rank three values and indepe
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2523,7 +2555,7 @@ TEST_CASE("CPU Gemma grouped attention uses rank five source and unchanged selec
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2597,7 +2629,7 @@ TEST_CASE("CPU ordered rank three partition keeps shared equal key and NaN order
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2657,7 +2689,7 @@ TEST_CASE("CPU ordered Gather preserves integer permutations repeated picks and 
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2728,7 +2760,7 @@ TEST_CASE("CPU ordered mask preserves row minima NaNs fill values and escaped ou
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   // Full's existing Vector copy preserves a compact per-row broadcast view.
   // Logical elements must use the actual strides, including after escape.
   const auto logical=[](const array& value,int position) {
@@ -2813,7 +2845,7 @@ TEST_CASE("CPU ordered scatter preserves duplicate negative indices and escaped 
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -2880,7 +2912,7 @@ TEST_CASE("CPU inferred Reshape preserves original nonzero backing and escaped a
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::array<float,64> data;for(size_t i=0;i!=data.size();++i)data[i]=float(int(i)-19)*0.0625f;
   array base(data.data(),Shape{1,1,64},float32);
   auto strided=slice(base,Shape{0,0,0},Shape{1,1,64},Shape{1,1,2},stream);eval(strided);
@@ -2950,7 +2982,7 @@ TEST_CASE("CPU all-axis F32 sum preserves ordinary SIMD tails and escaped source
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3004,7 +3036,7 @@ TEST_CASE("CPU I32 coordinates preserve values above float precision and escaped
     auto ordinary=arange(double(offset),double(offset)+7.0,1.0,int32,stream);eval(ordinary);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3085,7 +3117,7 @@ TEST_CASE("CPU broadcast Select preserves ordinary mask values and escaped nativ
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3151,7 +3183,7 @@ TEST_CASE("CPU explicit masked SDPA preserves nonzero MHA GQA equations and fina
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3226,7 +3258,7 @@ TEST_CASE("CPU strided head RMS keeps ordinary general-row rounding and escaped 
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<24,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3303,7 +3335,7 @@ TEST_CASE("CPU selected Matmul two-copy fallback keeps numeric order and final c
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3351,7 +3383,7 @@ TEST_CASE("CPU masked attention copies strided values with exact ordinary output
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3449,7 +3481,7 @@ TEST_CASE("CPU head joining reshape preserves ordinary values and copy or alias 
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> source,escaped;uint64_t source_identity=0;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3534,7 +3566,7 @@ TEST_CASE("CPU preview reuses exact rank-one Slice and retains original flattene
   struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   unsigned retired=0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void* p){++*static_cast<unsigned*>(p);})==0);
+      [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> source,escaped;uint64_t identity=0;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3639,7 +3671,7 @@ TEST_CASE("CPU flat count and maximum preserve ordinary SIMD tails and escaped o
     auto ordinary=count?sum(input,false,stream):max(input,false,stream);eval(ordinary);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3714,7 +3746,7 @@ TEST_CASE("CPU scalar overwrite preserves ordinary values input aliases and esca
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3781,7 +3813,7 @@ TEST_CASE("CPU candidate ArgSort preserves stable ties NaNs and escaped original
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3874,7 +3906,7 @@ TEST_CASE("CPU static rectangle update preserves batched ordinary values exact b
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -3936,7 +3968,7 @@ TEST_CASE("CPU F16 Gather preserves strided exact bits repeated picks and escape
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4012,7 +4044,7 @@ TEST_CASE("CPU precise half Softmax preserves scalar strided tails and escaped o
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4092,7 +4124,7 @@ TEST_CASE("CPU BF16 rank five Matmul binds exact copies and preserves row result
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4182,7 +4214,7 @@ TEST_CASE("CPU selected F16 tiles bind rank five copies default facts and escape
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4251,7 +4283,7 @@ TEST_CASE("CPU half SDPA shares precise masked and unmasked GQA sources and esca
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4319,7 +4351,7 @@ TEST_CASE("CPU byte View binds exact alias and one-copy reinterpretation with es
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4377,7 +4409,7 @@ TEST_CASE("CPU byte frame uses exact reshape concatenate slice and alignment sou
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4431,7 +4463,7 @@ TEST_CASE("CPU F16 scalar Full preserves exact source bits and escaped destinati
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4474,7 +4506,7 @@ TEST_CASE("CPU I32 broadcast Select preserves local indexes and exact escaped so
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4529,7 +4561,7 @@ TEST_CASE("CPU ordered member Stack shares exact N copy jobs and escaped half or
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4578,7 +4610,7 @@ TEST_CASE("CPU F16 residual pointwise uses exact half workers and escaped origin
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4639,7 +4671,7 @@ TEST_CASE("CPU half row Sum retains ordinary SIMD rounding source and escaped ba
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4692,7 +4724,7 @@ TEST_CASE("CPU weightless half RMS preserves half mean then F32 epsilon boundary
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4744,7 +4776,7 @@ TEST_CASE("CPU transposed head rotary shares exact ordinary slices and escaped o
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<23,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4834,7 +4866,7 @@ TEST_CASE("CPU sampler leaves preserve ordinary ordering scan rounding and escap
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4882,7 +4914,7 @@ TEST_CASE("CPU sampling GatherAxis retains exact ordering indices and escaped sc
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<22,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -4908,7 +4940,7 @@ TEST_CASE("CPU positive Slice keeps exact stepped coordinates and original escap
   struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   unsigned retired=0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void* p){++*static_cast<unsigned*>(p);})==0);
+      [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   const float values[]={7,99,-11,99,23,99,13,99,17,99,-19,99,31,99,43,99};
   array base(values,Shape{2,1,8},float32);
   auto strided=slice(base,Shape{0,0,0},Shape{2,1,8},Shape{1,1,2},stream);eval(strided);
@@ -4984,7 +5016,7 @@ TEST_CASE("CPU General Select preserves stepped input span and escaped output cu
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -5053,7 +5085,7 @@ TEST_CASE("MXFP4 explicit-index grouped projection owns five operands through Me
       ~Budget(){mlx_original_buffer_budget_release(value);} } budget;
     unsigned retired=0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void* p){++*static_cast<unsigned*>(p);})==0);
+        [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     struct Pipeline { mlx_pipeline_cache value{};
       ~Pipeline(){mlx_pipeline_cache_free(value);} } pipeline;
     REQUIRE(mlx_pipeline_cache_new_retaining(&pipeline.value,8,new int(0),wait_record_facts::release_token)==0);
@@ -5127,7 +5159,7 @@ TEST_CASE("Metal original indexed sum accumulates duplicate rows and retains out
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     struct Pipeline{mlx_pipeline_cache value{};~Pipeline(){mlx_pipeline_cache_free(value);}}pipeline;
     REQUIRE(mlx_pipeline_cache_new_retaining(&pipeline.value,8,new int(0),wait_record_facts::release_token)==0);
     std::optional<array> escaped;
@@ -5209,7 +5241,7 @@ TEST_CASE("CPU flat Scatter preserves ordinary row order and escaped original co
   struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -5286,7 +5318,7 @@ TEST_CASE("CPU paged row maxima retain ordinary SIMD values and escaped source c
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -5332,7 +5364,7 @@ TEST_CASE("CPU paged score rows preserve singleton transposed query copies and o
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -5434,3 +5466,67 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 #include "cpu_prepared_host_storage_tests.cpp"
 
 #include "cpu_static_update_tests.cpp"
+
+TEST_CASE("CPU selected AddMM source authenticates bias geometry and immutable tiled choice"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  const Stream selected(stream.index,stream.device,CpuMatmulKernel::Float32Tiles);
+  const float av[]={1,2,-1,3,0.5f,-2},bv[]={2,1,-3,4,0.5f,2},cv[]={0.25f,-0.5f};
+  array a(av,Shape{2,3},float32),b(bv,Shape{3,2},float32),c(cv,Shape{2},float32);
+  auto value=addmm(c,a,b,0.75f,-0.5f,selected);
+  auto platform=addmm(c,a,b,0.75f,-0.5f,stream);
+  eval(value.inputs()[2]);
+  cpu::CopyEvalStorage cold,actual;
+  REQUIRE(cpu::tiled_addmm_eval_layout(2,2,2,3,1,false,cold));
+  REQUIRE(cpu::tiled_addmm_eval_storage(value,actual));
+  CHECK(actual.allocation_extents==cold.allocation_extents);
+  CHECK(actual.backing_births==1);CHECK(actual.request_counts[6]==2);
+  CHECK(actual.request_counts[9]==1);
+  CHECK_FALSE(cpu::tiled_addmm_eval_storage(platform,actual));
+  auto wrong=array(Shape{2,3},float32,std::make_shared<AddMM>(selected,1.f,1.f),value.inputs());
+  CHECK_FALSE(cpu::tiled_addmm_eval_storage(wrong,actual));
+  auto bad_bias=array(Shape{2,2},float32,std::make_shared<AddMM>(selected,1.f,1.f),{a,b,c});
+  CHECK_FALSE(cpu::tiled_addmm_eval_storage(bad_bias,actual));
+  auto no_bias=matmul(a,b,selected);
+  CHECK_FALSE(cpu::tiled_addmm_eval_storage(no_bias,actual));
+  std::array<unsigned char,sizeof(cold)> saved;std::memcpy(saved.data(),&cold,sizeof(cold));
+  CHECK_FALSE(cpu::tiled_addmm_eval_layout(2,2,2,0,1,false,cold));
+  CHECK_FALSE(cpu::tiled_addmm_eval_layout(2,SIZE_MAX,2,3,1,false,cold));
+  CHECK(std::memcmp(saved.data(),&cold,sizeof(cold))==0);
+  eval(value,platform);
+  for(size_t i=0;i!=4;++i)CHECK(std::abs(value.data<float>()[i]-platform.data<float>()[i])<1e-6f);
+}
+
+TEST_CASE("CPU Copy alias authenticates typed shape and retains the same backing"
+    * doctest::skip(!wait_record_facts::layout_qualified)) {
+  using namespace pointwise_graph_tests;
+  auto stream=new_stream(Device::cpu);prepare(stream,stream);
+  const int values[]={3,-7,19,41};
+  array source(values,Shape{2,2},int32);
+  auto alias=copy(source,stream);
+  cpu::CopyEvalStorage cold,actual;
+  REQUIRE(cpu::alias_eval_layout(cpu::AliasOperation::Copy,2,2,false,cold));
+  REQUIRE(cpu::alias_eval_storage(alias,actual));
+  CHECK(actual.named_control_bytes==cold.named_control_bytes);
+  CHECK(actual.allocation_extents==cold.allocation_extents);
+  CHECK(actual.backing_births==0);CHECK(actual.request_counts[6]==0);
+  auto wrong_shape=array(Shape{4},int32,std::make_shared<Copy>(stream),{source});
+  auto wrong_dtype=array(Shape{2,2},float32,std::make_shared<Copy>(stream),{source});
+  CHECK_FALSE(cpu::alias_eval_storage(wrong_shape,actual));
+  CHECK_FALSE(cpu::alias_eval_storage(wrong_dtype,actual));
+  auto bad_source=array(Shape{8},int32,nullptr,{});bad_source.copy_shared_buffer(source);
+  CHECK_FALSE(cpu::alias_eval_storage(copy(bad_source,stream),actual));
+  CHECK_FALSE(cpu::alias_eval_layout(cpu::AliasOperation::Copy,2,3,false,actual));
+  CHECK_FALSE(cpu::alias_eval_layout(cpu::AliasOperation::Copy,SIZE_MAX,SIZE_MAX,false,actual));
+  eval(alias);alias.eval();
+  CHECK(alias.data<int>()==source.data<int>());
+  for(size_t i=0;i!=4;++i)CHECK(alias.data<int>()[i]==values[i]);
+  auto empty=as_strided(source,Shape{0,2},Strides{2,1},0,stream);
+  eval(empty);empty.eval();
+  auto empty_alias=copy(empty,stream);
+  REQUIRE(cpu::alias_eval_storage(empty_alias,actual));
+  CHECK(actual.backing_births==0);CHECK(actual.request_counts[6]==0);
+  eval(empty_alias);empty_alias.eval();
+  CHECK(empty_alias.data<int>()==source.data<int>());
+}

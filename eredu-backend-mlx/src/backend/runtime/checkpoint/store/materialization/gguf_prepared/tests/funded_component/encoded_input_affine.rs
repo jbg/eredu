@@ -1,18 +1,18 @@
 use super::*;
 use crate::backend::runtime::checkpoint::{
-    bounded_quantization::{BoundedQuantizationTarget, submit_original_affine_tile},
+    bounded_quantization::{submit_original_affine_tile, BoundedQuantizationTarget},
     store::{
         MaterializationPayloadShape, PreparedEncodedInputPlan, PreparedWeightMaterialization,
         WeightMaterialization,
     },
 };
 use eredu_checkpoint::{
-    AffineQuantization,
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::{CheckpointSource, MemoryWeightStore, SafetensorsWeightStore, TensorSelection},
+    AffineQuantization,
 };
 use safemlx::{Dtype, OperationEvent, PreparedInputRuntime, PreparedOriginalBufferBudget};
-use safetensors::tensor::{Dtype as SafeDtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
 #[test]
 fn admitted_encoded_sources_feed_original_affine_tiles_with_the_same_pool() {
@@ -120,18 +120,19 @@ fn admitted_encoded_sources_feed_original_affine_tiles_with_the_same_pool() {
                     controls,
                     Some(&budget),
                     |controls, observer, pool, host| {
-                        let before = pool.used_bytes().unwrap();
+                        let before = pool.fixture_host_charge().unwrap();
                         let input = input_plan.prepare(pool).unwrap();
                         input.validate_pool(pool).unwrap();
                         inputs.push(input.output().try_prepared_source_array().unwrap());
                         drop(input);
-                        assert_eq!(pool.used_bytes().unwrap(), before + input_bytes);
+                        assert_eq!(pool.fixture_host_charge().unwrap(), before + input_bytes);
                         let ready = PreparedWeightMaterialization::try_new(controls.clone(), shape)
                             .unwrap_or_else(|_| panic!("tile slot"));
                         let owner = WeightMaterialization::prepare_retained_impl(
                             inputs,
                             Vec::new(),
                             Some((ready, observer.clone())),
+                            None,
                         )
                         .unwrap();
                         let owner = submit_original_affine_tile(
@@ -182,3 +183,7 @@ fn admitted_encoded_sources_feed_original_affine_tiles_with_the_same_pool() {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

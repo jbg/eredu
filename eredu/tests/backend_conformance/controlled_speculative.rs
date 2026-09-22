@@ -26,7 +26,12 @@ fn setup() -> (
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -63,7 +68,7 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
             output_mode: eredu::api::PreparedChatOutputMode::Semantic,
             skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
-            settings,
+            settings: settings.clone(),
             options: Default::default(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -112,17 +117,13 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
             records[0].captures.as_step().invocation.unwrap().sequence,
             2
         );
-        assert!(
-            records
-                .iter()
-                .all(|r| r.completed && r.admission_identity.as_deref() == Some(identity.as_str()))
-        );
-        assert!(
-            records
-                .iter()
-                .flat_map(|r| &r.captures.as_step().interventions)
-                .any(|edit| edit.outcome == InterventionOutcome::Applied)
-        );
+        assert!(records
+            .iter()
+            .all(|r| r.completed && r.admission_identity.as_deref() == Some(identity.as_str())));
+        assert!(records
+            .iter()
+            .flat_map(|r| &r.captures.as_step().interventions)
+            .any(|edit| edit.outcome == InterventionOutcome::Applied));
         let mut continuous_steps = Vec::new();
         let streamed = model
             .generate_observed_prepared_chat_speculative(
@@ -261,7 +262,7 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
             output_mode: eredu::api::PreparedChatOutputMode::Semantic,
             skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
-            settings,
+            settings: settings.clone(),
             options: Default::default(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -624,7 +625,7 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
                     output_mode: eredu::api::PreparedChatOutputMode::Text,
                     skip_special_tokens: true,
                     drafting: SpeculativeDraft::Embedded,
-                    settings,
+                    settings: settings.clone(),
                     options: Default::default(),
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -659,14 +660,12 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
                     ));
                     assert_eq!(session.token_ids(), [7]);
                     let unchanged = session.sampling_state();
-                    assert!(
-                        session
-                            .override_sampling(eredu::api::SamplingOverride {
-                                temperature: Some(-1.0),
-                                reseed: None
-                            })
-                            .is_err()
-                    );
+                    assert!(session
+                        .override_sampling(eredu::api::SamplingOverride {
+                            temperature: Some(-1.0),
+                            reseed: None
+                        })
+                        .is_err());
                     assert_eq!(session.sampling_state(), unchanged);
                     session.override_sampling(eredu::api::SamplingOverride {
                         temperature: Some(0.7),

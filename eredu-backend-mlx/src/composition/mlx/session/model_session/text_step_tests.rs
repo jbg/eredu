@@ -6,7 +6,7 @@ use eredu_core::{
     TextGenerationDriver, TextGenerationInput, WorkspaceBound,
 };
 use eredu_runtime::working_memory::{
-    InferenceRequest, InferenceRetention, WorkingMemoryError, WorkingMemoryPool,
+    InferenceRequest, InferenceRetention, MemoryLedger, WorkingMemoryError,
 };
 
 #[derive(Clone, Default)]
@@ -38,20 +38,20 @@ fn stream() -> Stream {
     Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))
 }
 
-fn pool() -> WorkingMemoryPool {
-    WorkingMemoryPool::new(u64::MAX, 0).unwrap()
+fn pool() -> MemoryLedger {
+    crate::memory_fixture::ledger(u64::MAX, 0).unwrap()
 }
 
 fn runtime(
     stream: &Stream,
-    model_pool: &WorkingMemoryPool,
-    context_pool: &WorkingMemoryPool,
+    model_pool: &MemoryLedger,
+    context_pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
-    let loader = MlxBackend::new(stream, stream).with_memory_pool(model_pool.clone());
+    let loader = MlxBackend::new(stream, stream).with_memory_ledger(model_pool.clone());
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model =
         eredu_core::load_model(&loader, root.path(), crate::MlxLoadRequest::default()).unwrap();
-    let backend = MlxBackend::new(stream, stream).with_memory_pool(context_pool.clone());
+    let backend = MlxBackend::new(stream, stream).with_memory_ledger(context_pool.clone());
     let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
@@ -91,7 +91,7 @@ fn geometry() -> InferenceGeometry {
 // native input construction, model execution, and token sampling.
 fn reserved_request(
     runtime: &ModelRuntime<MlxBackend<'_>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> InferenceRequest {
     let layout = StateMemoryLayout::new(
         LayerSchedule::new(1, vec![eredu_core::cache::LayerCachePolicy::NoState]).unwrap(),
@@ -110,15 +110,18 @@ fn reserved_request(
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry: geometry(),
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry: geometry(),
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
     pool.reserve(
         runtime
@@ -127,12 +130,13 @@ fn reserved_request(
             .model
             .erased()
             .inference_execution_identity(),
-        &Admission {
+        &crate::memory_fixture::admission(Admission {
+            additional_headroom: Default::default(),
+            memory_limits: Default::default(),
             requested_positions: 5,
             state,
-            incremental_required_bytes: 0,
-            available_memory_bytes: None,
-        },
+            incremental_required_bytes: Some(0),
+        }),
     )
     .unwrap()
     .into()
@@ -155,11 +159,11 @@ struct Unchanged {
     inputs: usize,
     resets: usize,
     frontier: Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>,
-    pools: Vec<(WorkingMemoryPool, u64, u64, usize)>,
+    pools: Vec<(MemoryLedger, u64, u64, usize)>,
 }
 
 impl Unchanged {
-    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pools: &[&WorkingMemoryPool]) -> Self {
+    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pools: &[&MemoryLedger]) -> Self {
         Self {
             paths: paths::snapshot(),
             inputs: paths::session_input_creation_attempts(),
@@ -170,8 +174,8 @@ impl Unchanged {
                 .map(|pool| {
                     (
                         (*pool).clone(),
-                        pool.used_bytes().unwrap(),
-                        pool.peak_bytes().unwrap(),
+                        pool.fixture_host_charge().unwrap(),
+                        pool.fixture_host_peak().unwrap(),
                         pool.unquoted_owner_count().unwrap(),
                     )
                 })
@@ -190,8 +194,8 @@ impl Unchanged {
         );
         assert!(runtime.session().ensure_no_submission_in_flight().is_ok());
         for (pool, bytes, peak, owners) in &self.pools {
-            assert_eq!(pool.used_bytes().unwrap(), *bytes);
-            assert_eq!(pool.peak_bytes().unwrap(), *peak);
+            assert_eq!(pool.fixture_host_charge().unwrap(), *bytes);
+            assert_eq!(pool.fixture_host_peak().unwrap(), *peak);
             assert_eq!(pool.unquoted_owner_count().unwrap(), *owners);
         }
     }
@@ -254,8 +258,8 @@ fn replaced_prompt_request_with_equal_geometry_rejects_before_controller_or_mode
         .model
         .erased()
         .inference_execution_identity();
-    let canonical = InferenceRequest::without_memory_budget(execution, geometry()).unwrap();
-    let replacement = InferenceRequest::without_memory_budget(execution, geometry()).unwrap();
+    let canonical = reserved_request(&runtime, &pool);
+    let replacement = reserved_request(&runtime, &pool);
     assert_eq!(canonical.geometry(), replacement.geometry());
     assert!(canonical.validate_same_request(&replacement).is_err());
     let prompt = MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2, 3])
@@ -289,7 +293,7 @@ fn replaced_prompt_request_with_equal_geometry_rejects_before_controller_or_mode
 fn sampler_cannot_substitute_an_equally_sized_reservation_for_canonical_preparation() {
     let stream = stream();
     let pool = pool();
-    let request_pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let request_pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let (mut runtime, _root) = runtime(&stream, &pool, &pool);
     let canonical = reserved_request(&runtime, &request_pool);
     let replacement = reserved_request(&runtime, &request_pool);
@@ -332,7 +336,7 @@ fn retained_reservation_never_authorizes_unquoted_step_in_model_or_context_domai
                 &context_pool
             },
         );
-        let source = MlxBackend::new(&stream, &stream).with_memory_pool(source_pool.clone());
+        let source = MlxBackend::new(&stream, &stream).with_memory_ledger(source_pool.clone());
         let prompt = MlxBackend::prepare_text_prompt(&source, vec![1, 2, 3])
             .unwrap()
             .with_inference_request(request.clone());
@@ -372,3 +376,7 @@ fn retained_reservation_never_authorizes_unquoted_step_in_model_or_context_domai
             .covers_pool(&context_pool));
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

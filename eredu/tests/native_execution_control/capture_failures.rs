@@ -60,7 +60,6 @@ fn capture(scores: bool, cumulative: CaptureUsage) -> CapturePlan {
         limits: CaptureLimits {
             per_step: budgets(),
             cumulative,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -203,7 +202,7 @@ fn verify_public_capture_failures(device: LocalDevice) {
                     retained_bytes: 64 << 20,
                     cumulative_copy_bytes: 256 << 20,
                 },
-                ORIGINAL_CAPACITY,
+                native_limits(ORIGINAL_CAPACITY),
                 copy_limits(),
             )
             .unwrap();

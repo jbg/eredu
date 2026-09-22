@@ -65,7 +65,7 @@ fn fixture() -> tempfile::TempDir {
     dir
 }
 fn inspect(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     path: &Path,
 ) -> Result<ArtifactInspection<()>, OriginalArtifactInspectionError<()>> {
     pool.inspect_artifact_with_safetensors_pool(
@@ -88,7 +88,7 @@ fn early_inspection_shares_catalog_custody_and_builds_independent_caches_without
     if !super::qualified(dir.path()) {
         return;
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let inspection = inspect(&pool, dir.path()).unwrap();
     let alias = inspection.clone().map_architecture_plan(|_| 17u32);
     assert!(std::ptr::eq(
@@ -101,10 +101,10 @@ fn early_inspection_shares_catalog_custody_and_builds_independent_caches_without
             .same_admission(&alias.admission_token())
     );
     let tensors = inspection.tensors().clone();
-    let discovery_bytes = pool.used_bytes().unwrap();
+    let discovery_bytes = pool.payload_used_bytes().unwrap();
     assert!(discovery_bytes > 0);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     let shards = inspection.safetensors_shards().unwrap().clone();
     // Deferred store creation must consume the admitted owners, not these files.
     std::fs::remove_file(dir.path().join("model.safetensors.index.json")).unwrap();
@@ -146,17 +146,17 @@ fn early_inspection_shares_catalog_custody_and_builds_independent_caches_without
     drop(ordinary);
     drop(one);
     drop(two);
-    assert_eq!(pool.used_bytes().unwrap(), discovery_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), discovery_bytes);
     drop(shards);
     drop(inspection);
     drop(alias);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "tensor catalog owns its original metadata contribution"
     );
     assert_eq!(tensors.get("beta").unwrap().shape, [2]);
     drop(tensors);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn inspection_and_fresh_store_refusals_preserve_original_inputs() {
@@ -164,18 +164,20 @@ fn inspection_and_fresh_store_refusals_preserve_original_inputs() {
     if !super::qualified(dir.path()) {
         return;
     }
-    let initial = WorkingMemoryPool::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
-    let short = WorkingMemoryPool::new(initial - 1, 0).unwrap();
+    let initial = MemoryLedger::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(initial - 1, 0).unwrap();
     assert!(matches!(
         inspect(&short, dir.path()).unwrap_err().memory_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let inspection = inspect(&pool, dir.path()).unwrap();
-    let base = pool.used_bytes().unwrap();
+    let base = pool.payload_used_bytes().unwrap();
     let shards = inspection.safetensors_shards().unwrap().clone();
-    let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let error = foreign
         .open_admitted_safetensors_source(shards.clone(), 1, POLICY)
         .unwrap_err();
@@ -184,7 +186,7 @@ fn inspection_and_fresh_store_refusals_preserve_original_inputs() {
         Some(WorkingMemoryError::IdentityMismatch)
     ));
     assert!(error.rejected_shards().is_some());
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     drop(error);
     let invalid = pool
         .open_admitted_safetensors_source(shards.clone(), 0, POLICY)
@@ -194,9 +196,9 @@ fn inspection_and_fresh_store_refusals_preserve_original_inputs() {
         Some(StoreError::InvalidShardCacheLimit)
     ));
     assert!(invalid.rejected_shards().is_some());
-    assert!(pool.used_bytes().unwrap() > base);
+    assert!(pool.payload_used_bytes().unwrap() > base);
     drop(invalid);
-    assert_eq!(pool.used_bytes().unwrap(), base);
+    assert_eq!(pool.payload_used_bytes().unwrap(), base);
     let ordinary = SafetensorsShards::discover(dir.path()).unwrap();
     assert!(matches!(
         pool.open_admitted_safetensors_source(ordinary, 1, POLICY)
@@ -206,7 +208,7 @@ fn inspection_and_fresh_store_refusals_preserve_original_inputs() {
     ));
     drop(shards);
     drop(inspection);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn malformed_inspection_keeps_accepted_account_and_tensor_catalog_does_not_keep_pool_alive() {
@@ -214,7 +216,7 @@ fn malformed_inspection_keeps_accepted_account_and_tensor_catalog_does_not_keep_
     if !super::qualified(dir.path()) {
         return;
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let inspection = inspect(&pool, dir.path()).unwrap();
     let catalog = inspection.tensors().clone();
     drop(inspection);
@@ -224,7 +226,7 @@ fn malformed_inspection_keeps_accepted_account_and_tensor_catalog_does_not_keep_
     assert_eq!(catalog.len(), 2);
     drop(catalog);
     std::fs::write(dir.path().join("model.safetensors.index.json"), b"bad JSON").unwrap();
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let error = inspect(&pool, dir.path()).unwrap_err();
     assert!(matches!(
         error.construction_failure(),
@@ -232,11 +234,11 @@ fn malformed_inspection_keeps_accepted_account_and_tensor_catalog_does_not_keep_
             StoreError::SafetensorsShards(_)
         ))
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -245,7 +247,7 @@ fn loading_inspection_preserves_limits_and_refusals_across_admission_availabilit
     if !super::qualified(dir.path()) {
         return;
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let ordinary_owner = pool.acquire_unquoted().unwrap();
     let ordinary = pool
         .inspect_artifact_for_loading(
@@ -260,7 +262,7 @@ fn loading_inspection_preserves_limits_and_refusals_across_admission_availabilit
             .safetensors_shards_have_source_admission(ordinary.safetensors_shards().unwrap())
             .unwrap()
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let limits = SafetensorsDiscoveryLimits {
         max_index_bytes: 0,
         ..Default::default()
@@ -285,15 +287,15 @@ fn loading_inspection_preserves_limits_and_refusals_across_admission_availabilit
         pool.safetensors_shards_have_source_admission(admitted.safetensors_shards().unwrap())
             .unwrap()
     );
-    let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     assert!(matches!(
         foreign.safetensors_shards_have_source_admission(admitted.safetensors_shards().unwrap()),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop(admitted);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    let initial = WorkingMemoryPool::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
-    let short = WorkingMemoryPool::new(initial - 1, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    let initial = MemoryLedger::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(initial - 1, 0).unwrap();
     assert!(matches!(
         short
             .inspect_artifact_for_loading(
@@ -304,7 +306,9 @@ fn loading_inspection_preserves_limits_and_refusals_across_admission_availabilit
             )
             .unwrap_err()
             .memory_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     std::fs::write(dir.path().join("model.safetensors.index.json"), b"bad JSON").unwrap();
     let error = pool
@@ -315,12 +319,12 @@ fn loading_inspection_preserves_limits_and_refusals_across_admission_availabilit
             POLICY,
         )
         .unwrap_err();
-    let accepted = pool.used_bytes().unwrap();
+    let accepted = pool.payload_used_bytes().unwrap();
     assert!(accepted > 0);
     let error = eredu_core::AutomaticPlanningError::backend("inspect-loading-fixture", error);
     let alias = error.clone();
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), accepted);
+    assert_eq!(pool.payload_used_bytes().unwrap(), accepted);
     let mut cause: &(dyn std::error::Error + 'static) = &alias;
     while cause
         .downcast_ref::<OriginalArtifactInspectionError<()>>()
@@ -331,5 +335,5 @@ fn loading_inspection_preserves_limits_and_refusals_across_admission_availabilit
             .expect("original inspection cause remains in the chain");
     }
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

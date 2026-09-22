@@ -9,7 +9,7 @@ use eredu_checkpoint::store::TensorSelection;
 use eredu_core::residency::{
     MemoryTier, OffloadConfig, OffloadPlan, ResidencyPolicy, TransferDirection,
 };
-use eredu_runtime::{working_memory::WorkingMemoryPool, WeightBinding};
+use eredu_runtime::{WeightBinding, working_memory::MemoryLedger};
 
 pub(crate) struct NamedArraysFixture {
     manager: ResidencyManager,
@@ -192,20 +192,24 @@ impl NamedArraysFixture {
             Err(NamedArrayError::ForeignManager)
         );
         // Every rejection left both actual published ordinary maps untouched.
-        assert!(!state.storage[&roots[0]]
-            .device
-            .as_ref()
-            .unwrap()
-            .arrays
-            .arrays
-            .is_prepared());
-        assert!(!state.storage[&second_id]
-            .device
-            .as_ref()
-            .unwrap()
-            .arrays
-            .arrays
-            .is_prepared());
+        assert!(
+            !state.storage[&roots[0]]
+                .device
+                .as_ref()
+                .unwrap()
+                .arrays
+                .arrays
+                .is_prepared()
+        );
+        assert!(
+            !state.storage[&second_id]
+                .device
+                .as_ref()
+                .unwrap()
+                .arrays
+                .arrays
+                .is_prepared()
+        );
         let mut prepared = vec![
             (
                 roots[0].clone(),
@@ -283,7 +287,7 @@ impl NamedArraysFixture {
         old: FirstNamedOwners,
         mut collected: super::super::super::storage::CanonicalCollectionFixture,
         controls: &OriginalTextControlGuard,
-        old_pool: &WorkingMemoryPool,
+        old_pool: &MemoryLedger,
     ) {
         let roots = [ordinary::id("second")];
         let mut scratch = [ResidencyClosureSlot::default(); 2];
@@ -360,7 +364,9 @@ impl NamedArraysFixture {
             .arrays
             .retained_values()
             .find_map(|value| match value {
-                super::super::super::storage::RetainedStorageRef::CanonicalArray(cell) => Some(cell),
+                super::super::super::storage::RetainedStorageRef::CanonicalArray(cell) => {
+                    Some(cell)
+                }
                 _ => None,
             })
             .expect("later request canonical cell");
@@ -368,7 +374,7 @@ impl NamedArraysFixture {
         drop(warm_alias);
         drop(old);
         assert!(
-            old_pool.used_bytes().unwrap() > 0,
+            old_pool.fixture_host_charge().unwrap() > 0,
             "the old physical cell still owns old Q"
         );
         assert_eq!(
@@ -377,10 +383,10 @@ impl NamedArraysFixture {
         );
         drop(second);
         collected.assert_values();
-        let with_original_cell = old_pool.used_bytes().unwrap();
+        let with_original_cell = old_pool.fixture_host_charge().unwrap();
         drop(collected);
         assert!(
-            old_pool.used_bytes().unwrap() < with_original_cell,
+            old_pool.fixture_host_charge().unwrap() < with_original_cell,
             "retiring the last upgraded row releases A while B remains live"
         );
         // The composition caller performs the final ordinary pool settlement
@@ -388,3 +394,7 @@ impl NamedArraysFixture {
         // used as evidence while the old cell is live.
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

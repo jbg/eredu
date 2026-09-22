@@ -3,19 +3,18 @@
 use super::{MlxKeyValueLayerState, MlxKeyValueState};
 use crate::backend::runtime::residency::storage::StorageIdentity;
 use eredu_runtime::{
-    HostSlotInitialization, HostSlotInitializationError, SharedStateLayout,
     working_memory::{
-        DecoderCopyAdmissionError, FundedDecoderSlots, InitializedDecoderSlots,
-        RegisteredDecoderHostCopy, WorkingMemoryError, WorkingMemoryPool,
+        DecoderCopyAdmissionError, FundedDecoderSlots, InitializedDecoderSlots, MemoryLedger,
+        RegisteredDecoderHostCopy, WorkingMemoryError,
     },
+    HostSlotInitialization, HostSlotInitializationError, SharedStateLayout,
 };
-use safemlx::{Array, Stream, error::Exception};
+use safemlx::{error::Exception, Array, Stream};
 use std::cell::RefCell;
 
 mod dense;
 mod paged;
 mod workspace;
-pub(in crate::backend::runtime::cache::state) use paged::{PagedWork, PreparedPagedStorageCopy};
 pub(crate) use dense::{
     DenseResidentKvPublishError, PreparedDenseResidentKvState, PublishedDenseResidentKvState,
 };
@@ -23,6 +22,7 @@ pub(crate) use paged::{
     InitializedPagedDenseCopy, InitializedPagedKvCopy, PagedKvPreparationError,
     PreparedPagedKvCopy, PreparedPagedKvHostCopy, SavedPagedKvCopy,
 };
+pub(in crate::backend::runtime::cache::state) use paged::{PagedWork, PreparedPagedStorageCopy};
 pub(crate) use workspace::ProjectedDenseResidentKvCopy;
 
 #[derive(Debug, thiserror::Error)]
@@ -179,7 +179,7 @@ impl<'a> PreparedResidentKvCopy<'a> {
 
     pub(crate) fn host_copy(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<
         RegisteredDecoderHostCopy<'a, MlxKeyValueLayerState, StorageIdentity>,
         ResidentKvCopyError,
@@ -189,7 +189,7 @@ impl<'a> PreparedResidentKvCopy<'a> {
 
     pub(crate) fn host_copy_with_preparation(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         preparation: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<
         RegisteredDecoderHostCopy<'a, MlxKeyValueLayerState, StorageIdentity>,
@@ -257,6 +257,13 @@ pub(crate) struct SavedResidentKvCopy {
 }
 
 impl SavedResidentKvCopy {
+    pub(crate) fn continuation_bounds(&self, additional: u64) -> Option<(u64, u64)> {
+        Some((
+            MlxKeyValueState::layer_capacity_bound(self.layers.iter(), additional)?,
+            MlxKeyValueState::layer_auxiliary_growth(self.layers.iter(), additional)?,
+        ))
+    }
+
     pub(crate) fn prepare_copy(&self) -> Result<PreparedResidentKvCopy<'_>, ResidentKvCopyError> {
         PreparedResidentKvCopy::prepare_saved(self)
     }
@@ -348,7 +355,7 @@ impl<'a> KvCopySource<'a> {
     }
     pub(crate) fn host_copy_with_preparation(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         preparation: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<
         RegisteredDecoderHostCopy<'a, MlxKeyValueLayerState, StorageIdentity>,

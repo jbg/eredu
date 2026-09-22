@@ -184,6 +184,8 @@ pub trait ParameterMetadataAllocation {
     fn parameter_spec_clone_bytes(source: &ParameterSpec) -> Option<usize>;
     /// Copies one specification after reserving its complete storage.
     fn clone_parameter_spec(&self, source: &ParameterSpec) -> Result<ParameterSpec, Error>;
+    /// Exact storage for a companion and its authoritative weight identity.
+    fn parameter_companion_clone_bytes(weight: &ParameterSpec, source: &ParameterSpec) -> Option<usize>;
     /// Copies a physical companion and its authoritative weight identity.
     fn clone_parameter_companion(&self, weight: &ParameterSpec, source: &ParameterSpec) -> Result<ParameterSpec, Error>;
     /// Exact storage for a grouped gated-product declaration.
@@ -220,15 +222,43 @@ impl ParameterMetadataAllocation for super::HostMetadataFunding {
     }
     fn clone_parameter_companion(&self, weight: &ParameterSpec, source: &ParameterSpec)
         -> Result<ParameterSpec, Error> {
-        let bytes = source.metadata_clone_bytes()
-            .and_then(|n| n.checked_add(weight.id.metadata_clone_bytes()?))
+        let bytes = Self::parameter_companion_clone_bytes(weight, source)
             .ok_or(WorkspaceMetadataError::Overflow)?;
         self.reserve_metadata(bytes).map_err(WorkspaceMetadataError::from)?;
         let mut companion = source.clone();
         companion.linear_companion_of = Some(weight.id.clone());
         Ok(companion)
     }
+    fn parameter_companion_clone_bytes(weight: &ParameterSpec, source: &ParameterSpec) -> Option<usize> {
+        source.metadata_clone_bytes()?.checked_add(weight.id.metadata_clone_bytes()?)
+    }
     funded_group_spec_clone!(GroupedGatedProductSpec,grouped_gated_product_clone_bytes,clone_grouped_gated_product);
     funded_group_spec_clone!(GroupedRelu2Spec,grouped_relu2_clone_bytes,clone_grouped_relu2);
     funded_group_spec_clone!(GroupedLinearSpec,grouped_linear_clone_bytes,clone_grouped_linear);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::HostMetadataFunding;
+
+    #[test]
+    fn companion_copy_preserves_source_and_requires_its_exact_identity_storage() {
+        let weight = ParameterSpec::trainable("layers.7.projection.weight").unwrap();
+        let source = ParameterSpec::trainable("layers.7.projection.scales").unwrap();
+        let bytes = HostMetadataFunding::parameter_companion_clone_bytes(&weight, &source).unwrap();
+        let funding = |available| HostMetadataFunding::from_prepaid(
+            HostMetadataFunding::prepaid_control_bytes().unwrap() + available,
+            eredu_core::HostPreparationAuthority::retain(()),
+        ).unwrap();
+        let exact = funding(bytes);
+        let companion = exact.clone_parameter_companion(&weight, &source).unwrap();
+        assert_eq!(companion.id, source.id);
+        assert_eq!(companion.linear_companion_of.as_ref(), Some(&weight.id));
+        assert!(source.linear_companion_of.is_none());
+        assert!(exact.reserve_metadata(1).is_err());
+        let short = funding(bytes - 1);
+        assert!(short.clone_parameter_companion(&weight, &source).is_err());
+        assert!(short.reserve_metadata(bytes - 1).is_ok(), "rejected copy leaves its account unchanged");
+    }
 }

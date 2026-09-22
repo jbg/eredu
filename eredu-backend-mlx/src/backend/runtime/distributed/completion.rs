@@ -44,9 +44,10 @@ struct NativeResources {
 struct NativeOwner {
     resources: Option<Rc<NativeResources>>,
     custody: Option<prepared::ResourceCustody>,
+    ordinary: Option<crate::backend::nn::shared::OrdinaryExecutionOwner>,
 }
 impl Clone for NativeOwner {
-    fn clone(&self) -> Self { Self { resources: self.resources.clone(), custody: self.custody.clone() } }
+    fn clone(&self) -> Self { Self { resources: self.resources.clone(), custody: self.custody.clone(), ordinary: self.ordinary.clone() } }
 }
 impl std::ops::Deref for NativeOwner {
     type Target = NativeResources;
@@ -118,7 +119,7 @@ impl NativeResources {
                 }
             });
         }
-        NativeOwner { resources: Some(resources), custody }
+        NativeOwner { resources: Some(resources), custody, ordinary: None }
     }
 
     fn unavailable(&self) -> bool {
@@ -218,7 +219,10 @@ fn check_native_status(
     {
         return Err(match recovery.observer() {
             Some(observer) => observer.retained_failure().unwrap_or_else(|| observer.invalid_input_error()),
-            None => safemlx::error::Exception::custom("native communication failed; unresolved resources remain retained"),
+            None => match &resources.ordinary {
+                Some(owner) => ordinary::failure(ordinary::Cause::Completion, owner.host()),
+                None => safemlx::error::Exception::custom("native communication failed; unresolved resources remain retained"),
+            },
         });
     }
     // An inline original event can complete before its enclosing model role.
@@ -227,6 +231,8 @@ fn check_native_status(
 }
 
 mod communication;
+mod ordinary;
+pub(crate) use ordinary::{ordinary_completed_i32_scalar, ordinary_completed_i32_scalar_control_bytes};
 mod original;
 mod consumers;
 mod scalar;

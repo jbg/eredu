@@ -4,13 +4,13 @@ use eredu_architectures::prepared_execution::InferenceEquationTraceObserver;
 use eredu_nn::workspace::{WorkspaceStoragePopulation, WorkspaceTraceReport};
 use eredu_runtime::working_memory::InferenceWorkspaceSpan;
 pub(in crate::composition::mlx::replicated_text::prediction::workspace) struct CompletionTrace<'a> {
-    recorder: &'a mut ResidentRecipeRecorder,
+    recorder: &'a mut dyn InferenceEquationTraceObserver,
     context: &'a WorkspaceContext,
     roots: Option<usize>,
 }
 impl<'a> CompletionTrace<'a> {
     pub(in crate::composition::mlx::replicated_text::prediction::workspace) fn new(
-        recorder: &'a mut ResidentRecipeRecorder,
+        recorder: &'a mut dyn InferenceEquationTraceObserver,
         context: &'a WorkspaceContext,
     ) -> Result<Self, Error> {
         context
@@ -37,7 +37,9 @@ impl<'a> CompletionTrace<'a> {
         );
         Ok(())
     }
-    pub(in crate::composition::mlx::replicated_text::prediction::workspace) fn finish(self) -> Result<usize, Error> {
+    pub(in crate::composition::mlx::replicated_text::prediction::workspace) fn finish(
+        self,
+    ) -> Result<usize, Error> {
         self.roots.ok_or_else(|| {
             Error::from(
                 self.context
@@ -59,11 +61,24 @@ impl InferenceEquationTraceObserver for CompletionTrace<'_> {
         self.recorder
             .observe(span, report, retained_roots, output_roots, input_operation)
     }
-    fn observe_prepared_with_storage(&mut self,span:&InferenceWorkspaceSpan,
-        report:&WorkspaceTraceReport,retained_roots:usize,output_roots:usize,
-        input_operation:Option<usize>,output:Option<WorkspaceStoragePopulation>)->Result<(),eredu_nn::Error>{
-        self.record(retained_roots,output_roots)?;
-        self.recorder.observe_prepared_with_storage(span,report,retained_roots,output_roots,input_operation,output)
+    fn observe_prepared_with_storage(
+        &mut self,
+        span: &InferenceWorkspaceSpan,
+        report: &WorkspaceTraceReport,
+        retained_roots: usize,
+        output_roots: usize,
+        input_operation: Option<usize>,
+        output: Option<WorkspaceStoragePopulation>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.record(retained_roots, output_roots)?;
+        self.recorder.observe_prepared_with_storage(
+            span,
+            report,
+            retained_roots,
+            output_roots,
+            input_operation,
+            output,
+        )
     }
     fn observe_with_storage(
         &mut self,
@@ -110,18 +125,30 @@ impl InferenceEquationTraceObserver for CompletionTrace<'_> {
         )
     }
     fn observe_external_target_with_storage(
-        &mut self, span: &InferenceWorkspaceSpan, report: &WorkspaceTraceReport,
-        retained_roots: usize, output_roots: usize, input_operation: Option<usize>,
+        &mut self,
+        span: &InferenceWorkspaceSpan,
+        report: &WorkspaceTraceReport,
+        retained_roots: usize,
+        output_roots: usize,
+        input_operation: Option<usize>,
         output: Option<WorkspaceStoragePopulation>,
-        capture: &eredu_architectures::composite_execution::ExternalPredictionTargetCapture<WorkspaceTensor>,
+        capture: &eredu_architectures::composite_execution::ExternalPredictionTargetCapture<
+            WorkspaceTensor,
+        >,
         scores: Option<&WorkspaceTensor>,
     ) -> Result<(), eredu_nn::Error> {
         // As in the ordinary external target worker, the inner session settles
         // state/scores; the complete semantic capture remains in the outer role.
         self.record(retained_roots, usize::from(scores.is_some()))?;
         self.recorder.observe_external_target_with_storage(
-            span, report, retained_roots, output_roots, input_operation, output, capture, scores,
+            span,
+            report,
+            retained_roots,
+            output_roots,
+            input_operation,
+            output,
+            capture,
+            scores,
         )
     }
-
 }

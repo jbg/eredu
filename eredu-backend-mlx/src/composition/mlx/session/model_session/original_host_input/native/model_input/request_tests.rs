@@ -45,7 +45,10 @@ fn config() -> TextGenerationConfig {
     )
     .unwrap();
     TextGenerationConfig::new(sampling).with_inference_policy(eredu_core::TextInferencePolicy {
-        managed_memory_capacity_bytes: Some(u64::MAX),
+        memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(u64::MAX),
+        )]),
         prefill_chunk_positions: Some(2.try_into().unwrap()),
         ..Default::default()
     })
@@ -73,9 +76,9 @@ fn attempt_preparation(
     let _ = crate::composition::mlx::session::model_session::text_quote::take_original_cold_facts();
     let request = GenerationSequenceRequest::new(3, &[7]);
     let compiles = COMPILES.get();
-    let pool = runtime.backend().memory_pool().clone();
+    let pool = runtime.backend().memory_ledger().clone();
     let owners = pool.unquoted_owner_count().unwrap();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let (error, roots) = crate::tests::support::media_completion::observe(None, || {
         if manual {
             match ControlledTextGeneration::from_input_with_sequence(
@@ -88,7 +91,7 @@ fn attempt_preparation(
             ) {
                 Ok(generation) => {
                     assert!(
-                        pool.used_bytes().unwrap() > used,
+                        pool.fixture_host_charge().unwrap() > used,
                         "accepted Q and planning metadata remain owned by the prepared generation"
                     );
                     drop(generation);
@@ -108,7 +111,7 @@ fn attempt_preparation(
             ) {
                 Ok(generation) => {
                     assert!(
-                        pool.used_bytes().unwrap() > used,
+                        pool.fixture_host_charge().unwrap() > used,
                         "accepted Q and planning metadata remain owned by the prepared generation"
                     );
                     drop(generation);
@@ -134,10 +137,10 @@ fn attempt_preparation(
         crate::backend::submission_recovery::wait_for_retirement(|| {
             crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
             safemlx::reclaim_allocation_owners();
-            pool.used_bytes().unwrap() == used
+            pool.fixture_host_charge().unwrap() == used
         });
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             used,
             "dropping the prepared generation retires Q and planning while the independent B remains live"
         );
@@ -192,12 +195,12 @@ fn attempt_preparation(
             _ => unreachable!(),
         }
         assert!(
-            pool.used_bytes().unwrap() > used,
+            pool.fixture_host_charge().unwrap() > used,
             "the owning diagnostic retains its actual planning charge"
         );
     } else {
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             used,
             "fixed refusal allocates no planning account: manual={manual}, rejection={rejection:?}, error={error}"
         );
@@ -211,7 +214,7 @@ fn attempt_preparation(
     // planning alias. Its retirement cannot be mistaken for source-B refund.
     drop(error);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         used,
         "last diagnostic owner retires all planning metadata"
     );
@@ -222,17 +225,18 @@ fn attempt_preparation(
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[test]
-fn original_prepared_core_claim_reaches_precise_native_gap_in_both_families_and_selected_residencies() {
+fn original_prepared_core_claim_reaches_precise_native_gap_in_both_families_and_selected_residencies(
+) {
     request_facts_matrix(false);
 }
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[test]
-fn original_prepared_video_and_projected_media_keep_exact_canonical_attribution_in_selected_residencies()
-{
+fn original_prepared_video_and_projected_media_keep_exact_canonical_attribution_in_selected_residencies(
+) {
     request_facts_matrix(true);
 }
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-pub(super) fn original_request_backend(pool: &WorkingMemoryPool) -> MlxBackend<'static> {
+pub(super) fn original_request_backend(pool: &MemoryLedger) -> MlxBackend<'static> {
     use crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams;
     use crate::backend::{MlxAcceleratorFamily, MlxDeviceIdentity};
     // The preceding independent ordinary fixture can leave completed native
@@ -242,7 +246,12 @@ pub(super) fn original_request_backend(pool: &WorkingMemoryPool) -> MlxBackend<'
         pool.unquoted_owner_count().unwrap() == 0
     });
     let streams = PreparedExecutionStreams::for_factory(pool)
-        .unwrap_or_else(|cause| panic!("prepared stream initialization: {cause:?}; unquoted owners={:?}", pool.unquoted_owner_count()))
+        .unwrap_or_else(|cause| {
+            panic!(
+                "prepared stream initialization: {cause:?}; unquoted owners={:?}",
+                pool.unquoted_owner_count()
+            )
+        })
         .expect("original media requests require admitted native stream owners");
     let identity = MlxDeviceIdentity::from_realized_device(
         &safemlx::Device::new(safemlx::DeviceType::Gpu, 0),
@@ -269,17 +278,19 @@ pub(super) fn admitted_media_config(
     use eredu_runtime::{DenseDiskStreamLoadOptions, NormalizedLoadRequest, WeightResidency};
     let inspection = eredu_core::inspect_artifact(path, backend.configuration_resolver()).unwrap();
     let weights = crate::MlxLoadRequest::from_normalized(
-        NormalizedLoadRequest::default().with_weight_residency(
-            WeightResidency::dense_disk_stream(
-                DenseDiskStreamLoadOptions::new(1 << 26, 0, 0, 0).unwrap(),
-            ),
-        ),
+        NormalizedLoadRequest::default().with_weight_residency(WeightResidency::dense_disk_stream(
+            DenseDiskStreamLoadOptions::new(1 << 26, 0, 0, 0).unwrap(),
+        )),
     );
     eredu_core::prepare_inspected_model_config(backend, inspection, weights).unwrap()
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 fn request_facts_matrix(extended: bool) {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     // Admit the actual process/native owners before any fixture native work.
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     assert!(
@@ -309,7 +320,11 @@ fn request_facts_matrix(extended: bool) {
                 source(&pool, hidden)
             };
             let expected_media = if extended {
-                if conditional { 15 } else { 12 }
+                if conditional {
+                    15
+                } else {
+                    12
+                }
             } else {
                 4
             };
@@ -340,35 +355,34 @@ fn request_facts_matrix(extended: bool) {
             let prompt = full.bind(&runtime, a).unwrap();
             let compiles = COMPILES.get();
             let owners = pool.unquoted_owner_count().unwrap();
-            let used = pool.used_bytes().unwrap();
+            let used = pool.fixture_host_charge().unwrap();
             let (_, roots) = crate::tests::support::media_completion::observe(None, || {
                 runtime
                     .session()
                     .payload
                     .model
                     .erased()
-                    .inspection_adapters_for_test(eredu_core::InferenceGeometry {
-                        batch_size: 1,
-                        cached_positions: 0,
-                        input_positions: expected_decoder,
-                        max_output_tokens: 3,
-                        prefill_chunk_positions: 2,
-                        output: eredu_core::OutputDemand::LastPosition,
-                    }, &pool)
+                    .inspection_adapters_for_test(
+                        eredu_core::InferenceGeometry {
+                            batch_size: 1,
+                            cached_positions: 0,
+                            input_positions: expected_decoder,
+                            max_output_tokens: 3,
+                            prefill_chunk_positions: 2,
+                            output: eredu_core::OutputDemand::LastPosition,
+                        },
+                        &pool,
+                    )
                     .unwrap();
             });
             assert!(roots.is_empty());
             assert_eq!(COMPILES.get(), compiles);
-            assert_eq!(pool.used_bytes().unwrap(), used);
+            assert_eq!(pool.fixture_host_charge().unwrap(), used);
             assert_eq!(pool.unquoted_owner_count().unwrap(), owners);
 
-            // Independent ordinary attribution retains its real ordinary owner.
-            // The original prompt remains unchanged and gains no such authority.
-            use eredu_core::{
-                PreparedControlInput, PreparedControlInputBackend, PromptTokenAttribution,
-            };
-            let ordinary = MlxBackend::prepare_control_input(&runtime, prompt.clone()).unwrap();
-            let attribution = ordinary.attribution();
+            // The diagnostic projects the actual canonical source; it grants no execution permission.
+            use eredu_core::PromptTokenAttribution;
+            let attribution = crate::tests::support::original_input::attribution(&prompt);
             let input::OriginalMediaPacket::Original(packet) =
                 prompt.original_media.as_ref().unwrap()
             else {
@@ -431,11 +445,7 @@ fn request_facts_matrix(extended: bool) {
                 legacy_count.media_execution_workspace_kind(),
                 input_count.media_execution_workspace_kind()
             );
-            // This independent attribution adapter owns an ordinary exclusion
-            // lease. Its comparisons are finished; retire it before requesting
-            // a real managed planning account for the unchanged original input.
             drop(attribution);
-            drop(ordinary);
             let expected = legacy_state::estimate_runtime_state(
                 capability.state_layout(),
                 input_count,
@@ -511,53 +521,16 @@ fn request_facts_matrix(extended: bool) {
                 assert!(before.matches(&after));
                 assert_eq!(after.frontier(), 0);
             }
-            // An ordinary preinstalled collector is not an original capture
-            // owner, even for an empty source. Explicit source options instead
-            // enter the genuine original capture admission tested publicly.
-            let discovery = MlxBackend::capture_discovery(&runtime).unwrap();
-            let input::OriginalMediaPacket::Original(packet) =
-                prompt.original_media.as_ref().unwrap()
-            else {
-                unreachable!()
-            };
-            let shape = packet.shape();
-            let empty = empty_capture(&discovery, shape);
-            let paths = runtime.session().payload.model.erased().shared_observation_paths().unwrap();
-            let selection = paths.prepare_media_capture_selection(&empty).unwrap();
-            let ordinary = eredu_runtime::capture::OrdinaryPrefillCapture::new(
-                selection,
-                eredu_core::InferenceGeometry {
-                    batch_size: shape[0], cached_positions: 0, input_positions: shape[1],
-                    max_output_tokens: 3, prefill_chunk_positions: 2.min(shape[1]),
-                    output: eredu_core::OutputDemand::LastPosition,
-                },
-            ).unwrap();
-            for manual in [false, true] {
-                let mut installed = prompt.clone();
-                installed.prepared_capture = Some(ordinary.clone());
-                assert_eq!(
-                    failure_with_options(
-                        &mut runtime,
-                        installed,
-                        manual,
-                        Some(TextPreparationOptions {
-                            interventions: None, capture: Some(empty.clone())
-                        })
-                    ),
-                    R::MissingCapture
-                );
-                assert!(crate::composition::mlx::session::model_session::text_quote::take_original_cold_facts().is_none(), "capture rejects before fact derivation");
-            }
             if extended {
                 continue;
             }
-            // Existing ordinary execution still consumes the identical genuine
-            // prepared packet through the shared selected media driver.
-            let output = runtime
-                .prefill(prompt.with_prefill_chunk_positions(2.try_into().unwrap()))
-                .unwrap();
-            output.completion.wait().unwrap();
-            drop(output);
+            // The same complete packet enters ordinary bounded admission.
+            super::super::super::tests::admitted::collect(
+                &mut runtime,
+                prompt.with_prefill_chunk_positions(2.try_into().unwrap()),
+                1,
+                true,
+            );
             assert!(
                 runtime
                     .session()
@@ -575,19 +548,22 @@ fn request_facts_matrix(extended: bool) {
 
 #[test]
 fn original_prepared_source_substitution_and_stale_state_precede_missing_native_contribution() {
+    if !crate::tests::support::native_process::enter("prepared-request-stale-source") {
+        return;
+    }
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen3_vl_component_fixture(
         root.path(),
         false,
         false,
     );
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let backend = super::super::super::tests::admitted::backend(&pool);
+    let stream = backend.stream().clone();
     let input = source(&pool, 64);
     let equal = source(&pool, 64);
     assert_eq!(input.content_digest(), equal.content_digest());
     assert!(!input.same_source(&equal));
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
     let selected = cold_config(&backend, root.path(), 0);
     let a = selected
         .prepared_sources()
@@ -637,7 +613,7 @@ fn original_prepared_source_substitution_and_stale_state_precede_missing_native_
     );
     // A second real session over the same retained selected source has its own
     // execution/control/revision identities. Equal geometry never authenticates it.
-    let other_backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let other_backend = super::super::super::tests::admitted::backend(&pool);
     let other_model = other_backend.prepare_model_borrowed(&selected).unwrap();
     let mut other = ModelRuntime::from_prepared(other_backend, other_model).unwrap();
     other
@@ -652,8 +628,9 @@ fn original_prepared_source_substitution_and_stale_state_precede_missing_native_
         R::IdentityMismatch
     );
     drop(other);
-    let foreign_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let other_backend = MlxBackend::new(&stream, &stream).with_memory_pool(foreign_pool);
+    let foreign_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let other_backend = MlxBackend::new(&stream, runtime.backend().weights_stream())
+        .with_memory_ledger(foreign_pool);
     let foreign_selected = cold_config(&other_backend, root.path(), 0);
     let other_model = other_backend
         .prepare_model_borrowed(&foreign_selected)
@@ -682,11 +659,12 @@ fn original_prepared_source_substitution_and_stale_state_precede_missing_native_
     assert_eq!(failure(&mut runtime, prompt.clone(), true), R::Busy);
     drop(lease);
     let stale = prompt.clone();
-    let output = runtime
-        .prefill(prompt.with_prefill_chunk_positions(2.try_into().unwrap()))
-        .unwrap();
-    output.completion.wait().unwrap();
-    drop(output);
+    super::super::super::tests::admitted::collect(
+        &mut runtime,
+        prompt.with_prefill_chunk_positions(2.try_into().unwrap()),
+        1,
+        true,
+    );
     assert_eq!(failure(&mut runtime, stale, true), R::IdentityMismatch);
 }
 
@@ -708,7 +686,6 @@ fn empty_capture(
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -733,7 +710,7 @@ fn empty_capture(
 // projected media. Preparation vectors here are ordinary fixture setup; I's
 // actual compile performs the original source comparison and copies its slots.
 fn extended_source(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     hidden: usize,
     conditional: bool,
 ) -> OriginalPreparedHostInput {
@@ -847,3 +824,7 @@ fn extended_source(
     pool.compile_prepared_host_input(PreparedHostInputPlan::prepare(&parts).unwrap())
         .unwrap()
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

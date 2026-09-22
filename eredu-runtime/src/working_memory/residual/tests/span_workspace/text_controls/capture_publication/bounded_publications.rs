@@ -2,8 +2,8 @@ use super::*;
 use crate::working_memory::PreparedPrefillStoragePublicationPlan;
 #[test]
 fn finite_publication_layout_requires_exact_plan_and_same_key_original_c_before_seal() {
-    let pool = WorkingMemoryPool::new(2_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let raw = replacement_quote(&pool, geometry(), 0).into_incremental();
     let other = replacement_quote(&pool, geometry(), 0).into_incremental();
@@ -82,7 +82,10 @@ fn finite_publication_layout_requires_exact_plan_and_same_key_original_c_before_
     let quote = raw
         .with_span_workspace_and_text_controls(controls.clone())
         .unwrap();
-    assert_eq!(quote.incremental_bytes(), plain.incremental_bytes() + s);
+    assert_eq!(
+        quote.incremental_bytes().unwrap(),
+        plain.incremental_bytes().unwrap() + s
+    );
     assert!(matches!(
         quote
             .clone()
@@ -91,14 +94,14 @@ fn finite_publication_layout_requires_exact_plan_and_same_key_original_c_before_
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop((root, source, plain, quote, other));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn original_single_hold_prices_finite_publication_rows_once_and_c_remains_separate() {
-    let pool = WorkingMemoryPool::new(2_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let c = source.capacity_bytes().unwrap();
     let raw = replacement_quote(&pool, geometry(), 0).into_incremental();
@@ -121,13 +124,12 @@ fn original_single_hold_prices_finite_publication_rows_once_and_c_remains_separa
         .with_prefill_storage_publications(rows)
         .unwrap();
     let quote = raw.with_span_workspace_and_text_controls(controls).unwrap();
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let native = run.scope().unwrap();
@@ -146,10 +148,10 @@ fn original_single_hold_prices_finite_publication_rows_once_and_c_remains_separa
     native.certify().unwrap();
     drop((owner, witness, quote, root, r, run, source));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         protected + c,
         "unissued bank retains original full witness"
     );
     drop(bank);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

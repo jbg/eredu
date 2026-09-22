@@ -2,7 +2,7 @@ use super::super::*;
 use super::*;
 
 pub(crate) struct PartitionedDenseDecoderBindingVisitor<'a> {
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
     pub(in crate::composition::mlx) stream: &'a Stream,
@@ -10,7 +10,7 @@ pub(crate) struct PartitionedDenseDecoderBindingVisitor<'a> {
 }
 
 pub(crate) struct PartitionedPredictionBindingVisitor<'a> {
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub distributed: crate::backend::distributed::MlxDistributedSession,
     pub additional_claimed_sources: std::collections::BTreeSet<String>,
@@ -64,7 +64,7 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
             PredictionReplicatedFinalizer {
                 prediction: SelectedPrediction {
                     extension,
@@ -77,7 +77,7 @@ impl
 }
 
 pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
@@ -86,7 +86,7 @@ pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
 }
 
 pub(crate) struct PartitionedPoolingRoutedDecoderBindingVisitor<'a> {
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) stream: &'a Stream,
@@ -139,7 +139,7 @@ impl
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
             self.addressable_manager,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
         )
     }
 }
@@ -199,7 +199,7 @@ macro_rules! impl_partitioned_prediction_binding {
                         capability: self.capability,
                     },
                     self.addressable_manager,
-                    self.layerwise_manager.and_then(std::cell::Cell::take),
+                    self.construction_sources.and_then(std::cell::Cell::take),
                 )
             }
         }
@@ -250,7 +250,7 @@ impl
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
             self.addressable_manager,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
         )
     }
 }
@@ -292,7 +292,7 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
             OrdinaryReplicatedFinalizer,
         )
     }
@@ -310,7 +310,7 @@ pub(crate) fn bind_partitioned<A, G, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    construction_sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -330,10 +330,10 @@ where
             additional_claimed_sources,
             stream,
             weights_stream,
-            layerwise_manager,
+            construction_sources,
             finalizer,
         ),
-        |prepared, (store, distributed, additional, stream, weights_stream, layerwise_manager, finalizer)| {
+        |prepared, (store, distributed, additional, stream, weights_stream, construction_sources, finalizer)| {
             bind_partitioned_local(
                 prepared,
                 store,
@@ -341,11 +341,11 @@ where
                 additional,
                 stream,
                 weights_stream,
-                layerwise_manager,
+                construction_sources,
                 finalizer,
             )
         },
-        |prepared, (store, distributed, additional, stream, weights_stream, layerwise_manager, finalizer)| {
+        |prepared, (store, distributed, additional, stream, weights_stream, construction_sources, finalizer)| {
             bind_partitioned_pipeline(
                 prepared,
                 store,
@@ -353,7 +353,7 @@ where
                 additional,
                 stream,
                 weights_stream,
-                layerwise_manager,
+                construction_sources,
                 finalizer,
             )
         },
@@ -375,7 +375,7 @@ pub(crate) fn bind_partitioned_local<A, G, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    construction_sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -396,7 +396,7 @@ where
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
-    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
+    mechanisms.set_prepared_construction_sources(construction_sources);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);

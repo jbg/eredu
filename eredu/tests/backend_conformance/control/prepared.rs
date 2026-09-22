@@ -45,7 +45,8 @@ fn prepared_prepared_run_and_steps_share_unicode_commit_ranges_and_no_startup_pr
         let (mut model, chat, settings, first) = setup();
         let pool = model.original_pool().clone();
         let guard = crate::host_authority::Guard::new(&pool);
-        let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let prepared =
+            PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
         let mut records = Vec::new();
         let mut session = model
             .start_controlled_chat(prepared, limits(), Default::default(), |r| {
@@ -111,7 +112,7 @@ fn prepared_prepared_run_and_steps_share_unicode_commit_ranges_and_no_startup_pr
         drop(chat);
         drop(model);
         assert!(
-            pool.used_bytes().unwrap() > 0,
+            pool.live_charge_bytes().unwrap() > 0,
             "escaped control records retain actual host custody"
         );
         // Eight ordinary aliases can retire concurrently after the run/model.
@@ -127,7 +128,7 @@ fn prepared_prepared_run_and_steps_share_unicode_commit_ranges_and_no_startup_pr
                 join.join().unwrap();
             }
         });
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
     assert_eq!(outputs[0], outputs[1]);
 }
@@ -141,7 +142,7 @@ fn prepared_cancelled_start_and_consumer_break_do_not_predict() {
         if case == "zero" {
             settings.overrides.max_new_tokens = Some(0);
         }
-        let request = PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let request = PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
         let control = GenerationControlHandle::default();
         if case == "cancel" {
             control.cancel();
@@ -186,7 +187,7 @@ fn prepared_cancelled_start_and_consumer_break_do_not_predict() {
         assert!(guard.update(|p| p.steps.is_empty()));
         drop(chat);
         drop(model);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -195,11 +196,11 @@ fn prepared_capacity_mismatch_refuses_before_prediction_and_empty_capture_is_sup
     let (mut model, chat, settings, _) = setup();
     let pool = model.original_pool().clone();
     let guard = crate::host_authority::Guard::new(&pool);
-    let mut settings = original_sources::settings(settings);
-    settings.inference.managed_memory_capacity_bytes = Some(1);
+    let mut settings = original_sources::settings(settings.clone());
+    settings.inference.memory_limits = crate::memory::limits(1);
     let error = model
         .start_controlled_chat(
-            PreparedChatRequest::new(&chat, settings),
+            PreparedChatRequest::new(&chat, settings.clone()),
             limits(),
             Default::default(),
             |_| panic!("unadmitted delivery"),
@@ -209,9 +210,9 @@ fn prepared_capacity_mismatch_refuses_before_prediction_and_empty_capture_is_sup
     assert!(error.session_failure().unwrap().input_rejection().is_some());
     assert!(guard.update(|p| p.steps.is_empty()));
     drop(error);
-    settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
+    settings.inference.memory_limits = crate::memory::limits(original_sources::CAPACITY);
     let capture = CapturePlan::none();
-    let mut request = PreparedChatRequest::new(&chat, settings);
+    let mut request = PreparedChatRequest::new(&chat, settings.clone());
     request.capture = Some(&capture);
     let mut records = Vec::new();
     let mut session = model
@@ -241,7 +242,7 @@ fn prepared_capacity_mismatch_refuses_before_prediction_and_empty_capture_is_sup
     drop(records);
     drop(chat);
     drop(model);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -250,7 +251,7 @@ fn prepared_foreign_session_and_trace_failure_preserve_exact_source_custody() {
     let (mut other, other_chat, _, _) = setup();
     let error = other
         .start_controlled_chat(
-            PreparedChatRequest::new(&chat, original_sources::settings(settings)),
+            PreparedChatRequest::new(&chat, original_sources::settings(settings.clone())),
             limits(),
             Default::default(),
             |_| panic!("foreign delivery"),
@@ -268,7 +269,7 @@ fn prepared_foreign_session_and_trace_failure_preserve_exact_source_custody() {
     let guard = crate::host_authority::Guard::new(&pool);
     let error = model
         .start_controlled_chat(
-            PreparedChatRequest::new(&chat, original_sources::settings(settings)),
+            PreparedChatRequest::new(&chat, original_sources::settings(settings.clone())),
             TraceLimits {
                 per_record_bytes: 1,
                 total_bytes: 1,
@@ -289,18 +290,18 @@ fn prepared_foreign_session_and_trace_failure_preserve_exact_source_custody() {
         "{error:?}"
     );
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.live_charge_bytes().unwrap(),
         0,
         "fixed quota refusal owns no destination payload"
     );
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn wire_version_and_exact_record_transport_keep_source_attribution() {
     let (mut model, chat, settings, _) = setup();
-    let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut record = None;
     let session = model
         .start_controlled_chat(prepared, limits(), Default::default(), |r| {
@@ -336,7 +337,7 @@ fn prepared_snapshot_restore_and_serial_branch_keep_attribution_and_monotone_bud
     let (mut model, chat, settings, first) = setup();
     let pool = model.original_pool().clone();
     let guard = crate::host_authority::Guard::new(&pool);
-    let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut session = model
         .start_controlled_chat(prepared, limits(), Default::default(), |_| {
             ControlFlow::Continue(())
@@ -352,8 +353,10 @@ fn prepared_snapshot_restore_and_serial_branch_keep_attribution_and_monotone_bud
     session
         .enable_snapshots(
             snapshot_limits,
-            original_sources::CAPACITY,
-            eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+            crate::memory::limits(original_sources::CAPACITY),
+            eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+                original_sources::CAPACITY,
+            )),
         )
         .unwrap();
     let saved = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
@@ -464,7 +467,7 @@ fn prepared_snapshot_restore_and_serial_branch_keep_attribution_and_monotone_bud
     drop(session);
     drop(chat);
     drop(model);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     let aliases: Vec<_> = (0..8).map(|_| metadata.clone()).collect();
     drop(metadata);
     std::thread::scope(|scope| {
@@ -476,7 +479,7 @@ fn prepared_snapshot_restore_and_serial_branch_keep_attribution_and_monotone_bud
             join.join().unwrap();
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -487,9 +490,19 @@ fn prepared_terminal_sampling_facts_survive_restore_and_exchange_without_new_wor
     let pool = model.original_pool().clone();
     let guard = crate::host_authority::Guard::new(&pool);
     let cancellation = eredu_core::GenerationCancellationToken::new();
-    let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings));
-    let mut session = model.start_prepared_chat(prepared, &cancellation).unwrap().unwrap();
-    assert_eq!(session.preparation_report().unwrap().geometry.max_output_tokens, 8);
+    let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
+    let mut session = model
+        .start_prepared_chat(prepared, &cancellation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session
+            .preparation_report()
+            .unwrap()
+            .geometry
+            .max_output_tokens,
+        8
+    );
     let sampling = session.sampling_state().unwrap();
     while session.finish_reason().is_none() {
         session = session.advance(&cancellation, &mut |_| {}).unwrap();
@@ -504,19 +517,91 @@ fn prepared_terminal_sampling_facts_survive_restore_and_exchange_without_new_wor
         retained_bytes: original_sources::CAPACITY,
         cumulative_copy_bytes: original_sources::CAPACITY * 8,
     });
-    let saved = session.snapshot(&budget, original_sources::CAPACITY,
-        WorkspaceCopyLimits::new(original_sources::CAPACITY)).unwrap();
+    let saved = session
+        .snapshot(
+            &budget,
+            crate::memory::limits(original_sources::CAPACITY),
+            WorkspaceCopyLimits::new(crate::memory::limits(original_sources::CAPACITY)),
+        )
+        .unwrap();
+
+    for requested in [
+        eredu_core::MemoryLimitDeclarations::new([(
+            "foreign-domain".into(),
+            eredu_core::MemoryLimit::Unlimited,
+        )]),
+        eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(0),
+        )]),
+    ] {
+        let error = session
+            .restore_snapshot(
+                &saved,
+                PreparedChatResumeSettings {
+                    inference: Some(eredu_core::TextInferencePolicy {
+                        memory_limits: requested.clone(),
+                        ..settings.inference.clone()
+                    }),
+                    ..Default::default()
+                },
+                crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
+            .unwrap_err();
+        assert!(
+            has_cause::<eredu_core::MemoryDomainError>(&error, |cause| matches!(
+                cause,
+                eredu_core::MemoryDomainError::UnknownDomainName { .. }
+            )) || has_cause::<eredu_core::HostMetadataFundingError>(&error, |cause| matches!(
+                cause,
+                eredu_core::HostMetadataFundingError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { limit_bytes: 0, .. }
+                )
+            )),
+            "replacement domain limits preserve the actual refusal: {error:?}"
+        );
+        assert_eq!(session.token_ids(), history);
+        assert_eq!(session.sampling_state().unwrap(), sampling);
+        assert_eq!(session.next_prediction(), prediction);
+        assert_eq!(guard.update(|probe| probe.steps.len()), steps);
+    }
 
     for stage in 0..3 {
+        let requested = crate::memory::limits(match stage {
+            1 => original_sources::CAPACITY - 1,
+            2 => original_sources::CAPACITY + 1,
+            _ => original_sources::CAPACITY,
+        });
+        let resume = PreparedChatResumeSettings {
+            inference: Some(eredu_core::TextInferencePolicy {
+                memory_limits: requested.clone(),
+                ..settings.inference.clone()
+            }),
+            ..Default::default()
+        };
         let mut branch = match stage {
             1 => {
-                assert!(session.restore_snapshot(&saved, PreparedChatResumeSettings::default(),
-                    original_sources::CAPACITY, &cancellation).unwrap());
+                assert!(session
+                    .restore_snapshot(
+                        &saved,
+                        resume,
+                        crate::memory::limits(original_sources::CAPACITY),
+                        &cancellation
+                    )
+                    .unwrap());
                 None
             }
             2 => {
-                let mut branch = session.fork_snapshot(&saved, PreparedChatResumeSettings::default(),
-                    original_sources::CAPACITY, &cancellation).unwrap().unwrap();
+                let mut branch = session
+                    .fork_snapshot(
+                        &saved,
+                        resume,
+                        crate::memory::limits(original_sources::CAPACITY),
+                        &cancellation,
+                    )
+                    .unwrap()
+                    .unwrap();
                 session.exchange(&mut branch).unwrap();
                 Some(branch)
             }
@@ -524,16 +609,35 @@ fn prepared_terminal_sampling_facts_survive_restore_and_exchange_without_new_wor
         };
         assert_eq!(session.sampling_state().unwrap(), sampling);
         if stage != 0 {
+            assert_eq!(
+                session.preparation_report().unwrap().admission.memory_limits,
+                requested,
+                "the backend admits the replacement per-domain request policy"
+            );
             let geometry = session.preparation_report().unwrap().geometry;
-            assert_eq!((geometry.input_positions, geometry.max_output_tokens,
-                geometry.prefill_chunk_positions), (0, 0, 0));
+            assert_eq!(
+                (
+                    geometry.input_positions,
+                    geometry.max_output_tokens,
+                    geometry.prefill_chunk_positions
+                ),
+                (0, 0, 0)
+            );
             assert_eq!(geometry.output, eredu_core::OutputDemand::StateOnly);
         }
-        assert!(session.override_sampling(SamplingOverride {
-            temperature: Some(0.75), reseed: Some(99),
-        }).is_err(), "terminal sampler cannot be replaced");
+        assert!(
+            session
+                .override_sampling(SamplingOverride {
+                    temperature: Some(0.75),
+                    reseed: Some(99),
+                })
+                .is_err(),
+            "terminal sampler cannot be replaced"
+        );
         assert_eq!(session.sampling_state().unwrap(), sampling);
-        session = session.advance(&cancellation, &mut |_| panic!("terminal event")).unwrap();
+        session = session
+            .advance(&cancellation, &mut |_| panic!("terminal event"))
+            .unwrap();
         if let Some(branch) = &mut branch {
             session.exchange(branch).unwrap();
         }
@@ -544,7 +648,7 @@ fn prepared_terminal_sampling_facts_survive_restore_and_exchange_without_new_wor
     }
     drop((saved, session));
     drop((chat, model));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -554,7 +658,8 @@ fn prepared_direct_choice_and_snapshot_configuration_refuse_without_prediction()
         let (mut model, chat, settings, _) = setup();
         let pool = model.original_pool().clone();
         let guard = crate::host_authority::Guard::new(&pool);
-        let prepared = PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let prepared =
+            PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
         let control = GenerationControlHandle::default();
         let mut session = model
             .start_controlled_chat(prepared, limits(), control.clone(), |_| {
@@ -572,19 +677,19 @@ fn prepared_direct_choice_and_snapshot_configuration_refuse_without_prediction()
             session
                 .enable_snapshots(
                     limits,
-                    original_sources::CAPACITY,
-                    eredu_runtime::working_memory::WorkspaceCopyLimits::new(
+                    crate::memory::limits(original_sources::CAPACITY),
+                    eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
                         original_sources::CAPACITY,
-                    ),
+                    )),
                 )
                 .unwrap();
             session
                 .enable_snapshots(
                     limits,
-                    original_sources::CAPACITY,
-                    eredu_runtime::working_memory::WorkspaceCopyLimits::new(
+                    crate::memory::limits(original_sources::CAPACITY),
+                    eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
                         original_sources::CAPACITY,
-                    ),
+                    )),
                 )
                 .unwrap_err()
         } else {
@@ -605,8 +710,8 @@ fn prepared_direct_choice_and_snapshot_configuration_refuse_without_prediction()
         drop(session);
         drop(chat);
         drop(model);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

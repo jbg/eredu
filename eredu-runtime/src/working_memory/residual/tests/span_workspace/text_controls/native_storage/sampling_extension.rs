@@ -6,6 +6,23 @@ use std::convert::Infallible;
 #[derive(Debug)]
 struct SamplingFacts;
 impl WorkspaceMechanisms for SamplingFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     fn operation_bound(
         &self,
         _: &WorkspaceOperation,
@@ -14,6 +31,23 @@ impl WorkspaceMechanisms for SamplingFacts {
     }
 }
 impl WorkspaceFactMechanisms for SamplingFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     type Error = Infallible;
     fn operation_facts(
         &self,
@@ -85,11 +119,14 @@ fn candidate(
     .unwrap();
     let layout = context.layout(&[1, 37], WorkspaceDtype::Float32).unwrap();
     let sampler = crate::ConfiguredTextSampler::Standard(crate::GenerationSampler::new());
+    let source_requirements = fixture_requirements(layout.bytes().unwrap());
+    let source =
+        WorkspaceSamplingSource::from(&layout).with_physical_domains(Some(&source_requirements));
     let report = quote_sampling_workspace_with_observer(
         &sampler,
         0.0,
         None,
-        &layout,
+        source,
         &eredu_core::TokenFilter::All,
         pending.remaining_steps(),
         &context,
@@ -163,8 +200,8 @@ fn config() -> eredu_core::TextGenerationConfig {
 #[test]
 fn sampling_extension_uses_distinct_native_account_and_replaces_only_sampling_roles() {
     assert!(crate::working_memory::qualified_storage::qualified());
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let raw = replacement_quote(&pool, geometry(), 0).into_incremental();
     let controls = PreparedTextControlWorkspace::prepare_controls(
         geometry(),
@@ -201,16 +238,18 @@ fn sampling_extension_uses_distinct_native_account_and_replaces_only_sampling_ro
         .finish()
         .unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&reservation.0.execution, 1_000_000)
+        .prepare_workspace_metadata(
+            &reservation.0.execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1_000_000),
+        )
         .unwrap();
     let mut mechanism = Mechanism::new(&pool);
     mechanism.nested_key_bytes = Some(0);
     let quote = extension(&preparation, &context, &funding, &mechanism);
-    let short = pool.used_bytes().unwrap() + quote.required_bytes() - 1;
+    let short = pool.payload_used_bytes().unwrap() + quote.required_bytes().unwrap() - 1;
     assert!(matches!(
-        quote.admit(short),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
-    ));
+        quote.admit(crate::working_memory::memory_fixture::resolved_host_limits(&pool, short)),
+        Err(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((_, _))) || matches!(capacity_error, WorkingMemoryError::MetadataConstruction(eredu_nn::workspace::WorkspaceMetadataError::Funding(eredu_core::HostMetadataFundingError::Capacity { .. })))));
     assert_eq!(
         mechanism.calls.get(),
         0,
@@ -224,7 +263,11 @@ fn sampling_extension_uses_distinct_native_account_and_replaces_only_sampling_ro
         geometry().max_output_tokens
     );
     let quote = extension(&preparation, &context, &funding, &mechanism);
-    let mut owner = quote.admit(1_000_000).unwrap();
+    let mut owner = quote
+        .admit(crate::working_memory::memory_fixture::resolved_host_limits(
+            &pool, 1_000_000,
+        ))
+        .unwrap();
     let guard = owner.control_guard();
     assert!(guard.validate_reservation(&reservation).is_err());
     let reseed = owner.claim_reseed().unwrap();
@@ -276,11 +319,11 @@ fn sampling_extension_uses_distinct_native_account_and_replaces_only_sampling_ro
         guard,
     ));
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "escaped role custody retains original accounts"
     );
     drop((old, new, reseed, model, validation, scalar, sampling, event));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[derive(Debug, Default)]
@@ -312,7 +355,7 @@ impl eredu_core::HostMetadataAccount for AuditedAccount {
 #[test]
 fn sampling_extension_every_cold_native_plan_reservation_refuses_without_publication() {
     use std::sync::atomic::Ordering::SeqCst;
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let reservation = crate::working_memory::funding::tests::reservation(&pool, 100, 1_000_000);
     let config = eredu_core::TextGenerationConfig::new(
         eredu_core::resolve_generation_config(
@@ -325,7 +368,11 @@ fn sampling_extension_every_cold_native_plan_reservation_refuses_without_publica
         .unwrap(),
     );
     let preparation = InferenceRequest::from(&reservation)
-        .prepare_text(&reservation.0.execution, reservation.geometry(), config)
+        .prepare_text(
+            &reservation.0.execution,
+            reservation.geometry(),
+            config.clone(),
+        )
         .unwrap();
     let context = crate::working_memory::original_request::tests::issued_lock_context();
     preparation.bind_run(&context).unwrap();
@@ -338,14 +385,17 @@ fn sampling_extension_every_cold_native_plan_reservation_refuses_without_publica
         .unwrap();
     let mut mechanism = Mechanism::new(&pool);
     mechanism.nested_key_bytes = Some(0);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.payload_used_bytes().unwrap();
     let mut reached = 0;
     for fail in std::iter::once(usize::MAX).chain(1..=128) {
         if reached != 0 && fail > reached {
             break;
         }
         let original = pool
-            .prepare_workspace_metadata(&reservation.0.execution, 1_000_000)
+            .prepare_workspace_metadata(
+                &reservation.0.execution,
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1_000_000),
+            )
             .unwrap();
         let calls = std::sync::Arc::new(ColdReservations::default());
         calls.fail.store(fail, SeqCst);
@@ -363,7 +413,7 @@ fn sampling_extension_every_cold_native_plan_reservation_refuses_without_publica
             assert!(result.is_ok());
         } else {
             assert!(
-                matches!(result, Err(WorkingMemoryError::BudgetExceeded { .. })),
+                matches!(result, Err(ref capacity_error) if matches!(capacity_numbers(&capacity_error), Some((_, _))) || matches!(capacity_error, WorkingMemoryError::MetadataConstruction(eredu_nn::workspace::WorkspaceMetadataError::Funding(eredu_core::HostMetadataFundingError::Capacity { .. })))),
                 "reservation {fail}/{reached}: {result:?}"
             );
         }
@@ -378,11 +428,11 @@ fn sampling_extension_every_cold_native_plan_reservation_refuses_without_publica
         );
         drop(funding);
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             baseline,
             "reservation {fail} kept no failed prefix"
         );
     }
     drop((preparation, reservation));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

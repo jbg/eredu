@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 #[derive(Debug)]
 struct Payload {
@@ -34,7 +34,7 @@ impl Drop for Resource {
 struct PrefixFailure(Resource);
 #[derive(Debug)]
 struct Constructor {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
     fail: bool,
@@ -55,7 +55,7 @@ impl SharedNativeInitializer for Constructor {
         custody: SharedNativeInitializationCustody,
     ) -> Result<Resource, PrefixFailure> {
         // This public query locks Usage. Completion verifies callback unlocking.
-        assert!(self.pool.used_bytes().unwrap() > 0);
+        assert!(self.pool.payload_used_bytes().unwrap() > 0);
         self.calls.fetch_add(1, Ordering::SeqCst);
         let resource = Resource(Some(Arc::new(Payload {
             values: Box::new([11, 37, 91]),
@@ -69,7 +69,7 @@ impl SharedNativeInitializer for Constructor {
         }
     }
 }
-fn constructor(pool: &WorkingMemoryPool, fail: bool) -> Constructor {
+fn constructor(pool: &MemoryLedger, fail: bool) -> Constructor {
     Constructor {
         pool: pool.clone(),
         calls: Arc::new(AtomicUsize::new(0)),
@@ -78,9 +78,9 @@ fn constructor(pool: &WorkingMemoryPool, fail: bool) -> Constructor {
     }
 }
 fn requirement() -> Option<u64> {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let plan = constructor(&pool, false);
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(&plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(&plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -103,18 +103,20 @@ fn shared_initializer_exact_compare_precedes_constructor_and_preserves_alias_cus
     let Some(bytes) = requirement() else {
         return;
     };
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     let plan = constructor(&short, false);
     let calls = plan.calls.clone();
     let error = short.initialize_shared_native(plan).unwrap_err();
     assert!(matches!(
         error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert!(error.rejected_plan().is_some());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let plan = constructor(&pool, false);
     let calls = plan.calls.clone();
     let drops = plan.drops.clone();
@@ -129,18 +131,18 @@ fn shared_initializer_exact_compare_precedes_constructor_and_preserves_alias_cus
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop(completed);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(alias);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn shared_initializer_failed_prefix_retains_exact_debit_until_storage_retirement() {
     let Some(bytes) = requirement() else {
         return;
     };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let plan = constructor(&pool, true);
     let calls = plan.calls.clone();
     let drops = plan.drops.clone();
@@ -149,15 +151,17 @@ fn shared_initializer_failed_prefix_retains_exact_debit_until_storage_retirement
     assert!(error.accounting_failure().is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(error);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn mapped_constructor_error_retires_prefix_before_releasing_original_account() {
-    let Some(bytes) = requirement() else { return; };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let Some(bytes) = requirement() else {
+        return;
+    };
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let plan = constructor(&pool, true);
     let drops = plan.drops.clone();
     let error = pool.initialize_shared_native(plan).unwrap_err();
@@ -165,20 +169,26 @@ fn mapped_constructor_error_retires_prefix_before_releasing_original_account() {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(prefix);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         std::io::Error::other("native construction refused")
     });
     assert!(diagnostic.completed_output().is_none());
-    assert!(std::error::Error::source(&diagnostic).unwrap().is::<std::io::Error>());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert!(
+        std::error::Error::source(&diagnostic)
+            .unwrap()
+            .is::<std::io::Error>()
+    );
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(diagnostic);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn mapped_settlement_error_retires_output_but_retains_its_account() {
-    let Some(bytes) = requirement() else { return; };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let Some(bytes) = requirement() else {
+        return;
+    };
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let plan = constructor(&pool, false);
     let drops = plan.drops.clone();
     let InitializedSharedNative { output, account } = pool.initialize_shared_native(plan).unwrap();
@@ -188,22 +198,26 @@ fn mapped_settlement_error_retires_output_but_retains_its_account() {
         output: Some(output),
         account: Some(account),
     };
-    let diagnostic = failure.retire_output_and_map_error(|never| -> std::convert::Infallible { match never {} });
+    let diagnostic =
+        failure.retire_output_and_map_error(|never| -> std::convert::Infallible { match never {} });
     fn transferable<T: Send + Sync>(_: &T) {}
     transferable(&diagnostic);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert!(diagnostic.completed_output().is_none());
-    assert!(matches!(diagnostic.accounting_failure(), Some(WorkingMemoryError::IdentityMismatch)));
+    assert!(matches!(
+        diagnostic.accounting_failure(),
+        Some(WorkingMemoryError::IdentityMismatch)
+    ));
     drop(diagnostic);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn shared_initializer_keeps_existing_unquoted_exclusion() {
     let Some(bytes) = requirement() else {
         return;
     };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let ordinary = pool.acquire_unquoted().unwrap();
     let plan = constructor(&pool, false);
     let calls = plan.calls.clone();
@@ -213,14 +227,14 @@ fn shared_initializer_keeps_existing_unquoted_exclusion() {
         Some(WorkingMemoryError::UnknownBound)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(error);
     drop(ordinary);
     let completed = pool
         .initialize_shared_native(constructor(&pool, false))
         .unwrap();
     drop(completed);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 struct BorrowedConstructor<'a> {
@@ -256,7 +270,7 @@ impl SharedNativeInitializer for BorrowedConstructor<'_> {
 #[test]
 fn splitting_rejection_returns_the_uncalled_borrowed_plan_and_exact_cause() {
     let Some(_) = requirement() else { return };
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(0, 0).unwrap();
     let prerequisite = 37;
     let inner = constructor(&pool, false);
     let calls = inner.calls.clone();
@@ -265,7 +279,7 @@ fn splitting_rejection_returns_the_uncalled_borrowed_plan_and_exact_cause() {
         prerequisite: &prerequisite,
         poison_settlement: false,
     };
-    let required = WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
+    let required = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
     let (plan, failure) = pool
         .initialize_shared_native(plan)
         .unwrap_err()
@@ -274,25 +288,25 @@ fn splitting_rejection_returns_the_uncalled_borrowed_plan_and_exact_cause() {
     assert!(std::ptr::eq(plan.prerequisite, &prerequisite));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(
-        matches!(failure.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded {
-        required_bytes, available_bytes: 0,
-    }) if *required_bytes == required)
+        matches!(failure.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == required && limit_bytes - existing_bytes == 0)
     );
-    assert!(std::error::Error::source(&failure)
-        .unwrap()
-        .downcast_ref::<WorkingMemoryError>()
-        .is_some());
+    assert!(
+        std::error::Error::source(&failure)
+            .unwrap()
+            .downcast_ref::<WorkingMemoryError>()
+            .is_some()
+    );
     assert!(failure.constructor_failure().is_none());
     assert!(failure.completed_output().is_none());
     drop(plan);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn owned_failure_outlives_plan_borrows_and_preserves_prefix_and_alias_account() {
     let Some(_) = requirement() else { return };
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
     let (failure, required) = {
         let prerequisite = 37;
@@ -303,8 +317,7 @@ fn owned_failure_outlives_plan_borrows_and_preserves_prefix_and_alias_account() 
             prerequisite: &prerequisite,
             poison_settlement: false,
         };
-        let required =
-            WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
+        let required = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
         let (plan, failure) = pool
             .initialize_shared_native(plan)
             .unwrap_err()
@@ -318,15 +331,15 @@ fn owned_failure_outlives_plan_borrows_and_preserves_prefix_and_alias_account() 
         .unwrap()
         .downcast_ref::<PrefixFailure>()
         .unwrap();
-    assert_eq!(*cause.0 .0.as_ref().unwrap().values, [11, 37, 91]);
+    assert_eq!(*cause.0.0.as_ref().unwrap().values, [11, 37, 91]);
     let alias = cause.0.share();
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -334,7 +347,7 @@ fn owned_failure_outlives_plan_borrows_and_preserves_prefix_and_alias_account() 
 fn splitting_settlement_failure_retains_completed_output_or_failed_prefix() {
     let Some(_) = requirement() else { return };
     for fail in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let (failure, required) = {
             let prerequisite = 37;
@@ -346,7 +359,7 @@ fn splitting_settlement_failure_retains_completed_output_or_failed_prefix() {
                 poison_settlement: true,
             };
             let required =
-                WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
+                MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
             let (plan, failure) = pool
                 .initialize_shared_native(plan)
                 .unwrap_err()
@@ -376,11 +389,11 @@ fn splitting_settlement_failure_retains_completed_output_or_failed_prefix() {
         };
         let alias = resource.share();
         drop(failure);
-        assert_eq!(pool.used_bytes().unwrap(), required);
+        assert_eq!(pool.payload_used_bytes().unwrap(), required);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(alias);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
     }
 }

@@ -1,12 +1,14 @@
 //! Real core options constructors. Requires the combined original admission,
 //! installed owner, permitted execution and completion-first shared drain hooks.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::observation::TensorObservationData;
 use eredu_core::{
     ControlledTextGeneration, GenerationCancellationToken, TextGeneration, TextPreparationOptions,
 };
 
-fn load(stream: &Stream, pool: &WorkingMemoryPool, route: usize) -> (Runtime, tempfile::TempDir) {
+fn load(stream: &Stream, pool: &MemoryLedger, route: usize) -> (Runtime, tempfile::TempDir) {
     match route {
         0 => host::runtime(stream, pool, None),
         1 => host::runtime(stream, pool, Some(1)),
@@ -16,7 +18,8 @@ fn load(stream: &Stream, pool: &WorkingMemoryPool, route: usize) -> (Runtime, te
 }
 fn options(source: &SharedCapturePlan) -> TextPreparationOptions {
     TextPreparationOptions {
-        interventions: None, capture: Some(source.clone()),
+        interventions: None,
+        capture: Some(source.clone()),
     }
 }
 fn shared(delivery: SharedCapturedStep) -> SharedCapturedStep {
@@ -143,7 +146,7 @@ fn observed(
 #[test]
 fn options_capture_resident_host_and_disk_match_ordinary_controlled_and_unobserved_outputs() {
     let stream = stream();
-    let reference_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let reference_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut reference, _reference_artifact) = load(&stream, &reference_pool, 0);
     let outputs = disk::outputs(
         &mut reference,
@@ -158,7 +161,7 @@ fn options_capture_resident_host_and_disk_match_ordinary_controlled_and_unobserv
     let mut reference_values: Option<Vec<Vec<f32>>> = None;
     for route in 0..3 {
         for controlled in [false, true] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let (mut runtime, _artifact) = load(&stream, &pool, route);
             let source = source(&runtime);
             let source_alias = source.clone();
@@ -191,7 +194,7 @@ fn options_capture_resident_host_and_disk_match_ordinary_controlled_and_unobserv
             let escaped = frames[1].clone();
             let pointer = escaped.records().as_ptr();
             drop(frames);
-            assert_eq!(pool.used_bytes().unwrap(), retained);
+            assert_eq!(pool.fixture_host_charge().unwrap(), retained);
             assert_eq!(escaped.records().as_ptr(), pointer);
             verify(&escaped, 1);
             drop(escaped);
@@ -205,10 +208,10 @@ fn options_capture_resident_host_and_disk_match_ordinary_controlled_and_unobserv
 #[test]
 fn options_exact_original_capacity_and_one_byte_short_reject_before_prompt_or_controller_work() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     // The first actual accepted source retains original P+Q+S+C. The second
     // candidate omits new C but must coexist with this entire original tail.
     let probe = CaptureFundingProbe::new(&source);
@@ -221,8 +224,11 @@ fn options_exact_original_capacity_and_one_byte_short_reject_before_prompt_or_co
         .unwrap()
         .request()
         .memory_reservation()
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
         .unwrap()
-        .bytes();
+        .total()
+        .unwrap();
     let c = source.capacity_bytes().unwrap();
     assert_eq!(original.reservation, required);
     assert_eq!(original.source, c);
@@ -237,7 +243,7 @@ fn options_exact_original_capacity_and_one_byte_short_reject_before_prompt_or_co
     let controller = disk::Controller::default();
     let native = paths::snapshot();
     let inputs = paths::session_input_creation_attempts();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let probe = CaptureFundingProbe::new(&source);
     let error = ControlledTextGeneration::new_with_options(
         &mut runtime,
@@ -250,12 +256,12 @@ fn options_exact_original_capacity_and_one_byte_short_reject_before_prompt_or_co
     .unwrap();
     assert!(matches!(
         cause::<WorkingMemoryError>(&error),
-        WorkingMemoryError::BudgetExceeded { .. }
+        WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
     ));
     assert_eq!(controller.0.get(), (0, 0));
     assert_eq!(paths::snapshot(), native);
     assert_eq!(paths::session_input_creation_attempts(), inputs);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     assert!(
         probe.is_empty(),
         "short admission cannot publish an accepted owner"
@@ -263,7 +269,7 @@ fn options_exact_original_capacity_and_one_byte_short_reject_before_prompt_or_co
     drop(probe);
     let (_, frames, second) = observed(&mut runtime, &source, true, exact);
     assert_eq!(second.reservation, second_required);
-    assert!(pool.peak_bytes().unwrap() <= exact);
+    assert!(pool.fixture_host_peak().unwrap() <= exact);
     drop(frames);
     finish_runtime(runtime, &stream);
     settle_terminal(&pool, original.source_tail());
@@ -275,7 +281,7 @@ fn options_exact_original_capacity_and_one_byte_short_reject_before_prompt_or_co
 fn empty_shared_plan_keeps_original_account_and_terminal_drain_across_multiple_predictions() {
     let stream = stream();
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
         let discovery = MlxBackend::capture_discovery(&runtime).unwrap();
         let source = SharedCapturePlan::new(
@@ -349,7 +355,7 @@ fn empty_shared_plan_keeps_original_account_and_terminal_drain_across_multiple_p
 fn undrained_shared_frame_blocks_work_and_initial_cancellation_emits_no_frame() {
     let stream = stream();
     for cancel in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
         let source = source(&runtime);
         let c = source.capacity_bytes().unwrap();

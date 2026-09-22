@@ -2,7 +2,7 @@ use super::*;
 use eredu_checkpoint::store::{
     ReadPolicy, SelectedGgufConversionPlan, TensorReadRequest, TensorSelection,
 };
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
 
 fn selected(
     path: &std::path::Path,
@@ -38,7 +38,7 @@ fn selected_inspection(
 fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity() {
     let directory = super::tests::gemma4_gguf_fixture();
     let path = directory.path().join("model.gguf");
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (plan, selection) = selected(&path);
     let result = prepare_model_sources_with_catalog_pool(plan, selection, &pool);
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG").is_some()
@@ -60,7 +60,7 @@ fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity(
                 Some(WorkingMemoryError::UnknownBound)
             ) =>
         {
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
             return;
         }
         Err(PreparedModelSourcesError::GgufSourceConstructor(error))
@@ -70,7 +70,7 @@ fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity(
             ) =>
         {
             drop(error); // The refused source still owns its admitted catalog.
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
             return;
         }
         Err(PreparedModelSourcesError::GgufCompositeConstructor(error))
@@ -80,24 +80,24 @@ fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity(
             ) =>
         {
             drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
             return;
         }
         Err(PreparedModelSourcesError::SourceErasure(error))
             if matches!(error.accounting_failure(), WorkingMemoryError::UnknownBound) =>
         {
             drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
             return;
         }
         Err(error) => panic!("unexpected actual source preparation outcome: {error:?}"),
     };
-    let total = pool.used_bytes().unwrap();
+    let total = crate::memory_fixture::used(&pool).unwrap();
     assert!(total > 0);
     let (plan, selection) = selected(&path);
     let ordinary = prepare_model_sources(plan, selection).unwrap();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        crate::memory_fixture::used(&pool).unwrap(),
         total,
         "ordinary sources receive no catalog promotion"
     );
@@ -124,8 +124,8 @@ fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity(
         assert_eq!(diagnostics.physical_read_bytes, 0);
         assert!(diagnostics.payload_shard_paths.is_empty());
     }
-    let leaf_bytes = WorkingMemoryPool::gguf_source_erasure_required_bytes().unwrap();
-    let union_bytes = WorkingMemoryPool::gguf_composite_erasure_required_bytes().unwrap();
+    let leaf_bytes = MemoryLedger::gguf_source_erasure_required_bytes().unwrap();
+    let union_bytes = MemoryLedger::gguf_composite_erasure_required_bytes().unwrap();
     let primary_identity = sources.primary().identity();
     let companion_identity = sources.companion(&role).unwrap().identity();
     let union_identity = sources.complete().identity();
@@ -174,36 +174,42 @@ fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity(
     .unwrap();
     drop(sources);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        crate::memory_fixture::used(&pool).unwrap(),
         total,
         "complete route retains actual union and both sources"
     );
     drop(complete_route);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        crate::memory_fixture::used(&pool).unwrap() > 0,
         "the retained built-in route owns the primary catalog"
     );
     assert!(
-        pool.used_bytes().unwrap() < total,
+        crate::memory_fixture::used(&pool).unwrap() < total,
         "the independent companion catalog has retired"
     );
     drop(retained);
-    assert_eq!(pool.used_bytes().unwrap(), 2 * leaf_bytes + union_bytes);
+    assert_eq!(
+        crate::memory_fixture::used(&pool).unwrap(),
+        2 * leaf_bytes + union_bytes
+    );
     drop(primary_identity);
-    assert_eq!(pool.used_bytes().unwrap(), leaf_bytes + union_bytes);
+    assert_eq!(
+        crate::memory_fixture::used(&pool).unwrap(),
+        leaf_bytes + union_bytes
+    );
     drop(companion_identity);
-    assert_eq!(pool.used_bytes().unwrap(), union_bytes);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), union_bytes);
     drop(union_identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
     drop(ordinary);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }
 
 #[test]
 fn admitted_safetensors_inspection_reaches_selected_source_graph_without_rediscovery() {
     use eredu_checkpoint::store::EncodedTensorLease;
     use eredu_runtime::working_memory::DependencyMemoryPolicy;
-    let qualification = WorkingMemoryPool::safetensors_source_erasure_required_bytes();
+    let qualification = MemoryLedger::safetensors_source_erasure_required_bytes();
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE").is_some() {
         assert!(qualification.is_ok(), "{qualification:?}");
     }
@@ -222,7 +228,7 @@ fn admitted_safetensors_inspection_reaches_selected_source_graph_without_redisco
     std::fs::write(&path, bytes).unwrap();
     // This integration uses default metadata headroom for both inspection and
     // pinned views. Exact/one-byte-short view budgets are covered in runtime.
-    let pool = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(8_000_000, 0).unwrap();
     let (ordinary_plan, ordinary_selection) = selected(directory.path());
     let error = prepare_model_sources_with_catalog_pool(ordinary_plan, ordinary_selection, &pool)
         .err()
@@ -232,7 +238,7 @@ fn admitted_safetensors_inspection_reaches_selected_source_graph_without_redisco
         PreparedModelSourcesError::SafetensorsConstructor(_)
     ));
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
     let inspection = pool
         .inspect_artifact_with_safetensors_pool(
             directory.path(),
@@ -278,15 +284,15 @@ fn admitted_safetensors_inspection_reaches_selected_source_graph_without_redisco
     let identity = sources.primary().identity();
     drop(sources);
     drop(ordinary);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(crate::memory_fixture::used(&pool).unwrap() > 0);
     drop(identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }
 
 #[test]
 fn loading_preparation_uses_actual_inspection_admission_and_preserves_ordinary_inputs() {
     let (dir, ordinary_inspection) = crate::preparation_selection::tests::inspected_llama();
-    let quote = WorkingMemoryPool::safetensors_source_erasure_required_bytes();
+    let quote = MemoryLedger::safetensors_source_erasure_required_bytes();
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE").is_some() {
         assert!(quote.is_ok(), "{quote:?}");
     }
@@ -294,14 +300,14 @@ fn loading_preparation_uses_actual_inspection_admission_and_preserves_ordinary_i
         return;
     }
     quote.unwrap();
-    let pool = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(8_000_000, 0).unwrap();
     let (plan, selected) = selected_inspection(ordinary_inspection);
     let ordinary = prepare_model_sources_with_inspection_admission(plan, selected, &pool).unwrap();
     assert!(matches!(
         pool.validate_retained_source_controls(ordinary.primary()),
         Err(WorkingMemoryError::UnknownBound)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
     let inspection = pool
         .inspect_artifact_for_loading(
             dir.path(),
@@ -310,7 +316,7 @@ fn loading_preparation_uses_actual_inspection_admission_and_preserves_ordinary_i
             Default::default(),
         )
         .unwrap();
-    let foreign = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(8_000_000, 0).unwrap();
     let (plan, selected) = selected_inspection(inspection.clone());
     assert!(matches!(
         prepare_model_sources_with_inspection_admission(plan, selected, &foreign),
@@ -318,7 +324,7 @@ fn loading_preparation_uses_actual_inspection_admission_and_preserves_ordinary_i
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&foreign).unwrap(), 0);
     let (plan, selected) = selected_inspection(inspection);
     std::fs::remove_file(dir.path().join("config.json")).unwrap();
     let admitted = prepare_model_sources_with_inspection_admission(plan, selected, &pool).unwrap();
@@ -328,5 +334,5 @@ fn loading_preparation_uses_actual_inspection_admission_and_preserves_ordinary_i
     assert_eq!(admitted.resolutions(), ordinary.resolutions());
     drop(admitted);
     drop(ordinary);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }

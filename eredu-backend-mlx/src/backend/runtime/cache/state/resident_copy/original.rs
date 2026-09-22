@@ -9,7 +9,8 @@ use crate::backend::{
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::{
-    WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPlan, HostMetadataFunding,
+    HostMetadataFunding, WorkspaceContext, WorkspaceCopyPreparationLayoutBuilder,
+    WorkspaceIsolatedCopyPlan,
 };
 use eredu_runtime::working_memory::{
     OriginalStorageSourcesLayout, RegisteredWorkspaceCopy, RegisteredWorkspaceStorageLayout,
@@ -124,7 +125,7 @@ pub(crate) fn copy(
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
 ) -> Result<OriginalResidentState, Error> {
     copy_with_source(
         source,
@@ -146,12 +147,16 @@ pub(crate) fn copy_with_source(
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
 ) -> Result<OriginalResidentState, Error> {
     // Pay the enclosing typed source before any operation can fail with an
     // allocated diagnostic. A refusal here remains an inline funding failure.
     let frames = [
         size_of::<PreparedResidentDecoderCopy<'_>>(),
+        size_of::<Option<&super::super::MlxKeyValueState>>(),
+        size_of::<WorkspaceContext>(),
+        size_of::<Result<WorkspaceContext, eredu_nn::workspace::WorkspaceMetadataError>>(),
+        size_of::<Result<Option<super::super::MlxKeyValueState>, Error>>(),
         size_of::<Option<&CompletedResidentSource>>(),
         size_of::<Result<OriginalResidentState, Error>>(),
         size_of::<OriginalResidentState>(),
@@ -218,13 +223,47 @@ fn copy_inner(
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
     host: &HostPreparationAuthority,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
     stage: &Cell<&'static str>,
     source_rows: &Cell<Option<source::BindingRows>>,
 ) -> Result<OriginalResidentState, Error> {
-    // Paged independent state copies have their own existing exact source
-    // hook. Reject this H-only resident table path before opening a native
-    // scope or attempting source cloning under a paged manager loan.
+    if let Some(live) = source.live_paged_key_value() {
+        stage.set("live paged source copy");
+        let context = WorkspaceContext::new_with_metadata_funding(mechanisms, funding.clone())
+            .map_err(|cause| paid(funding, cause))?;
+        return live
+            .copy_original_paged(
+                completed,
+                environment,
+                initialized,
+                mechanisms,
+                &context,
+                host,
+                capacity,
+            )?
+            .map(OriginalResidentState::KeyValue)
+            .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch));
+    }
+    if let PreparedStorage::HybridGrouped(plan) = &source.storage {
+        if plan.is_paged() {
+            stage.set("grouped paged source copy");
+            let context = WorkspaceContext::new_with_metadata_funding(mechanisms, funding.clone())
+                .map_err(|cause| paid(funding, cause))?;
+            return plan
+                .copy_original_paged(
+                    completed,
+                    environment,
+                    initialized,
+                    mechanisms,
+                    &context,
+                    host,
+                    capacity,
+                )
+                .map(OriginalResidentState::Hybrid);
+        }
+    }
+    // Saved KV tables need their exact independent manager constructor. They
+    // cannot enter the H-only resident table worker below.
     if source.is_paged() {
         return Err(memory(WorkingMemoryError::UnknownBound));
     }
@@ -311,8 +350,15 @@ fn copy_inner(
     let projected = projection.construct(mechanisms, host)?;
     stage.set("completed source binding");
     let binding = source::bind(
-        &projected, completed, environment, funding, host,
-        source::BindingDiagnostics { stage, rows: source_rows },
+        &projected,
+        completed,
+        environment,
+        funding,
+        host,
+        source::BindingDiagnostics {
+            stage,
+            rows: source_rows,
+        },
     )?;
     stage.set("isolated copy program");
     let program = WorkspaceIsolatedCopyPlan::prepare_finite_with_layout(
@@ -325,14 +371,64 @@ fn copy_inner(
     .map_err(|cause| paid(funding, cause))?
     .construct()
     .map_err(|cause| paid(funding, cause))?;
+    let topology = environment.pool().topology();
+    let descriptor_bytes =
+        eredu_core::DomainMemoryRequirements::construction_backing_bytes(topology, 0)
+            .and_then(|bytes| {
+                bytes
+                    .checked_add(
+                        std::mem::size_of::<eredu_core::DomainMemoryRequirements>() as u64
+                            + 2 * std::mem::size_of::<usize>() as u64,
+                    )
+                    .ok_or(eredu_core::MemoryDomainError::Overflow)
+            })
+            .and_then(|bytes| {
+                capacity
+                    .named_initialization_bytes(topology)?
+                    .checked_add(bytes)
+                    .ok_or(eredu_core::MemoryDomainError::Overflow)
+            })
+            .map_err(|cause| paid(funding, cause))?;
+    reserve(
+        funding,
+        usize::try_from(descriptor_bytes).map_err(|_| memory(WorkingMemoryError::Overflow))?,
+    )?;
     let numerical = program
-        .incremental_bytes()
-        .ok_or_else(|| memory(WorkingMemoryError::UnknownBound))?;
-    let mut limits = WorkspaceCopyLimits::new(capacity);
-    limits.safety_reserve_bytes = native
+        .report()
+        .physical_domains
         .as_ref()
-        .map_or(0, |plan| plan.physical_bytes() as u64)
-        .saturating_sub(numerical);
+        .map(|domains| &domains.native_allocations)
+        .ok_or_else(|| memory(WorkingMemoryError::UnknownBound))?;
+    let mut delta = eredu_core::DomainMemoryRequirements::zero(topology);
+    if let Some(plan) = native.as_ref() {
+        let domain = plan
+            .physical_domain()
+            .map_err(|cause| paid(funding, cause))?;
+        let admitted = numerical
+            .get(domain)
+            .and_then(|charge| charge.total())
+            .map_err(|cause| paid(funding, cause))?;
+        let required = u64::try_from(plan.physical_bytes())
+            .map_err(|_| memory(WorkingMemoryError::Overflow))?;
+        let extra = if required > admitted {
+            required - admitted
+        } else {
+            0
+        };
+        delta
+            .add_allocation(
+                extra,
+                &eredu_core::MemoryPlacement::fixed(topology, domain)
+                    .map_err(|cause| paid(funding, cause))?,
+            )
+            .map_err(|cause| paid(funding, cause))?;
+    }
+    let mut limits = WorkspaceCopyLimits::new(
+        capacity
+            .named(topology)
+            .map_err(|cause| paid(funding, cause))?,
+    );
+    limits.additional_requirements = Some(std::sync::Arc::new(delta));
     stage.set("copy admission");
     let account = binding.admit(program, environment, limits, funding)?;
     let (custody, scope) = account.into_parts();

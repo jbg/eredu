@@ -5,12 +5,18 @@ use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ToolCause {
-    #[error(transparent)] Tagged(channels::tagged::TaggedCallError<BackendFailure>),
-    #[error(transparent)] TaggedSyntax(channels::tagged::TaggedError),
-    #[error(transparent)] Text(eredu_core::SemanticTextAllocationError),
-    #[error(transparent)] Schema(BackendFailure),
-    #[error("incomplete tagged-parameter tool call")] Incomplete,
-    #[error("original tool call event destination is full")] Capacity,
+    #[error(transparent)]
+    Tagged(channels::tagged::TaggedCallError<BackendFailure>),
+    #[error(transparent)]
+    TaggedSyntax(channels::tagged::TaggedError),
+    #[error(transparent)]
+    Text(eredu_core::SemanticTextAllocationError),
+    #[error(transparent)]
+    Schema(BackendFailure),
+    #[error("incomplete tagged-parameter tool call")]
+    Incomplete,
+    #[error("original tool call event destination is full")]
+    Capacity,
     #[error(transparent)]
     Funding(#[from] eredu_nn::workspace::HostMetadataFundingError),
     #[error(transparent)]
@@ -161,9 +167,11 @@ impl OriginalSemanticChannelParser {
             let Some(validation) = self.source.tool_validation().cloned() else {
                 return Err(self.tool_failure(ToolCause::Source));
             };
-            let controls = validation.failure_control_bytes()
+            let controls = validation
+                .failure_control_bytes()
                 .ok_or_else(|| self.tool_failure(ToolCause::Overflow))?;
-            self.funding.reserve_metadata(controls)
+            self.funding
+                .reserve_metadata(controls)
                 .map_err(|cause| self.tool_failure(cause.into()))?;
             let Some(call) = self.call.take() else {
                 return Err(self.tool_failure(ToolCause::Source));

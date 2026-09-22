@@ -23,11 +23,13 @@ pub(super) fn inspect(
         .max(intermediate_rank);
     use WorkspaceOperationKindView as K;
     if matches!(operation.kind, K::GeneratedF32Initialization) {
-        let source=super::super::basic::generated_f32_plan_view(operation).ok()?;
+        let source = super::super::basic::generated_f32_plan_view(operation).ok()?;
         return Some(Profile {
-            worker_rank:rank,extra_extents:0,
-            controls:source.worker_control_bytes::<crate::MlxTensor>()?
-                .checked_add(std::mem::size_of::<(&[f32],&[i32],&safemlx::Stream)>())?,
+            worker_rank: rank,
+            extra_extents: 0,
+            controls: source
+                .worker_control_bytes::<crate::MlxTensor>()?
+                .checked_add(std::mem::size_of::<(&[f32], &[i32], &safemlx::Stream)>())?,
         });
     }
     if matches!(operation.kind, K::Convolution { .. }) {
@@ -79,12 +81,17 @@ pub(super) fn inspect(
             controls,
         });
     }
-    if let K::View(name)=operation.kind {
-        if super::super::byte_view::selected(name).is_some(){
+    if let K::View(name) = operation.kind {
+        if super::super::byte_view::selected(name).is_some() {
             super::super::byte_view::inspect(operation)?;
-            let source=safemlx::ops::OriginalCopyWorkerLayout::inspect_byte_view(rank)?;
-            return Some(Profile{worker_rank:0,extra_extents:source.allocation_extents(),
-                controls:source.control_bytes()?.checked_add(safemlx::Array::view_dtype_control_bytes()?)?});
+            let source = safemlx::ops::OriginalCopyWorkerLayout::inspect_byte_view(rank)?;
+            return Some(Profile {
+                worker_rank: 0,
+                extra_extents: source.allocation_extents(),
+                controls: source
+                    .control_bytes()?
+                    .checked_add(safemlx::Array::view_dtype_control_bytes()?)?,
+            });
         }
     }
     if matches!(operation.kind, K::CastFloating(_)) {

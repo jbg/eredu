@@ -46,6 +46,7 @@ pub(super) struct ParameterRow {
     /// Actual full replacement descriptor and its selected original row.
     replacement: Option<(WorkspaceLayout, usize)>,
     pub(super) slice: Option<SpeculativeNumericalRecipe>,
+    pub(super) ordinary_slice_calls: Option<OrdinaryCallControls>,
 }
 pub(super) struct ParameterRows {
     pub(super) identity: IndexedBindingIdentity,
@@ -134,6 +135,7 @@ impl ParameterRows {
                                 .with_representation(row.representation),
                             replacement: None,
                             slice: None,
+                            ordinary_slice_calls: None,
                         },
                         IndexedBindingStorage::Replacement { value, row } => {
                             // Descriptor projection performs no native tensor work.
@@ -154,6 +156,7 @@ impl ParameterRows {
                                 )?,
                                 replacement: Some((layout, row)),
                                 slice: None,
+                                ordinary_slice_calls: None,
                             }
                         }
                     };
@@ -189,6 +192,7 @@ impl ParameterRows {
                     .layout(value.shape(), value.layout().dtype())?
                     .with_representation(value.layout().representation());
                 let report = slice_context.finish_report(&[value])?;
+                row.ordinary_slice_calls = super::quote::ordinary_report_calls(mechanism, &report)?;
                 row.slice = Some(SpeculativeNumericalRecipe::inspect_owned_child(
                     &report,
                     1,

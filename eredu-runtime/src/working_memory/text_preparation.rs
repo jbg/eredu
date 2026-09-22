@@ -11,8 +11,11 @@ use std::sync::Arc;
 
 mod no_decoder;
 mod run;
-pub use run::{InferenceTextStep, InferenceTextStepReceipt, PendingSamplingExtension, PendingTextBranchExchange};
 pub(in crate::working_memory) use run::SamplingExtensionBinding;
+pub use run::{
+    InferenceTextStep, InferenceTextStepReceipt, PendingSamplingExtension,
+    PendingTextBranchExchange,
+};
 
 #[derive(Debug)]
 pub(super) enum RequestStart {
@@ -259,10 +262,7 @@ impl InferencePreparationStage {
                 return Err(WorkingMemoryError::PreparationNotReady);
             }
         }
-        self.request
-            .memory_reservation()
-            .cloned()
-            .ok_or(WorkingMemoryError::UnknownBound)
+        Ok(self.request.memory_reservation().clone())
     }
 
     /// Constructs the exact canonical sampler under a distinct host-only scope
@@ -316,13 +316,10 @@ impl InferencePreparationStage {
                 return Err(WorkingMemoryError::PreparationNotReady);
             }
         }
-        let reservation = self
-            .request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::UnknownBound)?;
+        let reservation = self.request.memory_reservation();
         let execution = host_scope.validate_stage(reservation)?;
         Ok((
-            authority.config,
+            authority.config.clone(),
             self.request.geometry().max_output_tokens,
             execution,
         ))

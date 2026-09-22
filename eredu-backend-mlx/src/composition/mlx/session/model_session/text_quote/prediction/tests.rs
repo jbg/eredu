@@ -3,6 +3,8 @@ use super::*;
 use crate::backend::submission_recovery::prediction::PredictionRole as OriginalPredictionScopeRole;
 use crate::backend::submission_recovery::prediction::test_counts::Calls;
 use crate::backend::submission_recovery::{self, Retention, Status};
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     ControlledTextGeneration, GenerationCancellationToken, GenerationSequenceRequest,
     PendingTextInput, TextGeneration, TextGenerationInput, TextPreparationOptions, TokenFilter,
@@ -20,7 +22,8 @@ fn options(
     source: Option<&eredu_core::capture::SharedCapturePlan>,
 ) -> Option<TextPreparationOptions> {
     source.map(|source| TextPreparationOptions {
-        interventions: None, capture: Some(source.clone()),
+        interventions: None,
+        capture: Some(source.clone()),
     })
 }
 fn with_foreign_runtime(f: impl FnOnce()) {
@@ -103,7 +106,7 @@ fn five_original_roles_follow_shared_ordinary_controlled_and_resident_host_disk_
                 continue;
             }
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                 let (mut runtime, _artifact) = fixture::load(&stream, &pool, residency);
                 let source = (mode >= 2).then(|| fixture::source(&runtime));
                 let probe = (mode != 0).then(|| Probe::new(&runtime, source.as_ref(), mode == 3));
@@ -236,9 +239,9 @@ fn five_original_roles_follow_shared_ordinary_controlled_and_resident_host_disk_
 }
 
 #[test]
-fn original_scalar_is_once_after_run_drop_copy_rejects_and_ordinary_copy_observes_fresh() {
+fn original_scalar_is_once_after_run_drop_and_unlimited_uses_the_same_owner() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     let calls = Calls::new();
@@ -267,25 +270,8 @@ fn original_scalar_is_once_after_run_drop_copy_rejects_and_ordinary_copy_observe
         assert_eq!(alias.token_id().unwrap(), id);
     }
     assert_eq!(calls.original(), [1; 5]);
-    // The escaped funded token still owns its original work. The public copy
-    // path must preserve that exclusion; dropping the run is not a copy grant.
-    let copy_error = match MlxBackend::copy_pending_input(
-        &mut runtime,
-        Some(PendingTextInput::Decode(&token)),
-    ) {
-        Err(error) => error,
-        Ok(_) => panic!("live original token must exclude unquoted copy"),
-    };
-    let Error::Other(cause) = &copy_error else {
-        panic!("exact original copy exclusion")
-    };
-    assert_eq!(
-        cause.downcast_ref::<WorkingMemoryError>(),
-        Some(&WorkingMemoryError::ReservedWorkActive)
-    );
     assert_eq!(calls.legacy()[4], 0);
     assert_eq!(calls.original(), [1; 5]);
-    drop(copy_error);
     assert!(matches!(
         token.owner.take_token_scalar_scope(),
         Err(Error::PredictionScopeUnavailable)
@@ -312,16 +298,12 @@ fn original_scalar_is_once_after_run_drop_copy_rejects_and_ordinary_copy_observe
     stream.synchronize().unwrap();
     submission_recovery::reap();
 
-    // A distinct real ordinary producer carries no original quote. Its existing
-    // unquoted copy path is eligible without weakening the rejection above.
-    let ordinary_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    // Unlimited requests retain the same admitted allocation and scalar scopes.
+    let ordinary_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut ordinary, _ordinary_artifact) = fixture::load(&stream, &ordinary_pool, 0);
     let calls = Calls::new();
     let config = TextGenerationConfig::new(fixture::config(4, u64::MAX).sampling()).with_seed(19);
-    assert_eq!(
-        config.inference_policy().managed_memory_capacity_bytes,
-        None
-    );
+    assert!(config.inference_policy().memory_limits.iter().len() == 0);
     let mut run = TextGeneration::new(&mut ordinary, vec![2, 5, 7], config).unwrap();
     let token = run.next().unwrap().unwrap();
     drop(run);
@@ -330,36 +312,20 @@ fn original_scalar_is_once_after_run_drop_copy_rejects_and_ordinary_copy_observe
     for _ in 0..3 {
         assert_eq!(alias.token_id().unwrap(), id);
     }
-    assert_eq!(calls.legacy()[4], 1);
-    assert_eq!(calls.original(), [0; 5]);
-    let copied =
-        MlxBackend::copy_pending_input(&mut ordinary, Some(PendingTextInput::Decode(&token)))
-            .unwrap()
-            .unwrap();
-    let PendingTextInput::Decode(copied) = copied else {
-        panic!("actual copied ordinary token")
-    };
-    assert_eq!(calls.legacy()[4], 1);
-    assert_eq!(copied.token_id().unwrap(), id);
-    assert_eq!(calls.legacy()[4], 2);
-    let copied_alias = copied.clone();
-    for _ in 0..3 {
-        assert_eq!(copied_alias.token_id().unwrap(), id);
-    }
-    assert_eq!(calls.legacy()[4], 2);
-    assert_eq!(calls.original(), [0; 5]);
-    drop((token, alias, copied, copied_alias, calls));
+    assert_eq!(calls.legacy()[4], 0);
+    assert_eq!(calls.original(), [1; 5]);
+    drop((token, alias, calls));
     fixture::finish(ordinary, &stream);
     fixture::settle(&ordinary_pool, 0);
 }
 
-fn isolated_event_role() -> (OriginalPredictionScopeRole, WorkingMemoryPool, u64) {
+fn isolated_event_role() -> (OriginalPredictionScopeRole, MemoryLedger, u64) {
     isolated_event_role_with_controls(false)
 }
 
 fn isolated_event_role_with_controls(
     quoted: bool,
-) -> (OriginalPredictionScopeRole, WorkingMemoryPool, u64) {
+) -> (OriginalPredictionScopeRole, MemoryLedger, u64) {
     isolated_roles_with_controls(quoted, |roles| {
         let role = roles.take_sampling_event().unwrap();
         assert!(roles.take_sampling_event().is_err());
@@ -370,9 +336,9 @@ fn isolated_event_role_with_controls(
 fn isolated_roles_with_controls<T>(
     quoted: bool,
     take: impl FnOnce(&mut crate::backend::submission_recovery::prediction::PredictionSet) -> T,
-) -> (T, WorkingMemoryPool, u64) {
+) -> (T, MemoryLedger, u64) {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     let run = TextGeneration::from_input_with_sequence(
@@ -433,15 +399,15 @@ fn prediction_native_and_recovery_custody_retire_independently_after_original_ru
     scope.seal();
     assert!(scope.status().is_settled());
     drop(recovery);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(scope);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         held,
         "unlocked queue still owns exact original charge"
     );
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 struct CustodyOnly {
@@ -497,16 +463,16 @@ fn busy_prediction_begin_keeps_never_started_recovery_custody_without_false_comp
         drop(error);
         safemlx::reclaim_allocation_owners();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             held,
             "Rust recovery queued without a native probe owns its own custody"
         );
         assert_eq!(observed.get(), 0);
     });
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     submission_recovery::reap();
     assert_eq!(observed.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -535,7 +501,7 @@ fn original_prediction_missing_quota_refuses_before_scope_and_error_keeps_real_c
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
     assert_eq!(observed.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(error);
     fixture::settle(&pool, 0);
 }
@@ -567,7 +533,7 @@ fn original_prediction_busy_setup_error_outlives_never_started_native_and_recove
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
     assert_eq!(observed.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(escaped);
     fixture::settle(&pool, 0);
 }
@@ -607,7 +573,7 @@ fn original_prediction_scoped_busy_cause_retains_carrier_after_scope_and_run_ret
     drop(observer);
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     assert_eq!(
         escaped.as_ref().unwrap().scoped_evaluation_cause(),
         Some(safemlx::error::ScopedEvaluationCause::RuntimeBusy)
@@ -690,7 +656,7 @@ fn original_sampling_event_completes_nonzero_token_and_optional_rng_after_role_s
             HOOK_CALLS.with(Cell::get) > 0,
             "ordinary read is the live hook control"
         );
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         drop((submitted, sibling, calls, runtime, hook_owner));
         fixture::settle(&pool, 0);
     }
@@ -720,7 +686,7 @@ fn original_sampling_busy_poll_and_guarded_drop_keep_cause_until_exact_nodes_ret
         assert!(!submitted.completion.resources_releasable());
         drop(submitted);
         assert_eq!(submission_recovery::test_node_unbox_count(), nodes);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         escaped = Some(error);
     });
     // First retire the inner Scope/resources; the SAME observed cleanup node
@@ -729,7 +695,7 @@ fn original_sampling_busy_poll_and_guarded_drop_keep_cause_until_exact_nodes_ret
         submission_recovery::test_node_unbox_count() >= nodes + 2
     });
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     assert_eq!(
         MlxCompletion::sampling_event_native_cause(escaped.as_ref().unwrap()),
         Some(safemlx::error::ScopedEvaluationCause::RuntimeBusy)
@@ -762,7 +728,7 @@ fn original_sampling_missing_arena_keeps_typed_setup_refusal_and_never_submits()
     );
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(error);
     fixture::settle(&pool, 0);
 }
@@ -816,7 +782,7 @@ fn original_sampling_prepared_foreign_stream_completes_nonzero_token() {
             .unwrap(),
         &[47]
     );
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(submitted);
     release.0.take().unwrap().send(()).unwrap();
     assert!(release.1.take().unwrap().join().unwrap());
@@ -852,7 +818,7 @@ fn original_sampling_unprepared_cpu_stream_refusal_keeps_exact_native_cause_and_
         submission_recovery::test_node_unbox_count() >= nodes + 2
     });
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(error);
     fixture::settle(&pool, 0);
     drop(stream);
@@ -862,7 +828,7 @@ fn original_sampling_unprepared_cpu_stream_refusal_keeps_exact_native_cause_and_
 fn cancellation_after_real_permit_uses_only_model_and_validation_roles() {
     let stream = fixture::stream();
     for after_permit in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
         let probe = Probe::new(&runtime, None, false);
         let calls = Calls::new();
@@ -924,7 +890,7 @@ fn original_prediction_custody_survives_scope_unwind_until_guarded_reclamation()
             },
         )
         .unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         std::panic::panic_any(marker);
     }))
     .unwrap_err();
@@ -936,7 +902,7 @@ fn original_prediction_custody_survives_scope_unwind_until_guarded_reclamation()
     // does not turn an unwind into successful model submission or certification.
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 // Real roles come from the genuine request/step/quote above. This small neutral
@@ -948,7 +914,7 @@ fn scalar_submission(
     MlxTextToken,
     crate::backend::MlxCompletion,
     SessionAuthority,
-    WorkingMemoryPool,
+    MemoryLedger,
     u64,
 ) {
     let ((event, scalar), pool, held) = isolated_roles_with_controls(true, |roles| {
@@ -1018,7 +984,7 @@ fn original_token_scalar_early_read_matches_explicit_wait_and_clones_replay_with
         assert_eq!(calls.legacy(), [0; 5]);
         completion.wait().unwrap();
         drop((completion, token));
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         with_foreign_runtime(|| {
             for _ in 0..3 {
                 assert_eq!(alias.token_id().unwrap(), 74);
@@ -1053,9 +1019,9 @@ fn original_token_scalar_keeps_producer_after_completion_drop_and_health_error_a
     drop((token, alias, runtime, authority));
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(second);
     fixture::settle(&pool, 0);
 }
@@ -1087,7 +1053,7 @@ fn original_token_scalar_busy_setup_is_once_and_escaped_error_retains_source_cus
         assert!(same_observation_source(&error, &repeated));
         assert_eq!(calls.original(), [0, 0, 0, 0, 1]);
         drop(completion);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         escaped = Some((error, repeated));
     });
     // Each token owns an ordinary Stream whose Drop acquires the runtime lock.
@@ -1096,7 +1062,7 @@ fn original_token_scalar_busy_setup_is_once_and_escaped_error_retains_source_cus
     drop((token, alias));
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop((runtime, authority, calls, escaped));
     fixture::settle(&pool, 0);
 }
@@ -1129,7 +1095,7 @@ fn original_token_scalar_rejects_wrong_shape_and_dtype_without_ordinary_conversi
         drop((token, completion, runtime, authority));
         submission_recovery::reap();
         safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         drop((error, repeated));
         fixture::settle(&pool, 0);
     }
@@ -1164,7 +1130,7 @@ fn original_sampling_repeated_public_busy_errors_share_cause_and_retire_after_la
     drop(runtime);
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(escaped);
     fixture::settle(&pool, 0);
 }
@@ -1191,7 +1157,7 @@ fn original_sampling_publication_keeps_old_busy_snapshot_and_new_native_source()
     drop((root, runtime));
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(errors);
     fixture::settle(&pool, 0);
 }
@@ -1220,7 +1186,7 @@ fn original_sampling_contract_failure_is_sticky_for_completion_and_escaped_sourc
     drop((submitted, runtime));
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop((first, subsequent));
     fixture::settle(&pool, 0);
 }
@@ -1249,7 +1215,7 @@ fn original_scalar_reentrant_and_interrupted_aliases_keep_fixed_sources_and_both
         drop((token, completion, runtime, authority, calls));
         submission_recovery::reap();
         safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.fixture_host_charge().unwrap(), held);
         drop(errors);
         fixture::settle(&pool, 0);
     }
@@ -1286,8 +1252,8 @@ fn original_sampling_conflicting_carrier_is_terminal_and_retains_first_offending
     drop((foreign, observer, submitted, runtime));
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
-    assert_eq!(foreign_pool.used_bytes().unwrap(), foreign_held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
+    assert_eq!(foreign_pool.fixture_host_charge().unwrap(), foreign_held);
     drop(errors);
     fixture::settle(&pool, 0);
     fixture::settle(&foreign_pool, 0);
@@ -1317,7 +1283,7 @@ fn original_scalar_cached_value_rejects_shared_sampling_contract_failure() {
     drop((token, completion, runtime, authority));
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop((failure, first, repeated));
     fixture::settle(&pool, 0);
 }

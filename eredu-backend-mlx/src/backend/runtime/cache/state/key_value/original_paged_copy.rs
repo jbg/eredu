@@ -1,8 +1,8 @@
 //! Same paid state slots and registered numerical worker for full paged copies.
 use super::*;
 use crate::backend::{
-    OriginalCopyEnvironment, error::Error, nn::workspace::MlxMetalWorkspaceMechanisms,
-    runtime::cache::state::CompletedResidentSource,
+    error::Error, nn::workspace::MlxMetalWorkspaceMechanisms,
+    runtime::cache::state::CompletedResidentSource, OriginalCopyEnvironment,
 };
 use eredu_core::HostPreparationAuthority;
 use eredu_nn::workspace::WorkspaceContext;
@@ -20,7 +20,7 @@ impl MlxKeyValueState {
         mechanisms: MlxMetalWorkspaceMechanisms,
         context: &WorkspaceContext,
         host: &HostPreparationAuthority,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<Option<Self>, Error> {
         let Some(manager) = self.layers.slots().iter().find_map(|layer| match layer {
             MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),

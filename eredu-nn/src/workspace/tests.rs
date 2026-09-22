@@ -1,17 +1,18 @@
 use super::*;
 use crate::{
-    EmbeddingOperator, EmbeddingSpec, Index, LinearFormat, NeuralBackend, PadMode, ParameterSpec, Tensor,
+    EmbeddingOperator, EmbeddingSpec, Index, LinearFormat, NeuralBackend, PadMode, ParameterSpec,
+    Tensor,
 };
 
 mod blockwise;
 mod domains;
 mod grouped;
 mod hyper;
+mod masked_scatter;
 mod output_alias;
-mod zeros_like;
 mod parallel;
 mod storage;
-mod masked_scatter;
+mod zeros_like;
 
 /// Deliberately simple mechanism with exact documented allocation behavior.
 /// These facts are for the test mechanism, never substituted for native facts.
@@ -42,7 +43,10 @@ impl WorkspaceMechanisms for AllocatingMechanism {
     ) -> Result<Option<WorkspaceOperationBound>, Error> {
         let aliases = matches!(
             operation.kind,
-            WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
+            WorkspaceOperationKind::View(_)
+                | WorkspaceOperationKind::Transpose(_)
+                | WorkspaceOperationKind::Index { .. }
+                | WorkspaceOperationKind::StaticSlice { .. }
         );
         Ok(Some(WorkspaceOperationBound {
             outputs: operation
@@ -79,6 +83,31 @@ fn existing_i32(shape: &[i32], context: &WorkspaceContext) -> Result<WorkspaceTe
 }
 fn context() -> WorkspaceContext {
     WorkspaceContext::new(AllocatingMechanism)
+}
+
+#[test]
+fn borrowed_host_initialization_preserves_constructor_and_validates_before_emission() {
+    let context = context();
+    assert!(WorkspaceTensor::from_i32_slice(&[3, -7], &[3], &context).is_err());
+    assert!(WorkspaceTensor::from_f32_slice(&[1.5, -2.0], &[1], &context).is_err());
+    assert!(context.report(&[]).unwrap().operations.is_empty());
+    let integer = WorkspaceTensor::from_i32_slice(&[3, -7], &[2], &context).unwrap();
+    let floating = WorkspaceTensor::from_f32_slice(&[1.5, -2.0], &[2], &context).unwrap();
+    let fill = WorkspaceTensor::full_i32(3, &[2], &context).unwrap();
+    let report = context.report(&[integer, floating, fill]).unwrap();
+    assert_eq!(report.operations.len(), 3);
+    assert!(matches!(
+        report.operations[0].kind,
+        WorkspaceOperationKind::Elementwise("from_i32_slice")
+    ));
+    assert!(matches!(
+        report.operations[1].kind,
+        WorkspaceOperationKind::Elementwise("from_f32_slice")
+    ));
+    assert!(matches!(
+        report.operations[2].kind,
+        WorkspaceOperationKind::Elementwise("full_i32")
+    ));
 }
 
 #[test]
@@ -518,7 +547,10 @@ fn copy_or_view_state_preserves_every_possible_backing_owner_once() {
             operation: &WorkspaceOperation,
         ) -> Result<Option<WorkspaceOperationBound>, Error> {
             let mut bound = AllocatingMechanism.operation_bound(operation)?.unwrap();
-            if matches!(operation.kind, WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_)) {
+            if matches!(
+                operation.kind,
+                WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_)
+            ) {
                 bound.outputs = operation
                     .outputs
                     .iter()
@@ -570,18 +602,16 @@ fn sliding_attention_joins_heads_and_checks_retained_position_geometry() {
     .unwrap();
     assert_eq!(sliding.shape(), [2, 3, 20]);
     for (window, offset) in [(0, 4), (3, -1), (3, 3), (3, i32::MAX)] {
-        assert!(
-            WorkspaceBackend::sliding_window_attention(
-                q.clone(),
-                k.clone(),
-                v.clone(),
-                0.5,
-                window,
-                offset,
-                &context
-            )
-            .is_err()
-        );
+        assert!(WorkspaceBackend::sliding_window_attention(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            0.5,
+            window,
+            offset,
+            &context
+        )
+        .is_err());
     }
 }
 
@@ -613,20 +643,26 @@ fn tensor_clone_population_tracks_aliases_and_preserves_failed_span() {
 
 #[test]
 fn transpose_retains_normalized_axes_and_shared_storage_for_repeated_dimensions() {
-    let context=context();let input=existing_f32(&[2,3,3,4],&context).unwrap();
+    let context = context();
+    let input = existing_f32(&[2, 3, 3, 4], &context).unwrap();
     context.begin_span();
-    let output=input.transpose_axes(&[0,-2,1,-1],&context).unwrap();
-    assert_eq!(output.shape(),input.shape());
-    assert!(Rc::ptr_eq(&input.storage,&output.storage));
-    let report=context.report(&[output]).unwrap();
-    let WorkspaceOperationKind::Transpose(axes)=&report.operations[0].kind else {panic!("exact transpose descriptor");};
-    assert_eq!(axes,&[0,2,1,3]);
-    let WorkspaceOperationKindView::Transpose(borrowed)=report.operations[0].kind.as_view() else {unreachable!()};
-    assert!(std::ptr::eq(axes.as_ptr(),borrowed.as_ptr()));
+    let output = input.transpose_axes(&[0, -2, 1, -1], &context).unwrap();
+    assert_eq!(output.shape(), input.shape());
+    assert!(Rc::ptr_eq(&input.storage, &output.storage));
+    let report = context.report(&[output]).unwrap();
+    let WorkspaceOperationKind::Transpose(axes) = &report.operations[0].kind else {
+        panic!("exact transpose descriptor");
+    };
+    assert_eq!(axes, &[0, 2, 1, 3]);
+    let WorkspaceOperationKindView::Transpose(borrowed) = report.operations[0].kind.as_view()
+    else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(axes.as_ptr(), borrowed.as_ptr()));
     // The transposed result aliases an existing source; this span creates no backing.
-    assert_eq!(report.tensor_buffers.retained_bytes,Some(0));
-    assert_eq!(report.tensor_buffers.total_bytes,Some(0));
-    let unknown=WorkspaceRepresentation::new(WorkspaceFloatingType::Float32,false);
+    assert_eq!(report.tensor_buffers.retained_bytes, Some(0));
+    assert_eq!(report.tensor_buffers.total_bytes, Some(0));
+    let unknown = WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false);
     assert!(!unknown.last_axis_contiguous());
     assert!(!unknown.with_last_axis_contiguous(true).row_contiguous());
 }
@@ -636,46 +672,91 @@ fn integer_coordinate_clamp_preserves_gather_indices_through_padding_and_views()
     let context = context();
     let coordinates = existing_i32(&[1, 2, 2], &context).unwrap();
     let sanitized = WorkspaceTensor::pad(
-        &coordinates, &[(0, 0), (0, 1), (0, 0)], PadMode::Constant, &context,
-    ).unwrap().maximum_i32(0, &context).unwrap();
+        &coordinates,
+        &[(0, 0), (0, 1), (0, 0)],
+        PadMode::Constant,
+        &context,
+    )
+    .unwrap()
+    .maximum_i32(0, &context)
+    .unwrap();
     let batch = WorkspaceTensor::concatenate(&[sanitized], 0, &context).unwrap();
-    let x = batch.index(&[Index::Full, Index::Full, Index::At(0)], &context).unwrap();
+    let x = batch
+        .index(&[Index::Full, Index::Full, Index::At(0)], &context)
+        .unwrap();
     assert_eq!(x.layout().dtype(), WorkspaceDtype::Int32);
     let table = existing_f32(&[4, 7], &context).unwrap();
     let positions = table.take_axis(&x, 0, &context).unwrap();
     assert_eq!(positions.shape(), [1, 3, 7]);
     assert_eq!(positions.layout().dtype(), WorkspaceDtype::Float32);
-    assert!(table.take_axis(&x.maximum_scalar(0.0, &context).unwrap(), 0, &context).is_err());
+    assert!(table
+        .take_axis(&x.maximum_scalar(0.0, &context).unwrap(), 0, &context)
+        .is_err());
 }
-
 
 #[test]
 fn prepared_parameter_representations_extend_static_source_before_construction_only() {
     use crate::ParameterId;
-    let context=WorkspaceContext::new(AllocatingMechanism);
-    let row=|name:&str,shape:&[i32],dtype:WorkspaceFloatingType| {
-        WorkspaceParameterRepresentation::new(ParameterId::new(name).unwrap(),
-            context.layout(shape,WorkspaceDtype::Float32).unwrap()
-                .with_representation(Some(WorkspaceRepresentation::new(dtype,false))))
+    let context = WorkspaceContext::new(AllocatingMechanism);
+    let row = |name: &str, shape: &[i32], dtype: WorkspaceFloatingType| {
+        WorkspaceParameterRepresentation::new(
+            ParameterId::new(name).unwrap(),
+            context
+                .layout(shape, WorkspaceDtype::Float32)
+                .unwrap()
+                .with_representation(Some(WorkspaceRepresentation::new(dtype, false))),
+        )
     };
-    context.install_parameter_representations(vec![
-        row("static",&[2,3],WorkspaceFloatingType::Bfloat16),
-        row("conflict",&[2,3],WorkspaceFloatingType::Float32),
-    ]).unwrap();
-    context.extend_parameter_representations(vec![
-        row("unit",&[2,3],WorkspaceFloatingType::Float16),
-        row("conflict",&[2,3],WorkspaceFloatingType::Bfloat16),
-    ]).unwrap();
-    let get=|name:&str,shape:&[i32]|WorkspaceTensor::unloaded_parameter_f32(
-        &ParameterSpec::trainable(name).unwrap(),shape,&context).unwrap();
-    assert_eq!(get("static",&[2,3]).layout().representation().unwrap().dtype(),WorkspaceFloatingType::Bfloat16);
-    assert_eq!(get("unit",&[2,3]).layout().representation().unwrap().dtype(),WorkspaceFloatingType::Float16);
-    assert_eq!(get("conflict",&[2,3]).layout().representation(),None);
-    assert_eq!(get("absent",&[2,3]).layout().representation(),None);
-    assert_eq!(get("unit",&[3,2]).layout().representation(),None);
-    assert!(context.extend_parameter_representations(vec![row("late",&[2,3],WorkspaceFloatingType::Float32)]).is_err());
+    context
+        .install_parameter_representations(vec![
+            row("static", &[2, 3], WorkspaceFloatingType::Bfloat16),
+            row("conflict", &[2, 3], WorkspaceFloatingType::Float32),
+        ])
+        .unwrap();
+    context
+        .extend_parameter_representations(vec![
+            row("unit", &[2, 3], WorkspaceFloatingType::Float16),
+            row("conflict", &[2, 3], WorkspaceFloatingType::Bfloat16),
+        ])
+        .unwrap();
+    let get = |name: &str, shape: &[i32]| {
+        WorkspaceTensor::unloaded_parameter_f32(
+            &ParameterSpec::trainable(name).unwrap(),
+            shape,
+            &context,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        get("static", &[2, 3])
+            .layout()
+            .representation()
+            .unwrap()
+            .dtype(),
+        WorkspaceFloatingType::Bfloat16
+    );
+    assert_eq!(
+        get("unit", &[2, 3])
+            .layout()
+            .representation()
+            .unwrap()
+            .dtype(),
+        WorkspaceFloatingType::Float16
+    );
+    assert_eq!(get("conflict", &[2, 3]).layout().representation(), None);
+    assert_eq!(get("absent", &[2, 3]).layout().representation(), None);
+    assert_eq!(get("unit", &[3, 2]).layout().representation(), None);
+    assert!(context
+        .extend_parameter_representations(vec![row(
+            "late",
+            &[2, 3],
+            WorkspaceFloatingType::Float32
+        )])
+        .is_err());
     context.begin_span();
-    assert!(context.extend_parameter_representations(Vec::new()).is_err());
+    assert!(context
+        .extend_parameter_representations(Vec::new())
+        .is_err());
 }
 
 #[test]
@@ -687,15 +768,23 @@ fn layer_norm_trace_keeps_exact_optional_affine_roles() {
             let scale = existing_f32(&[8], &context).unwrap();
             let offset = existing_f32(&[8], &context).unwrap();
             let output = WorkspaceTensor::layer_norm(
-                &input, weight.then_some(&scale), bias.then_some(&offset), 1e-6, &context,
-            ).unwrap();
+                &input,
+                weight.then_some(&scale),
+                bias.then_some(&offset),
+                1e-6,
+                &context,
+            )
+            .unwrap();
             let report = context.report(&[output]).unwrap();
             assert_eq!(report.operations.len(), 1);
             let operation = &report.operations[0];
             assert!(matches!(operation.kind,
                 WorkspaceOperationKind::LayerNorm { weight: actual_weight, bias: actual_bias }
                 if actual_weight == weight && actual_bias == bias));
-            assert_eq!(operation.inputs.len(), 1 + usize::from(weight) + usize::from(bias));
+            assert_eq!(
+                operation.inputs.len(),
+                1 + usize::from(weight) + usize::from(bias)
+            );
             assert_eq!(operation.outputs[0].shape(), [2, 8]);
             assert!(matches!(operation.as_view().kind,
                 WorkspaceOperationKindView::LayerNorm { weight: actual_weight, bias: actual_bias }
@@ -708,28 +797,48 @@ fn layer_norm_trace_keeps_exact_optional_affine_roles() {
 fn pure_range_index_retains_normalized_coordinates_without_removing_axes() {
     let context = context();
     let input = existing_f32(&[2, 3, 7, 4], &context).unwrap();
-    let selected = input.index(&[Index::Full, Index::Range(1, 3), Index::Range(-5, -1)], &context).unwrap();
+    let selected = input
+        .index(
+            &[Index::Full, Index::Range(1, 3), Index::Range(-5, -1)],
+            &context,
+        )
+        .unwrap();
     assert_eq!(selected.shape(), [2, 2, 4, 4]);
     let empty = input.index(&[Index::Range(2, 2)], &context).unwrap();
     assert_eq!(empty.shape(), [0, 3, 7, 4]);
-    let removed = input.index(&[Index::Full, Index::At(-1), Index::Range(2, 6)], &context).unwrap();
+    let removed = input
+        .index(&[Index::Full, Index::At(-1), Index::Range(2, 6)], &context)
+        .unwrap();
     assert_eq!(removed.shape(), [2, 4, 4]);
     let report = context.report(&[selected, empty, removed]).unwrap();
     for (operation, starts, ends) in [
         (&report.operations[0], [0, 1, 2, 0], [2, 3, 6, 4]),
         (&report.operations[1], [2, 0, 0, 0], [2, 3, 7, 4]),
     ] {
-        let WorkspaceOperationKind::StaticSlice { starts: actual_start, ends: actual_end, strides } = &operation.kind else {
+        let WorkspaceOperationKind::StaticSlice {
+            starts: actual_start,
+            ends: actual_end,
+            strides,
+        } = &operation.kind
+        else {
             panic!("pure ranges must retain their actual rectangle");
         };
-        assert_eq!(actual_start, &starts); assert_eq!(actual_end, &ends);
+        assert_eq!(actual_start, &starts);
+        assert_eq!(actual_end, &ends);
         assert_eq!(strides, &[1, 1, 1, 1]);
     }
-    assert!(matches!(report.operations[2].kind, WorkspaceOperationKind::Index { selected_axes: 1 }));
+    assert!(matches!(
+        report.operations[2].kind,
+        WorkspaceOperationKind::Index { selected_axes: 1 }
+    ));
     assert_eq!(report.tensor_buffers.total_bytes, Some(0));
     context.begin_span();
-    for indexes in [vec![Index::Range(1, 0)], vec![Index::Range(-3, 2)], vec![Index::Range(0, 3)],
-        vec![Index::Full; 5]] {
+    for indexes in [
+        vec![Index::Range(1, 0)],
+        vec![Index::Range(-3, 2)],
+        vec![Index::Range(0, 3)],
+        vec![Index::Full; 5],
+    ] {
         assert!(input.index(&indexes, &context).is_err());
     }
     assert!(context.report(&[]).unwrap().operations.is_empty());

@@ -4,8 +4,8 @@ use crate::backend::array_copy::{
     IsolatedArrayCopy, OriginalPreparedArrayCopySource, RegisteredArrayCopy,
 };
 use crate::composition::mlx::speculative::{
-    OriginalNumericalValue, OriginalSpeculativeNumericalSources, prepared_registered_token_range,
-    registered_copy_input,
+    prepared_registered_token_range, registered_copy_input, OriginalNumericalValue,
+    OriginalSpeculativeNumericalSources,
 };
 use eredu_architectures::speculative_execution::EmbeddedPredictionTensor;
 use eredu_runtime::working_memory::{OriginalSpeculativeSourceIdentity, WorkingMemoryError};
@@ -26,13 +26,19 @@ fn invalid() -> Error {
 }
 impl OriginalEmbeddedPrefillInput {
     pub(super) fn prepare<A, S, P>(
-        plan: &P, prepared: &PreparedModelInputOwner<MlxTensor>,
+        plan: &P,
+        prepared: &PreparedModelInputOwner<MlxTensor>,
         media: Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
         context: SpeculativeExecutionStreams<'_>,
     ) -> Result<Self, Error>
-    where S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    where
+        S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
         A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
-        P: eredu_architectures::speculative_execution::PredictionPrefillPlan<A, MlxNeuralBackend, S>,
+        P: eredu_architectures::speculative_execution::PredictionPrefillPlan<
+            A,
+            MlxNeuralBackend,
+            S,
+        >,
     {
         let (sources, environment) = context.original_numerical().ok_or_else(invalid)?;
         let funding = sources.metadata_funding();
@@ -54,55 +60,90 @@ impl OriginalEmbeddedPrefillInput {
                 frames
                     .into_iter()
                     .try_fold(size_of_val(&frames), usize::checked_add)
-                    .ok_or(Error::WorkspacePlanning(
-                        HostMetadataFundingError::Overflow,
-                    ))?,
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             )
             .map_err(Error::WorkspacePlanning)?;
         sources.validate_environment(environment)?;
         if prepared.original_source().is_none() {
             return Err(invalid());
         }
+        use crate::composition::mlx::speculative::{
+            concatenate_token_inputs, repeated_token_input,
+        };
         use eredu_architectures::composite_execution::PredictionTokenPart;
-        use crate::composition::mlx::speculative::{repeated_token_input, concatenate_token_inputs};
         let mut part_count = 0usize;
         plan.visit_token_parts(&mut |_| {
-            part_count = part_count.checked_add(1).ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+            part_count = part_count
+                .checked_add(1)
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
             Ok(())
-        }).map_err(Error::Neural)?;
+        })
+        .map_err(Error::Neural)?;
         let mut values = funding.metadata_vec(part_count).map_err(Error::Neural)?;
         let mut positions = 0u64;
         plan.visit_token_parts(&mut |part| {
             let result = (|| {
-                funding.reserve_metadata(size_of::<(PredictionTokenPart<'_, MlxTensor>, Option<OriginalNumericalValue>,
-                    OriginalNumericalValue, Result<OriginalNumericalValue, Error>, u64)>())
+                funding
+                    .reserve_metadata(size_of::<(
+                        PredictionTokenPart<'_, MlxTensor>,
+                        Option<OriginalNumericalValue>,
+                        OriginalNumericalValue,
+                        Result<OriginalNumericalValue, Error>,
+                        u64,
+                    )>())
                     .map_err(Error::WorkspacePlanning)?;
                 let (next, count) = match part {
                     PredictionTokenPart::Tokens(tokens) => {
-                        let original = OriginalPreparedArrayCopySource::from_payload(prepared, tokens)
-                            .map_err(Error::PrefillControl)?;
-                        input::validate_token_ids_with_diagnostic(original.array(), |message| Error::Neural(funding.metadata_error(message)))?;
-                        let [1, count] = original.array().shape() else { return Err(invalid()); };
+                        let original =
+                            OriginalPreparedArrayCopySource::from_payload(prepared, tokens)
+                                .map_err(Error::PrefillControl)?;
+                        input::validate_token_ids_with_diagnostic(original.array(), |message| {
+                            Error::Neural(funding.metadata_error(message))
+                        })?;
+                        let [1, count] = original.array().shape() else {
+                            return Err(invalid());
+                        };
                         let count = u64::try_from(*count).map_err(|_| invalid())?;
                         let (roots, mechanisms) = sources.numerical_prerequisites();
-                        let copy = IsolatedArrayCopy::new(original.array()).copy_prepared(&original, environment,
-                            roots, mechanisms, funding, sources.request().capacity_bytes())?;
+                        let copy = IsolatedArrayCopy::new(original.array()).copy_prepared(
+                            &original,
+                            environment,
+                            roots,
+                            mechanisms,
+                            funding,
+                            sources.request().limits(),
+                        )?;
                         (registered_copy_input(copy, sources, environment)?, count)
                     }
-                    PredictionTokenPart::Repeated { token, positions } =>
-                        (repeated_token_input(token, positions, sources, environment)?, positions),
+                    PredictionTokenPart::Repeated { token, positions } => (
+                        repeated_token_input(token, positions, sources, environment)?,
+                        positions,
+                    ),
                 };
-                positions = positions.checked_add(count).ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
-                if values.len() == part_count { return Err(invalid()); }
+                positions = positions
+                    .checked_add(count)
+                    .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+                if values.len() == part_count {
+                    return Err(invalid());
+                }
                 values.push(next);
                 Ok(())
             })();
-            result.map_err(|cause: Error| super::super::embedded_error::neural_cause(cause, context))
-        }).map_err(Error::Neural)?;
-        if plan.shape().map_err(Error::Neural)? != [1, positions] { return Err(invalid()); }
-        if values.len() != part_count || part_count == 0 { return Err(invalid()); }
-        let value = if values.len() == 1 { values.pop().expect("one token part") }
-            else { concatenate_token_inputs(values, sources, environment)? };
+            result
+                .map_err(|cause: Error| super::super::embedded_error::neural_cause(cause, context))
+        })
+        .map_err(Error::Neural)?;
+        if plan.shape().map_err(Error::Neural)? != [1, positions] {
+            return Err(invalid());
+        }
+        if values.len() != part_count || part_count == 0 {
+            return Err(invalid());
+        }
+        let value = if values.len() == 1 {
+            values.pop().expect("one token part")
+        } else {
+            concatenate_token_inputs(values, sources, environment)?
+        };
         Ok(Self {
             value,
             prepared: prepared.clone(),
@@ -111,13 +152,18 @@ impl OriginalEmbeddedPrefillInput {
         })
     }
     pub(crate) fn project_media(
-        &self, context: &WorkspaceContext, sources: &OriginalSpeculativeNumericalSources,
-    ) -> Result<Option<eredu_architectures::prepared_execution::OriginalMediaWorkspaceInput>, Error> {
+        &self,
+        context: &WorkspaceContext,
+        sources: &OriginalSpeculativeNumericalSources,
+    ) -> Result<Option<eredu_architectures::prepared_execution::OriginalMediaWorkspaceInput>, Error>
+    {
         self.validate_request(sources)?;
-        context.charge_metadata(size_of::<(
-            Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
-            Option<eredu_architectures::prepared_execution::OriginalMediaWorkspaceInput>,
-        )>()).map_err(|cause| Error::Neural(cause.into()))?;
+        context
+            .charge_metadata(size_of::<(
+                Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
+                Option<eredu_architectures::prepared_execution::OriginalMediaWorkspaceInput>,
+            )>())
+            .map_err(|cause| Error::Neural(cause.into()))?;
         self.media.as_ref().map(|media| {
             eredu_architectures::prepared_execution::OriginalMediaWorkspaceInput::project_with_metadata(
                 &self.prepared, media.clone(), context, sources.pool(),
@@ -170,9 +216,7 @@ impl OriginalEmbeddedPrefillInput {
                 frames
                     .into_iter()
                     .try_fold(size_of_val(&frames), usize::checked_add)
-                    .ok_or(Error::WorkspacePlanning(
-                        HostMetadataFundingError::Overflow,
-                    ))?,
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             )
             .map_err(Error::WorkspacePlanning)?;
         let start = usize::try_from(chunk.input.start)

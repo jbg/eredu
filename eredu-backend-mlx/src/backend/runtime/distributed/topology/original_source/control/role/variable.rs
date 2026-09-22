@@ -268,7 +268,7 @@ impl OriginalParallelControlProjection {
                 let invocation = Invocation { input, empty, original, transport, peers, rank, transposed,
                     order, world, completed_source: completed_source.cloned(), claim, capacity,
                     owner: OriginalParallelControlOwner(retained.0.clone()) };
-                let output = run_native_role(invocation, capacity, &owner.bank, &owner.controls, c,
+                let output = run_native_role(invocation, capacity, &owner.native, c,
                     |value, observer| Ok(value.run(observer)))
                     .map_err(|cause| Error::with_original_control_source(cause, false))??;
                 let output = if let Some(plan) = plan.filter(|plan| !plan.canonical_order() && !is_idle) {

@@ -21,7 +21,7 @@ impl ErasedRealtimeExecutionContract for TestExecution {
         &self,
         _: &Stream,
         _: crate::backend::nn::workspace::NativeAllocationFacts,
-        _: &eredu_runtime::working_memory::WorkingMemoryPool,
+        _: &eredu_runtime::working_memory::MemoryLedger,
         _: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<RealtimeOperationPlan, Error> {
         Err(Error::PrefillControl(

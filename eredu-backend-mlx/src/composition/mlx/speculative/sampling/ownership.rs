@@ -83,9 +83,9 @@ pub struct MlxSpeculativeRandomState {
     pub(super) memory_retention: NativeMemoryRetention,
 }
 
-/// Cover the selected domain before mutation, retaining every source authority.
-/// An existing same-domain lease suffices; entering another unbound domain must
-/// acquire its authority before any native key splitting or sampling can start.
+/// Cover the selected ledger before mutation, retaining every source authority.
+/// An existing lease from that ledger suffices; another ledger requires its own
+/// authority before native key splitting or sampling can start.
 pub(super) fn derivation_memory(
     retained: &NativeMemoryRetention,
     context: SpeculativeExecutionStreams<'_>,
@@ -94,7 +94,7 @@ pub(super) fn derivation_memory(
     if let Some(owner) = context.memory_owner() {
         memory.retain(owner);
     } else {
-        let pool = context.memory_pool();
+        let pool = context.memory_ledger();
         if !memory.covers_pool(&pool) {
             let owner = NativeMemoryOwner::acquire(&pool).map_err(Exception::from_source)?;
             memory.retain(&owner);

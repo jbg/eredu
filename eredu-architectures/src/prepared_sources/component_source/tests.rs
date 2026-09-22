@@ -238,7 +238,10 @@ fn capture_identity_refusal_preserves_retry_and_resolved_identity_survives_sourc
     let (root, discovery) = fixture();
     let (refused, _, retired) = account(1);
     let error = discovery.prepare_capture_identity(&refused).unwrap_err();
-    assert_eq!(error.funding_error(), Some(HostMetadataFundingError::Unavailable));
+    assert_eq!(
+        error.funding_error(),
+        Some(HostMetadataFundingError::Unavailable)
+    );
     assert!(discovery.resolved_artifact_identity().is_none());
     drop(refused);
     assert!(!retired.load(Ordering::SeqCst));
@@ -249,8 +252,129 @@ fn capture_identity_refusal_preserves_retry_and_resolved_identity_survives_sourc
     let identity = discovery.prepare_capture_identity(&funding).unwrap();
     assert_eq!(discovery.resolved_artifact_identity(), Some(identity));
     drop(root);
-    assert_eq!(discovery.prepare_capture_identity(&funding).unwrap(), identity);
-    assert_eq!(discovery.capture().unwrap().artifact_identity, identity.to_string());
+    assert_eq!(
+        discovery.prepare_capture_identity(&funding).unwrap(),
+        identity
+    );
+    assert_eq!(
+        discovery.capture().unwrap().artifact_identity,
+        identity.to_string()
+    );
     drop(funding);
-    assert!(retired.load(Ordering::SeqCst), "cached digest owns no source account");
+    assert!(
+        retired.load(Ordering::SeqCst),
+        "cached digest owns no source account"
+    );
+}
+
+#[test]
+fn partitioned_ar_capture_revalidates_actual_layout_and_phase_publication() {
+    use crate::speculative_execution::SpeculativeActivationExecution;
+    use eredu_core::{intervention::*, speculative::*};
+    let (_root, source) = fixture();
+    let layouts = source.component_partition_layouts(2).unwrap().unwrap();
+    let mut loaded = source
+        .capture_with_partition_support(&layouts, |_| ObservationSupportStatus::Supported)
+        .unwrap();
+    loaded.support.capture.conditions =
+        vec!["Actual partition collector and source vote obligations".into()];
+    let execution = SpeculativeActivationExecution::ordinary_target();
+    let discovery = source
+        .speculative_activations_with_partition_support(
+            &execution,
+            &InterventionMechanisms::default(),
+            "session",
+            None,
+            &layouts,
+            |_| ObservationSupportStatus::Supported,
+        )
+        .unwrap();
+    let point = discovery
+        .captures
+        .catalog
+        .points
+        .iter()
+        .find(|point| {
+            point.axes.is_some()
+                && discovery.captures.support.points.iter().any(|row| {
+                    row.path == point.path
+                        && row.prefill == ObservationSupportStatus::Supported
+                        && row.decode == ObservationSupportStatus::Supported
+                })
+        })
+        .unwrap();
+    let usage = CaptureUsage {
+        captures: 32,
+        retained_bytes: 1 << 20,
+        host_bytes: 1 << 20,
+        encoded_bytes: 1 << 20,
+    };
+    let admitted = SpeculativeActivationPlan {
+        schema_version: SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+        captures: CapturePlan {
+            schema_version: CAPTURE_SCHEMA_VERSION,
+            selections: vec![CaptureSelection {
+                id: "actual".into(),
+                path: point.path.clone(),
+                schedule: Default::default(),
+                slices: vec![],
+                transform: CaptureTransform::Preview { max_elements: 8 },
+            }],
+            limits: CaptureLimits {
+                per_step: usage,
+                cumulative: usage,
+                on_limit: CaptureLimitPolicy::Fail,
+            },
+        },
+        interventions: InterventionPlan {
+            schema_version: INTERVENTION_SCHEMA_VERSION,
+            operations: vec![],
+        },
+        bounds: CaptureInvocationBounds {
+            batch: 1,
+            max_sequence: 3,
+            max_context: Some(16),
+            max_predictions: 8,
+        },
+    }
+    .admit(&discovery)
+    .unwrap();
+    let facts = InterventionMechanisms::default();
+    let profile = facts.borrowed();
+    let validate = |report: &CaptureDiscovery, label: &str| {
+        source.validate_original_partitioned_autoregressive_activations(
+            &admitted, &execution, "session", None, profile, profile, &layouts, report, label,
+        )
+    };
+    validate(&loaded, source.execution_identity()).unwrap();
+    assert!(
+        source
+            .validate_original_speculative_activations(&admitted, &execution, "session", None)
+            .is_err()
+    );
+    assert!(validate(&loaded, "foreign-execution").is_err());
+    let mut changed = loaded.clone();
+    changed
+        .support
+        .points
+        .iter_mut()
+        .find(|row| row.path == point.path)
+        .unwrap()
+        .decode = ObservationSupportStatus::Unsupported("actual collector refusal".into());
+    assert!(validate(&changed, source.execution_identity()).is_err());
+    changed = loaded.clone();
+    changed.support.capture.transformations.clear();
+    assert!(validate(&changed, source.execution_identity()).is_err());
+    changed = loaded.clone();
+    changed.artifact_identity.push('0');
+    assert!(validate(&changed, source.execution_identity()).is_err());
+    changed = loaded.clone();
+    changed
+        .catalog
+        .points
+        .iter_mut()
+        .find(|row| row.path == point.path)
+        .unwrap()
+        .prefill = false;
+    assert!(validate(&changed, source.execution_identity()).is_err());
 }

@@ -4,6 +4,7 @@ use crate::backend::{
     error::Error,
     runtime::cache::state::{InitializedResidentDecoderCopy, SavedResidentDecoderCopy},
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::TokenFilter;
 use eredu_runtime::{
     working_memory::{FundedSamplerCopy, WorkspaceCopyCustody},
@@ -90,7 +91,7 @@ fn words(array: &Array) -> Vec<u32> {
 fn id(array: &Array) -> safemlx::AllocationIdentity {
     array.allocation_info().unwrap().unwrap().identity()
 }
-fn sources(pool: &WorkingMemoryPool) -> (Array, Array) {
+fn sources(pool: &MemoryLedger) -> (Array, Array) {
     let loading = NativeMemoryOwner::acquire(pool).unwrap();
     let key = Array::from_slice(&[0x1020_3040u32, 0x5060_7080], &[2]);
     let pending = Array::from_slice(&[23u32], &[]);
@@ -107,7 +108,7 @@ fn joined<'a>(
     sampler: BorrowedFundedSampler<'a>,
     key: &Array,
     pending: &Array,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (
     RegisteredSamplingCopy<'a, StorageIdentity>,
     eredu_runtime::working_memory::WorkingMemoryStorage<StorageIdentity>,
@@ -125,7 +126,7 @@ fn joined<'a>(
         &context,
         native
             .iter()
-            .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+            .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root)),
     )
     .unwrap();
     let program =
@@ -199,15 +200,15 @@ fn assert_absent(native: &SavedResidentDecoderCopy) {
     let plan = native.prepare_copy().unwrap();
     assert!(plan.shared_layout().is_none());
     let mut count = 0;
-    plan.visit_operands(&mut |_| count += 1);
-    plan.visit_retained_arrays(&mut |_| count += 1);
+    plan.visit_operands(&mut |_| count += 1).unwrap();
+    plan.visit_retained_arrays(&mut |_| count += 1).unwrap();
     assert_eq!(count, 0);
 }
 
 #[test]
-fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absence() {
-    for drop_original_first in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+fn stateless_dispatch_admits_exact_preserves_live_ceiling_and_recopies_saved_absence() {
+    for (exact_first, drop_original_first) in [(true, false), (false, false), (false, true)] {
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let stream = metal();
         let (key, pending) = sources(&pool);
         let source = MlxPoolingAttentionState::stateless();
@@ -220,8 +221,25 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
             0
         );
         let (sampling, complete) = joined(sampler.borrow_funded(), &key, &pending, &pool);
-        let required = sampling.required_bytes();
-        let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+        let limits = crate::memory_fixture::publication_copy_limits(&pool, 2, u64::MAX);
+        let payload = sampling
+            .required_bytes()
+            .unwrap()
+            .checked_add(limits.additional_host_metadata_bytes)
+            .unwrap();
+        let descriptor = sampling.with_complete_source(complete);
+        let required = crate::memory_fixture::host_total(
+            &pool
+                .sampling_copy_with_source_requirements(&descriptor, &limits)
+                .unwrap(),
+        );
+        drop(descriptor);
+        let (sampling, complete) = joined(sampler.borrow_funded(), &key, &pending, &pool);
+        let physical_before = pool.fixture_host_current().unwrap();
+        let before = (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
         let error = plan
             .host_copy(&pool)
             .unwrap()
@@ -229,15 +247,22 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
                 &pool,
                 sampling,
                 complete,
-                WorkspaceCopyLimits::new(before.0 + required - 1),
+                crate::memory_fixture::publication_copy_limits(
+                    &pool,
+                    2,
+                    physical_before.checked_add(required).unwrap() - 1,
+                ),
             )
             .err()
             .unwrap();
         assert!(
-            matches!(memory_error(&error), WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes } if *required_bytes == required && *available_bytes == required - 1)
+            matches!(memory_error(&error), WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }) if *required_bytes == required && limit_bytes.checked_sub(*existing_bytes).unwrap() == required - 1)
         );
         assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+            (
+                pool.fixture_funded_charge().unwrap(),
+                pool.fixture_host_peak().unwrap()
+            ),
             before
         );
         assert_eq!(history(sampler.as_sampler()), &[11, 23]);
@@ -250,10 +275,26 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
                 &pool,
                 sampling,
                 complete,
-                WorkspaceCopyLimits::new(before.0 + required),
+                crate::memory_fixture::publication_copy_limits(
+                    &pool,
+                    2,
+                    if exact_first {
+                        physical_before.checked_add(required).unwrap()
+                    } else {
+                        u64::MAX
+                    },
+                ),
             )
             .unwrap();
-        assert_eq!(native.bytes(), required);
+        assert_eq!(
+            native
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+            required
+        );
         let first = finish(plan, slots, copied_sampler, native, &key, &pending, &stream);
         assert_absent(&first.native);
         assert_eq!(history(first.sampler.as_sampler()), &[11, 23]);
@@ -266,7 +307,18 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
             history(sampler.as_sampler()).as_ptr()
         );
         drop((key, pending, sampler, preparation, run, source));
-        settle(&pool, first.custody.bytes());
+        settle(
+            &pool,
+            first
+                .custody
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap()
+                .checked_sub(crate::memory_fixture::publication_control_bytes(4))
+                .unwrap(),
+        );
         let plan = first.native.prepare_copy().unwrap();
         let (sampling, complete) = joined(
             first.sampler.borrow_funded(),
@@ -274,17 +326,52 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
             &first.pending,
             &pool,
         );
-        let next_required = sampling.required_bytes();
-        let (sampler, slots, native) = plan
-            .host_copy(&pool)
+        let limits = crate::memory_fixture::publication_copy_limits(&pool, 2, u64::MAX);
+        let next_payload = sampling
+            .required_bytes()
             .unwrap()
-            .admit(
-                &pool,
-                sampling,
-                complete,
-                WorkspaceCopyLimits::new(pool.used_bytes().unwrap() + next_required),
-            )
+            .checked_add(limits.additional_host_metadata_bytes)
             .unwrap();
+        let descriptor = sampling.with_complete_source(complete);
+        let next_required = crate::memory_fixture::host_total(
+            &pool
+                .sampling_copy_with_source_requirements(&descriptor, &limits)
+                .unwrap(),
+        );
+        drop(descriptor);
+        let (sampling, complete) = joined(
+            first.sampler.borrow_funded(),
+            &first.key,
+            &first.pending,
+            &pool,
+        );
+        let copied = plan.host_copy(&pool).unwrap().admit(
+            &pool,
+            sampling,
+            complete,
+            crate::memory_fixture::publication_copy_limits(
+                &pool,
+                2,
+                pool.fixture_host_current()
+                    .unwrap()
+                    .checked_add(next_required)
+                    .unwrap(),
+            ),
+        );
+        if exact_first {
+            // A retained source's live finite ceiling constrains the next copy.
+            // Copy custody does not confer request-ceiling succession authority.
+            let error = copied.err().unwrap();
+            assert!(matches!(
+                memory_error(&error),
+                WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
+            ));
+            drop(error);
+            drop(first);
+            settle(&pool, 0);
+            continue;
+        }
+        let (sampler, slots, native) = copied.unwrap();
         let second = finish(
             plan,
             slots,
@@ -302,18 +389,32 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
             history(second.sampler.as_sampler()).as_ptr(),
             history(first.sampler.as_sampler()).as_ptr()
         );
-        let retained = if drop_original_first {
+        let (retained, account_controls) = if drop_original_first {
             drop(first);
-            second
+            (second, next_required.checked_sub(next_payload).unwrap())
         } else {
             drop(second);
-            first
+            (first, required.checked_sub(payload).unwrap())
         };
-        settle(&pool, retained.custody.bytes());
+        settle(
+            &pool,
+            retained
+                .custody
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap()
+                .checked_sub(crate::memory_fixture::publication_control_bytes(4))
+                .unwrap(),
+        );
         let escaped = retained.key.clone();
-        let escaped_bytes = escaped.allocation_info().unwrap().unwrap().bytes() as u64;
+        let info = escaped.allocation_info().unwrap().unwrap();
+        let escaped_bytes = (info.bytes() as u64)
+            .checked_add(info.host_control_bytes() as u64)
+            .unwrap();
         drop(retained);
-        settle(&pool, escaped_bytes);
+        settle(&pool, escaped_bytes + account_controls);
         assert_eq!(words(&escaped), vec![0x1020_3040, 0x5060_7080]);
         drop(escaped);
         settle(&pool, 0);
@@ -322,7 +423,7 @@ fn stateless_dispatch_admits_exact_without_table_and_saved_copy_preserves_absenc
 
 #[test]
 fn different_actual_absence_rejects_before_native_copy_and_releases_admitted_work() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let stream = metal();
     let (key, pending) = sources(&pool);
     let source = MlxPoolingAttentionState::stateless();
@@ -337,7 +438,7 @@ fn different_actual_absence_rejects_before_native_copy_and_releases_admitted_wor
             &pool,
             sampling,
             complete,
-            WorkspaceCopyLimits::new(u64::MAX),
+            crate::memory_fixture::publication_copy_limits(&pool, 2, u64::MAX),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
@@ -371,7 +472,7 @@ fn fail_after_key(key: &Array, stream: &Stream, roots: &RefCell<Vec<Array>>) -> 
 }
 #[test]
 fn stateless_late_failure_keeps_partial_roots_and_account_until_exact_settlement() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let stream = metal();
     let (key, pending) = sources(&pool);
     let source = MlxPoolingAttentionState::stateless();
@@ -386,7 +487,7 @@ fn stateless_late_failure_keeps_partial_roots_and_account_until_exact_settlement
             &pool,
             sampling,
             complete,
-            WorkspaceCopyLimits::new(u64::MAX),
+            crate::memory_fixture::publication_copy_limits(&pool, 2, u64::MAX),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
@@ -400,9 +501,9 @@ fn stateless_late_failure_keeps_partial_roots_and_account_until_exact_settlement
     assert_eq!(roots.borrow().len(), 2);
     assert_eq!(words(&key), vec![0x1020_3040, 0x5060_7080]);
     assert_eq!(history(sampler.as_sampler()), &[11, 23]);
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.fixture_funded_charge().unwrap();
     drop((saved, copied_sampler));
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.fixture_funded_charge().unwrap(), charged);
     for array in roots.borrow().iter() {
         array.evaluated().unwrap();
     }

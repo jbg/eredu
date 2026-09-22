@@ -1,7 +1,7 @@
 use super::*;
 const CAPACITY: u64 = 1 << 22;
-fn original(context: &TextStepContext) -> (WorkingMemoryPool, InferenceTextPreparation) {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+fn original(context: &TextStepContext) -> (MemoryLedger, InferenceTextPreparation) {
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let reserved = reservation(&pool, 100, CAPACITY);
     let execution = reserved.0.execution.clone();
     let geometry = reserved.geometry();
@@ -14,17 +14,12 @@ fn original(context: &TextStepContext) -> (WorkingMemoryPool, InferenceTextPrepa
     (pool, preparation)
 }
 fn planning(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     preparation: &InferenceTextPreparation,
 ) -> eredu_core::HostMetadataFunding {
     pool.prepare_workspace_metadata(
-        &preparation
-            .request()
-            .memory_reservation()
-            .unwrap()
-            .0
-            .execution,
-        CAPACITY,
+        &preparation.request().memory_reservation().0.execution,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, CAPACITY),
     )
     .unwrap()
 }
@@ -35,14 +30,14 @@ fn sampling_extension_rejects_foreign_active_and_stale_boundaries_before_plannin
     let foreign = lock_context();
     let (pool, preparation) = original(&context);
     let funding = planning(&pool, &preparation);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.payload_used_bytes().unwrap();
     assert!(matches!(
         preparation
             .request()
             .begin_sampling_extension(&foreign, &funding),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline);
     let step = preparation
         .claim_step(&context, PendingTextInput::Prefill(()))
         .unwrap();
@@ -52,7 +47,7 @@ fn sampling_extension_rejects_foreign_active_and_stale_boundaries_before_plannin
             .begin_sampling_extension(&context, &funding),
         Err(WorkingMemoryError::TextStepActive)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline);
     step.finish().unwrap();
     assert!(matches!(
         preparation
@@ -63,9 +58,9 @@ fn sampling_extension_rejects_foreign_active_and_stale_boundaries_before_plannin
             actual: 0
         })
     ));
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline);
     drop((preparation, funding));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -121,7 +116,7 @@ fn sampling_extension_attempts_are_not_reissued_and_pending_blocks_prediction() 
         1
     );
     drop((active, newest, abandoned, preparation, funding));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -129,13 +124,27 @@ fn sampling_extension_metadata_refusal_does_not_claim_the_attempt_or_replace_sam
     let context = lock_context();
     let (pool, preparation) = original(&context);
     let funding = planning(&pool, &preparation);
-    let remaining = CAPACITY - pool.used_bytes().unwrap();
+    let remaining = match pool
+        .snapshot()
+        .unwrap()
+        .domains
+        .iter()
+        .find(|d| d.domain == pool.topology().host_domain())
+        .unwrap()
+    {
+        d => match d.effective_limit {
+            eredu_core::MemoryLimit::Finite(limit) => limit - d.current_charge_bytes,
+            eredu_core::MemoryLimit::Unlimited => panic!("finite fixture limit"),
+        },
+    };
     funding.reserve_metadata(remaining as usize).unwrap();
     assert!(matches!(
         preparation
             .request()
             .begin_sampling_extension(&context, &funding),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert_eq!(
         preparation
@@ -150,5 +159,5 @@ fn sampling_extension_metadata_refusal_does_not_claim_the_attempt_or_replace_sam
     assert!(step.original_sampling_is_current().unwrap());
     step.finish().unwrap();
     drop((preparation, funding));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

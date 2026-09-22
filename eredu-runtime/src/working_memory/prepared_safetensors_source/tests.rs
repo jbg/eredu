@@ -79,7 +79,7 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn qualified() -> bool {
-    let result = WorkingMemoryPool::safetensors_source_erasure_required_bytes();
+    let result = MemoryLedger::safetensors_source_erasure_required_bytes();
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -89,7 +89,7 @@ fn qualified() -> bool {
         other => panic!("{other:?}"),
     }
 }
-fn inspection(pool: &WorkingMemoryPool, path: &Path) -> eredu_core::ArtifactInspection<()> {
+fn inspection(pool: &MemoryLedger, path: &Path) -> eredu_core::ArtifactInspection<()> {
     pool.inspect_artifact_with_safetensors_pool(
         path,
         &Resolver,
@@ -118,7 +118,7 @@ fn resolution(path: &Path) -> ResolvedCheckpointPlan {
     .unwrap();
     eredu_checkpoint::validation::resolve_safetensors_plan(&store, &plan).unwrap()
 }
-fn leaf(pool: &WorkingMemoryPool, path: &Path) -> RetainedCheckpointSource {
+fn leaf(pool: &MemoryLedger, path: &Path) -> RetainedCheckpointSource {
     let store = pool
         .open_safetensors_source(path, 2, SafetensorsDiscoveryLimits::default(), POLICY)
         .unwrap();
@@ -139,7 +139,7 @@ fn prepared_views_keep_typed_file_route_and_resolution_after_inspection_retires(
         return;
     }
     let dir = fixture();
-    let pool = WorkingMemoryPool::new(2_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
     let inspection = inspection(&pool, dir.path());
     let contract = resolution(dir.path())
         .project_claimed_sources("alpha-only", ["alpha".into()].into())
@@ -185,7 +185,7 @@ fn prepared_views_keep_typed_file_route_and_resolution_after_inspection_retires(
         eredu_checkpoint::store::SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { .. }
     ));
     let view_bytes =
-        WorkingMemoryPool::prepared_safetensors_view_bytes(inspection.tensors(), &contract, POLICY)
+        MemoryLedger::prepared_safetensors_view_bytes(inspection.tensors(), &contract, POLICY)
             .unwrap();
     let keys = vec!["alpha".into()];
     let initializer = SafetensorsEncodedReadPlan::from_source(&source, &keys)
@@ -203,9 +203,9 @@ fn prepared_views_keep_typed_file_route_and_resolution_after_inspection_retires(
     read.output().read_into(&mut output).unwrap();
     assert_eq!(output, [11, 19]);
     drop(read);
-    assert_eq!(pool.used_bytes().unwrap(), view_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), view_bytes);
     drop(identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn view_admission_exact_and_one_short_preserve_untouched_leaf() {
@@ -216,14 +216,14 @@ fn view_admission_exact_and_one_short_preserve_untouched_leaf() {
     let inspection = eredu_core::inspect_artifact(dir.path(), &Resolver).unwrap();
     let contract = resolution(dir.path());
     let quote =
-        WorkingMemoryPool::prepared_safetensors_view_bytes(inspection.tensors(), &contract, POLICY)
+        MemoryLedger::prepared_safetensors_view_bytes(inspection.tensors(), &contract, POLICY)
             .unwrap();
-    let measure = WorkingMemoryPool::new(2_000_000, 0).unwrap();
+    let measure = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
     let source = leaf(&measure, dir.path());
-    let base = measure.used_bytes().unwrap();
+    let base = measure.payload_used_bytes().unwrap();
     drop(source);
-    assert_eq!(measure.used_bytes().unwrap(), 0);
-    let short = WorkingMemoryPool::new(base + quote - 1, 0).unwrap();
+    assert_eq!(measure.payload_used_bytes().unwrap(), 0);
+    let short = crate::working_memory::memory_fixture::host_ledger(base + quote - 1, 0).unwrap();
     let error = short
         .prepare_safetensors_views(
             leaf(&short, dir.path()),
@@ -233,13 +233,13 @@ fn view_admission_exact_and_one_short_preserve_untouched_leaf() {
         )
         .unwrap_err();
     assert!(
-        matches!(error.memory_failure(),Some(WorkingMemoryError::BudgetExceeded { required_bytes,available_bytes }) if *required_bytes==quote && *available_bytes==quote-1)
+        matches!(error.memory_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==quote && (limit_bytes - existing_bytes)==quote-1)
     );
     assert!(error.rejected_source().is_some());
-    assert_eq!(short.used_bytes().unwrap(), base);
+    assert_eq!(short.payload_used_bytes().unwrap(), base);
     drop(error);
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let exact = WorkingMemoryPool::new(base + quote, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let exact = crate::working_memory::memory_fixture::host_ledger(base + quote, 0).unwrap();
     let source = exact
         .prepare_safetensors_views(
             leaf(&exact, dir.path()),
@@ -248,9 +248,9 @@ fn view_admission_exact_and_one_short_preserve_untouched_leaf() {
             POLICY,
         )
         .unwrap();
-    assert_eq!(exact.used_bytes().unwrap(), base + quote);
+    assert_eq!(exact.payload_used_bytes().unwrap(), base + quote);
     drop(source);
-    assert_eq!(exact.used_bytes().unwrap(), 0);
+    assert_eq!(exact.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn failed_catalog_pinning_retains_original_source_and_metadata_account() {
@@ -258,7 +258,7 @@ fn failed_catalog_pinning_retains_original_source_and_metadata_account() {
         return;
     }
     let dir = fixture();
-    let pool = WorkingMemoryPool::new(2_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
     let inspection = eredu_core::inspect_artifact(dir.path(), &Resolver).unwrap();
     let contract = resolution(dir.path());
     let tensors = TensorCatalog::new(inspection.tensors().descriptors().cloned().map(
@@ -268,10 +268,9 @@ fn failed_catalog_pinning_retains_original_source_and_metadata_account() {
         },
     ))
     .unwrap();
-    let quote =
-        WorkingMemoryPool::prepared_safetensors_view_bytes(&tensors, &contract, POLICY).unwrap();
+    let quote = MemoryLedger::prepared_safetensors_view_bytes(&tensors, &contract, POLICY).unwrap();
     let source = leaf(&pool, dir.path());
-    let base = pool.used_bytes().unwrap();
+    let base = pool.payload_used_bytes().unwrap();
     let error = pool
         .prepare_safetensors_views(source, &tensors, &contract, POLICY)
         .unwrap_err();
@@ -282,10 +281,10 @@ fn failed_catalog_pinning_retains_original_source_and_metadata_account() {
         ))
     ));
     assert!(error.rejected_source().is_some());
-    assert_eq!(pool.used_bytes().unwrap(), base + quote);
-    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), base + quote);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn view_origin_rejects_foreign_and_ordinary_sources_without_strong_pool_cycle() {
@@ -293,8 +292,8 @@ fn view_origin_rejects_foreign_and_ordinary_sources_without_strong_pool_cycle() 
         return;
     }
     let dir = fixture();
-    let pool = WorkingMemoryPool::new(2_000_000, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(2_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(2_000_000, 0).unwrap();
     let inspection = eredu_core::inspect_artifact(dir.path(), &Resolver).unwrap();
     let contract = resolution(dir.path());
     let error = foreign
@@ -310,8 +309,8 @@ fn view_origin_rejects_foreign_and_ordinary_sources_without_strong_pool_cycle() 
         Some(WorkingMemoryError::IdentityMismatch)
     ));
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     let ordinary = RetainedCheckpointSource::from_safetensors(
         SafetensorsWeightStore::open(dir.path()).unwrap(),
     );

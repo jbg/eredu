@@ -1,8 +1,8 @@
 //! One cold materialization slot admitted before its fixed destinations exist.
 use super::{MaterializationPayloadShape, PreparedWeightMaterialization};
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use std::{cell::RefCell, collections::TryReserveError, fmt};
 
@@ -57,13 +57,13 @@ pub(crate) struct ColdMaterializationSlotError(SharedNativeInitializationError<I
 
 impl ColdMaterializationSlotError {
     pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
-        eredu_core::BackendFailure::from_error(
-            self.0.into_parts().1.retire_output_and_map_error(|error| {
+        eredu_core::BackendFailure::from_error(self.0.into_parts().1.retire_output_and_map_error(
+            |error| {
                 let ConstructionFailure { _prefix, cause } = error;
                 drop(_prefix);
                 cause
-            }),
-        )
+            },
+        ))
     }
 }
 
@@ -82,11 +82,11 @@ impl ColdMaterializationSlot {
     pub(crate) fn required_bytes(
         shape: MaterializationPayloadShape,
     ) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::shared_native_initialization_required_bytes(&Initializer(shape))
+        MemoryLedger::shared_native_initialization_required_bytes(&Initializer(shape))
     }
 
     pub(crate) fn prepare(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         shape: MaterializationPayloadShape,
     ) -> Result<Self, ColdMaterializationSlotError> {
         pool.initialize_shared_native(Initializer(shape))
@@ -98,7 +98,7 @@ impl ColdMaterializationSlot {
     /// happen only once and creates neither another node nor request authority.
     pub(crate) fn take(
         &mut self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<PreparedWeightMaterialization, WorkingMemoryError> {
         self.0.validate_pool(pool)?;
         self.0

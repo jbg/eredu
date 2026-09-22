@@ -91,10 +91,11 @@ record cannot fit within its transport budget.
 The measured encoding is compact JSON; application framing, newlines, pretty
 printing, or additional encoding require a separate transport allowance.
 
-These limits do not bound the model, KV cache, accelerator allocator overhead,
-native private reduction workspace, or a caller's retained history. MLX rejects
-`physical_native_bytes`; logical accounting must not be presented as a hard
-physical allocator ceiling. Native capture uses borrowed source values inside
+These logical limits do not bound the model, KV cache, accelerator allocator
+overhead or a caller's retained history. Capture allocations also consume the
+enclosing request's per-domain memory allowances through `MemoryLedger`.
+Logical accounting does not establish a physical allocator or process ceiling.
+Native capture uses borrowed source values inside
 the observer call, evaluates dependencies before slicing, and returns only host
 records. It retains no views or lazy capture graphs across later model blocks.
 

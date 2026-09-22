@@ -42,11 +42,9 @@ fn native_issuer_cold_projection_preserves_exact_typed_source_without_retry_or_r
 #[test]
 fn native_issuer_requested_owner_layouts_keep_capacity_and_allocator_proof_separate() {
     let runtime = PreparedInputRuntime::prepare().unwrap();
-    let zero =
-        PreparedOriginalBufferBudget::<OriginalNativeBudgetCustody>::layout(&runtime, 0).unwrap();
+    let zero = PreparedOriginalBufferBudget::<NativeBudgetOwner>::layout(&runtime, 0).unwrap();
     let nonzero =
-        PreparedOriginalBufferBudget::<OriginalNativeBudgetCustody>::layout(&runtime, 8192)
-            .unwrap();
+        PreparedOriginalBufferBudget::<NativeBudgetOwner>::layout(&runtime, 8192).unwrap();
     assert_eq!(zero.capacity, 0);
     assert_eq!(nonzero.capacity, 8192);
     assert!(nonzero.native_owner_bytes > 0);
@@ -104,23 +102,27 @@ fn native_issuer_selected_plan_stays_unknown_even_for_actual_existing_source_onl
     let mechanism = MlxNativeStorage::new(&runtime, &selection);
     let root = Array::from_slice(&[2.5f32, -6.0], &[2]);
     let allocation = root.allocation_info().unwrap().unwrap();
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let registered = pool
-        .register_storage([(
-            StorageIdentity::Native(allocation.identity()),
-            allocation.bytes() as u64,
-        )])
-        .unwrap();
+    let pool = crate::memory_fixture::ledger(1_000_000, 0).unwrap();
+    let mut inventory = crate::backend::runtime::residency::storage::RetainedStorage::default();
+    inventory.include_array(&root).unwrap();
+    let registered = inventory.register(&pool).unwrap();
     let context = WorkspaceContext::new(
         crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms::current_host().unwrap(),
     );
-    let existing = WorkspaceExistingStorage::new(Some(allocation.bytes() as u64), &context);
+    let placement = crate::backend::managed_memory::cold_allocation_placement(&allocation).unwrap();
+    let existing = WorkspaceExistingStorage::try_new_placed_with_host_controls(
+        Some(allocation.bytes() as u64),
+        placement,
+        Some(allocation.host_control_bytes() as u64),
+        &context,
+    )
+    .unwrap();
     let storage = RegisteredWorkspaceStorage::bind(
         &pool,
         &context,
-        [(
-            StorageIdentity::Native(allocation.identity()),
-            existing.clone(),
+        [crate::backend::nn::workspace::registered_storage_row(
+            allocation.identity(),
+            &existing,
         )],
     )
     .unwrap();
@@ -165,7 +167,8 @@ fn native_issuer_selected_plan_stays_unknown_even_for_actual_existing_source_onl
             "fixture visits one already registered array without new operations",
         )
     };
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: zero(),
         attention: zero(),
@@ -173,11 +176,11 @@ fn native_issuer_selected_plan_stays_unknown_even_for_actual_existing_source_onl
         state_update: zero(),
         materialization: zero(),
         retained: zero(),
-    };
+    });
     let quote = ResidualInferenceQuote::compose(&report, state, outside, &storage)
         .unwrap()
         .into_incremental();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let plan = mechanism
         .selected_plan(quote.span_workspace(), None, None, None)
         .unwrap();
@@ -196,7 +199,7 @@ fn native_issuer_selected_plan_stays_unknown_even_for_actual_existing_source_onl
             WorkingMemoryError::UnknownBound
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert_eq!(
         root.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
         &[2.5, -6.0]
@@ -356,3 +359,11 @@ fn immutable_array_proves_physical_ownership_without_claiming_prepaid_funding() 
         &[2.0, -3.0, 7.0]
     );
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

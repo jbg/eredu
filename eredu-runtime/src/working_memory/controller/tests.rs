@@ -1,11 +1,10 @@
 use super::*;
 use crate::working_memory::{
-    InferenceExecutionIdentity, WorkingMemoryFundingRun, WorkingMemoryPool,
-    WorkingMemoryReservation,
+    InferenceExecutionIdentity, MemoryLedger, WorkingMemoryFundingRun, WorkingMemoryReservation,
 };
 use eredu_core::{
     Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
-    InputTokenCount, LayerSchedule, OutputDemand, SharedStorageDomain, StateMemoryLayout,
+    InputTokenCount, LayerSchedule, OutputDemand, SharedStorageAccountingId, StateMemoryLayout,
     TextControllerStorage, TokenFilter, WorkspaceBound,
 };
 use std::{
@@ -82,67 +81,84 @@ fn token_filter(capacity: usize) -> TokenFilter {
 // A stateless portable execution with an explicit enclosing host allowance.
 // No native execution or allocation bound is inferred by these ledger tests.
 fn funding(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
+    controls: u64,
 ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
-    pool.reserve(&InferenceExecutionIdentity::default(), &admission(bytes))
-        .unwrap()
-        .into_funding()
-        .unwrap()
-}
-
-fn admission(bytes: u64) -> Admission {
-    let geometry = InferenceGeometry {
-        batch_size: 1,
-        cached_positions: 0,
-        input_positions: 1,
-        max_output_tokens: 1,
-        prefill_chunk_positions: 1,
-        output: OutputDemand::LastPosition,
-    };
-    let layout = StateMemoryLayout::new(
-        LayerSchedule::empty(),
-        vec![],
-        1,
-        1,
-        EstimationCompleteness::Complete,
-    )
-    .unwrap();
-    let bound = |n| {
-        WorkspaceBound::bounded(
-            n,
-            "portable controller fixture: only enclosing host storage",
-        )
-    };
-    let state = eredu_core::estimate_runtime_state(
-        &layout,
-        InputTokenCount::text(1),
-        1,
-        1,
-        NonZeroU8::new(4).unwrap(),
+    pool.reserve(
+        &InferenceExecutionIdentity::default(),
+        &funding_admission(pool, bytes, controls),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: bound(0),
-        attention: bound(0),
-        vocabulary: bound(0),
-        state_update: bound(0),
-        materialization: bound(0),
-        retained: bound(bytes),
-    })
-    .unwrap();
-    Admission {
-        requested_positions: 2,
-        state,
-        incremental_required_bytes: bytes,
-        available_memory_bytes: None,
-    }
+    .into_funding()
+    .unwrap()
 }
 
-fn balances(pool: &WorkingMemoryPool) -> (u64, u64, u64) {
+fn funding_admission(pool: &MemoryLedger, bytes: u64, controls: u64) -> Admission {
+    let mut admission = admission(pool, bytes);
+    let workspace = admission.state.execution_workspace.as_mut().unwrap();
+    workspace.retained = WorkspaceBound::bounded(controls, "controller publication constructor");
+    workspace.physical_domains.as_mut().unwrap().retained =
+        crate::working_memory::memory_fixture::host_requirements(pool, controls);
+    admission.incremental_required_bytes = Some(bytes + controls);
+    admission
+}
+
+fn admission(pool: &MemoryLedger, bytes: u64) -> Admission {
+    crate::working_memory::memory_fixture::host_admission(pool, bytes)
+}
+
+fn balances(pool: &MemoryLedger) -> (u64, u64) {
     let usage = pool.0.usage.lock().unwrap();
-    (usage.reserved, usage.registered, usage.peak)
+    (
+        usage.reserved - usage.funding.control_bytes().unwrap(),
+        usage.registered - usage.registry_metadata,
+    )
+}
+fn payload_bytes(reservation: &WorkingMemoryReservation) -> Option<u64> {
+    reservation
+        .admission()
+        .state
+        .execution_workspace
+        .as_ref()?
+        .activations
+        .bytes()
+}
+fn source_controls() -> u64 {
+    super::controller_publication_layout()
+        .unwrap()
+        .requested_bytes()
+        + MemoryLedger::storage_metadata_control_bytes().unwrap()
+}
+fn reservation_controls() -> u64 {
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    crate::working_memory::memory_fixture::reservation_bytes(&pool, &admission(&pool, 0))
+}
+fn metadata_budget() -> u64 {
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let report =
+        crate::working_memory::memory_fixture::reservation_bytes(&pool, &admission(&pool, 0));
+    let source = super::controller_publication_layout()
+        .unwrap()
+        .requested_bytes()
+        + MemoryLedger::storage_metadata_control_bytes().unwrap();
+    let pin =
+        crate::working_memory::StoragePublicationLayout::<eredu_core::SharedStorageIdentity>::new(
+            4,
+        )
+        .unwrap()
+        .requested_bytes()
+            + MemoryLedger::storage_metadata_control_bytes().unwrap();
+    3 * report + 6 * source + 2 * pin
+}
+pub(super) fn host_ledger(
+    capacity: u64,
+    existing: u64,
+) -> Result<MemoryLedger, WorkingMemoryError> {
+    crate::working_memory::memory_fixture::host_ledger(
+        capacity.checked_add(metadata_budget()).unwrap(),
+        existing,
+    )
 }
 
 #[test]
@@ -172,84 +188,85 @@ fn exact_spare_capacity_is_priced_once_beyond_the_emitted_filter() {
         })
     ));
     assert_eq!(controller.decisions.get(), 0);
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
-    let (metadata, run) = funding(&pool, 128);
+    let pool = host_ledger(512, 0).unwrap();
+    let (metadata, run) = funding(&pool, 128, contract.publication_control_bytes().unwrap());
     let scope = run.scope().unwrap();
     controller.additional = 37;
     contract
         .validate_workspace(controller.inference_workspace(2).unwrap())
         .unwrap();
     contract.adopt(&controller, &scope).unwrap();
-    assert_eq!(balances(&pool), (91, 37, 128));
+    assert_eq!(balances(&pool), (91, 37));
     scope.certify().unwrap();
     drop((run, controller));
-    assert_eq!(pool.used_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(metadata.bytes(), 128);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(payload_bytes(&metadata), Some(128));
 }
 
 #[test]
 fn repeated_full_runs_share_one_charge_and_preexisting_alias_outlives_both() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let source = mask(37);
     let escaped_before_attachment = source.clone();
     let controller = Controller::new(vec![source], 37);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     let metadata_contract = contract.clone();
-    let (first_metadata, first) = funding(&pool, 128);
+    let (first_metadata, first) =
+        funding(&pool, 128, contract.publication_control_bytes().unwrap());
     let scope = first.scope().unwrap();
     contract.adopt(&controller, &scope).unwrap();
     scope.certify().unwrap();
     drop(first);
-    assert_eq!(balances(&pool), (0, 37, 128));
+    assert_eq!(balances(&pool), (0, 37));
 
-    let (second_metadata, second) = funding(&pool, 128);
-    assert_eq!(balances(&pool), (128, 37, 165));
+    let (second_metadata, second) = funding(&pool, 128, 0);
+    assert_eq!(balances(&pool), (128, 37));
     let scope = second.scope().unwrap();
     contract.adopt(&controller, &scope).unwrap();
     contract.adopt(&controller, &scope).unwrap();
-    assert_eq!(balances(&pool), (128, 37, 165));
+    assert_eq!(balances(&pool), (128, 37));
     scope.certify().unwrap();
     drop((second, controller, contract));
-    assert_eq!(balances(&pool), (0, 37, 165));
+    assert_eq!(balances(&pool), (0, 37));
     drop(escaped_before_attachment);
     // Neither historical request nor contract metadata retains the mask charge.
-    assert_eq!(balances(&pool), (0, 0, 165));
-    assert_eq!(first_metadata.bytes(), 128);
-    assert_eq!(second_metadata.bytes(), 128);
+    assert_eq!(balances(&pool), (0, 0));
+    assert_eq!(payload_bytes(&first_metadata), Some(128));
+    assert_eq!(payload_bytes(&second_metadata), Some(128));
     drop((metadata_contract, first_metadata, second_metadata));
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
 }
 
 #[test]
-fn independent_pool_domains_each_retain_the_shared_physical_payload() {
-    let first_pool = WorkingMemoryPool::new(512, 0).unwrap();
-    let second_pool = WorkingMemoryPool::new(512, 0).unwrap();
+fn independent_ledgers_each_retain_the_shared_physical_payload() {
+    let first_pool = host_ledger(512, 0).unwrap();
+    let second_pool = host_ledger(512, 0).unwrap();
     let source = mask(37);
     let controller = Controller::new(vec![source.clone()], 37);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     for pool in [&first_pool, &second_pool] {
-        let (metadata, run) = funding(pool, 128);
+        let (metadata, run) = funding(pool, 128, contract.publication_control_bytes().unwrap());
         let scope = run.scope().unwrap();
         contract.adopt(&controller, &scope).unwrap();
-        assert_eq!(balances(pool), (91, 37, 128));
+        assert_eq!(balances(pool), (91, 37));
         scope.certify().unwrap();
         drop((run, metadata));
-        assert_eq!(pool.used_bytes().unwrap(), 37);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     }
     drop(controller);
-    assert_eq!(first_pool.used_bytes().unwrap(), 37);
-    assert_eq!(second_pool.used_bytes().unwrap(), 37);
+    assert_eq!(first_pool.payload_used_bytes().unwrap(), 37);
+    assert_eq!(second_pool.payload_used_bytes().unwrap(), 37);
     drop(source);
-    assert_eq!(first_pool.used_bytes().unwrap(), 0);
-    assert_eq!(second_pool.used_bytes().unwrap(), 0);
+    assert_eq!(first_pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(second_pool.payload_used_bytes().unwrap(), 0);
     drop(contract);
 }
 
 #[test]
 fn unknown_lifetime_rejects_without_callbacks_or_accounting_changes() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let mut controller = Controller::new(vec![mask(37)], 37);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     controller.known = false;
@@ -265,8 +282,8 @@ fn unknown_lifetime_rejects_without_callbacks_or_accounting_changes() {
             WorkingMemoryError::UnknownBound
         ))
     ));
-    assert_eq!(balances(&pool), (0, 0, 0));
-    let (metadata, run) = funding(&pool, 128);
+    assert_eq!(balances(&pool), (0, 0));
+    let (metadata, run) = funding(&pool, 128, 0);
     let scope = run.scope().unwrap();
     assert!(matches!(
         contract.adopt(&controller, &scope),
@@ -274,18 +291,18 @@ fn unknown_lifetime_rejects_without_callbacks_or_accounting_changes() {
             WorkingMemoryError::UnknownBound
         ))
     ));
-    assert_eq!(balances(&pool), (128, 0, 128));
+    assert_eq!(balances(&pool), (128, 0));
     assert_eq!(controller.decisions.get(), 0);
     // No acquisition occurred, and all fixture payloads retire before scope certification.
     drop(controller);
     scope.certify().unwrap();
     drop((run, metadata));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn equal_sized_replacements_and_erased_decision_provenance_cannot_substitute_storage() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let original = mask(37);
     let replacement = mask(37);
     assert_eq!(original, replacement);
@@ -338,7 +355,7 @@ fn equal_sized_replacements_and_erased_decision_provenance_cannot_substitute_sto
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    let (metadata, run) = funding(&pool, 128);
+    let (metadata, run) = funding(&pool, 128, 0);
     let scope = run.scope().unwrap();
     assert!(matches!(
         contract.adopt(&controller, &scope),
@@ -346,44 +363,44 @@ fn equal_sized_replacements_and_erased_decision_provenance_cannot_substitute_sto
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    assert_eq!(balances(&pool), (128, 0, 128));
+    assert_eq!(balances(&pool), (128, 0));
     assert_eq!(controller.decisions.get(), 0);
     drop((good, foreign, erased));
     drop((controller, original, replacement, alias));
     scope.certify().unwrap();
     drop((run, metadata));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn completed_attachment_survives_later_preparation_rejection_without_retaining_unused_funding() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let escaped = mask(53);
     let controller = Controller::new(vec![escaped.clone()], 53);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
-    let (metadata, run) = funding(&pool, 192);
+    let (metadata, run) = funding(&pool, 192, contract.publication_control_bytes().unwrap());
     let scope = run.scope().unwrap();
     contract.adopt(&controller, &scope).unwrap();
-    assert_eq!(balances(&pool), (139, 53, 192));
+    assert_eq!(balances(&pool), (139, 53));
     // Simulate a later preparation agreement rejection before other work starts.
     // Complete shared publication permits safe certification after local payload retirement.
     drop(controller);
     scope.certify().unwrap();
     drop((run, metadata));
-    assert_eq!(balances(&pool), (0, 53, 192));
+    assert_eq!(balances(&pool), (0, 53));
     assert!(contract.shared_bytes > 0);
     drop(escaped);
-    assert_eq!(balances(&pool), (0, 0, 192));
+    assert_eq!(balances(&pool), (0, 0));
     drop(contract);
 }
 
 #[test]
 fn partial_attachment_and_uncertified_retirement_quarantine_the_remaining_envelope() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let mut sources = vec![mask(37), mask(53)];
     sources.sort_by(|a, b| a.identity().cmp(b.identity()));
     let first_bytes = sources[0].capacity_bytes().unwrap();
-    let poison_domain = SharedStorageDomain::default();
+    let poison_domain = SharedStorageAccountingId::default();
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
             let _ =
@@ -396,7 +413,7 @@ fn partial_attachment_and_uncertified_retirement_quarantine_the_remaining_envelo
     contract
         .validate_workspace(controller.inference_workspace(1).unwrap())
         .unwrap();
-    let (metadata, run) = funding(&pool, 192);
+    let (metadata, run) = funding(&pool, 192, contract.publication_control_bytes().unwrap());
     let scope = run.scope().unwrap();
     assert!(matches!(
         contract.adopt(&controller, &scope),
@@ -404,12 +421,27 @@ fn partial_attachment_and_uncertified_retirement_quarantine_the_remaining_envelo
             SharedStorageAttachmentError::Poisoned
         ))
     ));
-    assert_eq!(balances(&pool), (192 - first_bytes, first_bytes, 192));
+    assert_eq!(
+        balances(&pool),
+        (
+            192 + contract.publication_control_bytes().unwrap() / 2 - first_bytes,
+            first_bytes
+        )
+    );
     drop((scope, run, metadata));
-    assert_eq!(balances(&pool), (192 - first_bytes, first_bytes, 192));
+    assert_eq!(
+        balances(&pool),
+        (
+            192 + contract.publication_control_bytes().unwrap() / 2 - first_bytes,
+            first_bytes
+        )
+    );
     drop(controller);
     // Retiring the partial publication returns credit to quarantine, never refunds it.
-    assert_eq!(balances(&pool), (192, 0, 192));
+    assert_eq!(
+        balances(&pool),
+        (192 + contract.publication_control_bytes().unwrap(), 0)
+    );
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
@@ -420,23 +452,23 @@ fn partial_attachment_and_uncertified_retirement_quarantine_the_remaining_envelo
 #[test]
 fn final_filter_retirement_allows_accounting_reentry() {
     struct Reenter {
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         called: Arc<AtomicBool>,
     }
     impl Drop for Reenter {
         fn drop(&mut self) {
             assert!(self.pool.0.usage.try_lock().is_ok());
-            let extra = self.pool.register_storage([(719_u32, 11)]).unwrap();
-            assert!(self.pool.used_bytes().unwrap() >= 11);
+            let extra = self.pool.register_host_storage([(719_u32, 11)]).unwrap();
+            assert!(self.pool.payload_used_bytes().unwrap() >= 11);
             drop(extra);
             self.called.store(true, Ordering::SeqCst);
         }
     }
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let source = mask(37);
     let called = Arc::new(AtomicBool::new(false));
     source
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Reenter {
                 pool: pool.clone(),
                 called: called.clone(),
@@ -445,24 +477,27 @@ fn final_filter_retirement_allows_accounting_reentry() {
         .unwrap();
     let controller = Controller::new(vec![source], 37);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
-    let (metadata, run) = funding(&pool, 128);
+    let (metadata, run) = funding(&pool, 128, contract.publication_control_bytes().unwrap());
     let scope = run.scope().unwrap();
     contract.adopt(&controller, &scope).unwrap();
     scope.certify().unwrap();
     drop((run, metadata));
-    assert_eq!(pool.used_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     drop(controller);
     assert!(called.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(contract);
 }
 
 #[test]
 fn source_construction_rejects_live_reservations_before_invoking_factory() {
     for bytes in [0, 128] {
-        let pool = WorkingMemoryPool::new(512, 0).unwrap();
+        let pool = host_ledger(512, 0).unwrap();
         let reservation = pool
-            .reserve(&InferenceExecutionIdentity::default(), &admission(bytes))
+            .reserve(
+                &InferenceExecutionIdentity::default(),
+                &admission(&pool, bytes),
+            )
             .unwrap();
         let calls = Cell::new(0);
         let result = pool.prepare_shared_token_filter(|| {
@@ -476,7 +511,7 @@ fn source_construction_rejects_live_reservations_before_invoking_factory() {
             ))
         ));
         assert_eq!(calls.get(), 0);
-        assert_eq!(balances(&pool), (bytes, 0, bytes));
+        assert_eq!(balances(&pool), (bytes, 0));
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
         drop(reservation);
 
@@ -485,7 +520,7 @@ fn source_construction_rejects_live_reservations_before_invoking_factory() {
                 calls.set(calls.get() + 1);
                 assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
                 assert!(matches!(
-                    pool.reserve(&InferenceExecutionIdentity::default(), &admission(0)),
+                    pool.reserve(&InferenceExecutionIdentity::default(), &admission(&pool, 0)),
                     Err(WorkingMemoryError::UnknownBound)
                 ));
                 token_filter(37)
@@ -494,19 +529,23 @@ fn source_construction_rejects_live_reservations_before_invoking_factory() {
         assert_eq!(calls.get(), 1);
         assert_eq!(source.capacity_bytes(), Some(37));
         assert_eq!(source.allowed_mask(), Some(&[true, false, true][..]));
-        assert_eq!(balances(&pool), (0, 37, bytes.max(37)));
+        assert_eq!(balances(&pool), (0, 37));
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
         let alias = source.clone();
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), 37);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 37);
         drop(alias);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn never_admitted_sources_compete_with_the_next_request_for_domain_capacity() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        100 + 2 * source_controls() + reservation_controls(),
+        0,
+    )
+    .unwrap();
     let first = pool
         .prepare_shared_token_filter(|| token_filter(37))
         .unwrap();
@@ -514,20 +553,22 @@ fn never_admitted_sources_compete_with_the_next_request_for_domain_capacity() {
         .prepare_shared_token_filter(|| token_filter(53))
         .unwrap();
     let second_alias = second.clone();
-    assert_eq!(balances(&pool), (0, 90, 90));
+    assert_eq!(balances(&pool), (0, 90));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     assert!(matches!(
-        pool.reserve(&InferenceExecutionIdentity::default(), &admission(11)),
-        Err(WorkingMemoryError::BudgetExceeded {
-            required_bytes: 11,
-            available_bytes: 10
-        })
+        pool.reserve(&InferenceExecutionIdentity::default(), &admission(&pool, 11)),
+        Err(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded {
+            limit_bytes, existing_bytes, requested_bytes, ..
+        })) if requested_bytes == 11+reservation_controls() && limit_bytes-existing_bytes == 10+reservation_controls()
     ));
-    assert_eq!(balances(&pool), (0, 90, 90));
+    assert_eq!(balances(&pool), (0, 90));
     let exact = pool
-        .reserve(&InferenceExecutionIdentity::default(), &admission(10))
+        .reserve(
+            &InferenceExecutionIdentity::default(),
+            &admission(&pool, 10),
+        )
         .unwrap();
-    assert_eq!(balances(&pool), (10, 90, 100));
+    assert_eq!(balances(&pool), (10, 90));
     let called = Cell::new(false);
     assert!(
         pool.prepare_shared_token_filter(|| {
@@ -539,16 +580,16 @@ fn never_admitted_sources_compete_with_the_next_request_for_domain_capacity() {
     assert!(!called.get());
     drop(exact);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 90);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 90);
     drop(second_alias);
-    assert_eq!(pool.used_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     drop(first);
-    assert_eq!(balances(&pool), (0, 0, 100));
+    assert_eq!(balances(&pool), (0, 0));
 }
 
 #[test]
 fn prepared_source_reuses_its_existing_charge_during_full_funded_admission() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let source = pool
         .prepare_shared_token_filter(|| token_filter(37))
         .unwrap();
@@ -557,27 +598,31 @@ fn prepared_source_reuses_its_existing_charge_during_full_funded_admission() {
     contract
         .validate_workspace(controller.inference_workspace(1).unwrap())
         .unwrap();
-    assert_eq!(balances(&pool), (0, 37, 37));
-    let (metadata, run) = funding(&pool, 128);
+    assert_eq!(balances(&pool), (0, 37));
+    let (metadata, run) = funding(&pool, 128, 0);
     let scope = run.scope().unwrap();
-    assert_eq!(balances(&pool), (128, 37, 165));
+    assert_eq!(balances(&pool), (128, 37));
     contract.adopt(&controller, &scope).unwrap();
     // The source was already attached to this exact domain; no funding credit
     // transfers and the complete ordinary request envelope is still retained.
-    assert_eq!(balances(&pool), (128, 37, 165));
+    assert_eq!(balances(&pool), (128, 37));
     scope.certify().unwrap();
     drop((run, controller));
-    assert_eq!(balances(&pool), (0, 37, 165));
+    assert_eq!(balances(&pool), (0, 37));
     drop(source);
-    assert_eq!(balances(&pool), (0, 0, 165));
-    assert_eq!(metadata.bytes(), 128);
+    assert_eq!(balances(&pool), (0, 0));
+    assert_eq!(payload_bytes(&metadata), Some(128));
     drop((metadata, contract));
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
 }
 
 #[test]
 fn source_registration_rejection_and_factory_unwind_release_temporary_authority() {
-    let pool = WorkingMemoryPool::new(36, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        36 + source_controls() + MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        0,
+    )
+    .unwrap();
     let calls = Cell::new(0);
     let error = pool
         .prepare_shared_token_filter(|| {
@@ -597,13 +642,12 @@ fn source_registration_rejection_and_factory_unwind_release_temporary_authority(
     };
     assert!(matches!(
         capacity,
-        WorkingMemoryError::BudgetExceeded {
-            required_bytes: 37,
-            available_bytes: 36
-        }
+        WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded {
+            requested_bytes: 37, limit_bytes, existing_bytes, ..
+        }) if limit_bytes-existing_bytes == 36
     ));
     assert_eq!(calls.get(), 1);
-    assert_eq!(balances(&pool), (0, 0, 0));
+    assert_eq!(balances(&pool), (0, 0));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     drop(error);
 
@@ -619,33 +663,38 @@ fn source_registration_rejection_and_factory_unwind_release_temporary_authority(
         .is_err()
     );
     assert_eq!(calls.get(), 2);
-    assert_eq!(balances(&pool), (0, 0, 0));
+    assert_eq!(balances(&pool), (0, 0));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     // Both failure paths left the pool usable, including zero-payload owners.
     let all = pool
         .prepare_shared_token_filter(|| TokenFilter::All)
         .unwrap();
     assert_eq!(all.capacity_bytes(), Some(0));
-    assert_eq!(balances(&pool), (0, 0, 0));
+    assert_eq!(balances(&pool), (0, 0));
     let exact = pool
-        .reserve(&InferenceExecutionIdentity::default(), &admission(36))
+        .prepare_shared_token_filter(|| token_filter(36))
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 36);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 36);
     drop((exact, all));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn retained_original_controller_accepts_empty_inventory_without_adopting_shared_sources() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let mut controller = Controller::new(vec![], 0);
     let workspace = controller.inference_workspace(2).unwrap();
-    let contract =
-        ControllerStorageContract::inspect_original_retained(&controller, workspace, &pool, &InferenceExecutionIdentity::default(), 2)
-            .unwrap();
+    let contract = ControllerStorageContract::inspect_original_retained(
+        &controller,
+        workspace,
+        &pool,
+        &InferenceExecutionIdentity::default(),
+        2,
+    )
+    .unwrap();
     assert!(!contract.has_original_domain());
     contract.validate(&controller).unwrap();
-    assert_eq!(balances(&pool), (0, 0, 0));
+    assert_eq!(balances(&pool), (0, 0));
 
     controller.known = false;
     assert!(
@@ -673,7 +722,7 @@ fn retained_original_controller_accepts_empty_inventory_without_adopting_shared_
     );
     assert!(contract.validate(&controller).is_err());
     assert_eq!(controller.decisions.get(), 0);
-    assert_eq!(balances(&pool), (0, 0, 0));
+    assert_eq!(balances(&pool), (0, 0));
 }
 
 mod declarations;

@@ -56,7 +56,7 @@ impl PreparedResidencyAttempt {
         mut source_bank: Option<&mut eredu_runtime::working_memory::OriginalHostDestinationBank>,
         disk: Option<(
             &ForegroundDiskWindowPlan,
-            &eredu_runtime::working_memory::WorkingMemoryPool,
+            &eredu_runtime::working_memory::MemoryLedger,
             &ForegroundDiskSourceCapacity,
         )>,
         reservation: Option<&eredu_runtime::working_memory::WorkingMemoryReservation>,
@@ -103,7 +103,9 @@ impl PreparedResidencyAttempt {
             return Err(identity());
         }
         if let Some((_, _, capacity)) = disk {
-            if !capacity.custody().metadata_custody().same_account(custody) { return Err(identity()); }
+            if !capacity.custody().metadata_custody().same_account(custody) {
+                return Err(identity());
+            }
         }
         let foreground_disk = match disk {
             Some((plan, pool, capacity)) => plan
@@ -221,6 +223,7 @@ impl PreparedResidencyAttempt {
         reservation: Option<&'a eredu_runtime::working_memory::WorkingMemoryReservation>,
     ) -> OriginalResidencySlots<'a> {
         OriginalResidencySlots {
+            materialized_recipe: None,
             background_host: None,
             controller: &mut self.controller,
             closure_ids: &mut self.closure_ids,
@@ -275,7 +278,10 @@ struct ClosurePreparationFailure {
     cause: ClosurePreparationCause,
     _controls: OriginalOperationMetadataCustody,
 }
-fn closure_error(error: ClosurePreparationError, controls: &OriginalOperationMetadataCustody) -> Error {
+fn closure_error(
+    error: ClosurePreparationError,
+    controls: &OriginalOperationMetadataCustody,
+) -> Error {
     let ClosurePreparationError { cause, prefix } = error;
     let error = Error::with_original_control_source(
         eredu_core::BackendFailure::from_error(ClosurePreparationFailure {
@@ -311,7 +317,7 @@ fn factory<'a>(
     mut source_bank: Option<&'a mut eredu_runtime::working_memory::OriginalHostDestinationBank>,
     disk: Option<(
         &'a ForegroundDiskWindowPlan,
-        &'a eredu_runtime::working_memory::WorkingMemoryPool,
+        &'a eredu_runtime::working_memory::MemoryLedger,
         &'a ForegroundDiskSourceCapacity,
     )>,
     reservation: Option<&'a eredu_runtime::working_memory::WorkingMemoryReservation>,
@@ -432,9 +438,17 @@ pub(super) fn prepare(
     disk: Option<&ForegroundDiskRequestPlan>,
     reservation: Option<&eredu_runtime::working_memory::WorkingMemoryReservation>,
     disk_source: Option<ForegroundDiskSourceTicket>,
-) -> Result<(Vec<PreparedOperationBank<PreparedResidencyAttempt>>, Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>), Error> {
+) -> Result<
+    (
+        Vec<PreparedOperationBank<PreparedResidencyAttempt>>,
+        Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+    ),
+    Error,
+> {
     if !matches!(tier, MemoryTier::Host | MemoryTier::Device)
-        || (tier == MemoryTier::Host && (disk.is_some() || source_owner.is_some() || gguf_host_runtime.is_some())) {
+        || (tier == MemoryTier::Host
+            && (disk.is_some() || source_owner.is_some() || gguf_host_runtime.is_some()))
+    {
         return Err(identity());
     }
     if disk.is_some_and(|plan| !plan.matches(sources.len(), forwards)) {
@@ -444,11 +458,24 @@ pub(super) fn prepare(
     // after exact reservation/domain authentication. Slots retain cheap clones;
     // they allocate final source buffers only when their read is consumed.
     let capacity = match (disk, disk_source) {
-        (Some(plan), Some(ForegroundDiskSourceTicket::Text(bank))) => {
-            Some(plan.prepare_capacity(controls.ok_or_else(identity)?.clone(), reservation.ok_or_else(identity)?, bank)?)
-        }
-        (Some(plan), Some(ForegroundDiskSourceTicket::Source { bank, custody: source })) => {
-            if controls.is_some() || reservation.is_some() || !source.metadata_custody().same_account(custody) { return Err(identity()); }
+        (Some(plan), Some(ForegroundDiskSourceTicket::Text(bank))) => Some(plan.prepare_capacity(
+            controls.ok_or_else(identity)?.clone(),
+            reservation.ok_or_else(identity)?,
+            bank,
+        )?),
+        (
+            Some(plan),
+            Some(ForegroundDiskSourceTicket::Source {
+                bank,
+                custody: source,
+            }),
+        ) => {
+            if controls.is_some()
+                || reservation.is_some()
+                || !source.metadata_custody().same_account(custody)
+            {
+                return Err(identity());
+            }
             Some(plan.prepare_source_capacity(source, None, bank)?)
         }
         (None, None) => None,
@@ -457,8 +484,15 @@ pub(super) fn prepare(
     let background = match disk.and_then(ForegroundDiskRequestPlan::background) {
         Some(background) => {
             let capacity = capacity.as_ref().ok_or_else(identity)?;
-            Some(background.prepare(manager, disk.expect("paired plan").pool(), ids,
-                disk.expect("paired plan").windows(), capacity.custody().clone(), reservation, capacity)?)
+            Some(background.prepare(
+                manager,
+                disk.expect("paired plan").pool(),
+                ids,
+                disk.expect("paired plan").windows(),
+                capacity.custody().clone(),
+                reservation,
+                capacity,
+            )?)
         }
         None => None,
     };
@@ -496,7 +530,9 @@ pub(super) fn prepare(
                 disk.map(|plan| {
                     (
                         match plan.background() {
-                            Some(background) => background.direct(ordinal).expect("validated direct window count"),
+                            Some(background) => background
+                                .direct(ordinal)
+                                .expect("validated direct window count"),
                             None => plan.window(ordinal).expect("validated window count"),
                         },
                         plan.pool(),

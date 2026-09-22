@@ -31,7 +31,7 @@ struct BudgetHandle {
   mlx_original_buffer_budget raw{};
   BudgetHandle(mlx_prepared_input_runtime runtime, unsigned& retired) {
     auto status = mlx_original_buffer_budget_new_retaining(&raw, runtime, 1 << 20,
-        &retired, [](void* p) { ++*static_cast<unsigned*>(p); });
+        &retired, [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr);
     if (status) throw std::runtime_error("budget fixture creation failed");
   }
   ~BudgetHandle() { mlx_original_buffer_budget_release(raw); }
@@ -152,7 +152,7 @@ TEST_CASE("original buffer safe ABI binds once and preserves owner on refusal") 
     REQUIRE(mlx_original_buffer_budget_bind(role.raw(), budget.raw) == 0);
     CHECK(mlx_original_buffer_budget_bind(role.raw(), budget.raw) == MLX_ORIGINAL_BUFFER_BOUND);
     CHECK(mlx_original_buffer_budget_new_retaining(&duplicate, prepared, 1,
-        &retired, [](void* p) { ++*static_cast<unsigned*>(p); }) == MLX_ORIGINAL_BUFFER_SCOPE);
+        &retired, [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == MLX_ORIGINAL_BUFFER_SCOPE);
     CHECK(duplicate.ctx == nullptr);
     CHECK(retired == 0);
     submission::mark_native_control_construction();

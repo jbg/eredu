@@ -15,7 +15,10 @@ pub(super) use builder::allocate;
 mod plan;
 // Only the frame holds partition provenance. Independently shared tensors retain
 // their existing numerical custody; neither owner retains its enclosing frame.
-pub(super) type CaptureFrameCustody = (CaptureTensorCustody, Option<eredu_nn::workspace::HostMetadataFunding>);
+pub(super) type CaptureFrameCustody = (
+    CaptureTensorCustody,
+    Option<eredu_nn::workspace::HostMetadataFunding>,
+);
 pub use builder::{CaptureStepFinishError, PreparedCaptureDelivery, PreparedCaptureStep};
 pub use builder::{PendingCaptureDelivery, PendingCaptureDeliveryError};
 pub use plan::CaptureStepHostPlan;

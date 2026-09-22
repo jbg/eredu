@@ -13,8 +13,9 @@ mod ordinary_prefill;
 mod policy;
 mod prefill_transaction;
 pub use funded::{
-    FundedCaptureCheckpoint, FundedCaptureCheckpointError, FundedCaptureDrainError,
-    FundedCaptureError, FundedCaptureSession, FundedEmbeddedCaptureInvocation,
+    FundedAutoregressiveCaptureInvocation, FundedCaptureCheckpoint, FundedCaptureCheckpointError,
+    FundedCaptureDrainError, FundedCaptureError, FundedCaptureSession,
+    FundedEmbeddedCaptureInvocation, FundedModelCaptureInvocation,
     FundedSpeculativeCaptureInvocation, PreparedFundedCaptureCheckpoint, ScheduledCaptureBackend,
 };
 pub use ordinary_prefill::OrdinaryPrefillCapture;
@@ -34,16 +35,18 @@ mod generated;
 mod invocation;
 pub(crate) use invocation::InvocationPreflightBudget;
 mod prefix;
-pub(crate) use prefix::{PrefixDestination,PrefixError};
+pub(crate) use prefix::{PrefixDestination, PrefixError};
 pub(crate) mod reduction;
 pub use invocation::CaptureInvocationSelection;
 pub use reduction::{
     CaptureHistogramError, CaptureSummaryError, histogram_prefill_usage, summary_prefill_usage,
 };
 mod speculative;
+pub(crate) use speculative::requires_sequence_readout;
 pub use speculative::{
     CaptureBackendProvider, OriginalSpeculativeCapture, OriginalSpeculativeCaptureError,
     OriginalSpeculativeCaptureInvocation, OriginalSpeculativeCapturePrefix,
+    OriginalSpeculativeCapturePreview, OriginalSpeculativeCaptureProspect,
     PartitionCaptureBackendProvider, PreparedSpeculativeActivationRestore,
     SpeculativeActivationCheckpoint, SpeculativeCaptureErrorTransport, SpeculativeCaptureObserver,
     SpeculativeCaptureScope,
@@ -652,7 +655,10 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
     Ok(())
 }
 
-pub(crate) fn completed_capture_outcome(transform: &CaptureTransform, available: u64) -> CaptureOutcome {
+pub(crate) fn completed_capture_outcome(
+    transform: &CaptureTransform,
+    available: u64,
+) -> CaptureOutcome {
     match transform {
         CaptureTransform::Preview { max_elements } if *max_elements < available => {
             CaptureOutcome::Truncated {

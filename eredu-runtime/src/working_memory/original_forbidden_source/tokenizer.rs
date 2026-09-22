@@ -4,7 +4,7 @@ use crate::working_memory::OriginalTokenizer;
 use eredu_core::SpeculativeBuffer;
 use eredu_text::token_bytes::PackedTokenBytePlan;
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Exact packed temporary plus independent immutable input destinations.
     /// The plan is a borrow; this query grants neither a source nor a work lease.
     pub fn forbidden_tokenizer_source_required_bytes(
@@ -29,7 +29,7 @@ impl WorkingMemoryPool {
             size_of::<Result<SpeculativeBuffer<u8>, eredu_core::SpeculativeBufferAllocationError>>(
             ),
             size_of::<Result<(), eredu_core::generation::GenerationError>>(),
-            size_of::<(&WorkingMemoryPool, &OriginalTokenizer, &[u8])>(),
+            size_of::<(&MemoryLedger, &OriginalTokenizer, &[u8])>(),
             size_of::<(
                 &PackedTokenBytePlan<'_>,
                 &[u8],
@@ -103,7 +103,11 @@ impl WorkingMemoryPool {
                 // retires before settlement and does not create a scalar refund.
                 drop(packed);
                 match account.finish() {
-                    Ok(()) => Ok(OriginalForbiddenSource { inputs, tokenizer: Some(tokenizer.clone()), account }),
+                    Ok(()) => Ok(OriginalForbiddenSource {
+                        inputs,
+                        tokenizer: Some(tokenizer.clone()),
+                        account,
+                    }),
                     Err(cause) => Err(OriginalForbiddenSourceError {
                         cause: cause.into(),
                         settlement: None,

@@ -89,6 +89,28 @@ impl Drop for Owner {
 
 #[test]
 fn retirement_pass_preserves_actual_alias_charge_and_leaves_host_reclaim_explicit() {
+    // Cache eviction synchronizes every native CPU stream. Other tests
+    // deliberately terminate a worker; this fixture needs its own live
+    // process to verify the explicit eviction/reclaim boundary independently.
+    const CHILD: &str = "SAFEMLX_EXPLICIT_RETIREMENT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let module = module_path!().split_once("::").unwrap().1;
+        let name = format!(
+            "{module}::retirement_pass_preserves_actual_alias_charge_and_leaves_host_reclaim_explicit"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "isolated explicit retirement test failed:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
     let source = Array::from_slice(&[11_i32, -13, 17, 19], &[4]);
     let alias = source.clone();
     let allocation = source
@@ -112,8 +134,8 @@ fn retirement_pass_preserves_actual_alias_charge_and_leaves_host_reclaim_explici
         Some(allocation)
     );
     runtime_lock::try_retire(|| drop(alias)).unwrap();
-    // Last native alias queues the real owner, but this API must not run its
-    // arbitrary Rust destructor under the native runtime lock.
+    // Last native alias returns the physical root to the allocator cache.
+    // Record retirement neither evicts that root nor runs Rust destructors.
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert_eq!(
         try_retire_completed_submissions().unwrap(),
@@ -121,6 +143,9 @@ fn retirement_pass_preserves_actual_alias_charge_and_leaves_host_reclaim_explici
     );
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
+    drop(_hook);
+    crate::memory::clear_cache().unwrap();
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }

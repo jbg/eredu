@@ -84,7 +84,8 @@ pub fn quote_completed_layerwise_window(
             }
             WorkspaceBound::Bounded {
                 assumptions: value, ..
-            } => {
+            }
+            | WorkspaceBound::PerDomain { assumptions: value } => {
                 assumptions.insert(value.as_str());
             }
         }
@@ -102,8 +103,16 @@ pub fn quote_completed_layerwise_window(
             ),
         });
     }
+    if maximum.is_none() {
+        return Ok(WorkspaceBound::PerDomain {
+            assumptions: format!(
+                "selected completed layerwise windows retain per-domain requirements; {}",
+                assumptions.into_iter().collect::<Vec<_>>().join("; ")
+            ),
+        });
+    }
     Ok(WorkspaceBound::bounded(
-        maximum.expect("all unit facts are known"),
+        maximum.expect("all unit scalar facts are known"),
         format!(
             "maximum over sequential group-bounded lookahead windows of depth {}; preceding consumer and transfer settle and release native references before replacement; registered existing host/static/window storage is separate; constructor/equation costs are separate; {}",
             depth.get(),

@@ -4,8 +4,9 @@ use super::text_quote::{CaptureFundingProbe, CapturedFundingQuote};
 use super::*;
 use crate::composition::mlx::session::model_session::{
     disk_layerwise_tests as disk, host_layerwise_tests as host,
-    saved_array_copy::{decoder::PreparedTextComponentsCopy, PreparedTextArrayCopy},
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{capture::*, TextGenerationBackend};
 use eredu_runtime::working_memory::CaptureRunHostPlan;
@@ -85,7 +86,7 @@ fn finish_runtime(runtime: Runtime, stream: &Stream) {
         .unwrap();
 }
 
-fn settle_terminal(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle_terminal(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         // Terminal native graph owners retire in bounded batches. Each record
         // needs its own completion proof; this empty event submits no tensor work.
@@ -94,26 +95,26 @@ fn settle_terminal(pool: &WorkingMemoryPool, bytes: u64) {
             .synchronize()
             .unwrap();
         disk::reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
 #[test]
 fn one_use_owner_moves_actual_source_and_keeps_host_hold_after_quote_retirement() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = host::runtime(&stream, &pool, None);
     let source = source(&runtime);
     let alias = source.clone();
     let independent = self::source(&runtime);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let h = CaptureRunHostPlan::prepare(&source)
         .unwrap()
         .initialization_peak_bytes();
     let c = source.capacity_bytes().unwrap();
     let preparation = admit(&runtime, &source);
     let quote = preparation.quote.as_ref().unwrap().clone();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let native = paths::snapshot();
     let error = quote
         .take_capture_installation(runtime.session(), &independent)
@@ -123,7 +124,7 @@ fn one_use_owner_moves_actual_source_and_keeps_host_hold_after_quote_retirement(
         cause::<WorkingMemoryError>(&error),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     let mut installed = quote
         .take_capture_installation(runtime.session(), &source)
         .unwrap();
@@ -135,7 +136,7 @@ fn one_use_owner_moves_actual_source_and_keeps_host_hold_after_quote_retirement(
     assert_eq!(installed.collector().spent_steps(), 0);
     assert!(!installed.collector_mut().has_pending_step());
     installed.validate_sources(&pool).unwrap();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     assert!(matches!(
         cause::<WorkingMemoryError>(&installed.validate_sources(&foreign).unwrap_err()),
         WorkingMemoryError::IdentityMismatch
@@ -149,7 +150,7 @@ fn one_use_owner_moves_actual_source_and_keeps_host_hold_after_quote_retirement(
         WorkingMemoryError::PreparationAlreadyStarted
     ));
     assert_eq!(paths::snapshot(), native);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     let protected = installed.span_workspace().protected_host_bytes();
     drop((quote, preparation));
     // The original bank and aggregate controls remain, while transient native
@@ -168,7 +169,7 @@ fn one_use_owner_moves_actual_source_and_keeps_host_hold_after_quote_retirement(
 #[test]
 fn installed_witness_rechecks_inherited_origin_after_bank_moves_and_quote_drops() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = host::runtime(&stream, &pool, None);
     let source = source(&runtime);
     let old = admit(&runtime, &source);
@@ -184,7 +185,7 @@ fn installed_witness_rechecks_inherited_origin_after_bank_moves_and_quote_drops(
     drop(current);
     installed.validate_sources(&pool).unwrap();
     drop(abandoned);
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let native = paths::snapshot();
     for _ in 0..2 {
         assert!(matches!(
@@ -193,13 +194,13 @@ fn installed_witness_rechecks_inherited_origin_after_bank_moves_and_quote_drops(
         ));
         assert_eq!(installed.collector().spent_steps(), 0);
         assert!(installed.source().same_storage(&source));
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
     }
     assert_eq!(paths::snapshot(), native);
     drop((installed, old, source));
     finish_runtime(runtime, &stream);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.fixture_host_charge().unwrap() > 0,
         "unresolved inherited source remains quarantined"
     );
 }
@@ -207,7 +208,7 @@ fn installed_witness_rechecks_inherited_origin_after_bank_moves_and_quote_drops(
 #[test]
 fn actual_funded_sampler_copy_rejects_capture_before_work_and_collector_slots_are_exclusive() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = host::runtime(&stream, &pool, None);
     let source = source(&runtime);
     // The genuine core options path binds and prepares this capture-only run.
@@ -223,22 +224,14 @@ fn actual_funded_sampler_copy_rejects_capture_before_work_and_collector_slots_ar
     assert!(quote.has_capture());
     require_empty(&state).unwrap();
     let native = paths::snapshot();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let revision = runtime.session().payload.model.erased().state_snapshot();
-    for error in [
-        PreparedTextArrayCopy::prepare(&runtime, &state.sampling, None)
-            .err()
-            .unwrap(),
-        PreparedTextComponentsCopy::prepare(&runtime, &state.sampling, None)
-            .err()
-            .unwrap(),
-    ] {
-        assert!(matches!(
-            cause::<WorkingMemoryError>(&error),
-            WorkingMemoryError::UnknownBound
-        ));
-    }
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    let error = quote.validate_capture_copy().unwrap_err();
+    assert!(matches!(
+        cause::<WorkingMemoryError>(&error),
+        WorkingMemoryError::UnknownBound
+    ));
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert_eq!(paths::snapshot(), native);
     assert_eq!(
         runtime.session().payload.model.erased().state_snapshot(),
@@ -256,9 +249,7 @@ fn actual_funded_sampler_copy_rejects_capture_before_work_and_collector_slots_ar
         WorkingMemoryError::PreparationAlreadyStarted
     ));
     drop(state.funded_capture.take());
-    state.capture = Some(eredu_runtime::capture::CaptureSession::new(
-        source.clone(),
-    ));
+    state.capture = Some(eredu_runtime::capture::CaptureSession::new(source.clone()));
     assert!(matches!(
         cause::<WorkingMemoryError>(&require_empty(&state).unwrap_err()),
         WorkingMemoryError::PreparationAlreadyStarted

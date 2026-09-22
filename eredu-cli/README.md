@@ -104,12 +104,23 @@ Supported mixture-of-experts models can use an independent expert cache. These
 policies accept explicit host and device budgets and trade transfer or I/O work
 for a smaller resident parameter set.
 
-`--managed-memory-capacity-bytes` sets the generation working-memory capacity
-(default: 1 GiB). The same capacity applies to chat preparation and execution,
-including raw text and speculative generation; it is separate from weight
-residency budgets. Tokenizer and template sources use the loaded model's
-retained configuration, including GGUF metadata and explicit overrides.
-Capacity refusals are reported as errors rather than retrying without a bound.
+Repeated `--memory-limit <domain>=<bytes|unlimited>` entries configure physical
+memory limits for loading, preparation, and execution. Omitted domains are
+unlimited. `--verbose` reports the physical domain identifiers: `host` includes
+accelerators that share physical host memory; separate accelerators use
+`mlx-gpu-N`. For example, `--memory-limit host=8589934592 --memory-limit
+mlx-gpu-0=17179869184` configures separate host and accelerator limits. Unknown
+domains and repeated declarations are errors. Logical weight-residency budgets
+still select eviction policy; they do not replace physical allocation admission.
+Zero is a finite limit, and `18446744073709551615` is finite too; only the word
+`unlimited` skips capacity comparison. It preserves arithmetic, source identity,
+ownership, and completion checks. Limits constrain total live charges in each
+domain, including retained results and concurrent requests. There is no extra
+aggregate request limit across domains.
+
+Tokenizer and template sources use the loaded model's retained configuration,
+including GGUF metadata and explicit overrides. Both finite and unlimited
+requests require complete allocation facts and finite output bounds.
 
 See [Model loading, quantization, and memory](https://github.com/jbg/eredu/blob/main/doc/model-loading.md) for
 the policy contracts and accounting model.

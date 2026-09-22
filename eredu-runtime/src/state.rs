@@ -6,8 +6,8 @@
 
 mod construction;
 mod pooling;
-pub use pooling::{PoolingAttentionGeometry, pooling_attention_geometry};
-pub use pooling::{PoolingAttentionGeometryPlan, pooling_attention_geometry_plan};
+pub use pooling::{pooling_attention_geometry, PoolingAttentionGeometry};
+pub use pooling::{pooling_attention_geometry_plan, PoolingAttentionGeometryPlan};
 mod identity_workspace;
 #[cfg(test)]
 mod shared_construction_tests;
@@ -18,11 +18,11 @@ pub use shared_layout::SharedStateLayout;
 use std::{marker::PhantomData, ops::Range};
 
 use eredu_core::{
-    LayerSchedule,
     cache::{
         LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheStateSegment,
         PromptCacheTopology, StateComponentPolicy, StateTensorRole,
     },
+    LayerSchedule,
 };
 use eredu_nn::NeuralBackend;
 
@@ -1365,13 +1365,49 @@ mod prepared_layer_tests;
 #[path = "state/retained_visit_tests.rs"]
 mod retained_visit_tests;
 
-impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentKvResetLayer>
+impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentResetLayer>
     crate::working_memory::ResidentTableResetState for DeviceState<B, L>
 {
     type Layer = L;
-    type ResetPlan = ();
-    type ResetContext = ();
+    type ResetPlan = L::ResetPlan;
+    type ResetContext = L::ResetContext;
     type Child = ();
+    fn resident_reset_plan(
+        &self,
+    ) -> Result<(Self::ResetPlan, usize), crate::working_memory::WorkingMemoryError> {
+        L::reset_plan(self.as_ref())
+    }
+    fn prepare_resident_reset_context(
+        &self,
+        plan: &Self::ResetPlan,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Result<Self::ResetContext, eredu_core::BackendFailure> {
+        L::prepare_reset_context(self.as_ref(), plan, funding)
+    }
+    fn validate_resident_reset_placement(
+        layer: &L,
+        role: eredu_core::cache::StateComponentRole,
+        placement: crate::StateComponentPlacement,
+    ) -> bool {
+        layer.matches_reset_placement(role, placement)
+    }
+    fn empty_resident_reset_layer_prepared(
+        context: &mut Self::ResetContext,
+        source: &L,
+        policy: &LayerCachePolicy,
+        child: Option<crate::HostSlotTable<()>>,
+    ) -> Result<L, eredu_core::BackendFailure> {
+        if child.is_some() {
+            return Err(eredu_core::BackendFailure::from_error(
+                crate::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        source.empty_reset_prepared(context, policy)
+    }
+    fn resident_fork_is_empty(&self) -> bool {
+        self.as_ref().iter().all(L::reset_source_is_empty)
+    }
+
     fn resident_reset_layers(&self) -> &crate::HostSlotTable<L> {
         self.layers
             .as_ref()
@@ -1399,5 +1435,16 @@ impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentKvResetLayer>
     ) -> Self {
         assert_eq!(global_start, 0, "DeviceState uses local layer ordinals");
         Self::from_prepared_layers(layout, layers).expect("validated exact layer count")
+    }
+}
+
+impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentResetLayer>
+    crate::working_memory::ResidentResetProjection<DeviceState<B, L>> for DeviceState<B, L>
+{
+    fn resident_reset_ref(&self) -> Option<&Self> {
+        Some(self)
+    }
+    fn resident_reset_mut(&mut self) -> Option<&mut Self> {
+        Some(self)
     }
 }

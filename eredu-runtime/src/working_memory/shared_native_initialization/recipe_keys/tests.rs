@@ -10,7 +10,7 @@ fn recipe() -> DerivedWeightRecipe {
     }
 }
 fn required(plan: &EncodedRecipeKeysPlan<'_>) -> Option<u64> {
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -28,17 +28,19 @@ fn keys_use_exact_original_admission_and_survive_recipe_retirement() {
     let Some(bytes) = required(&plan()) else {
         return;
     };
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     let error = short.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
         error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert!(error.rejected_plan().is_some());
     assert!(error.constructor_failure().is_none());
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     drop(error);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let exclusion = pool.acquire_unquoted().unwrap();
     let error = pool.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
@@ -55,14 +57,16 @@ fn keys_use_exact_original_admission_and_survive_recipe_retirement() {
     let competitor = pool.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
         competitor.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     drop(competitor);
     drop(recipe);
     assert_eq!(keys.output().keys(), ["雪", "b", "雪"]);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(keys);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,8 +100,8 @@ fn later_failure_keeps_constructed_keys_and_account_after_recipe_is_gone() {
     let plan = EncodedRecipeKeysPlan::new(&recipe).unwrap().unwrap();
     let Some(_) = required(&plan) else { return };
     let plan = Later(plan);
-    let bytes = WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let (uncalled, failure) = pool
         .initialize_shared_native(plan)
         .unwrap_err()
@@ -110,7 +114,7 @@ fn later_failure_keeps_constructed_keys_and_account_after_recipe_is_gone() {
         panic!("expected completed key prefix")
     };
     assert_eq!(keys.keys(), ["雪", "b", "雪"]);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

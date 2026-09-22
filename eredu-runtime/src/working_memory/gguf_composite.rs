@@ -1,5 +1,5 @@
 //! One exact built-in GGUF union, independent of request or native fit.
-use super::{gguf_source::SourceAccount, qualified_storage, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError, gguf_source::SourceAccount, qualified_storage};
 use eredu_checkpoint::store::{
     CompositeCheckpointSource, GgufCompositeBuildFailure, GgufCompositePlan,
     GgufCompositeStorageRequest,
@@ -62,7 +62,7 @@ impl std::error::Error for OriginalGgufCompositeError {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Exact fresh owner-directory/child-vector/initial recipe-PAL contribution.
     /// Existing input stores, public Arc erasure shells, future arbitrary recipe
     /// entries and manager/model construction remain separate contributions.

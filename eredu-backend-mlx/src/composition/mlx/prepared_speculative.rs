@@ -1,8 +1,9 @@
 //! Whole-session MLX speculative generation capability.
 
+mod activation_source;
+pub(crate) use activation_source::observer as original_activation_observer;
 mod original;
 pub(crate) mod prefill_input;
-mod activation_source;
 pub(super) use prefill_input::OriginalEmbeddedPrefillInput;
 
 use eredu_architectures::speculative_execution::{
@@ -10,33 +11,33 @@ use eredu_architectures::speculative_execution::{
     ReplicatedPredictionInput, ReplicatedPredictionNative, SpeculativeTensorMechanisms,
 };
 use eredu_core::{
-    ModelRuntime, PreparedSpeculativeLane, SpeculativeCallbackPublisher, SpeculativeCapability,
-    SpeculativeDraft, SpeculativeExecutor, SpeculativeGenerationBackend,
+    generation::{GenerationCancellationToken, SemanticEvent, SpeculativeConfig},
+    ModelRuntime, PreparedSpeculativeLane, SemanticState, SpeculativeCallbackPublisher,
+    SpeculativeCapability, SpeculativeDraft, SpeculativeExecutor, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
-    SpeculativeSemanticConstraint, SemanticState, SpeculativeTokenFilterController,
-    generation::{GenerationCancellationToken, SemanticEvent, SpeculativeConfig},
+    SpeculativeSemanticConstraint, SpeculativeTokenFilterController,
 };
 use eredu_runtime::{ConstrainedSampler, SpeculativeSampler};
 use safemlx::{
-    Array, Stream, error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event,
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 
 use super::{
-    MlxBackend, MlxModelInput,
     session::MlxTextSampler,
     speculative::{
+        scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
         MlxAssistantPreparationVisitor, MlxDrafter, MlxSpeculativeSampling, MlxSpeculativeSeed,
         SpeculativeExecutionStreams,
-        scheduler::{MlxSpeculativeRuntime, component_timing_enabled},
     },
+    MlxBackend, MlxModelInput,
 };
-use crate::MlxTensor;
 use crate::backend::error::Error;
 use crate::backend::managed_memory::NativeMemoryOwner;
 use crate::backend::nn::{shared::MlxNeuralBackend, tensor::TokenValidationScope};
 use crate::backend::runtime::generation::MlxSamplingBackend;
 use crate::backend::runtime::media::input;
+use crate::MlxTensor;
 
 mod embedded_error;
 pub(super) mod embedded_logits;
@@ -48,7 +49,9 @@ pub(crate) struct MlxEmbeddedPredictionMechanisms;
 pub(crate) struct MlxEmbeddedExecutorTypes;
 
 pub(crate) trait MlxEmbeddedExecutorContinuation {
-    fn construction_controls(&self, _bytes: Option<usize>) -> Result<(), Error> { Ok(()) }
+    fn construction_controls(&self, _bytes: Option<usize>) -> Result<(), Error> {
+        Ok(())
+    }
     fn execute(
         &mut self,
         selected: &eredu_runtime::SelectedSpeculativeRealization,
@@ -63,16 +66,23 @@ impl EmbeddedExecutorTypes for MlxEmbeddedExecutorTypes {
     type Completion = super::speculative::TypedSpeculativeCompletion;
     type Telemetry = super::speculative::scheduler::SpeculativeComponentTimings;
     type Error = Error;
-    fn take_retained_failure(error:Error)->Result<eredu_core::BackendFailure,Error> {
+    fn take_retained_failure(error: Error) -> Result<eredu_core::BackendFailure, Error> {
         error.take_retained_backend_failure()
     }
 
-    fn request_context<'a>(request: eredu_core::SpeculativeRequestId, context: Self::Context<'a>)
-        -> Result<Self::Context<'a>, Self::Error> where Self: 'a {
+    fn request_context<'a>(
+        request: eredu_core::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Context<'a>, Self::Error>
+    where
+        Self: 'a,
+    {
         context.request_context(request)
     }
-    fn driver_buffer<V>(capacity: usize, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<V>, Error> {
+    fn driver_buffer<V>(
+        capacity: usize,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<V>, Error> {
         type Shared = super::speculative::autoregressive::MlxAutoregressiveMechanisms;
         use eredu_runtime::speculative::autoregressive::AutoregressiveMechanisms;
         Shared::driver_buffer(capacity, context)
@@ -82,20 +92,25 @@ impl EmbeddedExecutorTypes for MlxEmbeddedExecutorTypes {
         use eredu_runtime::speculative::autoregressive::AutoregressiveMechanisms;
         Shared::driver_buffer_bytes::<V>(capacity)
     }
-    fn driver_host_metadata(bytes: Option<usize>, context: Self::Context<'_>)
-        -> Result<eredu_core::HostPreparationAuthority, Error> {
+    fn driver_host_metadata(
+        bytes: Option<usize>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, Error> {
         type Shared = super::speculative::autoregressive::MlxAutoregressiveMechanisms;
         use eredu_runtime::speculative::autoregressive::AutoregressiveMechanisms;
         Shared::driver_host_metadata(bytes, context)
     }
-    fn driver_identity(context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeRequestIdentity, Error> {
+    fn driver_identity(
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeRequestIdentity, Error> {
         type Shared = super::speculative::autoregressive::MlxAutoregressiveMechanisms;
         use eredu_runtime::speculative::autoregressive::AutoregressiveMechanisms;
         Shared::driver_identity(context)
     }
-    fn copy_sequence(source: eredu_core::SpeculativeSequenceRef<'_>, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Error>> {
+    fn copy_sequence(
+        source: eredu_core::SpeculativeSequenceRef<'_>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Error>> {
         type Shared = super::speculative::autoregressive::MlxAutoregressiveMechanisms;
         use eredu_runtime::speculative::autoregressive::AutoregressiveMechanisms;
         Shared::copy_sequence(source, context)
@@ -105,30 +120,48 @@ impl EmbeddedExecutorTypes for MlxEmbeddedExecutorTypes {
         use eredu_runtime::speculative::autoregressive::AutoregressiveMechanisms;
         Shared::sequence_copy_bytes(source)
     }
-    fn coordinate_retained_buffer(local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
-        context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+    fn coordinate_retained_buffer(
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<
+        eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        eredu_core::BackendFailure,
+    > {
         context.coordinate_speculative_step(local)
     }
-    fn prepare_control_continuation(committed: usize,
-        status: eredu_core::generation::SpeculativeRequestStatus, context: Self::Context<'_>)
-        -> Result<(), eredu_core::speculative::SpeculativeControlError> {
-        let Some((sources, environment))=context.original_numerical() else {return Ok(());};
-        let result=(||{
+    fn prepare_control_continuation(
+        committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus,
+        context: Self::Context<'_>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        let Some((sources, environment)) = context.original_numerical() else {
+            return Ok(());
+        };
+        let result = (|| {
             sources.validate_environment(environment)?;
             if context.embedded_invocation().is_some() {
-                return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+                return Err(Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                ));
             }
-            let selected=context.original_embedded().ok_or(Error::PrefillControl(
-                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
-            selected.prepare_continuation(committed,status)
+            let selected = context.original_embedded().ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ))?;
+            selected.prepare_continuation(committed, status)
         })();
-        result.map_err(|cause|eredu_core::speculative::SpeculativeControlError::backend_with_retained(
-            sources.retain_error(cause),Error::take_retained_backend_failure))
+        result.map_err(|cause| {
+            eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                sources.retain_error(cause),
+                Error::take_retained_backend_failure,
+            )
+        })
     }
 
     fn erased_type_mismatch(value: &'static str) -> Self::Error {
-        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::ErasedValue {value}.into()
+        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::ErasedValue {
+            value,
+        }
+        .into()
     }
 }
 
@@ -220,8 +253,7 @@ where
         ) -> Result<R, Error>,
     ) -> Result<R, Error> {
         input.with_borrowed(|input| {
-            let tokens = input::text_token_ids(input, context)
-                .map(MlxTensor::from_array)?;
+            let tokens = input::text_token_ids(input, context).map(MlxTensor::from_array)?;
             let prepared_tokens = tokens.clone();
             operation(
                 A::text_input(&prepared_tokens, None),
@@ -251,6 +283,17 @@ where
     type Telemetry = super::speculative::scheduler::SpeculativeComponentTimings;
     type ExecutorTypes = MlxEmbeddedExecutorTypes;
 
+    fn prefill_schedule_authority(
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Result<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority, Error> {
+        context
+            .original_embedded()
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            ))?
+            .prefill_schedule()
+    }
+
     fn executor_context<'a>(
         context: <Self::ExecutorTypes as EmbeddedExecutorTypes>::Context<'a>,
     ) -> <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Context<'a> {
@@ -267,10 +310,23 @@ where
         lowerer: &mut I,
         input: MlxModelInput,
         context: SpeculativeExecutionStreams<'_>,
-        operation: impl for<'source> FnOnce(Result<P, <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error>, SpeculativeExecutionStreams<'source>) -> Result<R, <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error>,
+        operation: impl for<'source> FnOnce(
+            Result<P, <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error>,
+            SpeculativeExecutionStreams<'source>,
+        ) -> Result<
+            R,
+            <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error,
+        >,
     ) -> Result<R, <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error>
     where
-        I: ReplicatedPredictionInput<A, MlxNeuralBackend, S, <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error, Input = MlxModelInput, Prefill = P>,
+        I: ReplicatedPredictionInput<
+            A,
+            MlxNeuralBackend,
+            S,
+            <MlxEmbeddedPredictionMechanisms as SpeculativeTensorMechanisms>::Error,
+            Input = MlxModelInput,
+            Prefill = P,
+        >,
     {
         prefill_input::with_source::<A, S, I, R>(lowerer, input, context, operation)
     }
@@ -282,12 +338,12 @@ where
     ) -> Result<P::Chunk, eredu_nn::Error>
     where
         P: eredu_architectures::speculative_execution::PredictionPrefillSource<
-                A,
-                MlxNeuralBackend,
-                S,
-            >,
+            A,
+            MlxNeuralBackend,
+            S,
+        >,
     {
-        prefill_input::prepare_chunk::<A,S,P>(source,chunk,context)
+        prefill_input::prepare_chunk::<A, S, P>(source, chunk, context)
     }
 
     fn prediction_snapshot_context<'a>(
@@ -297,8 +353,8 @@ where
     >>::SnapshotContext<'a>
     where
         Self: eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
-                MlxNeuralBackend,
-            >,
+            MlxNeuralBackend,
+        >,
         MlxNeuralBackend: eredu_nn::BlockwiseAttentionBackend
             + eredu_nn::DistributedNeuralBackend
             + eredu_nn::GroupedNeuralBackend
@@ -307,20 +363,39 @@ where
         context
     }
 
-    fn uses_prepared_cache(context:SpeculativeExecutionStreams<'_>)->bool {
+    fn uses_prepared_cache(context: SpeculativeExecutionStreams<'_>) -> bool {
         context.original_numerical().is_some()
     }
-    fn prepared_cache_metadata(bytes:Option<usize>,context:SpeculativeExecutionStreams<'_>)
-        ->Result<eredu_core::HostPreparationAuthority,eredu_core::BackendFailure> {
-        super::replicated_text::cache_metadata(bytes,context)
+    fn prepared_cache_metadata(
+        bytes: Option<usize>,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, eredu_core::BackendFailure> {
+        super::replicated_text::cache_metadata(bytes, context)
     }
-    fn prepared_cache_error<E:std::error::Error+Send+Sync+'static>(cause:E,context:SpeculativeExecutionStreams<'_>)->eredu_core::BackendFailure {
-        super::replicated_text::cache_error(cause,context)
+    fn prepared_cache_error<E: std::error::Error + Send + Sync + 'static>(
+        cause: E,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> eredu_core::BackendFailure {
+        super::replicated_text::cache_error(cause, context)
     }
-    fn prepared_cache<P>(source:&S,extension:&P,selected:&eredu_runtime::SelectedSpeculativeRealization,context:SpeculativeExecutionStreams<'_>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionCache<S,P::LaneState>,eredu_core::BackendFailure>
-    where S:'static,P:eredu_architectures::prediction_extension::MaterializedPredictionExecutor<A,MlxNeuralBackend,Self> {
-        super::replicated_text::prepare_cache::<A,P,S>(source,extension,selected,context)
+    fn prepared_cache<P>(
+        source: &S,
+        extension: &P,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionCache<S, P::LaneState>,
+        eredu_core::BackendFailure,
+    >
+    where
+        S: 'static,
+        P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            A,
+            MlxNeuralBackend,
+            Self,
+        >,
+    {
+        super::replicated_text::prepare_cache::<A, P, S>(source, extension, selected, context)
     }
 
     fn checkpoint(state: &S) -> Result<S, Error> {
@@ -348,7 +423,9 @@ where
     }
 
     fn restore(state: &mut S, checkpoint: &S, context: &Stream) -> Result<(), Error> {
-        state.restore_checkpoint(checkpoint, context).map_err(Error::from)
+        state
+            .restore_checkpoint(checkpoint, context)
+            .map_err(Error::from)
     }
 
     fn generation(state: &S) -> Result<u64, Error> {
@@ -375,17 +452,28 @@ where
     }
 
     fn complete_prediction_state<P>(
-        extension:&P,state:&mut P::LaneState,outputs:&[&MlxTensor],
-        point:eredu_architectures::speculative_execution::PredictionCompletionPoint,
-        sources:eredu_architectures::speculative_execution::PredictionCompletionSources<'_>,
-        context:SpeculativeExecutionStreams<'_>,
-    )->Result<(),Error>
-    where P:eredu_architectures::prediction_extension::MaterializedPredictionExecutor<A,MlxNeuralBackend,Self> {
+        extension: &P,
+        state: &mut P::LaneState,
+        outputs: &[&MlxTensor],
+        point: eredu_architectures::speculative_execution::PredictionCompletionPoint,
+        sources: eredu_architectures::speculative_execution::PredictionCompletionSources<'_>,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Result<(), Error>
+    where
+        P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            A,
+            MlxNeuralBackend,
+            Self,
+        >,
+    {
         if context.original_numerical().is_some() {
-            return super::replicated_text::complete_original_prediction_state::<A,P>(
-                extension,state,outputs,point,sources,context);
+            return super::replicated_text::complete_original_prediction_state::<A, P>(
+                extension, state, outputs, point, sources, context,
+            );
         }
-        extension.complete_state(state,outputs,context.target()).map_err(Error::StorageSource)
+        extension
+            .complete_state(state, outputs, context.target())
+            .map_err(Error::StorageSource)
     }
 
     fn validate_with_context<T>(
@@ -397,7 +485,12 @@ where
                 active.validate_scope(context.target())?;
                 operation()
             }
-            None => <Self as ReplicatedPredictionNative<A, MlxNeuralBackend, S, MlxEmbeddedPredictionMechanisms>>::validate(operation),
+            None => <Self as ReplicatedPredictionNative<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxEmbeddedPredictionMechanisms,
+            >>::validate(operation),
         }
     }
 
@@ -406,15 +499,22 @@ where
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         if let Some(source) = context.original_embedded() {
-            let (_, environment) = context.original_numerical().ok_or(
-                Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch),
-            )?;
-            source.numerical_sources().validate_environment(environment)?;
+            let (_, environment) = context.original_numerical().ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ))?;
+            source
+                .numerical_sources()
+                .validate_environment(environment)?;
             // Each actual target/seed invocation installs its exact prepared
             // collector. No ordinary collector may enclose those native scopes.
             operation()
         } else {
-            <Self as ReplicatedPredictionNative<A, MlxNeuralBackend, S, MlxEmbeddedPredictionMechanisms>>::validate(operation)
+            <Self as ReplicatedPredictionNative<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxEmbeddedPredictionMechanisms,
+            >>::validate(operation)
         }
     }
 
@@ -436,10 +536,11 @@ where
     fn session_failure(error: eredu_core::BackendFailure) -> Error {
         Error::StorageSource(error)
     }
-    fn session_cause_with_context<E:std::error::Error+Send+Sync+'static>(
-        error:E,context:SpeculativeExecutionStreams<'_>,
-    )->Error {
-        embedded_error::session_cause(error,context)
+    fn session_cause_with_context<E: std::error::Error + Send + Sync + 'static>(
+        error: E,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Error {
+        embedded_error::session_cause(error, context)
     }
     fn prepare_session_cause<'context: 'context, E: std::error::Error + Send + Sync + 'static>(
         context: SpeculativeExecutionStreams<'context>,
@@ -447,16 +548,24 @@ where
     ) -> Result<impl FnOnce(E) -> Error, Error> {
         embedded_error::prepare_session_cause(context, additional_controls)
     }
-    fn session_arguments_with_context(arguments:std::fmt::Arguments<'_>, context:SpeculativeExecutionStreams<'_>)->Error {
-        embedded_error::session_arguments(arguments,context)
+    fn session_arguments_with_context(
+        arguments: std::fmt::Arguments<'_>,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Error {
+        embedded_error::session_arguments(arguments, context)
     }
-    fn neural_cause_with_context<E:std::error::Error+Send+Sync+'static>(error:E,context:SpeculativeExecutionStreams<'_>)->eredu_nn::Error {
-        embedded_error::neural_cause(error,context)
+    fn neural_cause_with_context<E: std::error::Error + Send + Sync + 'static>(
+        error: E,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> eredu_nn::Error {
+        embedded_error::neural_cause(error, context)
     }
-    fn neural_observer_error(error:&Error,context:SpeculativeExecutionStreams<'_>)->eredu_nn::Error {
-        embedded_error::neural_observer(error,context)
+    fn neural_observer_error(
+        error: &Error,
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> eredu_nn::Error {
+        embedded_error::neural_observer(error, context)
     }
-
 
     fn take_telemetry() -> Result<Self::Telemetry, Error> {
         Ok(Self::Telemetry::default())
@@ -471,7 +580,7 @@ pub(super) fn copy_control_state<S: super::replicated_text::MlxStateMechanisms>(
     if !state.supports_isolated_snapshot() {
         return Ok(None);
     }
-    let memory = NativeMemoryOwner::acquire(&context.memory_pool())
+    let memory = NativeMemoryOwner::acquire(&context.memory_ledger())
         .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
     let copy = crate::backend::submission_recovery::detached_retained(memory.clone(), || {
         super::speculative::state_snapshot::settle(state.retained_arrays())?;
@@ -494,7 +603,7 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     type Context<'a> = SpeculativeExecutionStreams<'a>;
     type Completion = super::speculative::TypedSpeculativeCompletion;
     type Error = Error;
-    fn take_retained_failure(error:Error)->Result<eredu_core::BackendFailure,Error> {
+    fn take_retained_failure(error: Error) -> Result<eredu_core::BackendFailure, Error> {
         error.take_retained_backend_failure()
     }
 
@@ -512,7 +621,7 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         value: &MlxTensor,
         context: Self::Context<'a>,
     ) -> Result<Option<MlxTensor>, eredu_core::speculative::SpeculativeControlError> {
-        let memory = NativeMemoryOwner::acquire(&context.memory_pool())
+        let memory = NativeMemoryOwner::acquire(&context.memory_ledger())
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         crate::backend::submission_recovery::detached_retained(memory.clone(), || {
             let array =
@@ -544,20 +653,27 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         request: eredu_core::SpeculativeRequestId,
         context: Self::Context<'a>,
     ) -> Result<
-        Option<
-            Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Error>>,
-        >,
+        Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Error>>>,
         eredu_core::speculative::SpeculativeControlError,
     > {
         if context.original_numerical().is_some() {
             return activation_source::observer(plan, request, context);
         }
-        let transport=super::speculative::capture_error_transport::RetainedCaptureTransport::new(
-            |error:&eredu_runtime::capture::CaptureExecutionError<Error>|Error::Exception(Exception::custom(error.to_string())));
+        let transport = super::speculative::capture_error_transport::RetainedCaptureTransport::new(
+            |error: &eredu_runtime::capture::CaptureExecutionError<Error>| {
+                Error::Exception(Exception::custom(error.to_string()))
+            },
+        );
         match context.capture_binding() {
-            Some(binding) => binding.observer_with_error(plan,request,context.target(),transport),
+            Some(binding) => {
+                binding.observer_with_error(plan, request, context.target(), transport)
+            }
             None => super::session::bounded_capture::speculative_capture_with_error(
-                plan,request,context.target(),transport),
+                plan,
+                request,
+                context.target(),
+                transport,
+            ),
         }
     }
 
@@ -570,7 +686,11 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     }
 
     fn invalid_prediction_commit(verified: usize, available: usize) -> Self::Error {
-        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::Commit {verified,available}.into()
+        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::Commit {
+            verified,
+            available,
+        }
+        .into()
     }
 
     fn invalid_prediction_output(
@@ -579,11 +699,21 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         tokens: usize,
         expected: Option<usize>,
     ) -> Self::Error {
-        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::Output {logits,capture,tokens,expected}.into()
+        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::Output {
+            logits,
+            capture,
+            tokens,
+            expected,
+        }
+        .into()
     }
 
     fn invalid_fused_capacity(requested: usize, available: usize) -> Self::Error {
-        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::FusedCapacity {requested,available}.into()
+        eredu_architectures::speculative_execution::EmbeddedPredictionContractError::FusedCapacity {
+            requested,
+            available,
+        }
+        .into()
     }
 
     fn sequence_len(value: &Self::Tensor) -> Result<usize, Self::Error> {
@@ -592,13 +722,16 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     }
 
     fn validate_outer_tensor_observer<'a>(
-        has_caller: bool, context: Self::Context<'a>,
+        has_caller: bool,
+        context: Self::Context<'a>,
     ) -> Result<(), Self::Error> {
         embedded_logits::validate_observer(has_caller, context)
     }
 
     fn observe_outer_tensor<'a>(
-        value: Self::Tensor, path: &str, chunk: Option<&eredu_runtime::prefill::PrefillChunk>,
+        value: Self::Tensor,
+        path: &str,
+        chunk: Option<&eredu_runtime::prefill::PrefillChunk>,
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Self::Tensor, Self::Error>>,
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
@@ -610,15 +743,20 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     }
 
     fn logits_row<'a>(
-        value: &Self::Tensor, row: usize, context: Self::Context<'a>,
+        value: &Self::Tensor,
+        row: usize,
+        context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
         if let Some(active) = context.embedded_invocation() {
             return active.logits_row(value.as_array(), row, context.target());
         }
         if context.original_numerical().is_some() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
-        embedded_logits::row(value.as_array(), row, context.target()).map(IndependentLogits::Ordinary)
+        embedded_logits::row(value.as_array(), row, context.target())
+            .map(IndependentLogits::Ordinary)
     }
 
     fn prefill_score_layout<'a>(
@@ -633,76 +771,194 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     }
 
     fn selected_prefill_logits_with_source<'a>(
-        value: Self::Tensor, source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
+        value: Self::Tensor,
+        source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
         embedded_logits::selected(value, source, context)
     }
     fn logits_row_with_source<'a>(
-        value: &Self::Tensor, row: usize, source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
+        value: &Self::Tensor,
+        row: usize,
+        source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
         embedded_logits::source_row(value, row, source, context, false)
     }
     fn fused_logits_row_with_source<'a>(
-        value: &Self::Tensor, row: usize, source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
+        value: &Self::Tensor,
+        row: usize,
+        source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
         embedded_logits::source_row(value, row, source, context, true)
     }
     fn retain_logit_block<'a>(
-        value: Self::Tensor, source: Option<eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
+        value: Self::Tensor,
+        source: Option<eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
-    ) -> Result<eredu_architectures::speculative_execution::EmbeddedPredictionLogitBlock<Self::Tensor>, Self::Error> {
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionLogitBlock<Self::Tensor>,
+        Self::Error,
+    > {
         embedded_logits::retain_block(value, source, context)
     }
 
-    fn tensor_row_with_source<'a>(value:&Self::Tensor,row:usize,source:Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,context:Self::Context<'a>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        if context.original_numerical().is_none(){return Self::tensor_row(value,row,context).map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);}
-        embedded_tensors::capture_range(value,row,row.checked_add(1).ok_or(Error::InvalidOperation("prediction row overflow"))?,source,None,context)
+    fn tensor_row_with_source<'a>(
+        value: &Self::Tensor,
+        row: usize,
+        source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
+        if context.original_numerical().is_none() {
+            return Self::tensor_row(value, row, context).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
+        }
+        embedded_tensors::capture_range(
+            value,
+            row,
+            row.checked_add(1)
+                .ok_or(Error::InvalidOperation("prediction row overflow"))?,
+            source,
+            None,
+            context,
+        )
     }
-    fn tensor_prefix_with_source<'a>(value:&Self::Tensor,end:usize,source:Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,context:Self::Context<'a>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        if context.original_numerical().is_none(){return Self::tensor_prefix(value,end,context).map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);}
-        embedded_tensors::capture_range(value,0,end,source,None,context)
+    fn tensor_prefix_with_source<'a>(
+        value: &Self::Tensor,
+        end: usize,
+        source: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
+        if context.original_numerical().is_none() {
+            return Self::tensor_prefix(value, end, context).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
+        }
+        embedded_tensors::capture_range(value, 0, end, source, None, context)
     }
-    fn tensor_row_packet<'a>(value:&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,row:usize,context:Self::Context<'a>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        if context.original_numerical().is_none(){return Self::tensor_row(value,row,context).map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);}
-        embedded_tensors::capture_range(value,row,row.checked_add(1).ok_or(Error::InvalidOperation("prediction row overflow"))?,value.evidence(),Some(value),context)
+    fn tensor_row_packet<'a>(
+        value: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        row: usize,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
+        if context.original_numerical().is_none() {
+            return Self::tensor_row(value, row, context).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
+        }
+        embedded_tensors::capture_range(
+            value,
+            row,
+            row.checked_add(1)
+                .ok_or(Error::InvalidOperation("prediction row overflow"))?,
+            value.evidence(),
+            Some(value),
+            context,
+        )
     }
-    fn tensor_prefix_packet<'a>(value:&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,end:usize,context:Self::Context<'a>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        if context.original_numerical().is_none(){return Self::tensor_prefix(value,end,context).map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);}
-        embedded_tensors::capture_range(value,0,end,value.evidence(),Some(value),context)
+    fn tensor_prefix_packet<'a>(
+        value: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        end: usize,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
+        if context.original_numerical().is_none() {
+            return Self::tensor_prefix(value, end, context).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
+        }
+        embedded_tensors::capture_range(value, 0, end, value.evidence(), Some(value), context)
     }
-    fn tensor_concatenate_packet<'a>(left:&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,right:&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
-        context:Self::Context<'a>,ordinary:impl FnOnce(&Self::Tensor,&Self::Tensor)->Result<Self::Tensor,Self::Error>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        if context.original_numerical().is_none(){return ordinary(left,right).map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);}
-        embedded_tensors::concatenate(left,right,context,std::mem::size_of_val(&ordinary))
+    fn tensor_concatenate_packet<'a>(
+        left: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        right: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        context: Self::Context<'a>,
+        ordinary: impl FnOnce(&Self::Tensor, &Self::Tensor) -> Result<Self::Tensor, Self::Error>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
+        if context.original_numerical().is_none() {
+            return ordinary(left, right).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
+        }
+        embedded_tensors::concatenate(left, right, context, std::mem::size_of_val(&ordinary))
     }
-    fn prefill_token_packet<'a>(value:&Self::Tensor,prepared:Option<&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>>,context:Self::Context<'a>)
-        ->Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        if context.original_numerical().is_none(){return Ok(prepared.cloned().unwrap_or_else(||eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary(value.clone())));}
-        let prepared=prepared.ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
-        embedded_tensors::share(prepared,context)
+    fn prefill_token_packet<'a>(
+        value: &Self::Tensor,
+        prepared: Option<
+            &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        >,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
+        if context.original_numerical().is_none() {
+            return Ok(prepared.cloned().unwrap_or_else(|| {
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary(
+                    value.clone(),
+                )
+            }));
+        }
+        let prepared = prepared.ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        ))?;
+        embedded_tensors::share(prepared, context)
     }
-    fn control_tensor_packet_estimate(value:&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>)
-        ->Option<eredu_core::execution_control::SnapshotEstimate>{
-        let Some(evidence)=value.evidence() else{return Self::control_tensor_estimate(value);};
+    fn control_tensor_packet_estimate(
+        value: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        let Some(evidence) = value.evidence() else {
+            return Self::control_tensor_estimate(value);
+        };
         if super::speculative::completed_tensor_source(evidence).is_none()
-            && super::speculative::registered_tensor_source(evidence).is_none(){return None;}
-        let bytes=std::mem::size_of_val(value) as u64;
-        Some(eredu_core::execution_control::SnapshotEstimate{retained_bytes:bytes,copy_bytes:bytes})
+            && super::speculative::registered_tensor_source(evidence).is_none()
+        {
+            return None;
+        }
+        let bytes = std::mem::size_of_val(value) as u64;
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: bytes,
+            copy_bytes: bytes,
+        })
     }
-    fn control_tensor_packet_snapshot<'a>(value:&eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,context:Self::Context<'a>)
-        ->Result<Option<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>>,eredu_core::speculative::SpeculativeControlError>{
-        if context.original_numerical().is_none(){return Self::control_tensor_snapshot(value,context)
-            .map(|value|value.map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary));}
-        embedded_tensors::share(value,context).map(Some).map_err(|cause|
-            eredu_core::speculative::SpeculativeControlError::backend_with_retained(cause,Self::take_retained_failure))
+    fn control_tensor_packet_snapshot<'a>(
+        value: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        context: Self::Context<'a>,
+    ) -> Result<
+        Option<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>>,
+        eredu_core::speculative::SpeculativeControlError,
+    > {
+        if context.original_numerical().is_none() {
+            return Self::control_tensor_snapshot(value, context).map(|value| {
+                value.map(
+                    eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+                )
+            });
+        }
+        embedded_tensors::share(value, context)
+            .map(Some)
+            .map_err(|cause| {
+                eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                    cause,
+                    Self::take_retained_failure,
+                )
+            })
     }
 
     fn tensor_row<'a>(
@@ -710,13 +966,18 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         row: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
-        if context.original_numerical().is_some(){return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));}
-        let row =
-            i32::try_from(row).map_err(|_| Error::InvalidOperation("prediction row exceeds i32"))?;
+        if context.original_numerical().is_some() {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        let row = i32::try_from(row)
+            .map_err(|_| Error::InvalidOperation("prediction row exceeds i32"))?;
         value
             .as_array()
             .try_index_device((.., row..row + 1, ..), context.target())
-            .map(MlxTensor::from_array).map_err(Error::from)
+            .map(MlxTensor::from_array)
+            .map_err(Error::from)
     }
 
     fn tensor_prefix<'a>(
@@ -724,13 +985,18 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         end: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
-        if context.original_numerical().is_some(){return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));}
-        let end =
-            i32::try_from(end).map_err(|_| Error::InvalidOperation("prediction prefix exceeds i32"))?;
+        if context.original_numerical().is_some() {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        let end = i32::try_from(end)
+            .map_err(|_| Error::InvalidOperation("prediction prefix exceeds i32"))?;
         value
             .as_array()
             .try_index_device((.., ..end, ..), context.target())
-            .map(MlxTensor::from_array).map_err(Error::from)
+            .map(MlxTensor::from_array)
+            .map_err(Error::from)
     }
 
     fn token_range<'a>(
@@ -739,7 +1005,11 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         end: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
-        if context.original_numerical().is_some(){return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));}
+        if context.original_numerical().is_some() {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
         let start = i32::try_from(start)
             .map_err(|_| Error::InvalidOperation("prediction token start exceeds i32"))?;
         let end = i32::try_from(end)
@@ -747,7 +1017,8 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         value
             .as_array()
             .try_index_device((.., start..end), context.target())
-            .map(MlxTensor::from_array).map_err(Error::from)
+            .map(MlxTensor::from_array)
+            .map_err(Error::from)
     }
 
     fn token_prefix<'a>(
@@ -755,41 +1026,59 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         end: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
-        if context.original_numerical().is_some(){return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));}
+        if context.original_numerical().is_some() {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
         let end = i32::try_from(end)
             .map_err(|_| Error::InvalidOperation("prediction token prefix exceeds i32"))?;
         value
             .as_array()
             .try_index_device((.., ..end), context.target())
-            .map(MlxTensor::from_array).map_err(Error::from)
+            .map(MlxTensor::from_array)
+            .map_err(Error::from)
     }
 
     fn target_tokens_packet<'a>(
-        tokens: &[u32], context: Self::Context<'a>,
-    ) -> Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        tokens: &[u32],
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
         if context.original_numerical().is_none() {
-            return Self::target_tokens(tokens, context)
-                .map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);
+            return Self::target_tokens(tokens, context).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
         }
         embedded_tensors::tokens(tokens, context)
     }
     fn token_range_packet<'a>(
         value: &eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
-        start: usize, end: usize, context: Self::Context<'a>,
-    ) -> Result<eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        start: usize,
+        end: usize,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        Self::Error,
+    > {
         if context.original_numerical().is_none() {
-            return Self::token_range(value, start, end, context)
-                .map(eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary);
+            return Self::token_range(value, start, end, context).map(
+                eredu_architectures::speculative_execution::EmbeddedPredictionTensor::ordinary,
+            );
         }
         embedded_tensors::token_range(value, start, end, context)
     }
     fn with_tensor_sources<R>(
-        sources:&[&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
-        context:Self::Context<'_>,
-        run:impl for<'scope> FnOnce(Self::Context<'scope>)->Result<R,Self::Error>,
-    )->Result<R,Self::Error>{
-        if context.original_numerical().is_none(){return run(context);}
-        embedded_tensors::with_sources(sources,context,run)
+        sources: &[&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
+        context: Self::Context<'_>,
+        run: impl for<'scope> FnOnce(Self::Context<'scope>) -> Result<R, Self::Error>,
+    ) -> Result<R, Self::Error> {
+        if context.original_numerical().is_none() {
+            return run(context);
+        }
+        embedded_tensors::with_sources(sources, context, run)
     }
 
     fn target_tokens<'a>(
@@ -797,7 +1086,9 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
         context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
         if context.original_numerical().is_some() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         let width = i32::try_from(tokens.len())
             .map_err(|_| Error::InvalidOperation("prediction token count exceeds i32"))?;
@@ -809,29 +1100,41 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     }
 
     fn fused_logits_row<'a>(
-        value: &Self::Tensor, row: usize, context: Self::Context<'a>,
+        value: &Self::Tensor,
+        row: usize,
+        context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
         if context.original_numerical().is_some() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
-        embedded_logits::row(value.as_array(), row, context.draft()).map(IndependentLogits::Ordinary)
+        embedded_logits::row(value.as_array(), row, context.draft())
+            .map(IndependentLogits::Ordinary)
     }
 
     fn submit_verification_completion_with_source<'a>(
-        output: &EmbeddedPredictionOutput<Self::Tensor>, inputs: &Self::Tensor,
+        output: &EmbeddedPredictionOutput<Self::Tensor>,
+        inputs: &Self::Tensor,
         evidence: Option<&eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
-    ) -> Result<Self::Completion,Self::Error> {
-        let Some((sources,environment))=context.original_numerical() else {
-            return Self::submit_verification_completion(output,inputs,context);
+    ) -> Result<Self::Completion, Self::Error> {
+        let Some((sources, environment)) = context.original_numerical() else {
+            return Self::submit_verification_completion(output, inputs, context);
         };
-        if context.embedded_invocation().is_some() || environment.stream()!=context.target() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        if context.embedded_invocation().is_some() || environment.stream() != context.target() {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         super::speculative::TypedSpeculativeCompletion::completed_embedded(
-            output.logits().as_array(),output.capture().as_array(),
-            evidence.ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?,
-            sources,environment,
+            output.logits().as_array(),
+            output.capture().as_array(),
+            evidence.ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ))?,
+            sources,
+            environment,
         )
     }
 
@@ -845,7 +1148,9 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
             output.capture().as_array(),
             output.tokens().as_array(),
             inputs.as_array(),
-        ]).map(super::speculative::TypedSpeculativeCompletion::new).map_err(Error::from)
+        ])
+        .map(super::speculative::TypedSpeculativeCompletion::new)
+        .map_err(Error::from)
     }
 }
 
@@ -981,11 +1286,6 @@ fn validate_speculative_inference_policy(
     policy
         .validate(generation.sampling().max_new_tokens)
         .map_err(|error| Error::Other(Box::new(error)))?;
-    if policy.managed_memory_capacity_bytes.is_some() {
-        return Err(Error::Other(Box::new(
-            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
-        )));
-    }
     Ok(())
 }
 
@@ -993,7 +1293,7 @@ fn validate_speculative_prefill_policy(
     generation: eredu_core::TextGenerationConfig,
     selected_support: bool,
 ) -> Result<(), Error> {
-    validate_speculative_inference_policy(generation)?;
+    validate_speculative_inference_policy(generation.clone())?;
     if generation
         .inference_policy()
         .prefill_chunk_positions
@@ -1127,8 +1427,8 @@ where
     'streams: 'run,
     B: MlxSpeculativeRuntime<'run>,
     B::Logits: super::speculative::LogitsSource,
-    B::Error: From<Exception>
-        + From<<B::Logits as super::speculative::LogitsSource>::OriginalError>,
+    B::Error:
+        From<Exception> + From<<B::Logits as super::speculative::LogitsSource>::OriginalError>,
     C: SpeculativeTokenFilterController + 'run,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'run,
 {
@@ -1169,10 +1469,13 @@ where
                 on_event,
                 memory_owner,
             } = lane;
-            let sampling =
-                MlxSpeculativeSampling::prepare(wrap_sampler(sampler)?, streams, memory_owner.as_ref())?
-                    .with_error::<B::Error>()
-                    .with_logits::<B::Logits>();
+            let sampling = MlxSpeculativeSampling::prepare(
+                wrap_sampler(sampler)?,
+                streams,
+                memory_owner.as_ref(),
+            )?
+            .with_error::<B::Error>()
+            .with_logits::<B::Logits>();
             let randomness =
                 <MlxSpeculativeSampling<S, B::Error, B::Logits> as SpeculativeSampling>::initialize_randomness(
                     prng_key,
@@ -1281,9 +1584,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     where
         C: SpeculativeTokenFilterController,
     {
-        validate_speculative_inference_policy(generation)?;
+        validate_speculative_inference_policy(generation.clone())?;
         let resolved = generation.sampling();
-        let sampler = MlxTextSampler::from_config(generation)
+        let sampler = MlxTextSampler::from_config(generation.clone())
             .map_err(|error| Error::Exception(Exception::from_source(error)))?;
         let prng_key = (resolved.temperature != 0.0)
             .then(|| {
@@ -1307,7 +1610,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
     {
         for lane in &lanes {
-            validate_speculative_inference_policy(*lane.generation())?;
+            validate_speculative_inference_policy(lane.generation().clone())?;
             validate_lane_proposal_capacity(lane.config(), proposal_capacity)?;
         }
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
@@ -1348,32 +1651,8 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         V: SpeculativeGenerationVisitor,
     {
         let drafting = request.take_drafting();
-        let selected_prefill = supports_prefill_chunking(self.runtime.session(), &drafting);
         let lanes = request.take_lanes();
-        if lanes.iter().any(|lane| lane.generation().inference_policy().managed_memory_capacity_bytes.is_some()) {
-            return original::run_request(self.runtime, drafting, lanes, visitor);
-        }
-        let admission = lanes
-            .iter()
-            .try_for_each(|lane| {
-                validate_speculative_prefill_policy(*lane.generation(), selected_prefill)
-            })
-            .and_then(|()| NativeMemoryOwner::acquire(self.runtime.backend().memory_pool()));
-        let memory = self.runtime.finish_text_preparation(
-            eredu_core::run_preparation::TextPreparationStage::Admission,
-            admission,
-            |error| Error::Other(Box::new(error)),
-        )?;
-        crate::backend::submission_recovery::detached_retained(memory.clone(), || match drafting {
-            SpeculativeDraft::External(drafter) => self
-                .generate_speculative_batch_with_external_draft(drafter, lanes, visitor, &memory),
-            SpeculativeDraft::Embedded => {
-                self.generate_speculative_batch_with_embedded_draft(lanes, visitor, &memory)
-            }
-            _ => Err(Error::ArchitectureModel(
-                "unsupported speculative draft source".to_string(),
-            )),
-        })
+        original::run_request(self.runtime, drafting, lanes, visitor)
     }
 
     fn generate_speculative_batch_with_external_draft<C, V>(
@@ -1548,7 +1827,6 @@ mod mechanism_tests;
 #[cfg(test)]
 mod memory_tests;
 
-
 fn prepare_speculative_callback<'a>(
     callback: eredu_core::SpeculativeEventCallback<'a>,
     streams: SpeculativeExecutionStreams<'_>,
@@ -1570,9 +1848,16 @@ fn prepare_speculative_callback<'a>(
         HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
             .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
-    let bytes = parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+    let bytes = parts
+        .into_iter()
+        .try_fold(size_of_val(&parts), usize::checked_add)
         .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
-    sources.metadata_funding().reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
+    sources
+        .metadata_funding()
+        .reserve_metadata(bytes)
+        .map_err(Error::WorkspacePlanning)?;
     let host = HostPreparationAuthority::retain(sources.metadata_funding().clone());
-    Ok(SpeculativeCallbackPublisher::semantic_prepared_callback(callback, host))
+    Ok(SpeculativeCallbackPublisher::semantic_prepared_callback(
+        callback, host,
+    ))
 }

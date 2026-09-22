@@ -1,6 +1,19 @@
 //! Prompt-cache catalog loading and fixed-state restoration.
 
 use super::*;
+#[path = "prompt_cache/materialize.rs"]
+mod materialize;
+pub(crate) use materialize::{PromptCacheMaterialization, load_prompt_cache_state_tensors_funded};
+
+#[path = "prompt_cache/funded.rs"]
+mod funded;
+#[path = "prompt_cache/import.rs"]
+mod import;
+#[path = "prompt_cache/readback.rs"]
+mod readback;
+#[path = "prompt_cache/tails.rs"]
+mod tails;
+pub(crate) use tails::PromptCacheTail;
 
 /// In-memory fixed state supplied when saving a cache snapshot.
 pub struct PromptCacheStateArray<'a> {
@@ -13,6 +26,7 @@ pub struct PromptCacheStateArray<'a> {
 }
 
 /// Catalogs a compatible prompt prefix lazily as read-only disk-backed blocks.
+#[cfg(test)]
 pub fn open_prompt_cache(
     directory: impl AsRef<Path>,
     expected: &PromptCacheDescriptor,
@@ -60,6 +74,7 @@ pub fn open_prompt_cache(
                         payload_sha256: Some(block.payload_sha256.clone()),
                         payload_verification: Arc::new(OnceLock::new()),
                         live_source: None,
+                        persistent_source: None,
                     }),
                 ),
                 bytes: block.logical_bytes,
@@ -99,6 +114,7 @@ pub struct LoadedPromptCacheStateTensor {
 }
 
 /// Loads all fixed-state tensors after manifest and model compatibility validation.
+#[cfg(test)]
 pub fn load_prompt_cache_state_tensors(
     directory: impl AsRef<Path>,
     manifest: &PromptCacheManifest,
@@ -155,6 +171,7 @@ pub fn load_prompt_cache_state_tensors(
 
 impl CacheResidencyManager {
     /// Writes a completed immutable prefix atomically to a persistent directory.
+    #[cfg(test)]
     pub fn save_prompt_cache(
         &self,
         destination: impl AsRef<Path>,

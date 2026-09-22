@@ -60,7 +60,10 @@ fn settings(temperature: f32) -> PreparedChatGenerationSettings {
         seed: 827,
         inference: TextInferencePolicy {
             prefill_chunk_positions: NonZeroU64::new(2),
-            managed_memory_capacity_bytes: Some(8 * 1024 * 1024 * 1024),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(8 * 1024 * 1024 * 1024),
+            )]),
             // Public callers supply one total budget; native component capacities
             // must be derived from the selected execution before admission.
             submission_tracking_capacity_bytes: None,
@@ -75,10 +78,17 @@ fn budget_failure(error: &(dyn Error + 'static)) -> bool {
     while let Some(error) = cause {
         if matches!(
             error.downcast_ref::<WorkingMemoryError>(),
-            Some(
-                WorkingMemoryError::BudgetExceeded { .. }
-                    | WorkingMemoryError::CapacityBelowUsage { .. }
-            )
+            Some(WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
+        ) || matches!(
+            error.downcast_ref::<eredu_core::MemoryDomainError>(),
+            Some(eredu_core::MemoryDomainError::BudgetExceeded { .. })
+        ) || matches!(
+            error.downcast_ref::<eredu_core::SessionResetRejection>(),
+            Some(eredu_core::SessionResetRejection::MemoryDomain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
         ) {
             return true;
         }
@@ -168,7 +178,15 @@ fn run_mode_with_state_residency_observed(
         Some(residency) => execution.with_residency(residency),
         None => execution,
     };
-    run_mode_with_execution_observed(mode, fixture, temperature, strategy, execution, state, after)
+    run_mode_with_execution_observed(
+        mode,
+        fixture,
+        temperature,
+        strategy,
+        execution,
+        state,
+        after,
+    )
 }
 
 fn run_mode_with_execution_observed(
@@ -219,18 +237,19 @@ fn run_mode_with_execution_observed(
             std::fs::File::open(root.0.join("tokenizer.json")).unwrap(),
         )
         .unwrap();
-    let request = ManagedPlainTextRequest::new(PROMPT, settings);
+    let request = ManagedPlainTextRequest::new(PROMPT, settings.clone());
     let cancelled = GenerationCancellationToken::new();
     cancelled.cancel();
-    assert!(
-        model
-            .start_managed_plain_text(&source, request, &cancelled)
-            .unwrap()
-            .is_none()
-    );
+    assert!(model
+        .start_managed_plain_text(&source, request.clone(), &cancelled)
+        .unwrap()
+        .is_none());
     let cancellation = GenerationCancellationToken::new();
-    let mut short = request;
-    short.settings.inference.managed_memory_capacity_bytes = Some(1);
+    let mut short = request.clone();
+    short.settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(1),
+    )]);
     let refusal = match model.start_managed_plain_text(&source, short, &cancellation) {
         Err(error) => error,
         Ok(_) => panic!("one byte cannot admit the public request"),
@@ -245,7 +264,7 @@ fn run_mode_with_execution_observed(
     };
     let output = if mode == "controlled" {
         let mut session = model
-            .start_managed_plain_text(&source, request, &cancellation)
+            .start_managed_plain_text(&source, request.clone(), &cancellation)
             .unwrap_or_else(report_failure)
             .expect("live request");
         while session.finish_reason().is_none() {
@@ -256,7 +275,7 @@ fn run_mode_with_execution_observed(
             .unwrap_or_else(|_| panic!("terminal session"))
     } else {
         model
-            .generate_managed_plain_text(&source, request, &cancellation, &mut emit)
+            .generate_managed_plain_text(&source, request.clone(), &cancellation, &mut emit)
             .unwrap_or_else(report_failure)
             .expect("live request")
     };
@@ -370,7 +389,8 @@ fn verify_mode_results_with_reference(
 ) {
     let reference_env = format!("{mode_env}_REFERENCE");
     if let Ok(mode) = std::env::var(mode_env) {
-        let reference = std::env::var(&reference_env).ok()
+        let reference = std::env::var(&reference_env)
+            .ok()
             .map(|value| serde_json::from_str(&value).unwrap());
         let result = run(&mode, reference);
         println!("\n{RESULT_PREFIX}{result}");
@@ -379,7 +399,9 @@ fn verify_mode_results_with_reference(
     let mut expected = None;
     for mode in ["ordinary", "managed", "controlled"] {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", case, "--ignored", "--nocapture"]).env(mode_env, mode);
+        command
+            .args(["--exact", case, "--ignored", "--nocapture"])
+            .env(mode_env, mode);
         if let Some(reference) = &expected {
             command.env(&reference_env, serde_json::to_string(reference).unwrap());
         } else {

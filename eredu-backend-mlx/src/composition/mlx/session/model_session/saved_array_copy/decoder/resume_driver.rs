@@ -3,12 +3,12 @@
 use super::*;
 use crate::composition::mlx::session::{
     generation::{MlxOrdinarySampler, MlxTextSamplingState},
-    model_session::text_quote::{PendingSavedTextAdmission, admit_original_saved, admit_saved},
+    model_session::text_quote::{admit_original_saved, PendingSavedTextAdmission},
     text_snapshot::MlxSavedTextComponents,
 };
 use eredu_core::{
-    TextResumeBackend, TextStepContext, TokenFilterController,
-    execution_control::NativeTextStateBackend,
+    execution_control::NativeTextStateBackend, TextResumeBackend, TextStepContext,
+    TokenFilterController,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,15 +110,20 @@ impl TextResumeBackend for MlxBackend<'_> {
     type ResumePreparation = MlxTextResumePreparation;
     type DisplacedState = MlxNativeTextState;
 
-    fn saved_text_resume_facts(saved: &Self::ResumeSource) -> Option<eredu_core::TextResumeSourceFacts> {
+    fn saved_text_resume_facts(
+        saved: &Self::ResumeSource,
+    ) -> Option<eredu_core::TextResumeSourceFacts> {
         let source = saved.funded_source_fixed()?;
         Some(eredu_core::TextResumeSourceFacts {
-            inherited_capture_usage: source.capture_checkpoint()
+            inherited_capture_usage: source
+                .capture_checkpoint()
                 .map_or_else(Default::default, |checkpoint| checkpoint.inherited_usage()),
             sampling_before: eredu_core::SamplingStateFacts {
                 temperature: source.sampling.temperature,
-                requires_positive_temperature: matches!(source.sampling.sampler.as_sampler(),
-                    crate::composition::mlx::session::MlxTextSampler::MirostatV2(_)),
+                requires_positive_temperature: matches!(
+                    source.sampling.sampler.as_sampler(),
+                    crate::composition::mlx::session::MlxTextSampler::MirostatV2(_)
+                ),
                 has_rng: source.sampling.arrays.key.is_some(),
             },
         })
@@ -126,55 +131,90 @@ impl TextResumeBackend for MlxBackend<'_> {
 
     fn text_resume_facts(state: &Self::TextGenerationState) -> eredu_core::TextResumeFacts<'_> {
         eredu_core::TextResumeFacts {
-            has_interventions: state.funded_capture.as_ref()
+            has_interventions: state
+                .funded_capture
+                .as_ref()
                 .and_then(|capture| capture.collector().intervention_source())
                 .is_some_and(|source| !source.plan().admission().plan().operations.is_empty()),
-            sampling_after: <Self as eredu_core::TextSamplingControlBackend>::sampling_control_facts(state),
-            capture_plan_id: state.funded_capture.as_ref().map(|capture| capture.source().admission().identity()),
-            intervention_plan_id: state.funded_capture.as_ref()
+            sampling_after:
+                <Self as eredu_core::TextSamplingControlBackend>::sampling_control_facts(state),
+            capture_plan_id: state
+                .funded_capture
+                .as_ref()
+                .map(|capture| capture.source().admission().identity()),
+            intervention_plan_id: state
+                .funded_capture
+                .as_ref()
                 .and_then(|capture| capture.collector().intervention_source())
                 .map(|source| source.plan().admission().identity()),
         }
     }
 
     fn prepare_text_resume_control(
-        runtime: &ModelRuntime<Self>, saved: &Self::ResumeSource,
-        config: TextGenerationConfig, context: &TextStepContext,
-        host: &eredu_core::HostPreparationAuthority, _options: &eredu_core::OriginalTextResumeOptions<'_>,
-    ) -> Result<Option<Self::TextPreparationControl>, eredu_core::BackendFailure> {
-        let session=runtime.session();
-        let Some(transport)=session.payload.distributed.as_ref() else {return Ok(None);};
-        let result=(|| {
-            let source=saved.funded_source()?;
-            source.validate_resume_origin_fixed(runtime)
-                .map_err(|cause|memory(cause.into_memory()))?;
-            if context.attempt()!=0 || !session.payload.target.has_retained_world() {
-                return Err(mismatch());
-            }
-            runtime.backend().validate_original_stream_owners()?;
-            let selected=session.payload.model.inference_blueprint().ok_or_else(unknown)?.selected();
-            let manifest=selected.communication_manifest().ok_or_else(unknown)?;
-            let capacity=config.inference_policy().managed_memory_capacity_bytes.ok_or_else(unknown)?;
-            transport.prepare_original_readiness(manifest,transport.native_world(),
-                runtime.backend().memory_pool(),session.payload.model.erased().inference_execution_identity(),
-                capacity,context).map(Some)
-        })();
-        result.map_err(|cause|eredu_core::BackendFailure::from_error(
-            super::resume_prompt::ResumeFailure::new(cause,host)))
-    }
-
-    fn admit_text_resume<C: TokenFilterController>(
         runtime: &ModelRuntime<Self>,
         saved: &Self::ResumeSource,
         config: TextGenerationConfig,
-        controller: &C,
         context: &TextStepContext,
+        host: &eredu_core::HostPreparationAuthority,
+        _options: &eredu_core::OriginalTextResumeOptions<'_>,
+    ) -> Result<Option<Self::TextPreparationControl>, eredu_core::BackendFailure> {
+        let session = runtime.session();
+        let Some(transport) = session.payload.distributed.as_ref() else {
+            return Ok(None);
+        };
+        let result = (|| {
+            let source = saved.funded_source()?;
+            source
+                .validate_resume_origin_fixed(runtime)
+                .map_err(|cause| memory(cause.into_memory()))?;
+            if context.attempt() != 0 || !session.payload.target.has_retained_world() {
+                return Err(mismatch());
+            }
+            runtime.backend().validate_original_stream_owners()?;
+            let selected = session
+                .payload
+                .model
+                .inference_blueprint()
+                .ok_or_else(unknown)?
+                .selected();
+            let manifest = selected.communication_manifest().ok_or_else(unknown)?;
+            let capacity = config
+                .inference_policy()
+                .memory_limits
+                .resolve(runtime.backend().memory_ledger().topology())
+                .map_err(|cause| memory(cause.into()))?;
+            transport
+                .prepare_original_readiness(
+                    manifest,
+                    transport.native_world(),
+                    runtime.backend().memory_ledger(),
+                    session
+                        .payload
+                        .model
+                        .erased()
+                        .inference_execution_identity(),
+                    capacity,
+                    context,
+                )
+                .map(Some)
+        })();
+        result.map_err(|cause| {
+            eredu_core::BackendFailure::from_error(super::resume_prompt::ResumeFailure::new(
+                cause, host,
+            ))
+        })
+    }
+
+    fn admit_text_resume<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _saved: &Self::ResumeSource,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _context: &TextStepContext,
     ) -> Result<Self::ResumePreparation, eredu_core::BackendFailure> {
-        let source = saved
-            .funded_source()
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        let admission = admit_saved(runtime, source, config, controller, context)?;
-        Ok(MlxTextResumePreparation::new(runtime, admission))
+        Err(eredu_core::BackendFailure::from_error(
+            WorkingMemoryError::UnknownBound,
+        ))
     }
 
     fn admit_original_text_resume<C: TokenFilterController>(
@@ -284,7 +324,9 @@ impl TextResumeBackend for MlxBackend<'_> {
             drop(original_custody);
             state.funding = Some(quote.take_funding_run()?);
             state.funded_capture = prepared.admission.take_capture(runtime)?;
-            prepared.admission.apply_child_sampling(runtime, &mut state.sampling)?;
+            prepared
+                .admission
+                .apply_child_sampling(runtime, &mut state.sampling)?;
             prepared.phase = Phase::Sampling;
             #[cfg(all(
                 test,
@@ -351,9 +393,12 @@ impl TextResumeBackend for MlxBackend<'_> {
                         .pending_media()
                         .filter(|_| has_future_input)
                         .map(|media| media.semantics().binding());
-                    prepared.admission.quote().with_parallel_control(runtime, |runtime| {
-                        exchange.install(runtime, slot, metadata, media)
-                    })?
+                    prepared
+                        .admission
+                        .quote()
+                        .with_parallel_control(runtime, |runtime| {
+                            exchange.install(runtime, slot, metadata, media)
+                        })?
                 }
                 None => {
                     Self::exchange_native_text_state(runtime, slot)?;
@@ -391,12 +436,16 @@ impl TextResumeBackend for MlxBackend<'_> {
     fn text_resume_intervention_source(
         state: &Self::TextGenerationState,
     ) -> Option<&eredu_core::intervention::SharedInterventionPlan> {
-        state.funded_capture.as_ref()
+        state
+            .funded_capture
+            .as_ref()
             .and_then(|capture| capture.collector().intervention_source())
             .map(|source| source.plan())
     }
 
-    fn finish_text_resume(prepared: &mut Self::ResumePreparation) -> (MlxTextPreparation, MlxNativeTextState) {
+    fn finish_text_resume(
+        prepared: &mut Self::ResumePreparation,
+    ) -> (MlxTextPreparation, MlxNativeTextState) {
         assert!(
             prepared.phase == Phase::Installed,
             "resume was not installed"
@@ -404,7 +453,13 @@ impl TextResumeBackend for MlxBackend<'_> {
         let ordinary = prepared.admission.finish();
         prepared.phase = Phase::Finished;
         prepared.armed = false;
-        (ordinary, prepared.native.take().expect("installed resume retains its displaced native state"))
+        (
+            ordinary,
+            prepared
+                .native
+                .take()
+                .expect("installed resume retains its displaced native state"),
+        )
     }
 }
 
@@ -414,44 +469,4 @@ impl TextResumeBackend for MlxBackend<'_> {
     feature = "metal",
     not(feature = "cuda")
 ))]
-pub(in crate::composition::mlx::session) mod failure_tests;
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod tests;
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod family_tests;
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod state_family_tests;
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod pooling_tests;
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod layerwise_tests;
+pub(in crate::composition::mlx) mod failure_tests;

@@ -1,8 +1,8 @@
 use super::*;
 use crate::*;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
 };
 
 #[derive(Debug)]
@@ -76,7 +76,6 @@ fn fixture() -> CaptureDiscovery {
             capture: CaptureCapabilities {
                 transformations: vec![CaptureTransformKind::Preview, CaptureTransformKind::Summary],
                 max_histogram_bins: 32,
-                physical_native_limit: true,
                 conditions: vec!["selected worker".into()],
             },
         },

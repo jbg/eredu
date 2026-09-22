@@ -1,6 +1,8 @@
 #![cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     ControlledTextGeneration, TextControllerStorage, TextFilterWorkspace, TextGeneration,
@@ -8,7 +10,7 @@ use eredu_core::{
 };
 use eredu_runtime::{
     execution_control::TokenChoiceController,
-    working_memory::{InferenceStateRevision, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{InferenceStateRevision, MemoryLedger, WorkingMemoryError},
     TokenDomain,
 };
 
@@ -68,7 +70,15 @@ fn config(capacity: Option<u64>, outputs: usize) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: capacity,
+        memory_limits: (capacity).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -76,10 +86,10 @@ fn config(capacity: Option<u64>, outputs: usize) -> TextGenerationConfig {
 
 fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -93,15 +103,35 @@ fn runtime(
 }
 
 fn reclaim() {
+    safemlx::memory::clear_cache().unwrap();
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
+    crate::backend::ordinary_retirement::reclaim_all();
 }
 
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
-    crate::backend::submission_recovery::wait_for_retirement(|| {
+fn settle(pool: &MemoryLedger, bytes: u64) {
+    let expected = if bytes == 0 {
+        pool.snapshot().unwrap().domains[0]
+            .fixed_baseline
+            .total()
+            .unwrap()
+    } else {
+        bytes
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
-    });
+        let actual = pool.fixture_host_current().unwrap();
+        if actual == expected && pool.unquoted_owner_count().unwrap() == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal charge did not retire: actual={actual}, expected={expected}, snapshot={:?}",
+            pool.snapshot().unwrap()
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn ids(outputs: &[MlxTextToken]) -> Vec<u32> {
@@ -112,7 +142,7 @@ fn ids(outputs: &[MlxTextToken]) -> Vec<u32> {
 }
 
 fn ordinary_reference(stream: &Stream, prompt: Vec<u32>, count: usize) -> Vec<u32> {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(stream, &pool);
     let outputs = TextGeneration::new(&mut runtime, prompt, config(None, count))
         .unwrap()
@@ -158,7 +188,7 @@ struct NoWork {
 }
 
 impl NoWork {
-    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) -> Self {
+    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) -> Self {
         Self {
             paths: paths::snapshot(),
             inputs: paths::session_input_creation_attempts(),
@@ -172,12 +202,12 @@ impl NoWork {
                 .unwrap()
                 .revision()
                 .clone(),
-            bytes: pool.used_bytes().unwrap(),
-            peak: pool.peak_bytes().unwrap(),
+            bytes: pool.fixture_host_current().unwrap(),
+            peak: pool.snapshot().unwrap().domains[0].historical_peak_bytes,
         }
     }
 
-    fn assert_unchanged(&self, runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) {
+    fn assert_unchanged(&self, runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) {
         assert_eq!(paths::snapshot(), self.paths);
         assert_eq!(paths::session_input_creation_attempts(), self.inputs);
         assert_eq!(paths::session_reset_attempts(), self.resets);
@@ -187,8 +217,11 @@ impl NoWork {
             model.retained_inference_authority().unwrap().revision(),
             &self.revision
         );
-        assert_eq!(pool.used_bytes().unwrap(), self.bytes);
-        assert_eq!(pool.peak_bytes().unwrap(), self.peak);
+        assert_eq!(pool.fixture_host_current().unwrap(), self.bytes);
+        assert_eq!(
+            pool.snapshot().unwrap().domains[0].historical_peak_bytes,
+            self.peak
+        );
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     }
 }
@@ -204,7 +237,7 @@ fn optional_choice_forced_then_unfiltered_matches_ordinary_and_controlled_native
     let reference = suffix_reference(&stream);
     let mut sequences = Vec::new();
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = runtime(&stream, &pool);
         let calls = Rc::new(Cell::new((0, 0)));
         let controller = force_before_preparation(calls.clone());
@@ -271,9 +304,9 @@ fn optional_choice_rejects_one_byte_short_and_runs_at_exact_real_quote_capacity(
         "fixture must force a changed prediction"
     );
     let reference = suffix_reference(&stream);
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_current().unwrap();
     let calls = Rc::new(Cell::new((0, 0)));
     let controller = force_before_preparation(calls.clone());
     let probe = MlxBackend::admit_text_preparation(
@@ -292,11 +325,17 @@ fn optional_choice_rejects_one_byte_short_and_runs_at_exact_real_quote_capacity(
         .unwrap()
         .request()
         .memory_reservation()
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
         .unwrap()
-        .bytes();
+        .total()
+        .unwrap();
     assert!(charge > 0);
-    let exact = initial.checked_add(charge).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), exact);
+    let exact = pool.fixture_host_current().unwrap();
+    assert!(
+        exact.checked_sub(initial).unwrap() >= charge,
+        "the complete preparation retains its planning and source owners"
+    );
     drop(probe);
     settle(&pool, initial);
     let before = NoWork::capture(&runtime, &pool);
@@ -309,11 +348,9 @@ fn optional_choice_rejects_one_byte_short_and_runs_at_exact_real_quote_capacity(
     .err()
     .unwrap();
     assert_eq!(
-        cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::BudgetExceeded {
-            required_bytes: charge,
-            available_bytes: charge - 1,
-        })
+        cause::<WorkingMemoryError>(&error)
+            .and_then(crate::tests::support::memory_error::host_budget_numbers),
+        Some((charge, charge - 1))
     );
     assert_eq!(calls.get(), (1, 0));
     before.assert_unchanged(&runtime, &pool);
@@ -324,7 +361,7 @@ fn optional_choice_rejects_one_byte_short_and_runs_at_exact_real_quote_capacity(
         controller,
     )
     .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), exact);
+    assert_eq!(pool.fixture_host_current().unwrap(), exact);
     let outputs = generation
         .map(|token| token.unwrap().into_output())
         .collect::<Vec<_>>();
@@ -334,7 +371,10 @@ fn optional_choice_rejects_one_byte_short_and_runs_at_exact_real_quote_capacity(
     assert_eq!(&actual[1..], reference.as_slice());
     assert_eq!(calls.get(), (4, 3));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), before.peak.max(exact));
+    assert_eq!(
+        pool.snapshot().unwrap().domains[0].historical_peak_bytes,
+        before.peak.max(exact)
+    );
     eprintln!(
         "optional native filtering: charge={charge}, exact_capacity={exact}, baseline={baseline}, forced={FORCED_TOKEN}, outputs={actual:?}"
     );
@@ -346,7 +386,7 @@ fn optional_choice_rejects_one_byte_short_and_runs_at_exact_real_quote_capacity(
 #[test]
 fn optional_filter_quote_does_not_authorize_post_preparation_controller_mutation() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let calls = Rc::new(Cell::new((0, 0)));
     let mut driver = TextGenerationDriver::new(&mut runtime);

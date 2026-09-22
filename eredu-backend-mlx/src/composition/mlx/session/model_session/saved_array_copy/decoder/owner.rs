@@ -1,53 +1,23 @@
 //! Closed active aliases; semantic payload destruction stays in ordinary retirement.
 use super::{CopiedTextComponents, FrozenDecoder};
 use crate::backend::ordinary_retirement::OrdinaryRetirement;
-#[cfg(test)]
-use std::cell::Cell;
 use std::{ops::Deref, rc::Rc};
-
-#[cfg(test)]
-struct RetirementProbe {
-    retired: Rc<Cell<bool>>,
-    _host: Option<eredu_core::HostPreparationAuthority>,
-}
-#[cfg(test)]
-impl RetirementProbe {
-    fn retired(&self) -> bool {
-        self.retired.get()
-    }
-}
 
 // No raw Rc/Weak or owning OrdinaryRetirement escapes this module.
 pub(super) struct FrozenDecoderOwner {
     inner: Option<Rc<OrdinaryRetirement<FrozenDecoder>>>,
-    // Separate from semantic Drop. All clones observe the same final active alias.
-    #[cfg(test)]
-    active_retired: Option<Rc<Cell<bool>>>,
 }
 impl FrozenDecoderOwner {
     pub(super) fn new(value: FrozenDecoder) -> Self {
         Self {
             inner: Some(Rc::new(OrdinaryRetirement::new(value))),
-            #[cfg(test)]
-            active_retired: Some(Rc::new(Cell::new(false))),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn retirement_probe(&self) -> impl Fn() -> bool + 'static {
-        let probe = RetirementProbe {
-            retired: self.active_retired.as_ref().expect("live probe").clone(),
-            _host: self._host_preparation.clone(),
-        };
-        move || probe.retired()
     }
 }
 impl Clone for FrozenDecoderOwner {
     fn clone(&self) -> Self {
         Self {
             inner: Some(self.inner.as_ref().expect("live payload owner").clone()),
-            #[cfg(test)]
-            active_retired: self.active_retired.clone(),
         }
     }
 }
@@ -69,14 +39,6 @@ impl Drop for FrozenDecoderOwner {
     fn drop(&mut self) {
         if let Some(owner) = self.inner.take() {
             let pending = retire_active(owner);
-            #[cfg(test)]
-            {
-                let probe = self.active_retired.take().expect("live probe");
-                if pending.is_some() {
-                    probe.set(true);
-                }
-                drop(probe);
-            }
             // Only queues the existing Box. No callback, wait or eager reclaim.
             drop(pending);
         }
@@ -87,34 +49,18 @@ impl Drop for FrozenDecoderOwner {
 /// exported, so the final shell retires before payloads can release preparation.
 pub(in crate::composition::mlx::session) struct CopiedTextComponentsOwner {
     inner: Option<Rc<CopiedTextComponents>>,
-    #[cfg(test)]
-    active_retired: Option<Rc<Cell<bool>>>,
 }
 impl CopiedTextComponentsOwner {
     pub(in crate::composition::mlx::session) fn new(value: CopiedTextComponents) -> Self {
         Self {
             inner: Some(Rc::new(value)),
-            #[cfg(test)]
-            active_retired: Some(Rc::new(Cell::new(false))),
         }
-    }
-    #[cfg(test)]
-    pub(in crate::composition::mlx::session) fn retirement_probe(
-        &self,
-    ) -> impl Fn() -> bool + 'static {
-        let probe = RetirementProbe {
-            retired: self.active_retired.as_ref().expect("live probe").clone(),
-            _host: self.host_preparation.clone(),
-        };
-        move || probe.retired()
     }
 }
 impl Clone for CopiedTextComponentsOwner {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            #[cfg(test)]
-            active_retired: self.active_retired.clone(),
         }
     }
 }
@@ -128,17 +74,6 @@ impl Drop for CopiedTextComponentsOwner {
     fn drop(&mut self) {
         if let Some(owner) = self.inner.take() {
             let value = Rc::into_inner(owner);
-            #[cfg(test)]
-            {
-                // This test-only allocation is included in host preparation.
-                // Retire the local probe alias before the pair can release it;
-                // exported probes retain their own preparation authority.
-                let probe = self.active_retired.take().expect("live probe");
-                if value.is_some() {
-                    probe.set(true);
-                }
-                drop(probe);
-            }
             drop(value);
         }
     }
@@ -178,9 +113,5 @@ pub(super) fn returned_control_bytes() -> Option<usize> {
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)?;
-    #[cfg(test)]
-    let bytes = bytes
-        .checked_add(rc_bytes::<Cell<bool>>()?)?
-        .checked_add(rc_bytes::<Cell<bool>>()?)?;
     Some(bytes)
 }

@@ -33,6 +33,9 @@ impl TransferDestination for ScheduledCaptureTensor<'_, '_> {
     fn push_f32(&mut self, value: f32) -> Result<(), Self::Error> {
         ScheduledCaptureTensor::push_f32(self, value)
     }
+    fn push_u64(&mut self, value: u64) -> Result<(), Self::Error> {
+        ScheduledCaptureTensor::push_u64(self, value)
+    }
 }
 /// Source belongs to the caller's authenticated model or completed numerical value.
 /// Existing Q is retained by the same recovery owner; no C publication or source
@@ -45,37 +48,48 @@ pub(crate) fn execute<'custody>(
     custody: impl Into<CaptureCustody<'custody>>,
     observer: &OriginalScopeObserver,
 ) -> Result<ClaimedCaptureTensor, CaptureTensorNativeError> {
-    execute_shared(source,claim,stream,roots,custody.into(),observer,None)
+    execute_shared(source, claim, stream, roots, custody.into(), observer, None)
 }
 
 /// The numerical caller lends its actual CPU recipe and currently entered
 /// observer. Shared claim/source validation and the ordinary transform remain
 /// identical; this path creates no additional completion allowance.
 pub(crate) fn execute_cpu<'custody>(
-    source:&Array,claim:CaptureTensorClaim<'_, '_>,roots:&RefCell<Vec<Array>>,
-    custody:impl Into<CaptureCustody<'custody>>,
-    loan:&crate::backend::nn::workspace::CpuCaptureLoan<'_>,
-)->Result<ClaimedCaptureTensor,CaptureTensorNativeError>{
-    execute_shared(source,claim,loan.stream(),roots,custody.into(),loan.observer(),Some(loan))
+    source: &Array,
+    claim: CaptureTensorClaim<'_, '_>,
+    roots: &RefCell<Vec<Array>>,
+    custody: impl Into<CaptureCustody<'custody>>,
+    loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>,
+) -> Result<ClaimedCaptureTensor, CaptureTensorNativeError> {
+    execute_shared(
+        source,
+        claim,
+        loan.stream(),
+        roots,
+        custody.into(),
+        loan.observer(),
+        Some(loan),
+    )
 }
-fn execute_shared(source:&Array,claim:CaptureTensorClaim<'_, '_>,stream:&Stream,
-    roots:&RefCell<Vec<Array>>,custody:CaptureCustody<'_>,observer:&OriginalScopeObserver,
-    cpu:Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
-)->Result<ClaimedCaptureTensor,CaptureTensorNativeError>{
+fn execute_shared(
+    source: &Array,
+    claim: CaptureTensorClaim<'_, '_>,
+    stream: &Stream,
+    roots: &RefCell<Vec<Array>>,
+    custody: CaptureCustody<'_>,
+    observer: &OriginalScopeObserver,
+    cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
+) -> Result<ClaimedCaptureTensor, CaptureTensorNativeError> {
     match custody {
         CaptureCustody::Model(owner) => claim.validate_model_custody(owner)?,
         CaptureCustody::Numerical(owner) => claim.validate_numerical_custody(owner)?,
     }
     let dtype = PreparedCaptureTensor::validate_borrowed_source(source, claim.geometry())?;
-    match cpu {Some(loan)=>loan.validate()?,None=>PreparedCaptureTensor::validate_stream(stream)?};
-    let program = Selection::with_conversion(
-        claim.geometry(),
-        if dtype == Dtype::Float32 {
-            ConversionMode::ActualF32
-        } else {
-            ConversionMode::ActualHalf
-        },
-    )?;
+    match cpu {
+        Some(loan) => loan.validate()?,
+        None => PreparedCaptureTensor::validate_stream(stream)?,
+    };
+    let program = Selection::with_conversion(claim.geometry(), ConversionMode::actual(dtype))?;
     let completion = CaptureCompletion::Original(observer);
     completion.validate()?;
     // One retained input and at most Slice/reshape/Preview-Slice/AsType outputs.
@@ -105,9 +119,13 @@ pub(crate) fn control_bytes() -> Option<usize> {
         size_of::<CaptureCustody<'static>>(),
         crate::backend::nn::workspace::CpuCaptureLoan::control_bytes()?,
         size_of::<Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>>(),
-        size_of::<(&Array,&RefCell<Vec<Array>>,CaptureCustody<'static>,
-            &crate::backend::nn::workspace::CpuCaptureLoan<'static>)>(),
-        size_of::<Result<ClaimedCaptureTensor,CaptureTensorNativeError>>(),
+        size_of::<(
+            &Array,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &crate::backend::nn::workspace::CpuCaptureLoan<'static>,
+        )>(),
+        size_of::<Result<ClaimedCaptureTensor, CaptureTensorNativeError>>(),
         size_of::<(
             &Array,
             &Stream,
@@ -164,21 +182,47 @@ pub(crate) fn execute_candidates<'custody>(
     observer: &OriginalScopeObserver,
     domain: Option<CaptureTokenDomain<'_>>,
 ) -> Result<ClaimedCaptureCandidates, CaptureTensorNativeError> {
-    execute_candidates_shared(source, claim, stream, roots, custody.into(), observer, domain, None)
+    execute_candidates_shared(
+        source,
+        claim,
+        stream,
+        roots,
+        custody.into(),
+        observer,
+        domain,
+        None,
+    )
 }
 
 /// Borrow the selected complete CPU recipe; keep the ordinary sort/take worker.
 pub(crate) fn execute_candidates_cpu<'custody>(
-    source: &Array, claim: CaptureCandidateClaim<'_, '_>, roots: &RefCell<Vec<Array>>,
+    source: &Array,
+    claim: CaptureCandidateClaim<'_, '_>,
+    roots: &RefCell<Vec<Array>>,
     custody: impl Into<CaptureCustody<'custody>>,
-    loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>, domain: Option<CaptureTokenDomain<'_>>,
+    loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>,
+    domain: Option<CaptureTokenDomain<'_>>,
 ) -> Result<ClaimedCaptureCandidates, CaptureTensorNativeError> {
-    execute_candidates_shared(source, claim, loan.stream(), roots, custody.into(), loan.observer(), domain, Some(loan))
+    execute_candidates_shared(
+        source,
+        claim,
+        loan.stream(),
+        roots,
+        custody.into(),
+        loan.observer(),
+        domain,
+        Some(loan),
+    )
 }
 fn execute_candidates_shared(
-    source: &Array, claim: CaptureCandidateClaim<'_, '_>, stream: &Stream,
-    roots: &RefCell<Vec<Array>>, custody: CaptureCustody<'_>, observer: &OriginalScopeObserver,
-    domain: Option<CaptureTokenDomain<'_>>, cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
+    source: &Array,
+    claim: CaptureCandidateClaim<'_, '_>,
+    stream: &Stream,
+    roots: &RefCell<Vec<Array>>,
+    custody: CaptureCustody<'_>,
+    observer: &OriginalScopeObserver,
+    domain: Option<CaptureTokenDomain<'_>>,
+    cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
 ) -> Result<ClaimedCaptureCandidates, CaptureTensorNativeError> {
     match custody {
         CaptureCustody::Model(owner) => claim.validate_model_custody(owner)?,
@@ -186,7 +230,10 @@ fn execute_candidates_shared(
     }
     let program = CandidateExtraction::from_geometry(claim.geometry())?;
     program.validate_source(source)?;
-    match cpu { Some(loan) => loan.validate()?, None => PreparedCaptureTensor::validate_stream(stream)? };
+    match cpu {
+        Some(loan) => loan.validate()?,
+        None => PreparedCaptureTensor::validate_stream(stream)?,
+    };
     let completion = CaptureCompletion::Original(observer);
     completion.validate()?;
     completion.reserve_roots(roots, 1 + CandidateExtraction::ROOTS)?;
@@ -217,21 +264,47 @@ pub(crate) fn execute_token_scores<'custody>(
     observer: &OriginalScopeObserver,
     domain: Option<CaptureTokenDomain<'_>>,
 ) -> Result<ClaimedCaptureTokenScores, CaptureTensorNativeError> {
-    execute_token_scores_shared(source, claim, stream, roots, custody.into(), observer, domain, None)
+    execute_token_scores_shared(
+        source,
+        claim,
+        stream,
+        roots,
+        custody.into(),
+        observer,
+        domain,
+        None,
+    )
 }
 
 /// Same selected-ID program and claim, borrowing the already entered CPU role.
 pub(crate) fn execute_token_scores_cpu<'custody>(
-    source: &Array, claim: CaptureTokenScoreClaim<'_, '_>, roots: &RefCell<Vec<Array>>,
+    source: &Array,
+    claim: CaptureTokenScoreClaim<'_, '_>,
+    roots: &RefCell<Vec<Array>>,
     custody: impl Into<CaptureCustody<'custody>>,
-    loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>, domain: Option<CaptureTokenDomain<'_>>,
+    loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>,
+    domain: Option<CaptureTokenDomain<'_>>,
 ) -> Result<ClaimedCaptureTokenScores, CaptureTensorNativeError> {
-    execute_token_scores_shared(source, claim, loan.stream(), roots, custody.into(), loan.observer(), domain, Some(loan))
+    execute_token_scores_shared(
+        source,
+        claim,
+        loan.stream(),
+        roots,
+        custody.into(),
+        loan.observer(),
+        domain,
+        Some(loan),
+    )
 }
 fn execute_token_scores_shared(
-    source: &Array, claim: CaptureTokenScoreClaim<'_, '_>, stream: &Stream,
-    roots: &RefCell<Vec<Array>>, custody: CaptureCustody<'_>, observer: &OriginalScopeObserver,
-    domain: Option<CaptureTokenDomain<'_>>, cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
+    source: &Array,
+    claim: CaptureTokenScoreClaim<'_, '_>,
+    stream: &Stream,
+    roots: &RefCell<Vec<Array>>,
+    custody: CaptureCustody<'_>,
+    observer: &OriginalScopeObserver,
+    domain: Option<CaptureTokenDomain<'_>>,
+    cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
 ) -> Result<ClaimedCaptureTokenScores, CaptureTensorNativeError> {
     match custody {
         CaptureCustody::Model(owner) => claim.validate_model_custody(owner)?,
@@ -239,7 +312,10 @@ fn execute_token_scores_shared(
     }
     let program = TokenScoreProgram::from_geometry(claim.geometry())?;
     program.validate_source(source)?;
-    match cpu { Some(loan) => loan.validate()?, None => PreparedCaptureTensor::validate_stream(stream)? };
+    match cpu {
+        Some(loan) => loan.validate()?,
+        None => PreparedCaptureTensor::validate_stream(stream)?,
+    };
     let completion = CaptureCompletion::Original(observer);
     completion.validate()?;
     let count = program
@@ -298,12 +374,24 @@ pub(crate) fn candidate_control_bytes() -> Option<usize> {
     let frames = [
         crate::backend::nn::workspace::CpuCaptureLoan::control_bytes()?,
         size_of::<Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>>(),
-        size_of::<(&Array, CaptureCandidateClaim<'static, 'static>, &RefCell<Vec<Array>>,
-            CaptureCustody<'static>, &crate::backend::nn::workspace::CpuCaptureLoan<'static>,
-            Option<CaptureTokenDomain<'static>>) >(),
-        size_of::<(&Array, CaptureCandidateClaim<'static, 'static>, &Stream, &RefCell<Vec<Array>>,
-            CaptureCustody<'static>, &OriginalScopeObserver, Option<CaptureTokenDomain<'static>>,
-            Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>) >(),
+        size_of::<(
+            &Array,
+            CaptureCandidateClaim<'static, 'static>,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &crate::backend::nn::workspace::CpuCaptureLoan<'static>,
+            Option<CaptureTokenDomain<'static>>,
+        )>(),
+        size_of::<(
+            &Array,
+            CaptureCandidateClaim<'static, 'static>,
+            &Stream,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &OriginalScopeObserver,
+            Option<CaptureTokenDomain<'static>>,
+            Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>,
+        )>(),
         size_of::<CaptureCandidateClaim<'static, 'static>>(),
         size_of::<ScheduledCaptureCandidates<'static, 'static>>(),
         size_of::<Result<ScheduledCaptureCandidates<'static, 'static>, CaptureRunHostError>>(),
@@ -329,12 +417,24 @@ pub(crate) fn token_score_control_bytes(program: TokenScoreProgram<'_>) -> Optio
     let frames = [
         crate::backend::nn::workspace::CpuCaptureLoan::control_bytes()?,
         size_of::<Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>>(),
-        size_of::<(&Array, CaptureTokenScoreClaim<'static, 'static>, &RefCell<Vec<Array>>,
-            CaptureCustody<'static>, &crate::backend::nn::workspace::CpuCaptureLoan<'static>,
-            Option<CaptureTokenDomain<'static>>) >(),
-        size_of::<(&Array, CaptureTokenScoreClaim<'static, 'static>, &Stream, &RefCell<Vec<Array>>,
-            CaptureCustody<'static>, &OriginalScopeObserver, Option<CaptureTokenDomain<'static>>,
-            Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>) >(),
+        size_of::<(
+            &Array,
+            CaptureTokenScoreClaim<'static, 'static>,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &crate::backend::nn::workspace::CpuCaptureLoan<'static>,
+            Option<CaptureTokenDomain<'static>>,
+        )>(),
+        size_of::<(
+            &Array,
+            CaptureTokenScoreClaim<'static, 'static>,
+            &Stream,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &OriginalScopeObserver,
+            Option<CaptureTokenDomain<'static>>,
+            Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>,
+        )>(),
         size_of::<CaptureTokenScoreClaim<'static, 'static>>(),
         size_of::<ScheduledCaptureTokenScores<'static, 'static>>(),
         size_of::<Result<ScheduledCaptureTokenScores<'static, 'static>, CaptureRunHostError>>(),
@@ -371,16 +471,30 @@ pub(crate) fn execute_summary<'custody>(
 }
 
 pub(crate) fn execute_summary_cpu<'custody>(
-    source: &Array, claim: eredu_runtime::working_memory::CaptureSummaryClaim<'_, '_>,
-    roots: &RefCell<Vec<Array>>, custody: impl Into<CaptureCustody<'custody>>,
+    source: &Array,
+    claim: eredu_runtime::working_memory::CaptureSummaryClaim<'_, '_>,
+    roots: &RefCell<Vec<Array>>,
+    custody: impl Into<CaptureCustody<'custody>>,
     loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>,
 ) -> Result<eredu_runtime::working_memory::ClaimedCaptureSummary, CaptureTensorNativeError> {
-    execute_summary_shared(source, claim, loan.stream(), roots, custody.into(), loan.observer(), Some(loan))
+    execute_summary_shared(
+        source,
+        claim,
+        loan.stream(),
+        roots,
+        custody.into(),
+        loan.observer(),
+        Some(loan),
+    )
 }
 fn execute_summary_shared(
-    source: &Array, claim: eredu_runtime::working_memory::CaptureSummaryClaim<'_, '_>,
-    stream: &Stream, roots: &RefCell<Vec<Array>>, custody: CaptureCustody<'_>,
-    observer: &OriginalScopeObserver, cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
+    source: &Array,
+    claim: eredu_runtime::working_memory::CaptureSummaryClaim<'_, '_>,
+    stream: &Stream,
+    roots: &RefCell<Vec<Array>>,
+    custody: CaptureCustody<'_>,
+    observer: &OriginalScopeObserver,
+    cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
 ) -> Result<eredu_runtime::working_memory::ClaimedCaptureSummary, CaptureTensorNativeError> {
     match custody {
         CaptureCustody::Model(owner) => claim.validate_model_custody(owner)?,
@@ -388,7 +502,10 @@ fn execute_summary_shared(
     }
     let program = PreparedCaptureSummary::from_geometry(claim.geometry())?;
     program.validate_source(source)?;
-    match cpu { Some(loan) => loan.validate()?, None => PreparedCaptureTensor::validate_stream(stream)? };
+    match cpu {
+        Some(loan) => loan.validate()?,
+        None => PreparedCaptureTensor::validate_stream(stream)?,
+    };
     let population = program
         .population()
         .ok_or(CaptureTensorNativeError::GeometryOverflow)?;
@@ -415,7 +532,13 @@ pub(crate) fn summary_control_bytes(program: &PreparedCaptureSummary) -> Option<
         size_of::<CaptureSummaryClaim<'static, 'static>>() * 3,
         size_of::<Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>>(),
         crate::backend::nn::workspace::CpuCaptureLoan::control_bytes()?,
-        size_of::<(&Array, &Stream, &RefCell<Vec<Array>>, CaptureCustody<'static>, &OriginalScopeObserver)>() * 2,
+        size_of::<(
+            &Array,
+            &Stream,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &OriginalScopeObserver,
+        )>() * 2,
         size_of::<Result<ClaimedCaptureSummary, CaptureTensorNativeError>>(),
         size_of::<eredu_core::capture::CaptureSummary>(),
         size_of::<Result<eredu_core::capture::CaptureSummary, CaptureTensorNativeError>>(),
@@ -445,16 +568,30 @@ pub(crate) fn execute_histogram<'custody>(
 }
 
 pub(crate) fn execute_histogram_cpu<'custody>(
-    source: &Array, claim: eredu_runtime::working_memory::CaptureHistogramClaim<'_, '_>,
-    roots: &RefCell<Vec<Array>>, custody: impl Into<CaptureCustody<'custody>>,
+    source: &Array,
+    claim: eredu_runtime::working_memory::CaptureHistogramClaim<'_, '_>,
+    roots: &RefCell<Vec<Array>>,
+    custody: impl Into<CaptureCustody<'custody>>,
     loan: &crate::backend::nn::workspace::CpuCaptureLoan<'_>,
 ) -> Result<eredu_runtime::working_memory::ClaimedCaptureHistogram, CaptureTensorNativeError> {
-    execute_histogram_shared(source, claim, loan.stream(), roots, custody.into(), loan.observer(), Some(loan))
+    execute_histogram_shared(
+        source,
+        claim,
+        loan.stream(),
+        roots,
+        custody.into(),
+        loan.observer(),
+        Some(loan),
+    )
 }
 fn execute_histogram_shared(
-    source: &Array, claim: eredu_runtime::working_memory::CaptureHistogramClaim<'_, '_>,
-    stream: &Stream, roots: &RefCell<Vec<Array>>, custody: CaptureCustody<'_>,
-    observer: &OriginalScopeObserver, cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
+    source: &Array,
+    claim: eredu_runtime::working_memory::CaptureHistogramClaim<'_, '_>,
+    stream: &Stream,
+    roots: &RefCell<Vec<Array>>,
+    custody: CaptureCustody<'_>,
+    observer: &OriginalScopeObserver,
+    cpu: Option<&crate::backend::nn::workspace::CpuCaptureLoan<'_>>,
 ) -> Result<eredu_runtime::working_memory::ClaimedCaptureHistogram, CaptureTensorNativeError> {
     match custody {
         CaptureCustody::Model(owner) => claim.validate_model_custody(owner)?,
@@ -463,7 +600,10 @@ fn execute_histogram_shared(
     // Edges borrow the immutable admission, not this moved claim or a new copy.
     let program = PreparedCaptureHistogram::from_geometry(claim.geometry())?;
     program.validate_source(source)?;
-    match cpu { Some(loan) => loan.validate()?, None => PreparedCaptureTensor::validate_stream(stream)? };
+    match cpu {
+        Some(loan) => loan.validate()?,
+        None => PreparedCaptureTensor::validate_stream(stream)?,
+    };
     let population = program
         .population()
         .ok_or(CaptureTensorNativeError::GeometryOverflow)?;
@@ -501,7 +641,13 @@ pub(crate) fn histogram_control_bytes(program: &PreparedCaptureHistogram<'_>) ->
         size_of::<CaptureHistogramClaim<'static, 'static>>() * 3,
         size_of::<Option<&crate::backend::nn::workspace::CpuCaptureLoan<'static>>>(),
         crate::backend::nn::workspace::CpuCaptureLoan::control_bytes()?,
-        size_of::<(&Array, &Stream, &RefCell<Vec<Array>>, CaptureCustody<'static>, &OriginalScopeObserver)>() * 2,
+        size_of::<(
+            &Array,
+            &Stream,
+            &RefCell<Vec<Array>>,
+            CaptureCustody<'static>,
+            &OriginalScopeObserver,
+        )>() * 2,
         size_of::<Result<ClaimedCaptureHistogram, CaptureTensorNativeError>>(),
         size_of::<Result<PreparedCaptureHistogram<'static>, CaptureTensorNativeError>>(),
         // The selected exact-owner finish owns the populated builder while forwarding to the

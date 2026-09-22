@@ -12,6 +12,9 @@ use std::mem::size_of;
 /// variants retain their complete original owner until normal error retirement.
 #[derive(Debug, thiserror::Error)]
 pub enum OriginalTextSourceError {
+    /// Invalid physical-domain configuration before source preparation.
+    #[error(transparent)]
+    Limits(#[from] eredu_core::MemoryDomainError),
     /// The request ceiling could not be installed before source preparation.
     #[error(transparent)]
     Budget(#[from] super::OriginalTextSourceBudgetError),
@@ -24,7 +27,6 @@ pub enum OriginalTextSourceError {
     /// Actual encoding cause and any original E/source custody.
     #[error(transparent)]
     Encode(#[from] OriginalTokenizerEncodeError),
-
 }
 impl OriginalTextSourceError {
     // Fixed named return populations only. These are control facts, no grant.
@@ -58,7 +60,8 @@ pub enum OriginalTokenizerSourceError {
 }
 impl OriginalTokenizerSourceError {
     pub(in crate::working_memory) fn tokenizer_controls() -> Option<usize> {
-        size_of::<Self>().checked_add(size_of::<eredu_core::TokenInputRejection>())?
+        size_of::<Self>()
+            .checked_add(size_of::<eredu_core::TokenInputRejection>())?
             .checked_add(size_of::<Result<(), Self>>())?
             .checked_add(size_of::<Result<OriginalTokenizer, Self>>())
     }

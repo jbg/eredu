@@ -25,7 +25,9 @@ pub(super) use error::QuoteError;
 pub trait WorkspaceLayerwiseParameters {
     /// Exact selected independently populated parameter identities. Ordinary
     /// and paid cold binding use the same selection as the native unit source.
-    fn excludes_parameter(&self, _name: &str) -> bool { false }
+    fn excludes_parameter(&self, _name: &str) -> bool {
+        false
+    }
 
     /// Exact group identifiers, unit counts and ordinal/address mapping.
     fn layout(&self) -> &ExecutionUnitLayout;
@@ -51,8 +53,14 @@ pub trait WorkspaceLayerwiseParameters {
     /// Records one actual shared-driver acquisition against a retained source.
     /// This metadata-only observation grants no materialization or submission.
     /// The default leaves ordinary providers unchanged.
-    fn observe_acquire(&self,_ordinal:usize,_address:ExecutionUnitAddress,
-        _context:&WorkspaceContext)->Result<(),Error> {Ok(())}
+    fn observe_acquire(
+        &self,
+        _ordinal: usize,
+        _address: ExecutionUnitAddress,
+        _context: &WorkspaceContext,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 
     /// Complete selected parameter inventory for one canonical execution unit.
     /// Missing, extra or incompatible slots reject before its equations execute.
@@ -94,9 +102,12 @@ where
         retain_target_capture: bool,
     ) -> Result<Self, Error> {
         Self::constructor_controls::<(
-            A, Option<&'a dyn WorkspaceLayerwiseParameters>, &WorkspaceContext,
+            A,
+            Option<&'a dyn WorkspaceLayerwiseParameters>,
+            &WorkspaceContext,
             Option<&eredu_runtime::SharedLayeredObservationPaths>,
-            Result<Self, Error>, Option<eredu_runtime::PreparedLayeredObservationPaths>,
+            Result<Self, Error>,
+            Option<eredu_runtime::PreparedLayeredObservationPaths>,
         )>(context)?;
         if retain_target_capture {
             architecture.retain_prediction_target_capture();
@@ -107,51 +118,84 @@ where
         }
     }
     #[inline(never)]
-    fn new_resident(architecture: A, context: &WorkspaceContext,
-        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>) -> Result<Self, Error> {
+    fn new_resident(
+        architecture: A,
+        context: &WorkspaceContext,
+        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>,
+    ) -> Result<Self, Error> {
         Self::constructor_controls::<(
-            Result<ResidentRuntime<A,WorkspaceBackend,ResidentState>,Error>,
-            ResidentRuntime<A,WorkspaceBackend,ResidentState>,
+            Result<ResidentRuntime<A, WorkspaceBackend, ResidentState>, Error>,
+            ResidentRuntime<A, WorkspaceBackend, ResidentState>,
             Option<&eredu_runtime::SharedLayeredObservationPaths>,
             Option<eredu_runtime::PreparedLayeredObservationPaths>,
             &WorkspaceContext,
-            Result<Self,Error>,
+            Result<Self, Error>,
         )>(context)?;
         // The shared resident constructor recursively builds each actual unit.
         // Its Result extraction, observation binding and final enum transport
         // run only after that constructor returns, in the helper below.
-        Self::finish_resident_result(ResidentRuntime::new_workspace(architecture,context),paths,context)
+        Self::finish_resident_result(
+            ResidentRuntime::new_workspace(architecture, context),
+            paths,
+            context,
+        )
     }
     #[inline(never)]
-    fn finish_resident_result(result:Result<ResidentRuntime<A,WorkspaceBackend,ResidentState>,Error>,
-        paths:Option<&eredu_runtime::SharedLayeredObservationPaths>,context:&WorkspaceContext)->Result<Self,Error> {
-        let runtime=result?;
-        let binding=paths.map(|paths|runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
-            .transpose().map_err(|cause| cause.into_quote_error(context))?;
-        Ok(Self::Resident(runtime,binding,None))
+    fn finish_resident_result(
+        result: Result<ResidentRuntime<A, WorkspaceBackend, ResidentState>, Error>,
+        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        let runtime = result?;
+        let binding = paths
+            .map(|paths| {
+                runtime.bind_observation_paths(
+                    paths,
+                    Some(eredu_runtime::layered::LayeredMetadata::new(
+                        context,
+                        |error| error,
+                    )),
+                )
+            })
+            .transpose()
+            .map_err(|cause| cause.into_quote_error(context))?;
+        Ok(Self::Resident(runtime, binding, None))
     }
     #[inline(never)]
-    fn new_layerwise(architecture: A, parameters: &'a dyn WorkspaceLayerwiseParameters,
-        context: &WorkspaceContext, paths: Option<&eredu_runtime::SharedLayeredObservationPaths>) -> Result<Self, Error> {
-
-                let graph = architecture.execution_graph()?.into_owned_with_metadata(context)?;
-                let mut counts = context.metadata_vec(graph.groups().len())?;
-                for group in 0..graph.groups().len() {
-                    counts.push(architecture.group_unit_count(group, Some(context))?);
-                }
-                let layout = ExecutionUnitLayout::new_with_metadata(&graph, &counts, context)?;
-                if parameters.layout() != &layout {
-                    return Err(context.metadata_error(format_args!(
-                        "workspace parameter population differs from the architecture unit layout"
-                    )));
-                }
-                let policy = WorkspaceLayerwisePolicy::new(parameters, layout)?;
-                let runtime = LayerwiseRuntime::new(architecture, policy);
-                let binding = paths
-                    .map(|paths| runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
-                    .transpose()
-                    .map_err(|cause| cause.into_quote_error(context))?;
-                Ok(Self::Layerwise(runtime, binding, None))
+    fn new_layerwise(
+        architecture: A,
+        parameters: &'a dyn WorkspaceLayerwiseParameters,
+        context: &WorkspaceContext,
+        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>,
+    ) -> Result<Self, Error> {
+        let graph = architecture
+            .execution_graph()?
+            .into_owned_with_metadata(context)?;
+        let mut counts = context.metadata_vec(graph.groups().len())?;
+        for group in 0..graph.groups().len() {
+            counts.push(architecture.group_unit_count(group, Some(context))?);
+        }
+        let layout = ExecutionUnitLayout::new_with_metadata(&graph, &counts, context)?;
+        if parameters.layout() != &layout {
+            return Err(context.metadata_error(format_args!(
+                "workspace parameter population differs from the architecture unit layout"
+            )));
+        }
+        let policy = WorkspaceLayerwisePolicy::new(parameters, layout)?;
+        let runtime = LayerwiseRuntime::new(architecture, policy);
+        let binding = paths
+            .map(|paths| {
+                runtime.bind_observation_paths(
+                    paths,
+                    Some(eredu_runtime::layered::LayeredMetadata::new(
+                        context,
+                        |error| error,
+                    )),
+                )
+            })
+            .transpose()
+            .map_err(|cause| cause.into_quote_error(context))?;
+        Ok(Self::Layerwise(runtime, binding, None))
     }
 
     pub(super) fn from_prepared(
@@ -178,70 +222,105 @@ where
             .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         context.charge_metadata(amount)?;
         Self::constructor_controls::<(
-            A, Option<A>, eredu_runtime::PreparedReplicatedTextExecutionGeometry,
-            Option<&'a dyn WorkspaceLayerwiseParameters>, &WorkspaceContext,
+            A,
+            Option<A>,
+            eredu_runtime::PreparedReplicatedTextExecutionGeometry,
+            Option<&'a dyn WorkspaceLayerwiseParameters>,
+            &WorkspaceContext,
             Option<&eredu_runtime::SharedLayeredObservationPaths>,
-            Result<Self, Error>, Option<eredu_runtime::PreparedLayeredObservationPaths>,
+            Result<Self, Error>,
+            Option<eredu_runtime::PreparedLayeredObservationPaths>,
         )>(context)?;
         let (mut architecture, source_architecture, geometry) = modules.into_execution_parts();
         if retain_target_capture {
             architecture.retain_prediction_target_capture();
         }
         match parameters {
-            None => Self::prepared_resident(architecture, source_architecture, geometry, context, paths),
-            Some(parameters) => Self::prepared_layerwise(architecture, source_architecture, geometry, parameters, context, paths),
+            None => {
+                Self::prepared_resident(architecture, source_architecture, geometry, context, paths)
+            }
+            Some(parameters) => Self::prepared_layerwise(
+                architecture,
+                source_architecture,
+                geometry,
+                parameters,
+                context,
+                paths,
+            ),
         }
     }
     // Both constructor selections pay the arguments/results of their one
     // selected helper before entering it. No heap object replaces these moves.
     fn constructor_controls<C>(context: &WorkspaceContext) -> Result<(), Error> {
         let bytes = std::mem::size_of::<C>()
-            .checked_add(std::mem::size_of::<(&WorkspaceContext, usize, Result<(), Error>)>())
+            .checked_add(std::mem::size_of::<(
+                &WorkspaceContext,
+                usize,
+                Result<(), Error>,
+            )>())
             .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         context.charge_metadata(bytes)?;
         Ok(())
     }
     #[inline(never)]
-    fn prepared_resident(architecture: A, source_architecture: Option<A>,
+    fn prepared_resident(
+        architecture: A,
+        source_architecture: Option<A>,
         geometry: eredu_runtime::PreparedReplicatedTextExecutionGeometry,
-        context: &WorkspaceContext, paths: Option<&eredu_runtime::SharedLayeredObservationPaths>) -> Result<Self, Error> {
-
-                let runtime = ResidentRuntime::new_workspace_with_prepared_geometry(
-                    architecture,
-                    geometry,
-                    context,
-                )?;
-                let binding = paths
-                    .map(|paths| runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
-                    .transpose()
-                    .map_err(|cause| cause.into_quote_error(context))?;
-                Ok(Self::Resident(runtime, binding, source_architecture))
+        context: &WorkspaceContext,
+        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>,
+    ) -> Result<Self, Error> {
+        let runtime =
+            ResidentRuntime::new_workspace_with_prepared_geometry(architecture, geometry, context)?;
+        let binding = paths
+            .map(|paths| {
+                runtime.bind_observation_paths(
+                    paths,
+                    Some(eredu_runtime::layered::LayeredMetadata::new(
+                        context,
+                        |error| error,
+                    )),
+                )
+            })
+            .transpose()
+            .map_err(|cause| cause.into_quote_error(context))?;
+        Ok(Self::Resident(runtime, binding, source_architecture))
     }
     #[inline(never)]
-    fn prepared_layerwise(architecture: A, source_architecture: Option<A>,
+    fn prepared_layerwise(
+        architecture: A,
+        source_architecture: Option<A>,
         geometry: eredu_runtime::PreparedReplicatedTextExecutionGeometry,
-        parameters: &'a dyn WorkspaceLayerwiseParameters, context: &WorkspaceContext,
-        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>) -> Result<Self, Error> {
-
-                // The source owns its immutable layout; compare the moved
-                // contract before retaining that existing borrow in the policy.
-                if parameters.layout() != geometry.units() {
-                    return Err(context.metadata_error(format_args!(
-                        "workspace parameter population differs from the architecture unit layout"
-                    )));
-                }
-                let policy = WorkspaceLayerwisePolicy {
-                    parameters,
-                    layout: Cow::Borrowed(parameters.layout()),
-                    projection: None,
-                };
-                let runtime =
-                    LayerwiseRuntime::new_with_prepared_geometry(architecture, policy, geometry);
-                let binding = paths
-                    .map(|paths| runtime.bind_observation_paths(paths, Some(eredu_runtime::layered::LayeredMetadata::new(context, |error| error))))
-                    .transpose()
-                    .map_err(|cause| cause.into_quote_error(context))?;
-                Ok(Self::Layerwise(runtime, binding, source_architecture))
+        parameters: &'a dyn WorkspaceLayerwiseParameters,
+        context: &WorkspaceContext,
+        paths: Option<&eredu_runtime::SharedLayeredObservationPaths>,
+    ) -> Result<Self, Error> {
+        // The source owns its immutable layout; compare the moved
+        // contract before retaining that existing borrow in the policy.
+        if parameters.layout() != geometry.units() {
+            return Err(context.metadata_error(format_args!(
+                "workspace parameter population differs from the architecture unit layout"
+            )));
+        }
+        let policy = WorkspaceLayerwisePolicy {
+            parameters,
+            layout: Cow::Borrowed(parameters.layout()),
+            projection: None,
+        };
+        let runtime = LayerwiseRuntime::new_with_prepared_geometry(architecture, policy, geometry);
+        let binding = paths
+            .map(|paths| {
+                runtime.bind_observation_paths(
+                    paths,
+                    Some(eredu_runtime::layered::LayeredMetadata::new(
+                        context,
+                        |error| error,
+                    )),
+                )
+            })
+            .transpose()
+            .map_err(|cause| cause.into_quote_error(context))?;
+        Ok(Self::Layerwise(runtime, binding, source_architecture))
     }
 
     /// Same typed target operation used by the replicated prediction driver.
@@ -252,12 +331,17 @@ where
         operation: O,
         context: &WorkspaceContext,
     ) -> Result<O::Output, Error>
-    where O: eredu_runtime::PredictionTargetOperation<A, WorkspaceBackend, ResidentState>,
+    where
+        O: eredu_runtime::PredictionTargetOperation<A, WorkspaceBackend, ResidentState>,
     {
         context.charge_metadata(std::mem::size_of::<(O, Result<O::Output, Error>, bool)>())?;
         match self {
-            Self::Resident(runtime, _, _) => runtime.apply_prediction_target_operation(operation, state, None, context),
-            Self::Layerwise(runtime, _, _) => runtime.apply_prediction_target_operation(operation, state, None, context),
+            Self::Resident(runtime, _, _) => {
+                runtime.apply_prediction_target_operation(operation, state, None, context)
+            }
+            Self::Layerwise(runtime, _, _) => {
+                runtime.apply_prediction_target_operation(operation, state, None, context)
+            }
         }
     }
 
@@ -285,19 +369,20 @@ where
     ) -> Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>
     where
         A: eredu_runtime::media_prefill::PrefillIngressArchitecture<
-                WorkspaceBackend,
-                ResidentState,
-            >,
+            WorkspaceBackend,
+            ResidentState,
+        >,
         H: eredu_runtime::LayeredTraversalHook<WorkspaceBackend, A::ForwardContext, Error> + ?Sized,
     {
         match (self, observer) {
-            (Self::Resident(runtime, Some(paths), _), Some(observer)) =>
-                source.forward_resident_observed(runtime, span, state, context, hook, observer, paths),
+            (Self::Resident(runtime, Some(paths), _), Some(observer)) => source
+                .forward_resident_observed(runtime, span, state, context, hook, observer, paths),
             (Self::Layerwise(runtime, Some(paths), _), Some(observer)) => source
                 .forward_layerwise_observed(runtime, span, state, context, hook, observer, paths)
                 .map_err(|cause| cause.into_quote_error(context)),
             (_, Some(_)) => Err(context.metadata_error(format_args!(
-                "media observation requires the runtime's prepared path source"))),
+                "media observation requires the runtime's prepared path source"
+            ))),
             (Self::Resident(runtime, _, _), None) => {
                 source.forward_resident(runtime, span, state, context, hook)
             }
@@ -307,43 +392,52 @@ where
         }
     }
 
-    pub(super) fn forward_media_routed<P,H>(
+    pub(super) fn forward_media_routed<P, H>(
         &mut self,
         source: &mut eredu_runtime::media_prefill::workspace::MediaEquationSource<A, ResidentState>,
         span: &eredu_runtime::prefill::PrefillChunk,
         state: &mut ResidentState,
         context: &WorkspaceContext,
         hook: &mut H,
-        provider:&mut P,
+        provider: &mut P,
         observer: Option<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
     ) -> Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>
     where
         A: eredu_runtime::media_prefill::PrefillIngressArchitecture<
-                WorkspaceBackend,
-                ResidentState,
-            >,
-        A:eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend,ResidentState>,
-        P:eredu_runtime::RoutedExpertProvider<WorkspaceBackend>,P::Error:std::fmt::Display,
+            WorkspaceBackend,
+            ResidentState,
+        >,
+        A: eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState>,
+        P: eredu_runtime::RoutedExpertProvider<WorkspaceBackend>,
+        P::Error: std::fmt::Display,
         H: eredu_runtime::LayeredTraversalHook<WorkspaceBackend, A::ForwardContext, Error> + ?Sized,
     {
         match (self, observer) {
-            (Self::Resident(runtime, Some(paths), _), Some(observer)) =>
-                source.forward_resident_routed_observed(runtime, span, state, context, hook, provider, observer, paths),
+            (Self::Resident(runtime, Some(paths), _), Some(observer)) => source
+                .forward_resident_routed_observed(
+                    runtime, span, state, context, hook, provider, observer, paths,
+                ),
             (Self::Layerwise(runtime, Some(paths), _), Some(observer)) => source
-                .forward_layerwise_routed_observed(runtime, span, state, context, hook, provider, observer, paths)
+                .forward_layerwise_routed_observed(
+                    runtime, span, state, context, hook, provider, observer, paths,
+                )
                 .map_err(|cause| cause.into_quote_error(context)),
             (_, Some(_)) => Err(context.metadata_error(format_args!(
-                "media observation requires the runtime's prepared path source"))),
+                "media observation requires the runtime's prepared path source"
+            ))),
             (Self::Resident(runtime, _, _), None) => {
-                source.forward_resident_routed(runtime, span, state, context, hook,provider)
+                source.forward_resident_routed(runtime, span, state, context, hook, provider)
             }
             (Self::Layerwise(runtime, _, _), None) => source
-                .forward_layerwise_routed(runtime, span, state, context, hook,provider)
+                .forward_layerwise_routed(runtime, span, state, context, hook, provider)
                 .map_err(|cause| cause.into_quote_error(context)),
         }
     }
 
-    pub(super) fn observation_host_peak_bytes(&self, context: &WorkspaceContext) -> Result<u64, Error> {
+    pub(super) fn observation_host_peak_bytes(
+        &self,
+        context: &WorkspaceContext,
+    ) -> Result<u64, Error> {
         let binding = match self {
             Self::Resident(_, binding, _) | Self::Layerwise(_, binding, _) => binding,
         };
@@ -382,8 +476,13 @@ where
         capture: bool,
     ) -> Result<(Option<WorkspaceTensor>, Option<WorkspaceTensor>), Error> {
         let output = self.forward_with_context(
-            input, state, context, demand,
-            observer.map(|observer| observer as &mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor, Error>),
+            input,
+            state,
+            context,
+            demand,
+            observer.map(|observer| {
+                observer as &mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor, Error>
+            }),
         )?;
         let (scores, forward) = output;
         let hidden = if capture {
@@ -406,63 +505,128 @@ where
         Ok((scores, hidden))
     }
 
-    pub(super) fn forward_routed_with_capture<'input,P>(
-        &mut self, input: A::Input<'input>, state: &mut ResidentState,
-        context: &WorkspaceContext, demand: eredu_core::OutputDemand,
+    pub(super) fn forward_routed_with_capture<'input, P>(
+        &mut self,
+        input: A::Input<'input>,
+        state: &mut ResidentState,
+        context: &WorkspaceContext,
+        demand: eredu_core::OutputDemand,
         observer: Option<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
-        capture: bool, pass: eredu_runtime::ExpertPass, provider:&mut P,
+        capture: bool,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
     ) -> Result<(Option<WorkspaceTensor>, Option<WorkspaceTensor>), Error>
-    where A: eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState>,
-        P:eredu_runtime::RoutedExpertProvider<WorkspaceBackend>,P::Error:std::fmt::Display,
+    where
+        A: eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState>,
+        P: eredu_runtime::RoutedExpertProvider<WorkspaceBackend>,
+        P::Error: std::fmt::Display,
     {
         context.charge_metadata(std::mem::size_of::<(
-            A::ForwardContext, &mut P, eredu_runtime::ExpertPass,
+            A::ForwardContext,
+            &mut P,
+            eredu_runtime::ExpertPass,
             Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>,
-            (Option<WorkspaceTensor>, Option<WorkspaceTensor>), [WorkspaceTensor; 2], bool,
+            (Option<WorkspaceTensor>, Option<WorkspaceTensor>),
+            [WorkspaceTensor; 2],
+            bool,
         )>())?;
-        let (scores,forward)=self.forward_routed_with_context(input,state,context,demand,
-            observer.map(|observer| observer as &mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor,Error>),
-            pass,provider)?;
+        let (scores, forward) = self.forward_routed_with_context(
+            input,
+            state,
+            context,
+            demand,
+            observer.map(|observer| {
+                observer as &mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor, Error>
+            }),
+            pass,
+            provider,
+        )?;
         let hidden = if capture {
-            Some(A::prediction_target_capture(&forward).ok_or_else(|| workspace_message(context,
-                format_args!("routed target equation did not retain prediction capture")))?.clone())
-        } else { None };
+            Some(
+                A::prediction_target_capture(&forward)
+                    .ok_or_else(|| {
+                        workspace_message(
+                            context,
+                            format_args!(
+                                "routed target equation did not retain prediction capture"
+                            ),
+                        )
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
         Ok((scores, hidden))
     }
 
-    pub(super) fn forward_routed_with_context<'input,P>(
-        &mut self, input:A::Input<'input>, state:&mut ResidentState,
-        context:&WorkspaceContext, demand:eredu_core::OutputDemand,
-        observer:Option<&mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor,Error>>,
-        pass:eredu_runtime::ExpertPass, provider:&mut P,
-    )->Result<(Option<WorkspaceTensor>,A::ForwardContext),Error>
-    where A:eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend,ResidentState>,
-        P:eredu_runtime::RoutedExpertProvider<WorkspaceBackend>,P::Error:std::fmt::Display,
+    pub(super) fn forward_routed_with_context<'input, P>(
+        &mut self,
+        input: A::Input<'input>,
+        state: &mut ResidentState,
+        context: &WorkspaceContext,
+        demand: eredu_core::OutputDemand,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor, Error>>,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+    ) -> Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>
+    where
+        A: eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState>,
+        P: eredu_runtime::RoutedExpertProvider<WorkspaceBackend>,
+        P::Error: std::fmt::Display,
     {
         context.charge_metadata(std::mem::size_of::<(
-            A::ForwardContext, &mut P, eredu_runtime::ExpertPass,
+            A::ForwardContext,
+            &mut P,
+            eredu_runtime::ExpertPass,
             Result<(Option<WorkspaceTensor>, A::ForwardContext), Error>,
-            Option<&mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor,Error>>,
+            Option<&mut dyn eredu_runtime::ActivationObserver<WorkspaceTensor, Error>>,
         )>())?;
         context.charge_metadata(
             eredu_runtime::ResidentExpertProvider::observation_control_bytes::<WorkspaceTensor>()
                 .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
         )?;
-        let output = match (self,observer) {
-            (Self::Resident(runtime, Some(paths), _),Some(observer)) => runtime
+        let output = match (self, observer) {
+            (Self::Resident(runtime, Some(paths), _), Some(observer)) => runtime
                 .forward_serial_routed_with_prepared_paths(
-                    input, state, pass, provider, context, observer, paths, demand)
-                .map_err(|cause|cause.into_quote_error(context))?,
-            (Self::Layerwise(runtime, Some(paths), _),Some(observer)) => runtime
-                .forward_serial_routed_with_prepared_paths(
-                    input, state, pass, provider, context, observer, paths, demand)
+                    input, state, pass, provider, context, observer, paths, demand,
+                )
                 .map_err(|cause| cause.into_quote_error(context))?,
-            (Self::Resident(runtime,_,_),None)=>runtime.forward_serial_routed_with_traversal_hook_with_readout(
-                input,state,pass,provider,context,&mut EquationTraversal,demand).map_err(|cause|cause.into_quote_error(context))?,
-            (Self::Layerwise(runtime,_,_),None)=>runtime.forward_serial_routed_with_traversal_hook_with_readout(
-                input,state,pass,provider,context,&mut EquationTraversal,demand).map_err(|cause|cause.into_quote_error(context))?,
-            _ => return Err(workspace_message(context,
-                format_args!("observed routed equation runtime lacks its prepared path binding"))),
+            (Self::Layerwise(runtime, Some(paths), _), Some(observer)) => runtime
+                .forward_serial_routed_with_prepared_paths(
+                    input, state, pass, provider, context, observer, paths, demand,
+                )
+                .map_err(|cause| cause.into_quote_error(context))?,
+            (Self::Resident(runtime, _, _), None) => runtime
+                .forward_serial_routed_with_traversal_hook_with_readout(
+                    input,
+                    state,
+                    pass,
+                    provider,
+                    context,
+                    &mut EquationTraversal,
+                    demand,
+                )
+                .map_err(|cause| cause.into_quote_error(context))?,
+            (Self::Layerwise(runtime, _, _), None) => runtime
+                .forward_serial_routed_with_traversal_hook_with_readout(
+                    input,
+                    state,
+                    pass,
+                    provider,
+                    context,
+                    &mut EquationTraversal,
+                    demand,
+                )
+                .map_err(|cause| cause.into_quote_error(context))?,
+            _ => {
+                return Err(workspace_message(
+                    context,
+                    format_args!(
+                        "observed routed equation runtime lacks its prepared path binding"
+                    ),
+                ))
+            }
         };
         Ok(output)
     }
@@ -521,7 +685,6 @@ where
         }?;
         Ok(output)
     }
-
 }
 
 pub(crate) struct WorkspaceLayerwisePolicy<'a> {
@@ -547,34 +710,70 @@ impl<'a> WorkspaceLayerwisePolicy<'a> {
         })
     }
 
-    pub(crate) fn for_layout(parameters:&'a dyn WorkspaceLayerwiseParameters,
-        layout:&ExecutionUnitLayout,context:&WorkspaceContext)->Result<Self,Error> {
-        context.charge_metadata(std::mem::size_of::<(Self,Result<Self,Error>,
-            &dyn WorkspaceLayerwiseParameters,&ExecutionUnitLayout,&WorkspaceContext)>())?;
-        if parameters.layout()!=layout {
-            return Err(context.metadata_error(format_args!("workspace parameter source differs from the constructor unit layout")));
+    pub(crate) fn for_layout(
+        parameters: &'a dyn WorkspaceLayerwiseParameters,
+        layout: &ExecutionUnitLayout,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        context.charge_metadata(std::mem::size_of::<(
+            Self,
+            Result<Self, Error>,
+            &dyn WorkspaceLayerwiseParameters,
+            &ExecutionUnitLayout,
+            &WorkspaceContext,
+        )>())?;
+        if parameters.layout() != layout {
+            return Err(context.metadata_error(format_args!(
+                "workspace parameter source differs from the constructor unit layout"
+            )));
         }
-        Ok(Self {parameters,layout:Cow::Borrowed(parameters.layout()),projection:None})
+        Ok(Self {
+            parameters,
+            layout: Cow::Borrowed(parameters.layout()),
+            projection: None,
+        })
     }
 
-    pub(super) fn for_partition<A>(parameters:&'a dyn WorkspaceLayerwiseParameters,
-        architecture:&A, addresses:&[ExecutionUnitAddress], context:&WorkspaceContext)->Result<Self,Error>
-    where A:LayeredArchitecture<WorkspaceBackend,ResidentState,Error=Error> {
-        context.charge_metadata(std::mem::size_of::<(Self,Result<Self,Error>,
-            &A,&[ExecutionUnitAddress],eredu_runtime::ExecutionGraph,Vec<usize>,ExecutionUnitLayout,
-            Result<ExecutionUnitLayout,Error>,usize)>())?;
-        let graph=architecture.execution_graph()?.into_owned_with_metadata(context)?;
-        let mut counts=context.metadata_vec(graph.groups().len())?;
-        counts.resize(graph.groups().len(),0usize);
-        for (ordinal,&address) in addresses.iter().enumerate() {
-            let count=counts.get_mut(address.group()).ok_or_else(||context.metadata_error(format_args!("partition source group is absent")))?;
-            *count=count.checked_add(1).ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
-            if parameters.execution_address(ordinal)!=Some(address) {
-                return Err(context.metadata_error(format_args!("partition parameter source differs from its retained global address")));
+    pub(super) fn for_partition<A>(
+        parameters: &'a dyn WorkspaceLayerwiseParameters,
+        architecture: &A,
+        addresses: &[ExecutionUnitAddress],
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error>
+    where
+        A: LayeredArchitecture<WorkspaceBackend, ResidentState, Error = Error>,
+    {
+        context.charge_metadata(std::mem::size_of::<(
+            Self,
+            Result<Self, Error>,
+            &A,
+            &[ExecutionUnitAddress],
+            eredu_runtime::ExecutionGraph,
+            Vec<usize>,
+            ExecutionUnitLayout,
+            Result<ExecutionUnitLayout, Error>,
+            usize,
+        )>())?;
+        let graph = architecture
+            .execution_graph()?
+            .into_owned_with_metadata(context)?;
+        let mut counts = context.metadata_vec(graph.groups().len())?;
+        counts.resize(graph.groups().len(), 0usize);
+        for (ordinal, &address) in addresses.iter().enumerate() {
+            let count = counts.get_mut(address.group()).ok_or_else(|| {
+                context.metadata_error(format_args!("partition source group is absent"))
+            })?;
+            *count = count
+                .checked_add(1)
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+            if parameters.execution_address(ordinal) != Some(address) {
+                return Err(context.metadata_error(format_args!(
+                    "partition parameter source differs from its retained global address"
+                )));
             }
         }
-        let layout=ExecutionUnitLayout::new_with_metadata(&graph,&counts,context)?;
-        Self::for_layout(parameters,&layout,context)
+        let layout = ExecutionUnitLayout::new_with_metadata(&graph, &counts, context)?;
+        Self::for_layout(parameters, &layout, context)
     }
 
     fn validate_address(
@@ -623,7 +822,8 @@ impl<U: Parameterized<WorkspaceTensor>> LayerwisePolicy<WorkspaceBackend, U>
     {
         self.validate_address(ordinal, address, context)
             .map_err(LayerwiseAcquireError::Policy)?;
-        self.parameters.observe_acquire(ordinal,address,context)
+        self.parameters
+            .observe_acquire(ordinal, address, context)
             .map_err(LayerwiseAcquireError::Policy)?;
         // The actual unit lease owns a Box, independently of its tensor and
         // parameter metadata. Reserve its allocation and return transports
@@ -649,30 +849,43 @@ impl<U: Parameterized<WorkspaceTensor>> LayerwisePolicy<WorkspaceBackend, U>
         // This same projection retains explicit trace-lifetime aliases across
         // acquires; an invocation root is recreated by its shared bind worker.
         if context.uses_checked_metadata() && self.projection.is_none() {
-            context.charge_metadata(std::mem::size_of::<(
-                eredu_runtime::working_memory::WorkspaceParameterSourceLoan<'_>,
-                Result<eredu_runtime::working_memory::WorkspaceParameterSourceLoan<'_>,
-                    eredu_runtime::working_memory::WorkspaceParameterSourceError>,
-            )>()).map_err(Error::from).map_err(LayerwiseAcquireError::Policy)?;
+            context
+                .charge_metadata(std::mem::size_of::<(
+                    eredu_runtime::working_memory::WorkspaceParameterSourceLoan<'_>,
+                    Result<
+                        eredu_runtime::working_memory::WorkspaceParameterSourceLoan<'_>,
+                        eredu_runtime::working_memory::WorkspaceParameterSourceError,
+                    >,
+                )>())
+                .map_err(Error::from)
+                .map_err(LayerwiseAcquireError::Policy)?;
             let parameters = self.parameters;
-            let source = parameters.parameter_source()
+            let source = parameters
+                .parameter_source()
                 .map_err(|cause| LayerwiseAcquireError::Policy(context.metadata_source(cause)))?;
-            self.projection = Some(source.prepare_projection(context)
-                .map_err(LayerwiseAcquireError::Policy)?);
+            self.projection = Some(
+                source
+                    .prepare_projection(context)
+                    .map_err(LayerwiseAcquireError::Policy)?,
+            );
         }
         // Keep the existing whole-forward ledger. In particular, constructing
         // the next native unit can overlap the previous pending unit; dropping
         // metadata or its immediate completion must not refund those buffers.
         let mut unit = build(context).map_err(LayerwiseAcquireError::Architecture)?;
         if let Some(projection) = &mut self.projection {
-            projection.bind(&mut unit, ordinal, address, context)
+            projection
+                .bind(&mut unit, ordinal, address, context)
                 .map_err(LayerwiseAcquireError::Policy)?;
         } else {
-            let values = self.parameters.parameters(ordinal, address, context)
+            let values = self
+                .parameters
+                .parameters(ordinal, address, context)
                 .map_err(LayerwiseAcquireError::Policy)?;
-            eredu_runtime::working_memory::bind_workspace_parameters(&mut unit, values,
-                |id| self.parameters.excludes_parameter(id.as_str()))
-                .map_err(LayerwiseAcquireError::Policy)?;
+            eredu_runtime::working_memory::bind_workspace_parameters(&mut unit, values, |id| {
+                self.parameters.excludes_parameter(id.as_str())
+            })
+            .map_err(LayerwiseAcquireError::Policy)?;
         }
         Ok(Box::new(unit))
     }
@@ -692,11 +905,22 @@ impl<U: Parameterized<WorkspaceTensor>> LayerwisePolicy<WorkspaceBackend, U>
         ContextValues: Iterator<Item = &'value WorkspaceTensor>,
     {
         self.validate_address(ordinal, address, context)?;
-        context.validate_values(
-            std::iter::once(output)
-                .chain(state_values)
-                .chain(context_values),
-        )?;
+        context.charge_metadata(std::mem::size_of::<(
+            Vec<&WorkspaceTensor>,
+            Result<(), Error>,
+        )>())?;
+        let mut roots = context.metadata_vec(1)?;
+        for value in std::iter::once(output)
+            .chain(state_values)
+            .chain(context_values)
+        {
+            context.reserve_metadata_vec(&mut roots, 1)?;
+            roots.push(value);
+        }
+        // The native policy submits this exact handle population. Repeated
+        // aliases still occupy distinct event-root slots; backing deduplication
+        // belongs to the separate physical storage reducer.
+        context.complete_values(&roots)?;
         drop(lease);
         Ok(())
     }

@@ -23,29 +23,53 @@ pub use layout::{WorkspaceLayoutError, WorkspaceLayoutView};
 pub use representation::{
     WorkspaceFloatingType, WorkspaceParameterRepresentation, WorkspaceRepresentation,
 };
+mod placement;
 mod report;
+pub use placement::{
+    WorkspaceAllocationPopulation, WorkspacePlacementError, WorkspaceScratchAllocation,
+};
 mod sampling;
 mod shape;
 pub use report::{
-    WorkspaceReportConstructionError, WorkspaceReportError, WorkspaceReportGraph,
-    WorkspaceReportInputs, WorkspaceReportLayout, WorkspaceReportNode, WorkspaceReportResidual,
-    WorkspaceReportScalars, WorkspaceReportWorkspace, WorkspaceStoragePopulation,
+    WorkspaceDomainReport, WorkspaceDomainReportEntry, WorkspaceDomainReportInputs,
+    WorkspaceDomainResidualReport, WorkspaceDomainStateReport, WorkspaceDomainStoragePopulation,
+    WorkspaceDomainTensorBufferReport, WorkspaceReportConstructionError, WorkspaceReportError,
+    WorkspaceReportGraph, WorkspaceReportInputs, WorkspaceReportLayout, WorkspaceReportNode,
+    WorkspaceReportPlacements, WorkspaceReportResidual, WorkspaceReportScalars,
+    WorkspaceReportWorkspace, WorkspaceStoragePopulation,
 };
-pub use shape::{validate_masked_scatter_shapes, WorkspaceBroadcastShape, WorkspaceMatmulShape, WorkspaceShapeError, WorkspaceScatterShapeError};
+pub use shape::{
+    WorkspaceBroadcastShape, WorkspaceMatmulShape, WorkspaceScatterShapeError, WorkspaceShapeError,
+    validate_masked_scatter_shapes,
+};
 mod effects;
 pub use effects::{
     WorkspaceEffectError, WorkspaceOutputStorageView, validate_workspace_host_assumptions,
     validate_workspace_output_storage, validate_workspace_tensor_declaration,
 };
 mod addressable_region;
-pub use addressable_region::{record_addressable_region,record_addressable_region_with_observation,
-    WorkspaceAddressableObservationView,WorkspaceAddressableObservationSource,WorkspaceAddressableObservationLayout, WorkspaceAddressableChunkPlan,
-    WorkspaceAddressableRegion, WorkspaceAddressableRegionView};
+pub use addressable_region::{
+    WorkspaceAddressableChunkPlan, WorkspaceAddressableObservationLayout,
+    WorkspaceAddressableObservationSource, WorkspaceAddressableObservationView,
+    WorkspaceAddressableRegion, WorkspaceAddressableRegionView, record_addressable_region,
+    record_addressable_region_with_observation,
+};
 mod grouped_observation_envelope;
-pub use grouped_observation_envelope::{WorkspaceGroupedObservationEnvelope, WorkspaceGroupedObservationExtent};
+pub use grouped_observation_envelope::{
+    WorkspaceGroupedObservationEnvelope, WorkspaceGroupedObservationExtent,
+};
 mod expert_region;
-pub use expert_region::observation::{WorkspaceExpertObservationSource,WorkspaceExpertObservationView,WorkspaceGroupedSourceRetention};
-pub use expert_region::{record_expert_inactive_wave, WorkspaceExpertInactiveWave, record_expert_provider_wave, WorkspaceExpertProviderWave, record_expert_region, record_expert_region_with_observation, WorkspaceExpertKernel, WorkspaceExpertRegion, WorkspaceExpertRegionView, WorkspaceExpertMovementPopulation, WorkspaceExpertTransfer, WorkspaceExpertTransfers, ExpertRegionInputShape};
+pub use expert_region::observation::{
+    WorkspaceExpertObservationSource, WorkspaceExpertObservationView,
+    WorkspaceGroupedSourceRetention,
+};
+pub use expert_region::{
+    ExpertRegionInputShape, WorkspaceExpertInactiveWave, WorkspaceExpertKernel,
+    WorkspaceExpertMovementPopulation, WorkspaceExpertProviderWave, WorkspaceExpertRegion,
+    WorkspaceExpertRegionView, WorkspaceExpertTransfer, WorkspaceExpertTransfers,
+    record_expert_inactive_wave, record_expert_provider_wave, record_expert_region,
+    record_expert_region_with_observation,
+};
 mod operation;
 pub use operation::{
     WorkspaceCollectiveView, WorkspaceLayoutIter, WorkspaceLayoutList, WorkspaceOperationKindView,
@@ -56,7 +80,6 @@ mod facts;
 mod metadata;
 mod metadata_funding;
 pub(crate) mod policy_clone;
-pub use policy_clone::ParameterMetadataAllocation;
 pub use fact_context::WorkspaceMetadataError;
 pub use facts::{
     WorkspaceEffectDestination, WorkspaceEffectLayout, WorkspaceFactDestinationError,
@@ -64,15 +87,15 @@ pub use facts::{
     WorkspaceHostFacts, WorkspaceOperationFacts, WorkspaceOutputEffect,
 };
 pub use metadata::{
-    WorkspaceContextMetadataBuilder, WorkspaceContextMetadataError, WorkspaceMetadataEnvelope, WorkspaceMetadataAllocation,
-    visit_isolated_copy_operations,
+    WorkspaceContextMetadataBuilder, WorkspaceContextMetadataError, WorkspaceMetadataAllocation,
+    WorkspaceMetadataEnvelope, visit_isolated_copy_operations,
 };
-pub use metadata_funding::{
-    HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
-};
+pub use metadata_funding::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
+pub use policy_clone::ParameterMetadataAllocation;
 mod borrowed_storage;
 mod construction;
 mod host_value;
+mod model_control;
 mod tensor;
 mod value_completion;
 pub use backend::{
@@ -94,6 +117,7 @@ pub use isolated_copy::{
     WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPlan,
     WorkspaceIsolatedCopyPreparation,
 };
+pub use model_control::{WorkspaceModelControl, WorkspaceModelControlPhase};
 pub use sampling::WorkspaceSamplingOperation;
 pub use tensor::{WorkspaceExistingStorage, WorkspaceTensor};
 
@@ -188,6 +212,9 @@ pub enum WorkspaceOperationKind {
     /// Actual floating conversion, possibly aliasing when the source type matches.
     /// This is not a view; native facts must include the conversion allocation.
     CastFloating(WorkspaceFloatingType),
+    /// Standalone effective checkpoint decoding, distinct from fused packed
+    /// matrix multiplication. Native facts must qualify this exact decoder.
+    ParameterDecode(crate::parameter_values::ParameterDecoding),
     /// Copy one retained immutable host value into independent device storage,
     /// preserving its exact floating type. The native source and completion
     /// account must be authenticated separately; this descriptor grants none.
@@ -207,7 +234,10 @@ pub enum WorkspaceOperationKind {
     /// Raw terminal-row candidate extraction, distinct from sampling masks.
     /// One floating [1, rows, vocabulary] input; U32 IDs[count] and F32 scores[count]
     /// outputs. Full-row finite validation and the selected sort workspace are retained.
-    CandidateExtraction { vocabulary: u32, count: u32 },
+    CandidateExtraction {
+        vocabulary: u32,
+        count: u32,
+    },
     /// Named elementwise equation. Native facts must explicitly recognize names.
     Elementwise(&'static str),
     /// Metadata transformation; native facts decide whether storage can alias.
@@ -443,6 +473,20 @@ pub enum WorkspaceOperationKind {
     /// phase. No new tensor storage or output value is constructed. This is a
     /// trace descriptor, not native submission or source authority.
     ValueCompletion,
+    /// Completes local roots through the selected communication backend's
+    /// ordinary operation submission. This describes the shared driver worker;
+    /// it grants no native source, account, or submission authority.
+    CommunicationDependencies,
+    /// One actual model-internal control call reached by the shared partition driver.
+    /// This source descriptor grants no native authority or tensor storage.
+    CommunicationControl(WorkspaceModelControl),
+    /// Completes the two actual paged backing roots before canonical block
+    /// publication. Native manager/source validation remains independently
+    /// required; this descriptor grants no publication authority.
+    CachePublicationCompletion,
+    /// Completes the paged scan result before releasing its source leases.
+    /// Source pins, manager metadata and native completion remain backend-owned.
+    CacheScanCompletion,
     /// Keeps actual existing values in the enclosing completion root union.
     ValueRetention,
     /// Boolean mask with prompt and cached-key geometry.
@@ -581,25 +625,147 @@ pub struct WorkspaceHostBound {
     pub assumptions: String,
 }
 
+/// The selected mechanism's completion boundary. Both choices traverse shared
+/// drivers and require independent native source and completion facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceCompletionStrategy {
+    /// Each operation owns its submission and completion resources.
+    OperationSubmissions,
+    /// Model operations borrow the enclosing admitted submission and settle
+    /// their dependencies through its nested completion mechanism.
+    EnclosingSubmission,
+}
+
+/// Actual operation-local backing populations produced by an allocating cold
+/// mechanism. The shared trace consumes these rows through the same lifetime
+/// reducer as lexical fact sources. This is metadata, never execution authority.
+#[derive(Debug)]
+pub struct WorkspaceOperationAllocationSources {
+    /// Simultaneous scratch rows, or pre-resolved complete source alternatives.
+    /// Its backing-byte envelope must equal the operation's scratch fact.
+    pub scratch: Option<WorkspaceAllocationPopulation>,
+    /// Independent output sources in result order; absent rows use the ordinary
+    /// effect and placement. Aliases must not carry an independent source.
+    pub outputs: Vec<Option<WorkspaceAllocationPopulation>>,
+}
+
 /// Side-effect-free native allocation facts. Unknown primitives return `None`;
 /// errors describe invalid geometry or arithmetic rather than filling a gap.
 /// Bounds must cover every numerical value and stride layout consistent with
 /// the descriptor, including widening, contiguous copies and host staging.
 /// Tensor buffers and disjoint managed host workspace are separate mandatory
-/// domains. Pricing one domain never supplies a missing fact for the other.
+/// contributions, even when they share physical memory. Pricing one never
+/// supplies a missing fact for the other.
 /// Metadata does not assume values, contiguity or in-place donation. A mechanism
 /// may only declare an alias when it is valid for all those possibilities.
 pub trait WorkspaceMechanisms: fmt::Debug {
+    /// Prepare operation-local source populations for an ordinary cold context.
+    /// Implementations fund every owning constructor through `context` and use
+    /// the same selected source worker as their lexical fact implementation.
+    /// Returning `None` preserves the preowned source loans below. Finite fact
+    /// contexts use `WorkspaceFactMechanisms::with_prepared_facts` instead.
+    fn prepare_allocation_sources(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _context: &WorkspaceContext,
+    ) -> Result<Option<WorkspaceOperationAllocationSources>, Error> {
+        Ok(None)
+    }
+
+    /// Descriptive scheduling input for shared cache and communication traversal.
+    /// The default follows their ordinary per-operation submission paths.
+    /// Selecting an enclosing submission never creates execution authority.
+    fn completion_strategy(&self) -> WorkspaceCompletionStrategy {
+        WorkspaceCompletionStrategy::OperationSubmissions
+    }
+    /// Immutable physical topology established by this selected mechanism.
+    /// Missing facts cannot grant physical-domain allocation permission.
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        None
+    }
+
+    /// Placement of the independent backing, when this output allocates.
+    /// Aliases preserve the original backing's placement instead.
+    fn output_placement(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _output: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        None
+    }
+
+    /// Placement of this operation's native scratch allocations.
+    fn scratch_placement(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        None
+    }
+    /// Source-owned scratch allocations retained through this operation's completion.
+    /// When present, these exact descriptors replace the homogeneous scratch
+    /// placement. Their checked byte sum must equal the operation's scratch fact.
+    /// Distinct occurrences are independent populations; this loan supplies no
+    /// physical owner, storage credit, or execution authority.
+    fn scratch_allocations(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<&WorkspaceAllocationPopulation>, Error> {
+        Ok(None)
+    }
+    /// Actual simultaneous backing rows retained by one new output. The raw
+    /// source rows replace a homogeneous output placement and keep separate
+    /// storage identities under the existing alias/lifetime graph. Resolved
+    /// alternative requirement groups cannot substitute for backing identities.
+    fn output_allocations(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _output: usize,
+    ) -> Result<Option<&WorkspaceAllocationPopulation>, Error> {
+        Ok(None)
+    }
+    /// Maximum independent backings in this operation's temporary allocation
+    /// source. This is independent of host-control bytes and cannot be inferred
+    /// from a different allocator or a scalar memory allowance.
+    fn scratch_allocation_count(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<usize>, Error> {
+        Ok(None)
+    }
+    /// Host controls owned by one newly allocated backing for its full lifetime.
+    /// Aliases reuse their backing's controls. `None` makes attribution incomplete.
+    fn allocation_host_control_bytes(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _output: usize,
+    ) -> Option<u64> {
+        Some(0)
+    }
+    /// Host controls retained by all temporary native scratch allocations.
+    fn scratch_host_control_bytes(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<u64>, Error> {
+        Ok(Some(0))
+    }
+
     /// Prospective Units layout from the retained addressable member sources.
     /// Absence carries no floating witness and grants no numerical work.
-    fn addressable_observation_layout(&self,_source:WorkspaceAddressableRegionView<'_>,
-        _inputs:&[WorkspaceLayout],_context:&WorkspaceContext)
-        ->Result<Option<WorkspaceAddressableObservationLayout>,Error>{Ok(None)}
+    fn addressable_observation_layout(
+        &self,
+        _source: WorkspaceAddressableRegionView<'_>,
+        _inputs: &[WorkspaceLayout],
+        _context: &WorkspaceContext,
+    ) -> Result<Option<WorkspaceAddressableObservationLayout>, Error> {
+        Ok(None)
+    }
 
     /// Integer element type of this selected worker's ordinary prepared text
     /// token source. This descriptive fact creates no tensor, readback or
     /// allocation permission. Explicitly borrowed inputs retain their own dtype.
-    fn prepared_text_input_dtype(&self) -> Option<WorkspaceDtype> { None }
+    fn prepared_text_input_dtype(&self) -> Option<WorkspaceDtype> {
+        None
+    }
 
     /// Exact physical representation of a successful output of this selected
     /// worker. Absence preserves the full dtype/stride union. Implementations
@@ -680,7 +846,10 @@ pub struct WorkspaceGroupedObservationScheduleUnavailable;
 #[derive(Debug)]
 struct Storage {
     bytes: Option<u64>,
+    host_control_bytes: Option<u64>,
+    placement: Option<eredu_core::MemoryPlacement>,
     maximum_allocations: usize,
+    population: Option<WorkspaceAllocationPopulation>,
     possible_aliases: Vec<Rc<Storage>>,
 }
 #[derive(Debug, Default)]
@@ -689,7 +858,11 @@ struct Trace {
     opening_state: Option<Vec<Rc<Storage>>>,
     allocations: Vec<Rc<Storage>>,
     scratch: u64,
+    scratch_overflow: bool,
+    placed_scratch: Vec<WorkspaceScratchAllocation>,
+    scratch_sources: Vec<WorkspaceAllocationPopulation>,
     host_workspace: u64,
+    host_staging_incomplete: bool,
     operations: Vec<WorkspaceOperation>,
     missing: Vec<usize>,
     missing_host: Vec<usize>,
@@ -755,6 +928,9 @@ impl fmt::Debug for WorkspaceContext {
 /// cover every operation before any byte total may authorize strict execution.
 #[derive(Debug, Clone)]
 pub struct WorkspaceTraceReport {
+    /// Per-domain results from these same original allocation identities.
+    /// Absence is missing physical attribution, independent of limit mode.
+    pub physical_domains: Option<WorkspaceDomainReport>,
     /// Complete backing union of the supplied closing roots. This stays separate
     /// from the ordinary retained/transient equation totals and native lifetime.
     pub closing_storage: WorkspaceStoragePopulation,
@@ -794,7 +970,9 @@ pub struct WorkspaceTraceReport {
     pub operations: Vec<WorkspaceOperation>,
     /// Indices into `operations` for primitives without tensor-buffer bounds.
     pub unpriced_operations: Vec<usize>,
-    /// Indices into `operations` without managed host-workspace bounds.
+    /// Indices into `operations` without managed host-workspace bounds or
+    /// native scratch allocation control costs. Known staging bytes remain
+    /// separately available in `host_workspace_bytes`.
     pub unpriced_host_operations: Vec<usize>,
     /// Unique selected-mechanism assumptions used by known operations.
     pub assumptions: Vec<String>,
@@ -975,6 +1153,11 @@ impl WorkspaceContext {
         self.trace.borrow().operations.len()
     }
 
+    /// Completion strategy supplied by this context's selected mechanism.
+    pub fn completion_strategy(&self) -> WorkspaceCompletionStrategy {
+        self.mechanisms.completion_strategy()
+    }
+
     /// Reports the span, assigning explicitly retained roots to persistent state
     /// once even when several cache views refer to the same allocation.
     pub fn report(&self, retained: &[WorkspaceTensor]) -> Result<WorkspaceTraceReport, Error> {
@@ -1020,13 +1203,90 @@ impl WorkspaceContext {
             };
             operation.outputs[index].representation = representation;
         }
-        let (bound, host) = self.emit_operation_facts(&operation)?;
+        let (mut bound, host) = self.emit_operation_facts(&operation)?;
+        let mut sources = if self.facts.is_none() {
+            self.charge_metadata(std::mem::size_of::<
+                Option<WorkspaceOperationAllocationSources>,
+            >())?;
+            self.mechanisms
+                .prepare_allocation_sources(operation.as_view(), self)?
+        } else {
+            None
+        };
+        if sources
+            .as_ref()
+            .is_some_and(|s| s.outputs.len() > operation.outputs.len())
+        {
+            return Err(WorkspaceMetadataError::Unqualified.into());
+        }
         let mut trace = self.trace.borrow_mut();
         let scratch = bound.as_ref().map_or(0, |bound| bound.scratch_bytes());
-        let next_scratch = trace
-            .scratch
-            .checked_add(scratch)
-            .ok_or_else(|| workspace_overflow("workspace scratch sum overflow"))?;
+        let next_scratch = trace.scratch.checked_add(scratch);
+        if next_scratch.is_none() && self.mechanisms.memory_topology().is_none() {
+            return Err(workspace_overflow("workspace scratch sum overflow"));
+        }
+        let mut missing_scratch_controls = false;
+        let explicit = bound
+            .as_mut()
+            .and_then(|value| value.take_scratch_allocations());
+        let prepared = sources
+            .as_mut()
+            .and_then(|s| s.scratch.take())
+            .map(|source| {
+                self.copy_scratch_population(&source, scratch)
+                    .map(|rows| (rows, source))
+            })
+            .transpose()?;
+        let explicit = match explicit.or(prepared) {
+            Some(rows) => Some(rows),
+            None if self.facts.is_none() => self
+                .mechanisms
+                .scratch_allocations(operation.as_view())?
+                .map(|source| {
+                    self.copy_scratch_population(source, scratch)
+                        .map(|rows| (rows, source.clone()))
+                })
+                .transpose()?,
+            None => None,
+        };
+        if let Some((rows, source)) = explicit {
+            source.validate_domains(self.memory_topology().ok_or_else(|| {
+                Error::backend_retained_source(WorkspacePlacementError::MissingTopology)
+            })?)?;
+            missing_scratch_controls |= source.host_control_bytes().is_none();
+            for row in &rows {
+                if let Some(placement) = &row.placement {
+                    placement
+                        .validate(
+                            self.memory_topology()
+                                .ok_or(WorkspacePlacementError::MissingTopology)
+                                .map_err(Error::backend_retained_source)?,
+                        )
+                        .map_err(Error::backend_retained_source)?;
+                }
+                missing_scratch_controls |= row.host_control_bytes.is_none();
+            }
+            self.reserve_metadata_vec(&mut trace.scratch_sources, 1)?;
+            self.reserve_metadata_vec(&mut trace.placed_scratch, rows.len())?;
+            trace.scratch_sources.push(source);
+            trace.placed_scratch.extend(rows);
+        } else if scratch != 0 {
+            let placement =
+                self.copy_placement(self.mechanisms.scratch_placement(operation.as_view()))?;
+            self.reserve_metadata_vec(&mut trace.placed_scratch, 1)?;
+            let host_control_bytes = self
+                .mechanisms
+                .scratch_host_control_bytes(operation.as_view())?;
+            missing_scratch_controls = host_control_bytes.is_none();
+            trace.placed_scratch.push(WorkspaceScratchAllocation {
+                bytes: scratch,
+                maximum_allocations: self
+                    .mechanisms
+                    .scratch_allocation_count(operation.as_view())?,
+                placement,
+                host_control_bytes,
+            });
+        }
         let next_host = trace
             .host_workspace
             .checked_add(host.as_ref().map_or(0, |bound| bound.bytes))
@@ -1035,16 +1295,65 @@ impl WorkspaceContext {
         self.reserve_metadata_vec(&mut trace.operations, 1)?;
         self.tracing_started.set(true);
         for (index, layout) in operation.outputs.iter().enumerate() {
-            let storage = match bound.as_ref().and_then(|bound| bound.output(index)) {
+            let population = bound
+                .as_mut()
+                .and_then(|bound| bound.take_output_population(index))
+                .or_else(|| {
+                    sources
+                        .as_mut()
+                        .and_then(|s| s.outputs.get_mut(index))
+                        .and_then(Option::take)
+                });
+            let population = match population {
+                Some(source) => Some(source),
+                None if self.facts.is_none() => self
+                    .mechanisms
+                    .output_allocations(operation.as_view(), index)?
+                    .cloned(),
+                None => None,
+            };
+            let effect = bound.as_ref().and_then(|bound| bound.output(index));
+            if population.is_some()
+                && !matches!(
+                    effect,
+                    Some(WorkspaceOutputStorageView::Allocate(_))
+                        | Some(WorkspaceOutputStorageView::AllocateOrAliasInputs { .. })
+                )
+            {
+                return Err(WorkspaceMetadataError::Unqualified.into());
+            }
+            let storage = match effect {
                 Some(WorkspaceOutputStorageView::AliasInput(input)) => {
                     inputs[input].storage.clone()
                 }
                 Some(WorkspaceOutputStorageView::AliasOutput(output)) => {
                     values[output].storage.clone()
                 }
+                effect if population.is_some() => {
+                    let (bytes, candidates) = match effect {
+                        Some(WorkspaceOutputStorageView::Allocate(bytes)) => (bytes, &[][..]),
+                        Some(WorkspaceOutputStorageView::AllocateOrAliasInputs {
+                            bytes,
+                            inputs,
+                        }) => (bytes, inputs),
+                        _ => return Err(WorkspaceMetadataError::Unqualified.into()),
+                    };
+                    let mut aliases = self.metadata_vec(candidates.len())?;
+                    aliases.extend(
+                        candidates
+                            .iter()
+                            .map(|index| inputs[*index].storage.clone()),
+                    );
+                    self.output_population_storage(
+                        population.expect("qualified population"),
+                        bytes,
+                        aliases,
+                        &mut trace,
+                    )?
+                }
                 effect => {
                     self.reserve_metadata_vec(&mut trace.allocations, 1)?;
-                    let storage = self.try_new_storage(
+                    let mut storage = self.try_new_storage(
                         match effect {
                             Some(WorkspaceOutputStorageView::Allocate(bytes))
                             | Some(WorkspaceOutputStorageView::AllocateOrAliasInputs {
@@ -1069,6 +1378,16 @@ impl WorkspaceContext {
                             _ => Vec::new(),
                         },
                     )?;
+                    Rc::get_mut(&mut storage)
+                        .expect("unpublished workspace allocation")
+                        .placement = self.copy_placement(
+                        self.mechanisms.output_placement(operation.as_view(), index),
+                    )?;
+                    Rc::get_mut(&mut storage)
+                        .expect("unpublished workspace allocation")
+                        .host_control_bytes = self
+                        .mechanisms
+                        .allocation_host_control_bytes(operation.as_view(), index);
                     trace.allocations.push(storage.clone());
                     storage
                 }
@@ -1080,11 +1399,15 @@ impl WorkspaceContext {
                 imported_existing: false,
             });
         }
-        trace.scratch = next_scratch;
+        trace.scratch_overflow |= next_scratch.is_none();
+        trace.scratch = next_scratch.unwrap_or(trace.scratch);
         trace.host_workspace = next_host;
+        let missing_host = host.is_none();
+        trace.host_staging_incomplete |= missing_host;
         if let Some(host) = host {
             self.insert_assumption(&mut trace.assumptions, host.assumptions)?;
-        } else {
+        }
+        if missing_host || missing_scratch_controls {
             let index = trace.operations.len();
             self.reserve_metadata_vec(&mut trace.missing_host, 1)?;
             trace.missing_host.push(index);

@@ -1,4 +1,8 @@
 use super::*;
+use crate::working_memory::capture_run::tests::{
+    CaptureFundingFixture, capture_test_ledger, fresh, ledger,
+};
+
 use crate::working_memory::*;
 use eredu_core::{cache::LayerCachePolicy, *};
 use std::{
@@ -101,7 +105,6 @@ fn admitted() -> AdmittedCapturePlan {
         limits: CaptureLimits {
             per_step: all,
             cumulative: all,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -115,7 +118,6 @@ fn admitted() -> AdmittedCapturePlan {
                 CaptureTransformKind::Preview,
             ],
             max_histogram_bins: 1,
-            physical_native_limit: false,
             conditions: vec![],
         },
         CaptureRequestShape {
@@ -153,86 +155,20 @@ fn tensor(shape: Vec<usize>) -> SharedTensorObservation {
         (),
     )
 }
-fn ledger(pool: &WorkingMemoryPool) -> (u64, u64, u64, usize, usize, usize) {
-    let usage = pool.0.usage.lock().unwrap();
-    (
-        usage.reserved + usage.registered,
-        usage.peak,
-        usage.funding.values().map(|s| s.host_held).sum(),
-        usage.funding.values().map(|s| s.scopes).sum(),
-        usage.reservations,
-        usage.funding.len(),
-    )
-}
-
-fn fresh(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
-) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
-    let geometry = InferenceGeometry {
-        batch_size: 1,
-        cached_positions: 0,
-        input_positions: 3,
-        max_output_tokens: 4,
-        prefill_chunk_positions: 3,
-        output: OutputDemand::LastPosition,
-    };
-    let layout = StateMemoryLayout::new(
-        LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
-        vec![0],
-        1,
-        1,
-        EstimationCompleteness::Complete,
-    )
-    .unwrap();
-    let state = estimate_runtime_state(
-        &layout,
-        InputTokenCount::text(3),
-        4,
-        1,
-        NonZeroU8::new(4).unwrap(),
-    )
-    .unwrap();
-    let bound = |bytes| WorkspaceBound::bounded(bytes, "portable parent-account fixture");
-    let state = state
-        .with_execution_workspace(ExecutionWorkspaceEstimate {
-            geometry,
-            activations: bound(bytes),
-            attention: bound(0),
-            vocabulary: bound(0),
-            state_update: bound(0),
-            materialization: bound(0),
-            retained: bound(0),
-        })
-        .unwrap();
-    pool.reserve_with_capacity(
-        &InferenceExecutionIdentity::default(),
-        &Admission {
-            state,
-            requested_positions: 7,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        pool.effective_capacity().unwrap(),
-    )
-    .unwrap()
-    .into_funding()
-    .unwrap()
-}
 
 #[test]
 fn exact_and_one_short_use_actual_plan_before_any_frame_buffers() {
     let source = admitted();
     let p = plan(&source).initialization_peak_bytes();
     for bytes in [p - 1, p] {
-        let pool = WorkingMemoryPool::new(2 * p, 0).unwrap();
+        let pool = capture_test_ledger(2 * p, 0).unwrap();
         let (reservation, run) = fresh(&pool, bytes);
         let before = ledger(&pool);
         let allocations = ALLOCATIONS.get();
         let result = run.prepare_capture_step(&reservation, plan(&source));
         if bytes < p {
             assert!(
-                matches!(result,Err(CaptureStepError::Memory(WorkingMemoryError::BudgetExceeded {required_bytes,available_bytes})) if required_bytes==p && available_bytes==p-1)
+                matches!(result,Err(CaptureStepError::Memory(WorkingMemoryError::DomainAllowanceExceeded { required_bytes, available_bytes, .. })) if required_bytes==p && available_bytes==p-1)
             );
             assert_eq!(ledger(&pool), before);
             assert_eq!(ALLOCATIONS.get(), allocations);
@@ -250,12 +186,12 @@ fn exact_and_one_short_use_actual_plan_before_any_frame_buffers() {
                 CaptureOutcome::Missing
             ));
             assert_eq!(ALLOCATIONS.get(), allocations + 1);
-            assert_eq!(ledger(&pool).2, p);
+            assert_eq!(ledger(&pool).1, p);
             drop(builder);
             assert_eq!(ledger(&pool), before);
         }
         drop((run, reservation));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -265,7 +201,7 @@ fn fixed_capacities_pointers_preview_and_utf8_failures_survive_finish() {
     let host_plan = plan(&source);
     let allocated = host_plan.allocated_payload_bytes();
     let p = host_plan.initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (reservation, run) = fresh(&pool, p);
     let mut b = run.prepare_capture_step(&reservation, host_plan).unwrap();
     let actual = size_of::<CapturedStep>()
@@ -294,7 +230,7 @@ fn fixed_capacities_pointers_preview_and_utf8_failures_survive_finish() {
         allocated
     );
     let original_ledger = ledger(&pool);
-    assert_eq!(original_ledger.2, p);
+    assert_eq!(original_ledger.1, p);
     let records = b.records().as_ptr();
     let id = b.records()[0].selection_id.as_ptr();
     let source_ptr = b.buffers[0].source.as_ptr();
@@ -417,10 +353,10 @@ fn fixed_capacities_pointers_preview_and_utf8_failures_survive_finish() {
     assert_eq!(shared.as_step(), &decoded);
     let alias = shared.clone();
     drop((source, shared, run, reservation));
-    assert_eq!(pool.used_bytes().unwrap(), p);
+    assert_eq!(pool.payload_used_bytes().unwrap(), p);
     assert_eq!(alias.records().as_ptr(), records);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -434,7 +370,7 @@ fn original_parent_frame_tensor_and_native_pressure_never_double_spend() {
     let h = tensor_plan.initialization_peak_bytes();
     let n = 61;
     let total = p + h + n;
-    let pool = WorkingMemoryPool::new(total, 0).unwrap();
+    let pool = capture_test_ledger(total, 0).unwrap();
     let (reservation, run) = fresh(&pool, total);
     let native = run.scope().unwrap();
     let mut b = run
@@ -451,27 +387,27 @@ fn original_parent_frame_tensor_and_native_pressure_never_double_spend() {
     b.record_tensor(0, TensorDtype::F32, values, CaptureUsage::default())
         .unwrap();
     let before = ledger(&pool);
-    assert_eq!(before.2, p + h);
+    assert_eq!(before.1, p + h);
     assert!(matches!(
-        native.adopt_storage_individually([(17u32, n + 1)]),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        native.adopt_capture_host_storage([(17u32, n + 1)]),
+        Err(WorkingMemoryError::DomainAllowanceExceeded { .. })
     ));
     assert_eq!(ledger(&pool), before);
-    let roots = native.adopt_storage_individually([(17u32, n)]).unwrap();
+    let roots = native.adopt_capture_host_storage([(17u32, n)]).unwrap();
     let frame = b
         .finish(CaptureStepOutcome::Committed, unlimited(), unlimited(), 0.0)
         .unwrap();
     drop((run, reservation));
     native.certify().unwrap();
     drop(frame);
-    assert_eq!(ledger(&pool).2, h);
+    assert_eq!(ledger(&pool).1, h);
     // The native work and run are closed; only the escaped tensor's exact
     // host hold and independently registered native allocation remain.
-    assert_eq!(pool.used_bytes().unwrap(), h + n);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h + n);
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), n);
+    assert_eq!(pool.payload_used_bytes().unwrap(), n);
     drop(roots);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -479,8 +415,8 @@ fn wrong_reservation_closed_and_quarantined_parents_reject_without_record_mutati
     for failure in 0..3 {
         let source = admitted();
         let p = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(3 * p, 0).unwrap();
-        let foreign = WorkingMemoryPool::new(p, 0).unwrap();
+        let pool = capture_test_ledger(3 * p, 0).unwrap();
+        let foreign = capture_test_ledger(p, 0).unwrap();
         let (r, run) = fresh(&pool, p);
         let (other, other_run) = fresh(&pool, p);
         let (foreign_r, foreign_run) = fresh(&foreign, p);
@@ -528,13 +464,13 @@ fn wrong_reservation_closed_and_quarantined_parents_reject_without_record_mutati
             CaptureStepError::Memory(WorkingMemoryError::ExecutionFenced)
         ));
         drop(error);
-        assert_eq!(ledger(&pool).2, 0);
+        assert_eq!(ledger(&pool).1, 0);
         drop((r, run, other, other_run, foreign_r, foreign_run));
-        assert_eq!(foreign.used_bytes().unwrap(), 0);
+        assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
         if failure < 2 {
-            assert_eq!(pool.used_bytes().unwrap(), 0)
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0)
         } else {
-            assert_eq!(pool.used_bytes().unwrap(), p)
+            assert_eq!(pool.payload_used_bytes().unwrap(), p)
         }
     }
 }
@@ -543,7 +479,7 @@ fn wrong_reservation_closed_and_quarantined_parents_reject_without_record_mutati
 fn invalid_tensor_finish_and_skips_preserve_fixed_owner_and_original_outcomes() {
     let source = admitted();
     let p = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (r, run) = fresh(&pool, p);
     let mut b = run.prepare_capture_step(&r, plan(&source)).unwrap();
     let pointers = (b.records().as_ptr(), b.buffers[0].source.as_ptr());
@@ -626,14 +562,14 @@ fn invalid_tensor_finish_and_skips_preserve_fixed_owner_and_original_outcomes() 
         CaptureOutcome::Missing
     ));
     drop((frame, r, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn partial_construction_unwind_releases_only_host_hold_and_never_native_scope() {
     let source = admitted();
     let p = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(p + 9, 0).unwrap();
+    let pool = capture_test_ledger(p + 9, 0).unwrap();
     let (r, run) = fresh(&pool, p + 9);
     let native = run.scope().unwrap();
     let before = ledger(&pool);
@@ -648,7 +584,7 @@ fn partial_construction_unwind_releases_only_host_hold_and_never_native_scope() 
     let mut b = run.prepare_capture_step(&r, plan(&source)).unwrap();
     struct Retired {
         count: Arc<AtomicUsize>,
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         held: u64,
     }
     impl Drop for Retired {
@@ -663,7 +599,7 @@ fn partial_construction_unwind_releases_only_host_hold_and_never_native_scope() 
                 usage
                     .funding
                     .values()
-                    .map(|state| state.host_held)
+                    .map(|state| state.host_held - state.control_floor)
                     .sum::<u64>(),
                 self.held
             );
@@ -690,12 +626,12 @@ fn partial_construction_unwind_releases_only_host_hold_and_never_native_scope() 
     );
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     assert_eq!(ledger(&pool), before);
-    let roots = native.adopt_storage_individually([(1u32, 9)]).unwrap();
+    let roots = native.adopt_capture_host_storage([(1u32, 9)]).unwrap();
     drop((run, r));
-    assert_eq!(pool.used_bytes().unwrap(), p + 9);
+    assert_eq!(pool.payload_used_bytes().unwrap(), p + 9);
     drop(native);
     drop(roots);
-    assert_eq!(pool.used_bytes().unwrap(), p + 9);
+    assert_eq!(pool.payload_used_bytes().unwrap(), p + 9);
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
@@ -739,7 +675,6 @@ fn readmit_with_invocation(
             CaptureTransformKind::Histogram,
         ],
         max_histogram_bins: 1,
-        physical_native_limit: false,
         conditions: vec![],
     };
     match bounds {
@@ -764,7 +699,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
     raw.selections.clear();
     let empty = readmit(raw, source.points()[..1].to_vec());
     let p = plan(&empty).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (r, run) = fresh(&pool, p);
     let b = run.prepare_capture_step(&r, plan(&empty)).unwrap();
     assert!(b.is_empty());
@@ -780,7 +715,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
         .unwrap();
     assert!(frame.records().is_empty());
     drop((frame, r, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     for kind in 0..3 {
         let mut raw = source.plan().clone();
         raw.selections.truncate(1);
@@ -811,7 +746,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
             _ => {
                 let host = result.unwrap();
                 let p = host.initialization_peak_bytes();
-                let pool = WorkingMemoryPool::new(p, 0).unwrap();
+                let pool = capture_test_ledger(p, 0).unwrap();
                 let (r, run) = fresh(&pool, p);
                 let mut b = run.prepare_capture_step(&r, host).unwrap();
                 b.record_tensor(
@@ -829,7 +764,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
                     Some(&[3, 0][..])
                 );
                 drop((frame, r, run));
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
         if kind < 2 {
@@ -858,7 +793,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
     let host =
         CaptureStepHostPlan::prepare(&invoked, CapturePhase::Decode, 2, Some(invocation)).unwrap();
     let p = host.initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (r, run) = fresh(&pool, p);
     let mut b = run.prepare_capture_step(&r, host).unwrap();
     b.record_tensor(
@@ -879,7 +814,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
         Some(&[2, 4][..])
     );
     drop((frame, r, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(plan::extent(usize::MAX, 2).is_err());
     assert!(plan::extent((isize::MAX as usize) / 8 + 1, 8).is_err());
     assert!(matches!(
@@ -895,7 +830,7 @@ fn empty_zero_geometry_and_unsupported_unknown_overflow_remain_explicit() {
 fn unhealthy_account_before_construction_and_poison_cleanup_never_grant_work() {
     let source = admitted();
     let p = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (r, run) = fresh(&pool, p);
     drop(run.scope().unwrap());
     let before = ledger(&pool);
@@ -909,8 +844,8 @@ fn unhealthy_account_before_construction_and_poison_cleanup_never_grant_work() {
     assert_eq!(ledger(&pool), before);
     assert_eq!(ALLOCATIONS.get(), allocations);
     drop((run, r));
-    assert_eq!(pool.used_bytes().unwrap(), p);
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), p);
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (r, run) = fresh(&pool, p);
     FENCE_AFTER_RECORD.with(|slot| *slot.borrow_mut() = Some(run.scope().unwrap()));
     let allocations = ALLOCATIONS.get();
@@ -921,11 +856,11 @@ fn unhealthy_account_before_construction_and_poison_cleanup_never_grant_work() {
         ))
     ));
     assert_eq!(ALLOCATIONS.get(), allocations + 1);
-    assert_eq!(ledger(&pool).2, 0);
+    assert_eq!(ledger(&pool).1, 0);
     drop((r, run));
-    assert_eq!(pool.used_bytes().unwrap(), p);
+    assert_eq!(pool.payload_used_bytes().unwrap(), p);
 
-    let pool = WorkingMemoryPool::new(p, 0).unwrap();
+    let pool = capture_test_ledger(p, 0).unwrap();
     let (r, run) = fresh(&pool, p);
     let b = run.prepare_capture_step(&r, plan(&source)).unwrap();
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -942,11 +877,18 @@ fn unhealthy_account_before_construction_and_poison_cleanup_never_grant_work() {
     drop(error);
     {
         let usage = pool.0.usage.lock().unwrap_err().into_inner();
-        assert_eq!(usage.funding.values().map(|s| s.host_held).sum::<u64>(), 0);
+        assert_eq!(
+            usage
+                .funding
+                .values()
+                .map(|s| s.host_held - s.control_floor)
+                .sum::<u64>(),
+            0
+        );
     }
     drop((r, run));
     assert!(matches!(
-        pool.used_bytes(),
+        pool.payload_used_bytes(),
         Err(WorkingMemoryError::Poisoned)
     ));
 }

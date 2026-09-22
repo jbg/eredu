@@ -27,9 +27,9 @@ fn inventory(tokens: impl IntoIterator<Item = HostSlotMetadata>) -> RetainedStor
     storage
 }
 
-fn reclaim(pool: &WorkingMemoryPool, bytes: u64) {
+fn reclaim(pool: &MemoryLedger, bytes: u64) {
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
 }
 
 fn cause<'a, T: std::error::Error + 'static>(
@@ -45,7 +45,7 @@ fn cause<'a, T: std::error::Error + 'static>(
 
 #[test]
 fn slot_inventory_deduplicates_tokens_but_preserves_independent_equal_tables() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let first = table();
     let second = table();
@@ -69,7 +69,7 @@ fn slot_inventory_deduplicates_tokens_but_preserves_independent_equal_tables() {
         .all(|(key, _)| matches!(key, StorageIdentity::HostMetadata(_))));
     let registered = inventory([a.clone(), b.clone()]).register(&pool).unwrap();
     let publication = storage.publish_unquoted(&loading).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes * 2);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes * 2);
     drop((registered, publication, loading, alias));
     reclaim(&pool, bytes * 2);
     drop((first, a));
@@ -81,8 +81,8 @@ fn slot_inventory_deduplicates_tokens_but_preserves_independent_equal_tables() {
 
 #[test]
 fn a_slot_table_attaches_once_per_domain_and_does_not_cycle_through_publication() {
-    let a = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-    let b = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let a = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+    let b = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading_a = NativeMemoryOwner::acquire(&a).unwrap();
     let loading_b = NativeMemoryOwner::acquire(&b).unwrap();
     let source = table();
@@ -98,7 +98,10 @@ fn a_slot_table_attaches_once_per_domain_and_does_not_cycle_through_publication(
         .publish_unquoted(&loading_a)
         .unwrap();
     assert_eq!(
-        (a.used_bytes().unwrap(), b.used_bytes().unwrap()),
+        (
+            a.fixture_host_charge().unwrap(),
+            b.fixture_host_charge().unwrap()
+        ),
         (bytes, bytes)
     );
     drop((loading_a, loading_b, repeated));
@@ -116,7 +119,7 @@ fn a_slot_table_attaches_once_per_domain_and_does_not_cycle_through_publication(
 fn mutable_slots_and_immutable_layouts_share_registry_namespace_without_sharing_charges() {
     use eredu_runtime::{SharedHostMetadata, SharedStateLayout, StateLayout};
 
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let source = table();
     let layout = SharedHostMetadata::Layout(SharedStateLayout::new(
@@ -150,19 +153,19 @@ fn mutable_slots_and_immutable_layouts_share_registry_namespace_without_sharing_
 fn table_payload_retires_before_charge_and_escaped_tokens_cannot_attach_again() {
     struct Tracked {
         value: u32,
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         observed: Arc<AtomicU64>,
         drops: Arc<AtomicUsize>,
     }
     impl Drop for Tracked {
         fn drop(&mut self) {
             self.observed
-                .store(self.pool.used_bytes().unwrap(), Ordering::SeqCst);
+                .store(self.pool.fixture_host_charge().unwrap(), Ordering::SeqCst);
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-    let other = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+    let other = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let loading_other = NativeMemoryOwner::acquire(&other).unwrap();
     let observed = Arc::new(AtomicU64::new(0));
@@ -206,28 +209,43 @@ fn table_payload_retires_before_charge_and_escaped_tokens_cannot_attach_again() 
 
 #[test]
 fn slot_registration_rejects_one_short_and_unknown_coverage_without_accounting_changes() {
-    let source_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let source_authority = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let source = table();
     let bytes = source.metadata().capacity_bytes().unwrap();
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let controls = crate::memory_fixture::publication_control_bytes(1);
+    let short = crate::memory_fixture::ledger(
+        bytes + controls - 1 + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let loading_short = NativeMemoryOwner::acquire(&short).unwrap();
     let error = inventory([source.metadata().clone()])
         .publish_unquoted(&loading_short)
         .unwrap_err();
     assert_eq!(
-        cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::BudgetExceeded {
-            required_bytes: bytes,
-            available_bytes: bytes - 1
-        })
+        cause::<WorkingMemoryError>(&error)
+            .and_then(crate::tests::support::memory_error::host_budget_numbers),
+        Some((bytes, bytes - 1))
     );
     assert_eq!(
-        (short.used_bytes().unwrap(), short.peak_bytes().unwrap()),
-        (0, 0)
+        (
+            short.fixture_host_charge().unwrap(),
+            short.fixture_host_peak().unwrap()
+        ),
+        (
+            0,
+            controls + crate::memory_fixture::native_owner_control_bytes()
+        )
     );
     assert_eq!(short.unquoted_owner_count().unwrap(), 1);
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let exact = crate::memory_fixture::ledger(
+        bytes
+            + crate::memory_fixture::publication_control_bytes(1)
+            + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let loading_exact = NativeMemoryOwner::acquire(&exact).unwrap();
     let mut unknown = inventory([source.metadata().clone()]);
     unknown.mark_incomplete();
@@ -239,8 +257,11 @@ fn slot_registration_rejects_one_short_and_unknown_coverage_without_accounting_c
         Some(&WorkingMemoryError::UnknownBound)
     );
     assert_eq!(
-        (exact.used_bytes().unwrap(), exact.peak_bytes().unwrap()),
-        (0, 0)
+        (
+            exact.fixture_host_charge().unwrap(),
+            exact.fixture_host_peak().unwrap()
+        ),
+        (0, 0 + crate::memory_fixture::native_owner_control_bytes())
     );
     let publication = inventory([source.metadata().clone()])
         .publish_unquoted(&loading_exact)
@@ -270,7 +291,7 @@ fn ordered_tables() -> (HostSlotTable<u32>, HostSlotTable<u32>) {
 
 #[test]
 fn failed_later_slot_attachment_preserves_earlier_charge_and_original_typed_error() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let (live, retired) = ordered_tables();
     let bytes = live.metadata().capacity_bytes().unwrap();
@@ -284,7 +305,12 @@ fn failed_later_slot_attachment_preserves_earlier_charge_and_original_typed_erro
         Some(HostSlotAttachmentError::Retired)
     ));
     reclaim(&pool, bytes);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes * 2);
+    assert_eq!(
+        pool.fixture_host_peak().unwrap(),
+        bytes * 2
+            + crate::memory_fixture::publication_control_bytes(2)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     assert_eq!(live.slots(), [3, 5, 7, 11]);
     drop((loading, live, dead_token));
@@ -293,7 +319,12 @@ fn failed_later_slot_attachment_preserves_earlier_charge_and_original_typed_erro
 
 #[test]
 fn zero_length_slot_sources_keep_attachment_retirement_semantics_without_payload_charge() {
-    let pool = WorkingMemoryPool::new(1024, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(
+        2 * crate::memory_fixture::publication_control_bytes(1)
+            + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let source = HostSlotTable::<u32>::new(Vec::new().into_boxed_slice());
     let token = source.metadata().clone();
@@ -317,9 +348,16 @@ fn zero_length_slot_sources_keep_attachment_retirement_semantics_without_payload
 // This host-only fixture has no native operation. Its sole payload contribution
 // is the measured fixed boxed slot extent constructed under the returned scope.
 fn funding(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
+    pool: &MemoryLedger,
+    payload: u64,
+    publication_rows: &[usize],
 ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
+    let bytes = publication_rows
+        .iter()
+        .try_fold(payload, |bytes, rows| {
+            bytes.checked_add(crate::memory_fixture::publication_control_bytes(*rows))
+        })
+        .unwrap();
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -345,25 +383,47 @@ fn funding(
         NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: WorkspaceBound::bounded(bytes, "exact retained boxed host slot extent"),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: WorkspaceBound::bounded(bytes, "exact retained boxed host slot extent"),
+        },
+    ))
     .unwrap();
+    let admission = crate::memory_fixture::host_admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
+        requested_positions: 1,
+        state,
+        incremental_required_bytes: Some(bytes),
+    });
+    let requirements = pool
+        .reservation_requirements(
+            &admission,
+            Some(&crate::memory_fixture::host_requirements(bytes)),
+        )
+        .unwrap();
+    let physical_limit = pool
+        .fixture_host_current()
+        .unwrap()
+        .checked_add(
+            requirements
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+        )
+        .unwrap();
     pool.reserve_with_capacity(
         &InferenceExecutionIdentity::default(),
-        &Admission {
-            requested_positions: 1,
-            state,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        bytes,
+        &admission,
+        crate::memory_fixture::physical_host_limits(pool, physical_limit),
     )
     .unwrap()
     .into_funding()
@@ -371,7 +431,7 @@ fn funding(
 }
 
 fn table_capacity() -> u64 {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let source = table();
     let bytes = source.metadata().capacity_bytes().unwrap();
@@ -382,8 +442,9 @@ fn table_capacity() -> u64 {
 #[test]
 fn funded_slot_publication_transfers_exact_credit_and_tokens_retain_it_after_table_retirement() {
     let bytes = table_capacity();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let (reservation, run) = funding(&pool, bytes);
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let (reservation, run) = funding(&pool, bytes, &[1, 1]);
+    let accepted_peak = pool.fixture_host_peak().unwrap();
     let scope = run.scope().unwrap();
     let source = table();
     let token = source.metadata().clone();
@@ -398,10 +459,13 @@ fn funded_slot_publication_transfers_exact_credit_and_tokens_retain_it_after_tab
     // All credit transferred to the actual boxed source. Repeated attachment
     // shares that charge rather than retaining a second slice of the envelope.
     assert_eq!(
-        scope.adopt_storage_individually([(37_u32, 1)]).unwrap_err(),
-        WorkingMemoryError::BudgetExceeded {
-            required_bytes: 1,
-            available_bytes: 0,
+        scope
+            .adopt_host_storage_individually([(37_u32, 1)])
+            .unwrap_err(),
+        WorkingMemoryError::DomainAllowanceExceeded {
+            domain: pool.topology().host_domain(),
+            required_bytes: MemoryLedger::storage_metadata_control_bytes().unwrap(),
+            available_bytes: 0
         }
     );
     scope.certify().unwrap();
@@ -414,7 +478,7 @@ fn funded_slot_publication_transfers_exact_credit_and_tokens_retain_it_after_tab
     // This remaining token is accounting custody only: its table has retired.
     let attempts = AtomicUsize::new(0);
     let error = token
-        .try_attach(pool.shared_storage_domain(), || {
+        .try_attach(pool.shared_storage_accounting_id(), || {
             attempts.fetch_add(1, Ordering::SeqCst);
             Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(Box::new(()))
         })
@@ -423,7 +487,7 @@ fn funded_slot_publication_transfers_exact_credit_and_tokens_retain_it_after_tab
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
     drop(token);
     reclaim(&pool, 0);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_peak().unwrap(), accepted_peak);
     drop(key);
 }
 
@@ -431,8 +495,10 @@ fn funded_slot_publication_transfers_exact_credit_and_tokens_retain_it_after_tab
 fn failed_funded_slot_publication_quarantines_the_complete_uncertified_envelope() {
     let bytes = table_capacity();
     let full = bytes * 2;
-    let pool = WorkingMemoryPool::new(full, 0).unwrap();
-    let (reservation, run) = funding(&pool, full);
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let (reservation, run) = funding(&pool, full, &[2]);
+    let accepted_peak = pool.fixture_host_peak().unwrap();
+    let accepted_charge = pool.fixture_host_current().unwrap();
     let scope = run.scope().unwrap();
     let (live, retired) = ordered_tables();
     assert_eq!(live.metadata().capacity_bytes(), Some(bytes));
@@ -446,20 +512,22 @@ fn failed_funded_slot_publication_quarantines_the_complete_uncertified_envelope(
         cause::<HostSlotAttachmentError<WorkingMemoryError>>(&error),
         Some(HostSlotAttachmentError::Retired)
     ));
-    reclaim(&pool, full);
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.fixture_host_current().unwrap(), accepted_charge);
     assert_eq!(live.slots(), [3, 5, 7, 11]);
     // The first attachment is retained, and the failed second attachment has
     // returned its charge to the active scope. Failure grants no certification.
     drop(scope);
     drop((run, reservation, live, retired_token, error));
-    reclaim(&pool, full);
-    assert_eq!(pool.peak_bytes().unwrap(), full);
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.fixture_host_current().unwrap(), accepted_charge);
+    assert_eq!(pool.fixture_host_peak().unwrap(), accepted_peak);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
 
 #[test]
 fn ordinary_native_source_classification_preserves_pin_bytes_and_alias_lifetimes() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let first = table();
     let second = table();
     let a = first.metadata().clone();
@@ -474,12 +542,12 @@ fn ordinary_native_source_classification_preserves_pin_bytes_and_alias_lifetimes
         storage.pin_registered(&pool).is_err(),
         "classification cannot register missing ordinary sources"
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     let registered = inventory([a.clone(), b.clone()]).register(&pool).unwrap();
     let pin = storage.pin_registered(&pool).unwrap();
-    assert_eq!(pin.bytes(), physical);
-    assert_eq!(registered.bytes(), physical);
-    assert_eq!(pool.used_bytes().unwrap(), physical);
+    assert_eq!(pin.bytes(), Some(physical));
+    assert_eq!(registered.bytes(), Some(physical));
+    assert_eq!(pool.fixture_host_charge().unwrap(), physical);
     assert_eq!(first.slots(), [3, 5, 7, 11]);
     assert_eq!(second.slots(), first.slots());
     drop((first, second, a, b, storage, registered));
@@ -490,9 +558,16 @@ fn ordinary_native_source_classification_preserves_pin_bytes_and_alias_lifetimes
 
 #[test]
 fn ordinary_source_error_retains_genuine_participant_after_callers_drop_their_lease() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
-    let source_population = UnquotedOriginalSlotSources::prepare(&owner.unquoted_lease().unwrap());
+    let prepared = prepare_storage_publication(&pool, 0).unwrap();
+    let source_population = UnquotedOriginalSlotSources::prepare(
+        &owner.unquoted_lease().unwrap(),
+        0,
+        prepared.host_authority(),
+    )
+    .unwrap();
+    drop(prepared);
     // The first fallible ordinary source step may fail before retaining a table.
     // Its concrete error still belongs to this actual ordinary participant.
     let error = original_source_failure(
@@ -513,10 +588,11 @@ fn ordinary_source_error_retains_genuine_participant_after_callers_drop_their_le
 
 #[test]
 fn partial_native_attachment_returns_no_complete_receipt_and_preserves_loading_authority() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let array = safemlx::Array::from_slice(&[53u32, 59], &[2]);
-    let bytes = array.allocation_info().unwrap().unwrap().bytes() as u64;
+    let facts = array.allocation_info().unwrap().unwrap();
+    let bytes = (facts.bytes() + facts.host_control_bytes()) as u64;
     let retired = table();
     let dead_token = retired.metadata().clone();
     let table_bytes = dead_token.capacity_bytes().unwrap();
@@ -532,13 +608,28 @@ fn partial_native_attachment_returns_no_complete_receipt_and_preserves_loading_a
         Some(HostSlotAttachmentError::Retired)
     ));
     reclaim(&pool, bytes);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes + table_bytes);
+    assert_eq!(
+        pool.fixture_host_peak().unwrap(),
+        bytes
+            + table_bytes
+            + crate::memory_fixture::publication_control_bytes(3)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     assert_eq!(array.evaluated().unwrap().as_slice::<u32>(), &[53, 59]);
     drop((array, error, dead_token));
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
     reclaim(&pool, 0);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     drop(loading);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

@@ -18,7 +18,7 @@ impl FinalOwner {
 pub(super) fn retire_final_owners(
     groups: Vec<BoundedRegisteredStorage<Key>>,
     parcels: Vec<SettledCaptureSourceParcel>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     original_floor: u64,
 ) {
     assert!(!groups.is_empty());
@@ -45,14 +45,14 @@ pub(super) fn retire_final_owners(
             })
             .collect::<Vec<_>>();
         ready.wait();
-        let held = pool.used_bytes();
+        let held = pool.payload_used_bytes();
         release.wait();
         for worker in workers {
             worker.join().unwrap();
         }
         assert!(held.unwrap() >= original_floor);
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]

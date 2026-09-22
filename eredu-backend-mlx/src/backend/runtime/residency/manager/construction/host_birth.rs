@@ -5,6 +5,7 @@ use eredu_core::residency::{
     ResidencyAdmissionStorage, ResidencyProtection, ResidencyReservationRow,
 };
 use safemlx::{PreparedHostTransferPlan, PreparedInputArena, PreparedSubmissionGraphQuota};
+pub(super) mod materialized;
 
 fn overflow() -> WorkingMemoryError {
     WorkingMemoryError::Overflow
@@ -35,19 +36,37 @@ impl OriginalManagerPlan {
                     .ok_or_else(overflow)
             })?
         } else {
-            let detached = EncodedRecipeRead::prepare_detached(
-                self.reads.iter().map(|row| row.read.encoded()),
+            let detached = eredu_checkpoint::recipe::EncodedRecipeReadView::prepare_detached(
+                self.read_source_plan()
+                    .encoded_leaves()
+                    .ok_or_else(unknown)?,
             )
             .ok_or_else(unknown)?;
+            let reads = if self.materialized.is_some() {
+                self.read_source_plan()
+                    .encoded_leaves()
+                    .ok_or_else(overflow)?
+                    .try_fold(0usize, |total, read| {
+                        let layout =
+                            eredu_checkpoint::recipe::EncodedRecipeReadView::prepare_detached(
+                                std::iter::once(read),
+                            )
+                            .and_then(|plan| plan.read_layout::<ManagerCustody>())
+                            .ok_or_else(unknown)?;
+                        total
+                            .checked_add(layout.required_bytes())
+                            .ok_or_else(overflow)
+                    })?
+            } else {
+                detached
+                    .read_layout::<ManagerCustody>()
+                    .ok_or_else(unknown)?
+                    .required_bytes()
+            };
             detached
                 .required_bytes::<ManagerCustody>()
                 .ok_or_else(overflow)?
-                .checked_add(
-                    detached
-                        .read_layout::<ManagerCustody>()
-                        .ok_or_else(unknown)?
-                        .required_bytes(),
-                )
+                .checked_add(reads)
                 .ok_or_else(overflow)?
         };
         let mut add = |n: usize| {
@@ -152,11 +171,19 @@ impl OriginalManagerPlan {
                 )?)?;
             }
             if self.foreground.is_some() {
-                let one = usize_bytes(ResidencyManager::original_foreground_operation_source_bytes(
-                    &self.pool, &target.layout, &self.units, target.selected_ids.len(),
-                )?)?;
+                let one = usize_bytes(
+                    ResidencyManager::original_foreground_operation_source_bytes(
+                        &self.pool,
+                        &target.layout,
+                        &self.units,
+                        target.selected_ids.len(),
+                    )?,
+                )?;
                 add(one)?;
-                if target.dense_controller.is_some_and(|facts| facts.options.host_budget_bytes() > 0) {
+                if target
+                    .dense_controller
+                    .is_some_and(|facts| facts.options.host_budget_bytes() > 0)
+                {
                     // The same constructor runs again for actual Host depth. Its
                     // metadata bound uses full controller/row counts, independently
                     // of depth; no source buffer or worker is created by this pass.
@@ -195,14 +222,18 @@ impl OriginalManagerPlan {
         &self,
         control: &ResidencyController,
         custody: ManagerCustody,
+        context: crate::backend::runtime::checkpoint::store::MaterializationView<'_>,
+        materialized: Option<&materialized::Session>,
     ) -> Result<(OriginalHostSources, u64, std::time::Duration), ConstructionCause> {
         let runtime = crate::backend::managed_memory::input_allocator::borrow_admitted(&self.pool)
             .map_err(ResidencyError::OriginalCache)?;
         let source = if let Some(foreground) = &self.foreground {
             source::ReadSourceOwner::Foreground(foreground.clone())
         } else {
-            let detached = EncodedRecipeRead::prepare_detached(
-                self.reads.iter().map(|row| row.read.encoded()),
+            let detached = eredu_checkpoint::recipe::EncodedRecipeReadView::prepare_detached(
+                self.read_source_plan()
+                    .encoded_leaves()
+                    .ok_or(ResidencyError::OriginalCache(overflow()))?,
             )
             .ok_or(ResidencyError::OriginalCache(unknown()))?
             .construct(custody.clone())?;
@@ -241,12 +272,49 @@ impl OriginalManagerPlan {
             );
         }
         let read_bytes = self.host_reads.iter().try_fold(0u64, |sum, &index| {
-            let bytes = self.reads[index].read.encoded().output().byte_len();
+            let bytes = (0..self.reads[index].read.leaf_count())
+                .try_fold(0u64, |bytes, leaf| {
+                    bytes.checked_add(self.reads[index].read.leaf(leaf)?.output().byte_len())
+                })
+                .ok_or(ResidencyError::OriginalCache(overflow()))?;
             sum.checked_add(bytes)
                 .ok_or(ResidencyError::OriginalCache(overflow()))
         })?;
         let read_started = std::time::Instant::now();
-        {
+        if let Some(materialized) = materialized {
+            for (slot, &index) in self.host_reads.iter().enumerate() {
+                let range = self
+                    .read_source_plan()
+                    .leaf_range(
+                        index
+                            ..index
+                                .checked_add(1)
+                                .ok_or(ResidencyError::OriginalCache(overflow()))?,
+                    )
+                    .ok_or(ResidencyError::OriginalOperationDomain)?;
+                match &self.reads[index].read {
+                    read_source_plan::ReadValue::Direct(_) => {
+                        source
+                            .read_slice(range)
+                            .ok_or(ResidencyError::OriginalOperationDomain)?
+                            .read_many_into(&mut [buffers[slot]
+                                .as_bytes_mut()
+                                .map_err(ResidencyError::OriginalNative)?])?;
+                    }
+                    read_source_plan::ReadValue::Materialized(plan) => {
+                        materialized::execute(
+                            plan,
+                            &source,
+                            range,
+                            &mut buffers[slot],
+                            context,
+                            &materialized.observer,
+                            materialized.host.clone(),
+                        )?;
+                    }
+                }
+            }
+        } else {
             // These are the final native destinations. A failed read publishes
             // none of the partially initialized buffers and retains its cause.
             let mut outputs = Vec::with_capacity(buffers.len());

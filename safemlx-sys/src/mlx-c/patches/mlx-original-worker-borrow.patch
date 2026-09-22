@@ -14,7 +14,7 @@ diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
  #if MLX_SCHEDULER_CONSTANT_STORAGE
    if (!scheduler_slot.mutex.try_lock()) return Cause::busy;
    std::lock_guard guard(scheduler_slot.mutex, std::adopt_lock);
-@@ -178,6 +179,11 @@
+@@ -178,6 +179,16 @@
    return Cause::unsupported;
  #endif
  }
@@ -23,10 +23,15 @@ diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
 +  if (!submission::submission_context_empty()) return SchedulerInitializationCause::invalid;
 +  return borrow_scheduler_identity(identity);
 +}
++SchedulerInitializationCause borrow_retained_scheduler(uint64_t identity) noexcept {
++  // Immutable source authentication grants no task or completion authority.
++  // Numerical producers validate their own current execution context.
++  return borrow_scheduler_identity(identity);
++}
  
  namespace {
  using WorkerCause = CpuWorkerStartupCause;
-@@ -194,8 +200,10 @@
+@@ -194,8 +205,10 @@
        a.thread_handle_bytes == b.thread_handle_bytes && a.thread_implementation_bytes == b.thread_implementation_bytes &&
        a.thread_packet_bytes == b.thread_packet_bytes && a.failure_requests == b.failure_requests && a.controls == b.controls;
  }
@@ -34,12 +39,12 @@ diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
 -  const auto scheduler = borrow_initialized_scheduler(identity);
 +CpuWorkerStartupResult worker_prerequisites(uint64_t identity, Stream stream,
 +    const void* birth, bool original_borrow = false) noexcept {
-+  const auto scheduler = original_borrow ? borrow_scheduler_identity(identity)
++  const auto scheduler = original_borrow ? borrow_retained_scheduler(identity)
 +                                         : borrow_initialized_scheduler(identity);
    if (scheduler != SchedulerInitializationCause::success) {
      if (scheduler == SchedulerInitializationCause::busy) return {WorkerCause::busy};
      if (scheduler == SchedulerInitializationCause::unsupported) return {WorkerCause::unsupported};
-@@ -256,7 +264,8 @@
+@@ -256,7 +269,8 @@
        sizeof(std::unique_lock<std::mutex>) + sizeof(std::error_code) +
        sizeof(void*) * 24 + sizeof(uint64_t) * 8 + sizeof(size_t) * 14 +
        sizeof(bool) * 12 + sizeof(std::string) * 4 +
@@ -49,7 +54,7 @@ diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
    output = value;
    return {};
  #else
-@@ -317,7 +326,20 @@
+@@ -317,7 +331,20 @@
  CpuWorkerStartupResult borrow_initialized_cpu_worker(uint64_t scheduler_identity, Stream stream,
      const void* stream_birth, const void* worker_birth) noexcept {
    if (!worker_birth || stream.device != Device::cpu) return {WorkerCause::identity_mismatch};
@@ -71,3 +76,16 @@ diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
    if (prerequisite.cause != WorkerCause::success) return prerequisite;
    auto* owner = prepared_scheduler();
    try {
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -56,6 +56,9 @@
+ MLX_API SchedulerInitializationCause initialize_scheduler(
+     const SchedulerInitializationLayout&, SchedulerInitializationOwner, uint64_t&) noexcept;
+ MLX_API SchedulerInitializationCause borrow_initialized_scheduler(uint64_t) noexcept;
++// Immutable identity loan; numerical producers retain their context checks.
++// Constructor callers keep their separate empty-context prerequisite.
++MLX_API SchedulerInitializationCause borrow_retained_scheduler(uint64_t) noexcept;
+ 
+ struct StreamProgress {
+   uint64_t accepted{0};

@@ -69,7 +69,7 @@ fn check(snapshots: bool, capacity: u64) {
             .unwrap();
         let policy = image_policy(choice);
         let chat = model
-            .prepare_chat(&source, &policy, capacity, &cancel)
+            .prepare_chat(&source, &policy, &native_limits(capacity), &cancel)
             .unwrap_or_else(fail)
             .unwrap();
         let encoded = tokenizer.encode(chat.rendered_prompt(), false).unwrap();
@@ -93,12 +93,10 @@ fn check(snapshots: bool, capacity: u64) {
         let parts = image.parts();
         let cancelled = GenerationCancellationToken::new();
         cancelled.cancel();
-        assert!(
-            model
-                .prepare_chat_input(&chat, &parts, &cancelled)
-                .unwrap_or_else(fail)
-                .is_none()
-        );
+        assert!(model
+            .prepare_chat_input(&chat, &parts, &cancelled)
+            .unwrap_or_else(fail)
+            .is_none());
         let decoder_positions = encoded.len() as u64 + 3; // one marker expands to four image rows
         let chunk = if decoder_positions % 17 == 0 { 19 } else { 17 };
         assert!(decoder_positions > chunk && decoder_positions % chunk != 0);
@@ -109,7 +107,10 @@ fn check(snapshots: bool, capacity: u64) {
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(capacity),
+                memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(capacity),
+                )]),
                 prefill_chunk_positions: NonZeroU64::new(chunk),
                 ..Default::default()
             },
@@ -155,7 +156,7 @@ fn check(snapshots: bool, capacity: u64) {
             .unwrap_or_else(fail)
             .unwrap();
         let foreign_chat = model
-            .prepare_chat(&source, &policy, capacity, &cancel)
+            .prepare_chat(&source, &policy, &native_limits(capacity), &cancel)
             .unwrap_or_else(fail)
             .unwrap();
         let mut foreign = PreparedChatRequest::new(&foreign_chat, settings.clone());
@@ -175,7 +176,7 @@ fn check(snapshots: bool, capacity: u64) {
                 model
                     .prepare_reset_ordinary()
                     .unwrap_or_else(fail)
-                    .reset_admitted(eredu_core::SessionResetLimits::new(capacity))
+                    .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(capacity)))
                     .unwrap_or_else(fail);
                 model.synchronize().unwrap_or_else(fail);
             }
@@ -192,11 +193,13 @@ fn check(snapshots: bool, capacity: u64) {
                 .unwrap_or_else(fail)
                 .unwrap();
             if snapshots {
-                let report = session.preparation_report().expect("original media admission");
+                let report = session
+                    .preparation_report()
+                    .expect("original media admission");
                 eprintln!(
-                    "MEDIA_ADMISSION choice={choice:?} manual={manual} required={} available={:?} geometry={:?}",
+                    "MEDIA_ADMISSION choice={choice:?} manual={manual} required={:?} limits={:?} geometry={:?}",
                     report.admission.incremental_required_bytes,
-                    report.admission.available_memory_bytes,
+                    report.admission.memory_limits,
                     report.geometry,
                 );
             }
@@ -237,7 +240,11 @@ fn check(snapshots: bool, capacity: u64) {
                 assert!(session.token_ids().is_empty());
                 assert_eq!(session.next_prediction(), 0);
                 let prepared = session
-                    .snapshot(&budget, capacity, WorkspaceCopyLimits::new(capacity))
+                    .snapshot(
+                        &budget,
+                        native_limits(capacity),
+                        WorkspaceCopyLimits::new(native_limits(capacity)),
+                    )
                     .unwrap_or_else(|error| panic!("{choice:?} pending media snapshot: {error:?}"));
                 assert!(prepared.token_ids().is_empty());
                 assert_eq!(prepared.next_prediction(), 0);
@@ -251,7 +258,7 @@ fn check(snapshots: bool, capacity: u64) {
                     .fork_snapshot(
                         &prepared,
                         PreparedChatResumeSettings::default(),
-                        capacity,
+                        native_limits(capacity),
                         &cancel,
                     )
                     .unwrap_or_else(|error| panic!("{choice:?} pending media fork: {error:?}"))
@@ -314,7 +321,11 @@ fn check(snapshots: bool, capacity: u64) {
                 )));
                 let prefix = events.clone();
                 let partial = session
-                    .snapshot(&budget, capacity, WorkspaceCopyLimits::new(capacity))
+                    .snapshot(
+                        &budget,
+                        native_limits(capacity),
+                        WorkspaceCopyLimits::new(native_limits(capacity)),
+                    )
                     .unwrap_or_else(|error| {
                         panic!("{choice:?} partial media tool snapshot: {error:?}")
                     });
@@ -333,18 +344,16 @@ fn check(snapshots: bool, capacity: u64) {
                 assert_eq!(serde_json::to_value(&events).unwrap(), expected.2);
                 let suffix = serde_json::to_value(&events[prefix.len()..]).unwrap();
                 let copied = budget.usage().cumulative_copy_bytes;
-                assert!(
-                    session
-                        .restore_snapshot(
-                            &partial,
-                            PreparedChatResumeSettings::default(),
-                            capacity,
-                            &cancel
-                        )
-                        .unwrap_or_else(|error| panic!(
-                            "{choice:?} partial media tool restore: {error:?}"
-                        ))
-                );
+                assert!(session
+                    .restore_snapshot(
+                        &partial,
+                        PreparedChatResumeSettings::default(),
+                        native_limits(capacity),
+                        &cancel
+                    )
+                    .unwrap_or_else(|error| panic!(
+                        "{choice:?} partial media tool restore: {error:?}"
+                    )));
                 assert!(budget.usage().cumulative_copy_bytes > copied);
                 assert_eq!(session.token_ids(), &script[..3]);
                 assert_eq!(session.next_prediction(), 3);
@@ -377,10 +386,13 @@ fn check(snapshots: bool, capacity: u64) {
                     .unwrap_or_else(|_| panic!("terminal session"))
             } else if manual {
                 while session.finish_reason().is_none() {
-                    session = session.advance(&cancel, &mut |event| events.push(event))
+                    session = session
+                        .advance(&cancel, &mut |event| events.push(event))
                         .unwrap_or_else(fail);
                 }
-                session.into_output().unwrap_or_else(|_| panic!("terminal manual media session"))
+                session
+                    .into_output()
+                    .unwrap_or_else(|_| panic!("terminal manual media session"))
             } else {
                 session
                     .run(&cancel, &mut |event| events.push(event))
@@ -421,7 +433,7 @@ fn check(snapshots: bool, capacity: u64) {
         model
             .prepare_reset_ordinary()
             .unwrap_or_else(fail)
-            .reset_admitted(eredu_core::SessionResetLimits::new(capacity))
+            .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(capacity)))
             .unwrap_or_else(fail);
         model.synchronize().unwrap_or_else(fail);
         let input = model
@@ -466,28 +478,50 @@ impl<'a> ImagePrompt<'a> {
             trailing,
             shapes: [[1, leading.len()], [1, trailing.len()]],
             pixels: std::array::from_fn(|i| (i as f32 - 93.0) / 193.0),
-            metadata: [(InputMetadataKey::PatchGrid, HostTensorView {
-                shape: &[1, 3], values: HostTensorValues::I32(&[1, 4, 4]),
-            })],
+            metadata: [(
+                InputMetadataKey::PatchGrid,
+                HostTensorView {
+                    shape: &[1, 3],
+                    values: HostTensorValues::I32(&[1, 4, 4]),
+                },
+            )],
         }
     }
     fn parts(&self) -> [HostInputPart<'_>; 3] {
         [
             HostInputPart {
-                modality: InputModality::Text, kind: InputPayloadKind::TokenIds,
-                payload: HostTensorView { shape: &self.shapes[0], values: HostTensorValues::U32(self.leading) },
-                metadata: &[], extents: &[],
+                modality: InputModality::Text,
+                kind: InputPayloadKind::TokenIds,
+                payload: HostTensorView {
+                    shape: &self.shapes[0],
+                    values: HostTensorValues::U32(self.leading),
+                },
+                metadata: &[],
+                extents: &[],
             },
             HostInputPart {
-                modality: InputModality::Image, kind: InputPayloadKind::Tensor,
-                payload: HostTensorView { shape: &[16, 12], values: HostTensorValues::F32(&self.pixels) },
+                modality: InputModality::Image,
+                kind: InputPayloadKind::Tensor,
+                payload: HostTensorView {
+                    shape: &[16, 12],
+                    values: HostTensorValues::F32(&self.pixels),
+                },
                 metadata: &self.metadata,
-                extents: &[InputExtent::PatchGrid { time: 1, height: 4, width: 4 }],
+                extents: &[InputExtent::PatchGrid {
+                    time: 1,
+                    height: 4,
+                    width: 4,
+                }],
             },
             HostInputPart {
-                modality: InputModality::Text, kind: InputPayloadKind::TokenIds,
-                payload: HostTensorView { shape: &self.shapes[1], values: HostTensorValues::U32(self.trailing) },
-                metadata: &[], extents: &[],
+                modality: InputModality::Text,
+                kind: InputPayloadKind::TokenIds,
+                payload: HostTensorView {
+                    shape: &self.shapes[1],
+                    values: HostTensorValues::U32(self.trailing),
+                },
+                metadata: &[],
+                extents: &[],
             },
         ]
     }
@@ -495,18 +529,18 @@ impl<'a> ImagePrompt<'a> {
 
 fn image_policy(choice: ToolChoice) -> ChatTemplateRequest {
     ChatTemplateRequest {
-            messages: vec![
-                serde_json::json!({"role":"user","content":"Read value 17. <|vision_start|><|image_pad|><|vision_end|>"}),
-            ],
-            tools: vec![
-                serde_json::json!({"type":"function","function":{"name":"reading",
+        messages: vec![
+            serde_json::json!({"role":"user","content":"Read value 17. <|vision_start|><|image_pad|><|vision_end|>"}),
+        ],
+        tools: vec![
+            serde_json::json!({"type":"function","function":{"name":"reading",
                 "parameters":{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",
                 "properties":{"value":{"enum":[17]}},"required":["value"],"additionalProperties":false}}}),
-            ],
-            tool_choice: choice,
-            add_generation_prompt: true,
-            ..Default::default()
-        }
+        ],
+        tool_choice: choice,
+        add_generation_prompt: true,
+        ..Default::default()
+    }
 }
 
 #[path = "media/distributed.rs"]

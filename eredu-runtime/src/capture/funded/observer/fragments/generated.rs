@@ -1,5 +1,5 @@
 //! Per-hook physical factory, per-selection full logical creation quota.
-use super::super::generated::{generate_once, Failure, GeneratedState, Retention};
+use super::super::generated::{Failure, GeneratedState, Retention, generate_once};
 use super::*;
 use eredu_nn::RetainedGeneratedTensorFactory;
 

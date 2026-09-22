@@ -6,6 +6,9 @@ type NativeFailure = Arc<OnceLock<DiskReadFinishFailure>>;
 #[path = "operation/promotion.rs"]
 mod promotion;
 pub(crate) use promotion::ReadCacheHostSource;
+#[path = "operation/ordinary_promotion.rs"]
+mod ordinary_promotion;
+pub(crate) use ordinary_promotion::{OrdinaryDiskReadSource, OrdinaryReadCacheHostSource};
 
 pub(super) struct CompletionSlots {
     finished: Finished,
@@ -27,9 +30,11 @@ impl CompletionSlots {
                     .ok_or_else(|| fail(CacheSourceError::Overflow))?,
             )
             .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
+        let finished = Mutex::new(None);
+        drop(finished.lock().expect("new unshared finished-read mutex"));
         Ok(Self {
             finished: context
-                .metadata_arc(Mutex::new(None))
+                .metadata_arc(finished)
                 .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?,
             native_failure: context
                 .metadata_arc(OnceLock::new())
@@ -44,7 +49,7 @@ pub(crate) struct DiskReadOperation {
     submission: Option<RuntimeDiskSubmission>,
     ticket: Option<DiskTicket>,
     output: PreparedDiskReadOutput,
-    source: LiveCacheBlockSource,
+    source: CacheFileSource,
     location: DiskLocation,
     manager: CacheResidencyManager,
     worker: Arc<DiskWorker>,
@@ -57,6 +62,7 @@ pub(crate) struct DiskReadOperation {
     armed: bool,
     committed: bool,
     promotion_attempted: bool,
+    staging_transferred: bool,
     funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +165,7 @@ pub(in super::super) fn prepare_operation(
         armed: false,
         committed: false,
         promotion_attempted: false,
+        staging_transferred: false,
         funding,
     };
     operation.task = Some(
@@ -210,7 +217,7 @@ impl DiskReadOperation {
             || record.bytes != self.logical_bytes
             || record
                 .disk()
-                .and_then(|location| location.live_source.as_ref())
+                .and_then(|location| location.file_source())
                 .is_none_or(|source| !source.same_source(&self.source))
         {
             return Err(fail());
@@ -317,7 +324,8 @@ impl DiskReadOperation {
             .as_ref()
             .expect("submitted task")
             .inner
-            .wait_for_task_resources().map_err(Cause::Worker)?;
+            .wait_for_task_resources()
+            .map_err(Cause::Worker)?;
         // Return to the actual creator for freeze/registration before borrowing
         // the manager. Both success and failed prefixes enter their paid owner.
         let completed = match self.output.finish() {
@@ -358,7 +366,9 @@ impl DiskReadOperation {
             .expect("same locked pending source");
         if let Err(cause) = reporting::update_report_totals_prepared_replacement(
             &mut state,
-            &mut occupancy,
+            occupancy
+                .as_mut()
+                .ok_or(Cause::Source(CacheSourceError::Identity))?,
             &self.manager.inner.pool_membership,
         ) {
             let mut original =
@@ -388,11 +398,11 @@ impl DiskReadOperation {
         Ok(())
     }
     pub(crate) fn completed_source_pin_count(&self) -> usize {
-        usize::from(self.committed)
+        usize::from(self.committed && !self.staging_transferred)
     }
-    fn control_bytes() -> Option<usize> {
+    pub(super) fn control_bytes() -> Option<usize> {
         type StateLoan<'a> = MutexGuard<'a, CacheManagerState>;
-        type PoolLoan<'a> = MutexGuard<'a, CachePoolReservation>;
+        type PoolLoan<'a> = MutexGuard<'a, Option<CachePoolReservation>>;
         let frames = [
             reporting::report_query_control_bytes()?,
             RuntimeCacheIoTicket::<DiskResult>::task_retirement_control_bytes()?,
@@ -408,6 +418,7 @@ impl DiskReadOperation {
             size_of::<Finished>(),
             size_of::<NativeFailure>(),
             WorkspaceContext::metadata_arc_bytes::<Mutex<Option<CompletedDiskRead>>>()?,
+            initialized_mutex_control_bytes::<Option<CompletedDiskRead>>()?,
             WorkspaceContext::metadata_arc_bytes::<OnceLock<DiskReadFinishFailure>>()?,
             size_of::<PreparedCacheIoTask<DiskTask, DiskResult>>(),
             size_of::<RuntimeDiskSubmission>(),

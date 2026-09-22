@@ -6,8 +6,8 @@ use crate::backend::array_copy::{
 };
 use eredu_core::{capture::*, checkpoint::TensorDtype};
 use eredu_nn::{
-    Tensor,
     workspace::{WorkspaceContext, WorkspaceTensor},
+    Tensor,
 };
 use eredu_runtime::capture::{
     CaptureObservationStep, FundedSpeculativeCaptureInvocation, ScheduledCaptureBackend,
@@ -34,7 +34,7 @@ fn cold(
 pub(crate) struct CaptureSource<'a> {
     source: &'a SharedCapturePlan,
     proof: Proof<'a>,
-    pool: &'a eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &'a eredu_runtime::working_memory::MemoryLedger,
     domain: Option<CaptureTokenDomain<'a>>,
     interventions: Option<&'a eredu_runtime::working_memory::OriginalInterventionSource>,
 }
@@ -52,7 +52,7 @@ impl<'a> CaptureSource<'a> {
         source: &'a SharedCapturePlan,
         witness: &'a RegisteredInferenceSourceWitness,
         sources: &OriginalSpeculativeNumericalSources,
-        pool: &'a eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &'a eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Self, Error> {
         sources
             .metadata_funding()
@@ -71,7 +71,7 @@ impl<'a> CaptureSource<'a> {
     pub(crate) fn original(
         source: &'a eredu_runtime::working_memory::OriginalCaptureSource,
         sources: &OriginalSpeculativeNumericalSources,
-        pool: &'a eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &'a eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Self, Error> {
         sources
             .metadata_funding()
@@ -113,7 +113,10 @@ impl<'a> CaptureSource<'a> {
     pub(super) fn domain(self) -> Option<CaptureTokenDomain<'a>> {
         self.domain
     }
-    pub(super) fn validate(self, sources: &OriginalSpeculativeNumericalSources) -> Result<(), Error> {
+    pub(super) fn validate(
+        self,
+        sources: &OriginalSpeculativeNumericalSources,
+    ) -> Result<(), Error> {
         let controls = match self.proof {
             Proof::Registered(_) => {
                 RegisteredInferenceSourceWitness::capture_validation_control_bytes()
@@ -122,9 +125,7 @@ impl<'a> CaptureSource<'a> {
                 eredu_runtime::working_memory::OriginalCaptureSource::validation_control_bytes()
             }
         }
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         sources
             .metadata_funding()
             .reserve_metadata(controls)
@@ -326,7 +327,7 @@ pub(super) struct Plan {
     // Actual immutable source owners survive the entire native recovery cut.
     source: SharedCapturePlan,
     proof: OwnedProof,
-    pool: eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: eredu_runtime::working_memory::MemoryLedger,
     _trace_roots: Vec<WorkspaceTensor>,
     edits: Option<Edits>,
     pub(super) effective: Option<WorkspaceTensor>,
@@ -367,7 +368,7 @@ impl Plan {
         };
         // CPU edits and their evidence use the same source-qualified trace and
         // typed recipe loan. Every action still needs a complete CPU plan.
-        let mut cpu_readouts=true;
+        let mut cpu_readouts = true;
         let mut roots = 1usize; // Normalized row exists even when logical quotas skip all hooks.
         let mut completions = 0usize;
         let mut controls = 0usize;
@@ -377,7 +378,14 @@ impl Plan {
             }
             let worker =
                 Selection::prepare(source.source.admission(), index, host.prediction(), context)?;
-            cpu_readouts &= matches!(&worker,Selection::Raw(_) | Selection::Summary(_) | Selection::Histogram(_) | Selection::Scores(_) | Selection::Candidates(_));
+            cpu_readouts &= matches!(
+                &worker,
+                Selection::Raw(_)
+                    | Selection::Summary(_)
+                    | Selection::Histogram(_)
+                    | Selection::Scores(_)
+                    | Selection::Candidates(_)
+            );
             let (worker_roots, worker_completions, worker_controls) = worker
                 .population()
                 .ok_or_else(|| cold(context, CaptureTensorNativeError::GeometryOverflow))?;
@@ -472,7 +480,10 @@ impl Plan {
             controls,
         })
     }
-    pub(super) fn validate(&self, sources: &OriginalSpeculativeNumericalSources) -> Result<(), Error> {
+    pub(super) fn validate(
+        &self,
+        sources: &OriginalSpeculativeNumericalSources,
+    ) -> Result<(), Error> {
         let controls = match &self.proof {
             OwnedProof::Registered(_) => {
                 RegisteredInferenceSourceWitness::capture_validation_control_bytes()
@@ -481,9 +492,7 @@ impl Plan {
                 eredu_runtime::working_memory::OriginalCaptureSource::validation_control_bytes()
             }
         }
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         sources
             .metadata_funding()
             .reserve_metadata(controls)
@@ -552,7 +561,7 @@ impl Roots {
 }
 pub(super) fn observe(
     plan: &Plan,
-    recipe:&crate::backend::nn::workspace::SpeculativeNumericalRecipe,
+    recipe: &crate::backend::nn::workspace::SpeculativeNumericalRecipe,
     invocation: &mut FundedSpeculativeCaptureInvocation,
     source: &Array,
     stream: &Stream,
@@ -566,7 +575,8 @@ pub(super) fn observe(
             CaptureTensorNativeError::ClaimMismatch,
         ));
     }
-    let cpu=recipe.cpu_capture_loan(stream,observer)
+    let cpu = recipe
+        .cpu_capture_loan(stream, observer)
         .map_err(eredu_runtime::capture::FundedCaptureError::Backend)?;
     let row = source
         .reshape(&[1, 1, -1], stream)
@@ -630,7 +640,7 @@ struct Backend<'a> {
     observer: &'a OriginalScopeObserver,
     domain: Option<CaptureTokenDomain<'a>>,
     edits: Option<&'a Edits>,
-    cpu:Option<crate::backend::nn::workspace::CpuCaptureLoan<'a>>,
+    cpu: Option<crate::backend::nn::workspace::CpuCaptureLoan<'a>>,
 }
 impl ScheduledCaptureBackend for Backend<'_> {
     type Tensor = Array;
@@ -752,9 +762,20 @@ impl ScheduledCaptureBackend for Backend<'_> {
     > {
         match self.cpu.as_ref() {
             Some(loan) => crate::backend::array_copy::execute_speculative_histogram_cpu(
-                source, claim, self.roots, self.custody, loan),
+                source,
+                claim,
+                self.roots,
+                self.custody,
+                loan,
+            ),
             None => crate::backend::array_copy::execute_speculative_histogram(
-                source, claim, self.stream, self.roots, self.custody, self.observer),
+                source,
+                claim,
+                self.stream,
+                self.roots,
+                self.custody,
+                self.observer,
+            ),
         }
         .map_err(eredu_runtime::capture::FundedCaptureError::Backend)
     }
@@ -785,9 +806,20 @@ impl ScheduledCaptureBackend for Backend<'_> {
     > {
         match self.cpu.as_ref() {
             Some(loan) => crate::backend::array_copy::execute_speculative_summary_cpu(
-                source, claim, self.roots, self.custody, loan),
+                source,
+                claim,
+                self.roots,
+                self.custody,
+                loan,
+            ),
             None => crate::backend::array_copy::execute_speculative_summary(
-                source, claim, self.stream, self.roots, self.custody, self.observer),
+                source,
+                claim,
+                self.stream,
+                self.roots,
+                self.custody,
+                self.observer,
+            ),
         }
         .map_err(eredu_runtime::capture::FundedCaptureError::Backend)
     }
@@ -818,9 +850,22 @@ impl ScheduledCaptureBackend for Backend<'_> {
     > {
         match self.cpu.as_ref() {
             Some(loan) => crate::backend::array_copy::execute_speculative_candidates_cpu(
-                source, claim, self.roots, self.custody, loan, self.domain),
+                source,
+                claim,
+                self.roots,
+                self.custody,
+                loan,
+                self.domain,
+            ),
             None => crate::backend::array_copy::execute_speculative_candidates(
-                source, claim, self.stream, self.roots, self.custody, self.observer, self.domain),
+                source,
+                claim,
+                self.stream,
+                self.roots,
+                self.custody,
+                self.observer,
+                self.domain,
+            ),
         }
         .map_err(eredu_runtime::capture::FundedCaptureError::Backend)
     }
@@ -851,9 +896,22 @@ impl ScheduledCaptureBackend for Backend<'_> {
     > {
         match self.cpu.as_ref() {
             Some(loan) => crate::backend::array_copy::execute_speculative_token_scores_cpu(
-                source, claim, self.roots, self.custody, loan, self.domain),
+                source,
+                claim,
+                self.roots,
+                self.custody,
+                loan,
+                self.domain,
+            ),
             None => crate::backend::array_copy::execute_speculative_token_scores(
-                source, claim, self.stream, self.roots, self.custody, self.observer, self.domain),
+                source,
+                claim,
+                self.stream,
+                self.roots,
+                self.custody,
+                self.observer,
+                self.domain,
+            ),
         }
         .map_err(eredu_runtime::capture::FundedCaptureError::Backend)
     }
@@ -862,9 +920,14 @@ impl ScheduledCaptureBackend for Backend<'_> {
         source: &Array,
         claim: CaptureTensorClaim<'_, '_>,
     ) -> Result<ClaimedCaptureTensor, Self::Error> {
-        if let Some(loan)=&self.cpu {
+        if let Some(loan) = &self.cpu {
             return crate::backend::array_copy::execute_speculative_capture_cpu(
-                source,claim,self.roots,self.custody,loan);
+                source,
+                claim,
+                self.roots,
+                self.custody,
+                loan,
+            );
         }
         crate::backend::array_copy::execute_speculative_capture(
             source,

@@ -1,41 +1,48 @@
 //! Fixed original reset account; no generic scope, refill, or public guard API.
 use super::*;
 use crate::working_memory::storage::reset_layout::ResetLayoutPin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use eredu_core::{DomainMemoryRequirements, MemoryDomainId, MemoryLimit, MemoryLimits};
 
 #[derive(Debug)]
 pub(in crate::working_memory) struct Entry {
     id: u64,
-    capacity: u64,
+    capacity: Arc<MemoryLimits>,
     active: bool,
     sources: Vec<(crate::HostMetadataKey, u64)>,
     next: Option<Box<Entry>>,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(in crate::working_memory) struct Pending {
     id: u64,
-    capacity: u64,
+    capacity: Arc<MemoryLimits>,
 }
-pub(in crate::working_memory) fn capacity(usage: &super::super::Usage) -> u64 {
-    let mut limit = usage
-        .reset_pending
-        .map_or(u64::MAX, |p| p.capacity)
-        .min(usage.reset_retiring_capacity);
+pub(in crate::working_memory) fn capacity(
+    usage: &super::super::Usage,
+    domain: MemoryDomainId,
+) -> Result<MemoryLimit, WorkingMemoryError> {
+    let mut limit = MemoryLimit::Unlimited;
+    if let Some(pending) = &usage.reset_pending {
+        limit = limit.minimum(pending.capacity.get(domain)?);
+    }
+    // Domain identities have already been validated against the immutable ledger.
+    let slot = usage.domain_slot(domain)?;
+    limit = limit.minimum(usage.domains[slot].reset_retiring_limit);
     let mut entry = usage.reset_entries.as_deref();
     while let Some(value) = entry {
-        limit = limit.min(value.capacity);
+        limit = limit.minimum(value.capacity.get(domain)?);
         entry = value.next.as_deref();
     }
-    limit
+    Ok(limit)
 }
 #[derive(Debug)]
 struct Charge {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     id: u64,
-    bytes: u64,
+    requirements: Option<DomainMemoryRequirements>,
 }
 struct Retirement {
     entry: Option<Box<Entry>>,
+    capacity: Arc<MemoryLimits>,
     active: bool,
 }
 impl Drop for Charge {
@@ -44,16 +51,16 @@ impl Drop for Charge {
             let Ok(mut usage) = self.pool.0.usage.lock() else {
                 return;
             };
-            let pending = usage.reset_pending.filter(|p| p.id == self.id);
+            let pending = usage.reset_pending.as_ref().filter(|p| p.id == self.id);
             let mut lookup = usage.reset_entries.as_deref();
             let matched = loop {
                 match lookup {
-                    Some(entry) if entry.id == self.id => break Some(entry.capacity),
+                    Some(entry) if entry.id == self.id => break Some(&entry.capacity),
                     Some(entry) => lookup = entry.next.as_deref(),
                     None => break None,
                 }
             };
-            let Some(capacity) = pending.map(|p| p.capacity).or(matched) else {
+            let Some(capacity) = pending.map(|p| &p.capacity).or(matched) else {
                 return;
             };
             let Some(count) = usage.reset_retiring_count.checked_add(1) else {
@@ -62,12 +69,19 @@ impl Drop for Charge {
             // Keep the ceiling while its paid entry allocation is destroyed.
             // Concurrent retirement conservatively retains the minimum until
             // the final retiring owner atomically refunds and clears it.
+            let capacity = Arc::clone(capacity);
+            let was_pending = pending.is_some();
             usage.reset_retiring_count = count;
-            usage.reset_retiring_capacity = usage.reset_retiring_capacity.min(capacity);
-            if pending.is_some() {
+            for (slot, (domain, _)) in self.pool.topology().domains().enumerate() {
+                usage.domains[slot].reset_retiring_limit = usage.domains[slot]
+                    .reset_retiring_limit
+                    .minimum(capacity.get(domain).expect("validated reset limits"));
+            }
+            if was_pending {
                 usage.reset_pending = None;
                 Retirement {
                     entry: None,
+                    capacity,
                     active: true,
                 }
             } else {
@@ -79,6 +93,7 @@ impl Drop for Charge {
                         let active = entry.active;
                         break Retirement {
                             entry: Some(entry),
+                            capacity,
                             active,
                         };
                     }
@@ -86,20 +101,52 @@ impl Drop for Charge {
                 }
             }
         };
-        let Retirement { entry, active } = retired;
+        let Retirement {
+            entry,
+            capacity,
+            active,
+        } = retired;
         // Entry contains only scalar/payload-free keys. Its Box allocation
         // retires outside Usage, while every byte and ceiling remain live.
         drop(entry);
+        drop(capacity);
         #[cfg(test)]
         super::tests::after_entry_retirement(&self.pool);
+        let requirements = self.requirements.take().expect("live reset requirements");
+        let host = self.pool.topology().host_domain();
+        let host_charge = requirements.get(host).expect("same reset topology");
         if let Ok(mut usage) = self.pool.0.usage.lock() {
-            usage.reserved -= self.bytes;
+            for (slot, (domain_id, charge)) in requirements.iter().enumerate() {
+                if domain_id == host {
+                    continue;
+                }
+                let domain = &mut usage.domains[slot];
+                domain.reserved -= charge.total().expect("accepted reset requirement");
+                domain.placement_allowances -= charge.placement_allowance_bytes;
+                domain.estimates -= charge.estimated_overhead_bytes;
+                domain.headroom -= charge.headroom_bytes;
+            }
+        } else {
+            return;
+        }
+        // The dense account vector is host storage. Keep the entire host charge
+        // and retiring ceilings until that final allocation is gone, outside Usage.
+        drop(requirements);
+        if let Ok(mut usage) = self.pool.0.usage.lock() {
+            let slot = usage.domain_slot(host).expect("same reset topology");
+            let domain = &mut usage.domains[slot];
+            domain.reserved -= host_charge.total().expect("accepted reset requirement");
+            domain.placement_allowances -= host_charge.placement_allowance_bytes;
+            domain.estimates -= host_charge.estimated_overhead_bytes;
+            domain.headroom -= host_charge.headroom_bytes;
             if active {
                 usage.reservations -= 1;
             }
             usage.reset_retiring_count -= 1;
             if usage.reset_retiring_count == 0 {
-                usage.reset_retiring_capacity = u64::MAX;
+                for domain in &mut usage.domains {
+                    domain.reset_retiring_limit = MemoryLimit::Unlimited;
+                }
             }
         }
     }
@@ -144,20 +191,31 @@ impl ResetCustody {
         )
     }
     pub(super) fn bytes(&self) -> u64 {
-        self.hold().charge.bytes
+        self.hold()
+            .charge
+            .requirements
+            .as_ref()
+            .expect("live reset requirements")
+            .get(self.pool().topology().host_domain())
+            .expect("same topology")
+            .total()
+            .expect("accepted charge")
     }
-    pub(crate) fn same_domain(&self, domain: &eredu_core::SharedStorageDomain) -> bool {
-        self.hold().charge.pool.shared_storage_domain() == domain
+    pub(crate) fn same_accounting_owner(
+        &self,
+        domain: &eredu_core::SharedStorageAccountingId,
+    ) -> bool {
+        self.hold().charge.pool.shared_storage_accounting_id() == domain
     }
-    pub(super) fn pool(&self) -> &WorkingMemoryPool {
+    pub(super) fn pool(&self) -> &MemoryLedger {
         &self.hold().charge.pool
     }
     pub(super) fn validate_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         metadata: &crate::HostSlotMetadata,
     ) -> Result<(), WorkingMemoryError> {
-        if !self.pool().same_domain(pool) {
+        if !self.pool().same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let usage = pool
@@ -169,11 +227,11 @@ impl ResetCustody {
     }
     pub(super) fn validate_source_in(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         metadata: &crate::HostSlotMetadata,
         usage: &super::super::Usage,
     ) -> Result<(), WorkingMemoryError> {
-        if !self.pool().same_domain(pool) || !metadata.original_source_is_live() {
+        if !self.pool().same_ledger(pool) || !metadata.original_source_is_live() {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let mut entry = usage.reset_entries.as_deref();
@@ -222,6 +280,21 @@ impl ResetCustody {
 }
 
 // Concrete source and pin representations, including their return/drop overlap.
+/// Dense comparison vectors, resolution scratch and the retained shared limits.
+/// The host-only reset carries no placement-estimate or diagnostic string rows.
+pub(super) fn domain_control_bytes(topology: &eredu_core::MemoryTopology) -> Option<u64> {
+    let per_domain = size_of::<eredu_core::DomainMemoryCharge>()
+        .checked_mul(3)?
+        .checked_add(size_of::<Option<MemoryLimit>>())?
+        .checked_add(size_of::<MemoryLimit>())?;
+    u64::try_from(
+        per_domain
+            .checked_mul(topology.len())?
+            .checked_add(arc_bytes::<MemoryLimits>()?)?,
+    )
+    .ok()
+}
+
 pub(super) fn control_bytes<K: HostSlotStorageKey>(grouped: bool) -> Option<usize> {
     [
         arc_bytes::<Hold>()?,
@@ -230,6 +303,7 @@ pub(super) fn control_bytes<K: HostSlotStorageKey>(grouped: bool) -> Option<usiz
         size_of::<Hold>(),
         size_of::<Option<Hold>>(),
         size_of::<Charge>(),
+        size_of::<eredu_core::DomainMemoryCharge>(),
         size_of::<Entry>(),
         size_of::<Box<Entry>>(),
         size_of::<Option<Box<Entry>>>(),
@@ -305,18 +379,17 @@ impl std::fmt::Debug for AdmissionFailure {
 }
 
 pub(super) fn admit<K: HostSlotStorageKey>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &TableSource<'_, K>,
     source_table: (&crate::HostMetadataKey, u64),
     source_layout: (&crate::HostMetadataKey, u64),
-    acceptance: eredu_core::SessionResetAcceptance,
+    requirements: DomainMemoryRequirements,
+    limits: MemoryLimits,
 ) -> Result<Admission, AdmissionFailure> {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map_err(|_| WorkingMemoryError::Overflow)?;
-    let bytes = acceptance.required_bytes();
-    let capacity = acceptance.limits().capacity_bytes;
+    requirements
+        .validate(pool.topology())
+        .map_err(WorkingMemoryError::from)?;
+    let capacity = Arc::new(limits);
     let (mut source_owner, mut layout_pin) = match source {
         TableSource::Ordinary { registration, .. } => (
             SourceOwner::Ordinary((*registration).clone()),
@@ -383,28 +456,14 @@ pub(super) fn admit<K: HostSlotStorageKey>(
         if usage.unquoted_owners != 0 {
             return Err(WorkingMemoryError::UnknownBound.into());
         }
-        let available = pool.0.available(&usage, Some(capacity))?;
-        if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
-                required_bytes: bytes,
-                available_bytes: available,
-            }
-            .into());
-        }
-        let reserved = usage
-            .reserved
-            .checked_add(bytes)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        let reservations = usage
-            .reservations
-            .checked_add(1)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        let peak = pool
-            .0
-            .existing
-            .checked_add(usage.registered)
-            .and_then(|n| n.checked_add(reserved))
-            .ok_or(WorkingMemoryError::Overflow)?;
+        let id = usage.next_reset;
+        let next_id = id.checked_add(1).ok_or(WorkingMemoryError::Overflow)?;
+        let commit = super::super::PreparedAccountCommit::prepare_reset(
+            pool,
+            &usage,
+            &requirements,
+            &capacity,
+        )?;
         // Acquire exactly one existing layout owner after all budget checks.
         // No fallible work follows these scalar updates before Charge exists.
         match source {
@@ -427,17 +486,19 @@ pub(super) fn admit<K: HostSlotStorageKey>(
                 )?;
             }
         }
-        usage.reserved = reserved;
-        usage.reservations = reservations;
-        usage.peak = usage.peak.max(peak);
-        usage.reset_pending = Some(Pending { id, capacity });
-        // Infallible stack owner installed before the loan ends or constructors run.
+        commit.commit(pool, &mut usage);
+        usage.next_reset = next_id;
+        usage.reset_pending = Some(Pending {
+            id,
+            capacity: Arc::clone(&capacity),
+        });
         Charge {
             pool: pool.clone(),
             id,
-            bytes,
+            requirements: Some(requirements),
         }
     };
+    let id = charge.id;
     let mut entry = Some(Box::new(Entry {
         id,
         capacity,
@@ -455,7 +516,7 @@ pub(super) fn admit<K: HostSlotStorageKey>(
     let installed = match pool.0.usage.lock() {
         Err(_) => Err(WorkingMemoryError::Poisoned),
         Ok(mut usage) => {
-            if !usage.reset_pending.is_some_and(|p| p.id == id) {
+            if !usage.reset_pending.as_ref().is_some_and(|p| p.id == id) {
                 Err(WorkingMemoryError::IdentityMismatch)
             } else {
                 let mut node = entry.take().expect("unpublished fixed entry");
@@ -487,7 +548,7 @@ pub(super) enum ChildSourceCustody {
     Registered(#[allow(dead_code)] ResetLayoutPin),
 }
 pub(super) fn pin_child<K: HostSlotStorageKey>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     metadata: &crate::HostSlotMetadata,
 ) -> Result<ChildSourceCustody, WorkingMemoryError> {
     if let Some(custody) = metadata.original_reset_custody() {

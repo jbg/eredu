@@ -7,10 +7,10 @@ fn role_facts() -> TextPredictionScopeFacts {
 
 #[test]
 fn prediction_bank_is_original_exact_admission_and_cannot_spend_protected_headroom() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
-    let original = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let original = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let plain = prepared(&source, &original);
     let controls = plain.clone().with_prediction_scopes(role_facts()).unwrap();
     assert!(!controls.same_binding(&plain));
@@ -21,18 +21,16 @@ fn prediction_bank_is_original_exact_admission_and_cannot_spend_protected_headro
     ));
     let q = controls.facts().total_bytes().unwrap().unwrap();
     assert!(q > 51 + geometry().max_output_tokens * (101 + 103 + 107 + 109 + 113));
-    let before = original.incremental_bytes();
+    let before = original.incremental_bytes().unwrap();
     let quote = original
         .with_span_workspace_and_text_controls(controls)
         .unwrap();
     let p = quote.span_workspace().retention_peak_bytes().unwrap();
-    assert_eq!(quote.incremental_bytes(), before + p + q);
-    let exact = 64 + quote.incremental_bytes();
+    assert_eq!(quote.incremental_bytes().unwrap(), before + p + q);
+    let exact = exact_capacity(&pool, &quote);
     assert!(matches!(sealed_plan(&pool, &quote, exact - 1),
-        Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded {
-            required_bytes, available_bytes
-        })) if required_bytes == quote.incremental_bytes() && available_bytes + 1 == required_bytes));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+        Err(PrefillPlanningError::Reservation(capacity_error)) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes == quote_reservation_bytes(&quote) && available_bytes + 1 == required_bytes)));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     drop(quote);
     let (r, run) = r.into_funding().unwrap();
@@ -45,27 +43,28 @@ fn prediction_bank_is_original_exact_admission_and_cannot_spend_protected_headro
         Err(WorkingMemoryError::AlreadyStarted)
     ));
     let scope = run.scope().unwrap();
-    let native = r.bytes() - held;
+    let native = reservation_payload_bytes(&r) - held;
     assert!(
-        matches!(scope.adopt_storage_individually([(33u32, native + 1)]),
-        Err(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
-        if required_bytes == native + 1 && available_bytes == native)
+        matches!(scope.adopt_host_storage_individually([(33u32, native + 1)]),
+        Err(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes > available_bytes && available_bytes <= native))
     );
-    let payload = scope.adopt_storage_individually([(33u32, native)]).unwrap();
+    let payload = scope
+        .adopt_host_storage_individually([(33u32, native - publication_controls())])
+        .unwrap();
     drop(payload);
     scope.certify().unwrap();
     drop((span, r, run, root, plain, source));
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(bank);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn unknown_prediction_role_and_overflow_reject_without_a_partial_original_seal() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
-    let q = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let q = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let plain = prepared(&source, &q);
     for absent in 0..5 {
         let mut values = [Some(1); 5];
@@ -98,12 +97,12 @@ fn unknown_prediction_role_and_overflow_reject_without_a_partial_original_seal()
             .unwrap(),
         None
     );
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     let q = q.with_span_workspace_and_text_controls(plain).unwrap();
     let (r, run, q) = accept(&pool, q);
     let (mut span, _) = q.into_funded_text_span_workspace(&run, &r).unwrap();
     assert!(span.take_prediction_scopes().unwrap().is_none());
     assert!(span.take_prediction_scopes().unwrap().is_none());
     drop((span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

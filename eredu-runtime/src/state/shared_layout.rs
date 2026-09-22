@@ -3,8 +3,8 @@
 use super::{StateLayout, StateSegmentId, StateSegmentSpec};
 use crate::host_metadata::{HostMetadataIdentity, MetadataCustody};
 use eredu_core::{
-    SharedStorageAttachmentError, SharedStorageDomain,
     cache::{LayerCachePolicy, StateComponentPolicy, StateTensorDimension, StateTensorPolicy},
+    SharedStorageAccountingId, SharedStorageAttachmentError,
 };
 use std::{fmt, mem::size_of, sync::Arc};
 
@@ -68,7 +68,7 @@ impl SharedStateLayout {
     /// Attaches one accounting handle per domain, including to earlier aliases.
     ///
     /// An existing domain returns false without calling the provider. Metadata
-    /// capacity is reserved before acquisition; rejection preserves previously
+    /// nodes are allocated after provider acquisition; rejection preserves previously
     /// attached handles. The provider runs under custody and may perform only
     /// closed accounting operations: no owner reentry, other source locks,
     /// native work or user callbacks. Its handle must not retain this payload,
@@ -76,14 +76,24 @@ impl SharedStateLayout {
     /// Provider handles retire outside the custody lock, after the layout.
     pub(crate) fn original_attachment_ready(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         self.0.custody.original_attachment_ready(domain)
     }
 
+    pub(crate) fn try_attach_owned_prepared<T: eredu_core::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            eredu_core::SharedStorageAttachmentLayout,
+        ) -> Result<eredu_core::SharedStorageOwner<T>, E>,
+    ) -> Result<bool, SharedStorageAttachmentError<E>> {
+        self.0.custody.try_attach_owned_prepared(owner, acquire)
+    }
+
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.0.custody.try_attach(domain, acquire)

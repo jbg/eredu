@@ -9,6 +9,23 @@ struct RoutedMechanism {
     omit_grouped: bool,
 }
 impl WorkspaceMechanisms for RoutedMechanism {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+
     fn host_workspace_bound(
         &self,
         _: &WorkspaceOperation,

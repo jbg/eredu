@@ -3,13 +3,13 @@ use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceHostBound, WorkspaceLayout, WorkspaceMechanisms, WorkspaceOperation,
     WorkspaceOperationBound, WorkspaceOutputStorage,
 };
-use safemlx::{Device, DeviceType, ops::indexing::TryIndexOp};
+use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType};
 use std::{
     cell::Cell,
     error::Error as _,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -348,12 +348,10 @@ fn late_failure_preserves_the_original_cause_and_both_isolated_recovery_roots() 
         assert_eq!(roots.borrow().len(), 2);
         assert_eq!(roots.borrow().capacity(), capacity);
         assert_eq!(roots.borrow().as_ptr(), pointer);
-        assert!(
-            roots
-                .borrow()
-                .iter()
-                .all(|root| root.shape() == original.shape() && root.dtype() == original.dtype())
-        );
+        assert!(roots
+            .borrow()
+            .iter()
+            .all(|root| root.shape() == original.shape() && root.dtype() == original.dtype()));
         for root in roots.borrow().iter() {
             assert_eq!(read_scalar(root), 723);
         }
@@ -552,9 +550,8 @@ fn cpu_pending_trace_prices_integer_scalar_and_complete_matrix_worker() {
         MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms, NativeAllocationFacts,
     };
     let native = NativeAllocationFacts::current_host().unwrap();
-    let selected = MlxCpuMatmulMechanism::select(
-        eredu_nn::CpuMatmulImplementation::Float32Tiles,
-    ).unwrap();
+    let selected =
+        MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
     let cpu = MlxCpuWorkspaceMechanisms::new(native, selected);
     let stream = stream();
     let cases = [
@@ -570,38 +567,78 @@ fn cpu_pending_trace_prices_integer_scalar_and_complete_matrix_worker() {
         let signed = source.dtype() == Dtype::Int32;
         let plan = if matrix {
             PreparedPendingTokenInput::new_prefill_fixed(
-                &source, std::num::NonZeroU64::new(5).unwrap(),
+                &source,
+                std::num::NonZeroU64::new(5).unwrap(),
             )
         } else {
             PreparedPendingTokenInput::new_fixed(&source)
-        }.unwrap();
+        }
+        .unwrap();
         let guard = ColdGuard::new();
         let context = WorkspaceContext::new(cpu);
         let mut projection = ExistingArrayProjection::new(&context);
         let input = projection.project(&source).unwrap();
-        context.begin_state_span(std::slice::from_ref(&input)).unwrap();
+        context
+            .begin_state_span(std::slice::from_ref(&input))
+            .unwrap();
         let output = plan.trace(&mut projection).unwrap();
         assert_eq!(output.shape(), [1, if matrix { 5 } else { 1 }]);
         assert_eq!(output.layout().dtype(), WorkspaceDtype::Uint32);
         assert!(output.layout().representation().is_none());
         let report = context.report(&[input, output]).unwrap();
-        assert!(report.unpriced_operations.is_empty(), "{:?}", report.unpriced_operations);
+        assert!(
+            report.unpriced_operations.is_empty(),
+            "{:?}",
+            report.unpriced_operations
+        );
         assert!(report.unpriced_host_operations.is_empty());
         assert!(report.tensor_buffers.total_bytes.is_some());
         assert_eq!(report.host_workspace_bytes, Some(0));
-        assert_eq!(report.operations.iter().filter(|operation|
-            matches!(operation.kind, WorkspaceOperationKind::Elementwise("cast_u32"))).count(),
-            usize::from(signed));
+        assert_eq!(
+            report
+                .operations
+                .iter()
+                .filter(|operation| matches!(
+                    operation.kind,
+                    WorkspaceOperationKind::Elementwise("cast_u32")
+                ))
+                .count(),
+            usize::from(signed)
+        );
         assert!(report.state.as_ref().unwrap().retained_bytes.is_some());
         guard.assert_cold();
         drop(guard);
     }
     // Integer shapes alone cannot prove that a nontrivial reshape aliases.
-    // A cast also requires the exact packed single text matrix and signed input.
+    // The shared reshape worker prices its possible General-copy destination.
+    let reshape = WorkspaceOperation {
+        kind: WorkspaceOperationKind::View("reshape"),
+        inputs: vec![WorkspaceLayout::new(&[2, 3], WorkspaceDtype::Int32).unwrap()],
+        outputs: vec![WorkspaceLayout::new(&[6], WorkspaceDtype::Int32).unwrap()],
+    };
+    let bound = cpu.operation_bound(&reshape).unwrap().unwrap();
+    assert!(
+        matches!(&bound.outputs[..], [eredu_nn::workspace::WorkspaceOutputStorage::AllocateOrAliasInputs { bytes, inputs }]
+        if *bytes >= 24 && inputs == &[0])
+    );
+    assert!(cpu.host_workspace_bound(&reshape).unwrap().is_some());
+    assert!(cpu.output_representation(reshape.as_view(), 0).is_none());
+    // A cast still requires the exact packed single text matrix and signed input.
     for (kind, input_shape, output_shape, input_dtype, output_dtype) in [
-        (WorkspaceOperationKind::View("reshape"), &[2, 3][..], &[6][..], WorkspaceDtype::Int32, WorkspaceDtype::Int32),
-        (WorkspaceOperationKind::Elementwise("cast_u32"), &[2, 3][..], &[2, 3][..], WorkspaceDtype::Int32, WorkspaceDtype::Uint32),
-        (WorkspaceOperationKind::Elementwise("cast_u32"), &[1, 3][..], &[1, 3][..], WorkspaceDtype::Uint32, WorkspaceDtype::Uint32),
+        (
+            WorkspaceOperationKind::Elementwise("cast_u32"),
+            &[2, 3][..],
+            &[2, 3][..],
+            WorkspaceDtype::Int32,
+            WorkspaceDtype::Uint32,
+        ),
+        (
+            WorkspaceOperationKind::Elementwise("cast_u32"),
+            &[1, 3][..],
+            &[1, 3][..],
+            WorkspaceDtype::Uint32,
+            WorkspaceDtype::Uint32,
+        ),
     ] {
         let operation = WorkspaceOperation {
             kind,

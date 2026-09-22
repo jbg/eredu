@@ -27,37 +27,79 @@ fn check_saved_capture(after_commit: bool) {
 }
 
 pub(in super::super) fn check_saved_capture_loaded(
-    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>, root: Fixture,
-    after_commit: bool, path: &str, width: usize, partitioned: bool,
+    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    root: Fixture,
+    after_commit: bool,
+    path: &str,
+    width: usize,
+    partitioned: bool,
 ) -> serde_json::Value {
-    check_saved_capture_loaded_with_transform(model, root, after_commit, path, width, partitioned,
-        CaptureTransform::FullTensor, Some(&[8, 38, 26, 1]))
+    check_saved_capture_loaded_with_transform(
+        model,
+        root,
+        after_commit,
+        path,
+        width,
+        partitioned,
+        CaptureTransform::FullTensor,
+        Some(&[8, 38, 26, 1]),
+    )
 }
 
 pub(in super::super) fn check_saved_capture_loaded_with_transform(
-    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>, root: Fixture,
-    after_commit: bool, path: &str, width: usize, partitioned: bool,
-    transform: CaptureTransform, expected_tokens: Option<&[u32]>,
+    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    root: Fixture,
+    after_commit: bool,
+    path: &str,
+    width: usize,
+    partitioned: bool,
+    transform: CaptureTransform,
+    expected_tokens: Option<&[u32]>,
 ) -> serde_json::Value {
-    check_saved_capture_input(model, root, after_commit, path, width, partitioned,
-        transform, expected_tokens, None)
+    check_saved_capture_input(
+        model,
+        root,
+        after_commit,
+        path,
+        width,
+        partitioned,
+        transform,
+        expected_tokens,
+        None,
+    )
 }
 
 pub(in super::super) fn check_saved_prepared_capture_loaded(
-    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>, root: Fixture,
+    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    root: Fixture,
     input: eredu_runtime::input::OriginalModelInput<eredu_backend_mlx::native::MlxModelInput>,
     after_commit: bool,
 ) -> serde_json::Value {
-    check_saved_capture_input(model, root, after_commit,
-        eredu_core::MODEL_LOGITS_OBSERVATION_PATH, 64, false,
-        CaptureTransform::FullTensor, None, Some(input))
+    check_saved_capture_input(
+        model,
+        root,
+        after_commit,
+        eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+        64,
+        false,
+        CaptureTransform::FullTensor,
+        None,
+        Some(input),
+    )
 }
 
 fn check_saved_capture_input(
-    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>, root: Fixture,
-    after_commit: bool, path: &str, width: usize, partitioned: bool,
-    transform: CaptureTransform, expected_tokens: Option<&[u32]>,
-    input: Option<eredu_runtime::input::OriginalModelInput<eredu_backend_mlx::native::MlxModelInput>>,
+    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    root: Fixture,
+    after_commit: bool,
+    path: &str,
+    width: usize,
+    partitioned: bool,
+    transform: CaptureTransform,
+    expected_tokens: Option<&[u32]>,
+    input: Option<
+        eredu_runtime::input::OriginalModelInput<eredu_backend_mlx::native::MlxModelInput>,
+    >,
 ) -> serde_json::Value {
     let sparse = matches!(transform, CaptureTransform::RoutedUnits);
     let mut plan = CapturePlan::none();
@@ -90,38 +132,86 @@ fn check_saved_capture_input(
         plan.limits.cumulative.encoded_bytes = 4 << 20;
     }
     plan.limits.on_limit = CaptureLimitPolicy::Skip;
-    check_saved_capture_run(model, root, after_commit, 8 << 30, 1,
-        expected_tokens, input, None, |_| plan, |ids, text, original, _, branch| {
-            compare_single_saved_capture(after_commit, width, partitioned, sparse, original, branch);
+    check_saved_capture_run(
+        model,
+        root,
+        after_commit,
+        8 << 30,
+        1,
+        expected_tokens,
+        input,
+        None,
+        |_| plan,
+        |ids, text, original, _, branch| {
+            compare_single_saved_capture(
+                after_commit,
+                width,
+                partitioned,
+                sparse,
+                original,
+                branch,
+            );
             serde_json::json!({"ids":ids, "text":text})
-        })
+        },
+    )
 }
 
 /// The existing snapshot/restore/fork driver with a caller-selected capture plan.
 /// Capture-count credits cover actual transforms; receiver bytes remain separate.
 pub(in super::super) fn check_saved_capture_loaded_with_plan(
-    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>, root: Fixture,
-    after_commit: bool, capacity: u64, captures_per_step: u64,
+    model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    root: Fixture,
+    after_commit: bool,
+    capacity: u64,
+    captures_per_step: u64,
     make_plan: impl FnOnce(&eredu_core::capture::CaptureDiscovery) -> CapturePlan,
-    inspect_escaped: impl FnOnce(&[u32], &str, &[SharedCapturedStep],
-        &[SharedCapturedStep], &[SharedCapturedStep]) -> serde_json::Value,
+    inspect_escaped: impl FnOnce(
+        &[u32],
+        &str,
+        &[SharedCapturedStep],
+        &[SharedCapturedStep],
+        &[SharedCapturedStep],
+    ) -> serde_json::Value,
 ) -> serde_json::Value {
-    check_saved_capture_run(model, root, after_commit, capacity, captures_per_step,
-        None, None, None, make_plan, inspect_escaped)
+    check_saved_capture_run(
+        model,
+        root,
+        after_commit,
+        capacity,
+        captures_per_step,
+        None,
+        None,
+        None,
+        make_plan,
+        inspect_escaped,
+    )
 }
 
 fn check_saved_capture_run(
-    mut model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>, root: Fixture,
-    after_commit: bool, capacity: u64, captures_per_step: u64,
+    mut model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
+    root: Fixture,
+    after_commit: bool,
+    capacity: u64,
+    captures_per_step: u64,
     expected_tokens: Option<&[u32]>,
-    input: Option<eredu_runtime::input::OriginalModelInput<eredu_backend_mlx::native::MlxModelInput>>,
+    input: Option<
+        eredu_runtime::input::OriginalModelInput<eredu_backend_mlx::native::MlxModelInput>,
+    >,
     interventions: Option<eredu_core::intervention::SharedInterventionPlan>,
     make_plan: impl FnOnce(&eredu_core::capture::CaptureDiscovery) -> CapturePlan,
-    inspect_escaped: impl FnOnce(&[u32], &str, &[SharedCapturedStep],
-        &[SharedCapturedStep], &[SharedCapturedStep]) -> serde_json::Value,
+    inspect_escaped: impl FnOnce(
+        &[u32],
+        &str,
+        &[SharedCapturedStep],
+        &[SharedCapturedStep],
+        &[SharedCapturedStep],
+    ) -> serde_json::Value,
 ) -> serde_json::Value {
-    let source = model.compile_managed_plain_text_source(
-        std::fs::File::open(root.0.join("tokenizer.json")).unwrap()).unwrap();
+    let source = model
+        .compile_managed_plain_text_source(
+            std::fs::File::open(root.0.join("tokenizer.json")).unwrap(),
+        )
+        .unwrap();
     let discovery = model.capture_discovery().unwrap();
     let plan = make_plan(&discovery);
     let capture_limit = captures_per_step.checked_mul(2).unwrap();
@@ -150,21 +240,44 @@ fn check_saved_capture_run(
         original_frames.push(frame);
     };
     let mut initial = settings(0.0);
-    initial.inference.managed_memory_capacity_bytes = Some(capacity);
+    initial.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(capacity),
+    )]);
     let mut session = match (input, interventions) {
         (Some(input), Some(edits)) => model.start_intervened_managed_prepared_input(
-            &source, ManagedPreparedInputRequest::from_original(input, initial),
-            capture, edits, &cancellation, &mut original_observer),
+            &source,
+            ManagedPreparedInputRequest::from_original(input, initial),
+            capture,
+            edits,
+            &cancellation,
+            &mut original_observer,
+        ),
         (None, Some(edits)) => model.start_intervened_managed_plain_text(
-            &source, ManagedPlainTextRequest::new(PROMPT, initial),
-            capture, edits, &cancellation, &mut original_observer),
+            &source,
+            ManagedPlainTextRequest::new(PROMPT, initial),
+            capture,
+            edits,
+            &cancellation,
+            &mut original_observer,
+        ),
         (Some(input), None) => model.start_observed_managed_prepared_input(
-            &source, ManagedPreparedInputRequest::from_original(input, initial),
-            capture, &cancellation, &mut original_observer),
+            &source,
+            ManagedPreparedInputRequest::from_original(input, initial),
+            capture,
+            &cancellation,
+            &mut original_observer,
+        ),
         (None, None) => model.start_observed_managed_plain_text(
-            &source, ManagedPlainTextRequest::new(PROMPT, initial),
-            capture, &cancellation, &mut original_observer),
-    }.unwrap_or_else(report_failure).unwrap();
+            &source,
+            ManagedPlainTextRequest::new(PROMPT, initial),
+            capture,
+            &cancellation,
+            &mut original_observer,
+        ),
+    }
+    .unwrap_or_else(report_failure)
+    .unwrap();
     if after_commit {
         session = session
             .advance(&cancellation, &mut |_| {})
@@ -176,9 +289,9 @@ fn check_saved_capture_run(
         retained_bytes: capacity,
         cumulative_copy_bytes: capacity.checked_mul(4).unwrap(),
     });
-    let copy = WorkspaceCopyLimits::new(capacity);
+    let copy = WorkspaceCopyLimits::new(native_limits(capacity));
     let saved = session
-        .snapshot(&budget, copy.capacity_bytes, copy)
+        .snapshot(&budget, copy.memory_limits.clone(), copy.clone())
         .unwrap_or_else(report_failure);
     let original = session
         .run(&cancellation, &mut |_| {})
@@ -189,14 +302,20 @@ fn check_saved_capture_run(
     assert_eq!(original.token_ids.len(), 4);
     drop(original_observer);
     assert_eq!(original_frames.len(), 4);
-    assert_eq!(original_frames[3].cumulative_usage().captures, capture_limit);
+    assert_eq!(
+        original_frames[3].cumulative_usage().captures,
+        capture_limit
+    );
     assert_eq!(saved.next_prediction(), u64::from(after_commit));
 
     // Two outputs deliberately shorten the saved allowance. Restoration shares
     // the original cumulative ledger, which the source has now exhausted.
     let mut resume = settings(0.0);
     resume.overrides.max_new_tokens = Some(2);
-    resume.inference.managed_memory_capacity_bytes = Some(capacity);
+    resume.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(capacity),
+    )]);
     let mut restored_frames = Vec::new();
     let mut restored_observer = |_: Option<u32>, frame: Option<SharedCapturedStep>, _: f64| {
         let Some(frame) = frame else {
@@ -205,7 +324,12 @@ fn check_saved_capture_run(
         restored_frames.push(frame);
     };
     let restored = model
-        .restore_managed_plain_text(&saved, resume.clone(), copy.capacity_bytes, &cancellation)
+        .restore_managed_plain_text(
+            &saved,
+            resume.clone(),
+            copy.memory_limits.clone(),
+            &cancellation,
+        )
         .unwrap_or_else(report_failure)
         .unwrap()
         .with_capture_observer(&mut restored_observer)
@@ -248,7 +372,7 @@ fn check_saved_capture_run(
         branch_frames.push(frame);
     };
     let branch = model
-        .fork_managed_plain_text(&saved, resume, copy.capacity_bytes, &cancellation)
+        .fork_managed_plain_text(&saved, resume, copy.memory_limits.clone(), &cancellation)
         .unwrap_or_else(report_failure)
         .unwrap()
         .with_capture_observer(&mut branch_observer)
@@ -274,13 +398,27 @@ fn check_saved_capture_run(
     drop((saved, source, model, root));
 
     // The caller inspects escaped frames after model/source/snapshot teardown.
-    assert_eq!(restored.token_ids.as_ref(), &original.token_ids.as_ref()[..end]);
-    inspect_escaped(original.token_ids.as_ref(), original.text.as_str(),
-        &original_frames, &restored_frames, &branch_frames)
+    assert_eq!(
+        restored.token_ids.as_ref(),
+        &original.token_ids.as_ref()[..end]
+    );
+    inspect_escaped(
+        original.token_ids.as_ref(),
+        original.text.as_str(),
+        &original_frames,
+        &restored_frames,
+        &branch_frames,
+    )
 }
 
-fn compare_single_saved_capture(after_commit: bool, width: usize, partitioned: bool, sparse: bool,
-    original_frames: &[SharedCapturedStep], branch_frames: &[SharedCapturedStep]) {
+fn compare_single_saved_capture(
+    after_commit: bool,
+    width: usize,
+    partitioned: bool,
+    sparse: bool,
+    original_frames: &[SharedCapturedStep],
+    branch_frames: &[SharedCapturedStep],
+) {
     fn logits(frame: &SharedCapturedStep) -> &[f32] {
         let TensorObservationData::F32(values) = frame.records()[0]
             .payload
@@ -295,7 +433,9 @@ fn compare_single_saved_capture(after_commit: bool, width: usize, partitioned: b
         values
     }
     if partitioned {
-        let original_evidence = &original_frames[usize::from(after_commit)].as_step().partitions;
+        let original_evidence = &original_frames[usize::from(after_commit)]
+            .as_step()
+            .partitions;
         let branch_evidence = &branch_frames[0].as_step().partitions;
         assert_eq!(original_evidence.len(), 1);
         assert_eq!(branch_evidence.len(), 1);
@@ -304,31 +444,43 @@ fn compare_single_saved_capture(after_commit: bool, width: usize, partitioned: b
             assert_eq!(evidence.producers, [0]);
             assert_eq!(evidence.context.prediction, u64::from(after_commit));
         }
-        assert_ne!(original_evidence[0].context.run_identity, branch_evidence[0].context.run_identity,
-            "an independent branch retains a distinct prepared run identity");
+        assert_ne!(
+            original_evidence[0].context.run_identity, branch_evidence[0].context.run_identity,
+            "an independent branch retains a distinct prepared run identity"
+        );
     }
     if sparse {
         use eredu_core::capture::CapturePayload;
         let Some(CapturePayload::RoutedUnits(expected)) =
-            &original_frames[usize::from(after_commit)].records()[0].payload else {
+            &original_frames[usize::from(after_commit)].records()[0].payload
+        else {
             panic!("original routed payload");
         };
-        let Some(CapturePayload::RoutedUnits(actual)) = &branch_frames[0].records()[0].payload else {
+        let Some(CapturePayload::RoutedUnits(actual)) = &branch_frames[0].records()[0].payload
+        else {
             panic!("branched routed payload");
         };
         assert_eq!(expected.geometry, actual.geometry);
         assert_eq!(expected.rows.len(), if after_commit { 4 } else { 20 });
         assert_eq!(actual.rows.len(), expected.rows.len());
         for (a, b) in actual.rows.iter().zip(&expected.rows) {
-            assert_eq!((a.token, a.slot, a.expert, a.unit_start, a.unit_stride),
-                (b.token, b.slot, b.expert, b.unit_start, b.unit_stride));
+            assert_eq!(
+                (a.token, a.slot, a.expert, a.unit_start, a.unit_stride),
+                (b.token, b.slot, b.expert, b.unit_start, b.unit_stride)
+            );
             assert!((a.coefficient - b.coefficient).abs() < 5e-5);
             let (TensorObservationData::F32(a), TensorObservationData::F32(b)) =
-                (a.values.data(), b.values.data()) else { panic!("float routed units"); };
+                (a.values.data(), b.values.data())
+            else {
+                panic!("float routed units");
+            };
             assert_eq!(a.len(), width);
             assert_eq!(a.len(), b.len());
             assert!(a.iter().any(|v| v.abs() > 1e-6));
-            assert!(a.iter().zip(b).all(|(a,b)| a.is_finite() && (a-b).abs() <= 5e-5));
+            assert!(a
+                .iter()
+                .zip(b)
+                .all(|(a, b)| a.is_finite() && (a - b).abs() <= 5e-5));
         }
     } else {
         let expected = logits(&original_frames[usize::from(after_commit)]);
@@ -344,27 +496,48 @@ fn compare_single_saved_capture(after_commit: bool, width: usize, partitioned: b
 
 fn check_saved_interventions(after_commit: bool) {
     let root = managed_fixture(fixture(false));
-    let execution = ExecutionPlan::fully_resident(
-        eredu_core::DevicePlan::new("mlx", "metal:0").unwrap());
-    let (model, _) = LoadedModel::load_execution_plan(
-        &MlxBackendFactory::default(), &root.0, &execution).unwrap().into_parts();
+    let execution =
+        ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "metal:0").unwrap());
+    let (model, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+            .unwrap()
+            .into_parts();
     let edits = super::interventions::admitted_edits(
         &model.intervention_discovery().unwrap(),
-        CaptureRequestShape { batch: 1, prompt_tokens: 5, max_predictions: 4 },
+        CaptureRequestShape {
+            batch: 1,
+            prompt_tokens: 5,
+            max_predictions: 4,
+        },
     );
     check_saved_capture_run(
-        model, root, after_commit, 8 << 30, 1, None, None, Some(edits),
+        model,
+        root,
+        after_commit,
+        8 << 30,
+        1,
+        None,
+        None,
+        Some(edits),
         |_| {
             let mut plan = CapturePlan::none();
             plan.selections.push(CaptureSelection {
                 id: "edited saved scores".into(),
                 path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
-                schedule: CaptureSchedule::default(), slices: vec![],
+                schedule: CaptureSchedule::default(),
+                slices: vec![],
                 transform: CaptureTransform::FullTensor,
             });
-            plan.limits.per_step = CaptureUsage { captures: 1,
-                retained_bytes: 16 << 20, host_bytes: 16 << 20, encoded_bytes: 16 << 20 };
-            plan.limits.cumulative = CaptureUsage { captures: 2, ..plan.limits.per_step };
+            plan.limits.per_step = CaptureUsage {
+                captures: 1,
+                retained_bytes: 16 << 20,
+                host_bytes: 16 << 20,
+                encoded_bytes: 16 << 20,
+            };
+            plan.limits.cumulative = CaptureUsage {
+                captures: 2,
+                ..plan.limits.per_step
+            };
             plan.limits.on_limit = CaptureLimitPolicy::Skip;
             plan
         },
@@ -378,9 +551,14 @@ fn check_saved_interventions(after_commit: bool) {
                 let record = &frame.interventions()[0];
                 assert_eq!(record.operation_id, "alternate-decode");
                 assert_eq!(record.prediction_index, frame.prediction_index());
-                assert_eq!(record.outcome, if frame.prediction_index() % 2 == 0 {
-                    InterventionOutcome::Inactive
-                } else { InterventionOutcome::Applied });
+                assert_eq!(
+                    record.outcome,
+                    if frame.prediction_index() % 2 == 0 {
+                        InterventionOutcome::Inactive
+                    } else {
+                        InterventionOutcome::Applied
+                    }
+                );
             }
             serde_json::json!({ "ids": ids, "text": text })
         },

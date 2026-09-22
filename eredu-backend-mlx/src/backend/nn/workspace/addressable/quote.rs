@@ -5,7 +5,7 @@ use crate::backend::runtime::residency::parameter_bank::{
     IndexedBankSource, IndexedChunkLayout, IndexedResidencyPlan,
 };
 use eredu_runtime::expert::AddressableChunkCensus;
-use eredu_runtime::working_memory::{HostSourceConstructionFacts, WorkingMemoryPool};
+use eredu_runtime::working_memory::{HostSourceConstructionFacts, MemoryLedger};
 
 #[derive(Debug)]
 pub(crate) struct RetainedAddressableDeclaration {
@@ -18,7 +18,9 @@ impl RetainedAddressableDeclaration {
         view.chunks.rows = self.rows;
         view
     }
-    fn observation(&self) -> Option<WorkspaceAddressableObservationSource> { self.value.observation() }
+    fn observation(&self) -> Option<WorkspaceAddressableObservationSource> {
+        self.value.observation()
+    }
 }
 pub(crate) struct AddressableQuote {
     pub(crate) declaration: RetainedAddressableDeclaration,
@@ -31,7 +33,7 @@ pub(crate) struct AddressableQuote {
     pub(crate) numerical: SpeculativeNumericalRecipe,
     pub(crate) capacity: BoundaryStageCapacity,
     pub(crate) host_bytes: u64,
-    pub(crate) capture_publications:usize,
+    pub(crate) capture_publications: usize,
     pub(crate) constructor_facts: HostSourceConstructionFacts,
     pub(crate) read_facts: Option<HostSourceConstructionFacts>,
     pub(crate) residency: IndexedResidencyPlan,
@@ -47,15 +49,36 @@ impl std::fmt::Debug for AddressableQuote {
             .finish_non_exhaustive()
     }
 }
-impl AddressableQuote {
-    pub(crate) fn prepare(
+/// The shared descriptive traversal of physical member rows and grouped equations.
+/// Native discovery, source transfers and their extra completions are composed
+/// by the selected caller after this population has been established.
+pub(crate) struct AddressableEquationSource {
+    pub(crate) declaration: RetainedAddressableDeclaration,
+    pub(crate) inputs: Vec<WorkspaceLayout>,
+    pub(crate) outputs: Vec<WorkspaceLayout>,
+    pub(crate) population: AddressableNumericalPopulation,
+    pub(crate) host_bytes: u64,
+    pub(crate) capture_publications: usize,
+    pub(crate) ordinary_calls: Option<OrdinaryCallControls>,
+    parameters: std::rc::Rc<ParameterRows>,
+}
+impl AddressableEquationSource {
+    pub(crate) fn matches(&self, operation: WorkspaceOperationView<'_>) -> bool {
+        matches_source(&self.declaration, &self.inputs, &self.outputs, operation)
+    }
+    pub(crate) fn prepare<F>(
         bank: &IndexedBankSource,
         operation: WorkspaceOperationView<'_>,
         mechanism: ResidentExecutionMechanisms,
-        runtime: &safemlx::PreparedInputRuntime,
-        pool: Option<&WorkingMemoryPool>,
         funding: &HostMetadataFunding,
-    ) -> Result<Self, Error> {
+        mut compact_host: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(
+            &crate::backend::runtime::residency::parameter_bank::IndexedBindingIdentity,
+            &WorkspaceGroupedBank,
+        ) -> Result<u64, Error>,
+    {
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
         let invalid = || {
             context.metadata_error(format_args!(
@@ -70,8 +93,7 @@ impl AddressableQuote {
             SpeculativeNumericalRecipe,
             AddressableParentSource,
             AddressableChildSource,
-            IndexedChunkLayout,
-            HostSourceConstructionFacts,
+            F,
             [usize; 10],
         )>())?;
         let WorkspaceOperationKindView::AddressableRegion(declaration) = operation.kind else {
@@ -93,20 +115,16 @@ impl AddressableQuote {
         }
         let parameters = ParameterRows::prepare(bank, source, mechanism, &context)?;
         let first = parameters.identity.first().ok_or_else(invalid)?;
-        // This is an actual manager/read constructor proof, not a tensor shape
-        // substitute. The accepted role must still bind the corresponding banks.
-        let residency = bank
-            .inspect_original_residency(first, pool, funding)
-            .map_err(|cause| context.metadata_source(cause))?;
-        let constructor_facts = residency.constructor_facts().ok_or_else(invalid)?;
-        let read_facts = residency.read_facts();
-        if residency.requires_reads() && read_facts.is_none() {
+        let observation = declaration.observation();
+        if observation.is_some_and(|v| v.unit_dtype.is_none()) {
             return Err(invalid());
         }
-        let observation=declaration.observation();
-        if observation.is_some_and(|v|v.unit_dtype.is_none()) {return Err(invalid());}
-        let source_groups=observation.map(|_|super::observation::source_groups(source,&inputs,mechanism,funding,&context)).transpose()?;
-        let mut capture_publications=0usize;
+        let source_groups = observation
+            .map(|_| {
+                super::observation::source_groups(source, &inputs, mechanism, funding, &context)
+            })
+            .transpose()?;
+        let mut capture_publications = 0usize;
         let fields = parameters.fields;
         // Ordinary compact concatenate is same-type. Verify each actual
         // source row before using a cardinality ceiling; source identities and
@@ -114,7 +132,10 @@ impl AddressableQuote {
         for member in 1..source.chunks.members {
             for field in 0..fields {
                 if parameters.rows[member * fields + field].layout != parameters.rows[field].layout
-                    || parameters.rows[member * fields + field].layout.representation() != parameters.rows[field].layout.representation()
+                    || parameters.rows[member * fields + field]
+                        .layout
+                        .representation()
+                        != parameters.rows[field].layout.representation()
                 {
                     return Err(context.metadata_error(format_args!(
                         "addressable compact rows require their exact common physical layout"
@@ -124,6 +145,7 @@ impl AddressableQuote {
         }
         let chunks = first.plan().len();
         let mut aggregate: Option<AddressableNumericalPopulation> = None;
+        let mut aggregate_calls = Some(OrdinaryCallControls::default());
         let mut parent_outputs = context.metadata_vec(roles)?;
         let mut host_bytes = 0u64;
         // Only two row classes exist: the exact full chunk and final tail.
@@ -133,7 +155,7 @@ impl AddressableQuote {
         for ordinal in 0..chunks {
             let rows = first.plan().range(ordinal).ok_or_else(invalid)?.len();
             if let Some((_, count)) = classes.iter_mut().find(|(n, _)| *n == rows) {
-                *count += 1;
+                *count = count.checked_add(1).ok_or_else(invalid)?;
             } else {
                 classes.push((rows, 1usize));
             }
@@ -146,8 +168,9 @@ impl AddressableQuote {
                 .ok_or_else(invalid)?
                 .min(source.chunks.members);
             let mut branch: Option<AddressableNumericalPopulation> = None;
+            let mut branch_calls = Some(OrdinaryCallControls::default());
             let mut branch_host = 0u64;
-            let mut branch_publications=0usize;
+            let mut branch_publications = 0usize;
             for members in 1..=maximum {
                 let mut selected =
                     context.metadata_vec(members.checked_mul(fields).ok_or_else(invalid)?)?;
@@ -158,31 +181,40 @@ impl AddressableQuote {
                             .with_representation(row.layout.representation()),
                     );
                 }
-                let child = AddressableChildSource::prepare_with_observation(
+                let child = AddressableChildSource::prepare_with_compact_host(
                     source,
                     &child_inputs,
                     members,
                     &selected,
                     mechanism,
-                    funding,observation,source_groups.as_ref(),
+                    funding,
+                    observation,
+                    source_groups.as_ref(),
+                    &mut |spec| compact_host(&parameters.identity, spec),
                 )?;
-                branch_publications=branch_publications.max(child.capture.publications);
+                branch_publications = branch_publications.max(child.capture.publications);
                 let recipe = SpeculativeNumericalRecipe::inspect_owned_child_with_capture(
                     &child.report,
                     roles,
                     mechanism,
-                    &context,child.capture,
+                    &context,
+                    child.capture,
                 )?;
                 let mut population = AddressableNumericalPopulation::from_recipe(recipe, true)
                     .ok_or_else(invalid)?;
+                let mut calls = ordinary_report_calls(mechanism, &child.report)?;
                 // Replacements are sliced by their exact original row before
                 // concatenate. Each field contributes at most its actual
                 // replacement population and at most the selected cardinality.
                 for field in 0..fields {
                     let mut slice: Option<AddressableNumericalPopulation> = None;
+                    let mut slice_calls = Some(OrdinaryCallControls::default());
                     let mut count = 0usize;
                     for member in 0..source.chunks.members {
                         if let Some(recipe) = parameters.rows[member * fields + field].slice {
+                            slice_calls = slice_calls
+                                .zip(parameters.rows[member * fields + field].ordinary_slice_calls)
+                                .map(|(prior, candidate)| prior.union(candidate));
                             count = count.checked_add(1).ok_or_else(invalid)?;
                             let candidate =
                                 AddressableNumericalPopulation::from_recipe(recipe, false)
@@ -196,6 +228,12 @@ impl AddressableQuote {
                     if let Some(slice) = slice {
                         for _ in 0..members.min(count) {
                             population = population.append(slice).ok_or_else(invalid)?;
+                            calls = calls
+                                .zip(slice_calls)
+                                .map(|(prior, slice)| {
+                                    prior.append(slice).ok_or(WorkspaceMetadataError::Overflow)
+                                })
+                                .transpose()?;
                         }
                     }
                 }
@@ -203,8 +241,17 @@ impl AddressableQuote {
                     None => population,
                     Some(prior) => prior.union(population).ok_or_else(invalid)?,
                 });
-                branch_host =
-                    branch_host.max(child.report.host_workspace_bytes.ok_or_else(invalid)?);
+                branch_calls = branch_calls
+                    .zip(calls)
+                    .map(|(prior, calls)| prior.union(calls));
+                branch_host = branch_host.max(
+                    child
+                        .report
+                        .host_workspace_bytes
+                        .ok_or_else(invalid)?
+                        .checked_add(child.compact_host_bytes)
+                        .ok_or_else(invalid)?,
+                );
                 if rows == source.chunks.rows.min(source.chunks.chunk_rows) {
                     if parent_outputs.is_empty() {
                         for layout in &child.output_layouts {
@@ -214,14 +261,36 @@ impl AddressableQuote {
                                     .with_representation(layout.representation()),
                             );
                         }
-                    } else if parent_outputs.len()!=child.output_layouts.len() || parent_outputs.iter().zip(&child.output_layouts).any(|(a,b)|a!=b||a.representation()!=b.representation()) {
+                    } else if parent_outputs.len() != child.output_layouts.len()
+                        || parent_outputs
+                            .iter()
+                            .zip(&child.output_layouts)
+                            .any(|(a, b)| a != b || a.representation() != b.representation())
+                    {
                         return Err(invalid());
                     }
                 }
             }
-            capture_publications=capture_publications.checked_add(branch_publications.checked_mul(occurrences).ok_or_else(invalid)?)
+            capture_publications = capture_publications
+                .checked_add(
+                    branch_publications
+                        .checked_mul(occurrences)
+                        .ok_or_else(invalid)?,
+                )
                 .ok_or_else(invalid)?;
             let branch = branch.ok_or_else(invalid)?;
+            aggregate_calls = aggregate_calls
+                .zip(branch_calls)
+                .map(|(prior, branch)| {
+                    prior
+                        .append(
+                            branch
+                                .repeat(occurrences)
+                                .ok_or(WorkspaceMetadataError::Overflow)?,
+                        )
+                        .ok_or(WorkspaceMetadataError::Overflow)
+                })
+                .transpose()?;
             for _ in 0..occurrences {
                 aggregate = Some(match aggregate {
                     None => branch,
@@ -251,9 +320,101 @@ impl AddressableQuote {
         )?;
         let parent_population = AddressableNumericalPopulation::from_recipe(parent_recipe, false)
             .ok_or_else(invalid)?;
+        let ordinary_calls = aggregate_calls
+            .zip(ordinary_report_calls(mechanism, &parent.report)?)
+            .map(|(child, parent)| child.append(parent).ok_or(WorkspaceMetadataError::Overflow))
+            .transpose()?;
         let population = parent_population
             .append(aggregate.ok_or_else(invalid)?)
             .ok_or_else(invalid)?;
+        host_bytes = host_bytes
+            .checked_add(parent.report.host_workspace_bytes.ok_or_else(invalid)?)
+            .ok_or_else(invalid)?;
+        for (actual, expected) in parent.output_layouts.iter().zip(operation.outputs.iter()) {
+            if actual.shape() != expected.shape() || actual.dtype() != expected.dtype() {
+                return Err(invalid());
+            }
+        }
+        context.charge_metadata(
+            super::sources::shared_bytes::<WorkspaceAddressableRegion>().ok_or_else(invalid)?,
+        )?;
+        let declaration = RetainedAddressableDeclaration {
+            value: std::rc::Rc::new(declaration.retain(&context)?),
+            rows: source.chunks.rows,
+        };
+        context.charge_metadata(
+            super::sources::shared_bytes::<ParameterRows>().ok_or_else(invalid)?,
+        )?;
+        Ok(Self {
+            declaration,
+            inputs,
+            outputs: parent.output_layouts,
+            population,
+            host_bytes,
+            capture_publications,
+            ordinary_calls,
+            parameters: std::rc::Rc::new(parameters),
+        })
+    }
+    pub(crate) fn identity(
+        &self,
+    ) -> &crate::backend::runtime::residency::parameter_bank::IndexedBindingIdentity {
+        &self.parameters.identity
+    }
+}
+
+pub(super) fn ordinary_report_calls(
+    mechanism: ResidentExecutionMechanisms,
+    report: &WorkspaceTraceReport,
+) -> Result<Option<OrdinaryCallControls>, Error> {
+    if mechanism.allocation().original_storage {
+        return Ok(None);
+    }
+    match mechanism {
+        ResidentExecutionMechanisms::Cpu { cpu, .. } => cpu
+            .ordinary_report_call_controls(report)
+            .map_err(MlxWorkspaceFactError::ordinary),
+        ResidentExecutionMechanisms::Metal(_) => Ok(None),
+    }
+}
+impl AddressableQuote {
+    pub(crate) fn prepare(
+        bank: &IndexedBankSource,
+        operation: WorkspaceOperationView<'_>,
+        mechanism: ResidentExecutionMechanisms,
+        runtime: &safemlx::PreparedInputRuntime,
+        pool: Option<&MemoryLedger>,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, Error> {
+        let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
+        let invalid = || {
+            context.metadata_error(format_args!(
+                "addressable original source composition differs"
+            ))
+        };
+        context.charge_metadata(size_of::<(
+            Self,
+            AddressableEquationSource,
+            Result<Self, Error>,
+            IndexedChunkLayout,
+            HostSourceConstructionFacts,
+            [usize; 4],
+        )>())?;
+        let shared =
+            AddressableEquationSource::prepare(bank, operation, mechanism, funding, |_, _| Ok(0))?;
+        let first = shared.identity().first().ok_or_else(invalid)?;
+        // This is an actual manager/read constructor proof, not a tensor shape
+        // substitute. The accepted role must still bind the corresponding banks.
+        let residency = bank
+            .inspect_original_residency(first, pool, funding)
+            .map_err(|cause| context.metadata_source(cause))?;
+        let constructor_facts = residency.constructor_facts().ok_or_else(invalid)?;
+        let read_facts = residency.read_facts();
+        if residency.requires_reads() && read_facts.is_none() {
+            return Err(invalid());
+        }
+        let mut host_bytes = shared.host_bytes;
+        let chunks = first.plan().len();
         let mut id_completions = 0usize;
         for ordinal in 0..chunks {
             let census = AddressableChunkCensus::new(
@@ -266,16 +427,15 @@ impl AddressableQuote {
             .ok_or_else(invalid)?;
             let indexed = IndexedChunkLayout::inspect(runtime, census).ok_or_else(invalid)?;
             host_bytes = host_bytes
-                .checked_add(indexed.host_bytes() as u64)
+                .checked_add(u64::try_from(indexed.host_bytes()).map_err(|_| invalid())?)
                 .ok_or_else(invalid)?;
             id_completions = id_completions
                 .checked_add(indexed.parent_completions())
                 .ok_or_else(invalid)?;
         }
-        host_bytes = host_bytes
-            .checked_add(parent.report.host_workspace_bytes.ok_or_else(invalid)?)
-            .ok_or_else(invalid)?;
-        let equation = population.finish(roles, id_completions, &context)?;
+        let equation = shared
+            .population
+            .finish(shared.outputs.len(), id_completions, &context)?;
         let numerical = equation.with_indexed_source(&residency, &context)?;
         let backing = safemlx::OriginalBufferBudget::population_layout(
             runtime,
@@ -288,101 +448,158 @@ impl AddressableQuote {
             records: numerical.record_capacity,
             backing: backing.capacity(),
         };
-        for (actual, expected) in parent.output_layouts.iter().zip(operation.outputs.iter()) {
-            if actual.shape() != expected.shape() || actual.dtype() != expected.dtype() {
-                return Err(invalid());
-            }
-        }
-        let mut value=Self {
-            declaration: {
-                context.charge_metadata(super::sources::shared_bytes::<WorkspaceAddressableRegion>().ok_or_else(invalid)?)?;
-                RetainedAddressableDeclaration { value: std::rc::Rc::new(declaration.retain(&context)?), rows: source.chunks.rows }
-            },
-            inputs,
-            outputs: parent.output_layouts,
+        let callback = crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement::invocation_control_bytes()
+            .ok_or_else(invalid)?.checked_add(shared.declaration.as_view().callback_control_bytes).ok_or_else(invalid)?;
+        let mut value = Self {
+            declaration: shared.declaration,
+            inputs: shared.inputs,
+            outputs: shared.outputs,
             equation,
             numerical,
             capacity,
-            host_bytes,capture_publications,
+            host_bytes,
+            capture_publications: shared.capture_publications,
             constructor_facts,
             read_facts,
             residency,
-            parameters: { context.charge_metadata(super::sources::shared_bytes::<ParameterRows>().ok_or_else(invalid)?)?; std::rc::Rc::new(parameters) },
+            parameters: shared.parameters,
             mechanism,
         };
-        let native=crate::backend::submission_recovery::addressable::control_bytes(&value)
-            .map_err(|cause|context.metadata_source(cause))?;
-        let callback=crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement::invocation_control_bytes()
-            .ok_or_else(invalid)?.checked_add(source.callback_control_bytes).ok_or_else(invalid)?;
-        value.host_bytes=value.host_bytes.checked_add(u64::try_from(native).map_err(|_|invalid())?)
-            .and_then(|n|n.checked_add(u64::try_from(callback).ok()?)).ok_or_else(invalid)?;
+        let native = crate::backend::submission_recovery::addressable::control_bytes(&value)
+            .map_err(|cause| context.metadata_source(cause))?;
+        value.host_bytes = value
+            .host_bytes
+            .checked_add(u64::try_from(native).map_err(|_| invalid())?)
+            .and_then(|n| n.checked_add(u64::try_from(callback).ok()?))
+            .ok_or_else(invalid)?;
         Ok(value)
     }
     fn specialization_frames() -> Option<usize> {
-        let frames = [size_of::<(Self, Result<Self, Error>, &Self, usize, &super::sources::LocalEnvelope)>(),
-            size_of::<WorkspaceAddressableRegionView<'_>>(), size_of::<RetainedAddressableDeclaration>(),
-            size_of::<[i32; 2]>(), size_of::<Vec<WorkspaceLayout>>() * 2,
+        let frames = [
+            size_of::<(
+                Self,
+                Result<Self, Error>,
+                &Self,
+                usize,
+                &super::sources::LocalEnvelope,
+            )>(),
+            size_of::<WorkspaceAddressableRegionView<'_>>(),
+            size_of::<RetainedAddressableDeclaration>(),
+            size_of::<[i32; 2]>(),
+            size_of::<Vec<WorkspaceLayout>>() * 2,
             size_of::<std::iter::Enumerate<std::slice::Iter<'_, WorkspaceLayout>>>(),
-            size_of::<std::slice::Iter<'_, WorkspaceLayout>>(), size_of::<HostMetadataFunding>(),
-            size_of::<HostSourceConstructionFacts>(), size_of::<Option<HostSourceConstructionFacts>>(),
-            size_of::<(&AddressableQuoteRef, usize, &HostMetadataFunding, AddressableQuoteRef, Result<AddressableQuoteRef, Error>)>()];
-        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+            size_of::<std::slice::Iter<'_, WorkspaceLayout>>(),
+            size_of::<HostMetadataFunding>(),
+            size_of::<HostSourceConstructionFacts>(),
+            size_of::<Option<HostSourceConstructionFacts>>(),
+            size_of::<(
+                &AddressableQuoteRef,
+                usize,
+                &HostMetadataFunding,
+                AddressableQuoteRef,
+                Result<AddressableQuoteRef, Error>,
+            )>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
     }
     pub(crate) fn specialization_control_bytes(&self) -> Option<usize> {
         let roles = self.outputs.len();
-        let frames = [Self::specialization_frames()?,
+        let frames = [
+            Self::specialization_frames()?,
             WorkspaceContext::construction_bytes::<ResidentExecutionMechanisms>()?,
             WorkspaceLayout::construction_bytes(2)?.checked_mul(4usize.checked_add(roles)?)?,
             super::sources::shared_bytes::<Self>()?,
             self.residency.for_rows_control_bytes()?,
             WorkspaceContext::metadata_vec_bytes::<WorkspaceLayout>(4)?,
-            WorkspaceContext::metadata_vec_bytes::<WorkspaceLayout>(roles)?];
-        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+            WorkspaceContext::metadata_vec_bytes::<WorkspaceLayout>(roles)?,
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
     }
     /// Selects only row geometry from a previously qualified local envelope.
     /// Physical parameter rows remain shared; no numerical constructor or
     /// admission policy is replayed at execution time.
-    pub(super) fn for_rows(&self, rows: usize, envelope: &super::sources::LocalEnvelope, funding: &HostMetadataFunding) -> Result<Self, Error> {
+    pub(super) fn for_rows(
+        &self,
+        rows: usize,
+        envelope: &super::sources::LocalEnvelope,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, Error> {
         let context = WorkspaceContext::new_with_metadata_funding(self.mechanism, funding.clone())?;
-        let invalid = || context.metadata_error(format_args!("local indexed rows exceed their retained source"));
+        let invalid = || {
+            context.metadata_error(format_args!(
+                "local indexed rows exceed their retained source"
+            ))
+        };
         context.charge_metadata(Self::specialization_frames().ok_or_else(invalid)?)?;
         let mut source = self.declaration.as_view();
-        if rows == 0 || rows > source.chunks.rows { return Err(invalid()); }
+        if rows == 0 || rows > source.chunks.rows {
+            return Err(invalid());
+        }
         source.chunks.rows = rows;
-        let declaration = RetainedAddressableDeclaration { value: self.declaration.value.clone(), rows };
+        let declaration = RetainedAddressableDeclaration {
+            value: self.declaration.value.clone(),
+            rows,
+        };
         let mut inputs = context.metadata_vec(self.inputs.len())?;
         let mut outputs = context.metadata_vec(self.outputs.len())?;
         for (index, layout) in self.inputs.iter().enumerate() {
-            inputs.push(context.layout(&[i32::try_from(rows).map_err(|_| invalid())?,
-                if index == 0 { source.kernel.dimensions().0 } else { 1 }], layout.dtype())?
-                .with_representation(layout.representation()));
+            inputs.push(
+                context
+                    .layout(
+                        &[
+                            i32::try_from(rows).map_err(|_| invalid())?,
+                            if index == 0 {
+                                source.kernel.dimensions().0
+                            } else {
+                                1
+                            },
+                        ],
+                        layout.dtype(),
+                    )?
+                    .with_representation(layout.representation()),
+            );
         }
         for layout in &self.outputs {
-            outputs.push(context.layout(&[i32::try_from(rows).map_err(|_| invalid())?, source.kernel.dimensions().1], layout.dtype())?
-                .with_representation(layout.representation()));
+            outputs.push(
+                context
+                    .layout(
+                        &[
+                            i32::try_from(rows).map_err(|_| invalid())?,
+                            source.kernel.dimensions().1,
+                        ],
+                        layout.dtype(),
+                    )?
+                    .with_representation(layout.representation()),
+            );
         }
-        let residency = self.residency.for_rows(rows, funding).map_err(|cause| context.metadata_source(cause))?;
+        let residency = self
+            .residency
+            .for_rows(rows, funding)
+            .map_err(|cause| context.metadata_source(cause))?;
         let constructor_facts = residency.constructor_facts().ok_or_else(invalid)?;
         let read_facts = residency.read_facts();
-        Ok(Self { declaration, inputs, outputs, equation: envelope.equation,
-            numerical: envelope.numerical, capacity: envelope.capacity,
-            host_bytes: envelope.host_bytes, capture_publications: envelope.capture_publications,
-            constructor_facts, read_facts, residency, parameters: self.parameters.clone(), mechanism: self.mechanism })
+        Ok(Self {
+            declaration,
+            inputs,
+            outputs,
+            equation: envelope.equation,
+            numerical: envelope.numerical,
+            capacity: envelope.capacity,
+            host_bytes: envelope.host_bytes,
+            capture_publications: envelope.capture_publications,
+            constructor_facts,
+            read_facts,
+            residency,
+            parameters: self.parameters.clone(),
+            mechanism: self.mechanism,
+        })
     }
     pub(crate) fn matches(&self, operation: WorkspaceOperationView<'_>) -> bool {
-        matches!(operation.kind,WorkspaceOperationKindView::AddressableRegion(value) if value.as_view()==self.declaration.as_view() && value.observation()==self.declaration.observation())
-            && operation.inputs.len() == self.inputs.len()
-            && operation.outputs.len() == self.outputs.len()
-            && operation.inputs.iter().zip(&self.inputs).all(|(a, b)| {
-                a.shape() == b.shape()
-                    && a.dtype() == b.dtype()
-                    && a.representation() == b.representation()
-            })
-            && operation
-                .outputs
-                .iter()
-                .zip(&self.outputs)
-                .all(|(a, b)| a.shape() == b.shape() && a.dtype() == b.dtype())
+        matches_source(&self.declaration, &self.inputs, &self.outputs, operation)
     }
     pub(crate) fn allocation(&self) -> NativeAllocationFacts {
         self.mechanism.allocation()
@@ -446,3 +663,24 @@ pub(super) fn normalized_inputs(
 }
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;
+
+fn matches_source(
+    declaration: &RetainedAddressableDeclaration,
+    inputs: &[WorkspaceLayout],
+    outputs: &[WorkspaceLayout],
+    operation: WorkspaceOperationView<'_>,
+) -> bool {
+    matches!(operation.kind,WorkspaceOperationKindView::AddressableRegion(value) if value.as_view()==declaration.as_view() && value.observation()==declaration.observation())
+        && operation.inputs.len() == inputs.len()
+        && operation.outputs.len() == outputs.len()
+        && operation.inputs.iter().zip(inputs).all(|(a, b)| {
+            a.shape() == b.shape()
+                && a.dtype() == b.dtype()
+                && a.representation() == b.representation()
+        })
+        && operation
+            .outputs
+            .iter()
+            .zip(outputs)
+            .all(|(a, b)| a.shape() == b.shape() && a.dtype() == b.dtype())
+}

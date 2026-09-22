@@ -250,14 +250,14 @@ fn selected(mut raw: CapturePlan) -> SharedCapturePlan {
 fn setup(
     source: &SharedCapturePlan,
 ) -> (
-    WorkingMemoryPool,
+    MemoryLedger,
     WorkingMemoryReservation,
     WorkingMemoryFundingRun,
     FundedCaptureSession,
     GeneratedBackend,
 ) {
     let h = plan(source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let funded = session(source, &pool, &r, &run);
     let scope = run.scope().unwrap();
@@ -343,9 +343,9 @@ fn multiple_generated_selections_match_legacy_usage_and_generate_once() {
     let h = plan(&source).initialization_peak_bytes();
     finish_backend(backend);
     drop((actual, f, funded, run, r));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn limit_skip_unselected_and_zero_extent_keep_factory_lazy_but_preview_zero_does_not() {
@@ -442,7 +442,7 @@ fn factory_error_and_unwind_keep_each_prior_output_and_do_not_refund_claim() {
             // An abandoned original native scope remains quarantined independently.
             drop(backend);
             drop((run, r));
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.payload_used_bytes().unwrap() > 0);
             assert!(weak.upgrade().is_none());
         }
     }
@@ -453,7 +453,7 @@ fn foreign_scope_and_preflight_failure_reject_before_factory_but_spend_once() {
         let source = selected(raw());
         let (pool, r, run, mut funded, mut backend) = setup(&source);
         let foreign_owner = if foreign {
-            let p = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let p = capture_test_ledger(u64::MAX, 0).unwrap();
             let (r2, run2) = fresh(&p, 64);
             let old = std::mem::replace(&mut backend.scope, run2.scope().unwrap());
             old.certify().unwrap();
@@ -472,7 +472,7 @@ fn foreign_scope_and_preflight_failure_reject_before_factory_but_spend_once() {
         drop(funded.take_shared_step().unwrap());
         finish_backend(backend);
         drop((f, funded, run, r, foreign_owner));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]

@@ -1,5 +1,6 @@
 //! Mutable source handoff and actual once-only verification payload storage.
 use super::*;
+use eredu_nn::workspace::WorkspaceMetadataAllocation;
 use eredu_runtime::working_memory::{
     OriginalSpeculativeBudgetCustody, OriginalSpeculativeRequest, OriginalSpeculativeRole,
     SpeculativeInvocationRequirements, WorkingMemoryError,
@@ -26,22 +27,25 @@ pub(crate) struct AutoregressiveSourcePair {
     draft: ReplicatedTextControlOrigin,
     target_media: Option<eredu_runtime::working_memory::MediaSessionBinding>,
     schedule: AutoregressiveScheduleIdentity,
+    activation_execution:
+        eredu_architectures::speculative_execution::SpeculativeActivationExecution,
     active: std::cell::RefCell<Option<ActiveSpeculativeInvocation>>,
     prefill: std::cell::RefCell<Option<ActiveSpeculativePrefill>>,
     numerical: crate::composition::mlx::speculative::OriginalSpeculativeNumericalSources,
+    partition: [Option<crate::composition::mlx::session::OriginalModelPartitionSource>; 2],
 }
 impl AutoregressiveSourcePair {
     pub(crate) fn prepare(
         target: &Executable,
         draft: &Executable,
         schedule: &AutoregressiveSchedulePlan<'_>,
-        pool: &WorkingMemoryPool,
-        metadata_capacity: u64,
+        pool: &MemoryLedger,
+        metadata_capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, Error> {
         let funding = pool
             .prepare_workspace_metadata(
                 target.erased().inference_execution_identity(),
-                metadata_capacity,
+                metadata_capacity.clone(),
             )
             .map_err(Error::WorkspacePlanning)?;
         Self::prepare_funded(target, draft, schedule, pool, metadata_capacity, funding)
@@ -52,15 +56,16 @@ impl AutoregressiveSourcePair {
         target: &Executable,
         draft: &Executable,
         schedule: &AutoregressiveSchedulePlan<'_>,
-        pool: &WorkingMemoryPool,
-        metadata_capacity: u64,
+        pool: &MemoryLedger,
+        metadata_capacity: eredu_core::MemoryLimits,
         funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         let controls = [
             size_of::<Self>(),
             size_of::<Result<Self, Error>>(),
             size_of::<ReplicatedTextControlOrigin>(),
-            size_of::<Result<eredu_runtime::working_memory::MediaSessionBinding, WorkingMemoryError>>(),
+            size_of::<Result<eredu_runtime::working_memory::MediaSessionBinding, WorkingMemoryError>>(
+            ),
             size_of::<
                 Option<
                     Result<
@@ -73,16 +78,14 @@ impl AutoregressiveSourcePair {
                 &Executable,
                 &Executable,
                 &AutoregressiveSchedulePlan<'_>,
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 u64,
             )>(),
         ];
         let bytes = controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         funding
             .reserve_metadata(bytes)
             .map_err(Error::WorkspacePlanning)?;
@@ -106,15 +109,55 @@ impl AutoregressiveSourcePair {
             draft: draft_origin,
             target_media: target.erased().original_request_media_binding().ok(),
             schedule: schedule.identity(),
+            activation_execution:eredu_architectures::speculative_execution::SpeculativeActivationExecution::autoregressive(schedule),
             active: std::cell::RefCell::new(None),
             prefill: std::cell::RefCell::new(None),
             numerical,
+            partition: [None,None],
         })
     }
+    /// Retain only the publication belonging to this actual Target/Draft origin.
+    /// Absence on one role does not qualify or disqualify the other role.
+    pub(crate) fn with_partition_source(
+        mut self,
+        kind: AutoregressiveSource,
+        source: Option<crate::composition::mlx::session::OriginalModelPartitionPreparation>,
+    ) -> Result<Self, Error> {
+        let Some(source) = source else {
+            return Ok(self);
+        };
+        if !source.origin().same_origin(self.origin(kind)) {
+            return Err(self.retain_startup_error(PreparationCause::Source));
+        }
+        let index = match kind {
+            AutoregressiveSource::Target => 0,
+            AutoregressiveSource::Draft => 1,
+        };
+        if self.partition[index].is_some() {
+            return Err(self.retain_startup_error(PreparationCause::Source));
+        }
+        self.partition[index] = Some(source.bind(self.request())?);
+        Ok(self)
+    }
+    pub(crate) fn partition_source(
+        &self,
+        kind: AutoregressiveSource,
+    ) -> Option<&crate::composition::mlx::session::OriginalModelPartitionSource> {
+        self.partition[match kind {
+            AutoregressiveSource::Target => 0,
+            AutoregressiveSource::Draft => 1,
+        }]
+        .as_ref()
+    }
     pub(crate) fn validate_media_input(
-        &self, semantics: &eredu_architectures::media_plan::BoundPreparedMediaSemantics,
+        &self,
+        semantics: &eredu_architectures::media_plan::BoundPreparedMediaSemantics,
     ) -> Result<(), Error> {
-        if self.target_media.as_ref().is_some_and(|binding| semantics.binding().matches(binding)) {
+        if self
+            .target_media
+            .as_ref()
+            .is_some_and(|binding| semantics.binding().matches(binding))
+        {
             Ok(())
         } else {
             Err(self.retain_startup_error(PreparationCause::Source))
@@ -129,7 +172,11 @@ impl AutoregressiveSourcePair {
         mut self,
         declaration: Option<crate::composition::mlx::session::OriginalInterventionDeclaration>,
     ) -> Result<Self, Error> {
-        self.numerical = self.numerical.with_intervention_declaration(declaration)?;
+        self.numerical = self
+            .numerical
+            .with_intervention_declaration(declaration.map(|declaration| {
+                declaration.with_autoregressive_execution(self.activation_execution.clone())
+            }))?;
         Ok(self)
     }
     pub(crate) fn validate_intervention(
@@ -214,9 +261,14 @@ pub(crate) struct PreparedAutoregressiveInvocation<'source> {
     group_source_facts: Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
     media_source: Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<()>>,
     projected: ProjectedResidentState,
+    paged: Option<ProjectedPagedSources>,
     layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
     report: InferenceWorkspaceReport,
     recipe: AutoregressiveEquationRecipe,
+    transaction_controls: usize,
+    transactions: Vec<Option<crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeTransactionQuote>>,
+    model_controls: Vec<Option<crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeModelControlQuote>>,
+    capture: Option<super::capture::Quote<'source>>,
     context: WorkspaceContext,
     // All actual payload buffers, inspection handles and error prefixes first.
     funding: HostMetadataFunding,
@@ -231,6 +283,17 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
         input: Option<&'source MlxModelInput>,
         claim: AutoregressiveOccurrenceClaim<'source>,
         prepared_prefill: Option<super::super::prefill_input::PreparedPrefillInput>,
+    ) -> Result<Self, Error> {
+        Self::prepare_observed(sources, model, state, input, claim, prepared_prefill, None)
+    }
+    pub(crate) fn prepare_observed(
+        sources: &'source AutoregressiveSourcePair,
+        model: &'source mut Executable,
+        state: &'source mut MlxAutoregressiveState,
+        input: Option<&'source MlxModelInput>,
+        claim: AutoregressiveOccurrenceClaim<'source>,
+        prepared_prefill: Option<super::super::prefill_input::PreparedPrefillInput>,
+        capture: Option<&'source eredu_runtime::capture::OriginalSpeculativeCaptureProspect>,
     ) -> Result<Self, Error> {
         if !claim.belongs_to(sources.schedule) || state.source_role != claim.invocation().source() {
             return Err(retain_planning_error(
@@ -247,6 +310,8 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
             claim.invocation(),
             sources.metadata_funding().clone(),
             prepared_prefill.as_ref(),
+            capture.map(|source| (source, sources)),
+            sources.partition_source(claim.invocation().source()),
         )?;
         let controls = [
             size_of::<Self>(),
@@ -255,8 +320,19 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
             size_of::<ReplicatedTextControlOrigin>(),
             size_of::<PreparationCause>(),
             size_of::<Option<eredu_runtime::working_memory::HostSourceConstructionFacts>>(),
-            size_of::<(u64, Option<eredu_runtime::working_memory::HostSourceConstructionFacts>)>(),
-            size_of::<Result<(u64, Option<eredu_runtime::working_memory::HostSourceConstructionFacts>), Error>>(),
+            size_of::<(
+                u64,
+                Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+            )>(),
+            size_of::<
+                Result<
+                    (
+                        u64,
+                        Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+                    ),
+                    Error,
+                >,
+            >(),
             size_of::<(
                 &mut Executable,
                 &mut MlxAutoregressiveState,
@@ -268,9 +344,7 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
         let bytes = controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         quote
             .funding
             .reserve_metadata(bytes)
@@ -291,14 +365,83 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
         let (group_control_bytes, group_source_facts) = quote
             .model
             .erased()
-            .bind_speculative_neural_recipe(quote.layerwise.as_ref(), sources.numerical_sources().pool(), &quote.funding, &mut quote.recipe)
-            .map_err(|cause| retain_planning_error(cause, quote.funding.clone()))?;
+            .bind_speculative_neural_recipe(
+                quote.layerwise.as_ref(),
+                sources.numerical_sources().pool(),
+                &quote.funding,
+                &mut quote.recipe,
+            )
+            .map_err(|cause| {
+                retain_planning_error(
+                    cause.at_speculative_stage("AR neural source binding"),
+                    quote.funding.clone(),
+                )
+            })?;
+        let transaction_source = {
+            use crate::backend::runtime::distributed::topology::original_source::control::speculative::PreparedSpeculativeControl;
+            let actual = quote.recipe.native_recipe().parallel_control_source()?;
+            match (
+                sources.partition_source(claim.invocation().source()),
+                actual,
+            ) {
+                (Some(partition), Some(actual))
+                    if partition.control().workspace_source().same_source(actual) =>
+                {
+                    Some(partition.control().clone())
+                }
+                (None, Some(actual)) => Some(PreparedSpeculativeControl::new(
+                    actual.clone(),
+                    sources.request().execution_identity(),
+                    sources.numerical_sources().pool(),
+                )?),
+                (None, None) => None,
+                _ => return Err(Error::PrefillScopeUnavailable),
+            }
+        };
+        let mut requires_sequence = quote
+            .funding
+            .metadata_vec(quote.recipe.records().len())
+            .map_err(Error::Neural)?;
+        for (ordinal, row) in quote.recipe.records().iter().enumerate() {
+            let required = quote
+                .capture
+                .as_ref()
+                .map(|capture| {
+                    super::capture::descriptor(
+                        capture.source,
+                        claim.invocation(),
+                        quote.report.geometry(),
+                        row.span(),
+                        ordinal,
+                    )?
+                    .requires_sequence_readout()
+                    .map_err(|cause| retain_planning_error(cause, quote.funding.clone()))
+                })
+                .transpose()?
+                .unwrap_or(false);
+            requires_sequence.push(required);
+        }
+        let (transaction_controls, transactions) = quote
+            .model
+            .erased()
+            .prepare_autoregressive_transaction_controls(
+                &quote.recipe,
+                transaction_source.as_ref(),
+                quote.capture.is_some(),
+                &requires_sequence,
+                &quote.funding,
+            )?;
+        let model_controls = quote.model.erased().prepare_autoregressive_model_controls(
+            &quote.recipe, transaction_source.as_ref(), &quote.funding,
+        )?;
         let AutoregressiveWorkspaceRecipe {
             media_source,
             projected,
+            paged,
             layerwise,
             report,
             recipe,
+            capture,
             context,
             funding,
             schedule: _,
@@ -319,11 +462,16 @@ impl<'source> PreparedAutoregressiveInvocation<'source> {
             source_origin,
             group_control_bytes,
             group_source_facts,
+            transaction_controls,
+            transactions,
+            model_controls,
             media_source,
             projected,
+            paged,
             layerwise,
             report,
             recipe,
+            capture,
             context,
             funding,
         })

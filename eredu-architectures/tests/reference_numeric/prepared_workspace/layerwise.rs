@@ -314,6 +314,7 @@ fn selected_layerwise_equations_do_not_supply_missing_materialization_coverage()
             .compose(
                 report.equations.refine_state_backing(state).unwrap(),
                 eredu_core::ExecutionWorkspaceEstimate {
+                    physical_domains: None,
                     geometry,
                     activations: absent(),
                     attention: absent(),

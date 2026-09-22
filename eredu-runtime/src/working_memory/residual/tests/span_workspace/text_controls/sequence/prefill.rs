@@ -13,7 +13,8 @@ fn actual_prefill_step_issues_once_and_four_independent_custodies_retire_last() 
             });
             let source = capture.then(capture_source);
             let options = source.as_ref().map(|s| TextPreparationOptions {
-                interventions: None, capture: Some(s.clone()),
+                interventions: None,
+                capture: Some(s.clone()),
             });
             let tokens = if controlled {
                 ControlledTextGeneration::from_input_with_sequence(
@@ -76,15 +77,15 @@ fn actual_prefill_step_issues_once_and_four_independent_custodies_retire_last() 
             state.borrow_mut().issued.clear();
             let (pool, held) = retire_request(&state);
             drop((set, sets, tokens, rt, state, source));
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(native);
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(recovery);
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(roots);
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(projections);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -128,12 +129,12 @@ fn prefill_claim_rejects_equal_geometry_foreign_step_and_spent_original_without_
         .claim_step(&other_context, PendingTextInput::Prefill(()))
         .unwrap();
     let mut bank = prepared.prefill_bank.borrow_mut().take().unwrap();
-    let before = state.borrow().pool.used_bytes().unwrap();
+    let before = state.borrow().pool.payload_used_bytes().unwrap();
     assert!(matches!(
         bank.claim(&foreign),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(state.borrow().pool.used_bytes().unwrap(), before);
+    assert_eq!(state.borrow().pool.payload_used_bytes().unwrap(), before);
     let set = bank.claim(&step).unwrap();
     assert!(matches!(
         bank.claim(&step),
@@ -146,8 +147,8 @@ fn prefill_claim_rejects_equal_geometry_foreign_step_and_spent_original_without_
     let (pool, _) = retire_request(&state);
     let (other_pool, _) = retire_request(&other_state);
     drop((rt, state, other_rt, other_state));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(other_pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(other_pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn cancelled_initial_step_never_consumes_prefill_scope_bank() {
@@ -172,7 +173,7 @@ fn cancelled_initial_step_never_consumes_prefill_scope_bank() {
     drop(run);
     let (pool, _) = retire_request(&state);
     drop((rt, state));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -221,7 +222,7 @@ fn source_component_handoff_keeps_exact_account_remaining_destinations_and_escap
             .unwrap();
         let mut foreign = other.owner.borrow_mut().take_host_destinations().unwrap();
         let pool = state.borrow().pool.clone();
-        let before = pool.used_bytes().unwrap();
+        let before = pool.payload_used_bytes().unwrap();
         assert!(matches!(
             set.take_source_component(&mut foreign, selected),
             Err(WorkingMemoryError::IdentityMismatch)
@@ -245,7 +246,7 @@ fn source_component_handoff_keeps_exact_account_remaining_destinations_and_escap
             (None, None) => assert_eq!(bytes, 0),
             _ => panic!("source extraction and remaining destination disagree"),
         }
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.payload_used_bytes().unwrap(), before);
         assert!(set.take_source_component(&mut host, selected).is_err());
         let receipt = source.try_debit(32).unwrap();
         let error = source.try_debit(33).unwrap_err();
@@ -265,11 +266,11 @@ fn source_component_handoff_keeps_exact_account_remaining_destinations_and_escap
         let (pool, held) = retire_request(&state);
         let (other_pool, _) = retire_request(&other_state);
         drop((rt, state, other_rt, other_state));
-        assert_eq!(other_pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(other_pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         drop(receipt);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

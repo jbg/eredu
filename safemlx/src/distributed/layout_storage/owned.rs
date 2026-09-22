@@ -49,6 +49,10 @@ impl GroupCpuLayoutStorage<'_> {
     }
 }
 impl OwnedGroupCpuLayoutStorage {
+    /// Descriptive ordinary allowance of the retained native incarnation.
+    pub fn ordinary_controls(&self) -> Option<super::super::OrdinaryGroupControls> {
+        self.view().ordinary_controls()
+    }
     pub(in crate::distributed) fn view(&self) -> GroupCpuLayoutStorage<'_> {
         GroupCpuLayoutStorage {
             group: &self.group,
@@ -59,9 +63,13 @@ impl OwnedGroupCpuLayoutStorage {
             evaluation: GroupCpuStorageFacts::from_native(*self.evaluation.native()),
         }
     }
-    pub(in crate::distributed) fn view_with_group<'a>(&'a self, group: &'a Group)
-        -> Result<GroupCpuLayoutStorage<'a>, GroupStorageUnavailable> {
-        if !self.group.shares_native_handle(group) { return Err(GroupStorageUnavailable); }
+    pub(in crate::distributed) fn view_with_group<'a>(
+        &'a self,
+        group: &'a Group,
+    ) -> Result<GroupCpuLayoutStorage<'a>, GroupStorageUnavailable> {
+        if !self.group.shares_native_handle(group) {
+            return Err(GroupStorageUnavailable);
+        }
         let mut view = self.view();
         view.group = group;
         Ok(view)

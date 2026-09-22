@@ -1,40 +1,56 @@
-// These tests exercise numeric ledger and retirement semantics. Their small
-// scalar fixtures are not complete model/workspace quotes or managed inference.
+// Host account phases retain their exact charged controls through retirement.
+// These neutral fixtures construct the account worker without native execution.
 use super::*;
+fn account_used(pool: &MemoryLedger) -> Result<u64, WorkingMemoryError> {
+    let snapshot = pool.snapshot()?;
+    Ok(pool
+        .payload_used_bytes()?
+        .checked_add(snapshot.domains[0].reservation_control_bytes)
+        .unwrap())
+}
 
 fn accepted(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     execution: &InferenceExecutionIdentity,
     bytes: u64,
     floor: u64,
     capacity: u64,
 ) -> Result<PendingAccount, WorkingMemoryError> {
+    let limits = crate::working_memory::memory_fixture::resolved_host_limits(pool, capacity);
     let mut usage = pool
         .0
         .usage
         .lock()
         .map_err(|_| WorkingMemoryError::Poisoned)?;
     let commit =
-        PreparedAccountCommit::prepare(pool, execution, &usage, bytes, Some(capacity), &[])?;
+        PreparedAccountCommit::prepare(pool, execution, &usage, bytes, Some(&limits), &[])?;
     PendingAccount::accept(
         pool,
         execution,
         &mut usage,
         commit,
         bytes,
-        Some(capacity),
+        Some(limits.clone()),
         floor,
     )
 }
 
 #[test]
 fn original_pending_publishes_before_partial_error_and_issued_ids_do_not_recur() {
-    let pool = WorkingMemoryPool::new(1000, 7).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1000, 7).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let pending = accepted(&pool, &execution, 150, 32, 700).unwrap();
-    let id = pool.0.usage.lock().unwrap().pending_original.unwrap().id();
-    assert_eq!(pool.used_bytes().unwrap(), 157);
-    assert_eq!(pool.effective_capacity().unwrap(), 700);
+    let id = pool
+        .0
+        .usage
+        .lock()
+        .unwrap()
+        .pending_original
+        .as_ref()
+        .unwrap()
+        .id();
+    assert_eq!(account_used(&pool).unwrap(), 157);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 700);
     assert!(matches!(
         accepted(&pool, &execution, 1, 0, 1000),
         Err(WorkingMemoryError::AccountConstructionBusy)
@@ -65,13 +81,13 @@ fn original_pending_publishes_before_partial_error_and_issued_ids_do_not_recur()
     assert_eq!(partial.prefix, [13, 21, 34]);
     assert!(std::error::Error::source(&partial.cause).is_none());
     assert_eq!(partial.ticket.id(), id);
-    assert_eq!(pool.used_bytes().unwrap(), 237);
+    assert_eq!(account_used(&pool).unwrap(), 237);
     drop(partial);
-    assert_eq!(pool.used_bytes().unwrap(), 87);
-    assert_eq!(pool.effective_capacity().unwrap(), 650);
+    assert_eq!(account_used(&pool).unwrap(), 87);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 650);
     drop(other);
-    assert_eq!(pool.used_bytes().unwrap(), 7);
-    assert_eq!(pool.effective_capacity().unwrap(), 1000);
+    assert_eq!(account_used(&pool).unwrap(), 7);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 1000);
     assert!(accepted(&pool, &execution, 994, 1, 1000).is_err());
     let next = accepted(&pool, &execution, 40, 16, 1000).unwrap().publish();
     assert!(next.id() > id);
@@ -80,26 +96,26 @@ fn original_pending_publishes_before_partial_error_and_issued_ids_do_not_recur()
 
 #[test]
 fn pending_unwind_returns_only_actual_unpublished_charge_and_keeps_issuance() {
-    let pool = WorkingMemoryPool::new(500, 11).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(500, 11).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let before = pool.0.usage.lock().unwrap().next_funding;
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _pending = accepted(&pool, &execution, 200, 64, 350).unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), 211);
+        assert_eq!(account_used(&pool).unwrap(), 211);
         panic!("before fixed node construction");
     }));
     assert!(failed.is_err());
-    assert_eq!(pool.used_bytes().unwrap(), 11);
-    assert_eq!(pool.effective_capacity().unwrap(), 500);
+    assert_eq!(account_used(&pool).unwrap(), 11);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 500);
     assert_eq!(pool.0.usage.lock().unwrap().next_funding, before + 1);
-    assert_eq!(pool.peak_bytes().unwrap(), 211);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), 211);
     drop(accepted(&pool, &execution, 50, 16, 500).unwrap().publish());
-    assert_eq!(pool.used_bytes().unwrap(), 11);
+    assert_eq!(account_used(&pool).unwrap(), 11);
 }
 
 #[test]
 fn concurrent_terminal_nodes_keep_exact_ceiling_and_floor_through_deallocation() {
-    let pool = WorkingMemoryPool::new(900, 7).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(900, 7).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let first = accepted(&pool, &execution, 120, 32, 500).unwrap().publish();
     let second = accepted(&pool, &execution, 120, 48, 300).unwrap().publish();
@@ -109,7 +125,7 @@ fn concurrent_terminal_nodes_keep_exact_ceiling_and_floor_through_deallocation()
         AFTER_NODE_RETIRE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |pool| {
                 // This would deadlock if the node or hook were destroyed under Usage.
-                let observation = (pool.used_bytes(), pool.effective_capacity());
+                let observation = (account_used(&pool), pool.payload_effective_capacity());
                 let _ = entered.send(observation);
                 let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
             }))
@@ -119,9 +135,9 @@ fn concurrent_terminal_nodes_keep_exact_ceiling_and_floor_through_deallocation()
     let observed = arrival.recv_timeout(std::time::Duration::from_secs(10));
     // Always release and join before checking assertions, including a failed hook.
     drop(second);
-    let held = (pool.used_bytes(), pool.effective_capacity());
+    let held = (account_used(&pool), pool.payload_effective_capacity());
     let third = accepted(&pool, &execution, 50, 16, 700).map(PendingAccount::publish);
-    let held_with_third = (pool.used_bytes(), pool.effective_capacity());
+    let held_with_third = (account_used(&pool), pool.payload_effective_capacity());
     drop(release);
     let joined = worker.join();
     assert!(joined.is_ok());
@@ -129,16 +145,16 @@ fn concurrent_terminal_nodes_keep_exact_ceiling_and_floor_through_deallocation()
     assert_eq!(held, (Ok(87), Ok(300))); // both exact floors; second is queued
     assert_eq!(held_with_third, (Ok(137), Ok(300)));
     let third = third.unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 57);
-    assert_eq!(pool.effective_capacity().unwrap(), 700);
+    assert_eq!(account_used(&pool).unwrap(), 57);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 700);
     drop(third);
-    assert_eq!(pool.used_bytes().unwrap(), 7);
-    assert_eq!(pool.effective_capacity().unwrap(), 900);
+    assert_eq!(account_used(&pool).unwrap(), 7);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 900);
 }
 
 #[test]
 fn poisoned_original_publication_clears_pending_slot_and_retains_conservative_account() {
-    let pool = WorkingMemoryPool::new(500, 3).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(500, 3).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let pending = accepted(&pool, &execution, 100, 32, 250).unwrap();
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -194,7 +210,7 @@ fn prepared_copy_final_owners_drain_host_account_without_an_external_pool() {
     // Numeric account controls only, like the other fixtures in this module.
     // No native work is submitted; the untouched scope can be certified.
     for last in 0..4 {
-        let pool = WorkingMemoryPool::new(1 << 20, 7).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1 << 20, 7).unwrap();
         let pool_weak = Arc::downgrade(&pool.0);
         let layout = WorkspaceCopyAccountLayout::workspace().unwrap();
         let host_bytes = u64::try_from(layout.requested_bytes()).unwrap();
@@ -217,20 +233,31 @@ fn prepared_copy_final_owners_drain_host_account_without_an_external_pool() {
         let identity = Arc::downgrade(&execution.0);
         let extra_identity = execution.clone();
         let source = pool
-            .register_storage(std::iter::empty::<(u32, u64)>())
+            .register_host_storage(std::iter::empty::<(u32, u64)>())
             .unwrap();
         let pin = RegisteredStoragePin::new(
             pool.pin_registered_storage(std::iter::empty::<(u32, u64)>())
                 .unwrap(),
         );
         let (run, scope) = pool
-            .open_workspace_copy_account(&source, pin, &execution, 64, 1 << 20)
+            .open_workspace_copy_account(
+                &source,
+                pin,
+                &execution,
+                &crate::working_memory::memory_fixture::host_requirements(&pool, 64),
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 20),
+            )
             .unwrap();
         copy_id.store(run.id, Ordering::SeqCst);
-        let (custody, scope) =
-            AdmittedWorkspaceCopy::from_account(execution, 64, run, scope).into_parts();
+        let (custody, scope) = AdmittedWorkspaceCopy::from_account(
+            execution,
+            crate::working_memory::memory_fixture::host_requirements(&pool, 64),
+            run,
+            scope,
+        )
+        .into_parts();
         let retained = (last == 3).then(|| custody.retention());
-        assert_eq!(pool.used_bytes().unwrap(), 7 + host_bytes + 64);
+        assert_eq!(account_used(&pool).unwrap(), 7 + host_bytes + 64);
         drop((source, source_execution, host, pool));
         match last {
             0 => {
@@ -288,7 +315,7 @@ fn finite_copy_publication_checks_exact_account_and_retires_last_output_host_cus
                 .expect("H ticket still retains the pool");
             let usage = pool.usage.lock().unwrap();
             assert_eq!(usage.reserved, self.bytes);
-            assert_eq!(usage.registered, 0);
+            assert_eq!(usage.registered - usage.registry_metadata, 0);
             assert!(usage.storage.is_empty());
             assert_eq!(self.drops.fetch_add(1, Ordering::SeqCst), 0);
         }
@@ -299,7 +326,7 @@ fn finite_copy_publication_checks_exact_account_and_retires_last_output_host_cus
     }
     // This is the neutral physical-capacity contract, without a native worker.
     // The two untouched scopes may be certified after the publication checks.
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 20, 0).unwrap();
     let pool_weak = Arc::downgrade(&pool.0);
     let account = WorkspaceCopyAccountLayout::workspace().unwrap();
     let publication = || WorkspaceCopyPublicationPlan::<u32>::new(1, 0).unwrap();
@@ -319,7 +346,7 @@ fn finite_copy_publication_checks_exact_account_and_retires_last_output_host_cus
         _ticket: ticket,
     });
     let source = pool
-        .register_storage(std::iter::empty::<(u32, u64)>())
+        .register_host_storage(std::iter::empty::<(u32, u64)>())
         .unwrap();
     let open = || {
         let execution = WorkspaceCopyAccountLayout::workspace()
@@ -330,34 +357,49 @@ fn finite_copy_publication_checks_exact_account_and_retires_last_output_host_cus
                 .unwrap(),
         );
         let (run, scope) = pool
-            .open_workspace_copy_account(&source, pin, &execution, 64, 1 << 20)
+            .open_workspace_copy_account(
+                &source,
+                pin,
+                &execution,
+                &crate::working_memory::memory_fixture::host_requirements(&pool, 64),
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 20),
+            )
             .unwrap();
-        AdmittedWorkspaceCopy::from_account(execution, 64, run, scope).into_parts()
+        AdmittedWorkspaceCopy::from_account(
+            execution,
+            crate::working_memory::memory_fixture::host_requirements(&pool, 64),
+            run,
+            scope,
+        )
+        .into_parts()
     };
     let (copy, scope) = open();
     let (foreign, foreign_scope) = open();
-    let before = pool.used_bytes().unwrap();
+    let before = account_used(&pool).unwrap();
     assert!(matches!(
         publication().prepare(&copy, &foreign_scope),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(account_used(&pool).unwrap(), before);
     let mut rejected = publication().prepare(&copy, &scope).unwrap();
-    rejected.push(17, 24).unwrap();
+    rejected.push(17, 24, pool.host_placement_handle()).unwrap();
     assert_eq!(
         rejected.publish(&foreign_scope),
         Err(WorkingMemoryError::IdentityMismatch)
     );
     assert!(rejected.input(0).is_none());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(account_used(&pool).unwrap(), before);
     assert!(pool.pin_registered_storage([(17u32, 24)]).is_err());
     let mut accepted = publication().prepare(&copy, &scope).unwrap();
-    accepted.push(19, 32).unwrap();
+    accepted.push(19, 32, pool.host_placement_handle()).unwrap();
     accepted.publish(&scope).unwrap();
     let output = accepted.take_input(0).unwrap();
-    assert_eq!(output.bytes(), 32);
-    assert_eq!(pool.0.usage.lock().unwrap().registered, 32);
-    assert_eq!(pool.used_bytes().unwrap(), before); // B moves; no second charge
+    assert_eq!(output.bytes(), Some(32));
+    {
+        let usage = pool.0.usage.lock().unwrap();
+        assert_eq!(usage.registered - usage.registry_metadata, 32);
+    }
+    assert_eq!(account_used(&pool).unwrap(), before); // B moves; no second charge
     scope.certify().unwrap();
     foreign_scope.certify().unwrap();
     drop((
@@ -382,18 +424,20 @@ fn finite_copy_publication_checks_exact_account_and_retires_last_output_host_cus
 #[test]
 fn original_ticket_quarantine_preserves_unfunded_phase_and_full_charge() {
     for poison in [false, true] {
-        let pool = WorkingMemoryPool::new(1000, 7).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1000, 7).unwrap();
         let execution = InferenceExecutionIdentity::default();
         let ticket = accepted(&pool, &execution, 150, 32, 700).unwrap().publish();
         let id = ticket.id();
         ticket.status().unwrap();
         let issuance = pool.0.usage.lock().unwrap().next_funding;
         if poison {
-            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _usage = pool.0.usage.lock().unwrap();
-                panic!("original source publication failure");
-            }))
-            .is_err());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _usage = pool.0.usage.lock().unwrap();
+                    panic!("original source publication failure");
+                }))
+                .is_err()
+            );
         }
         // An original ticket remains outside the native Funded lookup. Both
         // ordinary and poisoned cleanup must fence it without a second panic.
@@ -423,13 +467,20 @@ fn original_ticket_quarantine_preserves_unfunded_phase_and_full_charge() {
         assert!(state.quarantined && !state.metadata_live);
         assert_eq!(usage.reserved, 150);
         assert_eq!(usage.reservations, 1);
-        assert_eq!(usage.funding.capacity(), 700);
+        assert_eq!(
+            usage.funding.capacity(pool.topology().host_domain()),
+            Ok(
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, 700)
+                    .get(pool.topology().host_domain())
+                    .unwrap()
+            )
+        );
     }
 }
 
 #[test]
 fn original_source_capacity_keeps_unfunded_phase_and_rejects_foreign_or_retired_accounts() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1000, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let ticket = accepted(&pool, &execution, 150, 32, 700).unwrap().publish();
     let id = ticket.id();
@@ -437,16 +488,27 @@ fn original_source_capacity_keeps_unfunded_phase_and_rejects_foreign_or_retired_
         let usage = pool.0.usage.lock().unwrap();
         ticket.validate_in(&usage).unwrap();
         assert!(usage.funding.get(&id).is_none());
-        assert_eq!(usage.funding.accepted_source_capacity(id, &execution), Ok(700));
-        assert_eq!(usage.funding.accepted_source_capacity(
-            id, &InferenceExecutionIdentity::default()), Err(WorkingMemoryError::IdentityMismatch));
+        assert_eq!(
+            usage.funding.accepted_source_capacity(id, &execution),
+            Ok(Some(
+                &crate::working_memory::memory_fixture::resolved_host_limits(&pool, 700)
+            ))
+        );
+        assert_eq!(
+            usage
+                .funding
+                .accepted_source_capacity(id, &InferenceExecutionIdentity::default()),
+            Err(WorkingMemoryError::IdentityMismatch)
+        );
         assert!(usage.funding.get(&id).is_none());
     }
-    assert_eq!(pool.used_bytes().unwrap(), 150);
+    assert_eq!(account_used(&pool).unwrap(), 150);
     drop(ticket);
     let usage = pool.0.usage.lock().unwrap();
-    assert_eq!(usage.funding.accepted_source_capacity(id, &execution),
-        Err(WorkingMemoryError::IdentityMismatch));
+    assert_eq!(
+        usage.funding.accepted_source_capacity(id, &execution),
+        Err(WorkingMemoryError::IdentityMismatch)
+    );
     drop(usage);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(account_used(&pool).unwrap(), 0);
 }

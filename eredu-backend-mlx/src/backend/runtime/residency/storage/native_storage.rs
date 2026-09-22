@@ -17,6 +17,17 @@ mod selected;
 mod work_rows;
 pub(crate) use selected::{NativeProgramStorage, NativeSamplingStorage};
 
+/// The native callback holds only neutral accounting custody, never native roots.
+#[derive(Debug)]
+pub(crate) struct NativeBudgetOwner(OriginalNativeBudgetCustody);
+impl safemlx::OriginalBufferLifetimeObserver for NativeBudgetOwner {
+    fn closed_occupancy(&self, bytes: usize) {
+        if let Ok(bytes) = u64::try_from(bytes) {
+            self.0.retire_completed_occupancy(bytes);
+        }
+    }
+}
+
 pub(crate) type Registration = NativeStorageRegistration<StorageIdentity>;
 pub(crate) type Bank = eredu_runtime::working_memory::OriginalNativeStorageBank<MlxNativeStorage>;
 pub(crate) struct BankOwner(Option<Rc<std::cell::RefCell<Bank>>>);
@@ -164,11 +175,15 @@ pub(crate) struct MlxNativeStorage {
     runtime: Result<Rc<PreparedInputRuntime>, eredu_core::SharedBackendFailure>,
     selection: NativeStorageSelection,
     initial_publication: Option<super::RetainedStoragePublication>,
+    parameter_sources: crate::backend::nn::workspace::CompletedParameterSources,
+    displaced_parameter_sources: crate::backend::nn::workspace::CompletedParameterSources,
 }
 impl Clone for MlxNativeStorage {
     fn clone(&self) -> Self {
         Self {
             initial_publication: self.initial_publication.clone(),
+            parameter_sources: self.parameter_sources.clone(),
+            displaced_parameter_sources: self.displaced_parameter_sources.clone(),
             ..Self::new(&self.runtime, &self.selection)
         }
     }
@@ -181,6 +196,16 @@ impl fmt::Debug for MlxNativeStorage {
     }
 }
 impl MlxNativeStorage {
+    /// Borrows the allocator witness retained by this selected native context.
+    /// Inspection neither prepares a runtime nor grants a native budget.
+    pub(crate) fn prepared_input_runtime(
+        &self,
+    ) -> Result<&PreparedInputRuntime, NativeStorageCause> {
+        self.runtime
+            .as_deref()
+            .map_err(|cause| NativeStorageCause::Cold(cause.retained()))
+    }
+
     // Only the already-selected native context supplies this ordinary cold
     // witness. Projection clones no payload and performs no runtime preparation.
     pub(crate) fn new(
@@ -194,10 +219,31 @@ impl MlxNativeStorage {
             },
             selection: selection.clone(),
             initial_publication: None,
+            parameter_sources: Default::default(),
+            displaced_parameter_sources: Default::default(),
         }
     }
-    pub(crate) fn with_initial_publication(mut self, publication: super::RetainedStoragePublication) -> Self {
+    pub(crate) fn with_initial_publication(
+        mut self,
+        publication: super::RetainedStoragePublication,
+    ) -> Self {
         self.initial_publication = Some(publication);
+        self
+    }
+    pub(crate) fn with_parameter_sources(
+        mut self,
+        sources: crate::backend::nn::workspace::CompletedParameterSources,
+    ) -> Self {
+        self.parameter_sources = sources;
+        self
+    }
+    /// Publication includes displaced roots still retained for parameter removal.
+    /// Their completed accounts do not enlarge the installed workspace source.
+    pub(crate) fn with_displaced_parameter_sources(
+        mut self,
+        sources: crate::backend::nn::workspace::CompletedParameterSources,
+    ) -> Self {
+        self.displaced_parameter_sources = sources;
         self
     }
 }
@@ -226,19 +272,29 @@ impl<'a> CanonicalObservation<'a> {
         }
     }
     fn receipt(self) -> Option<super::RetainedAllocationReceipt<'a>> {
-        self.proof.map(|proof| proof.borrow(self.cell.custody()))
+        self.proof
+            .zip(self.cell.custody())
+            .map(|(proof, custody)| proof.borrow(custody))
     }
 }
 
 pub(crate) enum Observation<'a> {
     Origin(OriginalBufferWitness<'a>, Option<CanonicalObservation<'a>>),
+    CompletedNumerical(
+        OriginalBufferWitness<'a>,
+        &'a eredu_runtime::working_memory::OriginalNumericalBudgetCustody,
+        Option<CanonicalObservation<'a>>,
+    ),
     Existing(
         OriginalBufferAliasWitness<'a>,
         Option<CanonicalObservation<'a>>,
     ),
     Ordinary(OrdinaryBufferWitness<'a>),
     Immutable(safemlx::ImmutableSourceWitness<'a>),
-    Host(safemlx::HostTransferArrayAliasWitness<'a>),
+    Host(
+        safemlx::HostTransferArrayAliasWitness<'a>,
+        Option<super::RetainedAllocationReceipt<'a>>,
+    ),
     OrdinaryHostArray(safemlx::HostTransferArrayAliasWitness<'a>),
     HostBuffer(
         safemlx::ImmutableHostTransferWitness<'a>,
@@ -250,17 +306,20 @@ pub(crate) enum Observation<'a> {
 impl<'a> Observation<'a> {
     fn cell_receipt(&self) -> Option<super::RetainedAllocationReceipt<'a>> {
         match self {
-            Self::Origin(_, Some(cell)) | Self::Existing(_, Some(cell)) => (*cell).receipt(),
+            Self::Origin(_, Some(cell))
+            | Self::CompletedNumerical(_, _, Some(cell))
+            | Self::Existing(_, Some(cell)) => (*cell).receipt(),
             _ => None,
         }
     }
     fn allocation(&self) -> Option<safemlx::AllocationInfo> {
         Some(match self {
             Self::Origin(witness, _) => witness.allocation(),
+            Self::CompletedNumerical(witness, _, _) => witness.allocation(),
             Self::Existing(witness, _) => witness.allocation(),
             Self::Ordinary(witness) => witness.allocation(),
             Self::Immutable(witness) => witness.allocation(),
-            Self::Host(witness) | Self::OrdinaryHostArray(witness) => witness.allocation(),
+            Self::Host(witness, _) | Self::OrdinaryHostArray(witness) => witness.allocation(),
             Self::HostBuffer(witness, _) | Self::OrdinaryHost(witness) => witness.allocation(),
             Self::Empty => return None,
         })
@@ -269,6 +328,7 @@ impl<'a> Observation<'a> {
 
 pub(crate) enum NativeStorageCause {
     Cold(eredu_core::SharedBackendFailure),
+    Custody(eredu_runtime::working_memory::WorkingMemoryError),
     Fixed(OriginalBufferCause),
     Control(safemlx::OriginalNativeControlError),
     Observation(safemlx::ScopedSubmissionProgress),
@@ -290,6 +350,7 @@ impl fmt::Debug for NativeStorageCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cold(cause) => f.debug_tuple("Cold").field(cause).finish(),
+            Self::Custody(cause) => f.debug_tuple("Custody").field(cause).finish(),
             Self::Control(cause) => f.debug_tuple("Control").field(cause).finish(),
             Self::Observation(cause) => f.debug_tuple("Observation").field(cause).finish(),
             Self::Carrier(cause) => f.debug_tuple("Carrier").field(cause).finish(),
@@ -304,6 +365,7 @@ impl fmt::Display for NativeStorageCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cold(cause) => fmt::Display::fmt(cause.source_error(), f),
+            Self::Custody(cause) => fmt::Display::fmt(cause, f),
             Self::Control(cause) => fmt::Display::fmt(cause, f),
             Self::Observation(cause) => {
                 write!(f, "original preparation observation unavailable: {cause:?}")
@@ -322,6 +384,7 @@ impl std::error::Error for NativeStorageCause {
         Some(match self {
             Self::Observation(_) => unreachable!(),
             Self::Cold(cause) => cause.source_error(),
+            Self::Custody(cause) => cause,
             Self::Control(cause) => cause,
             Self::Carrier(cause) => cause,
             Self::Fixed(cause) | Self::Budget { cause, .. } => cause,
@@ -342,6 +405,13 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
         &self.selection
     }
 
+    fn uniform_budget_placement(&self) -> Option<std::sync::Arc<eredu_core::MemoryPlacement>> {
+        let runtime = self.runtime.as_ref().ok()?;
+        let pool = crate::backend::managed_memory::try_ledger().ok()?;
+        crate::backend::managed_memory::placement_fact_handle(runtime.allocation_placement(), &pool)
+            .ok()
+    }
+
     fn key_clone_storage_bytes(&self) -> Option<u64> {
         // The source key validator excludes arbitrary inline byte allocations.
         // Native keys are scalars; authentic checkpoint keys retain their own
@@ -355,6 +425,7 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
     ) -> Result<(), eredu_runtime::working_memory::WorkingMemoryError> {
         match key {
             StorageIdentity::Native(_)
+            | StorageIdentity::NativeControl(_)
             | StorageIdentity::GroupBuffer(_)
             | StorageIdentity::Source(_)
             | StorageIdentity::HostMetadata(_) => Ok(()),
@@ -384,22 +455,22 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
         };
         let capacity = usize::try_from(custody.capacity_bytes())
             .map_err(|_| NativeStorageCause::Fixed(OriginalBufferCause::InvalidLayout))?;
-        let prepared = PreparedOriginalBufferBudget::try_new(runtime, capacity, custody).map_err(
-            |failure| {
-                let (cause, custody) = failure.into_parts();
-                NativeStorageCause::Budget {
-                    cause,
-                    _custody: custody,
-                }
-            },
-        )?;
-        prepared.try_allocate().map_err(|failure| {
+        let prepared =
+            PreparedOriginalBufferBudget::try_new(runtime, capacity, NativeBudgetOwner(custody))
+                .map_err(|failure| {
+                    let (cause, custody) = failure.into_parts();
+                    NativeStorageCause::Budget {
+                        cause,
+                        _custody: custody.0,
+                    }
+                })?;
+        prepared.try_allocate_observed().map_err(|failure| {
             let (cause, prepared) = failure.into_parts();
             // C refusal guarantees null output and no retained native prefix.
             // Cancel only the unattached node, while its custody remains live.
             NativeStorageCause::Budget {
                 cause,
-                _custody: prepared.into_owner(),
+                _custody: prepared.into_owner().0,
             }
         })
     }
@@ -411,9 +482,13 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
     ) -> Result<Observation<'a>, Self::Error> {
         let (root, cell) = match root {
             NativeStorageRoot::Array(root) => (root, None),
-            NativeStorageRoot::CanonicalArray(cell) => (cell.array(), Some(cell)),
+            NativeStorageRoot::CanonicalArray(cell) => {
+                (cell.array(), cell.custody().is_some().then_some(cell))
+            }
             NativeStorageRoot::Host(host, receipt) => {
-                let witness = host.inspect_original_source().map_err(NativeStorageCause::Fixed)?;
+                let witness = host
+                    .inspect_original_source()
+                    .map_err(NativeStorageCause::Fixed)?;
                 // Prepared construction does not identify the payer: load-time
                 // managers, saved copies and source banks share this worker.
                 return if witness.is_prepared_source() {
@@ -421,19 +496,58 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
                 } else if receipt.is_none() {
                     Ok(Observation::OrdinaryHost(witness))
                 } else {
-                    Err(NativeStorageCause::Fixed(OriginalBufferCause::UncertifiedBacking))
+                    Err(NativeStorageCause::Fixed(
+                        OriginalBufferCause::UncertifiedBacking,
+                    ))
                 };
             }
         };
         let observed = match budget.inspect_array(root) {
-            Ok(Some(witness)) => Ok(Observation::Origin(witness, cell.map(CanonicalObservation::capture))),
-            Err(OriginalBufferCause::ForeignDomain) => root
-                .inspect_original_buffer_alias()
-                .map_err(NativeStorageCause::Fixed)?
-                .map(|witness| Observation::Existing(witness, cell.map(CanonicalObservation::capture)))
-                .ok_or(NativeStorageCause::Fixed(
-                    OriginalBufferCause::UncertifiedBacking,
-                )),
+            Ok(Some(witness)) => Ok(Observation::Origin(
+                witness,
+                cell.map(CanonicalObservation::capture),
+            )),
+            Err(OriginalBufferCause::ForeignDomain) => {
+                let retained_cell_source =
+                    match cell.and_then(|cell| cell.completed_numerical_source()) {
+                        Some(source) => source
+                            .budget()
+                            .inspect_array(root)
+                            .map_err(NativeStorageCause::Fixed)?
+                            .map(|witness| (witness, source.account())),
+                        None => None,
+                    };
+                let completed = match retained_cell_source {
+                    Some(source) => Some(source),
+                    None => match self
+                        .parameter_sources
+                        .observe(root)
+                        .map_err(NativeStorageCause::Fixed)?
+                    {
+                        Some(completed) => Some(completed),
+                        None => self
+                            .displaced_parameter_sources
+                            .observe(root)
+                            .map_err(NativeStorageCause::Fixed)?,
+                    },
+                };
+                match completed {
+                    Some((witness, account)) => Ok(Observation::CompletedNumerical(
+                        witness,
+                        account,
+                        cell.map(CanonicalObservation::capture),
+                    )),
+                    None => root
+                        .inspect_original_buffer_alias()
+                        .map_err(NativeStorageCause::Fixed)?
+                        .map(|witness| {
+                            Observation::Existing(witness, cell.map(CanonicalObservation::capture))
+                        })
+                        .ok_or(NativeStorageCause::Fixed(
+                            OriginalBufferCause::UncertifiedBacking,
+                        )),
+                }
+            }
             Err(cause) => Err(NativeStorageCause::Fixed(cause)),
             Ok(None) => match root
                 .inspect_immutable_source()
@@ -447,23 +561,63 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
                     .inspect_host_transfer_alias()
                     .map_err(NativeStorageCause::Fixed)?
                 {
-                    Some(witness) if witness.is_prepared_source() => Ok(Observation::Host(witness)),
+                    Some(witness) if witness.is_prepared_source() => {
+                        let receipt = match self
+                            .parameter_sources
+                            .host_receipt(witness.allocation())
+                            .map_err(NativeStorageCause::Fixed)?
+                        {
+                            Some(receipt) => Some(receipt),
+                            None => self
+                                .displaced_parameter_sources
+                                .host_receipt(witness.allocation())
+                                .map_err(NativeStorageCause::Fixed)?,
+                        };
+                        Ok(Observation::Host(witness, receipt))
+                    }
                     Some(witness) => Ok(Observation::OrdinaryHostArray(witness)),
                     None => ordinary_observation(root),
                 },
             },
         }?;
         let proof = match &observed {
-            Observation::Origin(_, Some(cell)) | Observation::Existing(_, Some(cell)) => cell.proof,
+            Observation::Origin(_, Some(cell))
+            | Observation::CompletedNumerical(_, _, Some(cell))
+            | Observation::Existing(_, Some(cell)) => cell.proof,
             _ => cell.and_then(|cell| cell.proof()),
         };
         if let Some(proof) = proof {
-            if !matches!(&observed, Observation::Origin(..) | Observation::Existing(..))
-                || observed.allocation() != Some(proof.allocation()) {
-                return Err(NativeStorageCause::Fixed(OriginalBufferCause::UncertifiedBacking));
+            if !matches!(
+                &observed,
+                Observation::Origin(..)
+                    | Observation::CompletedNumerical(..)
+                    | Observation::Existing(..)
+            ) || observed.allocation() != Some(proof.allocation())
+            {
+                return Err(NativeStorageCause::Fixed(
+                    OriginalBufferCause::UncertifiedBacking,
+                ));
             }
         }
         Ok(observed)
+    }
+
+    fn placement(
+        observation: &Observation<'_>,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<
+        std::sync::Arc<eredu_core::MemoryPlacement>,
+        eredu_runtime::working_memory::WorkingMemoryError,
+    > {
+        let facts = observation
+            .allocation()
+            .ok_or(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)?;
+        let pool = crate::backend::managed_memory::try_ledger()
+            .map_err(|_| eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)?;
+        topology.slot(pool.topology().host_domain())?;
+        Ok(crate::backend::managed_memory::allocation_placement_handle(
+            &facts, &pool,
+        )?)
     }
 
     fn describe(observation: &Observation<'_>) -> NativeStorageObservation<StorageIdentity> {
@@ -476,6 +630,9 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
         let bytes = facts.bytes() as u64;
         match observation {
             Observation::Origin(..) => NativeStorageObservation::Originating(key, bytes),
+            Observation::CompletedNumerical(_, account, _) => {
+                NativeStorageObservation::CompletedNumerical(key, bytes, (*account).clone())
+            }
             Observation::Ordinary(_)
             | Observation::OrdinaryHostArray(_)
             | Observation::OrdinaryHost(_) => NativeStorageObservation::Ordinary(key, bytes),
@@ -484,31 +641,67 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
             // prove ownership; the canonical row supplies the accounting origin.
             Observation::Existing(..)
             | Observation::Immutable(_)
-            | Observation::Host(_)
+            | Observation::Host(..)
             | Observation::HostBuffer(..) => NativeStorageObservation::ExistingPhysical(key, bytes),
             Observation::Empty => NativeStorageObservation::Empty,
         }
     }
 
-    fn has_retained_attachment(&self, previous: &Observation<'_>, observation: &Observation<'_>, pool: &eredu_runtime::working_memory::WorkingMemoryPool) -> bool {
-        let Some(allocation) = observation.allocation() else { return false };
+    fn missing_existing_source_label(observation: &Observation<'_>) -> &'static str {
+        match observation {
+            Observation::Existing(..) => "registry original tensor alias missing",
+            Observation::Immutable(_) => "registry immutable tensor alias missing",
+            Observation::Host(..) => "registry prepared host tensor alias missing",
+            Observation::HostBuffer(..) => "registry prepared host buffer alias missing",
+            _ => "registry physical alias missing",
+        }
+    }
+
+    fn has_retained_attachment(
+        &self,
+        previous: &Observation<'_>,
+        observation: &Observation<'_>,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
+    ) -> bool {
+        let Some(allocation) = observation.allocation() else {
+            return false;
+        };
         if std::mem::discriminant(previous) != std::mem::discriminant(observation)
             || previous.allocation() != Some(allocation)
-        { return false; }
+        {
+            return false;
+        }
+        if matches!(observation, Observation::CompletedNumerical(..)) {
+            // Its actual numerical owner already retains the backing account.
+            // Every publication still validates that account atomically; an
+            // unrelated canonical receipt cannot bypass that transaction.
+            return false;
+        }
         match (previous.cell_receipt(), observation.cell_receipt()) {
-            (Some(prior), Some(current)) => return prior.matches(allocation, pool) && current.matches(allocation, pool),
+            (Some(prior), Some(current)) => {
+                return prior.matches(allocation, pool) && current.matches(allocation, pool);
+            }
             (Some(_), None) | (None, Some(_)) => return false,
             _ => {}
         }
         match (previous, observation) {
-            (Observation::HostBuffer(_, Some(prior)), Observation::HostBuffer(_, Some(current))) =>
-                return prior.matches(allocation, pool) && current.matches(allocation, pool),
-            (Observation::HostBuffer(_, Some(_)), _) | (_, Observation::HostBuffer(_, Some(_))) =>
-                return false,
+            (Observation::Host(_, Some(prior)), Observation::Host(_, Some(current))) => {
+                return prior.matches(allocation, pool) && current.matches(allocation, pool);
+            }
+            (
+                Observation::HostBuffer(_, Some(prior)),
+                Observation::HostBuffer(_, Some(current)),
+            ) => return prior.matches(allocation, pool) && current.matches(allocation, pool),
+            (Observation::HostBuffer(_, Some(_)), _) | (_, Observation::HostBuffer(_, Some(_))) => {
+                return false;
+            }
             _ => {}
         }
-        self.initial_publication.as_ref().is_some_and(|publication|
-            publication.has_native_attachment(pool.shared_storage_domain(), allocation))
+        self.initial_publication
+            .as_ref()
+            .is_some_and(|publication| {
+                publication.has_native_attachment(pool.shared_storage_accounting_id(), allocation)
+            })
     }
 
     fn prepare_attachment(
@@ -535,24 +728,59 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
         let result = match observation {
             Observation::Origin(witness, cell) => {
                 let allocation = witness.allocation();
-                if cell.is_some_and(|cell| !attachment.owner().has_metadata_origin(cell.cell.custody())
-                    || cell.proof.is_some_and(|proof| proof.allocation() != allocation)) {
-                    return Err((NativeStorageCause::Fixed(OriginalBufferCause::UncertifiedBacking), attachment));
+                if cell.is_some_and(|cell| {
+                    !cell
+                        .cell
+                        .custody()
+                        .is_some_and(|custody| attachment.owner().has_metadata_origin(custody))
+                        || cell
+                            .proof
+                            .is_some_and(|proof| proof.allocation() != allocation)
+                }) {
+                    return Err((
+                        NativeStorageCause::Fixed(OriginalBufferCause::UncertifiedBacking),
+                        attachment,
+                    ));
                 }
                 let result = witness.try_attach(attachment);
                 if result.is_ok() {
                     if let Some(cell) = cell {
-                        assert!(cell.cell.record_attachment(super::PublishedAllocation::attached(allocation)),
-                            "immutable canonical allocation changed after checked attachment");
+                        assert!(
+                            cell.cell
+                                .record_attachment(super::PublishedAllocation::attached(
+                                    allocation
+                                )),
+                            "immutable canonical allocation changed after checked attachment"
+                        );
                     }
                 }
                 result
             }
+            Observation::CompletedNumerical(witness, account, _) => {
+                if let Err(cause) = witness.validate_current() {
+                    return Err((NativeStorageCause::Fixed(cause), attachment));
+                }
+                if let Err(cause) = attachment
+                    .owner()
+                    .confirm_completed_numerical_custody(account)
+                {
+                    return Err((NativeStorageCause::Custody(cause), attachment));
+                }
+                // The backing already retains NumericalBudgetOwner and its
+                // original metadata. Retire this publisher's transient nodes
+                // outside Usage without appending another native sidecar.
+                drop(attachment);
+                return Ok(());
+            }
             Observation::Existing(witness, _) => witness.try_attach(attachment),
             Observation::Ordinary(witness) => witness.try_attach(attachment),
             Observation::Immutable(witness) => witness.try_attach(attachment),
-            Observation::Host(witness) | Observation::OrdinaryHostArray(witness) => witness.try_attach(attachment),
-            Observation::HostBuffer(witness, _) | Observation::OrdinaryHost(witness) => witness.try_attach(attachment),
+            Observation::Host(witness, _) | Observation::OrdinaryHostArray(witness) => {
+                witness.try_attach(attachment)
+            }
+            Observation::HostBuffer(witness, _) | Observation::OrdinaryHost(witness) => {
+                witness.try_attach(attachment)
+            }
             Observation::Empty => {
                 return Err((
                     NativeStorageCause::Fixed(OriginalBufferCause::UncertifiedBacking),
@@ -604,9 +832,5 @@ fn ordinary_observation(root: &Array) -> Result<Observation<'_>, NativeStorageCa
     }
 }
 
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    not(feature = "cuda")
-))]
+#[cfg(all(test, target_vendor = "apple", not(feature = "cuda")))]
 mod tests;

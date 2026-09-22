@@ -10,14 +10,15 @@ fn schedule_fault(fault: ScheduleFault) {
 fn speculative_capacity_requires_matching_source_before_prompt_or_model_work() {
     for controlled in [false, true] {
         for (capacity, expected) in [
-            (None, eredu_core::TokenInputRejection::Unsupported),
+            (None, eredu_core::TokenInputRejection::IdentityMismatch),
             (
                 Some(16 << 20),
                 eredu_core::TokenInputRejection::IdentityMismatch,
             ),
         ] {
             let (mut model, chat, mut settings) = setup();
-            settings.inference.managed_memory_capacity_bytes = capacity;
+            settings.inference.memory_limits =
+                capacity.map(crate::memory::limits).unwrap_or_default();
             let _guard = probe(Fault::None);
             let error = run_speculative(&mut model, &chat, settings, controlled).unwrap_err();
             let error = error
@@ -36,8 +37,8 @@ fn speculative_capacity_requires_matching_source_before_prompt_or_model_work() {
 #[test]
 fn speculative_later_lane_foreign_capacity_rejects_whole_batch_before_prompt() {
     let (mut model, chat, settings) = setup();
-    let mut bounded = settings;
-    bounded.inference.managed_memory_capacity_bytes = Some(16 << 20);
+    let mut bounded = settings.clone();
+    bounded.inference.memory_limits = crate::memory::limits(16 << 20);
     let _guard = probe(Fault::None);
     let error = model
         .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
@@ -146,7 +147,8 @@ fn peer_cancellation_before_draft_and_during_verification_preserves_committed_pr
     for controlled in [false, true] {
         for pending in [false, true] {
             let (mut model, chat, settings) = setup();
-            let baseline = run_speculative(&mut model, &chat, settings, controlled).unwrap();
+            let baseline =
+                run_speculative(&mut model, &chat, settings.clone(), controlled).unwrap();
             let _guard = probe(Fault::None);
             schedule_fault(ScheduleFault::Cancel { lane: 0, pending });
             let actual = run_speculative(&mut model, &chat, settings, controlled).unwrap();
@@ -169,7 +171,7 @@ fn peer_cancellation_before_draft_and_during_verification_preserves_committed_pr
 fn peer_completion_delay_polls_without_repeating_native_work_or_publication() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
-        let baseline = run_speculative(&mut model, &chat, settings, controlled).unwrap();
+        let baseline = run_speculative(&mut model, &chat, settings.clone(), controlled).unwrap();
         let _guard = probe(Fault::None);
         schedule_fault(ScheduleFault::DelayCompletion);
         assert_eq!(
@@ -237,7 +239,7 @@ fn peer_cancellation_is_per_lane_and_other_batch_lanes_finish() {
                     input: eredu::api::PreparedChatPrompt::TokenIds(&[3, 4]),
                     output_mode: eredu::api::PreparedChatOutputMode::Text,
                     skip_special_tokens: true,
-                    settings,
+                    settings: settings.clone(),
                     max_draft_tokens: NonZeroUsize::new(1).unwrap(),
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),

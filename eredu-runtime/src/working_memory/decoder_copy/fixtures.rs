@@ -4,9 +4,9 @@ use crate::working_memory::{
 };
 use crate::{PenaltyConfig, SamplingBackend, TokenDomain};
 use eredu_core::{
-    cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
-    InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig,
-    StateMemoryLayout, TextGenerationConfig, TokenFilter, WorkspaceBound,
+    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
+    InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig, StateMemoryLayout,
+    TextGenerationConfig, TokenFilter, WorkspaceBound, cache::LayerCachePolicy,
 };
 use std::cell::Cell;
 
@@ -37,7 +37,7 @@ fn config(outputs: usize, adaptive: bool) -> TextGenerationConfig {
 // The generous source envelope covers this fixture's complete host work; it is
 // not a synthetic assertion about native model workspace or snapshot support.
 fn prepared_request(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     outputs: usize,
     adaptive: bool,
@@ -50,7 +50,7 @@ fn prepared_request(
 }
 
 fn prepared_request_with_bytes(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     outputs: usize,
     adaptive: bool,
@@ -86,8 +86,13 @@ fn prepared_request_with_bytes(
     )
     .unwrap();
     let bound = |bytes| WorkspaceBound::bounded(bytes, "portable scalar sampler host envelope");
-    let state = state
+    let mut state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: Some(crate::working_memory::memory_fixture::host_workspace(
+                pool,
+                geometry,
+                source_bytes,
+            )),
             geometry,
             activations: bound(source_bytes),
             attention: bound(0),
@@ -97,27 +102,35 @@ fn prepared_request_with_bytes(
             retained: bound(0),
         })
         .unwrap();
+    state.physical_domains = Some(crate::working_memory::memory_fixture::empty_state(
+        pool, geometry,
+    ));
     let reservation: WorkingMemoryReservation = pool
         .reserve_with_capacity(
             &execution,
             &Admission {
+                memory_limits: crate::working_memory::memory_fixture::host_limits(capacity),
+                additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
                 requested_positions: 1 + outputs as u64,
                 state,
-                incremental_required_bytes: source_bytes,
-                available_memory_bytes: None,
+                incremental_required_bytes: Some(source_bytes),
             },
-            capacity,
+            crate::working_memory::memory_fixture::host_limits(capacity)
+                .resolve(pool.topology())
+                .unwrap(),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let request = InferenceRequest::from(reservation);
     let config = config(outputs, adaptive);
-    let preparation = request.prepare_text(&execution, geometry, config).unwrap();
+    let preparation = request
+        .prepare_text(&execution, geometry, config.clone())
+        .unwrap();
     (preparation, run, config)
 }
 
 pub(super) fn source(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     outputs: usize,
     adaptive: bool,
@@ -128,7 +141,7 @@ pub(super) fn source(
 ) {
     let (preparation, run, config) = prepared_request(pool, capacity, outputs, adaptive);
     let (sampler, completion) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_sampler(run.sampler_scope().unwrap())
         .unwrap();
@@ -235,9 +248,40 @@ pub(super) fn history(sampler: &ConfiguredTextSampler) -> &[u32] {
 pub(super) struct Facts {
     missing_tensor: bool,
     missing_host: bool,
+    physical: Option<(
+        std::sync::Arc<eredu_core::MemoryTopology>,
+        eredu_core::MemoryPlacement,
+    )>,
+}
+
+impl Facts {
+    pub(super) fn with_pool(mut self, pool: &MemoryLedger) -> Self {
+        self.physical = Some((
+            pool.topology_handle(),
+            (*pool.host_placement_handle()).clone(),
+        ));
+        self
+    }
 }
 
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        self.physical.as_ref().map(|value| value.0.as_ref())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        self.physical.as_ref().map(|value| &value.1)
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        self.physical.as_ref().map(|value| &value.1)
+    }
+
     fn operation_bound(
         &self,
         operation: &WorkspaceOperation,

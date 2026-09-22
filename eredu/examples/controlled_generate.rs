@@ -1,16 +1,18 @@
 //! Complete local facade workflow; bounded JSONL records go to stdout.
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use eredu::{
     api::{
-        ChatSourceInput, ControlledGenerationRecord, GenerationBranchOptions, LoadedModel,
-        LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings, PreparedChatRequest,
-        SamplingOverride, TokenizerSourceInput, TraceLimits, local_device_plan,
+        local_device_plan, ChatSourceInput, ControlledGenerationRecord, GenerationBranchOptions,
+        LoadedModel, LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings,
+        PreparedChatRequest, SamplingOverride, TokenizerSourceInput, TraceLimits,
     },
     runtime::chat::{ChatTemplateRequest, ToolChoice},
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    ExecutionPlan, GenerationConfigOverrides, ObservationSupportStatus, SemanticEvent,
-    SessionCapabilities, capture::*, execution_control::*, intervention::*,
+    capture::*, execution_control::*, intervention::*, ExecutionPlan, GenerationConfigOverrides,
+    ObservationSupportStatus, SemanticEvent, SessionCapabilities,
 };
 use std::ops::ControlFlow;
 
@@ -83,7 +85,6 @@ pub fn run_example(
     let capture_limits = CaptureLimits {
         per_step: usage,
         cumulative: usage,
-        physical_native_bytes: None,
         on_limit: CaptureLimitPolicy::Fail,
     };
     let capture = CapturePlan {
@@ -139,7 +140,12 @@ pub fn run_example(
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .prepare_chat(
+            &source,
+            &policy,
+            &physical_memory::finite_each(CAPACITY)?,
+            &cancellation,
+        )?
         .ok_or_else(|| anyhow::anyhow!("cancelled before chat preparation"))?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -148,7 +154,10 @@ pub fn run_example(
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 42,
@@ -158,7 +167,7 @@ pub fn run_example(
         per_record_bytes: 64 << 10,
         total_bytes: 128 << 10,
     };
-    let mut request = PreparedChatRequest::new(&chat, settings);
+    let mut request = PreparedChatRequest::new(&chat, settings.clone());
     request.capture = Some(&capture);
     request.intervention = Some(&original);
     let mut prefix = vec![];
@@ -177,8 +186,10 @@ pub fn run_example(
             retained_bytes: 512 << 20,
             cumulative_copy_bytes: 2 << 30,
         },
-        CAPACITY,
-        eredu_runtime::working_memory::WorkspaceCopyLimits::new(CAPACITY),
+        physical_memory::finite_each(CAPACITY)?,
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(physical_memory::finite_each(
+            CAPACITY,
+        )?),
     )?;
     for _ in 0..2 {
         anyhow::ensure!(

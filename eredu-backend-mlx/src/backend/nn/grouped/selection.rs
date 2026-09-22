@@ -202,29 +202,66 @@ pub struct GroupSelectionOutput {
 }
 
 impl TopKGroupSelector {
-    /// Fixed Rust transports for the positive, unpartitioned CPU selector.
+    /// Fixed transports of the ordinary GPU cutoff predicate and the optional
+    /// existing CPU fallback. Native calls and its real Eval are quoted separately.
+    pub(crate) fn ordinary_tie_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<(Array, Array, Array, Array, Array)>(),
+            size_of::<Result<bool, Exception>>(),
+            size_of::<bool>(),
+            size_of::<Result<Array, Exception>>(),
+            size_of::<&Stream>(),
+            safemlx::OriginalScopeObserver::control_bytes()?,
+            crate::backend::managed_memory::router::ordinary_control_bytes()?,
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
+    /// Fixed Rust transports for the positive, unpartitioned selector.
     /// Native constructor/Eval sources are composed separately by the caller.
-    pub(crate) fn cpu_selection_control_bytes(supplied: bool) -> Option<usize> {
+    pub(crate) fn selection_control_bytes(supplied: bool) -> Option<usize> {
         use std::mem::{size_of, size_of_val};
         type Value = Result<Array, Exception>;
         type Output = Result<GroupSelectionOutput, Exception>;
-        let entry = if supplied {
-            // select_indices: logits, scores, reshaped IDs and completed output.
-            size_of::<(&mut Self, &Array, &Array, &Stream)>()
-                .checked_add(size_of::<(Array, Array, Array, GroupSelectionOutput, Output)>())?
-        } else {
-            // select_with_selection_bias: logits, scores, choice, IDs and output.
-            size_of::<(&mut Self, &Array, Option<&Array>, &Stream)>()
-                .checked_add(size_of::<(Array, Array, Array, Array, GroupSelectionOutput, Output)>())?
-        };
+        let entry =
+            if supplied {
+                // select_indices: logits, scores, reshaped IDs and completed output.
+                size_of::<(&mut Self, &Array, &Array, &Stream)>().checked_add(size_of::<(
+                    Array,
+                    Array,
+                    Array,
+                    GroupSelectionOutput,
+                    Output,
+                )>(
+                ))?
+            } else {
+                // select_with_selection_bias: logits, scores, choice, IDs and output.
+                size_of::<(&mut Self, &Array, Option<&Array>, &Stream)>().checked_add(
+                    size_of::<(Array, Array, Array, Array, GroupSelectionOutput, Output)>(),
+                )?
+            };
         let frames = [
-            size_of::<bool>(), size_of::<usize>(), entry,
+            size_of::<bool>(),
+            size_of::<usize>(),
+            entry,
             // project_logits: flat, floating flag, pre/post-bias logits and return.
             size_of::<(&Self, &Array, &Stream, Array, bool, Array, Array, Value)>(),
             // Selected F32 casts, transposed weight and dense product transports.
             size_of::<(Array, Array, Array, Value, Value, Value, Value)>(),
             // transform_input: flat, epsilon, variance, normalized and scaled values.
-            size_of::<(&Self, &Array, &Stream, Array, f32, Array, Array, Array, Value)>(),
+            size_of::<(
+                &Self,
+                &Array,
+                &Stream,
+                Array,
+                f32,
+                Array,
+                Array,
+                Array,
+                Value,
+            )>(),
             size_of::<(Array, Array, Array, Value, Value, Value)>(),
             // apply_scores and TopKGroupScoring::apply retain their moved input.
             size_of::<(&Self, Array, Dtype, &Stream, Value)>(),
@@ -238,15 +275,25 @@ impl TopKGroupSelector {
             size_of::<(&Self, &Array, &Stream, Value)>(),
             // largest_indices retains the real observer and optional CPU stream
             // loan even when the CPU branch never opens a GPU tie fallback.
-            size_of::<(&Array, i32, &Stream, Option<safemlx::OriginalScopeObserver>,
-                Option<&Stream>, Array, Array, Value)>(),
+            size_of::<(
+                &Array,
+                i32,
+                &Stream,
+                Option<safemlx::OriginalScopeObserver>,
+                Option<&Stream>,
+                Array,
+                Array,
+                Value,
+            )>(),
             // Both routing_dtype calls and fixed index descriptor transports.
             size_of::<(RoutingPrecision, Dtype, Dtype, Dtype)>() * 3,
             size_of::<[i32; 2]>(),
             size_of::<(std::ops::RangeFull, std::ops::RangeTo<i32>)>(),
             size_of::<Option<usize>>(),
         ];
-        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
     }
     /// Creates an unloaded dense or affine-packed selector.
     pub fn new_with_quantization(
@@ -282,7 +329,16 @@ impl TopKGroupSelector {
         if (config.top_k < config.group_count || config.topk_group < config.n_group)
             && stream.device_type().ok() == Some(safemlx::DeviceType::Gpu)
         {
-            crate::backend::managed_memory::router::prepare_before_native_construction();
+            if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
+                crate::backend::managed_memory::router::stream(&observer)?;
+            } else {
+                crate::backend::managed_memory::router::prepare_for_routing(
+                    &crate::backend::managed_memory::ledger(),
+                )
+                .map_err(
+                    crate::backend::managed_memory::router::PreparationError::into_exception,
+                )?;
+            }
         }
         Ok(Self {
             top_k: config.top_k,
@@ -659,7 +715,8 @@ impl TopKGroupSelector {
 fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array, Exception> {
     let original = safemlx::OriginalScopeObserver::try_current()?;
     // Acquire the existing admitted fallback before constructing even the
-    // descending/GPU prefix. Ordinary calls do not touch this shared runtime.
+    // descending/GPU prefix. Ordinary calls borrow the same paid source only
+    // when the completed crossing-tie predicate selects the CPU branch.
     let original_cpu = if let Some(observer) = original.as_ref() {
         if count < scores.dim(-1) && stream.device_type()? == safemlx::DeviceType::Gpu {
             Some(crate::backend::managed_memory::router::stream(observer)?)
@@ -676,7 +733,7 @@ fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array,
         && if original.is_some() {
             original_cpu.is_some()
         } else {
-            stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu
+            stream.device_type()? == safemlx::DeviceType::Gpu
         }
     {
         let selected = take_along_axis(scores, &indices, -1, stream)?;
@@ -703,9 +760,9 @@ fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array,
             // Native GPU partitions break cutoff ties by index. Share the
             // value-only partition when a tie crosses the cutoff. Only scores
             // and indices cross streams; expert tensors retain their storage.
-            let cpu = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-            return argpartition_axis(&descending, count - 1, -1, &cpu)?
-                .try_index_device((.., ..count), &cpu);
+            let cpu = crate::backend::managed_memory::router::ordinary_stream()?;
+            return argpartition_axis(&descending, count - 1, -1, cpu)?
+                .try_index_device((.., ..count), cpu);
         }
     }
     Ok(indices)

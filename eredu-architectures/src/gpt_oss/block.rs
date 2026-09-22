@@ -25,6 +25,9 @@ where
     const CAUSAL_PREFILL_ROWS: bool = true;
 
     type FeedForward = RoutedMlp<B>;
+    fn feed_forward_residual_observation(_: &ModelArgs, _: usize) -> &'static str {
+        "feed_forward.contribution"
+    }
 
     fn validate_with_metadata(
         _config: &ModelArgs,

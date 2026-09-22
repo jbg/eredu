@@ -1,7 +1,7 @@
 //! Source-qualified host preparation for facade-owned behavioral profile probes.
 use super::OriginalChatTemplate;
 use crate::working_memory::OriginalTokenizer;
-use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use eredu_core::{HostPreparationAuthority, TokenInputRejection};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use std::mem::{size_of, size_of_val};
@@ -9,6 +9,9 @@ use std::mem::{size_of, size_of_val};
 /// Fixed refusal before a probe source or render is constructed.
 #[derive(Debug, thiserror::Error)]
 pub enum OriginalChatProfileError {
+    /// Invalid physical-domain configuration before source preparation.
+    #[error(transparent)]
+    Limits(#[from] eredu_core::MemoryDomainError),
     /// The backend/source pair is unavailable or belongs to another domain.
     #[error(transparent)]
     Domain(#[from] TokenInputRejection),
@@ -33,7 +36,7 @@ impl OriginalChatProfilePreparation {
         template: &OriginalChatTemplate,
         tokenizer: &OriginalTokenizer,
         execution: &InferenceExecutionIdentity,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, OriginalChatProfileError> {
         template
             .validate_pool(tokenizer.pool())
@@ -76,7 +79,7 @@ impl OriginalChatProfilePreparation {
         self.template.same_source(template) && self.tokenizer.same_source(tokenizer)
     }
     /// Validate the real retained source domain without native work.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), TokenInputRejection> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), TokenInputRejection> {
         self.template
             .validate_pool(pool)
             .and_then(|()| self.tokenizer.validate_pool(pool))

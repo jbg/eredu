@@ -1,12 +1,12 @@
 use super::*;
 use crate::backend::managed_memory::{NativeMemoryOwner, NativeMemoryRetention};
 
-mod host_owner;
 mod capture;
+mod host_owner;
 mod interventions;
 use host_owner::Policy;
 mod ownership;
-use ownership::{KeyValue, derivation_memory, with_memory_recovery};
+use ownership::{derivation_memory, with_memory_recovery, KeyValue};
 pub use ownership::{MlxSpeculativeRandomState, MlxSpeculativeSeed};
 
 pub(crate) mod numerical;
@@ -190,7 +190,7 @@ where
                 })
                 .map_err(failure);
         }
-        let owner = NativeMemoryOwner::acquire(&context.memory_pool())
+        let owner = NativeMemoryOwner::acquire(&context.memory_ledger())
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         let memory = NativeMemoryRetention::from_owner(&owner);
         with_memory_recovery(memory.clone(), || {
@@ -316,7 +316,9 @@ where
         }
         validate_control_capture(&plan)?;
         self.capture = Some(std::rc::Rc::new(std::cell::RefCell::new(LogitCapture {
-            session: eredu_runtime::capture::CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan)),
+            session: eredu_runtime::capture::CaptureSession::new(
+                eredu_core::capture::SharedCapturePlan::new(plan),
+            ),
             records: Vec::new(),
         })));
         Ok(())
@@ -335,17 +337,27 @@ where
             return self.enable_control_capture(plan).map_err(Into::into);
         }
         if !self.inner.is_original() || self.capture.is_some() || self.original_capture.is_some() {
-            return Err(SpeculativeControlError::Invalid("capture observer is already installed or belongs to another source"));
+            return Err(SpeculativeControlError::Invalid(
+                "capture observer is already installed or belongs to another source",
+            ));
         }
-        self.original_capture = Some(capture::OriginalCapture::prepare(&plan, context)
-            .map_err(|cause| SpeculativeControlError::backend_with_retained(cause, Error::take_retained_backend_failure))?);
+        self.original_capture = Some(capture::OriginalCapture::prepare(&plan, context).map_err(
+            |cause| {
+                SpeculativeControlError::backend_with_retained(
+                    cause,
+                    Error::take_retained_backend_failure,
+                )
+            },
+        )?);
         Ok(())
     }
 
     fn take_control_captures(
         &mut self,
     ) -> eredu_core::SpeculativeBuffer<eredu_core::speculative::SpeculativePredictionCapture> {
-        if let Some(capture) = &self.original_capture { return capture.take(); }
+        if let Some(capture) = &self.original_capture {
+            return capture.take();
+        }
         // This collector is ordinary-only. Moving its Vec into the ordinary
         // buffer variant neither attaches H nor qualifies original capture.
         self.capture
@@ -360,31 +372,42 @@ where
         plans: &[eredu_core::speculative::SpeculativeInterventionPlan],
         context: Self::Context<'a>,
     ) -> Result<(), eredu_core::speculative::SpeculativeControlError>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
         if !self.inner.is_original() || context.original_numerical().is_none() {
-            return if plans.is_empty() {Ok(())} else {Err(
-                eredu_core::speculative::SpeculativeControlError::Unsupported(
-                    "loaded execution has no speculative intervention discovery"))};
+            return if plans.is_empty() {
+                Ok(())
+            } else {
+                Err(
+                    eredu_core::speculative::SpeculativeControlError::Unsupported(
+                        "loaded execution has no speculative intervention discovery",
+                    ),
+                )
+            };
         }
-        interventions::validate(plans,context)
+        interventions::validate(plans, context)
     }
     fn control_intervene_prepared<'a>(
         &mut self,
         plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
         context: Self::Context<'a>,
     ) -> Result<(), eredu_core::speculative::SpeculativeControlError>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
-        if context.original_numerical().is_none() {return self.control_intervene(plans);}
+        if context.original_numerical().is_none() {
+            return self.control_intervene(plans);
+        }
         if !self.inner.is_original() || self.capture.is_some() || !self.interventions.is_empty() {
             return Err(eredu_core::speculative::SpeculativeControlError::Invalid(
-                "original interventions require the original policy and capture source"));
+                "original interventions require the original policy and capture source",
+            ));
         }
-        let next=interventions::prepare(&plans,self.original_capture.as_ref(),context)?;
+        let next = interventions::prepare(&plans, self.original_capture.as_ref(), context)?;
         // All validation, shared preflight and fresh source copies completed.
         // Replacing fixed slots is the single commit; failures preserve old edits.
-        self.original_interventions=next;
+        self.original_interventions = next;
         Ok(())
     }
     fn control_intervene(
@@ -446,7 +469,9 @@ where
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
         if self.inner.is_original() && self.inner.source().prepared_grammar_controller().is_some() {
-            return self.current_grammar_original().map_err(|cause| E::from(L::original_error(cause)));
+            return self
+                .current_grammar_original()
+                .map_err(|cause| E::from(L::original_error(cause)));
         }
         if let Some(complete) = self.inner.grammar_complete() {
             return Ok(complete);
@@ -570,9 +595,18 @@ where
             reserve_original_key::<(), E, L>(Some(key), SamplingPlacement::Target, context)
                 .map_err(|cause| E::from(L::original_error(cause)))?;
             return numerical::next_key(key, context)
-                .and_then(|key|if context.crosses_devices(){
-                    numerical::copy_key_to(&key,SamplingPlacement::Target,SamplingPlacement::Draft,context)
-                }else{Ok(key)})
+                .and_then(|key| {
+                    if context.crosses_devices() {
+                        numerical::copy_key_to(
+                            &key,
+                            SamplingPlacement::Target,
+                            SamplingPlacement::Draft,
+                            context,
+                        )
+                    } else {
+                        Ok(key)
+                    }
+                })
                 .map(|key| MlxSpeculativeSeed {
                     value: KeyValue::Original(key),
                     memory_retention: NativeMemoryRetention::default(),
@@ -674,27 +708,45 @@ where
                     eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
                 ))));
             }
-            let policy = self.inner.original_source()
+            let policy = self
+                .inner
+                .original_source()
                 .map_err(|cause| E::from(L::original_error(cause)))?;
             let processed = match &self.original_capture {
-                Some(capture) => capture.process_with_interventions(policy, source, temperature, history, placement, context,
-                    interventions::for_placement(&self.original_interventions,placement)),
-                None => numerical::process_policy_at(policy, source, temperature, history, placement, context),
+                Some(capture) => capture.process_with_interventions(
+                    policy,
+                    source,
+                    temperature,
+                    history,
+                    placement,
+                    context,
+                    interventions::for_placement(&self.original_interventions, placement),
+                ),
+                None => numerical::process_policy_at(
+                    policy,
+                    source,
+                    temperature,
+                    history,
+                    placement,
+                    context,
+                ),
             };
-            return processed.and_then(|value| {
-                MlxSpeculativeDistribution::original(
-                    value,
-                    context
-                        .original_numerical()
-                        .expect("validated original context")
-                        .0,
-                )
-            })
-            .map_err(|cause| E::from(L::original_error(cause)));
+            return processed
+                .and_then(|value| {
+                    MlxSpeculativeDistribution::original(
+                        value,
+                        context
+                            .original_numerical()
+                            .expect("validated original context")
+                            .0,
+                    )
+                })
+                .map_err(|cause| E::from(L::original_error(cause)));
         }
         if self.original_interventions.is_some() {
             return Err(E::from(L::original_error(Error::InvalidOperation(
-                "original intervention source requires its admitted request context"))));
+                "original intervention source requires its admitted request context",
+            ))));
         }
         let logits = logits.ordinary().ok_or_else(|| {
             E::from(L::original_error(Error::InvalidOperation(
@@ -864,7 +916,8 @@ where
             reserve_original_consumer::<f32, E, L>(value, None, placement, context, 2)
                 .map_err(|cause| E::from(L::original_error(cause)))?;
             let probabilities = match numerical_phase(
-                context, placement,
+                context,
+                placement,
                 eredu_runtime::speculative::numerical::SpeculativeNumericalKind::Normalize,
                 value,
                 None,
@@ -875,7 +928,8 @@ where
                 _ => unreachable!("normalization output"),
             };
             return match numerical_phase(
-                context, placement,
+                context,
+                placement,
                 eredu_runtime::speculative::numerical::SpeculativeNumericalKind::ProbabilityAt {
                     token,
                 },
@@ -975,7 +1029,8 @@ where
                 )
                 .map_err(|cause| E::from(L::original_error(cause)))?;
                 return match numerical_phase(
-                    context, placement,
+                    context,
+                    placement,
                     eredu_runtime::speculative::numerical::SpeculativeNumericalKind::Correction,
                     left,
                     Some(right),
@@ -1089,35 +1144,76 @@ where
             return Ok(());
         }
         if self.inner.is_original()
-            || distributions.iter().any(|value|value.original_value().is_some()) {
+            || distributions
+                .iter()
+                .any(|value| value.original_value().is_some())
+        {
             if context.original_external().is_none()
-                || !matches!(context.topology(),eredu_core::SpeculativeExecutionTopology::SameDeviceSplit
-                    |eredu_core::SpeculativeExecutionTopology::CrossDeviceSplit) {
+                || !matches!(
+                    context.topology(),
+                    eredu_core::SpeculativeExecutionTopology::SameDeviceSplit
+                        | eredu_core::SpeculativeExecutionTopology::CrossDeviceSplit
+                )
+            {
                 return Err(E::from(L::original_error(Error::PrefillControl(
-                    eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))));
+                    eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+                ))));
             }
-            let (sources,_)=context.original_numerical().ok_or_else(||E::from(L::original_error(
-                Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))))?;
-            let frames=[std::mem::size_of::<(&mut [&mut Self::Distribution],f32,Self::Context<'_>)>(),
-                std::mem::size_of::<std::slice::IterMut<'_,&mut Self::Distribution>>(),
-                std::mem::size_of::<Result<(),Self::Error>>()];
-            sources.metadata_funding().reserve_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-                .ok_or_else(||E::from(L::original_error(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))))?)
-                .map_err(|cause|E::from(L::original_error(Error::WorkspacePlanning(cause))))?;
+            let (sources, _) = context.original_numerical().ok_or_else(|| {
+                E::from(L::original_error(Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                )))
+            })?;
+            let frames = [
+                std::mem::size_of::<(&mut [&mut Self::Distribution], f32, Self::Context<'_>)>(),
+                std::mem::size_of::<std::slice::IterMut<'_, &mut Self::Distribution>>(),
+                std::mem::size_of::<Result<(), Self::Error>>(),
+            ];
+            sources
+                .metadata_funding()
+                .reserve_metadata(
+                    frames
+                        .into_iter()
+                        .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+                        .ok_or_else(|| {
+                            E::from(L::original_error(Error::WorkspacePlanning(
+                                eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                            )))
+                        })?,
+                )
+                .map_err(|cause| E::from(L::original_error(Error::WorkspacePlanning(cause))))?;
             for distribution in distributions {
-                let value=distribution.original_value().ok_or_else(||E::from(L::original_error(
-                    Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))))?;
-                reserve_original_consumer::<(),E,L>(value,None,SamplingPlacement::Target,context,0)
-                    .map_err(|cause|E::from(L::original_error(cause)))?;
-                if context.crosses_devices(){
-                    let copied=numerical::copy_value_to(value,SamplingPlacement::Draft,SamplingPlacement::Target,context)
-                        .map_err(|cause|E::from(L::original_error(cause)))?;
-                    let completed=MlxSpeculativeDistribution::original(copied,sources)
-                        .map_err(|cause|E::from(L::original_error(cause)))?;
-                    **distribution=completed;
-                }else{
-                    numerical::NumericalProducer::validate_input_at(value,context,SamplingPlacement::Target)
-                        .map_err(|cause|E::from(L::original_error(cause)))?;
+                let value = distribution.original_value().ok_or_else(|| {
+                    E::from(L::original_error(Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                    )))
+                })?;
+                reserve_original_consumer::<(), E, L>(
+                    value,
+                    None,
+                    SamplingPlacement::Target,
+                    context,
+                    0,
+                )
+                .map_err(|cause| E::from(L::original_error(cause)))?;
+                if context.crosses_devices() {
+                    let copied = numerical::copy_value_to(
+                        value,
+                        SamplingPlacement::Draft,
+                        SamplingPlacement::Target,
+                        context,
+                    )
+                    .map_err(|cause| E::from(L::original_error(cause)))?;
+                    let completed = MlxSpeculativeDistribution::original(copied, sources)
+                        .map_err(|cause| E::from(L::original_error(cause)))?;
+                    **distribution = completed;
+                } else {
+                    numerical::NumericalProducer::validate_input_at(
+                        value,
+                        context,
+                        SamplingPlacement::Target,
+                    )
+                    .map_err(|cause| E::from(L::original_error(cause)))?;
                 }
             }
             // Same-device values keep their completed source owners. A copied
@@ -1179,9 +1275,12 @@ fn reserve_original_key<T, E, L: LogitsSource>(
 ) -> Result<(), Error> {
     use eredu_nn::workspace::HostMetadataFundingError;
     use std::mem::{size_of, size_of_val};
-    let (sources, environment) = context.original_numerical_for(placement).ok_or(Error::PrefillControl(
-        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-    ))?;
+    let (sources, environment) =
+        context
+            .original_numerical_for(placement)
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ))?;
     sources.validate_environment(environment)?;
     if let Some(key) = key {
         reserve_original_consumer::<T, E, L>(key.value(), None, placement, context, 0)?;
@@ -1216,9 +1315,7 @@ fn reserve_original_key<T, E, L: LogitsSource>(
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     sources
         .metadata_funding()
         .reserve_metadata(bytes)
@@ -1246,9 +1343,12 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
             ));
         }
     };
-    let (sources, environment) = context.original_numerical_for(placement).ok_or(Error::InvalidOperation(
-        "numerical value requires its admitted source context",
-    ))?;
+    let (sources, environment) =
+        context
+            .original_numerical_for(placement)
+            .ok_or(Error::InvalidOperation(
+                "numerical value requires its admitted source context",
+            ))?;
     let funding = left.validate_consumer(sources)?;
     if let Some(right) = right {
         right.validate_consumer(sources)?;
@@ -1293,9 +1393,7 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
                     .and_then(|phases| bytes.checked_add(phases))
             }
         })
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     funding
         .reserve_metadata(bytes)
         .map_err(Error::WorkspacePlanning)
@@ -1305,7 +1403,8 @@ fn reserve_original_consumer<T, E, L: LogitsSource>(
 fn numerical_phase_control_bytes() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     let parts = [
-        size_of::<SpeculativeExecutionStreams<'_>>(),size_of::<SamplingPlacement>(),
+        size_of::<SpeculativeExecutionStreams<'_>>(),
+        size_of::<SamplingPlacement>(),
         size_of::<eredu_runtime::speculative::numerical::SpeculativeNumericalKind>(),
         size_of::<&numerical::OriginalNumericalValue>(),
         size_of::<Option<&numerical::OriginalNumericalValue>>(),
@@ -1318,12 +1417,13 @@ fn numerical_phase_control_bytes() -> Option<usize> {
 }
 
 fn numerical_phase(
-    context: SpeculativeExecutionStreams<'_>,placement:SamplingPlacement,
+    context: SpeculativeExecutionStreams<'_>,
+    placement: SamplingPlacement,
     kind: eredu_runtime::speculative::numerical::SpeculativeNumericalKind,
     left: &numerical::OriginalNumericalValue,
     right: Option<&numerical::OriginalNumericalValue>,
 ) -> Result<numerical::NumericalOutput, Error> {
-    numerical::NumericalProducer::execute_at(context,placement,kind,left,right)
+    numerical::NumericalProducer::execute_at(context, placement, kind, left, right)
 }
 
 fn sampling_stream<'a>(

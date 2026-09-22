@@ -1,7 +1,8 @@
 #[test]
 fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
-    let fixture: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
+            .unwrap();
     let root = tiny_heterogeneous_artifact(fixture["mova"]["config"].clone());
     let (stream, weights_stream) = execution_streams();
     let host = eredu_runtime::LayerwiseLoadOptions::new(
@@ -50,28 +51,32 @@ fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
         .unwrap();
         let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
         let prefix = [1_u32, 3, 2];
         let prompt = Array::from_slice(&prefix, &[1, 3]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
-        let prefill = generic
+        let prefill = executable
+            .erased_mut()
             .prefill(input::ModelInput::new(&parts), &stream)
             .unwrap()
             .evaluated()
             .unwrap()
             .as_slice::<f32>()
             .to_vec();
-        let saved = generic.state_snapshot();
+        let saved = executable.erased_mut().state_snapshot();
         assert!(saved.iter().all(|(position, _)| *position == 3));
         let continuation = Array::from_slice(&[4_u32], &[1, 1]);
-        let probe = generic
+        let probe = executable
+            .erased_mut()
             .checkpoint_restore_probe(&continuation, &stream)
             .unwrap();
         assert_eq!(probe.0, probe.2);
         assert_eq!(probe.3, probe.5);
-        assert_eq!(generic.state_snapshot(), saved);
+        assert_eq!(executable.erased_mut().state_snapshot(), saved);
         let descriptor = PromptCacheDescriptor::from_model_identity(
-            generic.prompt_cache_model_identity().clone(),
+            executable
+                .erased_mut()
+                .prompt_cache_model_identity()
+                .clone(),
             "k2-fixture",
             "tokens:1,3,2",
             1,
@@ -79,18 +84,22 @@ fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
         .unwrap();
         let cache_root = tempfile::tempdir().unwrap();
         let destination = cache_root.path().join("cache");
-        generic
-            .save_prompt_cache(
+        with_prompt_cache_funding(&mut executable, |generic, funding| {
+            generic.save_prompt_cache(
+                funding,
+                None,
                 &destination,
                 descriptor.clone(),
                 &prefix,
                 &PromptCacheOptions::default(),
             )
-            .unwrap();
+        })
+        .unwrap();
         let mut outputs = vec![prefill];
         for token in [4_u32, 5, 6, 7] {
             outputs.push(
-                generic
+                executable
+                    .erased_mut()
                     .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
                     .unwrap()
                     .evaluated()
@@ -99,19 +108,33 @@ fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
                     .to_vec(),
             );
         }
-        assert!(generic
+        assert!(executable
+            .erased_mut()
             .state_snapshot()
             .iter()
             .all(|(position, _)| *position == 7));
-        let cache_report = generic.cache_residency_report().unwrap().unwrap();
+        let cache_report = executable
+            .erased_mut()
+            .cache_residency_report()
+            .unwrap()
+            .unwrap();
         assert!(cache_report.peak_device_bytes <= 768);
         assert!(cache_report.host_demotions > 0);
         assert!(cache_report.host_promotions > 0);
-        generic.reset_cache().unwrap();
-        generic
-            .load_prompt_cache(&destination, &descriptor, &prefix)
-            .unwrap();
-        let restored = generic
+        executable.erased_mut().reset_cache().unwrap();
+        with_prompt_cache_materialization(&mut executable, |generic, funding, materialization| {
+            generic.load_prompt_cache(
+                funding,
+                materialization,
+                None,
+                &destination,
+                &descriptor,
+                &prefix,
+            )
+        })
+        .unwrap();
+        let restored = executable
+            .erased_mut()
             .decode(&continuation, &stream)
             .unwrap()
             .evaluated()
@@ -120,7 +143,11 @@ fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
             .to_vec();
         assert_eq!(restored, outputs[1]);
         if addressable {
-            let report = generic.parameter_bank_report().unwrap().unwrap();
+            let report = executable
+                .erased_mut()
+                .parameter_bank_report()
+                .unwrap()
+                .unwrap();
             assert_eq!(report.banks().len(), 2);
             assert!(report.peak_device_resident_bytes() <= 1152);
             assert!(report.device_resident_bytes() <= 1152);
@@ -209,8 +236,9 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
             Ok(())
         }
     }
-    let fixture: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
+            .unwrap();
     let config = fixture["mova"]["config"].clone();
     let args = eredu_architectures::k2_horizon::model_args_from_config_value(&config).unwrap();
     let root = tiny_heterogeneous_artifact(config);
@@ -250,21 +278,28 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
         .unwrap();
         let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
         let prompt = Array::from_slice(&[1_u32, 3, 2], &[1, 3]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
-        generic
+        executable
+            .erased_mut()
             .prefill(input::ModelInput::new(&parts), &stream)
             .unwrap()
             .evaluated()
             .unwrap();
         assert!(matches!(
-            generic.native_control_support(),
+            executable.erased_mut().native_control_support(),
             eredu_core::execution_control::ControlSupport::Supported
         ));
-        let mut saved = generic.capture_native_control_state().unwrap();
-        let mut fork = generic.copy_native_control_state(saved.as_ref()).unwrap();
-        let estimate = generic
+        let mut saved = executable
+            .erased_mut()
+            .capture_native_control_state()
+            .unwrap();
+        let mut fork = executable
+            .erased_mut()
+            .copy_native_control_state(saved.as_ref())
+            .unwrap();
+        let estimate = executable
+            .erased_mut()
             .estimate_native_control_state(Some(saved.as_ref()))
             .unwrap()
             .unwrap();
@@ -283,7 +318,8 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
                 decisions: BTreeMap::new(),
                 applied: vec![],
             };
-            let output = generic
+            let output = executable
+                .erased_mut()
                 .forward_with_observer(
                     &Array::from_slice(&[token], &[1, 1]),
                     None,
@@ -302,25 +338,30 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
             }
             outputs.push(output);
         }
-        let before_restore = generic
+        let before_restore = executable
+            .erased_mut()
             .parameter_bank_report()
             .unwrap()
             .map(|r| r.incremental().device().requests());
-        generic
+        executable
+            .erased_mut()
             .exchange_native_control_state(saved.as_mut())
             .unwrap();
-        assert!(generic
+        assert!(executable
+            .erased_mut()
             .state_snapshot()
             .iter()
             .all(|(position, _)| *position == 3));
         assert_eq!(
             before_restore,
-            generic
+            executable
+                .erased_mut()
                 .parameter_bank_report()
                 .unwrap()
                 .map(|r| r.incremental().device().requests())
         );
-        let restored_prefix = generic
+        let restored_prefix = executable
+            .erased_mut()
             .decode(&Array::from_slice(&[4_u32], &[1, 1]), &stream)
             .unwrap()
             .evaluated()
@@ -345,8 +386,12 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
         ] {
             // Each trial starts from its own copy of the same prefix. Force a
             // distinct expert set, using the bank's actual normalization policy.
-            let mut trial = generic.copy_native_control_state(fork.as_ref()).unwrap();
-            generic
+            let mut trial = executable
+                .erased_mut()
+                .copy_native_control_state(fork.as_ref())
+                .unwrap();
+            executable
+                .erased_mut()
                 .exchange_native_control_state(trial.as_mut())
                 .unwrap();
             let ids = &decisions.as_ref().unwrap()[path].0;
@@ -367,7 +412,8 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
                 decisions: BTreeMap::new(),
                 applied: vec![],
             };
-            generic
+            executable
+                .erased_mut()
                 .forward_with_observer(
                     &Array::from_slice(&[4_u32], &[1, 1]),
                     None,
@@ -392,16 +438,19 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
                 assert!((sum - args.router_scaling_factor.unwrap_or(1.0)).abs() < 1e-5);
             }
         }
-        let after_interventions = generic
+        let after_interventions = executable
+            .erased_mut()
             .parameter_bank_report()
             .unwrap()
             .map(|r| r.incremental().device().requests());
-        generic
+        executable
+            .erased_mut()
             .exchange_native_control_state(fork.as_mut())
             .unwrap();
         assert_eq!(
             after_interventions,
-            generic
+            executable
+                .erased_mut()
                 .parameter_bank_report()
                 .unwrap()
                 .map(|r| r.incremental().device().requests())
@@ -410,7 +459,8 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
             assert!(after_interventions.unwrap() > before_restore.unwrap());
         }
         for (index, token) in [4_u32, 5, 6, 7].into_iter().enumerate() {
-            let restored = generic
+            let restored = executable
+                .erased_mut()
                 .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
                 .unwrap()
                 .evaluated()
@@ -469,7 +519,10 @@ fn assert_fp8_publisher_reference(stream: Stream, weights_stream: Stream) {
     use sha2::Digest;
     let bytes = std::fs::read(encoded.path().join("model.safetensors")).unwrap();
     assert_eq!(
-        sha2::Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         reference["artifact_sha256"].as_str().unwrap()
     );
     let expected: Vec<Vec<f32>> = serde_json::from_value(reference["logits"].clone()).unwrap();
@@ -509,10 +562,10 @@ fn assert_fp8_publisher_reference(stream: Stream, weights_stream: Stream) {
         .unwrap();
         let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
         let prompt = Array::from_slice(&[1_u32, 3, 2], &[1, 3]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
-        let mut outputs = vec![generic
+        let mut outputs = vec![executable
+            .erased_mut()
             .prefill(input::ModelInput::new(&parts), &stream)
             .unwrap()
             .evaluated()
@@ -521,7 +574,8 @@ fn assert_fp8_publisher_reference(stream: Stream, weights_stream: Stream) {
             .to_vec()];
         for token in [4_u32, 5, 6, 7] {
             outputs.push(
-                generic
+                executable
+                    .erased_mut()
                     .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
                     .unwrap()
                     .evaluated()
@@ -530,7 +584,7 @@ fn assert_fp8_publisher_reference(stream: Stream, weights_stream: Stream) {
                     .to_vec(),
             );
         }
-        if let Some(report) = generic.parameter_bank_report().unwrap() {
+        if let Some(report) = executable.erased_mut().parameter_bank_report().unwrap() {
             assert_eq!(report.banks().len(), 2);
             assert!(report.peak_device_resident_bytes() <= 393312);
             assert!(report.incremental().device().evictions() > 0);

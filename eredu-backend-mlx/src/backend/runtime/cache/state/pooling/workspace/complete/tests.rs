@@ -1,10 +1,10 @@
 use super::super::tests::{layout, step};
 use super::*;
 use crate::backend::runtime::cache::residency::{CacheResidencyError, CacheSourceFailureCause};
-use eredu_nn::{Error, Tensor, workspace::*};
+use eredu_nn::{workspace::*, Error, Tensor};
 use eredu_runtime::{
+    working_memory::{InferenceExecutionIdentity, MemoryLedger},
     CacheLifecycleError, PagedCacheOptions,
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryPool},
 };
 use safemlx::{Device, DeviceType};
 use std::{cell::Cell, collections::BTreeSet};
@@ -70,6 +70,15 @@ fn cold<T>(f: impl FnOnce() -> T) -> T {
 #[derive(Debug)]
 struct Facts;
 impl WorkspaceMechanisms for Facts {
+    fn output_representation(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        output: usize,
+    ) -> Option<WorkspaceRepresentation> {
+        (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32).then_some(
+            WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true),
+        )
+    }
     fn operation_bound(
         &self,
         op: &WorkspaceOperation,
@@ -81,7 +90,10 @@ impl WorkspaceMechanisms for Facts {
                 .map(|layout| {
                     if matches!(
                         op.kind,
-                        WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. } | WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_)
+                        WorkspaceOperationKind::Index { .. }
+                            | WorkspaceOperationKind::StaticSlice { .. }
+                            | WorkspaceOperationKind::View(_)
+                            | WorkspaceOperationKind::Transpose(_)
                     ) {
                         Ok(WorkspaceOutputStorage::AliasInput(0))
                     } else {
@@ -141,9 +153,12 @@ fn pooling_paged_projection_preserves_visible_history_partial_streams_and_failed
     .unwrap();
     tail.evaluated().unwrap();
     let capacity = 1 << 25;
-    let owner = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let owner = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let funding = owner
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -286,7 +301,7 @@ fn pooling_paged_projection_preserves_visible_history_partial_streams_and_failed
         CacheSourceFailureCause::Metadata(_)
     ));
     drop((native, context, funding, tail, gates, pooled));
-    assert!(owner.used_bytes().unwrap() > 0);
+    assert!(owner.fixture_host_charge().unwrap() > 0);
     drop(projected);
     assert!(matches!(
         manager.remove_block(&id),
@@ -297,5 +312,9 @@ fn pooling_paged_projection_preserves_visible_history_partial_streams_and_failed
     drop(failure);
     manager.remove_block(&id).unwrap();
     drop(manager);
-    assert_eq!(owner.used_bytes().unwrap(), 0);
+    assert_eq!(owner.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

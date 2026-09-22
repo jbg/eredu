@@ -112,7 +112,7 @@ fn termination_queries_preserve_original_finite_context_across_cached_decodes() 
             }
         }
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
 }
 
@@ -186,6 +186,6 @@ fn query_errors_do_not_rebind_or_fence_finite_run_but_mutable_policy_still_inval
             assert_eq!(f.attempts[1].run_identity(), f.bound[0].run_identity());
         }
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
 }

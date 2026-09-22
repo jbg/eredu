@@ -260,18 +260,22 @@ impl WorkspacePagedHostTrace {
                 values[0]
                     .layout()
                     .representation()
-                    .ok_or_else(|| context.metadata_source(MissingRepresentation {
-                        operand: "key",
-                        cause: WorkspaceMetadataError::Unqualified,
-                    }))?
+                    .ok_or_else(|| {
+                        context.metadata_source(MissingRepresentation {
+                            operand: "key",
+                            cause: WorkspaceMetadataError::Unqualified,
+                        })
+                    })?
                     .dtype(),
                 values[1]
                     .layout()
                     .representation()
-                    .ok_or_else(|| context.metadata_source(MissingRepresentation {
-                        operand: "value",
-                        cause: WorkspaceMetadataError::Unqualified,
-                    }))?
+                    .ok_or_else(|| {
+                        context.metadata_source(MissingRepresentation {
+                            operand: "value",
+                            cause: WorkspaceMetadataError::Unqualified,
+                        })
+                    })?
                     .dtype(),
             ];
             Source::Stored([

@@ -13,9 +13,14 @@ pub struct TextPromptWorkspaceReport {
     peak: WorkspaceBound,
     tensor_peak_bytes: Option<u64>,
     host_peak_bytes: Option<u64>,
+    physical_domains: Option<eredu_core::DomainMemoryRequirements>,
 }
 
 impl TextPromptWorkspaceReport {
+    /// Actual initialization allocations and overlapping host owners by domain.
+    pub fn physical_domains(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.physical_domains.as_ref()
+    }
     /// Exact request whose complete input was priced.
     pub const fn geometry(&self) -> InferenceGeometry {
         self.geometry
@@ -28,8 +33,8 @@ impl TextPromptWorkspaceReport {
     pub const fn tensor_peak_bytes(&self) -> Option<u64> {
         self.tensor_peak_bytes
     }
-    /// Legacy caller capacity (zero when source bytes are separately sealed in I),
-    /// plus unchanged host staging and text identity construction.
+    /// Caller capacity (zero when source bytes are separately sealed in I),
+    /// native backing controls, host staging and text identity construction.
     pub const fn host_peak_bytes(&self) -> Option<u64> {
         self.host_peak_bytes
     }
@@ -59,6 +64,14 @@ impl TextPromptWorkspaceReport {
             }
             .into());
         }
+        outside.physical_domains = match (outside.physical_domains.take(), &self.physical_domains) {
+            (Some(mut outside), Some(input)) => {
+                outside.activations =
+                    metadata.combine_domain_requirements(&outside.activations, input, true)?;
+                Some(outside)
+            }
+            _ => None,
+        };
         outside.activations = match (&outside.activations, &self.peak) {
             (
                 WorkspaceBound::Bounded { bytes, assumptions },
@@ -66,16 +79,24 @@ impl TextPromptWorkspaceReport {
                     bytes: input,
                     assumptions: input_assumptions,
                 },
-            ) => metadata.bounded(
-                bytes.checked_add(*input).ok_or(
-                    eredu_core::AdmissionPolicyError::ArithmeticOverflow {
+            ) => match bytes.checked_add(*input) {
+                Some(bytes) => {
+                    metadata.bounded(bytes, format_args!("{assumptions}; {input_assumptions}"))?
+                }
+                None if outside.physical_domains.is_some() => {
+                    metadata.per_domain(format_args!("{assumptions}; {input_assumptions}"))?
+                }
+                None => {
+                    return Err(eredu_core::AdmissionPolicyError::ArithmeticOverflow {
                         operation: "prompt and enclosing workspace",
-                    },
-                )?,
-                format_args!("{assumptions}; {input_assumptions}"),
-            )?,
+                    }
+                    .into());
+                }
+            },
             (WorkspaceBound::Unknown { .. }, _) => outside.activations,
             (_, unknown @ WorkspaceBound::Unknown { .. }) => metadata.clone_bound(unknown)?,
+            (bound @ WorkspaceBound::PerDomain { .. }, _)
+            | (_, bound @ WorkspaceBound::PerDomain { .. }) => metadata.clone_bound(bound)?,
         };
         Ok(outside)
     }
@@ -176,11 +197,24 @@ fn quote_prompt(
     // integer matrix. Retain that source distinction in the enclosing quote,
     // just as the shared model driver does for the exact input ordinal.
     let _tokens = if original {
-        Some(WorkspaceTensor::prepared_token_input(&[batch,positions],WorkspaceDtype::Uint32,context)?)
+        Some(WorkspaceTensor::prepared_token_input(
+            &[batch, positions],
+            WorkspaceDtype::Uint32,
+            context,
+        )?)
     } else {
         let mut outputs = context.metadata_vec(1)?;
         outputs.push(context.layout(&[batch, positions], WorkspaceDtype::Uint32)?);
-        let _tokens = context.execute(WorkspaceOperationKind::Initialize, &[], outputs)?.remove(0);
+        // Ordinary prompt preparation uploads this complete U32 matrix from
+        // the borrowed source. It is distinct from scalar fill and from the
+        // original input bank's independently authenticated placeholder.
+        let _tokens = context
+            .execute(
+                WorkspaceOperationKind::Elementwise("text_prompt_u32"),
+                &[],
+                outputs,
+            )?
+            .remove(0);
         None
     };
     let trace = if context.uses_checked_metadata() {
@@ -189,31 +223,93 @@ fn quote_prompt(
         context.report(&[])?
     };
     let tensor_peak_bytes = trace.tensor_buffers.total_bytes;
-    let host_peak_bytes = source_capacity_bytes
-        .zip(trace.host_workspace_bytes)
+    let additional_host_bytes = source_capacity_bytes
         .zip(text_identity_control_bytes())
-        .map(|((source, staging), identity_controls)| {
+        .map(|(source, identity_controls)| {
             source
-                .checked_add(staging)
-                .and_then(|bytes| bytes.checked_add(identity.peak_bytes()))
+                .checked_add(identity.peak_bytes())
                 .and_then(|bytes| bytes.checked_add(identity_controls))
                 .ok_or_else(|| {
                     context.metadata_error(format_args!("prompt host workspace overflow"))
                 })
         })
         .transpose()?;
-    let peak = match tensor_peak_bytes.zip(host_peak_bytes) {
-        Some((tensor, host)) => WorkspaceBound::bounded(
-            tensor.checked_add(host).ok_or_else(|| context.metadata_error(format_args!("prompt workspace overflow")))?,
+    let trace_host_bytes = match (&trace.physical_domains, context.memory_topology()) {
+        (Some(domains), Some(topology)) => {
+            let host = topology.host_domain();
+            let complete = domains
+                .new_allocations
+                .get(host)
+                .and_then(|charge| charge.total())
+                .map_err(|cause| context.metadata_source(cause))?;
+            let native = domains
+                .native_allocations
+                .get(host)
+                .and_then(|charge| charge.total())
+                .map_err(|cause| context.metadata_source(cause))?;
+            Some(
+                complete
+                    .checked_sub(native)
+                    .ok_or(WorkspaceMetadataError::Report(
+                        eredu_nn::workspace::WorkspaceReportError::Source,
+                    ))?,
+            )
+        }
+        _ => trace
+            .total_bytes
+            .zip(tensor_peak_bytes)
+            .map(|(complete, native)| {
+                complete
+                    .checked_sub(native)
+                    .ok_or(WorkspaceMetadataError::Report(
+                        eredu_nn::workspace::WorkspaceReportError::Source,
+                    ))
+            })
+            .transpose()?,
+    };
+    let host_peak_bytes = trace_host_bytes
+        .zip(additional_host_bytes)
+        .map(|(trace_host, additional)| {
+            trace_host
+                .checked_add(additional)
+                .ok_or(WorkspaceMetadataError::Overflow)
+        })
+        .transpose()?;
+    let physical_domains = match (
+        &trace.physical_domains,
+        additional_host_bytes,
+        context.memory_topology(),
+    ) {
+        (Some(trace), Some(host), Some(topology)) => {
+            let mut requirements = metadata
+                .clone_domain_requirements(&trace.new_allocations)
+                .map_err(|cause| metadata.error(cause))?;
+            requirements
+                .add_allocation(
+                    host,
+                    &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())
+                        .map_err(|cause| context.metadata_source(cause))?,
+                )
+                .map_err(|cause| context.metadata_source(cause))?;
+            Some(requirements)
+        }
+        _ => None,
+    };
+    let peak = match trace.total_bytes.zip(additional_host_bytes) {
+        Some((trace_bytes, host)) if trace_bytes.checked_add(host).is_some() => WorkspaceBound::bounded(
+            trace_bytes.checked_add(host).expect("checked diagnostic"),
             context.metadata_string(format_args!("host source mode original_input={original}; legacy host U32 capacity or separately sealed original I, and native input retained across all chunks; input/shape copies, host staging and closed text identity construction/retention including qualified shared headers and pre-share mutex storage included, excluding tokenizer/application strings; {}", PromptAssumptions(&trace.assumptions)))?,
         ),
-        None => WorkspaceBound::Unknown { reason: context.metadata_string(format_args!("full prompt backing, native initialization, identity owner or host staging has no complete bound"))? },
+        Some(_) if physical_domains.is_none() => return Err(context.metadata_error(format_args!("prompt workspace overflow"))),
+        _ if physical_domains.is_some() => WorkspaceBound::PerDomain { assumptions: context.metadata_string(format_args!("complete prompt physical-domain requirements have no aggregate u64 diagnostic"))? },
+        _ => WorkspaceBound::Unknown { reason: context.metadata_string(format_args!("aggregate prompt diagnostic is unavailable; physical attribution reports any established initialization and host contributions"))? },
     };
     Ok(TextPromptWorkspaceReport {
         geometry,
         peak,
         tensor_peak_bytes,
         host_peak_bytes,
+        physical_domains,
     })
 }
 

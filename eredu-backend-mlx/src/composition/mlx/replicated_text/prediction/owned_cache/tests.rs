@@ -1,5 +1,5 @@
 use super::*;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 
 /// Models a cache that can change state before reporting a restore failure.
 #[derive(Debug)]
@@ -147,7 +147,7 @@ impl PoolingAttentionCache<MlxTensor> for TestCache {
     }
 }
 
-fn owned(pool: &WorkingMemoryPool, value: i32) -> OwnedPredictionCache<TestCache> {
+fn owned(pool: &MemoryLedger, value: i32) -> OwnedPredictionCache<TestCache> {
     let owner = NativeMemoryOwner::acquire(pool).unwrap();
     OwnedPredictionCache::new(
         TestCache {
@@ -161,7 +161,7 @@ fn owned(pool: &WorkingMemoryPool, value: i32) -> OwnedPredictionCache<TestCache
 
 #[test]
 fn clone_from_keeps_installed_and_incoming_owners_when_payload_mutation_panics() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let mut installed = owned(&pool, 3);
     let mut incoming = owned(&pool, 7);
     incoming.value.panic_clone_from = true;
@@ -186,7 +186,7 @@ fn failing_restore_and_subsequent_clear_keep_both_checkpoint_owners() {
     ];
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for restore in restore {
-        let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
         let mut installed = owned(&pool, 11);
         installed.value.fail_restore = true;
         let incoming = owned(&pool, 17);
@@ -209,7 +209,7 @@ fn failing_restore_and_subsequent_clear_keep_both_checkpoint_owners() {
 
 #[test]
 fn independent_copy_retention_preserves_source_and_new_authority_with_priced_metadata() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let source = owned(&pool, 19);
     let new_owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let estimate = source.copy_ownership_metadata_bytes().unwrap();

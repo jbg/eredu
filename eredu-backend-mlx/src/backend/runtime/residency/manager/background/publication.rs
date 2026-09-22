@@ -70,6 +70,11 @@ impl PreparedHostPublication {
             size_of::<Result<ReadForegroundDiskBatch, BackgroundHostServiceError>>(),
             size_of::<Result<ResidentHostOwner, ForegroundDiskReadError>>(),
             size_of::<ReadForegroundDiskBatch>(),
+            size_of::<(
+                &mut crate::backend::runtime::checkpoint::store::OriginalMaterializationSlots<'_>,
+                Option<super::super::OriginalMaterializedLoan<'_>>,
+                &safemlx::OriginalScopeObserver,
+            )>(),
             size_of::<ResidentHostOwner>(),
             size_of::<RetainedHostBuffer>(),
             size_of::<String>(),
@@ -244,15 +249,36 @@ impl PreparedHostPublication {
         missing: &[bool],
         reads: &BackgroundHostReadService,
         started: Instant,
+        materialization: &mut crate::backend::runtime::checkpoint::store::OriginalMaterializationSlots<'_>,
+        loan: Option<super::super::OriginalMaterializedLoan<'_>>,
+        observer: &safemlx::OriginalScopeObserver,
     ) -> Result<(), ResidencyError> {
         let attempt = match reads.attempt() {
             Ok(attempt) => attempt,
-            Err(cause) => return Err(ResidencyError::OriginalHostPublication(Box::new(
-                BackgroundHostPublicationFailure { cause: cause.into(), retained: self },
-            ))),
+            Err(cause) => {
+                return Err(ResidencyError::OriginalHostPublication(Box::new(
+                    BackgroundHostPublicationFailure {
+                        cause: cause.into(),
+                        retained: self,
+                    },
+                )));
+            }
         };
-        match self.fill_and_publish(state, manager, ids, missing, reads, started) {
-            Ok(()) => { attempt.succeed(); Ok(()) },
+        match self.fill_and_publish(
+            state,
+            manager,
+            ids,
+            missing,
+            reads,
+            started,
+            materialization,
+            loan,
+            observer,
+        ) {
+            Ok(()) => {
+                attempt.succeed();
+                Ok(())
+            }
             Err(cause) => Err(ResidencyError::OriginalHostPublication(Box::new(
                 BackgroundHostPublicationFailure {
                     cause,
@@ -269,6 +295,9 @@ impl PreparedHostPublication {
         missing: &[bool],
         reads: &BackgroundHostReadService,
         started: Instant,
+        materialization: &mut crate::backend::runtime::checkpoint::store::OriginalMaterializationSlots<'_>,
+        loan: Option<super::super::OriginalMaterializedLoan<'_>>,
+        observer: &safemlx::OriginalScopeObserver,
     ) -> Result<(), PublicationCause> {
         let domain = || ResidencyError::OriginalOperationDomain;
         self.validate(manager, state, ids, missing)?;
@@ -296,6 +325,12 @@ impl PreparedHostPublication {
             {
                 return Err(domain().into());
             }
+            let batch = batch.materialize(
+                state.materialization.view(),
+                materialization,
+                loan,
+                observer,
+            )?;
             let (logical, capacity) = batch.completed_bytes();
             let planned = state
                 .control

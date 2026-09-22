@@ -5,10 +5,12 @@ use eredu_core::cache::{CachePolicyError, LayerCachePolicy};
 use eredu_runtime::{HostSlotMetadata, HostSlotTable};
 use std::{iter::Map, slice};
 
-mod prepared_copy;
 mod empty_copy;
-pub(in crate::backend::runtime::cache::state::hybrid) use prepared_copy::copy_slot_retained;
+mod prepared_copy;
 use prepared_copy::PreparedFixedStateCopy;
+pub(in crate::backend::runtime::cache::state::hybrid) use prepared_copy::{
+    copy_slot_retained, copy_slot_with,
+};
 
 pub(in crate::backend::runtime::cache::state::hybrid) type Slot =
     (StateTensorRole, Option<MlxTensor>);
@@ -33,6 +35,30 @@ pub(super) struct FixedStateSlots {
 }
 
 impl FixedStateSlots {
+    pub(super) fn checkpoint_host_bytes(&self) -> Option<usize> {
+        super::super::ordinary_checkpoint::table_bytes::<Slot>(self.slots.len())?.checked_add(
+            safemlx::Array::ordinary_clone_control_bytes()?.checked_mul(self.slots.len())?,
+        )
+    }
+    pub(super) fn checkpoint_with_host_source(
+        &self,
+        loan: &super::super::ordinary_checkpoint::Loan,
+    ) -> Result<Self, safemlx::error::Exception> {
+        loan.funding()
+            .reserve_metadata(
+                safemlx::Array::ordinary_clone_control_bytes()
+                    .and_then(|n| n.checked_mul(self.slots.len()))
+                    .ok_or_else(|| {
+                        loan.retain(safemlx::error::Exception::from_source(
+                            eredu_core::HostMetadataFundingError::Overflow,
+                        ))
+                    })?,
+            )
+            .map_err(|e| loan.retain(safemlx::error::Exception::from_source(e)))?;
+        Ok(Self {
+            slots: loan.table(self.slots.slots(), |slot| Ok(slot.clone()))?,
+        })
+    }
     /// Only empty role tables have a zero-payload copy path. The caller already
     /// owns the enclosing admitted layer construction; this allocates custody
     /// metadata only, never a slot or nested numerical payload.

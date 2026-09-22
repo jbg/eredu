@@ -157,7 +157,7 @@ where
                             checkpoint,
                             ReplicatedTextSessionError::Architecture(error),
                             context,
-                        )
+                        );
                     }
                 };
                 let (output, checkpoint, forward) = session
@@ -304,7 +304,9 @@ impl<T> PublishedPredictionPrefill<T> {
     }
     /// Borrows actual published roots for the enclosing native completion.
     pub fn visit_roots(&self, visit: &mut dyn FnMut(&T)) {
-        if let Some(scores) = &self.scores { visit(scores); }
+        if let Some(scores) = &self.scores {
+            visit(scores);
+        }
         visit(&self.capture);
     }
     /// Moves the published values and the target's pre-auxiliary receipt.

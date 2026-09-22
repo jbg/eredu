@@ -2,12 +2,48 @@
 //! The explicit runtime preparation is ordinary; construction never initializes
 //! an allocator, enters housekeeping, evaluates, submits, or attaches a grant.
 use crate::{
-    Array, PreparedSubmissionGraphQuota, SubmissionGraphQuota, SubmissionGraphQuotaCause,
-    SubmissionGraphQuotaError, SubmissionGraphQuotaLayout,
     error::{self, Exception},
     utils::{guard::Guarded, runtime_lock},
+    Array, PreparedSubmissionGraphQuota, SubmissionGraphQuota, SubmissionGraphQuotaCause,
+    SubmissionGraphQuotaError, SubmissionGraphQuotaLayout,
 };
-use std::{marker::PhantomData, mem, ptr, rc::Rc};
+use std::{
+    marker::PhantomData,
+    mem, ptr,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
+};
+
+struct AllocatorPlacementSnapshot {
+    placement: OnceLock<crate::AllocationPlacement>,
+    inconsistent: AtomicBool,
+}
+impl AllocatorPlacementSnapshot {
+    const fn new() -> Self {
+        Self {
+            placement: OnceLock::new(),
+            inconsistent: AtomicBool::new(false),
+        }
+    }
+    fn publish(&self, placement: crate::AllocationPlacement) {
+        if *self.placement.get_or_init(|| placement) != placement {
+            self.inconsistent.store(true, Ordering::Release);
+        }
+    }
+    fn get(&self) -> Option<crate::AllocationPlacement> {
+        let placement = *self.placement.get()?;
+        (!self.inconsistent.load(Ordering::Acquire)
+            && placement != crate::AllocationPlacement::Unknown)
+            .then_some(placement)
+    }
+}
+static ALLOCATOR_PLACEMENT: AllocatorPlacementSnapshot = AllocatorPlacementSnapshot::new();
+pub(crate) const fn placement_static_storage_bytes() -> usize {
+    mem::size_of::<AllocatorPlacementSnapshot>()
+}
 
 /// Fixed refusal without formatting, hidden retry or source-owner transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -59,17 +95,34 @@ impl PreparedInputRuntime {
     /// immutable scalar source. It does not initialize, allocate, reserve, or
     /// grant submission authority, and remains unable to cross threads.
     pub fn inspection_alias(&self) -> Self {
-        Self { raw:self.raw, _thread:PhantomData }
+        Self {
+            raw: self.raw,
+            _thread: PhantomData,
+        }
     }
     /// Named source/alias transport controls, with no dynamic destination.
     pub const fn inspection_alias_control_bytes() -> usize {
-        std::mem::size_of::<&Self>()+std::mem::size_of::<Self>()
+        std::mem::size_of::<&Self>() + std::mem::size_of::<Self>()
     }
     pub(crate) fn from_initialized(raw: safemlx_sys::mlx_prepared_input_runtime) -> Self {
+        ALLOCATOR_PLACEMENT.publish(crate::AllocationPlacement::from_native(raw.placement));
         Self {
             raw,
             _thread: PhantomData,
         }
+    }
+
+    /// Placement witnessed by successful preparation of the actual allocator.
+    /// This cold query initializes nothing and grants no execution authority.
+    /// It remains unavailable before preparation, for unknown placement, or if
+    /// later preparation contradicts the process-owned immutable strategy.
+    pub fn established_allocation_placement() -> Option<crate::AllocationPlacement> {
+        ALLOCATOR_PLACEMENT.get()
+    }
+
+    /// Physical placement selected by the actual prepared allocator mechanism.
+    pub fn allocation_placement(&self) -> crate::AllocationPlacement {
+        crate::AllocationPlacement::from_native(self.raw.placement)
     }
 
     pub(crate) fn raw(&self) -> safemlx_sys::mlx_prepared_input_runtime {
@@ -88,13 +141,15 @@ impl PreparedInputRuntime {
             maximum: 0,
             storage_kind: 0,
             controls: 0,
+            placement: safemlx_sys::mlx_memory_placement {
+                kind: 0,
+                device: -1,
+                device_count: 0,
+            },
         };
         let status = unsafe { safemlx_sys::mlx_prepared_input_runtime_prepare(&mut raw) };
         match status {
-            0 => Ok(Self {
-                raw,
-                _thread: PhantomData,
-            }),
+            0 => Ok(Self::from_initialized(raw)),
             2 => Err(error::get_and_clear_last_mlx_error()
                 .expect("ordinary native input initialization error")
                 .into()),
@@ -117,16 +172,7 @@ impl PreparedInputRuntime {
             elements,
             kind,
         };
-        let mut layout = safemlx_sys::mlx_prepared_input_layout {
-            metadata_bytes: 0,
-            backing_bytes: 0,
-            controls: 0,
-        };
-        let status =
-            unsafe { safemlx_sys::mlx_prepared_input_layout_for(&mut layout, self.raw, source) };
-        if status != 0 {
-            return Err(PreparedInputCause::Invalid);
-        }
+        let layout = self.source_layout(source)?;
         Ok(PreparedInputPlan {
             runtime: self,
             source,
@@ -134,26 +180,96 @@ impl PreparedInputRuntime {
             _source: PhantomData,
         })
     }
+    fn source_layout(
+        &self,
+        source: safemlx_sys::mlx_prepared_input_source,
+    ) -> Result<PreparedInputLayout, PreparedInputCause> {
+        let mut native = safemlx_sys::mlx_prepared_input_layout {
+            metadata_bytes: 0,
+            backing_bytes: 0,
+            controls: 0,
+        };
+        // SAFETY: the borrowed shape is live for this synchronous query. The
+        // native layout worker validates shape/count/kind and allocator facts;
+        // it neither dereferences source.data nor retains any source pointer.
+        let status =
+            unsafe { safemlx_sys::mlx_prepared_input_layout_for(&mut native, self.raw, source) };
+        if status != 0 {
+            return Err(PreparedInputCause::Invalid);
+        }
+        let controls = native
+            .controls
+            .checked_add(mem::size_of::<PreparedInputPlan<'_>>())
+            .and_then(|n| n.checked_add(mem::size_of::<PreparedInputLeaf>()))
+            .and_then(|n| {
+                n.checked_add(mem::size_of::<Result<PreparedInputLeaf, PreparedInputCause>>())
+            })
+            .and_then(|n| n.checked_add(mem::size_of::<runtime_lock::RuntimeLockGuard>()))
+            .ok_or(PreparedInputCause::Invalid)?;
+        Ok(PreparedInputLayout {
+            metadata_bytes: native.metadata_bytes,
+            backing_bytes: native.backing_bytes,
+            controls,
+        })
+    }
+    /// Describe the actual copied-U32 leaf producer before values are present.
+    /// This calls the same layout worker as `u32`, without creating a plan,
+    /// reserving storage, reading values, or granting construction authority.
+    pub fn u32_layout(&self, shape: &[usize]) -> Result<PreparedInputLayout, PreparedInputCause> {
+        let elements = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or(PreparedInputCause::Invalid)?;
+        self.source_layout(safemlx_sys::mlx_prepared_input_source {
+            data: ptr::null(),
+            shape: shape.as_ptr(),
+            rank: shape.len(),
+            elements,
+            kind: 0,
+        })
+    }
+    /// Fixed Rust query representations for `u32_layout`. The returned layout's
+    /// constructor controls belong to later leaf construction, not this query.
+    pub const fn u32_layout_control_bytes() -> usize {
+        mem::size_of::<(&Self, &[usize])>()
+            + mem::size_of::<usize>() * 3
+            + mem::size_of::<safemlx_sys::mlx_prepared_input_source>()
+            + mem::size_of::<safemlx_sys::mlx_prepared_input_layout>()
+            + mem::size_of::<PreparedInputLayout>()
+            + mem::size_of::<Result<PreparedInputLayout, PreparedInputCause>>()
+    }
     /// Exact initialized-zero leaf using the same prepared allocator and
     /// descriptor producer. No lazy operation, evaluation or host value vector.
     /// Shape and physical dtype remain explicit, checked source geometry.
-    pub fn zeros<'a>(&'a self, dtype: crate::Dtype, shape: &'a [usize])
-        -> Result<PreparedInputPlan<'a>, PreparedInputCause> {
+    pub fn zeros<'a>(
+        &'a self,
+        dtype: crate::Dtype,
+        shape: &'a [usize],
+    ) -> Result<PreparedInputPlan<'a>, PreparedInputCause> {
         let kind = match dtype {
-            crate::Dtype::Float16 => 4, crate::Dtype::Bfloat16 => 5,
-            crate::Dtype::Float32 => 6, crate::Dtype::Int32 => 7,
-            crate::Dtype::Uint32 => 8, crate::Dtype::Bool => 9,
+            crate::Dtype::Float16 => 4,
+            crate::Dtype::Bfloat16 => 5,
+            crate::Dtype::Float32 => 6,
+            crate::Dtype::Int32 => 7,
+            crate::Dtype::Uint32 => 8,
+            crate::Dtype::Bool => 9,
             _ => return Err(PreparedInputCause::Unsupported),
         };
-        let elements = shape.iter().copied().try_fold(1usize, usize::checked_mul)
+        let elements = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
             .ok_or(PreparedInputCause::Invalid)?;
         self.plan(ptr::null(), elements, shape, kind)
     }
     /// Controls of the zero-source planning call, before the plan is available.
     pub const fn zeros_plan_control_bytes() -> usize {
-        mem::size_of::<(&Self, crate::Dtype, &[usize])>() + mem::size_of::<u32>() +
-            mem::size_of::<usize>() * 3 + mem::size_of::<PreparedInputPlan<'_>>() +
-            mem::size_of::<Result<PreparedInputPlan<'_>, PreparedInputCause>>()
+        mem::size_of::<(&Self, crate::Dtype, &[usize])>()
+            + mem::size_of::<u32>()
+            + mem::size_of::<usize>() * 3
+            + mem::size_of::<PreparedInputPlan<'_>>()
+            + mem::size_of::<Result<PreparedInputPlan<'_>, PreparedInputCause>>()
     }
     /// Checked borrowed U32 source recipe; empty shape requires exactly one value.
     pub fn u32<'a>(
@@ -173,9 +289,14 @@ impl PreparedInputRuntime {
     }
     /// Checked borrowed Boolean source; the existing native producer copies
     /// canonical Rust Boolean bytes into its ordinary Boolean array storage.
-    pub fn boolean<'a>(&'a self, values: &'a [bool], shape: &'a [usize])
-        -> Result<PreparedInputPlan<'a>, PreparedInputCause> {
-        const { assert!(mem::size_of::<bool>() == 1); }
+    pub fn boolean<'a>(
+        &'a self,
+        values: &'a [bool],
+        shape: &'a [usize],
+    ) -> Result<PreparedInputPlan<'a>, PreparedInputCause> {
+        const {
+            assert!(mem::size_of::<bool>() == 1);
+        }
         self.plan(values.as_ptr().cast(), values.len(), shape, 3)
     }
     /// Checked borrowed F32 source recipe; empty shape requires exactly one value.
@@ -187,31 +308,53 @@ impl PreparedInputRuntime {
         self.plan(values.as_ptr().cast(), values.len(), shape, 2)
     }
 }
+/// Allocation facts of the selected prepared input producer. This value owns
+/// no allocator, data, arena, source pointers or construction capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedInputLayout {
+    metadata_bytes: usize,
+    backing_bytes: usize,
+    controls: usize,
+}
+impl PreparedInputLayout {
+    /// Source arena capacity, including its exact allocation headers.
+    pub const fn metadata_bytes(self) -> usize {
+        self.metadata_bytes
+    }
+    /// Complete page-rounded backing allocation from the selected allocator.
+    pub const fn backing_bytes(self) -> usize {
+        self.backing_bytes
+    }
+    /// Native and Rust constructor controls for the actual borrowed leaf plan.
+    pub const fn control_bytes(self) -> usize {
+        self.controls
+    }
+}
 /// Borrowed exact source and native recipe. No raw array or independent bytes
 /// can create this plan; every shape/count product is checked without allocation.
 #[derive(Debug)]
 pub struct PreparedInputPlan<'a> {
     runtime: &'a PreparedInputRuntime,
     source: safemlx_sys::mlx_prepared_input_source,
-    layout: safemlx_sys::mlx_prepared_input_layout,
+    layout: PreparedInputLayout,
     _source: PhantomData<&'a [u8]>,
 }
 impl PreparedInputPlan<'_> {
     /// Source arena block capacity, including exact allocator headers.
     pub fn metadata_bytes(&self) -> usize {
-        self.layout.metadata_bytes
+        self.layout.metadata_bytes()
     }
     /// Complete page-rounded native backing allocation.
     pub fn backing_bytes(&self) -> usize {
-        self.layout.backing_bytes
+        self.layout.backing_bytes()
     }
     /// Named native and Rust constructor/control representations.
     pub fn control_bytes(&self) -> usize {
-        self.layout.controls
-            + mem::size_of::<Self>()
-            + mem::size_of::<PreparedInputLeaf>()
-            + mem::size_of::<Result<PreparedInputLeaf, PreparedInputCause>>()
-            + mem::size_of::<runtime_lock::RuntimeLockGuard>()
+        self.layout.control_bytes()
+    }
+    /// Descriptive facts from the same validated borrowed source plan.
+    pub fn layout(&self) -> PreparedInputLayout {
+        self.layout
     }
     /// Constructs the exact borrowed values in this source-only arena. Refusal
     /// leaves that arena and all earlier leaves with the caller. No retry grant.
@@ -379,9 +522,41 @@ impl PreparedInputLeaf {
         if status != 0 {
             return Err(PreparedInputCause::Invalid);
         }
-        Ok(crate::AllocationInfo::from_native(identity, bytes, false))
+        let mut placement = safemlx_sys::mlx_memory_placement {
+            kind: 0,
+            device: -1,
+            device_count: 0,
+        };
+        if unsafe { safemlx_sys::mlx_prepared_input_leaf_placement(&mut placement, self.raw) } != 0
+        {
+            return Err(PreparedInputCause::Invalid);
+        }
+        Ok(crate::AllocationInfo::from_native(
+            identity, bytes, placement,
+        ))
     }
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
 mod tests;
+
+#[cfg(test)]
+mod placement_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_source_placement_is_independent_of_ordinary_managed_candidates() {
+        let source = AllocatorPlacementSnapshot::new();
+        assert_eq!(source.get(), None);
+        let ordinary = crate::AllocationPlacement::CudaManaged { device_count: 2 };
+        source.publish(crate::AllocationPlacement::Host);
+        assert_eq!(source.get(), Some(crate::AllocationPlacement::Host));
+        assert_ne!(source.get(), Some(ordinary));
+        source.publish(crate::AllocationPlacement::Host);
+        assert_eq!(source.get(), Some(crate::AllocationPlacement::Host));
+        source.publish(ordinary);
+        assert_eq!(source.get(), None);
+        source.publish(crate::AllocationPlacement::Host);
+        assert_eq!(source.get(), None);
+    }
+}

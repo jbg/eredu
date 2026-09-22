@@ -2,11 +2,13 @@
 
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <iterator>
 #include <new>
 #include <type_traits>
 
 #include "mlx/c/array.h"
+#include "mlx/c/private/memory_placement.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
 #include "mlx/c/private/allocation_owner.h"
@@ -216,6 +218,53 @@ extern "C" size_t mlx_array_clone_storage_control_bytes(void) {
   return sizeof(void**) * 2 + sizeof(void*) + sizeof(mlx_array*) +
       sizeof(mlx_array) * 2 + sizeof(mlx::core::array*) + sizeof(uint32_t) +
       sizeof(const std::exception*) + sizeof(const char*);
+}
+
+extern "C" uint32_t mlx_array_clone_storage_arena_capacity(size_t* capacity) {
+  using mlx::core::PreparedInputArray;
+  using mlx::core::submission::GraphQuota;
+  size_t extent = 0;
+  if (!capacity || !GraphQuota::allocation_extent(
+      sizeof(PreparedInputArray), alignof(PreparedInputArray), extent) ||
+      !GraphQuota::fresh_capacity_for_extents(extent, *capacity)) return 4;
+  return 0;
+}
+
+extern "C" uint32_t mlx_array_clone_storage_new_in(
+    void** storage, mlx_submission_graph_quota quota) {
+  using mlx::core::PreparedInputArray;
+  if (!storage || *storage || !quota.ctx) return 4;
+  auto* graph = static_cast<mlx::core::submission::GraphQuota*>(quota.ctx);
+  *storage = graph->try_allocate(sizeof(PreparedInputArray), alignof(PreparedInputArray));
+  return *storage ? 0 : 2;
+}
+
+extern "C" void mlx_array_clone_storage_free_in(
+    void* storage, mlx_submission_graph_quota quota) {
+  using mlx::core::PreparedInputArray;
+  if (!storage) return;
+  auto* graph = static_cast<mlx::core::submission::GraphQuota*>(quota.ctx);
+  graph->deallocate(storage, sizeof(PreparedInputArray), alignof(PreparedInputArray));
+}
+
+extern "C" uint32_t mlx_array_clone_storage_fill_in(
+    mlx_array* output, void** storage, const mlx_array source,
+    mlx_submission_graph_quota quota) {
+  if (!output || output->ctx || output->prepared_owner || !storage || !*storage ||
+      !source.ctx || !quota.ctx || *storage == source.ctx) return 4;
+  auto* graph = static_cast<mlx::core::submission::GraphQuota*>(quota.ctx);
+  auto* owner = mlx::core::PreparedInputArray::publish_storage(
+      *storage, *static_cast<const mlx::core::array*>(source.ctx), graph);
+  *output = mlx_array{&owner->value(), owner};
+  *storage = nullptr;
+  return 0;
+}
+
+extern "C" size_t mlx_array_clone_storage_arena_control_bytes(void) {
+  return sizeof(size_t) * 2 + sizeof(void**) + sizeof(void*) +
+      sizeof(mlx_array*) + sizeof(mlx_array) * 2 + sizeof(mlx_submission_graph_quota) +
+      sizeof(mlx::core::submission::GraphQuota*) +
+      sizeof(mlx::core::PreparedInputArray*) + sizeof(uint32_t);
 }
 
 extern "C" int mlx_array_set(mlx_array* arr, const mlx_array src) {
@@ -536,10 +585,12 @@ extern "C" size_t mlx_array_nbytes(const mlx_array arr) {
 
 namespace {
 struct AllocationFacts {
+  size_t host_controls{0};
   bool known{false};
   bool host_transfer{false};
   uint64_t identity{0};
   size_t bytes{0};
+  mlx_memory_placement placement{};
 };
 using NativeDeleter = void (*)(mlx::core::allocator::Buffer);
 struct AllocationInspection {
@@ -574,6 +625,7 @@ AllocationFacts allocation_facts(const mlx::core::array& value) noexcept {
   inspection.data = value.data_shared_ptr().get();
   if (!inspection.data) {
     result.known = value.size() == 0;
+    result.placement = {1, -1, 0};
     return result;
   }
   inspection.host = mlx::core::host_transfer_allocation_info(value);
@@ -582,6 +634,8 @@ AllocationFacts allocation_facts(const mlx::core::array& value) noexcept {
     result.host_transfer = true;
     result.identity = inspection.host->identity;
     result.bytes = inspection.host->capacity;
+    result.host_controls = inspection.host->host_controls;
+    result.placement = mlx_placement_to_c(inspection.host->placement);
     return result;
   }
   if (inspection.data->original_input &&
@@ -590,6 +644,7 @@ AllocationFacts allocation_facts(const mlx::core::array& value) noexcept {
     result.known = true;
     result.identity = inspection.data->allocation_generation;
     result.bytes = inspection.data->original_input->capacity;
+    result.placement = mlx_placement_to_c(mlx::core::allocator::memory_placement(inspection.data->buffer));
     return result;
   }
   inspection.deleter = inspection.data->d.target<NativeDeleter>();
@@ -597,6 +652,7 @@ AllocationFacts allocation_facts(const mlx::core::array& value) noexcept {
   // Unknown custom/mapped storage stays unknown; logical bytes are not capacity.
   if (!inspection.deleter || *inspection.deleter != &mlx::core::allocator::free ||
       inspection.data->allocation_generation == 0) return result;
+  result.placement = mlx_placement_to_c(mlx::core::allocator::memory_placement(inspection.data->buffer));
   if (inspection.data->buffer.original_buffer_budget()) {
     // Original mutable backing carries a complete physical charge, including
     // the CPU header. Ordinary buffer_size() describes only usable bytes.
@@ -612,8 +668,12 @@ AllocationFacts allocation_facts(const mlx::core::array& value) noexcept {
     result.known = value.size() == 0;
     return result;
   }
-  result.identity = inspection.data->allocation_generation;
-  result.bytes = value.buffer_size();
+  const auto* root = inspection.data->buffer.physical_backing();
+  if (!root || root->generation != inspection.data->allocation_generation) return result;
+  result.identity = root->generation;
+  result.bytes = root->capacity;
+  result.host_controls = root->host_controls;
+  result.placement = mlx_placement_to_c(root->placement);
   result.known = true;
   return result;
 }
@@ -646,7 +706,7 @@ uint32_t descriptor_read(
       static_cast<uint32_t>(inspection.status), inspection.event_present,
       inspection.data, inspection.data ? inspection.data->buffer.ptr() : nullptr,
       inspection.backing.known, inspection.backing.host_transfer,
-      inspection.backing.identity, inspection.backing.bytes};
+      inspection.backing.identity, inspection.backing.bytes, inspection.backing.placement, inspection.backing.host_controls};
   return 0;
 }
 
@@ -658,7 +718,7 @@ bool same_descriptor(
       a.event_present == b.event_present && a.data == b.data &&
       a.buffer == b.buffer && a.known == b.known &&
       a.host_transfer == b.host_transfer && a.identity == b.identity &&
-      a.allocation_bytes == b.allocation_bytes;
+      a.allocation_bytes == b.allocation_bytes && a.host_control_bytes == b.host_control_bytes && mlx_same_placement(a.placement, b.placement);
 }
 } // namespace
 
@@ -761,7 +821,8 @@ extern "C" int mlx_array_attach_prepared_allocation_owner(
         return 0;
       }
     } else {
-      value.data_shared_ptr()->allocation_owners.append_prepared(
+      mlx::core::allocator::retain_memory_placement(value.data_shared_ptr()->buffer);
+      value.data_shared_ptr()->physical_allocation_owners().append_prepared(
           prepared, payload, release);
     }
     *outcome = 2;
@@ -799,7 +860,8 @@ extern "C" int mlx_array_retain_allocation_owner(
         return 0;
       }
     } else {
-      value.data_shared_ptr()->allocation_owners.push_back(owner);
+      value.data_shared_ptr()->physical_allocation_owners().push_back(owner);
+      mlx::core::allocator::retain_memory_placement(value.data_shared_ptr()->buffer);
     }
     // No throwing operation follows this ownership-transfer point.
     owner->release = release;
@@ -1157,6 +1219,24 @@ extern "C" const bfloat16_t* mlx_array_data_bfloat16(const mlx_array arr) {
 }
 #endif
 
+extern "C" size_t mlx_array_availability_control_bytes(void) {
+  struct Controls {
+    mlx_array handle;
+    bool* destination;
+    const mlx::core::array* source;
+    const mlx::core::Event* event;
+    mlx::core::array::Status status;
+    bool available;
+    const std::exception* error;
+    const char* message;
+    int result;
+  };
+  // The CPU event query's lock transport and the shared event value are fixed;
+  // existing event/task/error storage remains with the selected producer.
+  return sizeof(Controls) + sizeof(mlx::core::Event) +
+      sizeof(std::lock_guard<std::mutex>);
+}
+
 extern "C" int _mlx_array_is_available(bool* res, const mlx_array arr) {
   try {
     *res = mlx_array_get_(arr).is_available();
@@ -1203,4 +1283,104 @@ extern "C" int _mlx_array_is_col_contiguous(bool* res, const mlx_array arr) {
     return 1;
   }
   return 0;
+}
+
+namespace {
+bool readback_add(int64_t a, int64_t b, int64_t& output) noexcept {
+  if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b) ||
+      (b < 0 && a < std::numeric_limits<int64_t>::min() - b)) return false;
+  output = a + b;
+  return true;
+}
+bool readback_scale(int64_t value, size_t count, int64_t& output) noexcept {
+  if (count > size_t(std::numeric_limits<int64_t>::max())) return false;
+  if (count && ((value > 0 && value > std::numeric_limits<int64_t>::max() / int64_t(count)) ||
+      (value < 0 && value < std::numeric_limits<int64_t>::min() / int64_t(count)))) return false;
+  output = value * int64_t(count);
+  return true;
+}
+}
+extern "C" size_t mlx_array_completed_readback_control_bytes(void) {
+  return mlx_array_descriptor_control_bytes() + sizeof(mlx_array_descriptor) +
+      sizeof(mlx_array) + sizeof(const mlx::core::array*) + sizeof(void*) * 4 +
+      sizeof(int64_t) * 9 + sizeof(size_t) * 11 + sizeof(int) * 4 +
+      sizeof(mlx::core::allocator::Buffer) + sizeof(bool) * 3;
+}
+extern "C" int mlx_array_copy_completed_data(
+    const mlx_array arr, void* destination, size_t bytes) {
+  mlx_array_descriptor descriptor{};
+  if (descriptor_read(&descriptor, arr) ||
+      bytes != descriptor.logical_bytes || (bytes && (!destination || !descriptor.data))) return -1;
+  if (!bytes) return 0;
+  const auto& source = *static_cast<const mlx::core::array*>(arr.ctx);
+  size_t readable_extent = descriptor.allocation_bytes;
+  if (!descriptor.known && !source.buffer().foreign_host_readback_extent(readable_extent)) return -1;
+  const auto& shape = source.shape();
+  const auto& strides = source.strides();
+  if (shape.size() != strides.size()) return -1;
+  int64_t minimum = 0, maximum = 0;
+  size_t contiguous_stride = 1;
+  bool contiguous = true;
+  for (size_t axis = shape.size(); axis != 0; --axis) {
+    const auto extent = shape[axis - 1];
+    if (extent <= 0) return -1;
+    const auto stride = strides[axis - 1];
+    contiguous = contiguous && (extent == 1 ||
+        (stride >= 0 && size_t(stride) == contiguous_stride));
+    if (size_t(extent) > std::numeric_limits<size_t>::max() / contiguous_stride) return -1;
+    contiguous_stride *= size_t(extent);
+    int64_t delta = 0;
+    if (!readback_scale(stride, size_t(extent - 1), delta) ||
+        !readback_add(delta < 0 ? minimum : maximum, delta,
+            delta < 0 ? minimum : maximum)) return -1;
+  }
+  if (contiguous_stride != descriptor.elements) return -1;
+  int64_t lower = 0, upper = 0;
+  if (!readback_scale(minimum, source.itemsize(), lower) ||
+      !readback_scale(maximum, source.itemsize(), upper) ||
+      !readback_add(source.offset(), lower, lower) ||
+      !readback_add(source.offset(), upper, upper) || lower < 0 || upper < 0 ||
+      uint64_t(upper) > readable_extent ||
+      source.itemsize() > readable_extent - size_t(upper)) return -1;
+  if (contiguous) return source.buffer().copy_to_host(destination, size_t(source.offset()), bytes);
+  // Validation above proves every logical displacement before the first write.
+  // Completed backing and caller destination remain borrowed for each synchronous copy.
+  for (size_t flat = 0; flat < descriptor.elements; ++flat) {
+    size_t index = flat;
+    int64_t offset = 0;
+    for (size_t axis = shape.size(); axis != 0; --axis) {
+      offset += int64_t(index % size_t(shape[axis - 1])) * strides[axis - 1];
+      index /= size_t(shape[axis - 1]);
+    }
+    offset = source.offset() + offset * int64_t(source.itemsize());
+    const auto status = source.buffer().copy_to_host(
+        static_cast<char*>(destination) + flat * source.itemsize(), size_t(offset), source.itemsize());
+    if (status) return status;
+  }
+  return 0;
+}
+
+extern "C" int mlx_array_copy_completed_element(
+    const mlx_array arr, size_t index, void* destination, size_t bytes) {
+  mlx_array_descriptor descriptor{};
+  if (descriptor_read(&descriptor, arr) || !descriptor.data ||
+      !destination || index >= descriptor.elements) return -1;
+  const auto& source = *static_cast<const mlx::core::array*>(arr.ctx);
+  size_t readable_extent = descriptor.allocation_bytes;
+  if (!descriptor.known && !source.buffer().foreign_host_readback_extent(readable_extent)) return -1;
+  if (bytes != source.itemsize() || source.shape().size() != source.strides().size()) return -1;
+  int64_t offset = 0;
+  for (size_t axis = source.shape().size(); axis != 0; --axis) {
+    const auto extent = source.shape()[axis - 1];
+    if (extent <= 0) return -1;
+    int64_t delta = 0;
+    if (!readback_scale(source.strides()[axis - 1], index % size_t(extent), delta) ||
+        !readback_add(offset, delta, offset)) return -1;
+    index /= size_t(extent);
+  }
+  if (index || !readback_scale(offset, bytes, offset) ||
+      !readback_add(source.offset(), offset, offset) || offset < 0 ||
+      uint64_t(offset) > readable_extent ||
+      bytes > readable_extent - size_t(offset)) return -1;
+  return source.buffer().copy_to_host(destination, size_t(offset), bytes);
 }

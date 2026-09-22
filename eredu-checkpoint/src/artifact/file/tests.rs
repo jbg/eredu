@@ -163,3 +163,45 @@ fn captured_version_rejects_same_bytes_from_another_file_and_later_source_rewrit
     ));
     ArtifactFileVersion::control_bytes().unwrap();
 }
+
+#[test]
+fn streaming_copy_preserves_exact_file_and_reports_changed_source_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("published.bin");
+    let bytes: Vec<u8> = (0..9007).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let mut destination = tempfile::tempfile().unwrap();
+    let source = PreparedArtifactFileRead::new(File::open(&path).unwrap()).unwrap();
+    let mut observed = Vec::new();
+    source
+        .copy_to_with(&mut destination, |offset, chunk| {
+            assert_eq!(offset, observed.len());
+            observed.extend_from_slice(chunk);
+        })
+        .unwrap();
+    destination.rewind().unwrap();
+    let mut actual = Vec::new();
+    std::io::Read::read_to_end(&mut destination, &mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(observed, bytes);
+    let source = PreparedArtifactFileRead::new(File::open(&path).unwrap()).unwrap();
+    let writer = OpenOptions::new().write(true).open(&path).unwrap();
+    let mut destination = tempfile::tempfile().unwrap();
+    let failure = source
+        .copy_to_with(&mut destination, |offset, _| {
+            if offset == 0 {
+                writer.set_len(4096).unwrap();
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(failure.cause(), ArtifactFileReadError::Truncated));
+    assert_eq!(failure.filled_bytes(), 4096);
+    assert_eq!(destination.metadata().unwrap().len(), 4096);
+    let mut destination = File::open(&path).unwrap();
+    let source = PreparedArtifactFileRead::new(File::open(&path).unwrap()).unwrap();
+    let failure = source
+        .copy_to_with(&mut destination, |_, _| {})
+        .unwrap_err();
+    assert!(matches!(failure.cause(), ArtifactFileReadError::Io(_)));
+    assert_eq!(failure.filled_bytes(), 0);
+}

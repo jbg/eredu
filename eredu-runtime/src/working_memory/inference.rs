@@ -1,18 +1,21 @@
 //! Complete-request composition of cold, completed equation spans.
 
-use super::{InferenceExecutionIdentity, InferenceRequest};
 use crate::prefill::{PrefillChunk, PrefillDriver, PrefillError, PrefillExecutor, PrefillOutcome};
 use eredu_core::{
-    CapabilityError, Completion, ExecutionWorkspaceEstimate, GenerationCancellationToken,
-    InferenceGeometry, OutputDemand, RuntimeStateEstimate, Submission, WorkspaceBound,
+    CapabilityError, Completion, ExecutionWorkspaceEstimate, InferenceGeometry, OutputDemand,
+    RuntimeStateEstimate, Submission, WorkspaceBound,
 };
 use eredu_nn::workspace::{WorkspaceBorrowedStorage, WorkspaceTraceReport};
 use std::convert::Infallible;
 
+mod domains;
 mod metadata;
 mod spans;
+pub use domains::InferenceDomainWorkspaceReport;
 use metadata::Metadata;
-pub use spans::{InferenceSpanWorkspacePlan, InferenceSpanWorkspaceRecord, SamplingWorkspacePlanCollector};
+pub use spans::{
+    InferenceSpanWorkspacePlan, InferenceSpanWorkspaceRecord, SamplingWorkspacePlanCollector,
+};
 
 /// One equation invocation in the admitted prompt and output allowance.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -54,12 +57,21 @@ pub trait InferenceWorkspaceObserver:
         None
     }
 
+    /// Exact currently selected invocation span for an observer whose source
+    /// program quotes each actual prefill chunk independently. This descriptive
+    /// loan supplies no native role or admission; execution still authenticates
+    /// its own consumed claim. A mismatched span does not qualify partial input.
+    fn prefill_invocation_span(&self) -> Option<&crate::prefill::PrefillChunk> {
+        None
+    }
+
     /// Selects one eligible ordinary prediction before its equations. Prediction
     /// zero is prefill; decode index k maps to k+1. Phantom final decode spans and
     /// zero-output requests never invoke this callback. It may inspect schedules
     /// and shape metadata but must not trace operations: the original span opens
     /// afterward. Active partial prefill requires the exact retained companion
-    /// above; default observers retain the typed whole-prompt attribution gate.
+    /// or matching invocation span above; default observers retain the typed
+    /// whole-prompt attribution gate.
     fn begin_span(
         &mut self,
         geometry: InferenceGeometry,
@@ -152,6 +164,9 @@ pub enum InferenceWorkspaceError<E> {
 /// cannot accidentally compose only the first chunk or the final cache size.
 #[derive(Debug, Clone)]
 pub struct InferenceWorkspaceReport {
+    physical_domains: Option<InferenceDomainWorkspaceReport>,
+    physical_domains_complete: bool,
+    traced_media: bool,
     geometry: InferenceGeometry,
     spans: InferenceSpanWorkspacePlan,
     completed_spans: u64,
@@ -170,12 +185,17 @@ pub struct InferenceWorkspaceReport {
 /// that the excluded allocations remain charged in the admission domain.
 #[derive(Debug, Clone)]
 pub struct InferenceResidualWorkspace {
+    physical_domains: Option<eredu_core::DomainMemoryRequirements>,
     borrowed: WorkspaceBorrowedStorage,
     peak_bytes: Option<u64>,
     association_complete: bool,
 }
 
 impl InferenceResidualWorkspace {
+    /// Peak of the original unborrowed backing union in each physical domain.
+    pub fn physical_domains(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.physical_domains.as_ref()
+    }
     pub(super) fn has_complete_association(&self) -> bool {
         self.association_complete
     }
@@ -205,6 +225,11 @@ impl InferenceWorkspaceReport {
     /// requires the separate opt-in quote contribution; this alone grants nothing.
     pub fn span_workspace_plan(&self) -> &InferenceSpanWorkspacePlan {
         &self.spans
+    }
+    /// Largest closing backing population in the retained equation schedule.
+    /// This is independent of byte completeness and grants no storage authority.
+    pub fn maximum_closing_storage_allocations(&self) -> usize {
+        self.spans.maximum_closing_storage_allocations()
     }
     /// Number of safely separated equation spans inspected.
     pub const fn completed_spans(&self) -> u64 {
@@ -256,8 +281,8 @@ impl InferenceWorkspaceReport {
     /// The same complete composition using supplied owning report destinations.
     pub fn compose_metadata(
         &self,
-        state: RuntimeStateEstimate,
-        outside: ExecutionWorkspaceEstimate,
+        mut state: RuntimeStateEstimate,
+        mut outside: ExecutionWorkspaceEstimate,
         metadata: super::WorkspaceReportMetadata<'_>,
     ) -> Result<RuntimeStateEstimate, super::WorkspaceReportError> {
         if outside.geometry != self.geometry {
@@ -266,6 +291,25 @@ impl InferenceWorkspaceReport {
                 detail: "outside workspace does not match inspected request geometry",
             }
             .into());
+        }
+        if let Some(physical) = self.physical_domains() {
+            if let Some(domains) = &mut outside.physical_domains {
+                if domains.geometry != self.geometry {
+                    return Err(eredu_core::AdmissionPolicyError::InvalidConfiguration {
+                        field: "physical_workspace",
+                        detail: "physical workspace geometry differs from equation traversal",
+                    }
+                    .into());
+                }
+                domains.activations = metadata.combine_domain_requirements(
+                    &domains.activations,
+                    &physical.transient,
+                    true,
+                )?;
+            }
+            self.refine_domain_state(&mut state, metadata)?;
+        } else if !self.has_empty_schedule() {
+            outside.physical_domains = None;
         }
         super::trace::with_transient_workspace_metadata(
             state,
@@ -289,7 +333,7 @@ impl InferenceWorkspaceReport {
     /// The same backing refinement with a counted final diagnostic destination.
     pub fn refine_state_backing_metadata(
         &self,
-        state: RuntimeStateEstimate,
+        mut state: RuntimeStateEstimate,
         metadata: super::WorkspaceReportMetadata<'_>,
     ) -> Result<RuntimeStateEstimate, super::WorkspaceReportError> {
         // A terminal placement inspects no equation and therefore says nothing
@@ -298,9 +342,12 @@ impl InferenceWorkspaceReport {
         if self.has_empty_schedule() {
             return Ok(state);
         }
+        self.refine_domain_state(&mut state, metadata)?;
         let backing = match self.retained_peak {
             Some(bytes) => metadata.bounded(bytes, format_args!(
                 "largest complete retained decoder-state backing over all selected prefill and decode spans, including capacity padding and distinct retained views"))?,
+            None if self.physical_domains().is_some() => metadata.per_domain(format_args!(
+                "complete per-domain decoder-state backing has no aggregate u64 diagnostic"))?,
             None => metadata.unknown(format_args!(
                 "selected equation spans have no complete decoder-state backing bound"))?,
         };
@@ -379,22 +426,15 @@ where
 {
     metadata.validate_geometry(geometry)?;
     metadata.admit_schedule::<F, E, R>()?;
-    let execution = InferenceExecutionIdentity::default();
-    // This authority drives metadata scheduling only and never escapes as native
-    // submission authority. Successful native admission must reserve the result.
-    let request = InferenceRequest::without_memory_budget(&execution, geometry)?;
-    let mut driver = PrefillDriver::<(), ColdCompletion>::new(
-        &execution,
-        request,
-        geometry,
-        GenerationCancellationToken::new(),
-    )
-    .map_err(|error| metadata.prefill_error(error))?;
+    let mut driver = PrefillDriver::<(), ColdCompletion, ()>::describe(geometry)?;
     let mut inspection = Inspection {
         quote,
         metadata,
         spans: Vec::new(),
         report: InferenceWorkspaceReport {
+            physical_domains: None,
+            physical_domains_complete: true,
+            traced_media: false,
             geometry,
             spans: InferenceSpanWorkspacePlan::new_metadata(
                 geometry,
@@ -441,7 +481,42 @@ where
         // No equation can create new storage. Residual composition still needs
         // this exact context selection and its separately registered owner;
         // absence of spans must not invent an empty source association.
+        let physical = metadata
+            .context()
+            .and_then(|context| context.memory_topology())
+            .map(|topology| {
+                let placement =
+                    eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())
+                        .map_err(|error| metadata.report().source(error))?;
+                metadata
+                    .report()
+                    .placed_requirements(topology, 0, &placement)
+                    .map_err(|error| metadata.report().error(error))
+            })
+            .transpose()?;
+        inspection.report.physical_domains = physical
+            .as_ref()
+            .map(|zero| {
+                Ok::<_, eredu_nn::Error>(InferenceDomainWorkspaceReport {
+                    transient: metadata
+                        .report()
+                        .clone_domain_requirements(zero)
+                        .map_err(|error| metadata.report().error(error))?,
+                    retained: metadata
+                        .report()
+                        .clone_domain_requirements(zero)
+                        .map_err(|error| metadata.report().error(error))?,
+                    residual: Some(
+                        metadata
+                            .report()
+                            .clone_domain_requirements(zero)
+                            .map_err(|error| metadata.report().error(error))?,
+                    ),
+                })
+            })
+            .transpose()?;
         inspection.report.residual = borrowed.map(|borrowed| InferenceResidualWorkspace {
+            physical_domains: physical,
             borrowed,
             peak_bytes: Some(0),
             association_complete: true,
@@ -468,26 +543,39 @@ where
             source,
         })?;
         let trace = std::borrow::Borrow::<WorkspaceTraceReport>::borrow(&owner);
+        self.record_domains(trace)?;
         self.metadata.reserve(&mut self.spans, 1)?;
-        self.spans
-            .push(InferenceSpanWorkspaceRecord::new(span.clone(), &trace));
+        self.spans.push(InferenceSpanWorkspaceRecord::new(
+            span.clone(),
+            &trace,
+            self.metadata.report(),
+        )?);
         self.report.state_spans_complete &= trace.state.is_some();
         // A partial family trace cannot become complete merely because its
         // borrowed-root union is known. Preserve every full-coverage gap.
         let residual_bytes = trace
             .inference_transient_bytes()
             .and_then(|_| trace.residual.as_ref()?.total_bytes);
+        let physical_residual = self
+            .report
+            .physical_domains()
+            .and_then(|value| value.residual())
+            .map(|value| self.metadata.report().clone_domain_requirements(value))
+            .transpose()
+            .map_err(|error| self.metadata.report().error(error))?;
         if self.report.completed_spans == 0 {
             self.report.residual =
                 trace
                     .residual
                     .as_ref()
                     .map(|residual| InferenceResidualWorkspace {
+                        physical_domains: physical_residual,
                         borrowed: residual.borrowed_storage.clone(),
                         peak_bytes: residual_bytes,
                         association_complete: true,
                     });
         } else if let Some(existing) = self.report.residual.as_mut() {
+            existing.physical_domains = physical_residual;
             existing.association_complete &= trace.residual.is_some();
             if let Some(residual) = &trace.residual {
                 if !existing.borrowed.same_identity(&residual.borrowed_storage) {
@@ -518,13 +606,15 @@ where
                 .tensor_buffers
                 .transient_bytes
                 .zip(state.and_then(|state| state.displaced_bytes))
-                .map(|(new, displaced)| {
-                    new.checked_add(displaced).ok_or_else(|| {
-                        self.metadata
-                            .invalid("tensor and displaced state workspace overflow")
-                    })
+                .map(|(new, displaced)| match new.checked_add(displaced) {
+                    Some(bytes) => Ok(Some(bytes)),
+                    None if trace.physical_domains.is_some() => Ok(None),
+                    None => Err(self
+                        .metadata
+                        .invalid("tensor and displaced state workspace overflow")),
                 })
-                .transpose()?,
+                .transpose()?
+                .flatten(),
         );
         self.report.host_peak = maximum(self.report.host_peak, trace.host_workspace_bytes);
         match trace.inference_transient_bytes() {
@@ -532,7 +622,9 @@ where
                 if self.report.peak_span.is_none() || bytes > self.known_peak {
                     self.known_peak = bytes;
                     self.report.peak_span = Some(span);
-                    if self.report.first_gap.is_none() {
+                    if self.report.first_gap.is_none()
+                        && !matches!(self.report.transient, WorkspaceBound::PerDomain { .. })
+                    {
                         self.report.transient = WorkspaceBound::bounded(
                             bytes,
                             self.metadata.text(format_args!(
@@ -542,6 +634,13 @@ where
                         );
                     }
                 }
+            }
+            None if self.report.physical_domains().is_some() => {
+                self.report.transient = WorkspaceBound::PerDomain {
+                    assumptions: self.metadata.text(format_args!(
+                        "complete physical-domain equation spans have no aggregate u64 diagnostic"
+                    ))?,
+                };
             }
             None if self.report.first_gap.is_none() => {
                 self.report.transient = WorkspaceBound::Unknown {
@@ -571,7 +670,7 @@ impl Completion for ColdCompletion {
         Ok(())
     }
 }
-impl<F, E, R> PrefillExecutor for Inspection<'_, F>
+impl<F, E, R> PrefillExecutor<()> for Inspection<'_, F>
 where
     F: FnMut(&InferenceWorkspaceSpan) -> Result<R, E>,
     R: std::borrow::Borrow<WorkspaceTraceReport>,
@@ -582,7 +681,7 @@ where
     fn submit_chunk(
         &mut self,
         chunk: &PrefillChunk,
-        _: InferenceRequest,
+        _: (),
     ) -> Result<Submission<Option<()>, ColdCompletion>, Self::Error> {
         self.record(InferenceWorkspaceSpan::Prefill(chunk.clone()))?;
         Ok(Submission {

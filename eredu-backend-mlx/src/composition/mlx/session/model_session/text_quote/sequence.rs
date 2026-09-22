@@ -235,12 +235,7 @@ impl SequenceQuotation {
         request: &InferenceRequest,
     ) -> Result<Self, AdmissionFailure> {
         let (span, witness) = accepted
-            .into_funded_text_span_workspace(
-                funding,
-                request
-                    .memory_reservation()
-                    .expect("accepted original reservation"),
-            )
+            .into_funded_text_span_workspace(funding, request.memory_reservation())
             .map_err(|cause| {
                 AdmissionFailure::Sequence(BackendFailure::new(
                     BackendFailureKind::InvalidSession,
@@ -256,12 +251,7 @@ impl SequenceQuotation {
         request: &InferenceRequest,
     ) -> Result<Self, AdmissionFailure> {
         let (span, witness) = accepted
-            .into_funded_text_span_workspace(
-                funding,
-                request
-                    .memory_reservation()
-                    .expect("accepted original reservation"),
-            )
+            .into_funded_text_span_workspace(funding, request.memory_reservation())
             .map_err(|cause| {
                 AdmissionFailure::Sequence(BackendFailure::new(
                     BackendFailureKind::InvalidSession,
@@ -458,7 +448,12 @@ fn prepare_controls(
     };
     let controls = match prefill {
         Some(facts) => {
-            #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+            #[cfg(all(
+                test,
+                target_vendor = "apple",
+                feature = "metal",
+                not(feature = "cuda")
+            ))]
             let facts = super::prefill_tests::pointwise_prefill_controls(facts)?;
             controls.with_prefill_scopes(facts).map_err(memory)?
         }
@@ -468,7 +463,12 @@ fn prepare_controls(
         Some(plan) => controls.with_native_storage(plan).map_err(memory)?,
         None => controls,
     };
-    #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+    #[cfg(all(
+        test,
+        target_vendor = "apple",
+        feature = "metal",
+        not(feature = "cuda")
+    ))]
     let controls = super::prefill_tests::host_destination_controls(controls)?;
     Ok(controls)
 }
@@ -483,10 +483,10 @@ fn preflight(
     let session = runtime.session();
     if session.poison.get()
         || !Rc::ptr_eq(&quote.session, &session.poison)
-        || !quote.model_pool.same_domain(&session.payload.memory_pool)
+        || !quote.model_pool.same_ledger(&session.payload.memory_ledger)
         || !quote
             .context_pool
-            .same_domain(runtime.backend().memory_pool())
+            .same_ledger(runtime.backend().memory_ledger())
         || !session.parameter_epoch_matches(quote.parameter_epoch)
         || quote.opening.require_sealed().is_err()
         || quote

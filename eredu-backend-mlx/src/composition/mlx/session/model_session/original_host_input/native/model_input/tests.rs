@@ -3,6 +3,10 @@ use super::*;
 
 #[test]
 fn full_original_input_qwen_vl_matches_all_states_and_three_cached_decodes_across_residencies() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen3_vl_component_fixture(
         root.path(),
@@ -14,6 +18,10 @@ fn full_original_input_qwen_vl_matches_all_states_and_three_cached_decodes_acros
 #[test]
 fn full_original_input_conditional_qwen_matches_all_states_and_three_cached_decodes_across_residencies(
 ) {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen35_conditional_component_fixture(
         root.path(),
@@ -23,6 +31,10 @@ fn full_original_input_conditional_qwen_matches_all_states_and_three_cached_deco
 }
 #[test]
 fn full_original_input_both_selected_families_use_same_iterator_and_manual_driver() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     core_driver_family(3, false);
     core_driver_family(3, true);
 }
@@ -36,9 +48,9 @@ fn full_original_input_exact_short_foreign_and_partial_constructor_preserve_b() 
     );
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let materializer = MlxPreparedInputMaterializer::prepare().unwrap();
-    let measure = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let measure = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let input = source(&measure, 64);
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(measure.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(measure.clone());
     let config = cold_config(&backend, root.path(), 0);
     let a = config
         .prepared_sources()
@@ -58,9 +70,9 @@ fn full_original_input_exact_short_foreign_and_partial_constructor_preserve_b() 
     drop(backend);
     drop(config);
     for short in [true, false] {
-        let pool = WorkingMemoryPool::new(i + abytes + b - u64::from(short), 0).unwrap();
+        let pool = crate::memory_fixture::ledger(i + abytes + b - u64::from(short), 0).unwrap();
         let input = source(&pool, 64);
-        let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+        let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
         let config = cold_config(&backend, root.path(), 0);
         let a = config
             .prepared_sources()
@@ -77,7 +89,7 @@ fn full_original_input_exact_short_foreign_and_partial_constructor_preserve_b() 
             assert_eq!(error.retained_bytes(), 0);
             assert_eq!(COMPILES.get(), 0);
             assert!(
-                matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if *required_bytes==b&&*available_bytes==b-1)
+                matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==b&&(*limit_bytes - *existing_bytes)==b-1)
             );
         } else {
             let full = result.unwrap();
@@ -86,9 +98,9 @@ fn full_original_input_exact_short_foreign_and_partial_constructor_preserve_b() 
             let cache = full.0.storage().cache().unwrap().clone();
             let parts = full.0.storage().parts().unwrap().clone();
             assert!(cache.original_source().unwrap().same_source(&input));
-            let before = pool.used_bytes().unwrap();
+            let before = pool.fixture_host_charge().unwrap();
             drop(full);
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before);
             assert_eq!(parts.as_ref().len(), input.parts().len());
             drop(parts);
             drop(cache);
@@ -109,7 +121,7 @@ fn full_original_input_exact_short_foreign_and_partial_constructor_preserve_b() 
             drop(error);
             settle(&pool, 0, i + abytes);
         }
-        let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let before = COMPILES.get();
         assert_eq!(
             materializer
@@ -136,10 +148,10 @@ fn full_original_cache_ordinary_publication_authenticates_residence_without_dupl
         false,
         false,
     );
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let input = source(&pool, 64);
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let config = cold_config(&backend, root.path(), 0);
     let a = config
         .prepared_sources()
@@ -154,7 +166,7 @@ fn full_original_cache_ordinary_publication_authenticates_residence_without_dupl
         .materialize(&pool)
         .unwrap();
     let cache = full.0.storage().cache().unwrap().clone();
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     let abytes = a.original_bytes();
     let inventory = || {
         let mut s = RetainedStorage::default();
@@ -167,18 +179,18 @@ fn full_original_cache_ordinary_publication_authenticates_residence_without_dupl
         .retain_metadata(&eredu_runtime::SharedHostMetadata::Input(cache.clone()))
         .unwrap();
     let publication = inventory().publish_unquoted(&owner).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     assert!(inventory().register(&pool).is_err());
-    let other = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let other = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let foreign = NativeMemoryOwner::acquire_typed(&other).unwrap();
     assert!(inventory().publish_unquoted(&foreign).is_err());
-    assert_eq!(other.used_bytes().unwrap(), 0);
+    assert_eq!(other.fixture_host_charge().unwrap(), 0);
     drop(inventory);
     drop(cache);
     drop(full);
     drop(a);
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), held - abytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held - abytes);
     drop(publication);
     drop(owner);
     crate::backend::ordinary_retirement::reclaim_all();
@@ -198,7 +210,11 @@ fn error_source<'a, T: std::error::Error + 'static>(
 #[test]
 fn full_original_input_binding_rejects_substitution_busy_poison_and_stale_frontier_without_refund()
 {
-    use eredu_core::Completion;
+    use super::super::super::tests::admitted;
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     for case in 0..5 {
         let root = tempfile::tempdir().unwrap();
         crate::tests::distributed_pipeline_ring::write_qwen3_vl_component_fixture(
@@ -206,13 +222,18 @@ fn full_original_input_binding_rejects_substitution_busy_poison_and_stale_fronti
             false,
             false,
         );
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
+        let backend = admitted::backend(&pool);
+        backend.stream().synchronize().unwrap();
+        safemlx::memory::clear_cache();
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        safemlx::reclaim_allocation_owners();
+        crate::backend::ordinary_retirement::reclaim_all();
+        let baseline = pool.fixture_host_charge().unwrap();
         let input = source(&pool, 64);
         let equal = source(&pool, 64);
         assert_eq!(input.content_digest(), equal.content_digest());
         assert!(!input.same_source(&equal));
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
         let config = cold_config(&backend, root.path(), 0);
         let a = config
             .prepared_sources()
@@ -227,6 +248,21 @@ fn full_original_input_binding_rejects_substitution_busy_poison_and_stale_fronti
             .materialize(&pool)
             .unwrap();
         let b = full.original_bytes();
+        let advance = (case == 4).then(|| {
+            let semantics = config
+                .prepared_sources()
+                .plan_original_media_semantics(&input)
+                .unwrap()
+                .compile(&pool)
+                .unwrap();
+            let native = MlxPreparedInputMaterializer::prepare()
+                .unwrap()
+                .model_input_plan(&semantics)
+                .unwrap()
+                .materialize(&pool)
+                .unwrap();
+            (semantics, native)
+        });
         let a = if case == 0 {
             drop(a);
             config
@@ -249,11 +285,9 @@ fn full_original_input_binding_rejects_substitution_busy_poison_and_stale_fronti
                 .prepare_completed_media_binding_fixture()
                 .unwrap();
         }
-        if case == 4 {
-            let ordinary = MlxModelInput::from_original_host_input(&runtime, &input).unwrap();
-            let output = runtime.prefill(ordinary).unwrap();
-            output.completion.wait().unwrap();
-            drop(output);
+        if let Some((semantic, native)) = advance {
+            let prompt = native.bind(&runtime, semantic).unwrap();
+            admitted::collect(&mut runtime, prompt, 1, true);
         }
         let lease = if case == 2 {
             Some(
@@ -270,11 +304,11 @@ fn full_original_input_binding_rejects_substitution_busy_poison_and_stale_fronti
         if case == 3 {
             runtime.session().poison.set(true);
         }
-        let used = pool.used_bytes().unwrap();
+        let used = pool.fixture_host_charge().unwrap();
         let owners = pool.unquoted_owner_count().unwrap();
         let error = full.bind(&runtime, a).unwrap_err();
         assert_eq!(error.retained_bytes(), b);
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
         assert_eq!(pool.unquoted_owner_count().unwrap(), owners);
         if case == 4 {
             assert!(
@@ -294,7 +328,8 @@ fn full_original_input_binding_rejects_substitution_busy_poison_and_stale_fronti
         drop(runtime);
         drop(input);
         drop(equal);
-        settle(&pool, 0, 0);
+        drop(config);
+        settle(&pool, 0, baseline);
     }
 }
 #[test]
@@ -308,10 +343,10 @@ fn full_original_input_frontier_error_representation_retains_actual_box_until_b_
         false,
         false,
     );
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let input = source(&pool, 64);
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let config = cold_config(&backend, root.path(), 0);
     let a = config
         .prepared_sources()
@@ -325,7 +360,7 @@ fn full_original_input_frontier_error_representation_retains_actual_box_until_b_
         .unwrap()
         .materialize(&pool)
         .unwrap();
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     let conversion = u64::try_from(-1i32).unwrap_err();
     assert!(size_of::<std::num::TryFromIntError>() > 0);
     let error = MlxPreparedModelInputBindError {
@@ -338,8 +373,12 @@ fn full_original_input_frontier_error_representation_retains_actual_box_until_b_
         input: full,
     };
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     assert!(error_source::<std::num::TryFromIntError>(&error).is_some());
     drop(error);
     settle(&pool, 0, 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

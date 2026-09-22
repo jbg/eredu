@@ -54,7 +54,7 @@ pub enum EncodedRecipeSourceError {
     Compilation(#[from] EncodedRecipeReadPreparationError<SharedNativeInitializationCustody>),
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Prepare encoded recipe metadata and projected source records under this
     /// pool before native input construction. The retained source supplies its
     /// exact closed route; no ordinary read or lease callback is used as fallback.

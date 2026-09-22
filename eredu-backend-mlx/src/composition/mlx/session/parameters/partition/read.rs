@@ -1,5 +1,6 @@
 //! Public bounded queries and contractions over actual global loaded ownership.
 use super::*;
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataAllocation};
 use std::cell::RefCell;
 
 struct PreparedRead {
@@ -12,20 +13,62 @@ struct ReadOutput {
     dtype: InterventionDtype,
     shape: Vec<u64>,
     values: Vec<f32>,
+    result: super::super::result::PreparedResult,
 }
 
 impl MlxModelSession {
+    fn completed_parameter_fragments(
+        &mut self,
+        parameter: &str,
+        prepared: &PreparedRead,
+        rank: usize,
+        host: &eredu_core::HostPreparationAuthority,
+        funding: &HostMetadataFunding,
+    ) -> Result<Option<Vec<u32>>, ParameterError> {
+        if prepared
+            .fragments
+            .iter()
+            .any(|(_, projection)| projection.is_some())
+        {
+            return Ok(None);
+        }
+        let mut words = funding
+            .metadata_vec(prepared.plan.rank_counts()[rank])
+            .map_err(|cause| failure(Error::Neural(cause)))?;
+        for (region, _) in &prepared.fragments {
+            let count =
+                usize::try_from(elements(&region.shape)?).map_err(|_| ParameterError::Overflow)?;
+            let controls = WorkspaceContext::metadata_vec_bytes::<f32>(count)
+                .ok_or(ParameterError::Overflow)?;
+            funding
+                .reserve_metadata(controls)
+                .map_err(|cause| failure(Error::WorkspacePlanning(cause)))?;
+            let Some(values) = self.query_completed_parameter(parameter, region, host)? else {
+                return Ok(None);
+            };
+            if words
+                .len()
+                .checked_add(values.len())
+                .is_none_or(|length| length > words.capacity())
+            {
+                return Err(ParameterError::Overflow);
+            }
+            words.extend(values.into_iter().map(f32::to_bits));
+        }
+        Ok(Some(words))
+    }
+
     pub(in super::super) fn query_partition_parameter(
         &mut self,
         identity: &str,
         parameter: &str,
         region: ParameterRegion,
         limits: CaptureUsage,
-        stream: &Stream,
-    ) -> Result<ParameterValues, ParameterError> {
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
+    ) -> Result<SharedParameterValues, ParameterError> {
         let output =
-            self.read_partition_parameter(identity, parameter, &region, None, limits, stream)?;
-        Ok(ParameterValues {
+            self.read_partition_parameter(identity, parameter, &region, None, limits, environment)?;
+        output.result.finish_query(ParameterValues {
             identity: identity.into(),
             parameter: parameter.into(),
             dtype: output.dtype,
@@ -40,17 +83,17 @@ impl MlxModelSession {
         parameter: &str,
         projection: ParameterProjection,
         limits: CaptureUsage,
-        stream: &Stream,
-    ) -> Result<ParameterProjectionValues, ParameterError> {
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
+    ) -> Result<SharedParameterProjectionValues, ParameterError> {
         let output = self.read_partition_parameter(
             identity,
             parameter,
             &projection.region,
             Some(&projection),
             limits,
-            stream,
+            environment,
         )?;
-        Ok(ParameterProjectionValues {
+        output.result.finish_projection(ParameterProjectionValues {
             identity: identity.into(),
             parameter: parameter.into(),
             source_dtype: output.dtype,
@@ -66,7 +109,7 @@ impl MlxModelSession {
         region: &ParameterRegion,
         projection: Option<&ParameterProjection>,
         limits: CaptureUsage,
-        stream: &Stream,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
     ) -> Result<ReadOutput, ParameterError> {
         let catalog = self.partition_parameter_catalog(Some(limits))?;
         let transport = self
@@ -75,6 +118,7 @@ impl MlxModelSession {
             .clone()
             .expect("completed distributed catalogue");
         let owner = transport.parameter_operations()?;
+        let prepared_transport = self.prepared_parameter_transport(&transport)?;
         let binding = self.parameter_operation_binding()?;
         let mut budget = NativeParameterBudget {
             total: Rc::clone(&self.payload.parameter_state.usage),
@@ -90,19 +134,38 @@ impl MlxModelSession {
             transport.parameter_rank(),
             &mut budget,
         );
-        let (prepared, admission) = match prepared {
-            Ok(prepared) => {
+        let prepared = prepared.and_then(|prepared| {
+            let result = if projection.is_some() {
+                super::super::result::PreparedResult::projection(
+                    &self.payload.memory_ledger,
+                    identity,
+                    parameter,
+                    prepared.plan.output_shape(),
+                    prepared.plan.output_shape().len(),
+                )?
+            } else {
+                super::super::result::PreparedResult::query(
+                    &self.payload.memory_ledger,
+                    identity,
+                    parameter,
+                    region,
+                )?
+            };
+            Ok((prepared, result))
+        });
+        let (prepared, result_funding, admission) = match prepared {
+            Ok((prepared, result)) => {
                 let admission = ParameterReadPreparation::new(
                     (),
                     *prepared.plan.identity(),
                     prepared.plan.max_rank_words(),
                 );
-                (Some(prepared), Ok(admission))
+                (Some(prepared), Some(result), Ok(admission))
             }
-            Err(error) => (None, Err(error)),
+            Err(error) => (None, None, Err(error)),
         };
         let result = owner.read(
-            &transport,
+            &prepared_transport,
             binding,
             &parameter_read_intent(parameter, region, projection),
             if projection.is_some() {
@@ -117,40 +180,65 @@ impl MlxModelSession {
                 if prepared.fragments.is_empty() {
                     return Ok(Vec::new());
                 }
+                if let Some(words) = self.completed_parameter_fragments(
+                    parameter,
+                    prepared,
+                    transport.parameter_rank(),
+                    result_funding
+                        .as_ref()
+                        .expect("admitted result")
+                        .host_authority(),
+                    prepared_transport.funding(),
+                )? {
+                    return Ok(words);
+                }
                 let layout = &catalog.layouts[parameter];
-                let mut ids = BTreeSet::from([parameter.to_owned()]);
-                layout.extend_dependencies(&mut ids);
-                self.with_model_operation(|model| {
-                    with_selected_parameter_values(model.erased_mut(), &ids, stream, |selected| {
-                        let tensor = layout.effective(parameter, selected, stream)?;
-                        let mut output = Vec::with_capacity(
-                            prepared.plan.rank_counts()[transport.parameter_rank()],
-                        );
-                        for (region, projection) in &prepared.fragments {
-                            let values = match projection {
-                                None => encoding::read_effective(&tensor, region, stream)?,
-                                Some(projection) => encoding::project_effective(
-                                    &tensor,
-                                    projection.projection(),
-                                    stream,
-                                )?,
-                            };
-                            output.extend(values.into_iter().map(f32::to_bits));
+                let mut output = prepared_transport
+                    .funding()
+                    .metadata_vec(prepared.plan.rank_counts()[transport.parameter_rank()])
+                    .map_err(|cause| failure(Error::Neural(cause)))?;
+                for (region, projection) in &prepared.fragments {
+                    let request = match projection {
+                        None => super::super::numerical::Request::Read(region),
+                        Some(projection) => {
+                            super::super::numerical::Request::Project(projection.projection())
                         }
-                        Ok(output)
-                    })
-                })
-                .map_err(failure)
+                    };
+                    let values = self
+                        .read_resident_effective_parameter(parameter, layout, request, environment)
+                        .map_err(failure)?
+                        .ok_or_else(|| {
+                            failure(Error::PrefillControl(
+                                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+                            ))
+                        })?;
+                    if output
+                        .len()
+                        .checked_add(values.len())
+                        .is_none_or(|n| n > output.capacity())
+                    {
+                        return Err(ParameterError::Overflow);
+                    }
+                    output.extend(values.into_iter().map(f32::to_bits));
+                }
+                Ok(output)
             },
             |rows| {
                 let prepared = prepared.as_ref().expect("admitted query");
-                let rows = rows
-                    .iter()
-                    .map(|row| row.iter().copied().map(f32::from_bits).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
+                let funding = prepared_transport.funding();
+                let mut decoded = funding
+                    .metadata_vec(rows.len())
+                    .map_err(|cause| failure(Error::Neural(cause)))?;
+                for row in rows {
+                    let mut values = funding
+                        .metadata_vec(row.len())
+                        .map_err(|cause| failure(Error::Neural(cause)))?;
+                    values.extend(row.iter().copied().map(f32::from_bits));
+                    decoded.push(values);
+                }
                 prepared
                     .plan
-                    .assemble(&rows, &mut *prepared.assembly.borrow_mut())
+                    .assemble(&decoded, &mut *prepared.assembly.borrow_mut())
             },
         );
         let values = self.finish_parameter_control(&transport, result)?;
@@ -159,6 +247,7 @@ impl MlxModelSession {
             dtype: prepared.dtype,
             shape: prepared.plan.output_shape().to_vec(),
             values,
+            result: result_funding.expect("completed result allocation grant"),
         })
     }
 }

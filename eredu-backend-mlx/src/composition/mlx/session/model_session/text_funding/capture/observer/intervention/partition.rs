@@ -55,19 +55,31 @@ impl NativeScheduledCapture<'_> {
         result.map_err(|cause| self.scheduled_failure(cause))
     }
     pub(in super::super) fn partition_evidence_validate(
-        &self,value:&Array,claim:&CaptureInterventionClaim<'_>,
-        side:eredu_core::capture::InterventionEvidenceSide,window:Option<Window>,
-    )->Result<(),FundedCaptureError<Error>> {
-        let result=(|| {
-            let (source,rank)=self.partition_edit_source(claim,window)?;
-            let source=source.evidence().ok_or_else(||Error::Other(Box::new(NativeFailure::SourceChanged)))?;
-            if source.rank()!=rank {return Err(Error::Other(Box::new(NativeFailure::ClaimMismatch)));}
-            let scope=self.work.scope.try_borrow().map_err(|_|Error::PrefillScopeReentrant)?;
-            let scope=scope.as_ref().ok_or(Error::PrefillScopeUnavailable)?;
-            source.validate_native(value,claim,side,window,scope)
-                .map_err(|cause|Error::Other(Box::new(cause)))
+        &self,
+        value: &Array,
+        claim: &CaptureInterventionClaim<'_>,
+        side: eredu_core::capture::InterventionEvidenceSide,
+        window: Option<Window>,
+    ) -> Result<(), FundedCaptureError<Error>> {
+        let result = (|| {
+            let (source, rank) = self.partition_edit_source(claim, window)?;
+            let source = source
+                .evidence()
+                .ok_or_else(|| Error::Other(Box::new(NativeFailure::SourceChanged)))?;
+            if source.rank() != rank {
+                return Err(Error::Other(Box::new(NativeFailure::ClaimMismatch)));
+            }
+            let scope = self
+                .work
+                .scope
+                .try_borrow()
+                .map_err(|_| Error::PrefillScopeReentrant)?;
+            let scope = scope.as_ref().ok_or(Error::PrefillScopeUnavailable)?;
+            source
+                .validate_native(value, claim, side, window, scope)
+                .map_err(|cause| Error::Other(Box::new(cause)))
         })();
-        result.map_err(|cause|self.scheduled_failure(cause))
+        result.map_err(|cause| self.scheduled_failure(cause))
     }
     pub(in super::super) fn partition_edit_apply(
         &self,
@@ -107,8 +119,13 @@ impl NativeScheduledCapture<'_> {
 pub(super) fn control_bytes() -> Option<usize> {
     [
         size_of::<Option<Window>>(),
-        size_of::<(&NativeScheduledCapture<'_>,&Array,&CaptureInterventionClaim<'_>,
-            eredu_core::capture::InterventionEvidenceSide,Option<Window>)>(),
+        size_of::<(
+            &NativeScheduledCapture<'_>,
+            &Array,
+            &CaptureInterventionClaim<'_>,
+            eredu_core::capture::InterventionEvidenceSide,
+            Option<Window>,
+        )>(),
         size_of::<(
             &NativeScheduledCapture<'_>,
             &Array,

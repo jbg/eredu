@@ -49,8 +49,11 @@ exchange, paid Hybrid reset and cumulative capture refusal.
 The recorded public and CLI builds use optimization level 2 for six Rust
 packages, retaining debug assertions, overflow checks and native development
 guards. Tests use a 64 MiB Rust test-thread stack. Default 2 MiB debug-stack
-execution is not established. CLI cases retain a 120-second deadline and
-64 GiB capacity. These functional runs are not throughput benchmarks.
+execution is not established. The CLI matrix uses a 240-second deadline and a
+finite 16 TiB shared-domain allowance, including conservative native graph and
+control populations. This allowance is not measured residency. Current ledger
+validation is recorded in [physical memory validation](physical-memory-validation.md).
+These functional cases are not throughput benchmarks.
 
 Apple CPU/Metal and Ring are the native hardware scope. An unrun configuration
 is not established by a portable test or metadata build. Released text and image

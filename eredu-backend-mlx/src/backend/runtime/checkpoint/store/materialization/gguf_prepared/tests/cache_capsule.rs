@@ -9,12 +9,12 @@ use eredu_core::residency::{
     MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy,
 };
 use eredu_runtime::residency::{OffloadUnit, WeightBinding};
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
 
 fn manager(
     fixture: &OriginalGgufMissFixture,
     cache: CacheHandle,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<ResidencyManager, ResidencyError> {
     let id = eredu_core::residency::OffloadUnitId::new("cache.window").unwrap();
     let binding = WeightBinding::new("weight", "bank.weight", TensorSelection::Full, 32).unwrap();
@@ -49,11 +49,11 @@ fn cache_capsule_manager_and_real_lease_preserve_the_original_birth() {
             &fixture.stream,
         )
         .unwrap();
-    let pool = WorkingMemoryPool::new(bytes.checked_add(stream_bytes).unwrap(), 0).unwrap();
-    let foreign = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(bytes.checked_add(stream_bytes).unwrap(), 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let cache = CacheHandle::prepare(&pool).unwrap();
     let selected = manager(&fixture, cache.clone(), &pool).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes + stream_bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes + stream_bytes);
     assert!(selected.gguf_cache_handle().unwrap().same(&cache));
     assert!(matches!(
         manager(&fixture, CacheHandle::ordinary(), &pool),
@@ -83,9 +83,9 @@ fn cache_capsule_manager_and_real_lease_preserve_the_original_birth() {
     assert_eq!(lease.output_shape(), &[2, 4]);
     drop((context, selected, cache));
     safemlx::reclaim_allocation_owners(); // final private stream pair retired before its accounts
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn cache_capsule_populated_cache_retires_after_pending_alias_and_before_final_cr
         return;
     };
     let fixture = OriginalGgufMissFixture::new();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let cache = CacheHandle::prepare(&pool).unwrap();
     let context = MlxParameterMaterializationContext::with_cache(
         fixture.stream.clone(),
@@ -114,11 +114,15 @@ fn cache_capsule_populated_cache_retires_after_pending_alias_and_before_final_cr
         .unwrap();
     assert_eq!(cache.try_lock().unwrap().len(), 1);
     drop((context, cache));
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     let output = pending.finish().unwrap();
     assert_eq!(values(&output, None), fixture.expected["bank.weight"]);
     // The output's ordinary native backing is a separate owner. Finishing the
     // last pending cache alias drops its now-stale row, mutex and shared shell.
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     drop(output);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

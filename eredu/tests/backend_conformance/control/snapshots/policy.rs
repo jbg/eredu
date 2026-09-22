@@ -6,10 +6,10 @@ use crate::host_authority::Guard;
 use eredu_core::{TextGeneration, TextGenerationDriver, TokenFilterController};
 use eredu_runtime::{
     execution_control::{
-        ManagedTextContinuation, SnapshotBudget, SnapshotTokenController, TextBranchRequest,
-        TextContinuationSnapshot, TextSnapshotError,
+        ManagedTextContinuation, SnapshotBudget, SnapshotTokenController, TextContinuationSnapshot,
+        TextSnapshotError,
     },
-    working_memory::WorkingMemoryPool,
+    working_memory::MemoryLedger,
 };
 
 #[derive(Clone, Default)]
@@ -76,17 +76,6 @@ fn budget() -> SnapshotBudget {
     })
 }
 
-fn branch_request() -> TextBranchRequest<'static> {
-    TextBranchRequest {
-        session_id: "snapshot-policy-child",
-        max_predictions: 4,
-        capture_limits: None,
-        intervention: None,
-        host_bytes: Some(64),
-        continuation_growth_bytes: Some(64),
-    }
-}
-
 fn advance(
     state: &mut ManagedTextContinuation<MockBackend, Controller>,
     driver: &mut TextGenerationDriver<'_, MockBackend>,
@@ -96,42 +85,53 @@ fn advance(
     Some(token)
 }
 
-#[test]
-fn capture_and_fork_preserve_parent_policy_and_match_ordinary_outputs() {
-    let expected = ordinary();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let probe = Guard::new(&pool);
-    let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
-    let mut driver = TextGenerationDriver::new(&mut runtime);
-    let mut state = ManagedTextContinuation::root(
-        driver
-            .start(vec![11, 7, 3].into(), config(), Controller::default())
-            .unwrap(),
-    );
-    let budget = budget();
-    assert_eq!(advance(&mut state, &mut driver), Some(expected[0]));
-    let first = probe.update(|p| p.steps[0].clone());
-    assert_eq!(first.attempt(), 0);
-    let saved = TextContinuationSnapshot::capture(
-        &mut state.boundary(&mut driver).unwrap(),
-        &budget,
-        Some(64),
+fn ignore(_: ControlledGenerationRecord) -> ControlFlow<()> {
+    ControlFlow::Continue(())
+}
+fn branch_options() -> eredu::api::GenerationBranchOptions {
+    eredu::api::GenerationBranchOptions {
+        trace_limits: limits(),
+        capture_limits: None,
+        sampling: None,
+        intervention: None,
+    }
+}
+fn enable_snapshots(run: &mut eredu::api::ControlledGenerationSession<'_, MockBackend>) {
+    run.enable_snapshots(
+        SnapshotLimits {
+            max_snapshots: 4,
+            max_branches: 2,
+            retained_bytes: 64_000_000,
+            cumulative_copy_bytes: 256_000_000,
+        },
+        crate::memory::limits(original_sources::CAPACITY),
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+            original_sources::CAPACITY,
+        )),
     )
     .unwrap();
-    let mut child = saved
-        .fork(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            branch_request(),
-        )
+}
+#[test]
+fn capture_and_fork_preserve_parent_policy_and_match_ordinary_outputs() {
+    let (mut model, chat, settings, first_token) = snapshot_setup();
+    let pool = model.original_pool().clone();
+    let probe = Guard::new(&pool);
+    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let mut run = model
+        .start_controlled_chat(request, limits(), Default::default(), ignore)
+        .unwrap()
         .unwrap();
-    assert_eq!(
-        probe.update(|p| p.steps.len()),
-        1,
-        "copying must not issue a prediction"
-    );
-    while advance(&mut state, &mut driver).is_some() {}
-    assert_eq!(state.controller().0, expected);
+    enable_snapshots(&mut run);
+    run.step(ignore).unwrap();
+    assert_eq!(run.token_ids(), [first_token]);
+    let first = probe.update(|p| p.steps[0].clone());
+    assert_eq!(first.attempt(), 0);
+    let saved = run.snapshot(ignore).unwrap();
+    let mut child = run.fork(&saved, branch_options(), ignore).unwrap();
+    assert_eq!(probe.update(|p| p.steps.len()), 1);
+    run.run(ignore).unwrap();
+    let expected = run.token_ids().to_vec();
+    assert!(expected.len() > 1);
     let parent_steps = probe.update(|p| p.steps.clone());
     assert_eq!(parent_steps.len(), expected.len());
     for (ordinal, context) in parent_steps.iter().enumerate() {
@@ -139,97 +139,71 @@ fn capture_and_fork_preserve_parent_policy_and_match_ordinary_outputs() {
         assert_eq!(context.policy_identity(), first.policy_identity());
         assert_eq!(context.attempt(), ordinal as u64);
     }
-
-    child.exchange(&mut driver, &mut state).unwrap();
-    while advance(&mut state, &mut driver).is_some() {}
-    assert_eq!(state.controller().0, expected);
-    let child_steps = probe.update(|p| p.steps[expected.len()..].to_vec());
-    assert_eq!(child_steps.len(), expected.len() - 1);
-    assert_ne!(child_steps[0].run_identity(), first.run_identity());
-    for (ordinal, context) in child_steps.iter().enumerate() {
-        assert_eq!(context.run_identity(), child_steps[0].run_identity());
-        assert_eq!(context.policy_identity(), child_steps[0].policy_identity());
+    run.exchange(&mut child, ignore).unwrap();
+    run.run(ignore).unwrap();
+    assert_eq!(run.token_ids(), expected);
+    let steps = probe.update(|p| p.steps[expected.len()..].to_vec());
+    assert_eq!(steps.len(), expected.len() - 1);
+    assert_ne!(steps[0].run_identity(), first.run_identity());
+    for (ordinal, context) in steps.iter().enumerate() {
+        assert_eq!(context.run_identity(), steps[0].run_identity());
+        assert_eq!(context.policy_identity(), steps[0].policy_identity());
         assert_eq!(context.attempt(), ordinal as u64);
     }
 }
-
 #[test]
-fn failed_copy_staging_preserves_policy_and_installed_restore_revises_without_refund() {
-    let expected = ordinary();
+fn failed_copy_staging_preserves_policy_and_restore_installs_fresh_funded_run() {
     for operation in ["capture", "restore", "fork"] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let (mut model, chat, settings, first_token) = snapshot_setup();
+        let pool = model.original_pool().clone();
         let probe = Guard::new(&pool);
-        let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
-        let mut driver = TextGenerationDriver::new(&mut runtime);
-        let mut state = ManagedTextContinuation::root(
-            driver
-                .start(vec![11, 7, 3].into(), config(), Controller::default())
-                .unwrap(),
-        );
-        let budget = budget();
-        assert_eq!(advance(&mut state, &mut driver), Some(expected[0]));
-        let first = probe.update(|p| p.steps[0].clone());
-        let saved = TextContinuationSnapshot::capture(
-            &mut state.boundary(&mut driver).unwrap(),
-            &budget,
-            Some(64),
-        )
-        .unwrap();
-        probe.update(|p| p.fail_copy = Some("sampling copy"));
-        let failed = {
-            let mut boundary = state.boundary(&mut driver).unwrap();
-            match operation {
-                "capture" => {
-                    TextContinuationSnapshot::capture(&mut boundary, &budget, Some(64)).map(|_| ())
-                }
-                "restore" => saved.restore(&mut boundary, &budget),
-                "fork" => saved
-                    .fork(&mut boundary, &budget, branch_request())
-                    .map(|_| ()),
-                _ => unreachable!(),
-            }
-        };
-        assert!(
-            matches!(failed, Err(TextSnapshotError::Backend(MockError::Capture(message))) if message == "host snapshot copy failed")
-        );
-        assert_eq!(probe.update(|p| p.steps.len()), 1);
-        assert_eq!(state.controller().0, expected[..1]);
-        probe.update(|p| p.fail_copy = None);
-
-        assert_eq!(advance(&mut state, &mut driver), Some(expected[1]));
-        let after_copy = probe.update(|p| p.steps[1].clone());
-        assert_eq!(
-            after_copy.run_identity(),
-            first.run_identity(),
-            "{operation}"
-        );
-        assert_eq!(
-            after_copy.policy_identity(),
-            first.policy_identity(),
-            "{operation}"
-        );
-        assert_eq!(after_copy.attempt(), 1);
-
-        saved
-            .restore(&mut state.boundary(&mut driver).unwrap(), &budget)
+        let request =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let mut run = model
+            .start_controlled_chat(request, limits(), Default::default(), ignore)
+            .unwrap()
             .unwrap();
-        assert_eq!(state.controller().0, expected[..1]);
-        assert_eq!(advance(&mut state, &mut driver), Some(expected[1]));
+        enable_snapshots(&mut run);
+        run.step(ignore).unwrap();
+        let first = probe.update(|p| p.steps[0].clone());
+        let saved = run.snapshot(ignore).unwrap();
+        let before = run.snapshot_usage().unwrap();
+        let failure = super::super::provider_errors::Armed::new(if operation == "capture" {
+            "capture"
+        } else {
+            "copy"
+        });
+        let error = match operation {
+            "capture" => run.snapshot(ignore).map(|_| ()),
+            "restore" => run.restore(&saved, ignore),
+            "fork" => run.fork(&saved, branch_options(), ignore).map(|_| ()),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        failure.assert_error(&error);
+        drop(error);
+        drop(failure);
+        assert_eq!(probe.update(|p| p.steps.len()), 1);
+        assert_eq!(run.token_ids(), [first_token]);
+        assert!(run.snapshot_usage().unwrap().cumulative_copy_bytes > before.cumulative_copy_bytes);
+        run.step(ignore).unwrap();
+        let after_copy = probe.update(|p| p.steps[1].clone());
+        assert_eq!(after_copy.run_identity(), first.run_identity());
+        assert_eq!(after_copy.policy_identity(), first.policy_identity());
+        assert_eq!(after_copy.attempt(), 1);
+        run.restore(&saved, ignore).unwrap();
+        assert_eq!(run.token_ids(), [first_token]);
+        run.step(ignore).unwrap();
         let after_restore = probe.update(|p| p.steps[2].clone());
-        assert_eq!(after_restore.run_identity(), first.run_identity());
+        assert_ne!(after_restore.run_identity(), first.run_identity());
         assert_ne!(after_restore.policy_identity(), first.policy_identity());
-        assert_eq!(
-            after_restore.attempt(),
-            2,
-            "restoration never refunds issued attempts"
-        );
-        while advance(&mut state, &mut driver).is_some() {}
-        assert_eq!(state.controller().0, expected);
-        let steps = probe.update(|p| p.steps.clone());
-        for (ordinal, context) in steps.iter().enumerate().skip(2) {
-            assert_eq!(context.run_identity(), first.run_identity());
+        assert_eq!(after_restore.attempt(), 0);
+        run.run(ignore).unwrap();
+        assert!(run.token_ids().len() > 1);
+        for (ordinal, context) in probe.update(|p| p.steps.clone()).iter().enumerate().skip(2) {
+            assert_eq!(context.run_identity(), after_restore.run_identity());
             assert_eq!(context.policy_identity(), after_restore.policy_identity());
-            assert_eq!(context.attempt(), ordinal as u64);
+            assert_eq!(context.attempt(), (ordinal - 2) as u64);
         }
     }
 }

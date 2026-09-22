@@ -88,7 +88,11 @@ fn headroom_refusal_precedes_parsing_and_string_copy_keeps_separate_admission() 
     let (funding, _) = account(0);
     let error = OriginalJsonValue::parse("invalid", &funding).unwrap_err();
     assert!(matches!(error.cause, Cause::Funding(_)));
-    assert!(std::error::Error::source(&error).unwrap().is::<HostMetadataFundingError>());
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<HostMetadataFundingError>()
+    );
     assert!(error.partial.is_none());
 
     let policy = DependencyMemoryPolicy {

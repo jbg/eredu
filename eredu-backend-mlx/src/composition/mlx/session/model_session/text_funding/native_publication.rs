@@ -1,7 +1,7 @@
 //! Finite terminal transactions retained by the same actual Work recovery.
 use super::*;
 use crate::backend::runtime::residency::storage::{
-    native_storage::BankOwner, PendingNativePublication,
+    PendingNativePublication, native_storage::BankOwner,
 };
 
 struct Node {
@@ -68,7 +68,10 @@ impl NativePublications {
                 // Exhaustion/health refusal creates no new node or native
                 // preparation. Preserve the first actual inventory in place.
                 *self.refused_inventory.borrow_mut() = Some(inventory);
-                return Err(Error::PrefillControl(cause));
+                return Err(Error::OriginalSourceContract {
+                    stage: "native publication source claim",
+                    cause,
+                });
             }
         };
         // The global selected count is spent BEFORE this one fixed node. Its

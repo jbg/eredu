@@ -1,22 +1,19 @@
 //! Original admission for an explicit selected-state reset, separate from text.
 
 /// Limits for one new reset operation; prior accounts remain charged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct SessionResetLimits {
-    /// Ceiling on the complete resource domain.
-    pub capacity_bytes: u64,
-    /// Optional limit on this operation including its safety reserve.
-    pub application_memory_budget_bytes: Option<u64>,
-    /// Additional bytes retained with this operation's final owners.
-    pub safety_reserve_bytes: u64,
+    /// Total live-charge limits in every physical domain.
+    pub memory_limits: crate::MemoryLimitDeclarations,
+    /// Additional domain-attributed bytes retained with this operation's owners.
+    pub additional_headroom: crate::MemoryHeadroomDeclarations,
 }
 impl SessionResetLimits {
-    /// Selects a domain ceiling without an additional application limit.
-    pub const fn new(capacity_bytes: u64) -> Self {
+    /// Selects domain limits without additional headroom.
+    pub const fn new(memory_limits: crate::MemoryLimitDeclarations) -> Self {
         Self {
-            capacity_bytes,
-            application_memory_budget_bytes: None,
-            safety_reserve_bytes: 0,
+            memory_limits,
+            additional_headroom: crate::MemoryHeadroomDeclarations::none(),
         }
     }
 }
@@ -36,14 +33,9 @@ pub enum SessionResetRejection {
     /// A checked requirement or safety sum cannot be represented.
     #[error("reset requirement overflow")]
     Overflow,
-    /// Complete incremental demand exceeds the application limit.
-    #[error("reset requires {required_bytes} bytes; application limit is {budget_bytes}")]
-    ApplicationBudgetExceeded {
-        /// Original demand plus safety.
-        required_bytes: u64,
-        /// Requested incremental limit.
-        budget_bytes: u64,
-    },
+    /// A domain declaration, identity, or checked requirement is invalid.
+    #[error(transparent)]
+    MemoryDomain(#[from] crate::MemoryDomainError),
 }
 
 /// A move-only claim issued by the actual ModelRuntime reset entry.
@@ -98,30 +90,27 @@ impl<'a> SessionResetClaim<'a> {
         self._admission.validate(actual)
     }
     /// Original caller policy, with no mutable or refill surface.
-    pub const fn limits(&self) -> SessionResetLimits {
-        self.limits
+    pub const fn limits(&self) -> &SessionResetLimits {
+        &self.limits
     }
-    /// Performs the shared checked incremental comparison exactly once. The
-    /// provider supplies requirements from its concrete source-bound plan;
-    /// this value alone cannot construct runtime funding or a destination.
+    /// Resolves the complete domain demand and policy exactly once. The provider
+    /// supplies requirements from its source-bound plan. The ledger atomically
+    /// compares these against existing live charges before issuing funding.
     pub fn compare(
         self,
-        required_bytes: u64,
+        topology: &crate::MemoryTopology,
+        requirements: crate::DomainMemoryRequirements,
     ) -> Result<SessionResetAcceptance, SessionResetRejection> {
-        let bytes = required_bytes
-            .checked_add(self.limits.safety_reserve_bytes)
-            .ok_or(SessionResetRejection::Overflow)?;
-        if let Some(budget_bytes) = self.limits.application_memory_budget_bytes {
-            if bytes > budget_bytes {
-                return Err(SessionResetRejection::ApplicationBudgetExceeded {
-                    required_bytes: bytes,
-                    budget_bytes,
-                });
-            }
+        requirements.validate(topology)?;
+        let requirements =
+            requirements.checked_add(&self.limits.additional_headroom.resolve(topology)?)?;
+        let limits = self.limits.memory_limits.resolve(topology)?;
+        for (domain, charge) in requirements.iter() {
+            limits.get(domain)?.check(domain, 0, charge.total()?)?;
         }
         Ok(SessionResetAcceptance {
-            bytes,
-            limits: self.limits,
+            requirements,
+            limits,
         })
     }
 }
@@ -129,16 +118,22 @@ impl<'a> SessionResetClaim<'a> {
 /// Consumed comparison result, not an execution, account or source capability.
 #[derive(Debug)]
 pub struct SessionResetAcceptance {
-    bytes: u64,
-    limits: SessionResetLimits,
+    requirements: crate::DomainMemoryRequirements,
+    limits: crate::MemoryLimits,
 }
 impl SessionResetAcceptance {
-    /// Complete original demand plus safety reserve.
-    pub const fn required_bytes(&self) -> u64 {
-        self.bytes
+    /// Moves the pure comparison into the ledger without duplicating vectors.
+    /// This result still supplies neither source ownership nor execution authority.
+    pub fn into_parts(self) -> (crate::DomainMemoryRequirements, crate::MemoryLimits) {
+        (self.requirements, self.limits)
+    }
+
+    /// Complete original demand plus domain-attributed headroom.
+    pub const fn requirements(&self) -> &crate::DomainMemoryRequirements {
+        &self.requirements
     }
     /// Original caller policy.
-    pub const fn limits(&self) -> SessionResetLimits {
-        self.limits
+    pub const fn limits(&self) -> &crate::MemoryLimits {
+        &self.limits
     }
 }

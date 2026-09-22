@@ -91,6 +91,13 @@ impl SharedTensorObservation {
         }))))
     }
 
+    /// Shares a caller-owned observation without granting execution or funding.
+    /// Deserialized and independently constructed portable evidence uses this
+    /// ownership boundary; native producers retain their actual admitted owner.
+    pub fn from_caller_owned(observation: TensorObservation) -> Self {
+        Self::retain(observation, ())
+    }
+
     /// Borrowing or cloning this raw DTO does not transfer allocation authority.
     /// A deep clone of the borrowed DTO is a separate caller-owned allocation.
     pub fn as_observation(&self) -> &TensorObservation {
@@ -142,6 +149,18 @@ impl fmt::Debug for SharedTensorObservation {
 impl Serialize for SharedTensorObservation {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_observation().serialize(serializer)
+    }
+}
+
+impl From<TensorObservation> for SharedTensorObservation {
+    fn from(observation: TensorObservation) -> Self {
+        Self::from_caller_owned(observation)
+    }
+}
+impl<'de> Deserialize<'de> for SharedTensorObservation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The serialized values cannot carry a process-local allocation grant.
+        TensorObservation::deserialize(deserializer).map(Self::from_caller_owned)
     }
 }
 
@@ -285,5 +304,33 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(order.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn portable_observation_values_share_live_custody_and_deserialize_independently() {
+        let retired = Arc::new(AtomicUsize::new(0));
+        let tensor = SharedTensorObservation::retain(
+            TensorObservation::new(vec![2], TensorObservationData::F32(vec![1.5, -3.0])).unwrap(),
+            Retired(retired.clone()),
+        );
+        let original = ObservationValue::Tensor(tensor);
+        let alias = original.clone();
+        let wire = serde_json::to_value(&original).unwrap();
+        let decoded: ObservationValue = serde_json::from_value(wire.clone()).unwrap();
+        let (
+            ObservationValue::Tensor(first),
+            ObservationValue::Tensor(second),
+            ObservationValue::Tensor(decoded_tensor),
+        ) = (&original, &alias, &decoded)
+        else {
+            unreachable!()
+        };
+        assert!(first.same_storage(second));
+        assert!(!first.same_storage(decoded_tensor));
+        assert_eq!(decoded, original);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        drop(original);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        drop(alias);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
     }
 }

@@ -54,7 +54,7 @@ fn terminal_geometry_has_no_prefill_roles_or_submissions() {
     assert_eq!(facts.total_bytes().unwrap(), Some(19));
     assert_eq!(facts.graph_bytes().unwrap(), 0);
     let execution = InferenceExecutionIdentity::default();
-    let request = InferenceRequest::without_memory_budget(&execution, g).unwrap();
+    let request = unlimited_request(&execution, g).unwrap();
     let mut driver =
         PrefillDriver::new(&execution, request, g, GenerationCancellationToken::new()).unwrap();
     let mut executor = Boundaries::new();
@@ -116,7 +116,7 @@ fn shared_driver_boundaries_are_completion_gated_and_run_step_equivalent() {
     let execution = InferenceExecutionIdentity::default();
     let mut results = vec![];
     for controlled in [false, true] {
-        let request = InferenceRequest::without_memory_budget(&execution, g).unwrap();
+        let request = unlimited_request(&execution, g).unwrap();
         let mut driver =
             PrefillDriver::new(&execution, request, g, GenerationCancellationToken::new()).unwrap();
         let mut executor = Boundaries::new();
@@ -191,7 +191,7 @@ fn shared_driver_cancelled_boundary_does_not_reissue_or_publish_completed_scores
         let mut g = geometry(2, OutputDemand::Sequence);
         g.input_positions = 5;
         let execution = InferenceExecutionIdentity::default();
-        let request = InferenceRequest::without_memory_budget(&execution, g).unwrap();
+        let request = unlimited_request(&execution, g).unwrap();
         let mut driver =
             PrefillDriver::new(&execution, request, g, GenerationCancellationToken::new()).unwrap();
         let mut executor = Boundaries::new();

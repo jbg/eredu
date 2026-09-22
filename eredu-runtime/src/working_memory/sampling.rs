@@ -32,7 +32,9 @@ impl WorkspaceSamplingRandomState {
         Ok(Self { key, fresh: false })
     }
     /// Move the current key without creating another metadata/native handle.
-    pub fn into_key(self) -> WorkspaceTensor { self.key }
+    pub fn into_key(self) -> WorkspaceTensor {
+        self.key
+    }
     /// The same split-two and static row selection as the native state worker.
     pub fn next_key(&mut self, context: &WorkspaceContext) -> Result<WorkspaceTensor, Error> {
         let split = split_keys(&self.key, 2, context)?;
@@ -42,7 +44,10 @@ impl WorkspaceSamplingRandomState {
     }
     /// Same sequential split and fixed [0, 1) draw as the native state worker.
     /// Both this result and the advanced key remain part of the completion roots.
-    pub fn uniform_unit_interval(&mut self, context: &WorkspaceContext) -> Result<WorkspaceTensor, Error> {
+    pub fn uniform_unit_interval(
+        &mut self,
+        context: &WorkspaceContext,
+    ) -> Result<WorkspaceTensor, Error> {
         let key = self.next_key(context)?;
         operation(
             WorkspaceSamplingOperation::UniformUnitInterval,
@@ -52,9 +57,17 @@ impl WorkspaceSamplingRandomState {
         )
     }
     /// Exact position-key constructor, including the complete split table.
-    pub fn key_at(key: &WorkspaceTensor, position: u32, context: &WorkspaceContext) -> Result<WorkspaceTensor, Error> {
-        let count = position.checked_add(1).and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(|| context.metadata_error(format_args!("random subkey index exceeds i32")))?;
+    pub fn key_at(
+        key: &WorkspaceTensor,
+        position: u32,
+        context: &WorkspaceContext,
+    ) -> Result<WorkspaceTensor, Error> {
+        let count = position
+            .checked_add(1)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| {
+                context.metadata_error(format_args!("random subkey index exceeds i32"))
+            })?;
         select_key(&split_keys(key, count, context)?, position, context)
     }
     /// Retained key after the latest metadata sampling step.
@@ -65,9 +78,9 @@ impl WorkspaceSamplingRandomState {
 
 mod request;
 pub use request::{
-    SamplingWorkspaceObserver, SamplingWorkspacePhase, SamplingWorkspaceReport, SamplingWorkspaceInputPlan,
-    WorkspaceSamplingInput, WorkspaceSamplingSource, quote_sampling_workspace,
-    quote_sampling_workspace_with_observer,
+    SamplingWorkspaceInputPlan, SamplingWorkspaceObserver, SamplingWorkspacePhase,
+    SamplingWorkspaceReport, WorkspaceSamplingInput, WorkspaceSamplingSource,
+    quote_sampling_workspace, quote_sampling_workspace_with_observer,
 };
 
 #[cfg(test)]
@@ -139,10 +152,19 @@ fn apply_workspace_token_filter(
 
 impl WorkspaceSamplingBackend {
     /// Traces the actual fixed mask selected by the shared ordinary constructor.
-    pub fn apply_prepared_token_mask(logits:&WorkspaceTensor,plan:crate::generation::TokenMaskPlan<'_>,context:&WorkspaceContext)->Result<WorkspaceTensor,Error> {
-        if !plan.matches_shape(logits.shape()) { return Err(context.metadata_error(format_args!("token mask source geometry changed"))); }
-        if plan.is_identity() { Ok(logits.clone()) }
-        else { same_shape(WorkspaceSamplingOperation::TokenFilter,logits,context) }
+    pub fn apply_prepared_token_mask(
+        logits: &WorkspaceTensor,
+        plan: crate::generation::TokenMaskPlan<'_>,
+        context: &WorkspaceContext,
+    ) -> Result<WorkspaceTensor, Error> {
+        if !plan.matches_shape(logits.shape()) {
+            return Err(context.metadata_error(format_args!("token mask source geometry changed")));
+        }
+        if plan.is_identity() {
+            Ok(logits.clone())
+        } else {
+            same_shape(WorkspaceSamplingOperation::TokenFilter, logits, context)
+        }
     }
 }
 
@@ -153,28 +175,48 @@ impl SamplingBackend for WorkspaceSamplingBackend {
     type Context = WorkspaceContext;
     type Error = Error;
 
-    fn clone_token_with_host_source(value:&Self::Token,funding:&eredu_core::HostMetadataFunding,
-        context:&Self::Context)->Result<Self::Token,eredu_core::BackendFailure> {
-        funding.reserve_metadata(std::mem::size_of::<(&WorkspaceTensor,&eredu_core::HostMetadataFunding,
-            &WorkspaceContext,Result<WorkspaceTensor,eredu_core::BackendFailure>)>())?;
-        context.validate_values([value]).map_err(eredu_core::BackendFailure::from_error)?;
+    fn clone_token_with_host_source(
+        value: &Self::Token,
+        funding: &eredu_core::HostMetadataFunding,
+        context: &Self::Context,
+    ) -> Result<Self::Token, eredu_core::BackendFailure> {
+        funding.reserve_metadata(std::mem::size_of::<(
+            &WorkspaceTensor,
+            &eredu_core::HostMetadataFunding,
+            &WorkspaceContext,
+            Result<WorkspaceTensor, eredu_core::BackendFailure>,
+        )>())?;
+        context
+            .validate_values([value])
+            .map_err(eredu_core::BackendFailure::from_error)?;
         Ok(value.clone())
     }
-    fn clone_logits_with_host_source(value:&Self::Logits,funding:&eredu_core::HostMetadataFunding,
-        context:&Self::Context)->Result<Self::Logits,eredu_core::BackendFailure> {
-        Self::clone_token_with_host_source(value,funding,context)
+    fn clone_logits_with_host_source(
+        value: &Self::Logits,
+        funding: &eredu_core::HostMetadataFunding,
+        context: &Self::Context,
+    ) -> Result<Self::Logits, eredu_core::BackendFailure> {
+        Self::clone_token_with_host_source(value, funding, context)
     }
 
-    fn clone_random_with_host_source(value:&Self::RandomState,
-        funding:&eredu_core::HostMetadataFunding,context:&Self::Context)
-        ->Result<Self::RandomState,eredu_core::BackendFailure> {
+    fn clone_random_with_host_source(
+        value: &Self::RandomState,
+        funding: &eredu_core::HostMetadataFunding,
+        context: &Self::Context,
+    ) -> Result<Self::RandomState, eredu_core::BackendFailure> {
         // WorkspaceTensor::clone records the actual native descriptor clone in
         // this trace and pays its own metadata layout through its source. The
         // extra wrapper is a host constructor, never a random numerical op.
         funding.reserve_metadata(std::mem::size_of::<(
-            &Self::RandomState,&eredu_core::HostMetadataFunding,&Self::Context,
-            Self::RandomState,Result<Self::RandomState,eredu_core::BackendFailure>)>())?;
-        context.validate_values([&value.key]).map_err(eredu_core::BackendFailure::from_error)?;
+            &Self::RandomState,
+            &eredu_core::HostMetadataFunding,
+            &Self::Context,
+            Self::RandomState,
+            Result<Self::RandomState, eredu_core::BackendFailure>,
+        )>())?;
+        context
+            .validate_values([&value.key])
+            .map_err(eredu_core::BackendFailure::from_error)?;
         Ok(value.clone())
     }
 
@@ -403,23 +445,42 @@ fn apply_mirostat_extent(
     same_shape(WorkspaceSamplingOperation::MirostatCutoff, &logits, context)
 }
 
-
-fn split_keys(key: &WorkspaceTensor, count: i32, context: &WorkspaceContext) -> Result<WorkspaceTensor, Error> {
+fn split_keys(
+    key: &WorkspaceTensor,
+    count: i32,
+    context: &WorkspaceContext,
+) -> Result<WorkspaceTensor, Error> {
     if key.shape() != [2] || key.layout().dtype() != WorkspaceDtype::Uint32 || count <= 0 {
         return Err(context.metadata_error(format_args!("invalid explicit key split geometry")));
     }
-    operation(WorkspaceSamplingOperation::SplitRandomKey, &[key],
-        context.layout(&[count,2], WorkspaceDtype::Uint32)?, context)
+    operation(
+        WorkspaceSamplingOperation::SplitRandomKey,
+        &[key],
+        context.layout(&[count, 2], WorkspaceDtype::Uint32)?,
+        context,
+    )
 }
 
 // Same first-axis static Slice/Reshape as the native random-state worker. The
 // closed descriptor retains the row instead of losing it in a generic Index.
-fn select_key(keys: &WorkspaceTensor, index: u32, context: &WorkspaceContext) -> Result<WorkspaceTensor, Error> {
+fn select_key(
+    keys: &WorkspaceTensor,
+    index: u32,
+    context: &WorkspaceContext,
+) -> Result<WorkspaceTensor, Error> {
     let shape = keys.shape();
-    if shape.len() != 2 || shape[0] <= 0 || shape[1] != 2
-        || keys.layout().dtype() != WorkspaceDtype::Uint32 || u64::from(index) >= shape[0] as u64 {
+    if shape.len() != 2
+        || shape[0] <= 0
+        || shape[1] != 2
+        || keys.layout().dtype() != WorkspaceDtype::Uint32
+        || u64::from(index) >= shape[0] as u64
+    {
         return Err(context.metadata_error(format_args!("random key row exceeds split table")));
     }
-    operation(WorkspaceSamplingOperation::SelectRandomKey { index }, &[keys],
-        context.layout(&[2], WorkspaceDtype::Uint32)?, context)
+    operation(
+        WorkspaceSamplingOperation::SelectRandomKey { index },
+        &[keys],
+        context.layout(&[2], WorkspaceDtype::Uint32)?,
+        context,
+    )
 }

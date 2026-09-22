@@ -64,31 +64,37 @@ impl RealtimeTrace {
         let mut observations = ObservationSet::new();
         observations.insert(
             "trace.text_tokens",
-            ObservationValue::Tensor(integer_tensor(
-                vec![self.batch, self.frames.len()],
-                transpose_frame_values(
-                    self.frames.iter().map(RealtimeOutputFrame::text_tokens),
-                    self.batch,
-                    1,
-                )?,
-            )?),
+            ObservationValue::Tensor(
+                (integer_tensor(
+                    vec![self.batch, self.frames.len()],
+                    transpose_frame_values(
+                        self.frames.iter().map(RealtimeOutputFrame::text_tokens),
+                        self.batch,
+                        1,
+                    )?,
+                )?)
+                .into(),
+            ),
         )?;
         observations.insert(
             "trace.sampled_audio_tokens",
-            ObservationValue::Tensor(integer_tensor(
-                vec![
-                    self.batch,
-                    self.generated_audio_codebooks,
-                    self.frames.len(),
-                ],
-                transpose_frame_values(
-                    self.frames
-                        .iter()
-                        .map(RealtimeOutputFrame::sampled_audio_tokens),
-                    self.batch,
-                    self.generated_audio_codebooks,
-                )?,
-            )?),
+            ObservationValue::Tensor(
+                (integer_tensor(
+                    vec![
+                        self.batch,
+                        self.generated_audio_codebooks,
+                        self.frames.len(),
+                    ],
+                    transpose_frame_values(
+                        self.frames
+                            .iter()
+                            .map(RealtimeOutputFrame::sampled_audio_tokens),
+                        self.batch,
+                        self.generated_audio_codebooks,
+                    )?,
+                )?)
+                .into(),
+            ),
         )?;
         let emitted = self
             .frames
@@ -97,14 +103,17 @@ impl RealtimeTrace {
             .collect::<Vec<_>>();
         observations.insert(
             "trace.output_audio_tokens",
-            ObservationValue::Tensor(integer_tensor(
-                vec![self.batch, self.generated_audio_codebooks, emitted.len()],
-                transpose_frame_values(
-                    emitted.iter().copied(),
-                    self.batch,
-                    self.generated_audio_codebooks,
-                )?,
-            )?),
+            ObservationValue::Tensor(
+                (integer_tensor(
+                    vec![self.batch, self.generated_audio_codebooks, emitted.len()],
+                    transpose_frame_values(
+                        emitted.iter().copied(),
+                        self.batch,
+                        self.generated_audio_codebooks,
+                    )?,
+                )?)
+                .into(),
+            ),
         )?;
         for (frame, output) in self.frames.iter().enumerate() {
             for diagnostic in output.diagnostics() {
@@ -113,7 +122,7 @@ impl RealtimeTrace {
                         "frames.{frame}.decisions.{}.logits",
                         diagnostic.prediction()
                     ),
-                    ObservationValue::Tensor(diagnostic.tensor().clone()),
+                    ObservationValue::Tensor((diagnostic.tensor().clone()).into()),
                 )?;
             }
         }

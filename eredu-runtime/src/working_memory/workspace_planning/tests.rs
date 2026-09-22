@@ -4,18 +4,26 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+mod construction;
+
 #[test]
 fn competing_planning_producers_reserve_before_allocation_and_keep_last_owner_charged() {
     let capacity = 1 << 20;
-    let pool = WorkingMemoryPool::new(capacity, 17).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 17).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let first = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
     let second = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     let request = usize::try_from((capacity - before) / 2 + 1).unwrap();
     let start = Arc::new(Barrier::new(3));
     let produced = Arc::new(AtomicUsize::new(0));
@@ -44,19 +52,19 @@ fn competing_planning_producers_reserve_before_allocation_and_keep_last_owner_ch
             Ok(bytes) => assert!(bytes.iter().all(|byte| *byte == 127)),
             Err(error) => assert!(matches!(
                 error,
-                HostMetadataFundingError::Capacity { required, available }
-                    if *required == request as u64 && *available < *required
+                HostMetadataFundingError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required, limit_bytes, existing_bytes, .. })
+                    if *required == request as u64 && limit_bytes-existing_bytes < *required
             )),
         }
     }
-    assert_eq!(pool.used_bytes().unwrap(), before + request as u64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before + request as u64);
     assert!(pool.acquire_unquoted().is_err());
     drop(first);
     drop(second);
     // Thread-returned owners keep both the failed candidate's fixed controls
     // and the successful candidate's actual destination charged.
-    assert_eq!(pool.used_bytes().unwrap(), before + request as u64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before + request as u64);
     drop(a);
     drop(b);
-    assert_eq!(pool.used_bytes().unwrap(), 17);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 17);
 }

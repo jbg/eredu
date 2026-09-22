@@ -89,14 +89,17 @@ pub(super) fn run(mode: &str) -> serde_json::Value {
             })
             .unwrap();
         let mut settings = settings(0.0);
-        settings.inference.managed_memory_capacity_bytes = Some(ORIGINAL_CAPACITY);
+        settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(ORIGINAL_CAPACITY),
+        )]);
         let prepared_prefix = vec![0, 1, 2, 3, 4];
         let prepared_capture = plan(mode);
         let prepared_trace = TraceLimits {
             per_record_bytes: 1 << 20,
             total_bytes: 4 << 20,
         };
-        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
         prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
         prepared.output_mode = PreparedChatOutputMode::Text;
         prepared.capture = Some(&prepared_capture);
@@ -327,12 +330,10 @@ fn native_histogram_matches_full_prompt_and_decode_in_managed_and_controlled_ses
             assert_eq!(actual_rows.len(), rows.len());
             for (actual, expected) in actual_rows.iter().zip(&rows) {
                 assert_eq!(actual.len(), expected.len());
-                assert!(
-                    actual
-                        .iter()
-                        .zip(expected)
-                        .all(|(a, b)| (a - b).abs() < 2e-5)
-                );
+                assert!(actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| (a - b).abs() < 2e-5));
             }
         }
     }

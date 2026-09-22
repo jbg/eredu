@@ -2,7 +2,7 @@
 
 use super::{BackendStreams, MlxBackend};
 use crate::backend::managed_memory::{gpu_stream::MlxStreamOwnershipError, input_allocator};
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
 use safemlx::{
     InitializedInputAllocator, InputAllocatorCause, PreparedInputRuntime, PreparedStreamCopy,
     Stream, StreamCopyCause, StreamCopyPlan,
@@ -13,7 +13,7 @@ use safemlx::{
 /// allocator independently retains its admitted initializer account.
 pub(crate) struct OriginalCopyEnvironment<'a> {
     stream: &'a Stream,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     allocator: &'static InitializedInputAllocator,
 }
 
@@ -42,11 +42,11 @@ impl MlxBackend<'_> {
             BackendStreams::Prepared(streams) => streams,
             BackendStreams::Ordinary { .. } => return Err(WorkingMemoryError::UnknownBound.into()),
         };
-        streams.validate_pool(&self.memory_pool)?;
-        let allocator = input_allocator::admitted_initializer(&self.memory_pool)?;
+        streams.validate_pool(&self.memory_ledger)?;
+        let allocator = input_allocator::admitted_initializer(&self.memory_ledger)?;
         Ok(OriginalCopyEnvironment {
             stream: streams.execution(),
-            pool: &self.memory_pool,
+            pool: &self.memory_ledger,
             allocator,
         })
     }
@@ -57,7 +57,7 @@ impl OriginalCopyEnvironment<'_> {
         self.stream
     }
 
-    pub(crate) fn pool(&self) -> &WorkingMemoryPool {
+    pub(crate) fn pool(&self) -> &MemoryLedger {
         self.pool
     }
 
@@ -67,6 +67,19 @@ impl OriginalCopyEnvironment<'_> {
         &self,
     ) -> Result<PreparedInputRuntime, OriginalCopyEnvironmentError> {
         Ok(self.allocator.try_borrow_runtime()?)
+    }
+
+    /// Placement of the exact allocator which constructs original guarded
+    /// backing banks. A later stream borrowing the bank does not change it.
+    pub(crate) fn buffer_placement(
+        &self,
+    ) -> Result<std::sync::Arc<eredu_core::MemoryPlacement>, OriginalCopyEnvironmentError> {
+        let runtime = self.input_runtime()?;
+        crate::backend::managed_memory::placement_fact_handle(
+            runtime.allocation_placement(),
+            self.pool,
+        )
+        .map_err(|cause| WorkingMemoryError::from(cause).into())
     }
 
     pub(crate) fn allocator(&self) -> &'static InitializedInputAllocator {
@@ -96,7 +109,7 @@ impl OriginalCopyEnvironment<'_> {
 #[derive(Clone)]
 pub(crate) struct RetainedOriginalCopyEnvironment {
     stream: StreamCopyPlan<()>,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     allocator: &'static InitializedInputAllocator,
 }
 impl OriginalCopyEnvironment<'_> {
@@ -127,9 +140,9 @@ impl RetainedOriginalCopyEnvironment {
     pub(crate) fn loan<'a, C: Send + Sync + 'static>(
         &'a self,
         stream: &'a PreparedStreamCopy<C>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<OriginalCopyEnvironment<'a>, OriginalCopyEnvironmentError> {
-        if !self.pool.same_domain(pool) || !self.stream.matches_source(stream.as_stream()) {
+        if !self.pool.same_ledger(pool) || !self.stream.matches_source(stream.as_stream()) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         // The same admitted singleton must still validate this pool; equal

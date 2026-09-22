@@ -68,48 +68,9 @@ impl OriginalIndexedChunkSource {
                 || source.parameter_revision()!=b.identity.parameter_revision {
                 return Err(self.failure(Cause::Identity));
             }
-            for key in &acquisition.identities {
-                let members=source.members().filter(|member|member.key==*key);
-                let mut found=0usize;
-                for member in members {
-                    if names.binary_search(&member.binding.as_str()).is_err(){return Err(self.failure(Cause::Identity));}
-                    found=found.checked_add(1).ok_or_else(||self.failure(Cause::Overflow))?;
-                }
-                if found!=names.len(){return Err(self.failure(Cause::Identity));}
-            }
-            for &name in names {
-                rows.clear();
-                for (key,lease) in acquisition.identities.iter().zip(acquisition.transfer.leases()) {
-                    let mut matches=source.members().filter(|member|member.key==*key&&member.binding==name);
-                    let member=matches.next().ok_or_else(||self.failure(Cause::Identity))?;
-                    if matches.next().is_some(){return Err(self.failure(Cause::Identity));}
-                    let value=if let Some((replacement,row))=source.replacement(member) {
-                        let start=i32::try_from(row).map_err(|_|self.failure(Cause::Geometry))?;
-                        let end=start.checked_add(1).ok_or_else(||self.failure(Cause::Overflow))?;
-                        let controls=crate::tensor::narrow::control_bytes(replacement.shape().len())
-                            .ok_or_else(||self.failure(Cause::Overflow))?;
-                        b.funding.reserve_metadata(controls).map_err(|cause|self.failure(Cause::Funding(cause)))?;
-                        replacement.narrow_axis(0,start,end,stream)
-                            .map_err(|cause|self.failure(Cause::Consumer(Error::Neural(cause))))?.into_array()
-                    }else {
-                        if lease.tier()!=MemoryTier::Device || !lease.binding_names().any(|actual|actual==name) {
-                            return Err(self.failure(Cause::Identity));
-                        }
-                        let value=lease.device_value(name).map_err(|cause|self.failure(Cause::Residency(cause)))?;
-                        let mut slot=safemlx::PreparedArrayClone::try_prepare_for_inspection()
-                            .map_err(|cause|self.failure(Cause::Clone(cause)))?;
-                        slot.fill_for_inspection(value).map_err(|cause|self.failure(Cause::Clone(cause)))?
-                    };
-                    // Each addressable member contributes exactly one group.
-                    // Scalar/packed geometry is checked by the common physical
-                    // binder against the actual compact constructor fields.
-                    if value.shape().first()!=Some(&1){return Err(self.failure(Cause::Geometry));}
-                    rows.push(value);
-                }
-                let value=concatenate_axis(&rows,0,stream)
-                    .map_err(|cause|self.failure(Cause::Native(cause)))?;
-                bindings.push(name,value).map_err(|cause|self.failure(Cause::Consumer(Error::Neural(cause))))?;
-            }
+            crate::backend::runtime::residency::parameter_bank::parameters::fill_compact_rows(
+                &source, acquisition, names, stream, &b.funding, &mut bindings, &mut rows)
+                .map_err(|cause| self.failure(Cause::Compact(cause)))?;
             Ok::<_,Error>(())
         }).map_err(|cause|self.failure(Cause::Bank(cause)))??;
         drop(rows);

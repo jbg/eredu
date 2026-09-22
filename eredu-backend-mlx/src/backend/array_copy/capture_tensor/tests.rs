@@ -50,6 +50,8 @@ mod native {
     mod prepared_fragments;
     #[cfg(feature = "metal")]
     mod scheduled;
+    #[cfg(feature = "metal")]
+    mod unsigned;
     use super::*;
     use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
     use eredu_core::{cache::LayerCachePolicy, capture::*, *};
@@ -57,7 +59,7 @@ mod native {
         WorkspaceContext, WorkspaceHostBound, WorkspaceMechanisms, WorkspaceOperation,
         WorkspaceOperationBound,
     };
-    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
     use safemlx::{
         ops::indexing::{IntoStrideBy, TryIndexOp},
         Device, DeviceType,
@@ -73,12 +75,20 @@ mod native {
         transform: CaptureTransform,
         slices: Vec<CaptureSlice>,
     ) -> AdmittedCapturePlan {
+        admitted_dtype(axes, transform, slices, ObservationDtype::Floating)
+    }
+    fn admitted_dtype(
+        axes: Vec<SymbolicDimension>,
+        transform: CaptureTransform,
+        slices: Vec<CaptureSlice>,
+        dtype: ObservationDtype,
+    ) -> AdmittedCapturePlan {
         let point = ObservationPoint {
             path: "block.output".into(),
             node_id: "block".into(),
             meaning: "actual activation".into(),
             value_type: ObservationValueType::Tensor,
-            dtype: ObservationDtype::Floating,
+            dtype,
             axes: Some(
                 axes.into_iter()
                     .enumerate()
@@ -128,7 +138,6 @@ mod native {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -143,7 +152,6 @@ mod native {
                     CaptureTransformKind::Summary,
                 ],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             },
             CaptureRequestShape {
@@ -154,10 +162,7 @@ mod native {
         )
         .unwrap()
     }
-    fn fresh(
-        pool: &WorkingMemoryPool,
-        bytes: u64,
-    ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
+    fn parent_admission(bytes: u64) -> Admission {
         let geometry = InferenceGeometry {
             batch_size: 1,
             cached_positions: 0,
@@ -184,34 +189,125 @@ mod native {
         .unwrap();
         let bound = |bytes| WorkspaceBound::bounded(bytes, "portable parent-account fixture");
         let state = state
-            .with_execution_workspace(ExecutionWorkspaceEstimate {
-                geometry,
-                activations: bound(bytes),
-                attention: bound(0),
-                vocabulary: bound(0),
-                state_update: bound(0),
-                materialization: bound(0),
-                retained: bound(0),
-            })
+            .with_execution_workspace(crate::memory_fixture::workspace(
+                ExecutionWorkspaceEstimate {
+                    physical_domains: None,
+                    geometry,
+                    activations: bound(bytes),
+                    attention: bound(0),
+                    vocabulary: bound(0),
+                    state_update: bound(0),
+                    materialization: bound(0),
+                    retained: bound(0),
+                },
+            ))
             .unwrap();
+        crate::memory_fixture::admission(Admission {
+            additional_headroom: Default::default(),
+            memory_limits: Default::default(),
+            state,
+            requested_positions: 7,
+            incremental_required_bytes: Some(bytes),
+        })
+    }
+    fn source_pin_controls() -> u64 {
+        MemoryLedger::storage_metadata_control_bytes().unwrap()
+            + eredu_runtime::working_memory::StoragePublicationLayout::<StorageIdentity>::new(2)
+                .unwrap()
+                .requested_bytes()
+    }
+    fn source_controls(source: &Array) -> u64 {
+        source
+            .allocation_info()
+            .unwrap()
+            .unwrap()
+            .host_control_bytes() as u64
+    }
+    fn fresh_result(
+        pool: &MemoryLedger,
+        bytes: u64,
+    ) -> Result<(WorkingMemoryReservation, WorkingMemoryFundingRun), WorkingMemoryError> {
         pool.reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
-            &Admission {
-                state,
-                requested_positions: 7,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
-            },
-            pool.effective_capacity().unwrap(),
-        )
-        .unwrap()
+            &parent_admission(bytes.checked_add(source_pin_controls()).unwrap()),
+            pool.configured_limits().clone(),
+        )?
         .into_funding()
-        .unwrap()
+    }
+    fn fresh(
+        pool: &MemoryLedger,
+        bytes: u64,
+    ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
+        fresh_result(pool, bytes).unwrap()
+    }
+    // Exact parent limits include the actual source registration and retained
+    // admission descriptors. The supplied capacity remains the payload limit,
+    // so a one-byte shortage exercises the same allocation boundary.
+    fn parent_ledger(
+        capacity: u64,
+        source: &Array,
+        accounts: u64,
+    ) -> Result<MemoryLedger, WorkingMemoryError> {
+        let probe = crate::memory_fixture::ledger(u64::MAX, 0)?;
+        let domain = probe.topology().host_domain();
+        let current = |pool: &MemoryLedger| {
+            pool.snapshot()
+                .unwrap()
+                .domains
+                .into_iter()
+                .find(|entry| entry.domain == domain)
+                .unwrap()
+                .current_charge_bytes
+        };
+        let baseline = current(&probe);
+        let source_bytes = source
+            .try_metadata_snapshot()
+            .unwrap()
+            .allocation()
+            .unwrap()
+            .bytes() as u64;
+        let registration = register(&probe, source);
+        let source_controls = current(&probe)
+            .checked_sub(baseline)
+            .unwrap()
+            .checked_sub(source_bytes)
+            .unwrap();
+        let payload = capacity
+            .checked_sub(source_bytes)
+            .unwrap()
+            .checked_div(accounts)
+            .unwrap();
+        let increment = probe
+            .reservation_requirements(
+                &parent_admission(payload.checked_add(source_pin_controls()).unwrap()),
+                None,
+            )?
+            .get(domain)?
+            .total()?;
+        let account_controls = increment
+            .checked_sub(payload)
+            .unwrap()
+            .checked_mul(accounts)
+            .unwrap();
+        drop((registration, probe));
+        crate::memory_fixture::ledger(
+            capacity
+                .checked_add(source_controls)
+                .unwrap()
+                .checked_add(account_controls)
+                .unwrap(),
+            0,
+        )
     }
 
     fn stream() -> Stream {
         Stream::new_with_device(&Device::new(
-            if cfg!(feature = "metal") { DeviceType::Gpu } else { DeviceType::Cpu }, 0,
+            if cfg!(feature = "metal") {
+                DeviceType::Gpu
+            } else {
+                DeviceType::Cpu
+            },
+            0,
         ))
     }
     fn workspace() -> WorkspaceContext {
@@ -220,9 +316,9 @@ mod native {
             WorkspaceContext::new(native)
         } else {
             use crate::backend::nn::workspace::{MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms};
-            let matmul = MlxCpuMatmulMechanism::select(
-                eredu_nn::CpuMatmulImplementation::Float32Tiles,
-            ).unwrap();
+            let matmul =
+                MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles)
+                    .unwrap();
             WorkspaceContext::new(MlxCpuWorkspaceMechanisms::new(native.allocation(), matmul))
         }
     }
@@ -247,7 +343,7 @@ mod native {
         )
     }
     fn register(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         source: &Array,
     ) -> eredu_runtime::working_memory::WorkingMemoryStorage<StorageIdentity> {
         let info = source
@@ -256,12 +352,25 @@ mod native {
             .allocation()
             .unwrap();
         pool.register_storage(
-            [(
-                StorageIdentity::Native(info.identity()),
-                info.bytes() as u64,
-            )]
+            [
+                (
+                    StorageIdentity::Native(info.identity()),
+                    eredu_runtime::working_memory::StorageAllocation::new(
+                        info.bytes() as u64,
+                        crate::backend::managed_memory::allocation_placement_handle(&info, pool)
+                            .unwrap(),
+                    ),
+                ),
+                (
+                    StorageIdentity::NativeControl(info.identity()),
+                    eredu_runtime::working_memory::StorageAllocation::new(
+                        info.host_control_bytes() as u64,
+                        pool.host_placement_handle(),
+                    ),
+                ),
+            ]
             .into_iter()
-            .filter(|(_, n)| *n != 0),
+            .filter(|(_, allocation)| allocation.capacity_bytes() != 0),
         )
         .unwrap()
     }
@@ -347,13 +456,18 @@ mod native {
             context.begin_state_span(&[input.clone()]).unwrap();
             let output = plan.trace(&mut projection).unwrap();
             let report = context.report(&[input, output]).unwrap();
-            assert!(report.unpriced_operations.is_empty(), "{:?}: {:?}", shape, report.unpriced_operations);
+            assert!(
+                report.unpriced_operations.is_empty(),
+                "{:?}: {:?}",
+                shape,
+                report.unpriced_operations
+            );
             assert!(report.unpriced_host_operations.is_empty());
             assert_eq!(report.host_workspace_bytes, Some(0));
             let root_bytes = view.allocation_info().unwrap().unwrap().bytes() as u64;
             let n = report.total_bytes.unwrap();
             assert!(report.state.as_ref().unwrap().retained_bytes.unwrap() >= root_bytes);
-            let pool = WorkingMemoryPool::new(root_bytes + p + n, 0).unwrap();
+            let pool = parent_ledger(root_bytes + p + n, &view, 1).unwrap();
             let registered = register(&pool, &view);
             let (reservation, run) = fresh(&pool, p + n);
             let mut native = run.scope().unwrap();
@@ -381,14 +495,17 @@ mod native {
                 .sum::<u64>();
             assert!(native_bytes <= root_bytes + n);
             // Before settlement, source plus host and native workspace stay charged.
-            assert_eq!(pool.used_bytes().unwrap(), root_bytes + p + n);
+            assert_eq!(
+                pool.fixture_host_charge().unwrap(),
+                root_bytes + source_controls(&view) + p + n
+            );
             settle(&roots);
             native.certify().unwrap();
             drop((run, reservation, registered));
             // Only the finished host observation survives; native scratch is free.
-            assert_eq!(pool.used_bytes().unwrap(), p);
+            assert_eq!(pool.fixture_host_charge().unwrap(), p);
             drop(result);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         }
         for (source, shape, expected) in [
             (Array::from_slice(&[7.25f32], &[]), vec![], vec![7.25]),
@@ -410,7 +527,7 @@ mod native {
             let plan = PreparedCaptureTensor::new(&source, host(&admitted)).unwrap();
             let p = plan.host_peak_bytes();
             let bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-            let pool = WorkingMemoryPool::new(bytes + p, 0).unwrap();
+            let pool = parent_ledger(bytes + p, &source, 1).unwrap();
             let registered = register(&pool, &source);
             let (reservation, run) = fresh(&pool, p);
             let mut native = run.scope().unwrap();
@@ -429,7 +546,7 @@ mod native {
             settle(&roots);
             native.certify().unwrap();
             drop((registered, run, reservation, result));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         }
     }
 
@@ -556,12 +673,12 @@ mod native {
         ));
         let p = host(&admitted).initialization_peak_bytes();
         let bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-        let pool = WorkingMemoryPool::new(bytes + p, 0).unwrap();
+        let pool = parent_ledger(bytes + p, &source, 1).unwrap();
         let registration = register(&pool, &source);
         let (reservation, run) = fresh(&pool, p - 1);
         let mut native = run.scope().unwrap();
         let roots = RefCell::new(vec![]);
-        let before = pool.used_bytes().unwrap();
+        let before = pool.fixture_host_charge().unwrap();
         let error = PreparedCaptureTensor::new(&source, host(&admitted))
             .unwrap()
             .transfer(&run, &reservation, &mut native, &stream, &roots)
@@ -569,15 +686,17 @@ mod native {
         assert!(matches!(
             error,
             CaptureTensorExecutionError::Mechanism(CaptureTensorNativeError::Host(
-                CaptureTensorConstructionError::Memory(WorkingMemoryError::BudgetExceeded { .. })
+                CaptureTensorConstructionError::Memory(
+                    WorkingMemoryError::DomainAllowanceExceeded { .. }
+                )
             ))
         ));
         assert!(roots.borrow().is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
         drop(error);
         native.certify().unwrap();
         drop((registration, reservation, run));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 
     #[test]
@@ -593,7 +712,7 @@ mod native {
             );
             let p = host(&admitted).initialization_peak_bytes();
             let bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-            let pool = WorkingMemoryPool::new(bytes + p + 4096, 0).unwrap();
+            let pool = parent_ledger(bytes + p + 4096, &source, 1).unwrap();
             let registration = register(&pool, &source);
             let (reservation, run) = fresh(&pool, p + 4096);
             let mut native = run.scope().unwrap();
@@ -622,13 +741,16 @@ mod native {
             }
             assert!(roots.borrow().len() >= 2);
             drop(registration);
-            assert_eq!(pool.used_bytes().unwrap(), bytes + p + 4096);
+            assert_eq!(
+                pool.fixture_host_charge().unwrap(),
+                bytes + source_controls(&source) + p + 4096
+            );
             // Settling actual retained payload is explicit and separate from the
             // failed host result; safe recovery permits certification of this scope.
             settle(&roots);
             native.certify().unwrap();
             drop((run, reservation));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         }
     }
 
@@ -640,7 +762,7 @@ mod native {
         let admitted = admission(&[2], CaptureTransform::FullTensor, vec![]);
         let p = host(&admitted).initialization_peak_bytes();
         let bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-        let pool = WorkingMemoryPool::new(bytes + 2 * p, 0).unwrap();
+        let pool = parent_ledger(bytes + 2 * p, &source, 2).unwrap();
         let registered = register(&pool, &source);
         let (reservation, run) = fresh(&pool, p);
         let (other, other_run) = fresh(&pool, p);
@@ -673,6 +795,14 @@ mod native {
         native.certify().unwrap();
         wrong.certify().unwrap();
         drop((registered, reservation, run, other, other_run));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

@@ -65,7 +65,7 @@ impl<C: fmt::Debug + 'static> InitializedSharedNative<PreparedEncodedRead<C>> {
     pub fn compile_recipe(
         self,
         recipe: &DerivedWeightRecipe,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<
         Option<EncodedRecipeRead<CompiledRecipeCustody<C>>>,
         EncodedRecipeReadPreparationError<C>,
@@ -74,7 +74,14 @@ impl<C: fmt::Debug + 'static> InitializedSharedNative<PreparedEncodedRead<C>> {
         self.validate_pool(pool)?;
         let catalog = pool
             .initialize_shared_native(ReadBatchCatalogPlan::new(self.output.tensors())?)
-            .map_err(|error| E::Catalog(error.into_parts().1.retire_output_and_map_error(|cause| cause)))?;
+            .map_err(|error| {
+                E::Catalog(
+                    error
+                        .into_parts()
+                        .1
+                        .retire_output_and_map_error(|cause| cause),
+                )
+            })?;
         let compiled = catalog
             .output()
             .compile_recipe(recipe, &mut AdmittedRecipeConstruction::new(pool))?;
@@ -97,7 +104,7 @@ impl<C: fmt::Debug + 'static> InitializedSharedNative<PreparedEncodedRead<C>> {
         let InitializedSharedNative { output, account } = metadata;
         let read = projected
             .into_owned_read()
-            .with_custody(SharedNativeInitializationCustody(account));
+            .with_custody(SharedNativeInitializationCustody(account, None));
         EncodedRecipeRead::from_prepared(output, read)
             .map(Some)
             .map_err(E::Assembly)

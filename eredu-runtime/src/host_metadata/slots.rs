@@ -1,13 +1,13 @@
 //! Fixed mutable host slots with independently retained accounting metadata.
 
 use super::{HostMetadataIdentity, MetadataCustody};
-use eredu_core::{SharedStorageAttachmentError, SharedStorageDomain};
+use eredu_core::{SharedStorageAccountingId, SharedStorageAttachmentError};
 use std::{
     fmt,
     mem::size_of,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
 };
 
@@ -50,25 +50,37 @@ pub struct HostSlotTable<T> {
 impl<T> HostSlotTable<T> {
     /// Exact metadata constructors around an already-paid boxed slot payload.
     /// Slot contents and the boxed extent require their own source inventory.
-    pub fn host_source_control_bytes()->Option<usize> {
-        use eredu_core::{HostMetadataFunding,HostPreparationAuthority,BackendFailure};
-        let parts=[HostSlotMetadata::prepared_host_control_bytes()?,
+    pub fn host_source_control_bytes() -> Option<usize> {
+        use eredu_core::{BackendFailure, HostMetadataFunding, HostPreparationAuthority};
+        let parts = [
+            HostSlotMetadata::prepared_host_control_bytes()?,
             HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()?,
-            size_of::<(Box<[T]>,&HostMetadataFunding,HostPreparationAuthority,Self)>(),
-            size_of::<Result<Self,BackendFailure>>()];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
+            size_of::<(
+                Box<[T]>,
+                &HostMetadataFunding,
+                HostPreparationAuthority,
+                Self,
+            )>(),
+            size_of::<Result<Self, BackendFailure>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
     /// Installs the existing prepared-host metadata owner under actual funding.
     /// The input extent is moved, never copied or resized. Its caller must have
     /// paid the extent and every nested child before this metadata handoff.
-    pub fn from_boxed_with_host_source(slots:Box<[T]>,funding:&eredu_core::HostMetadataFunding)
-        ->Result<Self,eredu_core::BackendFailure> {
-        let bytes=Self::host_source_control_bytes().ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
+    pub fn from_boxed_with_host_source(
+        slots: Box<[T]>,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        let bytes = Self::host_source_control_bytes()
+            .ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
         funding.reserve_metadata(bytes)?;
-        let authority=eredu_core::HostPreparationAuthority::retain(funding.clone());
-        let identity=HostMetadataIdentity::prepared_host(&authority)
+        let authority = eredu_core::HostPreparationAuthority::retain(funding.clone());
+        let identity = HostMetadataIdentity::prepared_host(&authority)
             .map_err(eredu_core::BackendFailure::from_error)?;
-        Ok(Self::new_prepared_host(slots,identity,&authority))
+        Ok(Self::new_prepared_host(slots, identity, &authority))
     }
 
     /// Transfers an existing exact boxed extent without cloning its elements.
@@ -275,7 +287,7 @@ impl HostSlotMetadata {
     }
 
     pub(crate) fn workspace_control_bytes() -> Option<usize> {
-        use crate::working_memory::{OriginalHostMetadataCustody, qualified_shared_bytes};
+        use crate::working_memory::{qualified_shared_bytes, OriginalHostMetadataCustody};
         let mutex =
             usize::try_from(OriginalHostMetadataCustody::initialized_mutex_bytes().ok()?).ok()?;
         [
@@ -383,10 +395,10 @@ impl HostSlotMetadata {
     /// Read-only existing attachment or original fixed-table domain check.
     pub fn validate_original_attachment(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         if let Some(reset) = &self.inner().custody.reset {
-            return if reset.same_domain(domain) {
+            return if reset.same_accounting_owner(domain) {
                 Ok(())
             } else {
                 Err(crate::working_memory::WorkingMemoryError::IdentityMismatch)
@@ -401,7 +413,7 @@ impl HostSlotMetadata {
     pub fn copy_attachment_control_bytes() -> Option<usize> {
         [
             MetadataCustody::text_attachment_control_bytes()?,
-            size_of::<(&Self, &SharedStorageDomain)>(),
+            size_of::<(&Self, &SharedStorageAccountingId)>(),
             size_of::<std::sync::MutexGuard<'_, bool>>(),
             size_of::<Result<(), crate::working_memory::WorkingMemoryError>>(),
             size_of::<
@@ -418,7 +430,7 @@ impl HostSlotMetadata {
     #[doc(hidden)]
     pub fn prepare_copy_attachment(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         use crate::working_memory::WorkingMemoryError as E;
         let SlotLiveness::Ordinary(live) = &self.inner().live else {
@@ -431,9 +443,41 @@ impl HostSlotMetadata {
         self.inner().custody.prepare_copy_attachment(domain)
     }
 
+    /// Attaches a concrete accounting owner after funding its prospective node.
+    /// The liveness gate and metadata lock are released before unused captures
+    /// or the returned error can retire. No native authority is created.
+    pub(crate) fn try_attach_owned_prepared<T: eredu_core::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            eredu_core::SharedStorageAttachmentLayout,
+        ) -> Result<eredu_core::SharedStorageOwner<T>, E>,
+    ) -> Result<bool, HostSlotAttachmentError<E>> {
+        let SlotLiveness::Ordinary(live) = &self.inner().live else {
+            return Err(HostSlotAttachmentError::OriginalDomainMismatch);
+        };
+        let mut acquire = Some(acquire);
+        let result = (|| {
+            let live = live.lock().map_err(|_| {
+                HostSlotAttachmentError::Attachment(SharedStorageAttachmentError::Poisoned)
+            })?;
+            if !*live {
+                return Err(HostSlotAttachmentError::Retired);
+            }
+            self.inner()
+                .custody
+                .try_attach_owned_prepared(owner, |layout| {
+                    acquire.take().expect("single provider")(layout)
+                })
+                .map_err(HostSlotAttachmentError::Attachment)
+        })();
+        drop(acquire);
+        result
+    }
+
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, HostSlotAttachmentError<E>> {
         self.try_attach_mode(domain, acquire, false)
@@ -444,14 +488,14 @@ impl HostSlotMetadata {
     #[doc(hidden)]
     pub fn try_attach_prepared_copy<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, HostSlotAttachmentError<E>> {
         self.try_attach_mode(domain, acquire, true)
     }
     fn try_attach_mode<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
         prepared_copy: bool,
     ) -> Result<bool, HostSlotAttachmentError<E>> {
@@ -465,7 +509,7 @@ impl HostSlotMetadata {
                     .reset
                     .as_ref()
                     .expect("original liveness has custody")
-                    .same_domain(domain)
+                    .same_accounting_owner(domain)
                 {
                     Ok(false)
                 } else {

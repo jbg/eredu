@@ -17,6 +17,7 @@ use eredu_runtime::parameter_operations::{
 use std::convert::Infallible;
 use std::sync::OnceLock;
 
+mod inspection;
 pub(super) mod original;
 mod workspace;
 pub(crate) use original::{
@@ -60,7 +61,8 @@ pub struct MlxPredictionModule<M> {
     pub(super) manager: ManagerSlot,
     pub(super) id: Option<OffloadUnitId>,
     pub(super) placeholders: BTreeMap<String, MlxTensor>,
-    pub(super) replacements: BTreeMap<String, MlxTensor>,
+    pub(super) replacements:
+        eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
     pub(super) stream: Stream,
     pub(super) original:
         Option<crate::backend::runtime::execution::generic::PredictionModuleProjection>,
@@ -116,7 +118,7 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
             &self.placeholders,
             guard,
         )?;
-        counts.observe_map(
+        counts.observe_replacements(
             ParameterOwnerRole::PredictionReplacement,
             Some(ordinal),
             &self.replacements,
@@ -139,15 +141,8 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
     ) -> Result<(), Error> {
         storage.include_retained_values::<Error>(|visitor| {
             let complete = self.inner.visit_retained_values(visitor);
-            for values in [&self.placeholders, &self.replacements] {
-                let result: Result<(), Infallible> = visit_parameter_map(values, |_, value| {
-                    visitor(value);
-                    Ok(())
-                });
-                match result {
-                    Ok(()) => {}
-                    Err(never) => match never {},
-                }
+            for value in self.placeholders.values().chain(self.replacements.values()) {
+                visitor(value);
             }
             Ok(complete)
         })?;
@@ -165,7 +160,10 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
         operation: impl FnOnce(&mut M) -> (Result<O, Error>, Vec<MlxTensor>),
     ) -> Result<O, Error> {
         if safemlx::OriginalScopeObserver::try_current()?.is_some() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch).at_speculative_stage("ordinary prediction module entry"));
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            )
+            .at_speculative_stage("ordinary prediction module entry"));
         }
         let manager = self
             .manager
@@ -192,7 +190,7 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
                 return (Err(error.into()), Vec::new());
             }
             self.inner
-                .visit_parameters_mut(&mut Publish(&self.replacements));
+                .visit_parameters_mut(&mut PublishReplacements(&self.replacements));
             operation(&mut self.inner)
         });
         // Clear every native module handle, including derived operator caches.
@@ -360,12 +358,12 @@ impl<M: Parameterized<MlxTensor>> Parameterized<MlxTensor> for MlxPredictionModu
         &'a self,
         visitor: &mut V,
     ) -> Result<(), eredu_nn::ParameterSourceError> {
- let mut __source_result = Ok(());
+        let mut __source_result = Ok(());
 
-__source_result = __source_result.and(        self.inner.visit_parameter_sources(visitor));
+        __source_result = __source_result.and(self.inner.visit_parameter_sources(visitor));
 
- __source_result
-}
+        __source_result
+    }
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, MlxTensor>>(
         &'a mut self,
         visitor: &mut V,
@@ -443,7 +441,11 @@ where
 
 struct Slots<'a>(&'a mut dyn ParameterSlotVisitor<MlxTensor>);
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Slots<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         self.0.visit_slot(metadata, value);
     }
 }
@@ -476,17 +478,19 @@ pub(in crate::composition::mlx::replicated_text) fn with_slots<A, P>(
     extension: &mut P,
     ordinal: usize,
     operation: &mut ParameterSlotOperation<'_, MlxTensor, Error>,
+    preparation: Option<&crate::backend::runtime::execution::generic::MlxParameterPreparation<'_>>,
 ) -> Result<bool, Error>
 where
     P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
 {
-    struct Selected<'a, 'b> {
+    struct Selected<'a, 'b, 'c> {
         ordinal: usize,
         found: bool,
         operation: &'a mut ParameterSlotOperation<'b, MlxTensor, Error>,
+        preparation: &'a crate::backend::runtime::execution::generic::MlxParameterPreparation<'c>,
     }
     impl PredictionModuleVisitor<MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>
-        for Selected<'_, '_>
+        for Selected<'_, '_, '_>
     {
         type Error = Error;
         fn visit<M: Parameterized<MlxTensor>>(
@@ -501,13 +505,7 @@ where
                     ));
                 }
                 self.found = true;
-                let stream = module.stream.clone();
-                module.invoke(&stream, |inner| {
-                    let result = (self.operation)(&mut |visitor| {
-                        inner.visit_parameters_mut(&mut Slots(visitor))
-                    });
-                    (result, Vec::new())
-                })?;
+                inspection::with_slots(module, self.operation, self.preparation)?;
             }
             Ok(())
         }
@@ -516,6 +514,9 @@ where
         ordinal,
         found: false,
         operation,
+        preparation: preparation.ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))?,
     };
     extension.visit_modules(&mut selected)?;
     Ok(selected.found)
@@ -525,52 +526,54 @@ pub(in crate::composition::mlx::replicated_text) struct Publish<'a>(
     pub &'a BTreeMap<String, MlxTensor>,
 );
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Publish<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         if let Some(replacement) = self.0.get(metadata.id().as_str()) {
             *value = replacement.clone();
         }
     }
 }
 
-/// Infallible publication after the enclosing atomic target/bank transaction.
-/// The immutable source stays unchanged; each later loan reapplies this set.
-pub(in crate::composition::mlx::replicated_text) fn publish<A, P>(
+struct PublishReplacements<'a>(
+    &'a eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
+);
+impl<'a> ParameterVisitorMut<'a, MlxTensor> for PublishReplacements<'_> {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
+        if let Some(replacement) = self.0.get(metadata.id().as_str()) {
+            *value = replacement.clone();
+        }
+    }
+}
+
+/// Lends future-loader sources; prepared publication owns every displaced root.
+pub(in crate::composition::mlx::replicated_text) fn visit_publication<A, P>(
     extension: &mut P,
-    values: &BTreeMap<String, MlxTensor>,
-    active: bool,
+    visitor: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
 ) where
     P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
 {
-    struct PublishModules<'a> {
-        values: &'a BTreeMap<String, MlxTensor>,
-        active: bool,
-    }
-    impl PredictionModuleVisitor<MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>
-        for PublishModules<'_>
-    {
+    struct Modules<'a>(
+        &'a mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
+    );
+    impl PredictionModuleVisitor<MlxNeuralBackend, MlxEmbeddedPredictionMaterializer> for Modules<'_> {
         type Error = Infallible;
         fn visit<M: Parameterized<MlxTensor>>(
             &mut self,
             _: usize,
             module: &mut MlxPredictionModule<M>,
         ) -> Result<(), Infallible> {
-            module.replacements = if self.active {
-                module
-                    .parameters
-                    .iter()
-                    .filter_map(|slot| {
-                        self.values
-                            .get(slot.parameter.id.as_str())
-                            .map(|value| (slot.parameter.id.as_str().to_owned(), value.clone()))
-                    })
-                    .collect()
-            } else {
-                BTreeMap::new()
-            };
+            self.0.replacement_source(&mut module.replacements);
             Ok(())
         }
     }
-    match extension.visit_modules(&mut PublishModules { values, active }) {
+    match extension.visit_modules(&mut Modules(visitor)) {
         Ok(()) => {}
         Err(never) => match never {},
     }

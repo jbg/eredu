@@ -52,8 +52,8 @@ impl OriginalControllerCompiler for Compiler<'_> {
         })
     }
 }
-fn preparation() -> (WorkingMemoryPool, OriginalChatProfilePreparation) {
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+fn preparation() -> (MemoryLedger, OriginalChatProfilePreparation) {
+    let pool = crate::working_memory::memory_fixture::host_ledger(64 << 20, 0).unwrap();
     let tokenizer = crate::working_memory::original_chat::tests::tokenizer(&pool);
     let template = pool
         .compile_chat_template(crate::working_memory::original_chat::tests::source_plan())
@@ -62,7 +62,9 @@ fn preparation() -> (WorkingMemoryPool, OriginalChatProfilePreparation) {
         &template,
         &tokenizer,
         &crate::working_memory::InferenceExecutionIdentity::default(),
-        64 << 20,
+        crate::working_memory::memory_fixture::host_limits(64 << 20)
+            .resolve(&crate::working_memory::memory_fixture::host_topology())
+            .unwrap(),
     )
     .unwrap();
     (pool, preparation)
@@ -107,7 +109,7 @@ fn compilation_receipt_authenticates_exact_sources_without_copy_or_registration(
             .validate_sources(other.controller_sources(), &pool)
             .is_err()
     );
-    let foreign = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(64 << 20, 0).unwrap();
     assert!(
         receipt
             .validate_sources(output.controller_sources(), &foreign)
@@ -123,24 +125,31 @@ fn compilation_receipt_authenticates_exact_sources_without_copy_or_registration(
     let alias = output.declaration.clone();
     let receipt_alias = receipt.clone();
     drop((output, receipt, other, other_receipt, preparation));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(receipt_alias);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn semantic_consumer_requires_the_exact_tokenizer_and_selected_execution() {
     use crate::working_memory::{InferenceExecutionIdentity, PreparedSemanticSource};
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(64 << 20, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let tokenizer = crate::working_memory::original_chat::tests::tokenizer(&pool);
     let template = pool
         .compile_chat_template(crate::working_memory::original_chat::tests::source_plan())
         .unwrap();
-    let preparation =
-        OriginalChatProfilePreparation::new(&template, &tokenizer, &execution, 64 << 20).unwrap();
+    let preparation = OriginalChatProfilePreparation::new(
+        &template,
+        &tokenizer,
+        &execution,
+        crate::working_memory::memory_fixture::host_limits(64 << 20)
+            .resolve(&crate::working_memory::memory_fixture::host_topology())
+            .unwrap(),
+    )
+    .unwrap();
     let entered = AtomicBool::new(false);
     let (output, receipt) = preparation
         .compile_controller(Compiler {
@@ -148,7 +157,14 @@ fn semantic_consumer_requires_the_exact_tokenizer_and_selected_execution() {
             refuse: false,
         })
         .unwrap();
-    let semantic = PreparedSemanticSource::new(&tokenizer, &execution, 64 << 20).unwrap();
+    let semantic = PreparedSemanticSource::new(
+        &tokenizer,
+        &execution,
+        crate::working_memory::memory_fixture::host_limits(64 << 20)
+            .resolve(&crate::working_memory::memory_fixture::host_topology())
+            .unwrap(),
+    )
+    .unwrap();
     receipt
         .validate_preparation(output.controller_sources(), &semantic)
         .unwrap();
@@ -163,15 +179,27 @@ fn semantic_consumer_requires_the_exact_tokenizer_and_selected_execution() {
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop((foreign_output, foreign_receipt));
-    let other_execution =
-        PreparedSemanticSource::new(&tokenizer, &InferenceExecutionIdentity::default(), 64 << 20)
-            .unwrap();
+    let other_execution = PreparedSemanticSource::new(
+        &tokenizer,
+        &InferenceExecutionIdentity::default(),
+        crate::working_memory::memory_fixture::host_limits(64 << 20)
+            .resolve(&crate::working_memory::memory_fixture::host_topology())
+            .unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         receipt.validate_preparation(output.controller_sources(), &other_execution),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     let other_tokenizer = crate::working_memory::original_chat::tests::tokenizer(&pool);
-    let other_source = PreparedSemanticSource::new(&other_tokenizer, &execution, 64 << 20).unwrap();
+    let other_source = PreparedSemanticSource::new(
+        &other_tokenizer,
+        &execution,
+        crate::working_memory::memory_fixture::host_limits(64 << 20)
+            .resolve(&crate::working_memory::memory_fixture::host_topology())
+            .unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         receipt.validate_preparation(output.controller_sources(), &other_source),
         Err(WorkingMemoryError::IdentityMismatch)
@@ -187,7 +215,7 @@ fn semantic_consumer_requires_the_exact_tokenizer_and_selected_execution() {
         tokenizer,
         other_tokenizer,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -213,15 +241,15 @@ fn refused_compiler_keeps_its_original_account_through_the_error() {
         })
     ));
     drop(preparation);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn insufficient_constructor_funding_never_enters_the_compiler() {
     let (pool, preparation) = preparation();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.payload_used_bytes().unwrap();
     preparation
         .metadata_funding()
         .reserve_metadata((64 * 1024 * 1024 - used) as usize)
@@ -236,9 +264,9 @@ fn insufficient_constructor_funding_never_enters_the_compiler() {
     };
     assert!(!entered.load(Ordering::SeqCst));
     drop(preparation);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -272,5 +300,5 @@ fn existing_owners_without_the_actual_payer_cannot_be_published() {
         Some(WorkingMemoryError::IdentityMismatch)
     ));
     drop((receipt, preparation));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

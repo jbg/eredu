@@ -2,7 +2,7 @@
 use super::*;
 use std::{
     mem::{size_of, size_of_val},
-    sync::{TryLockError, atomic::Ordering},
+    sync::{atomic::Ordering, TryLockError},
 };
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]

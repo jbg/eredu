@@ -256,7 +256,7 @@ fn cpu_factory_retains_admitted_streams_without_requiring_metal() {
         backend.weights_stream().device_type().unwrap(),
         DeviceType::Cpu
     );
-    assert_eq!(backend.memory_pool().unquoted_owner_count().unwrap(), 0);
+    assert_eq!(backend.memory_ledger().unquoted_owner_count().unwrap(), 0);
     println!("CPU_FACTORY_OK");
 }
 

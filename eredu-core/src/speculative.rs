@@ -6,13 +6,16 @@ use crate::generation::{SemanticState, SemanticStateOwner};
 pub mod byte_trigger;
 mod forbidden_controller;
 pub use forbidden_controller::{
-    ForbiddenControllerDecision, ForbiddenControllerError, ForbiddenControllerInputs,
-    ForbiddenControllerMutation, ForbiddenControllerSource, PreparedForbiddenControllerIdentity,
-    PreparedForbiddenInputCopy, packed_controller_token_bytes,
+    packed_controller_token_bytes, ForbiddenControllerDecision, ForbiddenControllerError,
+    ForbiddenControllerInputs, ForbiddenControllerMutation, ForbiddenControllerSource,
+    PreparedForbiddenControllerIdentity, PreparedForbiddenInputCopy,
 };
 
 mod grammar_controller;
-pub use grammar_controller::{NoPreparedGrammar, PreparedGrammarIdentity, PreparedGrammarController, PreparedGrammarInstallCause, PreparedGrammarInstallError, PreparedGrammarSource};
+pub use grammar_controller::{
+    NoPreparedGrammar, PreparedGrammarController, PreparedGrammarIdentity,
+    PreparedGrammarInstallCause, PreparedGrammarInstallError, PreparedGrammarSource,
+};
 
 mod plain_controller;
 pub use plain_controller::{
@@ -46,7 +49,7 @@ mod buffer;
 pub use buffer::{SpeculativeBuffer, SpeculativeBufferAllocationError, SpeculativeBufferIntoIter};
 
 #[cfg(test)]
-use crate::{GenerationSequence, backend::BoundedCompletionOutcome};
+use crate::{backend::BoundedCompletionOutcome, GenerationSequence};
 use crate::{
     backend::{
         BoundedCompletion, BoundedCompletionWait, Completion, CompletionCancellationMode,
@@ -2070,6 +2073,9 @@ where
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SpeculativeOutputError {
+    /// A physical-domain configuration, identity, or checked requirement failed.
+    #[error(transparent)]
+    MemoryDomain(#[from] crate::MemoryDomainError),
     /// Paid shared diagnostic retaining the actual portable producer source,
     /// partial output/input and its funding. Aliases allocate no new source.
     #[error("{0}")]
@@ -4962,8 +4968,8 @@ mod tests {
         fmt,
         rc::Rc,
         sync::{
-            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
         },
     };
 
@@ -5064,9 +5070,7 @@ mod tests {
         assert!(ready.is_ready_for(SpeculativeDraftSource::Embedded));
         assert!(!unsupported.admits_source(SpeculativeDraftSource::Embedded));
         assert!(!unsupported.is_ready_for(SpeculativeDraftSource::Embedded));
-        assert!(
-            !SpeculativeCapability::Unavailable.admits_source(SpeculativeDraftSource::Embedded)
-        );
+        assert!(!SpeculativeCapability::Unavailable.admits_source(SpeculativeDraftSource::Embedded));
     }
 
     #[derive(Debug, Clone, Default)]
@@ -5146,16 +5150,14 @@ mod tests {
             let mut publisher = SpeculativeCallbackPublisher::semantic(move |event| {
                 published.borrow_mut().push(event)
             });
-            assert!(
-                !publisher
-                    .publish_committed(
-                        &mut constraint,
-                        &[7],
-                        &GenerationCancellationToken::new(),
-                        true,
-                    )
-                    .unwrap()
-            );
+            assert!(!publisher
+                .publish_committed(
+                    &mut constraint,
+                    &[7],
+                    &GenerationCancellationToken::new(),
+                    true,
+                )
+                .unwrap());
         }
         assert_eq!(
             *published.borrow(),

@@ -1,9 +1,9 @@
 //! One destination account for a frozen sampler and isolated native copies.
 
 use super::{
-    residual::RegisteredStoragePin, AdmittedWorkspaceCopy, BorrowedFundedSampler,
-    FundedSamplerCopy, InferenceExecutionIdentity, RegisteredWorkspaceCopy, WorkingMemoryError,
-    WorkingMemoryPool, WorkingMemoryStorage, WorkspaceCopyLimits,
+    AdmittedWorkspaceCopy, BorrowedFundedSampler, FundedSamplerCopy, InferenceExecutionIdentity,
+    MemoryLedger, RegisteredWorkspaceCopy, WorkingMemoryError, WorkingMemoryStorage,
+    WorkspaceCopyLimits, residual::RegisteredStoragePin,
 };
 use crate::generation::{SamplerCopyError, SamplerCopyPlan};
 
@@ -18,7 +18,7 @@ pub struct RegisteredSamplingCopy<'a, K: Ord + Send + 'static> {
     pub(super) sampler_plan: SamplerCopyPlan<'a>,
     pub(super) arrays: RegisteredWorkspaceCopy<K>,
     pub(super) host_bytes: u64,
-    bytes: u64,
+    bytes: Option<u64>,
 }
 
 impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
@@ -30,9 +30,9 @@ impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
     ) -> Result<Self, SamplingCopyAdmissionError> {
         let sampler_plan = sampler.prepare_copy()?;
         let host_bytes = sampler_plan.retained_bytes();
-        let bytes = host_bytes
-            .checked_add(arrays.incremental_bytes())
-            .ok_or(WorkingMemoryError::Overflow)?;
+        let bytes = arrays
+            .incremental_bytes()
+            .and_then(|bytes| bytes.checked_add(host_bytes));
         Ok(Self {
             sampler,
             sampler_plan,
@@ -61,7 +61,7 @@ impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
 
     /// Incremental managed host payload plus native closed-program demand,
     /// excluding any safety reserve selected at admission.
-    pub fn required_bytes(&self) -> u64 {
+    pub fn required_bytes(&self) -> Option<u64> {
         self.bytes
     }
 }
@@ -81,7 +81,7 @@ pub struct RegisteredSamplingCopyWithSource<'a, K: Ord + Send + 'static> {
 impl<K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopyWithSource<'_, K> {
     /// Incremental sampler and native demand, excluding the existing source
     /// inventory and any safety reserve selected at admission.
-    pub fn required_bytes(&self) -> u64 {
+    pub fn required_bytes(&self) -> Option<u64> {
         self.sampling.required_bytes()
     }
 }
@@ -95,17 +95,9 @@ pub enum SamplingCopyAdmissionError {
     /// Source custody, arithmetic or shared-domain admission failed.
     #[error("{0}")]
     Memory(#[from] WorkingMemoryError),
-    /// Combined destination demand and safety exceed the application limit.
-    #[error("sampling copy needs {required_bytes} bytes; application limit is {budget_bytes}")]
-    ApplicationBudgetExceeded {
-        /// Both component bounds plus safety reserve.
-        required_bytes: u64,
-        /// Requested per-copy application allowance.
-        budget_bytes: u64,
-    },
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Atomically admits both components, then copies the exact host sampler.
     /// The returned native operation is already admitted and must enter the
     /// existing completion/publication path without reserving another account.
@@ -148,23 +140,35 @@ impl WorkingMemoryPool {
         complete_source: Option<WorkingMemoryStorage<K>>,
         limits: WorkspaceCopyLimits,
     ) -> Result<(FundedSamplerCopy, AdmittedWorkspaceCopy), SamplingCopyAdmissionError> {
-        let bytes = copy
-            .bytes
-            .checked_add(limits.safety_reserve_bytes)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        if let Some(budget_bytes) = limits.application_memory_budget_bytes {
-            if bytes > budget_bytes {
-                return Err(SamplingCopyAdmissionError::ApplicationBudgetExceeded {
-                    required_bytes: bytes,
-                    budget_bytes,
-                });
-            }
-        }
         let source = copy.arrays.source().registration();
         let preparation = complete_source
             .as_ref()
             .and_then(WorkingMemoryStorage::source_preparation)
             .or_else(|| source.source_preparation());
+        let direct_controls =
+            sampling_controls::<K>(preparation.is_some(), complete_source.is_some())?;
+        let accepted = super::workspace_copy::prepare_copy_account(
+            self,
+            copy.sampler.execution(),
+            copy.arrays.incremental_requirements(),
+            copy.host_bytes,
+            &limits,
+            direct_controls,
+            super::funding::CopyHostHolds::Sampler(copy.host_bytes),
+            |usage| {
+                if !self.same_ledger(copy.sampler.source().pool()) {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                copy.sampler
+                    .source()
+                    .validate(usage, copy.sampler.execution())?;
+                source.validate_copy_source(self, usage)?;
+                if let Some(complete) = &complete_source {
+                    complete.validate_copy_source(self, usage)?;
+                }
+                Ok(())
+            },
+        )?;
         let execution = match preparation {
             Some(preparation) => {
                 super::WorkspaceCopyAccountLayout::sampling()?.execution(preparation)
@@ -180,22 +184,13 @@ impl WorkingMemoryPool {
                 if complete.has_source_preparation() {
                     RegisteredStoragePin::aggregate_counted(pins, 2)?
                 } else {
-                    RegisteredStoragePin::aggregate(pins)
+                    RegisteredStoragePin::pair(pins[0].clone(), pins[1].clone())
                 }
             }
             None => operand_pin,
         };
-        let (funding, host_scope, scope) = self.open_sampling_copy_account(
-            copy.sampler.source(),
-            copy.sampler.execution(),
-            source,
-            complete_source.as_ref(),
-            pin,
-            &execution,
-            bytes,
-            copy.host_bytes,
-            limits.capacity_bytes,
-        )?;
+        let (requirements, funding, host_scope, scope) =
+            accepted.sampling(&execution, pin, copy.host_bytes)?;
         #[cfg(test)]
         tests::before_copy();
         let sampler = copy.sampler_plan.copy();
@@ -205,8 +200,73 @@ impl WorkingMemoryPool {
             copy.host_bytes,
             host_scope,
         );
-        let arrays = AdmittedWorkspaceCopy::from_account(execution, bytes, funding, scope);
+        let arrays = AdmittedWorkspaceCopy::from_account(execution, requirements, funding, scope);
         Ok((sampler, arrays))
+    }
+}
+
+fn sampling_controls<K: Ord + Send + Sync + 'static>(
+    prepared: bool,
+    complete: bool,
+) -> Result<usize, WorkingMemoryError> {
+    Ok(if !prepared {
+        let mut bytes = super::WorkspaceCopyAccountLayout::sampling()?
+            .requested_bytes()
+            .checked_add(RegisteredStoragePin::single_control_bytes::<K>(false)?)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        if complete {
+            bytes = bytes
+                .checked_add(RegisteredStoragePin::single_control_bytes::<K>(false)?)
+                .and_then(|n| n.checked_add(RegisteredStoragePin::pair_control_bytes(false).ok()?))
+                .ok_or(WorkingMemoryError::Overflow)?;
+        }
+        bytes
+    } else {
+        0
+    })
+}
+impl MemoryLedger {
+    /// Complete incremental domains for the ordinary sampler and workspace copy.
+    pub fn sampling_copy_requirements<K: Clone + Ord + Send + Sync + 'static>(
+        &self,
+        copy: &RegisteredSamplingCopy<'_, K>,
+        limits: &WorkspaceCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        self.sampling_requirements_inner(copy, None, limits)
+    }
+    /// Complete domains including the supplied complete-source pin constructor.
+    pub fn sampling_copy_with_source_requirements<K: Clone + Ord + Send + Sync + 'static>(
+        &self,
+        copy: &RegisteredSamplingCopyWithSource<'_, K>,
+        limits: &WorkspaceCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        self.sampling_requirements_inner(&copy.sampling, Some(&copy.complete_source), limits)
+    }
+    fn sampling_requirements_inner<K: Clone + Ord + Send + Sync + 'static>(
+        &self,
+        copy: &RegisteredSamplingCopy<'_, K>,
+        complete: Option<&WorkingMemoryStorage<K>>,
+        limits: &WorkspaceCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        let prepared = complete
+            .and_then(WorkingMemoryStorage::source_preparation)
+            .or_else(|| copy.arrays.source().registration().source_preparation())
+            .is_some();
+        let controls = sampling_controls::<K>(prepared, complete.is_some())?;
+        super::workspace_copy::with_copy_projection(
+            self,
+            copy.arrays.incremental_requirements(),
+            copy.host_bytes,
+            limits,
+            controls,
+            |mut projection, controls| {
+                projection.host_bytes = projection
+                    .host_bytes
+                    .checked_add(controls)
+                    .ok_or(WorkingMemoryError::Overflow)?;
+                projection.materialize(self.topology())
+            },
+        )
     }
 }
 

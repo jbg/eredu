@@ -26,6 +26,13 @@ mod array;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod device;
+mod memory_placement;
+pub use allocation_retention::{PhysicalBackingCustody, PhysicalBackingPublication};
+pub use memory_placement::{
+    default_allocation_placement, gpu_allocation_placement, observe_physical_backings,
+    physical_backing_control_bytes, physical_memory_topology, AllocationPlacement,
+    PhysicalBackingObserver, PhysicalMemoryDevice, ScopedPhysicalBackingObserver,
+};
 pub mod distributed;
 mod dtype;
 pub mod error;
@@ -35,10 +42,10 @@ pub use operation_event::{
     AffineQuantizeConstructionLayout, CpuAffineQuantizeSubmissionLayout,
     CpuMxFp4QuantizeConstructionLayout, CpuMxFp4QuantizePayloadLayout,
     CpuMxFp4QuantizeSubmissionLayout, OperationEvalRecordLayout, OperationEvalTraversalLayout,
-    OperationEvalTraversalLimits,
-    OperationEvent, OperationRootStorageLayout, OperationWaitRecordLayout, PointwiseGraphLayout,
-    PreparedNestedRoots, PreparedNestedRootsCause, PreparedNestedRootsFailure,
-    PreparedPointwiseGraph, PreparedResidentGraph, ResidentGpuWorkerLayout, ResidentGraphLayout,
+    OperationEvalTraversalLimits, OperationEvent, OperationRootStorageLayout, OrdinaryControlPopulation,
+    OperationWaitRecordLayout, PointwiseGraphLayout, PreparedNestedRoots, PreparedNestedRootsCause,
+    PreparedNestedRootsFailure, PreparedPointwiseGraph, PreparedResidentGraph,
+    ResidentGpuWorkerLayout, ResidentGraphLayout,
 };
 pub mod fast;
 pub mod fft;
@@ -68,8 +75,10 @@ pub use runtime_deadline::*;
 pub use stream::*;
 pub use submission::*;
 
-pub use utils::runtime_lock::{HousekeepingRegistrationCause, HousekeepingRegistrationFailure,
-    PreparedThreadRuntimeHousekeeping, RegisteredThreadRuntimeHousekeeping};
+pub use utils::runtime_lock::{
+    HousekeepingRegistrationCause, HousekeepingRegistrationFailure,
+    PreparedThreadRuntimeHousekeeping, RegisteredThreadRuntimeHousekeeping,
+};
 
 /// Registers one idempotent same-thread housekeeping callback.
 ///
@@ -139,6 +148,8 @@ pub(crate) mod sealed {
 pub use submission::{OriginalNativeControlError, OriginalNativeControlLayout};
 
 pub use operation_event::{
-    CpuArgPartitionLayout, CpuCopyEvalLayout, CpuUnaryOperation, CpuUnaryEvalLayout, CpuBinaryOperation, CpuBinaryEvalLayout, CpuEvalCleanupLayout, CpuEvalCleanupPopulation, RouterReceiptLayout,
+    CpuArgPartitionLayout, CpuBinaryEvalLayout, CpuBinaryOperation, CpuCopyEvalLayout,
+    CpuEvalCleanupLayout, CpuEvalCleanupPopulation, CpuUnaryEvalLayout, CpuUnaryOperation,
+    RouterReceiptLayout,
 };
 pub use operation_event::{GpuEvalPrologueLayout, GpuEvalProloguePopulation};

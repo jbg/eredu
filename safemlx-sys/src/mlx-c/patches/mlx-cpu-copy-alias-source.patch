@@ -1,0 +1,72 @@
+diff --git a/mlx/backend/cpu/alias_storage.h b/mlx/backend/cpu/alias_storage.h
+--- a/mlx/backend/cpu/alias_storage.h
++++ b/mlx/backend/cpu/alias_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1, ExpandDims = 2, EmptyBroadcast = 3 };
++enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1, ExpandDims = 2, EmptyBroadcast = 3, Copy = 4 };
+ // Common alias workers inspect only fixed inline shape/stride state. These
+ // queries grant neither source storage nor permission to evaluate a primitive.
+ MLX_API bool alias_input_geometry(const array&, size_t& elements) noexcept;
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -52,13 +52,14 @@
+ }
+ bool is_alias_eval_primitive(const array& out) noexcept {
+   return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+-      (typeid(out.primitive())==typeid(Transpose)||typeid(out.primitive())==typeid(Broadcast)||typeid(out.primitive())==typeid(ExpandDims));
++      (typeid(out.primitive())==typeid(Transpose)||typeid(out.primitive())==typeid(Broadcast)||typeid(out.primitive())==typeid(ExpandDims)||typeid(out.primitive())==typeid(Copy));
+ }
+ bool alias_eval_layout(AliasOperation operation,size_t rank,size_t output_rank,
+     bool tracer,CopyEvalStorage& out) noexcept {
+   if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+   switch(operation) {
+-    case AliasOperation::Transpose:if(rank!=output_rank)return false;break;
++    case AliasOperation::Transpose:
++    case AliasOperation::Copy:if(rank!=output_rank)return false;break;
+     case AliasOperation::Broadcast:if(rank>output_rank)return false;break;
+     case AliasOperation::EmptyBroadcast:if(rank>output_rank||!output_rank)return false;break;
+     case AliasOperation::ExpandDims:if(rank>=output_rank)return false;break;
+@@ -78,6 +79,11 @@
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+   value.named_control_bytes+=controls;
++  if(operation==AliasOperation::Copy) {
++    const size_t copy_controls=sizeof(bool)*2+empty_alias_input_geometry_control_bytes();
++    if(copy_controls>SIZE_MAX-value.named_control_bytes)return false;
++    value.named_control_bytes+=copy_controls;
++  }
+   if(operation==AliasOperation::EmptyBroadcast) {
+     if(!append_empty_data_layout(value))return false;
+   }
+@@ -89,16 +95,24 @@
+   const size_t rank=input.ndim(),output_rank=output.ndim();
+   if(rank>5||output_rank>5)return false;
+   size_t input_elements=0,output_elements=0,bytes=0;
++  const bool copy_alias=typeid(output.primitive())==typeid(Copy);
++  if(copy_alias&&!canonical_dtype(input))return false;
++  const bool empty_copy=copy_alias&&output.size()==0;
+   const bool empty_broadcast=typeid(output.primitive())==typeid(Broadcast)&&output.size()==0;
+   // Empty broadcast does not read or alias the input's backing. Its declared
+   // shape, scalar type and exact Broadcast target still have to agree.
+-  if(!(empty_broadcast ? (canonical_dtype(input)&&input.strides().size()==rank&&
++  if(!(empty_copy ? (empty_alias_input_geometry(input)&&
++          shape_elements(input,input_elements,true)) :
++      empty_broadcast ? (canonical_dtype(input)&&input.strides().size()==rank&&
+           shape_elements(input,input_elements,true)) : alias_input_geometry(input,input_elements))||
+-      !shape_elements(output,output_elements,empty_broadcast)||
++      !shape_elements(output,output_elements,empty_broadcast||empty_copy)||
+       input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !product(output_elements,size_t(output.itemsize()),bytes))return false;
+   AliasOperation operation;
+-  if(typeid(output.primitive())==typeid(Transpose)) {
++  if(typeid(output.primitive())==typeid(Copy)) {
++    operation=AliasOperation::Copy;
++    if(input.shape()!=output.shape())return false;
++  } else if(typeid(output.primitive())==typeid(Transpose)) {
+     operation=AliasOperation::Transpose;
+     const auto& axes=static_cast<const Transpose&>(output.primitive()).axes_ref();
+     if(rank!=output_rank||axes.size()!=rank||input_elements!=output_elements)return false;

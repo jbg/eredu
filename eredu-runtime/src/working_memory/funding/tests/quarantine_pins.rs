@@ -15,17 +15,17 @@ fn attach_pin(
 }
 
 fn distinct_scopes() -> (
-    WorkingMemoryPool,
+    MemoryLedger,
     WorkingMemoryReservation,
     WorkingMemoryFundingRun,
     Vec<WorkingMemoryFundingScope>,
 ) {
-    let pool = WorkingMemoryPool::new(400, 0).unwrap();
+    let pool = device_ledger(400, 0).unwrap();
     let originals = pool
-        .register_storage_individually([(1u32, 40), (2, 24), (3, 16), (4, 0)])
+        .register_device_storage_individually([(1u32, 40), (2, 24), (3, 16), (4, 0)])
         .unwrap();
     let inherited = pool.pin_registered_storage([(1u32, 40)]).unwrap();
-    let (metadata, run) = with_borrowed_storage(reservation(&pool, 100, 400), inherited)
+    let (metadata, run) = with_borrowed_storage(device_reservation(&pool, 100, 400), inherited)
         .into_funding()
         .unwrap();
     let scopes = vec![
@@ -42,7 +42,7 @@ fn distinct_scopes() -> (
     (pool, metadata, run, scopes)
 }
 
-fn assert_roots(pool: &WorkingMemoryPool, retained: [bool; 4]) {
+fn assert_roots(pool: &MemoryLedger, retained: [bool; 4]) {
     for ((key, bytes), retained) in [(1u32, 40), (2, 24), (3, 16), (4, 0)]
         .into_iter()
         .zip(retained)
@@ -77,7 +77,7 @@ fn quarantine_preserves_distinct_overlapping_and_zero_byte_pins_in_every_drop_or
                     assert_eq!(balances(&pool), (100, 80, 180));
                 }
                 assert_roots(&pool, [true; 4]);
-                assert_eq!(pool.effective_capacity().unwrap(), 400);
+                assert_eq!(pool.device_capacity().unwrap(), 400);
                 blocked(&pool);
             }
         }
@@ -113,7 +113,7 @@ fn certified_siblings_release_only_their_own_distinct_pins() {
         );
         assert_roots(&pool, retained);
         if certified == 15 {
-            drop(pool.acquire_unquoted().unwrap());
+            crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
         } else {
             blocked(&pool);
         }
@@ -141,7 +141,7 @@ fn poisoned_cleanup_keeps_every_later_source_bundle_and_does_not_certify_it() {
             Err(WorkingMemoryError::Poisoned)
         );
         drop(scopes);
-        assert_eq!(pool.used_bytes(), Err(WorkingMemoryError::Poisoned));
+        assert_eq!(pool.device_used_bytes(), Err(WorkingMemoryError::Poisoned));
         let usage = pool.0.usage.lock().unwrap_or_else(|p| p.into_inner());
         let account = usage.funding.get(&id).unwrap();
         assert!(account.quarantined);
@@ -149,7 +149,11 @@ fn poisoned_cleanup_keeps_every_later_source_bundle_and_does_not_certify_it() {
         assert!(!account.run_open);
         assert!(!account.metadata_live);
         assert_eq!(
-            (usage.reserved, usage.registered, usage.peak),
+            (
+                usage.domains[1].reserved,
+                usage.domains[1].registered,
+                usage.domains[1].peak
+            ),
             (100, 80, 180)
         );
         // No poison clearing or settlement is inferred by this inspection.
@@ -176,7 +180,7 @@ fn concurrent_failed_scopes_retain_the_union_of_actual_registered_roots() {
 }
 
 struct ProviderProbe {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     clones: AtomicUsize,
     drops: AtomicUsize,
 }
@@ -228,7 +232,7 @@ impl Drop for ProbeKey {
 #[test]
 fn quarantine_moves_provider_pins_without_callbacks_and_certified_keys_drop_unlocked() {
     for certify_second in [false, true] {
-        let pool = WorkingMemoryPool::new(400, 0).unwrap();
+        let pool = device_ledger(400, 0).unwrap();
         let probe = Arc::new(ProviderProbe {
             pool: pool.clone(),
             clones: AtomicUsize::new(0),
@@ -238,10 +242,12 @@ fn quarantine_moves_provider_pins_without_callbacks_and_certified_keys_drop_unlo
             id,
             probe: probe.clone(),
         };
-        let original = pool.register_storage([(key(1), 40), (key(2), 24)]).unwrap();
+        let original = pool
+            .register_device_storage([(key(1), 40), (key(2), 24)])
+            .unwrap();
         let first_pin = pool.pin_registered_storage([(key(1), 40)]).unwrap();
         let second_pin = pool.pin_registered_storage([(key(2), 24)]).unwrap();
-        let (metadata, run) = with_borrowed_storage(reservation(&pool, 100, 400), first_pin)
+        let (metadata, run) = with_borrowed_storage(device_reservation(&pool, 100, 400), first_pin)
             .into_funding()
             .unwrap();
         let first = run.scope().unwrap();

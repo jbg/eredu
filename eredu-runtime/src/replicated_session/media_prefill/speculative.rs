@@ -84,8 +84,42 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<(), M::Error>,
     {
+        self.prefill_media_span_with_checkpoint_completion_and_observer(
+            source,
+            span,
+            context,
+            checkpoint,
+            funding,
+            complete,
+            &mut crate::NoopObserver,
+        )
+    }
+
+    /// Executes the same admitted media span with the caller's observation
+    /// program, preserving the source revision and completion transaction.
+    pub fn prefill_media_span_with_checkpoint_completion_and_observer<F, O>(
+        &mut self,
+        source: &mut PreparedMediaPrefill<A, B, M::State>,
+        span: &OriginalSpeculativePrefillSpan,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: M::StateCheckpoint,
+        funding: &HostMetadataFunding,
+        complete: F,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        M::Error: From<HostMetadataFundingError>,
+        O: crate::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+        F: FnOnce(
+            Option<&B::Tensor>,
+            &M::State,
+            &crate::media_prefill::RetainedMediaRoots<'_, B::Tensor>,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<(), M::Error>,
+    {
         let controls = std::mem::size_of::<(
             F,
+            &mut O,
             Option<M::StateCheckpoint>,
             Option<B::Tensor>,
             Result<
@@ -123,36 +157,30 @@ where
             }
             Ok(span.chunk())
         })();
-        let result =
-            self.with_observation_transaction(&mut crate::NoopObserver, |session, observer| {
-                let (output, checkpoint, forward) = session.execute_media_span_before_publication(
-                    source,
-                    input,
-                    span.chunk().output,
+        let result = self.with_observation_transaction(observer, |session, observer| {
+            let (output, checkpoint, forward) = session.execute_media_span_before_publication(
+                source,
+                input,
+                span.chunk().output,
+                context,
+                observer,
+                Some(checkpoint),
+            )?;
+            if output.is_some() != (span.chunk().output != eredu_core::OutputDemand::StateOnly) {
+                return session.rollback_failure(
+                    checkpoint,
+                    ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::IdentityMismatch),
                     context,
-                    observer,
-                    Some(checkpoint),
+                );
+            }
+            let (output, checkpoint, forward) = session
+                .publish_observed_output_transaction_with_readout(
+                    output, checkpoint, forward, context,
                 )?;
-                if output.is_some() != (span.chunk().output != eredu_core::OutputDemand::StateOnly)
-                {
-                    return session.rollback_failure(
-                        checkpoint,
-                        ReplicatedTextSessionError::WorkingMemory(
-                            WorkingMemoryError::IdentityMismatch,
-                        ),
-                        context,
-                    );
-                }
-                let (output, checkpoint, forward) = session
-                    .publish_observed_output_transaction_with_readout(
-                        output, checkpoint, forward, context,
-                    )?;
-                let completion =
-                    complete(output.as_ref(), &session.state, &source.roots(), context)
-                        .map_err(ReplicatedTextSessionError::Mechanism);
-                session
-                    .finish_publication(output, checkpoint, forward, context, observer, completion)
-            });
+            let completion = complete(output.as_ref(), &session.state, &source.roots(), context)
+                .map_err(ReplicatedTextSessionError::Mechanism);
+            session.finish_publication(output, checkpoint, forward, context, observer, completion)
+        });
         match result {
             Ok(output) => {
                 source

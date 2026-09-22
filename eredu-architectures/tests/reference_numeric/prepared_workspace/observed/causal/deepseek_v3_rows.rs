@@ -133,7 +133,11 @@ fn assert_loaded_parameters(model: &Model, config: &deepseek::V3Args) {
     #[derive(Default)]
     struct Loaded(BTreeMap<String, Vec<usize>>);
     impl<'a> ParameterVisitor<'a, NumericTensor> for Loaded {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a NumericTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a NumericTensor,
+        ) {
             let name = metadata.id().as_str();
             assert!(
                 value.data.iter().all(|v| v.is_finite()),
@@ -190,21 +194,31 @@ fn make_model(
     // Sparse carrier hooks have their own typed collector. This fixture
     // compares every actual dense tensor declaration, including the new
     // local units and complete/additive writes, with whole-request execution.
-    let declarations: Vec<_> = declarations.into_iter()
-        .filter(|declaration| !declaration.flattens_batch_tokens()).collect();
+    let declarations: Vec<_> = declarations
+        .into_iter()
+        .filter(|declaration| !declaration.flattens_batch_tokens())
+        .collect();
     assert!(declarations.len() >= 10 + 8 * config.num_hidden_layers as usize);
     for index in 0..config.num_hidden_layers as usize {
         let path = <V3Architecture as LayeredArchitecture<NumericBackend, V3State>>::unit_path(
             &architecture,
             0,
-            index, None)
+            index,
+            None,
+        )
         .unwrap();
-        let component = match config.layer_schedule.get(index).expect("validated target layer policy") {
+        let component = match config
+            .layer_schedule
+            .get(index)
+            .expect("validated target layer policy")
+        {
             deepseek::LayerPolicy::DenseMlp => format!("{path}.feed_forward"),
             deepseek::LayerPolicy::SparseMoe => format!("{path}.feed_forward.shared"),
         };
         for suffix in ["units", "units.effective", "write", "write.effective"] {
-            assert!(declarations.iter().any(|d| d.path() == format!("{component}.{suffix}")));
+            assert!(declarations
+                .iter()
+                .any(|d| d.path() == format!("{component}.{suffix}")));
         }
         for suffix in ["input", "input.effective", "output", "output.effective"] {
             assert!(declarations
@@ -435,7 +449,13 @@ fn deepseek_v3_prepared_paths_bind_actual_sources_and_physical_readout() {
         let (_, declarations, paths) = make_model(&config, &context);
         let (_, _, independent_paths) = make_model(&config, &context);
         let before = sources.target().source_diagnostics().unwrap();
-        assert_eq!(declarations.iter().filter(|d| !d.flattens_batch_tokens()).count(), 26);
+        assert_eq!(
+            declarations
+                .iter()
+                .filter(|d| !d.flattens_batch_tokens())
+                .count(),
+            28
+        );
         for declaration in &declarations {
             for preview in [false, true] {
                 let source = admission(&discovery, &[declaration.path()], preview, true);
@@ -607,7 +627,13 @@ fn deepseek_v3_target_declarations_preserve_existing_prediction_availability() {
         }
         let declarations = <V3Architecture as LayeredArchitecture<NumericBackend, V3State>>::
             prefill_observation_declarations(&architecture, None).unwrap();
-        assert_eq!(declarations.iter().filter(|d| !d.flattens_batch_tokens()).count(), 26);
+        assert_eq!(
+            declarations
+                .iter()
+                .filter(|d| !d.flattens_batch_tokens())
+                .count(),
+            28
+        );
         assert!(declarations
             .iter()
             .all(|d| !d.path().starts_with("model.layers.2.") && !d.path().starts_with("mtp.")));
@@ -627,7 +653,6 @@ fn deepseek_v3_target_declarations_preserve_existing_prediction_availability() {
         }
     }
 }
-
 
 #[test]
 fn dense_and_shared_component_rows_match_full_cached_request_before_partition_delivery() {

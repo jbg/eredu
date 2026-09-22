@@ -1,0 +1,131 @@
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -2163,6 +2163,17 @@
+ #endif
+ }
+ }
++bool ordinary_metal_wait_record_control_layout(OrdinaryControlPopulation& out) noexcept {
++  CompletionWaitRecordLayout record;
++  EventDispatchControlLayout dispatch;
++  if (!completion_wait_record_layout(record) || !event_dispatch_control_layout(dispatch) ||
++      !dispatch.gpu_handler_bytes) return false;
++  OrdinaryControlPopulation value;
++  if (!append_ordinary_control(value, record.object_bytes, record.object_alignment) ||
++      !append_ordinary_control(value, record.capture_bytes, record.capture_alignment) ||
++      !append_ordinary_control(value, record.stream_bytes, record.stream_alignment)) return false;
++  out = value; return true;
++}
+ bool ordinary_cpu_wait_control_layout(OrdinaryControlPopulation& out) noexcept {
+   CompletionWaitRecordLayout record;
+   EventDispatchControlLayout dispatch;
+@@ -2174,7 +2185,8 @@
+       !append_ordinary_control(value, dispatch.cpu_wait_bytes, dispatch.cpu_wait_alignment)) return false;
+   out = value; return true;
+ }
+-bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation p,
++namespace {
++bool ordinary_eval_control_layout(OrdinaryEvalPopulation p, bool metal,
+     OrdinaryControlPopulation& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+@@ -2189,7 +2201,7 @@
+   EvalGraphLayout graph;
+   if (!Record::frontier_storage_layout(p.streams, p.outputs, base) ||
+       !event_control_layout(event) || !event_dispatch_control_layout(dispatch) ||
+-      !eval_graph_layout(graph)) return false;
++      !eval_graph_layout(graph) || (metal && !dispatch.gpu_handler_bytes)) return false;
+   OrdinaryControlPopulation value;
+   if (!append_ordinary_control(value, sizeof(EvalSubmissionRecord), alignof(EvalSubmissionRecord))) return false;
+   // Captures clear between primitives. libc++ emplace growth doubles the
+@@ -2217,6 +2229,15 @@
+   for (size_t i = 0; i < 3; ++i)
+     if (!append_ordinary_control(value, graph.request_bytes[i], graph.request_alignments[i])) return false;
+   if (!ordinary_items<array>(value, p.roots)) return false;
++  // GPU dispatch's source query owns the async Event and all GPU handlers.
++  // This shared Eval source owns only its Synchronizer Event on that route.
++  // CPU dispatch has no separate Event producer, so its tasks stay here.
++  if (metal) {
++    if (!append_ordinary_control(value, event.shared_bytes, event.shared_alignment)) return false;
++    if (event.platform_events > SIZE_MAX / 2) return false;
++    value.platform_events = 2 * event.platform_events;
++    out = value; return true;
++  }
+   size_t events, waits;
+   if (!ordinary_add(p.streams, p.streams, events) ||
+       !ordinary_add(p.edges, p.streams, waits) ||
+@@ -2228,4 +2249,13 @@
+   out = value; return true;
+ #endif
+ }
+-}
++} // namespace
++bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation p,
++    OrdinaryControlPopulation& out) noexcept {
++  return ordinary_eval_control_layout(p, false, out);
++}
++bool ordinary_metal_eval_control_layout(OrdinaryEvalPopulation p,
++    OrdinaryControlPopulation& out) noexcept {
++  return ordinary_eval_control_layout(p, true, out);
++}
++}
+diff --git a/mlx/ordinary_control.h b/mlx/ordinary_control.h
+--- a/mlx/ordinary_control.h
++++ b/mlx/ordinary_control.h
+@@ -34,5 +34,10 @@
+ // platform-private event overhead remain separate source contributions.
+ MLX_API bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation,
+     OrdinaryControlPopulation&) noexcept;
++// One selected Metal stream: shared ordinary Eval containers and Synchronizer
++// Event only. The selected GPU worker owns async Event/handler/encoder controls.
++MLX_API bool ordinary_metal_eval_control_layout(OrdinaryEvalPopulation,
++    OrdinaryControlPopulation&) noexcept;
++MLX_API bool ordinary_metal_wait_record_control_layout(OrdinaryControlPopulation&) noexcept;
+ MLX_API bool ordinary_cpu_wait_control_layout(OrdinaryControlPopulation&) noexcept;
+ }
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -904,11 +904,18 @@
+   if (owner.original)
+     return std::allocate_shared<Receipt>(submission::GraphAllocator<Receipt>(owner.graph),
+                                         owner.carrier->clone());
++  if (auto physical = submission::current_physical_funding(); physical.get()) {
++    auto* scope = submission::current_scope();
++    return std::allocate_shared<Receipt>(
++        submission::GraphAllocator<Receipt>(nullptr, std::move(physical)),
++        scope ? scope->failure_owner() : FailureCarrierRef{});
++  }
+   return std::make_shared<Receipt>();
+ }
+ 
+ void CommandEncoder::ensure_receipt(submission::NativeControlBinding owner) {
+-  if (!receipt_ || (owner.original && !receipt_->active && !receipt_->failure &&
++  const bool funded = owner.original || submission::current_physical_funding().get();
++  if (!receipt_ || (funded && !receipt_->active && !receipt_->failure &&
+       receipt_->handlers.empty() && receipt_->waits.empty() && receipt_->signals.empty())) {
+     auto prepared = prepare_receipt(owner);
+     receipt_ = std::move(prepared);
+@@ -1022,9 +1029,10 @@
+     throw std::runtime_error("Metal command buffer has an unresolved commit.");
+   auto next_buffer = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+   if (!next_buffer) throw std::runtime_error("Failed to make Metal command buffer.");
+-  // Ordinary behavior still prepares its successor eagerly. Original work leaves
+-  // no idle Graph header behind after commit; later work chooses its own owner.
+-  auto next_receipt = owner.original ? std::shared_ptr<Receipt>{} : prepare_receipt(owner);
++  // A funded request leaves no idle receipt retaining its account. The next
++  // submitted worker selects its own payer before publishing any native effect.
++  const bool funded = owner.original || submission::current_physical_funding().get();
++  auto next_receipt = funded ? std::shared_ptr<Receipt>{} : prepare_receipt(owner);
+   ensure_receipt(owner);
+   if (!receipt_->active) record_submission();
+   auto receipt = receipt_;
+@@ -1092,7 +1100,7 @@
+     throw submission::NativeControlError(submission::NativeControlFailure::failed_worker);
+   if (!encoder_) {
+     const auto owner = allocation_owner();
+-    auto prepared = owner.original
++    auto prepared = (owner.original || submission::current_physical_funding().get())
+         ? std::allocate_shared<detail::EncoderFence>(
+               submission::GraphAllocator<detail::EncoderFence>(owner.graph))
+         : std::make_shared<detail::EncoderFence>();

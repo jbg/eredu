@@ -373,7 +373,7 @@ fn tensor_pair<'a>(
 ) -> Result<(&'a TensorObservation, &'a TensorObservation), ParityError> {
     match (actual, reference) {
         (ObservationValue::Tensor(actual), ObservationValue::Tensor(reference)) => {
-            Ok((actual, reference))
+            Ok((actual.as_observation(), reference.as_observation()))
         }
         _ => Err(ParityError::Incomparable(
             "logit comparison requires two tensors".into(),
@@ -616,13 +616,15 @@ mod tests {
 
     fn tensor(shape: Vec<usize>, values: Vec<f32>) -> ObservationValue {
         ObservationValue::Tensor(
-            TensorObservation::new(shape, TensorObservationData::F32(values)).unwrap(),
+            (TensorObservation::new(shape, TensorObservationData::F32(values)).unwrap()).into(),
         )
     }
 
     fn tokens(values: Vec<i64>) -> ObservationValue {
         ObservationValue::Tensor(
-            TensorObservation::new(vec![values.len()], TensorObservationData::I64(values)).unwrap(),
+            (TensorObservation::new(vec![values.len()], TensorObservationData::I64(values))
+                .unwrap())
+            .into(),
         )
     }
 

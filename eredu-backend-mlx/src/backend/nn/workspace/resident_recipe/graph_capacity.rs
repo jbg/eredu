@@ -14,9 +14,14 @@ pub(crate) struct ResidentGraphStorage {
     query_controls: usize,
 }
 impl ResidentGraphStorage {
-    fn include_sampling(&mut self, rows: &[ResidentSamplingRecipe]) -> Result<bool, crate::backend::error::Error> {
-        let unknown = || crate::backend::error::Error::PrefillControl(WorkingMemoryError::UnknownBound);
-        let overflow = || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
+    fn include_sampling(
+        &mut self,
+        rows: &[ResidentSamplingRecipe],
+    ) -> Result<bool, crate::backend::error::Error> {
+        let unknown =
+            || crate::backend::error::Error::PrefillControl(WorkingMemoryError::UnknownBound);
+        let overflow =
+            || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
         let mut complete = true;
         for row in rows {
             match row.phase() {
@@ -25,37 +30,35 @@ impl ResidentGraphStorage {
                     match row.preparation {
                         Some(ResidentSamplingPreparation::Empty) => {}
                         Some(ResidentSamplingPreparation::EagerKey(graph)) => {
-                            self
-                                .add(graph.allocation_extents())
-                                .ok_or_else(overflow)?;
+                            self.add(graph.allocation_extents()).ok_or_else(overflow)?;
                         }
                         None => complete = false,
                     }
                 }
                 SamplingWorkspacePhase::Step { .. } => match row.completion() {
                     Some(completion) => {
-                        self
-                            .add(completion.graph.allocation_extents())
+                        self.add(completion.graph.allocation_extents())
                             .ok_or_else(overflow)?;
                         // ReadToken moves this same completion into Submission;
                         // outer scalar observation issues no second Eval/event.
                         let event =
                             OperationEvent::root_storage_layout(completion.traversal.roots())
                                 .ok_or_else(unknown)?;
-                        self
-                            .add(event.graph_request_extent())
+                        self.add(event.graph_request_extent())
                             .ok_or_else(overflow)?;
                         match completion.dispatch {
                             Some(dispatch) => {
-                                self
-                                    .include_dag(
-                                        completion.traversal,
-                                        completion.graph,
-                                        dispatch,
-                                        NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
-                                        0,
-                                    )
-                                    .ok_or_else(unknown)?;
+                                self.include_dag(
+                                    completion.traversal,
+                                    completion.graph,
+                                    dispatch,
+                                    NestedCompletionRoots::uniform(
+                                        completion.nested_completions,
+                                        completion.nested_root_capacity.max(3),
+                                    ),
+                                    0,
+                                )
+                                .ok_or_else(unknown)?;
                             }
                             None => complete = false,
                         }
@@ -67,74 +70,73 @@ impl ResidentGraphStorage {
         Ok(complete)
     }
     fn finish_capacity(&mut self, complete: bool) -> Result<(), crate::backend::error::Error> {
-        let overflow = || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
+        let overflow =
+            || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
         if complete {
             let extents = usize::try_from(self.known_constructor_bytes).map_err(|_| overflow())?;
-            self.full_capacity = Some(u64::try_from(
-                SubmissionGraphQuota::fresh_capacity_for_extents(extents).ok_or_else(overflow)?,
-            ).map_err(|_| overflow())?);
+            self.full_capacity = Some(
+                u64::try_from(
+                    SubmissionGraphQuota::fresh_capacity_for_extents(extents)
+                        .ok_or_else(overflow)?,
+                )
+                .map_err(|_| overflow())?,
+            );
         }
         Ok(())
     }
-    pub(super) fn include_source_copies(&mut self, copies: host_copies::HostCopies,
-        transfers: host_copies::HostTransfers, dispatch: ResidentDispatchPopulation) -> Option<()> {
+    /// Add a separately constructed bank to this same cumulative Graph quota.
+    pub(super) fn include_construction_bank(
+        &mut self,
+        graph: safemlx::ResidentGraphLayout,
+    ) -> Result<(), crate::backend::error::Error> {
+        let overflow =
+            || crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow);
+        self.add(graph.allocation_extents()).ok_or_else(overflow)?;
+        self.query_controls = self
+            .query_controls
+            .checked_add(graph.control_bytes().ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
+        self.finish_capacity(self.full_capacity.is_some())
+    }
+    pub(super) fn include_source_copies(
+        &mut self,
+        copies: host_copies::HostCopies,
+        transfers: host_copies::HostTransfers,
+        dispatch: ResidentDispatchPopulation,
+    ) -> Option<()> {
         let mut one = ResidentGraphStorage::default();
-        one.include_eval(copies.traversal, copies.dispatch)
-            ?;
-        one.add(
-            OperationEvent::root_storage_layout(1)
-                ?
-                .graph_request_extent(),
-        )
-        ?;
-        self.known_constructor_bytes = self
-            .known_constructor_bytes
-            .checked_add(
-                one.known_constructor_bytes
-                    .checked_mul(u64::try_from(copies.per_forward).ok()?)
-                    ?,
-            )
-            ?;
-        self
-            .add(copies.direct_graph_extents)
-            ?;
+        one.include_eval(copies.traversal, copies.dispatch)?;
+        one.add(OperationEvent::root_storage_layout(1)?.graph_request_extent())?;
+        self.known_constructor_bytes = self.known_constructor_bytes.checked_add(
+            one.known_constructor_bytes
+                .checked_mul(u64::try_from(copies.per_forward).ok()?)?,
+        )?;
+        self.add(copies.direct_graph_extents)?;
         self.query_controls = self.query_controls.max(one.query_controls);
         let mut aggregate = ResidentGraphStorage::default();
+        aggregate.include_eval(copies.aggregate_traversal, copies.aggregate_dispatch)?;
         aggregate
-            .include_eval(copies.aggregate_traversal, copies.aggregate_dispatch)
-            ?;
-        aggregate
-            .add(
-                OperationEvent::root_storage_layout(transfers.roots)
-                    ?
-                    .graph_request_extent(),
-            )
-            ?;
-        self.known_constructor_bytes = self
-            .known_constructor_bytes
-            .checked_add(
-                aggregate
-                    .known_constructor_bytes
-                    .checked_mul(
-                u64::try_from(transfers.per_forward).ok()?,
-                    )
-                    ?,
-            )
-            ?;
+            .add(OperationEvent::root_storage_layout(transfers.roots)?.graph_request_extent())?;
+        self.known_constructor_bytes = self.known_constructor_bytes.checked_add(
+            aggregate
+                .known_constructor_bytes
+                .checked_mul(u64::try_from(transfers.per_forward).ok()?)?,
+        )?;
         // Source waits can close an encoder containing both model and
         // source resources. Price both authentic worker universes.
-        self
-            .add(
-                dispatch.worker_graph_extents
-                    .checked_add(copies.aggregate_dispatch.worker_graph_extents)
-                    ?
-                    .checked_mul(transfers.waits_per_forward)
-                    ?,
-            )
-            ?;
+        self.add(
+            dispatch
+                .worker_graph_extents
+                .checked_add(copies.aggregate_dispatch.worker_graph_extents)?
+                .checked_mul(transfers.waits_per_forward)?,
+        )?;
         self.query_controls = self.query_controls.max(aggregate.query_controls);
-        self.full_capacity = Some(u64::try_from(SubmissionGraphQuota::fresh_capacity_for_extents(
-            usize::try_from(self.known_constructor_bytes).ok()?)?).ok()?);
+        self.full_capacity = Some(
+            u64::try_from(SubmissionGraphQuota::fresh_capacity_for_extents(
+                usize::try_from(self.known_constructor_bytes).ok()?,
+            )?)
+            .ok()?,
+        );
         Some(())
     }
     /// Same actual DAG and completion population for one non-text numerical cut.
@@ -148,7 +150,10 @@ impl ResidentGraphStorage {
             completion.traversal,
             completion.graph,
             completion.dispatch?,
-            NestedCompletionRoots::uniform(completion.nested_completions, completion.nested_root_capacity.max(3)),
+            NestedCompletionRoots::uniform(
+                completion.nested_completions,
+                completion.nested_root_capacity.max(3),
+            ),
             0,
         )?;
         value.full_capacity = Some(
@@ -161,39 +166,95 @@ impl ResidentGraphStorage {
     }
     /// Existing eager input, fixed-rank view or F32 numerical worker with private CPU completion.
     /// The eager constructor's Graph and backing remain priced by its own source.
-    pub(super) fn for_cpu_completion(completion: ResidentCompletionRecipe, cpu_operation: Option<numerical::CpuNumericalOperation>) -> Option<Self> {
+    pub(super) fn for_cpu_completion(
+        completion: ResidentCompletionRecipe,
+        cpu_operation: Option<numerical::CpuNumericalOperation>,
+    ) -> Option<Self> {
         let limits = completion.traversal.limits();
-        let roots_count=match cpu_operation {
-            Some(numerical::CpuNumericalOperation::SplitKeys {views,..}) if (1..=2).contains(&views)=>views,
-            Some(numerical::CpuNumericalOperation::SplitKeys {..})=>return None,
-            Some(numerical::CpuNumericalOperation::UniformUnitInterval|numerical::CpuNumericalOperation::Difference{..}|numerical::CpuNumericalOperation::Categorical{..})=>2,
-            _=>1,
+        let roots_count = match cpu_operation {
+            Some(numerical::CpuNumericalOperation::SplitKeys { views, .. })
+                if (1..=2).contains(&views) =>
+            {
+                views
+            }
+            Some(numerical::CpuNumericalOperation::SplitKeys { .. }) => return None,
+            Some(
+                numerical::CpuNumericalOperation::UniformUnitInterval
+                | numerical::CpuNumericalOperation::Difference { .. }
+                | numerical::CpuNumericalOperation::Categorical { .. },
+            ) => 2,
+            _ => 1,
         };
-        if limits.roots != roots_count || limits.streams != 1
-            || match cpu_operation { None | Some(numerical::CpuNumericalOperation::EagerKey) => limits.tape_entries != 1,
-                Some(numerical::CpuNumericalOperation::Slice {..} | numerical::CpuNumericalOperation::Index {..}) => !(1..=3).contains(&limits.tape_entries),
-                Some(numerical::CpuNumericalOperation::Normalize {..}) => !(1..=4).contains(&limits.tape_entries),
-                Some(numerical::CpuNumericalOperation::Greedy {..}) => !(1..=6).contains(&limits.tape_entries),
-                Some(numerical::CpuNumericalOperation::SplitKeys {views,..}) => !(1..=views.checked_mul(2)?.checked_add(2)?).contains(&limits.tape_entries),
-                Some(numerical::CpuNumericalOperation::Difference{..}|numerical::CpuNumericalOperation::Categorical{..})=>limits.tape_entries==0
-                    ||limits.tape_entries>completion.graph.primitives().checked_add(completion.graph.seeds())?.checked_add(2)?,
-                Some(numerical::CpuNumericalOperation::Logarithm{..})=>!(1..=3).contains(&limits.tape_entries),
-                Some(numerical::CpuNumericalOperation::UniformUnitInterval) => limits.tape_entries==0
+        if limits.roots != roots_count
+            || limits.streams != 1
+            || match cpu_operation {
+                None | Some(numerical::CpuNumericalOperation::EagerKey) => limits.tape_entries != 1,
+                Some(
+                    numerical::CpuNumericalOperation::Slice { .. }
+                    | numerical::CpuNumericalOperation::Index { .. },
+                ) => !(1..=3).contains(&limits.tape_entries),
+                Some(numerical::CpuNumericalOperation::Normalize { .. }) => {
+                    !(1..=4).contains(&limits.tape_entries)
+                }
+                Some(numerical::CpuNumericalOperation::Greedy { .. }) => {
+                    !(1..=6).contains(&limits.tape_entries)
+                }
+                Some(numerical::CpuNumericalOperation::SplitKeys { views, .. }) => {
+                    !(1..=views.checked_mul(2)?.checked_add(2)?).contains(&limits.tape_entries)
+                }
+                Some(
+                    numerical::CpuNumericalOperation::Difference { .. }
+                    | numerical::CpuNumericalOperation::Categorical { .. },
+                ) => {
+                    limits.tape_entries == 0
+                        || limits.tape_entries
+                            > completion
+                                .graph
+                                .primitives()
+                                .checked_add(completion.graph.seeds())?
+                                .checked_add(2)?
+                }
+                Some(numerical::CpuNumericalOperation::Logarithm { .. }) => {
+                    !(1..=3).contains(&limits.tape_entries)
+                }
+                Some(numerical::CpuNumericalOperation::UniformUnitInterval) => {
+                    limits.tape_entries==0
                     // One existing incoming key is a leaf outside the new constructor bank.
-                    || limits.tape_entries>completion.graph.primitives().checked_add(completion.graph.seeds())?.checked_add(1)? }
-            || completion.nested_completions != 0 || completion.validation_roots != 0
-            || completion.dispatch.is_some() {
+                    || limits.tape_entries>completion.graph.primitives().checked_add(completion.graph.seeds())?.checked_add(1)?
+                }
+            }
+            || completion.nested_completions != 0
+            || completion.validation_roots != 0
+            || completion.dispatch.is_some()
+        {
             return None;
         }
         let operation = match cpu_operation {
-            Some(numerical::CpuNumericalOperation::Slice {rank} | numerical::CpuNumericalOperation::Index {rank,..}) => Some(OperationEvent::cpu_slice_layout(rank, false, false)?),
-            Some(numerical::CpuNumericalOperation::Normalize {rank,columns,rows}) =>
-                Some(OperationEvent::cpu_softmax_layout(rank,columns,rows,false)?),
-            Some(numerical::CpuNumericalOperation::Greedy {rank,columns}) =>
-                Some(OperationEvent::cpu_arg_reduce_layout(rank,columns,1,false)?),
-            Some(numerical::CpuNumericalOperation::SplitKeys {count,..}) => Some(OperationEvent::cpu_random_bits_layout(2,count.checked_mul(2)?,false)?),
-            None | Some(numerical::CpuNumericalOperation::EagerKey | numerical::CpuNumericalOperation::UniformUnitInterval
-                | numerical::CpuNumericalOperation::Difference{..}|numerical::CpuNumericalOperation::Logarithm{..}|numerical::CpuNumericalOperation::Categorical{..}) => None,
+            Some(
+                numerical::CpuNumericalOperation::Slice { rank }
+                | numerical::CpuNumericalOperation::Index { rank, .. },
+            ) => Some(OperationEvent::cpu_slice_layout(rank, false, false)?),
+            Some(numerical::CpuNumericalOperation::Normalize {
+                rank,
+                columns,
+                rows,
+            }) => Some(OperationEvent::cpu_softmax_layout(
+                rank, columns, rows, false,
+            )?),
+            Some(numerical::CpuNumericalOperation::Greedy { rank, columns }) => Some(
+                OperationEvent::cpu_arg_reduce_layout(rank, columns, 1, false)?,
+            ),
+            Some(numerical::CpuNumericalOperation::SplitKeys { count, .. }) => Some(
+                OperationEvent::cpu_random_bits_layout(2, count.checked_mul(2)?, false)?,
+            ),
+            None
+            | Some(
+                numerical::CpuNumericalOperation::EagerKey
+                | numerical::CpuNumericalOperation::UniformUnitInterval
+                | numerical::CpuNumericalOperation::Difference { .. }
+                | numerical::CpuNumericalOperation::Logarithm { .. }
+                | numerical::CpuNumericalOperation::Categorical { .. },
+            ) => None,
         };
         let roots = safemlx::PrefillRoots::layout(roots_count).ok()?;
         let source = OperationEvent::cpu_completion_layout(roots_count)?;
@@ -207,62 +268,140 @@ impl ResidentGraphStorage {
         value.add(source.graph_allocation_extents())?;
         value.add(source.signal_graph_allocation_extents())?;
         let operation_controls = if let Some(operation) = operation {
-            let expected_births = usize::from(matches!(cpu_operation, Some(numerical::CpuNumericalOperation::Normalize {..} | numerical::CpuNumericalOperation::Greedy {..} | numerical::CpuNumericalOperation::SplitKeys {..})));
-            if operation.backing_births()!=expected_births || operation.signal_graph_allocation_extents()!=0 { return None; }
+            let expected_births = usize::from(matches!(
+                cpu_operation,
+                Some(
+                    numerical::CpuNumericalOperation::Normalize { .. }
+                        | numerical::CpuNumericalOperation::Greedy { .. }
+                        | numerical::CpuNumericalOperation::SplitKeys { .. }
+                )
+            ));
+            if operation.backing_births() != expected_births
+                || operation.signal_graph_allocation_extents() != 0
+            {
+                return None;
+            }
             value.add(operation.graph_allocation_extents())?;
             value.add(operation.worker_graph_allocation_extents())?;
             operation.control_bytes()?
-        } else { 0 };
-        let alias=match cpu_operation {
-            Some(numerical::CpuNumericalOperation::Greedy {rank,..}) => Some(OperationEvent::cpu_squeeze_layout(rank,false)?),
-            Some(numerical::CpuNumericalOperation::Index {rank,output_rank}) => Some(OperationEvent::cpu_reshape_alias_layout(rank,output_rank,false)?),
+        } else {
+            0
+        };
+        let alias = match cpu_operation {
+            Some(numerical::CpuNumericalOperation::Greedy { rank, .. }) => {
+                Some(OperationEvent::cpu_squeeze_layout(rank, false)?)
+            }
+            Some(numerical::CpuNumericalOperation::Index { rank, output_rank }) => Some(
+                OperationEvent::cpu_reshape_alias_layout(rank, output_rank, false)?,
+            ),
             _ => None,
         };
-        let alias_controls=if let Some(alias)=alias {
-            if alias.backing_births()!=0 || alias.worker_graph_allocation_extents()!=0
-                || alias.signal_graph_allocation_extents()!=0 {return None;}
+        let alias_controls = if let Some(alias) = alias {
+            if alias.backing_births() != 0
+                || alias.worker_graph_allocation_extents() != 0
+                || alias.signal_graph_allocation_extents() != 0
+            {
+                return None;
+            }
             value.add(alias.graph_allocation_extents())?;
             alias.control_bytes()?
-        } else {0};
-        let split_controls=if let Some(numerical::CpuNumericalOperation::SplitKeys {count,views})=cpu_operation {
-            let sources=[if count==1 {None} else {Some(OperationEvent::cpu_slice_layout(2, false, false)?)},
-                Some(OperationEvent::cpu_reshape_alias_layout(2,1,false)?)];
-            let mut controls=0usize;
-            for source in sources.into_iter().flatten() {
-                if source.backing_births()!=0 || source.worker_graph_allocation_extents()!=0
-                    || source.signal_graph_allocation_extents()!=0 {return None;}
-                value.add(source.graph_allocation_extents().checked_mul(views)?)?;
-                controls=controls.checked_add(source.control_bytes()?.checked_mul(views)?)?;
-            }
-            controls
-        } else {0};
-        let composed=match cpu_operation {
-            Some(numerical::CpuNumericalOperation::UniformUnitInterval)=>Some(super::super::cpu::uniform_population()?),
-            Some(numerical::CpuNumericalOperation::Categorical{rank,columns})=>Some(super::super::cpu::categorical_population(rank,columns)?),
-            Some(numerical::CpuNumericalOperation::Difference{rank,columns,rows})=>Some(super::super::cpu::difference_population(rank,columns,rows)?),
-            Some(numerical::CpuNumericalOperation::Logarithm{rank})=>Some(super::super::cpu::logarithm_population(rank)?),
-            _=>None,
+        } else {
+            0
         };
-        let composed_controls=if let Some(population)=composed {
-            value.add(population.extents)?;population.controls
-        }else{0};
-        let parts = [controls, roots.control_bytes, source.control_bytes()?, operation_controls, alias_controls, split_controls, composed_controls,
-            size_of::<super::super::cpu::CpuPopulation>(),size_of::<Option<super::super::cpu::CpuPopulation>>(),
-            size_of::<[Option<safemlx::CpuCopyEvalLayout>;2]>(),
-            size_of::<std::iter::Flatten<std::array::IntoIter<Option<safemlx::CpuCopyEvalLayout>,2>>>(),
-            size_of::<usize>()*3,
+        let split_controls =
+            if let Some(numerical::CpuNumericalOperation::SplitKeys { count, views }) =
+                cpu_operation
+            {
+                let sources = [
+                    if count == 1 {
+                        None
+                    } else {
+                        Some(OperationEvent::cpu_slice_layout(2, false, false)?)
+                    },
+                    Some(OperationEvent::cpu_reshape_alias_layout(2, 1, false)?),
+                ];
+                let mut controls = 0usize;
+                for source in sources.into_iter().flatten() {
+                    if source.backing_births() != 0
+                        || source.worker_graph_allocation_extents() != 0
+                        || source.signal_graph_allocation_extents() != 0
+                    {
+                        return None;
+                    }
+                    value.add(source.graph_allocation_extents().checked_mul(views)?)?;
+                    controls = controls.checked_add(source.control_bytes()?.checked_mul(views)?)?;
+                }
+                controls
+            } else {
+                0
+            };
+        let composed = match cpu_operation {
+            Some(numerical::CpuNumericalOperation::UniformUnitInterval) => {
+                Some(super::super::cpu::uniform_population()?)
+            }
+            Some(numerical::CpuNumericalOperation::Categorical { rank, columns }) => {
+                Some(super::super::cpu::categorical_population(rank, columns)?)
+            }
+            Some(numerical::CpuNumericalOperation::Difference {
+                rank,
+                columns,
+                rows,
+            }) => Some(super::super::cpu::difference_population(
+                rank, columns, rows,
+            )?),
+            Some(numerical::CpuNumericalOperation::Logarithm { rank }) => {
+                Some(super::super::cpu::logarithm_population(rank)?)
+            }
+            _ => None,
+        };
+        let composed_controls = if let Some(population) = composed {
+            value.add(population.extents)?;
+            population.controls
+        } else {
+            0
+        };
+        let parts = [
+            controls,
+            roots.control_bytes,
+            source.control_bytes()?,
+            operation_controls,
+            alias_controls,
+            split_controls,
+            composed_controls,
+            size_of::<super::super::cpu::CpuPopulation>(),
+            size_of::<Option<super::super::cpu::CpuPopulation>>(),
+            size_of::<[Option<safemlx::CpuCopyEvalLayout>; 2]>(),
+            size_of::<
+                std::iter::Flatten<std::array::IntoIter<Option<safemlx::CpuCopyEvalLayout>, 2>>,
+            >(),
+            size_of::<usize>() * 3,
             size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
-            size_of::<safemlx::CpuCopyEvalLayout>(),size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
-            size_of::<Option<numerical::CpuNumericalOperation>>(), size_of::<safemlx::CpuCopyEvalLayout>(),
+            size_of::<safemlx::CpuCopyEvalLayout>(),
             size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
-            completion.graph.control_bytes()?, completion.traversal.query_control_bytes()?,
-            size_of::<ResidentCompletionRecipe>(), size_of::<Self>(), size_of::<Option<Self>>(),
-            size_of::<safemlx::OperationEvalTraversalLimits>(), size_of::<safemlx::PrefillRootsLayout>(),
-            size_of::<safemlx::CpuCopyEvalLayout>(), size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
-            size_of::<Option<usize>>(), size_of::<usize>()];
-        value.query_controls = parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)?;
-        value.full_capacity = Some(u64::try_from(SubmissionGraphQuota::fresh_capacity_for_extents(
-            usize::try_from(value.known_constructor_bytes).ok()?)?).ok()?);
+            size_of::<Option<numerical::CpuNumericalOperation>>(),
+            size_of::<safemlx::CpuCopyEvalLayout>(),
+            size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
+            completion.graph.control_bytes()?,
+            completion.traversal.query_control_bytes()?,
+            size_of::<ResidentCompletionRecipe>(),
+            size_of::<Self>(),
+            size_of::<Option<Self>>(),
+            size_of::<safemlx::OperationEvalTraversalLimits>(),
+            size_of::<safemlx::PrefillRootsLayout>(),
+            size_of::<safemlx::CpuCopyEvalLayout>(),
+            size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
+            size_of::<Option<usize>>(),
+            size_of::<usize>(),
+        ];
+        value.query_controls = parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)?;
+        value.full_capacity = Some(
+            u64::try_from(SubmissionGraphQuota::fresh_capacity_for_extents(
+                usize::try_from(value.known_constructor_bytes).ok()?,
+            )?)
+            .ok()?,
+        );
         Some(value)
     }
     pub(super) fn add(&mut self, extents: usize) -> Option<()> {
@@ -314,15 +453,18 @@ impl ResidentGraphStorage {
         u64::try_from(fixed).ok()
     }
     fn include_nested(
-        &mut self, traversal: safemlx::OperationEvalTraversalLayout,
-        dispatch: ResidentDispatchPopulation, roots: NestedCompletionRoots<'_>,
+        &mut self,
+        traversal: safemlx::OperationEvalTraversalLayout,
+        dispatch: ResidentDispatchPopulation,
+        roots: NestedCompletionRoots<'_>,
     ) -> Option<()> {
         for count in roots.iter() {
             let mut single = Self::default();
             let traversal = nested_traversal_with_roots(traversal, count)?;
             single.include_eval(traversal, dispatch)?;
             single.add(OperationEvent::root_storage_layout(count)?.graph_request_extent())?;
-            self.known_constructor_bytes = self.known_constructor_bytes
+            self.known_constructor_bytes = self
+                .known_constructor_bytes
                 .checked_add(single.known_constructor_bytes)?;
             self.query_controls = self.query_controls.max(single.query_controls);
         }
@@ -374,7 +516,10 @@ impl ResidentGraphStorage {
             evaluations,
             waits,
         )?;
-        population.worker_graph_extents = worker.allocation_extents().checked_add(population.copy_rank_extents)?.checked_add(population.parallel_graph_extents)?;
+        population.worker_graph_extents = worker
+            .allocation_extents()
+            .checked_add(population.copy_rank_extents)?
+            .checked_add(population.parallel_graph_extents)?;
         self.include_eval(traversal, population)?;
         self.query_controls = self.query_controls.max(worker.control_bytes()?);
         for count in roots.iter() {
@@ -382,7 +527,9 @@ impl ResidentGraphStorage {
             // Each actual completion constructs its own synchronization/root
             // storage. Preserve the real distribution instead of max times count.
             let synchronizer = OperationEvent::eval_record_layout(
-                limits.tape_entries, limits.streams, limits.output_slots,
+                limits.tape_entries,
+                limits.streams,
+                limits.output_slots,
             )?;
             let event_roots = OperationEvent::root_storage_layout(count)?;
             self.add(synchronizer.host_graph_allocation_extents())?;
@@ -406,34 +553,51 @@ impl ResidentGraphStorage {
         Some(())
     }
     fn include_eval_construction(
-        &mut self, traversal: safemlx::OperationEvalTraversalLayout,
+        &mut self,
+        traversal: safemlx::OperationEvalTraversalLayout,
     ) -> Option<usize> {
         let limits = traversal.limits();
         let synchronizer = OperationEvent::eval_record_layout(
-            limits.tape_entries, limits.streams, limits.output_slots,
+            limits.tape_entries,
+            limits.streams,
+            limits.output_slots,
         )?;
         self.add(synchronizer.host_graph_allocation_extents())?;
-        let parts = [synchronizer.query_control_bytes()?,
+        let parts = [
+            synchronizer.query_control_bytes()?,
             size_of::<(&mut Self, safemlx::OperationEvalTraversalLayout)>(),
-            size_of::<Option<usize>>(), size_of::<safemlx::OperationEvalTraversalLimits>()];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+            size_of::<Option<usize>>(),
+            size_of::<safemlx::OperationEvalTraversalLimits>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// One actual CPU Contiguous and its private completion. A pending copy
     /// installs the shared three-entry traversal ceiling for both frontiers;
     /// the extra entry does not create another copy worker or output birth.
     pub(super) fn include_cpu_copy_eval(
-        &mut self, traversal: safemlx::OperationEvalTraversalLayout, rank: usize,
+        &mut self,
+        traversal: safemlx::OperationEvalTraversalLayout,
+        rank: usize,
     ) -> Option<()> {
         let copy = OperationEvent::cpu_contiguous_layout(rank, false)?;
-        if copy.backing_births() != 1 { return None; }
+        if copy.backing_births() != 1 {
+            return None;
+        }
         self.include_cpu_copy_sources(traversal, [Some(copy), None], 2)?;
-        let parts = [size_of::<safemlx::CpuCopyEvalLayout>(),
+        let parts = [
+            size_of::<safemlx::CpuCopyEvalLayout>(),
             size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
             size_of::<(&mut Self, safemlx::OperationEvalTraversalLayout, usize)>(),
-            size_of::<Option<()>>()];
+            size_of::<Option<()>>(),
+        ];
         self.query_controls = self.query_controls.checked_add(
-            parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)?)?;
+            parts
+                .into_iter()
+                .try_fold(size_of_val(&parts), usize::checked_add)?,
+        )?;
         Some(())
     }
 
@@ -441,58 +605,115 @@ impl ResidentGraphStorage {
     /// gives [1,N] at rank two, otherwise all dimensions are singleton. Reshape
     /// is an alias when present; only the signed cast can produce new backing.
     pub(super) fn include_cpu_pending_eval(
-        &mut self, traversal: safemlx::OperationEvalTraversalLayout,
-        rank: usize, elements: usize, cast: bool,
+        &mut self,
+        traversal: safemlx::OperationEvalTraversalLayout,
+        rank: usize,
+        elements: usize,
+        cast: bool,
     ) -> Option<()> {
-        if elements == 0 || (rank != 2 && elements != 1) { return None; }
+        if elements == 0 || (rank != 2 && elements != 1) {
+            return None;
+        }
         let reshape = if rank != 2 {
             let source = OperationEvent::cpu_reshape_alias_layout(rank, 2, false)?;
-            if source.backing_births() != 0 || source.worker_graph_allocation_extents() != 0 { return None; }
+            if source.backing_births() != 0 || source.worker_graph_allocation_extents() != 0 {
+                return None;
+            }
             Some(source)
-        } else { None };
+        } else {
+            None
+        };
         let conversion = if cast {
-            let source = OperationEvent::cpu_cast_layout(safemlx::Dtype::Int32,
-                safemlx::Dtype::Uint32, 2, elements, false)?;
-            if source.backing_births() != 1 { return None; }
+            let source = OperationEvent::cpu_cast_layout(
+                safemlx::Dtype::Int32,
+                safemlx::Dtype::Uint32,
+                2,
+                elements,
+                false,
+            )?;
+            if source.backing_births() != 1 {
+                return None;
+            }
             Some(source)
-        } else { None };
+        } else {
+            None
+        };
         let entries = 1 + usize::from(reshape.is_some()) + usize::from(conversion.is_some());
         self.include_cpu_copy_sources(traversal, [reshape, conversion], entries)?;
-        let parts = [size_of::<[Option<safemlx::CpuCopyEvalLayout>; 2]>(),
+        let parts = [
+            size_of::<[Option<safemlx::CpuCopyEvalLayout>; 2]>(),
             size_of::<safemlx::CpuCopyEvalLayout>() * 2,
             size_of::<Option<safemlx::CpuCopyEvalLayout>>() * 2,
-            size_of::<(&mut Self, safemlx::OperationEvalTraversalLayout, usize, usize, bool)>(),
-            size_of::<usize>(), size_of::<Option<()>>()];
+            size_of::<(
+                &mut Self,
+                safemlx::OperationEvalTraversalLayout,
+                usize,
+                usize,
+                bool,
+            )>(),
+            size_of::<usize>(),
+            size_of::<Option<()>>(),
+        ];
         self.query_controls = self.query_controls.checked_add(
-            parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)?)?;
+            parts
+                .into_iter()
+                .try_fold(size_of_val(&parts), usize::checked_add)?,
+        )?;
         Some(())
     }
 
-    fn include_cpu_copy_sources(&mut self, traversal: safemlx::OperationEvalTraversalLayout,
-        sources: [Option<safemlx::CpuCopyEvalLayout>; 2], entries: usize,
+    fn include_cpu_copy_sources(
+        &mut self,
+        traversal: safemlx::OperationEvalTraversalLayout,
+        sources: [Option<safemlx::CpuCopyEvalLayout>; 2],
+        entries: usize,
     ) -> Option<()> {
         let limits = traversal.limits();
-        if limits.streams != 1 || limits.roots != 1 || !(2..=3).contains(&limits.tape_entries)
-            || entries == 0 || entries > limits.tape_entries { return None; }
+        if limits.streams != 1
+            || limits.roots != 1
+            || !(2..=3).contains(&limits.tape_entries)
+            || entries == 0
+            || entries > limits.tape_entries
+        {
+            return None;
+        }
         let completion = OperationEvent::cpu_completion_layout(1)?;
-        if completion.backing_births() != 0 { return None; }
+        if completion.backing_births() != 0 {
+            return None;
+        }
         let mut controls = self.include_eval_construction(traversal)?;
-        for source in [sources[0], sources[1], Some(completion)].into_iter().flatten() {
+        for source in [sources[0], sources[1], Some(completion)]
+            .into_iter()
+            .flatten()
+        {
             self.add(source.graph_allocation_extents())?;
             self.add(source.worker_graph_allocation_extents())?;
             self.add(source.signal_graph_allocation_extents())?;
             controls = controls.checked_add(source.control_bytes()?)?;
         }
-        let parts = [controls, size_of::<[Option<safemlx::CpuCopyEvalLayout>; 3]>(),
-            size_of::<std::iter::Flatten<std::array::IntoIter<Option<safemlx::CpuCopyEvalLayout>, 3>>>(),
+        let parts = [
+            controls,
+            size_of::<[Option<safemlx::CpuCopyEvalLayout>; 3]>(),
+            size_of::<
+                std::iter::Flatten<std::array::IntoIter<Option<safemlx::CpuCopyEvalLayout>, 3>>,
+            >(),
             size_of::<std::array::IntoIter<Option<safemlx::CpuCopyEvalLayout>, 3>>(),
             size_of::<safemlx::OperationEvalTraversalLimits>(),
             size_of::<safemlx::CpuCopyEvalLayout>() * 2,
             size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
-            size_of::<(&mut Self, safemlx::OperationEvalTraversalLayout, [Option<safemlx::CpuCopyEvalLayout>; 2], usize)>(),
-            size_of::<Option<()>>(), size_of::<usize>()];
+            size_of::<(
+                &mut Self,
+                safemlx::OperationEvalTraversalLayout,
+                [Option<safemlx::CpuCopyEvalLayout>; 2],
+                usize,
+            )>(),
+            size_of::<Option<()>>(),
+            size_of::<usize>(),
+        ];
         self.query_controls = self.query_controls.max(
-            parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)?,
+            parts
+                .into_iter()
+                .try_fold(size_of_val(&parts), usize::checked_add)?,
         );
         Some(())
     }
@@ -502,7 +723,9 @@ impl ResidentGraphStorage {
         traversal: safemlx::OperationEvalTraversalLayout,
         dispatch: ResidentDispatchPopulation,
     ) -> Option<()> {
-        if dispatch.completion_streams()? != traversal.limits().streams { return None; }
+        if dispatch.completion_streams()? != traversal.limits().streams {
+            return None;
+        }
         if (dispatch.gpu_entries == 0
             && (dispatch.gpu_input_edges != 0 || dispatch.gpu_siblings != 0))
             || (dispatch.cpu_entries == 0
@@ -512,28 +735,75 @@ impl ResidentGraphStorage {
             return None;
         }
         if let Some(source) = dispatch.cpu_model {
-            let limits=traversal.limits();
-            if dispatch.cpu_siblings!=dispatch.cpu_entries || limits.tape_entries!=dispatch.cpu_entries
-                || limits.input_edges<source.input_edges.checked_add(dispatch.parallel_entries)?.checked_add(limits.roots)?
-                || dispatch.cpu_input_edges<source.input_edges.checked_add(dispatch.parallel_entries)? {
+            let limits = traversal.limits();
+            if dispatch.cpu_siblings != dispatch.cpu_entries
+                || limits.tape_entries != dispatch.cpu_entries
+                || limits.input_edges
+                    < source
+                        .input_edges
+                        .checked_add(dispatch.parallel_entries)?
+                        .checked_add(limits.roots)?
+                || dispatch.cpu_input_edges
+                    < source.input_edges.checked_add(dispatch.parallel_entries)?
+            {
                 return None;
             }
-            let completion=OperationEvent::cpu_completion_layout(limits.roots)?;
-            if completion.backing_births()!=0 || completion.worker_graph_allocation_extents()!=0 {return None;}
-            let controls=self.include_eval_construction(traversal)?
+            let completion = OperationEvent::cpu_completion_layout(limits.roots)?;
+            if completion.backing_births() != 0 || completion.worker_graph_allocation_extents() != 0
+            {
+                return None;
+            }
+            let controls = self
+                .include_eval_construction(traversal)?
                 .checked_add(ResidentDispatchPopulation::completion_stream_control_bytes())?;
             self.add(source.extents)?;
             self.add(dispatch.parallel_graph_extents)?;
             self.add(completion.graph_allocation_extents())?;
             self.add(completion.signal_graph_allocation_extents())?;
-            let parts=[controls,source.controls,completion.control_bytes()?,
-                size_of::<super::super::cpu::CpuPopulation>(),size_of::<safemlx::CpuCopyEvalLayout>(),
-                size_of::<Option<safemlx::CpuCopyEvalLayout>>(),size_of::<safemlx::OperationEvalTraversalLimits>()];
-            self.query_controls=self.query_controls.max(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)?);
+            let parts = [
+                controls,
+                source.controls,
+                completion.control_bytes()?,
+                size_of::<super::super::cpu::CpuPopulation>(),
+                size_of::<safemlx::CpuCopyEvalLayout>(),
+                size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
+                size_of::<safemlx::OperationEvalTraversalLimits>(),
+            ];
+            self.query_controls = self.query_controls.max(
+                parts
+                    .into_iter()
+                    .try_fold(size_of_val(&parts), usize::checked_add)?,
+            );
             return Some(());
         }
-        let mut controls = self.include_eval_construction(traversal)?
+        let controls = self
+            .include_eval_construction(traversal)?
             .checked_add(ResidentDispatchPopulation::completion_stream_control_bytes())?;
+        self.include_non_cpu_dispatch(dispatch, controls)
+    }
+    /// Same selected GPU prologue, worker, encoder and optional CPU router bank.
+    /// Ring dispatch extents come from its retained communication source.
+    /// Eval containers and frontend constructors retain their own sources.
+    pub(super) fn include_ordinary_metal_dispatch(
+        &mut self,
+        dispatch: ResidentDispatchPopulation,
+    ) -> Option<()> {
+        if dispatch.cpu_model.is_some()
+            || dispatch.gpu_entries == 0
+            || dispatch.completion_streams()? != 1 + usize::from(dispatch.cpu_entries != 0)
+        {
+            return None;
+        }
+        self.include_non_cpu_dispatch(
+            dispatch,
+            ResidentDispatchPopulation::completion_stream_control_bytes(),
+        )
+    }
+    fn include_non_cpu_dispatch(
+        &mut self,
+        dispatch: ResidentDispatchPopulation,
+        mut controls: usize,
+    ) -> Option<()> {
         let mut prologue = 0usize;
         if dispatch.gpu_entries != 0 {
             // Original traversal authentication forbids tracing/export. The
@@ -564,7 +834,9 @@ impl ResidentGraphStorage {
             }
             controls = controls.checked_add(layout.control_bytes()?)?;
         }
-        let router_entries=dispatch.cpu_entries.checked_sub(dispatch.parallel_entries)?;
+        let router_entries = dispatch
+            .cpu_entries
+            .checked_sub(dispatch.parallel_entries)?;
         if router_entries != 0 {
             // This profile has only rank-two, one-input/no-sibling CPU
             // ArgPartition. Its owning bank includes outputs(), task weak
@@ -575,11 +847,8 @@ impl ResidentGraphStorage {
                 return None;
             }
             let layout = OperationEvent::cpu_argpartition_layout(false)?;
-            prologue = prologue.checked_add(
-                layout
-                    .allocation_extents()
-                    .checked_mul(router_entries)?,
-            )?;
+            prologue =
+                prologue.checked_add(layout.allocation_extents().checked_mul(router_entries)?)?;
             controls = controls.checked_add(layout.control_bytes()?)?;
         }
         // Worker fields exclude every bank above. Their own typed producer
@@ -616,9 +885,14 @@ impl ResidentNativeRecipe {
             ));
         }
         let mut fit = self.graph_storage_requirement_with_preparation(0)?;
-        fit.query_controls = fit.query_controls.checked_add(
-            std::mem::size_of::<&eredu_runtime::input::OriginalPreparedWorkspaceSource>(),
-        ).ok_or(crate::backend::error::Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        fit.query_controls = fit
+            .query_controls
+            .checked_add(std::mem::size_of::<
+                &eredu_runtime::input::OriginalPreparedWorkspaceSource,
+            >())
+            .ok_or(crate::backend::error::Error::PrefillControl(
+                WorkingMemoryError::Overflow,
+            ))?;
         Ok(fit)
     }
     pub(crate) fn resume_graph_storage_requirement(
@@ -652,9 +926,12 @@ impl ResidentNativeRecipe {
         required
             .add(preparation_graph_extents)
             .ok_or_else(overflow)?;
-        let root_capacity = records.iter().try_fold(0usize, |maximum, row| {
-            row.traversal.map(|layout| maximum.max(layout.roots()))
-        }).ok_or_else(unknown)?;
+        let root_capacity = records
+            .iter()
+            .try_fold(0usize, |maximum, row| {
+                row.traversal.map(|layout| maximum.max(layout.roots()))
+            })
+            .ok_or_else(unknown)?;
         let roots = safemlx::PrefillRoots::layout(root_capacity).map_err(|_| unknown())?;
         required.query_controls = roots.control_bytes;
         let mut complete = !records.is_empty() || self.is_terminal_resume();
@@ -684,8 +961,13 @@ impl ResidentNativeRecipe {
                 None => complete = false,
             }
             if let Some(copies) = self.host_copies {
-                required.include_source_copies(copies, self.host_transfers.ok_or_else(unknown)?,
-                    row.dispatch.ok_or_else(unknown)?).ok_or_else(unknown)?;
+                required
+                    .include_source_copies(
+                        copies,
+                        self.host_transfers.ok_or_else(unknown)?,
+                        row.dispatch.ok_or_else(unknown)?,
+                    )
+                    .ok_or_else(unknown)?;
             }
             complete &= row.unqualified_kernel_owner.is_none();
         }
@@ -695,11 +977,18 @@ impl ResidentNativeRecipe {
     }
 }
 
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod prediction_tests {
     use super::*;
     use eredu_nn::Tensor;
-    use eredu_nn::workspace::{WorkspaceContext, WorkspaceTensor, WorkspaceDtype, WorkspaceLayout, WorkspaceOperationKind};
+    use eredu_nn::workspace::{
+        WorkspaceContext, WorkspaceDtype, WorkspaceLayout, WorkspaceOperationKind, WorkspaceTensor,
+    };
 
     #[test]
     fn prediction_completion_root_distribution_prices_graph_and_record_frontiers() {
@@ -707,26 +996,46 @@ mod prediction_tests {
         let context = WorkspaceContext::new(mechanism);
         let source = WorkspaceTensor::unloaded_f32(&[1, 5], &context).unwrap();
         context.begin_span();
-        let output = context.execute(
-            WorkspaceOperationKind::Elementwise("capture_cast_f32"), &[&source],
-            vec![WorkspaceLayout::new(&[1, 5], WorkspaceDtype::Float32).unwrap()],
-        ).unwrap().remove(0);
+        let output = context
+            .execute(
+                WorkspaceOperationKind::Elementwise("capture_cast_f32"),
+                &[&source],
+                vec![WorkspaceLayout::new(&[1, 5], WorkspaceDtype::Float32).unwrap()],
+            )
+            .unwrap()
+            .remove(0);
         let mut completion = original_component_tests::OriginalComponentTestPlan::from_report(
             context.report(&[output]).unwrap(),
-        ).completion;
+        )
+        .completion;
         let graph = |roots: NestedCompletionRoots<'_>| {
             let mut value = ResidentGraphStorage::default();
-            value.include_dag(completion.traversal, completion.graph,
-                completion.dispatch.unwrap(), roots, 0).unwrap();
+            value
+                .include_dag(
+                    completion.traversal,
+                    completion.graph,
+                    completion.dispatch.unwrap(),
+                    roots,
+                    0,
+                )
+                .unwrap();
             value.known_constructor_bytes
         };
         let old_fixed = graph(NestedCompletionRoots::uniform(2, 3));
         let actual = graph(NestedCompletionRoots {
-            fixed_attempts: 0, fixed_roots: 3, additional: &[1, 17],
+            fixed_attempts: 0,
+            fixed_roots: 3,
+            additional: &[1, 17],
         });
         let padded = graph(NestedCompletionRoots::uniform(2, 17));
-        assert!(actual > old_fixed, "the second native root list must be funded");
-        assert!(actual < padded, "the short first list must retain its actual population");
+        assert!(
+            actual > old_fixed,
+            "the second native root list must be funded"
+        );
+        assert!(
+            actual < padded,
+            "the short first list must retain its actual population"
+        );
 
         completion.nested_completions = 2;
         completion.nested_root_capacity = 3;
@@ -740,7 +1049,9 @@ mod prediction_tests {
 }
 
 impl ResidentSamplingProgram {
-    pub(crate) fn graph_storage_requirement(&self) -> Result<ResidentGraphStorage, crate::backend::error::Error> {
+    pub(crate) fn graph_storage_requirement(
+        &self,
+    ) -> Result<ResidentGraphStorage, crate::backend::error::Error> {
         let mut required = ResidentGraphStorage::default();
         let complete = required.include_sampling(self.rows())?;
         required.finish_capacity(complete)?;

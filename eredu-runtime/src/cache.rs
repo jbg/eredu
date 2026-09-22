@@ -16,6 +16,9 @@ pub use visible::{
 mod scan;
 pub use scan::{PagedScanError, PagedScanMechanisms, PagedScanPlan};
 
+mod truncate;
+pub use truncate::{PagedTruncateError, PagedTruncateMechanisms, PagedTruncatePlan};
+
 mod append;
 pub use append::{
     PagedAppendError, PagedAppendMechanisms, PagedAppendPlan, PagedAppendStep, PagedAppendSteps,
@@ -41,6 +44,7 @@ mod executor;
 mod lifecycle;
 mod persistence;
 mod policy;
+pub(crate) mod prompt_source;
 mod source;
 mod storage;
 mod telemetry;
@@ -61,13 +65,18 @@ pub use lifecycle::{
 };
 pub use persistence::{
     CacheShardError, CacheShardLayout, CacheShardMetadata, CacheShardTensor,
-    LiveCacheBlockPublication, LiveCacheBlockSource, LiveCachePublicationError,
-    LiveCacheReadFailure, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
-    PROMPT_CACHE_GENERATIONS_DIRECTORY, PreparedLiveCacheRead, PromptCachePersistenceError,
+    DEFAULT_PROMPT_CACHE_MANIFEST_BYTE_LIMIT, LiveCacheBlockPublication, LiveCacheBlockSource,
+    LiveCachePublicationError, LiveCacheReadFailure, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+    PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_DEPENDENCY_BASIS, PROMPT_CACHE_DEPENDENCY_SOURCE,
+    PROMPT_CACHE_GENERATIONS_DIRECTORY, PersistentCacheBlockSource, PersistentCacheReadFailure,
+    PersistentCacheStateTensor, PreparedLiveCacheRead, PreparedPersistentCacheRead,
+    PreparedPromptCachePublication, PreparedReversiblePromptCachePublication,
+    PromptCachePersistenceError, PromptCachePersistenceFailure, PromptCachePersistenceFunding,
     PromptCachePublication, ReversiblePromptCachePublication, cache_shard_tensor_names,
-    finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
-    prompt_cache_rank_path, resolve_prompt_cache_root, safe_prompt_cache_shard_path,
-    validate_prompt_cache_manifest,
+    finalize_prompt_cache_shard, hash_prompt_cache_shard_payload,
+    hash_prompt_cache_shard_payload_from_funded, inspect_prompt_cache, inspect_prompt_cache_funded,
+    prompt_cache_rank_path, read_shard_metadata_from_funded, resolve_prompt_cache_root,
+    safe_prompt_cache_shard_path, validate_prompt_cache_manifest,
 };
 pub use policy::{
     CacheResidencyConfigurationError, CacheResidencyPolicy, LiveCacheDiskPolicy, PagedCacheOptions,

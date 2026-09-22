@@ -1,9 +1,8 @@
 //! Closed isolated-copy demand associated with already registered source roots.
 
 use super::{
-    InferenceExecutionIdentity, RegisteredWorkspaceStorage, WorkingMemoryError,
-    WorkingMemoryFundingRun, WorkingMemoryFundingScope, WorkingMemoryPool,
-    residual::RegisteredStoragePin,
+    InferenceExecutionIdentity, MemoryLedger, RegisteredWorkspaceStorage, WorkingMemoryError,
+    WorkingMemoryFundingRun, WorkingMemoryFundingScope, residual::RegisteredStoragePin,
 };
 use eredu_nn::workspace::{WorkspaceIsolatedCopyPlan, WorkspaceTraceReport};
 
@@ -12,8 +11,9 @@ pub(in crate::working_memory) mod completed;
 mod numerical;
 pub use account::WorkspaceCopyAccountLayout;
 pub use completed::{
-    CompletedWorkspaceSourceAccount, CompletedWorkspaceSourceLayout, CompletedWorkspaceStorage, CompletedWorkspaceStorageLayout,
-    OriginalCompletedWorkspaceCopy, OriginalCompletedWorkspaceSource,
+    CompletedWorkspaceSourceAccount, CompletedWorkspaceSourceLayout, CompletedWorkspaceStorage,
+    CompletedWorkspaceStorageLayout, OriginalCompletedWorkspaceCopy,
+    OriginalCompletedWorkspaceSource,
 };
 pub use numerical::OriginalNumericalWorkspaceCopy;
 
@@ -25,7 +25,7 @@ pub use numerical::OriginalNumericalWorkspaceCopy;
 pub struct RegisteredWorkspaceCopy<K: Ord + Send + 'static> {
     plan: WorkspaceIsolatedCopyPlan,
     source: RegisteredWorkspaceStorage<K>,
-    bytes: u64,
+    requirements: eredu_core::DomainMemoryRequirements,
 }
 
 impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
@@ -43,13 +43,14 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        let bytes = plan
-            .incremental_bytes()
-            .ok_or(WorkingMemoryError::UnknownBound)?;
+        let requirements = plan
+            .incremental_requirements()
+            .ok_or(WorkingMemoryError::UnknownBound)?
+            .clone();
         Ok(Self {
             plan,
             source,
-            bytes,
+            requirements,
         })
     }
 
@@ -63,8 +64,11 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
         &self.source
     }
 
-    pub(super) fn incremental_bytes(&self) -> u64 {
-        self.bytes
+    pub(super) fn incremental_requirements(&self) -> &eredu_core::DomainMemoryRequirements {
+        &self.requirements
+    }
+    pub(super) fn incremental_bytes(&self) -> Option<u64> {
+        diagnostic_bytes(&self.requirements)
     }
 }
 
@@ -92,7 +96,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredPreparedWorkspaceCopy<K> 
     ) -> Result<Self, WorkspaceCopyAdmissionError> {
         let (registered, source) = source.into_copy_parts();
         if registered.registration().source_preparation().is_none()
-            || !registered.pool().same_domain(source.pool())
+            || !registered.pool().same_ledger(source.pool())
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
@@ -112,7 +116,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredPreparedWorkspaceCopy<K> 
                 RegisteredWorkspaceCopy<K>,
                 crate::input::OriginalPreparedWorkspaceSource,
             )>(),
-            size_of::<(&WorkingMemoryPool, WorkspaceCopyLimits)>(),
+            size_of::<(&MemoryLedger, WorkspaceCopyLimits)>(),
         ];
         parts
             .into_iter()
@@ -121,24 +125,27 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredPreparedWorkspaceCopy<K> 
 }
 
 /// Capacity policy for one independently funded isolated-copy operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceCopyLimits {
-    /// Ceiling on the complete shared domain, including sources and all other
-    /// accounts. This never raises a tighter existing descendant ceiling.
-    pub capacity_bytes: u64,
-    /// Optional limit on this copy's incremental demand plus safety reserve.
-    pub application_memory_budget_bytes: Option<u64>,
-    /// Conservative additional charge retained with destination custody.
-    pub safety_reserve_bytes: u64,
+    /// Total live-charge limits in each physical domain, including sources and
+    /// all other accounts. Tighter existing constraints remain effective.
+    pub memory_limits: eredu_core::MemoryLimitDeclarations,
+    /// Additional domain-attributed charge retained with destination custody.
+    pub additional_headroom: eredu_core::MemoryHeadroomDeclarations,
+    /// Exact additional host metadata retained by the selected copy mechanism.
+    pub additional_host_metadata_bytes: u64,
+    /// Additional placed allowances certified by the selected copy mechanism.
+    pub additional_requirements: Option<std::sync::Arc<eredu_core::DomainMemoryRequirements>>,
 }
 
 impl WorkspaceCopyLimits {
-    /// Selects a domain ceiling without an additional application limit/reserve.
-    pub const fn new(capacity_bytes: u64) -> Self {
+    /// Selects domain limits without additional headroom.
+    pub const fn new(memory_limits: eredu_core::MemoryLimitDeclarations) -> Self {
         Self {
-            capacity_bytes,
-            application_memory_budget_bytes: None,
-            safety_reserve_bytes: 0,
+            memory_limits,
+            additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
+            additional_host_metadata_bytes: 0,
+            additional_requirements: None,
         }
     }
 }
@@ -149,14 +156,6 @@ pub enum WorkspaceCopyAdmissionError {
     /// Missing numerical facts, mismatched source custody or shared accounting.
     #[error("{0}")]
     Memory(#[from] WorkingMemoryError),
-    /// Complete copy demand and safety exceed its application allowance.
-    #[error("workspace copy needs {required_bytes} bytes; application limit is {budget_bytes}")]
-    ApplicationBudgetExceeded {
-        /// Incremental closed-program demand plus safety reserve.
-        required_bytes: u64,
-        /// Explicit per-copy application allowance.
-        budget_bytes: u64,
-    },
 }
 
 /// One admitted copy with exactly one work scope. Dropping it uncertified
@@ -173,7 +172,7 @@ pub struct AdmittedWorkspaceCopy {
 impl AdmittedWorkspaceCopy {
     pub(super) fn from_account(
         execution: InferenceExecutionIdentity,
-        bytes: u64,
+        requirements: eredu_core::DomainMemoryRequirements,
         funding: WorkingMemoryFundingRun,
         scope: WorkingMemoryFundingScope,
     ) -> Self {
@@ -181,7 +180,7 @@ impl AdmittedWorkspaceCopy {
             scope,
             custody: WorkspaceCopyCustody {
                 retention: WorkspaceCopyRetention(Some(std::sync::Arc::new(CopyAccount {
-                    bytes,
+                    requirements,
                     execution,
                     funding,
                 }))),
@@ -189,10 +188,9 @@ impl AdmittedWorkspaceCopy {
         }
     }
 
-    /// Complete admitted operation demand plus the requested safety reserve.
-    /// An aggregate sampling copy also includes its protected host component.
-    pub fn bytes(&self) -> u64 {
-        self.custody.bytes()
+    /// Complete domain-attributed charge retained by this operation.
+    pub fn requirements(&self) -> &eredu_core::DomainMemoryRequirements {
+        self.custody.requirements()
     }
 
     /// Transfers the single work scope into native completion/recovery and
@@ -216,7 +214,7 @@ pub struct WorkspaceCopyCustody {
 
 #[derive(Debug)]
 struct CopyAccount {
-    bytes: u64,
+    requirements: eredu_core::DomainMemoryRequirements,
     // This same identity is cloned by sampler/table host owners. Each closed
     // clone retains its preparation until the final strong/ledger Weak dies.
     execution: InferenceExecutionIdentity,
@@ -247,9 +245,12 @@ impl WorkspaceCopyRetention {
     /// Check this admitted copy's exact managed pool without granting source
     /// credit or certifying completion. Native published-source owners must
     /// independently authenticate their actual allocation and completed stream.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.account().funding.pool().same_domain(pool) { Ok(()) }
-        else { Err(WorkingMemoryError::IdentityMismatch) }
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.account().funding.pool().same_ledger(pool) {
+            Ok(())
+        } else {
+            Err(WorkingMemoryError::IdentityMismatch)
+        }
     }
     fn account(&self) -> &CopyAccount {
         self.0.as_deref().expect("live copy retention")
@@ -289,24 +290,24 @@ impl WorkspaceCopyCustody {
     }
 
     /// The exact managed domain of this destination account.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    pub fn pool(&self) -> &MemoryLedger {
         self.retention.account().funding.pool()
     }
 
-    /// Original incremental demand plus safety, not current remaining balance.
-    pub fn bytes(&self) -> u64 {
-        self.retention.account().bytes
+    /// Complete domain-attributed charge retained by this operation.
+    pub fn requirements(&self) -> &eredu_core::DomainMemoryRequirements {
+        &self.retention.account().requirements
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Admits a closed isolated-copy program against its registered sources.
     /// Source-origin health and destination capacity are validated atomically.
     /// This performs no native copying, evaluation, completion or publication.
     ///
-    /// The numerical boundary is the workspace contract: tensor storage and
-    /// operation-owned host workspace. Runtime bookkeeping and unrelated host
-    /// snapshot/controller/decoder payloads are not covered by this component.
+    /// The domain charge covers tensor storage, operation-owned host workspace,
+    /// and the account, report and source-pin controls. Unrelated host snapshot,
+    /// controller and decoder payloads require their own attributed producer.
     /// Native callers must execute exactly the prepared slots under their own
     /// checked source binding and retain every partial result through recovery.
     pub fn admit_workspace_copy<K: Clone + Ord + Send + Sync + 'static>(
@@ -331,13 +332,22 @@ impl WorkingMemoryPool {
         prepared: Option<crate::input::OriginalPreparedWorkspaceSource>,
         limits: WorkspaceCopyLimits,
     ) -> Result<AdmittedWorkspaceCopy, WorkspaceCopyAdmissionError> {
-        if !self.same_domain(copy.source.pool()) {
+        if !self.same_ledger(copy.source.pool()) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        let bytes = copy_requirement(copy.bytes, limits)?;
-        // Metadata and erased pin construction happen before accounting locks.
-        // The public caller cannot use this identity to fabricate source proof.
-        let execution = match copy.source.registration().source_preparation() {
+        let preparation = copy.source.registration().source_preparation();
+        let direct_controls = workspace_controls::<K>(preparation.is_some(), prepared.is_some())?;
+        let accepted = prepare_copy_account(
+            self,
+            &self.construction_identity(),
+            copy.incremental_requirements(),
+            0,
+            &limits,
+            direct_controls,
+            super::funding::CopyHostHolds::None,
+            |usage| copy.source.registration().validate_copy_source(self, usage),
+        )?;
+        let execution = match preparation {
             Some(preparation) => WorkspaceCopyAccountLayout::workspace()?.execution(preparation),
             None => InferenceExecutionIdentity::default(),
         };
@@ -349,35 +359,146 @@ impl WorkingMemoryPool {
             ),
             None => pin,
         };
-        let (funding, scope) = self.open_workspace_copy_account(
-            copy.source.registration(),
-            pin,
-            &execution,
-            bytes,
-            limits.capacity_bytes,
-        )?;
+        let (requirements, funding, scope) = accepted.workspace(&execution, Some(pin))?;
         Ok(AdmittedWorkspaceCopy::from_account(
-            execution, bytes, funding, scope,
+            execution,
+            requirements,
+            funding,
+            scope,
         ))
     }
 }
 
-fn copy_requirement(
-    bytes: u64,
-    limits: WorkspaceCopyLimits,
-) -> Result<u64, WorkspaceCopyAdmissionError> {
-    let bytes = bytes
-        .checked_add(limits.safety_reserve_bytes)
-        .ok_or(WorkingMemoryError::Overflow)?;
-    if let Some(budget_bytes) = limits.application_memory_budget_bytes {
-        if bytes > budget_bytes {
-            return Err(WorkspaceCopyAdmissionError::ApplicationBudgetExceeded {
-                required_bytes: bytes,
-                budget_bytes,
-            });
-        }
+fn workspace_controls<K: Ord + Send + Sync + 'static>(
+    prepared: bool,
+    attached: bool,
+) -> Result<usize, WorkingMemoryError> {
+    if prepared {
+        return Ok(0);
     }
-    Ok(bytes)
+    WorkspaceCopyAccountLayout::workspace()?
+        .requested_bytes()
+        .checked_add(RegisteredStoragePin::single_control_bytes::<K>(false)?)
+        .and_then(|n| {
+            n.checked_add(if attached {
+                RegisteredStoragePin::pair_control_bytes(true).ok()?
+            } else {
+                0
+            })
+        })
+        .ok_or(WorkingMemoryError::Overflow)
+}
+impl MemoryLedger {
+    /// Quotes this source-qualified copy's entire incremental domain charge,
+    /// including its account and pin construction. This grants no allocation authority.
+    pub fn workspace_copy_requirements<K: Clone + Ord + Send + Sync + 'static>(
+        &self,
+        copy: &RegisteredWorkspaceCopy<K>,
+        limits: &WorkspaceCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        if !self.same_ledger(copy.source.pool()) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let controls =
+            workspace_controls::<K>(copy.source.registration().has_source_preparation(), false)?;
+        with_copy_projection(
+            self,
+            copy.incremental_requirements(),
+            0,
+            limits,
+            controls,
+            |mut projection, controls| {
+                projection.host_bytes = projection
+                    .host_bytes
+                    .checked_add(controls)
+                    .ok_or(WorkingMemoryError::Overflow)?;
+                projection.materialize(self.topology())
+            },
+        )
+    }
+}
+
+pub(super) fn prepare_copy_account(
+    pool: &MemoryLedger,
+    execution: &InferenceExecutionIdentity,
+    native: &eredu_core::DomainMemoryRequirements,
+    host_bytes: u64,
+    limits: &WorkspaceCopyLimits,
+    direct_controls: usize,
+    holds: super::funding::CopyHostHolds,
+    validate: impl FnOnce(&super::Usage) -> Result<(), WorkingMemoryError>,
+) -> Result<super::funding::PreparedCopyAccount, WorkingMemoryError> {
+    with_copy_projection(
+        pool,
+        native,
+        host_bytes,
+        limits,
+        direct_controls,
+        |projection, controls| {
+            super::funding::PreparedCopyAccount::accept(
+                pool,
+                execution,
+                projection,
+                &limits.memory_limits,
+                controls,
+                holds,
+                validate,
+            )
+        },
+    )
+}
+
+pub(super) fn with_copy_projection<T>(
+    pool: &MemoryLedger,
+    native: &eredu_core::DomainMemoryRequirements,
+    host_bytes: u64,
+    limits: &WorkspaceCopyLimits,
+    direct_controls: usize,
+    use_projection: impl FnOnce(
+        super::transaction_buffers::RequirementProjection<'_>,
+        u64,
+    ) -> Result<T, WorkingMemoryError>,
+) -> Result<T, WorkingMemoryError> {
+    let parts = [
+        native,
+        limits.additional_requirements.as_deref().unwrap_or(native),
+    ];
+    let parts = &parts[..if limits.additional_requirements.is_some() {
+        2
+    } else {
+        1
+    }];
+    let additional_metadata = limits
+        .additional_requirements
+        .as_ref()
+        .map(|additional| {
+            additional
+                .backing_bytes()?
+                .checked_add(super::qualified_storage::shared_bytes::<
+                    eredu_core::DomainMemoryRequirements,
+                >()?)
+                .ok_or(WorkingMemoryError::Overflow)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let projection = super::transaction_buffers::RequirementProjection {
+        parts,
+        headroom: &limits.additional_headroom,
+        host_bytes: host_bytes
+            .checked_add(limits.additional_host_metadata_bytes)
+            .and_then(|n| n.checked_add(additional_metadata))
+            .ok_or(WorkingMemoryError::Overflow)?,
+    };
+    let controls = super::funding::copy_domain_controls(pool, &projection)?
+        .checked_add(u64::try_from(direct_controls).map_err(|_| WorkingMemoryError::Overflow)?)
+        .ok_or(WorkingMemoryError::Overflow)?;
+    use_projection(projection, controls)
+}
+
+fn diagnostic_bytes(requirements: &eredu_core::DomainMemoryRequirements) -> Option<u64> {
+    requirements.iter().try_fold(0_u64, |sum, (_, charge)| {
+        sum.checked_add(charge.total().ok()?)
+    })
 }
 
 #[cfg(test)]

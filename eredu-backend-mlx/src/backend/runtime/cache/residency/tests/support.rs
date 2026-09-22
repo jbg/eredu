@@ -63,6 +63,7 @@ fn missing_location_data(root: &Path, name: &str) -> DiskLocationData {
         payload_sha256: None,
         payload_verification: Arc::new(OnceLock::new()),
         live_source: None,
+        persistent_source: None,
     }
 }
 

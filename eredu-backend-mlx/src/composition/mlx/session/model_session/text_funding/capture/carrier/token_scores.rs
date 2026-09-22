@@ -1,7 +1,7 @@
 //! Same terminal source carrier and scalar worker, with no replacement scope.
 use super::*;
-use eredu_core::capture::CaptureTokenDomain;
 use crate::backend::array_copy::TokenScoreProgram;
+use eredu_core::capture::CaptureTokenDomain;
 use eredu_runtime::working_memory::{CaptureTokenScoreClaim, ClaimedCaptureTokenScores};
 impl FundedWork {
     pub(in crate::composition::mlx::session::model_session::text_funding) fn capture_prefill_token_scores(

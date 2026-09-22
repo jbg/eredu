@@ -1,0 +1,124 @@
+diff --git a/mlx/allocator.h b/mlx/allocator.h
+--- a/mlx/allocator.h
++++ b/mlx/allocator.h
+@@ -45,6 +45,7 @@
+   uint64_t generation;
+   size_t capacity;
+   size_t host_controls;
++  bool retain_in_cache{true};
+   MemoryPlacement placement;
+   AllocationOwners owners;
+   void* pointer{nullptr};
+diff --git a/mlx/backend/common/buffer_cache.h b/mlx/backend/common/buffer_cache.h
+--- a/mlx/backend/common/buffer_cache.h
++++ b/mlx/backend/common/buffer_cache.h
+@@ -35,9 +35,16 @@
+   allocator::Buffer reuse_from_cache(size_t size) {
+     return reuse_from_cache(size, [](T*) { return true; });
+   }
+-  void recycle_to_cache(allocator::Buffer buffer) noexcept {
++  bool recycle_to_cache(allocator::Buffer buffer) noexcept {
+     auto* root = buffer.physical_backing();
+     assert(root && root->pointer == buffer.ptr());
++    // A temporary source keeps its charge through the last physical alias,
++    // then retires this root instead of extending custody through the cache.
++    if (!root->retain_in_cache) {
++      free_(static_cast<T*>(root->pointer));
++      allocator::destroy_physical_backing(root);
++      return false;
++    }
+     auto bytes = get_size_(static_cast<T*>(root->pointer));
+     if (bytes > SIZE_MAX - pool_size_) std::terminate();
+     root->cache_previous = nullptr;
+@@ -45,6 +52,7 @@
+     if (head_) head_->cache_previous = root; else tail_ = root;
+     head_ = root;
+     pool_size_ += bytes;
++    return true;
+   }
+   int release_cached_buffers(size_t minimum) {
+     int count = 0;
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -263,7 +263,7 @@
+   std::unique_lock lk(mutex_);
+   active_memory_ -= buf->length();
+   if (buffer.physical_backing() && get_cache_memory() <= max_pool_size_ && buf->length() <= max_pool_size_ - get_cache_memory()) {
+-    buffer_cache_.recycle_to_cache(buffer);
++    if (!buffer_cache_.recycle_to_cache(buffer)) --num_resources_;
+   } else {
+     num_resources_--;
+     if (!buf->heap()) {
+diff --git a/mlx/physical_backing.cpp b/mlx/physical_backing.cpp
+--- a/mlx/physical_backing.cpp
++++ b/mlx/physical_backing.cpp
+@@ -50,7 +50,10 @@
+   if (selected && !selected(selected_context, identity, capacity, controls, placement, &payload, &release, &publish))
+     throw PhysicalBackingAdmissionError(payload, release);
+   PhysicalBacking* root = nullptr;
+-  try { root = new PhysicalBacking(identity, capacity, controls, placement); }
++  try {
++    root = new PhysicalBacking(identity, capacity, controls, placement);
++    root->retain_in_cache = scoped.retain_in_cache;
++  }
+   catch (...) { if (release) release(payload); throw; }
+   root->observation = payload;
+   root->release_observation = release;
+diff --git a/mlx/physical_funding.h b/mlx/physical_funding.h
+--- a/mlx/physical_funding.h
++++ b/mlx/physical_funding.h
+@@ -23,6 +23,7 @@
+ struct PhysicalFundingObserver {
+   void* context{nullptr};
+   allocator::PhysicalBackingObserver callback{nullptr};
++  bool retain_in_cache{true};
+ };
+ MLX_API PhysicalFundingObserver current_physical_observer() noexcept;
+ class MLX_API PhysicalFundingWorkerGuard final {
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -252,19 +252,20 @@
+ }
+ 
+ bool Scope::bind_physical_observer(void* context, allocator::PhysicalBackingObserver callback,
+-    void (*release)(void*)) noexcept {
++    void (*release)(void*), bool retain_in_cache) noexcept {
+   if (!context || !callback || !release || active_scope != this || !active_ ||
+       !on_owner_thread() || original_required_ || physical_callback_ ||
+       native_construction_started_ || activity_.load(std::memory_order_acquire) ||
+       pending_records_.load(std::memory_order_acquire)) return false;
+   physical_context_ = context;
+   physical_callback_ = callback;
++  physical_retain_in_cache_ = retain_in_cache;
+   physical_release_ = release;
+   return true;
+ }
+ PhysicalFundingObserver Scope::physical_observer() const noexcept {
+   for (auto* scope = this; scope; scope = scope->parent_) {
+-    if (scope->physical_callback_) return {scope->physical_context_, scope->physical_callback_};
++    if (scope->physical_callback_) return {scope->physical_context_, scope->physical_callback_, scope->physical_retain_in_cache_};
+   }
+   return {};
+ }
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -104,7 +104,7 @@
+ 
+   // Configure once on the empty current ordinary scope. Owner release follows
+   // destruction of the native Scope, and precedes its enclosing retirement.
+-  bool bind_physical_observer(void*, allocator::PhysicalBackingObserver, void (*)(void*)) noexcept;
++  bool bind_physical_observer(void*, allocator::PhysicalBackingObserver, void (*)(void*), bool = true) noexcept;
+   PhysicalFundingObserver physical_observer() const noexcept;
+   uint64_t identity() const noexcept { return identity_; }
+   ScopedProgress progress_scoped() noexcept;
+@@ -165,6 +165,7 @@
+   allocator::OriginalBufferBudget* required_buffer_origin_{nullptr};
+   void* physical_context_{nullptr};
+   allocator::PhysicalBackingObserver physical_callback_{nullptr};
++  bool physical_retain_in_cache_{true};
+   void (*physical_release_)(void*){nullptr};
+   void* retained_owner_{nullptr};
+   void (*retire_owner_)(void*){nullptr};

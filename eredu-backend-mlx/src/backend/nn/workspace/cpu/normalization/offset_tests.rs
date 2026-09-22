@@ -89,14 +89,13 @@ fn offset_rms_quotes_mixed_precisions_and_retains_unknown_representation_refusal
                 );
                 let mut layouts = operation.inputs.iter().collect::<Vec<_>>();
                 layouts[0] = layouts[0].with_representation(None);
-                assert!(
-                    cpu.plan(WorkspaceOperationView {
+                assert!(cpu
+                    .plan(WorkspaceOperationView {
                         inputs: WorkspaceLayoutList::Views(&layouts),
                         ..operation
                     })
                     .unwrap()
-                    .is_none()
-                );
+                    .is_none());
             }
         }
     }
@@ -134,12 +133,15 @@ fn rounded(value: f32, dtype: WorkspaceFloatingType) -> f32 {
 
 #[test]
 fn offset_rms_admitted_cpu_execution_matches_independent_arithmetic_and_retires_owners() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     use crate::{
-        MlxTensor,
         backend::{
-            MlxBackend, MlxDeviceIdentity, managed_memory::gpu_stream::PreparedExecutionStreams,
-            nn::shared::MlxNeuralBackend,
+            managed_memory::gpu_stream::PreparedExecutionStreams, nn::shared::MlxNeuralBackend,
+            MlxBackend, MlxDeviceIdentity,
         },
+        MlxTensor,
     };
     use safemlx::{Device, DeviceType};
     let pool = crate::tests::support::test_utils::initialize_original_sources();

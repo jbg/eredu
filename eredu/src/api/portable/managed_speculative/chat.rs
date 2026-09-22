@@ -18,7 +18,7 @@ pub struct PreparedChatSpeculativeRequest<'a, P, D, F> {
     pub input: PreparedChatPrompt<'a, P>,
     /// Selected assistant, consumed by the shared speculative backend adapter.
     pub drafting: SpeculativeDraft<'a, D>,
-    /// Sampling/token controls, including the required managed-memory ceiling.
+    /// Sampling/token controls and physical-domain memory limits.
     pub settings: PreparedChatGenerationSettings,
     /// Semantic channels or explicitly permitted literal text, shared with ordinary generation.
     pub output_mode: crate::api::PreparedChatOutputMode,
@@ -104,7 +104,9 @@ impl PreparedChatSpeculativeError {
     /// Selected backend failure with the original retained source chain.
     pub fn backend_failure(&self) -> Option<&BackendFailure> {
         match &self.cause {
-            Cause::Backend(error) | Cause::Control(SpeculativeControlError::Backend(error)) => Some(error),
+            Cause::Backend(error) | Cause::Control(SpeculativeControlError::Backend(error)) => {
+                Some(error)
+            }
             Cause::Preparation(error) => error.backend_failure(),
             _ => None,
         }
@@ -157,7 +159,7 @@ impl<B: OriginalChatBackend + SpeculativeGenerationBackend> LoadedModel<B> {
                 input_funding: None,
             });
         }
-        self.validate_controlled_speculative_options(request.settings, &options)
+        self.validate_controlled_speculative_options(request.settings.clone(), &options)
             .map_err(|cause| PreparedChatSpeculativeError {
                 cause,
                 funding: None,
@@ -327,7 +329,7 @@ impl<B: OriginalChatBackend + SpeculativeGenerationBackend> LoadedModel<B> {
         let invocation = self.prepare_chat_invocation(
             chat,
             input,
-            settings,
+            settings.clone(),
             event_window,
             caller_stop_sequences,
             skip_special_tokens,
@@ -409,13 +411,11 @@ impl<B: OriginalChatBackend + SpeculativeGenerationBackend> LoadedModel<B> {
         let mut funding = None;
         let mut input_funding = None;
         let count = lanes.len();
-        let validation = lanes
-            .iter()
-            .try_for_each(|lane| {
-                self.validate_chat_invocation(lane.chat, &lane.input, lane.settings)
-                    .map(|_| ())
-                    .map_err(Cause::from)
-            });
+        let validation = lanes.iter().try_for_each(|lane| {
+            self.validate_chat_invocation(lane.chat, &lane.input, lane.settings.clone())
+                .map(|_| ())
+                .map_err(Cause::from)
+        });
         let result = self
             .prepare_speculative_batch(
                 drafting,

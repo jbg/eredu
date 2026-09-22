@@ -137,7 +137,11 @@ fn qwen_fixture_arrays(
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor MlxTensor,
+        ) {
             let name = metadata.id().to_string();
             let shape = parameter.as_array().shape().to_vec();
             let value = if name.ends_with("norm.weight") {
@@ -166,11 +170,13 @@ fn qwen_fixture_arrays(
     };
     architecture
         .static_modules()
-        .visit_parameters(&mut collector);
+        .visit_parameters(&mut collector)
+        .unwrap();
     for layer in 0..args.num_hidden_layers as usize {
         eredu_architectures::qwen::new_routed_block::<MlxNeuralBackend>(args, layer, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
     }
     collector.arrays
 }
@@ -339,56 +345,123 @@ fn write_qwen_gguf_fixture_with_banks(path: &Path, model_type: &str, packed_bank
     if packed_banks {
         let mut reference_banks = BTreeMap::<String, (Vec<i32>, Vec<f32>)>::new();
         for tensor in &mut specs {
-            if !tensor.name.ends_with("_exps.weight") { continue; }
-            let layer = tensor.name.split('.').nth(1).unwrap().parse::<usize>().unwrap();
-            let ty = if layer == 0 { GgmlType::Q8_0 } else { GgmlType::IQ4NL };
-            let [width, rows, groups] = tensor.dimensions.as_slice() else { panic!("expert bank geometry"); };
+            if !tensor.name.ends_with("_exps.weight") {
+                continue;
+            }
+            let layer = tensor
+                .name
+                .split('.')
+                .nth(1)
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let ty = if layer == 0 {
+                GgmlType::Q8_0
+            } else {
+                GgmlType::IQ4NL
+            };
+            let [width, rows, groups] = tensor.dimensions.as_slice() else {
+                panic!("expert bank geometry");
+            };
             let (width, rows, groups) = (*width as usize, *rows as usize, *groups as usize);
             assert_eq!(width % 32, 0);
             let down = tensor.name.contains("ffn_down_exps");
             let bank_rows = if down { rows } else { rows * 2 };
-            let row_start = if tensor.name.contains("ffn_up_exps") { rows } else { 0 };
-            let id = format!("model.layers.{layer}.mlp.experts.{}", if down { "down_proj" } else { "gate_up_proj" });
-            let (_, reference) = reference_banks.entry(id).or_insert_with(|| (
-                vec![groups as i32, bank_rows as i32, width as i32], vec![0.0; groups * bank_rows * width],
-            ));
+            let row_start = if tensor.name.contains("ffn_up_exps") {
+                rows
+            } else {
+                0
+            };
+            let id = format!(
+                "model.layers.{layer}.mlp.experts.{}",
+                if down { "down_proj" } else { "gate_up_proj" }
+            );
+            let (_, reference) = reference_banks.entry(id).or_insert_with(|| {
+                (
+                    vec![groups as i32, bank_rows as i32, width as i32],
+                    vec![0.0; groups * bank_rows * width],
+                )
+            });
             let phase = tensor.name.bytes().map(usize::from).sum::<usize>();
             let mut bytes = Vec::new();
-            let table = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
-            for group in 0..groups { for row in 0..rows { for block in 0..width / 32 {
-                let exponent = ((group + row + block) % 3) as i32 - if ty == GgmlType::Q8_0 { 8 } else { 11 };
-                let scale = 2.0f32.powi(exponent);
-                bytes.extend((((exponent + 15) as u16) << 10).to_le_bytes());
-                let code = |column: usize| group * 7 + row * 5 + block * 3 + column * 11 + phase;
-                if ty == GgmlType::Q8_0 {
-                    for column in 0..32 { bytes.push(((code(column) % 31) as i8 - 15) as u8); }
-                } else {
-                    for column in 0..16 { bytes.push((code(column) % 16) as u8 | ((code(column + 16) % 16) as u8) << 4); }
+            let table = [
+                -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+            ];
+            for group in 0..groups {
+                for row in 0..rows {
+                    for block in 0..width / 32 {
+                        let exponent = ((group + row + block) % 3) as i32
+                            - if ty == GgmlType::Q8_0 { 8 } else { 11 };
+                        let scale = 2.0f32.powi(exponent);
+                        bytes.extend((((exponent + 15) as u16) << 10).to_le_bytes());
+                        let code =
+                            |column: usize| group * 7 + row * 5 + block * 3 + column * 11 + phase;
+                        if ty == GgmlType::Q8_0 {
+                            for column in 0..32 {
+                                bytes.push(((code(column) % 31) as i8 - 15) as u8);
+                            }
+                        } else {
+                            for column in 0..16 {
+                                bytes.push(
+                                    (code(column) % 16) as u8
+                                        | ((code(column + 16) % 16) as u8) << 4,
+                                );
+                            }
+                        }
+                        for column in 0..32 {
+                            let scalar = if ty == GgmlType::Q8_0 {
+                                (code(column) % 31) as i32 - 15
+                            } else {
+                                table[code(column) % 16]
+                            };
+                            reference[(group * bank_rows + row_start + row) * width
+                                + block * 32
+                                + column] = scalar as f32 * scale;
+                        }
+                    }
                 }
-                for column in 0..32 {
-                    let scalar = if ty == GgmlType::Q8_0 { (code(column) % 31) as i32 - 15 } else { table[code(column) % 16] };
-                    reference[(group * bank_rows + row_start + row) * width + block * 32 + column] = scalar as f32 * scale;
-                }
-            }}}
+            }
             tensor.data = bytes;
             encodings.insert(tensor.name.clone(), ty);
         }
         assert_eq!(reference_banks.len(), 4);
         let reference_dir = path.parent().unwrap().join("independent-reference");
         std::fs::create_dir(&reference_dir).unwrap();
-        std::fs::write(reference_dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-        let reference_arrays: Vec<_> = arrays.iter().map(|(name, value)| {
-            (name.clone(), reference_banks.get(name).map_or_else(|| value.clone(), |(shape, values)| Array::from_slice(values, shape)))
-        }).collect();
-        Array::save_safetensors(reference_arrays.iter().map(|(name,value)| (name.as_str(),value)), None,
-            reference_dir.join("model.safetensors")).unwrap();
+        std::fs::write(
+            reference_dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let reference_arrays: Vec<_> = arrays
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    reference_banks.get(name).map_or_else(
+                        || value.clone(),
+                        |(shape, values)| Array::from_slice(values, shape),
+                    ),
+                )
+            })
+            .collect();
+        Array::save_safetensors(
+            reference_arrays
+                .iter()
+                .map(|(name, value)| (name.as_str(), value)),
+            None,
+            reference_dir.join("model.safetensors"),
+        )
+        .unwrap();
     }
     let tensors = specs
         .iter()
         .map(|tensor| TensorInput {
             name: &tensor.name,
             dimensions: &tensor.dimensions,
-            ggml_type: encodings.get(&tensor.name).copied().unwrap_or(GgmlType::F32),
+            ggml_type: encodings
+                .get(&tensor.name)
+                .copied()
+                .unwrap_or(GgmlType::F32),
             data: &tensor.data,
         })
         .collect::<Vec<_>>();

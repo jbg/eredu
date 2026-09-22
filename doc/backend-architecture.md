@@ -93,6 +93,410 @@ Native factories select the implementation for the generic facade.
 
 ## Memory contract
 
+Core's physical-domain descriptors distinguish location, accounting ownership,
+and backing allocation identity. `MemoryTopology` contains immutable domains and
+the backend-declared mapping of host and accelerator locations to those domains.
+Every topology has a distinct process-local identity; identically named domains
+in independent topologies are not interchangeable. Unified locations share one
+physical domain only when backend facts establish that physical sharing.
+
+`MemoryLimit` distinguishes `Finite(u64)` from `Unlimited`, including at
+`u64::MAX`. `MemoryLimits` resolves a complete vector, defaults unspecified domains
+to unlimited, and rejects unknown names, duplicate declarations, and foreign
+identities. Pointwise intersections describe the tightest configured and live
+constraints. Raising a finite limit to unlimited is a relaxation; a pure limit
+comparison grants no ceiling succession authority.
+
+`MemoryPlacement` describes fixed placement or a finite, source-labelled set of
+candidate domains. A candidate set reserves a conservative full-capacity allowance
+in each distinct physical domain. Locations mapping to one domain collapse;
+independent allocations do not. Candidate allowances retain their estimation
+basis and describe no measured residency. `validate_access` rejects a location
+outside that set but grants no native work authority.
+
+`DomainMemoryRequirements` separates accounted allocations, candidate-placement
+allowances, finite overhead estimates, and domain-specific headroom. It checks
+all arithmetic before changing a descriptor, including under unlimited limits.
+Descriptions expose their controlled backing capacities for host metadata
+quotation. Descriptor construction does not reserve or fund those capacities.
+Its capacity comparison consumes existing live requirements and an increment;
+it does not coordinate concurrent operations or register storage.
+
+`SharedStorageAccountingId` identifies an attachment's accounting owner rather
+than physical placement. Shared immutable backing carries one attachment for
+each accounting identity. `same_ledger` compares runtime accounting-owner
+identity and does not infer physical sharing. Allocation identities continue to
+establish backing sharing independently of these identities and diagnostic names.
+
+Shared host attachments use one ordered-map node per accounting owner. The
+portable collection worker reports the prospective node layout before allocation;
+the closed provider admits that node and its concrete custody owner before either
+is constructed. Runtime host metadata uses its existing source lock for both
+fixed prepared slots and ordinary nodes. Reuse needs no new node or funding.
+Final retirement frees the node and accounting identity key before releasing its
+attached owner. The source constructor separately covers source and lock controls;
+attachment funding grants no native execution authority.
+
+`MemoryLedger` coordinates all registered physical domains in one process. Dense
+domain balances, one storage directory and funding accounts share one mutex.
+The [physical memory validation guide](physical-memory-validation.md) separates
+neutral conformance, native mechanism evidence and platform qualification gaps.
+Reservation, publication and ceiling succession validate every participating
+domain before committing any counters, identities, owners or peaks. An ordinary
+publication rejection preserves the complete ledger observation taken after
+its separately admitted preparation. Commit performs
+no allocation, provider callback, native work or payload destruction; retired
+owners are released after unlocking.
+Ceiling succession has a read-only preflight that rejects an ineligible live
+predecessor before planning metadata is constructed. It uses the reservation's
+eligibility worker and grants no authority; the transaction repeats that check
+under its commit lock.
+
+Prepared-chat resume forwards replacement physical-domain request limits into
+that same saved-source admission. The facade validates domain declarations and
+the retained semantic source; it does not require equality with historical
+request limits or mint successor authority. The semantic source's independent
+metadata account keeps its accepted limits, and host-copy limits intersect those
+constraints. Public failures retain the neutral domain or metadata-funding cause.
+
+The coordinator owns a funded dense transaction scratch buffer. Admission checks
+borrowed requirement descriptions and all domain ceilings in that buffer before
+allocating account vectors, report copies, source-pin containers or execution
+identities. The accepted pending account covers those constructors; concurrent
+constructors wait on the coordinator's funded condition variable. A constructor
+failure releases its pending charge while preserving the already observed peak.
+Ordinary admission rejection changes no counters or funding identifiers.
+
+Exact host-container quotations use the published runtime's
+[compiler memory profiles](../eredu-runtime/compiler-memory-profiles.md), including
+standard-library backing and target-specific mutex and condition-variable storage.
+These profiles authenticate unmodified compiler and library artifacts; they do
+not establish a process-memory ceiling.
+
+Host metadata includes topology descriptors, domain vectors, account/report
+controls and storage-registration containers. `StorageMetadataFunding` admits
+registration metadata before construction and authenticates its ledger identity.
+Cold shared constructors obtain `prepare_construction_metadata` before building
+their plans. This host-only planning owner uses the coordinator's construction
+identity and preserves configured and live account ceilings without adding a
+request ceiling. It retains the charge through plans and owning errors and grants
+no native allocation or submission authority. Its move-only
+`PreparedConstructionMetadata` seals a completed immutable plan: the coordinator
+closes further allocation through every funding alias and ends the construction
+exclusion without changing charges, peaks, identifiers or active limits. The
+returned custody retains the same charge until the last metadata owner retires;
+later consumers fund their own new allocations. Native constructor temporaries use
+the separately admitted allocation scope of the same shared-constructor account.
+Its scoped physical observer marks newly born backing for physical retirement at
+the final alias instead of cache retention. The shared cache worker preserves an
+existing cached root's original payer, identity and cache policy when reused;
+entering a constructor neither relabels that root nor changes its charge. Normal
+observers keep the ordinary cache policy. Bounded ordinary request Work uses
+the same observer and allocator workers with an explicit fresh-backing policy:
+it bypasses cache reuse and retires newly created roots after their last physical
+alias. This selection is independent of finite or unlimited limits and device
+topology. Older cached roots keep their existing identity and charge until their
+own physical eviction; the request neither borrows nor relabels them. The
+same rule preserves the original payer and cache policy when a native operation
+aliases or donates an already live external backing. The
+selected tensor capacity envelope includes fresh allocator rounding, and every
+new root still enters the existing assigned physical admission callback. Deferred
+accounting release follows actual physical destruction, including escaped aliases
+and asynchronous workers; logical paging reservations attached to those roots
+follow that same destruction.
+After certified completion and retirement of all temporary native resources,
+that account may retain only its authenticated fixed host metadata owner. Its
+request exclusion then closes while the same fixed charge, domain limits and
+account controls remain live through the last storage alias. The private owner
+identity prevents an escaped native allocation from substituting for fixed host
+storage; incomplete or quarantined construction retains the exclusion.
+`StoragePublicationLayout<K>` quotes a bounded inventory without allocating.
+Its `fund` operation reserves the complete constructor on that metadata owner;
+`fund_from` converts an admitted account's assigned fixed host allowance without
+increasing the total charge. The resulting move-only
+`PreparedStoragePublication<K>` publishes or pins the exact backing descriptors.
+It can accompany an existing unquoted loading owner but grants no execution or
+native allocation authority. Metadata custody survives through the last returned
+owner and container; native completion governs the separate backing lifetimes. Snapshots distinguish fixed baselines, registered
+storage, reservations, placement allowances, estimates and headroom in every
+domain. Registry metadata and reservation controls are identified subsets of
+those charges. Historical peaks include their simultaneous physical charges.
+Unquoted owners pay for their shared host ownership records before construction.
+Their aliases preserve both the admission exclusion and this charge; the final
+owner releases the shared allocation before refunding its host controls. Their
+unknown payload remains excluded from inference admission. A full host domain
+can refuse the owner record even when no execution is active.
+
+Shared native constructors declare fixed host storage separately from temporary
+physical allocations. When a constructor creates temporary native storage, one
+ledger transaction admits both contributions and their accounting metadata.
+The fixed host owner converts its allowance into retained custody; the producer
+takes the temporary allocation scope once and uses its ordinary metadata and
+allocation funding. Publication preserves the total charge. Native completion
+and independent storage custody are required before certification, including
+under unlimited limits. An abandoned scope retains quarantine, while completed
+temporary allocations and surviving fixed host owners retire independently.
+
+Scheduled capture source pins use the original program's prepaid host controls.
+The consuming claim authenticates the native account, original control custody
+and canonical chunk before constructing its bounded source pin. This operation
+keeps the source backing and native backing-control record alive without a second
+capacity reservation. Ordinary admitted transfers use their account's assigned
+host allowance for the same pinning mechanism.
+
+Placement-allowance snapshots identify the conservative full-capacity-per-candidate
+rule. Allocation descriptors and retained requirements preserve the supplying
+mechanism's basis and candidate set; these allowances are not residency telemetry.
+Protected original host payloads remain payload charges even when an account
+retains them in its control floor. Only quoted reservation bookkeeping is reported
+as reservation controls.
+
+The MLX coordinator attaches one accounting owner to each native backing root,
+including roots already present when its observer is installed. An allocation
+callback first reserves a pending backing allowance and its registration controls.
+An admitted ordinary native scope carries an accounting-only handle to its
+already assigned allowance. The exact scope and scheduled CPU task transport
+that handle to allocation; the pending backing consumes that account's allowance
+without increasing the ledger's total charge. The handle cannot grant execution
+authority or create another scope, and certification, abandonment or quarantine
+fences further allocation. Successful backing publication moves reserved bytes
+to registered storage atomically. Allocation failure restores the same account's
+allowance; surviving aliases keep their backing and host controls charged.
+Views and cached buffers preserve the root identity. Reuse carries its existing
+charge, while eviction retires the backing and controls. Ordinary Metal buffers
+and CUDA device buffers use independent native allocations so their physical
+retirement matches those roots.
+
+Ordinary graph and submission allocators retain the accounting handle captured
+at construction. Container growth, delayed task destruction, descriptors and
+shared data owners use that same source even when another scope is current;
+source refusal cannot fall back to the current scope. Their host allocations
+publish through the existing physical observer and retire with the last owner.
+CPU source queries describe the selected frontend, Eval, dispatch and consumer
+wait populations separately from C wrapper shells and numerical payloads.
+The dispatch allowance conservatively converts the same native worker's request
+extents, including unused framing; the observer charges actual live capacities.
+Opaque platform-event overhead remains a separate contribution. These queries
+neither reserve capacity nor grant original execution authority. Caller metadata
+comes from the selected safe/C signatures, including dense lookup validation and
+mask construction, fused CPU attention, and each Default/YaRN RoPE batch, slice
+and final join. Native primitive counts do not substitute for that caller census;
+a selected worker without a matching caller source remains unqualified.
+
+Each selected CPU completion frontier receives an Eval allowance for its reachable
+graph. Container growth bounds include conservative deque blocks and hash-node
+attempts; each possible observed allocation also receives its ledger ownership
+allowance. Repeated nested frontiers can therefore produce a reservation much
+larger than tensor storage or measured live native allocations. These allowances
+remain balances in the admitted domain account; they do not eagerly allocate a
+table for every possible control occurrence. Actual allocations consume their
+assigned allowance and retain their individual ownership records.
+
+CPU Eval source queries include the actual cross-stream Fence owners, one wait
+per crossing edge and one update per crossing output, including siblings. The
+CPU-only build retains the existing condition-variable worker. Ordinary CPU
+producers in a Metal build select the Fence's existing Event worker independently
+of limits, avoiding an unrelated GPU synchronization buffer. Both retain the
+actual physical payer through queued tasks and final aliases. Ordinary GPU
+Fence shared owners also retain that payer through the selected fast-buffer or
+Event worker. Original Fence sources keep their prepared mechanism; CPU-only
+facts do not qualify a mixed-device graph.
+
+The Metal census combines the shared ordinary Eval containers with the selected
+GPU prologue, numerical worker and encoder allocation sources. A retained router
+CPU partition uses its separate source stream and actual ArgPartition bank; its
+two-stream Eval query includes the crossing Fence and Event population. The
+single-stream query remains separate. A retained Ring source contributes its
+actual CPU constructors, dispatch population and completion frontiers before
+the enclosing Metal graph's Eval allowances are computed. Each such frontier
+can reach lazy GPU predecessors. Its two possible fast Fence U32 buffers have
+separate default-allocator placement, allocation counts and host controls in the
+collective scratch trace; slow Event mode retains the same conservative allowance.
+The query's typed frames, worker controls and nested traversal metadata consume
+the preparation account even when the requested native source is unqualified.
+A graph containing both a router CPU stream and a distinct Ring CPU stream
+requires a three-stream source and remains unqualified by the two-stream query.
+The Eval contribution owns its Synchronizer event;
+the GPU worker owns the async event, handlers, receipts and fences. Their
+platform-event count is composed once. Consumer boundaries retain their actual
+wait population without replaying the numerical DAG. Funded receipts and encoder
+fences use the same captured physical observer as other graph controls; commit
+leaves no idle successor receipt retaining the completed request. Prepared
+fixed-kernel callers quote their actual borrowed-input vector reserve and
+returned C handles separately from their native graph and numerical workers.
+
+Retained CPU worker and GPU stream loans authenticate the same admitted
+Scheduler identity during ordinary and original execution. GPU loans also
+check the Device, stream and constructor token. This read-only source validation
+creates no resource and grants no numerical or completion authority; each
+producer validates its own execution context. Native constructors continue to
+require an empty submission context.
+
+Scope observer custody includes its quoted deferred retirement node. Native
+release enqueues that node; the shared reclaimer destroys the Rust owner outside
+native locks, after the native bridge and shared allocation have retired. The
+same reclaimer retires completed submission records before draining owner queues,
+so their scope and account custody can retire without another inference request.
+
+Ordinary host-transfer buffers use the same backing observer. Their public C++
+shared allocator reports the concrete rebound control allocation before either
+the control or payload is allocated. Admission reserves both together. An array
+view of a transfer buffer preserves its full backing identity, capacity and
+placement. Completed staging buffers and independent destinations retire
+separately; an alias keeps the original backing and charge alive.
+
+CUDA managed roots keep full-capacity allowances in each backend-reported
+candidate domain for their entire lifetime. The prepared CUDA mechanism uses
+host-accessible pinned host storage with fixed host placement, including its
+funded native descriptor. It uses the same original-buffer account and completion
+custody as the other prepared mechanisms. This selection may cost device access
+performance; it does not reinterpret managed storage as fixed host memory.
+Native constructors still require their selected C++ ownership-layout profile.
+An unqualified profile is an attribution failure under either limit mode.
+The current native preparation profile qualifies Apple clang/libc++ 210106.
+GCC and MSVC qualification is incomplete for the original allocator, scheduler
+and main-thread guard, stream-registration storage, worker TLS and submission
+registry. Cold Original workspace placement uses the immutable strategy witnessed
+by actual prepared allocator initialization, including pinned Host storage. It
+remains unqualified before that source exists or if a later initialization
+contradicts it. Ordinary CPU and GPU allocation candidates retain their separate
+allocator facts; selecting a CPU worker does not replace those candidates with
+Host placement. The fixed snapshot belongs to the admitted process baseline.
+CUDA backing placement and managed-domain allowances are implemented;
+they do not establish those separate preparation and execution facts. A CUDA
+inference path requiring that profile rejects with incomplete attribution under
+finite and unlimited limits. This is an implementation qualification gap.
+
+Host access cannot silently relocate an attributed CUDA device backing while
+retaining its old identity and placement. A host read requiring new storage uses
+an explicit host-transfer allocation and retains source and destination custody
+through completion. Direct slice access to fixed device backing rejects the
+implicit relocation; host-accessible prepared and managed backing retain their
+respective fixed or candidate-domain attribution.
+
+The neutral tensor readback methods return `HostTensorBuffer<T>`. Its full host
+backing capacity and concrete accounting owner remain together through slice
+access, truncation and consuming iteration. The backing deallocates before the
+accounting owner retires; there is no conversion that detaches the same vector
+from its charge. MLX copies a completed source synchronously into the admitted
+host destination without constructing another execution graph. General exports
+reserve that new retained output under the live domain ceilings. Selected expert
+and capture readbacks use their existing prepared source and destination funding.
+CUDA device-to-host readback uses the runtime's documented synchronous copy
+contract, which completes host access before returning; an asynchronous polling
+error provides no such evidence. Native copy errors retain their CUDA status.
+See NVIDIA's [API synchronization behavior](https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html).
+A completed adopted Metal host buffer can supply its readable extent from the
+retained native buffer even when its foreign allocation identity is unknown.
+That read-only extent witness does not change placement or capacity attribution,
+reserve storage, or authorize an admitted source; descriptor-based admission
+continues to require its independent allocation evidence.
+Copying values into application-owned storage creates an independent allocation
+outside this retained owner and does not establish a process-memory ceiling.
+Ordinary tensor observations use `SharedTensorObservation`, so cloning an
+`ObservationValue::Tensor` retains the same admitted host backing. The raw
+`TensorObservation` remains a caller-owned data-transfer value. Serialization
+keeps that value's wire representation; deserialization creates independent
+caller-owned storage and grants no execution or allocation authority.
+Parameter reads and projections return `SharedParameterValues` and
+`SharedParameterProjectionValues`. Their strings, geometry and numerical buffers
+share one owner, so aliases retain the original producer's paid host custody.
+The raw parameter DTOs remain explicit caller-owned exports. Final retirement
+frees shared controls and payload storage before releasing that custody.
+The neutral `NeuralBackend::ParameterPreparation` associated loan carries the
+backend's preparation context through the ordinary parameter owner and residency
+policy. The MLX loan retains its actual source, allocator, selected stream and
+metadata payer. Nonresident inspection uses the same selected-window construction
+and completion worker, with a standalone numerical account that atomically admits
+native backing, source reads and constructor controls. It supplies no token,
+prediction or realtime execution authority; target and supplementary source
+identities remain distinct.
+
+
+Configured limits and live account constraints intersect independently in each
+domain. Raising a predecessor's constraint, including to `Unlimited`, requires
+its move-only succession authority; unrelated constraints remain effective.
+Unlimited skips capacity comparison only. Arithmetic, completeness, allocation
+identity, source pins, ownership and completion checks use the same paths.
+Core admission checks context and completeness and retains the domain declarations
+for this transaction. Aggregate hardware-availability observations do not impose
+another inference ceiling; cold mechanism selection may still use those observations.
+
+Cold workspace inspection uses descriptive inputs through the same
+`PrefillDriver` traversal as execution; it constructs no `InferenceRequest`,
+execution identity or submission authority. Workspace lifetimes are reduced in
+their resolved domains. `WorkspaceBound::PerDomain` preserves complete domain
+requirements when an aggregate diagnostic cannot be represented; `Unknown`
+continues to mean missing evidence.
+The eager F32 and U8 scalar producers retain the default allocator's physical
+placement. A typed zero or Full operation quotes its eager scalar scratch on
+that same source, separately from its GPU fill output. Original execution keeps
+the placement established by its retained prepared allocator. Aliases preserve
+the full original backing and its controls through the shared lifetime reducer.
+Generated F32 initialization owns its fixed Rust staging vector separately from
+one eager native upload backing; its stream Copy retains that backing. The cold
+CPU and Metal producers use the same typed upload facts. Geometry-only generic
+initialization retains its numerical envelope but supplies no allocator placement,
+including under an Original allocation strategy. Parameter coefficients use their
+actual borrowed F32 slice producer instead of that geometry-only declaration.
+Cold contexts created before native topology publication retain numerical facts
+and incomplete physical reports; source preparation does not initialize native
+resources or turn absent topology into an operation failure.
+Compound native fact emitters retain actual default-allocator constructors and
+complete mutually exclusive scratch envelopes before any domain reduction.
+Their lexical companion resolves simultaneous source rows, then takes domain
+maxima. Child projections carry their source alternatives into parent equations;
+scalar-sized casts remain on the selected execution allocator. Repeated grouped
+chunks preserve each complete first/down projection choice before reduction.
+Attention keeps query and value dtype choices consistent across all tiles. Its
+bounded source witnesses preserve the maxima for the default allocator, execution
+allocator and their shared domain before physical reduction. Completed key-block
+phases release eager page inputs while retaining their accumulator and query
+outputs; normalization, value and final-concatenation populations remain distinct.
+Absent constructor counts remain explicit missing controls even when the source
+backing bytes are finite. Recording and
+ordinary workspace contexts consume the same source factory and lifetime reducer,
+including direct Metal facts and retained resident mechanisms. Lexical source
+construction uses the caller's metadata recorder and account, so recorded cold
+quotes include the same source tables funded execution constructs. Source preparation
+errors retain their metadata payer separately from allocation-free equation errors.
+The router's existing cold equation worker retains eager scalar, mask and ID
+constructors and CPU cutoff partitions separately from execution-stream child
+buffers. Its lexical source companion resolves each simultaneous scratch branch
+before taking per-domain maxima. Returned partition and partial-update backings
+keep their actual allocator candidates; a full forced-ID replacement retains
+its eager U32 source. Escaping-output candidates and completion scratch retain
+independent conservative placement allowances, including their source basis,
+rather than claiming a data-dependent placement was measured. Their raw output
+rows preserve aliases and allocation controls in the same lifetime graph.
+Ordinary Broadcast quotes its actual retained publication group and three-array
+completion population: input, rank contribution and returned output. The non-root
+contribution remains in the shared numerical trace; publication uses the existing
+Sum and completion workers without creating an Original execution source.
+Ordinary token-mask caller quotation uses the shared expanded Bool upload,
+logits clone, scalar and Select worker; its Rust mask payload remains in the
+separate Host workspace source.
+
+The selected communication mechanism also supplies a descriptive completion
+strategy. Cold model collectives use the ordinary per-operation fallback when
+the native mechanism owns separate submissions; mechanisms borrowing an admitted
+model submission record their nested completions. Both follow the same partition
+driver. Local communication dependencies retain a distinct worker description,
+so their caller and completion charges do not consume layerwise completion
+evidence. An enclosing-submission selection cannot use a direct dependency
+submission without a separately qualified source. These scheduling facts create
+no native completion or execution authority.
+
+The same span and sampling reports retain their closing allocation populations.
+Ordinary storage publication combines these populations with the actual opening
+source inventory to quote finite collector and registry storage. Its assigned
+host allowance funds the collector owner before constructing any collector
+vectors or cloned storage descriptors. Publication retains that owner through
+the resulting receipts. This host custody supplies no original-source or native
+execution authority. Repeated sampler outputs that alias independent score
+backings retain those complete backing charges; their simultaneous domain totals
+remain subject to checked arithmetic.
+
 `eredu_core::memory` provides borrowed memory contributions, checked aggregation,
 pure policy evaluation and source-labelled warning records. The declaration for
 one reservation scope separates:
@@ -157,7 +561,7 @@ mechanisms and unsafe completion states remain errors under both choices.
 
 The pure evaluator is independent of current inference admission. Execution
 contexts do not apply `MemoryOverheadPolicy`; inference uses `WorkspaceBound`,
-completeness requirements and the working-memory pool's unquoted-owner exclusion.
+completeness requirements and the memory ledger's unquoted-owner exclusion.
 `DependencyMemoryPolicy` supplies scalar host estimates to its existing reservation
 mechanisms. These producers and reports do not use the three contribution variants,
 and the runtime does not deliver the evaluator's warnings. `UnknownBound` also
@@ -205,6 +609,15 @@ Neither missing bindings nor an empty local member list establishes exclusion.
 Composite construction completes the retained model graph before validating its
 boundary, including routed destinations. Publication of the direct composite
 equation source remains a separate selection gate.
+
+Ordinary residency acquisition can borrow its request's host-metadata account
+for the same prepared controller, canonical closure, lease collection, named
+destinations and transfer-publication workers. The ordinary recovery scope keeps
+that payer through completion; cached named values retain it through their own
+retirement. This host custody supplies no original-operation observer or source
+receipt. Source-derived constructor queries describe those concrete controls;
+checkpoint recipe/read preparation, native copies and completion require their
+own contributions before the complete operation has a finite estimate.
 
 Checkpoint preparation validates indexes, admitted shard/header identities,
 recipes and requested ranges. A prepared store may reopen an authorized range
@@ -275,9 +688,110 @@ installation does not certify native completion or refund cumulative grants;
 escaped projections and unsettled recovery retain their own original custody.
 Active parallel controls remain installed.
 
+The shared session describes each output transaction from its actual demand,
+observer participation and selected strategy control operations. Its one-use
+cursor distinguishes prediction-state loan entry and return, admits only the
+driver's conditional phase order, and keeps failed prefixes separate from
+successful commit. Named callback factories supply the actual session and
+prepared-group callback types to backend metadata queries; these descriptions
+create neither native resources nor submission authority. The existing shared
+transaction and prediction-state loan remain the execution workers.
+
+Model-internal partition agreements are recorded by that same partition driver in
+the ordered workspace trace, with their selected group and boundary route. These
+markers carry no tensor storage or native authority. A funded shared source table
+retains their actual operation ordinals after numerical trace reduction. The
+selected session visits the same outer-context and required-group callback
+factories used by execution; only the inner agreement contributes native capacity.
+A separate one-use cursor checks these model events without consuming session
+lifecycle occurrences. Source-table aliases share their original host payer, while
+the admitted native owner funds cursor construction and preserves failed-prefix
+and completion custody.
+
+Text and speculative model controls share the same group authentication,
+collective callbacks, and native submission worker. The closed native owner lends
+either the accepted text bank or the actual speculative role's retained budget;
+it does not construct a second request. Speculative recovery retains that owner,
+while lexical projection closure prevents later submissions. A retained root may
+lend a current descendant only when the existing child collector authenticates
+its explicit parent identity. The shared worker prices those checks and retains
+its actual completion custody. Expert regions retain their separately recorded
+provider-vote sources; their suppressed cold callbacks add no duplicate model
+phase or native allowance.
+
+Autoregressive, embedded-target and external-equation roles authenticate their
+actual issuance account through the same request custody comparison. Embedded
+recovery owns the completion roots and retained parallel invocation; the session
+borrows a weak projection only for the existing equation callback. The projection
+checks execution identity, current scope and the captured compute stream before
+lending its group. Initialized expert integers are a distinct source-program
+component, separate from parameter storage. Phase-funded workspace metadata and
+addressable descriptors keep their own payer while the retained communication
+source preserves its original native quotation and control payer. Recorded model
+callbacks use a separate prepaid child sealed to that same source issuer; the
+model-only context hook lends it through the shared agreement worker. Expert
+and neural-collective callbacks keep the original source payer. The lexical
+phase binding spends its own prepaid phase child, and neither child is charged
+again to the native role. Weak projections retain the account that pays their
+shared control header without retaining the native root payload.
+
+Distributed prompt-cache controls use the same phase callback and prepared-group
+visitor. Their neutral source retains the selected save preflight, preparation,
+and publication votes, or the load preflight and preparation votes. A move-only
+cursor accepts only that order and requires every selected vote before successful
+completion; actual failure may end a reached prefix. The existing reversible save
+and provisional load drivers perform all cache work. The source and callback query
+carry no cache, communication, or submission authority.
+
+MLX retains the initialized agreement source in one cache-control owner and
+installs only a weak projection during the shared save/load call. Each exact
+phase consumes the neutral cursor before using the shared physical native-role
+worker, which admits the source's backing, graph, record and callback controls
+and preserves its completion timeout. The accepted construction account funds
+the owner, projection header and typed failure transports. Refusal, an invalid
+phase or unwinding closes the owner; completion and recovery retain their own
+native custody independently of the lexical installation.
+
+`SharedPromptCacheManifest` retains one immutable manifest, its construction
+account and any separately admitted dependency estimate account. Its prepared
+shell is charged before publication; field constructors pay their own allocations
+through the construction account. Cloning shares the backing, and the final
+shared shell and payload retire before their funding. The plain manifest remains
+an independently owned schema for inspection and deserialization;
+neither representation authenticates file contents or grants cache restoration.
+
+The public per-session cache methods require a rank-local state manifest and
+return `PromptCacheError::RankHasNoState` for a stateless rank. The neutral
+distributed driver still participates in the selected agreements and explicitly
+returns `None` for that rank; it does not import a manifest or establish a new
+logical frontier there.
+
+Admitted prompt-cache persistence separates controlled metadata from dependency
+estimates. Exact buffers, paths and shared shells use the session's construction
+account. Each bounded metadata input admits a source-labelled finite estimate for
+stock parsing, validation containers and filesystem scratch through the same
+ledger transaction. The upper estimate appears as estimated overhead in the host
+domain; retention links remain accounted metadata. Failed admission leaves every
+domain and funding identifier unchanged. All successful estimates remain charged
+through the final result or failure alias, including intermediate parser storage.
+The default manifest input limit is 64 MiB; it bounds bytes read from the opened
+file, independently of the estimate and physical-domain ceilings. Low-level
+persistence constructors accept an explicit finite input limit. These allowances
+do not establish a process-memory ceiling or apply `MemoryOverheadPolicy` to
+inference admission.
+
+The MLX autoregressive row retains a separately quoted control owner from its
+actual partition source. Its admitted model role funds the existing native child
+worker for each selected control occurrence, independently of capture transport.
+The lexical mechanism binding covers prediction-state entry, the shared model
+transaction, and state return. Actual callback factories supply both loan and
+binding layouts before admission; typed failure transports retain the same
+metadata account. Transaction and loan completion advance the one-use cursor,
+while failed prefixes and unwinding preserve native recovery custody.
+
 A successful reset may retire the previous nonstate publication when its remaining
 registered sources exactly match the executable's still-retained initial
-publication. Runtime compares live pool identity, storage keys and capacities;
+publication. Runtime compares live ledger identity, storage keys and capacities;
 equal byte totals provide no authority, and additional source custody prevents
 the match. The backend performs this comparison before mutation and moves the
 covered owner into its already funded reset-retirement node. New or uncovered
@@ -296,12 +810,25 @@ transport counters; reset does not refund model, capture or communication work.
 State installation and displaced-state retirement use the shared typed worker.
 The canonical `ResidentTableResetState` contract validates placement for each
 actual component, so paged attention and device-resident fixed children can share
-one Hybrid layer. KV and Hybrid resets use the same source-authenticated,
+one Hybrid layer. Generation also permits fixed-only sibling layers beside an
+actual paged KV layer. The complete hybrid source worker validates each fixed
+role, dtype, extent and backing; the paged source retains its independent manager,
+file, transfer and completion proofs. KV and Hybrid resets use the same source-authenticated,
 independently funded empty-manager constructor. The final table constructor moves
 that prepared manager even when the local partition has no paged attention rows;
 layout, global layer indices, child roles and physical pool identity remain exact.
 Old pages and escaped fixed tensors keep their original owners. This constructs
 empty metadata and tables without copying tensors or refunding cumulative work.
+Resident key-only and compressed latent/rotary caches use their exact inline
+empty constructors. Reset preserves the key-only/window configuration and the
+compressed allocation step, checks their actual component placements, and leaves
+snapshot-owned backings charged until those snapshots retire.
+Pooling state uses the same prepared table publication and retirement worker. Its
+local-key window and pooling ratios come from the retained layer policy; paged
+local keys use a source-qualified empty manager. The portable `DeviceState`
+adapter forwards the actual layer constructor plan and funded host context,
+while displaced local, pooled, partial-window and overlap arrays retain their
+original custody.
 The six-case Dense/Mova Resident/Host/Disk CLI matrix covers distributed reset;
 its exact profile and limits are in [validation](bounded-inference-validation.md).
 
@@ -317,11 +844,11 @@ already has a retained attachment. MLX supplies this proof from a complete
 initial publication after loading authority retires, or from a sealed successful
 source attachment whose original custody remains healthy. Its existing Array and Host
 inventory nodes use one shared owner/receipt representation and become scalar
-allocation-generation/capacity receipts in the exact pool domain. They retain no
+allocation-generation/capacity receipts for the exact ledger. They retain no
 native payload or registration pin, and publication allocates no receipt table. Current backing
 validation remains required. A matching receipt avoids constructing another
 registration and attaching the current request's control account to an already
-covered parameter. New allocations, foreign domains and missing proof use the
+covered parameter. New allocations, foreign ledgers and missing proof use the
 ordinary checked publication worker. The enlarged owners and receipt-lookup
 controls are prospectively funded; no admission allowance is discounted.
 
@@ -352,6 +879,14 @@ constructor custody is validated even when ordinary loading registered the full
 payload without prepaid credit. Later controlled publication preserves that full
 ordinary charge; it cannot promote the row, create a missing row or substitute
 an unrelated execution account for source funding.
+
+Host source construction receipts retain only the actual accepted accounting
+hold after a finite debit. The producing bank keeps the full source-validation
+guard through construction and publication. Escaped native buffers and owning
+refusals retain their paid storage without retaining an earlier request's source
+witnesses; repeated disk materialization therefore does not form a chain of
+completed request accounts. Receipt identity still compares the original account,
+and a spent receipt cannot issue or refill construction capacity.
 
 Lazy Host sources and canonical device parameter cells share one private scalar
 proof of successful attachment. The Host source transaction returns its sealed
@@ -445,6 +980,10 @@ pending media. A rank-local projection is validated against its retained local
 realization rather than the serial global layout. This preparation grants no
 invocation or completion authority.
 
+Restoring a completed snapshot retains the selected neural and layerwise-transfer
+source descriptions even when its equation schedule is empty. The same source
+matching checks apply; its submission, transfer and wait populations remain zero.
+
 Prepared text and retained media execute under the same transaction's admitted
 model and parallel-control context loans. Their execution callbacks share the
 same boundary issuer, checkpoint, completion vote and rollback ordering. Context
@@ -463,6 +1002,124 @@ funds the exact output and root tables, constructs every once-only reduction, an
 then completes the whole wave; waiting after the first lazy reduction could
 prevent its peers from submitting later members. An absent retained source uses
 the ordinary communication mechanism. An invalid retained source is an error.
+
+The shared local-expert callback distinguishes genuine completed Original row
+receipts from ordinary receive-row values. An ordinary MLX callback borrows the
+indexed owner installed by its admitted Work, selected by the exact current
+physical observer. Its existing bank channel authenticates the declaration and
+actual row count, and retains the source through completion or failed-callback
+retirement. Cold preparation carries a separate ordinary local bank program;
+branch alternatives share the same source census, and the parent joins their
+lazy graph and validation roots into its completion. Descriptive Original
+communication sources never grant an ordinary bank an Original role or arena.
+
+Admitted ordinary communication retains that same Work source through its
+prepared recovery, resource registry, quarantine destination and housekeeping
+registration. Its caller census uses the actual retained array, count-buffer,
+group and stream populations, including the selected group's nested metadata.
+Completion polling observes each array's own signalled event before applying
+strict backing and completed-read checks. It performs no evaluation or wait and
+creates no new recovery scope. Escaped scalar agreement and flag results retain the prepaid host owner
+until their final alias retires. Boundary header comparisons use fixed readback
+buffers sized from the actual expected bytes; an escaped mismatch retains the
+same host owner. Bounded-wait refusals also retain that owner while native work
+remains quarantined, and independently until the final escaped error retires.
+The route's declared tensor limit bounds the bundled completion root vector
+before allocation. Native Eval remains part of the enclosing lazy
+graph census; host-result buffers and route metadata have separate producers.
+
+Original status agreements retain their scalar arithmetic and native leaf
+descriptions with the actual prepared communication source. These descriptions
+own native Group handles and paid host metadata, but no input Array, callback,
+producing scope or communication-owner backreference. Each admitted vote pays
+its own execution metadata and authenticates the same retained group itinerary.
+The source keeps preparation-account identity separate from the current
+execution payer; lending a funded source changes neither its origin nor its
+native authority.
+
+Completed communication readback first observes the source array's own
+availability, including a signalled event still attached after a pair wait.
+Both ordinary paths use that same nonwaiting worker before immutable backing
+inspection. Pending arrays remain refused; observing readiness supplies no
+allocation identity or execution authority.
+
+Ordinary paged publication borrows the same authenticated Work channel. Its
+companion retains canonical manager sources and prepares independent catalog and
+record-metadata destinations from the exact append schedule. Installation checks
+the retained manager generation and population before mutation. Original and
+ordinary appends share the numerical traversal and canonical publication and
+rollback workers; each supplies its own source checks and completion mechanism.
+Rollback identities come from the consumed publication program and cannot remove
+unrelated existing blocks. Published records retain their own metadata payer.
+Synchronous cache-evaluation failures preserve the native cause and prepaid host
+custody. A completion wrapper quote alone does not qualify scan, tier-transfer,
+visible-window or truncation bookkeeping; those need their own source-owned
+prepared destinations.
+
+Ordinary paged Host transfers retain the actual cold store/load itinerary beside
+that companion. Each destination has independent metadata funding, immutable
+source identity and one-use submission state. Logical cache reservations are
+prepared without occupancy and committed only after canonical source and capacity
+checks. Admission separately includes each retained Host allocation's actual
+capacity and placement, observed constructor controls, and the shared native
+copy population. Hot reads and completed promotions use the same scan traversal;
+canonical publication and eviction use the same policy workers with ordinary
+source proofs. Pending arrays, buffers and events remain in their destination
+through failure, and escaped Host aliases retain their allocation metadata payer.
+A completed Disk-read promotion attaches its replaced Host and transfer reservation
+to the exact staging backings. An independent copied Device destination does not
+retain that Host occupancy; a Host-backed Device view does until its final backing
+alias retires. The later Device return uses a separately prepared empty reservation
+identity. Both publications preserve aggregate usage and peaks, and specific
+retirement handles release only the token whose backing has actually retired.
+A failed checkout restoration quarantines the complete transfer owner. Disk
+itineraries require their own qualified reader, writer and publication sources;
+Host transfer support alone cannot admit them.
+
+The ordinary Disk itinerary binds those sources to the same per-manager I/O
+worker and canonical write/read transitions. Read destinations retain their
+actual ordinary allocator capacities and placements. They activate prepared
+logical reservations only for the selected load, then attach the prepaid source
+owner to fresh exclusive Host writers before lending bytes to the I/O worker.
+The creator context stays outside the Send payload; a closed identity token
+joins the completed body back to that context. A successful read moves its
+completed body into the promotion witness, so the operation does not retain a
+second staging owner. Completed writes retain their durable file and canonical
+pin independently from Host staging. Their source witness authenticates every
+Host alias released by the itinerary; the replaced logical token remains
+attached to the actual backing until its last alias retires. The same selected
+destinations supply the finite caller-control envelope before their one-use
+read and write descriptors move into execution.
+
+Disk completion, occupancy and retained-failure mutexes include their qualified
+platform storage in the Host quotation. Each mutex is initialized before it is
+shared, so its allowance covers one platform allocation. Completion errors retain
+that funding alongside the actual file, buffer and source-pin owners.
+
+The enclosing ordinary state checkpoint has one host source per actual model
+forward. Its cold state hook retains the actual shared layout, outer and nested
+slot-table identities, and existing inference request and lease handles. The
+accepted text step supplies the only request that may be added to that retained
+source. Before copying, the native worker validates those identities against
+its borrowed live state and consumes one checkpoint row. Outer layer tables,
+hybrid fixed-role tables and retention directories use the current Work's
+metadata funding and the existing host-table constructors. Retention copies
+keep their payer after their directories and revision, independently of state
+field order. This host source grants no native numerical copy authority.
+
+Ordinary paged checkpoints consume a separate destination from that same
+retained step source. It captures the actual canonical IDs and tail frontier
+before mutation, and the saved pager retains its immutable native tail aliases,
+thread-safe metadata owner and prepaid host custody. Restoration authenticates
+both current and saved pagers, removes only later append blocks through the
+shared rollback worker, and restores the saved tail directly. It does not copy a
+partial sealed replacement at the saved token offset. Prepared sliding-history
+entries preserve the existing discard predicate; both strong checkpoint aliases
+and weak manager entries retain the payer until their own allocations retire.
+The neutral `PagedTruncatePlan` also drives ordinary arbitrary cuts in the same
+slice, completion, contiguous-copy and publication order. That separate crossing
+copy still requires its own numerical source under an admitted scope; checkpoint
+custody does not grant it permission.
 
 Architecture block workers preserve tensor geometry and parallel coordinates
 independently of observation. Qwen-VL dense blocks and DeepSeek routed blocks use
@@ -562,6 +1219,120 @@ Copying and enclosing work remain separately admitted.
 it with NN-specific allocation and parameter-copy operations; there is no transparent
 second funding wrapper. Source constructors reserve concrete capacity, then retain
 that payer through result, error and final shared-shell destruction.
+
+The copied-U32 input producer exposes descriptive layout facts through the same
+native shape/count/allocator query used by its borrowed-value plan. Inspection
+reads no payload, constructs no tensor or arena, and grants no allocation
+capacity. The returned facts retain no source pointers; actual construction
+still requires the initialized runtime, exact borrowed values and admitted arena.
+CPU static integer-axis indexing uses the existing Slice and Reshape sources.
+Its possible reshape copy keeps both destination allowance and the full input
+alias identity; erased axis/stride information never establishes output layout
+or physical floating precision.
+
+Distributed parameter operations and scheduler exchanges share the prepared
+portable-word transport. Its native source, staging, destination and exact
+completion retain their admitted physical charges. Neutral coordination borrows
+completed words during validation, prepays its framing and decoding vectors,
+and retains the metadata payer in escaped typed coordination errors. The same
+operation worker performs admission, source preparation, delivery and reversible
+publication; logical communication quotas do not authorize physical allocation.
+Partition executors forward structured parameter reads and publication traversal
+to these shared workers. Borrowed reads and publication preparation preserve the
+current observation binding; raw mutable architecture exposure still invalidates
+it, as does finalization after successful publication. Read-only parameter inspection
+uses the same native guard and recovery worker: a callback error is returned with
+preserved state only after successful settlement. Failed or unobservable native
+completion still fences execution and retains its source custody.
+
+Parameter publication exchanges a checked generation counter with its prepared
+values and retained replacement sources. Snapshot and media bindings retain the
+session's existing identity owner plus that generation; overflow rejects during
+preparation, and rollback restores the prior counter with the prior values.
+Finalization invalidates observation bindings after publication locks are released
+and creates no identity allocation. It retains the immutable path source and
+clears only the session token. The next explicit cold preparation revalidates
+that source and funds a fresh binding before construction. Old fingerprints
+remain stale; raw mutable architecture exposure leaves a populated stale token
+and cannot request this publication-specific rebind.
+The same transaction prepares the complete empty state through the original
+source-bound reset constructor. Its host account includes domain vectors, limit
+metadata, source pins and retirement controls. Commit swaps the prepared state,
+prompt identity, parameter handles, future-loader sources and counters without
+constructing or destroying payloads. The displaced state remains in the prepared
+slot for rollback or completion-safe retirement. All participating parameter-bank
+locks remain held across final validation and exchange.
+Prepared native handle clones use a separately paid metadata arena and the
+existing closed prepared-handle destructor. Dropping a prepared or published
+handle retires its arena charge even while the source backing and other handles
+remain alive; failed preparation attaches no payer to that source backing.
+
+Standalone numerical work uses `NumericalSourceRequirements` to reserve its native
+backing, native wrapper metadata, finite source-construction population and Host
+controls in one ledger transaction. `OriginalNumericalSource` issues separate,
+once-only source, native and metadata claims. A native claim authenticates the
+accepted backing capacity and placement; the backend supplies mechanism and
+completion evidence. Source receipts, native outputs and escaped failures retain
+the same account through their final owner. Once all native producers and
+submissions close, completion-certified occupancy releases unused allowance and
+each independently retired backing under the coordinator lock. Completed-source
+inspection aliases retain native identity without retaining allocation authority
+or a finished staging buffer's charge. Managed backings retain their full
+allowance in every candidate domain until that backing retires; occupancy here
+describes live allocated backing, not physical residency. Host controls and live
+account ceilings remain charged through their final owners. Invalid retirement,
+poisoning and unwinding quarantine the remaining charge. This source grants no
+inference or text-generation execution authority.
+`SharedOriginalBufferInspection` can retain that non-producing identity across
+threads: reference counts and occupancy are atomic, descriptor inspection takes
+the native runtime lock, and final custody enters the unlocked retirement queue.
+It exposes no producer or Scope binding. Canonical cached parameter cells retain
+their exact completed source without retaining a cell, directory or array through
+that source, so cache eviction and final array aliases determine backing retirement.
+Selected parameter sources complete their actual transfers before a separately
+admitted numerical consumer begins. The completed source loan retains its unit,
+residency pins and original cleanup accounts throughout that consumer.
+Completed parameter results retain their actual native budget and account. The
+backend authenticates each full backing against that budget before importing its
+capacity, placement and host controls into workspace planning. The ordinary
+registered source pin also retains these completed accounts, including when its
+source union contains a prepared input. Binding adds no physical registry entry
+or second allocation charge. Native publication preserves the same distinction:
+completed numerical aliases receive account-only validation in the ordinary
+publication transaction. The backend reauthenticates their native owner and
+retires transient publication controls outside the coordinator lock. The native
+budget already retains the original accounting custody, so repeated publication
+adds no backing sidecar. Array-handle controls retain their own metadata payers.
+Fixed prompt-cache imports publish authenticated completed numerical backings
+through a separate canonical publication plan. The existing directory retains
+full allocation identity, capacity, placement and the original numerical account;
+native Host-control rows use that account's separate metadata allowance. This
+publication reserves only its exact directory and attachment metadata. It neither
+charges the payload again nor refunds it: the original native budget observer
+retains that responsibility. A move-only receipt attached to the actual backing
+marks its directory rows retired after the final physical alias disappears.
+Failed attachment disarms that physical-retirement signal and withdraws only
+its fresh publication, so surviving directory pins reject the abandoned source.
+It neither refunds numerical payload nor invalidates an existing canonical row. Existing registered-copy and capture discovery can therefore pin
+imported allocations without retaining a materializer or a second storage bank.
+
+Session publication also retains the exact completed sources of displaced
+parameters kept for removal or rollback. Those observation owners authenticate
+only their selected roots and do not enlarge the installed workspace source.
+Per-domain capacity
+and placement-allowance checks preserve the original estimation basis, and every
+later admission validates the
+retained account under the coordinator lock. Standalone numerical custody cannot
+serve as a speculative model or numerical-phase role.
+
+Completed parameter loans retain the successful filled-buffer attachment receipt
+when an exported parameter aliases Host storage. The receipt records the exact
+native allocation facts and its accounting-only source custody; it holds no
+payload and grants no construction authority. Parameter publication selects these
+receipts by the actual retained roots, including displaced originals needed for
+overlay removal. Later tensor aliases validate the same receipt and ledger before
+reusing the backing's existing attachment, so repeated requests do not accumulate
+registration owners on an unchanged Host allocation.
 
 NN errors have one canonical typed-source owner. Construction and cloning retain
 the original error without eager diagnostic formatting. Aliases share its control
@@ -704,6 +1475,61 @@ not by dependency allocation callbacks. Schema preparation reserves separate
 input-derived headroom alongside its validator. Syntax, declared types, required
 fields, insertion order, and validation failures share the ordinary parser path.
 
+Admitted prompt-cache persistence uses the same manifest parser, shard validator
+and atomic generation publication workers as caller-managed inspection. It funds
+controlled input buffers, paths, formatting destinations and shared manifest
+shells before construction. Opened manifest files are read only through their
+admitted extent; the default input limit is 64 MiB, configurable through the
+low-level funding constructor. Safetensors headers retain their separate 1 MiB
+limit. Stock serde/safetensors containers, catalog validation and platform path
+scratch receive separately classified, input-derived `DependencyMemoryPolicy`
+estimates. Each allowance is admitted through the same ledger transaction with
+its source and basis; it is not an exact dependency or process-memory bound.
+Returned shared manifests and typed errors retain both accounts until their final
+alias retires. Reversible publication prepares rollback metadata before changing
+visibility. These persistence allowances do not apply `MemoryOverheadPolicy` to
+inference admission or replace file identity, schema, digest or completion checks.
+
+Imported decoder layer and fixed-role tables are constructed by the ledger's
+closed host-slot builder. It admits their exact boxed extent before allocation
+and publishes the actual table identity in the existing storage directory. The
+persistence construction account pays and retains metadata separately; table
+payload is charged once and stays attached through its final table owner. The
+next request's opening census and source pins consume these same canonical rows,
+including nested hybrid fixed-role tables, without inferring custody from a
+metadata byte allowance.
+
+Imported cache blocks retain a distinct persistent-file source: the opened file,
+its observed version, actual encoded header and offsets, verified payload digest,
+and both metadata accounts. This source neither owns a live-writer Disk reservation
+nor unlinks the persistent shard. Canonical cache reads select the retained Live or
+Persistent origin and use the same positional reader; persistent reads validate
+the header and digest before publication. File-to-file saves use that reader's
+fixed 4 KiB buffer and authenticate the completed source version, without a
+tensor-sized Host staging allocation. Failed reads retain their source handle,
+written prefix and funding until retirement. Paged projection retains the same
+closed file source through cold planning, promotion and backed Device return;
+append validation compares that exact source with the canonical row. Persistent
+imports use their authenticated shard layout without acquiring live-writer
+reservation or unlink authority. Their selected loads prepare and fund the shared
+Disk read worker and Host staging even when the manager disables live writes;
+write destinations remain conditional on that separate policy.
+
+Fixed-state imports authenticate a single declared tensor on the same opened file,
+then use the retained executable, ledger and prepared allocator through the shared
+native numerical constructor and completion worker. File bytes and decoded typed
+Host values each have an independent storage account; both retire after completed
+construction while native aliases retain their own physical allowance. Exact
+completed allocation witnesses publish payload and native Host-control identities
+into the canonical source directory without charging those bytes again. The
+backing owns the directory receipts, so ordinary capture and copy discovery remain
+valid after the importer retires and aliases release their registrations only with
+the actual backing. No state-specific source bank or opaque array attachment is
+used as a substitute for canonical identity.
+The qualified constructor source covers Float32, Float16, Bfloat16, Int32 and
+Uint32. A persisted Float64 state currently returns a typed missing-constructor
+source refusal; it is not represented as Float32 or treated as a hardware limit.
+
 Facade tool schemas compile with stock `jsonschema::Validator` and validate the
 runtime's retained `serde_json::Value` directly. The preparation account admits
 configurable dependency headroom before compilation; each validation invocation
@@ -747,8 +1573,9 @@ retirement. Completion-schema validation preserves the selected draft and typed
 errors; funding or tokenization refusals cannot select the syntax-only fallback.
 
 Framework-managed bounds do not describe total process or system memory. Application
-buffers, event copies, allocator caches and opaque driver/JIT internals need their
-own declared policy. [Bounded inference](bounded-inference.md) defines the public
+buffers, independently copied events and opaque driver/JIT internals need their
+own declared policy. Registered MLX backing remains charged while its allocator
+cache retains it. [Bounded inference](bounded-inference.md) defines the public
 scope; [released tool validation](prepared-chat-validation.md) records
 current Required/Auto text and image successes, exact capacity and process-memory
 measurements and validation limits.
@@ -792,7 +1619,10 @@ CPU reshape admission validates the physical stride span, so GQA broadcasts may
 repeat a smaller backing. The same borrowed reshape planner determines and prices
 aliasing or copying from the actual shape and strides. Integer unit-axis and
 transpose views retain their exact scalar dtype and source backing without
-floating stride evidence. Transpose facts require the canonical retained axis
+floating stride evidence. Floating squeeze and expand-dimension views preserve
+the exact nonunit source strides across their changed rank, including sliced
+rows. Their existing native alias workers validate the readable source span and
+retain the complete backing without another allocation. Transpose facts require the canonical retained axis
 permutation; a name-only event supplies no native source. Integer reshapes reserve the existing General-copy
 branch when strides are unknown; the storage report also retains the possible
 full input alias. Ranked gather quotes therefore include the actual expand,
@@ -803,6 +1633,80 @@ source extent distinct from the index/result extent only after checking both
 actual readable stride spans; queued indices retain their bounds check. F32
 LogAddExp uses the same named floating task in ordinary and admitted execution,
 with its existing weak input/output owners, fixed iterator source and rounding.
+
+Prepared spatial rotary on CPU uses the existing native rotary worker and its
+selected row layout. Its census includes I32/U32-to-I64 widening, signed
+saturation, strided column aliases, eight-byte integer intermediates, supplied
+frequency seeds and Copy aliases, concatenations, F32 cosine/sine and both output
+roots. The native alias and concatenate consumers authenticate the same I64
+backing spans and byte widths as the unchanged copy worker. Original row storage
+uses its inspected Graph bank; ordinary row storage retains the selected local
+container capacity. These facts do not authorize unprepared frequency generation.
+The shared CPU trigonometric worker checks its reduced argument before using
+the SIMD polynomial. Lanes outside that range use the platform scalar sine or
+cosine with the original value; the source includes those fixed call frames.
+
+Caller-provided rotary embeddings use the shared explicit application worker.
+Its CPU source covers full-width F32 split halves with dense rank-two or
+rank-three cosine/sine tables and exact batch, position and feature broadcasting.
+Input head views may retain gaps between rows when their final axis is proved
+contiguous. The census includes the actual batch/head views, dtype casts, half
+slices, negative scalar seed, concatenate, products and sum. The tables remain
+independent source roots; their geometry does not grant frequency-construction
+authority.
+
+CPU equality with an I32 scalar retains the eager signed scalar source and the
+native integer promotion. U32 inputs and that scalar widen to I64 before the
+Bool comparison, with both eight-byte cast destinations included in the
+allowance. I32 inputs keep their dtype. Boolean unions use the existing logical
+worker; none of these operations converts integer identifiers through floating
+point storage.
+
+CPU biased tensor-linear operations retain their distinct AddMM source. The
+selected F32 tiled path accounts for the real bias copy and matrix tasks, their
+three-input cleanup, weak copy owners, and one possible output backing. The
+frontend quote includes weight transpose, bias broadcast, and any batch flatten
+and restore views. Native evaluation validates the exact AddMM primitive,
+immutable CPU selection, matrix interiors and readable bias span; constructed
+linear modules retain their separate Matmul-plus-Add sequence.
+
+Borrowed F32 and I32 tensor slices retain their exact host constructor in the
+neutral trace. MLX realizes it as one eager backing and a stream-bound Copy
+alias. CPU admission prices the actual alias evaluation and its cleanup without
+a numerical task or second payload; native evaluation checks the same shape,
+dtype and readable source extent, including empty aliases. Generic scalar-fill
+initialization remains a separate operation and requires its own source facts.
+Signed and unsigned integer fills retain their typed scalar constructor and the
+shared Broadcast/Full worker, including the eager seed backing. Prepared spatial
+rotary execution preserves widened I64 coordinates through slicing and reshape;
+its CPU source uses the actual column strides and borrowed reshape planner before
+the existing arithmetic, concatenation and trigonometric workers.
+Ordinary text prompt preparation has its own final-shape U32 upload descriptor:
+the native worker creates one eager backing without a lazy Copy, while the
+report separately retains the caller's actual host capacity and text identity
+controls. This descriptive upload quote does not supply original token-input
+authority or waive the ordinary request's reservation and source checks.
+
+Completed parameter replacements remain explicit sources when a bounded policy
+loads a later unit. The layerwise snapshot retains their immutable owner and
+copies descriptor facts under the funded preparation context. Its borrowed rows
+perform no native calls. Retained rows require the same actual backing installed
+in the parameter table; native allocation generations join aliases with static
+parameters, including full capacities and physical placement. Prospective lease
+destinations remain separate materialization contributions. The existing native
+binding worker chooses one fallible handle per row, and invocation checks reject
+a different replacement owner before any unit slot is populated.
+
+An escaping standalone numerical replacement keeps its completed arena and
+numerical account. Publication selects those sources by authenticated native
+budget, allocation generation, full capacity and placement, then exchanges them
+alongside the immutable parameter values. Workspace bindings combine these
+completed roots with existing registry pins and, where applicable, prepared media
+roots in one checked selection. The source account remains in the same retained
+registration through residual quotation and copying; it creates neither another
+payload charge nor a registry entry for an arena-backed root. Restoring original
+parameters restores their source subset, allowing unrelated replacement arenas
+to retire. Standalone numerical custody grants no speculative request role.
 
 An explicitly selected F32 tiled CPU GatherMM uses the same SIMD matrix worker
 as selected Matmul. Ordinary and admitted execution share its checked matrix
@@ -840,12 +1744,28 @@ dtype without floating representation evidence. Changed operand shapes contribut
 their actual Broadcast alias producers before the binary task; native evaluation
 still checks strides, physical spans and signed loop limits. The logical peer
 dependency keeps its typed zero, multiply and add sequence unchanged.
+Checked CPU axis-zero gathers retain the selected complete trailing slice at
+source ranks one through four. Their quote uses the existing signed-index
+validation, native Gather and Squeeze sources, including all trailing dimensions
+and the native worker's combined-rank limit.
 
 Ungrouped learned-offset RMS normalization uses the shared CPU RMS recipe. The
 explicit F32 offset promotes the learned gain before normalization, so the recipe
 counts that cast/add sequence, its scalar source and vector backing, and the F32
 result. Width-one means retain their actual identity-cast reduction. Grouped RMS
-keeps its distinct reshape and final input-precision cast sequence.
+keeps its distinct reshape and final input-precision cast sequence. Its caller
+source follows the actual cast, grouped reshape, weightless RMS, output reshape
+and optional gain operations. Positive Metal rows select the F32 row kernel;
+CPU and empty rows select the arithmetic fallback. Shape vectors and returned
+handles are included independently of numerical backing.
+
+CPU LayerNorm follows the same native fallback as ordinary execution. Its source
+retains both F32 mean reductions, centering and variance arithmetic, actual
+optional affine casts, and the final selected precision. Eager mean divisors,
+epsilon and absent affine defaults have separate backing births. Every primitive
+uses the selected stream, and the named fallback reports its own control frames.
+Unknown operand precision or unsupported row geometry remains an identified
+missing numerical source.
 
 The explicit CPU attention recipe follows the shared score-policy worker:
 K/V head expansion, score-precision casts and products, optional soft-capping,
@@ -853,6 +1773,13 @@ Boolean or additive masks, optional sink logits, F32 softmax, and the final
 query/value-precision product. It uses retained scalar and stride facts for
 reshape and matrix-copy admission. Its source population is distinct from the
 native fused SDPA fallback and from bounded query/key recurrence.
+
+The fused CPU SDPA fallback accepts proved contiguous final-axis rows with gaps
+between them. Its query-scaling product creates a dense input for the first
+matrix product; a key or value that retains its gapped layout contributes the
+existing matrix worker's compaction source. A precision-changing cast already
+creates a dense operand and does not require that additional copy. Missing row
+evidence remains an unavailable source.
 
 Sliding-window CPU planning composes each actual query tile from three source
 views, the shared causal-mask recipe, and its selected attention recipe. The
@@ -866,6 +1793,12 @@ Unbounded gated products compose the selected activation recipe with the shared
 multiplication recipe using the activation's resulting precision. SiLU and sigmoid
 keep their F32 internal arithmetic and final F16/BF16 cast.
 
+CPU scalar multiplication composes its actual eager F32 scalar with the same
+binary worker used by tensor multiplication. Complete strided rows retain their
+readable backing geometry through the native source checks. F16 and BF16 operands
+use the quoted promotion copy before the F32 result; scalar and output storage
+remain separate births.
+
 The neutral `zeros_like` trace delegates to the existing typed zero constructor,
 using the prototype's authenticated scalar precision and shape without claiming
 its values as graph inputs. Generic host initialization remains a separate
@@ -873,6 +1806,14 @@ contract. CPU empty reshape and squeeze use their actual shared-buffer workers:
 they produce no task, Data owner or physical backing, and retain the complete
 input owner even when a zero-element view holds a nonempty allocation. Exact
 shape, inferred-dimension and singleton-axis checks still precede admission.
+CPU transpose preserves exact input strides through its selected permutation,
+including slices with gaps between rows. A reshape that only inserts or removes
+unit axes retains its nonunit steps after the native planner proves an alias.
+Singleton coordinates carry canonical strides. A later noncontiguous reshape
+that removes a leading singleton prices both the existing alias and General-copy branches,
+retains either backing owner, and preserves only their common scalar fact.
+These alias facts do not establish a dense layout or replace complete backing
+custody with the selected region's byte count.
 
 CPU Slice preserves the native distinction between a partial empty result and
 a whole-shape identity. The partial empty worker calls `allocate_data(0)`: its
@@ -902,6 +1843,12 @@ quote alone does not qualify an entire high-rank CPU pipeline. The recorded
 rank-11 to rank-12 Broadcast exceeds the native alias source's rank-five limit
 and retains `GraphFailure::invalid_layout` under a real physical budget, followed
 by positive record retirement. No larger budget changes that source requirement.
+
+Contiguous CPU reshape uses the native source's checked arbitrary-rank layout
+witness. Its out-of-line shape and stride controls are priced by that source;
+the view retains the complete backing allocation without another storage charge.
+This witness requires proven row contiguity and does not extend the separate
+fixed-rank limits of Broadcast, strided views or other native workers.
 
 CPU host spill and reload use the existing native General-copy workers and the
 same admitted Host source owners as their ordinary counterparts. Their exact
@@ -940,11 +1887,136 @@ equations with the same paid context. It does not disable lifecycle, cancellatio
 transport, or retained-media cut callbacks; those remain at their existing
 completion boundaries.
 
+Independent autoregressive and Embedded model capture share the same neutral
+request-owned cumulative ledger and funded host collector. Each retains its
+own genuine occurrence role. An autoregressive role admits the sum of its exact
+recorded prefill-frame plans, including each physical width and global window,
+then constructs an owned frame bank before native execution. The same source
+readout predicate permits a Sequence output demand only when the selected
+prefill capture or edit requires it; all other role geometry remains exact.
+The bank issues
+frames in the same order as actual prefill-span claims; sequence decode consumes
+one frame. Cloning a role, restoring state, or abandoning a callback does not
+restore a spent frame or refund capture usage. Frame outputs and typed failures
+retain the accepted account through their final aliases. These host contracts
+supply no native observer, scope, numerical source, or completion authority.
+
+Independent partition equations borrow the selected constructor's exact local
+state and retained communication declaration through the same partition worker
+and collective recorder as ordinary text. Every recorded prefill span, or the
+single sequence-decode span, retains its own parallel invocation. The admitted
+AR completion lends that invocation and its actual root owner to the shared
+native callbacks. A lexical session binding removes the loan on success, error
+or unwind, including when execution fences the session; teardown does not claim
+completion, restore a spent occurrence or release pending recovery custody.
+Each retained model row quotes its actual expert integer publications and admits
+those constructors as a distinct component of its source program. That bank moves
+once into the same model control owner, which authenticates the accepted source
+account before lending a constructor. Sampling, parameter materialization and
+cache construction retain their separate banks and lifetimes.
+
+Embedded target and prediction quotes consume the retained partition constructor,
+its communication declaration, and the selected rank-local state. Target-only
+construction preserves the extension's retained placement without materializing
+prediction modules. Prediction quotes apply the same typed target operations and
+prediction equation worker as execution. Target hidden capture remains independent
+of vocabulary demand and follows the ordinary partition capture/publication path.
+Request-funded reconstruction reuses the exact load-time store-validation witness;
+a symbolic communication description or metadata account cannot replace it.
+
+Independent-target discovery projects the ordinary architecture descriptor and
+target hook support without requiring a prediction-extension catalog. It omits
+prediction-only scopes. Execution revalidates those same borrowed declarations
+against the actual selected autoregressive schedule, source identity and role;
+the descriptive discovery report grants no invocation authority. Partitioned target revalidation borrows the actual loaded layout and collector phase report, checks their artifact and execution identity against the selected source, and uses the same declaration validator. An ordinary single-source report cannot qualify that route.
+
+Before/after intervention fragment plans retain their exact companion storage identity, operation ordinal, side, physical shape and logical window. The model frame admits both destinations with its existing role, consumes the pair once, and keeps that role account alive through the final Host alias. A text prefill causal selection is required only for the text traversal; explicit model invocation evidence uses its retained invocation coordinates. The backend evidence companion retains the loaded component coordinate maps and sealed per-side scalar facts, then binds the consumed Model Hosts through the same two-side program constructor used by Text. Source-owned metadata queries cover those actual map copies, selected row tables and label copies. Borrowed receipt descriptors supply the later protocol census without constructing another receipt or admission.
+
+The funded partition receipt worker retains explicit invocation axes through
+native geometry, decoding and the final assembly charge. Its final destination
+must belong to the same source, phase, prediction and invocation. Owned fragment
+quotations retain their immutable receipt and are consumed once by the admitted
+model frame; the shared destination constructor preserves the actual Text or
+Model account custody. These quotations do not grant transport or native work.
+The shared native frame constructor borrows the retained loaded partition
+publication and consumes those same funded fragment slots. Its immutable
+protocol census comes from the receipt exchange's checked payload width and
+fixed frame kinds. Source-only transport demands retain each scheduled source
+vote, the enclosing coordination checks, receipt writer, and each rank's byte
+decoder scratch, including inactive ranks. Native gather quotation uses the
+actual retained Group, copied-U32 input layout, completion source and the same
+caller-control queries as execution; it constructs no placeholder tensor.
+Single and batched independent requests retain the target session's exact
+partition publication and communication source before entering its model
+operation. Each target role borrows that retained pair under its own admitted
+budget. Draft roles keep their separate source identity and cannot borrow the
+target's transport by default. The local autoregressive unit bank accepts a
+partitioned execution only when its actual equation recipe retains one common
+communication source across every span. The same local policy and selected
+stream construct the unit bank; the communication worker separately validates
+the retained group and active scope. Publication settles its intermediate leaf and
+closes the model construction bank. Autoregressive row readout retains its
+actual Index trace; captured prefill retains the exact final-row Index operation
+from its observed model span, using the local output on its producer and the
+received publication on other ranks. A selected publication quotes an independent
+construction bank from those source facts before converting cumulative extents
+to Graph capacity. The same role and observer open that bank once, retain it
+through failure or recovery, and use the existing merged final completion.
+Explicit physical axes and logical row windows remain separate. Receipt context
+retains both the logical invocation and the exact physical interval; canonical
+identity and decoding distinguish equal-width windows with different starts.
+The existing window geometry worker intersects the selection before spatial
+producer projection. Complete and partial windows then use the same funded
+fragment destinations, assembly, delivery votes and evidence publication.
+Final destinations authenticate the original source, physical axes and window,
+including on failure, and retain the accepted account until the last owner drops.
+
+The runtime's prospective partition constructor queries use the same fixed
+controls, exact UTF-8 label formatter and selected-row allocation workers as
+execution. Projected rows share their actual table; routed rows retain the
+additional hook table. Epoch-label queries describe the same run-name formatter
+without binding an epoch. These queries reserve no capacity and grant no source
+or execution authority. Receipt preparation, protocol callbacks and delivery
+remain separate contributions to the accepted model role. Receipt execution
+queries retain the actual complete, contiguous or routed source mode. They
+compose reconstruction, evidence, allowance and the same closed encoder/decoder
+workers, including the existing parser estimate at the receipt's maximum wire
+size. The program separately quotes its once-only evidence table and fixed entry
+controls. Source-labelled queries neither fabricate a context nor execute a
+worker to estimate its storage.
+
+The shared text and media session workers accept an explicit observer alongside
+their existing completion callback. Observation failure and completion failure
+use the same transaction rollback. Independent-decoder orchestration carries
+the collector's scheduler origin, delivery and snapshot authority through its
+existing prefill and cached-sequence invocation workers. A cold prospective
+capture description retains the source's funded metadata without beginning an
+invocation or spending capture usage. Its physical prefill span must match the
+recorded input range, cache position and output demand; the native adapter must
+separately authenticate the genuine model role and completion resources.
+
 Raw capture/intervention declarations are admitted after actual request geometry
 is known. Core's intervention validator and copy producer are shared by ordinary
 and funded admission. Runtime's paid support projection copies requested targets;
 architectures authenticate family points and retained partition placement. A
 backend supplies mechanism facts rather than semantic branch logic.
+
+Partition intervention transcripts retain the exact physical model invocation and
+its optional logical row window alongside the source-owned component projection.
+Equal physical widths at different logical offsets have distinct source identities.
+The local allowance validates those coordinates against the original frame claim
+before spending edit credits; the final outcome revalidates them on return.
+Descriptor metadata queries describe the same paid copy worker and grant neither
+a claim nor native execution authority.
+
+The intervention claim bank retains two activation evidence rows or four routing
+rows: expert IDs and coefficients before and after the operation. Each field
+has its own ordered, nonrefundable claim within the same account. Unsigned IDs
+use a fixed U64 host destination; floating coefficients use F32. Native source
+types must match those declared categories, and host quotation uses the actual
+element width. Prefill keeps these targets across every canonical chunk, including
+chunks that contribute no values to a bounded Preview. Missing or abandoned hooks
+prevent successful delivery. Logical completion does not certify native completion.
 
 `CaptureSourceConstruction` is core's borrowed prospective descriptive-copy
 policy; it grants no admission or submission authority. Architectures publish a
@@ -1001,10 +2073,35 @@ authority; a reset does not convert or revoke that authority. Embedded predictio
 state has no whole-state admitted reset profile and retains its ordinary reset
 path.
 
+Native-state discovery and atomic exchange are neutral primitive contracts.
+Allocating snapshot and copy operations require the complete prepared continuation
+source and its host/native reservations, including when configured limits are
+unlimited. The primitive state interface has no unadmitted allocating copy hook.
+
 Saved-array and pending-input copy admission selects native resource requirements
 from the retained execution stream. CPU copies use the shared CPU copy worker
 without requiring the Metal feature, with no GPU pipeline lookups. Source
 completion, physical-buffer admission and destination custody remain required.
+
+An empty paged state still owns a cache manager. Autoregressive startup and
+state copying lend the inspected KV or grouped source to the same independently
+admitted paged-manager and tail-copy worker, even when there are no array
+operands. Grouped copies preserve every parent and fixed-role child table;
+present fixed values use the same completed numerical copy worker and remain
+under its custody. Saved grouped sources retain their own exact manager and
+table identities. The host-only empty-table constructor remains limited to
+sources with no additional manager construction.
+
+Autoregressive paged execution retains those actual manager sources beside its
+invocation recipe. It prepares the same canonical catalogs, append programs and
+Host itinerary, then binds them to the admitted speculative account and exact
+span plan. Each claimed prefill span, or the sole decode invocation row,
+authenticates both that account and the current native scope before lending the
+source bank. The existing recovery owner retains the bank through completion or
+failure; weak lookup storage does not own it or authorize another occurrence.
+The per-span source-facts table retains its original construction-metadata payer
+when moved into the role. Admission reserves its additional source-construction
+allowances without charging that already paid table backing again.
 
 Hybrid snapshot inspection and copying use the same grouped source worker for
 ordinary and prepared entry. Every actual fixed-role child table is retained
@@ -1123,6 +2220,12 @@ and dtype checks precede admission; only a complete successful read publishes an
 immutable source. Escaped array aliases retain the source account independently
 of the constructor wrapper, and failed reads retain their account with the typed
 error. Retained read metadata and runtime initialization are separate prerequisites.
+`EncodedRecipeReadView` borrows an admitted read's exact output and source records
+while its typed custody remains with the owning read. Reads with different custody
+types use the same detached-source constructor. Detachment copies funded metadata
+and retains authenticated backing identities; shape or content equality does not
+establish source identity. Detached read failures retain their own constructor
+custody after the detached source retires.
 Shared constructor failures can separate their uncalled plan from an owned
 failure. The failure retains typed causes, any completed output or failed prefix,
 and its original account. This allows borrowed planning inputs to retire without
@@ -1345,7 +2448,7 @@ The reservation completion callback runs once after header construction,
 before publishing its result. It ends active construction while retaining bytes;
 completion errors retain any completed metadata and preserve a simultaneous
 construction error as the primary source.
-Runtime supplies header admission through the existing working-memory pool.
+Runtime supplies header admission through the memory ledger.
 Its quote separates the encoded buffer, configurable metadata/dependency
 headroom and qualified fixed reservation/error controls. The metadata portion is
 an input-derived estimate, not a dependency-wide or process-wide ceiling.
@@ -1392,7 +2495,7 @@ for prepared reads without copying headers; generic closed provider ownership
 does not supply a typed acquisition route.
 
 Core inspection accepts a neutral SafeTensors source policy before discovery;
-runtime can supply it from a working-memory pool without core depending on
+runtime can supply it from a memory ledger without core depending on
 runtime. Strict inspection uses the same discovery and header workers, admitting
 the metadata map and tensor-descriptor map before copying them. Tensor-catalog
 clones share one immutable map and its retained custody. Equality and serialized
@@ -1429,10 +2532,14 @@ workspace coverage for the selected allocator and operators.
 Cold workspace selection also supports CPU-only Apple builds. Allocation facts
 query the compiled allocator through the native public layout API, independently
 of the selected operator stream. CPU bounds include the size header and page
-rounding used by original allocations, plus ordinary cache reuse. Ordinary Metal
+rounding used by original allocations and a conservative ordinary cache-reuse
+envelope that also covers fresh request allocations. Ordinary Metal
 bounds retain their own rounding rules; original Metal backing uses separately
-queried physical capacities. These buffer bounds do not cover allocator caches
-or establish a process-wide memory ceiling. CPU and Metal equations retain their
+queried physical capacities. The canonical backing census retains ordinary
+allocator-cache charges through cache reuse and releases them only on physical
+eviction. Bounded ordinary request sources bypass those cached roots and retire
+their own fresh backing at its final physical alias. These charges do not
+establish a process-wide memory ceiling. CPU and Metal equations retain their
 respective mechanism dispatch, and missing operator facts still reject admission.
 Shared sampling-constructor controls take the selected device explicitly. CPU
 workers retain their operation-specific layout accounting; GPU sampling also
@@ -1701,6 +2808,29 @@ exclusion. Missing unit parameters, unexpected rows and incompatible
 representations still refuse before replacement. The retained policy and
 exact names establish source identity; the owner outlives policy retirement.
 
+Ordinary indexed-bank construction retains its originating host payer and checks
+the actual bank revision and chunk census. Compact construction uses the same
+physical row binder for acquired leases and published replacement views. Its
+host quotation composes the concrete source visitor, finite row destinations,
+prepared bindings, grouped specification copies and selected module constructor.
+The constructor reads the same physical-field declarations used by its quote;
+companion copies include their authoritative weight identity. Replacement-view
+controls use the largest actual candidate rank for each possibly selected field.
+Discovery, acquisition, materialization, native allocation and completion retain
+their separate source requirements; a compact-constructor quote grants none of
+those authorities.
+
+Ordinary acquisition funds the same prepared controller, closure, named array,
+lease and recovery destinations through its request's host account. This funding
+does not supply an original-operation observer. Retained immutable Host backups
+serve both Host publication and Device copying through the shared transfer worker;
+Host publication preserves the existing backing owner and receipt. Actual source
+pins and metadata custody remain with the invocation through completion and
+deferred unpinning. Cold acquisition facts report request metadata, physically
+observed host controls, Host staging and Device destinations separately. Existing
+pinned backing is not charged as a fresh allocation. Recipe materialization or
+transfer execution without a qualified source contribution remains incomplete.
+
 The MLX Host and foreground Disk parameter sources retain the exact selected
 stream's scalar identity and device. CPU and Metal destinations use the same
 paid source-manager constructor and residency lifecycle; CPU selection does not
@@ -1712,8 +2842,10 @@ selected destination. Copy quotation selects the actual CPU General-copy and
 completion controls or Metal dispatch controls from that retained device.
 Completed source descriptors enlarge traversal storage without duplicating the
 equation worker population. CPU source shapes additionally prove positive
-signed-index geometry; rank and dtype remain subject to the native CPU copy
-query. The existing Transfer/MetalShared Host-backing requirement is preserved
+signed-index geometry; the native CPU host-copy source covers ranks one through
+five for F32, F16, BF16, I32 and U32 through the existing General-copy worker.
+Its rank-dependent iterator and weak-descriptor storage comes from that worker's
+checked source query. The existing Transfer/MetalShared Host-backing requirement is preserved
 for both destinations, independently of which device executes the copy.
 Layerwise parameter construction uses that same destination witness for CPU
 and Metal. Each named unloaded slot contributes its actual scalar seed and
@@ -1729,6 +2861,15 @@ Supplementary sources retain their own slot inventory and never index the main
 execution units' constructor table through a shared manager.
 Sampling spans on
 the same recorder remain separate and do not reconstruct model parameters.
+The same cold acquisition callback records the ordered unit ordinals for each
+equation span. Its paid visit lists move into the native recipe with the
+constructor census. Background Disk preparation consumes the generation subset
+of those exact records, excluding the conservative final decode. Each forward
+keeps its own selected windows and their original Host lookahead; decoder spans
+do not acquire encoder units omitted by their actual traversal. Runtime checks
+the first and subsequent ordinals against that prepared list and requires every
+selected window to complete before joining the worker. These descriptive visits
+grant no source ownership or execution authority.
 CPU and Metal descriptive reports share the exact eager dtype-sized scalar
 backing and zero disjoint Host-payload facts for unloaded slots, keeping tensor,
 Host and residual totals complete. These facts do not certify a native CPU
@@ -1751,6 +2892,21 @@ requires healthy inactive registries with no registered roles, pending leases,
 preparation loans or active background forward. Deactivation neither clears
 registrations nor refunds counters. Speculative and realtime banks retain their
 existing single-invocation activation and failure custody.
+
+Materialization borrows the enclosing role's native backing budget and accepted
+host metadata account. Text registries retain the selected native bank and
+validate its control guard before lending that budget. Nested and standalone
+numerical roles lend the budget retained by their actual native role context.
+Speculative and realtime banks retain the same explicit loan from the accepted
+role, and authenticate its registered observer before every materialization.
+Embedded invocation binding receives the actual recovery owner's budget and
+metadata account before graph construction.
+Inactive, stale or borrowed sources refuse before invoking the materializer.
+These loans do not create another reservation or infer authority from the current
+stream. Ordinary materialization requirements follow the recorded layerwise
+visits and their selected windows; physical temporary allowances join the request's
+domain vector, while caller metadata enters the corresponding work owner's host
+allowance. Existing source storage remains pinned under its own identity.
 Prediction roles keep their registration in the same native recovery node.
 Successful retirement destroys its payload, drains that exact observer's records,
 then removes the live registration without restoring the cumulative role count.
@@ -1801,12 +2957,6 @@ boundaries; manual composite/pipeline traversal contributes no unexecuted group
 submissions or consumer waits. The backend consumes this declaration in quote,
 source facts and installation. Resident addressable registries and bounded final
 output completion keep their independent authority and accounting.
-The executor separately declares its group-submission mechanism. Direct and routed
-layered drivers retain their ordinary initial/group completion source; manual
-composite and pipeline traversals reserve only the policy completions they call.
-This distinction preserves bounded final-output completion and the registered
-resident owner needed by indexed children, without adding nonexistent graph
-boundaries merely because a parameter policy is available.
 Expert-region declarations carry the exact local
 physical members, compact-bank byte policy, tensor partition and finite received-row
 ceiling. Direct and exchanged Units observations use the same physical addressable
@@ -1900,3 +3050,25 @@ in the [validation guide](bounded-inference-validation.md) and its result record
 The [design guide](bounded-inference-design.md) describes execution ownership;
 validation distinguishes portable contracts, native mechanisms and released
 requests with explicit platform and test-environment limits.
+
+Composite workspace populations retain the source's distinct new-allocation identities
+and original physical placement descriptors through the shared domain reducer.
+The fact producer lends this immutable population before scalar summation; its
+fixed placements and candidate-placement bases stay separate. Existing borrowed
+inputs do not become new child scratch. Repeated occurrences represent independent
+populations, and the same metadata account pays retained source and destination
+descriptors. Alternative completed paths resolve those original descriptors before
+the core per-domain peak comparison; a scalar-largest branch does not substitute
+for the largest requirement in every physical domain. Charges preserve accounted
+allocation versus candidate-placement allowance categories and all retained bases.
+The MLX movement producer retains its actual zero, unit, and maximum-row cold
+branches through this loan; executing its ordinary worker does not copy planning
+descriptors. Expert, count, provider, reorder and transport composition retains
+each selected numerical child and native CPU communication allocation source.
+Retained outputs use the same allocation and alias graph: each raw backing row
+keeps its placement, allocation count and host controls, while a zero-byte union
+root retains those rows and any actual input-alias alternatives. Pipeline frame
+buffers and decoded tensor buffers therefore remain separate through closing,
+state displacement and borrowed-source exclusion. Resolved alternative maxima
+cannot substitute for output backing identities. The descriptive loans grant no
+storage credit or native permission.

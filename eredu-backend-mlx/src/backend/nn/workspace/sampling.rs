@@ -57,15 +57,25 @@ pub(super) fn sort_fixed(
 pub(super) fn token_validation_layouts(
     operation: WorkspaceOperationView<'_>,
 ) -> Option<[WorkspaceLayoutView<'_>; 2]> {
-    let WorkspaceOperationKindView::Sampling(
-        WorkspaceSamplingOperation::ValidateToken { cardinality },
-    ) = operation.kind else { return None; };
+    let WorkspaceOperationKindView::Sampling(WorkspaceSamplingOperation::ValidateToken {
+        cardinality,
+    }) = operation.kind
+    else {
+        return None;
+    };
     let [input] = operation.inputs.array()?;
     let [output] = operation.outputs.array()?;
-    if *cardinality == 0 || *cardinality > i32::MAX as u32
-        || !matches!(input.dtype(), WorkspaceDtype::Int32 | WorkspaceDtype::Uint32)
-        || output.shape() != input.shape() || output.dtype() != WorkspaceDtype::Int32
-    { return None; }
+    if *cardinality == 0
+        || *cardinality > i32::MAX as u32
+        || !matches!(
+            input.dtype(),
+            WorkspaceDtype::Int32 | WorkspaceDtype::Uint32
+        )
+        || output.shape() != input.shape()
+        || output.dtype() != WorkspaceDtype::Int32
+    {
+        return None;
+    }
     Some([input, output])
 }
 
@@ -117,10 +127,17 @@ pub(super) fn emit(
             0
         }
         S::SelectRandomKey { index } => {
-            if op.inputs.len() != 1 || input.dtype() != WorkspaceDtype::Uint32
-                || input.shape().len() != 2 || input.shape()[0] <= 0 || input.shape()[1] != 2
+            if op.inputs.len() != 1
+                || input.dtype() != WorkspaceDtype::Uint32
+                || input.shape().len() != 2
+                || input.shape()[0] <= 0
+                || input.shape()[1] != 2
                 || u64::from(*index) >= input.shape()[0] as u64
-                || out.shape() != [2] || out.dtype() != WorkspaceDtype::Uint32 { return Err(invalid()); }
+                || out.shape() != [2]
+                || out.dtype() != WorkspaceDtype::Uint32
+            {
+                return Err(invalid());
+            }
             alias = true;
             0
         }
@@ -129,7 +146,8 @@ pub(super) fn emit(
                 || input.shape() != [2]
                 || input.dtype() != WorkspaceDtype::Uint32
                 || out.shape().len() != 2
-                || out.shape()[0] <= 0 || out.shape()[1] != 2
+                || out.shape()[0] <= 0
+                || out.shape()[1] != 2
                 || out.dtype() != WorkspaceDtype::Uint32
             {
                 return Err(invalid());
@@ -138,19 +156,31 @@ pub(super) fn emit(
             buffer_capacity(a, mul(out.elements()?, 4)?)?
         }
         S::UniformUnitInterval => {
-            if op.inputs.len() != 1 || input.shape() != [2]
+            if op.inputs.len() != 1
+                || input.shape() != [2]
                 || input.dtype() != WorkspaceDtype::Uint32
-                || out.shape() != [1] || out.dtype() != WorkspaceDtype::Float32 {
+                || out.shape() != [1]
+                || out.dtype() != WorkspaceDtype::Float32
+            {
                 return Err(invalid());
             }
             // Four eager low/high/upper/maxval scalars, two initial casts,
             // RandomBits, five binary workers and one restoration cast.
             // Each binary bound includes both operand casts/copies and result;
             // all capacities remain live conservatively through completion.
+            sink.default_scratch(mul(4, capacity(a, 1)?)?, 4)?;
             add(mul(8, capacity(a, 1)?)?, mul(5, pointwise(a, 1, 2)?)?)?
         }
         S::ValidateToken { .. } => {
-            if token_validation_layouts(op).is_none() { return Err(invalid()); }
+            if token_validation_layouts(op).is_none() {
+                return Err(invalid());
+            }
+            let (bytes, births) = super::indexing::token_validation_default_scratch(
+                input.elements()?,
+                EmbeddingLookupPolicy::Strict,
+                a,
+            )?;
+            sink.default_scratch(bytes, births)?;
             add(
                 capacity(a, input.elements()?)?,
                 embedding_validation_cost(
@@ -212,6 +242,9 @@ pub(super) fn emit(
                     // RandomBits; uniform divide/min/cast/multiply/add; four
                     // Gumbel unary operations; addition to logits; argmax.
                     // Include each possible cast and all uniform/fill scalars.
+                    // Gumbel adds no eager sources beyond uniform low, high,
+                    // nextafter(1, 0) and the U32 maximum converted to F32.
+                    sink.default_scratch(mul(4, scalar)?, 4)?;
                     add(add(mul(25, full)?, mul(21, scalar)?)?, row)?
                 }
                 S::Penalties {
@@ -221,6 +254,12 @@ pub(super) fn emit(
                 } => {
                     let mut total = 0;
                     if *repetition {
+                        // Bool upload, two separately constructed penalty
+                        // scalars, and the positive-logit comparison zero.
+                        sink.default_scratch(
+                            add(buffer_capacity(a, elements)?, mul(3, scalar)?)?,
+                            4,
+                        )?;
                         total = add(
                             buffer_capacity(a, elements)?,
                             add(
@@ -230,6 +269,7 @@ pub(super) fn emit(
                         )?;
                     }
                     if *additive {
+                        sink.default_scratch(full, 1)?;
                         total = add(total, add(full, pointwise(a, elements, 2)?)?)?;
                     }
                     // A disabled or zero-window operation can preserve input.
@@ -239,14 +279,17 @@ pub(super) fn emit(
                     if *keep == 0 || u64::from(*keep) >= width {
                         return Err(invalid());
                     }
-                    // Native partition is Metal sort; its sliced result may
-                    // retain the entire buffer. Then min, comparison and where.
+                    sink.default_scratch(scalar, 1)?; // mask_logits negative infinity
+                                                      // Native partition is Metal sort; its sliced result may
+                                                      // retain the entire buffer. Then min, comparison and where.
                     add(
                         add(sort_fixed(a, elements, rows, width)?, reduction()?)?,
                         add(pointwise(a, elements, 2)?, pointwise(a, elements, 3)?)?,
                     )?
                 }
                 S::TopP => {
+                    // Threshold, mask negative infinity and dense-fill seed.
+                    sink.default_scratch(mul(3, scalar)?, 3)?;
                     // Negative, sort, gather (including index/layout copies),
                     // softmax, scan/copy, subtract, compare, mask, fill/cast,
                     // and scatter with source/index/update copies.
@@ -267,6 +310,7 @@ pub(super) fn emit(
                     total
                 }
                 S::MinP => {
+                    sink.default_scratch(mul(2, scalar)?, 2)?;
                     let mut total = add(full, reduction()?)?;
                     for bytes in [
                         pointwise(a, rows, 2)?,
@@ -278,12 +322,20 @@ pub(super) fn emit(
                     total
                 }
                 S::TokenFilter | S::OptionalTokenFilter => {
+                    // Uploaded Bool mask and mask_logits negative infinity.
+                    sink.default_scratch(add(buffer_capacity(a, elements)?, scalar)?, 2)?;
                     add(buffer_capacity(a, elements)?, pointwise(a, elements, 3)?)?
                 }
                 S::MirostatCutoff => {
                     if rows != 1 {
                         return Err(invalid());
                     }
+                    // Cutoff and negative infinity are F32; fallback and
+                    // keep-best construct separate Bool fill seeds.
+                    sink.default_scratch(
+                        add(mul(2, scalar)?, mul(2, buffer_capacity(a, 1)?)?)?,
+                        4,
+                    )?;
                     let mut total = add(add(full, reduction()?)?, row)?;
                     for bytes in [
                         scalar,
@@ -314,7 +366,10 @@ pub(super) fn emit(
     }
     sink.output(if alias {
         Output::AliasInput(0)
-    } else if matches!(kind, S::SplitRandomKey | S::UniformUnitInterval | S::Greedy | S::Categorical) {
+    } else if matches!(
+        kind,
+        S::SplitRandomKey | S::UniformUnitInterval | S::Greedy | S::Categorical
+    ) {
         Output::Allocate(output)
     } else {
         Output::AllocateOrAliasInputs {

@@ -71,7 +71,9 @@ impl PreparedPrefillSource<Rows, FakeBackend, State> for Input {
     fn prepare_chunk(&self, chunk: &PrefillChunk, _: &()) -> Result<FakeTensor, Error> {
         self.events.borrow_mut().prepared.push(chunk.input.clone());
         if chunk.input.start > 0 && self.fail == Fail::Source {
-            return Err(Error::backend_retained_source(Sentinel(self.identity.clone())));
+            return Err(Error::backend_retained_source(Sentinel(
+                self.identity.clone(),
+            )));
         }
         if chunk.input.start > 0 && self.fail == Fail::Panic {
             std::panic::panic_any(self.identity.clone());
@@ -164,7 +166,9 @@ impl ScheduledCaptureBackend for Backend {
     ) -> Result<ClaimedCaptureTensor, Error> {
         let mut writer = claim.prepare().map_err(Error::backend_retained_source)?;
         for &n in &value.0 {
-            writer.push_f32(n as f32).map_err(Error::backend_retained_source)?;
+            writer
+                .push_f32(n as f32)
+                .map_err(Error::backend_retained_source)?;
         }
         Ok(writer.finish().unwrap())
     }
@@ -202,7 +206,7 @@ impl ScheduledCaptureBackend for Backend {
     }
 }
 struct Original {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     root: WorkingMemoryStorage<u32>,
     source: SharedCapturePlan,
     selection: PreparedCaptureSelection,
@@ -221,8 +225,8 @@ impl Original {
         seal: bool,
         explicit_source: bool,
     ) -> Self {
-        let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::memory::host_ledger(4_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let source = source(g, body);
         let selection = session
             .shared_observation_paths()
@@ -234,7 +238,7 @@ impl Original {
         // every cold candidate rather than rebinding after acceptance.
         let joined = explicit_source.then_some(&root);
         let q = candidate_quote(&pool, &source, &selection, g, seal, joined);
-        let exact = 64 + q.incremental_bytes();
+        let exact = pool.live_charge_bytes().unwrap() + incremental_reservation_bytes(&pool, &q);
         let mut rejected = Vec::new();
         let rejection = accept(session, &pool, g, exact - 1, |candidate| {
             let quoted = if candidate == g {
@@ -246,8 +250,8 @@ impl Original {
             // For this scalar fixture, smaller chunks keep the same tensor/H
             // demand and may enlarge the actual retained record capacity.
             // Inspect each real quote; do not invent a retry budget failure.
-            assert!(quoted.incremental_bytes() >= q.incremental_bytes());
-            rejected.push((candidate, quoted.incremental_bytes()));
+            assert!(quoted.incremental_bytes().unwrap() >= q.incremental_bytes().unwrap());
+            rejected.push((candidate, incremental_reservation_bytes(&pool, &quoted)));
             quoted
         })
         .err()
@@ -263,13 +267,14 @@ impl Original {
         assert!(
             matches!(
                 &rejection,
-                PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded {
-                    required_bytes, available_bytes,
-                }) if *required_bytes == last_required && *available_bytes == q.incremental_bytes() - 1
+                PrefillPlanningError::Reservation(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded {
+                    domain, requested_bytes, existing_bytes, limit_bytes,
+                })) if *domain == pool.topology().host_domain() && *requested_bytes == last_required
+                    && *limit_bytes - *existing_bytes <= incremental_reservation_bytes(&pool, &q) - 1
             ),
             "{rejection:?}"
         );
-        assert_eq!(pool.used_bytes().unwrap(), 64);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 64);
         let mut admitted_candidates = Vec::new();
         let (r, accepted) = accept(session, &pool, g, exact, |candidate| {
             admitted_candidates.push(candidate);
@@ -279,13 +284,23 @@ impl Original {
         .unwrap();
         assert_eq!(admitted_candidates, [g]);
         assert_eq!(r.geometry(), g);
-        assert_eq!(r.bytes(), q.incremental_bytes());
-        assert_eq!(r.admission().incremental_required_bytes, q.incremental_bytes());
+        assert_eq!(
+            r.requirements()
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+            incremental_reservation_bytes(&pool, &q)
+        );
+        assert_eq!(
+            r.admission().incremental_required_bytes,
+            q.incremental_bytes()
+        );
         assert!(accepted
             .span_workspace()
             .plan()
             .same_plan(q.span_workspace().plan()));
-        assert_eq!(pool.used_bytes().unwrap(), exact);
+        assert_eq!(pool.live_charge_bytes().unwrap(), exact);
         let (r, run) = r.into_funding().unwrap();
         let (owner, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
         Self {
@@ -306,7 +321,7 @@ impl Original {
     fn bank(&self) -> FundedCaptureSession {
         self.run
             .prepare_capture_run(
-                self.request.memory_reservation().unwrap(),
+                self.request.memory_reservation(),
                 CaptureRunHostPlan::prepare(&self.source).unwrap(),
             )
             .unwrap()
@@ -518,9 +533,12 @@ fn run(
     for prediction in 1..4 {
         let value = FakeTensor(vec![prediction as i32 + 1]);
         let result = bank
-            .with_observer(&mut backend, prediction, &Error::backend_retained_source, |o| {
-                session.decode_input_with_observer(&value, &(), o)
-            })
+            .with_observer(
+                &mut backend,
+                prediction,
+                &Error::backend_retained_source,
+                |o| session.decode_input_with_observer(&value, &(), o),
+            )
             .unwrap()
             .unwrap();
         outputs.extend(result.0);
@@ -544,7 +562,10 @@ fn run(
     drop((backend, bank, session));
     drop(original);
     let source_bytes = if explicit_source { 64 } else { 0 };
-    assert_eq!(pool.used_bytes().unwrap(), h + protected + source_bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        h + protected + source_bytes
+    );
     let source_pin = pool.pin_registered_storage([(1u32, 64)]);
     if explicit_source {
         drop(source_pin.expect("full original source witness still pins key 1"));
@@ -555,9 +576,9 @@ fn run(
         ));
     }
     drop(frames);
-    assert_eq!(pool.used_bytes().unwrap(), protected + source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected + source_bytes);
     drop(plan);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(matches!(
         pool.pin_registered_storage([(1u32, 64)]),
         Err(WorkingMemoryError::IdentityMismatch)
@@ -663,13 +684,13 @@ fn admitted_sequence_seal_rejects_missing_duplicate_equal_content_foreign_source
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    let held = original.pool.used_bytes().unwrap();
+    let held = original.pool.payload_used_bytes().unwrap();
     drop(original.run.scope().unwrap());
     assert!(matches!(
         original.owner.prefill_capture(bound),
         Err(WorkingMemoryError::ExecutionFenced)
     ));
-    assert_eq!(original.pool.used_bytes().unwrap(), held);
+    assert_eq!(original.pool.payload_used_bytes().unwrap(), held);
 }
 
 #[test]
@@ -774,7 +795,7 @@ fn sequence_gateway_checks_current_token_and_state_only_before_source_work() {
         if !state_only {
             // Parameter replacement publication invalidates the token while preserving
             // the immutable original path source and quote.
-            session.publish_parameter_replacements(&Default::default(), false).unwrap();
+            session.invalidate_parameter_observations();
         }
         let before = state(&session);
         let events = Rc::new(RefCell::new(Events::default()));
@@ -921,17 +942,22 @@ fn sequence_gateway_preserves_factory_observer_source_retirement_and_index_failu
     let mut bank = original.bank();
     let admitted = original.owner.prefill_capture(original.bound()).unwrap();
     let error = bank
-        .with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_retained_source, |o| {
-            invoke(
-                &mut session,
-                &original,
-                &events,
-                Fail::None,
-                &Arc::new(()),
-                &cancel,
-                o,
-            )
-        })
+        .with_admitted_prefill_observer(
+            &mut backend,
+            &admitted,
+            &Error::backend_retained_source,
+            |o| {
+                invoke(
+                    &mut session,
+                    &original,
+                    &events,
+                    Fail::None,
+                    &Arc::new(()),
+                    &cancel,
+                    o,
+                )
+            },
+        )
         .unwrap()
         .err()
         .unwrap();
@@ -967,17 +993,22 @@ fn sequence_gateway_cancellation_and_panic_keep_real_committed_frontier_and_abor
         let mut bank = original.bank();
         let admitted = original.owner.prefill_capture(original.bound()).unwrap();
         let result = bank
-            .with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_retained_source, |o| {
-                invoke(
-                    &mut session,
-                    &original,
-                    &events,
-                    Fail::None,
-                    &Arc::new(()),
-                    &cancel,
-                    o,
-                )
-            })
+            .with_admitted_prefill_observer(
+                &mut backend,
+                &admitted,
+                &Error::backend_retained_source,
+                |o| {
+                    invoke(
+                        &mut session,
+                        &original,
+                        &events,
+                        Fail::None,
+                        &Arc::new(()),
+                        &cancel,
+                        o,
+                    )
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(matches!(result, PrefillSourceOutcome::Cancelled));
@@ -1002,17 +1033,22 @@ fn sequence_gateway_cancellation_and_panic_keep_real_committed_frontier_and_abor
     let mut bank = original.bank();
     let admitted = original.owner.prefill_capture(original.bound()).unwrap();
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bank.with_admitted_prefill_observer(&mut backend, &admitted, &Error::backend_retained_source, |o| {
-            invoke(
-                &mut session,
-                &original,
-                &events,
-                Fail::Panic,
-                &identity,
-                &cancel,
-                o,
-            )
-        })
+        bank.with_admitted_prefill_observer(
+            &mut backend,
+            &admitted,
+            &Error::backend_retained_source,
+            |o| {
+                invoke(
+                    &mut session,
+                    &original,
+                    &events,
+                    Fail::Panic,
+                    &identity,
+                    &cancel,
+                    o,
+                )
+            },
+        )
     }))
     .err()
     .expect("original panic");

@@ -62,7 +62,6 @@ fn bind(
             CaptureTransformKind::FullTensor,
         ],
         max_histogram_bins: 128,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = ObservationSupportReport {
@@ -140,6 +139,53 @@ fn bind(
         },
     )
     .unwrap()
+}
+#[test]
+fn prepared_media_preview_keeps_bounded_transform_and_tensor_fragment_views() {
+    use crate::capture::CapturePrefillObservationPolicy;
+    for maximum in [0, 7] {
+        let binding = bind(
+            &[CaptureTransform::Preview {
+                max_elements: maximum,
+            }],
+            5,
+            2,
+            2,
+            true,
+            &[],
+            limits(),
+        );
+        let mut paths = source_paths();
+        Arc::get_mut(&mut paths.0).unwrap().media_prefill =
+            vec![PrefillObservationDeclaration::prepared_media_decoder(
+                "block.output".into(),
+                1,
+                PrefillReadoutStage::BeforeReadout,
+            )]
+            .into_boxed_slice();
+        let selected = paths
+            .prepare_media_capture_selection(binding.source())
+            .unwrap();
+        let policy = CapturePrefillObservationPolicy::from_bound(
+            selected.bind_geometry(binding.geometry()).unwrap(),
+        )
+        .unwrap();
+        let row = policy.row(0).unwrap();
+        assert!(row.transform_plan().is_some());
+        let assembly = row.assembly().unwrap();
+        assert_eq!(assembly.logical_geometry().elements(), maximum as usize);
+        let mut destinations = Vec::new();
+        for chunk in 0..assembly.chunk_count() {
+            let fragment = assembly.fragment(chunk).unwrap();
+            destinations.extend(
+                (0..fragment.selected_elements())
+                    .filter_map(|index| fragment.mapping_at(index))
+                    .map(|mapping| mapping.destination_index()),
+            );
+        }
+        destinations.sort_unstable();
+        assert_eq!(destinations, (0..maximum as usize).collect::<Vec<_>>());
+    }
 }
 fn source_paths() -> SharedLayeredObservationPaths {
     super::super::source()

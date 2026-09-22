@@ -145,6 +145,8 @@ bool mlx_operation_event_cpu_concatenate_eval_layout(mlx_cpu_copy_eval_layout* o
     mlx_dtype dtype,size_t rank,size_t left_elements,size_t right_elements,bool tracer);
 bool mlx_operation_event_cpu_rms_fallback_control_bytes(
     size_t* out, mlx_dtype dtype, size_t rank, size_t width, size_t rows);
+bool mlx_operation_event_cpu_layer_norm_fallback_control_bytes(
+    size_t* out, mlx_dtype dtype, size_t rank, size_t width, size_t rows);
 bool mlx_operation_event_cpu_select_broadcast_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t rank,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_typed_select_broadcast_eval_layout(mlx_cpu_copy_eval_layout* out,
@@ -161,12 +163,16 @@ bool mlx_operation_event_cpu_scatter_axis_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype index,size_t rank,size_t output_elements,size_t update_elements,bool tracer);
 bool mlx_operation_event_cpu_scatter_add_rows_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype,size_t,size_t,bool);
+bool mlx_operation_event_cpu_int32_histogram_eval_layout(mlx_cpu_copy_eval_layout*,
+    mlx_dtype,size_t,size_t,bool);
 bool mlx_operation_event_cpu_gather_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype source, mlx_dtype index, size_t source_rank, size_t index_rank,
     size_t source_elements, size_t index_elements, size_t slice_elements, bool tracer);
 bool mlx_operation_event_cpu_alias_eval_layout(mlx_cpu_copy_eval_layout* out,
     unsigned operation, size_t rank, size_t output_rank, bool tracer);
 bool mlx_operation_event_cpu_tiled_matmul_eval_layout(mlx_cpu_copy_eval_layout* out,
+    size_t rank, size_t m, size_t n, size_t k, size_t batches, bool tracer);
+bool mlx_operation_event_cpu_tiled_addmm_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t rank, size_t m, size_t n, size_t k, size_t batches, bool tracer);
 bool mlx_operation_event_cpu_tiled_matmul_copy_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t rank, size_t m, size_t n, size_t k, size_t batches, size_t copies, bool tracer);
@@ -200,6 +206,11 @@ bool mlx_operation_event_cpu_byte_view_eval_layout(mlx_cpu_copy_eval_layout*,
     mlx_dtype source, mlx_dtype destination, size_t rank, size_t bytes, bool copy, bool tracer);
 bool mlx_operation_event_cpu_copy_eval_layout(mlx_cpu_copy_eval_layout*,
     size_t rank, size_t inputs, bool copy, bool tracer);
+
+bool mlx_operation_event_cpu_constant_pad_eval_layout(mlx_cpu_copy_eval_layout*,
+    size_t rank, size_t elements, size_t input_elements, bool tracer);
+bool mlx_operation_event_cpu_depthwise_convolution_eval_layout(
+    mlx_cpu_copy_eval_layout*, mlx_dtype dtype, bool tracer);
 
 // Closed existing unary worker selector, matched again against the real primitive.
 typedef struct mlx_cpu_unary_eval_layout_ {

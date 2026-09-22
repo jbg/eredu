@@ -4,13 +4,13 @@
 #![warn(missing_docs)]
 
 mod checkpoint;
-/// Shared small checkpoint fixtures for native and public conformance.
-pub mod fixtures;
 /// Host reference arithmetic for signed component reconstruction.
 pub mod component_attribution;
 mod distribution;
 mod evidence;
 pub mod execution_control;
+/// Shared small checkpoint fixtures for native and public conformance.
+pub mod fixtures;
 pub mod intervention;
 mod parity;
 mod realtime;
@@ -537,7 +537,7 @@ fn encode_pcm<T: Tensor>(
     for frame in pcm.as_chunks::<FRAME_SAMPLES>().0 {
         let frame = T::from_f32_slice(frame, &[1, 1, FRAME_SAMPLES as i32], context)?;
         if let Some(tokens) = mimi.encode_step(&frame, context)? {
-            frames.push(tokens.to_i32_vec(context)?);
+            frames.push(tokens.to_i32_vec(context)?.into_iter().collect());
         }
     }
     Ok(frames)
@@ -582,7 +582,11 @@ fn offline_roundtrip<T: Tensor>(
             frames[frame][codebook] = values[codebook * frame_count + frame];
         }
     }
-    let mut roundtrip = mimi.decode(&codes, context)?.to_f32_vec(context)?;
+    let mut roundtrip = mimi
+        .decode(&codes, context)?
+        .to_f32_vec(context)?
+        .into_iter()
+        .collect::<Vec<_>>();
     roundtrip.truncate(pcm.len());
     roundtrip.resize(pcm.len(), 0.0);
     Ok(OfflineRoundtrip {

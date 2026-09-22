@@ -2,8 +2,8 @@
 use super::*;
 mod owners;
 use crate::working_memory::{
-    residual::TextControlBinding, InferenceRequest, RegisteredInferenceSourceWitness,
-    ReservedInferenceSpanWorkspace,
+    InferenceRequest, RegisteredInferenceSourceWitness, ReservedInferenceSpanWorkspace,
+    residual::TextControlBinding,
 };
 pub(in crate::working_memory) use owners::retirement_control_bytes;
 pub(in crate::working_memory) use owners::{RawSpanHostOwner, SpanHostOwner};
@@ -28,7 +28,7 @@ pub(in crate::working_memory) struct RawSpanHostCustody {
 impl SpanHostCustody {
     pub(in crate::working_memory) fn validate_issuance_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
         reservation: &WorkingMemoryReservation,
     ) -> Result<(), WorkingMemoryError> {
@@ -77,7 +77,7 @@ impl SpanHostCustody {
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if self.controls.is_none()
             || original.id != native.id
-            || !self.raw.host.pool().same_domain(native.pool())
+            || !self.raw.host.pool().same_ledger(native.pool())
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -95,7 +95,7 @@ impl SpanHostCustody {
 
     fn validate_account_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.validate_prepublication_locked(pool, usage)?;
@@ -132,7 +132,7 @@ impl SpanHostCustody {
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if self.raw.reservation != reservation.0.account_id
             || reservation.0.funding != Some(scope.id)
-            || !self.raw.host.pool().same_domain(&reservation.0.pool)
+            || !self.raw.host.pool().same_ledger(&reservation.0.pool)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -154,7 +154,7 @@ impl SpanHostCustody {
     }
     pub(in crate::working_memory) fn validate_control_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
         reservation: &WorkingMemoryReservation,
         binding: &TextControlBinding,
@@ -199,7 +199,7 @@ impl SpanHostCustody {
             .scope
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if native.id != original.id || !native.pool.same_domain(self.raw.host.pool()) {
+        if native.id != original.id || !native.pool.same_ledger(self.raw.host.pool()) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let pool = self.raw.host.pool();
@@ -218,7 +218,7 @@ impl WorkingMemoryFundingRun {
         receipt: &ReservedInferenceSpanWorkspace<'_>,
     ) -> Result<SpanHostOwner, WorkingMemoryError> {
         let reservation = receipt.reservation();
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let bytes = receipt.workspace().protected_peak_bytes()?;
@@ -246,7 +246,8 @@ impl WorkingMemoryFundingRun {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: self.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -278,6 +279,7 @@ impl WorkingMemoryFundingRun {
                         borrowed_storage: None,
                         capture_source: None,
                         native_publication_identity: None,
+                        allocation_funding: None,
                     }),
                     held: bytes,
                 },
@@ -315,7 +317,7 @@ impl SpanHostCustody {
     }
     pub(in crate::working_memory) fn validate_pin_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
         native: &WorkingMemoryFundingScope,
         layout: &Arc<crate::working_memory::storage::bounded_pin::PinLayout>,
@@ -331,9 +333,7 @@ impl SpanHostCustody {
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let reservation = request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = request.memory_reservation();
         self.validate_control_locked(pool, usage, reservation, binding)?;
         let scope = self
             .raw
@@ -341,7 +341,7 @@ impl SpanHostCustody {
             .scope
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if native.id != scope.id || !native.pool.same_domain(pool) {
+        if native.id != scope.id || !native.pool.same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         FundingSource::NativeScope(native).validate(usage, &self.raw.execution)
@@ -350,7 +350,7 @@ impl SpanHostCustody {
     // quarantine and explicit-origin checks, without requiring run_open.
     pub(in crate::working_memory) fn validate_pin_origin_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.validate_prepublication_locked(pool, usage)?;
@@ -368,7 +368,7 @@ impl RawSpanHostCustody {
     pub(in crate::working_memory) fn execution(&self) -> &InferenceExecutionIdentity {
         &self.execution
     }
-    pub(in crate::working_memory) fn pool(&self) -> &WorkingMemoryPool {
+    pub(in crate::working_memory) fn pool(&self) -> &MemoryLedger {
         self.host.pool()
     }
     pub(in crate::working_memory) fn account(&self) -> u64 {
@@ -384,7 +384,7 @@ impl RawSpanHostCustody {
     }
     pub(in crate::working_memory) fn validate_origin_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.host.validate(pool, usage, &self.execution)
@@ -399,7 +399,7 @@ impl RawSpanHostCustody {
             .scope
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if original.id != native.id || !self.host.pool().same_domain(&native.pool) {
+        if original.id != native.id || !self.host.pool().same_ledger(&native.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         self.validate_origin_locked(&native.pool, usage)?;
@@ -445,7 +445,7 @@ impl SpanHostCustody {
     }
     pub(in crate::working_memory) fn validate_prepublication_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.raw.validate_origin_locked(pool, usage)?;
@@ -489,7 +489,7 @@ impl SpanHostCustody {
         K: crate::working_memory::storage::CapturePlanStorageKey,
     >(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
         native: &WorkingMemoryFundingScope,
         layout: &Arc<crate::working_memory::storage::bounded_publication::BatchPublicationLayout>,
@@ -509,9 +509,7 @@ impl SpanHostCustody {
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let reservation = request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = request.memory_reservation();
         self.validate_control_locked(pool, usage, reservation, binding)?;
         self.raw.validate_publication_locked(native, usage)?;
         // Full witness health above includes the actual completed original C

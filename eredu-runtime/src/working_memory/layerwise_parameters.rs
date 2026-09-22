@@ -1,6 +1,6 @@
 //! Identity-keyed binding of already projected layerwise parameter storage.
 
-use eredu_nn::{workspace::WorkspaceTensor, Error, ParameterId, Parameterized};
+use eredu_nn::{Error, ParameterId, Parameterized, workspace::WorkspaceTensor};
 use std::collections::BTreeMap;
 
 /// Binds supplied metadata values after validating the complete immutable and
@@ -27,14 +27,16 @@ pub fn bind_workspace_parameters<M: Parameterized<WorkspaceTensor>>(
             validate_workspace_binding(parameter, weight).map_err(|cause| match cause {
                 PreparedWorkspaceBindingCause::Shape => Error::backend(format!(
                     "workspace parameter shape {:?} does not match supplied weight {:?}",
-                    parameter.layout().shape(), weight.layout().shape(),
+                    parameter.layout().shape(),
+                    weight.layout().shape(),
                 )),
                 PreparedWorkspaceBindingCause::Context => Error::backend(
                     "workspace parameter and supplied weight belong to different contexts",
                 ),
                 PreparedWorkspaceBindingCause::Dtype => Error::backend(format!(
                     "workspace parameter dtype {:?} does not match supplied weight {:?}",
-                    parameter.layout().dtype(), weight.layout().dtype(),
+                    parameter.layout().dtype(),
+                    weight.layout().dtype(),
                 )),
             })
         },
@@ -59,13 +61,16 @@ pub enum PreparedWorkspaceBindingCause {
     #[error("workspace parameter dtype differs from its source")]
     Dtype,
 }
-fn validate_workspace_binding(parameter: &WorkspaceTensor, weight: &WorkspaceTensor)
-    -> Result<(), PreparedWorkspaceBindingCause>
-{
+fn validate_workspace_binding(
+    parameter: &WorkspaceTensor,
+    weight: &WorkspaceTensor,
+) -> Result<(), PreparedWorkspaceBindingCause> {
     if parameter.layout().shape() != weight.layout().shape() {
         return Err(PreparedWorkspaceBindingCause::Shape);
     }
-    if !parameter.same_context(weight) { return Err(PreparedWorkspaceBindingCause::Context); }
+    if !parameter.same_context(weight) {
+        return Err(PreparedWorkspaceBindingCause::Context);
+    }
     if parameter.layout().dtype() != weight.layout().dtype() {
         return Err(PreparedWorkspaceBindingCause::Dtype);
     }
@@ -91,19 +96,40 @@ where
     use eredu_nn::workspace::WorkspaceMetadataError;
     use std::mem::{size_of, size_of_val};
     let all = crate::prepared_parameter_binding_control_bytes::<
-        WorkspaceTensor, WorkspaceTensor, PreparedWorkspaceBindingCause,
-    >(rows.len()).ok_or(WorkspaceMetadataError::Overflow)?;
+        WorkspaceTensor,
+        WorkspaceTensor,
+        PreparedWorkspaceBindingCause,
+    >(rows.len())
+    .ok_or(WorkspaceMetadataError::Overflow)?;
     // Row storage is the caller's already-paid destination; retain all shared
     // traversal and return controls from the actual finite binding query.
-    let row_bytes = std::alloc::Layout::array::<crate::PreparedParameterBinding<'_, WorkspaceTensor>>(rows.len())
-        .map_err(|_| WorkspaceMetadataError::Overflow)?.size();
-    let frames = [all.checked_sub(row_bytes).ok_or(WorkspaceMetadataError::Overflow)?,
-        size_of::<&mut M>(), size_of::<&mut [crate::PreparedParameterBinding<'_, WorkspaceTensor>]>(),
-        size_of::<Result<(), Error>>(), size_of_val(&excluded),
-        size_of::<(&F, &ParameterId, bool)>()];
-    context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
-        .ok_or(WorkspaceMetadataError::Overflow)?)?;
-    crate::bind_prepared_parameter_values(module, rows, excluded,
-        validate_workspace_binding, |parameter, weight| *parameter = weight)
-        .map_err(|cause| context.metadata_source(cause))
+    let row_bytes =
+        std::alloc::Layout::array::<crate::PreparedParameterBinding<'_, WorkspaceTensor>>(
+            rows.len(),
+        )
+        .map_err(|_| WorkspaceMetadataError::Overflow)?
+        .size();
+    let frames = [
+        all.checked_sub(row_bytes)
+            .ok_or(WorkspaceMetadataError::Overflow)?,
+        size_of::<&mut M>(),
+        size_of::<&mut [crate::PreparedParameterBinding<'_, WorkspaceTensor>]>(),
+        size_of::<Result<(), Error>>(),
+        size_of_val(&excluded),
+        size_of::<(&F, &ParameterId, bool)>(),
+    ];
+    context.charge_metadata(
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+            .ok_or(WorkspaceMetadataError::Overflow)?,
+    )?;
+    crate::bind_prepared_parameter_values(
+        module,
+        rows,
+        excluded,
+        validate_workspace_binding,
+        |parameter, weight| *parameter = weight,
+    )
+    .map_err(|cause| context.metadata_source(cause))
 }

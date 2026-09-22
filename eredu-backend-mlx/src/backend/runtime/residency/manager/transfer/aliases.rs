@@ -9,12 +9,13 @@ pub(super) fn bind_host(
     state: &ManagerState,
     prepared: &mut [PreparedHost],
 ) -> Result<(), ResidencyError> {
-    let mut aliases = Vec::new();
-    for (index, (id, _, _, _, _)) in prepared.iter().enumerate() {
+    for index in 0..prepared.len() {
+        let id = &prepared[index].0;
         let unit = state
             .control
             .unit(id)
             .ok_or(ResidencyError::StatePoisoned)?;
+        let id = unit.id();
         for binding in unit.bindings().iter().filter(|binding| binding.is_alias()) {
             let (owner, _) = state
                 .control
@@ -30,12 +31,14 @@ pub(super) fn bind_host(
                     .and_then(|(_, buffers, ..)| buffers.buffers.get(name))
                     .cloned()
             })?;
-            aliases.push((index, binding.name().to_owned(), source));
-        }
-    }
-    for (index, name, source) in aliases {
-        if prepared[index].1.buffers.insert(name, source).is_some() {
-            return Err(ResidencyError::StatePoisoned);
+            if prepared[index]
+                .1
+                .buffers
+                .insert(binding.name().to_owned(), source)
+                .is_some()
+            {
+                return Err(ResidencyError::StatePoisoned);
+            }
         }
     }
     Ok(())
@@ -255,4 +258,84 @@ pub(in crate::backend::runtime::residency::manager) fn pin_owners(
         }
     }
     Ok(())
+}
+
+/// New named destinations over the manager's exact immutable Host backup.
+/// External aliases join only after every canonical owner has been prepared.
+pub(in crate::backend::runtime::residency::manager) fn retained_host_source_control_bytes(
+    unit: &eredu_runtime::residency::OffloadUnit,
+) -> Option<usize> {
+    use std::{
+        alloc::Layout,
+        mem::{size_of, size_of_val},
+    };
+    let names = unit
+        .bindings()
+        .iter()
+        .try_fold(0usize, |n, b| n.checked_add(b.name().len()))?;
+    let fields = [
+        Layout::array::<(String, RetainedHostBuffer)>(unit.bindings().len())
+            .ok()?
+            .size(),
+        names,
+        size_of::<Vec<(String, RetainedHostBuffer)>>(),
+        size_of::<ResidentHostBuffers>(),
+        size_of::<Result<ResidentHostBuffers, ResidencyError>>(),
+        size_of::<(
+            &ManagerState,
+            &OffloadUnitId,
+            &ResidentHostOwner,
+            Option<&eredu_nn::workspace::HostMetadataFunding>,
+        )>(),
+        size_of::<Option<(&OffloadUnitId, &eredu_runtime::residency::WeightBinding)>>(),
+        size_of::<(String, RetainedHostBuffer)>(),
+        size_of::<std::collections::TryReserveError>(),
+    ];
+    fields
+        .into_iter()
+        .try_fold(size_of_val(&fields), usize::checked_add)
+}
+
+pub(super) fn retain_host_source_rows(
+    state: &ManagerState,
+    id: &OffloadUnitId,
+    source: &ResidentHostOwner,
+    funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+) -> Result<ResidentHostBuffers, ResidencyError> {
+    let unit = state
+        .control
+        .unit(id)
+        .ok_or(ResidencyError::StatePoisoned)?;
+    let bytes =
+        retained_host_source_control_bytes(unit).ok_or(ResidencyError::ArithmeticOverflow {
+            context: "retained Host source controls",
+        })?;
+    if let Some(funding) = funding {
+        funding
+            .reserve_metadata(bytes)
+            .map_err(ResidencyError::HostMetadataFunding)?;
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(unit.bindings().len())
+        .map_err(ResidencyError::HostDestinationReserve)?;
+    for binding in unit.bindings() {
+        if binding.is_alias() {
+            let (owner, _) = state
+                .control
+                .binding_owner_borrowed(id, binding)
+                .ok_or(ResidencyError::StatePoisoned)?;
+            if owner != id {
+                continue;
+            }
+        }
+        let value = source
+            .buffers
+            .get(binding.name())
+            .ok_or(ResidencyError::StatePoisoned)?;
+        rows.push((binding.name().to_owned(), value.clone()));
+    }
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(ResidentHostBuffers {
+        buffers: super::super::rows::Rows::from_sorted(rows),
+    })
 }

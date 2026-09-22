@@ -2,67 +2,107 @@
 use super::*;
 
 #[derive(Debug)]
-pub(in crate::working_memory::capture_run) enum VocabularyDestination<'r,'a,'c> {
-    Candidates(&'r mut ScheduledCaptureCandidates<'a,'c>),
-    Scores(&'r mut ScheduledCaptureTokenScores<'a,'c>),
+pub(in crate::working_memory::capture_run) enum VocabularyDestination<'r, 'a, 'c> {
+    Candidates(&'r mut ScheduledCaptureCandidates<'a, 'c>),
+    Scores(&'r mut ScheduledCaptureTokenScores<'a, 'c>),
 }
-impl<'a> VocabularyDestination<'_,'a,'_> {
-    fn source(&self)->(&'a AdmittedCapturePlan,usize,CapturePhase,u64,[usize;3]) {
-        match self {Self::Candidates(value)=>value.partition_source(),Self::Scores(value)=>value.partition_source()}
+impl<'a> VocabularyDestination<'_, 'a, '_> {
+    fn source(
+        &self,
+    ) -> (
+        &'a AdmittedCapturePlan,
+        usize,
+        CapturePhase,
+        u64,
+        [usize; 3],
+    ) {
+        match self {
+            Self::Candidates(value) => value.partition_source(),
+            Self::Scores(value) => value.partition_source(),
+        }
     }
 }
-pub(in crate::working_memory::capture_run) fn prepare_vocabulary_decoder(custody:&CaptureTensorCustody,
-    funding:&HostMetadataFunding)->Result<(),PartitionCaptureTensorDecodeError> {
-    let error=|cause|PartitionCaptureTensorDecodeError {cause,_histogram:None,_vocabulary:None,
-        _custody:custody.share_scheduled(),_metadata:funding.clone()};
-    let parts=[
-        crate::capture::partition::vocabulary_validation_control_bytes().ok_or_else(||error(Cause::Source("vocabulary validation controls overflow")))?,
-        size_of::<CaptureCandidateClaim<'_,'_>>().max(size_of::<CaptureTokenScoreClaim<'_,'_>>()),
-        size_of::<ScheduledCaptureCandidates<'_,'_>>().max(size_of::<ScheduledCaptureTokenScores<'_,'_>>()),
-        size_of::<Result<ClaimedCaptureCandidates,PartitionCaptureTensorDecodeError>>().max(size_of::<Result<ClaimedCaptureTokenScores,PartitionCaptureTensorDecodeError>>()),
-        size_of::<PartitionCaptureTensorDecodeError>()*2,size_of::<Cause>(),size_of::<VocabularyFailure>(),
-        size_of::<VocabularyDestination<'_,'_,'_>>(),size_of::<CaptureTensorCustody>(),
-        size_of::<(&[u8],PartitionCaptureTensorReceipt<'_>,&HostMetadataFunding)>(),
-        size_of::<(Option<CandidateDomain>,f64,[usize;3],[u64;3],&AdmittedCapturePlan,usize)>(),
-        size_of::<(&CaptureTensorCustody,&HostMetadataFunding)>(),
-    ];
-    funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-        .ok_or_else(||error(Cause::Source("vocabulary claim controls overflow")))?).map_err(|cause|error(cause.into()))?;
-    custody.validate().map_err(|cause|error(cause.into()))
+pub(in crate::working_memory::capture_run) fn prepare_vocabulary_decoder(
+    custody: &CaptureTensorCustody,
+    funding: &HostMetadataFunding,
+) -> Result<(), PartitionCaptureTensorDecodeError> {
+    let error = |cause| PartitionCaptureTensorDecodeError {
+        cause,
+        _histogram: None,
+        _vocabulary: None,
+        _custody: custody.share_scheduled(),
+        _metadata: funding.clone(),
+    };
+
+    funding
+        .reserve_metadata(
+            claim_control_bytes()
+                .ok_or_else(|| error(Cause::Source("vocabulary claim controls overflow")))?,
+        )
+        .map_err(|cause| error(cause.into()))?;
+    custody.validate().map_err(|cause| error(cause.into()))
 }
 pub(in crate::working_memory::capture_run) fn decode_vocabulary_receipt<'a>(
-    output:VocabularyDestination<'_,'a,'_>,bytes:&[u8],expected:PartitionCaptureTensorReceipt<'_>,
-    custody:&CaptureTensorCustody,funding:&HostMetadataFunding,
-)->Result<(Option<CandidateDomain>,f64),PartitionCaptureTensorDecodeError> {
-    let error=|cause|PartitionCaptureTensorDecodeError {cause,_histogram:None,_vocabulary:None,
-        _custody:custody.share_scheduled(),_metadata:funding.clone()};
-    let controls=[TensorReader::construction_control_bytes()
-        .ok_or_else(||error(Cause::Source("receipt reader construction controls overflow")))?,size_of::<TensorReader<'_,'_,'_>>(),size_of::<VocabularyDestination<'_,'_,'_>>(),
-        size_of::<PartitionCaptureTensorReceipt<'_>>(),size_of::<Cause>(),size_of::<PartitionCaptureTensorDecodeError>(),
-        size_of::<(&AdmittedCapturePlan,usize,CapturePhase,u64,[usize;3])>(),
-        size_of::<[[usize;32];2]>(),size_of::<(Option<CandidateDomain>,f64)>(),
-        size_of::<Result<(Option<CandidateDomain>,f64),PartitionCaptureTensorDecodeError>>(),
-        size_of::<(&[u8],&CaptureTensorCustody,&HostMetadataFunding,bool)>(),
-    ];
-    funding.reserve_metadata(controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-        .ok_or_else(||error(Cause::Source("vocabulary decoder controls overflow")))?).map_err(|cause|error(cause.into()))?;
-    custody.validate().map_err(|cause|error(cause.into()))?;
-    let (source,index,phase,prediction,shape)=output.source();
-    if expected.context.capture_plan_identity!=source.identity()||expected.context.selection_index!=index
-        ||expected.context.phase!=phase||expected.context.prediction!=prediction||expected.context.invocation.is_some()
-        ||expected.identity.is_empty()||!matches!(expected.dtype,TensorDtype::F32|TensorDtype::F16|TensorDtype::Bf16) {
-        return Err(error(Cause::Source("receipt differs from its scheduled vocabulary claim")));
-    }
-    reserve_parser_headroom(bytes, funding).map_err(|cause|error(cause.into()))?;
-    let mut reader=match output {
-        VocabularyDestination::Candidates(output)=>TensorReader::new_candidates(output,expected,source,index,shape),
-        VocabularyDestination::Scores(output)=>TensorReader::new_scores(output,expected,source,index,shape),
+    output: VocabularyDestination<'_, 'a, '_>,
+    bytes: &[u8],
+    expected: PartitionCaptureTensorReceipt<'_>,
+    custody: &CaptureTensorCustody,
+    funding: &HostMetadataFunding,
+) -> Result<(Option<CandidateDomain>, f64), PartitionCaptureTensorDecodeError> {
+    let error = |cause| PartitionCaptureTensorDecodeError {
+        cause,
+        _histogram: None,
+        _vocabulary: None,
+        _custody: custody.share_scheduled(),
+        _metadata: funding.clone(),
     };
-    let parsed=json::parse(bytes, |event| reader.event(event));let valid=reader.complete();let memory=reader.take_memory();
-    let metadata=reader.vocabulary_metadata();drop(reader);
-    parsed.map_err(|cause|error(cause.into()))?;
-    if let Some(cause)=memory {return Err(error(cause.into()));}
-    if !valid {return Err(error(Cause::Source("receipt identity, shape, charge or vocabulary payload differs")));}
+
+    funding
+        .reserve_metadata(
+            decoder_control_bytes()
+                .ok_or_else(|| error(Cause::Source("vocabulary decoder controls overflow")))?,
+        )
+        .map_err(|cause| error(cause.into()))?;
+    custody.validate().map_err(|cause| error(cause.into()))?;
+    let (source, index, phase, prediction, shape) = output.source();
+    if expected.context.capture_plan_identity != source.identity()
+        || expected.context.selection_index != index
+        || expected.context.phase != phase
+        || expected.context.prediction != prediction
+        || expected.context.invocation.is_some()
+        || expected.identity.is_empty()
+        || !matches!(
+            expected.dtype,
+            TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16
+        )
+    {
+        return Err(error(Cause::Source(
+            "receipt differs from its scheduled vocabulary claim",
+        )));
+    }
+    reserve_parser_headroom(bytes, funding).map_err(|cause| error(cause.into()))?;
+    let mut reader = match output {
+        VocabularyDestination::Candidates(output) => {
+            TensorReader::new_candidates(output, expected, source, index, shape)
+        }
+        VocabularyDestination::Scores(output) => {
+            TensorReader::new_scores(output, expected, source, index, shape)
+        }
+    };
+    let parsed = json::parse(bytes, |event| reader.event(event));
+    let valid = reader.complete();
+    let memory = reader.take_memory();
+    let metadata = reader.vocabulary_metadata();
+    drop(reader);
+    parsed.map_err(|cause| error(cause.into()))?;
+    if let Some(cause) = memory {
+        return Err(error(cause.into()));
+    }
+    if !valid {
+        return Err(error(Cause::Source(
+            "receipt identity, shape, charge or vocabulary payload differs",
+        )));
+    }
     Ok(metadata)
 }
 
@@ -92,8 +132,74 @@ pub(super) fn exchange_control_bytes(transform: &CaptureTransform) -> Option<usi
         ],
         _ => return Some(0),
     };
-    parts.into_iter().try_fold(size_of_val(&parts).checked_add(size_of::<(
-        &mut ScheduledCaptureStep<'_>, usize, bool, Option<usize>,
-        Result<Option<usize>, CaptureRunHostError>, eredu_core::InferenceGeometry,
-    )>())?, usize::checked_add)
+    parts.into_iter().try_fold(
+        size_of_val(&parts).checked_add(size_of::<(
+            &mut ScheduledCaptureStep<'_>,
+            usize,
+            bool,
+            Option<usize>,
+            Result<Option<usize>, CaptureRunHostError>,
+            eredu_core::InferenceGeometry,
+        )>())?,
+        usize::checked_add,
+    )
+}
+
+fn claim_control_bytes() -> Option<usize> {
+    let parts = [
+        crate::capture::partition::vocabulary_validation_control_bytes()?,
+        size_of::<CaptureCandidateClaim<'_, '_>>().max(size_of::<CaptureTokenScoreClaim<'_, '_>>()),
+        size_of::<ScheduledCaptureCandidates<'_, '_>>()
+            .max(size_of::<ScheduledCaptureTokenScores<'_, '_>>()),
+        size_of::<Result<ClaimedCaptureCandidates, PartitionCaptureTensorDecodeError>>().max(
+            size_of::<Result<ClaimedCaptureTokenScores, PartitionCaptureTensorDecodeError>>(),
+        ),
+        size_of::<PartitionCaptureTensorDecodeError>() * 2,
+        size_of::<Cause>(),
+        size_of::<VocabularyFailure>(),
+        size_of::<VocabularyDestination<'_, '_, '_>>(),
+        size_of::<CaptureTensorCustody>(),
+        size_of::<(
+            &[u8],
+            PartitionCaptureTensorReceipt<'_>,
+            &HostMetadataFunding,
+        )>(),
+        size_of::<(
+            Option<CandidateDomain>,
+            f64,
+            [usize; 3],
+            [u64; 3],
+            &AdmittedCapturePlan,
+            usize,
+        )>(),
+        size_of::<(&CaptureTensorCustody, &HostMetadataFunding)>(),
+    ];
+    parts
+        .into_iter()
+        .try_fold(size_of_val(&parts), usize::checked_add)
+}
+
+fn decoder_control_bytes() -> Option<usize> {
+    let controls = [
+        TensorReader::construction_control_bytes()?,
+        size_of::<TensorReader<'_, '_, '_>>(),
+        size_of::<VocabularyDestination<'_, '_, '_>>(),
+        size_of::<PartitionCaptureTensorReceipt<'_>>(),
+        size_of::<Cause>(),
+        size_of::<PartitionCaptureTensorDecodeError>(),
+        size_of::<(&AdmittedCapturePlan, usize, CapturePhase, u64, [usize; 3])>(),
+        size_of::<[[usize; 32]; 2]>(),
+        size_of::<(Option<CandidateDomain>, f64)>(),
+        size_of::<Result<(Option<CandidateDomain>, f64), PartitionCaptureTensorDecodeError>>(),
+        size_of::<(&[u8], &CaptureTensorCustody, &HostMetadataFunding, bool)>(),
+    ];
+    controls
+        .into_iter()
+        .try_fold(size_of_val(&controls), usize::checked_add)
+}
+
+pub(super) fn decoder_metadata_bytes(maximum: usize) -> Option<usize> {
+    claim_control_bytes()?
+        .checked_add(decoder_control_bytes()?)?
+        .checked_add(super::parser_metadata_bytes(maximum)?)
 }

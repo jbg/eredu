@@ -11,10 +11,16 @@ struct LocalTarget {
     edits: Vec<LocalEdit>,
 }
 struct PreparedOverlay {
-    original: BTreeMap<String, MlxTensor>,
-    replacement: BTreeMap<String, MlxTensor>,
-    state: Box<dyn std::any::Any>,
+    original: ParameterReplacementValues<MlxTensor>,
+    replacement: ParameterReplacementValues<MlxTensor>,
+    original_sources: super::super::CompletedParameterSources,
+    replacement_sources: super::super::CompletedParameterSources,
+    state: super::super::PreparedParameterReset,
+    publication: super::super::publication::PreparedNativeParameterPublication,
+    transforms: Vec<(String, ProjectionInputTransform)>,
+    active: Option<String>,
     state_exchanged: bool,
+    funding: eredu_nn::workspace::HostMetadataFunding,
 }
 
 impl MlxModelSession {
@@ -22,7 +28,7 @@ impl MlxModelSession {
         &mut self,
         overlay: &AdmittedParameterOverlay,
         limits: CaptureUsage,
-        stream: &Stream,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
     ) -> Result<ParameterDiscovery, ParameterError> {
         let mut catalog = self.partition_parameter_catalog(Some(limits))?;
         let transport = self
@@ -31,6 +37,7 @@ impl MlxModelSession {
             .clone()
             .expect("partition catalogue");
         let owner = transport.parameter_operations()?;
+        let prepared_transport = self.prepared_parameter_transport(&transport)?;
         let binding = self.parameter_operation_binding()?;
         let mut budget = NativeParameterBudget {
             total: Rc::clone(&self.payload.parameter_state.usage),
@@ -73,62 +80,97 @@ impl MlxModelSession {
         let intent: [u8; 32] = Sha256::digest(overlay.intent_identity().as_bytes()).into();
         let session = RefCell::new(&mut *self);
         let result = owner.transaction(
-            &transport,
+            &prepared_transport,
             binding,
             &intent,
             ParameterOperationKind::Activation,
             local,
             |(targets, estimate, epoch)| {
-                let prepared = session
-                    .borrow_mut()
-                    .with_model_operation(|model| {
-                        let mut original = BTreeMap::new();
-                        let mut replacement = BTreeMap::new();
-                        for target in &targets {
-                            let layout = &catalog.layouts[&target.id];
-                            let mut ids = BTreeSet::from([target.id.clone()]);
-                            layout.extend_dependencies(&mut ids);
-                            let candidate = with_selected_parameter_values(
-                                model.erased_mut(),
-                                &ids,
-                                stream,
-                                |selected| {
-                                    let source = &selected[&target.id];
-                                    source.as_array().evaluated()?;
-                                    let mut value =
-                                        layout.effective(&target.id, selected, stream)?;
-                                    for edit in &target.edits {
-                                        if let Err(error) = apply_effective_update(
-                                            &mut value,
-                                            &edit.region,
-                                            &edit.update,
-                                            stream,
-                                        )? {
-                                            return Ok(Err(error));
-                                        }
-                                    }
-                                    // Every owner promotes an affected packed parameter,
-                                    // even if the selected edit misses this owner's shard.
-                                    value.evaluated()?;
-                                    Ok(Ok((source.clone(), MlxTensor::from_array(value))))
-                                },
-                            )?;
-                            let (before, after) = match candidate {
-                                Ok(pair) => pair,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            original.insert(target.id.clone(), before);
-                            replacement.insert(target.id.clone(), after);
-                        }
-                        let state = model.erased_mut().prepare_parameter_reset_state()?;
-                        Ok(Ok(PreparedOverlay {
-                            original,
-                            replacement,
-                            state,
-                            state_exchanged: false,
-                        }))
-                    })
-                    .map_err(failure)??;
+                let mut session = session.borrow_mut();
+                let operation =
+                    super::super::numerical::PreparedOperation::new(&session, environment)
+                        .map_err(failure)?;
+                let context = &operation.context;
+                let mut original = context
+                    .metadata_vec(targets.len())
+                    .map_err(|cause| failure(Error::Neural(cause)))?;
+                let mut replacement = context
+                    .metadata_vec(targets.len())
+                    .map_err(|cause| failure(Error::Neural(cause)))?;
+                for target in &targets {
+                    let mut edits = context
+                        .metadata_vec(target.edits.len())
+                        .map_err(|cause| failure(Error::Neural(cause)))?;
+                    edits.extend(target.edits.iter().map(|edit| (&edit.region, &edit.update)));
+                    let (before, after) = session
+                        .prepare_parameter_update(
+                            &target.id,
+                            &catalog.layouts[&target.id],
+                            &edits,
+                            &operation,
+                        )
+                        .map_err(failure)?;
+                    context
+                        .charge_metadata(
+                            target
+                                .id
+                                .len()
+                                .checked_mul(2)
+                                .ok_or(ParameterError::Overflow)?,
+                        )
+                        .map_err(|cause| failure(Error::Neural(cause.into())))?;
+                    original.push((target.id.clone(), before));
+                    replacement.push((target.id.clone(), after));
+                }
+                let original = super::super::parameter_rows(original, &operation)?;
+                let replacement = super::super::parameter_rows(replacement, &operation)?;
+                let sources = super::super::CompletedParameterSources::from_prepared(
+                    operation.take_sources(),
+                    context,
+                    operation.funding.clone(),
+                )
+                .map_err(failure)?;
+                let original_sources = sources
+                    .select(&original, context, operation.funding.clone())
+                    .map_err(failure)?;
+                let replacement_sources = sources
+                    .select(&replacement, context, operation.funding.clone())
+                    .map_err(failure)?;
+                let (publication, state) = session
+                    .prepare_parameter_publication(
+                        replacement.clone(),
+                        replacement_sources.clone(),
+                        true,
+                        &operation,
+                    )
+                    .map_err(failure)?;
+                let mut transforms = context
+                    .metadata_vec(catalog.discovery.parameters.len())
+                    .map_err(|cause| failure(Error::Neural(cause)))?;
+                for parameter in &catalog.discovery.parameters {
+                    if overlay.shared_targets().contains(&parameter.shared_id) {
+                        context
+                            .charge_metadata(parameter.id.len())
+                            .map_err(|cause| failure(Error::Neural(cause.into())))?;
+                        transforms.push((parameter.id.clone(), parameter.input_transform.clone()));
+                    }
+                }
+                context
+                    .charge_metadata(overlay.intent_identity().len())
+                    .map_err(|cause| failure(Error::Neural(cause.into())))?;
+                let active = Some(overlay.intent_identity().to_owned());
+                let prepared = PreparedOverlay {
+                    original,
+                    replacement,
+                    original_sources,
+                    replacement_sources,
+                    state,
+                    publication,
+                    transforms,
+                    active,
+                    funding: operation.funding.clone(),
+                    state_exchanged: false,
+                };
                 Ok((prepared, estimate, epoch))
             },
             |(prepared, _, _)| {
@@ -150,19 +192,20 @@ impl MlxModelSession {
             .expect("completed parameter transaction");
         // Only completed peer publication invalidates reusable snapshots. These
         // final metadata changes cannot submit native work or fail semantically.
-        payload.model.erased_mut().invalidate_parameter_snapshots();
+        payload.model.erased_mut().finalize_parameter_publication();
         let state = &mut payload.parameter_state;
         state.originals = prepared.original;
         state.published = prepared.replacement;
+        state.original_sources = prepared.original_sources;
+        state.published_sources = prepared.replacement_sources;
+        state.metadata = Some(prepared.funding);
         state.reset_estimate = Some(estimate);
-        state.active = Some(overlay.intent_identity().into());
+        state.active = prepared.active;
+        state.baseline_transforms = prepared.transforms;
         state.epoch = epoch;
         state.floating_state_dtype_bytes = None;
         for parameter in &mut catalog.discovery.parameters {
             if overlay.shared_targets().contains(&parameter.shared_id) {
-                state
-                    .baseline_transforms
-                    .insert(parameter.id.clone(), parameter.input_transform.clone());
                 parameter.input_transform = ProjectionInputTransform::Identity;
                 let width = match parameter.dtype {
                     Some(InterventionDtype::Float32) => 4,
@@ -185,6 +228,7 @@ impl MlxModelSession {
     pub(in super::super) fn remove_partition_parameter_overlay(
         &mut self,
         identity: &str,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
     ) -> Result<ParameterDiscovery, ParameterError> {
         let mut catalog = self.partition_parameter_catalog(None)?;
         let transport = self
@@ -193,6 +237,7 @@ impl MlxModelSession {
             .clone()
             .expect("partition catalogue");
         let owner = transport.parameter_operations()?;
+        let prepared_transport = self.prepared_parameter_transport(&transport)?;
         let binding = self.parameter_operation_binding()?;
         // Removal has no caller payload or new weight materialization. Its known
         // state/handle costs are charged monotonically, like loaded discovery.
@@ -211,7 +256,7 @@ impl MlxModelSession {
                 host_bytes: add(4096, estimate.copy_bytes)?,
                 encoded_bytes: 4096,
             };
-            for id in state.originals.keys() {
+            for (id, _) in state.originals.iter() {
                 cost.host_bytes = add(cost.host_bytes, add(512, mul(id.len() as u64, 4)?)?)?;
             }
             NativeParameterBudget {
@@ -220,7 +265,13 @@ impl MlxModelSession {
                 operation: None,
             }
             .reserve_quota(cost)?;
-            Ok((state.originals.clone(), state.published.clone(), epoch))
+            Ok((
+                state.originals.clone(),
+                state.published.clone(),
+                state.original_sources.clone(),
+                state.published_sources.clone(),
+                epoch,
+            ))
         })();
         let mut digest = Sha256::new();
         digest.update(b"eredu-remove-parameter-overlay-v1\0");
@@ -230,23 +281,35 @@ impl MlxModelSession {
         let intent = digest.finalize().into();
         let session = RefCell::new(&mut *self);
         let result = owner.transaction(
-            &transport,
+            &prepared_transport,
             binding,
             &intent,
             ParameterOperationKind::Removal,
             local,
-            |(replacement, original, epoch)| {
-                let state = session
-                    .borrow_mut()
-                    .with_model_operation(|model| {
-                        model.erased_mut().prepare_parameter_reset_state()
-                    })
+            |(replacement, original, replacement_sources, original_sources, epoch)| {
+                let mut session = session.borrow_mut();
+                let operation =
+                    super::super::numerical::PreparedOperation::new(&session, environment)
+                        .map_err(failure)?;
+                let (publication, state) = session
+                    .prepare_parameter_publication(
+                        replacement.clone(),
+                        replacement_sources.clone(),
+                        false,
+                        &operation,
+                    )
                     .map_err(failure)?;
                 Ok((
                     PreparedOverlay {
                         original,
                         replacement,
+                        original_sources,
+                        replacement_sources,
                         state,
+                        publication,
+                        funding: operation.funding.clone(),
+                        transforms: Vec::new(),
+                        active: None,
                         state_exchanged: false,
                     },
                     epoch,
@@ -269,15 +332,22 @@ impl MlxModelSession {
             .payload
             .get_mut()
             .expect("completed parameter restoration");
-        payload.model.erased_mut().invalidate_parameter_snapshots();
+        payload.model.erased_mut().finalize_parameter_publication();
         let state = &mut payload.parameter_state;
         for parameter in &mut catalog.discovery.parameters {
-            if let Some(transform) = state.baseline_transforms.remove(&parameter.id) {
-                parameter.input_transform = transform;
+            if let Some((_, transform)) = state
+                .baseline_transforms
+                .iter()
+                .find(|(id, _)| id == &parameter.id)
+            {
+                parameter.input_transform = transform.clone();
             }
         }
-        state.originals.clear();
-        state.published.clear();
+        state.baseline_transforms.clear();
+        state.originals = Default::default();
+        state.published = Default::default();
+        state.original_sources = Default::default();
+        state.published_sources = Default::default();
         state.reset_estimate = None;
         state.active = None;
         state.floating_state_dtype_bytes = None;
@@ -293,39 +363,33 @@ impl MlxModelSession {
     fn publish_partition_overlay(
         &mut self,
         prepared: &mut PreparedOverlay,
-        active: bool,
+        _active: bool,
         restore: bool,
     ) -> Result<(), ParameterError> {
-        self.with_model_operation(|model| {
-            // The outer parameter coordinator supplies the only peer agreement.
-            // No nested collective may strand peers on a local publication error.
-            if !restore {
-                model
-                    .erased_mut()
-                    .exchange_parameter_reset_state(prepared.state.as_mut())?;
-                prepared.state_exchanged = true;
-            }
-            if !model.erased_mut().publish_parameter_replacements(
-                if restore {
-                    &prepared.original
-                } else {
-                    &prepared.replacement
-                },
-                active,
-            )? {
-                return Err(Error::ArchitectureModel(
-                    "prepared parameter publication is unavailable".into(),
-                ));
-            }
-            if restore && prepared.state_exchanged {
-                model
-                    .erased_mut()
-                    .exchange_parameter_reset_state(prepared.state.as_mut())?;
-                prepared.state_exchanged = false;
-            }
-            Ok(())
-        })
-        .map_err(failure)?;
+        if !restore || prepared.state_exchanged {
+            self.original_model_source()
+                .map_err(|cause| failure(Error::PrefillControl(cause)))?;
+            let payload = self.payload.get_mut().ok_or_else(|| {
+                failure(Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::ReservedWorkActive,
+                ))
+            })?;
+            prepared
+                .publication
+                .exchange_reset(payload.model.erased_mut(), prepared.state.native.as_mut())
+                .map_err(failure)?;
+            crate::composition::mlx::replicated_text::exchange_parameter_reset_memory(
+                prepared.state.native.as_mut(),
+                &mut payload.state_memory,
+                payload.nonstate_publication.get_mut(),
+                prepared.state.covered_publication,
+            )
+            .expect("validated prepared reset");
+            payload
+                .model
+                .exchange_parameter_sources(&mut prepared.state.sources);
+            prepared.state_exchanged = !prepared.state_exchanged;
+        }
         #[cfg(test)]
         if !restore
             && std::mem::take(

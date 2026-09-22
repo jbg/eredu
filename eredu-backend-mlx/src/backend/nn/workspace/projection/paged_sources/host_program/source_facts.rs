@@ -10,15 +10,19 @@ impl ProjectedNativeStorage {
     pub(crate) fn paged_host_source_facts(
         &self,
         plan: &InferenceSpanWorkspacePlan,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
     ) -> Result<Option<HostSourceConstructionFacts>, CacheSourceFailure> {
         let fail = |cause| CacheSourceFailure::source(cause, context);
         let frames = [
+            ProjectedPagedSource::retained_file_control_bytes(),
+            size_of::<
+                std::slice::Iter<'_, crate::backend::runtime::cache::kv::PagedCacheBlockGeometry>,
+            >(),
             size_of::<(
                 &Self,
                 &InferenceSpanWorkspacePlan,
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 &WorkspaceContext,
             )>(),
             size_of::<Result<Option<HostSourceConstructionFacts>, CacheSourceFailure>>(),
@@ -44,7 +48,7 @@ impl ProjectedNativeStorage {
                 &mut usize,
             )>(),
             size_of::<Result<HostSourceConstructionFacts, CacheSourceFailure>>(),
-            size_of::<(u64, usize, [Dtype; 2])>(),
+            size_of::<(u64, usize, [Dtype; 2], bool, bool)>(),
             size_of::<PreparedInputRuntime>(),
             size_of::<Result<PreparedInputRuntime, safemlx::InputAllocatorCause>>(),
             size_of::<Result<&safemlx::InitializedInputAllocator, WorkingMemoryError>>(),
@@ -148,15 +152,21 @@ impl ProjectedNativeStorage {
                     Ok(())
                 })
                 .map_err(|cause| CacheSourceFailure::metadata(cause, context))??;
-            if matches!(
+            let writes_enabled = matches!(
                 source.manager().options().live_disk_policy(),
                 eredu_runtime::LiveCacheDiskPolicy::Enabled { .. }
-            ) {
+            );
+            {
                 trace.with_loads(|loads| -> Result<(), CacheSourceFailure> {
                     for load in loads {
                         if !selection::submitted(plan, (load.query_start, load.context_end), context)? { continue; }
                         trace.with_entries(|entries| -> Result<(), CacheSourceFailure> {
                             let entry = entries.get(load.entry).ok_or_else(|| fail(CacheSourceError::Identity))?;
+                            let retained_file = source.geometry().blocks.iter().any(|block| {
+                                block.id.start == entry.range().start && block.id.end == entry.range().end
+                                    && source.retained_file(&block.id).is_some()
+                            });
+                            if !writes_enabled && !retained_file { return Ok(()); }
                             let shapes = [
                                 entry.shape(0).ok_or_else(|| fail(CacheSourceError::Geometry))?.try_into().map_err(|_| fail(CacheSourceError::Geometry))?,
                                 entry.shape(1).ok_or_else(|| fail(CacheSourceError::Geometry))?.try_into().map_err(|_| fail(CacheSourceError::Geometry))?,

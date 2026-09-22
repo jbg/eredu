@@ -2,11 +2,10 @@ use super::*;
 use std::{
     convert::Infallible,
     error::Error,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        Barrier,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
+        mpsc, Barrier,
     },
 };
 
@@ -30,7 +29,7 @@ impl Drop for Charge {
 }
 fn attach(
     token: &HostSlotMetadata,
-    domain: &SharedStorageDomain,
+    domain: &SharedStorageAccountingId,
     used: &Arc<AtomicU64>,
     retired: Option<(Arc<AtomicUsize>, usize)>,
 ) -> bool {
@@ -90,14 +89,12 @@ fn empty_and_zero_sized_tables_preserve_distinct_identity_and_zero_capacity() {
     assert_eq!(empty.slots(), equal.slots());
     assert_ne!(empty.metadata().identity(), equal.metadata().identity());
     let token = zst.metadata().clone();
-    let domain = SharedStorageDomain::default();
-    assert!(
-        token
-            .try_attach(&domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
-                Box::new(())
-            ))
-            .unwrap()
-    );
+    let domain = SharedStorageAccountingId::default();
+    assert!(token
+        .try_attach(&domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
+            Box::new(())
+        ))
+        .unwrap());
     drop(zst);
     assert!(matches!(
         token.try_attach::<Infallible>(&domain, || panic!("retired zero extent")),
@@ -143,7 +140,7 @@ fn prepared_table_metadata_and_identity_retain_host_custody_but_registry_key_doe
         let metadata = table.metadata().clone();
         let identity = metadata.identity().clone();
         let key = identity.registry_key().clone();
-        let domain = SharedStorageDomain::default();
+        let domain = SharedStorageAccountingId::default();
         let used = Arc::new(AtomicU64::new(0));
         assert!(attach(
             &metadata,
@@ -186,8 +183,8 @@ fn payload_precedes_charge_and_escaped_tokens_only_prolong_existing_custody() {
         ]));
         let used = Arc::new(AtomicU64::new(0));
         let bytes = table.metadata().capacity_bytes().unwrap();
-        let first = SharedStorageDomain::default();
-        let second = SharedStorageDomain::default();
+        let first = SharedStorageAccountingId::default();
+        let second = SharedStorageAccountingId::default();
         assert!(attach(
             table.metadata(),
             &first,
@@ -208,7 +205,7 @@ fn payload_precedes_charge_and_escaped_tokens_only_prolong_existing_custody() {
             assert_eq!(used.load(Ordering::SeqCst), 2 * bytes);
             assert_eq!(token.identity(), &key);
             assert_eq!(token.capacity_bytes(), Some(bytes));
-            for domain in [&first, &SharedStorageDomain::default()] {
+            for domain in [&first, &SharedStorageAccountingId::default()] {
                 assert!(matches!(
                     token.try_attach::<Infallible>(domain, || panic!(
                         "retired token is not a source"
@@ -232,8 +229,8 @@ fn concurrent_live_attachments_acquire_once_for_each_domain() {
     send_sync::<HostSlotMetadata>();
     let table = HostSlotTable::new(Box::new([17u32, 29, 31]));
     let domains = [
-        SharedStorageDomain::default(),
-        SharedStorageDomain::default(),
+        SharedStorageAccountingId::default(),
+        SharedStorageAccountingId::default(),
     ];
     let barrier = Barrier::new(8);
     let used = Arc::new(AtomicU64::new(0));
@@ -264,7 +261,7 @@ fn concurrent_live_attachments_acquire_once_for_each_domain() {
 #[derive(Debug)]
 struct ReenterError {
     token: HostSlotMetadata,
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
     dropped: Arc<AtomicBool>,
 }
 impl fmt::Display for ReenterError {
@@ -275,13 +272,12 @@ impl fmt::Display for ReenterError {
 impl Error for ReenterError {}
 impl Drop for ReenterError {
     fn drop(&mut self) {
-        assert!(
-            self.token
-                .try_attach(&self.domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
-                    Box::new(())
-                ))
-                .unwrap()
-        );
+        assert!(self
+            .token
+            .try_attach(&self.domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
+                Box::new(())
+            ))
+            .unwrap());
         self.dropped.store(true, Ordering::SeqCst);
     }
 }
@@ -291,8 +287,8 @@ fn provider_error_keeps_prior_custody_and_reenters_after_both_locks_release() {
     let table = HostSlotTable::new(Box::new([17u64, 29]));
     let token = table.metadata().clone();
     let used = Arc::new(AtomicU64::new(0));
-    attach(&token, &SharedStorageDomain::default(), &used, None);
-    let domain = SharedStorageDomain::default();
+    attach(&token, &SharedStorageAccountingId::default(), &used, None);
+    let domain = SharedStorageAccountingId::default();
     let dropped = Arc::new(AtomicBool::new(false));
     let error = token
         .try_attach(&domain, || {
@@ -314,29 +310,26 @@ fn provider_error_keeps_prior_custody_and_reenters_after_both_locks_release() {
     assert_eq!(used.load(Ordering::SeqCst), 16);
     drop(error);
     assert!(dropped.load(Ordering::SeqCst));
-    assert!(
-        !token
-            .try_attach::<Infallible>(&domain, || panic!("error destructor already attached"))
-            .unwrap()
-    );
+    assert!(!token
+        .try_attach::<Infallible>(&domain, || panic!("error destructor already attached"))
+        .unwrap());
     drop((table, token));
     assert_eq!(used.load(Ordering::SeqCst), 0);
 }
 
 struct SkippedProviderDrop {
     token: HostSlotMetadata,
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
     dropped: Arc<AtomicBool>,
 }
 impl Drop for SkippedProviderDrop {
     fn drop(&mut self) {
-        assert!(
-            self.token
-                .try_attach(&self.domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
-                    Box::new(())
-                ))
-                .unwrap()
-        );
+        assert!(self
+            .token
+            .try_attach(&self.domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
+                Box::new(())
+            ))
+            .unwrap());
         self.dropped.store(true, Ordering::SeqCst);
     }
 }
@@ -345,7 +338,7 @@ impl Drop for SkippedProviderDrop {
 fn duplicate_provider_captures_retire_after_the_outer_lifecycle_gate() {
     let table = HostSlotTable::new(Box::new([17u32]));
     let token = table.metadata();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     token
         .try_attach(&domain, || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(()))
@@ -354,17 +347,15 @@ fn duplicate_provider_captures_retire_after_the_outer_lifecycle_gate() {
     let dropped = Arc::new(AtomicBool::new(false));
     let capture = SkippedProviderDrop {
         token: token.clone(),
-        domain: SharedStorageDomain::default(),
+        domain: SharedStorageAccountingId::default(),
         dropped: dropped.clone(),
     };
-    assert!(
-        !token
-            .try_attach::<Infallible>(&domain, move || {
-                let _capture = capture;
-                panic!("duplicate must not invoke provider")
-            })
-            .unwrap()
-    );
+    assert!(!token
+        .try_attach::<Infallible>(&domain, move || {
+            let _capture = capture;
+            panic!("duplicate must not invoke provider")
+        })
+        .unwrap());
     assert!(dropped.load(Ordering::SeqCst));
 }
 
@@ -373,19 +364,17 @@ fn poison_preserves_existing_custody_and_does_not_lock_hot_payload_mutation() {
     let mut table = HostSlotTable::new(Box::new([17u32, 29]));
     let token = table.metadata().clone();
     let used = Arc::new(AtomicU64::new(0));
-    attach(&token, &SharedStorageDomain::default(), &used, None);
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            let _ = token.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
-                panic!("injected acquisition panic")
-            });
-        }))
-        .is_err()
-    );
+    attach(&token, &SharedStorageAccountingId::default(), &used, None);
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _ = token.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
+            panic!("injected acquisition panic")
+        });
+    }))
+    .is_err());
     table.slots_mut()[0] = 41;
     assert_eq!(table.slots(), [41, 29]);
     assert!(matches!(
-        token.try_attach::<Infallible>(&SharedStorageDomain::default(), || panic!(
+        token.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || panic!(
             "poison rejects before provider"
         )),
         Err(HostSlotAttachmentError::Attachment(
@@ -407,7 +396,7 @@ impl Drop for RetiringSlot {
     fn drop(&mut self) {
         let token = self.token.as_ref().unwrap();
         assert!(matches!(
-            token.try_attach::<Infallible>(&SharedStorageDomain::default(), || panic!(
+            token.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || panic!(
                 "payload Drop sees retired source"
             )),
             Err(HostSlotAttachmentError::Retired)
@@ -432,7 +421,7 @@ fn concurrent_provider_finishes_before_retirement_and_payload_drop_reenters_unlo
     let retired_copy = retired.clone();
     let provider = std::thread::spawn(move || {
         token_copy
-            .try_attach(&SharedStorageDomain::default(), || {
+            .try_attach(&SharedStorageAccountingId::default(), || {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 assert!(!retired_copy.load(Ordering::SeqCst));
@@ -452,25 +441,24 @@ fn concurrent_provider_finishes_before_retirement_and_payload_drop_reenters_unlo
     dropping.join().unwrap();
     assert!(retired.load(Ordering::SeqCst));
     assert!(matches!(
-        token.try_attach::<Infallible>(&SharedStorageDomain::default(), || panic!("retired")),
+        token.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || panic!("retired")),
         Err(HostSlotAttachmentError::Retired)
     ));
 }
 
 struct AttachOtherOnDrop {
     other: HostSlotMetadata,
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
     dropped: Arc<AtomicBool>,
 }
 impl Drop for AttachOtherOnDrop {
     fn drop(&mut self) {
-        assert!(
-            self.other
-                .try_attach(&self.domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
-                    Box::new(())
-                ))
-                .unwrap()
-        );
+        assert!(self
+            .other
+            .try_attach(&self.domain, || Ok::<Box<dyn Send + Sync>, Infallible>(
+                Box::new(())
+            ))
+            .unwrap());
         self.dropped.store(true, Ordering::SeqCst);
     }
 }
@@ -479,11 +467,11 @@ impl Drop for AttachOtherOnDrop {
 fn final_attached_handle_can_reenter_another_live_table_outside_owner_locks() {
     let source = HostSlotTable::new(Box::new([17u32]));
     let other = HostSlotTable::new(Box::new([29u32]));
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let dropped = Arc::new(AtomicBool::new(false));
     source
         .metadata()
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(AttachOtherOnDrop {
                 other: other.metadata().clone(),
                 domain: domain.clone(),
@@ -493,10 +481,8 @@ fn final_attached_handle_can_reenter_another_live_table_outside_owner_locks() {
         .unwrap();
     drop(source);
     assert!(dropped.load(Ordering::SeqCst));
-    assert!(
-        !other
-            .metadata()
-            .try_attach::<Infallible>(&domain, || panic!("attached during other owner retirement"))
-            .unwrap()
-    );
+    assert!(!other
+        .metadata()
+        .try_attach::<Infallible>(&domain, || panic!("attached during other owner retirement"))
+        .unwrap());
 }

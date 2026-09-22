@@ -3,15 +3,14 @@ use super::owner::{FailureFlag, ManagerCustody, ManagerStream};
 use super::*;
 use crate::backend::runtime::checkpoint::recipe::{DirectRecipeRead, WeightRecipeError};
 use crate::backend::runtime::checkpoint::store::{CacheHandle, PreparedMaterializationStreams};
+use crate::backend::runtime::execution::generic::ParameterConstructors;
 use crate::backend::runtime::execution::layerwise::{
     OriginalDenseControllerFacts, PreparedDenseController, PreparedDenseControllerError,
 };
 use eredu_runtime::ExecutionUnitLayout;
-use crate::backend::runtime::execution::generic::ParameterConstructors;
 use eredu_runtime::working_memory::{
-    OriginalHostMetadataCustody, SharedNativeInitializationCustody,
+    MemoryLedger, OriginalHostMetadataCustody, SharedNativeInitializationCustody,
     SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-    WorkingMemoryPool,
 };
 use safemlx::PreparedHostTransferPlan;
 use std::{alloc::Layout, fmt, mem::size_of, time::Duration};
@@ -20,19 +19,20 @@ mod read_source_plan;
 mod source;
 pub(crate) use foreground_disk::{
     ForegroundDiskDescriptors, ForegroundDiskReadError, ForegroundDiskReadLayout,
-    ForegroundDiskReadPlan, ForegroundDiskSourceError, PreparedForegroundDiskIo, PreparedForegroundDiskRead,
-    ReadForegroundDiskBatch, prepare_foreground_disk_descriptors,
+    ForegroundDiskReadPlan, ForegroundDiskSourceError, ForegroundMaterializationPopulation,
+    PreparedForegroundDiskIo, PreparedForegroundDiskRead, ReadForegroundDiskBatch,
+    prepare_foreground_disk_descriptors,
 };
 use read_source_plan::ReadSourcePlan;
 pub(super) use source::OriginalHostSources;
+mod addressable;
 mod host_birth;
 mod supplementary;
-mod addressable;
 use supplementary::SupplementarySourcePlan;
 struct PlannedRead {
     unit: usize,
     binding: usize,
-    read: DirectRecipeRead,
+    read: read_source_plan::ReadValue,
 }
 
 // These declarations are caller-owned cold planning inputs. Only the consumed
@@ -54,9 +54,10 @@ pub(crate) struct OriginalManagerPlan {
     initial_units: [Vec<OffloadUnitId>; 2],
     binding_reads: Vec<Vec<usize>>,
     array_handles: Vec<usize>,
+    materialized: Option<host_birth::materialized::ConstructionPlan>,
     pub(crate) streams: PreparedMaterializationStreams,
     pub(crate) cache: CacheHandle,
-    pub(crate) pool: WorkingMemoryPool,
+    pub(crate) pool: MemoryLedger,
 }
 // Target execution topology is distinct from the actual bank source protocol.
 // A source-only manager has no target layout, selection or dense controller.
@@ -223,6 +224,9 @@ impl OriginalManagerPlan {
 impl SharedNativeInitializer for OriginalManagerPlan {
     type Output = ResidencyManager;
     type Error = ConstructionError;
+    fn temporary_allocation_requirements(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.materialized.as_ref().map(|plan| &plan.requirements)
+    }
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         self.streams.validate_pool(&self.pool)?;
         self.cache.validate_pool(&self.pool)?;
@@ -277,11 +281,14 @@ impl SharedNativeInitializer for OriginalManagerPlan {
                 &target.parameter_exclusions)?)?;
             if let Some(constructors) = &target.parameter_constructors {
                 add(Layout::array::<ParameterConstructors>(constructors.len())
-                    .map_err(|_| WorkingMemoryError::Overflow)?.size())?;
+                    .map_err(|_| WorkingMemoryError::Overflow)?
+                    .size())?;
             }
             if let Some(facts) = target.dense_controller {
                 add(PreparedDenseController::storage_bytes(
-                    facts, &target.layout, &target.selected_ids,
+                    facts,
+                    &target.layout,
+                    &target.selected_ids,
                 )?)?;
             }
         }
@@ -304,10 +311,15 @@ impl SharedNativeInitializer for OriginalManagerPlan {
             size_of::<Duration>(),
             size_of::<ConstructionError>(),
             size_of::<Result<ResidencyManager, ConstructionError>>(),
-            size_of::<(Option<&OriginalTargetPlan>, &OriginalTargetPlan,
-                Option<&Vec<ParameterConstructors>>, &Vec<ParameterConstructors>,
-                &[ParameterConstructors], Vec<ParameterConstructors>,
-                Option<Vec<ParameterConstructors>>)>() ,
+            size_of::<(
+                Option<&OriginalTargetPlan>,
+                &OriginalTargetPlan,
+                Option<&Vec<ParameterConstructors>>,
+                &Vec<ParameterConstructors>,
+                &[ParameterConstructors],
+                Vec<ParameterConstructors>,
+                Option<Vec<ParameterConstructors>>,
+            )>(),
         ] {
             add(n)?;
         }
@@ -315,10 +327,23 @@ impl SharedNativeInitializer for OriginalManagerPlan {
     }
     fn initialize(
         self,
-        custody: SharedNativeInitializationCustody,
+        mut custody: SharedNativeInitializationCustody,
     ) -> Result<Self::Output, Self::Error> {
+        let temporary = if self.materialized.is_some() {
+            custody.take_allocation_scope().map(Some)
+        } else {
+            Ok(None)
+        };
         let custody = ManagerCustody::new(custody);
         let result = (|| -> Result<ResidencyManager, ConstructionCause> {
+            let temporary = temporary.map_err(ResidencyError::OriginalCache)?;
+            let materialized = match (self.materialized.as_ref(), temporary) {
+                (Some(plan), Some(scope)) => {
+                    Some(host_birth::materialized::Session::new(plan, scope)?)
+                }
+                (None, None) => None,
+                _ => return Err(ResidencyError::OriginalOperationDomain.into()),
+            };
             let mut control = ResidencyController::prepare_constructor(
                 |id| self.source(id),
                 &self.plan,
@@ -336,8 +361,18 @@ impl SharedNativeInitializer for OriginalManagerPlan {
                     .into());
                 }
             }
-            let (sources, read_bytes, read_duration) =
-                self.construct_hosts(&control, custody.clone())?;
+            let materialization = crate::backend::runtime::checkpoint::store::ManagerMaterializationContext::prepared(
+                self.streams.clone(),self.cache.clone(),&self.pool,
+            ).map_err(ResidencyError::OriginalCache)?;
+            let (sources, read_bytes, read_duration) = self.construct_hosts(
+                &control,
+                custody.clone(),
+                materialization.view(),
+                materialized.as_ref(),
+            )?;
+            if let Some(materialized) = materialized {
+                materialized.finish()?;
+            }
             control.ledger_mut().record_transfer(
                 TransferDirection::DiskToHost,
                 read_bytes,
@@ -350,9 +385,6 @@ impl SharedNativeInitializer for OriginalManagerPlan {
                 .map(|unit| (unit.id().clone(), UnitStorage::default()))
                 .collect();
             let failed_transfer = FailureFlag::new(custody.clone());
-            let materialization = crate::backend::runtime::checkpoint::store::ManagerMaterializationContext::prepared(
-                self.streams.clone(),self.cache.clone(),&self.pool,
-            ).map_err(ResidencyError::OriginalCache)?;
             let mut manager = ResidencyManager {
                 inner: ManagerOwner::new(
                     ManagerInner {
@@ -433,10 +465,18 @@ impl SharedNativeInitializer for OriginalManagerPlan {
                             target.depth,
                         )
                         .map_err(ConstructionCause::Operation)?;
-                    if let Some(facts) = target.dense_controller.filter(|facts| facts.options.host_budget_bytes() > 0) {
-                        manager.initialize_original_background_operation_source(
-                            &self.pool, &target.selected_ids, &target.layout, facts.options.host_lookahead(),
-                        ).map_err(ConstructionCause::Operation)?;
+                    if let Some(facts) = target
+                        .dense_controller
+                        .filter(|facts| facts.options.host_budget_bytes() > 0)
+                    {
+                        manager
+                            .initialize_original_background_operation_source(
+                                &self.pool,
+                                &target.selected_ids,
+                                &target.layout,
+                                facts.options.host_lookahead(),
+                            )
+                            .map_err(ConstructionCause::Operation)?;
                     }
                 }
             }
@@ -469,6 +509,8 @@ impl SharedNativeInitializer for OriginalManagerPlan {
 
 #[derive(Debug, thiserror::Error)]
 enum ConstructionCause {
+    #[error(transparent)]
+    Materialized(#[from] host_birth::materialized::Failure),
     #[error("original source selection: {0}")]
     SourceSelection(#[source] WorkingMemoryError),
     #[error(transparent)]
@@ -578,11 +620,16 @@ impl std::error::Error for OriginalManagerError {
 }
 impl ResidencyManager {
     pub(crate) fn parameter_constructors(&self, ordinal: usize) -> Option<ParameterConstructors> {
-        self.inner.parameter_constructors.as_ref()?.get(ordinal).copied()
+        self.inner
+            .parameter_constructors
+            .as_ref()?
+            .get(ordinal)
+            .copied()
     }
 
-    pub(crate) fn original_parameter_exclusions(&self)
-        -> Option<&crate::backend::runtime::execution::generic::MlxParameterExclusions> {
+    pub(crate) fn original_parameter_exclusions(
+        &self,
+    ) -> Option<&crate::backend::runtime::execution::generic::MlxParameterExclusions> {
         self.inner.parameter_exclusions.as_ref()
     }
 
@@ -600,7 +647,7 @@ impl ResidencyManager {
         parameter_constructors: Option<&[ParameterConstructors]>,
         source_stream: &Stream,
         execution_stream: &Stream,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Option<Self>, OriginalManagerError> {
         Self::prepare_original_layerwise_impl(
             primary,
@@ -608,7 +655,14 @@ impl ResidencyManager {
             plan,
             units,
             groups,
-            Some(OriginalTargetInputs { parameter_exclusions, parameter_constructors, selected_ids, layout, depth, dense_controller: None }),
+            Some(OriginalTargetInputs {
+                parameter_exclusions,
+                parameter_constructors,
+                selected_ids,
+                layout,
+                depth,
+                dense_controller: None,
+            }),
             source_stream,
             execution_stream,
             pool,
@@ -629,7 +683,7 @@ impl ResidencyManager {
         parameter_constructors: Option<&[ParameterConstructors]>,
         source_stream: &Stream,
         execution_stream: &Stream,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Option<Self>, OriginalManagerError> {
         Self::prepare_original_layerwise_impl(
             primary,
@@ -637,7 +691,14 @@ impl ResidencyManager {
             plan,
             units,
             groups,
-            Some(OriginalTargetInputs { parameter_exclusions, parameter_constructors, selected_ids, layout, depth, dense_controller: None }),
+            Some(OriginalTargetInputs {
+                parameter_exclusions,
+                parameter_constructors,
+                selected_ids,
+                layout,
+                depth,
+                dense_controller: None,
+            }),
             source_stream,
             execution_stream,
             pool,
@@ -658,7 +719,7 @@ impl ResidencyManager {
         parameter_constructors: Option<&[ParameterConstructors]>,
         source_stream: &Stream,
         execution_stream: &Stream,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         dense_controller: OriginalDenseControllerFacts,
     ) -> Result<Option<Self>, OriginalManagerError> {
         Self::prepare_original_layerwise_impl(
@@ -667,7 +728,14 @@ impl ResidencyManager {
             plan,
             units,
             groups,
-            Some(OriginalTargetInputs { parameter_exclusions, parameter_constructors, selected_ids, layout, depth, dense_controller: Some(dense_controller) }),
+            Some(OriginalTargetInputs {
+                parameter_exclusions,
+                parameter_constructors,
+                selected_ids,
+                layout,
+                depth,
+                dense_controller: Some(dense_controller),
+            }),
             source_stream,
             execution_stream,
             pool,
@@ -684,12 +752,15 @@ impl ResidencyManager {
         target: Option<OriginalTargetInputs<'_>>,
         source_stream: &Stream,
         execution_stream: &Stream,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         foreground: bool,
     ) -> Result<Option<Self>, OriginalManagerError> {
         (|| -> Result<_, PreparationFailure> {
-            if target.as_ref().is_some_and(|target| target.parameter_constructors
-                .is_some_and(|rows| rows.len() != target.selected_ids.len())) {
+            if target.as_ref().is_some_and(|target| {
+                target
+                    .parameter_constructors
+                    .is_some_and(|rows| rows.len() != target.selected_ids.len())
+            }) {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
             let has_disk = plan
@@ -711,9 +782,12 @@ impl ResidencyManager {
             // no ordinary manager is substituted for CPU execution.
             safemlx::StreamCopyPlan::<ManagerCustody>::capture(execution_stream)
                 .map_err(|_| WorkingMemoryError::UnknownBound)?;
-            let Some(reads) = read_source_plan::prepare_reads(units, |id| {
-                sources.get(id).unwrap_or(&primary).as_ref()
-            })?
+            let Some(reads) = read_source_plan::prepare_host_reads(
+                units,
+                |id| sources.get(id).unwrap_or(&primary),
+                pool,
+                source_stream,
+            )?
             else {
                 return Ok(None);
             };
@@ -739,25 +813,38 @@ impl ResidencyManager {
             let streams =
                 PreparedMaterializationStreams::prepare(pool, source_stream, execution_stream)?;
             let cache = CacheHandle::prepare(pool)?;
-            let selected_ids = target.as_ref().map_or(&[][..], |target| target.selected_ids);
-            let target = target.map(|target| {
-                let selected_definitions = target.selected_ids.iter().map(|id| {
-                    units.iter().find(|unit| unit.id() == id).cloned()
-                        .ok_or(WorkingMemoryError::IdentityMismatch)
-                }).collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, WorkingMemoryError>(OriginalTargetPlan {
-                    parameter_exclusions: target.parameter_exclusions.iter().cloned().collect(),
-                    parameter_constructors: target.parameter_constructors.map(<[_]>::to_vec),
-                    selected_ids: target.selected_ids.to_vec(), selected_definitions,
-                    layout: target.layout.clone(), depth: target.depth,
-                    dense_controller: target.dense_controller,
+            let selected_ids = target
+                .as_ref()
+                .map_or(&[][..], |target| target.selected_ids);
+            let target = target
+                .map(|target| {
+                    let selected_definitions = target
+                        .selected_ids
+                        .iter()
+                        .map(|id| {
+                            units
+                                .iter()
+                                .find(|unit| unit.id() == id)
+                                .cloned()
+                                .ok_or(WorkingMemoryError::IdentityMismatch)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, WorkingMemoryError>(OriginalTargetPlan {
+                        parameter_exclusions: target.parameter_exclusions.iter().cloned().collect(),
+                        parameter_constructors: target.parameter_constructors.map(<[_]>::to_vec),
+                        selected_ids: target.selected_ids.to_vec(),
+                        selected_definitions,
+                        layout: target.layout.clone(),
+                        depth: target.depth,
+                        dense_controller: target.dense_controller,
+                    })
                 })
-            }).transpose()?;
+                .transpose()?;
             let catalogs = source::OriginalHostCatalogPlan::capture(&primary, &sources, units)?;
             let foreground = if foreground {
                 Some(
-                    prepare_foreground_disk_descriptors(
-                        &primary, &sources, plan, units, groups, pool,
+                    foreground_disk::prepare_foreground_disk_descriptors_from_reads(
+                        &primary, &sources, plan, units, groups, pool, &reads,
                     )?
                     .ok_or(WorkingMemoryError::UnknownBound)?,
                 )
@@ -782,11 +869,25 @@ impl ResidencyManager {
                 initial_units: [Vec::new(), Vec::new()],
                 binding_reads: Vec::new(),
                 array_handles: Vec::new(),
+                materialized: None,
                 streams,
                 cache,
                 pool: pool.clone(),
             };
             value.prepare_populations()?;
+            value.materialized = host_birth::materialized::ConstructionPlan::prepare(&value)?;
+            // Every cold descriptor and temporary requirement is complete.
+            // Preserve the existing charge while closing growth and exclusion
+            // before handing these immutable sources to the native constructor.
+            for row in &mut value.reads {
+                if let read_source_plan::ReadValue::Materialized(read) = &mut row.read {
+                    read.seal_metadata().map_err(|cause| {
+                        WorkingMemoryError::MetadataConstruction(
+                            eredu_nn::workspace::WorkspaceMetadataError::Funding(cause),
+                        )
+                    })?;
+                }
+            }
             let pool = pool.clone();
             pool.initialize_shared_native(value)
                 .map(|ready| Some(ready.output().clone()))

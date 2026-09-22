@@ -1,6 +1,6 @@
 //! Closed concrete Rc population; payload retirement follows allocation retirement.
 use super::{
-    Array, Error, ObservationRetention, ObservationRoots, Recovery, ScopeRetention,
+    Array, Error, ObservationRetention, ObservationRoots, Recovery, ScopeFunding, ScopeRetention,
     SubmissionResources,
 };
 use std::{
@@ -86,6 +86,7 @@ impl SubmissionResourcesOwner {
             role,
             ScopeRetention {
                 owner: self.clone(),
+                funding: ScopeFunding::Sampling,
                 paged: None,
                 _original: None,
             },
@@ -109,6 +110,7 @@ impl SubmissionResourcesOwner {
             role,
             ScopeRetention {
                 owner: self.clone(),
+                funding: ScopeFunding::Model,
                 paged: None,
                 _original: None,
             },
@@ -121,12 +123,17 @@ impl SubmissionResourcesOwner {
         role: Option<crate::backend::submission_recovery::prediction::PredictionRole>,
     ) -> Result<Recovery<ObservationRetention>, Error> {
         self.scopes.set(self.scopes.get() + 1);
+        let funding = match &roots {
+            ObservationRoots::Scalar { .. } => ScopeFunding::Sampling,
+            _ => ScopeFunding::Model,
+        };
         crate::backend::submission_recovery::prediction::begin(
             role,
             ObservationRetention {
                 _roots: roots,
                 ticket: ScopeRetention {
                     owner: self.clone(),
+                    funding,
                 paged: None,
                     _original: None,
                 },
@@ -158,6 +165,7 @@ impl SubmissionResourcesOwner {
         self.scopes.set(self.scopes.get() + 1);
         ScopeRetention {
             owner: self.clone(),
+            funding: ScopeFunding::Model,
             paged: None,
             _original: None,
         }

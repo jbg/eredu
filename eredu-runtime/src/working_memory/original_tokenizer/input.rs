@@ -1,6 +1,6 @@
 //! Original exact file bytes coexist with a fresh aggregate in the same pool.
 use super::{
-    OriginalTokenizer, OriginalTokenizerError, TokenizerPlan, WorkingMemoryError, WorkingMemoryPool,
+    MemoryLedger, OriginalTokenizer, OriginalTokenizerError, TokenizerPlan, WorkingMemoryError,
 };
 use eredu_checkpoint::artifact::{ArtifactFileReadFailure, PreparedArtifactFileRead};
 use eredu_core::{BackendFailure, BackendFailureKind};
@@ -159,7 +159,7 @@ impl std::error::Error for OriginalTokenizerInputError {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Original input bytes and concrete finite controls, before any read reserve.
     /// This is I only; the root-derived C comparison occurs with I still retained.
     pub fn tokenizer_file_required_bytes(
@@ -283,9 +283,11 @@ impl WorkingMemoryPool {
                         io::Error::from(io::ErrorKind::OutOfMemory)
                     })?;
                 if needed > self.input.bytes.capacity() {
-                    let capacity = needed
-                        .max(self.input.bytes.capacity().saturating_mul(2))
-                        .max(1024);
+                    let doubled = self.input.bytes.capacity().checked_mul(2).ok_or_else(|| {
+                        self.accounting = Some(WorkingMemoryError::Overflow);
+                        io::Error::from(io::ErrorKind::OutOfMemory)
+                    })?;
+                    let capacity = needed.max(doubled).max(1024);
                     // During reallocation the old allocation can coexist with
                     // the replacement. Reserve the full new capacity and keep
                     // that conservative charge until the input owner retires.

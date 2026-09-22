@@ -28,7 +28,12 @@ fn text_setup() -> (
             .unwrap()
             .unwrap();
         probe
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -42,7 +47,12 @@ fn text_setup() -> (
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -79,8 +89,10 @@ impl Instrumentation {
         chat: &'a PreparedChat,
         settings: PreparedChatGenerationSettings,
     ) -> eredu::api::PreparedChatRequest<'a, Prompt> {
-        let mut request =
-            eredu::api::PreparedChatRequest::new(chat, original_sources::settings(settings));
+        let mut request = eredu::api::PreparedChatRequest::new(
+            chat,
+            original_sources::settings(settings.clone()),
+        );
         request.capture = Some(&self.capture);
         request.intervention = self.intervention.as_ref();
         request.output_mode = eredu::api::PreparedChatOutputMode::Text;
@@ -102,7 +114,7 @@ fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_
     for mode in 0..4 {
         let (mut model, chat, settings, _) = text_setup();
         let instrumentation = declarations(mode);
-        let mut prepared = instrumentation.request(&chat, settings);
+        let mut prepared = instrumentation.request(&chat, settings.clone());
         let mut ordinary = vec![];
         let output = {
             let mut run = model
@@ -182,7 +194,7 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         assert_eq!(chat.rendered_prompt(), "user says: hello\nreply begins: ");
         assert_eq!(chat.generation_prompt(), "reply begins: ");
         let instrumentation = declarations(mode);
-        let mut prepared = instrumentation.request(&chat, settings);
+        let mut prepared = instrumentation.request(&chat, settings.clone());
         let prompt = model.encode(chat.rendered_prompt(), false).unwrap();
         prepared.output_mode = eredu::api::PreparedChatOutputMode::Semantic;
         assert_eq!(prompt, model.encode(chat.rendered_prompt(), false).unwrap());
@@ -197,7 +209,7 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
             Some(SemanticSupport::Unsupported { .. })
         ));
         let instrumentation = declarations(mode);
-        let mut prepared = instrumentation.request(&chat, settings);
+        let mut prepared = instrumentation.request(&chat, settings.clone());
         let resolved = model.resolve_generation_config(settings.overrides).unwrap();
         let control = GenerationControlHandle::default();
         let mut records = vec![];
@@ -398,8 +410,10 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
             };
             run.enable_snapshots(
                 bounds,
-                original_sources::CAPACITY,
-                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+                crate::memory::limits(original_sources::CAPACITY),
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+                    original_sources::CAPACITY,
+                )),
             )
             .unwrap();
             run.step(collect(&mut records)).unwrap();
@@ -462,7 +476,7 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
             assert!(run.snapshot_usage().unwrap().retained_bytes > 0);
             drop(run);
             drop((continuation, chat, model));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         }
     }
 }
@@ -486,7 +500,12 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
                     .unwrap()
                     .unwrap();
                 model
-                    .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                    .prepare_chat(
+                        &source,
+                        &request,
+                        &crate::memory::limits(original_sources::CAPACITY),
+                        &cancellation,
+                    )
                     .unwrap()
                     .unwrap()
             };
@@ -516,7 +535,7 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
         .prepare_chat(
             &source,
             &requested,
-            original_sources::CAPACITY,
+            &crate::memory::limits(original_sources::CAPACITY),
             &cancellation
         )
         .is_err());
@@ -531,12 +550,17 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
     let instrumentation = declarations(0);
-    let mut prepared = instrumentation.request(&required, settings);
+    let mut prepared = instrumentation.request(&required, settings.clone());
     assert!(model
         .start_controlled_chat(prepared, limits(), Default::default(), |_| panic!(
             "required tools admitted"
@@ -554,7 +578,12 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -600,7 +629,12 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -672,7 +706,12 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };

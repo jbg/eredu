@@ -18,7 +18,7 @@ impl<'a> CaptureSourceConstruction<'a> {
     }
     /// Borrow the selected account for nested original source workers.
     pub fn funding(self) -> Option<&'a HostMetadataFunding> {
-        self.0.0
+        self.0 .0
     }
     /// Admit the caller's concrete fixed constructor/error transports.
     pub fn controls(self, bytes: usize) -> Result<(), CaptureError> {
@@ -96,7 +96,6 @@ impl<'a> CaptureSourceConstruction<'a> {
         Ok(CaptureCapabilities {
             transformations,
             max_histogram_bins: source.max_histogram_bins,
-            physical_native_limit: source.physical_native_limit,
             conditions: self.texts(&source.conditions)?,
         })
     }

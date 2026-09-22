@@ -4,6 +4,7 @@ use crate::backend::{
     nn::workspace::{ExistingArrayProjection, MlxMetalWorkspaceMechanisms},
     runtime::{cache::state::PreparedResidentDecoderCopy, residency::storage::RetainedStorage},
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{
     Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
     InputTokenCount, OutputDemand, StateMemoryLayout, TextGenerationConfig, WorkspaceBound,
@@ -21,11 +22,22 @@ use eredu_runtime::{
 pub(in super::super) fn metal() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Gpu, 0))
 }
-pub(in super::super) fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+pub(in super::super) fn settle(pool: &MemoryLedger, bytes: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9);
+    let mut reported = false;
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::ordinary_retirement::reclaim_all();
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        if !reported && std::time::Instant::now() >= deadline {
+            eprintln!(
+                "retirement expected funded={bytes}, actual={}, snapshot={:?}",
+                pool.fixture_funded_charge().unwrap(),
+                pool.snapshot().unwrap()
+            );
+            reported = true;
+        }
+        pool.fixture_funded_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 pub(in super::super) fn publish_source(
@@ -50,7 +62,7 @@ pub(in super::super) fn publish_source(
 // 1024-byte source envelope covers only a scalar sampler's host construction.
 // Native decoder copying below uses the selected Metal facts, never this number.
 pub(in super::super) fn sampler(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (
     RunOwnedTextSampler,
     InferenceTextPreparation,
@@ -84,6 +96,7 @@ pub(in super::super) fn sampler(
     let bound = |bytes| WorkspaceBound::bounded(bytes, "portable scalar sampler host fixture");
     let state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: bound(1024),
             attention: bound(0),
@@ -96,13 +109,14 @@ pub(in super::super) fn sampler(
     let reservation = pool
         .reserve_with_capacity(
             &execution,
-            &Admission {
+            &crate::memory_fixture::host_admission(Admission {
                 requested_positions: 3,
                 state,
-                incremental_required_bytes: 1024,
-                available_memory_bytes: None,
-            },
-            u64::MAX,
+                incremental_required_bytes: Some(1024),
+                memory_limits: Default::default(),
+                additional_headroom: Default::default(),
+            }),
+            crate::memory_fixture::resolved_limits(u64::MAX),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
@@ -117,7 +131,7 @@ pub(in super::super) fn sampler(
         .unwrap(),
     );
     let preparation = InferenceRequest::from(reservation)
-        .prepare_text(&execution, geometry, config)
+        .prepare_text(&execution, geometry, config.clone())
         .unwrap();
     let (sampler, completion) = preparation
         .claim_sampling(config)
@@ -131,7 +145,7 @@ pub(in super::super) fn sampler(
 pub(in super::super) fn sampling_plan<'a>(
     plan: &PreparedResidentPoolingCopy<'_>,
     sampler: BorrowedFundedSampler<'a>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (
     RegisteredSamplingCopy<'a, StorageIdentity>,
     eredu_runtime::working_memory::WorkingMemoryStorage<StorageIdentity>,
@@ -149,7 +163,7 @@ pub(in super::super) fn sampling_plan<'a>(
         &context,
         native
             .iter()
-            .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+            .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root)),
     )
     .unwrap();
     let program =
@@ -189,7 +203,7 @@ pub(in super::super) fn finish_native(
 
 #[test]
 fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_source_drop() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let stream = metal();
     let source = state(&stream, true);
@@ -202,7 +216,7 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
     drop(ordinary);
     publish_source(&source, &loading);
     drop(loading);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_funded_charge().unwrap();
     settle(&pool, baseline);
     let (sampler, preparation, run) = sampler(&pool);
     let plan = PreparedResidentPoolingCopy::prepare(&source).unwrap();
@@ -220,17 +234,42 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
     let joined = sampling
         .with_decoder_slots(plan.host_copy(&pool).unwrap(), complete)
         .unwrap();
-    let required = joined.required_bytes();
-    let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+    let copy_limits =
+        crate::memory_fixture::publication_copy_limits(&pool, operands(&plan).len(), u64::MAX);
+    let payload = joined
+        .required_bytes()
+        .unwrap()
+        .checked_add(copy_limits.additional_host_metadata_bytes)
+        .unwrap();
+    let required = crate::memory_fixture::host_total(
+        &pool
+            .text_components_copy_requirements(&joined, &copy_limits)
+            .unwrap(),
+    );
+    let physical_before = pool.fixture_host_current().unwrap();
+    let before = (
+        pool.fixture_funded_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
+    );
     let error = pool
-        .copy_text_components(joined, WorkspaceCopyLimits::new(before.0 + required - 1))
+        .copy_text_components(
+            joined,
+            crate::memory_fixture::publication_copy_limits(
+                &pool,
+                operands(&plan).len(),
+                physical_before.checked_add(required).unwrap() - 1,
+            ),
+        )
         .err()
         .unwrap();
     assert!(
-        matches!(error,DecoderCopyAdmissionError::Memory(WorkingMemoryError::BudgetExceeded {required_bytes, available_bytes}) if required_bytes==required && available_bytes==required-1)
+        matches!(error,DecoderCopyAdmissionError::Memory(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if required_bytes==required && limit_bytes.checked_sub(existing_bytes).unwrap()==required-1)
     );
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         before
     );
     let (sampling, complete) = sampling_plan(&plan, sampler.borrow_funded(), &pool);
@@ -240,10 +279,7 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
     let (copied_sampler, slots, native) = pool
         .copy_text_components(
             joined,
-            WorkspaceCopyLimits {
-                application_memory_budget_bytes: Some(required),
-                ..WorkspaceCopyLimits::new(u64::MAX)
-            },
+            crate::memory_fixture::publication_copy_limits(&pool, operands(&plan).len(), u64::MAX),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
@@ -251,7 +287,10 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
     let saved = plan.copy_retained(slots, &stream, &roots).unwrap();
     assert_eq!(roots.borrow().len(), ids.len() * 2);
     finish_native(&saved, scope, &roots);
-    assert_eq!(pool.used_bytes().unwrap(), before.0 + required);
+    assert!(
+        pool.fixture_host_current().unwrap() <= physical_before + required,
+        "completion retires temporary preparation charges within the admitted peak"
+    );
     assert_eq!(values(&saved.prepare_copy().unwrap()), expected);
     assert_eq!(controls(&saved.prepare_copy().unwrap()), expected_controls);
     assert!(saved
@@ -272,22 +311,56 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
     drop((source, sampler, preparation, run));
     settle(
         &pool,
-        custody.bytes() + saved.shared_layout().capacity_bytes().unwrap(),
+        custody
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap()
+            + saved.shared_layout().capacity_bytes().unwrap()
+            - crate::memory_fixture::publication_control_bytes(
+                operands(&saved.prepare_copy().unwrap())
+                    .len()
+                    .checked_mul(2)
+                    .unwrap(),
+            ),
     );
     let plan = saved.prepare_copy().unwrap();
     let (sampling, complete) = sampling_plan(&plan, copied_sampler.borrow_funded(), &pool);
     let joined = sampling
         .with_decoder_slots(plan.host_copy(&pool).unwrap(), complete)
         .unwrap();
-    let required = joined.required_bytes();
-    let before = pool.used_bytes().unwrap();
+    let copy_limits =
+        crate::memory_fixture::publication_copy_limits(&pool, operands(&plan).len(), u64::MAX);
+    let payload = joined
+        .required_bytes()
+        .unwrap()
+        .checked_add(copy_limits.additional_host_metadata_bytes)
+        .unwrap();
+    let required = crate::memory_fixture::host_total(
+        &pool
+            .text_components_copy_requirements(&joined, &copy_limits)
+            .unwrap(),
+    );
+    let physical_before = pool.fixture_host_current().unwrap();
+    let before = pool.fixture_funded_charge().unwrap();
     let (next_sampler, slots, next_native) = pool
-        .copy_text_components(joined, WorkspaceCopyLimits::new(before + required))
+        .copy_text_components(
+            joined,
+            crate::memory_fixture::publication_copy_limits(
+                &pool,
+                operands(&plan).len(),
+                physical_before.checked_add(required).unwrap(),
+            ),
+        )
         .unwrap();
     let (next_custody, scope) = next_native.into_parts();
     let duplicate = plan.copy_retained(slots, &stream, &roots).unwrap();
     finish_native(&duplicate, scope, &roots);
-    assert_eq!(pool.used_bytes().unwrap(), before + required);
+    assert!(
+        pool.fixture_host_current().unwrap() <= physical_before + required,
+        "completion retires temporary preparation charges within the admitted peak"
+    );
     drop((saved, copied_sampler, custody));
     assert_eq!(values(&duplicate.prepare_copy().unwrap()), expected);
     assert_eq!(
@@ -295,9 +368,13 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
         expected_controls
     );
     let escaped = operands(&duplicate.prepare_copy().unwrap())[0].clone();
-    let escaped_bytes = escaped.allocation_info().unwrap().unwrap().bytes() as u64;
+    let info = escaped.allocation_info().unwrap().unwrap();
+    let escaped_bytes = (info.bytes() as u64)
+        .checked_add(info.host_control_bytes() as u64)
+        .unwrap();
+    let account_controls = required.checked_sub(payload).unwrap();
     drop((duplicate, next_sampler, next_custody));
-    settle(&pool, escaped_bytes);
+    settle(&pool, escaped_bytes + account_controls);
     assert!(escaped
         .evaluated()
         .unwrap()
@@ -311,7 +388,7 @@ fn funded_pooling_copy_matches_local_compressed_sparse_and_saved_copy_after_sour
 
 #[test]
 fn pooling_builder_identity_rejects_before_work_and_late_failure_keeps_roots() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let stream = metal();
     let source = state(&stream, true);
@@ -329,7 +406,7 @@ fn pooling_builder_identity_rejects_before_work_and_late_failure_keeps_roots() {
             sampling
                 .with_decoder_slots(plan.host_copy(&pool).unwrap(), complete)
                 .unwrap(),
-            WorkspaceCopyLimits::new(u64::MAX),
+            crate::memory_fixture::publication_copy_limits(&pool, operands(&plan).len(), u64::MAX),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
@@ -351,7 +428,7 @@ fn pooling_builder_identity_rejects_before_work_and_late_failure_keeps_roots() {
             sampling
                 .with_decoder_slots(plan.host_copy(&pool).unwrap(), complete)
                 .unwrap(),
-            WorkspaceCopyLimits::new(u64::MAX),
+            crate::memory_fixture::publication_copy_limits(&pool, operands(&plan).len(), u64::MAX),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
@@ -387,7 +464,7 @@ fn pooling_builder_identity_rejects_before_work_and_late_failure_keeps_roots() {
 #[test]
 fn native_dispatch_uses_same_single_account_for_pooling_slots() {
     for populated in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         let stream = metal();
         let source = state(&stream, populated);
@@ -406,10 +483,19 @@ fn native_dispatch_uses_same_single_account_for_pooling_slots() {
                 &pool,
                 sampling,
                 complete,
-                WorkspaceCopyLimits::new(u64::MAX),
+                crate::memory_fixture::publication_copy_limits(
+                    &pool,
+                    operands(&plan).len(),
+                    u64::MAX,
+                ),
             )
             .unwrap();
-        let aggregate = native.bytes();
+        let aggregate = native
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         let (custody, scope) = native.into_parts();
         let roots = RefCell::new(Vec::new());
         let saved = native_plan.copy_retained(slots, &stream, &roots).unwrap();
@@ -425,7 +511,8 @@ fn native_dispatch_uses_same_single_account_for_pooling_slots() {
                 array.evaluated().unwrap();
                 storage.include_array(array).unwrap();
                 actual.push(array.evaluated().unwrap().try_to_vec::<f32>().unwrap());
-            });
+            })
+            .unwrap();
         drop(storage.publish_funded(&scope).unwrap());
         roots.borrow_mut().clear();
         scope.certify().unwrap();

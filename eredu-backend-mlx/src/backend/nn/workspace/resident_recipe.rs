@@ -13,9 +13,15 @@ mod attention_direct;
 mod attention_tiled;
 // These are the fixed frames of the same Rust accumulator, independent of its
 // selected numerical backend. CPU primitives retain their own query census.
-pub(in crate::backend::nn::workspace) fn blockwise_control_bytes(operation: WorkspaceOperationView<'_>) -> Option<usize> {
-    matches!(operation.kind,WorkspaceOperationKindView::BlockwiseAttention{..})
-        .then(||attention_tiled::control_bytes(operation)).flatten()
+pub(in crate::backend::nn::workspace) fn blockwise_control_bytes(
+    operation: WorkspaceOperationView<'_>,
+) -> Option<usize> {
+    matches!(
+        operation.kind,
+        WorkspaceOperationKindView::BlockwiseAttention { .. }
+    )
+    .then(|| attention_tiled::control_bytes(operation))
+    .flatten()
 }
 mod capture;
 mod clip;
@@ -25,9 +31,9 @@ mod fp8;
 mod gather;
 mod gather_pooled_mask;
 mod graph_capacity;
-mod initialized_inputs;
 mod grouped_packed;
 mod grouped_reduction;
+mod initialized_inputs;
 pub(super) fn mxfp4_sources(operation: WorkspaceOperationView<'_>) -> Option<usize> {
     grouped_packed::mxfp4_sources(operation)
 }
@@ -36,7 +42,10 @@ pub(super) fn affine_sources(operation: WorkspaceOperationView<'_>) -> Option<us
 }
 mod isolated_copy;
 pub(crate) use isolated_copy::IsolatedCopyNativeLayout;
-pub(crate) use numerical::{SpeculativeNumericalRecipe,CpuCaptureLoan,AddressableNumericalPopulation};
+pub(crate) use numerical::{
+    AddressableNumericalPopulation, CpuCaptureLoan, OrdinaryCpuPopulation,
+    SpeculativeNumericalRecipe,
+};
 mod convolution;
 mod cpu;
 mod embedded;
@@ -51,6 +60,8 @@ mod joint_selection;
 mod masked_readout;
 mod neural_boundaries;
 mod numerical;
+mod ordinary;
+pub(crate) use ordinary::{OrdinaryIndexedPrograms, OrdinaryNativeControls};
 #[cfg(all(
     test,
     target_vendor = "apple",
@@ -59,8 +70,6 @@ mod numerical;
 ))]
 pub(super) mod original_component_tests;
 mod parameter_construction;
-#[cfg(test)]
-mod stream_tests;
 mod pooled_attention;
 mod pooled_positions;
 mod pooling_mask;
@@ -72,10 +81,17 @@ mod router;
 mod sampling_filters;
 mod sampling_mirostat;
 mod sampling_penalties;
-mod sampling_random;
 mod sampling_program;
+mod sampling_random;
+#[cfg(test)]
+mod stream_tests;
 pub(crate) use sampling_program::ResidentSamplingProgram;
-#[cfg(all(test, target_vendor="apple", feature="metal", not(feature="cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod sampling_validation_tests;
 mod selective_scan;
 mod speculative;
@@ -84,12 +100,24 @@ mod speculative_io;
 pub(crate) use speculative::AutoregressiveEquationRecipe;
 pub(crate) use speculative_io::AutoregressiveReadoutRecipe;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CertifiedSpanStorage {
     mutable_bytes: u64,
     maximum_births: usize,
 }
 impl CertifiedSpanStorage {
+    pub(crate) fn checked_add(self, bytes: u64, births: usize) -> Option<Self> {
+        Some(Self {
+            mutable_bytes: self.mutable_bytes.checked_add(bytes)?,
+            maximum_births: self.maximum_births.checked_add(births)?,
+        })
+    }
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            mutable_bytes: self.mutable_bytes.max(other.mutable_bytes),
+            maximum_births: self.maximum_births.max(other.maximum_births),
+        }
+    }
     pub(crate) fn mutable_bytes(self) -> u64 {
         self.mutable_bytes
     }
@@ -124,24 +152,40 @@ impl ResidentDispatchPopulation {
     /// CPU model has no crossed router; its collective stream is still distinct.
     fn completion_streams(&self) -> Option<usize> {
         if let Some(source) = self.cpu_model.as_ref() {
-            if self.gpu_entries != 0 || self.gpu_input_edges != 0
-                || self.gpu_siblings != 0 || self.gpu_births != 0
-                || self.worker_graph_extents != 0 || self.copy_rank_extents != 0
-                || self.kernel_attempts != 0 || self.additional_sort_kernels != 0
-                || self.cpu_entries != source.primitives.checked_add(self.parallel_entries)?.checked_add(1)?
+            if self.gpu_entries != 0
+                || self.gpu_input_edges != 0
+                || self.gpu_siblings != 0
+                || self.gpu_births != 0
+                || self.worker_graph_extents != 0
+                || self.copy_rank_extents != 0
+                || self.kernel_attempts != 0
+                || self.additional_sort_kernels != 0
+                || self.cpu_entries
+                    != source
+                        .primitives
+                        .checked_add(self.parallel_entries)?
+                        .checked_add(1)?
             {
                 return None;
             }
             Some(1 + usize::from(self.parallel_entries != 0))
         } else {
-            if self.gpu_entries == 0 { return None; }
+            if self.gpu_entries == 0 {
+                return None;
+            }
             let routers = self.cpu_entries.checked_sub(self.parallel_entries)?;
             Some(1 + usize::from(routers != 0) + usize::from(self.parallel_entries != 0))
         }
     }
     fn completion_stream_control_bytes() -> usize {
-        std::mem::size_of::<(&Self, Option<&super::cpu::CpuPopulation>,
-            usize, usize, Option<usize>, bool)>()
+        std::mem::size_of::<(
+            &Self,
+            Option<&super::cpu::CpuPopulation>,
+            usize,
+            usize,
+            Option<usize>,
+            bool,
+        )>()
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -223,6 +267,7 @@ impl<'a> NestedCompletionRoots<'a> {
 #[derive(Debug)]
 pub(crate) struct ResidentSpanRecipe {
     span: InferenceWorkspaceSpan,
+    layerwise_ordinals: Option<Vec<usize>>,
     closing_state: WorkspaceStoragePopulation,
     opening_state: Option<WorkspaceStoragePopulation>,
     current_output: Option<WorkspaceStoragePopulation>,
@@ -247,8 +292,25 @@ pub(crate) struct ResidentSpanRecipe {
     prediction_roots: Option<Vec<usize>>,
     parallel: Option<parallel::OriginalParallelInvocation>,
     addressable: Option<AddressableInvocation>,
+    ordinary_addressable: Option<std::rc::Rc<OrdinaryAddressableProgram>>,
+    ordinary_parallel: Option<super::parallel::OrdinaryParallelControls>,
+    ordinary_calls: Option<OrdinaryCallControls>,
+    ordinary_call_failure: Option<ordinary::OrdinaryCallFailure>,
+    ordinary_paged_source: bool,
+    model_controls: Option<eredu_runtime::replicated_session::SessionModelControlPlan>,
 }
 impl ResidentSpanRecipe {
+    /// Paid descriptions retained from the same model traversal. These do not
+    /// grant communication or inference authority; the real owner admits them.
+    pub(crate) fn model_controls(
+        &self,
+    ) -> Option<&eredu_runtime::replicated_session::SessionModelControlPlan> {
+        self.model_controls.as_ref()
+    }
+    /// Exact shared traversal visits, including spans which skip encoder units.
+    pub(crate) fn layerwise_ordinals(&self) -> Option<&[usize]> {
+        self.layerwise_ordinals.as_deref()
+    }
     pub(crate) fn missing_operation_detail(&self) -> Option<&str> {
         self.missing_operation_detail.as_deref()
     }
@@ -258,7 +320,9 @@ impl ResidentSpanRecipe {
             self.missing_operation_detail.take()?,
         ))
     }
-    pub(crate) fn addressable(&self)->Option<&AddressableInvocation>{self.addressable.as_ref()}
+    pub(crate) fn addressable(&self) -> Option<&AddressableInvocation> {
+        self.addressable.as_ref()
+    }
     pub(crate) fn parallel(&self) -> Option<&parallel::OriginalParallelInvocation> {
         self.parallel.as_ref()
     }
@@ -312,9 +376,13 @@ pub(crate) struct ResidentSamplingRecipe {
     phase: eredu_runtime::working_memory::SamplingWorkspacePhase,
     preparation: Option<ResidentSamplingPreparation>,
     first_missing_operation: Option<usize>,
+    missing_operation_detail: Option<String>,
     mutable_storage: Option<CertifiedSpanStorage>,
     completion: Option<ResidentCompletionRecipe>,
     query_controls: Option<usize>,
+    ordinary_calls: Option<OrdinaryCallControls>,
+    ordinary_call_failure: Option<ordinary::OrdinaryCallFailure>,
+    ordinary_paged_source: bool,
 }
 impl ResidentSamplingRecipe {
     pub(crate) fn first_missing_operation(&self) -> Option<usize> {
@@ -340,6 +408,8 @@ pub(crate) struct ResidentNativeRecipe {
     records: Vec<ResidentSpanRecipe>,
     sampling: ResidentSamplingProgram,
     neural: Option<neural_boundaries::NeuralBoundaries>,
+    ordinary_neural: Option<ordinary::OrdinaryNeuralCalls>,
+    ordinary_model_completion_bound: bool,
     layerwise_constructors: Option<parameter_construction::ParameterConstructors>,
     host_copies: Option<host_copies::HostCopies>,
     host_transfers: Option<host_copies::HostTransfers>,
@@ -352,21 +422,37 @@ pub(crate) struct ResidentNativeRecipe {
     planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl ResidentNativeRecipe {
+    pub(crate) fn ordinary_requires_paged_source(&self) -> bool {
+        self.records.iter().any(|row| row.ordinary_paged_source)
+            || self
+                .sampling
+                .rows()
+                .iter()
+                .any(|row| row.ordinary_paged_source)
+    }
     pub(crate) fn planning_metadata(&self) -> Option<&HostMetadataFunding> {
         self.planning_metadata.as_ref()
     }
-    pub(crate) fn record_quote_components(&mut self,
-        mut value: crate::backend::error::WorkspaceQuoteComponents) -> Result<(), crate::backend::error::Error> {
+    pub(crate) fn record_quote_components(
+        &mut self,
+        mut value: crate::backend::error::WorkspaceQuoteComponents,
+    ) -> Result<(), crate::backend::error::Error> {
         let metadata = self.planning_metadata.as_ref();
         if let Some(funding) = metadata {
-            funding.reserve_metadata(std::mem::size_of::<(
-                &mut Self, crate::backend::error::WorkspaceQuoteComponents,
-                std::slice::Iter<'_, ResidentSpanRecipe>,
-                std::slice::Iter<'_, ResidentSamplingRecipe>,
-                Option<ResidentDispatchPopulation>, Option<ResidentCompletionRecipe>,
-                NestedCompletionRoots<'_>, Option<usize>, usize,
-                Result<(), crate::backend::error::Error>,
-            )>()).map_err(crate::backend::error::Error::WorkspacePlanning)?;
+            funding
+                .reserve_metadata(std::mem::size_of::<(
+                    &mut Self,
+                    crate::backend::error::WorkspaceQuoteComponents,
+                    std::slice::Iter<'_, ResidentSpanRecipe>,
+                    std::slice::Iter<'_, ResidentSamplingRecipe>,
+                    Option<ResidentDispatchPopulation>,
+                    Option<ResidentCompletionRecipe>,
+                    NestedCompletionRoots<'_>,
+                    Option<usize>,
+                    usize,
+                    Result<(), crate::backend::error::Error>,
+                )>())
+                .map_err(crate::backend::error::Error::WorkspacePlanning)?;
         }
         value.kernel_attempts = self.kernel_attempts();
         value.equation_rows = self.records.len();
@@ -374,20 +460,34 @@ impl ResidentNativeRecipe {
         value.cpu_entries = Some(0);
         value.nested_frontiers = Some(0);
         for row in &self.records {
-            value.mixed_rows += usize::from(row.dispatch.is_some_and(|dispatch| dispatch.cpu_entries != 0));
-            value.gpu_entries = value.gpu_entries.and_then(|total| total.checked_add(row.dispatch?.gpu_entries));
-            value.cpu_entries = value.cpu_entries.and_then(|total| total.checked_add(row.dispatch?.cpu_entries));
-            value.nested_frontiers = value.nested_frontiers.and_then(|total|
-                total.checked_add(NestedCompletionRoots::for_row(row).count()?));
+            value.mixed_rows += usize::from(
+                row.dispatch
+                    .is_some_and(|dispatch| dispatch.cpu_entries != 0),
+            );
+            value.gpu_entries = value
+                .gpu_entries
+                .and_then(|total| total.checked_add(row.dispatch?.gpu_entries));
+            value.cpu_entries = value
+                .cpu_entries
+                .and_then(|total| total.checked_add(row.dispatch?.cpu_entries));
+            value.nested_frontiers = value
+                .nested_frontiers
+                .and_then(|total| total.checked_add(NestedCompletionRoots::for_row(row).count()?));
         }
         value.sampling_gpu_entries = Some(0);
         value.sampling_cpu_entries = Some(0);
         value.sampling_nested_frontiers = Some(0);
         for row in self.sampling.rows() {
             if let Some(completion) = row.completion() {
-                value.sampling_gpu_entries = value.sampling_gpu_entries.and_then(|total| total.checked_add(completion.dispatch?.gpu_entries));
-                value.sampling_cpu_entries = value.sampling_cpu_entries.and_then(|total| total.checked_add(completion.dispatch?.cpu_entries));
-                value.sampling_nested_frontiers = value.sampling_nested_frontiers.and_then(|total| total.checked_add(completion.nested_completions));
+                value.sampling_gpu_entries = value
+                    .sampling_gpu_entries
+                    .and_then(|total| total.checked_add(completion.dispatch?.gpu_entries));
+                value.sampling_cpu_entries = value
+                    .sampling_cpu_entries
+                    .and_then(|total| total.checked_add(completion.dispatch?.cpu_entries));
+                value.sampling_nested_frontiers = value
+                    .sampling_nested_frontiers
+                    .and_then(|total| total.checked_add(completion.nested_completions));
             }
         }
         self.quote_components = value;
@@ -417,8 +517,10 @@ impl ResidentNativeRecipe {
     // of model rows does not make those independently counted programs unknown.
     fn is_terminal_resume(&self) -> bool {
         let geometry = self.plan.geometry();
-        self.resume_copy.is_some() && self.records.is_empty()
-            && geometry.input_positions == 0 && geometry.max_output_tokens == 0
+        self.resume_copy.is_some()
+            && self.records.is_empty()
+            && geometry.input_positions == 0
+            && geometry.max_output_tokens == 0
             && geometry.prefill_chunk_positions == 0
             && geometry.output == eredu_core::OutputDemand::StateOnly
     }
@@ -449,18 +551,46 @@ impl ResidentNativeRecipe {
             size_of::<std::iter::Enumerate<std::slice::IterMut<'_, ResidentSpanRecipe>>>(),
             size_of::<(usize, &mut ResidentSpanRecipe)>(),
             size_of::<Option<(usize, &mut ResidentSpanRecipe)>>(),
+            size_of::<std::iter::Enumerate<std::slice::IterMut<'_, ResidentSamplingRecipe>>>(),
+            size_of::<(usize, &mut ResidentSamplingRecipe)>(),
+            size_of::<Option<(usize, &mut ResidentSamplingRecipe)>>(),
             size_of::<usize>(),
             size_of::<Option<(usize, usize, Option<String>)>>(),
-            size_of::<Result<Option<(usize, usize, Option<String>)>, crate::backend::error::Error>>(),
+            size_of::<Result<Option<(usize, usize, Option<String>)>, crate::backend::error::Error>>(
+            ),
         ];
         if let Some(funding) = &self.planning_metadata {
-            let bytes = frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
-                .ok_or(crate::backend::error::Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?;
-            funding.reserve_metadata(bytes).map_err(crate::backend::error::Error::WorkspacePlanning)?;
+            let bytes = frames
+                .into_iter()
+                .try_fold(size_of_val(&frames), usize::checked_add)
+                .ok_or(crate::backend::error::Error::WorkspacePlanning(
+                    eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                ))?;
+            funding
+                .reserve_metadata(bytes)
+                .map_err(crate::backend::error::Error::WorkspacePlanning)?;
         }
         for (record, row) in self.records.iter_mut().enumerate() {
             if let Some(operation) = row.first_missing_operation {
-                return Ok(Some((record, operation, row.missing_operation_detail.take())));
+                return Ok(Some((
+                    record,
+                    operation,
+                    row.missing_operation_detail.take(),
+                )));
+            }
+        }
+        for (sampling, row) in self.sampling.rows.iter_mut().enumerate() {
+            if let Some(operation) = row.first_missing_operation {
+                let record = self.records.len().checked_add(sampling).ok_or(
+                    crate::backend::error::Error::WorkspacePlanning(
+                        eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                    ),
+                )?;
+                return Ok(Some((
+                    record,
+                    operation,
+                    row.missing_operation_detail.take(),
+                )));
             }
         }
         Ok(None)
@@ -517,8 +647,9 @@ impl ResidentNativeRecipe {
     pub(crate) fn sampling_preparation_graph(
         &self,
     ) -> Result<Option<safemlx::ResidentGraphLayout>, crate::backend::error::Error> {
-        self.sampling.preparation_graph().ok_or(
-            crate::backend::error::Error::PrefillControl(
+        self.sampling
+            .preparation_graph()
+            .ok_or(crate::backend::error::Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             ))
     }
@@ -555,10 +686,22 @@ impl ResidentNativeRecipe {
                 .and_then(|n| n.checked_add(size_of::<Self>()))
                 .and_then(|n| {
                     n.checked_add(
-                        self.sampling.rows
+                        self.sampling
+                            .rows
                             .capacity()
                             .checked_mul(size_of::<ResidentSamplingRecipe>())?,
                     )
+                })
+                .and_then(|n| {
+                    self.records.iter().try_fold(n, |sum, row| {
+                        sum.checked_add(
+                            row.layerwise_ordinals
+                                .as_ref()
+                                .map_or(Some(0), |ordinals| {
+                                    ordinals.capacity().checked_mul(size_of::<usize>())
+                                })?,
+                        )
+                    })
                 })
                 .ok_or_else(|| Error::backend("resident recipe control overflow"))?
         };
@@ -568,7 +711,8 @@ impl ResidentNativeRecipe {
             .try_fold(retained, |n, row| n.checked_add(row.query_controls?))
             .ok_or_else(|| Error::backend("resident recipe query controls are unqualified"))?;
         let controls = self
-            .sampling.rows
+            .sampling
+            .rows
             .iter()
             .try_fold(controls, |n, row| n.checked_add(row.query_controls?))
             .ok_or_else(|| Error::backend("resident sampling query controls are unqualified"))?;
@@ -614,33 +758,45 @@ impl ResidentNativeRecipe {
         .ok_or_else(|| Error::backend("resident recipe control overflow"))?;
         u64::try_from(fixed).map_err(Error::backend_retained_source)
     }
+    fn parallel_control_sources(&self) -> impl Iterator<Item = &parallel::OriginalParallelSource> {
+        self.parallel_source.iter().chain(
+            self.records
+                .iter()
+                .filter_map(|row| row.parallel().map(|value| value.source())),
+        )
+    }
+    fn parallel_source_scan_control_bytes<I: Iterator>(sources: &I) -> Option<usize> {
+        std::mem::size_of_val(sources)
+            .checked_add(std::mem::size_of::<Option<&parallel::OriginalParallelSource>>())?
+            .checked_add(std::mem::size_of::<
+                Result<Option<&parallel::OriginalParallelSource>, crate::backend::error::Error>,
+            >())
+    }
+    /// Prospective frames of the same immutable source scan, without a debit or
+    /// a source grant. An empty source range performs no funded scan.
+    pub(crate) fn parallel_control_source_control_bytes(&self) -> Option<usize> {
+        let mut sources = self.parallel_control_sources();
+        if sources.next().is_none() {
+            return Some(0);
+        }
+        Self::parallel_source_scan_control_bytes(&sources)
+    }
     /// The same immutable model quote source for every collective span. No
     /// occurrence or control request is created by this borrowed projection.
     pub(crate) fn parallel_control_source(
         &self,
     ) -> Result<Option<&parallel::OriginalParallelSource>, crate::backend::error::Error> {
-        let mut sources = self.parallel_source.iter().chain(self.records.iter()
-            .filter_map(|row| row.parallel().map(|value| value.source())));
+        let mut sources = self.parallel_control_sources();
         let Some(source) = sources.next() else {
             return Ok(None);
         };
         source
             .funding()
-            .reserve_metadata(
-                std::mem::size_of_val(&sources)
-                    .checked_add(std::mem::size_of::<Option<&parallel::OriginalParallelSource>>())
-                    .and_then(|n| {
-                        n.checked_add(std::mem::size_of::<
-                            Result<
-                                Option<&parallel::OriginalParallelSource>,
-                                crate::backend::error::Error,
-                            >,
-                        >())
-                    })
-                    .ok_or(crate::backend::error::Error::WorkspacePlanning(
-                        eredu_nn::workspace::HostMetadataFundingError::Overflow,
-                    ))?,
-            )
+            .reserve_metadata(Self::parallel_source_scan_control_bytes(&sources).ok_or(
+                crate::backend::error::Error::WorkspacePlanning(
+                    eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                ),
+            )?)
             .map_err(crate::backend::error::Error::WorkspacePlanning)?;
         if sources.any(|other| !source.same_source(other)) {
             return Err(crate::backend::error::Error::PrefillControl(
@@ -715,7 +871,8 @@ impl ResidentNativeRecipe {
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ));
         }
-        usize::try_from(step.attempt()).ok()
+        usize::try_from(step.attempt())
+            .ok()
             .and_then(|index| self.sampling.completion(index))
             .ok_or(crate::backend::error::Error::PrefillScopeUnavailable)
     }
@@ -741,41 +898,42 @@ impl ResidentNativeRecipe {
         self.records
             .iter()
             .find(|row| matches(&row.span))
-            .and_then(|row| {
-                if row.unqualified_kernel_owner.is_some() {
-                    return None;
-                }
-                Some(ResidentCompletionRecipe {
-                    validation_roots: row.validation_roots,
-                    grouped_outputs: row.grouped_outputs,
-                    traversal: row.traversal?,
-                    graph: row.graph?,
-                    dispatch: row.dispatch,
-                    nested_completions: NestedCompletionRoots::for_row(row)
-                        .count()?
-                        .checked_add(self.host_copies.map_or(0, |copies| copies.per_forward))?
-                        .checked_add(
-                            self.host_transfers
-                                .map_or(0, |transfers| transfers.per_forward),
-                        )?,
-                    nested_root_capacity: self
-                        .host_transfers
-                        .map_or(3, |transfers| transfers.roots)
-                        .max(row.nested_root_capacity)
-                        .max(
-                            row.prediction_roots
-                                .as_deref()
-                                .unwrap_or(&[])
-                                .iter()
-                                .copied()
-                                .max()
-                                .unwrap_or(0),
-                        ),
-                })
-            })
+            .and_then(|row| self.completion_for_row(row))
             .ok_or(crate::backend::error::Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             ))
+    }
+    fn completion_for_row(&self, row: &ResidentSpanRecipe) -> Option<ResidentCompletionRecipe> {
+        if row.unqualified_kernel_owner.is_some() {
+            return None;
+        }
+        Some(ResidentCompletionRecipe {
+            validation_roots: row.validation_roots,
+            grouped_outputs: row.grouped_outputs,
+            traversal: row.traversal?,
+            graph: row.graph?,
+            dispatch: row.dispatch,
+            nested_completions: NestedCompletionRoots::for_row(row)
+                .count()?
+                .checked_add(self.host_copies.map_or(0, |copies| copies.per_forward))?
+                .checked_add(
+                    self.host_transfers
+                        .map_or(0, |transfers| transfers.per_forward),
+                )?,
+            nested_root_capacity: self
+                .host_transfers
+                .map_or(3, |transfers| transfers.roots)
+                .max(row.nested_root_capacity)
+                .max(
+                    row.prediction_roots
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0),
+                ),
+        })
     }
 }
 pub(crate) struct ResidentRecipeRecorder {
@@ -783,7 +941,10 @@ pub(crate) struct ResidentRecipeRecorder {
     mechanism: MlxMetalWorkspaceMechanisms,
     cpu: Option<MlxCpuWorkspaceMechanisms>,
     layerwise_constructors: Option<parameter_construction::ParameterConstructors>,
+    layerwise_span_constructors:
+        Option<crate::backend::runtime::execution::generic::LayerwiseConstructorTrace>,
     addressable_sources: Option<AddressableSources>,
+    ordinary_addressable_sources: Option<OrdinaryAddressableSources>,
     records: Vec<ResidentSpanRecipe>,
     sampling: Vec<ResidentSamplingRecipe>,
     sampling_input: Option<eredu_runtime::working_memory::SamplingWorkspaceInputPlan>,
@@ -797,7 +958,9 @@ impl ResidentRecipeRecorder {
             mechanism,
             cpu: None,
             layerwise_constructors: None,
+            layerwise_span_constructors: None,
             addressable_sources: None,
+            ordinary_addressable_sources: None,
             records: Vec::new(),
             sampling: Vec::new(),
             sampling_input: None,
@@ -817,6 +980,11 @@ impl ResidentRecipeRecorder {
             std::mem::size_of::<Result<Self, Error>>(),
             std::mem::size_of::<ReducedTrace>(),
             std::mem::size_of::<Result<ReducedTrace, Error>>(),
+            std::mem::size_of::<(
+                Option<eredu_runtime::replicated_session::SessionModelControlPlan>,
+                Option<HostMetadataFunding>,
+                &WorkspaceTraceReport,
+            )>(),
             std::mem::size_of::<(
                 Option<WorkspaceStoragePopulation>,
                 WorkspaceStoragePopulation,
@@ -839,13 +1007,49 @@ impl ResidentRecipeRecorder {
         recorder.context = Some(context.clone());
         Ok(recorder)
     }
-    pub(crate) fn bind_addressable_sources(&mut self,source:AddressableSources)->Result<(),Error>{
-        let context=self.context.as_ref().ok_or_else(||self.metadata_error("addressable recorder requires original funding"))?;
-        if self.addressable_sources.is_some() || context.metadata_funding().is_none_or(|funding|!funding.same_account(source.funding())) {
+    pub(crate) fn bind_addressable_sources(
+        &mut self,
+        source: AddressableSources,
+    ) -> Result<(), Error> {
+        let context = self
+            .context
+            .as_ref()
+            .ok_or_else(|| self.metadata_error("addressable recorder requires original funding"))?;
+        if self.addressable_sources.is_some()
+            || self.ordinary_addressable_sources.is_some()
+            || context
+                .metadata_funding()
+                .is_none_or(|funding| !funding.same_account(source.funding()))
+        {
             return Err(self.metadata_error("addressable recorder source or account differs"));
         }
-        context.charge_metadata(std::mem::size_of::<(AddressableSources,Result<(),Error>)>())?;
-        self.addressable_sources=Some(source);Ok(())
+        context.charge_metadata(std::mem::size_of::<(AddressableSources, Result<(), Error>)>())?;
+        self.addressable_sources = Some(source);
+        Ok(())
+    }
+    /// Binds descriptive ordinary source rows under this recorder's planning
+    /// account. These rows never install original arenas or execution authority.
+    pub(crate) fn bind_ordinary_addressable_sources(
+        &mut self,
+        source: OrdinaryAddressableSources,
+    ) -> Result<(), Error> {
+        let context = self.context.as_ref().ok_or_else(|| {
+            self.metadata_error("ordinary addressable recorder requires planning funding")
+        })?;
+        if self.addressable_sources.is_some()
+            || self.ordinary_addressable_sources.is_some()
+            || context
+                .metadata_funding()
+                .is_none_or(|funding| !funding.same_account(source.funding()))
+        {
+            return Err(self.metadata_error("ordinary addressable source or account differs"));
+        }
+        context.charge_metadata(std::mem::size_of::<(
+            OrdinaryAddressableSources,
+            Result<(), Error>,
+        )>())?;
+        self.ordinary_addressable_sources = Some(source);
+        Ok(())
     }
     fn metadata_error(&self, message: &'static str) -> Error {
         match &self.context {
@@ -896,6 +1100,8 @@ impl ResidentRecipeRecorder {
             records: self.records,
             sampling,
             neural: None,
+            ordinary_neural: None,
+            ordinary_model_completion_bound: false,
             layerwise_constructors: self.layerwise_constructors,
             host_copies: None,
             foreground_copies: None,
@@ -1001,8 +1207,8 @@ fn reduction_lowering(primitives: usize, edges: usize, seeds: usize, extra: usiz
     value
 }
 fn normalization_lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
-    use WorkspaceOperationKindView as K;
     use eredu_nn::NormalizationScale;
+    use WorkspaceOperationKindView as K;
     let mut value = match operation.kind {
         K::Normalization("rms", _) if operation.inputs.len() == 1 => {
             reduction_lowering(21, 24, 2, 3)
@@ -1399,6 +1605,22 @@ fn host_store_lowering() -> Lowering {
     value
 }
 
+/// The same selected lowering supplies the maximum backing population for
+/// ordinary allocator controls; output roots are subtracted by their effects.
+pub(super) fn allocation_births(operation: WorkspaceOperationView<'_>) -> Option<usize> {
+    if matches!(
+        operation.kind,
+        WorkspaceOperationKindView::GroupSelection { .. }
+    ) {
+        // Original lowering additionally authenticates its prepared CPU stream.
+        // Its branch population bounds ordinary ranking without granting that
+        // original execution source or replacing ordinary host-side controls.
+        router::allocation_births(operation)
+    } else {
+        lowering(operation).map(|value| value.maximum_births)
+    }
+}
+
 fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
     use WorkspaceOperationKindView as K;
     match operation.kind {
@@ -1413,14 +1635,28 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
             // The host payload is already charged by the same operation's host
             // fact; fixed worker frames are included by copy_rank below.
             basic::generated_f32_plan_view(operation).ok()?;
-            Some(Lowering::plain(1, 1, 1))
+            let mut source = Lowering::plain(1, 1, 1);
+            source.maximum_births = 1;
+            Some(source)
+        }
+        K::Elementwise(_) if super::host_array::slice_dtype(operation).is_some() => {
+            let mut source = Lowering::plain(1, 1, 1);
+            source.maximum_births = 1;
+            Some(source)
+        }
+        K::Elementwise(_) if super::host_array::dtype(operation).is_some() => {
+            Some(Lowering::plain(0, 0, 1))
         }
         K::Elementwise(_) if super::zero_fill::dtype(operation).is_some() => {
-            let primitives=1+usize::from(!operation.outputs.get(0)?.shape().is_empty());
-            Some(Lowering::plain(primitives,primitives,1))
+            let primitives = 1 + usize::from(!operation.outputs.get(0)?.shape().is_empty());
+            Some(Lowering::plain(primitives, primitives, 1))
         }
-        K::Elementwise("scalar_u8") if basic::is_scalar_u8(operation) => Some(Lowering::plain(0, 0, 1)),
-        K::Elementwise("scalar_f32") if basic::is_scalar_f32(operation) => Some(Lowering::plain(0, 0, 1)),
+        K::Elementwise("scalar_u8") if basic::is_scalar_u8(operation) => {
+            Some(Lowering::plain(0, 0, 1))
+        }
+        K::Elementwise("scalar_f32") if basic::is_scalar_f32(operation) => {
+            Some(Lowering::plain(0, 0, 1))
+        }
         K::HostStoreFloating(..) => {
             let dtype = basic::host_transfer_dtype(operation)?;
             safemlx::PreparedHostCopyDestination::original_layout(
@@ -1472,17 +1708,27 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
             super::byte_view::inspect(operation)?;
             // The graph has one View. The generic GPU worker census includes
             // its temporary descriptor/Data and shared general-copy branch.
-            Some(Lowering::plain(1,1,0))
+            Some(Lowering::plain(1, 1, 0))
         }
         K::View("broadcast" | "squeeze" | "expand_dims" | "reshape")
         | K::Transpose(_)
-        | K::Contiguous
-        | K::DeepCopy => Some(Lowering::plain(1, 1, 0)),
+        | K::Contiguous => Some(Lowering::plain(1, 1, 0)),
+        K::DeepCopy => {
+            // The actual isolated-copy worker completes its contiguous source,
+            // then invokes the eager typed constructor for independent data.
+            let mut value = Lowering::plain(0, 0, 1);
+            value.helper_controls = safemlx::original_scoped_deep_copy_control_bytes(
+                operation.inputs.get(0)?.shape().len(),
+            )?;
+            Some(value)
+        }
         // Tensor's static indexing route builds Slice and optional Reshape.
         // Array-valued gathers use K::Gather and do not enter this branch.
         K::Index { .. } => Some(Lowering::plain(2, 2, 0)),
         // This worker preserves rank: there is no indexing-wrapper Reshape.
-        K::StaticSlice { .. } if basic::is_static_slice(operation) => Some(Lowering::plain(1,1,0)),
+        K::StaticSlice { .. } if basic::is_static_slice(operation) => {
+            Some(Lowering::plain(1, 1, 0))
+        }
         K::Pad(eredu_nn::PadMode::Constant) => {
             safemlx::ops::constant_pad_control_bytes(operation.inputs.get(0)?.shape().len())?;
             // The shared adapter creates an I32 zero and a dtype cast; native
@@ -1559,8 +1805,12 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
             // Eval-only flatten/contiguous-mask and offsets descriptors are
             // outside the lazy graph. Scan writes the existing offsets buffer.
             value.maximum_births += 3;
-            value.intermediate_rank = operation.inputs.iter()
-                .map(|input| input.shape().len()).max()?.checked_add(1)?;
+            value.intermediate_rank = operation
+                .inputs
+                .iter()
+                .map(|input| input.shape().len())
+                .max()?
+                .checked_add(1)?;
             Some(value)
         }
         // The shared activation adapters try one custom F32 kernel, then the
@@ -1659,7 +1909,9 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         | K::Elementwise("cast_u32" | "capture_cast_f32" | "cast_f32" | "bool_to_u32") => {
             Some(Lowering::plain(1, 1, 0))
         }
-        K::Normalization(..) | K::LayerNorm { .. } | K::ConstructedNormalization(_) => normalization_lowering(operation),
+        K::Normalization(..) | K::LayerNorm { .. } | K::ConstructedNormalization(_) => {
+            normalization_lowering(operation)
+        }
         K::Reduction("sum" | "sum_all" | "min" | "max", _, _) => {
             Some(reduction_lowering(2, 2, 0, 2))
         }
@@ -1684,6 +1936,43 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         // addmm's three casts, up to three broadcasts, input/output reshape
         // and AddMM; the explicit zero-K adapter contributes two reshapes.
         K::DenseLinear => Some(Lowering::product(14, 16, 0, 1)),
+        K::ParameterDecode(_) => {
+            if let Some(g) = super::parameter_decode::gguf::inspect(operation).ok()? {
+                let mut value = Lowering::plain(1, 1, 1);
+                value.maximum_births = 1;
+                value.intermediate_rank = g.rank;
+                value.nested_completions = 2;
+                value.backend_shells = 1;
+                value.helper_controls = super::parameter_decode::gguf::control_bytes()?;
+                return Some(value);
+            }
+            if let Some(g) = super::parameter_decode::fp8::inspect(operation).ok()? {
+                // Two three-node repeat programs, ConvertFP8, Slice and the
+                // five-node mixed multiply. E8M0 adds the table seed plus
+                // cast/flatten/index-cast/Gather/Squeeze; partitions add the
+                // two source reshapes and final shape restoration.
+                let primitives = 13usize
+                    .checked_add(if g.encoded_scale { 5 } else { 0 })?
+                    .checked_add(if g.partitioned { 3 } else { 0 })?;
+                let edges = 14usize
+                    .checked_add(if g.encoded_scale { 6 } else { 0 })?
+                    .checked_add(if g.partitioned { 3 } else { 0 })?;
+                let mut value = Lowering::plain(primitives, edges, usize::from(g.encoded_scale));
+                value.maximum_births = g.births()?;
+                value.intermediate_rank = g.work_rank + 1;
+                value.maximum_operands = 2;
+                value.helper_controls = super::parameter_decode::fp8::control_bytes(g)?;
+                return Some(value);
+            }
+            let _source = super::parameter_decode::inspect(operation).ok()??;
+            // One fast::Quantize and the enclosing AsType candidate. The
+            // kernel owns one possible compaction for each retained input.
+            let mut value = Lowering::plain(2, operation.inputs.len().checked_add(1)?, 0);
+            value.maximum_births = operation.inputs.len().checked_add(1)?;
+            value.maximum_operands = operation.inputs.len();
+            value.helper_controls = super::parameter_decode::control_bytes()?;
+            Some(value)
+        }
         K::Projection(format) => match format.encoding() {
             // PhysicalLinear permits floating replacements for these exact
             // descriptors. Retain that shared dense alternative, including its
@@ -1723,11 +2012,14 @@ fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         K::IndexedRowAdd if super::basic::indexed_row_add(operation) => {
             // scatter_axis: update cast, five broadcast candidates, one
             // three-input ScatterAxis::Sum. Empty output may alias the base.
-            let mut value=Lowering::plain(7,9,0);
-            value.intermediate_rank=2;
-            value.maximum_operands=3;
-            if safemlx::PreparedPipelineCachePlan::new(0).layout::<()>().is_err() {
-                value.unqualified_kernel_owner=Some(CustomKernelOwner::GroupedIndexed);
+            let mut value = Lowering::plain(7, 9, 0);
+            value.intermediate_rank = 2;
+            value.maximum_operands = 3;
+            if safemlx::PreparedPipelineCachePlan::new(0)
+                .layout::<()>()
+                .is_err()
+            {
+                value.unqualified_kernel_owner = Some(CustomKernelOwner::GroupedIndexed);
             }
             Some(value)
         }
@@ -1821,7 +2113,11 @@ impl ResidentRecipeRecorder {
                 self.metadata_error("resident input producer ordinal is outside its trace")
             })?;
             if !(matches!(input.kind, WorkspaceOperationKind::Initialize)
-                || super::basic::is_prepared_token_input(input.as_view()))
+                || super::basic::is_prepared_token_input(input.as_view())
+                || matches!(
+                    input.kind,
+                    WorkspaceOperationKind::Elementwise("full_i32" | "full_u32")
+                ))
                 || !input.inputs.is_empty()
                 || input.outputs.len() != 1
                 || !matches!(
@@ -1834,7 +2130,7 @@ impl ResidentRecipeRecorder {
                 ));
             }
         }
-        self.validate_layerwise_constructor_trace(report)?;
+        let layerwise_ordinals = self.validate_layerwise_constructor_trace(report)?;
         // One TokenValidationScope owns the entire prefill. Each completion
         // appends that accumulated batch, including earlier completed results.
         // Those detached predecessors need root/cache/edge slots, but neither
@@ -1848,15 +2144,46 @@ impl ResidentRecipeRecorder {
                 0
             },
         )?;
-        let publications=report.operations.iter().filter(|op|matches!(op.kind,
-            WorkspaceOperationKind::Collective(eredu_nn::workspace::WorkspaceCollective::Broadcast{..}))).count();
+        let publications = report
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.kind,
+                    WorkspaceOperationKind::Collective(
+                        eredu_nn::workspace::WorkspaceCollective::Broadcast { .. }
+                    )
+                )
+            })
+            .count();
         // The completed contribution remains in the actual root collector until
         // final model completion; it is distinct from the published output.
         let reduced = self.reduce_trace_with_parallel(
-            report,input_operation,retained_roots,self.add(output_roots,publications)?,parallel.as_ref(),
+            report,
+            input_operation,
+            retained_roots,
+            self.add(output_roots, publications)?,
+            parallel.as_ref(),
         )?;
-        let addressable=self.addressable_sources.as_ref().map(|source|source.invocation(&report.operations)).transpose()?
-            .filter(|invocation|!invocation.occurrences().is_empty());
+        let addressable = self
+            .addressable_sources
+            .as_ref()
+            .map(|source| source.invocation(&report.operations))
+            .transpose()?
+            .filter(|invocation| !invocation.occurrences().is_empty());
+        let ordinary_addressable = self
+            .ordinary_addressable_sources
+            .as_ref()
+            .map(|source| source.program(&report.operations))
+            .transpose()?
+            .filter(|program| crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestProgram::len(&**program) != 0);
+        let ordinary_calls = self.ordinary_trace_call_controls(
+            report,
+            input_operation,
+            layerwise_ordinals.as_ref().map(Vec::len),
+            ordinary_addressable.as_deref(),
+            parallel.as_ref(),
+        )?;
         let next_prefill_validations = if prefill {
             self.add(self.prefill_validation_roots, reduced.validation_roots)?
         } else {
@@ -1865,10 +2192,25 @@ impl ResidentRecipeRecorder {
         if let Some(context) = &self.context {
             context.reserve_metadata_vec(&mut self.records, 1)?;
         } else {
-            self.records.try_reserve(1).map_err(Error::backend_retained_source)?;
+            self.records
+                .try_reserve(1)
+                .map_err(Error::backend_retained_source)?;
         }
+        let model_controls = self
+            .context
+            .as_ref()
+            .and_then(|context| context.metadata_funding())
+            .map(|funding| {
+                eredu_runtime::replicated_session::SessionModelControlPlan::from_operations(
+                    &report.operations,
+                    &funding,
+                )
+            })
+            .transpose()?;
         self.records.push(ResidentSpanRecipe {
+            model_controls,
             span: span.clone(),
+            layerwise_ordinals,
             closing_state,
             opening_state,
             current_output: reduced.carryover_complete.then_some(output).flatten(),
@@ -1893,13 +2235,41 @@ impl ResidentRecipeRecorder {
             prediction_roots: None,
             parallel,
             addressable,
+            ordinary_addressable,
+            ordinary_parallel: ordinary_calls.parallel,
+            ordinary_call_failure: ordinary_calls.failure,
+            ordinary_paged_source: ordinary_calls.paged_source,
+            ordinary_calls: ordinary_calls.controls,
         });
-        let capture_publications=self.records.last().and_then(|row|row.addressable.as_ref())
-            .map(|invocation|invocation.occurrences().iter().try_fold(0usize,|sum,(_,quote)|
-                sum.checked_add(quote.capture_publications))).unwrap_or(Some(0))
-            .ok_or_else(||self.metadata_error("addressable capture publication population overflow"))?;
-        self.record_capture_population(crate::backend::array_copy::CaptureNativePopulation{
-            publications:capture_publications,..Default::default()
+        let capture_publications = self
+            .records
+            .last()
+            .and_then(|row| row.addressable.as_ref())
+            .map(|invocation| {
+                invocation
+                    .occurrences()
+                    .iter()
+                    .try_fold(0usize, |sum, (_, quote)| {
+                        sum.checked_add(quote.capture_publications)
+                    })
+            })
+            .unwrap_or(Some(0))
+            .ok_or_else(|| {
+                self.metadata_error("addressable capture publication population overflow")
+            })?;
+        let ordinary_publications = self
+            .records
+            .last()
+            .and_then(|row| row.ordinary_addressable.as_ref())
+            .map(|program| program.capture_publications())
+            .unwrap_or(Some(0))
+            .ok_or_else(|| {
+                self.metadata_error("ordinary addressable capture population overflow")
+            })?;
+        let capture_publications = self.add(capture_publications, ordinary_publications)?;
+        self.record_capture_population(crate::backend::array_copy::CaptureNativePopulation {
+            publications: capture_publications,
+            ..Default::default()
         })?;
         // Per-row validation_roots stays local: its sum sizes the one batch.
         // Advance the prefix only after this complete row was retained.
@@ -1928,82 +2298,88 @@ impl ResidentRecipeRecorder {
         // This is an observed empty preparation, not an inference from
         // temperature or policy. Existing sources are priced separately.
         let mut preparation = None;
-        let (mutable_storage, completion, query_controls, first_missing_operation) =
-            if phase == Phase::Preparation && report.operations.is_empty() {
-                preparation = Some(ResidentSamplingPreparation::Empty);
-                (
-                    Some(CertifiedSpanStorage {
-                        mutable_bytes: 0,
-                        maximum_births: 0,
-                    }),
-                    None,
-                    Some(0),
-                    None,
-                )
-            } else if phase == Phase::Preparation && sampling_random::is_eager_key_trace(report) {
-                match sampling_random::eager_preparation(report, self.mechanism.allocation())? {
-                    Some((storage, graph, controls)) => {
-                        preparation = Some(ResidentSamplingPreparation::EagerKey(graph));
-                        (Some(storage), None, Some(controls), None)
-                    }
-                    None => (None, None, None, Some(0)),
+        let (
+            mutable_storage,
+            completion,
+            query_controls,
+            first_missing_operation,
+            missing_operation_detail,
+        ) = if phase == Phase::Preparation && report.operations.is_empty() {
+            preparation = Some(ResidentSamplingPreparation::Empty);
+            (
+                Some(CertifiedSpanStorage {
+                    mutable_bytes: 0,
+                    maximum_births: 0,
+                }),
+                None,
+                Some(0),
+                None,
+                None,
+            )
+        } else if phase == Phase::Preparation && sampling_random::is_eager_key_trace(report) {
+            match sampling_random::eager_preparation(report, self.mechanism.allocation())? {
+                Some((storage, graph, controls)) => {
+                    preparation = Some(ResidentSamplingPreparation::EagerKey(graph));
+                    (Some(storage), None, Some(controls), None, None)
                 }
-            } else {
-                // One final token root. Prior completed tokens and logits enter as
-                // leaves through actual operation inputs, never as new producers.
-                let read = |operation: &&eredu_nn::workspace::WorkspaceOperation| {
-                    matches!(
-                        operation.kind,
-                        WorkspaceOperationKind::Sampling(
-                            eredu_nn::workspace::WorkspaceSamplingOperation::ReadToken
-                        )
+                None => (None, None, None, Some(0), None),
+            }
+        } else {
+            // One final token root. Prior completed tokens and logits enter as
+            // leaves through actual operation inputs, never as new producers.
+            let read = |operation: &&eredu_nn::workspace::WorkspaceOperation| {
+                matches!(
+                    operation.kind,
+                    WorkspaceOperationKind::Sampling(
+                        eredu_nn::workspace::WorkspaceSamplingOperation::ReadToken
                     )
-                };
-                let adaptive_read = sampling_mirostat::is_adaptive_step(report);
-                let final_read = report
-                    .operations
-                    .last()
-                    .is_some_and(|operation| read(&operation))
-                    && report.operations.iter().filter(read).count() == 1;
-                let final_read = final_read || adaptive_read;
-                let random_root = report.operations.iter().any(|operation| {
-                    matches!(
-                        operation.kind,
-                        WorkspaceOperationKind::Sampling(
-                            eredu_nn::workspace::WorkspaceSamplingOperation::SplitRandomKey
-                        )
-                    )
-                });
-                let output_roots = if matches!(phase, Phase::Step { .. }) {
-                    1 + usize::from(random_root)
-                } else {
-                    0
-                };
-                let reduced = self.reduce_trace(report, None, 0, output_roots)?;
-                let final_read =
-                    final_read && reduced.nested_completions == usize::from(adaptive_read);
-                (
-                    if matches!(phase, Phase::Step { .. }) && !final_read {
-                        None
-                    } else {
-                        reduced.mutable_storage
-                    },
-                    final_read
-                        .then_some(reduced.traversal.zip(reduced.graph))
-                        .flatten()
-                        .map(|(traversal, graph)| ResidentCompletionRecipe {
-                            traversal,
-                            graph,
-                            dispatch: reduced.dispatch,
-                            nested_completions: reduced.nested_completions,
-                            nested_root_capacity: reduced.nested_root_capacity.max(3),
-                            validation_roots: reduced.validation_roots,
-                            grouped_outputs: reduced.grouped_outputs,
-                        }),
-                    reduced.query_controls,
-                    reduced.first_missing_operation,
                 )
             };
+            let adaptive_read = sampling_mirostat::is_adaptive_step(report);
+            let final_read = report
+                .operations
+                .last()
+                .is_some_and(|operation| read(&operation))
+                && report.operations.iter().filter(read).count() == 1;
+            let final_read = final_read || adaptive_read;
+            let random_root = report.operations.iter().any(|operation| {
+                matches!(
+                    operation.kind,
+                    WorkspaceOperationKind::Sampling(
+                        eredu_nn::workspace::WorkspaceSamplingOperation::SplitRandomKey
+                    )
+                )
+            });
+            let output_roots = if matches!(phase, Phase::Step { .. }) {
+                1 + usize::from(random_root)
+            } else {
+                0
+            };
+            let reduced = self.reduce_trace(report, None, 0, output_roots)?;
+            let final_read = final_read && reduced.nested_completions == usize::from(adaptive_read);
+            (
+                if matches!(phase, Phase::Step { .. }) && !final_read {
+                    None
+                } else {
+                    reduced.mutable_storage
+                },
+                final_read
+                    .then_some(reduced.traversal.zip(reduced.graph))
+                    .flatten()
+                    .map(|(traversal, graph)| ResidentCompletionRecipe {
+                        traversal,
+                        graph,
+                        dispatch: reduced.dispatch,
+                        nested_completions: reduced.nested_completions,
+                        nested_root_capacity: reduced.nested_root_capacity.max(3),
+                        validation_roots: reduced.validation_roots,
+                        grouped_outputs: reduced.grouped_outputs,
+                    }),
+                reduced.query_controls,
+                reduced.first_missing_operation,
+                reduced.missing_operation_detail,
+            )
+        };
         if let Some(context) = &self.context {
             context.reserve_metadata_vec(&mut self.sampling, 1)?;
         } else {
@@ -2011,14 +2387,19 @@ impl ResidentRecipeRecorder {
                 .try_reserve(1)
                 .map_err(Error::backend_retained_source)?;
         }
+        let ordinary_calls = self.ordinary_trace_call_controls(report, None, None, None, None)?;
         self.sampling.push(ResidentSamplingRecipe {
             closing_roots,
             phase,
             preparation,
             first_missing_operation,
+            missing_operation_detail,
             mutable_storage,
             completion,
             query_controls,
+            ordinary_call_failure: ordinary_calls.failure,
+            ordinary_paged_source: ordinary_calls.paged_source,
+            ordinary_calls: ordinary_calls.controls,
         });
         Ok(())
     }
@@ -2081,7 +2462,10 @@ impl InferenceEquationTraceObserver for ResidentRecipeRecorder {
             true,
         )
     }
-    fn observe_sampling_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+    fn observe_sampling_input(
+        &mut self,
+        input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan,
+    ) -> Result<(), Error> {
         self.record_sampling_input(input)
     }
     fn observe_sampling(
@@ -2193,7 +2577,12 @@ impl ResidentRecipeRecorder {
     ) -> Result<ReducedTrace, Error> {
         if let Some(cpu) = self.cpu {
             return self.reduce_cpu_trace_with_parallel(
-                report, input_operation, retained_roots, output_roots, cpu, parallel,
+                report,
+                input_operation,
+                retained_roots,
+                output_roots,
+                cpu,
+                parallel,
             );
         }
         let (
@@ -2256,9 +2645,21 @@ impl ResidentRecipeRecorder {
         // observation. Cutoff itself is a pure graph constructor, also reused
         // by deterministic speculative processing without any scalar read.
         let mut nested_completions = usize::from(sampling_mirostat::is_adaptive_step(report));
-        let mut nested_root_capacity = report.operations.iter()
-            .filter(|op| matches!(op.kind, WorkspaceOperationKind::ValueCompletion))
-            .map(|op| op.inputs.len()).max().unwrap_or(0);
+        let mut nested_root_capacity = report
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.kind,
+                    WorkspaceOperationKind::ValueCompletion
+                        | WorkspaceOperationKind::CommunicationDependencies
+                        | WorkspaceOperationKind::CachePublicationCompletion
+                        | WorkspaceOperationKind::CacheScanCompletion
+                )
+            })
+            .map(|op| op.inputs.len())
+            .max()
+            .unwrap_or(0);
 
         #[cfg(all(
             test,
@@ -2296,6 +2697,14 @@ impl ResidentRecipeRecorder {
         let mut missing_operation_detail = None;
         let mut unqualified_kernel_owner = None;
         for (index, op) in operations.enumerate() {
+            if matches!(op.kind, WorkspaceOperationKind::CommunicationControl(_)) {
+                // The retained control source prices the agreement child; this
+                // trace marker creates no model graph node or numerical root.
+                if !op.inputs.is_empty() || !op.outputs.is_empty() {
+                    missing.get_or_insert(index);
+                }
+                continue;
+            }
             maximum_rank = maximum_rank.max(
                 op.inputs
                     .iter()
@@ -2338,69 +2747,150 @@ impl ResidentRecipeRecorder {
                 // bind_layerwise_parameter_constructors, before native admission.
                 continue;
             }
-            if matches!(op.kind,WorkspaceOperationKind::AddressableRegion(_)) {
-                let Some(source)=self.addressable_sources.as_ref()else{missing.get_or_insert(index);continue;};
-                let quote=source.quote(op.as_view())?;
-                bytes=bytes.checked_add(u64::try_from(quote.capacity.backing).map_err(|_|self.metadata_error("addressable backing overflow"))?)
-                    .ok_or_else(||self.metadata_error("addressable backing overflow"))?;
-                boundary_births=add(boundary_births,quote.numerical.storage.maximum_births())?;
-                arrays=add(arrays,add(op.inputs.len(),op.outputs.len())?)?;
+            if matches!(op.kind, WorkspaceOperationKind::AddressableRegion(_)) {
+                let Some(source) = self.addressable_sources.as_ref() else {
+                    missing.get_or_insert(index);
+                    continue;
+                };
+                let quote = source.quote(op.as_view())?;
+                bytes = bytes
+                    .checked_add(
+                        u64::try_from(quote.capacity.backing)
+                            .map_err(|_| self.metadata_error("addressable backing overflow"))?,
+                    )
+                    .ok_or_else(|| self.metadata_error("addressable backing overflow"))?;
+                boundary_births = add(boundary_births, quote.numerical.storage.maximum_births())?;
+                arrays = add(arrays, add(op.inputs.len(), op.outputs.len())?)?;
                 // The shared native parent worker completes the four original
                 // operands together before opening this one distinct role.
-                nested_completions=add(nested_completions,1)?;
-                nested_root_capacity=nested_root_capacity.max(4);
-                operation_controls=add(operation_controls,crate::backend::runtime::cache::value_completion_control_bytes(4)
-                    .ok_or_else(||self.metadata_error("addressable parent completion has no source"))?)?;
+                nested_completions = add(nested_completions, 1)?;
+                nested_root_capacity = nested_root_capacity.max(4);
+                operation_controls = add(
+                    operation_controls,
+                    crate::backend::runtime::cache::value_completion_control_bytes(4).ok_or_else(
+                        || self.metadata_error("addressable parent completion has no source"),
+                    )?,
+                )?;
                 continue;
             }
-            if matches!(op.kind,WorkspaceOperationKind::ExpertProviderWave(_)) {
-                let Some(wave)=parallel.and_then(|p|p.expert_provider_wave_occurrence(index))else{
-                    missing.get_or_insert(index);continue;
+            if matches!(op.kind, WorkspaceOperationKind::ExpertProviderWave(_)) {
+                let Some(wave) = parallel.and_then(|p| p.expert_provider_wave_occurrence(index))
+                else {
+                    missing.get_or_insert(index);
+                    continue;
                 };
-                bytes=bytes.checked_add(wave.provider.backing).ok_or_else(||self.metadata_error("provider wave backing overflow"))?;
-                boundary_births=add(boundary_births,wave.provider.births)?;
+                bytes = bytes
+                    .checked_add(wave.provider.backing)
+                    .ok_or_else(|| self.metadata_error("provider wave backing overflow"))?;
+                boundary_births = add(boundary_births, wave.provider.births)?;
                 continue;
             }
-            if matches!(op.kind,WorkspaceOperationKind::ExpertRegion(_)|WorkspaceOperationKind::ExpertInactiveWave(_)) {
-                let Some(region)=parallel.and_then(|p|p.expert_aggregate(index))else{
-                    missing.get_or_insert(index);continue;
+            if matches!(
+                op.kind,
+                WorkspaceOperationKind::ExpertRegion(_)
+                    | WorkspaceOperationKind::ExpertInactiveWave(_)
+            ) {
+                let Some(region) = parallel.and_then(|p| p.expert_aggregate(index)) else {
+                    missing.get_or_insert(index);
+                    continue;
                 };
-                bytes=bytes.checked_add(region.child_bytes).ok_or_else(||self.metadata_error("expert region backing overflow"))?;
-                boundary_births=add(boundary_births,region.child_births)?;
-                nested_completions=add(nested_completions,region.parent_completions)?;
+                bytes = bytes
+                    .checked_add(region.child_bytes)
+                    .ok_or_else(|| self.metadata_error("expert region backing overflow"))?;
+                boundary_births = add(boundary_births, region.child_births)?;
+                nested_completions = add(nested_completions, region.parent_completions)?;
                 if region.indexed_parent {
-                    nested_root_capacity=nested_root_capacity.max(4);
-                    arrays=add(arrays,4)?;
-                    operation_controls=add(operation_controls,crate::backend::runtime::cache::value_completion_control_bytes(4)
-                        .ok_or_else(||self.metadata_error("indexed expert parent completion has no source"))?)?;
+                    nested_root_capacity = nested_root_capacity.max(4);
+                    arrays = add(arrays, 4)?;
+                    operation_controls = add(
+                        operation_controls,
+                        crate::backend::runtime::cache::value_completion_control_bytes(4)
+                            .ok_or_else(|| {
+                                self.metadata_error(
+                                    "indexed expert parent completion has no source",
+                                )
+                            })?,
+                    )?;
                 }
-                arrays=add(arrays,op.outputs.len())?;
-                for (slice,n) in std::iter::once((&region.empty_slice,region.empty_slices))
-                    .chain(region.extra_parents.iter().map(|operation|(operation,1))){
-                let Some(lowering)=lowering(slice.as_view())else{missing.get_or_insert(index);continue;};
-                let repeated=|value:usize|value.checked_mul(n).ok_or_else(||self.metadata_error("expert empty source population overflow"));
-                additional_shells=additional_shells.and_then(|v|v.checked_add(backend_handle_shells(slice.as_view(),lowering)?.checked_mul(n)?));
-                complete_worker_profile &= resident_worker_profile(slice.as_view().kind,lowering);
-                let Some(copy)=copy_rank::inspect(slice.as_view(),lowering.intermediate_rank)else{missing.get_or_insert(index);continue;};
-                worker_rank=worker_rank.max(copy.worker_rank);
-                copy_rank_extents=add(copy_rank_extents,repeated(copy.extra_extents)?)?;
-                operation_controls=add(operation_controls,repeated(add(copy.controls,lowering.helper_controls)?)?)?;
-                let mut sink=facts::Emitter::count();
-                let Some(fact)=self.mechanism.emit(slice.as_view(),&mut sink).map_err(MlxWorkspaceFactError::ordinary)?else{missing.get_or_insert(index);continue;};
-                let slice_bytes=sink.allocated_output_bytes().and_then(|v|v.checked_add(fact.scratch_bytes))
-                    .and_then(|v|v.checked_mul(n as u64)).ok_or_else(||self.metadata_error("expert empty slice backing overflow"))?;
-                bytes=bytes.checked_add(slice_bytes).ok_or_else(||self.metadata_error("expert parent backing overflow"))?;
-                arrays=add(arrays,repeated(add(add(add(lowering.primitives,lowering.seeds)?,lowering.hidden_leaves)?,slice.inputs.len())?)?)?;
-                tape=add(tape,repeated(lowering.primitives)?)?;
-                edges=add(edges,repeated(lowering.edges)?)?;
-                births=add(births,repeated(lowering.maximum_births)?)?;
-                seeds=add(seeds,repeated(lowering.seeds)?)?;
-                maximum_rank=maximum_rank.max(lowering.intermediate_rank).max(2);
-                maximum_operands=maximum_operands.max(lowering.maximum_operands);
-                streams=streams.max(lowering.streams);
-                if lowering.validations!=0||lowering.nested_completions!=0||lowering.router_cpu_partitions!=0
-                    ||lowering.grouped_output_chunks!=0||lowering.unqualified_kernel_owner.is_some(){missing.get_or_insert(index);}
-                additional_sort_kernels=additional_sort_kernels.and_then(|v|v.checked_add(lowering.additional_sort_kernels?.checked_mul(n)?));
+                arrays = add(arrays, op.outputs.len())?;
+                for (slice, n) in std::iter::once((&region.empty_slice, region.empty_slices))
+                    .chain(region.extra_parents.iter().map(|operation| (operation, 1)))
+                {
+                    let Some(lowering) = lowering(slice.as_view()) else {
+                        missing.get_or_insert(index);
+                        continue;
+                    };
+                    let repeated = |value: usize| {
+                        value.checked_mul(n).ok_or_else(|| {
+                            self.metadata_error("expert empty source population overflow")
+                        })
+                    };
+                    additional_shells = additional_shells.and_then(|v| {
+                        v.checked_add(
+                            backend_handle_shells(slice.as_view(), lowering)?.checked_mul(n)?,
+                        )
+                    });
+                    complete_worker_profile &=
+                        resident_worker_profile(slice.as_view().kind, lowering);
+                    let Some(copy) =
+                        copy_rank::inspect(slice.as_view(), lowering.intermediate_rank)
+                    else {
+                        missing.get_or_insert(index);
+                        continue;
+                    };
+                    worker_rank = worker_rank.max(copy.worker_rank);
+                    copy_rank_extents = add(copy_rank_extents, repeated(copy.extra_extents)?)?;
+                    operation_controls = add(
+                        operation_controls,
+                        repeated(add(copy.controls, lowering.helper_controls)?)?,
+                    )?;
+                    let mut sink = facts::Emitter::count();
+                    let Some(fact) = self
+                        .mechanism
+                        .emit(slice.as_view(), &mut sink)
+                        .map_err(MlxWorkspaceFactError::ordinary)?
+                    else {
+                        missing.get_or_insert(index);
+                        continue;
+                    };
+                    let slice_bytes = sink
+                        .allocated_output_bytes()
+                        .and_then(|v| v.checked_add(fact.scratch_bytes))
+                        .and_then(|v| v.checked_mul(n as u64))
+                        .ok_or_else(|| {
+                            self.metadata_error("expert empty slice backing overflow")
+                        })?;
+                    bytes = bytes
+                        .checked_add(slice_bytes)
+                        .ok_or_else(|| self.metadata_error("expert parent backing overflow"))?;
+                    arrays = add(
+                        arrays,
+                        repeated(add(
+                            add(
+                                add(lowering.primitives, lowering.seeds)?,
+                                lowering.hidden_leaves,
+                            )?,
+                            slice.inputs.len(),
+                        )?)?,
+                    )?;
+                    tape = add(tape, repeated(lowering.primitives)?)?;
+                    edges = add(edges, repeated(lowering.edges)?)?;
+                    births = add(births, repeated(lowering.maximum_births)?)?;
+                    seeds = add(seeds, repeated(lowering.seeds)?)?;
+                    maximum_rank = maximum_rank.max(lowering.intermediate_rank).max(2);
+                    maximum_operands = maximum_operands.max(lowering.maximum_operands);
+                    streams = streams.max(lowering.streams);
+                    if lowering.validations != 0
+                        || lowering.nested_completions != 0
+                        || lowering.router_cpu_partitions != 0
+                        || lowering.grouped_output_chunks != 0
+                        || lowering.unqualified_kernel_owner.is_some()
+                    {
+                        missing.get_or_insert(index);
+                    }
+                    additional_sort_kernels = additional_sort_kernels.and_then(|v| {
+                        v.checked_add(lowering.additional_sort_kernels?.checked_mul(n)?)
+                    });
                 }
                 continue;
             }
@@ -2409,7 +2899,8 @@ impl ResidentRecipeRecorder {
                     missing.get_or_insert(index);
                     continue;
                 };
-                bytes = bytes.checked_add(profile.bytes)
+                bytes = bytes
+                    .checked_add(profile.bytes)
                     .ok_or_else(|| self.metadata_error("parallel backing source overflow"))?;
                 boundary_births = add(boundary_births, profile.child_births)?;
                 nested_completions = add(nested_completions, profile.nested)?;
@@ -2424,7 +2915,7 @@ impl ResidentRecipeRecorder {
                 streams = streams.max(profile.streams);
                 continue;
             }
-            let Some(lowering) = lowering(op.as_view()) else {
+            let Some(mut lowering) = lowering(op.as_view()) else {
                 if missing.is_none() {
                     let arguments = format_args!(
                         "{:?}; inputs: {:?}; router source ready: {}",
@@ -2440,6 +2931,12 @@ impl ResidentRecipeRecorder {
                 }
                 continue;
             };
+            if !self.mechanism.allocation().original_storage {
+                lowering.nested_completions = add(
+                    lowering.nested_completions,
+                    router::ordinary_predicate_completions(op.as_view()),
+                )?;
+            }
             additional_shells = additional_shells
                 .and_then(|n| n.checked_add(backend_handle_shells(op.as_view(), lowering)?));
             nested_completions = add(nested_completions, lowering.nested_completions)?;
@@ -2481,20 +2978,50 @@ impl ResidentRecipeRecorder {
                 )?;
             }
             if matches!(op.kind, WorkspaceOperationKind::StaticSlice { .. }) {
-                operation_controls=add(operation_controls,crate::tensor::narrow::control_bytes(op.inputs[0].shape().len())
-                    .ok_or_else(||self.metadata_error("static slice caller controls overflow"))?)?;
+                operation_controls = add(
+                    operation_controls,
+                    crate::tensor::narrow::control_bytes(op.inputs[0].shape().len()).ok_or_else(
+                        || self.metadata_error("static slice caller controls overflow"),
+                    )?,
+                )?;
+            }
+            if super::host_array::dtype(op.as_view()).is_some()
+                || super::host_array::slice_dtype(op.as_view()).is_some()
+            {
+                operation_controls = add(
+                    operation_controls,
+                    (if super::host_array::slice_dtype(op.as_view()).is_some() {
+                        super::host_array::slice_control_bytes()
+                    } else {
+                        super::host_array::control_bytes()
+                    })
+                    .ok_or_else(|| {
+                        self.metadata_error("typed host-array caller controls overflow")
+                    })?,
+                )?;
             }
             if super::zero_fill::dtype(op.as_view()).is_some() {
-                operation_controls=add(operation_controls,super::zero_fill::control_bytes()
-                    .ok_or_else(||self.metadata_error("typed zero caller controls overflow"))?)?;
+                operation_controls = add(
+                    operation_controls,
+                    super::zero_fill::operation_control_bytes(op.as_view()).ok_or_else(|| {
+                        self.metadata_error("typed scalar fill caller controls overflow")
+                    })?,
+                )?;
             }
             if basic::is_scalar_u8(op.as_view()) {
-                operation_controls = add(operation_controls,
-                    basic::scalar_u8_control_bytes().ok_or_else(|| self.metadata_error("eager byte scalar controls overflow"))?)?;
+                operation_controls = add(
+                    operation_controls,
+                    basic::scalar_u8_control_bytes().ok_or_else(|| {
+                        self.metadata_error("eager byte scalar controls overflow")
+                    })?,
+                )?;
             }
             if basic::is_scalar_f32(op.as_view()) {
-                operation_controls = add(operation_controls,
-                    basic::scalar_f32_control_bytes().ok_or_else(|| self.metadata_error("eager scalar controls overflow"))?)?;
+                operation_controls = add(
+                    operation_controls,
+                    basic::scalar_f32_control_bytes()
+                        .ok_or_else(|| self.metadata_error("eager scalar controls overflow"))?,
+                )?;
             }
             if matches!(op.kind, WorkspaceOperationKind::ValueRetention) {
                 let bytes = crate::backend::submission_recovery::prefill::TransientRootsProjection::control_bytes()
@@ -2512,7 +3039,13 @@ impl ResidentRecipeRecorder {
                     missing.get_or_insert(index);
                 }
             }
-            if matches!(op.kind, WorkspaceOperationKind::ValueCompletion) {
+            if matches!(
+                op.kind,
+                WorkspaceOperationKind::ValueCompletion
+                    | WorkspaceOperationKind::CommunicationDependencies
+                    | WorkspaceOperationKind::CachePublicationCompletion
+                    | WorkspaceOperationKind::CacheScanCompletion
+            ) {
                 let Some(controls) =
                     crate::backend::nn::shared::value_completion_control_bytes(op.inputs.len())
                 else {
@@ -2613,8 +3146,9 @@ impl ResidentRecipeRecorder {
                         | eredu_nn::workspace::WorkspaceSamplingOperation::Categorical
                 )
             ) {
-                let Some(controls) = crate::backend::random::standard_sampling_control_bytes(safemlx::DeviceType::Gpu)
-                else {
+                let Some(controls) = crate::backend::random::standard_sampling_control_bytes(
+                    safemlx::DeviceType::Gpu,
+                ) else {
                     missing.get_or_insert(index);
                     continue;
                 };
@@ -2690,11 +3224,14 @@ impl ResidentRecipeRecorder {
                 };
                 operation_controls = add(operation_controls, controls)?;
             }
-            if matches!(op.as_view().kind, WorkspaceOperationKindView::Grouped {
-                bank: WorkspaceGroupedBank::GatedProduct(_),
-                phase: WorkspaceGroupedPhase::Whole | WorkspaceGroupedPhase::Units,
-                partitions: Some(_),
-            }) {
+            if matches!(
+                op.as_view().kind,
+                WorkspaceOperationKindView::Grouped {
+                    bank: WorkspaceGroupedBank::GatedProduct(_),
+                    phase: WorkspaceGroupedPhase::Whole | WorkspaceGroupedPhase::Units,
+                    partitions: Some(_),
+                }
+            ) {
                 let Some(controls) = super::super::shared::MlxGroupedGatedProduct::original_tensor_parallel_control_bytes() else {
                     missing.get_or_insert(index);
                     continue;
@@ -2807,6 +3344,9 @@ impl ResidentRecipeRecorder {
                 op.kind,
                 WorkspaceOperationKind::ValueRetention
                     | WorkspaceOperationKind::ValueCompletion
+                    | WorkspaceOperationKind::CommunicationDependencies
+                    | WorkspaceOperationKind::CachePublicationCompletion
+                    | WorkspaceOperationKind::CacheScanCompletion
                     | WorkspaceOperationKind::HostStoreFloating(..)
             ) && !op.inputs.is_empty()
                 && op.outputs.is_empty();
@@ -3042,7 +3582,7 @@ impl ResidentRecipeRecorder {
             traversal,
             mutable_storage: missing.is_none().then_some(CertifiedSpanStorage {
                 mutable_bytes: bytes,
-                maximum_births: add(births,boundary_births)?,
+                maximum_births: add(births, boundary_births)?,
             }),
             first_missing_operation: missing,
             missing_operation_detail,
@@ -3161,13 +3701,11 @@ mod recurrent_tests {
                     let mut unknown = report;
                     unknown.operations[0].kind =
                         WorkspaceOperationKind::Elementwise("unrecognized_scan");
-                    assert!(
-                        recorder
-                            .reduce_trace(&unknown, None, 0, 2)
-                            .unwrap()
-                            .mutable_storage
-                            .is_none()
-                    );
+                    assert!(recorder
+                        .reduce_trace(&unknown, None, 0, 2)
+                        .unwrap()
+                        .mutable_storage
+                        .is_none());
                 }
             }
         }
@@ -3240,13 +3778,11 @@ mod depthwise_tests {
             );
             let mut unsupported = report.clone();
             unsupported.operations[0] = other;
-            assert!(
-                recorder
-                    .reduce_trace(&unsupported, None, 0, 1)
-                    .unwrap()
-                    .dispatch
-                    .is_none()
-            );
+            assert!(recorder
+                .reduce_trace(&unsupported, None, 0, 1)
+                .unwrap()
+                .dispatch
+                .is_none());
         }
 
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
@@ -3281,12 +3817,10 @@ mod depthwise_tests {
         }
         assert_eq!(values.len(), expected.len());
         assert!(expected.iter().any(|n| n.abs() > 0.1));
-        assert!(
-            values
-                .iter()
-                .zip(expected)
-                .all(|(actual, expected)| (actual - expected).abs() < 1e-5)
-        );
+        assert!(values
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() < 1e-5));
     }
 }
 
@@ -3600,7 +4134,12 @@ mod stored_host_effect_tests {
     }
 }
 
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod muse_tests;
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;

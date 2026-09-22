@@ -32,13 +32,17 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
                 ));
             }
         }
-        let capacity = settings
+        let limits = settings
             .inference
-            .managed_memory_capacity_bytes
-            .ok_or_else(|| {
-                PreparedChatSessionError::before(TokenInputRejection::Unsupported)
-            })?;
-        if capacity != chat.capacity() {
+            .memory_limits
+            .resolve(chat.tokenizer_source().memory_topology())
+            .map_err(PreparedChatSessionError::before)?;
+        if limits
+            != chat
+                .limits()
+                .resolve(chat.tokenizer_source().memory_topology())
+                .map_err(PreparedChatSessionError::before)?
+        {
             return Err(PreparedChatSessionError::before(
                 TokenInputRejection::IdentityMismatch,
             ));
@@ -51,7 +55,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
                 PreparedChatSessionError::before(TokenInputRejection::IdentityMismatch)
             })?;
             if !binding.matches(chat.render(), binding.preparation(), chat.generation())
-                || binding.preparation().capacity_bytes() != capacity
+                || binding.preparation().limits() != &limits
             {
                 return Err(PreparedChatSessionError::before(
                     TokenInputRejection::IdentityMismatch,
@@ -76,7 +80,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
     ) -> Result<PreparedChatInvocation<'a, B>, PreparedChatSessionError> {
         let prepared = (|| {
             let (config, maximum) = self.validate_chat_invocation(chat, &input, settings)?;
-            let capacity = chat.capacity();
+            let limits = chat.limits();
             let preparation = match &input {
                 PreparedChatPrompt::Media(input) => input
                     .chat_binding()
@@ -84,7 +88,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
                     .preparation()
                     .clone(),
                 PreparedChatPrompt::Rendered | PreparedChatPrompt::TokenIds(_) => {
-                    self.prepare_semantic_source(chat.tokenizer_source(), capacity)?
+                    self.prepare_semantic_source(chat.tokenizer_source(), limits)?
                 }
             };
             let funding = preparation.metadata_funding().clone();

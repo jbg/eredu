@@ -1,5 +1,5 @@
 use super::*;
-use crate::{prefill::PrefillChunk, ActivationObserver};
+use crate::{ActivationObserver, prefill::PrefillChunk};
 
 type Error = FundedCaptureError<MechanismError>;
 type Observer<'a> = dyn ActivationObserver<Tensor, Error> + 'a;
@@ -46,7 +46,7 @@ fn skipped(step: &SharedCapturedStep, outcome: CaptureStepOutcome) {
 fn chunks_spend_one_p0_row_and_metadata_then_preserve_nonzero_decode() {
     let source = metadata_source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -122,7 +122,7 @@ fn outer_cancel_is_the_only_terminal_even_after_final_chunk_commit() {
     for entered in [0, 1, 3] {
         let source = metadata_source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut funded = session(&source, &pool, &r, &run);
         funded
@@ -155,7 +155,7 @@ fn chunk_rejection_late_error_and_unwind_keep_one_aborted_frame() {
         for mode in 0..3 {
             let source = metadata_source();
             let h = plan(&source).initialization_peak_bytes();
-            let pool = WorkingMemoryPool::new(h, 0).unwrap();
+            let pool = capture_test_ledger(h, 0).unwrap();
             let (r, run) = fresh(&pool, h);
             let mut funded = session(&source, &pool, &r, &run);
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -202,9 +202,9 @@ fn chunk_rejection_late_error_and_unwind_keep_one_aborted_frame() {
             drop(funded);
             drop(run);
             drop(r);
-            assert!(pool.used_bytes().unwrap() >= h);
+            assert!(pool.payload_used_bytes().unwrap() >= h);
             drop(clone);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -214,7 +214,7 @@ fn missing_outer_success_never_promotes_an_intermediate_or_sealed_frame() {
     for entered in [1, 3] {
         let source = metadata_source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut funded = session(&source, &pool, &r, &run);
         funded
@@ -238,7 +238,7 @@ fn missing_outer_success_never_promotes_an_intermediate_or_sealed_frame() {
 fn bad_coordinates_reject_before_claim_and_later_gaps_abort_without_refund() {
     let source = metadata_source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     for bad in [
@@ -303,7 +303,7 @@ fn stale_or_wrong_chunk_epochs_and_repeated_completion_cannot_commit() {
     for mode in 0..5 {
         let source = metadata_source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut funded = session(&source, &pool, &r, &run);
         funded
@@ -379,7 +379,7 @@ impl eredu_nn::RetainedGeneratedTensorFactory<Tensor, Error> for Uncalled {
 fn value_and_both_generated_hooks_require_a_current_chunk_transaction() {
     let source = metadata_source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -432,7 +432,7 @@ fn value_and_both_generated_hooks_require_a_current_chunk_transaction() {
 fn selected_split_prefill_stays_rejected_but_full_sequence_and_unannotated_match() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -465,7 +465,7 @@ fn selected_split_prefill_stays_rejected_but_full_sequence_and_unannotated_match
         })
         .unwrap();
     let actual = funded.take_shared_step().unwrap().unwrap();
-    let other_pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let other_pool = capture_test_ledger(h, 0).unwrap();
     let (other_r, other_run) = fresh(&other_pool, h);
     let mut ordinary = session(&source, &other_pool, &other_r, &other_run);
     forward(&mut ordinary, &mut Backend::default(), 0, true).unwrap();
@@ -482,7 +482,7 @@ fn empty_plan_chunks_keep_mandatory_terminal_drain_without_claims() {
     raw.selections.clear();
     let source = admit(raw, point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     funded
@@ -495,9 +495,11 @@ fn empty_plan_chunks_keep_mandatory_terminal_drain_without_claims() {
         })
         .unwrap();
     assert!(funded.has_pending_step());
-    assert!(funded
-        .with_observer(&mut Backend::default(), 1, &|e| e, |_| ())
-        .is_err());
+    assert!(
+        funded
+            .with_observer(&mut Backend::default(), 1, &|e| e, |_| ())
+            .is_err()
+    );
     assert!(funded.take_shared_step().unwrap().is_none());
     assert!(!funded.has_pending_step());
     funded
@@ -517,7 +519,7 @@ fn empty_plan_chunks_keep_mandatory_terminal_drain_without_claims() {
 fn final_sealing_failure_keeps_original_partial_owner_and_all_charges() {
     let source = metadata_source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     funded
@@ -543,5 +545,5 @@ fn final_sealing_failure_keeps_original_partial_owner_and_all_charges() {
     assert_eq!(ledger(&pool), held);
     drop(funded);
     drop(r);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

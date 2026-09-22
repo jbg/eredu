@@ -4,34 +4,61 @@ use super::bounded_capture::NativeCapture;
 use super::*;
 use eredu_core::{capture::*, intervention::*};
 
+pub(in crate::composition::mlx::session) mod model;
+pub(in crate::composition::mlx::session) mod partition;
 mod routed;
 mod static_activation;
-mod model;
-mod partition;
 pub(crate) use partition::PreparedPartitionModelIntervention;
 mod text;
 pub(crate) use model::PreparedModelInterventions;
-pub(crate) use text::{PreparedTextInterventions, PreparedTextInterventionsOwner};
+pub(crate) use static_activation::{
+    PreparedSparseActivation, PreparedStaticActivation, SparseActivationFailure,
+    StaticActivationPopulation,
+};
 pub(in crate::composition::mlx) use text::TextInterventionQuote;
-pub(crate) use static_activation::{PreparedStaticActivation, StaticActivationPopulation, PreparedSparseActivation, SparseActivationFailure};
+pub(crate) use text::{PreparedTextInterventions, PreparedTextInterventionsOwner};
 #[cfg(test)]
 mod tests;
 
-const OPERATIONS:&[InterventionKind]=&[
-    InterventionKind::Zero,InterventionKind::Scale,InterventionKind::Mask,
-    InterventionKind::MaskComponents,InterventionKind::Replace,InterventionKind::Add,
-    InterventionKind::MaskLogits,InterventionKind::ExcludeExperts,
-    InterventionKind::ZeroExpertContribution,InterventionKind::BiasRoutingScores,InterventionKind::ForceExperts,
+const OPERATIONS: &[InterventionKind] = &[
+    InterventionKind::Zero,
+    InterventionKind::Scale,
+    InterventionKind::Mask,
+    InterventionKind::MaskComponents,
+    InterventionKind::Replace,
+    InterventionKind::Add,
+    InterventionKind::MaskLogits,
+    InterventionKind::ExcludeExperts,
+    InterventionKind::ZeroExpertContribution,
+    InterventionKind::BiasRoutingScores,
+    InterventionKind::ForceExperts,
 ];
-const DTYPES:&[InterventionDtype]=&[InterventionDtype::Float32,InterventionDtype::Float16,InterventionDtype::Bfloat16];
-const SCORE_STAGES:&[RoutingScoreStage]=&[RoutingScoreStage::RawLogits,RoutingScoreStage::TransformedScores,RoutingScoreStage::RankingScores];
-pub(crate) fn mechanism_facts()->InterventionMechanismFacts<'static> {
-    InterventionMechanismFacts {routed_units:true,operations:OPERATIONS,dtypes:DTYPES,score_stages:SCORE_STAGES}
+const DTYPES: &[InterventionDtype] = &[
+    InterventionDtype::Float32,
+    InterventionDtype::Float16,
+    InterventionDtype::Bfloat16,
+];
+const SCORE_STAGES: &[RoutingScoreStage] = &[
+    RoutingScoreStage::RawLogits,
+    RoutingScoreStage::TransformedScores,
+    RoutingScoreStage::RankingScores,
+];
+pub(crate) fn mechanism_facts() -> InterventionMechanismFacts<'static> {
+    InterventionMechanismFacts {
+        routed_units: true,
+        operations: OPERATIONS,
+        dtypes: DTYPES,
+        score_stages: SCORE_STAGES,
+    }
 }
-pub(crate) fn mechanisms()->InterventionMechanisms {
-    let facts=mechanism_facts();
-    InterventionMechanisms {routed_units:facts.routed_units,operations:facts.operations.to_vec(),
-        dtypes:facts.dtypes.to_vec(),score_stages:facts.score_stages.to_vec()}
+pub(crate) fn mechanisms() -> InterventionMechanisms {
+    let facts = mechanism_facts();
+    InterventionMechanisms {
+        routed_units: facts.routed_units,
+        operations: facts.operations.to_vec(),
+        dtypes: facts.dtypes.to_vec(),
+        score_stages: facts.score_stages.to_vec(),
+    }
 }
 
 /// Cold MLX bounds: the same estimator is used at admission and before execution.
@@ -39,24 +66,46 @@ pub(crate) struct NativeInterventionEstimator;
 impl NativeInterventionEstimator {
     /// Shared dense/sparse preflight controls and bounded diagnostic alternatives.
     /// The virtual sparse expert axis is never a native allocation.
-    pub(crate) fn prepared_preflight_control_bytes()->Option<usize> {
-        use std::mem::{size_of,size_of_val};
-        let messages=["MLX intervention geometry exceeds signed 32-bit indexing",
-            "scalar activation edit", "MLX capture shape/index exceeds signed 32-bit indexing",
+    pub(crate) fn prepared_preflight_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let messages = [
+            "MLX intervention geometry exceeds signed 32-bit indexing",
+            "scalar activation edit",
+            "MLX capture shape/index exceeds signed 32-bit indexing",
             "selected score IDs exceed the runtime vocabulary or count limit",
-            "candidate count exceeds the runtime vocabulary", "histogram bin count",
-            "invalid sparse edit virtual shape", "MLX sparse edit indexing exceeds i32",
-            "sparse routing action", "sparse edit estimate includes record encoding"];
-        let frames=[size_of::<(&Self,&[u64],&ResolvedCaptureSlice,&InterventionAction)>(),
-            size_of::<(&[u64],&CaptureSelection,&[u64],&[u64])>(),
-            size_of::<[CaptureUsage;2]>(),size_of::<Result<CaptureUsage,CaptureError>>(),
+            "candidate count exceeds the runtime vocabulary",
+            "histogram bin count",
+            "invalid sparse edit virtual shape",
+            "MLX sparse edit indexing exceeds i32",
+            "sparse routing action",
+            "sparse edit estimate includes record encoding",
+        ];
+        let frames = [
+            size_of::<(&Self, &[u64], &ResolvedCaptureSlice, &InterventionAction)>(),
+            size_of::<(&[u64], &CaptureSelection, &[u64], &[u64])>(),
+            size_of::<[CaptureUsage; 2]>(),
+            size_of::<Result<CaptureUsage, CaptureError>>(),
             // Four activation census values and eight dense capture census values.
-            size_of::<[u64;4]>(),size_of::<[u64;8]>(),size_of::<std::slice::Iter<'_,u64>>(),
-            size_of::<std::slice::Iter<'_,u32>>(),
-            size_of::<(RoutedUnitGeometry,&[u64],&ResolvedCaptureSlice,&InterventionAction)>(),
-            size_of::<(u64,u64,u64)>(),size_of::<Option<InterventionDtype>>()];
-        frames.into_iter().try_fold(size_of_val(&frames).checked_add(size_of_val(&messages))?,usize::checked_add)?
-            .checked_add(messages.iter().map(|text|text.len()).max().unwrap_or(0))
+            size_of::<[u64; 4]>(),
+            size_of::<[u64; 8]>(),
+            size_of::<std::slice::Iter<'_, u64>>(),
+            size_of::<std::slice::Iter<'_, u32>>(),
+            size_of::<(
+                RoutedUnitGeometry,
+                &[u64],
+                &ResolvedCaptureSlice,
+                &InterventionAction,
+            )>(),
+            size_of::<(u64, u64, u64)>(),
+            size_of::<Option<InterventionDtype>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(
+                size_of_val(&frames).checked_add(size_of_val(&messages))?,
+                usize::checked_add,
+            )?
+            .checked_add(messages.iter().map(|text| text.len()).max().unwrap_or(0))
     }
 }
 
@@ -254,9 +303,17 @@ fn native_dtype(dtype: InterventionDtype) -> Dtype {
 }
 
 impl InterventionBackend for NativeCapture<'_> {
-    fn matches_intervention_shape(&self, tensor:&MlxTensor, expected:&[u64])->Result<bool,Error> {
-        Ok(tensor.shape().len()==expected.len()
-            && tensor.shape().iter().zip(expected).all(|(a,b)|u64::try_from(*a).ok()==Some(*b)))
+    fn matches_intervention_shape(
+        &self,
+        tensor: &MlxTensor,
+        expected: &[u64],
+    ) -> Result<bool, Error> {
+        Ok(tensor.shape().len() == expected.len()
+            && tensor
+                .shape()
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| u64::try_from(*a).ok() == Some(*b)))
     }
 
     fn partition_routed_unit_locations(
@@ -281,7 +338,9 @@ impl InterventionBackend for NativeCapture<'_> {
         Some((|| {
             let indices = routed::indices(indices)?;
             let flat = source.as_array().reshape(&[-1], self.stream)?;
-            static_activation::ordinary(self.stream, |worker| worker.indexed_select(&flat, &indices))
+            static_activation::ordinary(self.stream, |worker| {
+                worker.indexed_select(&flat, &indices)
+            })
         })())
     }
     fn update_elements(
@@ -293,9 +352,12 @@ impl InterventionBackend for NativeCapture<'_> {
         Some((|| {
             let indices = routed::indices(indices)?;
             let flat = source.as_array().reshape(&[-1], self.stream)?;
-            let output = static_activation::ordinary(self.stream, |worker|
-                worker.indexed_update(&flat, &indices, replacement.as_array()))?;
-            Ok(MlxTensor::from_array(output.as_array().reshape(source.shape(), self.stream)?))
+            let output = static_activation::ordinary(self.stream, |worker| {
+                worker.indexed_update(&flat, &indices, replacement.as_array())
+            })?;
+            Ok(MlxTensor::from_array(
+                output.as_array().reshape(source.shape(), self.stream)?,
+            ))
         })())
     }
     fn intervention_dtype(&self, tensor: &MlxTensor) -> Result<InterventionDtype, Error> {
@@ -320,7 +382,9 @@ impl InterventionBackend for NativeCapture<'_> {
         tensor: &MlxTensor,
         slice: &ResolvedCaptureSlice,
     ) -> Result<MlxTensor, Error> {
-        static_activation::ordinary(self.stream, |worker| worker.select_region(tensor.as_array(), slice))
+        static_activation::ordinary(self.stream, |worker| {
+            worker.select_region(tensor.as_array(), slice)
+        })
     }
     fn update_region(
         &mut self,
@@ -328,7 +392,9 @@ impl InterventionBackend for NativeCapture<'_> {
         slice: &ResolvedCaptureSlice,
         replacement: &MlxTensor,
     ) -> Result<MlxTensor, Error> {
-        static_activation::ordinary(self.stream, |worker| worker.update_region(tensor.as_array(), slice, replacement.as_array()))
+        static_activation::ordinary(self.stream, |worker| {
+            worker.update_region(tensor.as_array(), slice, replacement.as_array())
+        })
     }
     fn zeros(&mut self, shape: &[u64], dtype: InterventionDtype) -> Result<MlxTensor, Error> {
         static_activation::ordinary(self.stream, |worker| worker.zeros(shape, dtype))
@@ -342,7 +408,9 @@ impl InterventionBackend for NativeCapture<'_> {
         keep: &[bool],
         fill: f32,
     ) -> Result<MlxTensor, Error> {
-        static_activation::ordinary(self.stream, |worker| worker.fill_masked(value.as_array(), keep, fill))
+        static_activation::ordinary(self.stream, |worker| {
+            worker.fill_masked(value.as_array(), keep, fill)
+        })
     }
     fn mask_components(
         &mut self,
@@ -350,13 +418,17 @@ impl InterventionBackend for NativeCapture<'_> {
         ids: &[u32],
         keep_selected: bool,
     ) -> Result<MlxTensor, Error> {
-        static_activation::ordinary(self.stream, |worker| worker.mask_components(value.as_array(), ids, keep_selected))
+        static_activation::ordinary(self.stream, |worker| {
+            worker.mask_components(value.as_array(), ids, keep_selected)
+        })
     }
     fn realize_tensor(&mut self, tensor: &InterventionTensor) -> Result<MlxTensor, Error> {
         static_activation::ordinary(self.stream, |worker| worker.realize_tensor(tensor))
     }
     fn add(&mut self, left: &MlxTensor, right: &MlxTensor) -> Result<MlxTensor, Error> {
-        static_activation::ordinary(self.stream, |worker| worker.add(left.as_array(), right.as_array()))
+        static_activation::ordinary(self.stream, |worker| {
+            worker.add(left.as_array(), right.as_array())
+        })
     }
     fn fill_columns(
         &mut self,
@@ -364,6 +436,8 @@ impl InterventionBackend for NativeCapture<'_> {
         ids: &[u32],
         fill: f32,
     ) -> Result<MlxTensor, Error> {
-        static_activation::ordinary(self.stream, |worker| worker.fill_columns(value.as_array(), ids, fill))
+        static_activation::ordinary(self.stream, |worker| {
+            worker.fill_columns(value.as_array(), ids, fill)
+        })
     }
 }

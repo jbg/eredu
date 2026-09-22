@@ -1,7 +1,7 @@
 use super::*;
 use crate::working_memory::{
     HostSlotStorageKey, InferenceExecutionIdentity, InferenceRequest, InferenceTextPreparation,
-    RegisteredDecoderHostCopy, WorkingMemoryPool,
+    MemoryLedger, RegisteredDecoderHostCopy,
 };
 use crate::{HostMetadataKey, HostSlotTable};
 use eredu_core::{
@@ -28,17 +28,19 @@ pub(super) fn before_construct() {
         "injected pending-part construction failure"
     );
 }
-fn held(pool: &WorkingMemoryPool) -> u64 {
+fn held(pool: &MemoryLedger) -> u64 {
     pool.0
         .usage
         .lock()
         .unwrap()
         .funding
         .values()
-        .map(|state| state.host_held)
+        // Observe the pending payload's hold independently of the reservation's
+        // already funded report and account controls.
+        .map(|state| state.host_held - state.control_floor)
         .sum()
 }
-fn state(pool: &WorkingMemoryPool) -> (u64, u64, u64, usize) {
+fn state(pool: &MemoryLedger) -> (u64, u64, u64, usize) {
     let u = pool.0.usage.lock().unwrap();
     (
         u.reserved,
@@ -55,13 +57,16 @@ impl HostSlotStorageKey for Key {
     }
 }
 fn fresh(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
 ) -> (
     InferenceTextPreparation,
     WorkingMemoryFundingRun,
     TextGenerationConfig,
 ) {
+    let bytes = bytes
+        + crate::working_memory::storage::ordinary_dense_preparation_bytes::<u8, u8, Key>()
+            .unwrap();
     let execution = InferenceExecutionIdentity::default();
     let geometry = InferenceGeometry {
         batch_size: 1,
@@ -90,6 +95,7 @@ fn fresh(
     let bound = |bytes| WorkspaceBound::bounded(bytes, "closed scalar host preparation fixture");
     let state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: bound(bytes),
             attention: bound(0),
@@ -102,13 +108,17 @@ fn fresh(
     let reservation = pool
         .reserve_with_capacity(
             &execution,
-            &Admission {
-                requested_positions: 1,
-                state,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
-            },
-            CAPACITY,
+            &crate::working_memory::memory_fixture::attribute_host_admission(
+                &pool,
+                Admission {
+                    memory_limits: Default::default(),
+                    additional_headroom: Default::default(),
+                    requested_positions: 1,
+                    state,
+                    incremental_required_bytes: Some(bytes),
+                },
+            ),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, CAPACITY),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
@@ -126,7 +136,9 @@ fn fresh(
         max_new_tokens: Some(0),
     });
     (
-        request.prepare_text(&execution, geometry, config).unwrap(),
+        request
+            .prepare_text(&execution, geometry, config.clone())
+            .unwrap(),
         run,
         config,
     )
@@ -136,10 +148,13 @@ fn fresh(
 fn completion(
     preparation: &InferenceTextPreparation,
     run: &WorkingMemoryFundingRun,
-) -> InferencePromptCompletion {
+) -> (InferencePromptCompletion, HostSlotTable<u8>) {
     let source = HostSlotTable::new(Vec::<u8>::new().into_boxed_slice());
     let key = Key(source.metadata().identity().registry_key().clone());
-    let charge = run.pool().register_storage([(key.clone(), 0)]).unwrap();
+    let charge = run
+        .pool()
+        .register_host_storage([(key.clone(), 0)])
+        .unwrap();
     let plan =
         RegisteredDecoderHostCopy::bind(run.pool(), source.prepare_copy_slots().unwrap(), key)
             .unwrap()
@@ -154,12 +169,11 @@ fn completion(
     let destination = Key(finished.metadata().identity().registry_key().clone());
     let (table, completion) = finished.publish(destination).unwrap();
     native.certify().unwrap();
-    drop(table);
-    completion
+    (completion, table)
 }
 struct Payload {
     value: u32,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     drops: Arc<AtomicUsize>,
     expected_hold: u64,
 }
@@ -173,7 +187,7 @@ impl Drop for Payload {
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
-fn payload(pool: &WorkingMemoryPool, drops: &Arc<AtomicUsize>, expected_hold: u64) -> Payload {
+fn payload(pool: &MemoryLedger, drops: &Arc<AtomicUsize>, expected_hold: u64) -> Payload {
     Payload {
         value: 37,
         pool: pool.clone(),
@@ -189,9 +203,9 @@ fn exact_host_plan_constructs_one_nonclone_payload_and_aliases_keep_custody() {
     assert_eq!(plan.retained_bytes(), d);
     let h = plan.initialization_peak_bytes();
     assert_eq!(h, 3 * d + size_of::<Payload>() as u64);
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h);
-    let completion = completion(&preparation, &run);
+    let (completion, prompt) = completion(&preparation, &run);
     let prior = CONSTRUCTIONS.get();
     let prepared = completion
         .prepare_pending_token_input::<Payload>(&run)
@@ -213,18 +227,18 @@ fn exact_host_plan_constructs_one_nonclone_payload_and_aliases_keep_custody() {
     assert_eq!(input.request().geometry().input_positions, 1);
     complete.finish().unwrap();
     preparation.bind_prompt().unwrap();
-    drop(preparation);
+    drop((preparation, prompt));
     run.close().unwrap();
     drop(input);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
     ));
     drop(alias);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(pool.acquire_unquoted().is_ok());
 }
 
@@ -233,14 +247,14 @@ fn one_byte_short_rejects_before_part_construction_without_refunding_claim() {
     let h = PendingTokenInputHostPlan::<u32>::prepare()
         .unwrap()
         .initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h - 1);
-    let completion = completion(&preparation, &run);
+    let (completion, prompt) = completion(&preparation, &run);
     let before = state(&pool);
     let attempts = CONSTRUCTIONS.get();
     assert!(
         matches!(completion.prepare_pending_token_input::<u32>(&run),
-        Err(WorkingMemoryError::BudgetExceeded {required_bytes,available_bytes})
+        Err(WorkingMemoryError::DomainAllowanceExceeded { required_bytes, available_bytes, .. })
         if required_bytes==h && available_bytes==h-1)
     );
     assert_eq!(state(&pool), before);
@@ -250,9 +264,9 @@ fn one_byte_short_rejects_before_part_construction_without_refunding_claim() {
         preparation.claim_prompt(),
         Err(WorkingMemoryError::PreparationAlreadyStarted)
     ));
-    drop(preparation);
+    drop((preparation, prompt));
     run.close().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -261,15 +275,15 @@ fn foreign_pool_and_same_pool_account_fail_before_host_hold() {
         .unwrap()
         .initialization_peak_bytes();
     for same_pool in [false, true] {
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
         let other = if same_pool {
             pool.clone()
         } else {
-            WorkingMemoryPool::new(CAPACITY, 0).unwrap()
+            crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap()
         };
         let (preparation, run, _) = fresh(&pool, h);
         let (foreign, foreign_run, _) = fresh(&other, h);
-        let complete = completion(&preparation, &run);
+        let (complete, prompt) = completion(&preparation, &run);
         let before = (state(&pool), state(&other), CONSTRUCTIONS.get());
         assert!(matches!(
             complete.prepare_pending_token_input::<u32>(&foreign_run),
@@ -279,11 +293,11 @@ fn foreign_pool_and_same_pool_account_fail_before_host_hold() {
         assert_eq!(held(&pool), 0);
         assert_eq!(held(&other), 0);
         foreign_run.scope().unwrap().certify().unwrap();
-        drop((preparation, foreign));
+        drop((preparation, foreign, prompt));
         run.close().unwrap();
         foreign_run.close().unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(other.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(other.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -292,26 +306,25 @@ fn protected_host_payload_cannot_be_spent_by_native_publication() {
     let h = PendingTokenInputHostPlan::<u32>::prepare()
         .unwrap()
         .initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h);
-    let prepared = completion(&preparation, &run)
-        .prepare_pending_token_input::<u32>(&run)
-        .unwrap();
+    let (completion, prompt) = completion(&preparation, &run);
+    let prepared = completion.prepare_pending_token_input::<u32>(&run).unwrap();
     let native = run.scope().unwrap();
     let before = state(&pool);
     assert!(matches!(
-        native.adopt_storage_individually([(17u32, 1)]),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        native.adopt_host_storage_individually([(17u32, 1)]),
+        Err(WorkingMemoryError::DomainAllowanceExceeded { .. })
     ));
     assert_eq!(state(&pool), before);
     let (input, complete) = prepared.construct(11).unwrap();
     native.certify().unwrap();
     complete.finish().unwrap();
-    drop(preparation);
+    drop((preparation, prompt));
     run.close().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -319,9 +332,10 @@ fn unwind_drops_incoming_payload_before_closed_hold_and_does_not_quarantine() {
     let h = PendingTokenInputHostPlan::<Payload>::prepare()
         .unwrap()
         .initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h);
-    let prepared = completion(&preparation, &run)
+    let (completion, prompt) = completion(&preparation, &run);
+    let prepared = completion
         .prepare_pending_token_input::<Payload>(&run)
         .unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
@@ -339,9 +353,9 @@ fn unwind_drops_incoming_payload_before_closed_hold_and_does_not_quarantine() {
         preparation.claim_prompt(),
         Err(WorkingMemoryError::PreparationAlreadyStarted)
     ));
-    drop(preparation);
+    drop((preparation, prompt));
     run.close().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -349,9 +363,9 @@ fn accounting_overflow_and_quarantine_reject_without_partial_host_hold() {
     let h = PendingTokenInputHostPlan::<u32>::prepare()
         .unwrap()
         .initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h);
-    let complete = completion(&preparation, &run);
+    let (complete, prompt) = completion(&preparation, &run);
     {
         let mut usage = pool.0.usage.lock().unwrap();
         let account = usage.funding.values_mut().next().unwrap();
@@ -374,13 +388,13 @@ fn accounting_overflow_and_quarantine_reject_without_partial_host_hold() {
         .next()
         .unwrap()
         .scopes = 0;
-    drop(preparation);
+    drop((preparation, prompt));
     run.close().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h);
-    let complete = completion(&preparation, &run);
+    let (complete, prompt) = completion(&preparation, &run);
     drop(run.scope().unwrap());
     let before = state(&pool);
     assert!(matches!(
@@ -397,9 +411,10 @@ fn prepared_hold_does_not_permit_fill_after_quarantine_or_run_close() {
         .unwrap()
         .initialization_peak_bytes();
     for quarantine in [false, true] {
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
         let (preparation, run, _) = fresh(&pool, h);
-        let prepared = completion(&preparation, &run)
+        let (completion, prompt) = completion(&preparation, &run);
+        let prepared = completion
             .prepare_pending_token_input::<Payload>(&run)
             .unwrap();
         let mut open_run = Some(run);
@@ -422,7 +437,16 @@ fn prepared_hold_does_not_permit_fill_after_quarantine_or_run_close() {
         if let Some(run) = open_run {
             run.close().unwrap();
         }
-        drop(preparation);
-        assert_eq!(pool.used_bytes().unwrap(), if quarantine { h } else { 0 });
+        drop((preparation, prompt));
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            if quarantine {
+                h + crate::working_memory::storage::ordinary_dense_preparation_bytes::<u8, u8, Key>(
+                )
+                .unwrap()
+            } else {
+                0
+            }
+        );
     }
 }

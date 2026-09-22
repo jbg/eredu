@@ -2,8 +2,9 @@
 use super::*;
 use crate::decoder::identity::Metadata;
 use eredu_nn::{workspace::WorkspaceContext, Error};
-pub(super) mod inkling;
 pub(crate) mod gemma;
+pub(super) mod inkling;
+pub(in crate::media_plan) mod muse;
 pub(crate) use inkling::admit as inkling;
 
 pub(super) fn inspect_shared<T, E>(

@@ -6,8 +6,8 @@ use crate::working_memory::capture_tensor::prefill::{
 };
 use eredu_core::{InferenceGeometry, TensorObservation, TensorObservationData};
 
-mod progression;
 mod partition;
+mod progression;
 mod transfer;
 pub use transfer::CapturePrefillFragmentTransfer;
 
@@ -19,16 +19,17 @@ impl<'a> CaptureStepClaim<'a> {
         self,
         inference: InferenceGeometry,
     ) -> Result<ScheduledCaptureStep<'a>, CaptureRunHostError> {
-        let captures=self.validate_prefill_source(inference)?;
-        let mut step=self.prepare()?;
-        step.initialize_prefill_targets(inference,captures)?;
+        let captures = self.validate_prefill_source(inference)?;
+        let mut step = self.prepare()?;
+        step.initialize_prefill_targets(inference, captures)?;
         Ok(step)
     }
-    fn validate_prefill_source(&self,inference:InferenceGeometry)->Result<usize,CaptureRunHostError> {
+    fn validate_prefill_source(
+        &self,
+        inference: InferenceGeometry,
+    ) -> Result<usize, CaptureRunHostError> {
         self.custody.validate()?;
-        if self.phase != CapturePhase::Prefill
-            || self.prediction != 0
-        {
+        if self.phase != CapturePhase::Prefill || self.prediction != 0 {
             return Err(CapturePrefillHostError::Identity.into());
         }
         // Inference reserves the full F + P + M frontier, even when p0 has no
@@ -41,8 +42,8 @@ impl<'a> CaptureStepClaim<'a> {
                 CapturePrefillGeometryError::Overflow,
             ))?;
         // Validate every eligible geometry before allocating even the slot box.
-        let captures=self.source.admission().plan().selections.len();
-        for (index, state) in self.row[1..1+captures].iter().enumerate() {
+        let captures = self.source.admission().plan().selections.len();
+        for (index, state) in self.row[1..1 + captures].iter().enumerate() {
             if *state == ClaimState::Available {
                 if matches!(
                     self.source.admission().plan().selections[index].transform,
@@ -69,9 +70,10 @@ impl<'a> CaptureStepClaim<'a> {
                     )
                     .map_err(CaptureStepError::from)?;
                 } else if matches!(
-                    self.source.admission().plan().selections[index].transform, CaptureTransform::RoutedUnits
+                    self.source.admission().plan().selections[index].transform,
+                    CaptureTransform::RoutedUnits
                 ) {
-                    CaptureRoutedPrefillPlan::prepare(self.source.admission(),index,inference)
+                    CaptureRoutedPrefillPlan::prepare(self.source.admission(), index, inference)
                         .map_err(CapturePrefillHostError::from)?;
                 } else if matches!(
                     self.source.admission().plan().selections[index].transform,
@@ -108,10 +110,16 @@ impl<'a> CaptureStepClaim<'a> {
     }
 }
 impl ScheduledCaptureStep<'_> {
-    fn initialize_prefill_targets(&mut self,inference:InferenceGeometry,captures:usize)->Result<(),CaptureRunHostError> {
-        if self.frame.prefill.is_some(){return Err(CapturePrefillHostError::Identity.into());}
+    fn initialize_prefill_targets(
+        &mut self,
+        inference: InferenceGeometry,
+        captures: usize,
+    ) -> Result<(), CaptureRunHostError> {
+        if self.frame.prefill.is_some() {
+            return Err(CapturePrefillHostError::Identity.into());
+        }
         let mut slots = Vec::with_capacity(captures);
-        for state in &self.claim.row[1..1+captures] {
+        for state in &self.claim.row[1..1 + captures] {
             slots.push(TargetSlot {
                 tensor: None,
                 completed: None,
@@ -249,7 +257,13 @@ impl ScheduledCaptureStep<'_> {
                 // or remain in the separately paid partition fragment bank.
                 // Logical hook progression above still authenticates this exact
                 // committed chunk, including zero-contribution occurrences.
-                if slot.tensor.is_some() || slot.completed.is_some() || slot.summary.is_some() || slot.histogram.is_some() || slot.routed.is_some() || slot.done {
+                if slot.tensor.is_some()
+                    || slot.completed.is_some()
+                    || slot.summary.is_some()
+                    || slot.histogram.is_some()
+                    || slot.routed.is_some()
+                    || slot.done
+                {
                     return Err(CapturePrefillHostError::Identity.into());
                 }
                 continue;
@@ -265,9 +279,11 @@ impl ScheduledCaptureStep<'_> {
                 }
                 continue;
             }
-            if matches!(self.claim.source.admission().plan().selections[index].transform,
-                CaptureTransform::RoutedUnits) {
-                if slot.state!=TargetState::Active || !slot.done || slot.routed.is_none() {
+            if matches!(
+                self.claim.source.admission().plan().selections[index].transform,
+                CaptureTransform::RoutedUnits
+            ) {
+                if slot.state != TargetState::Active || !slot.done || slot.routed.is_none() {
                     return Err(CapturePrefillHostError::Incomplete { index }.into());
                 }
                 continue;
@@ -329,7 +345,10 @@ impl ScheduledCaptureStep<'_> {
     pub(crate) fn finish_local_prefill_targets(&mut self) -> Result<(), CaptureRunHostError> {
         self.finish_prefill_targets_inner(true)
     }
-    fn finish_prefill_targets_inner(&mut self, allow_remote: bool) -> Result<(), CaptureRunHostError> {
+    fn finish_prefill_targets_inner(
+        &mut self,
+        allow_remote: bool,
+    ) -> Result<(), CaptureRunHostError> {
         self.claim.custody.validate()?;
         self.validate_prefill_progression_finished()?;
         let targets = self
@@ -346,14 +365,22 @@ impl ScheduledCaptureStep<'_> {
             return Err(CapturePrefillHostError::Order.into());
         }
         for (index, slot) in targets.slots.iter().enumerate() {
-            if matches!(slot.state, TargetState::Inactive | TargetState::Recorded | TargetState::RemoteRecorded | TargetState::AssemblyRecorded)
-                || (allow_remote && matches!(slot.state, TargetState::Remote | TargetState::Assembling))
+            if matches!(
+                slot.state,
+                TargetState::Inactive
+                    | TargetState::Recorded
+                    | TargetState::RemoteRecorded
+                    | TargetState::AssemblyRecorded
+            ) || (allow_remote
+                && matches!(slot.state, TargetState::Remote | TargetState::Assembling))
             {
                 continue;
             }
-            if matches!(self.claim.source.admission().plan().selections[index].transform,
-                CaptureTransform::RoutedUnits) {
-                if slot.state!=TargetState::Active || slot.routed.is_none() {
+            if matches!(
+                self.claim.source.admission().plan().selections[index].transform,
+                CaptureTransform::RoutedUnits
+            ) {
+                if slot.state != TargetState::Active || slot.routed.is_none() {
                     return Err(CapturePrefillHostError::Incomplete { index }.into());
                 }
                 continue;
@@ -418,21 +445,28 @@ impl ScheduledCaptureStep<'_> {
         for index in 0..count {
             self.claim.custody.validate()?;
             let slot = &mut self.frame.prefill.as_mut().expect("checked prefill").slots[index];
-            if matches!(slot.state, TargetState::RemoteRecorded | TargetState::AssemblyRecorded) {
+            if matches!(
+                slot.state,
+                TargetState::RemoteRecorded | TargetState::AssemblyRecorded
+            ) {
                 slot.state = TargetState::Recorded;
                 continue;
             }
             if matches!(slot.state, TargetState::Inactive | TargetState::Recorded)
-                || (allow_remote && matches!(slot.state, TargetState::Remote | TargetState::Assembling))
+                || (allow_remote
+                    && matches!(slot.state, TargetState::Remote | TargetState::Assembling))
             {
                 continue;
             }
-            if let Some(owner)=slot.routed.take() {
-                slot.state=TargetState::Failed;
-                let dtype=slot.dtype.clone().expect("claimed dtype");
-                let receipt=owner.finish().map_err(|failure|CaptureRunHostError::Routed(failure.error().clone()))?;
-                self.record_routed_units(receipt,dtype,CaptureUsage::default())?;
-                self.frame.prefill.as_mut().expect("checked prefill").slots[index].state=TargetState::Recorded;
+            if let Some(owner) = slot.routed.take() {
+                slot.state = TargetState::Failed;
+                let dtype = slot.dtype.clone().expect("claimed dtype");
+                let receipt = owner
+                    .finish()
+                    .map_err(|failure| CaptureRunHostError::Routed(failure.error().clone()))?;
+                self.record_routed_units(receipt, dtype, CaptureUsage::default())?;
+                self.frame.prefill.as_mut().expect("checked prefill").slots[index].state =
+                    TargetState::Recorded;
                 continue;
             }
             if let Some(value) = slot.histogram.take() {
@@ -461,7 +495,7 @@ impl ScheduledCaptureStep<'_> {
                 } = slot.tensor.take().expect("complete target");
                 // The closed allocator derived exactly this product. No setter
                 // can change shape/length; zero initialization is not coverage.
-                let observation = TensorObservation::new(shape, TensorObservationData::F32(data))
+                let observation = TensorObservation::new(shape, data.into_observation())
                     .expect("checked fixed target shape");
                 slot.completed = Some(SharedTensorObservation::retain(observation, custody));
             }
@@ -514,10 +548,18 @@ impl<'t, 'f, 'p, 'a> CapturePrefillFragmentClaim<'t, 'f, 'p, 'a> {
     // Its retained host plan and exact source comparison precede this loan;
     // ordinary scheduled claims keep their original allocation path.
     pub(in crate::working_memory) fn from_partition(
-        slot: &'t mut TargetSlot, fragment: &'f CapturePrefillFragment<'p, 'a>,
-        index: usize, custody: CaptureTensorCustody,
+        slot: &'t mut TargetSlot,
+        fragment: &'f CapturePrefillFragment<'p, 'a>,
+        index: usize,
+        custody: CaptureTensorCustody,
     ) -> Self {
-        Self { slot: Some(slot), fragment, index, custody, partition: true }
+        Self {
+            slot: Some(slot),
+            fragment,
+            index,
+            custody,
+            partition: true,
+        }
     }
 
     /// Borrow the exact mapping already bound to this target, source and host
@@ -545,7 +587,8 @@ impl<'t, 'f, 'p, 'a> CapturePrefillFragmentClaim<'t, 'f, 'p, 'a> {
         let slot = self.slot.as_mut().expect("owned fragment claim");
         if slot.tensor.is_none() && self.partition {
             slot.tensor = Some(OwnedPrefillTensor::allocate_geometry(
-                self.fragment.assembly().logical_geometry(), self.custody.share_scheduled(),
+                self.fragment.assembly().logical_geometry(),
+                self.custody.share_scheduled(),
             )?);
         } else if slot.tensor.is_none() {
             let geometry = CaptureTensorGeometry::prepare(
@@ -594,6 +637,19 @@ impl CapturePrefillFragmentWriter<'_, '_, '_, '_> {
     /// Append one selected scalar to its unique geometry-derived destination.
     /// Failure poisons this target; its partial payload remains in the frame.
     pub fn push_f32(&mut self, value: f32) -> Result<(), CaptureRunHostError> {
+        self.push_scalar(|data, index| data.set_f32(index, value))
+    }
+    /// Writes an unsigned field without narrowing its value or changing coverage.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), CaptureRunHostError> {
+        self.push_scalar(|data, index| data.set_u64(index, value))
+    }
+    fn push_scalar(
+        &mut self,
+        write: impl FnOnce(
+            &mut crate::working_memory::capture_tensor::CaptureTensorData,
+            usize,
+        ) -> Result<(), WorkingMemoryError>,
+    ) -> Result<(), CaptureRunHostError> {
         let result = (|| {
             if self.slot.state == TargetState::Failed {
                 return Err(CapturePrefillHostError::Incomplete { index: self.index }.into());
@@ -609,11 +665,7 @@ impl CapturePrefillFragmentWriter<'_, '_, '_, '_> {
                 .checked_add(1)
                 .filter(|n| *n <= tensor.data.len())
                 .ok_or(CapturePrefillHostError::Order)?;
-            let destination = tensor
-                .data
-                .get_mut(mapping.destination_index())
-                .ok_or(CapturePrefillHostError::Identity)?;
-            *destination = value;
+            write(&mut tensor.data, mapping.destination_index())?;
             tensor.covered = next;
             self.cursor += 1;
             Ok(())

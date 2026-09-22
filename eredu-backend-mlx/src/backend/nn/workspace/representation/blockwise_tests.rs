@@ -1,6 +1,6 @@
-use eredu_nn::Tensor;
 use super::*;
 use eredu_nn::workspace::WorkspaceBlockwiseStage;
+use eredu_nn::Tensor;
 use eredu_nn::{BlockwiseAttentionBackend, BlockwiseAttentionOptions, BlockwiseAttentionSpec};
 
 fn source(shape: &[i32], dtype: Option<F>, context: &WorkspaceContext) -> WorkspaceTensor {
@@ -68,12 +68,10 @@ fn blockwise_scalar_roundtrip_preserves_original_query_and_host_store_qualificat
                     .map(WorkspaceRepresentation::dtype),
                 dtype
             );
-            assert!(
-                output
-                    .layout()
-                    .representation()
-                    .is_none_or(|value| !value.row_contiguous())
-            );
+            assert!(output
+                .layout()
+                .representation()
+                .is_none_or(|value| !value.row_contiguous()));
             let report = context.report(&[output.clone()]).unwrap();
             for operation in &report.operations {
                 if let WorkspaceOperationKind::BlockwiseAttention { policy, stage } = operation.kind
@@ -113,17 +111,32 @@ fn blockwise_scalar_roundtrip_preserves_original_query_and_host_store_qualificat
 }
 
 #[test]
-fn metal_sampling_filters_retain_only_known_f32_source_representation(){
-    let mechanism=MlxMetalWorkspaceMechanisms::current_host().unwrap();
-    for shape in [&[64][..],&[1,64][..],&[1,1,64][..]]{
-        for dtype in [Some(F::Float32),Some(F::Float16),Some(F::Bfloat16),None]{
-            let context=WorkspaceContext::new(mechanism);
-            let input=source(shape,dtype,&context);
-            for kind in [WorkspaceSamplingOperation::TokenFilter,WorkspaceSamplingOperation::OptionalTokenFilter,
-                WorkspaceSamplingOperation::TopK {keep:40},WorkspaceSamplingOperation::TopP,WorkspaceSamplingOperation::MinP]{
-                let layout=context.layout(shape,WorkspaceDtype::Float32).unwrap();
-                let result=context.execute(WorkspaceOperationKind::Sampling(kind),&[&input],vec![layout]).unwrap().remove(0);
-                assert_eq!(result.layout().representation().map(|r|r.dtype()),dtype.filter(|d|*d==F::Float32));
+fn metal_sampling_filters_retain_only_known_f32_source_representation() {
+    let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    for shape in [&[64][..], &[1, 64][..], &[1, 1, 64][..]] {
+        for dtype in [Some(F::Float32), Some(F::Float16), Some(F::Bfloat16), None] {
+            let context = WorkspaceContext::new(mechanism);
+            let input = source(shape, dtype, &context);
+            for kind in [
+                WorkspaceSamplingOperation::TokenFilter,
+                WorkspaceSamplingOperation::OptionalTokenFilter,
+                WorkspaceSamplingOperation::TopK { keep: 40 },
+                WorkspaceSamplingOperation::TopP,
+                WorkspaceSamplingOperation::MinP,
+            ] {
+                let layout = context.layout(shape, WorkspaceDtype::Float32).unwrap();
+                let result = context
+                    .execute(
+                        WorkspaceOperationKind::Sampling(kind),
+                        &[&input],
+                        vec![layout],
+                    )
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(
+                    result.layout().representation().map(|r| r.dtype()),
+                    dtype.filter(|d| *d == F::Float32)
+                );
             }
         }
     }
@@ -136,14 +149,35 @@ fn causal_padding_preserves_actual_scalar_through_convolution_and_history() {
         let context = WorkspaceContext::new(facts);
         let input = source(&[1, 2, 16], dtype, &context);
         let weight = source(&[16, 3, 1], Some(F::Float32), &context);
-        let padded = WorkspaceTensor::pad(&input, &[(0,0),(2,0),(0,0)],
-            eredu_nn::PadMode::Constant, &context).unwrap();
+        let padded = WorkspaceTensor::pad(
+            &input,
+            &[(0, 0), (2, 0), (0, 0)],
+            eredu_nn::PadMode::Constant,
+            &context,
+        )
+        .unwrap();
         let output = WorkspaceTensor::conv1d(&padded, &weight, 1, 0, 1, 16, &context).unwrap();
-        assert_eq!(padded.layout().representation().map(|value|value.dtype()), dtype);
-        assert_eq!(output.layout().representation().map(|value|value.dtype()),
-            dtype.map(|value|promote(value,F::Float32)));
-        let history = padded.index(&[eredu_nn::Index::Full,eredu_nn::Index::Range(2,4),
-            eredu_nn::Index::Full], &context).unwrap();
-        assert_eq!(history.layout().representation().map(|value|value.dtype()),dtype);
+        assert_eq!(
+            padded.layout().representation().map(|value| value.dtype()),
+            dtype
+        );
+        assert_eq!(
+            output.layout().representation().map(|value| value.dtype()),
+            dtype.map(|value| promote(value, F::Float32))
+        );
+        let history = padded
+            .index(
+                &[
+                    eredu_nn::Index::Full,
+                    eredu_nn::Index::Range(2, 4),
+                    eredu_nn::Index::Full,
+                ],
+                &context,
+            )
+            .unwrap();
+        assert_eq!(
+            history.layout().representation().map(|value| value.dtype()),
+            dtype
+        );
     }
 }

@@ -1,7 +1,6 @@
 //! Ordinary and admitted execution consume the same selector and its quote.
 use super::*;
 use crate::backend::{
-    MlxBackend, MlxDeviceIdentity,
     managed_memory::gpu_stream::PreparedExecutionStreams,
     nn::{
         grouped::{
@@ -9,6 +8,7 @@ use crate::backend::{
         },
         shared::MlxNeuralBackend,
     },
+    MlxBackend, MlxDeviceIdentity,
 };
 use safemlx::{
     Array, Device, DeviceType, OriginalBufferBudget, OriginalScopeObserver, PrefillRoots,
@@ -17,8 +17,8 @@ use safemlx::{
     SubmissionScope,
 };
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 #[derive(Debug)]
 struct Lifetime(Arc<AtomicBool>);

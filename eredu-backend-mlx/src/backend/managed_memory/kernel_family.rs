@@ -1,9 +1,9 @@
 //! Unenforced custody for the same finite native families used after admission.
 use super::NativeMemoryOwner;
 use safemlx::{
-    OriginalScopeObserver,
     error::Exception,
     fast::{KernelDefinitionError, PreparedMetalKernelFamily},
+    OriginalScopeObserver,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -41,7 +41,7 @@ impl UnenforcedFamilyCache {
         // It cannot disappear from admission just because the invoking arrays
         // retired, nor can it be promoted into a later paid source family.
         let owner =
-            NativeMemoryOwner::acquire_typed(&super::domain()).map_err(Exception::from_source)?;
+            NativeMemoryOwner::acquire_typed(&super::ledger()).map_err(Exception::from_source)?;
         let _guard = self.initialization.lock().map_err(|_| {
             Exception::from_source(InitializationPoisoned {
                 owner: owner.clone(),
@@ -81,7 +81,7 @@ mod tests {
         let mut failed_owner = None;
         let error = cache
             .get_or_try_init(|owner| {
-                failed_owner = Some(Arc::downgrade(&owner.0));
+                failed_owner = Some(Arc::downgrade(owner.shared()));
                 invalid.realize(owner)
             })
             .unwrap_err();
@@ -94,7 +94,7 @@ mod tests {
         let mut cached_owner = None;
         cache
             .get_or_try_init(|owner| {
-                cached_owner = Some(Arc::downgrade(&owner.0));
+                cached_owner = Some(Arc::downgrade(owner.shared()));
                 family.realize(owner)
             })
             .unwrap();

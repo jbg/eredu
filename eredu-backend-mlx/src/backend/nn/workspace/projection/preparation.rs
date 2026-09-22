@@ -351,6 +351,18 @@ where
     match allocation {
         Some(info) => {
             let bytes = u64::try_from(info.bytes()).map_err(|_| ProjectionSourceError::Overflow)?;
+            let placement = context
+                .memory_topology()
+                .map(|topology| {
+                    let placement =
+                        crate::backend::managed_memory::cold_allocation_placement(&info)
+                            .ok_or(ProjectionSourceError::UnknownBacking)?;
+                    placement.validate(topology).map_err(|cause| {
+                        ProjectionSourceError::Metadata(context.metadata_source(cause))
+                    })?;
+                    Ok::<_, ProjectionSourceError>(placement)
+                })
+                .transpose()?;
             match rows[..*known].binary_search_by_key(&info.identity(), ProjectionRow::identity) {
                 Ok(index) => match &mut rows[index] {
                     ProjectionRow::Known {
@@ -359,7 +371,12 @@ where
                         array,
                         ..
                     } => {
-                        if *previous != bytes {
+                        if *previous != bytes
+                            || storage.placement() != placement
+                            || (placement.is_some()
+                                && storage.host_control_bytes()
+                                    != u64::try_from(info.host_control_bytes()).ok())
+                        {
                             return Err(ProjectionSourceError::CapacityChanged);
                         }
                         complete_witness(array)?;
@@ -370,7 +387,20 @@ where
                 Err(index) => {
                     check(rows.len(), maximum)?;
                     context.reserve_metadata_vec(rows, 1)?;
-                    let storage = WorkspaceExistingStorage::try_new(Some(bytes), context)?;
+                    let storage = match placement {
+                        Some(placement) => {
+                            WorkspaceExistingStorage::try_new_placed_with_host_controls(
+                                Some(bytes),
+                                placement,
+                                Some(
+                                    u64::try_from(info.host_control_bytes())
+                                        .map_err(|_| ProjectionSourceError::Overflow)?,
+                                ),
+                                context,
+                            )?
+                        }
+                        None => WorkspaceExistingStorage::try_new(Some(bytes), context)?,
+                    };
                     rows.insert(
                         index,
                         ProjectionRow::Known {

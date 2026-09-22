@@ -1,5 +1,7 @@
 use super::*;
 use crate::backend::nn::{shared::MlxNeuralBackend, tensor::GroupedOriginalTestPlan};
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_nn::{
     GroupSelection, GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec,
     GroupedNeuralBackend, GroupedProjectionSpec, LinearFormatSpec, ParameterSpec,
@@ -130,7 +132,7 @@ fn original_bf16_grouped_projection_defers_validation_masks_invalid_ids_and_pres
                 .unwrap();
             assert_eq!(actual, expected);
             assert!(
-                pool.used_bytes().unwrap() > 0,
+                pool.fixture_host_charge().unwrap() > 0,
                 "published output lost original custody"
             );
             drop(output);
@@ -177,7 +179,7 @@ fn original_grouped_chunk_destination_refuses_growth_and_retains_detached_custod
         &[2.0]
     );
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.fixture_host_charge().unwrap() > 0,
         "detached destination lost original custody"
     );
     drop(output);
@@ -245,7 +247,7 @@ fn original_attention_key_blocks_match_full_reference_and_retire_each_pass() {
     POINTWISE_CONTROLS.with(|slot| assert!(slot.replace(Some(plan.control_bytes())).is_none()));
     let controls_reset = PointwiseControlsReset;
     let completion = plan.completion;
-    let baseline = prepared.pool.used_bytes().unwrap();
+    let baseline = prepared.pool.fixture_host_charge().unwrap();
     let baseline_unquoted = prepared.pool.unquoted_owner_count().unwrap();
     let output = with_prepared_original_operation_controls(
         None,
@@ -318,13 +320,13 @@ fn original_attention_key_blocks_match_full_reference_and_retire_each_pass() {
     );
     drop((quote_guard, controls_reset));
     assert!(
-        prepared.pool.used_bytes().unwrap() > baseline,
+        prepared.pool.fixture_host_charge().unwrap() > baseline,
         "escaped output keeps actual original custody"
     );
     drop(output);
     crate::backend::submission_recovery::wait_for_retirement(|| {
         disk::reclaim();
-        prepared.pool.used_bytes().unwrap() == baseline
+        prepared.pool.fixture_host_charge().unwrap() == baseline
             && prepared.pool.unquoted_owner_count().unwrap() == baseline_unquoted
     });
     drop((q, k, v, mask, sinks, stream));

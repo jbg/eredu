@@ -5,6 +5,9 @@ use std::{alloc::Layout, collections::TryReserveError, marker::PhantomData, mem:
 /// Preparation failure retaining the selected fact or allocation cause.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceCopyPreparationError<E> {
+    /// The original context refused funded placement/report metadata.
+    #[error(transparent)]
+    Metadata(#[from] Error),
     /// The actual imported source set does not match its context and selection.
     #[error(transparent)]
     Source(#[from] WorkspaceCopyError),
@@ -391,7 +394,7 @@ impl<F: WorkspaceFactMechanisms> WorkspaceIsolatedCopyPreparation<'_, F> {
     /// missing effects remain incomplete, with no ordinary fallback.
     pub fn construct(self) -> Result<WorkspaceIsolatedCopyPlan, F::Error> {
         self.validate()?;
-        let mut build = Build::new(self.facts, self.layout)?;
+        let mut build = Build::new(self.facts, self.context, self.layout)?;
         for root in self.borrowed.roots() {
             build.borrowed.push(build.nodes.len());
             build.nodes.push(WorkspaceReportNode {
@@ -399,6 +402,11 @@ impl<F: WorkspaceFactMechanisms> WorkspaceIsolatedCopyPreparation<'_, F> {
                 alias_start: 0,
                 alias_count: 0,
             });
+            build.placements.push(
+                self.context
+                    .copy_placement(root.storage.placement.as_ref())?,
+            );
+            build.host_controls.push(root.storage.host_control_bytes);
         }
         for source in self.sources {
             let root = self
@@ -435,17 +443,91 @@ impl<F: WorkspaceFactMechanisms> WorkspaceIsolatedCopyPreparation<'_, F> {
         build.assumptions.dedup();
         let graph = WorkspaceReportGraph::new(&build.nodes, &build.edges)?;
         let mut report_workspace = WorkspaceReportWorkspace::new(self.layout.report)?;
-        let scalar = report_workspace.report(
+        let physical_domains = self
+            .facts
+            .memory_topology()
+            .map(|topology| {
+                report_workspace
+                    .report_domains_owned(
+                        graph,
+                        WorkspaceDomainReportInputs {
+                            opening: Some(&build.closing[..self.sources.len()]),
+                            allocations: &build.allocations,
+                            closing: &build.closing,
+                            borrowed: Some(&build.borrowed),
+                            host_workspace: (!build.host_staging_incomplete).then_some(build.host),
+                            tensor_complete: build.missing.is_empty(),
+                        },
+                        WorkspaceReportPlacements {
+                            topology,
+                            backings: &build.placements,
+                            host_controls: Some(&build.host_controls),
+                            scratch: &build.placed_scratch,
+                        },
+                        self.context,
+                    )
+                    .and_then(|mut report| {
+                        for source in &build.scratch_sources {
+                            report.append_scratch_population(source, self.context)?;
+                        }
+                        Ok(Some(report))
+                    })
+                    .or_else(|cause| match &cause.storage {
+                        crate::ErrorStorage::WorkspaceMetadata(WorkspaceMetadataError::Report(
+                            WorkspaceReportError::IncompletePlacement,
+                        )) => Ok(None),
+                        _ => Err(cause),
+                    })
+            })
+            .transpose()?
+            .flatten();
+        let input = WorkspaceReportInputs {
+            opening: Some(&build.closing[..self.sources.len()]),
+            allocations: &build.allocations,
+            closing: &build.closing,
+            borrowed: Some(&build.borrowed),
+            scratch: build.scratch,
+            host_workspace: (!build.host_staging_incomplete).then_some(build.host),
+            tensor_complete: build.missing.is_empty() && !build.scratch_overflow,
+        };
+        let extra = build
+            .scratch_sources
+            .iter()
+            .filter(|source| source.domain_population().is_some())
+            .count();
+        let mut diagnostic_scratch = self.context.metadata_vec(
+            build
+                .placed_scratch
+                .len()
+                .checked_add(extra)
+                .ok_or(WorkspaceCopyPreparationError::Overflow)?,
+        )?;
+        for row in &build.placed_scratch {
+            diagnostic_scratch.push(WorkspaceScratchAllocation {
+                bytes: row.bytes,
+                maximum_allocations: row.maximum_allocations,
+                host_control_bytes: row.host_control_bytes,
+                placement: self.context.copy_placement(row.placement.as_ref())?,
+            });
+        }
+        for source in build
+            .scratch_sources
+            .iter()
+            .filter(|source| source.domain_population().is_some())
+        {
+            diagnostic_scratch.push(WorkspaceScratchAllocation {
+                bytes: 0,
+                maximum_allocations: None,
+                host_control_bytes: source.host_control_bytes(),
+                placement: None,
+            });
+        }
+        let scalar = report_workspace.report_domain_diagnostics(
             graph,
-            WorkspaceReportInputs {
-                opening: Some(&build.closing[..self.sources.len()]),
-                allocations: &build.allocations,
-                closing: &build.closing,
-                borrowed: Some(&build.borrowed),
-                scratch: build.scratch,
-                host_workspace: build.missing_host.is_empty().then_some(build.host),
-                tensor_complete: build.missing.is_empty(),
-            },
+            input,
+            &build.host_controls,
+            &diagnostic_scratch,
+            physical_domains.is_some(),
         )?;
         let residual = scalar.residual.map(|value| WorkspaceResidualReport {
             opening_storage: value.opening_storage,
@@ -458,6 +540,7 @@ impl<F: WorkspaceFactMechanisms> WorkspaceIsolatedCopyPreparation<'_, F> {
         });
         let incremental_bytes = residual.as_ref().and_then(|r| r.total_bytes);
         let report = WorkspaceTraceReport {
+            physical_domains,
             closing_storage: scalar.closing_storage,
             opening_storage: scalar.opening_storage,
             residual,
@@ -497,6 +580,11 @@ fn layout_slot<E>(layout: WorkspaceLayoutView<'_>) -> Result<Vec<WorkspaceLayout
 
 struct Build<'a, F> {
     facts: &'a F,
+    context: &'a WorkspaceContext,
+    placements: Vec<Option<eredu_core::MemoryPlacement>>,
+    host_controls: Vec<Option<u64>>,
+    placed_scratch: Vec<WorkspaceScratchAllocation>,
+    scratch_sources: Vec<WorkspaceAllocationPopulation>,
     limit: WorkspaceCopyPreparationLayout,
     nodes: Vec<WorkspaceReportNode>,
     edges: Vec<usize>,
@@ -510,17 +598,28 @@ struct Build<'a, F> {
     missing_host: Vec<usize>,
     assumptions: Vec<String>,
     scratch: u64,
+    scratch_overflow: bool,
     host: u64,
+    host_staging_incomplete: bool,
     text_used: usize,
     shapes_used: usize,
 }
 impl<'a, F: WorkspaceFactMechanisms> Build<'a, F> {
-    fn new(facts: &'a F, limit: WorkspaceCopyPreparationLayout) -> Result<Self, F::Error> {
+    fn new(
+        facts: &'a F,
+        context: &'a WorkspaceContext,
+        limit: WorkspaceCopyPreparationLayout,
+    ) -> Result<Self, F::Error> {
         let c = limit.counts;
         let mut aliases = reserve(c.alias_scratch)?;
         aliases.resize(c.alias_scratch, 0);
         Ok(Self {
             facts,
+            context,
+            placements: context.metadata_vec(limit.report.nodes())?,
+            host_controls: context.metadata_vec(limit.report.nodes())?,
+            placed_scratch: context.metadata_vec(c.operations)?,
+            scratch_sources: context.metadata_vec(c.operations)?,
             limit,
             nodes: reserve(limit.report.nodes())?,
             edges: reserve(c.aliases)?,
@@ -534,7 +633,9 @@ impl<'a, F: WorkspaceFactMechanisms> Build<'a, F> {
             missing_host: reserve(c.operations)?,
             assumptions: reserve(c.assumptions)?,
             scratch: 0,
+            scratch_overflow: false,
             host: 0,
+            host_staging_incomplete: false,
             text_used: 0,
             shapes_used: 0,
         })
@@ -671,21 +772,65 @@ impl<'a, F: WorkspaceFactMechanisms> Build<'a, F> {
                 }
                 let index = self.nodes.len();
                 self.nodes.push(node);
+                self.placements.push(
+                    self.context
+                        .copy_placement(self.facts.output_placement(operation, 0))?,
+                );
+                self.host_controls
+                    .push(self.facts.allocation_host_control_bytes(operation, 0));
                 self.allocations.push(index);
                 index
             }
         };
-        self.scratch = self
-            .scratch
-            .checked_add(tensor.map_or(0, |f| f.scratch_bytes))
-            .ok_or(WorkspaceCopyPreparationError::Overflow)?;
+        let scratch = tensor.map_or(0, |f| f.scratch_bytes);
+        let mut missing_scratch_controls = false;
+        if let Some(rows) = self
+            .facts
+            .scratch_allocations(operation)
+            .map_err(WorkspaceCopyPreparationError::Mechanism)?
+        {
+            self.scratch_sources.push(rows.clone());
+            missing_scratch_controls |= rows.host_control_bytes().is_none();
+            let rows = self.context.copy_scratch_population(rows, scratch)?;
+            self.context
+                .reserve_metadata_vec(&mut self.placed_scratch, rows.len())?;
+            for row in rows {
+                missing_scratch_controls |= row.host_control_bytes.is_none();
+                self.placed_scratch.push(row);
+            }
+        } else if scratch != 0 {
+            let host_control_bytes = self
+                .facts
+                .scratch_host_control_bytes(operation)
+                .map_err(WorkspaceCopyPreparationError::Mechanism)?;
+            missing_scratch_controls = host_control_bytes.is_none();
+            self.placed_scratch.push(WorkspaceScratchAllocation {
+                bytes: scratch,
+                maximum_allocations: None,
+                host_control_bytes,
+                placement: self
+                    .context
+                    .copy_placement(self.facts.scratch_placement(operation))?,
+            });
+        }
+        self.scratch = match self.scratch.checked_add(scratch) {
+            Some(total) => total,
+            None if self.facts.memory_topology().is_some() => {
+                self.scratch_overflow = true;
+                self.scratch
+            }
+            None => return Err(WorkspaceCopyPreparationError::Overflow),
+        };
         self.host = self
             .host
             .checked_add(host.map_or(0, |f| f.bytes))
             .ok_or(WorkspaceCopyPreparationError::Overflow)?;
+        let missing_host = host_text.is_none();
+        self.host_staging_incomplete |= missing_host;
         if let Some(text) = host_text {
             self.assumptions.push(text);
-        } else {
+        }
+        if missing_host || missing_scratch_controls {
             self.missing_host.push(ordinal);
         }
         if let Some(text) = tensor_text {

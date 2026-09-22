@@ -15,7 +15,7 @@ impl SharedSource {
             Self::Aggregate(s) => s.decode_source(),
         }
     }
-    fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Standalone(s) => s.validate_pool(pool),
             Self::Aggregate(s) => s.validate_pool(pool),
@@ -40,7 +40,7 @@ impl<'a> SourceRef<'a> {
             Self::Aggregate(s) => SharedSource::Aggregate(s.clone()),
         }
     }
-    fn validate_pool(self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    fn validate_pool(self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Standalone(s) => s.validate_pool(pool),
             Self::Aggregate(s) => s.validate_pool(pool),
@@ -110,7 +110,7 @@ fn take(
     source: SourceRef<'_>,
     stops: Option<&OriginalStopSource>,
     claim: &GenerationSequencePreparation<'_, '_>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<OriginalGenerationDecoderSource, BackendFailure> {
     let reject = || GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure();
     source.validate_pool(pool).map_err(|_| reject())?;
@@ -220,7 +220,7 @@ impl LoadedGenerationDecoderInput {
     pub(super) fn take(
         &self,
         claim: &GenerationSequencePreparation<'_, '_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<OriginalGenerationDecoderSource, BackendFailure> {
         take(
             self.binding,
@@ -271,9 +271,11 @@ impl OriginalTokenDomainBinding {
     pub(in crate::working_memory) fn prepare(
         source: &OriginalTokenizer,
         claim: &GenerationSequencePreparation<'_, '_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Self, WorkingMemoryError> {
-        if claim.request().semantic_state().is_some() { return Err(WorkingMemoryError::IdentityMismatch); }
+        if claim.request().semantic_state().is_some() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         let header = claim
             .request()
             .decoder_input()
@@ -308,21 +310,33 @@ impl OriginalTokenDomainBinding {
         })
     }
     pub(in crate::working_memory) fn prepare_semantic(
-        source: &OriginalTokenizer, claim: &GenerationSequencePreparation<'_, '_>, pool: &WorkingMemoryPool,
+        source: &OriginalTokenizer,
+        claim: &GenerationSequencePreparation<'_, '_>,
+        pool: &MemoryLedger,
     ) -> Result<Self, WorkingMemoryError> {
         source.validate_pool(pool)?;
-        if claim.context().attempt() != 0 || claim.request().max_new_tokens() == 0
-            || claim.request().decoder_input().is_some() || claim.request().semantic_state().is_none()
-            || !claim.request().consumer_layout().is_some_and(|c| !c.plain_text_output())
-            || source.generation_domain().is_none() {
+        if claim.context().attempt() != 0
+            || claim.request().max_new_tokens() == 0
+            || claim.request().decoder_input().is_some()
+            || claim.request().semantic_state().is_none()
+            || !claim
+                .request()
+                .consumer_layout()
+                .is_some_and(|c| !c.plain_text_output())
+            || source.generation_domain().is_none()
+        {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        Ok(Self { source: source.clone(), binding: OriginalTokenDomainEvidence::Semantic {
-            maximum: claim.request().max_new_tokens() } })
+        Ok(Self {
+            source: source.clone(),
+            binding: OriginalTokenDomainEvidence::Semantic {
+                maximum: claim.request().max_new_tokens(),
+            },
+        })
     }
     pub(in crate::working_memory) fn prepare_retained(
         source: &OriginalTokenizer,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         maximum: usize,
     ) -> Result<Self, WorkingMemoryError> {
         source.validate_pool(pool)?;
@@ -343,7 +357,8 @@ impl OriginalTokenDomainBinding {
     pub(in crate::working_memory) fn maximum(&self) -> usize {
         match self.binding {
             OriginalTokenDomainEvidence::Initial(binding) => binding.maximum,
-            OriginalTokenDomainEvidence::Retained { maximum } | OriginalTokenDomainEvidence::Semantic { maximum } => maximum,
+            OriginalTokenDomainEvidence::Retained { maximum }
+            | OriginalTokenDomainEvidence::Semantic { maximum } => maximum,
         }
     }
 }
@@ -407,7 +422,7 @@ impl AggregateGenerationDecoderInput {
     pub(super) fn take(
         &self,
         claim: &GenerationSequencePreparation<'_, '_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<OriginalGenerationDecoderSource, BackendFailure> {
         take(
             self.binding,
@@ -445,18 +460,25 @@ impl SharedStorage {
                 Result<OriginalTokenDomainBinding, WorkingMemoryError>,
             >())?
             .checked_add(size_of::<crate::working_memory::ControllerStorageContract>())?
-            .checked_add(crate::working_memory::PreparedControllerBinding::validation_control_bytes()?)?
+            .checked_add(
+                crate::working_memory::PreparedControllerBinding::validation_control_bytes()?,
+            )?
             .checked_add(size_of::<crate::working_memory::PreparedControllerBinding>())?
-            .checked_add(size_of::<Option<crate::working_memory::PreparedControllerBinding>>())?
+            .checked_add(size_of::<
+                Option<crate::working_memory::PreparedControllerBinding>,
+            >())?
             .checked_add(size_of::<eredu_core::PreparedControllerSource<'static>>())?
-            .checked_add(size_of::<Result<Option<crate::working_memory::PreparedControllerBinding>, WorkingMemoryError>>())?
+            .checked_add(size_of::<
+                Result<
+                    Option<crate::working_memory::PreparedControllerBinding>,
+                    WorkingMemoryError,
+                >,
+            >())?
             .checked_add(size_of::<
                 Result<crate::working_memory::ControllerStorageContract, BackendFailure>,
             >())?
             .checked_add(size_of::<eredu_core::OriginalSourceWitness<'static>>())?
-            .checked_add(size_of::<
-                Option<eredu_core::OriginalSourceWitness<'static>>,
-            >())?
+            .checked_add(size_of::<Option<eredu_core::OriginalSourceWitness<'static>>>())?
             .checked_add(size_of::<eredu_core::TextControllerStorage<'static>>())?
             .checked_add(size_of::<
                 Result<(), crate::working_memory::ControllerStorageError>,
@@ -502,7 +524,7 @@ pub(in super::super) enum DecoderStorage {
 impl DecoderStorage {
     pub(in super::super) fn validate_pool(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Owned(_) => Ok(()),
@@ -556,7 +578,7 @@ pub(in super::super) enum StopStorage {
 impl StopStorage {
     pub(in super::super) fn validate_pool(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Owned(_) => Ok(()),

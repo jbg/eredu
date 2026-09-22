@@ -1,30 +1,33 @@
 //! Portable model capabilities, runtime-state accounting, and admission policy.
 
 use crate::{
-    AttentionPolicy, LayerSchedule, ObservationKind, Observed,
     cache::{
         LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
         StateTensorPresence, StateTensorRole,
     },
+    AttentionPolicy, LayerSchedule, ObservationKind, Observed,
 };
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
 mod admission;
 pub use admission::{
-    AdmissionObservation, AdmissionPolicyDecision, AdmissionPolicyError, AdmissionRequirements,
+    apply_admission_requirements, check_admission_context_borrowed, AdmissionObservation,
+    AdmissionPolicyDecision, AdmissionPolicyError, AdmissionRequirements,
     AdmissionStateRequirements, BorrowedAdmissionRejection, BorrowedAdmissionResult,
-    ExecutionWorkspaceRequirements, SelectedStateRequirements, apply_admission_requirements,
-    check_admission_context_borrowed,
+    ExecutionWorkspaceRequirements, SelectedStateRequirements,
 };
 
 mod state_facts;
 pub use state_facts::{
-    RuntimeStateFacts, StateWindowDestinationError, StateWindowPlan, estimate_runtime_state_facts,
+    estimate_runtime_state_facts, RuntimeStateFacts, StateWindowDestinationError, StateWindowPlan,
 };
 
 mod workspace;
-pub use workspace::{ExecutionWorkspaceEstimate, WorkspaceBound};
+pub use workspace::{
+    DomainExecutionWorkspaceEstimate, DomainRuntimeStateEstimate, ExecutionWorkspaceEstimate,
+    WorkspaceBound,
+};
 
 /// Model inputs accepted by a prepared model.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -243,6 +246,10 @@ impl SelectedStateBacking {
 /// Persistent and transient runtime-state estimate for one request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeStateEstimate {
+    /// Physical requirements supplied by selected allocation mechanisms.
+    /// Serialized diagnostics cannot preserve process-local topology identities.
+    #[serde(skip)]
+    pub physical_domains: Option<DomainRuntimeStateEstimate>,
     /// Context-independent recurrent/convolution state.
     pub fixed_state_bytes: u64,
     /// Unbounded bytes added per position before multiplying by batch.
@@ -333,18 +340,25 @@ impl RuntimeStateEstimate {
 
     fn refresh_completeness(&mut self) -> Result<(), AdmissionPolicyError> {
         self.validate_selected_geometry()?;
-        let known_execution = self
-            .execution_workspace
-            .as_ref()
-            .map(ExecutionWorkspaceEstimate::peak_bytes_fixed)
-            .transpose()?
-            .flatten()
-            .is_some();
+        let known_execution = match self.execution_workspace.as_ref() {
+            Some(workspace) if workspace.physical_domains.is_some() => [
+                &workspace.activations,
+                &workspace.attention,
+                &workspace.vocabulary,
+                &workspace.state_update,
+                &workspace.materialization,
+                &workspace.retained,
+            ]
+            .into_iter()
+            .all(|bound| !matches!(bound, WorkspaceBound::Unknown { .. })),
+            Some(workspace) => workspace.peak_bytes_fixed()?.is_some(),
+            None => false,
+        };
         self.completeness = if known_execution
-            && self
-                .selected_state_backing
-                .as_ref()
-                .is_none_or(|bound| bound.bytes().is_some())
+            && self.selected_state_backing.as_ref().is_none_or(|backing| {
+                !matches!(backing.bound, WorkspaceBound::Unknown { .. })
+                    && (backing.bytes().is_some() || self.physical_domains.is_some())
+            })
             && self.persistent_state_completeness != EstimationCompleteness::PersistentStateOnly
         {
             EstimationCompleteness::Conservative
@@ -437,7 +451,7 @@ pub struct AvailableMemory {
 }
 
 /// One pre-generation admission request.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionRequest {
     /// Authoritative prompt accounting.
     pub input: InputTokenCount,
@@ -445,18 +459,19 @@ pub struct AdmissionRequest {
     pub max_output_tokens: u64,
     /// Logical batch size.
     pub batch_size: u64,
-    /// Caller-selected reserve added to modeled state.
-    pub safety_reserve_bytes: u64,
-    /// Optional enforceable application budget for incremental state, execution
-    /// workspace and reserve. Supplying a budget requires complete bounds.
-    pub application_memory_budget_bytes: Option<u64>,
-    /// Reject estimates that omit execution transients even without a budget.
-    pub require_complete_estimate: bool,
+    /// Additional allowances attributed to named physical domains.
+    pub additional_headroom: crate::MemoryHeadroomDeclarations,
+    /// Physical-domain limits resolved by the selected ledger before admission.
+    pub memory_limits: crate::MemoryLimitDeclarations,
 }
 
 /// Detailed successful admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admission {
+    /// Per-domain request limits; the ledger compares the complete live charge.
+    pub memory_limits: crate::MemoryLimitDeclarations,
+    /// Explicit additional per-domain allowances retained in the reservation.
+    pub additional_headroom: crate::MemoryHeadroomDeclarations,
     /// Prompt plus output allowance.
     pub requested_positions: u64,
     /// Runtime-state estimate.
@@ -464,9 +479,7 @@ pub struct Admission {
     /// Required incremental bytes including the caller reserve. Ordinary policy
     /// uses full state plus workspace; separately proved incremental reporting
     /// may exclude physical storage already charged elsewhere.
-    pub incremental_required_bytes: u64,
-    /// Availability signal used, when supplied.
-    pub available_memory_bytes: Option<u64>,
+    pub incremental_required_bytes: Option<u64>,
 }
 
 /// Structured reason a request was rejected before generation.
@@ -489,25 +502,6 @@ pub enum AdmissionRejection {
         /// Effective model limit.
         maximum_positions: u64,
     },
-    /// Application budget is smaller than modeled state, workspace and reserve.
-    MemoryBudgetExceeded {
-        /// Required incremental bytes.
-        required_bytes: u64,
-        /// Caller-supplied budget.
-        budget_bytes: u64,
-    },
-    /// Current availability is smaller than modeled state, workspace and reserve.
-    InsufficientAvailableMemory {
-        /// Required incremental bytes.
-        required_bytes: u64,
-        /// Observed available bytes.
-        available_bytes: u64,
-    },
-    /// A requested availability check could not be performed.
-    AvailableMemoryUnavailable {
-        /// Platform report detail.
-        reason: String,
-    },
     /// Policy requires estimator coverage the model cannot provide.
     EstimationUnsupported {
         /// Coverage detail.
@@ -528,6 +522,9 @@ pub enum AdmissionResult {
 /// Structured capability and accounting failures.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum CapabilityError {
+    /// Physical placement, identity or checked per-domain arithmetic failed.
+    #[error(transparent)]
+    MemoryDomain(#[from] crate::MemoryDomainError),
     /// A validated architecture exposed an invalid value.
     #[error("invalid model capability field {field}: {detail}")]
     InvalidConfiguration {
@@ -631,13 +628,12 @@ impl StateMemoryLayout {
             return Err(error(field, format_args!("{detail}")));
         }
         for (layer, policy) in layer_layout.iter().enumerate() {
-            policy
-                .validate_with_diagnostic(|detail| {
-                    error(
-                        "layer_layout",
-                        format_args!("invalid state policy at layer {layer}: {detail}"),
-                    )
-                })?;
+            policy.validate_with_diagnostic(|detail| {
+                error(
+                    "layer_layout",
+                    format_args!("invalid state policy at layer {layer}: {detail}"),
+                )
+            })?;
         }
         Ok(Self {
             layer_layout,
@@ -702,14 +698,13 @@ pub fn check_admission_context(
     .map_err(Into::into)
 }
 
-/// Applies context and memory policy to an already-computed state estimate.
+/// Checks context and completeness, retaining per-domain limits for atomic ledger admission.
 pub fn apply_admission_policy(
     capabilities: &ModelCapabilities,
     request: AdmissionRequest,
     state: RuntimeStateEstimate,
-    available: Option<&AvailableMemory>,
 ) -> Result<AdmissionResult, CapabilityError> {
-    apply_admission_policy_impl(capabilities, request, state, None, available)
+    apply_admission_policy_impl(capabilities, request, state, None)
 }
 
 /// Applies ordinary admission policy using a separately proved complete
@@ -731,9 +726,8 @@ pub fn apply_admission_policy_with_incremental(
     request: AdmissionRequest,
     state: RuntimeStateEstimate,
     incremental: &WorkspaceBound,
-    available: Option<&AvailableMemory>,
 ) -> Result<AdmissionResult, CapabilityError> {
-    apply_admission_policy_impl(capabilities, request, state, Some(incremental), available)
+    apply_admission_policy_impl(capabilities, request, state, Some(incremental))
 }
 
 fn apply_admission_policy_impl(
@@ -741,9 +735,8 @@ fn apply_admission_policy_impl(
     request: AdmissionRequest,
     state: RuntimeStateEstimate,
     incremental: Option<&WorkspaceBound>,
-    available: Option<&AvailableMemory>,
 ) -> Result<AdmissionResult, CapabilityError> {
-    admission::owned(capabilities, request, state, incremental, available)
+    admission::owned(capabilities, request, state, incremental)
 }
 
 #[cfg(test)]
@@ -756,6 +749,7 @@ mod tests {
     fn bounded_fixture_workspace(input: u64, output: u64) -> ExecutionWorkspaceEstimate {
         let zero = || WorkspaceBound::bounded(0, "fixture has no such allocation");
         ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry: crate::InferenceGeometry {
                 batch_size: 1,
                 cached_positions: 0,
@@ -818,20 +812,18 @@ mod tests {
             let mut changed_workspace = workspace.clone();
             changed_workspace.geometry = changed;
             let bound = || WorkspaceBound::bounded(64, "fixture bound for exact schedule");
-            assert!(
-                base.clone()
-                    .with_selected_state_backing(g, bound())
-                    .unwrap()
-                    .with_execution_workspace(changed_workspace.clone())
-                    .is_err()
-            );
-            assert!(
-                base.clone()
-                    .with_execution_workspace(changed_workspace)
-                    .unwrap()
-                    .with_selected_state_backing(g, bound())
-                    .is_err()
-            );
+            assert!(base
+                .clone()
+                .with_selected_state_backing(g, bound())
+                .unwrap()
+                .with_execution_workspace(changed_workspace.clone())
+                .is_err());
+            assert!(base
+                .clone()
+                .with_execution_workspace(changed_workspace)
+                .unwrap()
+                .with_selected_state_backing(g, bound())
+                .is_err());
         }
         let mut estimate = base
             .with_selected_state_backing(g, WorkspaceBound::bounded(64, "fixture"))
@@ -854,22 +846,18 @@ mod tests {
             modalities: InputModalities::TEXT,
             estimation: EstimationCompleteness::Complete,
         };
-        assert!(
-            apply_admission_policy(
-                &capabilities,
-                AdmissionRequest {
-                    input: InputTokenCount::text(3),
-                    max_output_tokens: 2,
-                    batch_size: 1,
-                    application_memory_budget_bytes: None,
-                    safety_reserve_bytes: 0,
-                    require_complete_estimate: true,
-                },
-                decoded,
-                None
-            )
-            .is_err()
-        );
+        assert!(apply_admission_policy(
+            &capabilities,
+            AdmissionRequest {
+                input: InputTokenCount::text(3),
+                max_output_tokens: 2,
+                batch_size: 1,
+                memory_limits: Default::default(),
+                additional_headroom: crate::MemoryHeadroomDeclarations::new([("host".into(), 0)]),
+            },
+            decoded
+        )
+        .is_err());
     }
 
     #[test]
@@ -918,13 +906,37 @@ mod tests {
         assert_eq!(restored, refined);
         // Replacing a bound recalculates the total; neither repeated attachment
         // nor an undersized selected bound subtracts logical or media storage.
-        let smaller = refined
+        let mut smaller = refined
             .with_selected_state_backing(
                 geometry,
                 WorkspaceBound::bounded(0, "fixture replacement"),
             )
             .unwrap();
         assert_eq!(smaller.requested_state_bytes, base.requested_state_bytes);
+        let topology = crate::MemoryTopology::new(vec![crate::MemoryDomainDescription {
+            name: "host".into(),
+            locations: vec![crate::MemoryLocation::Host],
+        }])
+        .unwrap();
+        // Domain vectors are descriptive and cannot override missing evidence
+        // when a later producer replaces a selected backing bound.
+        let empty = || crate::DomainMemoryRequirements::zero(&topology);
+        smaller.physical_domains = Some(crate::DomainRuntimeStateEstimate {
+            geometry,
+            decoder_state: empty(),
+            media_embeddings: empty(),
+            media_workspace: empty(),
+        });
+        let mut qualified_workspace = workspace.clone();
+        qualified_workspace.physical_domains = Some(crate::DomainExecutionWorkspaceEstimate {
+            geometry,
+            activations: empty(),
+            attention: empty(),
+            vocabulary: empty(),
+            state_update: empty(),
+            materialization: empty(),
+            retained: empty(),
+        });
         let unknown = smaller
             .with_selected_state_backing(
                 geometry,
@@ -933,7 +945,7 @@ mod tests {
                 },
             )
             .unwrap()
-            .with_execution_workspace(workspace.clone())
+            .with_execution_workspace(qualified_workspace)
             .unwrap();
         assert_eq!(
             unknown.completeness,
@@ -953,17 +965,16 @@ mod tests {
                 .completeness,
             EstimationCompleteness::PersistentStateOnly
         );
-        assert!(
-            base.clone()
-                .with_selected_state_backing(
-                    crate::InferenceGeometry {
-                        batch_size: 2,
-                        ..geometry
-                    },
-                    WorkspaceBound::bounded(logical, "wrong batch")
-                )
-                .is_err()
-        );
+        assert!(base
+            .clone()
+            .with_selected_state_backing(
+                crate::InferenceGeometry {
+                    batch_size: 2,
+                    ..geometry
+                },
+                WorkspaceBound::bounded(logical, "wrong batch")
+            )
+            .is_err());
         assert!(matches!(
             base.with_selected_state_backing(
                 geometry,
@@ -1065,12 +1076,16 @@ mod tests {
                     input,
                     max_output_tokens: 2,
                     batch_size: 1,
-                    safety_reserve_bytes: 0,
-                    application_memory_budget_bytes: Some(1024),
-                    require_complete_estimate: true
+                    additional_headroom: crate::MemoryHeadroomDeclarations::new([(
+                        "host".into(),
+                        0
+                    )]),
+                    memory_limits: crate::MemoryLimitDeclarations::new([(
+                        "host".into(),
+                        crate::MemoryLimit::Finite(1024)
+                    )]),
                 },
-                state,
-                None
+                state
             )
             .unwrap(),
             AdmissionResult::Admitted(_)
@@ -1088,6 +1103,7 @@ mod tests {
             estimation: EstimationCompleteness::Complete,
         };
         let state = RuntimeStateEstimate {
+            physical_domains: None,
             fixed_state_bytes: 0,
             bytes_per_position_per_batch: 0,
             context_state_bytes: 0,
@@ -1110,49 +1126,12 @@ mod tests {
             input: InputTokenCount::text(7),
             max_output_tokens: 2,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: crate::MemoryHeadroomDeclarations::new([("host".into(), 0)]),
+            memory_limits: Default::default(),
         };
         assert!(matches!(
-            apply_admission_policy(&capabilities, request, state, None).unwrap(),
+            apply_admission_policy(&capabilities, request, state).unwrap(),
             AdmissionResult::Rejected(AdmissionRejection::OutputHeadroomExceedsContext { .. })
-        ));
-
-        let unavailable = AvailableMemory {
-            physical_memory_bytes: Observed::unavailable("not reported"),
-            available_memory_bytes: Observed::unavailable("not reported"),
-            physical_semantics: PhysicalMemorySemantics::Unknown,
-        };
-        let request = AdmissionRequest {
-            input: InputTokenCount::text(1),
-            max_output_tokens: 0,
-            batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
-        };
-        let state = estimate_runtime_state(
-            &StateMemoryLayout::new(
-                LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
-                vec![0],
-                1,
-                1,
-                EstimationCompleteness::Complete,
-            )
-            .unwrap(),
-            request.input,
-            0,
-            1,
-            NonZeroU8::new(4).unwrap(),
-        )
-        .unwrap();
-        let state = state
-            .with_execution_workspace(bounded_fixture_workspace(1, 0))
-            .unwrap();
-        assert!(matches!(
-            apply_admission_policy(&capabilities, request, state, Some(&unavailable)).unwrap(),
-            AdmissionResult::Rejected(AdmissionRejection::AvailableMemoryUnavailable { .. })
         ));
     }
 

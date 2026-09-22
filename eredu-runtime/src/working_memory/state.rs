@@ -18,8 +18,8 @@ use std::num::NonZeroU32;
 mod fixed;
 use fixed::FixedSlots;
 
-mod projection;
 mod paged;
+mod projection;
 pub use paged::{WorkspacePagedLayerState, WorkspacePagedValues};
 
 /// Traces an explicitly selected exact-concatenation cache mechanism. Sliding

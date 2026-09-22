@@ -60,7 +60,7 @@ TEST_CASE("CPU grouped GatherAxis preserves nonfinal ordering and escaped origin
     struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
     unsigned retired = 0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-        [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+        [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
     std::optional<array> escaped;
     {
       Role role; REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);
@@ -97,7 +97,7 @@ TEST_CASE("CPU grouped GatherAxis checks queued index values and retains failed 
   struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
   unsigned retired = 0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-      [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   std::optional<array> failed_output;
   {
     Role role; REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);

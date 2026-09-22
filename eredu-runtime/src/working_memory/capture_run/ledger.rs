@@ -12,8 +12,12 @@ struct State {
 }
 #[derive(Debug)]
 enum Custody {
-    Capture { _custody: CaptureTensorCustody },
-    Request { _ticket: crate::working_memory::funding::AccountTicket },
+    Capture {
+        _custody: CaptureTensorCustody,
+    },
+    Request {
+        _ticket: crate::working_memory::funding::AccountTicket,
+    },
 }
 #[derive(Debug)]
 struct Owner {
@@ -60,7 +64,10 @@ impl CaptureRunLedger {
     pub(in crate::working_memory) fn new_request(
         ticket: crate::working_memory::funding::AccountTicket,
     ) -> Self {
-        Self::with_custody(Custody::Request { _ticket: ticket }, CaptureUsage::default())
+        Self::with_custody(
+            Custody::Request { _ticket: ticket },
+            CaptureUsage::default(),
+        )
     }
     fn with_custody(custody: Custody, usage: CaptureUsage) -> Self {
         Self(Some(Arc::new(Owner {
@@ -72,7 +79,10 @@ impl CaptureRunLedger {
         })))
     }
     pub(crate) fn same_storage(&self, other: &Self) -> bool {
-        Arc::ptr_eq(self.0.as_ref().expect("live ledger"), other.0.as_ref().expect("live ledger"))
+        Arc::ptr_eq(
+            self.0.as_ref().expect("live ledger"),
+            other.0.as_ref().expect("live ledger"),
+        )
     }
     pub(crate) fn inspection_control_bytes() -> Option<usize> {
         Some(

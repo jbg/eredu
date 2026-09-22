@@ -127,14 +127,18 @@ fn projected_state_rejects_foreign_geometry_roles_and_dtype_before_equations() {
             )),
         )],
     ] {
-        assert!(factory
-            .project_layer(0, &policy, 7, None, None, slots)
-            .is_err());
+        assert!(
+            factory
+                .project_layer(0, &policy, 7, None, None, slots)
+                .is_err()
+        );
     }
     let attention = LayerCachePolicy::key_value(AttentionPolicy::Full, 2, 8).unwrap();
     let wrong = existing(&[2, 2, 6, 8], WorkspaceDtype::Float32, Some(1000), &context);
-    assert!(factory
-        .project_layer(0, &attention, 7, Some(wrong.clone()), Some(wrong), [])
-        .is_err());
+    assert!(
+        factory
+            .project_layer(0, &attention, 7, Some(wrong.clone()), Some(wrong), [])
+            .is_err()
+    );
     assert!(context.report(&[]).unwrap().operations.is_empty());
 }

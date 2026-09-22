@@ -5,14 +5,26 @@ use eredu_runtime::{PreparedInputInspector, PreparedModelInput, SharedPreparedIn
 
 /// Exact admitted source, including independently optional image and audio parts.
 pub struct MediaPrefillPlan<T> {
-    prepared: PreparedModelInput<T>,
-    admitted: crate::media_plan::AdmittedCompositeInput<InklingInputPartPlan>,
+    prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
+    admitted: Option<crate::media_plan::AdmittedCompositeInput<InklingInputPartPlan>>,
+    original: Option<crate::media_plan::BoundPreparedMediaSemantics>,
+    workspace: Option<(
+        eredu_runtime::input::OriginalPreparedInputProjection,
+        eredu_runtime::input::OriginalPreparedWorkspaceSource,
+        Option<eredu_runtime::working_memory::WorkingMemoryUnquotedLease>,
+    )>,
     geometry: eredu_core::InferenceGeometry,
     fingerprint: String,
     identity: Option<SharedPreparedInputCacheIdentity>,
+    // All source and native/metadata payload owners retire before their funding.
+    _workspace_funding: (
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+    ),
+    metadata: Option<eredu_nn::workspace::WorkspaceContext>,
 }
 impl<T: Tensor> MediaPrefillPlan<T> {
-    /// Applies the ordinary family admission without changing its placeholders.
+    /// Applies unchanged Inkling admission, including independent optional roots.
     pub fn prepare(
         args: &ModelArgs,
         prepared: PreparedModelInput<T>,
@@ -22,22 +34,86 @@ impl<T: Tensor> MediaPrefillPlan<T> {
         geometry.validate().map_err(Error::backend)?;
         let admitted = crate::media_plan::admit_inkling_input(args, &prepared, inspector)
             .map_err(Error::backend)?;
+        Self::prepare_admitted(args, prepared, admitted, geometry)
+    }
+    pub fn prepare_admitted(
+        args: &ModelArgs,
+        prepared: PreparedModelInput<T>,
+        admitted: crate::media_plan::AdmittedCompositeInput<InklingInputPartPlan>,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self, Error> {
+        geometry.validate().map_err(Error::backend)?;
+        PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::backend)?;
         if admitted.decoder_shape() != [geometry.batch_size, geometry.input_positions]
             || geometry.batch_size != 1
         {
             return Err(Error::backend(
-                "Inkling retained input geometry differs from admission",
+                "Inkling retained source geometry differs from admission",
             ));
         }
         Ok(Self {
-            prepared,
-            admitted,
+            prepared: prepared.into(),
+            admitted: Some(admitted),
+            original: None,
+            workspace: None,
             geometry,
             fingerprint: args.architecture_fingerprint(),
             identity: None,
+            _workspace_funding: (None, None),
+            metadata: None,
         })
     }
-    /// Retains the existing exact whole-input cache identity.
+    fn input(&self) -> Result<PreparedCompositeInput<'_, T, InklingInputPartPlan>, String> {
+        self.input_with_diagnostic(str::to_owned)
+    }
+    fn input_with_diagnostic<E>(
+        &self,
+        diagnostic: impl FnOnce(&'static str) -> E,
+    ) -> Result<PreparedCompositeInput<'_, T, InklingInputPartPlan>, E> {
+        let input = match (&self.admitted, &self.original) {
+            (Some(admitted), None) => {
+                PreparedCompositeInput::new_with_diagnostic(&self.prepared, admitted, diagnostic)
+            }
+            (None, Some(original)) => PreparedCompositeInput::from_original_with_diagnostic(
+                &self.prepared,
+                original,
+                diagnostic,
+            ),
+            _ => unreachable!("closed Inkling semantic plan"),
+        }?;
+        Ok(input.with_metadata_loan(self.metadata.as_ref()))
+    }
+    fn from_original(
+        prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self, eredu_runtime::working_memory::OriginalCompositeSemanticStorageError> {
+        if !original.is_inkling()
+            || geometry.batch_size != 1
+            || geometry.cached_positions != 0
+            || geometry.input_positions != original.decoder_positions() as u64
+            || prepared.len() != original.records().len()
+            || geometry.validate_fixed().is_err()
+        {
+            return Err(
+                original.reject(crate::media_plan::MediaSemanticError::input(
+                    "compiled Inkling media source geometry mismatch",
+                )),
+            );
+        }
+        Ok(Self {
+            prepared,
+            admitted: None,
+            original: Some(original),
+            workspace: None,
+            geometry,
+            fingerprint: String::new(),
+            identity: None,
+            _workspace_funding: (None, None),
+            metadata: None,
+        })
+    }
+    /// Associates the existing original whole-input identity.
     pub fn with_shared_cache_identity(
         mut self,
         identity: SharedPreparedInputCacheIdentity,
@@ -81,33 +157,70 @@ where
     fn ingress_geometry(plan: &Self::IngressPlan) -> eredu_core::InferenceGeometry {
         plan.geometry
     }
+    fn ingress_session_binding(
+        plan: &Self::IngressPlan,
+    ) -> Option<&eredu_runtime::working_memory::MediaSessionBinding> {
+        plan.original.as_ref().map(|original| original.binding())
+    }
     fn ingress_cache_identity(
         plan: &Self::IngressPlan,
     ) -> Option<SharedPreparedInputCacheIdentity> {
         plan.identity.clone()
     }
-    fn ingress_execution_graph(&self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>)
-        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+    fn ingress_execution_graph(
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, Option<&eredu_nn::workspace::WorkspaceContext>, eredu_runtime::ArchitectureExecutionGraph<'_>)>()?;
-        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.execution_graph))
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            eredu_runtime::ArchitectureExecutionGraph<'_>,
+        )>()?;
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
+            &self.execution_graph,
+        ))
     }
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Error> {
+    fn validate_ingress_plan(
+        &self,
+        plan: &Self::IngressPlan,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(), Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, &Self::IngressPlan, Option<&eredu_nn::workspace::WorkspaceContext>,
-            PreparedCompositeInput<'_, B::Tensor, InklingInputPartPlan>, String)>()?;
+        metadata.controls::<(
+            &Self,
+            &Self::IngressPlan,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            PreparedCompositeInput<'_, B::Tensor, InklingInputPartPlan>,
+            String,
+        )>()?;
         let identity_metadata = crate::decoder::identity::Metadata::new(metadata_context);
-        let fingerprint = self.args.architecture_fingerprint_with_metadata(identity_metadata)?;
-        if fingerprint != plan.fingerprint {
-            return Err(metadata.error(format_args!("Inkling media source belongs to another architecture")));
+        if let Some(original) = &plan.original {
+            if !original.is_inkling() {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+        } else {
+            let fingerprint = self
+                .args
+                .architecture_fingerprint_with_metadata(identity_metadata)?;
+            if fingerprint != plan.fingerprint {
+                return Err(metadata.error(format_args!(
+                    "Inkling media source belongs to another architecture"
+                )));
+            }
         }
-        PreparedCompositeInput::new_with_diagnostic(&plan.prepared, &plan.admitted,
-            |message| metadata.error(format_args!("{message}")))?;
+        plan.input_with_diagnostic(|message| metadata.error(format_args!("{message}")))?;
         Ok(())
     }
-    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Error {
+    fn ingress_error(
+        error: MediaIngressError,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Error {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        if let Err(refusal) = metadata.controls::<(MediaIngressError, Option<&eredu_nn::workspace::WorkspaceContext>)>() {
+        if let Err(refusal) = metadata.controls::<(
+            MediaIngressError,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>() {
             return refusal;
         }
         metadata.source(error)
@@ -136,10 +249,12 @@ where
     }
     fn retain_ingress(
         &mut self,
-        _plan: &Self::IngressPlan,
+        plan: &Self::IngressPlan,
         forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Ingress, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(plan.metadata.as_ref());
+        metadata.controls::<(Self::Ingress, i32, usize)>()?;
         let pending = forward
             .pending_media
             .as_ref()
@@ -164,7 +279,13 @@ where
                 .filter(|((_, m), p)| **m == modality && p.is_none())
                 .try_fold(0i32, |n, ((t, _), _)| n.checked_add(t.dim(1)))
                 .ok_or_else(|| Error::backend("Inkling cut extent overflow"))?;
-            validate_component(label, value, count, self.args.text_config.hidden_size)?;
+            validate_component_with_metadata(
+                label,
+                value,
+                count,
+                self.args.text_config.hidden_size,
+                metadata,
+            )?;
         }
         // Keep padded/concatenated raw inputs in the old first-span context
         // until its completion. Later spans retain only semantic parts and the
@@ -197,14 +318,32 @@ where
     where
         B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
+        let metadata = crate::decoder::ModuleMetadata::destination(
+            plan.metadata
+                .as_ref()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(
+            LayeredForwardState<B::Tensor, Self::ForwardContext>,
+            Vec<B::Tensor>,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            bool,
+            bool,
+        )>()?;
         let start = i32::try_from(span.input.start).map_err(Error::backend)?;
         let end = i32::try_from(span.input.end).map_err(Error::backend)?;
         if end <= start || end as u64 > plan.geometry.input_positions {
             return Err(Error::backend("Inkling span exceeds original input"));
         }
-        let mut parts = Vec::new();
-        let mut vision = Vec::new();
-        let mut audio = Vec::new();
+        let mut parts = metadata.vector(ingress.pending.tokens.len())?;
+        let mut vision = metadata.vector(ingress.pending.tokens.len())?;
+        let mut audio = metadata.vector(ingress.pending.tokens.len())?;
         let mut position = 0i32;
         let mut vision_position = 0i32;
         let mut audio_position = 0i32;
@@ -284,8 +423,14 @@ where
         };
         let vision = join(vision)?;
         let audio = join(audio)?;
-        let hidden = self.assemble(&parts, vision.as_ref(), audio.as_ref(), context)?;
-        let tokens = ordered_tokens(&parts, context)?;
+        let hidden = self.assemble_with_metadata(
+            &parts,
+            vision.as_ref(),
+            audio.as_ref(),
+            context,
+            metadata,
+        )?;
+        let tokens = ordered_tokens_with_metadata(&parts, context, metadata)?;
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
@@ -324,6 +469,19 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
     {
+        let metadata = crate::decoder::ModuleMetadata::destination(
+            plan.metadata
+                .as_ref()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            PreparedInput<B::Tensor>,
+            B::Tensor,
+            Option<B::Tensor>,
+            i32,
+            bool,
+        )>()?;
         if !self.accepts_execution_state(state.layout())? {
             return Err(Error::backend("Inkling source state layout mismatch"));
         }
@@ -337,7 +495,7 @@ where
             return Err(Error::backend("Inkling source cached position mismatch"));
         }
         let pending = prepare_input(
-            PreparedCompositeInput::new(&plan.prepared, &plan.admitted).map_err(Error::backend)?,
+            plan.input_with_diagnostic(|cause| metadata.error(format_args!("{cause}")))?,
             context,
         )?;
         let tokens = B::Tensor::concatenate(&pending.tokens, 1, context)?;
@@ -380,10 +538,94 @@ where
     ) -> Result<Self::IngressPlan, Error> {
         MediaPrefillPlan::prepare(admission, input, inspector, geometry)
     }
+    fn prepare_ingress_plan_admitted(
+        admission: &Self::AdmissionConfig,
+        input: PreparedModelInput<B::Tensor>,
+        admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        _inspector: &impl PreparedInputInspector<B::Tensor>,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self::IngressPlan, Error> {
+        MediaPrefillPlan::prepare_admitted(admission, input, admitted, geometry)
+    }
+    fn bind_original_media_semantics(
+        admission: &Self::AdmissionConfig,
+        original: crate::media_plan::OriginalPreparedMediaSemantics<'_>,
+        blueprint: &crate::prepared_execution::PreparedInferenceBlueprint,
+        source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
+        binding: eredu_runtime::working_memory::MediaSessionBinding,
+    ) -> Result<
+        crate::media_plan::BoundPreparedMediaSemantics,
+        eredu_runtime::working_memory::OriginalCompositeSemanticStorageError,
+    > {
+        original.bind_inkling(admission, blueprint, source, binding)
+    }
+    fn prepare_bound_original_ingress_plan(
+        input: crate::processor_execution::OriginalHostLowering<B::Tensor>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<
+        Self::IngressPlan,
+        eredu_runtime::working_memory::OriginalCompositeSemanticStorageError,
+    > {
+        if !input.source().same_source(original.source()) {
+            return Err(
+                original.reject(crate::media_plan::MediaSemanticError::input(
+                    "lowered source differs from compiled source",
+                )),
+            );
+        }
+        MediaPrefillPlan::from_original(input.into_prepared(), original, geometry)
+    }
+    fn prepare_bound_original_ingress_plan_with_metadata(
+        input: crate::processor_execution::OriginalHostLowering<B::Tensor>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        geometry: eredu_core::InferenceGeometry,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self::IngressPlan, Error> {
+        let mut plan = <Self as crate::composite_execution::CompositeMediaIngressArchitecture<
+            B,
+            S,
+        >>::prepare_bound_original_ingress_plan(input, original, geometry)
+        .map_err(|cause| context.metadata_source(cause))?;
+        plan.metadata = Some(context.clone());
+        Ok(plan)
+    }
+    fn prepare_original_workspace_ingress_plan(
+        input: crate::prepared_execution::OriginalMediaWorkspaceInput,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self::IngressPlan, Self::Error>
+    where
+        B: eredu_nn::NeuralBackend<Tensor = eredu_nn::workspace::WorkspaceTensor>,
+    {
+        let (mut plan, workspace, funding) = input
+            .construct_source_plan(None, |prepared, original| {
+                MediaPrefillPlan::from_original(prepared, original, geometry)
+            })?;
+        plan.workspace = Some(workspace);
+        plan._workspace_funding = funding;
+        Ok(plan)
+    }
+    fn prepare_original_workspace_ingress_plan_with_metadata(
+        input: crate::prepared_execution::OriginalMediaWorkspaceInput,
+        geometry: eredu_core::InferenceGeometry,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self::IngressPlan, Self::Error>
+    where
+        B: eredu_nn::NeuralBackend<Tensor = eredu_nn::workspace::WorkspaceTensor>,
+    {
+        let (mut plan, workspace, funding) = input
+            .construct_source_plan(Some(context), |prepared, original| {
+                MediaPrefillPlan::from_original(prepared, original, geometry)
+            })?;
+        plan.workspace = Some(workspace);
+        plan._workspace_funding = funding;
+        plan.metadata = Some(context.clone());
+        Ok(plan)
+    }
     fn prepared_ingress_input(
         plan: &Self::IngressPlan,
     ) -> PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan> {
-        PreparedCompositeInput::new(&plan.prepared, &plan.admitted).expect("retained admission")
+        plan.input().expect("retained Inkling admission")
     }
     fn media_group_collective_waves(
         &self,
@@ -395,34 +637,89 @@ where
     {
         <Self as CompositeArchitecture<B,S>>::prepared_group_collective_waves(self,group,<Self as crate::composite_execution::CompositeMediaIngressArchitecture<B,S>>::prepared_ingress_input(plan),tensor_partitions,pipeline_stages,None).map_err(|error|error.to_string())
     }
+    fn media_group_collective_waves_with_metadata(
+        &self,
+        plan: &Self::IngressPlan,
+        group: usize,
+        tensor_partitions: usize,
+        pipeline_stages: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, Error>
+    {
+        <Self as CompositeArchitecture<B, S>>::prepared_group_collective_waves(
+            self,
+            group,
+            plan.input_with_diagnostic(|cause| context.metadata_error(format_args!("{cause}")))?,
+            tensor_partitions,
+            pipeline_stages,
+            Some(context),
+        )
+    }
     fn media_primary_ingress_collectives(
         &self,
         plan: &Self::IngressPlan,
         span: &eredu_runtime::prefill::PrefillChunk,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
-        let mut offset = 0u64;
-        let mut positions = Vec::new();
-        for part in plan.admitted.parts() {
-            let (length, text) = match part {
-                InklingInputPartPlan::TextTokens { positions } => (*positions, true),
-                InklingInputPartPlan::Projected { positions, .. } => (*positions, false),
-                InklingInputPartPlan::Media { ingress, .. } => (ingress.placeholder_count, false),
-            };
-            let end = offset
-                .checked_add(length)
-                .ok_or("Inkling collective extent overflow")?;
-            let start = offset.max(span.input.start);
-            let stop = end.min(span.input.end);
-            if text && start < stop {
-                positions.push(stop - start);
-            }
-            offset = end;
-        }
-        crate::composite_execution::segmented_token_ingress_collectives(
-            positions,
+        media_ingress_waves(
+            plan,
+            span,
             self.args.text_config.hidden_size,
             tensor_partitions,
+            crate::composite_execution::graph::Destination(None),
+        )
+        .map_err(|cause| cause.to_string())
+    }
+    fn media_primary_ingress_collectives_with_metadata(
+        &self,
+        plan: &Self::IngressPlan,
+        span: &eredu_runtime::prefill::PrefillChunk,
+        tensor_partitions: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
+        media_ingress_waves(
+            plan,
+            span,
+            self.args.text_config.hidden_size,
+            tensor_partitions,
+            crate::composite_execution::graph::Destination(Some(context)),
         )
     }
+}
+fn media_ingress_waves<T: Tensor>(
+    plan: &MediaPrefillPlan<T>,
+    span: &eredu_runtime::prefill::PrefillChunk,
+    hidden: i32,
+    tensor_partitions: usize,
+    destination: crate::composite_execution::graph::Destination<'_>,
+) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
+    destination.controls::<(Vec<u64>, u64, u64, u64, u64, bool, InklingInputPartPlan)>()?;
+    let mut offset = 0u64;
+    let mut positions = destination.vector(plan.prepared.len())?;
+    for part in plan
+        .input_with_diagnostic(|cause| destination.error(format_args!("{cause}")))?
+        .admitted()
+        .inkling_parts()
+    {
+        let (length, text) = match part {
+            InklingInputPartPlan::TextTokens { positions } => (positions, true),
+            InklingInputPartPlan::Projected { positions, .. } => (positions, false),
+            InklingInputPartPlan::Media { ingress, .. } => (ingress.placeholder_count, false),
+        };
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| destination.error(format_args!("Inkling collective extent overflow")))?;
+        let start = offset.max(span.input.start);
+        let stop = end.min(span.input.end);
+        if text && start < stop {
+            positions.push(stop - start);
+        }
+        offset = end;
+    }
+    crate::composite_execution::segmented_token_ingress_collectives_in(
+        positions,
+        hidden,
+        tensor_partitions,
+        destination,
+    )
 }

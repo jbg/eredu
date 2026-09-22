@@ -75,6 +75,24 @@ pub struct PartitionCaptureEvidence {
     pub contributions: Vec<PartitionCaptureContributionRecord>,
 }
 
+/// Exact physical interval of an independently admitted logical invocation.
+/// The descriptor is serialized into receipt identity; equal widths at different
+/// logical starts are distinct sources. It carries no capture or native authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionCaptureInvocationWindow {
+    /// Actual native tensor axes in this frame.
+    pub physical: super::CaptureInvocationShape,
+    /// Exact interval in the original logical invocation.
+    pub window: super::CaptureInvocationWindow,
+}
+impl PartitionCaptureInvocationWindow {
+    /// Revalidate the same interval equation used by the ordinary window worker.
+    pub fn logical(self) -> Result<super::CaptureInvocationShape, CaptureError> {
+        self.window.validate(self.physical)
+    }
+}
+
 /// Exact shared execution context attached to a partition capture receipt.
 /// The enclosing session establishes these identities from retained admission;
 /// accepting caller-provided strings alone does not authenticate a session.
@@ -99,17 +117,50 @@ pub struct PartitionCaptureContext {
     pub prediction: u64,
     /// Monotone forward submission epoch; restore must not reuse it.
     pub forward_epoch: u64,
-    /// Independently admitted physical axes, distinct from prediction coordinates.
+    /// Independently admitted logical axes, distinct from prediction coordinates.
     /// Absent only for ordinary request-shaped capture authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation: Option<super::CaptureInvocationShape>,
+    /// Physical interval within `invocation`; the latter retains logical axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_window: Option<PartitionCaptureInvocationWindow>,
 }
 
 impl PartitionCaptureContext {
+    /// Exact native axes represented by this receipt, before applying its selection.
+    pub fn physical_invocation(&self) -> Option<super::CaptureInvocationShape> {
+        self.invocation_window
+            .map(|source| source.physical)
+            .or(self.invocation)
+    }
+    /// Compare the original scheduled frame, including a shifted logical origin.
+    /// Equal extents alone never authenticate a windowed source.
+    pub fn matches_invocation(
+        &self,
+        physical: Option<super::CaptureInvocationShape>,
+        window: Option<super::CaptureInvocationWindow>,
+    ) -> bool {
+        match self.invocation_window {
+            Some(source) => {
+                physical == Some(source.physical)
+                    && window == Some(source.window)
+                    && source.logical().ok() == self.invocation
+            }
+            None => physical == self.invocation && window.is_none(),
+        }
+    }
+
     /// Bounds identity storage and rejects absent required identities.
     pub fn validate(&self) -> Result<(), CaptureError> {
         if let Some(shape) = self.invocation {
             shape.validate()?;
+        }
+        if let Some(window) = self.invocation_window {
+            if self.invocation != Some(window.logical()?) {
+                return Err(CaptureError::Invalid(
+                    "partition receipt window differs from logical axes".into(),
+                ));
+            }
         }
         for identity in [
             &self.artifact_identity,
@@ -202,7 +253,8 @@ impl Serialize for PartitionCaptureFragmentRecord {
         BorrowedPartitionCaptureFragmentRecord {
             fragment_index: self.fragment_index,
             record: &self.record,
-        }.serialize(serializer)
+        }
+        .serialize(serializer)
     }
 }
 impl Serialize for PartitionCaptureProducerRecord {
@@ -215,6 +267,7 @@ impl Serialize for PartitionCaptureProducerRecord {
             producer_rank: self.producer_rank,
             source_dtype: self.source_dtype.as_ref(),
             fragments: &self.fragments,
-        }.serialize(serializer)
+        }
+        .serialize(serializer)
     }
 }

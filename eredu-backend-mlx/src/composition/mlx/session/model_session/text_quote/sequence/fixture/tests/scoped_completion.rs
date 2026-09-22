@@ -1,8 +1,13 @@
 //! Actual native carrier contribution participates in the unchanged original Q.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 
 #[test]
 fn c2_native_carrier_exact_and_one_short_precede_chunk_source_for_each_driver() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     let carrier = safemlx::PreparedPrefillFailure::<
         eredu_runtime::working_memory::OriginalPrefillRootCustody,
@@ -13,10 +18,10 @@ fn c2_native_carrier_exact_and_one_short_precede_chunk_source_for_each_driver() 
     for driver in 0..3 {
         let mut required = None;
         for pass in 0..3 {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::tests::support::test_utils::initialize_original_sources();
             let (mut runtime, _artifact) = load(&stream, &pool, 0);
             let probe = Probe::new(&runtime, None, false);
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.fixture_host_charge().unwrap();
             let input_attempts = paths::session_input_creation_attempts();
             let native = paths::snapshot();
             let capacity = required.map_or(u64::MAX, |n| baseline + n - u64::from(pass == 1));
@@ -61,13 +66,15 @@ fn c2_native_carrier_exact_and_one_short_precede_chunk_source_for_each_driver() 
                 let error = result.unwrap_err();
                 assert!(matches!(
                     cause::<WorkingMemoryError>(&error),
-                    WorkingMemoryError::BudgetExceeded { .. }
+                    WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    )
                 ));
                 assert!(probe.0.admitted.borrow().is_none());
                 assert_eq!(probe.0.calls.get(), 0);
                 assert_eq!(paths::session_input_creation_attempts(), input_attempts);
                 assert_eq!(paths::snapshot(), native);
-                assert_eq!(pool.used_bytes().unwrap(), baseline);
+                assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
             } else {
                 result.unwrap();
                 assert!(callback_called);

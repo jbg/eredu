@@ -2,6 +2,7 @@ use super::super::plain::{
     start_original_plain_string_with_options_for, OriginalPlainSession, OriginalPlainStartError,
 };
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use std::io::Write as _;
 
 /// Test shorthand preserving the fixture's concrete consumer error transport.
@@ -60,7 +61,7 @@ fn original_string_file_c_e_i_r_and_terminal_text_share_ordinary_and_manual_driv
         let source = source(&runtime, true);
         let cold = source.original_bytes();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.live_charge_bytes().unwrap(),
             cold,
             "consumed tokenizer-file I has retired"
         );
@@ -133,7 +134,7 @@ fn original_string_file_c_e_i_r_and_terminal_text_share_ordinary_and_manual_driv
             assert_eq!(facts.borrow().order[5], "delivery");
             let held = facts.borrow().held;
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.live_charge_bytes().unwrap(),
                 cold + previous_held + held,
                 "E and S have retired; results retain only original R"
             );
@@ -148,14 +149,14 @@ fn original_string_file_c_e_i_r_and_terminal_text_share_ordinary_and_manual_driv
         let address = text.as_str().as_ptr();
         let mut ids = output.token_ids.clone().into_iter();
         drop((output, source, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), previous_held);
+        assert_eq!(pool.live_charge_bytes().unwrap(), previous_held);
         assert_eq!(text.as_str(), "h hih");
         assert_eq!(text.as_str().as_ptr(), address);
         assert_eq!(ids.next(), Some(0));
         drop(text);
-        assert_eq!(pool.used_bytes().unwrap(), previous_held);
+        assert_eq!(pool.live_charge_bytes().unwrap(), previous_held);
         drop(ids);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -197,7 +198,7 @@ fn original_string_preflight_cancellation_foreign_source_and_short_admission_pre
         (foreign_facts.borrow().encodes, foreign_facts.borrow().stops),
         (0, 0)
     );
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.live_charge_bytes().unwrap(), 0);
     let decoder_only = pool
         .compile_tokenizer(
             eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(JSON.as_bytes()).unwrap(),
@@ -236,7 +237,7 @@ fn original_string_preflight_cancellation_foreign_source_and_short_admission_pre
     drop(failed);
     assert_eq!((facts.borrow().encodes, facts.borrow().stops), (1, 1));
     assert_eq!(facts.borrow().order, ["admit"]);
-    assert_eq!(pool.used_bytes().unwrap(), cold);
+    assert_eq!(pool.live_charge_bytes().unwrap(), cold);
     facts.borrow_mut().short = false;
     let session = start_original_plain_string(
         &mut runtime,
@@ -258,7 +259,7 @@ fn original_string_preflight_cancellation_foreign_source_and_short_admission_pre
     assert!(output.token_ids.is_empty());
     assert!(!facts.borrow().order.contains(&"submit"));
     drop((output, source, runtime, foreign));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 #[test]
 fn generation_c_domain_matches_fresh_hf_for_declared_ids_duplicates_overlap_and_sparse_ids() {
@@ -293,7 +294,7 @@ fn generation_c_domain_matches_fresh_hf_for_declared_ids_duplicates_overlap_and_
         assert!(vocab.values().all(|id| (*id as usize) < domain.len()));
         assert_eq!(source.token_id("new"), ordinary.token_to_id("new"));
         drop((source, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -432,7 +433,7 @@ fn actual_core_iterator_authenticates_original_domain_after_callbacks_before_sub
         assert!(!facts.borrow().order.contains(&"submit"));
         drop(generator);
         drop((input, stops, source, foreign, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -479,7 +480,7 @@ fn foreign_c_header_rejects_before_take_and_real_header_remains_usable() {
     assert!(!facts.borrow().order.contains(&"submit"));
     drop(generator);
     drop((header, stops, a, b, runtime));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -512,12 +513,12 @@ fn source_phase_cancellation_and_eos_mismatch_precede_original_input_and_submiss
         assert_eq!(facts.borrow().encodes, usize::from(phase == 2));
         assert!(facts.borrow().order.is_empty());
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.live_charge_bytes().unwrap(),
             cold,
             "actual S/E retire on phase cancellation"
         );
         drop((source, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
     let (mut runtime, facts, pool) = bare_runtime();
     let source = source(&runtime, false);
@@ -573,7 +574,7 @@ fn source_phase_cancellation_and_eos_mismatch_precede_original_input_and_submiss
         (0, 0, 0)
     );
     drop((source, runtime));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -608,7 +609,7 @@ fn ten_released_files_use_private_original_string_startup_and_retained_terminal_
         )
         .unwrap();
         let c = source.original_bytes();
-        assert_eq!(pool.used_bytes().unwrap(), c);
+        assert_eq!(pool.live_charge_bytes().unwrap(), c);
         let domain = source.generation_domain().unwrap().allowed_mask().unwrap();
         for (id, &actual) in domain.iter().enumerate() {
             let expected = ordinary
@@ -680,12 +681,12 @@ fn ten_released_files_use_private_original_string_startup_and_retained_terminal_
                     assert_eq!(output.text.as_str(), chunks);
                     assert!(!chunks.is_empty());
                     let held = facts.borrow().held;
-                    assert_eq!(pool.used_bytes().unwrap(), c + held);
+                    assert_eq!(pool.live_charge_bytes().unwrap(), c + held);
                     let retained = output.text.clone();
                     drop(output);
-                    assert_eq!(pool.used_bytes().unwrap(), c + held);
+                    assert_eq!(pool.live_charge_bytes().unwrap(), c + held);
                     drop(retained);
-                    assert_eq!(pool.used_bytes().unwrap(), c);
+                    assert_eq!(pool.live_charge_bytes().unwrap(), c);
                     returns.push((manual, add_special, skip_special));
                 }
             }
@@ -714,10 +715,10 @@ fn ten_released_files_use_private_original_string_startup_and_retained_terminal_
         };
         let held = facts.borrow().held;
         drop((source, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.live_charge_bytes().unwrap(), held);
         assert_eq!(final_text.as_str(), "a");
         drop(final_text);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         rows.push(serde_json::json!({"label":artifact.label,"sha256":sha,"domain_positions":domain_positions,"c":c,"ordinary_manual_special_skip_cases":returns.len(),"stop_override":true}));
     }
     println!(
@@ -731,28 +732,31 @@ fn original_text_source_rejections_stay_by_value_before_their_actual_allowance()
     let (runtime, _, pool) = bare_runtime_with_capacity(u64::MAX);
     let sample = source(&runtime, false);
     let c = sample.original_bytes();
-    let s = WorkingMemoryPool::stop_source_required_bytes(
+    let s = MemoryLedger::stop_source_required_bytes(
         &eredu_text::stop_storage::StopCompilePlan::prepare_refs(&["halt"]).unwrap(),
     )
     .unwrap();
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&sample, "hi", true).unwrap();
+    let e = MemoryLedger::tokenizer_encode_required_bytes(&sample, "hi", true).unwrap();
     drop((sample, runtime));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     let mut file = tempfile::tempfile().unwrap();
     std::io::Write::write_all(&mut file, JSON.as_bytes()).unwrap();
     let read = eredu_checkpoint::artifact::PreparedArtifactFileRead::new(file).unwrap();
-    let i = WorkingMemoryPool::tokenizer_file_required_bytes(&read).unwrap();
+    let i = MemoryLedger::tokenizer_file_required_bytes(&read).unwrap();
     let (runtime, facts, pool) = bare_runtime_with_capacity(i - 1);
-    let error =
-        Backend::compile_original_tokenizer_source_for_generation(&runtime, eredu_runtime::working_memory::OriginalTokenizerInput::File(read)).unwrap_err();
+    let error = Backend::compile_original_tokenizer_source_for_generation(
+        &runtime,
+        eredu_runtime::working_memory::OriginalTokenizerInput::File(read),
+    )
+    .unwrap_err();
     let OriginalTokenizerSourceError::Input(cause) = &error else {
         panic!("actual file admission cause")
     };
     assert_eq!(cause.input_bytes(), 0);
     assert!(
-        matches!(cause.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == i && *available_bytes == i - 1)
+        matches!(cause.accounting_failure(), Some(WorkingMemoryError::Domain(MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == i && limit_bytes.checked_sub(*existing_bytes) == Some(i - 1))
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     assert!(facts.borrow().order.is_empty());
     drop((runtime, error));
     for (capacity, phase) in [(c + s - 1, 0), (c + s + e - 1, 1)] {
@@ -777,7 +781,7 @@ fn original_text_source_rejections_stay_by_value_before_their_actual_allowance()
             OriginalPlainStartError::Source(OriginalTextSourceError::Stop(error)) if phase == 0 => {
                 assert_eq!(error.retained_bytes(), 0);
                 assert!(
-                    matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes==s && *available_bytes==s-1)
+                    matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==s && limit_bytes.checked_sub(*existing_bytes)==Some(s-1))
                 );
             }
             OriginalPlainStartError::Source(OriginalTextSourceError::Encode(error))
@@ -785,7 +789,7 @@ fn original_text_source_rejections_stay_by_value_before_their_actual_allowance()
             {
                 assert_eq!(error.retained_bytes(), 0);
                 assert!(
-                    matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes==e && *available_bytes==e-1)
+                    matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==e && limit_bytes.checked_sub(*existing_bytes)==Some(e-1))
                 );
             }
             _ => panic!("wrong actual source cause: {error:?}"),
@@ -793,9 +797,9 @@ fn original_text_source_rejections_stay_by_value_before_their_actual_allowance()
         assert_eq!(facts.borrow().stops, 1);
         assert_eq!(facts.borrow().encodes, 0);
         assert!(facts.borrow().order.is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), c);
+        assert_eq!(pool.live_charge_bytes().unwrap(), c);
         drop((source, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         drop(error); // unadmitted closed causes own no payload/allowance
     }
 }
@@ -824,7 +828,7 @@ fn public_managed_plain_entry_authenticates_source_and_shares_controlled_output(
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(JSON.as_bytes()).unwrap();
         let source = model.compile_managed_plain_text_source(file).unwrap();
-        let source_bytes = pool.used_bytes().unwrap();
+        let source_bytes = pool.live_charge_bytes().unwrap();
         // Same vocabulary and pipeline, different BPE merge policy: reject and refund C.
         let mut changed = tempfile::tempfile().unwrap();
         changed
@@ -841,21 +845,27 @@ fn public_managed_plain_entry_authenticates_source_and_shares_controlled_output(
             Some(TokenInputRejection::IdentityMismatch)
         );
         drop(rejected);
-        assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+        assert_eq!(pool.live_charge_bytes().unwrap(), source_bytes);
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(3),
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(STRING_FIXTURE_CAPACITY),
+                memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(STRING_FIXTURE_CAPACITY),
+                )]),
                 ..Default::default()
             },
             ..Default::default()
         };
         let request = ManagedPlainTextRequest::new("hi hi<S>", settings);
-        let mut short = request;
-        short.settings.inference.managed_memory_capacity_bytes = Some(1);
+        let mut short = request.clone();
+        short.settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(1),
+        )]);
         let short_error = match model.start_managed_plain_text(
             &source,
             short,
@@ -866,16 +876,15 @@ fn public_managed_plain_entry_authenticates_source_and_shares_controlled_output(
         };
         assert_eq!(facts.borrow().encodes, 0);
         assert_eq!(facts.borrow().stops, 0);
-        assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+        assert_eq!(pool.live_charge_bytes().unwrap(), source_bytes);
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&short_error);
         let mut classified = false;
         while let Some(error) = cause {
             classified |= matches!(
                 error.downcast_ref::<WorkingMemoryError>(),
-                Some(WorkingMemoryError::CapacityBelowUsage {
-                    capacity_bytes: 1,
-                    ..
-                })
+                Some(WorkingMemoryError::Domain(
+                    MemoryDomainError::BudgetExceeded { .. }
+                ))
             );
             cause = error.source();
         }
@@ -884,7 +893,7 @@ fn public_managed_plain_entry_authenticates_source_and_shares_controlled_output(
         let cancelled = GenerationCancellationToken::new();
         cancelled.cancel();
         assert!(model
-            .start_managed_plain_text(&source, request, &cancelled)
+            .start_managed_plain_text(&source, request.clone(), &cancelled)
             .unwrap()
             .is_none());
         assert_eq!(facts.borrow().encodes, 0);
@@ -935,51 +944,86 @@ fn public_managed_plain_entry_authenticates_source_and_shares_controlled_output(
         let ptr = output.text.as_str().as_ptr();
         drop((source, model));
         assert_eq!(output.text.as_str().as_ptr(), ptr);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         drop(output);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn original_plain_readiness_source_is_explicit_through_shared_startup_and_advancement() {
-    let mut runs=Vec::new();
-    for manual in [false,true] {
-        let (mut runtime,facts,_pool)=bare_runtime_with_capacity(STRING_FIXTURE_CAPACITY);
-        facts.borrow_mut().shared_admission_capacity=Some(STRING_FIXTURE_CAPACITY);
-        facts.borrow_mut().preparation_control_enabled=true;
-        let tokenizer=source(&runtime,true);
-        let cancellation=GenerationCancellationToken::new();
-        let mut session=start_original_plain_string(&mut runtime,&tokenizer,"hi hi<S>",config(),
-            &[],&[],true,true,&cancellation).unwrap().unwrap();
-        assert_eq!(facts.borrow().preparation_control_calls,
-            [(Stage::Admission,Status::Ready),(Stage::Prompt,Status::Ready),(Stage::Sampling,Status::Ready)]);
-        assert_eq!(facts.borrow().preparation_control_drops,0);
-        let output=if manual {
+    let mut runs = Vec::new();
+    for manual in [false, true] {
+        let (mut runtime, facts, _pool) = bare_runtime_with_capacity(STRING_FIXTURE_CAPACITY);
+        facts.borrow_mut().shared_admission_capacity = Some(STRING_FIXTURE_CAPACITY);
+        facts.borrow_mut().preparation_control_enabled = true;
+        let tokenizer = source(&runtime, true);
+        let cancellation = GenerationCancellationToken::new();
+        let mut session = start_original_plain_string(
+            &mut runtime,
+            &tokenizer,
+            "hi hi<S>",
+            config(),
+            &[],
+            &[],
+            true,
+            true,
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            facts.borrow().preparation_control_calls,
+            [
+                (Stage::Admission, Status::Ready),
+                (Stage::Prompt, Status::Ready),
+                (Stage::Sampling, Status::Ready)
+            ]
+        );
+        assert_eq!(facts.borrow().preparation_control_drops, 0);
+        let output = if manual {
             while session.finish_reason().is_none() {
-                session=session.advance(&cancellation,&mut |_|{}).unwrap();
+                session = session.advance(&cancellation, &mut |_| {}).unwrap();
             }
-            session.into_output().unwrap_or_else(|_|panic!("terminal"))
-        } else {session.run(&cancellation,&mut |_|{}).unwrap()};
-        assert_eq!(facts.borrow().preparation_control_drops,1);
-        let calls=facts.borrow().preparation_control_calls.clone();
-        assert!(calls.iter().any(|(stage,_)|*stage==Stage::Prediction));
-        assert!(calls.iter().any(|(stage,_)|*stage==Stage::Decision));
-        assert!(calls.iter().any(|(stage,_)|*stage==Stage::Commitment));
-        assert!(calls.iter().any(|(stage,_)|*stage==Stage::Delivery));
-        runs.push((output.token_ids.as_slice().to_vec(),output.text.as_str().to_owned(),calls));
+            session.into_output().unwrap_or_else(|_| panic!("terminal"))
+        } else {
+            session.run(&cancellation, &mut |_| {}).unwrap()
+        };
+        assert_eq!(facts.borrow().preparation_control_drops, 1);
+        let calls = facts.borrow().preparation_control_calls.clone();
+        assert!(calls.iter().any(|(stage, _)| *stage == Stage::Prediction));
+        assert!(calls.iter().any(|(stage, _)| *stage == Stage::Decision));
+        assert!(calls.iter().any(|(stage, _)| *stage == Stage::Commitment));
+        assert!(calls.iter().any(|(stage, _)| *stage == Stage::Delivery));
+        runs.push((
+            output.token_ids.as_slice().to_vec(),
+            output.text.as_str().to_owned(),
+            calls,
+        ));
     }
-    assert_eq!(runs[0],runs[1]);
-    let (mut runtime,facts,_pool)=bare_runtime_with_capacity(STRING_FIXTURE_CAPACITY);
-    facts.borrow_mut().shared_admission_capacity=Some(STRING_FIXTURE_CAPACITY);
-    facts.borrow_mut().preparation_control_failed=true;
-    let tokenizer=source(&runtime,true);
-    let result=start_original_plain_string(&mut runtime,&tokenizer,"hi",config(),&[],&[],true,true,
-        &GenerationCancellationToken::new());
+    assert_eq!(runs[0], runs[1]);
+    let (mut runtime, facts, _pool) = bare_runtime_with_capacity(STRING_FIXTURE_CAPACITY);
+    facts.borrow_mut().shared_admission_capacity = Some(STRING_FIXTURE_CAPACITY);
+    facts.borrow_mut().preparation_control_failed = true;
+    let tokenizer = source(&runtime, true);
+    let result = start_original_plain_string(
+        &mut runtime,
+        &tokenizer,
+        "hi",
+        config(),
+        &[],
+        &[],
+        true,
+        true,
+        &GenerationCancellationToken::new(),
+    );
     assert!(result.is_err());
-    assert!(facts.borrow().order.is_empty(),"failed source cannot enter model admission or ordinary consensus");
+    assert!(
+        facts.borrow().order.is_empty(),
+        "failed source cannot enter model admission or ordinary consensus"
+    );
     assert!(facts.borrow().preparation_control_calls.is_empty());
-    assert_eq!(facts.borrow().total_agreements,0);
+    assert_eq!(facts.borrow().total_agreements, 0);
 }
 
 #[test]
@@ -988,16 +1032,28 @@ fn peer_startup_refusal_uses_the_source_authenticated_plain_driver() {
         let (mut runtime, facts, pool) = bare_runtime_with_capacity(STRING_FIXTURE_CAPACITY);
         facts.borrow_mut().shared_admission_capacity = Some(STRING_FIXTURE_CAPACITY);
         let tokenizer = source(&runtime, true);
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.live_charge_bytes().unwrap();
         facts.borrow_mut().reject = Some(stage);
-        let failure = start_original_plain_string(&mut runtime, &tokenizer, "hi hi<S>",
-            config(), &[], &[], true, true, &GenerationCancellationToken::new());
+        let failure = start_original_plain_string(
+            &mut runtime,
+            &tokenizer,
+            "hi hi<S>",
+            config(),
+            &[],
+            &[],
+            true,
+            true,
+            &GenerationCancellationToken::new(),
+        );
         assert!(failure.is_err());
         assert!(!facts.borrow().order.contains(&"submit"));
-        assert_eq!(facts.borrow().ids.len(), if stage == Stage::Admission { 0 } else { 3 });
+        assert_eq!(
+            facts.borrow().ids.len(),
+            if stage == Stage::Admission { 0 } else { 3 }
+        );
         drop(failure);
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.live_charge_bytes().unwrap(), baseline);
         drop((tokenizer, runtime));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

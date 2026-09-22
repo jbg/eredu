@@ -1,3 +1,5 @@
+#[path = "support/memory.rs"]
+mod memory;
 use eredu_core::{
     cache::LayerCachePolicy, Admission, AdmissionRequest, AdmissionResult, AttentionPolicy,
     CacheStateStrategy, Completion, EstimationCompleteness, ExecutionWorkspaceEstimate,
@@ -6,6 +8,7 @@ use eredu_core::{
     SessionAuthority, StateMemoryLayout, Submission, WorkspaceBound,
 };
 use eredu_runtime::{prefill::*, working_memory::*};
+use memory::{FundingFixture, LedgerFixture, StorageFixture};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -42,9 +45,8 @@ fn request(g: InferenceGeometry) -> AdmissionRequest {
         input: InputTokenCount::text(g.cached_positions + g.input_positions),
         max_output_tokens: g.max_output_tokens,
         batch_size: g.batch_size,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: eredu_core::MemoryHeadroomDeclarations::default(),
+        memory_limits: eredu_core::MemoryLimitDeclarations::default(),
     }
 }
 
@@ -69,24 +71,39 @@ fn quote(g: InferenceGeometry) -> Result<RuntimeStateEstimate, eredu_core::Capab
         std::num::NonZeroU8::new(4).unwrap(),
     )?;
     let bound = |n| WorkspaceBound::bounded(n, "neutral fixture storage bound");
-    state.with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry: g,
-        activations: bound(g.prefill_chunk_positions * 32),
-        attention: bound(0),
-        vocabulary: bound(g.output.positions(g.prefill_chunk_positions) * 16),
-        state_update: bound(80),
-        materialization: bound(0),
-        retained: bound(32),
-    })
+    state
+        .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry: g,
+            activations: bound(g.prefill_chunk_positions * 32),
+            attention: bound(0),
+            vocabulary: bound(g.output.positions(g.prefill_chunk_positions) * 16),
+            state_update: bound(80),
+            materialization: bound(0),
+            retained: bound(32),
+        })
+        .map(memory::state)
 }
 
 fn admission(g: InferenceGeometry) -> Admission {
-    match eredu_core::apply_admission_policy(&capabilities(), request(g), quote(g).unwrap(), None)
-        .unwrap()
+    match eredu_core::apply_admission_policy(
+        &capabilities(),
+        request(g),
+        memory::state(quote(g).unwrap()),
+    )
+    .unwrap()
     {
         AdmissionResult::Admitted(admitted) => admitted,
         other => panic!("{other:?}"),
     }
+}
+
+fn unlimited_request(
+    execution: &InferenceExecutionIdentity,
+    g: InferenceGeometry,
+) -> Result<InferenceRequest, WorkingMemoryError> {
+    let pool = memory::unlimited_ledger(0);
+    Ok(pool.reserve(execution, &admission(g))?.into())
 }
 
 struct NativeCompletion {
@@ -188,7 +205,7 @@ impl PrefillExecutor for RecurrentExecutor {
 
 fn run(chunk: u64, output: OutputDemand, controlled: bool) -> (RecurrentExecutor, Vec<f64>) {
     let g = geometry(chunk, output);
-    let pool = WorkingMemoryPool::new(10000, 100).unwrap();
+    let pool = memory::host_ledger(10000, 100).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let reserve = pool.reserve(&execution, &admission(g)).unwrap();
     let mut driver =
@@ -216,7 +233,7 @@ fn run(chunk: u64, output: OutputDemand, controlled: bool) -> (RecurrentExecutor
         );
     }
     drop(driver);
-    assert_eq!(pool.used_bytes().unwrap(), 100);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 100);
     (executor, scores)
 }
 
@@ -259,13 +276,13 @@ fn nonzero_chunked_state_matches_full_prompt_and_cached_decodes_in_both_drivers(
 #[test]
 fn cancellation_polls_the_same_submission_and_holds_capacity_until_completion() {
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 20).unwrap();
+    let pool = memory::host_ledger(65536, 20).unwrap();
     let id = InferenceExecutionIdentity::default();
-    let capacity = 20 + admission(g).incremental_required_bytes;
+    let capacity = 20 + memory::reservation_bytes(&admission(g));
     let cancellation = GenerationCancellationToken::new();
     let mut driver = PrefillDriver::new(
         &id,
-        pool.reserve_with_capacity(&id, &admission(g), capacity)
+        pool.reserve_with_capacity(&id, &admission(g), memory::resolved_limits(capacity))
             .unwrap(),
         g,
         cancellation.clone(),
@@ -284,11 +301,13 @@ fn cancellation_polls_the_same_submission_and_holds_capacity_until_completion() 
         ));
     }
     assert_eq!(executor.submitted.len(), 1);
-    assert!(pool.used_bytes().unwrap() > 20);
-    assert_eq!(pool.effective_capacity().unwrap(), capacity);
+    assert!(pool.funded_used_bytes().unwrap() > 20);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), capacity);
     assert!(matches!(
         pool.reserve(&id, &admission(g)),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     executor.status.store(1, Ordering::SeqCst);
     assert!(matches!(
@@ -296,14 +315,14 @@ fn cancellation_polls_the_same_submission_and_holds_capacity_until_completion() 
         PrefillProgress::Cancelled
     ));
     drop(driver);
-    assert_eq!(pool.used_bytes().unwrap(), 20);
-    assert_eq!(pool.effective_capacity().unwrap(), 1000);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 20);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 65536);
 }
 
 #[test]
 fn cancellation_before_first_step_submits_nothing() {
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let id = InferenceExecutionIdentity::default();
     let cancel = GenerationCancellationToken::new();
     cancel.cancel();
@@ -322,12 +341,12 @@ fn cancellation_before_first_step_submits_nothing() {
 #[test]
 fn failed_completion_never_refunds_or_replays_unresolved_work() {
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let id = InferenceExecutionIdentity::default();
-    let capacity = admission(g).incremental_required_bytes;
+    let capacity = memory::reservation_bytes(&admission(g));
     let mut driver = PrefillDriver::new(
         &id,
-        pool.reserve_with_capacity(&id, &admission(g), capacity)
+        pool.reserve_with_capacity(&id, &admission(g), memory::resolved_limits(capacity))
             .unwrap(),
         g,
         GenerationCancellationToken::new(),
@@ -346,17 +365,19 @@ fn failed_completion_never_refunds_or_replays_unresolved_work() {
     ));
     assert_eq!(executor.submitted.len(), 1);
     drop(driver);
-    assert!(pool.used_bytes().unwrap() > 0);
-    assert_eq!(pool.effective_capacity().unwrap(), capacity);
+    assert!(pool.funded_used_bytes().unwrap() > 0);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), capacity);
     assert!(matches!(
-        pool.register_storage([(1_u32, 1)]),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        pool.register_host_storage([(1_u32, 1)]),
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     // The native recovery owner independently proves safe release.
     executor.status.store(1, Ordering::SeqCst);
     executor.quarantine.borrow_mut().clear();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.effective_capacity().unwrap(), 1000);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 65536);
 }
 
 #[test]
@@ -387,30 +408,33 @@ fn retained_source_capacity_selects_chunks_and_competes_with_concurrent_requests
         .unwrap();
     assert_eq!(storage.bytes().unwrap(), capacity);
     assert!(matches!(
-        WorkingMemoryPool::new(capacity - 1, storage.bytes().unwrap()),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        memory::host_ledger(capacity - 1, storage.bytes().unwrap()),
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     let baseline = run(7, OutputDemand::LastPosition, false).1;
     for controlled in [false, true] {
         let g = geometry(7, OutputDemand::LastPosition);
         let id = InferenceExecutionIdentity::default();
-        let available = admission(geometry(3, g.output)).incremental_required_bytes;
-        let pool =
-            WorkingMemoryPool::new(capacity + 2 * available, storage.bytes().unwrap()).unwrap();
+        let available = memory::reservation_bytes(&admission(geometry(3, g.output)));
+        let pool = memory::host_ledger(capacity + 2 * available, storage.bytes().unwrap()).unwrap();
         let (admitted, reservation) = plan_prefill_with_capacity(
             &id,
             &pool,
             &capabilities(),
             request(g),
             g,
-            capacity + available,
+            memory::resolved_limits(capacity + available),
             quote,
         )
         .unwrap();
         assert_eq!(reservation.geometry().prefill_chunk_positions, 3);
         assert!(matches!(
             pool.reserve(&id, &admitted),
-            Err(WorkingMemoryError::BudgetExceeded { .. })
+            Err(WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
         ));
         let geometry = reservation.geometry();
         let mut driver = PrefillDriver::new(
@@ -443,11 +467,17 @@ fn retained_source_capacity_selects_chunks_and_competes_with_concurrent_requests
             );
         }
         assert_eq!(scores, baseline);
-        assert_eq!(pool.used_bytes().unwrap(), capacity + available);
-        assert_eq!(pool.effective_capacity().unwrap(), capacity + available);
+        assert_eq!(pool.funded_used_bytes().unwrap(), capacity + available);
+        assert_eq!(
+            pool.payload_effective_capacity().unwrap(),
+            capacity + available
+        );
         drop(driver);
-        assert_eq!(pool.used_bytes().unwrap(), capacity);
-        assert_eq!(pool.effective_capacity().unwrap(), capacity + 2 * available);
+        assert_eq!(pool.funded_used_bytes().unwrap(), capacity);
+        assert_eq!(
+            pool.payload_effective_capacity().unwrap(),
+            capacity + 2 * available
+        );
         assert!(pool.reserve(&id, &admitted).is_ok());
     }
 }
@@ -456,28 +486,31 @@ fn retained_source_capacity_selects_chunks_and_competes_with_concurrent_requests
 fn planner_reduces_chunk_under_shared_capacity_and_keeps_decode_allowance() {
     let g = geometry(7, OutputDemand::LastPosition);
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(400, 80).unwrap();
+    let expected_charge = memory::reservation_bytes(&admission(geometry(3, g.output)));
+    let pool = memory::host_ledger(80 + expected_charge, 80).unwrap();
     let (admitted, reservation) =
         plan_prefill(&id, &pool, &capabilities(), request(g), g, quote).unwrap();
     assert_eq!(reservation.geometry().prefill_chunk_positions, 3);
     assert_eq!(admitted.requested_positions, 10);
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 80 + expected_charge);
     assert!(matches!(
         pool.reserve(&id, &admitted),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     let clone = reservation.clone();
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 80 + expected_charge);
     drop(clone);
-    assert_eq!(pool.used_bytes().unwrap(), 80);
-    assert_eq!(pool.peak_bytes().unwrap(), 384);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 80);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), 80 + expected_charge);
 }
 
 #[test]
 fn reservation_is_bound_to_execution_and_geometry_and_retained_by_submission_authority() {
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let id = InferenceExecutionIdentity::default();
     let reservation = pool.reserve(&id, &admission(g)).unwrap();
     assert_eq!(
@@ -492,9 +525,9 @@ fn reservation_is_bound_to_execution_and_geometry_and_retained_by_submission_aut
     let mut lease = authority.begin_submission().unwrap();
     lease.retain_resource(reservation);
     assert!(lease.resolve());
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.funded_used_bytes().unwrap() > 0);
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -520,15 +553,15 @@ fn selected_state_backing_gaps_and_geometry_reject_even_with_stale_coverage() {
                 WorkspaceBound::bounded(0, "fixture mismatched schedule")
             },
         });
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = memory::host_ledger(u64::MAX, 0).unwrap();
         let result = pool.reserve(&execution, &admitted);
         assert!(
             matches!(result, Err(ref error) if *error == if unknown { WorkingMemoryError::UnknownBound } else { WorkingMemoryError::IdentityMismatch })
         );
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.peak_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_peak_bytes().unwrap(), 0);
         let result =
-            eredu_core::apply_admission_policy(&capabilities(), request(g), admitted.state, None);
+            eredu_core::apply_admission_policy(&capabilities(), request(g), admitted.state);
         if unknown {
             assert!(matches!(
                 result,
@@ -550,9 +583,10 @@ fn strict_admission_rejects_unknown_workspace_even_with_a_large_safety_reserve()
         reason: "native scratch not bounded".into(),
     };
     let mut req = request(g);
-    req.safety_reserve_bytes = 1_000_000;
+    req.additional_headroom =
+        eredu_core::MemoryHeadroomDeclarations::new([("host".into(), 1_000_000)]);
     assert!(matches!(
-        eredu_core::apply_admission_policy(&capabilities(), req, state, None).unwrap(),
+        eredu_core::apply_admission_policy(&capabilities(), req, state).unwrap(),
         AdmissionResult::Rejected(eredu_core::AdmissionRejection::EstimationUnsupported { .. })
     ));
 }
@@ -560,7 +594,7 @@ fn strict_admission_rejects_unknown_workspace_even_with_a_large_safety_reserve()
 #[test]
 fn chunk_planning_checks_nonmonotone_native_bounds_and_rejects_before_submission() {
     let g = geometry(7, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let id = InferenceExecutionIdentity::default();
     let (_, reservation) = plan_prefill(&id, &pool, &capabilities(), request(g), g, |geometry| {
         let mut estimate = quote(geometry)?;
@@ -573,15 +607,15 @@ fn chunk_planning_checks_nonmonotone_native_bounds_and_rejects_before_submission
     })
     .unwrap();
     assert_eq!(reservation.geometry().prefill_chunk_positions, 5);
-    let too_small = WorkingMemoryPool::new(1, 0).unwrap();
+    let too_small = memory::host_ledger(1, 0).unwrap();
     assert!(plan_prefill(&id, &too_small, &capabilities(), request(g), g, quote).is_err());
-    assert_eq!(too_small.used_bytes().unwrap(), 0);
+    assert_eq!(too_small.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn submission_failure_fences_driver_without_advancing_state() {
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let id = InferenceExecutionIdentity::default();
     let mut driver = PrefillDriver::new(
         &id,
@@ -603,13 +637,13 @@ fn submission_failure_fences_driver_without_advancing_state() {
     assert_eq!(executor.state, 0.25);
     assert!(executor.submitted.is_empty());
     drop(driver);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn cloned_retention_cannot_start_another_request_or_refund_started_authority() {
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let id = InferenceExecutionIdentity::default();
     let reserve = pool.reserve(&id, &admission(g)).unwrap();
     let driver: PrefillDriver<Vec<f64>, NativeCompletion> =
@@ -624,14 +658,14 @@ fn cloned_retention_cannot_start_another_request_or_refund_started_authority() {
         ),
         Err(WorkingMemoryError::AlreadyStarted)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn concurrent_admissions_cannot_overbook_shared_physical_capacity() {
     let g = geometry(3, OutputDemand::LastPosition);
     let admitted = admission(g);
-    let pool = WorkingMemoryPool::new(2 * admitted.incremental_required_bytes + 20, 20).unwrap();
+    let pool = memory::host_ledger(2 * memory::reservation_bytes(&admitted) + 20, 20).unwrap();
     let workers = (0..8)
         .map(|_| {
             let pool = pool.clone();
@@ -647,11 +681,11 @@ fn concurrent_admissions_cannot_overbook_shared_physical_capacity() {
         .collect::<Vec<_>>();
     assert_eq!(held.iter().filter(|result| result.is_ok()).count(), 2);
     assert_eq!(
-        pool.used_bytes().unwrap(),
-        2 * admitted.incremental_required_bytes + 20
+        pool.funded_used_bytes().unwrap(),
+        2 * memory::reservation_bytes(&admitted) + 20
     );
     drop(held);
-    assert_eq!(pool.used_bytes().unwrap(), 20);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 20);
 }
 
 #[test]
@@ -674,7 +708,8 @@ fn one_rank_cancellation_stops_every_rank_at_the_same_completed_boundary() {
             cancellation: &GenerationCancellationToken,
             _: InferenceRequest,
         ) -> Result<bool, Self::Error> {
-            self.any_cancelled.fetch_or(cancellation.is_cancelled(), Ordering::SeqCst);
+            self.any_cancelled
+                .fetch_or(cancellation.is_cancelled(), Ordering::SeqCst);
             self.barrier.wait();
             let cancelled = self.any_cancelled.load(Ordering::SeqCst);
             self.barrier.wait();
@@ -702,7 +737,7 @@ fn one_rank_cancellation_stops_every_rank_at_the_same_completed_boundary() {
                 std::thread::spawn(move || {
                     let g = geometry(2, OutputDemand::LastPosition);
                     let execution = InferenceExecutionIdentity::default();
-                    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+                    let pool = memory::host_ledger(65536, 0).unwrap();
                     let reservation = pool.reserve(&execution, &admission(g)).unwrap();
                     let cancellation = GenerationCancellationToken::new();
                     if rank == 0 && cancel_before_first {
@@ -744,7 +779,7 @@ fn one_rank_cancellation_stops_every_rank_at_the_same_completed_boundary() {
                     let state = executor.inner.state;
                     drop(driver);
                     drop(executor);
-                    assert_eq!(pool.used_bytes().unwrap(), 0);
+                    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
                     state
                 })
             })
@@ -758,19 +793,19 @@ fn one_rank_cancellation_stops_every_rank_at_the_same_completed_boundary() {
 }
 
 #[test]
-fn explicit_unbudgeted_requests_share_scheduling_without_claiming_memory_coverage() {
+fn finite_and_unlimited_requests_share_admission_custody_and_scheduling() {
     let g = geometry(3, OutputDemand::LastPosition);
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
     let mut results = Vec::new();
     for budgeted in [false, true] {
-        let request: InferenceRequest = if budgeted {
-            pool.reserve(&id, &admission(g)).unwrap().into()
+        let pool = if budgeted {
+            memory::host_ledger(65536, 0).unwrap()
         } else {
-            InferenceRequest::without_memory_budget(&id, g).unwrap()
+            memory::unlimited_ledger(0)
         };
-        assert_eq!(request.memory_reservation().is_some(), budgeted);
-        let same_geometry = InferenceRequest::without_memory_budget(&id, g).unwrap();
+        let request: InferenceRequest = pool.reserve(&id, &admission(g)).unwrap().into();
+        assert!(request.memory_reservation().validate_ledger(&pool).is_ok());
+        let same_geometry = unlimited_request(&id, g).unwrap();
         assert_eq!(
             request.validate_same_request(&same_geometry),
             Err(WorkingMemoryError::IdentityMismatch)
@@ -799,7 +834,7 @@ fn explicit_unbudgeted_requests_share_scheduling_without_claiming_memory_coverag
         results.push((executor.state, scores, executor.submitted));
         drop(driver);
         drop(request);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
     assert_eq!(results[0], results[1]);
 }
@@ -808,46 +843,59 @@ fn explicit_unbudgeted_requests_share_scheduling_without_claiming_memory_coverag
 fn reservation_domain_validation_uses_identity_without_changing_charges() {
     let g = geometry(2, OutputDemand::LastPosition);
     let id = InferenceExecutionIdentity::default();
-    let first_pool = WorkingMemoryPool::new(4096, 0).unwrap();
-    let second_pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let first_pool = memory::host_ledger(65536, 0).unwrap();
+    let second_pool = memory::host_ledger(65536, 0).unwrap();
     let first = first_pool.reserve(&id, &admission(g)).unwrap();
     let second = second_pool.reserve(&id, &admission(g)).unwrap();
-    let charged = first.bytes();
+    let charged = first
+        .requirements()
+        .get(first_pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     assert!(charged > 0);
-    assert_eq!(second.bytes(), charged);
-    assert_eq!(first_pool.used_bytes().unwrap(), charged);
-    assert_eq!(second_pool.used_bytes().unwrap(), charged);
+    assert_eq!(
+        second
+            .requirements()
+            .get(second_pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
+        charged
+    );
+    assert_eq!(first_pool.funded_used_bytes().unwrap(), charged);
+    assert_eq!(second_pool.funded_used_bytes().unwrap(), charged);
     for _ in 0..2 {
         first.validate(&id, g).unwrap();
         second.validate(&id, g).unwrap();
-        first.validate_domain(&first_pool.clone()).unwrap();
-        second.validate_domain(&second_pool).unwrap();
+        first.validate_ledger(&first_pool.clone()).unwrap();
+        second.validate_ledger(&second_pool).unwrap();
         assert_eq!(
-            first.validate_domain(&second_pool),
+            first.validate_ledger(&second_pool),
             Err(WorkingMemoryError::IdentityMismatch)
         );
         assert_eq!(
-            second.validate_domain(&first_pool),
+            second.validate_ledger(&first_pool),
             Err(WorkingMemoryError::IdentityMismatch)
         );
     }
     for pool in [&first_pool, &second_pool] {
-        assert_eq!(pool.used_bytes().unwrap(), charged);
-        assert_eq!(pool.peak_bytes().unwrap(), charged);
+        assert_eq!(pool.funded_used_bytes().unwrap(), charged);
+        assert_eq!(pool.payload_peak_bytes().unwrap(), charged);
     }
     drop(first);
-    assert_eq!(first_pool.used_bytes().unwrap(), 0);
-    assert_eq!(second_pool.used_bytes().unwrap(), charged);
+    assert_eq!(first_pool.funded_used_bytes().unwrap(), 0);
+    assert_eq!(second_pool.funded_used_bytes().unwrap(), charged);
     drop(second);
-    assert_eq!(second_pool.used_bytes().unwrap(), 0);
+    assert_eq!(second_pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn equal_geometry_cannot_replace_the_exact_reserved_charge_owner() {
     let g = geometry(2, OutputDemand::LastPosition);
     let id = InferenceExecutionIdentity::default();
-    let first_pool = WorkingMemoryPool::new(4096, 0).unwrap();
-    let second_pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let first_pool = memory::host_ledger(65536, 0).unwrap();
+    let second_pool = memory::host_ledger(65536, 0).unwrap();
     let reservation = first_pool.reserve(&id, &admission(g)).unwrap();
     let request = InferenceRequest::from(&reservation);
     assert_eq!(
@@ -868,8 +916,8 @@ fn state_retention_survives_request_drop_and_never_refunds_newer_charges_on_rest
     let g = geometry(3, OutputDemand::LastPosition);
     let execution = InferenceExecutionIdentity::default();
     let admitted = admission(g);
-    let charge = admitted.incremental_required_bytes;
-    let pool = WorkingMemoryPool::new(charge * 2, 0).unwrap();
+    let charge = memory::reservation_bytes(&admitted);
+    let pool = memory::host_ledger(charge * 2, 0).unwrap();
     let first = pool.reserve(&execution, &admitted).unwrap();
     let first_alias: InferenceRequest = (&first).into();
     let first_request: InferenceRequest = first.into();
@@ -893,23 +941,22 @@ fn state_retention_survives_request_drop_and_never_refunds_newer_charges_on_rest
     drop(first_alias);
     drop(first_request);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), charge * 2);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charge * 2);
     assert!(matches!(
         pool.reserve(&execution, &admitted),
-        Err(WorkingMemoryError::BudgetExceeded {
-            available_bytes: 0,
-            ..
-        })
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     state.clone_from(&saved);
     assert_eq!(state.as_ref()[0], [7, 11, 13]);
     assert_eq!(state.inference_retention().requests().len(), 2);
-    assert_eq!(pool.used_bytes().unwrap(), charge * 2);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charge * 2);
     drop(state);
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charge);
     drop(saved);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), charge * 2);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), charge * 2);
 }
 
 #[test]
@@ -919,17 +966,18 @@ fn exchanged_state_and_descendants_keep_their_exact_charges_without_charging_han
     let g = geometry(2, OutputDemand::LastPosition);
     let execution = InferenceExecutionIdentity::default();
     let admitted = admission(g);
-    let charge = admitted.incremental_required_bytes;
-    let pool = WorkingMemoryPool::new(charge, 0).unwrap();
+    let charge = memory::reservation_bytes(&admitted);
+    let pool = memory::host_ledger(charge, 0).unwrap();
     let request: InferenceRequest = pool.reserve(&execution, &admitted).unwrap().into();
-    let unbudgeted = InferenceRequest::without_memory_budget(&execution, g).unwrap();
+    let alias = request.clone();
     let mut installed = State::stateless();
     installed.retain_inference(&request);
-    installed.retain_inference(&unbudgeted);
+    installed.retain_inference(&alias);
+    drop(alias);
     drop(request);
     let mut branch = installed.clone();
     let saved = branch.clone();
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charge);
     assert_eq!(installed.inference_retention().requests().len(), 1);
     installed = State::stateless();
     std::mem::swap(&mut installed, &mut branch);
@@ -937,12 +985,13 @@ fn exchanged_state_and_descendants_keep_their_exact_charges_without_charging_han
     assert_eq!(branch.inference_retention().requests().len(), 0);
     drop(branch);
     drop(installed);
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charge);
     drop(saved);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
+    let unlimited = unlimited_request(&execution, g).unwrap();
     let mut state = State::stateless();
-    state.retain_inference(&unbudgeted);
-    assert_eq!(state.inference_retention().requests().len(), 0);
+    state.retain_inference(&unlimited);
+    assert_eq!(state.inference_retention().requests().len(), 1);
 }
 
 #[test]
@@ -959,7 +1008,7 @@ fn active_admission_checks_exact_span_geometry_phase_readout_and_native_frontier
                 ..geometry(chunk, output)
             };
             let execution = InferenceExecutionIdentity::default();
-            let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+            let pool = memory::host_ledger(1 << 20, 0).unwrap();
             let request: InferenceRequest = pool.reserve(&execution, &admission(g)).unwrap().into();
             let mut retention = InferenceRetention::new();
             retention.admit(&request);
@@ -1037,7 +1086,7 @@ fn single_row_readouts_are_equivalent_but_state_only_is_not() {
             ..geometry(1, output)
         };
         let execution = InferenceExecutionIdentity::default();
-        let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+        let pool = memory::host_ledger(1 << 20, 0).unwrap();
         let request: InferenceRequest = pool.reserve(&execution, &admission(g)).unwrap().into();
         let mut retention = InferenceRetention::new();
         retention.admit(&request);
@@ -1067,7 +1116,7 @@ fn single_row_readouts_are_equivalent_but_state_only_is_not() {
 #[test]
 fn restoring_logical_admission_keeps_newer_charges_and_empty_snapshots_cannot_erase_it() {
     let execution = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = memory::host_ledger(1 << 20, 0).unwrap();
     let old_g = geometry(3, OutputDemand::LastPosition);
     let new_g = InferenceGeometry {
         cached_positions: 2,
@@ -1075,7 +1124,7 @@ fn restoring_logical_admission_keeps_newer_charges_and_empty_snapshots_cannot_er
     };
     let old: InferenceRequest = pool.reserve(&execution, &admission(old_g)).unwrap().into();
     let new: InferenceRequest = pool.reserve(&execution, &admission(new_g)).unwrap().into();
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
     let mut retention = InferenceRetention::new();
     retention.admit(&old);
     let snapshot = retention.clone();
@@ -1090,7 +1139,6 @@ fn restoring_logical_admission_keeps_newer_charges_and_empty_snapshots_cannot_er
         .validate_same_request(&old)
         .is_ok());
     retention.restore_admission(&InferenceRetention::new());
-    retention.admit(&InferenceRequest::without_memory_budget(&execution, old_g).unwrap());
     assert!(retention
         .admission()
         .unwrap()
@@ -1100,11 +1148,11 @@ fn restoring_logical_admission_keeps_newer_charges_and_empty_snapshots_cannot_er
     assert_eq!(retention.requests().len(), 2);
     drop(old);
     drop(new);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
     drop(snapshot);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
     drop(retention);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[path = "bounded_prefill/text_preparation.rs"]
@@ -1127,3 +1175,17 @@ mod final_output;
 
 #[path = "bounded_prefill/controls.rs"]
 mod controls;
+
+fn budget_error(pool: &MemoryLedger, requested: u64, available: u64) -> WorkingMemoryError {
+    let observation = pool.snapshot().unwrap();
+    let host = &observation.domains[0];
+    let eredu_core::MemoryLimit::Finite(limit) = host.effective_limit else {
+        panic!("finite fixture")
+    };
+    WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded {
+        domain: host.domain,
+        limit_bytes: limit,
+        existing_bytes: limit - available,
+        requested_bytes: requested,
+    })
+}

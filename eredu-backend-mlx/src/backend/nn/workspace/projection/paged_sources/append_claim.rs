@@ -371,7 +371,7 @@ impl OriginalPagedAppendClaim<'_> {
         &self,
         id: &CacheBlockId,
         phase: eredu_runtime::CacheStoragePhase,
-        file: Option<&eredu_runtime::cache::LiveCacheBlockSource>,
+        file: Option<&crate::backend::runtime::cache::residency::CacheFileSource>,
     ) -> Result<(), Exception> {
         if phase == eredu_runtime::CacheStoragePhase::DiskReady {
             let same_file = file.is_some_and(|file| {
@@ -714,7 +714,7 @@ pub(super) fn control_bytes(steps: usize) -> Option<usize> {
             &OriginalPagedAppendClaim<'_>,
             &CacheBlockId,
             eredu_runtime::CacheStoragePhase,
-            Option<&eredu_runtime::cache::LiveCacheBlockSource>,
+            Option<&crate::backend::runtime::cache::residency::CacheFileSource>,
         )>(),
         super::host_program::PreparedPagedHostProgram::retained_file_control_bytes(),
         Exception::retained_source_control_bytes::<Failure>()?,

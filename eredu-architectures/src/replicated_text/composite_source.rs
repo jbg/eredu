@@ -29,7 +29,9 @@ impl Requirements {
         let metadata = B::construction_metadata(context);
         if let Some(metadata) = metadata {
             metadata.charge_metadata(std::mem::size_of::<(
-                Self, Result<Self, eredu_nn::Error>, Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self,
+                Result<Self, eredu_nn::Error>,
+                Option<&eredu_nn::workspace::WorkspaceContext>,
             )>())?;
         }
         SharedCompositeConfig::new(value, metadata).map(Self::Owned)
@@ -235,9 +237,20 @@ impl Requirements {
 }
 
 impl PreparedModelSources {
-    pub(crate) fn matches_retained_gemma_admission(&self, admission: &crate::gemma4::FamilyConfig) -> bool {
+    pub(crate) fn matches_retained_inkling_admission(
+        &self,
+        admission: &crate::inkling::ModelArgs,
+    ) -> bool {
+        self.construction_semantics().composite.get().is_some_and(|source| {
+            matches!(&source.configurations, Configurations::Inkling { target, .. } if target.matches_admission(admission))
+        }) || self.construction_semantics().direct_partition.get().is_some_and(|source| source.matches_inkling_admission(admission))
+    }
+    pub(crate) fn matches_retained_gemma_admission(
+        &self,
+        admission: &crate::gemma4::FamilyConfig,
+    ) -> bool {
         self.construction_semantics().composite.get().is_some_and(|source| {
             matches!(&source.configurations, Configurations::Gemma4 { target, .. } if target.matches_admission(admission))
-        })
+        }) || self.construction_semantics().direct_partition.get().is_some_and(|source| source.matches_gemma_admission(admission))
     }
 }

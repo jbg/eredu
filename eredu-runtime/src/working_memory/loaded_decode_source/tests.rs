@@ -10,22 +10,22 @@ fn plan(snapshot: &TokenizerSnapshot) -> DecodeCompilePlan<'_> {
 #[test]
 fn exact_cold_admission_precedes_compiler_and_retains_full_idle_allowance() {
     let snapshot = snapshot();
-    let required = WorkingMemoryPool::decode_source_required_bytes(&plan(&snapshot)).unwrap();
-    let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+    let required = MemoryLedger::decode_source_required_bytes(&plan(&snapshot)).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(required - 1, 0).unwrap();
     let error = short
         .compile_decode_source_with(plan(&snapshot), || {
             panic!("short admission reached compiler")
         })
         .unwrap_err();
     assert!(
-        matches!(error.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == required && *available_bytes == required - 1)
+        matches!(error.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == required && (limit_bytes - existing_bytes) == required - 1)
     );
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(required, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
     let source = pool
         .compile_decode_source_with(plan(&snapshot), || {
-            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_eq!(pool.payload_used_bytes().unwrap(), required);
             assert!(matches!(
                 pool.acquire_unquoted(),
                 Err(WorkingMemoryError::ReservedWorkActive)
@@ -33,20 +33,17 @@ fn exact_cold_admission_precedes_compiler_and_retains_full_idle_allowance() {
         })
         .unwrap();
     assert_eq!(source.original_bytes(), required);
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     // Terminal compilation ends the active operation, not its byte allowance.
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     let second = pool.compile_decode_source(plan(&snapshot)).unwrap_err();
     assert!(matches!(
         second.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded {
-            available_bytes: 0,
-            ..
-        })
-    ));
+        Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { limit_bytes, existing_bytes, .. }))
+     if limit_bytes - existing_bytes == 0));
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), required);
 }
 
 #[test]
@@ -55,8 +52,8 @@ fn every_real_partial_compiler_failure_retains_its_original_allowance() {
     let mut previous_prefix = 0;
     for stage in 0..3 {
         let plan = plan(&snapshot).fail_reservation(stage);
-        let required = WorkingMemoryPool::decode_source_required_bytes(&plan).unwrap();
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        let required = MemoryLedger::decode_source_required_bytes(&plan).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
         let error = pool.compile_decode_source(plan).unwrap_err();
         assert_eq!(error.retained_bytes(), required);
         let failure = error.compiler_failure().unwrap();
@@ -70,21 +67,21 @@ fn every_real_partial_compiler_failure_retains_its_original_allowance() {
             assert!(prefix > previous_prefix);
         }
         previous_prefix = prefix;
-        assert_eq!(pool.used_bytes().unwrap(), required);
-        drop(pool.acquire_unquoted().unwrap());
+        assert_eq!(pool.payload_used_bytes().unwrap(), required);
+        crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
         // The actual owning error enters core's closed source Box directly.
         let error = BackendFailure::new(eredu_core::BackendFailureKind::ResourceExhausted, error);
-        assert_eq!(pool.used_bytes().unwrap(), required);
+        assert_eq!(pool.payload_used_bytes().unwrap(), required);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn unknown_host_owner_and_panicking_active_compiler_preserve_original_exclusion() {
     let snapshot = snapshot();
-    let required = WorkingMemoryPool::decode_source_required_bytes(&plan(&snapshot)).unwrap();
-    let pool = WorkingMemoryPool::new(required, 0).unwrap();
+    let required = MemoryLedger::decode_source_required_bytes(&plan(&snapshot)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
     let unknown = pool.acquire_unquoted().unwrap();
     let error = pool
         .compile_decode_source_with(plan(&snapshot), || panic!("unknown bound invoked compiler"))
@@ -93,53 +90,55 @@ fn unknown_host_owner_and_panicking_active_compiler_preserve_original_exclusion(
         error.accounting_failure(),
         Some(WorkingMemoryError::UnknownBound)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(unknown);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pool.compile_decode_source_with(plan(&snapshot), || {
-            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_eq!(pool.payload_used_bytes().unwrap(), required);
             panic!("injected before compile, under actual allowance");
         })
     }));
     assert!(panic.is_err());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(pool.compile_decode_source(plan(&snapshot)).unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn independent_sources_and_concurrent_last_aliases_preserve_exact_domain_bytes() {
     let snapshot = snapshot();
-    let required = WorkingMemoryPool::decode_source_required_bytes(&plan(&snapshot)).unwrap();
-    let pool = WorkingMemoryPool::new(2 * required, 0).unwrap();
+    let required = MemoryLedger::decode_source_required_bytes(&plan(&snapshot)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2 * required, 0).unwrap();
     let first = pool.compile_decode_source(plan(&snapshot)).unwrap();
     let second = pool.compile_decode_source(plan(&snapshot)).unwrap();
     assert!(!first.same_source(&second));
     let alias = first.clone();
     assert!(first.same_source(&alias));
     assert!(matches!(
-        first.validate_pool(&WorkingMemoryPool::new(u64::MAX, 0).unwrap()),
+        first.validate_pool(
+            &crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap()
+        ),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     first.validate_pool(&pool).unwrap();
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), 2 * required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 2 * required);
     let peer = alias.clone();
     std::thread::scope(|scope| {
         scope.spawn(move || drop(alias));
         scope.spawn(move || drop(peer));
     });
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn poisoned_terminal_accounting_keeps_completed_source_and_active_allowance_unsettled() {
     let snapshot = snapshot();
-    let required = WorkingMemoryPool::decode_source_required_bytes(&plan(&snapshot)).unwrap();
-    let pool = WorkingMemoryPool::new(required, 0).unwrap();
+    let required = MemoryLedger::decode_source_required_bytes(&plan(&snapshot)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
     let error = pool
         .compile_decode_source_with(plan(&snapshot), || {
             let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

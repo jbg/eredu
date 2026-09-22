@@ -12,14 +12,14 @@ use eredu_text::tokenizer::ChatTemplateIdentity;
 use std::{
     alloc::Layout,
     mem::{size_of, size_of_val},
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 #[derive(Debug)]
 struct Data {
     render: OriginalRenderedChat,
     generation: bool,
-    capacity: u64,
+    limits: eredu_core::MemoryLimitDeclarations,
     template_identity: ChatTemplateIdentity,
     policy: crate::api::CompiledChatPolicy,
     compilation: OriginalControllerCompilation,
@@ -46,9 +46,9 @@ impl PreparedChat {
     pub(crate) fn generation(&self) -> bool {
         self.data().generation
     }
-    /// Enforced request capacity authenticated by this prepared chat, in bytes.
-    pub fn capacity(&self) -> u64 {
-        self.data().capacity
+    /// Enforced request limits authenticated by this prepared chat, in bytes.
+    pub fn limits(&self) -> &eredu_core::MemoryLimitDeclarations {
+        &self.data().limits
     }
     pub(crate) fn tokenizer_source(&self) -> &OriginalTokenizer {
         self.render().tokenizer_source()
@@ -59,7 +59,7 @@ impl PreparedChat {
     pub(crate) fn publish(
         render: OriginalRenderedChat,
         generation: bool,
-        capacity: u64,
+        limits: eredu_core::MemoryLimitDeclarations,
         named_entry: Option<&str>,
         policy: crate::api::CompiledChatPolicy,
         compilation: OriginalControllerCompilation,
@@ -68,7 +68,7 @@ impl PreparedChat {
         let mut data = Data {
             render,
             generation,
-            capacity,
+            limits,
             template_identity: ChatTemplateIdentity::Single,
             policy,
             compilation,

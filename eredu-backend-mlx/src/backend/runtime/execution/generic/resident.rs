@@ -41,9 +41,13 @@ impl<U> std::ops::DerefMut for MlxResidentUnit<U> {
 }
 
 impl<U: 'static> MlxResidentPolicy<U> {
-    pub(crate) fn original_realtime_plan(&self,stream:&Stream,context:&eredu_nn::workspace::WorkspaceContext)
-        ->Result<original_operations::RealtimeNeuralPlan<U>,Error> {
-        self.original_neural.realtime_plan(&self.layout,stream,context)
+    pub(crate) fn original_realtime_plan(
+        &self,
+        stream: &Stream,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<original_operations::RealtimeNeuralPlan<U>, Error> {
+        self.original_neural
+            .realtime_plan(&self.layout, stream, context)
     }
 
     pub(crate) fn original_neural_plan(
@@ -133,16 +137,17 @@ impl<U: Parameterized<MlxTensor> + 'static> LayerwisePolicy<MlxNeuralBackend, U>
         self.submit_neural(stream, value)
     }
 
-    fn publish_parameter_replacements(
+    fn visit_parameter_publication(
         &mut self,
-        values: &std::collections::BTreeMap<String, MlxTensor>,
-        _active: bool,
+        visitor: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
     ) -> Result<bool, Error> {
         if !self.resident_parameters_available() {
             return Ok(false);
         }
         self.visit_resident_units(&mut |unit| {
-            unit.visit_parameters_mut(&mut ParameterPublisher(values))
+            unit.visit_parameters_mut(
+                &mut eredu_runtime::parameter_operations::ParameterPublicationVisitor(visitor),
+            );
         });
         Ok(true)
     }
@@ -186,6 +191,9 @@ impl<U: Parameterized<MlxTensor> + 'static> LayerwisePolicy<MlxNeuralBackend, U>
         _build: F,
         operation: V,
         _stream: &Stream,
+        _preparation: Option<
+            &crate::backend::runtime::execution::generic::MlxParameterPreparation<'_>,
+        >,
     ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
     where
         F: FnOnce(&Stream) -> Result<U, E>,

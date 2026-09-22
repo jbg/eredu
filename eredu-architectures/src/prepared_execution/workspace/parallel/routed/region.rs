@@ -1,6 +1,6 @@
 //! Cold boundary adapter around the ordinary routed architecture equations.
 use super::*;
-use eredu_nn::{GroupedGatedProductOperator, GroupedLinearOperator, GroupedRelu2Operator};
+use eredu_nn::{GroupedGatedProductOperator, GroupedLinearOperator};
 use eredu_runtime::{RoutedExpertProvider, TensorParallelRoutedExpertProvider};
 
 pub(super) struct RegionProvider<'a, P> {
@@ -8,8 +8,15 @@ pub(super) struct RegionProvider<'a, P> {
     provider: &'a mut P,
 }
 impl<'a, P> RegionProvider<'a, P> {
-    pub(super) fn new(execution: &'a crate::partitioned_execution::PreparedRoutedExecutionHandoff,
-        provider: &'a mut P) -> Self { Self { execution, provider } }
+    pub(super) fn new(
+        execution: &'a crate::partitioned_execution::PreparedRoutedExecutionHandoff,
+        provider: &'a mut P,
+    ) -> Self {
+        Self {
+            execution,
+            provider,
+        }
+    }
 }
 
 macro_rules! ordinary {
@@ -100,33 +107,80 @@ macro_rules! parallel {
     };
 }
 impl<P> RoutedExpertProvider<WorkspaceBackend> for RegionProvider<'_, P>
-where P: TensorParallelRoutedExpertProvider<WorkspaceBackend> {
+where
+    P: TensorParallelRoutedExpertProvider<WorkspaceBackend>,
+{
     type Error = crate::RoutedTextExecutionError;
-    fn routing_control(&mut self, bank: eredu_runtime::RoutedBankId, rows: u64)
-        -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
-        self.provider.routing_control(bank, rows).map_err(crate::RoutedTextExecutionError::from_error)
+    fn routing_control(
+        &mut self,
+        bank: eredu_runtime::RoutedBankId,
+        rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
+        self.provider
+            .routing_control(bank, rows)
+            .map_err(crate::RoutedTextExecutionError::from_error)
     }
-    fn routing_unmodified_interest(&self, bank: eredu_runtime::RoutedBankId) -> eredu_runtime::RoutingUnmodifiedInterest {
+    fn routing_unmodified_interest(
+        &self,
+        bank: eredu_runtime::RoutedBankId,
+    ) -> eredu_runtime::RoutingUnmodifiedInterest {
         self.provider.routing_unmodified_interest(bank)
     }
-    fn routing_unmodified(&mut self, bank: eredu_runtime::RoutedBankId,
-        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>) -> Result<(), Self::Error> {
-        self.provider.routing_unmodified(bank, effective).map_err(crate::RoutedTextExecutionError::from_error)
+    fn routing_unmodified(
+        &mut self,
+        bank: eredu_runtime::RoutedBankId,
+        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>,
+    ) -> Result<(), Self::Error> {
+        self.provider
+            .routing_unmodified(bank, effective)
+            .map_err(crate::RoutedTextExecutionError::from_error)
     }
-    fn routing_applied(&mut self, bank: eredu_runtime::RoutedBankId,
+    fn routing_applied(
+        &mut self,
+        bank: eredu_runtime::RoutedBankId,
         original: Option<eredu_runtime::RoutingDecision<'_, WorkspaceTensor>>,
-        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>) -> Result<(), Self::Error> {
-        self.provider.routing_applied(bank, original, effective).map_err(crate::RoutedTextExecutionError::from_error)
+        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>,
+    ) -> Result<(), Self::Error> {
+        self.provider
+            .routing_applied(bank, original, effective)
+            .map_err(crate::RoutedTextExecutionError::from_error)
     }
     fn routing_failed(&mut self, bank: eredu_runtime::RoutedBankId, message: &str) {
         self.provider.routing_failed(bank, message);
     }
-    ordinary!(forward_grouped, <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups, Gated, gated);
-    ordinary!(forward_linear_routed, <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::LinearGroups, Linear, linear);
-    ordinary!(forward_relu2_routed, <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups, Relu2, relu2);
+    ordinary!(
+        forward_grouped,
+        <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
+        Gated,
+        gated
+    );
+    ordinary!(
+        forward_linear_routed,
+        <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::LinearGroups,
+        Linear,
+        linear
+    );
+    ordinary!(
+        forward_relu2_routed,
+        <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
+        Relu2,
+        relu2
+    );
 }
 impl<P> TensorParallelRoutedExpertProvider<WorkspaceBackend> for RegionProvider<'_, P>
-where P: TensorParallelRoutedExpertProvider<WorkspaceBackend> {
-    parallel!(forward_grouped_tensor_parallel, <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups, Gated, gated);
-    parallel!(forward_relu2_routed_tensor_parallel, <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups, Relu2, relu2);
+where
+    P: TensorParallelRoutedExpertProvider<WorkspaceBackend>,
+{
+    parallel!(
+        forward_grouped_tensor_parallel,
+        <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
+        Gated,
+        gated
+    );
+    parallel!(
+        forward_relu2_routed_tensor_parallel,
+        <WorkspaceBackend as eredu_nn::GroupedNeuralBackend>::Relu2Groups,
+        Relu2,
+        relu2
+    );
 }

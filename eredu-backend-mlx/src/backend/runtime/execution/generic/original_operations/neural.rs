@@ -4,7 +4,8 @@ use super::*;
 use crate::backend::{
     nn::shared::{
         MlxSubmissionCompletion, NeuralSubmissionShape, OriginalNeuralSubmissionCompletion,
-        PreparedNeuralSubmission as NativePreparedNeuralSubmission, SubmissionPreparationCause, SubmissionPreparationError,
+        PreparedNeuralSubmission as NativePreparedNeuralSubmission, SubmissionPreparationCause,
+        SubmissionPreparationError,
     },
     submission_recovery::observed::Observer,
 };
@@ -13,7 +14,10 @@ use eredu_runtime::{OrderedLayerwiseCompletion, SubmissionBackend};
 use safemlx::OriginalScopeObserver;
 
 use eredu_runtime::working_memory::OriginalOperationMetadataCustody;
-pub(super) type PreparedNeuralSubmission<C = OriginalOperationMetadataCustody, P = OriginalScopeObserver> = NativePreparedNeuralSubmission<C, P>;
+pub(super) type PreparedNeuralSubmission<
+    C = OriginalOperationMetadataCustody,
+    P = OriginalScopeObserver,
+> = NativePreparedNeuralSubmission<C, P>;
 type PreparedSlot = PreparedNeuralSubmission;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,8 +56,12 @@ impl NeuralPopulation {
         layout: &ExecutionUnitLayout,
         final_submission: bool,
     ) -> Result<Self, Error> {
-        Self::from_forwards(layout, 1, eredu_runtime::GroupSubmissionMechanism::LayeredGraph,
-            final_submission)
+        Self::from_forwards(
+            layout,
+            1,
+            eredu_runtime::GroupSubmissionMechanism::LayeredGraph,
+            final_submission,
+        )
     }
     fn from_forwards(
         layout: &ExecutionUnitLayout,
@@ -82,7 +90,10 @@ impl NeuralPopulation {
         measured_layout(
             self,
             &factory::<OriginalOperationMetadataCustody, OriginalScopeObserver>(self.shape, None),
-        )?.checked_add(u64::try_from(size_of::<OperationControls>().checked_mul(self.submissions)?).ok()?)
+        )?
+        .checked_add(
+            u64::try_from(size_of::<OperationControls>().checked_mul(self.submissions)?).ok()?,
+        )
     }
     pub(super) fn native_requirements(self) -> Option<NeuralNativeRequirements> {
         let submissions = self.submissions;
@@ -175,7 +186,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         &self,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
     ) -> Result<(), Error> {
-        let geometry=self.geometry.ok_or_else(unknown)?;
+        let geometry = self.geometry.ok_or_else(unknown)?;
         if self
             .manager
             .original_foreground_disk_descriptors()
@@ -184,6 +195,11 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         {
             return Err(unknown());
         }
+        recipe.bind_ordinary_neural_calls(
+            geometry,
+            self.neural.per_forward,
+            self.neural.shape.consumers(),
+        )?;
         recipe.bind_neural_boundaries(
             geometry,
             self.neural.per_forward,
@@ -208,7 +224,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                 self.foreground_disk_forward_population()
                     .ok_or_else(unknown)?,
                 self.foreground_disk_population().ok_or_else(unknown)?,
-                self.manager.original_foreground_workspace().ok_or_else(unknown)?.destination_device_type(),
+                self.manager
+                    .original_foreground_workspace()
+                    .ok_or_else(unknown)?
+                    .destination_device_type(),
             )?;
         }
         Ok(())
@@ -220,7 +239,7 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
     ) -> Result<Self, Error> {
         if let Some(recipe) = recipe {
-            let geometry=self.geometry.ok_or_else(unknown)?;
+            let geometry = self.geometry.ok_or_else(unknown)?;
             if self
                 .manager
                 .original_foreground_disk_descriptors()
@@ -234,7 +253,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                 self.neural.submissions,
                 self.neural.shape.consumers(),
             ) {
-                return Err(identity());
+                return Err(Error::OriginalSourceContract {
+                    stage: "original operation neural completion population",
+                    cause: WorkingMemoryError::IdentityMismatch,
+                });
             }
             let residency = self.residency.ok_or_else(unknown)?;
             if !recipe.matches_host_transfer_population(
@@ -249,7 +271,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                     .as_slice(),
             ) || (self.retained_sources.is_some() && !recipe.has_host_copy_recipe())
             {
-                return Err(identity());
+                return Err(Error::OriginalSourceContract {
+                    stage: "original operation host transfer population",
+                    cause: WorkingMemoryError::IdentityMismatch,
+                });
             }
             match self.foreground_disk_descriptors() {
                 Some(source) => {
@@ -258,13 +283,31 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                         self.foreground_disk_forward_population()
                             .ok_or_else(unknown)?,
                         self.foreground_disk_population().ok_or_else(unknown)?,
-                        self.manager.original_foreground_workspace().ok_or_else(unknown)?.destination_device_type(),
+                        self.manager
+                            .original_foreground_workspace()
+                            .ok_or_else(unknown)?
+                            .destination_device_type(),
                     ) {
-                        return Err(identity());
+                        return Err(Error::OriginalSourceContract {
+                            stage: "original operation foreground disk copy population",
+                            cause: WorkingMemoryError::IdentityMismatch,
+                        });
                     }
                 }
-                None if recipe.has_foreground_disk_copy_recipe() => return Err(identity()),
+                None if recipe.has_foreground_disk_copy_recipe() => {
+                    return Err(Error::OriginalSourceContract {
+                        stage: "original operation absent foreground disk copy source",
+                        cause: WorkingMemoryError::IdentityMismatch,
+                    });
+                }
                 None => {}
+            }
+            if let Some(disk) = self
+                .foreground_disk
+                .as_mut()
+                .filter(|disk| disk.background().is_some())
+            {
+                disk.select_background_execution_recipe(recipe)?;
             }
             self.neural_fit = NeuralProducerFit::Recipe(self.neural_fit.requirement());
         }
@@ -353,11 +396,15 @@ where
         size_of::<Result<(), Error>>(),
         size_of::<(PreparedNeuralSubmission, OriginalScopeObserver)>(),
         size_of::<Result<(PreparedNeuralSubmission, OriginalScopeObserver), Error>>(),
-        size_of::<crate::backend::nn::shared::OriginalSubmissionFailure<OriginalOperationMetadataCustody>>(),
+        size_of::<
+            crate::backend::nn::shared::OriginalSubmissionFailure<OriginalOperationMetadataCustody>,
+        >(),
         size_of::<
             Result<
                 OriginalNeuralSubmissionCompletion<OriginalOperationMetadataCustody>,
-                crate::backend::nn::shared::OriginalSubmissionFailure<OriginalOperationMetadataCustody>,
+                crate::backend::nn::shared::OriginalSubmissionFailure<
+                    OriginalOperationMetadataCustody,
+                >,
             >,
         >(),
         size_of::<[&'static MlxTensor; 1]>(),
@@ -411,7 +458,10 @@ struct NeuralClonePreparationFailure {
     cause: safemlx::error::Exception,
     _controls: OriginalOperationMetadataCustody,
 }
-fn clone_error(cause: safemlx::error::Exception, controls: &OriginalOperationMetadataCustody) -> Error {
+fn clone_error(
+    cause: safemlx::error::Exception,
+    controls: &OriginalOperationMetadataCustody,
+) -> Error {
     Error::with_original_control_source(
         eredu_core::BackendFailure::from_error(NeuralClonePreparationFailure {
             cause,
@@ -423,15 +473,22 @@ fn clone_error(cause: safemlx::error::Exception, controls: &OriginalOperationMet
 pub(super) fn clone_error_control_bytes() -> Option<u64> {
     // Nested native error text/source allocations and allocator infrastructure
     // remain pending; this is the concrete closed wrapper/retirement layout.
-    u64::try_from(eredu_core::BackendFailure::source_retention_peak_bytes::<
-        NeuralClonePreparationFailure,
-    >()?.checked_add(eredu_core::BackendFailure::source_retention_peak_bytes::<
-        PreparationFailure<OriginalOperationMetadataCustody>,
-    >()?)?
-        .checked_add(size_of::<OriginalOperationMetadataCustody>())?
-        .checked_add(size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>())?
-        .checked_add(size_of::<eredu_runtime::working_memory::OriginalSpeculativeBudgetCustody>())?
-        .checked_add(size_of::<Result<PreparedOperationBank<PreparedNeuralSubmission>, Error>>())?)
+    u64::try_from(
+        eredu_core::BackendFailure::source_retention_peak_bytes::<NeuralClonePreparationFailure>()?
+            .checked_add(eredu_core::BackendFailure::source_retention_peak_bytes::<
+                PreparationFailure<OriginalOperationMetadataCustody>,
+            >()?)?
+            .checked_add(size_of::<OriginalOperationMetadataCustody>())?
+            .checked_add(size_of::<
+                eredu_runtime::working_memory::OriginalTextMetadataCustody,
+            >())?
+            .checked_add(size_of::<
+                eredu_runtime::working_memory::OriginalSpeculativeBudgetCustody,
+            >())?
+            .checked_add(size_of::<
+                Result<PreparedOperationBank<PreparedNeuralSubmission>, Error>,
+            >())?,
+    )
     .ok()
 }
 
@@ -512,9 +569,18 @@ pub(super) fn submit_prepared(
     prepared
         .submit_nested(value, observer, stream)
         .map(|completion| match controls {
-            OperationControls::Text(controls) => OrderedNeuralCompletion::Original { completion, controls: controls.clone() },
-            OperationControls::Speculative(controls) => OrderedNeuralCompletion::Speculative { completion, controls: controls.clone() },
-            OperationControls::Realtime(controls) => OrderedNeuralCompletion::Realtime { completion, controls: controls.clone() },
+            OperationControls::Text(controls) => OrderedNeuralCompletion::Original {
+                completion,
+                controls: controls.clone(),
+            },
+            OperationControls::Speculative(controls) => OrderedNeuralCompletion::Speculative {
+                completion,
+                controls: controls.clone(),
+            },
+            OperationControls::Realtime(controls) => OrderedNeuralCompletion::Realtime {
+                completion,
+                controls: controls.clone(),
+            },
         })
         .map_err(|failure| Error::from(failure.into_cause()))
 }
@@ -553,8 +619,12 @@ impl Completion for OrderedNeuralCompletion {
             } => completion
                 .is_complete()
                 .map_err(|e| boundary_error(e.into(), controls)),
-            Self::Realtime {completion,controls}=>completion.is_complete()
-                .map_err(|e|boundary_error(e.into(),controls)),
+            Self::Realtime {
+                completion,
+                controls,
+            } => completion
+                .is_complete()
+                .map_err(|e| boundary_error(e.into(), controls)),
         }
     }
     fn wait(&self) -> Result<(), Error> {
@@ -572,8 +642,12 @@ impl Completion for OrderedNeuralCompletion {
             } => completion
                 .wait()
                 .map_err(|e| boundary_error(e.into(), controls)),
-            Self::Realtime {completion,controls}=>completion.wait()
-                .map_err(|e|boundary_error(e.into(),controls)),
+            Self::Realtime {
+                completion,
+                controls,
+            } => completion
+                .wait()
+                .map_err(|e| boundary_error(e.into(), controls)),
         }
     }
     fn resources_releasable(&self) -> bool {
@@ -603,8 +677,12 @@ impl OrderedLayerwiseCompletion<Stream> for OrderedNeuralCompletion {
             } => completion
                 .order_after(stream)
                 .map_err(|e| boundary_error(e.into(), controls)),
-            Self::Realtime {completion,controls}=>completion.order_after(stream)
-                .map_err(|e|boundary_error(e.into(),controls)),
+            Self::Realtime {
+                completion,
+                controls,
+            } => completion
+                .order_after(stream)
+                .map_err(|e| boundary_error(e.into(), controls)),
         }
     }
     fn finish(self) -> Result<(), Error> {
@@ -622,8 +700,12 @@ impl OrderedLayerwiseCompletion<Stream> for OrderedNeuralCompletion {
             } => completion
                 .finish()
                 .map_err(|e| boundary_error(e, &controls)),
-            Self::Realtime {completion,controls}=>completion.finish()
-                .map_err(|e|boundary_error(e,&controls)),
+            Self::Realtime {
+                completion,
+                controls,
+            } => completion
+                .finish()
+                .map_err(|e| boundary_error(e, &controls)),
         }
     }
 }

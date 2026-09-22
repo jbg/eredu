@@ -394,14 +394,27 @@ impl CompletedResidentSource {
     }
     /// Descriptive comparison with the actual completed publication. This does
     /// not authenticate its request/account or change that publication's stream.
-    pub(crate) fn matches_completed_stream(&self, stream: &safemlx::Stream,
-        funding: &HostMetadataFunding) -> Result<bool, Error> {
-        let parts = [size_of::<(&Self, &safemlx::Stream, &HostMetadataFunding)>(),
+    pub(crate) fn matches_completed_stream(
+        &self,
+        stream: &safemlx::Stream,
+        funding: &HostMetadataFunding,
+    ) -> Result<bool, Error> {
+        let parts = [
+            size_of::<(&Self, &safemlx::Stream, &HostMetadataFunding)>(),
             size_of::<Result<bool, Error>>(),
-            self.completed_stream.as_ref().map_or(Some(0), |source|
-                source.source_comparison_control_bytes()).ok_or_else(|| memory(WorkingMemoryError::Overflow))?];
-        reserve(funding, parts.into_iter().try_fold(size_of_val(&parts), add)?)?;
-        Ok(self.completed_stream.as_ref().is_some_and(|source| source.matches_source(stream)))
+            self.completed_stream
+                .as_ref()
+                .map_or(Some(0), |source| source.source_comparison_control_bytes())
+                .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
+        ];
+        reserve(
+            funding,
+            parts.into_iter().try_fold(size_of_val(&parts), add)?,
+        )?;
+        Ok(self
+            .completed_stream
+            .as_ref()
+            .is_some_and(|source| source.matches_source(stream)))
     }
     /// Reuses the actual publication's scalar stream identity. Equal device or
     /// request identity alone cannot substitute for this completed placement.
@@ -496,7 +509,8 @@ impl CompletedResidentSource {
         let (budget, account) = self.array_source_account(array, funding)?;
         match account {
             CompletedWorkspaceSourceAccount::Model(account) => Ok((budget, account)),
-            CompletedWorkspaceSourceAccount::Numerical(_) => {
+            CompletedWorkspaceSourceAccount::Numerical(_)
+            | CompletedWorkspaceSourceAccount::Standalone(_) => {
                 Err(memory(WorkingMemoryError::IdentityMismatch))
             }
         }
@@ -718,15 +732,18 @@ fn bind_projected_with_priors_selection(
             .map_err(|cause| paid(funding, cause))?;
         let rows = native
             .iter()
-            .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone()));
+            .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root));
         binding_stage(diagnostic, "registered source rows");
         let registered = if select {
             layout.construct(environment.pool(), context, rows)
         } else {
             layout.construct_unselected(environment.pool(), context, rows)
-        }.map_err(memory)?;
+        }
+        .map_err(memory)?;
         binding_stage(diagnostic, "registered source custody");
-        let registered = registered.with_retained_original_sources(&mut carrier).map_err(memory)?;
+        let registered = registered
+            .with_retained_original_sources(&mut carrier)
+            .map_err(memory)?;
         return Ok(SourceBinding::Registered(registered));
     }
     binding_stage(diagnostic, "completed source layouts");
@@ -786,7 +803,7 @@ fn bind_projected_with_priors_selection(
     let rows = native
         .iter()
         .filter(|(id, _, _)| !completed.iter().any(|source| source.entry(*id).is_some()))
-        .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone()));
+        .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root));
     binding_stage(diagnostic, "completed source rows");
     let registered = if select {
         layout.construct(environment.pool(), context, rows, source, &mut carrier)

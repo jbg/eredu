@@ -133,7 +133,6 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                             limits: CaptureLimits {
                                 per_step: usage,
                                 cumulative: usage,
-                                physical_native_bytes: None,
                                 on_limit: CaptureLimitPolicy::Fail,
                             },
                         },
@@ -253,15 +252,13 @@ fn summary_histogram_prefill_matches_full_and_controlled_on_real_residencies() {
                 }
                 for physical in records.iter().filter(|r| r.prefill_span.is_some()) {
                     assert!(physical.captures.as_step().invocation.unwrap().sequence <= 2);
-                    assert!(
-                        physical
-                            .captures
-                            .as_step()
-                            .records
-                            .iter()
-                            .filter(|r| r.payload.is_some())
-                            .all(|r| r.source_shape.as_ref().unwrap()[1] <= 2)
-                    );
+                    assert!(physical
+                        .captures
+                        .as_step()
+                        .records
+                        .iter()
+                        .filter(|r| r.payload.is_some())
+                        .all(|r| r.source_shape.as_ref().unwrap()[1] <= 2));
                 }
                 let mut controlled_records = Vec::new();
                 let controlled = model

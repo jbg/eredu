@@ -1,21 +1,23 @@
 use super::*;
 mod checkpoint;
+mod ordinary_completion;
 pub(super) use checkpoint::StateCheckpoint;
+pub(crate) use ordinary_completion::ordinary_model_completion_call_controls;
 
-// Both ordinary and original inspection read the same selected layout/offset.
-// The conversion error itself is fixed; only the legacy adapter boxes it.
+// Both ordinary and original inspection use the same allocation-free check of
+// every actual stateful layer. Only the legacy adapter boxes a fixed refusal.
 fn checked_prefill_frontier<S: MlxStateMechanisms>(
     state: &S,
-) -> Result<Option<u64>, std::num::TryFromIntError> {
-    if state.optional_layout().is_none() {
-        return Ok(None);
-    }
-    u64::try_from(state.offset()).map(Some)
+) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+    state.original_text_frontier()
 }
 
+mod embedded_parallel;
+mod model_controls;
 mod opening_sources;
 mod prefill_controls;
 mod prefill_entry;
+mod transaction_controls;
 use opening_sources::{NativeOpeningSourceBinding, NativeOpeningSourceGuard};
 
 impl<A, S> eredu_runtime::replicated_session::ReplicatedTextSnapshotMechanisms<A, MlxNeuralBackend>
@@ -90,6 +92,7 @@ where
     prepared_bindings: Option<PreparedExactBindings>,
     prepared_layerwise_manager:
         Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    cache_transfer: Option<crate::backend::runtime::cache::residency::PreparedCacheTransferStream>,
     prediction_residency: super::super::prediction::parameters::PredictionResidency,
     prepared_parameters: Vec<eredu_runtime::parameter_operations::PreparedParameterSlot>,
     parameter_declarations: Vec<eredu_nn::ParameterMetadata>,
@@ -125,11 +128,18 @@ where
     gguf_host_allocator_coverage:
         crate::backend::managed_memory::input_allocator::InputAllocatorCoverage,
     native_storage_selection: eredu_runtime::working_memory::NativeStorageSelection,
+    pub(super) prompt_cache_context: Option<eredu_runtime::cache::PromptCachePersistenceFunding>,
+    pub(super) prompt_cache_materialization: Option<crate::backend::runtime::cache::residency::PromptCacheMaterialization>,
     prefill_controls: std::cell::RefCell<
         Option<crate::backend::submission_recovery::prefill::PrefillControlProjection>,
     >,
     prefill_roots: Option<crate::backend::submission_recovery::prefill::RootsProjection>,
+    autoregressive_invocation: Option<crate::composition::mlx::speculative::autoregressive::ActiveSpeculativeInvocation>,
+    embedded_invocation: Option<crate::composition::mlx::speculative::embedded_native::EmbeddedParallelInvocation>,
+    speculative_controls: std::cell::RefCell<Vec<crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeControlProjection>>,
+    active_speculative_control: std::cell::RefCell<Option<crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeControlProjection>>,
     parallel_control: std::cell::RefCell<Option<crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection>>,
+    pub(super) cache_control: Option<crate::backend::runtime::distributed::topology::original_source::control::cache::CacheControlProjection>,
     nested_completion: std::cell::RefCell<Option<crate::backend::submission_recovery::prefill::nested::NestedCompletionProjection>>,
     // Weak host-only installation: the original quote/work owns all row payloads.
     opening_rows: std::cell::RefCell<Option<opening_sources::InstalledOpeningRows>>,
@@ -146,8 +156,8 @@ pub(in crate::composition::mlx::replicated_text) struct PreparedExactBindings {
 }
 
 pub(in crate::composition::mlx::replicated_text) struct MlxPromptCacheSaveTransaction {
-    publication: eredu_runtime::ReversiblePromptCachePublication,
-    manifest: PromptCacheManifest,
+    publication: eredu_runtime::cache::PreparedReversiblePromptCachePublication,
+    manifest: eredu_core::cache::SharedPromptCacheManifest,
 }
 
 impl<A, S> MlxReplicatedTextMechanisms<A, S>
@@ -155,6 +165,45 @@ where
     S: MlxStateMechanisms,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
 {
+    fn install_embedded_invocation(
+        &mut self,
+        active: crate::composition::mlx::speculative::embedded_native::EmbeddedParallelInvocation,
+    ) -> Result<(), Error> {
+        if self.autoregressive_invocation.is_some()
+            || self.prefill_roots.is_some()
+            || self.embedded_invocation.is_some()
+        {
+            return Err(crate::composition::mlx::model::retain_planning_error(
+                Error::PrefillScopeReentrant,
+                active.metadata_funding().clone(),
+            ));
+        }
+        self.embedded_invocation = Some(active);
+        Ok(())
+    }
+    fn retire_embedded_invocation(&mut self, (): ()) {
+        drop(self.embedded_invocation.take());
+    }
+    pub(super) fn install_autoregressive_invocation(
+        &mut self,
+        active: crate::composition::mlx::speculative::autoregressive::ActiveSpeculativeInvocation,
+    ) -> Result<(), Error> {
+        if self.autoregressive_invocation.is_some()
+            || self.prefill_roots.is_some()
+            || self.embedded_invocation.is_some()
+        {
+            return Err(crate::composition::mlx::model::retain_planning_error(
+                Error::PrefillScopeReentrant,
+                active.metadata_funding(),
+            ));
+        }
+        self.autoregressive_invocation = Some(active);
+        Ok(())
+    }
+    pub(super) fn retire_autoregressive_invocation(&mut self, (): ()) {
+        drop(self.autoregressive_invocation.take());
+    }
+
     pub(super) fn new(
         store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         stream: &Stream,
@@ -185,6 +234,7 @@ where
             store,
             prepared_bindings: None,
             prepared_layerwise_manager: None,
+            cache_transfer: None,
             prediction_residency: Default::default(),
             prepared_parameters: Vec::new(),
             parameter_declarations: Vec::new(),
@@ -208,9 +258,16 @@ where
             }),
             gguf_host_allocator_coverage,
             native_storage_selection: Default::default(),
+            prompt_cache_context: None,
+            prompt_cache_materialization: None,
             prefill_controls: std::cell::RefCell::new(None),
             prefill_roots: None,
+            autoregressive_invocation: None,
+            embedded_invocation: None,
             parallel_control: std::cell::RefCell::new(None),
+            cache_control: None,
+            speculative_controls: std::cell::RefCell::new(Vec::new()),
+            active_speculative_control: std::cell::RefCell::new(None),
             nested_completion: std::cell::RefCell::new(None),
             opening_rows: std::cell::RefCell::new(None),
             state: PhantomData,
@@ -284,11 +341,14 @@ where
         })?(allocation)
     }
 
-    pub(super) fn set_prepared_layerwise_manager(
+    pub(super) fn set_prepared_construction_sources(
         &mut self,
-        manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+        sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     ) {
-        self.prepared_layerwise_manager = manager;
+        if let Some(sources) = sources {
+            self.prepared_layerwise_manager = sources.layerwise;
+            self.cache_transfer = sources.cache_transfer;
+        }
     }
 
     pub(super) fn set_parallel_layout(&mut self, layout: eredu_runtime::LocalModelLayout) {
@@ -471,7 +531,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let graph = architecture
             .execution_graph()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?.into_owned();
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .into_owned();
         let layout = eredu_runtime::partitioned_materialization_unit_layout(&graph, addresses)
             .map_err(Error::ArchitectureModel)?;
         (self.prepared_parameters, self.parameter_declarations) =
@@ -555,7 +616,8 @@ where
         }
         let populator = match self.prepared_layerwise_manager.as_ref() {
             Some(manager) => MlxSelectiveUnitPopulator::from_prepared(
-                manager.parameter_exclusions(&prepared.excluded_parameters)?),
+                manager.parameter_exclusions(&prepared.excluded_parameters)?,
+            ),
             None => MlxSelectiveUnitPopulator::new(prepared.excluded_parameters.clone()),
         };
         let (policy, _) = crate::backend::runtime::execution::generic::prepare_layerwise_policy_with_prepared_manager(
@@ -657,73 +719,169 @@ where
         Ok(())
     }
 
-    fn with_execution_parallel_control<T,E,F>(
-        &self,event:eredu_runtime::replicated_session::ParallelControlEvent,context:&Stream,run:F,
-    )->Result<Result<T,E>,eredu_core::BackendFailure>
-    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>, {
-        let projection={
-            let slot=self.parallel_control.try_borrow()
-                .map_err(|_|eredu_core::PreparedRequestRejection::Busy.into_backend_failure())?;
-            slot.as_ref().map(|value|value.retained()).transpose().map_err(Error::into_backend_failure)?
-        };
-        match projection {Some(projection)=>projection.run(event,context,run),None=>Ok(run(None))}
-    }
-
-    fn with_execution_parallel_control_context<T,E,F>(
-        &self,_context:&Stream,run:F,
-    )->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&mut Option<Box<<MlxNeuralBackend as NeuralBackend>::ParallelContext>>,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>,
+    fn with_execution_parallel_control<T, E, F>(
+        &self,
+        event: eredu_runtime::replicated_session::ParallelControlEvent,
+        context: &Stream,
+        run: F,
+    ) -> Result<Result<T, E>, eredu_core::BackendFailure>
+    where
+        F: FnOnce(
+            Option<(
+                &<MlxNeuralBackend as NeuralBackend>::ParallelContext,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
     {
-        let control={
-            let slot=self.parallel_control.try_borrow().map_err(|_|
-                Error::with_original_control_source(eredu_core::PreparedRequestRejection::Busy.into_backend_failure(),false))?;
-            slot.as_ref().map(|control|control.retained()).transpose()?
+        if let Some(control) = &self.cache_control {
+            return control.run(event, context, run);
+        }
+        let projection = {
+            let slot = self
+                .parallel_control
+                .try_borrow()
+                .map_err(|_| eredu_core::PreparedRequestRejection::Busy.into_backend_failure())?;
+            slot.as_ref()
+                .map(|value| value.retained())
+                .transpose()
+                .map_err(Error::into_backend_failure)?
         };
-        match control {
-            Some(control)=>{
-                let roots=self.prefill_roots.as_ref().map(|roots|roots.transient_roots()).transpose()?;
-                let binding=match &self.prefill_roots {
-                    Some(roots)=>roots.with_parallel(|parallel|parallel
-                        .map(|(parallel,_)|parallel.boundary_binding()).transpose())?,
-                    None=>None,
-                };
-                control.with_request_context(roots,binding,run)
-            },
-            None=>Ok(run(None)),
+        match projection {
+            Some(projection) => projection.run(event, context, run),
+            None => {
+                let control = self.active_speculative_control.try_borrow().map_err(|_| {
+                    eredu_core::PreparedRequestRejection::Busy.into_backend_failure()
+                })?;
+                match control.as_ref().filter(|control| control.is_active()) {
+                    Some(control) => control.run(event, context, run),
+                    None => match &self.autoregressive_invocation {
+                        Some(active) => active.with_transaction_control(event, context, run),
+                        None => Ok(run(None)),
+                    },
+                }
+            }
         }
     }
 
-    fn with_execution_parallel<T,E,F>(
-        &self,context:&Stream,run:F,
-    )->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&mut <MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>,
+    fn with_execution_parallel_control_context<T, E, F>(
+        &self,
+        _context: &Stream,
+        run: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where
+        F: FnOnce(
+            Option<(
+                &mut Option<Box<<MlxNeuralBackend as NeuralBackend>::ParallelContext>>,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
+    {
+        let control = {
+            let slot = self.parallel_control.try_borrow().map_err(|_| {
+                Error::with_original_control_source(
+                    eredu_core::PreparedRequestRejection::Busy.into_backend_failure(),
+                    false,
+                )
+            })?;
+            slot.as_ref()
+                .map(|control| control.retained())
+                .transpose()?
+        };
+        match control {
+            Some(control) => {
+                let roots = self
+                    .prefill_roots
+                    .as_ref()
+                    .map(|roots| roots.transient_roots())
+                    .transpose()?;
+                let binding = match &self.prefill_roots {
+                    Some(roots) => roots.with_parallel(|parallel| {
+                        parallel
+                            .map(|(parallel, _)| parallel.boundary_binding())
+                            .transpose()
+                    })?,
+                    None => None,
+                };
+                control.with_request_context(roots, binding, run)
+            }
+            None => Ok(run(None)),
+        }
+    }
+
+    fn with_execution_parallel<T, E, F>(
+        &self,
+        context: &Stream,
+        run: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where
+        F: FnOnce(
+            Option<(
+                &mut <MlxNeuralBackend as NeuralBackend>::ParallelContext,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
     {
         // Release the mechanism slot loan before model work or nested policy
         // calls. The copied view is weak and shares the submission activation.
-        let control={
-            let slot=self.parallel_control.try_borrow().map_err(|_|
-                Error::with_original_control_source(eredu_core::PreparedRequestRejection::Busy.into_backend_failure(),false))?;
-            slot.as_ref().map(|control|control.retained()).transpose()?
+        let control = {
+            let slot = self.parallel_control.try_borrow().map_err(|_| {
+                Error::with_original_control_source(
+                    eredu_core::PreparedRequestRejection::Busy.into_backend_failure(),
+                    false,
+                )
+            })?;
+            slot.as_ref()
+                .map(|control| control.retained())
+                .transpose()?
         };
+        if let Some(active) = &self.autoregressive_invocation {
+            return active.with_parallel(context, control.as_ref(), run);
+        }
+        if let Some(active) = &self.embedded_invocation {
+            return active.with_parallel(context, control.as_ref(), run);
+        }
         match &self.prefill_roots {
-            Some(roots)=>roots.with_addressable(|| roots.with_parallel(|parallel|match parallel {
-                Some((parallel,observer))=>{
-                    let neural=parallel.has_neural_context();
-                    parallel.with_model_context(observer,context,control.as_ref(),roots.transient_roots()?,
-                        |parallel,funding|run(neural.then_some((parallel,funding))))
-                },
-                None=>Ok(run(None)),
-            })),
-            None=>Ok(run(None)),
+            Some(roots) => roots.with_addressable(|| {
+                roots.with_parallel(|parallel| match parallel {
+                    Some((parallel, observer)) => {
+                        let neural = parallel.has_neural_context();
+                        parallel.with_model_context(
+                            observer,
+                            context,
+                            control.as_ref(),
+                            roots.transient_roots()?,
+                            |parallel, funding| run(neural.then_some((parallel, funding))),
+                        )
+                    }
+                    None => Ok(run(None)),
+                })
+            }),
+            None => Ok(run(None)),
         }
     }
 
-    fn with_execution_parallel_publication<T,E,F>(&self,context:&Stream,run:F)
-        ->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
+    fn with_execution_parallel_publication<T, E, F>(
+        &self,
+        context: &Stream,
+        run: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where
+        F: FnOnce(
+            Option<(
+                &<MlxNeuralBackend as NeuralBackend>::ParallelContext,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
+    {
+        if let Some(active) = &self.autoregressive_invocation {
+            return active.with_parallel_publication(context, run);
+        }
+        if let Some(active) = &self.embedded_invocation {
+            return active.with_parallel_publication(context, run);
+        }
         match &self.prefill_roots {
-            Some(roots)=>roots.with_parallel_publication(context,run),
-            None=>Ok(run(None)),
+            Some(roots) => roots.with_parallel_publication(context, run),
+            None => Ok(run(None)),
         }
     }
 
@@ -736,7 +894,6 @@ where
         state: &S,
     ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
         checked_prefill_frontier(state)
-            .map_err(|_| eredu_runtime::working_memory::WorkingMemoryError::Overflow)
     }
 
     type PrefillReservationGuard = crate::backend::submission_recovery::prefill::ReservationGuard;
@@ -764,11 +921,94 @@ where
         self.enter_prefill_retention(reservation, role, true)
     }
 
+    fn has_speculative_parallel_control(
+        &self,
+        authority: &eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority,
+    ) -> Result<bool, Self::Error> {
+        let controls = self
+            .speculative_controls
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        for control in controls.iter() {
+            if control.matches(authority)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn coordinate_speculative_prefill_entry(
+        &mut self,
+        authority: &eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority,
+        role: Option<eredu_runtime::prefill::PrefillControlRole>,
+    ) -> Result<Option<Self::PrefillReservationGuard>, Self::Error> {
+        // Scheduling owns only the funded host authority. Numerical spans and
+        // distributed control retain their separately admitted native roles.
+        // Final indexing itself creates native work and needs such a role.
+        if matches!(
+            role,
+            None | Some(eredu_runtime::prefill::PrefillControlRole::FinalIndex)
+        ) {
+            return Ok(None);
+        }
+        let installed = self
+            .prefill_controls
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        if installed.is_some() || self.prefill_roots.is_some() {
+            return Err(Error::PrefillScopeUnavailable);
+        }
+        let controls = [
+            std::mem::size_of::<Self::PrefillReservationGuard>(),
+            std::mem::size_of::<Option<Self::PrefillReservationGuard>>(),
+            std::mem::size_of::<Result<Option<Self::PrefillReservationGuard>, Error>>(),
+        ];
+        let bytes = controls
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+            ))?;
+        authority
+            .metadata_funding()
+            .reserve_metadata(bytes)
+            .map_err(|cause| Error::Neural(authority.metadata_funding().metadata_source(cause)))?;
+        let controls = self
+            .speculative_controls
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        let mut active = None;
+        for control in controls.iter() {
+            if control.matches(authority)? {
+                active = Some(control.clone());
+                break;
+            }
+        }
+        let activation = active
+            .as_ref()
+            .map(|control| control.activate())
+            .transpose()?;
+        *self
+            .active_speculative_control
+            .try_borrow_mut()
+            .map_err(|_| Error::PrefillScopeReentrant)? = active;
+        let guard = crate::backend::submission_recovery::prefill::ReservationGuard::new(
+            crate::backend::submission_recovery::prefill::NativeReservationGuard::SpeculativeSchedule(authority.clone(),activation),
+            None,
+        )?;
+        Ok(Some(guard))
+    }
+
     fn finish_prefill_reservation(
         &mut self,
         guard: Self::PrefillReservationGuard,
     ) -> Result<(), Self::Error> {
         let guard = match guard.into_native() {
+            crate::backend::submission_recovery::prefill::NativeReservationGuard::SpeculativeSchedule(authority,activation) => {
+                drop(activation);
+                drop(authority);
+                return Ok(());
+            }
             crate::backend::submission_recovery::prefill::NativeReservationGuard::Model(guard) => {
                 let result = guard.finish();
                 drop(self.prefill_roots.take());
@@ -790,6 +1030,7 @@ where
         Ok(())
     }
 
+    type PromptCacheManifest = eredu_core::cache::SharedPromptCacheManifest;
     type State = S;
     type PolicyError = Error;
     type ResidentPolicy = MlxArchitectureLayerwisePolicy<A, S>;
@@ -857,6 +1098,13 @@ where
             tasks,
             &addressable_parameters,
         )
+        .map_err(|cause| {
+            #[cfg(test)]
+            if std::env::var_os("EREDU_PIPELINE_ORIGINAL_AR_CAPTURE").is_some() {
+                eprintln!("AR provider factory partition materialization: {cause:?}");
+            }
+            cause
+        })
     }
 
     fn prepare_materialization(
@@ -957,9 +1205,22 @@ where
     fn realize_state(
         &mut self,
         selected: &SelectedStateRealization,
-        _context: &Stream,
+        context: &Stream,
     ) -> Result<S, Error> {
-        S::realize(selected, self.state_rank, self.state_global_layer_start)
+        S::realize(
+            selected,
+            self.state_rank,
+            self.state_global_layer_start,
+            context,
+            self.cache_transfer.as_ref(),
+        )
+        .map_err(|cause| {
+            #[cfg(test)]
+            if std::env::var_os("EREDU_PIPELINE_ORIGINAL_AR_CAPTURE").is_some() {
+                eprintln!("AR provider factory state realization: {cause:?}");
+            }
+            cause
+        })
     }
 
     fn resident_policy(
@@ -969,8 +1230,24 @@ where
         selected: &SelectedReplicatedTextRealization,
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
-        let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
-        let resident = policy.into_resident_units(units, context)?;
+        let (policy, layout, addresses) = self
+            .take_prepared_policy(architecture, selected)
+            .map_err(|cause| {
+                #[cfg(test)]
+                if std::env::var_os("EREDU_PIPELINE_ORIGINAL_AR_CAPTURE").is_some() {
+                    eprintln!("AR provider factory prepared residency policy: {cause:?}");
+                }
+                cause
+            })?;
+        let resident = policy
+            .into_resident_units(units, context)
+            .map_err(|cause| {
+                #[cfg(test)]
+                if std::env::var_os("EREDU_PIPELINE_ORIGINAL_AR_CAPTURE").is_some() {
+                    eprintln!("AR provider factory resident population: {cause:?}");
+                }
+                cause
+            })?;
         self.resident_report = Some(resident.residency_report()?);
         MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)
     }
@@ -981,7 +1258,15 @@ where
         selected: &SelectedReplicatedTextRealization,
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
-        let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
+        let (policy, layout, addresses) = self
+            .take_prepared_policy(architecture, selected)
+            .map_err(|cause| {
+                #[cfg(test)]
+                if std::env::var_os("EREDU_PIPELINE_ORIGINAL_AR_CAPTURE").is_some() {
+                    eprintln!("AR provider factory prepared residency policy: {cause:?}");
+                }
+                cause
+            })?;
         let policy = MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)?;
         if matches!(
             selected.residency(),
@@ -1004,16 +1289,22 @@ where
     ) -> Result<MlxTensor, Error> {
         use eredu_nn::Tensor;
         let [_, positions, _] = output.shape() else {
-            return Err(Error::ArchitectureModel("text output must have three axes".into()));
+            return Err(Error::ArchitectureModel(
+                "text output must have three axes".into(),
+            ));
         };
         let start = if sequence_index < 0 {
             positions.checked_add(sequence_index)
         } else {
             Some(sequence_index)
-        }.ok_or_else(|| Error::ArchitectureModel("text output index overflow".into()))?;
-        let end = start.checked_add(1)
+        }
+        .ok_or_else(|| Error::ArchitectureModel("text output index overflow".into()))?;
+        let end = start
+            .checked_add(1)
             .ok_or_else(|| Error::ArchitectureModel("text output index overflow".into()))?;
-        let indexed = output.narrow_axis(1, start, end, context)?.squeeze_axes(&[1], context)?;
+        let indexed = output
+            .narrow_axis(1, start, end, context)?
+            .squeeze_axes(&[1], context)?;
         // The model root is complete, but selecting the row introduces lazy views.
         // Finish that operation while the enclosing prefill reservation still
         // owns it, before publishing the output and its physical allocation.
@@ -1050,26 +1341,41 @@ where
         fork_mlx_prediction_target_state(state, context)
     }
 
+    fn prompt_cache_funding(&self) -> Option<&eredu_runtime::cache::PromptCachePersistenceFunding> {
+        self.prompt_cache_context.as_ref()
+    }
+
     fn load_prompt_cache(
         &mut self,
+        source: &Self::State,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         selected: &SelectedStateRealization,
         context: &Stream,
-    ) -> Result<(S, PromptCacheManifest), Error> {
-        let directory = eredu_runtime::prompt_cache_rank_path(directory, expected.topology());
+    ) -> Result<(S, Self::PromptCacheManifest), Error> {
+        let funding = self
+            .prompt_cache_context
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        let directory = funding
+            .rank_path(directory, expected.topology())
+            .map_err(|cause| super::cache_binding::failure(funding, cause))?;
         S::load_prompt_cache(
+            source,
             selected,
             &directory,
             expected,
             identity,
             prefix_token_ids,
             context,
+            funding,
+            self.prompt_cache_materialization
+                .as_ref()
+                .ok_or(Error::PrefillScopeUnavailable)?,
         )
     }
-
     fn save_prompt_cache(
         &mut self,
         state: &mut S,
@@ -1078,9 +1384,22 @@ where
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
         _context: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        let destination = eredu_runtime::prompt_cache_rank_path(destination, descriptor.topology());
-        S::save_prompt_cache(state, &destination, descriptor, prefix_token_ids, options)
+    ) -> Result<Self::PromptCacheManifest, Error> {
+        let funding = self
+            .prompt_cache_context
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        let destination = funding
+            .rank_path(destination, descriptor.topology())
+            .map_err(|cause| super::cache_binding::failure(funding, cause))?;
+        S::save_prompt_cache(
+            state,
+            &destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            funding,
+        )
     }
 
     fn state_report(&self, state: &S) -> Result<Self::StateReport, Error> {
@@ -1126,7 +1445,15 @@ where
         _context: &Stream,
     ) -> Option<Result<(), Error>> {
         match self.active_nested_completion() {
-            Ok(Some(nested)) => return Some(self.complete_nested_roots(&nested, output, state, Some(roots), _context)),
+            Ok(Some(nested)) => {
+                return Some(self.complete_nested_roots(
+                    &nested,
+                    output,
+                    state,
+                    Some(roots),
+                    _context,
+                ));
+            }
             Err(cause) => return Some(Err(cause)),
             Ok(None) => {}
         }
@@ -1216,21 +1543,32 @@ where
         options: &PromptCacheOptions,
         _context: &Stream,
     ) -> Result<Self::PromptCacheSaveTransaction, Error> {
-        let destination = eredu_runtime::prompt_cache_rank_path(destination, descriptor.topology());
-        let publication = eredu_runtime::ReversiblePromptCachePublication::begin(
+        let funding = self
+            .prompt_cache_context
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        let destination = funding
+            .rank_path(destination, descriptor.topology())
+            .map_err(|cause| super::cache_binding::failure(funding, cause))?;
+        let publication = eredu_runtime::cache::PreparedReversiblePromptCachePublication::begin(
             &destination,
             options.replace_existing(),
+            funding,
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let staging_options =
-            PromptCacheOptions::new(options.application_namespace().map(str::to_owned), false)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(|cause| super::cache_binding::failure(funding, cause))?;
+        let namespace = options
+            .application_namespace()
+            .map(|text| funding.context().metadata_string(format_args!("{text}")))
+            .transpose()?;
+        let staging_options = PromptCacheOptions::new(namespace, false)
+            .map_err(|cause| super::cache_binding::failure(funding, cause))?;
         let manifest = S::save_prompt_cache(
             state,
             publication.staging_destination(),
             descriptor,
             prefix_token_ids,
             &staging_options,
+            funding,
         )?;
         Ok(MlxPromptCacheSaveTransaction {
             publication,
@@ -1240,7 +1578,7 @@ where
 
     fn prepared_prompt_cache_manifest(
         transaction: &Self::PromptCacheSaveTransaction,
-    ) -> &PromptCacheManifest {
+    ) -> &Self::PromptCacheManifest {
         &transaction.manifest
     }
 
@@ -1248,10 +1586,14 @@ where
         &mut self,
         transaction: &mut Self::PromptCacheSaveTransaction,
     ) -> Result<(), Error> {
+        let funding = self
+            .prompt_cache_context
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
         transaction
             .publication
             .publish()
-            .map_err(|error| Error::Parallel(error.to_string()))
+            .map_err(|cause| super::cache_binding::failure(funding, cause))
     }
 
     fn commit_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
@@ -1282,8 +1624,9 @@ impl crate::backend::submission_recovery::Retention for PrefillReservationRetent
 mod prefill_reservation_tests {
     use super::PrefillReservationRetention;
     use crate::backend::submission_recovery::{self, Probe, Recovery, Status};
+    use crate::memory_fixture::LedgerFixture as _;
     use eredu_core::*;
-    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
     use std::{cell::Cell, rc::Rc};
 
     struct Deferred(Rc<Cell<Status>>);
@@ -1307,9 +1650,8 @@ mod prefill_reservation_tests {
             input: InputTokenCount::text(3),
             max_output_tokens: 1,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: crate::memory_fixture::headroom(0),
+            memory_limits: Default::default(),
         };
         let capabilities = ModelCapabilities {
             effective_model_type: "native retention fixture".into(),
@@ -1336,18 +1678,21 @@ mod prefill_reservation_tests {
             std::num::NonZeroU8::new(4).unwrap(),
         )
         .unwrap()
-        .with_execution_workspace(ExecutionWorkspaceEstimate {
-            geometry,
-            activations: bound(),
-            attention: bound(),
-            vocabulary: bound(),
-            state_update: bound(),
-            materialization: bound(),
-            retained: bound(),
-        })
+        .with_execution_workspace(crate::memory_fixture::workspace(
+            ExecutionWorkspaceEstimate {
+                physical_domains: None,
+                geometry,
+                activations: bound(),
+                attention: bound(),
+                vocabulary: bound(),
+                state_update: bound(),
+                materialization: bound(),
+                retained: bound(),
+            },
+        ))
         .unwrap();
         let AdmissionResult::Admitted(admission) =
-            apply_admission_policy(&capabilities, request, state, None).unwrap()
+            apply_admission_policy(&capabilities, request, state).unwrap()
         else {
             panic!("fixture admission")
         };
@@ -1358,11 +1703,22 @@ mod prefill_reservation_tests {
     fn reservation_remains_charged_after_unobservable_native_scope_is_dropped() {
         let admission = retention_admission();
         for blocked in [false, true] {
-            let pool = WorkingMemoryPool::new(admission.incremental_required_bytes, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(
+                admission
+                    .incremental_required_bytes
+                    .expect("finite fixture diagnostic"),
+                0,
+            )
+            .unwrap();
             let reservation = pool
                 .reserve(&InferenceExecutionIdentity::default(), &admission)
                 .unwrap();
-            let charge = reservation.bytes();
+            let charge = reservation
+                .requirements()
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap();
             let status = Rc::new(Cell::new(Status {
                 settled: false,
                 failed: !blocked,
@@ -1375,13 +1731,15 @@ mod prefill_reservation_tests {
             let observed = recovery.finish().unwrap();
             assert!(!observed.settled);
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 charge,
                 "scope failure cannot refund native authority"
             );
             assert!(matches!(
                 pool.reserve(&InferenceExecutionIdentity::default(), &admission),
-                Err(eredu_runtime::working_memory::WorkingMemoryError::BudgetExceeded { .. })
+                Err(eredu_runtime::working_memory::WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
             ));
             status.set(Status {
                 settled: true,
@@ -1389,16 +1747,16 @@ mod prefill_reservation_tests {
                 blocked: false,
             });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while pool.used_bytes().unwrap() != 0 && std::time::Instant::now() < deadline {
+            while pool.fixture_host_charge().unwrap() != 0 && std::time::Instant::now() < deadline {
                 submission_recovery::reap();
                 std::thread::yield_now();
             }
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 0,
                 "independent settlement releases the retained charge"
             );
-            assert!(pool.peak_bytes().unwrap() >= charge);
+            assert!(pool.fixture_host_peak().unwrap() >= charge);
         }
     }
 
@@ -1432,8 +1790,10 @@ mod prefill_reservation_tests {
             // these native arrays. Numerical/native capacity bounds are tested
             // separately; this test follows exact charge ownership only.
             let admission = retention_admission();
-            let charge = admission.incremental_required_bytes;
-            let pool = WorkingMemoryPool::new(charge * 2, 0).unwrap();
+            let charge = admission
+                .incremental_required_bytes
+                .expect("finite fixture diagnostic");
+            let pool = crate::memory_fixture::ledger(charge * 2, 0).unwrap();
             let execution = InferenceExecutionIdentity::default();
             let first: InferenceRequest = pool.reserve(&execution, &admission).unwrap().into();
             state.retain_inference(&first);
@@ -1453,15 +1813,15 @@ mod prefill_reservation_tests {
             state.restore_checkpoint(&checkpoint, stream).unwrap();
             assert_eq!(state.inference_retention().requests().len(), 2);
             assert_eq!(values(&state, stream), before);
-            assert_eq!(pool.used_bytes().unwrap(), charge * 2);
+            assert_eq!(pool.fixture_host_charge().unwrap(), charge * 2);
             drop(state);
-            assert_eq!(pool.used_bytes().unwrap(), charge);
+            assert_eq!(pool.fixture_host_charge().unwrap(), charge);
             drop(checkpoint);
             drop(saved);
-            assert_eq!(pool.used_bytes().unwrap(), charge);
+            assert_eq!(pool.fixture_host_charge().unwrap(), charge);
             drop(fork);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
-            assert_eq!(pool.peak_bytes().unwrap(), charge * 2);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
+            assert_eq!(pool.fixture_host_peak().unwrap(), charge * 2);
         }
 
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
@@ -1534,3 +1894,7 @@ pub(crate) use opening_sources::{
     NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
     SealedOpeningRows,
 };
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

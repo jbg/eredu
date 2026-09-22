@@ -1,14 +1,14 @@
 use super::*;
 use eredu_core::{
-    CapabilityError, SharedStorageDomain, SharedTokenFilter, TextControllerContractError,
+    CapabilityError, SharedStorageAccountingId, SharedTokenFilter, TextControllerContractError,
     TextControllerStorage, TextFilterWorkspace, TokenFilter, TokenFilterController,
 };
 use std::{
     convert::Infallible,
     error::Error,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -49,7 +49,7 @@ fn filter(capacity: usize) -> TokenFilter {
     bits.extend([true, false, true, false]);
     TokenFilter::allowed(bits).unwrap()
 }
-fn prepared(pool: &WorkingMemoryPool, capacity: usize) -> SharedTokenFilter {
+fn prepared(pool: &MemoryLedger, capacity: usize) -> SharedTokenFilter {
     pool.prepare_shared_token_filter(|| filter(capacity))
         .unwrap()
 }
@@ -75,6 +75,7 @@ fn workspace(additional_host_bytes: u64) -> TextControllerWorkspace<'static> {
 fn outside() -> ExecutionWorkspaceEstimate {
     let bound = |bytes| WorkspaceBound::bounded(bytes, "independent enclosing fixture component");
     ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: geometry(),
         activations: bound(11),
         attention: bound(13),
@@ -105,16 +106,15 @@ fn mismatch(error: ControllerStorageError) {
 
 #[test]
 fn exact_unique_source_capacity_is_removed_only_from_fixed_controller_addition() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let source = prepared(&pool, 37);
     let controller = Controller::new(vec![source.clone(), source.clone()]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     let pin = contract.pin_registered(&controller, &pool).unwrap();
     assert_eq!(source.allowed_mask().unwrap().len(), 4);
     assert_eq!(pin.source_bytes(), 37);
-    assert!(pin.pool().same_domain(&pool));
-    assert_eq!(pool.used_bytes().unwrap(), 37);
-    assert_eq!(pool.peak_bytes().unwrap(), 37);
+    assert!(pin.pool().same_ledger(&pool));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     let declaration = workspace(64);
     let contribution = ControllerWorkspaceContribution::new(
         geometry(),
@@ -128,14 +128,26 @@ fn exact_unique_source_capacity_is_removed_only_from_fixed_controller_addition()
     let base = outside();
     assert_eq!(base.peak_bytes().unwrap(), Some(112));
     let estimate = contribution.compose(base.clone()).unwrap();
-    assert_eq!(estimate.full().retained.bytes(), Some(93));
-    assert_eq!(estimate.incremental().retained.bytes(), Some(56));
-    assert_eq!(estimate.full().peak_bytes().unwrap(), Some(176));
-    assert_eq!(estimate.incremental().peak_bytes().unwrap(), Some(139));
+    assert_eq!(
+        estimate.full().retained.bytes(),
+        Some(93 + contract.publication_control_bytes().unwrap())
+    );
+    assert_eq!(
+        estimate.incremental().retained.bytes(),
+        Some(56 + contract.publication_control_bytes().unwrap())
+    );
+    assert_eq!(
+        estimate.full().peak_bytes().unwrap(),
+        Some(176 + contract.publication_control_bytes().unwrap())
+    );
+    assert_eq!(
+        estimate.incremental().peak_bytes().unwrap(),
+        Some(139 + contract.publication_control_bytes().unwrap())
+    );
     unchanged_components(estimate.full(), &base);
     unchanged_components(estimate.incremental(), &base);
     assert_eq!(estimate.geometry(), geometry());
-    assert!(estimate.pool().same_domain(&pool));
+    assert!(estimate.pool().same_ledger(&pool));
     assert_eq!(
         estimate.controller_contract(),
         contribution.controller_contract()
@@ -147,13 +159,12 @@ fn exact_unique_source_capacity_is_removed_only_from_fixed_controller_addition()
         estimate.controller_contract(),
         &TextControllerContract::from_workspace(declaration, 4).unwrap()
     );
-    assert_eq!(pool.used_bytes().unwrap(), 37);
-    assert_eq!(pool.peak_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
 }
 
 #[test]
 fn uncredited_contribution_preserves_the_full_allowance_and_pins_no_sources() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let source = prepared(&pool, 37);
     let controller = Controller::new(vec![source]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
@@ -162,50 +173,51 @@ fn uncredited_contribution_preserves_the_full_allowance_and_pins_no_sources() {
             .unwrap();
     let estimate = contribution.compose(outside()).unwrap();
     assert_eq!(estimate.full(), estimate.incremental());
-    assert_eq!(estimate.full().peak_bytes().unwrap(), Some(176));
+    assert_eq!(
+        estimate.full().peak_bytes().unwrap(),
+        Some(176 + contract.publication_control_bytes().unwrap())
+    );
     assert!(estimate.pin().is_none());
     drop(controller);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop((contract, contribution, estimate));
 }
 
 #[test]
 fn complete_existing_only_pin_rejects_missing_members_without_partial_retention() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let registered = prepared(&pool, 37);
     let absent = SharedTokenFilter::new(filter(53));
     let controller = Controller::new(vec![registered.clone(), absent.clone()]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     mismatch(contract.pin_registered(&controller, &pool).unwrap_err());
-    assert_eq!(pool.used_bytes().unwrap(), 37);
-    assert_eq!(pool.peak_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     drop((controller, registered));
     // A staged first key must not survive rejection of the complete inventory.
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert_eq!(absent.capacity_bytes(), Some(53));
     drop((absent, contract));
 }
 
 #[test]
 fn existing_pin_rejects_conflicting_capacity_instead_of_registering_a_new_charge() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let source = SharedTokenFilter::new(filter(37));
     let conflicting = pool
-        .register_storage([(source.identity().clone(), 38)])
+        .register_host_storage([(source.identity().clone(), 38)])
         .unwrap();
     let controller = Controller::new(vec![source.clone()]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     mismatch(contract.pin_registered(&controller, &pool).unwrap_err());
-    assert_eq!(pool.used_bytes().unwrap(), 38);
-    assert_eq!(pool.peak_bytes().unwrap(), 38);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 38);
     drop((controller, source, conflicting));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn foreign_pools_and_equal_sized_replacement_inventories_cannot_reuse_credit() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
+    let foreign = super::super::tests::host_ledger(512, 0).unwrap();
     let first = prepared(&pool, 37);
     let replacement = prepared(&pool, 37);
     assert_eq!(first, replacement);
@@ -239,16 +251,15 @@ fn foreign_pools_and_equal_sized_replacement_inventories_cannot_reuse_credit() {
         )
         .unwrap_err(),
     );
-    assert_eq!(pool.used_bytes().unwrap(), 74);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
-    assert_eq!(foreign.peak_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 74);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     drop((registered, controller));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn zero_byte_sources_still_bind_identity_without_requiring_registry_entries() {
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = super::super::tests::host_ledger(0, 0).unwrap();
     let source = SharedTokenFilter::new(TokenFilter::All);
     let mut controller = Controller::new(vec![source.clone(), source.clone()]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
@@ -268,15 +279,14 @@ fn zero_byte_sources_still_bind_identity_without_requiring_registry_entries() {
     .unwrap();
     let estimate = contribution.compose(outside()).unwrap();
     assert_eq!(estimate.full(), estimate.incremental());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     controller.filters = vec![SharedTokenFilter::new(TokenFilter::All)];
     mismatch(contract.pin_registered(&controller, &pool).unwrap_err());
-    assert_eq!(pool.peak_bytes().unwrap(), 0);
 }
 
 #[test]
 fn unknown_lifetime_invalid_metadata_and_unpriced_sources_preserve_typed_causes() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let mut controller = Controller::new(vec![prepared(&pool, 37)]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     let registered = contract.pin_registered(&controller, &pool).unwrap();
@@ -351,13 +361,12 @@ fn unknown_lifetime_invalid_metadata_and_unpriced_sources_preserve_typed_causes(
         ),
         Err(ControllerStorageError::Contract(_))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 37);
-    assert_eq!(pool.peak_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
 }
 
 #[test]
 fn composition_checks_geometry_and_full_overflow_without_upgrading_unknown_components() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let controller = Controller::new(vec![prepared(&pool, 37)]);
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     let registered = contract.pin_registered(&controller, &pool).unwrap();
@@ -401,12 +410,17 @@ fn composition_checks_geometry_and_full_overflow_without_upgrading_unknown_compo
             assert_eq!(estimate.full().retained, missing.retained);
             assert_eq!(estimate.incremental().retained, missing.retained);
         } else {
-            assert_eq!(estimate.full().retained.bytes(), Some(93));
-            assert_eq!(estimate.incremental().retained.bytes(), Some(56));
+            assert_eq!(
+                estimate.full().retained.bytes(),
+                Some(93 + contract.publication_control_bytes().unwrap())
+            );
+            assert_eq!(
+                estimate.incremental().retained.bytes(),
+                Some(56 + contract.publication_control_bytes().unwrap())
+            );
         }
     }
-    assert_eq!(pool.used_bytes().unwrap(), 37);
-    assert_eq!(pool.peak_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
 }
 
 #[test]
@@ -417,11 +431,11 @@ fn accounting_proofs_outlive_mask_payload_without_owner_cycles_and_release_at_la
             self.0.store(true, Ordering::SeqCst);
         }
     }
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = super::super::tests::host_ledger(512, 0).unwrap();
     let source = prepared(&pool, 37);
     let retired = Arc::new(AtomicBool::new(false));
     source
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Retired(retired.clone())))
         })
         .unwrap();
@@ -445,12 +459,11 @@ fn accounting_proofs_outlive_mask_payload_without_owner_cycles_and_release_at_la
         retired.load(Ordering::SeqCst),
         "proofs must retain no SharedTokenFilter owner"
     );
-    assert_eq!(pool.used_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     drop((registered, contribution, estimate, independent_estimate));
-    assert_eq!(pool.used_bytes().unwrap(), 37);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 37);
     drop(scope_pin);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     // Identity-only contract metadata remains alive after all physical custody retires.
     assert_eq!(contract, contract.clone());
-    assert_eq!(pool.peak_bytes().unwrap(), 37);
 }

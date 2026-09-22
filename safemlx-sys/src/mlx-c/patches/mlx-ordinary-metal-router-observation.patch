@@ -1,0 +1,116 @@
+diff --git a/mlx/backend/metal/fence.cpp b/mlx/backend/metal/fence.cpp
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -156,11 +156,11 @@
+     fence_ = std::allocate_shared<FenceImpl>(
+         submission::GraphAllocator<FenceImpl>(original ? original->graph() : binding.graph),
+         stream, *device, original);
+-  } else if (stream.device == Device::cpu) {
++  } else {
++    // Both ordinary producer classes retain the actual physical payer in the
++    // shared owner. Stream selection still chooses the same Event/fast-buffer
++    // worker, independently of limits; no Original arena is substituted.
+     fence_ = std::allocate_shared<FenceImpl>(submission::GraphAllocator<FenceImpl>{}, stream);
+-  } else {
+-    auto dtor = [](void* ptr) { delete static_cast<FenceImpl*>(ptr); };
+-    fence_ = std::shared_ptr<void>(new FenceImpl(stream), dtor);
+   }
+ }
+ 
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1983,9 +1983,10 @@
+   // Do not certify the fast alternative unless its actual source was compiled.
+   if (cpu_partitions) return false;
+ #endif
+-  // The existing mixed-stream worker remains one Eval. The consumed
+-  // cumulative profile is the authenticated no-tracing, single-GPU DAG.
+-  if (!evaluations || (cpu_partitions && (evaluations != 1 || consumer_waits)) ||
++  // The mixed profile is one Eval on the retained model GPU/router CPU
++  // pair. Consumer waits use that same GPU's Event worker and encoder; they
++  // do not introduce another traversal, stream or Fence producer.
++  if (!evaluations || (cpu_partitions && evaluations != 1) ||
+       cpu_partitions > input_edges) return false;
+   ResidentGpuWorkerLayout value;
+   size_t temporaries, data_controls, frontier_controls = 0;
+@@ -2164,8 +2165,10 @@
+     };
+     size_t gpu_actions, actions, cpu_actions;
+     if (!add(input_edges, cpu_partitions, gpu_actions) ||
++        !add(gpu_actions, consumer_waits, gpu_actions) ||
+         !mul(cpu_partitions, 3, cpu_actions) ||
+         !add(input_edges, cpu_actions, actions) ||
++        !add(actions, consumer_waits, actions) ||
+         !extent(fence.shared_bytes, fence.shared_alignment, 2) ||
+         // Slow fences own an Event instead of a U32 backing. Fast backing
+         // births already belong to backing_births, with their routing owner.
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -2187,12 +2187,13 @@
+ }
+ namespace {
+ bool ordinary_eval_control_layout(OrdinaryEvalPopulation p, bool metal,
+-    OrdinaryControlPopulation& out) noexcept {
++    bool router, OrdinaryControlPopulation& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+   if (!p.roots || !p.arrays || !p.tape || p.tape > p.arrays ||
+-      !p.streams || p.streams > p.tape || (metal && p.streams != 1) || p.outputs < p.tape ||
++      !p.streams || p.streams > p.tape ||
++      (metal && p.streams != (router ? 2 : 1)) || p.outputs < p.tape ||
+       p.roots > p.edges || p.arrays > size_t(INT_MAX) ||
+       p.edges > size_t(INT_MAX) || p.tape > size_t(INT_MAX)) return false;
+   RecordFrontierStorageLayout base;
+@@ -2234,8 +2235,13 @@
+   // CPU dispatch has no separate Event producer, so its tasks stay here.
+   if (metal) {
+     if (!append_ordinary_control(value, event.shared_bytes, event.shared_alignment)) return false;
+-    if (event.platform_events > SIZE_MAX / 2) return false;
+-    value.platform_events = 2 * event.platform_events;
++    // The qualified router source owns at most one GPU and one CPU Fence.
++    // Their slow alternatives each create an Event; their owner/task/handler
++    // bytes already belong to the selected mixed GPU dispatch source. Count
++    // the platform objects here once, beside Synchronizer and CPU async Event.
++    const size_t events = router ? 4 : 2;
++    if (event.platform_events > SIZE_MAX / events) return false;
++    value.platform_events = events * event.platform_events;
+     out = value; return true;
+   }
+   size_t events, waits;
+@@ -2261,10 +2267,14 @@
+ } // namespace
+ bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation p,
+     OrdinaryControlPopulation& out) noexcept {
+-  return ordinary_eval_control_layout(p, false, out);
++  return ordinary_eval_control_layout(p, false, false, out);
+ }
+ bool ordinary_metal_eval_control_layout(OrdinaryEvalPopulation p,
+     OrdinaryControlPopulation& out) noexcept {
+-  return ordinary_eval_control_layout(p, true, out);
+-}
+-}
++  return ordinary_eval_control_layout(p, true, false, out);
++}
++bool ordinary_metal_router_eval_control_layout(OrdinaryEvalPopulation p,
++    OrdinaryControlPopulation& out) noexcept {
++  return ordinary_eval_control_layout(p, true, true, out);
++}
++}
+diff --git a/mlx/ordinary_control.h b/mlx/ordinary_control.h
+--- a/mlx/ordinary_control.h
++++ b/mlx/ordinary_control.h
+@@ -42,6 +42,11 @@
+ // Event only. The selected GPU worker owns async Event/handler/encoder controls.
+ MLX_API bool ordinary_metal_eval_control_layout(OrdinaryEvalPopulation,
+     OrdinaryControlPopulation&) noexcept;
++// One selected Metal model stream and one qualified CPU router stream. The
++// same mixed GPU worker owns both Fence alternatives, async Event and dispatch
++// controls. Platform Events (including slow Fences) are counted only here.
++MLX_API bool ordinary_metal_router_eval_control_layout(OrdinaryEvalPopulation,
++    OrdinaryControlPopulation&) noexcept;
+ MLX_API bool ordinary_metal_wait_record_control_layout(OrdinaryControlPopulation&) noexcept;
+ MLX_API bool ordinary_cpu_wait_control_layout(OrdinaryControlPopulation&) noexcept;
+ }

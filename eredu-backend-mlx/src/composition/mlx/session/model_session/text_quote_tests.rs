@@ -5,7 +5,7 @@ use eredu_core::{
 };
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 use eredu_core::{InferenceGeometry, OutputDemand, TextGeneration};
-use eredu_runtime::working_memory::{PrefillPlanningError, WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, PrefillPlanningError, WorkingMemoryError};
 
 #[derive(Clone, Default)]
 struct Controller(Rc<Cell<(usize, usize, usize)>>);
@@ -65,7 +65,15 @@ fn config(temperature: f32, capacity: Option<u64>) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: capacity,
+        memory_limits: (capacity).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -85,10 +93,10 @@ fn evidence() -> TextPreparationInput<'static, MlxModelInput> {
 
 fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -98,7 +106,7 @@ fn runtime(
         pool.unquoted_owner_count().unwrap() == 0
     });
     assert!(runtime.session().payload.model.has_published_idle_storage());
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     (runtime, artifact)
 }
 
@@ -107,10 +115,10 @@ fn reclaim() {
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -151,7 +159,7 @@ struct ColdState {
 }
 
 impl ColdState {
-    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) -> Self {
+    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) -> Self {
         let inventory = runtime.session().payload.retained_idle_storage().unwrap();
         assert!(inventory.has_empty_decoder_storage().unwrap());
         Self {
@@ -159,8 +167,8 @@ impl ColdState {
             inputs: paths::session_input_creation_attempts(),
             resets: paths::session_reset_attempts(),
             frontier: runtime.session().payload.model.erased().state_snapshot(),
-            bytes: pool.used_bytes().unwrap(),
-            peak: pool.peak_bytes().unwrap(),
+            bytes: pool.fixture_host_charge().unwrap(),
+            peak: pool.fixture_host_peak().unwrap(),
             nonstate: inventory.nonstate_bytes().unwrap().unwrap(),
         }
     }
@@ -179,9 +187,9 @@ impl ColdState {
         assert!(inventory.has_empty_decoder_storage().unwrap());
     }
 
-    fn assert_uncharged(&self, pool: &WorkingMemoryPool) {
-        assert_eq!(pool.used_bytes().unwrap(), self.bytes);
-        assert_eq!(pool.peak_bytes().unwrap(), self.peak);
+    fn assert_uncharged(&self, pool: &MemoryLedger) {
+        assert_eq!(pool.fixture_host_charge().unwrap(), self.bytes);
+        assert_eq!(pool.fixture_host_peak().unwrap(), self.peak);
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     }
 }
@@ -189,10 +197,14 @@ impl ColdState {
 #[test]
 fn cpu_public_quote_retains_cpu_selection_and_rejects_missing_native_facts_before_work() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     assert!(matches!(
-        runtime.session().payload.model.resident_workspace_mechanisms(),
+        runtime
+            .session()
+            .payload
+            .model
+            .resident_workspace_mechanisms(),
         Some(crate::backend::nn::workspace::ResidentExecutionMechanisms::Cpu { .. })
     ));
     let controller = Controller::default();
@@ -266,7 +278,7 @@ fn sized_external_controller_rejects_before_sampling_or_callbacks() {
     }
 
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     assert!(runtime.session().payload.model.has_workspace_mechanisms());
     let mask = Rc::new(TokenFilter::allowed(vec![true; 64]).unwrap());
@@ -313,7 +325,7 @@ fn sized_external_controller_rejects_before_sampling_or_callbacks() {
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 fn checked_prompt_provenance(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     controller: &Controller,
     preparation: MlxTextPreparation,
 ) {
@@ -409,16 +421,19 @@ fn checked_prompt_provenance(
     )
     .unwrap();
     let mut installed_epoch = None;
-    runtime.session().validate_parameter_epoch(&mut installed_epoch).unwrap();
+    runtime
+        .session()
+        .validate_parameter_epoch(&mut installed_epoch)
+        .unwrap();
     assert!(installed_epoch.is_some());
-    assert_eq!(sampling.sampling.parameter_epoch, installed_epoch,
-        "pending admitted sampling must retain its quoted parameter version before prefill");
+    assert_eq!(
+        sampling.sampling.parameter_epoch, installed_epoch,
+        "pending admitted sampling must retain its quoted parameter version before prefill"
+    );
     let before_override = ColdState::capture(runtime, pool);
     let original_temperature = sampling.sampling.temperature;
     let had_rng = sampling.sampling.prng.is_some();
-    use eredu_runtime::execution_control::{
-        SamplingOverride, TextSamplingControlBackend,
-    };
+    use eredu_runtime::execution_control::{SamplingOverride, TextSamplingControlBackend};
     for change in [
         SamplingOverride {
             temperature: Some(0.0),
@@ -487,7 +502,7 @@ fn live_storage_bytes(
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 fn accepted_run(
     mut runtime: ModelRuntime<MlxBackend<'static>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     temperature: f32,
     capacity: u64,
     controlled: bool,
@@ -532,7 +547,13 @@ fn accepted_run(
         .requests()
         .next()
         .expect("populated decoder retains its request");
-    let charge = request.memory_reservation().unwrap().bytes();
+    let charge = request
+        .memory_reservation()
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     assert!(charge > 0);
     for (index, token) in outputs.iter().enumerate() {
         assert_eq!(token.step_receipt().unwrap().attempt(), index as u64);
@@ -563,7 +584,7 @@ fn accepted_run(
         "completed sampling must release workspace: original={charge}, retained={retained_increment}"
     );
     assert!(live_storage <= capacity);
-    assert!(pool.peak_bytes().unwrap() <= capacity);
+    assert!(pool.fixture_host_peak().unwrap() <= capacity);
     eprintln!(
         "funded Metal quote: temperature={temperature}, controlled={controlled}, \
          original={charge}, retained_increment={retained_increment}, \
@@ -601,8 +622,11 @@ fn accepted_run(
                 .next()
                 .unwrap()
                 .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
                 .unwrap()
-                .bytes(),
+                .total()
+                .unwrap(),
             charge
         );
         drop(retained);
@@ -619,7 +643,7 @@ fn metal_real_quote_is_cold_and_either_explains_a_gap_or_runs_multiple_receipted
     for temperature in [0.0, 0.7] {
         let mut sequences = Vec::new();
         for controlled in [false, true] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let (mut runtime, _artifact) = runtime(&stream, &pool);
             let controller = Controller::default();
             let before = ColdState::capture(&runtime, &pool);
@@ -687,8 +711,15 @@ fn metal_real_quote_is_cold_and_either_explains_a_gap_or_runs_multiple_receipted
             let (preparation, proof) = admitted.unwrap_or_else(|error| {
                 panic!("complete real Metal components failed admission: {error}")
             });
-            let charge = preparation.request().memory_reservation().unwrap().bytes();
-            let capacity = pool.used_bytes().unwrap();
+            let charge = preparation
+                .request()
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap();
+            let capacity = pool.fixture_host_charge().unwrap();
             assert_eq!(capacity, before.bytes + charge);
             assert!(charge > 0);
             assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
@@ -720,3 +751,7 @@ fn metal_real_quote_is_cold_and_either_explains_a_gap_or_runs_multiple_receipted
         assert!(sequences.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

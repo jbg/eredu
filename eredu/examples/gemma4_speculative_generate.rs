@@ -1,15 +1,18 @@
 //! Compare ordinary and speculative generation with the same prepared chat.
 //! Arguments: target directory, assistant directory, prompt, maximum tokens,
-//! and the enforced request capacity in bytes.
+//! and comma-separated physical limits such as `host=8589934592` or
+//! `host=unlimited`. Omitted domains are unlimited.
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 
 use anyhow::Context;
 use eredu::{
     api::{
-        ChatSourceInput, LoadedModel, PreparedChatGenerationSettings, PreparedChatOutputMode,
-        PreparedChatPrompt, PreparedChatRequest, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeRequest, TokenizerSourceInput, default_local_device,
-        local_device_plan,
+        default_local_device, local_device_plan, ChatSourceInput, LoadedModel,
+        PreparedChatGenerationSettings, PreparedChatOutputMode, PreparedChatPrompt,
+        PreparedChatRequest, PreparedChatSpeculativeGenerationOptions,
+        PreparedChatSpeculativeRequest, TokenizerSourceInput,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -28,10 +31,7 @@ fn main() -> anyhow::Result<()> {
         .get(3)
         .context("maximum token count required")?
         .parse::<usize>()?;
-    let capacity = args
-        .get(4)
-        .context("request capacity in bytes required")?
-        .parse::<u64>()?;
+    let capacity = physical_memory::parse(args.get(4).context("physical domain limits required")?)?;
     anyhow::ensure!(max_tokens > 0, "maximum token count must be positive");
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?)
@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
                 add_generation_prompt: true,
                 ..Default::default()
             },
-            capacity,
+            &capacity,
             &cancellation,
         )?
         .context("chat preparation cancelled")?;
@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: capacity.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -88,7 +88,10 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let mut text = String::new();
     let ordinary = target
-        .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)?
+        .start_prepared_chat(
+            PreparedChatRequest::new(&prepared, settings.clone()),
+            &cancellation,
+        )?
         .context("ordinary generation cancelled")?
         .run(&cancellation, &mut |event| {
             if let SemanticEvent::TextDelta(delta) = event {
@@ -110,7 +113,7 @@ fn main() -> anyhow::Result<()> {
             drafting: drafting
                 .as_speculative_draft()
                 .context("drafting plan was not realized")?,
-            settings,
+            settings: settings.clone(),
             output_mode: PreparedChatOutputMode::Semantic,
             skip_special_tokens: true,
             options: PreparedChatSpeculativeGenerationOptions {

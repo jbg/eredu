@@ -44,7 +44,6 @@ fn declarations() -> (CapturePlan, ObservationCatalog, ObservationSupportReport)
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -71,9 +70,12 @@ fn declarations() -> (CapturePlan, ObservationCatalog, ObservationSupportReport)
 
 #[test]
 fn raw_capture_source_matches_admission_and_aliases_keep_original_charge() {
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(64 << 20, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 64 << 20)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 64 << 20),
+        )
         .unwrap();
     let (plan, catalog, support) = declarations();
     let request = CaptureRequestShape {
@@ -94,21 +96,24 @@ fn raw_capture_source_matches_admission_and_aliases_keep_original_charge() {
     assert_eq!(source.plan().admission().identity(), expected.identity());
     assert_eq!(source.plan().admission().points(), expected.points());
     source.validate_pool(&pool).unwrap();
-    let other = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let other = crate::working_memory::memory_fixture::host_ledger(64 << 20, 0).unwrap();
     assert!(source.validate_pool(&other).is_err());
     let alias = source.plan().clone();
     drop((source, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     assert_eq!(alias.admission().text_origin(), Some(origin));
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn failed_raw_capture_retains_its_admission_payer_until_diagnostic_retirement() {
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(64 << 20, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 64 << 20)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 64 << 20),
+        )
         .unwrap();
     let (mut plan, catalog, support) = declarations();
     plan.selections[0].path = "missing".into();
@@ -130,7 +135,7 @@ fn failed_raw_capture_retains_its_admission_payer_until_diagnostic_retirement() 
         matches!(&error.cause, Cause::Admission(CaptureError::MissingPath(path)) if path == "missing")
     );
     drop(funding);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

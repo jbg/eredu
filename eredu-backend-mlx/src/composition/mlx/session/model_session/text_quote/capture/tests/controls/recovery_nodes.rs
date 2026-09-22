@@ -1,11 +1,13 @@
 use super::*;
 use crate::backend::submission_recovery::{self, Probe, Recovery, Retention, Status};
 use crate::composition::mlx::session::model_session::ScopeRetention;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use std::sync::Arc;
 
 struct OriginalRetention {
     _root: Array,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     expected: u64,
     probe_dropped: Rc<Cell<bool>>,
     panic_on_observe: Option<Arc<()>>,
@@ -24,14 +26,14 @@ impl Drop for OriginalRetention {
     fn drop(&mut self) {
         assert!(self.probe_dropped.get());
         assert!(!safemlx::can_reclaim_submission_resources());
-        assert!(self.pool.used_bytes().unwrap() >= self.expected);
+        assert!(self.pool.fixture_host_charge().unwrap() >= self.expected);
     }
 }
 struct ProbeOrder {
     settled: Rc<Cell<bool>>,
     dropped: Rc<Cell<bool>>,
     initial_unboxes: usize,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     expected: u64,
 }
 impl Probe for ProbeOrder {
@@ -48,7 +50,7 @@ impl Drop for ProbeOrder {
     fn drop(&mut self) {
         assert!(submission_recovery::test_node_unbox_count() > self.initial_unboxes);
         assert!(!safemlx::can_reclaim_submission_resources());
-        assert!(self.pool.used_bytes().unwrap() >= self.expected);
+        assert!(self.pool.fixture_host_charge().unwrap() >= self.expected);
         self.dropped.set(true);
     }
 }
@@ -83,7 +85,7 @@ fn recovery_node_keeps_actual_original_custody_through_typed_and_erased_retireme
         resources.request_release();
         drop(resources);
         assert!(authority.require_idle().is_err());
-        assert_eq!(pool.used_bytes().unwrap(), expected);
+        assert_eq!(pool.fixture_host_charge().unwrap(), expected);
         recovery.seal();
         if terminal_at_finish {
             let status = recovery.finish().unwrap();
@@ -104,7 +106,7 @@ fn recovery_node_keeps_actual_original_custody_through_typed_and_erased_retireme
             ));
             assert!(!probe_dropped.get());
             assert!(authority.require_idle().is_err());
-            assert_eq!(pool.used_bytes().unwrap(), expected);
+            assert_eq!(pool.fixture_host_charge().unwrap(), expected);
             settled.set(true);
             submission_recovery::wait_for_retirement(|| authority.require_idle().is_ok());
         }
@@ -151,5 +153,5 @@ fn poisoned_real_scope_retains_original_account_and_lease_after_callback_unwind(
         submission_recovery::reap();
     }
     assert!(authority.require_idle().is_err());
-    assert_eq!(pool.used_bytes().unwrap(), expected);
+    assert_eq!(pool.fixture_host_charge().unwrap(), expected);
 }

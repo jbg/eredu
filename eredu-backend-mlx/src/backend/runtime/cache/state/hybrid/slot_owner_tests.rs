@@ -1,7 +1,7 @@
 use super::*;
 use eredu_core::{
     cache::{MutableStateResidency, StateTensorDtype, StateTensorPolicy},
-    LayerSchedule, SharedStorageDomain,
+    LayerSchedule, SharedStorageAccountingId,
 };
 use eredu_runtime::{HostSlotAttachmentError, HostSlotMetadata};
 use safemlx::{Device, DeviceType};
@@ -113,7 +113,8 @@ fn layer_clone_owns_new_boxes_and_restore_reuses_the_existing_tables() {
         .all(|(a, b)| !a.same_storage(&b)));
     for token in original {
         assert!(matches!(
-            token.try_attach::<Infallible>(&SharedStorageDomain::default(), || unreachable!()),
+            token
+                .try_attach::<Infallible>(&SharedStorageAccountingId::default(), || unreachable!()),
             Err(HostSlotAttachmentError::Retired)
         ));
     }
@@ -125,7 +126,7 @@ fn escaped_layer_tokens_retain_custody_without_retaining_layer_payloads() {
     let copy = source.clone();
     // Aliases captured before registration share later attachments.
     let tokens = identities(&source);
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let retired = Arc::new(AtomicUsize::new(0));
     for token in std::iter::once(source.layer_slot_metadata()).chain(source.fixed_slot_metadata()) {
         assert!(token

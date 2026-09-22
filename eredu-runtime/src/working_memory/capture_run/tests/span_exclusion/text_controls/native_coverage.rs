@@ -19,8 +19,24 @@ impl OriginalNativeStorageMechanism for CoverageOnly {
     fn create_budget(&self, _: OriginalNativeBudgetCustody) -> Result<Self::Budget, Self::Error> {
         unreachable!("this test issues the accounting partition, not a native counter")
     }
-    fn observe<'a, 'root: 'a>(&'a self, _: &'a Self::Budget, _: &'root ()) -> Result<(), Self::Error> {
+    fn observe<'a, 'root: 'a>(
+        &'a self,
+        _: &'a Self::Budget,
+        _: &'root (),
+    ) -> Result<(), Self::Error> {
         unreachable!()
+    }
+    fn placement(
+        _: &Self::Observation<'_>,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<
+        std::sync::Arc<eredu_core::MemoryPlacement>,
+        crate::working_memory::WorkingMemoryError,
+    > {
+        Ok(std::sync::Arc::new(eredu_core::MemoryPlacement::fixed(
+            topology,
+            topology.host_domain(),
+        )?))
     }
     fn describe(_: &()) -> NativeStorageObservation<u32> {
         unreachable!()
@@ -40,9 +56,9 @@ impl OriginalNativeStorageMechanism for CoverageOnly {
 fn actual_span_subtracts_only_selected_native_coverage_and_checks_exact_partition_under_usage() {
     // Missing, foreign-sized, exact remainder, and one-byte-short remainder.
     for case in 0..4 {
-        let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
+        let pool = capture_test_ledger(4_000_000, 0).unwrap();
         let source = source();
-        let opening_root = pool.register_storage([(73u32, 8)]).unwrap();
+        let opening_root = pool.register_host_storage([(73u32, 8)]).unwrap();
         let original = quote(&pool, plan(&source).initialization_peak_bytes());
         let pins =
             PreparedPrefillStoragePinPlan::<u32>::prepare(original.span_workspace().plan(), |_| {
@@ -64,7 +80,8 @@ fn actual_span_subtracts_only_selected_native_coverage_and_checks_exact_partitio
             Some(0),
             Some(0), // This private fixture constructs no native counter/sidecar.
         )
-        .unwrap();
+        .unwrap()
+        .with_uniform_placement(pool.host_placement_handle());
         let controls = PreparedTextControlWorkspace::prepare(
             &source,
             geometry(),
@@ -83,7 +100,7 @@ fn actual_span_subtracts_only_selected_native_coverage_and_checks_exact_partitio
                 .unwrap(),
         );
         let (mut owner, _) = q
-            .into_funded_text_span_workspace(&run, r.memory_reservation().unwrap())
+            .into_funded_text_span_workspace(&run, r.memory_reservation())
             .unwrap();
         let native_bank = if case >= 2 {
             owner
@@ -128,13 +145,13 @@ fn actual_span_subtracts_only_selected_native_coverage_and_checks_exact_partitio
         let pressure = if case >= 2 {
             let free = {
                 let u = pool.0.usage.lock().unwrap();
-                u.funding[&r.memory_reservation().unwrap().0.funding.unwrap()]
+                u.funding[&r.memory_reservation().0.funding.unwrap()]
                     .spendable_remaining()
                     .unwrap()
             };
             Some(
                 native
-                    .adopt_storage_individually([(71u32, free - 8 + u64::from(case == 3))])
+                    .adopt_capture_host_storage([(71u32, free - 8 + u64::from(case == 3))])
                     .unwrap(),
             )
         } else {
@@ -149,9 +166,10 @@ fn actual_span_subtracts_only_selected_native_coverage_and_checks_exact_partitio
         } else if case == 3 {
             assert!(matches!(
                 result,
-                Err(WorkingMemoryError::BudgetExceeded {
+                Err(WorkingMemoryError::DomainAllowanceExceeded {
                     required_bytes: 8,
-                    available_bytes: 7
+                    available_bytes: 7,
+                    ..
                 })
             ));
             assert_eq!(ledger(&pool), before);
@@ -181,6 +199,6 @@ fn actual_span_subtracts_only_selected_native_coverage_and_checks_exact_partitio
             source,
             opening_root,
         ));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

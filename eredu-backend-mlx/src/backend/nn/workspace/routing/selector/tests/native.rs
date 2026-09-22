@@ -25,7 +25,11 @@ struct Bind<'a> {
     values: &'a BTreeMap<String, MlxTensor>,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         *value = self.values[metadata.id().as_str()].clone();
     }
 }
@@ -230,9 +234,12 @@ fn check(
         .filter(|(key, _)| !matches!(key.as_str(), "weight" | "scales" | "biases"))
         .map(|(key, value)| (key.clone(), value.to_f32_vec(s).unwrap()))
         .collect::<BTreeMap<_, _>>();
-    if spec.format().encoding() == LinearFormat::Dense {
-        dense = values["weight"].to_f32_vec(s).unwrap();
-    }
+    let dense = if spec.format().encoding() == LinearFormat::Dense {
+        values["weight"].to_f32_vec(s).unwrap()
+    } else {
+        // Independently constructed reference fixture, outside native execution.
+        eredu_core::HostTensorBuffer::new(dense, ())
+    };
     decoded.insert("weight".into(), dense);
     if let Some(original) = &output.original {
         numeric(spec, original, &x, &decoded, rows, dtype, false, None, s);
@@ -253,7 +260,7 @@ fn numeric(
     spec: &TopKGroupSelectorSpec,
     output: &GroupSelection<MlxTensor>,
     x: &[f32],
-    data: &BTreeMap<String, Vec<f32>>,
+    data: &BTreeMap<String, eredu_core::HostTensorBuffer<f32>>,
     rows: usize,
     dtype: Dtype,
     supplied: bool,

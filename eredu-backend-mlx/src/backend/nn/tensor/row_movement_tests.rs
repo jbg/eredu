@@ -16,6 +16,7 @@ use crate::{
         },
     },
 };
+use eredu_nn::Tensor;
 use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceDtype, WorkspaceFloatingType, WorkspaceRepresentation,
     WorkspaceTensor,
@@ -117,6 +118,15 @@ fn run_case(
         // exact retained descriptor before its independent original role.
         input.as_array().evaluated().unwrap();
     }
+    let expected_shape = match operation {
+        Operation::Gather(false) => {
+            let mut shape = inputs[0].shape().to_vec();
+            shape[0] = inputs[1].shape()[0];
+            shape
+        }
+        Operation::Gather(true) => vec![inputs[1].shape()[0], 1],
+        Operation::Add => inputs[0].shape().to_vec(),
+    };
     let recipe = trace(operation, inputs);
     let completion = recipe.completion;
     // This component fixture supplies the actual production collector with its
@@ -193,6 +203,7 @@ fn run_case(
         )
     });
     drop(bank);
+    assert_eq!(output.shape(), expected_shape);
     let batch = collector.finish();
     assert_eq!(batch.validations.len(), completion.validation_roots);
     roots.append(output.as_array()).unwrap();
@@ -378,5 +389,39 @@ fn original_cpu_additive_rows_preserve_duplicates_and_constructor_census() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn cpu_ranked_axis_zero_gather_preserves_full_slices_and_original_custody() {
+    if !crate::tests::support::native_process::enter("cpu-ranked-axis-zero-gather") {
+        return;
+    }
+    let backend = backend();
+    for shape in [&[8, 4, 8][..], &[3, 2, 2, 3][..]] {
+        let count = shape.iter().map(|&n| n as usize).product::<usize>();
+        let width = shape[1..].iter().map(|&n| n as usize).product::<usize>();
+        let values = (0..count)
+            .map(|n| (n as f32 - 91.0) * 0.125)
+            .collect::<Vec<_>>();
+        let picks = [2, -1, 0, 2];
+        let input = MlxTensor::from_array(Array::from_slice(&values, shape));
+        let indices = MlxTensor::from_array(Array::from_slice(&picks, &[4]));
+        let expected = picks
+            .iter()
+            .flat_map(|&index| {
+                let index = if index < 0 { shape[0] + index } else { index } as usize;
+                values[index * width..(index + 1) * width].iter().copied()
+            })
+            .collect::<Vec<_>>();
+        // Signed indices require the same prepaid validation collector and
+        // completed assertion roots as the ordinary checked-gather worker.
+        run_case(
+            Operation::Gather(false),
+            &[&input, &indices],
+            &expected,
+            false,
+            &backend,
+        );
     }
 }

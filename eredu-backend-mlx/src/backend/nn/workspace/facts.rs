@@ -410,12 +410,35 @@ enum Storage<'a> {
     },
 }
 
+pub(super) const DEFAULT_SCRATCH_ALTERNATIVES: usize = 16;
+
+/// Raw source alternatives, retained before any physical-domain reduction.
+/// `None` uses the emitter's unchanged simultaneous scratch envelope.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct DefaultScratchAlternative {
+    pub scratch_bytes: Option<u64>,
+    pub default_bytes: u64,
+    pub default_births: usize,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct DefaultScratchSources {
+    rows: [DefaultScratchAlternative; DEFAULT_SCRATCH_ALTERNATIVES],
+    length: usize,
+}
+impl DefaultScratchSources {
+    pub(super) fn alternatives(&self) -> &[DefaultScratchAlternative] {
+        &self.rows[..self.length]
+    }
+}
+
 pub(super) struct Emitter<'a> {
     storage: Storage<'a>,
     outputs: usize,
     aliases: usize,
     first_output: Option<WorkspaceOutputEffect>,
     allocated_output_bytes: Option<u64>,
+    allocated_output_births: usize,
+    default_scratch: DefaultScratchSources,
 }
 
 impl<'a> Emitter<'a> {
@@ -426,6 +449,8 @@ impl<'a> Emitter<'a> {
             aliases: 0,
             first_output: None,
             allocated_output_bytes: Some(0),
+            allocated_output_births: 0,
+            default_scratch: DefaultScratchSources::default(),
         }
     }
     pub(super) fn fixed(destination: WorkspaceEffectDestination<'a>) -> Self {
@@ -435,6 +460,8 @@ impl<'a> Emitter<'a> {
             aliases: 0,
             first_output: None,
             allocated_output_bytes: Some(0),
+            allocated_output_births: 0,
+            default_scratch: DefaultScratchSources::default(),
         }
     }
     fn ordinary() -> Self {
@@ -447,7 +474,93 @@ impl<'a> Emitter<'a> {
             aliases: 0,
             first_output: None,
             allocated_output_bytes: Some(0),
+            allocated_output_births: 0,
+            default_scratch: DefaultScratchSources::default(),
         }
+    }
+
+    /// Mark genuine default-allocator scratch already charged by this worker.
+    /// Counts name actual constructor sources, not scalar-sized promotions.
+    /// These simultaneous markers also apply to every explicit source branch.
+    pub(super) fn default_scratch(&mut self, bytes: u64, births: usize) -> FactResult<()> {
+        if self.default_scratch.length == 0 {
+            self.default_scratch.length = 1;
+        }
+        for row in &mut self.default_scratch.rows[..self.default_scratch.length] {
+            row.default_bytes = add(row.default_bytes, bytes)?;
+            row.default_births = row
+                .default_births
+                .checked_add(births)
+                .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+        }
+        Ok(())
+    }
+    /// Complete raw scratch envelope, default backing bytes and constructor
+    /// count for each mutually exclusive selected source path. Each total must
+    /// include simultaneous markers; this is not a split of a scalar maximum.
+    /// Exactly one branch directory may be supplied for an operation.
+    pub(super) fn default_scratch_alternatives(
+        &mut self,
+        rows: &[(u64, u64, usize)],
+    ) -> FactResult<()> {
+        if rows.is_empty()
+            || rows.len() > self.default_scratch.rows.len()
+            || self
+                .default_scratch
+                .alternatives()
+                .iter()
+                .any(|row| row.scratch_bytes.is_some())
+        {
+            return Err(MlxWorkspaceFactError::descriptor(
+                "invalid default allocation source alternatives",
+            ));
+        }
+        let common = self.default_scratch.rows[0];
+        for (destination, &(scratch_bytes, default_bytes, default_births)) in
+            self.default_scratch.rows.iter_mut().zip(rows)
+        {
+            *destination = DefaultScratchAlternative {
+                scratch_bytes: Some(scratch_bytes),
+                default_bytes: add(common.default_bytes, default_bytes)?,
+                default_births: common
+                    .default_births
+                    .checked_add(default_births)
+                    .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+            };
+        }
+        self.default_scratch.length = rows.len();
+        Ok(())
+    }
+    /// Lift a child's source alternatives into this exact parent's raw scratch
+    /// envelope. The wrapper bytes include all parent-only simultaneous rows.
+    pub(super) fn default_scratch_child(
+        &mut self,
+        child: &Emitter<'_>,
+        child_scratch: u64,
+        wrapper_scratch: u64,
+    ) -> FactResult<()> {
+        let Some(source) = child.default_scratch_sources() else {
+            return Ok(());
+        };
+        let mut rows = [(0u64, 0u64, 0usize); DEFAULT_SCRATCH_ALTERNATIVES];
+        for (out, row) in rows.iter_mut().zip(source.alternatives()) {
+            let raw = row.scratch_bytes.unwrap_or(child_scratch);
+            if raw > child_scratch || row.default_bytes > raw {
+                return Err(MlxWorkspaceFactError::descriptor(
+                    "child source exceeds its scratch envelope",
+                ));
+            }
+            *out = (
+                add(raw, wrapper_scratch)?,
+                row.default_bytes,
+                row.default_births,
+            );
+        }
+        self.default_scratch_alternatives(&rows[..source.alternatives().len()])
+    }
+
+    pub(super) fn default_scratch_sources(&self) -> Option<DefaultScratchSources> {
+        (self.default_scratch.length != 0).then_some(self.default_scratch)
     }
 
     /// The actual first effect is retained by the count pass for closed
@@ -462,8 +575,18 @@ impl<'a> Emitter<'a> {
     pub(super) fn allocated_output_bytes(&self) -> Option<u64> {
         self.allocated_output_bytes
     }
+    pub(super) fn allocated_output_births(&self) -> usize {
+        self.allocated_output_births
+    }
 
     pub(super) fn output(&mut self, output: Output<'_>) -> FactResult<()> {
+        let births = self
+            .allocated_output_births
+            .checked_add(usize::from(matches!(
+                output,
+                Output::Allocate(_) | Output::AllocateOrAliasInputs { .. }
+            )))
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
         let next = self
             .outputs
             .checked_add(1)
@@ -522,6 +645,7 @@ impl<'a> Emitter<'a> {
             .allocated_output_bytes
             .and_then(|n| n.checked_add(bytes));
         self.outputs = next;
+        self.allocated_output_births = births;
         self.aliases = end;
         Ok(())
     }
@@ -531,6 +655,23 @@ impl<'a> Emitter<'a> {
         scratch_bytes: u64,
         arguments: fmt::Arguments<'_>,
     ) -> FactResult<WorkspaceOperationFacts> {
+        if let Some(sources) = self.default_scratch_sources() {
+            let mut peak = 0;
+            for source in sources.alternatives() {
+                let total = source.scratch_bytes.unwrap_or(scratch_bytes);
+                if source.default_bytes > total || total > scratch_bytes {
+                    return Err(MlxWorkspaceFactError::descriptor(
+                        "default source exceeds its raw scratch envelope",
+                    ));
+                }
+                peak = peak.max(total);
+            }
+            if peak != scratch_bytes {
+                return Err(MlxWorkspaceFactError::descriptor(
+                    "source alternatives omit the operation scratch envelope",
+                ));
+            }
+        }
         let assumption_bytes = match &mut self.storage {
             Storage::Count => text_length(arguments)?,
             Storage::Fixed(destination) => write_text(arguments, destination.assumptions)?,

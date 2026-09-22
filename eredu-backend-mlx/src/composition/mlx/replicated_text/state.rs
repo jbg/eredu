@@ -1,16 +1,21 @@
 use super::*;
 
+use crate::backend::runtime::cache::residency::PromptCacheMaterialization;
+use eredu_core::cache::SharedPromptCacheManifest;
+use eredu_runtime::cache::PromptCachePersistenceFunding;
 use eredu_runtime::working_memory::InferenceStateRetention;
 
-fn validate_text_frontiers(
+fn text_frontier(
     layout: &eredu_runtime::StateLayout,
     positions: impl ExactSizeIterator<Item = i32>,
-    expected: u64,
-) -> Result<(), Error> {
+    expected: Option<u64>,
+) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
     use eredu_runtime::working_memory::WorkingMemoryError;
     if positions.len() != layout.len() {
-        return Err(Error::Other(Box::new(WorkingMemoryError::IdentityMismatch)));
+        return Err(WorkingMemoryError::IdentityMismatch);
     }
+    let mut frontier = expected;
+    let mut stateful = false;
     for (index, position) in positions.enumerate() {
         if matches!(
             layout.layer(index),
@@ -18,14 +23,27 @@ fn validate_text_frontiers(
         ) {
             continue;
         }
-        let actual = u64::try_from(position).map_err(|error| Error::Other(Box::new(error)))?;
-        if actual != expected {
-            return Err(Error::Other(Box::new(
-                WorkingMemoryError::StateFrontierMismatch { expected, actual },
-            )));
+        let actual = u64::try_from(position).map_err(|_| WorkingMemoryError::Overflow)?;
+        if let Some(expected) = frontier {
+            if actual != expected {
+                return Err(WorkingMemoryError::StateFrontierMismatch { expected, actual });
+            }
+        } else {
+            frontier = Some(actual);
         }
+        stateful = true;
     }
-    Ok(())
+    Ok(if stateful { frontier } else { None })
+}
+
+fn validate_text_frontiers(
+    layout: &eredu_runtime::StateLayout,
+    positions: impl ExactSizeIterator<Item = i32>,
+    expected: u64,
+) -> Result<(), Error> {
+    text_frontier(layout, positions, Some(expected))
+        .map(|_| ())
+        .map_err(|cause| Error::Other(Box::new(cause)))
 }
 
 #[cfg(test)]
@@ -39,12 +57,14 @@ mod frontier_tests {
         let layout = eredu_runtime::StateLayout::new(
             LayerSchedule::new(
                 1,
-                vec![eredu_core::cache::LayerCachePolicy::key_only(
-                    AttentionPolicy::sliding(7).unwrap(),
-                    1,
-                    2,
-                )
-                .unwrap()],
+                vec![
+                    eredu_core::cache::LayerCachePolicy::key_only(
+                        AttentionPolicy::sliding(7).unwrap(),
+                        1,
+                        2,
+                    )
+                    .unwrap(),
+                ],
             )
             .unwrap(),
         )
@@ -57,10 +77,12 @@ mod frontier_tests {
             )
             .unwrap();
         let checkpoint = state.deep_checkpoint().unwrap();
-        assert!(state
-            .shared_layout()
-            .unwrap()
-            .same_storage(checkpoint.shared_layout().unwrap()));
+        assert!(
+            state
+                .shared_layout()
+                .unwrap()
+                .same_storage(checkpoint.shared_layout().unwrap())
+        );
         assert_eq!(MlxStateMechanisms::offset(&checkpoint), 3);
         state.as_mut()[0]
             .append_local(
@@ -72,15 +94,17 @@ mod frontier_tests {
         assert_eq!(MlxStateMechanisms::offset(&checkpoint), 3);
         state.restore_checkpoint(&checkpoint, &stream).unwrap();
         assert_eq!(MlxStateMechanisms::offset(&state), 3);
-        assert!(state
-            .shared_layout()
-            .unwrap()
-            .same_storage(checkpoint.shared_layout().unwrap()));
+        assert!(
+            state
+                .shared_layout()
+                .unwrap()
+                .same_storage(checkpoint.shared_layout().unwrap())
+        );
     }
 
     #[test]
     fn every_stateful_layer_must_match_even_when_the_first_layer_has_no_state() {
-        use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
+        use eredu_core::{AttentionPolicy, LayerSchedule, cache::LayerCachePolicy};
         let attention = LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 4).unwrap();
         let layout = eredu_runtime::StateLayout::new(
             LayerSchedule::new(
@@ -90,6 +114,35 @@ mod frontier_tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            text_frontier(&layout, [0, 7, 7].into_iter(), None).unwrap(),
+            Some(7)
+        );
+        assert!(matches!(
+            text_frontier(&layout, [0, 7, 6].into_iter(), None),
+            Err(
+                eredu_runtime::working_memory::WorkingMemoryError::StateFrontierMismatch {
+                    expected: 7,
+                    actual: 6,
+                }
+            )
+        ));
+        assert!(matches!(
+            text_frontier(&layout, [0, 7, -1].into_iter(), None),
+            Err(eredu_runtime::working_memory::WorkingMemoryError::Overflow)
+        ));
+        let stateless = eredu_runtime::StateLayout::new(
+            LayerSchedule::new(
+                2,
+                vec![LayerCachePolicy::NoState, LayerCachePolicy::NoState],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            text_frontier(&stateless, [0, 0].into_iter(), None).unwrap(),
+            None
+        );
         validate_text_frontiers(&layout, [0, 7, 7].into_iter(), 7).unwrap();
         let error = validate_text_frontiers(&layout, [0, 7, 6].into_iter(), 7).unwrap_err();
         let Error::Other(error) = error else {
@@ -120,6 +173,7 @@ pub(crate) enum PreparedDenseControlBindingError {
 pub(crate) enum ResidentResetProfile {
     KeyValue,
     Hybrid,
+    Pooling,
 }
 
 pub(crate) trait MlxStateMechanisms:
@@ -127,6 +181,7 @@ pub(crate) trait MlxStateMechanisms:
     + InferenceStateRetention
     + eredu_runtime::working_memory::ResidentResetProjection<MlxKeyValueState>
     + eredu_runtime::working_memory::ResidentResetProjection<MlxHybridState>
+    + eredu_runtime::working_memory::ResidentResetProjection<MlxPoolingAttentionState>
     + Sized
 {
     fn resident_reset_profile() -> Option<ResidentResetProfile> {
@@ -209,7 +264,7 @@ pub(crate) trait MlxStateMechanisms:
         _mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
         _funding: &eredu_nn::workspace::HostMetadataFunding,
         _host: &eredu_core::HostPreparationAuthority,
-        _capacity: u64,
+        _capacity: eredu_core::MemoryLimits,
     ) -> Result<Option<crate::backend::runtime::cache::state::OriginalResidentState>, Error> {
         Ok(None)
     }
@@ -222,6 +277,13 @@ pub(crate) trait MlxStateMechanisms:
     ) -> Result<Self, crate::backend::runtime::cache::state::OriginalResidentState> {
         Err(state)
     }
+
+    /// Checks actual stateful layers without allocating or reading native values.
+    /// A stateless rank has no physical frontier and retains logical progress in
+    /// its independently authenticated request.
+    fn original_text_frontier(
+        &self,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError>;
 
     /// Checks every stateful layer's host frontier without reading native values.
     fn validate_text_frontier(&self, expected: u64) -> Result<(), Error>;
@@ -383,73 +445,56 @@ pub(crate) trait MlxStateMechanisms:
         if !self.supports_isolated_snapshot() {
             return None;
         }
-        // Ordinary text is a single sequence. Interpret only the declared
-        // component geometry, including absent fixed tensors. MLX floating
-        // storage is at most eight bytes; explicit integer components use four.
-        // Charge the full future payload as an additional conservative allowance
-        // (rather than subtracting currently retained data), including the same
-        // materialization/descriptor allowance as an immutable copy.
-        use eredu_core::cache::{StateTensorDimension as Dim, StateTensorDtype};
-        let absolute = u64::try_from(self.offset()).ok()?.checked_add(additional)?;
-        i32::try_from(absolute).ok()?;
-        let prefix = absolute.max(self.continuation_capacity_bound(additional)?);
-        i32::try_from(prefix).ok()?;
-        let mut bytes = 0u64;
-        for layer in 0..self.layout().len() {
-            for component in self.layout().components(layer)? {
-                let mut elements = 1u64;
-                for dimension in component.shape() {
-                    let extent = match dimension {
-                        Dim::Batch | Dim::Scalar => 1,
-                        Dim::Fixed(n) => u64::from(n.get()),
-                        Dim::PrefixTokens => prefix,
-                        Dim::PrefixTokensDiv(n) => prefix / u64::from(n.get()),
-                        // The final remainder is not the maximum over a run.
-                        Dim::PrefixTokensRem(n) => prefix.min(u64::from(n.get()) - 1),
-                    };
-                    elements = elements.checked_mul(extent)?;
-                }
-                let width = match component.dtype() {
-                    StateTensorDtype::Floating => 8,
-                    StateTensorDtype::Float32
-                    | StateTensorDtype::Int32
-                    | StateTensorDtype::Uint32 => 4,
-                };
-                bytes = bytes
-                    .checked_add(elements.checked_mul(width)?.checked_mul(2)?)?
-                    .checked_add(4096)?
-                    .checked_add(
-                        u64::try_from(component.shape().len())
-                            .ok()?
-                            .checked_mul(16)?,
-                    )?;
-            }
-        }
-        bytes.checked_add(self.isolated_snapshot_auxiliary_growth(additional)?)
+        crate::backend::runtime::cache::state::snapshot_estimate::continuation_growth(
+            self.layout(),
+            u64::try_from(self.offset()).ok()?,
+            additional,
+            self.continuation_capacity_bound(additional)?,
+            self.isolated_snapshot_auxiliary_growth(additional)?,
+        )
     }
     fn offset(&self) -> i32;
     fn realize(
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
         global_layer_start: usize,
+        stream: &Stream,
+        transfer: Option<&crate::backend::runtime::cache::residency::PreparedCacheTransferStream>,
     ) -> Result<Self, Error>;
     fn load_prompt_cache(
+        source: &Self,
         selected: &SelectedStateRealization,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         stream: &Stream,
-    ) -> Result<(Self, PromptCacheManifest), Error>;
+        funding: &PromptCachePersistenceFunding,
+        materialization: &PromptCacheMaterialization,
+    ) -> Result<(Self, SharedPromptCacheManifest), Error>;
     fn save_prompt_cache(
         &mut self,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Error>;
+        funding: &PromptCachePersistenceFunding,
+    ) -> Result<SharedPromptCacheManifest, Error>;
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
     fn retained_arrays(&self) -> Vec<&Array>;
+    fn ordinary_checkpoint_program(
+        &self,
+        plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        Option<
+            crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram,
+        >,
+        Error,
+    > {
+        let _ = (plan, context);
+        Ok(None)
+    }
     fn deep_checkpoint(&self) -> Result<Self, Exception>;
     fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception>;
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception>;
@@ -525,6 +570,27 @@ impl eredu_runtime::working_memory::ResidentResetProjection<MlxHybridState>
     }
 }
 
+impl eredu_runtime::working_memory::ResidentResetProjection<MlxPoolingAttentionState>
+    for MlxKeyValueState
+{
+    fn resident_reset_ref(&self) -> Option<&MlxPoolingAttentionState> {
+        None
+    }
+    fn resident_reset_mut(&mut self) -> Option<&mut MlxPoolingAttentionState> {
+        None
+    }
+}
+impl eredu_runtime::working_memory::ResidentResetProjection<MlxPoolingAttentionState>
+    for MlxHybridState
+{
+    fn resident_reset_ref(&self) -> Option<&MlxPoolingAttentionState> {
+        None
+    }
+    fn resident_reset_mut(&mut self) -> Option<&mut MlxPoolingAttentionState> {
+        None
+    }
+}
+
 pub(super) fn fork_mlx_prediction_target_state<S: MlxStateMechanisms>(
     state: &S,
     stream: &Stream,
@@ -536,15 +602,28 @@ pub(super) fn fork_mlx_prediction_target_state<S: MlxStateMechanisms>(
 
 pub(super) fn selected_state_manager(
     selected: &SelectedStateRealization,
+    stream: &Stream,
+    transfer: Option<&crate::backend::runtime::cache::residency::PreparedCacheTransferStream>,
 ) -> Result<Option<CacheResidencyManager>, Error> {
     let needs_paging = selected
         .components()
         .iter()
         .any(|component| component.placement() == StateComponentPlacement::Paged);
     match (needs_paging, selected.policy()) {
-        (_, CacheResidencyPolicy::Paged(options)) => CacheResidencyManager::new(options.clone())
-            .map(Some)
-            .map_err(|error| Error::Parallel(error.to_string())),
+        (_, CacheResidencyPolicy::Paged(options)) => {
+            let manager = CacheResidencyManager::new(options.clone())
+                .map_err(|cause| Error::Other(Box::new(cause)))?;
+            let ledger = crate::backend::managed_memory::try_ledger()?;
+            let transfer = transfer.ok_or_else(|| {
+                Error::Other(Box::new(
+                crate::backend::runtime::cache::residency::CacheTransferStreamError::Unavailable,
+            ))
+            })?;
+            manager
+                .install_transfer_stream(transfer, &ledger, stream)
+                .map_err(|cause| Error::Other(Box::new(cause)))?;
+            Ok(Some(manager))
+        }
         (false, CacheResidencyPolicy::Device) => Ok(None),
         (true, CacheResidencyPolicy::Device) => Err(Error::Parallel(
             "selected paged state component has no paging policy".into(),
@@ -554,26 +633,49 @@ pub(super) fn selected_state_manager(
 
 impl MlxStateMechanisms for MlxKeyValueState {
     fn copy_original_paged_state(
-        &self, completed: Option<&crate::backend::runtime::cache::state::CompletedResidentSource>,
-        environment: &crate::backend::OriginalCopyEnvironment<'_>, initialized: &safemlx::PrefillRootsRuntime,
+        &self,
+        completed: Option<&crate::backend::runtime::cache::state::CompletedResidentSource>,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
+        initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms,
         funding: &eredu_nn::workspace::HostMetadataFunding,
-        host: &eredu_core::HostPreparationAuthority, capacity: u64,
+        host: &eredu_core::HostPreparationAuthority,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Option<crate::backend::runtime::cache::state::OriginalResidentState>, Error> {
-        if !self.as_ref().iter().any(|layer| matches!(layer, crate::backend::runtime::cache::state::MlxKeyValueLayerState::Paged(_))) {
+        if !self.as_ref().iter().any(|layer| {
+            matches!(
+                layer,
+                crate::backend::runtime::cache::state::MlxKeyValueLayerState::Paged(_)
+            )
+        }) {
             return Ok(None);
         }
-        let context = eredu_nn::workspace::WorkspaceContext::new_with_metadata_funding(mechanisms, funding.clone())
-            .map_err(|cause| Error::Neural(cause.into()))?;
-        self.copy_original_paged(completed, environment, initialized, mechanisms, &context, host, capacity)
-            .map(|value| value.map(crate::backend::runtime::cache::state::OriginalResidentState::KeyValue))
+        let context = eredu_nn::workspace::WorkspaceContext::new_with_metadata_funding(
+            mechanisms,
+            funding.clone(),
+        )
+        .map_err(|cause| Error::Neural(cause.into()))?;
+        self.copy_original_paged(
+            completed,
+            environment,
+            initialized,
+            mechanisms,
+            &context,
+            host,
+            &capacity,
+        )
+        .map(|value| {
+            value.map(crate::backend::runtime::cache::state::OriginalResidentState::KeyValue)
+        })
     }
 
     fn from_original_resident_copy(
         state: crate::backend::runtime::cache::state::OriginalResidentState,
     ) -> Result<Self, crate::backend::runtime::cache::state::OriginalResidentState> {
         match state {
-            crate::backend::runtime::cache::state::OriginalResidentState::KeyValue(value) => Ok(value),
+            crate::backend::runtime::cache::state::OriginalResidentState::KeyValue(value) => {
+                Ok(value)
+            }
             other => Err(other),
         }
     }
@@ -614,6 +716,20 @@ impl MlxStateMechanisms for MlxKeyValueState {
         visitor: &mut dyn FnMut(&eredu_runtime::HostSlotMetadata) -> Result<(), E>,
     ) -> Result<(), E> {
         visitor(self.layer_slot_metadata())
+    }
+
+    fn original_text_frontier(
+        &self,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        self.optional_layout().map_or(Ok(None), |layout| {
+            text_frontier(
+                layout,
+                self.as_ref()
+                    .iter()
+                    .map(crate::backend::runtime::cache::kv::KeyValueCache::offset),
+                None,
+            )
+        })
     }
 
     fn validate_text_frontier(&self, expected: u64) -> Result<(), Error> {
@@ -675,10 +791,12 @@ impl MlxStateMechanisms for MlxKeyValueState {
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
         global_layer_start: usize,
+        stream: &Stream,
+        transfer: Option<&crate::backend::runtime::cache::residency::PreparedCacheTransferStream>,
     ) -> Result<Self, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::state_allocation();
-        let manager = selected_state_manager(selected)?;
+        let manager = selected_state_manager(selected, stream, transfer)?;
         MlxKeyValueState::from_selected_with_global_layer_start(
             selected,
             manager,
@@ -689,50 +807,31 @@ impl MlxStateMechanisms for MlxKeyValueState {
     }
 
     fn load_prompt_cache(
-        selected: &SelectedStateRealization,
+        source: &Self,
+        _selected: &SelectedStateRealization,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
-        _stream: &Stream,
-    ) -> Result<(Self, PromptCacheManifest), Error> {
-        let CacheResidencyPolicy::Paged(options) = selected.policy() else {
-            return Err(Error::Parallel(
-                "prompt-cache loading requires selected paged state".into(),
-            ));
-        };
-        let (manager, manifest) = open_prompt_cache(
-            directory,
-            expected,
-            identity,
-            prefix_token_ids,
-            options.clone(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let state = MlxKeyValueState::from_selected_with_global_layer_start(
-            selected,
-            Some(manager),
-            expected.topology().cache_rank_identity(),
-            identity.global_layer_start(),
-        )?;
-        Ok((state, manifest))
+        stream: &Stream,
+        funding: &PromptCachePersistenceFunding,
+        materialization: &PromptCacheMaterialization,
+    ) -> Result<(Self, SharedPromptCacheManifest), Error> {
+        let _ = (stream, materialization);
+        source
+            .load_prompt_cache_funded(directory, expected, identity, prefix_token_ids, funding)
+            .map_err(|cause| Error::Neural(funding.context().metadata_source(cause)))
     }
-
     fn save_prompt_cache(
         &mut self,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Error> {
-        MlxKeyValueState::save_prompt_cache(
-            self,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-        )
-        .map_err(Into::into)
+        funding: &PromptCachePersistenceFunding,
+    ) -> Result<SharedPromptCacheManifest, Error> {
+        self.save_prompt_cache_funded(destination, descriptor, prefix_token_ids, options, funding)
+            .map_err(|cause| Error::Neural(funding.context().metadata_source(cause)))
     }
 
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
@@ -756,6 +855,18 @@ impl MlxStateMechanisms for MlxKeyValueState {
         MlxKeyValueState::original_isolated_snapshot_auxiliary_bytes(self)
     }
 
+    fn ordinary_checkpoint_program(
+        &self,
+        plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        Option<
+            crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram,
+        >,
+        Error,
+    > {
+        MlxKeyValueState::ordinary_checkpoint_program(self, plan, context).map(Some)
+    }
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         self.deep_clone_state()
     }
@@ -802,7 +913,9 @@ impl MlxStateMechanisms for MlxHybridState {
         state: crate::backend::runtime::cache::state::OriginalResidentState,
     ) -> Result<Self, crate::backend::runtime::cache::state::OriginalResidentState> {
         match state {
-            crate::backend::runtime::cache::state::OriginalResidentState::Hybrid(value) => Ok(value),
+            crate::backend::runtime::cache::state::OriginalResidentState::Hybrid(value) => {
+                Ok(value)
+            }
             other => Err(other),
         }
     }
@@ -854,6 +967,14 @@ impl MlxStateMechanisms for MlxHybridState {
             visitor(metadata)?;
         }
         Ok(())
+    }
+
+    fn original_text_frontier(
+        &self,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        self.optional_layout().map_or(Ok(None), |layout| {
+            text_frontier(layout, self.layer_positions(), None)
+        })
     }
 
     fn validate_text_frontier(&self, expected: u64) -> Result<(), Error> {
@@ -908,10 +1029,12 @@ impl MlxStateMechanisms for MlxHybridState {
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
         global_layer_start: usize,
+        stream: &Stream,
+        transfer: Option<&crate::backend::runtime::cache::residency::PreparedCacheTransferStream>,
     ) -> Result<Self, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::state_allocation();
-        let manager = selected_state_manager(selected)?;
+        let manager = selected_state_manager(selected, stream, transfer)?;
         MlxHybridState::from_selected_with_global_layer_start(
             selected,
             manager,
@@ -922,52 +1045,39 @@ impl MlxStateMechanisms for MlxHybridState {
     }
 
     fn load_prompt_cache(
-        selected: &SelectedStateRealization,
+        source: &Self,
+        _selected: &SelectedStateRealization,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         stream: &Stream,
-    ) -> Result<(Self, PromptCacheManifest), Error> {
-        let CacheResidencyPolicy::Paged(options) = selected.policy() else {
-            return Err(Error::Parallel(
-                "prompt-cache loading requires selected paged state".into(),
-            ));
-        };
-        let (manager, manifest) = open_prompt_cache(
-            directory,
-            expected,
-            identity,
-            prefix_token_ids,
-            options.clone(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        let mut state = MlxHybridState::from_selected_with_global_layer_start(
-            selected,
-            Some(manager),
-            expected.topology().cache_rank_identity(),
-            identity.global_layer_start(),
-        )?;
-        state.restore_prompt_cache_state(
-            tensors,
-            i32::try_from(prefix_token_ids.len())
-                .map_err(|_| Error::Parallel("prompt-cache prefix exceeds i32".into()))?,
-            identity.layer_prefix_offsets(),
-        )?;
-        Ok((state, manifest))
+        funding: &PromptCachePersistenceFunding,
+        materialization: &PromptCacheMaterialization,
+    ) -> Result<(Self, SharedPromptCacheManifest), Error> {
+        let _ = stream;
+        source
+            .load_prompt_cache_funded(
+                directory,
+                expected,
+                identity,
+                prefix_token_ids,
+                stream,
+                funding,
+                materialization,
+            )
+            .map_err(|cause| Error::Neural(funding.context().metadata_source(cause)))
     }
-
     fn save_prompt_cache(
         &mut self,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Error> {
-        MlxHybridState::save_prompt_cache(self, destination, descriptor, prefix_token_ids, options)
-            .map_err(Into::into)
+        funding: &PromptCachePersistenceFunding,
+    ) -> Result<SharedPromptCacheManifest, Error> {
+        self.save_prompt_cache_funded(destination, descriptor, prefix_token_ids, options, funding)
+            .map_err(|cause| Error::Neural(funding.context().metadata_source(cause)))
     }
 
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
@@ -991,6 +1101,18 @@ impl MlxStateMechanisms for MlxHybridState {
         MlxHybridState::original_isolated_snapshot_auxiliary_bytes(self)
     }
 
+    fn ordinary_checkpoint_program(
+        &self,
+        plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        Option<
+            crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram,
+        >,
+        Error,
+    > {
+        MlxHybridState::ordinary_checkpoint_program(self, plan, context).map(Some)
+    }
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         self.deep_clone_state()
     }
@@ -1030,11 +1152,16 @@ impl MlxStateMechanisms for MlxHybridState {
 }
 
 impl MlxStateMechanisms for MlxPoolingAttentionState {
+    fn resident_reset_profile() -> Option<ResidentResetProfile> {
+        Some(ResidentResetProfile::Pooling)
+    }
     fn from_original_resident_copy(
         state: crate::backend::runtime::cache::state::OriginalResidentState,
     ) -> Result<Self, crate::backend::runtime::cache::state::OriginalResidentState> {
         match state {
-            crate::backend::runtime::cache::state::OriginalResidentState::Pooling(value) => Ok(value),
+            crate::backend::runtime::cache::state::OriginalResidentState::Pooling(value) => {
+                Ok(value)
+            }
             other => Err(other),
         }
     }
@@ -1073,7 +1200,6 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         match state {
             PublishedResidentDecoderState::Pooling(state) => Ok(state.into_state()),
             PublishedResidentDecoderState::KeyValue(_)
-
             | PublishedResidentDecoderState::HybridGrouped(_) => {
                 Err(PreparedDenseControlBindingError::UnsupportedStateType)
             }
@@ -1103,6 +1229,18 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
             visitor(metadata)?;
         }
         Ok(())
+    }
+
+    fn original_text_frontier(
+        &self,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        self.optional_layout().map_or(Ok(None), |layout| {
+            text_frontier(
+                layout,
+                self.as_ref().iter().map(|layer| layer.offset()),
+                None,
+            )
+        })
     }
 
     fn validate_text_frontier(&self, expected: u64) -> Result<(), Error> {
@@ -1181,10 +1319,12 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
         global_layer_start: usize,
+        stream: &Stream,
+        transfer: Option<&crate::backend::runtime::cache::residency::PreparedCacheTransferStream>,
     ) -> Result<Self, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::state_allocation();
-        let manager = selected_state_manager(selected)?;
+        let manager = selected_state_manager(selected, stream, transfer)?;
         match manager {
             Some(manager) => MlxPoolingAttentionStateFactory::paged(
                 selected.layout().clone(),
@@ -1199,81 +1339,46 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
     }
 
     fn load_prompt_cache(
-        selected: &SelectedStateRealization,
+        source: &Self,
+        _selected: &SelectedStateRealization,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         stream: &Stream,
-    ) -> Result<(Self, PromptCacheManifest), Error> {
-        let CacheResidencyPolicy::Paged(options) = selected.policy() else {
-            return Err(Error::Parallel(
-                "prompt-cache loading requires selected paged state".into(),
-            ));
-        };
-        let (manager, manifest) = open_prompt_cache(
+        funding: &PromptCachePersistenceFunding,
+        materialization: &PromptCacheMaterialization,
+    ) -> Result<(Self, SharedPromptCacheManifest), Error> {
+        let _ = stream;
+        MlxPoolingAttentionStateFactory::load_prompt_cache_funded(
+            source,
             directory,
             expected,
             identity,
             prefix_token_ids,
-            options.clone(),
+            stream,
+            funding,
+            materialization,
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let prefix = i32::try_from(prefix_token_ids.len())
-            .map_err(|_| Error::Parallel("prompt-cache prefix exceeds i32".into()))?;
-        let mut state = MlxPoolingAttentionStateFactory::paged(
-            selected.layout().clone(),
-            manager,
-            identity.global_layer_start(),
-            prefix,
-            expected.topology().cache_rank_identity(),
-        )?;
-        let mut tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?
-            .into_iter()
-            .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
-            .collect::<BTreeMap<_, _>>();
-        for (layer, cache) in state.as_mut().iter_mut().enumerate() {
-            let processed = prefix
-                .checked_add(identity.layer_prefix_offsets()[layer])
-                .ok_or_else(|| Error::Parallel("prompt-cache layer offset overflowed".into()))?;
-            cache.restore_prompt_cache_state(
-                identity.global_layer_start() + layer,
-                &mut tensors,
-                processed,
-            )?;
-        }
-        if !tensors.is_empty() {
-            return Err(Error::Parallel(
-                "prompt cache contains unexpected state tensors".into(),
-            ));
-        }
-        Ok((state, manifest))
+        .map_err(|cause| Error::Neural(funding.context().metadata_source(cause)))
     }
-
     fn save_prompt_cache(
         &mut self,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Error> {
-        let mut manager = None;
-        for layer in self.as_mut() {
-            layer.finalize()?;
-            manager.get_or_insert_with(|| layer.residency_manager().cloned());
-        }
-        let fixed = self
-            .as_ref()
-            .iter()
-            .enumerate()
-            .flat_map(|(layer, cache)| cache.prompt_cache_state_arrays(layer))
-            .collect::<Vec<_>>();
-        manager
-            .flatten()
-            .ok_or_else(|| Error::Parallel("prompt-cache persistence requires paged state".into()))?
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, &fixed, options)
-            .map_err(|error| Error::Parallel(error.to_string()))
+        funding: &PromptCachePersistenceFunding,
+    ) -> Result<SharedPromptCacheManifest, Error> {
+        MlxPoolingAttentionStateFactory::save_prompt_cache_funded(
+            self,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            funding,
+        )
+        .map_err(|cause| Error::Neural(funding.context().metadata_source(cause)))
     }
 
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
@@ -1305,12 +1410,49 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         MlxPoolingAttentionStateFactory::original_isolated_snapshot_auxiliary_bytes(self)
     }
 
+    fn ordinary_checkpoint_program(
+        &self,
+        plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        Option<
+            crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram,
+        >,
+        Error,
+    > {
+        let Some(layout) = self.shared_layout() else {
+            return Ok(None);
+        };
+        let Some(metadata) = self.layer_slot_metadata() else {
+            return Ok(None);
+        };
+        crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram::prepare(layout, metadata, self.as_ref(), std::iter::empty(),
+            self.inference_retention(), plan, context).map(Some)
+    }
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         // Pooling updates replace arrays. Retain exact views and the paged
         // sliding history that speculative verification could otherwise discard.
         let layout = self.shared_layout().cloned().ok_or_else(|| {
             Exception::custom("pooling checkpoint requires an owned state layout")
         })?;
+        if let Some(metadata) = self.layer_slot_metadata() {
+            if let Some(loan) = crate::backend::runtime::cache::state::ordinary_checkpoint::begin(
+                &layout,
+                metadata,
+                std::iter::empty(),
+                self.inference_retention(),
+            )? {
+                let layers = loan.table(
+                    self.as_ref(),
+                    MlxPoolingAttentionCache::checkpoint_clone_state,
+                )?;
+                let retention = loan.retention(self.inference_retention())?;
+                let mut checkpoint = Self::from_prepared_layers(layout, layers)
+                    .map_err(|e| loan.retain(Exception::from_source(e)))?;
+                *checkpoint.inference_retention_mut() = retention;
+                return Ok(checkpoint);
+            }
+        }
         let mut checkpoint = Self::create_with_shared_layout(layout, |layer, _| {
             self.as_ref()[layer].checkpoint_clone_state()
         })?;
@@ -1419,12 +1561,14 @@ pub(crate) use slot_bounds::PreparedNativeStateSlotBounds;
 /// A sampling group contributes the same retained native buffer as its parent
 /// communicator table, deduplicated by the closed physical source identity.
 pub(super) fn collect_partition_auxiliary_storage(
-    storage:&mut crate::backend::runtime::residency::storage::RetainedStorage,
-    group:Option<&crate::backend::runtime::distributed::Group>,
-    authority:Option<&eredu_runtime::PartitionCommunicationAuthority>,
-)->Result<(),crate::backend::runtime::residency::manager::ResidencyError>{
-    if let Some(group)=group {
-        if !authority.is_some_and(|authority|authority.completion_policy()==group.completion_policy()){
+    storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    group: Option<&crate::backend::runtime::distributed::Group>,
+    authority: Option<&eredu_runtime::PartitionCommunicationAuthority>,
+) -> Result<(), crate::backend::runtime::residency::manager::ResidencyError> {
+    if let Some(group) = group {
+        if !authority
+            .is_some_and(|authority| authority.completion_policy() == group.completion_policy())
+        {
             storage.mark_incomplete();
         }
         group.collect_idle_retained_storage(storage)?;

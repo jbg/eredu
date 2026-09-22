@@ -1,5 +1,8 @@
 //! Source-bound synchronous IDs crossing the controller's mutable loan.
-use super::{ManagerOwner, ManagerWeak, OffloadUnitId, ResidencyError, ResidencyManager};
+use super::{
+    ManagerOwner, ManagerWeak, OffloadUnitId, ResidencyControlCustody, ResidencyError,
+    ResidencyManager,
+};
 use eredu_runtime::{
     residency::{ResidencyClosure, ResidencyClosureSlot},
     working_memory::OriginalOperationMetadataCustody,
@@ -15,7 +18,7 @@ pub(crate) struct PreparedClosureIds {
     manager: ManagerWeak,
     complete: bool,
     // Includes the Vec/String allocations and Weak header alias above.
-    _custody: OriginalOperationMetadataCustody,
+    _custody: ResidencyControlCustody,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +44,17 @@ impl ResidencyManager {
         units: usize,
         id_bytes: usize,
         custody: OriginalOperationMetadataCustody,
+    ) -> Result<PreparedClosureIds, ClosurePreparationError> {
+        self.prepare_closure_ids_with_custody(roots, scratch, units, id_bytes, custody.into())
+    }
+
+    pub(super) fn prepare_closure_ids_with_custody(
+        &self,
+        roots: &[OffloadUnitId],
+        scratch: &mut [ResidencyClosureSlot],
+        units: usize,
+        id_bytes: usize,
+        custody: ResidencyControlCustody,
     ) -> Result<PreparedClosureIds, ClosurePreparationError> {
         let mut value = PreparedClosureIds {
             ids: Vec::new(),
@@ -132,6 +146,7 @@ impl PreparedClosureIds {
             .checked_add(id_bytes)?;
         let controls = [
             size_of::<OriginalOperationMetadataCustody>(),
+            size_of::<ResidencyControlCustody>(),
             size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>(),
             size_of::<Self>(),
             size_of::<Option<Self>>(),
@@ -265,15 +280,19 @@ impl ResidencyManager {
         }
         let state = self.inner.state.try_lock().unwrap();
         let empty = state.control.operation_closure(&[], &mut scratch).unwrap();
-        assert!(
-            PreparedClosureIds::take(&mut slot, &self.inner, &empty)
-                .unwrap_or_else(|e| panic!("empty closure: {e}"))
-                .as_slice()
-                .is_empty()
-        );
+        assert!(PreparedClosureIds::take(&mut slot, &self.inner, &empty)
+            .unwrap_or_else(|e| panic!("empty closure: {e}"))
+            .as_slice()
+            .is_empty());
         drop(state);
         let error = self
-            .prepare_closure_ids(&[first], &mut scratch, 1, 99, controls.metadata_custody().into())
+            .prepare_closure_ids(
+                &[first],
+                &mut scratch,
+                1,
+                99,
+                controls.metadata_custody().into(),
+            )
             .err()
             .expect("source byte mismatch");
         assert!(error.prefix.ids.is_empty());

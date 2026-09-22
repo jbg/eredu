@@ -1,29 +1,29 @@
 //! Whole pending-input copy through the existing registered-copy account and
 //! original native copy/completion engine. Per-span views are separate work.
 use super::*;
+use crate::backend::runtime::cache::state::{
+    bind_completed_resident_sources, CompletedResidentSource, OriginalResidentSourceBinding,
+};
 use crate::backend::{
-    OriginalCopyEnvironment,
     array_copy::{OriginalCopyLayoutBuilder, OriginalCopyPlan},
     error::Error,
     nn::workspace::{MlxMetalWorkspaceMechanisms, ProjectionSourceLayout},
     runtime::residency::storage::{CopyPublicationLayout, RetainedStorage, StorageIdentity},
     submission_recovery::{Retention, Status},
+    OriginalCopyEnvironment,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::{
-    WorkspaceContext, WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPlan,
-    HostMetadataFunding,
+    HostMetadataFunding, WorkspaceContext, WorkspaceCopyPreparationLayoutBuilder,
+    WorkspaceIsolatedCopyPlan,
 };
+use eredu_runtime::working_memory::{CompletedWorkspaceStorage, OriginalCompletedWorkspaceCopy};
 use eredu_runtime::working_memory::{
     OriginalStorageSourcesLayout, RegisteredPreparedWorkspaceCopy,
     RegisteredPreparedWorkspaceStorage, RegisteredWorkspaceCopy, RegisteredWorkspaceStorage,
     RegisteredWorkspaceStorageLayout, WorkingMemoryError, WorkingMemoryFundingScope,
     WorkspaceCopyAccountLayout, WorkspaceCopyLimits, WorkspaceCopyRetention,
 };
-use crate::backend::runtime::cache::state::{
-    CompletedResidentSource, OriginalResidentSourceBinding, bind_completed_resident_sources,
-};
-use eredu_runtime::working_memory::{CompletedWorkspaceStorage, OriginalCompletedWorkspaceCopy};
 use std::{
     alloc::Layout,
     cell::Cell,
@@ -46,20 +46,33 @@ pub(crate) struct RegisteredArrayCopyCustody {
 }
 impl RegisteredArrayCopyCustody {
     /// Lexical loan of this closed published copy's actual account.
-    pub(crate) fn copy_retention(&self) -> &WorkspaceCopyRetention { &self._copy }
+    pub(crate) fn copy_retention(&self) -> &WorkspaceCopyRetention {
+        &self._copy
+    }
 }
 impl RegisteredArrayCopy {
-    pub(crate) fn custody(&self) -> &RegisteredArrayCopyCustody { &self.custody }
+    pub(crate) fn custody(&self) -> &RegisteredArrayCopyCustody {
+        &self.custody
+    }
     pub(crate) fn copy_retention(&self) -> &WorkspaceCopyRetention {
         self.custody.copy_retention()
     }
     pub(crate) fn validate_completed_stream(
-        &self, stream: &Stream, funding: &HostMetadataFunding,
+        &self,
+        stream: &Stream,
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
-        reserve(funding, self.completed_stream.source_comparison_control_bytes()
-            .ok_or_else(||memory(WorkingMemoryError::Overflow))?)?;
-        if self.completed_stream.matches_source(stream) { Ok(()) }
-        else { Err(memory(WorkingMemoryError::IdentityMismatch)) }
+        reserve(
+            funding,
+            self.completed_stream
+                .source_comparison_control_bytes()
+                .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
+        )?;
+        if self.completed_stream.matches_source(stream) {
+            Ok(())
+        } else {
+            Err(memory(WorkingMemoryError::IdentityMismatch))
+        }
     }
     pub(crate) fn array(&self) -> &Array {
         &self.array
@@ -102,7 +115,9 @@ impl Source {
         plan: WorkspaceIsolatedCopyPlan,
     ) -> Result<Copy, eredu_runtime::working_memory::WorkspaceCopyAdmissionError> {
         match self {
-            Self::Completed(source) => OriginalCompletedWorkspaceCopy::bind(plan, source).map(Copy::Completed),
+            Self::Completed(source) => {
+                OriginalCompletedWorkspaceCopy::bind(plan, source).map(Copy::Completed)
+            }
             Self::Numerical {
                 roots,
                 custody,
@@ -129,7 +144,7 @@ enum Copy {
 impl Copy {
     fn admit(
         self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         limits: WorkspaceCopyLimits,
     ) -> Result<
         eredu_runtime::working_memory::AdmittedWorkspaceCopy,
@@ -284,7 +299,7 @@ impl PreparedPendingTokenInput<'_> {
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Pending(self).copy_registered(
             Proof::Registered,
@@ -302,7 +317,7 @@ impl PreparedPendingTokenInput<'_> {
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Pending(self).copy_registered(
             prepared.map_or(Proof::Registered, Proof::Prepared),
@@ -318,12 +333,22 @@ impl IsolatedArrayCopy<'_> {
     /// Preserve the actual prepared B leaf dtype through the same isolated-copy
     /// worker and original-source binding used by all other completed copies.
     pub(crate) fn copy_prepared(
-        self, prepared:&crate::backend::array_copy::OriginalPreparedArrayCopySource<'_>,
-        environment:&OriginalCopyEnvironment<'_>,initialized:&safemlx::PrefillRootsRuntime,
-        mechanisms:MlxMetalWorkspaceMechanisms,funding:&HostMetadataFunding,capacity:u64,
-    )->Result<RegisteredArrayCopy,Error>{
-        Program::Isolated(self.source).copy_registered(Proof::Prepared(prepared),
-            environment,initialized,mechanisms,funding,capacity)
+        self,
+        prepared: &crate::backend::array_copy::OriginalPreparedArrayCopySource<'_>,
+        environment: &OriginalCopyEnvironment<'_>,
+        initialized: &safemlx::PrefillRootsRuntime,
+        mechanisms: MlxMetalWorkspaceMechanisms,
+        funding: &HostMetadataFunding,
+        capacity: &eredu_core::MemoryLimits,
+    ) -> Result<RegisteredArrayCopy, Error> {
+        Program::Isolated(self.source).copy_registered(
+            Proof::Prepared(prepared),
+            environment,
+            initialized,
+            mechanisms,
+            funding,
+            capacity,
+        )
     }
 
     /// Reuses the completed-state root binder for one exact current cache leaf.
@@ -335,11 +360,15 @@ impl IsolatedArrayCopy<'_> {
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Isolated(self.source).copy_registered(
             completed.map_or(Proof::Registered, Proof::Completed),
-            environment, initialized, mechanisms, funding, capacity,
+            environment,
+            initialized,
+            mechanisms,
+            funding,
+            capacity,
         )
     }
     /// A source is either an existing published copy or the exact immutable
@@ -354,7 +383,7 @@ impl IsolatedArrayCopy<'_> {
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<RegisteredArrayCopy, Error> {
         Program::Isolated(self.source).copy_registered(
             numerical.map_or(Proof::Registered, |(b, c)| Proof::Numerical(b, c)),
@@ -374,7 +403,7 @@ impl Program<'_> {
         initialized: &safemlx::PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<RegisteredArrayCopy, Error> {
         let frames = [
             PreparedPendingTokenInput::source_control_bytes()
@@ -441,17 +470,26 @@ impl Program<'_> {
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
         host: &HostPreparationAuthority,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<RegisteredArrayCopy, Error> {
         let stream_frames = [
             size_of::<safemlx::StreamCopyPlan<()>>(),
             size_of::<Result<safemlx::StreamCopyPlan<()>, safemlx::StreamCopyCause>>(),
         ];
-        reserve(funding, stream_frames.into_iter().try_fold(size_of_val(&stream_frames), add)?)?;
-        let completed_stream=safemlx::StreamCopyPlan::<()>::capture(environment.stream())
-            .map_err(|cause|paid(funding,cause))?;
-        reserve(funding,completed_stream.control_bytes()
-            .ok_or_else(||memory(WorkingMemoryError::Overflow))?)?;
+        reserve(
+            funding,
+            stream_frames
+                .into_iter()
+                .try_fold(size_of_val(&stream_frames), add)?,
+        )?;
+        let completed_stream = safemlx::StreamCopyPlan::<()>::capture(environment.stream())
+            .map_err(|cause| paid(funding, cause))?;
+        reserve(
+            funding,
+            completed_stream
+                .control_bytes()
+                .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
+        )?;
         if let Proof::Prepared(source) = proof {
             if !std::ptr::eq(self.source(), source.array()) {
                 return Err(memory(WorkingMemoryError::IdentityMismatch));
@@ -545,8 +583,17 @@ impl Program<'_> {
             .construct(environment.pool(), host)
             .map_err(|e| paid(funding, e))?;
         let registered = if let Proof::Completed(completed) = proof {
-            let projected = projected.as_ref().ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?;
-            match bind_completed_resident_sources(&context, projected, Some(completed), environment, funding, host)? {
+            let projected = projected
+                .as_ref()
+                .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?;
+            match bind_completed_resident_sources(
+                &context,
+                projected,
+                Some(completed),
+                environment,
+                funding,
+                host,
+            )? {
                 OriginalResidentSourceBinding::Registered(source) => Source::Registered(source),
                 OriginalResidentSourceBinding::Completed(source) => Source::Completed(source),
             }
@@ -580,7 +627,10 @@ impl Program<'_> {
                         .construct_with_prepared_source(
                             environment.pool(),
                             &context,
-                            std::iter::empty(),
+                            std::iter::empty::<(
+                                StorageIdentity,
+                                eredu_nn::workspace::WorkspaceExistingStorage,
+                            )>(),
                             source,
                         )
                         .and_then(|source| source.with_retained_original_sources(&mut carrier))
@@ -595,7 +645,9 @@ impl Program<'_> {
                                 .as_ref()
                                 .expect("registered projection")
                                 .iter()
-                                .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+                                .map(|(id, _, root)| {
+                                    crate::backend::nn::workspace::registered_storage_row(id, root)
+                                }),
                         )
                         .and_then(|source| source.with_retained_original_sources(&mut carrier))
                         .map_err(memory)?,
@@ -612,17 +664,64 @@ impl Program<'_> {
         .map_err(|e| paid(funding, e))?
         .construct()
         .map_err(|e| paid(funding, e))?;
+        let topology = environment.pool().topology();
+        let descriptor_bytes =
+            eredu_core::DomainMemoryRequirements::construction_backing_bytes(topology, 0)
+                .and_then(|bytes| {
+                    bytes
+                        .checked_add(
+                            std::mem::size_of::<eredu_core::DomainMemoryRequirements>() as u64
+                                + 2 * std::mem::size_of::<usize>() as u64,
+                        )
+                        .ok_or(eredu_core::MemoryDomainError::Overflow)
+                })
+                .and_then(|bytes| {
+                    capacity
+                        .named_initialization_bytes(topology)?
+                        .checked_add(bytes)
+                        .ok_or(eredu_core::MemoryDomainError::Overflow)
+                })
+                .map_err(|cause| paid(funding, cause))?;
+        reserve(
+            funding,
+            usize::try_from(descriptor_bytes).map_err(|_| memory(WorkingMemoryError::Overflow))?,
+        )?;
         let numerical = program
-            .incremental_bytes()
+            .report()
+            .physical_domains
+            .as_ref()
+            .map(|domains| &domains.native_allocations)
             .ok_or_else(|| memory(WorkingMemoryError::UnknownBound))?;
+        let mut delta = eredu_core::DomainMemoryRequirements::zero(topology);
+        let plan = &native;
+        let domain = plan
+            .physical_domain()
+            .map_err(|cause| paid(funding, cause))?;
+        let admitted = numerical
+            .get(domain)
+            .and_then(|charge| charge.total())
+            .map_err(|cause| paid(funding, cause))?;
+        let required = u64::try_from(plan.physical_bytes())
+            .map_err(|_| memory(WorkingMemoryError::Overflow))?;
+        let extra = if required > admitted {
+            required - admitted
+        } else {
+            0
+        };
+        delta
+            .add_allocation(
+                extra,
+                &eredu_core::MemoryPlacement::fixed(topology, domain)
+                    .map_err(|cause| paid(funding, cause))?,
+            )
+            .map_err(|cause| paid(funding, cause))?;
+        let mut limits = WorkspaceCopyLimits::new(
+            capacity
+                .named(topology)
+                .map_err(|cause| paid(funding, cause))?,
+        );
+        limits.additional_requirements = Some(std::sync::Arc::new(delta));
         let copy = registered.bind(program).map_err(|e| paid(funding, e))?;
-        let mut limits = WorkspaceCopyLimits::new(capacity);
-        // The native population includes the same isolated copy plus its real
-        // reshape/optional cast and both nested completions. Charge only the
-        // positive physical delta over the registered isolated-copy component.
-        limits.safety_reserve_bytes = u64::try_from(native.physical_bytes())
-            .map_err(|_| memory(WorkingMemoryError::Overflow))?
-            .saturating_sub(numerical);
         let account = copy
             .admit(environment.pool(), limits)
             .map_err(|e| paid(funding, e))?;

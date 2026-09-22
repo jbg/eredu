@@ -23,7 +23,7 @@ struct Sources {
 // Native A/B/B3/C have no such producer yet; they retain their fixed early gap.
 // No public bytes/flags/closure constructor or ordinary-report adoption exists.
 struct Recipe<'a> {
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     execution: &'a InferenceExecutionIdentity,
     selected_model: &'a OriginalPreparedHostInput,
     input: &'a OriginalPreparedHostInput,
@@ -33,7 +33,7 @@ struct Recipe<'a> {
     maximum_context: u64,
     request: AdmissionRequest,
     geometry: InferenceGeometry,
-    capacity: Option<u64>,
+    capacity: Option<eredu_core::MemoryLimits>,
 }
 impl Recipe<'_> {
     fn validate(&self, sources: &Sources) -> Result<(), WorkingMemoryError> {
@@ -87,10 +87,10 @@ fn admit<'source>(
     recipe.validate(&sources)?;
     // Same cheap context check before candidate construction as the legacy route.
     // A complete source has a concrete maximum, so no allocated missing reason.
-    let request = recipe.request;
+    let request = recipe.request.clone();
     if let Some(rejection) = eredu_core::check_admission_context_borrowed(
         AdmissionObservation::Available(recipe.maximum_context),
-        request,
+        request.clone(),
     )
     .map_err(Failure::Policy)?
     {
@@ -116,27 +116,19 @@ fn admit<'source>(
                 .requirements()
                 .map_err(|e| CandidateFailure::Terminal(Failure::Source(e)))?;
             let decision = match eredu_core::apply_admission_requirements(
-                request,
+                request.clone(),
                 AdmissionRequirements {
                     maximum_context: AdmissionObservation::Available(recipe.maximum_context),
                     state: requirements,
                     incremental: None,
-                    available: None,
+                    incremental_per_domain: false,
                 },
             )
             .map_err(|e| CandidateFailure::Terminal(Failure::Policy(e)))?
             {
                 BorrowedAdmissionResult::Admitted(decision) => decision,
                 BorrowedAdmissionResult::Rejected(rejection) => {
-                    let retry = matches!(
-                        rejection,
-                        BorrowedAdmissionRejection::MemoryBudgetExceeded { .. }
-                    );
-                    return Err(if retry {
-                        CandidateFailure::SmallerChunk(Failure::Rejected(rejection))
-                    } else {
-                        CandidateFailure::Terminal(Failure::Rejected(rejection))
-                    });
+                    return Err(CandidateFailure::Terminal(Failure::Rejected(rejection)));
                 }
             };
             let pending = {
@@ -147,14 +139,16 @@ fn admit<'source>(
                     recipe.pool,
                     recipe.execution,
                     &usage,
-                    decision.incremental_required_bytes,
-                    recipe.capacity,
+                    decision
+                        .incremental_required_bytes
+                        .expect("host fixture requirement"),
+                    recipe.capacity.as_ref(),
                     &[],
                 )
                 .map_err(|e| match e {
-                    e @ WorkingMemoryError::BudgetExceeded { .. } => {
-                        CandidateFailure::SmallerChunk(Failure::Source(e))
-                    }
+                    e @ (WorkingMemoryError::Domain(MemoryDomainError::BudgetExceeded {
+                        ..
+                    })) => CandidateFailure::SmallerChunk(Failure::Source(e)),
                     e => CandidateFailure::Terminal(Failure::Source(e)),
                 })?;
                 funding::PendingAccount::accept(
@@ -162,8 +156,10 @@ fn admit<'source>(
                     recipe.execution,
                     &mut usage,
                     commit,
-                    decision.incremental_required_bytes,
-                    recipe.capacity,
+                    decision
+                        .incremental_required_bytes
+                        .expect("host fixture requirement"),
+                    recipe.capacity.clone(),
                     floor,
                 )
                 .map_err(|e| CandidateFailure::Terminal(Failure::Source(e)))?

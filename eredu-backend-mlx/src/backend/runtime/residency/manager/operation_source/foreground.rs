@@ -3,7 +3,7 @@ use super::*;
 use eredu_core::WorkspaceBound;
 use eredu_runtime::residency::ResidencyClosure;
 use eredu_runtime::working_memory::{
-    WorkingMemoryError, WorkingMemoryPool, WorkspaceParameterLifetime, WorkspaceParameterOwner,
+    MemoryLedger, WorkingMemoryError, WorkspaceParameterLifetime, WorkspaceParameterOwner,
 };
 use std::mem::size_of_val;
 use std::ops::Range;
@@ -29,7 +29,7 @@ struct Data {
     depth: usize,
     materialization: WorkspaceBound,
     source: ForegroundDiskDescriptors,
-    domain: eredu_core::SharedStorageDomain,
+    domain: eredu_core::SharedStorageAccountingId,
     destination: safemlx::StreamCopyPlan<()>,
 }
 /// Shares exact source metadata, not an active disk receipt or source grant.
@@ -53,6 +53,9 @@ impl PartialEq for ForegroundDiskIdentity {
 }
 impl Eq for ForegroundDiskIdentity {}
 impl ForegroundDiskIdentity {
+    pub(crate) fn destination_device_index(&self) -> i32 {
+        self.value.destination.device_index()
+    }
     pub(crate) fn destination_device_type(&self) -> safemlx::DeviceType {
         self.value.destination.device_type()
     }
@@ -69,7 +72,7 @@ impl ForegroundDiskIdentity {
         &self,
         controls: &eredu_runtime::working_memory::OriginalOperationMetadataCustody,
     ) -> Result<(), WorkingMemoryError> {
-        if controls.matches_domain(&self.value.domain) {
+        if controls.matches_accounting_owner(&self.value.domain) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -81,7 +84,7 @@ impl ForegroundDiskIdentity {
     ) -> Result<(), WorkingMemoryError> {
         if controls
             .metadata_custody()
-            .matches_domain(&self.value.domain)
+            .matches_accounting_owner(&self.value.domain)
         {
             Ok(())
         } else {
@@ -196,7 +199,7 @@ impl ForegroundDiskIdentity {
         destination: safemlx::StreamCopyPlan<()>,
         source: &ForegroundDiskDescriptors,
         runtime: &safemlx::PreparedInputRuntime,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
         ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: NonZeroUsize,
@@ -312,8 +315,10 @@ impl ForegroundDiskIdentity {
                 let (shape, _) = source
                     .native_output(definition.id(), binding.name())
                     .ok_or_else(bad)?;
-                if !super::super::host_workspace::copy_shape_is_supported(destination.device_type(), shape)
-                    || metadata.byte_len() != binding.expected_bytes()
+                if !super::super::host_workspace::copy_shape_is_supported(
+                    destination.device_type(),
+                    shape,
+                ) || metadata.byte_len() != binding.expected_bytes()
                     || shape.len() != metadata.shape().len()
                     || !shape
                         .iter()
@@ -405,7 +410,7 @@ impl ResidencyManager {
     /// Exact source constructor payload and fixed transports. No query allocates,
     /// reads payload, initializes an allocator or grants request/native authority.
     pub(crate) fn original_foreground_operation_source_bytes(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         layout: &ExecutionUnitLayout,
         units: &[OffloadUnit],
         selected_count: usize,
@@ -441,7 +446,13 @@ impl ResidencyManager {
                 .map_err(|_| WorkingMemoryError::UnknownBound)?,
             size_of::<safemlx::StreamCopyPlan<()>>(),
             size_of::<Result<safemlx::StreamCopyPlan<()>, safemlx::StreamCopyCause>>(),
-            size_of::<(safemlx::DeviceType, &[i32], std::slice::Iter<'_, i32>, Option<i32>, bool)>(),
+            size_of::<(
+                safemlx::DeviceType,
+                &[i32],
+                std::slice::Iter<'_, i32>,
+                Option<i32>,
+                bool,
+            )>(),
             size_of::<ForegroundDiskIdentity>(),
             size_of::<Unit>(),
             size_of::<Row>(),
@@ -459,10 +470,10 @@ impl ResidencyManager {
             size_of::<WorkspaceBound>(),
             size_of::<Option<u64>>(),
             size_of::<Range<usize>>(),
-            size_of::<eredu_core::SharedStorageDomain>(),
+            size_of::<eredu_core::SharedStorageAccountingId>(),
             size_of::<(
                 &ResidencyManager,
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 &[OffloadUnitId],
                 &ExecutionUnitLayout,
                 NonZeroUsize,
@@ -482,7 +493,7 @@ impl ResidencyManager {
     }
     pub(crate) fn initialize_original_foreground_operation_source(
         &mut self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
@@ -501,7 +512,7 @@ impl ResidencyManager {
     /// Its population is separately included in the actual manager load source.
     pub(in crate::backend::runtime::residency::manager) fn initialize_original_background_operation_source(
         &mut self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
@@ -511,12 +522,15 @@ impl ResidencyManager {
             return Err(OperationSourceFailure::Layout);
         }
         let source = self.build_original_foreground_operation_source(pool, ids, layout, depth)?;
-        self.inner.background_operation_source.set(source).map_err(|_| OperationSourceFailure::Layout)
+        self.inner
+            .background_operation_source
+            .set(source)
+            .map_err(|_| OperationSourceFailure::Layout)
     }
 
     pub(in crate::backend::runtime::residency::manager) fn build_original_foreground_operation_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: NonZeroUsize,
@@ -546,7 +560,7 @@ impl ResidencyManager {
                 .map_err(|_| OperationSourceFailure::Layout)?,
             descriptor,
             &runtime,
-            pool.shared_storage_domain(),
+            pool.shared_storage_accounting_id(),
             ids,
             layout,
             depth,

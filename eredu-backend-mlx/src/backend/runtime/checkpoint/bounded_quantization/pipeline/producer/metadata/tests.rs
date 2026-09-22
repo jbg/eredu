@@ -3,7 +3,7 @@ use eredu_checkpoint::{
     recipe::RecipeError,
     store::{MemoryWeightStore, SafetensorsWeightStore, TensorSelection},
 };
-use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 #[test]
 fn output_metadata_is_admitted_before_inference_and_retires_with_its_owner() {
@@ -43,16 +43,16 @@ fn output_metadata_is_admitted_before_inference_and_retires_with_its_owner() {
         let before = source.source_diagnostics().unwrap();
         let plan = MetadataPlan::new(&recipe, source).unwrap();
         let required = plan.required_bytes().unwrap();
-        let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+        let short = crate::memory_fixture::ledger(required - 1, 0).unwrap();
         let error = plan.prepare(&short).unwrap_err();
         assert!(
-            matches!(error.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == required && *available_bytes == required - 1)
+            matches!(error.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == required && limit_bytes.checked_sub(*existing_bytes).unwrap() == required - 1)
         );
         assert!(error.rejected_plan().is_some());
         assert!(error.constructor_failure().is_none());
-        assert_eq!(short.used_bytes().unwrap(), 0);
+        assert_eq!(short.fixture_host_charge().unwrap(), 0);
         drop(error);
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(required, 0).unwrap();
         let ready = MetadataPlan::new(&recipe, source)
             .unwrap()
             .prepare(&pool)
@@ -61,7 +61,7 @@ fn output_metadata_is_admitted_before_inference_and_retires_with_its_owner() {
         assert_eq!(ready.output().inferred().shape(), &[2, 64]);
         assert_eq!(ready.output().inferred().byte_len(), 512);
         assert_eq!(ready.original_bytes(), required);
-        assert_eq!(pool.used_bytes().unwrap(), required);
+        assert_eq!(pool.fixture_host_charge().unwrap(), required);
         ready.validate_pool(&pool).unwrap();
         assert!(matches!(
             ready.validate_pool(&short),
@@ -69,7 +69,7 @@ fn output_metadata_is_admitted_before_inference_and_retires_with_its_owner() {
         ));
         assert_eq!(source.source_diagnostics().unwrap(), before);
         drop(ready);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
 
@@ -89,7 +89,7 @@ fn inference_failure_retains_the_typed_error_and_original_account() {
         };
         let plan = MetadataPlan::new(&recipe, &source).unwrap();
         let required = plan.required_bytes().unwrap();
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(required, 0).unwrap();
         let (uncalled, failure) = plan.prepare(&pool).unwrap_err().into_parts();
         assert!(uncalled.is_none());
         (failure, pool, required)
@@ -104,19 +104,19 @@ fn inference_failure_retains_the_typed_error_and_original_account() {
         ))
     ));
     assert!(failure.constructor_failure().unwrap()._metadata.is_none());
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.fixture_host_charge().unwrap(), required);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
 fn native_dimension_failure_keeps_constructed_metadata_and_shape_prefix() {
     use eredu_checkpoint::{
-        StoredDtype,
         store::{
             CheckpointLease, SourceMetadataLoan, StoreError, TensorMetadata, TensorReadRequest,
             WeightStoreDiagnostics,
         },
+        StoredDtype,
     };
     struct Source(TensorMetadata);
     impl CheckpointSource for Source {
@@ -149,7 +149,7 @@ fn native_dimension_failure_keeps_constructed_metadata_and_shape_prefix() {
         let recipe = DerivedWeightRecipe::source("weight", TensorSelection::Full);
         let plan = MetadataPlan::new(&recipe, &source).unwrap();
         let required = plan.required_bytes().unwrap();
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(required, 0).unwrap();
         let (uncalled, failure) = plan.prepare(&pool).unwrap_err().into_parts();
         assert!(uncalled.is_none());
         (failure, pool, required)
@@ -160,7 +160,11 @@ fn native_dimension_failure_keeps_constructed_metadata_and_shape_prefix() {
     assert!(matches!(cause.cause, Cause::Dimension { axis: 1, dimension } if dimension == large));
     assert_eq!(cause._metadata.as_ref().unwrap().shape(), &[2, large]);
     assert_eq!(cause._shape, [2]);
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.fixture_host_charge().unwrap(), required);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

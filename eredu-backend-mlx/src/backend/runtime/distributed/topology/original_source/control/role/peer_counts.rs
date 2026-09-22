@@ -186,7 +186,7 @@ impl OriginalParallelControlProjection {
                     input, order: Some(order), expected, claim, capacity,
                     owner: OriginalParallelControlOwner(retained.0.clone()),
                 };
-                let words = run_native_role(invocation, capacity, &owner.bank, &owner.controls, c,
+                let words = run_native_role(invocation, capacity, &owner.native, c,
                     |value, observer| Ok(value.run(observer)))
                     .map_err(|cause| Error::with_original_control_source(cause, false))??;
                 let source = owner.request.source.communication_source()?;
@@ -326,7 +326,7 @@ fn complete_world(owner: &OriginalParallelControlOwner, local: &[i32], group: &G
     drop(source);
     let invocation = Invocation { input, order: None, expected, claim, capacity,
         owner: OriginalParallelControlOwner(owner.0.clone()) };
-    let words = run_native_role(invocation, capacity, &retained.bank, &retained.controls, c,
+    let words = run_native_role(invocation, capacity, &retained.native, c,
         |value, observer| Ok(value.run(observer)))
         .map_err(|cause| Error::with_original_control_source(cause, false))??;
     let world = table::WorldTable::decode(words.as_slice(), world, world, c)?;

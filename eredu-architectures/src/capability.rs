@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 
 use crate::rotary::RopeValue;
 use eredu_core::{
+    cache::{LayerCachePolicy, StateTensorRole},
     CacheStateStrategy, CapabilityError, EstimationCompleteness, InputModalities,
     ModelCapabilities, ObservationKind, Observed, SlidingWindowLayerCount, SpeculativeDraftSource,
     StateMemoryLayout,
-    cache::{LayerCachePolicy, StateTensorRole},
 };
 use eredu_runtime::StateLayout as RuntimeStateLayout;
 
@@ -22,8 +22,8 @@ use crate::{
     llama::ModelArgs as LlamaModelArgs,
     nemotron_h,
     qwen::{
-        ModelArgs as QwenModelArgs, QwenVariant,
         hybrid::{HybridConfig as QwenHybridConfig, HybridLayerPolicy as QwenHybridLayerPolicy},
+        ModelArgs as QwenModelArgs, QwenVariant,
     },
 };
 use eredu_core::attention::AttentionPolicy;
@@ -1179,12 +1179,10 @@ mod tests {
                         input,
                         max_output_tokens: 3,
                         batch_size: 1,
-                        safety_reserve_bytes: 0,
-                        application_memory_budget_bytes: Some(u64::MAX),
-                        require_complete_estimate: false,
+                        additional_headroom: Default::default(),
+                        memory_limits: Default::default(),
                     },
-                    state,
-                    None
+                    state
                 )
                 .unwrap(),
                 eredu_core::AdmissionResult::Rejected(
@@ -1369,24 +1367,17 @@ mod tests {
         .unwrap();
         assert_eq!(v3_state.context_state_bytes, 3 * (4 + 2) * 256 * 2);
         let target_only_budget = 2 * (4 + 2) * 256 * 2;
+        let ledger = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+        let mut physical = eredu_core::DomainMemoryRequirements::zero(ledger.topology());
+        physical
+            .add_allocation(v3_state.context_state_bytes, ledger.host_placement())
+            .unwrap();
         assert!(matches!(
-            eredu_core::apply_admission_policy(
-                v3.capabilities(),
-                eredu_core::AdmissionRequest {
-                    input: eredu_core::InputTokenCount::text(3),
-                    max_output_tokens: 0,
-                    batch_size: 1,
-                    safety_reserve_bytes: 0,
-                    application_memory_budget_bytes: Some(target_only_budget),
-                    require_complete_estimate: true,
-                },
-                v3_state,
-                None,
-            )
-            .unwrap(),
-            eredu_core::AdmissionResult::Rejected(
-                eredu_core::AdmissionRejection::MemoryBudgetExceeded { .. }
-            )
+            physical.check_increment(
+                &eredu_core::DomainMemoryRequirements::zero(ledger.topology()),
+                &crate::memory_fixture::limits(&ledger, target_only_budget),
+            ),
+            Err(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ));
 
         let v4_args = crate::deepseek::parse_v4_config(&json!({

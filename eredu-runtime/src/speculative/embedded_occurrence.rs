@@ -10,7 +10,7 @@ use eredu_core::{
         PredictionPrefillAlignment, SpeculativeActivationPhase as Phase, SpeculativePrefillSpan,
         SpeculativeRequestGeometry,
     },
-    GenerationError, OutputDemand,
+    GenerationError, InferenceGeometry, OutputDemand,
 };
 use std::{
     num::NonZeroUsize,
@@ -275,6 +275,10 @@ impl<'a> EmbeddedSchedulePlan<'a> {
     pub const fn geometry(&self) -> SpeculativeRequestGeometry {
         self.geometry
     }
+    /// Exact complete ingress geometry before individual model-role claims.
+    pub const fn prefill_geometry(&self) -> InferenceGeometry {
+        self.prefill.geometry()
+    }
     pub const fn attempts(&self, kind: EmbeddedOccurrenceKind) -> usize {
         self.limits[kind as usize]
     }
@@ -331,12 +335,19 @@ impl<'a> EmbeddedSchedulePlan<'a> {
             }
             let span = span.ok_or(EmbeddedOccurrenceError::Geometry)?;
             let width = self.prefill.geometry().prefill_chunk_positions;
-            let index = span.input_start.checked_div(width)
+            let index = span
+                .input_start
+                .checked_div(width)
                 .ok_or(EmbeddedOccurrenceError::Geometry)?;
-            let (target, prediction) = self.prefill_invocations(index)
+            let (target, prediction) = self
+                .prefill_invocations(index)
                 .ok_or(EmbeddedOccurrenceError::Geometry)?;
-            let invocation = if phase == Phase::TargetPrefill { Some(target) } else { prediction }
-                .ok_or(EmbeddedOccurrenceError::Geometry)?;
+            let invocation = if phase == Phase::TargetPrefill {
+                Some(target)
+            } else {
+                prediction
+            }
+            .ok_or(EmbeddedOccurrenceError::Geometry)?;
             if invocation.prefill_span() != Some(span) || invocation.positions() != positions {
                 return Err(EmbeddedOccurrenceError::Geometry);
             }
@@ -345,10 +356,14 @@ impl<'a> EmbeddedSchedulePlan<'a> {
         if span.is_some() || origin.prediction < origin.committed_tokens {
             return Err(EmbeddedOccurrenceError::Geometry);
         }
-        let prefix = origin.prediction.checked_sub(1)
+        let prefix = origin
+            .prediction
+            .checked_sub(1)
             .and_then(|n| u64::try_from(n).ok())
             .ok_or(EmbeddedOccurrenceError::Geometry)?;
-        let frontier = self.first_frontier.checked_add(prefix)
+        let frontier = self
+            .first_frontier
+            .checked_add(prefix)
             .ok_or(EmbeddedOccurrenceError::Overflow)?;
         self.decode_invocation(phase, frontier, positions)
     }
@@ -537,7 +552,9 @@ impl EmbeddedContinuation {
             std::mem::size_of::<(usize, SpeculativeRequestStatus)>(),
             std::mem::size_of::<([usize; 7], [usize; 7], usize, usize, usize)>(),
         ];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
 }
 impl<'a> EmbeddedOccurrenceCursor<'a> {
@@ -619,8 +636,16 @@ impl<'a> EmbeddedOccurrenceCursor<'a> {
             identity: self.plan.identity,
             previous: self.plan.limits,
             next,
-            previous_slots: self.plan.limits.iter().try_fold(0usize, |n, v| n.checked_add(*v)).ok_or(EmbeddedOccurrenceError::Overflow)?,
-            next_slots: next.iter().try_fold(0usize, |n, v| n.checked_add(*v)).ok_or(EmbeddedOccurrenceError::Overflow)?,
+            previous_slots: self
+                .plan
+                .limits
+                .iter()
+                .try_fold(0usize, |n, v| n.checked_add(*v))
+                .ok_or(EmbeddedOccurrenceError::Overflow)?,
+            next_slots: next
+                .iter()
+                .try_fold(0usize, |n, v| n.checked_add(*v))
+                .ok_or(EmbeddedOccurrenceError::Overflow)?,
         })
     }
     /// Install only after the enclosing source-specific adapter funds its actual

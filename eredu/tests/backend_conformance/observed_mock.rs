@@ -24,10 +24,15 @@ pub(super) struct Sampling {
 pub(super) fn artifact_identity() -> eredu_core::artifact::ArtifactIdentity {
     use sha2::Digest;
     let equations = b"prefill: token_count; decode: token+1; logits intervention: token*scale";
-    eredu_core::artifact::fingerprint_artifact("neutral-arithmetic-fixture", [
-        eredu_core::artifact::ArtifactMemberIdentity::new("equations", equations.len() as u64,
-            sha2::Sha256::digest(equations).into()),
-    ]).unwrap()
+    eredu_core::artifact::fingerprint_artifact(
+        "neutral-arithmetic-fixture",
+        [eredu_core::artifact::ArtifactMemberIdentity::new(
+            "equations",
+            equations.len() as u64,
+            sha2::Sha256::digest(equations).into(),
+        )],
+    )
+    .unwrap()
 }
 
 pub(super) fn discovery() -> CaptureDiscovery {
@@ -35,7 +40,6 @@ pub(super) fn discovery() -> CaptureDiscovery {
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::Summary],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     CaptureDiscovery {
@@ -218,7 +222,10 @@ impl State {
     pub(super) fn take_capture(&mut self) -> Result<Option<SharedCapturedStep>, MockError> {
         match &mut self.funded {
             Some(capture) => Ok(capture.take_shared_step()?),
-            None => Ok(self.capture.as_mut().and_then(|capture| capture.take_shared_step())),
+            None => Ok(self
+                .capture
+                .as_mut()
+                .and_then(|capture| capture.take_shared_step())),
         }
     }
     pub fn observe(
@@ -232,7 +239,7 @@ impl State {
             scale: 1.0,
         };
         if self.funded.is_some() {
-            value = self.observe_funded(value,phase)?;
+            value = self.observe_funded(value, phase)?;
         } else if let Some(capture) = &mut self.capture {
             capture
                 .begin_step(phase, self.sampling.prediction)
@@ -259,7 +266,9 @@ impl State {
 }
 
 impl InterventionBackend for Mechanism {
-    fn matches_intervention_shape(&self, value: &Value, shape: &[u64]) -> Result<bool,MockError> { Ok(value.shape == shape) }
+    fn matches_intervention_shape(&self, value: &Value, shape: &[u64]) -> Result<bool, MockError> {
+        Ok(value.shape == shape)
+    }
     fn mask_components(&mut self, _: &Value, _: &[u32], _: bool) -> Result<Value, MockError> {
         Err(MockError::Capture(
             "mock does not advertise component masks".into(),
@@ -282,7 +291,11 @@ impl InterventionBackend for Mechanism {
         slice: &ResolvedCaptureSlice,
     ) -> Result<Value, MockError> {
         Ok(Value {
-            shape: slice.shape.as_slice().try_into().map_err(|_| MockError::CaptureGeometry)?,
+            shape: slice
+                .shape
+                .as_slice()
+                .try_into()
+                .map_err(|_| MockError::CaptureGeometry)?,
             scale: value.scale,
         })
     }
@@ -419,7 +432,6 @@ pub(super) fn plan() -> CapturePlan {
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -482,8 +494,19 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
             ..Default::default()
         };
         let cancellation = eredu_core::GenerationCancellationToken::new();
-        let source = model.chat_source(!request.tools.is_empty(), &cancellation).unwrap().unwrap();
-        model.prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation).unwrap().unwrap()
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
+            .unwrap()
+            .unwrap()
     };
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -500,88 +523,206 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
     let baseline = {
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let mut on_event = |_| {};
-        let mut request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(settings.clone()),
+        );
         request.stop_sequences = &[];
-        model.start_prepared_chat(request, &cancellation).and_then(|session|
-            session.expect("uncancelled original request").run(&cancellation, &mut on_event))
+        model
+            .start_prepared_chat(request, &cancellation)
+            .and_then(|session| {
+                session
+                    .expect("uncancelled original request")
+                    .run(&cancellation, &mut on_event)
+            })
     }
-        .unwrap();
-    let capture=plan();
-    let unchanged=intervention_plan(1.0);
-    let make_request=|intervention| {
-        let mut request=eredu::api::PreparedChatRequest::new(&chat,original_sources::settings(settings));
-        request.capture=Some(&capture);
-        request.intervention=Some(intervention);
+    .unwrap();
+    let capture = plan();
+    let unchanged = intervention_plan(1.0);
+    let make_request = |intervention| {
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(settings.clone()),
+        );
+        request.capture = Some(&capture);
+        request.intervention = Some(intervention);
         request
     };
-    let mut records=Vec::new();
-    let mut session=model.start_controlled_chat(make_request(&unchanged),limits,Default::default(),|r| {records.push(r);std::ops::ControlFlow::Continue(())}).unwrap().unwrap();
-    session.run(|r| {records.push(r);std::ops::ControlFlow::Continue(())}).unwrap();
-    assert_eq!(session.token_ids(),baseline.token_ids.as_ref());
-    assert_eq!(session.finish_reason(),Some(baseline.finish_reason));
+    let mut records = Vec::new();
+    let mut session = model
+        .start_controlled_chat(make_request(&unchanged), limits, Default::default(), |r| {
+            records.push(r);
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap()
+        .unwrap();
+    session
+        .run(|r| {
+            records.push(r);
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(session.token_ids(), baseline.token_ids.as_ref());
+    assert_eq!(session.finish_reason(), Some(baseline.finish_reason));
     assert!(session.timing().time_to_first_token().is_some());
-    let identity=match &records[0].instrumentation {eredu::api::PreparedInstrumentationRecord::Intervened{intervention_plan_id,..}=>intervention_plan_id.clone(),_=>panic!("intervention source")};
-    let mut predictions=Vec::new();
+    let identity = match &records[0].instrumentation {
+        eredu::api::PreparedInstrumentationRecord::Intervened {
+            intervention_plan_id,
+            ..
+        } => intervention_plan_id.clone(),
+        _ => panic!("intervention source"),
+    };
+    let mut predictions = Vec::new();
     for record in &records {
-        assert!(matches!(&record.instrumentation,eredu::api::PreparedInstrumentationRecord::Intervened{intervention_plan_id,..} if *intervention_plan_id==identity));
-        if let Some(Event::Token{captures:Some(step),..})=record.event.progress() {
-            assert_eq!(step.interventions[0].outcome,InterventionOutcome::Applied);
-            assert_eq!(step.interventions[0].evidence.len(),2);
-            assert_eq!(step.step_usage.captures,3);
-            assert_eq!(step.records[0].payload,step.interventions[0].evidence[0].payload);
-            assert_eq!(step.interventions[0].evidence[0].payload,step.interventions[0].evidence[1].payload);
+        assert!(
+            matches!(&record.instrumentation,eredu::api::PreparedInstrumentationRecord::Intervened{intervention_plan_id,..} if *intervention_plan_id==identity)
+        );
+        if let Some(Event::Token {
+            captures: Some(step),
+            ..
+        }) = record.event.progress()
+        {
+            assert_eq!(step.interventions[0].outcome, InterventionOutcome::Applied);
+            assert_eq!(step.interventions[0].evidence.len(), 2);
+            assert_eq!(step.step_usage.captures, 3);
+            assert_eq!(
+                step.records[0].payload,
+                step.interventions[0].evidence[0].payload
+            );
+            assert_eq!(
+                step.interventions[0].evidence[0].payload,
+                step.interventions[0].evidence[1].payload
+            );
             predictions.push(step.prediction_index);
         }
     }
-    assert_eq!(predictions,[0,1,2]);
-    drop(session);drop(records);
-    let empty=InterventionPlan::none();
-    let mut session=model.start_controlled_chat(make_request(&empty),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
-    session.run(|r| {
-        assert!(!matches!(r.instrumentation,eredu::api::PreparedInstrumentationRecord::Intervened{..}));
-        if let Some(Event::Token{captures:Some(step),..})=r.event.progress() {assert!(step.interventions.is_empty());assert_eq!(step.records.len(),1);}
-        ControlFlow::Continue(())
-    }).unwrap();
-    assert_eq!(session.token_ids(),baseline.token_ids.as_ref());
-    assert_eq!(session.finish_reason(),Some(baseline.finish_reason));
+    assert_eq!(predictions, [0, 1, 2]);
     drop(session);
-    let mut invalid=intervention_plan(1.0);invalid.operations[0].target="nonexistent".into();
-    assert!(model.start_controlled_chat(make_request(&invalid),limits,Default::default(), |_|panic!("invalid admission delivery")).is_err());
-    let failed=intervention_plan(13.0);
-    let mut records=Vec::new();
-    let mut session=model.start_controlled_chat(make_request(&failed),limits,Default::default(),|r|{records.push(r);ControlFlow::Continue(())}).unwrap().unwrap();
-    assert!(session.run(|r| {records.push(r);ControlFlow::Continue(())}).is_err());
+    drop(records);
+    let empty = InterventionPlan::none();
+    let mut session = model
+        .start_controlled_chat(make_request(&empty), limits, Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap()
+        .unwrap();
+    session
+        .run(|r| {
+            assert!(!matches!(
+                r.instrumentation,
+                eredu::api::PreparedInstrumentationRecord::Intervened { .. }
+            ));
+            if let Some(Event::Token {
+                captures: Some(step),
+                ..
+            }) = r.event.progress()
+            {
+                assert!(step.interventions.is_empty());
+                assert_eq!(step.records.len(), 1);
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(session.token_ids(), baseline.token_ids.as_ref());
+    assert_eq!(session.finish_reason(), Some(baseline.finish_reason));
+    drop(session);
+    let mut invalid = intervention_plan(1.0);
+    invalid.operations[0].target = "nonexistent".into();
+    assert!(model
+        .start_controlled_chat(
+            make_request(&invalid),
+            limits,
+            Default::default(),
+            |_| panic!("invalid admission delivery")
+        )
+        .is_err());
+    let failed = intervention_plan(13.0);
+    let mut records = Vec::new();
+    let mut session = model
+        .start_controlled_chat(make_request(&failed), limits, Default::default(), |r| {
+            records.push(r);
+            ControlFlow::Continue(())
+        })
+        .unwrap()
+        .unwrap();
+    assert!(session
+        .run(|r| {
+            records.push(r);
+            ControlFlow::Continue(())
+        })
+        .is_err());
     assert!(records.iter().any(|r|matches!(r.event.progress(),Some(Event::CaptureFailure{captures,..}) if matches!(captures.interventions[0].outcome,InterventionOutcome::Failed{..}))));
-    assert!(matches!(records.last().unwrap().event.progress(),Some(Event::Failed{..})));
-    drop(session);drop(records);
-    for pre_cancel in [false,true] {
-        let control=eredu_core::execution_control::GenerationControlHandle::default();
-        if pre_cancel {control.cancel();}
-        let mut closed=false;
-        let session=model.start_controlled_chat(make_request(&unchanged),limits,control, |_|ControlFlow::Continue(())).unwrap();
-        if pre_cancel {assert!(session.is_none());continue;}
-        let mut session=session.unwrap();
-        session.run(|r| {
-            assert!(!closed,"delivery after consumer Break");
-            if matches!(r.event.progress(),Some(Event::Token{..})) {closed=true;ControlFlow::Break(())} else {ControlFlow::Continue(())}
-        }).unwrap();
-        assert_eq!(session.finish_reason(),Some(FinishReason::Cancelled));
-        assert_eq!(session.token_ids().len(),1);
+    assert!(matches!(
+        records.last().unwrap().event.progress(),
+        Some(Event::Failed { .. })
+    ));
+    drop(session);
+    drop(records);
+    for pre_cancel in [false, true] {
+        let control = eredu_core::execution_control::GenerationControlHandle::default();
+        if pre_cancel {
+            control.cancel();
+        }
+        let mut closed = false;
+        let session = model
+            .start_controlled_chat(make_request(&unchanged), limits, control, |_| {
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        if pre_cancel {
+            assert!(session.is_none());
+            continue;
+        }
+        let mut session = session.unwrap();
+        session
+            .run(|r| {
+                assert!(!closed, "delivery after consumer Break");
+                if matches!(r.event.progress(), Some(Event::Token { .. })) {
+                    closed = true;
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        assert_eq!(session.finish_reason(), Some(FinishReason::Cancelled));
+        assert_eq!(session.token_ids().len(), 1);
         assert!(session.timing().time_to_first_token().is_some());
     }
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut session=model.start_controlled_chat(make_request(&unchanged),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
-        let _=session.run(|r| {if matches!(r.event.progress(),Some(Event::Token{..})) {panic!("consumer unwinds");} ControlFlow::Continue(())});
-    })).is_err());
-    let mut session=model.start_controlled_chat(make_request(&unchanged),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
-    session.run(|_|ControlFlow::Continue(())).unwrap();
-    assert_eq!(session.token_ids(),baseline.token_ids.as_ref());
-    assert_eq!(session.finish_reason(),Some(baseline.finish_reason));
+        let mut session = model
+            .start_controlled_chat(make_request(&unchanged), limits, Default::default(), |_| {
+                ControlFlow::Continue(())
+            })
+            .unwrap()
+            .unwrap();
+        let _ = session.run(|r| {
+            if matches!(r.event.progress(), Some(Event::Token { .. })) {
+                panic!("consumer unwinds");
+            }
+            ControlFlow::Continue(())
+        });
+    }))
+    .is_err());
+    let mut session = model
+        .start_controlled_chat(make_request(&unchanged), limits, Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap()
+        .unwrap();
+    session.run(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(), baseline.token_ids.as_ref());
+    assert_eq!(session.finish_reason(), Some(baseline.finish_reason));
     drop(session);
-    let zero=intervention_plan(0.0);
-    let mut session=model.start_controlled_chat(make_request(&zero),limits,Default::default(), |_|ControlFlow::Continue(())).unwrap().unwrap();
-    session.run(|_|ControlFlow::Continue(())).unwrap();
-    assert_eq!(session.token_ids(),[0,0,0]);
+    let zero = intervention_plan(0.0);
+    let mut session = model
+        .start_controlled_chat(make_request(&zero), limits, Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap()
+        .unwrap();
+    session.run(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(), [0, 0, 0]);
 }
 
 #[test]

@@ -3,7 +3,7 @@ use super::*;
 use crate::working_memory::{
     CapturePlanPublicationCause, CapturePlanStorageKey, PreparedCapturePlanPublication,
 };
-use eredu_core::{SharedStorageDomain, SharedStorageIdentity};
+use eredu_core::{SharedStorageAccountingId, SharedStorageIdentity};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Key(SharedStorageIdentity);
 impl CapturePlanStorageKey for Key {
@@ -22,7 +22,7 @@ fn key(source: &SharedCapturePlan) -> Key {
     Key(source.storage_identity().clone())
 }
 fn publication_quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &SharedCapturePlan,
     existing: Option<&WorkingMemoryStorage<Key>>,
 ) -> IncrementalInferenceQuote {
@@ -42,13 +42,13 @@ fn publication_quote(
 }
 #[test]
 fn publication_seal_prices_exact_c_outside_one_original_host_hold() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let earlier_source = source.clone();
     let c = source.capacity_bytes().unwrap();
     let raw = replacement_quote(&pool, geometry(), 0).into_incremental();
-    let before = raw.incremental_bytes();
+    let before = raw.incremental_bytes().unwrap();
     let publication = PreparedCapturePlanPublication::prepare(
         &pool,
         raw.span_workspace().plan(),
@@ -66,75 +66,86 @@ fn publication_seal_prices_exact_c_outside_one_original_host_hold() {
     assert!(controls.capture_publication_control_bytes() > 0);
     let q = raw.with_span_workspace_and_text_controls(controls).unwrap();
     let protected = q.span_workspace().protected_peak_bytes().unwrap();
-    assert_eq!(q.incremental_bytes(), before + protected + c);
-    let required = q.incremental_bytes();
+    assert_eq!(q.incremental_bytes().unwrap(), before + protected + c);
+    let required = q.incremental_bytes().unwrap();
+    let layout = crate::working_memory::StoragePublicationLayout::<Key>::new(1).unwrap();
+    let pin_prepared = layout.fund(&pool).unwrap();
+    let exact = exact_capacity(&pool, &q);
     assert!(matches!(
-        sealed_plan(&pool, &q, 64 + required - 1),
+        sealed_plan(&pool, &q, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
-    let (r, accepted) = sealed_plan(&pool, &q, 64 + required).unwrap();
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
+    let (r, accepted) = sealed_plan(&pool, &q, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
-    assert!(accepted
-        .clone()
-        .into_funded_text_span_workspace(&run, &r)
-        .is_err());
+    assert!(
+        accepted
+            .clone()
+            .into_funded_text_span_workspace(&run, &r)
+            .is_err()
+    );
     let native = run.scope().unwrap();
     let pending = accepted
         .begin_capture_plan_publication::<Key>(&run, &r, &source)
         .unwrap();
     let held = account(&pool, &r);
     assert_eq!(held.1, protected);
-    assert!(q
-        .clone()
-        .begin_capture_plan_publication::<Key>(&run, &r, &source)
-        .is_err());
+    assert!(
+        q.clone()
+            .begin_capture_plan_publication::<Key>(&run, &r, &source)
+            .is_err()
+    );
     assert_eq!(account(&pool, &r), held);
     let (owner, witness) = pending.publish_and_finish(&native).unwrap();
     assert_eq!(account(&pool, &r), (held.0 - c, protected, held.2));
-    assert_eq!(pool.used_bytes().unwrap(), 64 + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64 + required);
     witness.validate(&pool).unwrap();
-    assert!(owner
-        .workspace()
-        .text_controls()
-        .unwrap()
-        .same_binding(&earlier_controls));
+    assert!(
+        owner
+            .workspace()
+            .text_controls()
+            .unwrap()
+            .same_binding(&earlier_controls)
+    );
     let witness_alias = witness.clone();
-    let registered = pool.pin_registered_storage([(key(&source), c)]).unwrap();
+    let registered = pin_prepared
+        .pin_registered_storage_with_placement([(
+            key(&source),
+            crate::working_memory::StorageAllocation::new(c, pool.host_placement_handle()),
+        )])
+        .unwrap();
     let next = publication_quote(&pool, &source, Some(&registered));
-    assert_eq!(next.incremental_bytes() + c, required);
+    assert_eq!(next.incremental_bytes().unwrap() + c, required);
     assert!(matches!(
         sealed_plan(&pool, &next, 1_000_000),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
-    assert_eq!(pool.used_bytes().unwrap(), 64 + required);
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64 + required);
     drop((next, registered));
     native.certify().unwrap();
     drop((owner, witness, r, run, q, earlier_controls, root, source));
     // The earlier source and escaped witness retain exactly the original P+Q+S
     // hold and registered C; unused equation/controller headroom is terminal.
-    assert_eq!(pool.used_bytes().unwrap(), protected + c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected + c);
     drop(earlier_source);
-    assert_eq!(pool.used_bytes().unwrap(), protected + c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected + c);
     witness_alias.validate(&pool).unwrap();
     drop(witness_alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn existing_and_raced_c_preserve_origins_without_retroactive_quote_credit() {
     for raced in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let source = capture_source();
         let c = source.capacity_bytes().unwrap();
         let before = if raced {
             None
         } else {
-            Some(pool.register_storage([(key(&source), c)]).unwrap())
+            Some(pool.register_host_storage([(key(&source), c)]).unwrap())
         };
         let q = publication_quote(&pool, &source, before.as_ref());
         assert_eq!(
@@ -147,7 +158,7 @@ fn existing_and_raced_c_preserve_origins_without_retroactive_quote_credit() {
         let (r, run, q) = accept(&pool, q);
         let native = run.scope().unwrap();
         let race = if raced {
-            Some(pool.register_storage([(key(&source), c)]).unwrap())
+            Some(pool.register_host_storage([(key(&source), c)]).unwrap())
         } else {
             None
         };
@@ -155,55 +166,61 @@ fn existing_and_raced_c_preserve_origins_without_retroactive_quote_credit() {
             .begin_capture_plan_publication::<Key>(&run, &r, &source)
             .unwrap();
         let held = account(&pool, &r);
-        let used = pool.used_bytes().unwrap();
+        let used = pool.payload_used_bytes().unwrap();
         let (owner, witness) = pending.publish_and_finish(&native).unwrap();
         assert_eq!(account(&pool, &r), held);
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.payload_used_bytes().unwrap(), used);
         witness.validate(&pool).unwrap();
         let retained = owner.protected_host_bytes() + c;
         native.certify().unwrap();
         drop((owner, witness, run, r, root, before, race));
-        assert_eq!(pool.used_bytes().unwrap(), retained);
+        assert_eq!(pool.payload_used_bytes().unwrap(), retained);
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn publication_rejects_wrong_identity_capacity_domain_and_independent_binding() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let other = capture_source();
     let c = source.capacity_bytes().unwrap();
     let raw = replacement_quote(&pool, geometry(), 0).into_incremental();
-    assert!(PreparedCapturePlanPublication::prepare(
-        &pool,
-        raw.span_workspace().plan(),
-        &source,
-        key(&other),
-        None
-    )
-    .is_err());
-    let wrong = pool.register_storage([(key(&source), c + 1)]).unwrap();
-    assert!(PreparedCapturePlanPublication::prepare(
-        &pool,
-        raw.span_workspace().plan(),
-        &source,
-        key(&source),
-        Some(&wrong)
-    )
-    .is_err());
+    assert!(
+        PreparedCapturePlanPublication::prepare(
+            &pool,
+            raw.span_workspace().plan(),
+            &source,
+            key(&other),
+            None
+        )
+        .is_err()
+    );
+    let wrong = pool.register_host_storage([(key(&source), c + 1)]).unwrap();
+    assert!(
+        PreparedCapturePlanPublication::prepare(
+            &pool,
+            raw.span_workspace().plan(),
+            &source,
+            key(&source),
+            Some(&wrong)
+        )
+        .is_err()
+    );
     drop(wrong);
-    let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let foreign_pin = foreign.register_storage([(key(&source), c)]).unwrap();
-    assert!(PreparedCapturePlanPublication::prepare(
-        &pool,
-        raw.span_workspace().plan(),
-        &source,
-        key(&source),
-        Some(&foreign_pin)
-    )
-    .is_err());
+    let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let foreign_pin = foreign.register_host_storage([(key(&source), c)]).unwrap();
+    assert!(
+        PreparedCapturePlanPublication::prepare(
+            &pool,
+            raw.span_workspace().plan(),
+            &source,
+            key(&source),
+            Some(&foreign_pin)
+        )
+        .is_err()
+    );
     let make = || {
         PreparedCapturePlanPublication::prepare(
             &pool,
@@ -225,24 +242,26 @@ fn publication_rejects_wrong_identity_capacity_domain_and_independent_binding() 
     let q = raw.with_span_workspace_and_text_controls(a).unwrap();
     let (r, run, q) = accept(&pool, q);
     let before = account(&pool, &r);
-    assert!(q
-        .clone()
-        .begin_capture_plan_publication::<Key>(&run, &r, &other)
-        .is_err());
+    assert!(
+        q.clone()
+            .begin_capture_plan_publication::<Key>(&run, &r, &other)
+            .is_err()
+    );
     assert_eq!(account(&pool, &r), before);
-    assert!(q
-        .clone()
-        .begin_capture_plan_publication::<OtherKey>(&run, &r, &source)
-        .is_err());
+    assert!(
+        q.clone()
+            .begin_capture_plan_publication::<OtherKey>(&run, &r, &source)
+            .is_err()
+    );
     assert_eq!(account(&pool, &r), before);
     drop((q, r, run, b, root, foreign_pin));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn wrong_original_scope_keeps_unready_plan_alias_under_one_hold() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = publication_quote(&pool, &source, None);
     let alias = q.span_workspace().plan().clone();
@@ -260,23 +279,25 @@ fn wrong_original_scope_keeps_unready_plan_alias_under_one_hold() {
         CapturePlanPublicationCause::Storage(WorkingMemoryError::IdentityMismatch)
     ));
     assert_eq!(account(&pool, &r), before);
-    assert!(alias
-        .original_host()
-        .unwrap()
-        .validate_control_reservation(&r)
-        .is_err());
+    assert!(
+        alias
+            .original_host()
+            .unwrap()
+            .validate_control_reservation(&r)
+            .is_err()
+    );
     original.certify().unwrap();
     wrong.certify().unwrap();
     drop((failed, r, run, other_r, other_run, other_q, root));
-    assert!(pool.used_bytes().unwrap() >= before.1);
+    assert!(pool.payload_used_bytes().unwrap() >= before.1);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn busy_usage_and_poisoned_attachment_preserve_pending_custody() {
     for poisoned in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let source = capture_source();
         let q = publication_quote(&pool, &source, None);
         let alias = q.span_workspace().plan().clone();
@@ -287,12 +308,14 @@ fn busy_usage_and_poisoned_attachment_preserve_pending_custody() {
             .unwrap();
         let before = account(&pool, &r);
         let failed = if poisoned {
-            assert!(catch_unwind(AssertUnwindSafe(|| source
-                .try_attach::<WorkingMemoryError>(
-                    &SharedStorageDomain::default(),
-                    || panic!("attachment sentinel")
-                )))
-            .is_err());
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| source
+                    .try_attach::<WorkingMemoryError>(
+                        &SharedStorageAccountingId::default(),
+                        || panic!("attachment sentinel")
+                    )))
+                .is_err()
+            );
             pending.publish_and_finish(&native).unwrap_err()
         } else {
             let lock = pool.0.usage.lock().unwrap();
@@ -306,20 +329,21 @@ fn busy_usage_and_poisoned_attachment_preserve_pending_custody() {
             _ => false,
         });
         assert_eq!(account(&pool, &r), before);
-        assert!(pool
-            .pin_registered_storage([(key(&source), source.capacity_bytes().unwrap())])
-            .is_err());
+        assert!(
+            pool.pin_registered_storage([(key(&source), source.capacity_bytes().unwrap())])
+                .is_err()
+        );
         native.certify().unwrap();
         drop((failed, r, run, root, source));
-        assert!(pool.used_bytes().unwrap() >= before.1);
+        assert!(pool.payload_used_bytes().unwrap() >= before.1);
         drop(alias);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn busy_source_attachment_does_not_wait_or_consume_another_provider() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let (r, run, q) = accept(&pool, publication_quote(&pool, &source, None));
     let native = run.scope().unwrap();
@@ -332,7 +356,7 @@ fn busy_source_attachment_does_not_wait_or_consume_another_provider() {
         let source_ref = &source;
         let worker = threads.spawn(move || {
             source_ref
-                .try_attach::<WorkingMemoryError>(&SharedStorageDomain::default(), || {
+                .try_attach::<WorkingMemoryError>(&SharedStorageAccountingId::default(), || {
                     entered.send(()).unwrap();
                     finish
                         .recv_timeout(std::time::Duration::from_secs(5))
@@ -351,16 +375,18 @@ fn busy_source_attachment_does_not_wait_or_consume_another_provider() {
     });
     native.certify().unwrap();
     drop((source, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn late_original_source_quarantine_rejects_before_c_and_does_not_refund_aliases() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let (old_r, old_run, old_q) = accept(&pool, quote(&pool, &source));
     let abandoned = old_run.scope().unwrap();
-    let mut retained = abandoned.adopt_storage_individually([(51u32, 7)]).unwrap();
+    let mut retained = abandoned
+        .adopt_host_storage_individually([(51u32, 7)])
+        .unwrap();
     let pin = retained.remove(&51).unwrap();
     let q = publication_quote(&pool, &source, None)
         .with_registered_sources(pin.clone())
@@ -379,29 +405,30 @@ fn late_original_source_quarantine_rejects_before_c_and_does_not_refund_aliases(
         CapturePlanPublicationCause::Storage(WorkingMemoryError::ExecutionFenced)
     ));
     assert_eq!(account(&pool, &r), before);
-    assert!(pool
-        .pin_registered_storage([(key(&source), source.capacity_bytes().unwrap())])
-        .is_err());
+    assert!(
+        pool.pin_registered_storage([(key(&source), source.capacity_bytes().unwrap())])
+            .is_err()
+    );
     native.certify().unwrap();
     drop((failed, r, run, source, root));
-    assert!(pool.used_bytes().unwrap() >= before.1);
+    assert!(pool.payload_used_bytes().unwrap() >= before.1);
     drop((alias, pin, retained, old_r, old_run, old_q));
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "real abandoned origin stays quarantined"
     );
 }
 #[test]
 fn existing_c_late_quarantine_is_checked_at_original_reservation_and_publication() {
     for after_reserve in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let source = capture_source();
         let c = source.capacity_bytes().unwrap();
         let (old_r, old_run, old_q) = accept(&pool, quote(&pool, &source));
         let abandoned = old_run.scope().unwrap();
         let mut storage = abandoned
-            .adopt_storage_individually([(key(&source), c)])
+            .adopt_host_storage_individually([(key(&source), c)])
             .unwrap();
         let pin = storage.remove(&key(&source)).unwrap();
         let q = publication_quote(&pool, &source, Some(&pin));
@@ -429,15 +456,15 @@ fn existing_c_late_quarantine_is_checked_at_original_reservation_and_publication
             ));
         }
         drop((old_r, old_run, old_q, source, root, pin, storage));
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.payload_used_bytes().unwrap() > 0);
     }
 }
 
 #[test]
 fn exact_typed_reuse_and_typed_race_keep_the_original_source_owner() {
     for raced in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let source = capture_source();
         let earlier = source.clone();
         let c = source.capacity_bytes().unwrap();
@@ -487,30 +514,30 @@ fn exact_typed_reuse_and_typed_race_keep_the_original_source_owner() {
             root,
             source,
         ));
-        assert_eq!(pool.used_bytes().unwrap(), first_retained);
+        assert_eq!(pool.payload_used_bytes().unwrap(), first_retained);
         assert_eq!(earlier.capacity_bytes(), Some(c));
         drop(earlier);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn opaque_or_other_typed_attachment_never_substitutes_for_exact_source_custody() {
     for typed in [false, true] {
         for registered in [false, true] {
-            let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-            let root = pool.register_storage([(1u32, 64)]).unwrap();
+            let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+            let root = pool.register_host_storage([(1u32, 64)]).unwrap();
             let source = capture_source();
             let c = source.capacity_bytes().unwrap();
-            let pin = registered.then(|| pool.register_storage([(key(&source), c)]).unwrap());
+            let pin = registered.then(|| pool.register_host_storage([(key(&source), c)]).unwrap());
             if typed {
                 source
-                    .try_attach_typed_nonblocking(pool.shared_storage_domain(), || {
+                    .try_attach_typed_nonblocking(pool.shared_storage_accounting_id(), || {
                         Ok::<_, WorkingMemoryError>(Arc::new(7u32))
                     })
                     .unwrap();
             } else {
                 source
-                    .try_attach(pool.shared_storage_domain(), || {
+                    .try_attach(pool.shared_storage_accounting_id(), || {
                         Ok::<_, WorkingMemoryError>(Box::new(()))
                     })
                     .unwrap();
@@ -521,28 +548,31 @@ fn opaque_or_other_typed_attachment_never_substitutes_for_exact_source_custody()
                 .begin_capture_plan_publication::<Key>(&run, &r, &source)
                 .unwrap();
             let before = account(&pool, &r);
-            let used = pool.used_bytes().unwrap();
+            let used = pool.payload_used_bytes().unwrap();
             let failed = pending.publish_and_finish(&scope).unwrap_err();
             assert!(matches!(
                 failed.cause(),
                 CapturePlanPublicationCause::AttachmentMismatch
             ));
             assert_eq!(account(&pool, &r), before);
-            assert_eq!(pool.used_bytes().unwrap(), used);
+            assert_eq!(pool.payload_used_bytes().unwrap(), used);
             assert_eq!(
                 pool.pin_registered_storage([(key(&source), c)]).is_ok(),
                 registered
             );
             // Old opaque API compatibility: an existing typed or opaque domain is
             // still false, without invoking the legacy provider.
-            assert!(!source
-                .try_attach::<WorkingMemoryError>(pool.shared_storage_domain(), || panic!(
-                    "legacy provider must stay lazy"
-                ))
-                .unwrap());
+            assert!(
+                !source
+                    .try_attach::<WorkingMemoryError>(
+                        pool.shared_storage_accounting_id(),
+                        || panic!("legacy provider must stay lazy")
+                    )
+                    .unwrap()
+            );
             scope.certify().unwrap();
             drop((failed, source, r, run, root, pin));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -573,8 +603,8 @@ fn typed_owner_attached_to_another_physical_source_is_rejected_even_with_collidi
             Some(&self.0)
         }
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let first = capture_source();
     let other = SharedCapturePlan::new(first.admission().clone());
     let make = |source: &SharedCapturePlan| {
@@ -601,12 +631,12 @@ fn typed_owner_attached_to_another_physical_source_is_rejected_even_with_collidi
         .unwrap();
     let actual = first
         .try_attach_owned_nonblocking::<PublishedCaptureStorage<Colliding>, WorkingMemoryError>(
-            pool.shared_storage_domain(),
+            pool.shared_storage_accounting_id(),
             || panic!("already typed"),
         )
         .unwrap();
     other
-        .try_attach_owned_nonblocking(pool.shared_storage_domain(), || {
+        .try_attach_owned_nonblocking(pool.shared_storage_accounting_id(), || {
             Ok::<_, WorkingMemoryError>(actual)
         })
         .unwrap();
@@ -627,14 +657,14 @@ fn typed_owner_attached_to_another_physical_source_is_rejected_even_with_collidi
     drop((
         aowner, awitness, a, arun, r, run, failed, first, other, root,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn provider_comparison_unwind_drops_staged_keys_after_both_locks_release() {
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     struct Probe {
         pool: Weak<crate::working_memory::Pool>,
@@ -695,7 +725,7 @@ fn provider_comparison_unwind_drops_staged_keys_after_both_locks_release() {
             if let Some(source) = self.probe.source.upgrade() {
                 if matches!(
                     source.try_attach_nonblocking::<WorkingMemoryError>(
-                        &SharedStorageDomain::default(),
+                        &SharedStorageAccountingId::default(),
                         || Ok(Box::new(()))
                     ),
                     Err(eredu_core::SharedStorageAttachmentError::Busy)
@@ -705,8 +735,8 @@ fn provider_comparison_unwind_drops_staged_keys_after_both_locks_release() {
             }
         }
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = Arc::new(capture_source());
     let other = capture_source();
     let probe = Arc::new(Probe {
@@ -718,7 +748,7 @@ fn provider_comparison_unwind_drops_staged_keys_after_both_locks_release() {
         drops: AtomicUsize::new(0),
     });
     let other_pin = pool
-        .register_storage([(
+        .register_host_storage([(
             Probed {
                 id: other.storage_identity().clone(),
                 probe: probe.clone(),
@@ -759,7 +789,7 @@ fn provider_comparison_unwind_drops_staged_keys_after_both_locks_release() {
     assert!(!probe.locked.load(Ordering::SeqCst));
     probe.checking.store(false, Ordering::SeqCst);
     assert!(matches!(
-        pool.used_bytes(),
+        pool.payload_used_bytes(),
         Err(WorkingMemoryError::Poisoned)
     ));
     // Poisoned accounting is not repaired or certified by this fixture.
@@ -768,41 +798,52 @@ fn provider_comparison_unwind_drops_staged_keys_after_both_locks_release() {
 
 #[test]
 fn intervening_original_scope_spend_cannot_consume_protected_controls_or_partially_publish_c() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let c = source.capacity_bytes().unwrap();
-    let (r, run, q) = accept(&pool, publication_quote(&pool, &source, None));
+    let quote = publication_quote(&pool, &source, None);
+    let extra = crate::working_memory::StoragePublicationLayout::<u64>::new(1)
+        .unwrap()
+        .requested_bytes()
+        + MemoryLedger::storage_metadata_control_bytes().unwrap();
+    let mut quote = quote;
+    let domains = quote.incremental_requirements.as_mut().unwrap();
+    domains
+        .add_allocation(extra, pool.host_placement())
+        .unwrap();
+    quote.incremental_bytes = quote.incremental_bytes.map(|bytes| bytes + extra);
+    let (r, run, q) = accept(&pool, quote);
     let scope = run.scope().unwrap();
     let pending = q
         .begin_capture_plan_publication::<Key>(&run, &r, &source)
         .unwrap();
     let state = account(&pool, &r);
-    let pressure = state.0 - state.1 - c + 1;
+    let pressure = state.0 - state.1 - c - extra + 1;
     let payload: Arc<[u8]> = vec![19; usize::try_from(pressure).unwrap()].into();
     let registered = scope
-        .adopt_storage_individually([(99u64, payload.len() as u64)])
+        .adopt_host_storage_individually([(99u64, payload.len() as u64)])
         .unwrap();
     let before = account(&pool, &r);
-    let used = pool.used_bytes().unwrap();
+    let used = pool.payload_used_bytes().unwrap();
     let failed = pending.publish_and_finish(&scope).unwrap_err();
     assert!(
-        matches!(failed.cause(),CapturePlanPublicationCause::Storage(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if *required_bytes==c && *available_bytes+1==c)
+        matches!(failed.cause(),CapturePlanPublicationCause::Storage(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes==c && available_bytes+1==c))
     );
     assert_eq!(account(&pool, &r), before);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.payload_used_bytes().unwrap(), used);
     assert!(pool.pin_registered_storage([(key(&source), c)]).is_err());
     drop(payload);
     drop(registered);
     scope.certify().unwrap();
     drop((failed, r, run, source, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn ordinary_no_publication_promotion_and_source_witness_keep_existing_behavior() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = quote(&pool, &source)
         .with_registered_sources(root.clone())
@@ -833,10 +874,10 @@ fn ordinary_no_publication_promotion_and_source_witness_keep_existing_behavior()
     witness.validate(&pool).unwrap();
     scope.certify().unwrap();
     drop((owner, r, run, source, root));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     witness.validate(&pool).unwrap();
     drop(witness);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[path = "capture_publication/bounded_publications.rs"]

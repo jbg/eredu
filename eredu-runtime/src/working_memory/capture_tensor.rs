@@ -1,8 +1,8 @@
-//! One fresh F32 host destination; capture/native execution remains separate.
-use super::{WorkingMemoryError, WorkingMemoryPool, funding::CaptureTensorCustody};
+//! One typed host destination; capture/native execution remains separate.
+use super::{MemoryLedger, WorkingMemoryError, funding::CaptureTensorCustody};
 use eredu_core::{
-    ObservationError, SharedTensorObservation, TensorObservation, TensorObservationData,
-    capture::CaptureTensorGeometry,
+    ObservationDtype, ObservationError, SharedTensorObservation, TensorObservation,
+    TensorObservationData, capture::CaptureTensorGeometry,
 };
 use std::{fmt, mem::size_of};
 
@@ -13,19 +13,19 @@ pub(super) use transfer::allocate_scheduled;
 pub use transfer::{CaptureTensorTransferFinishError, PreparedCaptureTensorTransfer};
 
 /// Limits on this independent host destination, never an allocation declaration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct CaptureTensorLimits {
-    /// Complete domain ceiling, including all existing sources and accounts.
-    pub capacity_bytes: u64,
-    /// Optional additional ceiling on this exact closed construction envelope.
-    pub application_memory_budget_bytes: Option<u64>,
+    /// Total live-charge limits in every physical domain.
+    pub memory_limits: eredu_core::MemoryLimitDeclarations,
+    /// Additional domain-attributed charge retained with destination custody.
+    pub additional_headroom: eredu_core::MemoryHeadroomDeclarations,
 }
 impl CaptureTensorLimits {
-    /// Select a domain ceiling without an additional application limit.
-    pub const fn new(capacity_bytes: u64) -> Self {
+    /// Selects domain limits without additional headroom.
+    pub const fn new(memory_limits: eredu_core::MemoryLimitDeclarations) -> Self {
         Self {
-            capacity_bytes,
-            application_memory_budget_bytes: None,
+            memory_limits,
+            additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
         }
     }
 }
@@ -50,7 +50,12 @@ impl<'a> CaptureTensorHostPlan<'a> {
                 .ok_or(WorkingMemoryError::Overflow)
         };
         let shape = allocation(geometry.shape().len(), size_of::<usize>())?;
-        let data = allocation(geometry.elements(), size_of::<f32>())?;
+        let width = if geometry.value_dtype() == ObservationDtype::Integer {
+            size_of::<u64>()
+        } else {
+            size_of::<f32>()
+        };
+        let data = allocation(geometry.elements(), width)?;
         let inline = u64::try_from(size_of::<TensorObservation>())
             .map_err(|_| WorkingMemoryError::Overflow)?;
         let retained = inline
@@ -74,7 +79,7 @@ impl<'a> CaptureTensorHostPlan<'a> {
         let scalar_moves = if geometry.elements() == 0 {
             0
         } else {
-            2 * size_of::<f32>() as u64
+            2 * width as u64
         };
         let peak = shape
             .checked_add(data)
@@ -114,17 +119,27 @@ pub enum CaptureTensorConstructionError {
     /// Existing domain policy/accounting rejected this exact construction.
     #[error(transparent)]
     Memory(#[from] WorkingMemoryError),
-    /// Exact P does not fit the application's independent destination limit.
-    #[error("capture tensor needs {required_bytes} bytes; application limit is {budget_bytes}")]
-    ApplicationBudgetExceeded {
-        /// Exact closed construction envelope.
-        required_bytes: u64,
-        /// Caller-selected upper limit.
-        budget_bytes: u64,
-    },
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
+    /// Complete domain requirements for the concrete destination and its account.
+    /// This read-only quotation grants no allocation or transfer authority.
+    pub fn capture_tensor_requirements(
+        &self,
+        plan: &CaptureTensorHostPlan<'_>,
+        limits: &CaptureTensorLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        let mut projection = super::transaction_buffers::RequirementProjection {
+            parts: &[],
+            headroom: &limits.additional_headroom,
+            host_bytes: plan.peak,
+        };
+        projection.host_bytes = projection
+            .host_bytes
+            .checked_add(super::funding::capture_controls(self, &projection)?)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        projection.materialize(self.topology())
+    }
     /// Reserve and allocate one bounded host transfer destination.
     ///
     /// The source is actual admitted geometry, not a caller byte declaration or
@@ -138,15 +153,7 @@ impl WorkingMemoryPool {
         plan: CaptureTensorHostPlan<'a>,
         limits: CaptureTensorLimits,
     ) -> Result<PreparedCaptureTensor<'a>, CaptureTensorConstructionError> {
-        if let Some(budget_bytes) = limits.application_memory_budget_bytes {
-            if plan.peak > budget_bytes {
-                return Err(CaptureTensorConstructionError::ApplicationBudgetExceeded {
-                    required_bytes: plan.peak,
-                    budget_bytes,
-                });
-            }
-        }
-        let custody = self.open_capture_tensor_account(&plan, limits.capacity_bytes)?;
+        let custody = self.open_capture_tensor_account(&plan, &limits)?;
         allocate(plan, custody)
     }
 }
@@ -167,7 +174,7 @@ pub(super) fn allocate<'a>(
     for &dimension in plan.geometry.shape() {
         shape.push(dimension);
     }
-    let data = Vec::with_capacity(plan.geometry.elements());
+    let data = CaptureTensorData::allocate(&plan.geometry, false);
     Ok(PreparedCaptureTensor {
         shape,
         data,
@@ -176,12 +183,108 @@ pub(super) fn allocate<'a>(
     })
 }
 
+#[derive(Debug)]
+pub(in crate::working_memory) enum CaptureTensorData {
+    F32(Vec<f32>),
+    U64(Vec<u64>),
+}
+impl CaptureTensorData {
+    pub(in crate::working_memory) fn allocate(
+        geometry: &CaptureTensorGeometry<'_>,
+        initialized: bool,
+    ) -> Self {
+        if geometry.value_dtype() == ObservationDtype::Integer {
+            let mut values = Vec::with_capacity(geometry.elements());
+            if initialized {
+                values.resize(geometry.elements(), 0);
+            }
+            Self::U64(values)
+        } else {
+            let mut values = Vec::with_capacity(geometry.elements());
+            if initialized {
+                values.resize(geometry.elements(), 0.0);
+            }
+            Self::F32(values)
+        }
+    }
+    pub(in crate::working_memory) fn len(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::U64(v) => v.len(),
+        }
+    }
+    fn push_f32(&mut self, value: f32) -> Result<(), WorkingMemoryError> {
+        match self {
+            Self::F32(v) if v.len() < v.capacity() => {
+                v.push(value);
+                Ok(())
+            }
+            _ => Err(WorkingMemoryError::IdentityMismatch),
+        }
+    }
+    fn push_u64(&mut self, value: u64) -> Result<(), WorkingMemoryError> {
+        match self {
+            Self::U64(v) if v.len() < v.capacity() => {
+                v.push(value);
+                Ok(())
+            }
+            _ => Err(WorkingMemoryError::IdentityMismatch),
+        }
+    }
+    pub(in crate::working_memory) fn set_f32(
+        &mut self,
+        index: usize,
+        value: f32,
+    ) -> Result<(), WorkingMemoryError> {
+        let Self::F32(values) = self else {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        };
+        *values
+            .get_mut(index)
+            .ok_or(WorkingMemoryError::IdentityMismatch)? = value;
+        Ok(())
+    }
+    pub(in crate::working_memory) fn set_u64(
+        &mut self,
+        index: usize,
+        value: u64,
+    ) -> Result<(), WorkingMemoryError> {
+        let Self::U64(values) = self else {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        };
+        *values
+            .get_mut(index)
+            .ok_or(WorkingMemoryError::IdentityMismatch)? = value;
+        Ok(())
+    }
+    pub(in crate::working_memory) fn into_observation(self) -> TensorObservationData {
+        match self {
+            Self::F32(v) => TensorObservationData::F32(v),
+            Self::U64(v) => TensorObservationData::U64(v),
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::working_memory) fn as_ptr(&self) -> *const f32 {
+        match self {
+            Self::F32(v) => v.as_ptr(),
+            _ => panic!("expected floating test storage"),
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::working_memory) fn capacity(&self) -> usize {
+        match self {
+            Self::F32(v) => v.capacity(),
+            Self::U64(v) => v.capacity(),
+        }
+    }
+}
+
 /// Partial destination with no mutable slice/Vec/raw scope escape.
 /// Values precede the final private host custody on ordinary drop and unwind.
 #[must_use = "finish this exact destination or retire its partial payload"]
 pub struct PreparedCaptureTensor<'a> {
     shape: Vec<usize>,
-    data: Vec<f32>,
+    data: CaptureTensorData,
     plan: CaptureTensorHostPlan<'a>,
     custody: CaptureTensorCustody,
 }
@@ -205,11 +308,25 @@ impl PreparedCaptureTensor<'_> {
     /// Write only a previously initialized destination slot. This is used by
     /// the shared disjoint-prefix copier; it cannot grow or complete a partial
     /// buffer and grants no native allocation/completion authority.
-    pub(in crate::working_memory) fn replace_initialized_f32(&mut self,index:usize,value:f32)->Result<(),WorkingMemoryError> {
+    pub(in crate::working_memory) fn replace_initialized_f32(
+        &mut self,
+        index: usize,
+        value: f32,
+    ) -> Result<(), WorkingMemoryError> {
         self.custody.validate()?;
-        if self.data.len()!=self.len(){return Err(WorkingMemoryError::IdentityMismatch);}
-        let slot=self.data.get_mut(index).ok_or(WorkingMemoryError::IdentityMismatch)?;
-        *slot=value;Ok(())
+        if self.data.len() != self.len() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.data.set_f32(index, value)?;
+        Ok(())
+    }
+    /// Appends one unsigned scalar without conversion, allocation or native work.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), WorkingMemoryError> {
+        self.custody.validate()?;
+        if self.data.len() == self.len() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.data.push_u64(value)
     }
     /// Full original closed construction hold, not a native byte allowance.
     pub fn protected_bytes(&self) -> u64 {
@@ -222,7 +339,7 @@ impl PreparedCaptureTensor<'_> {
         if self.data.len() == self.len() {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        self.data.push(value);
+        self.data.push_f32(value)?;
         Ok(())
     }
 }
@@ -245,7 +362,7 @@ impl<'a> PreparedCaptureTensor<'a> {
             plan,
             custody,
         } = self;
-        let observation = match TensorObservation::new(shape, TensorObservationData::F32(data)) {
+        let observation = match TensorObservation::new(shape, data.into_observation()) {
             Ok(observation) => observation,
             Err(error) => {
                 return Err(CaptureTensorFinishError(FinishFailure::Invalid {

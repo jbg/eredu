@@ -220,3 +220,5 @@ include!("tests/original_capacity_retry.rs");
 #[path = "tests/original_lease_return.rs"]
 mod original_lease_return;
 pub(crate) use original_lease_return::LeaseReturnFixture;
+#[path = "tests/host_acquisition.rs"]
+mod host_acquisition;

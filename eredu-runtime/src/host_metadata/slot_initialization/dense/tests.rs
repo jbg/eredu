@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::SharedStorageDomain;
+use eredu_core::SharedStorageAccountingId;
 use std::{
     cell::Cell,
     convert::Infallible,
@@ -203,7 +203,7 @@ fn partial_error_and_unwind_drop_only_initialized_values_without_boxing() {
         // No source borrow or payload owner is hidden in the partial result.
         drop(source);
         assert!(matches!(
-            source_metadata.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+            source_metadata.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
                 panic!("the destination must not retain its source")
             }),
             Err(crate::HostSlotAttachmentError::Retired)
@@ -324,7 +324,7 @@ fn completed_table_transfer_keeps_payload_pointer_identity_and_retirement_order(
     let token = dense.metadata().clone();
     let address = dense.slots.slots().as_ptr();
     token
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Charge {
                 drops: drops.clone(),
                 retired: retired.clone(),
@@ -343,7 +343,7 @@ fn completed_table_transfer_keeps_payload_pointer_identity_and_retirement_order(
     assert_eq!(drops.load(Ordering::SeqCst), 2);
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        token.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+        token.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
             panic!("escaped accounting token cannot reacquire after table retirement")
         }),
         Err(crate::HostSlotAttachmentError::Retired)

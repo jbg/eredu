@@ -41,7 +41,6 @@ fn check_speculative_control_delivery<'world>(
                 limits: CaptureLimits {
                     per_step: usage,
                     cumulative: usage.checked_mul(if rank == 0 { 1 } else { 16 }).unwrap(),
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             }

@@ -202,13 +202,8 @@ impl PredictionResourceVisitor<MlxNeuralBackend, MlxEmbeddedPredictionMaterializ
             .id
             .as_ref()
             .ok_or_else(|| failure(self.context, SourceError::Module))?;
-        if module
-            .replacements
-            .keys()
-            .any(|name| !module.bindings.iter().any(|binding| binding.name() == name))
-        {
-            return Err(failure(self.context, SourceError::Module));
-        }
+        // The immutable publication owner can serve several modules. Each
+        // binding below resolves only its exact authenticated local identity.
         controls(
             self.context,
             &[

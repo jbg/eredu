@@ -1,5 +1,5 @@
 //! Closed compiler account shared by actual immutable observation/edit sources.
-use super::{WorkingMemoryError, WorkingMemoryPool, loaded_decode_source::Allowance};
+use super::{MemoryLedger, WorkingMemoryError, loaded_decode_source::Allowance};
 use eredu_core::HostPreparationAuthority;
 use std::{
     alloc::Layout,
@@ -14,7 +14,7 @@ struct AccountNode {
 // boundary. The trait has no constructor or generic custody/adoption operation.
 trait SourceAccount: std::fmt::Debug + Send + Sync {
     fn finish(&self) -> Result<(), WorkingMemoryError>;
-    fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError>;
+    fn validate(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError>;
     // Dynamic dispatch recovers the concrete Arc type before final retirement.
     // Unsizing Arc changes no allocation; its shell still dies before Allowance.
     fn retire(self: Arc<Self>);
@@ -34,7 +34,7 @@ impl Drop for Account {
     }
 }
 impl Account {
-    pub(super) fn admit(pool: &WorkingMemoryPool, bytes: u64) -> Result<Self, WorkingMemoryError> {
+    pub(super) fn admit(pool: &MemoryLedger, bytes: u64) -> Result<Self, WorkingMemoryError> {
         let allowance = pool.admit_source_compiler(bytes)?;
         Ok(Self(Some(Arc::new(AccountNode {
             allowance: Mutex::new(allowance),
@@ -56,7 +56,7 @@ impl Account {
             size_of::<Arc<dyn SourceAccount>>(),
             size_of::<Option<Arc<dyn SourceAccount>>>(),
             size_of::<Arc<AccountNode>>(),
-            size_of::<(&dyn SourceAccount, &WorkingMemoryPool)>(),
+            size_of::<(&dyn SourceAccount, &MemoryLedger)>(),
             size_of::<Allowance>(),
             size_of::<Result<Allowance, WorkingMemoryError>>(),
             size_of::<std::sync::MutexGuard<'_, Allowance>>(),
@@ -71,7 +71,7 @@ impl Account {
     pub(super) fn finish(&self) -> Result<(), WorkingMemoryError> {
         self.0.as_ref().expect("live source account").finish()
     }
-    pub(super) fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub(super) fn validate(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.0.as_ref().expect("live source account").validate(pool)
     }
 }
@@ -82,12 +82,12 @@ impl SourceAccount for AccountNode {
             .map_err(|_| WorkingMemoryError::Poisoned)?
             .end_compilation()
     }
-    fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         let allowance = self
             .allowance
             .lock()
             .map_err(|_| WorkingMemoryError::Poisoned)?;
-        if !allowance.pool().same_domain(pool) {
+        if !allowance.pool().same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         Ok(())

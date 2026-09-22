@@ -23,6 +23,7 @@ pub mod backend;
 mod composition;
 
 pub use adapter::*;
+pub use backend::managed_memory::{configure_memory_limits, memory_snapshot, memory_topology};
 pub use composition::mlx::{MlxLoadRequest, MlxModelConfig, MlxSelectedPreparation};
 
 pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn};
@@ -70,10 +71,10 @@ pub mod native {
     pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::{
+        MlxManagedFrameSessionBranch, MlxManagedRealtimeScheduler, MlxManagedRealtimeSessionState,
         MlxPreparedRealtimeExecution, MlxRealtimeCompletion, MlxRealtimeExecutionContext,
-        MlxRealtimeFrameCompletionMechanism, MlxRealtimeFrameTensorMechanisms,
-        MlxRealtimeHostObserver, MlxRealtimeFramePreparation, MlxManagedRealtimeSessionState,
-        MlxManagedRealtimeScheduler, MlxManagedFrameSessionBranch,
+        MlxRealtimeFrameCompletionMechanism, MlxRealtimeFramePreparation,
+        MlxRealtimeFrameTensorMechanisms, MlxRealtimeHostObserver,
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
     pub use crate::composition::mlx::{
@@ -140,9 +141,11 @@ pub mod native {
         device: safemlx::DeviceType,
     ) -> Result<Option<crate::backend::MlxBackend<'_>>, MlxGpuStreamError> {
         let streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(
-            &crate::backend::managed_memory::domain(), device,
+            &crate::backend::managed_memory::ledger(), device,
         )?;
-        Ok(streams.map(|streams|crate::backend::MlxBackend::with_prepared_distributed_world(streams, world)))
+        Ok(streams.map(|streams| {
+            crate::backend::MlxBackend::with_prepared_distributed_world(streams, world)
+        }))
     }
 
     /// Binds semantic topology, wire dtype, and maximum invocation geometry to model options.
@@ -189,3 +192,6 @@ pub(crate) fn test_parallel_rank(
 mod tests;
 
 pub use tensor::MlxTensor;
+
+#[cfg(test)]
+pub(crate) mod memory_fixture;

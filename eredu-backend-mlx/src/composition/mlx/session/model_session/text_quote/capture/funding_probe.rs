@@ -84,7 +84,13 @@ pub(super) fn record(
                 "fixture must consume its original admission record"
             );
             slot.value.set(Some(CapturedFundingQuote {
-                reservation: span.reservation().bytes(),
+                reservation: span
+                    .reservation()
+                    .requirements()
+                    .get(crate::memory_topology().unwrap().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap(),
                 protected: span.protected_host_bytes(),
                 capture: bank.protected_bytes(),
                 source: source.capacity_bytes().expect("admitted source extent"),

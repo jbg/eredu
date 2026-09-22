@@ -39,36 +39,29 @@ pub(super) fn reset_fixture_with_state(
     let cancellation = GenerationCancellationToken::new();
     let request = ManagedPlainTextRequest::new(PROMPT, settings(0.0));
     let first = model
-        .generate_managed_plain_text(&source, request, &cancellation, &mut |_| {})
+        .generate_managed_plain_text(&source, request.clone(), &cancellation, &mut |_| {})
         .unwrap_or_else(report_failure)
         .unwrap();
     let address = first.text.as_str().as_ptr();
 
     // A refused reset must leave both the old state and its output custody valid.
-    let mut short = eredu_core::SessionResetLimits::new(8 * 1024 * 1024 * 1024);
-    short.application_memory_budget_bytes = Some(1);
+    let short = eredu_core::SessionResetLimits::new(native_limits(1));
     let error = model
         .prepare_reset_ordinary()
         .unwrap_or_else(report_failure)
         .reset_admitted(short)
         .unwrap_err();
-    assert!(
-        std::iter::successors(Some(&error as &(dyn Error + 'static)), |e| (*e).source()).any(
-            |e| matches!(
-                e.downcast_ref::<eredu_core::SessionResetRejection>(),
-                Some(eredu_core::SessionResetRejection::ApplicationBudgetExceeded { .. })
-            )
-        ),
-        "{error}"
-    );
+    assert!(budget_failure(&error), "{error}");
     drop(error);
     model
         .prepare_reset_ordinary()
         .unwrap_or_else(report_failure)
-        .reset_admitted(eredu_core::SessionResetLimits::new(8 * 1024 * 1024 * 1024))
+        .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(
+            8 * 1024 * 1024 * 1024,
+        )))
         .unwrap_or_else(report_failure);
     let second = model
-        .generate_managed_plain_text(&source, request, &cancellation, &mut |_| {})
+        .generate_managed_plain_text(&source, request.clone(), &cancellation, &mut |_| {})
         .unwrap_or_else(report_failure)
         .unwrap();
     assert_eq!(first.finish_reason, FinishReason::MaxTokens);
@@ -90,12 +83,9 @@ pub(super) fn reset_fixture_with_state(
     // thread and prove that no old request still excludes a fresh model load.
     drop((first, second));
     eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
-    let fresh = LoadedModel::load_execution_plan(
-        &MlxBackendFactory::default(),
-        &root.0,
-        &execution,
-    )
-    .unwrap_or_else(report_failure);
+    let fresh =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+            .unwrap_or_else(report_failure);
     drop(fresh);
     eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
 }
@@ -236,14 +226,14 @@ fn chat_fixture(case: &str, mode_variable: &str, template: &str, rendered: &str)
             .prepare_chat(
                 &source,
                 &chat,
-                settings.inference.managed_memory_capacity_bytes.unwrap(),
+                &settings.inference.memory_limits.clone(),
                 &cancelled
             )
             .unwrap()
             .is_none()
     );
     let error = model
-        .prepare_chat(&source, &chat, 1, &cancellation)
+        .prepare_chat(&source, &chat, &native_limits(1), &cancellation)
         .unwrap_err();
     assert!(budget_failure(&error), "{error}");
     drop(error);
@@ -251,13 +241,13 @@ fn chat_fixture(case: &str, mode_variable: &str, template: &str, rendered: &str)
         .prepare_chat(
             &source,
             &chat,
-            settings.inference.managed_memory_capacity_bytes.unwrap(),
+            &settings.inference.memory_limits.clone(),
             &cancellation,
         )
         .unwrap_or_else(report_failure)
         .unwrap();
     assert_eq!(prepared.rendered_prompt(), rendered);
-    let mut request = PreparedChatRequest::new(&prepared, settings);
+    let mut request = PreparedChatRequest::new(&prepared, settings.clone());
     request.output_mode = PreparedChatOutputMode::Text;
     let mut visible = String::new();
     let mut finishes = Vec::new();

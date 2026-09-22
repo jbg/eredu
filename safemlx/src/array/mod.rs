@@ -1,9 +1,9 @@
 use crate::{
+    Stream,
     dtype::Dtype,
     error::AsSliceError,
     sealed::Sealed,
     utils::{guard::Guarded, runtime_lock},
-    Stream,
 };
 use element::FromSliceElement;
 use num_complex::Complex;
@@ -69,15 +69,16 @@ pub struct Array {
 pub struct AllocationInfo {
     identity: AllocationIdentity,
     bytes: usize,
+    placement: crate::AllocationPlacement,
+    host_control_bytes: usize,
 }
 
 /// Opaque allocation equality key. Nonzero generations are never reused by the
 /// linked native runtime, so deferred charges cannot alias a new allocation
-/// that reuses an address. Allocator and host-transfer namespaces are distinct.
+/// that reuses an address. Native buffers and host-transfer aliases share this identity.
 /// Allocation-free empty values use a zero sentinel and carry no storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AllocationIdentity {
-    host_transfer: bool,
     generation: u64,
 }
 
@@ -85,14 +86,29 @@ pub struct AllocationIdentity {
 pub type ArrayAllocationInfo = AllocationInfo;
 
 impl AllocationInfo {
-    pub(crate) const fn from_native(generation: u64, bytes: usize, host_transfer: bool) -> Self {
+    pub(crate) const fn from_native(
+        generation: u64,
+        bytes: usize,
+        placement: safemlx_sys::mlx_memory_placement,
+    ) -> Self {
         Self {
-            identity: AllocationIdentity {
-                host_transfer,
-                generation,
-            },
+            identity: AllocationIdentity { generation },
             bytes,
+            placement: crate::AllocationPlacement::from_native(placement),
+            host_control_bytes: 0,
         }
+    }
+    pub(crate) const fn with_host_controls(mut self, bytes: usize) -> Self {
+        self.host_control_bytes = bytes;
+        self
+    }
+    /// Controlled native host records retained for this complete backing lifetime.
+    pub const fn host_control_bytes(&self) -> usize {
+        self.host_control_bytes
+    }
+    /// Native backing mechanism and its physical candidate locations.
+    pub const fn placement(&self) -> crate::AllocationPlacement {
+        self.placement
     }
     /// Opaque equality key for views of the same retained physical allocation.
     pub const fn identity(&self) -> AllocationIdentity {
@@ -144,9 +160,11 @@ mod direct_init_tests {
                         .collect::<Vec<_>>(),
                     [4, 8, 0]
                 );
-                assert!(outputs
-                    .iter()
-                    .all(|output| output.iter().all(|byte| *byte == 0)));
+                assert!(
+                    outputs
+                        .iter()
+                        .all(|output| output.iter().all(|byte| *byte == 0))
+                );
                 addresses = outputs.iter().map(|output| output.as_ptr()).collect();
                 outputs[0].copy_from_slice(&[1, 2, 3, 4]);
                 outputs[1].copy_from_slice(
@@ -207,12 +225,14 @@ mod direct_init_tests {
             });
         assert!(result.is_err());
         assert!(!called);
-        assert!(Array::try_init_many_with(&[], |outputs| {
-            assert!(outputs.is_empty());
-            Ok::<_, crate::error::Exception>(())
-        })
-        .unwrap()
-        .is_empty());
+        assert!(
+            Array::try_init_many_with(&[], |outputs| {
+                assert!(outputs.is_empty());
+                Ok::<_, crate::error::Exception>(())
+            })
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -773,20 +793,26 @@ impl Array {
     /// Logical view size never substitutes for unknown physical capacity.
     pub fn allocation_info(&self) -> crate::error::Result<Option<ArrayAllocationInfo>> {
         let _guard = runtime_lock::enter();
-        let (mut known, mut host_transfer, mut identity, mut bytes) = (false, false, 0, 0);
-        // SAFETY: all outputs point to live initialized scalars. The native
-        // query only reads this retained array and certified native-owned data;
-        // it neither exposes nor dereferences a caller-provided data pointer.
-        <() as Guarded>::try_from_op(|_| unsafe {
-            safemlx_sys::mlx_array_allocation_info(
-                &mut known,
-                &mut host_transfer,
-                &mut identity,
-                &mut bytes,
-                self.as_ptr(),
+        let mut descriptor = std::mem::MaybeUninit::<safemlx_sys::mlx_array_descriptor>::uninit();
+        // SAFETY: the retained array and runtime guard provide an exclusive
+        // descriptor loan; success initializes every fixed output field.
+        let status = unsafe {
+            safemlx_sys::mlx_array_descriptor_read(descriptor.as_mut_ptr(), self.as_ptr())
+        };
+        if status != 0 {
+            return Err(crate::error::Exception::custom(
+                "invalid allocation descriptor",
+            ));
+        }
+        let descriptor = unsafe { descriptor.assume_init() };
+        Ok(descriptor.known.then_some(
+            AllocationInfo::from_native(
+                descriptor.identity,
+                descriptor.allocation_bytes,
+                descriptor.placement,
             )
-        })?;
-        Ok(known.then_some(AllocationInfo::from_native(identity, bytes, host_transfer)))
+            .with_host_controls(descriptor.host_control_bytes),
+        ))
     }
 
     /// The array’s dimension.
@@ -1154,6 +1180,26 @@ impl<'a> EvaluatedArray<'a> {
 }
 
 impl Array {
+    /// Fixed native handle storage and call controls for an ordinary descriptor
+    /// clone. The existing graph/backing is shared; its storage and any dynamic
+    /// native error payload remain separate contributions.
+    pub fn ordinary_clone_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let fields = [
+            Self::inspection_clone_handle_bytes(),
+            size_of::<&Self>(),
+            size_of::<Self>(),
+            size_of::<<Self as Guarded>::Guard>(),
+            size_of::<crate::error::Result<Self>>(),
+            size_of::<safemlx_sys::mlx_array>() * 2,
+            size_of::<*mut safemlx_sys::mlx_array>(),
+            size_of::<i32>(),
+        ];
+        fields
+            .into_iter()
+            .try_fold(size_of_val(&fields), usize::checked_add)
+    }
+
     /// Shares the existing native descriptor through one fallible C handle.
     /// This does not evaluate or copy tensor storage. The current original
     /// scope, when present, owns the same handle constructor as `Clone`.
@@ -1184,9 +1230,9 @@ impl EvaluatedArray<'_> {
             array.size(),
             "inconsistent evaluated host layout"
         );
-        let mut bytes = Vec::with_capacity(span.size * array.item_size());
-        self.visit_native_bytes(|value| bytes.extend_from_slice(value))
-            .expect("invalid evaluated host data");
+        let mut bytes = vec![0; span.size * array.item_size()];
+        self.try_copy_native_bytes_into(&mut bytes)
+            .expect("invalid completed native data");
         bytes
     }
 
@@ -1194,17 +1240,15 @@ impl EvaluatedArray<'_> {
     /// Supports signed strides, broadcast and unaligned storage without a
     /// numerical staging allocation. The source is already evaluated; this
     /// operation neither evaluates nor compacts it. Errors leave the destination
-    /// unchanged, including when its length differs from the logical byte count.
+    /// unchanged for layout/length refusals. Native copy failures may leave a
+    /// completed prefix and never retain access to the destination.
     pub fn try_copy_native_bytes_into(
         &self,
         destination: &mut [u8],
     ) -> Result<(), crate::error::NativeBytesCopyError> {
         let array = self.as_array();
-        let span = host_read::checked_layout(
-            array.shape(),
-            array.signed_strides(),
-            array.item_size(),
-        )?;
+        let span =
+            host_read::checked_layout(array.shape(), array.signed_strides(), array.item_size())?;
         if span.size != array.size() {
             return Err(AsSliceError::InvalidLayout.into());
         }
@@ -1218,44 +1262,26 @@ impl EvaluatedArray<'_> {
                 found: destination.len(),
             });
         }
-        let mut offset = 0;
-        self.visit_native_bytes(|value| {
-            destination[offset..offset + value.len()].copy_from_slice(value);
-            offset += value.len();
-        })?;
-        Ok(())
-    }
-
-    fn visit_native_bytes(&self, mut visit: impl FnMut(&[u8])) -> Result<(), AsSliceError> {
-        macro_rules! extend_bytes {
-            ($ty:ty, $encode:expr) => {{
-                for value in self.host_values::<$ty>()? {
-                    visit(&$encode(value));
-                }
-            }};
+        if expected == 0 {
+            return Ok(());
         }
-        match self.as_array().dtype() {
-            Dtype::Bool => extend_bytes!(bool, |v| [u8::from(v)]),
-            Dtype::Uint8 => extend_bytes!(u8, |v| [v]),
-            Dtype::Uint16 => extend_bytes!(u16, u16::to_ne_bytes),
-            Dtype::Uint32 => extend_bytes!(u32, u32::to_ne_bytes),
-            Dtype::Uint64 => extend_bytes!(u64, u64::to_ne_bytes),
-            Dtype::Int8 => extend_bytes!(i8, |v: i8| v.to_ne_bytes()),
-            Dtype::Int16 => extend_bytes!(i16, i16::to_ne_bytes),
-            Dtype::Int32 => extend_bytes!(i32, i32::to_ne_bytes),
-            Dtype::Int64 => extend_bytes!(i64, i64::to_ne_bytes),
-            Dtype::Float16 => extend_bytes!(half::f16, |v: half::f16| v.to_bits().to_ne_bytes()),
-            Dtype::Float32 => extend_bytes!(f32, f32::to_ne_bytes),
-            Dtype::Float64 => extend_bytes!(f64, f64::to_ne_bytes),
-            Dtype::Bfloat16 => extend_bytes!(half::bf16, |v: half::bf16| v.to_bits().to_ne_bytes()),
-            Dtype::Complex64 => extend_bytes!(complex64, |v: complex64| {
-                let mut out = [0_u8; 8];
-                out[..4].copy_from_slice(&v.re.to_ne_bytes());
-                out[4..].copy_from_slice(&v.im.to_ne_bytes());
-                out
-            }),
+        let Some(_guard) = crate::utils::runtime_lock::try_enter_for_recovery() else {
+            return Err(crate::error::CompletedReadbackError::Busy.into());
+        };
+        // SAFETY: checked exact initialized byte destination and completed source.
+        // The synchronous worker validates backing provenance and retains no borrow.
+        let status = unsafe {
+            safemlx_sys::mlx_array_copy_completed_data(
+                array.as_ptr(),
+                destination.as_mut_ptr().cast(),
+                expected,
+            )
+        };
+        match status {
+            0 => Ok(()),
+            -1 => Err(crate::error::CompletedReadbackError::Attribution.into()),
+            value => Err(crate::error::CompletedReadbackError::CudaStatus(value).into()),
         }
-        Ok(())
     }
 
     /// Compare two evaluated arrays for equal dtype, shape, and values.
@@ -2012,6 +2038,19 @@ mod tests {
         let before = foreign.allocation_info().unwrap();
         let evaluated = foreign.evaluated().unwrap();
         assert_eq!(evaluated.as_slice::<f32>(), values);
+        let mut copied = vec![0f32; values.len()];
+        evaluated.try_copy_into(&mut copied).unwrap();
+        assert_eq!(copied, values);
+        let mut widened = vec![0f64; values.len()];
+        evaluated
+            .try_map_into::<f32, f64>(&mut widened, f64::from)
+            .unwrap();
+        assert_eq!(
+            widened,
+            values.iter().copied().map(f64::from).collect::<Vec<_>>()
+        );
+        // A readable native extent grants neither a physical allocation identity
+        // nor source authority to the completed-descriptor API.
         if evaluated.as_slice::<f32>().as_ptr() == source {
             assert_eq!(
                 before, None,

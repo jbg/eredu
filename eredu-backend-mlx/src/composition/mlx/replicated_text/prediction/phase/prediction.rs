@@ -1,11 +1,12 @@
 //! One source-bound prediction equation through the shared native recovery.
-use super::super::workspace::source_bindings::SourceBindings;
 use super::super::parameters::{
     clear_prediction_module_bank, inspect_prediction_module_plan, install_prediction_module_bank,
 };
 use super::super::workspace::quote::{PreparedPredictionEquationQuote, PreparedPredictionIo};
+use super::super::workspace::source_bindings::SourceBindings;
 use super::binding::{Binding, StateCompletion};
 use super::*;
+use crate::backend::runtime::residency::manager::OriginalMaterializedLoan;
 use crate::backend::{
     OriginalCopyEnvironment,
     nn::workspace::{ProjectedNativeStorage, ProjectedResidentState},
@@ -25,7 +26,7 @@ use crate::composition::mlx::speculative::{
 };
 use eredu_architectures::speculative_execution::PreparedEmbeddedEvidence;
 use eredu_core::{HostPreparationAuthority, OutputDemand};
-use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext};
 use eredu_runtime::{
     speculative::embedded_occurrence::EmbeddedInvocationWorkspace,
     working_memory::{
@@ -40,7 +41,67 @@ use std::{
     mem::{size_of, size_of_val},
 };
 
+type ParallelSession<A, S, D> =
+    ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>;
+struct ParallelArguments<'a, 'scope, 'observer, P, L, F> {
+    execute: F,
+    extension: &'a mut P,
+    lane: &'a mut L,
+    observer: Option<&'observer mut dyn ActivationObserver<MlxTensor, eredu_nn::Error>>,
+    context: SpeculativeExecutionStreams<'a>,
+    capture: Option<&'a super::capture::Capture>,
+    active:
+        &'a crate::composition::mlx::speculative::embedded_native::ActiveEmbeddedNativeInvocation<
+            'scope,
+        >,
+    stream: &'a Stream,
+}
+fn execute_parallel<'a, 'scope, 'observer, A, S, D, P, R, F>(
+    session: &mut ParallelSession<A, S, D>,
+    args: ParallelArguments<'a, 'scope, 'observer, P, P::LaneState, F>,
+) -> Result<R, Error>
+where
+    S: MlxStateMechanisms,
+    A: LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::Unit: 'static,
+    D: ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+        >,
+    P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
+    F: for<'execution, 'observation> FnOnce(
+        &mut ParallelSession<A, S, D>,
+        &mut P,
+        &mut P::LaneState,
+        Option<&'observation mut dyn ActivationObserver<MlxTensor, eredu_nn::Error>>,
+        SpeculativeExecutionStreams<'execution>,
+    ) -> Result<R, Error>,
+{
+    match args.capture {
+        Some(capture) => capture.run(args.active, args.stream, |observer| {
+            (args.execute)(
+                session,
+                args.extension,
+                args.lane,
+                Some(observer),
+                args.context,
+            )
+        }),
+        None => (args.execute)(
+            session,
+            args.extension,
+            args.lane,
+            args.observer,
+            args.context,
+        ),
+    }
+}
+
 struct Payload {
+    parallel_funding: HostMetadataFunding,
     capture: Option<super::capture::Capture>,
     io: RefCell<PreparedPredictionIo>,
     logits: Option<PendingModelLogits>,
@@ -66,10 +127,15 @@ struct QuotedPreparation<'a> {
     workspace: EmbeddedInvocationWorkspace,
     capture: Option<eredu_runtime::capture::OriginalSpeculativeCaptureInvocation<'a>>,
     capture_host: Option<eredu_runtime::working_memory::EmbeddedCaptureHostPlan<'a>>,
-    capture_edits: Option<crate::composition::mlx::session::intervention::PreparedModelInterventions>,
+    capture_edits:
+        Option<crate::composition::mlx::session::intervention::PreparedModelInterventions>,
 }
 
-type QuotedOutcome<R> = (Result<R, Error>, Option<super::capture::Owner>, Option<String>);
+type QuotedOutcome<R> = (
+    Result<R, Error>,
+    Option<super::capture::Owner>,
+    Option<String>,
+);
 
 struct Work<'a, 'state, 'context, 'observer, A, S, D, P, F>
 where
@@ -260,7 +326,10 @@ where
         size_of::<QuotedPreparation<'_>>(),
         size_of::<QuotedOutcome<R>>(),
         size_of::<Result<QuotedOutcome<R>, Error>>(),
-        size_of::<(&mut Work<'_, '_, '_, '_, A, S, D, P, F>, &PredictionEquation<&MlxTensor>)>(),
+        size_of::<(
+            &mut Work<'_, '_, '_, '_, A, S, D, P, F>,
+            &PredictionEquation<&MlxTensor>,
+        )>(),
         size_of::<Installed<'_, A, P>>(),
         size_of::<Result<R, Error>>(),
         size_of::<R>(),
@@ -324,12 +393,27 @@ where
             }
         }),
         |quote_context, storage| {
-            crate::composition::mlx::speculative::validate_registered_tensor_inputs(context, storage[2]).map_err(|cause| cause.at_speculative_stage("prediction registered input sources"))?;
-            let prior = priors(lane.evidence(), context, funding).map_err(|cause| cause.at_speculative_stage("prediction prior sources"))?;
-            SourceBindings::prepare(quote_context, storage, None, &prior, environment, funding, host)
-                .map_err(|cause| sources.retain_error(cause.at_speculative_stage("prediction source binding")))
+            crate::composition::mlx::speculative::validate_registered_tensor_inputs(
+                context, storage[2],
+            )
+            .map_err(|cause| cause.at_speculative_stage("prediction registered input sources"))?;
+            let prior = priors(lane.evidence(), context, funding)
+                .map_err(|cause| cause.at_speculative_stage("prediction prior sources"))?;
+            SourceBindings::prepare(
+                quote_context,
+                storage,
+                None,
+                &prior,
+                environment,
+                funding,
+                host,
+            )
+            .map_err(|cause| {
+                sources.retain_error(cause.at_speculative_stage("prediction source binding"))
+            })
         },
-    ).map_err(|cause| sources.retain_error(cause))?;
+    )
+    .map_err(|cause| sources.retain_error(cause))?;
     let parts = quote.into_parts();
     let mut work = Work {
         session,
@@ -353,7 +437,8 @@ where
             capture_host,
             capture_edits: capture_edits.into_inner(),
         },
-    ).map_err(|cause| sources.retain_error(cause))?;
+    )
+    .map_err(|cause| sources.retain_error(cause))?;
     let delivery = match (capture_owner.as_ref(), capture_invocation, capture_identity) {
         (Some(owner), Some(invocation), Some(identity)) => {
             owner.finish(invocation, identity, result.is_ok())
@@ -416,8 +501,17 @@ where
         SpeculativeExecutionStreams<'execution>,
     ) -> Result<R, Error>,
 {
-    let QuotedPreparation {parts, claim, workspace, capture: capture_invocation, capture_host, capture_edits} = prepared;
-    let (_, environment) = work.context.original_numerical()
+    let QuotedPreparation {
+        parts,
+        claim,
+        workspace,
+        capture: capture_invocation,
+        capture_host,
+        capture_edits,
+    } = prepared;
+    let (_, environment) = work
+        .context
+        .original_numerical()
         .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
     // Continue under the account which funded this exact quote.
     let phase_funding = parts.funding.clone();
@@ -436,10 +530,10 @@ where
         bindings,
         funding: quote_funding,
     } = parts;
-    let validations = recipe
-        .record()
-        .validation_roots()
-        .ok_or_else(|| Error::PrefillControl(WorkingMemoryError::UnknownBound).at_speculative_stage("prediction validation roots"))?;
+    let validations = recipe.record().validation_roots().ok_or_else(|| {
+        Error::PrefillControl(WorkingMemoryError::UnknownBound)
+            .at_speculative_stage("prediction validation roots")
+    })?;
     let point_roots = completion
         .map(|point| {
             let outputs = match point {
@@ -467,9 +561,11 @@ where
         environment.stream(),
         sources.pool(),
         &quote_context,
-    ).map_err(|cause| cause.at_speculative_stage("prediction module plan"))?;
+    )
+    .map_err(|cause| cause.at_speculative_stage("prediction module plan"))?;
     let mut roots = if let Some(plan) = &module_plan {
-        plan.boundary_roots(boundary_completion).map_err(|cause| cause.at_speculative_stage("prediction boundary roots"))?
+        plan.boundary_roots(boundary_completion)
+            .map_err(|cause| cause.at_speculative_stage("prediction boundary roots"))?
     } else {
         let mut roots = quote_context
             .metadata_vec(usize::from(boundary_completion.is_some()))
@@ -483,25 +579,49 @@ where
         recipe.bind_prediction_boundaries(std::mem::take(&mut roots), 0)?;
     }
     let (bank_controls, source_facts) = if let Some(plan) = &mut module_plan {
-        plan.bind_source_recipe(&mut recipe, boundary_completion).map_err(|cause| cause.at_speculative_stage("prediction module recipe"))?;
+        plan.bind_source_recipe(&mut recipe, boundary_completion)
+            .map_err(|cause| cause.at_speculative_stage("prediction module recipe"))?;
         (
-            plan.control_bytes()
-                .ok_or_else(|| Error::PrefillControl(WorkingMemoryError::UnknownBound).at_speculative_stage("prediction module control bound"))?,
+            plan.control_bytes().ok_or_else(|| {
+                Error::PrefillControl(WorkingMemoryError::UnknownBound)
+                    .at_speculative_stage("prediction module control bound")
+            })?,
             plan.source_facts()?,
         )
     } else {
         (0, None)
     };
     let facts = io.input_facts();
-    let layout = EmbeddedNativeLayout::inspect(
+    let model_control =
+        MlxReplicatedTextMechanisms::<A, S>::prepare_session_embedded_model_control(
+            work.session,
+            recipe.native_recipe(),
+            sources.model_control_source(),
+            funding,
+        )?;
+    let parallel_controls =
+        MlxReplicatedTextMechanisms::<A, S>::session_embedded_parallel_control_bytes::<
+            D,
+            ParallelArguments<'_, '_, '_, P, P::LaneState, F>,
+            R,
+        >(work.session)
+        .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::Overflow))?;
+    let parallel_funding =
+        crate::backend::submission_recovery::addressable::prepare_wrapper_funding(
+            parallel_controls,
+            funding,
+        )?;
+    let layout = EmbeddedNativeLayout::inspect_with_model_control(
         &recipe,
         environment,
         facts.map_or(0, |f| f.graph_bytes()),
         facts.map_or(0, |f| f.mutable_bytes()),
+        model_control,
     )
     .map_err(|cause| sources.retain_startup_error(cause))?;
     let handlers=(
-        |work:&mut Work<'_, '_, '_, 'observer, A,S,D,P,F>,q:&Payload,scope:&safemlx::SubmissionScope| {
+        |work:&mut Work<'_, '_, '_, 'observer, A,S,D,P,F>,q:&Payload,scope:&safemlx::SubmissionScope,
+         _materialized: OriginalMaterializedLoan<'_>| {
             let active=q.modules.as_ref().map(|bank|bank.activate(scope)).transpose()?;
             if let Some(active)=&active {
                 let projection=active.projection();
@@ -518,11 +638,7 @@ where
             let binding=Binding {active,sources,io:Some(&q.io),logits:q.logits.as_ref(),completion:q.completion.as_ref()};
             let context=work.context.with_embedded_invocation(&binding)?;
             let execute = work.execute.take().ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-            let output = match &q.capture {
-                Some(capture) => capture.run(active, environment.stream(), |observer|
-                    execute(work.session, &mut *installed.extension, work.lane.state_mut(), Some(observer), context)),
-                None => execute(work.session, &mut *installed.extension, work.lane.state_mut(), work.observer.take(), context),
-            }?;
+            let output=MlxReplicatedTextMechanisms::<A,S>::with_session_embedded_parallel(work.session,active.parallel_projection(),&q.parallel_funding,ParallelArguments {execute,extension:&mut *installed.extension,lane:work.lane.state_mut(),observer:work.observer.take(),context,capture:q.capture.as_ref(),active,stream:environment.stream()},execute_parallel::<A,S,D,P,R,F>)?;
             if let Some(bank)=&q.modules {bank.validate_complete().map_err(|cause|cause.at_speculative_stage("prediction module completion"))?;}
             if let Some(point)=&q.completion {point.try_borrow().map_err(|_|Error::PrefillScopeReentrant)?.validate_complete()?;}
             active.complete(|visit| {
@@ -570,7 +686,12 @@ where
                     n.checked_add(size_of::<(
                         F,
                         SpeculativeExecutionStreams<'_>,
-                        &mut ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
+                        &mut ReplicatedTextSession<
+                            A,
+                            MlxNeuralBackend,
+                            MlxReplicatedTextMechanisms<A, S>,
+                            D,
+                        >,
                         &mut P,
                         &mut P::LaneState,
                         &mut dyn ActivationObserver<MlxTensor, eredu_nn::Error>,
@@ -591,8 +712,15 @@ where
         Some(layout.graph_bytes()),
         Some(layout.record_bytes()),
         controls,
+        environment
+            .buffer_placement()
+            .map_err(|cause| sources.retain_startup_error(cause))?,
     )
-    .map_err(|cause| sources.retain_startup_error(Error::PrefillControl(cause).at_speculative_stage("prediction invocation requirements")))?;
+    .map_err(|cause| {
+        sources.retain_startup_error(
+            Error::PrefillControl(cause).at_speculative_stage("prediction invocation requirements"),
+        )
+    })?;
     let requirements = match source_facts {
         Some(facts) => requirements
             .with_host_source_constructions(facts)
@@ -640,7 +768,10 @@ where
         })
         .transpose()?;
     let modules = module_plan
-        .map(|plan| plan.prepare(role.clone(), environment.stream()).map_err(|cause| cause.at_speculative_stage("prediction module bank construction")))
+        .map(|plan| {
+            plan.prepare(role.clone(), environment.stream())
+                .map_err(|cause| cause.at_speculative_stage("prediction module bank construction"))
+        })
         .transpose()?;
     if modules.is_none() {
         role.claim_neural_bank(0)
@@ -661,8 +792,11 @@ where
     } else {
         None
     };
-    let io = io.prepare(role.clone(), recipe.plan(), sources).map_err(|cause| cause.at_speculative_stage("prediction input bank construction"))?;
+    let io = io
+        .prepare(role.clone(), recipe.plan(), sources)
+        .map_err(|cause| cause.at_speculative_stage("prediction input bank construction"))?;
     let payload = Payload {
+        parallel_funding,
         capture,
         io: RefCell::new(io),
         logits,
@@ -682,6 +816,7 @@ where
         &recipe,
         environment,
         sources.numerical_prerequisites().0,
+        sources.request(),
         role,
         payload,
         funding.clone(),

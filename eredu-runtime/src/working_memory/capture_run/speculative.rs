@@ -24,7 +24,7 @@ impl Eq for InterventionBinding {}
 impl SpeculativeCaptureBinding {
     pub(in crate::working_memory) fn validate_source_pool(
         &self,
-        pool: &super::super::WorkingMemoryPool,
+        pool: &super::super::MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         if let Some(binding) = &self.intervention {
             binding.0.validate_pool(pool)?;

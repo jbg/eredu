@@ -1,15 +1,16 @@
 //! Finite source-owned controller fixtures. Every constructor and operation is
 //! the same paid worker used by public preparation; no fixture runtime exists.
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use eredu_runtime::working_memory::{
     ControllerCompilationOutput, ControllerCompilationSources, InferenceExecutionIdentity,
-    OriginalChatProfilePreparation, OriginalControllerCompilation, OriginalControllerCompiler,
-    OriginalTokenizer, WorkingMemoryPool,
+    MemoryLedger, OriginalChatProfilePreparation, OriginalControllerCompilation,
+    OriginalControllerCompiler, OriginalTokenizer,
 };
 
 const CAPACITY: u64 = 1 << 30;
 pub(crate) struct Compiler {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     execution: InferenceExecutionIdentity,
     validity: SharedTokenFilter,
     tokenizer: OriginalTokenizer,
@@ -20,7 +21,7 @@ pub(crate) struct Plan {
     plan: GenerationRuntimePlan,
     compilation: OriginalControllerCompilation,
     tokenizer: OriginalTokenizer,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     execution: InferenceExecutionIdentity,
     validity: SharedTokenFilter,
 }
@@ -55,21 +56,21 @@ where
 }
 impl Compiler {
     pub(crate) fn new(tokenizer: &ChatTokenizer, eos: &[u32]) -> Self {
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
         // Establish the same canonical baseline before source reservations,
         // including sparse IDs, exactly as model loading does.
         let validity = pool
-            .prepare_shared_token_filter(|| {
-                crate::api::tokenizer_token_filter_for_tests(tokenizer)
-            })
+            .prepare_shared_token_filter(|| crate::api::tokenizer_token_filter_for_tests(tokenizer))
             .unwrap();
         let tokenizer = pool
             .compile_tokenizer_source_for_generation(
                 eredu_runtime::working_memory::OriginalTokenizerInput::Configuration(tokenizer),
             )
             .unwrap();
-        assert!(tokenizer.generation_domain().unwrap() == validity.as_ref(),
-            "original source must match ordinary tokenizer validity");
+        assert!(
+            tokenizer.generation_domain().unwrap() == validity.as_ref(),
+            "original source must match ordinary tokenizer validity"
+        );
         let execution = InferenceExecutionIdentity::default();
         let template = pool
             .compile_chat_template(
@@ -77,9 +78,13 @@ impl Compiler {
                     .unwrap(),
             )
             .unwrap();
-        let profile =
-            OriginalChatProfilePreparation::new(&template, &tokenizer, &execution, CAPACITY)
-                .unwrap();
+        let profile = OriginalChatProfilePreparation::new(
+            &template,
+            &tokenizer,
+            &execution,
+            crate::memory_fixture::resolved_limits(CAPACITY),
+        )
+        .unwrap();
         Self {
             pool,
             execution,
@@ -231,14 +236,17 @@ impl Compiler {
 impl Plan {
     pub(crate) fn funding(&self) -> eredu_core::HostMetadataFunding {
         self.pool
-            .prepare_workspace_metadata(&self.execution, CAPACITY)
+            .prepare_workspace_metadata(
+                &self.execution,
+                crate::memory_fixture::resolved_limits(CAPACITY),
+            )
             .unwrap()
     }
     pub(crate) fn controller(&self) -> ConstraintController {
         let preparation = eredu_runtime::working_memory::PreparedSemanticSource::new(
             &self.tokenizer,
             &self.execution,
-            CAPACITY,
+            crate::memory_fixture::resolved_limits(CAPACITY),
         )
         .unwrap();
         let validity = self.validity.clone();

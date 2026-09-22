@@ -3,6 +3,7 @@
 use super::*;
 
 mod prepared_copy;
+mod prompt_cache;
 pub(crate) use prepared_copy::PagedPoolingCopy;
 mod resident_copy;
 pub(crate) use prepared_copy::PreparedPoolingAttentionCopy;
@@ -12,6 +13,7 @@ pub(crate) use resident_copy::{
     PreparedResidentPoolingCopy, ProjectedDenseResidentPoolingCopy,
     PublishedDenseResidentPoolingState, ResidentPoolingCopyError, SavedResidentPoolingCopy,
 };
+mod resident_reset;
 mod workspace;
 
 /// General MLX realization of bounded local keys plus zero, one, or two
@@ -112,7 +114,13 @@ impl MlxPoolingAttentionStateFactory {
         state: &MlxPoolingAttentionState,
         additional: u64,
     ) -> Option<u64> {
-        state.as_ref().iter().try_fold(0, |bound, cache| {
+        Self::layer_capacity_bound(state.as_ref().iter(), additional)
+    }
+    pub(in crate::backend::runtime::cache::state) fn layer_capacity_bound<'a>(
+        mut layers: impl Iterator<Item = &'a MlxPoolingAttentionCache>,
+        additional: u64,
+    ) -> Option<u64> {
+        layers.try_fold(0, |bound, cache| {
             Some(bound.max(cache.continuation_capacity_bound(additional)?))
         })
     }
@@ -121,7 +129,13 @@ impl MlxPoolingAttentionStateFactory {
         state: &MlxPoolingAttentionState,
         additional: u64,
     ) -> Option<u64> {
-        state.as_ref().iter().try_fold(0u64, |bytes, cache| {
+        Self::layer_auxiliary_growth(state.as_ref().iter(), additional)
+    }
+    pub(in crate::backend::runtime::cache::state) fn layer_auxiliary_growth<'a>(
+        mut layers: impl Iterator<Item = &'a MlxPoolingAttentionCache>,
+        additional: u64,
+    ) -> Option<u64> {
+        layers.try_fold(0u64, |bytes, cache| {
             // The neutral key-only geometry has no value tensor. Native local
             // storage uses a one-channel persistence sentinel; bound it as well
             // as every possible new sealed-block catalog entry.
@@ -682,7 +696,8 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             .gt(
                 queries
                     .subtract(
-                        Array::try_from_int(window).map_err(ComputeError::backend_retained_source)?,
+                        Array::try_from_int(window)
+                            .map_err(ComputeError::backend_retained_source)?,
                         stream,
                     )
                     .map_err(ComputeError::backend_retained_source)?,

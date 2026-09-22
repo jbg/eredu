@@ -184,7 +184,7 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
     capture.limits.cumulative = usage;
     capture.limits.on_limit = CaptureLimitPolicy::Fail;
     let capture = model
-        .prepare_speculative_capture(settings, capture)
+        .prepare_speculative_capture(settings.clone(), capture)
         .unwrap();
     let edits = [
         (SpeculativeCaptureRole::Target, 12),
@@ -263,11 +263,10 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
             session.intervene(Vec::new())?;
             *visible.borrow_mut() = prefix_text.clone();
             while let Some(step) = session.step()? {
-                assert!(
-                    step.captures
-                        .iter()
-                        .all(|c| c.capture.as_step().interventions.is_empty())
-                );
+                assert!(step
+                    .captures
+                    .iter()
+                    .all(|c| c.capture.as_step().interventions.is_empty()));
             }
             assert!(
                 session.token_ids()[1..].iter().any(|&id| id != 12),
@@ -309,7 +308,7 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
                     output_mode: eredu::api::PreparedChatOutputMode::Text,
                     skip_special_tokens: true,
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings: chat_settings(&chat, settings),
+                    settings: chat_settings(&chat, settings.clone()),
                     options,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -332,7 +331,7 @@ fn run(mode: &str, evidence: Evidence) -> serde_json::Value {
             .with_controlled_managed_plain_text_speculative(
                 &source,
                 ManagedPlainTextSpeculativeRequest {
-                    text: ManagedPlainTextRequest::new(PROMPT, settings),
+                    text: ManagedPlainTextRequest::new(PROMPT, settings.clone()),
                     drafting: drafting.as_speculative_draft().unwrap(),
                     options,
                     cancellation: Default::default(),

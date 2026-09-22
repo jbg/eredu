@@ -1,7 +1,7 @@
 //! Public prediction equations, effective matrices and coordinated reversible edits.
 use super::*;
 use eredu_core::{
-    TensorObservationData, component::*, intervention::InterventionDtype, parameters::*,
+    component::*, intervention::InterventionDtype, parameters::*, TensorObservationData,
 };
 use std::collections::BTreeMap;
 
@@ -23,7 +23,7 @@ fn values<'a>(records: &'a [CaptureRecord], path: &str) -> &'a [f32] {
 fn reconstruct(
     records: &[CaptureRecord],
     scope: &ComponentExecutionScope,
-    weights: &BTreeMap<String, Vec<f32>>,
+    weights: &BTreeMap<String, SharedParameterValues>,
 ) {
     let (inputs, output) = match &scope.residual_base {
         ComponentResidualBase::ProjectedSum { inputs, output, .. } => (inputs.as_slice(), output),
@@ -32,7 +32,7 @@ fn reconstruct(
     };
     let mixing = scope.readout.stream_residual.as_ref().unwrap();
     let readout = &scope.readout;
-    let gain = &weights[readout.normalization.gain.as_ref().unwrap()];
+    let gain = &weights[readout.normalization.gain.as_ref().unwrap()].values;
     let hidden = gain.len();
     let streams = mixing.streams;
     let fused = values(records, output);
@@ -54,7 +54,7 @@ fn reconstruct(
     for input in inputs {
         let before = values(records, &input.projection_input);
         let projected = values(records, &input.output);
-        let weight = &weights[&input.weight];
+        let weight = &weights[&input.weight].values;
         for (row, (before, actual)) in before
             .chunks_exact(hidden)
             .zip(projected.chunks_exact(hidden))
@@ -131,7 +131,7 @@ fn reconstruct(
     let coefficients = values(records, &mixing.head.coefficients);
     let residual = values(records, &readout.residual);
     let scores = values(records, &readout.logits);
-    let head = &weights[&readout.weight];
+    let head = &weights[&readout.weight].values;
     let vocabulary = head.len() / hidden;
     for row in 0..rows {
         let rms = (residual[row * hidden..(row + 1) * hidden]
@@ -160,7 +160,7 @@ fn reconstruct(
         for write in &readout.score_writes {
             assert_eq!(write.broadcast_axes, ["sequence"]);
             let input = values(records, &write.projection_input);
-            let matrix = &weights[&write.weight];
+            let matrix = &weights[&write.weight].values;
             let original = values(records, &write.output);
             let effective = values(records, &write.effective_output);
             assert_eq!(matrix.len(), vocabulary * input.len());
@@ -296,7 +296,7 @@ fn verify(device: LocalDevice, fused: bool) {
                     limits,
                 )
                 .unwrap();
-            weights.insert(name, queried.values);
+            weights.insert(name, queried);
         }
         let baseline =
             super::parameters::captures(&mut model, &generation, &paths, &[1, 2, 5], false);

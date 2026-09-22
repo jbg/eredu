@@ -45,7 +45,7 @@ fn file() -> (tempfile::TempDir, SafetensorsWeightStore) {
     (directory, source)
 }
 fn required<P: SharedNativeInitializer>(plan: &P) -> Option<u64> {
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -102,13 +102,13 @@ macro_rules! sequence {
                     None => total,
                     _ => unreachable!(),
                 };
-                let pool = WorkingMemoryPool::new(limit, 0).unwrap();
+                let pool = crate::working_memory::memory_fixture::host_ledger(limit, 0).unwrap();
                 let keys = pool.initialize_shared_native(keys_plan()).unwrap();
-                assert_eq!(pool.used_bytes().unwrap(), key_bytes);
+                assert_eq!(pool.payload_used_bytes().unwrap(), key_bytes);
                 let batch = pool
                     .initialize_shared_native($plan::new(&source, keys.output().keys()).unwrap())
                     .unwrap();
-                assert_eq!(pool.used_bytes().unwrap(), key_bytes + batch_bytes);
+                assert_eq!(pool.payload_used_bytes().unwrap(), key_bytes + batch_bytes);
                 assert_eq!(keys.output().keys(), ["a", "雪", "a"]);
                 assert_eq!(batch.output().byte_len(), 8);
                 let result = pool.initialize_shared_native(
@@ -118,16 +118,18 @@ macro_rules! sequence {
                     let failure = result.unwrap_err();
                     assert!(matches!(
                         failure.accounting_failure(),
-                        Some(WorkingMemoryError::BudgetExceeded { .. })
+                        Some(WorkingMemoryError::Domain(
+                            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                        ))
                     ));
                     assert!(failure.rejected_plan().is_some());
                     assert!(failure.constructor_failure().is_none());
-                    assert_eq!(pool.used_bytes().unwrap(), key_bytes + batch_bytes);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), key_bytes + batch_bytes);
                     drop(failure);
                     None
                 } else {
                     let catalog = result.unwrap();
-                    assert_eq!(pool.used_bytes().unwrap(), catalog_total);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), catalog_total);
                     assert!(std::ptr::eq(
                         catalog.output().tensor_metadata_borrowed("a").unwrap(),
                         &batch.output().tensors()[2]
@@ -157,18 +159,20 @@ macro_rules! sequence {
                         let failure = result.unwrap_err();
                         assert!(matches!(
                             failure.accounting_failure(),
-                            Some(WorkingMemoryError::BudgetExceeded { .. })
+                            Some(WorkingMemoryError::Domain(
+                                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                            ))
                         ));
                         assert!(failure.rejected_plan().is_some());
                         assert!(failure.constructor_failure().is_none());
-                        assert_eq!(pool.used_bytes().unwrap(), catalog_total);
+                        assert_eq!(pool.payload_used_bytes().unwrap(), catalog_total);
                         drop(failure);
                         None
                     } else {
                         let inferred = result.unwrap();
                         assert_eq!(inferred.output().shape(), [8]);
                         assert_eq!(inferred.output().byte_len(), 8);
-                        assert_eq!(pool.used_bytes().unwrap(), total);
+                        assert_eq!(pool.payload_used_bytes().unwrap(), total);
                         Some(inferred)
                     };
                     drop(catalog);
@@ -180,18 +184,21 @@ macro_rules! sequence {
                 } else {
                     0
                 };
-                assert_eq!(pool.used_bytes().unwrap(), batch_bytes + retained_inference);
+                assert_eq!(
+                    pool.payload_used_bytes().unwrap(),
+                    batch_bytes + retained_inference
+                );
                 let mut output = [0; 8];
                 batch.output().read_into(&mut output).unwrap();
                 assert_eq!(output, [3, 7, 11, 13, 29, 3, 7, 11]);
                 drop(batch);
-                assert_eq!(pool.used_bytes().unwrap(), retained_inference);
+                assert_eq!(pool.payload_used_bytes().unwrap(), retained_inference);
                 if let Some(inferred) = &inferred {
                     assert_eq!(inferred.output().shape(), [8]);
                     assert_eq!(inferred.output().byte_len(), 8);
                 }
                 drop(inferred);
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     };

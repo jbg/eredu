@@ -180,7 +180,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
                             prefill_chunk_positions: chunk,
                             ..Default::default()
                         },
-                        ..settings
+                        ..settings.clone()
                     },
                 ),
                 options: generation.clone(),
@@ -196,7 +196,7 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
             };
             let admitted = model
                 .prepare_speculative_capture(
-                    settings,
+                    settings.clone(),
                     CapturePlan {
                         schema_version: CAPTURE_SCHEMA_VERSION,
                         selections: vec![CaptureSelection {
@@ -209,7 +209,6 @@ fn embedded_captured_prefill_matches_full_and_controlled_on_every_residency() {
                         limits: CaptureLimits {
                             per_step: usage,
                             cumulative: usage,
-                            physical_native_bytes: None,
                             on_limit: CaptureLimitPolicy::Fail,
                         },
                     },
@@ -402,7 +401,6 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
                     limits: CaptureLimits {
                         per_step: usage,
                         cumulative: usage,
-                        physical_native_bytes: None,
                         on_limit: CaptureLimitPolicy::Fail,
                     },
                 },
@@ -433,7 +431,7 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
                         prefill_chunk_positions: chunk,
                         ..Default::default()
                     },
-                    ..settings
+                    ..settings.clone()
                 },
             ),
             options: generation.clone(),
@@ -443,7 +441,7 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         };
         let score_plan = model
             .prepare_speculative_capture(
-                settings,
+                settings.clone(),
                 CapturePlan {
                     schema_version: CAPTURE_SCHEMA_VERSION,
                     selections: vec![CaptureSelection {
@@ -456,7 +454,6 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
                     limits: CaptureLimits {
                         per_step: usage,
                         cumulative: usage,
-                        physical_native_bytes: None,
                         on_limit: CaptureLimitPolicy::Fail,
                     },
                 },
@@ -511,12 +508,10 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         assert_eq!(default.token_ids(), full.token_ids());
         assert_eq!(output.stats().target_tokens(), full.stats().target_tokens());
         let expected_scores = scores(&full_scores);
-        assert!(
-            expected_scores
-                .iter()
-                .flat_map(|x| &x.2)
-                .any(|x| x.1 != 0.0)
-        );
+        assert!(expected_scores
+            .iter()
+            .flat_map(|x| &x.2)
+            .any(|x| x.1 != 0.0));
         compare_scores(&scores(&default_scores), &expected_scores);
         compare_scores(&scores(&observed_scores), &expected_scores);
         assert_eq!(output.token_ids().len(), 13);
@@ -543,11 +538,9 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
                     .collect::<Vec<_>>(),
                 widths
             );
-            assert!(
-                spans
-                    .iter()
-                    .all(|r| r.completed && r.origin.prediction == 0)
-            );
+            assert!(spans
+                .iter()
+                .all(|r| r.completed && r.origin.prediction == 0));
             for record in spans {
                 let span = record.prefill_span.unwrap();
                 assert!(span.validate(
@@ -596,18 +589,14 @@ fn captured_prefill_records_actual_target_and_shifted_seed_windows() {
         assert!(records.iter().filter(|r|r.phase==SpeculativeActivationPhase::TargetPrefill)
             .flat_map(|r|&r.captures.as_step().records).filter_map(|r| r.payload.as_ref().and_then(CapturePayload::as_tensor))
             .any(|t| matches!(t.data(),eredu_core::TensorObservationData::F32(v) if v.iter().any(|x|*x!=0.0))));
-        assert!(
-            records
-                .iter()
-                .any(|r| r.phase == SpeculativeActivationPhase::Verification
-                    && r.prefill_span.is_none()
-                    && r.captures.as_step().invocation.unwrap().sequence > 1)
-        );
-        assert!(
-            records
-                .windows(2)
-                .all(|r| r[1].captures.as_step().cumulative_usage.host_bytes
-                    >= r[0].captures.as_step().cumulative_usage.host_bytes)
-        );
+        assert!(records
+            .iter()
+            .any(|r| r.phase == SpeculativeActivationPhase::Verification
+                && r.prefill_span.is_none()
+                && r.captures.as_step().invocation.unwrap().sequence > 1));
+        assert!(records
+            .windows(2)
+            .all(|r| r[1].captures.as_step().cumulative_usage.host_bytes
+                >= r[0].captures.as_step().cumulative_usage.host_bytes));
     }
 }

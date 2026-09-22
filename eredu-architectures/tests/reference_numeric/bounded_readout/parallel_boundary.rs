@@ -189,10 +189,8 @@ where
         trace: Rc::clone(&trace),
     };
     let execution = session.inference_execution_identity().clone();
-    let request = eredu_runtime::working_memory::InferenceRequest::without_memory_budget(
-        &execution, geometry,
-    )
-    .map_err(|error| error.to_string())?;
+    let request =
+        crate::memory_fixture::request(&execution, geometry).map_err(|error| error.to_string())?;
     let mut observer = BoundaryObserver {
         trace: Rc::clone(&trace),
         transactional,

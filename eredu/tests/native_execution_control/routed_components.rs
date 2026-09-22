@@ -121,7 +121,7 @@ fn verify(device: LocalDevice) {
                 }
             }
             assert_eq!(selected.values, expected);
-            originals.insert(parameter.id.clone(), full.values);
+            originals.insert(parameter.id.clone(), full);
         }
         let edits = [&gate, &write]
             .into_iter()
@@ -173,7 +173,7 @@ fn verify(device: LocalDevice) {
             for (index, (&actual, &original)) in full
                 .values
                 .iter()
-                .zip(&originals[&parameter.id])
+                .zip(&originals[&parameter.id].values)
                 .enumerate()
             {
                 let expert = index as u64 / (parameter.shape[1] * parameter.shape[2]);
@@ -283,8 +283,7 @@ fn capture_units(device: LocalDevice) {
                         },
                         usage,
                     )
-                    .unwrap()
-                    .values,
+                    .unwrap(),
             );
         }
         let discovery = model.capture_discovery().unwrap();
@@ -348,7 +347,6 @@ fn capture_units(device: LocalDevice) {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         };
@@ -362,7 +360,7 @@ fn capture_units(device: LocalDevice) {
             let prepared_prefix = prefix.clone();
             let prepared_capture = capture.clone();
             let prepared_trace = trace;
-            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
             prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
             prepared.output_mode = PreparedChatOutputMode::Text;
             prepared.capture = Some(&prepared_capture);
@@ -384,7 +382,7 @@ fn capture_units(device: LocalDevice) {
                         retained_bytes: 512 << 20,
                         cumulative_copy_bytes: 2 << 30,
                     },
-                    ORIGINAL_CAPACITY,
+                    native_limits(ORIGINAL_CAPACITY),
                     copy_limits(),
                 )
                 .unwrap();
@@ -474,9 +472,11 @@ fn capture_units(device: LocalDevice) {
                         let mut up = 0.0f64;
                         for k in 0..16 {
                             let x = input[row.token as usize * 16 + k] as f64;
-                            gate +=
-                                x * weights[0][(row.expert as usize * 12 + unit) * 16 + k] as f64;
-                            up += x * weights[0][(row.expert as usize * 12 + 6 + unit) * 16 + k]
+                            gate += x * weights[0].values
+                                [(row.expert as usize * 12 + unit) * 16 + k]
+                                as f64;
+                            up += x * weights[0].values
+                                [(row.expert as usize * 12 + 6 + unit) * 16 + k]
                                 as f64;
                         }
                         let expected = gate / (1.0 + (-gate).exp()) * up;
@@ -484,7 +484,8 @@ fn capture_units(device: LocalDevice) {
                         for k in 0..16 {
                             reconstructed[row.token as usize * 16 + k] += actual as f64
                                 * row.coefficient as f64
-                                * weights[1][(row.expert as usize * 16 + k) * 6 + unit] as f64;
+                                * weights[1].values[(row.expert as usize * 16 + k) * 6 + unit]
+                                    as f64;
                         }
                     }
                 }
@@ -540,7 +541,7 @@ fn capture_units(device: LocalDevice) {
             let prepared_prefix = prefix.clone();
             let prepared_capture = sliced;
             let prepared_trace = trace;
-            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
             prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
             prepared.output_mode = PreparedChatOutputMode::Text;
             prepared.capture = Some(&prepared_capture);

@@ -13,6 +13,8 @@ use crate::{Array, Dtype, Stream};
 use safemlx_internal_macros::generate_macro;
 pub(crate) mod fixed_config;
 mod host_controls;
+mod ordinary_controls;
+pub use ordinary_controls::{ordinary_rope_invocation_control_bytes, ordinary_sdpa_control_bytes};
 pub(crate) mod prepared_definition;
 pub use fixed_config::{BorrowedKernelOutput, BorrowedKernelTemplate};
 pub use host_controls::three_input_kernel_control_bytes;

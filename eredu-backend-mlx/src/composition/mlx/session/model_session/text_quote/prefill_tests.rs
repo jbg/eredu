@@ -5,18 +5,22 @@ use crate::backend::submission_recovery::prefill::{
     test_trace::{Event, Trace},
 };
 use crate::composition::mlx::session::model_session::disk_layerwise_tests as disk;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     ControlledTextGeneration, GenerationSequenceRequest, PendingTextInput, TextGeneration,
     TextGenerationInput, TokenFilter, TokenOutput,
 };
 use eredu_runtime::prefill::{PrefillControlPlan, PrefillControlRole};
 use std::num::NonZeroU64;
-#[path = "prefill_tests/cpu_paged.rs"]
-mod cpu_paged;
 #[path = "prefill_tests/activation.rs"]
 mod activation;
+#[path = "prefill_tests/cpu_paged.rs"]
+mod cpu_paged;
 #[path = "prefill_tests/persistent_disk.rs"]
 mod persistent_disk;
+#[path = "prefill_tests/prompt_cache.rs"]
+mod prompt_cache;
 
 fn config(original: bool) -> TextGenerationConfig {
     let mut config = fixture::config(4, u64::MAX);
@@ -26,64 +30,55 @@ fn config(original: bool) -> TextGenerationConfig {
     if original {
         fixture::chunked_original(config)
     } else {
-        let mut policy = config.inference_policy();
+        let mut policy = config.inference_policy().clone();
         policy.prefill_chunk_positions = NonZeroU64::new(2);
-        config.with_inference_policy(policy)
+        config.with_inference_policy(policy.clone())
     }
 }
 fn original_source_config() -> TextGenerationConfig {
     // The borrowed token source supplies the actual input producer. Derive
     // both native arenas from that complete source rather than old test caps.
     let config = config(true);
-    let mut policy = config.inference_policy();
+    let mut policy = config.inference_policy().clone();
     policy.submission_tracking_capacity_bytes = None;
     policy.graph_metadata_capacity_bytes = None;
-    config.with_inference_policy(policy)
+    config.with_inference_policy(policy.clone())
 }
 #[test]
 fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency_results() {
+    if !crate::tests::support::native_process::enter("physical-limit-parity") {
+        return;
+    }
     let environment = fixture::PreparedResidencyFixture::new();
     let stream = environment.stream();
     let pool = &environment.pool;
     for residency in 0..3 {
         let mut expected = None;
-        for original in [false, true] {
+        for finite in [false, true] {
             for controlled in [false, true] {
                 let (mut runtime, _artifact, baseline) = environment.load(residency, None);
                 let disk_reads = environment.disk_read_bytes(&runtime, residency);
-                let probe = original.then(|| Probe::new(&runtime, None, false));
+                let probe = Some(Probe::new(&runtime, None, false));
                 let trace = Trace::new();
                 let input = vec![2, 5, 7, 3, 11];
-                let mut request_config = config(original);
-                if original {
-                    // The admitted fixture supplies its actual borrowed input
-                    // source. Select complete native arenas from that source;
-                    // a raw ordinary Vec cannot prove the input Graph producer.
-                    let mut policy = request_config.inference_policy();
+                let mut request_config = config(finite);
+                {
+                    let mut policy = request_config.inference_policy().clone();
                     policy.submission_tracking_capacity_bytes = None;
                     policy.graph_metadata_capacity_bytes = None;
-                    request_config = request_config.with_inference_policy(policy);
+                    request_config = request_config.with_inference_policy(policy.clone());
                 }
                 let outputs = if controlled {
-                    let mut generation = if original {
-                        ControlledTextGeneration::from_token_ids_with_sequence(
-                            &mut runtime,
-                            eredu_core::TokenIdsInputPlan::new(&input).unwrap(),
-                            request_config,
-                            disk::Controller::default(),
-                            None,
-                            GenerationSequenceRequest::new(4, &[]),
-                        )
-                    } else {
-                        ControlledTextGeneration::from_input(
-                            &mut runtime,
-                            TextGenerationInput::TokenIds(input),
-                            request_config,
-                            disk::Controller::default(),
-                        )
-                    }
+                    let mut generation = ControlledTextGeneration::from_token_ids_with_sequence(
+                        &mut runtime,
+                        eredu_core::TokenIdsInputPlan::new(&input).unwrap(),
+                        request_config,
+                        disk::Controller::default(),
+                        None,
+                        GenerationSequenceRequest::new(4, &[]),
+                    )
                     .unwrap();
-                    let mut sequence = original.then(|| {
+                    let mut sequence = Some({
                         generation
                             .take_prepared_sequence()
                             .unwrap()
@@ -93,7 +88,7 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                     let mut outputs = Vec::new();
                     for next in &mut generation {
                         let token = next.unwrap_or_else(|error| panic!(
-                            "residency={residency}, original={original}, controlled={controlled}: {error:?}"));
+                            "residency={residency}, finite={finite}, controlled={controlled}: {error:?}"));
                         if let Some(sequence) = &mut sequence {
                             sequence
                                 .commit(
@@ -109,20 +104,16 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                     }
                     outputs
                 } else {
-                    let mut generation = if original {
-                        TextGeneration::from_token_ids_with_sequence(
-                            &mut runtime,
-                            eredu_core::TokenIdsInputPlan::new(&input).unwrap(),
-                            request_config,
-                            TokenFilter::All,
-                            None,
-                            GenerationSequenceRequest::new(4, &[]),
-                        )
-                    } else {
-                        TextGeneration::new(&mut runtime, input, request_config)
-                    }
+                    let mut generation = TextGeneration::from_token_ids_with_sequence(
+                        &mut runtime,
+                        eredu_core::TokenIdsInputPlan::new(&input).unwrap(),
+                        request_config,
+                        TokenFilter::All,
+                        None,
+                        GenerationSequenceRequest::new(4, &[]),
+                    )
                     .unwrap();
-                    let mut sequence = original.then(|| {
+                    let mut sequence = Some({
                         generation
                             .take_prepared_sequence()
                             .unwrap()
@@ -132,7 +123,7 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                     let mut outputs = Vec::new();
                     for next in &mut generation {
                         let token = next.unwrap_or_else(|error| panic!(
-                            "residency={residency}, original={original}, controlled={controlled}: {error:?}"));
+                            "residency={residency}, finite={finite}, controlled={controlled}: {error:?}"));
                         if let Some(sequence) = &mut sequence {
                             sequence
                                 .commit(
@@ -203,16 +194,20 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                // A complete native recipe selects the prepared stream for
-                // each of three prefill spans and three cached decode steps.
-                // The ordinary reference uses its three prefill collectors.
-                assert_eq!(completed.len(), if original { 0 } else { 3 },
-                    "residency={residency}, original={original}, controlled={controlled}: {events:?}");
-                assert_eq!(on_stream.len(), if original { 6 } else { 0 },
-                    "residency={residency}, original={original}, controlled={controlled}: {events:?}");
+                // Finite and unlimited limits use the same prepared scopes.
+                assert_eq!(
+                    completed.len(),
+                    0,
+                    "residency={residency}, finite={finite}, controlled={controlled}: {events:?}"
+                );
+                assert_eq!(
+                    on_stream.len(),
+                    6,
+                    "residency={residency}, finite={finite}, controlled={controlled}: {events:?}"
+                );
                 assert!(completed.iter().all(|(roots, _)| *roots > 0));
                 assert!(on_stream.iter().all(|roots| *roots > 0));
-                if original {
+                {
                     assert_eq!(prepared.len(), 1);
                     let (plan, roots, graph) = prepared[0];
                     assert_eq!(plan.span_count(), 3);
@@ -234,9 +229,6 @@ fn c1_actual_original_roles_preserve_ordinary_controlled_nonzero_three_residency
                             .collect::<Vec<_>>()
                     );
                     assert!(completed.iter().all(|(_, original)| *original));
-                } else {
-                    assert!(prepared.is_empty());
-                    assert!(completed.iter().all(|(_, original)| !*original));
                 }
                 if let Some(probe) = &probe {
                     let preparation = probe.take();
@@ -256,11 +248,15 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
     let (mut runtime, _artifact, first_source_baseline) = environment.load(0, None);
     let stream = runtime.backend().stream().clone();
     // Construct both model identities before the original request reserves work.
-    let before_foreign_source = pool.used_bytes().unwrap();
+    let before_foreign_source = pool.fixture_host_charge().unwrap();
     let (foreign_runtime, _other_artifact, foreign_target_bytes) = environment.load(0, None);
     let foreign_stream = foreign_runtime.backend().stream().clone();
     let source_baseline = first_source_baseline
-        .checked_add(foreign_target_bytes.checked_sub(before_foreign_source).unwrap())
+        .checked_add(
+            foreign_target_bytes
+                .checked_sub(before_foreign_source)
+                .unwrap(),
+        )
         .unwrap();
     runtime.backend().validate_original_stream_owners().unwrap();
     let native_runtime = runtime
@@ -306,7 +302,7 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
             .is_err()
     );
     let first = plan.role(0).unwrap();
-    let foreign = InferenceRequest::without_memory_budget(
+    let foreign = crate::memory_fixture::empty_admitted_request(
         &eredu_runtime::working_memory::InferenceExecutionIdentity::default(),
         plan.geometry(),
     )
@@ -368,7 +364,7 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
     assert!(view.is_live());
     assert_eq!(executable.prefill_status_for_test().unwrap(), (true, true));
     fixture::finish(foreign_runtime, &foreign_stream);
-    assert!(pool.used_bytes().unwrap() >= held);
+    assert!(pool.fixture_host_charge().unwrap() >= held);
     runtime.synchronize().unwrap();
     assert!(view.is_live());
     assert_eq!(executable.prefill_status_for_test().unwrap(), (true, true));
@@ -390,7 +386,7 @@ fn c1_actual_prepared_bank_rejects_foreign_request_role_and_reissue_without_adva
     fixture::finish(runtime, &stream);
     // The escaped view retains Q and its actual parent planning/source accounts.
     // The pre-request factory source baseline remains independently owned.
-    assert!(pool.used_bytes().unwrap() >= source_baseline.checked_add(held).unwrap());
+    assert!(pool.fixture_host_charge().unwrap() >= source_baseline.checked_add(held).unwrap());
     drop(view);
     fixture::settle(pool, source_baseline);
 }
@@ -475,7 +471,7 @@ fn with_foreign_runtime(f: impl FnOnce()) {
 #[test]
 fn c3_original_bank_missing_record_refuses_before_role_or_carrier_construction() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let native_runtime = runtime
         .session()
@@ -547,7 +543,7 @@ fn c4_genuine_original_source_span_and_final_index_roles_evaluate_with_retained_
     use safemlx::error::ScopedEvaluationCause;
     let stream = fixture::stream();
     for residency in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = fixture::load(&stream, &pool, residency);
         let native_runtime = runtime
             .session()
@@ -621,7 +617,7 @@ fn c4_genuine_original_source_span_and_final_index_roles_evaluate_with_retained_
         drop((run, step, bank, view, preparation, probe));
         fixture::finish(runtime, &stream);
         // Exact role carrier still owns real Q custody after runtime and bank.
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         assert_eq!(
             escaped.as_ref().unwrap().scoped_evaluation_cause(),
             Some(ScopedEvaluationCause::RuntimeBusy)
@@ -650,7 +646,7 @@ fn with_original_operation_controls_and_pool<T>(
     operation: impl FnOnce(
         &eredu_runtime::working_memory::OriginalTextControlGuard,
         &safemlx::OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
     ) -> T,
 ) -> T {
     with_original_operation_controls_and_destinations(None, |controls, observer, pool, bank| {
@@ -730,7 +726,7 @@ fn with_registered_original_operation_controls<T>(
     operation: impl FnOnce(
         &eredu_runtime::working_memory::OriginalTextControlGuard,
         &safemlx::OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
     ) -> T,
 ) -> T {
     with_original_operation_controls_and_destinations_mode(
@@ -747,7 +743,7 @@ fn with_original_operation_controls_and_destinations<T>(
     operation: impl FnOnce(
         &eredu_runtime::working_memory::OriginalTextControlGuard,
         &safemlx::OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
     ) -> T,
 ) -> T {
@@ -756,7 +752,7 @@ fn with_original_operation_controls_and_destinations<T>(
 struct OriginalOperationFixture {
     runtime: ModelRuntime<MlxBackend<'static>>,
     artifact: tempfile::TempDir,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     stream: safemlx::Stream,
     tokenizer: Option<eredu_runtime::working_memory::OriginalTokenizer>,
     stops: Option<eredu_runtime::working_memory::OriginalStopSource>,
@@ -788,7 +784,7 @@ impl OriginalOperationFixture {
             (runtime, artifact, pool, stream)
         } else {
             let stream = fixture::stream();
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let (runtime, artifact) = fixture::load(&stream, &pool, 0);
             (runtime, artifact, pool, stream)
         };
@@ -841,7 +837,7 @@ fn with_original_operation_controls_and_destinations_mode<T>(
     operation: impl FnOnce(
         &eredu_runtime::working_memory::OriginalTextControlGuard,
         &safemlx::OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
     ) -> T,
 ) -> T {
@@ -856,7 +852,7 @@ fn with_prepared_original_operation_controls<T>(
     operation: impl FnOnce(
         &eredu_runtime::working_memory::OriginalTextControlGuard,
         &safemlx::OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
     ) -> T,
 ) -> T {
@@ -872,7 +868,7 @@ fn with_prepared_original_operation_reservation<T>(
     operation: impl FnOnce(
         &eredu_runtime::working_memory::OriginalTextControlGuard,
         &safemlx::OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
         &eredu_runtime::working_memory::WorkingMemoryReservation,
     ) -> T,
@@ -992,9 +988,7 @@ fn with_prepared_original_operation_reservation<T>(
         &observer,
         &pool,
         host_destinations,
-        step.request()
-            .memory_reservation()
-            .expect("actual admitted request"),
+        step.request().memory_reservation(),
     );
 
     source.seal();
@@ -1068,7 +1062,7 @@ fn original_gguf_read_failure_outlives_source_role_with_actual_box_and_custody()
     });
     drop(source);
     assert!(failure.cause().store_error().is_some());
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(failure);
     fixture::settle(&pool, 0);
 }
@@ -1112,39 +1106,48 @@ fn original_named_destinations_preserve_cycle_aliases_refusals_and_cross_request
     let stream = runtime.backend().stream().clone();
     runtime.backend().validate_original_stream_owners().unwrap();
     let mut first = OriginalOperationFixture {
-        runtime, artifact, pool: pool.clone(), stream, tokenizer: None, stops: None,
+        runtime,
+        artifact,
+        pool: pool.clone(),
+        stream,
+        tokenizer: None,
+        stops: None,
     };
     // Both loading authorities must retire before A deliberately escapes.
     // A's canonical cells keep their reserved account alive across B; opening
     // a new model-loading authority at that point correctly refuses.
-    let before_second_load = pool.used_bytes().unwrap();
+    let before_second_load = pool.fixture_host_charge().unwrap();
     let (runtime, artifact, second_source_baseline) = environment.load(0, None);
     let final_source_baseline = source_baseline
-        + second_source_baseline.checked_sub(before_second_load).unwrap();
+        + second_source_baseline
+            .checked_sub(before_second_load)
+            .unwrap();
     let stream = runtime.backend().stream().clone();
     runtime.backend().validate_original_stream_owners().unwrap();
     let mut second = OriginalOperationFixture {
-        runtime, artifact, pool: pool.clone(), stream, tokenizer: None, stops: None,
+        runtime,
+        artifact,
+        pool: pool.clone(),
+        stream,
+        tokenizer: None,
+        stops: None,
     };
     // Prime the genuine managed source before this component creates ordinary
     // numerical references. These extra named tables exercise the mechanism;
     // they are not a model quote-fit claim.
     let mut tables = crate::backend::runtime::residency::manager::NamedArraysFixture::new();
-    let old = with_prepared_original_operation_controls(
-        None, &mut first, |controls, _, _, bank| {
+    let old =
+        with_prepared_original_operation_controls(None, &mut first, |controls, _, _, bank| {
             assert!(bank.is_none());
             tables.first_request(controls)
-        },
-    );
+        });
     first.finish();
-    assert!(pool.used_bytes().unwrap() > source_baseline);
+    assert!(pool.fixture_host_charge().unwrap() > source_baseline);
     let collected = old.collect_plain_before_canonical();
-    with_prepared_original_operation_controls(
-        None, &mut second, |controls, _, _, bank| {
-            assert!(bank.is_none());
-            tables.second_request(old, collected, controls, pool);
-        },
-    );
+    with_prepared_original_operation_controls(None, &mut second, |controls, _, _, bank| {
+        assert!(bank.is_none());
+        tables.second_request(old, collected, controls, pool);
+    });
     second.finish();
     drop(tables);
     fixture::settle(pool, final_source_baseline);
@@ -1155,7 +1158,7 @@ fn original_lease_return_moves_prepared_ids_on_miss_and_warm_and_keeps_request_c
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let mut first_fixture = OriginalOperationFixture::prepare(true);
     let mut second_fixture = OriginalOperationFixture::prepare(true);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let baseline_unquoted = pool.unquoted_owner_count().unwrap();
     let leases = crate::backend::runtime::residency::manager::LeaseReturnFixture::new(&pool);
     let (first, old_pool) = with_prepared_original_operation_controls(
@@ -1182,8 +1185,8 @@ fn original_lease_return_moves_prepared_ids_on_miss_and_warm_and_keeps_request_c
     // Its arrays still own the first request's physical cells, while its own
     // final Vec/IDs/deferred node keep the second request's custody.
     drop(leases);
-    assert!(old_pool.same_domain(&current_pool));
-    assert!(current_pool.used_bytes().unwrap() > baseline);
+    assert!(old_pool.same_ledger(&current_pool));
+    assert!(current_pool.fixture_host_charge().unwrap() > baseline);
     assert_eq!(current.leases().len(), 2);
     assert_eq!(
         current.leases()[0]
@@ -1197,7 +1200,7 @@ fn original_lease_return_moves_prepared_ids_on_miss_and_warm_and_keeps_request_c
     drop(current);
     crate::backend::submission_recovery::wait_for_retirement(|| {
         disk::reclaim();
-        pool.used_bytes().unwrap() == baseline
+        pool.fixture_host_charge().unwrap() == baseline
             && pool.unquoted_owner_count().unwrap() == baseline_unquoted
     });
     first_fixture.finish();
@@ -1210,7 +1213,7 @@ fn original_resident_cached_decode_preserves_selected_model_scope_and_nonzero_st
     let mut reference = None;
     for original in [false, true] {
         for controlled in [false, true] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
             let trace = Trace::new();
             let input = vec![2, 5, 7, 3, 11];
@@ -1304,7 +1307,7 @@ fn original_model_projection_refuses_foreign_authority_and_retains_outer_scope_a
         }
     }
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let native = runtime
         .session()
@@ -1359,9 +1362,11 @@ fn original_model_projection_refuses_foreign_authority_and_retains_outer_scope_a
     let observer = safemlx::OriginalScopeObserver::require_current().unwrap();
     assert!(prediction::owns_observer(&recovery, &observer));
     let foreign_execution = eredu_runtime::working_memory::InferenceExecutionIdentity::default();
-    let foreign =
-        InferenceRequest::without_memory_budget(&foreign_execution, step.request().geometry())
-            .unwrap();
+    let foreign = crate::memory_fixture::empty_admitted_request(
+        &foreign_execution,
+        step.request().geometry(),
+    )
+    .unwrap();
     assert!(view.validate_execution(&foreign_execution).is_err());
     assert!(view.begin(&foreign).is_err());
     {
@@ -1410,16 +1415,16 @@ fn speculative_capture_pair_keeps_actual_source_custody_after_request_in_both_dr
             });
         // Both aliases outlive the genuine Source role, bank and request.
         // This checks error custody only, not an additional source admission.
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         if control_first {
             drop(control);
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.fixture_host_charge().unwrap() > 0);
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             drop(execution);
         } else {
             drop(execution);
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.fixture_host_charge().unwrap() > 0);
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             drop(control);
         }
@@ -1441,7 +1446,7 @@ fn original_speculative_completion_keeps_nonzero_duplicate_roots_and_exact_itera
     for input in &inputs {
         input.evaluated().unwrap();
     }
-    with_original_operation_controls(|controls, observer| {
+    with_registered_original_operation_controls(|controls, observer, _pool| {
         crate::backend::nn::shared::PreparedNeuralSubmission::exercise_exact_root_iterator(
             controls, observer, &inputs[0], &stream,
         );
@@ -1466,13 +1471,13 @@ fn original_speculative_busy_pair_retains_actual_custody_in_both_final_drop_orde
             pool.clone(),
         )
     });
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     let [(execution_a, control_a), (execution_b, control_b)] = pairs;
     drop(control_a);
     drop(execution_b);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(execution_a);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(control_b);
     fixture::settle(&pool, 0);
     drop(root);
@@ -1499,7 +1504,7 @@ fn original_speculative_snapshot_publication_keeps_old_busy_and_three_snapshot_k
             pool.clone(),
         )
     });
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(errors);
     fixture::settle(&pool, 0);
     drop(root);
@@ -1537,8 +1542,8 @@ fn original_speculative_foreign_role_refusal_keeps_both_actual_custodies() {
         )
     });
     drop(foreign);
-    assert!(pool.used_bytes().unwrap() > 0);
-    assert!(foreign_pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
+    assert!(foreign_pool.fixture_host_charge().unwrap() > 0);
     drop(error);
     fixture::settle(&pool, 0);
     fixture::settle(&foreign_pool, 0);
@@ -1554,10 +1559,10 @@ fn original_speculative_terminal_source_keeps_first_offending_cause_after_reques
             pool.clone(),
         )
     });
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     let [first, later] = errors;
     drop(first);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(later);
     fixture::settle(&pool, 0);
 }
@@ -1575,7 +1580,7 @@ fn original_speculative_deadline_overflow_quarantines_active_owner_and_retains_e
             pool.clone(),
         )
     });
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(error);
     fixture::settle(&pool, 0);
     drop(root);
@@ -1609,7 +1614,7 @@ fn original_speculative_exact_native_root_reserve_failure_retains_source_after_r
             pool.clone(),
         )
     });
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert_eq!(
         root.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
         &[19.0]
@@ -1628,7 +1633,7 @@ fn original_neural_clone_preparation_error_keeps_cause_and_custody_after_request
     };
     #[derive(Debug)]
     struct Source {
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         dropped: Arc<AtomicBool>,
         funded_on_drop: Arc<AtomicBool>,
     }
@@ -1641,8 +1646,10 @@ fn original_neural_clone_preparation_error_keeps_cause_and_custody_after_request
     impl Drop for Source {
         fn drop(&mut self) {
             // The final native source child still sees its original admission.
-            self.funded_on_drop
-                .store(self.pool.used_bytes().unwrap() > 0, Ordering::SeqCst);
+            self.funded_on_drop.store(
+                self.pool.fixture_host_charge().unwrap() > 0,
+                Ordering::SeqCst,
+            );
             self.dropped.store(true, Ordering::SeqCst);
         }
     }
@@ -1663,7 +1670,7 @@ fn original_neural_clone_preparation_error_keeps_cause_and_custody_after_request
     // destroy that queue before testing that only the escaping source keeps Q.
     assert!(safemlx::can_reclaim_submission_resources());
     crate::backend::ordinary_retirement::reclaim_all();
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert!(!dropped.load(Ordering::SeqCst));
     // Public neutral conversion must keep the same original Exception and text.
     let error = error.into_backend_failure();
@@ -1674,7 +1681,7 @@ fn original_neural_clone_preparation_error_keeps_cause_and_custody_after_request
         .unwrap();
     assert_eq!(cause.what(), "retained cold native clone cause");
     assert_eq!(cause.what().as_ptr() as usize, message);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(error);
     assert!(dropped.load(Ordering::SeqCst));
     assert!(funded_on_drop.load(Ordering::SeqCst));
@@ -1695,7 +1702,7 @@ fn original_source_acquisition_exhaustion_preserves_typed_cause_without_new_cust
     assert!(safemlx::can_reclaim_submission_resources());
     crate::backend::ordinary_retirement::reclaim_all();
     fixture::settle(&pool, 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     let cause = std::error::Error::source(&error)
         .unwrap()
         .downcast_ref::<PreparedAcquisitionRefusal>()
@@ -1713,7 +1720,7 @@ fn original_gguf_host_copy_busy_preserves_typed_source_after_role() {
         (gguf.host_copy_busy(controls, observer), pool.clone())
     });
     drop(gguf);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert!(matches!(
         error.cause(),
         crate::backend::runtime::checkpoint::store::GgufHostCopyCause::Copy {
@@ -1742,7 +1749,7 @@ fn original_gguf_host_copy_foreign_owner_failure_retains_both_final_drop_orders(
             });
         drop(gguf);
         if !error_first {
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.fixture_host_charge().unwrap() > 0);
         }
         drop(error);
         fixture::settle(&pool, 0);
@@ -1768,7 +1775,7 @@ fn original_gguf_host_copy_affine_prefix_failure_keeps_actual_failed_input() {
     });
     drop(gguf);
     assert_eq!(error.output_ordinal(), 1);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(error);
     fixture::settle(&pool, 0);
     drop(foreign);
@@ -1786,7 +1793,7 @@ fn original_gguf_immutable_cached_alias_outlives_role_and_retires_on_other_threa
         )
     });
     drop(gguf);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert_eq!(
         array.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
         &[1.5, -2.5, 3.5, 4.5, -5.5, 6.5, 7.5, -8.5]
@@ -1816,7 +1823,7 @@ fn original_gguf_typed_transform_refusals_retain_actual_input_and_source_in_both
                 });
             drop(fixture);
             if let Some(error) = error {
-                assert!(pool.used_bytes().unwrap() > 0);
+                assert!(pool.fixture_host_charge().unwrap() > 0);
                 if wrong_binding {
                     assert!(matches!(error.cause(), GgufHostCopyCause::TypedBinding));
                 } else {
@@ -1858,10 +1865,10 @@ fn original_gguf_admitted_g1_and_typed_refusals_retain_same_source_and_accepted_
                 )
             },
         );
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         drop(error);
         fixture::settle(&pool, 0);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
 
@@ -1885,7 +1892,7 @@ fn original_gguf_admitted_exact_miss_retains_output_and_warm_hit_spends_no_desti
             )
         },
     );
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(output);
     fixture::settle(&pool, 0);
     let warm = OriginalGgufMissFixture::new();
@@ -1924,10 +1931,10 @@ fn original_gguf_admitted_g2_g3_prefix_refusals_keep_same_source_and_release_exa
                 )
             },
         );
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         drop(error);
         fixture::settle(&pool, 0);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
 
@@ -1981,7 +1988,7 @@ fn original_gguf_funded_source_arenas_charge_actual_misses_and_keep_escaped_alia
             },
         );
         drop(gguf);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         std::thread::spawn(move || drop(array)).join().unwrap();
         safemlx::reclaim_allocation_owners();
         fixture::settle(&pool, 0);
@@ -2018,7 +2025,7 @@ fn original_gguf_funded_source_refuses_dense_one_short_and_affine_second_arena()
             },
         );
         drop(gguf);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         drop(error);
         fixture::settle(&pool, 0);
     }
@@ -2042,7 +2049,7 @@ fn original_gguf_source_bank_refuses_foreign_request_before_pending_construction
     let bank = with_original_operation_controls(|controls, _| {
         gguf.reject_foreign_source_bank(controls, bank)
     });
-    assert!(origin_pool.used_bytes().unwrap() > 0);
+    assert!(origin_pool.fixture_host_charge().unwrap() > 0);
     drop(bank);
     fixture::settle(&origin_pool, 0);
 }
@@ -2134,19 +2141,28 @@ fn inactive_parallel_slot_retires_only_its_alias_and_preserves_escaped_original_
     let stream = runtime.backend().stream().clone();
     runtime.backend().validate_original_stream_owners().unwrap();
     let mut prepared = OriginalOperationFixture {
-        runtime, artifact, pool: pool.clone(), stream, tokenizer: None, stops: None,
+        runtime,
+        artifact,
+        pool: pool.clone(),
+        stream,
+        tokenizer: None,
+        stops: None,
     };
-    let raw = with_prepared_original_operation_controls(
-        None, &mut prepared, |controls, _, _, bank| {
+    let raw =
+        with_prepared_original_operation_controls(None, &mut prepared, |controls, _, _, bank| {
             assert!(bank.is_none());
             controls.metadata_custody()
-        },
-    );
+        });
     prepared.finish();
-    assert!(pool.used_bytes().unwrap() > source_baseline, "actual accepted span remains held");
+    assert!(
+        pool.fixture_host_charge().unwrap() > source_baseline,
+        "actual accepted span remains held"
+    );
     let escaped = OriginalParallelControlProjection::exercise_inactive_retirement(raw);
-    assert!(pool.used_bytes().unwrap() > source_baseline,
-        "removing the closed installed slot cannot release its escaped alias");
+    assert!(
+        pool.fixture_host_charge().unwrap() > source_baseline,
+        "removing the closed installed slot cannot release its escaped alias"
+    );
     drop(escaped);
     fixture::settle(pool, source_baseline);
 }

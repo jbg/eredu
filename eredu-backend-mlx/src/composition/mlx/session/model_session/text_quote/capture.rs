@@ -2,11 +2,10 @@
 #[cfg(test)]
 pub(super) mod funding_probe;
 use super::*;
-mod saved;
 mod interventions;
-mod partition;
+pub(in crate::composition::mlx) mod partition;
+mod saved;
 mod validation;
-pub(in crate::composition::mlx::session::model_session) use partition::OriginalPartitionCaptureFrame;
 use crate::backend::runtime::residency::storage::StorageIdentity;
 use eredu_core::capture::SharedCapturePlan;
 use eredu_runtime::{
@@ -19,12 +18,14 @@ use eredu_runtime::{
         WorkingMemoryFundingScope, WorkingMemoryStorage,
     },
 };
+pub(in crate::composition::mlx::session::model_session) use partition::OriginalPartitionCaptureFrame;
 
 use crate::composition::mlx::replicated_text::{NativeOpeningRowsOwner, SealedOpeningRows};
 
 /// Borrow only the actual immutable sources while evaluating cold candidates.
 pub(in crate::composition::mlx::session::model_session) struct CaptureAdmission<'a> {
     session: &'a MlxModelSession,
+    pub(super) ordinary_publications: std::cell::Cell<usize>,
     checkpoint: Option<&'a eredu_runtime::capture::FundedCaptureCheckpoint>,
     saved_witness: Option<&'a RegisteredInferenceSourceWitness>,
     opening_rows: Option<RefCell<Option<SealedOpeningRows>>>,
@@ -32,7 +33,8 @@ pub(in crate::composition::mlx::session::model_session) struct CaptureAdmission<
     paths: &'a SharedLayeredObservationPaths,
     selection: PreparedCaptureSelection,
     host: CaptureRunHostPlan<'a>,
-    text_interventions: RefCell<Option<crate::composition::mlx::session::intervention::PreparedTextInterventions>>,
+    text_interventions:
+        RefCell<Option<crate::composition::mlx::session::intervention::PreparedTextInterventions>>,
     partition_hosts: RefCell<Option<partition::host::HostAdmission>>,
     partition_evidence: RefCell<Option<partition::host::evidence::Admission>>,
     paths_pin: Option<WorkingMemoryStorage<StorageIdentity>>,
@@ -75,10 +77,18 @@ impl<'a> CaptureAdmission<'a> {
         media: bool,
         metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
     ) -> Result<Self, Error> {
-        metadata.charge(std::mem::size_of::<(
-            Self, Result<Self, Error>, &MlxModelSession, InferenceGeometry,
-            &SharedCapturePlan, bool, PreparedCaptureSelection, CaptureRunHostPlan<'_>,
-        )>()).map_err(|cause| Error::Neural(metadata.error(cause)))?;
+        metadata
+            .charge(std::mem::size_of::<(
+                Self,
+                Result<Self, Error>,
+                &MlxModelSession,
+                InferenceGeometry,
+                &SharedCapturePlan,
+                bool,
+                PreparedCaptureSelection,
+                CaptureRunHostPlan<'_>,
+            )>())
+            .map_err(|cause| Error::Neural(metadata.error(cause)))?;
         validate_semantics(session, source, geometry, metadata)?;
         let paths = session
             .payload
@@ -98,9 +108,10 @@ impl<'a> CaptureAdmission<'a> {
             paths.prepare_media_capture_selection(source)
         } else {
             paths.prepare_capture_selection(source)
-        }.map_err(|error| Error::Neural(validation::source(metadata, error)))?;
-        let host =
-            CaptureRunHostPlan::prepare(source).map_err(|error| Error::Neural(validation::source(metadata, error)))?;
+        }
+        .map_err(|error| Error::Neural(validation::source(metadata, error)))?;
+        let host = CaptureRunHostPlan::prepare(source)
+            .map_err(|error| Error::Neural(validation::source(metadata, error)))?;
         Self::new_selected(session, source, paths, selection, host, None, metadata)
     }
 
@@ -113,20 +124,31 @@ impl<'a> CaptureAdmission<'a> {
         checkpoint: Option<&'a eredu_runtime::capture::FundedCaptureCheckpoint>,
         metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
     ) -> Result<Self, Error> {
-        let pool = &session.payload.memory_pool;
-        let paths_pin = pin_existing(pool,
+        let pool = &session.payload.memory_ledger;
+        let paths_pin = pin_existing(
+            pool,
             StorageIdentity::HostMetadata(paths.identity().registry_key().clone()),
-            paths.capacity_bytes().ok_or_else(unknown)?, metadata)?;
+            paths.capacity_bytes().ok_or_else(unknown)?,
+            metadata,
+        )?;
         let capacity = source.capacity_bytes().ok_or_else(unknown)?;
-        let plan_pin = match pin_existing(pool,
-            StorageIdentity::CapturePlan(source.storage_identity().clone()), capacity, metadata) {
+        let plan_pin = match pin_existing(
+            pool,
+            StorageIdentity::CapturePlan(source.storage_identity().clone()),
+            capacity,
+            metadata,
+        ) {
             Ok(pin) => Some(pin),
-            Err(Error::TextAdmission { cause: WorkingMemoryError::IdentityMismatch, .. }) => None,
+            Err(Error::TextAdmission {
+                cause: WorkingMemoryError::IdentityMismatch,
+                ..
+            }) => None,
             Err(error) => return Err(error),
         };
         let new_source_bytes = if plan_pin.is_some() { 0 } else { capacity };
         Ok(Self {
             session,
+            ordinary_publications: std::cell::Cell::new(0),
             checkpoint,
             saved_witness: None,
             opening_rows: None,
@@ -169,15 +191,20 @@ impl<'a> CaptureAdmission<'a> {
         if !traced.is_prepared_media() || !self.selection.is_prepared_media() {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
-        traced.validate_sources(self.source, self.paths)
+        traced
+            .validate_sources(self.source, self.paths)
             .map_err(|_| memory(WorkingMemoryError::IdentityMismatch))?;
         Ok(())
     }
 
     pub(super) fn physical_output(&self, minimum: OutputDemand) -> OutputDemand {
         let output = self.selection.physical_output(minimum);
-        if self.host.intervention_source().is_some_and(|source|
-            source.plan().admission().requires_sequence_scores(eredu_core::capture::CapturePhase::Prefill, 0)) {
+        if self.host.intervention_source().is_some_and(|source| {
+            source
+                .plan()
+                .admission()
+                .requires_sequence_scores(eredu_core::capture::CapturePhase::Prefill, 0)
+        }) {
             OutputDemand::Sequence
         } else {
             output
@@ -214,10 +241,15 @@ impl<'a> CaptureAdmission<'a> {
             })
             .and_then(|n| n.checked_add(std::mem::size_of::<PromotedCaptureAdmission<'_>>()))
             .and_then(|n| n.checked_mul(3))
-            .and_then(|n| n.checked_add(std::mem::size_of::<(
-                [&MlxModelSession; 2], [InferenceGeometry; 2],
-                [&SharedCapturePlan; 2], bool, Result<Self, Error>,
-            )>()))
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<(
+                    [&MlxModelSession; 2],
+                    [InferenceGeometry; 2],
+                    [&SharedCapturePlan; 2],
+                    bool,
+                    Result<Self, Error>,
+                )>())
+            })
             .and_then(|n| u64::try_from(n).ok())
             .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
         fixed
@@ -237,14 +269,17 @@ impl<'a> CaptureAdmission<'a> {
     pub(super) fn intervention_quote(
         &self,
     ) -> Option<crate::composition::mlx::session::intervention::TextInterventionQuote<'_>> {
-        self.host.intervention_source().map(|source|
+        self.host.intervention_source().map(|source| {
             crate::composition::mlx::session::intervention::TextInterventionQuote {
-                source, rows: &self.text_interventions,
-            })
+                source,
+                rows: &self.text_interventions,
+            }
+        })
     }
 
     pub(in crate::composition::mlx::session::model_session) fn validate_intervention_source(
-        &self, actual: Option<&eredu_runtime::working_memory::OriginalInterventionSource>,
+        &self,
+        actual: Option<&eredu_runtime::working_memory::OriginalInterventionSource>,
     ) -> Result<(), Error> {
         match (actual, self.host.intervention_source()) {
             (None, None) => Ok(()),
@@ -284,29 +319,59 @@ impl<'a> CaptureAdmission<'a> {
         metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
     ) -> Result<(), Error> {
         let partition_hosts = match metadata.funding() {
-            Some(funding) => partition::host::HostAdmission::prepare(self.session,self.source,
-                workspace.geometry,self.checkpoint.map_or(0,|checkpoint|checkpoint.next_prediction()),&funding)?,
+            Some(funding) => partition::host::HostAdmission::prepare(
+                self.session,
+                self.source,
+                workspace.geometry,
+                self.checkpoint
+                    .map_or(0, |checkpoint| checkpoint.next_prediction()),
+                &funding,
+            )?,
             None => None,
         };
-        let partition_evidence=match metadata.funding() {
-            Some(funding)=>partition::host::evidence::Admission::prepare(self.session,self.source,
-                self.host.intervention_source(),&self.selection,workspace.geometry,
-                self.checkpoint.map_or(0,|checkpoint|checkpoint.next_prediction()),&funding)?,
-            None=>None,
+        let partition_evidence = match metadata.funding() {
+            Some(funding) => partition::host::evidence::Admission::prepare(
+                self.session,
+                self.source,
+                self.host.intervention_source(),
+                &self.selection,
+                workspace.geometry,
+                self.checkpoint
+                    .map_or(0, |checkpoint| checkpoint.next_prediction()),
+                &funding,
+            )?,
+            None => None,
         };
-        let extra = self.host.initialization_peak_bytes()
-            .checked_add(partition_hosts.as_ref().map_or(0,|hosts|hosts.bytes()))
-            .and_then(|bytes|bytes.checked_add(partition_evidence.as_ref().map_or(0,|hosts|hosts.bytes())))
-            .ok_or_else(||memory(WorkingMemoryError::Overflow))?;
+        let extra = self
+            .host
+            .initialization_peak_bytes()
+            .checked_add(partition_hosts.as_ref().map_or(0, |hosts| hosts.bytes()))
+            .and_then(|bytes| {
+                bytes.checked_add(partition_evidence.as_ref().map_or(0, |hosts| hosts.bytes()))
+            })
+            .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
+        let ordinary = if self.ordinary_publications.get() == 0 {
+            0
+        } else {
+            super::super::text_funding::ordinary_capture_publication_control_bytes()?
+                .checked_mul(
+                    u64::try_from(self.ordinary_publications.get())
+                        .map_err(|_| memory(WorkingMemoryError::Overflow))?,
+                )
+                .ok_or_else(|| memory(WorkingMemoryError::Overflow))?
+        };
+        let extra = extra
+            .checked_add(ordinary)
+            .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
         self.partition_hosts.replace(partition_hosts);
         self.partition_evidence.replace(partition_evidence);
-        if let WorkspaceBound::Bounded { bytes, assumptions } = &mut workspace.retained {
-            *bytes = bytes
-                .checked_add(extra)
-                .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-            metadata.append(assumptions, "; cumulative capture host bank once; the accepted span seal separately adds exact new C and original P+Q+publication-slot custody for measured controls; native capture transforms remain in the equation spans")
-                .map_err(|cause| Error::Neural(metadata.error(cause)))?;
-        }
+        super::observed::add_retained_host(
+            workspace,
+            &self.session.payload.memory_ledger,
+            extra,
+            "cumulative capture host bank once; the accepted span seal separately adds exact new C and original P+Q+publication-slot custody for measured controls; native capture transforms remain in the equation spans",
+            metadata,
+        )?;
         Ok(())
     }
 
@@ -318,7 +383,8 @@ impl<'a> CaptureAdmission<'a> {
         Ok(TextHostControlFacts::new(
             Some(Self::control_peak_bytes()?),
             Some(super::super::text_funding::capture_carrier_control_bytes(
-                self.source, self.host.intervention_source(),
+                self.source,
+                self.host.intervention_source(),
             )?),
             Some(super::super::text_funding::text_work_control_bytes(
                 geometry.max_output_tokens,
@@ -505,7 +571,7 @@ impl<'a> CaptureAdmission<'a> {
             .model
             .erased()
             .validate_prepared_observation_paths(self.paths, self.metadata())?;
-        if !accepted.pool().same_domain(&session.payload.memory_pool)
+        if !accepted.pool().same_ledger(&session.payload.memory_ledger)
             || geometry != request.geometry()
         {
             return Err(memory(WorkingMemoryError::IdentityMismatch).into());
@@ -516,7 +582,7 @@ impl<'a> CaptureAdmission<'a> {
         let pending = accepted
             .begin_capture_plan_publication::<StorageIdentity>(
                 funding,
-                request.memory_reservation().ok_or_else(unknown)?,
+                request.memory_reservation(),
                 self.source,
             )
             .map_err(|error| AdmissionFailure::retained(error, sequence))?;
@@ -572,17 +638,22 @@ impl<'a> CaptureAdmission<'a> {
             })
             .transpose()?;
         let controls = promoted.span.control_guard();
-        let partition_hosts=promoted.admission.partition_hosts.borrow_mut().take()
-            .map(|hosts|hosts.protect(funding,request.memory_reservation().ok_or_else(unknown)?))
+        let partition_hosts = promoted
+            .admission
+            .partition_hosts
+            .borrow_mut()
+            .take()
+            .map(|hosts| hosts.protect(funding, request.memory_reservation()))
             .transpose()?;
-        let partition_evidence=promoted.admission.partition_evidence.borrow_mut().take()
-            .map(|hosts|hosts.protect(funding,request.memory_reservation().ok_or_else(unknown)?))
+        let partition_evidence = promoted
+            .admission
+            .partition_evidence
+            .borrow_mut()
+            .take()
+            .map(|hosts| hosts.protect(funding, request.memory_reservation()))
             .transpose()?;
         let bank = funding
-            .prepare_capture_run(
-                request.memory_reservation().ok_or_else(unknown)?,
-                promoted.admission.host,
-            )
+            .prepare_capture_run(request.memory_reservation(), promoted.admission.host)
             .map_err(|error| Error::Neural(validation::source(metadata, error)))?;
         #[cfg(test)]
         funding_probe::record(promoted.admission.source, &promoted.span, &bank);
@@ -638,7 +709,8 @@ pub(super) struct CaptureQuotation {
     // Last, including after the installer removes pending: the historical
     // fixed quote object is still an actual Q-owned control payload.
     rows: Option<NativeOpeningRowsOwner>,
-    text_interventions: Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>,
+    text_interventions:
+        Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>,
     controls: OriginalTextControlGuard,
     metadata_funding: Option<eredu_core::HostMetadataFunding>,
 }
@@ -650,8 +722,10 @@ impl CaptureQuotation {
             eredu_runtime::working_memory::WorkspaceReportMetadata::with_funding,
         )
     }
-    pub(super) fn text_interventions(&self)
-        -> Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner> {
+    pub(super) fn text_interventions(
+        &self,
+    ) -> Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>
+    {
         self.text_interventions.clone()
     }
 
@@ -907,7 +981,7 @@ impl CaptureQuotation {
             .ok_or_else(|| memory(WorkingMemoryError::PreparationAlreadyStarted))?;
         current
             .witness
-            .validate(&session.payload.memory_pool)
+            .validate(&session.payload.memory_ledger)
             .map_err(memory)?;
         if !current.bank.source().same_storage(source)
             || current.span.workspace().plan().geometry() != geometry
@@ -960,17 +1034,28 @@ fn validate_current_admission(
     metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
 ) -> Result<(), Error> {
     if let Some(transport) = &session.payload.distributed {
-        let loaded = session.partition_capture_source()
-            .ok_or_else(unknown)?;
+        let loaded = session.partition_capture_source().ok_or_else(unknown)?;
         let (_, execution, setup) = loaded.source_labels();
-        let blueprint = session.payload.model.inference_blueprint().ok_or_else(unknown)?;
+        let blueprint = session
+            .payload
+            .model
+            .inference_blueprint()
+            .ok_or_else(unknown)?;
         if setup != transport.session_identity() || execution != blueprint.execution_identity() {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
-        validation::validate_parts(admission, &loaded.discovery.catalog, &loaded.discovery.support, metadata)
-            .map_err(Error::Neural)
+        validation::validate_parts(
+            admission,
+            &loaded.discovery.catalog,
+            &loaded.discovery.support,
+            metadata,
+        )
+        .map_err(Error::Neural)
     } else {
-        let (catalog, support) = session.capture_discovery.as_ref().ok_or_else(unknown)?
+        let (catalog, support) = session
+            .capture_discovery
+            .as_ref()
+            .ok_or_else(unknown)?
             .capture_parts();
         validation::validate_parts(admission, catalog, support, metadata).map_err(Error::Neural)
     }
@@ -987,16 +1072,19 @@ mod tests;
 // One known existing source uses the same counted pin worker in both profiles.
 // The enclosing admission/quotation retains its actual metadata account.
 fn pin_existing(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     key: StorageIdentity,
     bytes: u64,
     metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
 ) -> Result<WorkingMemoryStorage<StorageIdentity>, Error> {
     let layout = eredu_runtime::working_memory::ExistingStoragePinLayout::new(1).map_err(memory)?;
-    metadata.charge(layout.requested_bytes()).map_err(|cause| Error::Neural(metadata.error(cause)))?;
+    metadata
+        .charge(layout.requested_bytes())
+        .map_err(|cause| Error::Neural(metadata.error(cause)))?;
     let funding = metadata.funding();
     let mut input = eredu_core::capture::CaptureSourceConstruction::new(funding.as_ref())
-        .vector(1).map_err(|cause| Error::Neural(validation::source(metadata, cause)))?;
+        .vector(1)
+        .map_err(|cause| Error::Neural(validation::source(metadata, cause)))?;
     input.push((key, bytes));
     layout.construct(pool, input).map_err(memory)
 }

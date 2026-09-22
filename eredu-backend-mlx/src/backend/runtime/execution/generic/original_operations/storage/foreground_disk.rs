@@ -1,17 +1,26 @@
 //! Request population for the actual foreground disk read constructors.
 use super::*;
 use crate::backend::runtime::residency::manager::{
-    ForegroundDiskPopulation, ForegroundDiskSourceCapacity, ForegroundDiskWindowPlan,
+    ForegroundDiskDescriptors, ForegroundDiskPopulation, ForegroundDiskSourceCapacity,
+    ForegroundDiskWindowPlan,
 };
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::mem::size_of_val;
 mod background;
-pub(in crate::backend::runtime::execution::generic::original_operations) use background::BackgroundSelection;
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+mod tests;
 use background::BackgroundRequestPlan;
+pub(in crate::backend::runtime::execution::generic::original_operations) use background::BackgroundSelection;
 
 pub(crate) struct ForegroundDiskRequestPlan {
     windows: Vec<ForegroundDiskWindowPlan>,
-    pool: WorkingMemoryPool,
+    source: ForegroundDiskDescriptors,
+    pool: MemoryLedger,
     forwards: usize,
     temporary_bytes: usize,
     nested_source_peak: Option<usize>,
@@ -20,7 +29,7 @@ pub(crate) struct ForegroundDiskRequestPlan {
 impl ForegroundDiskRequestPlan {
     pub(crate) fn new(
         manager: &ResidencyManager,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         windows: &[crate::backend::runtime::residency::manager::WindowPopulation],
         ids: &[OffloadUnitId],
         population: ResidencyPopulation,
@@ -29,7 +38,7 @@ impl ForegroundDiskRequestPlan {
     }
     pub(in crate::backend::runtime::execution::generic) fn new_with_metadata(
         manager: &ResidencyManager,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         windows: &[crate::backend::runtime::residency::manager::WindowPopulation],
         ids: &[OffloadUnitId],
         population: ResidencyPopulation,
@@ -89,6 +98,10 @@ impl ForegroundDiskRequestPlan {
                 .size();
         let value = Self {
             windows: out,
+            source: manager
+                .original_foreground_disk_descriptors()
+                .ok_or_else(identity)?
+                .clone(),
             pool: pool.clone(),
             forwards: population.forwards,
             temporary_bytes,
@@ -99,23 +112,64 @@ impl ForegroundDiskRequestPlan {
         value.population().ok_or_else(overflow)?;
         Ok(value)
     }
-    pub(crate) fn with_background(mut self, selection: Option<&BackgroundSelection>, manager: &ResidencyManager, ids: &[OffloadUnitId], device_sources: &[crate::backend::runtime::residency::manager::WindowPopulation], funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Result<Self, Error> {
+    pub(crate) fn with_background(
+        mut self,
+        selection: Option<&BackgroundSelection>,
+        manager: &ResidencyManager,
+        ids: &[OffloadUnitId],
+        device_sources: &[crate::backend::runtime::residency::manager::WindowPopulation],
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Result<Self, Error> {
         if let Some(selection) = selection {
-            self.background = Some(BackgroundRequestPlan::new(selection, manager, &self.pool, ids, &self.windows, device_sources, self.forwards, funding.ok_or_else(unknown)?)?);
+            self.background = Some(BackgroundRequestPlan::new(
+                selection,
+                manager,
+                &self.pool,
+                ids,
+                &self.windows,
+                device_sources,
+                self.forwards,
+                funding.ok_or_else(unknown)?,
+            )?);
         }
         Ok(self)
     }
-    pub(crate) fn background(&self) -> Option<&BackgroundRequestPlan> { self.background.as_ref() }
-    pub(in crate::backend::runtime::execution::generic::original_operations) fn select_background_execution_ordinals(&mut self, ordinals: &[usize]) -> Result<(), Error> {
-        self.background.as_mut().ok_or_else(identity)?.select_execution_ordinals(ordinals)
+    pub(crate) fn background(&self) -> Option<&BackgroundRequestPlan> {
+        self.background.as_ref()
+    }
+    pub(in crate::backend::runtime::execution::generic::original_operations) fn select_background_execution_ordinals(
+        &mut self,
+        ordinals: &[usize],
+    ) -> Result<(), Error> {
+        self.background
+            .as_mut()
+            .ok_or_else(identity)?
+            .select_execution_ordinals(ordinals)
+    }
+    pub(in crate::backend::runtime::execution::generic::original_operations) fn select_background_execution_recipe(
+        &mut self,
+        recipe: &crate::backend::nn::workspace::ResidentNativeRecipe,
+    ) -> Result<(), Error> {
+        self.background
+            .as_mut()
+            .ok_or_else(identity)?
+            .select_execution_recipe(recipe)
     }
     /// Only live operation destinations; the borrowed cold declaration has
     /// already been paid by its retained source quote.
     pub(crate) fn operation_control_bytes(&self) -> Option<u64> {
         if let Some(background) = &self.background {
-            return (0..self.windows.len()).try_fold(u64::try_from(ForegroundDiskSourceCapacity::control_bytes()?).ok()?, |sum, ordinal| {
-                sum.checked_add(background.direct(ordinal)?.attempt_control_bytes()?.checked_mul(u64::try_from(self.forwards).ok()?)?)
-            });
+            return (0..self.windows.len()).try_fold(
+                u64::try_from(ForegroundDiskSourceCapacity::control_bytes()?).ok()?,
+                |sum, ordinal| {
+                    sum.checked_add(
+                        background
+                            .direct(ordinal)?
+                            .attempt_control_bytes()?
+                            .checked_mul(u64::try_from(self.forwards).ok()?)?,
+                    )
+                },
+            );
         }
         self.windows.iter().try_fold(
             u64::try_from(ForegroundDiskSourceCapacity::control_bytes()?).ok()?,
@@ -136,10 +190,18 @@ impl ForegroundDiskRequestPlan {
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Result<Self, Error>>(),
-            size_of::<WorkingMemoryPool>(),
+            size_of::<MemoryLedger>(),
             size_of::<Vec<ForegroundDiskWindowPlan>>(),
             size_of::<Vec<eredu_runtime::residency::ResidencyClosureSlot>>(),
             size_of::<ForegroundDiskPopulation>(),
+            size_of::<(
+                eredu_runtime::working_memory::HostSourceConstructionFacts,
+                Result<eredu_runtime::working_memory::HostSourceConstructionFacts, Error>,
+            )>(),
+            size_of::<(
+                eredu_runtime::working_memory::HostDestinationFacts,
+                Result<eredu_runtime::working_memory::HostDestinationFacts, Error>,
+            )>(),
             size_of::<Result<(), Error>>(),
         ];
         let bytes = fixed.into_iter().try_fold(
@@ -160,9 +222,12 @@ impl ForegroundDiskRequestPlan {
                     Some(background) => background.direct(ordinal)?,
                     None => window,
                 };
-                sum.checked_add(window.retained_control_bytes()?)?.checked_add(
-                    reads.attempt_control_bytes()?.checked_mul(u64::try_from(self.forwards).ok()?)?,
-                )
+                sum.checked_add(window.retained_control_bytes()?)?
+                    .checked_add(
+                        reads
+                            .attempt_control_bytes()?
+                            .checked_mul(u64::try_from(self.forwards).ok()?)?,
+                    )
             },
         )
     }
@@ -177,7 +242,9 @@ impl ForegroundDiskRequestPlan {
         if self.forwards == 0 {
             return Some(0);
         }
-        if let Some(background) = &self.background { return background.backing_capacity(); }
+        if let Some(background) = &self.background {
+            return background.backing_capacity();
+        }
         if let Some(peak) = self.nested_source_peak {
             return Some(peak);
         }
@@ -188,38 +255,75 @@ impl ForegroundDiskRequestPlan {
     pub(crate) fn source_facts(
         &self,
     ) -> Option<eredu_runtime::working_memory::HostSourceConstructionFacts> {
-        if let Some(background) = &self.background {
-            let population = background.population()?.checked_mul(self.forwards)?;
-            let bytes = background.source_control_bytes()?.checked_mul(u64::try_from(self.forwards).ok()?)?;
-            let selection = background.peak_selection(u64::try_from(self.source_backing_capacity()?).ok()?);
-            return eredu_runtime::working_memory::HostSourceConstructionFacts::new(bytes, population.outputs, population.attempts).ok()?.with_peak_backing(selection).ok();
-        }
-        let population = self.population()?;
-        let bytes = self
-            .windows
-            .iter()
-            .try_fold(0u64, |sum, window| {
-                sum.checked_add(window.source_control_bytes()?)
-            })?
-            .checked_mul(u64::try_from(self.forwards).ok()?)?;
-        let selection = self
-            .windows
-            .first()?
-            .peak_selection(u64::try_from(self.source_backing_capacity()?).ok()?);
+        self.checked_source_facts().ok()
+    }
+    pub(crate) fn checked_source_facts(
+        &self,
+    ) -> Result<eredu_runtime::working_memory::HostSourceConstructionFacts, Error> {
+        let overflow = |stage| Error::OriginalSourceContract {
+            stage,
+            cause: WorkingMemoryError::Overflow,
+        };
+        let forwards =
+            u64::try_from(self.forwards).map_err(|_| overflow("foreground disk forward count"))?;
+        let (population, bytes, selection) = if let Some(background) = &self.background {
+            let population = background
+                .population()
+                .and_then(|population| population.checked_mul(self.forwards))
+                .ok_or_else(|| overflow("background disk source population"))?;
+            let bytes = background
+                .source_control_bytes()
+                .and_then(|bytes| bytes.checked_mul(forwards))
+                .ok_or_else(|| overflow("background disk source controls"))?;
+            let backing = self
+                .source_backing_capacity()
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| overflow("background disk source backing"))?;
+            (population, bytes, background.peak_selection(backing))
+        } else {
+            let population = self
+                .population()
+                .ok_or_else(|| overflow("foreground disk source population"))?;
+            let bytes = self
+                .windows
+                .iter()
+                .try_fold(0u64, |sum, window| {
+                    sum.checked_add(window.source_control_bytes()?)
+                })
+                .and_then(|bytes| bytes.checked_mul(forwards))
+                .ok_or_else(|| overflow("foreground disk source controls"))?;
+            // Source identity survives an empty acquisition schedule without
+            // granting any output construction or physical backing.
+            let backing = self
+                .source_backing_capacity()
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| overflow("foreground disk source backing"))?;
+            (population, bytes, self.source.peak_selection(backing))
+        };
         eredu_runtime::working_memory::HostSourceConstructionFacts::new(
             bytes,
-            population.outputs,
+            population.sources,
             population.attempts,
         )
-        .ok()?
-        .with_peak_backing(selection)
-        .ok()
+        .and_then(|facts| facts.with_peak_backing(selection))
+        .map_err(|cause| Error::OriginalSourceContract {
+            stage: "foreground disk source bank controls",
+            cause,
+        })
     }
     pub(crate) fn host_facts(&self) -> Option<eredu_runtime::working_memory::HostDestinationFacts> {
+        self.checked_host_facts().ok()
+    }
+    pub(crate) fn checked_host_facts(
+        &self,
+    ) -> Result<eredu_runtime::working_memory::HostDestinationFacts, Error> {
+        let source = self.checked_source_facts()?;
         eredu_runtime::working_memory::HostDestinationFacts::new(0, 0)
-            .ok()?
-            .with_source_constructions(self.source_facts()?)
-            .ok()
+            .and_then(|facts| facts.with_source_constructions(source))
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "foreground disk host destination controls",
+                cause,
+            })
     }
     pub(crate) fn prepare_capacity(
         &self,
@@ -229,13 +333,19 @@ impl ForegroundDiskRequestPlan {
     ) -> Result<ForegroundDiskSourceCapacity, Error> {
         if !custody
             .metadata_custody()
-            .matches_domain(self.pool.shared_storage_domain())
+            .matches_accounting_owner(self.pool.shared_storage_accounting_id())
         {
-            return Err(identity());
+            return Err(Error::OriginalSourceContract {
+                stage: "foreground disk source accounting owner",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         if !bank.belongs_to(&custody) || !bank.matches_facts(self.host_facts().ok_or_else(unknown)?)
         {
-            return Err(identity());
+            return Err(Error::OriginalSourceContract {
+                stage: "foreground disk destination source bank",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         self.prepare_source_capacity(
             custody.into(),
@@ -249,16 +359,27 @@ impl ForegroundDiskRequestPlan {
         reservation: Option<&eredu_runtime::working_memory::WorkingMemoryReservation>,
         bank: eredu_runtime::working_memory::OriginalHostSourceBank,
     ) -> Result<ForegroundDiskSourceCapacity, Error> {
-        if !custody.metadata_custody().matches_domain(self.pool.shared_storage_domain())
+        if !custody
+            .metadata_custody()
+            .matches_accounting_owner(self.pool.shared_storage_accounting_id())
             || !bank.belongs_to_source(&custody)
-            || !bank.matches_facts(self.source_facts().ok_or_else(unknown)?) {
-            return Err(identity());
+            || !bank.matches_facts(self.source_facts().ok_or_else(unknown)?)
+        {
+            return Err(Error::OriginalSourceContract {
+                stage: "foreground disk construction source bank",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
-        let bytes = u64::try_from(self.source_backing_capacity().ok_or_else(overflow)?).map_err(|_| overflow())?;
-        let selection = if let Some(background) = &self.background { background.peak_selection(bytes) } else { self.windows.first().ok_or_else(identity)?.peak_selection(
-            u64::try_from(self.source_backing_capacity().ok_or_else(overflow)?)
-                .map_err(|_| overflow())?,
-        ) };
+        let bytes = u64::try_from(self.source_backing_capacity().ok_or_else(overflow)?)
+            .map_err(|_| overflow())?;
+        let selection = if let Some(background) = &self.background {
+            background.peak_selection(bytes)
+        } else {
+            self.source.peak_selection(
+                u64::try_from(self.source_backing_capacity().ok_or_else(overflow)?)
+                    .map_err(|_| overflow())?,
+            )
+        };
         ForegroundDiskSourceCapacity::with_source_account(selection, bank, custody, reservation)
             .map_err(Error::PrefillControl)
     }
@@ -273,11 +394,13 @@ impl ForegroundDiskRequestPlan {
                 sum.checked_add(window.population()?)
             })
     }
-    pub(crate) fn windows(&self) -> &[ForegroundDiskWindowPlan] { &self.windows }
+    pub(crate) fn windows(&self) -> &[ForegroundDiskWindowPlan] {
+        &self.windows
+    }
     pub(crate) fn window(&self, ordinal: usize) -> Option<&ForegroundDiskWindowPlan> {
         self.windows.get(ordinal)
     }
-    pub(crate) fn pool(&self) -> &WorkingMemoryPool {
+    pub(crate) fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
     pub(crate) fn matches(&self, windows: usize, forwards: usize) -> bool {
@@ -293,9 +416,11 @@ pub(crate) struct PreparedSpeculativeForegroundSource {
 }
 impl PreparedSpeculativeForegroundSource {
     pub(crate) fn new(
-        manager: &ResidencyManager, pool: &WorkingMemoryPool,
+        manager: &ResidencyManager,
+        pool: &MemoryLedger,
         windows: &[crate::backend::runtime::residency::manager::WindowPopulation],
-        ids: &[OffloadUnitId], population: ResidencyPopulation,
+        ids: &[OffloadUnitId],
+        population: ResidencyPopulation,
         funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<Self, Error> {
         funding
@@ -319,8 +444,16 @@ impl PreparedSpeculativeForegroundSource {
             _funding: funding,
         })
     }
-    pub(crate) fn with_background(mut self, selection: Option<&BackgroundSelection>, manager: &ResidencyManager, ids: &[OffloadUnitId], sources: &[crate::backend::runtime::residency::manager::WindowPopulation]) -> Result<Self, Error> {
-        self.plan = self.plan.with_background(selection, manager, ids, sources, Some(&self._funding))?;
+    pub(crate) fn with_background(
+        mut self,
+        selection: Option<&BackgroundSelection>,
+        manager: &ResidencyManager,
+        ids: &[OffloadUnitId],
+        sources: &[crate::backend::runtime::residency::manager::WindowPopulation],
+    ) -> Result<Self, Error> {
+        self.plan =
+            self.plan
+                .with_background(selection, manager, ids, sources, Some(&self._funding))?;
         Ok(self)
     }
     pub(crate) fn plan(&self) -> &ForegroundDiskRequestPlan {

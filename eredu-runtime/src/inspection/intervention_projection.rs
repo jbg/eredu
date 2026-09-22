@@ -1,15 +1,24 @@
 //! One support projection with owned and borrowed declaration destinations.
-use eredu_core::{ObservationSupport, ObservationSupportStatus as Status, intervention::*};
+use eredu_core::{intervention::*, ObservationSupport, ObservationSupportStatus as Status};
 mod funded;
-pub use funded::{prepare_intervention_discovery, intervention_discovery_preparation_bytes,
-    FundedInterventionDiscovery, InterventionDiscoveryPreparationError};
+pub use funded::{
+    intervention_discovery_preparation_bytes, prepare_intervention_discovery,
+    FundedInterventionDiscovery, InterventionDiscoveryPreparationError,
+};
 const UNAVAILABLE: &str = "required intervention geometry or native mechanism is not declared";
-pub(super) fn support_for<'a>(point: &InterventionPoint, support: &'a [ObservationSupport]) -> Option<&'a ObservationSupport> {
+pub(super) fn support_for<'a>(
+    point: &InterventionPoint,
+    support: &'a [ObservationSupport],
+) -> Option<&'a ObservationSupport> {
     support.iter().find(|row| {
         if point.routing.is_some() {
-            row.path.strip_prefix(&point.path).and_then(|suffix| suffix.strip_prefix(".routing."))
+            row.path
+                .strip_prefix(&point.path)
+                .and_then(|suffix| suffix.strip_prefix(".routing."))
                 == Some(eredu_core::RoutingObservationField::SelectedExperts.suffix())
-        } else { row.path == point.path }
+        } else {
+            row.path == point.path
+        }
     })
 }
 enum ProjectedStatus<'a> {
@@ -138,21 +147,40 @@ pub fn validate_static_intervention_declarations_with_phases(
     facts: InterventionMechanismFacts<'_>,
     phases: impl FnMut(&InterventionPoint, &InterventionPoint) -> bool,
 ) -> Result<(), InterventionSourceError> {
-    validate_declarations(admitted, points, facts, false, phases)
+    validate_declarations(admitted, points, facts, false, false, phases)
 }
 /// Same comparison for dense and sparse activation declarations. The caller must
 /// also validate its original producer's operation profile; this only checks the
 /// immutable declaration against ordinary discovery and actual mechanism facts.
 pub fn validate_activation_intervention_declarations_with_phases(
-    admitted: &AdmittedInterventionPlan, points: &[InterventionPoint],
+    admitted: &AdmittedInterventionPlan,
+    points: &[InterventionPoint],
     facts: InterventionMechanismFacts<'_>,
     phases: impl FnMut(&InterventionPoint, &InterventionPoint) -> bool,
 ) -> Result<(), InterventionSourceError> {
-    validate_declarations(admitted, points, facts, true, phases)
+    validate_declarations(admitted, points, facts, true, false, phases)
+}
+/// Compares the actual retained routing and activation declarations. This pure
+/// comparison grants no source, host claim or native mechanism authority; the
+/// prepared observer must independently qualify and fund every selected hook.
+pub fn validate_prepared_intervention_declarations(
+    admitted: &AdmittedInterventionPlan,
+    points: &[InterventionPoint],
+    support: &[ObservationSupport],
+    facts: InterventionMechanismFacts<'_>,
+) -> Result<(), InterventionSourceError> {
+    validate_declarations(admitted, points, facts, true, true, |actual, expected| {
+        let support = support_for(actual, support);
+        let projected = Projection::new(actual, support, facts);
+        projected.prefill.matches(&expected.prefill) && projected.decode.matches(&expected.decode)
+    })
 }
 fn validate_declarations(
-    admitted: &AdmittedInterventionPlan, points: &[InterventionPoint],
-    facts: InterventionMechanismFacts<'_>, routed: bool,
+    admitted: &AdmittedInterventionPlan,
+    points: &[InterventionPoint],
+    facts: InterventionMechanismFacts<'_>,
+    routed: bool,
+    routing: bool,
     mut phases: impl FnMut(&InterventionPoint, &InterventionPoint) -> bool,
 ) -> Result<(), InterventionSourceError> {
     if admitted.plan().operations.len() != admitted.points().len() {
@@ -161,7 +189,10 @@ fn validate_declarations(
     for (operation, expected) in admitted.plan().operations.iter().zip(admitted.points()) {
         let mut found = points.iter().filter(|point| point.path == operation.target);
         let actual = found.next().ok_or(InterventionSourceError::Identity)?;
-        if found.next().is_some() || actual.routing.is_some() || (actual.routed_units.is_some() && !routed) {
+        if found.next().is_some()
+            || (actual.routing.is_some() && !routing)
+            || (actual.routed_units.is_some() && !routed)
+        {
             return Err(InterventionSourceError::Identity);
         }
         let projected = Projection::new(actual, None, facts);
@@ -184,7 +215,7 @@ pub fn static_intervention_validation_control_bytes() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     let frames = [
         size_of::<Projection<'static>>(),
-        size_of::<bool>(),
+        size_of::<[bool; 3]>(),
         size_of::<InterventionMechanismFacts<'static>>(),
         size_of::<[std::slice::Iter<'static, InterventionPoint>; 2]>(),
         size_of::<[&InterventionPoint; 3]>(),
@@ -200,4 +231,103 @@ pub fn static_intervention_validation_control_bytes() -> Option<usize> {
     frames
         .into_iter()
         .try_fold(size_of_val(&frames), usize::checked_add)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eredu_core::{capture::CaptureRequestShape, SymbolicDimension, TensorAxis};
+    #[test]
+    fn prepared_routing_checks_the_selected_field_support_projection() {
+        let point = InterventionPoint {
+            path: "router".into(),
+            node_id: "block".into(),
+            stage: InterventionStage::RoutingBeforeDispatch,
+            axes: vec![
+                TensorAxis {
+                    name: "token".into(),
+                    dimension: SymbolicDimension::TokenRows,
+                },
+                TensorAxis {
+                    name: "selected_expert".into(),
+                    dimension: SymbolicDimension::Known(2),
+                },
+            ],
+            dtypes: vec![],
+            operations: vec![InterventionKind::ExcludeExperts],
+            score_stages: vec![],
+            prefill: Status::Unverified("requires selected native source".into()),
+            decode: Status::Unverified("requires selected native source".into()),
+            conditions: vec![],
+            routed_units: None,
+            routing: Some(InterventionRoutingPolicy {
+                expert_count: 4,
+                top_k: 2,
+                scoring: RoutingScoring::Softmax,
+                normalize_selected: true,
+                normalization_epsilon: 0.,
+                coefficient_scale: 1.,
+                groups: 1,
+                selected_groups: 1,
+                learned_coefficient_scale: false,
+                shared_experts: 0,
+            }),
+        };
+        let facts = InterventionMechanismFacts {
+            routed_units: false,
+            operations: &[InterventionKind::ExcludeExperts],
+            dtypes: &[],
+            score_stages: &[],
+        };
+        let support = ObservationSupport {
+            path: "router.routing.selected_experts".into(),
+            prefill: Status::Supported,
+            decode: Status::Supported,
+            floating_to_f32: false,
+        };
+        let mut selected = point.clone();
+        apply(&mut selected, Some(&support), facts);
+        let discovery = InterventionDiscovery {
+            schema_version: 1,
+            artifact_identity: "artifact".into(),
+            session_identity: Some("native-source".into()),
+            points: vec![selected],
+        };
+        let plan = InterventionPlan {
+            schema_version: 1,
+            operations: vec![InterventionOperation {
+                id: "exclude".into(),
+                target: point.path.clone(),
+                schedule: Default::default(),
+                slices: vec![],
+                action: InterventionAction::ExcludeExperts {
+                    expert_ids: vec![3],
+                },
+                evidence: InterventionEvidence::None,
+            }],
+        }
+        .admit(
+            &discovery,
+            CaptureRequestShape {
+                batch: 1,
+                prompt_tokens: 3,
+                max_predictions: 2,
+            },
+            "capture",
+        )
+        .unwrap();
+        validate_prepared_intervention_declarations(
+            &plan,
+            std::slice::from_ref(&point),
+            std::slice::from_ref(&support),
+            facts,
+        )
+        .unwrap();
+        let mut changed = support;
+        changed.decode = Status::Unsupported("selected mechanism cannot decode".into());
+        assert!(matches!(
+            validate_prepared_intervention_declarations(&plan, &[point], &[changed], facts),
+            Err(InterventionSourceError::Identity)
+        ));
+    }
 }

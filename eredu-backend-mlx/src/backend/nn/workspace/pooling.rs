@@ -2,7 +2,7 @@
 //! einsums lower to batch_tensordot, with input and output reshape copies around
 //! ordinary matmul. No bound scales a gather by the complete broadcast source.
 
-use super::facts::{self, add, buffer_capacity, mul, Aliases, Emitter, FactResult, Output};
+use super::facts::{self, Aliases, Emitter, FactResult, Output, add, buffer_capacity, mul};
 use super::{
     matrix::einsum_matmul_cost_fixed as einsum_cost,
     reduction::{capacity_fixed as capacity, sum_cost_fixed as sum_cost},
@@ -216,6 +216,21 @@ fn pooled(
         } else {
             WorkspaceDtype::Bool
         };
+        // The shared normalize closure creates only missing-mask operands
+        // and the zero/minimum pair when a Bool mask joins an additive mask.
+        // Dtype promotion and joined-mask buffers remain execution storage.
+        let additive = dtype == WorkspaceDtype::Float32;
+        let default_births = [local, pooled]
+            .into_iter()
+            .map(|mask| match mask {
+                Some(mask) if additive && mask.dtype() == WorkspaceDtype::Bool => 2,
+                Some(_) => 0,
+                None => 1,
+            })
+            .sum::<usize>();
+        if default_births != 0 {
+            sink.default_scratch(mul(default_births as u64, capacity(a, 1)?)?, default_births)?;
+        }
         mask_shape = [ls[0], ls[1], ls[2], keys];
         let mask = WorkspaceLayoutView::new(&mask_shape, dtype)?;
         // Each source can be cast after broadcasting, plus missing true scalar
@@ -257,6 +272,7 @@ fn pooled(
         Some(WorkspaceOutputEffect::AllocateOrAliasInputs { bytes, .. }) => (bytes, true),
         _ => return Err(invalid()),
     };
+    sink.default_scratch_child(&child_output, bound.scratch_bytes, total)?;
     total = add(total, add(retained, bound.scratch_bytes)?)?;
     let _ = (h, n);
     finish(total, retained, a, "promoted local/pooled bank concatenation, broadcast-normalized masks, and the retained fused/fallback SDPA mechanism", alias, sink).map(Some)
@@ -325,6 +341,14 @@ fn indexed(
     }
     let local_mask = lm.then(|| op.inputs.get(6).unwrap());
     let pooled_mask = pm.then(|| op.inputs.get(6 + usize::from(lm)).unwrap());
+    // run constructs one query-scale scalar; mask constructs a finite-min
+    // scalar only for each actual Bool mask. Casts stay on the execution stream.
+    let default_births = 1 + [local_mask, pooled_mask]
+        .into_iter()
+        .flatten()
+        .filter(|mask| mask.dtype() == WorkspaceDtype::Bool)
+        .count();
+    sink.default_scratch(mul(default_births as u64, capacity(a, 1)?)?, default_births)?;
     let Some(local_mask) = mask_cost(local_mask, &[b, h, q, l], a)? else {
         return Ok(None);
     };
@@ -436,6 +460,9 @@ fn positions(
         return Ok(None);
     }
     if p == 0 {
+        // Native zeros owns its eager U32 seed independently of the empty
+        // stream-produced Full result. Only that seed is default storage.
+        sink.default_scratch(capacity(a, 1)?, 1)?;
         let retained = capacity(a, 0)?;
         return finish(
             mul(3, retained)?,
@@ -447,6 +474,10 @@ fn positions(
         )
         .map(Some);
     }
+    // Actual eager arguments in pooled_positions::run: zero, score scale,
+    // head scale, and optional negative-infinity mask value.
+    let default_births = 3 + usize::from(masked);
+    sink.default_scratch(mul(default_births as u64, capacity(a, 1)?)?, default_births)?;
     let rows = product(&[b, q])?;
     let scores = product(&[b, h, q, p])?;
     let reduced = product(&[b, q, p])?;
@@ -487,12 +518,9 @@ pub(super) fn gather_geometry(
     let indices = op.inputs.get(1).unwrap();
     let m = mask.shape();
     let i = indices.shape();
-    let geometry = crate::backend::nn::attention::gather_mask::Geometry::new(m, i)
-        .map_err(|_| invalid())?;
-    if m[0] != i[1]
-        || !index(indices)
-        || m[1] == 0 && indices.elements()? != 0
-    {
+    let geometry =
+        crate::backend::nn::attention::gather_mask::Geometry::new(m, i).map_err(|_| invalid())?;
+    if m[0] != i[1] || !index(indices) || m[1] == 0 && indices.elements()? != 0 {
         return Err(invalid());
     }
     output(op, &geometry.output, mask.dtype())?;
@@ -505,7 +533,14 @@ fn gather(
 ) -> FactResult<WorkspaceOperationFacts> {
     gather_geometry(op)?;
     let retained = buffer_capacity(a, op.outputs.get(0).unwrap().bytes()?.max(4))?;
-    finish(retained,retained,a,"broadcast/expand views and direct strided GatherAxis output; no source-table or index replication",false, sink)
+    finish(
+        retained,
+        retained,
+        a,
+        "broadcast/expand views and direct strided GatherAxis output; no source-table or index replication",
+        false,
+        sink,
+    )
 }
 
 #[cfg(test)]

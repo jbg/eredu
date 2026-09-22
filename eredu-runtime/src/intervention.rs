@@ -1,16 +1,22 @@
 //! Prospective intervention scheduling under the ordinary capture/run owner.
 //! There is no additional sampling loop or native-resource owner here.
 
+mod routing_control;
 mod static_preflight;
-pub use static_preflight::{StaticInterventionPreflight,StaticInterventionScratchError,StaticInterventionPreflightError};
+pub use routing_control::{PreparedRoutingControl, PreparedRoutingControlError};
+pub use static_preflight::{
+    StaticInterventionPreflight, StaticInterventionPreflightError, StaticInterventionScratchError,
+};
 mod hook;
 mod prefill;
-pub use prefill::{InterventionPrefillWindow,InterventionPrefillSourceError,InterventionPrefillProjectionError};
 use crate::capture::{
-    CaptureExecutionError, CaptureSession, bounded_diagnostic, metadata_reservation,
+    bounded_diagnostic, metadata_reservation, CaptureExecutionError, CaptureSession,
 };
 use eredu_core::{capture::*, intervention::*};
-pub use hook::{ActivationHook, activation_hook};
+pub use hook::{activation_hook, ActivationHook};
+pub use prefill::{
+    InterventionPrefillProjectionError, InterventionPrefillSourceError, InterventionPrefillWindow,
+};
 
 mod activation;
 mod partition;
@@ -20,20 +26,23 @@ pub use activation::{
     apply_activation, apply_activation_with_source_shape, localize_component_mask,
 };
 pub use partition::{
-    PartitionActivationLayout, PartitionActivationMember, PartitionActivationProjection,
-    PartitionRoutedActivationMember, ReservedPartitionActivation,
-    PreparedPartitionInterventionProjection, PartitionInterventionProjectionSourceError, PartitionInterventionUpdate,
-    PartitionInterventionProjectionCost, PartitionInterventionColumnError, validate_partition_column_region, intervention_window_metadata,
-    PreparedWindowInterventionPayload, PreparedWindowInterventionPayloadError, WindowInterventionPayloadError,
+    intervention_window_metadata, validate_partition_column_region, PartitionActivationLayout,
+    PartitionActivationMember, PartitionActivationProjection, PartitionInterventionColumnError,
+    PartitionInterventionProjectionCost, PartitionInterventionProjectionSourceError,
+    PartitionInterventionUpdate, PartitionRoutedActivationMember,
+    PreparedPartitionInterventionProjection, PreparedWindowInterventionPayload,
+    PreparedWindowInterventionPayloadError, ReservedPartitionActivation,
+    WindowInterventionPayloadError,
 };
 pub use routed::{
-    RoutedInterventionNumericalAction, routed_intervention_full_component_count, routed_intervention_full_component_count_control_bytes,
-    LoweredRoutedIntervention, lower_partition_routed_intervention, lower_routed_intervention,
-    PreparedRoutedInterventionRows, PreparedRoutedIntervention, PreparedRoutedInterventionError,
-    RoutedInterventionLoweringError,
+    lower_partition_routed_intervention, lower_routed_intervention,
+    routed_intervention_full_component_count,
+    routed_intervention_full_component_count_control_bytes, LoweredRoutedIntervention,
+    PreparedRoutedIntervention, PreparedRoutedInterventionError, PreparedRoutedInterventionRows,
+    RoutedInterventionLoweringError, RoutedInterventionNumericalAction,
 };
 pub(crate) use session::validate_continuation;
-pub use session::{CaptureObserver, install_session, validate_session};
+pub use session::{install_session, validate_session, CaptureObserver};
 
 pub(crate) struct InterventionRun {
     pub(crate) plan: AdmittedInterventionPlan,
@@ -553,7 +562,9 @@ fn validate_capture_origin(
     intervention: &AdmittedInterventionPlan,
 ) -> Result<(), CaptureError> {
     if !intervention.is_empty() && capture.text_origin() != intervention.text_origin() {
-        return Err(CaptureError::Invalid("capture/intervention text origins differ".into()));
+        return Err(CaptureError::Invalid(
+            "capture/intervention text origins differ".into(),
+        ));
     }
     Ok(())
 }
@@ -705,9 +716,6 @@ impl CaptureSession {
         path: &str,
         token_rows: u64,
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, CaptureError> {
-        use eredu_nn::routing_intervention::{
-            GroupScoreStage, GroupSelectionAction, GroupSelectionControl,
-        };
         self.validate_ordinary_intervention()?;
         let physical = self
             .invocation_window
@@ -773,126 +781,32 @@ impl CaptureSession {
                     "routing rows differ from actual prefill window".into(),
                 ));
             }
-            let (first_row, end_row, payload_start, payload_end) =
-                if let Some(window) = self.invocation_window {
-                    let end = add(window.start, token_rows)?;
-                    let ordinal = window
-                        .start
-                        .saturating_sub(slice.starts[0])
-                        .div_ceil(slice.strides[0]);
-                    let first = add(slice.starts[0], mul(ordinal, slice.strides[0])?)?;
-                    let limit = end.min(slice.ends[0]);
-                    if first >= limit {
-                        return Ok(None);
-                    }
-                    let rows = (limit - first).div_ceil(slice.strides[0]);
-                    (
-                        first - window.start,
-                        limit - window.start,
-                        mul(ordinal, policy.top_k as u64)?,
-                        mul(add(ordinal, rows)?, policy.top_k as u64)?,
-                    )
-                } else {
-                    (
-                        slice.starts[0],
-                        slice.ends[0],
-                        0,
-                        mul(slice.shape[0], policy.top_k as u64)?,
-                    )
-                };
-            // The selector owns its native workspace. This separate reservation
-            // covers only the actual host control payload cloned/gathered here.
-            let elements = match &operation.action {
-                InterventionAction::ExcludeExperts { expert_ids }
-                | InterventionAction::ZeroExpertContribution { expert_ids } => {
-                    expert_ids.len() as u64
-                }
-                InterventionAction::ForceExperts { .. } => payload_end - payload_start,
-                InterventionAction::BiasRoutingScores {
-                    expert_ids, biases, ..
-                } => add(expert_ids.len() as u64, biases.len() as u64)?,
-                _ => 0,
+            let Some(prepared) = PreparedRoutingControl::inspect(
+                operation,
+                policy,
+                token_rows,
+                &slice,
+                self.invocation_window,
+            )
+            .map_err(|cause| CaptureError::Invalid(cause.to_string()))?
+            else {
+                return Ok(None);
             };
-            let controls = CaptureUsage {
-                host_bytes: add(
-                    std::mem::size_of::<GroupSelectionControl>() as u64,
-                    mul(elements, 4)?,
-                )?,
-                ..Default::default()
-            };
+            let controls = prepared
+                .usage()
+                .map_err(|cause| CaptureError::Invalid(cause.to_string()))?;
             reserve_envelope(&mut self.ledger, controls)?;
             record.charged = record.charged.checked_add(controls)?;
-            let action = match &operation.action {
-                InterventionAction::ExcludeExperts { expert_ids } => {
-                    GroupSelectionAction::Exclude(expert_ids.clone())
-                }
-                InterventionAction::ZeroExpertContribution { expert_ids } => {
-                    GroupSelectionAction::ZeroContribution(expert_ids.clone())
-                }
-                InterventionAction::ForceExperts { expert_ids, .. } => GroupSelectionAction::Force(
-                    expert_ids
-                        .get(
-                            usize::try_from(payload_start).map_err(|_| CaptureError::Overflow)?
-                                ..usize::try_from(payload_end)
-                                    .map_err(|_| CaptureError::Overflow)?,
-                        )
-                        .ok_or_else(|| {
-                            CaptureError::Invalid(
-                                "projected routing payload differs from admission".into(),
-                            )
-                        })?
-                        .to_vec(),
-                ),
-                InterventionAction::BiasRoutingScores {
-                    stage,
-                    expert_ids,
-                    biases,
-                } => GroupSelectionAction::Bias {
-                    stage: match stage {
-                        RoutingScoreStage::RawLogits => GroupScoreStage::RawLogits,
-                        RoutingScoreStage::TransformedScores => GroupScoreStage::TransformedScores,
-                        RoutingScoreStage::RankingScores => GroupScoreStage::RankingScores,
-                    },
-                    ids: expert_ids.clone(),
-                    values: biases.clone(),
-                },
-                _ => {
-                    return Err(CaptureError::Invalid(
-                        "activation operation cannot control routing".into(),
-                    ));
-                }
-            };
-            let expected = eredu_nn::TopKGroupSelectionSpec::new(
-                i32::try_from(policy.expert_count).map_err(|_| CaptureError::Overflow)?,
-                i32::try_from(policy.top_k).map_err(|_| CaptureError::Overflow)?,
-                match policy.scoring {
-                    RoutingScoring::Softmax => eredu_nn::GroupScoring::Softmax,
-                    RoutingScoring::SelectedSoftmax => eredu_nn::GroupScoring::SelectedSoftmax,
-                    RoutingScoring::Sigmoid => eredu_nn::GroupScoring::Sigmoid,
-                    RoutingScoring::SqrtSoftplus => eredu_nn::GroupScoring::SqrtSoftplus,
-                },
-                policy.normalize_selected,
-            )
-            .and_then(|spec| spec.with_groups(policy.groups as i32, policy.selected_groups as i32))
-            .and_then(|spec| {
-                spec.with_weight_policy(policy.normalization_epsilon, policy.coefficient_scale)
-            })
-            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
             let capture_original = operation.evidence != InterventionEvidence::None;
             if capture_original {
                 let cost = original_route_cost(run.estimator.as_ref(), policy, token_rows)?;
                 reserve_envelope(&mut self.ledger, cost)?;
                 record.charged = record.charged.checked_add(cost)?;
             }
-            Ok(Some(GroupSelectionControl {
-                expected,
-                learned_coefficient_scale: policy.learned_coefficient_scale,
-                first_row,
-                end_row,
-                row_stride: slice.strides[0],
-                action,
-                capture_original,
-            }))
+            prepared
+                .copy_control()
+                .map(Some)
+                .map_err(|cause| CaptureError::Invalid(cause.to_string()))
         })();
         match result {
             Ok(control) => {

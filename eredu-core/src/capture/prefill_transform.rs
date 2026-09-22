@@ -7,16 +7,20 @@ fn invalid() -> CaptureError {
 }
 
 /// Exact original projection/temporal source failure, preserving its typed cause.
-#[derive(Debug,thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum CapturePrefillPartitionError {
     /// The existing immutable request/window constructor rejected this source.
-    #[error(transparent)] Original(#[from] CaptureError),
+    #[error(transparent)]
+    Original(#[from] CaptureError),
     /// Actual partition tensor geometry differs from the original admission.
-    #[error(transparent)] Geometry(#[from] CaptureTensorGeometryError),
+    #[error(transparent)]
+    Geometry(#[from] CaptureTensorGeometryError),
     /// Actual spatial source cannot share the retained temporal window.
-    #[error(transparent)] Window(#[from] CaptureWindowError),
+    #[error(transparent)]
+    Window(#[from] CaptureWindowError),
     /// The existing raw temporal scatter rejected the source.
-    #[error(transparent)] Rows(#[from] CapturePrefillGeometryError),
+    #[error(transparent)]
+    Rows(#[from] CapturePrefillGeometryError),
 }
 
 /// Borrowed ordinary Summary/Histogram/Preview geometry. This supplies neither
@@ -49,7 +53,12 @@ impl<'a> CapturePrefillTransformPlan<'a> {
             || inference.prefill_chunk_positions > inference.input_positions
             || !point.prefill
             || !selection.schedule.includes(CapturePhase::Prefill, 0)
-            || point.dtype != ObservationDtype::Floating
+            || !(point.dtype == ObservationDtype::Floating
+                || point.dtype == ObservationDtype::Integer
+                    && matches!(
+                        selection.transform,
+                        CaptureTransform::Preview { .. } | CaptureTransform::Summary
+                    ))
             || point.value_type != ObservationValueType::Tensor
             || !matches!(
                 selection.transform,
@@ -68,13 +77,17 @@ impl<'a> CapturePrefillTransformPlan<'a> {
         let axes = point.axes.as_ref().ok_or_else(invalid)?;
         if axes
             .iter()
-            .filter(|a| a.dimension == SymbolicDimension::Sequence)
+            .filter(|a| {
+                a.dimension == SymbolicDimension::Sequence
+                    || a.dimension == SymbolicDimension::TokenRows && inference.batch_size == 1
+            })
             .count()
             != 1
             || axes.iter().any(|a| {
                 !matches!(
                     a.dimension,
                     SymbolicDimension::Sequence
+                        | SymbolicDimension::TokenRows
                         | SymbolicDimension::Batch
                         | SymbolicDimension::Known(_)
                 )
@@ -101,34 +114,95 @@ impl<'a> CapturePrefillTransformPlan<'a> {
     /// Project one actual spatial term while retaining the same original
     /// transform, request and temporal worker. Sum terms remain raw at native
     /// execution; this plan describes only their selected source geometry.
-    pub fn prepare_partition(source: &'a AdmittedCapturePlan, index: usize,
-        inference: InferenceGeometry, projection: &CaptureSlicePartition, fragment: usize,
-        combination: PartitionCaptureCombination) -> Result<Self, CapturePrefillPartitionError>
-    {
-        let mut plan=Self::prepare(source,index,inference)?;
-        if combination==PartitionCaptureCombination::SumF64ToF32 {
-            CaptureTensorGeometry::prepare_partition(source,index,CapturePhase::Prefill,0,None,
-                projection,fragment,combination)?;
-        }else{match plan.selection().transform {
-            CaptureTransform::Summary=>{CaptureSummaryGeometry::prepare_partition(source,index,CapturePhase::Prefill,0,None,projection,fragment)?;},
-            CaptureTransform::Histogram{..}=>{CaptureHistogramGeometry::prepare_partition(source,index,CapturePhase::Prefill,0,None,projection,fragment)?;},
-            CaptureTransform::Preview{..}=>{CaptureTensorGeometry::prepare_partition(source,index,CapturePhase::Prefill,0,None,projection,fragment,combination)?;},
-            _=>return Err(CaptureTensorGeometryError::Unsupported.into()),
-        }}
-        plan.window=plan.window.project_partition(projection,fragment)?;
+    pub fn prepare_partition(
+        source: &'a AdmittedCapturePlan,
+        index: usize,
+        inference: InferenceGeometry,
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+        combination: PartitionCaptureCombination,
+    ) -> Result<Self, CapturePrefillPartitionError> {
+        let mut plan = Self::prepare(source, index, inference)?;
+        if combination == PartitionCaptureCombination::SumF64ToF32 {
+            CaptureTensorGeometry::prepare_partition(
+                source,
+                index,
+                CapturePhase::Prefill,
+                0,
+                None,
+                projection,
+                fragment,
+                combination,
+            )?;
+        } else {
+            match plan.selection().transform {
+                CaptureTransform::Summary => {
+                    CaptureSummaryGeometry::prepare_partition(
+                        source,
+                        index,
+                        CapturePhase::Prefill,
+                        0,
+                        None,
+                        projection,
+                        fragment,
+                    )?;
+                }
+                CaptureTransform::Histogram { .. } => {
+                    CaptureHistogramGeometry::prepare_partition(
+                        source,
+                        index,
+                        CapturePhase::Prefill,
+                        0,
+                        None,
+                        projection,
+                        fragment,
+                    )?;
+                }
+                CaptureTransform::Preview { .. } => {
+                    CaptureTensorGeometry::prepare_partition(
+                        source,
+                        index,
+                        CapturePhase::Prefill,
+                        0,
+                        None,
+                        projection,
+                        fragment,
+                        combination,
+                    )?;
+                }
+                _ => return Err(CaptureTensorGeometryError::Unsupported.into()),
+            }
+        }
+        plan.window = plan.window.project_partition(projection, fragment)?;
         Ok(plan)
     }
     /// Fixed source, typed geometry and result transports for this adapter.
     pub fn partition_preparation_control_bytes() -> Option<usize> {
-        use std::mem::{size_of,size_of_val};
-        let parts=[size_of::<Self>()*3,size_of::<CaptureWindowGeometry>()*3,
-            size_of::<CapturePrefillPartitionError>(),size_of::<Result<Self,CapturePrefillPartitionError>>(),
-            size_of::<(&AdmittedCapturePlan,usize,InferenceGeometry,&CaptureSlicePartition,usize,PartitionCaptureCombination)>(),
-            size_of::<CaptureSummaryGeometry<'_>>(),size_of::<CaptureHistogramGeometry<'_>>(),
-            size_of::<(usize,&ResolvedCaptureSlice)>(),size_of::<Result<CaptureWindowGeometry,CaptureWindowError>>(),
+        use std::mem::{size_of, size_of_val};
+        let parts = [
+            size_of::<Self>() * 3,
+            size_of::<CaptureWindowGeometry>() * 3,
+            size_of::<CapturePrefillPartitionError>(),
+            size_of::<Result<Self, CapturePrefillPartitionError>>(),
+            size_of::<(
+                &AdmittedCapturePlan,
+                usize,
+                InferenceGeometry,
+                &CaptureSlicePartition,
+                usize,
+                PartitionCaptureCombination,
+            )>(),
+            size_of::<CaptureSummaryGeometry<'_>>(),
+            size_of::<CaptureHistogramGeometry<'_>>(),
+            size_of::<(usize, &ResolvedCaptureSlice)>(),
+            size_of::<Result<CaptureWindowGeometry, CaptureWindowError>>(),
             CaptureTensorGeometry::partition_preparation_control_bytes()?,
-            CaptureSummaryGeometry::preparation_control_bytes()?,CaptureHistogramGeometry::preparation_control_bytes()?,
-        ];parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+            CaptureSummaryGeometry::preparation_control_bytes()?,
+            CaptureHistogramGeometry::preparation_control_bytes()?,
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Exact original semantic admission, never an allocation pin.

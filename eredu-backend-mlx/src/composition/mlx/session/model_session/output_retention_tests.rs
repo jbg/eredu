@@ -4,8 +4,8 @@ use eredu_core::{
     InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound,
 };
 use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, InferenceRequest, InferenceRetention, WorkingMemoryError,
-    WorkingMemoryPool,
+    InferenceExecutionIdentity, InferenceRequest, InferenceRetention, MemoryLedger,
+    WorkingMemoryError,
 };
 
 fn stream() -> Stream {
@@ -39,22 +39,26 @@ fn admission(bytes: u64) -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: bound(bytes),
-        attention: bound(0),
-        vocabulary: bound(0),
-        state_update: bound(0),
-        materialization: bound(0),
-        retained: bound(0),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: bound(bytes),
+            attention: bound(0),
+            vocabulary: bound(0),
+            state_update: bound(0),
+            materialization: bound(0),
+            retained: bound(0),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 2,
         state,
-        incremental_required_bytes: bytes,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(bytes),
+    })
 }
 
 fn resources() -> (SessionAuthority, SubmissionResourcesOwner) {
@@ -68,7 +72,7 @@ fn resources() -> (SessionAuthority, SubmissionResourcesOwner) {
 
 fn retain_request(
     resources: &SubmissionResources,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
 ) -> InferenceRequest {
     let request: InferenceRequest = pool
@@ -81,18 +85,19 @@ fn retain_request(
     request
 }
 
-fn settle(stream: &Stream, pool: &WorkingMemoryPool, bytes: u64, owners: usize) {
+fn settle(stream: &Stream, pool: &MemoryLedger, bytes: u64, owners: usize) {
     stream.synchronize().unwrap();
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == owners
+        pool.fixture_host_charge().unwrap() == bytes
+            && pool.unquoted_owner_count().unwrap() == owners
     });
 }
 
 #[test]
 fn completed_output_aliases_keep_all_request_charges_until_last_backing_retires() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(256, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(256, 0).unwrap();
     let (session, resources) = resources();
     let first = retain_request(&resources, &pool, 96);
     let second = retain_request(&resources, &pool, 32);
@@ -122,14 +127,14 @@ fn completed_output_aliases_keep_all_request_charges_until_last_backing_retires(
     assert_eq!(view.allocation_info().unwrap(), Some(identity));
     drop(view);
     settle(&stream, &pool, 0, 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 128);
+    assert_eq!(pool.fixture_host_peak().unwrap(), 128);
     assert!(pool.acquire_unquoted().is_ok());
 }
 
 #[test]
 fn zero_byte_request_still_excludes_unquoted_work_while_output_backing_survives() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let (session, resources) = resources();
     let request = retain_request(&resources, &pool, 0);
     let output = Array::from_slice(&[3_i32, 7], &[2]);
@@ -152,7 +157,7 @@ fn zero_byte_request_still_excludes_unquoted_work_while_output_backing_survives(
 #[test]
 fn allocation_free_completed_output_adds_no_charge_owner() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(64, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(64, 0).unwrap();
     let (session, resources) = resources();
     let request = retain_request(&resources, &pool, 64);
     let output = Array::from_slice::<i32>(&[], &[0]);
@@ -165,32 +170,33 @@ fn allocation_free_completed_output_adds_no_charge_owner() {
 }
 
 #[test]
-fn unbudgeted_output_attachment_remains_a_cold_noop_without_memory_owners() {
+fn unlimited_output_attachment_retains_ordinary_reservation_until_last_alias() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let (session, resources) = resources();
-    let request = InferenceRequest::without_memory_budget(
-        &InferenceExecutionIdentity::default(),
-        admission(0).state.execution_workspace.unwrap().geometry,
+    let topology = crate::memory_fixture::topology();
+    let pool = MemoryLedger::new(
+        topology.clone(),
+        eredu_core::MemoryLimits::unlimited(&topology),
+        eredu_core::DomainMemoryRequirements::zero(&topology),
     )
     .unwrap();
-    let mut retention = InferenceRetention::new();
-    retention.retain(&request);
-    resources.retain_inference(&retention);
+    let (session, resources) = resources();
+    let request = retain_request(&resources, &pool, 64);
     let source = Array::from_slice(&[2_i32, 5], &[2]);
-    let lazy = source.square(&stream).unwrap();
-    assert_eq!(lazy.allocation_info().unwrap(), None);
-    resources.retain_output_allocation(&lazy).unwrap();
-    assert_eq!(lazy.allocation_info().unwrap(), None);
-    drop((retention, request, resources, session));
+    let output = source.square(&stream).unwrap();
+    output.evaluated().unwrap();
+    resources.retain_output_allocation(&output).unwrap();
+    let alias = output.clone();
+    drop((request, resources, session, output));
+    settle(&stream, &pool, 64, 0);
+    assert_eq!(alias.evaluated().unwrap().as_slice::<i32>(), &[4, 25]);
+    drop(alias);
     settle(&stream, &pool, 0, 0);
-    assert!(pool.acquire_unquoted().is_ok());
 }
 
 #[test]
 fn existing_unquoted_output_owners_still_follow_the_native_backing() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let (session, resources) = resources();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     resources.retain_memory_owner(Some(&owner));
@@ -207,7 +213,7 @@ fn existing_unquoted_output_owners_still_follow_the_native_backing() {
 #[test]
 fn unfinished_backing_failure_preserves_submission_charge_for_retry() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(64, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(64, 0).unwrap();
     let (session, resources) = resources();
     let request = retain_request(&resources, &pool, 64);
     let source = Array::from_slice(&[2_i32, 5], &[2]);
@@ -242,8 +248,8 @@ fn direct_session_outputs_inherit_state_reservations_without_a_sampler() {
         // This isolated reservation is synthetic ownership evidence, not a
         // complete native bound or successful public managed-budget admission.
         // Model, prompt and operation allocations use another unquoted domain.
-        let native_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let backend = MlxBackend::new(&stream, &stream).with_memory_pool(native_pool);
+        let native_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+        let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(native_pool);
         let artifact =
             crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
         let model =
@@ -283,15 +289,18 @@ fn direct_session_outputs_inherit_state_reservations_without_a_sampler() {
             std::num::NonZeroU8::new(4).unwrap(),
         )
         .unwrap()
-        .with_execution_workspace(ExecutionWorkspaceEstimate {
-            geometry,
-            activations: bound(1 << 24),
-            attention: bound(0),
-            vocabulary: bound(0),
-            state_update: bound(0),
-            materialization: bound(0),
-            retained: bound(4096),
-        })
+        .with_execution_workspace(crate::memory_fixture::workspace(
+            ExecutionWorkspaceEstimate {
+                physical_domains: None,
+                geometry,
+                activations: bound(1 << 24),
+                attention: bound(0),
+                vocabulary: bound(0),
+                state_update: bound(0),
+                materialization: bound(0),
+                retained: bound(4096),
+            },
+        ))
         .unwrap();
         let eredu_core::AdmissionResult::Admitted(admitted) = eredu_core::apply_admission_policy(
             capability.capabilities(),
@@ -299,17 +308,15 @@ fn direct_session_outputs_inherit_state_reservations_without_a_sampler() {
                 input: InputTokenCount::text(5),
                 max_output_tokens: 2,
                 batch_size: 1,
-                safety_reserve_bytes: 0,
-                application_memory_budget_bytes: None,
-                require_complete_estimate: true,
+                additional_headroom: crate::memory_fixture::headroom(0),
+                memory_limits: Default::default(),
             },
             state,
-            None,
         )
         .unwrap() else {
             panic!("selected fixture geometry must admit");
         };
-        let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(1 << 26, 0).unwrap();
         let request: InferenceRequest = pool
             .reserve(
                 runtime
@@ -322,7 +329,13 @@ fn direct_session_outputs_inherit_state_reservations_without_a_sampler() {
             )
             .unwrap()
             .into();
-        let charged = request.memory_reservation().unwrap().bytes();
+        let charged = request
+            .memory_reservation()
+            .requirements()
+            .get(pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         let prompt = MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2, 3, 4, 5])
             .unwrap()
             .with_inference_request(request.clone());
@@ -371,3 +384,7 @@ fn direct_session_outputs_inherit_state_reservations_without_a_sampler() {
         assert!(pool.acquire_unquoted().is_ok());
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

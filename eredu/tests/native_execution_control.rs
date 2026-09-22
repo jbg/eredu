@@ -5,8 +5,8 @@ use eredu::{
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    ExecutionPlan, GenerationConfigOverrides, SemanticEvent, SessionCapabilities, capture::*,
-    execution_control::*,
+    capture::*, execution_control::*, ExecutionPlan, GenerationConfigOverrides, SemanticEvent,
+    SessionCapabilities,
 };
 use std::{
     io::Write,
@@ -14,9 +14,18 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokenizers::{
-    AddedToken, Tokenizer, decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
-    pre_tokenizers::whitespace::Whitespace,
+    decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
+    pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
 };
+
+fn native_limits(bytes: u64) -> eredu_core::MemoryLimitDeclarations {
+    let topology = eredu::api::local_memory_topology().unwrap();
+    eredu_core::MemoryLimitDeclarations::new(
+        topology
+            .domains()
+            .map(|(_, domain)| (domain.name.clone(), eredu_core::MemoryLimit::Finite(bytes))),
+    )
+}
 
 const ORIGINAL_CAPACITY: u64 = 64 << 30;
 trait SourceChatFixture {
@@ -40,19 +49,20 @@ impl<B: eredu_runtime::working_memory::OriginalChatBackend> SourceChatFixture fo
     ) -> anyhow::Result<eredu::runtime::chat::PreparedChat> {
         use anyhow::Context;
         let cancel = eredu_core::GenerationCancellationToken::new();
-        let tokenizer =
-            self.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
-                .context("compile retained tokenizer source")?;
+        let tokenizer = self
+            .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+            .context("compile retained tokenizer source")?;
         let source = self
             .compile_managed_chat_source(
                 &tokenizer,
                 ChatSourceInput::RetainedConfiguration,
                 !policy.tools.is_empty(),
                 &cancel,
-            ).context("compile retained chat source")?
+            )
+            .context("compile retained chat source")?
             .expect("fixture preparation is not cancelled");
         Ok(self
-            .prepare_chat(&source, &policy, capacity, &cancel)
+            .prepare_chat(&source, &policy, &native_limits(capacity), &cancel)
             .context("prepare chat from retained sources")?
             .expect("fixture preparation is not cancelled"))
     }
@@ -60,18 +70,21 @@ impl<B: eredu_runtime::working_memory::OriginalChatBackend> SourceChatFixture fo
 fn original_settings(
     mut settings: PreparedChatGenerationSettings,
 ) -> PreparedChatGenerationSettings {
-    settings.inference.managed_memory_capacity_bytes = Some(ORIGINAL_CAPACITY);
+    settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(ORIGINAL_CAPACITY),
+    )]);
     settings
 }
 fn chat_settings(
     chat: &eredu::runtime::chat::PreparedChat,
     mut settings: PreparedChatGenerationSettings,
 ) -> PreparedChatGenerationSettings {
-    settings.inference.managed_memory_capacity_bytes = Some(chat.capacity());
+    settings.inference.memory_limits = chat.limits().clone();
     settings
 }
 fn copy_limits() -> eredu_runtime::working_memory::WorkspaceCopyLimits {
-    eredu_runtime::working_memory::WorkspaceCopyLimits::new(ORIGINAL_CAPACITY)
+    eredu_runtime::working_memory::WorkspaceCopyLimits::new(native_limits(ORIGINAL_CAPACITY))
 }
 
 struct Fixture(PathBuf);
@@ -252,7 +265,10 @@ fn native_cpu_controlled_text_restores_and_forks_without_semantic_support() {
 }
 
 #[test]
-#[cfg_attr(feature = "metal", ignore = "run with --no-default-features --features mlx")]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
 fn native_cpu_public_reset_preserves_prepared_sources_and_retained_outputs() {
     for family in ["qwen2", "nanbeige"] {
         let root = fixture(false);
@@ -264,11 +280,13 @@ fn native_cpu_public_reset_preserves_prepared_sources_and_retained_outputs() {
                 .into_parts();
         // Resetting an unused model must still allow fresh managed sources.
         model.reset().unwrap();
-        let chat = model.source_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({"role":"user", "content":"left"})],
-            add_generation_prompt: true,
-            ..Default::default()
-        }).unwrap();
+        let chat = model
+            .source_chat(ChatTemplateRequest {
+                messages: vec![serde_json::json!({"role":"user", "content":"left"})],
+                add_generation_prompt: true,
+                ..Default::default()
+            })
+            .unwrap();
         let settings = original_settings(PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(0.0),
@@ -282,8 +300,9 @@ fn native_cpu_public_reset_preserves_prepared_sources_and_retained_outputs() {
         let mut outputs = Vec::new();
         for _ in 0..3 {
             let output = model
-                .start_prepared_chat(PreparedChatRequest::new(&chat, settings), &cancel)
-                .unwrap().unwrap()
+                .start_prepared_chat(PreparedChatRequest::new(&chat, settings.clone()), &cancel)
+                .unwrap()
+                .unwrap()
                 .run(&cancel, &mut |_| {})
                 .unwrap();
             assert!(!output.token_ids().is_empty());
@@ -292,7 +311,8 @@ fn native_cpu_public_reset_preserves_prepared_sources_and_retained_outputs() {
             // The source and every previous output keep their own reservations.
             model.reset().unwrap();
         }
-        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+        model
+            .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
             .unwrap();
     }
 }
@@ -364,7 +384,7 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
         per_record_bytes: 16384,
         total_bytes: 65536,
     };
-    let mut request = PreparedChatRequest::new(&chat, original_settings(settings));
+    let mut request = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
     if text {
         request.output_mode = PreparedChatOutputMode::Text;
     }
@@ -389,7 +409,7 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
             retained_bytes: 64 << 20,
             cumulative_copy_bytes: 256 << 20,
         },
-        ORIGINAL_CAPACITY,
+        native_limits(ORIGINAL_CAPACITY),
         copy_limits(),
     )
     .unwrap();
@@ -652,7 +672,7 @@ fn text_matches_ordinary_sampling_with_policy(
         assert_eq!(resolved.repetition_penalty, 1.1);
         assert_eq!(resolved.max_new_tokens, Some(12));
         let mut records = vec![];
-        let mut request = PreparedChatRequest::new(&chat, original_settings(settings));
+        let mut request = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
         request.output_mode = PreparedChatOutputMode::Text;
         let mut run = model
             .start_controlled_chat(request, trace, Default::default(), collect(&mut records))
@@ -680,7 +700,9 @@ fn text_matches_ordinary_sampling_with_policy(
         model
             .prepare_reset_ordinary()
             .unwrap()
-            .reset_admitted(eredu_core::SessionResetLimits::new(8 * 1024 * 1024 * 1024))
+            .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(
+                8 * 1024 * 1024 * 1024,
+            )))
             .unwrap();
     }
 }
@@ -692,7 +714,9 @@ fn use_family_weights(root: &Path, family: &str) {
     match family {
         "qwen2" => {}
         "k2_horizon_dense" | "k2_horizon_mova" => {
-            let fixture: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
+            let fixture: serde_json::Value = serde_json::from_str(
+                eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON,
+            )
             .unwrap();
             let mut config = fixture[if family == "k2_horizon_dense" {
                 "dense"

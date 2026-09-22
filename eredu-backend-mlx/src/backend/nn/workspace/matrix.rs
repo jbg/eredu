@@ -208,6 +208,8 @@ pub(super) fn emit(
     } else {
         geometry.matmul_cost_with_compaction(allocation, !mixed_row_weight)?
     };
+    let gemm_total = total;
+    let mut custom_total = None;
     let biased = operation.inputs.len() == 3;
     if constructed {
         // PhysicalLinear may select a complete-F32-accumulation BF16 row kernel.
@@ -222,6 +224,7 @@ pub(super) fn emit(
                 )?,
                 add(mul(2, output_capacity)?, capacity(allocation, 1)?)?,
             )?;
+            custom_total = Some(custom);
             total = total.max(custom);
         }
         if biased {
@@ -251,6 +254,23 @@ pub(super) fn emit(
         Output::Allocate(output_capacity)
     };
     sink.output(storage)?;
+    if selected_row {
+        sink.default_scratch(capacity(allocation, 1)?, 1)?;
+    } else if let Some(custom) = custom_total {
+        // Keep both complete selected worker envelopes before taking any domain
+        // peak. Bias belongs to each branch, while only custom has an eager ID.
+        let common = total
+            .checked_sub(gemm_total.max(custom))
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+        sink.default_scratch_alternatives(&[
+            (add(gemm_total, common)? - output_capacity, 0, 0),
+            (
+                add(custom, common)? - output_capacity,
+                capacity(allocation, 1)?,
+                1,
+            ),
+        ])?;
+    }
     if selected_row {
         return sink.finish(total - output_capacity, format_args!("actual BF16 input and completed row-contiguous BF16 weight select the shared Metal row-projection worker; possible input compaction, scalar group seed, result/reshape and separate bias retained; no weight cast or compaction; page={} with bounded oversized reuse", allocation.page_size())).map(Some);
     }

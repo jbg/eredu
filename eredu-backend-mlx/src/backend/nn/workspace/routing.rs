@@ -1,13 +1,13 @@
 //! Selected native routing mechanisms, retaining full index backing and shared
 //! coefficient allocations across distinct logical output views.
 
-use super::facts::{self, add, mul, Emitter, FactResult, HostEmitter, Output};
+use super::facts::{self, Emitter, FactResult, HostEmitter, Output, add, mul};
 use super::{
     matrix::matmul_cost_fixed as matmul_cost, reduction::capacity_fixed as capacity,
     sampling::sort_fixed as sort, *,
 };
 
-mod selector;
+pub(super) mod selector;
 pub(super) use selector::with_projection as with_selector_projection;
 
 fn invalid() -> MlxWorkspaceFactError {
@@ -34,7 +34,9 @@ pub(super) struct JointGeometry {
     pub coefficients: i32,
 }
 pub(super) fn joint_geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<JointGeometry>> {
-    let WorkspaceOperationKindView::JointGroupSelection(spec) = op.kind else { return Ok(None); };
+    let WorkspaceOperationKindView::JointGroupSelection(spec) = op.kind else {
+        return Ok(None);
+    };
     if op.inputs.len() != 4 || op.outputs.len() != 3 {
         return Err(invalid());
     }
@@ -78,8 +80,15 @@ pub(super) fn joint_geometry(op: WorkspaceOperationView<'_>) -> FactResult<Optio
     {
         return Ok(None);
     }
-    Ok(Some(JointGeometry {rows, rows_i32, dimensions:d, groups,
-        selectable:p, selected:k, coefficients}))
+    Ok(Some(JointGeometry {
+        rows,
+        rows_i32,
+        dimensions: d,
+        groups,
+        selectable: p,
+        selected: k,
+        coefficients,
+    }))
 }
 
 pub(super) fn emit(
@@ -90,9 +99,18 @@ pub(super) fn emit(
     if matches!(op.kind, WorkspaceOperationKindView::GroupSelection { .. }) {
         return Ok(selector::emit(op, a, sink)?.map(|(tensor, _)| tensor));
     }
-    let Some(g) = joint_geometry(op)? else { return Ok(None); };
-    let JointGeometry { rows, rows_i32, dimensions: d, groups,
-        selectable: p, selected: k, coefficients } = g;
+    let Some(g) = joint_geometry(op)? else {
+        return Ok(None);
+    };
+    let JointGeometry {
+        rows,
+        rows_i32,
+        dimensions: d,
+        groups,
+        selectable: p,
+        selected: k,
+        coefficients,
+    } = g;
     let primary = mul(rows, p as u64)?;
     let selected = mul(rows, k as u64)?;
     let joined = mul(rows, coefficients as u64)?;
@@ -110,9 +128,13 @@ pub(super) fn emit(
     total = add(total, add(mul(4, primary_bytes)?, capacity(a, p as u64)?)?)?;
     total = add(total, sort(a, primary, rows, p as u64)?)?;
     total = add(total, capacity(a, selected)?)?; // direct GatherAxis of raw logits
-                                                 // Concatenate; negative/logaddexp/negative (including possible promotion);
-                                                 // precise last-axis softmax; fixed and learned scale products/promotions.
+    // Concatenate; negative/logaddexp/negative (including possible promotion);
+    // precise last-axis softmax; fixed and learned scale products/promotions.
     total = add(total, add(mul(10, coefficient_bytes)?, mul(5, scalar)?)?)?;
+    // Joint selection uses the primitive seed-free sigmoid. Log-sigmoid's
+    // logaddexp creates one I32 zero; the coefficient product creates one F32
+    // scale. The other scalar capacities cover execution-side cast/results.
+    sink.default_scratch(mul(2, scalar)?, 2)?;
     let retained = add(primary_bytes, coefficient_bytes)?;
     let scratch = total.checked_sub(retained).ok_or_else(invalid)?;
     sink.output(Output::Allocate(primary_bytes))?;

@@ -2,8 +2,7 @@
 use super::*;
 use crate::{
     composite_execution::{
-        CompositeMediaIngressArchitecture, PreparedCompositeArchitecture,
-        PreparedCompositeInput,
+        CompositeMediaIngressArchitecture, PreparedCompositeArchitecture, PreparedCompositeInput,
     },
     media_plan::BoundPreparedMediaSemantics,
 };
@@ -12,11 +11,11 @@ use eredu_nn::workspace::{
     WorkspaceTensorBufferReport, WorkspaceTraceReport,
 };
 use eredu_runtime::working_memory::{
-    InferenceWorkspaceError, WorkspaceReportMetadata, quote_inference_workspace_with_report_owner,
+    quote_inference_workspace_with_report_owner, InferenceWorkspaceError, WorkspaceReportMetadata,
 };
 use eredu_runtime::{
-    PreparedInputPart, PreparedInputPayload, PreparedModelInput,
     input::OriginalPreparedInputProjection, working_memory::WorkingMemoryUnquotedLease,
+    PreparedInputPart, PreparedInputPayload, PreparedModelInput,
 };
 use std::{borrow::Borrow, cell::RefCell, ops::Deref, rc::Rc};
 
@@ -170,7 +169,9 @@ pub struct OriginalMediaWorkspaceReport {
     _planning: Option<HostMetadataFunding>,
 }
 impl OriginalMediaWorkspaceReport {
-    pub(super) fn into_equations(self) -> InferenceWorkspaceReport { self.equations }
+    pub(super) fn into_equations(self) -> InferenceWorkspaceReport {
+        self.equations
+    }
     /// Moves the completed equation/sampling reports into the shared generation
     /// composer. The caller already retains the exact source registration; no
     /// report, source tensor or sampling history is cloned by this conversion.
@@ -402,10 +403,19 @@ impl PreparedInferenceBlueprint {
         let observer = RefCell::new(observer);
         let trace = RefCell::new(trace);
         self.quote_original_media_with_trace(
-            input, current, geometry, state, context, parameters,
+            input,
+            current,
+            geometry,
+            state,
+            context,
+            parameters,
             Some(TextSamplingInput::Configured(config, filter.into())),
             Some(EquationTraceRef(&trace)),
-            Some(observed::ObservationRef { paths, observer: &observer, invocation_prediction: None }),
+            Some(observed::ObservationRef {
+                paths,
+                observer: &observer,
+                invocation_prediction: None,
+            }),
             communication,
         )
     }
@@ -429,10 +439,19 @@ impl PreparedInferenceBlueprint {
         let observer = RefCell::new(observer);
         let trace = RefCell::new(trace);
         self.quote_original_media_with_trace(
-            input, current, geometry, state, context, parameters,
+            input,
+            current,
+            geometry,
+            state,
+            context,
+            parameters,
             Some(TextSamplingInput::Borrowed(sampling)),
             Some(EquationTraceRef(&trace)),
-            Some(observed::ObservationRef { paths, observer: &observer, invocation_prediction: None }),
+            Some(observed::ObservationRef {
+                paths,
+                observer: &observer,
+                invocation_prediction: None,
+            }),
             communication,
         )
     }
@@ -477,18 +496,24 @@ impl PreparedInferenceBlueprint {
                 ));
             }
             if let Some(observation) = observation {
-                metadata.admit::<(
-                    observed::ObservationRef<'_, '_>,
-                    RefCell<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
-                    RefCell<&mut dyn InferenceEquationTraceObserver>,
-                )>().map_err(|cause| PreparedExecutionError::Backend(metadata.error(cause)))?;
-                observation.validate_selection(geometry, context)
+                metadata
+                    .admit::<(
+                        observed::ObservationRef<'_, '_>,
+                        RefCell<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
+                        RefCell<&mut dyn InferenceEquationTraceObserver>,
+                    )>()
+                    .map_err(|cause| PreparedExecutionError::Backend(metadata.error(cause)))?;
+                observation
+                    .validate_selection(geometry, context)
                     .map_err(PreparedExecutionError::Backend)?;
-                if geometry.max_output_tokens > 0 && observation.requires_sequence_readout()
+                if geometry.max_output_tokens > 0
+                    && observation.requires_sequence_readout()
                     && geometry.output != eredu_core::OutputDemand::Sequence
                 {
-                    return Err(preparation_message(context,
-                        format_args!("media observation requires sequence readout")));
+                    return Err(preparation_message(
+                        context,
+                        format_args!("media observation requires sequence readout"),
+                    ));
                 }
             }
             if sampling.is_some()
@@ -512,8 +537,11 @@ impl PreparedInferenceBlueprint {
             // catalogs stay with the enclosing completed-input quote owner.
             if self.selected().execution().parallel_topology().is_none() {
                 eredu_runtime::working_memory::validate_workspace_state_realization(
-                    state, self.selected().text_realization().state(), context,
-                ).map_err(PreparedExecutionError::Metadata)?;
+                    state,
+                    self.selected().text_realization().state(),
+                    context,
+                )
+                .map_err(PreparedExecutionError::Metadata)?;
             }
             if parameters.is_some()
                 && !matches!(
@@ -544,12 +572,22 @@ impl PreparedInferenceBlueprint {
                     input: &inputs,
                     intervals: Some(&intervals),
                 }),
-            }
-            ;
+            };
             if self.selected().execution().parallel_topology().is_some() {
-                let source = self.sources.construction_semantics().direct_partition.get()
-                    .ok_or_else(|| preparation_message(context, format_args!("completed partition media source is unavailable")))?;
-                source.quote_media(&self.sources, communication, visitor).map_err(PreparedExecutionError::Metadata)
+                let source = self
+                    .sources
+                    .construction_semantics()
+                    .direct_partition
+                    .get()
+                    .ok_or_else(|| {
+                        preparation_message(
+                            context,
+                            format_args!("completed partition media source is unavailable"),
+                        )
+                    })?;
+                source
+                    .quote_media(&self.sources, communication, visitor)
+                    .map_err(PreparedExecutionError::Metadata)
             } else {
                 visitor.construct(self)
             }
@@ -643,11 +681,12 @@ impl EquationVisitor<'_, '_, '_> {
             PreparedCompositeArchitecture<A>,
         >,
         admission: A::AdmissionConfig,
-        provider:super::EquationRoutedProvider,
+        provider: super::EquationRoutedProvider,
     ) -> Result<EquationQuote, Error>
     where
         A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error>
-            + eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend,ResidentState> + 'static,
+            + eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState>
+            + 'static,
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
     {
@@ -662,25 +701,32 @@ impl EquationVisitor<'_, '_, '_> {
         }
         let (original_roots, plan) = self.prepare_media_interval_source::<A>()?;
         modules.retain_composite_graph(self.context)?;
-        let runtime =
-            EquationRuntime::from_prepared(
-                modules, self.parameters, self.context,
-                self.observation.map(|observation| observation.paths), false,
-            )?;
-        self.context.charge_metadata(std::mem::size_of::<runtime::Serial<'_, A>>())?;
+        let runtime = EquationRuntime::from_prepared(
+            modules,
+            self.parameters,
+            self.context,
+            self.observation.map(|observation| observation.paths),
+            false,
+        )?;
+        self.context
+            .charge_metadata(std::mem::size_of::<runtime::Serial<'_, A>>())?;
         let mut driver = runtime::Serial { runtime, provider };
         self.quote_media_intervals::<A, _>(admission, original_roots, plan, &mut driver)
     }
 
-    pub(super) fn prepare_media_interval_source<A>(&self) -> Result<(
-        Vec<WorkspaceTensor>, A::IngressPlan,
-    ), Error>
-    where A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error> + 'static,
+    pub(super) fn prepare_media_interval_source<A>(
+        &self,
+    ) -> Result<(Vec<WorkspaceTensor>, A::IngressPlan), Error>
+    where
+        A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error>
+            + 'static,
         A::InputPartPlan: 'static,
     {
         let reference = self.media.expect("typed media visitor");
         let input = reference.input.borrow_mut().take().ok_or_else(|| {
-            self.context.metadata_error(format_args!("media equation source consumed more than once"))
+            self.context.metadata_error(format_args!(
+                "media equation source consumed more than once"
+            ))
         })?;
         let mut roots = self.context.metadata_vec(0)?;
         for value in input.prepared.parts().iter().flat_map(|part| {
@@ -689,22 +735,39 @@ impl EquationVisitor<'_, '_, '_> {
             self.context.reserve_metadata_vec(&mut roots, 1)?;
             roots.push(value.clone());
         }
-        let plan = A::prepare_original_workspace_ingress_plan_with_metadata(input, self.geometry, self.context)?;
+        let plan = A::prepare_original_workspace_ingress_plan_with_metadata(
+            input,
+            self.geometry,
+            self.context,
+        )?;
         Ok((roots, plan))
     }
 
-    pub(super) fn quote_media_intervals<A, D>(self, admission: A::AdmissionConfig,
-        original_roots: Vec<WorkspaceTensor>, plan: A::IngressPlan, driver: &mut D,
+    pub(super) fn quote_media_intervals<A, D>(
+        self,
+        admission: A::AdmissionConfig,
+        original_roots: Vec<WorkspaceTensor>,
+        plan: A::IngressPlan,
+        driver: &mut D,
     ) -> Result<EquationQuote, Error>
-    where A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error> + 'static,
+    where
+        A: CompositeMediaIngressArchitecture<WorkspaceBackend, ResidentState, Error = Error>
+            + 'static,
         A::InputPartPlan: 'static,
         D: runtime::Driver<A>,
     {
         self.context.charge_metadata(std::mem::size_of::<(
-            &mut D, A::AdmissionConfig, A::IngressPlan, Vec<WorkspaceTensor>,
+            &mut D,
+            A::AdmissionConfig,
+            A::IngressPlan,
+            Vec<WorkspaceTensor>,
             Result<EquationQuote, Error>,
         )>())?;
-        let intervals = self.media.expect("typed media visitor").intervals.expect("retained media intervals");
+        let intervals = self
+            .media
+            .expect("typed media visitor")
+            .intervals
+            .expect("retained media intervals");
         let observation_host_peak = driver.observation_host_peak_bytes(self.context)?;
         let mut source = driver.prepare_source(plan, self.context)?;
         let mut state = self.state.try_clone_workspace(self.context)?;
@@ -720,24 +783,43 @@ impl EquationVisitor<'_, '_, '_> {
                     self.context.reserve_metadata_vec(&mut intervals, 1)?;
                 }
                 let (position, count, mut demand) = match span {
-                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
-                    InferenceWorkspaceSpan::Prefill(chunk) => {
-                        (chunk.position, chunk.input.end - chunk.input.start, chunk.output)
+                    InferenceWorkspaceSpan::Sampling(_) => {
+                        unreachable!("model equation scheduler emits only prefill/decode spans")
                     }
-                    InferenceWorkspaceSpan::Decode { position, output, .. } => (*position, 1, *output),
+                    InferenceWorkspaceSpan::Prefill(chunk) => (
+                        chunk.position,
+                        chunk.input.end - chunk.input.start,
+                        chunk.output,
+                    ),
+                    InferenceWorkspaceSpan::Decode {
+                        position, output, ..
+                    } => (*position, 1, *output),
                 };
                 validate_frontier_with_context(&state, position, self.context)?;
                 let active = match self.observation {
-                    Some(observation) => observation.begin_span(self.geometry, span, self.context)?,
+                    Some(observation) => {
+                        observation.begin_span(self.geometry, span, self.context)?
+                    }
                     None => false,
                 };
-                if active && self.observation.expect("active observation").requires_sequence_readout() {
+                if active
+                    && self
+                        .observation
+                        .expect("active observation")
+                        .requires_sequence_readout()
+                {
                     demand = eredu_core::OutputDemand::Sequence;
                 }
-                metadata.admit::<(
-                    bool, eredu_core::OutputDemand, eredu_runtime::prefill::PrefillChunk,
-                    Option<WorkspaceTensor>, Option<A::ForwardContext>, CutHook,
-                )>().map_err(|cause| metadata.error(cause))?;
+                metadata
+                    .admit::<(
+                        bool,
+                        eredu_core::OutputDemand,
+                        eredu_runtime::prefill::PrefillChunk,
+                        Option<WorkspaceTensor>,
+                        Option<A::ForwardContext>,
+                        CutHook,
+                    )>()
+                    .map_err(|cause| metadata.error(cause))?;
                 let mut opening = copy_roots(&original_roots, self.context)?;
                 for value in state
                     .as_ref()
@@ -762,17 +844,35 @@ impl EquationVisitor<'_, '_, '_> {
                 let mut forward = None;
                 let mut input_operation = None;
                 let scores = match span {
-                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
+                    InferenceWorkspaceSpan::Sampling(_) => {
+                        unreachable!("model equation scheduler emits only prefill/decode spans")
+                    }
                     InferenceWorkspaceSpan::Prefill(chunk) => {
                         let mut chunk = chunk.clone();
                         chunk.output = demand;
                         let (scores, context) = if active {
-                            let mut observer = self.observation.expect("active observation").observer.borrow_mut();
-                            driver.prefill(&mut source, &chunk, &mut state, self.context,
-                                &mut hook, Some(&mut **observer))?
+                            let mut observer = self
+                                .observation
+                                .expect("active observation")
+                                .observer
+                                .borrow_mut();
+                            driver.prefill(
+                                &mut source,
+                                &chunk,
+                                &mut state,
+                                self.context,
+                                &mut hook,
+                                Some(&mut **observer),
+                            )?
                         } else {
-                            driver.prefill(&mut source, &chunk, &mut state, self.context,
-                                &mut hook, None)?
+                            driver.prefill(
+                                &mut source,
+                                &chunk,
+                                &mut state,
+                                self.context,
+                                &mut hook,
+                                None,
+                            )?
                         };
                         forward = Some(context);
                         scores
@@ -814,26 +914,47 @@ impl EquationVisitor<'_, '_, '_> {
                             self.context,
                         )?;
                         let input = PreparedCompositeInput::new_with_diagnostic(
-                            &prepared, &admitted,
+                            &prepared,
+                            &admitted,
                             |message| self.context.metadata_error(format_args!("{message}")),
                         )?;
                         if active {
-                            let mut observer = self.observation.expect("active observation").observer.borrow_mut();
-                            driver.decode(input, &mut state, self.context, demand, Some(&mut **observer))?
+                            let mut observer = self
+                                .observation
+                                .expect("active observation")
+                                .observer
+                                .borrow_mut();
+                            driver.decode(
+                                input,
+                                &mut state,
+                                self.context,
+                                demand,
+                                Some(&mut **observer),
+                            )?
                         } else {
                             driver.decode(input, &mut state, self.context, demand, None)?
                         }
                     }
                 };
                 let scores = if active {
-                    let mut observer = self.observation.expect("active observation").observer.borrow_mut();
+                    let mut observer = self
+                        .observation
+                        .expect("active observation")
+                        .observer
+                        .borrow_mut();
                     driver.finish_logits(scores, demand, Some(&mut **observer), self.context)?
-                } else { driver.finish_logits(scores, demand, None, self.context)? };
+                } else {
+                    driver.finish_logits(scores, demand, None, self.context)?
+                };
                 // Match the native text output selection after complete logits
                 // observation; its source backing remains in the observer roots.
                 let scores = if self.observation.is_some() && self.sampling.is_some() {
-                    scores.map(|scores| observed::sampling_row(&scores, self.context)).transpose()?
-                } else { scores };
+                    scores
+                        .map(|scores| observed::sampling_row(&scores, self.context))
+                        .transpose()?
+                } else {
+                    scores
+                };
                 let mut rollback = self.context.metadata_vec(checkpoint.len())?;
                 for lane in &checkpoint {
                     rollback.push(lane.checkpoint_for_transaction(self.context)?);
@@ -865,9 +986,11 @@ impl EquationVisitor<'_, '_, '_> {
                 }
                 let mut report = self.context.finish_report(&closing)?;
                 if self.observation.is_some() {
-                    report = observed::with_hook_workspace(report, observation_host_peak, self.context)?;
+                    report =
+                        observed::with_hook_workspace(report, observation_host_peak, self.context)?;
                 }
                 if let Some(reason) = self.unpriced_execution {
+                    report.physical_domains = None;
                     report.state.as_mut().expect("span opened").transient_bytes = None;
                     report.tensor_buffers.transient_bytes = None;
                     report.host_workspace_bytes = None;
@@ -878,7 +1001,10 @@ impl EquationVisitor<'_, '_, '_> {
                         .push(self.context.metadata_string(format_args!("{reason}"))?);
                 }
                 if active {
-                    self.observation.expect("active observation").observer.borrow_mut()
+                    self.observation
+                        .expect("active observation")
+                        .observer
+                        .borrow_mut()
                         .end_span(span, self.context)?;
                 }
                 if let Some(trace) = self.trace {
@@ -921,7 +1047,7 @@ impl EquationVisitor<'_, '_, '_> {
                 trace as &mut dyn eredu_runtime::working_memory::SamplingWorkspaceObserver
             }),
         )?;
-        Ok((equations, sampling))
+        Ok((equations.with_traced_media(), sampling))
     }
 }
 

@@ -31,7 +31,11 @@ fn head(streams: i32, hidden_size: i32) -> HyperHeadSpec {
 }
 struct BindHyper<'a>(&'a [MlxTensor; 6]);
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for BindHyper<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         let index = match metadata.id().as_str() {
             "mix.function" => 0,
             "mix.base" => 1,

@@ -21,7 +21,9 @@ use crate::backend::runtime::cache::state::{
 use eredu_runtime::replicated_session::ReplicatedTextControlOrigin;
 use eredu_runtime::working_memory::WorkingMemoryStorage;
 use eredu_runtime::{SharedHostMetadata, SharedPreparedInputCacheIdentity};
-pub(in crate::composition::mlx::session) use resume_quote::{PreparedSavedTextResumeQuote, ResumeCapture};
+pub(in crate::composition::mlx::session) use resume_quote::{
+    PreparedSavedTextResumeQuote, ResumeCapture,
+};
 
 /// Temporary access custody. The saved result never retains a live executable.
 #[derive(Clone)]
@@ -31,13 +33,6 @@ enum DecoderCopyOwner {
 }
 
 impl DecoderCopyOwner {
-    fn prepare(&self) -> Result<PreparedResidentDecoderCopy<'_>, Error> {
-        match self {
-            Self::Live(payload) => payload.model.erased().prepare_resident_decoder_copy(),
-            Self::Saved(saved) => saved.native.prepare_copy(),
-        }
-    }
-
     fn prepare_fixed(
         &self,
     ) -> Result<
@@ -112,67 +107,40 @@ impl CopyRecovery {
 pub(in crate::composition::mlx::session) struct PreparedTextComponentsCopy<'a> {
     sampling: TextArrayBinding<'a>,
     decoder: DecoderCopyOwner,
-    source_native: Option<crate::backend::nn::workspace::ProjectedNativeStorage>,
+    source_native: crate::backend::nn::workspace::ProjectedNativeStorage,
     proof: RegisteredWorkspaceCopy<StorageIdentity>,
     complete_source: WorkingMemoryStorage<StorageIdentity>,
-    required_bytes: u64,
-    original: Option<original::CopyRequirements>,
-    physical_extra: u64,
+    original: original::CopyRequirements,
+    physical_extra: eredu_core::DomainMemoryRequirements,
     collector: RootCollectorPlan,
     destination: TextCopyDestination,
     // The preparation owner outlives every source/proof/table metadata field.
-    host_preparation: Option<eredu_core::HostPreparationAuthority>,
+    host_preparation: eredu_core::HostPreparationAuthority,
 }
 
 impl<'a> PreparedTextComponentsCopy<'a> {
-    pub(in crate::composition::mlx::session) fn prepare(
-        runtime: &ModelRuntime<MlxBackend<'_>>,
-        sampling: &'a super::super::super::generation::MlxTextSamplingState,
-        pending: Option<&'a MlxTextToken>,
-    ) -> Result<Self, Error> {
-        Self::prepare_with_host(runtime, sampling, pending, None)
-    }
-
-    pub(in crate::composition::mlx::session) fn prepare_with_host(
-        runtime: &ModelRuntime<MlxBackend<'_>>,
-        sampling: &'a super::super::super::generation::MlxTextSamplingState,
-        pending: Option<&'a MlxTextToken>,
-        host: Option<&eredu_core::HostPreparationAuthority>,
-    ) -> Result<Self, Error> {
-        Self::prepare_with_input(
-            runtime,
-            sampling,
-            pending.map(eredu_core::PendingTextInput::Decode),
-            host,
-        )
-    }
-
-    pub(in crate::composition::mlx::session) fn prepare_with_input(
-        runtime: &ModelRuntime<MlxBackend<'_>>,
-        sampling: &'a super::super::super::generation::MlxTextSamplingState,
-        pending: Option<eredu_core::PendingTextInput<&'a MlxModelInput, &'a MlxTextToken>>,
-        host: Option<&eredu_core::HostPreparationAuthority>,
-    ) -> Result<Self, Error> {
-        Self::prepare_with_input_and_capture(runtime, sampling, pending, host, None)
-    }
-
     pub(in crate::composition::mlx::session) fn prepare_with_input_and_capture(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         sampling: &'a super::super::super::generation::MlxTextSamplingState,
         pending: Option<eredu_core::PendingTextInput<&'a MlxModelInput, &'a MlxTextToken>>,
-        host: Option<&eredu_core::HostPreparationAuthority>,
+        host: &eredu_core::HostPreparationAuthority,
         capture: Option<&super::capture::SavedCaptureCheckpoint>,
     ) -> Result<Self, Error> {
         let capture_source = capture.map(|capture| capture.checkpoint().source());
         let result = (|| match pending {
             Some(eredu_core::PendingTextInput::Prefill(prompt)) => {
-                let authority = host.ok_or_else(unknown)?;
+                let authority = host;
                 cold_source::inspect_live(runtime, sampling, None, capture_source)
                     .map_err(|cause| cold_source::retain_failure(cause, authority))?;
                 let prompt = super::pending_input::PromptCopySource::prepare(sampling, prompt)
                     .map_err(|cause| cold_source::retain_failure(cause.into(), authority))?;
-                let source =
-                    TextArraySource::inspect_with_capture(runtime, sampling, None, host, capture)?;
+                let source = TextArraySource::inspect_with_capture(
+                    runtime,
+                    sampling,
+                    None,
+                    Some(host),
+                    capture,
+                )?;
                 Self::prepare_source(
                     runtime,
                     TextArrayBinding::LivePrefill {
@@ -190,26 +158,19 @@ impl<'a> PreparedTextComponentsCopy<'a> {
                     None => None,
                     Some(eredu_core::PendingTextInput::Prefill(_)) => unreachable!(),
                 };
-                if let Some(authority) = host {
-                    cold_source::inspect_live(runtime, sampling, pending, capture_source)
-                        .map_err(|cause| cold_source::retain_failure(cause, authority))?;
-                }
+                cold_source::inspect_live(runtime, sampling, pending, capture_source)
+                    .map_err(|cause| cold_source::retain_failure(cause, host))?;
                 Self::prepare_live_inner(runtime, sampling, pending, host, capture)
             }
         })();
-        match host {
-            Some(authority) => {
-                result.map_err(|cause| cold_source::retain_operation_failure(cause, authority))
-            }
-            None => result,
-        }
+        result.map_err(|cause| cold_source::retain_operation_failure(cause, host))
     }
 
     fn prepare_live_inner(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         sampling: &'a super::super::super::generation::MlxTextSamplingState,
         pending: Option<&'a MlxTextToken>,
-        host: Option<&eredu_core::HostPreparationAuthority>,
+        host: &eredu_core::HostPreparationAuthority,
         capture: Option<&super::capture::SavedCaptureCheckpoint>,
     ) -> Result<Self, Error> {
         runtime.session().validate_backend(runtime.backend())?;
@@ -220,7 +181,7 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             .require_idle()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let source =
-            TextArraySource::inspect_with_capture(runtime, sampling, pending, host, capture)?;
+            TextArraySource::inspect_with_capture(runtime, sampling, pending, Some(host), capture)?;
         Self::prepare_source(
             runtime,
             TextArrayBinding::Live {
@@ -233,23 +194,11 @@ impl<'a> PreparedTextComponentsCopy<'a> {
         )
     }
 
-    pub(in crate::composition::mlx::session) fn prepare_saved(
-        runtime: &ModelRuntime<MlxBackend<'_>>,
-        saved: &'a CopiedTextComponents,
-    ) -> Result<Self, Error> {
-        Self::prepare_source(
-            runtime,
-            TextArrayBinding::Saved(&saved.sampling),
-            DecoderCopyOwner::Saved(saved.decoder.clone()),
-            None,
-        )
-    }
-
     fn prepare_source(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         sampling: TextArrayBinding<'a>,
         decoder: DecoderCopyOwner,
-        host: Option<&eredu_core::HostPreparationAuthority>,
+        host: &eredu_core::HostPreparationAuthority,
     ) -> Result<Self, Error> {
         let session = runtime.session();
         session.validate_backend(runtime.backend())?;
@@ -265,16 +214,10 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             .borrow_mut()
             .begin_submission()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let plan = match host {
-            Some(authority) => decoder.prepare_fixed().map_err(|cause| {
-                cold_source::retain_failure(
-                    cold_source::SourcePreparationCause::Decoder(cause),
-                    authority,
-                )
-            })?,
-            None => decoder.prepare()?,
-        };
-        let pool = runtime.backend().memory_pool();
+        let plan = decoder.prepare_fixed().map_err(|cause| {
+            cold_source::retain_failure(cold_source::SourcePreparationCause::Decoder(cause), host)
+        })?;
+        let pool = runtime.backend().memory_ledger();
         let collector_for = |operand_count: usize, host_rows: usize| {
             let mut source_count =
                 Some(sampling.key().iter().count() + sampling.pending().iter().count());
@@ -315,137 +258,57 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             let collector = RootCollectorPlan::from_root_count(roots)?;
             Ok::<_, Error>(collector)
         };
-        let (program, registered, complete_source, collector, original, source_native) =
-            if let Some(host) = host {
-                let mechanisms = session
-                    .payload
-                    .model
-                    .workspace_mechanisms()
-                    .ok_or_else(unknown)?;
-                let finite = finite_preparation::SnapshotFinitePreparation::inspect(
-                    &decoder,
-                    &plan,
-                    sampling.key(),
-                    sampling.pending(),
-                    pool,
-                    mechanisms,
-                    runtime.backend(),
-                )
-                .map_err(|cause| finite_preparation::retain_failure(cause, host))?;
-                let prepared = finite.construct(host)?;
-                let collector = collector_for(
-                    prepared.operand_count,
-                    prepared.copy_requirements.host_rows(),
-                )?;
-                (
-                    prepared.program,
-                    prepared.registered,
-                    prepared.complete_source,
-                    collector,
-                    Some(prepared.copy_requirements),
-                    Some(prepared.source_native),
-                )
-            } else {
-                let source = decoder.complete_storage()?;
-                let complete_source = source.pin_registered(pool)?;
-                let mechanisms = session
-                    .payload
-                    .model
-                    .resident_workspace_mechanisms()
-                    .ok_or_else(unknown)?;
-                let context = WorkspaceContext::new(mechanisms);
-                let mut operand_count = Some(
-                    usize::from(sampling.key().is_some())
-                        + usize::from(sampling.pending().is_some()),
-                );
-                plan.visit_operands(&mut |_| {
-                    operand_count = operand_count.and_then(|count| count.checked_add(1))
-                })
-                .map_err(
-                    crate::backend::runtime::cache::state::SnapshotProjectionCause::into_error,
-                )?;
-                let operand_count =
-                    operand_count.ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-                let mut native = None;
-                let mut projection = crate::backend::nn::workspace::OwnedArrayProjection::prepare(
-                    &mut native,
-                    &context,
-                    operand_count,
-                )
-                .map_err(|cause| Error::Other(Box::new(cause)))?;
-                let mut inputs = Vec::new();
-                inputs
-                    .try_reserve_exact(operand_count)
-                    .map_err(|cause| Error::Other(Box::new(cause)))?;
-                let mut failure = None;
-                let mut project = |array: &Array| {
-                    if failure.is_none() {
-                        match projection.project_prepared(array) {
-                            Ok(input) => inputs.push(input),
-                            Err(cause) => failure = Some(cause),
-                        }
-                    }
-                };
-                plan.visit_operands(&mut project).map_err(
-                    crate::backend::runtime::cache::state::SnapshotProjectionCause::into_error,
-                )?;
-                for array in sampling.key().into_iter().chain(sampling.pending()) {
-                    project(array);
-                }
-                if let Some(cause) = failure {
-                    return Err(Error::Other(Box::new(cause)));
-                }
-                drop(projection);
-                let native = native.expect("installed owned projection");
-                let collector = collector_for(inputs.len(), 0)?;
-                if !native.is_complete() {
-                    return Err(unknown());
-                }
-                let registered = RegisteredWorkspaceStorage::bind(
-                    pool,
-                    &context,
-                    native
-                        .iter()
-                        .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
-                )
-                .map_err(memory)?;
-                let program = WorkspaceIsolatedCopyPlan::prepare(
-                    &context,
-                    registered.borrowed_storage(),
-                    &inputs,
-                )
-                .map_err(|error| Error::Other(Box::new(error)))?;
-                (program, registered, complete_source, collector, None, None)
-            };
-        let numerical_bytes = program.incremental_bytes().ok_or_else(unknown)?;
-        let host_bytes = sampling
-            .sampler()
-            .prepare_copy()
-            .map_err(|error| Error::Other(Box::new(error)))?
-            .retained_bytes();
-        let decoder_bytes = match host {
-            Some(authority) => plan
-                .host_copy_initialization_peak_bytes()
-                .map_err(|cause| {
-                    cold_source::retain_failure(
-                        cold_source::SourcePreparationCause::Decoder(cause),
-                        authority,
-                    )
-                })?,
-            None => plan.host_copy(pool)?.initialization_peak_bytes(),
+        let (program, registered, complete_source, collector, original, source_native) = {
+            let mechanisms = session
+                .payload
+                .model
+                .workspace_mechanisms()
+                .ok_or_else(unknown)?;
+            let finite = finite_preparation::SnapshotFinitePreparation::inspect(
+                &decoder,
+                &plan,
+                sampling.key(),
+                sampling.pending(),
+                pool,
+                mechanisms,
+                runtime.backend(),
+            )
+            .map_err(|cause| finite_preparation::retain_failure(cause, host))?;
+            let prepared = finite.construct(host)?;
+            let collector = collector_for(
+                prepared.operand_count,
+                prepared.copy_requirements.host_rows(),
+            )?;
+            (
+                prepared.program,
+                prepared.registered,
+                prepared.complete_source,
+                collector,
+                prepared.copy_requirements,
+                prepared.source_native,
+            )
         };
-        let physical_extra = original
-            .map(|requirements| requirements.physical_extra(numerical_bytes))
-            .transpose()
-            .map_err(memory)?
-            .unwrap_or(0);
-        let native_controls = collector.copy_control_bytes()?;
-        let required_bytes = host_bytes
-            .checked_add(decoder_bytes)
-            .and_then(|n| n.checked_add(numerical_bytes))
-            .and_then(|n| n.checked_add(physical_extra))
-            .and_then(|n| n.checked_add(native_controls))
-            .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
+        let numerical_requirements = &program
+            .report()
+            .physical_domains
+            .as_ref()
+            .ok_or_else(unknown)?
+            .native_allocations;
+        let extra = original
+            .physical_extra(numerical_requirements)
+            .map_err(memory)?;
+        let mut physical_extra = eredu_core::DomainMemoryRequirements::zero(pool.topology());
+        if let Some((domain, bytes)) = extra {
+            physical_extra
+                .add_allocation(
+                    bytes,
+                    &eredu_core::MemoryPlacement::fixed(pool.topology(), domain)
+                        .map_err(WorkingMemoryError::from)
+                        .map_err(memory)?,
+                )
+                .map_err(WorkingMemoryError::from)
+                .map_err(memory)?;
+        }
         let proof = RegisteredWorkspaceCopy::bind(program, registered)
             .map_err(|error| Error::Other(Box::new(error)))?;
         Ok(Self {
@@ -454,7 +317,6 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             source_native,
             proof,
             complete_source,
-            required_bytes,
             original,
             physical_extra,
             collector,
@@ -462,12 +324,8 @@ impl<'a> PreparedTextComponentsCopy<'a> {
                 session: Rc::clone(&session.poison),
                 lease,
             },
-            host_preparation: host.cloned(),
+            host_preparation: host.clone(),
         })
-    }
-
-    pub(in crate::composition::mlx::session) fn required_bytes(&self) -> u64 {
-        self.required_bytes
     }
 
     pub(in crate::composition::mlx::session) fn copy(
@@ -477,12 +335,7 @@ impl<'a> PreparedTextComponentsCopy<'a> {
     ) -> Result<CopiedTextComponents, Error> {
         let host = self.host_preparation.clone();
         let result = self.copy_inner(runtime, limits);
-        match host {
-            Some(authority) => {
-                result.map_err(|cause| cold_source::retain_operation_failure(cause, &authority))
-            }
-            None => result,
-        }
+        result.map_err(|cause| cold_source::retain_operation_failure(cause, &host))
     }
 
     fn copy_inner(
@@ -493,34 +346,26 @@ impl<'a> PreparedTextComponentsCopy<'a> {
         self.destination.validate(runtime)?;
         self.sampling.validate(runtime)?;
         self.decoder.validate(runtime)?;
-        let plan = match &self.host_preparation {
-            Some(authority) => self.decoder.prepare_fixed().map_err(|cause| {
-                cold_source::retain_failure(
-                    cold_source::SourcePreparationCause::Decoder(cause),
-                    authority,
-                )
-            })?,
-            None => self.decoder.prepare()?,
-        };
+        let plan = self.decoder.prepare_fixed().map_err(|cause| {
+            cold_source::retain_failure(
+                cold_source::SourcePreparationCause::Decoder(cause),
+                &self.host_preparation,
+            )
+        })?;
         let input = self.decoder.input_identity()?;
         let origin = self.decoder.control_origin()?;
         let (temperature, next_prediction, parameter_epoch) = self.sampling.metadata();
-        let pool = runtime.backend().memory_pool();
+        let pool = runtime.backend().memory_ledger();
         // Recount the same pinned source before admitting any destination. The
         // borrowed environment is consumed into owned native controls before
         // taking the mutable session loan.
         let native_error = |cause| {
             cold_source::retain_failure(
                 cold_source::SourcePreparationCause::NativeCopy(cause),
-                self.host_preparation
-                    .as_ref()
-                    .expect("original requirements retain H"),
+                &self.host_preparation,
             )
         };
-        let environment = if self
-            .original
-            .is_some_and(original::CopyRequirements::has_native)
-        {
+        let environment = if self.original.has_native() {
             Some(
                 runtime
                     .backend()
@@ -545,14 +390,10 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             .map_err(original::CopyPreparationCause::from)
             .map_err(native_error)?
             .flatten();
-        let publication = self
-            .original
-            .map(|requirements| {
-                requirements.validate_native(native_plan.as_ref())?;
-                requirements.publication_plan()
-            })
-            .transpose()
+        self.original
+            .validate_native(native_plan.as_ref())
             .map_err(memory)?;
+        let publication = self.original.publication_plan().map_err(memory)?;
         let initialized = if native_plan.is_some() {
             Some(
                 runtime
@@ -567,24 +408,38 @@ impl<'a> PreparedTextComponentsCopy<'a> {
         };
         let sampling = RegisteredSamplingCopy::prepare(self.sampling.borrow_funded()?, self.proof)
             .map_err(|error| Error::Other(Box::new(error)))?;
-        let host_copy = match &self.host_preparation {
-            Some(authority) => plan.host_copy_prepared(pool, authority)?,
-            None => plan.host_copy(pool)?,
-        };
+        let host_copy = plan.host_copy_prepared(pool, &self.host_preparation)?;
         let mut limits = limits;
-        // Native physical_bytes is the whole copy envelope. Only its positive
-        // delta above the shared numerical proof enters the same B account.
-        limits.safety_reserve_bytes = limits
-            .safety_reserve_bytes
-            .checked_add(self.physical_extra)
-            .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
+        limits.additional_requirements = Some(std::sync::Arc::new(
+            match limits.additional_requirements.take() {
+                Some(existing) => existing
+                    .checked_add(&self.physical_extra)
+                    .map_err(WorkingMemoryError::from)
+                    .map_err(memory)?,
+                None => self.physical_extra,
+            },
+        ));
+        #[cfg(all(
+            test,
+            target_vendor = "apple",
+            feature = "metal",
+            not(feature = "cuda")
+        ))]
+        let limits = tests::limits(pool, limits);
         let (sampler, mut slots, account) = host_copy.admit(
             pool,
             sampling,
             self.complete_source,
-            self.collector.limits(limits)?,
+            self.collector.limits(limits, false)?,
         )?;
         let (custody, scope) = account.into_parts();
+        #[cfg(all(
+            test,
+            target_vendor = "apple",
+            feature = "metal",
+            not(feature = "cuda")
+        ))]
+        tests::charged(&custody);
         let roots = match self.collector.construct() {
             Ok(roots) => roots,
             Err(cause) => {
@@ -622,35 +477,21 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             }
         }
         drop(environment);
-        let funding = match publication {
-            Some(publication) => match publication.construct(
-                scope,
-                &custody,
-                self.host_preparation
-                    .as_ref()
-                    .expect("original publication retains H"),
-                prepared.as_ref().map(|prepared| prepared.budget()),
-            ) {
-                Ok(funding) => funding,
-                Err(cause) => {
-                    // The constructor retires/certifies its untouched scope;
-                    // final empty tables and sampler retire before its error.
-                    drop((slots, sampler));
-                    return Err(cause);
-                }
-            },
-            None => text_funding::FundedWork::new(scope),
+        let funding = match publication.construct(
+            scope,
+            &custody,
+            &self.host_preparation,
+            prepared.as_ref().map(|prepared| prepared.budget()),
+        ) {
+            Ok(funding) => funding,
+            Err(cause) => {
+                drop((slots, sampler));
+                return Err(cause);
+            }
         };
-        let original = self.original.is_some();
-        let host_only = original && prepared.is_none();
+        let host_only = prepared.is_none();
         let (backend, session) = runtime.parts_mut();
-        // Ordinary stream cloning preserves its existing ownership. The
-        // original worker uses the exact admitted environment stream loan.
-        let ordinary_stream = (!original).then(|| backend.stream().clone());
-        let stream = ordinary_stream.as_ref().unwrap_or_else(|| backend.stream());
-        if !original {
-            original::retain_sources(&plan, &self.sampling, &roots, false, None)?;
-        }
+        let stream = backend.stream();
         let mut execution = None;
         let mut submission = None;
         let (native, key, pending) = if host_only {
@@ -663,7 +504,7 @@ impl<'a> PreparedTextComponentsCopy<'a> {
                 stream,
                 &roots,
                 &funding,
-                self.host_preparation.as_ref(),
+                &self.host_preparation,
             )?
         } else {
             let owner = SubmissionResources::with_purpose(
@@ -694,15 +535,13 @@ impl<'a> PreparedTextComponentsCopy<'a> {
             // The submission and original bank now retain every failure path,
             // including a refusal while cloning the first source descriptor.
             let copied = original::during_construction(&mut execution, || {
-                if original {
-                    original::retain_sources(
-                        &plan,
-                        &self.sampling,
-                        &roots,
-                        true,
-                        self.source_native.as_ref(),
-                    )?;
-                }
+                original::retain_sources(
+                    &plan,
+                    &self.sampling,
+                    &roots,
+                    true,
+                    Some(&self.source_native),
+                )?;
                 copy_native(
                     plan,
                     slots,
@@ -710,7 +549,7 @@ impl<'a> PreparedTextComponentsCopy<'a> {
                     stream,
                     &roots,
                     &funding,
-                    self.host_preparation.as_ref(),
+                    &self.host_preparation,
                 )
             });
             let copied = finish_saved_copy(operation, copied)?;
@@ -720,23 +559,17 @@ impl<'a> PreparedTextComponentsCopy<'a> {
         // Keep execution (and its original buffer witness) alive until the
         // complete result has been registered and the neutral scope certified.
         let mut host = funding.prepare_inventory()?;
-        if let Some(authority) = &self.host_preparation {
-            let destination = original::destination_plan(&native, authority)?;
-            let mut failure = None;
-            destination.visit_registered_child_metadata_borrowed(&mut |metadata| {
-                if failure.is_none() {
-                    failure = host.include_slot_metadata(metadata.clone()).err();
-                }
-            });
-            if let Some(cause) = failure {
-                return Err(cause.into());
+        let destination = original::destination_plan(&native, &self.host_preparation)?;
+        let mut failure = None;
+        destination.visit_registered_child_metadata_borrowed(&mut |metadata| {
+            if failure.is_none() {
+                failure = host.include_slot_metadata(metadata.clone()).err();
             }
-        } else {
-            native.visit_registered_child_metadata(&mut |metadata| {
-                host.include_slot_metadata(metadata.clone())
-                    .map_err(Error::from)
-            })?;
+        });
+        if let Some(cause) = failure {
+            return Err(cause.into());
         }
+        drop(destination);
         funding.publish(host)?;
         if let Some(owner) = &submission {
             if let SubmissionPurpose::SavedComponentsCopy(recovery) = &owner.purpose {
@@ -745,12 +578,12 @@ impl<'a> PreparedTextComponentsCopy<'a> {
         }
         funding.certify()?;
         drop(execution);
-        Ok(CopiedTextComponents {
+        let copied = CopiedTextComponents {
             decoder: FrozenDecoderOwner::new(FrozenDecoder {
                 native,
                 origin,
                 input,
-                _host_preparation: self.host_preparation.clone(),
+                _host_preparation: Some(self.host_preparation.clone()),
             }),
             sampling: CopiedTextSampling {
                 sampler,
@@ -765,8 +598,16 @@ impl<'a> PreparedTextComponentsCopy<'a> {
                 next_prediction,
                 parameter_epoch,
             },
-            host_preparation: self.host_preparation.clone(),
-        })
+            _host_preparation: Some(self.host_preparation.clone()),
+        };
+        #[cfg(all(
+            test,
+            target_vendor = "apple",
+            feature = "metal",
+            not(feature = "cuda")
+        ))]
+        tests::completed(&copied);
+        Ok(copied)
     }
 }
 
@@ -777,17 +618,10 @@ fn copy_native<'a>(
     stream: &Stream,
     roots: &RefCell<Vec<Array>>,
     funding: &text_funding::FundedWork,
-    host: Option<&eredu_core::HostPreparationAuthority>,
+    host: &eredu_core::HostPreparationAuthority,
 ) -> Result<(SavedResidentDecoderCopy, Option<Array>, Option<Array>), Error> {
     let paged = plan.is_paged();
-    let validate = |array: &Array| -> Result<(), Error> {
-        if host.is_some() {
-            original::validate_completed_destination(array)
-        } else {
-            array.evaluated()?;
-            Ok(())
-        }
-    };
+    let validate = original::validate_completed_destination;
     let mut observed = |array: &Array| {
         funding.retain(array);
         if let Some(cause) = funding.take_collection_failure() {
@@ -816,21 +650,11 @@ fn copy_native<'a>(
         }
     };
     if !paged {
-        let destination = match host {
-            Some(authority) => original::destination_plan(&native, authority)?,
-            None => native.prepare_copy()?,
-        };
-        if host.is_some() {
-            // Compressed storage aliases share these logical destination backings;
-            // the finite publisher inspects each actual copied operand once.
-            destination.visit_operands(&mut retain).map_err(
-                crate::backend::runtime::cache::state::SnapshotProjectionCause::into_error,
-            )?;
-        } else {
-            destination.visit_retained_arrays(&mut retain).map_err(
-                crate::backend::runtime::cache::state::SnapshotProjectionCause::into_error,
-            )?;
-        }
+        let destination = original::destination_plan(&native, host)?;
+        // Exact copied operand identities prevent compressed aliases from duplicating charges.
+        destination
+            .visit_operands(&mut retain)
+            .map_err(crate::backend::runtime::cache::state::SnapshotProjectionCause::into_error)?;
         drop(destination);
     }
     if let Some(error) = failure {
@@ -860,10 +684,19 @@ pub(in crate::composition::mlx::session) struct CopiedTextComponents {
     decoder: FrozenDecoderOwner,
     sampling: CopiedTextSampling,
     // Returned aggregate wrappers and aliases retain the accepted H after payloads.
-    host_preparation: Option<eredu_core::HostPreparationAuthority>,
+    _host_preparation: Option<eredu_core::HostPreparationAuthority>,
 }
 
 impl CopiedTextComponents {
+    pub(in crate::composition::mlx::session) fn logical_continuation_growth(
+        &self,
+        input_tokens: u64,
+    ) -> Option<u64> {
+        self.decoder
+            .native
+            .logical_continuation_growth(self.sampling.frontier(), input_tokens)
+    }
+
     pub(in crate::composition::mlx::session) fn capture_checkpoint(
         &self,
     ) -> Option<&eredu_runtime::capture::FundedCaptureCheckpoint> {
@@ -913,8 +746,8 @@ impl CopiedTextComponents {
             .map_err(|error| Error::Other(Box::new(error)))?;
         if !runtime
             .backend()
-            .memory_pool()
-            .same_domain(self.sampling.arrays.custody.pool())
+            .memory_ledger()
+            .same_ledger(self.sampling.arrays.custody.pool())
         {
             return Err(mismatch());
         }
@@ -939,10 +772,6 @@ impl CopiedTextComponents {
     pub(in crate::composition::mlx::session) fn sampling(&self) -> &CopiedTextSampling {
         &self.sampling
     }
-
-    pub(in crate::composition::mlx::session) fn bytes(&self) -> u64 {
-        self.sampling.bytes()
-    }
 }
 
 #[cfg(all(
@@ -951,4 +780,4 @@ impl CopiedTextComponents {
     feature = "metal",
     not(feature = "cuda")
 ))]
-mod tests;
+pub(in crate::composition::mlx) mod tests;

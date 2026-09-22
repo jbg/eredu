@@ -264,6 +264,19 @@ fn ring_two_process_inkling_mtp_expert_parallel_neutral_visitor() {
     );
 }
 
+/// Exercises the actual AR expert input publishers across prefill, verification
+/// and commit, comparing the two-rank traversal with the same local model.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_inkling_original_autoregressive_expert_sources() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Inkling,
+        "ep",
+        WorkerMode::OriginalAutoregressiveCapture("cpu"),
+    );
+}
+
 /// Proves routed prediction reuses the target's addressable expert bank while
 /// extension weights remain a separately materialized resident component.
 #[test]

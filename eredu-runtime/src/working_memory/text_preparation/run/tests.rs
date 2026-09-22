@@ -1,10 +1,38 @@
 use super::*;
-use crate::working_memory::{WorkingMemoryPool, funding::tests::reservation};
+use crate::working_memory::{MemoryLedger, funding::tests::reservation};
+
+fn control_allowance() -> u64 {
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let admission = crate::working_memory::memory_fixture::host_admission(&pool, 0);
+    2 * crate::working_memory::memory_fixture::reservation_bytes(&pool, &admission)
+}
+fn lock_ledger(capacity: u64) -> MemoryLedger {
+    crate::working_memory::memory_fixture::host_ledger(capacity + control_allowance(), 0).unwrap()
+}
+fn lock_reservation(
+    pool: &MemoryLedger,
+    bytes: u64,
+    capacity: u64,
+) -> crate::working_memory::WorkingMemoryReservation {
+    let admission = crate::working_memory::memory_fixture::host_admission(pool, bytes);
+    pool.reserve_with_capacity(
+        &InferenceExecutionIdentity::default(),
+        &admission,
+        crate::working_memory::memory_fixture::resolved_host_limits(
+            pool,
+            capacity + control_allowance(),
+        ),
+    )
+    .unwrap()
+}
+fn effective_payload_limit(pool: &MemoryLedger) -> u64 {
+    pool.payload_effective_capacity().unwrap() - control_allowance()
+}
 
 #[test]
 fn reserved_receipt_identity_rejects_same_account_replaced_preparation_without_retaining_control() {
-    let pool = WorkingMemoryPool::new(500, 0).unwrap();
-    let reserved = reservation(&pool, 100, 400);
+    let pool = lock_ledger(500);
+    let reserved = lock_reservation(&pool, 100, 400);
     let execution = reserved.0.execution.clone();
     let geometry = reserved.geometry();
     let request: InferenceRequest = reserved.into();
@@ -18,7 +46,9 @@ fn reserved_receipt_identity_rejects_same_account_replaced_preparation_without_r
         )
         .unwrap(),
     );
-    let preparation = request.prepare_text(&execution, geometry, config).unwrap();
+    let preparation = request
+        .prepare_text(&execution, geometry, config.clone())
+        .unwrap();
     drop(request);
     // This private unit tests identity transport only. Genuine issuance and
     // completed/fenced/ordinal checks are exercised through the shared core
@@ -41,14 +71,14 @@ fn reserved_receipt_identity_rejects_same_account_replaced_preparation_without_r
     );
     let mut replaced = preparation.request.clone();
     replaced.preparation = Some(Arc::new(TextPreparationAuthority {
-        config,
+        config: config.clone(),
         state: ControlMutex::new(TextPreparationState::default()),
     }));
     assert!(!receipt.authority.matches_request(&replaced).unwrap());
     preparation.claim_prompt().unwrap().finish().unwrap();
     preparation.bind_prompt().unwrap();
     preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .finish()
         .unwrap();
@@ -65,9 +95,9 @@ fn reserved_receipt_identity_rejects_same_account_replaced_preparation_without_r
     assert!(!receipt.authority.matches_request(&replaced).unwrap());
     drop(replaced);
     drop(preparation);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.effective_capacity().unwrap(), 500);
-    let next = reservation(&pool, 100, 400);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(effective_payload_limit(&pool), 500);
+    let next = lock_reservation(&pool, 100, 400);
     let next_execution = next.0.execution.clone();
     let next_request: InferenceRequest = next.into();
     let next = next_request
@@ -91,18 +121,19 @@ fn lock_config() -> TextGenerationConfig {
     )
 }
 fn lock_preparation(
-    pool: &WorkingMemoryPool,
-    reserved_mode: bool,
+    pool: &MemoryLedger,
+    finite_request_limit: bool,
     context: &TextStepContext,
 ) -> (InferenceTextPreparation, InferenceExecutionIdentity) {
-    let reserved = reservation(pool, 100, 400);
+    let reserved = lock_reservation(pool, 100, 400);
     let execution = reserved.0.execution.clone();
     let geometry = reserved.geometry();
-    let request = if reserved_mode {
+    let request = if finite_request_limit {
         InferenceRequest::from(reserved)
     } else {
+        let admission = reserved.admission().clone();
         drop(reserved);
-        InferenceRequest::without_memory_budget(&execution, geometry).unwrap()
+        pool.reserve(&execution, &admission).unwrap().into()
     };
     let preparation = request
         .prepare_text(&execution, geometry, lock_config())
@@ -129,7 +160,7 @@ fn request_control_mutex_abandoned_step_waits_then_fences_before_charge_retireme
     use crate::working_memory::control_mutex::tests::wait_for_contention;
     for reserved in [false, true] {
         let context = lock_context();
-        let pool = WorkingMemoryPool::new(500, 0).unwrap();
+        let pool = lock_ledger(500);
         let (preparation, _) = lock_preparation(&pool, reserved, &context);
         let step = preparation
             .claim_step(&context, PendingTextInput::Prefill(()))
@@ -141,7 +172,7 @@ fn request_control_mutex_abandoned_step_waits_then_fences_before_charge_retireme
             wait_for_contention(&authority.state);
             assert_eq!(guard.run.as_ref().unwrap().active, Some(0));
             assert!(!guard.run.as_ref().unwrap().fenced);
-            assert_eq!(pool.used_bytes().unwrap(), if reserved { 100 } else { 0 });
+            assert_eq!(pool.payload_used_bytes().unwrap(), 100);
             drop(guard);
             dropped.join().unwrap();
         });
@@ -154,34 +185,32 @@ fn request_control_mutex_abandoned_step_waits_then_fences_before_charge_retireme
             Err(WorkingMemoryError::ExecutionFenced)
         ));
         drop(preparation);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.effective_capacity().unwrap(), 500);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(effective_payload_limit(&pool), 500);
     }
 }
 
 #[test]
 fn request_control_mutex_start_contention_preserves_one_canonical_preparation() {
     use crate::working_memory::control_mutex::tests::wait_for_contention;
-    for reserved_mode in [false, true] {
-        let pool = WorkingMemoryPool::new(500, 0).unwrap();
-        let reserved = reservation(&pool, 100, 400);
+    for finite_request_limit in [false, true] {
+        let pool = lock_ledger(500);
+        let reserved = lock_reservation(&pool, 100, 400);
         let execution = reserved.0.execution.clone();
         let geometry = reserved.geometry();
-        let request = if reserved_mode {
+        let request = if finite_request_limit {
             InferenceRequest::from(reserved)
         } else {
+            let admission = reserved.admission().clone();
             drop(reserved);
-            InferenceRequest::without_memory_budget(&execution, geometry).unwrap()
+            pool.reserve(&execution, &admission).unwrap().into()
         };
         let guard = request.start_state().lock().unwrap();
         let preparation = std::thread::scope(|scope| {
             let worker = scope.spawn(|| request.prepare_text(&execution, geometry, lock_config()));
             wait_for_contention(request.start_state());
             assert!(matches!(*guard, RequestStart::Fresh));
-            assert_eq!(
-                pool.used_bytes().unwrap(),
-                if reserved_mode { 100 } else { 0 }
-            );
+            assert_eq!(pool.payload_used_bytes().unwrap(), 100);
             drop(guard);
             worker.join().unwrap().unwrap()
         });
@@ -198,12 +227,9 @@ fn request_control_mutex_start_contention_preserves_one_canonical_preparation() 
         }
         drop(canonical);
         drop(request);
-        assert_eq!(
-            pool.used_bytes().unwrap(),
-            if reserved_mode { 100 } else { 0 }
-        );
+        assert_eq!(pool.payload_used_bytes().unwrap(), 100);
         drop(preparation);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -211,7 +237,7 @@ fn request_control_mutex_start_contention_preserves_one_canonical_preparation() 
 fn request_control_mutex_poison_rejects_new_steps_and_retires_exact_request() {
     let context = lock_context();
     for reserved in [false, true] {
-        let pool = WorkingMemoryPool::new(500, 0).unwrap();
+        let pool = lock_ledger(500);
         let (preparation, _) = lock_preparation(&pool, reserved, &context);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = preparation.authority().state.lock().unwrap();
@@ -222,18 +248,18 @@ fn request_control_mutex_poison_rejects_new_steps_and_retires_exact_request() {
             preparation.claim_step(&context, PendingTextInput::Prefill(())),
             Err(WorkingMemoryError::Poisoned)
         ));
-        assert_eq!(pool.used_bytes().unwrap(), if reserved { 100 } else { 0 });
+        assert_eq!(pool.payload_used_bytes().unwrap(), 100);
         drop(preparation);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.effective_capacity().unwrap(), 500);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(effective_payload_limit(&pool), 500);
     }
 }
 
 #[test]
 fn request_control_mutex_opposing_handoffs_keep_order_and_leave_active_runs_unchanged() {
     use crate::working_memory::control_mutex::tests::wait_for_contention;
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let first = reservation(&pool, 100, 900);
+    let pool = lock_ledger(1000);
+    let first = lock_reservation(&pool, 100, 900);
     let execution = first.0.execution.clone();
     let geometry = first.geometry();
     let second = pool.reserve(&execution, &first.0.admission).unwrap();
@@ -284,10 +310,10 @@ fn request_control_mutex_opposing_handoffs_keep_order_and_leave_active_runs_unch
         assert!(!run.fenced);
         assert!(!run.supersession_claimed);
     }
-    assert_eq!(pool.used_bytes().unwrap(), 200);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 200);
     drop((left_step, right_step, left, right));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.effective_capacity().unwrap(), 1000);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(effective_payload_limit(&pool), 1000);
 }
 
 mod sampling_extension;

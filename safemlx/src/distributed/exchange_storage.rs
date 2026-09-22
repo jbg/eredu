@@ -164,6 +164,12 @@ impl<'a> GroupCpuLayoutStorage<'a> {
     }
 }
 impl GroupCpuExchangeLayoutStorage<'_> {
+    /// Both selected ordinary native edges and their shared CPU completion.
+    /// Tensor backing and the caller's root collector remain separate.
+    pub fn ordinary_controls(&self) -> Option<super::OrdinaryGroupControls> {
+        self.send.ordinary_controls()?.checked_add(self.receive.ordinary_controls()?)?
+            .completion(self.traversal.limits())
+    }
     /// Same two-output completion traversal as the executing pair.
     pub fn traversal(&self) -> OperationEvalTraversalLayout { self.traversal }
     /// Actual shared constructor/Eval/worker and completion Graph capacity.
@@ -241,6 +247,10 @@ impl GroupCpuExchangeLayoutStorage<'_> {
     }
 }
 impl OwnedGroupCpuExchangeLayoutStorage {
+    /// Ordinary allocation facts of this retained pair, without bank authority.
+    pub fn ordinary_controls(&self) -> Option<super::OrdinaryGroupControls> {
+        self.view().ok()?.ordinary_controls()
+    }
     fn view(&self) -> std::result::Result<GroupCpuExchangeLayoutStorage<'_>,GroupStorageUnavailable> {
         let send=self.send.view();
         // The two owned aliases refer to the same actual native source. Lend

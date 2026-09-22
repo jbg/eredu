@@ -39,7 +39,7 @@ impl SpeculativeTokenFilterController for TestConstraint {
 
 #[test]
 fn native_preparation_speculative_sampling_rejects_unintegrated_policy() {
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let memory = NativeMemoryOwner::acquire(&pool).unwrap();
     let sampling = eredu_core::resolve_generation_config(
         None,
@@ -55,8 +55,8 @@ fn native_preparation_speculative_sampling_rejects_unintegrated_policy() {
         ..Default::default()
     };
     let generation = TextGenerationConfig::new(sampling).with_inference_policy(chunk);
-    validate_speculative_prefill_policy(generation, true).unwrap();
-    let error = validate_speculative_prefill_policy(generation, false).unwrap_err();
+    validate_speculative_prefill_policy(generation.clone(), true).unwrap();
+    let error = validate_speculative_prefill_policy(generation.clone(), false).unwrap_err();
     let Error::Other(source) = error else {
         panic!("typed policy rejection")
     };
@@ -68,12 +68,15 @@ fn native_preparation_speculative_sampling_rejects_unintegrated_policy() {
         })
     ));
     let managed = eredu_core::TextInferencePolicy {
-        managed_memory_capacity_bytes: Some(u64::MAX),
+        memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(u64::MAX),
+        )]),
         ..Default::default()
     };
     for independent in [false, true] {
-        let generation = TextGenerationConfig::new(sampling).with_inference_policy(managed);
-        assert!(validate_speculative_prefill_policy(generation, independent).is_err());
+        let generation = TextGenerationConfig::new(sampling).with_inference_policy(managed.clone());
+        assert!(validate_speculative_prefill_policy(generation.clone(), independent).is_err());
         let error = MlxSpeculativeSession::prepare_mlx_speculative_sampling(
             generation,
             TestConstraint::default(),
@@ -93,7 +96,7 @@ fn native_preparation_speculative_sampling_rejects_unintegrated_policy() {
 
 #[test]
 fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let memory = NativeMemoryOwner::acquire(&pool).unwrap();
     let device = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);
     let stream = Stream::new_with_device(&device);
@@ -259,6 +262,8 @@ fn fused_rows_are_selected_by_backend_mechanisms_without_family_policy() {
         SpeculativeExecutionStreams::single(&stream),
     )
     .unwrap();
-    let IndependentLogits::Ordinary(row) = row else { panic!("ordinary fused row"); };
+    let IndependentLogits::Ordinary(row) = row else {
+        panic!("ordinary fused row");
+    };
     assert_eq!(row.evaluated().unwrap().as_slice::<f32>(), &[4.0, 5.0, 6.0]);
 }

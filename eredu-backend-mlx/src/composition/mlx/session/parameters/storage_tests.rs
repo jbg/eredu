@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::managed_memory::NativeMemoryOwner;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -21,7 +21,7 @@ fn empty_parameter_storage_is_complete_even_with_descriptive_metadata() {
     state.floating_state_dtype_bytes = std::num::NonZeroU8::new(4);
     state
         .baseline_transforms
-        .insert("projection".into(), ProjectionInputTransform::Identity);
+        .push(("projection".into(), ProjectionInputTransform::Identity));
     state.reset_estimate = Some(eredu_core::execution_control::SnapshotEstimate {
         retained_bytes: 128,
         copy_bytes: 256,
@@ -76,7 +76,7 @@ impl Drop for RetirementProbe {
 #[test]
 fn original_and_published_aliases_retain_unique_full_backing_capacity() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let _memory = NativeMemoryOwner::acquire(&pool).unwrap();
     let original = Array::from_slice(&[1_f32, 2., 3., 4., 5., 6., 7., 8.], &[8]);
     let published = Array::from_slice(&[3_f32; 32], &[32]);
@@ -99,19 +99,14 @@ fn original_and_published_aliases_retain_unique_full_backing_capacity() {
         .unwrap();
 
     let mut state = NativeParameterState::default();
-    state
-        .originals
-        .insert("original".into(), MlxTensor::from_array(original.clone()));
-    state
-        .originals
-        .insert("original-alias".into(), MlxTensor::from_array(view.clone()));
-    state
-        .published
-        .insert("published".into(), MlxTensor::from_array(published.clone()));
-    state.published.insert(
-        "cross-map-alias".into(),
-        MlxTensor::from_array(view.clone()),
-    );
+    state.originals = fixture_rows([
+        ("original", MlxTensor::from_array(original.clone())),
+        ("original-alias", MlxTensor::from_array(view.clone())),
+    ]);
+    state.published = fixture_rows([
+        ("published", MlxTensor::from_array(published.clone())),
+        ("cross-map-alias", MlxTensor::from_array(view.clone())),
+    ]);
     let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))
         .unwrap()
         .enter()
@@ -130,14 +125,14 @@ fn original_and_published_aliases_retain_unique_full_backing_capacity() {
             .counts()
             .role(ParameterOwnerRole::DisplacedOriginal)
             .map_key_bytes,
-        "originaloriginal-alias".len()
+        0
     );
     assert_eq!(
         counted
             .counts()
             .role(ParameterOwnerRole::PublishedOverlay)
             .map_key_bytes,
-        "publishedcross-map-alias".len()
+        0
     );
     drop(counted);
     drop(guard);
@@ -167,17 +162,13 @@ fn original_and_published_aliases_retain_unique_full_backing_capacity() {
 #[test]
 fn lazy_parameter_inventory_stays_unknown_without_materializing() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let _memory = NativeMemoryOwner::acquire(&pool).unwrap();
     let original = Array::from_slice(&[2_f32, -3.], &[2]);
     let lazy = original.square(&stream).unwrap();
     let mut state = NativeParameterState::default();
-    state
-        .originals
-        .insert("original".into(), MlxTensor::from_array(original));
-    state
-        .published
-        .insert("published".into(), MlxTensor::from_array(lazy.clone()));
+    state.originals = fixture_rows([("original", MlxTensor::from_array(original))]);
+    state.published = fixture_rows([("published", MlxTensor::from_array(lazy.clone()))]);
     assert_eq!(lazy.allocation_info().unwrap(), None);
     let cold = state.retained_storage().unwrap();
     assert_eq!(cold.byte_bound().unwrap(), None);

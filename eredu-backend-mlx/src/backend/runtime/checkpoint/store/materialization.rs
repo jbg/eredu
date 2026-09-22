@@ -1,9 +1,9 @@
 use super::*;
-use crate::backend::submission_recovery::observed::{operation::OperationRecovery, Observer};
+use crate::backend::submission_recovery::observed::{Observer, operation::OperationRecovery};
 use eredu_runtime::working_memory::OriginalTextControlGuard;
 use safemlx::{
-    transforms::async_eval_with_operation_event as async_eval_with_event, OperationEvent as Event,
-    OriginalScopeObserver,
+    OperationEvent as Event, OriginalScopeObserver,
+    transforms::async_eval_with_operation_event as async_eval_with_event,
 };
 type MaterializationRecovery<T: Retention> = OperationRecovery<T, OriginalTextControlGuard>;
 use operation_slots::WeightMaterializationCustody;
@@ -270,12 +270,60 @@ fn materialization_error(
 }
 
 impl WeightMaterialization {
+    /// One prepared-leaf validation guard: one owned input, no checkpoint
+    /// lease, and the actual prepaid recovery/native Scope constructor.
+    /// Numerical evaluation, graph records and operator shells are separate.
+    pub(crate) fn prepared_validation_control_bytes() -> Option<usize> {
+        use crate::backend::submission_recovery::PreparedRecovery;
+        use eredu_core::HostPreparationAuthority;
+        use eredu_nn::workspace::WorkspaceContext;
+        use std::mem::{size_of, size_of_val};
+        type Resources = Rc<MaterializationResources>;
+        let frames = [
+            usize::try_from(
+                PreparedRecovery::<Resources, HostPreparationAuthority>::control_bytes()?,
+            )
+            .ok()?,
+            usize::try_from(
+                OperationRecovery::<Resources, WeightMaterializationCustody>::control_bytes()?,
+            )
+            .ok()?,
+            WorkspaceContext::metadata_rc_bytes::<MaterializationResources>()?,
+            size_of::<Array>(),
+            "<derived checkpoint materialization>"
+                .len()
+                .checked_mul(2)?,
+            "native materialization failed; unresolved resources remain retained".len(),
+            size_of::<MaterializationResources>(),
+            size_of::<Self>(),
+            size_of::<Result<Self, CheckpointMaterializationError>>(),
+            size_of::<Result<Vec<PendingWeightMaterialization>, CheckpointMaterializationError>>(),
+            size_of::<Result<(), CheckpointMaterializationError>>(),
+            size_of::<CheckpointMaterializationError>(),
+            size_of::<(
+                Vec<Array>,
+                Vec<PendingWeightMaterialization>,
+                HostPreparationAuthority,
+            )>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
     /// Arms ownership before a potentially eager conversion or native submission.
     pub(crate) fn prepare_retained(
         inputs: Vec<Array>,
         sources: Vec<PendingWeightMaterialization>,
     ) -> Result<Self, CheckpointMaterializationError> {
-        Self::prepare_retained_impl(inputs, sources, None)
+        Self::prepare_retained_impl(inputs, sources, None, None)
+    }
+    pub(crate) fn prepare_retained_with_host(
+        inputs: Vec<Array>,
+        sources: Vec<PendingWeightMaterialization>,
+        host: eredu_core::HostPreparationAuthority,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        Self::prepare_retained_impl(inputs, sources, None, Some(host))
     }
     pub(crate) fn prepare_retained_with_operations(
         inputs: Vec<Array>,
@@ -290,7 +338,7 @@ impl WeightMaterialization {
                 prepared: cause.prepared,
             }
         })?;
-        Self::prepare_retained_impl(inputs, sources, Some((ready, observer.clone())))
+        Self::prepare_retained_impl(inputs, sources, Some((ready, observer.clone())), None)
     }
 
     /// Activate one supplied slot without allocating input/source transports.
@@ -299,12 +347,18 @@ impl WeightMaterialization {
         observer: &OriginalScopeObserver,
     ) -> Result<Self, CheckpointMaterializationError> {
         validate_operation(observer)?;
-        Self::prepare_retained_impl(Vec::new(), Vec::new(), Some((ready, observer.clone())))
+        Self::prepare_retained_impl(
+            Vec::new(),
+            Vec::new(),
+            Some((ready, observer.clone())),
+            None,
+        )
     }
     fn prepare_retained_impl(
         inputs: Vec<Array>,
         sources: Vec<PendingWeightMaterialization>,
         original: Option<(PreparedWeightMaterialization, OriginalScopeObserver)>,
+        host: Option<eredu_core::HostPreparationAuthority>,
     ) -> Result<Self, CheckpointMaterializationError> {
         // Original errors retain the actual fixed native cause and need no
         // allocated diagnostic key. Ordinary text/error identity is unchanged.
@@ -316,23 +370,35 @@ impl WeightMaterialization {
                 .map(|source| source.key().to_owned())
                 .unwrap_or_else(|| "<derived checkpoint materialization>".into())
         };
-        let retained =
-            match original {
-                Some((ready, observer)) => ready.activate(inputs, sources, observer)?,
-                None => {
-                    let value = Rc::new(MaterializationResources {
-                        inputs,
-                        outputs: Vec::new(),
-                        _sources: sources,
-                        event: None,
-                        children: Cell::new(0),
-                        failed: Cell::new(false),
-                    });
-                    OperationRecovery::ordinary(Recovery::begin(value).map_err(|source| {
+        let retained = match original {
+            Some((ready, observer)) => ready.activate(inputs, sources, observer)?,
+            None => {
+                let value = Rc::new(MaterializationResources {
+                    inputs,
+                    outputs: Vec::new(),
+                    _sources: sources,
+                    event: None,
+                    children: Cell::new(0),
+                    failed: Cell::new(false),
+                });
+                let recovery = match host {
+                    Some(host) => {
+                        crate::backend::submission_recovery::PreparedRecovery::new(value, host)
+                            .map_err(|error| {
+                                CheckpointMaterializationError::HostScope(error.cause)
+                            })?
+                            .try_begin()
+                            .map_err(|error| {
+                                CheckpointMaterializationError::HostScope(error.cause)
+                            })?
+                    }
+                    None => Recovery::begin(value).map_err(|source| {
                         materialization_error(&key, "prepare recovery", source)
-                    })?)
-                }
-            };
+                    })?,
+                };
+                OperationRecovery::ordinary(recovery)
+            }
+        };
         Ok(Self { key, retained })
     }
 
@@ -383,7 +449,10 @@ impl WeightMaterialization {
         Ok(())
     }
 
-    pub(crate) fn retain_input(&mut self, input: Array) -> Result<(), CheckpointMaterializationError> {
+    pub(crate) fn retain_input(
+        &mut self,
+        input: Array,
+    ) -> Result<(), CheckpointMaterializationError> {
         self.prepare_input_capacity(self.inputs().len() + 1)?;
         Rc::get_mut(self.retained.retention_mut())
             .expect("unpublished owner")
@@ -412,9 +481,8 @@ impl WeightMaterialization {
     /// outputs use their retained observer without another native submission.
     pub(crate) fn completed_outputs(
         &self,
-    ) -> impl ExactSizeIterator<
-        Item = Result<safemlx::EvaluatedArray<'_>, CheckpointMaterializationError>,
-    > {
+    ) -> impl ExactSizeIterator<Item = Result<safemlx::EvaluatedArray<'_>, CheckpointMaterializationError>>
+    {
         readback::completed_outputs(self.outputs(), self.retained.original_observer())
             .map(|result| result.map_err(|source| self.mlx_error("output readback", source)))
     }
@@ -718,19 +786,23 @@ impl WeightMaterialization {
     pub(crate) fn finish(mut self) -> Result<(), CheckpointMaterializationError> {
         self.retained.seal();
         let original = self.retained.original_observer().is_some();
-        let observed = self
-            .retained
-            .finish()
-            .map_err(|source| {
-                use crate::backend::submission_recovery::observed::FinishRetainingError;
-                match source {
-                    FinishRetainingError::Native(source) if original =>
-                        CheckpointMaterializationError::OriginalNative(source),
-                    FinishRetainingError::Native(source) => materialization_error(&self.key, "retirement", source),
-                    FinishRetainingError::Retirement(cause) => CheckpointMaterializationError::OriginalRetirement(cause),
-                    FinishRetainingError::Observation(_) => CheckpointMaterializationError::OriginalOperationDomain,
+        let observed = self.retained.finish().map_err(|source| {
+            use crate::backend::submission_recovery::observed::FinishRetainingError;
+            match source {
+                FinishRetainingError::Native(source) if original => {
+                    CheckpointMaterializationError::OriginalNative(source)
                 }
-            })?;
+                FinishRetainingError::Native(source) => {
+                    materialization_error(&self.key, "retirement", source)
+                }
+                FinishRetainingError::Retirement(cause) => {
+                    CheckpointMaterializationError::OriginalRetirement(cause)
+                }
+                FinishRetainingError::Observation(_) => {
+                    CheckpointMaterializationError::OriginalOperationDomain
+                }
+            }
+        })?;
         if !observed.can_retire() {
             return Err(CheckpointMaterializationError::OriginalOperationRetirementTransferred);
         }
@@ -1085,16 +1157,18 @@ mod recovery_tests {
         materialized.wait().unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || loop {
-            if safemlx::try_with_submission_retirement(|| {
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            })
-            .is_some()
-            {
-                break;
+        let holder = std::thread::spawn(move || {
+            loop {
+                if safemlx::try_with_submission_retirement(|| {
+                    ready_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                })
+                .is_some()
+                {
+                    break;
+                }
+                std::thread::yield_now();
             }
-            std::thread::yield_now();
         });
         ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let started = Instant::now();
@@ -1108,8 +1182,8 @@ mod recovery_tests {
     }
 }
 
-mod operation_slots;
 mod cold_slot;
+mod operation_slots;
 pub(crate) use cold_slot::{ColdMaterializationSlot, ColdMaterializationSlotError};
 pub(crate) use operation_slots::{
     PreparedMaterializationObservation, PreparedPendingWeight, PreparedWeightMaterialization,

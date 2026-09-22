@@ -120,7 +120,7 @@ fn run_artifacts_on_inspected(
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]);
         let mut ordinary = generation;
-        ordinary.inference.managed_memory_capacity_bytes = None;
+        ordinary.inference.memory_limits = eredu_core::MemoryLimitDeclarations::unlimited();
         let output = model
             .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
                 chat: &chat,
@@ -359,7 +359,7 @@ fn run_continuation_artifacts_on(
         let ids = model.encode(PROMPT, false).unwrap();
         assert_eq!(ids, [0, 1, 2, 3, 4]);
         let mut ordinary = generation;
-        ordinary.inference.managed_memory_capacity_bytes = None;
+        ordinary.inference.memory_limits = eredu_core::MemoryLimitDeclarations::unlimited();
         let output = model
             .generate_prepared_chat_speculative(PreparedChatSpeculativeRequest {
                 chat: &chat,

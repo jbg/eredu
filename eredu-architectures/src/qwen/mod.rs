@@ -234,12 +234,27 @@ where
     const CAUSAL_PREFILL_ROWS: bool = true;
 
     type FeedForward = FeedForward<B>;
+    fn feed_forward_residual_observation(args: &ModelArgs, _: usize) -> &'static str {
+        if args.is_moe() {
+            "feed_forward.contribution"
+        } else {
+            "feed_forward.output"
+        }
+    }
 
     fn append_component_prefill_observations(
-        args: &ModelArgs, unit_path: &str, _layer: usize,
-        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(),Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&str,usize,&mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>)>()?;
+        args: &ModelArgs,
+        unit_path: &str,
+        _layer: usize,
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &str,
+            usize,
+            &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+        )>()?;
 
         // Same selected Dense/Routed branch as this factory's FeedForward.
         // Sparse units retain the separately declared routed bank semantics.
@@ -248,8 +263,8 @@ where
                 unit_path, declarations, metadata_context)?;
         }
 
-Ok(())
-}
+        Ok(())
+    }
 
     fn validate_with_metadata(
         _config: &ModelArgs,
@@ -300,12 +315,19 @@ Ok(())
     }
 
     fn parameter_groups_with_metadata(
-        block: &RoutedTransformerBlock<B>, args: &ModelArgs, layer: usize,
+        block: &RoutedTransformerBlock<B>,
+        args: &ModelArgs,
+        layer: usize,
         context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Option<Result<Vec<eredu_runtime::ParameterGroupSpec>, Error>> {
-        Some(parallel::routed_layer_parallel_parameter_groups_with_metadata(
-            block, args, layer, Some(context),
-        ))
+        Some(
+            parallel::routed_layer_parallel_parameter_groups_with_metadata(
+                block,
+                args,
+                layer,
+                Some(context),
+            ),
+        )
     }
 }
 

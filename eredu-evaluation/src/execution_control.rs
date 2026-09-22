@@ -1,223 +1,350 @@
-//! Reusable continuation checks over the production portable snapshot driver.
+//! Reusable continuation checks over the funded portable snapshot driver.
 //!
-//! Fixtures supply actual backend mechanisms, an ordinary prepared continuation,
-//! resource bounds and a probe for forward execution, resets and weight loading.
-//! Run with ordinary, captured, intervened and combined admissions. These checks
-//! concern native/sampler/controller/record state; facade semantic conformance is
-//! additional, and must exercise the facade's incremental decoding pipeline.
-
-use eredu_core::{capture::*, execution_control::*, TextGenerationDriver, TokenFilterController};
+//! Fixtures supply actual original input, host-copy, native-copy and resume
+//! mechanisms. The same controlled machine advances ordinary and resumed work.
+use eredu_core::{
+    capture::*, execution_control::*, ControlledTextGeneration, HostMetadataFunding, ModelRuntime,
+    OriginalTextResumeKind, OriginalTextResumeOptions, TextGenerationBranch, TextResumeBackend,
+    TextSnapshotSource,
+};
 use eredu_runtime::execution_control::{
-    apply_sampling_override, ManagedTextContinuation, SamplingOverride, SnapshotBudget,
-    SnapshotTokenController, TextBranchRequest, TextContinuationSnapshot,
-    TextSamplingControlBackend, TextSnapshotBackend, TextSnapshotError, TokenChoiceController,
+    SnapshotBudget, SnapshotTokenController, TextContinuationSnapshot, TextSnapshotBackend,
+    TextSnapshotError, TokenChoiceController,
 };
 use std::fmt::Debug;
 
-#[cfg(test)]
-mod tests;
+/// Prepared source fixtures shared by native and portable conformance tests.
+pub mod fixture;
 
 /// Known fixture storage bounds and explicitly admitted child limits.
 pub struct ContinuationFixtureLimits {
-    /// Controller/host storage through the fixture's complete continuation.
+    /// Complete host-copy payload bound.
     pub host_bytes: u64,
-    /// Additional native and host growth through the absolute prediction limit.
+    /// Complete future native and host growth bound.
     pub growth_bytes: u64,
-    /// Absolute prediction limit, at least eight for this scenario.
+    /// Absolute prediction bound, at least eight for the scenario.
     pub max_predictions: u64,
-    /// Explicit child capture limits, including inherited consumption.
+    /// Child capture limits including inherited consumption.
     pub capture: Option<CaptureLimits>,
 }
 
-fn step<B: TextSnapshotBackend, C: TokenFilterController>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    state: &mut ManagedTextContinuation<B, C>,
-) -> (u32, Option<CapturedStep>) {
-    let token = state.advance(driver).unwrap().expect("fixture ended early");
-    assert!(matches!(
-        state.boundary(driver),
-        Err(eredu_core::TextContinuationError::NotQuiescent)
-    ));
-    let records = state.take_completed_delivery(driver).unwrap().map(|step| {
+/// Actual funded mechanisms supplied by a conformance fixture.
+///
+/// Capture calls `capture_original_host`; resume calls
+/// `resume_original_host_with_displaced`. Their independently admitted host
+/// providers retain copy controls, output aliases and logical budget custody.
+/// Implementations do not create execution authority from diagnostic bounds.
+pub trait ContinuationSnapshotProvider<B, C>
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = <B as TextSnapshotBackend>::SavedTextComponents,
+            DisplacedState = <B as NativeTextStateBackend>::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+{
+    /// Independently owned copied host state.
+    type Host;
+    /// Copies the exact completed source through ordinary physical admission.
+    fn capture(
+        &mut self,
+        source: &mut TextSnapshotSource<'_, B, C>,
+        budget: &SnapshotBudget,
+        host_bytes: Option<u64>,
+    ) -> Result<(TextContinuationSnapshot<B, C>, Self::Host), TextSnapshotError<B::Error>>;
+    /// Admits a fresh execution and installs the actual immutable saved state.
+    fn resume<'a>(
+        &mut self,
+        runtime: &'a mut ModelRuntime<B>,
+        saved: &TextContinuationSnapshot<B, C>,
+        host: &Self::Host,
+        options: &OriginalTextResumeOptions<'_>,
+    ) -> Result<
+        Option<(
+            ControlledTextGeneration<'a, B, C>,
+            B::NativeTextState,
+            Self::Host,
+        )>,
+        TextSnapshotError<B::Error>,
+    >;
+    /// Applies one successful model commitment to the active host sequence.
+    fn observe_token(&mut self, token: u32);
+    /// Exchanges complete active host state alongside the core/native machine.
+    fn exchange_host(&mut self, host: &mut Self::Host);
+    /// Actual cumulative usage of the installed funded capture collector.
+    fn capture_usage(&self, source: &TextSnapshotSource<'_, B, C>) -> CaptureUsage;
+    /// Reaps already completed native owners until the supplied retirement
+    /// observation holds. Portable owners retire synchronously. A native fixture
+    /// must use actual completion evidence and fail if its bounded wait expires.
+    fn settle_retirement(mut complete: impl FnMut() -> bool) {
+        assert!(complete(), "completed fixture owners remain retained");
+    }
+    /// Original finite allowance for a prospective restriction mask.
+    fn choice_funding(&self) -> HostMetadataFunding;
+}
+
+fn step<B, C, H>(
+    state: &mut ControlledTextGeneration<'_, B, C>,
+    provider: &mut H,
+) -> (u32, Option<CapturedStep>)
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+    H: ContinuationSnapshotProvider<B, C>,
+{
+    let token = state.next().expect("fixture ended early").unwrap();
+    if state.capture_pending() {
+        assert!(matches!(
+            state.snapshot_source(),
+            Err(eredu_core::TextContinuationError::NotQuiescent)
+        ));
+    }
+    let records = state.take_captured_delivery().unwrap().map(|step| {
         let mut step = step.as_step().clone();
         step.capture_seconds = 0.0;
         step.cumulative_usage = Default::default();
         step
     });
+    state.snapshot_source().unwrap();
+    provider.observe_token(token.token_id());
     (token.token_id(), records)
 }
-
 fn branch_values(mut value: (u32, Option<CapturedStep>)) -> (u32, Option<CapturedStep>) {
     if let Some(step) = &mut value.1 {
         for record in &mut step.interventions {
-            // Child plans are intentionally re-admitted with fresh identities.
             record.plan_id.clear();
         }
     }
     value
 }
+fn budget(branches: u64) -> SnapshotBudget {
+    SnapshotBudget::new(SnapshotLimits {
+        max_snapshots: 2,
+        max_branches: branches,
+        retained_bytes: 64_000_000,
+        cumulative_copy_bytes: 512_000_000,
+    })
+}
+fn capture<B, C, H>(
+    state: &mut ControlledTextGeneration<'_, B, C>,
+    provider: &mut H,
+    budget: &SnapshotBudget,
+    limits: &ContinuationFixtureLimits,
+) -> (TextContinuationSnapshot<B, C>, H::Host)
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+    H: ContinuationSnapshotProvider<B, C>,
+{
+    provider
+        .capture(
+            &mut state.snapshot_source().unwrap(),
+            budget,
+            Some(limits.host_bytes),
+        )
+        .unwrap()
+}
+fn restore<B, C, H>(
+    state: &mut ControlledTextGeneration<'_, B, C>,
+    provider: &mut H,
+    saved: &(TextContinuationSnapshot<B, C>, H::Host),
+) where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+    H: ContinuationSnapshotProvider<B, C>,
+{
+    let mut host = state
+        .replace_completed(
+            |runtime| {
+                provider
+                    .resume(
+                        runtime,
+                        &saved.0,
+                        &saved.1,
+                        &OriginalTextResumeOptions::new(OriginalTextResumeKind::Restore),
+                    )
+                    .map(|value| {
+                        value.map(|(state, displaced, host)| {
+                            drop(displaced);
+                            (state, host)
+                        })
+                    })
+            },
+            |error| panic!("completed restore boundary: {error:?}"),
+        )
+        .unwrap()
+        .expect("nonterminal saved source");
+    provider.exchange_host(&mut host);
+}
 
-/// Checks read-only rejection, exact inherited randomness across temperature
-/// changes, and reproducible explicit reseeding in an isolated child. Restores
-/// the initial parent afterward without model replay.
-pub fn sampling_override_conformance<B, C, P>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    state: &mut ManagedTextContinuation<B, C>,
+fn fork<B, C, H>(
+    state: &mut ControlledTextGeneration<'_, B, C>,
+    provider: &mut H,
+    saved: &(TextContinuationSnapshot<B, C>, H::Host),
+    limits: &ContinuationFixtureLimits,
+    session: &str,
+) -> (TextGenerationBranch<B, C>, H::Host)
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+    H: ContinuationSnapshotProvider<B, C>,
+{
+    let mut options = OriginalTextResumeOptions::new(OriginalTextResumeKind::Branch);
+    options.session_id = Some(session);
+    options.capture_limits = limits.capture.as_ref();
+    state
+        .fork_completed(
+            |runtime| provider.resume(runtime, &saved.0, &saved.1, &options),
+            |error| panic!("completed branch boundary: {error:?}"),
+        )
+        .unwrap()
+        .expect("nonterminal saved source")
+}
+
+/// Checks read-only rejection, exact inherited randomness, temperature changes,
+/// reproducible reseeding and isolation from the parent.
+pub fn sampling_override_conformance<B, C, H, P>(
+    state: &mut ControlledTextGeneration<'_, B, C>,
+    provider: &mut H,
     limits: &ContinuationFixtureLimits,
     probe: impl Fn() -> P,
 ) where
-    B: TextSnapshotBackend + TextSamplingControlBackend,
+    B: TextSnapshotBackend
+        + TextSamplingControlBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
     C: SnapshotTokenController + Clone + PartialEq + Debug,
+    H: ContinuationSnapshotProvider<B, C>,
     P: PartialEq + Debug,
 {
-    let budget = SnapshotBudget::new(SnapshotLimits {
-        max_snapshots: 2,
-        max_branches: 1,
-        retained_bytes: 64_000_000,
-        cumulative_copy_bytes: 512_000_000,
-    });
-    let initial = TextContinuationSnapshot::capture(
-        &mut state.boundary(driver).unwrap(),
-        &budget,
-        Some(limits.host_bytes),
-    )
-    .unwrap();
-    let facts = B::sampling_control_facts(state.boundary(driver).unwrap().parts().1);
-    let baseline: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
-    initial
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
+    let budget = budget(1);
+    let initial = capture(state, provider, &budget, limits);
+    let facts = state.sampling_boundary().unwrap().facts();
+    let baseline: Vec<_> = (0..3).map(|_| step(state, provider)).collect();
+    restore(state, provider, &initial);
     let before = probe();
-    assert!(apply_sampling_override(
-        &mut state.boundary(driver).unwrap(),
-        SamplingOverride {
+    assert!(state
+        .sampling_boundary()
+        .unwrap()
+        .apply(SamplingOverride {
             temperature: Some(f32::NAN),
-            reseed: Some(123),
-        }
-    )
-    .is_err());
-    let greedy = apply_sampling_override(
-        &mut state.boundary(driver).unwrap(),
-        SamplingOverride {
-            temperature: Some(0.0),
-            reseed: None,
-        },
-    );
+            reseed: Some(123)
+        })
+        .is_err());
+    assert_eq!(state.sampling_boundary().unwrap().facts(), facts);
+    assert_eq!(probe(), before);
+    let greedy = state.sampling_boundary().unwrap().apply(SamplingOverride {
+        temperature: Some(0.0),
+        reseed: None,
+    });
     if facts.requires_positive_temperature {
-        assert!(greedy.is_err());
+        assert!(matches!(
+            greedy,
+            Err(eredu_core::SamplingOverrideError::Invalid(_))
+        ));
+        assert_eq!(state.sampling_boundary().unwrap().facts(), facts);
+        assert_eq!(probe(), before);
     } else {
-        assert!(
-            greedy.unwrap().has_rng,
-            "temporary greedy selection discarded inherited RNG"
-        );
+        assert_eq!(greedy.unwrap().temperature, 0.0);
     }
-    apply_sampling_override(
-        &mut state.boundary(driver).unwrap(),
-        SamplingOverride {
+    let restored = state
+        .sampling_boundary()
+        .unwrap()
+        .apply(SamplingOverride {
             temperature: Some(facts.temperature),
             reseed: None,
-        },
-    )
-    .unwrap();
-    assert_eq!(probe(), before);
-    let actual: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
+        })
+        .unwrap();
+    assert_eq!(restored, facts);
     assert_eq!(
-        actual, baseline,
-        "invalid/no-draw changes lost RNG or sampler state"
+        (0..3).map(|_| step(state, provider)).collect::<Vec<_>>(),
+        baseline
     );
-    initial
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
-    let mut child = initial
-        .fork(
-            &mut state.boundary(driver).unwrap(),
-            &budget,
-            TextBranchRequest {
-                session_id: "conformance-sampling-child",
-                max_predictions: limits.max_predictions,
-                capture_limits: limits.capture.clone(),
-                intervention: None,
-                host_bytes: Some(limits.host_bytes),
-                continuation_growth_bytes: Some(limits.growth_bytes),
-            },
-        )
-        .unwrap();
-    child.exchange(driver, state).unwrap();
+    restore(state, provider, &initial);
+    let mut child = fork(
+        state,
+        provider,
+        &initial,
+        limits,
+        "conformance-sampling-child",
+    );
+    state.exchange_branch(&mut child.0).unwrap();
+    provider.exchange_host(&mut child.1);
     let before = probe();
-    let updated = apply_sampling_override(
-        &mut state.boundary(driver).unwrap(),
-        SamplingOverride {
+    let updated = state
+        .sampling_boundary()
+        .unwrap()
+        .apply(SamplingOverride {
             temperature: Some(0.35),
             reseed: Some(711),
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(updated.temperature, 0.35);
     assert!(updated.has_rng);
-    let modified = TextContinuationSnapshot::capture(
-        &mut state.boundary(driver).unwrap(),
-        &budget,
-        Some(limits.host_bytes),
-    )
-    .unwrap();
+    let modified = capture(state, provider, &budget, limits);
     assert_eq!(probe(), before, "sampling change executed model work");
-    let changed: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
-    modified
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
+    let changed: Vec<_> = (0..3).map(|_| step(state, provider)).collect();
+    restore(state, provider, &modified);
+    assert_eq!(state.sampling_boundary().unwrap().facts(), updated);
     assert_eq!(
-        B::sampling_control_facts(state.boundary(driver).unwrap().parts().1),
-        updated
+        (0..3).map(|_| step(state, provider)).collect::<Vec<_>>(),
+        changed
     );
-    let again: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
+    state.exchange_branch(&mut child.0).unwrap();
+    provider.exchange_host(&mut child.1);
+    assert_eq!(state.sampling_boundary().unwrap().facts(), facts);
     assert_eq!(
-        again, changed,
-        "snapshot lost explicit reseed or temperature change"
+        (0..3).map(|_| step(state, provider)).collect::<Vec<_>>(),
+        baseline
     );
-    child.exchange(driver, state).unwrap();
-    assert_eq!(
-        B::sampling_control_facts(state.boundary(driver).unwrap().parts().1),
-        facts
-    );
-    let parent: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
-    assert_eq!(parent, baseline, "sampling override changed the parent");
-    initial
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
+    restore(state, provider, &initial);
 }
 
-/// Exercises a genuinely alternative canonical choice, isolated branch commitment,
-/// and a reusable snapshot with a still-pending choice. The fixture must allow at
-/// least two tokens at its initial decision. Restores the initial state afterward,
-/// so the same run can enter `continuation_conformance` without replay.
-pub fn forced_choice_conformance<B, C, P>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    state: &mut ManagedTextContinuation<B, TokenChoiceController<C>>,
+/// Checks a genuinely alternative canonical choice, isolated commitment and a
+/// reusable saved source containing a still-pending prospective restriction.
+pub fn forced_choice_conformance<B, C, H, P>(
+    state: &mut ControlledTextGeneration<'_, B, TokenChoiceController<C>>,
+    provider: &mut H,
     limits: &ContinuationFixtureLimits,
     vocabulary: usize,
     probe: impl Fn() -> P,
 ) where
-    B: TextSnapshotBackend,
-    C: SnapshotTokenController + Clone + PartialEq + Debug,
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController
+        + eredu_core::SpeculativeTokenFilterController
+        + Clone
+        + PartialEq
+        + Debug,
+    H: ContinuationSnapshotProvider<B, TokenChoiceController<C>>,
     P: PartialEq + Debug,
 {
-    let budget = SnapshotBudget::new(SnapshotLimits {
-        max_snapshots: 2,
-        max_branches: 1,
-        retained_bytes: 64_000_000,
-        cumulative_copy_bytes: 512_000_000,
-    });
-    let initial = TextContinuationSnapshot::capture(
-        &mut state.boundary(driver).unwrap(),
-        &budget,
-        Some(limits.host_bytes),
-    )
-    .unwrap();
-    let baseline = step(driver, state).0;
-    initial
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
-    let filter = state.controller_mut().current_filter().unwrap();
+    let budget = budget(1);
+    let initial = capture(state, provider, &budget, limits);
+    let baseline = step(state, provider).0;
+    restore(state, provider, &initial);
+    let filter = state.controller().inner().clone().current_filter().unwrap();
     let alternative = (0..vocabulary as u32)
         .find(|&token| {
             token != baseline
@@ -225,269 +352,283 @@ pub fn forced_choice_conformance<B, C, P>(
                     .allowed_mask()
                     .is_none_or(|mask| mask[token as usize])
         })
-        .expect("fixture must admit an alternative canonical token");
+        .expect("alternative canonical token");
     let mut expected = state.controller().inner().clone();
     expected.commit_token(alternative).unwrap();
     let before = probe();
-    let mut child = initial
-        .fork(
-            &mut state.boundary(driver).unwrap(),
-            &budget,
-            TextBranchRequest {
-                session_id: "conformance-forced-child",
-                max_predictions: limits.max_predictions,
-                capture_limits: limits.capture.clone(),
-                intervention: None,
-                host_bytes: Some(limits.host_bytes),
-                continuation_growth_bytes: Some(limits.growth_bytes),
-            },
-        )
+    let mut child = fork(
+        state,
+        provider,
+        &initial,
+        limits,
+        "conformance-forced-child",
+    );
+    state.exchange_branch(&mut child.0).unwrap();
+    provider.exchange_host(&mut child.1);
+    state
+        .token_choice_boundary()
+        .unwrap()
+        .force_next(alternative, &provider.choice_funding())
         .unwrap();
-    child.exchange(driver, state).unwrap();
-    state.controller_mut().force_next(alternative).unwrap();
-    let pending = TextContinuationSnapshot::capture(
-        &mut state.boundary(driver).unwrap(),
-        &budget,
-        Some(limits.host_bytes),
-    )
-    .unwrap();
+    let pending = capture(state, provider, &budget, limits);
     assert_eq!(probe(), before, "choice/fork/capture executed the model");
-    assert_eq!(step(driver, state).0, alternative);
+    assert_eq!(step(state, provider).0, alternative);
     assert!(state.controller().last_committed_was_forced());
     assert_eq!(state.controller().inner(), &expected);
-    let continuation: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
+    let continuation: Vec<_> = (0..3).map(|_| step(state, provider)).collect();
     assert!(!state.controller().last_committed_was_forced());
     for _ in 0..2 {
         let before = probe();
-        pending
-            .restore(&mut state.boundary(driver).unwrap(), &budget)
-            .unwrap();
+        restore(state, provider, &pending);
         assert_eq!(probe(), before, "restore replayed the forced prefix");
         assert_eq!(state.controller().pending_forced(), Some(alternative));
-        assert_eq!(step(driver, state).0, alternative);
+        assert_eq!(step(state, provider).0, alternative);
         assert_eq!(state.controller().inner(), &expected);
-        let actual: Vec<_> = (0..3).map(|_| step(driver, state)).collect();
-        assert_eq!(actual, continuation);
+        assert_eq!(
+            (0..3).map(|_| step(state, provider)).collect::<Vec<_>>(),
+            continuation
+        );
     }
-    child.exchange(driver, state).unwrap();
+    state.exchange_branch(&mut child.0).unwrap();
+    provider.exchange_host(&mut child.1);
     assert_eq!(state.controller().pending_forced(), None);
-    assert_eq!(step(driver, state).0, baseline, "child changed the parent");
-    initial
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
+    assert_eq!(step(state, provider).0, baseline);
+    restore(state, provider, &initial);
 }
 
-/// Checks reusable initial/decode snapshots, pending-input position, exact sampled
-/// continuations, controller restoration, isolated interleaved siblings, fresh
-/// child admissions, cumulative capture accounting and retention-lease ownership.
-/// `probe` must change on model forward, reset, artifact reopen or weight reload;
-/// it must not count copying. Nonzero-temperature/adaptive fixtures detect lost
-/// RNG/history state. This function consumes the initial continuation for cleanup
-/// checks; its driver remains usable only for inspecting the fixture afterward.
-pub fn continuation_conformance<B, C, P>(
-    driver: &mut TextGenerationDriver<'_, B>,
-    mut state: ManagedTextContinuation<B, C>,
+/// Checks exact snapshot/restore output, independent child state, non-replayed
+/// native work, inherited capture usage and completion-safe branch retirement.
+///
+/// The final child remains installed in the runtime. After this function returns,
+/// the caller retires that state through its normal reset or teardown mechanism,
+/// then finishes the returned retirement check.
+pub fn continuation_conformance<B, C, H, P>(
+    mut state: ControlledTextGeneration<'_, B, C>,
+    mut provider: H,
     limits: ContinuationFixtureLimits,
     probe: impl Fn() -> P,
-) where
-    B: TextSnapshotBackend,
+) -> ContinuationRetirement<B, C, H>
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
     C: SnapshotTokenController + Clone + PartialEq + Debug,
+    H: ContinuationSnapshotProvider<B, C>,
     P: PartialEq + Debug,
 {
     assert!(limits.max_predictions >= 8);
-    let budget = SnapshotBudget::new(SnapshotLimits {
-        max_snapshots: 2,
-        max_branches: 2,
-        retained_bytes: 64_000_000,
-        cumulative_copy_bytes: 512_000_000,
-    });
+    let budget = budget(2);
     let before = probe();
     assert!(matches!(
-        TextContinuationSnapshot::capture(&mut state.boundary(driver).unwrap(), &budget, None),
+        provider.capture(&mut state.snapshot_source().unwrap(), &budget, None),
         Err(TextSnapshotError::Control(
             ExecutionControlError::UnknownEstimate
         ))
     ));
     assert_eq!(budget.usage(), SnapshotUsage::default());
     assert_eq!(probe(), before);
-    let initial = TextContinuationSnapshot::capture(
-        &mut state.boundary(driver).unwrap(),
-        &budget,
-        Some(limits.host_bytes),
-    )
-    .unwrap();
-    assert_eq!(initial.next_prediction(), 0);
-    let initial_native = B::estimate_native_text_state(driver.runtime(), None)
+    let initial = capture(&mut state, &mut provider, &budget, &limits);
+    let initial_position = initial.0.next_prediction();
+    let initial_native = B::estimate_native_text_state(state.runtime(), None)
         .unwrap()
         .unwrap()
         .retained_bytes;
     let initial_growth = initial
-        .native_continuation_growth(driver.runtime(), limits.max_predictions)
+        .0
+        .native_continuation_growth(state.runtime(), limits.max_predictions)
         .unwrap();
     assert_eq!(
         probe(),
         before,
         "growth estimation executed or rebuilt the model"
     );
-    let prefix: Vec<_> = (0..3).map(|_| step(driver, &mut state)).collect();
+    let prefix: Vec<_> = (0..3).map(|_| step(&mut state, &mut provider)).collect();
     let prefix_controller = state.controller().clone();
-    let saved = TextContinuationSnapshot::capture(
-        &mut state.boundary(driver).unwrap(),
-        &budget,
-        Some(limits.host_bytes),
-    )
-    .unwrap();
-    assert_eq!(saved.next_prediction(), 3);
+    let saved = capture(&mut state, &mut provider, &budget, &limits);
+    assert_eq!(saved.0.next_prediction(), initial_position + 3);
     let usage = budget.usage();
     let before = probe();
     assert!(matches!(
-        TextContinuationSnapshot::capture(
-            &mut state.boundary(driver).unwrap(),
+        provider.capture(
+            &mut state.snapshot_source().unwrap(),
             &budget,
-            Some(limits.host_bytes),
+            Some(limits.host_bytes)
         ),
         Err(TextSnapshotError::Control(ExecutionControlError::Limit(
             "snapshot count"
         )))
     ));
     assert_eq!(budget.usage(), usage);
-    let native_growth = saved
-        .native_continuation_growth(driver.runtime(), limits.max_predictions)
-        .unwrap();
-    let child = |session_id| TextBranchRequest {
-        session_id,
-        max_predictions: limits.max_predictions,
-        capture_limits: limits.capture.clone(),
-        intervention: None,
-        host_bytes: Some(limits.host_bytes),
-        continuation_growth_bytes: Some(limits.growth_bytes.checked_add(native_growth).unwrap()),
-    };
-    let mut left = saved
-        .fork(
-            &mut state.boundary(driver).unwrap(),
-            &budget,
-            child("conformance-left"),
-        )
-        .unwrap();
-    let mut right = saved
-        .fork(
-            &mut state.boundary(driver).unwrap(),
-            &budget,
-            child("conformance-right"),
-        )
-        .unwrap();
+    let snapshots_retained = usage.retained_bytes;
+    let mut left = fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &limits,
+        "conformance-left",
+    );
+    let active_child_bytes = budget.usage().retained_bytes - usage.retained_bytes;
+    let mut right = fork(
+        &mut state,
+        &mut provider,
+        &saved,
+        &limits,
+        "conformance-right",
+    );
     assert_eq!(probe(), before, "copy/fork executed or rebuilt the model");
-    let baseline: Vec<_> = (0..5).map(|_| step(driver, &mut state)).collect();
-    let native_after = B::estimate_native_text_state(driver.runtime(), None)
+    let baseline: Vec<_> = (0..5).map(|_| step(&mut state, &mut provider)).collect();
+    let native_after = B::estimate_native_text_state(state.runtime(), None)
         .unwrap()
         .unwrap()
         .retained_bytes;
-    assert!(
-        native_after <= initial_native.checked_add(initial_growth).unwrap(),
-        "retained native state exceeded the pre-generation growth allowance"
-    );
-    left.exchange(driver, &mut state).unwrap();
-    assert!(matches!(
-        saved.restore(&mut state.boundary(driver).unwrap(), &budget),
-        Err(TextSnapshotError::IncompatibleRun)
-    ));
-    if let Some(checkpoint) = saved.capture_checkpoint() {
-        let boundary = state.boundary(driver).unwrap();
+    assert!(native_after <= initial_native.checked_add(initial_growth).unwrap());
+    state.exchange_branch(&mut left.0).unwrap();
+    provider.exchange_host(&mut left.1);
+    if let Some(checkpoint) = saved.0.capture_checkpoint() {
         assert_eq!(
-            B::capture_run(boundary.parts().1)
-                .unwrap()
-                .cumulative_usage(),
+            provider.capture_usage(&state.snapshot_source().unwrap()),
             checkpoint.inherited_usage()
         );
     }
-    let first_left = step(driver, &mut state);
+    let first_left = step(&mut state, &mut provider);
     if let (Some(child), Some(parent)) = (&first_left.1, &baseline[0].1) {
         for (child, parent) in child.interventions.iter().zip(&parent.interventions) {
-            assert_ne!(
-                child.plan_id, parent.plan_id,
-                "child reused a session-bound admission"
-            );
+            assert_ne!(child.plan_id, parent.plan_id);
         }
     }
     assert_eq!(
         branch_values(first_left),
         branch_values(baseline[0].clone())
     );
-    left.exchange(driver, &mut state).unwrap();
-    right.exchange(driver, &mut state).unwrap();
-    let other: Vec<_> = (0..5)
-        .map(|_| branch_values(step(driver, &mut state)))
-        .collect();
+    state.exchange_branch(&mut left.0).unwrap();
+    provider.exchange_host(&mut left.1);
+    state.exchange_branch(&mut right.0).unwrap();
+    provider.exchange_host(&mut right.1);
     assert_eq!(
-        other,
+        (0..5)
+            .map(|_| branch_values(step(&mut state, &mut provider)))
+            .collect::<Vec<_>>(),
         baseline
             .iter()
             .cloned()
             .map(branch_values)
             .collect::<Vec<_>>()
     );
-    right.exchange(driver, &mut state).unwrap();
-    left.exchange(driver, &mut state).unwrap();
-    let rest: Vec<_> = (0..4)
-        .map(|_| branch_values(step(driver, &mut state)))
-        .collect();
+    state.exchange_branch(&mut right.0).unwrap();
+    provider.exchange_host(&mut right.1);
+    state.exchange_branch(&mut left.0).unwrap();
+    provider.exchange_host(&mut left.1);
     assert_eq!(
-        rest,
+        (0..4)
+            .map(|_| branch_values(step(&mut state, &mut provider)))
+            .collect::<Vec<_>>(),
         baseline[1..]
             .iter()
             .cloned()
             .map(branch_values)
             .collect::<Vec<_>>()
     );
-    left.exchange(driver, &mut state).unwrap();
-    let capture_usage = {
-        let boundary = state.boundary(driver).unwrap();
-        B::capture_run(boundary.parts().1).map(|run| run.cumulative_usage())
-    };
+    state.exchange_branch(&mut left.0).unwrap();
+    provider.exchange_host(&mut left.1);
+    let before_usage = provider.capture_usage(&state.snapshot_source().unwrap());
     for _ in 0..2 {
         let before = probe();
-        saved
-            .restore(&mut state.boundary(driver).unwrap(), &budget)
-            .unwrap();
+        restore(&mut state, &mut provider, &saved);
         assert_eq!(probe(), before, "restore executed or rebuilt the model");
         assert_eq!(state.controller(), &prefix_controller);
-        let actual: Vec<_> = (0..5).map(|_| step(driver, &mut state)).collect();
-        assert_eq!(actual, baseline);
+        assert_eq!(
+            (0..5)
+                .map(|_| step(&mut state, &mut provider))
+                .collect::<Vec<_>>(),
+            baseline
+        );
     }
-    if let Some(before) = capture_usage {
-        let boundary = state.boundary(driver).unwrap();
-        let after = B::capture_run(boundary.parts().1)
-            .unwrap()
-            .cumulative_usage();
-        assert!(after.captures >= before.captures);
-        assert!(after.encoded_bytes >= before.encoded_bytes);
-        if before.encoded_bytes != 0 {
-            assert!(after.encoded_bytes > before.encoded_bytes);
-        }
-    }
-    initial
-        .restore(&mut state.boundary(driver).unwrap(), &budget)
-        .unwrap();
-    let actual: Vec<_> = (0..3).map(|_| step(driver, &mut state)).collect();
-    assert_eq!(actual, prefix);
+    let after = provider.capture_usage(&state.snapshot_source().unwrap());
+    assert!(after.captures >= before_usage.captures);
+    assert!(after.encoded_bytes >= before_usage.encoded_bytes);
+    restore(&mut state, &mut provider, &initial);
+    assert_eq!(
+        (0..3)
+            .map(|_| step(&mut state, &mut provider))
+            .collect::<Vec<_>>(),
+        prefix
+    );
     drop(right);
     assert_eq!(budget.usage().branches, 1);
-    left.exchange(driver, &mut state).unwrap();
-    assert!(state.retained_branch_bytes().is_some());
+    state.exchange_branch(&mut left.0).unwrap();
+    provider.exchange_host(&mut left.1);
     let usage = budget.usage();
-    drop(left); // This slot now holds the original parent, not the charged child.
+    drop(left);
     assert_eq!(
-        budget.usage(),
-        usage,
+        budget.usage().branches,
+        usage.branches,
         "dropping parent released active child retention"
     );
-    drop(state);
-    assert_eq!(budget.usage().branches, 0);
-    drop((initial, saved));
-    assert_eq!(budget.usage().retained_bytes, 0);
-    assert_eq!(budget.usage().snapshots, 0);
+    assert_eq!(budget.usage().snapshots, usage.snapshots);
     assert_eq!(
         budget.usage().cumulative_copy_bytes,
         usage.cumulative_copy_bytes
     );
+    assert_eq!(
+        budget.usage().retained_bytes,
+        snapshots_retained + active_child_bytes
+    );
+    drop(state);
+    // The active host cursor is an independent owner of the same branch lease.
+    assert_eq!(budget.usage().branches, 1);
+    drop(provider);
+    ContinuationRetirement {
+        snapshots: [initial, saved],
+        budget,
+        cumulative_copy_bytes: usage.cumulative_copy_bytes,
+    }
+}
+
+/// Final ownership checks after the caller retires the installed native state.
+///
+/// The logical branch lease follows its copied host and native owners, including
+/// buffers still installed in the runtime after the controlled driver is dropped.
+/// Completion polling alone cannot release an installed owner's lease.
+#[must_use = "retire the installed runtime state, then finish the ownership checks"]
+pub struct ContinuationRetirement<B, C, H>
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+    H: ContinuationSnapshotProvider<B, C>,
+{
+    snapshots: [(TextContinuationSnapshot<B, C>, H::Host); 2],
+    budget: SnapshotBudget,
+    cumulative_copy_bytes: u64,
+}
+
+impl<B, C, H> ContinuationRetirement<B, C, H>
+where
+    B: TextSnapshotBackend
+        + TextResumeBackend<
+            ResumeSource = B::SavedTextComponents,
+            DisplacedState = B::NativeTextState,
+        >,
+    C: SnapshotTokenController,
+    H: ContinuationSnapshotProvider<B, C>,
+{
+    /// Verifies branch retirement, then releases snapshots and checks that all
+    /// retained charges retire without refunding cumulative copy consumption.
+    pub fn finish(self) {
+        H::settle_retirement(|| self.budget.usage().branches == 0);
+        assert_eq!(self.budget.usage().branches, 0);
+        drop(self.snapshots);
+        H::settle_retirement(|| self.budget.usage().retained_bytes == 0);
+        assert_eq!(self.budget.usage().retained_bytes, 0);
+        assert_eq!(self.budget.usage().snapshots, 0);
+        assert_eq!(
+            self.budget.usage().cumulative_copy_bytes,
+            self.cumulative_copy_bytes
+        );
+    }
 }

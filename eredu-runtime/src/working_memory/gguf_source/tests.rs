@@ -75,18 +75,18 @@ impl Fixture {
 
 fn requirements(fixture: &Fixture) -> Option<(u64, u64)> {
     let catalog = fixture.plan().compile(()).unwrap();
-    let result = WorkingMemoryPool::gguf_source_required_bytes(&catalog);
+    let result = MemoryLedger::gguf_source_required_bytes(&catalog);
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
     match result {
         Ok(source) => Some((
-            WorkingMemoryPool::gguf_catalog_required_bytes(&fixture.plan()).unwrap(),
+            MemoryLedger::gguf_catalog_required_bytes(&fixture.plan()).unwrap(),
             source,
         )),
         Err(WorkingMemoryError::UnknownBound) => {
             assert!(matches!(
-                WorkingMemoryPool::gguf_source_required_bytes(&catalog),
+                MemoryLedger::gguf_source_required_bytes(&catalog),
                 Err(WorkingMemoryError::UnknownBound)
             ));
             None
@@ -110,33 +110,41 @@ fn source_constructor_exact_one_short_preserves_catalog_and_last_weak_charge() {
     let Some((catalog_bytes, source_bytes)) = requirements(&fixture) else {
         return;
     };
-    let short = WorkingMemoryPool::new(catalog_bytes + source_bytes - 1, 0).unwrap();
+    let short =
+        crate::working_memory::memory_fixture::host_ledger(catalog_bytes + source_bytes - 1, 0)
+            .unwrap();
     let catalog = short
         .compile_gguf_catalog(fixture.plan())
         .unwrap()
         .into_prepared();
     let refused = short.compile_gguf_source(catalog).unwrap_err();
     assert!(
-        matches!(refused.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
-        if *required_bytes == source_bytes && *available_bytes == source_bytes - 1)
+        matches!(refused.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))
+        if *required_bytes == source_bytes && (limit_bytes - existing_bytes) == source_bytes - 1)
     );
     assert!(refused.rejected_catalog().is_some());
     assert!(refused.construction_failure().is_none());
-    assert!(std::error::Error::source(&refused)
-        .unwrap()
-        .is::<WorkingMemoryError>());
-    assert_eq!(short.used_bytes().unwrap(), catalog_bytes);
+    assert!(
+        std::error::Error::source(&refused)
+            .unwrap()
+            .is::<WorkingMemoryError>()
+    );
+    assert_eq!(short.payload_used_bytes().unwrap(), catalog_bytes);
     drop(refused);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
 
-    let pool = WorkingMemoryPool::new(catalog_bytes + source_bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(catalog_bytes + source_bytes, 0)
+        .unwrap();
     let catalog = pool
         .compile_gguf_catalog(fixture.plan())
         .unwrap()
         .into_prepared();
     let source = pool.compile_gguf_source(catalog).unwrap();
     pool.validate_gguf_source_controls(&source).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), catalog_bytes + source_bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        catalog_bytes + source_bytes
+    );
     assert_eq!(source.diagnostics().unwrap().physical_reads, 0);
     let key = identity(&source);
     let lease = source
@@ -147,12 +155,15 @@ fn source_constructor_exact_one_short_preserves_catalog_and_last_weak_charge() {
         })
         .unwrap();
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), catalog_bytes + source_bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        catalog_bytes + source_bytes
+    );
     let converted = lease.materialize_portable().unwrap();
     assert_eq!(converted.output_names(), ["first"]);
     drop(converted);
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes);
     let clones = [key.clone(), key.clone(), key.clone()];
     drop(key);
     std::thread::scope(|scope| {
@@ -160,7 +171,7 @@ fn source_constructor_exact_one_short_preserves_catalog_and_last_weak_charge() {
             scope.spawn(move || drop(key));
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn source_weak_account_has_no_pool_cycle_and_origin_cannot_be_promoted() {
@@ -168,15 +179,16 @@ fn source_weak_account_has_no_pool_cycle_and_origin_cannot_be_promoted() {
     let Some((catalog_bytes, source_bytes)) = requirements(&fixture) else {
         return;
     };
-    let pool = WorkingMemoryPool::new(catalog_bytes + source_bytes, 0).unwrap();
-    let other = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(catalog_bytes + source_bytes, 0)
+        .unwrap();
+    let other = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let ordinary = fixture.plan().compile(()).unwrap();
     let refused = pool.compile_gguf_source(ordinary).unwrap_err();
     assert!(matches!(
         refused.accounting_failure(),
         Some(WorkingMemoryError::UnknownBound)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(refused);
     let catalog = pool
         .compile_gguf_catalog(fixture.plan())
@@ -187,7 +199,7 @@ fn source_weak_account_has_no_pool_cycle_and_origin_cannot_be_promoted() {
         refused.accounting_failure(),
         Some(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(other.used_bytes().unwrap(), 0);
+    assert_eq!(other.payload_used_bytes().unwrap(), 0);
     drop(refused);
     let catalog = pool
         .compile_gguf_catalog(fixture.plan())
@@ -234,7 +246,15 @@ fn source_inventory_registration_preserves_full_capacity_and_charges_only_same_p
         .inventory_bytes();
     assert!(prepaid > 0 && physical >= prepaid);
     let residual = physical - prepaid;
-    let pool = WorkingMemoryPool::new(catalog_bytes + source_bytes + residual + 19, 0).unwrap();
+    let publication = MemoryLedger::storage_metadata_control_bytes().unwrap()
+        + crate::working_memory::StoragePublicationLayout::<Key>::new(2)
+            .unwrap()
+            .requested_bytes();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        catalog_bytes + source_bytes + residual + 19 + 3 * publication,
+        0,
+    )
+    .unwrap();
     let source = pool
         .compile_gguf_source(
             pool.compile_gguf_catalog(fixture.plan())
@@ -243,44 +263,71 @@ fn source_inventory_registration_preserves_full_capacity_and_charges_only_same_p
         )
         .unwrap();
     let key = Key::Source(identity(&source));
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     let bad = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical + 1)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(
+                physical + 1,
+                pool.host_placement_handle(),
+            ),
+        )])
         .unwrap_err();
     assert!(matches!(
         bad,
         WorkingMemoryError::StorageCapacityMismatch { .. }
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let first = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical), (Key::Ordinary(1), 19)])
+        .register_storage_with_gguf_sources([
+            (
+                key.clone(),
+                crate::working_memory::StorageAllocation::new(
+                    physical,
+                    pool.host_placement_handle(),
+                ),
+            ),
+            (
+                Key::Ordinary(1),
+                crate::working_memory::StorageAllocation::new(19, pool.host_placement_handle()),
+            ),
+        ])
         .unwrap();
-    assert_eq!(first.bytes(), physical + 19);
-    assert_eq!(pool.used_bytes().unwrap(), before + residual + 19);
+    assert_eq!(first.bytes(), Some(physical + 19));
+    assert_eq!(pool.payload_used_bytes().unwrap(), before + residual + 19);
     let alias = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), before + residual + 19);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before + residual + 19);
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), before + residual);
-    let raw_alias = pool.register_storage([(key.clone(), physical)]).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), before + residual);
+    let raw_alias = pool
+        .register_host_storage([(key.clone(), physical)])
+        .unwrap();
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), before + residual);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before + residual);
     drop(raw_alias);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     // B cannot borrow A's accepted reader construction. It registers exactly
     // the full truthful physical inventory in its independent domain.
-    let foreign = WorkingMemoryPool::new(physical, 0).unwrap();
+    let foreign =
+        crate::working_memory::memory_fixture::host_ledger(physical + publication, 0).unwrap();
     let foreign_pin = foreign
-        .register_storage_with_gguf_sources([(key.clone(), physical)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
         .unwrap();
-    assert_eq!(foreign.used_bytes().unwrap(), physical);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), physical);
     drop(foreign_pin);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes);
     drop(key);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[derive(Clone, Debug)]
@@ -342,7 +389,7 @@ fn source_registration_comparison_unwind_retires_candidates_after_usage_without_
     let Some((catalog_bytes, source_bytes)) = requirements(&fixture) else {
         return;
     };
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let catalog = pool
         .compile_gguf_catalog(fixture.plan())
         .unwrap()
@@ -359,14 +406,20 @@ fn source_registration_comparison_unwind_retires_candidates_after_usage_without_
         drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     let registration = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
         .unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert_eq!(before, catalog_bytes + source_bytes + physical - prepaid);
     let drops_before = key.drops.load(Ordering::SeqCst);
     key.panic_in_lookup.store(true, Ordering::SeqCst);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pool.register_storage_with_gguf_sources([(key.clone(), physical)])
+        pool.register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
     }));
     assert!(failed.is_err());
     assert!(key.drops.load(Ordering::SeqCst) > drops_before);
@@ -374,13 +427,16 @@ fn source_registration_comparison_unwind_retires_candidates_after_usage_without_
     // Explicit test recovery permits inspection after the injected comparison;
     // production preserves poison and never treats it as permission to refund.
     pool.0.usage.clear_poison();
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     drop(registration);
-    assert_eq!(pool.used_bytes().unwrap(), catalog_bytes + source_bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        catalog_bytes + source_bytes
+    );
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes);
     drop(key);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -398,8 +454,15 @@ fn native_publication_reuses_actual_source_origin_and_rejects_absent_or_foreign_
         .source_storage_request::<SourcePayloadCustody>()
         .unwrap()
         .inventory_bytes();
-    let capacity = catalog_bytes + source_bytes + 2 * physical + 64;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let publication = MemoryLedger::storage_metadata_control_bytes().unwrap()
+        + crate::working_memory::StoragePublicationLayout::<Key>::new(1)
+            .unwrap()
+            .requested_bytes();
+    let scratch = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let admission = crate::working_memory::memory_fixture::host_admission(&scratch, 64);
+    let controls = crate::working_memory::memory_fixture::reservation_bytes(&scratch, &admission);
+    let capacity = catalog_bytes + source_bytes + 2 * physical + controls + 2 * publication;
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let source = pool
         .compile_gguf_source(
             pool.compile_gguf_catalog(fixture.plan())
@@ -417,30 +480,32 @@ fn native_publication_reuses_actual_source_origin_and_rejects_absent_or_foreign_
     missing
         .push_source(&key, physical, Some(&id), &pool)
         .unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert_eq!(
         missing.publish(&scope).unwrap_err(),
         WorkingMemoryError::IdentityMismatch
     );
     assert!(missing.take_input(0).is_none());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let existing = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
         .unwrap();
     let ordinary = pool
-        .register_storage([(Key::Ordinary(99), physical)])
+        .register_host_storage([(Key::Ordinary(99), physical)])
         .unwrap();
     let mut wrong = PreparedNativePublication::prepare_slots(partition.clone(), 1);
-    wrong
-        .push_source(&Key::Ordinary(99), physical, Some(&id), &pool)
-        .unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert_eq!(
-        wrong.publish(&scope).unwrap_err(),
+        wrong
+            .push_source(&Key::Ordinary(99), physical, Some(&id), &pool)
+            .unwrap_err(),
         WorkingMemoryError::IdentityMismatch
     );
-    assert_eq!(pool.used_bytes().unwrap(), before);
-    let foreign = WorkingMemoryPool::new(capacity, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
+    let foreign = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let mut wrong_pool = PreparedNativePublication::prepare_slots(partition.clone(), 1);
     assert_eq!(
         wrong_pool
@@ -457,21 +522,21 @@ fn native_publication_reuses_actual_source_origin_and_rejects_absent_or_foreign_
     alias.push_source(&key, physical, Some(&id), &pool).unwrap();
     alias.publish(&scope).unwrap();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         before,
         "existing source is not recharged as mutable P"
     );
     let retained = alias.take_input(0).unwrap();
-    assert_eq!(retained.bytes(), physical);
+    assert_eq!(retained.bytes(), Some(physical));
     scope.certify().unwrap();
     drop((
         missing, wrong, changed, wrong_pool, alias, ordinary, existing, partition, metadata, run,
         key, id, source,
     ));
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "the canonical source row retains the real original account"
     );
     drop(retained);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

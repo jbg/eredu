@@ -51,7 +51,7 @@ where
         config: TextGenerationConfig,
         options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Result<u64, TextSnapshotError<B::Error>> {
-        self.validate_original_resume(config)?;
+        self.validate_original_resume(config.clone())?;
         B::original_saved_components_resume_preparation_bytes(
             runtime,
             &self.saved,
@@ -156,11 +156,6 @@ where
         &self,
         config: TextGenerationConfig,
     ) -> Result<(), TextSnapshotError<B::Error>> {
-        if self.driver.is_some() || self.capture.is_some() {
-            return Err(TextSnapshotError::Unsupported(
-                "original resume source contract",
-            ));
-        }
         match (self.remaining_tokens, config.sampling().max_new_tokens) {
             (Some(saved), Some(requested)) if requested <= saved => Ok(()),
             _ => Err(TextSnapshotError::InconsistentState),
@@ -193,7 +188,8 @@ where
             eredu_core::OriginalTextResumeKind::Restore => SnapshotResourceKind::Restore,
             eredu_core::OriginalTextResumeKind::Branch => SnapshotResourceKind::Branch,
         };
-        let preparation = self.original_resume_preparation_bytes(runtime, config, options)?;
+        let preparation =
+            self.original_resume_preparation_bytes(runtime, config.clone(), options)?;
         let controls = Self::original_resume_control_bytes::<H::Copied>()
             .ok_or(ExecutionControlError::Overflow)?;
         if host
@@ -216,7 +212,7 @@ where
             [B::original_saved_components_resume_estimate(
                 runtime,
                 &self.saved,
-                config,
+                config.clone(),
                 options,
             )],
             host_bytes

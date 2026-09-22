@@ -7,7 +7,9 @@ use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType, Stream};
 fn metal_text_prompt_preparation_prices_complete_backing_across_chunks() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let backend = crate::native::backend(&stream, &stream);
-    let facts = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    let facts = MlxMetalWorkspaceMechanisms::current_host()
+        .unwrap()
+        .ordinary_storage();
     for positions in [1, 37, 3000, 4097, 16385] {
         for spare_capacity in [0, 8192] {
             let mut ids = Vec::with_capacity(positions + spare_capacity);
@@ -35,7 +37,28 @@ fn metal_text_prompt_preparation_prices_complete_backing_across_chunks() {
                     &WorkspaceContext::new(facts),
                 )
                 .unwrap();
-                assert_eq!(quote.host_peak_bytes(), Some(host_bytes + identity_peak));
+                let host = quote.host_peak_bytes().unwrap();
+                assert!(
+                    host >= host_bytes
+                        + identity_peak
+                        + facts.allocation().host_control_bytes().unwrap()
+                );
+                assert_eq!(
+                    quote.peak().bytes(),
+                    host.checked_add(quote.tensor_peak_bytes().unwrap())
+                );
+                let minimal = eredu_runtime::working_memory::quote_text_prompt_workspace(
+                    quote.geometry(),
+                    Some(positions as u64 * 4),
+                    &WorkspaceContext::new(facts),
+                )
+                .unwrap();
+                // Changing caller capacity changes exactly that retained host
+                // contribution; native and identity controls remain present.
+                assert_eq!(
+                    host.checked_sub(minimal.host_peak_bytes().unwrap()),
+                    host_bytes.checked_sub(positions as u64 * 4)
+                );
                 quotes.push(quote);
             }
             assert_eq!(safemlx::memory::active_memory().unwrap(), cold_before);
@@ -51,7 +74,8 @@ fn metal_text_prompt_preparation_prices_complete_backing_across_chunks() {
             stream.synchronize().unwrap();
             let observed = safemlx::memory::peak_memory()
                 .unwrap()
-                .saturating_sub(cold_before) as u64;
+                .checked_sub(cold_before)
+                .unwrap() as u64;
             let quote = &quotes[0];
             assert!(observed <= quote.tensor_peak_bytes().unwrap());
             assert_eq!(tokens.shape(), [1, positions as i32]);
@@ -73,7 +97,12 @@ fn metal_text_prompt_preparation_prices_complete_backing_across_chunks() {
             drop(tokens);
             drop(prompt);
             assert_eq!(last.allocation_info().unwrap(), Some(backing));
-            eprintln!("text prompt positions={positions} host_capacity={host_bytes} observed={observed} tensor_bound={} managed_bound={} retained_backing={}", quote.tensor_peak_bytes().unwrap(), quote.peak().bytes().unwrap(), backing.bytes());
+            eprintln!(
+                "text prompt positions={positions} host_capacity={host_bytes} observed={observed} tensor_bound={} managed_bound={} retained_backing={}",
+                quote.tensor_peak_bytes().unwrap(),
+                quote.peak().bytes().unwrap(),
+                backing.bytes()
+            );
         }
     }
 }

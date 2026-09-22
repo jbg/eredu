@@ -114,7 +114,7 @@ void exercise(mlx::core::Dtype dtype,int rank,size_t rows,size_t columns,int var
     }
     // The physical budget comes from the cold per-request inventory. The
     // fixture's Graph/Record arenas still isolate evaluation/custody coverage.
-    REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity,&retired,[](void* p){++*static_cast<unsigned*>(p);})==0);
+    REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity,&retired,[](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::array<std::optional<array>,2> escaped;
     {
       Role role;Observer observer;Bank bank;Outputs outputs;

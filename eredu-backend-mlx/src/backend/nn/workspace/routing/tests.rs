@@ -6,7 +6,11 @@ use eredu_nn::{
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -93,7 +97,7 @@ fn joint_routing_workspace_retains_partition_and_shared_coefficient_backing_once
         drop(result);
         let report = context.report(&[shared]).unwrap();
         assert_eq!(report.tensor_buffers.retained_bytes, Some(coefficients));
-        assert!(report.total_bytes.is_some());
+        crate::backend::nn::workspace::test_backing_control_completeness(&mechanisms(), &report);
     }
 }
 
@@ -139,7 +143,7 @@ mod native {
         ops::indexing::{IntoStrideBy, TryIndexOp},
         Array, Device, DeviceType, Dtype, Stream,
     };
-    fn values(a: &MlxTensor, s: &Stream) -> Vec<f32> {
+    fn values(a: &MlxTensor, s: &Stream) -> eredu_core::HostTensorBuffer<f32> {
         a.to_f32_vec(s).unwrap()
     }
     fn inputs(
@@ -233,7 +237,10 @@ mod native {
                                             _ => None,
                                         })
                                         .sum::<u64>();
-                                assert!(observed<=allowed,"{leading:?} d={d} p={p} shared={shared} k={k} {dtype:?} low={low_parameters} strided={strided} ties={ties}: {observed}>{allowed}");
+                                assert!(
+                                    observed <= allowed,
+                                    "{leading:?} d={d} p={p} shared={shared} k={k} {dtype:?} low={low_parameters} strided={strided} ties={ties}: {observed}>{allowed}"
+                                );
                                 let rows = op.outputs[0].shape()[0] as usize;
                                 let primary = output
                                     .primary_coefficients()

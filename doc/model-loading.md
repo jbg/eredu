@@ -36,6 +36,40 @@ match a planned load. Backend-author tooling that binds native distributed
 groups uses the selected implementation crate directly. Non-replicated
 distributed topologies still use the same architecture-erased loader.
 
+## Physical capacity
+
+`eredu::api::local_memory_topology()` reports the selected backend's physical
+domains. `configure_local_runtime` resolves the `MemoryLimitDeclarations` supplied
+to `LocalRuntimeConfiguration::with_memory_limits` against that topology before
+loading. Every omitted domain defaults to `Unlimited`;
+`Finite(u64::MAX)` remains a finite limit. Unknown and repeated domain names are
+errors. The CLI uses repeated `--memory-limit <domain>=<bytes|unlimited>` entries.
+
+One process-local `MemoryLedger` coordinates registered devices, loading,
+preparation, execution, and retained results. Limits constrain total live charges
+in each domain, including concurrent work and overlapping transfer sources,
+staging buffers, and destinations. Shared backing storage keeps one charge;
+independent copies retain independent charges. Unified host and accelerator
+locations share one physical limit only when backend hardware facts establish
+that relationship. CUDA managed storage keeps a conservative full-capacity
+allowance in every candidate physical domain for its entire lifetime.
+
+`local_memory_snapshot()` reports configured and effective limits, allocation
+charges, estimated allowances, additional headroom, and historical peaks by
+domain. These amounts are accounting facts and allowances, rather than measured
+physical residency or a process-memory ceiling. Unlimited requests retain the
+same completeness, ownership, checked arithmetic, and completion requirements.
+Inference admission does not apply `MemoryOverheadPolicy`; that neutral policy
+remains separate as described in the [memory contract](backend-architecture.md#memory-contract).
+`MemoryHeadroomDeclarations` assigns additional allowances to named domains.
+Those allowances remain a separate charge category; they neither describe
+controlled allocations nor make unknown overhead finite. Repeated headroom
+entries add with checked arithmetic, while repeated limit declarations are errors.
+
+Residency byte quotas below choose cache windows and eviction policy. Physical
+allocation permission comes from the ledger; logical eviction does not refund a
+backing still retained by another owner or an in-flight submission.
+
 ## Weight residency
 
 ### Fully resident
@@ -147,15 +181,26 @@ prompt caches.
 
 ## Reusable prompt caches
 
-A prompt cache is a completed immutable prefix. Saving seals partial tails and
-publishes a manifest plus bounded SafeTensors shards atomically. Loading first
-validates the entire manifest and owned layer layout, then attaches compatible
-shards as read-only disk blocks and promotes them only on demand.
+A prompt cache is a completed immutable prefix. Saving borrows completed partial
+tails without changing the live state and atomically publishes a manifest plus
+bounded SafeTensors shards. Loading validates the manifest, owned layer layout
+and actual shard contents before replacing state. Attention blocks remain
+read-only disk sources until needed; fixed state tensors use the admitted native
+materializer.
 
 Prompt-cache persistence is a backend/tooling facility, not an `eredu` facade
 operation. Its portable identity and manifest types use their canonical
 `eredu_core::cache` paths; MLX persistence operations are owned by
 `eredu-backend-mlx`.
+
+The admitted save and load methods return `SharedPromptCacheManifest`. Clones
+share its immutable backing and retain both construction funding and separately
+admitted dependency estimates. The plain `PromptCacheManifest` remains a
+caller-owned schema; inspecting it grants no restoration or execution authority.
+Loading requires paged state residency. Imported shards retain their authenticated
+file source and can be read and promoted with live disk writing disabled. Those
+reads admit their own staging and transfer work; they neither enable live writes
+nor acquire permission to delete the imported files.
 
 Callers obtain one complete `PromptCacheModelIdentity` from the prepared
 session and pass it to `PromptCacheDescriptor::from_model_identity`. Only the
@@ -198,6 +243,10 @@ remain distinct cache identities.
 
 Distributed prompt caches are rank-local beneath one shared root. A cache
 cannot be reopened under a different tensor, pipeline, or expert topology.
+Public per-session persistence requires a local state manifest and returns
+`PromptCacheError::RankHasNoState` for a stateless rank. The neutral distributed
+driver still includes that rank in the selected agreements and returns `None`
+without importing a manifest or establishing a new logical frontier.
 Realtime Moshi and PersonaPlex sessions remain outside this decoder prompt-cache
 format.
 

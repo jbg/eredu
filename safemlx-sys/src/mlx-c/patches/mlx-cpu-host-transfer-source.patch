@@ -29,7 +29,7 @@ diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
 +// The optional Contiguous before store is a distinct ordinary Eval.
 +bool host_transfer_eval_layout(Dtype dtype,size_t rank,bool store,bool tracer,
 +    CopyEvalStorage& out) noexcept {
-+  if(rank==0||rank>4||(dtype!=float32&&dtype!=float16&&dtype!=bfloat16&&dtype!=uint32&&dtype!=int32))return false;
++  if(rank==0||rank>5||(dtype!=float32&&dtype!=float16&&dtype!=bfloat16&&dtype!=uint32&&dtype!=int32))return false;
 +  CopyEvalStorage value;
 +  if(!copy_eval_layout(rank,1,true,tracer,value))return false;
 +  if(store)value.backing_births=0;
@@ -45,7 +45,7 @@ diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
 +  if(output.inputs().size()!=1)return false;
 +  const auto& input=output.inputs()[0];
 +  if(input.dtype()!=output.dtype()||input.shape()!=output.shape()||
-+      input.ndim()<1||input.ndim()>4||!input.flags().row_contiguous||
++      input.ndim()<1||input.ndim()>5||!input.flags().row_contiguous||
 +      input.size()==0||input.size()>size_t(INT_MAX)||input.data_size()<input.size())return false;
 +  for(const auto dimension:input.shape())if(dimension<=0)return false;
 +  const bool store=typeid(output.primitive())==typeid(CopyToHostTransfer);

@@ -11,6 +11,7 @@ mod banks;
 pub use banks::{prepare_bank_parameter_slots, PreparedBankParameter, PreparedBankParameterMember};
 mod catalog;
 mod coordination;
+mod publication;
 pub use assembly::{
     parameter_read_intent, PartitionParameterReadFragment, PartitionParameterReadPlan,
 };
@@ -22,6 +23,10 @@ pub use coordination::{
     ParameterModelIdentity, ParameterOperationBinding, ParameterOperationCoordinator,
     ParameterOperationKind, ParameterOperationTransport, ParameterReadPreparation,
     PARAMETER_CONTROL_WORDS,
+};
+pub use publication::{
+    ParameterPublication, ParameterPublicationError, ParameterPublicationFailure,
+    ParameterPublicationVisitor, ParameterReplacementValues, PreparedParameterPublication,
 };
 
 /// The architecture and residency policy actually retained by an execution.
@@ -74,7 +79,9 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
             return false;
         };
         visit_loaded_parameters_in_parts::<Self::Architecture, B, S, Self::Policy>(
-            architecture, policy, visitor,
+            architecture,
+            policy,
+            visitor,
         )
     }
 
@@ -95,6 +102,8 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
             >>::Error,
         >,
         context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<
         bool,
         LayerwiseAcquireError<
@@ -109,18 +118,25 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
             return Ok(false);
         };
         with_parameter_slots_in_parts::<Self::Architecture, B, S, Self::Policy>(
-            architecture, policy, location, operation, context,
+            architecture,
+            policy,
+            location,
+            operation,
+            context,
+            _preparation,
         )
     }
 
-    /// Publishes already-completed replacements to loaded and future loaded units.
-    /// The selected policy validates before changing handles. Its rejection leaves
-    /// pinned modules untouched; after acceptance static publication is infallible.
-    /// The live transaction owner separately handles caches, snapshots and peers.
-    fn publish_parameter_replacements(
+    /// Invalidates observation/geometry declarations after successful publication.
+    /// Release participant locks before retiring these displaced metadata owners.
+    fn invalidate_parameter_observations(&mut self) {
+        let _ = self.parameter_parts();
+    }
+
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn visit_parameter_publication(
         &mut self,
-        values: &std::collections::BTreeMap<String, B::Tensor>,
-        active: bool,
+        publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<
         bool,
         <Self::Policy as LayerwisePolicy<
@@ -131,8 +147,10 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
         let Some((architecture, policy)) = self.parameter_parts() else {
             return Ok(false);
         };
-        publish_parameter_replacements_in_parts::<Self::Architecture, B, S, Self::Policy>(
-            architecture, policy, values, active,
+        visit_parameter_publication_in_parts::<Self::Architecture, B, S, Self::Policy>(
+            architecture,
+            policy,
+            publication,
         )
     }
 }
@@ -152,7 +170,7 @@ where
     P: LayerwisePolicy<B, U>,
     V: for<'source> eredu_nn::ParameterSourceVisitor<'source, B::Tensor>,
 {
-    use eredu_nn::{ParameterSourceError, workspace::WorkspaceMetadataError};
+    use eredu_nn::{workspace::WorkspaceMetadataError, ParameterSourceError};
     let controls = [
         std::mem::size_of_val(&static_modules),
         std::mem::size_of::<(&P, &mut V, &eredu_nn::workspace::WorkspaceContext)>(),
@@ -167,17 +185,15 @@ where
     )?;
     match static_modules.visit_parameter_sources(visitor) {
         Ok(()) => {}
-        Err(
-            ParameterSourceError::UnclassifiedRetainedField,
-        ) => return Ok(false),
+        Err(ParameterSourceError::UnclassifiedRetainedField) => return Ok(false),
         Err(cause) => return Err(context.metadata_source(cause)),
     }
     policy.visit_resident_parameter_sources(visitor, context)
 }
 
-// Inspection lends immutable tensor values; publication separately replaces
-// slots. Neither operation exposes the raw architecture to its caller.
-pub(crate) fn visit_loaded_parameters_in_parts<A, B, S, P>(
+/// Lends immutable loaded values from the actual architecture and policy.
+/// The visitor cannot mutate slots or invalidate their observation declarations.
+pub fn visit_loaded_parameters_in_parts<A, B, S, P>(
     architecture: &mut A,
     policy: &mut P,
     visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
@@ -199,12 +215,16 @@ where
     policy.visit_resident_units(&mut |unit| unit.visit_parameters_mut(&mut adapter))
 }
 
-pub(crate) fn with_parameter_slots_in_parts<A, B, S, P>(
+/// Runs the shared prepared parameter loan through the retained source owners.
+/// This does not expose mutable architecture or replace parameter slots.
+pub fn with_parameter_slots_in_parts<A, B, S, P>(
     architecture: &mut A,
     policy: &mut P,
     location: &PreparedParameterLocation,
     operation: &mut ParameterSlotOperation<'_, B::Tensor, P::Error>,
     context: &<B::Tensor as Tensor>::Context,
+
+    _preparation: Option<&B::ParameterPreparation<'_>>,
 ) -> Result<bool, LayerwiseAcquireError<A::Error, P::Error>>
 where
     B: NeuralBackend,
@@ -213,8 +233,9 @@ where
     P: LayerwisePolicy<B, A::Unit>,
 {
     match location {
-        PreparedParameterLocation::Bank { .. }
-        | PreparedParameterLocation::Prediction { .. } => Ok(false),
+        PreparedParameterLocation::Bank { .. } | PreparedParameterLocation::Prediction { .. } => {
+            Ok(false)
+        }
         PreparedParameterLocation::Static { .. } => {
             operation(&mut |visitor| match architecture
                 .visit_static_parameters_mut(&mut LoadedSlotAdapter::<B>(visitor))
@@ -235,15 +256,17 @@ where
                 })
             },
             context,
+            _preparation,
         ),
     }
 }
 
-pub(crate) fn publish_parameter_replacements_in_parts<A, B, S, P>(
+/// Visits publication participants without changing observation bindings.
+/// The caller finalizes those bindings after successful committed publication.
+pub fn visit_parameter_publication_in_parts<A, B, S, P>(
     architecture: &mut A,
     policy: &mut P,
-    values: &std::collections::BTreeMap<String, B::Tensor>,
-    active: bool,
+    publication: &mut dyn ParameterPublication<B::Tensor>,
 ) -> Result<bool, P::Error>
 where
     B: NeuralBackend,
@@ -251,43 +274,37 @@ where
     A: LayeredArchitecture<B, S>,
     P: LayerwisePolicy<B, A::Unit>,
 {
-    if !policy.publish_parameter_replacements(values, active)? {
+    if !policy.visit_parameter_publication(publication)? {
         return Ok(false);
     }
-    match architecture
-        .visit_static_parameters_mut(&mut Publish(values))
-    {
-        Ok(()) => {}
-        Err(never) => match never {},
-    }
-    Ok(true)
-}
-
-struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
-impl<'a, T: Clone + 'a> eredu_nn::ParameterVisitorMut<'a, T> for Publish<'_, T> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut T) {
-        if let Some(replacement) = self.0.get(metadata.id().as_str()) {
-            *value = replacement.clone();
+    struct Static<'a, T>(&'a mut dyn ParameterPublication<T>);
+    impl<B: NeuralBackend> crate::StaticParameterVisitorMut<B> for Static<'_, B::Tensor> {
+        type Error = std::convert::Infallible;
+        fn visit_mut<M: Parameterized<B::Tensor>>(
+            &mut self,
+            _role: &str,
+            module: &mut M,
+        ) -> Result<(), Self::Error> {
+            module.visit_parameters_mut(&mut ParameterPublicationVisitor(self.0));
+            Ok(())
         }
     }
-}
-impl<B: NeuralBackend> crate::StaticParameterVisitorMut<B> for Publish<'_, B::Tensor> {
-    type Error = std::convert::Infallible;
-    fn visit_mut<M: Parameterized<B::Tensor>>(
-        &mut self, _role: &str, module: &mut M,
-    ) -> Result<(), Self::Error> {
-        module.visit_parameters_mut(self);
-        Ok(())
+    match architecture.visit_static_parameters_mut(&mut Static(publication)) {
+        Ok(()) => Ok(true),
+        Err(never) => match never {},
     }
 }
-
 struct LoadedSlotAdapter<'a, B: NeuralBackend>(
     &'a mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
 );
 impl<'a, B: NeuralBackend> eredu_nn::ParameterVisitorMut<'a, B::Tensor>
     for LoadedSlotAdapter<'_, B>
 {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut B::Tensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut B::Tensor,
+    ) {
         self.0.visit_slot(metadata, value);
     }
 }

@@ -80,17 +80,25 @@ impl InferenceStateRevision {
     fn new() -> Self {
         Self(RevisionIdentity::Ordinary(Arc::new(())))
     }
-    fn metadata_control_bytes()->Option<usize> {
+    fn metadata_control_bytes() -> Option<usize> {
         use std::mem::size_of;
-        let allocation=std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize;2]>()
-            .extend(std::alloc::Layout::new::<PlannedRevision>()).ok()?.0.pad_to_align().size();
-        allocation.checked_add(size_of::<(Self,PlannedRevision,Option<Self>,
-            Result<Self,eredu_nn::workspace::HostMetadataFundingError>)>())
+        let allocation = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<PlannedRevision>())
+            .ok()?
+            .0
+            .pad_to_align()
+            .size();
+        allocation.checked_add(size_of::<(
+            Self,
+            PlannedRevision,
+            Option<Self>,
+            Result<Self, eredu_nn::workspace::HostMetadataFundingError>,
+        )>())
     }
     pub(crate) fn prepare_metadata(
-        funding:&eredu_nn::workspace::HostMetadataFunding,
-    )->Result<Self,eredu_nn::workspace::HostMetadataFundingError> {
-        let bytes=Self::metadata_control_bytes()
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<Self, eredu_nn::workspace::HostMetadataFundingError> {
+        let bytes = Self::metadata_control_bytes()
             .ok_or(eredu_nn::workspace::HostMetadataFundingError::Overflow)?;
         funding.reserve_metadata(bytes)?;
         Ok(Self(RevisionIdentity::Planned(Some(Arc::new(
@@ -211,6 +219,8 @@ pub struct InferenceRetention {
     // closed original reset installs its funded revision before publication;
     // escaped revision aliases retain that original account without payload.
     revision: OnceLock<InferenceStateRevision>,
+    // Independently retained after every copied directory and revision.
+    metadata_funding: Option<eredu_core::HostMetadataFunding>,
 }
 
 impl Clone for InferenceRetention {
@@ -220,6 +230,7 @@ impl Clone for InferenceRetention {
             admission: self.admission.clone(),
             unquoted: self.unquoted.clone(),
             revision: OnceLock::from(self.revision().clone()),
+            metadata_funding: self.metadata_funding.clone(),
         }
     }
 
@@ -232,36 +243,127 @@ impl Clone for InferenceRetention {
 impl InferenceRetention {
     /// Exact handle directories and lazy revision metadata used by a copied
     /// retention owner. Shared requests and leases are retained, never reissued.
-    pub fn host_clone_bytes(&self)->Option<usize> {
-        use std::mem::{size_of,size_of_val};
-        let parts=[
-            eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<InferenceRequest>(self.requests.len())?,
-            eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<WorkingMemoryUnquotedLease>(self.unquoted.len())?,
-            if self.revision.get().is_none(){InferenceStateRevision::metadata_control_bytes()?}else{0},
-            size_of::<(Self,&Self,eredu_nn::workspace::HostMetadataFunding,Option<InferenceStateRevision>)>(),
-            size_of::<Result<Self,eredu_core::BackendFailure>>()];
-        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+    pub fn host_clone_bytes(&self) -> Option<usize> {
+        self.clone_source_bytes(self.requests.len(), self.revision.get().is_none())
+    }
+
+    /// Prospective directories for this retained source plus one exact future
+    /// admitted request. The source validator must authenticate that request;
+    /// the extra slot alone is neither admission nor permission to copy state.
+    pub fn checkpoint_clone_bytes(&self) -> Option<usize> {
+        self.clone_source_bytes(self.requests.len().checked_add(1)?, true)
+    }
+
+    /// Checks the actual retained handles before a sourced checkpoint copy.
+    /// Existing handles must survive, and only the supplied admitted request
+    /// may have been added since the cold source was retained.
+    pub fn validate_checkpoint_source(
+        &self,
+        source: &Self,
+        request: &InferenceRequest,
+    ) -> Result<(), WorkingMemoryError> {
+        let contains_request = |requests: &[InferenceRequest], candidate: &InferenceRequest| {
+            requests
+                .iter()
+                .any(|r| r.validate_same_request(candidate).is_ok())
+        };
+        if source
+            .requests
+            .iter()
+            .any(|r| !contains_request(&self.requests, r))
+            || self.requests.iter().any(|r| {
+                !contains_request(&source.requests, r) && r.validate_same_request(request).is_err()
+            })
+            || self.unquoted.len() != source.unquoted.len()
+            || self.unquoted.iter().any(|lease| {
+                !source
+                    .unquoted
+                    .iter()
+                    .any(|prior| Arc::ptr_eq(lease.inner(), prior.inner()))
+            })
+            || self.admission.as_ref().is_some_and(|admission| {
+                admission.request.validate_same_request(request).is_err()
+                    && source.admission.as_ref().is_none_or(|prior| {
+                        admission
+                            .request
+                            .validate_same_request(&prior.request)
+                            .is_err()
+                    })
+            })
+        {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    fn clone_source_bytes(&self, requests: usize, revision: bool) -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let parts = [
+            eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<InferenceRequest>(
+                requests,
+            )?,
+            eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<WorkingMemoryUnquotedLease>(
+                self.unquoted.len(),
+            )?,
+            if revision {
+                InferenceStateRevision::metadata_control_bytes()?
+            } else {
+                0
+            },
+            size_of::<(
+                Self,
+                &Self,
+                eredu_nn::workspace::HostMetadataFunding,
+                Option<InferenceStateRevision>,
+            )>(),
+            size_of::<Result<Self, eredu_core::BackendFailure>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
     /// Copies exact existing charge handles under one paid metadata source.
     /// Restoring or cloning this value grants no submission or budget refund.
-    /// The caller retains funding after the returned directories.
-    pub fn clone_with_host_source(&self,funding:&eredu_core::HostMetadataFunding)
-        ->Result<Self,eredu_core::BackendFailure> {
+    /// The returned owner retains funding after its directories and revision.
+    pub fn clone_with_host_source(
+        &self,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, eredu_core::BackendFailure> {
         use eredu_nn::workspace::HostMetadataFunding;
-        let funding=funding.clone();
+        let funding = funding.clone();
         // Actual dynamic directories and revision producer reserve themselves.
-        let fixed=std::mem::size_of::<(Self,&Self,HostMetadataFunding,Option<InferenceStateRevision>)>()
-            .checked_add(std::mem::size_of::<Result<Self,eredu_core::BackendFailure>>())
-            .and_then(|n|n.checked_add(std::mem::size_of::<[usize;5]>()))
-            .ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
+        let fixed = std::mem::size_of::<(
+            Self,
+            &Self,
+            HostMetadataFunding,
+            Option<InferenceStateRevision>,
+        )>()
+        .checked_add(std::mem::size_of::<Result<Self, eredu_core::BackendFailure>>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<[usize; 5]>()))
+        .ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
         funding.reserve_metadata(fixed)?;
-        self.initialize_metadata_revision(&funding).map_err(eredu_core::BackendFailure::from_error)?;
-        let mut requests=funding.metadata_vec(self.requests.len()).map_err(eredu_core::BackendFailure::from_error)?;
+        self.initialize_metadata_revision(&funding)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let mut requests = funding
+            .metadata_vec(self.requests.len())
+            .map_err(eredu_core::BackendFailure::from_error)?;
         requests.extend(self.requests.iter().cloned());
-        let mut unquoted=funding.metadata_vec(self.unquoted.len()).map_err(eredu_core::BackendFailure::from_error)?;
+        let mut unquoted = funding
+            .metadata_vec(self.unquoted.len())
+            .map_err(eredu_core::BackendFailure::from_error)?;
         unquoted.extend(self.unquoted.iter().cloned());
-        Ok(Self{requests,unquoted,admission:self.admission.clone(),
-            revision:OnceLock::from(self.revision.get().expect("funded initialized revision").clone())})
+        Ok(Self {
+            requests,
+            unquoted,
+            admission: self.admission.clone(),
+            metadata_funding: Some(funding.clone()),
+            revision: OnceLock::from(
+                self.revision
+                    .get()
+                    .expect("funded initialized revision")
+                    .clone(),
+            ),
+        })
     }
 
     /// Initializes only the missing identity using its exact accounted producer.
@@ -306,6 +408,7 @@ impl InferenceRetention {
             admission: None,
             unquoted: Vec::new(),
             revision: OnceLock::new(),
+            metadata_funding: None,
         }
     }
 
@@ -355,13 +458,11 @@ impl InferenceRetention {
     }
 
     /// Retains an exact reserved request once, regardless of cloned handles.
-    /// Explicitly unbudgeted execution adds no accounting metadata.
     pub fn retain(&mut self, request: &InferenceRequest) {
-        if request.memory_reservation().is_some()
-            && !self
-                .requests
-                .iter()
-                .any(|retained| retained.validate_same_request(request).is_ok())
+        if !self
+            .requests
+            .iter()
+            .any(|retained| retained.validate_same_request(request).is_ok())
         {
             self.requests.push(request.clone());
         }
@@ -378,7 +479,7 @@ impl InferenceRetention {
         if !self
             .unquoted
             .iter()
-            .any(|retained| std::sync::Arc::ptr_eq(&retained.0, &lease.0))
+            .any(|retained| std::sync::Arc::ptr_eq(retained.inner(), lease.inner()))
         {
             self.unquoted.push(lease.clone());
         }
@@ -401,9 +502,6 @@ impl InferenceRetention {
 
     /// Begins a reserved request once, preserving advancement on later chunks.
     pub fn admit(&mut self, request: &InferenceRequest) {
-        if request.memory_reservation().is_none() {
-            return;
-        }
         self.retain(request);
         if self
             .admission

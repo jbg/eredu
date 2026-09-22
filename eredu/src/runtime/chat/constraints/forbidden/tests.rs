@@ -1,7 +1,8 @@
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use eredu_core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
 use eredu_nn::workspace::HostMetadataAccount;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
@@ -58,10 +59,10 @@ fn funding() -> (
 struct Fixture {
     plan: super::super::fixtures::Plan,
     packed: Vec<u8>,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
 }
 impl Fixture {
-    fn new(pool: WorkingMemoryPool) -> Self {
+    fn new(pool: MemoryLedger) -> Self {
         use super::super::{fixtures, frozen_tests, ParallelToolCallPolicy, ToolChoice};
         let compiler = fixtures::Compiler::byte_tokens(&[255, 254]);
         let plan = compiler
@@ -126,7 +127,7 @@ impl Fixture {
 
 #[test]
 fn forbidden_original_source_preserves_filter_bytes_atomic_history_and_escaped_custody() {
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let fixture = Fixture::new(pool.clone());
     let (funding, _, _, retired) = funding();
     let mut controller = fixture.controller(4, &funding).unwrap();
@@ -167,15 +168,15 @@ fn forbidden_original_source_preserves_filter_bytes_atomic_history_and_escaped_c
     ));
     drop((controller, funding));
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn forbidden_startup_refusal_preserves_cause_and_source_budget() {
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let fixture = Fixture::new(pool.clone());
     let (funding, used, limit, retired) = funding();
     let before = used.load(Ordering::SeqCst);
@@ -186,7 +187,7 @@ fn forbidden_startup_refusal_preserves_cause_and_source_budget() {
         Cause::Funding(HostMetadataFundingError::Capacity { .. })
     ));
     assert_eq!(used.load(Ordering::SeqCst), before);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     drop(funding);
     assert!(!retired.load(Ordering::SeqCst));
     assert!(std::error::Error::source(&failure).is_some());
@@ -199,7 +200,7 @@ fn forbidden_startup_refusal_preserves_cause_and_source_budget() {
 
 #[test]
 fn forbidden_copy_uses_exact_inputs_independent_history_and_shared_forcing() {
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let fixture = Fixture::new(pool.clone());
     let (funding, _, _, retired) = funding();
     let mut prepared = fixture.controller(4, &funding).unwrap();
@@ -290,7 +291,7 @@ fn forbidden_copy_uses_exact_inputs_independent_history_and_shared_forcing() {
     assert!(!retired.load(Ordering::SeqCst));
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -308,8 +309,8 @@ fn forbidden_shared_sampler_preserves_forcing_provisional_commit_and_choice_reti
         SpeculativeSampler::<WorkspaceSamplingBackend>::prepared_controller(source).unwrap()
     }
     let (funding, _, _, retired) = funding();
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let foreign_pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let foreign_pool = crate::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let fixture = Fixture::new(pool.clone());
     let mut controller = fixture.controller(2, &funding).unwrap();
     controller.commit_token(0).unwrap();
@@ -381,8 +382,8 @@ fn forbidden_shared_sampler_preserves_forcing_provisional_commit_and_choice_reti
     assert!(plan(&forced).matches_choice(&escaped));
     drop((source, forced, committed, host, funding));
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

@@ -46,7 +46,7 @@ TEST_CASE("CPU empty reshape and squeeze use exact alias sources and ordinary co
     struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
     unsigned retired = 0;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-        [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+        [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
     {
       Role role; REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);
       Observer observer; Bank bank;
@@ -77,7 +77,7 @@ TEST_CASE("CPU empty structural aliases retain the original nonempty physical ba
   struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
   unsigned retired = 0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-      [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   std::optional<array> source, escaped;
   uint64_t identity = 0, capacity = 0;
   {

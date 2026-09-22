@@ -2,7 +2,7 @@
 
 use super::{IncrementalInferenceQuote, RegisteredStoragePin};
 use crate::working_memory::{
-    Usage, WorkingMemoryError, WorkingMemoryPool, WorkingMemoryStorage,
+    MemoryLedger, Usage, WorkingMemoryError, WorkingMemoryStorage,
     saved_source::SavedSourceValidation,
 };
 use std::sync::Arc;
@@ -18,7 +18,7 @@ pub(super) struct RegisteredInferenceSources {
 impl RegisteredInferenceSources {
     // Moves only the quote's already retained immutable accounting bundle. No source
     // can be appended here; there is no new allocation, identity or credit.
-    pub(super) fn into_witness(self, pool: WorkingMemoryPool) -> RegisteredInferenceSourceWitness {
+    pub(super) fn into_witness(self, pool: MemoryLedger) -> RegisteredInferenceSourceWitness {
         RegisteredInferenceSourceWitness {
             sources: Some(self),
             capture: None,
@@ -51,19 +51,26 @@ impl std::fmt::Debug for RegisteredInferenceSources {
 pub struct RegisteredInferenceSourceWitness {
     sources: Option<RegisteredInferenceSources>,
     capture: Option<crate::working_memory::storage::capture_publication::CaptureSourceOwner>,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
 }
 
 impl RegisteredInferenceSourceWitness {
     /// Fixed borrowed validator frames; no source payload or registration birth.
     pub fn capture_validation_control_bytes() -> Option<usize> {
         use std::mem::size_of;
-        [size_of::<&Self>(), size_of::<&eredu_core::capture::SharedCapturePlan>(),
-            size_of::<&WorkingMemoryPool>(),
-            size_of::<Option<&crate::working_memory::storage::capture_publication::CaptureSourceOwner>>(),
+        [
+            size_of::<&Self>(),
+            size_of::<&eredu_core::capture::SharedCapturePlan>(),
+            size_of::<&MemoryLedger>(),
+            size_of::<
+                Option<&crate::working_memory::storage::capture_publication::CaptureSourceOwner>,
+            >(),
             size_of::<std::sync::MutexGuard<'_, Usage>>(),
-            size_of::<WorkingMemoryError>(), size_of::<Result<(), WorkingMemoryError>>()]
-            .into_iter().try_fold(0usize,usize::checked_add)
+            size_of::<WorkingMemoryError>(),
+            size_of::<Result<(), WorkingMemoryError>>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
     }
     /// Authenticate this exact previously published capture C source. The
     /// payload remains independently owned; this neither imports an ordinary
@@ -71,10 +78,16 @@ impl RegisteredInferenceSourceWitness {
     pub fn validate_capture_source(
         &self,
         source: &eredu_core::capture::SharedCapturePlan,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
-        let capture = self.capture.as_ref().or_else(||
-            self.sources.as_ref().and_then(|sources| sources.inherited_capture.as_ref()))
+        let capture = self
+            .capture
+            .as_ref()
+            .or_else(|| {
+                self.sources
+                    .as_ref()
+                    .and_then(|sources| sources.inherited_capture.as_ref())
+            })
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if !capture.same_source(source.storage_identity()) {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -87,8 +100,8 @@ impl RegisteredInferenceSourceWitness {
     /// quote's source validator. It allocates no storage and changes no ledger,
     /// capacity, hold or scope. Success is a point-in-time health check, not a
     /// promise that another source account cannot become quarantined later.
-    pub fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if !self.pool.same_domain(pool) {
+    pub fn validate(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if !self.pool.same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let usage = self
@@ -101,10 +114,10 @@ impl RegisteredInferenceSourceWitness {
     }
     pub(in crate::working_memory) fn validate_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
-        if !self.pool.same_domain(pool) {
+        if !self.pool.same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         if let Some(sources) = &self.sources {
@@ -117,7 +130,7 @@ impl RegisteredInferenceSourceWitness {
     }
     pub(in crate::working_memory) fn with_capture(
         previous: Option<Self>,
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         capture: crate::working_memory::storage::capture_publication::CaptureSourceOwner,
     ) -> Self {
         Self {
@@ -131,17 +144,22 @@ impl RegisteredInferenceSourceWitness {
 struct Source<K: Ord + Send + 'static>(WorkingMemoryStorage<K>);
 
 impl<K: Clone + Ord + Send + Sync + 'static> SavedSourceValidation for Source<K> {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         self.0.validate_copy_source(pool, usage)
     }
 
     fn pin(&self) -> RegisteredStoragePin {
         RegisteredStoragePin::new(self.0.clone())
     }
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        crate::working_memory::residual::RegisteredStoragePin::single_control_bytes::<K>(
+            self.0.has_source_preparation(),
+        )
+    }
 }
 
 impl SavedSourceValidation for RegisteredInferenceSources {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         for source in self
             .ordinary
             .iter()
@@ -159,6 +177,9 @@ impl SavedSourceValidation for RegisteredInferenceSources {
     fn pin(&self) -> RegisteredStoragePin {
         RegisteredStoragePin::Sources(self.clone())
     }
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        Ok(0)
+    }
 }
 
 impl IncrementalInferenceQuote {
@@ -175,6 +196,7 @@ impl IncrementalInferenceQuote {
             state,
             geometry: _,
             incremental_bytes: _,
+            incremental_requirements: _,
             equation_incremental_bytes: _,
             pool,
             pin,
@@ -195,18 +217,21 @@ impl IncrementalInferenceQuote {
         witness: &RegisteredInferenceSourceWitness,
         source: &eredu_core::capture::SharedCapturePlan,
     ) -> Result<Self, WorkingMemoryError> {
-        if self.sources.is_some() || !self.pool.same_domain(&witness.pool) {
+        if self.sources.is_some() || !self.pool.same_ledger(&witness.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let capture = witness
             .capture
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        // A changed declaration is accepted only through the closed compiler's
-        // exact retained parent. This transfers the parent's existing custody;
-        // the new source still needs its own separately funded publication.
-        let inherited = source.limit_revision_source().unwrap_or(source);
-        if !capture.same_source(inherited.storage_identity()) {
+        // A saved child already carries that child's published source. Creating
+        // a new revision may instead borrow its exact compiler-retained parent;
+        // its independently funded publication still follows this source check.
+        let exact_source = capture.same_source(source.storage_identity());
+        let retained_parent = source
+            .limit_revision_source()
+            .is_some_and(|parent| capture.same_source(parent.storage_identity()));
+        if !exact_source && !retained_parent {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         witness.validate(&self.pool)?;

@@ -3,14 +3,14 @@
 use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::{
-    DraftingPlan, ExternalDraftArtifact, SpeculativeCapability, SpeculativeGenerationBackend,
-    TokenizerCompatibilityProof, generation::resolve_generation_config,
+    generation::resolve_generation_config, DraftingPlan, ExternalDraftArtifact,
+    SpeculativeCapability, SpeculativeGenerationBackend, TokenizerCompatibilityProof,
 };
 use eredu_text::{
     gguf::GgufTokenizer,
     tokenizer::{
-        ChatTemplateIdentity, Tokenizer as ChatTokenizer,
-        chat_template_kwargs as inspect_chat_template_kwargs,
+        chat_template_kwargs as inspect_chat_template_kwargs, ChatTemplateIdentity,
+        Tokenizer as ChatTokenizer,
     },
 };
 
@@ -73,9 +73,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             .max_new_tokens
             .and_then(NonZeroUsize::new)
             .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
-        if settings.inference.managed_memory_capacity_bytes.is_some()
-            && resolved.max_new_tokens.is_none()
-        {
+        if resolved.max_new_tokens.is_none() {
             resolved.max_new_tokens = Some(max_tokens.get());
         }
         let config = eredu_core::TextGenerationConfig::new(resolved)
@@ -133,8 +131,8 @@ impl<B> LoadedModel<B>
 where
     B: eredu_core::TextGenerationBackend + eredu_core::ModelLoadingBackend,
     B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
+        ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
 {
     /// Realizes a complete portable execution plan through the selected factory.
     ///
@@ -151,9 +149,9 @@ where
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
-                Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-            >,
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
     {
         Self::load_execution_plan_with_text_options(
             factory,
@@ -175,13 +173,14 @@ where
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
-                Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-            >,
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
     {
         let artifact = artifact.as_ref();
         let inspection = factory.inspect_loading_artifact(
-            artifact, &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+            artifact,
+            &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
         )?;
         Self::load_inspected_execution_plan_with_text_options(
             factory,
@@ -203,9 +202,9 @@ where
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
-                Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-            >,
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
     {
         Self::load_inspected_execution_plan_with_text_options(
             factory,
@@ -226,9 +225,9 @@ where
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
-                Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-            >,
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
     {
         Self::load_inspected_execution_plan_with_cache_policy(
             factory,
@@ -250,9 +249,9 @@ where
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
-                Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-            >,
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
     {
         let (tokenizer, config) =
             loaded_text_artifact_with_cache_policy(&inspection, text_options, policy)
@@ -407,7 +406,9 @@ where
         policy: eredu_text::tokenizer::ModelCachePolicy,
     ) -> Result<Self, LoadedModelLoadError> {
         let artifact = artifact.as_ref();
-        let inspection = backend.inspect_model_artifact(artifact).map_err(map_model_load_error)?;
+        let inspection = backend
+            .inspect_model_artifact(artifact)
+            .map_err(map_model_load_error)?;
         let (tokenizer, config) =
             loaded_text_artifact_with_cache_policy(&inspection, text_options, policy)?;
         Self::from_inspected(backend, inspection, options, tokenizer, config)

@@ -4,8 +4,8 @@ use eredu_core::{
 };
 use eredu_runtime::capture::SpeculativeCaptureScope;
 
-/// Complete internal hook coverage of one architecture-selected prediction
-/// executor. Only the sealed materialized extension contract constructs it.
+/// Invocation scope projection of an architecture-selected model traversal.
+/// Native source, completion and admission remain separate prerequisites.
 #[derive(Debug, Clone)]
 pub struct SpeculativeActivationExecution {
     pub(crate) depth: usize,
@@ -13,6 +13,29 @@ pub struct SpeculativeActivationExecution {
 }
 
 impl SpeculativeActivationExecution {
+    pub(crate) fn ordinary_target() -> Self {
+        Self {
+            depth: 0,
+            strategy: eredu_runtime::SpeculativeStrategyClass::External,
+        }
+    }
+
+    pub(crate) fn is_autoregressive(&self) -> bool {
+        self.strategy == eredu_runtime::SpeculativeStrategyClass::External
+    }
+
+    /// Target hook scopes for the shared ordinary autoregressive traversal.
+    /// The retained schedule proves the independent strategy selection; this
+    /// declaration grants no role or native execution authority.
+    pub fn autoregressive(
+        schedule: &eredu_runtime::speculative::autoregressive::AutoregressiveSchedulePlan<'_>,
+    ) -> Self {
+        Self {
+            depth: 0,
+            strategy: schedule.selected().requirements().strategy().class(),
+        }
+    }
+
     pub(crate) fn selected(
         complete_hooks: bool,
         depth: usize,

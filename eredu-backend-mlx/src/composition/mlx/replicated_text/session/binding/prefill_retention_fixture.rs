@@ -3,6 +3,8 @@
 use super::*;
 use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
 use crate::backend::runtime::residency::storage::RetainedStorage;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_architectures::prepared_execution::{
     construct_prepared_execution, PreparedExecutableAssembler, PreparedExecutableParts,
     PreparedExecutionRoutes, PreparedInferenceBlueprint, ReplicatedRoute,
@@ -52,7 +54,7 @@ trait TypedSession {
         &self,
         source: &SharedCapturePlan,
         quote: eredu_runtime::working_memory::IncrementalInferenceQuote,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         capacity: Option<u64>,
     ) -> Result<super::super::mechanisms::OpeningPinSetup, Error>;
     fn opening_paths(&self) -> &eredu_runtime::SharedLayeredObservationPaths;
@@ -61,7 +63,12 @@ trait TypedSession {
         expected: Option<&eredu_runtime::SharedLayeredObservationPaths>,
     ) -> Result<(usize, usize, u64), Error>;
     fn identity(&self) -> &InferenceExecutionIdentity;
-    fn inventory(&self) -> Result<RetainedStorage, Error>;
+    fn collect_inventory(&self, storage: &mut RetainedStorage) -> Result<(), Error>;
+    fn inventory(&self) -> Result<RetainedStorage, Error> {
+        let mut storage = RetainedStorage::default();
+        self.collect_inventory(&mut storage)?;
+        Ok(storage)
+    }
     fn settle_loaded_roots(&self) -> Result<(), Error>;
     fn state_estimate(
         &self,
@@ -147,6 +154,9 @@ where
         context: &WorkspaceContext,
     ) -> Result<InferenceWorkspaceReport, Error> {
         let geometry = bound.geometry();
+        let _parameters = self
+            .install_workspace_parameter_representations(context)
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let state = self.project_resident_workspace_with_storage(
             NonZeroU32::new(geometry.batch_size.try_into().unwrap()).unwrap(),
             context,
@@ -194,17 +204,20 @@ where
     }
     fn rebind_after_parameter_access(&mut self) -> Result<(), Error> {
         let source = self.session.shared_observation_paths().unwrap().clone();
-        self.session.publish_parameter_replacements(&Default::default(), false)
-            .map_err(|error| Error::Other(Box::new(error)))?;
+        self.session.invalidate_parameter_observations();
         assert!(matches!(
             self.session.validate_prepared_observation_paths(&source),
-            Err(eredu_runtime::ReplicatedTextSessionError::PreparedObservation(
-                eredu_runtime::PreparedSessionObservationError::BindingMismatch
-            ))
+            Err(
+                eredu_runtime::ReplicatedTextSessionError::PreparedObservation(
+                    eredu_runtime::PreparedSessionObservationError::BindingMismatch
+                )
+            )
         ));
-        self.session.rebind_observation_paths()
+        self.session
+            .rebind_observation_paths()
             .map_err(|error| Error::Other(Box::new(error)))?;
-        self.session.validate_prepared_observation_paths(&source)
+        self.session
+            .validate_prepared_observation_paths(&source)
             .map_err(|error| Error::Other(Box::new(error)))
     }
     fn opening_paths(&self) -> &eredu_runtime::SharedLayeredObservationPaths {
@@ -220,7 +233,7 @@ where
         &self,
         source: &SharedCapturePlan,
         quote: eredu_runtime::working_memory::IncrementalInferenceQuote,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         capacity: Option<u64>,
     ) -> Result<super::super::mechanisms::OpeningPinSetup, Error> {
         MlxReplicatedTextMechanisms::prepare_opening_pins_for_test(
@@ -235,10 +248,9 @@ where
     fn identity(&self) -> &InferenceExecutionIdentity {
         self.session.inference_execution_identity()
     }
-    fn inventory(&self) -> Result<RetainedStorage, Error> {
-        let mut storage = self.retained_target_storage()?;
-        storage.merge(self.retained_idle_auxiliary_storage()?)?;
-        Ok(storage)
+    fn collect_inventory(&self, storage: &mut RetainedStorage) -> Result<(), Error> {
+        self.collect_retained_target_storage(storage)?;
+        self.collect_retained_idle_auxiliary_storage(storage)
     }
     fn settle_loaded_roots(&self) -> Result<(), Error> {
         // Same actual retained roots used for loading finalization. No editable
@@ -275,6 +287,9 @@ where
         geometry: InferenceGeometry,
         context: &WorkspaceContext,
     ) -> Result<InferenceWorkspaceReport, Error> {
+        let _parameters = self
+            .install_workspace_parameter_representations(context)
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let projected = self.project_resident_workspace_with_storage(
             NonZeroU32::new(
                 u32::try_from(geometry.batch_size).map_err(|e| Error::Other(Box::new(e)))?,
@@ -282,9 +297,24 @@ where
             .ok_or_else(|| Error::Other(Box::new(WorkingMemoryError::IdentityMismatch)))?,
             context,
         )?;
-        blueprint
-            .quote_replicated_resident_text(geometry, &projected.state, context)
-            .map_err(|error| Error::Other(Box::new(error)))
+        let quote = match blueprint.selected().text_realization().residency() {
+            eredu_runtime::LayerWeightResidency::FullyResident => {
+                blueprint.quote_replicated_resident_text(geometry, &projected.state, context)
+            }
+            eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+            | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                let facts = MlxMetalWorkspaceMechanisms::current_host()?;
+                let parameters = self.layerwise_workspace(facts.allocation())?;
+                blueprint.quote_replicated_layerwise_text(
+                    geometry,
+                    &projected.state,
+                    context,
+                    &crate::composition::mlx::model::NativeLayerwiseParameters(&parameters),
+                )
+            }
+            _ => return Err(Error::Other(Box::new(WorkingMemoryError::UnknownBound))),
+        };
+        quote.map_err(|error| Error::Other(Box::new(error)))
     }
     fn validate_frontier(&self, expected: u64) -> Result<(), Error> {
         self.validate_text_frontier(expected)
@@ -500,16 +530,21 @@ impl PrefillRetentionFixture {
     }
     pub(crate) fn opening_rows_quote(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         geometry: InferenceGeometry,
         source: &SharedCapturePlan,
         tokens: &Arc<[i32]>,
+        publication_controls: impl FnOnce(&InferenceWorkspaceReport) -> Result<u64, Error>,
     ) -> Result<eredu_runtime::working_memory::IncrementalInferenceQuote, Error> {
         use eredu_runtime::working_memory::{RegisteredWorkspaceStorage, ResidualInferenceQuote};
         let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host()?);
         // Bind before any projection/equation can start the trace.
-        let storage = RegisteredWorkspaceStorage::<u32>::bind(pool, &context, [])
-            .map_err(|e| Error::Other(Box::new(e)))?;
+        let storage = RegisteredWorkspaceStorage::<u32>::bind(
+            pool,
+            &context,
+            std::iter::empty::<eredu_runtime::working_memory::RegisteredWorkspaceStorageRow<u32>>(),
+        )
+        .map_err(|e| Error::Other(Box::new(e)))?;
         let selected = self.opening_selection(source)?;
         let bound = selected
             .bind_geometry(geometry)
@@ -524,7 +559,12 @@ impl PrefillRetentionFixture {
         let zero = || {
             WorkspaceBound::bounded(0, "actual selected equation and native capture trace includes work; fixture has no sampling")
         };
-        let outside = ExecutionWorkspaceEstimate {
+        let publication = self
+            .opening_rows_proposal(bound)?
+            .completion_publication_bytes()?;
+        let publication_controls = publication_controls(&equations)?;
+        let mut outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: zero(),
             attention: zero(),
@@ -534,10 +574,15 @@ impl PrefillRetentionFixture {
             retained: WorkspaceBound::bounded(
                 CaptureRunHostPlan::prepare(source)
                     .map_err(|e| Error::Other(Box::new(e)))?
-                    .initialization_peak_bytes(),
-                "actual original scheduled H",
+                    .initialization_peak_bytes()
+                    .checked_add(publication)
+                    .and_then(|bytes| bytes.checked_add(publication_controls))
+                    .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?,
+                "actual scheduled capture, ordinary collectors and final publication constructors",
             ),
-        };
+        });
+        outside.physical_domains.as_mut().unwrap().retained =
+            crate::memory_fixture::host_requirements(outside.retained.bytes().unwrap());
         let outside = quote_text_prompt_workspace(
             geometry,
             Some(std::mem::size_of_val(tokens.as_ref()) as u64),
@@ -612,6 +657,9 @@ impl PrefillRetentionFixture {
     pub(crate) fn inventory(&self) -> Result<RetainedStorage, Error> {
         self.session.inventory()
     }
+    pub(crate) fn collect_inventory(&self, storage: &mut RetainedStorage) -> Result<(), Error> {
+        self.session.collect_inventory(storage)
+    }
     pub(crate) fn validate_frontier(&self, expected: u64) -> Result<(), Error> {
         self.session.validate_frontier(expected)
     }
@@ -624,7 +672,7 @@ impl PrefillRetentionFixture {
         geometry: InferenceGeometry,
         capture: &SharedCapturePlan,
         tokens: &Arc<[i32]>,
-    ) -> Result<RuntimeStateEstimate, Error> {
+    ) -> Result<(RuntimeStateEstimate, usize), Error> {
         geometry
             .validate()
             .map_err(|error| Error::Other(Box::new(error)))?;
@@ -658,7 +706,8 @@ impl PrefillRetentionFixture {
         let zero = || {
             WorkspaceBound::bounded(0, "covered by actual resident equation trace; no materialization, sampling or native capture transformation in this fixture")
         };
-        let outside = ExecutionWorkspaceEstimate {
+        let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: zero(),
             attention: zero(),
@@ -669,7 +718,7 @@ impl PrefillRetentionFixture {
                 h,
                 "actual original-bank cumulative capture host plan",
             ),
-        };
+        });
         let prompt = quote_text_prompt_workspace(
             geometry,
             Some(std::mem::size_of_val(tokens.as_ref()) as u64),
@@ -682,7 +731,7 @@ impl PrefillRetentionFixture {
         let state = equation
             .compose(state, outside)
             .map_err(|error| Error::Other(Box::new(error)))?;
-        Ok(state)
+        Ok((state, equation.maximum_closing_storage_allocations()))
     }
     pub(crate) fn capabilities(&self) -> &eredu_core::ModelCapabilities {
         self.session.capabilities()
@@ -701,19 +750,19 @@ impl PrefillRetentionFixture {
 #[test]
 fn actual_typed_native_session_lends_its_own_fixed_opening_pair() {
     use crate::backend::managed_memory::NativeMemoryOwner;
-    use eredu_runtime::working_memory::WorkingMemoryPool;
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    use eredu_runtime::working_memory::MemoryLedger;
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading_owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let fixture = PrefillRetentionFixture::load(artifact.path(), &stream).unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let (retained, slots, controls) = fixture.session.inspect_fixed_opening_pair(None).unwrap();
     assert!(retained > 0);
     assert!(slots >= retained);
     assert!(controls > 0);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         before,
         "cold pairing creates no grant or hold"
     );
@@ -723,12 +772,12 @@ fn actual_typed_native_session_lends_its_own_fixed_opening_pair() {
         .session
         .opening_paths()
         .same_storage(foreign.session.opening_paths()));
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     assert!(fixture
         .session
         .inspect_fixed_opening_pair(Some(foreign.session.opening_paths()))
         .is_err());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     fixture.validate_frontier(0).unwrap();
     drop(foreign);
     drop(fixture);

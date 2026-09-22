@@ -1,0 +1,209 @@
+diff --git a/mlx/backend/no_gpu/fence.cpp b/mlx/backend/no_gpu/fence.cpp
+--- a/mlx/backend/no_gpu/fence.cpp
++++ b/mlx/backend/no_gpu/fence.cpp
+@@ -6,6 +6,7 @@
+ #include "mlx/fence.h"
+ #include "mlx/scheduler.h"
+ #include "mlx/submission.h"
++#include "mlx/ordinary_control.h"
+ 
+ namespace mlx::core {
+ 
+@@ -15,6 +16,47 @@
+   std::mutex mtx;
+   std::condition_variable cv;
+ };
++
++namespace {
++struct CpuFenceWait {
++  uint32_t count;
++  std::shared_ptr<void> fence;
++  void operator()() {
++    auto& f = *static_cast<FenceImpl*>(fence.get());
++    std::unique_lock<std::mutex> lock(f.mtx);
++    if (f.value >= count) return;
++    f.cv.wait(lock, [&f, count = count] { return f.value >= count; });
++  }
++};
++struct CpuFenceUpdate {
++  uint32_t count;
++  std::shared_ptr<void> fence;
++  void operator()() {
++    auto& f = *static_cast<FenceImpl*>(fence.get());
++    std::unique_lock<std::mutex> lock(f.mtx);
++    f.value = count;
++    f.cv.notify_all();
++  }
++};
++}
++
++namespace submission {
++bool ordinary_cpu_fence_control_layout(size_t streams, size_t waits,
++    size_t updates, OrdinaryControlPopulation& out) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  using Shared = std::__shared_ptr_emplace<FenceImpl, GraphAllocator<FenceImpl>>;
++  using Wait = scheduler::TaskNode<CpuFenceWait>;
++  using Update = scheduler::TaskNode<CpuFenceUpdate>;
++  OrdinaryControlPopulation value;
++  if (!append_ordinary_control(value, sizeof(Shared), alignof(Shared), streams) ||
++      !append_ordinary_control(value, sizeof(Wait), alignof(Wait), waits) ||
++      !append_ordinary_control(value, sizeof(Update), alignof(Update), updates)) return false;
++  out = value; return true;
++#else
++  return false;
++#endif
++}
++}
+ 
+ Fence::Fence(Stream stream) : Fence(stream, nullptr) {}
+ Fence::Fence(Stream stream, const allocator::OriginalBufferBinding& original)
+@@ -38,22 +80,16 @@
+     fence_ = std::allocate_shared<FenceImpl>(
+         submission::GraphAllocator<FenceImpl>(original ? original->graph() : binding.graph));
+   } else {
+-    auto dtor = [](void* ptr) { delete static_cast<FenceImpl*>(ptr); };
+-    fence_ = std::shared_ptr<void>(new FenceImpl{}, dtor);
++    // This allocator captures the actual ordinary physical payer. Refusal is
++    // propagated before publishing a fence; its owner survives queued tasks.
++    fence_ = std::allocate_shared<FenceImpl>(submission::GraphAllocator<FenceImpl>{});
+   }
+ }
+ 
+ void Fence::wait(Stream stream, const array&) {
+   auto& f = *static_cast<FenceImpl*>(fence_.get());
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [count = f.count, fence_ = fence_]() mutable {
+-      auto& f = *static_cast<FenceImpl*>(fence_.get());
+-      std::unique_lock<std::mutex> lk(f.mtx);
+-      if (f.value >= count) {
+-        return;
+-      }
+-      f.cv.wait(lk, [&f, count] { return f.value >= count; });
+-    });
++    scheduler::enqueue(stream, CpuFenceWait{f.count, fence_});
+   } else {
+     throw std::runtime_error("[Fence::wait] Invalid stream.");
+   }
+@@ -63,12 +99,7 @@
+   auto& f = *static_cast<FenceImpl*>(fence_.get());
+   f.count++;
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [count = f.count, fence_ = fence_]() mutable {
+-      auto& f = *static_cast<FenceImpl*>(fence_.get());
+-      std::unique_lock<std::mutex> lk(f.mtx);
+-      f.value = count;
+-      f.cv.notify_all();
+-    });
++    scheduler::enqueue(stream, CpuFenceUpdate{f.count, fence_});
+   } else {
+     throw std::runtime_error("[Fence::update] Invalid stream.");
+   }
+diff --git a/mlx/backend/metal/fence.cpp b/mlx/backend/metal/fence.cpp
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -3,14 +3,24 @@
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/scheduler.h"
+ #include "mlx/submission.h"
++#include "mlx/ordinary_control.h"
+ #include <optional>
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core {
+ 
+ struct FenceImpl {
+-  FenceImpl(Stream stream) : FenceImpl(stream, metal::device(stream.device), nullptr) {}
++  FenceImpl(Stream stream) {
++    // Ordinary CPU producers use this Fence's existing Event worker. The
++    // choice depends on the stream, never on limits or physical funding.
++    if (stream.device == Device::cpu) { event.emplace(stream); return; }
++    initialize(stream, metal::device(stream.device), nullptr);
++  }
+   FenceImpl(Stream stream, metal::Device& device,
++      const allocator::OriginalBufferBinding* original) {
++    initialize(stream, device, original);
++  }
++  void initialize(Stream stream, metal::Device& device,
+       const allocator::OriginalBufferBinding* original) {
+     auto d = device.mtl_device();
+     if (!d->supportsFamily(MTL::GPUFamilyMetal3)) {
+@@ -104,6 +114,28 @@
+ #endif
+ }
+ 
++namespace submission {
++bool ordinary_cpu_fence_control_layout(size_t streams, size_t waits,
++    size_t updates, OrdinaryControlPopulation& out) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  using Shared = std::__shared_ptr_emplace<FenceImpl, GraphAllocator<FenceImpl>>;
++  EventControlLayout event;
++  EventDispatchControlLayout dispatch;
++  if (!event_control_layout(event) || !event_dispatch_control_layout(dispatch)) return false;
++  OrdinaryControlPopulation value;
++  if (!append_ordinary_control(value, sizeof(Shared), alignof(Shared), streams) ||
++      !append_ordinary_control(value, event.shared_bytes, event.shared_alignment, streams) ||
++      !append_ordinary_control(value, dispatch.cpu_wait_bytes, dispatch.cpu_wait_alignment, waits) ||
++      !append_ordinary_control(value, dispatch.cpu_signal_bytes, dispatch.cpu_signal_alignment, updates) ||
++      (event.platform_events && streams > SIZE_MAX / event.platform_events)) return false;
++  value.platform_events = streams * event.platform_events;
++  out = value; return true;
++#else
++  return false;
++#endif
++}
++}
++
+ Fence::Fence(Stream stream) : Fence(stream, nullptr) {}
+ Fence::Fence(Stream stream, const allocator::OriginalBufferBinding& original)
+     : Fence(stream, &original) {}
+@@ -124,6 +156,8 @@
+     fence_ = std::allocate_shared<FenceImpl>(
+         submission::GraphAllocator<FenceImpl>(original ? original->graph() : binding.graph),
+         stream, *device, original);
++  } else if (stream.device == Device::cpu) {
++    fence_ = std::allocate_shared<FenceImpl>(submission::GraphAllocator<FenceImpl>{}, stream);
+   } else {
+     auto dtor = [](void* ptr) { delete static_cast<FenceImpl*>(ptr); };
+     fence_ = std::shared_ptr<void>(new FenceImpl(stream), dtor);
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -2192,7 +2192,7 @@
+   return false;
+ #else
+   if (!p.roots || !p.arrays || !p.tape || p.tape > p.arrays ||
+-      p.streams != 1 || p.outputs < p.tape ||
++      !p.streams || p.streams > p.tape || (metal && p.streams != 1) || p.outputs < p.tape ||
+       p.roots > p.edges || p.arrays > size_t(INT_MAX) ||
+       p.edges > size_t(INT_MAX) || p.tape > size_t(INT_MAX)) return false;
+   RecordFrontierStorageLayout base;
+@@ -2246,6 +2246,15 @@
+       !append_ordinary_control(value, dispatch.cpu_wait_bytes, dispatch.cpu_wait_alignment, waits) ||
+       (event.platform_events && events > SIZE_MAX / event.platform_events)) return false;
+   value.platform_events = events * event.platform_events;
++  if (p.streams > 1) {
++    // A producer stream needs at most one Fence; every crossing input waits
++    // and every crossing output updates it. Siblings are included in outputs.
++    OrdinaryControlPopulation fences;
++    if (!ordinary_cpu_fence_control_layout(p.streams, p.edges, p.outputs, fences) ||
++        !ordinary_add(value.observed_host_controls, fences.observed_host_controls, value.observed_host_controls) ||
++        !ordinary_add(value.control_allocations, fences.control_allocations, value.control_allocations) ||
++        !ordinary_add(value.platform_events, fences.platform_events, value.platform_events)) return false;
++  }
+   out = value; return true;
+ #endif
+ }
+diff --git a/mlx/ordinary_control.h b/mlx/ordinary_control.h
+--- a/mlx/ordinary_control.h
++++ b/mlx/ordinary_control.h
+@@ -32,6 +32,10 @@
+ };
+ // Core CPU Eval only. Caller C shells, backend workers, payload backing and
+ // platform-private event overhead remain separate source contributions.
++// The selected CPU Fence worker: one owner per stream, one wait per crossing
++// edge and one update per crossing output. No GPU or mixed-device claim.
++MLX_API bool ordinary_cpu_fence_control_layout(size_t streams, size_t waits,
++    size_t updates, OrdinaryControlPopulation&) noexcept;
+ MLX_API bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation,
+     OrdinaryControlPopulation&) noexcept;
+ // One selected Metal stream: shared ordinary Eval containers and Synchronizer

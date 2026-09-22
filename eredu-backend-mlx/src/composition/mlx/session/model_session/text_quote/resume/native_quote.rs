@@ -37,8 +37,6 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
         .original_copy_environment()
         .map_err(|cause| Error::Other(Box::new(cause)))?;
     let mechanism = session
-        .payload
-        .model
         .native_storage_mechanism()?
         .ok_or_else(|| unknown())?;
     if recipe.resume_copy().is_none() || (layerwise.is_some() && !recipe.has_host_copy_recipe()) {
@@ -75,7 +73,7 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
         .model
         .erased()
         .prefill_control_facts(
-            &session.payload.memory_pool,
+            &session.payload.memory_ledger,
             geometry,
             graphs,
             Some(recipe.maximum_roots()?),
@@ -84,20 +82,37 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
             metadata.funding().as_ref(),
         )?
         .ok_or_else(|| unknown())?;
-    let target=prefill.source_construction_facts();
-    let compound=recipe.prepare_addressable_source_program(target,paged_host_facts,&metadata.funding().ok_or_else(||memory(WorkingMemoryError::IdentityMismatch))?)?;
-    let prefill=if let Some(sources)=compound.or(paged_host_facts){
-        let destinations=match prefill.host_destination_facts(){
-            Some(host)=>host,
-            None=>eredu_runtime::working_memory::HostDestinationFacts::new(0,0).map_err(memory)?,
-        }.replace_source_constructions(target,sources).map_err(memory)?;
-        prefill.with_source_constructions(Some(sources)).with_host_destinations(Some(destinations))
-    }else{prefill};
+    let target = prefill.source_construction_facts();
+    let compound = recipe.prepare_addressable_source_program(
+        target,
+        paged_host_facts,
+        &metadata
+            .funding()
+            .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?,
+    )?;
+    let prefill = if let Some(sources) = compound.or(paged_host_facts) {
+        let destinations = match prefill.host_destination_facts() {
+            Some(host) => host,
+            None => {
+                eredu_runtime::working_memory::HostDestinationFacts::new(0, 0).map_err(memory)?
+            }
+        }
+        .replace_source_constructions(target, sources)
+        .map_err(|cause| Error::OriginalSourceContract {
+            stage: "saved native host-source composition",
+            cause,
+        })?;
+        prefill
+            .with_source_constructions(Some(sources))
+            .with_host_destinations(Some(destinations))
+    } else {
+        prefill
+    };
     let prefill = match recipe.initialized_input_source_facts(geometry.max_output_tokens)? {
         Some(facts) => prefill.with_output_source_constructions(facts),
         None => prefill,
     };
-    let addressable_controls=recipe.addressable_request_control_bytes()?;
+    let addressable_controls = recipe.addressable_request_control_bytes()?;
     let recipe_controls = recipe
         .control_bytes()?
         .checked_add(
@@ -108,18 +123,13 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
         .and_then(|n| n.checked_add(addressable_controls))
         .and_then(|n| n.checked_add(copy_controls))
         .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-    let eredu_core::WorkspaceBound::Bounded { bytes, assumptions } = &mut outside.retained else {
-        return Err(unknown());
-    };
-    *bytes = bytes
-        .checked_add(recipe_controls)
-        .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-    metadata
-        .append(
-            assumptions,
-            "; actual resumed native recipe, token-validation and finite pipeline producers",
-        )
-        .map_err(|cause| Error::Neural(metadata.error(cause)))?;
+    super::super::observed::add_retained_host(
+        &mut outside,
+        &session.payload.memory_ledger,
+        recipe_controls,
+        "actual resumed native recipe, token-validation and finite pipeline producers",
+        metadata,
+    )?;
     let program = mechanism
         .resume_program(
             recipe,
@@ -130,7 +140,7 @@ pub(in crate::composition::mlx::session) fn seal_saved_native_quote(
             paged_sources,
         )?
         .ok_or_else(|| unknown())?;
-    program.replace_enclosing_metadata(&mut outside, metadata)?;
+    program.replace_enclosing_metadata(&mut outside, None, &generation.sampling, metadata)?;
     let quote = match prepared_input {
         Some(prepared) => source.compose_inference_with_prepared_source_metadata(
             &generation.equations,

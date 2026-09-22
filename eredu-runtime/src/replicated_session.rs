@@ -14,6 +14,7 @@ use std::{
     path::Path,
 };
 
+use crate::cache::prompt_source::CacheContractFailure;
 use crate::working_memory::InferenceStateRetention;
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
@@ -23,12 +24,23 @@ use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCo
 use eredu_nn::{NeuralBackend, Tensor};
 
 mod control;
+mod parameter_control_identity;
+pub(crate) use parameter_control_identity::ParameterControlIdentity;
 mod execution_inspection;
+mod mechanism_binding;
 mod parallel_context;
+pub use mechanism_binding::ExecutionMechanismBindingCause;
 mod parallel_control;
-pub use parallel_control::{ParallelControlEvent, ParallelControlIdentity, ParallelControlCursor, ParallelControlClaim};
-pub use parallel_context::{PreparedParallelContextCause, PreparedParallelContextFailure};
 pub use execution_inspection::RuntimeInspectionBoundary;
+pub use parallel_context::{PreparedParallelContextCause, PreparedParallelContextFailure};
+pub use parallel_control::{
+    SessionModelControlCursor, SessionModelControlOccurrence, SessionModelControlPlan,
+    ParallelControlCallbackVisitor, ParallelControlClaim, ParallelControlCursor,
+    ParallelControlEvent, ParallelControlIdentity, SessionCacheControlCursor,
+    SessionCacheControlOperation, SessionCacheControlPlan, SessionTransactionControlCursor,
+    SessionTransactionControlError, SessionTransactionControlOccurrence,
+    SessionTransactionControlPlan,
+};
 mod media_semantic_binding;
 pub(crate) mod observation_paths;
 mod resident_reset;
@@ -41,13 +53,14 @@ mod prediction_loan;
 pub use prediction_loan::PredictionStateLoanError;
 mod prefill;
 pub use control::{
-    ControlBranchSource, ControlBranchPlacement, ControlExchangeResult,
+    ControlBranchPlacement, ControlBranchSource, ControlExchangeResult,
     PreparedControlBindingError, PreparedControlExchangeError, ReplicatedTextControlOrigin,
     ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms,
 };
 pub use prefill::{
-    MediaPrefillSpan, OrdinaryPrefillSpan, PrefillScoreLayout, PrefillSourceOutcome, PrefillSourceProgress,
-    PrefillSpanOperation, PreparedPrefillSource, SessionPrefill, SettledPrefillCompletion,
+    MediaPrefillSpan, OrdinaryPrefillSpan, PrefillScoreLayout, PrefillSourceOutcome,
+    PrefillSourceProgress, PrefillSpanOperation, PreparedPrefillSource, SessionPrefill,
+    SettledPrefillCompletion,
 };
 
 use crate::{
@@ -79,36 +92,66 @@ where
     Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
     Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
 {
+    /// Ownership of returned manifest metadata. Cloning preserves any retained
+    /// construction custody rather than requiring a deep DTO copy.
+    type PromptCacheManifest: AsRef<PromptCacheManifest> + Clone;
+
     /// Lends a prepared backend context only around the existing selected
     /// numerical forward. The outer session keeps admission, checkpoint,
     /// agreement, publication and failure recovery. Ordinary mechanisms call
     /// the same closure directly. A context owner must outlive enclosing native
     /// completion; restoring a context does not claim completion or refund.
-    fn with_execution_parallel<T,E,F>(
-        &self, context:&<B::Tensor as Tensor>::Context, run:F,
-    )->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&mut B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E>,
+    fn with_execution_parallel<T, E, F>(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+        run: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where
+        F: FnOnce(
+            Option<(
+                &mut B::ParallelContext,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
     {
-        let _=context;
+        let _ = context;
         Ok(run(None))
     }
 
     /// Reborrows the enclosing numerical invocation for its quoted output
     /// publication after forward. This does not rebind or reopen the invocation.
-    fn with_execution_parallel_publication<T,E,F>(&self,context:&<B::Tensor as Tensor>::Context,run:F)
-        ->Result<Result<T,E>,Self::Error>
-    where F:FnOnce(Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
-        let _=context;Ok(run(None))
+    fn with_execution_parallel_publication<T, E, F>(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+        run: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where
+        F: FnOnce(
+            Option<(
+                &B::ParallelContext,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
+    {
+        let _ = context;
+        Ok(run(None))
     }
 
     /// Lends a control-only request context around the existing numerical
     /// forward. This is independent of the architecture's optional neural TP
     /// context and retains no authority to alter tensor-parallel selection.
     fn with_execution_parallel_control_context<T, E, F>(
-        &self, context: &<B::Tensor as Tensor>::Context, run: F,
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+        run: F,
     ) -> Result<Result<T, E>, Self::Error>
-    where F: FnOnce(Option<(&mut Option<Box<B::ParallelContext>>,
-        &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
+    where
+        F: FnOnce(
+            Option<(
+                &mut Option<Box<B::ParallelContext>>,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
     {
         let _ = context;
         Ok(run(None))
@@ -119,9 +162,18 @@ where
     /// mechanisms pass None; prepared contexts must never fall back to ordinary
     /// communication. Native errors retain their source through BackendFailure.
     fn with_execution_parallel_control<T, E, F>(
-        &self, event: ParallelControlEvent, context: &<B::Tensor as Tensor>::Context, run: F,
+        &self,
+        event: ParallelControlEvent,
+        context: &<B::Tensor as Tensor>::Context,
+        run: F,
     ) -> Result<Result<T, E>, eredu_core::BackendFailure>
-    where F: FnOnce(Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>) -> Result<T, E>,
+    where
+        F: FnOnce(
+            Option<(
+                &B::ParallelContext,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
     {
         let _ = (event, context);
         Ok(run(None))
@@ -189,6 +241,25 @@ where
             Some(role) => self.begin_prefill_control(reservation, role),
             None => self.begin_prefill_reservation(reservation),
         }
+    }
+
+    /// Retains funded external scheduling controls without issuing a native
+    /// model allowance. Each executing span obtains its own original role.
+    /// `None` is an explicit unsupported mechanism, rejected before source work.
+    /// An exact native communication source installed for this admitted scheduler.
+    fn has_speculative_parallel_control(
+        &self,
+        _authority: &crate::working_memory::SpeculativePrefillScheduleAuthority,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    fn coordinate_speculative_prefill_entry(
+        &mut self,
+        _authority: &crate::working_memory::SpeculativePrefillScheduleAuthority,
+        _role: Option<crate::prefill::PrefillControlRole>,
+    ) -> Result<Option<Self::PrefillReservationGuard>, Self::Error> {
+        Ok(None)
     }
 
     /// Settles successful preparation/execution and closes its retention scope.
@@ -449,16 +520,23 @@ where
         Ok(fork)
     }
 
-    /// Restores native state bytes from a validated prompt-cache artifact.
+    /// Lexical funding for the existing persistence driver. This is an account
+    /// loan, not authority to replace state or execute a cache-control callback.
+    fn prompt_cache_funding(&self) -> Option<&crate::cache::PromptCachePersistenceFunding> {
+        None
+    }
+
+    /// Restores native state bytes using the actual current storage source and a validated artifact.
     fn load_prompt_cache(
         &mut self,
+        source: &Self::State,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
         selected: &SelectedStateRealization,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<(Self::State, PromptCacheManifest), Self::Error>;
+    ) -> Result<(Self::State, Self::PromptCacheManifest), Self::Error>;
 
     /// Serializes native state bytes for a neutrally validated cache identity.
     fn save_prompt_cache(
@@ -469,7 +547,7 @@ where
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<PromptCacheManifest, Self::Error>;
+    ) -> Result<Self::PromptCacheManifest, Self::Error>;
 
     /// Reports the realized mutable-state storage.
     fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error>;
@@ -581,7 +659,7 @@ where
     /// Returns the fully validated candidate manifest before publication.
     fn prepared_prompt_cache_manifest(
         transaction: &Self::PromptCacheSaveTransaction,
-    ) -> &PromptCacheManifest;
+    ) -> &Self::PromptCacheManifest;
 
     /// Makes the staged candidate visible while retaining reversible ownership.
     fn publish_prompt_cache_save(
@@ -646,28 +724,41 @@ where
             R::Error,
         >,
         context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => {
-                runtime.with_parameter_slots(location, operation, context)
+                runtime.with_parameter_slots(location, operation, context, _preparation)
             }
             ReplicatedTextRuntimeKind::Bounded(runtime) => {
-                runtime.with_parameter_slots(location, operation, context)
+                runtime.with_parameter_slots(location, operation, context, _preparation)
             }
         }
     }
 
-    fn publish_parameter_replacements(
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn invalidate_parameter_observations(&mut self) {
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => {
+                runtime.invalidate_parameter_observations()
+            }
+            ReplicatedTextRuntimeKind::Bounded(runtime) => {
+                runtime.invalidate_parameter_observations()
+            }
+        }
+    }
+
+    fn visit_parameter_publication(
         &mut self,
-        values: &BTreeMap<String, B::Tensor>,
-        active: bool,
+        publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<bool, R::Error> {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => {
-                runtime.publish_parameter_replacements(values, active)
+                runtime.visit_parameter_publication(publication)
             }
             ReplicatedTextRuntimeKind::Bounded(runtime) => {
-                runtime.publish_parameter_replacements(values, active)
+                runtime.visit_parameter_publication(publication)
             }
         }
     }
@@ -846,53 +937,95 @@ where
     /// Exchanges a caller-owned context loan with the selected runtime. A
     /// successful exchange promises the same allocation-free inverse. No new
     /// context is copied or retained by this hook.
-    fn exchange_parallel_context(_runtime:&mut Self::Runtime,_context:&mut B::ParallelContext)->bool { false }
+    fn exchange_parallel_context(
+        _runtime: &mut Self::Runtime,
+        _context: &mut B::ParallelContext,
+    ) -> bool {
+        false
+    }
 
     /// Executes the same forward under a lexical context loan and restores
     /// both values on return, failure or unwind. This creates no source grant.
-    fn with_borrowed_parallel_context<T,F>(
-        runtime:&mut Self::Runtime,context:&mut B::ParallelContext,
-        funding:&eredu_nn::workspace::HostMetadataFunding,run:F,
-    )->Result<T,PreparedParallelContextCause>
-    where F:FnOnce(&mut Self::Runtime)->T {
-        parallel_context::with_borrowed_runtime(runtime,context,funding,Self::exchange_parallel_context,run)
+    fn with_borrowed_parallel_context<T, F>(
+        runtime: &mut Self::Runtime,
+        context: &mut B::ParallelContext,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        run: F,
+    ) -> Result<T, PreparedParallelContextCause>
+    where
+        F: FnOnce(&mut Self::Runtime) -> T,
+    {
+        parallel_context::with_borrowed_runtime(
+            runtime,
+            context,
+            funding,
+            Self::exchange_parallel_context,
+            run,
+        )
     }
 
     /// Exchanges only the runtime's request-control slot. Success promises
     /// allocation-free restoration and leaves neural parallel selection intact.
     fn exchange_parallel_control_context(
-        _runtime: &mut Self::Runtime, _context: &mut Option<Box<B::ParallelContext>>,
-    ) -> bool { false }
+        _runtime: &mut Self::Runtime,
+        _context: &mut Option<Box<B::ParallelContext>>,
+    ) -> bool {
+        false
+    }
 
     /// Reuses the scoped restoration worker for a separate control-only loan.
     fn with_borrowed_parallel_control_context<T, F>(
-        runtime: &mut Self::Runtime, context: &mut Option<Box<B::ParallelContext>>,
-        funding: &eredu_nn::workspace::HostMetadataFunding, run: F,
+        runtime: &mut Self::Runtime,
+        context: &mut Option<Box<B::ParallelContext>>,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        run: F,
     ) -> Result<T, PreparedParallelContextCause>
-    where F: FnOnce(&mut Self::Runtime) -> T,
+    where
+        F: FnOnce(&mut Self::Runtime) -> T,
     {
         parallel_context::with_borrowed_runtime(
-            runtime, context, funding, Self::exchange_parallel_control_context, run)
+            runtime,
+            context,
+            funding,
+            Self::exchange_parallel_control_context,
+            run,
+        )
     }
 
     /// Replaces only the selected executor's opaque parallel context. Success
     /// returns its exact prior value and must remain reversible until restored.
     /// Refusal returns `replacement` unchanged before mutation. No source,
     /// completion, allocation or communication authority is created here.
-    fn replace_parallel_context(_runtime:&mut Self::Runtime,replacement:B::ParallelContext)
-        -> Result<B::ParallelContext,B::ParallelContext>
-    where B::ParallelContext:Sized { Err(replacement) }
+    fn replace_parallel_context(
+        _runtime: &mut Self::Runtime,
+        replacement: B::ParallelContext,
+    ) -> Result<B::ParallelContext, B::ParallelContext>
+    where
+        B::ParallelContext: Sized,
+    {
+        Err(replacement)
+    }
 
     /// Temporarily lends one already prepared backend context to the actual
     /// selected runtime. Callers own source/admission and completion custody;
     /// this shared worker guarantees restoration on return, error or unwind.
-    fn with_prepared_parallel_context<T,F>(
-        runtime:&mut Self::Runtime, context:B::ParallelContext,
-        funding:&eredu_nn::workspace::HostMetadataFunding, run:F,
-    )->Result<T,PreparedParallelContextFailure<B::ParallelContext>>
-    where B::ParallelContext:Sized, F:FnOnce(&mut Self::Runtime)->T,
+    fn with_prepared_parallel_context<T, F>(
+        runtime: &mut Self::Runtime,
+        context: B::ParallelContext,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        run: F,
+    ) -> Result<T, PreparedParallelContextFailure<B::ParallelContext>>
+    where
+        B::ParallelContext: Sized,
+        F: FnOnce(&mut Self::Runtime) -> T,
     {
-        parallel_context::with_runtime(runtime,context,funding,Self::replace_parallel_context,run)
+        parallel_context::with_runtime(
+            runtime,
+            context,
+            funding,
+            Self::replace_parallel_context,
+            run,
+        )
     }
 
     /// Permanently fences this strategy's retained communication incarnations.
@@ -978,15 +1111,18 @@ where
             R::Error,
         >,
         _context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
         Ok(false)
     }
 
-    /// Atomically publishes completed replacements in the selected ownership mechanism.
-    fn publish_parameter_replacements(
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn invalidate_parameter_observations(_runtime: &mut Self::Runtime) {}
+
+    fn visit_parameter_publication(
         _runtime: &mut Self::Runtime,
-        _values: &BTreeMap<String, B::Tensor>,
-        _active: bool,
+        _publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<bool, R::Error> {
         Ok(false)
     }
@@ -1015,8 +1151,10 @@ where
     /// Source publication and finite execution permission remain separate.
     fn prepare_observation_paths(
         _runtime: &Self::Runtime,
-    ) -> Result<Option<crate::PreparedLayeredObservationPaths>,
-        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+    ) -> Result<
+        Option<crate::PreparedLayeredObservationPaths>,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    > {
         Ok(None)
     }
 
@@ -1026,7 +1164,8 @@ where
     fn bind_observation_paths(
         _runtime: &Self::Runtime,
         _source: &crate::SharedLayeredObservationPaths,
-        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>,
+    ) -> Result<
         crate::PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
@@ -1115,12 +1254,22 @@ where
 
     /// Publishes through the same policy using a retained native occurrence.
     /// Strategies without that producer refuse an explicitly prepared context.
-    fn publish_observed_output_with_parallel(runtime:&mut Self::Runtime,output:B::Tensor,
-        context:&<B::Tensor as Tensor>::Context,
-        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::HostMetadataFunding)>)
-        ->Result<B::Tensor,ReplicatedTextSessionError<A::Error,R::Error,std::convert::Infallible>> {
-        if prepared.is_some(){return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));}
-        Self::publish_observed_output(runtime,output,context)
+    fn publish_observed_output_with_parallel(
+        runtime: &mut Self::Runtime,
+        output: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        prepared: Option<(
+            &B::ParallelContext,
+            &eredu_nn::workspace::HostMetadataFunding,
+        )>,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    {
+        if prepared.is_some() {
+            return Err(ReplicatedTextSessionError::ParallelContext(
+                PreparedParallelContextCause::Unsupported,
+            ));
+        }
+        Self::publish_observed_output(runtime, output, context)
     }
 
     /// Resolves the rank-local tensor used by an additive prediction extension.
@@ -1168,8 +1317,39 @@ where
     /// Exact native operation selected for this actual control event.
     /// None is a local phase and must not create a native control claim.
     fn parallel_control_operation(
-        _runtime: &Self::Runtime, _event: ParallelControlEvent,
-    ) -> Option<crate::CommunicationOperation> { None }
+        _runtime: &Self::Runtime,
+        _event: ParallelControlEvent,
+    ) -> Option<crate::CommunicationOperation> {
+        None
+    }
+
+    /// Visits the actual prepared-group callback used by this selected strategy.
+    /// False preserves an unavailable source; it grants no communication authority.
+    fn visit_parallel_control_callback<V>(
+        _runtime: &Self::Runtime,
+        _occurrence: SessionTransactionControlOccurrence,
+        _visitor: &mut V,
+    ) -> Result<bool, V::Error>
+    where
+        B: crate::CommunicationBackend,
+        V: ParallelControlCallbackVisitor<B>,
+    {
+        Ok(false)
+    }
+
+    /// Visits the actual shared partition callback types for one recorded model
+    /// control. The default supplies no source and grants no execution authority.
+    fn visit_model_control_callback<V>(
+        _runtime: &Self::Runtime,
+        _occurrence: parallel_control::SessionModelControlOccurrence,
+        _visitor: &mut V,
+    ) -> Result<bool, V::Error>
+    where
+        B: crate::CommunicationBackend,
+        V: ParallelControlCallbackVisitor<B>,
+    {
+        Ok(false)
+    }
 
     /// Performs strategy-specific distributed commit only after output
     /// intervention and exact mechanism completion have succeeded.
@@ -1184,24 +1364,41 @@ where
     /// Final decision under an exact prepared control context. The default
     /// preserves ordinary behavior and explicitly refuses an unconsumed context.
     fn commit_after_completion_with_parallel(
-        runtime: &mut Self::Runtime, epoch: DistributedCommitEpoch,
+        runtime: &mut Self::Runtime,
+        epoch: DistributedCommitEpoch,
         context: &<B::Tensor as Tensor>::Context,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
-    ) -> Result<DistributedCommitOutcome, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        prepared: Option<(
+            &B::ParallelContext,
+            &eredu_nn::workspace::HostMetadataFunding,
+        )>,
+    ) -> Result<
+        DistributedCommitOutcome,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    > {
         if prepared.is_some() {
-            return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));
+            return Err(ReplicatedTextSessionError::ParallelContext(
+                PreparedParallelContextCause::Unsupported,
+            ));
         }
         Ok(Self::commit_after_completion(runtime, epoch, context))
     }
 
     /// Same phase policy with an explicit prepared communication context.
     fn agree_distributed_phase_with_parallel(
-        runtime: &mut Self::Runtime, phase: crate::DistributedExecutionPhase,
-        local_success: bool, context: &<B::Tensor as Tensor>::Context,
-        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::HostMetadataFunding)>,
-    ) -> Result<bool, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        runtime: &mut Self::Runtime,
+        phase: crate::DistributedExecutionPhase,
+        local_success: bool,
+        context: &<B::Tensor as Tensor>::Context,
+        prepared: Option<(
+            &B::ParallelContext,
+            &eredu_nn::workspace::HostMetadataFunding,
+        )>,
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    {
         if prepared.is_some() {
-            return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));
+            return Err(ReplicatedTextSessionError::ParallelContext(
+                PreparedParallelContextCause::Unsupported,
+            ));
         }
         Self::agree_distributed_phase(runtime, phase, local_success, context)
     }
@@ -1264,7 +1461,8 @@ where
     fn bind_observation_paths(
         runtime: &Self::Runtime,
         source: &crate::SharedLayeredObservationPaths,
-        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>,
+    ) -> Result<
         crate::PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
@@ -1326,16 +1524,22 @@ where
             R::Error,
         >,
         context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
-        runtime.with_parameter_slots(location, operation, context)
+        runtime.with_parameter_slots(location, operation, context, _preparation)
     }
 
-    fn publish_parameter_replacements(
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn invalidate_parameter_observations(runtime: &mut Self::Runtime) {
+        runtime.invalidate_parameter_observations();
+    }
+
+    fn visit_parameter_publication(
         runtime: &mut Self::Runtime,
-        values: &BTreeMap<String, B::Tensor>,
-        active: bool,
+        publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<bool, R::Error> {
-        runtime.publish_parameter_replacements(values, active)
+        runtime.visit_parameter_publication(publication)
     }
 
     fn resident_policy(runtime: &Self::Runtime) -> Option<&R> {
@@ -1466,7 +1670,8 @@ where
     fn bind_observation_paths(
         runtime: &Self::Runtime,
         source: &crate::SharedLayeredObservationPaths,
-        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>,
+    ) -> Result<
         crate::PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
@@ -1537,16 +1742,22 @@ where
             R::Error,
         >,
         context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
-        runtime.with_parameter_slots(location, operation, context)
+        runtime.with_parameter_slots(location, operation, context, _preparation)
     }
 
-    fn publish_parameter_replacements(
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn invalidate_parameter_observations(runtime: &mut Self::Runtime) {
+        runtime.invalidate_parameter_observations();
+    }
+
+    fn visit_parameter_publication(
         runtime: &mut Self::Runtime,
-        values: &BTreeMap<String, B::Tensor>,
-        active: bool,
+        publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<bool, R::Error> {
-        runtime.publish_parameter_replacements(values, active)
+        runtime.visit_parameter_publication(publication)
     }
 
     fn resident_policy(runtime: &Self::Runtime) -> Option<&R> {
@@ -1679,7 +1890,8 @@ where
     execution: D::Runtime,
     // The runtime owns its private binding; metadata projections bind this
     // same physical source independently during their own cold preparation.
-    observation_paths: Option<crate::PreparedLayeredObservationPaths>,
+    observation_source: Option<crate::SharedLayeredObservationPaths>,
+    observation_paths: std::sync::OnceLock<crate::PreparedLayeredObservationPaths>,
     driver: D,
     state: M::State,
     mechanisms: M,
@@ -1691,7 +1903,7 @@ where
     active_commit_epoch: Option<DistributedCommitEpoch>,
     last_commit_outcome: Option<DistributedCommitOutcome>,
     successful_state_restorations: Option<u64>,
-    control_identity: std::sync::Arc<()>,
+    control_identity: ParameterControlIdentity,
     prefill_identity: crate::working_memory::InferenceExecutionIdentity,
     inference_guard: Option<M::PrefillReservationGuard>,
     active_prefill_control: Option<crate::prefill::PrefillControlRole>,
@@ -1874,16 +2086,24 @@ where
 {
     let (mut architecture, partition, communication, tasks) = input.into_parts();
     let global_layout = partition.unit_layout().clone();
-    let addresses=partitioned_materialization_addresses(&partition,scope)
+    let addresses = partitioned_materialization_addresses(&partition, scope)
         .map_err(PartitionedRuntimeConstructionError::Contract)?;
     let task_partition =
         plan_local_replicated_text_materialization_tasks(&tasks, &global_layout, &addresses)
             .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
-    let mut units=crate::layered::ordinary_addressed_units::<A,B,M::State>(&architecture,&addresses,context)
-        .map_err(PartitionedRuntimeConstructionError::Architecture)?;
-    let mut source_units=source_architecture.as_ref().map(|source|
-        crate::layered::ordinary_addressed_units::<A,B,M::State>(source,&addresses,context)
-            .map_err(PartitionedRuntimeConstructionError::Architecture)).transpose()?;
+    let mut units = crate::layered::ordinary_addressed_units::<A, B, M::State>(
+        &architecture,
+        &addresses,
+        context,
+    )
+    .map_err(PartitionedRuntimeConstructionError::Architecture)?;
+    let mut source_units = source_architecture
+        .as_ref()
+        .map(|source| {
+            crate::layered::ordinary_addressed_units::<A, B, M::State>(source, &addresses, context)
+                .map_err(PartitionedRuntimeConstructionError::Architecture)
+        })
+        .transpose()?;
     let local_state = partition.state().ok_or_else(|| {
         PartitionedRuntimeConstructionError::Contract(
             "partition owns no local mutable state".into(),
@@ -1954,28 +2174,42 @@ where
 /// Exact unit addresses consumed by the existing partition materializer.
 /// The architecture-selected scope preserves global parameter names while its
 /// local residency policy assigns slots in this order.
-pub fn partitioned_materialization_addresses<G,W>(
-    partition:&ArchitecturePartition<G,W>, scope:PartitionedUnitScope,
-)->Result<Vec<crate::ExecutionUnitAddress>,String> {
-    let layout=partition.unit_layout();
-    let addresses=match scope {
-        PartitionedUnitScope::All => (0..layout.len()).map(|ordinal|layout.address(ordinal)
-            .ok_or_else(||format!("global unit ordinal {ordinal} has no canonical address")))
-            .collect::<Result<Vec<_>,_>>()?,
+pub fn partitioned_materialization_addresses<G, W>(
+    partition: &ArchitecturePartition<G, W>,
+    scope: PartitionedUnitScope,
+) -> Result<Vec<crate::ExecutionUnitAddress>, String> {
+    let layout = partition.unit_layout();
+    let addresses = match scope {
+        PartitionedUnitScope::All => (0..layout.len())
+            .map(|ordinal| {
+                layout.address(ordinal).ok_or_else(|| {
+                    format!("global unit ordinal {ordinal} has no canonical address")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         PartitionedUnitScope::Owned => partition.units().collect(),
     };
-    if addresses.is_empty(){return Err("partition owns no execution units".into());}
+    if addresses.is_empty() {
+        return Err("partition owns no execution units".into());
+    }
     Ok(addresses)
 }
 
 /// The policy-local unit layout of the same ordered global partition addresses.
 /// This is descriptive construction metadata, not source or native authority.
 pub fn partitioned_materialization_unit_layout(
-    graph:&crate::ExecutionGraph, addresses:&[crate::ExecutionUnitAddress],
-)->Result<crate::ExecutionUnitLayout,String> {
-    let counts=(0..graph.groups().len()).map(|group|addresses.iter()
-        .filter(|address|address.group()==group).count()).collect::<Vec<_>>();
-    crate::ExecutionUnitLayout::new(graph,counts).map_err(|cause|cause.to_string())
+    graph: &crate::ExecutionGraph,
+    addresses: &[crate::ExecutionUnitAddress],
+) -> Result<crate::ExecutionUnitLayout, String> {
+    let counts = (0..graph.groups().len())
+        .map(|group| {
+            addresses
+                .iter()
+                .filter(|address| address.group() == group)
+                .count()
+        })
+        .collect::<Vec<_>>();
+    crate::ExecutionUnitLayout::new(graph, counts).map_err(|cause| cause.to_string())
 }
 
 /// Failure while consuming architecture authority into a rank-local runtime.
@@ -2068,8 +2302,11 @@ where
     let parameters = architecture
         .parameter_description(context)
         .map_err(|error| PartitionedSessionPreparationError::Contract(error.to_string()))?;
-    let parameters = crate::ArchitectureParameterDescription::into_owned(parameters,B::construction_metadata(context))
-        .map_err(PartitionedSessionPreparationError::Metadata)?;
+    let parameters = crate::ArchitectureParameterDescription::into_owned(
+        parameters,
+        B::construction_metadata(context),
+    )
+    .map_err(PartitionedSessionPreparationError::Metadata)?;
     let mut tasks =
         partitioned_replicated_text_materialization_tasks(&selected, &parameters, &partition)
             .map_err(|error| PartitionedSessionPreparationError::Contract(error.to_string()))?;
@@ -2198,7 +2435,7 @@ pub struct DistributedSessionCheckpoint<C> {
 
 /// Fixed shared prediction-target preparation refusal. Original destinations
 /// retain it without allocating the ordinary contract diagnostic String.
-#[derive(Debug,Clone,Copy,PartialEq,thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum PredictionTargetPreparationError {
     /// Existing commit/fence boundary, retained without legacy formatting.
     #[error(transparent)]
@@ -2368,30 +2605,40 @@ pub struct PreparedReplicatedTextExecutionGeometry {
 }
 enum PreparedTextGeometrySource {
     Selected(SelectedReplicatedTextRealization),
-    Workspace {graph:crate::ExecutionGraph, units:crate::ExecutionUnitLayout},
+    Workspace {
+        graph: crate::ExecutionGraph,
+        units: crate::ExecutionUnitLayout,
+    },
 }
 impl PreparedReplicatedTextExecutionGeometry {
     /// The exact graph compared with or emitted by the architecture constructor.
     pub fn graph(&self) -> &crate::ExecutionGraph {
         match &self.source {
-            PreparedTextGeometrySource::Selected(selected)=>selected.requirements().execution_graph(),
-            PreparedTextGeometrySource::Workspace{graph,..}=>graph,
+            PreparedTextGeometrySource::Selected(selected) => {
+                selected.requirements().execution_graph()
+            }
+            PreparedTextGeometrySource::Workspace { graph, .. } => graph,
         }
     }
     /// Canonical group/unit layout of the same completed constructor.
     pub fn units(&self) -> &crate::ExecutionUnitLayout {
         match &self.source {
-            PreparedTextGeometrySource::Selected(selected)=>selected.requirements().execution_units(),
-            PreparedTextGeometrySource::Workspace{units,..}=>units,
+            PreparedTextGeometrySource::Selected(selected) => {
+                selected.requirements().execution_units()
+            }
+            PreparedTextGeometrySource::Workspace { units, .. } => units,
         }
     }
     pub(crate) fn from_workspace_units(
-        graph:crate::ExecutionGraph, counts:&[usize],
-        context:&eredu_nn::workspace::WorkspaceContext,
-    )->Result<Self,eredu_nn::Error> {
-        context.charge_metadata(std::mem::size_of::<(Self,Result<Self,eredu_nn::Error>)>())?;
-        let units=crate::ExecutionUnitLayout::new_with_metadata(&graph,counts,context)?;
-        Ok(Self{source:PreparedTextGeometrySource::Workspace{graph,units}})
+        graph: crate::ExecutionGraph,
+        counts: &[usize],
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(Self, Result<Self, eredu_nn::Error>)>())?;
+        let units = crate::ExecutionUnitLayout::new_with_metadata(&graph, counts, context)?;
+        Ok(Self {
+            source: PreparedTextGeometrySource::Workspace { graph, units },
+        })
     }
 }
 
@@ -2410,7 +2657,8 @@ impl PreparedReplicatedTextContract {
 
     /// Returns the validated exact materialization tasks.
     pub fn materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
-        self.materialization.as_ref()
+        self.materialization
+            .as_ref()
             .map(PreparedContractMaterialization::tasks)
             .unwrap_or_else(|| self.selected.materialization_tasks())
     }
@@ -2418,8 +2666,10 @@ impl PreparedReplicatedTextContract {
     /// Exact destinations assigned to independently addressable storage.
     /// Both cold and native binding exclude this same validated population.
     pub fn addressable_parameters(&self) -> &[String] {
-        self.materialization.as_ref()
-            .map(PreparedContractMaterialization::addressable).unwrap_or(&[])
+        self.materialization
+            .as_ref()
+            .map(PreparedContractMaterialization::addressable)
+            .unwrap_or(&[])
     }
 
     /// Successful source-owned task/exclusion result, available after initial
@@ -2449,7 +2699,8 @@ impl PreparedReplicatedTextContract {
     ) {
         // A native consuming constructor still receives owned tasks. The
         // checked quote path consumes into_execution_geometry instead.
-        let (tasks, addressable_parameters) = self.materialization
+        let (tasks, addressable_parameters) = self
+            .materialization
             .map(PreparedContractMaterialization::into_parts)
             .unwrap_or_else(|| (self.selected.materialization_tasks().to_vec(), Vec::new()));
         (
@@ -2658,8 +2909,12 @@ where
     A::Error: std::fmt::Display,
 {
     let mut declarations = addressable_parameters.into_iter();
-    metadata.controls::<(Option<&PreparedContractMaterialization>, BTreeSet<String>,
-        Option<Vec<String>>, Option<PreparedContractMaterialization>)>()?;
+    metadata.controls::<(
+        Option<&PreparedContractMaterialization>,
+        BTreeSet<String>,
+        Option<Vec<String>>,
+        Option<PreparedContractMaterialization>,
+    )>()?;
     let mut addressable_parameters = if let Some(source) = materialization {
         source.validate(&selected, declarations, metadata)?;
         BTreeSet::new()
@@ -2708,7 +2963,8 @@ where
             "invalid replicated text contract: selected realization omitted its authoritative materialization tasks"
         )));
     }
-    let tasks: Cow<'_, [ReplicatedTextMaterializationTask]> = if metadata.is_checked() || materialization.is_some()
+    let tasks: Cow<'_, [ReplicatedTextMaterializationTask]> = if metadata.is_checked()
+        || materialization.is_some()
     {
         Cow::Borrowed(selected.materialization_tasks())
     } else {
@@ -2819,13 +3075,18 @@ where
         (None, Cow::Owned(mut tasks)) => {
             tasks.retain(|task| !addressable_parameters.contains(task.name()));
             Some(PreparedContractMaterialization::new(
-                selected.clone(), tasks, declared.unwrap_or_default(),
+                selected.clone(),
+                tasks,
+                declared.unwrap_or_default(),
                 addressable_parameters.into_iter().collect(),
             ))
         }
     };
     Ok(PreparedReplicatedTextContract {
-        selected, materialization, prompt_cache_identity, output_selection,
+        selected,
+        materialization,
+        prompt_cache_identity,
+        output_selection,
     })
 }
 
@@ -2981,7 +3242,12 @@ where
         selected,
         selected_state,
         execution,
-        observation_paths,
+        observation_source: observation_paths
+            .as_ref()
+            .map(|paths| paths.source().clone()),
+        observation_paths: observation_paths
+            .map(std::sync::OnceLock::from)
+            .unwrap_or_default(),
         driver,
         state,
         mechanisms,
@@ -2993,7 +3259,7 @@ where
         active_commit_epoch: None,
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
-        control_identity: std::sync::Arc::new(()),
+        control_identity: ParameterControlIdentity::new(),
         prefill_identity: Default::default(),
         inference_guard: None,
         active_prefill_control: None,
@@ -3078,13 +3344,17 @@ where
     let materialization_report = mechanisms
         .take_materialization_report()
         .map_err(ReplicatedTextSessionError::Mechanism)?;
-    let observation_paths = D::prepare_observation_paths(&runtime)
-        .map_err(widen_infallible)?;
+    let observation_paths = D::prepare_observation_paths(&runtime).map_err(widen_infallible)?;
     Ok(ReplicatedTextSession {
         selected,
         selected_state,
         execution: runtime,
-        observation_paths,
+        observation_source: observation_paths
+            .as_ref()
+            .map(|paths| paths.source().clone()),
+        observation_paths: observation_paths
+            .map(std::sync::OnceLock::from)
+            .unwrap_or_default(),
         driver,
         state,
         mechanisms,
@@ -3096,7 +3366,7 @@ where
         active_commit_epoch: None,
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
-        control_identity: std::sync::Arc::new(()),
+        control_identity: ParameterControlIdentity::new(),
         prefill_identity: Default::default(),
         inference_guard: None,
         active_prefill_control: None,
@@ -3225,23 +3495,43 @@ where
             M::PolicyError,
         >,
         context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, M::PolicyError>> {
-        D::with_parameter_slots(&mut self.execution, location, operation, context)
+        D::with_parameter_slots(
+            &mut self.execution,
+            location,
+            operation,
+            context,
+            _preparation,
+        )
     }
 
-    /// Publishes completed replacements after resetting incompatible mutable state.
-    pub fn publish_parameter_replacements(
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    pub fn visit_parameter_publication(
         &mut self,
-        values: &BTreeMap<String, B::Tensor>,
-        active: bool,
+        publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<bool, M::PolicyError> {
-        D::publish_parameter_replacements(&mut self.execution, values, active)
+        if !D::visit_parameter_publication(&mut self.execution, publication)? {
+            return Ok(false);
+        }
+        self.control_identity.visit(publication);
+        Ok(true)
     }
 
-    /// Invalidates native snapshots after a completed parameter publication.
-    /// Call only after resetting incompatible mutable state and publishing all slots.
-    pub fn invalidate_parameter_snapshots(&mut self) {
-        self.control_identity = std::sync::Arc::new(());
+    /// Invalidates observation and geometry bindings after a completed parameter publication.
+    pub fn invalidate_parameter_observations(&mut self) {
+        D::invalidate_parameter_observations(&mut self.execution);
+    }
+
+    /// Finalizes observation bindings after the prepared parameter exchanges.
+    /// The same transaction already exchanged the control generation; this hook
+    /// neither creates an identity allocation nor changes publication counters.
+    pub fn finalize_parameter_publication(&mut self) {
+        self.invalidate_parameter_observations();
+        // Only a finalized parameter transaction clears the token for a new
+        // funded cold binding. Raw mutable access leaves a stale token present.
+        self.observation_paths.take();
     }
 
     /// Runs one direct forward and returns the complete architecture output.
@@ -3311,7 +3601,14 @@ where
     where
         F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
     {
-        self.sequence_logits_with_optional_checkpoint(input, pass, context, None, complete)
+        self.sequence_logits_with_optional_checkpoint(
+            input,
+            pass,
+            context,
+            None,
+            complete,
+            &mut crate::NoopObserver,
+        )
     }
 
     /// Uses a caller-prepared checkpoint at the existing checkpoint agreement
@@ -3328,25 +3625,54 @@ where
     where
         F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
     {
+        self.sequence_logits_with_checkpoint_completion_and_observer(
+            input,
+            pass,
+            context,
+            checkpoint,
+            complete,
+            &mut crate::NoopObserver,
+        )
+    }
+
+    /// Completes and publishes the same checkpointed sequence transaction with
+    /// the caller's observation program. Observation failure uses the existing
+    /// rollback and all-rank agreement path before cache publication.
+    pub fn sequence_logits_with_checkpoint_completion_and_observer<'a, F, O>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: M::StateCheckpoint,
+        complete: F,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
         self.sequence_logits_with_optional_checkpoint(
             input,
             pass,
             context,
             Some(checkpoint),
             complete,
+            observer,
         )
     }
 
-    fn sequence_logits_with_optional_checkpoint<'a, F>(
+    fn sequence_logits_with_optional_checkpoint<'a, F, O>(
         &mut self,
         input: A::Input<'a>,
         pass: ExpertPass,
         context: &<B::Tensor as Tensor>::Context,
         checkpoint: Option<M::StateCheckpoint>,
         complete: F,
+        observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
         F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.output_with_optional_checkpoint_and_completion(
             input,
@@ -3354,6 +3680,7 @@ where
             eredu_core::OutputDemand::Sequence,
             context,
             checkpoint,
+            observer,
             |output, state, context| {
                 complete(output.expect("sequence output checked"), state, context)
             },
@@ -3387,26 +3714,84 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<(), M::Error>,
     {
+        self.prefill_span_with_checkpoint_completion_and_observer(
+            input,
+            demand,
+            context,
+            checkpoint,
+            funding,
+            complete,
+            &mut crate::NoopObserver,
+        )
+    }
+
+    /// Observed form of the same bounded prefill-span transaction. The exact
+    /// caller-owned completion still settles all model and observation roots
+    /// before the common publication/rollback worker commits the span.
+    pub fn prefill_span_with_checkpoint_completion_and_observer<'a, F, O>(
+        &mut self,
+        input: A::Input<'a>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: M::StateCheckpoint,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        complete: F,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        M::Error: From<eredu_nn::workspace::HostMetadataFundingError>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+        F: FnOnce(
+            Option<&B::Tensor>,
+            &M::State,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<(), M::Error>,
+    {
         let controls = [
             std::mem::size_of::<F>(),
+            std::mem::size_of::<&mut O>(),
             std::mem::size_of::<Option<M::StateCheckpoint>>(),
             std::mem::size_of::<Option<B::Tensor>>(),
-            std::mem::size_of::<Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>>(),
-            std::mem::size_of::<Result<(Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>>(),
-            std::mem::size_of::<(&mut Self, A::Input<'a>, eredu_core::OutputDemand, &<B::Tensor as Tensor>::Context, M::StateCheckpoint, &eredu_nn::workspace::HostMetadataFunding, F)>(),
+            std::mem::size_of::<
+                Result<
+                    Option<B::Tensor>,
+                    ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+                >,
+            >(),
+            std::mem::size_of::<
+                Result<
+                    (Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
+                    ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+                >,
+            >(),
+            std::mem::size_of::<(
+                &mut Self,
+                A::Input<'a>,
+                eredu_core::OutputDemand,
+                &<B::Tensor as Tensor>::Context,
+                M::StateCheckpoint,
+                &eredu_nn::workspace::HostMetadataFunding,
+                F,
+            )>(),
         ];
-        let bytes = controls.into_iter()
+        let bytes = controls
+            .into_iter()
             .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-            .ok_or_else(|| ReplicatedTextSessionError::Mechanism(
-                eredu_nn::workspace::HostMetadataFundingError::Overflow.into(),
-            ))?;
-        funding.reserve_metadata(bytes).map_err(|cause| ReplicatedTextSessionError::Mechanism(cause.into()))?;
+            .ok_or_else(|| {
+                ReplicatedTextSessionError::Mechanism(
+                    eredu_nn::workspace::HostMetadataFundingError::Overflow.into(),
+                )
+            })?;
+        funding
+            .reserve_metadata(bytes)
+            .map_err(|cause| ReplicatedTextSessionError::Mechanism(cause.into()))?;
         self.output_with_optional_checkpoint_and_completion(
             input,
             ExpertPass::Prefill,
             demand,
             context,
             Some(checkpoint),
+            observer,
             complete,
             || {
                 ReplicatedTextSessionError::WorkingMemory(
@@ -3416,13 +3801,14 @@ where
         )
     }
 
-    fn output_with_optional_checkpoint_and_completion<'a, F, E>(
+    fn output_with_optional_checkpoint_and_completion<'a, F, E, O>(
         &mut self,
         input: A::Input<'a>,
         pass: ExpertPass,
         demand: eredu_core::OutputDemand,
         context: &<B::Tensor as Tensor>::Context,
         checkpoint: Option<M::StateCheckpoint>,
+        observer: &mut O,
         complete: F,
         output_error: E,
     ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
@@ -3433,8 +3819,9 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<(), M::Error>,
         E: FnOnce() -> ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.with_observation_transaction(&mut crate::NoopObserver, |session, observer| {
+        self.with_observation_transaction(observer, |session, observer| {
             let (output, checkpoint, forward) = session
                 .execute_input_result_before_publication_with_readout(
                     Ok(input),
@@ -4228,16 +4615,17 @@ where
         self.prepare_prediction_target_state_with(
             context,
             |mechanisms, source, selected| {
-                let mut state=mechanisms.fork_prediction_target_state(source,selected,context)
+                let mut state = mechanisms
+                    .fork_prediction_target_state(source, selected, context)
                     .map_err(ReplicatedTextSessionError::Mechanism)?;
                 state.inherit_inference_retention(source);
                 Ok(state)
             },
-            |state|state,
-            |error|error,
-            |cause|match cause {
-                PredictionTargetPreparationError::Boundary(cause)=>cause.into_legacy(),
-                cause=>ReplicatedTextSessionError::Contract(cause.to_string()),
+            |state| state,
+            |error| error,
+            |cause| match cause {
+                PredictionTargetPreparationError::Boundary(cause) => cause.into_legacy(),
+                cause => ReplicatedTextSessionError::Contract(cause.to_string()),
             },
         )
     }
@@ -4248,32 +4636,35 @@ where
     /// transaction: commit resolution, local copy/layout check and rank agreement
     /// complete before any destination is returned. The callback must preserve
     /// the exact inherited storage/account custody required by its state type.
-    pub fn prepare_prediction_target_state_with<T,E>(
+    pub fn prepare_prediction_target_state_with<T, E>(
         &mut self,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-        prepare: impl FnOnce(&mut M,&M::State,&SelectedStateRealization)->Result<T,E>,
-        state: impl FnOnce(&T)->&M::State,
-        session_error: impl Fn(ReplicatedTextSessionError<A::Error,M::PolicyError,M::Error>)->E,
-        contract_error: impl Fn(PredictionTargetPreparationError)->E,
-    )->Result<T,E> {
-        RuntimeInspectionBoundary::resolved(self.control_fence,self.last_commit_outcome)
-            .map_err(|cause|contract_error(PredictionTargetPreparationError::Boundary(cause)))?;
-        let provisional=match self.selected_state.state() {
-            None=>Err(contract_error(PredictionTargetPreparationError::Stateless)),
-            Some(selected)=>prepare(&mut self.mechanisms,&self.state,selected).and_then(|prepared| {
-                if !realized_state_layout_matches::<B,M::State>(state(&prepared),selected) {
-                    return Err(contract_error(PredictionTargetPreparationError::Layout));
-                }
-                Ok(prepared)
-            }),
+        prepare: impl FnOnce(&mut M, &M::State, &SelectedStateRealization) -> Result<T, E>,
+        state: impl FnOnce(&T) -> &M::State,
+        session_error: impl Fn(ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>) -> E,
+        contract_error: impl Fn(PredictionTargetPreparationError) -> E,
+    ) -> Result<T, E> {
+        RuntimeInspectionBoundary::resolved(self.control_fence, self.last_commit_outcome)
+            .map_err(|cause| contract_error(PredictionTargetPreparationError::Boundary(cause)))?;
+        let provisional = match self.selected_state.state() {
+            None => Err(contract_error(PredictionTargetPreparationError::Stateless)),
+            Some(selected) => {
+                prepare(&mut self.mechanisms, &self.state, selected).and_then(|prepared| {
+                    if !realized_state_layout_matches::<B, M::State>(state(&prepared), selected) {
+                        return Err(contract_error(PredictionTargetPreparationError::Layout));
+                    }
+                    Ok(prepared)
+                })
+            }
         };
-        let phase=crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
-        let agreed=self.agree_execution_phase(phase,provisional.is_ok(),context)
-            .map_err(|cause|session_error(widen_infallible(cause)))?;
+        let phase = crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
+        let agreed = self
+            .agree_execution_phase(phase, provisional.is_ok(), context)
+            .map_err(|cause| session_error(widen_infallible(cause)))?;
         match provisional {
-            Ok(prepared) if agreed=>Ok(prepared),
-            Ok(_)=>Err(contract_error(PredictionTargetPreparationError::Peer)),
-            Err(cause)=>Err(cause),
+            Ok(prepared) if agreed => Ok(prepared),
+            Ok(_) => Err(contract_error(PredictionTargetPreparationError::Peer)),
+            Err(cause) => Err(cause),
         }
     }
 
@@ -4536,33 +4927,41 @@ where
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    {
+    ) -> Result<
+        M::PromptCacheManifest,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
         self.ensure_control_unfenced()?;
-        let identity = self.prompt_cache_identity()?.clone();
-        validate_prompt_cache_model_identity(expected, &identity)?;
+        self.prompt_cache_identity()?;
+        let identity = self
+            .prompt_cache_identity
+            .as_ref()
+            .expect("validated cache identity");
+        self.cache_validate_model(expected, identity)?;
         let selected_state = self.selected_state.state().ok_or_else(|| {
-            ReplicatedTextSessionError::Contract(
-                "this partition rank owns no prompt-cache state shard".into(),
-            )
+            self.cache_contract(CacheContractFailure::Static(
+                "this partition rank owns no prompt-cache state shard",
+            ))
         })?;
         let (state, manifest) = self
             .mechanisms
             .load_prompt_cache(
+                &self.state,
                 directory,
                 expected,
-                &identity,
+                identity,
                 prefix_token_ids,
                 selected_state,
                 context,
             )
             .map_err(ReplicatedTextSessionError::Mechanism)?;
-        manifest.validate_compatibility(expected, prefix_token_ids)?;
+        self.cache_validate_compatibility(manifest.as_ref(), expected, prefix_token_ids)?;
         validate_realized_state(&state, selected_state)?;
+        self.cache_validate_commit(manifest.as_ref().distributed_commit)?;
         self.state = state;
         self.state.inference_retention_mut().invalidate_revision();
         self.committed_prompt_input_identity = None;
-        self.restore_distributed_commit(manifest.distributed_commit)?;
+        self.restore_distributed_commit(manifest.as_ref().distributed_commit)?;
         Ok(manifest)
     }
 
@@ -4576,8 +4975,10 @@ where
         prefix_token_ids: &[u32],
         input_identity: impl Into<SharedPreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    {
+    ) -> Result<
+        M::PromptCacheManifest,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
         let input_identity = input_identity.into();
         self.validate_prompt_input_descriptor(expected, input_identity.as_ref())?;
         let manifest = self.load_prompt_cache(directory, expected, prefix_token_ids, context)?;
@@ -4598,7 +4999,7 @@ where
         prefix_token_ids: &[u32],
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        Option<PromptCacheManifest>,
+        Option<M::PromptCacheManifest>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.load_prompt_cache_distributed_inner(
@@ -4620,7 +5021,7 @@ where
         input_identity: impl Into<SharedPreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        Option<PromptCacheManifest>,
+        Option<M::PromptCacheManifest>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.load_prompt_cache_distributed_inner(
@@ -4640,23 +5041,26 @@ where
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    {
+    ) -> Result<
+        M::PromptCacheManifest,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
         self.ensure_control_unfenced()?;
-        validate_prompt_cache_model_identity(&descriptor, self.prompt_cache_identity()?)?;
+        self.cache_validate_model(&descriptor, self.prompt_cache_identity()?)?;
         let descriptor = descriptor.with_distributed_commit(self.last_commit_outcome);
+        let copied_descriptor = self.cache_clone_descriptor(&descriptor)?;
         let manifest = self
             .mechanisms
             .save_prompt_cache(
                 &mut self.state,
                 destination,
-                descriptor.clone(),
+                copied_descriptor,
                 prefix_token_ids,
                 options,
                 context,
             )
             .map_err(ReplicatedTextSessionError::Mechanism)?;
-        manifest.validate_compatibility(&descriptor, prefix_token_ids)?;
+        self.cache_validate_compatibility(manifest.as_ref(), &descriptor, prefix_token_ids)?;
         Ok(manifest)
     }
 
@@ -4669,13 +5073,15 @@ where
         options: &PromptCacheOptions,
         input_identity: &PreparedInputCacheIdentity,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    {
+    ) -> Result<
+        M::PromptCacheManifest,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
         self.validate_prompt_input_descriptor(&descriptor, input_identity)?;
         if self.committed_prompt_input_identity() != Some(input_identity) {
-            return Err(ReplicatedTextSessionError::Contract(
-                "prompt-cache prepared-input identity differs from the committed prompt".into(),
-            ));
+            return Err(self.cache_contract(CacheContractFailure::Static(
+                "prompt-cache prepared-input identity differs from the committed prompt",
+            )));
         }
         self.save_prompt_cache(destination, descriptor, prefix_token_ids, options, context)
     }
@@ -4688,7 +5094,7 @@ where
         input_identity: Option<SharedPreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        Option<PromptCacheManifest>,
+        Option<M::PromptCacheManifest>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.ensure_commit_resolved()?;
@@ -4703,17 +5109,18 @@ where
             ) {
                 (Some(selected_state), Some(identity)) => {
                     if !self.selected.prompt_cache() {
-                        return Err(ReplicatedTextSessionError::Contract(
-                            "prompt-cache persistence was not selected for this session".into(),
-                        ));
+                        return Err(self.cache_contract(CacheContractFailure::Static(
+                            "prompt-cache persistence was not selected for this session",
+                        )));
                     }
-                    validate_prompt_cache_model_identity(expected, identity)?;
-                    Ok(Some((selected_state.clone(), identity.clone())))
+                    self.cache_validate_model(expected, identity)?;
+                    let _ = selected_state;
+                    Ok(Some(()))
                 }
                 (None, None) => Ok(None),
-                _ => Err(ReplicatedTextSessionError::Contract(
-                    "partition cache state and rank-local identity ownership disagree".into(),
-                )),
+                _ => Err(self.cache_contract(CacheContractFailure::Static(
+                    "partition cache state and rank-local identity ownership disagree",
+                ))),
             }
         })();
         let phase = crate::DistributedExecutionPhase::PromptCacheLoadPreflight;
@@ -4728,21 +5135,31 @@ where
             }
         };
 
-        let provisional = local.map(|(selected_state, identity)| {
+        let provisional = local.map(|()| {
+            let selected_state = self.selected_state.state().expect("validated local state");
+            let identity = self
+                .prompt_cache_identity
+                .as_ref()
+                .expect("validated cache identity");
             self.mechanisms
                 .load_prompt_cache(
+                    &self.state,
                     directory,
                     expected,
-                    &identity,
+                    identity,
                     prefix_token_ids,
-                    &selected_state,
+                    selected_state,
                     context,
                 )
                 .map_err(ReplicatedTextSessionError::Mechanism)
                 .and_then(|(state, manifest)| {
-                    manifest.validate_compatibility(expected, prefix_token_ids)?;
-                    validate_realized_state(&state, &selected_state)?;
-                    validate_distributed_commit_restore(manifest.distributed_commit)?;
+                    self.cache_validate_compatibility(
+                        manifest.as_ref(),
+                        expected,
+                        prefix_token_ids,
+                    )?;
+                    validate_realized_state(&state, selected_state)?;
+                    self.cache_validate_commit(manifest.as_ref().distributed_commit)?;
                     Ok((state, manifest))
                 })
         });
@@ -4766,8 +5183,8 @@ where
             self.state.inference_retention_mut().invalidate_revision();
             self.committed_prompt_input_identity = input_identity;
             self.active_commit_epoch = None;
-            self.last_commit_outcome = manifest.distributed_commit;
-            if let Some(outcome) = manifest.distributed_commit {
+            self.last_commit_outcome = manifest.as_ref().distributed_commit;
+            if let Some(outcome) = manifest.as_ref().distributed_commit {
                 self.next_commit_epoch =
                     self.next_commit_epoch
                         .max(outcome.epoch().next().unwrap_or_else(|| {
@@ -4939,11 +5356,14 @@ where
         let execution = &mut self.execution;
         let event = ParallelControlEvent::Phase(phase);
         let result = if D::parallel_control_operation(execution, event).is_some() {
-            self.mechanisms.with_execution_parallel_control(
-                event, context,
-                |prepared| D::agree_distributed_phase_with_parallel(
-                    execution, phase, local_success, context, prepared),
-            ).map_err(ReplicatedTextSessionError::ParallelControl).and_then(|result| result)
+            self.mechanisms
+                .with_execution_parallel_control(
+                    event,
+                    context,
+                    Self::phase_control_callback(execution, phase, local_success, context),
+                )
+                .map_err(ReplicatedTextSessionError::ParallelControl)
+                .and_then(|result| result)
         } else {
             D::agree_distributed_phase(execution, phase, local_success, context)
         };
@@ -5371,7 +5791,7 @@ where
         let prepared_traversal = observer.requires_prepared_traversal();
         let input = input.and_then(|input| {
             if prepared_traversal {
-                let paths = self.observation_paths.as_ref().ok_or(
+                let paths = self.observation_paths.get().ok_or(
                     ReplicatedTextSessionError::PreparedObservation(
                         PreparedSessionObservationError::Unavailable,
                     ),
@@ -5479,57 +5899,76 @@ where
         // Text and retained media borrow the same admitted model and control
         // contexts. Their callbacks select only the input equation; partition
         // boundaries, one-use source claims and context restoration stay here.
-        let paths = prepared_traversal.then(|| self.observation_paths.as_ref()
-            .expect("binding checked before input agreement"));
-        let execution = self.mechanisms.with_execution_parallel_control_context(context, |control| {
-            let execute_context = |execution: &mut D::Runtime| {
-                self.mechanisms.with_execution_parallel(context, |parallel| {
-                    let run = |runtime: &mut D::Runtime| {
-                        execute(&mut self.driver, runtime, &mut self.state, paths,
-                            input, observer, demand)
-                    };
-                    match parallel {
-                        Some((parallel, funding)) => D::with_borrowed_parallel_context(
-                            execution, parallel, funding, run,
-                        ).map_err(ReplicatedTextSessionError::ParallelContext)?,
-                        None => run(execution),
-                    }
-                }).map_err(ReplicatedTextSessionError::Mechanism)?
-            };
-            match control {
-                Some((control, funding)) => D::with_borrowed_parallel_control_context(
-                    &mut self.execution, control, funding, execute_context,
-                ).map_err(ReplicatedTextSessionError::ParallelContext)?,
-                None => execute_context(&mut self.execution),
-            }
-        }).map_err(ReplicatedTextSessionError::Mechanism).and_then(|result| result);
-        let execution = execution.and_then(
-            |(output, forward)| {
-                if let Some(expected) = span_end {
-                    if let Some(actual) = self
-                        .mechanisms
-                        .prefill_state_frontier(&self.state)
+        let paths = prepared_traversal.then(|| {
+            self.observation_paths
+                .get()
+                .expect("binding checked before input agreement")
+        });
+        let execution = self
+            .mechanisms
+            .with_execution_parallel_control_context(context, |control| {
+                let execute_context = |execution: &mut D::Runtime| {
+                    self.mechanisms
+                        .with_execution_parallel(context, |parallel| {
+                            let run = |runtime: &mut D::Runtime| {
+                                execute(
+                                    &mut self.driver,
+                                    runtime,
+                                    &mut self.state,
+                                    paths,
+                                    input,
+                                    observer,
+                                    demand,
+                                )
+                            };
+                            match parallel {
+                                Some((parallel, funding)) => D::with_borrowed_parallel_context(
+                                    execution, parallel, funding, run,
+                                )
+                                .map_err(ReplicatedTextSessionError::ParallelContext)?,
+                                None => run(execution),
+                            }
+                        })
                         .map_err(ReplicatedTextSessionError::Mechanism)?
-                    {
-                        if actual != expected {
-                            return Err(ReplicatedTextSessionError::WorkingMemory(
-                                crate::working_memory::WorkingMemoryError::StateFrontierMismatch {
-                                    expected,
-                                    actual,
-                                },
-                            ));
-                        }
+                };
+                match control {
+                    Some((control, funding)) => D::with_borrowed_parallel_control_context(
+                        &mut self.execution,
+                        control,
+                        funding,
+                        execute_context,
+                    )
+                    .map_err(ReplicatedTextSessionError::ParallelContext)?,
+                    None => execute_context(&mut self.execution),
+                }
+            })
+            .map_err(ReplicatedTextSessionError::Mechanism)
+            .and_then(|result| result);
+        let execution = execution.and_then(|(output, forward)| {
+            if let Some(expected) = span_end {
+                if let Some(actual) = self
+                    .mechanisms
+                    .prefill_state_frontier(&self.state)
+                    .map_err(ReplicatedTextSessionError::Mechanism)?
+                {
+                    if actual != expected {
+                        return Err(ReplicatedTextSessionError::WorkingMemory(
+                            crate::working_memory::WorkingMemoryError::StateFrontierMismatch {
+                                expected,
+                                actual,
+                            },
+                        ));
                     }
                 }
-                if output.is_some() == (demand != eredu_core::OutputDemand::StateOnly) {
-                    Ok((output, forward))
-                } else {
-                    Err(ReplicatedTextSessionError::Contract(
-                        "execution output presence differs from agreed readout demand".into(),
-                    ))
-                }
-            },
-        );
+            }
+            if output.is_some() == (demand != eredu_core::OutputDemand::StateOnly) {
+                Ok((output, forward))
+            } else {
+                Err(ReplicatedTextSessionError::Contract(
+                    "execution output presence differs from agreed readout demand".into(),
+                ))
+            }
+        });
         let execution_agreed = match self.agree_execution_phase(
             crate::DistributedExecutionPhase::Execution,
             execution.is_ok(),
@@ -5637,12 +6076,22 @@ where
         (Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        let publication = output.map(|output| {
-            self.mechanisms.with_execution_parallel_publication(context,|prepared| {
-                D::publish_observed_output_with_parallel(&mut self.execution,output,context,prepared)
-                    .map_err(widen_infallible)
-            }).map_err(ReplicatedTextSessionError::Mechanism).and_then(|result|result)
-        }).transpose();
+        let publication = output
+            .map(|output| {
+                self.mechanisms
+                    .with_execution_parallel_publication(context, |prepared| {
+                        D::publish_observed_output_with_parallel(
+                            &mut self.execution,
+                            output,
+                            context,
+                            prepared,
+                        )
+                        .map_err(widen_infallible)
+                    })
+                    .map_err(ReplicatedTextSessionError::Mechanism)
+                    .and_then(|result| result)
+            })
+            .transpose();
         let publication_agreement = self.agree_execution_phase(
             crate::DistributedExecutionPhase::OutputPublication,
             publication.is_ok(),
@@ -5827,20 +6276,25 @@ where
             }
         }
         let execution = &mut self.execution;
-        let outcome = if D::parallel_control_operation(execution, ParallelControlEvent::Commit).is_some() {
-            self.mechanisms.with_execution_parallel_control(
-                ParallelControlEvent::Commit, context,
-                |prepared| D::commit_after_completion_with_parallel(execution, epoch, context, prepared),
-            ).map_err(ReplicatedTextSessionError::ParallelControl)
-                .and_then(|result| result.map_err(widen_infallible))
-        } else {
-            Ok(D::commit_after_completion(execution, epoch, context))
-        };
+        let outcome =
+            if D::parallel_control_operation(execution, ParallelControlEvent::Commit).is_some() {
+                self.mechanisms
+                    .with_execution_parallel_control(
+                        ParallelControlEvent::Commit,
+                        context,
+                        Self::commit_control_callback(execution, epoch, context),
+                    )
+                    .map_err(ReplicatedTextSessionError::ParallelControl)
+                    .and_then(|result| result.map_err(widen_infallible))
+            } else {
+                Ok(D::commit_after_completion(execution, epoch, context))
+            };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.last_commit_outcome = Some(DistributedCommitOutcome::Indeterminate {
-                    epoch, phase: DistributedCommitPhase::DecisionSubmission,
+                    epoch,
+                    phase: DistributedCommitPhase::DecisionSubmission,
                 });
                 self.active_commit_epoch = None;
                 self.fence_terminal(crate::DistributedExecutionPhase::Commit);
@@ -5942,14 +6396,14 @@ where
         &self,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         RuntimeInspectionBoundary::resolved(self.control_fence, self.last_commit_outcome)
-            .map_err(RuntimeInspectionBoundary::into_legacy)
+            .map_err(|cause| self.cache_boundary(cause))
     }
 
     fn ensure_control_unfenced(
         &self,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         RuntimeInspectionBoundary::unfenced(self.control_fence)
-            .map_err(RuntimeInspectionBoundary::into_legacy)
+            .map_err(|cause| self.cache_boundary(cause))
     }
 
     fn agree_cache_control_phase(
@@ -5969,9 +6423,9 @@ where
         &self,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         if D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT {
-            return Err(ReplicatedTextSessionError::Contract(
-                "partitioned cache control requires the selected bounded failure agreement".into(),
-            ));
+            return Err(self.cache_contract(CacheContractFailure::Static(
+                "partitioned cache control requires the selected bounded failure agreement",
+            )));
         }
         Ok(())
     }
@@ -5981,9 +6435,7 @@ where
         phase: crate::DistributedExecutionPhase,
     ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.control_fence.get_or_insert(phase);
-        Err(ReplicatedTextSessionError::Contract(format!(
-            "another rank failed distributed cache control at {phase:?}"
-        )))
+        Err(self.cache_contract(CacheContractFailure::Remote(phase)))
     }
 
     fn abort_without_rollback<T>(
@@ -5998,20 +6450,118 @@ where
         Err(error)
     }
 
+    fn cache_validate_commit(
+        &self,
+        outcome: Option<DistributedCommitOutcome>,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if outcome.is_some_and(|outcome| outcome.epoch().next().is_none()) {
+            return Err(self.cache_contract(CacheContractFailure::Static(
+                "distributed commit epoch overflow",
+            )));
+        }
+        Ok(())
+    }
+
     fn restore_distributed_commit(
         &mut self,
         outcome: Option<DistributedCommitOutcome>,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.cache_validate_commit(outcome)?;
         self.active_commit_epoch = None;
         self.last_commit_outcome = outcome;
         if let Some(outcome) = outcome {
-            self.next_commit_epoch =
-                self.next_commit_epoch
-                    .max(outcome.epoch().next().ok_or_else(|| {
-                        ReplicatedTextSessionError::Contract(
-                            "distributed commit epoch overflow".into(),
-                        )
-                    })?);
+            self.next_commit_epoch = self.next_commit_epoch.max(
+                outcome
+                    .epoch()
+                    .next()
+                    .expect("validated cache commit epoch"),
+            );
+        }
+        Ok(())
+    }
+
+    fn cache_contract(
+        &self,
+        cause: CacheContractFailure,
+    ) -> ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error> {
+        if let Some(funding) = self.mechanisms.prompt_cache_funding() {
+            if let Err(cause) = funding.context().charge_metadata(std::mem::size_of::<(
+                &Self,
+                CacheContractFailure,
+                ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+            )>()) {
+                return StateError::WorkspaceConstruction(cause.into()).into();
+            }
+            StateError::from(funding.context().metadata_source(cause)).into()
+        } else {
+            ReplicatedTextSessionError::Contract(cause.to_string())
+        }
+    }
+
+    fn cache_boundary(
+        &self,
+        cause: RuntimeInspectionBoundary,
+    ) -> ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error> {
+        // The existing inline indeterminate result needs no diagnostic owner.
+        if matches!(cause, RuntimeInspectionBoundary::Indeterminate { .. }) {
+            return cause.into_legacy();
+        }
+        if let Some(funding) = self.mechanisms.prompt_cache_funding() {
+            if let Err(cause) = funding.context().charge_metadata(std::mem::size_of::<(
+                &Self,
+                RuntimeInspectionBoundary,
+                ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+            )>()) {
+                return StateError::WorkspaceConstruction(cause.into()).into();
+            }
+            StateError::from(funding.context().metadata_source(cause)).into()
+        } else {
+            cause.into_legacy()
+        }
+    }
+
+    fn cache_clone_descriptor(
+        &self,
+        source: &PromptCacheDescriptor,
+    ) -> Result<PromptCacheDescriptor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        crate::cache::prompt_source::clone_descriptor(
+            source,
+            self.mechanisms
+                .prompt_cache_funding()
+                .map(|funding| funding.context()),
+        )
+        .map_err(StateError::from)
+        .map_err(Into::into)
+    }
+
+    fn cache_validate_model(
+        &self,
+        descriptor: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if let Some(funding) = self.mechanisms.prompt_cache_funding() {
+            funding
+                .validate_model_identity(descriptor, identity)
+                .map_err(|cause| StateError::from(funding.context().metadata_source(cause)))?;
+        } else {
+            validate_prompt_cache_model_identity(descriptor, identity)?;
+        }
+        Ok(())
+    }
+
+    fn cache_validate_compatibility(
+        &self,
+        manifest: &eredu_core::cache::PromptCacheManifest,
+        descriptor: &PromptCacheDescriptor,
+        prefix: &[u32],
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if let Some(funding) = self.mechanisms.prompt_cache_funding() {
+            funding
+                .validate_compatibility(manifest, descriptor, prefix)
+                .map_err(|cause| StateError::from(funding.context().metadata_source(cause)))?;
+        } else {
+            manifest.validate_compatibility(descriptor, prefix)?;
         }
         Ok(())
     }
@@ -6022,9 +6572,9 @@ where
         input_identity: &PreparedInputCacheIdentity,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         if descriptor.prefix_content_fingerprint() != input_identity.prefix_content_fingerprint() {
-            return Err(ReplicatedTextSessionError::Contract(
-                "prompt-cache content identity differs from the prepared input".into(),
-            ));
+            return Err(self.cache_contract(CacheContractFailure::Static(
+                "prompt-cache content identity differs from the prepared input",
+            )));
         }
         Ok(())
     }
@@ -6036,14 +6586,14 @@ where
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         if !self.selected.prompt_cache() {
-            return Err(ReplicatedTextSessionError::Contract(
-                "prompt-cache persistence was not selected for this session".into(),
-            ));
+            return Err(self.cache_contract(CacheContractFailure::Static(
+                "prompt-cache persistence was not selected for this session",
+            )));
         }
         self.prompt_cache_identity.as_ref().ok_or_else(|| {
-            ReplicatedTextSessionError::Contract(
-                "this partition rank owns no prompt-cache model identity".into(),
-            )
+            self.cache_contract(CacheContractFailure::Static(
+                "this partition rank owns no prompt-cache model identity",
+            ))
         })
     }
 }
@@ -6067,7 +6617,7 @@ where
         options: &PromptCacheOptions,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        Option<PromptCacheManifest>,
+        Option<M::PromptCacheManifest>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.save_prompt_cache_distributed_inner(
@@ -6090,7 +6640,7 @@ where
         input_identity: &PreparedInputCacheIdentity,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        Option<PromptCacheManifest>,
+        Option<M::PromptCacheManifest>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.save_prompt_cache_distributed_inner(
@@ -6113,7 +6663,7 @@ where
         input_identity: Option<&PreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        Option<PromptCacheManifest>,
+        Option<M::PromptCacheManifest>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.ensure_commit_resolved()?;
@@ -6122,10 +6672,9 @@ where
             if let Some(input_identity) = input_identity {
                 self.validate_prompt_input_descriptor(&descriptor, input_identity)?;
                 if self.committed_prompt_input_identity() != Some(input_identity) {
-                    return Err(ReplicatedTextSessionError::Contract(
-                        "prompt-cache prepared-input identity differs from the committed prompt"
-                            .into(),
-                    ));
+                    return Err(self.cache_contract(CacheContractFailure::Static(
+                        "prompt-cache prepared-input identity differs from the committed prompt",
+                    )));
                 }
             }
             match (
@@ -6134,21 +6683,20 @@ where
             ) {
                 (Some(_), Some(identity)) => {
                     if !self.selected.prompt_cache() {
-                        return Err(ReplicatedTextSessionError::Contract(
-                            "prompt-cache persistence was not selected for this session".into(),
-                        ));
+                        return Err(self.cache_contract(CacheContractFailure::Static(
+                            "prompt-cache persistence was not selected for this session",
+                        )));
                     }
-                    validate_prompt_cache_model_identity(&descriptor, identity)?;
+                    self.cache_validate_model(&descriptor, identity)?;
                     Ok(Some(
-                        descriptor
-                            .clone()
+                        self.cache_clone_descriptor(&descriptor)?
                             .with_distributed_commit(self.last_commit_outcome),
                     ))
                 }
                 (None, None) => Ok(None),
-                _ => Err(ReplicatedTextSessionError::Contract(
-                    "partition cache state and rank-local identity ownership disagree".into(),
-                )),
+                _ => Err(self.cache_contract(CacheContractFailure::Static(
+                    "partition cache state and rank-local identity ownership disagree",
+                ))),
             }
         })();
         let phase = crate::DistributedExecutionPhase::PromptCacheSavePreflight;
@@ -6164,19 +6712,23 @@ where
         };
 
         let mut transaction = local_descriptor.map(|descriptor| {
+            let copied_descriptor = self.cache_clone_descriptor(&descriptor)?;
             self.mechanisms
                 .prepare_prompt_cache_save(
                     &mut self.state,
                     destination,
-                    descriptor.clone(),
+                    copied_descriptor,
                     prefix_token_ids,
                     options,
                     context,
                 )
                 .map_err(ReplicatedTextSessionError::Mechanism)
                 .and_then(|transaction| {
-                    M::prepared_prompt_cache_manifest(&transaction)
-                        .validate_compatibility(&descriptor, prefix_token_ids)?;
+                    self.cache_validate_compatibility(
+                        M::prepared_prompt_cache_manifest(&transaction).as_ref(),
+                        &descriptor,
+                        prefix_token_ids,
+                    )?;
                     Ok(transaction)
                 })
         });
@@ -6240,22 +6792,6 @@ where
     }
 }
 
-fn validate_distributed_commit_restore<A, P, M>(
-    outcome: Option<DistributedCommitOutcome>,
-) -> Result<(), ReplicatedTextSessionError<A, P, M>>
-where
-    A: std::fmt::Display,
-    P: std::fmt::Display,
-    M: std::fmt::Display,
-{
-    if outcome.is_some_and(|outcome| outcome.epoch().next().is_none()) {
-        return Err(ReplicatedTextSessionError::Contract(
-            "distributed commit epoch overflow".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_architecture_geometry<A, B, S>(
     architecture: &A,
     selected: &SelectedReplicatedTextRealization,
@@ -6274,8 +6810,9 @@ where
         usize,
         bool,
     )>()?;
-    let graph = architecture.execution_graph()
-    .map_err(|error| metadata.architecture_error(error, ""))?;
+    let graph = architecture
+        .execution_graph()
+        .map_err(|error| metadata.architecture_error(error, ""))?;
     if !graph.matches(requirements.execution_graph()) {
         return Err(metadata.message(format_args!(
             "architecture execution graph differs from selection"
@@ -6305,8 +6842,9 @@ where
             )));
         }
     }
-    let layout = architecture.state_layout(metadata.context())
-    .map_err(|error| metadata.architecture_error(error, ""))?;
+    let layout = architecture
+        .state_layout(metadata.context())
+        .map_err(|error| metadata.architecture_error(error, ""))?;
     if &layout != selected.state().layout() {
         return Err(metadata.message(format_args!(
             "architecture state layout differs from selection"

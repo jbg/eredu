@@ -1,7 +1,9 @@
 //! Portable discovery and resource contracts for completed-token execution control.
 
 mod sampling;
-pub use sampling::{SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend};
+pub use sampling::{
+    SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
+};
 
 use crate::generation::GenerationCancellationToken;
 use serde::{Deserialize, Serialize};
@@ -20,10 +22,13 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
 
     /// Side-effect-free support facts for this exact loaded execution. This is
     /// a primitive report, not full generation-snapshot capability discovery.
-    fn native_text_state_support(runtime: &crate::ModelRuntime<Self>) -> ControlSupport<&'static str>;
+    fn native_text_state_support(
+        runtime: &crate::ModelRuntime<Self>,
+    ) -> ControlSupport<&'static str>;
 
     /// Estimates copying installed state (`None`) or a compatible saved slot.
-    /// Unknown costs remain explicit and must be rejected before copying.
+    /// Unknown costs remain explicit. Copy admission belongs to the complete
+    /// prepared continuation source and its reserved host/native producers.
     fn estimate_native_text_state(
         runtime: &crate::ModelRuntime<Self>,
         saved: Option<&Self::NativeTextState>,
@@ -40,20 +45,6 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
     ) -> Result<Option<u64>, Self::Error> {
         Ok(None)
     }
-
-    /// Captures independent state after portable resource reservation. Returns
-    /// only after successful exact native completion. Failure never changes
-    /// the logical source state; unresolved work remains retained and fenced.
-    fn capture_native_text_state(
-        runtime: &mut crate::ModelRuntime<Self>,
-    ) -> Result<Self::NativeTextState, Self::Error>;
-
-    /// Copies a reusable saved slot without installing it or replaying input.
-    /// The source remains unchanged even if allocation or completion fails.
-    fn copy_native_text_state(
-        runtime: &mut crate::ModelRuntime<Self>,
-        saved: &Self::NativeTextState,
-    ) -> Result<Self::NativeTextState, Self::Error>;
 
     /// Validates exact executable identity, geometry and safe native boundary
     /// before any state mutation. A different compatible-looking model fails.
@@ -120,7 +111,9 @@ impl<R> ControlSupport<R> {
     pub fn map_reason<T>(self, convert: impl FnOnce(R) -> T) -> ControlSupport<T> {
         match self {
             Self::Supported => ControlSupport::Supported,
-            Self::Unsupported { reason } => ControlSupport::Unsupported { reason: convert(reason) },
+            Self::Unsupported { reason } => ControlSupport::Unsupported {
+                reason: convert(reason),
+            },
         }
     }
 }
@@ -192,7 +185,9 @@ pub struct GenerationControlHandle {
 }
 
 impl Default for GenerationControlHandle {
-    fn default() -> Self { Self::new_retained(crate::HostPreparationAuthority::unmanaged()) }
+    fn default() -> Self {
+        Self::new_retained(crate::HostPreparationAuthority::unmanaged())
+    }
 }
 impl GenerationControlHandle {
     /// Exact fresh pause/cancellation cells and constructor controls, before
@@ -206,8 +201,10 @@ impl GenerationControlHandle {
     /// The caller pays `construction_bytes` before this operation. Both kinds of
     /// escaping alias retain that same destination authority.
     pub fn new_retained(host: crate::HostPreparationAuthority) -> Self {
-        Self { pause: crate::generation::ControlFlag::new(host.clone()),
-            cancellation: GenerationCancellationToken::new_retained(host) }
+        Self {
+            pause: crate::generation::ControlFlag::new(host.clone()),
+            cancellation: GenerationCancellationToken::new_retained(host),
+        }
     }
     /// Creates a handle using the ordinary caller's cancellation token.
     pub fn new(cancellation: GenerationCancellationToken) -> Self {

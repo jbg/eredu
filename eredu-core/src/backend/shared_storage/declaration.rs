@@ -1,8 +1,8 @@
 //! Immutable declaration sources with the shared accounting/retirement worker.
 use super::{
-    ErasedSharedStorageOwner, SharedStorageAttachmentError, SharedStorageCustody,
-    SharedStorageDomain, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
-    HostPreparationAuthority,
+    ErasedSharedStorageOwner, HostPreparationAuthority, SharedStorageAccountingId,
+    SharedStorageAttachmentError, SharedStorageCustody, SharedStorageIdentity, SharedStorageOwner,
+    SharedStorageRetirement,
 };
 use std::{fmt, sync::Arc};
 
@@ -59,14 +59,21 @@ fn capacity<T: ControllerDeclarationData>(owner: &ErasedSharedStorageOwner) -> O
         .owned_capacity_bytes()
 }
 fn admission<T: ControllerDeclarationData>(owner: &ErasedSharedStorageOwner) -> Option<u64> {
-    owner.downcast_ref::<Inner<T>>().expect("closed declaration type")
-        .value.admission_bytes()
+    owner
+        .downcast_ref::<Inner<T>>()
+        .expect("closed declaration type")
+        .value
+        .admission_bytes()
 }
 fn retains_funding<T: ControllerDeclarationData>(
-    owner: &ErasedSharedStorageOwner, funding: &super::super::HostMetadataFunding,
+    owner: &ErasedSharedStorageOwner,
+    funding: &super::super::HostMetadataFunding,
 ) -> bool {
-    owner.downcast_ref::<Inner<T>>().expect("closed declaration type")
-        .authority.is_funded_by(funding)
+    owner
+        .downcast_ref::<Inner<T>>()
+        .expect("closed declaration type")
+        .authority
+        .is_funded_by(funding)
 }
 /// Shared immutable declaration data with exact identity and attached storage
 /// accounting. Payload destruction precedes custody on every typed/erased exit.
@@ -86,8 +93,14 @@ impl SharedControllerDeclaration {
     pub fn source_shell_bytes<T: ControllerDeclarationData>() -> Option<usize> {
         use std::{alloc::Layout, sync::atomic::AtomicUsize};
         let header = Layout::new::<[AtomicUsize; 2]>();
-        let owner = header.extend(Layout::new::<Inner<T>>()).ok()?.0.pad_to_align();
-        owner.size().checked_add(SharedStorageIdentity::source_shell_bytes()?)
+        let owner = header
+            .extend(Layout::new::<Inner<T>>())
+            .ok()?
+            .0
+            .pad_to_align();
+        owner
+            .size()
+            .checked_add(SharedStorageIdentity::source_shell_bytes()?)
     }
 
     /// Actual shared shell and named move/erasure/custody constructor controls.
@@ -107,7 +120,9 @@ impl SharedControllerDeclaration {
             size_of::<HostPreparationAuthority>(),
             size_of::<Self>(),
         ];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Fixed borrowed type/identity/capacity inspection transports. This query
@@ -134,7 +149,10 @@ impl SharedControllerDeclaration {
     /// after the shared allocation, declaration and accounting custody.
     /// Callers must establish their applicable constructor permission first;
     /// this constructor neither adopts managed work nor certifies its producer.
-    pub fn new<T: ControllerDeclarationData>(value: T, authority: HostPreparationAuthority) -> Self {
+    pub fn new<T: ControllerDeclarationData>(
+        value: T,
+        authority: HostPreparationAuthority,
+    ) -> Self {
         Self {
             owner: SharedStorageOwner::new(Inner {
                 value,
@@ -176,16 +194,32 @@ impl SharedControllerDeclaration {
     pub fn retains_funding(&self, funding: &super::super::HostMetadataFunding) -> bool {
         (self.retains_funding)(&self.owner, funding)
     }
-    pub(super) fn has_accounting_custody(&self, domain: &SharedStorageDomain)
-        -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {
+    pub(super) fn has_accounting_custody(
+        &self,
+        domain: &SharedStorageAccountingId,
+    ) -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {
         (self.custody)(&self.owner).has_accounting_custody(domain)
     }
+    /// Attaches a concrete owner after admitting its prospective node layout.
+    /// Reuse preserves the same closed owner; a different owner type rejects.
+    pub fn try_attach_owned_prepared<T: super::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            super::SharedStorageAttachmentLayout,
+        ) -> Result<super::SharedStorageOwner<T>, E>,
+    ) -> Result<super::SharedStorageOwner<T>, SharedStorageAttachmentError<E>> {
+        (self.custody)(&self.owner)
+            .attachments
+            .try_attach_owned_nonblocking(owner, acquire)
+    }
+
     /// Same closed accounting attachment protocol as filters and byte sources.
     /// Providers must retain no declaration/payload alias; attached custody
     /// outlives payloads, and provider callbacks run under the custody lock.
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         (self.custody)(&self.owner).try_attach(domain, acquire)

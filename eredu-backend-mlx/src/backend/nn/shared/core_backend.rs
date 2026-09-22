@@ -119,6 +119,8 @@ impl ParameterBackend for MlxNeuralBackend {
 }
 
 impl NeuralBackend for MlxNeuralBackend {
+    type ParameterPreparation<'a> =
+        crate::backend::runtime::execution::generic::MlxParameterPreparation<'a>;
     const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
         eredu_nn::NeuralOperatorCapabilities::ALL;
 
@@ -462,10 +464,13 @@ impl NeuralBackend for MlxNeuralBackend {
             up = compute(safemlx::ops::clip(up, (-bound, bound), context))?;
         }
         if policy.up_offset() != 0.0 {
-            up = compute(up.add(
-                Array::try_from_f32(policy.up_offset()).map_err(ComputeError::backend_retained_source)?,
-                context,
-            ))?;
+            up = compute(
+                up.add(
+                    Array::try_from_f32(policy.up_offset())
+                        .map_err(ComputeError::backend_retained_source)?,
+                    context,
+                ),
+            )?;
         }
         let gate = match policy.activation() {
             eredu_nn::GatedProductActivation::Silu if policy.sigmoid_multiplier() == 1.0 => {
@@ -597,10 +602,13 @@ impl NeuralBackend for MlxNeuralBackend {
             i64::from(input.key_offset) + i64::from(key_len),
             context,
         ))?;
-        let scaled = compute(relative.queries.multiply(
-            Array::try_from_f32(1.0 / dimensions as f32).map_err(ComputeError::backend_retained_source)?,
-            context,
-        ))?;
+        let scaled = compute(
+            relative.queries.multiply(
+                Array::try_from_f32(1.0 / dimensions as f32)
+                    .map_err(ComputeError::backend_retained_source)?,
+                context,
+            ),
+        )?;
         let scores = compute(matmul(
             &scaled,
             &compute(keys.swap_axes(-1, -2, context))?,
@@ -610,7 +618,8 @@ impl NeuralBackend for MlxNeuralBackend {
         let scores = compute(r#where(
             &valid,
             scores,
-            Array::try_from_f32(f32::NEG_INFINITY).map_err(ComputeError::backend_retained_source)?,
+            Array::try_from_f32(f32::NEG_INFINITY)
+                .map_err(ComputeError::backend_retained_source)?,
             context,
         ))?;
         let probabilities = compute(softmax_axis(scores, -1, true, context))?;
@@ -841,7 +850,7 @@ impl NeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        linear.forward_observed_input(input,Some(parallel),context,None)
+        linear.forward_observed_input(input, Some(parallel), context, None)
     }
 
     fn row_parallel_linear_with_input_observer(
@@ -866,9 +875,10 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxEmbedding, ComputeError> {
         range.validate_global_rows(spec.vocabulary)?;
-        let global =
-            i32::try_from(range.global_vocabulary).map_err(ComputeError::backend_retained_source)?;
-        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend_retained_source)?;
+        let global = i32::try_from(range.global_vocabulary)
+            .map_err(ComputeError::backend_retained_source)?;
+        let local =
+            i32::try_from(range.local.len()).map_err(ComputeError::backend_retained_source)?;
         let module = compute(common::linear::unloaded_embedding(
             local,
             spec.dimensions,
@@ -890,7 +900,8 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxLinear, ComputeError> {
         range.validate_global_rows(spec.output)?;
-        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend_retained_source)?;
+        let local =
+            i32::try_from(range.local.len()).map_err(ComputeError::backend_retained_source)?;
         let module = compute(common::linear::PhysicalLinear::unloaded(
             spec.input,
             local,
@@ -913,7 +924,7 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        parallel_lookup::lookup(embedding,input,policy,parallel,context)
+        parallel_lookup::lookup(embedding, input, policy, parallel, context)
     }
 
     fn vocabulary_parallel_project(
@@ -938,9 +949,10 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
             .vocabulary_range
             .clone()
             .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
-        let widths = parallel_gather::widths(&range,parallel)?;
+        let widths = parallel_gather::widths(&range, parallel)?;
         let local = linear.forward_with_input_observer(input, context, observer)?;
-        parallel_gather::run(local.as_array(),&widths,parallel,context).map(MlxTensor::from_array)
+        parallel_gather::run(local.as_array(), &widths, parallel, context)
+            .map(MlxTensor::from_array)
     }
 
     fn vocabulary_parallel_embedding_project(
@@ -965,9 +977,10 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
             .vocabulary_range
             .clone()
             .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let widths = parallel_gather::widths(&range,parallel)?;
+        let widths = parallel_gather::widths(&range, parallel)?;
         let local = embedding.as_linear_with_input_observer(input, context, observer)?;
-        parallel_gather::run(local.as_array(),&widths,parallel,context).map(MlxTensor::from_array)
+        parallel_gather::run(local.as_array(), &widths, parallel, context)
+            .map(MlxTensor::from_array)
     }
 
     fn sum_parallel(
@@ -975,6 +988,8 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        parallel.sum_model(value.as_array(),context).map(MlxTensor::from_array)
+        parallel
+            .sum_model(value.as_array(), context)
+            .map(MlxTensor::from_array)
     }
 }

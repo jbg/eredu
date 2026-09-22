@@ -6,6 +6,13 @@ use safemlx::{
     PreparedArrayClone, error::Exception,
 };
 
+#[path = "host_promotion/commit.rs"]
+mod commit;
+pub(crate) use commit::PreparedHostPromotion;
+#[path = "host_promotion/ordinary.rs"]
+mod ordinary;
+pub(crate) use ordinary::{PreparedHostReturn, PreparedOrdinaryCacheHostPromotion};
+
 #[path = "host_promotion/return_disk.rs"]
 mod return_disk;
 #[path = "host_promotion/return_host.rs"]
@@ -197,7 +204,9 @@ pub(super) fn dtype_matches(dtype: Dtype, name: &str) -> bool {
     )
 }
 impl PreparedCacheHostPromotion {
-    pub(crate) fn reclaim_replaced_device(&mut self) { self.device_retirement.reclaim(); }
+    pub(crate) fn reclaim_replaced_device(&mut self) {
+        self.device_retirement.reclaim();
+    }
 
     fn validate_host_source(&self, proof: &OriginalPagedScanSource<'_>) -> Result<(), Exception> {
         match (&self.stored_source, &self.read_source) {
@@ -239,27 +248,7 @@ impl PreparedCacheHostPromotion {
         self.pin.acquire()
     }
     fn validate_record(&self, record: &CacheBlockRecord) -> Result<(), CacheSourceError> {
-        if !matches!(
-            record.physical.phase(),
-            CacheStoragePhase::HostUnbacked | CacheStoragePhase::HostBacked
-        ) || record.physical.id() != &self.id
-        {
-            return Err(CacheSourceError::Identity);
-        }
-        let actual = record.host_block().ok_or(CacheSourceError::Identity)?;
-        let a = actual.buffers();
-        let b = self.host.buffers();
-        if !std::ptr::eq(a[0], b[0]) || !std::ptr::eq(a[1], b[1]) {
-            return Err(CacheSourceError::Identity);
-        }
-        for (index, descriptor) in self.descriptors.iter().enumerate() {
-            if record.shapes[index].as_slice() != descriptor.shape()
-                || !dtype_matches(descriptor.dtype(), &record.dtypes[index])
-            {
-                return Err(CacheSourceError::Geometry);
-            }
-        }
-        Ok(())
+        commit::validate_record(record, &self.id, &self.host, &self.descriptors)
     }
     /// Actual native transfer uses the existing original copy worker. No ordinary
     /// manager lock, reaping, transfer Vec or fallback execution occurs here.
@@ -332,7 +321,9 @@ impl PreparedCacheHostPromotion {
             {
                 return Err(proof.error(CacheSourceError::Geometry));
             }
-            roots.retire_completed(array).map_err(|cause| proof.error(cause))?;
+            roots
+                .retire_completed(array)
+                .map_err(|cause| proof.error(cause))?;
             self.canonical[index] =
                 Some(self.aliases[index].fill_in_original_scope(array, proof.observer())?);
         }
@@ -347,90 +338,24 @@ impl PreparedCacheHostPromotion {
         if !self.completed || self.published {
             return Err(proof.error(CacheSourceError::Identity));
         }
-        let mut state = self.manager.inner.state.try_lock().map_err(|e| {
-            proof.error(match e {
-                TryLockError::WouldBlock => CacheSourceError::Busy,
-                TryLockError::Poisoned(_) => CacheSourceError::Poisoned,
-            })
-        })?;
-        proof.validate_manager(&self.manager, state.generation)?;
-        if !self.manager.borrowed_storage_complete(&state) || state.generation != self.generation {
-            return Err(proof.error(CacheSourceError::Identity));
-        }
-        self.validate_record(
-            state
-                .blocks
-                .get(&self.id)
-                .ok_or_else(|| proof.error(CacheSourceError::Identity))?,
-        )
-        .map_err(|e| proof.error(e))?;
-        reporting::update_report_totals_prepared(&mut state).map_err(|e| proof.error(e))?;
-        let bytes = state.blocks.get(&self.id).expect("validated record").bytes;
-        if state
-            .telemetry
-            .report
-            .current_device_bytes
-            .checked_add(bytes)
-            .is_none_or(|n| n > state.device_budget_bytes)
-        {
-            return Err(proof.error(CacheSourceError::PromotionRequired));
-        }
-        let first = self.canonical[0].take().expect("completed first alias");
-        let second = self.canonical[1].take().expect("completed second alias");
-        let arrays = pair(self.id.representation, first, second);
-        // All phase preconditions were checked under this same guard. The
-        // shared transition cannot lose a device owner to a fallible mismatch.
-        let promotion = state
-            .blocks
-            .get_mut(&self.id)
-            .expect("validated record")
-            .physical
-            .promote_host(arrays)
-            .expect("same locked stable host phase");
-        if let Err(cause) = reporting::update_report_totals_prepared_replacement(
-            &mut state,
-            self.reservation.as_mut().expect("unpublished reservation"),
-            &self.manager.inner.pool_membership,
-        ) {
-            let arrays = state
-                .blocks
-                .get_mut(&self.id)
-                .expect("same locked record")
-                .physical
-                .restore_host(promotion)
-                .expect("same locked promotion");
-            self.canonical = match arrays {
-                CacheBlockArrays::KeyValue { keys, values } => [Some(keys), Some(values)],
-                CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
-                    [Some(latent), Some(rotary_key)]
-                }
-            };
-            // Canonical storage is restored before the same ordinary report
-            // repair; failed pool publication did not change aggregate usage.
-            reporting::update_report_totals(&mut state);
-            drop(state);
-            return Err(proof.error(cause));
-        }
-        // This closed source exists only after a real file read completed and
-        // committed its exact Host buffers. The same demand receipt must retain
-        // that origin rather than classifying every shared Host->Device leg as
-        // a Host hit. run/published remain one-use, so a later resident demand
-        // cannot increment the disk count again.
-        acquisition::record_host_promotion(
-            &mut state,
+        commit::publish(
+            &self.manager,
+            proof,
             &self.id,
+            self.generation,
+            &self.host,
+            &self.descriptors,
+            &mut self.canonical,
+            self.reservation.as_mut().expect("unpublished reservation"),
             self.read_source.is_some(),
-            bytes,
-            started.elapsed(),
-        );
+            started,
+        )?;
         self.published = true;
-        drop(state);
-        // Exact host aliases remain in self.host, now paid by the reservation.
-        drop(promotion);
         Ok(())
     }
     pub(crate) fn control_bytes() -> Option<usize> {
         let frames = [
+            commit::control_bytes::<OriginalPagedScanSource<'_>>()?,
             super::host_demotion::commit_control_bytes()?,
             return_disk::control_bytes()?,
             size_of::<crate::backend::nn::workspace::OriginalPagedHostReturn<'_, '_>>(),

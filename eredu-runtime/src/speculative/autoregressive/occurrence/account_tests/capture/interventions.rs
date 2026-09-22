@@ -66,12 +66,12 @@ fn numerical_intervention_source_and_aborted_outcomes_preserve_identity_spending
             .workspace_geometry(2, pass, NonZeroU64::new(1).unwrap())
             .unwrap(),
     );
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let request = OriginalSpeculativeRequest::prepare(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        1 << 24,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
@@ -106,10 +106,10 @@ fn numerical_intervention_source_and_aborted_outcomes_preserve_identity_spending
         Err(InterventionSourceError::Identity)
     );
     let copy = PreparedInterventionPlanCopy::inspect(&caller).unwrap();
-    let required = WorkingMemoryPool::intervention_source_required_bytes(&copy).unwrap();
-    let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+    let required = MemoryLedger::intervention_source_required_bytes(&copy).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(required - 1, 0).unwrap();
     assert!(short.compile_intervention_source(copy).is_err());
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     let edit = pool
         .compile_intervention_source(PreparedInterventionPlanCopy::inspect(&caller).unwrap())
         .unwrap();
@@ -119,16 +119,22 @@ fn numerical_intervention_source_and_aborted_outcomes_preserve_identity_spending
         edit.plan().admission().plan().operations.as_ptr(),
         caller.plan().operations.as_ptr()
     );
-    let foreign_pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let foreign_pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let foreign = foreign_pool
         .compile_intervention_source(PreparedInterventionPlanCopy::inspect(&caller).unwrap())
         .unwrap();
     let foreign_host = host(&source, 1).with_interventions(&foreign).unwrap();
-    let requirements =
-        SpeculativeNumericalRequirements::new(program(1), Some(0), Some(0), Some(0), Some(0))
-            .unwrap()
-            .with_capture_destination(&foreign_host)
-            .unwrap();
+    let requirements = SpeculativeNumericalRequirements::new(
+        program(1),
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(0),
+        std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+    )
+    .unwrap()
+    .with_capture_destination(&foreign_host)
+    .unwrap();
     let failed = request
         .reserve_numerical(requirements, &[SpeculativeNumericalSource::Model(&model)])
         .unwrap_err();
@@ -139,13 +145,19 @@ fn numerical_intervention_source_and_aborted_outcomes_preserve_identity_spending
     drop(failed);
     drop(foreign_host);
     drop(foreign);
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.payload_used_bytes().unwrap(), 0);
     let prepared = host(&source, 1).with_interventions(&edit).unwrap();
-    let requirements =
-        SpeculativeNumericalRequirements::new(program(1), Some(0), Some(0), Some(0), Some(0))
-            .unwrap()
-            .with_capture_destination(&prepared)
-            .unwrap();
+    let requirements = SpeculativeNumericalRequirements::new(
+        program(1),
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(0),
+        std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+    )
+    .unwrap()
+    .with_capture_destination(&prepared)
+    .unwrap();
     let phase = request
         .reserve_numerical(requirements, &[SpeculativeNumericalSource::Model(&model)])
         .unwrap();
@@ -158,11 +170,9 @@ fn numerical_intervention_source_and_aborted_outcomes_preserve_identity_spending
     let mut backend = HostBackend::default();
     // No native edit producer is installed yet. A mere observation must never
     // certify the pending edit, but the real aborted evidence remains deliverable.
-    assert!(
-        invocation
-            .observe(&mut backend, &[1.0, 2.0, 3.0, 4.0])
-            .is_err()
-    );
+    assert!(invocation
+        .observe(&mut backend, &[1.0, 2.0, 3.0, 4.0])
+        .is_err());
     let escaped = invocation.take_failed_evidence().unwrap().unwrap();
     assert_eq!(escaped.as_ref().outcome, CaptureStepOutcome::Aborted);
     let record = &escaped.as_ref().interventions[0];
@@ -178,9 +188,9 @@ fn numerical_intervention_source_and_aborted_outcomes_preserve_identity_spending
     assert_eq!(backend.calls, 1);
     request.close().unwrap();
     drop((invocation, budget, model, role, request, edit, source));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 struct EditBackend<'a> {
@@ -275,12 +285,12 @@ fn numerical_intervention_callback_preserves_original_capture_and_failed_spendin
             .workspace_geometry(2, pass, NonZeroU64::new(1).unwrap())
             .unwrap(),
     );
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let request = OriginalSpeculativeRequest::prepare(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        1 << 24,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
@@ -298,11 +308,17 @@ fn numerical_intervention_callback_preserves_original_capture_and_failed_spendin
         .unwrap();
     let invoke = || {
         let host = host(&source, 1).with_interventions(&edit).unwrap();
-        let quote =
-            SpeculativeNumericalRequirements::new(program(1), Some(0), Some(0), Some(0), Some(0))
-                .unwrap()
-                .with_capture_destination(&host)
-                .unwrap();
+        let quote = SpeculativeNumericalRequirements::new(
+            program(1),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+        )
+        .unwrap()
+        .with_capture_destination(&host)
+        .unwrap();
         request
             .reserve_numerical(quote, &[SpeculativeNumericalSource::Model(&model)])
             .unwrap()
@@ -384,9 +400,9 @@ fn numerical_intervention_callback_preserves_original_capture_and_failed_spendin
         edit,
         source,
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop((escaped, failed));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod evidence;

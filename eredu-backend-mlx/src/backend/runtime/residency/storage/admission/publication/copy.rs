@@ -76,7 +76,7 @@ impl CopyPublicationLayout {
             size_of::<Option<&Arc<ImmutableHostTransferBuffer>>>(),
             size_of::<Result<(), Error>>(),
             size_of::<std::slice::Iter<'_, Arc<ImmutableHostTransferBuffer>>>(),
-            Layout::array::<(StorageIdentity, u64)>(rows)
+            Layout::array::<(StorageIdentity, u64, Arc<eredu_core::MemoryPlacement>)>(rows)
                 .map_err(|_| WorkingMemoryError::Overflow)?
                 .size(),
             usize::try_from(nested)
@@ -179,7 +179,7 @@ impl CopyPublicationLayout {
 
 pub(crate) struct PendingCopyPublication {
     inventory: Option<RetainedStorage>,
-    entries: Vec<(StorageIdentity, u64)>,
+    entries: Vec<(StorageIdentity, u64, Arc<eredu_core::MemoryPlacement>)>,
     host_sources: Vec<Arc<ImmutableHostTransferBuffer>>,
     attempt: PreparedWorkspaceCopyPublication<StorageIdentity>,
     failed_attachment: Option<PreparedAllocationOwner<Registration>>,
@@ -243,7 +243,7 @@ impl PendingCopyPublication {
         inventory
             .validate_snapshot_publication(scope.pool())
             .map_err(Error::PrefillControl)?;
-        if inventory.byte_bound()?.is_none()
+        if inventory.validate_inventory_completeness().is_err()
             || inventory.metadata_entries().next().is_some()
             || inventory.capture_entries().next().is_some()
             || inventory.source_capacities().next().is_some()
@@ -266,6 +266,7 @@ impl PendingCopyPublication {
                 &mut self.entries,
                 StorageIdentity::Native(*identity),
                 *bytes,
+                placement_handle(&witness.allocation(), scope.pool())?,
             )?;
         }
         if inventory.host_entries().count() != self.host_sources.len() {
@@ -293,21 +294,23 @@ impl PendingCopyPublication {
                 &mut self.entries,
                 StorageIdentity::Native(*identity),
                 *bytes,
+                placement_handle(&descriptor.allocation(), scope.pool())?,
             )?;
         }
         for (identity, (bytes, token)) in inventory.slot_entries() {
             token
-                .prepare_copy_attachment(scope.pool().shared_storage_domain())
+                .prepare_copy_attachment(scope.pool().shared_storage_accounting_id())
                 .map_err(Error::PrefillControl)?;
             push(
                 &mut self.entries,
                 StorageIdentity::HostMetadata(identity.registry_key().clone()),
                 *bytes,
+                scope.pool().host_placement_handle(),
             )?;
         }
-        for (key, bytes) in &self.entries {
+        for (key, bytes, placement) in &self.entries {
             self.attempt
-                .push(key.clone(), *bytes)
+                .push(key.clone(), *bytes, Arc::clone(placement))
                 .map_err(Error::PrefillControl)?;
         }
         self.attempt.publish(scope).map_err(Error::PrefillControl)?;
@@ -315,7 +318,7 @@ impl PendingCopyPublication {
             let index = self
                 .entries
                 .iter()
-                .position(|(key, _)| key == &StorageIdentity::Native(*identity))
+                .position(|(key, _, _)| key == &StorageIdentity::Native(*identity))
                 .expect("prepared native row");
             let registration = self
                 .attempt
@@ -347,7 +350,7 @@ impl PendingCopyPublication {
             let index = self
                 .entries
                 .iter()
-                .position(|(key, _)| key == &StorageIdentity::Native(*identity))
+                .position(|(key, _, _)| key == &StorageIdentity::Native(*identity))
                 .expect("prepared completed Host row");
             let registration = self
                 .attempt
@@ -369,12 +372,12 @@ impl PendingCopyPublication {
             |key| {
                 self.entries
                     .iter()
-                    .position(|(entry, _)| entry == key)
+                    .position(|(entry, _, _)| entry == key)
                     .and_then(|index| self.attempt.input(index).cloned())
             },
             &UnquotedOriginalSlotSources::default(),
             None,
-            scope.pool().shared_storage_domain(),
+            scope.pool().shared_storage_accounting_id(),
             false,
             true,
         )?;
@@ -389,14 +392,15 @@ impl PendingCopyPublication {
             UnquotedOriginalSlotSources::default(),
             None,
             Some(self._host.clone()),
-            scope.pool().shared_storage_domain(),
+            scope.pool().shared_storage_accounting_id(),
         ))
     }
 }
 fn push(
-    entries: &mut Vec<(StorageIdentity, u64)>,
+    entries: &mut Vec<(StorageIdentity, u64, Arc<eredu_core::MemoryPlacement>)>,
     key: StorageIdentity,
     bytes: u64,
+    placement: Arc<eredu_core::MemoryPlacement>,
 ) -> Result<(), Error> {
     if entries.len() == entries.capacity() {
         return Err(Error::PrefillControl(
@@ -407,7 +411,7 @@ fn push(
             },
         ));
     }
-    entries.push((key, bytes));
+    entries.push((key, bytes, placement));
     Ok(())
 }
 fn buffer_error(cause: safemlx::OriginalBufferCause) -> Error {
@@ -425,4 +429,12 @@ pub(crate) fn retain_failure(cause: Error, host: &HostPreparationAuthority) -> E
         cause,
         _host: host.clone(),
     }))
+}
+
+fn placement_handle(
+    info: &safemlx::AllocationInfo,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
+) -> Result<Arc<eredu_core::MemoryPlacement>, Error> {
+    crate::backend::managed_memory::allocation_placement_handle(info, pool)
+        .map_err(|error| Error::Other(Box::new(error)))
 }

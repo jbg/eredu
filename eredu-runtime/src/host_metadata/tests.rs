@@ -58,13 +58,13 @@ struct Charge {
     used: Arc<AtomicU64>,
     bytes: u64,
     _identity: HostMetadataIdentity,
-    _domain: SharedStorageDomain,
+    _domain: SharedStorageAccountingId,
 }
 
 impl Charge {
     fn acquire(
         source: &SharedHostMetadata,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         used: &Arc<AtomicU64>,
     ) -> Box<dyn Send + Sync> {
         let bytes = source.capacity_bytes().expect("closed fixture capacity");
@@ -86,7 +86,7 @@ impl Drop for Charge {
 
 fn attach(
     source: &SharedHostMetadata,
-    domain: &SharedStorageDomain,
+    domain: &SharedStorageAccountingId,
     used: &Arc<AtomicU64>,
 ) -> bool {
     source
@@ -103,8 +103,8 @@ fn earlier_aliases_retain_both_domain_attachments_until_the_final_owner() {
         let before_attachment = earlier.clone();
         let capacity = source.capacity_bytes().unwrap();
         assert!(capacity > 97);
-        let first = SharedStorageDomain::default();
-        let second = SharedStorageDomain::default();
+        let first = SharedStorageAccountingId::default();
+        let second = SharedStorageAccountingId::default();
         let used = Arc::new(AtomicU64::new(0));
         assert!(attach(&source, &first, &used));
         assert!(!earlier
@@ -164,7 +164,7 @@ fn identity_keys_do_not_retain_payload_or_registration_and_distinguish_equal_val
         ]);
         assert_eq!((ordered.len(), hashed.len()), (2, 2));
         let used = Arc::new(AtomicU64::new(0));
-        let domain = SharedStorageDomain::default();
+        let domain = SharedStorageAccountingId::default();
         attach(&source, &domain, &used);
         assert!(used.load(AtomicOrdering::SeqCst) > 0);
         drop(source);
@@ -179,7 +179,7 @@ fn identity_keys_do_not_retain_payload_or_registration_and_distinguish_equal_val
 #[test]
 fn concurrent_attachments_acquire_once_per_domain_for_each_closed_owner() {
     for source in [layout(), input()] {
-        let domain = SharedStorageDomain::default();
+        let domain = SharedStorageAccountingId::default();
         let barrier = Barrier::new(8);
         let used = Arc::new(AtomicU64::new(0));
         let acquired = AtomicUsize::new(0);
@@ -216,7 +216,7 @@ fn concurrent_attachments_acquire_once_per_domain_for_each_closed_owner() {
 #[derive(Debug)]
 struct Rejected {
     source: SharedHostMetadata,
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
     dropped: Arc<AtomicBool>,
 }
 
@@ -243,8 +243,8 @@ impl Drop for Rejected {
 #[test]
 fn provider_failure_preserves_earlier_charge_and_its_error_drops_after_unlock() {
     for source in [layout(), input()] {
-        let first = SharedStorageDomain::default();
-        let rejected = SharedStorageDomain::default();
+        let first = SharedStorageAccountingId::default();
+        let rejected = SharedStorageAccountingId::default();
         let used = Arc::new(AtomicU64::new(0));
         attach(&source, &first, &used);
         let dropped = Arc::new(AtomicBool::new(false));
@@ -280,8 +280,8 @@ fn provider_failure_preserves_earlier_charge_and_its_error_drops_after_unlock() 
 fn provider_panic_keeps_old_attachments_and_poison_blocks_every_later_provider() {
     for source in [layout(), input()] {
         let alias = source.clone();
-        let first = SharedStorageDomain::default();
-        let second = SharedStorageDomain::default();
+        let first = SharedStorageAccountingId::default();
+        let second = SharedStorageAccountingId::default();
         let used = Arc::new(AtomicU64::new(0));
         attach(&source, &first, &used);
         let capacity = source.capacity_bytes().unwrap();
@@ -306,7 +306,7 @@ fn provider_panic_keeps_old_attachments_and_poison_blocks_every_later_provider()
 
 struct AttachOnDrop {
     other: SharedHostMetadata,
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
     completed: Arc<AtomicBool>,
 }
 
@@ -326,10 +326,10 @@ impl Drop for AttachOnDrop {
 fn final_attachment_retirement_can_reenter_another_live_metadata_owner() {
     let source = layout();
     let other = input();
-    let target_domain = SharedStorageDomain::default();
+    let target_domain = SharedStorageAccountingId::default();
     let completed = Arc::new(AtomicBool::new(false));
     source
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<_, Infallible>(Box::new(AttachOnDrop {
                 other: other.clone(),
                 domain: target_domain.clone(),
@@ -342,4 +342,65 @@ fn final_attachment_retirement_can_reenter_another_live_metadata_owner() {
     assert!(!other
         .try_attach::<Infallible>(&target_domain, || panic!("already attached"))
         .unwrap());
+}
+
+struct PaidAttachment {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+impl eredu_core::SharedStorageRetirement for PaidAttachment {
+    fn retire(self: Arc<Self>) {
+        drop(Arc::into_inner(self));
+    }
+}
+impl Drop for PaidAttachment {
+    fn drop(&mut self) {
+        assert!(self.used.fetch_sub(self.bytes, AtomicOrdering::SeqCst) >= self.bytes);
+    }
+}
+
+#[test]
+fn paid_nodes_admit_before_owner_construction_and_follow_earlier_metadata_aliases() {
+    for source in [layout(), input()] {
+        let alias = source.clone();
+        let owner = SharedStorageAccountingId::default();
+        let used = Arc::new(AtomicUsize::new(0));
+        let mut required = 0;
+        let rejection = source.try_attach_owned_prepared::<PaidAttachment, _>(&owner, |layout| {
+            required = layout.requested_bytes();
+            Err("insufficient constructor allowance")
+        });
+        assert!(matches!(
+            rejection,
+            Err(SharedStorageAttachmentError::Provider(
+                "insufficient constructor allowance"
+            ))
+        ));
+        assert!(required > 0);
+        assert_eq!(used.load(AtomicOrdering::SeqCst), 0);
+        assert!(source
+            .try_attach_owned_prepared(&owner, |layout| {
+                assert_eq!(layout.requested_bytes(), required);
+                used.fetch_add(required, AtomicOrdering::SeqCst);
+                Ok::<_, &str>(eredu_core::SharedStorageOwner::new(PaidAttachment {
+                    used: used.clone(),
+                    bytes: required,
+                }))
+            })
+            .unwrap());
+        assert!(!alias
+            .try_attach_owned_prepared::<PaidAttachment, Infallible>(&owner, |_| panic!(
+                "same owner must reuse its paid node"
+            ))
+            .unwrap());
+        assert!(!alias
+            .try_attach::<Infallible>(&owner, || panic!(
+                "ordinary alias must reuse existing accounting custody"
+            ))
+            .unwrap());
+        drop(source);
+        assert_eq!(used.load(AtomicOrdering::SeqCst), required);
+        drop(alias);
+        assert_eq!(used.load(AtomicOrdering::SeqCst), 0);
+    }
 }

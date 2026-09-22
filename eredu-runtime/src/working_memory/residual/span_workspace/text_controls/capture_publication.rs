@@ -1,8 +1,8 @@
 //! Consume the exact accepted quote into unready source custody, then join S+C.
 use super::*;
 use crate::working_memory::{
-    storage::capture_publication::{CaptureSourceOwner, PreparedCaptureStorage},
     CapturePlanPublicationCause,
+    storage::capture_publication::{CaptureSourceOwner, PreparedCaptureStorage},
 };
 
 /// One move-only originally accepted publication attempt. No guard, span view,
@@ -143,7 +143,7 @@ impl<K: CapturePlanStorageKey> PendingCapturePlanPublication<K> {
                 return Err(FailedCapturePlanPublication {
                     cause,
                     _pending: self,
-                })
+                });
             }
         };
         let (span, prior) = self

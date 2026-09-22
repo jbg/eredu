@@ -1,13 +1,13 @@
 //! Borrowed sampling state for the shared prepared equation traversal.
 
 use eredu_core::{TextFilterWorkspace, TextGenerationConfig};
-use eredu_nn::{Error, workspace::WorkspaceContext};
+use eredu_nn::{workspace::WorkspaceContext, Error};
 use eredu_runtime::{
-    ConfiguredTextSampler,
     working_memory::{
-        SamplingWorkspaceObserver, SamplingWorkspaceReport, WorkspaceSamplingRandomState,
-        WorkspaceSamplingSource, quote_sampling_workspace_with_observer,
+        quote_sampling_workspace_with_observer, SamplingWorkspaceObserver, SamplingWorkspaceReport,
+        WorkspaceSamplingRandomState, WorkspaceSamplingSource,
     },
+    ConfiguredTextSampler,
 };
 
 /// Actual sampler policy and history borrowed alongside projected random state.
@@ -50,7 +50,7 @@ impl<'a> BorrowedTextSamplingWorkspace<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum TextSamplingInput<'a> {
     Configured(TextGenerationConfig, TextFilterWorkspace<'a>),
     Borrowed(BorrowedTextSamplingWorkspace<'a>),
@@ -66,7 +66,7 @@ impl TextSamplingInput<'_> {
     ) -> Result<SamplingWorkspaceReport, Error> {
         match self {
             Self::Configured(config, filter) => {
-                let sampler = ConfiguredTextSampler::from_config(config)
+                let sampler = ConfiguredTextSampler::from_config(config.clone())
                     .map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
                 // Equation quotation has finished its last report. The fresh
                 // key descriptor belongs to sampling construction, before the
@@ -108,6 +108,8 @@ pub(super) struct SamplingScores {
     layout: Option<eredu_nn::workspace::WorkspaceLayout>,
     capacity: Option<u64>,
     allocations: usize,
+    physical_domains: Option<eredu_core::DomainMemoryRequirements>,
+    physical_complete: bool,
 }
 impl Default for SamplingScores {
     fn default() -> Self {
@@ -115,6 +117,8 @@ impl Default for SamplingScores {
             layout: None,
             capacity: Some(0),
             allocations: 0,
+            physical_domains: None,
+            physical_complete: true,
         }
     }
 }
@@ -164,6 +168,31 @@ impl SamplingScores {
             .allocations
             .max(report.closing_storage.maximum_allocations);
         if uniform {
+            if self.physical_complete {
+                match context.complete_domain_report(std::slice::from_ref(scores))? {
+                    Some(physical) => {
+                        let current = physical
+                            .retained_state
+                            .as_ref()
+                            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)?;
+                        let metadata =
+                            eredu_runtime::working_memory::WorkspaceReportMetadata::new(context);
+                        self.physical_domains = Some(
+                            match &self.physical_domains {
+                                Some(previous) => {
+                                    metadata.combine_domain_requirements(previous, current, false)
+                                }
+                                None => metadata.clone_domain_requirements(current),
+                            }
+                            .map_err(|e| metadata.error(e))?,
+                        );
+                    }
+                    None => {
+                        self.physical_complete = false;
+                        self.physical_domains = None;
+                    }
+                }
+            }
             let backing = report.state.and_then(|state| state.retained_bytes);
             self.capacity = self
                 .capacity
@@ -172,9 +201,11 @@ impl SamplingScores {
             self.layout = Some(scores.layout().clone());
         }
         Ok(if exclude_borrowed {
-            report.residual.map_or(Some(report.closing_storage), |residual| {
-                residual.closing_storage
-            })
+            report
+                .residual
+                .map_or(Some(report.closing_storage), |residual| {
+                    residual.closing_storage
+                })
         } else {
             Some(report.closing_storage)
         })
@@ -198,7 +229,8 @@ impl SamplingScores {
                         })?,
                         backing_capacity_bytes: self.capacity,
                     }
-                    .with_backing_population(self.allocations),
+                    .with_backing_population(self.allocations)
+                    .with_physical_domains(self.physical_domains.as_ref()),
                     steps,
                     context,
                     observer,

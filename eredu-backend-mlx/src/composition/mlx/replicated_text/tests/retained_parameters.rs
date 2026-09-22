@@ -96,7 +96,8 @@ fn retained_target_parameters_track_replacements_without_loading_or_double_count
                         visit(&mut read);
                         Ok(())
                     },
-                    &stream
+                    &stream,
+                    None
                 )
                 .unwrap());
             let original = read.value.unwrap();
@@ -127,12 +128,11 @@ fn retained_target_parameters_track_replacements_without_loading_or_double_count
                 panic!("idle target parameters have settled backing: {label}: {before:?}")
             });
             assert!(before_bytes > 0);
-            assert!(target
-                .publish_parameter_replacements(
-                    &std::collections::BTreeMap::from([(key.to_owned(), replacement.clone())]),
-                    true
-                )
-                .unwrap());
+            crate::memory_fixture::publish_model_parameters(
+                target,
+                [(key.to_owned(), replacement.clone())],
+                true,
+            );
             let mut after = target.retained_target_module_storage().unwrap();
             let mut full_after = target.retained_target_storage().unwrap();
             assert_eq!(
@@ -160,12 +160,11 @@ fn retained_target_parameters_track_replacements_without_loading_or_double_count
                 Some(before_bytes + replacement_bytes),
                 "old snapshot retains the original owners"
             );
-            assert!(target
-                .publish_parameter_replacements(
-                    &std::collections::BTreeMap::from([(key.to_owned(), original)]),
-                    false
-                )
-                .unwrap());
+            crate::memory_fixture::publish_model_parameters(
+                target,
+                [(key.to_owned(), original)],
+                false,
+            );
             assert_eq!(
                 target
                     .retained_target_module_storage()

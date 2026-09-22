@@ -69,7 +69,7 @@ fn seed(session: &mut Session) -> *const i32 {
     drop(state);
     pointer
 }
-fn original_request(session: &Session) -> (WorkingMemoryPool, InferenceRequest) {
+fn original_request(session: &Session) -> (MemoryLedger, InferenceRequest) {
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 4,
@@ -78,7 +78,7 @@ fn original_request(session: &Session) -> (WorkingMemoryPool, InferenceRequest) 
         prefill_chunk_positions: 1,
         output: OutputDemand::LastPosition,
     };
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request = pool
         .reserve(
             session.inference_execution_identity(),
@@ -225,7 +225,9 @@ impl ActivationObserver<FakeTensor, Error> for Opening {
         r.events.push(Log::Open(c.chunk().input.start, values));
         self.epoch = Some(c.epoch());
         if self.fail_at == Some(c.chunk().input.start) {
-            return Err(Error::backend_retained_source(Original(self.identity.clone())));
+            return Err(Error::backend_retained_source(Original(
+                self.identity.clone(),
+            )));
         }
         Ok(None) // This view does not manufacture a bank, stamp or ticket.
     }
@@ -324,7 +326,7 @@ fn opening_precedes_source_under_guard_and_borrows_updated_cached_state() {
         .unwrap();
     scopes.settled();
     drop((observer, session, request));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn opening_callback_failure_prevents_next_preparation_and_bridge_keeps_cause() {
@@ -361,7 +363,7 @@ fn opening_callback_failure_prevents_next_preparation_and_bridge_keeps_cause() {
     assert_eq!(session.report().unwrap().state_report(), &[5]);
     scopes.settled();
     drop((observer, request, session));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn input_preparation_failure_after_opening_preserves_original_cause() {
@@ -391,7 +393,7 @@ fn input_preparation_failure_after_opening_preserves_original_cause() {
     assert_eq!(session.report().unwrap().state_report(), &[4]);
     scopes.settled();
     drop((observer, request, session));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn initial_cancellation_visits_no_opening_state_or_input() {
@@ -421,7 +423,7 @@ fn initial_cancellation_visits_no_opening_state_or_input() {
     assert_eq!(counters.snapshot().forward_calls, 0);
     scopes.settled();
     drop((observer, request, session));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 struct Legacy {
     inner: Opening,
@@ -507,7 +509,7 @@ fn old_retention_callback_remains_exact_with_default_or_opted_in_fallback() {
         assert_eq!(counters.snapshot().forward_calls, 3);
         scopes.settled();
         drop((observer, request, session));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -527,7 +529,9 @@ fn whole_state_inventory_uses_actual_local_slots_independently_of_global_unit_ad
         ))
     })
     .unwrap();
-    let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder").unwrap().into_owned();
+    let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder")
+        .unwrap()
+        .into_owned();
     let units = ExecutionUnitLayout::new(&graph, [7]).unwrap();
     // Existing per-unit retention receives a local policy ordinal alongside a
     // global semantic address. Whole-state opening access needs neither guess.

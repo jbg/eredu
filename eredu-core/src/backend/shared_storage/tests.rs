@@ -62,24 +62,30 @@ fn source_authority_survives_byte_aliases_but_detached_value_keys_need_no_storag
 #[test]
 fn concurrent_source_identities_do_not_repeat_after_payload_retirement() {
     let keys = std::thread::scope(|scope| {
-        let workers = (0..4).map(|_| scope.spawn(|| {
-            (0..64).map(|_| *bytes().identity()).collect::<Vec<_>>()
-        })).collect::<Vec<_>>();
-        workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+        let workers = (0..4)
+            .map(|_| scope.spawn(|| (0..64).map(|_| *bytes().identity()).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
     });
-    assert_eq!(keys.iter().copied().collect::<BTreeSet<_>>().len(), keys.len());
+    assert_eq!(
+        keys.iter().copied().collect::<BTreeSet<_>>().len(),
+        keys.len()
+    );
 }
 
 struct Charge {
     used: Arc<AtomicUsize>,
     bytes: usize,
     _identity: SharedStorageIdentity,
-    _domain: SharedStorageDomain,
+    _domain: SharedStorageAccountingId,
 }
 impl Charge {
     fn acquire(
         source: SharedControllerSource<'_>,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         used: &Arc<AtomicUsize>,
     ) -> Box<dyn Send + Sync> {
         let bytes = source.capacity_bytes().unwrap() as usize;
@@ -99,7 +105,7 @@ impl Drop for Charge {
 }
 fn attach(
     bytes: &SharedControllerBytes,
-    domain: &SharedStorageDomain,
+    domain: &SharedStorageAccountingId,
     used: &Arc<AtomicUsize>,
 ) -> bool {
     bytes
@@ -136,10 +142,14 @@ fn transfer_preserves_pointer_spare_capacity_and_distinct_equal_owner_identity()
     assert_eq!(source.identity(), alias.identity());
     assert_ne!(source.identity(), equal.identity());
     assert_eq!(
-        SharedControllerBytes::new(Vec::new(), crate::HostPreparationAuthority::unmanaged()).capacity_bytes(),
+        SharedControllerBytes::new(Vec::new(), crate::HostPreparationAuthority::unmanaged())
+            .capacity_bytes(),
         Some(0)
     );
-    let empty_spare = SharedControllerBytes::new(Vec::with_capacity(19), crate::HostPreparationAuthority::unmanaged());
+    let empty_spare = SharedControllerBytes::new(
+        Vec::with_capacity(19),
+        crate::HostPreparationAuthority::unmanaged(),
+    );
     assert!(empty_spare.as_ref().is_empty());
     assert_eq!(empty_spare.capacity_bytes(), Some(19));
 }
@@ -149,7 +159,7 @@ fn identity_keys_survive_without_retaining_payload_or_domain_charges() {
     let retired = Arc::new(AtomicBool::new(false));
     let source = bytes_with_retirement(&retired);
     let identity = source.identity().clone();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     attach(&source, &domain, &used);
     drop(source);
@@ -186,8 +196,8 @@ fn identity_keys_survive_without_retaining_payload_or_domain_charges() {
 fn earlier_aliases_keep_each_domain_custody_until_final_retirement() {
     let source = bytes();
     let earlier_alias = source.clone();
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     let capacity = source.capacity_bytes().unwrap() as usize;
     assert!(attach(&source, &first, &used));
@@ -208,7 +218,7 @@ fn earlier_aliases_keep_each_domain_custody_until_final_retirement() {
 #[test]
 fn simultaneous_attachments_publish_one_handle_per_domain() {
     let source = bytes();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let barrier = Barrier::new(8);
     let used = Arc::new(AtomicUsize::new(0));
     let acquisitions = AtomicUsize::new(0);
@@ -266,8 +276,8 @@ impl Drop for Rejected {
 #[test]
 fn rejected_provider_preserves_prior_custody_and_error_drops_after_unlock() {
     let source = bytes();
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     attach(&source, &first, &used);
     let capacity = source.capacity_bytes().unwrap() as usize;
@@ -286,7 +296,8 @@ fn rejected_provider_preserves_prior_custody_and_error_drops_after_unlock() {
         "source capacity rejected"
     );
     assert_eq!(used.load(Ordering::SeqCst), capacity);
-    assert_eq!(source.0.custody.attachments.lock().unwrap().len(), 1);
+    assert!(source.0.custody.has_accounting_custody(&first).unwrap());
+    assert!(!source.0.custody.has_accounting_custody(&second).unwrap());
     drop(error);
     assert!(dropped.load(Ordering::SeqCst));
     assert!(attach(&source, &second, &used));
@@ -299,8 +310,8 @@ fn rejected_provider_preserves_prior_custody_and_error_drops_after_unlock() {
 fn provider_panic_preserves_old_charge_and_poison_blocks_all_new_acquisition() {
     let source = bytes();
     let alias = source.clone();
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     attach(&source, &first, &used);
     let capacity = source.capacity_bytes().unwrap() as usize;
@@ -324,7 +335,7 @@ struct RetireProbe {
     payload_retired: Arc<AtomicBool>,
     custody_retired: Arc<AtomicBool>,
     other: SharedControllerBytes,
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
 }
 impl Drop for RetireProbe {
     fn drop(&mut self) {
@@ -347,7 +358,7 @@ fn closed_payload_retires_before_reentrant_custody_drop_even_after_poison() {
         let custody_retired = Arc::new(AtomicBool::new(false));
         let other = bytes();
         let other_alias = other.clone();
-        let domain = SharedStorageDomain::default();
+        let domain = SharedStorageAccountingId::default();
         source
             .try_attach(&domain, || {
                 Ok::<_, Infallible>(Box::new(RetireProbe {
@@ -361,9 +372,10 @@ fn closed_payload_retires_before_reentrant_custody_drop_even_after_poison() {
         let alias = source.clone();
         if poison {
             assert!(catch_unwind(AssertUnwindSafe(|| {
-                let _ = source.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
-                    panic!("poison before final retirement")
-                });
+                let _ = source
+                    .try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
+                        panic!("poison before final retirement")
+                    });
             }))
             .is_err());
         }
@@ -393,7 +405,10 @@ fn mixed_inventory_preserves_kind_and_never_misreports_complete_filter_only_stor
     let filters = [SharedTokenFilter::new(TokenFilter::Allowed(vec![
         true, false, true,
     ]))];
-    let bytes = [bytes(), SharedControllerBytes::new(Vec::new(), crate::HostPreparationAuthority::unmanaged())];
+    let bytes = [
+        bytes(),
+        SharedControllerBytes::new(Vec::new(), crate::HostPreparationAuthority::unmanaged()),
+    ];
     let mixed = TextControllerStorage::RunOwnedWithSharedStorage {
         filters: &filters,
         bytes: &bytes,
@@ -422,7 +437,7 @@ fn mixed_inventory_preserves_kind_and_never_misreports_complete_filter_only_stor
         bytes: &bytes[1..],
     };
     assert!(zero_bytes.shared_filters().is_none());
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     let expected = sources
         .iter()
@@ -473,7 +488,11 @@ fn forced_overrides_preserve_borrowed_post_callback_source_witness() {
             .shared_tokenizer_validity()
             .unwrap()
             .same_storage(&filters[0]));
-        let crate::capture::CaptureTokenFilter::Fixed(capture_filter) = decision.capture_domain().unwrap().filter else { panic!("fixed pre-forcing filter"); };
+        let crate::capture::CaptureTokenFilter::Fixed(capture_filter) =
+            decision.capture_domain().unwrap().filter
+        else {
+            panic!("fixed pre-forcing filter");
+        };
         assert_eq!(
             capture_filter.allowed_mask(),
             Some(&[true, true, false][..])

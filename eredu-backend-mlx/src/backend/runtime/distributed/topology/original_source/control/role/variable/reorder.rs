@@ -35,7 +35,7 @@ pub(super) fn run<I: Iterator<Item = usize>>(owner: &OriginalParallelControlOwne
     let capacity = plan.capacity;
     let kernels = plan.recipe.kernels;
     run_native_role_with_pipeline(plan, capacity, Some(safemlx::PreparedPipelineCachePlan::new(kernels)),
-        &owner.owner().bank, &owner.owner().controls, c,
+        &owner.owner().native, c,
         |plan, observer| Ok(plan.execute(observer)))
         .map_err(|cause| Error::with_original_control_source(cause, false))?
 }
@@ -58,7 +58,7 @@ pub(super) fn axis(owner: &OriginalParallelControlOwner, claim: ParallelControlC
         completed_source.cloned(), stream, claim, OriginalParallelControlOwner(owner.0.clone()), c.clone())?;
     let capacity = plan.capacity; let kernels = plan.recipe.kernels;
     run_native_role_with_pipeline(plan, capacity, Some(safemlx::PreparedPipelineCachePlan::new(kernels)),
-        &owner.owner().bank, &owner.owner().controls, c, |plan, observer| Ok(plan.execute(observer)))
+        &owner.owner().native, c, |plan, observer| Ok(plan.execute(observer)))
         .map_err(|cause| Error::with_original_control_source(cause, false))?
 }
 pub(super) fn concatenate(owner: &OriginalParallelControlOwner, claim: ParallelControlClaim,
@@ -79,7 +79,7 @@ pub(super) fn concatenate(owner: &OriginalParallelControlOwner, claim: ParallelC
     }
     let capacity = plan.capacity; let kernels = plan.recipe.kernels;
     run_native_role_with_pipeline(plan, capacity, Some(safemlx::PreparedPipelineCachePlan::new(kernels)),
-        &owner.owner().bank, &owner.owner().controls, c, |plan, observer| Ok(plan.execute(observer)))
+        &owner.owner().native, c, |plan, observer| Ok(plan.execute(observer)))
         .map_err(|cause| Error::with_original_control_source(cause, false))?
 }
 struct Reorder {

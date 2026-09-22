@@ -15,7 +15,7 @@ struct Measured<'a> {
     calls: [usize; 4],
 }
 impl<'a> Measured<'a> {
-    fn new(pool: &'a WorkingMemoryPool) -> Self {
+    fn new(pool: &'a MemoryLedger) -> Self {
         Self {
             inner: AdmittedRecipeConstruction::new(pool),
             peak: 0,
@@ -23,11 +23,10 @@ impl<'a> Measured<'a> {
         }
     }
     fn record<P: SharedNativeInitializer>(&mut self, plan: &P, kind: usize) {
-        let required =
-            WorkingMemoryPool::shared_native_initialization_required_bytes(plan).unwrap();
+        let required = MemoryLedger::shared_native_initialization_required_bytes(plan).unwrap();
         self.peak = self
             .peak
-            .max(self.inner.pool.used_bytes().unwrap() + required);
+            .max(self.inner.pool.payload_used_bytes().unwrap() + required);
         self.calls[kind] += 1;
     }
 }
@@ -132,7 +131,7 @@ fn file() -> (tempfile::TempDir, SafetensorsWeightStore) {
 }
 fn qualified() -> bool {
     let plan = EncodedRecipeMappingPlan::source(0..1).unwrap();
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(&plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(&plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -158,7 +157,7 @@ macro_rules! sequence {
                     1 => measured_peak,
                     _ => measured_peak - 1,
                 };
-                let pool = WorkingMemoryPool::new(limit, 0).unwrap();
+                let pool = crate::working_memory::memory_fixture::host_ledger(limit, 0).unwrap();
                 let keys = pool
                     .initialize_shared_native(EncodedRecipeKeysPlan::new(&recipe).unwrap().unwrap())
                     .unwrap();
@@ -170,7 +169,7 @@ macro_rules! sequence {
                         ReadBatchCatalogPlan::new(batch.output().tensors()).unwrap(),
                     )
                     .unwrap();
-                let prerequisites = pool.used_bytes().unwrap();
+                let prerequisites = pool.payload_used_bytes().unwrap();
                 let mut construction = Measured::new(&pool);
                 let result = catalog.output().compile_recipe(&recipe, &mut construction);
                 if attempt == 2 {
@@ -184,9 +183,11 @@ macro_rules! sequence {
                     };
                     assert!(matches!(
                         accounting,
-                        Some(WorkingMemoryError::BudgetExceeded { .. })
+                        Some(WorkingMemoryError::Domain(
+                            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                        ))
                     ));
-                    assert_eq!(pool.used_bytes().unwrap(), prerequisites);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), prerequisites);
                     drop(failure);
                     drop(catalog);
                     drop((batch, keys));
@@ -201,7 +202,7 @@ macro_rules! sequence {
                     assert_eq!(output.output().shape(), [2, 1, 3]);
                     assert_eq!(output.output().dtype(), &RecipeDtype::U8);
                     assert_eq!(
-                        pool.used_bytes().unwrap(),
+                        pool.payload_used_bytes().unwrap(),
                         prerequisites + output.original_bytes() + mapping.original_bytes()
                     );
                     assert_eq!(
@@ -230,7 +231,7 @@ macro_rules! sequence {
                     assert_eq!(short, [99; 5]);
                     drop((projected, output));
                 }
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     };
@@ -263,7 +264,7 @@ fn unsupported_recipes_release_temporaries_and_owned_validation_errors_keep_cust
         .unwrap()
         .construct(())
         .unwrap();
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let source = || Box::new(DerivedWeightRecipe::source("a", TensorSelection::Full));
     for recipe in [
         DerivedWeightRecipe::Cast {
@@ -281,7 +282,7 @@ fn unsupported_recipes_release_temporaries_and_owned_validation_errors_keep_cust
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     let invalid = DerivedWeightRecipe::Transpose {
         input: source(),
@@ -301,7 +302,7 @@ fn unsupported_recipes_release_temporaries_and_owned_validation_errors_keep_cust
             RecipeError::InvalidPermutation { .. }
         ))
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

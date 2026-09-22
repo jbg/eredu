@@ -5,7 +5,10 @@ use super::*;
 pub(super) struct Rows(OrdinaryTextFixture);
 impl ArchitectureParameters<FakeBackend> for Rows {
     type DefinitionError = Error;
-    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+    fn state_layout(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<StateLayout, Error> {
         self.0.state_layout(metadata)
     }
     fn state_identity(
@@ -16,7 +19,10 @@ impl ArchitectureParameters<FakeBackend> for Rows {
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
         self.0.state_identity(s, t, metadata)
     }
-    fn parameter_description(&self, c: &()) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
+    fn parameter_description(
+        &self,
+        c: &(),
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.0.parameter_description(c)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -39,13 +45,24 @@ impl LayeredArchitecture<FakeBackend, State> for Rows {
     type ForwardContext = usize;
     type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
     type Error = Error;
-    fn prefill_observation_declarations(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>)
-        -> Result<Vec<PrefillObservationDeclaration>, Error> {
-        let mut rows = match metadata { Some(context) => context.metadata_vec(PATHS.len())?, None => Vec::with_capacity(PATHS.len()) };
+    fn prefill_observation_declarations(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<PrefillObservationDeclaration>, Error> {
+        let mut rows = match metadata {
+            Some(context) => context.metadata_vec(PATHS.len())?,
+            None => Vec::with_capacity(PATHS.len()),
+        };
         for (i, &path) in PATHS.iter().enumerate() {
             rows.push(PrefillObservationDeclaration::causal_ordinary_text(
-                architecture_metadata::text(format_args!("{path}"), metadata)?, 0,
-                if i < 4 { PrefillReadoutStage::BeforeReadout } else { PrefillReadoutStage::VocabularyScores }));
+                architecture_metadata::text(format_args!("{path}"), metadata)?,
+                0,
+                if i < 4 {
+                    PrefillReadoutStage::BeforeReadout
+                } else {
+                    PrefillReadoutStage::VocabularyScores
+                },
+            ));
         }
         Ok(rows)
     }
@@ -67,10 +84,19 @@ impl LayeredArchitecture<FakeBackend, State> for Rows {
     fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         self.0.execution_graph()
     }
-    fn group_unit_count(&self, g: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+    fn group_unit_count(
+        &self,
+        g: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Error> {
         self.0.group_unit_count(g, metadata_context)
     }
-    fn unit_path(&self, g: usize, i: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+    fn unit_path(
+        &self,
+        g: usize,
+        i: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Error> {
         self.0.unit_path(g, i, metadata_context)
     }
     fn static_modules(&self) -> &FakeOperator {
@@ -337,6 +363,23 @@ pub(super) fn source(g: InferenceGeometry, body: bool) -> SharedCapturePlan {
 #[derive(Debug)]
 struct Facts;
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory::topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+
     fn operation_bound(
         &self,
         op: &WorkspaceOperation,
@@ -362,12 +405,17 @@ impl WorkspaceMechanisms for Facts {
     }
 }
 pub(super) fn quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &SharedCapturePlan,
     g: InferenceGeometry,
 ) -> IncrementalInferenceQuote {
     let context = WorkspaceContext::new(Facts);
-    let backing = WorkspaceExistingStorage::new(Some(64), &context);
+    let backing = WorkspaceExistingStorage::try_new_placed(
+        Some(64),
+        crate::memory::placement_ref(),
+        &context,
+    )
+    .unwrap();
     let tensor = WorkspaceTensor::existing_with_storage(
         WorkspaceLayout::new(&[1], WorkspaceDtype::Float32).unwrap(),
         &backing,
@@ -385,7 +433,8 @@ pub(super) fn quote(
         .unwrap()
         .initialization_peak_bytes();
     let b = |n| WorkspaceBound::bounded(n, "neutral scalar fixture enclosing owner");
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: b(4096),
         attention: b(0),
@@ -393,7 +442,7 @@ pub(super) fn quote(
         state_update: b(0),
         materialization: b(0),
         retained: b(h),
-    };
+    });
     ResidualInferenceQuote::compose(
         &report,
         mock_inference_admission(g).state,
@@ -407,7 +456,7 @@ pub(super) fn quote(
 /// original seal, with the same physical source/path owners and join policy.
 /// This is still cold quotation, before any successful reservation or native work.
 pub(super) fn candidate_quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &SharedCapturePlan,
     selection: &PreparedCaptureSelection,
     g: InferenceGeometry,
@@ -426,11 +475,11 @@ pub(super) fn candidate_quote(
             .with_prefill_capture_selection(selection.bind_geometry(g).unwrap())
             .unwrap();
     }
-    let before = q.incremental_bytes();
+    let before = q.incremental_bytes().unwrap();
     let q = q.with_span_workspace_and_text_controls(c).unwrap();
     assert_eq!(q.geometry(), g);
     assert_eq!(
-        q.incremental_bytes(),
+        q.incremental_bytes().unwrap(),
         before + q.span_workspace().retention_peak_bytes().unwrap()
     );
     q
@@ -438,17 +487,11 @@ pub(super) fn candidate_quote(
 
 pub(super) fn accept(
     session: &Session,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     g: InferenceGeometry,
     capacity: u64,
     mut candidate_quote: impl FnMut(InferenceGeometry) -> IncrementalInferenceQuote,
-) -> Result<
-    (
-        WorkingMemoryReservation,
-        IncrementalInferenceQuote,
-    ),
-    PrefillPlanningError,
-> {
+) -> Result<(WorkingMemoryReservation, IncrementalInferenceQuote), PrefillPlanningError> {
     let caps = ModelCapabilities {
         effective_model_type: "ordinary-text-fixture".into(),
         native_max_context: Observed::exact(128, "fixture"),
@@ -465,12 +508,11 @@ pub(super) fn accept(
             input: InputTokenCount::text(g.cached_positions + g.input_positions),
             max_output_tokens: g.max_output_tokens,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: Default::default(),
+            memory_limits: Default::default(),
         },
         g,
-        capacity,
+        crate::memory::resolved_limits(capacity),
         |candidate| Ok(candidate_quote(candidate)),
     )
 }

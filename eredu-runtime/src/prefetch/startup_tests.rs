@@ -1,6 +1,6 @@
 //! Actual standard-thread startup refusal, joined retirement and abandonment.
 use super::*;
-use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use std::time::Duration;
 
 fn units() -> Vec<OffloadUnitId> {
@@ -28,15 +28,27 @@ fn admitted_thread_refuses_before_spawn_and_refunds_after_join() {
     let Some(plan) = plan(&operation) else { return };
     let bytes = plan.required_bytes();
     let execution = InferenceExecutionIdentity::default();
-    let small = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let small = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     assert!(matches!(
-        plan.prepare(&small, &execution, bytes - 1),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        plan.prepare(
+            &small,
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&small, bytes - 1)
+        ),
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
-    assert_eq!(small.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let startup = plan.prepare(&pool, &execution, bytes).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(small.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
+    let startup = plan
+        .prepare(
+            &pool,
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, bytes),
+        )
+        .unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     let ids = units();
     let storage = PreparedPrefetchStorage::ordinary(1, Some(ids.clone())).unwrap();
     let worker = BackgroundPrefetchWorker::for_admitted_prepared_units_retaining(
@@ -49,7 +61,7 @@ fn admitted_thread_refuses_before_spawn_and_refunds_after_join() {
         PrefetchDemandResolution::Ready
     ));
     worker.finish().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn detached_thread_never_refunds_startup_at_callback_return() {
@@ -76,8 +88,14 @@ fn detached_thread_never_refunds_startup_at_callback_return() {
     let Some(plan) = plan(&operation) else { return };
     let bytes = plan.required_bytes();
     let execution = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let startup = plan.prepare(&pool, &execution, bytes).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
+    let startup = plan
+        .prepare(
+            &pool,
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, bytes),
+        )
+        .unwrap();
     let ids = units();
     let storage = PreparedPrefetchStorage::ordinary(1, Some(ids.clone())).unwrap();
     let worker = BackgroundPrefetchWorker::for_admitted_prepared_units_retaining(
@@ -88,9 +106,9 @@ fn detached_thread_never_refunds_startup_at_callback_return() {
     worker.submit(&ids[0], false).unwrap();
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     drop(worker);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
     retired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
 }

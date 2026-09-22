@@ -81,7 +81,9 @@ impl PreparedTextControlWorkspace {
         mut self,
         facts: GraphMetadataFacts,
     ) -> Result<Self, WorkingMemoryError> {
-        cold_controls::<(Self, GraphMetadataFacts, Result<Self, WorkingMemoryError>)>(self.plan.metadata_funding().as_ref())?;
+        cold_controls::<(Self, GraphMetadataFacts, Result<Self, WorkingMemoryError>)>(
+            self.plan.metadata_funding().as_ref(),
+        )?;
         if self.binding.graph_metadata.is_some() {
             return Err(WorkingMemoryError::AlreadyStarted);
         }
@@ -119,10 +121,7 @@ impl OwnedTextSpanWorkspace {
         if self.graph_taken {
             return Err(WorkingMemoryError::AlreadyStarted);
         }
-        let reservation = preparation
-            .request()
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = preparation.request().memory_reservation();
         if !reservation.0.same(&self.reservation().0)
             || preparation.request().geometry() != binding.geometry
         {
@@ -131,22 +130,39 @@ impl OwnedTextSpanWorkspace {
         preparation.validate_graph_preparation(facts.requested_ceiling)?;
         self.publish_graph_metadata(facts)
     }
-    pub(super) fn take_extension_graph_metadata(&mut self,
+    pub(super) fn take_extension_graph_metadata(
+        &mut self,
         origin: &crate::working_memory::text_preparation::SamplingExtensionBinding,
     ) -> Result<Option<OriginalGraphMetadata>, WorkingMemoryError> {
         origin.validate_pending()?;
-        let binding = self.workspace().control_binding().ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !binding.sampling_extension.as_ref().is_some_and(|expected| expected.same(origin)) {
+        let binding = self
+            .workspace()
+            .control_binding()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        if !binding
+            .sampling_extension
+            .as_ref()
+            .is_some_and(|expected| expected.same(origin))
+        {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let Some(facts) = binding.graph_metadata else { return Ok(None); };
+        let Some(facts) = binding.graph_metadata else {
+            return Ok(None);
+        };
         self.publish_graph_metadata(facts)
     }
-    fn publish_graph_metadata(&mut self, facts: GraphMetadataFacts)
-        -> Result<Option<OriginalGraphMetadata>, WorkingMemoryError> {
-        if self.graph_taken { return Err(WorkingMemoryError::AlreadyStarted); }
+    fn publish_graph_metadata(
+        &mut self,
+        facts: GraphMetadataFacts,
+    ) -> Result<Option<OriginalGraphMetadata>, WorkingMemoryError> {
+        if self.graph_taken {
+            return Err(WorkingMemoryError::AlreadyStarted);
+        }
         self.controls.validate_reservation(self.reservation())?;
-        let original = OriginalGraphMetadata { facts, _raw: self.controls.custody.raw().clone() };
+        let original = OriginalGraphMetadata {
+            facts,
+            _raw: self.controls.custody.raw().clone(),
+        };
         self.graph_taken = true;
         Ok(Some(original))
     }

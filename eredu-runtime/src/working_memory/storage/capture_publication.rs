@@ -1,11 +1,11 @@
 //! Single exact capture source publication, using the ordinary registry namespace.
 use super::*;
 use crate::working_memory::{
-    funding::{RawSpanHostOwner, SpanHostCustody},
     InferenceSpanWorkspacePlan, Usage,
+    funding::{RawSpanHostOwner, SpanHostCustody},
 };
 use eredu_core::{
-    capture::SharedCapturePlan, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
+    SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement, capture::SharedCapturePlan,
 };
 mod owner;
 pub(in crate::working_memory) use owner::CaptureSourceOwner;
@@ -84,7 +84,7 @@ impl<K: CapturePlanStorageKey> PreparedCapturePlanPublication<K> {
     /// The caller must keep that existing registration in the quote's source
     /// joins (this constructor additionally retains it in the prepared layout).
     pub fn prepare(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         plan: &InferenceSpanWorkspacePlan,
         source: &SharedCapturePlan,
         key: K,
@@ -105,7 +105,7 @@ impl<K: CapturePlanStorageKey> PreparedCapturePlanPublication<K> {
             existing.validate_copy_source(pool, &usage)?;
             if existing.0.keys.len() != 1
                 || existing.0.keys[0].cmp(&key) != Ordering::Equal
-                || existing.bytes() != capacity
+                || existing.bytes() != Some(capacity)
             {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
@@ -158,9 +158,8 @@ impl<K: CapturePlanStorageKey> PreparedCapturePlanPublication<K> {
     }
 }
 
-// Includes each actual introduced allocation and explicit construction/move
-// overlap. Existing registry BTreeMap nodes/core attachment Vec remain the
-// pre-existing bookkeeping classification; this does NOT exempt these owners.
+// Includes the source owner, prepared registry slots and namespace, and their
+// construction/retirement transport. Provider key payloads are separate facts.
 fn publication_control_bytes<K: CapturePlanStorageKey>() -> Option<u64> {
     let bytes = size_of::<PublicationLayout>()
         .checked_add(size_of::<K>().checked_mul(3)?)?
@@ -175,6 +174,7 @@ fn publication_control_bytes<K: CapturePlanStorageKey>() -> Option<u64> {
         .checked_add(size_of::<CaptureSourceOwner>())?
         .checked_add(SharedCapturePlan::owned_attachment_control_bytes::<
             PublishedCaptureStorage<K>,
+            CapturePlanPublicationCause,
         >()?)?
         .checked_add(size_of::<PreparedCapturePlanPublication<K>>())?
         .checked_add(size_of::<PreparedCaptureStorage<K>>())?
@@ -188,25 +188,38 @@ fn publication_control_bytes<K: CapturePlanStorageKey>() -> Option<u64> {
         // Eight Arc headers: layout, erased key, staged key, optional existing
         // validator, registration, published owner, reserved pin and fixed pair.
         .checked_add(16 * size_of::<usize>())?;
-    u64::try_from(bytes).ok()
+    u64::try_from(bytes)
+        .ok()?
+        .checked_add(directory::PreparedNamespace::requested_control_bytes::<K>().ok()?)?
+        .checked_add(
+            u64::try_from(
+                size_of::<RegistryBatch<K>>() + size_of::<Option<(RegistryKey<K>, Entry)>>(),
+            )
+            .ok()?,
+        )
 }
 
 struct ExistingCaptureStorage<K: CapturePlanStorageKey>(WorkingMemoryStorage<K>);
 impl<K: CapturePlanStorageKey> crate::working_memory::saved_source::SavedSourceValidation
     for ExistingCaptureStorage<K>
 {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         self.0.validate_copy_source(pool, usage)
     }
     fn pin(&self) -> crate::working_memory::residual::RegisteredStoragePin {
         crate::working_memory::residual::RegisteredStoragePin::new(self.0.clone())
+    }
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        crate::working_memory::residual::RegisteredStoragePin::single_control_bytes::<K>(
+            self.0.has_source_preparation(),
+        )
     }
 }
 
 pub(in crate::working_memory) trait CaptureSourceValidation:
     fmt::Debug + Send + Sync
 {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError>;
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError>;
 }
 // Registration/payload keys must retire before raw custody. No plan, full
 // source association or control guard is reachable from this source sidecar.
@@ -244,7 +257,7 @@ impl<K: CapturePlanStorageKey> fmt::Debug for PublishedCaptureStorage<K> {
     }
 }
 impl<K: CapturePlanStorageKey> CaptureSourceValidation for PublishedCaptureStorage<K> {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         self.raw.validate_origin_locked(pool, usage)?;
         match self
             .registration
@@ -263,6 +276,8 @@ pub(in crate::working_memory) struct PreparedCaptureStorage<K: CapturePlanStorag
     pub(in crate::working_memory) published: SharedStorageOwner<PublishedCaptureStorage<K>>,
     capacity: u64,
     new_bytes: u64,
+    batch: Option<Box<RegistryBatch<K>>>,
+    namespace: Option<std::sync::Mutex<directory::PreparedNamespace>>,
 }
 impl<K: CapturePlanStorageKey> fmt::Debug for PreparedCaptureStorage<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -278,6 +293,13 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
         raw: RawSpanHostOwner,
     ) -> Result<Self, WorkingMemoryError> {
         let key = layout.key::<K>()?;
+        // Provider clones run before raw registry custody exists. The accepted
+        // span hold covers their allocations and any failed clone prefix; an
+        // unpublished empty namespace cannot establish a native quarantine.
+        let staged_key = Arc::new(key.clone());
+        let registration = WorkingMemoryStorage::pending(vec![key.clone()], layout.capacity);
+        let batch = RegistryBatch::prepare(1, raw.clone());
+        let namespace = directory::PreparedNamespace::prepare::<K>(Some(raw.clone()));
         let published = SharedStorageOwner::new(PublishedCaptureStorage {
             source: layout.source.clone(),
             capacity: layout.capacity,
@@ -285,14 +307,13 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
             raw,
         });
         Ok(Self {
-            key: Arc::new(key.clone()),
-            registration: Some(WorkingMemoryStorage::pending(
-                vec![key.clone()],
-                layout.capacity,
-            )),
+            key: staged_key,
+            registration: Some(registration),
             published,
             capacity: layout.capacity,
             new_bytes: layout.new_bytes,
+            batch: Some(batch),
+            namespace: Some(std::sync::Mutex::new(namespace)),
         })
     }
     pub(in crate::working_memory) fn publish(
@@ -301,7 +322,7 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
         native: &WorkingMemoryFundingScope,
         custody: &SpanHostCustody,
     ) -> Result<(), CapturePlanPublicationCause> {
-        let domain = native.pool().shared_storage_domain().clone();
+        let domain = native.pool().shared_storage_accounting_id().clone();
         let owner = source
             .try_attach_owned_nonblocking(&domain, || {
                 self.commit(native, custody)?;
@@ -315,8 +336,8 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
                 eredu_core::SharedStorageAttachmentError::Poisoned => {
                     WorkingMemoryError::Poisoned.into()
                 }
-                eredu_core::SharedStorageAttachmentError::Allocation(error) => {
-                    CapturePlanPublicationCause::Allocation(error)
+                eredu_core::SharedStorageAttachmentError::Overflow => {
+                    WorkingMemoryError::Overflow.into()
                 }
                 eredu_core::SharedStorageAttachmentError::Provider(error) => error,
             })?;
@@ -340,7 +361,7 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
             let key: &K = self.key.as_ref().borrow();
             if registered.0.keys.len() != 1
                 || registered.0.keys[0].cmp(key) != Ordering::Equal
-                || registered.bytes() != self.capacity
+                || registered.bytes() != Some(self.capacity)
             {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
@@ -375,11 +396,14 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
         let prior = usage.storage.get(&TypeId::of::<K>()).and_then(|r| {
             r.downcast_ref::<Registry<K>>()
                 .expect("typed registry")
-                .get(key)
+                .locate(key)
         });
-        let expected = prior.map(|entry| (entry.bytes, entry.owners, entry.funding));
-        let existing = if let Some(entry) = prior {
+        let locator = prior.map(|(locator, _)| locator);
+        let existing = if let Some((_, entry)) = prior {
             same_capacity(entry.bytes, self.capacity)?;
+            if entry.placement != pool.0.host_placement {
+                return Err(WorkingMemoryError::StoragePlacementMismatch.into());
+            }
             validate_entry_origin(entry, &usage)?;
             entry
                 .owners
@@ -392,7 +416,7 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
         if !existing && self.new_bytes != self.capacity {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        let _ = pool.0.available(&usage, None)?;
+        let _ = pool.0.check_host_increment(&usage, 0)?;
         let debit = if existing { 0 } else { self.capacity };
         let state = usage
             .funding
@@ -400,7 +424,8 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         let available = state.spendable_remaining()?;
         if debit > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: pool.topology().host_domain(),
                 required_bytes: debit,
                 available_bytes: available,
             }
@@ -426,35 +451,41 @@ impl<K: CapturePlanStorageKey> PreparedCaptureStorage<K> {
             .registered
             .checked_add(debit)
             .ok_or(WorkingMemoryError::Overflow)?;
-        // Provider Ord runs only during entry search. The staged outer Arc keeps
-        // its key alive on unwind; after entry acquisition there is no provider
-        // comparison/clone/drop or rejecting operation before full commit.
+        // All comparisons and fallible checks precede linking prepared slots.
+        if usage.storage.get(&TypeId::of::<K>()).is_none() {
+            usage.storage.install(
+                self.namespace
+                    .take()
+                    .expect("prepared capture namespace")
+                    .into_inner()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            );
+        }
         let registry = usage
             .storage
-            .entry(TypeId::of::<K>())
-            .or_insert_with(|| Box::new(Registry::<K>::new()))
+            .get_mut(&TypeId::of::<K>())
+            .unwrap()
             .downcast_mut::<Registry<K>>()
-            .expect("typed registry");
-        match registry.entry(RegistryKey::Shared(self.key.clone())) {
-            RegistryEntry::Vacant(entry) => {
-                if existing {
-                    return Err(WorkingMemoryError::IdentityMismatch.into());
-                }
-                entry.insert(Entry {
+            .expect("typed capture namespace");
+        if let Some(locator) = locator {
+            registry.at_mut(locator).owners += 1;
+        } else {
+            let mut batch = self.batch.take().expect("prepared capture row");
+            batch.entries[0] = Some((
+                RegistryKey::Shared(Arc::clone(&self.key)),
+                Entry {
                     reset_layout_id: None,
+                    placement: Arc::clone(&pool.0.host_placement),
                     prepaid: None,
                     bytes: self.capacity,
                     owners: 1,
                     funding: Some(native.id),
-                });
-            }
-            RegistryEntry::Occupied(entry) => {
-                let actual = &*entry;
-                if expected != Some((actual.bytes, actual.owners, actual.funding)) {
-                    return Err(WorkingMemoryError::IdentityMismatch.into());
-                }
-                entry.owners += 1;
-            }
+                    native_retired: false,
+                    pending_allocation: false,
+                    funding_allowance_bytes: 0,
+                },
+            ));
+            registry.link(batch);
         }
         let state = usage
             .funding

@@ -90,9 +90,9 @@ impl WorkspaceExistingStorage {
 }
 
 impl WorkspaceTensor {
-    /// Records the existing initialization primitive with the actual source
-    /// dtype. The shared producer pays shape/output metadata before allocation;
-    /// it creates no native tensor and supplies no execution permission.
+    /// Records initialization geometry and logical dtype without selecting a
+    /// native constructor. The shared producer pays shape/output metadata;
+    /// native placement and execution require a source-specific producer.
     pub fn initialized(
         shape: &[i32],
         dtype: WorkspaceDtype,
@@ -112,19 +112,29 @@ impl WorkspaceTensor {
     /// permission to create token data. The enclosing driver retains its exact
     /// ordinal and replaces it with the independently admitted input receipt.
     pub fn prepared_token_input(
-        shape: &[i32], dtype: WorkspaceDtype, context: &WorkspaceContext,
+        shape: &[i32],
+        dtype: WorkspaceDtype,
+        context: &WorkspaceContext,
     ) -> Result<Self, Error> {
         if !matches!(shape, [batch, positions] if *batch > 0 && *positions > 0)
             || !matches!(dtype, WorkspaceDtype::Int32 | WorkspaceDtype::Uint32)
         {
-            return Err(context.metadata_error(format_args!("prepared token input requires a nonempty I32/U32 matrix")));
+            return Err(context.metadata_error(format_args!(
+                "prepared token input requires a nonempty I32/U32 matrix"
+            )));
         }
-        Self::operation(WorkspaceOperationKind::Elementwise("prepared_token_input"),
-            &[], shape, dtype, context)
+        Self::operation(
+            WorkspaceOperationKind::Elementwise("prepared_token_input"),
+            &[],
+            shape,
+            dtype,
+            context,
+        )
     }
 
-    /// Traces the actual scalar/host constructor with exact floating precision.
-    /// The selected mechanism supplies physical facts; logical storage stays F32.
+    /// Records initialization geometry and floating precision without selecting
+    /// a scalar, fill or host-upload constructor. Logical storage stays F32;
+    /// native placement and execution require a source-specific producer.
     pub fn initialized_floating(
         shape: &[i32],
         dtype: WorkspaceFloatingType,
@@ -207,6 +217,18 @@ impl WorkspaceTensor {
         Ok(value)
     }
 
+    pub(super) fn parameter_placeholder_with_backing(
+        layout: WorkspaceLayout,
+        backing: &WorkspaceExistingStorage,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        let value = Self::existing_with_storage(layout, backing, context)?;
+        let mut outputs = context.metadata_vec(1)?;
+        outputs.push(context.layout(&[], value.layout.dtype())?);
+        context.execute(WorkspaceOperationKind::ParameterPlaceholder, &[], outputs)?;
+        Ok(value)
+    }
+
     /// Introduces existing storage. Its residency is priced separately from
     /// this span, including when subsequent views alias its backing allocation.
     pub fn existing(layout: WorkspaceLayout, context: &WorkspaceContext) -> Result<Self, Error> {
@@ -240,6 +262,31 @@ impl WorkspaceTensor {
             )),
             WorkspaceImportError::Reserve(cause) => context.metadata_source(cause),
             WorkspaceImportError::Metadata(cause) => cause,
+        })
+    }
+
+    /// Imports a descriptive source envelope whose components occupy distinct
+    /// physical domains. Every view retains the complete backing graph. These
+    /// prospective identities provide no registered storage or source credit.
+    pub fn existing_with_storages(
+        layout: WorkspaceLayout,
+        storages: &[WorkspaceExistingStorage],
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        let mut children = context.metadata_vec(storages.len())?;
+        for storage in storages {
+            if !Rc::ptr_eq(&storage.context, &context.identity) {
+                return Err(context.metadata_error(format_args!(
+                    "source envelope belongs to another workspace context"
+                )));
+            }
+            children.push(storage.storage.clone());
+        }
+        Ok(Self {
+            layout,
+            storage: context.try_new_storage(Some(0), children)?,
+            context: context.identity.clone(),
+            imported_existing: true,
         })
     }
     /// Exact logical geometry carried by this metadata value.
@@ -289,53 +336,102 @@ impl WorkspaceTensor {
     /// Describes an exact typed zero-fill constructor. The prototype lends only
     /// its scalar representation; the result has independent storage and shape.
     /// Concrete mechanisms still qualify the actual scalar seed and fill worker.
-    pub fn zeros_from_prototype(shape: &[i32], prototype: WorkspaceLayoutView<'_>,
-        context: &WorkspaceContext) -> Result<Self, Error> {
-    let name=match prototype.dtype() {
-        WorkspaceDtype::Float32=>match prototype.representation().ok_or_else(||
-            context.metadata_error(format_args!("zero fill lacks exact floating source dtype")))?.dtype() {
-            WorkspaceFloatingType::Float32=>"zeros_f32",WorkspaceFloatingType::Float16=>"zeros_f16",
-            WorkspaceFloatingType::Bfloat16=>"zeros_bf16",
-        },
-        WorkspaceDtype::Int32=>"zeros_i32",WorkspaceDtype::Uint32=>"zeros_u32",
-        WorkspaceDtype::Uint8=>"zeros_u8",WorkspaceDtype::Bool=>"zeros_bool",
-    };
-    let mut outputs=context.metadata_vec(1)?;outputs.push(context.layout(shape,prototype.dtype())?);
-    let mut values=context.execute(WorkspaceOperationKind::Elementwise(name),&[],outputs)?;
-    Ok(values.pop().expect("one declared zero output"))
+    pub fn zeros_from_prototype(
+        shape: &[i32],
+        prototype: WorkspaceLayoutView<'_>,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        let name = match prototype.dtype() {
+            WorkspaceDtype::Float32 => match prototype
+                .representation()
+                .ok_or_else(|| {
+                    context
+                        .metadata_error(format_args!("zero fill lacks exact floating source dtype"))
+                })?
+                .dtype()
+            {
+                WorkspaceFloatingType::Float32 => "zeros_f32",
+                WorkspaceFloatingType::Float16 => "zeros_f16",
+                WorkspaceFloatingType::Bfloat16 => "zeros_bf16",
+            },
+            WorkspaceDtype::Int32 => "zeros_i32",
+            WorkspaceDtype::Uint32 => "zeros_u32",
+            WorkspaceDtype::Uint8 => "zeros_u8",
+            WorkspaceDtype::Bool => "zeros_bool",
+        };
+        let mut outputs = context.metadata_vec(1)?;
+        outputs.push(context.layout(shape, prototype.dtype())?);
+        let mut values =
+            context.execute(WorkspaceOperationKind::Elementwise(name), &[], outputs)?;
+        Ok(values.pop().expect("one declared zero output"))
     }
     /// Traces the existing rank-preserving positive-stride Slice worker with
     /// its exact coordinates. Empty/scalar geometry remains descriptive; each
     /// mechanism separately qualifies the actual native source it supports.
-    pub fn static_slice(&self, starts:&[i32], ends:&[i32], strides:&[i32],
-        context:&WorkspaceContext) -> Result<Self,Error> {
-        use std::mem::{size_of,size_of_val};
-        let frames=[size_of::<(&Self,&[i32],&[i32],&[i32],&WorkspaceContext)>(),
-            size_of::<[Vec<i32>;4]>(),size_of::<Result<Self,Error>>(),
-            size_of::<[i32;4]>(),size_of::<Option<i32>>(),size_of::<usize>(),
-            size_of::<std::ops::Range<usize>>()];
-        context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-            .ok_or_else(||context.metadata_error(format_args!("static slice controls overflow")))?)?;
+    pub fn static_slice(
+        &self,
+        starts: &[i32],
+        ends: &[i32],
+        strides: &[i32],
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<(&Self, &[i32], &[i32], &[i32], &WorkspaceContext)>(),
+            size_of::<[Vec<i32>; 4]>(),
+            size_of::<Result<Self, Error>>(),
+            size_of::<[i32; 4]>(),
+            size_of::<Option<i32>>(),
+            size_of::<usize>(),
+            size_of::<std::ops::Range<usize>>(),
+        ];
+        context.charge_metadata(
+            frames
+                .into_iter()
+                .try_fold(size_of_val(&frames), usize::checked_add)
+                .ok_or_else(|| {
+                    context.metadata_error(format_args!("static slice controls overflow"))
+                })?,
+        )?;
         self.validate_context(context)?;
-        let rank=self.shape().len();
-        if starts.len()!=rank || ends.len()!=rank || strides.len()!=rank {
-            return Err(context.metadata_error(format_args!("static slice coordinate rank differs")));
+        let rank = self.shape().len();
+        if starts.len() != rank || ends.len() != rank || strides.len() != rank {
+            return Err(
+                context.metadata_error(format_args!("static slice coordinate rank differs"))
+            );
         }
-        let mut shape=context.metadata_vec(rank)?;
+        let mut shape = context.metadata_vec(rank)?;
         for axis in 0..rank {
-            let (a,b,step,n)=(starts[axis],ends[axis],strides[axis],self.shape()[axis]);
-            if a<0 || b<a || b>n || step<=0 {
+            let (a, b, step, n) = (starts[axis], ends[axis], strides[axis], self.shape()[axis]);
+            if a < 0 || b < a || b > n || step <= 0 {
                 return Err(context.metadata_error(format_args!("invalid static slice geometry")));
             }
-            let width=b.checked_sub(a).and_then(|d|d.checked_add(step-1))
-                .map(|d|d/step).ok_or_else(||context.metadata_error(format_args!("static slice extent overflow")))?;
+            let width = b
+                .checked_sub(a)
+                .and_then(|d| d.checked_add(step - 1))
+                .map(|d| d / step)
+                .ok_or_else(|| {
+                    context.metadata_error(format_args!("static slice extent overflow"))
+                })?;
             shape.push(width);
         }
-        let mut a=context.metadata_vec(rank)?;a.extend_from_slice(starts);
-        let mut b=context.metadata_vec(rank)?;b.extend_from_slice(ends);
-        let mut c=context.metadata_vec(rank)?;c.extend_from_slice(strides);
-        Self::operation(WorkspaceOperationKind::StaticSlice {starts:a,ends:b,strides:c},
-            &[self],&shape,self.layout.dtype,context)
+        let mut a = context.metadata_vec(rank)?;
+        a.extend_from_slice(starts);
+        let mut b = context.metadata_vec(rank)?;
+        b.extend_from_slice(ends);
+        let mut c = context.metadata_vec(rank)?;
+        c.extend_from_slice(strides);
+        Self::operation(
+            WorkspaceOperationKind::StaticSlice {
+                starts: a,
+                ends: b,
+                strides: c,
+            },
+            &[self],
+            &shape,
+            self.layout.dtype,
+            context,
+        )
     }
     /// Traces an exact positive-stride replacement without broadcasting or
     /// rank changes. Native storage facts still account for a full source copy.
@@ -556,10 +652,11 @@ impl Tensor for WorkspaceTensor {
         shape: &[i32],
         context: &WorkspaceContext,
     ) -> Result<Self, Error> {
-        Self::parameter_placeholder(
-            context.parameter_layout(parameter, shape, WorkspaceDtype::Float32)?,
-            context,
-        )
+        let layout = context.parameter_layout(parameter, shape, WorkspaceDtype::Float32)?;
+        match context.parameter_backing(parameter, &layout)? {
+            Some(root) => Self::parameter_placeholder_with_backing(layout, &root, context),
+            None => Self::parameter_placeholder(layout, context),
+        }
     }
     fn unloaded_i32(shape: &[i32], context: &WorkspaceContext) -> Result<Self, Error> {
         Self::parameter_placeholder(context.layout(shape, WorkspaceDtype::Int32)?, context)
@@ -578,7 +675,13 @@ impl Tensor for WorkspaceTensor {
                 "workspace host data length differs from shape"
             )));
         }
-        Self::full_f32(0.0, shape, context)
+        Self::operation(
+            WorkspaceOperationKind::Elementwise("from_f32_slice"),
+            &[],
+            shape,
+            WorkspaceDtype::Float32,
+            context,
+        )
     }
     fn from_f32_fn(
         shape: &[i32],
@@ -608,16 +711,40 @@ impl Tensor for WorkspaceTensor {
                 "workspace host data length differs from shape"
             )));
         }
-        Self::full_i32(0, shape, context)
+        Self::operation(
+            WorkspaceOperationKind::Elementwise("from_i32_slice"),
+            &[],
+            shape,
+            WorkspaceDtype::Int32,
+            context,
+        )
     }
     fn full_f32(_: f32, shape: &[i32], context: &WorkspaceContext) -> Result<Self, Error> {
-        Self::initialized(shape, WorkspaceDtype::Float32, context)
+        Self::operation(
+            WorkspaceOperationKind::Elementwise("full_f32"),
+            &[],
+            shape,
+            WorkspaceDtype::Float32,
+            context,
+        )
     }
     fn full_i32(_: i32, shape: &[i32], context: &WorkspaceContext) -> Result<Self, Error> {
-        Self::initialized(shape, WorkspaceDtype::Int32, context)
+        Self::operation(
+            WorkspaceOperationKind::Elementwise("full_i32"),
+            &[],
+            shape,
+            WorkspaceDtype::Int32,
+            context,
+        )
     }
     fn full_u32(_: u32, shape: &[i32], context: &WorkspaceContext) -> Result<Self, Error> {
-        Self::initialized(shape, WorkspaceDtype::Uint32, context)
+        Self::operation(
+            WorkspaceOperationKind::Elementwise("full_u32"),
+            &[],
+            shape,
+            WorkspaceDtype::Uint32,
+            context,
+        )
     }
     binary!(add, subtract, multiply);
     unary!(square);
@@ -765,8 +892,13 @@ impl Tensor for WorkspaceTensor {
         }
         let mut shape = context.metadata_vec(normalized.len())?;
         shape.extend(normalized.iter().map(|a| self.shape()[*a]));
-        Self::operation(WorkspaceOperationKind::Transpose(normalized),
-            &[self], &shape, self.layout.dtype, context)
+        Self::operation(
+            WorkspaceOperationKind::Transpose(normalized),
+            &[self],
+            &shape,
+            self.layout.dtype,
+            context,
+        )
     }
     fn swap_axes(&self, left: i32, right: i32, context: &WorkspaceContext) -> Result<Self, Error> {
         let mut axes = context.metadata_vec(self.shape().len())?;
@@ -817,9 +949,19 @@ impl Tensor for WorkspaceTensor {
     }
     fn index(&self, indexes: &[Index], context: &WorkspaceContext) -> Result<Self, Error> {
         context.charge_metadata(std::mem::size_of::<(
-            &Self, &[Index], &WorkspaceContext, usize, [Vec<i32>; 4],
-            std::slice::Iter<'_, Index>, std::iter::Enumerate<std::iter::Copied<std::slice::Iter<'_, i32>>>,
-            usize, i32, Index, [i64; 2], i32, WorkspaceOperationKind,
+            &Self,
+            &[Index],
+            &WorkspaceContext,
+            usize,
+            [Vec<i32>; 4],
+            std::slice::Iter<'_, Index>,
+            std::iter::Enumerate<std::iter::Copied<std::slice::Iter<'_, i32>>>,
+            usize,
+            i32,
+            Index,
+            [i64; 2],
+            i32,
+            WorkspaceOperationKind,
             Result<Self, Error>,
         )>())?;
         if indexes.len() > self.shape().len() {
@@ -832,9 +974,21 @@ impl Tensor for WorkspaceTensor {
         let mut shape = context.metadata_vec(self.shape().len() - selected_axes)?;
         // Full/Range are the only rank-preserving Index variants. Preserve
         // their normalized coordinates instead of erasing them to a rank count.
-        let mut starts = if selected_axes == 0 { context.metadata_vec(self.shape().len())? } else { Vec::new() };
-        let mut ends = if selected_axes == 0 { context.metadata_vec(self.shape().len())? } else { Vec::new() };
-        let mut strides = if selected_axes == 0 { context.metadata_vec(self.shape().len())? } else { Vec::new() };
+        let mut starts = if selected_axes == 0 {
+            context.metadata_vec(self.shape().len())?
+        } else {
+            Vec::new()
+        };
+        let mut ends = if selected_axes == 0 {
+            context.metadata_vec(self.shape().len())?
+        } else {
+            Vec::new()
+        };
+        let mut strides = if selected_axes == 0 {
+            context.metadata_vec(self.shape().len())?
+        } else {
+            Vec::new()
+        };
         for (i, size) in self.shape().iter().copied().enumerate() {
             let position = |n: i32| {
                 if n < 0 {
@@ -846,8 +1000,12 @@ impl Tensor for WorkspaceTensor {
             match indexes.get(i).copied().unwrap_or(Index::Full) {
                 Index::Full => {
                     shape.push(size);
-                    if selected_axes == 0 { starts.push(0); ends.push(size); strides.push(1); }
-                },
+                    if selected_axes == 0 {
+                        starts.push(0);
+                        ends.push(size);
+                        strides.push(1);
+                    }
+                }
                 Index::At(n) => {
                     let n = position(n);
                     if n < 0 || n >= i64::from(size) {
@@ -867,14 +1025,20 @@ impl Tensor for WorkspaceTensor {
                     shape.push(extent(end - start, context)?);
                     if selected_axes == 0 {
                         // Bounds above prove both values fit the original i32 extent.
-                        starts.push(start as i32); ends.push(end as i32); strides.push(1);
+                        starts.push(start as i32);
+                        ends.push(end as i32);
+                        strides.push(1);
                     }
                 }
             }
         }
         Self::operation(
             if selected_axes == 0 {
-                WorkspaceOperationKind::StaticSlice { starts, ends, strides }
+                WorkspaceOperationKind::StaticSlice {
+                    starts,
+                    ends,
+                    strides,
+                }
             } else {
                 WorkspaceOperationKind::Index { selected_axes }
             },
@@ -884,20 +1048,38 @@ impl Tensor for WorkspaceTensor {
             context,
         )
     }
-    fn narrow_axis(&self, axis: usize, start: i32, end: i32, context: &WorkspaceContext) -> Result<Self, Error> {
+    fn narrow_axis(
+        &self,
+        axis: usize,
+        start: i32,
+        end: i32,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
         self.validate_context(context)?;
         let range = crate::TensorAxisRange::new(self.shape(), axis, start, end)
-            .map_err(|cause|context.metadata_error(format_args!("{cause}")))?;
-        let frames = [std::mem::size_of::<crate::TensorAxisRange<'_>>(),
-            std::mem::size_of::<[Vec<i32>;3]>(), std::mem::size_of::<(&Self,usize,i32,i32,&WorkspaceContext)>(),
-            std::mem::size_of::<Result<Self,Error>>(), std::mem::size_of::<Result<crate::TensorAxisRange<'_>,crate::TensorAxisRangeError>>()];
-        context.charge_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-            .ok_or(WorkspaceMetadataError::Overflow)?)?;
-        let mut starts=context.metadata_vec(range.shape().len())?; starts.resize(range.shape().len(),0);
-        let mut ends=context.metadata_vec(range.shape().len())?; ends.extend_from_slice(range.shape());
-        let mut strides=context.metadata_vec(range.shape().len())?; strides.resize(range.shape().len(),1);
-        starts[range.axis()]=range.start(); ends[range.axis()]=range.end();
-        self.static_slice(&starts,&ends,&strides,context)
+            .map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
+        let frames = [
+            std::mem::size_of::<crate::TensorAxisRange<'_>>(),
+            std::mem::size_of::<[Vec<i32>; 3]>(),
+            std::mem::size_of::<(&Self, usize, i32, i32, &WorkspaceContext)>(),
+            std::mem::size_of::<Result<Self, Error>>(),
+            std::mem::size_of::<Result<crate::TensorAxisRange<'_>, crate::TensorAxisRangeError>>(),
+        ];
+        context.charge_metadata(
+            frames
+                .into_iter()
+                .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+                .ok_or(WorkspaceMetadataError::Overflow)?,
+        )?;
+        let mut starts = context.metadata_vec(range.shape().len())?;
+        starts.resize(range.shape().len(), 0);
+        let mut ends = context.metadata_vec(range.shape().len())?;
+        ends.extend_from_slice(range.shape());
+        let mut strides = context.metadata_vec(range.shape().len())?;
+        strides.resize(range.shape().len(), 1);
+        starts[range.axis()] = range.start();
+        ends[range.axis()] = range.end();
+        self.static_slice(&starts, &ends, &strides, context)
     }
     fn take_axis(
         &self,
@@ -931,7 +1113,10 @@ impl Tensor for WorkspaceTensor {
     }
     fn zeros_like(&self, context: &WorkspaceContext) -> Result<Self, Error> {
         context.charge_metadata(std::mem::size_of::<(
-            &Self, &WorkspaceContext, WorkspaceLayoutView<'_>, Result<Self, Error>,
+            &Self,
+            &WorkspaceContext,
+            WorkspaceLayoutView<'_>,
+            Result<Self, Error>,
         )>())?;
         self.validate_context(context)?;
         // The native zeros-like worker reads only this prototype's shape and
@@ -1258,7 +1443,10 @@ impl Tensor for WorkspaceTensor {
         inputs.extend(weight);
         inputs.extend(bias);
         Self::operation(
-            WorkspaceOperationKind::LayerNorm { weight: weight.is_some(), bias: bias.is_some() },
+            WorkspaceOperationKind::LayerNorm {
+                weight: weight.is_some(),
+                bias: bias.is_some(),
+            },
             &inputs,
             input.shape(),
             input.layout.dtype,
@@ -1551,58 +1739,130 @@ impl WorkspaceTensor {
     /// Trace the ordinary owner contribution and selected publication Sum.
     /// Native source identity, completion and transport remain independently
     /// required by the mechanism that supplies this context's collective facts.
-    pub fn broadcast_publication(&self, group:eredu_core::CollectiveGroupId,
-        root:usize, rank:usize, partitions:usize, context:&WorkspaceContext)
-        ->Result<Self,Error> {
-        if root>=partitions || rank>=partitions {
+    pub fn broadcast_publication(
+        &self,
+        group: eredu_core::CollectiveGroupId,
+        root: usize,
+        rank: usize,
+        partitions: usize,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        if root >= partitions || rank >= partitions {
             return Err(context.metadata_error(format_args!("invalid selected publication rank")));
         }
-        let contribution=if rank==root {self.clone()} else {self.multiply_scalar(0.0,context)?};
-        Self::operation(WorkspaceOperationKind::Collective(super::WorkspaceCollective::Broadcast {
-            group,root,rank,partitions,
-        }),&[&contribution],contribution.shape(),contribution.layout.dtype,context)
+        let contribution = if rank == root {
+            self.clone()
+        } else {
+            self.multiply_scalar(0.0, context)?
+        };
+        Self::operation(
+            WorkspaceOperationKind::Collective(super::WorkspaceCollective::Broadcast {
+                group,
+                root,
+                rank,
+                partitions,
+            }),
+            &[&contribution],
+            contribution.shape(),
+            contribution.layout.dtype,
+            context,
+        )
     }
 }
 
 impl WorkspaceTensor {
     /// Metadata for the ordinary rank-two additive indexed update. The supplied
     /// IDs remain a borrowed tensor source; this does not claim their values.
-    pub fn indexed_row_add(&self, indices:&Self, updates:&Self, context:&WorkspaceContext)->Result<Self,Error> {
-        self.validate_context(context)?;indices.validate_context(context)?;updates.validate_context(context)?;
-        if self.shape().len()!=2 || indices.shape().len()!=2 || updates.shape().len()!=2
-            || indices.shape()[1]!=1 || indices.shape()[0]!=updates.shape()[0]
-            || self.shape()[1]!=updates.shape()[1]
-            || !matches!(indices.layout.dtype,WorkspaceDtype::Int32|WorkspaceDtype::Uint32)
-            || self.layout.dtype!=updates.layout.dtype {
-            return Err(context.metadata_error(format_args!("indexed row-add differs from its retained rank-two geometry")));
+    pub fn indexed_row_add(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        self.validate_context(context)?;
+        indices.validate_context(context)?;
+        updates.validate_context(context)?;
+        if self.shape().len() != 2
+            || indices.shape().len() != 2
+            || updates.shape().len() != 2
+            || indices.shape()[1] != 1
+            || indices.shape()[0] != updates.shape()[0]
+            || self.shape()[1] != updates.shape()[1]
+            || !matches!(
+                indices.layout.dtype,
+                WorkspaceDtype::Int32 | WorkspaceDtype::Uint32
+            )
+            || self.layout.dtype != updates.layout.dtype
+        {
+            return Err(context.metadata_error(format_args!(
+                "indexed row-add differs from its retained rank-two geometry"
+            )));
         }
-        Self::operation(WorkspaceOperationKind::IndexedRowAdd,&[self,indices,updates],self.shape(),self.layout.dtype,context)
+        Self::operation(
+            WorkspaceOperationKind::IndexedRowAdd,
+            &[self, indices, updates],
+            self.shape(),
+            self.layout.dtype,
+            context,
+        )
     }
 }
 
 impl WorkspaceTensor {
     /// Trace the existing one-index Gather from an independently validated
     /// native I32 source. This geometry does not authenticate index values.
-    pub fn select_elements_with_indices(&self, indices: &Self, context: &WorkspaceContext) -> Result<Self, Error> {
+    pub fn select_elements_with_indices(
+        &self,
+        indices: &Self,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
         self.validate_context(context)?;
         indices.validate_context(context)?;
-        if self.shape().len() != 1 || self.shape()[0] <= 0
-            || indices.shape().len() != 1 || indices.layout.dtype != WorkspaceDtype::Int32 {
-            return Err(context.metadata_error(format_args!("indexed element selection requires rank-one values and I32 indices")));
+        if self.shape().len() != 1
+            || self.shape()[0] <= 0
+            || indices.shape().len() != 1
+            || indices.layout.dtype != WorkspaceDtype::Int32
+        {
+            return Err(context.metadata_error(format_args!(
+                "indexed element selection requires rank-one values and I32 indices"
+            )));
         }
-        Self::operation(WorkspaceOperationKind::IndexedElementSelect, &[self, indices], indices.shape(), self.layout.dtype, context)
+        Self::operation(
+            WorkspaceOperationKind::IndexedElementSelect,
+            &[self, indices],
+            indices.shape(),
+            self.layout.dtype,
+            context,
+        )
     }
     /// Trace exact-shape general Scatter overwrite. Distinct in-range index
     /// values stay with the original sparse producer, outside this metadata.
-    pub fn update_elements_with_indices(&self, indices: &Self, updates: &Self, context: &WorkspaceContext) -> Result<Self, Error> {
+    pub fn update_elements_with_indices(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
         self.validate_context(context)?;
         indices.validate_context(context)?;
         updates.validate_context(context)?;
-        if self.shape().len() != 1 || self.shape()[0] <= 0
-            || indices.shape().len() != 1 || indices.layout.dtype != WorkspaceDtype::Int32
-            || updates.shape() != indices.shape() || updates.layout.dtype != self.layout.dtype {
-            return Err(context.metadata_error(format_args!("indexed element overwrite differs from its rank-one source geometry")));
+        if self.shape().len() != 1
+            || self.shape()[0] <= 0
+            || indices.shape().len() != 1
+            || indices.layout.dtype != WorkspaceDtype::Int32
+            || updates.shape() != indices.shape()
+            || updates.layout.dtype != self.layout.dtype
+        {
+            return Err(context.metadata_error(format_args!(
+                "indexed element overwrite differs from its rank-one source geometry"
+            )));
         }
-        Self::operation(WorkspaceOperationKind::IndexedElementUpdate, &[self, indices, updates], self.shape(), self.layout.dtype, context)
+        Self::operation(
+            WorkspaceOperationKind::IndexedElementUpdate,
+            &[self, indices, updates],
+            self.shape(),
+            self.layout.dtype,
+            context,
+        )
     }
 }

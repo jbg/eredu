@@ -1,4 +1,4 @@
-//! Real public startup, copied source rebind and two serial captured branches.
+//! Real public startup, copied source rebind and serial captured branches.
 use super::*;
 fn limits() -> CaptureLimits {
     let usage = CaptureUsage {
@@ -10,7 +10,6 @@ fn limits() -> CaptureLimits {
     CaptureLimits {
         per_step: usage,
         cumulative: usage,
-        physical_native_bytes: None,
         on_limit: CaptureLimitPolicy::Fail,
     }
 }
@@ -188,7 +187,7 @@ fn captured_branches(global: bool) {
             background_queue: 1,
         },
     ] {
-        let root = components::qwen_vl_component_fixture(false);
+        let root = prepared_media_copy::media_fixture();
         let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
             .with_residency(residency)
             .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
@@ -198,7 +197,9 @@ fn captured_branches(global: bool) {
                 .into_parts();
         let chat = model
             .source_chat(ChatTemplateRequest {
-                messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+                messages: vec![
+                    serde_json::json!({"role":"user","content":prepared_media_copy::CHAT_TEXT}),
+                ],
                 tools: vec![],
                 tool_choice: ToolChoice::None,
                 add_generation_prompt: true,
@@ -225,9 +226,9 @@ fn captured_branches(global: bool) {
         .unwrap()
         .expect("live media preparation");
         let capture = if global { global_plan() } else { plan() };
-        let mut settings = original_settings(settings);
+        let mut settings = original_settings(settings.clone());
         settings.inference.prefill_chunk_positions = std::num::NonZeroU64::new(2);
-        let mut prepared = PreparedChatRequest::new(&chat, settings);
+        let mut prepared = PreparedChatRequest::new(&chat, settings.clone());
         prepared.input = PreparedChatPrompt::Media(input);
         prepared.output_mode = PreparedChatOutputMode::Text;
         prepared.capture = Some(&capture);
@@ -246,7 +247,11 @@ fn captured_branches(global: bool) {
             cumulative_copy_bytes: 2 << 30,
         };
         session
-            .enable_snapshots(snapshot_limits, ORIGINAL_CAPACITY, copy_limits())
+            .enable_snapshots(
+                snapshot_limits,
+                native_limits(ORIGINAL_CAPACITY),
+                copy_limits(),
+            )
             .unwrap();
         let initial = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
         let mut records = Vec::new();
@@ -322,16 +327,26 @@ fn captured_branches(global: bool) {
             assert!(restored.last().unwrap().cumulative_usage.host_bytes > observed.host_bytes);
             observed = restored.last().unwrap().cumulative_usage;
         }
-        // Preserve the original oversized child request as a typed negative.
-        // Every possible semantic event slot is priced before native copying.
-        assert!(
-            trace
-                .total_bytes
-                .checked_mul(std::mem::size_of::<SemanticEvent>() as u64 + 1)
-                .unwrap()
-                > snapshot_limits.retained_bytes
-        );
+        // The full JSON trace ceiling does not allocate future journal entries.
+        // Keep one real child alive so the next fork exceeds the finite branch
+        // population before native copying or record delivery.
+        let before_full_trace = session.snapshot_usage().unwrap();
+        let mut full_trace_branch = session
+            .fork(
+                &initial,
+                GenerationBranchOptions {
+                    trace_limits: trace,
+                    capture_limits: Some(limits()),
+                    sampling: None,
+                    intervention: None,
+                },
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap();
         let before_fork = session.snapshot_usage().unwrap();
+        assert_eq!(before_fork.branches, snapshot_limits.max_branches);
+        assert!(before_fork.retained_bytes > before_full_trace.retained_bytes);
+        assert!(before_fork.cumulative_copy_bytes > before_full_trace.cumulative_copy_bytes);
         let before_status = session.status();
         let mut rejected_emission = false;
         let error = session
@@ -349,21 +364,20 @@ fn captured_branches(global: bool) {
                 },
             )
             .err()
-            .expect("oversized captured child trace rejects before native copy");
-        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-        let mut retained_limit = false;
-        while let Some(error) = cause {
-            if error.downcast_ref::<ControlledGenerationError>().is_some_and(|error| {
-            matches!(error, ControlledGenerationError::Snapshot(snapshot)
-                if matches!(snapshot.cause(), eredu_runtime::execution_control::TextSnapshotError::Control(
-                    ExecutionControlError::Limit("retained bytes"))))
-        }) {
-            retained_limit = true;
-            break;
-        }
-            cause = error.source();
-        }
-        assert!(retained_limit, "typed retained-byte refusal");
+            .expect("second live captured child rejects before native copy");
+        assert!(
+            matches!(
+                error
+                    .session_failure()
+                    .and_then(|session| session.snapshot_failure()),
+                Some(
+                    eredu_runtime::execution_control::TextSnapshotError::Control(
+                        ExecutionControlError::Limit("branch count")
+                    )
+                )
+            ),
+            "typed simultaneous-branch refusal: {error:?}"
+        );
         assert!(!rejected_emission);
         assert_eq!(
             session.snapshot_usage().unwrap(),
@@ -374,6 +388,34 @@ fn captured_branches(global: bool) {
         assert_eq!(session.token_ids(), expected);
         assert_eq!(session.prompt_attribution(), &attribution);
         drop(error);
+        session
+            .exchange(&mut full_trace_branch, |_| ControlFlow::Continue(()))
+            .unwrap();
+        let mut full_trace_records = Vec::new();
+        session
+            .run(|record| {
+                full_trace_records.push(record);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(session.token_ids(), expected);
+        assert_eq!(session.prompt_attribution(), &attribution);
+        assert!(session.emitted_bytes() > 0 && session.emitted_bytes() <= trace.total_bytes);
+        let full_trace_frames = frames(&full_trace_records);
+        assert_eq!(full_trace_frames.len(), first.len());
+        for (actual, expected) in full_trace_frames.iter().zip(&first) {
+            equal(actual, expected);
+        }
+        drop(full_trace_frames);
+        drop(full_trace_records);
+        session
+            .exchange(&mut full_trace_branch, |_| ControlFlow::Continue(()))
+            .unwrap();
+        drop(full_trace_branch);
+        assert_eq!(
+            session.snapshot_usage().unwrap().branches,
+            before_full_trace.branches
+        );
         // Only the child trace changes. The parent's trace, snapshot, copy and
         // capture ceilings stay exact. Actual emitted bytes must fit this request.
         let child_trace = TraceLimits {

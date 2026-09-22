@@ -1,5 +1,6 @@
 //! One source-bound descriptive table from actual idle resident parameter owners.
 use super::*;
+use crate::backend::nn::workspace::ParameterWorkspaceBackings;
 use eredu_nn::{
     workspace::{
         WorkspaceContext, WorkspaceDtype, WorkspaceFloatingType, WorkspaceMetadataError,
@@ -12,6 +13,7 @@ use std::mem::{size_of, size_of_val};
 pub(in crate::composition::mlx::replicated_text) struct Collector<'context> {
     context: &'context WorkspaceContext,
     rows: Vec<WorkspaceParameterRepresentation>,
+    backings: ParameterWorkspaceBackings,
     failure: Option<eredu_nn::Error>,
 }
 impl Collector<'_> {
@@ -22,15 +24,18 @@ impl Collector<'_> {
         &mut self,
         source: &(impl Parameterized<MlxTensor> + ?Sized),
     ) -> Result<bool, eredu_nn::Error> {
-        self.context.charge_metadata(size_of::<(
-            &mut Self, Result<bool, eredu_nn::Error>,
-        )>().checked_add(size_of_val(&source)).ok_or(WorkspaceMetadataError::Overflow)?)?;
+        self.context.charge_metadata(
+            size_of::<(&mut Self, Result<bool, eredu_nn::Error>)>()
+                .checked_add(size_of_val(&source))
+                .ok_or(WorkspaceMetadataError::Overflow)?,
+        )?;
         // The enclosing installer must surface a real native/metadata failure;
         // a narrower source cannot turn such a failure into successful evidence.
         if self.failure.is_some() {
             return Ok(false);
         }
         self.rows.clear();
+        self.backings.clear();
         self.source(source)
     }
     fn source(
@@ -43,10 +48,7 @@ impl Collector<'_> {
         }
         match visited {
             Ok(()) => Ok(true),
-            Err(
-                eredu_nn::ParameterSourceError::UnclassifiedRetainedField
-                | eredu_nn::ParameterSourceError::UnclassifiedRetainedField,
-            ) => Ok(false),
+            Err(eredu_nn::ParameterSourceError::UnclassifiedRetainedField) => Ok(false),
             Err(cause) => Err(self.context.metadata_source(cause)),
         }
     }
@@ -63,7 +65,7 @@ impl Collector<'_> {
             size_of::<Option<WorkspaceRepresentation>>(),
             size_of::<Option<bool>>(),
             size_of::<WorkspaceParameterRepresentation>(),
-            size_of::<Result<(), eredu_nn::Error>>(),
+            size_of::<Result<ParameterWorkspaceBackings, eredu_nn::Error>>(),
         ];
         let bytes = controls
             .into_iter()
@@ -75,11 +77,23 @@ impl Collector<'_> {
             .as_array()
             .try_descriptor()
             .map_err(|cause| self.context.metadata_source(cause))?;
-        let floating = match descriptor.facts().dtype() {
-            Dtype::Float32 => WorkspaceFloatingType::Float32,
-            Dtype::Float16 => WorkspaceFloatingType::Float16,
-            Dtype::Bfloat16 => WorkspaceFloatingType::Bfloat16,
-            // Quantized/integer slots retain their existing format facts.
+        let (dtype, floating) = match descriptor.facts().dtype() {
+            Dtype::Float32 => (
+                WorkspaceDtype::Float32,
+                Some(WorkspaceFloatingType::Float32),
+            ),
+            Dtype::Float16 => (
+                WorkspaceDtype::Float32,
+                Some(WorkspaceFloatingType::Float16),
+            ),
+            Dtype::Bfloat16 => (
+                WorkspaceDtype::Float32,
+                Some(WorkspaceFloatingType::Bfloat16),
+            ),
+            Dtype::Int32 => (WorkspaceDtype::Int32, None),
+            Dtype::Uint32 => (WorkspaceDtype::Uint32, None),
+            Dtype::Uint8 => (WorkspaceDtype::Uint8, None),
+            Dtype::Bool => (WorkspaceDtype::Bool, None),
             _ => return Ok(()),
         };
         self.context.reserve_metadata_vec(&mut self.rows, 1)?;
@@ -90,16 +104,19 @@ impl Collector<'_> {
         .map_err(|cause| self.context.metadata_source(cause))?;
         // Dtype belongs to the actual descriptor even when an unevaluated
         // view has no settled stride flags. False makes no contiguity claim.
-        let representation = Some(WorkspaceRepresentation::new(
-            floating,
-            descriptor.row_contiguous().unwrap_or(false),
-        ));
+        let representation = floating.map(|floating| {
+            WorkspaceRepresentation::new(floating, descriptor.row_contiguous().unwrap_or(false))
+        });
         let layout = self
             .context
-            .layout(descriptor.shape(), WorkspaceDtype::Float32)?
+            .layout(descriptor.shape(), dtype)?
             .with_representation(representation);
-        self.rows
-            .push(WorkspaceParameterRepresentation::new(id, layout));
+        let row = WorkspaceParameterRepresentation::new(id, layout);
+        let row = match self.backings.import(value.as_array(), self.context)? {
+            Some(backing) => row.with_backing(backing),
+            None => row,
+        };
+        self.rows.push(row);
         Ok(())
     }
 }
@@ -118,11 +135,11 @@ impl<'source> ParameterSourceVisitor<'source, MlxTensor> for Collector<'_> {
 pub(in crate::composition::mlx::replicated_text) fn install<'context>(
     context: &'context WorkspaceContext,
     visit: impl FnOnce(&mut Collector<'context>) -> Result<bool, eredu_nn::Error>,
-) -> Result<(), eredu_nn::Error> {
+) -> Result<ParameterWorkspaceBackings, eredu_nn::Error> {
     let controls = [
         size_of::<Collector<'_>>(),
         size_of::<Result<bool, eredu_nn::Error>>(),
-        size_of::<Result<(), eredu_nn::Error>>(),
+        size_of::<Result<ParameterWorkspaceBackings, eredu_nn::Error>>(),
         size_of::<(&WorkspaceContext,)>(),
         size_of_val(&visit),
     ];
@@ -135,6 +152,7 @@ pub(in crate::composition::mlx::replicated_text) fn install<'context>(
     let mut collector = Collector {
         context,
         rows: context.metadata_vec(0)?,
+        backings: ParameterWorkspaceBackings::default(),
         failure: None,
     };
     let complete = visit(&mut collector)?;
@@ -143,8 +161,10 @@ pub(in crate::composition::mlx::replicated_text) fn install<'context>(
     }
     if complete {
         context.install_parameter_representations(collector.rows)?;
+        Ok(collector.backings)
+    } else {
+        Ok(ParameterWorkspaceBackings::default())
     }
-    Ok(())
 }
 
 /// Uses the same retained execution's static source when its complete unit
@@ -154,7 +174,7 @@ pub(in crate::composition::mlx::replicated_text) fn install_with_static_fallback
     context: &'context WorkspaceContext,
     static_modules: Option<&(impl Parameterized<MlxTensor> + ?Sized)>,
     visit: impl FnOnce(&mut Collector<'context>) -> Result<bool, eredu_nn::Error>,
-) -> Result<(), eredu_nn::Error> {
+) -> Result<ParameterWorkspaceBackings, eredu_nn::Error> {
     // install accounts the concrete callback, including its source/visit
     // captures; static_source accounts the fallback traversal before it starts.
     install(context, |collector| {
@@ -243,10 +263,7 @@ where
                 .map_err(|cause| context.metadata_source(cause))?;
             match unit.visit_parameter_sources(visitor) {
                 Ok(()) => {}
-                Err(
-                    eredu_nn::ParameterSourceError::UnclassifiedRetainedField
-                    | eredu_nn::ParameterSourceError::UnclassifiedRetainedField,
-                ) => return Ok(false),
+                Err(eredu_nn::ParameterSourceError::UnclassifiedRetainedField) => return Ok(false),
                 Err(cause) => return Err(context.metadata_source(cause)),
             }
         }
@@ -257,19 +274,29 @@ where
         &self,
         static_modules: &(impl Parameterized<MlxTensor> + ?Sized),
         context: &WorkspaceContext,
-    ) -> Result<(), eredu_nn::Error> {
+    ) -> Result<ParameterWorkspaceBackings, eredu_nn::Error> {
         install(context, |collector| {
             if !collector.source(static_modules)? {
                 return Ok(false);
             }
-            let frames=[size_of::<std::sync::MutexGuard<'_,MlxSelectedLayerwisePolicyInner<U,P>>>(),
-                size_of::<Result<std::sync::MutexGuard<'_,MlxSelectedLayerwisePolicyInner<U,P>>,Error>>(),
-                size_of::<bool>()];
-            context.charge_metadata(frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
-                .ok_or(WorkspaceMetadataError::Overflow)?)?;
-            let bounded={
-                let selected=self.operation_policy().map_err(|cause|context.metadata_source(cause))?;
-                matches!(&*selected,MlxSelectedLayerwisePolicyInner::Bounded {..})
+            let frames = [
+                size_of::<std::sync::MutexGuard<'_, MlxSelectedLayerwisePolicyInner<U, P>>>(),
+                size_of::<
+                    Result<std::sync::MutexGuard<'_, MlxSelectedLayerwisePolicyInner<U, P>>, Error>,
+                >(),
+                size_of::<bool>(),
+            ];
+            context.charge_metadata(
+                frames
+                    .into_iter()
+                    .try_fold(size_of_val(&frames), usize::checked_add)
+                    .ok_or(WorkspaceMetadataError::Overflow)?,
+            )?;
+            let bounded = {
+                let selected = self
+                    .operation_policy()
+                    .map_err(|cause| context.metadata_source(cause))?;
+                matches!(&*selected, MlxSelectedLayerwisePolicyInner::Bounded { .. })
             };
             if bounded {
                 // All static modules were visited above. Unit dtype facts are

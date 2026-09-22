@@ -1,11 +1,82 @@
 //! Native controls reuse the ordinary selector's projection, top-k and weights.
 use super::*;
 use eredu_nn::routing_intervention::{
-    execute_routing_intervention, GroupSelectionControl, RoutingMechanism, RoutingRows,
+    execute_routing_intervention_fixed, FixedRoutingExecutionError, GroupSelectionControl,
+    RoutingMechanism, RoutingRows,
 };
-use safemlx::ops::indexing::{IntoStrideBy, TryIndexMutOp};
+
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+struct RetainedRoutingRefusal {
+    #[source]
+    cause: eredu_nn::routing_intervention::RoutingInvalidCause,
+    // This fixed original carrier retains the real admitted host envelope
+    // until the erased error box has been deallocated.
+    _custody: Exception,
+}
+fn refusal(cause: eredu_nn::routing_intervention::RoutingInvalidCause) -> Exception {
+    match safemlx::OriginalScopeObserver::try_current() {
+        Ok(Some(observer)) => Exception::from_retained_source(RetainedRoutingRefusal {
+            cause,
+            _custody: observer.invalid_input_error(),
+        }),
+        Err(error) => error,
+        Ok(None) => Exception::from_source(cause),
+    }
+}
 
 impl TopKGroupSelector {
+    pub(crate) fn intervention_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        type Failure = FixedRoutingExecutionError<Exception>;
+        type Decision = eredu_nn::GroupSelection<Array>;
+        type Decisions = eredu_nn::routing_intervention::IntervenedGroupSelection<Array>;
+        let frames = [
+            size_of::<NativeRouting<'static>>(),
+            size_of::<NativeRows>(),
+            size_of::<Vec<f32>>(),
+            size_of::<Vec<bool>>(),
+            size_of::<(&[u32], &[f32], &[bool])>(),
+            size_of::<std::iter::Zip<std::slice::Iter<'static, u32>, std::slice::Iter<'static, f32>>>(
+            ),
+            crate::backend::nn::workspace::host_array::control_bytes()?,
+            size_of::<(&mut Self, &Array, &GroupSelectionControl, &Stream)>(),
+            size_of::<Decisions>(),
+            size_of::<Result<Decisions, Failure>>(),
+            size_of::<Failure>(),
+            size_of::<GroupSelectionOutput>() * 2,
+            size_of::<Option<GroupSelectionOutput>>(),
+            size_of::<Result<(Option<GroupSelectionOutput>, GroupSelectionOutput), Exception>>(),
+            size_of::<Option<Decision>>(),
+            size_of::<Decision>() * 2,
+            size_of::<Option<(Array, Array)>>(),
+            size_of::<(Array, Array)>(),
+            size_of::<RoutingRows>(),
+            size_of::<eredu_nn::TopKGroupSelectionSpec>(),
+            size_of::<(&NativeRouting<'static>, &Array, &NativeRows)>(),
+            size_of::<(&NativeRouting<'static>, &Array, &[u32], &NativeRows)>(),
+            size_of::<(Array, Array, Array)>(),
+            size_of::<Result<Array, Exception>>() * 2,
+            size_of::<[i32; 2]>() * 4,
+            size_of::<[i32; 4]>(),
+            size_of::<(&[i32], u64, Option<u64>)>(),
+            size_of::<(bool, u64, u64, u64)>(),
+            size_of::<Result<bool, Exception>>(),
+            size_of::<Result<NativeRows, Exception>>(),
+            size_of::<Result<(eredu_nn::TopKGroupSelectionSpec, bool), Exception>>(),
+            size_of::<Result<u64, Exception>>(),
+            safemlx::Array::static_slice_update_control_bytes()?,
+            safemlx::original_scoped_evaluation_control_bytes()?,
+            Self::selection_control_bytes(false)?,
+            Exception::retained_source_control_bytes::<RetainedRoutingRefusal>()?,
+            safemlx::OriginalScopeObserver::control_bytes()?,
+            size_of::<RetainedRoutingRefusal>(),
+            size_of::<Result<Option<safemlx::OriginalScopeObserver>, Exception>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
     pub(crate) fn selection_spec(&self) -> Result<eredu_nn::TopKGroupSelectionSpec, Exception> {
         use eredu_nn::GroupScoring as S;
         eredu_nn::TopKGroupSelectionSpec::new(
@@ -32,7 +103,7 @@ impl TopKGroupSelector {
         control: &GroupSelectionControl,
         stream: &Stream,
     ) -> Result<(Option<GroupSelectionOutput>, GroupSelectionOutput), Exception> {
-        let result = execute_routing_intervention(
+        let result = execute_routing_intervention_fixed(
             &mut NativeRouting {
                 selector: self,
                 stream,
@@ -41,7 +112,10 @@ impl TopKGroupSelector {
             input,
             control,
         )
-        .map_err(|error| Exception::custom(error.to_string()))?;
+        .map_err(|error| match error {
+            FixedRoutingExecutionError::Native(error) => error,
+            FixedRoutingExecutionError::Invalid(error) => refusal(error),
+        })?;
         let output = |selection: eredu_nn::GroupSelection<Array>| {
             let (indices, scores, weights) = selection.into_parts();
             Ok::<_, Exception>(GroupSelectionOutput {
@@ -240,15 +314,19 @@ impl RoutingMechanism for NativeRouting<'_> {
         ids: &[u32],
         rows: &NativeRows,
     ) -> Result<Array, Exception> {
-        let mut output = indices.clone();
         let forced = Array::try_from_slice(ids, &[rows.count, self.selector.top_k])?
             .as_dtype(indices.dtype(), self.stream)?;
-        output.try_index_mut_device(
-            ((rows.first..rows.end).stride_by(rows.stride), ..),
-            forced,
+        if rows.first == 0 && rows.end == indices.dim(0) && rows.stride == 1 {
+            return Ok(forced);
+        }
+        let output = indices.contiguous(false, self.stream)?;
+        output.try_slice_update(
+            &forced,
+            &[rows.first, 0],
+            &[rows.end, self.selector.top_k],
+            &[rows.stride, 1],
             self.stream,
-        )?;
-        Ok(output)
+        )
     }
     fn fill_gathered(
         &self,

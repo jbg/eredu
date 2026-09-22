@@ -159,6 +159,9 @@ pub(super) fn emit(
         ] {
             scratch = add(scratch, capacity(allocation, count)?)?;
         }
+        // winograd_conv_2D_gpu constructs zero_arr with the default allocator
+        // and retains it in copies_w while fill_gpu writes the padded input.
+        sink.default_scratch(capacity(allocation, 1)?, 1)?;
         // The 64 independent Winograd GEMMs have non-broadcast weights. They
         // cannot collapse to unbatched split-K and allocate no partial tensor.
         "FP32 Winograd padded input, fill scalar, three transformed buffers and possible final dtype restoration"

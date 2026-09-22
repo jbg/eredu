@@ -99,15 +99,27 @@ fn validate_record_encoding(
         .get(index)
         .ok_or(CaptureStepError::RecordNotPending { index })?;
     match (&record.outcome, &record.payload) {
-        (CaptureOutcome::Captured | CaptureOutcome::Truncated { .. },
-            Some(CapturePayload::SharedTensor(_) | CapturePayload::Candidates(_)
-                | CapturePayload::TokenScores(_) | CapturePayload::Summary(_)
-                | CapturePayload::Histogram(_) | CapturePayload::RoutedUnits(_))) => {}
+        (
+            CaptureOutcome::Captured | CaptureOutcome::Truncated { .. },
+            Some(
+                CapturePayload::SharedTensor(_)
+                | CapturePayload::Candidates(_)
+                | CapturePayload::TokenScores(_)
+                | CapturePayload::Summary(_)
+                | CapturePayload::Histogram(_)
+                | CapturePayload::RoutedUnits(_),
+            ),
+        ) => {}
         // A no-overlap window observed its real source but has no selected
         // rectangle or payload. It still requires the exact encoding check.
-        (CaptureOutcome::Skipped { reason: CaptureSkipReason::NotInvoked }, None)
-            if record.source_shape.is_some() && record.source_dtype.is_some()
-                && record.selected_shape.is_none() => {}
+        (
+            CaptureOutcome::Skipped {
+                reason: CaptureSkipReason::NotInvoked,
+            },
+            None,
+        ) if record.source_shape.is_some()
+            && record.source_dtype.is_some()
+            && record.selected_shape.is_none() => {}
         _ => return Err(CaptureStepError::RecordNotPending { index }),
     }
     if crate::capture::record_fits_encoding(record) {

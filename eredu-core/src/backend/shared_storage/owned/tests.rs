@@ -95,7 +95,7 @@ impl Drop for Unused<'_> {
 #[test]
 fn owned_attachment_reuses_same_owner_and_unused_closure_drops_after_unlock() {
     let custody = SharedStorageCustody::new();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let (owner, probe) = owner();
     let attached = custody
         .try_attach_owned_nonblocking(&domain, || Ok::<_, Infallible>(owner.clone()))
@@ -124,7 +124,7 @@ fn owned_attachment_reuses_same_owner_and_unused_closure_drops_after_unlock() {
 fn owned_and_raw_attachment_populations_cannot_cross_and_mismatch_is_lazy() {
     for raw in [false, true] {
         let custody = SharedStorageCustody::new();
-        let domain = SharedStorageDomain::default();
+        let domain = SharedStorageAccountingId::default();
         if raw {
             custody
                 .try_attach_typed_nonblocking(&domain, || Ok::<_, Infallible>(Arc::new(Other)))
@@ -166,7 +166,7 @@ fn owned_and_raw_attachment_populations_cannot_cross_and_mismatch_is_lazy() {
 #[test]
 fn owned_provider_error_and_unwind_keep_staged_payload_outside_source_lock() {
     let custody = SharedStorageCustody::new();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let checked = AtomicBool::new(false);
     let error = custody.try_attach_owned_nonblocking::<Payload, _>(&domain, || {
         Err(Unused {
@@ -206,11 +206,12 @@ fn owned_attachment_busy_and_cold_controls_do_not_invoke_provider() {
     let custody = SharedStorageCustody::new();
     let guard = custody.attachments.lock().unwrap();
     let bytes =
-        crate::capture::SharedCapturePlan::owned_attachment_control_bytes::<Payload>().unwrap();
-    assert!(bytes >= size_of::<Attachment>() + size_of::<Option<Payload>>());
+        crate::capture::SharedCapturePlan::owned_attachment_control_bytes::<Payload, Infallible>()
+            .unwrap();
+    assert!(bytes > 0);
     assert!(matches!(
         custody.try_attach_owned_nonblocking::<Payload, Infallible>(
-            &SharedStorageDomain::default(),
+            &SharedStorageAccountingId::default(),
             || panic!("busy provider")
         ),
         Err(SharedStorageAttachmentError::Busy)

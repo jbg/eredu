@@ -1,5 +1,7 @@
+#[path = "support/memory.rs"]
+mod memory;
 use eredu::api::{
-    LoadedModel, LoadedTextModelConfig, TextInspectionOptions, inspect_text_model, load_tokenizer,
+    inspect_text_model, load_tokenizer, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
 };
 use eredu_architectures::ModelKind;
 use eredu_core::{
@@ -11,7 +13,8 @@ use eredu_core::{
     TokenFilter, TokenOutput,
 };
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
-use tokenizers::{AddedToken, Tokenizer, models::wordlevel::WordLevel};
+use memory::{FundingFixture, LedgerFixture, StorageFixture};
+use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
 #[path = "support/admitted_text.rs"]
 mod admitted_text;
@@ -59,7 +62,7 @@ struct BackendCalls {
     reject_submission: bool,
     reject_prompt: bool,
     reject_sampling: bool,
-    pool: Option<eredu_runtime::working_memory::WorkingMemoryPool>,
+    pool: Option<eredu_runtime::working_memory::MemoryLedger>,
 }
 
 #[derive(Default)]
@@ -428,7 +431,7 @@ impl TextGenerationBackend for MockBackend {
         p: &Self::TextPreparation,
     ) -> Result<Self::TextGenerationState, Self::Error> {
         if let Some(p) = p {
-            p.request.claim_sampling(config)?.finish()?;
+            p.request.claim_sampling(config.clone())?.finish()?;
         }
         Self::start_text_generation(backend, config)
     }
@@ -647,9 +650,7 @@ fn loaded_model_generates_without_an_mlx_dependency() {
 #[test]
 #[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT; tokenizer/template only, no native backend"]
 fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
-    use eredu::api::{
-        PreparedChatGenerationSettings,
-    };
+    use eredu::api::PreparedChatGenerationSettings;
     use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
     use eredu_core::{FinishReason, SemanticEvent};
     use serde_json::json;
@@ -719,7 +720,12 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel,
+            )
             .map(|chat| chat.expect("active preparation"))
     }
     .unwrap();
@@ -789,9 +795,7 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
 
 #[test]
 fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
-    use eredu::api::{
-        PreparedChatGenerationSettings,
-    };
+    use eredu::api::PreparedChatGenerationSettings;
     use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
     use eredu_core::{FinishReason, SemanticEvent};
     use serde_json::json;
@@ -910,7 +914,12 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                         .unwrap()
                         .unwrap();
                     model
-                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                        .prepare_chat(
+                            &source,
+                            &request,
+                            &crate::memory::limits(original_sources::CAPACITY),
+                            &cancel,
+                        )
                         .map(|chat| chat.expect("active preparation"))
                 }
                 .unwrap();
@@ -968,11 +977,9 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                         .count(),
                     count
                 );
-                assert!(
-                    !events
-                        .iter()
-                        .any(|event| matches!(event, SemanticEvent::TextDelta(_)))
-                );
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, SemanticEvent::TextDelta(_))));
                 assert_eq!(events.last(), Some(&SemanticEvent::Finished { reason }));
             }
         }
@@ -1084,9 +1091,7 @@ fn sparse_vocabulary_model_with_backend(
 
 #[test]
 fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
-    use eredu::api::{
-        PreparedChatGenerationSettings,
-    };
+    use eredu::api::PreparedChatGenerationSettings;
     use eredu::runtime::chat::ChatTemplateRequest;
     for (logits, expected) in [
         (vec![0.0, 100.0, 10.0, 200.0, 300.0, 1.0, 400.0, 500.0], 2),
@@ -1119,7 +1124,12 @@ fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancel,
+                )
                 .map(|chat| chat.expect("active preparation"))
         }
         .unwrap();
@@ -1178,14 +1188,18 @@ fn ordinary_generation_fails_if_no_mapped_id_is_executable() {
         },
     )
     .unwrap();
-    let config =
-        TextGenerationConfig::new(model.resolve_generation_config(Default::default()).unwrap());
-    assert!(
+    let config = TextGenerationConfig::new(
         model
-            .generate_tokens(vec![0].into(), config)
-            .unwrap()
-            .next()
-            .unwrap()
-            .is_err()
+            .resolve_generation_config(GenerationConfigOverrides {
+                max_new_tokens: Some(1),
+                ..Default::default()
+            })
+            .unwrap(),
     );
+    assert!(model
+        .generate_tokens(vec![0].into(), config)
+        .unwrap()
+        .next()
+        .unwrap()
+        .is_err());
 }

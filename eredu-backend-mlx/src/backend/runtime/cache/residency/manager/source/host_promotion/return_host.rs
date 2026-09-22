@@ -43,13 +43,17 @@ impl PreparedCacheHostPromotion {
                 n.checked_add(u64::try_from(d.allocation().bytes()).ok()?)
             })
             .ok_or_else(|| source.error(CacheSourceError::Overflow))?;
-        self.device_retirement.attach(arrays).map_err(|cause| source.error(cause))?;
+        self.device_retirement
+            .attach(arrays)
+            .map_err(|cause| source.error(cause))?;
         self.replaced = Some(super::super::host_demotion::commit_host(
             &self.manager,
             &eviction,
             self.host.clone(),
             capacity,
-            self.reservation.as_mut().expect("completed promotion reservation"),
+            self.reservation
+                .as_mut()
+                .expect("completed promotion reservation"),
             false,
         )?);
         self.demoted = true;

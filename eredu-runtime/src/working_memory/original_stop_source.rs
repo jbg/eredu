@@ -1,13 +1,13 @@
 //! Original stop compiler charge; immutable strings are borrowed only during construction.
 use super::loaded_decode_source::Allowance;
-use super::{WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError};
 use eredu_core::BackendFailure;
 use eredu_text::stop_storage::{PreparedStopSource, StopCompileFailure, StopCompilePlan};
 use std::{
     alloc::Layout,
     fmt,
     mem::size_of,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 #[derive(Debug)]
@@ -47,8 +47,8 @@ impl OriginalStopSource {
         decoder.validate_pool(self.payload().allowance.pool())
     }
     /// Checks the original domain without minting a request or another hold.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.payload().allowance.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.payload().allowance.pool().same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -129,7 +129,7 @@ impl std::error::Error for OriginalStopSourceError {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Actual source-derived compiler plus closed owner/error control requirements.
     /// This query grants no budget and takes no ownership of the borrowed plan.
     pub fn stop_source_required_bytes(

@@ -1,7 +1,7 @@
 //! Global tensor and finite-statistic assembly with exact bounded coverage checks.
 use super::*;
 use eredu_core::{
-    checkpoint::TensorDtype, ObservationPoint, TensorObservation, TensorObservationData,
+    ObservationPoint, TensorObservation, TensorObservationData, checkpoint::TensorDtype,
 };
 
 fn invalid(message: &str) -> PartitionCaptureMergeError {
@@ -40,7 +40,7 @@ pub(super) fn assembly_payload_usage(
             CaptureTransform::RoutedUnits => {
                 return Err(CaptureError::Unsupported(
                     "routed-unit assembly requires retained expert/source ownership".into(),
-                ))
+                ));
             }
             CaptureTransform::FullTensor | CaptureTransform::Slice => {
                 (mul(elements, 8)?, mul(elements, 32)?)
@@ -88,6 +88,7 @@ pub(super) fn assemble_vocabulary_fragment(
         prediction,
         global_shape,
         &fragments,
+        None,
     )?;
     if fragments.len() != 1 {
         return Err(invalid(
@@ -136,6 +137,7 @@ impl<'a> Assembly<'a> {
         prediction: u64,
         global_shape: &'a [u64],
         fragments: &[CapturedPartitionFragment],
+        context: Option<&PartitionCaptureContext>,
     ) -> Result<Self, PartitionCaptureMergeError> {
         let selection = plan
             .plan()
@@ -151,9 +153,27 @@ impl<'a> Assembly<'a> {
         }
         let point = &plan.points()[selection_index];
         let invocation = fragments.first().and_then(|fragment| fragment.invocation);
-        plan.geometry_at(phase, prediction, invocation)?
-            .validate_actual(point, global_shape)?;
-        let slice = resolve_slice(point, selection, global_shape)?;
+        if let Some(context) = context {
+            if context.capture_plan_identity != plan.identity()
+                || context.selection_index != selection_index
+                || context.phase != phase
+                || context.prediction != prediction
+                || context.invocation != invocation
+            {
+                return Err(invalid("assembly differs from its original receipt"));
+            }
+            context.validate()?;
+        }
+        plan.geometry_at(
+            phase,
+            prediction,
+            context.map_or(invocation, PartitionCaptureContext::physical_invocation),
+        )?
+        .validate_actual(point, global_shape)?;
+        let slice = match context {
+            Some(context) => super::receipt::geometry::source_slice(plan, context, global_shape)?,
+            None => resolve_slice(point, selection, global_shape)?,
+        };
         let count = elements(&slice.shape)?;
         let Some(first) = fragments.first() else {
             return Err(PartitionCaptureMergeError::Incomplete {
@@ -292,6 +312,28 @@ pub fn assemble_tensor_fragments(
     fragments: Vec<CapturedPartitionFragment>,
     ledger: &mut dyn CaptureReservation,
 ) -> Result<AssembledPartitionCapture, PartitionCaptureMergeError> {
+    assemble_tensor_source(
+        plan,
+        selection_index,
+        phase,
+        prediction,
+        global_shape,
+        fragments,
+        ledger,
+        None,
+    )
+}
+
+pub(super) fn assemble_tensor_source(
+    plan: &AdmittedCapturePlan,
+    selection_index: usize,
+    phase: CapturePhase,
+    prediction: u64,
+    global_shape: &[u64],
+    fragments: Vec<CapturedPartitionFragment>,
+    ledger: &mut dyn CaptureReservation,
+    context: Option<&PartitionCaptureContext>,
+) -> Result<AssembledPartitionCapture, PartitionCaptureMergeError> {
     let mut assembly = Assembly::validate(
         plan,
         selection_index,
@@ -299,6 +341,7 @@ pub fn assemble_tensor_fragments(
         prediction,
         global_shape,
         &fragments,
+        context,
     )?;
     if !matches!(
         assembly.selection.transform,
@@ -434,6 +477,28 @@ pub fn assemble_reduced_fragments(
     fragments: Vec<CapturedPartitionFragment>,
     ledger: &mut dyn CaptureReservation,
 ) -> Result<AssembledPartitionCapture, PartitionCaptureMergeError> {
+    assemble_reduced_source(
+        plan,
+        selection_index,
+        phase,
+        prediction,
+        global_shape,
+        fragments,
+        ledger,
+        None,
+    )
+}
+
+pub(super) fn assemble_reduced_source(
+    plan: &AdmittedCapturePlan,
+    selection_index: usize,
+    phase: CapturePhase,
+    prediction: u64,
+    global_shape: &[u64],
+    fragments: Vec<CapturedPartitionFragment>,
+    ledger: &mut dyn CaptureReservation,
+    context: Option<&PartitionCaptureContext>,
+) -> Result<AssembledPartitionCapture, PartitionCaptureMergeError> {
     let mut assembly = Assembly::validate(
         plan,
         selection_index,
@@ -441,6 +506,7 @@ pub fn assemble_reduced_fragments(
         prediction,
         global_shape,
         &fragments,
+        context,
     )?;
     match &assembly.selection.transform {
         CaptureTransform::Summary => {

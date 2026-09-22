@@ -5,7 +5,7 @@ use crate::backend::array_copy::{CaptureNativePopulation, CaptureTensorSelection
 use eredu_core::{InferenceGeometry, capture::*};
 use eredu_nn::{
     Tensor,
-    workspace::{WorkspaceContext, WorkspaceTensor, WorkspaceFloatingType},
+    workspace::{WorkspaceContext, WorkspaceFloatingType, WorkspaceTensor},
 };
 use eredu_runtime::{
     ActivationObserver,
@@ -17,10 +17,10 @@ use std::cell::{Cell, RefCell};
 mod fragments;
 mod partition;
 pub(in crate::composition::mlx::session) use partition::estimate_geometry as estimate_partition_prefill;
-pub(in crate::composition::mlx::session) use partition::trace_geometry as trace_partition_prefill_geometry;
-pub(in crate::composition::mlx::session) use partition::invocation::trace_geometry as trace_partition_invocation_geometry;
 pub(in crate::composition::mlx::session) use partition::invocation::estimate_geometry as estimate_partition_invocation;
+pub(in crate::composition::mlx::session) use partition::invocation::trace_geometry as trace_partition_invocation_geometry;
 pub(in crate::composition::mlx) use partition::source::validate as validate_partition_capture_source;
+pub(in crate::composition::mlx::session) use partition::trace_geometry as trace_partition_prefill_geometry;
 mod routed;
 
 type Result<T> = std::result::Result<T, eredu_nn::Error>;
@@ -51,24 +51,40 @@ fn record_source(
     context: &WorkspaceContext,
     value: &WorkspaceTensor,
 ) -> Result<()> {
-    record_scalar_source(counter,index,context,value.layout().representation().map(|source|source.dtype()))
+    record_scalar_source(
+        counter,
+        index,
+        context,
+        value.layout().representation().map(|source| source.dtype()),
+    )
 }
 fn record_scalar_source(
-    counter:Option<&[Cell<Option<WorkspaceFloatingType>>]>,index:usize,
-    context:&WorkspaceContext,dtype:Option<WorkspaceFloatingType>,
-)->Result<()> {
-    let Some(counters) = counter else { return Ok(()); };
+    counter: Option<&[Cell<Option<WorkspaceFloatingType>>]>,
+    index: usize,
+    context: &WorkspaceContext,
+    dtype: Option<WorkspaceFloatingType>,
+) -> Result<()> {
+    let Some(counters) = counter else {
+        return Ok(());
+    };
     context.charge_metadata(std::mem::size_of::<(
-        Option<WorkspaceFloatingType>, &WorkspaceTensor, Result<()>, usize,
-        Option<&[Cell<Option<WorkspaceFloatingType>>]>, &Cell<Option<WorkspaceFloatingType>>,
+        Option<WorkspaceFloatingType>,
+        &WorkspaceTensor,
+        Result<()>,
+        usize,
+        Option<&[Cell<Option<WorkspaceFloatingType>>]>,
+        &Cell<Option<WorkspaceFloatingType>>,
         eredu_runtime::working_memory::WorkingMemoryError,
     )>())?;
-    let counter = counters.get(index).ok_or_else(|| context.metadata_source(
-        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
-    let dtype = dtype
-        .ok_or_else(|| context.metadata_source(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))?;
+    let counter = counters.get(index).ok_or_else(|| {
+        context.metadata_source(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)
+    })?;
+    let dtype = dtype.ok_or_else(|| {
+        context.metadata_source(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound)
+    })?;
     if counter.get().is_some_and(|prior| prior != dtype) {
-        return Err(context.metadata_source(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        return Err(context
+            .metadata_source(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
     }
     counter.set(Some(dtype));
     Ok(())
@@ -92,11 +108,17 @@ fn record_replica(
     value: &WorkspaceTensor,
 ) -> Result<()> {
     context.charge_metadata(std::mem::size_of::<(
-        Option<&Cell<CaptureNativePopulation>>, &WorkspaceContext,
-        &mut Vec<WorkspaceTensor>, &WorkspaceTensor, CaptureNativePopulation, Result<()>,
+        Option<&Cell<CaptureNativePopulation>>,
+        &WorkspaceContext,
+        &mut Vec<WorkspaceTensor>,
+        &WorkspaceTensor,
+        CaptureNativePopulation,
+        Result<()>,
     )>())?;
     let population = CaptureNativePopulation {
-        publications: 0, completions: 1, retained_roots: 1,
+        publications: 0,
+        completions: 1,
+        retained_roots: 1,
         controls: super::model_session::text_funding::capture_replica_control_bytes()
             .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
     };
@@ -109,14 +131,19 @@ fn record_replica(
 /// The same completed replica source used by an ordinary projected hook.
 /// Empty selected overlap remains an actual invocation with its own scalar.
 pub(in crate::composition::mlx::session) fn trace_partition_replica(
-    value:&WorkspaceTensor,context:&WorkspaceContext,roots:&mut Vec<WorkspaceTensor>,
-)->Result<CaptureNativePopulation> {
+    value: &WorkspaceTensor,
+    context: &WorkspaceContext,
+    roots: &mut Vec<WorkspaceTensor>,
+) -> Result<CaptureNativePopulation> {
     context.charge_metadata(std::mem::size_of::<(
-        &WorkspaceTensor,&WorkspaceContext,&mut Vec<WorkspaceTensor>,
-        Cell<CaptureNativePopulation>,Result<CaptureNativePopulation>,
+        &WorkspaceTensor,
+        &WorkspaceContext,
+        &mut Vec<WorkspaceTensor>,
+        Cell<CaptureNativePopulation>,
+        Result<CaptureNativePopulation>,
     )>())?;
-    let counter=Cell::new(CaptureNativePopulation::default());
-    record_replica(Some(&counter),context,roots,value)?;
+    let counter = Cell::new(CaptureNativePopulation::default());
+    record_replica(Some(&counter), context, roots, value)?;
     Ok(counter.get())
 }
 
@@ -201,8 +228,12 @@ pub(in crate::composition::mlx) struct CaptureWorkspaceObserver<'a> {
     source: &'a SharedCapturePlan,
     invocation: Option<Invocation<'a>>,
     transfers: Option<&'a Cell<CaptureNativePopulation>>,
+    completed_publications: usize,
     scalar_source: Option<&'a [Cell<Option<WorkspaceFloatingType>>]>,
-    placement: Option<(&'a eredu_architectures::component_partition::ComponentPartitionLayouts, usize)>,
+    placement: Option<(
+        &'a eredu_architectures::component_partition::ComponentPartitionLayouts,
+        usize,
+    )>,
     geometry: InferenceGeometry,
     context: WorkspaceContext,
     ledger: CaptureLedger,
@@ -226,7 +257,7 @@ pub(in crate::composition::mlx) struct CaptureWorkspaceObserver<'a> {
     routed_active: bool,
     // Exact original provider extent of a cold addressable source. This is not
     // a delivered native batch or received-row count.
-    routed_addressable_rows:Option<u64>,
+    routed_addressable_rows: Option<u64>,
     routed_tokens: [u64; 2],
     routed_native_rows: Option<u64>,
 }
@@ -279,12 +310,19 @@ impl<'a> CaptureWorkspaceObserver<'a> {
         context: &WorkspaceContext,
         transfers: &'a Cell<CaptureNativePopulation>,
         scalar: &'a [Cell<Option<WorkspaceFloatingType>>],
-        placement: (&'a eredu_architectures::component_partition::ComponentPartitionLayouts, usize),
+        placement: (
+            &'a eredu_architectures::component_partition::ComponentPartitionLayouts,
+            usize,
+        ),
     ) -> Result<(Self, CaptureRunHostPlan<'a>)> {
         context.charge_metadata(std::mem::size_of::<(
-            Self, Result<(Self, CaptureRunHostPlan<'a>)>,
+            Self,
+            Result<(Self, CaptureRunHostPlan<'a>)>,
             &[Cell<Option<WorkspaceFloatingType>>],
-            (&eredu_architectures::component_partition::ComponentPartitionLayouts, usize),
+            (
+                &eredu_architectures::component_partition::ComponentPartitionLayouts,
+                usize,
+            ),
         )>())?;
         let (mut observer, host) = Self::with_prefill_transfers(bound, context, transfers)?;
         observer.bind_partition_sources(scalar, placement)?;
@@ -293,17 +331,30 @@ impl<'a> CaptureWorkspaceObserver<'a> {
     /// Borrow the exact source rows alongside either initial or saved capture
     /// state. No source or plan may be replaced after this observer is bound.
     pub(in crate::composition::mlx) fn bind_partition_sources(
-        &mut self, scalar: &'a [Cell<Option<WorkspaceFloatingType>>],
-        placement: (&'a eredu_architectures::component_partition::ComponentPartitionLayouts, usize),
+        &mut self,
+        scalar: &'a [Cell<Option<WorkspaceFloatingType>>],
+        placement: (
+            &'a eredu_architectures::component_partition::ComponentPartitionLayouts,
+            usize,
+        ),
     ) -> Result<()> {
         self.context.charge_metadata(std::mem::size_of::<(
-            &mut Self, &[Cell<Option<WorkspaceFloatingType>>],
-            (&eredu_architectures::component_partition::ComponentPartitionLayouts, usize), Result<()>,
+            &mut Self,
+            &[Cell<Option<WorkspaceFloatingType>>],
+            (
+                &eredu_architectures::component_partition::ComponentPartitionLayouts,
+                usize,
+            ),
+            Result<()>,
         )>())?;
-        if self.scalar_source.is_some() || self.placement.is_some()
+        if self.scalar_source.is_some()
+            || self.placement.is_some()
             || scalar.len() != self.source.admission().plan().selections.len()
-            || placement.1 >= placement.0.topology().world_size() {
-            return Err(self.context.metadata_source(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            || placement.1 >= placement.0.topology().world_size()
+        {
+            return Err(self.context.metadata_source(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         self.scalar_source = Some(scalar);
         self.placement = Some(placement);
@@ -534,6 +585,7 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                 source,
                 invocation,
                 transfers,
+                completed_publications: 0,
                 scalar_source: None,
                 placement: None,
                 geometry,
@@ -557,12 +609,28 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                 routed_selection: None,
                 routed_intervention_selection: None,
                 routed_active: false,
-                routed_addressable_rows:None,
+                routed_addressable_rows: None,
                 routed_tokens: [0; 2],
                 routed_native_rows: None,
             },
             host,
         ))
+    }
+    /// Attach a descriptive counter to the same observer; no native source is granted.
+    pub(in crate::composition::mlx) fn with_transfer_counter(
+        mut self,
+        transfers: &'a Cell<CaptureNativePopulation>,
+    ) -> Self {
+        self.transfers = Some(transfers);
+        self
+    }
+    pub(in crate::composition::mlx) fn publication_count(&self) -> Result<usize> {
+        self.completed_publications
+            .checked_add(
+                self.transfers
+                    .map_or(0, |counter| counter.get().publications),
+            )
+            .ok_or_else(|| eredu_nn::workspace::WorkspaceMetadataError::Overflow.into())
     }
     /// Use the same settled request usage as the forthcoming actual model role.
     pub(in crate::composition::mlx) fn with_inherited_usage(
@@ -640,8 +708,10 @@ impl<'a> CaptureWorkspaceObserver<'a> {
         edits: &'a RefCell<Option<PreparedTextInterventions>>,
     ) -> Result<Self> {
         let metadata = Metadata::new(&self.context)?;
-        if self.invocation.is_some() || self.active.is_some()
-            || self.interventions.is_some() || self.text_interventions.is_some()
+        if self.invocation.is_some()
+            || self.active.is_some()
+            || self.interventions.is_some()
+            || self.text_interventions.is_some()
             || self.first_prediction == 0 && self.bound.is_none()
         {
             return Err(metadata.coordinate());
@@ -657,21 +727,35 @@ impl<'a> CaptureWorkspaceObserver<'a> {
         Ok(self)
     }
     /// Bind the same cold schedule to the actual retained partition source.
-    pub(in crate::composition::mlx) fn with_partition_interventions(mut self,
+    pub(in crate::composition::mlx) fn with_partition_interventions(
+        mut self,
         edits: &'a RefCell<Option<PreparedTextInterventions>>,
-        communication: &'a eredu_runtime::RetainedCommunicationSource) -> Result<Self> {
-        let metadata=Metadata::new(&self.context)?;
-        let (layouts,rank)=self.placement.ok_or_else(||metadata.coordinate())?;
-        if self.partition_intervention_source.is_some() {return Err(metadata.coordinate());}
-        edits.try_borrow_mut().map_err(|cause|metadata.error(cause))?.as_mut()
-            .ok_or_else(||metadata.coordinate())?.bind_partition(layouts,rank,communication,&self.context)?;
-        self.partition_intervention_source=Some(communication);
+        communication: &'a eredu_runtime::RetainedCommunicationSource,
+    ) -> Result<Self> {
+        let metadata = Metadata::new(&self.context)?;
+        let (layouts, rank) = self.placement.ok_or_else(|| metadata.coordinate())?;
+        if self.partition_intervention_source.is_some() {
+            return Err(metadata.coordinate());
+        }
+        edits
+            .try_borrow_mut()
+            .map_err(|cause| metadata.error(cause))?
+            .as_mut()
+            .ok_or_else(|| metadata.coordinate())?
+            .bind_partition(layouts, rank, communication, &self.context)?;
+        self.partition_intervention_source = Some(communication);
         self.with_text_interventions(edits)
     }
     fn finish_text_interventions(&mut self) -> Result<()> {
         if let Some(edits) = self.text_interventions {
-            edits.try_borrow_mut().map_err(|cause| self.context.metadata_source(cause))?
-                .as_mut().ok_or_else(|| self.context.metadata_source(CaptureProtocolError::Transaction))?
+            edits
+                .try_borrow_mut()
+                .map_err(|cause| self.context.metadata_source(cause))?
+                .as_mut()
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_source(CaptureProtocolError::Transaction)
+                })?
                 .finish(&self.context)?;
         }
         Ok(())
@@ -743,8 +827,11 @@ impl<'a> CaptureWorkspaceObserver<'a> {
             }
         }
         if let Some(edits) = self.text_interventions {
-            edits.try_borrow_mut().map_err(|cause| metadata.error(cause))?
-                .as_mut().ok_or_else(|| metadata.coordinate())?
+            edits
+                .try_borrow_mut()
+                .map_err(|cause| metadata.error(cause))?
+                .as_mut()
+                .ok_or_else(|| metadata.coordinate())?
                 .begin(phase, prediction, &mut self.ledger, &self.context)?;
         }
         if let Some(usage) = self
@@ -788,32 +875,65 @@ impl<'a> CaptureWorkspaceObserver<'a> {
         .map_err(|cause| metadata.error(cause))
     }
     fn observe_value(&mut self, path: &str, value: &WorkspaceTensor) -> Result<()> {
-        self.observe_value_with_origin(path,value,true)
+        self.observe_value_with_origin(path, value, true)
     }
-    fn observe_value_with_origin(&mut self, path: &str, value: &WorkspaceTensor, mut local:bool) -> Result<()> {
+    fn observe_value_with_origin(
+        &mut self,
+        path: &str,
+        value: &WorkspaceTensor,
+        mut local: bool,
+    ) -> Result<()> {
         let metadata = Metadata::new(&self.context)?;
         let source_present = local;
-        self.context.charge_metadata(std::mem::size_of::<(&mut Self,&str,&WorkspaceTensor,bool,bool,
-            Option<eredu_architectures::component_partition::CompletePartitionCaptureSource>)>())?;
+        self.context.charge_metadata(std::mem::size_of::<(
+            &mut Self,
+            &str,
+            &WorkspaceTensor,
+            bool,
+            bool,
+            Option<eredu_architectures::component_partition::CompletePartitionCaptureSource>,
+        )>())?;
         // Inactive projected prefill selections do not acquire a new source
         // when the shared model emits the same path during cached decode.
-        if self.active.is_some_and(|prediction|self.source.admission().plan().selections.iter()
-            .any(|selection|selection.path==path&&selection.schedule.includes(self.phase(prediction),prediction))) {
+        if self.active.is_some_and(|prediction| {
+            self.source
+                .admission()
+                .plan()
+                .selections
+                .iter()
+                .any(|selection| {
+                    selection.path == path
+                        && selection
+                            .schedule
+                            .includes(self.phase(prediction), prediction)
+                })
+        }) {
             if let Some((layout, rank)) = self.placement {
                 self.context.charge_metadata(
                     eredu_architectures::component_partition::ComponentPartitionLayouts::complete_capture_source_control_bytes()
                         .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
                 )?;
-                if let Some(source)=layout.complete_capture_source(path) {
-                    local &= source.producer()==rank;
-                } else if (self.bound.is_some() && self.active==Some(0))
-                    || (self.invocation.is_none() && self.active.is_some_and(|p|p>0)) {
+                if let Some(source) = layout.complete_capture_source(path) {
+                    local &= source.producer() == rank;
+                } else if (self.bound.is_some() && self.active == Some(0))
+                    || self
+                        .invocation
+                        .is_some_and(|invocation| self.active == Some(invocation.prediction))
+                    || (self.invocation.is_none() && self.active.is_some_and(|p| p > 0))
+                {
+                    // The explicit invocation was validated by begin_span.
+                    // Its shape and window are consumed by observe_invocation
+                    // below; this source loan only determines the local producer.
                     self.context.charge_metadata(
                         eredu_architectures::component_partition::ContiguousPartitionCaptureSource::control_bytes()
                             .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
-                    let source=layout.contiguous_capture_source(path).map_err(|cause|metadata.error(cause))?;
-                    local &= source.rank(rank).is_some_and(|rank|rank.produces);
-                } else {return Err(metadata.coordinate());}
+                    let source = layout
+                        .contiguous_capture_source(path)
+                        .map_err(|cause| metadata.error(cause))?;
+                    local &= source.rank(rank).is_some_and(|rank| rank.produces);
+                } else {
+                    return Err(metadata.coordinate());
+                }
             }
         }
         if self.bound.is_some() && self.active == Some(0) {
@@ -849,14 +969,27 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                     continue;
                 }
             }
-            if let Some(placement)=self.placement.filter(|(layout,_)|
-                layout.complete_capture_source(path).is_none()) {
-                if self.invocation.is_some(){return Err(metadata.coordinate());}
-                let prediction=self.active.ok_or_else(||metadata.coordinate())?;
-                if partition::observer::observe_invocation(self.source,index,self.phase(prediction),prediction,
-                    placement,source_present,value,&self.context,&mut self.roots,&mut self.ledger,
-                    self.transfers,self.scalar_source)? {
-                    self.statuses[index]=CaptureRecordStatus::Skipped;
+            if let Some(placement) = self
+                .placement
+                .filter(|(layout, _)| layout.complete_capture_source(path).is_none())
+            {
+                let prediction = self.active.ok_or_else(|| metadata.coordinate())?;
+                if partition::observer::observe_invocation(
+                    self.source,
+                    index,
+                    self.phase(prediction),
+                    prediction,
+                    self.invocation.map(|source| (source.shape, source.window)),
+                    placement,
+                    source_present,
+                    value,
+                    &self.context,
+                    &mut self.roots,
+                    &mut self.ledger,
+                    self.transfers,
+                    self.scalar_source,
+                )? {
+                    self.statuses[index] = CaptureRecordStatus::Skipped;
                 }
                 continue;
             }
@@ -886,9 +1019,11 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                     self.statuses[index] = CaptureRecordStatus::Skipped;
                     continue;
                 }
-                record_source(self.scalar_source,index,&self.context,value)?;
+                record_source(self.scalar_source, index, &self.context, value)?;
                 if !local {
-                    if source_present {record_replica(self.transfers,&self.context,&mut self.roots,value)?;}
+                    if source_present {
+                        record_replica(self.transfers, &self.context, &mut self.roots, value)?;
+                    }
                     continue;
                 }
                 metadata.reserve(&mut self.roots, 1)?;
@@ -935,9 +1070,11 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                     self.statuses[index] = CaptureRecordStatus::Skipped;
                     continue;
                 }
-                record_source(self.scalar_source,index,&self.context,value)?;
+                record_source(self.scalar_source, index, &self.context, value)?;
                 if !local {
-                    if source_present {record_replica(self.transfers,&self.context,&mut self.roots,value)?;}
+                    if source_present {
+                        record_replica(self.transfers, &self.context, &mut self.roots, value)?;
+                    }
                     continue;
                 }
                 metadata.reserve(&mut self.roots, 1)?;
@@ -985,7 +1122,9 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                 }
                 record_source(self.scalar_source, index, &self.context, value)?;
                 if !local {
-                    if source_present { record_replica(self.transfers, &self.context, &mut self.roots, value)?; }
+                    if source_present {
+                        record_replica(self.transfers, &self.context, &mut self.roots, value)?;
+                    }
                     continue;
                 }
                 metadata.reserve(&mut self.roots, 1)?;
@@ -1033,7 +1172,9 @@ impl<'a> CaptureWorkspaceObserver<'a> {
                 }
                 record_source(self.scalar_source, index, &self.context, value)?;
                 if !local {
-                    if source_present {record_replica(self.transfers,&self.context,&mut self.roots,value)?;}
+                    if source_present {
+                        record_replica(self.transfers, &self.context, &mut self.roots, value)?;
+                    }
                     continue;
                 }
                 metadata.reserve(&mut self.roots, 1)?;
@@ -1084,7 +1225,9 @@ impl<'a> CaptureWorkspaceObserver<'a> {
             // The complete receipt is charged on the receiver as well, but
             // only the selected producer owns the native transform graph.
             if !local {
-                if source_present { record_replica(self.transfers, &self.context, &mut self.roots, value)?; }
+                if source_present {
+                    record_replica(self.transfers, &self.context, &mut self.roots, value)?;
+                }
                 continue;
             }
             // The native work retains every source/intermediate through its
@@ -1117,17 +1260,88 @@ impl<'a> CaptureWorkspaceObserver<'a> {
         Ok(())
     }
 }
+impl CaptureWorkspaceObserver<'_> {
+    fn finish_routing_quote(
+        &mut self,
+        path: &str,
+        original: Option<eredu_runtime::RoutingDecision<'_, WorkspaceTensor>>,
+        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>,
+        unmodified: bool,
+    ) -> Result<()> {
+        let population = if let Some(edits) = self.text_interventions {
+            edits
+                .try_borrow_mut()
+                .map_err(|cause| self.context.metadata_source(cause))?
+                .as_mut()
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_source(CaptureProtocolError::Transaction)
+                })?
+                .trace_routing_result(
+                    path,
+                    original,
+                    effective,
+                    unmodified,
+                    &self.context,
+                    &mut self.ledger,
+                    &mut self.roots,
+                )?
+        } else {
+            self.interventions
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_source(CaptureProtocolError::Transaction)
+                })?
+                .try_borrow_mut()
+                .map_err(|cause| self.context.metadata_source(cause))?
+                .as_mut()
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_source(CaptureProtocolError::Transaction)
+                })?
+                .trace_routing_result(
+                    path,
+                    original,
+                    effective,
+                    unmodified,
+                    &self.context,
+                    &mut self.ledger,
+                    &mut self.roots,
+                    None,
+                )?
+        };
+        record_population(self.transfers, &self.context, population)
+    }
+}
 impl ActivationObserver<WorkspaceTensor, eredu_nn::Error> for CaptureWorkspaceObserver<'_> {
-    fn routed_unit_observer(&mut self, path: &str) -> Result<Option<&mut dyn eredu_runtime::RoutedUnitObserver<WorkspaceTensor>>> {
+    fn routed_unit_observer(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<&mut dyn eredu_runtime::RoutedUnitObserver<WorkspaceTensor>>> {
         let index = self.source.admission().points().iter().position(|point|
             matches!(&point.value_type, eredu_core::ObservationValueType::RoutedUnits {routing,..} if routing == path));
-        let edit = if let Some(edits) = self.interventions {
-            edits.try_borrow().map_err(|cause| self.context.metadata_source(cause))?
-                .as_ref().and_then(|edits| edits.routed_selection(path))
-        } else { None };
-        if index.is_none() && edit.is_none() { return Ok(None); }
+        let edit = if let Some(edits) = self.text_interventions {
+            edits
+                .try_borrow()
+                .map_err(|cause| self.context.metadata_source(cause))?
+                .as_ref()
+                .and_then(|edits| edits.routed_selection(path))
+        } else if let Some(edits) = self.interventions {
+            edits
+                .try_borrow()
+                .map_err(|cause| self.context.metadata_source(cause))?
+                .as_ref()
+                .and_then(|edits| edits.routed_selection(path))
+        } else {
+            None
+        };
+        if index.is_none() && edit.is_none() {
+            return Ok(None);
+        }
         let metadata = Metadata::new(&self.context)?;
-        if self.routed_active && (self.routed_selection != index || self.routed_intervention_selection != edit) {
+        if self.routed_active
+            && (self.routed_selection != index || self.routed_intervention_selection != edit)
+        {
             return Err(metadata.coordinate());
         }
         self.routed_selection = index;
@@ -1139,9 +1353,14 @@ impl ActivationObserver<WorkspaceTensor, eredu_nn::Error> for CaptureWorkspaceOb
     }
     fn requires_sequence_readout(&self) -> bool {
         if self.text_interventions.is_some_and(|edits| {
-            edits.try_borrow().map_or(true, |edits| edits.as_ref()
-                .is_some_and(PreparedTextInterventions::requires_sequence_readout))
-        }) { return true; }
+            edits.try_borrow().map_or(true, |edits| {
+                edits
+                    .as_ref()
+                    .is_some_and(PreparedTextInterventions::requires_sequence_readout)
+            })
+        }) {
+            return true;
+        }
         if self.interventions.is_some_and(|edits| {
             edits.try_borrow().map_or(true, |edits| {
                 edits
@@ -1176,16 +1395,100 @@ impl ActivationObserver<WorkspaceTensor, eredu_nn::Error> for CaptureWorkspaceOb
             )
         })
     }
+    fn routing_control(
+        &mut self,
+        path: &str,
+        rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>> {
+        if let Some(edits) = self.text_interventions {
+            return edits
+                .try_borrow_mut()
+                .map_err(|cause| self.context.metadata_source(cause))?
+                .as_mut()
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_source(CaptureProtocolError::Transaction)
+                })?
+                .trace_routing_control(path, rows, &self.context, &mut self.ledger);
+        }
+        let Some(edits) = self.interventions else {
+            return Ok(None);
+        };
+        edits
+            .try_borrow_mut()
+            .map_err(|cause| self.context.metadata_source(cause))?
+            .as_mut()
+            .ok_or_else(|| {
+                self.context
+                    .metadata_source(CaptureProtocolError::Transaction)
+            })?
+            .trace_routing_control(path, rows, &self.context, &mut self.ledger)
+    }
+    fn routing_unmodified_interest(&self, path: &str) -> eredu_runtime::RoutingUnmodifiedInterest {
+        if let Some(edits) = self.text_interventions {
+            return edits
+                .try_borrow()
+                .ok()
+                .and_then(|edits| {
+                    edits
+                        .as_ref()
+                        .map(|edits| edits.routing_unmodified_interest(path))
+                })
+                .unwrap_or(eredu_runtime::RoutingUnmodifiedInterest::None);
+        }
+        self.interventions
+            .and_then(|edits| edits.try_borrow().ok())
+            .and_then(|edits| {
+                edits
+                    .as_ref()
+                    .map(|edits| edits.routing_unmodified_interest(path))
+            })
+            .unwrap_or(eredu_runtime::RoutingUnmodifiedInterest::None)
+    }
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>,
+    ) -> Result<()> {
+        if self.routing_unmodified_interest(path) == eredu_runtime::RoutingUnmodifiedInterest::None
+        {
+            return Ok(());
+        }
+        let original = eredu_runtime::RoutingDecision {
+            ids: effective.ids,
+            coefficients: effective.coefficients,
+        };
+        self.finish_routing_quote(path, Some(original), effective, true)
+    }
+    fn routing_applied(
+        &mut self,
+        path: &str,
+        original: Option<eredu_runtime::RoutingDecision<'_, WorkspaceTensor>>,
+        effective: eredu_runtime::RoutingDecision<'_, WorkspaceTensor>,
+    ) -> Result<()> {
+        self.finish_routing_quote(path, original, effective, false)
+    }
     fn intervene(
         &mut self,
         path: &str,
         value: &WorkspaceTensor,
     ) -> Result<Option<WorkspaceTensor>> {
         if let Some(edits) = self.text_interventions {
-            let (output, population) = edits.try_borrow_mut()
+            let (output, population) = edits
+                .try_borrow_mut()
                 .map_err(|cause| self.context.metadata_source(cause))?
-                .as_mut().ok_or_else(|| self.context.metadata_source(CaptureProtocolError::Transaction))?
-                .trace(path, value, &self.context, &mut self.ledger, &mut self.roots)?;
+                .as_mut()
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_source(CaptureProtocolError::Transaction)
+                })?
+                .trace(
+                    path,
+                    value,
+                    &self.context,
+                    &mut self.ledger,
+                    &mut self.roots,
+                )?;
             record_population(self.transfers, &self.context, population)?;
             return Ok(output);
         }
@@ -1215,7 +1518,9 @@ impl ActivationObserver<WorkspaceTensor, eredu_nn::Error> for CaptureWorkspaceOb
         self.observe_value(path, value)
     }
     fn observe_replica(&mut self, path: &str, value: &WorkspaceTensor) -> Result<()> {
-        if self.placement.is_none() { return Ok(()); }
+        if self.placement.is_none() {
+            return Ok(());
+        }
         self.observe_value(path, value)
     }
     fn observe_generated_retained(
@@ -1411,41 +1716,92 @@ impl ActivationObserver<WorkspaceTensor, eredu_nn::Error> for CaptureWorkspaceOb
     }
 }
 impl InferenceWorkspaceObserver for CaptureWorkspaceObserver<'_> {
-    fn observe_remote_output(&mut self,value:&WorkspaceTensor,context:&WorkspaceContext)->Result<()> {
-        let metadata=Metadata::new(&self.context)?;
-        self.context.charge_metadata(std::mem::size_of::<(&mut Self,&WorkspaceTensor,&WorkspaceContext,bool)>())?;
+    fn observe_remote_output(
+        &mut self,
+        value: &WorkspaceTensor,
+        context: &WorkspaceContext,
+    ) -> Result<()> {
+        let metadata = Metadata::new(&self.context)?;
+        self.context.charge_metadata(std::mem::size_of::<(
+            &mut Self,
+            &WorkspaceTensor,
+            &WorkspaceContext,
+            bool,
+        )>())?;
         self.context.charge_metadata(
             eredu_architectures::component_partition::ComponentPartitionLayouts::complete_capture_source_control_bytes()
                 .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
         )?;
-        if !context.shares_trace(&self.context) || self.invocation.is_some() || self.interventions.is_some()
-            || (self.text_interventions.is_some() && self.partition_intervention_source.is_none()) {
-            return Err(metadata.error(eredu_runtime::working_memory::InferenceObservationError::RemoteOutput));
+        if !context.shares_trace(&self.context)
+            || self
+                .invocation
+                .is_some_and(|invocation| self.active != Some(invocation.prediction))
+            || (self.interventions.is_some() && self.invocation.is_none())
+            || (self.text_interventions.is_some() && self.partition_intervention_source.is_none())
+        {
+            return Err(metadata
+                .error(eredu_runtime::working_memory::InferenceObservationError::RemoteOutput));
         }
-        let placement=self.placement.ok_or_else(||metadata.error(
-            eredu_runtime::working_memory::InferenceObservationError::RemoteOutput))?;
-        if let Some(edits)=self.text_interventions {
-            let communication=self.partition_intervention_source.ok_or_else(||metadata.coordinate())?;
-            let mut edits=edits.try_borrow_mut().map_err(|cause|metadata.error(cause))?;
-            let edits=edits.as_mut().ok_or_else(||metadata.coordinate())?;
-            edits.validate_partition(placement.0,placement.1,communication).map_err(|cause|metadata.error(cause))?;
-            edits.trace_remote_output(placement.0,placement.1,value,&self.context)?;
+        let placement = self.placement.ok_or_else(|| {
+            metadata.error(eredu_runtime::working_memory::InferenceObservationError::RemoteOutput)
+        })?;
+        if let Some(edits) = self.interventions {
+            self.context.charge_metadata(std::mem::size_of::<(
+                std::cell::RefMut<'_, Option<PreparedModelInterventions>>,
+                &mut PreparedModelInterventions,
+                (usize, usize, &eredu_runtime::RetainedCommunicationSource),
+            )>())?;
+            let mut edits = edits
+                .try_borrow_mut()
+                .map_err(|cause| metadata.error(cause))?;
+            let edits = edits.as_mut().ok_or_else(|| metadata.coordinate())?;
+            let (rank, world, _) = edits
+                .partition_binding()
+                .ok_or_else(|| metadata.coordinate())?;
+            if rank != placement.1 || world != placement.0.topology().world_size() {
+                return Err(metadata.coordinate());
+            }
+            edits.trace_remote_output(placement.0, placement.1, value, &self.context)?;
+        }
+        if let Some(edits) = self.text_interventions {
+            let communication = self
+                .partition_intervention_source
+                .ok_or_else(|| metadata.coordinate())?;
+            let mut edits = edits
+                .try_borrow_mut()
+                .map_err(|cause| metadata.error(cause))?;
+            let edits = edits.as_mut().ok_or_else(|| metadata.coordinate())?;
+            edits
+                .validate_partition(placement.0, placement.1, communication)
+                .map_err(|cause| metadata.error(cause))?;
+            edits.trace_remote_output(placement.0, placement.1, value, &self.context)?;
         }
         for selection in &self.source.admission().plan().selections {
-            validate_partition_capture_source(selection,placement,&self.context)?;
+            validate_partition_capture_source(selection, placement, &self.context)?;
         }
         // Non-publication selections without a local PP invocation advance at
         // end_fragment_span. The final logits value is not their tensor source.
-        if !self.source.admission().plan().selections.iter()
-            .any(|selection|selection.path==eredu_core::MODEL_LOGITS_OBSERVATION_PATH) {return Ok(());}
-        // A real local replica already traversed its hook before publication.
-        // Only ranks without that source need the remote logical progression.
-        if self.placement.and_then(|(layouts, rank)| layouts.rank(rank))
-            .and_then(|layout| layout.observation(eredu_core::MODEL_LOGITS_OBSERVATION_PATH))
-            .is_some_and(|point| point.coordinates().is_some()) {
+        if !self
+            .source
+            .admission()
+            .plan()
+            .selections
+            .iter()
+            .any(|selection| selection.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+        {
             return Ok(());
         }
-        self.observe_value_with_origin(eredu_core::MODEL_LOGITS_OBSERVATION_PATH,value,false)
+        // A real local replica already traversed its hook before publication.
+        // Only ranks without that source need the remote logical progression.
+        if self
+            .placement
+            .and_then(|(layouts, rank)| layouts.rank(rank))
+            .and_then(|layout| layout.observation(eredu_core::MODEL_LOGITS_OBSERVATION_PATH))
+            .is_some_and(|point| point.coordinates().is_some())
+        {
+            return Ok(());
+        }
+        self.observe_value_with_origin(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, value, false)
     }
     fn prefill_selection(&self) -> Option<eredu_runtime::layered::BoundCaptureSelection<'_>> {
         self.bound
@@ -1462,6 +1818,7 @@ impl InferenceWorkspaceObserver for CaptureWorkspaceObserver<'_> {
             return Err(metadata.coordinate());
         }
         if let Some(transfers) = self.transfers {
+            self.completed_publications = self.publication_count()?;
             transfers.set(CaptureNativePopulation::default());
         }
         if let Some(scalars) = self.scalar_source {
@@ -1469,7 +1826,9 @@ impl InferenceWorkspaceObserver for CaptureWorkspaceObserver<'_> {
                 std::slice::Iter<'_, Cell<Option<WorkspaceFloatingType>>>,
                 Option<&Cell<Option<WorkspaceFloatingType>>>,
             )>())?;
-            for scalar in scalars { scalar.set(None); }
+            for scalar in scalars {
+                scalar.set(None);
+            }
         }
         if let Some(invocation) = self.invocation {
             if self.prefill_complete || prediction != invocation.prediction {

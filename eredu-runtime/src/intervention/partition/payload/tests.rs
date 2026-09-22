@@ -1,17 +1,20 @@
 use super::*;
-use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use eredu_nn::workspace::WorkspaceContext;
 
 #[test]
 fn window_payloads_share_stride_bits_and_keep_success_and_partial_error_funding() {
     let existing = 17;
     let capacity = 1 << 20;
-    let pool = WorkingMemoryPool::new(capacity, existing).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, existing).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let funding = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.payload_used_bytes().unwrap();
     let destination = ResolvedCaptureSlice {
         starts: vec![0, 1, 0],
         ends: vec![1, 3, 3],
@@ -94,29 +97,36 @@ fn window_payloads_share_stride_bits_and_keep_success_and_partial_error_funding(
         rejected.cause,
         Cause::Geometry(WindowInterventionPayloadError::Destination)
     ));
-    assert!(pool.used_bytes().unwrap() > initial);
-    let charged = pool.used_bytes().unwrap();
+    assert!(pool.payload_used_bytes().unwrap() > initial);
+    let charged = pool.payload_used_bytes().unwrap();
     drop(actions);
     drop(funding);
     drop(escaped);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         charged,
         "failure keeps the same cumulative account after payload retirement"
     );
     drop(rejected);
-    assert_eq!(pool.used_bytes().unwrap(), existing);
+    assert_eq!(pool.payload_used_bytes().unwrap(), existing);
 
     // Admit exactly the queried controls and the first (shape) vector. The
     // second (bool payload) constructor must refuse after that actual allocation.
     let partial_capacity = initial
         + PreparedWindowInterventionPayload::control_bytes().unwrap() as u64
         + WorkspaceContext::metadata_vec_bytes::<u64>(3).unwrap() as u64;
-    let partial_pool = WorkingMemoryPool::new(partial_capacity, existing).unwrap();
+    let partial_pool =
+        crate::working_memory::memory_fixture::host_ledger(partial_capacity, existing).unwrap();
     let funding = partial_pool
-        .prepare_workspace_metadata(&execution, partial_capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(
+                &partial_pool,
+                partial_capacity,
+            ),
+        )
         .unwrap();
-    assert_eq!(partial_pool.used_bytes().unwrap(), initial);
+    assert_eq!(partial_pool.payload_used_bytes().unwrap(), initial);
     let action = InterventionAction::Mask {
         dtype: InterventionDtype::Float32,
         shape: vec![1, 3, 3],
@@ -125,9 +135,9 @@ fn window_payloads_share_stride_bits_and_keep_success_and_partial_error_funding(
     let error =
         PreparedWindowInterventionPayload::prepare(&action, &destination, funding).unwrap_err();
     assert!(matches!(error.cause, Cause::Metadata(_)));
-    assert_eq!(partial_pool.used_bytes().unwrap(), partial_capacity);
+    assert_eq!(partial_pool.payload_used_bytes().unwrap(), partial_capacity);
     drop(action);
-    assert_eq!(partial_pool.used_bytes().unwrap(), partial_capacity);
+    assert_eq!(partial_pool.payload_used_bytes().unwrap(), partial_capacity);
     drop(error);
-    assert_eq!(partial_pool.used_bytes().unwrap(), existing);
+    assert_eq!(partial_pool.payload_used_bytes().unwrap(), existing);
 }

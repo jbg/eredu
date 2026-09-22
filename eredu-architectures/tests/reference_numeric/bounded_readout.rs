@@ -472,30 +472,53 @@ pub(super) fn scalar_session_admission(
         input: InputTokenCount::text(geometry.cached_positions + geometry.input_positions),
         max_output_tokens: geometry.max_output_tokens,
         batch_size: geometry.batch_size,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
     };
     let bound = || WorkspaceBound::bounded(16 << 20, "tiny eager scalar fixture contract");
-    let state = estimate_runtime_state(
+    let mut state = estimate_runtime_state(
         capability.state_layout(),
         request.input,
         request.max_output_tokens,
         request.batch_size,
         std::num::NonZeroU8::new(4).unwrap(),
     )
-    .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: bound(),
-        attention: bound(),
-        vocabulary: bound(),
-        state_update: bound(),
-        materialization: bound(),
-        retained: bound(),
-    })
     .unwrap();
-    match apply_admission_policy(capability.capabilities(), request, state, None).unwrap() {
+    let requirements = crate::memory_fixture::requirements;
+    state.physical_domains = Some(DomainRuntimeStateEstimate {
+        geometry,
+        decoder_state: requirements(
+            state
+                .requested_state_bytes
+                .checked_sub(state.multimodal_embedding_bytes)
+                .unwrap()
+                .checked_sub(state.media_execution_workspace_bytes)
+                .unwrap(),
+        ),
+        media_embeddings: requirements(state.multimodal_embedding_bytes),
+        media_workspace: requirements(state.media_execution_workspace_bytes),
+    });
+    let state = state
+        .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: Some(DomainExecutionWorkspaceEstimate {
+                geometry,
+                activations: requirements(16 << 20),
+                attention: requirements(16 << 20),
+                vocabulary: requirements(16 << 20),
+                state_update: requirements(16 << 20),
+                materialization: requirements(16 << 20),
+                retained: requirements(16 << 20),
+            }),
+            geometry,
+            activations: bound(),
+            attention: bound(),
+            vocabulary: bound(),
+            state_update: bound(),
+            materialization: bound(),
+            retained: bound(),
+        })
+        .unwrap();
+    match apply_admission_policy(capability.capabilities(), request, state).unwrap() {
         AdmissionResult::Admitted(admission) => admission,
         other => panic!("fixture admission: {other:?}"),
     }
@@ -662,7 +685,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 prefill_chunk_positions: chunk.min(5 - cached),
                 output: OutputDemand::LastPosition,
             };
-            let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(1 << 30, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
             let execution = session.inference_execution_identity().clone();
             let reservation = pool
                 .reserve(&execution, &scalar_session_admission(&capability, geometry))
@@ -699,7 +722,15 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                         .iter()
                         .any(|(name, _)| name == &readout));
                 }
-                assert_eq!(pool.used_bytes().unwrap(), reservation.bytes());
+                assert_eq!(
+                    crate::memory_fixture::used(&pool).unwrap(),
+                    reservation
+                        .requirements()
+                        .get(crate::memory_fixture::topology().host_domain())
+                        .unwrap()
+                        .total()
+                        .unwrap()
+                );
             };
             if stepped {
                 loop {
@@ -745,9 +776,14 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                     .div_ceil(geometry.prefill_chunk_positions)
             );
             drop(driver);
-            let charged = reservation.bytes();
+            let charged = reservation
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap();
             drop(reservation);
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             assert_eq!(
                 context
                     .projections
@@ -820,7 +856,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 before_rejection.layout().len(),
                 "output failure restores state and the admitted decoder frontier",
             );
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             drop(before_rejection);
             for (token, expected) in [6, 2, 1].into_iter().zip(&outputs[1..]) {
                 let actual = session
@@ -831,7 +867,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                     expected,
                     "decode after completed state-only chunks",
                 );
-                assert_eq!(pool.used_bytes().unwrap(), charged);
+                assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             }
             let projection_count = context.projections.lock().unwrap().len();
             assert_span_rejection(
@@ -853,7 +889,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             session
                 .rollback_complete(decode_checkpoint, context)
                 .map_err(|e| e.to_string())?;
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             for (token, expected) in [6, 2, 1].into_iter().zip(&outputs[1..]) {
                 let actual = session
                     .sequence_logits(
@@ -885,11 +921,11 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 .checkpoint_complete(context)
                 .map_err(|e| e.to_string())?;
             session.reset(context).map_err(|e| e.to_string())?;
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             session
                 .rollback_complete(checkpoint, context)
                 .map_err(|e| e.to_string())?;
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             assert_state_exact(
                 session.report().map_err(|e| e.to_string())?.state_report(),
                 &expected_state,
@@ -900,9 +936,9 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 .checkpoint_complete(context)
                 .map_err(|e| e.to_string())?;
             session.reset(context).map_err(|e| e.to_string())?;
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             drop(survivor);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
         }
         // The ordinary native adapter uses this same automatic source driver.
         for cached in [0, 2] {
@@ -914,9 +950,25 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                         .map_err(|e| e.to_string())?;
                 }
                 context.projections.lock().unwrap().clear();
+                let geometry = eredu_core::InferenceGeometry {
+                    batch_size: 1,
+                    cached_positions: cached as u64,
+                    input_positions: (5 - cached) as u64,
+                    max_output_tokens: 3,
+                    prefill_chunk_positions: chunk.min((5 - cached) as u64),
+                    output: OutputDemand::LastPosition,
+                };
+                let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
+                let authority: eredu_runtime::working_memory::InferenceRequest = pool
+                    .reserve(
+                        session.inference_execution_identity(),
+                        &scalar_session_admission(&capability, geometry),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .into();
                 let actual = session
                     .try_prefill_source_cancellable(
-                        None,
+                        Some(&authority),
                         Some([1, (5 - cached) as u64]),
                         std::num::NonZeroU64::new(chunk),
                         |geometry| {
@@ -933,7 +985,9 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                         &mut eredu_runtime::NoopObserver,
                     )
                     .map_err(|e| e.to_string())?;
-                let eredu_runtime::replicated_session::PrefillSourceOutcome::Complete(actual) = actual else {
+                let eredu_runtime::replicated_session::PrefillSourceOutcome::Complete(actual) =
+                    actual
+                else {
                     return Err("ordinary text source did not complete".into());
                 };
                 assert_tensor_close(
@@ -980,7 +1034,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             prefill_chunk_positions: 2,
             output: OutputDemand::LastPosition,
         };
-        let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(1 << 30, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
         let execution = session.inference_execution_identity().clone();
         let admission = scalar_session_admission(&capability, geometry);
         let request: eredu_runtime::working_memory::InferenceRequest =
@@ -1121,14 +1175,26 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             },
         );
         assert_eq!(
-            pool.used_bytes().unwrap(),
-            request.memory_reservation().unwrap().bytes()
+            crate::memory_fixture::used(&pool).unwrap(),
+            request
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap()
         );
         drop(request);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
         let request: eredu_runtime::working_memory::InferenceRequest =
             pool.reserve(&execution, &admission).unwrap().into();
-        let charged = request.memory_reservation().unwrap().bytes();
+        let charged = request
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         let actual = session
             .try_prefill_source_cancellable(
                 Some(&request),
@@ -1136,7 +1202,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 std::num::NonZeroU64::new(2),
                 |selected| {
                     assert_eq!(selected, geometry);
-                    assert_eq!(pool.used_bytes().unwrap(), charged);
+                    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
                     eredu_architectures::prefill::PreparedTextPrefill::from_tensor(
                         tokens.axis_slice(1, 2, 5),
                         None,
@@ -1159,13 +1225,13 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             "admitted source gateway prefill",
         );
         drop(request);
-        assert_eq!(pool.used_bytes().unwrap(), charged);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
         for (token, expected) in [6, 2, 1].into_iter().zip(&outputs[1..]) {
             let actual = session
                 .decode(&NumericTensor::token_ids(&[token]), context)
                 .map_err(|e| e.to_string())?;
             assert_tensor_close(&actual, expected, "decode retains gateway admission");
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
         }
         assert_span_rejection(
             session.decode(&NumericTensor::token_ids(&[3]), context),
@@ -1180,7 +1246,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             },
         );
         session.reset(context).map_err(|e| e.to_string())?;
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 
         // The production gateway cancels at the first completed span, preserving
         // exactly that prefix and a healthy session without vocabulary output.
@@ -1209,7 +1275,13 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             )
             .unwrap()
             .into();
-        let cancellation_charge = cancel_request.memory_reservation().unwrap().bytes();
+        let cancellation_charge = cancel_request
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         let outcome = session
             .try_prefill_source_cancellable(
                 Some(&cancel_request),
@@ -1246,10 +1318,13 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             "gateway cancellation commits only one span",
         );
         drop(cancel_request);
-        assert_eq!(pool.used_bytes().unwrap(), cancellation_charge);
+        assert_eq!(
+            crate::memory_fixture::used(&pool).unwrap(),
+            cancellation_charge
+        );
         // An admission for an older cached prefix cannot prepare the first span.
         session.reset(context).map_err(|e| e.to_string())?;
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
         session
             .prefill(&tokens.axis_slice(1, 0, 2), None, context)
             .map_err(|e| e.to_string())?;
@@ -1266,7 +1341,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
             prefill_chunk_positions: 2,
             output: OutputDemand::LastPosition,
         };
-        let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(1 << 30, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
         let execution = session.inference_execution_identity().clone();
         let reservation = pool
             .reserve(&execution, &scalar_session_admission(&capability, geometry))
@@ -1324,7 +1399,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
         );
         session.reset(context).map_err(|e| e.to_string())?;
         drop(reservation);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 
         // Cancellation and typed preparation failure stop the same scheduler
         // after one committed state-only chunk, without losing its mutable state.
@@ -1348,7 +1423,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 prefill_chunk_positions: 2,
                 output: OutputDemand::LastPosition,
             };
-            let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(1 << 30, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
             let execution = session.inference_execution_identity().clone();
             let reservation = pool
                 .reserve(&execution, &scalar_session_admission(&capability, geometry))
@@ -1374,11 +1449,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 &mut observer,
             )
             .unwrap();
-            let substituted =
-                eredu_runtime::working_memory::InferenceRequest::without_memory_budget(
-                    &execution, geometry,
-                )
-                .unwrap();
+            let substituted = crate::memory_fixture::request(&execution, geometry).unwrap();
             assert!(matches!(
                 eredu_runtime::prefill::PrefillExecutor::submit_chunk(
                     &mut executor,
@@ -1457,12 +1528,25 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, ReadoutState> for Complet
                 partial.layout().len(),
                 "stopped scheduler preserves committed prefix",
             );
-            assert_eq!(pool.used_bytes().unwrap(), reservation.bytes());
-            let charged = reservation.bytes();
+            assert_eq!(
+                crate::memory_fixture::used(&pool).unwrap(),
+                reservation
+                    .requirements()
+                    .get(crate::memory_fixture::topology().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap()
+            );
+            let charged = reservation
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap();
             drop(reservation);
-            assert_eq!(pool.used_bytes().unwrap(), charged);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
             session.reset(context).map_err(|e| e.to_string())?;
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
         }
         Ok(NumericReplicatedRun {
             outputs,
@@ -1764,9 +1848,29 @@ where
     if !stepped {
         let admitted = A::admit_prepared_input(admission, input, &NumericInputInspector)
             .map_err(|error| error.to_string())?;
+        let shape = admitted.decoder_shape();
+        let report = session.report().map_err(|e| e.to_string())?;
+        let layer = report
+            .state_report()
+            .as_ref()
+            .first()
+            .ok_or_else(|| "composite text state has no decoder layer".to_string())?;
+        let cached = eredu_nn::AttentionCache::offset(layer);
+        let authority = crate::memory_fixture::request(
+            session.inference_execution_identity(),
+            eredu_core::InferenceGeometry {
+                batch_size: shape[0],
+                cached_positions: u64::try_from(cached).map_err(|e| e.to_string())?,
+                input_positions: shape[1],
+                max_output_tokens: 2,
+                prefill_chunk_positions: chunk.min(shape[1]),
+                output: OutputDemand::LastPosition,
+            },
+        )
+        .map_err(|e| e.to_string())?;
         let outcome = session
             .try_prefill_source_cancellable(
-                None,
+                Some(&authority),
                 Some(admitted.decoder_shape()),
                 std::num::NonZeroU64::new(chunk),
                 |geometry| {

@@ -2,19 +2,18 @@
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 mod metal {
     use eredu_runtime::working_memory::{
-        InitializedSharedNative, SharedNativeInitializationCustody,
+        InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
         SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-        WorkingMemoryPool,
     };
-    use safemlx::Dtype;
     use safemlx::fast::{
         KernelDefinitionError, KernelFamilyLayout, KernelInputClass, KernelInputSignature,
         KernelSpecialization, MetalKernelDefinitionPlan, MetalKernelFamilyPlan,
         PreparedMetalKernelFamily,
     };
+    use safemlx::Dtype;
     use std::sync::{
-        OnceLock,
         atomic::{AtomicBool, Ordering},
+        OnceLock,
     };
 
     pub(crate) type Family = PreparedMetalKernelFamily<SharedNativeInitializationCustody>;
@@ -290,8 +289,8 @@ mod metal {
         #[error("row kernel initialization is busy")]
         Busy,
     }
-    pub(crate) fn prepare_admitted(pool: &WorkingMemoryPool) -> Result<(), MlxRowKernelError> {
-        if !pool.same_domain(&super::super::domain()) {
+    pub(crate) fn prepare_admitted(pool: &MemoryLedger) -> Result<(), MlxRowKernelError> {
+        if !pool.same_ledger(&super::super::ledger()) {
             return Err(MlxRowKernelError::Policy(
                 WorkingMemoryError::IdentityMismatch,
             ));
@@ -331,21 +330,19 @@ mod metal {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use safemlx::{Array, Device, DeviceType, Stream, fast::BorrowedKernelOutput};
+        use safemlx::{fast::BorrowedKernelOutput, Array, Device, DeviceType, Stream};
 
         #[test]
         fn row_families_use_actual_dimensions_and_match_scalar_equations() {
             if std::env::var_os("EREDU_REQUIRE_QUALIFIED_ROW_FAMILY").is_some() {
-                assert!(
-                    [RowKernel::Rms, RowKernel::Sum, RowKernel::Softmax]
-                        .into_iter()
-                        .all(source_qualified)
-                );
+                assert!([RowKernel::Rms, RowKernel::Sum, RowKernel::Softmax]
+                    .into_iter()
+                    .all(source_qualified));
             }
             if !source_qualified(RowKernel::Rms) {
                 return;
             }
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let rms = pool
                 .initialize_shared_native(Initializer(RowKernel::Rms))
                 .unwrap();

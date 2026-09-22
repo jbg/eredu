@@ -32,3 +32,7 @@ use eredu_core::{
     AllocatorTelemetry, AutomaticPlanningError, DevicePlan, ExecutionPlan, ExpertCacheTelemetry,
     ModelInspectionReport, QuantizationRequest, ResidencyTelemetry, SessionCapabilities,
 };
+
+#[cfg(test)]
+#[path = "../tests/support/memory.rs"]
+mod memory_fixture;

@@ -3,9 +3,10 @@ use super::*;
 #[path = "host_program/consumer.rs"]
 mod consumer;
 #[path = "host_program/disk.rs"]
-mod disk;
+pub(super) mod disk;
 #[path = "host_program/selection.rs"]
 mod selection;
+pub(super) use selection::{HostAppendSource, program as select_append};
 #[path = "host_program/source_facts.rs"]
 mod source_facts;
 use crate::backend::runtime::cache::{
@@ -18,8 +19,8 @@ use crate::backend::runtime::cache::{
 pub(super) use consumer::HostCheckout;
 use eredu_core::cache::CacheBlockId;
 use eredu_runtime::working_memory::{
-    HostSourceConstructionFacts, OriginalHostSourceBank, OriginalHostSourceCustody,
-    WorkingMemoryPool, WorkspacePagedHostEntry,
+    HostSourceConstructionFacts, MemoryLedger, OriginalHostSourceBank, OriginalHostSourceCustody,
+    WorkspacePagedHostEntry,
 };
 use safemlx::{AllocationInfo, Dtype, PreparedInputRuntime};
 use std::mem::size_of;
@@ -123,12 +124,12 @@ fn dtype(value: eredu_nn::workspace::WorkspaceFloatingType) -> Dtype {
         eredu_nn::workspace::WorkspaceFloatingType::Bfloat16 => Dtype::Bfloat16,
     }
 }
-fn declaration<'a>(
+pub(super) fn declaration<'a, P: HostAppendSource>(
     source: &'a ProjectedPagedSource,
     source_index: usize,
     entry: &WorkspacePagedHostEntry,
-    programs: &'a [Option<super::programs::PagedAppendProgram>],
-    selected: &'a super::programs::PagedAppendProgram,
+    programs: &'a [Option<P>],
+    selected: &'a P,
     context: &'a WorkspaceContext,
 ) -> Result<(PagedHostStoreDeclaration<'a>, usize), CacheSourceFailure> {
     let fail = |cause| CacheSourceFailure::source(cause, context);
@@ -143,8 +144,8 @@ fn declaration<'a>(
             &ProjectedPagedSource,
             usize,
             &WorkspacePagedHostEntry,
-            &[Option<super::programs::PagedAppendProgram>],
-            &super::programs::PagedAppendProgram,
+            &[Option<P>],
+            &P,
             &WorkspaceContext,
             PagedHostStoreDeclaration<'_>,
             [[i32; 4]; 2],
@@ -176,12 +177,10 @@ fn declaration<'a>(
         let id = programs
             .iter()
             .flatten()
-            .filter(|prior| prior.source == source_index && prior.ordinal <= program.ordinal)
-            .flat_map(|prior| &prior.publications)
-            .find(|publication| {
-                publication.id.start == range.start && publication.id.end == range.end
+            .filter(|prior| {
+                prior.source_index() == source_index && prior.ordinal() <= program.ordinal()
             })
-            .map(|publication| &publication.id)
+            .find_map(|prior| prior.publication(&range))
             .ok_or_else(|| {
                 fail(CacheSourceError::HostIdentity(
                     "future publication selection",
@@ -267,7 +266,7 @@ fn declaration<'a>(
             dtypes,
             context,
         },
-        program.ordinal,
+        program.ordinal(),
     ))
 }
 impl PreparedPagedHostProgram {
@@ -275,7 +274,7 @@ impl PreparedPagedHostProgram {
         sources: &[ProjectedPagedSource],
         programs: &[Option<super::programs::PagedAppendProgram>],
         plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
     ) -> Result<Option<Self>, CacheSourceFailure> {
         if !sources.iter().any(|source| source.host_trace().is_some()) {
@@ -291,7 +290,7 @@ impl PreparedPagedHostProgram {
                 &[ProjectedPagedSource],
                 &[Option<super::programs::PagedAppendProgram>],
                 &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 &WorkspaceContext,
             )>(),
             size_of::<Result<Option<Self>, CacheSourceFailure>>(),
@@ -555,7 +554,7 @@ impl PreparedPagedHostProgram {
                                     |loan| {
                                         let disk_layout = source
                                             .retained_file(declaration.id())
-                                            .and_then(|file| file.writer_layout())
+                                            .and_then(|file| file.layout())
                                             .or_else(|| {
                                                 stores[store]
                                                     .disk
@@ -573,6 +572,7 @@ impl PreparedPagedHostProgram {
                                         .ok_or_else(|| fail(CacheSourceError::Overflow))?;
                                         let slots = loan.prepare_declared_host_promotion(
                                             &declaration,
+                                            disk_layout,
                                             &runtime,
                                             reservations,
                                             context,
@@ -626,7 +626,12 @@ impl PreparedPagedHostProgram {
                 })
                 .map_err(|cause| CacheSourceFailure::metadata(cause, context))??;
         }
-        let disk_workers = disk::prepare_workers(sources, &stores, &loads, context)?;
+        let disk_workers = disk::prepare_workers(
+            sources,
+            stores.iter().map(|store| &sources[store.source]),
+            loads.iter().map(|load| &sources[stores[load.store].source]),
+            context,
+        )?;
         let append_steps = programs
             .iter()
             .flatten()
@@ -733,7 +738,7 @@ impl ProjectedPagedSources {
     /// before comparison. This allocates no Host payload or Device tensor.
     pub(crate) fn prepare_host_program(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
     ) -> Result<(), CacheSourceFailure> {
         let fail = |cause| CacheSourceFailure::source(cause, context);

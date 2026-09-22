@@ -32,7 +32,11 @@ fn borrowed_existing_entries_use_one_original_comparison_and_exact_retry() {
         .clone();
     for _ in 0..3 {
         let error = runtime
-            .reset_admitted(SessionResetLimits::new(source_bytes + required - 1))
+            .reset_admitted(SessionResetLimits::new(
+                crate::working_memory::memory_fixture::host_limits(
+                    source_bytes + required - 1 + registry_controls(&pool),
+                ),
+            ))
             .unwrap_err();
         let error = std::error::Error::source(&error)
             .unwrap()
@@ -40,7 +44,7 @@ fn borrowed_existing_entries_use_one_original_comparison_and_exact_retry() {
             .unwrap();
         assert_eq!(error.retained_bytes(), 0);
         assert_eq!(FILLS.get(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes);
         assert_eq!(
             data.borrow()
                 .state
@@ -50,25 +54,30 @@ fn borrowed_existing_entries_use_one_original_comparison_and_exact_retry() {
                 .registry_key(),
             &key
         );
-        assert!(data
-            .borrow()
-            .state
-            .layers
-            .slots()
-            .iter()
-            .all(|s| s.position == 19 && s.values[1] == 7));
+        assert!(
+            data.borrow()
+                .state
+                .layers
+                .slots()
+                .iter()
+                .all(|s| s.position == 19 && s.values[1] == 7)
+        );
     }
     runtime
-        .reset_admitted(SessionResetLimits::new(source_bytes + required))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(
+                source_bytes + required + registry_controls(&pool),
+            ),
+        ))
         .unwrap();
     assert_eq!(FILLS.get(), 3);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes + required);
     let (pool, layout_bytes) = sources::release_ordinary_source(&data);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     drop(runtime);
     drop(data);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         0,
         "no pin from failed admission survived"
     );
@@ -81,7 +90,11 @@ fn borrowed_source_partial_failure_keeps_both_entries_after_all_callers_drop() {
     let pool = data.borrow().pool.clone();
     FAIL_AT.set(Some(2));
     let error = runtime
-        .reset_admitted(SessionResetLimits::new(source_bytes + required))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(
+                source_bytes + required + registry_controls(&pool),
+            ),
+        ))
         .unwrap_err();
     FAIL_AT.set(None);
     let typed = std::error::Error::source(&error)
@@ -92,7 +105,7 @@ fn borrowed_source_partial_failure_keeps_both_entries_after_all_callers_drop() {
     assert_eq!(typed.retained_bytes(), required);
     drop(runtime);
     drop(data);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes + required);
     KEY_DROP_CHECK.with_borrow_mut(|check| *check = Some((pool.clone(), required, 0)));
     drop(error);
     let (_, _, drops) = KEY_DROP_CHECK.with_borrow_mut(Option::take).unwrap();
@@ -100,7 +113,7 @@ fn borrowed_source_partial_failure_keeps_both_entries_after_all_callers_drop() {
         drops, 2,
         "canonical table/layout keys retire outside Usage before refund"
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -110,7 +123,9 @@ fn borrowed_entries_cannot_replace_the_actual_genuine_claim_source() {
     let (_, foreign, _, _) = fixture(None, 2);
     data.borrow_mut().foreign_source = Some(foreign);
     let error = runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap_err();
     let error = std::error::Error::source(&error)
         .unwrap()
@@ -122,10 +137,15 @@ fn borrowed_entries_cannot_replace_the_actual_genuine_claim_source() {
     ));
     assert_eq!(error.retained_bytes(), 0);
     assert_eq!(FILLS.get(), 0);
-    assert_eq!(data.borrow().pool.used_bytes().unwrap(), source_bytes);
+    assert_eq!(
+        data.borrow().pool.payload_used_bytes().unwrap(),
+        source_bytes
+    );
     data.borrow_mut().foreign_source = None;
     runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap();
     assert_eq!(FILLS.get(), 2);
 }

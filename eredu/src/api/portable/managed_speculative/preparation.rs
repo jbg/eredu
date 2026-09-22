@@ -125,15 +125,11 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
         on_event: F,
         retained: &mut Option<HostMetadataFunding>,
     ) -> Result<PreparedLane<'a, B>, Cause> {
-        let capacity = text
-            .settings
-            .inference
-            .managed_memory_capacity_bytes
-            .ok_or(TokenInputRejection::Unsupported)?;
-        let (generation, maximum) = self.resolve_text_generation_settings(text.settings)?;
+        let limits = text.settings.inference.memory_limits.clone();
+        let (generation, maximum) = self.resolve_text_generation_settings(text.settings.clone())?;
         let host = self.prepare_original_speculative_plain_host(
             source,
-            capacity,
+            &limits,
             maximum.get(),
             maximum_draft.get(),
             generation.sampling().temperature,
@@ -207,10 +203,6 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
             return Err(TokenInputRejection::IdentityMismatch.into());
         }
         for setting in settings {
-            setting
-                .inference
-                .managed_memory_capacity_bytes
-                .ok_or(TokenInputRejection::Unsupported)?;
             self.resolve_text_generation_settings(setting)?;
         }
         Ok(())
@@ -241,8 +233,8 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
         I: ExactSizeIterator,
         P: FnMut(I::Item, &mut Option<HostMetadataFunding>) -> Result<PreparedLane<'a, B>, Cause>,
     {
-        use eredu_core::SpeculativeGenerationBatchRequest as Request;
         use eredu_core::run_preparation::TextPreparationStage as Stage;
+        use eredu_core::SpeculativeGenerationBatchRequest as Request;
         let count = input.len();
         let local = (|| {
             validation?;

@@ -19,6 +19,8 @@ use crate::{
 };
 
 mod materialization;
+mod construction_sources;
+pub(crate) use construction_sources::PreparedNativeConstructionSources;
 mod addressable;
 pub(crate) use addressable::prepare_addressable_source;
 mod selection;
@@ -26,7 +28,7 @@ mod selection;
 #[cfg(test)]
 pub(super) use materialization::{bind_replicated_text, prepared_safetensors_architecture};
 pub(crate) use materialization::{
-    materialize_model_plan, materialize_model_plan_with_layerwise_manager,
+    materialize_model_plan, materialize_model_plan_with_construction_sources,
 };
 #[cfg(test)]
 pub(crate) use selection::prepare_selected_sources;

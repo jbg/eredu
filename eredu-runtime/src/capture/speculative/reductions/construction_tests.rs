@@ -1,5 +1,5 @@
 use super::*;
-use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use eredu_core::{
     DescriptionCompleteness, ObservationCatalog, ObservationDtype, ObservationPoint,
     ObservationPosition, ObservationSupport, ObservationSupportReport, ObservationSupportStatus,
@@ -58,7 +58,6 @@ pub(super) fn source() -> AdmittedCapturePlan {
         limits: CaptureLimits {
             per_step: unlimited,
             cumulative: unlimited,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -85,7 +84,6 @@ pub(super) fn source() -> AdmittedCapturePlan {
                 CaptureTransformKind::Preview,
             ],
             max_histogram_bins: 3,
-            physical_native_limit: false,
             conditions: Vec::new(),
         },
         CaptureInvocationBounds {
@@ -246,9 +244,12 @@ fn paid_aggregate_constructor_matches_nonzero_window_algebra_and_refuses_one_sho
         .unwrap(),
         &source,
     );
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 26)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 26),
+        )
         .unwrap();
     let mut ledger = CaptureLedger::new(&source);
     let group = WindowReductions::create_capture(
@@ -263,7 +264,7 @@ fn paid_aggregate_constructor_matches_nonzero_window_algebra_and_refuses_one_sho
     )
     .unwrap()
     .unwrap();
-    let required = pool.used_bytes().unwrap();
+    let required = pool.payload_used_bytes().unwrap();
     assert_eq!(ordinary.total(), ledger.total());
     let actual = finish(group, &source);
     assert_eq!(actual, expected);
@@ -290,12 +291,15 @@ fn paid_aggregate_constructor_matches_nonzero_window_algebra_and_refuses_one_sho
         preview.data(),
         &TensorObservationData::F32(full[..5].to_vec())
     );
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     drop((actual, expected, funding));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    let short = crate::working_memory::memory_fixture::host_ledger(required - 1, 0).unwrap();
     let funding = short
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), required - 1)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&short, required - 1),
+        )
         .unwrap();
     let mut ledger = CaptureLedger::new(&source);
     let refused = WindowReductions::create_capture(
@@ -310,9 +314,9 @@ fn paid_aggregate_constructor_matches_nonzero_window_algebra_and_refuses_one_sho
     );
     assert!(matches!(refused, Err(ConstructionError::Metadata(_))));
     assert!(ledger.total().host_bytes > 0);
-    assert!(short.used_bytes().unwrap() > 0);
-    assert!(short.used_bytes().unwrap() < required);
+    assert!(short.payload_used_bytes().unwrap() > 0);
+    assert!(short.payload_used_bytes().unwrap() < required);
     drop(refused);
     drop(funding);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
 }

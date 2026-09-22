@@ -74,7 +74,8 @@ pub(crate) struct PreparedResidentTransfer {
     value: Rc<ResidentTransferResources>,
     leases: Option<PreparedLeaseCollection>,
     publication: super::publication::TransferPublication,
-    ready: PreparedObservedRecovery<Rc<ResidentTransferResources>, OriginalOperationMetadataCustody>,
+    ready:
+        PreparedObservedRecovery<Rc<ResidentTransferResources>, OriginalOperationMetadataCustody>,
 }
 impl PreparedResidentTransfer {
     #[cfg(test)]
@@ -160,7 +161,15 @@ impl PreparedResidentTransfer {
         roots: &[OffloadUnitId],
         scratch: &mut [eredu_runtime::residency::ResidencyClosureSlot],
     ) -> Result<Self, (Self, PreparedTransferDestinationCause)> {
-        Self::try_new_for_window_in_tier(custody, shape, manager, catalog, roots, scratch, MemoryTier::Device)
+        Self::try_new_for_window_in_tier(
+            custody,
+            shape,
+            manager,
+            catalog,
+            roots,
+            scratch,
+            MemoryTier::Device,
+        )
     }
 
     /// Same final destinations for an explicitly selected Host or Device
@@ -203,11 +212,18 @@ impl PreparedResidentTransfer {
         let mut layout = Self::bank_layout_with_payload::<F, E>(count, shape)?;
         let bytes = u64::try_from(names.destination_requested_bytes)
             .ok()?
-            .checked_add(u64::try_from(size_of::<(
-                OriginalOperationMetadataCustody, TransferPayloadShape,
-                &ResidencyManager, &super::super::named_arrays::NameCatalogOwner,
-                &[OffloadUnitId], &mut [eredu_runtime::residency::ResidencyClosureSlot], MemoryTier,
-            )>()).ok()?)?
+            .checked_add(
+                u64::try_from(size_of::<(
+                    OriginalOperationMetadataCustody,
+                    TransferPayloadShape,
+                    &ResidencyManager,
+                    &super::super::named_arrays::NameCatalogOwner,
+                    &[OffloadUnitId],
+                    &mut [eredu_runtime::residency::ResidencyClosureSlot],
+                    MemoryTier,
+                )>())
+                .ok()?,
+            )?
             .checked_add(PreparedLeaseCollection::control_bytes(shape)?)?
             .checked_add(super::publication::TransferPublication::control_bytes(
                 shape,
@@ -226,8 +242,16 @@ impl PreparedResidentTransfer {
             Rc<ResidentTransferResources>,
             OriginalOperationMetadataCustody,
         >::control_bytes::<Exception>()?;
-        let dispatch = OperationRecovery::<Rc<ResidentTransferResources>, OriginalOperationMetadataCustody>::control_bytes()?;
-        let node = node.checked_add(u64::try_from(size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>()).ok()?)?;
+        let dispatch = OperationRecovery::<
+            Rc<ResidentTransferResources>,
+            OriginalOperationMetadataCustody,
+        >::control_bytes()?;
+        let node = node.checked_add(
+            u64::try_from(size_of::<
+                eredu_runtime::working_memory::OriginalTextMetadataCustody,
+            >())
+            .ok()?,
+        )?;
         let native = u64::try_from(OriginalScopeObserver::control_bytes()?).ok()?;
         let slot = node
             .checked_add(dispatch)?
@@ -291,10 +315,12 @@ impl PreparedResidentTransfer {
         Rc::get_mut(&mut value.application)
             .expect("unissued prepared application")
             .tier = tier;
-        // Rc::try_unwrap frees the resource allocation before its moved
-        // application/custody is returned. No native work was activated.
+        // Rc::try_unwrap frees the resource allocation before its application
+        // is returned. The existing application Rc is retained without a new
+        // allocation while this unactivated resource payload and its prepared
+        // vectors retire under their original custody.
         match Rc::try_unwrap(self.value) {
-            Ok(value) => value.application,
+            Ok(value) => Rc::clone(&value.application),
             Err(_) => unreachable!("prepared payload has no aliases"),
         }
     }
@@ -325,7 +351,12 @@ impl PreparedTransferObservation {
     pub(crate) fn bank_layout<F, E>(count: usize) -> Option<BankLayout> {
         let node = PreparedObservedRecovery::<TransferObservation, OriginalOperationMetadataCustody>
             ::control_bytes::<Exception>()?;
-        let node = node.checked_add(u64::try_from(size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>()).ok()?)?;
+        let node = node.checked_add(
+            u64::try_from(size_of::<
+                eredu_runtime::working_memory::OriginalTextMetadataCustody,
+            >())
+            .ok()?,
+        )?;
         let dispatch =
             OperationRecovery::<TransferObservation, OriginalOperationMetadataCustody>::control_bytes()?;
         let native = u64::try_from(OriginalScopeObserver::control_bytes()?).ok()?;

@@ -1,10 +1,11 @@
 //! Public plain-text token and memory probe; run one mode per fresh process.
 //!
 //! managed_plain_memory_probe CHECKPOINT PROMPT.txt ordinary|managed|controlled OUTPUT.json
-//!   [--max-tokens N] [--chunk N] [--budget BYTES] [--tokenizer TOKENIZER.json]
+//!   [--max-tokens N] [--chunk N] [--memory-limit DOMAIN=BYTES|unlimited] [--tokenizer TOKENIZER.json]
 //!   [--device cpu|accelerator|metal] [--seed N] [--no-special-tokens] [--reference REPORT.json]
 //!
-//! `--budget` is required for managed/controlled and is not applied to ordinary.
+//! Repeated physical-domain limits apply to loading and all generation modes.
+//! Omitted domains are unlimited; all modes retain ordinary admission.
 //! The ordinary public token iterator runs to its finite output limit; it does
 //! not implement the managed text driver's EOS stopping. Reports expose the
 //! first EOS position and full produced IDs, including any ordinary post-EOS tail.
@@ -14,21 +15,21 @@
 //! Allocator peaks are reset after loading, reference encoding and source setup.
 //! They include retained model allocations. RSS samples are not process peaks;
 //! on macOS, use `/usr/bin/time -l` for an independent process high-water mark.
-//! The requested budget covers the managed domain, not all process memory or
+//! Physical limits cover accounted domain charges, not all process memory or
 //! this probe's reference IDs, telemetry, JSON, or caller-owned output copies.
-use anyhow::{Context, bail, ensure};
+use anyhow::{bail, ensure, Context};
 use eredu::api::{
-    LoadedModel, LocalDevice, ManagedPlainTextRequest, ManagedPlainTextSource,
-    PreparedChatGenerationSettings, local_device_plan, reset_local_allocator_peak,
+    local_device_plan, reset_local_allocator_peak, LoadedModel, LocalDevice,
+    ManagedPlainTextRequest, ManagedPlainTextSource, PreparedChatGenerationSettings,
 };
-use eredu_backend_mlx::{MlxBackendFactory, backend::MlxBackend};
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{
     ExecutionPlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
     GenerationPlainTextEvent, GenerationPlainTextOutput, ResolvedGenerationConfig,
     TextGenerationConfig, TextInferencePolicy,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{io::Write, num::NonZeroU64, path::PathBuf, process::Command, time::Instant};
 
@@ -54,7 +55,7 @@ struct Options {
     output: PathBuf,
     max_tokens: usize,
     chunk: Option<NonZeroU64>,
-    budget: Option<u64>,
+    memory_limits: eredu_core::MemoryLimitDeclarations,
     tokenizer: Option<PathBuf>,
     device: String,
     seed: u64,
@@ -64,7 +65,8 @@ struct Options {
 impl Options {
     fn parse() -> anyhow::Result<Self> {
         let mut args = std::env::args().skip(1);
-        let usage = "usage: managed_plain_memory_probe CHECKPOINT PROMPT.txt ordinary|managed|controlled OUTPUT.json [--max-tokens N] [--chunk N] [--budget BYTES] [--tokenizer FILE] [--device cpu|accelerator|metal] [--seed N] [--no-special-tokens] [--reference REPORT.json]";
+        let mut declarations = Vec::new();
+        let usage = "usage: managed_plain_memory_probe CHECKPOINT PROMPT.txt ordinary|managed|controlled OUTPUT.json [--max-tokens N] [--chunk N] [--memory-limit DOMAIN=BYTES|unlimited] [--tokenizer FILE] [--device cpu|accelerator|metal] [--seed N] [--no-special-tokens] [--reference REPORT.json]";
         let checkpoint = args.next().context(usage)?.into();
         let prompt = args.next().context(usage)?.into();
         let mode = match args.next().context(usage)?.as_str() {
@@ -81,7 +83,7 @@ impl Options {
             output,
             max_tokens: 32,
             chunk: None,
-            budget: None,
+            memory_limits: eredu_core::MemoryLimitDeclarations::unlimited(),
             tokenizer: None,
             device: "accelerator".into(),
             seed: 0,
@@ -99,7 +101,18 @@ impl Options {
             match flag.as_str() {
                 "--max-tokens" => options.max_tokens = value.parse()?,
                 "--chunk" => options.chunk = Some(value.parse()?),
-                "--budget" => options.budget = Some(value.parse()?),
+                "--memory-limit" => {
+                    let (domain, amount) = value
+                        .split_once('=')
+                        .context("expected DOMAIN=BYTES|unlimited")?;
+                    ensure!(!domain.is_empty(), "physical domain is empty");
+                    let limit = if amount == "unlimited" {
+                        eredu_core::MemoryLimit::Unlimited
+                    } else {
+                        eredu_core::MemoryLimit::Finite(amount.parse()?)
+                    };
+                    declarations.push((domain.to_owned(), limit));
+                }
                 "--tokenizer" => options.tokenizer = Some(value.into()),
                 "--device" => {
                     ensure!(
@@ -114,10 +127,7 @@ impl Options {
             }
         }
         ensure!(options.max_tokens > 0, "max-tokens must be positive");
-        ensure!(
-            options.mode == Mode::Ordinary || options.budget.is_some(),
-            "managed and controlled require --budget BYTES"
-        );
+        options.memory_limits = eredu_core::MemoryLimitDeclarations::new(declarations);
         ensure!(
             !options.output.exists(),
             "output already exists: {}",
@@ -151,11 +161,38 @@ fn sample(model: &LoadedModel<MlxBackend<'_>>) -> Value {
     // This public method synchronizes before sampling the MLX counters.
     let allocator = model.allocator_telemetry();
     let rss = process_rss_bytes();
+    let physical = (|| -> anyhow::Result<Value> {
+        let topology = eredu::api::local_memory_topology()?;
+        let snapshot = eredu::api::local_memory_snapshot()?;
+        let domains = snapshot.domains.iter().map(|row| {
+            Ok(json!({
+                "domain": topology.description(row.domain)?.name,
+                "configured_limit": row.configured_limit,
+                "effective_limit": row.effective_limit,
+                "fixed_baseline_bytes": row.fixed_baseline.total()?,
+                "registered_storage_bytes": row.registered_storage_bytes,
+                "outstanding_reservation_bytes": row.outstanding_reservation_bytes,
+                "current_charge_bytes": row.current_charge_bytes,
+                "historical_peak_bytes": row.historical_peak_bytes,
+                "estimated_placement_allowance_bytes": row.estimated_placement_allowance_bytes,
+                "placement_allowance_basis": row.placement_allowance_basis.map(|basis| format!("{basis:?}")),
+                "estimated_overhead_bytes": row.estimated_overhead_bytes,
+                "additional_headroom_bytes": row.additional_headroom_bytes,
+            }))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(
+            json!({"domains": domains, "reservations": snapshot.reservations,
+            "funding_accounts": snapshot.funding_accounts, "unquoted_owners": snapshot.unquoted_owners,
+            "accounting_scope": "conservative physical-domain charges, not measured residency"}),
+        )
+    })();
     json!({
         "mlx": allocator.as_ref().ok(),
         "mlx_error": allocator.as_ref().err().map(ToString::to_string),
         "process_rss_bytes": rss.as_ref().ok(),
         "process_rss_error": rss.as_ref().err().map(ToString::to_string),
+        "physical_memory": physical.as_ref().ok(),
+        "physical_memory_error": physical.as_ref().err().map(ToString::to_string),
     })
 }
 fn error_chain(error: &anyhow::Error) -> Vec<String> {
@@ -206,7 +243,7 @@ impl Output {
 #[derive(Clone, Copy)]
 struct SelectedPreparation {
     prefill_chunk_positions: u64,
-    incremental_required_bytes: u64,
+    incremental_required_bytes: Option<u64>,
 }
 impl SelectedPreparation {
     fn from_report(report: eredu_core::TextPreparationReport<'_>) -> Self {
@@ -242,7 +279,9 @@ fn generate(
             .with_seed(settings.seed)
             .with_inference_policy(settings.inference);
         let generation = model.generate_tokens(ordinary_prompt, config)?;
-        *selected = generation.preparation_report().map(SelectedPreparation::from_report);
+        *selected = generation
+            .preparation_report()
+            .map(SelectedPreparation::from_report);
         for token in generation {
             ids.push(token?.token_id()?);
             first.get_or_insert_with(|| started.elapsed().as_secs_f64());
@@ -257,7 +296,7 @@ fn generate(
     }
     let source = source.context("managed tokenizer source missing")?;
     let cancellation = GenerationCancellationToken::new();
-    let mut request = ManagedPlainTextRequest::new(prompt, settings);
+    let mut request = ManagedPlainTextRequest::new(prompt, settings.clone());
     request.add_special_tokens = options.special_tokens;
     let mut events = Events::default();
     let mut emit = |event: GenerationPlainTextEvent<'_>| events.emit(event);
@@ -265,10 +304,12 @@ fn generate(
     let session = model
         .start_managed_plain_text(source, request, &cancellation)?
         .context("unexpected pre-start cancellation")?;
-    *selected = session.preparation_report().map(SelectedPreparation::from_report);
+    *selected = session
+        .preparation_report()
+        .map(SelectedPreparation::from_report);
     if let Some(report) = selected.as_ref() {
         eprintln!(
-            "{} preparation completed in {:.3}s: chunk={}, admitted_incremental_bytes={}",
+            "{} preparation completed in {:.3}s: chunk={}, admitted_incremental_bytes={:?}",
             options.mode.name(),
             started.elapsed().as_secs_f64(),
             report.prefill_chunk_positions,
@@ -331,6 +372,7 @@ fn compare(reference: &Reference, prompt: &[u32], generated: &[u32]) -> Value {
 }
 
 fn run(options: &Options) -> anyhow::Result<bool> {
+    eredu_backend_mlx::configure_memory_limits(&options.memory_limits)?;
     let prompt = std::fs::read_to_string(&options.prompt).context("read UTF-8 prompt")?;
     let reference = options
         .reference
@@ -402,11 +444,7 @@ fn run(options: &Options) -> anyhow::Result<bool> {
         seed: options.seed,
         inference: TextInferencePolicy {
             prefill_chunk_positions: options.chunk,
-            managed_memory_capacity_bytes: if options.mode == Mode::Ordinary {
-                None
-            } else {
-                options.budget
-            },
+            memory_limits: options.memory_limits.clone(),
             submission_tracking_capacity_bytes: None,
             graph_metadata_capacity_bytes: None,
         },
@@ -428,7 +466,7 @@ fn run(options: &Options) -> anyhow::Result<bool> {
             &prompt,
             ordinary_prompt,
             source.as_ref(),
-            settings,
+            settings.clone(),
             resolved,
             &mut selected,
         ),
@@ -447,12 +485,12 @@ fn run(options: &Options) -> anyhow::Result<bool> {
         "managed_tokenizer_source": if options.mode == Mode::Ordinary { None } else { Some(&tokenizer_path) },
         "managed_input_encoding": if options.mode == Mode::Ordinary { Value::Null } else { json!("independently admitted from text using the authenticated same tokenizer configuration") },
         "eos_token_ids": model.eos_token_ids(), "resolved_generation_config": resolved, "seed": options.seed,
-        "inference_policy": settings.inference, "requested_total_budget_bytes": options.budget,
+        "inference_policy": settings.inference, "requested_memory_limits": options.memory_limits,
         "selected_prefill_chunk_positions": selected.map(|value| value.prefill_chunk_positions),
         "admitted_incremental_required_bytes": selected.map(|value| value.incremental_required_bytes),
         "selected_chunk_note": "actual accepted request geometry; null means no accepted-admission report was available",
-        "admission_requirement_note": "historical accepted incremental working-memory bound including proved existing-storage credit; not measured high-water or current managed-domain total",
-        "managed_capacity_scope": "managed domain including retained residency, not total process RSS",
+        "admission_requirement_note": "historical accepted incremental working-memory bound including proved existing-storage credit; not measured high-water or a physical-domain total",
+        "memory_limit_scope": "physical domains including retained allocations and conservative placement allowances; not total process RSS",
         "output_scope": if options.mode == Mode::Ordinary { "full raw finite iterator" } else { "shared driver committed output through termination" },
         "termination_policy": if options.mode == Mode::Ordinary { "raw public token iterator; no EOS stopping" }
             else { "shared managed plain-text termination; EOS/max-tokens; no literal stop strings" },
@@ -460,7 +498,7 @@ fn run(options: &Options) -> anyhow::Result<bool> {
         "managed_source_setup_seconds": setup_seconds, "generation_attempted": source.is_ok(),
         "memory": { "after_load": after_load, "before_generation": before_generation, "after_generation_with_output_or_error_retained": after_generation },
         "process_peak_rss_bytes": Value::Null,
-        "measurement_notes": "MLX peak reset immediately before generation; counters include retained baseline. RSS samples are not high-water; use /usr/bin/time -l on macOS. Probe buffers and serialization are outside managed budget.",
+        "measurement_notes": "MLX peak reset immediately before generation; counters include retained baseline. RSS samples are not high-water; use /usr/bin/time -l on macOS. Probe buffers and serialization are caller-owned diagnostic storage.",
         "score_comparison": "none; use the separate historical readout_memory_probe for full-score evidence",
     });
     let mut success = false;

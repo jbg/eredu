@@ -10,6 +10,25 @@ pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
     eredu_backend_mlx::discover_hardware()
 }
 
+/// Reports the physical domains addressed by local memory-limit declarations.
+pub fn local_memory_topology(
+) -> Result<std::sync::Arc<eredu_core::MemoryTopology>, eredu_core::BackendFailure> {
+    eredu_backend_mlx::memory_topology().map_err(|error| {
+        eredu_core::BackendFailure::from_error(error).with_operation("memory topology")
+    })
+}
+
+/// Reports coherent process-local charges and limits for every physical domain.
+/// Conservative placement allowances do not represent measured residency.
+/// The diagnostic container belongs to the caller and grants no allocation or
+/// execution authority; it is outside admitted execution storage.
+pub fn local_memory_snapshot(
+) -> Result<eredu_runtime::working_memory::MemoryLedgerSnapshot, eredu_core::BackendFailure> {
+    eredu_backend_mlx::memory_snapshot().map_err(|error| {
+        eredu_core::BackendFailure::from_error(error).with_operation("memory ledger snapshot")
+    })
+}
+
 use super::{DevicePlanError, ExpertCacheBenchmarkError};
 use eredu_core::BackendFailure;
 
@@ -203,9 +222,17 @@ pub struct LocalRuntimeConfiguration {
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     accelerator_library_path: Option<PathBuf>,
     allocator_cache_limit: Option<usize>,
+    memory_limits: eredu_core::MemoryLimitDeclarations,
 }
 
 impl LocalRuntimeConfiguration {
+    /// Configures physical-domain limits before any local session is created.
+    /// Omitted domains are unlimited; a live coordinator cannot be reconfigured.
+    pub fn with_memory_limits(mut self, limits: eredu_core::MemoryLimitDeclarations) -> Self {
+        self.memory_limits = limits;
+        self
+    }
+
     /// Overrides the native accelerator kernel-library path.
     ///
     /// Embedded Apple applications use this when their bundled library cannot
@@ -227,6 +254,9 @@ impl LocalRuntimeConfiguration {
 pub fn configure_local_runtime(
     configuration: &LocalRuntimeConfiguration,
 ) -> Result<(), BackendFailure> {
+    eredu_backend_mlx::configure_memory_limits(&configuration.memory_limits).map_err(|error| {
+        BackendFailure::from_error(error).with_operation("memory configuration")
+    })?;
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     if let Some(path) = &configuration.accelerator_library_path {
         eredu_backend_mlx::set_accelerator_library_path(path).map_err(|error| {
@@ -512,8 +542,8 @@ pub fn benchmark_local_expert_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        DevicePlanError, ExpertCacheBenchmarkError, LocalDevice, default_local_device,
-        local_device_plan, validate_expert_cache_benchmark_prompt,
+        default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
+        DevicePlanError, ExpertCacheBenchmarkError, LocalDevice,
     };
 
     #[test]

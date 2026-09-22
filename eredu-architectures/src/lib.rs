@@ -15,7 +15,6 @@
 
 mod boundary_metadata;
 mod cache_identity;
-mod state_geometry;
 /// Portable model capabilities and scalar runtime-state estimates.
 pub mod capability;
 /// Exact architecture-owned plans for dense checkpoint conversion.
@@ -28,10 +27,13 @@ pub mod composite_partitioned;
 pub mod configuration;
 /// Logical architecture and observation catalog generation from admitted plans.
 pub mod discovery;
+#[cfg(test)]
+mod memory_fixture;
 /// Architecture-owned semantic spans for bounded prefill.
 pub mod prefill;
 /// Shared hidden-position selection before vocabulary projection.
 pub mod readout;
+mod state_geometry;
 pub use configuration::{GgufArchitecture, ModelKind};
 /// Architecture-owned external assistant inspection and preparation.
 pub mod external_assistant;
@@ -46,7 +48,8 @@ pub use external_assistant::{
     ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
     MaterializedExternalAssistantExecution, MaterializedExternalAssistantVisitor,
     PreparedCompatibleExternalAssistant, PreparedExternalAssistantExecution,
-    PreparedExternalAssistantSource, SelectedExternalAssistantPreparation, SelectedExternalAssistantVisitor,
+    PreparedExternalAssistantSource, SelectedExternalAssistantPreparation,
+    SelectedExternalAssistantVisitor,
 };
 pub use external_draft::{
     prepare_execution_plan_draft, prepare_external_draft, ExternalDraftPreparation,
@@ -116,12 +119,12 @@ pub use expert_residency::{
     execute_expert_route_exchange_tensor_parallel, execute_routed_gated_product,
     ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertRealizationPlanError,
     ExpertResidencyCatalog, ExpertResidencyCatalogError, ExpertResidencyDistribution,
-    ExpertResidencyUnit, ExpertRouteCountPlan, ExpertRouteCountSource, ExpertRouteCountCause,
-    FundedExpertRouteCounts, FundedExpertRouteCountFailure, ExpertRouteExchangeDirection,
-    ExpertRoutePackingPlan, ExpertRoutePackingCause, ExpertRoutePackingGeometry,
-    ExpertRoutePackingSource, FundedExpertRoutePacking, FundedExpertRoutePackingFailure,
-    ExpertRouteRegionSource, ExpertRouteRegionPopulation, ExpertRouteRegionRows, ExpertRouteRegionCause,
-    PartitionExpertRouteExchange, RoutedMechanismExecutionError,
+    ExpertResidencyUnit, ExpertRouteCountCause, ExpertRouteCountPlan, ExpertRouteCountSource,
+    ExpertRouteExchangeDirection, ExpertRoutePackingCause, ExpertRoutePackingGeometry,
+    ExpertRoutePackingPlan, ExpertRoutePackingSource, ExpertRouteRegionCause,
+    ExpertRouteRegionPopulation, ExpertRouteRegionRows, ExpertRouteRegionSource,
+    FundedExpertRouteCountFailure, FundedExpertRouteCounts, FundedExpertRoutePacking,
+    FundedExpertRoutePackingFailure, PartitionExpertRouteExchange, RoutedMechanismExecutionError,
 };
 pub use routed_text::{
     routed_text_requirements, select_routed_text_realization,

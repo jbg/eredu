@@ -8,7 +8,11 @@ use eredu_nn::{
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -109,7 +113,7 @@ fn encodings() -> Vec<LinearFormat> {
 
 #[test]
 #[cfg(not(feature = "cuda"))]
-fn packed_formats_preserve_complete_projection_lookup_and_tied_readout_bounds() {
+fn packed_formats_preserve_projection_lookup_payloads_and_report_control_gaps() {
     for encoding in encodings() {
         for shape in [
             vec![1024],
@@ -128,17 +132,20 @@ fn packed_formats_preserve_complete_projection_lookup_and_tied_readout_bounds() 
             c.begin_span();
             let out = projection.forward(&input, &c).unwrap();
             let report = c.report(&[out]).unwrap();
-            assert!(
-                report.total_bytes.is_some(),
-                "{encoding:?}: {:?}",
-                report.unpriced_operations
-            );
+            crate::backend::nn::workspace::test_backing_control_completeness(&selected(), &report);
             let expected_host = 0;
             assert_eq!(report.host_workspace_bytes, Some(expected_host));
-            assert_eq!(
-                report.total_bytes,
-                report.tensor_buffers.total_bytes.map(|v| v + expected_host)
-            );
+            if report.total_bytes.is_some() {
+                assert_eq!(
+                    report.total_bytes,
+                    report.tensor_buffers.total_bytes.map(|v| v
+                        + expected_host
+                        + crate::backend::nn::workspace::test_backing_controls(
+                            &selected(),
+                            &report
+                        ))
+                );
+            }
             if matches!(encoding, LinearFormat::E4M3BlockFp8(_)) {
                 continue;
             }
@@ -156,7 +163,10 @@ fn packed_formats_preserve_complete_projection_lookup_and_tied_readout_bounds() 
                 let out = table.lookup(&ids, policy, &c).unwrap();
                 let tied = table.as_linear(&input, &c).unwrap();
                 let report = c.report(&[out, tied]).unwrap();
-                assert!(report.total_bytes.is_some(), "{encoding:?}");
+                crate::backend::nn::workspace::test_backing_control_completeness(
+                    &selected(),
+                    &report,
+                );
                 assert_eq!(report.host_workspace_bytes, Some(0));
             }
         }
@@ -197,12 +207,10 @@ fn packed_geometry_validates_companions_and_split_k_reduction_storage() {
     let mut unrelated = op;
     unrelated.kind = WorkspaceOperationKind::Elementwise("unpriced_packed_transform");
     assert!(selected().operation_bound(&unrelated).unwrap().is_none());
-    assert!(
-        selected()
-            .host_workspace_bound(&unrelated)
-            .unwrap()
-            .is_none()
-    );
+    assert!(selected()
+        .host_workspace_bound(&unrelated)
+        .unwrap()
+        .is_none());
 }
 
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]

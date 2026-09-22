@@ -9,9 +9,18 @@ pub(in super::super) fn uses_source(operation: WorkspaceOperationView<'_>) -> bo
 }
 pub(in super::super) fn control_bytes(operation: WorkspaceOperationView<'_>) -> Option<usize> {
     let [_, gather, selected] = super::sources::counts(operation)?;
-    gather.checked_mul(crate::backend::nn::grouped::affine_projection_control_bytes(false)?)?
-        .checked_add(selected.checked_mul(crate::backend::nn::grouped::affine_projection_control_bytes(true)?)?)
+    gather
+        .checked_mul(crate::backend::nn::grouped::affine_projection_control_bytes(false)?)?
+        .checked_add(
+            selected
+                .checked_mul(crate::backend::nn::grouped::affine_projection_control_bytes(true)?)?,
+        )
 }
 
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod tests;

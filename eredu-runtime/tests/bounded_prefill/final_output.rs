@@ -46,7 +46,8 @@ impl PrefillExecutor for Tracked {
         cancellation: &GenerationCancellationToken,
         _: InferenceRequest,
     ) -> Result<bool, Self::Error> {
-        Ok(cancellation.is_cancelled() || (self.cancel_after_first && !self.inner.submitted.is_empty()))
+        Ok(cancellation.is_cancelled()
+            || (self.cancel_after_first && !self.inner.submitted.is_empty()))
     }
     fn submit_chunk(
         &mut self,
@@ -86,7 +87,7 @@ fn final_only_run_retires_settled_sequence_scores_before_next_submission() {
             OutputDemand::StateOnly,
         ] {
             let g = geometry(chunk_size, demand);
-            let pool = WorkingMemoryPool::new(10000, 100).unwrap();
+            let pool = memory::host_ledger(10000, 100).unwrap();
             let execution = InferenceExecutionIdentity::default();
             let reservation = pool.reserve(&execution, &admission(g)).unwrap();
             let mut driver = PrefillDriver::new(
@@ -158,7 +159,7 @@ fn final_only_run_retires_settled_sequence_scores_before_next_submission() {
                 .all(|owner| owner.upgrade().is_none()));
             assert_eq!(executor.retired.borrow().len(), executor.owners.len());
             drop(driver);
-            assert_eq!(pool.used_bytes().unwrap(), 100);
+            assert_eq!(pool.funded_used_bytes().unwrap(), 100);
         }
     }
 }
@@ -167,7 +168,7 @@ fn final_only_run_retires_settled_sequence_scores_before_next_submission() {
 fn final_only_run_cancellation_and_later_failure_leave_no_prior_scores() {
     for cancel in [false, true] {
         let g = geometry(3, OutputDemand::Sequence);
-        let pool = WorkingMemoryPool::new(10000, 100).unwrap();
+        let pool = memory::host_ledger(10000, 100).unwrap();
         let execution = InferenceExecutionIdentity::default();
         let reservation = pool.reserve(&execution, &admission(g)).unwrap();
         let mut driver = PrefillDriver::new(
@@ -199,6 +200,6 @@ fn final_only_run_cancellation_and_later_failure_leave_no_prior_scores() {
             .iter()
             .all(|owner| owner.upgrade().is_none()));
         drop(driver);
-        assert_eq!(pool.used_bytes().unwrap(), 100);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 100);
     }
 }

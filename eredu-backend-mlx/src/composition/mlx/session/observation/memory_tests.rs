@@ -1,15 +1,11 @@
 use super::*;
 use crate::backend::managed_memory::NativeMemoryOwner;
 use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, InferenceRequest, WorkingMemoryError, WorkingMemoryPool,
+    InferenceExecutionIdentity, InferenceRequest, MemoryLedger, WorkingMemoryError,
 };
 use eredu_runtime::{RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver};
 
-fn authority() -> (
-    WorkingMemoryPool,
-    WorkingMemoryPool,
-    ArrayObserverAllocationAuthority,
-) {
+fn authority() -> (MemoryLedger, MemoryLedger, ArrayObserverAllocationAuthority) {
     use eredu_core::{
         cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
         InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout,
@@ -41,24 +37,35 @@ fn authority() -> (
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: bound(96),
-        attention: bound(0),
-        vocabulary: bound(0),
-        state_update: bound(0),
-        materialization: bound(0),
-        retained: bound(0),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: bound(96),
+            attention: bound(0),
+            vocabulary: bound(0),
+            state_update: bound(0),
+            materialization: bound(0),
+            retained: bound(0),
+        },
+    ))
     .unwrap();
-    let admitted = Admission {
+    let admitted = crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 96,
-        available_memory_bytes: None,
-    };
-    let requests = WorkingMemoryPool::new(96, 0).unwrap();
-    let native = WorkingMemoryPool::new(0, 0).unwrap();
+        incremental_required_bytes: Some(96),
+    });
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let required = probe.reservation_requirements(&admitted, None).unwrap();
+    let required = required
+        .get(probe.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let requests = crate::memory_fixture::ledger(required, 0).unwrap();
+    let native = crate::memory_fixture::ledger(0, 0).unwrap();
     let request: InferenceRequest = requests
         .reserve(&InferenceExecutionIdentity::default(), &admitted)
         .unwrap()
@@ -73,11 +80,12 @@ fn authority() -> (
     (requests, native, authority)
 }
 
-fn settled(requests: &WorkingMemoryPool, native: &WorkingMemoryPool, retained: bool) {
+fn settled(requests: &MemoryLedger, native: &MemoryLedger, retained: bool) {
     let expected_bytes = if retained { 96 } else { 0 };
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
-        requests.used_bytes().unwrap() == expected_bytes
+        requests.fixture_host_charge().unwrap() == expected_bytes
             && native.unquoted_owner_count().unwrap() == usize::from(retained)
     });
     if retained {
@@ -528,75 +536,67 @@ fn routing_observation_and_original_effective_decisions_cover_every_exposed_arra
 }
 
 #[test]
-fn session_observer_intermediate_keeps_execution_domain_after_session_retirement() {
+fn session_observer_requires_complete_admission_before_callbacks_in_both_limit_modes() {
     #[derive(Default)]
-    struct Intermediate {
-        array: Option<Array>,
-        was_lazy: bool,
-    }
-    impl RuntimeActivationObserver<MlxTensor, Error> for Intermediate {
-        fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Error> {
-            if self.array.is_none() && path.ends_with(".attention.output") {
-                // The callback only borrows and clones; it must not evaluate work.
-                self.was_lazy = value.as_array().allocation_info()?.is_none();
-                self.array = Some(value.as_array().clone());
-            }
+    struct Observer(usize);
+    impl RuntimeActivationObserver<MlxTensor, Error> for Observer {
+        fn observe(&mut self, _: &str, _: &MlxTensor) -> Result<(), Error> {
+            self.0 += 1;
             Ok(())
         }
     }
-
-    let stream = stream();
-    let model_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let operation_pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let source = MlxBackend::new(&stream, &stream).with_memory_pool(model_pool.clone());
-    let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
-    let model =
-        eredu_core::load_model(&source, root.path(), crate::MlxLoadRequest::default()).unwrap();
-    let prompt = MlxBackend::prepare_text_prompt(&source, vec![1, 2, 3]).unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(operation_pool.clone());
-    let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(operation_pool.clone());
-    let mut observer = Intermediate::default();
-    let output = runtime
-        .session_mut()
-        .submit_prefill_with_observer(&backend, prompt, &mut observer)
-        .unwrap()
-        .wait()
+    for limit in [
+        eredu_core::MemoryLimit::Finite(1 << 30),
+        eredu_core::MemoryLimit::Unlimited,
+    ] {
+        let stream = stream();
+        let topology = crate::memory_fixture::topology();
+        let limits =
+            eredu_core::MemoryLimits::resolve(&topology, [(topology.host_domain(), limit)])
+                .unwrap();
+        let pool = MemoryLedger::new(
+            topology.clone(),
+            limits,
+            eredu_core::DomainMemoryRequirements::zero(&topology),
+        )
         .unwrap();
-    assert!(observer.was_lazy);
-    let escaped = observer
-        .array
-        .take()
-        .expect("capture an attention intermediate");
-    // A Weak probe intentionally prevents Rc::get_mut, so install it only
-    // after the submission has finished all exclusive payload access.
-    let retired = runtime.session().test_payload_retirement_probe();
-    drop((output, observer, runtime, backend, source, root));
-    crate::backend::submission_recovery::wait_for_retirement(|| {
-        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
+        let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
+        let model = eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
+            .unwrap();
+        let prompt = MlxBackend::prepare_text_prompt(&backend, vec![1, 2, 3]).unwrap();
+        let mut runtime = ModelRuntime::from_prepared(
+            MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone()),
+            model,
+        )
+        .unwrap();
+        let state = runtime.session().test_state_presence();
+        let before = pool.snapshot().unwrap();
+        let mut observer = Observer::default();
+        let error = runtime
+            .session_mut()
+            .submit_prefill_with_observer(&backend, prompt, &mut observer)
+            .err()
+            .unwrap();
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut missing = false;
+        while let Some(error) = cause {
+            missing |= matches!(
+                error.downcast_ref::<WorkingMemoryError>(),
+                Some(WorkingMemoryError::UnknownBound)
+            );
+            cause = error.source();
+        }
+        assert!(missing, "{error:?}");
+        assert_eq!(observer.0, 0);
+        assert_eq!(runtime.session().test_state_presence(), state);
+        drop(error);
+        crate::backend::ordinary_retirement::reclaim_all();
         safemlx::reclaim_allocation_owners();
-        retired() && operation_pool.unquoted_owner_count().unwrap() == 1
-    });
-
-    let values = escaped.evaluated().unwrap().try_to_vec::<f32>().unwrap();
-    assert!(values.iter().all(|value| value.is_finite()));
-    assert!(values.iter().any(|value| value.abs() > 1e-6));
-    let allocation = escaped.allocation_info().unwrap().unwrap();
-    let view = escaped.as_strided(&[4][..], &[2][..], 1, &stream).unwrap();
-    view.evaluated().unwrap();
-    assert_eq!(view.allocation_info().unwrap(), Some(allocation));
-    drop(escaped);
-    safemlx::reclaim_allocation_owners();
-    assert_eq!(operation_pool.unquoted_owner_count().unwrap(), 1);
-    assert_eq!(
-        view.evaluated().unwrap().try_to_vec::<f32>().unwrap(),
-        vec![values[1], values[3], values[5], values[7]]
-    );
-    drop(view);
-    crate::backend::submission_recovery::wait_for_retirement(|| {
-        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
-        safemlx::reclaim_allocation_owners();
-        operation_pool.unquoted_owner_count().unwrap() == 0
-            && model_pool.unquoted_owner_count().unwrap() == 0
-    });
+        assert_eq!(pool.snapshot().unwrap(), before);
+    }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

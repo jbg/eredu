@@ -1,6 +1,10 @@
 //! Canonical paged custody moves out of temporary native projection handles.
 use super::*;
 mod catalogs;
+mod ordinary;
+mod ordinary_scan;
+pub(crate) use ordinary_scan::PreparedOrdinaryPagedScan;
+pub(crate) use ordinary::{OrdinaryPagedProgram,OrdinaryPagedWork,OrdinaryPagedAppend,OrdinaryPagedCause,OrdinaryPagedHostScan};
 mod host_program;
 pub(crate) use host_program::PagedHostStoreDeclaration;
 mod programs;
@@ -15,7 +19,7 @@ pub(crate) use scan_claim::{
 };
 mod append_claim;
 pub(crate) use append_claim::{
-    OriginalPagedAppendClaim, OriginalPagedVisibleClaim, PagedAppendInput,
+    OriginalPagedAppendClaim, OriginalPagedVisibleClaim, PagedAppendInput, PagedMutationCause,
 };
 use catalogs::PreparedPagedCatalogs;
 mod roles;

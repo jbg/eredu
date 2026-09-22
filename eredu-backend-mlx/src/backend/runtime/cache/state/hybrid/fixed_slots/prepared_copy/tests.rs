@@ -323,6 +323,7 @@ fn partial_failure_keeps_actual_native_roots_until_collector_and_raw_alias_retir
     assert_eq!(numbers(&escaped), [2., 3., 6., 7.]);
     drop(escaped);
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
         safemlx::reclaim_allocation_owners();
         retired.load(Ordering::SeqCst) == 1
     });

@@ -145,7 +145,9 @@ impl
             std::panic::panic_any(self.identity.clone());
         }
         if self.failure == Failure::Input {
-            return Err(Error::backend_retained_source(Original(self.identity.clone())));
+            return Err(Error::backend_retained_source(Original(
+                self.identity.clone(),
+            )));
         }
         Ok(FakeTensor(vec![3, 7]))
     }
@@ -195,7 +197,6 @@ fn capture_source() -> SharedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::FullTensor],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     SharedCapturePlan::new(
@@ -211,7 +212,6 @@ fn capture_source() -> SharedCapturePlan {
             limits: CaptureLimits {
                 per_step: limits,
                 cumulative: limits,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -262,7 +262,8 @@ fn exercise(failure: Failure, initial_cancel: bool) {
     let bound = |n| WorkspaceBound::bounded(n, "actual neutral scalar protocol account");
     admission.state = admission
         .state
-        .with_execution_workspace(ExecutionWorkspaceEstimate {
+        .with_execution_workspace(crate::memory::workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: bound(h + 384),
             attention: bound(0),
@@ -270,10 +271,10 @@ fn exercise(failure: Failure, initial_cancel: bool) {
             state_update: bound(0),
             materialization: bound(0),
             retained: bound(0),
-        })
+        }))
         .unwrap();
-    admission.incremental_required_bytes = h + 384;
-    let pool = WorkingMemoryPool::new(h + 384, 0).unwrap();
+    admission.incremental_required_bytes = Some(h + 384);
+    let pool = crate::memory::host_ledger(crate::memory::reservation_bytes(&admission), 0).unwrap();
     let (reservation, run) = pool
         .reserve(session.inference_execution_identity(), &admission)
         .unwrap()
@@ -302,36 +303,41 @@ fn exercise(failure: Failure, initial_cancel: bool) {
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         funded
-            .with_observer(&mut backend, 0, &|e| Error::backend_retained_source(e), |observer| {
-                let mut driver = eredu_runtime::prefill::PrefillDriver::new(
-                    session.inference_execution_identity(),
-                    request.clone(),
-                    geometry,
-                    cancellation,
-                )
-                .unwrap();
-                let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-                let mut executor = eredu_runtime::replicated_session::SessionPrefill::new(
-                    &mut session,
-                    Input {
+            .with_observer(
+                &mut backend,
+                0,
+                &|e| Error::backend_retained_source(e),
+                |observer| {
+                    let mut driver = eredu_runtime::prefill::PrefillDriver::new(
+                        session.inference_execution_identity(),
+                        request.clone(),
                         geometry,
-                        prepared: prepared.clone(),
-                        failure,
-                        identity: identity.clone(),
-                    },
-                    request.clone(),
-                    &(),
-                    &mut borrowed,
-                )
-                .unwrap();
-                let result = driver.run(&mut executor, |_, _| {});
-                drop(executor);
-                borrowed.finish_prefill(matches!(
-                    result,
-                    Ok(eredu_runtime::prefill::PrefillOutcome::Complete)
-                ));
-                result
-            })
+                        cancellation,
+                    )
+                    .unwrap();
+                    let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+                    let mut executor = eredu_runtime::replicated_session::SessionPrefill::new(
+                        &mut session,
+                        Input {
+                            geometry,
+                            prepared: prepared.clone(),
+                            failure,
+                            identity: identity.clone(),
+                        },
+                        request.clone(),
+                        &(),
+                        &mut borrowed,
+                    )
+                    .unwrap();
+                    let result = driver.run(&mut executor, |_, _| {});
+                    drop(executor);
+                    borrowed.finish_prefill(matches!(
+                        result,
+                        Ok(eredu_runtime::prefill::PrefillOutcome::Complete)
+                    ));
+                    result
+                },
+            )
             .unwrap()
     }));
     let result = match result {
@@ -514,7 +520,7 @@ fn exercise(failure: Failure, initial_cancel: bool) {
     drop((funded, session, request, reservation));
     backend.scope.take().unwrap().certify().unwrap();
     drop((backend, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn actual_session_issues_final_ticket_before_outer_frame_commit() {

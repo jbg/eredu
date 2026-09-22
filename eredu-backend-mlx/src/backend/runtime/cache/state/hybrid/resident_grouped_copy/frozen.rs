@@ -95,9 +95,14 @@ impl<'a> PreparedHybridGroupedCopy<'a> {
                 )?;
             bytes = bytes.checked_add(child).ok_or(E::Overflow)?;
         }
-        if let Some(paged)=&self.paged {
-            bytes=bytes.checked_add(paged.host_preparation_bytes(self.paged_caller_controls().ok_or(E::Overflow)?)
-                .ok_or(E::Overflow)?).ok_or(E::Overflow)?;
+        if let Some(paged) = &self.paged {
+            bytes = bytes
+                .checked_add(
+                    paged
+                        .host_preparation_bytes(self.paged_caller_controls().ok_or(E::Overflow)?)
+                        .ok_or(E::Overflow)?,
+                )
+                .ok_or(E::Overflow)?;
         }
         bytes
             .checked_add(std::mem::size_of::<PreparedHybridGroupHostCopy<'_>>())
@@ -111,14 +116,14 @@ impl<'a> PreparedHybridGroupedCopy<'a> {
 
     pub(crate) fn host_copy(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<PreparedHybridGroupHostCopy<'a>, Error> {
         self.host_copy_with_preparation(pool, None)
     }
 
     pub(crate) fn host_copy_with_preparation(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         preparation: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<PreparedHybridGroupHostCopy<'a>, Error> {
         self.validate()?;
@@ -179,90 +184,194 @@ impl<'a> PreparedHybridGroupedCopy<'a> {
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<SavedHybridGroupedCopy, Error> {
-        self.copy_retained_with(initialized,stream,roots,&mut |_|Ok(()),&mut |_|Ok(()))
+        self.copy_retained_with(initialized, stream, roots, &mut |_| Ok(()), &mut |_| Ok(()))
     }
     pub(crate) fn copy_retained_with(
-        self, initialized:InitializedHybridGroupCopy, stream:&Stream, roots:&RefCell<Vec<Array>>,
-        observe:&mut dyn FnMut(&Array)->Result<(),Error>,
-        observe_host:&mut dyn FnMut(&crate::backend::array_copy::PreparedSavedHostCopy)->Result<(),Error>,
-    )->Result<SavedHybridGroupedCopy,Error>{
+        self,
+        initialized: InitializedHybridGroupCopy,
+        stream: &Stream,
+        roots: &RefCell<Vec<Array>>,
+        observe: &mut dyn FnMut(&Array) -> Result<(), Error>,
+        observe_host: &mut dyn FnMut(
+            &crate::backend::array_copy::PreparedSavedHostCopy,
+        ) -> Result<(), Error>,
+    ) -> Result<SavedHybridGroupedCopy, Error> {
         self.validate()?;
-        let InitializedHybridGroupCopy{mut slots,mut paged}=initialized;
-        if self.is_paged()!=paged.is_some(){return Err(mismatch());}
-        let result=(||{
-        match self.source {
-            Source::Live(s) => slots
-                .validate_source(
-                    &s.layers
-                        .prepare_copy_slots()
-                        .map_err(other)?
-                        .for_destination::<SavedHybridGroupedLayer>()
-                        .map_err(other)?,
-                )
-                .map_err(other)?,
-            Source::Saved(s) => slots
-                .validate_source(&s.layers.prepare_copy_slots().map_err(other)?)
-                .map_err(other)?,
+        let InitializedHybridGroupCopy {
+            mut slots,
+            mut paged,
+        } = initialized;
+        if self.is_paged() != paged.is_some() {
+            return Err(mismatch());
         }
-        if let Some(work)=&mut paged{work.copy_pages(stream,roots,observe,observe_host,false)?;}
-        for i in 0..self.len() {
-            let layer = self.layer(i).ok_or_else(mismatch)?;
-            let mut child = slots.take_child(i).map_err(other)?;
-            let actual = match layer.fixed {
-                Fixed::Live(s) => s.prepare_slots().map_err(other)?,
-                Fixed::Saved(s) => s.prepare_copy_slots().map_err(other)?,
-            };
-            child.validate_source(&actual).map_err(other)?;
-            let attention = self.copy_attention_with_paged(i,&mut paged,stream,roots,observe)?;
-            for j in 0..layer.fixed.len() {
-                let value =
-                    copy_slot_retained(layer.fixed.slot(j).ok_or_else(mismatch)?, stream, roots)?;
-                #[cfg(all(
-                    test,
-                    target_vendor = "apple",
-                    feature = "metal",
-                    not(feature = "cuda")
-                ))]
-                tests::after_fixed_copy()?;
-                child.push(value).map_err(|_| mismatch())?;
+        let result = (|| {
+            match self.source {
+                Source::Live(s) => slots
+                    .validate_source(
+                        &s.layers
+                            .prepare_copy_slots()
+                            .map_err(other)?
+                            .for_destination::<SavedHybridGroupedLayer>()
+                            .map_err(other)?,
+                    )
+                    .map_err(other)?,
+                Source::Saved(s) => slots
+                    .validate_source(&s.layers.prepare_copy_slots().map_err(other)?)
+                    .map_err(other)?,
             }
-            let fixed = child.finish().map_err(|_| mismatch())?;
-            slots
-                .push(SavedHybridGroupedLayer {
-                    attention,
-                    fixed,
-                    fixed_offset: layer.fixed_offset,
-                })
-                .map_err(|_| mismatch())?;
-        }
-        if let Some(work)=&mut paged{work.finish()?;}
-        let retained = slots.retained_bytes();
-        let protected = slots.protected_bytes();
-        let layers = slots.finish().map_err(|_| mismatch())?;
-        Ok(SavedHybridGroupedCopy {
-            layers,
-            layout: self.shared_layout().clone(),
-            global_layer_start: self.global_layer_start(),
-            retained,
-            protected,
-        })
+            if let Some(work) = &mut paged {
+                work.copy_pages(stream, roots, observe, observe_host, false)?;
+            }
+            for i in 0..self.len() {
+                let layer = self.layer(i).ok_or_else(mismatch)?;
+                let mut child = slots.take_child(i).map_err(other)?;
+                let actual = match layer.fixed {
+                    Fixed::Live(s) => s.prepare_slots().map_err(other)?,
+                    Fixed::Saved(s) => s.prepare_copy_slots().map_err(other)?,
+                };
+                child.validate_source(&actual).map_err(other)?;
+                let attention =
+                    self.copy_attention_with_paged(i, &mut paged, stream, roots, observe)?;
+                for j in 0..layer.fixed.len() {
+                    let value = copy_slot_retained(
+                        layer.fixed.slot(j).ok_or_else(mismatch)?,
+                        stream,
+                        roots,
+                    )?;
+                    #[cfg(all(
+                        test,
+                        target_vendor = "apple",
+                        feature = "metal",
+                        not(feature = "cuda")
+                    ))]
+                    tests::after_fixed_copy()?;
+                    child.push(value).map_err(|_| mismatch())?;
+                }
+                let fixed = child.finish().map_err(|_| mismatch())?;
+                slots
+                    .push(SavedHybridGroupedLayer {
+                        attention,
+                        fixed,
+                        fixed_offset: layer.fixed_offset,
+                    })
+                    .map_err(|_| mismatch())?;
+            }
+            if let Some(work) = &mut paged {
+                work.finish()?;
+            }
+            let retained = slots.retained_bytes();
+            let protected = slots.protected_bytes();
+            let layers = slots.finish().map_err(|_| mismatch())?;
+            Ok(SavedHybridGroupedCopy {
+                layers,
+                layout: self.shared_layout().clone(),
+                global_layer_start: self.global_layer_start(),
+                retained,
+                protected,
+            })
         })();
-        match (result,paged){(Err(cause),Some(work))=>Err(work.retain_failure(cause)),(result,_)=>result}
+        match (result, paged) {
+            (Err(cause), Some(work)) => Err(work.retain_failure(cause)),
+            (result, _) => result,
+        }
     }
 }
 impl InitializedHybridGroupCopy {
     #[cfg(test)]
-    pub(super) fn retained_bytes(&self) -> u64 { self.slots.retained_bytes() }
+    pub(super) fn retained_bytes(&self) -> u64 {
+        self.slots.retained_bytes()
+    }
     #[cfg(test)]
-    pub(super) fn protected_bytes(&self) -> u64 { self.slots.protected_bytes() }
+    pub(super) fn protected_bytes(&self) -> u64 {
+        self.slots.protected_bytes()
+    }
 
-    pub(crate) fn prepare_host_destinations(&mut self,
-        copy:&mut crate::backend::array_copy::PreparedOriginalCopy,
-        environment:&crate::backend::OriginalCopyEnvironment<'_>)->Result<(),Error>{
-        self.paged.as_mut().map_or(Ok(()),|work|work.prepare_host_destinations(copy,environment))
+    pub(crate) fn prepare_host_destinations(
+        &mut self,
+        copy: &mut crate::backend::array_copy::PreparedOriginalCopy,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
+    ) -> Result<(), Error> {
+        self.paged.as_mut().map_or(Ok(()), |work| {
+            work.prepare_host_destinations(copy, environment)
+        })
     }
 }
 impl<'a> PreparedHybridGroupHostCopy<'a> {
+    #[cfg(test)]
+    pub(super) fn admit_exact_fixture(
+        self,
+        pool: &MemoryLedger,
+        sampling: RegisteredSamplingCopy<'a, StorageIdentity>,
+        complete: WorkingMemoryStorage<StorageIdentity>,
+        maximum_roots: usize,
+        one_byte_short: bool,
+    ) -> Result<
+        (
+            FundedSamplerCopy,
+            InitializedHybridGroupCopy,
+            AdmittedWorkspaceCopy,
+        ),
+        Error,
+    > {
+        let mut limits = WorkspaceCopyLimits::new(Default::default());
+        limits.additional_host_metadata_bytes =
+            crate::backend::runtime::residency::storage::generic_storage_publication_layout(
+                maximum_roots,
+            )
+            .map_err(other)?
+            .requested_bytes()
+            .checked_add(MemoryLedger::storage_metadata_control_bytes().map_err(other)?)
+            .ok_or_else(|| other(WorkingMemoryError::Overflow))?;
+        macro_rules! admit {
+            ($group:expr, $paged:expr) => {{
+                let copy = sampling
+                    .with_decoder_group($group, complete)
+                    .map_err(other)?;
+                let requirements = pool
+                    .text_components_group_copy_requirements(&copy, &limits)
+                    .map_err(other)?;
+                let snapshot = pool.snapshot().map_err(other)?;
+                limits.memory_limits = eredu_core::MemoryLimitDeclarations::new(
+                    snapshot.domains.iter().map(|domain| {
+                        let increment = requirements.get(domain.domain).unwrap().total().unwrap();
+                        let ceiling = domain
+                            .current_charge_bytes
+                            .checked_add(increment)
+                            .unwrap()
+                            .checked_sub(u64::from(
+                                one_byte_short && domain.domain == pool.topology().host_domain(),
+                            ))
+                            .unwrap();
+                        (
+                            pool.topology()
+                                .description(domain.domain)
+                                .unwrap()
+                                .name
+                                .clone(),
+                            eredu_core::MemoryLimit::Finite(ceiling),
+                        )
+                    }),
+                );
+                pool.copy_text_components_group(copy, limits)
+                    .map(|(sampler, slots, native)| {
+                        (
+                            sampler,
+                            InitializedHybridGroupCopy {
+                                slots,
+                                paged: $paged,
+                            },
+                            native,
+                        )
+                    })
+                    .map_err(other)
+            }};
+        }
+        match self {
+            Self::Live(group, paged) => admit!(group, paged),
+            Self::Saved(group, paged) => admit!(group, paged),
+        }
+    }
+
     pub(crate) fn initialization_peak_bytes(&self) -> u64 {
         match self {
             Self::Live(p, _) => p.initialization_peak_bytes(),
@@ -271,7 +380,7 @@ impl<'a> PreparedHybridGroupHostCopy<'a> {
     }
     pub(crate) fn admit(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         sampling: RegisteredSamplingCopy<'a, StorageIdentity>,
         complete: WorkingMemoryStorage<StorageIdentity>,
         limits: WorkspaceCopyLimits,
@@ -284,19 +393,23 @@ impl<'a> PreparedHybridGroupHostCopy<'a> {
         Error,
     > {
         match self {
-            Self::Live(p,paged) => pool
+            Self::Live(p, paged) => pool
                 .copy_text_components_group(
                     sampling.with_decoder_group(p, complete).map_err(other)?,
                     limits,
                 )
-                .map(|(sampler,slots,native)|(sampler,InitializedHybridGroupCopy{slots,paged},native))
+                .map(|(sampler, slots, native)| {
+                    (sampler, InitializedHybridGroupCopy { slots, paged }, native)
+                })
                 .map_err(other),
-            Self::Saved(p,paged) => pool
+            Self::Saved(p, paged) => pool
                 .copy_text_components_group(
                     sampling.with_decoder_group(p, complete).map_err(other)?,
                     limits,
                 )
-                .map(|(sampler,slots,native)|(sampler,InitializedHybridGroupCopy{slots,paged},native))
+                .map(|(sampler, slots, native)| {
+                    (sampler, InitializedHybridGroupCopy { slots, paged }, native)
+                })
                 .map_err(other),
         }
     }

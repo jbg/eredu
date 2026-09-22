@@ -15,18 +15,26 @@ impl<'a> CaptureAdmission<'a> {
     }
 
     pub(in crate::composition::mlx::session::model_session::text_quote) fn with_saved_interventions(
-        self, rows: Option<crate::composition::mlx::session::intervention::PreparedTextInterventions>,
+        self,
+        rows: Option<crate::composition::mlx::session::intervention::PreparedTextInterventions>,
         geometry: InferenceGeometry,
     ) -> Result<Self, Error> {
-        let checkpoint=self.checkpoint.ok_or_else(unknown)?;
+        let checkpoint = self.checkpoint.ok_or_else(unknown)?;
         match (checkpoint.intervention_source(), rows.as_ref()) {
-            (Some(source),Some(rows)) => rows.validate_range(source,checkpoint.next_prediction(),geometry.max_output_tokens)
-                .map_err(|_|memory(WorkingMemoryError::IdentityMismatch))?,
-            (None,None)=>{},
-            _=>return Err(memory(WorkingMemoryError::IdentityMismatch)),
+            (Some(source), Some(rows)) => rows
+                .validate_range(
+                    source,
+                    checkpoint.next_prediction(),
+                    geometry.max_output_tokens,
+                )
+                .map_err(|_| memory(WorkingMemoryError::IdentityMismatch))?,
+            (None, None) => {}
+            _ => return Err(memory(WorkingMemoryError::IdentityMismatch)),
         }
-        if self.text_interventions.borrow().is_some(){return Err(memory(WorkingMemoryError::AlreadyStarted));}
-        *self.text_interventions.borrow_mut()=rows;
+        if self.text_interventions.borrow().is_some() {
+            return Err(memory(WorkingMemoryError::AlreadyStarted));
+        }
+        *self.text_interventions.borrow_mut() = rows;
         Ok(self)
     }
 
@@ -48,7 +56,7 @@ impl<'a> CaptureAdmission<'a> {
             .admit::<eredu_runtime::capture::FundedCaptureCheckpointError>()
             .map_err(|cause| Error::Neural(metadata.error(cause)))?;
         witness
-            .validate(&session.payload.memory_pool)
+            .validate(&session.payload.memory_ledger)
             .map_err(memory)?;
         checkpoint
             .validate_continuation_geometry(geometry)
@@ -62,9 +70,7 @@ impl<'a> CaptureAdmission<'a> {
             .erased()
             .validate_prepared_observation_paths(selection.paths(), metadata)?;
         validate_current_admission(session, checkpoint.source().admission(), metadata)?;
-        interventions::validate_saved_source(
-            session, checkpoint.intervention_source(), metadata,
-        )?;
+        interventions::validate_saved_source(session, checkpoint.intervention_source(), metadata)?;
         let host = checkpoint
             .continuation_host_plan_for(geometry)
             .map_err(|cause| Error::Neural(validation::source(metadata, cause)))?;
@@ -74,17 +80,33 @@ impl<'a> CaptureAdmission<'a> {
         // The shared worker returns None only for a non-applicable source or a
         // continuation after the initial prefill observation has been spent.
         let partition_hosts = match metadata.funding() {
-            Some(funding) if geometry.max_output_tokens > 0 => partition::host::HostAdmission::prepare(
-                session, checkpoint.source(), geometry, checkpoint.next_prediction(), &funding,
-            )?,
+            Some(funding) if geometry.max_output_tokens > 0 => {
+                partition::host::HostAdmission::prepare(
+                    session,
+                    checkpoint.source(),
+                    geometry,
+                    checkpoint.next_prediction(),
+                    &funding,
+                )?
+            }
             _ => None,
         };
-        let partition_evidence=match metadata.funding() {
-            Some(funding) if geometry.max_output_tokens > 0 =>partition::host::evidence::Admission::prepare(session,checkpoint.source(),
-                checkpoint.intervention_source(),selection,geometry,checkpoint.next_prediction(),&funding)?,
-            _=>None,
+        let partition_evidence = match metadata.funding() {
+            Some(funding) if geometry.max_output_tokens > 0 => {
+                partition::host::evidence::Admission::prepare(
+                    session,
+                    checkpoint.source(),
+                    checkpoint.intervention_source(),
+                    selection,
+                    geometry,
+                    checkpoint.next_prediction(),
+                    &funding,
+                )?
+            }
+            _ => None,
         };
         Ok(Self {
+            ordinary_publications: std::cell::Cell::new(0),
             session,
             checkpoint: Some(checkpoint),
             saved_witness: Some(witness),
@@ -135,7 +157,10 @@ impl<'a> CaptureAdmission<'a> {
             StorageIdentity::CapturePlan(self.source.storage_identity().clone()),
             self.plan_pin.as_ref(),
         )
-        .map_err(memory)?;
+        .map_err(|cause| Error::OriginalSourceContract {
+            stage: "saved capture plan publication",
+            cause,
+        })?;
         if publication.new_source_bytes() != self.new_source_bytes {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
@@ -147,34 +172,68 @@ impl<'a> CaptureAdmission<'a> {
             // when the facade already owns its copied decoder/cursor bank.
             self.control_facts_with_sequence(quote.geometry(), true)?,
         )
-        .map_err(memory)?;
-        let controls = if checkpoint.next_prediction() == 0 && quote.geometry().max_output_tokens > 0 {
-            controls
-                .with_prefill_capture_selection(self.bind_geometry(quote.geometry())?)
-                .map_err(memory)?
-        } else {
-            controls
-                .with_capture_continuation_selection(checkpoint, &self.selection)
-                .map_err(memory)?
-        };
+        .map_err(|cause| Error::OriginalSourceContract {
+            stage: "saved capture continuation controls",
+            cause,
+        })?;
+        let controls =
+            if checkpoint.next_prediction() == 0 && quote.geometry().max_output_tokens > 0 {
+                controls
+                    .with_prefill_capture_selection(self.bind_geometry(quote.geometry())?)
+                    .map_err(|cause| Error::OriginalSourceContract {
+                        stage: "saved capture initial selection",
+                        cause,
+                    })?
+            } else {
+                controls
+                    .with_capture_continuation_selection(checkpoint, &self.selection)
+                    .map_err(|cause| Error::OriginalSourceContract {
+                        stage: "saved capture continuation selection",
+                        cause,
+                    })?
+            };
         let controls = controls
             .with_capture_plan_publication(publication)
-            .map_err(memory)?
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture source publication controls",
+                cause,
+            })?
             .with_preparation_scopes(super::super::preparation::facts()?)
-            .map_err(memory)?
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture preparation scope",
+                cause,
+            })?
             .with_prediction_scopes(super::super::prediction::facts()?)
-            .map_err(memory)?
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture prediction scope",
+                cause,
+            })?
             .with_submission_tracking(tracking)
-            .map_err(memory)?
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture tracking scope",
+                cause,
+            })?
             .with_graph_metadata(graph)
-            .map_err(memory)?
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture graph scope",
+                cause,
+            })?
             .with_prefill_scopes(prefill)
-            .map_err(memory)?
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture prefill scope",
+                cause,
+            })?
             .with_native_storage(native)
-            .map_err(memory)?;
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture native storage",
+                cause,
+            })?;
         quote = quote
             .with_saved_capture_sources(self.saved_witness.ok_or_else(unknown)?, self.source)
-            .map_err(memory)?;
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "saved capture registered source",
+                cause,
+            })?;
         quote
             .with_span_workspace_and_text_controls(controls)
             .map_err(|cause| Error::Neural(validation::source(self.metadata(), cause)))
@@ -199,17 +258,13 @@ impl<'a> CaptureAdmission<'a> {
             .validate_prepared_observation_paths(self.paths, self.metadata())?;
         if !accepted
             .pool()
-            .same_domain(&self.session.payload.memory_pool)
+            .same_ledger(&self.session.payload.memory_ledger)
             || geometry != request.geometry()
         {
             return Err(memory(WorkingMemoryError::IdentityMismatch).into());
         }
         let pending = accepted
-            .begin_capture_plan_publication(
-                funding,
-                request.memory_reservation().ok_or_else(unknown)?,
-                self.source,
-            )
+            .begin_capture_plan_publication(funding, request.memory_reservation(), self.source)
             .map_err(|cause| AdmissionFailure::retained(cause, true))?;
         let (span, witness) = pending
             .publish_and_finish(scope)

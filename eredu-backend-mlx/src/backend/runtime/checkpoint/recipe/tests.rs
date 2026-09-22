@@ -959,6 +959,73 @@ fn neg_log_materializes_negative_rates_and_rejects_nonnegative_values() {
 }
 
 #[test]
+fn prepared_recipe_leaves_preserve_nested_source_order_and_completion_custody() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let context = MlxParameterMaterializationContext::new(&stream, &stream);
+    let buffers = [[-1.0_f32, -4.0], [4.0_f32, 9.0]].map(|values| {
+        let mut buffer =
+            HostTransferBuffer::new(&[2], Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
+        for (chunk, value) in buffer
+            .as_bytes_mut()
+            .unwrap()
+            .chunks_exact_mut(4)
+            .zip(values)
+        {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        buffer.freeze()
+    });
+    let recipe = DerivedWeightRecipe::Stack {
+        axis: 0,
+        inputs: vec![
+            DerivedWeightRecipe::NegLog {
+                input: Box::new(source("rates")),
+            },
+            DerivedWeightRecipe::SubtractOne {
+                input: Box::new(source("offsets")),
+            },
+        ],
+    };
+    let mut copies = Vec::new();
+    let mut ordinal = 0usize;
+    assert!(safemlx::OriginalScopeObserver::try_current()
+        .unwrap()
+        .is_none());
+    let pending = {
+        let mut leaves = |key: &str, selection: &TensorSelection, actual: &Stream| {
+            assert_eq!(key, ["rates", "offsets"][ordinal]);
+            assert_eq!(selection, &TensorSelection::Full);
+            assert_eq!(actual, &stream);
+            let copy = buffers[ordinal].copy_to_array(actual)?;
+            let output = copy.value().clone();
+            copies.push(copy);
+            ordinal += 1;
+            Ok(output)
+        };
+        prepare_ordinary_recipe_from_leaves(&recipe, &context, &mut leaves).unwrap()
+    };
+    assert_eq!(ordinal, 2);
+    assert!(pending.sources.is_empty());
+    drop(buffers);
+    let output = pending.finish().unwrap();
+    assert_eq!(output.shape(), &[2, 2]);
+    let value = output.evaluated().unwrap();
+    for (actual, expected) in value
+        .as_slice::<f32>()
+        .iter()
+        .zip([0.0, 4.0_f32.ln(), 3.0, 8.0])
+    {
+        assert!((actual - expected).abs() < 1e-6);
+    }
+    for copy in copies {
+        copy.completion().synchronize().unwrap();
+    }
+    assert!(safemlx::OriginalScopeObserver::try_current()
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn neg_log_eager_preparation_hands_back_exact_source_lease_until_submission_finishes() {
     use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, StoreError, TensorReadRequest};
     let dir = tempfile::tempdir().unwrap();

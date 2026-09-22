@@ -80,7 +80,7 @@ TEST_CASE("CPU selected GatherMM shares tiled tails transpose repeated indices a
   struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
   unsigned retired = 0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-      [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   std::optional<array> escaped;
   {
     Role role; REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);
@@ -120,7 +120,7 @@ TEST_CASE("CPU selected GatherMM original frontend uses actual U32 range and cas
   struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
   unsigned retired = 0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-      [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   {
     Role role; REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);
     Observer observer; Bank constructors;
@@ -172,7 +172,7 @@ TEST_CASE("CPU selected GatherMM checks queued index bounds and retains failed o
   struct Budget { mlx_original_buffer_budget value{}; ~Budget() { mlx_original_buffer_budget_release(value); } } budget;
   unsigned retired = 0;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, 1 << 20, &retired,
-      [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   std::optional<array> failed_output;
   {
     Role role; REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);

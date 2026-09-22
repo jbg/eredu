@@ -39,8 +39,11 @@ pub mod execution;
 pub mod execution_control;
 /// Backend-independent generation lifecycle and output events.
 pub mod generation;
+mod host_tensor_buffer;
 /// Exact output demand and geometry for bounded inference.
 pub mod inference;
+pub use host_tensor_buffer::{HostTensorBuffer, HostTensorBufferIntoIter};
+
 /// Portable identity for ordered, prepared model input.
 pub mod input;
 pub use inference::{
@@ -55,6 +58,12 @@ pub mod intervention;
 pub mod media;
 /// Accounted allocations, overhead estimates, and pure memory-policy evaluation.
 pub mod memory;
+pub use memory::{
+    DomainMemoryCharge, DomainMemoryRequirements, DomainOverheadEstimate, MemoryDeviceId,
+    MemoryDomainDescription, MemoryDomainError, MemoryDomainId, MemoryHeadroomDeclarations,
+    MemoryLimit, MemoryLimitDeclarations, MemoryLimits, MemoryLocation, MemoryPlacement,
+    MemoryPlacementKind, MemoryTopology, PlacementAllowance,
+};
 /// Portable, explicitly requested execution observations.
 pub mod observation;
 /// Backend-generic realtime token-session execution and scheduling.
@@ -73,142 +82,149 @@ pub mod speculative;
 pub mod topology;
 
 pub use admission::{
-    ArchitecturePreparationCapabilities, PreparationAdmission, PreparationAdmissionError,
-    PreparationAdmissionRequest, PreparationMechanismCapabilities, admit_preparation,
+    admit_preparation, ArchitecturePreparationCapabilities, PreparationAdmission,
+    PreparationAdmissionError, PreparationAdmissionRequest, PreparationMechanismCapabilities,
 };
 pub use artifact::{
-    ArtifactFormat, ArtifactInspection, GgufCompanionEncoding, GgufCompanionRequirement,
-    GgufCompanionRole, LoadingProtocol, MaterializationRoute, ModelArtifact, ModelConfiguration,
-    ModelConfigurationResolver, ModelPreparationPlan, PreparationPolicy, QuantizationRequest,
-    ResidencyRequest, ResolvedModelConfiguration, ValidatedGguf, ValidatedGgufCompanion,
     gguf_u32_metadata_values, inspect_artifact, inspect_artifact_with_prepared_gguf_headers,
-    inspect_artifact_with_safetensors_admission,
-    plan_model_preparation, resolve_gguf_companions, validate_preparation_policy,
+    inspect_artifact_with_safetensors_admission, plan_model_preparation, resolve_gguf_companions,
+    validate_preparation_policy, ArtifactFormat, ArtifactInspection, GgufCompanionEncoding,
+    GgufCompanionRequirement, GgufCompanionRole, LoadingProtocol, MaterializationRoute,
+    ModelArtifact, ModelConfiguration, ModelConfigurationResolver, ModelPreparationPlan,
+    PreparationPolicy, QuantizationRequest, ResidencyRequest, ResolvedModelConfiguration,
+    ValidatedGguf, ValidatedGgufCompanion,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{
-    AUTOMATIC_SCHEMA_VERSION, AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError,
-    BoundedResidencyRequirement, CandidateAdmission, DurationSeconds, ExecutionPlanBackendFactory,
-    ExecutionPlanReport, ExecutionPlanTarget, ExecutionPlanTargetLoadError,
-    ExecutionPlanTargetSelection, ExecutionTelemetry, ExpertCacheTelemetry, ExternalDraftArtifact,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    ModelResourceProfile, ObservationKind, Observed, ParameterMaterializationWorkspace,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, PreparedExecutionPlanTarget,
-    RealizedDrafting, ResidencyTelemetry, RetainedAutomaticPlan, SelectedExecutionPlanDrafting,
-    SelectedExecutionPlanTarget, SelectedRankResourceProfile, SpeculativeDecodingTelemetry,
-    TimingTelemetry, TokenizerCompatibilityError, TokenizerCompatibilityProof, TransferTelemetry,
     realize_execution_plan_drafting, realize_execution_plan_target, select_execution_plan_drafting,
-    select_execution_plan_target, speculative_decoding_telemetry,
+    select_execution_plan_target, speculative_decoding_telemetry, AllocatorTelemetry,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
+    AutomaticPlanningError, BoundedResidencyRequirement, CandidateAdmission, DurationSeconds,
+    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget,
+    ExecutionPlanTargetLoadError, ExecutionPlanTargetSelection, ExecutionTelemetry,
+    ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ObservationKind, Observed,
+    ParameterMaterializationWorkspace, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    PreparedExecutionPlanTarget, RealizedDrafting, ResidencyTelemetry, RetainedAutomaticPlan,
+    SelectedExecutionPlanDrafting, SelectedExecutionPlanTarget, SelectedRankResourceProfile,
+    SpeculativeDecodingTelemetry, TimingTelemetry, TokenizerCompatibilityError,
+    TokenizerCompatibilityProof, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
-pub use execution_control::{SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend};
 pub use backend::{
-    ProspectiveTokenController, TextTokenChoiceBoundary, TextSamplingBoundary,
-    BackendDescriptor, BackendError, BackendFailure, BackendFailureKind, BackendProvider,
-    BackendSession, BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
-    BoundedCompletionWaitError, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
-    CollectiveGroupId, CollectiveScope, Completion, CompletionCancellationMode,
-    ControlledTextGeneration, ControlledTextGenerationError, ControlledToken,
-    ControllerDeclarationData, DeviceCapabilities, DeviceDescriptor, DistributedBackend,
-    DistributedCapabilities, DistributedCommitEpoch, DistributedCommitOutcome,
-    DistributedCommitPhase, DistributedSession, DistributedSessionDescriptor,
-    ErasedSharedStorageOwner, GenerationDecoderError, GenerationDecoderInput,
-    GenerationDecoderOutput, GenerationPlainText, GenerationPlainTextEvent,
+    load_model, prepare_inspected_model, prepare_inspected_model_config,
+    text_generation_control_bytes, text_resume_control_bytes, BackendDescriptor, BackendError,
+    BackendFailure, BackendFailureKind, BackendProvider, BackendSession, BoundedCompletion,
+    BoundedCompletionOutcome, BoundedCompletionWait, BoundedCompletionWaitError,
+    BoundedSubmissionOutcome, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope,
+    Completion, CompletionCancellationMode, ControlledTextGeneration,
+    ControlledTextGenerationError, ControlledToken, ControllerDeclarationData, DeviceCapabilities,
+    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedCommitEpoch,
+    DistributedCommitOutcome, DistributedCommitPhase, DistributedSession,
+    DistributedSessionDescriptor, ErasedSharedStorageOwner, GenerationDecoderError,
+    GenerationDecoderInput, GenerationDecoderOutput, GenerationPlainText, GenerationPlainTextEvent,
     GenerationPlainTextEvents, GenerationPlainTextProjection, GenerationSequenceAdmissionError,
     GenerationSequenceBankRejection, GenerationSequenceConsumerLayout,
-    GenerationSequencePreparation, GenerationSequenceRequest, HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
-    HostPreparationAuthority, InspectableBackendSession, ModelCapabilityBackend, ModelLoadError,
-    ModelLoadingBackend, ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure,
-    OriginalTextResumeKind, OriginalTextResumeOptions, TextResumeFacts, TextResumeSourceFacts, OriginalSourceWitness, PreparedControllerSource, PREPARED_PROMPT_ATTRIBUTION_VERSION,
-    PackedTokenFilter, PackedTokenFilterError, PendingTextInput, PreparedControlInput, PreparedControlInputBackend, PreparedControlInputError,
+    GenerationSequencePreparation, GenerationSequenceRequest, HostMetadataAccount,
+    HostMetadataFunding, HostMetadataFundingError, HostPreparationAuthority,
+    InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
+    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure,
+    OriginalSourceWitness, OriginalTextResumeKind, OriginalTextResumeOptions, PackedTokenFilter,
+    PackedTokenFilterError, PendingTextInput, PreparedControlInputError, PreparedControllerSource,
     PreparedModel, PreparedPromptAttribution, PreparedPromptSegment, PreparedPromptSegmentPlan,
     PreparedRequestRejection, PreparedSessionReset, PromptTokenAttribution,
-    SelectedModelPreparation, SessionCapabilities, SessionCapabilityError,
-    SessionResetPreparationBackend, SessionResetReadiness, SharedBackendFailure,
-    SharedControllerBytes, SharedControllerDeclaration, SharedControllerSource,
-    SharedPromptAttribution, SharedStorageAttachmentError, SharedStorageDomain,
-    SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement, SharedTokenFilter,
-    SpeculativeTokenFilterController, Submission, TextContextError,
-    TextContinuationBoundary, TextContinuationError, TextContinuationIdentity,
-    TextControllerContract, TextControllerContractError, TextControllerStorage, TextDriverIdentity, TextBranchSource, TextGenerationBranch, TextBranchFenced,
-    TextGeneration, TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation,
-    TextGenerationDriver, TextGenerationInput, TextPolicyIdentity, TextPreparationInput,
-    TextPreparationOptions, TextResumeBackend, TextRunIdentity, TextSamplingStrategy,
-    TextSnapshotSource, TextStepContext, TokenFilter, TokenFilterController, TokenFilterError,
+    ProspectiveTokenController, SelectedModelPreparation, SessionCapabilities,
+    SessionCapabilityError, SessionResetPreparationBackend, SessionResetReadiness,
+    SharedBackendFailure, SharedControllerBytes, SharedControllerDeclaration,
+    SharedControllerSource, SharedPromptAttribution, SharedStorageAccountingId,
+    SharedStorageAttachmentError, SharedStorageAttachmentLayout, SharedStorageAttachmentTable,
+    SharedStorageAttachments, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
+    SharedTokenFilter, SpeculativeTokenFilterController, Submission, TextBranchFenced,
+    TextBranchSource, TextContextError, TextContinuationBoundary, TextContinuationError,
+    TextContinuationIdentity, TextControllerContract, TextControllerContractError,
+    TextControllerStorage, TextDriverIdentity, TextGeneration, TextGenerationBackend,
+    TextGenerationBranch, TextGenerationConfig, TextGenerationContinuation, TextGenerationDriver,
+    TextGenerationInput, TextPolicyIdentity, TextPreparationInput, TextPreparationOptions,
+    TextResumeBackend, TextResumeFacts, TextResumeSourceFacts, TextRunIdentity,
+    TextSamplingBoundary, TextSamplingStrategy, TextSnapshotSource, TextStepContext,
+    TextTokenChoiceBoundary, TokenFilter, TokenFilterController, TokenFilterError,
     TokenIdsInputPlan, TokenInputRejection, TokenOutput, TokenSamplingDecision, ValueDescriptor,
-    load_model, prepare_inspected_model, prepare_inspected_model_config,
-    text_generation_control_bytes, text_resume_control_bytes,
+    PREPARED_PROMPT_ATTRIBUTION_VERSION,
 };
 pub use capability::{
-    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AvailableMemory,
-    CacheStateStrategy, CapabilityError, EstimationCompleteness, InputModalities, InputTokenCount,
-    ModelCapabilities, PhysicalMemorySemantics, RuntimeStateEstimate, RuntimeStateFacts,
-    SelectedStateBacking, SlidingWindowLayerCount, StateMemoryAssumptions, StateMemoryLayout,
-    StateWindowDestinationError, StateWindowPlan, StaticMemoryReport, apply_admission_policy,
-    apply_admission_policy_with_incremental, check_admission_context, estimate_runtime_state,
-    estimate_runtime_state_facts,
+    apply_admission_policy, apply_admission_policy_with_incremental, check_admission_context,
+    estimate_runtime_state, estimate_runtime_state_facts, Admission, AdmissionRejection,
+    AdmissionRequest, AdmissionResult, AvailableMemory, CacheStateStrategy, CapabilityError,
+    EstimationCompleteness, InputModalities, InputTokenCount, ModelCapabilities,
+    PhysicalMemorySemantics, RuntimeStateEstimate, RuntimeStateFacts, SelectedStateBacking,
+    SlidingWindowLayerCount, StateMemoryAssumptions, StateMemoryLayout,
+    StateWindowDestinationError, StateWindowPlan, StaticMemoryReport,
 };
 pub use capability::{
-    AdmissionObservation, AdmissionPolicyDecision, AdmissionPolicyError, AdmissionRequirements,
+    apply_admission_requirements, check_admission_context_borrowed, AdmissionObservation,
+    AdmissionPolicyDecision, AdmissionPolicyError, AdmissionRequirements,
     AdmissionStateRequirements, BorrowedAdmissionRejection, BorrowedAdmissionResult,
-    ExecutionWorkspaceRequirements, SelectedStateRequirements, apply_admission_requirements,
-    check_admission_context_borrowed,
+    ExecutionWorkspaceRequirements, SelectedStateRequirements,
 };
-pub use capability::{ExecutionWorkspaceEstimate, WorkspaceBound};
-pub use memory::{
-    evaluate_memory_requirements, FiniteMemoryEstimate, MemoryContractError, MemoryContribution,
-    MemoryOverheadPolicy, MemoryPolicyDecision, MemoryPolicyEvaluation, MemoryRequirementReport,
-    UnknownMemoryOverhead,
+pub use capability::{
+    DomainExecutionWorkspaceEstimate, DomainRuntimeStateEstimate, ExecutionWorkspaceEstimate,
+    WorkspaceBound,
 };
 pub use execution::{
-    BackendId, DEFAULT_MAX_CACHED_SHARDS, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    EXECUTION_PLAN_SCHEMA_VERSION, ExecutionPlan, ExecutionPlanError, ExpertCachePlan,
-    ResidencyPlan, WeightTransformationPlan,
+    BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
+    ExpertCachePlan, ResidencyPlan, WeightTransformationPlan, DEFAULT_MAX_CACHED_SHARDS,
+    EXECUTION_PLAN_SCHEMA_VERSION,
+};
+pub use execution_control::{
+    SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
 };
 pub use generation::{
-    CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,
-    GenerationConfigOverrides, GenerationError, GenerationOutput, GenerationPlainTextOutput,
-    GenerationSequence, GenerationSequenceStorage, GenerationText, GenerationTiming,
-    GenerationTokenIdStorage, GenerationTokenIds, GenerationTokenIdsIntoIter,
-    OwnedGenerationStorage, OptimisticReuseDecision, ResolvedGenerationConfig,
+    resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
+    GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationOutput,
+    GenerationPlainTextOutput, GenerationSequence, GenerationSequenceStorage, GenerationText,
+    GenerationTiming, GenerationTokenIdStorage, GenerationTokenIds, GenerationTokenIdsIntoIter,
+    OptimisticReuseDecision, OwnedGenerationStorage, ResolvedGenerationConfig,
     RetainedGenerationSequence, RetainedGenerationSequenceCopy, RetainedGenerationSequenceStorage,
     RetainedGenerationStorage, RetainedGenerationStorageOwner, RetainedSequenceConstructionError,
     RetainedSequenceCopyMismatch, RetainedSequencePreparationError, SemanticEvent,
     SpeculativeCancellationDisposition, SpeculativeCommitPlan, SpeculativeConfig,
     SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
     SpeculativeSchedulerOptions, SpeculativeTail, TokenCommit, TokenTerminalSignals,
-    resolve_generation_config, resolve_optimistic_reuse,
 };
 pub use input::{
     InputExtent, InputIdentityMap, InputMetadataKey, InputModality, InputPartDescriptor,
     InputPayloadKind, InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
 };
 pub use inspection::{
-    ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
-    InspectionReadiness, InspectionRequirement, InspectionSeverity, MediaFeatureAvailability,
-    MediaProjectorRequirement, ModelInspectionReport, RealizedInspectionOutcomes,
     assemble_portable_model_inspection, finalize_realized_model_inspection,
     media_feature_readiness, record_media_projector_inspection, record_processor_inspection,
-    reject_portable_artifact_inspection,
+    reject_portable_artifact_inspection, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    MediaFeatureAvailability, MediaProjectorRequirement, ModelInspectionReport,
+    RealizedInspectionOutcomes,
 };
 pub use media::{
     Audio, Media, MediaBinding, MediaRequestError, MultimodalRequest, MultimodalSegment, RgbImage,
     TokenizedMultimodalRequest, TokenizedMultimodalSegment, Video, VideoSampling,
 };
+pub use memory::{
+    evaluate_memory_requirements, FiniteMemoryEstimate, MemoryContractError, MemoryContribution,
+    MemoryOverheadPolicy, MemoryPolicyDecision, MemoryPolicyEvaluation, MemoryRequirementReport,
+    UnknownMemoryOverhead,
+};
 pub use observation::{
-    AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH, InspectedOutput,
-    MODALITY_MERGE_OUTPUT_OBSERVATION_PATH, MODEL_LOGITS_OBSERVATION_PATH, ObservationError,
-    ObservationRequest, ObservationSelector, ObservationSet, ObservationValue,
-    PROCESSOR_OUTPUT_OBSERVATION_PATH, SharedTensorObservation, TensorObservation,
-    TensorObservationData, VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH,
+    InspectedOutput, ObservationError, ObservationRequest, ObservationSelector, ObservationSet,
+    ObservationValue, SharedTensorObservation, TensorObservation, TensorObservationData,
+    AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH, MODALITY_MERGE_OUTPUT_OBSERVATION_PATH,
+    MODEL_LOGITS_OBSERVATION_PATH, PROCESSOR_OUTPUT_OBSERVATION_PATH,
+    VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH,
 };
 pub use realtime::{
-    MAX_REALTIME_FRAME_DELAY, RealtimeConfigError, RealtimeDecisionDiagnostics, RealtimeError,
-    RealtimeForcedSource, RealtimeFrameConvention, RealtimeFrameForcing,
-    RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition,
-    RealtimeInputDescriptorError, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeScheduleError, RealtimeSlotCoordinate, RealtimeSlotOccupancy, RealtimeSpeechConfig,
-    RealtimeTargetDecision, RealtimeTargetSource, RealtimeTemporalSource,
+    RealtimeConfigError, RealtimeDecisionDiagnostics, RealtimeError, RealtimeForcedSource,
+    RealtimeFrameConvention, RealtimeFrameForcing, RealtimeFrameScheduleState, RealtimeFrameSlot,
+    RealtimeFrameTransition, RealtimeInputDescriptorError, RealtimeInputFrame, RealtimeOutputFrame,
+    RealtimeSampling, RealtimeScheduleError, RealtimeSlotCoordinate, RealtimeSlotOccupancy,
+    RealtimeSpeechConfig, RealtimeTargetDecision, RealtimeTargetSource, RealtimeTemporalSource,
+    MAX_REALTIME_FRAME_DELAY,
 };
 pub use residency::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
@@ -219,6 +235,9 @@ pub use session_authority::{
     SubmissionLease,
 };
 pub use speculative::{
+    cancel_pending_verification, decide_speculative_proposal, propose_block,
+    resolve_commit_and_publish, resolve_optimistic_branch, resolve_round,
+    speculative_acceptance_probability, submit_verification_transaction,
     CompletedSpeculativeRequest, CompletedSpeculativeSchedule, PendingSpeculativeVerification,
     PreparedSpeculativeLane, ProposalDecision, PublishedSpeculativeResult,
     PublishedSpeculativeVerification, ResolvedSpeculativeRound, SamplingPlacement,
@@ -236,17 +255,13 @@ pub use speculative::{
     SpeculativePublicationStatus, SpeculativePublisher, SpeculativeRandomness, SpeculativeRequest,
     SpeculativeRequestIdentity, SpeculativeRequestTable, SpeculativeSampling, SpeculativeSchedule,
     SpeculativeScheduleState, SpeculativeSchedulerStats, SpeculativeSemanticConstraint,
-    SpeculativeSequence,
-    SpeculativeSequenceAllocationError, SpeculativeSequenceRef, SpeculativeStats,
-    SpeculativeStatsCounters, SpeculativeTelemetry, SpeculativeTokenIds,
+    SpeculativeSequence, SpeculativeSequenceAllocationError, SpeculativeSequenceRef,
+    SpeculativeStats, SpeculativeStatsCounters, SpeculativeTelemetry, SpeculativeTokenIds,
     SpeculativeTokenIdsIntoIter, SpeculativeValues, SpeculativeValuesIntoIter,
-    cancel_pending_verification, decide_speculative_proposal, propose_block,
-    resolve_commit_and_publish, resolve_optimistic_branch, resolve_round,
-    speculative_acceptance_probability, submit_verification_transaction,
 };
 pub use topology::{
-    ParallelAxis, ParallelCoordinates, ParallelRankTopology, ParallelTopology, SubgroupMembership,
-    TopologyError, TopologyPreflightReport, balanced_contiguous_range,
+    balanced_contiguous_range, ParallelAxis, ParallelCoordinates, ParallelRankTopology,
+    ParallelTopology, SubgroupMembership, TopologyError, TopologyPreflightReport,
 };
 
 mod session_reset;

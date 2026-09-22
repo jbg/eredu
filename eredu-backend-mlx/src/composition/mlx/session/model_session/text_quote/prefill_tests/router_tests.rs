@@ -65,7 +65,7 @@ fn original_router_keeps_global_cutoff_ties_and_gpu_no_tie_order_without_eager_e
         safemlx::CpuWorkerCause::UnknownLayout
     );
     crate::backend::managed_memory::input_allocator::prepare_admitted(
-        &crate::backend::managed_memory::domain(),
+        &crate::backend::managed_memory::ledger(),
     )
     .unwrap();
     // Create all cold source/runtime owners before either request retains R.

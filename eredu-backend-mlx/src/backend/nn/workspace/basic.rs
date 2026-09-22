@@ -4,7 +4,7 @@
 //! once to row-contiguous storage. All intermediate buffers are charged until
 //! completion, even when MLX can release or donate them sooner.
 
-use super::facts::{self, Aliases, Emitter, FactResult, Output, add, buffer_capacity, mul};
+use super::facts::{self, add, buffer_capacity, mul, Aliases, Emitter, FactResult, Output};
 use super::*;
 
 /// The architecture's exact prepared text-input placeholder. Its producer
@@ -12,44 +12,88 @@ use super::*;
 /// this equation accounts only the one resulting integer matrix backing.
 /// Generic Initialize may mean a fill/copy graph and is deliberately unrelated.
 pub(super) fn is_prepared_token_input(operation: WorkspaceOperationView<'_>) -> bool {
-    matches!(operation.kind, WorkspaceOperationKindView::Elementwise("prepared_token_input"))
-        && operation.inputs.is_empty() && operation.outputs.len() == 1
-        && operation.outputs.get(0).is_some_and(|output|
-            matches!(output.dtype(), WorkspaceDtype::Int32 | WorkspaceDtype::Uint32)
-                && matches!(output.shape(), [batch, positions] if *batch > 0 && *positions > 0))
+    matches!(
+        operation.kind,
+        WorkspaceOperationKindView::Elementwise("prepared_token_input")
+    ) && operation.inputs.is_empty()
+        && operation.outputs.len() == 1
+        && operation.outputs.get(0).is_some_and(|output| {
+            matches!(
+                output.dtype(),
+                WorkspaceDtype::Int32 | WorkspaceDtype::Uint32
+            ) && matches!(output.shape(), [batch, positions] if *batch > 0 && *positions > 0)
+        })
 }
 
 /// The eager host scalar has one exact F32 value and no lazy fill/copy operator.
 /// This describes Array::try_from_f32; generic Initialize retains its own bound.
 pub(super) fn is_scalar_f32(operation: WorkspaceOperationView<'_>) -> bool {
-    matches!(operation.kind, WorkspaceOperationKindView::Elementwise("scalar_f32"))
-        && operation.inputs.is_empty() && operation.outputs.len() == 1
-        && operation.outputs.get(0).is_some_and(|output|
-            output.dtype() == WorkspaceDtype::Float32 && output.shape().is_empty())
+    matches!(
+        operation.kind,
+        WorkspaceOperationKindView::Elementwise("scalar_f32")
+    ) && operation.inputs.is_empty()
+        && operation.outputs.len() == 1
+        && operation.outputs.get(0).is_some_and(|output| {
+            output.dtype() == WorkspaceDtype::Float32 && output.shape().is_empty()
+        })
 }
 
 /// Closed eager byte seed used by the shared boundary alignment worker.
 pub(super) fn is_scalar_u8(operation: WorkspaceOperationView<'_>) -> bool {
-    matches!(operation.kind, WorkspaceOperationKindView::Elementwise("scalar_u8"))
-        && operation.inputs.is_empty() && operation.outputs.len() == 1
-        && operation.outputs.get(0).is_some_and(|output|
-            output.dtype() == WorkspaceDtype::Uint8 && output.shape().is_empty())
+    matches!(
+        operation.kind,
+        WorkspaceOperationKindView::Elementwise("scalar_u8")
+    ) && operation.inputs.is_empty()
+        && operation.outputs.len() == 1
+        && operation.outputs.get(0).is_some_and(|output| {
+            output.dtype() == WorkspaceDtype::Uint8 && output.shape().is_empty()
+        })
+}
+
+/// Geometry-only initialization has no selected native constructor or backing.
+pub(super) fn is_unattributed_initializer(operation: WorkspaceOperationView<'_>) -> bool {
+    matches!(
+        operation.kind,
+        WorkspaceOperationKindView::Initialize | WorkspaceOperationKindView::InitializeFloating(_)
+    )
 }
 
 /// Fixed Rust transports for the actual borrowed scalar constructor. Native
 /// Array/Data/C-wrapper controls remain in the resident seed-source layout.
-pub(super) fn scalar_f32_control_bytes() -> Option<usize> { scalar_control_bytes::<f32>() }
-pub(super) fn scalar_u8_control_bytes() -> Option<usize> { scalar_control_bytes::<u8>() }
+pub(super) fn scalar_f32_control_bytes() -> Option<usize> {
+    scalar_control_bytes::<f32>()
+}
+pub(super) fn scalar_bool_control_bytes() -> Option<usize> {
+    scalar_control_bytes::<bool>()
+}
+pub(super) fn scalar_u32_control_bytes() -> Option<usize> {
+    scalar_control_bytes::<u32>()
+}
+pub(super) fn scalar_i32_control_bytes() -> Option<usize> {
+    scalar_control_bytes::<i32>()
+}
+pub(super) fn scalar_u8_control_bytes() -> Option<usize> {
+    scalar_control_bytes::<u8>()
+}
 fn scalar_control_bytes<T>() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
-    let frames = [size_of::<T>() * 3, size_of::<&[T]>() * 2,
-        size_of::<&[i32]>() * 2, size_of::<safemlx::Array>() * 2,
+    let frames = [
+        size_of::<T>() * 3,
+        size_of::<&[T]>() * 2,
+        size_of::<&[i32]>() * 2,
+        size_of::<safemlx::Array>() * 2,
         size_of::<Result<safemlx::Array, safemlx::error::Exception>>() * 2,
-        size_of::<(&[T], &[i32], i32)>(), size_of::<Option<usize>>(),
-        size_of::<usize>() * 2, size_of::<i32>(),
+        size_of::<(&[T], &[i32], i32)>(),
+        size_of::<Option<usize>>(),
+        size_of::<usize>() * 2,
+        size_of::<i32>(),
         size_of::<std::slice::Iter<'_, i32>>(),
-        size_of::<Result<i32, std::num::TryFromIntError>>(),size_of::<Option<usize>>()];
-    frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+        size_of::<Result<i32, std::num::TryFromIntError>>(),
+        size_of::<Option<usize>>(),
+    ];
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
 }
 
 /// The closed cast worker has already made one packed logical text-matrix copy.
@@ -184,32 +228,71 @@ pub(super) fn emit(
     }
     let bound = match &operation.kind {
         Kind::IndexedElementSelect | Kind::IndexedElementUpdate => {
-            if !indexed_elements(operation) { return invalid(); }
+            if !indexed_elements(operation) {
+                return invalid();
+            }
             let output = operation.outputs.get(0).expect("validated element output");
             // The one-index Gather reads source strides directly. Exact-dtype
             // Scatter copies its complete base once, then overwrites sparse
             // cells; its rank-one broadcast/reshape preparation only aliases.
-            one(sink, allocation, Output::Allocate(buffer_capacity(allocation, output.bytes()?)?), 0,
-                format_args!("single-index Gather or general Scatter overwrite; retained I32 indices, equal physical update precision, and no dense expert tensor"))?
+            one(
+                sink,
+                allocation,
+                Output::Allocate(buffer_capacity(allocation, output.bytes()?)?),
+                0,
+                format_args!(
+                    "single-index Gather or general Scatter overwrite; retained I32 indices, equal physical update precision, and no dense expert tensor"
+                ),
+            )?
         }
         Kind::IndexedRowAdd => {
-            if !indexed_row_add(operation) { return invalid(); }
-            let base=operation.inputs.get(0).expect("validated indexed base");
-            let updates=operation.inputs.get(2).expect("validated indexed updates");
-            let output=buffer_capacity(allocation,base.bytes()?)?;
+            if !indexed_row_add(operation) {
+                return invalid();
+            }
+            let base = operation.inputs.get(0).expect("validated indexed base");
+            let updates = operation.inputs.get(2).expect("validated indexed updates");
+            let output = buffer_capacity(allocation, base.bytes()?)?;
             // ops.cpp::scatter_axis casts updates once, broadcasts both indices
             // and updates, broadcasts all three inputs ignoring axis0, then
             // emits ScatterAxis::Sum. Retain every possible copy independently.
             // Integral normalized IDs and floating updates are at most4 bytes.
-            let route_bytes=mul(updates.elements()?,4)?;
-            let scratch=add(mul(buffer_capacity(allocation,route_bytes)?,5)?,output)?;
-            one(sink,allocation,Output::AllocateOrAliasInputs{bytes:output,inputs:Aliases::Slice(&[0])},scratch,
-                format_args!("rank-two ScatterAxis Sum with actual integer source; update cast, five broadcasts and output copy; repeated row destinations accumulate"))?
+            let route_bytes = mul(updates.elements()?, 4)?;
+            let scratch = add(mul(buffer_capacity(allocation, route_bytes)?, 5)?, output)?;
+            one(
+                sink,
+                allocation,
+                Output::AllocateOrAliasInputs {
+                    bytes: output,
+                    inputs: Aliases::Slice(&[0]),
+                },
+                scratch,
+                format_args!(
+                    "rank-two ScatterAxis Sum with actual integer source; update cast, five broadcasts and output copy; repeated row destinations accumulate"
+                ),
+            )?
         }
         Kind::Elementwise("prepared_token_input") => {
-            if !is_prepared_token_input(operation) { return invalid(); }
-            one(sink, allocation, Output::Allocate(buffer_capacity(allocation, one_output(operation)?.bytes()?)?),
-                0, format_args!("one integer matrix supplied by the separately admitted prepared input; no model fill/copy primitive"))?
+            if !is_prepared_token_input(operation) {
+                return invalid();
+            }
+            one(
+                sink,
+                allocation,
+                Output::Allocate(buffer_capacity(
+                    allocation,
+                    one_output(operation)?.bytes()?,
+                )?),
+                0,
+                format_args!(
+                    "one integer matrix supplied by the separately admitted prepared input; no model fill/copy primitive"
+                ),
+            )?
+        }
+        Kind::CommunicationControl(_) => {
+            if !operation.inputs.is_empty() || !operation.outputs.is_empty() {
+                return invalid();
+            }
+            sink.finish(0, format_args!("descriptive model control event has no numerical payload; its selected communication owner quotes the actual agreement child"))?
         }
         Kind::ValueCompletion | Kind::ValueRetention => {
             if operation.inputs.is_empty() || !operation.outputs.is_empty() {
@@ -237,6 +320,21 @@ pub(super) fn emit(
                 .count() as u64;
             let bytes = buffer_capacity(allocation, output.bytes()?.max(4))?;
             let scalar = buffer_capacity(allocation, 4)?;
+            sink.default_scratch(
+                mul(
+                    if matches!(mode, eredu_nn::PadMode::Edge) {
+                        2
+                    } else {
+                        1
+                    },
+                    scalar,
+                )?,
+                if matches!(mode, eredu_nn::PadMode::Edge) {
+                    2
+                } else {
+                    1
+                },
+            )?;
             let scratch = match mode {
                 // pad_gpu fills its output and copies the strided input into a
                 // shared output slice. safemlx constructs an I32 zero and casts
@@ -273,23 +371,82 @@ pub(super) fn emit(
                 ),
             )?
         }
+        Kind::Elementwise(_) if super::host_array::slice_dtype(operation).is_some() => one(
+            sink,
+            allocation,
+            Output::Allocate(buffer_capacity(
+                allocation,
+                one_output(operation)?.bytes()?,
+            )?),
+            0,
+            format_args!(
+                "borrowed typed host slice creates one eager backing retained by the stream-bound Copy alias"
+            ),
+        )?,
+        Kind::Elementwise(_) if super::host_array::dtype(operation).is_some() => one(
+            sink,
+            allocation,
+            Output::Allocate(buffer_capacity(
+                allocation,
+                one_output(operation)?.bytes()?,
+            )?),
+            0,
+            format_args!(
+                "one eager typed host-array backing; source slice remains with its producer"
+            ),
+        )?,
         Kind::Elementwise(_) if super::zero_fill::dtype(operation).is_some() => {
-            let (_,_,seed_bytes)=super::zero_fill::dtype(operation).expect("qualified zero fill");
-            let output=one_output(operation)?;
-            one(sink,allocation,Output::Allocate(buffer_capacity(allocation,output.bytes()?)?),
-                buffer_capacity(allocation,seed_bytes)?,format_args!("typed eager zero plus optional Broadcast and Full"))?
+            let (_, _, seed_bytes) =
+                super::zero_fill::dtype(operation).expect("qualified scalar fill");
+            let output = one_output(operation)?;
+            one(
+                sink,
+                allocation,
+                Output::Allocate(buffer_capacity(allocation, output.bytes()?)?),
+                buffer_capacity(allocation, seed_bytes)?,
+                format_args!("typed eager scalar plus optional Broadcast and Full"),
+            )?
         }
         Kind::Elementwise("scalar_u8") => {
-            if !is_scalar_u8(operation) { return invalid(); }
-            one(sink, allocation, Output::Allocate(buffer_capacity(allocation, 1)?), 0,
-                format_args!("one eager U8 scalar copied directly to native storage"))?
+            if !is_scalar_u8(operation) {
+                return invalid();
+            }
+            one(
+                sink,
+                allocation,
+                Output::Allocate(buffer_capacity(allocation, 1)?),
+                0,
+                format_args!("one eager U8 scalar copied directly to native storage"),
+            )?
         }
         Kind::Elementwise("scalar_f32") => {
-            if !is_scalar_f32(operation) { return invalid(); }
-            one(sink, allocation, Output::Allocate(buffer_capacity(allocation, 4)?), 0,
-                format_args!("one eager F32 scalar copied directly to native storage"))?
+            if !is_scalar_f32(operation) {
+                return invalid();
+            }
+            one(
+                sink,
+                allocation,
+                Output::Allocate(buffer_capacity(allocation, 4)?),
+                0,
+                format_args!("one eager F32 scalar copied directly to native storage"),
+            )?
         }
-        Kind::Initialize | Kind::InitializeFloating(_) | Kind::GeneratedF32Initialization => {
+        Kind::GeneratedF32Initialization => {
+            generated_f32_plan_view(operation)?;
+            one(
+                sink,
+                allocation,
+                Output::Allocate(buffer_capacity(
+                    allocation,
+                    one_output(operation)?.bytes()?,
+                )?),
+                0,
+                format_args!(
+                    "generated host F32 values upload one eager backing retained by the stream Copy alias"
+                ),
+            )?
+        }
+        Kind::Initialize | Kind::InitializeFloating(_) => {
             let output = one_output(operation)?;
             if operation.inputs.len() > 1 {
                 return invalid();
@@ -299,12 +456,9 @@ pub(super) fn emit(
             {
                 return invalid();
             }
-            if matches!(operation.kind, Kind::GeneratedF32Initialization) {
-                generated_f32_plan_view(operation)?;
-            }
-            // Host input, scalar fill and zeros_like share this envelope.
-            // Charge a complete source plus a possible copy and fill scalar.
-            // Even an empty broadcast can retain its scalar backing buffer.
+            // Geometry alone retains the conservative numerical envelope.
+            // No constructor is selected, so this fact supplies no physical
+            // placement or complete native execution population.
             let bytes = buffer_capacity(allocation, output.bytes()?.max(4))?;
             one(
                 sink,
@@ -315,30 +469,49 @@ pub(super) fn emit(
             )?
         }
         Kind::View(name) if super::byte_view::selected(name).is_some() => {
-            let Some((bytes,_))=super::byte_view::inspect(operation) else{return Ok(None);};
+            let Some((bytes, _)) = super::byte_view::inspect(operation) else {
+                return Ok(None);
+            };
             // View's exact GPU worker shares storage or creates one contiguous
             // temporary of the same physical byte size and shares that result.
-            one(sink,allocation,Output::AllocateOrAliasInputs{
-                bytes:buffer_capacity(allocation,bytes.max(one_output(operation)?.bytes()?))?,inputs:Aliases::Slice(&[0]),
-            },0,format_args!("byte reinterpretation with possible strided copy"))?
+            one(
+                sink,
+                allocation,
+                Output::AllocateOrAliasInputs {
+                    bytes: buffer_capacity(allocation, bytes.max(one_output(operation)?.bytes()?))?,
+                    inputs: Aliases::Slice(&[0]),
+                },
+                0,
+                format_args!("byte reinterpretation with possible strided copy"),
+            )?
         }
         Kind::Transpose(axes) => {
             let output = one_output(operation)?;
-            let Some(input) = operation.inputs.get(0) else {return invalid();};
-            if operation.inputs.len()!=1 || input.dtype()!=output.dtype() ||
-                axes.len()!=input.shape().len() || axes.len()!=output.shape().len() ||
-                axes.iter().enumerate().any(|(i,&axis)| axis>=axes.len() ||
-                    axes[..i].contains(&axis) || output.shape()[i]!=input.shape()[axis]) {
+            let Some(input) = operation.inputs.get(0) else {
+                return invalid();
+            };
+            if operation.inputs.len() != 1
+                || input.dtype() != output.dtype()
+                || axes.len() != input.shape().len()
+                || axes.len() != output.shape().len()
+                || axes.iter().enumerate().any(|(i, &axis)| {
+                    axis >= axes.len()
+                        || axes[..i].contains(&axis)
+                        || output.shape()[i] != input.shape()[axis]
+                })
+            {
                 return invalid();
             }
-            one(sink,allocation,Output::AliasInput(0),0,
-                format_args!("exact axis permutation shares the retained source buffer"))?
+            one(
+                sink,
+                allocation,
+                Output::AliasInput(0),
+                0,
+                format_args!("exact axis permutation shares the retained source buffer"),
+            )?
         }
         Kind::View(name) => {
-            if !matches!(
-                *name,
-                "broadcast" | "squeeze" | "expand_dims" | "reshape"
-            ) {
+            if !matches!(*name, "broadcast" | "squeeze" | "expand_dims" | "reshape") {
                 return Ok(None);
             }
             let output = one_output(operation)?;
@@ -368,10 +541,17 @@ pub(super) fn emit(
                 format_args!("{}", "shared-buffer views; reshape may copy"),
             )?
         }
-        Kind::StaticSlice {..} => {
-            if !is_static_slice(operation) {return invalid();}
-            one(sink,allocation,Output::AliasInput(0),0,
-                format_args!("exact rank-preserving static Slice aliases the full source backing"))?
+        Kind::StaticSlice { .. } => {
+            if !is_static_slice(operation) {
+                return invalid();
+            }
+            one(
+                sink,
+                allocation,
+                Output::AliasInput(0),
+                0,
+                format_args!("exact rank-preserving static Slice aliases the full source backing"),
+            )?
         }
         Kind::Index { selected_axes } => {
             let output = one_output(operation)?;
@@ -548,6 +728,7 @@ pub(super) fn emit(
             // native AsType candidates alias. Strided pointwise kernels read
             // their sources directly. All six outputs remain counted.
             let boolean = buffer_capacity(allocation, output.bytes()?)?;
+            sink.default_scratch(mul(2, buffer_capacity(allocation, 4)?)?, 2)?;
             one(
                 sink,
                 allocation,
@@ -578,6 +759,9 @@ pub(super) fn emit(
             } else {
                 buffer_capacity(allocation, 4)?
             };
+            if *name != "is_nan" {
+                sink.default_scratch(scalar, 1)?;
+            }
             one(
                 sink,
                 allocation,
@@ -711,6 +895,17 @@ pub(super) fn emit(
                 return invalid();
             }
             check_pointwise_shape(operation)?;
+            let seeds = match *name {
+                "multiply_scalar" | "maximum_scalar" | "maximum_i32" | "equal_i32" => 1,
+                "silu" => silu_default_births(operation)?,
+                "softplus" | "gelu" | "elu" => 3,
+                "gelu_approximate" => 5,
+                // Both the custom and primitive Sigmoid workers are seed-free.
+                _ => 0,
+            };
+            if seeds != 0 {
+                sink.default_scratch(mul(seeds as u64, buffer_capacity(allocation, 4)?)?, seeds)?;
+            }
             pointwise(operation, allocation, buffers, scalars, sink)?
         }
         Kind::GatedProduct(policy) => {
@@ -735,17 +930,31 @@ pub(super) fn emit(
                 eredu_nn::GatedProductActivation::GeluApproximate => (23, 7),
                 _ => return Ok(None),
             };
+            let mut seeds = match policy.activation() {
+                eredu_nn::GatedProductActivation::Silu if policy.sigmoid_multiplier() == 1.0 => {
+                    silu_default_births(operation)?
+                }
+                eredu_nn::GatedProductActivation::Silu => 1,
+                eredu_nn::GatedProductActivation::GeluApproximate => 5,
+                _ => return Ok(None),
+            };
             if policy.gate_upper_bound().is_some() {
+                seeds += 1;
                 buffers += 3;
                 scalars += 1;
             }
             if policy.up_absolute_bound().is_some() {
+                seeds += 2;
                 buffers += 6;
                 scalars += 2;
             }
             if policy.up_offset() != 0.0 {
+                seeds += 1;
                 buffers += 3;
                 scalars += 1;
+            }
+            if seeds != 0 {
+                sink.default_scratch(mul(seeds as u64, buffer_capacity(allocation, 4)?)?, seeds)?;
             }
             pointwise(operation, allocation, buffers + 3, scalars, sink)?
         }
@@ -759,6 +968,7 @@ pub(super) fn emit(
             }
             let queries = buffer_capacity(allocation, mul(geometry.queries() as u64, 4)?.max(4))?;
             let pooled = buffer_capacity(allocation, mul(geometry.pooled() as u64, 4)?.max(4))?;
+            sink.default_scratch(buffer_capacity(allocation, 4)?, 1)?;
             one(
                 sink,
                 allocation,
@@ -786,6 +996,7 @@ pub(super) fn emit(
             let mask = buffer_capacity(allocation, output.bytes()?)?;
             let mut scratch = add(queries, keys)?;
             if geometry.max_past().is_some() {
+                sink.default_scratch(buffer_capacity(allocation, 4)?, 1)?;
                 // Earliest-key subtraction and scalar, second comparison,
                 // and the first mask retained until the final logical_and.
                 scratch = add(
@@ -824,8 +1035,10 @@ fn invalid<T>() -> FactResult<T> {
 fn parameter_placeholder_output(
     operation: WorkspaceOperationView<'_>,
 ) -> FactResult<WorkspaceLayoutView<'_>> {
-    if !matches!(operation.kind, WorkspaceOperationKindView::ParameterPlaceholder)
-        || !operation.inputs.is_empty()
+    if !matches!(
+        operation.kind,
+        WorkspaceOperationKindView::ParameterPlaceholder
+    ) || !operation.inputs.is_empty()
         || operation.outputs.len() != 1
         || !operation.outputs.get(0).unwrap().shape().is_empty()
     {
@@ -847,7 +1060,10 @@ pub(super) fn emit_parameter_placeholder(
     let output = parameter_placeholder_output(operation)?;
     // Pinned zeros(shape, dtype) constructs array(0, dtype) eagerly on either
     // device. Each constructor owns one seed; no donation sharing is assumed.
-    sink.output(Output::Allocate(buffer_capacity(allocation, output.dtype().bytes())?))?;
+    sink.output(Output::Allocate(buffer_capacity(
+        allocation,
+        output.dtype().bytes(),
+    )?))?;
     sink.finish(0, format_args!(
         "unloaded parameter construction eagerly copies one dtype-sized scalar into shared native storage; logical weight fill stays unevaluated until replaced by binding; page={} bytes with bounded oversized cache reuse",
         allocation.page_size(),
@@ -906,8 +1122,13 @@ fn pointwise(
     // Preserve those eight-byte intermediate allocations even though the
     // neutral result is Bool; wider-result integer equations remain rejected.
     let element_bytes = if matches!(
-        operation.kind, WorkspaceOperationKindView::Elementwise("equal_i32")
-    ) && operation.inputs.get(0).is_some_and(|input| input.dtype() == WorkspaceDtype::Uint32) {
+        operation.kind,
+        WorkspaceOperationKindView::Elementwise("equal_i32")
+    ) && operation
+        .inputs
+        .get(0)
+        .is_some_and(|input| input.dtype() == WorkspaceDtype::Uint32)
+    {
         8
     } else {
         4
@@ -954,27 +1175,69 @@ mod placeholder_tests;
 mod split_tests;
 
 /// Coordinate qualification shared by the CPU source and ordinary Metal facts.
-pub(super) fn is_static_slice(operation:WorkspaceOperationView<'_>)->bool {
-    let WorkspaceOperationKindView::StaticSlice {starts,ends,strides}=operation.kind else {return false;};
-    let (Some([input]),Some([output]))=(operation.inputs.array(),operation.outputs.array()) else {return false;};
-    let rank=input.shape().len();
-    if output.shape().len()!=rank || input.dtype()!=output.dtype() || starts.len()!=rank || ends.len()!=rank || strides.len()!=rank {return false;}
+pub(super) fn is_static_slice(operation: WorkspaceOperationView<'_>) -> bool {
+    let WorkspaceOperationKindView::StaticSlice {
+        starts,
+        ends,
+        strides,
+    } = operation.kind
+    else {
+        return false;
+    };
+    let (Some([input]), Some([output])) = (operation.inputs.array(), operation.outputs.array())
+    else {
+        return false;
+    };
+    let rank = input.shape().len();
+    if output.shape().len() != rank
+        || input.dtype() != output.dtype()
+        || starts.len() != rank
+        || ends.len() != rank
+        || strides.len() != rank
+    {
+        return false;
+    }
     for axis in 0..rank {
-        let (a,b,step,n)=(starts[axis],ends[axis],strides[axis],input.shape()[axis]);
-        if a<0 || b<a || b>n || step<=0 || b.checked_sub(a).and_then(|d|d.checked_add(step-1)).map(|d|d/step)!=Some(output.shape()[axis]) {return false;}
+        let (a, b, step, n) = (starts[axis], ends[axis], strides[axis], input.shape()[axis]);
+        if a < 0
+            || b < a
+            || b > n
+            || step <= 0
+            || b.checked_sub(a)
+                .and_then(|d| d.checked_add(step - 1))
+                .map(|d| d / step)
+                != Some(output.shape()[axis])
+        {
+            return false;
+        }
     }
     true
 }
 
 /// Exact geometry of the shared rank-two ScatterAxis::Sum worker.
-pub(super) fn indexed_row_add(operation:WorkspaceOperationView<'_>)->bool {
-    if !matches!(operation.kind,WorkspaceOperationKindView::IndexedRowAdd){return false;}
-    let (Some([base,indices,updates]),Some([output]))=(operation.inputs.array(),operation.outputs.array()) else{return false;};
-    base.shape().len()==2 && indices.shape().len()==2 && updates.shape().len()==2
-        && indices.shape()[1]==1 && indices.shape()[0]==updates.shape()[0]
-        && base.shape()[1]==updates.shape()[1] && base.shape()==output.shape()
-        && base.dtype()==WorkspaceDtype::Float32 && updates.dtype()==base.dtype() && output.dtype()==base.dtype()
-        && matches!(indices.dtype(),WorkspaceDtype::Int32|WorkspaceDtype::Uint32)
+pub(super) fn indexed_row_add(operation: WorkspaceOperationView<'_>) -> bool {
+    if !matches!(operation.kind, WorkspaceOperationKindView::IndexedRowAdd) {
+        return false;
+    }
+    let (Some([base, indices, updates]), Some([output])) =
+        (operation.inputs.array(), operation.outputs.array())
+    else {
+        return false;
+    };
+    base.shape().len() == 2
+        && indices.shape().len() == 2
+        && updates.shape().len() == 2
+        && indices.shape()[1] == 1
+        && indices.shape()[0] == updates.shape()[0]
+        && base.shape()[1] == updates.shape()[1]
+        && base.shape() == output.shape()
+        && base.dtype() == WorkspaceDtype::Float32
+        && updates.dtype() == base.dtype()
+        && output.dtype() == base.dtype()
+        && matches!(
+            indices.dtype(),
+            WorkspaceDtype::Int32 | WorkspaceDtype::Uint32
+        )
 }
 
 /// Exact descriptor of the shared sparse native element worker. The owning
@@ -985,18 +1248,54 @@ pub(super) fn indexed_elements(operation: WorkspaceOperationView<'_>) -> bool {
         WorkspaceOperationKindView::IndexedElementUpdate => true,
         _ => return false,
     };
-    if operation.inputs.len() != if update { 3 } else { 2 } || operation.outputs.len() != 1 { return false; }
+    if operation.inputs.len() != if update { 3 } else { 2 } || operation.outputs.len() != 1 {
+        return false;
+    }
     let source = operation.inputs.get(0).expect("checked indexed source");
     let indices = operation.inputs.get(1).expect("checked indexed source");
     let output = operation.outputs.get(0).expect("checked indexed output");
-    if source.shape().len() != 1 || source.shape()[0] <= 0
-        || indices.shape().len() != 1 || indices.dtype() != WorkspaceDtype::Int32
-        || source.dtype() != WorkspaceDtype::Float32 || output.dtype() != source.dtype()
-        || output.shape() != if update { source.shape() } else { indices.shape() } {
+    if source.shape().len() != 1
+        || source.shape()[0] <= 0
+        || indices.shape().len() != 1
+        || indices.dtype() != WorkspaceDtype::Int32
+        || source.dtype() != WorkspaceDtype::Float32
+        || output.dtype() != source.dtype()
+        || output.shape()
+            != if update {
+                source.shape()
+            } else {
+                indices.shape()
+            }
+    {
         return false;
     }
-    let Some(precision) = source.representation().map(|r| r.dtype()) else { return false; };
-    !update || operation.inputs.get(2).is_some_and(|updates|
-        updates.shape() == indices.shape() && updates.dtype() == source.dtype()
-            && updates.representation().is_some_and(|r| r.dtype() == precision))
+    let Some(precision) = source.representation().map(|r| r.dtype()) else {
+        return false;
+    };
+    !update
+        || operation.inputs.get(2).is_some_and(|updates| {
+            updates.shape() == indices.shape()
+                && updates.dtype() == source.dtype()
+                && updates
+                    .representation()
+                    .is_some_and(|r| r.dtype() == precision)
+        })
+}
+
+// The selected Metal pointwise worker widens every admitted floating source to
+// F32 and uses its seed-free custom kernel for a nonempty input. Other compiled
+// mechanisms and empty inputs execute the actual eager-one SiLU fallback.
+fn silu_default_births(operation: WorkspaceOperationView<'_>) -> FactResult<usize> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if operation
+        .inputs
+        .get(0)
+        .ok_or_else(|| MlxWorkspaceFactError::descriptor("missing activation source"))?
+        .elements()?
+        != 0
+    {
+        return Ok(0);
+    }
+    let _ = operation;
+    Ok(1)
 }

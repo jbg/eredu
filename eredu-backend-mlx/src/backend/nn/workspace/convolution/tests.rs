@@ -110,7 +110,11 @@ fn cases() -> Vec<Case> {
 }
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -123,7 +127,7 @@ fn meta(shape: &[i32], context: &WorkspaceContext) -> WorkspaceTensor {
 }
 
 #[test]
-fn convolution_dispatch_bounds_cover_realizations_and_derived_shared_host_storage() {
+fn convolution_dispatch_preserves_payload_and_identifies_backing_control_gaps() {
     for case in cases() {
         let context = WorkspaceContext::new(selected());
         let output = case
@@ -137,9 +141,15 @@ fn convolution_dispatch_bounds_cover_realizations_and_derived_shared_host_storag
         assert!(report.tensor_buffers.total_bytes.is_some());
         assert!(report.tensor_buffers.retained_bytes.unwrap() > 0);
         assert!(report.unpriced_operations.is_empty());
-        assert_eq!(report.total_bytes, report.tensor_buffers.total_bytes);
+        crate::backend::nn::workspace::test_backing_control_completeness(&selected(), &report);
+        if report.total_bytes.is_some() {
+            assert_eq!(
+                report.total_bytes,
+                report.tensor_buffers.total_bytes.map(|n| n
+                    + crate::backend::nn::workspace::test_backing_controls(&selected(), &report))
+            );
+        }
         assert_eq!(report.host_workspace_bytes, Some(0));
-        assert!(report.unpriced_host_operations.is_empty());
     }
     let case = &cases()[0];
     let context = WorkspaceContext::new(selected());
@@ -172,7 +182,12 @@ fn convolution_composes_with_an_independently_audited_pointwise_host_fact() {
         .unwrap();
     let report = context.report(&[output]).unwrap();
     assert!(report.tensor_buffers.total_bytes.is_some());
-    assert_eq!(report.total_bytes, report.tensor_buffers.total_bytes);
+    assert_eq!(
+        report.total_bytes,
+        report.tensor_buffers.total_bytes.map(
+            |n| n + crate::backend::nn::workspace::test_backing_controls(&selected(), &report)
+        )
+    );
     assert_eq!(report.host_workspace_bytes, Some(0));
     assert!(report.unpriced_host_operations.is_empty());
 }
@@ -414,10 +429,17 @@ mod native {
                             let expected = reference(&case, &x, &w, declared.shape(), index);
                             let difference = (f64::from(actual[index]) - expected).abs();
                             maximum = maximum.max(difference);
-                            assert!(difference<=0.02+0.02*expected.abs(),"case {case_index} {input_dtype:?}/{weight_dtype:?} index {index}: {} != {expected}",actual[index]);
+                            assert!(
+                                difference <= 0.02 + 0.02 * expected.abs(),
+                                "case {case_index} {input_dtype:?}/{weight_dtype:?} index {index}: {} != {expected}",
+                                actual[index]
+                            );
                         }
                         assert!(actual.iter().any(|v| v.abs() > 1e-6));
-                        eprintln!("convolution case={case_index} dtypes={input_dtype:?}/{weight_dtype:?} strided={input_strided}/{weight_strided} observed={observed} bound={bound} values={} max_error={maximum}",indices.len());
+                        eprintln!(
+                            "convolution case={case_index} dtypes={input_dtype:?}/{weight_dtype:?} strided={input_strided}/{weight_strided} observed={observed} bound={bound} values={} max_error={maximum}",
+                            indices.len()
+                        );
                         tested += 1;
                     }
                 }

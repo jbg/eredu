@@ -137,7 +137,6 @@ fn verify(device: LocalDevice) {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         };
@@ -231,7 +230,7 @@ fn verify(device: LocalDevice) {
             let prepared_capture = capture.clone();
             let prepared_trace = trace;
             let prepared_intervention = plan.clone();
-            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+            let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
             prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
             prepared.output_mode = PreparedChatOutputMode::Text;
             prepared.capture = Some(&prepared_capture);
@@ -359,7 +358,7 @@ fn verify(device: LocalDevice) {
         let prepared_capture = capture.clone();
         let prepared_trace = trace;
         let prepared_intervention = keep_plan.unwrap();
-        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
         prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
         prepared.output_mode = PreparedChatOutputMode::Text;
         prepared.capture = Some(&prepared_capture);
@@ -389,7 +388,7 @@ fn verify(device: LocalDevice) {
                     retained_bytes: 512 << 20,
                     cumulative_copy_bytes: 2 << 30,
                 },
-                ORIGINAL_CAPACITY,
+                native_limits(ORIGINAL_CAPACITY),
                 copy_limits(),
             )
             .unwrap();

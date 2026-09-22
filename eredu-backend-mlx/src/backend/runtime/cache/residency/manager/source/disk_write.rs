@@ -22,7 +22,7 @@ struct WriteBody {
     publication: Option<PreparedLiveCachePublication>,
     layout: CacheShardLayout,
     location: DiskLocation,
-    host: HostCacheBlock,
+    host: Option<HostCacheBlock>,
     descriptors: [HostTransferDescriptor<4>; 2],
     id: CacheBlockId,
     generation: u64,
@@ -34,7 +34,7 @@ struct WriteBody {
     funding: HostMetadataFunding,
 }
 struct Occupancy {
-    reservation: Mutex<CachePoolReservation>,
+    reservation: Mutex<Option<CachePoolReservation>>,
     host_bytes: u64,
 }
 /// Closed shared ownership of this source's actual transfer reservation. The
@@ -58,7 +58,24 @@ impl DiskWriteOccupancy {
 }
 struct WriteCompletion {
     result: Result<DiskLocation, DiskWriteFailure>,
+    host: Mutex<Option<HostCacheBlock>>,
     body: WriteBody,
+}
+/// Creator-side retirement nodes never enter the Send I/O task.
+pub(crate) struct PreparedDiskWriteHostRetirement {
+    retirement: super::device_retirement::DeviceRetirement,
+    context: WorkspaceContext,
+    consumed: bool,
+    publication_controls: usize,
+}
+/// Closed evidence of this writer's committed file and exact Host source.
+/// The immutable result and source pin remain with the operation.
+pub(crate) struct OrdinaryWrittenCacheHostSource {
+    host: HostCacheBlock,
+    file: LiveCacheBlockSource,
+    id: CacheBlockId,
+    context: WorkspaceContext,
+    funding: HostMetadataFunding,
 }
 /// Preallocated output shell. Both success and failure retain the exact source,
 /// partial destination, transfer charge and H; clones share that same owner.
@@ -89,7 +106,7 @@ impl std::fmt::Debug for PreparedDiskWriteOutput {
 }
 #[path = "disk_write/destination.rs"]
 mod destination;
-pub(crate) use destination::PreparedDiskWriteDestination;
+pub(crate) use destination::{PreparedCacheDiskWriteSource, PreparedDiskWriteDestination};
 
 impl CacheBlockSourceLoan<'_> {
     /// Selects an actual stable Host row and the manager's configured directory.
@@ -195,13 +212,15 @@ impl PreparedDiskWrite {
             size_of::<Result<usize, Exception>>(),
             size_of::<WriteBody>(),
             size_of::<WriteCompletion>(),
+            initialized_mutex_control_bytes::<Option<HostCacheBlock>>()?,
             size_of::<DiskWriteOccupancy>(),
             size_of::<Occupancy>(),
-            size_of::<MutexGuard<'_, CachePoolReservation>>(),
+            initialized_mutex_control_bytes::<Option<CachePoolReservation>>()?,
+            size_of::<MutexGuard<'_, Option<CachePoolReservation>>>(),
             size_of::<
                 Result<
-                    MutexGuard<'_, CachePoolReservation>,
-                    TryLockError<MutexGuard<'_, CachePoolReservation>>,
+                    MutexGuard<'_, Option<CachePoolReservation>>,
+                    TryLockError<MutexGuard<'_, Option<CachePoolReservation>>>,
                 >,
             >(),
             size_of::<PreparedDiskWriteOutput>(),
@@ -249,6 +268,8 @@ impl PreparedDiskWrite {
     /// Existing physical worker entry. It never formats ordinary error text.
     pub(crate) fn run(mut self) -> PreparedDiskWriteOutput {
         let result = self.body.write();
+        let host = Mutex::new(self.body.host.take());
+        drop(host.lock().expect("new unshared completion mutex"));
         // Once-only construction is private and immutable; no caller can replace
         // another result or substitute source identity after submission.
         if self
@@ -256,6 +277,7 @@ impl PreparedDiskWrite {
             .inner
             .set(WriteCompletion {
                 result,
+                host,
                 body: self.body,
             })
             .is_err()
@@ -267,7 +289,7 @@ impl PreparedDiskWrite {
 }
 impl WriteBody {
     fn write(&mut self) -> Result<DiskLocation, DiskWriteFailure> {
-        let [first, second] = self.host.buffers();
+        let [first, second] = self.host.as_ref().expect("one writer source").buffers();
         let bytes = [
             first.as_bytes().map_err(DiskWriteFailure::Host)?,
             second.as_bytes().map_err(DiskWriteFailure::Host)?,

@@ -3,7 +3,11 @@ use eredu_nn::{AttentionMask, AttentionRequest, NeuralBackend, Tensor};
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -188,7 +192,9 @@ fn attention_prices_selected_kernels_copies_masks_and_retained_scratch_override(
         v: 64,
     };
     assert!(
-        fused_cost(g, Mask::None, false, mechanisms().allocation, None).unwrap()
+        fused_cost(g, Mask::None, false, mechanisms().allocation, None)
+            .unwrap()
+            .maximum()
             < capacity(mechanisms().allocation, g.scores().unwrap()).unwrap()
     );
 }
@@ -543,12 +549,19 @@ fn metal_attention_peaks_fit_bounds_and_values_match_independent_host_equation()
                                     };
                                     let difference = (f64::from(actual[index]) - expected).abs();
                                     error = error.max(difference);
-                                    assert!(difference<=0.003+0.03*expected.abs(),"{case:?} {dtype:?}: index {index} actual={} expected={expected} difference={difference}",actual[index]);
+                                    assert!(
+                                        difference <= 0.003 + 0.03 * expected.abs(),
+                                        "{case:?} {dtype:?}: index {index} actual={} expected={expected} difference={difference}",
+                                        actual[index]
+                                    );
                                 }
                             }
                         }
                     }
-                    println!("ATTENTION_MEASUREMENT case={case:?} dtype={dtype:?} strided={strided} blocks={:?} peak={observed} bound={allowed} max_abs={error}",selected.sdpa_blocks);
+                    println!(
+                        "ATTENTION_MEASUREMENT case={case:?} dtype={dtype:?} strided={strided} blocks={:?} peak={observed} bound={allowed} max_abs={error}",
+                        selected.sdpa_blocks
+                    );
                 }
             }
         }
@@ -633,6 +646,65 @@ fn metal_retained_scratch_overrides_fit_the_same_native_quote() {
 
 #[test]
 fn completed_key_blocks_bound_transients_independently_of_context_length() {
+    // Both retained allocation sources use the same completed-page phases.
+    // Growing the number of completed pages must not grow either physical
+    // population; their default inputs die at the per-page completion boundary.
+    for original_storage in [false, true] {
+        let allocation = NativeAllocationFacts {
+            original_storage,
+            ..mechanisms().allocation
+        };
+        for mask in [Mask::None, Mask::Boolean, Mask::Additive(2 * 8193)] {
+            let geometry = Geometry {
+                b: 1,
+                h: 4,
+                kv: 2,
+                q: 2,
+                k: 8193,
+                d: 32,
+                v: 17,
+            };
+            let first =
+                blockwise::input_score_branches(geometry, mask, true, true, allocation).unwrap();
+            let rows = first.alternatives();
+            assert_eq!(rows.len(), 5);
+            assert!(rows[..4]
+                .iter()
+                .all(|(_, bytes, births)| *bytes > 0 && *births > 0));
+            assert_eq!(
+                (rows[4].1, rows[4].2),
+                (0, 0),
+                "concatenation retains completed outputs only"
+            );
+            if original_storage {
+                // Original full(true) is one scalar for both page widths.
+                assert_eq!((rows[0].1, rows[0].2), (rows[2].1, rows[2].2));
+                assert_eq!((rows[1].1, rows[1].2), (rows[3].1, rows[3].2));
+            } else {
+                // Ordinary allowed::mask copies the exact Bool page, retaining
+                // the different full/tail capacities with the same birth count.
+                assert!(rows[0].1 > rows[2].1);
+                assert!(rows[1].1 > rows[3].1);
+                assert_eq!(rows[0].2, rows[2].2);
+                assert_eq!(rows[1].2, rows[3].2);
+            }
+            for k in [16385, 32769, 65537] {
+                let later = blockwise::input_score_branches(
+                    Geometry { k, ..geometry },
+                    mask,
+                    true,
+                    true,
+                    allocation,
+                )
+                .unwrap();
+                assert_eq!(
+                    rows,
+                    later.alternatives(),
+                    "completed page populations must retire"
+                );
+            }
+        }
+    }
     for q in [1, 2, 17] {
         for mask in [0, 2, 3] {
             for sinks in [false, true] {
@@ -668,4 +740,119 @@ fn completed_key_blocks_bound_transients_independently_of_context_length() {
             }
         }
     }
+}
+
+#[test]
+fn attention_source_branches_preserve_shared_and_separate_domain_peaks() {
+    // Exact representations select genuine constructor paths. The value bank
+    // never makes QK use BF16, and a non-BF16 query keeps PV on plain Matmul.
+    // Missing representation retains the conservative compatible-source union.
+    for original_storage in [false, true] {
+        let allocation = NativeAllocationFacts {
+            original_storage,
+            ..mechanisms().allocation
+        };
+        for (query, value, products) in [
+            (
+                WorkspaceFloatingType::Float32,
+                WorkspaceFloatingType::Float32,
+                0,
+            ),
+            (
+                WorkspaceFloatingType::Float32,
+                WorkspaceFloatingType::Bfloat16,
+                0,
+            ),
+            (
+                WorkspaceFloatingType::Bfloat16,
+                WorkspaceFloatingType::Float32,
+                1,
+            ),
+            (
+                WorkspaceFloatingType::Bfloat16,
+                WorkspaceFloatingType::Bfloat16,
+                2,
+            ),
+        ] {
+            let represented = |dtype| {
+                WorkspaceLayout::new(&[1, 2, 32, 32], WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true)))
+            };
+            let operation = WorkspaceOperation {
+                kind: WorkspaceOperationKind::Attention {
+                    causal: false,
+                    window: None,
+                    sinks: false,
+                    softcap: false,
+                    arithmetic: AttentionArithmetic::InputScores,
+                },
+                inputs: vec![
+                    represented(query),
+                    represented(WorkspaceFloatingType::Float32),
+                    represented(value),
+                ],
+                outputs: vec![
+                    WorkspaceLayout::new(&[1, 2, 32, 32], WorkspaceDtype::Float32).unwrap(),
+                ],
+            };
+            let mut emitter = Emitter::count();
+            emit(operation.as_view(), allocation, None, &mut emitter)
+                .unwrap()
+                .unwrap();
+            let births = 1 + products * if original_storage { 4 } else { 3 };
+            assert!(
+                emitter
+                    .default_scratch_sources()
+                    .unwrap()
+                    .alternatives()
+                    .iter()
+                    .all(|row| row.default_births == births),
+                "query {query:?}, values {value:?}"
+            );
+        }
+    }
+    // The largest total, eager source and execution source deliberately occur
+    // on different branches. Compare repeated composition with the complete
+    // branch population, including a source-free fused operation.
+    let choices = [
+        &[(100, 90, 3), (130, 10, 1), (80, 40, 2)][..],
+        &[(40, 35, 2), (55, 5, 1), (60, 30, 3)][..],
+        &[(17, 0, 0)][..],
+        &[(21, 20, 1), (44, 2, 1)][..],
+    ];
+    let mut reduced = Costs::fixed(0);
+    let mut reference = vec![(0_u64, 0_u64, 0_usize)];
+    for rows in choices {
+        reduced = reduced.append(Costs::from_rows(rows).unwrap()).unwrap();
+        reference = reference
+            .iter()
+            .flat_map(|&(total, default, births)| {
+                rows.iter()
+                    .map(move |&(t, d, b)| (total + t, default + d, births + b))
+            })
+            .collect();
+        for (host, execution) in [(true, true), (true, false), (false, true), (false, false)] {
+            let charge = |total: u64, default: u64| {
+                u64::from(host) * default + u64::from(execution) * (total - default)
+            };
+            assert_eq!(
+                reduced.0.iter().map(|r| charge(r.total, r.default)).max(),
+                reference.iter().map(|&(t, d, _)| charge(t, d)).max(),
+                "physical sharing: default={host}, execution={execution}",
+            );
+        }
+        for row in reduced.0 {
+            assert!(reference.contains(&(row.total, row.default, row.births)));
+        }
+    }
+    let mut emitter = Emitter::count();
+    Costs::fixed(17).publish(17, &mut emitter).unwrap();
+    assert!(emitter
+        .default_scratch_sources()
+        .unwrap()
+        .alternatives()
+        .iter()
+        .all(|row| row.scratch_bytes == Some(0) && row.default_bytes == 0));
+    assert!(Costs::fixed(u64::MAX).extra(1).is_err());
 }

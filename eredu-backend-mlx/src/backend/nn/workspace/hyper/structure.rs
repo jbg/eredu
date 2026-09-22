@@ -4,6 +4,8 @@ use crate::backend::nn::hyper_connections::{
     self as native,
     worker::{self, Binary, Unary, Worker},
 };
+use crate::backend::nn::workspace::OrdinaryCallControls;
+use safemlx::ops::OrdinaryRecipeCall;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Value {
@@ -39,6 +41,7 @@ pub(crate) struct Structure {
     pub aliases: usize,
     pub reshapes: usize,
     pub controls: usize,
+    ordinary_calls: Option<OrdinaryCallControls>,
 }
 fn add_count(a: usize, b: usize) -> FactResult<usize> {
     a.checked_add(b)
@@ -51,6 +54,19 @@ fn mul_count(a: usize, b: usize) -> FactResult<usize> {
 #[derive(Default)]
 struct Counter(Structure);
 impl Counter {
+    fn call(&mut self, call: OrdinaryRecipeCall) -> FactResult<()> {
+        if let Some(total) = self.0.ordinary_calls {
+            self.0.ordinary_calls = match OrdinaryCallControls::call(call) {
+                Some(calls) => Some(
+                    total
+                        .append(calls)
+                        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+                ),
+                None => None,
+            };
+        }
+        Ok(())
+    }
     fn record(
         &mut self,
         value: Value,
@@ -95,22 +111,38 @@ impl Worker for Counter {
         value.shape()
     }
     fn alias(&mut self, value: &Value) -> FactResult<Value> {
+        if let Some(total) = self.0.ordinary_calls {
+            self.0.ordinary_calls = match safemlx::Array::ordinary_clone_control_bytes() {
+                Some(bytes) => Some(
+                    total
+                        .metadata(bytes)
+                        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+                ),
+                None => None,
+            };
+        }
         self.0.aliases = add_count(self.0.aliases, 1)?;
         self.record(*value, 0, 0, 0, 0)
     }
     fn f32(&mut self, value: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Cast)?;
         self.record(*value, 1, 1, 0, 0)
     }
     fn cast_like(&mut self, value: &Value, _: &Value) -> FactResult<Value> {
         self.f32(value)
     }
     fn scalar(&mut self, _: f32) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::ScalarF32)?;
         self.record(Value::new(&[])?, 0, 0, 1, 0)
     }
     fn zeros_like(&mut self, shape: &[i32], _: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Fill { rank: shape.len() })?;
         self.record(Value::new(shape)?, 4, 4, 1, 0)
     }
     fn reshape(&mut self, input: &Value, requested: &[i32]) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Reshape {
+            rank: requested.len(),
+        })?;
         if requested.len() > 4 {
             return Err(invalid());
         }
@@ -140,6 +172,7 @@ impl Worker for Counter {
         self.record(Value::new(&shape[..requested.len()])?, 1, 1, 0, 0)
     }
     fn transpose(&mut self, input: &Value, axes: &[i32]) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Transpose { rank: axes.len() })?;
         if axes.len() != input.rank {
             return Err(invalid());
         }
@@ -156,6 +189,7 @@ impl Worker for Counter {
         self.record(Value::new(&shape[..input.rank])?, 1, 1, 0, 0)
     }
     fn slice(&mut self, input: &Value, axis: usize, start: i32, end: i32) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::StaticSlice { rank: input.rank })?;
         if axis >= input.rank || start < 0 || end < start || end > input.axes[axis] {
             return Err(invalid());
         }
@@ -164,6 +198,7 @@ impl Worker for Counter {
         self.record(value, 1, 1, 0, 0)
     }
     fn unary(&mut self, kind: Unary, input: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Unary)?;
         // Direct MLX unary worker, not the separately optimized shared NN
         // sigmoid wrapper: only its actual dtype cast and unary descriptor.
         let count = match kind {
@@ -173,9 +208,11 @@ impl Worker for Counter {
         self.record(*input, count, count, 0, 0)
     }
     fn binary(&mut self, _: Binary, a: &Value, b: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Binary)?;
         self.record(self.binary_value(*a, *b)?, 5, 6, 0, 0)
     }
     fn matmul(&mut self, a: &Value, b: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::Binary)?;
         if a.rank < 2 || b.rank < 2 || a.axes[a.rank - 1] != b.axes[b.rank - 2] {
             return Err(invalid());
         }
@@ -195,6 +232,7 @@ impl Worker for Counter {
         self.record(output, 8, 9, usize::from(empty), if empty { 0 } else { 6 })
     }
     fn mean_last(&mut self, input: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::ReduceAxis)?;
         let mut output = *input;
         output.axes[output.rank - 1] = 1;
         // mean_owned: keepdims Reduce, one exact count scalar, Divide's two
@@ -202,6 +240,7 @@ impl Worker for Counter {
         self.record(output, 6, 7, 1, 2)
     }
     fn sum(&mut self, input: &Value, axis: usize, keep: bool) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::ReduceAxis)?;
         if axis >= input.rank {
             return Err(invalid());
         }
@@ -219,6 +258,7 @@ impl Worker for Counter {
         self.record(output, count, count, 0, 2)
     }
     fn softmax_last(&mut self, input: &Value) -> FactResult<Value> {
+        self.call(OrdinaryRecipeCall::ReduceAxis)?;
         self.record(*input, 2, 2, 0, 1)
     }
     fn repeat<F>(&mut self, count: usize, value: Value, mut step: F) -> FactResult<Value>
@@ -229,6 +269,9 @@ impl Worker for Counter {
             return Ok(value);
         }
         let before = self.0;
+        self.0.ordinary_calls = before
+            .ordinary_calls
+            .map(|_| OrdinaryCallControls::default());
         let output = step(self, &value)?;
         if output != value {
             return Err(invalid());
@@ -238,15 +281,33 @@ impl Worker for Counter {
                 mul_count(self.0.$field.checked_sub(before.$field).ok_or_else(invalid)?, count)?)?;
         )* }; }
         extend!(primitives, edges, seeds, births, handles, aliases, reshapes);
+        self.0.ordinary_calls = match (before.ordinary_calls, self.0.ordinary_calls) {
+            (Some(before), Some(delta)) => Some(
+                before
+                    .append(
+                        delta
+                            .repeat(count)
+                            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+                    )
+                    .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+            ),
+            _ => None,
+        };
         Ok(output)
     }
 }
 
-pub(crate) fn inspect(op: WorkspaceOperationView<'_>) -> FactResult<Option<Structure>> {
+fn inspect_with_calls(
+    op: WorkspaceOperationView<'_>,
+    ordinary: bool,
+) -> FactResult<Option<Structure>> {
     let Some(geometry) = super::geometry(op)? else {
         return Ok(None);
     };
     let mut counter = Counter::default();
+    if ordinary {
+        counter.0.ordinary_calls = Some(OrdinaryCallControls::default());
+    }
     let mut values = [Value::new(&[])?; 4];
     for (value, input) in values.iter_mut().zip(op.inputs.iter()) {
         *value = Value::new(input.shape())?;
@@ -315,9 +376,34 @@ pub(crate) fn inspect(op: WorkspaceOperationView<'_>) -> FactResult<Option<Struc
             }
         }
     }
-    counter.0.controls = native::control_bytes(counter.0.handles, counter.0.aliases)
-        .and_then(|n| n.checked_add(std::mem::size_of::<Counter>()))
-        .and_then(|n| n.checked_add(std::mem::size_of::<[Value; 6]>()))
-        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+    if !ordinary {
+        counter.0.controls = native::control_bytes(counter.0.handles, counter.0.aliases)
+            .and_then(|n| n.checked_add(std::mem::size_of::<Counter>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<[Value; 6]>()))
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+    }
     Ok(Some(counter.0))
+}
+
+pub(crate) fn inspect(op: WorkspaceOperationView<'_>) -> FactResult<Option<Structure>> {
+    inspect_with_calls(op, false)
+}
+
+pub(super) fn ordinary_call_controls(
+    op: WorkspaceOperationView<'_>,
+) -> FactResult<Option<OrdinaryCallControls>> {
+    let Some(source) = inspect_with_calls(op, true)? else {
+        return Ok(None);
+    };
+    let Some(calls) = source.ordinary_calls else {
+        return Ok(None);
+    };
+    let Some(frames) = native::ordinary_control_bytes(source.handles) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        calls
+            .metadata(frames)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+    ))
 }

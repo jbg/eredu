@@ -1,0 +1,29 @@
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -333,20 +333,12 @@
+ CpuWorkerStartupResult borrow_initialized_cpu_worker(uint64_t scheduler_identity, Stream stream,
+     const void* stream_birth, const void* worker_birth) noexcept {
+   if (!worker_birth || stream.device != Device::cpu) return {WorkerCause::identity_mismatch};
+-  // An immutable worker loan creates no Scheduler, registration, worker or
+-  // task. Only the existing valid original Scope may bypass the constructor's
+-  // empty-context requirement; all three retained source identities are still
+-  // checked below. Ordinary/scoped contexts keep their existing refusal.
+-  const bool scoped = !submission::submission_context_empty();
+-  if (scoped) {
+-    const auto binding = submission::current_native_controls();
+-    const auto* scope = submission::current_scope();
+-    if (!scope || !scope->valid_original_observer() || !binding.original ||
+-        binding.failure != submission::NativeControlFailure::none)
+-      return {WorkerCause::invalid};
+-  }
++  // A birth-identity loan creates no Scheduler, registration, worker, task or
++  // completion authority. It is valid during ordinary and original work;
++  // each numerical producer separately authenticates its current role.
++  // Construction still requires the empty context in initialize_cpu_worker.
+   const auto prerequisite = worker_prerequisites(
+-      scheduler_identity, stream, stream_birth, scoped);
++      scheduler_identity, stream, stream_birth, true);
+   if (prerequisite.cause != WorkerCause::success) return prerequisite;
+   auto* owner = prepared_scheduler();
+   try {

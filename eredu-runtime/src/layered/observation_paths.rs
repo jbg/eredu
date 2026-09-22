@@ -2,7 +2,7 @@
 use super::*;
 mod prefill;
 use crate::host_metadata::{HostMetadataIdentity, MetadataCustody};
-use eredu_core::{SharedStorageAttachmentError, SharedStorageDomain};
+use eredu_core::{SharedStorageAccountingId, SharedStorageAttachmentError};
 pub use prefill::{
     BoundCaptureSelection, PrefillObservationDeclaration, PrefillReadoutStage,
     PreparedCaptureSelection, PreparedCaptureSelectionError,
@@ -100,14 +100,24 @@ impl SharedLayeredObservationPaths {
         S: RuntimeState<B>,
         A: LayeredArchitecture<B, S>,
     {
-        destination.controls::<(&Self, &A, &metadata::Destination<A::Error>, usize, usize,
-            Vec<PrefillObservationDeclaration>, String, Option<String>,
-            crate::ArchitectureExecutionGraph<'_>,
-            std::iter::Enumerate<std::slice::Iter<'_, GroupPaths>>,
-            std::iter::Enumerate<std::slice::Iter<'_, UnitPaths>>,
-            Result<Vec<PrefillObservationDeclaration>, A::Error>,
-            Result<String, A::Error>, Result<Option<String>, A::Error>,
-            Result<(), PreparedLayeredObservationError<A::Error>>)>()
+        destination
+            .controls::<(
+                &Self,
+                &A,
+                &metadata::Destination<A::Error>,
+                usize,
+                usize,
+                Vec<PrefillObservationDeclaration>,
+                String,
+                Option<String>,
+                crate::ArchitectureExecutionGraph<'_>,
+                std::iter::Enumerate<std::slice::Iter<'_, GroupPaths>>,
+                std::iter::Enumerate<std::slice::Iter<'_, UnitPaths>>,
+                Result<Vec<PrefillObservationDeclaration>, A::Error>,
+                Result<String, A::Error>,
+                Result<Option<String>, A::Error>,
+                Result<(), PreparedLayeredObservationError<A::Error>>,
+            )>()
             .map_err(PreparedLayeredObservationError::Execution)?;
         if architecture
             .prefill_observation_declarations(destination.context())
@@ -131,8 +141,7 @@ impl SharedLayeredObservationPaths {
         if graph.group_count() != self.0.payload.len() {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
-        for (group, retained) in self.0.payload.iter().enumerate()
-        {
+        for (group, retained) in self.0.payload.iter().enumerate() {
             let count = architecture
                 .group_unit_count(group, destination.context())
                 .map_err(PreparedLayeredObservationError::Execution)?;
@@ -156,10 +165,18 @@ impl SharedLayeredObservationPaths {
                 // Declaration temporaries belong to cold preparation. Every unit
                 // is validated, including architecture-owned internal boundaries.
                 if retained.outer == architecture.observes_unit_boundaries(group, index)
-                    || !retained.input.strip_suffix(".input").is_some_and(|unit| unit == path)
-                    || !retained.output.strip_suffix(".output").is_some_and(|unit| unit == path)
-                    || retained.effective_input.strip_suffix(".effective") != Some(retained.input.as_str())
-                    || retained.effective_output.strip_suffix(".effective") != Some(retained.output.as_str())
+                    || !retained
+                        .input
+                        .strip_suffix(".input")
+                        .is_some_and(|unit| unit == path)
+                    || !retained
+                        .output
+                        .strip_suffix(".output")
+                        .is_some_and(|unit| unit == path)
+                    || retained.effective_input.strip_suffix(".effective")
+                        != Some(retained.input.as_str())
+                    || retained.effective_output.strip_suffix(".effective")
+                        != Some(retained.output.as_str())
                 {
                     return Err(PreparedLayeredObservationError::SemanticMismatch);
                 }
@@ -249,20 +266,31 @@ impl SharedLayeredObservationPaths {
     pub fn group_output(&self, group: usize) -> Option<&str> {
         self.0.payload.get(group)?.output.as_deref()
     }
-    /// Attaches exact source custody once per domain, including earlier aliases.
+    /// Attaches exact source custody once per ledger, including earlier aliases.
     /// The provider may perform only closed accounting under the owner lock;
     /// never retain this payload in the handle or reenter it from the provider.
     /// Payloads retire before handles, and handle destructors run outside locks.
     pub(crate) fn original_attachment_ready(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         self.0.custody.original_attachment_ready(domain)
     }
 
+    /// Funds the new attachment node and closed owner before construction.
+    pub(crate) fn try_attach_owned_prepared<T: eredu_core::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            eredu_core::SharedStorageAttachmentLayout,
+        ) -> Result<eredu_core::SharedStorageOwner<T>, E>,
+    ) -> Result<bool, SharedStorageAttachmentError<E>> {
+        self.0.custody.try_attach_owned_prepared(owner, acquire)
+    }
+
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.0.custody.try_attach(domain, acquire)
@@ -301,47 +329,89 @@ impl ObservationBinding {
         self.0.take();
     }
     /// Collect the actual architecture declarations during initial loading.
-    pub fn prepare_architecture<B, S, A>(&self, architecture: &A)
-        -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>
-    where B: NeuralBackend, S: RuntimeState<B>, A: LayeredArchitecture<B, S> {
-        self.prepare(SharedLayeredObservationPaths::collect::<B, S, A>(architecture)
-            .map_err(PreparedLayeredObservationError::Execution)?, &metadata::Destination(None))
-            .map_err(PreparedLayeredObservationError::Execution)
+    pub fn prepare_architecture<B, S, A>(
+        &self,
+        architecture: &A,
+    ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>
+    where
+        B: NeuralBackend,
+        S: RuntimeState<B>,
+        A: LayeredArchitecture<B, S>,
+    {
+        self.prepare(
+            SharedLayeredObservationPaths::collect::<B, S, A>(architecture)
+                .map_err(PreparedLayeredObservationError::Execution)?,
+            &metadata::Destination(None),
+        )
+        .map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Validate declarations and bind an existing source at a cold boundary.
-    pub fn bind_architecture<B, S, A>(&self, architecture: &A, source: &SharedLayeredObservationPaths, metadata: Option<LayeredMetadata<A::Error>>)
-        -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>
-    where B: NeuralBackend, S: RuntimeState<B>, A: LayeredArchitecture<B, S> {
+    pub fn bind_architecture<B, S, A>(
+        &self,
+        architecture: &A,
+        source: &SharedLayeredObservationPaths,
+        metadata: Option<LayeredMetadata<A::Error>>,
+    ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>
+    where
+        B: NeuralBackend,
+        S: RuntimeState<B>,
+        A: LayeredArchitecture<B, S>,
+    {
         let destination = metadata::Destination(metadata);
-        destination.controls::<(&Self, &A, &SharedLayeredObservationPaths,
-            metadata::Destination<A::Error>, Result<PreparedLayeredObservationPaths,
-            PreparedLayeredObservationError<A::Error>>)>().map_err(PreparedLayeredObservationError::Execution)?;
+        destination
+            .controls::<(
+                &Self,
+                &A,
+                &SharedLayeredObservationPaths,
+                metadata::Destination<A::Error>,
+                Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>,
+            )>()
+            .map_err(PreparedLayeredObservationError::Execution)?;
         source.validate::<B, S, A>(architecture, &destination)?;
-        self.prepare(source.clone(), &destination).map_err(PreparedLayeredObservationError::Execution)
+        self.prepare(source.clone(), &destination)
+            .map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Check this exact generation without rebuilding declarations or allocating.
-    pub fn validate_binding(&self, paths: &PreparedLayeredObservationPaths)
-        -> Result<(), PreparedLayeredObservationError<std::convert::Infallible>> {
+    pub fn validate_binding(
+        &self,
+        paths: &PreparedLayeredObservationPaths,
+    ) -> Result<(), PreparedLayeredObservationError<std::convert::Infallible>> {
         self.validate(paths)
     }
 
-    fn prepare<E>(&self, source: SharedLayeredObservationPaths, destination: &metadata::Destination<E>)
-        -> Result<PreparedLayeredObservationPaths, E> {
-        destination.controls::<(&Self, SharedLayeredObservationPaths, &metadata::Destination<E>,
-            BindingOwner, PreparedLayeredObservationPaths, Result<BindingOwner, BindingOwner>,
-            Result<PreparedLayeredObservationPaths, E>)>()?;
+    fn prepare<E>(
+        &self,
+        source: SharedLayeredObservationPaths,
+        destination: &metadata::Destination<E>,
+    ) -> Result<PreparedLayeredObservationPaths, E> {
+        destination.controls::<(
+            &Self,
+            SharedLayeredObservationPaths,
+            &metadata::Destination<E>,
+            BindingOwner,
+            PreparedLayeredObservationPaths,
+            Result<BindingOwner, BindingOwner>,
+            Result<PreparedLayeredObservationPaths, E>,
+        )>()?;
         if self.0.get().is_none() {
             let runtime = match destination.context() {
-                Some(context) => context.metadata_arc(()).map_err(|cause| destination.map(cause.into()))?,
+                Some(context) => context
+                    .metadata_arc(())
+                    .map_err(|cause| destination.map(cause.into()))?,
                 None => Arc::new(()),
             };
-            let funding = destination.context().and_then(eredu_nn::workspace::WorkspaceContext::metadata_funding);
+            let funding = destination
+                .context()
+                .and_then(eredu_nn::workspace::WorkspaceContext::metadata_funding);
             // A racing producer drops its own paid shell, preserving the first identity.
             let _ = self.0.set(BindingOwner { runtime, funding });
         }
-        Ok(PreparedLayeredObservationPaths { source, runtime: self.0.get().expect("initialized binding").clone() })
+        Ok(PreparedLayeredObservationPaths {
+            source,
+            runtime: self.0.get().expect("initialized binding").clone(),
+        })
     }
     fn validate<E>(
         &self,
@@ -360,11 +430,15 @@ impl ObservationBinding {
 
 impl fmt::Debug for ObservationBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LayeredObservationBinding").field("prepared", &self.0.get().is_some()).finish_non_exhaustive()
+        f.debug_struct("LayeredObservationBinding")
+            .field("prepared", &self.0.get().is_some())
+            .finish_non_exhaustive()
     }
 }
 impl Default for ObservationBinding {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Read-only source binding issued by one actual runtime after cold preparation.
@@ -390,7 +464,8 @@ pub struct PreparedObservationBindingIdentity {
 impl PreparedObservationBindingIdentity {
     /// Compare with an actual token without upgrading or allocating.
     pub fn matches(&self, current: &PreparedLayeredObservationPaths) -> bool {
-        self.runtime.strong_count() != 0 && self.runtime.as_ptr() == Arc::as_ptr(&current.runtime.runtime)
+        self.runtime.strong_count() != 0
+            && self.runtime.as_ptr() == Arc::as_ptr(&current.runtime.runtime)
     }
 
     /// Retained Arc control block plus fingerprint construction/move overlap.
@@ -426,7 +501,9 @@ impl PreparedLayeredObservationPaths {
         // and the fixed token-validation result before either entry runs.
         extent::<BorrowedHook<'_, dyn ActivationObserver<(), std::convert::Infallible>>>(2)?
             .checked_add(extent::<Option<&Self>>(2)?)?
-            .checked_add(extent::<Result<(), PreparedLayeredObservationError<std::convert::Infallible>>>(2)?)
+            .checked_add(extent::<
+                Result<(), PreparedLayeredObservationError<std::convert::Infallible>>,
+            >(2)?)
     }
 }
 
@@ -556,10 +633,19 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
-    fn validate_observation_shape(&self, destination: &metadata::Destination<A::Error>) -> Result<(), PreparedLayeredObservationError<A::Error>> {
-        destination.controls::<(&Self, &metadata::Destination<A::Error>, usize,
-            crate::ArchitectureExecutionGraph<'_>, Result<usize, A::Error>,
-            Result<(), PreparedLayeredObservationError<A::Error>>)>()
+    fn validate_observation_shape(
+        &self,
+        destination: &metadata::Destination<A::Error>,
+    ) -> Result<(), PreparedLayeredObservationError<A::Error>> {
+        destination
+            .controls::<(
+                &Self,
+                &metadata::Destination<A::Error>,
+                usize,
+                crate::ArchitectureExecutionGraph<'_>,
+                Result<usize, A::Error>,
+                Result<(), PreparedLayeredObservationError<A::Error>>,
+            )>()
             .map_err(PreparedLayeredObservationError::Execution)?;
         let graph = self
             .architecture
@@ -586,10 +672,13 @@ where
         &self,
     ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>> {
         self.validate_observation_shape(&metadata::Destination(None))?;
-        self.observation_binding.prepare(
-            SharedLayeredObservationPaths::collect::<B, S, A>(&self.architecture)
-                .map_err(PreparedLayeredObservationError::Execution)?, &metadata::Destination(None),
-        ).map_err(PreparedLayeredObservationError::Execution)
+        self.observation_binding
+            .prepare(
+                SharedLayeredObservationPaths::collect::<B, S, A>(&self.architecture)
+                    .map_err(PreparedLayeredObservationError::Execution)?,
+                &metadata::Destination(None),
+            )
+            .map_err(PreparedLayeredObservationError::Execution)
     }
     /// Coldly validates actual semantic declarations and binds the same retained
     /// payload to this runtime, e.g. for a metadata equation projection. Temporary
@@ -600,12 +689,19 @@ where
         metadata: Option<LayeredMetadata<A::Error>>,
     ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>> {
         let destination = metadata::Destination(metadata);
-        destination.controls::<(&Self, &SharedLayeredObservationPaths, metadata::Destination<A::Error>,
-            Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>)>()
+        destination
+            .controls::<(
+                &Self,
+                &SharedLayeredObservationPaths,
+                metadata::Destination<A::Error>,
+                Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>,
+            )>()
             .map_err(PreparedLayeredObservationError::Execution)?;
         self.validate_observation_shape(&destination)?;
         source.validate::<B, S, A>(&self.architecture, &destination)?;
-        self.observation_binding.prepare(source.clone(), &destination).map_err(PreparedLayeredObservationError::Execution)
+        self.observation_binding
+            .prepare(source.clone(), &destination)
+            .map_err(PreparedLayeredObservationError::Execution)
     }
     /// Checks only the existing private runtime token, without allocating,
     /// reconstructing declarations, evaluating tensors or granting execution.
@@ -617,28 +713,54 @@ where
     }
     /// Borrows the actual resident provider through the existing prepared
     /// internal traversal, without requiring a parallel execution contract.
-    pub fn forward_serial_routed_with_traversal_hook_with_readout<'a,Provider,H>(
-        &mut self,input:A::Input<'a>,state:&mut S,pass:ExpertPass,provider:&mut Provider,
-        context:&<B::Tensor as Tensor>::Context,hook:&mut H,demand:eredu_core::OutputDemand)
-        ->Result<(Option<B::Tensor>,A::ForwardContext),A::Error>
-    where B:eredu_nn::GroupedNeuralBackend,A:RoutedLayeredArchitecture<B,S>,
-        Provider:crate::RoutedExpertProvider<B>,Provider::Error:std::fmt::Display,
-        H:crate::LayeredTraversalHook<B,A::ForwardContext,A::Error>+?Sized,
+    pub fn forward_serial_routed_with_traversal_hook_with_readout<'a, Provider, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), A::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        Provider: crate::RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        H: crate::LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        self.forward_with_invocation_and_unit_executor(OrdinaryLayeredInput::new(input),state,context,hook,demand,
-            |architecture,group,index,unit,hidden,state,forward,context,_hook|
-                architecture.forward_unit_with_provider(group,index,unit,hidden,state,forward,pass,provider,context))
+        self.forward_with_invocation_and_unit_executor(
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            hook,
+            demand,
+            |architecture, group, index, unit, hidden, state, forward, context, _hook| {
+                architecture.forward_unit_with_provider(
+                    group, index, unit, hidden, state, forward, pass, provider, context,
+                )
+            },
+        )
     }
     /// Executes the provider through the existing prepared observation binding.
     pub fn forward_serial_routed_with_prepared_paths<'a, Provider, O>(
-        &mut self, input: A::Input<'a>, state: &mut S, pass: ExpertPass,
-        provider: &mut Provider, context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O, paths: &PreparedLayeredObservationPaths,
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        paths: &PreparedLayeredObservationPaths,
         demand: eredu_core::OutputDemand,
     ) -> Result<(Option<B::Tensor>, A::ForwardContext), PreparedLayeredObservationError<A::Error>>
-    where B: eredu_nn::GroupedNeuralBackend,
-        A: RoutedLayeredArchitecture<B, S>, A::Error: std::fmt::Display,
-        Provider: crate::RoutedExpertProvider<B>, Provider::Error: std::fmt::Display,
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: crate::RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.observation_binding.validate(paths)?;
@@ -646,12 +768,30 @@ where
             return Err(PreparedLayeredObservationError::ReadoutDemand);
         }
         self.forward_with_invocation_and_unit_executor(
-            OrdinaryLayeredInput::new(input), state, context,
-            &mut BorrowedHook { observer, paths: &paths.source }, demand,
-            |architecture, group, index, unit, hidden, state, forward, context, hook|
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            &mut BorrowedHook {
+                observer,
+                paths: &paths.source,
+            },
+            demand,
+            |architecture, group, index, unit, hidden, state, forward, context, hook| {
                 architecture.forward_unit_observed_with_provider(
-                    group, index, unit, hidden, state, forward, pass, provider, context, hook.observer))
-            .map_err(PreparedLayeredObservationError::Execution)
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    pass,
+                    provider,
+                    context,
+                    hook.observer,
+                )
+            },
+        )
+        .map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Runs the ordinary observed equations with borrowed precomputed paths.
@@ -703,10 +843,13 @@ where
         if self.geometry_stale {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
-        self.observation_binding.prepare(
-            SharedLayeredObservationPaths::collect::<B, S, A>(&self.architecture)
-                .map_err(PreparedLayeredObservationError::Execution)?, &metadata::Destination(None),
-        ).map_err(PreparedLayeredObservationError::Execution)
+        self.observation_binding
+            .prepare(
+                SharedLayeredObservationPaths::collect::<B, S, A>(&self.architecture)
+                    .map_err(PreparedLayeredObservationError::Execution)?,
+                &metadata::Destination(None),
+            )
+            .map_err(PreparedLayeredObservationError::Execution)
     }
     /// Reuses the exact retained source after cold semantic declaration checks.
     pub fn bind_observation_paths(
@@ -715,14 +858,21 @@ where
         metadata: Option<LayeredMetadata<A::Error>>,
     ) -> Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>> {
         let destination = metadata::Destination(metadata);
-        destination.controls::<(&Self, &SharedLayeredObservationPaths, metadata::Destination<A::Error>,
-            Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>)>()
+        destination
+            .controls::<(
+                &Self,
+                &SharedLayeredObservationPaths,
+                metadata::Destination<A::Error>,
+                Result<PreparedLayeredObservationPaths, PreparedLayeredObservationError<A::Error>>,
+            )>()
             .map_err(PreparedLayeredObservationError::Execution)?;
         if self.geometry_stale {
             return Err(PreparedLayeredObservationError::SemanticMismatch);
         }
         source.validate::<B, S, A>(&self.architecture, &destination)?;
-        self.observation_binding.prepare(source.clone(), &destination).map_err(PreparedLayeredObservationError::Execution)
+        self.observation_binding
+            .prepare(source.clone(), &destination)
+            .map_err(PreparedLayeredObservationError::Execution)
     }
     /// Checks only the existing private runtime token, without allocating,
     /// reconstructing declarations, evaluating tensors or granting execution.
@@ -734,39 +884,74 @@ where
     }
     /// Borrows the actual resident provider through the existing prepared
     /// internal traversal, without requiring a parallel execution contract.
-    pub fn forward_serial_routed_with_traversal_hook_with_readout<'a,Provider,H>(
-        &mut self,input:A::Input<'a>,state:&mut S,pass:ExpertPass,provider:&mut Provider,
-        context:&<B::Tensor as Tensor>::Context,hook:&mut H,demand:eredu_core::OutputDemand)
-        ->Result<(Option<B::Tensor>,A::ForwardContext),LayerwiseRuntimeError<A::Error,P::Error>>
-    where B:eredu_nn::GroupedNeuralBackend,A:RoutedLayeredArchitecture<B,S>,
-        Provider:crate::RoutedExpertProvider<B>,Provider::Error:std::fmt::Display,
-        H:crate::LayeredTraversalHook<B,A::ForwardContext,A::Error>+?Sized,
+    pub fn forward_serial_routed_with_traversal_hook_with_readout<'a, Provider, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        Provider: crate::RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        H: crate::LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         self.forward_with_unit_executor_and_invocation(
-            OrdinaryLayeredInput::new(input), state, context,
-            |architecture, group, index, unit, hidden, state, forward, context, _hook|
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context, _hook| {
                 architecture.forward_unit_with_provider(
-                    group, index, unit, hidden, state, forward, pass, provider, context),
-            hook, false, true, demand)
+                    group, index, unit, hidden, state, forward, pass, provider, context,
+                )
+            },
+            hook,
+            false,
+            true,
+            demand,
+        )
     }
     /// Executes the provider through the existing prepared observation binding.
     pub fn forward_serial_routed_with_prepared_paths<'a, Provider, O>(
-        &mut self, input: A::Input<'a>, state: &mut S, pass: ExpertPass,
-        provider: &mut Provider, context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O, paths: &PreparedLayeredObservationPaths,
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        paths: &PreparedLayeredObservationPaths,
         demand: eredu_core::OutputDemand,
-    ) -> Result<(Option<B::Tensor>, A::ForwardContext), PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>>
-    where B: eredu_nn::GroupedNeuralBackend,
-        A: RoutedLayeredArchitecture<B, S>, A::Error: std::fmt::Display,
-        Provider: crate::RoutedExpertProvider<B>, Provider::Error: std::fmt::Display,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>,
+    >
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: crate::RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.forward_invocation_with_prepared_internal_observer(
-            OrdinaryLayeredInput::new(input), state, context,
-            |architecture, group, index, unit, hidden, state, forward, context, observer|
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context, observer| {
                 architecture.forward_unit_observed_with_provider(
-                    group, index, unit, hidden, state, forward, pass, provider, context, observer),
-            observer, paths, demand)
+                    group, index, unit, hidden, state, forward, pass, provider, context, observer,
+                )
+            },
+            observer,
+            paths,
+            demand,
+        )
     }
 
     /// Uses the same ordinary unit acquisition, observed internals and abort
@@ -808,67 +993,138 @@ where
     /// or shared observer is allocated during forward, and ordinary layerwise
     /// acquisition, internal unit hooks, readout and abort behavior are preserved.
     pub fn forward_parallel_with_prepared_observer_and_context_with_readout<'a, O>(
-        &mut self, input: A::Input<'a>, state: &mut S, parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context, observer: Option<&mut O>,
-        paths: &PreparedLayeredObservationPaths, demand: eredu_core::OutputDemand,
-    ) -> Result<(Option<B::Tensor>, A::ForwardContext),
-        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>>
-    where A: ParallelLayeredArchitecture<B, S>,
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+        paths: &PreparedLayeredObservationPaths,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>,
+    >
+    where
+        A: ParallelLayeredArchitecture<B, S>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.observation_binding.validate(paths)?;
         let Some(observer) = observer else {
             // An unscheduled span preserves the same immutable path binding;
             // it executes only ordinary equations and creates no observation.
-            return self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
-                input, state, parallel, context,
-                |architecture, group, index, unit, hidden, state, forward, parallel, context|
-                    architecture.forward_unit_parallel(group, index, unit, hidden, state, forward, parallel, context),
-                &mut NoopLayeredTraversalHook, true, demand,
-            ).map_err(PreparedLayeredObservationError::Execution);
+            return self
+                .forward_parallel_with_unit_executor_and_traversal_hook_impl(
+                    input,
+                    state,
+                    parallel,
+                    context,
+                    |architecture,
+                     group,
+                     index,
+                     unit,
+                     hidden,
+                     state,
+                     forward,
+                     parallel,
+                     context| {
+                        architecture.forward_unit_parallel(
+                            group, index, unit, hidden, state, forward, parallel, context,
+                        )
+                    },
+                    &mut NoopLayeredTraversalHook,
+                    true,
+                    demand,
+                )
+                .map_err(PreparedLayeredObservationError::Execution);
         };
         if observer.requires_sequence_readout() && demand != eredu_core::OutputDemand::Sequence {
             return Err(PreparedLayeredObservationError::ReadoutDemand);
         }
         self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
-            input, state, parallel, context,
-            |architecture, group, index, unit, hidden, state, forward, parallel, context|
-                architecture.forward_unit_parallel(group, index, unit, hidden, state, forward, parallel, context),
-            &mut BorrowedHook { observer, paths: &paths.source }, true, demand,
-        ).map_err(PreparedLayeredObservationError::Execution)
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                architecture.forward_unit_parallel(
+                    group, index, unit, hidden, state, forward, parallel, context,
+                )
+            },
+            &mut BorrowedHook {
+                observer,
+                paths: &paths.source,
+            },
+            true,
+            demand,
+        )
+        .map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Uses the architecture's existing routed/provider equations with the
     /// actual prepared path loan. This accepts a typed expert provider, not a
     /// caller-supplied mutable architecture or unit callback.
     pub fn forward_routed_with_prepared_paths<'a, Provider, O>(
-        &mut self, input: A::Input<'a>, state: &mut S, parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context, provider: &mut Provider, pass: ExpertPass,
-        observer: &mut O, demand: eredu_core::OutputDemand,
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut Provider,
+        pass: ExpertPass,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
         paths: Option<&PreparedLayeredObservationPaths>,
-    ) -> Result<(Option<B::Tensor>, A::ForwardContext),
-        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>>
-    where B: eredu_nn::GroupedNeuralBackend,
-        A: ParallelRoutedLayeredArchitecture<B, S>, A::Error: std::fmt::Display,
-        Provider: crate::TensorParallelRoutedExpertProvider<B>, Provider::Error: std::fmt::Display,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>,
+    >
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: ParallelRoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: crate::TensorParallelRoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         match parallel {
             Some(parallel) => self.forward_parallel_with_internal_observer_and_prepared_paths(
-                input, state, parallel, context,
-                |architecture, group, index, unit, hidden, state, forward, parallel, context, observer|
+                input,
+                state,
+                parallel,
+                context,
+                |architecture,
+                 group,
+                 index,
+                 unit,
+                 hidden,
+                 state,
+                 forward,
+                 parallel,
+                 context,
+                 observer| {
                     architecture.forward_unit_parallel_observed_with_provider(
-                        group, index, unit, hidden, state, forward, pass, provider, parallel, context, observer,
-                    ),
-                observer, demand, paths,
+                        group, index, unit, hidden, state, forward, pass, provider, parallel,
+                        context, observer,
+                    )
+                },
+                observer,
+                demand,
+                paths,
             ),
             None => self.forward_with_internal_observer_and_prepared_paths(
-                input, state, context,
-                |architecture, group, index, unit, hidden, state, forward, context, observer|
+                input,
+                state,
+                context,
+                |architecture, group, index, unit, hidden, state, forward, context, observer| {
                     architecture.forward_unit_observed_with_provider(
-                        group, index, unit, hidden, state, forward, pass, provider, context, observer,
-                    ),
-                observer, demand, paths,
+                        group, index, unit, hidden, state, forward, pass, provider, context,
+                        observer,
+                    )
+                },
+                observer,
+                demand,
+                paths,
             ),
         }
     }
@@ -876,24 +1132,55 @@ where
     /// Runs the selected internal/provider equation with an optional prepared
     /// path loan. A present loan never enters the allocating ordinary observer.
     fn forward_with_internal_observer_and_prepared_paths<'a, E, O>(
-        &mut self, input: A::Input<'a>, state: &mut S,
-        context: &<B::Tensor as Tensor>::Context, execute: E, observer: &mut O,
-        demand: eredu_core::OutputDemand, paths: Option<&PreparedLayeredObservationPaths>,
-    ) -> Result<(Option<B::Tensor>, A::ForwardContext),
-        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>>
-    where E: FnMut(&mut A, usize, usize, &mut A::Unit, &B::Tensor, &mut S,
-        &mut A::ForwardContext, &<B::Tensor as Tensor>::Context, &mut O) -> Result<B::Tensor, A::Error>,
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        execute: E,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
+        paths: Option<&PreparedLayeredObservationPaths>,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>,
+    >
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as Tensor>::Context,
+            &mut O,
+        ) -> Result<B::Tensor, A::Error>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         match paths {
             Some(paths) => self.forward_invocation_with_prepared_internal_observer(
-                OrdinaryLayeredInput::new(input), state, context, execute, observer, paths, demand,
+                OrdinaryLayeredInput::new(input),
+                state,
+                context,
+                execute,
+                observer,
+                paths,
+                demand,
             ),
             // This helper is private to the fixed typed routed provider entry.
             // Its canonical equations cannot replace the architecture geometry.
-            None => self.forward_invocation_with_internal_observer(
-                OrdinaryLayeredInput::new(input), state, context, execute, observer, demand, true,
-            ).map_err(PreparedLayeredObservationError::Execution),
+            None => self
+                .forward_invocation_with_internal_observer(
+                    OrdinaryLayeredInput::new(input),
+                    state,
+                    context,
+                    execute,
+                    observer,
+                    demand,
+                    true,
+                )
+                .map_err(PreparedLayeredObservationError::Execution),
         }
     }
 
@@ -901,33 +1188,81 @@ where
     /// The ordinary layerwise worker owns acquisition, dependency completion,
     /// readout and abort; the callback cannot replace that invocation driver.
     fn forward_parallel_with_internal_observer_and_prepared_paths<'a, E, O>(
-        &mut self, input: A::Input<'a>, state: &mut S, parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context, mut execute: E, observer: &mut O,
-        demand: eredu_core::OutputDemand, paths: Option<&PreparedLayeredObservationPaths>,
-    ) -> Result<(Option<B::Tensor>, A::ForwardContext),
-        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>>
-    where A: ParallelLayeredArchitecture<B, S>,
-        E: FnMut(&mut A, usize, usize, &mut A::Unit, &B::Tensor, &mut S,
-            &mut A::ForwardContext, &B::ParallelContext, &<B::Tensor as Tensor>::Context,
-            &mut O) -> Result<B::Tensor, A::Error>,
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        mut execute: E,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
+        paths: Option<&PreparedLayeredObservationPaths>,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        PreparedLayeredObservationError<LayerwiseRuntimeError<A::Error, P::Error>>,
+    >
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as Tensor>::Context,
+            &mut O,
+        ) -> Result<B::Tensor, A::Error>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         let Some(paths) = paths else {
-            return self.forward_parallel_invocation_with_internal_observer(
-                OrdinaryLayeredInput::new(input), state, parallel, context,
-                execute, observer, demand, true,
-            ).map_err(PreparedLayeredObservationError::Execution);
+            return self
+                .forward_parallel_invocation_with_internal_observer(
+                    OrdinaryLayeredInput::new(input),
+                    state,
+                    parallel,
+                    context,
+                    execute,
+                    observer,
+                    demand,
+                    true,
+                )
+                .map_err(PreparedLayeredObservationError::Execution);
         };
         self.observation_binding.validate(paths)?;
         if observer.requires_sequence_readout() && demand != eredu_core::OutputDemand::Sequence {
             return Err(PreparedLayeredObservationError::ReadoutDemand);
         }
         self.forward_parallel_with_unit_executor_and_invocation_hook(
-            OrdinaryLayeredInput::new(input), state, parallel, context,
-            |architecture, group, index, unit, hidden, state, forward, parallel, context, hook|
-                execute(architecture, group, index, unit, hidden, state, forward, parallel, context, hook.observer),
-            &mut BorrowedHook { observer, paths: &paths.source }, false, true, demand,
-        ).map_err(PreparedLayeredObservationError::Execution)
+            OrdinaryLayeredInput::new(input),
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context, hook| {
+                execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    parallel,
+                    context,
+                    hook.observer,
+                )
+            },
+            &mut BorrowedHook {
+                observer,
+                paths: &paths.source,
+            },
+            false,
+            true,
+            demand,
+        )
+        .map_err(PreparedLayeredObservationError::Execution)
     }
 
     /// Selected internal unit execution over an already authenticated invocation.

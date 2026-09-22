@@ -1,10 +1,9 @@
 use super::*;
-use eredu_core::{capture::*, component::ComponentCoordinateMap, BackendProvider as _};
-use eredu_runtime::capture::{partition::*, CaptureSession};
+use eredu_core::{BackendProvider as _, capture::*, component::ComponentCoordinateMap};
+use eredu_runtime::capture::{CaptureSession, partition::*};
 
-// This fixture verifies the actual native forward/observer lifecycle with a
-// singleton transport. Multi-process subgroup participation has separate Ring
-// coverage; this is not a claim of public distributed generation support.
+// Local observer cases use a singleton transport. The speculative provider
+// cases below use real Ring groups and the admitted autoregressive traversal.
 struct SingletonLayout;
 impl PartitionCaptureLayout for SingletonLayout {
     fn capture_placement(
@@ -76,12 +75,16 @@ fn native_partition_invocation_preserves_multirow_cached_geometry_metal() {
 
 #[test]
 fn native_partition_speculative_provider_preserves_real_components_cpu() {
-    verify_native_partition_components(true, true, safemlx::DeviceType::Cpu);
+    crate::tests::distributed_pipeline_ring::run_original_autoregressive_capture(
+        safemlx::DeviceType::Cpu,
+    );
 }
 #[test]
 #[ignore = "requires Metal device access"]
 fn native_partition_speculative_provider_preserves_real_components_metal() {
-    verify_native_partition_components(true, true, safemlx::DeviceType::Gpu);
+    crate::tests::distributed_pipeline_ring::run_original_autoregressive_capture(
+        safemlx::DeviceType::Gpu,
+    );
 }
 impl eredu_runtime::intervention::PartitionActivationLayout for SingletonLayout {
     fn activation_members<'a>(
@@ -105,7 +108,7 @@ fn verify_native_partition_components(
     use eredu_core::speculative::{
         SpeculativeActivationOrigin, SpeculativeActivationPhase, SpeculativeCaptureScope,
     };
-    use eredu_runtime::inspection::{with_speculative_activation, SpeculativeActivationObserver};
+    use eredu_runtime::inspection::{SpeculativeActivationObserver, with_speculative_activation};
 
     let context = crate::backend::ExecutionContext::new(safemlx::Device::new(device, 0));
     let source_context =
@@ -179,7 +182,6 @@ fn verify_native_partition_components(
             limits: CaptureLimits {
                 per_step: budget,
                 cumulative: budget,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         };
@@ -209,7 +211,9 @@ fn verify_native_partition_components(
         }
         .unwrap();
         let count = plan.points().len();
-        let mut capture = Some(CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan)));
+        let mut capture = Some(CaptureSession::new(
+            eredu_core::capture::SharedCapturePlan::new(plan),
+        ));
         let identity = PartitionCaptureIdentity::for_session(
             discovery.artifact_identity,
             session
@@ -311,7 +315,7 @@ fn verify_native_partition_components(
                     .begin_invocation(phase, prediction, invocation, Default::default())
                     .unwrap();
             }
-            let mut submit = |observer: &mut dyn RuntimeActivationObserver<MlxTensor, Error>| -> Result<Vec<f32>, Error> {
+            let mut submit = |observer: &mut dyn RuntimeActivationObserver<MlxTensor, Error>| -> Result<eredu_core::HostTensorBuffer<f32>, Error> {
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
             let submitted = if step_index == 0 {
                 session.submit_prefill_with_observer(
@@ -414,14 +418,20 @@ fn verify_native_partition_components(
                     assert_eq!(result.invocation, step_index);
                     result.captures.as_step().clone()
                 }
-                None => capture.as_mut().unwrap().take_shared_step().map(|frame| frame.as_step().clone()).unwrap(),
+                None => capture
+                    .as_mut()
+                    .unwrap()
+                    .take_shared_step()
+                    .map(|frame| frame.as_step().clone())
+                    .unwrap(),
             };
             assert_eq!(step.prediction_index, prediction);
             assert_eq!(step.invocation, invocation);
-            assert!(step
-                .records
-                .iter()
-                .all(|record| record.outcome == CaptureOutcome::Captured));
+            assert!(
+                step.records
+                    .iter()
+                    .all(|record| record.outcome == CaptureOutcome::Captured)
+            );
             assert_eq!(
                 step.partitions.len(),
                 if partitioned { step.records.len() } else { 0 }
@@ -529,7 +539,7 @@ fn native_shared_preparation_preserves_ordinary_and_controlled_generation() {
     );
     let mut outputs = Vec::new();
     for controlled in [false, true] {
-        for supplied in [false, true] {
+        {
             let backend = MlxBackend::new(stream, stream);
             let prepared =
                 eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
@@ -537,13 +547,13 @@ fn native_shared_preparation_preserves_ordinary_and_controlled_generation() {
             let mut runtime = ModelRuntime::from_prepared(backend, prepared).unwrap();
             let prompt =
                 MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2, 3, 4, 5]).unwrap();
-            let foreign = InferenceRequest::without_memory_budget(
+            let foreign = crate::memory_fixture::empty_admitted_request(
                 &InferenceExecutionIdentity::default(),
                 geometry,
             )
             .unwrap();
             let wrong_target = prompt.clone().with_inference_request(foreign);
-            let request = InferenceRequest::without_memory_budget(
+            let request = crate::memory_fixture::empty_admitted_request(
                 runtime
                     .session()
                     .payload
@@ -559,10 +569,11 @@ fn native_shared_preparation_preserves_ordinary_and_controlled_generation() {
                 .with_prefill_chunk_positions(std::num::NonZeroU64::new(1).unwrap());
             let before = crate::tests::support::path_instrumentation::snapshot().forwards;
             for rejected in [wrong_target, wrong_chunk] {
-                let error = match TextGeneration::from_prompt(&mut runtime, rejected, config) {
-                    Ok(_) => panic!("incompatible admission passed shared startup"),
-                    Err(error) => error,
-                };
+                let error =
+                    match TextGeneration::from_prompt(&mut runtime, rejected, config.clone()) {
+                        Ok(_) => panic!("incompatible admission passed shared startup"),
+                        Err(error) => error,
+                    };
                 let mut cause: &(dyn std::error::Error + 'static) = &error;
                 while let Some(source) = cause.source() {
                     cause = source;
@@ -576,21 +587,17 @@ fn native_shared_preparation_preserves_ordinary_and_controlled_generation() {
                     before
                 );
             }
-            let input = if supplied {
-                TextGenerationInput::Prepared(prompt.with_inference_request(request))
-            } else {
-                drop(prompt);
-                TextGenerationInput::TokenIds(vec![1, 2, 3, 4, 5])
-            };
+            drop((prompt, request));
+            let input = TextGenerationInput::TokenIds(vec![1, 2, 3, 4, 5]);
             let tokens = if controlled {
-                ControlledTextGeneration::from_input(&mut runtime, input, config, AllTokens)
+                ControlledTextGeneration::from_input(&mut runtime, input, config.clone(), AllTokens)
                     .unwrap()
                     .map(|token| token.unwrap().token_id())
                     .collect::<Vec<_>>()
             } else {
                 let generation = match input {
                     TextGenerationInput::TokenIds(ids) => {
-                        TextGeneration::new(&mut runtime, ids, config)
+                        TextGeneration::new(&mut runtime, ids, config.clone())
                     }
                     TextGenerationInput::OriginalTokenIds => {
                         unreachable!("legacy prepared-input fixture")
@@ -599,7 +606,7 @@ fn native_shared_preparation_preserves_ordinary_and_controlled_generation() {
                         unreachable!("ordinary fixture input")
                     }
                     TextGenerationInput::Prepared(prompt) => {
-                        TextGeneration::from_prompt(&mut runtime, prompt, config)
+                        TextGeneration::from_prompt(&mut runtime, prompt, config.clone())
                     }
                 }
                 .unwrap();

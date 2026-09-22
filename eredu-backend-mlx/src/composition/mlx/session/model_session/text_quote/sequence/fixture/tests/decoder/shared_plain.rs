@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_runtime::working_memory::{
     LoadedDecodeSourceBackend, LoadedGenerationDecoderInput, OriginalStopSourceBackend,
 };
@@ -7,9 +9,12 @@ use eredu_text::decoder_storage::DecodeCompilePlan;
 #[test]
 fn native_plain_requests_reuse_and_override_original_stops_across_residency_and_cached_continuation()
  {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for residency in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (mut runtime, _artifact) = load(&stream, &pool, residency);
         let tokenizer = tokenizer();
         let snapshot = tokenizer.snapshot();
@@ -56,11 +61,14 @@ fn native_plain_requests_reuse_and_override_original_stops_across_residency_and_
             let probe = Probe::new(&runtime, None, false);
             let mut driver = TextGenerationDriver::new(&mut runtime);
             let mut run = driver
-                .start_input_with_sequence(
-                    TextGenerationInput::TokenIds(vec![2, 5, 7]),
+                .start_token_ids_with_sequence(
+                    eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap(),
                     config(4, u64::MAX).with_inference_policy(eredu_core::TextInferencePolicy {
                         prefill_chunk_positions: std::num::NonZeroU64::new(2),
-                        managed_memory_capacity_bytes: Some(u64::MAX),
+                        memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                            "host".into(),
+                            eredu_core::MemoryLimit::Finite(u64::MAX),
+                        )]),
                         submission_tracking_capacity_bytes: None,
                         graph_metadata_capacity_bytes: None,
                     }),
@@ -105,7 +113,7 @@ fn native_plain_requests_reuse_and_override_original_stops_across_residency_and_
                 // Cached native owners can keep the prior original request
                 // charge alive. This is continuation, not an unfunded reset.
                 runtime.synchronize().unwrap();
-                assert!(pool.used_bytes().unwrap() >= cold);
+                assert!(pool.fixture_host_charge().unwrap() >= cold);
             } else {
                 final_ids = Some(ids);
                 final_held = facts.held;
@@ -124,8 +132,11 @@ fn native_plain_requests_reuse_and_override_original_stops_across_residency_and_
 }
 #[test]
 fn native_plain_shared_sources_fenced_error_outlives_model_and_header() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let snapshot = tokenizer().snapshot();
     let source = MlxBackend::compile_loaded_decode_source(
@@ -152,8 +163,8 @@ fn native_plain_shared_sources_fenced_error_outlives_model_and_header() {
     probe.mode(Mode::FenceProvider);
     let error = {
         let mut driver = TextGenerationDriver::new(&mut runtime);
-        let result = driver.start_input_with_sequence(
-            TextGenerationInput::TokenIds(vec![2, 5, 7]),
+        let result = driver.start_token_ids_with_sequence(
+            eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap(),
             config(4, u64::MAX),
             disk::Controller::default(),
             None,

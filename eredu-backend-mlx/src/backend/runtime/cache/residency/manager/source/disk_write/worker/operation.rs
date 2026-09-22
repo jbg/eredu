@@ -9,7 +9,7 @@ pub(crate) struct DiskWriteOperation {
     submission: Option<RuntimeDiskSubmission>,
     ticket: Option<DiskTicket>,
     output: PreparedDiskWriteOutput,
-    host: HostCacheBlock,
+    host: Option<HostCacheBlock>,
     occupancy: DiskWriteOccupancy,
     manager: CacheResidencyManager,
     worker: Arc<DiskWorker>,
@@ -27,6 +27,8 @@ pub(crate) struct DiskWriteOperation {
 enum Cause {
     #[error(transparent)]
     Source(CacheSourceError),
+    #[error(transparent)]
+    SourceProof(Exception),
     #[error(transparent)]
     Task(CacheIoTaskRefusal),
     #[error(transparent)]
@@ -202,7 +204,11 @@ impl DiskWriteOperation {
             .host_block()
             .ok_or(Cause::Source(CacheSourceError::Identity))?
             .buffers();
-        let expected = self.host.buffers();
+        let expected = self
+            .host
+            .as_ref()
+            .ok_or(Cause::Source(CacheSourceError::Identity))?
+            .buffers();
         if !std::ptr::eq(actual[0], expected[0]) || !std::ptr::eq(actual[1], expected[1]) {
             return Err(Cause::Source(CacheSourceError::Identity));
         }
@@ -283,7 +289,9 @@ impl DiskWriteOperation {
             reporting::update_report_totals_prepared(&mut state).map_err(Cause::Policy)?;
             let ticket = self.ticket.as_ref().expect("prepared task ticket");
             let row = HostWriteReservation {
-                reservation_id: NEXT_HOST_WRITE_RESERVATION_ID.fetch_add(1, Ordering::Relaxed),
+                reservation_id: NEXT_HOST_WRITE_RESERVATION_ID
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                    .map_err(|_| Cause::Source(CacheSourceError::Overflow))?,
                 global_layer: self.key.id.global_layer,
                 logical_bytes: self.logical_bytes,
                 host_capacity: self.occupancy.host_bytes(),
@@ -349,7 +357,32 @@ impl DiskWriteOperation {
             .reservation
             .try_lock()
             .map_err(|e| Cause::Source(lock_cause(e)))?;
+        let reservation = occupancy
+            .as_mut()
+            .ok_or(Cause::Source(CacheSourceError::Identity))?;
         reporting::update_report_totals_prepared(&mut state).map_err(Cause::Policy)?;
+        let overflow = || Cause::Source(CacheSourceError::Overflow);
+        let transfer_bytes = state
+            .telemetry
+            .report
+            .transfer_bytes
+            .checked_add(self.logical_bytes)
+            .ok_or_else(overflow)?;
+        let disk_demotions = state
+            .telemetry
+            .report
+            .disk_demotions
+            .checked_add(1)
+            .ok_or_else(overflow)?;
+        let activity = state.layer_activity_mut(self.key.id.global_layer);
+        let layer_transfer_bytes = activity
+            .transfer_bytes
+            .checked_add(self.logical_bytes)
+            .ok_or_else(overflow)?;
+        let layer_disk_demotions = activity
+            .disk_demotions
+            .checked_add(1)
+            .ok_or_else(overflow)?;
         let (host, io) = state
             .blocks
             .get_mut(&self.key.id)
@@ -363,7 +396,7 @@ impl DiskWriteOperation {
             .expect("validated pending row");
         if let Err(cause) = reporting::update_report_totals_prepared_replacement(
             &mut state,
-            &mut occupancy,
+            reservation,
             &self.manager.inner.pool_membership,
         ) {
             let mut original = MlxCacheBlockStorage::host(self.key.id.clone(), host, None);
@@ -388,14 +421,11 @@ impl DiskWriteOperation {
             drop(retired);
             return Err(Cause::Policy(cause));
         }
-        state.telemetry.report.transfer_bytes += self.logical_bytes;
-        state
-            .layer_activity_mut(self.key.id.global_layer)
-            .transfer_bytes += self.logical_bytes;
-        state.telemetry.report.disk_demotions += 1;
-        state
-            .layer_activity_mut(self.key.id.global_layer)
-            .disk_demotions += 1;
+        state.telemetry.report.transfer_bytes = transfer_bytes;
+        state.telemetry.report.disk_demotions = disk_demotions;
+        let activity = state.layer_activity_mut(self.key.id.global_layer);
+        activity.transfer_bytes = layer_transfer_bytes;
+        activity.disk_demotions = layer_disk_demotions;
         self.armed = false;
         self.committed = true;
         drop(state);
@@ -478,6 +508,7 @@ impl DiskWriteOperation {
             size_of::<(HostCacheBlock, MlxCacheIoOperation)>(),
             size_of::<MlxCacheBlockStorage>(),
             size_of::<DiskLocation>(),
+            size_of::<[u64; 4]>(),
             size_of::<MutexGuard<'_, CacheManagerState>>(),
             size_of::<
                 Result<
@@ -485,11 +516,11 @@ impl DiskWriteOperation {
                     TryLockError<MutexGuard<'_, CacheManagerState>>,
                 >,
             >(),
-            size_of::<MutexGuard<'_, CachePoolReservation>>(),
+            size_of::<MutexGuard<'_, Option<CachePoolReservation>>>(),
             size_of::<
                 Result<
-                    MutexGuard<'_, CachePoolReservation>,
-                    TryLockError<MutexGuard<'_, CachePoolReservation>>,
+                    MutexGuard<'_, Option<CachePoolReservation>>,
+                    TryLockError<MutexGuard<'_, Option<CachePoolReservation>>>,
                 >,
             >(),
             size_of::<(
@@ -519,3 +550,6 @@ impl DiskWriteOperation {
 #[cfg(test)]
 #[path = "operation/tests.rs"]
 mod tests;
+
+#[path = "operation/ordinary_retirement.rs"]
+mod ordinary_retirement;

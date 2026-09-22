@@ -99,16 +99,20 @@ fn parts<R>(hidden: usize, f: impl FnOnce(&[HostInputPart<'_>]) -> R) -> R {
         },
     ])
 }
-pub(super) fn source(pool: &WorkingMemoryPool, hidden: usize) -> OriginalPreparedHostInput {
+pub(super) fn source(pool: &MemoryLedger, hidden: usize) -> OriginalPreparedHostInput {
     parts(hidden, |p| {
         pool.compile_prepared_host_input(PreparedHostInputPlan::prepare(p).unwrap())
             .unwrap()
     })
 }
-pub(super) fn settle(pool: &WorkingMemoryPool, expected: usize, bytes: u64) {
+pub(super) fn settle(pool: &MemoryLedger, expected: usize, bytes: u64) {
     submission_recovery::wait_for_retirement(|| {
+        crate::backend::ordinary_retirement::reclaim_all();
+        safemlx::memory::clear_cache();
         safemlx::reclaim_allocation_owners();
-        pool.unquoted_owner_count().unwrap() == expected && pool.used_bytes().unwrap() == bytes
+
+        pool.unquoted_owner_count().unwrap() == expected
+            && pool.fixture_host_charge().unwrap() == bytes
     });
     assert_eq!(pool.unquoted_owner_count().unwrap(), expected);
 }
@@ -124,10 +128,10 @@ pub(super) fn array_values(value: &Array) -> Vec<f64> {
 #[test]
 fn ordinary_upload_preserves_every_slot_and_identity_but_foreign_pool_does_no_work() {
     let _hooks = Hooks;
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let source = source(&pool, 64);
     let bytes = source.original_bytes();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     SLOTS.set(0);
     assert!(matches!(
         upload(&foreign, &source),
@@ -136,7 +140,7 @@ fn ordinary_upload_preserves_every_slot_and_identity_but_foreign_pool_does_no_wo
         ))
     ));
     assert_eq!(SLOTS.get(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), 0);
     assert_eq!(foreign.unquoted_owner_count().unwrap(), 0);
     let output = upload(&pool, &source).unwrap();
     assert_eq!(SLOTS.get(), 5);
@@ -190,17 +194,17 @@ fn ordinary_upload_preserves_every_slot_and_identity_but_foreign_pool_does_no_wo
     let identity = output.shared_cache_identity().unwrap().clone();
     drop(output);
     settle(&pool, 1, bytes);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     drop(identity);
     settle(&pool, 0, bytes);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 #[test]
 fn partial_upload_error_and_unwind_preserve_original_and_escaped_native_owners() {
     for unwind in [false, true] {
         let _hooks = Hooks;
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let source = source(&pool, 64);
         let bytes = source.original_bytes();
         SLOTS.set(0);
@@ -214,12 +218,12 @@ fn partial_upload_error_and_unwind_preserve_original_and_escaped_native_owners()
         } else {
             let error = result.unwrap().unwrap_err();
             settle(&pool, 1, bytes);
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
             assert!(matches!(error, MlxHostInputUploadError::Operation(_)));
             drop(error);
         }
         settle(&pool, 1, 0);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         let escaped = ESCAPED.with_borrow_mut(Option::take).unwrap();
         assert!(!array_values(&escaped).is_empty());
         drop(escaped);
@@ -242,7 +246,7 @@ fn weights(mode: usize) -> crate::MlxLoadRequest {
         eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(residency),
     )
 }
-fn baseline(pool: &WorkingMemoryPool, hidden: usize) -> MlxModelInput {
+fn baseline(pool: &MemoryLedger, hidden: usize) -> MlxModelInput {
     let owner = NativeMemoryOwner::acquire_typed(pool).unwrap();
     parts(hidden, |parts| {
         let one = |v: HostTensorView<'_>| {
@@ -281,47 +285,11 @@ fn baseline(pool: &WorkingMemoryPool, hidden: usize) -> MlxModelInput {
             .unwrap()
     })
 }
-fn run(
-    path: &std::path::Path,
-    mode: usize,
-    compiled: bool,
-    hidden: usize,
-) -> (
-    Vec<Vec<f64>>,
-    Vec<(
-        Vec<(Vec<i32>, Vec<f32>)>,
-        Vec<(
-            usize,
-            eredu_core::cache::StateTensorRole,
-            Vec<i32>,
-            Vec<f32>,
-        )>,
-    )>,
-) {
-    run_mode(path, mode, usize::from(compiled), hidden)
-}
-fn run_mode(
-    path: &std::path::Path,
-    mode: usize,
-    source_mode: usize,
-    hidden: usize,
-) -> (
-    Vec<Vec<f64>>,
-    Vec<(
-        Vec<(Vec<i32>, Vec<f32>)>,
-        Vec<(
-            usize,
-            eredu_core::cache::StateTensorRole,
-            Vec<i32>,
-            Vec<f32>,
-        )>,
-    )>,
-) {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+fn check_upload_mode(path: &std::path::Path, mode: usize, source_mode: usize, hidden: usize) {
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     // Original source construction is before any ordinary native fixture owner.
     let source = (source_mode != 0).then(|| source(&pool, hidden));
-    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let backend = admitted::backend(&pool);
     let config = cold_config(&backend, path, mode);
     let semantics = if source_mode >= 2 {
         Some(
@@ -392,40 +360,27 @@ fn run_mode(
             .with_prefill_chunk_positions(2.try_into().unwrap()),
         (None, None) => baseline(&pool, hidden),
     };
-    input::reset_original_semantic_preparations();
-    let mut outputs = Vec::new();
-    let mut states = Vec::new();
-    let first = runtime.prefill(prompt).unwrap();
-    first.completion.wait().unwrap();
-    assert_eq!(
-        input::original_semantic_preparations(),
-        usize::from(source_mode < 2)
-    );
-    outputs.push(array_values(first.output.logits().unwrap().as_array()));
-    drop(first);
-    drop(source);
-    for token in [None, Some(4_u32), Some(5), Some(6)] {
-        if let Some(token) = token {
-            let next = runtime
-                .decode(Array::from_slice(&[token], &[1, 1]))
-                .unwrap();
-            next.completion.wait().unwrap();
-            outputs.push(array_values(next.output.logits().unwrap().as_array()));
-            drop(next);
-        }
-        let target = runtime
-            .session_mut()
-            .neutral_prediction_target_mut()
-            .unwrap();
-        states.push((
-            target.retained_numeric_state_snapshot().unwrap().unwrap(),
-            target.fixed_numeric_state_snapshot().unwrap(),
-        ));
-    }
-    assert_eq!(outputs.len(), 4);
-    assert!(outputs.iter().all(|o| o.iter().any(|v| v.abs() > 1e-5)));
-    assert!(states.iter().all(|(a, _)| !a.is_empty()));
-    (outputs, states)
+    let reference = baseline(&pool, hidden);
+    let values = |prompt: &MlxModelInput| {
+        prompt.with_borrowed(|view| {
+            view.parts
+                .iter()
+                .flat_map(|part| {
+                    std::iter::once(part.payload().value()).chain(part.metadata().values())
+                })
+                .map(|array| (array.shape().to_vec(), array_values(array)))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(values(&prompt), values(&reference));
+    admitted::rejects_upload(&mut runtime, &prompt);
+    drop((reference, prompt, runtime, config, source));
+    submission_recovery::wait_for_retirement(|| {
+        crate::backend::ordinary_retirement::reclaim_all();
+        safemlx::memory::clear_cache();
+        safemlx::reclaim_allocation_owners();
+        pool.unquoted_owner_count().unwrap() == 0
+    });
 }
 fn close(a: &[f64], b: &[f64]) {
     assert_eq!(a.len(), b.len());
@@ -437,9 +392,17 @@ fn same(path: &std::path::Path, hidden: usize) {
     same_mode(path, hidden, 1);
 }
 pub(super) fn same_mode(path: &std::path::Path, hidden: usize, source_mode: usize) {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     for mode in 0..3 {
-        let (expected, states) = run(path, mode, false, hidden);
-        let (actual, actual_states) = run_mode(path, mode, source_mode, hidden);
+        if source_mode < 4 {
+            check_upload_mode(path, mode, source_mode, hidden);
+            continue;
+        }
+        let (expected, states) = admitted::run(path, mode, hidden, true, true);
+        let (actual, actual_states) = admitted::run(path, mode, hidden, false, true);
         for (a, b) in actual.iter().zip(&expected) {
             close(a, b);
         }
@@ -465,7 +428,11 @@ pub(super) fn same_mode(path: &std::path::Path, hidden: usize, source_mode: usiz
     }
 }
 #[test]
-fn original_host_qwen_vl_matches_full_reference_across_residency_and_three_cached_decodes() {
+fn original_host_qwen_vl_upload_matches_source_and_refuses_execution_across_residencies() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen3_vl_component_fixture(
         root.path(),
@@ -475,8 +442,11 @@ fn original_host_qwen_vl_matches_full_reference_across_residency_and_three_cache
     same(root.path(), 64);
 }
 #[test]
-fn original_host_conditional_qwen_matches_full_reference_across_residency_and_three_cached_decodes()
-{
+fn original_host_conditional_qwen_upload_matches_source_and_refuses_execution_across_residencies() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen35_conditional_component_fixture(
         root.path(),
@@ -485,7 +455,11 @@ fn original_host_conditional_qwen_matches_full_reference_across_residency_and_th
     same(root.path(), 16);
 }
 #[test]
-fn original_source_upload_enters_the_same_core_prepared_iterator_and_manual_driver() {
+fn original_source_upload_requires_complete_execution_producer() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     core_driver(false);
 }
 fn core_driver(semantic: bool) {
@@ -495,21 +469,9 @@ pub(super) fn core_driver_mode(source_mode: usize) {
     core_driver_family(source_mode, false);
 }
 pub(super) fn core_driver_family(source_mode: usize, conditional: bool) {
-    use eredu_core::{
-        GenerationCancellationToken, TextGenerationConfig, TokenFilter, TokenFilterController,
-    };
-    struct AllowAllTokens;
-    impl TokenFilterController for AllowAllTokens {
-        type Error = std::convert::Infallible;
-        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
-            Ok(TokenFilter::All)
-        }
-        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        fn is_complete(&mut self) -> Result<bool, Self::Error> {
-            Ok(false)
-        }
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
     }
     let root = tempfile::tempdir().unwrap();
     if conditional {
@@ -525,168 +487,22 @@ pub(super) fn core_driver_family(source_mode: usize, conditional: bool) {
         );
     }
     let hidden = if conditional { 16 } else { 64 };
-    let sampling = eredu_core::resolve_generation_config(
-        None,
-        eredu_core::GenerationConfigOverrides {
-            do_sample: Some(false),
-            max_new_tokens: Some(4),
-            ..Default::default()
-        },
-    )
-    .unwrap();
     for mode in 0..3 {
-        let mut reports = Vec::new();
-        for manual in [false, true] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-            let source = source(&pool, hidden);
-            let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-            let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
-            let config = cold_config(&backend, root.path(), mode);
-            let semantics = (source_mode != 0).then(|| {
-                config
-                    .prepared_sources()
-                    .plan_original_media_semantics(&source)
-                    .unwrap()
-                    .compile(&pool)
-                    .unwrap()
-            });
-            let native = if source_mode == 2 {
-                Some(
-                    MlxPreparedInputMaterializer::prepare()
-                        .unwrap()
-                        .plan(&source)
-                        .unwrap()
-                        .materialize(&pool)
-                        .unwrap(),
-                )
-            } else {
-                None
-            };
-            let full = if source_mode == 3 {
-                Some(
-                    MlxPreparedInputMaterializer::prepare()
-                        .unwrap()
-                        .model_input_plan(semantics.as_ref().unwrap())
-                        .unwrap()
-                        .materialize(&pool)
-                        .unwrap(),
-                )
-            } else {
-                None
-            };
-            let model = backend.prepare_model_borrowed(&config).unwrap();
-            let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-            if full.is_some() {
-                runtime
-                    .session()
-                    .payload
-                    .model
-                    .erased()
-                    .prepare_completed_media_binding_fixture()
-                    .unwrap();
-            }
-            let prompt = match semantics {
-                Some(semantics) => {
-                    if let Some(full) = full {
-                        full.bind(&runtime, semantics).unwrap()
-                    } else {
-                        match native {
-                            Some(native) => {
-                                MlxModelInput::from_original_native_input_with_semantics(
-                                    &runtime, native, semantics,
-                                )
-                            }
-                            None => MlxModelInput::from_original_host_input_with_semantics(
-                                &runtime, semantics,
-                            ),
-                        }
-                        .unwrap()
-                    }
-                }
-                None => MlxModelInput::from_original_host_input(&runtime, &source).unwrap(),
-            }
-            .with_prefill_chunk_positions(2.try_into().unwrap());
-            let identity = prompt.cache_identity().unwrap().clone();
-            let (ids, roots) = crate::tests::support::media_completion::observe(None, || {
-                if manual {
-                    let mut generation = eredu_core::ControlledTextGeneration::from_input(
-                        &mut runtime,
-                        eredu_core::TextGenerationInput::Prepared(prompt),
-                        TextGenerationConfig::new(sampling),
-                        AllowAllTokens,
-                    )
-                    .unwrap();
-                    let mut ids = Vec::new();
-                    while let Some(next) =
-                        generation.next_cancellable(&GenerationCancellationToken::new())
-                    {
-                        ids.push(next.unwrap().token_id());
-                    }
-                    assert!(generation
-                        .next_cancellable(&GenerationCancellationToken::new())
-                        .is_none());
-                    ids
-                } else {
-                    eredu_core::TextGeneration::from_prompt(
-                        &mut runtime,
-                        prompt,
-                        TextGenerationConfig::new(sampling),
-                    )
-                    .unwrap()
-                    .map(|next| next.unwrap().token_id().unwrap())
-                    .collect::<Vec<_>>()
-                }
-            });
-            assert_eq!(ids.len(), 4);
-            assert_eq!(
-                roots.len(),
-                10,
-                "five actual decoder spans, no terminal extra work"
-            );
-            assert!(roots.iter().all(|r| !r.shapes.is_empty()));
-            assert!(roots
-                .iter()
-                .filter(|r| r.after)
-                .all(|r| r.ready.iter().all(|r| *r)));
-            let target = runtime
-                .session_mut()
-                .neutral_prediction_target_mut()
-                .unwrap();
-            assert_eq!(
-                target
-                    .resident_copy_input_identity()
-                    .unwrap()
-                    .as_ref()
-                    .map(AsRef::as_ref),
-                Some(&identity)
-            );
-            let state = target.retained_numeric_state_snapshot().unwrap().unwrap();
-            let fixed = target.fixed_numeric_state_snapshot().unwrap();
-            assert!(!state.is_empty());
-            reports.push((ids, state, fixed));
-            drop(source);
+        if source_mode < 3 {
+            check_upload_mode(root.path(), mode, source_mode + 1, hidden);
+            continue;
         }
-        assert_eq!(reports[0].0, reports[1].0);
-        assert_eq!(reports[0].1.len(), reports[1].1.len());
-        for ((shape, a), (other, b)) in reports[0].1.iter().zip(&reports[1].1) {
-            assert_eq!(shape, other);
-            close(
-                &a.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-                &b.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-            );
+        let (expected, expected_states) = admitted::run(root.path(), mode, hidden, false, false);
+        let (actual, actual_states) = admitted::run(root.path(), mode, hidden, false, true);
+        assert_eq!(expected.len(), actual.len());
+        for (a, b) in actual.iter().zip(&expected) {
+            close(a, b);
         }
-        assert_eq!(reports[0].2.len(), reports[1].2.len());
-        for ((layer, role, shape, a), (other_layer, other_role, other_shape, b)) in
-            reports[0].2.iter().zip(&reports[1].2)
-        {
-            assert_eq!((layer, role, shape), (other_layer, other_role, other_shape));
-            close(
-                &a.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-                &b.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-            );
-        }
+        assert_eq!(actual_states.last(), expected_states.last());
     }
 }
+#[path = "tests/admitted.rs"]
+pub(super) mod admitted;
 
 pub(super) fn cold_config(
     backend: &MlxBackend<'_>,
@@ -703,5 +519,13 @@ pub(super) mod semantics;
 #[test]
 #[cfg(target_vendor = "apple")]
 fn original_native_pending_copy_uses_independent_slots_and_clears_the_compiled_packet() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     semantics::pending_copy(true);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

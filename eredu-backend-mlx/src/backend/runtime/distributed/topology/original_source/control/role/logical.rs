@@ -264,7 +264,7 @@ where F: FnOnce(Array, &OriginalScopeObserver) -> Result<T, Error> {
                 let pair=Pair {input:previous,round,quote:quote.clone(),
                     claim:match first.take(){Some(first)=>first,None=>claim(owner.owner(),c)?},
                     owner:OriginalParallelControlOwner(owner.0.clone()),custody:c.clone()};
-                let outputs=run_native_role(pair,capacity,&owner.owner().bank,&owner.owner().controls,c,
+                let outputs=run_native_role(pair,capacity,&owner.owner().native,c,
                     |pair,observer|Ok(pair.run(observer)))
                     .map_err(|cause|Error::with_original_control_source(cause,false))??;
                 run_arithmetic(&owner,quote.clone(),ArithmeticStage::Peer,outputs,stream,c)
@@ -511,8 +511,7 @@ where F:FnOnce(Array,&OriginalScopeObserver)->Result<T,Error>{
         plan,
         capacity,
         Some(safemlx::PreparedPipelineCachePlan::new(kernels)),
-        &owner.owner().bank,
-        &owner.owner().controls,
+        &owner.owner().native,
         c,
         |plan, observer| Ok(plan.run(observer).and_then(|value| finish(value, observer))),
     )
@@ -798,7 +797,7 @@ pub(super) fn execute_count_route_step(owner: &OriginalParallelControlOwner,
     let pair = Pair { input, round: 0, quote: quote.clone(),
         claim: match first { Some(first) => first, None => claim(owner.owner(), c)? },
         owner: OriginalParallelControlOwner(owner.0.clone()), custody: c.clone() };
-    let outputs = run_native_role(pair, capacity, &owner.owner().bank, &owner.owner().controls, c,
+    let outputs = run_native_role(pair, capacity, &owner.owner().native, c,
         |pair, observer| Ok(pair.run(observer))).map_err(|cause| Error::with_original_control_source(cause, false))??;
     run_arithmetic_finish(owner, quote, ArithmeticStage::Peer, outputs, stream, c, |output, observer| {
         let source = owner.owner().request.source.communication_source()?;

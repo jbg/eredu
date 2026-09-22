@@ -1,0 +1,203 @@
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows, Uint32Rows, Float16MaximumRows, Bfloat16MaximumRows };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows, Float32MaximumRows, Float32StridedRows, Uint32Rows, Float16MaximumRows, Bfloat16MaximumRows, Int32FlatSum };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -35,7 +35,7 @@
+       if(width<=1)return false;break;
+     case ReductionEvalKind::Uint32Rows:
+       if(rank<2||width<=1)return false;break;
+-    case ReductionEvalKind::Uint32FlatSum:
++    case ReductionEvalKind::Uint32FlatSum:case ReductionEvalKind::Int32FlatSum:
+       if(rank!=1||rows!=1||width<=1)return false;break;
+     case ReductionEvalKind::Float32FlatMaximum:
+       if(rank>3||rows!=1||width<=1)return false;break;
+@@ -48,7 +48,7 @@
+   const size_t controls=sizeof(kind)+sizeof(rank)+sizeof(width)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
+       sizeof(elements)+sizeof(bytes)+sizeof(dispatch)+sizeof(common)+sizeof(value)+
+       sizeof(const array*)*3+sizeof(const Reduce*)+sizeof(const Shape*)+
+-      sizeof(size_t)*15+sizeof(bool)*4+sizeof(int)*3+sizeof(Reduce::ReduceType)+sizeof(Dtype)+
++      sizeof(size_t)*15+sizeof(bool)*5+sizeof(int)*3+sizeof(Reduce::ReduceType)+sizeof(Dtype)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   // The nonfinal source additionally checks its one selected axis and the
+@@ -81,10 +81,10 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(axes[axis]!=int(axis)||output.shape(axis)!=1)return false;
+     selected=kind==Reduce::And?ReductionEvalKind::BooleanAll:ReductionEvalKind::BooleanAny;
+-  } else if((kind==Reduce::Sum&&input.dtype()==uint32&&rank==1)||(kind==Reduce::Max&&input.dtype()==float32&&rank<=3&&output.size()==1)) {
++  } else if((kind==Reduce::Sum&&(input.dtype()==uint32||input.dtype()==int32)&&rank==1)||(kind==Reduce::Max&&input.dtype()==float32&&rank<=3&&output.size()==1)) {
+     // The summary count/extremum source is a complete rank-one buffer. This
+     // proves the ordinary ContiguousAllReduce path before admitting its task.
+-    const Dtype dtype=kind==Reduce::Sum?uint32:float32;
++    const Dtype dtype=kind==Reduce::Sum?input.dtype():float32;
+     if((kind==Reduce::Sum?rank!=1:rank>3)||input.dtype()!=dtype||output.dtype()!=dtype||input.itemsize()!=4||output.itemsize()!=4||
+         axes.size()!=1||axes[0]!=int(rank)-1||output.size()!=1||elements<=1||
+         !input.flags().contiguous||input.data_size()!=elements||span!=elements)return false;
+@@ -92,7 +92,9 @@
+     // body: every logical element is reduced and no strided-row plan remains.
+     for(size_t axis=0;axis<rank;++axis)
+       if(output.shape(axis)!=1||(axis+1<rank&&input.shape(axis)!=1))return false;
+-    selected=kind==Reduce::Sum?ReductionEvalKind::Uint32FlatSum:ReductionEvalKind::Float32FlatMaximum;
++    selected=kind==Reduce::Sum?
++        (dtype==int32?ReductionEvalKind::Int32FlatSum:ReductionEvalKind::Uint32FlatSum):
++        ReductionEvalKind::Float32FlatMaximum;
+   } else if(kind==Reduce::Sum&&input.dtype()==uint32) {
+     // The compact final axis produces the ordinary one-row ContiguousReduce
+     // plan. Keep the native U32 input and I32 accumulator representation.
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -688,6 +688,7 @@
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+     case ReductionEvalKind::Float32Rows:case ReductionEvalKind::Float32MinimumRows:
+     case ReductionEvalKind::Float32All:case ReductionEvalKind::Uint32FlatSum:
++    case ReductionEvalKind::Int32FlatSum:
+     case ReductionEvalKind::Float32FlatMaximum:case ReductionEvalKind::Float32MaximumRows:
+     case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
+     case ReductionEvalKind::Float32StridedRows:case ReductionEvalKind::Uint32Rows:
+@@ -753,6 +754,12 @@
+       sizeof(simd::Simd<uint32_t,uint_sum_lanes>)*2+sizeof(simd::Simd<int32_t,uint_sum_lanes>)*4+
+       sizeof(uint32_t)*3+sizeof(int32_t)*4+sizeof(const uint32_t*)*3+sizeof(int32_t*)*3+
+       sizeof(int)*4+sizeof(size_t)*3;
++  // The histogram validation sum preserves the selected signed I32 loads,
++  // accumulator and output of the same ContiguousAllReduce worker.
++  constexpr int int_sum_lanes=simd::max_size<int32_t>;
++  const size_t int_sum=sizeof(ReductionPlan)*2+sizeof(AxisView)*3+sizeof(SumReduce)*3+
++      sizeof(simd::Simd<int32_t,int_sum_lanes>)*6+sizeof(int32_t)*7+
++      sizeof(const int32_t*)*3+sizeof(int32_t*)*3+sizeof(int)*4+sizeof(size_t)*3;
+   // A compact U32 final axis uses the same mixed U32/I32 accumulator as
+   // the flat source, plus the inline one-axis plan and contiguous-row loop.
+   const size_t uint_rows=uint_sum+sizeof(Shape)*2+sizeof(Strides)*2+
+@@ -771,12 +778,13 @@
+           kind==ReductionEvalKind::Float32All?sum_all:
+           kind==ReductionEvalKind::Float32StridedRows?nonfinal_rows:
+           kind==ReductionEvalKind::Uint32FlatSum?uint_sum:
++          kind==ReductionEvalKind::Int32FlatSum?int_sum:
+           kind==ReductionEvalKind::Uint32Rows?uint_rows:
+           kind==ReductionEvalKind::Float32FlatMaximum?maximum:boolean,
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)+sizeof(maximum_rows)+sizeof(strided_rows)+sizeof(nonfinal_rows)+sizeof(uint_rows)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)+sizeof(maximum_rows)+sizeof(strided_rows)+sizeof(nonfinal_rows)+sizeof(uint_rows)+sizeof(int_sum_lanes)+sizeof(int_sum)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;
+diff --git a/mlx/backend/cpu/scatter_storage.h b/mlx/backend/cpu/scatter_storage.h
+--- a/mlx/backend/cpu/scatter_storage.h
++++ b/mlx/backend/cpu/scatter_storage.h
+@@ -17,6 +17,9 @@
+ // zero updates. A nonempty destination always keeps its possible copy birth.
+ MLX_API bool scatter_add_rows_eval_layout(Dtype index,size_t output_elements,
+     size_t update_elements,bool tracer,CopyEvalStorage&) noexcept;
++// The actual I32 rank-one histogram uses the same copy/ScatterAxis sum tasks.
++MLX_API bool int32_histogram_eval_layout(Dtype index,size_t output_elements,
++    size_t update_elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_scatter_axis_eval_primitive(const array&) noexcept;
+ MLX_API bool scatter_axis_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }
+diff --git a/mlx/backend/cpu/scatter_storage.cpp b/mlx/backend/cpu/scatter_storage.cpp
+--- a/mlx/backend/cpu/scatter_storage.cpp
++++ b/mlx/backend/cpu/scatter_storage.cpp
+@@ -99,10 +99,10 @@
+   return scatter_eval_layout(source.dtype(),index.dtype(),rank,source_elements,update_elements,output.is_tracer(),out);
+ }
+ static bool scatter_axis_worker_layout(Dtype index,size_t rank,size_t output_elements,
+-    size_t update_elements,bool tracer,bool row_sum,CopyEvalStorage& out) noexcept {
++    size_t update_elements,bool tracer,unsigned sum_rank,CopyEvalStorage& out) noexcept {
+   if(!((index==int32&&index.size()==4)||(index==uint32&&index.size()==4))||rank<1||rank>4||
+       !output_elements||output_elements>size_t(INT_MAX)||output_elements>size_t(PTRDIFF_MAX)/sizeof(float)||
+-      (!row_sum&&!update_elements)||(row_sum&&rank!=2)||
++      (!sum_rank&&!update_elements)||(sum_rank&&rank!=sum_rank)||
+       update_elements>size_t(INT_MAX)||update_elements>size_t(PTRDIFF_MAX)/sizeof(float))return false;
+   CopyEvalStorage value;
+   // Exactly one Eval cleanup retains all three inputs through both queued jobs.
+@@ -125,7 +125,7 @@
+   if(!add(value.worker_graph_extents,scatter.worker_graph_extents))return false;
+   const auto adoption=array::buffer_adoption_layout();
+   const size_t controls[]={sizeof(value)*2,sizeof(out),sizeof(index),sizeof(rank),sizeof(output_elements),
+-      sizeof(update_elements),sizeof(tracer),sizeof(row_sum),sizeof(copy),sizeof(scatter),sizeof(weak),sizeof(routing),
++      sizeof(update_elements),sizeof(tracer),sizeof(sum_rank),sizeof(copy),sizeof(scatter),sizeof(weak),sizeof(routing),
+       sizeof(allocation_controls),sizeof(adoption),sizeof(first),sizeof(second),sizeof(birth),
+       copy.controls,scatter.controls,weak.controls,weak.controls,weak.controls,weak.controls,weak.controls,
+       sizeof(std::function<allocator::Buffer(size_t)>)*2,sizeof(allocator::Buffer)*2,
+@@ -133,7 +133,7 @@
+       sizeof(Shape),sizeof(Strides),sizeof(array::Flags),sizeof(CopyType),sizeof(Stream),sizeof(bool),
+       adoption.incoming_bytes,adoption.scratch_owner_bytes,adoption.deleter_bytes,
+       adoption.allocator_callable_bytes,adoption.prepared_strides_bytes,allocation_controls,
+-      sizeof(const array*)*6,sizeof(const ScatterAxis*),sizeof(size_t)*11,sizeof(int)*3,sizeof(bool)*3,
++      sizeof(const array*)*6,sizeof(const ScatterAxis*),sizeof(size_t)*12,sizeof(int)*3,sizeof(bool)*4,
+       sizeof(std::pair<ScatterAxis::ReduceType,int>),sizeof(submission::FixedEvalPrologueGuard*),
+       sizeof(submission::Record*),sizeof(submission::GraphQuota*),
+       sizeof(submission::GraphConstructionContext),sizeof(submission::GraphFailure),
+@@ -149,18 +149,22 @@
+ // iterator layouts are shared. The F32 extent check also bounds Bool extents.
+ bool scatter_axis_eval_layout(Dtype index,size_t rank,size_t output_elements,
+     size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  return scatter_axis_worker_layout(index,rank,output_elements,update_elements,tracer,false,out);
++  return scatter_axis_worker_layout(index,rank,output_elements,update_elements,tracer,0,out);
+ }
+ bool scatter_add_rows_eval_layout(Dtype index,size_t output_elements,
+     size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  return scatter_axis_worker_layout(index,2,output_elements,update_elements,tracer,true,out);
++  return scatter_axis_worker_layout(index,2,output_elements,update_elements,tracer,2,out);
++}
++bool int32_histogram_eval_layout(Dtype index,size_t output_elements,
++    size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
++  return scatter_axis_worker_layout(index,1,output_elements,update_elements,tracer,1,out);
+ }
+ namespace {
+ bool scatter_input_geometry(const array& input,size_t& elements) noexcept {
+   if(input.size()!=0)return alias_input_geometry(input,elements);
+-  if(input.ndim()!=2||input.strides().size()!=2||input.data_size()!=0)return false;
++  if(input.ndim()<1||input.ndim()>2||input.strides().size()!=size_t(input.ndim())||input.data_size()!=0)return false;
+   elements=1;
+-  for(size_t axis=0;axis!=2;++axis) {
++  for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
+     if(input.shape(axis)<0||input.strides()[axis]<0||
+         (input.shape(axis)&&elements>size_t(PTRDIFF_MAX)/size_t(input.shape(axis))))return false;
+     elements*=size_t(input.shape(axis));
+@@ -178,23 +182,25 @@
+   const size_t rank=source.ndim();const auto state=static_cast<const ScatterAxis&>(output.primitive()).state();
+   size_t source_elements=0,index_elements=0,update_elements=0;
+   const bool row_sum=state.first==ScatterAxis::Sum&&state.second==0&&rank==2;
++  const bool histogram=state.first==ScatterAxis::Sum&&state.second==0&&rank==1;
+   if(rank<1||rank>4||output.ndim()!=rank||index.ndim()!=rank||updates.ndim()!=rank||
+-      (!row_sum&&(state.first!=ScatterAxis::None||state.second!=int(rank)-1))||
+-      !((source.dtype()==float32&&source.itemsize()==sizeof(float))||
+-        (!row_sum&&source.dtype()==bool_&&source.itemsize()==sizeof(bool)))||
++      (!row_sum&&!histogram&&(state.first!=ScatterAxis::None||state.second!=int(rank)-1))||
++      !((!histogram&&source.dtype()==float32&&source.itemsize()==sizeof(float))||
++        (!row_sum&&!histogram&&source.dtype()==bool_&&source.itemsize()==sizeof(bool))||
++        (histogram&&source.dtype()==int32&&source.itemsize()==sizeof(int32_t)))||
+       updates.dtype()!=source.dtype()||updates.itemsize()!=source.itemsize()||
+       output.dtype()!=source.dtype()||output.itemsize()!=source.itemsize()||
+       source.shape()!=output.shape()||updates.shape()!=index.shape()||
+       !alias_input_geometry(source,source_elements)||
+-      !(row_sum?scatter_input_geometry(index,index_elements):alias_input_geometry(index,index_elements))||
+-      !(row_sum?scatter_input_geometry(updates,update_elements):alias_input_geometry(updates,update_elements))||
++      !((row_sum||histogram)?scatter_input_geometry(index,index_elements):alias_input_geometry(index,index_elements))||
++      !((row_sum||histogram)?scatter_input_geometry(updates,update_elements):alias_input_geometry(updates,update_elements))||
+       source_elements!=output.size()||index_elements!=update_elements)return false;
+   for(size_t axis=0;axis!=rank;++axis) {
+-    if(source.shape(axis)<=0||index.shape(axis)<0||(!row_sum&&index.shape(axis)==0)||
++    if(source.shape(axis)<=0||index.shape(axis)<0||(!row_sum&&!histogram&&index.shape(axis)==0)||
+         (axis!=size_t(state.second)&&source.shape(axis)!=index.shape(axis)))return false;
+   }
+   return scatter_axis_worker_layout(index.dtype(),rank,source_elements,update_elements,
+-      output.is_tracer(),row_sum,out);
++      output.is_tracer(),row_sum?2:histogram?1:0,out);
+ }
+ }
+ namespace mlx::core::submission {

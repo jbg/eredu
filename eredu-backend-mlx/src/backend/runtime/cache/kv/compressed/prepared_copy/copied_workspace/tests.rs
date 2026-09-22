@@ -1,8 +1,8 @@
 use super::*;
 use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceOperationKind, WorkspaceTensor},
     CompressedAttentionCache, CompressedAttentionState, Tensor,
+    workspace::{WorkspaceContext, WorkspaceOperationKind, WorkspaceTensor},
 };
 use safemlx::{Device, DeviceType, Stream};
 use std::{
@@ -175,11 +175,13 @@ fn detached_four_root_source_projects_two_compact_destinations_and_matches_cache
             (copied.offset(), copied.capacity()),
             (native.offset(), native.capacity())
         );
-        assert!(context
-            .report(&copied.retained_arrays().cloned().collect::<Vec<_>>())
-            .unwrap()
-            .total_bytes
-            .is_some());
+        assert!(
+            context
+                .report(&copied.retained_arrays().cloned().collect::<Vec<_>>())
+                .unwrap()
+                .total_bytes
+                .is_some()
+        );
         let (latent, rotary) = native.arrays().unwrap();
         assert_eq!(values(latent, &stream), payload(0, native.offset(), 8));
         assert_eq!(values(rotary, &stream), payload(0, native.offset(), 4));
@@ -249,14 +251,16 @@ fn unknown_source_stays_unknown_and_wrong_geometry_rejects_without_native_work()
             .square(&stream)
             .unwrap(),
     );
-    assert!(source
-        .latent_storage
-        .as_ref()
-        .unwrap()
-        .try_metadata_snapshot()
-        .unwrap()
-        .allocation()
-        .is_none());
+    assert!(
+        source
+            .latent_storage
+            .as_ref()
+            .unwrap()
+            .try_metadata_snapshot()
+            .unwrap()
+            .allocation()
+            .is_none()
+    );
     source.latent = source.latent_storage.clone();
     source.rotary_key = source.rotary_key_storage.clone();
     source.offset = 3;
@@ -269,9 +273,10 @@ fn unknown_source_stays_unknown_and_wrong_geometry_rejects_without_native_work()
     let mut roots = Vec::new();
     plan.visit_retained_arrays(&mut |array| roots.push(projection.project(array).unwrap()));
     context.begin_state_span(&roots).unwrap();
-    assert!(plan
-        .project_copied_workspace(nz(1), nz(8), nz(4), &mut projection)
-        .is_err());
+    assert!(
+        plan.project_copied_workspace(nz(1), nz(8), nz(4), &mut projection)
+            .is_err()
+    );
     assert!(context.report(&roots).unwrap().operations.is_empty());
     let copy = plan
         .project_copied_workspace(nz(2), nz(8), nz(4), &mut projection)

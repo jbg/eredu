@@ -15,6 +15,13 @@ pub enum WorkspaceBound {
         /// Selected implementation, representation and lifetime assumptions.
         assumptions: String,
     },
+    /// Complete per-domain requirements are available, while their aggregate
+    /// cannot be represented by one u64 diagnostic. This grants no authority
+    /// without the matching attributed report.
+    PerDomain {
+        /// Selected placement and simultaneous lifetime estimation basis.
+        assumptions: String,
+    },
     /// The selected implementation has no proved bound for this component.
     Unknown {
         /// Missing mechanism or geometry detail.
@@ -36,7 +43,7 @@ impl WorkspaceBound {
     pub const fn bytes(&self) -> Option<u64> {
         match self {
             Self::Bounded { bytes, .. } => Some(*bytes),
-            Self::Unknown { .. } => None,
+            Self::Unknown { .. } | Self::PerDomain { .. } => None,
         }
     }
 }
@@ -49,6 +56,10 @@ impl WorkspaceBound {
 /// process memory are not guaranteed by an Eredu-managed working-memory bound.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionWorkspaceEstimate {
+    /// Physical attribution from the same selected allocation-lifetime trace.
+    /// Process-local topology identities cannot be restored from diagnostics.
+    #[serde(skip)]
+    pub physical_domains: Option<DomainExecutionWorkspaceEstimate>,
     /// Exact request and chunk geometry priced by these bounds.
     pub geometry: InferenceGeometry,
     /// Layer inputs, outputs, MLP intermediates and recurrent work arrays.
@@ -63,6 +74,64 @@ pub struct ExecutionWorkspaceEstimate {
     pub materialization: WorkspaceBound,
     /// Prediction, observation and snapshot resources not counted elsewhere.
     pub retained: WorkspaceBound,
+}
+
+/// Simultaneous execution requirements resolved before allocation sums.
+/// Missing this report is an attribution gap under every limit mode.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DomainExecutionWorkspaceEstimate {
+    /// Exact request geometry priced by the selected mechanism.
+    pub geometry: InferenceGeometry,
+    /// Complete activation lifetimes, retaining candidate-placement allowances.
+    pub activations: crate::DomainMemoryRequirements,
+    /// Attention allocations and scratch beyond activation storage.
+    pub attention: crate::DomainMemoryRequirements,
+    /// Vocabulary and sampling allocations.
+    pub vocabulary: crate::DomainMemoryRequirements,
+    /// Additional state growth, copies and rollback versions.
+    pub state_update: crate::DomainMemoryRequirements,
+    /// Materialization, transfers and communication allocations.
+    pub materialization: crate::DomainMemoryRequirements,
+    /// Observation, host controls and other retained request storage.
+    pub retained: crate::DomainMemoryRequirements,
+}
+impl DomainExecutionWorkspaceEstimate {
+    /// Checked simultaneous sum independently in every physical domain.
+    pub fn requirements(
+        &self,
+    ) -> Result<crate::DomainMemoryRequirements, crate::MemoryDomainError> {
+        self.activations
+            .checked_add(&self.attention)?
+            .checked_add(&self.vocabulary)?
+            .checked_add(&self.state_update)?
+            .checked_add(&self.materialization)?
+            .checked_add(&self.retained)
+    }
+}
+
+/// Actual persistent and media allocation placement for one selected request.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DomainRuntimeStateEstimate {
+    /// Exact requested state/media geometry.
+    pub geometry: InferenceGeometry,
+    /// Complete canonical retained state graph, including capacity and distinct
+    /// copies. A complete media traversal includes its retained source/cache
+    /// roots here; the separate media terms then contain only additional owners.
+    pub decoder_state: crate::DomainMemoryRequirements,
+    /// Additional media embeddings outside the selected canonical state graph.
+    pub media_embeddings: crate::DomainMemoryRequirements,
+    /// Additional media execution overlap outside the selected equation trace.
+    pub media_workspace: crate::DomainMemoryRequirements,
+}
+impl DomainRuntimeStateEstimate {
+    /// Checked simultaneous sum without an aggregate physical-memory amount.
+    pub fn requirements(
+        &self,
+    ) -> Result<crate::DomainMemoryRequirements, crate::MemoryDomainError> {
+        self.decoder_state
+            .checked_add(&self.media_embeddings)?
+            .checked_add(&self.media_workspace)
+    }
 }
 
 impl ExecutionWorkspaceEstimate {

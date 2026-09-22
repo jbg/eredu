@@ -95,12 +95,17 @@ pub enum CheckpointMaterializationError {
     /// Prepared acquisition failure retaining its actual source/destination and custody.
     #[error(transparent)]
     PreparedAcquisition(#[from] PreparedSourceAcquisitionFailure),
+    /// The ordinary constructor's paid native recovery could not be entered.
+    #[error("funded checkpoint recovery: {0:?}")]
+    HostScope(#[source] safemlx::SubmissionScopeOwnerCause),
     /// Original native fixed cause, without a formatted key/error shell.
     #[error("original checkpoint operation: {0}")]
     OriginalNative(#[source] safemlx::error::Exception),
     /// Exact post-payload registered-role retirement refusal.
     #[error("original checkpoint retirement: {0}")]
-    OriginalRetirement(#[from] crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause),
+    OriginalRetirement(
+        #[from] crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause,
+    ),
     /// Explicit original operation did not match its registered current role.
     #[error("original checkpoint operation domain mismatch")]
     OriginalOperationDomain,
@@ -310,8 +315,8 @@ use leases::WeightLeaseSource;
 mod tests;
 
 pub(crate) use materialization::{
-    ColdMaterializationSlot, ColdMaterializationSlotError, PreparedMaterializationObservation, PreparedPendingWeight,
-    PreparedWeightMaterialization,
+    ColdMaterializationSlot, ColdMaterializationSlotError, PreparedMaterializationObservation,
+    PreparedPendingWeight, PreparedWeightMaterialization,
 };
 
 pub(crate) use materialization::{MaterializationPayloadShape, OriginalMaterializationSlots};
@@ -320,14 +325,14 @@ mod acquisition;
 pub use acquisition::PreparedSourceAcquisitionFailure;
 pub(crate) use acquisition::PreparedSourceAcquisitions;
 
-mod prepared_streams;
 mod encoded_input;
+mod prepared_streams;
 pub(crate) use encoded_input::{EncodedInputConstructionError, PreparedEncodedInputPlan};
 mod source_stream;
 pub use prepared_streams::PreparedMaterializationStreamError;
 pub(crate) use prepared_streams::{
     ManagerMaterializationContext, PreparedMaterializationStreams,
-    prepare_one_materialization_stream, prepare_materialization_stream_from_plan,
+    prepare_materialization_stream_from_plan, prepare_one_materialization_stream,
 };
 pub use source_stream::{
     MaterializationSourceStreamError, MaterializationSourceWorkerError,

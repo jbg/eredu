@@ -3,8 +3,8 @@ use super::*;
 use crate::HostPreparationAuthority;
 use crate::{
     backend::SharedStorageCustody, ObservationRequirement, ObservationValueType,
-    SharedStorageAttachmentError, SharedStorageDomain, SharedStorageIdentity, SharedStorageOwner,
-    SharedStorageRetirement, TensorAxis,
+    SharedStorageAccountingId, SharedStorageAttachmentError, SharedStorageIdentity,
+    SharedStorageOwner, SharedStorageRetirement, TensorAxis,
 };
 use std::{
     fmt,
@@ -52,7 +52,7 @@ impl Drop for PlanOwner {
             if let Some(mut inner) = Arc::into_inner(tail.0.take().expect("live capture source")) {
                 pending = inner.predecessor.take().map(|source| source.0);
                 // All strong exits consume their Arc; no Weak/raw owner escapes.
-                // Arc/control deallocation precedes payload, attachment Vec and
+                // Arc/control deallocation precedes payload, attachment nodes and
                 // finally ordinary custody retirement.
                 #[cfg(test)]
                 if let Some(flag) = &inner.shell_retired {
@@ -108,19 +108,26 @@ impl SharedCapturePlan {
         }))))
     }
 
-    pub(super) fn from_prepared_copy(plan: AdmittedCapturePlan, host: HostPreparationAuthority,
-        predecessor: Option<SharedCapturePlan>) -> Self {
+    pub(super) fn from_prepared_copy(
+        plan: AdmittedCapturePlan,
+        host: HostPreparationAuthority,
+        predecessor: Option<SharedCapturePlan>,
+    ) -> Self {
         Self(PlanOwner(Some(Arc::new(Inner {
             plan,
             predecessor,
-            #[cfg(test)] retired: None,
+            #[cfg(test)]
+            retired: None,
             custody: SharedStorageCustody::new(),
-            #[cfg(test)] shell_retired: None,
-            #[cfg(test)] custody_retired: None,
+            #[cfg(test)]
+            shell_retired: None,
+            #[cfg(test)]
+            custody_retired: None,
             ordinary: Mutex::new(Some(OrdinaryHostOwner(Some(Arc::new(OrdinaryHostNode {
                 previous: None,
                 _incoming: host,
-                #[cfg(test)] allocation_retired: None,
+                #[cfg(test)]
+                allocation_retired: None,
             }))))),
         }))))
     }
@@ -195,7 +202,11 @@ impl SharedCapturePlan {
     /// This owner was built by the checked limit-revision compiler from this
     /// exact predecessor. Equal declarations or digests provide no such proof.
     pub fn is_limit_revision_of(&self, source: &Self) -> bool {
-        self.0.get().predecessor.as_ref().is_some_and(|parent| parent.same_storage(source))
+        self.0
+            .get()
+            .predecessor
+            .as_ref()
+            .is_some_and(|parent| parent.same_storage(source))
     }
 
     /// Exact predecessor retained by the closed limit-revision compiler.
@@ -217,7 +228,7 @@ impl SharedCapturePlan {
     /// Attach custody once per exact accounting domain, including earlier aliases.
     ///
     /// An existing domain returns false without invoking the provider. Otherwise
-    /// the publication slot is reserved before acquisition. Rejection preserves
+    /// the prepaid publication node is allocated after acquisition. Rejection preserves
     /// earlier attachments. Provider errors retain their concrete cause.
     /// The provider runs under the custody lock and must perform only closed
     /// accounting: no owner reentry, native work or user callbacks. Its handle
@@ -226,7 +237,7 @@ impl SharedCapturePlan {
     /// and outside its lock. An acquisition panic poisons subsequent attachment.
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.0.get().custody.try_attach(domain, acquire)
@@ -234,11 +245,10 @@ impl SharedCapturePlan {
 
     /// Nonblocking form of [`Self::try_attach`]. Busy never invokes the provider
     /// or changes attachments. All provider/lifetime rules are identical.
-    /// The existing per-domain custody Vec may reserve metadata before provider
-    /// acquisition; this method does not make that bookkeeping allocation-free.
+    /// A new accounting owner needs one prepaid map node; reuse allocates nothing.
     pub fn try_attach_nonblocking<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.0.get().custody.try_attach_nonblocking(domain, acquire)
@@ -250,11 +260,11 @@ impl SharedCapturePlan {
     /// The provider obeys the closed-accounting restrictions of try_attach and
     /// must borrow staged resources; consumed closure captures may not run user
     /// destructors under custody. Unused closures and returned errors retire
-    /// outside the lock. Existing metadata may reserve before acquisition; owner
+    /// outside the lock. The prepared node is allocated after acquisition; owner
     /// erasure/lookup/clone add no allocation. No funding or completion is implied.
     pub fn try_attach_owned_nonblocking<T: SharedStorageRetirement, E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<SharedStorageOwner<T>, E>,
     ) -> Result<SharedStorageOwner<T>, SharedStorageAttachmentError<E>> {
         self.0
@@ -263,12 +273,12 @@ impl SharedCapturePlan {
             .try_attach_owned_nonblocking(domain, acquire)
     }
 
-    /// Actual fixed attachment element and owned-dispatch/retirement controls.
-    /// The concrete payload/header, metadata Vec capacity, source outer owner
-    /// and allocator internals remain separate original facts. This checked
+    /// One attachment node and the addressable insertion/retirement controls,
+    /// including the actual provider error type. The concrete payload/header,
+    /// source outer owner and allocator internals remain separate facts. This checked
     /// diagnostic allocates nothing and grants no memory or execution authority.
-    pub fn owned_attachment_control_bytes<T: SharedStorageRetirement>() -> Option<usize> {
-        SharedStorageCustody::owned_attachment_control_bytes::<T>()
+    pub fn owned_attachment_control_bytes<T: SharedStorageRetirement, E>() -> Option<usize> {
+        SharedStorageCustody::owned_attachment_control_bytes::<T, E>()
     }
 
     /// Retain or retrieve the exact typed owner attached in this domain.
@@ -279,7 +289,7 @@ impl SharedCapturePlan {
     /// aliases are added; no typed wrapper is allocated inside the custody lock.
     pub fn try_attach_typed_nonblocking<T: Send + Sync + 'static, E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Arc<T>, E>,
     ) -> Result<Arc<T>, SharedStorageAttachmentError<E>> {
         self.0

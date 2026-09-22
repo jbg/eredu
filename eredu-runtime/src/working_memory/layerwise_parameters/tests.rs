@@ -1,11 +1,11 @@
 use super::*;
-use crate::parameter::{bind_parameter_values, ParameterOrchestrationError};
+use crate::parameter::{ParameterOrchestrationError, bind_parameter_values};
 use eredu_nn::{
+    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
     workspace::{
         WorkspaceContext, WorkspaceDtype, WorkspaceExistingStorage, WorkspaceLayout,
         WorkspaceMechanisms, WorkspaceOperation, WorkspaceOperationBound,
     },
-    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
 };
 use std::{cell::Cell, error::Error as _};
 
@@ -34,25 +34,30 @@ impl Slots {
         }
     }
 }
-fn spec(name: &str) -> ParameterSpec { ParameterSpec::trainable(name).unwrap() }
+fn spec(name: &str) -> ParameterSpec {
+    ParameterSpec::trainable(name).unwrap()
+}
 
 impl Parameterized<WorkspaceTensor> for Slots {
-    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, WorkspaceTensor>>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
- let mut __source_result = Ok(());
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, WorkspaceTensor>>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), eredu_nn::ParameterSourceError> {
+        let mut __source_result = Ok(());
 
         for (id, value) in self.immutable.iter().zip(&self.values) {
-            visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(id,true), value);
+            visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(id, true), value);
         }
 
- __source_result
-}
+        __source_result
+    }
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, WorkspaceTensor>>(
         &'a mut self,
         visitor: &mut V,
     ) {
         for (id, value) in self.mutable.iter().zip(&mut self.values) {
             if let Some(id) = id {
-                visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(id,true), value);
+                visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(id, true), value);
             }
         }
     }
@@ -190,7 +195,8 @@ fn changed_mutable_topology_rejects_before_publication() {
         let mut module = Slots::new(&context);
         module.mutable[1] = (!missing).then(|| spec("unexpected"));
         context.begin_state_span([]).unwrap();
-        let error = bind_workspace_parameters(&mut module, weights(&context), |_| false).unwrap_err();
+        let error =
+            bind_workspace_parameters(&mut module, weights(&context), |_| false).unwrap_err();
         let ParameterOrchestrationError::ParameterTraversalMismatch { parameters } = cause(&error)
         else {
             panic!("wrong failure: {error}");
@@ -259,11 +265,13 @@ fn unknown_and_sublogical_backing_remain_provider_facts_after_binding() {
     .unwrap();
     assert_eq!(retained(&context, &module.values[..1]), Some(4));
     assert_eq!(retained(&context, &module.values), None);
-    assert!(context
-        .report(&module.values)
-        .unwrap()
-        .operations
-        .is_empty());
+    assert!(
+        context
+            .report(&module.values)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
 }
 
 #[test]
@@ -311,44 +319,79 @@ fn empty_modules_accept_only_empty_bindings() {
 
 #[test]
 fn finite_workspace_rows_reject_late_mismatch_then_publish_shared_aliases_atomically() {
-    struct PreparedSlots { specs: [ParameterSpec;2], values: [WorkspaceTensor;2] }
+    struct PreparedSlots {
+        specs: [ParameterSpec; 2],
+        values: [WorkspaceTensor; 2],
+    }
     impl Parameterized<WorkspaceTensor> for PreparedSlots {
-        fn visit_parameter_sources<'a,V:eredu_nn::ParameterSourceVisitor<'a,WorkspaceTensor>>(&'a self, visitor:&mut V) -> Result<(), eredu_nn::ParameterSourceError> {
- let mut __source_result = Ok(());
+        fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, WorkspaceTensor>>(
+            &'a self,
+            visitor: &mut V,
+        ) -> Result<(), eredu_nn::ParameterSourceError> {
+            let mut __source_result = Ok(());
 
-            for (spec,value) in self.specs.iter().zip(&self.values) {
-                visitor.parameter(eredu_nn::ParameterMetadataView::from_spec(spec,true),value);
+            for (spec, value) in self.specs.iter().zip(&self.values) {
+                visitor.parameter(
+                    eredu_nn::ParameterMetadataView::from_spec(spec, true),
+                    value,
+                );
             }
 
- __source_result
-}
-        fn visit_parameters_mut<'a,V:ParameterVisitorMut<'a,WorkspaceTensor>>(&'a mut self,visitor:&mut V) {
-            for (spec,value) in self.specs.iter().zip(&mut self.values) {
-                visitor.visit_mut(eredu_nn::ParameterMetadataView::from_spec(spec,true),value);
+            __source_result
+        }
+        fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, WorkspaceTensor>>(
+            &'a mut self,
+            visitor: &mut V,
+        ) {
+            for (spec, value) in self.specs.iter().zip(&mut self.values) {
+                visitor.visit_mut(
+                    eredu_nn::ParameterMetadataView::from_spec(spec, true),
+                    value,
+                );
             }
         }
-        fn set_trainable(&mut self,_:bool) {}
+        fn set_trainable(&mut self, _: bool) {}
     }
-    let context=WorkspaceContext::new(NoOperations);
-    let mut module=PreparedSlots {specs:[ParameterSpec::trainable("a").unwrap(),ParameterSpec::trainable("b").unwrap()],
-        values:[value(&context,Some(7)),value(&context,Some(11))]};
-    let root=WorkspaceExistingStorage::new(Some(64),&context);
-    let first=view(&context,&root,&[2],WorkspaceDtype::Float32);
-    let wrong=view(&context,&root,&[2],WorkspaceDtype::Uint32);
-    let mut rows=[crate::PreparedParameterBinding::new("a",first.clone()),
-        crate::PreparedParameterBinding::new("b",wrong)];
+    let context = WorkspaceContext::new(NoOperations);
+    let mut module = PreparedSlots {
+        specs: [
+            ParameterSpec::trainable("a").unwrap(),
+            ParameterSpec::trainable("b").unwrap(),
+        ],
+        values: [value(&context, Some(7)), value(&context, Some(11))],
+    };
+    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let first = view(&context, &root, &[2], WorkspaceDtype::Float32);
+    let wrong = view(&context, &root, &[2], WorkspaceDtype::Uint32);
+    let mut rows = [
+        crate::PreparedParameterBinding::new("a", first.clone()),
+        crate::PreparedParameterBinding::new("b", wrong),
+    ];
     context.begin_state_span([]).unwrap();
-    let error=bind_prepared_workspace_parameters(&mut module,&mut rows,&context, |_| false).unwrap_err();
-    assert!(matches!(error.source().unwrap().downcast_ref::<crate::PreparedParameterBindingError<PreparedWorkspaceBindingCause>>(),
-        Some(crate::PreparedParameterBindingError::Backend(PreparedWorkspaceBindingCause::Dtype))));
-    assert_eq!(retained(&context,&module.values),Some(18));
+    let error = bind_prepared_workspace_parameters(&mut module, &mut rows, &context, |_| false)
+        .unwrap_err();
+    assert!(matches!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<crate::PreparedParameterBindingError<PreparedWorkspaceBindingCause>>(),
+        Some(crate::PreparedParameterBindingError::Backend(
+            PreparedWorkspaceBindingCause::Dtype
+        ))
+    ));
+    assert_eq!(retained(&context, &module.values), Some(18));
     // The first valid row was not consumed by a later failed companion; the
     // same fixed destination can be corrected and validated before publication.
-    rows[1]=crate::PreparedParameterBinding::new("b",view(&context,&root,&[2],WorkspaceDtype::Float32));
-    bind_prepared_workspace_parameters(&mut module,&mut rows,&context, |_| false).unwrap();
-    assert_eq!(retained(&context,&module.values),Some(64));
-    let report=context.report(&[first,module.values[0].clone(),module.values[1].clone()]).unwrap();
+    rows[1] = crate::PreparedParameterBinding::new(
+        "b",
+        view(&context, &root, &[2], WorkspaceDtype::Float32),
+    );
+    bind_prepared_workspace_parameters(&mut module, &mut rows, &context, |_| false).unwrap();
+    assert_eq!(retained(&context, &module.values), Some(64));
+    let report = context
+        .report(&[first, module.values[0].clone(), module.values[1].clone()])
+        .unwrap();
     assert!(report.operations.is_empty());
-    assert_eq!(report.state.unwrap().retained_bytes,Some(64));
-    assert_eq!(report.tensor_buffers.total_bytes,Some(0));
+    assert_eq!(report.state.unwrap().retained_bytes, Some(64));
+    assert_eq!(report.tensor_buffers.total_bytes, Some(0));
 }

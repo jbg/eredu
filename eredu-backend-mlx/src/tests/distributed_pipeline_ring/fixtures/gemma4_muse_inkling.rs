@@ -93,7 +93,11 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         arrays: &'a mut Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor MlxTensor,
+        ) {
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id().to_string(),
@@ -110,7 +114,8 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         crate::backend::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
-    .visit_parameters(&mut collector);
+    .visit_parameters(&mut collector)
+    .unwrap();
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
@@ -123,7 +128,8 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
         }
     }
     // MLX's SafeTensors writer promotes rank-zero arrays to `[1]`, while the
@@ -256,7 +262,11 @@ fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, 
         arrays: &'a mut Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor MlxTensor,
+        ) {
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id().to_string(),
@@ -294,7 +304,8 @@ fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, 
         crate::backend::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
-    .visit_parameters(&mut collector);
+    .visit_parameters(&mut collector)
+    .unwrap();
     for group in 0..2 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
@@ -307,7 +318,8 @@ fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, 
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
         }
     }
     Array::save_safetensors(
@@ -343,7 +355,11 @@ fn initialized_inkling_parameters(
     }
 
     impl<'tensor> ParameterVisitorMut<'tensor, MlxTensor> for Initializer<'_> {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor mut MlxTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor mut MlxTensor,
+        ) {
             let name = metadata.id().to_string();
             let shape = parameter.as_array().shape().to_vec();
             let dtype = parameter.as_array().dtype();
@@ -626,18 +642,25 @@ fn gguf_fixture_serializer_preserves_strided_and_broadcast_values() {
         selected.evaluated().unwrap().try_as_slice::<f32>(),
         Err(safemlx::error::AsSliceError::NonContiguous)
     ));
-    let broadcast = Array::full::<f32>(
-        &[2, 3], Array::from_f32(-1.25), &stream,
-    ).unwrap();
+    let broadcast = Array::full::<f32>(&[2, 3], Array::from_f32(-1.25), &stream).unwrap();
     for (array, dimensions, expected) in [
-        (&selected, vec![4, 1, 2], vec![5.0, 6.0, 7.0, 8.0, 17.0, 18.0, 19.0, 20.0]),
+        (
+            &selected,
+            vec![4, 1, 2],
+            vec![5.0, 6.0, 7.0, 8.0, 17.0, 18.0, 19.0, 20.0],
+        ),
         (&broadcast, vec![3, 2], vec![-1.25; 6]),
     ] {
         let tensor = gguf_tensor_from_array("fixture.weight", array);
         assert_eq!(tensor.dimensions, dimensions);
         assert_eq!(tensor.name, "fixture.weight");
-        assert_eq!(tensor.data, expected.into_iter()
-            .flat_map(f32::to_le_bytes).collect::<Vec<_>>());
+        assert_eq!(
+            tensor.data,
+            expected
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
     }
 }
 

@@ -30,3 +30,7 @@ pub use sort::*;
 mod graph_rows;
 pub use graph_rows::{OriginalArrayRows, OriginalArrayRowsLayout, OriginalCopyWorkerLayout,
     reshape_like_prefix, reshape_like_prefix_control_bytes};
+
+mod ordinary_recipe;
+pub use ordinary_recipe::{OrdinaryRecipeCall, OrdinaryRecipeWrapperControls};
+pub use ordinary_recipe::ordinary_array_result_guard_control_bytes;

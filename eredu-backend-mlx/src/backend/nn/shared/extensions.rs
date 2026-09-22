@@ -338,6 +338,18 @@ mod convolution_error_tests {
 
 
 impl MlxNeuralBackend {
+    pub(crate) fn grouped_gated_product_construction_bytes(spec: &GroupedGatedProductSpec)
+        -> Result<Option<usize>, ComputeError> {
+        Ok(grouped_construction::Constructor::named_metadata_bytes::<MlxGroupedGatedProduct>(
+            &gated_declarations(spec)?))
+    }
+    pub(crate) fn grouped_relu2_construction_bytes(spec: &GroupedRelu2Spec) -> Option<usize> {
+        grouped_construction::Constructor::named_metadata_bytes::<MlxGroupedRelu2>(
+            &relu2_declarations(spec))
+    }
+    pub(crate) fn grouped_linear_construction_bytes(spec: &GroupedLinearSpec) -> Option<usize> {
+        super::selected_linear::MlxGroupedLinear::construction_metadata_bytes(spec)
+    }
     pub(crate) fn grouped_gated_product_from_bindings(spec:GroupedGatedProductSpec,
         bindings:PreparedCompactBindings<'_>)->Result<MlxGroupedGatedProduct,ComputeError> {
         construct_gated(spec,grouped_construction::Constructor::prepared::<MlxGroupedGatedProduct>(bindings)?)

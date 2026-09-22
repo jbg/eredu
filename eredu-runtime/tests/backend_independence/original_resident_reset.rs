@@ -1,6 +1,8 @@
 //! Actual shared-session source mint plus genuine core reset claim. This fixture
 //! tests provisional construction only; no native publication is simulated.
 use super::*;
+#[path = "original_resident_reset/publication.rs"]
+pub(crate) mod publication;
 use eredu_core::{
     BackendDescriptor, BackendFailure, BackendProvider, BackendSession, DeviceCapabilities,
     DeviceDescriptor, ModelRuntime, ObservationSet, PendingTextInput, PreparedModel,
@@ -8,14 +10,16 @@ use eredu_core::{
     TextPreparationInput, TextStepContext, TokenFilterController, TokenOutput,
 };
 use eredu_runtime::working_memory::{
-    HostSlotStorageKey, InferenceStateRetention, PreparedResidentKvReset, ResidentKvResetLayer,
-    ResidentTableResetState, ResidentResetSession, ResidentResetSource, WorkingMemoryError,
-    WorkingMemoryPool, WorkingMemoryStorage,
+    HostSlotStorageKey, InferenceStateRetention, MemoryLedger, PreparedResidentKvReset,
+    ResidentResetLayer, ResidentResetSession, ResidentResetSource, ResidentTableResetState,
+    WorkingMemoryError, WorkingMemoryStorage,
 };
 type ActualSession =
     ReplicatedTextSession<OrdinaryTextFixture, FakeBackend, ReferenceTextMechanisms>;
 type State = DeviceState<FakeBackend, FakeLayerState>;
-impl ResidentKvResetLayer for FakeLayerState {
+impl ResidentResetLayer for FakeLayerState {
+    type ResetPlan = ();
+    type ResetContext = ();
     fn matches_resident_reset(&self, policy: &LayerCachePolicy) -> bool {
         matches!(policy, LayerCachePolicy::KeyValue { .. })
     }
@@ -33,7 +37,7 @@ impl HostSlotStorageKey for Key {
 struct Backend;
 struct Session {
     inner: ActualSession,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     registration: WorkingMemoryStorage<Key>,
     replacement: Rc<RefCell<Option<State>>>,
 }
@@ -128,7 +132,7 @@ impl TextGenerationBackend for Backend {
             .inner
             .resident_reset_source()
             .map_err(BackendFailure::from_error)?;
-        let plan = PreparedResidentKvReset::prepare(source, &session.registration)
+        let plan = PreparedResidentKvReset::prepare(source, &session.registration, &session.pool)
             .map_err(BackendFailure::from_error)?;
         let replacement = plan
             .construct(&*session, claim, &session.pool)
@@ -236,13 +240,13 @@ fn actual_selected_session_borrow_constructs_provisional_empty_state_under_real_
             counts.unit_constructions,
             1 + usize::from(!residency.is_fully_resident())
         );
-        let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+        let pool = crate::memory::host_ledger(10_000_000, 0).unwrap();
         let source = inner.resident_reset_source().unwrap();
         let state = source.state();
         let table = state.resident_reset_layers().metadata();
         let layout = state.resident_reset_layout();
         let registration = pool
-            .register_storage([
+            .register_host_storage([
                 (
                     Key(table.identity().registry_key().clone()),
                     table.capacity_bytes().unwrap(),
@@ -253,7 +257,7 @@ fn actual_selected_session_borrow_constructs_provisional_empty_state_under_real_
                 ),
             ])
             .unwrap();
-        let plan = PreparedResidentKvReset::prepare(source, &registration).unwrap();
+        let plan = PreparedResidentKvReset::prepare(source, &registration, &pool).unwrap();
         let required = plan.required_bytes();
         let original_layout = state.resident_reset_layout().clone();
         let original_revision = state.inference_retention().revision().clone();
@@ -271,14 +275,13 @@ fn actual_selected_session_borrow_constructs_provisional_empty_state_under_real_
         .unwrap();
         runtime
             .reset_admitted(SessionResetLimits {
-                capacity_bytes: 10_000_000,
-                application_memory_budget_bytes: Some(required - 1),
-                safety_reserve_bytes: 0,
+                memory_limits: crate::memory::limits(required - 1),
+                additional_headroom: Default::default(),
             })
             .unwrap_err();
         assert!(replacement.borrow().is_none());
         runtime
-            .reset_admitted(SessionResetLimits::new(10_000_000))
+            .reset_admitted(SessionResetLimits::new(crate::memory::limits(10_000_000)))
             .unwrap();
         let state = replacement.borrow_mut().take().unwrap();
         assert!(state
@@ -294,8 +297,8 @@ fn actual_selected_session_borrow_constructs_provisional_empty_state_under_real_
         drop(runtime);
         drop(original_layout);
         drop(original_revision);
-        assert_eq!(pool.used_bytes().unwrap(), remaining);
+        assert_eq!(pool.payload_used_bytes().unwrap(), remaining);
         drop(identity);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

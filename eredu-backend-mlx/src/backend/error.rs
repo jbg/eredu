@@ -69,7 +69,9 @@ pub enum Error {
 
     /// Exact shared embedded protocol diagnostic, with no formatted allocation.
     #[error("{0}")]
-    EmbeddedPredictionContract(#[from] eredu_architectures::speculative_execution::EmbeddedPredictionContractError),
+    EmbeddedPredictionContract(
+        #[from] eredu_architectures::speculative_execution::EmbeddedPredictionContractError,
+    ),
     /// Fixed mechanism validation diagnostic without a formatted allocation.
     #[error("{0}")]
     InvalidOperation(&'static str),
@@ -94,6 +96,17 @@ pub enum Error {
     /// Fixed original Event/task mode refusal, without a second boxed shell.
     #[error(transparent)]
     OriginalNativeControl(#[from] safemlx::OriginalNativeControlError),
+    /// Native attachment refusal retaining its prepaid host error controls.
+    #[error("native allocation attachment: {0}")]
+    AllocationAttachment(#[source] eredu_core::BackendFailure),
+    /// Fixed shared-host accounting attachment refusal without a boxed adapter.
+    #[error("shared host metadata attachment: {0}")]
+    HostMetadataAttachment(
+        #[source]
+        eredu_core::SharedStorageAttachmentError<
+            eredu_runtime::working_memory::WorkingMemoryError,
+        >,
+    ),
     /// Fixed shared-session inspection boundary; no formatted or boxed wrapper.
     #[error("runtime inspection: {0}")]
     RuntimeInspection(#[source] eredu_runtime::replicated_session::RuntimeInspectionBoundary),
@@ -127,7 +140,9 @@ pub enum Error {
     },
     /// Exact retained equation prerequisite which refused a neural frontier.
     /// Existing paid detail moves from the recipe; this adds no formatted copy.
-    #[error("original neural boundary {boundary}, record {record}, {requirement} (operation {operation:?}, detail {detail:?}): {cause}")]
+    #[error(
+        "original neural boundary {boundary}, record {record}, {requirement} (operation {operation:?}, detail {detail:?}): {cause}"
+    )]
     NeuralBoundarySource {
         /// Selected shared completion worker.
         boundary: &'static str,
@@ -198,7 +213,9 @@ pub enum Error {
         blocked: bool,
     },
     /// The enclosing originally funded model operation did not prove settlement.
-    #[error("original operation completion unavailable (settled={settled}, failed={failed}, blocked={blocked})")]
+    #[error(
+        "original operation completion unavailable (settled={settled}, failed={failed}, blocked={blocked})"
+    )]
     OriginalOperationCompletion {
         /// Whether the retained native scope established terminal settlement.
         settled: bool,
@@ -284,7 +301,12 @@ pub enum Error {
 
     /// Portable inspection failed while retaining source admission custody.
     #[error(transparent)]
-    ArtifactInspection(#[from] eredu_runtime::working_memory::OriginalArtifactInspectionError<eredu_architectures::processor_plan::ArtifactArchitecturePlan>),
+    ArtifactInspection(
+        #[from]
+        eredu_runtime::working_memory::OriginalArtifactInspectionError<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+    ),
 
     /// Architecture source preparation failed with its original retained inputs.
     #[error(transparent)]
@@ -461,7 +483,10 @@ pub enum Error {
 impl Error {
     #[track_caller]
     pub(crate) fn text_admission(cause: eredu_runtime::working_memory::WorkingMemoryError) -> Self {
-        Self::TextAdmission { at: std::panic::Location::caller(), cause }
+        Self::TextAdmission {
+            at: std::panic::Location::caller(),
+            cause,
+        }
     }
 
     /// Reuse the existing boxed neutral error, if present, without allocating
@@ -469,10 +494,12 @@ impl Error {
     #[track_caller]
     pub(crate) fn at_text_admission(self) -> Self {
         match self {
-            Self::Other(source) => match source.downcast::<eredu_runtime::working_memory::WorkingMemoryError>() {
-                Ok(cause) => Self::text_admission(*cause),
-                Err(source) => Self::Other(source),
-            },
+            Self::Other(source) => {
+                match source.downcast::<eredu_runtime::working_memory::WorkingMemoryError>() {
+                    Ok(cause) => Self::text_admission(*cause),
+                    Err(source) => Self::Other(source),
+                }
+            }
             Self::PrefillControl(cause) => Self::text_admission(cause),
             error => error,
         }
@@ -481,6 +508,13 @@ impl Error {
     pub(crate) fn at_speculative_stage(self, stage: &'static str) -> Self {
         match self {
             Self::PrefillControl(cause) => Self::SpeculativePrerequisite { stage, cause },
+            other => other,
+        }
+    }
+
+    pub(crate) fn at_original_stage(self, stage: &'static str) -> Self {
+        match self {
+            Self::PrefillControl(cause) => Self::OriginalSourceContract { stage, cause },
             other => other,
         }
     }
@@ -537,7 +571,7 @@ impl Error {
             Self::RetainedOriginal(error) => error.source.into_failure(),
             Self::OutputObservation(error) => error.into_backend_failure(),
             Self::OriginalControl(error) => error.source,
-            Self::SavedCopyConstructor(error) => error,
+            Self::SavedCopyConstructor(error) | Self::AllocationAttachment(error) => error,
             ordinary => eredu_core::BackendFailure::from_error(ordinary),
         }
     }

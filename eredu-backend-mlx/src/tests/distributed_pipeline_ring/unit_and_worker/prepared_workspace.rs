@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 #[test]
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 #[ignore = "requires native Metal execution"]
@@ -174,8 +176,15 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
             .quote_text_prompt_workspace(geometry, Some(128))
             .unwrap();
         assert_eq!(prompt.geometry(), combined.equations.geometry());
-        assert_eq!(prompt.host_peak_bytes(), Some(128));
+        let logical = geometry.batch_size * geometry.input_positions * 4;
+        let minimal = executable.quote_text_prompt_workspace(geometry, Some(logical)).unwrap();
+        let host = prompt.host_peak_bytes().unwrap();
+        assert_eq!(host.checked_sub(minimal.host_peak_bytes().unwrap()), Some(128 - logical));
+        let identity = eredu_runtime::input::TextInputIdentityPlan::new(
+            geometry.batch_size, geometry.input_positions).unwrap();
+        assert!(host >= 128 + identity.peak_bytes() + safemlx::physical_backing_control_bytes() as u64);
         assert!(prompt.tensor_peak_bytes().is_some());
+        assert_eq!(prompt.peak().bytes(), host.checked_add(prompt.tensor_peak_bytes().unwrap()));
         assert!(prompt.peak().bytes().unwrap() >= 128 + geometry.input_positions * 4);
     }
 
@@ -188,14 +197,13 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
         input: eredu_core::InputTokenCount::text(5),
         max_output_tokens: 3,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(0),
+        memory_limits: Default::default(),
     };
     let zero = || {
         eredu_core::WorkspaceBound::bounded(0, "fixture has resident parameters, no enclosing capture, snapshots or prediction; all transaction state work included by trace")
     };
-    let outside = eredu_core::ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(eredu_core::ExecutionWorkspaceEstimate { physical_domains: None,
         geometry,
         activations: zero(),
         attention: zero(),
@@ -203,7 +211,7 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
         state_update: zero(),
         materialization: zero(),
         retained: zero(),
-    };
+    });
     let sampling = eredu_core::resolve_generation_config(
         None,
         eredu_core::GenerationConfigOverrides {
@@ -219,7 +227,7 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
         additional_host_bytes: 32,
     };
     let state = executable
-        .quote_text_preparation_workspace(geometry, Some(128), config, controller, outside.clone())
+        .quote_text_preparation_workspace(geometry, Some(128), config.clone(), controller, outside.clone())
         .unwrap();
     assert!(state
         .selected_state_backing
@@ -232,7 +240,7 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
         eredu_core::EstimationCompleteness::Conservative
     );
     let no_source = executable
-        .quote_text_preparation_workspace(geometry, None, config, controller, outside.clone())
+        .quote_text_preparation_workspace(geometry, None, config.clone(), controller, outside.clone())
         .unwrap();
     assert_eq!(
         no_source.completeness,
@@ -244,7 +252,7 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
     };
     assert_eq!(
         executable
-            .quote_text_preparation_workspace(geometry, Some(128), config, controller, missing,)
+            .quote_text_preparation_workspace(geometry, Some(128), config.clone(), controller, missing,)
             .unwrap()
             .completeness,
         eredu_core::EstimationCompleteness::PersistentStateOnly
@@ -281,13 +289,11 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
     let eredu_core::AdmissionResult::Admitted(admission) = eredu_core::apply_admission_policy(
         capability.capabilities(),
         admission_request,
-        state,
-        None,
-    )
+        state)
     .unwrap() else {
         panic!("native fixture admission")
     };
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
     let request: eredu_runtime::working_memory::InferenceRequest = pool
         .reserve(
             executable.erased().inference_execution_identity(),
@@ -295,7 +301,7 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
         )
         .unwrap()
         .into();
-    let charged = request.memory_reservation().unwrap().bytes();
+    let charged = request.memory_reservation().requirements().get(crate::memory_fixture::topology().host_domain()).unwrap().total().unwrap();
     let tokens = Array::from_slice(&[1_u32, 3, 2, 4, 5], &[1, 5]);
     let parts = [text_input_part(&tokens)];
     let prompt = crate::composition::mlx::MlxModelInput::from(
@@ -328,13 +334,13 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
     assert!(error.model_state_preserved());
     assert_eq!(executable.erased().state_snapshot(), before);
     drop(wrong_chunk);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charged);
     let scores = prompt
         .with_borrowed(|input| executable.prefill(input, stream))
         .unwrap();
     drop(prompt);
     drop(request);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charged);
     scores.evaluated().unwrap();
     let before = executable.erased().state_snapshot();
     assert!(before.iter().all(|(position, _)| *position == 5));
@@ -374,7 +380,7 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
             .state_snapshot()
             .iter()
             .all(|(position, _)| *position == 6 + step as i32));
-        assert_eq!(pool.used_bytes().unwrap(), charged);
+        assert_eq!(pool.fixture_host_charge().unwrap(), charged);
     }
     let before = executable.erased().state_snapshot();
     assert!(executable
@@ -384,5 +390,5 @@ fn prepared_workspace_native_executable_retains_selection_and_projects_live_stat
     assert_eq!(executable.erased().state_snapshot(), before);
     drop(scores);
     executable.reset_cache_distributed().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }

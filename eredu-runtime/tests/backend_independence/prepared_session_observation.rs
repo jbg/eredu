@@ -118,11 +118,17 @@ fn ordinary_generation_and_reset_preserve_prepared_observation_binding() {
         let source = observer.paths.clone();
         let tokens = FakeTensor(vec![3, 7, 2]);
         let expected = session.forward(&tokens, None, &()).unwrap();
-        session.validate_prepared_observation_paths(&source).unwrap();
+        session
+            .validate_prepared_observation_paths(&source)
+            .unwrap();
         session.forward(&FakeTensor(vec![11]), None, &()).unwrap();
-        session.validate_prepared_observation_paths(&source).unwrap();
+        session
+            .validate_prepared_observation_paths(&source)
+            .unwrap();
         session.reset(&()).unwrap();
-        session.validate_prepared_observation_paths(&source).unwrap();
+        session
+            .validate_prepared_observation_paths(&source)
+            .unwrap();
         let actual = session
             .forward_with_observer(&tokens, None, &(), &mut observer)
             .unwrap();
@@ -171,9 +177,11 @@ fn prepared_session_keeps_actual_boundary_pointers_and_existing_transaction_equa
             ]
         );
         assert_eq!(counters.snapshot().publications, 3);
-        assert!(observer
-            .paths
-            .same_storage(prepared.shared_observation_paths().unwrap()));
+        assert!(
+            observer
+                .paths
+                .same_storage(prepared.shared_observation_paths().unwrap())
+        );
     }
 }
 
@@ -186,9 +194,11 @@ fn stale_binding_rejects_before_state_and_cold_rebind_reuses_original_source() {
         let (mut session, counters) = session(residency);
         let mut observer = Observer::new(&session);
         let _ = session.visit_loaded_parameters(&mut Slots);
-        session.validate_prepared_observation_paths(session.shared_observation_paths().unwrap()).unwrap();
-        // Replacement publication invalidates even if the replacement set is empty.
-        session.publish_parameter_replacements(&Default::default(), false).unwrap();
+        session
+            .validate_prepared_observation_paths(session.shared_observation_paths().unwrap())
+            .unwrap();
+        // Completed publication invalidates the binding independently of row count.
+        session.invalidate_parameter_observations();
         let before = counters.snapshot();
         let error = session
             .forward_with_observer(&FakeTensor(vec![4, 9]), None, &(), &mut observer)
@@ -238,9 +248,11 @@ fn prepared_callback_failure_uses_original_rollback_and_preserves_reusable_path_
     assert_eq!(counters.snapshot().publications, 1);
     assert_eq!(observer.boundaries, 4);
     assert_eq!(observer.logits, 2);
-    assert!(observer
-        .paths
-        .same_storage(session.shared_observation_paths().unwrap()));
+    assert!(
+        observer
+            .paths
+            .same_storage(session.shared_observation_paths().unwrap())
+    );
 }
 
 #[test]
@@ -291,7 +303,7 @@ fn cold_path_validation_rejects_stale_token_and_accepts_valid_same_source_rebind
         session
             .validate_prepared_observation_paths(&source)
             .unwrap();
-        session.publish_parameter_replacements(&Default::default(), false).unwrap();
+        session.invalidate_parameter_observations();
         let before = counters.snapshot();
         assert!(matches!(
             session.validate_prepared_observation_paths(&source),
@@ -350,3 +362,101 @@ fn cold_path_validation_preserves_unavailable_and_session_fence_errors() {
 
 #[path = "prepared_session_observation/parameter_owner_sources.rs"]
 mod parameter_owner_sources;
+
+#[test]
+fn checkpointed_sequence_observation_uses_shared_completion_commit_and_rollback() {
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+    ] {
+        let (mut observed, counters) = session(residency);
+        let (mut baseline, _) = session(residency);
+        let mut observer = Observer::new(&observed);
+        let mut completions = 0;
+        for (index, ids) in [vec![3, 7], vec![2, 11, 5], vec![13]]
+            .into_iter()
+            .enumerate()
+        {
+            let tokens = FakeTensor(ids);
+            let pass = if index == 0 {
+                eredu_runtime::ExpertPass::Prefill
+            } else {
+                eredu_runtime::ExpertPass::Decode
+            };
+            let expected = baseline.sequence_logits(&tokens, pass, &()).unwrap();
+            let checkpoint = observed.checkpoint(&()).unwrap();
+            let actual = observed
+                .sequence_logits_with_checkpoint_completion_and_observer(
+                    &tokens,
+                    pass,
+                    &(),
+                    checkpoint,
+                    |output, _, _| {
+                        assert_eq!(output, &expected);
+                        completions += 1;
+                        Ok(())
+                    },
+                    &mut observer,
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                observed.report().unwrap().state_report(),
+                baseline.report().unwrap().state_report()
+            );
+        }
+        assert_eq!(completions, 3);
+        assert_eq!(observer.boundaries, 6);
+        assert_eq!(observer.logits, 3);
+        assert_eq!(counters.snapshot().publications, 0);
+        assert_eq!(
+            observer.events,
+            [
+                "prepare", "complete", "commit", "prepare", "complete", "commit", "prepare",
+                "complete", "commit"
+            ]
+        );
+
+        let before = observed.report().unwrap().state_report().to_vec();
+        observer.failure = true;
+        let checkpoint = observed.checkpoint(&()).unwrap();
+        let failure = observed
+            .sequence_logits_with_checkpoint_completion_and_observer(
+                &FakeTensor(vec![17, 19, 23]),
+                eredu_runtime::ExpertPass::Decode,
+                &(),
+                checkpoint,
+                |_, _, _| {
+                    completions += 1;
+                    Ok(())
+                },
+                &mut observer,
+            )
+            .unwrap_err();
+        assert!(failure.to_string().contains("prepared observer sentinel"));
+        assert_eq!(
+            completions, 3,
+            "failed observation cannot reach output completion"
+        );
+        assert_eq!(observed.report().unwrap().state_report(), &before);
+        assert_eq!(observer.events.last(), Some(&"abort"));
+        assert_eq!(counters.snapshot().publications, 0);
+
+        observer.failure = false;
+        let checkpoint = observed.checkpoint(&()).unwrap();
+        let failure = observed
+            .sequence_logits_with_checkpoint_completion_and_observer(
+                &FakeTensor(vec![17]),
+                eredu_runtime::ExpertPass::Decode,
+                &(),
+                checkpoint,
+                |_, _, _| Err("completion sentinel"),
+                &mut observer,
+            )
+            .unwrap_err();
+        assert!(failure.to_string().contains("completion sentinel"));
+        assert_eq!(observed.report().unwrap().state_report(), &before);
+        assert_eq!(observer.events.last(), Some(&"abort"));
+        assert_eq!(counters.snapshot().publications, 0);
+    }
+}

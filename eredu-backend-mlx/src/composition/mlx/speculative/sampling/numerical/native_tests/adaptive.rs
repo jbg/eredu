@@ -2,32 +2,39 @@
 use super::*;
 use crate::backend::runtime::generation::MlxSamplingBackend;
 use crate::composition::mlx::{
-    MlxPreparedInputMaterializer,
     speculative::{
         autoregressive::MlxAutoregressiveMechanisms as Mechanisms,
         sampling::logits::IndependentLogits,
     },
+    MlxPreparedInputMaterializer,
 };
-use eredu_core::{GenerationCancellationToken, SpeculativePrefillOutcome, speculative::SamplingPlacement};
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
+use eredu_core::{
+    speculative::SamplingPlacement, GenerationCancellationToken, SpeculativePrefillOutcome,
+};
 use eredu_runtime::{
-    ConfiguredTextSampler, MirostatV2Sampler, SamplingBackend,
     generation::SpeculativeSampler,
     speculative::autoregressive::{AutoregressiveMechanisms, AutoregressivePass},
+    ConfiguredTextSampler, MirostatV2Sampler, SamplingBackend,
 };
 const TEMPERATURE: f32 = 0.7;
 
 #[test]
 #[ignore = "requires native Metal execution"]
 fn original_mirostat_preserves_mu_history_snapshot_and_native_retirement() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let backend = admitted_backend(&pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let mut target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
-    let loaded = pool.used_bytes().unwrap();
+    let loaded = pool.fixture_host_charge().unwrap();
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let config = SpeculativeConfig {
         max_tokens: 2,
@@ -92,7 +99,7 @@ fn original_mirostat_preserves_mu_history_snapshot_and_native_retirement() {
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let environment = backend.original_copy_environment().unwrap();
@@ -180,17 +187,14 @@ fn original_mirostat_preserves_mu_history_snapshot_and_native_retirement() {
                 context,
             )
             .unwrap_or_else(|error| panic!("adaptive choice {step}: {error}"));
-            let bytes =
-                sampler
-                    .original_snapshot_metadata(None, None)
-                    .unwrap()
-                    .checked_add(
-                        eredu_core::HostPreparationAuthority::retention_bytes::<
-                            HostMetadataFunding,
-                        >()
+            let bytes = sampler
+                .original_snapshot_metadata(None, None)
+                .unwrap()
+                .checked_add(
+                    eredu_core::HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
                         .unwrap(),
-                    )
-                    .unwrap();
+                )
+                .unwrap();
             pair.metadata_funding().reserve_metadata(bytes).unwrap();
             let (snapshot, _, _) = sampler
                 .copy_snapshot(

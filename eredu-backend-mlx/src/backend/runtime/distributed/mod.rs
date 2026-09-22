@@ -3,6 +3,7 @@
 /// MLX ownership for submitted distributed work.
 pub mod completion;
 mod group;
+pub(crate) use group::ordinary_local_variable_control_bytes;
 pub(crate) use group::independent_status_members;
 /// Native tensor-parallel execution contexts.
 pub mod parallel;

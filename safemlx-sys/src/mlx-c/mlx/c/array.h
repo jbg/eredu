@@ -4,6 +4,7 @@
 #define MLX_ARRAY_H
 
 #include "mlx/c/string.h"
+#include "mlx/c/memory_placement.h"
 
 #include <float.h>
 #include <stdbool.h>
@@ -37,8 +38,8 @@ extern "C" {
  */
 typedef struct mlx_array_ {
   void* ctx;
-  // Null for ordinary new/delete. Only the prepared-input factory sets this
-  // closed source-arena owner. Shallow C copies still obey unique-handle custody.
+  // Null for ordinary new/delete. Prepared inputs and prepaid handle clones use
+  // this closed arena owner. Shallow C copies still obey unique-handle custody.
   void* prepared_owner;
 } mlx_array;
 
@@ -299,6 +300,8 @@ typedef struct mlx_array_descriptor_ {
   bool host_transfer;
   uint64_t identity;
   size_t allocation_bytes;
+  mlx_memory_placement placement;
+  size_t host_control_bytes;
 } mlx_array_descriptor;
 
 /** Fixed status, no allocation/evaluation/poll/reap/error callback. Output is
@@ -307,6 +310,15 @@ typedef struct mlx_array_descriptor_ {
  * 6 wrong destination length; 7 null nonempty destination. Legal borrowed
  * descriptors use audited nonthrowing native queries, never catch/erase a cause.
  */
+/** Synchronous copy from completed authenticated backing into exact host storage.
+ * Never evaluates, allocates, compacts or relocates the source. Returns -1 for
+ * invalid source/destination; positive values preserve a native CUDA error code.
+ * A native refusal may leave a copied prefix, but retains no destination access.
+ */
+int mlx_array_copy_completed_data(const mlx_array arr, void* destination, size_t bytes);
+size_t mlx_array_completed_readback_control_bytes(void);
+/** Synchronous logical scalar copy for caller-owned inline conversion. */
+int mlx_array_copy_completed_element(const mlx_array arr, size_t index, void* destination, size_t bytes);
 uint32_t mlx_array_descriptor_read(mlx_array_descriptor* out, const mlx_array arr);
 /** Rechecks the same witness before writing an exact, disjoint caller-owned
  * shape destination. No rank cap or destination allocation. Zero rank accepts
@@ -531,6 +543,9 @@ const bfloat16_t* mlx_array_data_bfloat16(const mlx_array arr);
  * Internal function: use at your own risk.
  */
 int _mlx_array_is_available(bool* res, const mlx_array arr);
+
+/** Fixed availability-query caller transports; no evaluation or wait. */
+size_t mlx_array_availability_control_bytes(void);
 
 /**
  * Wait on the array to be available. After this `_mlx_array_is_available`

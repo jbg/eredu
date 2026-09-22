@@ -9,7 +9,7 @@ use eredu_runtime::RuntimeStateComponents;
 #[test]
 fn retained_prediction_storage_keeps_nonzero_state_prototypes_and_their_aliases() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let memory = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let memory = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = crate::backend::managed_memory::NativeMemoryOwner::acquire(&memory).unwrap();
     let policy = eredu_core::cache::LayerCachePolicy::key_only(
         eredu_core::AttentionPolicy::sliding(8).unwrap(),
@@ -190,19 +190,20 @@ fn retained_prediction_storage_keeps_nonzero_state_prototypes_and_their_aliases(
     inventory.merge(expected).unwrap();
     assert_eq!(inventory.byte_bound().unwrap(), Some(bytes));
     let publication = inventory.publish_unquoted(&loading).unwrap();
-    assert_eq!(memory.used_bytes().unwrap(), bytes);
+    assert_eq!(memory.fixture_host_charge().unwrap(), bytes);
     drop((extension, layout, publication, loading));
     // Neither the publication nor metadata-only keys pin prototype payloads.
     // Escaped table tokens conservatively retain their exact inline charges.
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
-        memory.used_bytes().unwrap() == slot_bytes && memory.unquoted_owner_count().unwrap() == 0
+        memory.fixture_host_charge().unwrap() == slot_bytes
+            && memory.unquoted_owner_count().unwrap() == 0
     });
     for token in &tokens {
         let error = token
             .try_attach(
-                memory.shared_storage_domain(),
+                memory.shared_storage_accounting_id(),
                 || -> Result<Box<dyn Send + Sync>, std::convert::Infallible> {
                     panic!("retired prototype tables cannot acquire new custody")
                 },
@@ -217,7 +218,7 @@ fn retained_prediction_storage_keeps_nonzero_state_prototypes_and_their_aliases(
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
-        memory.used_bytes().unwrap() == 0
+        memory.fixture_host_charge().unwrap() == 0
     });
     // These surviving identity maps own neither source payload nor custody.
     assert_eq!(found_slots, slot_facts);
@@ -293,3 +294,7 @@ fn prediction_placeholders_preserve_geometry_with_bounded_completed_backing() {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

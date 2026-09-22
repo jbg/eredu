@@ -1,8 +1,8 @@
 //! Fixed semantic destinations. These records confer no architecture admission.
 //! Equation and source/selection authority remain with the architecture compiler.
 use super::{
-    InferenceExecutionIdentity, InferenceStateRevision, OriginalPreparedHostInput,
-    WorkingMemoryError, WorkingMemoryPool, loaded_decode_source::Allowance,
+    InferenceExecutionIdentity, InferenceStateRevision, MemoryLedger, OriginalPreparedHostInput,
+    WorkingMemoryError, loaded_decode_source::Allowance,
 };
 use eredu_core::{BackendFailure, InputModality};
 use std::{
@@ -89,8 +89,21 @@ pub enum CompositeGeneratedText {
 impl fmt::Display for CompositeGeneratedText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::DecimalSeconds { value_bits, prefix, suffix } => write!(f, "{prefix}{:.1}{suffix}", f64::from_bits(value_bits)),
-            Self::ClockSeconds { seconds, leading_space } => write!(f, "{}{:02}:{:02} ", if leading_space { " " } else { "" }, seconds / 60, seconds % 60),
+            Self::DecimalSeconds {
+                value_bits,
+                prefix,
+                suffix,
+            } => write!(f, "{prefix}{:.1}{suffix}", f64::from_bits(value_bits)),
+            Self::ClockSeconds {
+                seconds,
+                leading_space,
+            } => write!(
+                f,
+                "{}{:02}:{:02} ",
+                if leading_space { " " } else { "" },
+                seconds / 60,
+                seconds % 60
+            ),
         }
     }
 }
@@ -182,7 +195,7 @@ impl PreparedCompositeSemanticLayout {
 pub struct MediaSessionBinding {
     pub(crate) execution: InferenceExecutionIdentity,
     pub(crate) revision: InferenceStateRevision,
-    pub(crate) control: Arc<()>,
+    pub(crate) control: crate::replicated_session::ParameterControlIdentity,
     pub(crate) frontier: u64,
 }
 impl MediaSessionBinding {
@@ -190,12 +203,11 @@ impl MediaSessionBinding {
         self.frontier
     }
     pub fn same_origin(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.execution.0, &other.execution.0)
-            && Arc::ptr_eq(&self.control, &other.control)
+        Arc::ptr_eq(&self.execution.0, &other.execution.0) && self.control.matches(&other.control)
     }
     pub fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.execution.0, &other.execution.0)
-            && Arc::ptr_eq(&self.control, &other.control)
+            && self.control.matches(&other.control)
             && self.revision == other.revision
             && self.frontier == other.frontier
     }
@@ -221,15 +233,15 @@ impl MediaSessionBinding {
         retention: &super::InferenceRetention,
         frontier: u64,
     ) -> bool {
-        retention.initialized_revision().is_some_and(|revision| {
-            self.matches_snapshot(execution, revision, frontier)
-        })
+        retention
+            .initialized_revision()
+            .is_some_and(|revision| self.matches_snapshot(execution, revision, frontier))
     }
     fn duplicate(&self) -> Self {
         Self {
             execution: self.execution.clone(),
             revision: self.revision.clone(),
-            control: Arc::clone(&self.control),
+            control: self.control.clone(),
             frontier: self.frontier,
         }
     }
@@ -322,11 +334,11 @@ impl<'p, 'h, P: Sized> PreparedCompositeSemanticRecipe<'p, 'h, P> {
         self.layout
     }
     pub fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::composite_semantic_required_bytes::<P>(self.layout)
+        MemoryLedger::composite_semantic_required_bytes::<P>(self.layout)
     }
     pub fn allocate(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<PreparedCompositeSemanticBuilder<'p, P>, OriginalCompositeSemanticStorageError>
     {
         pool.prepare_composite_semantic_storage(self.source, self.provenance, self.layout)
@@ -617,7 +629,7 @@ impl std::error::Error for OriginalCompositeSemanticStorageError {
         }
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Exact fixed destinations and named concrete control representations.
     /// P is borrowed only: its payload/layout/destructor is never charged here.
     pub fn composite_semantic_required_bytes<P: Sized>(

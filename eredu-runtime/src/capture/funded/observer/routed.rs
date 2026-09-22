@@ -1,12 +1,12 @@
 //! Actual sparse provider batches share one original logical prefill row.
 use super::fragments::progress_error;
 use super::*;
+mod interventions;
 mod invocation;
 mod partition;
-mod interventions;
 use crate::capture::{CapturePrefillHookDecision, CapturePrefillObservationPolicy};
-fn same_routing(source:&AdmittedCapturePlan,first:usize,index:usize)->bool {
-    crate::capture::partition::PartitionCaptureRoutedHooks::same_routing(source,first,index)
+fn same_routing(source: &AdmittedCapturePlan, first: usize, index: usize) -> bool {
+    crate::capture::partition::PartitionCaptureRoutedHooks::same_routing(source, first, index)
 }
 impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'_, T, E, N> {
     fn routed_batch(
@@ -14,11 +14,15 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         batch: &crate::RoutedUnitBatch<'_, T>,
         effective: bool,
     ) -> Result<(), FundedCaptureError<E>> {
-        if self.routed_partition_hooks.is_some(){return self.partition_routed_batch(batch,effective);}
+        if self.routed_partition_hooks.is_some() {
+            return self.partition_routed_batch(batch, effective);
+        }
         if !self.routed_active || batch.origins.is_some() || batch.unit_coordinates.is_some() {
             return Err(CaptureProtocolError::Transaction.into());
         }
-        let Some(first)=self.routed_selection else {return Ok(());};
+        let Some(first) = self.routed_selection else {
+            return Ok(());
+        };
         if self.prefill.is_none() {
             return self.routed_invocation_batch(batch, effective, first);
         }
@@ -85,10 +89,14 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         if !self.routed_active {
             return Err(CaptureProtocolError::Transaction.into());
         }
-        if self.routed_partition_hooks.is_some(){return self.finish_partition_routed(success);}
+        if self.routed_partition_hooks.is_some() {
+            return self.finish_partition_routed(success);
+        }
         self.routed_active = false;
         self.finish_routed_interventions(success)?;
-        let Some(first)=self.routed_selection else {return Ok(());};
+        let Some(first) = self.routed_selection else {
+            return Ok(());
+        };
         if self.prefill.is_none() {
             return self.finish_routed_ordinary_invocation(success, first);
         }
@@ -139,7 +147,8 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::RoutedUnitObserv
         invocation: &crate::RoutedUnitInvocation<'_, T>,
     ) -> Result<(), eredu_nn::Error> {
         let result = (|| {
-            if self.routed_active || (self.routed_selection.is_none() && self.routed_intervention_selection.is_none())
+            if self.routed_active
+                || (self.routed_selection.is_none() && self.routed_intervention_selection.is_none())
             {
                 return Err(CaptureProtocolError::Transaction.into());
             }
@@ -148,9 +157,9 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::RoutedUnitObserv
             } else if !matches!(self.frame, Frame::Active(_)) {
                 return Err(CaptureProtocolError::Transaction.into());
             }
-            if self.backend.partition_capture().is_some(){
+            if self.backend.partition_capture().is_some() {
                 self.begin_partition_routed(invocation)?;
-            }else if invocation.origins.is_some() || invocation.unit_coordinates.is_some(){
+            } else if invocation.origins.is_some() || invocation.unit_coordinates.is_some() {
                 return Err(CaptureProtocolError::Transaction.into());
             }
             self.routed_active = true;
@@ -166,9 +175,12 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::RoutedUnitObserv
         self.routed_batch(batch, false)
             .map_err(|cause| self.backend.routed_error(cause))
     }
-    fn intervene(&mut self,batch:&crate::RoutedUnitBatch<'_,T>)->Result<Option<T>,eredu_nn::Error>{
+    fn intervene(
+        &mut self,
+        batch: &crate::RoutedUnitBatch<'_, T>,
+    ) -> Result<Option<T>, eredu_nn::Error> {
         self.intervene_routed_batch(batch)
-            .map_err(|cause|self.backend.routed_error(cause))
+            .map_err(|cause| self.backend.routed_error(cause))
     }
     fn observe_effective(
         &mut self,
@@ -192,12 +204,15 @@ pub(in crate::capture::funded) fn control_bytes() -> Option<usize> {
         size_of::<crate::working_memory::RoutedInterventionCursor<'_>>(),
         size_of::<crate::working_memory::RoutedInterventionBatch<'_, '_>>(),
         size_of::<Option<usize>>(),
-        size_of::<[u64;2]>(),
-        size_of::<Result<[u64;2],FundedCaptureError<std::convert::Infallible>>>(),
+        size_of::<[u64; 2]>(),
+        size_of::<Result<[u64; 2], FundedCaptureError<std::convert::Infallible>>>(),
         size_of::<CaptureRoutedPrefillFragment<'_, '_>>(),
         size_of::<Result<(), FundedCaptureError<std::convert::Infallible>>>(),
     ]
     .into_iter()
-    .try_fold(CaptureRoutedUnitsGeometry::preparation_control_bytes()?, usize::checked_add)?
+    .try_fold(
+        CaptureRoutedUnitsGeometry::preparation_control_bytes()?,
+        usize::checked_add,
+    )?
     .checked_mul(3)
 }

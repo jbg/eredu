@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::{
-    MlxBackend, MlxDeviceIdentity, managed_memory::gpu_stream::PreparedExecutionStreams,
-    nn::shared::MlxNeuralBackend,
+    managed_memory::gpu_stream::PreparedExecutionStreams, nn::shared::MlxNeuralBackend, MlxBackend,
+    MlxDeviceIdentity,
 };
 use safemlx::{
     Array, Device, DeviceType, OriginalBufferBudget, OriginalScopeObserver, PrefillRoots,
@@ -10,8 +10,8 @@ use safemlx::{
     SubmissionScope,
 };
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 #[derive(Debug)]

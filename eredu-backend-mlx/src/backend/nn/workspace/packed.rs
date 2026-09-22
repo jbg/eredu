@@ -1,7 +1,7 @@
 //! Selected packed projections and row lookups. Packed storage is retained;
 //! Metal kernels decode in registers rather than materializing a dense weight.
 
-use super::facts::{self, add, buffer_capacity, mul, Emitter, FactResult, Output};
+use super::facts::{self, Emitter, FactResult, Output, add, buffer_capacity, mul};
 use super::{reduction::capacity_fixed as capacity, *};
 use eredu_checkpoint::{BlockFp8ScaleEncoding, LinearFormat};
 use eredu_nn::{LinearFormatSpec, LinearRowLayout};
@@ -152,6 +152,10 @@ pub(super) fn emit(
         // PhysicalLinear adds output bias after the packed kernel: possible
         // result/bias casts and the final pointwise result.
         scratch = add(scratch, add(mul(2, output)?, r(g.rows)?)?)?;
+    }
+    if let Some(policy) = policy {
+        let (bytes, births) = indexing::embedding_default_scratch(g.positions, policy, allocation)?;
+        sink.default_scratch(bytes, births)?;
     }
     sink.output(Output::Allocate(output))?;
     sink.finish(scratch, format_args!("selected MLX Metal packed {:?}: exact physical companions; direct packed kernels or selected-row dequantization; all compatible casts, compaction, shape copies and geometry-selected quantized split-K/reduction storage retained through completion; FP8 activation quantization and scale lookup included; no dense weight expansion; page={} with bounded oversized reuse; tensor buffers only, disjoint host facts and observation factories separately required",format.encoding(),allocation.page_size())).map(Some)

@@ -63,7 +63,10 @@ impl WorkspaceMechanisms for OptionalFacts {
                         }
                     }
                     WorkspaceOperationKind::Sampling(S::ReadToken | S::SelectRandomKey { .. })
-                    | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. } => WorkspaceOutputStorage::AliasInput(0),
+                    | WorkspaceOperationKind::Index { .. }
+                    | WorkspaceOperationKind::StaticSlice { .. } => {
+                        WorkspaceOutputStorage::AliasInput(0)
+                    }
                     _ if !op.inputs.is_empty() && out == &op.inputs[0] => {
                         // Intermediate transforms may preserve the filtered score's
                         // backing, so later token aliases reach all original roots.
@@ -198,9 +201,11 @@ fn optional_filtering_uses_every_configured_sampler_and_prices_only_emitted_mask
                     .count(),
                 steps as usize
             );
-            assert!(!calls
-                .iter()
-                .any(|kind| matches!(kind, WorkspaceSamplingOperation::TokenFilter)));
+            assert!(
+                !calls
+                    .iter()
+                    .any(|kind| matches!(kind, WorkspaceSamplingOperation::TokenFilter))
+            );
             if matches!(sampler, ConfiguredTextSampler::MirostatV2(_)) {
                 assert_eq!(
                     calls
@@ -237,10 +242,12 @@ fn optional_filter_facts_are_required_for_nonzero_allowance_but_not_initializati
                 assert_eq!(report.tensor_peak_bytes, all.tensor_peak_bytes);
                 assert_eq!(report.host_peak_bytes, all.host_peak_bytes);
                 assert_eq!(report.first_gap, None);
-                assert!(!calls
-                    .borrow()
-                    .iter()
-                    .any(|kind| matches!(kind, WorkspaceSamplingOperation::OptionalTokenFilter)));
+                assert!(
+                    !calls.borrow().iter().any(|kind| matches!(
+                        kind,
+                        WorkspaceSamplingOperation::OptionalTokenFilter
+                    ))
+                );
             } else {
                 assert_eq!(report.first_gap, Some(0));
                 assert_eq!(report.peak.bytes(), None);
@@ -452,16 +459,10 @@ fn exact_filter_compatibility_and_packed_input_contract_remain_explicit() {
         let selected = facts(OutputBacking::Independent);
         let calls = selected.calls.clone();
         let context = WorkspaceContext::new(selected);
-        assert!(quote_sampling_workspace(
-            &plain_sampler(),
-            0.0,
-            None,
-            &layout,
-            filter,
-            1,
-            &context
-        )
-        .is_err());
+        assert!(
+            quote_sampling_workspace(&plain_sampler(), 0.0, None, &layout, filter, 1, &context)
+                .is_err()
+        );
         assert!(calls.borrow().is_empty());
     }
 }

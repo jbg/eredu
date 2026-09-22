@@ -62,7 +62,10 @@ fn borrowed_descriptor_loan_and_exact_fill_allocate_nothing_and_share_ordinary_b
         assert_eq!(lazy.row_contiguous(), None);
         let unknown = lazy.facts().allocation();
         drop(lazy);
-        assert_eq!(runtime.descriptor(&source).unwrap().row_contiguous(), Some(true));
+        assert_eq!(
+            runtime.descriptor(&source).unwrap().row_contiguous(),
+            Some(true)
+        );
         (facts, borrowed, fill, short, unknown)
     });
     assert_eq!(allocations, 0);
@@ -134,9 +137,11 @@ fn borrowed_descriptor_loan_preserves_source_and_does_not_reclaim_unrelated_queu
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     drop(_hook);
     drop(runtime);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     drop(source);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 2);
 }

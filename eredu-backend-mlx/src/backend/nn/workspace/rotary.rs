@@ -106,15 +106,34 @@ pub(super) fn emit(
     let full = cap(count)?;
     let half_dims = dimensions as u64 / 2;
     let scalar = cap(1)?;
-    let frequency_state = if let Some(spec) = constructed {
+    let frequency_state = if let Some(spec) = constructed.filter(|_| offset.is_some()) {
         match spec.algorithm {
             // Include the complete lazy construction graph even on first use:
             // powers, wavelength comparisons, interpolation and reciprocal.
-            RotaryAlgorithm::Llama3 { .. } => add(mul(20, cap(half_dims)?)?, mul(16, scalar)?)?,
-            RotaryAlgorithm::Yarn { .. } | RotaryAlgorithm::Proportional { .. } => {
+            RotaryAlgorithm::Llama3 { .. } => {
+                // Twelve explicit F32 constructors plus reciprocal's numerator;
+                // InputProducts retains another reciprocal numerator.
+                let sources = 13 + usize::from(spec.arithmetic == RotaryArithmetic::InputProducts);
+                sink.default_scratch(mul(u64::try_from(sources)?, scalar)?, sources)?;
+                add(mul(20, cap(half_dims)?)?, mul(16, scalar)?)?
+            }
+            RotaryAlgorithm::Yarn { .. } => {
+                let sources = 1 + usize::from(spec.arithmetic == RotaryArithmetic::InputProducts);
+                sink.default_scratch(mul(u64::try_from(sources)?, cap(half_dims)?)?, sources)?;
                 mul(2, cap(half_dims)?)?
             }
-            _ if spec.arithmetic == RotaryArithmetic::InputProducts => cap(half_dims)?,
+            RotaryAlgorithm::Proportional { .. } => {
+                let inverse = spec.arithmetic == RotaryArithmetic::InputProducts;
+                sink.default_scratch(
+                    add(cap(half_dims)?, if inverse { scalar } else { 0 })?,
+                    1 + usize::from(inverse),
+                )?;
+                add(mul(2, cap(half_dims)?)?, if inverse { scalar } else { 0 })?
+            }
+            _ if spec.arithmetic == RotaryArithmetic::InputProducts => {
+                sink.default_scratch(cap(half_dims)?, 1)?;
+                cap(half_dims)?
+            }
             _ => 0,
         }
     } else {
@@ -147,9 +166,10 @@ pub(super) fn emit(
             }
             embeddings = add(embeddings, cap(layout.elements()?)?)?;
         }
-        // Embedding dtype casts, negative second half, rotate-half concat,
-        // both full products and sum. Include possible F32 scalar promotion
-        // casts of the two halves and one product before the final sum.
+        sink.default_scratch(scalar, 1)?; // negative-half multiplier
+                                          // Embedding dtype casts, negative second half, rotate-half concat,
+                                          // both full products and sum. Include possible F32 scalar promotion
+                                          // casts of the two halves and one product before the final sum.
         let first = cap(mul(count / width, width / 2)?)?;
         let second = cap(mul(count / width, width - width / 2)?)?;
         add(
@@ -161,6 +181,7 @@ pub(super) fn emit(
         let wavelength =
             matches!(spec.algorithm, RotaryAlgorithm::Llama3 { .. }) && !spec.traditional;
         let equation = if explicit || wavelength {
+            sink.default_scratch(scalar, 1)?; // amplitude or wavelength scale
             let angles = cap(mul(length, half_dims)?)?;
             let half = cap(mul(mul(leading, length)?, half_dims)?)?;
             let rotated = cap(mul(mul(leading, length)?, dimensions as u64)?)?;
@@ -206,12 +227,14 @@ pub(super) fn emit(
                 flattened,
                 half_dims,
                 allocation,
+                sink,
             )?;
             aliases_input = batches == 1;
             if flattened {
                 cost = add(cost, mul(2, full)?)?;
             }
             if matches!(spec.algorithm, RotaryAlgorithm::Yarn { .. }) {
+                sink.default_scratch(scalar, 1)?;
                 // Input amplitude multiplication, potential input/scalar casts.
                 cost = add(cost, add(mul(2, full)?, mul(2, scalar)?)?)?;
                 aliases_input = false;
@@ -239,6 +262,7 @@ pub(super) fn emit(
             explicit_frequencies,
             half_dims,
             allocation,
+            sink,
         )?
     };
     let total = add(total, frequency_state)?;
@@ -264,6 +288,7 @@ fn fused_cost(
     frequencies: bool,
     half_dims: u64,
     allocation: NativeAllocationFacts,
+    sink: &mut Emitter<'_>,
 ) -> FactResult<u64> {
     // The native dispatcher forms T*D and (N+3) in signed native integers,
     // including when its element-addressing kernel uses 64-bit offsets.
@@ -285,6 +310,10 @@ fn fused_cost(
     // even for a partial rotation or non-contiguous input; there is no extra
     // full-sized internal copy. Each invocation creates an integer offset and
     // may cast the frequency vector to F32.
+    sink.default_scratch(
+        mul(batches, capacity(allocation, 1)?)?,
+        usize::try_from(batches)?,
+    )?;
     let mut per_batch = add(
         capacity(allocation, count / batches)?,
         capacity(allocation, 1)?,

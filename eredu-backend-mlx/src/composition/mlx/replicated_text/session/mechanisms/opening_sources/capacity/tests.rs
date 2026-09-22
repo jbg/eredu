@@ -1,7 +1,7 @@
 //! Actual native topology and original neutral seal; no model work or publication.
 use super::*;
 use eredu_core::{capture::*, *};
-use eredu_nn::{workspace::*, Parameterized};
+use eredu_nn::{Parameterized, workspace::*};
 use eredu_runtime::working_memory::*;
 use eredu_runtime::{
     ArchitectureParameters, ResidentUnitWindow, StateLayout, StaticParameterVisitorMut,
@@ -156,7 +156,6 @@ pub(super) fn source() -> SharedCapturePlan {
                 &CaptureCapabilities {
                     transformations: vec![],
                     max_histogram_bins: 0,
-                    physical_native_limit: false,
                     conditions: vec![],
                 },
                 CaptureRequestShape {
@@ -183,10 +182,15 @@ impl WorkspaceMechanisms for NoOperations {
         panic!("no numerical operation in the host-custody fixture")
     }
 }
-pub(super) fn quote(pool: &WorkingMemoryPool) -> IncrementalInferenceQuote {
+pub(super) fn quote(pool: &MemoryLedger) -> IncrementalInferenceQuote {
     let g = geometry();
     let context = WorkspaceContext::new(NoOperations);
-    let storage = RegisteredWorkspaceStorage::<u32>::bind(pool, &context, []).unwrap();
+    let storage = RegisteredWorkspaceStorage::<u32>::bind(
+        pool,
+        &context,
+        std::iter::empty::<(u32, WorkspaceExistingStorage)>(),
+    )
+    .unwrap();
     let report = quote_inference_workspace(g, |_| {
         context.begin_state_span(std::iter::empty::<&WorkspaceTensor>())?;
         context.report(&[])
@@ -214,7 +218,8 @@ pub(super) fn quote(pool: &WorkingMemoryPool) -> IncrementalInferenceQuote {
             "no native work; existing sources externally retained in this fixture",
         )
     };
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: bound(),
         attention: bound(),
@@ -222,13 +227,13 @@ pub(super) fn quote(pool: &WorkingMemoryPool) -> IncrementalInferenceQuote {
         state_update: bound(),
         materialization: bound(),
         retained: bound(),
-    };
+    });
     ResidualInferenceQuote::compose(&report, state, outside, &storage)
         .unwrap()
         .into_incremental()
 }
 pub(super) fn accept(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     q: IncrementalInferenceQuote,
 ) -> (WorkingMemoryFundingRun, OwnedTextSpanWorkspace) {
     let caps = ModelCapabilities {
@@ -243,28 +248,29 @@ pub(super) fn accept(
         input: InputTokenCount::text(1),
         max_output_tokens: 2,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(0),
+        memory_limits: Default::default(),
     };
-    let exact = q.incremental_bytes();
-    assert!(plan_prefill_incremental_with_capacity(
-        &InferenceExecutionIdentity::default(),
-        pool,
-        &caps,
-        request.clone(),
-        geometry(),
-        exact - 1,
-        |_| Ok(q.clone())
-    )
-    .is_err());
+    let exact = q.incremental_bytes().expect("finite fixture diagnostic");
+    assert!(
+        plan_prefill_incremental_with_capacity(
+            &InferenceExecutionIdentity::default(),
+            pool,
+            &caps,
+            request.clone(),
+            geometry(),
+            crate::memory_fixture::resolved_limits(exact - 1),
+            |_| Ok(q.clone())
+        )
+        .is_err()
+    );
     let (r, q) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &caps,
         request,
         geometry(),
-        exact,
+        crate::memory_fixture::resolved_limits(exact),
         |_| Ok(q.clone()),
     )
     .unwrap();
@@ -362,7 +368,7 @@ fn one_actual_original_seal_funds_fixed_capsule_and_equal_facts_cannot_substitut
     let selected = paths.source().prepare_capture_selection(&source).unwrap();
     let bound = selected.bind_geometry(geometry()).unwrap();
     let store = eredu_checkpoint::store::MemoryWeightStore::default();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let q = quote(&pool);
     let plan = NativeOpeningCapacityPlan::prepare(&state, &execution, &store, None, bound, &paths)
         .unwrap();
@@ -413,13 +419,13 @@ fn one_actual_original_seal_funds_fixed_capsule_and_equal_facts_cannot_substitut
     ));
     drop(owned);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(capsule);
     // Its control binding is foreign, but the earlier diagnostic still owns
     // an alias of the actual equation plan and its later original custody.
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(foreign);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -431,7 +437,7 @@ fn separately_prepared_equal_controls_reject_before_capsule_allocation() {
     let source = source();
     let selected = paths.source().prepare_capture_selection(&source).unwrap();
     let store = eredu_checkpoint::store::MemoryWeightStore::default();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let q = quote(&pool);
     let plan = NativeOpeningCapacityPlan::prepare(
         &state,
@@ -461,16 +467,16 @@ fn separately_prepared_equal_controls_reject_before_capsule_allocation() {
         .unwrap();
     let (sealed, legitimate_q) = proposal.finish(q).unwrap();
     let (run, owned) = accept(&pool, foreign_q);
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let error = match sealed.allocate(&owned) {
         Err(e) => e,
         Ok(_) => panic!("foreign original identity accepted"),
     };
     assert!(matches!(error.cause, OpeningError::Identity));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert!(std::ptr::eq(error.plan.plan.state, &state));
     drop((error, legitimate_q, owned, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -551,26 +557,29 @@ fn actual_weight_manager_host_device_and_duplicate_checkpoint_roles_fit_original
     // Retain only through the permitted inspection clone under the manager
     // loan, then inspect/drop after unlocking and before original admission.
     let mut manager_array = None;
-    assert!(manager
-        .try_visit_retained_storage(&mut |entry| -> Result<(), OpeningError> {
-            if let crate::backend::runtime::residency::storage::RetainedStorageRef::Array(array) =
-                entry
-            {
-                assert!(
-                    manager_array.is_none(),
-                    "exactly one declared manager binding"
-                );
-                manager_array = Some(array.try_clone_for_inspection()?);
-            }
-            Ok(())
-        })
-        .unwrap());
+    assert!(
+        manager
+            .try_visit_retained_storage(&mut |entry| -> Result<(), OpeningError> {
+                if let crate::backend::runtime::residency::storage::RetainedStorageRef::Array(
+                    array,
+                ) = entry
+                {
+                    assert!(
+                        manager_array.is_none(),
+                        "exactly one declared manager binding"
+                    );
+                    manager_array = Some(array.try_clone_for_inspection()?);
+                }
+                Ok(())
+            })
+            .unwrap()
+    );
     let manager_array = manager_array.expect("the populated device binding was visited");
     let manager_fact = manager_array.try_allocation_info().unwrap().unwrap();
     assert!(manager_fact.bytes() >= 8);
     expected_arrays.push(manager_fact);
     drop(manager_array);
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let q = quote(&pool);
     let proposal = plan
         .seal(
@@ -608,7 +617,7 @@ fn actual_weight_manager_host_device_and_duplicate_checkpoint_roles_fit_original
         1
     );
     drop((capsule, owned, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 struct AdversarialSource {
@@ -674,7 +683,7 @@ impl CheckpointSource for AdversarialSource {
 
 #[test]
 fn unknown_source_rejects_cold_and_failed_visitors_keep_real_prefix_and_original_cause() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     let stream = stream();
     let execution = execution(&stream);
     let paths = execution.prepare_observation_paths().unwrap();
@@ -696,7 +705,7 @@ fn unknown_source_rejects_cold_and_failed_visitors_keep_real_prefix_and_original
         ));
         assert_eq!(store.visits.load(std::sync::atomic::Ordering::SeqCst), 0);
         store.bound = Some(1);
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let q = quote(&pool);
         let plan =
             NativeOpeningCapacityPlan::prepare(&state, &execution, &store, None, bound, &paths)
@@ -740,18 +749,18 @@ fn unknown_source_rejects_cold_and_failed_visitors_keep_real_prefix_and_original
         ));
         let held = owned.protected_host_bytes();
         drop((owned, run));
-        assert!(pool.used_bytes().unwrap() >= held);
+        assert!(pool.fixture_host_charge().unwrap() >= held);
         drop(capsule);
         assert_eq!(Arc::strong_count(&store.root), 1);
         if mode != 3 {
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 held,
                 "escaped error keeps exactly original P+Q after capsule retirement"
             );
         }
         drop(result);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
 
@@ -770,7 +779,7 @@ fn partial_buffer_allocation_failure_keeps_the_original_plan_hold_and_sources_un
         panic: Arc::new(()),
         visits: Default::default(),
     };
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let q = quote(&pool);
     let plan = NativeOpeningCapacityPlan::prepare(
         &state,
@@ -799,7 +808,11 @@ fn partial_buffer_allocation_failure_keeps_the_original_plan_hold_and_sources_un
     assert_eq!(store.visits.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(Arc::strong_count(&store.root), 1);
     drop((owned, run));
-    assert!(pool.used_bytes().unwrap() >= held);
+    assert!(pool.fixture_host_charge().unwrap() >= held);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

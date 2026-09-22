@@ -236,21 +236,32 @@ impl<'a> CapturePrefillObservationPolicy<'a> {
             None
         };
         let routed = if active && matches!(selection.transform, CaptureTransform::RoutedUnits) {
-            Some(CaptureRoutedPrefillPlan::prepare(admission,index,self.inference)?)
-        } else {None};
-        let assembly =
-            if active && candidate.is_none() && token_scores.is_none() && transform.is_none() && routed.is_none() {
-                if !admission.points().get(index).is_some_and(|p| p.prefill) {
-                    return Err(CapturePrefillProgressError::UnavailableHook);
-                }
-                Some(CapturePrefillRowAssembly::prepare(
-                    admission,
-                    index,
-                    self.inference,
-                )?)
-            } else {
-                None
-            };
+            Some(CaptureRoutedPrefillPlan::prepare(
+                admission,
+                index,
+                self.inference,
+            )?)
+        } else {
+            None
+        };
+        let assembly = if active
+            && candidate.is_none()
+            && token_scores.is_none()
+            && (transform.is_none()
+                || matches!(selection.transform, CaptureTransform::Preview { .. }))
+            && routed.is_none()
+        {
+            if !admission.points().get(index).is_some_and(|p| p.prefill) {
+                return Err(CapturePrefillProgressError::UnavailableHook);
+            }
+            Some(CapturePrefillRowAssembly::prepare(
+                admission,
+                index,
+                self.inference,
+            )?)
+        } else {
+            None
+        };
         Ok(CapturePrefillObservationRow {
             source: self.source,
             inference: self.inference,
@@ -279,26 +290,35 @@ pub struct CapturePrefillObservationRow<'a> {
 impl CapturePrefillObservationRow<'_> {
     /// Report a terminal quota skip from this exact immutable row and schedule.
     /// The result grants no source, payload or completion authority.
-    pub fn is_skipped(&self, progress: &CapturePrefillRowProgress)
-        -> Result<bool, CapturePrefillProgressError> {
+    pub fn is_skipped(
+        &self,
+        progress: &CapturePrefillRowProgress,
+    ) -> Result<bool, CapturePrefillProgressError> {
         self.validate(progress, progress.next)?;
         Ok(progress.logical == Logical::Skipped)
     }
     /// Actual sparse source bound to the same canonical driver progression.
-    pub fn routed_plan(&self)->Option<&CaptureRoutedPrefillPlan<'_>> {self.routed.as_ref()}
+    pub fn routed_plan(&self) -> Option<&CaptureRoutedPrefillPlan<'_>> {
+        self.routed.as_ref()
+    }
     /// Complete a sparse hook after its real provider ranges and rows were recorded.
-    pub fn finish_routed_hook(&self,progress:&mut CapturePrefillRowProgress,
-        fragment:&CaptureRoutedPrefillFragment<'_,'_>)->Result<(),CapturePrefillProgressError>{
-        let plan=fragment.plan();
-        if !std::ptr::eq(plan.geometry().admission(),self.source.admission())
-            || plan.geometry().selection_index()!=self.index || plan.inference_geometry()!=self.inference {
+    pub fn finish_routed_hook(
+        &self,
+        progress: &mut CapturePrefillRowProgress,
+        fragment: &CaptureRoutedPrefillFragment<'_, '_>,
+    ) -> Result<(), CapturePrefillProgressError> {
+        let plan = fragment.plan();
+        if !std::ptr::eq(plan.geometry().admission(), self.source.admission())
+            || plan.geometry().selection_index() != self.index
+            || plan.inference_geometry() != self.inference
+        {
             return Err(CapturePrefillProgressError::Identity);
         }
-        self.validate(progress,fragment.chunk_index())?;
-        if progress.logical!=Logical::Charged || progress.hook!=Hook::Attempting {
+        self.validate(progress, fragment.chunk_index())?;
+        if progress.logical != Logical::Charged || progress.hook != Hook::Attempting {
             return Err(CapturePrefillProgressError::Attempt);
         }
-        progress.hook=Hook::Seen;
+        progress.hook = Hook::Seen;
         Ok(())
     }
     /// Active ordinary transform plan. No original claim is provided.
@@ -327,6 +347,8 @@ impl CapturePrefillObservationRow<'_> {
     }
 
     /// Only active rows have geometry. No execution/readout authority is implied.
+    /// Preview also exposes bounded tensor fragments for funded collectors;
+    /// ordinary transform collectors retain the same logical prefix plan.
     pub fn assembly(&self) -> Option<&CapturePrefillRowAssembly<'_>> {
         self.assembly.as_ref()
     }
@@ -457,7 +479,11 @@ impl CapturePrefillObservationRow<'_> {
             inference: self.inference,
             index: self.index,
             next: 0,
-            logical: if self.assembly.is_some() || self.terminal() || self.transform.is_some() || self.routed.is_some() {
+            logical: if self.assembly.is_some()
+                || self.terminal()
+                || self.transform.is_some()
+                || self.routed.is_some()
+            {
                 Logical::Uncharged
             } else {
                 Logical::Skipped
@@ -509,7 +535,11 @@ impl CapturePrefillObservationRow<'_> {
                 return Ok(CapturePrefillHookDecision::Ignore);
             }
         } else if let Some(plan) = &self.routed {
-            if !plan.fragment(progress.next)?.matches_chunk(&chunk.input,chunk.position,chunk.output) {
+            if !plan.fragment(progress.next)?.matches_chunk(
+                &chunk.input,
+                chunk.position,
+                chunk.output,
+            ) {
                 return Err(CapturePrefillProgressError::Order);
             }
         } else if let Some(plan) = &self.transform {
@@ -547,15 +577,23 @@ impl CapturePrefillObservationRow<'_> {
     /// Continue one routed provider invocation after its first batch charged
     /// the logical row. Only sparse hooks permit multiple physical batches.
     pub fn begin_routed_batch(
-        &self, progress: &mut CapturePrefillRowProgress,
-        chunk: &PrefillChunk, path: &str,
+        &self,
+        progress: &mut CapturePrefillRowProgress,
+        chunk: &PrefillChunk,
+        path: &str,
     ) -> Result<CapturePrefillHookDecision, CapturePrefillProgressError> {
         if self.source.admission().plan().selections[self.index].path != path {
             return Ok(CapturePrefillHookDecision::Ignore);
         }
-        let plan = self.routed.as_ref().ok_or(CapturePrefillProgressError::Identity)?;
+        let plan = self
+            .routed
+            .as_ref()
+            .ok_or(CapturePrefillProgressError::Identity)?;
         self.validate(progress, progress.next)?;
-        if !plan.fragment(progress.next)?.matches_chunk(&chunk.input, chunk.position, chunk.output) {
+        if !plan
+            .fragment(progress.next)?
+            .matches_chunk(&chunk.input, chunk.position, chunk.output)
+        {
             return Err(CapturePrefillProgressError::Order);
         }
         if progress.logical == Logical::Charged && progress.hook == Hook::Attempting {
@@ -589,8 +627,10 @@ impl CapturePrefillObservationRow<'_> {
             }
         }
     }
-    pub(crate) fn skip_partition_before_hook(&self, progress: &mut CapturePrefillRowProgress)
-        -> Result<(), CapturePrefillProgressError> {
+    pub(crate) fn skip_partition_before_hook(
+        &self,
+        progress: &mut CapturePrefillRowProgress,
+    ) -> Result<(), CapturePrefillProgressError> {
         self.validate(progress, 0)?;
         if progress.logical != Logical::Uncharged || progress.hook != Hook::Unseen {
             return Err(CapturePrefillProgressError::Attempt);
@@ -601,25 +641,36 @@ impl CapturePrefillObservationRow<'_> {
     /// Advance the same first-hook state using the existing global producer
     /// reservation. The receiver creates no second logical native charge.
     pub(crate) fn reserve_remote_first(
-        &self, progress: &mut CapturePrefillRowProgress,
+        &self,
+        progress: &mut CapturePrefillRowProgress,
         charge: &crate::capture::partition::PreparedPartitionRemoteCharge<'_>,
     ) -> Result<(), CapturePrefillProgressError> {
         self.validate(progress, progress.next)?;
-        if progress.logical != Logical::Uncharged || progress.hook != Hook::Attempting
+        if progress.logical != Logical::Uncharged
+            || progress.hook != Hook::Attempting
             || !charge.validate(self.source, self.index)
-        { return Err(CapturePrefillProgressError::Attempt); }
+        {
+            return Err(CapturePrefillProgressError::Attempt);
+        }
         progress.logical = Logical::Charged;
         Ok(())
     }
     /// Acknowledge the same already-paid global equation for local/remote
     /// fragment assembly. This source supplies no local native work credits.
-    pub(crate) fn reserve_assembly_first(&self,progress:&mut CapturePrefillRowProgress,
-        charge:&crate::capture::partition::PreparedPartitionAssemblyCharge<'_>)
-        ->Result<(),CapturePrefillProgressError> {
-        self.validate(progress,progress.next)?;
-        if progress.logical!=Logical::Uncharged || progress.hook!=Hook::Attempting
-            || !charge.validate(self.source,self.index) {return Err(CapturePrefillProgressError::Attempt);}
-        progress.logical=Logical::Charged;Ok(())
+    pub(crate) fn reserve_assembly_first(
+        &self,
+        progress: &mut CapturePrefillRowProgress,
+        charge: &crate::capture::partition::PreparedPartitionAssemblyCharge<'_>,
+    ) -> Result<(), CapturePrefillProgressError> {
+        self.validate(progress, progress.next)?;
+        if progress.logical != Logical::Uncharged
+            || progress.hook != Hook::Attempting
+            || !charge.validate(self.source, self.index)
+        {
+            return Err(CapturePrefillProgressError::Attempt);
+        }
+        progress.logical = Logical::Charged;
+        Ok(())
     }
     /// Reuse the legacy generated creation charge from the checked FULL source.
     /// Actual chunk descriptors, source roots and physical traces remain separate.

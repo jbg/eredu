@@ -2947,7 +2947,11 @@ fn with_local_expert_child<B, P, F>(source: eredu_nn::workspace::WorkspaceExpert
 where B: eredu_runtime::CommunicationBackend, P: eredu_nn::Parameterized<B::Tensor>,
     F: FnOnce(&mut P) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, crate::RoutedTextExecutionError> {
     match local {
-        LocalExpertIndices::Ordinary(_) => run(bank),
+        LocalExpertIndices::Ordinary(indices) => {
+            B::with_ordinary_expert_route_local(source, bank, input, scores, coefficients,
+                indices, source_context, executor, run)
+                .map_err(crate::RoutedTextExecutionError::from_error)?
+        },
         LocalExpertIndices::Original(receipt) => {
             let context = source_context.ok_or("local expert child lost its original model source")?;
             B::with_expert_route_local(source, bank, input, scores, coefficients, receipt.completed_source(),

@@ -8,8 +8,8 @@ use std::{
     fmt,
     ops::Deref,
     sync::{
-        Arc, Weak,
         atomic::{AtomicBool, Ordering},
+        Arc, Weak,
     },
 };
 
@@ -25,13 +25,15 @@ impl Drop for ManagerCustody {
     }
 }
 impl ManagerCustody {
-    pub(crate) fn is_source_funded(&self) -> bool { self.0.is_some() }
+    pub(crate) fn is_source_funded(&self) -> bool {
+        self.0.is_some()
+    }
     pub(super) fn new(custody: SharedNativeInitializationCustody) -> Self {
         Self(Some(Arc::new(custody)))
     }
     pub(super) fn validate_pool(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.0
             .as_deref()
@@ -82,7 +84,7 @@ impl ManagerOwner {
     }
     pub(super) fn validate_pool(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.custody.validate_pool(pool)
     }
@@ -210,6 +212,7 @@ impl AsRef<safemlx::Stream> for ManagerStream {
 enum HostCustody {
     Source(ManagerCustody),
     Request(eredu_runtime::working_memory::OriginalOperationMetadataCustody),
+    Ordinary(eredu_nn::workspace::HostMetadataFunding),
 }
 
 /// Immutable transfer-buffer owner preserving its source account through every
@@ -229,12 +232,29 @@ struct PreparedHostBuffer {
     attachment: Option<super::super::storage::PublishedAllocation>,
 }
 impl RetainedHostBuffer {
+    pub(super) fn ordinary_with_metadata(
+        buffer: safemlx::ImmutableHostTransferBuffer,
+        funding: eredu_nn::workspace::HostMetadataFunding,
+    ) -> Self {
+        Self {
+            value: HostBufferValue::Ordinary(Arc::new(buffer)),
+            custody: HostCustody::Ordinary(funding),
+        }
+    }
+    pub(super) fn ordinary_storage_bytes() -> Result<u64, WorkingMemoryError> {
+        OriginalHostMetadataCustody::shared_storage_bytes(Layout::new::<
+            safemlx::ImmutableHostTransferBuffer,
+        >())
+    }
     pub(super) fn original(
         buffer: safemlx::ImmutableHostTransferBuffer,
         custody: ManagerCustody,
     ) -> Self {
         Self {
-            value: HostBufferValue::Original(Arc::new(PreparedHostBuffer { buffer, attachment: None })),
+            value: HostBufferValue::Original(Arc::new(PreparedHostBuffer {
+                buffer,
+                attachment: None,
+            })),
             custody: HostCustody::Source(custody),
         }
     }
@@ -262,12 +282,17 @@ impl RetainedHostBuffer {
             size_of::<super::super::storage::RetainedAllocationReceipt<'_>>(),
             size_of::<Option<super::super::storage::RetainedAllocationReceipt<'_>>>(),
         ];
-        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
     }
-    pub(crate) fn attachment_receipt(&self) -> Option<super::super::storage::RetainedAllocationReceipt<'_>> {
+    pub(crate) fn attachment_receipt(
+        &self,
+    ) -> Option<super::super::storage::RetainedAllocationReceipt<'_>> {
         match (&self.value, &self.custody) {
-            (HostBufferValue::Original(value), HostCustody::Request(custody)) =>
-                value.attachment.map(|proof| proof.borrow(custody)),
+            (HostBufferValue::Original(value), HostCustody::Request(custody)) => {
+                value.attachment.map(|proof| proof.borrow(custody))
+            }
             _ => None,
         }
     }
@@ -326,6 +351,16 @@ pub struct ResidentHostOwner {
     _metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl ResidentHostOwner {
+    pub(super) fn ordinary_with_metadata(
+        value: super::ResidentHostBuffers,
+        funding: eredu_nn::workspace::HostMetadataFunding,
+    ) -> Self {
+        Self {
+            value: Arc::new(value),
+            custody: HostCustody::Ordinary(funding),
+            _metadata: None,
+        }
+    }
     pub(super) fn original(value: super::ResidentHostBuffers, custody: ManagerCustody) -> Self {
         Self {
             value: Arc::new(value),

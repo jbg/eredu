@@ -29,7 +29,11 @@ pub(super) fn validate_invocation(
     let rows = PartitionRoutedUnitCaptureLayout::input_rows(shape)
         .map_err(|_| failure(backend, CaptureTensorNativeError::ShapeMismatch))?;
     layout
-        .validate_input_invocation(rows, input.unit_coordinates, input.origins.map(|origins| origins.capture_coordinates()))
+        .validate_input_invocation(
+            rows,
+            input.unit_coordinates,
+            input.origins.map(|origins| origins.capture_coordinates()),
+        )
         .map_err(FundedCaptureError::Admission)?;
     Ok((
         rows,
@@ -43,30 +47,60 @@ pub(super) fn validate_source(
     invocation_source_tokens: u64,
     actual_native_rows: u64,
 ) -> Result<TensorDtype, FundedCaptureError<Error>> {
-    validate_batch(backend, source, &PartitionRoutedUnitCaptureLayout {
-        geometry: request.geometry, source_tokens: invocation_source_tokens,
-        ownership: request.ownership,
-    }, actual_native_rows).map(|(dtype,_)|dtype)
+    validate_batch(
+        backend,
+        source,
+        &PartitionRoutedUnitCaptureLayout {
+            geometry: request.geometry,
+            source_tokens: invocation_source_tokens,
+            ownership: request.ownership,
+        },
+        actual_native_rows,
+    )
+    .map(|(dtype, _)| dtype)
 }
 
 pub(super) fn validate_batch(
-    backend: &NativeScheduledCapture<'_>, source: &PartitionRoutedUnitCaptureSource<'_, Array>,
-    layout: &PartitionRoutedUnitCaptureLayout<'_>, actual_native_rows: u64,
-) -> Result<(TensorDtype,u64), FundedCaptureError<Error>> {
-    let value=&source.source;
-    let shapes=[value.values.shape(),value.token_indices.shape(),value.selection_indices.shape(),
-        value.coefficients.shape(),value.source_groups.shape()];
-    let dtypes=[value.values.dtype(),value.token_indices.dtype(),value.selection_indices.dtype(),
-        value.coefficients.dtype(),value.source_groups.dtype()];
-    let (_,tokens)=CompletedPartitionRoutedCaptureSource::validate_source_layouts(
-        shapes,Some(dtypes),value.token_offset,crate::backend::array_copy::PartitionRoutedCaptureLayout {
-            geometry:layout.geometry,source_tokens:layout.source_tokens,ownership:layout.ownership,
-            origins:source.origins,units:source.unit_coordinates,
-        }).map_err(|cause|failure(backend,cause))?;
-    if u64::try_from(shapes[4][0]).ok()!=Some(actual_native_rows) {
-        return Err(failure(backend,CaptureTensorNativeError::SourceChanged));
+    backend: &NativeScheduledCapture<'_>,
+    source: &PartitionRoutedUnitCaptureSource<'_, Array>,
+    layout: &PartitionRoutedUnitCaptureLayout<'_>,
+    actual_native_rows: u64,
+) -> Result<(TensorDtype, u64), FundedCaptureError<Error>> {
+    let value = &source.source;
+    let shapes = [
+        value.values.shape(),
+        value.token_indices.shape(),
+        value.selection_indices.shape(),
+        value.coefficients.shape(),
+        value.source_groups.shape(),
+    ];
+    let dtypes = [
+        value.values.dtype(),
+        value.token_indices.dtype(),
+        value.selection_indices.dtype(),
+        value.coefficients.dtype(),
+        value.source_groups.dtype(),
+    ];
+    let (_, tokens) = CompletedPartitionRoutedCaptureSource::validate_source_layouts(
+        shapes,
+        Some(dtypes),
+        value.token_offset,
+        crate::backend::array_copy::PartitionRoutedCaptureLayout {
+            geometry: layout.geometry,
+            source_tokens: layout.source_tokens,
+            ownership: layout.ownership,
+            origins: source.origins,
+            units: source.unit_coordinates,
+        },
+    )
+    .map_err(|cause| failure(backend, cause))?;
+    if u64::try_from(shapes[4][0]).ok() != Some(actual_native_rows) {
+        return Err(failure(backend, CaptureTensorNativeError::SourceChanged));
     }
-    Ok((dtype(value.values).map_err(|cause|failure(backend,cause))?,tokens))
+    Ok((
+        dtype(value.values).map_err(|cause| failure(backend, cause))?,
+        tokens,
+    ))
 }
 
 pub(super) fn control_bytes() -> Option<usize> {

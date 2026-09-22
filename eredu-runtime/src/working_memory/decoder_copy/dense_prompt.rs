@@ -85,6 +85,35 @@ impl<'a, S, D, K: HostSlotStorageKey> RegisteredDenseDecoderInitialization<'a, S
         Ok(())
     }
 
+    /// Complete publication constructor allowance required in the admitted host
+    /// workspace when the source has no original preparation authority. This
+    /// diagnostic grants no allocation or execution permission. Concrete nested
+    /// key clone payload must be quoted by the key producer separately.
+    pub fn ordinary_publication_control_bytes() -> Result<u64, WorkingMemoryError> {
+        crate::working_memory::storage::ordinary_dense_host_publication_bytes::<K>()
+    }
+
+    /// Complete ordinary constructor allowance for this actual table source and
+    /// destination type, including header and publication metadata. The closed
+    /// constructor protects it before allocating the destination table.
+    pub fn ordinary_preparation_control_bytes(&self) -> Result<u64, WorkingMemoryError> {
+        crate::working_memory::storage::ordinary_dense_preparation_bytes::<S, D, K>()
+    }
+
+    pub(super) fn prepare_before_allocation(
+        &mut self,
+        custody: &WorkingMemoryDecoderHostScope,
+        execution: &InferenceExecutionIdentity,
+    ) -> Result<(), WorkingMemoryError> {
+        if self.preparation.is_none() {
+            let host = crate::working_memory::storage::prepare_dense_host_metadata::<S, D, K>(
+                custody, execution,
+            )?;
+            self.prepare_destination(Some(&host))?;
+        }
+        Ok(())
+    }
+
     /// Owning cold constructor facts for one exact dense table. The provider
     /// supplies the actual source branch and key clone payload extent.
     pub fn preparation_control_bytes(
@@ -93,6 +122,13 @@ impl<'a, S, D, K: HostSlotStorageKey> RegisteredDenseDecoderInitialization<'a, S
     ) -> Result<usize, preparation::DecoderHostPreparationError> {
         use std::mem::size_of;
         preparation::add([
+            // The generic constructor supports both a retained original H and
+            // an ordinary account. Its cold allowance covers the latter's
+            // separately retained publication metadata as well.
+            usize::try_from(preparation::memory(
+                crate::working_memory::storage::ordinary_dense_preparation_bytes::<S, D, K>(),
+            )?)
+            .map_err(|_| preparation::DecoderHostPreparationError::Overflow)?,
             RegisteredDecoderHostCopy::<S, K>::binding_control_bytes(registered)?,
             DenseHostSlotInitialization::<S, D>::preparation_control_bytes()
                 .ok_or(preparation::DecoderHostPreparationError::UnknownBound)?,
@@ -159,6 +195,12 @@ impl<'a, S, D, K: HostSlotStorageKey> RegisteredDenseDecoderInitialization<'a, S
             pins,
             self.initialization_peak_bytes(),
         )?;
+        if let Err(error) = self.prepare_before_allocation(&custody, &execution) {
+            // No destination or native operation has been constructed or exposed.
+            // Retire this unused native scope without quarantining the source.
+            native.certify()?;
+            return Err(error.into());
+        }
         #[cfg(test)]
         tests::before_initialize();
         Ok((

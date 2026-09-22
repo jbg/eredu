@@ -119,7 +119,7 @@ impl ProviderAuthority {
             Self::Copy(c) => GenerationCopySource::Copied(c),
         }
     }
-    fn pool(&self) -> &WorkingMemoryPool {
+    fn pool(&self) -> &MemoryLedger {
         match self {
             Self::Original { controls, .. } => controls.custody.raw().pool(),
             Self::Copy(c) => c.pool(),

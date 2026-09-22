@@ -1,7 +1,7 @@
 //! Finite destination constructors for the same independently admitted copy.
 use super::*;
 use crate::backend::runtime::residency::storage::{
-    CopyPublicationLayout, PendingCopyPublication, retain_copy_publication_failure,
+    retain_copy_publication_failure, CopyPublicationLayout, PendingCopyPublication,
 };
 use eredu_core::HostPreparationAuthority;
 use eredu_runtime::working_memory::{WorkspaceCopyCustody, WorkspaceCopyRetention};

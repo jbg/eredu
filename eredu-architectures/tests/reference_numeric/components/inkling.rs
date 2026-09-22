@@ -9,6 +9,7 @@ fn relative_attention_rejects_invalid_geometry_before_backend_work() {
         data: Vec::new(),
         dtype: eredu_core::checkpoint::TensorDtype::F32,
         retirement_probe: None,
+        publication_funding: None,
     };
     let mut q = make(&[1, 4, 3, 8]);
     let mut k = make(&[1, 2, 3, 8]);
@@ -206,10 +207,11 @@ impl eredu_runtime::RoutedUnitObserver<NumericTensor> for Observer {
         &mut self,
         batch: &eredu_runtime::RoutedUnitBatch<'_, NumericTensor>,
     ) -> Result<(), Error> {
-        assert!(self
-            .original_units
-            .replace(batch.units.values.clone())
-            .is_none());
+        assert!(
+            self.original_units
+                .replace(batch.units.values.clone())
+                .is_none()
+        );
         Ok(())
     }
     fn intervene(
@@ -259,7 +261,11 @@ impl eredu_runtime::RoutedUnitObserver<NumericTensor> for Observer {
 
 struct Initialize;
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Initialize {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut NumericTensor,
+    ) {
         let name = metadata.id().as_str();
         value.data = deterministic_values(
             &ParameterSpec::trainable(name).unwrap(),
@@ -536,10 +542,12 @@ fn trial(
                     equation => panic!("unexpected decoder transform {equation:?}"),
                 };
                 assert_eq!(parameter.parameter, parameter.shared_parameter);
-                assert!(graph
-                    .parameter_groups
-                    .iter()
-                    .any(|group| group.id == parameter.parameter_group));
+                assert!(
+                    graph
+                        .parameter_groups
+                        .iter()
+                        .any(|group| group.id == parameter.parameter_group)
+                );
                 assert_tensor_close(
                     &reference,
                     &observer.values[&transform.output],

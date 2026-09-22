@@ -292,7 +292,7 @@ pub(in crate::backend::nn::workspace) fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_nn::{BlockwiseAttentionOptions, workspace::WorkspaceLayoutList};
+    use eredu_nn::{workspace::WorkspaceLayoutList, BlockwiseAttentionOptions};
     fn f32_layout(shape: &[i32]) -> WorkspaceLayoutView<'_> {
         WorkspaceLayoutView::new(shape, WorkspaceDtype::Float32).unwrap()
     }
@@ -344,24 +344,7 @@ mod tests {
         let outputs = [inputs[0], f32_layout(&[1, 2, 2, 2])];
         for mask in [f32_layout(&[]), f32_layout(&[2, 1]), f32_layout(&[2, 0])] {
             let inputs = [inputs[0], mask];
-            assert!(
-                decode(WorkspaceOperationView {
-                    kind: WorkspaceOperationKindView::BlockwiseAttention {
-                        policy: WorkspaceBlockwisePolicy {
-                            mask_origin: Some(0),
-                            ..policy
-                        },
-                        stage: WorkspaceBlockwiseStage::Begin
-                    },
-                    inputs: WorkspaceLayoutList::Views(&inputs),
-                    outputs: WorkspaceLayoutList::Views(&outputs),
-                })
-                .is_err()
-            );
-        }
-        let inputs = [inputs[0], f32_layout(&[2, 2])];
-        assert!(
-            decode(WorkspaceOperationView {
+            assert!(decode(WorkspaceOperationView {
                 kind: WorkspaceOperationKindView::BlockwiseAttention {
                     policy: WorkspaceBlockwisePolicy {
                         mask_origin: Some(0),
@@ -372,8 +355,21 @@ mod tests {
                 inputs: WorkspaceLayoutList::Views(&inputs),
                 outputs: WorkspaceLayoutList::Views(&outputs),
             })
-            .unwrap()
-            .is_some()
-        );
+            .is_err());
+        }
+        let inputs = [inputs[0], f32_layout(&[2, 2])];
+        assert!(decode(WorkspaceOperationView {
+            kind: WorkspaceOperationKindView::BlockwiseAttention {
+                policy: WorkspaceBlockwisePolicy {
+                    mask_origin: Some(0),
+                    ..policy
+                },
+                stage: WorkspaceBlockwiseStage::Begin
+            },
+            inputs: WorkspaceLayoutList::Views(&inputs),
+            outputs: WorkspaceLayoutList::Views(&outputs),
+        })
+        .unwrap()
+        .is_some());
     }
 }

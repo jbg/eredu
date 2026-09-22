@@ -5,9 +5,7 @@ use super::{
 };
 use crate::working_memory::{OriginalTokenizer, OriginalTokenizerBackend};
 use eredu_core::{ModelRuntime, TokenInputRejection};
-use eredu_text::chat_storage::{
-    ChatRenderContext, ChatSourceError, ChatTemplatePlan,
-};
+use eredu_text::chat_storage::{ChatRenderContext, ChatSourceError, ChatTemplatePlan};
 use std::mem::size_of;
 
 /// Actual source/file operation error with no pre-admission error erasure.
@@ -57,7 +55,8 @@ pub enum OriginalChatRenderOperationError {
 }
 impl OriginalChatRenderOperationError {
     pub(super) fn render_controls() -> Option<usize> {
-        size_of::<Self>().checked_add(size_of::<TokenInputRejection>())?
+        size_of::<Self>()
+            .checked_add(size_of::<TokenInputRejection>())?
             .checked_add(size_of::<Result<(), Self>>())?
             .checked_add(size_of::<Result<OriginalRenderedChat, Self>>())?
             .checked_add(size_of::<Option<OriginalRenderedChat>>())?
@@ -72,19 +71,27 @@ pub trait OriginalChatBackend: OriginalTokenizerBackend {
     /// Geometry comes from the actual paid prompt; the returned original source
     /// owns fresh declaration storage and does not grant execution authority.
     fn compile_original_capture_declaration(
-        _runtime: &ModelRuntime<Self>, _plan: &eredu_core::capture::CapturePlan,
+        _runtime: &ModelRuntime<Self>,
+        _plan: &eredu_core::capture::CapturePlan,
         _request: eredu_core::capture::CaptureRequestShape,
         _funding: &eredu_core::HostMetadataFunding,
-    ) -> Result<crate::working_memory::OriginalCaptureSource, crate::working_memory::OriginalCaptureSourceError> {
-        Err(crate::working_memory::OriginalCaptureSourceError::rejected(crate::working_memory::WorkingMemoryError::UnknownBound))
+    ) -> Result<
+        crate::working_memory::OriginalCaptureSource,
+        crate::working_memory::OriginalCaptureSourceError,
+    > {
+        Err(crate::working_memory::OriginalCaptureSourceError::rejected(
+            crate::working_memory::WorkingMemoryError::UnknownBound,
+        ))
     }
 
     /// Compile the same original intervention source used by restored children,
     /// using this logical session and exact capture geometry. No ordinary source
     /// may be relabeled; failure preserves the concrete preparation cause.
     fn compile_original_intervention_declaration(
-        _runtime: &ModelRuntime<Self>, _plan: &eredu_core::intervention::InterventionPlan,
-        _capture: &eredu_core::capture::SharedCapturePlan, _session_id: &str,
+        _runtime: &ModelRuntime<Self>,
+        _plan: &eredu_core::intervention::InterventionPlan,
+        _capture: &eredu_core::capture::SharedCapturePlan,
+        _session_id: &str,
         _funding: &eredu_core::HostMetadataFunding,
     ) -> Result<crate::working_memory::OriginalInterventionSource, eredu_core::BackendFailure> {
         Err(TokenInputRejection::Unsupported.into_backend_failure())
@@ -129,7 +136,7 @@ pub trait OriginalChatBackend: OriginalTokenizerBackend {
         _runtime: &ModelRuntime<Self>,
         _template: &OriginalChatTemplate,
         _tokenizer: &OriginalTokenizer,
-        _capacity: u64,
+        _limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<super::OriginalChatProfilePreparation, super::OriginalChatProfileError> {
         Err(TokenInputRejection::Unsupported.into())
     }

@@ -5,9 +5,9 @@
 //! use the existing atomic account commit before constructing original owners.
 
 use super::{
-    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AvailableMemory,
-    CapabilityError, EstimationCompleteness, ExecutionWorkspaceEstimate, ModelCapabilities,
-    RuntimeStateEstimate, WorkspaceBound,
+    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, CapabilityError,
+    EstimationCompleteness, ExecutionWorkspaceEstimate, ModelCapabilities, RuntimeStateEstimate,
+    WorkspaceBound,
 };
 use crate::{InferenceGeometry, Observed};
 
@@ -119,6 +119,9 @@ pub struct SelectedStateRequirements {
 /// Borrowed-report projection of the state fields consumed by admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionStateRequirements {
+    /// Complete physical-domain attribution is available independently of any
+    /// aggregate diagnostic. This pure observation grants no execution authority.
+    pub physical_domains: bool,
     /// Actual state plus distinct retained-media and media-workspace terms.
     pub requested_state_bytes: u64,
     /// State estimator batch assumption.
@@ -138,6 +141,23 @@ pub struct AdmissionStateRequirements {
 impl From<&RuntimeStateEstimate> for AdmissionStateRequirements {
     fn from(value: &RuntimeStateEstimate) -> Self {
         Self {
+            physical_domains: value.physical_domains.is_some()
+                && value.selected_state_backing.as_ref().is_none_or(|backing| {
+                    !matches!(backing.bound, super::WorkspaceBound::Unknown { .. })
+                })
+                && value.execution_workspace.as_ref().is_some_and(|w| {
+                    w.physical_domains.is_some()
+                        && [
+                            &w.activations,
+                            &w.attention,
+                            &w.vocabulary,
+                            &w.state_update,
+                            &w.materialization,
+                            &w.retained,
+                        ]
+                        .into_iter()
+                        .all(|bound| !matches!(bound, super::WorkspaceBound::Unknown { .. }))
+                }),
             requested_state_bytes: value.requested_state_bytes,
             batch_size: value.assumptions.batch_size,
             requested_positions: value.assumptions.requested_positions,
@@ -196,8 +216,9 @@ pub struct AdmissionRequirements<'a> {
     pub state: AdmissionStateRequirements,
     /// Separately proved incremental requirement, when supplied.
     pub incremental: Option<AdmissionObservation<'a>>,
-    /// Actual requested availability signal, when supplied.
-    pub available: Option<AdmissionObservation<'a>>,
+    /// The complete incremental charge is reported independently in each
+    /// physical domain and has no aggregate byte diagnostic.
+    pub incremental_per_domain: bool,
 }
 
 impl<'a> AdmissionRequirements<'a> {
@@ -206,16 +227,20 @@ impl<'a> AdmissionRequirements<'a> {
         capabilities: &'a ModelCapabilities,
         state: &RuntimeStateEstimate,
         incremental: Option<&'a WorkspaceBound>,
-        available: Option<&'a AvailableMemory>,
     ) -> Self {
         Self {
             maximum_context: (&capabilities.effective_max_context).into(),
             state: state.into(),
-            incremental: incremental.map(|v| match v {
-                WorkspaceBound::Bounded { bytes, .. } => AdmissionObservation::Available(*bytes),
-                WorkspaceBound::Unknown { reason } => AdmissionObservation::Unavailable(reason),
+            incremental: incremental.and_then(|v| match v {
+                WorkspaceBound::Bounded { bytes, .. } => {
+                    Some(AdmissionObservation::Available(*bytes))
+                }
+                WorkspaceBound::Unknown { reason } => {
+                    Some(AdmissionObservation::Unavailable(reason))
+                }
+                WorkspaceBound::PerDomain { .. } => None,
             }),
-            available: available.map(|v| (&v.available_memory_bytes).into()),
+            incremental_per_domain: matches!(incremental, Some(WorkspaceBound::PerDomain { .. })),
         }
     }
 }
@@ -239,28 +264,12 @@ pub enum BorrowedAdmissionRejection<'a> {
         /// Actual context maximum.
         maximum_positions: u64,
     },
-    /// Required bytes exceed the application budget.
-    MemoryBudgetExceeded {
-        /// Complete reported requirement including safety reserve.
-        required_bytes: u64,
-        /// Application budget.
-        budget_bytes: u64,
-    },
-    /// Required bytes exceed the observed available memory.
-    InsufficientAvailableMemory {
-        /// Complete reported requirement including safety reserve.
-        required_bytes: u64,
-        /// Available memory.
-        available_bytes: u64,
-    },
     /// Context estimation is unavailable.
     EstimationUnsupported(&'a str),
     /// Incremental workspace is unknown.
     IncrementalUnsupported(&'a str),
     /// A required state or execution component is incomplete.
     IncompleteCoverage(EstimationCompleteness),
-    /// Requested availability is unavailable.
-    AvailableMemoryUnavailable(&'a str),
 }
 
 impl BorrowedAdmissionRejection<'_> {
@@ -296,20 +305,6 @@ impl BorrowedAdmissionRejection<'_> {
                 output_tokens,
                 maximum_positions,
             },
-            Self::MemoryBudgetExceeded {
-                required_bytes,
-                budget_bytes,
-            } => AdmissionRejection::MemoryBudgetExceeded {
-                required_bytes,
-                budget_bytes,
-            },
-            Self::InsufficientAvailableMemory {
-                required_bytes,
-                available_bytes,
-            } => AdmissionRejection::InsufficientAvailableMemory {
-                required_bytes,
-                available_bytes,
-            },
             Self::EstimationUnsupported(reason) => AdmissionRejection::EstimationUnsupported {
                 reason: text(format_args!("{reason}"))?,
             },
@@ -323,11 +318,6 @@ impl BorrowedAdmissionRejection<'_> {
                     "architecture estimator coverage is {coverage:?}"
                 ))?,
             },
-            Self::AvailableMemoryUnavailable(reason) => {
-                AdmissionRejection::AvailableMemoryUnavailable {
-                    reason: text(format_args!("{reason}"))?,
-                }
-            }
         })
     }
 }
@@ -338,9 +328,7 @@ pub struct AdmissionPolicyDecision {
     /// Prompt plus output allowance.
     pub requested_positions: u64,
     /// Complete incremental requirement including safety reserve.
-    pub incremental_required_bytes: u64,
-    /// Actual availability signal when requested.
-    pub available_memory_bytes: Option<u64>,
+    pub incremental_required_bytes: Option<u64>,
 }
 
 /// Allocation-free policy result, with borrowed rejection diagnostics.
@@ -403,7 +391,7 @@ pub fn apply_admission_requirements<'a>(
     use BorrowedAdmissionRejection as R;
     use BorrowedAdmissionResult::{Admitted, Rejected};
     if let Some(rejection) =
-        check_admission_context_borrowed(requirements.maximum_context, request)?
+        check_admission_context_borrowed(requirements.maximum_context, request.clone())?
     {
         return Ok(Rejected(rejection));
     }
@@ -435,67 +423,53 @@ pub fn apply_admission_requirements<'a>(
             });
         }
     }
-    let workspace_bytes = state
+    let workspace_bytes = match state
         .execution_workspace
         .map(ExecutionWorkspaceRequirements::peak_bytes)
-        .transpose()?
-        .flatten();
-    let full_required = add(
-        state.requested_state_bytes,
-        workspace_bytes.unwrap_or(0),
-        "state plus execution workspace",
-    )?;
-    let required = match requirements.incremental {
-        Some(AdmissionObservation::Available(bytes)) => bytes,
+        .transpose()
+    {
+        Ok(value) => value.flatten(),
+        Err(_) if state.physical_domains => None,
+        Err(error) => return Err(error),
+    };
+    let full_required = match state
+        .requested_state_bytes
+        .checked_add(workspace_bytes.unwrap_or(0))
+    {
+        Some(bytes) if workspace_bytes.is_some() || !state.physical_domains => Some(bytes),
+        _ if state.physical_domains => None,
+        _ => {
+            return Err(AdmissionPolicyError::ArithmeticOverflow {
+                operation: "state plus execution workspace",
+            })
+        }
+    };
+    let incremental_required_bytes = match requirements.incremental {
+        Some(AdmissionObservation::Available(bytes)) => Some(bytes),
         Some(AdmissionObservation::Unavailable(reason)) => {
-            return Ok(Rejected(R::IncrementalUnsupported(reason)));
+            return Ok(Rejected(R::IncrementalUnsupported(reason)))
+        }
+        None if requirements.incremental_per_domain && state.physical_domains => None,
+        None if requirements.incremental_per_domain => {
+            return Ok(Rejected(R::IncrementalUnsupported(
+                "physical-domain requirements are incomplete",
+            )))
         }
         None => full_required,
     };
-    let incremental_required_bytes = add(
-        required,
-        request.safety_reserve_bytes,
-        "state plus safety reserve",
-    )?;
-    if let Some(budget_bytes) = request.application_memory_budget_bytes {
-        if incremental_required_bytes > budget_bytes {
-            return Ok(Rejected(R::MemoryBudgetExceeded {
-                required_bytes: incremental_required_bytes,
-                budget_bytes,
-            }));
-        }
-    }
-    if (requirements.incremental.is_some()
-        || request.require_complete_estimate
-        || request.application_memory_budget_bytes.is_some())
+    if (!state.physical_domains
         && (workspace_bytes.is_none()
             || state
                 .selected_state_backing
-                .is_some_and(|backing| backing.bytes.is_none())
-            || state.persistent_state_completeness == EstimationCompleteness::PersistentStateOnly
-            || state.completeness == EstimationCompleteness::PersistentStateOnly)
+                .is_some_and(|backing| backing.bytes.is_none())))
+        || state.persistent_state_completeness == EstimationCompleteness::PersistentStateOnly
+        || state.completeness == EstimationCompleteness::PersistentStateOnly
     {
         return Ok(Rejected(R::IncompleteCoverage(state.completeness)));
-    }
-    let available_memory_bytes = match requirements.available {
-        Some(AdmissionObservation::Available(value)) => Some(value),
-        Some(AdmissionObservation::Unavailable(reason)) => {
-            return Ok(Rejected(R::AvailableMemoryUnavailable(reason)));
-        }
-        None => None,
-    };
-    if let Some(available_bytes) = available_memory_bytes {
-        if incremental_required_bytes > available_bytes {
-            return Ok(Rejected(R::InsufficientAvailableMemory {
-                required_bytes: incremental_required_bytes,
-                available_bytes,
-            }));
-        }
     }
     Ok(Admitted(AdmissionPolicyDecision {
         requested_positions,
         incremental_required_bytes,
-        available_memory_bytes,
     }))
 }
 
@@ -504,20 +478,58 @@ pub(super) fn owned(
     request: AdmissionRequest,
     state: RuntimeStateEstimate,
     incremental: Option<&WorkspaceBound>,
-    available: Option<&AvailableMemory>,
 ) -> Result<AdmissionResult, CapabilityError> {
+    if let (Some(persistent), Some(workspace)) = (
+        state.physical_domains.as_ref(),
+        state
+            .execution_workspace
+            .as_ref()
+            .and_then(|w| w.physical_domains.as_ref()),
+    ) {
+        if persistent.geometry != workspace.geometry {
+            return Err(CapabilityError::InvalidConfiguration {
+                field: "physical_domains",
+                detail: "state and workspace geometries differ".into(),
+            });
+        }
+        for (domain, initial) in persistent.decoder_state.iter() {
+            let mut charge = initial;
+            for component in [
+                &persistent.media_embeddings,
+                &persistent.media_workspace,
+                &workspace.activations,
+                &workspace.attention,
+                &workspace.vocabulary,
+                &workspace.state_update,
+                &workspace.materialization,
+                &workspace.retained,
+            ] {
+                charge = charge
+                    .checked_add(component.get(domain).map_err(|_| {
+                        CapabilityError::InvalidConfiguration {
+                            field: "physical_domains",
+                            detail: "component topology differs".into(),
+                        }
+                    })?)
+                    .map_err(|_| CapabilityError::ArithmeticOverflow {
+                        operation: "physical-domain requirement",
+                    })?;
+            }
+        }
+    }
     match apply_admission_requirements(
-        request,
-        AdmissionRequirements::from_reports(capabilities, &state, incremental, available),
+        request.clone(),
+        AdmissionRequirements::from_reports(capabilities, &state, incremental),
     )? {
         BorrowedAdmissionResult::Rejected(rejection) => {
             Ok(AdmissionResult::Rejected(rejection.into_owned()))
         }
         BorrowedAdmissionResult::Admitted(decision) => Ok(AdmissionResult::Admitted(Admission {
+            memory_limits: request.memory_limits,
+            additional_headroom: request.additional_headroom,
             requested_positions: decision.requested_positions,
             state,
             incremental_required_bytes: decision.incremental_required_bytes,
-            available_memory_bytes: decision.available_memory_bytes,
         })),
     }
 }

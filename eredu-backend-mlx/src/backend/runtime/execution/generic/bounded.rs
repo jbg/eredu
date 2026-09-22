@@ -57,10 +57,9 @@ where
         self.populator.visit_retained_values(visitor)
     }
 
-    fn publish_parameter_replacements(
+    fn visit_parameter_publication(
         &mut self,
-        values: &std::collections::BTreeMap<String, MlxTensor>,
-        active: bool,
+        visitor: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
     ) -> Result<bool, Error> {
         if !self.pending_is_empty().unwrap_or(false)
             || self
@@ -72,9 +71,7 @@ where
                 "parameter publication requires an idle policy".into(),
             ));
         }
-        Ok(self
-            .populator
-            .publish_parameter_replacements(values, active))
+        Ok(self.populator.visit_parameter_publication(visitor))
     }
 
     fn inspect_unit<E, F, V>(
@@ -84,6 +81,9 @@ where
         build: F,
         operation: V,
         stream: &Stream,
+        _preparation: Option<
+            &crate::backend::runtime::execution::generic::MlxParameterPreparation<'_>,
+        >,
     ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
     where
         F: FnOnce(&Stream) -> Result<U, E>,
@@ -95,6 +95,9 @@ where
             return Err(LayerwiseAcquireError::Policy(Error::Parallel(
                 "parameter unit address differs from the selected layout".into(),
             )));
+        }
+        if let Some(preparation) = _preparation {
+            return preparation.inspect(self, ordinal, build, operation, stream);
         }
         // Managed direct dispatch is exclusively the quoted forward traversal;
         // ad-hoc parameter inspection has no admitted constructor/window span.
@@ -353,6 +356,9 @@ where
             let (unit, transfer) = lease.population_parts();
             match &original {
                 Some(source) => {
+                    source.validate_parameter_replacements(
+                        this.populator.prepared_parameter_replacements(),
+                    )?;
                     this.populator
                         .populate_original(unit, transfer, source.binding_row_limit()?)?
                 }

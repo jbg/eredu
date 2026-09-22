@@ -2,8 +2,11 @@
 mod config;
 mod encoder;
 mod gemma;
-mod position_facts;
+mod inkling;
+mod muse;
+pub(crate) use muse::MuseInputPartRef;
 mod chat_projection;
+mod position_facts;
 use super::qwen::{
     self, InspectedPartRef, MediaSemanticError, QwenPartRef, QwenPartRole, QwenPolicy,
 };
@@ -11,7 +14,7 @@ use crate::{
     prepared_execution::PreparedInferenceBlueprint,
     prepared_sources::PreparedModelSources,
     qwen::vl::positions::{
-        GridRows, PositionComponent, PositionDestination, emit_positions, validate_positions,
+        emit_positions, validate_positions, GridRows, PositionComponent, PositionDestination,
     },
 };
 pub use encoder::PreparedMediaEncoderTablePlan;
@@ -20,9 +23,9 @@ use eredu_runtime::{
     input::host::{HostInputPartView, HostTensorValues},
     working_memory::{
         BoundCompositeSemanticStorage, CompositeSemanticCoordinates, CompositeSemanticPartRecord,
-        CompositeSemanticRole, MediaSessionBinding, OriginalCompositeSemanticStorage,
+        CompositeSemanticRole, MediaSessionBinding, MemoryLedger, OriginalCompositeSemanticStorage,
         OriginalCompositeSemanticStorageError, OriginalPreparedHostInput,
-        PreparedCompositeSemanticRecipe, WorkingMemoryError, WorkingMemoryPool,
+        PreparedCompositeSemanticRecipe, WorkingMemoryError,
     },
 };
 pub use position_facts::{OriginalPromptSegment, PreparedMediaPositionFacts};
@@ -30,6 +33,8 @@ pub use position_facts::{OriginalPromptSegment, PreparedMediaPositionFacts};
 #[derive(Clone, Copy)]
 enum Policy<'a> {
     Vl(&'a crate::qwen::vl::ModelArgs),
+    Inkling(&'a crate::inkling::ModelArgs),
+    Muse(&'a crate::muse_glimmer::DecoderConfig),
     Gemma(&'a crate::gemma4::FamilyConfig),
     Conditional(&'a crate::qwen::hybrid::ParsedHybridConfig),
 }
@@ -42,6 +47,8 @@ impl<'a> Policy<'a> {
         let architecture = sources.architecture();
         if let Some(projector) = architecture.gguf_media_projector() {
             return match projector.model() {
+                P::Inkling(args) => Ok(Self::Inkling(args)),
+                P::MuseGlimmer(args) => Ok(Self::Muse(args)),
                 P::Qwen3Vl(args) => Ok(Self::Vl(args)),
                 P::Gemma4(args) => Ok(Self::Gemma(args)),
                 P::Qwen35(args) => Ok(Self::Conditional(args)),
@@ -54,6 +61,12 @@ impl<'a> Policy<'a> {
             architecture.safetensors_architecture().map(|p| p.model()),
             architecture.gguf_plan().map(|p| p.model()),
         ) {
+            (Some(S::Inkling(args)), None) | (None, Some(G::Inkling(args))) => {
+                Ok(Self::Inkling(args))
+            }
+            (Some(S::MuseGlimmer(args)), None) | (None, Some(G::MuseGlimmer(args))) => {
+                Ok(Self::Muse(args))
+            }
             (Some(S::QwenVl(args)), None) => Ok(Self::Vl(args)),
             (Some(S::Gemma4(args)), None) | (None, Some(G::Gemma4(args))) => Ok(Self::Gemma(args)),
             (Some(S::QwenHybrid(args)), None) | (None, Some(G::QwenHybrid(args)))
@@ -68,7 +81,9 @@ impl<'a> Policy<'a> {
     }
     fn qwen(self) -> QwenPolicy<'a> {
         match self {
-            Self::Gemma(_) => unreachable!("typed Gemma source does not consume Qwen encoder tables"),
+            Self::Gemma(_) | Self::Inkling(_) | Self::Muse(_) => {
+                unreachable!("typed Gemma source does not consume Qwen encoder tables")
+            }
             Self::Vl(args) => QwenPolicy {
                 hidden: args.text.hidden_size,
                 vision: Some(&args.vision),
@@ -88,7 +103,9 @@ impl<'a> Policy<'a> {
     fn coordinates(self) -> CompositeSemanticCoordinates {
         match self {
             Self::Vl(_) => CompositeSemanticCoordinates::ThreeAxesAndPrefix,
-            Self::Conditional(_) | Self::Gemma(_) => CompositeSemanticCoordinates::Ordinary,
+            Self::Conditional(_) | Self::Gemma(_) | Self::Inkling(_) | Self::Muse(_) => {
+                CompositeSemanticCoordinates::Ordinary
+            }
         }
     }
 }
@@ -112,36 +129,122 @@ fn semantic_part<'a>(
     part: eredu_runtime::input::host::PreparedHostPart<'a>,
     policy: Policy<'a>,
 ) -> Result<SemanticPart<'a>, MediaSemanticError> {
+    if let Policy::Inkling(args) = policy {
+        let modality = part.modality();
+        let plan = super::admission::inkling::original_part(args, &part)?;
+        use super::InklingInputPartPlan as Part;
+        let (role, positions, placeholder, workspace_scalars) = match plan {
+            Part::TextTokens { positions } => (CompositeSemanticRole::Tokens, positions, 0, 0),
+            Part::Projected {
+                positions,
+                placeholder_token_id,
+                ..
+            } => (
+                CompositeSemanticRole::Projected,
+                positions,
+                placeholder_token_id,
+                0,
+            ),
+            Part::Media { ingress, shape, .. } => (
+                CompositeSemanticRole::Encoded,
+                shape.decoder_positions,
+                ingress.placeholder_token_id,
+                shape.execution_workspace_scalars,
+            ),
+        };
+        return Ok(SemanticPart {
+            role,
+            modality,
+            positions,
+            placeholder,
+            grid: &[],
+            workspace_scalars,
+        });
+    }
+    if let Policy::Muse(args) = policy {
+        return muse::semantic_part(args, part);
+    }
     if let Policy::Gemma(args) = policy {
         let modality = part.modality();
         let plan = super::admission::gemma::raw::original_part(args, &part)?;
         let (role, positions, placeholder, workspace_scalars) = match plan {
-            super::Gemma4InputPartPlan::TextTokens { positions } => (CompositeSemanticRole::Tokens, positions, 0, 0),
-            super::Gemma4InputPartPlan::Projected { positions, placeholder_token_id, .. } => (CompositeSemanticRole::Projected, positions, placeholder_token_id, 0),
-            super::Gemma4InputPartPlan::Vision { placeholder_token_id, shape, .. }
-            | super::Gemma4InputPartPlan::Audio { placeholder_token_id, shape, .. } =>
-                (CompositeSemanticRole::Encoded, shape.decoder_positions, placeholder_token_id, shape.execution_workspace_scalars),
+            super::Gemma4InputPartPlan::TextTokens { positions } => {
+                (CompositeSemanticRole::Tokens, positions, 0, 0)
+            }
+            super::Gemma4InputPartPlan::Projected {
+                positions,
+                placeholder_token_id,
+                ..
+            } => (
+                CompositeSemanticRole::Projected,
+                positions,
+                placeholder_token_id,
+                0,
+            ),
+            super::Gemma4InputPartPlan::Vision {
+                placeholder_token_id,
+                shape,
+                ..
+            }
+            | super::Gemma4InputPartPlan::Audio {
+                placeholder_token_id,
+                shape,
+                ..
+            } => (
+                CompositeSemanticRole::Encoded,
+                shape.decoder_positions,
+                placeholder_token_id,
+                shape.execution_workspace_scalars,
+            ),
         };
-        let grid = if role == CompositeSemanticRole::Encoded && matches!(modality, InputModality::Image | InputModality::Video) {
-            let (_, view) = part.metadata_view(InputMetadataKey::PatchGrid).ok_or(MediaSemanticError::input("Gemma original source grid"))?;
-            let HostTensorValues::I32(values) = view.values else { return Err(MediaSemanticError::input("Gemma original source grid type")); };
+        let grid = if role == CompositeSemanticRole::Encoded
+            && matches!(modality, InputModality::Image | InputModality::Video)
+        {
+            let (_, view) = part
+                .metadata_view(InputMetadataKey::PatchGrid)
+                .ok_or(MediaSemanticError::input("Gemma original source grid"))?;
+            let HostTensorValues::I32(values) = view.values else {
+                return Err(MediaSemanticError::input("Gemma original source grid type"));
+            };
             let (rows, tail) = values.as_chunks::<3>();
-            if !tail.is_empty() { return Err(MediaSemanticError::input("Gemma original source grid rows")); }
+            if !tail.is_empty() {
+                return Err(MediaSemanticError::input("Gemma original source grid rows"));
+            }
             rows
-        } else { &[] };
-        return Ok(SemanticPart { role, modality, positions, placeholder, grid, workspace_scalars });
+        } else {
+            &[]
+        };
+        return Ok(SemanticPart {
+            role,
+            modality,
+            positions,
+            placeholder,
+            grid,
+            workspace_scalars,
+        });
     }
     let value = qwen::qwen_part(policy.qwen(), InspectedPartRef::original(part)?)?;
     Ok(SemanticPart {
-        role: match value.role { QwenPartRole::Tokens => CompositeSemanticRole::Tokens,
-            QwenPartRole::Projected => CompositeSemanticRole::Projected, QwenPartRole::Encoded => CompositeSemanticRole::Encoded },
-        modality: value.modality, positions: value.positions, placeholder: value.placeholder,
-        grid: value.grid, workspace_scalars: value.workspace_scalars,
+        role: match value.role {
+            QwenPartRole::Tokens => CompositeSemanticRole::Tokens,
+            QwenPartRole::Projected => CompositeSemanticRole::Projected,
+            QwenPartRole::Encoded => CompositeSemanticRole::Encoded,
+        },
+        modality: value.modality,
+        positions: value.positions,
+        placeholder: value.placeholder,
+        grid: value.grid,
+        workspace_scalars: value.workspace_scalars,
     })
 }
-fn semantic_parts<'a>(source: &'a OriginalPreparedHostInput, policy: Policy<'a>)
-    -> impl Iterator<Item = Result<SemanticPart<'a>, MediaSemanticError>> + Clone {
-    source.parts().enumerate().map(move |(index, part)| semantic_part(part, policy).map_err(|cause| cause.at(index)))
+fn semantic_parts<'a>(
+    source: &'a OriginalPreparedHostInput,
+    policy: Policy<'a>,
+) -> impl Iterator<Item = Result<SemanticPart<'a>, MediaSemanticError>> + Clone {
+    source
+        .parts()
+        .enumerate()
+        .map(move |(index, part)| semantic_part(part, policy).map_err(|cause| cause.at(index)))
 }
 fn positions<'a>(
     source: &'a OriginalPreparedHostInput,
@@ -167,8 +270,8 @@ fn account(error: WorkingMemoryError) -> MediaSemanticError {
 
 /// ```compile_fail
 /// use eredu_architectures::prepared_sources::PreparedModelSources;
-/// use eredu_runtime::working_memory::{OriginalPreparedHostInput,WorkingMemoryPool};
-/// fn no_detach(sources:PreparedModelSources,source:&OriginalPreparedHostInput,pool:&WorkingMemoryPool) {
+/// use eredu_runtime::working_memory::{OriginalPreparedHostInput,MemoryLedger};
+/// fn no_detach(sources:PreparedModelSources,source:&OriginalPreparedHostInput,pool:&MemoryLedger) {
 ///     let plan=sources.plan_original_media_semantics(source).unwrap();
 ///     drop(sources);
 ///     let _=plan.compile(pool);
@@ -176,8 +279,8 @@ fn account(error: WorkingMemoryError) -> MediaSemanticError {
 /// ```
 /// ```compile_fail
 /// use eredu_architectures::media_plan::PreparedMediaSemanticCompile;
-/// use eredu_runtime::working_memory::WorkingMemoryPool;
-/// fn once(plan:PreparedMediaSemanticCompile<'_, '_>,pool:&WorkingMemoryPool) {
+/// use eredu_runtime::working_memory::MemoryLedger;
+/// fn once(plan:PreparedMediaSemanticCompile<'_, '_>,pool:&MemoryLedger) {
 ///     let _=plan.compile(pool);
 ///     let _=plan.compile(pool);
 /// }
@@ -202,13 +305,23 @@ pub struct OriginalPreparedMediaSemantics<'s>(
 );
 /// Compiled semantics authenticated against a current actual native destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SemanticKind { Vl, Conditional, Gemma }
+enum SemanticKind {
+    Vl,
+    Conditional,
+    Gemma,
+    Inkling,
+    Muse,
+}
 impl Policy<'_> {
-    fn kind(self) -> SemanticKind { match self {
-        Self::Vl(_) => SemanticKind::Vl,
-        Self::Conditional(_) => SemanticKind::Conditional,
-        Self::Gemma(_) => SemanticKind::Gemma,
-    } }
+    fn kind(self) -> SemanticKind {
+        match self {
+            Self::Vl(_) => SemanticKind::Vl,
+            Self::Conditional(_) => SemanticKind::Conditional,
+            Self::Gemma(_) => SemanticKind::Gemma,
+            Self::Inkling(_) => SemanticKind::Inkling,
+            Self::Muse(_) => SemanticKind::Muse,
+        }
+    }
 }
 #[derive(Clone)]
 pub struct BoundPreparedMediaSemantics(BoundCompositeSemanticStorage, SemanticKind);
@@ -232,7 +345,6 @@ impl PreparedModelSources {
                     "selected execution has no composite processor",
                 ))?;
         let mut total = 0u64;
-        let mut encoded = false;
         for (index, part) in source.parts().enumerate() {
             validate_selected_part(processor, part.modality(), part.kind())
                 .map_err(|error| error.at(index))?;
@@ -242,11 +354,10 @@ impl PreparedModelSources {
                 .ok_or(MediaSemanticError::overflow(
                     "Qwen complete decoder positions",
                 ))?;
-            encoded |= part.role == CompositeSemanticRole::Encoded;
         }
-        if !encoded || total == 0 {
+        if total == 0 {
             return Err(MediaSemanticError::input(
-                "retained media requires a positive source and actual raw encoder part",
+                "retained composite input requires a positive decoder position count",
             ));
         }
         let count = usize::try_from(total)
@@ -300,7 +411,7 @@ impl<'s, 'h> PreparedMediaSemanticCompile<'s, 'h> {
     }
     pub fn compile(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<OriginalPreparedMediaSemantics<'s>, OriginalCompositeSemanticStorageError> {
         let source = self.0.source();
         let provenance = self.0.provenance();
@@ -336,7 +447,9 @@ impl<'s, 'h> PreparedMediaSemanticCompile<'s, 'h> {
                 modality: part.modality,
                 placeholder: part.placeholder,
                 workspace_scalars: part.workspace_scalars,
-                chat_projection: chat_projection::part(provenance, source, index, policy, part.role),
+                chat_projection: chat_projection::part(
+                    provenance, source, index, policy, part.role,
+                ),
             };
             position = end;
         }
@@ -415,7 +528,34 @@ impl<'s> OriginalPreparedMediaSemantics<'s> {
         // The completed constructor retained this exact immutable admission
         // owner after source-format normalization. Equal configs are insufficient.
         let matches = matches!(Policy::source(self.0.provenance()), Ok(Policy::Gemma(_)))
-            && self.0.provenance().matches_retained_gemma_admission(admission);
+            && self
+                .0
+                .provenance()
+                .matches_retained_gemma_admission(admission);
+        self.bind_checked(matches, blueprint, source, binding)
+    }
+    pub(crate) fn bind_inkling(
+        self,
+        admission: &crate::inkling::ModelArgs,
+        blueprint: &PreparedInferenceBlueprint,
+        source: &OriginalPreparedHostInput,
+        binding: MediaSessionBinding,
+    ) -> Result<BoundPreparedMediaSemantics, OriginalCompositeSemanticStorageError> {
+        let matches = matches!(Policy::source(self.0.provenance()), Ok(Policy::Inkling(_)))
+            && self
+                .0
+                .provenance()
+                .matches_retained_inkling_admission(admission);
+        self.bind_checked(matches, blueprint, source, binding)
+    }
+    pub(crate) fn bind_muse(
+        self,
+        admission: &crate::muse_glimmer::DecoderConfig,
+        blueprint: &PreparedInferenceBlueprint,
+        source: &OriginalPreparedHostInput,
+        binding: MediaSessionBinding,
+    ) -> Result<BoundPreparedMediaSemantics, OriginalCompositeSemanticStorageError> {
+        let matches = matches!(Policy::source(self.0.provenance()), Ok(Policy::Muse(args)) if config::muse(args, admission));
         self.bind_checked(matches, blueprint, source, binding)
     }
     fn bind_checked(
@@ -425,19 +565,25 @@ impl<'s> OriginalPreparedMediaSemantics<'s> {
         source: &OriginalPreparedHostInput,
         binding: MediaSessionBinding,
     ) -> Result<BoundPreparedMediaSemantics, OriginalCompositeSemanticStorageError> {
-        if !config_matches
-            || !self.matches_destination(blueprint)
-            || !self.source().same_source(source)
-            || binding.frontier() != 0
-        {
-            return Err(self.0.reject(
-                MediaSemanticError::input(
-                    "original media source/selection/current-state binding mismatch",
-                )
-                .diagnostic(),
-            ));
+        let rejection = if !config_matches {
+            Some("original media retained destination configuration mismatch")
+        } else if !self.matches_destination(blueprint) {
+            Some("original media selected blueprint mismatch")
+        } else if !self.source().same_source(source) {
+            Some("original media host source identity mismatch")
+        } else if binding.frontier() != 0 {
+            Some("original media destination frontier is not empty")
+        } else {
+            None
+        };
+        if let Some(operation) = rejection {
+            return Err(self
+                .0
+                .reject(MediaSemanticError::input(operation).diagnostic()));
         }
-        let kind = Policy::source(self.0.provenance()).expect("validated semantic policy").kind();
+        let kind = Policy::source(self.0.provenance())
+            .expect("validated semantic policy")
+            .kind();
         Ok(BoundPreparedMediaSemantics(self.0.bind(binding), kind))
     }
 }
@@ -453,7 +599,9 @@ impl BoundPreparedMediaSemantics {
         &self,
         transition: &eredu_runtime::working_memory::CopiedMediaStateBinding,
     ) -> Result<Self, eredu_runtime::working_memory::WorkingMemoryError> {
-        self.0.for_copied_state(transition).map(|storage| Self(storage, self.1))
+        self.0
+            .for_copied_state(transition)
+            .map(|storage| Self(storage, self.1))
     }
 
     /// Borrows original ordered source attribution without token/grid copies,
@@ -490,7 +638,10 @@ impl BoundPreparedMediaSemantics {
         self.0.coordinates()
     }
     pub(crate) fn part(&self, index: usize) -> QwenPartRef<'_> {
-        assert!(self.1 != SemanticKind::Gemma, "typed Qwen admission source");
+        assert!(
+            matches!(self.1, SemanticKind::Vl | SemanticKind::Conditional),
+            "typed Qwen admission source"
+        );
         let record = &self.0.records()[index];
         let grid = if record.role == CompositeSemanticRole::Encoded {
             let part = self

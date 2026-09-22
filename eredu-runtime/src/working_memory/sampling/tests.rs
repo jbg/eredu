@@ -121,30 +121,62 @@ fn layout() -> WorkspaceLayout {
 fn sampling_replanning_preserves_physical_evidence_and_rejects_substitution() {
     let sampler = ConfiguredTextSampler::Standard(GenerationSampler::new());
     let strided = WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false)
-        .with_element_strides(&[111, 111, 3]).unwrap();
-    for representation in [None, Some(strided),
-        Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true)),
-        Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float16, true))] {
+        .with_element_strides(&[111, 111, 3])
+        .unwrap();
+    for representation in [
+        None,
+        Some(strided),
+        Some(WorkspaceRepresentation::new(
+            WorkspaceFloatingType::Float32,
+            true,
+        )),
+        Some(WorkspaceRepresentation::new(
+            WorkspaceFloatingType::Float16,
+            true,
+        )),
+    ] {
         let (context, _) = setup(false);
         let original = layout().with_representation(representation);
-        let report = quote_sampling_workspace(&sampler, 0.0, None,
-            WorkspaceSamplingInput { layout: &original, backing_capacity_bytes: Some(4096) }
-                .with_backing_population(2),
-            &TokenFilter::All, 3, &context).unwrap();
+        let report = quote_sampling_workspace(
+            &sampler,
+            0.0,
+            None,
+            WorkspaceSamplingInput {
+                layout: &original,
+                backing_capacity_bytes: Some(4096),
+            }
+            .with_backing_population(2),
+            &TokenFilter::All,
+            3,
+            &context,
+        )
+        .unwrap();
         let plan = report.input_plan();
         let restored = plan.layout(&context).unwrap();
         assert_eq!(restored.shape(), &[1, 1, 37]);
         assert_eq!(restored.dtype(), WorkspaceDtype::Float32);
         assert_eq!(restored.representation(), representation);
-        let repeated = quote_sampling_workspace(&sampler, 0.0, None,
-            plan.source(&restored).unwrap(), &TokenFilter::All, 3, &context).unwrap();
+        let repeated = quote_sampling_workspace(
+            &sampler,
+            0.0,
+            None,
+            plan.source(&restored).unwrap(),
+            &TokenFilter::All,
+            3,
+            &context,
+        )
+        .unwrap();
         assert_eq!(repeated.input_plan(), plan);
         assert_eq!(repeated.peak.bytes(), report.peak.bytes());
-        let incompatible = layout().with_representation(if representation.is_some() { None }
-            else { Some(strided) });
+        let incompatible = layout().with_representation(if representation.is_some() {
+            None
+        } else {
+            Some(strided)
+        });
         assert!(plan.source(&incompatible).is_err());
         let wrong_shape = WorkspaceLayout::new(&[1, 37], WorkspaceDtype::Float32)
-            .unwrap().with_representation(representation);
+            .unwrap()
+            .with_representation(representation);
         assert!(plan.source(&wrong_shape).is_err());
     }
 }
@@ -299,38 +331,44 @@ fn configured_sampling_rejects_wrong_context_or_geometry_and_keeps_history_capac
     let (foreign, _) = setup(false);
     let random = WorkspaceSamplingRandomState::from_seed(&foreign).unwrap();
     let mut sampler = ConfiguredTextSampler::Standard(GenerationSampler::new());
-    assert!(quote_sampling_workspace(
-        &sampler,
-        0.7,
-        Some(&random),
-        &layout(),
-        &TokenFilter::All,
-        1,
-        &context
-    )
-    .is_err());
-    for shape in [vec![2, 37], vec![0], vec![1, 1, 1, 37]] {
-        assert!(quote_sampling_workspace(
+    assert!(
+        quote_sampling_workspace(
             &sampler,
-            0.0,
-            None,
-            &WorkspaceLayout::new(&shape, WorkspaceDtype::Float32).unwrap(),
+            0.7,
+            Some(&random),
+            &layout(),
             &TokenFilter::All,
             1,
             &context
         )
-        .is_err());
+        .is_err()
+    );
+    for shape in [vec![2, 37], vec![0], vec![1, 1, 1, 37]] {
+        assert!(
+            quote_sampling_workspace(
+                &sampler,
+                0.0,
+                None,
+                &WorkspaceLayout::new(&shape, WorkspaceDtype::Float32).unwrap(),
+                &TokenFilter::All,
+                1,
+                &context
+            )
+            .is_err()
+        );
     }
-    assert!(quote_sampling_workspace(
-        &sampler,
-        0.0,
-        None,
-        &layout(),
-        &TokenFilter::All,
-        u64::MAX,
-        &context
-    )
-    .is_err());
+    assert!(
+        quote_sampling_workspace(
+            &sampler,
+            0.0,
+            None,
+            &layout(),
+            &TokenFilter::All,
+            u64::MAX,
+            &context
+        )
+        .is_err()
+    );
     let logits = WorkspaceTensor::existing(layout(), &context).unwrap();
     for _ in 0..5 {
         Sampler::<WorkspaceSamplingBackend>::sample(&mut sampler, &logits, 0.0, None, &context)
@@ -406,8 +444,11 @@ impl WorkspaceMechanisms for RetainedOutputFacts {
             WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey) => {
                 outputs[0] = WorkspaceOutputStorage::Allocate(128);
             }
-            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SelectRandomKey { .. })
-            | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
+            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SelectRandomKey {
+                ..
+            })
+            | WorkspaceOperationKind::Index { .. }
+            | WorkspaceOperationKind::StaticSlice { .. }
             | WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::ReadToken) => {
                 outputs[0] = WorkspaceOutputStorage::AliasInput(0);
             }
@@ -606,7 +647,6 @@ fn retained_output_capacity_overflow_is_reported_across_spans() {
     assert!(quote(2).is_err());
 }
 
-
 #[test]
 fn prepared_logit_policy_matches_actual_policy_and_refuses_changed_history_before_work() {
     use crate::generation::{LogitProgramError, PreparedLogitPolicyError};
@@ -629,13 +669,19 @@ fn prepared_logit_policy_matches_actual_policy_and_refuses_changed_history_befor
             let source = WorkspaceTensor::existing(layout(), &context).unwrap();
             context.begin_span();
             let output = if prepared_path {
-                prepared.process::<WorkspaceSamplingBackend>(&source, &history, &context).unwrap()
+                prepared
+                    .process::<WorkspaceSamplingBackend>(&source, &history, &context)
+                    .unwrap()
             } else {
                 <ConfiguredTextSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
                     ::process_logits(policy, &source, 0.7, &history, &context).unwrap()
             };
             let report = context.finish_report(&[output]).unwrap();
-            let operations = report.operations.iter().map(|op| op.kind.clone()).collect::<Vec<_>>();
+            let operations = report
+                .operations
+                .iter()
+                .map(|op| op.kind.clone())
+                .collect::<Vec<_>>();
             let calls = calls.borrow().clone();
             (operations, calls, report.tensor_handle_clones)
         };
@@ -651,128 +697,264 @@ fn prepared_logit_policy_matches_actual_policy_and_refuses_changed_history_befor
         let (context, calls) = setup(false);
         let source = WorkspaceTensor::existing(layout(), &context).unwrap();
         context.begin_span();
-        let refused = prepared.process::<WorkspaceSamplingBackend>(&source, &history[..3], &context);
-        assert!(matches!(refused, Err(LogitProgramError::Policy(PreparedLogitPolicyError::History))));
+        let refused =
+            prepared.process::<WorkspaceSamplingBackend>(&source, &history[..3], &context);
+        assert!(matches!(
+            refused,
+            Err(LogitProgramError::Policy(PreparedLogitPolicyError::History))
+        ));
         assert!(calls.borrow().is_empty());
         assert!(context.finish_report(&[]).unwrap().operations.is_empty());
     }
-    let identity = <DefaultSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
-        ::prepared_logit_policy(&DefaultSampler).unwrap().bind(-0.0, history.len()).unwrap();
+    let identity =
+        <DefaultSampler as SpeculativeSampler<WorkspaceSamplingBackend>>::prepared_logit_policy(
+            &DefaultSampler,
+        )
+        .unwrap()
+        .bind(-0.0, history.len())
+        .unwrap();
     let (context, _) = setup(false);
     let source = WorkspaceTensor::existing(layout(), &context).unwrap();
     context.begin_span();
-    let output = identity.process::<WorkspaceSamplingBackend>(&source, &history, &context).unwrap();
-    assert!(context.finish_report(&[output]).unwrap().operations.is_empty());
+    let output = identity
+        .process::<WorkspaceSamplingBackend>(&source, &history, &context)
+        .unwrap();
+    assert!(
+        context
+            .finish_report(&[output])
+            .unwrap()
+            .operations
+            .is_empty()
+    );
 
     struct Callback;
     impl SpeculativeSampler<WorkspaceSamplingBackend> for Callback {
-    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
-        fn process_logits(&mut self, _: &WorkspaceTensor, _: f32, _: &[u32], _: &WorkspaceContext)
-            -> Result<WorkspaceTensor, Error> { panic!("unqualified callback must not be invoked") }
+        type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
+        fn process_logits(
+            &mut self,
+            _: &WorkspaceTensor,
+            _: f32,
+            _: &[u32],
+            _: &WorkspaceContext,
+        ) -> Result<WorkspaceTensor, Error> {
+            panic!("unqualified callback must not be invoked")
+        }
     }
     assert!(Callback.prepared_logit_policy().is_none());
 }
 
 #[test]
 fn prepared_greedy_choice_is_exact_and_unknown_or_adaptive_commit_stays_closed() {
-    use crate::{DefaultSampler, SpeculativeSampler};
     use crate::generation::PreparedGreedyError;
+    use crate::{DefaultSampler, SpeculativeSampler};
     let mut standard = GenerationSampler::default().with_generated_tokens([2, 3]);
     let original_history = standard.generated_tokens().to_vec();
     let choice = <GenerationSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
         ::prepared_greedy_policy(&standard).unwrap().greedy(-0.0).unwrap();
-    use crate::speculative::numerical::{SpeculativeNumericalProgram, SpeculativeNumericalKind, SpeculativeNumericalError};
-    assert!(SpeculativeNumericalProgram::new(SpeculativeNumericalKind::Greedy(choice), &[1,1,37]).is_ok());
-    assert_eq!(SpeculativeNumericalProgram::new(SpeculativeNumericalKind::Greedy(choice), &[2,37]),
-        Err(SpeculativeNumericalError::GreedyRows));
+    use crate::speculative::numerical::{
+        SpeculativeNumericalError, SpeculativeNumericalKind, SpeculativeNumericalProgram,
+    };
+    assert!(
+        SpeculativeNumericalProgram::new(SpeculativeNumericalKind::Greedy(choice), &[1, 1, 37])
+            .is_ok()
+    );
+    assert_eq!(
+        SpeculativeNumericalProgram::new(SpeculativeNumericalKind::Greedy(choice), &[2, 37]),
+        Err(SpeculativeNumericalError::GreedyRows)
+    );
     let (context, _) = setup(false);
     let source = WorkspaceTensor::existing(layout(), &context).unwrap();
     context.begin_span();
-    let token = choice.construct::<WorkspaceSamplingBackend>(&source, &context).unwrap();
+    let token = choice
+        .construct::<WorkspaceSamplingBackend>(&source, &context)
+        .unwrap();
     let report = context.finish_report(&[token]).unwrap();
     assert_eq!(report.operations.len(), 1);
-    assert!(matches!(report.operations[0].kind,
-        WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::Greedy)));
+    assert!(matches!(
+        report.operations[0].kind,
+        WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::Greedy)
+    ));
     assert_eq!(report.operations[0].outputs[0].shape(), &[1, 1]);
-    assert_eq!(report.operations[0].outputs[0].dtype(), WorkspaceDtype::Uint32);
-    <GenerationSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
-        ::prepared_greedy_policy(&standard).unwrap().commit_without_mutation();
-    <GenerationSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
-        ::commit_token(&mut standard, &source, 3, &context).unwrap();
+    assert_eq!(
+        report.operations[0].outputs[0].dtype(),
+        WorkspaceDtype::Uint32
+    );
+    <GenerationSampler as SpeculativeSampler<WorkspaceSamplingBackend>>::prepared_greedy_policy(
+        &standard,
+    )
+    .unwrap()
+    .commit_without_mutation();
+    <GenerationSampler as SpeculativeSampler<WorkspaceSamplingBackend>>::commit_token(
+        &mut standard,
+        &source,
+        3,
+        &context,
+    )
+    .unwrap();
     assert_eq!(standard.generated_tokens(), original_history);
     for temperature in [0.1, -0.1, f32::NAN] {
-        assert!(matches!(<DefaultSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
+        assert!(
+            matches!(<DefaultSampler as SpeculativeSampler<WorkspaceSamplingBackend>>
             ::prepared_greedy_policy(&DefaultSampler).unwrap().greedy(temperature),
-            Err(PreparedGreedyError::Temperature)));
+            Err(PreparedGreedyError::Temperature))
+        );
     }
     assert!(<MirostatV2Sampler as SpeculativeSampler<WorkspaceSamplingBackend>>
         ::prepared_greedy_policy(&MirostatV2Sampler::default()).is_none());
     struct Override;
     impl SpeculativeSampler<WorkspaceSamplingBackend> for Override {
-    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
-        fn process_logits(&mut self, _: &WorkspaceTensor, _: f32, _: &[u32], _: &WorkspaceContext)
-            -> Result<WorkspaceTensor, Error> { panic!("unqualified callback") }
-        fn commit_token(&mut self, _: &WorkspaceTensor, _: u32, _: &WorkspaceContext)
-            -> Result<(), Error> { panic!("unqualified commit") }
+        type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
+        fn process_logits(
+            &mut self,
+            _: &WorkspaceTensor,
+            _: f32,
+            _: &[u32],
+            _: &WorkspaceContext,
+        ) -> Result<WorkspaceTensor, Error> {
+            panic!("unqualified callback")
+        }
+        fn commit_token(
+            &mut self,
+            _: &WorkspaceTensor,
+            _: u32,
+            _: &WorkspaceContext,
+        ) -> Result<(), Error> {
+            panic!("unqualified commit")
+        }
     }
     assert!(Override.prepared_greedy_policy().is_none());
 }
 
 #[test]
 fn prepared_random_phases_keep_full_split_tables_and_both_categorical_roots() {
+    use crate::speculative::numerical::{
+        SpeculativeNumericalKind as Kind, SpeculativeNumericalProgram as Program,
+    };
     use crate::{DefaultSampler, SpeculativeSampler};
-    use crate::speculative::numerical::{SpeculativeNumericalKind as Kind, SpeculativeNumericalProgram as Program};
     let (context, _) = setup(false);
     context.begin_span();
-    let key = WorkspaceSamplingRandomState::from_seed(&context).unwrap().into_key();
+    let key = WorkspaceSamplingRandomState::from_seed(&context)
+        .unwrap()
+        .into_key();
     let report = context.finish_report(&[key.clone()]).unwrap();
     assert_eq!(report.operations.len(), 1);
-    assert!(matches!(report.operations[0].kind, WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::CreateRandomKey)));
-    assert_eq!(Program::new(Kind::CreateKey { seed: 71 }, &[2]).unwrap().source_count(), 0);
+    assert!(matches!(
+        report.operations[0].kind,
+        WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::CreateRandomKey)
+    ));
+    assert_eq!(
+        Program::new(Kind::CreateKey { seed: 71 }, &[2])
+            .unwrap()
+            .source_count(),
+        0
+    );
     for position in [0, 1, 7, 128] {
         context.begin_span();
         let selected = WorkspaceSamplingRandomState::key_at(&key, position, &context).unwrap();
         let report = context.finish_report(&[selected]).unwrap();
-        assert_eq!(report.operations[0].outputs[0].shape(), &[position as i32 + 1, 2]);
-        assert!(matches!(report.operations[0].kind, WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey)));
+        assert_eq!(
+            report.operations[0].outputs[0].shape(),
+            &[position as i32 + 1, 2]
+        );
+        assert!(matches!(
+            report.operations[0].kind,
+            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey)
+        ));
         assert_eq!(report.operations.len(), 2);
-        assert!(matches!(report.operations[1].kind, WorkspaceOperationKind::Sampling(
-            WorkspaceSamplingOperation::SelectRandomKey { index }) if index == position));
-        assert_eq!(Program::new(Kind::KeyAt { position }, &[2]).unwrap().source_count(), 1);
+        assert!(
+            matches!(report.operations[1].kind, WorkspaceOperationKind::Sampling(
+            WorkspaceSamplingOperation::SelectRandomKey { index }) if index == position)
+        );
+        assert_eq!(
+            Program::new(Kind::KeyAt { position }, &[2])
+                .unwrap()
+                .source_count(),
+            1
+        );
     }
-    assert!(Program::new(Kind::KeyAt { position: i32::MAX as u32 }, &[2]).is_err());
+    assert!(
+        Program::new(
+            Kind::KeyAt {
+                position: i32::MAX as u32
+            },
+            &[2]
+        )
+        .is_err()
+    );
     let scores = WorkspaceTensor::existing(layout(), &context).unwrap();
     let choice = <DefaultSampler as SpeculativeSampler<WorkspaceSamplingBackend>>::prepared_categorical_policy(&DefaultSampler)
         .unwrap().bind(0.7).unwrap();
-    assert_eq!(Program::new(Kind::Categorical(choice), scores.shape()).unwrap().source_count(), 2);
+    assert_eq!(
+        Program::new(Kind::Categorical(choice), scores.shape())
+            .unwrap()
+            .source_count(),
+        2
+    );
     context.begin_span();
     let mut random = WorkspaceSamplingRandomState::from_key(key.clone()).unwrap();
-    let token = choice.construct::<WorkspaceSamplingBackend>(&scores, &mut random, &context).unwrap();
+    let token = choice
+        .construct::<WorkspaceSamplingBackend>(&scores, &mut random, &context)
+        .unwrap();
     let advanced = random.into_key();
     assert_eq!(advanced.shape(), &[2]);
-    assert_eq!(token.shape(), &[1,1]);
-    let report = context.finish_report(&[token,advanced]).unwrap();
-    assert!(matches!(report.operations[0].kind, WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey)));
-    assert!(matches!(report.operations.last().unwrap().kind, WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::Categorical)));
-    assert_eq!(report.operations[0].outputs[0].shape(), &[2,2]);
+    assert_eq!(token.shape(), &[1, 1]);
+    let report = context.finish_report(&[token, advanced]).unwrap();
+    assert!(matches!(
+        report.operations[0].kind,
+        WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey)
+    ));
+    assert!(matches!(
+        report.operations.last().unwrap().kind,
+        WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::Categorical)
+    ));
+    assert_eq!(report.operations[0].outputs[0].shape(), &[2, 2]);
     let (ordinary_context, ordinary_calls) = setup(false);
     let ordinary_scores = WorkspaceTensor::existing(layout(), &ordinary_context).unwrap();
     let ordinary_key = WorkspaceSamplingRandomState::from_seed(&ordinary_context).unwrap();
     ordinary_calls.borrow_mut().clear();
     let mut ordinary_key = ordinary_key;
     ordinary_context.begin_span();
-    let token = WorkspaceSamplingBackend::sample_processed(&ordinary_scores,0.7,Some(&mut ordinary_key),&ordinary_context).unwrap();
-    let ordinary = ordinary_context.finish_report(&[token,ordinary_key.into_key()]).unwrap();
-    assert_eq!(format!("{:?}",report.operations.iter().map(|op|&op.kind).collect::<Vec<_>>()),
-        format!("{:?}",ordinary.operations.iter().map(|op|&op.kind).collect::<Vec<_>>()));
+    let token = WorkspaceSamplingBackend::sample_processed(
+        &ordinary_scores,
+        0.7,
+        Some(&mut ordinary_key),
+        &ordinary_context,
+    )
+    .unwrap();
+    let ordinary = ordinary_context
+        .finish_report(&[token, ordinary_key.into_key()])
+        .unwrap();
+    assert_eq!(
+        format!(
+            "{:?}",
+            report
+                .operations
+                .iter()
+                .map(|op| &op.kind)
+                .collect::<Vec<_>>()
+        ),
+        format!(
+            "{:?}",
+            ordinary
+                .operations
+                .iter()
+                .map(|op| &op.kind)
+                .collect::<Vec<_>>()
+        )
+    );
 }
 
 #[test]
 fn prepared_uniform_draw_keeps_sequential_key_and_scalar_roots() {
-    use crate::speculative::numerical::{SpeculativeNumericalKind as Kind, SpeculativeNumericalProgram as Program};
+    use crate::speculative::numerical::{
+        SpeculativeNumericalKind as Kind, SpeculativeNumericalProgram as Program,
+    };
     let (context, _) = setup(false);
     let key = WorkspaceTensor::existing(
-        context.layout(&[2], WorkspaceDtype::Uint32).unwrap(), &context).unwrap();
+        context.layout(&[2], WorkspaceDtype::Uint32).unwrap(),
+        &context,
+    )
+    .unwrap();
     let mut random = WorkspaceSamplingRandomState::from_key(key).unwrap();
     for _ in 0..2 {
         context.begin_span();
@@ -780,17 +962,110 @@ fn prepared_uniform_draw_keeps_sequential_key_and_scalar_roots() {
         assert_eq!(draw.shape(), &[1]);
         assert_eq!(draw.layout().dtype(), WorkspaceDtype::Float32);
         assert_eq!(random.key().shape(), &[2]);
-        let report = context.finish_report(&[draw, random.key().clone()]).unwrap();
+        let report = context
+            .finish_report(&[draw, random.key().clone()])
+            .unwrap();
         assert_eq!(report.operations.len(), 4);
-        assert!(matches!(report.operations[0].kind,
-            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey)));
-        assert_eq!(report.operations[0].outputs[0].shape(), &[2,2]);
-        assert!(matches!(report.operations[3].kind,
-            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::UniformUnitInterval)));
+        assert!(matches!(
+            report.operations[0].kind,
+            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::SplitRandomKey)
+        ));
+        assert_eq!(report.operations[0].outputs[0].shape(), &[2, 2]);
+        assert!(matches!(
+            report.operations[3].kind,
+            WorkspaceOperationKind::Sampling(WorkspaceSamplingOperation::UniformUnitInterval)
+        ));
         assert_eq!(report.operations[3].inputs[0].shape(), &[2]);
     }
-    assert_eq!(Program::new(Kind::UniformUnitInterval, &[2]).unwrap().source_count(), 1);
-    for shape in [&[][..], &[1][..], &[4][..], &[1,2][..]] {
+    assert_eq!(
+        Program::new(Kind::UniformUnitInterval, &[2])
+            .unwrap()
+            .source_count(),
+        1
+    );
+    for shape in [&[][..], &[1][..], &[4][..], &[1, 2][..]] {
         assert!(Program::new(Kind::UniformUnitInterval, shape).is_err());
     }
+}
+
+#[test]
+fn closing_population_is_the_same_with_and_without_a_native_recipe_observer() {
+    #[derive(Default)]
+    struct Closing(Vec<eredu_nn::workspace::WorkspaceStoragePopulation>);
+    impl SamplingWorkspaceObserver for Closing {
+        fn observe(
+            &mut self,
+            _: SamplingWorkspacePhase,
+            _: &WorkspaceTraceReport,
+        ) -> Result<(), Error> {
+            unreachable!("closing population callback is selected")
+        }
+        fn observe_with_storage(
+            &mut self,
+            _: SamplingWorkspacePhase,
+            _: &WorkspaceTraceReport,
+            closing: eredu_nn::workspace::WorkspaceStoragePopulation,
+        ) -> Result<(), Error> {
+            self.0.push(closing);
+            Ok(())
+        }
+    }
+    let sampler = ConfiguredTextSampler::Standard(GenerationSampler::new());
+    for temperature in [0.0, 0.7] {
+        let (context, _) = setup(false);
+        let random =
+            (temperature > 0.0).then(|| WorkspaceSamplingRandomState::from_seed(&context).unwrap());
+        for steps in [0, 3] {
+            let ordinary = quote_sampling_workspace(
+                &sampler,
+                temperature,
+                random.as_ref(),
+                &layout(),
+                &TokenFilter::All,
+                steps,
+                &context,
+            )
+            .unwrap();
+            let mut closing = Closing::default();
+            let observed = quote_sampling_workspace_with_observer(
+                &sampler,
+                temperature,
+                random.as_ref(),
+                &layout(),
+                &TokenFilter::All,
+                steps,
+                &context,
+                Some(&mut closing),
+            )
+            .unwrap();
+            assert_eq!(closing.0.len(), steps as usize + 1);
+            let expected = closing
+                .0
+                .iter()
+                .map(|storage| storage.maximum_allocations)
+                .max();
+            assert_eq!(ordinary.maximum_closing_storage_allocations, expected);
+            assert_eq!(observed.maximum_closing_storage_allocations, expected);
+            assert_eq!(ordinary.peak.bytes(), observed.peak.bytes());
+            assert_eq!(
+                expected,
+                Some(steps as usize + usize::from(temperature > 0.0))
+            );
+        }
+    }
+    let (context, _) = setup(false);
+    let unknown = quote_sampling_workspace(
+        &sampler,
+        0.0,
+        None,
+        WorkspaceSamplingInput {
+            layout: &layout(),
+            backing_capacity_bytes: Some(148),
+        },
+        &TokenFilter::All,
+        1,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(unknown.maximum_closing_storage_allocations, None);
 }

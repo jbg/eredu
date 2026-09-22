@@ -14,10 +14,15 @@ pub(crate) struct AutoregressiveEquationRecipe {
 }
 impl AutoregressiveEquationRecipe {
     /// Borrow the retained native reduction for the selected operation bank.
-    pub(crate) fn native_recipe(&self) -> &ResidentNativeRecipe { &self.recipe }
+    pub(crate) fn native_recipe(&self) -> &ResidentNativeRecipe {
+        &self.recipe
+    }
     pub(crate) fn with_native_recipe<T>(
-        &mut self, run: impl FnOnce(&mut ResidentNativeRecipe) -> T,
-    ) -> T { run(&mut self.recipe) }
+        &mut self,
+        run: impl FnOnce(&mut ResidentNativeRecipe) -> T,
+    ) -> T {
+        run(&mut self.recipe)
+    }
     pub(crate) fn invocation(&self) -> AutoregressiveInvocation {
         self.invocation
     }
@@ -66,9 +71,11 @@ impl AutoregressiveEquationRecipe {
     }
     pub(crate) fn bind_prefill_inputs(
         &mut self,
-        mechanism: MlxMetalWorkspaceMechanisms,
+        mechanism: super::super::ResidentExecutionMechanisms,
         context: &WorkspaceContext,
-        mut trace: impl FnMut(&eredu_runtime::prefill::PrefillChunk) -> Result<WorkspaceTraceReport, crate::backend::error::Error>,
+        mut trace: impl FnMut(
+            &eredu_runtime::prefill::PrefillChunk,
+        ) -> Result<WorkspaceTraceReport, crate::backend::error::Error>,
     ) -> Result<(), crate::backend::error::Error> {
         if self.io_bound || self.invocation.execution_pass() != eredu_runtime::ExpertPass::Prefill {
             return Err(crate::backend::error::Error::PrefillControl(
@@ -100,8 +107,20 @@ impl AutoregressiveEquationRecipe {
         &self,
         ordinal: usize,
         preparation_graph_bytes: usize,
-    ) -> Result<(ResidentCompletionRecipe, usize, usize, usize, u64), crate::backend::error::Error> {
-        self.recipe.equation_domains(ordinal, preparation_graph_bytes)
+    ) -> Result<(ResidentCompletionRecipe, usize, usize, usize, u64), crate::backend::error::Error>
+    {
+        self.recipe
+            .equation_domains(ordinal, preparation_graph_bytes)
+    }
+    pub(crate) fn equation_domains_with_readout(
+        &self,
+        ordinal: usize,
+        preparation_graph_bytes: usize,
+        readout: Option<safemlx::ResidentGraphLayout>,
+    ) -> Result<(ResidentCompletionRecipe, usize, usize, usize, u64), crate::backend::error::Error>
+    {
+        self.recipe
+            .equation_domains_with_readout(ordinal, preparation_graph_bytes, readout)
     }
     pub(crate) fn single_equation_completion(
         &self,
@@ -158,6 +177,14 @@ impl ResidentRecipeRecorder {
         plan: &InferenceSpanWorkspacePlan,
         invocation: AutoregressiveInvocation,
     ) -> Result<AutoregressiveEquationRecipe, Error> {
+        self.finish_autoregressive_observed(plan, invocation, false)
+    }
+    pub(crate) fn finish_autoregressive_observed(
+        self,
+        plan: &InferenceSpanWorkspacePlan,
+        invocation: AutoregressiveInvocation,
+        source_sequence: bool,
+    ) -> Result<AutoregressiveEquationRecipe, Error> {
         let expected_output = match invocation.pass() {
             eredu_runtime::speculative::autoregressive::AutoregressivePass::TargetPrefill => {
                 eredu_core::OutputDemand::LastPosition
@@ -166,6 +193,13 @@ impl ResidentRecipeRecorder {
                 eredu_core::OutputDemand::StateOnly
             }
             _ => eredu_core::OutputDemand::Sequence,
+        };
+        let expected_output = if source_sequence
+            && invocation.execution_pass() == eredu_runtime::ExpertPass::Prefill
+        {
+            eredu_core::OutputDemand::Sequence
+        } else {
+            expected_output
         };
         let decode = invocation.execution_pass() == eredu_runtime::ExpertPass::Decode;
         if self.geometry.max_output_tokens != 0
@@ -210,31 +244,49 @@ impl ResidentNativeRecipe {
         &self,
         ordinal: usize,
     ) -> Result<ResidentCompletionRecipe, crate::backend::error::Error> {
-        let row = self.records.get(ordinal).ok_or(
-            crate::backend::error::Error::PrefillControl(
+        let row = self
+            .records
+            .get(ordinal)
+            .ok_or(crate::backend::error::Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-            ),
-        )?;
+            ))?;
         self.completion_for(|span| span == &row.span)
     }
     pub(super) fn equation_domains(
         &self,
         ordinal: usize,
         preparation_graph_bytes: usize,
-    ) -> Result<(ResidentCompletionRecipe, usize, usize, usize, u64), crate::backend::error::Error> {
-        let unknown = || crate::backend::error::Error::PrefillControl(
-            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
-        );
+    ) -> Result<(ResidentCompletionRecipe, usize, usize, usize, u64), crate::backend::error::Error>
+    {
+        self.equation_domains_with_readout(ordinal, preparation_graph_bytes, None)
+    }
+    fn equation_domains_with_readout(
+        &self,
+        ordinal: usize,
+        preparation_graph_bytes: usize,
+        readout: Option<safemlx::ResidentGraphLayout>,
+    ) -> Result<(ResidentCompletionRecipe, usize, usize, usize, u64), crate::backend::error::Error>
+    {
+        let unknown = || {
+            crate::backend::error::Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            )
+        };
         let row = self.records.get(ordinal).ok_or_else(unknown)?;
-        if row.unqualified_kernel_owner.is_some() || !self.sampling.rows.is_empty()
+        if row.unqualified_kernel_owner.is_some()
+            || !self.sampling.rows.is_empty()
             || self.resume_copy.is_some()
             || ((self.host_copies.is_some() || self.host_transfers.is_some())
-                && !self.has_host_copy_recipe()) {
+                && !self.has_host_copy_recipe())
+        {
             return Err(unknown());
         }
         let rows = std::slice::from_ref(row);
         let completion = self.equation_completion(ordinal)?;
-        let graph = self.graph_storage_requirement_with_rows(preparation_graph_bytes, rows)?;
+        let mut graph = self.graph_storage_requirement_with_rows(preparation_graph_bytes, rows)?;
+        if let Some(readout) = readout {
+            graph.include_construction_bank(readout)?;
+        }
         let record = self.record_storage_requirement_with_rows(rows)?;
         Ok((
             completion,

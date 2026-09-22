@@ -1,10 +1,10 @@
-//! Exact own-writer file lifetime retained beside the canonical source pins.
+//! Authenticated live or imported file retained beside canonical source pins.
 use super::*;
-use eredu_runtime::cache::LiveCacheBlockSource;
+use crate::backend::runtime::cache::residency::CacheFileSource;
 
 pub(super) struct RetainedPagedDisk {
     id: CacheBlockId,
-    source: LiveCacheBlockSource,
+    source: CacheFileSource,
 }
 impl RetainedPagedDisk {
     pub(super) fn prepare(
@@ -20,12 +20,12 @@ impl RetainedPagedDisk {
             .disk()
             .ok_or_else(|| fail(CacheSourceError::Identity))?;
         let source = disk
-            .live_file()
+            .file_source()
             .ok_or_else(|| fail(CacheSourceError::PromotionRequired))?;
         let layout = source
-            .writer_layout()
+            .layout()
             .ok_or_else(|| fail(CacheSourceError::PromotionRequired))?;
-        if disk.persistent()
+        if !source.owns_declared_backing()
             || disk.buffered().is_some()
             || disk.path() != source.path()
             || disk.names() != layout.names()
@@ -56,7 +56,7 @@ impl RetainedPagedDisk {
         }
         Ok(Self {
             id: block.id().clone(),
-            source: source.clone(),
+            source,
         })
     }
     pub(super) fn controls() -> Option<usize> {
@@ -69,12 +69,20 @@ impl RetainedPagedDisk {
             [PagedCacheArrayGeometry; 2],
             [(&[usize], safetensors::tensor::Dtype, usize); 2],
             (usize, Dtype),
-            Option<&LiveCacheBlockSource>,
+            Option<CacheFileSource>,
         )>())
     }
 }
 impl ProjectedPagedSource {
-    pub(crate) fn retained_file(&self, id: &CacheBlockId) -> Option<&LiveCacheBlockSource> {
+    pub(crate) fn retained_file_control_bytes() -> usize {
+        size_of::<(
+            &Self,
+            &CacheBlockId,
+            std::slice::Iter<'_, RetainedPagedDisk>,
+            Option<&CacheFileSource>,
+        )>()
+    }
+    pub(crate) fn retained_file(&self, id: &CacheBlockId) -> Option<&CacheFileSource> {
         self.files
             .iter()
             .find(|entry| &entry.id == id)
@@ -91,8 +99,8 @@ impl ProjectedPagedSource {
                 .ok_or(CacheSourceError::Identity)?;
             if row
                 .disk()
-                .and_then(|disk| disk.live_file())
-                .is_none_or(|actual| !file.source.same_source(actual))
+                .and_then(|disk| disk.file_source())
+                .is_none_or(|actual| !file.source.same_source(&actual))
             {
                 return Err(CacheSourceError::Identity);
             }

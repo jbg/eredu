@@ -20,6 +20,7 @@ typedef struct mlx_prepared_input_runtime {
   size_t maximum;
   unsigned storage_kind;
   size_t controls;
+  mlx_memory_placement placement;
 } mlx_prepared_input_runtime;
 // Shared allocator initialization. Dynamic object storage is distinct from
 // fixed module storage and from the borrowed Device ownership prerequisite.
@@ -70,6 +71,7 @@ int mlx_prepared_input_leaf_clone_array(mlx_array*, mlx_prepared_input_leaf);
 int mlx_prepared_input_array_layout(size_t* metadata_bytes, size_t* controls);
 unsigned mlx_prepared_input_leaf_array(mlx_array*, mlx_prepared_input_leaf);
 int mlx_prepared_input_leaf_info(uint64_t*, size_t*, mlx_prepared_input_leaf);
+int mlx_prepared_input_leaf_placement(mlx_memory_placement*, mlx_prepared_input_leaf);
 // Exact closed mutable U32[2] producer; this is not a generic tensor grant.
 typedef struct mlx_original_mutable_pair_layout {
   size_t metadata_bytes;

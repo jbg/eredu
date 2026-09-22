@@ -1,6 +1,8 @@
 //! Original RNG snapshots consume real completed keys and independently publish
 //! copied backings through the same production copy and sampler callbacks.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::HostPreparationAuthority;
 use eredu_runtime::DefaultSampler;
 
@@ -13,9 +15,7 @@ fn snapshot_host(
     let bytes = sampler
         .original_snapshot_metadata(Some(target), Some(draft))
         .unwrap()
-        .checked_add(
-            HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
-        )
+        .checked_add(HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap())
         .unwrap();
     funding.reserve_metadata(bytes).unwrap();
     HostPreparationAuthority::retain(funding.clone())
@@ -34,15 +34,18 @@ fn allocation(key: &OriginalNumericalKey) -> safemlx::AllocationIdentity {
 #[test]
 #[ignore = "requires native Metal execution"]
 fn original_rng_snapshot_copies_alias_backing_and_keeps_request_identity() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let backend = admitted_backend(&pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
-    let loaded = pool.used_bytes().unwrap();
+    let loaded = pool.fixture_host_charge().unwrap();
     let config = SpeculativeConfig {
         max_tokens: 2,
         max_draft_tokens: 1,
@@ -64,7 +67,7 @@ fn original_rng_snapshot_copies_alias_backing_and_keeps_request_identity() {
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let environment = backend.original_copy_environment().unwrap();
@@ -158,7 +161,7 @@ fn original_rng_snapshot_copies_alias_backing_and_keeps_request_identity() {
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
             pair.metadata_funding().clone(),
         )
         .unwrap();
@@ -169,17 +172,13 @@ fn original_rng_snapshot_copies_alias_backing_and_keeps_request_identity() {
             value: KeyValue::Original(create_key(SEED, foreign_context).unwrap()),
             memory_retention: NativeMemoryRetention::default(),
         };
-        assert!(
-            sampler
-                .original_snapshot_metadata(Some(&target_key), Some(&foreign_key))
-                .is_none()
-        );
+        assert!(sampler
+            .original_snapshot_metadata(Some(&target_key), Some(&foreign_key))
+            .is_none());
         let host = snapshot_host(&sampler, &target_key, &draft_key, pair.metadata_funding());
-        assert!(
-            sampler
-                .copy_snapshot(Some(&target_key), Some(&foreign_key), host)
-                .is_err()
-        );
+        assert!(sampler
+            .copy_snapshot(Some(&target_key), Some(&foreign_key), host)
+            .is_err());
         assert_eq!(
             key_words(again_target.value.original().unwrap()),
             source_words
@@ -199,7 +198,7 @@ fn original_rng_snapshot_copies_alias_backing_and_keeps_request_identity() {
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
         drop(pair);
         reclaim();
-        assert!(pool.used_bytes().unwrap() > loaded);
+        assert!(pool.fixture_host_charge().unwrap() > loaded);
         assert_eq!(
             key_words(again_target.value.original().unwrap()),
             source_words

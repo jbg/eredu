@@ -24,13 +24,13 @@ fn required(frame: &ScheduledCaptureStep<'_>) -> CaptureUsage {
 fn exact_precommit_hold_and_one_short_keep_original_account_and_all_payload_pointers() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (short_r, short_run) = fresh(&pool, h - 1);
     let before = ledger(&pool);
     assert!(matches!(
         short_run.prepare_capture_run(&short_r, plan(&source)),
         Err(CaptureRunHostError::Memory(
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::DomainAllowanceExceeded { .. }
         ))
     ));
     assert_eq!(ledger(&pool), before);
@@ -92,15 +92,15 @@ fn exact_precommit_hold_and_one_short_keep_original_account_and_all_payload_poin
     drop(bank);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn invalid_usage_and_timing_return_same_builder_without_refunding_claim() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut frame = bank
@@ -130,14 +130,14 @@ fn invalid_usage_and_timing_return_same_builder_without_refunding_claim() {
     drop(bank);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn completed_delivery_survives_parent_close_or_quarantine_without_certifying_native_work() {
     for quarantine in [false, true] {
         let source = source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
         let frame = bank
@@ -157,14 +157,17 @@ fn completed_delivery_survives_parent_close_or_quarantine_without_certifying_nat
         assert_eq!(ledger(&pool), before); // no validation/refund/certification
         assert_eq!(published.outcome(), CaptureStepOutcome::Aborted);
         drop(published);
-        assert_eq!(pool.used_bytes().unwrap(), if quarantine { h } else { 0 });
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            if quarantine { h } else { 0 }
+        );
     }
 }
 #[test]
 fn parent_close_before_sealing_rejects_and_keeps_same_partial_owner() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut frame = bank
@@ -187,13 +190,13 @@ fn parent_close_before_sealing_rejects_and_keeps_same_partial_owner() {
     drop(frame);
     drop(bank);
     drop(r);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn encoded_counter_matches_nonfinite_wire_at_exact_limit_and_one_short() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut frame = bank
@@ -225,7 +228,7 @@ fn encoded_counter_matches_nonfinite_wire_at_exact_limit_and_one_short() {
     drop(bank);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn encoded_failure_retains_metadata_charges_and_escaped_tensor_then_seals_aborted() {
@@ -235,7 +238,7 @@ fn encoded_failure_retains_metadata_charges_and_escaped_tensor_then_seals_aborte
     point.axes.as_mut().unwrap()[1].dimension = SymbolicDimension::Known(512);
     let source = admit(raw, point, 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut frame = bank
@@ -286,33 +289,35 @@ fn encoded_failure_retains_metadata_charges_and_escaped_tensor_then_seals_aborte
     drop(bank);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     assert_eq!(alias.shape(), &[5, 512]);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn unwinding_with_ready_delivery_retires_payload_and_does_not_refund_frame_claim() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
-    assert!(catch_unwind(AssertUnwindSafe(|| {
-        let frame = bank
-            .begin_step(CapturePhase::Prefill, 0)
-            .unwrap()
-            .prepare()
-            .unwrap();
-        let spent = required(&frame);
-        let _delivery = frame.prepare_delivery(spent, spent, 0.).unwrap();
-        panic!("after completed frame before outcome");
-    }))
-    .is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let frame = bank
+                .begin_step(CapturePhase::Prefill, 0)
+                .unwrap()
+                .prepare()
+                .unwrap();
+            let spent = required(&frame);
+            let _delivery = frame.prepare_delivery(spent, spent, 0.).unwrap();
+            panic!("after completed frame before outcome");
+        }))
+        .is_err()
+    );
     assert_eq!(bank.spent_steps(), 1);
     assert!(bank.begin_step(CapturePhase::Prefill, 0).is_err());
     drop(bank);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

@@ -207,8 +207,15 @@ impl TextGenerationBackend for StatefulBackend {
             return Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure());
         }
         let env = Self::source_environment(runtime);
-        admitted_text::Preparation::admit(env, config, controller, claim, env.output_width.get(), None)
-            .map(Some)
+        admitted_text::Preparation::admit(
+            env,
+            config,
+            controller,
+            claim,
+            env.output_width.get(),
+            None,
+        )
+        .map(Some)
     }
     fn bind_text_preparation_run<C: eredu_core::TokenFilterController>(
         _: &ModelRuntime<Self>,
@@ -251,7 +258,7 @@ impl TextGenerationBackend for StatefulBackend {
     ) -> io::Result<()> {
         if let Some(p) = p {
             p.request
-                .claim_sampling(config)
+                .claim_sampling(config.clone())
                 .and_then(|s| s.finish())
                 .map_err(io::Error::other)?;
         }
@@ -434,7 +441,12 @@ fn reset_restores_fresh_requests_without_reloading_and_synchronize_preserves_sta
 #[test]
 fn abandoned_generation_settles_before_generic_reuse_or_eviction() {
     let (mut model, state) = model();
-    let config = model.resolve_generation_config(Default::default()).unwrap();
+    let config = model
+        .resolve_generation_config(GenerationConfigOverrides {
+            max_new_tokens: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
     let mut generation = model
         .generate_tokens(vec![0], TextGenerationConfig::new(config))
         .unwrap();
@@ -451,9 +463,7 @@ fn abandoned_generation_settles_before_generic_reuse_or_eviction() {
 
 #[test]
 fn cancellation_settles_and_allows_a_fresh_generic_request() {
-    use eredu::api::{
-        PreparedChatGenerationSettings,
-    };
+    use eredu::api::PreparedChatGenerationSettings;
     use eredu::runtime::chat::ChatTemplateRequest;
     use eredu_core::{FinishReason, GenerationCancellationToken};
 
@@ -472,7 +482,7 @@ fn cancellation_settles_and_allows_a_fresh_generic_request() {
                     add_generation_prompt: true,
                     ..Default::default()
                 },
-                original_sources::CAPACITY,
+                &crate::memory::limits(original_sources::CAPACITY),
                 &preparation_cancel,
             )
             .unwrap()
@@ -510,7 +520,12 @@ fn cancellation_settles_and_allows_a_fresh_generic_request() {
 #[test]
 fn failed_drop_wait_is_reported_and_reset_cannot_release_unresolved_work() {
     let (mut model, state) = model();
-    let config = model.resolve_generation_config(Default::default()).unwrap();
+    let config = model
+        .resolve_generation_config(GenerationConfigOverrides {
+            max_new_tokens: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
     let mut generation = model
         .generate_tokens(vec![0], TextGenerationConfig::new(config))
         .unwrap();

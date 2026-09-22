@@ -1,11 +1,19 @@
 use super::FundedCaptureError;
-use std::{error::Error, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+use std::{
+    error::Error,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("native capture fault")]
 struct NativeFault(Arc<AtomicUsize>);
 impl Drop for NativeFault {
-    fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -23,7 +31,10 @@ fn public_backend_failure_exposes_and_retains_original_capture_leaf() {
         }
         source = error.source();
     }
-    assert_eq!(leaves, 1, "the actual native leaf must survive neutral erasure");
+    assert_eq!(
+        leaves, 1,
+        "the actual native leaf must survive neutral erasure"
+    );
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     drop(failure);
     assert_eq!(retired.load(Ordering::SeqCst), 1);

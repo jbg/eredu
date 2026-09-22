@@ -1,6 +1,8 @@
 //! Finite source binding and table metadata under the existing preparation grant.
 use super::*;
-use crate::working_memory::{qualified_storage, ExistingStoragePinLayout, OriginalStorageSourcesLayout};
+use crate::working_memory::{
+    ExistingStoragePinLayout, OriginalStorageSourcesLayout, qualified_storage,
+};
 use eredu_core::HostPreparationAuthority;
 use std::{alloc::Layout, mem::size_of};
 
@@ -46,7 +48,7 @@ impl<'a, S, K: HostSlotStorageKey> RegisteredDecoderHostCopy<'a, S, K> {
     /// Original tables use their authenticated source carrier; a rejected original
     /// source is never retried as an ordinary registration. No payload is charged.
     pub fn bind_prepared(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         plan: HostSlotInitialization<'a, S>,
         key: K,
         authority: &HostPreparationAuthority,
@@ -84,7 +86,7 @@ impl<'a, S, K: HostSlotStorageKey> RegisteredDecoderHostCopy<'a, S, K> {
     /// Shared ordinary/prepared adapter; only a supplied accepted preparation
     /// selects the finite source constructor. No failed branch is retried.
     pub fn bind_with_preparation(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         plan: HostSlotInitialization<'a, S>,
         key: K,
         authority: Option<&HostPreparationAuthority>,
@@ -141,7 +143,7 @@ impl<S, D, K: HostSlotStorageKey> RegisteredDecoderHostCopy<'_, S, K, D> {
     }
 }
 
-impl<OS, OD, CS, CD, K: HostSlotStorageKey> RegisteredDecoderTableGroup<'_, OS, OD, CS, CD, K> {
+impl<OS, OD, CS, CD, K: Ord + Send + 'static> RegisteredDecoderTableGroup<'_, OS, OD, CS, CD, K> {
     /// Exact group bookkeeping before/during destination admission. Per-table
     /// binding/metadata and slot payloads are queried separately; this measures
     /// the source plan children, initialized children, progress and scope arrays.

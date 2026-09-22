@@ -1,6 +1,6 @@
 //! Original source compilation and canonical prepared-chat publication.
 use super::original_token_input::chat::{
-    OriginalChatError, compile_original_chat_file, prepare_original_chat,
+    compile_original_chat_file, prepare_original_chat, OriginalChatError,
 };
 use super::{LoadedModel, ManagedPlainTextSource};
 use crate::runtime::chat::{ChatTemplateRequest, DependencyMemoryPolicy};
@@ -168,7 +168,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
         Ok(Some(source))
     }
 
-    /// Prepares one authenticated chat under the supplied managed capacity.
+    /// Prepares one authenticated chat under the supplied managed limits.
     /// The actual request stays borrowed through profile, policy and rendering;
     /// the result retains their original allocations for every execution consumer.
     /// Cancellation returns `None` before the next expensive preparation stage.
@@ -176,13 +176,13 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
         &self,
         source: &ManagedChatSource,
         request: &ChatTemplateRequest,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<crate::runtime::chat::PreparedChat>, ManagedChatError> {
         self.prepare_chat_with_grammar_memory(
             source,
             request,
-            capacity,
+            limits,
             DependencyMemoryPolicy::default(),
             cancellation,
         )
@@ -199,7 +199,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
         &self,
         source: &ManagedChatSource,
         request: &ChatTemplateRequest,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
         grammar_memory: DependencyMemoryPolicy,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<crate::runtime::chat::PreparedChat>, ManagedChatError> {
@@ -219,7 +219,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
             request,
             Some(self.tokenizer.template_kwargs()),
             &self.eos_token_ids,
-            capacity,
+            limits,
             grammar_memory,
             cancellation,
         )

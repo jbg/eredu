@@ -126,7 +126,7 @@ fn selected_paged_state_controls_generic_construction() {
                 BindingVisitor {
                     stream: &stream,
                     weights_stream: &weights_stream,
-                    layerwise_manager: None,
+                    construction_sources: None,
                 },
             )
             .unwrap();

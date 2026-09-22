@@ -2,8 +2,8 @@
 use super::*;
 use crate::cache::{PagedScanMechanisms, PagedScanPlan};
 use eredu_nn::{
-    BlockwiseAttentionBackend, BlockwiseAttentionOptions, BlockwiseAttentionSpec,
     workspace::{WorkspaceBackend, WorkspaceBlockwiseAccumulator},
+    BlockwiseAttentionBackend, BlockwiseAttentionOptions, BlockwiseAttentionSpec,
 };
 
 impl WorkspacePagedAppendState {
@@ -199,7 +199,7 @@ where
             self.context,
         )?;
         self.context.retain_values(&[&output])?;
-        self.context.complete_values(&[&output])?;
+        self.context.complete_cache_scan(&output)?;
         self.state.discard_after_attention(self.context)?;
         Ok(output)
     }

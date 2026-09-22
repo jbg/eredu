@@ -11,17 +11,21 @@ mod ordinary;
 mod read;
 pub(crate) use read::{
     ForegroundDiskReadError, ForegroundDiskReadLayout, ForegroundDiskReadPlan,
-    PreparedForegroundDiskIo, PreparedForegroundDiskRead, ReadForegroundDiskBatch,
+    ForegroundMaterializationPopulation, PreparedForegroundDiskIo, PreparedForegroundDiskRead,
+    ReadForegroundDiskBatch,
 };
 
 struct UnitDescriptor {
     definition: OffloadUnit,
     canonical_reads: Vec<usize>,
     own_reads: std::ops::Range<usize>,
+    own_leaves: std::ops::Range<usize>,
 }
 struct NativeRead {
     shape: Vec<i32>,
     dtype: safemlx::Dtype,
+    leaves: std::ops::Range<usize>,
+    materialized: Option<Arc<read_source_plan::MaterializedReadPlan>>,
 }
 struct DescriptorData {
     peak_source: eredu_runtime::working_memory::HostSourcePeakSelection,
@@ -67,10 +71,9 @@ impl ForegroundDiskDescriptors {
         self.native_copy_output(id, name)
             .map(|(shape, dtype, _)| (shape, dtype))
     }
-    /// This source retains only encoded reads into the final immutable
-    /// PreparedHostTransferPlan destination. Its subsequent native copy has
-    /// that constructor's physical layout, including for packed companions.
-    /// Arbitrary materialization recipes do not use this source type.
+    /// Both encoded and materialized sources finish in the same immutable
+    /// PreparedHostTransferPlan destination. The following native copy has
+    /// that constructor's layout, independently of the producer equation.
     pub(crate) fn native_copy_output(
         &self,
         id: &OffloadUnitId,
@@ -110,10 +113,17 @@ impl ForegroundDiskDescriptors {
             .bindings()
             .binary_search_by(|binding| binding.name().cmp(name))
             .ok()?;
-        self.value
-            .source
-            .read_output(*unit.canonical_reads.get(ordinal)?)
+        self.read_output(*unit.canonical_reads.get(ordinal)?)
     }
+    fn read_output(&self, index: usize) -> Option<&RecipeMetadata> {
+        let read = self.value.native_reads.get(index)?;
+        match &read.materialized {
+            Some(plan) => Some(&plan.output),
+            None if read.leaves.len() == 1 => self.value.source.read_output(read.leaves.start),
+            None => None,
+        }
+    }
+
     pub(crate) fn source(
         &self,
         id: &OffloadUnitId,
@@ -165,29 +175,32 @@ impl ForegroundDiskDescriptors {
     }
 }
 
-struct DescriptorPlan {
-    units: Vec<OffloadUnit>,
-    reads: Vec<PlannedRead>,
+struct DescriptorPlan<'a> {
+    units: &'a [OffloadUnit],
+    reads: &'a [PlannedRead],
     catalogs: OriginalHostCatalogPlan,
     canonical_reads: Vec<Vec<usize>>,
 }
-impl DescriptorPlan {
+impl DescriptorPlan<'_> {
     fn source_plan(&self) -> ReadSourcePlan<'_> {
         ReadSourcePlan {
-            units: &self.units,
-            reads: &self.reads,
+            units: self.units,
+            reads: self.reads,
             catalogs: &self.catalogs,
         }
     }
 }
-impl SharedNativeInitializer for DescriptorPlan {
+impl SharedNativeInitializer for DescriptorPlan<'_> {
     type Output = ForegroundDiskDescriptors;
     type Error = ConstructionError;
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         let overflow = || WorkingMemoryError::Overflow;
-        let detached =
-            EncodedRecipeRead::prepare_detached(self.reads.iter().map(|row| row.read.encoded()))
-                .ok_or(WorkingMemoryError::UnknownBound)?;
+        let detached = eredu_checkpoint::recipe::EncodedRecipeReadView::prepare_detached(
+            self.source_plan()
+                .encoded_leaves()
+                .ok_or(WorkingMemoryError::Overflow)?,
+        )
+        .ok_or(WorkingMemoryError::UnknownBound)?;
         let mut bytes = OriginalReadSources::storage_bytes(&self.source_plan())?
             .checked_add(
                 detached
@@ -209,7 +222,7 @@ impl SharedNativeInitializer for DescriptorPlan {
                     .size(),
             )
             .ok_or_else(overflow)?;
-        for row in &self.reads {
+        for row in self.reads {
             bytes = bytes
                 .checked_add(
                     Layout::array::<i32>(row.read.shape().len())
@@ -253,8 +266,10 @@ impl SharedNativeInitializer for DescriptorPlan {
     ) -> Result<Self::Output, Self::Error> {
         let custody = ManagerCustody::new(custody);
         let result = (|| -> Result<_, ConstructionCause> {
-            let detached = EncodedRecipeRead::prepare_detached(
-                self.reads.iter().map(|row| row.read.encoded()),
+            let detached = eredu_checkpoint::recipe::EncodedRecipeReadView::prepare_detached(
+                self.source_plan()
+                    .encoded_leaves()
+                    .ok_or(ResidencyError::OriginalCache(WorkingMemoryError::Overflow))?,
             )
             .ok_or(ResidencyError::OriginalOperationDomain)?
             .construct(custody.clone())?;
@@ -266,6 +281,10 @@ impl SharedNativeInitializer for DescriptorPlan {
                     definition: unit.clone(),
                     canonical_reads: reads.clone(),
                     own_reads: self.source_plan().read_range(ordinal),
+                    own_leaves: self
+                        .source_plan()
+                        .leaf_range(self.source_plan().read_range(ordinal))
+                        .ok_or(ResidencyError::OriginalCache(WorkingMemoryError::Overflow))?,
                 });
             }
             Ok(ForegroundDiskDescriptors {
@@ -277,11 +296,23 @@ impl SharedNativeInitializer for DescriptorPlan {
                     native_reads: self
                         .reads
                         .iter()
-                        .map(|row| NativeRead {
-                            shape: row.read.shape().to_vec(),
-                            dtype: row.read.dtype(),
+                        .enumerate()
+                        .map(|(index, row)| {
+                            Ok(NativeRead {
+                                shape: row.read.shape().to_vec(),
+                                dtype: row.read.dtype(),
+                                leaves: self.source_plan().leaf_range(index..index + 1).ok_or(
+                                    ResidencyError::OriginalCache(WorkingMemoryError::Overflow),
+                                )?,
+                                materialized: match &row.read {
+                                    read_source_plan::ReadValue::Direct(_) => None,
+                                    read_source_plan::ReadValue::Materialized(plan) => {
+                                        Some(plan.shared())
+                                    }
+                                },
+                            })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, ConstructionCause>>()?,
                 }),
                 _custody: custody.clone(),
             })
@@ -305,7 +336,13 @@ enum ForegroundDiskFailure {
     #[error(transparent)]
     Declaration(#[from] ResidencyControllerError),
     #[error("foreground disk descriptor construction: {0}")]
-    Constructor(#[source] SharedNativeInitializationError<DescriptorPlan>),
+    Constructor(
+        #[source]
+        eredu_runtime::working_memory::SharedNativeInitializationFailure<
+            ForegroundDiskDescriptors,
+            ConstructionError,
+        >,
+    ),
 }
 
 #[derive(Debug)]
@@ -329,7 +366,7 @@ fn prepare_descriptors(
     plan: &OffloadPlan,
     units: &[OffloadUnit],
     groups: &[String],
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<Option<ForegroundDiskDescriptors>, ForegroundDiskFailure> {
     if !plan
         .units()
@@ -343,6 +380,18 @@ fn prepare_descriptors(
     else {
         return Ok(None);
     };
+    prepare_descriptors_from_reads(primary, sources, plan, units, groups, pool, &reads)
+}
+
+fn prepare_descriptors_from_reads(
+    primary: &RetainedCheckpointSource,
+    sources: &BTreeMap<OffloadUnitId, RetainedCheckpointSource>,
+    plan: &OffloadPlan,
+    units: &[OffloadUnit],
+    groups: &[String],
+    pool: &MemoryLedger,
+    reads: &[PlannedRead],
+) -> Result<Option<ForegroundDiskDescriptors>, ForegroundDiskFailure> {
     let prepared = ResidencyController::prepare_constructor(
         |id| sources.get(id).unwrap_or(primary).as_ref(),
         plan,
@@ -384,14 +433,18 @@ fn prepare_descriptors(
     }
     drop(index);
     let value = DescriptorPlan {
-        units: units.to_vec(),
+        units,
         catalogs: OriginalHostCatalogPlan::capture(primary, sources, units)?,
         reads,
         canonical_reads,
     };
     pool.initialize_shared_native(value)
         .map(|ready| Some(ready.output().clone()))
-        .map_err(ForegroundDiskFailure::Constructor)
+        .map_err(|error| {
+            let (uncalled, failure) = error.into_parts();
+            drop(uncalled);
+            ForegroundDiskFailure::Constructor(failure)
+        })
 }
 
 pub(crate) fn prepare_foreground_disk_descriptors(
@@ -400,8 +453,21 @@ pub(crate) fn prepare_foreground_disk_descriptors(
     plan: &OffloadPlan,
     units: &[OffloadUnit],
     groups: &[String],
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<Option<ForegroundDiskDescriptors>, ForegroundDiskSourceError> {
     prepare_descriptors(primary, sources, plan, units, groups, pool)
+        .map_err(ForegroundDiskSourceError)
+}
+
+pub(super) fn prepare_foreground_disk_descriptors_from_reads(
+    primary: &RetainedCheckpointSource,
+    sources: &BTreeMap<OffloadUnitId, RetainedCheckpointSource>,
+    plan: &OffloadPlan,
+    units: &[OffloadUnit],
+    groups: &[String],
+    pool: &MemoryLedger,
+    reads: &[PlannedRead],
+) -> Result<Option<ForegroundDiskDescriptors>, ForegroundDiskSourceError> {
+    prepare_descriptors_from_reads(primary, sources, plan, units, groups, pool, reads)
         .map_err(ForegroundDiskSourceError)
 }

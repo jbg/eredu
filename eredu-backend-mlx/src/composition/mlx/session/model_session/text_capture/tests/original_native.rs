@@ -1,6 +1,8 @@
 //! Real public core original-input options, including full prefill row capture.
 //! Compares ordinary capture with original managed and controlled entry points.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::observation::TensorObservationData;
 use eredu_core::{
     ControlledTextGeneration, GenerationSequenceRequest, TextGeneration, TextPreparationOptions,
@@ -86,7 +88,7 @@ fn frame(delivery: SharedCapturedStep, prediction: u64) -> SharedCapturedStep {
 fn run(mode: &str) -> serde_json::Value {
     // Original input entry points require the same admitted stream owners as
     // the public factory; the older borrowed-stream fixture cannot grant them.
-    let pool = crate::backend::managed_memory::domain();
+    let pool = crate::backend::managed_memory::ledger();
     let streams =
         crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_factory(&pool)
             .unwrap()
@@ -104,13 +106,14 @@ fn run(mode: &str) -> serde_json::Value {
     let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
     let source = full_source(&runtime);
     let options = || TextPreparationOptions {
-        interventions: None, capture: Some(source.clone()),
+        interventions: None,
+        capture: Some(source.clone()),
     };
     let config = disk::config(0.0, if mode == "ordinary" { 3 } else { 2 }, 8 << 30);
     let config = if mode == "ordinary" {
-        let mut policy = config.inference_policy();
-        policy.managed_memory_capacity_bytes = None;
-        config.with_inference_policy(policy)
+        let mut policy = config.inference_policy().clone();
+        policy.memory_limits = eredu_core::MemoryLimitDeclarations::unlimited();
+        config.with_inference_policy(policy.clone())
     } else {
         config
     };
@@ -223,18 +226,18 @@ fn run(mode: &str) -> serde_json::Value {
     if mode != "ordinary" {
         assert!(frames.iter().all(|frame| !frame.records().is_empty()));
         assert!(
-            pool.used_bytes().unwrap() > 0,
+            pool.fixture_host_charge().unwrap() > 0,
             "escaped frames retain original custody"
         );
     }
-    let with_frames = pool.used_bytes().unwrap();
+    let with_frames = pool.fixture_host_charge().unwrap();
     drop(frames);
     if mode != "ordinary" {
         // Process initialization has independent persistent custody. The escaped
         // frame owners must release their own original request hold.
         crate::backend::submission_recovery::wait_for_retirement(|| {
             disk::reclaim();
-            pool.used_bytes().unwrap() < with_frames
+            pool.fixture_host_charge().unwrap() < with_frames
         });
     }
     serde_json::json!({"ids":output,"values":values})

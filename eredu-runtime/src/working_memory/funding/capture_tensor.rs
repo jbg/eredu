@@ -109,56 +109,53 @@ impl CaptureTensorCustody {
         Ok(())
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     // Called only by the concrete F32 geometry worker. No generic scalar/closure
     // funding API is widened and no existing native scope is auto-certified.
     pub(in crate::working_memory) fn open_capture_tensor_account(
         &self,
         plan: &CaptureTensorHostPlan<'_>,
-        capacity: u64,
+        limits: &crate::working_memory::CaptureTensorLimits,
     ) -> Result<CaptureTensorCustody, WorkingMemoryError> {
-        let execution = InferenceExecutionIdentity::default();
         let bytes = plan.initialization_peak_bytes();
-        let mut node = Some(AccountNode::empty());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        let id = commit_copy_account(
+        let projection = crate::working_memory::transaction_buffers::RequirementProjection {
+            parts: &[],
+            headroom: &limits.additional_headroom,
+            host_bytes: bytes,
+        };
+        let controls = capture_controls(self, &projection)?;
+        let accepted = PreparedCopyAccount::accept(
             self,
-            &mut usage,
-            &mut node,
-            &execution,
-            bytes,
-            capacity,
+            &self.construction_identity(),
+            projection,
+            &limits.memory_limits,
+            controls,
             CopyHostHolds::HostOnly(bytes),
+            |_| Ok(()),
         )?;
-        // No public run can authorize future native work. The sole freshly
-        // minted host scope retains the full envelope until its payload dies.
-        usage
-            .funding
-            .get_mut(&id)
-            .expect("new host account")
-            .run_open = false;
-        drop(usage);
+        let execution = InferenceExecutionIdentity::default();
+        let host = accepted.host(&execution, bytes)?;
         Ok(CaptureTensorCustody::Single(CaptureHostCustody {
-            host: WorkingMemoryDecoderHostScope {
-                scope: Some(WorkingMemoryFundingScope {
-                    purpose: ScopePurpose::Host,
-                    pool: self.clone(),
-                    id,
-                    active: true,
-                    borrowed_storage: None,
-                    capture_source: None,
-                    native_publication_identity: None,
-                }),
-                held: bytes,
-            },
+            host,
             execution,
             requires_open_parent: false,
         }))
     }
+}
+
+pub(in crate::working_memory) fn capture_controls(
+    pool: &MemoryLedger,
+    projection: &crate::working_memory::transaction_buffers::RequirementProjection<'_>,
+) -> Result<u64, WorkingMemoryError> {
+    copy_domain_controls(pool, projection)?
+        .checked_add(
+            u64::try_from(copy_account_control_bytes(false, 1, false)?)
+                .map_err(|_| WorkingMemoryError::Overflow)?,
+        )
+        .and_then(|n| {
+            n.checked_add(crate::working_memory::qualified_storage::shared_bytes::<()>().ok()?)
+        })
+        .ok_or(WorkingMemoryError::Overflow)
 }
 
 impl WorkingMemoryFundingRun {
@@ -188,7 +185,7 @@ impl WorkingMemoryFundingRun {
         reservation: &WorkingMemoryReservation,
         bytes: u64,
     ) -> Result<CaptureTensorCustody, WorkingMemoryError> {
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let execution = reservation.0.execution.clone();
@@ -209,7 +206,8 @@ impl WorkingMemoryFundingRun {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: self.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -235,6 +233,7 @@ impl WorkingMemoryFundingRun {
                     borrowed_storage: None,
                     capture_source: None,
                     native_publication_identity: None,
+                    allocation_funding: None,
                 }),
                 held: bytes,
             },
@@ -302,7 +301,7 @@ impl WorkingMemoryFundingRun {
         source: &WorkingMemoryStorage<K>,
     ) -> Result<(CaptureTensorCustody, CaptureSourceRollback<'s>), WorkingMemoryError> {
         if reservation.0.funding != Some(self.id)
-            || !self.pool.same_domain(&reservation.0.pool)
+            || !self.pool.same_ledger(&reservation.0.pool)
             || !FundingSource::CopyRun(self).same_account(FundingSource::HostScope(native))
         {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -337,7 +336,8 @@ impl WorkingMemoryFundingRun {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: self.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -370,6 +370,7 @@ impl WorkingMemoryFundingRun {
                         borrowed_storage: None,
                         capture_source: None,
                         native_publication_identity: None,
+                        allocation_funding: None,
                     }),
                     held: bytes,
                 },
@@ -559,21 +560,34 @@ impl WorkingMemoryFundingRun {
     // completed terms from being exchanged between ranks or fragment ordinals.
     // All holds consume the original account; no native scope is created.
     pub(in crate::working_memory) fn hold_partition_fragment(
-        &self,reservation:&WorkingMemoryReservation,plan:&crate::working_memory::capture_run::FragmentHostPlan<'_>,
-    )->Result<CaptureTensorCustody,WorkingMemoryError> {
-        let CaptureTensorCustody::Single(host)=self.hold_capture_destination(reservation,plan.initialization_peak_bytes()?)? else {unreachable!("fresh host hold")};
+        &self,
+        reservation: &WorkingMemoryReservation,
+        plan: &crate::working_memory::capture_run::FragmentHostPlan<'_>,
+    ) -> Result<CaptureTensorCustody, WorkingMemoryError> {
+        let CaptureTensorCustody::Single(host) =
+            self.hold_capture_destination(reservation, plan.initialization_peak_bytes()?)?
+        else {
+            unreachable!("fresh host hold")
+        };
         Ok(CaptureTensorCustody::Scheduled(std::sync::Arc::new(host)))
     }
     pub(in crate::working_memory) fn hold_partition_fragment_table(
-        &self,reservation:&WorkingMemoryReservation,plan:&crate::working_memory::PartitionFragmentHostPlan<'_>,
-    )->Result<CaptureTensorCustody,WorkingMemoryError> {
-        let CaptureTensorCustody::Single(host)=self.hold_capture_destination(reservation,plan.table_peak_bytes())? else {unreachable!("fresh host hold")};
+        &self,
+        reservation: &WorkingMemoryReservation,
+        plan: &crate::working_memory::PartitionFragmentHostPlan<'_>,
+    ) -> Result<CaptureTensorCustody, WorkingMemoryError> {
+        let CaptureTensorCustody::Single(host) =
+            self.hold_capture_destination(reservation, plan.table_peak_bytes())?
+        else {
+            unreachable!("fresh host hold")
+        };
         Ok(CaptureTensorCustody::Scheduled(std::sync::Arc::new(host)))
     }
 }
 
 impl CaptureTensorCustody {
-    pub(in crate::working_memory) fn shared_host_control_bytes()->Result<u64,WorkingMemoryError> {
+    pub(in crate::working_memory) fn shared_host_control_bytes() -> Result<u64, WorkingMemoryError>
+    {
         crate::working_memory::qualified_shared_bytes::<CaptureHostCustody>()
     }
 }

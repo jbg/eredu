@@ -64,9 +64,12 @@ fn native_paged_append_matches_projected_blocks_and_retains_failed_source_custod
     cache.append(first, first_values, &stream).unwrap();
     settle(&cache);
     let capacity = 1 << 23;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(AppendFacts, funding.clone()).unwrap();
@@ -170,7 +173,7 @@ fn native_paged_append_matches_projected_blocks_and_retains_failed_source_custod
         Err(failure) => failure,
     };
     drop((cache, actual, context, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert!(matches!(
         manager.remove_block(&id),
         Err(CacheResidencyError::Lifecycle(
@@ -178,7 +181,7 @@ fn native_paged_append_matches_projected_blocks_and_retains_failed_source_custod
         ))
     ));
     drop(projected);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert!(matches!(
         manager.remove_block(&id),
         Err(CacheResidencyError::Lifecycle(
@@ -188,5 +191,9 @@ fn native_paged_append_matches_projected_blocks_and_retains_failed_source_custod
     drop(failure);
     manager.remove_block(&id).unwrap();
     drop(manager);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

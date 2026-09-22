@@ -60,12 +60,12 @@ where
     ) -> Result<NativeOpeningCapacityPlan<'a, S, NativeExecution<A, S>>, PairedOpeningError>
     where
         D: ReplicatedRuntimeExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime_execution(|mechanisms, state, execution| {
@@ -123,12 +123,12 @@ where
     ) -> Result<super::super::NativeOpeningRowsPlan, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime_execution(|mechanisms, state, runtime| {
@@ -162,12 +162,12 @@ where
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime_execution(|mechanisms, _, runtime| {
@@ -207,12 +207,12 @@ where
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         let expired = session
             .inspect_runtime(|mechanisms, _| {
@@ -238,12 +238,12 @@ where
     ) -> Result<(bool, bool), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime(|mechanisms, _| {
@@ -264,12 +264,12 @@ where
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime(|mechanisms, _| {

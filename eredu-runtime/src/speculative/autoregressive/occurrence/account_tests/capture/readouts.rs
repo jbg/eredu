@@ -244,12 +244,12 @@ fn check(transform: CaptureTransform) {
         plan.workspace_geometry(2, pass, NonZeroU64::new(1).unwrap())
             .unwrap(),
     );
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let request = OriginalSpeculativeRequest::prepare(
         &pool,
         &InferenceExecutionIdentity::default(),
         &plan,
-        1 << 24,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
     )
     .unwrap();
     let mut cursor = plan.into_cursor();
@@ -318,7 +318,7 @@ fn check(transform: CaptureTransform) {
     drop((
         backend, unused, foreign, invocation, budget, model, role, request, source,
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(frame);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

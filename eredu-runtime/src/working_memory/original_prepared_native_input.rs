@@ -1,7 +1,7 @@
 //! One original materialization of the immutable host source's native leaves.
 //! Concrete native recipes implement the compiler contract. This is not request,
 //! encoder, prepared-input control or managed generation authority.
-use super::{OriginalPreparedHostInput, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, OriginalPreparedHostInput, WorkingMemoryError};
 use std::{
     alloc::Layout,
     fmt,
@@ -14,10 +14,14 @@ use std::{
 
 #[derive(Debug)]
 struct AccountInner {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     bytes: u64,
+    requirements: Option<eredu_core::DomainMemoryRequirements>,
     armed: AtomicBool,
     compiling: AtomicBool,
+    // Converted host storage spends an ordinary account exactly once. This
+    // custody retires after the shared shell, without a second scalar refund.
+    _funded_host: Option<eredu_core::HostPreparationAuthority>,
 }
 impl Drop for AccountInner {
     fn drop(&mut self) {
@@ -30,19 +34,55 @@ impl Drop for AccountInner {
             if *self.compiling.get_mut() {
                 usage.reservations -= 1;
             }
-            usage.reserved -= self.bytes;
+            if let Some(requirements) = &self.requirements {
+                for (slot, (_, charge)) in requirements.iter().enumerate() {
+                    let domain = &mut usage.domains[slot];
+                    domain.reserved -= charge.total().expect("validated compiler charge");
+                    domain.placement_allowances -= charge.placement_allowance_bytes;
+                    domain.estimates -= charge.estimated_overhead_bytes;
+                    domain.headroom -= charge.headroom_bytes;
+                }
+            } else {
+                usage.reserved -= self.bytes;
+            }
         }
     }
 }
 #[derive(Debug)]
 pub(super) struct Account(Option<Arc<AccountInner>>);
 impl Account {
-    pub(super) fn new_unarmed(pool: WorkingMemoryPool, bytes: u64) -> Self {
+    pub(super) fn new_unarmed(pool: MemoryLedger, bytes: u64) -> Self {
         Self(Some(Arc::new(AccountInner {
             pool,
             bytes,
+            requirements: None,
             armed: AtomicBool::new(false),
             compiling: AtomicBool::new(true),
+            _funded_host: None,
+        })))
+    }
+    fn new_domains(pool: MemoryLedger, requirements: eredu_core::DomainMemoryRequirements) -> Self {
+        Self(Some(Arc::new(AccountInner {
+            pool,
+            bytes: 0,
+            requirements: Some(requirements),
+            armed: AtomicBool::new(false),
+            compiling: AtomicBool::new(true),
+            _funded_host: None,
+        })))
+    }
+    pub(super) fn from_funded_host(
+        pool: MemoryLedger,
+        bytes: u64,
+        host: eredu_core::HostPreparationAuthority,
+    ) -> Self {
+        Self(Some(Arc::new(AccountInner {
+            pool,
+            bytes,
+            requirements: None,
+            armed: AtomicBool::new(false),
+            compiling: AtomicBool::new(false),
+            _funded_host: Some(host),
         })))
     }
     pub(super) fn share(&self) -> Self {
@@ -55,8 +95,8 @@ impl Account {
             .ok()
             .and_then(|n| usize::try_from(n).ok())
     }
-    pub(super) fn matches_pool(&self, pool: &WorkingMemoryPool) -> bool {
-        self.inner().pool.same_domain(pool)
+    pub(super) fn matches_pool(&self, pool: &MemoryLedger) -> bool {
+        self.inner().pool.same_ledger(pool)
     }
     pub(super) fn held_bytes(&self) -> u64 {
         self.inner().bytes
@@ -132,11 +172,22 @@ impl PreparedInputHostCustody {
         let OriginalPreparedInputCustody(account) = self.0.native_owner();
         Self(account)
     }
-    pub(crate) fn pool(&self) -> &WorkingMemoryPool {
+    pub(crate) fn pool(&self) -> &MemoryLedger {
         &self.0.inner().pool
     }
-    pub(crate) fn bytes(&self) -> u64 {
-        self.0.inner().bytes
+    pub(crate) fn bytes(&self) -> Option<u64> {
+        self.requirements()
+            .iter()
+            .try_fold(0u64, |sum, (_, charge)| {
+                sum.checked_add(charge.total().ok()?)
+            })
+    }
+    pub(crate) fn requirements(&self) -> &eredu_core::DomainMemoryRequirements {
+        self.0
+            .inner()
+            .requirements
+            .as_ref()
+            .expect("prepared native compiler domain account")
     }
 }
 
@@ -154,6 +205,12 @@ pub trait PreparedNativeInputCompiler: Sized {
     fn source(&self) -> &OriginalPreparedHostInput;
     /// Checked concrete allocation and control contribution, without allocation.
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError>;
+    /// Actual backend-supplied placement of every native allocation and host control.
+    /// This descriptor is descriptive; compilation starts only after admission.
+    fn required_storage_requirements(
+        &self,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError>;
     /// Performs the one actual materialization, preserving a failed prefix.
     fn compile(
         self,
@@ -193,8 +250,21 @@ impl<T> OriginalPreparedInputMaterialization<T> {
         &self.payload().source
     }
     /// Total original B1 allowance, independent of the host source's allowance.
-    pub fn original_bytes(&self) -> u64 {
-        self.payload().account.inner().bytes
+    pub fn original_bytes(&self) -> Option<u64> {
+        self.requirements()
+            .iter()
+            .try_fold(0u64, |sum, (_, charge)| {
+                sum.checked_add(charge.total().ok()?)
+            })
+    }
+    /// Complete physical-domain allowance retained by all native aliases.
+    pub fn requirements(&self) -> &eredu_core::DomainMemoryRequirements {
+        self.payload()
+            .account
+            .inner()
+            .requirements
+            .as_ref()
+            .expect("native compiler account")
     }
     /// Converts a rejected completed result into the same closed retirement
     /// failure used by compiler refusals. Concrete storage retires before the
@@ -202,13 +272,17 @@ impl<T> OriginalPreparedInputMaterialization<T> {
     pub fn retire_rejected<E>(self, cause: E) -> RetiredPreparedInputMaterializationError<E> {
         let source = self.source().clone();
         OriginalPreparedInputMaterializationError {
-            accounting: None, compilation: Some(cause), completed: Some(self), source,
-        }.retire_storage()
+            accounting: None,
+            compilation: Some(cause),
+            completed: Some(self),
+            source,
+        }
+        .retire_storage()
     }
 
     /// Validates the actual domain without changing any accounting state.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.payload().account.inner().pool.same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.payload().account.inner().pool.same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -256,17 +330,29 @@ impl<T, E> OriginalPreparedInputMaterializationError<T, E> {
             size_of::<RetiredPreparedInputMaterializationError<E>>(),
             size_of::<Option<Account>>(),
         ];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
     /// Retires concrete storage through its existing Drop path and preserves
     /// the exact cause, immutable I and accounting-only B owner. Native aliases
     /// still retain their own B custody; this creates no completion evidence,
     /// retry, source credit or allocation. No concrete prefix can escape.
     pub fn retire_storage(self) -> RetiredPreparedInputMaterializationError<E> {
-        let Self { accounting, compilation, completed, source } = self;
-        let account = completed.as_ref().map(|value| value.payload().account.share());
+        let Self {
+            accounting,
+            compilation,
+            completed,
+            source,
+        } = self;
+        let account = completed
+            .as_ref()
+            .map(|value| value.payload().account.share());
         let retired = RetiredPreparedInputMaterializationError {
-            accounting, compilation, source, account,
+            accounting,
+            compilation,
+            source,
+            account,
         };
         // Establish the closed result first so unwinding native retirement also
         // keeps the original account until the concrete prefix has unwound.
@@ -282,10 +368,12 @@ impl<T, E> OriginalPreparedInputMaterializationError<T, E> {
         self.compilation.as_ref()
     }
     /// Original bytes still held by the failed materialization.
-    pub fn retained_bytes(&self) -> u64 {
-        self.completed.as_ref().map_or(0, |v| v.original_bytes())
+    pub fn retained_bytes(&self) -> Option<u64> {
+        self.completed
+            .as_ref()
+            .map_or(Some(0), |v| v.original_bytes())
     }
-    /// Exact immutable input, including on a foreign-domain rejection.
+    /// Exact immutable input, including on a foreign-ledger rejection.
     pub fn source(&self) -> &OriginalPreparedHostInput {
         &self.source
     }
@@ -303,26 +391,55 @@ pub struct RetiredPreparedInputMaterializationError<E> {
 }
 impl<E> RetiredPreparedInputMaterializationError<E> {
     /// Exact original comparison/settlement diagnostic.
-    pub fn accounting_failure(&self) -> Option<&WorkingMemoryError> { self.accounting.as_ref() }
+    pub fn accounting_failure(&self) -> Option<&WorkingMemoryError> {
+        self.accounting.as_ref()
+    }
     /// Exact original compiler diagnostic; no formatted replacement.
-    pub fn compiler_failure(&self) -> Option<&E> { self.compilation.as_ref() }
+    pub fn compiler_failure(&self) -> Option<&E> {
+        self.compilation.as_ref()
+    }
     /// Original B still retained by this closed failure.
-    pub fn retained_bytes(&self) -> u64 { self.account.as_ref().map_or(0, Account::held_bytes) }
+    pub fn retained_bytes(&self) -> Option<u64> {
+        self.account.as_ref().map_or(Some(0), |account| {
+            account.inner().requirements.as_ref().map_or(
+                Some(account.held_bytes()),
+                |requirements| {
+                    requirements.iter().try_fold(0u64, |sum, (_, charge)| {
+                        sum.checked_add(charge.total().ok()?)
+                    })
+                },
+            )
+        })
+    }
     /// Immutable I consumed by the failed materialization.
-    pub fn source(&self) -> &OriginalPreparedHostInput { &self.source }
+    pub fn source(&self) -> &OriginalPreparedHostInput {
+        &self.source
+    }
 }
 impl<E: fmt::Display> fmt::Display for RetiredPreparedInputMaterializationError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.compilation {
             Some(cause) => cause.fmt(f),
-            None => self.accounting.as_ref().expect("materialization failure").fmt(f),
+            None => self
+                .accounting
+                .as_ref()
+                .expect("materialization failure")
+                .fmt(f),
         }
     }
 }
-impl<E: std::error::Error + 'static> std::error::Error for RetiredPreparedInputMaterializationError<E> {
+impl<E: std::error::Error + 'static> std::error::Error
+    for RetiredPreparedInputMaterializationError<E>
+{
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.compilation.as_ref().map(|cause| cause as &dyn std::error::Error)
-            .or_else(|| self.accounting.as_ref().map(|cause| cause as &dyn std::error::Error))
+        self.compilation
+            .as_ref()
+            .map(|cause| cause as &dyn std::error::Error)
+            .or_else(|| {
+                self.accounting
+                    .as_ref()
+                    .map(|cause| cause as &dyn std::error::Error)
+            })
     }
 }
 
@@ -362,11 +479,23 @@ impl<T, E: std::error::Error + 'static> std::error::Error
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Source-derived native recipe plus actual generic host/accounting controls.
     pub fn prepared_native_input_required_bytes<P: PreparedNativeInputCompiler>(
         plan: &P,
     ) -> Result<u64, WorkingMemoryError> {
+        let requirements =
+            plan.required_storage_requirements(plan.source().memory_ledger().topology())?;
+        Self::prepared_native_input_control_bytes::<P>()?
+            .checked_add(
+                u64::try_from(plan.required_storage_bytes()?)
+                    .map_err(|_| WorkingMemoryError::Overflow)?,
+            )
+            .and_then(|bytes| bytes.checked_add(requirements.backing_bytes().ok()?))
+            .ok_or(WorkingMemoryError::Overflow)
+    }
+    fn prepared_native_input_control_bytes<P: PreparedNativeInputCompiler>()
+    -> Result<u64, WorkingMemoryError> {
         let account_arc = Layout::new::<[AtomicUsize; 2]>()
             .extend(Layout::new::<AccountInner>())
             .map_err(|_| WorkingMemoryError::Overflow)?
@@ -395,7 +524,7 @@ impl WorkingMemoryPool {
         ];
         let bytes = controls
             .into_iter()
-            .try_fold(plan.required_storage_bytes()?, usize::checked_add)
+            .try_fold(0usize, usize::checked_add)
             .ok_or(WorkingMemoryError::Overflow)?;
         u64::try_from(bytes).map_err(|_| WorkingMemoryError::Overflow)
     }
@@ -411,10 +540,93 @@ impl WorkingMemoryPool {
         let source = plan.source().clone();
         let reject = |e| OriginalPreparedInputMaterializationError::rejected(source.clone(), e);
         source.validate_pool(self).map_err(reject)?;
-        let bytes = Self::prepared_native_input_required_bytes(&plan).map_err(reject)?;
-        let allowance = self.admit_source_compiler(bytes).map_err(reject)?;
-        // The original guard remains armed until the shared account exists.
-        let account = allowance.into_prepared_native_account();
+        let mut requirements = plan
+            .required_storage_requirements(self.topology())
+            .map_err(reject)?;
+        requirements
+            .validate(self.topology())
+            .map_err(WorkingMemoryError::from)
+            .map_err(reject)?;
+        let generic = Self::prepared_native_input_control_bytes::<P>().map_err(reject)?;
+        let host = generic
+            .checked_add(
+                requirements
+                    .backing_bytes()
+                    .map_err(WorkingMemoryError::from)
+                    .map_err(reject)?,
+            )
+            .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+        requirements
+            .add_allocation(host, self.host_placement())
+            .map_err(WorkingMemoryError::from)
+            .map_err(reject)?;
+        let account = Account::new_domains(self.clone(), requirements);
+        {
+            let requirements = account
+                .inner()
+                .requirements
+                .as_ref()
+                .expect("prepared requirements");
+            let mut usage = self
+                .0
+                .usage
+                .lock()
+                .map_err(|_| reject(WorkingMemoryError::Poisoned))?;
+            if usage.unquoted_owners != 0 {
+                return Err(reject(WorkingMemoryError::UnknownBound));
+            }
+            let reservations = usage
+                .reservations
+                .checked_add(1)
+                .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+            for (slot, (domain, charge)) in requirements.iter().enumerate() {
+                let increment = charge
+                    .total()
+                    .map_err(WorkingMemoryError::from)
+                    .map_err(reject)?;
+                let current = &usage.domains[slot];
+                let existing = self.0.domains[slot]
+                    .existing
+                    .checked_add(current.registered)
+                    .and_then(|bytes| bytes.checked_add(current.reserved))
+                    .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+                self.0
+                    .domain_capacity(&usage, domain, None)
+                    .map_err(reject)?
+                    .check(domain, existing, increment)
+                    .map_err(WorkingMemoryError::from)
+                    .map_err(reject)?;
+                current
+                    .reserved
+                    .checked_add(increment)
+                    .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+                current
+                    .placement_allowances
+                    .checked_add(charge.placement_allowance_bytes)
+                    .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+                current
+                    .estimates
+                    .checked_add(charge.estimated_overhead_bytes)
+                    .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+                current
+                    .headroom
+                    .checked_add(charge.headroom_bytes)
+                    .ok_or_else(|| reject(WorkingMemoryError::Overflow))?;
+            }
+            // Fixed scalar writes only. All domains and counters were validated.
+            for (slot, (_, charge)) in requirements.iter().enumerate() {
+                let current = &mut usage.domains[slot];
+                current.reserved += charge.total().expect("validated domain charge");
+                current.placement_allowances += charge.placement_allowance_bytes;
+                current.estimates += charge.estimated_overhead_bytes;
+                current.headroom += charge.headroom_bytes;
+                current.peak = current
+                    .peak
+                    .max(self.0.domains[slot].existing + current.registered + current.reserved);
+            }
+            usage.reservations = reservations;
+            account.activate();
+        }
         let result = plan.compile(account.native_owner());
         let (storage, compilation) = match result {
             Ok(v) => (v, None),

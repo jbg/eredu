@@ -6,7 +6,9 @@ use eredu_core::{
 };
 use std::ops::Range;
 
+mod authority;
 mod controls;
+pub use authority::PrefillSchedulingAuthority;
 pub use controls::{PrefillControlPlan, PrefillControlRole, PrefillSpanControlPhase};
 
 /// Exact boundary reached by the shared driver; carries no allocation authority.
@@ -152,6 +154,26 @@ impl<T, C: Completion> PrefillDriver<T, C> {
     }
 }
 
+// Cold consumers use the same traversal with descriptive inputs. Unit carries
+// no reservation or executable identity and cannot satisfy a native executor's
+// PrefillExecutor<InferenceRequest> contract.
+impl<T, C: Completion> PrefillDriver<T, C, ()> {
+    pub(crate) fn describe(
+        geometry: InferenceGeometry,
+    ) -> Result<Self, eredu_core::AdmissionPolicyError> {
+        geometry.validate_fixed()?;
+        Ok(Self {
+            geometry,
+            reservation: (),
+            cancellation: GenerationCancellationToken::new(),
+            next: 0,
+            pending: None,
+            failed: false,
+            cancelled: false,
+        })
+    }
+}
+
 impl<T, C: Completion> PrefillDriver<T, C, crate::working_memory::OriginalSpeculativeRole> {
     /// Binds one accepted target/draft prefill to this same chunk driver. The
     /// role authenticates its actual report, execution and one-shot start; no
@@ -208,10 +230,8 @@ impl<T, C: Completion, R: Clone> PrefillDriver<T, C, R> {
             if self.cancelled {
                 return Ok(PrefillProgress::Cancelled);
             }
-            let end = self
-                .next
-                .saturating_add(self.geometry.prefill_chunk_positions)
-                .min(self.geometry.input_positions);
+            let remaining = self.geometry.input_positions - self.next;
+            let end = self.next + self.geometry.prefill_chunk_positions.min(remaining);
             let chunk = PrefillChunk {
                 input: self.next..end,
                 position: self.geometry.cached_positions + self.next,

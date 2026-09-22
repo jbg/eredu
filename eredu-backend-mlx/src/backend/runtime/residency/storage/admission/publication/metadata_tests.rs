@@ -60,9 +60,9 @@ fn inventory(sources: impl IntoIterator<Item = SharedHostMetadata>) -> RetainedS
     storage
 }
 
-fn reclaim(pool: &WorkingMemoryPool, expected: u64) {
+fn reclaim(pool: &MemoryLedger, expected: u64) {
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(pool.used_bytes().unwrap(), expected);
+    assert_eq!(pool.fixture_host_charge().unwrap(), expected);
 }
 
 fn assert_payload(source: &SharedHostMetadata) {
@@ -92,7 +92,7 @@ fn cause<'a, T: std::error::Error + 'static>(
 
 #[test]
 fn metadata_publication_keeps_preexisting_aliases_charged_after_enclosing_owner_drop() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let layout = layout();
     let input = input();
@@ -106,8 +106,13 @@ fn metadata_publication_keeps_preexisting_aliases_charged_after_enclosing_owner_
     let duplicate = inventory(aliases.clone())
         .publish_unquoted(&loading)
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
+    assert_eq!(
+        pool.fixture_host_peak().unwrap(),
+        bytes
+            + 2 * crate::memory_fixture::publication_control_bytes(2)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
     // This tuple stands for the enclosing model-like owner; the escaped aliases
     // predate publication and must acquire custody through the shared payload.
     drop((loading, layout, input, publication, duplicate));
@@ -124,13 +129,18 @@ fn metadata_publication_keeps_preexisting_aliases_charged_after_enclosing_owner_
     reclaim(&pool, 0);
     // Registry/identity metadata must not form source -> charge -> source cycles.
     assert_ne!(keys[0], keys[1]);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes);
+    assert_eq!(
+        pool.fixture_host_peak().unwrap(),
+        bytes
+            + 2 * crate::memory_fixture::publication_control_bytes(2)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
 }
 
 #[test]
 fn equal_metadata_values_are_distinct_sources_while_aliases_deduplicate() {
     for make in [layout as fn() -> SharedHostMetadata, input] {
-        let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         let first = make();
         let second = make();
@@ -158,8 +168,8 @@ fn equal_metadata_values_are_distinct_sources_while_aliases_deduplicate() {
 #[test]
 fn metadata_attachments_keep_each_domain_charged_until_the_last_payload_alias() {
     for make in [layout as fn() -> SharedHostMetadata, input] {
-        let a = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-        let b = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+        let a = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+        let b = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
         let loading_a = NativeMemoryOwner::acquire(&a).unwrap();
         let loading_b = NativeMemoryOwner::acquire(&b).unwrap();
         let source = make();
@@ -175,7 +185,10 @@ fn metadata_attachments_keep_each_domain_charged_until_the_last_payload_alias() 
             .publish_unquoted(&loading_a)
             .unwrap();
         assert_eq!(
-            (a.used_bytes().unwrap(), b.used_bytes().unwrap()),
+            (
+                a.fixture_host_charge().unwrap(),
+                b.fixture_host_charge().unwrap()
+            ),
             (bytes, bytes)
         );
         drop((pa, pb, repeated, source, loading_a, loading_b));
@@ -190,39 +203,54 @@ fn metadata_attachments_keep_each_domain_charged_until_the_last_payload_alias() 
 
 #[test]
 fn metadata_batch_registration_rejects_one_short_without_partial_charge_or_owner_loss() {
-    let source_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let source_authority = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let sources = [layout(), input()];
     let bytes: u64 = sources
         .iter()
         .map(|source| source.capacity_bytes().unwrap())
         .sum();
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let controls = crate::memory_fixture::publication_control_bytes(2);
+    let short = crate::memory_fixture::ledger(
+        bytes + controls - 1 + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let loading_short = NativeMemoryOwner::acquire(&short).unwrap();
     let error = inventory(sources.clone())
         .publish_unquoted(&loading_short)
         .unwrap_err();
     assert_eq!(
-        cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::BudgetExceeded {
-            required_bytes: bytes,
-            available_bytes: bytes - 1,
-        })
+        cause::<WorkingMemoryError>(&error)
+            .and_then(crate::tests::support::memory_error::host_budget_numbers),
+        Some((bytes, bytes - 1))
     );
     assert_eq!(
-        (short.used_bytes().unwrap(), short.peak_bytes().unwrap()),
-        (0, 0)
+        (
+            short.fixture_host_charge().unwrap(),
+            short.fixture_host_peak().unwrap()
+        ),
+        (
+            0,
+            controls + crate::memory_fixture::native_owner_control_bytes()
+        )
     );
     assert_eq!(short.unquoted_owner_count().unwrap(), 1);
     for source in &sources {
         assert_payload(source);
     }
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let exact = crate::memory_fixture::ledger(
+        bytes
+            + crate::memory_fixture::publication_control_bytes(2)
+            + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let loading_exact = NativeMemoryOwner::acquire(&exact).unwrap();
     let publication = inventory(sources.clone())
         .publish_unquoted(&loading_exact)
         .unwrap();
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
     assert_eq!(exact.unquoted_owner_count().unwrap(), 1);
     drop((publication, loading_exact, loading_short, source_authority));
     reclaim(&exact, bytes);
@@ -235,9 +263,16 @@ fn metadata_batch_registration_rejects_one_short_without_partial_charge_or_owner
 // these zero state/operator terms. Its only managed payload is the exact real
 // metadata constructed below, and the retained contribution prices that payload.
 fn funding(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
+    pool: &MemoryLedger,
+    payload: u64,
+    publication_rows: &[usize],
 ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
+    let bytes = publication_rows
+        .iter()
+        .try_fold(payload, |bytes, rows| {
+            bytes.checked_add(crate::memory_fixture::publication_control_bytes(*rows))
+        })
+        .unwrap();
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -263,25 +298,50 @@ fn funding(
         NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: WorkspaceBound::bounded(bytes, "exact retained immutable host metadata payload"),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: WorkspaceBound::bounded(
+                bytes,
+                "exact retained immutable host metadata payload",
+            ),
+        },
+    ))
     .unwrap();
+    let admission = crate::memory_fixture::host_admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
+        requested_positions: 1,
+        state,
+        incremental_required_bytes: Some(bytes),
+    });
+    let requirements = pool
+        .reservation_requirements(
+            &admission,
+            Some(&crate::memory_fixture::host_requirements(bytes)),
+        )
+        .unwrap();
+    let physical_limit = pool
+        .fixture_host_current()
+        .unwrap()
+        .checked_add(
+            requirements
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+        )
+        .unwrap();
     pool.reserve_with_capacity(
         &InferenceExecutionIdentity::default(),
-        &Admission {
-            requested_positions: 1,
-            state,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        bytes,
+        &admission,
+        crate::memory_fixture::physical_host_limits(pool, physical_limit),
     )
     .unwrap()
     .into_funding()
@@ -293,13 +353,14 @@ fn funded_metadata_publication_consumes_exact_credit_and_outlives_run_as_aliases
     for make in [layout as fn() -> SharedHostMetadata, input] {
         // Establish this deterministic test fixture's concrete capacity while
         // holding loading authority; no guessed numerical allocation is hidden.
-        let probe_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+        let probe_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&probe_pool).unwrap();
         let probe = make();
         let bytes = probe.capacity_bytes().unwrap();
         drop((probe, loading));
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-        let (reservation, run) = funding(&pool, bytes);
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+        let (reservation, run) = funding(&pool, bytes, &[1, 1]);
+        let accepted_peak = pool.fixture_host_peak().unwrap();
         let scope = run.scope().unwrap();
         let source = make();
         assert_eq!(source.capacity_bytes(), Some(bytes));
@@ -308,14 +369,21 @@ fn funded_metadata_publication_consumes_exact_credit_and_outlives_run_as_aliases
         let publication = inventory([source.clone(), alias.clone()])
             .publish_funded(&scope)
             .unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(
+            pool.fixture_host_charge().unwrap(),
+            bytes + crate::memory_fixture::publication_control_bytes(1)
+        );
         let duplicate = inventory([alias.clone()]).publish_funded(&scope).unwrap();
+        assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
         // No remaining credit: every byte was transferred to this actual source.
-        let error = scope.adopt_storage_individually([(37_u32, 1)]).unwrap_err();
+        let error = scope
+            .adopt_host_storage_individually([(37_u32, 1)])
+            .unwrap_err();
         assert_eq!(
             error,
-            WorkingMemoryError::BudgetExceeded {
-                required_bytes: 1,
+            WorkingMemoryError::DomainAllowanceExceeded {
+                domain: pool.topology().host_domain(),
+                required_bytes: MemoryLedger::storage_metadata_control_bytes().unwrap(),
                 available_bytes: 0
             }
         );
@@ -326,6 +394,14 @@ fn funded_metadata_publication_consumes_exact_credit_and_outlives_run_as_aliases
         assert_eq!(alias.identity(), &key);
         drop(alias);
         reclaim(&pool, 0);
-        assert_eq!(pool.peak_bytes().unwrap(), bytes);
+        assert_eq!(pool.fixture_host_peak().unwrap(), accepted_peak);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

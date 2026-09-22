@@ -21,6 +21,39 @@ pub(in crate::working_memory) struct AccountNode {
     planning_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 impl AccountNode {
+    pub(in crate::working_memory) fn prepared_domains(
+        topology: &eredu_core::MemoryTopology,
+        requirements: &eredu_core::DomainMemoryRequirements,
+        capacity: Option<MemoryLimits>,
+        execution: &InferenceExecutionIdentity,
+    ) -> Result<Box<Self>, WorkingMemoryError> {
+        let state = FundingState::new(topology, requirements, capacity, execution, false, 0, 0)?;
+        Ok(Box::new(Self {
+            id: 0,
+            phase: Phase::Unfunded,
+            state,
+            next: None,
+            planning_metadata: None,
+        }))
+    }
+    pub(in crate::working_memory) fn prepared_host(
+        topology: &eredu_core::MemoryTopology,
+        bytes: u64,
+        capacity: Option<MemoryLimits>,
+        execution: &InferenceExecutionIdentity,
+    ) -> Result<Box<Self>, WorkingMemoryError> {
+        let state = FundingState::host(topology, bytes, capacity, execution, false, 0, 0)?;
+        Ok(Box::new(Self {
+            id: 0,
+            phase: Phase::Unfunded,
+            state,
+            next: None,
+            planning_metadata: None,
+        }))
+    }
+    pub(in crate::working_memory) fn take_prepared(&mut self) -> FundingState {
+        std::mem::replace(&mut self.state, FundingState::empty())
+    }
     // Ordinary paths use their existing owner. Original requests use an accepted
     // pending slot; prepared copies use their enclosing admitted host plan.
     pub(in crate::working_memory) fn empty() -> Box<Self> {
@@ -54,6 +87,13 @@ pub(in crate::working_memory) struct AccountLedger {
     head: Option<Box<AccountNode>>,
 }
 impl AccountLedger {
+    pub(in crate::working_memory) fn control_bytes(&self) -> Result<u64, WorkingMemoryError> {
+        self.nodes().try_fold(0u64, |bytes, node| {
+            bytes
+                .checked_add(node.state.report_control_bytes)
+                .ok_or(WorkingMemoryError::Overflow)
+        })
+    }
     fn nodes(&self) -> impl Iterator<Item = &AccountNode> {
         let mut next = self.head.as_deref();
         std::iter::from_fn(move || {
@@ -111,14 +151,14 @@ impl AccountLedger {
         &self,
         id: u64,
         execution: &InferenceExecutionIdentity,
-    ) -> Result<u64, WorkingMemoryError> {
+    ) -> Result<Option<&MemoryLimits>, WorkingMemoryError> {
         self.validate_metadata(id, execution)?;
-        self.nodes()
+        Ok(self
+            .nodes()
             .find(|node| node.id == id)
             .expect("validated source account")
             .state
-            .accepted_capacity()
-            .ok_or(WorkingMemoryError::UnknownBound)
+            .accepted_capacity())
     }
     pub(in crate::working_memory) fn get_mut(&mut self, id: &u64) -> Option<&mut FundingState> {
         let mut next = self.head.as_deref_mut();
@@ -137,11 +177,14 @@ impl AccountLedger {
     pub(in crate::working_memory) fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub(in crate::working_memory) fn capacity(&self) -> u64 {
+    pub(in crate::working_memory) fn capacity(
+        &self,
+        domain: MemoryDomainId,
+    ) -> Result<MemoryLimit, WorkingMemoryError> {
         self.nodes()
-            .filter_map(|node| node.state.capacity)
-            .min()
-            .unwrap_or(u64::MAX)
+            .try_fold(MemoryLimit::Unlimited, |limit, node| {
+                Ok(limit.minimum(node.state.limit(domain)?))
+            })
     }
     pub(in crate::working_memory) fn validate_metadata(
         &self,
@@ -185,10 +228,94 @@ impl AccountLedger {
             .nodes()
             .find(|node| node.id == id)
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if node.phase != Phase::Unfunded || !node.state.metadata_live || node.state.quarantined {
+        if node.phase != Phase::Unfunded
+            || !node.state.metadata_live
+            || node.state.quarantined
+            || matches!(
+                node.state.reservation_exclusion,
+                ReservationExclusion::SealedPlanning
+            )
+        {
             return Err(WorkingMemoryError::ExecutionFenced);
         }
         Ok(())
+    }
+
+    // The move-only cold producer closes growth without retiring its existing
+    // metadata charge. The caller prepares the reservation count under the
+    // same coordinator lock before this allocation-free commit.
+    pub(in crate::working_memory) fn seal_construction_metadata(
+        &mut self,
+        id: u64,
+        construction: &InferenceExecutionIdentity,
+    ) -> Result<(), WorkingMemoryError> {
+        self.validate_constructing(id)?;
+        let mut next = self.head.as_deref_mut();
+        while let Some(node) = next {
+            if node.id == id {
+                let state = &mut node.state;
+                if state.execution.as_ptr() != Arc::as_ptr(&construction.0)
+                    || state.capacity.is_some()
+                    || !matches!(state.reservation_exclusion, ReservationExclusion::Request)
+                    || state.allocations != 0
+                    || state.registrations != 0
+                    || state.scopes != 0
+                    || state.native_scopes != 0
+                    || state.native_issued
+                    || state.active_span.is_some()
+                    || state.quarantined_borrowed.is_some()
+                    || state.preparation.is_some()
+                    || state.remaining != state.control_floor
+                    || state.host_held != state.control_floor
+                    || state.domains.iter().enumerate().any(|(slot, balance)| {
+                        (slot != state.host_slot && balance.remaining != 0)
+                            || balance.native_held.is_some()
+                            || balance.native_registered != 0
+                            || balance.native_held_allowance != 0
+                            || balance.remaining_charge.placement_allowance_bytes != 0
+                            || balance.remaining_charge.estimated_overhead_bytes != 0
+                            || balance.remaining_charge.headroom_bytes != 0
+                    })
+                {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                state.reservation_exclusion = ReservationExclusion::SealedPlanning;
+                return Ok(());
+            }
+            next = node.next.as_deref_mut();
+        }
+        Err(WorkingMemoryError::IdentityMismatch)
+    }
+
+    pub(in crate::working_memory) fn report_constructor_controls(
+        &mut self,
+        id: u64,
+        bytes: u64,
+    ) -> Result<(), WorkingMemoryError> {
+        self.validate_constructing(id)?;
+        let mut next = self.head.as_deref_mut();
+        while let Some(node) = next {
+            if node.id == id {
+                if bytes > node.state.control_floor {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                node.state.report_control_bytes = bytes;
+                return Ok(());
+            }
+            next = node.next.as_deref_mut();
+        }
+        Err(WorkingMemoryError::IdentityMismatch)
+    }
+
+    #[cfg(test)]
+    pub(in crate::working_memory) fn constructor_control_bytes(
+        &self,
+        id: u64,
+    ) -> Result<u64, WorkingMemoryError> {
+        self.nodes()
+            .find(|node| node.id == id)
+            .map(|node| node.state.report_control_bytes)
+            .ok_or(WorkingMemoryError::IdentityMismatch)
     }
     // A host-only planning account never enters native funding. Its complete
     // cumulative charge remains protected through final metadata retirement.
@@ -206,6 +333,10 @@ impl AccountLedger {
                 if node.phase != Phase::Unfunded
                     || !state.metadata_live
                     || state.quarantined
+                    || matches!(
+                        state.reservation_exclusion,
+                        ReservationExclusion::SealedPlanning
+                    )
                     || state.remaining != state.control_floor
                     || state.host_held != state.control_floor
                 {
@@ -306,51 +437,62 @@ impl AccountLedger {
     // borrowed scan has no container growth or per-concurrent-request multiplier.
     pub(in crate::working_memory) fn capacity_after(
         &self,
-        requested: Option<u64>,
+        domain: MemoryDomainId,
+        requested: Option<&MemoryLimits>,
         handoffs: &[WorkingMemoryCapacityHandoff],
-    ) -> u64 {
+    ) -> Result<MemoryLimit, WorkingMemoryError> {
         self.nodes()
-            .filter_map(|node| {
-                node.state.capacity.map(|current| {
-                    if node.phase == Phase::Funded
-                        && handoffs
-                            .iter()
-                            .any(|handoff| handoff.account_id() == node.id)
-                    {
-                        current.max(requested.unwrap_or(current))
-                    } else {
-                        current
-                    }
-                })
+            .try_fold(MemoryLimit::Unlimited, |limit, node| {
+                let current = node.state.limit(domain)?;
+                let next = requested
+                    .map(|limits| limits.get(domain))
+                    .transpose()?
+                    .unwrap_or(MemoryLimit::Unlimited);
+                let constraint = if node.phase == Phase::Funded
+                    && handoffs.iter().any(|h| h.account_id() == node.id)
+                    && current.is_raised_by(next)
+                {
+                    next
+                } else {
+                    current
+                };
+                Ok(limit.minimum(constraint))
             })
-            .min()
-            .unwrap_or(u64::MAX)
     }
     pub(in crate::working_memory) fn commit_handoffs(
         &mut self,
-        requested: Option<u64>,
+        requested: Option<&MemoryLimits>,
         handoffs: &[WorkingMemoryCapacityHandoff],
     ) {
-        let Some(next) = requested else {
-            return;
-        };
         for handoff in handoffs {
             if let Some(state) = self.get_mut(&handoff.account_id()) {
                 if let Some(current) = &mut state.capacity {
-                    *current = (*current).max(next);
+                    if let Some(next) = requested {
+                        current.raise(next).expect("validated ceiling topology");
+                    } else {
+                        // Removing a complete constraint is a move-only raise to Unlimited.
+                        current.make_unlimited();
+                    }
                 }
             }
         }
     }
     #[cfg(test)]
-    pub(in crate::working_memory) fn capacity_counts(&self) -> BTreeMap<u64, usize> {
+    pub(in crate::working_memory) fn capacity_counts(
+        &self,
+        domain: MemoryDomainId,
+    ) -> BTreeMap<u64, usize> {
         let mut counts = BTreeMap::new();
-        for cap in self.nodes().filter_map(|node| node.state.capacity) {
+        for limits in self.nodes().filter_map(|node| node.state.capacity.as_ref()) {
+            let MemoryLimit::Finite(cap) = limits.get(domain).expect("fixture domain") else {
+                panic!("finite fixture limits");
+            };
             *counts.entry(cap).or_default() += 1;
         }
         counts
     }
 }
+
 impl std::ops::Index<&u64> for AccountLedger {
     type Output = FundingState;
     fn index(&self, id: &u64) -> &FundingState {
@@ -367,17 +509,14 @@ impl Drop for AccountLedger {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(in crate::working_memory) struct RetiringAccount {
     id: u64,
     execution: usize,
-    capacity: Option<u64>,
     floor: u64,
+    reservation_active: bool,
 }
 impl RetiringAccount {
-    pub(in crate::working_memory) fn capacity(&self) -> u64 {
-        self.capacity.unwrap_or(u64::MAX)
-    }
     pub(in crate::working_memory) fn identity(&self, id: u64) -> Option<usize> {
         (id == self.id).then_some(self.execution)
     }
@@ -386,7 +525,7 @@ impl RetiringAccount {
 // Every cleanup caller uses this same guard. It unlocks before draining terminal
 // node shells; old source/provider retirement keeps its existing detached order.
 pub(in crate::working_memory) struct RetirementGuard<'a> {
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     usage: Option<std::sync::MutexGuard<'a, Usage>>,
 }
 impl std::ops::Deref for RetirementGuard<'_> {
@@ -406,7 +545,7 @@ impl Drop for RetirementGuard<'_> {
         drain(self.pool);
     }
 }
-pub(in crate::working_memory) fn lock(pool: &WorkingMemoryPool) -> RetirementGuard<'_> {
+pub(in crate::working_memory) fn lock(pool: &MemoryLedger) -> RetirementGuard<'_> {
     let usage = match pool.0.usage.lock() {
         Ok(usage) => usage,
         Err(poison) => {
@@ -420,7 +559,7 @@ pub(in crate::working_memory) fn lock(pool: &WorkingMemoryPool) -> RetirementGua
         usage: Some(usage),
     }
 }
-pub(in crate::working_memory) fn drain(pool: &WorkingMemoryPool) {
+pub(in crate::working_memory) fn drain(pool: &MemoryLedger) {
     loop {
         let node = {
             let (mut usage, poisoned) = match pool.0.usage.lock() {
@@ -433,11 +572,17 @@ pub(in crate::working_memory) fn drain(pool: &WorkingMemoryPool) {
             let Some(node) = usage.funding.take_terminal(poisoned) else {
                 return;
             };
+            for (slot, (domain, _)) in pool.topology().domains().enumerate() {
+                usage.domains[slot].retiring_limit = node
+                    .state
+                    .limit(domain)
+                    .expect("authenticated account limits");
+            }
             usage.account_retiring = Some(RetiringAccount {
                 id: node.id,
                 execution: node.state.execution.as_ptr() as usize,
-                capacity: node.state.capacity,
                 floor: node.state.control_floor,
+                reservation_active: node.state.reservation_exclusion.active(),
             });
             node
         };
@@ -475,16 +620,21 @@ pub(in crate::working_memory) fn drain(pool: &WorkingMemoryPool) {
             .reserved
             .checked_sub(retiring.floor)
             .expect("retained control floor");
-        usage.reservations = usage
-            .reservations
-            .checked_sub(1)
-            .expect("retained account exclusion");
+        if retiring.reservation_active {
+            usage.reservations = usage
+                .reservations
+                .checked_sub(1)
+                .expect("retained account exclusion");
+        }
+        for domain in &mut usage.domains {
+            domain.retiring_limit = MemoryLimit::Unlimited;
+        }
     }
 }
 
 #[cfg(test)]
 thread_local! {
-    static AFTER_NODE_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce(&WorkingMemoryPool)>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_NODE_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce(&MemoryLedger)>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 mod tests;

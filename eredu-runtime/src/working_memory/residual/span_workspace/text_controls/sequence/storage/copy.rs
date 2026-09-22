@@ -9,7 +9,7 @@ pub(in crate::working_memory) struct RetainedSequenceHostCopy<'a> {
     sequence: RetainedGenerationSequenceCopy<'a>,
     bytes: u64,
     logical_bytes: u64,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     snapshot_controls: Option<usize>,
     native_preparation_bytes: Option<u64>,
 }
@@ -31,7 +31,7 @@ struct CopyFailure {
     // This holds only the new independently accepted destination account.
     custody: GenerationCopyCustody,
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Borrow an actual originally retained generation provider. Source identity,
     /// policy and state remain frozen through the shared host-copy transaction.
     /// This returns no grant; `PreparedTextHostCopy::copy` opens the independent
@@ -39,7 +39,7 @@ impl WorkingMemoryPool {
     pub fn prepare_generation_host_copy<'a, C: 'static, E>(
         &self,
         sequence: &'a RetainedGenerationSequence,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<
         impl PreparedTextHostCopy<Copied = RetainedGenerationSequence> + 'a,
         WorkingMemoryError,
@@ -53,7 +53,7 @@ impl WorkingMemoryPool {
     pub fn prepare_generation_snapshot_host_copy<'a, C: 'static, E, B, D>(
         &self,
         sequence: &'a RetainedGenerationSequence,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         native_preparation_bytes: u64,
     ) -> Result<
         impl PreparedTextHostCopy<Copied = RetainedGenerationSequence> + 'a,
@@ -75,7 +75,7 @@ impl WorkingMemoryPool {
     pub fn prepare_generation_resume_host_copy<'a, C: 'static, E, B, D>(
         &self,
         sequence: &'a RetainedGenerationSequence,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         native_preparation_bytes: u64,
     ) -> Result<impl PreparedTextHostCopy<Copied = RetainedGenerationSequence> + 'a, WorkingMemoryError>
     where
@@ -94,7 +94,7 @@ impl WorkingMemoryPool {
     pub(in crate::working_memory) fn prepare_resume_provider_for_test<'a, C: 'static, E>(
         &self,
         sequence: &'a RetainedGenerationSequence,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<
         impl PreparedTextHostCopy<Copied = RetainedGenerationSequence> + 'a,
         WorkingMemoryError,
@@ -115,7 +115,7 @@ impl WorkingMemoryPool {
     fn prepare_generation_host_copy_plan<'a, C: 'static, E>(
         &self,
         sequence: &'a RetainedGenerationSequence,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<RetainedSequenceHostCopy<'a>, WorkingMemoryError> {
         let sequence = sequence.prepare_host_copy();
         let source = sequence
@@ -123,7 +123,7 @@ impl WorkingMemoryPool {
             .copy_source()
             .and_then(|s| s.downcast_ref::<Provider>())
             .ok_or(WorkingMemoryError::UnknownBound)?;
-        if !self.same_domain(source.authority.pool()) {
+        if !self.same_ledger(source.authority.pool()) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         source.authority.validate()?;
@@ -265,7 +265,8 @@ impl PreparedTextHostCopy for RetainedSequenceHostCopy<'_> {
 }
 impl RetainedSequenceHostCopy<'_> {
     fn with_controls(mut self, controls: usize, native: u64) -> Result<Self, WorkingMemoryError> {
-        self.bytes = self.bytes
+        self.bytes = self
+            .bytes
             .checked_add(u64::try_from(controls).map_err(|_| WorkingMemoryError::Overflow)?)
             .and_then(|bytes| bytes.checked_add(native))
             .ok_or(WorkingMemoryError::Overflow)?;

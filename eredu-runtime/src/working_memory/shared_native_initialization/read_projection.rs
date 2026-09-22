@@ -10,7 +10,7 @@ impl<C> InitializedSharedNative<PreparedEncodedRead<C>> {
     /// releasing source metadata admission or exposing an uncharged output.
     pub fn into_owned_read(self) -> PreparedEncodedRead<(C, SharedNativeInitializationCustody)> {
         self.output
-            .with_custody(SharedNativeInitializationCustody(self.account))
+            .with_custody(SharedNativeInitializationCustody(self.account, None))
     }
 }
 

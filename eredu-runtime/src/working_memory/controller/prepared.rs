@@ -176,7 +176,7 @@ impl PreparedControllerBinding {
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<Option<&Self>>(),
             size_of::<(&Self, PreparedControllerSource<'_>)>(),
-            size_of::<(&Self, &WorkingMemoryPool, &InferenceExecutionIdentity)>(),
+            size_of::<(&Self, &MemoryLedger, &InferenceExecutionIdentity)>(),
             size_of::<(&Self, &Self)>(),
             size_of::<bool>(),
             size_of::<(
@@ -239,7 +239,7 @@ impl PreparedControllerBinding {
     }
     pub(super) fn validate_execution(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
     ) -> Result<(), WorkingMemoryError> {
         self.preparation.validate(pool, execution)

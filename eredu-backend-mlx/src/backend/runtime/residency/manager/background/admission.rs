@@ -38,7 +38,10 @@ impl Admission {
         if self.closed.load(Ordering::Acquire) {
             return Err(());
         }
-        Ok(BackgroundSourceAttempt { admission: self, succeeded: false })
+        Ok(BackgroundSourceAttempt {
+            admission: self,
+            succeeded: false,
+        })
     }
     pub(super) fn submit(&self, slot: Slot) -> Result<(), ()> {
         let attempt = self.attempt()?;
@@ -53,7 +56,10 @@ impl Admission {
     pub(super) fn begin(&self, slot: &mut Slot) -> Result<bool, ()> {
         let attempt = self.attempt()?;
         let read = match slot {
-            Slot::Unread => { *slot = Slot::Reading; true }
+            Slot::Unread => {
+                *slot = Slot::Reading;
+                true
+            }
             Slot::Ready => false,
             Slot::Reading | Slot::Consumed => return Err(()),
         };
@@ -68,7 +74,7 @@ impl Admission {
         let attempt = self.attempt()?;
         match slot {
             Slot::Consumed => *slot = Slot::Unread,
-            Slot::Unread | Slot::Ready => {},
+            Slot::Unread | Slot::Ready => {}
             Slot::Reading => return Err(()),
         }
         attempt.succeed();
@@ -76,7 +82,9 @@ impl Admission {
     }
     pub(super) fn complete(&self, slot: &mut Slot) -> Result<(), ()> {
         let attempt = self.attempt()?;
-        if *slot != Slot::Reading { return Err(()); }
+        if *slot != Slot::Reading {
+            return Err(());
+        }
         *slot = Slot::Ready;
         attempt.succeed();
         Ok(())
@@ -84,7 +92,10 @@ impl Admission {
     pub(super) fn take(&self, slot: &mut Slot) -> Result<bool, ()> {
         let attempt = self.attempt()?;
         let ready = match slot {
-            Slot::Ready => { *slot = Slot::Consumed; true }
+            Slot::Ready => {
+                *slot = Slot::Consumed;
+                true
+            }
             Slot::Unread => false,
             Slot::Reading | Slot::Consumed => return Err(()),
         };
@@ -130,7 +141,9 @@ mod tests {
             let attempt = admission.attempt().unwrap();
             let mut slot = Slot::Unread;
             assert!(admission.begin(&mut slot).unwrap());
-            if cancel { admission.close(); }
+            if cancel {
+                admission.close();
+            }
             drop(attempt); // Same RAII path as a retained read/publication error.
             assert!(admission.complete(&mut slot).is_err());
             assert!(admission.submit(Slot::Unread).is_err());

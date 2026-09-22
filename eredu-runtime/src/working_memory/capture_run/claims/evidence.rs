@@ -1,10 +1,10 @@
 //! Typed before/after claims on the same original model or numerical occurrence.
-mod partition;
-pub(crate) use partition::PartitionInterventionEvidenceFrame;
+mod frame;
 use super::*;
 use crate::working_memory::{
     OriginalInterventionSource, OriginalSpeculativeNumericalBudgetCustody,
 };
+pub(crate) use frame::InterventionEvidenceFrame;
 
 /// Closed payload choice from one immutable evidence companion.
 #[derive(Debug)]
@@ -20,6 +20,7 @@ pub struct InterventionEvidenceReceipt<'a> {
     source: &'a OriginalInterventionSource,
     operation: usize,
     side: InterventionEvidenceSide,
+    field: Option<eredu_core::RoutingObservationField>,
     invocation: Option<CaptureInvocationShape>,
     window: Option<CaptureInvocationWindow>,
     identity: ReceiptIdentity,
@@ -52,6 +53,10 @@ impl<'a, 'c> CaptureInterventionEvidenceClaim<'a, 'c> {
             self.receipt.identity.prediction,
         )
     }
+    /// Actual routing field, or no field for an activation companion.
+    pub fn routing_field(&self) -> Option<eredu_core::RoutingObservationField> {
+        self.receipt.field
+    }
     /// Authenticate the immutable loaded declaration used by the native action.
     pub fn validate_source(
         &self,
@@ -72,26 +77,56 @@ impl<'a, 'c> CaptureInterventionEvidenceClaim<'a, 'c> {
     }
     /// Same ordinary projection metadata policy, before source/value work.
     pub fn window_metadata_usage(&self) -> Result<Option<CaptureUsage>, CaptureRunHostError> {
-        let companion = self.receipt.source.plan().evidence(self.receipt.operation)
+        let companion = self
+            .receipt
+            .source
+            .plan()
+            .evidence(self.receipt.operation)
             .ok_or(CaptureRunHostError::ReceiptMismatch)?;
         crate::capture::CaptureObservationStep::with_invocation(
-            companion.geometry_source(), self.receipt.identity.phase,
-            self.receipt.identity.prediction, self.receipt.invocation,
-        )?.with_window(self.receipt.window)?.window_metadata_usage(self.receipt.side.index())
-            .map_err(|cause| CaptureRunHostError::Step(CaptureStepError::Capture(cause)))
+            companion.geometry_source(),
+            self.receipt.identity.phase,
+            self.receipt.identity.prediction,
+            self.receipt.invocation,
+        )?
+        .with_window(self.receipt.window)?
+        .window_metadata_usage(
+            companion
+                .field_index(self.receipt.side, self.receipt.field)
+                .ok_or(CaptureRunHostError::ReceiptMismatch)?,
+        )
+        .map_err(|cause| CaptureRunHostError::Step(CaptureStepError::Capture(cause)))
     }
     /// An exact source window with no selected row requires metadata only.
     pub fn window_empty(&self) -> bool {
-        self.receipt.window.is_some() && match &self.kind {
-            CaptureInterventionEvidenceKind::Preview(claim) => claim.geometry().starts().iter().zip(claim.geometry().ends()).any(|(a,b)|a==b),
-            CaptureInterventionEvidenceKind::Summary(claim) => claim.geometry().starts().iter().zip(claim.geometry().ends()).any(|(a,b)|a==b),
-        }
+        self.receipt.window.is_some()
+            && match &self.kind {
+                CaptureInterventionEvidenceKind::Preview(claim) => claim
+                    .geometry()
+                    .starts()
+                    .iter()
+                    .zip(claim.geometry().ends())
+                    .any(|(a, b)| a == b),
+                CaptureInterventionEvidenceKind::Summary(claim) => claim
+                    .geometry()
+                    .starts()
+                    .iter()
+                    .zip(claim.geometry().ends())
+                    .any(|(a, b)| a == b),
+            }
     }
     /// Authenticate the exact model occurrence that paid this evidence child.
-    pub fn validate_model_custody(&self, expected: &crate::working_memory::OriginalSpeculativeBudgetCustody) -> Result<(), WorkingMemoryError> {
+    pub fn validate_model_custody(
+        &self,
+        expected: &crate::working_memory::OriginalSpeculativeBudgetCustody,
+    ) -> Result<(), WorkingMemoryError> {
         match &self.kind {
-            CaptureInterventionEvidenceKind::Preview(claim) => claim.validate_model_custody(expected),
-            CaptureInterventionEvidenceKind::Summary(claim) => claim.validate_model_custody(expected),
+            CaptureInterventionEvidenceKind::Preview(claim) => {
+                claim.validate_model_custody(expected)
+            }
+            CaptureInterventionEvidenceKind::Summary(claim) => {
+                claim.validate_model_custody(expected)
+            }
         }
     }
     /// Authenticate scheduled text evidence against the active native scope
@@ -184,6 +219,23 @@ impl<'a> ScheduledCaptureStep<'a> {
         operation: usize,
         side: InterventionEvidenceSide,
     ) -> Result<Option<CaptureInterventionEvidenceClaim<'a, 'c>>, CaptureRunHostError> {
+        self.take_intervention_evidence_field(operation, side, None)
+    }
+    /// Spends one exact before/after routing field from the four-row companion.
+    pub fn take_routing_intervention_evidence<'c>(
+        &'c mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: eredu_core::RoutingObservationField,
+    ) -> Result<Option<CaptureInterventionEvidenceClaim<'a, 'c>>, CaptureRunHostError> {
+        self.take_intervention_evidence_field(operation, side, Some(field))
+    }
+    fn take_intervention_evidence_field<'c>(
+        &'c mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: Option<eredu_core::RoutingObservationField>,
+    ) -> Result<Option<CaptureInterventionEvidenceClaim<'a, 'c>>, CaptureRunHostError> {
         self.claim.custody.validate()?;
         let source = self
             .claim
@@ -192,7 +244,9 @@ impl<'a> ScheduledCaptureStep<'a> {
         let Some(companion) = source.plan().evidence(operation) else {
             return Ok(None);
         };
-        let index = side.index();
+        let index = companion
+            .field_index(side, field)
+            .ok_or(CaptureRunHostError::ClaimUnavailable { index: operation })?;
         if companion.operation() != operation
             || self.claim.row.get(self.intervention_slot(operation)?) != Some(&ClaimState::Spent)
         {
@@ -207,7 +261,7 @@ impl<'a> ScheduledCaptureStep<'a> {
             .len()
             .checked_add(1)
             .and_then(|n| n.checked_add(source.plan().admission().plan().operations.len()))
-            .and_then(|n| n.checked_add(operation.checked_mul(2)?))
+            .and_then(|n| n.checked_add(operation.checked_mul(4)?))
             .and_then(|n| n.checked_add(index))
             .ok_or(WorkingMemoryError::Overflow)?;
         let child = self
@@ -216,10 +270,15 @@ impl<'a> ScheduledCaptureStep<'a> {
             .get_mut(operation)
             .and_then(Option::as_mut)
             .ok_or(CaptureRunHostError::ClaimUnavailable { index: operation })?;
-        if child.partition || child.spent[index] || index == 1 && !child.spent[0] {
+        if child.framed || child.spent[index] || child.spent[..index].iter().any(|spent| !spent) {
             return Err(CaptureRunHostError::ClaimUnavailable { index: operation });
         }
-        match child.frame()?.records().get(index).map(|record| &record.outcome) {
+        match child
+            .frame()?
+            .records()
+            .get(index)
+            .map(|record| &record.outcome)
+        {
             Some(CaptureOutcome::Skipped { .. }) => {
                 // The immutable source sidecar already made this logical side
                 // unavailable. Consuming it still preserves Before/After order.
@@ -237,7 +296,8 @@ impl<'a> ScheduledCaptureStep<'a> {
         };
         let kind = match companion.geometry_source().plan().selections[index].transform {
             CaptureTransform::Preview { .. } => {
-                let geometry = child.tensor_geometry(index)?
+                let geometry = child
+                    .tensor_geometry(index)?
                     .ok_or(CaptureRunHostError::ReceiptMismatch)?;
                 CaptureInterventionEvidenceKind::Preview(CaptureTensorClaim {
                     plan: CaptureTensorHostPlan::prepare(geometry)?,
@@ -246,7 +306,8 @@ impl<'a> ScheduledCaptureStep<'a> {
                 })
             }
             CaptureTransform::Summary => {
-                let geometry = child.summary_geometry(index)?
+                let geometry = child
+                    .summary_geometry(index)?
                     .ok_or(CaptureRunHostError::ReceiptMismatch)?;
                 CaptureInterventionEvidenceKind::Summary(
                     super::super::CaptureSummaryClaim::for_evidence(geometry, identity())?,
@@ -261,6 +322,7 @@ impl<'a> ScheduledCaptureStep<'a> {
                 source,
                 operation,
                 side,
+                field,
                 invocation: self.claim.invocation,
                 window: self.claim.window,
                 identity: identity(),
@@ -293,7 +355,12 @@ impl<'a> ScheduledCaptureStep<'a> {
             .get_mut(proof.operation)
             .and_then(Option::as_mut)
             .ok_or(CaptureRunHostError::ReceiptMismatch)?;
-        let index = proof.side.index();
+        let index = proof
+            .source
+            .plan()
+            .evidence(proof.operation)
+            .and_then(|companion| companion.field_index(proof.side, proof.field))
+            .ok_or(CaptureRunHostError::ReceiptMismatch)?;
         if !child.spent[index] {
             return Err(CaptureRunHostError::ReceiptMismatch);
         }
@@ -305,7 +372,9 @@ impl<'a> ScheduledCaptureStep<'a> {
             }
             Payload::Summary(value) => {
                 let (summary, _) = value.into_evidence()?;
-                child.frame_mut()?.record_summary(index, dtype, summary, usage)?;
+                child
+                    .frame_mut()?
+                    .record_summary(index, dtype, summary, usage)?;
             }
         }
         child.frame_mut()?.validate_record_encoding(index)?;
@@ -319,14 +388,60 @@ impl<'a> ScheduledCaptureStep<'a> {
         reason: CaptureSkipReason,
         dtype: TensorDtype,
     ) -> Result<(), CaptureRunHostError> {
-        self.skip_intervention_evidence_with_usage(operation, side, reason, Some(dtype), CaptureUsage::default())
+        self.skip_intervention_evidence_with_usage(
+            operation,
+            side,
+            reason,
+            Some(dtype),
+            CaptureUsage::default(),
+        )
     }
     /// Preserve projection spending when a side is skipped before or after
     /// source validation. A refused reservation adds no value charge.
     pub(crate) fn skip_intervention_evidence_with_usage(
-        &mut self, operation: usize, side: InterventionEvidenceSide,
-        reason: CaptureSkipReason, dtype: Option<TensorDtype>, usage: CaptureUsage,
+        &mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        reason: CaptureSkipReason,
+        dtype: Option<TensorDtype>,
+        usage: CaptureUsage,
     ) -> Result<(), CaptureRunHostError> {
+        self.skip_intervention_evidence_field(operation, side, None, reason, dtype, usage)
+    }
+    /// Records a skip for an already spent exact routing field.
+    pub(crate) fn skip_routing_intervention_evidence_with_usage(
+        &mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: eredu_core::RoutingObservationField,
+        reason: CaptureSkipReason,
+        dtype: Option<TensorDtype>,
+        usage: CaptureUsage,
+    ) -> Result<(), CaptureRunHostError> {
+        self.skip_intervention_evidence_field(operation, side, Some(field), reason, dtype, usage)
+    }
+    fn evidence_field_index(
+        &self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: Option<eredu_core::RoutingObservationField>,
+    ) -> Result<usize, CaptureRunHostError> {
+        self.claim
+            .interventions
+            .and_then(|source| source.plan().evidence(operation))
+            .and_then(|companion| companion.field_index(side, field))
+            .ok_or(CaptureRunHostError::ReceiptMismatch)
+    }
+    fn skip_intervention_evidence_field(
+        &mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: Option<eredu_core::RoutingObservationField>,
+        reason: CaptureSkipReason,
+        dtype: Option<TensorDtype>,
+        usage: CaptureUsage,
+    ) -> Result<(), CaptureRunHostError> {
+        let index = self.evidence_field_index(operation, side, field)?;
         self.claim.custody.validate()?;
         let child = self
             .frame
@@ -334,17 +449,28 @@ impl<'a> ScheduledCaptureStep<'a> {
             .get_mut(operation)
             .and_then(Option::as_mut)
             .ok_or(CaptureRunHostError::ReceiptMismatch)?;
-        if !child.spent[side.index()] {
+        if !child.spent[index] {
             return Err(CaptureRunHostError::ReceiptMismatch);
         }
-        let empty = self.claim.window.is_some() && match side.index() {
-            index => child.tensor_geometry(index)?.is_some_and(|g|g.starts().iter().zip(g.ends()).any(|(a,b)|a==b))
-                || child.summary_geometry(index)?.is_some_and(|g|g.starts().iter().zip(g.ends()).any(|(a,b)|a==b)),
-        };
+        let empty = self.claim.window.is_some()
+            && match index {
+                index => {
+                    child
+                        .tensor_geometry(index)?
+                        .is_some_and(|g| g.starts().iter().zip(g.ends()).any(|(a, b)| a == b))
+                        || child
+                            .summary_geometry(index)?
+                            .is_some_and(|g| g.starts().iter().zip(g.ends()).any(|(a, b)| a == b))
+                }
+            };
         if reason == CaptureSkipReason::NotInvoked && empty && dtype.is_some() {
-            child.frame_mut()?.record_window_empty(side.index(),dtype.expect("checked dtype"),usage)?;
+            child
+                .frame_mut()?
+                .record_window_empty(index, dtype.expect("checked dtype"), usage)?;
         } else {
-            child.frame_mut()?.record_skip(side.index(), reason, dtype, usage)?;
+            child
+                .frame_mut()?
+                .record_skip(index, reason, dtype, usage)?;
         }
         Ok(())
     }
@@ -357,6 +483,30 @@ impl<'a> ScheduledCaptureStep<'a> {
         dtype: Option<TensorDtype>,
         usage: CaptureUsage,
     ) -> Result<(), CaptureRunHostError> {
+        self.fail_intervention_evidence_field(operation, side, None, reason, dtype, usage)
+    }
+    /// Records a failure for an already spent exact routing field.
+    pub fn fail_routing_intervention_evidence(
+        &mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: eredu_core::RoutingObservationField,
+        reason: CaptureFailureReason,
+        dtype: Option<TensorDtype>,
+        usage: CaptureUsage,
+    ) -> Result<(), CaptureRunHostError> {
+        self.fail_intervention_evidence_field(operation, side, Some(field), reason, dtype, usage)
+    }
+    fn fail_intervention_evidence_field(
+        &mut self,
+        operation: usize,
+        side: InterventionEvidenceSide,
+        field: Option<eredu_core::RoutingObservationField>,
+        reason: CaptureFailureReason,
+        dtype: Option<TensorDtype>,
+        usage: CaptureUsage,
+    ) -> Result<(), CaptureRunHostError> {
+        let index = self.evidence_field_index(operation, side, field)?;
         self.claim.custody.validate()?;
         let child = self
             .frame
@@ -364,12 +514,12 @@ impl<'a> ScheduledCaptureStep<'a> {
             .get_mut(operation)
             .and_then(Option::as_mut)
             .ok_or(CaptureRunHostError::ReceiptMismatch)?;
-        if !child.spent[side.index()] {
+        if !child.spent[index] {
             return Err(CaptureRunHostError::ReceiptMismatch);
         }
-        if child.frame()?.records()[side.index()].outcome == CaptureOutcome::Missing {
+        if child.frame()?.records()[index].outcome == CaptureOutcome::Missing {
             child.frame_mut()?.record_failure(
-                side.index(),
+                index,
                 reason,
                 "admitted intervention evidence failed",
                 dtype,

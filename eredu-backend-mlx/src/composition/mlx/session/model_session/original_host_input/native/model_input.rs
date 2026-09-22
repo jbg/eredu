@@ -130,10 +130,12 @@ impl MlxPreparedInputMaterializer {
 impl MlxPreparedModelInputPlan<'_> {
     /// Full original B bytes, including the one generic account/output/error shell.
     pub fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::prepared_native_input_required_bytes(&FullCompiler {
+        MemoryLedger::prepared_native_input_required_bytes(&FullCompiler {
             leaf: self.leaf.borrowed(),
             host: match self.encoder {
-                Some(encoder) => HostPlan::new(self.leaf.source)?.with_encoder_tables(encoder.layout())?,
+                Some(encoder) => {
+                    HostPlan::new(self.leaf.source)?.with_encoder_tables(encoder.layout())?
+                }
                 None => HostPlan::new(self.leaf.source)?,
             },
             encoder: self.encoder,
@@ -144,7 +146,7 @@ impl MlxPreparedModelInputPlan<'_> {
     /// source views. No ordinary owner, general guard or native submission enters.
     pub fn materialize(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<MlxOriginalPreparedModelInput, MlxPreparedModelInputError> {
         pool.compile_prepared_native_input(FullCompiler {
             leaf: self.leaf,
@@ -170,6 +172,21 @@ impl PreparedNativeInputCompiler for FullCompiler<'_> {
     }
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         Ok(self.required)
+    }
+    fn required_storage_requirements(
+        &self,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        if self.leaf.runtime.allocation_placement() != safemlx::AllocationPlacement::Host {
+            return Err(WorkingMemoryError::UnknownBound);
+        }
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero(topology);
+        requirements.add_allocation(
+            u64::try_from(self.required_storage_bytes()?)
+                .map_err(|_| WorkingMemoryError::Overflow)?,
+            &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())?,
+        )?;
+        Ok(requirements)
     }
     fn compile(self, custody: OriginalPreparedInputCustody) -> Result<Body, (Body, CompileCause)> {
         let source = self.leaf.source;
@@ -231,7 +248,9 @@ impl MlxOriginalPreparedModelInput {
     }
     /// The one originally accepted full B charge.
     pub fn original_bytes(&self) -> u64 {
-        self.0.original_bytes()
+        self.0
+            .original_bytes()
+            .expect("prepared mechanism has one fixed host domain")
     }
     /// Binds once to an already initialized actual session. Every rejection owns
     /// B/A and the actual cause; success only shares already allocated storage.
@@ -243,7 +262,7 @@ impl MlxOriginalPreparedModelInput {
         let session = runtime.session();
         let boundary = if self
             .0
-            .validate_pool(runtime.backend().memory_pool())
+            .validate_pool(runtime.backend().memory_ledger())
             .is_err()
             || !self.source().same_source(original.source())
         {
@@ -312,7 +331,6 @@ impl CompletedOriginalModelInput {
                 self.body.parts().expect("complete B parts").clone(),
             ),
             controlled_attribution: None,
-            prepared_capture: None,
             original_media: Some(input::OriginalMediaPacket::original(self.clone())),
             placement_semantics: None,
             cache_identity: Some(self.body.cache().expect("complete B cache").clone()),
@@ -352,7 +370,7 @@ impl CompletedOriginalModelInput {
     // never used as permission, and no alias gains another one-shot B bind.
     pub(crate) fn validate_request_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         parts: &[input::InputPart],
         cache: &eredu_runtime::SharedPreparedInputCacheIdentity,
     ) -> Result<
@@ -411,8 +429,8 @@ pub struct MlxPreparedModelInputError(
     OriginalPreparedInputMaterializationError<Body, CompileCause>,
 );
 impl MlxPreparedModelInputError {
-    pub(in crate::composition::mlx::session::model_session) fn retirement_control_bytes()
-    -> Option<usize> {
+    pub(in crate::composition::mlx::session::model_session) fn retirement_control_bytes(
+    ) -> Option<usize> {
         OriginalPreparedInputMaterializationError::<Body, CompileCause>::retirement_control_bytes()
     }
     pub(in crate::composition::mlx::session::model_session) fn retire_storage(
@@ -426,7 +444,9 @@ impl MlxPreparedModelInputError {
     }
     /// Returns the original charge retained by this construction failure.
     pub fn retained_bytes(&self) -> u64 {
-        self.0.retained_bytes()
+        self.0
+            .retained_bytes()
+            .expect("prepared mechanism has one fixed host domain")
     }
 }
 impl std::fmt::Display for MlxPreparedModelInputError {
@@ -448,7 +468,9 @@ pub(in crate::composition::mlx::session::model_session) struct RetiredMlxPrepare
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub(in crate::composition::mlx::session::model_session) struct RetiredMlxPreparedModelInputBindError(
-    eredu_runtime::working_memory::RetiredPreparedInputMaterializationError<CompletedMediaBindingError>,
+    eredu_runtime::working_memory::RetiredPreparedInputMaterializationError<
+        CompletedMediaBindingError,
+    >,
 );
 
 /// Terminal owning failure. Cause retires before input and its original B pins.
@@ -458,10 +480,13 @@ pub struct MlxPreparedModelInputBindError {
     input: MlxOriginalPreparedModelInput,
 }
 impl MlxPreparedModelInputBindError {
-    pub(in crate::composition::mlx::session::model_session) fn retirement_control_bytes() -> Option<usize> {
+    pub(in crate::composition::mlx::session::model_session) fn retirement_control_bytes(
+    ) -> Option<usize> {
         OriginalPreparedInputMaterializationError::<Body, CompletedMediaBindingError>::retirement_control_bytes()
     }
-    pub(in crate::composition::mlx::session::model_session) fn retire_storage(self) -> RetiredMlxPreparedModelInputBindError {
+    pub(in crate::composition::mlx::session::model_session) fn retire_storage(
+        self,
+    ) -> RetiredMlxPreparedModelInputBindError {
         RetiredMlxPreparedModelInputBindError(self.input.0.retire_rejected(self.cause))
     }
     /// Returns the original B charge retained by this failed binding.
@@ -495,11 +520,19 @@ impl MlxPreparedInputMaterializer {
     /// Test loan from the same full B compiler, including signed source leaves
     /// which the public plain-U32 policy does not select on its own.
     pub(crate) fn with_test_original_copy_source<R>(
-        &self,source:&OriginalPreparedHostInput,pool:&WorkingMemoryPool,
-        run:impl for<'source> FnOnce(crate::backend::array_copy::OriginalPreparedArrayCopySource<'source>)->R,
-    )->R{
-        let full=pool.compile_prepared_native_input(self.full_source_plan(source,None).unwrap()).unwrap();
-        let source=crate::backend::array_copy::OriginalPreparedArrayCopySource::from_input(full.storage()).unwrap();
+        &self,
+        source: &OriginalPreparedHostInput,
+        pool: &MemoryLedger,
+        run: impl for<'source> FnOnce(
+            crate::backend::array_copy::OriginalPreparedArrayCopySource<'source>,
+        ) -> R,
+    ) -> R {
+        let full = pool
+            .compile_prepared_native_input(self.full_source_plan(source, None).unwrap())
+            .unwrap();
+        let source =
+            crate::backend::array_copy::OriginalPreparedArrayCopySource::from_input(full.storage())
+                .unwrap();
         run(source)
     }
 }

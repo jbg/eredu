@@ -1,7 +1,7 @@
 //! Exact supplementary-module occurrences using the existing residency worker.
 use super::*;
 use crate::backend::runtime::residency::manager::{SupplementaryResidencySource, WindowPopulation};
-use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext};
 use eredu_runtime::working_memory::{
     OriginalEmbeddedSpeculativeRole, OriginalOperationMetadataCustody,
 };
@@ -60,7 +60,7 @@ impl PredictionModulePlan {
         calls: Vec<PredictionModuleCall>,
         validations: usize,
         stream: &Stream,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         context: &WorkspaceContext,
     ) -> Result<Self, Error> {
         let funding = context.metadata_funding().ok_or_else(unknown)?;
@@ -107,9 +107,13 @@ impl PredictionModulePlan {
                     .iter()
                     .any(|prior| prior.completion == call.completion)
             {
-                return Err(identity().at_speculative_stage("prediction module completion permutation"));
+                return Err(
+                    identity().at_speculative_stage("prediction module completion permutation")
+                );
             }
-            let window = *declared.get(call.source_ordinal).ok_or_else(|| identity().at_speculative_stage("prediction module declared window"))?;
+            let window = *declared.get(call.source_ordinal).ok_or_else(|| {
+                identity().at_speculative_stage("prediction module declared window")
+            })?;
             if window.requested != 1
                 || window.request_start != call.source_ordinal
                 || window.request_end != call.source_ordinal.checked_add(1).ok_or_else(overflow)?
@@ -225,11 +229,18 @@ impl PredictionModulePlan {
         }
         self.layerwise
             .validate_supplementary_policy(&self.manager, &self.source)
-            .map_err(|cause| cause.at_speculative_stage("prediction supplementary source policy"))?;
+            .map_err(|cause| {
+                cause.at_speculative_stage("prediction supplementary source policy")
+            })?;
         let p = self.population;
         // Actual ordered calls include repeated shared-module invocations.
-        let retained_handle_copies = self.calls.iter().try_fold(0usize, |sum, call|
-            sum.checked_add(call.retained_parameter_copies)).ok_or_else(overflow)?;
+        let retained_handle_copies = self
+            .calls
+            .iter()
+            .try_fold(0usize, |sum, call| {
+                sum.checked_add(call.retained_parameter_copies)
+            })
+            .ok_or_else(overflow)?;
         recipe.with_native_recipe(|recipe| {
             recipe.bind_host_transfer_population(
                 recipe.plan().geometry(),
@@ -247,14 +258,19 @@ impl PredictionModulePlan {
                         self.source.foreground().ok_or_else(identity)?.source(),
                         plan.forward_population().ok_or_else(unknown)?,
                         plan.population().ok_or_else(unknown)?,
-                        self.source.foreground().ok_or_else(identity)?.destination_device_type(),
+                        self.source
+                            .foreground()
+                            .ok_or_else(identity)?
+                            .destination_device_type(),
                     )?;
                 }
-                (None, Some(host)) => recipe.bind_host_copies(host)
+                (None, Some(host)) => recipe
+                    .bind_host_copies(host)
                     .map_err(|cause| cause.at_speculative_stage("prediction source-copy recipe"))?,
                 _ => return Err(identity()),
             }
-            recipe.bind_retained_parameter_slots(&self.layerwise, retained_handle_copies)
+            recipe
+                .bind_retained_parameter_slots(&self.layerwise, retained_handle_copies)
                 .map_err(|cause| cause.at_speculative_stage("prediction retained source slots"))?;
             Ok(())
         })?;
@@ -360,7 +376,9 @@ impl PredictionModulePlan {
             .map_err(memory)?;
         self.layerwise
             .validate_supplementary_policy(&self.manager, &self.source)
-            .map_err(|cause| cause.at_speculative_stage("prediction supplementary source policy"))?;
+            .map_err(|cause| {
+                cause.at_speculative_stage("prediction supplementary source policy")
+            })?;
         role.claim_neural_bank(self.control_bytes().ok_or_else(unknown)?)
             .map_err(memory)?;
         let custody: OriginalOperationMetadataCustody = role.budget_custody().into();

@@ -1,25 +1,32 @@
 //! Exact connected-member status program with paid original leaf completions.
+use super::super::packed_world::OwnedPackedWorldSource;
 use super::*;
+use crate::backend::nn::logical_collective::{self, packed};
 use crate::backend::nn::workspace::{
-    selected_parallel_numerical, ExistingArrayProjection, MlxMetalWorkspaceMechanisms,
-    ResidentExecutionMechanisms, SpeculativeNumericalRecipe,
+    ExistingArrayProjection, MlxMetalWorkspaceMechanisms, ResidentExecutionMechanisms,
+    SpeculativeNumericalRecipe, selected_parallel_numerical,
 };
 use crate::backend::runtime::distributed::completion::{
-    prepared::{CompletionResourceLayout, PreparedCompletionResources},
     OriginalCommunicationCompletion,
+    prepared::{CompletionResourceLayout, PreparedCompletionResources},
 };
-use crate::backend::runtime::distributed::group::{StatusChainOperations, StatusPlan,LogicalPackedWorldPlan};
-use crate::backend::nn::logical_collective::{self,packed};
-use super::super::packed_world::OwnedPackedWorldSource;
+use crate::backend::runtime::distributed::group::{
+    LogicalPackedWorldPlan, StatusChainOperations, StatusPlan,
+};
 use eredu_core::{BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait};
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceTraceReport,WorkspaceTensor},
     Tensor,
+    workspace::{WorkspaceContext, WorkspaceTensor, WorkspaceTraceReport},
 };
 use safemlx::{Array, OperationEvent, OriginalBufferBudget};
 
-#[derive(Clone,Copy)]
-enum ArithmeticKind { Alias,Add,Pack{slot:usize,world:usize},Extract{slot:usize,world:usize} }
+#[derive(Clone, Copy)]
+enum ArithmeticKind {
+    Alias,
+    Add,
+    Pack { slot: usize, world: usize },
+    Extract { slot: usize, world: usize },
+}
 struct ArithmeticQuote {
     recipe: SpeculativeNumericalRecipe,
     capacity: AgreementCapacity,
@@ -47,13 +54,18 @@ impl ArithmeticQuote {
                 size_of::<(ResidentExecutionMechanisms, MlxMetalWorkspaceMechanisms)>(),
                 size_of::<OriginalBufferBudget>(),
                 size_of::<ArithmeticKind>(),
-                size_of::<(&OriginalAgreementInputs,&OriginalCommunicationSource<'_>,&Stream,ArithmeticKind)>(),
+                size_of::<(
+                    &OriginalAgreementInputs,
+                    &OriginalCommunicationSource<'_>,
+                    &Stream,
+                    ArithmeticKind,
+                )>(),
                 size_of::<std::time::Instant>(),
                 size_of::<std::time::Duration>(),
                 failure_control_bytes().ok_or_else(overflow)?,
             ],
         )?;
-        let add=matches!(kind,ArithmeticKind::Add);
+        let add = matches!(kind, ArithmeticKind::Add);
         let ordinary = MlxMetalWorkspaceMechanisms::current_host().map_err(|cause| {
             failure(
                 Cause::StatusPlanning(cause.into()),
@@ -131,19 +143,48 @@ impl ArithmeticQuote {
         drop(projection);
         // Extraction borrows the exact layout produced by the same packing
         // worker, then starts its own numerical span at that completed source.
-        let left=if let ArithmeticKind::Extract{slot,world}=kind {
-            let packed=packed::pack(&logical_collective::Workspace(&context),&left,slot,world)
-                .map_err(|cause|failure(Cause::StatusPlanning(cause),source.source(),source.funding()))?;
-            WorkspaceTensor::existing(packed.layout().clone(),&context)
-                .map_err(|cause|failure(Cause::StatusPlanning(cause),source.source(),source.funding()))?
-        } else {left};
+        let left = if let ArithmeticKind::Extract { slot, world } = kind {
+            let packed = packed::pack(&logical_collective::Workspace(&context), &left, slot, world)
+                .map_err(|cause| {
+                    failure(
+                        Cause::StatusPlanning(cause),
+                        source.source(),
+                        source.funding(),
+                    )
+                })?;
+            WorkspaceTensor::existing(packed.layout().clone(), &context).map_err(|cause| {
+                failure(
+                    Cause::StatusPlanning(cause),
+                    source.source(),
+                    source.funding(),
+                )
+            })?
+        } else {
+            left
+        };
         context.begin_span();
-        let output=match kind {
-            ArithmeticKind::Alias=>Ok(left),
-            ArithmeticKind::Add=>left.add(right.as_ref().ok_or_else(||failure(Cause::Resource,source.source(),source.funding()))?,&context),
-            ArithmeticKind::Pack{slot,world}=>packed::pack(&logical_collective::Workspace(&context),&left,slot,world),
-            ArithmeticKind::Extract{slot,..}=>packed::sum_result(&logical_collective::Workspace(&context),&left,slot),
-        }.map_err(|cause|failure(Cause::StatusPlanning(cause),source.source(),source.funding()))?;
+        let output = match kind {
+            ArithmeticKind::Alias => Ok(left),
+            ArithmeticKind::Add => left.add(
+                right
+                    .as_ref()
+                    .ok_or_else(|| failure(Cause::Resource, source.source(), source.funding()))?,
+                &context,
+            ),
+            ArithmeticKind::Pack { slot, world } => {
+                packed::pack(&logical_collective::Workspace(&context), &left, slot, world)
+            }
+            ArithmeticKind::Extract { slot, .. } => {
+                packed::sum_result(&logical_collective::Workspace(&context), &left, slot)
+            }
+        }
+        .map_err(|cause| {
+            failure(
+                Cause::StatusPlanning(cause),
+                source.source(),
+                source.funding(),
+            )
+        })?;
         let report = context.finish_report(&[output]).map_err(|cause| {
             failure(
                 Cause::StatusPlanning(cause.into()),
@@ -165,10 +206,6 @@ impl ArithmeticQuote {
             recipe.storage.maximum_births(),
         )
         .map_err(|cause| failure(Cause::Buffer(cause), source.source(), source.funding()))?;
-        reserve(
-            source.funding(),
-            &[usize::try_from(recipe.controls).map_err(|_| overflow())?],
-        )?;
         let capacity = AgreementCapacity {
             graph: recipe.graph_capacity,
             records: recipe.record_capacity,
@@ -191,15 +228,180 @@ impl ArithmeticQuote {
         Err(failure(Cause::Resource, source.source(), source.funding()))
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    Chain,
+    Exchange,
+    Routed,
+    Packed,
+}
+impl StatusKind {
+    fn of(plan: StatusPlan<'_>) -> Self {
+        match plan {
+            StatusPlan::Chain(_) => Self::Chain,
+            StatusPlan::Exchange { .. } => Self::Exchange,
+            StatusPlan::Routed(_) => Self::Routed,
+            StatusPlan::Packed(_) => Self::Packed,
+        }
+    }
+}
+/// Paid immutable equations and the exact selected itinerary. No input Array,
+/// communication owner, callback or scope is retained by these descriptors.
+pub(super) struct StatusQuote {
+    native: safemlx::distributed::Group,
+    kind: StatusKind,
+    operations: Vec<(bool, usize)>,
+    leaves: Vec<super::quote::LeafQuote>,
+    additions: usize,
+    packed_axes: Option<(usize, usize)>,
+    final_quote: ArithmeticQuote,
+    add: Option<ArithmeticQuote>,
+    packed: Option<PackedQuote>,
+}
+impl StatusQuote {
+    pub(super) fn prepare(
+        inputs: &OriginalAgreementInputs,
+        source: &OriginalCommunicationSource<'_>,
+        order: usize,
+    ) -> Result<Option<Self>, Error> {
+        let Some((group, descriptor, _)) = source.group(order) else {
+            return Ok(None);
+        };
+        if descriptor.local_index().is_none()
+            || !descriptor.requirements().operations().iter().any(|entry| {
+                entry.operation() == CommunicationOperation::FailureAgreement
+                    && entry.exact_completion()
+            })
+        {
+            return Ok(None);
+        }
+        let Some(plan) = group.selected_status_plan().map_err(|_| {
+            failure(
+                Cause::LogicalWorldTransport,
+                source.source(),
+                source.funding(),
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+        reserve(
+            source.funding(),
+            &[
+                size_of::<Self>(),
+                size_of::<Option<Self>>(),
+                size_of::<Result<Option<Self>, Error>>(),
+                size_of::<(
+                    &OriginalAgreementInputs,
+                    &OriginalCommunicationSource<'_>,
+                    usize,
+                )>(),
+                size_of_val(&plan.operations()),
+                failure_control_bytes().ok_or_else(overflow)?,
+            ],
+        )?;
+        let stream = group
+            .retained_transport_stream()
+            .ok_or_else(|| failure(Cause::Resource, source.source(), source.funding()))?;
+        let count = plan
+            .operations()
+            .try_fold(0usize, |n, _| n.checked_add(1))
+            .ok_or_else(overflow)?;
+        let mut operations = source
+            .funding()
+            .metadata_vec(count)
+            .map_err(Error::Neural)?;
+        operations.extend(plan.operations());
+        if operations.len() != count {
+            return Err(failure(Cause::Resource, source.source(), source.funding()));
+        }
+        let mut leaves = source
+            .funding()
+            .metadata_vec(operations.len())
+            .map_err(Error::Neural)?;
+        for &(sending, peer) in &operations {
+            let peer = i32::try_from(peer).map_err(|_| overflow())?;
+            let operation = if sending {
+                GroupWorkerOperation::Send { peer }
+            } else {
+                GroupWorkerOperation::Receive { peer }
+            };
+            leaves.push(super::quote::LeafQuote::prepare(
+                source,
+                inputs.runtime(),
+                order,
+                operation,
+                true,
+            )?);
+        }
+        let final_quote = ArithmeticQuote::prepare(inputs, source, stream, ArithmeticKind::Alias)?;
+        let add = if plan.additions() != 0 {
+            Some(ArithmeticQuote::prepare(
+                inputs,
+                source,
+                stream,
+                ArithmeticKind::Add,
+            )?)
+        } else {
+            None
+        };
+        let packed = match plan {
+            StatusPlan::Packed(plan) => {
+                Some(PackedQuote::prepare(inputs, source, order, stream, plan)?)
+            }
+            _ => None,
+        };
+        Ok(Some(Self {
+            native: group.native_group().clone(),
+            kind: StatusKind::of(plan),
+            operations,
+            leaves,
+            additions: plan.additions(),
+            packed_axes: match plan {
+                StatusPlan::Packed(plan) => Some((plan.representative(), plan.world_size())),
+                _ => None,
+            },
+            final_quote,
+            add,
+            packed,
+        }))
+    }
+    fn matches(&self, group: &Group, plan: StatusPlan<'_>) -> bool {
+        self.native.shares_native_handle(group.native_group())
+            && self.kind == StatusKind::of(plan)
+            && self.additions == plan.additions()
+            && self.operations.iter().copied().eq(plan.operations())
+            && self.packed_axes
+                == match plan {
+                    StatusPlan::Packed(plan) => Some((plan.representative(), plan.world_size())),
+                    _ => None,
+                }
+    }
+    fn execution_control_bytes(&self) -> Option<usize> {
+        let mut bytes = usize::try_from(self.final_quote.recipe.controls).ok()?;
+        if let Some(add) = &self.add {
+            bytes = bytes.checked_add(
+                usize::try_from(add.recipe.controls)
+                    .ok()?
+                    .checked_mul(self.additions)?,
+            )?;
+        }
+        if let Some(packed) = &self.packed {
+            bytes = bytes.checked_add(packed.execution_control_bytes()?)?;
+        }
+        Some(bytes)
+    }
+}
 pub(super) struct PreparedStatusAgreement<'a> {
     input: &'a Array,
     runtime: &'a PreparedInputRuntime,
     order: usize,
     plan: StatusPlan<'a>,
-    final_quote: ArithmeticQuote,
-    add: Option<ArithmeticQuote>,
-    packed:Option<PackedQuote>,
+    final_quote: &'a ArithmeticQuote,
+    add: Option<&'a ArithmeticQuote>,
+    packed: Option<&'a PackedQuote>,
     capacity: AgreementCapacity,
+    execution_controls: usize,
     leaf: AgreementCapacity,
     source: RetainedCommunicationSource,
     funding: HostMetadataFunding,
@@ -222,83 +424,69 @@ impl<'a> PreparedStatusAgreement<'a> {
             .group(order)
             .ok_or_else(|| failure(Cause::Resource, source.source(), source.funding()))?
             .0;
-        let Some(plan) = group.selected_status_plan()
-            .map_err(|_|failure(Cause::LogicalWorldTransport,source.source(),source.funding()))? else {
+        let Some(plan) = group.selected_status_plan().map_err(|_| {
+            failure(
+                Cause::LogicalWorldTransport,
+                source.source(),
+                source.funding(),
+            )
+        })?
+        else {
             return Ok(None);
         };
-        reserve(
-            source.funding(),
-            &[
-                size_of::<Self>(),
-                size_of::<Option<Self>>(),
-                size_of::<Result<Option<Self>, Error>>(),
-                size_of::<[Option<usize>; 2]>(),
-                size_of::<[AgreementCapacity; 3]>(),size_of::<std::ops::Range<usize>>(),
-                size_of::<[GroupWorkerOperation;2]>(),size_of::<usize>(),size_of::<[i32;2]>(),
-                size_of_val(&plan.operations()),size_of::<Option<(bool,usize)>>(),
-                failure_control_bytes().ok_or_else(overflow)?,
-            ],
-        )?;
+        source
+            .funding()
+            .reserve_metadata(Self::prepare_frame_control_bytes(plan).ok_or_else(overflow)?)
+            .map_err(Error::WorkspacePlanning)?;
         let stream = group
             .retained_transport_stream()
             .ok_or_else(|| failure(Cause::Resource, source.source(), source.funding()))?;
-        reserve(
-            source.funding(),
-            &[
-                plan.control_bytes::<Worker<'_, '_, '_, '_>>()
-                    .ok_or_else(overflow)?,
-                // Every planned leaf borrows a completed predecessor. Price
-                // its exact scoped validation before issuing any native work.
-                OperationEvent::traversal_leaf_control_bytes().and_then(|bytes|
-                    bytes.checked_mul(plan.sends().checked_add(plan.receives())?
-                        .checked_add(plan.additions().checked_mul(2)?)?))
-                    .ok_or_else(overflow)?,
-                size_of::<ArithmeticQuote>(),
-                size_of::<Option<ArithmeticQuote>>(),
-                size_of::<safemlx::PreparedArrayClone>(),
-                size_of::<safemlx::StreamCopyPlan<()>>(),
-                safemlx::PreparedArrayClone::control_bytes().ok_or_else(overflow)?,
-                safemlx::Stream::device_type_control_bytes().ok_or_else(overflow)?,
-            ],
-        )?;
-        let final_quote = ArithmeticQuote::prepare(inputs, source, stream, ArithmeticKind::Alias)?;
-        let add = if plan.additions()!=0 {
-            Some(ArithmeticQuote::prepare(inputs, source, stream, ArithmeticKind::Add)?)
-        } else {
-            None
-        };
-        let packed=match plan {StatusPlan::Packed(plan)=>Some(PackedQuote::prepare(inputs,source,order,stream,plan)?),_=>None};
+        source
+            .funding()
+            .reserve_metadata(Self::prepare_worker_control_bytes(plan).ok_or_else(overflow)?)
+            .map_err(Error::WorkspacePlanning)?;
+        let retained = inputs
+            .status_quote(order)
+            .filter(|quote| quote.matches(group, plan))
+            .ok_or_else(|| failure(Cause::Identity, source.source(), source.funding()))?;
+        let final_quote = &retained.final_quote;
+        let add = retained.add.as_ref();
+        let packed = retained.packed.as_ref();
         let mut capacity = final_quote.capacity;
-        if let Some(packed)=&packed{capacity=sum(capacity,packed.capacity()?)?;}
+        if let Some(packed) = &packed {
+            capacity = sum(capacity, packed.capacity()?)?;
+        }
         if let Some(add) = &add {
-            for _ in 0..plan.additions(){capacity = sum(capacity, add.capacity)?;}
+            for _ in 0..plan.additions() {
+                capacity = sum(capacity, add.capacity)?;
+            }
         }
         let mut leaf = AgreementCapacity {
             graph: 0,
             records: 0,
             backing: 0,
         };
-        for (sending,peer) in plan.operations() {
-                let peer=i32::try_from(peer).map_err(|_|overflow())?;
-                let kind=if sending{GroupWorkerOperation::Send{peer}}else{GroupWorkerOperation::Receive{peer}};
-                let operation = source.status_cpu_operation_storage(
-                    order,
-                    plan,
-                    inputs.value(success),
-                    kind,
-                )?;
-                if operation.native().constructor().output_geometry() != (1, 1) {
-                    return Err(failure(Cause::Output, source.source(), source.funding()));
-                }
-                let backing = operation.backing_storage(inputs.runtime())?.capacity();
-                let completed = operation.with_completion()?;
-                let actual = AgreementCapacity {
-                    graph: completed.graph_capacity(),
-                    records: completed.record_capacity(),
-                    backing,
-                };
-                capacity = sum(capacity, actual)?;
-                leaf = leaf.union(actual);
+        for (sending, peer) in plan.operations() {
+            let peer = i32::try_from(peer).map_err(|_| overflow())?;
+            let kind = if sending {
+                GroupWorkerOperation::Send { peer }
+            } else {
+                GroupWorkerOperation::Receive { peer }
+            };
+            let operation =
+                source.status_cpu_operation_storage(order, plan, inputs.value(success), kind)?;
+            if operation.native().constructor().output_geometry() != (1, 1) {
+                return Err(failure(Cause::Output, source.source(), source.funding()));
+            }
+            let backing = operation.backing_storage(inputs.runtime())?.capacity();
+            let completed = operation.with_completion()?;
+            let actual = AgreementCapacity {
+                graph: completed.graph_capacity(),
+                records: completed.record_capacity(),
+                backing,
+            };
+            capacity = sum(capacity, actual)?;
+            leaf = leaf.union(actual);
         }
         Ok(Some(Self {
             input: inputs.value(success),
@@ -309,6 +497,7 @@ impl<'a> PreparedStatusAgreement<'a> {
             add,
             packed,
             capacity,
+            execution_controls: retained.execution_control_bytes().ok_or_else(overflow)?,
             leaf,
             source: source.source().clone(),
             funding: source.funding().clone(),
@@ -326,24 +515,19 @@ impl<'a> PreparedStatusAgreement<'a> {
         observer: &OriginalScopeObserver,
         stream: &Stream,
     ) -> Result<(OriginalCommunicationBool, MlxNeuralCommunicationCompletion), Error> {
-        reserve(
-            &self.funding,
-            &[
-                size_of::<Self>(),
-                size_of::<Worker<'_, '_, '_, '_>>(),
-                size_of::<Array>(),
-                size_of::<
-                    Result<(OriginalCommunicationBool, MlxNeuralCommunicationCompletion), Error>,
-                >(),
-                failure_control_bytes().ok_or_else(overflow)?,
-            ],
-        )?;
+        reserve(&self.funding, &[self.execution_controls])?;
+        self.funding
+            .reserve_metadata(Self::submit_control_bytes().ok_or_else(overflow)?)
+            .map_err(Error::WorkspacePlanning)?;
         let group = source
             .group(self.order)
             .ok_or_else(|| failure(Cause::Resource, &self.source, &self.funding))?
             .0;
         if !self.source.same_source(source.source())
-            || group.selected_status_plan().map_err(|_|failure(Cause::LogicalWorldTransport,&self.source,&self.funding))? != Some(self.plan)
+            || group
+                .selected_status_plan()
+                .map_err(|_| failure(Cause::LogicalWorldTransport, &self.source, &self.funding))?
+                != Some(self.plan)
             || stream
                 .device_type()
                 .map_err(|cause| failure(Cause::Native(cause), &self.source, &self.funding))?
@@ -549,32 +733,62 @@ impl Worker<'_, '_, '_, '_> {
 impl StatusChainOperations for Worker<'_, '_, '_, '_> {
     type Value = Array;
     type Error = Error;
-    fn packed_sum(&mut self,input:&Array,plan:LogicalPackedWorldPlan<'_>)->Result<Array,Error>{
-        let selected=self.quote.packed.as_ref().ok_or_else(||failure(Cause::Identity,&self.quote.source,&self.quote.funding))?;
-        if selected.slot!=plan.representative() || selected.world.shape()!=[i32::try_from(plan.world_size()).map_err(|_|overflow())?,1] {
-            return Err(failure(Cause::Identity,&self.quote.source,&self.quote.funding));
+    fn packed_sum(
+        &mut self,
+        input: &Array,
+        plan: LogicalPackedWorldPlan<'_>,
+    ) -> Result<Array, Error> {
+        let selected = self
+            .quote
+            .packed
+            .as_ref()
+            .ok_or_else(|| failure(Cause::Identity, &self.quote.source, &self.quote.funding))?;
+        if selected.slot != plan.representative()
+            || selected.world.shape()
+                != [i32::try_from(plan.world_size()).map_err(|_| overflow())?, 1]
+        {
+            return Err(failure(
+                Cause::Identity,
+                &self.quote.source,
+                &self.quote.funding,
+            ));
         }
-        let packed=self.packed_arithmetic(input,&selected.pack,true,selected.slot,plan.world_size())?;
-        OperationEvent::validate_traversal_leaf(&packed,self.observer).map_err(|cause|self.native(cause))?;
+        let packed = self.packed_arithmetic(
+            input,
+            &selected.pack,
+            true,
+            selected.slot,
+            plan.world_size(),
+        )?;
+        OperationEvent::validate_traversal_leaf(&packed, self.observer)
+            .map_err(|cause| self.native(cause))?;
         self.check_deadline()?;
-        let operation=selected.world.bind_actual(self.source,&packed)?;
-        let ready=operation.prepare_resources(self.source,None)?;
-        let stream=self.source.world().retained_transport_stream().ok_or_else(||failure(Cause::Identity,&self.quote.source,&self.quote.funding))?;
-        let (output,completion)=operation.construct_accepted(self.source,self.observer,stream)?.submit(ready)?;
+        let operation = selected.world.bind_actual(self.source, &packed)?;
+        let ready = operation.prepare_resources(self.source, None)?;
+        let stream = self
+            .source
+            .world()
+            .retained_transport_stream()
+            .ok_or_else(|| failure(Cause::Identity, &self.quote.source, &self.quote.funding))?;
+        let (output, completion) = operation
+            .construct_accepted(self.source, self.observer, stream)?
+            .submit(ready)?;
         self.wait(completion)?;
-        let (output,source,funding)=output.into_parts();
-        drop((source,funding));
-        self.packed_arithmetic(&output,&selected.extract,false,selected.slot,plan.world_size())
+        let (output, source, funding) = output.into_parts();
+        drop((source, funding));
+        self.packed_arithmetic(
+            &output,
+            &selected.extract,
+            false,
+            selected.slot,
+            plan.world_size(),
+        )
     }
     fn alias(&mut self, input: &Array) -> Result<Array, Error> {
-        reserve(
-            &self.quote.funding,
-            &[
-                safemlx::PreparedArrayClone::control_bytes().ok_or_else(overflow)?,
-                Array::inspection_clone_handle_bytes(),
-                size_of::<Result<Array, Error>>(),
-            ],
-        )?;
+        self.quote
+            .funding
+            .reserve_metadata(Self::alias_control_bytes().ok_or_else(overflow)?)
+            .map_err(Error::WorkspacePlanning)?;
         let mut slot =
             safemlx::PreparedArrayClone::try_prepare_for_inspection().map_err(|cause| {
                 failure(
@@ -592,11 +806,21 @@ impl StatusChainOperations for Worker<'_, '_, '_, '_> {
         })
     }
     fn receive(&mut self, input: &Array, peer: usize) -> Result<Array, Error> {
-        self.leaf(input, GroupWorkerOperation::Receive { peer: i32::try_from(peer).map_err(|_|overflow())? })
+        self.leaf(
+            input,
+            GroupWorkerOperation::Receive {
+                peer: i32::try_from(peer).map_err(|_| overflow())?,
+            },
+        )
     }
     fn send(&mut self, input: &Array, peer: usize) -> Result<(), Error> {
-        self.leaf(input, GroupWorkerOperation::Send { peer: i32::try_from(peer).map_err(|_|overflow())? })
-            .map(drop)
+        self.leaf(
+            input,
+            GroupWorkerOperation::Send {
+                peer: i32::try_from(peer).map_err(|_| overflow())?,
+            },
+        )
+        .map(drop)
     }
     fn add(&mut self, left: &Array, right: &Array) -> Result<Array, Error> {
         self.check_deadline()?;
@@ -636,42 +860,292 @@ impl StatusChainOperations for Worker<'_, '_, '_, '_> {
 }
 
 /// Separate native stages retain one source and use the common packed worker.
-struct PackedQuote {pack:ArithmeticQuote,extract:ArithmeticQuote,world:OwnedPackedWorldSource,slot:usize}
+struct PackedQuote {
+    pack: ArithmeticQuote,
+    extract: ArithmeticQuote,
+    world: OwnedPackedWorldSource,
+    slot: usize,
+    world_metadata: usize,
+}
 impl PackedQuote {
-    fn prepare(inputs:&OriginalAgreementInputs,source:&OriginalCommunicationSource<'_>,order:usize,stream:&Stream,plan:LogicalPackedWorldPlan<'_>)->Result<Self,Error>{
-        let slot=plan.representative();let world_size=plan.world_size();
-        reserve(source.funding(),&[size_of::<Self>(),size_of::<Option<Self>>(),size_of::<Result<Self,Error>>(),
-            size_of::<(&OriginalAgreementInputs,&OriginalCommunicationSource<'_>,usize,&Stream,LogicalPackedWorldPlan<'_>)>(),
-            size_of::<[i32;2]>(),size_of::<[Array;3]>(),size_of::<OriginalCommunicationCompletion>(),
-            size_of::<(bool,usize,usize,&Array,&ArithmeticQuote)>(),
-            packed::controls::<logical_collective::Native<'_>>(1).ok_or_else(overflow)?,
-            packed::controls::<logical_collective::Native<'_>>(2).ok_or_else(overflow)?,
-            OperationEvent::traversal_leaf_control_bytes().and_then(|n|n.checked_mul(3)).ok_or_else(overflow)?])?;
-        let pack=ArithmeticQuote::prepare(inputs,source,stream,ArithmeticKind::Pack{slot,world:world_size})?;
-        let extract=ArithmeticQuote::prepare(inputs,source,stream,ArithmeticKind::Extract{slot,world:world_size})?;
-        let shape=[i32::try_from(world_size).map_err(|_|overflow())?,1];
-        let world=source.packed_world_completion_source(order,&shape,safemlx::Dtype::Int32,inputs.runtime())?;
-        Ok(Self{pack,extract,world,slot})
+    fn prepare(
+        inputs: &OriginalAgreementInputs,
+        source: &OriginalCommunicationSource<'_>,
+        order: usize,
+        stream: &Stream,
+        plan: LogicalPackedWorldPlan<'_>,
+    ) -> Result<Self, Error> {
+        let slot = plan.representative();
+        let world_size = plan.world_size();
+        reserve(
+            source.funding(),
+            &[
+                size_of::<Self>(),
+                size_of::<Option<Self>>(),
+                size_of::<Result<Self, Error>>(),
+                size_of::<(
+                    &OriginalAgreementInputs,
+                    &OriginalCommunicationSource<'_>,
+                    usize,
+                    &Stream,
+                    LogicalPackedWorldPlan<'_>,
+                )>(),
+                size_of::<[i32; 2]>(),
+            ],
+        )?;
+        let pack = ArithmeticQuote::prepare(
+            inputs,
+            source,
+            stream,
+            ArithmeticKind::Pack {
+                slot,
+                world: world_size,
+            },
+        )?;
+        let extract = ArithmeticQuote::prepare(
+            inputs,
+            source,
+            stream,
+            ArithmeticKind::Extract {
+                slot,
+                world: world_size,
+            },
+        )?;
+        let shape = [i32::try_from(world_size).map_err(|_| overflow())?, 1];
+        let world = source.packed_world_completion_source(
+            order,
+            &shape,
+            safemlx::Dtype::Int32,
+            inputs.runtime(),
+        )?;
+        let world_metadata = world.execution_metadata_bytes(source)?;
+        Ok(Self {
+            pack,
+            extract,
+            world,
+            slot,
+            world_metadata,
+        })
     }
-    fn capacity(&self)->Result<AgreementCapacity,Error>{sum(sum(self.pack.capacity,self.extract.capacity)?,AgreementCapacity{
-        graph:self.world.graph_capacity(),records:self.world.record_capacity(),backing:self.world.backing_capacity()})}
+    fn execution_control_bytes(&self) -> Option<usize> {
+        let parts = [
+            usize::try_from(self.pack.recipe.controls).ok()?,
+            usize::try_from(self.extract.recipe.controls).ok()?,
+            size_of::<[Array; 3]>(),
+            size_of::<OriginalCommunicationCompletion>(),
+            size_of::<(bool, usize, usize, &Array, &ArithmeticQuote)>(),
+            packed::controls::<logical_collective::Native<'_>>(1)?,
+            packed::controls::<logical_collective::Native<'_>>(2)?,
+            OperationEvent::traversal_leaf_control_bytes()?.checked_mul(3)?,
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+    fn capacity(&self) -> Result<AgreementCapacity, Error> {
+        sum(
+            sum(self.pack.capacity, self.extract.capacity)?,
+            AgreementCapacity {
+                graph: self.world.graph_capacity(),
+                records: self.world.record_capacity(),
+                backing: self.world.backing_capacity(),
+            },
+        )
+    }
 }
 impl Worker<'_, '_, '_, '_> {
-    fn packed_arithmetic(&self,input:&Array,quote:&ArithmeticQuote,pack:bool,slot:usize,world:usize)->Result<Array,Error>{
+    fn packed_arithmetic(
+        &self,
+        input: &Array,
+        quote: &ArithmeticQuote,
+        pack: bool,
+        slot: usize,
+        world: usize,
+    ) -> Result<Array, Error> {
         self.check_deadline()?;
-        if input.dtype()!=safemlx::Dtype::Int32 || if pack{input.shape()!=[1]}else{input.shape()!=[i32::try_from(world).map_err(|_|overflow())?,1]}{
-            return Err(failure(Cause::Identity,&self.quote.source,&self.quote.funding));
+        if input.dtype() != safemlx::Dtype::Int32
+            || if pack {
+                input.shape() != [1]
+            } else {
+                input.shape() != [i32::try_from(world).map_err(|_| overflow())?, 1]
+            }
+        {
+            return Err(failure(
+                Cause::Identity,
+                &self.quote.source,
+                &self.quote.funding,
+            ));
         }
-        OperationEvent::validate_traversal_leaf(input,self.observer).map_err(|cause|self.native(cause))?;
-        let ready=self.ready(quote.recipe.completion.traversal)?;
-        let bank=OperationEvent::prepare_resident_graph(quote.recipe.completion.graph,self.observer).map_err(|cause|self.native(cause))?;
-        let output=if pack{packed::pack(&logical_collective::Native(self.stream),input,slot,world)}
-            else{packed::sum_result(&logical_collective::Native(self.stream),input,slot)}.map_err(|cause|self.native(cause))?;
+        OperationEvent::validate_traversal_leaf(input, self.observer)
+            .map_err(|cause| self.native(cause))?;
+        let ready = self.ready(quote.recipe.completion.traversal)?;
+        let bank =
+            OperationEvent::prepare_resident_graph(quote.recipe.completion.graph, self.observer)
+                .map_err(|cause| self.native(cause))?;
+        let output = if pack {
+            packed::pack(&logical_collective::Native(self.stream), input, slot, world)
+        } else {
+            packed::sum_result(&logical_collective::Native(self.stream), input, slot)
+        }
+        .map_err(|cause| self.native(cause))?;
         drop(bank);
-        let completion=ready.submit_original(self.source,self.observer,self.stream,std::slice::from_ref(&output))?;
+        let completion = ready.submit_original(
+            self.source,
+            self.observer,
+            self.stream,
+            std::slice::from_ref(&output),
+        )?;
         self.wait(completion)?;
         Ok(output)
     }
 }
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;
+
+impl PreparedStatusAgreement<'_> {
+    pub(super) fn prepare_frame_control_bytes(plan: StatusPlan<'_>) -> Option<usize> {
+        let parts = [
+            size_of::<Self>(),
+            size_of::<Option<Self>>(),
+            size_of::<Result<Option<Self>, Error>>(),
+            size_of::<[Option<usize>; 2]>(),
+            size_of::<[AgreementCapacity; 3]>(),
+            size_of::<std::ops::Range<usize>>(),
+            size_of::<[GroupWorkerOperation; 2]>(),
+            size_of::<usize>(),
+            size_of::<[i32; 2]>(),
+            size_of_val(&plan.operations()),
+            size_of::<Option<(bool, usize)>>(),
+            failure_control_bytes()?,
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+}
+
+impl PreparedStatusAgreement<'_> {
+    pub(super) fn prepare_worker_control_bytes(plan: StatusPlan<'_>) -> Option<usize> {
+        let parts = [
+            plan.control_bytes::<Worker<'_, '_, '_, '_>>()?,
+            // Every planned leaf borrows a completed predecessor. Price
+            // its exact scoped validation before issuing any native work.
+            OperationEvent::traversal_leaf_control_bytes().and_then(|bytes| {
+                bytes.checked_mul(
+                    plan.sends()
+                        .checked_add(plan.receives())?
+                        .checked_add(plan.additions().checked_mul(2)?)?,
+                )
+            })?,
+            size_of::<ArithmeticQuote>(),
+            size_of::<Option<ArithmeticQuote>>(),
+            size_of::<safemlx::PreparedArrayClone>(),
+            size_of::<safemlx::StreamCopyPlan<()>>(),
+            safemlx::PreparedArrayClone::control_bytes()?,
+            safemlx::Stream::device_type_control_bytes()?,
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+}
+
+impl PreparedStatusAgreement<'_> {
+    pub(super) fn submit_control_bytes() -> Option<usize> {
+        let parts = [
+            size_of::<Self>(),
+            size_of::<Worker<'_, '_, '_, '_>>(),
+            size_of::<Array>(),
+            size_of::<Result<(OriginalCommunicationBool, MlxNeuralCommunicationCompletion), Error>>(
+            ),
+            failure_control_bytes()?,
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+}
+
+impl Worker<'_, '_, '_, '_> {
+    pub(super) fn alias_control_bytes() -> Option<usize> {
+        let parts = [
+            safemlx::PreparedArrayClone::control_bytes()?,
+            Array::inspection_clone_handle_bytes(),
+            size_of::<Result<Array, Error>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+}
+
+impl StatusQuote {
+    pub(super) fn requirements(
+        &self,
+        group: &Group,
+        plan: StatusPlan<'_>,
+    ) -> Option<super::AgreementRequirements> {
+        if !self.matches(group, plan) {
+            return None;
+        }
+        let mut capacity = self.final_quote.capacity;
+        let mut preparation = PreparedStatusAgreement::prepare_frame_control_bytes(plan)?
+            .checked_add(PreparedStatusAgreement::prepare_worker_control_bytes(plan)?)?;
+        for leaf in &self.leaves {
+            preparation = preparation
+                .checked_add(leaf.operation)?
+                .checked_add(leaf.backing)?;
+            capacity = sum(capacity, leaf.capacity).ok()?;
+        }
+        let comparison = group
+            .retained_transport_stream()
+            .and_then(|stream| safemlx::StreamCopyPlan::<()>::capture(stream).ok())?
+            .source_comparison_control_bytes()?;
+        let aliases = match plan {
+            StatusPlan::Chain(plan) => usize::from(plan.left.is_none()),
+            StatusPlan::Exchange { .. } => 1,
+            StatusPlan::Routed(plan) => plan.len(),
+            StatusPlan::Packed(_) => 0,
+        };
+        let mut submission = PreparedStatusAgreement::submit_control_bytes()?
+            .checked_add(super::metadata_bytes(&[comparison])?)?
+            .checked_add(super::metadata_bytes(&[self.execution_control_bytes()?])?)?
+            .checked_add(Worker::alias_control_bytes()?.checked_mul(aliases)?)?;
+        for leaf in &self.leaves {
+            submission = submission
+                .checked_add(leaf.operation)?
+                .checked_add(leaf.backing)?
+                .checked_add(leaf.resources)?
+                .checked_add(leaf.submit)?;
+        }
+        let checked_submit =
+            ReadyCompletionResources::original_checked_one_root_submit_control_bytes()?;
+        let arithmetic_completion = |quote: &ArithmeticQuote| -> Option<usize> {
+            super::quote::arithmetic_resources(group, &quote.recipe.completion.traversal)?
+                .checked_add(checked_submit)
+        };
+        submission = submission
+            .checked_add(OriginalCommunicationSource::validation_control_bytes()?)?
+            .checked_add(PreparedCommunicationScalar::control_bytes()?)?
+            .checked_add(arithmetic_completion(&self.final_quote)?)?;
+        if let Some(add) = &self.add {
+            for _ in 0..self.additions {
+                capacity = sum(capacity, add.capacity).ok()?;
+            }
+            submission =
+                submission.checked_add(arithmetic_completion(add)?.checked_mul(self.additions)?)?;
+        }
+        if let Some(packed) = &self.packed {
+            capacity = sum(capacity, packed.capacity().ok()?).ok()?;
+            submission = submission
+                .checked_add(arithmetic_completion(&packed.pack)?)?
+                .checked_add(arithmetic_completion(&packed.extract)?)?
+                .checked_add(packed.world_metadata)?;
+        }
+        Some(super::AgreementRequirements {
+            capacity,
+            capacity_metadata: preparation,
+            execution_metadata: preparation.checked_add(submission)?,
+        })
+    }
+}

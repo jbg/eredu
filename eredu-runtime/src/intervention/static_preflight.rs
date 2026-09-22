@@ -39,6 +39,9 @@ pub enum StaticInterventionPreflightError {
     /// Admitted edit geometry differs from the source.
     #[error("{0}")]
     Geometry(#[from] InterventionGeometryError),
+    /// The admitted router policy cannot describe its selected rows.
+    #[error(transparent)]
+    Routing(#[from] PreparedRoutingControlError),
 }
 /// Four exact rank destinations reused for every declaration/phase; source
 /// shapes are fixed stack metadata. A host token retains paid storage only.
@@ -68,6 +71,7 @@ impl StaticInterventionPreflight {
             size_of::<Option<&InterventionEvidenceCompanion>>(),
             size_of::<Result<(), StaticInterventionPreflightError>>(),
             size_of::<[u64; RANK]>(),
+            size_of::<Option<PreparedRoutingControl<'_>>>(),
             size_of::<Self>(),
             size_of::<Result<Self, StaticInterventionScratchError>>(),
             size_of::<StaticInterventionScratchError>(),
@@ -161,14 +165,19 @@ impl StaticInterventionPreflight {
     /// Validates a capture-only source using the same scheduled geometry and
     /// cumulative budget worker, without constructing an intervention source.
     pub fn run_capture(
-        &mut self, capture: &AdmittedCapturePlan, estimator: &dyn InterventionEstimator,
+        &mut self,
+        capture: &AdmittedCapturePlan,
+        estimator: &dyn InterventionEstimator,
     ) -> Result<(), StaticInterventionPreflightError> {
-        if capture.invocation_bounds().is_some() { return Err(StaticInterventionPreflightError::Request); }
+        if capture.invocation_bounds().is_some() {
+            return Err(StaticInterventionPreflightError::Request);
+        }
         let mut base = CaptureUsage::default();
         for (selection, point) in capture.plan().selections.iter().zip(capture.points()) {
             base = base.checked_add(crate::capture::metadata_reservation(selection, point)?)?;
         }
-        let mut budget = crate::capture::PreflightBudget::new(capture, base, 0, CaptureUsage::default())?;
+        let mut budget =
+            crate::capture::PreflightBudget::new(capture, base, 0, CaptureUsage::default())?;
         for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
             if budget.begin_phase(phase) {
                 self.add_selections(&mut budget, capture, phase, estimator)?;
@@ -220,9 +229,6 @@ impl StaticInterventionPreflight {
             .zip(intervention.points())
             .enumerate()
         {
-            if point.routing.is_some() || point.routed_units.is_some() {
-                return Err(E::Profile);
-            }
             base = base.checked_add(intervention_metadata(
                 operation,
                 point,
@@ -237,7 +243,8 @@ impl StaticInterventionPreflight {
                     InterventionEvidence::Preview { .. } | InterventionEvidence::Summary,
                     Some(companion),
                 ) if companion.operation() == index
-                    && companion.geometry_source().plan().selections.len() == 2 =>
+                    && companion.geometry_source().plan().selections.len()
+                        == if point.routing.is_some() { 4 } else { 2 } =>
                 {
                     for (selection, point) in companion
                         .geometry_source()
@@ -284,17 +291,8 @@ impl StaticInterventionPreflight {
                 if !actual.resolve_axes_into(&point.axes, shape)? {
                     continue;
                 }
-                intervention.resolve_prepared_at(
-                    index,
-                    phase,
-                    last,
-                    shape,
-                    operation.action.dtype().ok_or(E::Dtype)?,
-                    &mut self.slice,
-                )?;
-                estimator.validate_geometry(shape, &self.slice)?;
                 budget.add(
-                    activation_cost(estimator, shape, &self.slice, &operation.action)?,
+                    self.resolve_cost(intervention, index, phase, last, None, shape, estimator)?,
                     count,
                 )?;
                 if let Some(companion) = source.and_then(|source| source.evidence(index)) {
@@ -311,6 +309,70 @@ impl StaticInterventionPreflight {
         }
         budget.finish()?;
         Ok(())
+    }
+    fn resolve_cost(
+        &mut self,
+        plan: &AdmittedInterventionPlan,
+        index: usize,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+        shape: &[u64],
+        estimator: &dyn InterventionEstimator,
+    ) -> Result<CaptureUsage, StaticInterventionPreflightError> {
+        use StaticInterventionPreflightError as E;
+        let operation = &plan.plan().operations[index];
+        let point = &plan.points()[index];
+        if let Some(policy) = &point.routing {
+            plan.resolve_prepared_routing_at(
+                index,
+                phase,
+                prediction,
+                invocation,
+                shape,
+                &mut self.slice,
+            )?;
+            estimator.validate_geometry(shape, &self.slice)?;
+            let rows = *shape.first().ok_or(E::Rank)?;
+            let Some(prepared) =
+                PreparedRoutingControl::inspect(operation, policy, rows, &self.slice, None)?
+            else {
+                return Ok(CaptureUsage::default());
+            };
+            let mut usage = prepared.usage()?;
+            if operation.evidence != InterventionEvidence::None {
+                usage = usage.checked_add(original_route_cost(estimator, policy, rows)?)?;
+            }
+            return Ok(usage);
+        }
+        let dtype = operation.action.dtype().ok_or(E::Dtype)?;
+        match invocation {
+            Some(invocation) => plan.resolve_prepared_invocation_at(
+                index,
+                phase,
+                prediction,
+                invocation,
+                shape,
+                dtype,
+                &mut self.slice,
+            )?,
+            None => {
+                plan.resolve_prepared_at(index, phase, prediction, shape, dtype, &mut self.slice)?
+            }
+        }
+        if let Some(routed) = &point.routed_units {
+            routed::cost(
+                estimator,
+                routed.geometry,
+                shape,
+                &self.slice,
+                &operation.action,
+            )
+            .map_err(Into::into)
+        } else {
+            estimator.validate_geometry(shape, &self.slice)?;
+            activation_cost(estimator, shape, &self.slice, &operation.action).map_err(Into::into)
+        }
     }
     fn add_selections(
         &mut self,

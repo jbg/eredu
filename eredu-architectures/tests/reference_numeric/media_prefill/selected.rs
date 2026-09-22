@@ -274,7 +274,9 @@ fn run_partition_case_with_chunk(
                     assert_tensor_close(output, expected.as_ref().unwrap(), "selected media full versus shared spans");
                 }
                 for (token, actual) in [2, 6, 1].into_iter().zip(&report.cached) {
-                    let expected = reference.forward(&numeric_text_prepared_input(&[token]), false).unwrap();
+                    let expected = if token == 2 && cancel_after.is_some() {
+                        (reference.restart_after_cancel)(token, cancel_after.unwrap()).unwrap()
+                    } else { reference.forward(&numeric_text_prepared_input(&[token]), false).unwrap() };
                     nonzero(actual);
                     assert_tensor_close(actual, &expected, "ordinary selected media prefix cached decode");
                 }

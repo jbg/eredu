@@ -1,6 +1,9 @@
 use crate::{Array, Event, OriginalScopeObserver, Stream, error::Result, utils::runtime_lock};
 use std::ptr;
 
+mod ordinary_wrapper;
+mod ordinary_control;
+pub use ordinary_control::OrdinaryControlPopulation;
 mod cpu_argpartition;
 mod cpu_copy;
 mod cpu_unary;

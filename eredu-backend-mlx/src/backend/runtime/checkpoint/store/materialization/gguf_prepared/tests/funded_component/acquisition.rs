@@ -96,7 +96,7 @@ fn g4_exact_tickets_outlive_bank_and_repeated_exhaustion_owns_no_custody() {
             (lease, errors, pool.clone())
         },
     );
-    assert!(pool.used_bytes().unwrap() > existing);
+    assert!(pool.fixture_host_charge().unwrap() > existing);
     drop((root, rows, fixture, lease));
     settle_pool_at(&pool, existing);
     assert_eq!(errors.len(), 32, "retained fixed refusals do not pin G4");
@@ -156,7 +156,7 @@ fn g4_debit_refusal_is_typed_and_exhaustion_has_no_custody() {
         if exhausted {
             settle_pool_at(&pool, existing);
         } else {
-            assert!(pool.used_bytes().unwrap() > existing);
+            assert!(pool.fixture_host_charge().unwrap() > existing);
         }
         drop(error);
         settle_pool_at(&pool, existing);
@@ -287,7 +287,7 @@ fn g4_same_box_survives_g1_refusal_or_successful_native_source_alias() {
             },
         );
         drop((root, rows, fixture));
-        assert!(pool.used_bytes().unwrap() > existing);
+        assert!(pool.fixture_host_charge().unwrap() > existing);
         if let Some(error) = error {
             assert_eq!(std::ptr::from_ref(error.lease()), address);
             drop(error);
@@ -302,3 +302,7 @@ fn g4_same_box_survives_g1_refusal_or_successful_native_source_alias() {
         settle_pool_at(&pool, existing);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

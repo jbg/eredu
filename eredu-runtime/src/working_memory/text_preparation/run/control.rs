@@ -7,9 +7,6 @@ pub(super) fn validate<T>(
     context: &TextStepContext,
     f: impl FnOnce(&mut RunProgress) -> Result<T, WorkingMemoryError>,
 ) -> Result<T, WorkingMemoryError> {
-    request
-        .memory_reservation()
-        .ok_or(WorkingMemoryError::IdentityMismatch)?;
     let start = request
         .start_state()
         .lock()
@@ -56,4 +53,3 @@ pub(super) fn validate<T>(
     }
     f(run)
 }
-

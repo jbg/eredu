@@ -2,6 +2,38 @@
 use super::*;
 use std::mem::size_of;
 
+/// Closed, checked account geometry prepared before physical admission.
+pub(in crate::working_memory) struct CopyAccountState {
+    pub(super) control_floor: u64,
+    pub(super) host_held: u64,
+    pub(super) scopes: usize,
+    pub(super) native_scopes: usize,
+    pub(super) run_open: bool,
+}
+impl CopyAccountState {
+    pub(super) fn prepare(
+        controls: u64,
+        holds: CopyHostHolds,
+        host_requirement: u64,
+    ) -> Result<Self, WorkingMemoryError> {
+        let native_scopes = usize::from(!matches!(holds, CopyHostHolds::HostOnly(_)));
+        let (held, scopes) = holds.total_and_scopes()?;
+        let host_held = held
+            .checked_add(controls)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        if host_held > host_requirement {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        Ok(Self {
+            control_floor: controls,
+            host_held,
+            scopes,
+            native_scopes,
+            run_open: native_scopes != 0,
+        })
+    }
+}
+
 pub(in crate::working_memory) fn copy_account_control_bytes(
     sampler: bool,
     tables: usize,

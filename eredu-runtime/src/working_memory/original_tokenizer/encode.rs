@@ -1,5 +1,5 @@
 //! One original encoding operation, independent of source C and generation input I.
-use super::{Allowance, OriginalTokenizer, WorkingMemoryError, WorkingMemoryPool};
+use super::{Allowance, MemoryLedger, OriginalTokenizer, WorkingMemoryError};
 use eredu_core::{BackendFailure, BackendFailureKind};
 use eredu_text::tokenizer_storage::{
     EncodeIdsError, EncodeIdsFailure, EncodeIdsPlan, EncodedTokenIds,
@@ -168,7 +168,7 @@ fn required(plan: &EncodeIdsPlan<'_>) -> Result<u64, WorkingMemoryError> {
     .ok_or(WorkingMemoryError::Overflow)?;
     u64::try_from(bytes).map_err(|_| WorkingMemoryError::Overflow)
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Borrows the exact source and text to derive E without allocating or granting it.
     pub fn tokenizer_encode_required_bytes(
         source: &OriginalTokenizer,

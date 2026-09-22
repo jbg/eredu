@@ -1,7 +1,7 @@
 //! Exact original forbidden inputs through the existing immutable source compiler.
 mod tokenizer;
 use super::{
-    WorkingMemoryError, WorkingMemoryPool, loaded_decode_source::Allowance,
+    MemoryLedger, WorkingMemoryError, loaded_decode_source::Allowance,
     original_declaration_source::Account,
 };
 use eredu_core::{
@@ -25,7 +25,9 @@ impl OriginalForbiddenSource {
     /// Exact tokenizer retained by the original lexical-byte compiler. Generic
     /// packed sources have no tokenizer association and cannot claim one later.
     pub fn matches_semantic_tokenizer(&self, tokenizer: &super::OriginalTokenizer) -> bool {
-        self.tokenizer.as_ref().is_some_and(|source| source.same_source(tokenizer))
+        self.tokenizer
+            .as_ref()
+            .is_some_and(|source| source.same_source(tokenizer))
     }
 
     /// Actual fresh copied vocabulary and trigger, with original custody inside.
@@ -33,14 +35,14 @@ impl OriginalForbiddenSource {
         &self.inputs
     }
     /// Exact original compiler domain; no source bytes are credited to a request.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.account.validate(pool)
     }
     /// Checks the actual input owner, not equal byte contents or a caller token.
     pub fn validate_controller(
         &self,
         source: ForbiddenControllerSource<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.validate_pool(pool)?;
         if !self.inputs.same_source(source.inputs()) {
@@ -52,7 +54,7 @@ impl OriginalForbiddenSource {
     pub fn validation_control_bytes() -> Option<usize> {
         let parts = [
             size_of::<&Self>(),
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<ForbiddenControllerSource<'_>>(),
             size_of::<std::sync::MutexGuard<'_, Allowance>>(),
             size_of::<WorkingMemoryError>(),
@@ -104,7 +106,7 @@ impl OriginalForbiddenSourceError {
         }
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Exact copy destinations and compiler/header controls from the actual plan.
     pub fn forbidden_source_required_bytes(
         plan: PreparedForbiddenInputCopy<'_>,
@@ -116,7 +118,7 @@ impl WorkingMemoryPool {
             size_of::<OriginalForbiddenSourceError>(),
             size_of::<Result<OriginalForbiddenSource, OriginalForbiddenSourceError>>(),
             size_of::<Result<ForbiddenControllerInputs, ForbiddenControllerError>>(),
-            size_of::<(&WorkingMemoryPool, PreparedForbiddenInputCopy<'_>)>(),
+            size_of::<(&MemoryLedger, PreparedForbiddenInputCopy<'_>)>(),
         ];
         parts
             .into_iter()
@@ -146,7 +148,11 @@ impl WorkingMemoryPool {
                 })
             }
             Ok(inputs) => match account.finish() {
-                Ok(()) => Ok(OriginalForbiddenSource { inputs, tokenizer: None, account }),
+                Ok(()) => Ok(OriginalForbiddenSource {
+                    inputs,
+                    tokenizer: None,
+                    account,
+                }),
                 Err(cause) => Err(OriginalForbiddenSourceError {
                     cause: cause.into(),
                     settlement: None,

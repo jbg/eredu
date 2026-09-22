@@ -6,7 +6,7 @@ fn complete_histogram_delivery_retains_partition_evidence_and_spent_final_vote()
     for reject in [false, true] {
         let source = histogram_source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (reservation, run) = fresh(&pool, h);
         let mut bank = run
             .prepare_capture_run(&reservation, plan(&source))
@@ -105,12 +105,12 @@ fn complete_histogram_delivery_retains_partition_evidence_and_spent_final_vote()
         drop(transport);
         drop(funding);
         drop(result);
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         assert!(!retired.load(Ordering::SeqCst));
         drop(delivered);
         assert!(!retired.load(Ordering::SeqCst));
         drop(escaped);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert!(retired.load(Ordering::SeqCst));
     }
 }
@@ -119,7 +119,7 @@ fn complete_histogram_delivery_retains_partition_evidence_and_spent_final_vote()
 fn complete_histogram_program_lends_the_prepaid_transform_charge_once() {
     let source = histogram_source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (reservation, run) = fresh(&pool, h);
     let mut bank = run
         .prepare_capture_run(&reservation, plan(&source))
@@ -173,32 +173,38 @@ fn complete_histogram_program_lends_the_prepaid_transform_charge_once() {
         .unwrap();
     program.coordinate(epoch, &quota).unwrap();
     let prepaid = quota.total();
-    assert!(program
-        .reservation(0, &TensorDtype::F32, native_usage())
-        .is_err());
+    assert!(
+        program
+            .reservation(0, &TensorDtype::F32, native_usage())
+            .is_err()
+    );
     let mut foreign = native_usage();
     foreign.host_bytes += 1;
     assert!(program.reservation(0, &TensorDtype::F16, foreign).is_err());
     let policy =
         crate::capture::CaptureObservationStep::new(source.admission(), CapturePhase::Prefill, 0)
             .unwrap();
-    assert!(policy
-        .reserve_value(
-            program
-                .reservation(0, &TensorDtype::F16, native_usage())
-                .unwrap(),
-            native_usage()
-        )
-        .unwrap()
-        .is_none());
-    assert!(policy
-        .reserve_value(
-            program
-                .reservation(0, &TensorDtype::F16, native_usage())
-                .unwrap(),
-            native_usage()
-        )
-        .is_err());
+    assert!(
+        policy
+            .reserve_value(
+                program
+                    .reservation(0, &TensorDtype::F16, native_usage())
+                    .unwrap(),
+                native_usage()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        policy
+            .reserve_value(
+                program
+                    .reservation(0, &TensorDtype::F16, native_usage())
+                    .unwrap(),
+                native_usage()
+            )
+            .is_err()
+    );
     assert_eq!(
         quota.total(),
         prepaid,
@@ -209,7 +215,8 @@ fn complete_histogram_program_lends_the_prepaid_transform_charge_once() {
     let mut bins = claim.prepare().unwrap();
     bins.add_bin(0, count).unwrap();
     let receipt = bins.finish(0, 0, 0).unwrap();
-    frame.record_histogram(receipt, TensorDtype::F16, native_usage())
+    frame
+        .record_histogram(receipt, TensorDtype::F16, native_usage())
         .unwrap();
     assert!(frame.take_histogram(0).is_err());
     drop(program);
@@ -219,6 +226,6 @@ fn complete_histogram_program_lends_the_prepaid_transform_charge_once() {
     drop(reservation);
     drop(transport);
     drop(funding);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(retired.load(Ordering::SeqCst));
 }

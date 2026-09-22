@@ -1,11 +1,7 @@
 use super::*;
 use crate::working_memory::{HostDestinationCause, HostDestinationFacts};
 
-fn request(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
-    attempts: usize,
-) -> Option<IncrementalInferenceQuote> {
+fn request(pool: &MemoryLedger, bytes: u64, attempts: usize) -> Option<IncrementalInferenceQuote> {
     let host_facts = match HostDestinationFacts::new(bytes, attempts) {
         Ok(facts) => facts,
         Err(WorkingMemoryError::UnknownBound) => return None,
@@ -33,8 +29,8 @@ fn request(
 
 #[test]
 fn admitted_fresh_vec_keeps_exact_hold_through_prefix_error_and_final_storage() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = request(&pool, 12, 3) else {
         assert!(matches!(
             HostDestinationFacts::new(12, 3),
@@ -42,13 +38,12 @@ fn admitted_fresh_vec_keeps_exact_hold_through_prefix_error_and_final_storage() 
         ));
         return;
     };
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
@@ -101,21 +96,21 @@ fn admitted_fresh_vec_keeps_exact_hold_through_prefix_error_and_final_storage() 
     ));
     // Native storage cannot spend the disjoint host hold.
     let native = run.scope().unwrap();
-    let free = reservation.bytes() - protected;
+    let free = reservation_payload_bytes(&reservation) - protected;
     assert!(
-        matches!(native.adopt_storage_individually([(90u32, free + 1)]), Err(WorkingMemoryError::BudgetExceeded { available_bytes, .. }) if available_bytes == free)
+        matches!(native.adopt_host_storage_individually([(90u32, free + 1)]), Err(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((_, available_bytes)) if available_bytes == free))
     );
     native.certify().unwrap();
     drop((quote, span, bank, reservation, run, root, tail, error));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(values);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn admitted_vec_checks_real_iterator_completion_and_does_not_refund_or_change_request_owner() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = request(&pool, 4, 2) else {
         return;
     };
@@ -123,13 +118,13 @@ fn admitted_vec_checks_real_iterator_completion_and_does_not_refund_or_change_re
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     let mut bank = span.take_host_destinations().unwrap().unwrap();
     assert!(bank.belongs_to(&span.control_guard()));
-    let foreign_pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let foreign_root = foreign_pool.register_storage([(1u32, 64)]).unwrap();
+    let foreign_pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let foreign_root = foreign_pool.register_host_storage([(1u32, 64)]).unwrap();
     let (fr, frun, fq) = accept(&foreign_pool, request(&foreign_pool, 4, 2).unwrap());
     let (foreign, _) = fq.into_funded_text_span_workspace(&frun, &fr).unwrap();
     assert!(!bank.belongs_to(&foreign.control_guard()));
     drop((foreign, frun, fr, foreign_root));
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.payload_used_bytes().unwrap(), 0);
     let mut storage = bank.try_vec::<u8>(4).unwrap();
     struct Short;
     impl Iterator for Short {
@@ -161,15 +156,15 @@ fn admitted_vec_checks_real_iterator_completion_and_does_not_refund_or_change_re
     ));
     let protected = span.protected_host_bytes();
     drop((span, bank, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn admitted_empty_vec_has_no_payload_allocation_and_zst_is_outside_qualified_contract() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = request(&pool, 0, 2) else {
         return;
     };
@@ -185,14 +180,14 @@ fn admitted_empty_vec_has_no_payload_allocation_and_zst_is_outside_qualified_con
     ));
     assert_eq!((bank.remaining_bytes(), bank.remaining_attempts()), (0, 0));
     drop((empty, bank, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn exhausted_calls_cannot_retain_new_custody_and_closed_health_spends_its_only_attempt() {
     for attempts in [0, 1] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let Some(quote) = request(&pool, 0, attempts) else {
             return;
         };
@@ -222,12 +217,12 @@ fn exhausted_calls_cannot_retain_new_custody_and_closed_health_spends_its_only_a
         ) && error.destination().is_none()));
         drop((span, bank, r, root));
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             if attempts == 1 { protected } else { 0 }
         );
         drop(owned);
         // All 32 fixed refusal values still exist. None owns/cloned the hold.
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert_eq!(refusals.len(), 32);
         drop(refusals);
     }

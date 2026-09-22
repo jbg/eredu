@@ -49,7 +49,7 @@ impl OriginalParallelControlProjection {
                 let capacity=AgreementCapacity{graph:operation.graph_capacity(),records:operation.record_capacity(),backing};
                 drop(operation);drop(source);
                 let physical=PhysicalVote{input,claim,vote,capacity,owner:OriginalParallelControlOwner(retained.0.clone()),custody:c.clone()};
-                return run_native_role(physical,capacity,&owner.bank,&owner.controls,c,|physical,observer|{
+                return run_native_role(physical,capacity,&owner.native,c,|physical,observer|{
                     Ok(physical.run(observer).and_then(|value|{
                         binding.complete_expert_vote(model,&physical.vote,stream)?;Ok(value)
                     }))

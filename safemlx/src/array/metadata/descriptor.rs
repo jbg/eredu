@@ -181,11 +181,8 @@ impl DescriptorSnapshot {
             dtype,
             logical_bytes: raw.logical_bytes,
             allocation: raw.known.then(|| {
-                ArrayAllocationInfo::from_native(
-                    raw.identity,
-                    raw.allocation_bytes,
-                    raw.host_transfer,
-                )
+                ArrayAllocationInfo::from_native(raw.identity, raw.allocation_bytes, raw.placement)
+                    .with_host_controls(raw.host_control_bytes)
             }),
         };
         Ok(Self { raw, facts })
@@ -310,8 +307,11 @@ impl Array {
     /// Fixed descriptor controls plus the second-source inspection performed
     /// by [`ArrayDescriptorLoan::same_descriptor`].
     pub fn descriptor_comparison_control_bytes() -> Option<usize> {
-        Self::descriptor_control_bytes()?.checked_add(std::mem::size_of::<DescriptorSnapshot>())?
-            .checked_add(std::mem::size_of::<Result<DescriptorSnapshot, ArrayDescriptorError>>())?
+        Self::descriptor_control_bytes()?
+            .checked_add(std::mem::size_of::<DescriptorSnapshot>())?
+            .checked_add(std::mem::size_of::<
+                Result<DescriptorSnapshot, ArrayDescriptorError>,
+            >())?
             .checked_add(std::mem::size_of::<Result<bool, ArrayDescriptorError>>())?
             .checked_add(std::mem::size_of::<&Array>())
     }

@@ -9,20 +9,35 @@ struct Guard {
     issue: u64,
 }
 impl Guard {
-    fn prepare(request: &InferenceRequest, context: &TextStepContext) -> Result<Self, WorkingMemoryError> {
+    fn prepare(
+        request: &InferenceRequest,
+        context: &TextStepContext,
+    ) -> Result<Self, WorkingMemoryError> {
         let issue = control::validate(request, context, |run| {
-            if run.control_pending.is_some() { return Err(WorkingMemoryError::PreparationNotReady); }
-            let issue = run.control_issue.checked_add(1).ok_or(WorkingMemoryError::Overflow)?;
+            if run.control_pending.is_some() {
+                return Err(WorkingMemoryError::PreparationNotReady);
+            }
+            let issue = run
+                .control_issue
+                .checked_add(1)
+                .ok_or(WorkingMemoryError::Overflow)?;
             run.control_issue = issue;
             run.control_pending = Some(issue);
             Ok(issue)
         })?;
-        Ok(Self { request: request.clone(), context: context.clone(), issue })
+        Ok(Self {
+            request: request.clone(),
+            context: context.clone(),
+            issue,
+        })
     }
     fn validate(&self) -> Result<(), WorkingMemoryError> {
         control::validate(&self.request, &self.context, |run| {
-            if run.control_pending == Some(self.issue) { Ok(()) }
-            else { Err(WorkingMemoryError::IdentityMismatch) }
+            if run.control_pending == Some(self.issue) {
+                Ok(())
+            } else {
+                Err(WorkingMemoryError::IdentityMismatch)
+            }
         })
     }
 }
@@ -31,7 +46,9 @@ impl Drop for Guard {
         if let Some(authority) = self.request.preparation.as_ref() {
             if let Ok(mut state) = authority.state.lock() {
                 if let Some(run) = state.run.as_mut() {
-                    if run.control_pending == Some(self.issue) { run.control_pending = None; }
+                    if run.control_pending == Some(self.issue) {
+                        run.control_pending = None;
+                    }
                 }
             }
         }
@@ -51,13 +68,21 @@ pub struct PendingTextBranchExchange {
 impl InferenceRequest {
     /// Validates both exact completed contexts without allocating or claiming.
     pub fn validate_branch_exchange(
-        &self, context: &TextStepContext, incoming: &Self, incoming_context: &TextStepContext,
+        &self,
+        context: &TextStepContext,
+        incoming: &Self,
+        incoming_context: &TextStepContext,
     ) -> Result<(), WorkingMemoryError> {
-        if self.validate_same_request(incoming).is_ok() { return Err(WorkingMemoryError::IdentityMismatch); }
+        if self.validate_same_request(incoming).is_ok() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         for (request, context) in [(self, context), (incoming, incoming_context)] {
             control::validate(request, context, |run| {
-                if run.control_pending.is_some() { Err(WorkingMemoryError::PreparationNotReady) }
-                else { Ok(()) }
+                if run.control_pending.is_some() {
+                    Err(WorkingMemoryError::PreparationNotReady)
+                } else {
+                    Ok(())
+                }
             })?;
         }
         Ok(())
@@ -65,17 +90,28 @@ impl InferenceRequest {
     /// Pays fixed control storage, then gates both actual runs before planning.
     /// Failure abandons any first gate but never refunds its monotone issue.
     pub fn begin_branch_exchange(
-        &self, context: &TextStepContext, incoming: &Self, incoming_context: &TextStepContext,
+        &self,
+        context: &TextStepContext,
+        incoming: &Self,
+        incoming_context: &TextStepContext,
         funding: &HostMetadataFunding,
     ) -> Result<PendingTextBranchExchange, WorkingMemoryError> {
         self.validate_branch_exchange(context, incoming, incoming_context)?;
-        funding.reserve_metadata(std::mem::size_of::<(
-            PendingTextBranchExchange, Guard, Result<PendingTextBranchExchange, WorkingMemoryError>,
-            Result<Guard, WorkingMemoryError>,
-        )>()).map_err(crate::working_memory::reservation_metadata::funding_error)?;
+        funding
+            .reserve_metadata(std::mem::size_of::<(
+                PendingTextBranchExchange,
+                Guard,
+                Result<PendingTextBranchExchange, WorkingMemoryError>,
+                Result<Guard, WorkingMemoryError>,
+            )>())
+            .map_err(crate::working_memory::reservation_metadata::funding_error)?;
         let installed = Guard::prepare(self, context)?;
         let incoming = Guard::prepare(incoming, incoming_context)?;
-        Ok(PendingTextBranchExchange { installed, incoming, _funding: funding.clone() })
+        Ok(PendingTextBranchExchange {
+            installed,
+            incoming,
+            _funding: funding.clone(),
+        })
     }
 }
 impl PendingTextBranchExchange {
@@ -85,7 +121,11 @@ impl PendingTextBranchExchange {
         self.incoming.validate()
     }
     pub(crate) fn source_request(&self, incoming: bool) -> (&InferenceRequest, &TextStepContext) {
-        let guard = if incoming { &self.incoming } else { &self.installed };
+        let guard = if incoming {
+            &self.incoming
+        } else {
+            &self.installed
+        };
         (&guard.request, &guard.context)
     }
 }

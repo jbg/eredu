@@ -14,6 +14,116 @@ use super::facts::{self, add, mul, Aliases, Emitter, FactResult, Output};
 
 pub(super) mod blockwise;
 
+/// Raw simultaneous backing charges from the same selected equation worker.
+#[derive(Clone, Copy, Default, Debug)]
+struct Cost {
+    total: u64,
+    default: u64,
+    births: usize,
+}
+impl Cost {
+    fn new(total: u64, default: u64, births: usize) -> FactResult<Self> {
+        total
+            .checked_sub(default)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
+        Ok(Self {
+            total,
+            default,
+            births,
+        })
+    }
+    fn add(self, other: Self) -> FactResult<Self> {
+        Self::new(
+            add(self.total, other.total)?,
+            add(self.default, other.default)?,
+            self.births
+                .checked_add(other.births)
+                .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+        )
+    }
+}
+
+/// Retain actual branch witnesses for all possible physical sharing choices.
+/// A domain contains the default allocator, the execution allocator, both or
+/// neither. Maximizing each of the three nonzero sums preserves its exact peak.
+/// Composing simultaneous workers takes their Cartesian product before reducing;
+/// it never splits a previously selected aggregate peak. Native control counts
+/// come from the enclosing operation's common constructor census.
+#[derive(Clone, Copy)]
+struct Costs([Cost; 3]);
+impl Costs {
+    fn fixed(total: u64) -> Self {
+        Self(
+            [Cost {
+                total,
+                ..Cost::default()
+            }; 3],
+        )
+    }
+    fn source(total: u64, default: u64, births: usize) -> FactResult<Self> {
+        Ok(Self([Cost::new(total, default, births)?; 3]))
+    }
+    fn include(&mut self, cost: Cost) {
+        if cost.total >= self.0[0].total {
+            self.0[0] = cost;
+        }
+        if cost.default >= self.0[1].default {
+            self.0[1] = cost;
+        }
+        if cost.total - cost.default >= self.0[2].total - self.0[2].default {
+            self.0[2] = cost;
+        }
+    }
+    fn append(self, other: Self) -> FactResult<Self> {
+        let mut result = Self::fixed(0);
+        for left in self.0 {
+            for right in other.0 {
+                result.include(left.add(right)?);
+            }
+        }
+        Ok(result)
+    }
+    fn extra(self, bytes: u64) -> FactResult<Self> {
+        self.append(Self::fixed(bytes))
+    }
+    fn alternative(mut self, other: Self) -> Self {
+        for row in other.0 {
+            self.include(row);
+        }
+        self
+    }
+    fn maximum(self) -> u64 {
+        self.0[0].total
+    }
+    fn from_rows(rows: &[(u64, u64, usize)]) -> FactResult<Self> {
+        let mut result = Self::fixed(0);
+        for &(total, default, births) in rows {
+            result.include(Cost::new(total, default, births)?);
+        }
+        Ok(result)
+    }
+    fn publish(self, output: u64, sink: &mut Emitter<'_>) -> FactResult<()> {
+        let mut rows = [(0, 0, 0); 3];
+        for (destination, source) in rows.iter_mut().zip(self.0) {
+            *destination = (
+                source
+                    .total
+                    .checked_sub(output)
+                    .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+                source.default,
+                source.births,
+            );
+        }
+        sink.default_scratch_alternatives(&rows)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Dtypes {
+    query_bf16: bool,
+    value_bf16: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Geometry {
     b: i32,
@@ -104,7 +214,10 @@ pub(super) fn emit(
     blocks: Option<u32>,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
-    if matches!(operation.kind, WorkspaceOperationKindView::BlockwiseAttention { .. }) {
+    if matches!(
+        operation.kind,
+        WorkspaceOperationKindView::BlockwiseAttention { .. }
+    ) {
         return blockwise::emit(operation, allocation, sink);
     }
     let WorkspaceOperationKindView::Attention {
@@ -210,55 +323,86 @@ pub(super) fn emit(
         ));
     }
     let output = capacity(allocation, g.output()?)?;
-    let total = if let Some((window, offset)) = window {
-        let origin = SlidingAttentionGeometry::new_fixed(g.q, g.k, window, offset)?.key_origin();
-        if arithmetic == AttentionArithmetic::Fused && !softcap && offset == 0 && g.q <= window {
-            // Native causal SDPA, head permutation, then possible reshape copy.
-            add(
-                fused_cost(g, Mask::Causal, sinks, allocation, blocks)?,
-                output,
-            )?
-        } else {
-            let mut total = 0;
-            let mut start = 0;
-            while start < g.q {
-                let end = start + super::super::attention::SLIDING_QUERY_TILE.min(g.q - start);
-                let abs = offset + start;
-                let first = (abs - (window - 1)).max(origin);
-                let tile = Geometry {
-                    q: end - start,
-                    k: offset + end - first,
-                    ..g
-                };
-                total = add(
-                    total,
-                    causal_mask_cost(tile.q, abs - first, window - 1, allocation)?,
-                )?;
-                let Some(cost) = equation_cost(
-                    tile,
-                    Mask::Boolean,
-                    sinks,
-                    softcap,
-                    arithmetic,
-                    allocation,
-                    blocks,
-                )?
-                else {
-                    return Ok(None);
-                };
-                total = add(total, cost)?;
-                start = end;
-            }
-            // Same-dtype chunk concatenation followed by head-joining reshape.
-            add(total, mul(2, output)?)?
+    // Query dtype is shared by every QK and restored-probability product;
+    // the value dtype independently decides whether the PV custom path applies.
+    // Preserve that correlation across every tile before selecting domain peaks.
+    let query_bf16 = inputs
+        .get(0)
+        .unwrap()
+        .representation()
+        .map(|representation| representation.dtype() == WorkspaceFloatingType::Bfloat16);
+    let value_bf16 = inputs
+        .get(2)
+        .unwrap()
+        .representation()
+        .map(|representation| representation.dtype() == WorkspaceFloatingType::Bfloat16);
+    let mut total: Option<Costs> = None;
+    for (query, value) in [(false, false), (false, true), (true, false), (true, true)] {
+        if query_bf16.is_some_and(|known| known != query)
+            || value_bf16.is_some_and(|known| known != value)
+        {
+            continue;
         }
-    } else {
-        let Some(cost) = equation_cost(g, mask, sinks, softcap, arithmetic, allocation, blocks)?
-        else {
-            return Ok(None);
+        let dtypes = Dtypes {
+            query_bf16: query,
+            value_bf16: value,
         };
-        cost
-    };
+        let branch = if let Some((window, offset)) = window {
+            let origin =
+                SlidingAttentionGeometry::new_fixed(g.q, g.k, window, offset)?.key_origin();
+            if arithmetic == AttentionArithmetic::Fused && !softcap && offset == 0 && g.q <= window
+            {
+                // Native causal SDPA, head permutation, then possible reshape copy.
+                fused_cost(g, Mask::Causal, sinks, allocation, blocks)?.extra(output)?
+            } else {
+                let mut total = Costs::fixed(0);
+                let mut start = 0;
+                while start < g.q {
+                    let end = start + super::super::attention::SLIDING_QUERY_TILE.min(g.q - start);
+                    let abs = offset + start;
+                    let first = (abs - (window - 1)).max(origin);
+                    let tile = Geometry {
+                        q: end - start,
+                        k: offset + end - first,
+                        ..g
+                    };
+                    total = total.append(causal_mask_cost(
+                        tile.q,
+                        abs - first,
+                        window - 1,
+                        allocation,
+                    )?)?;
+                    let Some(cost) = equation_cost(
+                        tile,
+                        Mask::Boolean,
+                        sinks,
+                        softcap,
+                        arithmetic,
+                        allocation,
+                        blocks,
+                        dtypes,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    total = total.append(cost)?;
+                    start = end;
+                }
+                // Same-dtype chunk concatenation followed by head-joining reshape.
+                total.extra(mul(2, output)?)?
+            }
+        } else {
+            let Some(cost) = equation_cost(
+                g, mask, sinks, softcap, arithmetic, allocation, blocks, dtypes,
+            )?
+            else {
+                return Ok(None);
+            };
+            cost
+        };
+        total = Some(total.map_or(branch, |previous| previous.alternative(branch)));
+    }
+    let total = total.expect("nonempty dtype source choices");
     sink.output(
         if arithmetic == AttentionArithmetic::Fused
             && !softcap
@@ -273,7 +417,8 @@ pub(super) fn emit(
             Output::Allocate(output)
         },
     )?;
-    sink.finish(total-output, format_args!("vendored MLX Metal forward inference attention; exact fused eligibility or explicit product/softmax equation; all compatible floating dtypes through F32, casts, layout copies and grouped-head replication; retained SDPA blocks={blocks:?}, device-default union when unset; sliding query tiles=256; input-score rows above 8192 use completed 256-key blocks with retained normalization/state/query outputs; other intermediates charged through the enclosing completion; page={} with bounded oversized reuse; active tensor buffers only, excluding cache/heap/driver/JIT and host allocations",allocation.page_size())).map(Some)
+    total.publish(output, sink)?;
+    sink.finish(total.maximum().checked_sub(output).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?, format_args!("vendored MLX Metal forward inference attention; exact fused eligibility or explicit product/softmax equation; all compatible floating dtypes through F32, casts, layout copies and grouped-head replication; retained SDPA blocks={blocks:?}, device-default union when unset; sliding query tiles=256; input-score rows above 8192 use completed 256-key blocks with retained normalization/state/query outputs; other intermediates charged through the enclosing completion; page={} with bounded oversized reuse; active tensor buffers only, excluding cache/heap/driver/JIT and host allocations",allocation.page_size())).map(Some)
 }
 
 fn causal_mask_cost(
@@ -281,7 +426,7 @@ fn causal_mask_cost(
     offset: i32,
     distance: i32,
     allocation: NativeAllocationFacts,
-) -> FactResult<u64> {
+) -> FactResult<Costs> {
     let shape = [
         q,
         offset
@@ -311,7 +456,18 @@ fn causal_mask_cost(
             ));
         }
     };
-    add(result, bound.scratch_bytes)
+    let mut costs = Costs::fixed(add(result, bound.scratch_bytes)?);
+    if let Some(sources) = child.default_scratch_sources() {
+        costs = Costs::fixed(0);
+        for source in sources.alternatives() {
+            costs.include(Cost::new(
+                add(result, source.scratch_bytes.unwrap_or(bound.scratch_bytes))?,
+                source.default_bytes,
+                source.default_births,
+            )?);
+        }
+    }
+    Ok(costs)
 }
 
 fn equation_cost(
@@ -322,7 +478,8 @@ fn equation_cost(
     arithmetic: AttentionArithmetic,
     a: NativeAllocationFacts,
     blocks: Option<u32>,
-) -> FactResult<Option<u64>> {
+    dtypes: Dtypes,
+) -> FactResult<Option<Costs>> {
     if arithmetic == AttentionArithmetic::Fused && !cap {
         return fused_cost(g, mask, sinks, a, blocks).map(Some);
     }
@@ -330,11 +487,12 @@ fn equation_cost(
         && mul(g.q as u64, g.k as u64)? > INPUT_SCORE_ROW_BUDGET as u64
     {
         if g.k > INPUT_SCORE_ROW_BUDGET {
-            return blockwise::input_score_cost(g, mask, sinks, cap, a).map(Some);
+            let phases = blockwise::input_score_branches(g, mask, sinks, cap, a)?;
+            return Costs::from_rows(phases.alternatives()).map(Some);
         }
         let step = input_score_query_step(g.k);
         let mut start = 0;
-        let mut total = 0;
+        let mut total = Costs::fixed(0);
         while start < g.q {
             let q = step.min(g.q - start);
             let tile = Geometry { q, ..g };
@@ -343,10 +501,10 @@ fn equation_cost(
                 Mask::Additive(_) => Mask::Additive(tile.scores()?),
                 other => other,
             };
-            total = add(total, explicit_cost(tile, tile_mask, sinks, cap, true, a)?)?;
+            total = total.append(explicit_cost(tile, tile_mask, sinks, cap, true, a, dtypes)?)?;
             start += q;
         }
-        return add(total, capacity(a, g.output()?)?).map(Some);
+        return total.extra(capacity(a, g.output()?)?).map(Some);
     }
     explicit_cost(
         g,
@@ -355,6 +513,7 @@ fn equation_cost(
         cap,
         arithmetic == AttentionArithmetic::InputScores,
         a,
+        dtypes,
     )
     .map(Some)
 }
@@ -365,7 +524,7 @@ fn fused_cost(
     sinks: bool,
     a: NativeAllocationFacts,
     blocks: Option<u32>,
-) -> FactResult<u64> {
+) -> FactResult<Costs> {
     let r = |n| capacity(a, n);
     // Native front-end Q/K/V promotion, optional wrapper/native mask casts,
     // and sink promotion all precede the kernel or fallback equation.
@@ -380,7 +539,7 @@ fn fused_cost(
         total = add(total, r(g.h as u64)?)?;
     }
     if !g.fused(mask) {
-        return add(total, fallback_cost(g, mask, sinks, a)?);
+        return fallback_cost(g, mask, sinks, a)?.extra(total);
     }
     total = add(
         total,
@@ -401,7 +560,7 @@ fn fused_cost(
         let rows = mul(g.rows()?, blocks)?;
         total = add(total, add(r(mul(rows, g.v as u64)?)?, mul(2, r(rows)?)?)?)?;
     }
-    Ok(total)
+    Ok(Costs::fixed(total))
 }
 fn default_blocks(g: Geometry) -> u32 {
     let n = g.k;
@@ -427,7 +586,12 @@ fn default_blocks(g: Geometry) -> u32 {
     };
     small.max(large)
 }
-fn fallback_cost(g: Geometry, mask: Mask, sinks: bool, a: NativeAllocationFacts) -> FactResult<u64> {
+fn fallback_cost(
+    g: Geometry,
+    mask: Mask,
+    sinks: bool,
+    a: NativeAllocationFacts,
+) -> FactResult<Costs> {
     let r = |n| capacity(a, n);
     let mut total = add(mul(3, r(g.query()?)?)?, r(1)?)?;
     let grouped = g.h != g.kv;
@@ -483,7 +647,10 @@ fn fallback_cost(g: Geometry, mask: Mask, sinks: bool, a: NativeAllocationFacts)
     if grouped {
         total = add(total, r(g.output()?)?)?;
     }
-    Ok(total)
+    // Native fallback constructs scale and the Boolean-mask fill. Causal
+    // coordinate aranges are stream-produced and allocate no eager seeds.
+    let seeds = 1 + usize::from(mask.boolean());
+    Costs::source(total, mul(r(1)?, seeds as u64)?, seeds)
 }
 
 fn explicit_cost(
@@ -493,7 +660,8 @@ fn explicit_cost(
     cap: bool,
     input_scores: bool,
     a: NativeAllocationFacts,
-) -> FactResult<u64> {
+    dtypes: Dtypes,
+) -> FactResult<Costs> {
     let r = |n| capacity(a, n);
     let q = [g.b, g.h, g.q, g.d];
     let kt = [g.b, g.h, g.d, g.k];
@@ -507,7 +675,7 @@ fn explicit_cost(
             r(g.query()?)?,
         )?,
     )?;
-    total = add(total, product_cost(&q, &kt, input_scores, false, a)?)?;
+    let qk = product_cost(&q, &kt, input_scores && dtypes.query_bf16, false, a)?;
     let score = r(g.scores()?)?;
     total = add(total, add(mul(5, score)?, r(1)?)?)?;
     if cap {
@@ -531,8 +699,10 @@ fn explicit_cost(
     // Explicit F32 score cast and one custom-softmax input copy plus result.
     total = add(total, mul(3, soft)?)?;
     total = add(total, score)?; // restore probability input dtype
-    total = add(total, product_cost(&p, &v, true, true, a)?)?;
-    Ok(total)
+    let pv = product_cost(&p, &v, dtypes.query_bf16 && dtypes.value_bf16, true, a)?;
+    let seeds = 1 + 2 * usize::from(cap) + usize::from(mask.boolean());
+    qk.append(pv)?
+        .append(Costs::source(total, mul(r(1)?, seeds as u64)?, seeds)?)
 }
 
 fn product_cost(
@@ -541,10 +711,10 @@ fn product_cost(
     bf16: bool,
     columns: bool,
     a: NativeAllocationFacts,
-) -> FactResult<u64> {
+) -> FactResult<Costs> {
     let plain = matmul_cost(left, right, a)?;
     if !bf16 {
-        return Ok(plain);
+        return Ok(Costs::fixed(plain));
     }
     let elements = |shape: &[i32]| shape.iter().try_fold(1, |n, d| mul(n, *d as u64));
     let batches = usize::try_from(left[0])?
@@ -562,7 +732,7 @@ fn product_cost(
     // custom kernel checks width divisibility. Price the fallback attempt too.
     let fallback = add(plain, add(add(l, r)?, ids)?)?;
     if !columns && left[3] % 32 != 0 {
-        return Ok(fallback);
+        return Costs::source(fallback, ids, 1);
     }
     let output = capacity(a, mul(rows, right[3] as u64)?)?;
     let custom = add(
@@ -587,7 +757,13 @@ fn product_cost(
         add(mul(2, add(l, r)?)?, mul(3, ids)?)?,
         add(validation, mul(2, output)?)?,
     )?;
-    Ok(fallback.max(custom).max(original))
+    let seeds = if a.original_storage { 3 } else { 2 };
+    let selected = if a.original_storage { original } else { custom };
+    Costs::source(
+        selected,
+        add(ids, mul(capacity(a, 1)?, seeds as u64)?)?,
+        seeds + 1,
+    )
 }
 
 #[cfg(test)]

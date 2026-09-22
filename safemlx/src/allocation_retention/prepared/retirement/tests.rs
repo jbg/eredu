@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::{Barrier, atomic::AtomicUsize};
+use std::sync::{atomic::AtomicUsize, Barrier};
 
 struct Probe(Arc<AtomicUsize>);
 impl Drop for Probe {
@@ -40,6 +40,12 @@ fn specific_retirement_preserves_live_aliases_and_does_not_reap_unrelated_owners
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     assert_eq!(unrelated_dropped.load(Ordering::SeqCst), 0);
     drop(alias);
+    {
+        // Evict physical backing while the outer entry prevents unrelated
+        // queued owners from being reclaimed by housekeeping.
+        let _entry = runtime_lock::coordinate_entry();
+        crate::memory::clear_cache().unwrap();
+    }
     assert!(receiver.try_reclaim());
     assert!(
         !receiver.try_reclaim(),
@@ -75,6 +81,7 @@ fn abandoned_specific_receivers_queue_only_after_the_native_backing_retires() {
             0,
             "receiver Drop never runs the payload"
         );
+        crate::memory::clear_cache().unwrap();
         crate::reclaim_allocation_owners();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }

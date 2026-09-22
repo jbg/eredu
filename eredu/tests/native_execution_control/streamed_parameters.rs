@@ -204,8 +204,7 @@ fn native_streamed_parameter_failure_does_not_publish_an_earlier_unit() {
                 first.region.clone(),
                 limits,
             )
-            .unwrap()
-            .values;
+            .unwrap();
         overflow.update = ParameterUpdate::Add {
             values: vec![f32::MAX; overflow.region.shape[1] as usize],
         };
@@ -237,7 +236,7 @@ fn native_streamed_parameter_failure_does_not_publish_an_earlier_unit() {
                 )
                 .unwrap()
                 .values,
-            before
+            before.values
         );
         // A completed value rejection must leave the owner usable for another loan/publication.
         let valid = model
@@ -267,7 +266,7 @@ fn native_streamed_parameter_failure_does_not_publish_an_earlier_unit() {
                 .query_parameter(&restored.identity, &first.parameter, first.region, limits)
                 .unwrap()
                 .values,
-            before
+            before.values
         );
         assert_eq!(
             std::fs::read(root.0.join("model.safetensors")).unwrap(),

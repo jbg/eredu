@@ -2,7 +2,7 @@
 use super::*;
 
 fn qualified_plan(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     mechanism: &Mechanism,
     attempts: usize,
     rows: usize,
@@ -33,7 +33,7 @@ fn qualified_plan(
 }
 
 fn ready(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     attempts: usize,
     rows: usize,
 ) -> Option<(
@@ -66,8 +66,8 @@ fn ready(
 
 #[test]
 fn qualified_controls_require_key_fact_and_exact_admission_before_provider_work() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let mut mechanism = Mechanism::new(&pool);
     assert!(matches!(
         qualified_plan(&pool, &mechanism, 2, 3),
@@ -76,22 +76,21 @@ fn qualified_controls_require_key_fact_and_exact_admission_before_provider_work(
         ))
     ));
     assert_eq!(mechanism.calls.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     mechanism.nested_key_bytes = Some(0);
     if !crate::working_memory::qualified_storage::qualified() {
         assert!(qualified_plan(&pool, &mechanism, 2, 3).is_err());
         return;
     }
     let quote = qualified_plan(&pool, &mechanism, 2, 3).unwrap();
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     assert_eq!(mechanism.calls.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
@@ -107,13 +106,13 @@ fn qualified_controls_require_key_fact_and_exact_admission_before_provider_work(
     scope.certify().unwrap();
     drop((attempt, bank, span, r, run, namespace));
     drop(quote);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn qualified_controls_actual_roots_ignore_size_hints_and_do_not_grow_or_retry() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((r, run, span, mut bank, mechanism)) = ready(&pool, 2, 1) else {
         return;
     };
@@ -157,13 +156,13 @@ fn qualified_controls_actual_roots_ignore_size_hints_and_do_not_grow_or_retry() 
     }
     scope.certify().unwrap();
     drop((refused, exact, root, bank, span, r, run, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn qualified_controls_distinct_scope_shells_remain_exact_and_moving_scope_preserves_association() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((r, run, span, mut bank, mechanism)) = ready(&pool, 3, 2) else {
         return;
     };
@@ -188,13 +187,13 @@ fn qualified_controls_distinct_scope_shells_remain_exact_and_moving_scope_preser
     moved.certify().unwrap();
     other.certify().unwrap();
     drop((same, distinct, refused, root, bank, span, r, run, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn qualified_controls_keep_native_prefix_and_failed_preparation_until_actual_retirement() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((r, run, span, mut bank, _)) = ready(&pool, 1, 2) else {
         return;
     };
@@ -211,21 +210,21 @@ fn qualified_controls_keep_native_prefix_and_failed_preparation_until_actual_ret
         )))
     ));
     assert_eq!((first.attachments(), refused.attachments()), (1, 0));
-    assert_eq!(balances(&pool), before);
+    assert_eq!(balances(&pool), (before.0 - 32, before.1 + 32));
     assert_eq!(attempt.control_capacities(), [2; 6]);
     drop((first, refused));
     scope.certify().unwrap();
     drop((bank, span, r, run, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), held + 32);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 32);
     drop(attempt);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn qualified_controls_existing_alias_keeps_donor_and_same_vec_registry_without_double_charge() {
     for birth_first in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
         let Some((ar, a_run, a_span, mut a, _)) = ready(&pool, 1, 2) else {
             return;
         };
@@ -240,13 +239,13 @@ fn qualified_controls_existing_alias_keeps_donor_and_same_vec_registry_without_d
         ap.publish(&ascope, [&root, &root], &[]).unwrap();
         let mut bp = b.claim_publication(&mut bscope).unwrap();
         bp.publish(&bscope, [&root], &[]).unwrap();
-        assert_eq!(balances(&pool), before);
+        assert_eq!(balances(&pool), (before.0 - 16, before.1 + 16));
         assert_eq!(root.attachments(), 2);
         ascope.certify().unwrap();
         bscope.certify().unwrap();
         drop((ap, bp, a, b, a_span, b_span, ar, br, a_run, b_run));
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             64 + protected + b_protected + 32
         );
         if birth_first {
@@ -258,18 +257,18 @@ fn qualified_controls_existing_alias_keeps_donor_and_same_vec_registry_without_d
                 .for_each(|owner| drop(owner.take()));
         }
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             64 + protected + 32 + if birth_first { b_protected } else { 0 }
         );
         drop((root, namespace));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn qualified_controls_overflow_is_not_hidden_by_missing_native_facts() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let mut mechanism = Mechanism::new(&pool);
     mechanism.nested_key_bytes = Some(u64::MAX);
     let q = replacement_quote(&pool, geometry(), 0).into_incremental();
@@ -289,16 +288,16 @@ fn qualified_controls_overflow_is_not_hidden_by_missing_native_facts() {
         Err(WorkingMemoryError::Overflow)
     ));
     assert_eq!(mechanism.calls.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop(q);
     drop(namespace);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn qualified_zero_attempt_bank_refuses_repeatedly_without_scope_identity_or_provider_calls() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((r, run, span, mut bank, mechanism)) = ready(&pool, 0, 0) else {
         return;
     };
@@ -313,16 +312,18 @@ fn qualified_zero_attempt_bank_refuses_repeatedly_without_scope_identity_or_prov
                 .expect("zero attempts refuse"),
         );
     }
-    assert!(refused
-        .iter()
-        .all(|e| *e == WorkingMemoryError::PreparationAlreadyStarted));
+    assert!(
+        refused
+            .iter()
+            .all(|e| *e == WorkingMemoryError::PreparationAlreadyStarted)
+    );
     assert!(scope.native_publication_identity.is_none());
     assert_eq!(mechanism.calls.get(), calls);
     assert_eq!(balances(&pool), before);
     scope.certify().unwrap();
     drop((bank, span, r, run, namespace));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         0,
         "nonowning refusals cannot pin original credit"
     );
@@ -334,8 +335,8 @@ mod namespace;
 #[test]
 fn qualified_source_attachment_prefix_keeps_original_rows_and_moves_only_unattached_sources() {
     for refuse_attachment in [true, false] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
         let Some((r, run, span, mut bank, _)) = ready(&pool, 1, 3) else {
             return;
         };
@@ -346,7 +347,29 @@ fn qualified_source_attachment_prefix_keeps_original_rows_and_moves_only_unattac
             .publish(
                 &scope,
                 std::iter::empty::<&Root>(),
-                &[(71, 4), (72, 8), (72, 8)],
+                &[
+                    (
+                        71,
+                        crate::working_memory::StorageAllocation::new(
+                            4,
+                            pool.host_placement_handle(),
+                        ),
+                    ),
+                    (
+                        72,
+                        crate::working_memory::StorageAllocation::new(
+                            8,
+                            pool.host_placement_handle(),
+                        ),
+                    ),
+                    (
+                        72,
+                        crate::working_memory::StorageAllocation::new(
+                            8,
+                            pool.host_placement_handle(),
+                        ),
+                    ),
+                ],
             )
             .unwrap();
         assert!(
@@ -354,28 +377,28 @@ fn qualified_source_attachment_prefix_keeps_original_rows_and_moves_only_unattac
             "duplicate has no second registration"
         );
         let attachment = attempt.clone_source_for_attachment(0).unwrap();
-        assert_eq!(attachment.bytes(), 4);
+        assert_eq!(attachment.bytes(), Some(4));
         assert!(attempt.clone_source_for_attachment(0).is_none());
         assert_eq!(
             attempt.source(0).unwrap().bytes(),
-            4,
+            Some(4),
             "the actual attempt retains the original through the attachment call"
         );
         scope.certify().unwrap();
         if refuse_attachment {
             drop(attachment);
-            assert_eq!(attempt.source(0).unwrap().bytes(), 4);
-            assert_eq!(attempt.source(1).unwrap().bytes(), 8);
+            assert_eq!(attempt.source(0).unwrap().bytes(), Some(4));
+            assert_eq!(attempt.source(1).unwrap().bytes(), Some(8));
             drop((bank, span, r, run, namespace));
             assert!(
-                pool.used_bytes().unwrap() > 0,
+                pool.payload_used_bytes().unwrap() > 0,
                 "failed prefix remains owned by its attempt"
             );
             drop(attempt);
         } else {
             let remaining = attempt.take_remaining_sources().unwrap();
             assert_eq!(remaining.len(), 1);
-            assert_eq!(remaining[0].bytes(), 8);
+            assert_eq!(remaining[0].bytes(), Some(8));
             assert_eq!(
                 remaining.capacity(),
                 3,
@@ -384,26 +407,26 @@ fn qualified_source_attachment_prefix_keeps_original_rows_and_moves_only_unattac
             assert!(attempt.take_remaining_sources().is_none());
             assert_eq!(
                 attempt.source(0).unwrap().bytes(),
-                4,
+                Some(4),
                 "attached originals stay with the attempt, not the published source vector"
             );
             drop((attempt, bank, span, r, run, namespace));
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.payload_used_bytes().unwrap() > 0);
             drop(remaining);
             assert!(
-                pool.used_bytes().unwrap() > 0,
+                pool.payload_used_bytes().unwrap() > 0,
                 "the real attached owner still holds its row"
             );
             drop(attachment);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn retained_equation_generations_replace_the_peak_and_fund_one_exact_partition() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let mut mechanism = Mechanism::new(&pool);
     mechanism.nested_key_bytes = Some(0);
     let quote = replacement_quote(&pool, geometry(), 0).into_incremental();
@@ -415,7 +438,22 @@ fn retained_equation_generations_replace_the_peak_and_fund_one_exact_partition()
         .map(|record| record.new_tensor_allocation_bytes().unwrap() + 32)
         .collect();
     let capacity: u64 = generations.iter().sum();
-    let old_peak = quote.equation_incremental_bytes.unwrap();
+    let old_peak = quote
+        .span_workspace()
+        .plan()
+        .records()
+        .iter()
+        .map(|record| {
+            record
+                .domain_native_allocations()
+                .unwrap()
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
     let host_peak = quote
         .span_workspace()
         .plan()
@@ -471,16 +509,15 @@ fn retained_equation_generations_replace_the_peak_and_fund_one_exact_partition()
     )
     .unwrap();
     assert_eq!(
-        retained.incremental_bytes() - old.incremental_bytes(),
+        retained.incremental_bytes().unwrap() - old.incremental_bytes().unwrap(),
         capacity + host_peak - old_peak
     );
-    let exact = 64 + retained.incremental_bytes();
+    let exact = exact_capacity(&pool, &retained);
     assert!(matches!(
         sealed_plan(&pool, &retained, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     assert_eq!(mechanism.calls.get(), 0);
     let (reservation, accepted) = sealed_plan(&pool, &retained, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
@@ -509,5 +546,5 @@ fn retained_equation_generations_replace_the_peak_and_fund_one_exact_partition()
         quote,
         namespace,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

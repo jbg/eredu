@@ -3,6 +3,8 @@ use super::*;
 use crate::composition::mlx::session::model_session::{
     disk_layerwise_tests as disk, host_layerwise_tests as host,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{capture::*, TextGenerationBackend, TokenFilter};
 
 fn source(runtime: &ModelRuntime<MlxBackend<'_>>, cached: u64, prefill: bool) -> SharedCapturePlan {
@@ -28,7 +30,6 @@ fn source(runtime: &ModelRuntime<MlxBackend<'_>>, cached: u64, prefill: bool) ->
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -60,7 +61,7 @@ fn quiescent(runtime: &ModelRuntime<MlxBackend<'_>>) {
 fn real_resident_host_and_disk_quotes_share_paths_and_preserve_populated_decoder() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = match route {
             0 => host::runtime(&stream, &pool, None),
             1 => host::runtime(&stream, &pool, Some(1)),
@@ -80,15 +81,22 @@ fn real_resident_host_and_disk_quotes_share_paths_and_preserve_populated_decoder
                 output: eredu_core::OutputDemand::LastPosition,
             };
             let config = disk::config(0.0, 2, u64::MAX);
-            let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+            let before = (
+                pool.fixture_host_charge().unwrap(),
+                pool.fixture_host_peak().unwrap(),
+            );
             let frontier = executable.erased().state_snapshot();
             let plain = executable
-                .quote_replicated_resident_text_with_sampling(shape, config, &TokenFilter::All)
+                .quote_replicated_resident_text_with_sampling(
+                    shape,
+                    config.clone(),
+                    &TokenFilter::All,
+                )
                 .unwrap();
             let (observed, h) = executable
                 .quote_replicated_resident_text_with_sampling_and_capture(
                     shape,
-                    config,
+                    config.clone(),
                     &TokenFilter::All,
                     &capture,
                 )
@@ -96,7 +104,7 @@ fn real_resident_host_and_disk_quotes_share_paths_and_preserve_populated_decoder
             let (registered, pin, rh) = executable
                 .quote_registered_resident_text_with_sampling_and_capture(
                     shape,
-                    config,
+                    config.clone(),
                     &TokenFilter::All,
                     &pool,
                     &capture,
@@ -122,14 +130,17 @@ fn real_resident_host_and_disk_quotes_share_paths_and_preserve_populated_decoder
             assert!(paths.same_storage(executable.erased().shared_observation_paths().unwrap()));
             assert_eq!(executable.erased().state_snapshot(), frontier);
             assert_eq!(
-                (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+                (
+                    pool.fixture_host_charge().unwrap(),
+                    pool.fixture_host_peak().unwrap()
+                ),
                 before
             );
             let selected_prefill = source(&runtime, cached, true);
             let rejected = executable
                 .quote_replicated_resident_text_with_sampling_and_capture(
                     shape,
-                    config,
+                    config.clone(),
                     &TokenFilter::All,
                     &selected_prefill,
                 )

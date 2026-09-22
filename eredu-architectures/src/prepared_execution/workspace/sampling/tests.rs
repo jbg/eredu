@@ -1,7 +1,7 @@
 use super::*;
-use eredu_nn::{Tensor, workspace::*};
+use eredu_nn::{workspace::*, Tensor};
 use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, SamplingWorkspacePhase, WorkingMemoryPool, WorkspaceSamplingInput,
+    InferenceExecutionIdentity, MemoryLedger, SamplingWorkspacePhase, WorkspaceSamplingInput,
 };
 use std::convert::Infallible;
 
@@ -65,7 +65,9 @@ impl WorkspaceFactMechanisms for Facts {
     ) -> Result<Option<WorkspaceOperationFacts>, Infallible> {
         let facts = self.operation_facts(operation)?.unwrap();
         destination.validate(facts.layout).unwrap();
-        destination.assumptions.copy_from_slice(TENSOR_FACT.as_bytes());
+        destination
+            .assumptions
+            .copy_from_slice(TENSOR_FACT.as_bytes());
         for (slot, layout) in destination.outputs.iter_mut().zip(operation.outputs.iter()) {
             *slot = WorkspaceOutputEffect::Allocate(layout.bytes().unwrap());
         }
@@ -87,7 +89,9 @@ impl WorkspaceFactMechanisms for Facts {
     ) -> Result<Option<WorkspaceHostFacts>, Infallible> {
         let facts = self.host_facts(operation)?.unwrap();
         destination.validate(facts).unwrap();
-        destination.assumptions.copy_from_slice(HOST_FACT.as_bytes());
+        destination
+            .assumptions
+            .copy_from_slice(HOST_FACT.as_bytes());
         Ok(Some(facts))
     }
 }
@@ -119,9 +123,12 @@ impl SamplingWorkspaceObserver for Phases {
 fn configured_sampling_after_finished_equations_prices_fresh_seed_and_keeps_report_closed() {
     for known in [false, true] {
         let capacity = 1 << 24;
-        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
         let funding = pool
-            .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+            .prepare_workspace_metadata(
+                &InferenceExecutionIdentity::default(),
+                crate::memory_fixture::limits(&pool, capacity),
+            )
             .unwrap();
         let context = WorkspaceContext::new_with_metadata_funding(
             Facts {
@@ -132,7 +139,7 @@ fn configured_sampling_after_finished_equations_prices_fresh_seed_and_keeps_repo
         )
         .unwrap();
         let logits = context.layout(&[1, 37], WorkspaceDtype::Float32).unwrap();
-        let mut previous = pool.used_bytes().unwrap();
+        let mut previous = crate::memory_fixture::used(&pool).unwrap();
         for temperature in [0.0, 0.8] {
             for steps in [0, 2] {
                 context.begin_state_span([]).unwrap();
@@ -154,7 +161,7 @@ fn configured_sampling_after_finished_equations_prices_fresh_seed_and_keeps_repo
                 );
                 let mut phases = Phases::default();
                 let sampling = TextSamplingInput::Configured(
-                    config,
+                    config.clone(),
                     TextFilterWorkspace::Exact(&eredu_core::TokenFilter::All),
                 )
                 .quote(
@@ -246,7 +253,7 @@ fn configured_sampling_after_finished_equations_prices_fresh_seed_and_keeps_repo
                     1,
                     "sampling cannot reopen the finished equation report"
                 );
-                let used = pool.used_bytes().unwrap();
+                let used = crate::memory_fixture::used(&pool).unwrap();
                 assert!(
                     used > previous,
                     "new spans do not refund prior metadata spending"
@@ -256,6 +263,6 @@ fn configured_sampling_after_finished_equations_prices_fresh_seed_and_keeps_repo
         }
         drop(logits);
         drop(context);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
     }
 }

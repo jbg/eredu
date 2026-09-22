@@ -47,6 +47,12 @@ pub(super) fn store_words<T: CommunicationWord>(evaluated: &safemlx::EvaluatedAr
 pub(super) struct BoundaryHeaders {
     rows:Vec<communication::BoundaryHeaderResolution>,
     custody:Option<ResourceCustody>,
+    ordinary:Option<eredu_core::HostPreparationAuthority>,
+}
+impl BoundaryHeaders {
+    pub(super) fn retain_ordinary(&mut self, host:Option<eredu_core::HostPreparationAuthority>) {
+        self.ordinary=host;
+    }
 }
 impl Deref for BoundaryHeaders {
     type Target=Vec<communication::BoundaryHeaderResolution>;
@@ -100,6 +106,12 @@ impl<T:Copy> OriginalWordDestination<T> {
     }
 }
 impl<T:CommunicationWord> PreparedWordDestination<T> {
+    /// The same fixed word-destination worker and exact payload cells reserved
+    /// by `prepare_operation`. The retained constructor supplies `words`; this
+    /// descriptive result grants no source, native budget, or execution right.
+    pub(crate) fn original_operation_control_bytes(words:usize)->Option<usize> {
+        control_bytes::<T>()?.checked_add(Layout::array::<T>(words).ok()?.size())
+    }
     /// The actual owned output supplies exact dtype and word population. Only
     /// its host destination is born here; its native producer is already paid.
     pub(crate) fn prepare(source:&OriginalCommunicationSource<'_>,output:Array)->Result<Self,Error> {
@@ -197,8 +209,8 @@ impl PreparedCommunicationHeader {
         }
         let mut bytes=vector(expected.len(),&custody)?;bytes.extend_from_slice(expected);
         let mut rows=vector(1,&custody)?;
-        rows.push(communication::BoundaryHeaderResolution { received,expected:bytes });
-        Ok(Self { headers:BoundaryHeaders { rows,custody:Some(custody) } })
+        rows.push(communication::BoundaryHeaderResolution { received,expected:bytes,ordinary_readback:None });
+        Ok(Self { headers:BoundaryHeaders { rows,custody:Some(custody),ordinary:None } })
     }
     /// The selected payload and its actual received header share one exact
     /// completion. The existing resolver still compares in-band bytes before

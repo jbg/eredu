@@ -15,9 +15,11 @@ impl GroupedUnitObserver<WorkspaceTensor> for Observe {
     }
 }
 fn mechanism(implementation: CpuMatmulImplementation) -> MlxCpuWorkspaceMechanisms {
-    let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    let original = MlxMetalWorkspaceMechanisms::current_host()
+        .unwrap()
+        .original_storage();
     MlxCpuWorkspaceMechanisms::new(
-        ordinary.allocation(),
+        original.allocation(),
         MlxCpuMatmulMechanism::select(implementation).unwrap(),
     )
 }
@@ -125,6 +127,17 @@ fn cpu_grouped_sources_cover_chunked_sum_and_sequential_equations() {
                         .unwrap();
                     let plan = cpu.plan(op.as_view()).unwrap().unwrap();
                     assert_eq!(plan.validations, 1);
+                    let ordinary = cpu.ordinary_storage();
+                    let calls = ordinary
+                        .ordinary_call_controls(op.as_view())
+                        .unwrap()
+                        .unwrap_or_else(|| panic!(
+                            "ordinary grouped caller: rows={rows}, routes={routes}, policy={policy:?}, reduction={reduction:?}"
+                        ));
+                    assert!(calls.metadata_bytes > 0);
+                    // Packed ordinary execution does not register the Original
+                    // mask predicate, despite its conservative native envelope.
+                    assert_eq!(ordinary.plan(op.as_view()).unwrap().unwrap().validations, 0);
                     assert!(plan.population.births > 0 && plan.population.controls > 0);
                     assert_eq!(
                         plan.population.maximum_captures,
@@ -220,6 +233,27 @@ fn cpu_grouped_unit_split_preserves_population_and_actual_callback_storage() {
         assert_eq!(phases[1].1.unit_observers, 0);
         assert_eq!(phases[0].1.calls, 0);
         assert_eq!(phases[1].1.calls, usize::from(rows > 64));
+        let ordinary = cpu.ordinary_storage();
+        for operation in split
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, WorkspaceOperationKind::Grouped { .. }))
+        {
+            assert!(
+                ordinary
+                    .ordinary_call_controls(operation.as_view())
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                ordinary
+                    .plan(operation.as_view())
+                    .unwrap()
+                    .unwrap()
+                    .validations,
+                0
+            );
+        }
     }
 }
 
@@ -262,6 +296,39 @@ fn cpu_grouped_source_requires_selected_worker_and_exact_physical_descriptor() {
             true,
         )));
     assert!(cpu.plan(malformed.as_view()).is_err());
+}
+
+#[test]
+fn metal_grouped_callers_retain_unknown_operand_precision_and_require_f32_banks() {
+    let cpu = mechanism(CpuMatmulImplementation::Float32Tiles);
+    let report = trace(
+        3,
+        2,
+        false,
+        GatedProductPolicy::ordinary_silu(),
+        GroupReduction::Sum,
+        cpu,
+    );
+    let mut operation = report
+        .operations
+        .iter()
+        .find(|op| matches!(op.kind, WorkspaceOperationKind::Grouped { .. }))
+        .unwrap()
+        .clone();
+    let quoted = ordinary_metal_call_controls(operation.as_view()).unwrap();
+    for index in [0, 2, 3] {
+        operation.inputs[index] = operation.inputs[index].clone().with_representation(None);
+    }
+    assert!(cpu.plan(operation.as_view()).unwrap().is_none());
+    assert_eq!(
+        ordinary_metal_call_controls(operation.as_view()),
+        Some(quoted)
+    );
+    assert!(operation.inputs[0].representation().is_none());
+    assert!(operation.inputs[2].representation().is_none());
+    assert!(operation.inputs[3].representation().is_none());
+    operation.inputs[4] = operation.inputs[4].clone().with_representation(None);
+    assert!(ordinary_metal_call_controls(operation.as_view()).is_none());
 }
 
 #[test]

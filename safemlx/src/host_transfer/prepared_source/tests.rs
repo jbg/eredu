@@ -78,7 +78,9 @@ fn prepared_host_layout_refusals_leave_output_unchanged() {
                 1
             }
             2 => {
-                facts.storage_kind = safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_PINNED;
+                // Pinned Host is a supported CUDA source class. An unknown class
+                // remains a fixed refusal even for a pure synthetic query.
+                facts.storage_kind = u32::MAX;
                 1
             }
             3 => {

@@ -1,17 +1,17 @@
 //! Original immutable source preparation before ordinary native model construction.
 
-use super::*;
 use super::super::ParameterConstructors;
+use super::*;
 use eredu_architectures::{
-    prepared_execution::{project_replicated_text_binding_destinations, PreparedExecutionError},
+    prepared_execution::{PreparedExecutionError, project_replicated_text_binding_destinations},
     prepared_sources::PreparedModelSources,
 };
 use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceMechanisms, WorkspaceOperation, WorkspaceOperationBound,
 };
-use eredu_runtime::working_memory::WorkingMemoryPool;
-mod partitioned;
+use eredu_runtime::working_memory::MemoryLedger;
 mod conversion;
+mod partitioned;
 #[cfg(test)]
 mod tests;
 use crate::backend::runtime::checkpoint::bounded_quantization::ConvertedQuantization;
@@ -26,16 +26,24 @@ pub(crate) struct PreparedLayerwiseManager {
 
 impl PreparedLayerwiseManager {
     pub(crate) fn take_conversion(&mut self) -> Result<ConvertedQuantization, Error> {
-        self.conversions.next().ok_or_else(|| Error::Quantization(
-            "prepared residency has no remaining selected conversion".into(),
-        ))
+        self.conversions.next().ok_or_else(|| {
+            Error::Quantization("prepared residency has no remaining selected conversion".into())
+        })
     }
 
-    pub(crate) fn parameter_exclusions(&self, selected: &BTreeSet<String>)
-        -> Result<super::super::MlxParameterExclusions, Error> {
-        let source = self.manager.original_parameter_exclusions()
-            .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
-        source.for_selection(selected).map_err(Error::PrefillControl)
+    pub(crate) fn parameter_exclusions(
+        &self,
+        selected: &BTreeSet<String>,
+    ) -> Result<super::super::MlxParameterExclusions, Error> {
+        let source = self
+            .manager
+            .original_parameter_exclusions()
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ))?;
+        source
+            .for_selection(selected)
+            .map_err(Error::PrefillControl)
     }
 
     pub(crate) fn validate_and_take(
@@ -45,7 +53,9 @@ impl PreparedLayerwiseManager {
         execution_stream: &Stream,
     ) -> Result<ResidencyManager, Error> {
         if !self.conversions.as_slice().is_empty() {
-            return Err(Error::Quantization("prepared residency has unconsumed conversions".into()));
+            return Err(Error::Quantization(
+                "prepared residency has unconsumed conversions".into(),
+            ));
         }
         self.manager.validate_original_layerwise_preparation(
             &declarations.store,
@@ -64,12 +74,13 @@ impl PreparedLayerwiseManager {
 /// admission starts, every failure propagates; no fallback can promote its work.
 pub(crate) fn prepare_layerwise_manager(
     sources: &PreparedModelSources,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<Option<PreparedLayerwiseManager>, Error> {
     let selected = sources.selected().text_realization().residency();
-    if !(matches!(selected, LayerWeightResidency::FullyResident) && sources.prediction_extension().is_some())
+    if !(matches!(selected, LayerWeightResidency::FullyResident)
+        && sources.prediction_extension().is_some())
         && !matches!(selected, LayerWeightResidency::LayerwiseHost(_))
         && !matches!(selected, LayerWeightResidency::DenseDiskStream(_))
     {
@@ -83,7 +94,7 @@ pub(crate) fn prepare_layerwise_manager(
 /// Request read slots and native operation bounds are established separately.
 pub(crate) fn prepare_foreground_layerwise_manager(
     sources: &PreparedModelSources,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<Option<PreparedLayerwiseManager>, Error> {
@@ -98,19 +109,25 @@ pub(crate) fn prepare_foreground_layerwise_manager(
 
 fn prepare_selected_layerwise_manager(
     sources: &PreparedModelSources,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<Option<PreparedLayerwiseManager>, Error> {
     let selected = sources.selected().text_realization();
     if matches!(selected.residency(), LayerWeightResidency::DenseDiskStream(options)
-        if options.samples_backend_memory() || options.samples_process_memory()) {
+        if options.samples_backend_memory() || options.samples_process_memory())
+    {
         return Ok(None);
     }
-    let transforms = |tasks: &[eredu_runtime::ReplicatedTextMaterializationTask]| tasks.iter().any(|task| {
-        matches!(task.lowering(), eredu_runtime::WeightLoweringKind::Transform
-            | eredu_runtime::WeightLoweringKind::DerivedTransform)
-    });
+    let transforms = |tasks: &[eredu_runtime::ReplicatedTextMaterializationTask]| {
+        tasks.iter().any(|task| {
+            matches!(
+                task.lowering(),
+                eredu_runtime::WeightLoweringKind::Transform
+                    | eredu_runtime::WeightLoweringKind::DerivedTransform
+            )
+        })
+    };
     if transforms(selected.auxiliary_materialization_tasks()) {
         return Ok(None);
     }
@@ -118,7 +135,7 @@ fn prepare_selected_layerwise_manager(
         if transforms(selected.materialization_tasks()) {
             return Ok(None);
         }
-        return partitioned::prepare(sources,pool,source_stream,execution_stream);
+        return partitioned::prepare(sources, pool, source_stream, execution_stream);
     }
     let context = WorkspaceContext::new(DestinationFacts);
     let projected = match project_replicated_text_binding_destinations(sources, &context) {
@@ -129,17 +146,21 @@ fn prepare_selected_layerwise_manager(
             | PreparedExecutionError::MissingCommunication,
         ) => {
             return Ok(None);
-        },
+        }
         Err(cause) => return Err(Error::PreparedParameterSource(cause)),
     };
     let contract = projected.contract();
     let selected = contract.selected();
     let layout = selected.requirements().execution_units();
     let tasks = contract.materialization_tasks();
-    let modules = std::iter::once(projected.static_parameters()).chain(projected.units()).collect::<Vec<_>>();
-    let Some((store, conversions)) = conversion::prepare(
-        sources.target(), &modules, tasks, pool, execution_stream,
-    )? else { return Ok(None) };
+    let modules = std::iter::once(projected.static_parameters())
+        .chain(projected.units())
+        .collect::<Vec<_>>();
+    let Some((store, conversions)) =
+        conversion::prepare(sources.target(), &modules, tasks, pool, execution_stream)?
+    else {
+        return Ok(None);
+    };
 
     let partitions = eredu_runtime::plan_replicated_text_materialization_tasks(tasks, layout)
         .map_err(|cause| Error::ArchitectureModel(cause.to_string()))?;
@@ -206,16 +227,30 @@ fn prepare_selected_layerwise_manager(
         let store = sources.extension().ok_or(Error::PrefillControl(
             eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
         ))?;
-        let targets = crate::backend::runtime::checkpoint::binding::mlx_workspace_binding_targets(&module.parameters)
-            .ok_or_else(|| Error::ArchitectureModel("invalid cold MLX prediction destination representation".into()))?;
+        let targets = crate::backend::runtime::checkpoint::binding::mlx_workspace_binding_targets(
+            &module.parameters,
+        )
+        .ok_or_else(|| {
+            Error::ArchitectureModel(
+                "invalid cold MLX prediction destination representation".into(),
+            )
+        })?;
         let tasks = module.tasks.iter().collect::<Vec<_>>();
         let bindings = eredu_runtime::build_exact_replicated_text_bindings_for_targets(
-            &targets, store.as_ref(), &tasks, &BTreeSet::new(), module.layout.as_ref(),
-            |_task, recipe, source| crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source),
-        ).map_err(|cause| Error::ArchitectureModel(cause.to_string()))?;
+            &targets,
+            store.as_ref(),
+            &tasks,
+            &BTreeSet::new(),
+            module.layout.as_ref(),
+            |_task, recipe, source| {
+                crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
+            },
+        )
+        .map_err(|cause| Error::ArchitectureModel(cause.to_string()))?;
         supplementary.push(SupplementaryResidencyUnit {
             definition: eredu_runtime::OffloadUnit::new(
-                OffloadUnitId::new(format!("prediction.module.{:05}", module.ordinal))?, bindings,
+                OffloadUnitId::new(format!("prediction.module.{:05}", module.ordinal))?,
+                bindings,
             )?,
             source: store.clone(),
             shared: module.shared,
@@ -230,18 +265,33 @@ fn prepare_selected_layerwise_manager(
         unit_bindings,
         supplementary,
     )?;
-    let constructors = projected.units().iter().map(ParameterConstructors::from_layouts)
+    let constructors = projected
+        .units()
+        .iter()
+        .map(ParameterConstructors::from_layouts)
         .collect::<Option<Vec<_>>>()
-        .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?;
-    let manager = prepare_manager_from_declarations(declarations, selected.residency(), layout, &addressable,
-        Some(&constructors), pool, source_stream, execution_stream)?;
+        .ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+        ))?;
+    let manager = prepare_manager_from_declarations(
+        declarations,
+        selected.residency(),
+        layout,
+        &addressable,
+        Some(&constructors),
+        pool,
+        source_stream,
+        execution_stream,
+    )?;
     match manager {
         Some(mut manager) => {
             manager.conversions = conversions.into_iter();
             Ok(Some(manager))
         }
         None if conversions.is_empty() => Ok(None),
-        None => Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound)),
+        None => Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        )),
     }
 }
 
@@ -251,7 +301,7 @@ pub(crate) fn prepare_manager_from_declarations(
     layout: &ExecutionUnitLayout,
     parameter_exclusions: &BTreeSet<String>,
     parameter_constructors: Option<&[ParameterConstructors]>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<Option<PreparedLayerwiseManager>, Error> {
@@ -264,10 +314,7 @@ pub(crate) fn prepare_manager_from_declarations(
                 .to_owned()
         })
         .collect::<Vec<_>>();
-    if matches!(
-        residency,
-        LayerWeightResidency::DenseDiskStream(_)
-    ) {
+    if matches!(residency, LayerWeightResidency::DenseDiskStream(_)) {
         // Ordinary sessions may use the same source-prepared manager. Declare
         // the shared scheduler's exact finite protection names at construction.
         let names = groups
@@ -279,21 +326,23 @@ pub(crate) fn prepare_manager_from_declarations(
         groups.extend(names);
     }
     let manager = match residency {
-        LayerWeightResidency::FullyResident | LayerWeightResidency::LayerwiseHost(_) => ResidencyManager::prepare_original_host(
-            declarations.store.clone(),
-            declarations.sources.clone(),
-            &declarations.plan,
-            &declarations.definitions,
-            &groups,
-            &declarations.unit_ids,
-            layout,
-            declarations.depth,
-            parameter_exclusions,
-            parameter_constructors,
-            source_stream,
-            execution_stream,
-            pool,
-        ),
+        LayerWeightResidency::FullyResident | LayerWeightResidency::LayerwiseHost(_) => {
+            ResidencyManager::prepare_original_host(
+                declarations.store.clone(),
+                declarations.sources.clone(),
+                &declarations.plan,
+                &declarations.definitions,
+                &groups,
+                &declarations.unit_ids,
+                layout,
+                declarations.depth,
+                parameter_exclusions,
+                parameter_constructors,
+                source_stream,
+                execution_stream,
+                pool,
+            )
+        }
         LayerWeightResidency::DenseDiskStream(options) => {
             ResidencyManager::prepare_original_foreground_disk_with_controller(
                 declarations.store.clone(),
@@ -322,7 +371,10 @@ pub(crate) fn prepare_manager_from_declarations(
         _ => return Ok(None),
     }
     .map_err(|cause| Error::Other(Box::new(cause)))?;
-    Ok(manager.map(|manager| PreparedLayerwiseManager { manager, conversions: Vec::new().into_iter() }))
+    Ok(manager.map(|manager| PreparedLayerwiseManager {
+        manager,
+        conversions: Vec::new().into_iter(),
+    }))
 }
 
 /// Destination construction uses only geometry. This planner supplies no

@@ -1,6 +1,7 @@
 //! Source-qualified startup for the closed stable standard-thread worker.
 use super::{
-    InferenceExecutionIdentity, OriginalHostSourceCustody, PreparedAccountCommit, WorkingMemoryError, WorkingMemoryPool, WorkingMemoryReservation,
+    InferenceExecutionIdentity, MemoryLedger, OriginalHostSourceCustody, PreparedAccountCommit,
+    WorkingMemoryError, WorkingMemoryReservation,
     funding::{AccountLedger, AccountNode, AccountTicket, PendingAccount, PendingOriginal},
     qualified_storage,
 };
@@ -169,10 +170,26 @@ impl HostThreadStartupPlan {
             size_of::<Result<String, WorkingMemoryError>>(),
             size_of::<String>(),
             size_of::<std::collections::TryReserveError>(),
-            size_of::<(&WorkingMemoryPool, &InferenceExecutionIdentity, u64)>(),
-            size_of::<(&OriginalHostSourceCustody, Option<&WorkingMemoryReservation>)>(),
-            size_of::<Option<(&OriginalHostSourceCustody, Option<&WorkingMemoryReservation>)>>(),
-            size_of::<(&WorkingMemoryPool, &InferenceExecutionIdentity, Option<u64>, Option<(&OriginalHostSourceCustody, Option<&WorkingMemoryReservation>)>)>(),
+            size_of::<(&MemoryLedger, &InferenceExecutionIdentity, u64)>(),
+            size_of::<(
+                &OriginalHostSourceCustody,
+                Option<&WorkingMemoryReservation>,
+            )>(),
+            size_of::<
+                Option<(
+                    &OriginalHostSourceCustody,
+                    Option<&WorkingMemoryReservation>,
+                )>,
+            >(),
+            size_of::<(
+                &MemoryLedger,
+                &InferenceExecutionIdentity,
+                Option<u64>,
+                Option<(
+                    &OriginalHostSourceCustody,
+                    Option<&WorkingMemoryReservation>,
+                )>,
+            )>(),
             size_of::<(&AccountLedger, u64, &InferenceExecutionIdentity)>(),
             size_of::<Option<&AccountNode>>(),
             size_of::<Result<u64, WorkingMemoryError>>(),
@@ -200,9 +217,9 @@ impl HostThreadStartupPlan {
     /// after startup uses the established unresolved-account quarantine policy.
     pub fn prepare(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<HostThreadStartup, WorkingMemoryError> {
         self.prepare_inner(pool, execution, Some(capacity), None)
     }
@@ -220,30 +237,41 @@ impl HostThreadStartupPlan {
     }
     fn prepare_inner(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
-        capacity: Option<u64>,
-        source: Option<(&OriginalHostSourceCustody, Option<&WorkingMemoryReservation>)>,
+        capacity: Option<eredu_core::MemoryLimits>,
+        source: Option<(
+            &OriginalHostSourceCustody,
+            Option<&WorkingMemoryReservation>,
+        )>,
     ) -> Result<HostThreadStartup, WorkingMemoryError> {
+        let mut comparison =
+            capacity.unwrap_or_else(|| eredu_core::MemoryLimits::unlimited(pool.topology()));
+        let mut retained = eredu_core::MemoryLimits::unlimited(pool.topology());
         let pending = {
             let mut usage = pool
                 .0
                 .usage
                 .lock()
                 .map_err(|_| WorkingMemoryError::Poisoned)?;
-            let capacity = if let Some((source, reservation)) = source {
+            if let Some((source, reservation)) = source {
                 source.validate_publication_locked(reservation, pool, &usage)?;
                 let (_, source_execution, account) = source.origin();
-                usage.funding.accepted_source_capacity(account, source_execution)?
-            } else {
-                capacity.ok_or(WorkingMemoryError::IdentityMismatch)?
-            };
+                match usage
+                    .funding
+                    .accepted_source_capacity(account, source_execution)?
+                {
+                    Some(limits) => comparison.copy_from(limits)?,
+                    None => comparison.make_unlimited(),
+                }
+            }
+            retained.copy_from(&comparison)?;
             let commit = PreparedAccountCommit::prepare(
                 pool,
                 execution,
                 &usage,
                 self.bytes,
-                Some(capacity),
+                Some(&comparison),
                 &[],
             )?;
             PendingAccount::accept(
@@ -252,7 +280,7 @@ impl HostThreadStartupPlan {
                 &mut usage,
                 commit,
                 self.bytes,
-                Some(capacity),
+                Some(retained),
                 self.bytes,
             )?
         };

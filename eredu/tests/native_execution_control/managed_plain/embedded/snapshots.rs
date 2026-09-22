@@ -57,7 +57,10 @@ fn run_inner(kind: &str, capacity: u64, expect_refusal: bool) {
     let visible = Rc::new(RefCell::new(String::new()));
     let events = visible.clone();
     let mut settings = settings(0.7);
-    settings.inference.managed_memory_capacity_bytes = Some(capacity);
+    settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(capacity),
+    )]);
     let request = ManagedPlainTextSpeculativeRequest {
         text: ManagedPlainTextRequest::new(PROMPT, settings),
         drafting: drafting.as_speculative_draft().unwrap(),

@@ -1,7 +1,7 @@
 //! Closed immutable model/input metadata and per-domain accounting custody.
 
 use crate::{input::SharedPreparedInputCacheIdentity, state::SharedStateLayout};
-use eredu_core::{SharedStorageAttachmentError, SharedStorageDomain};
+use eredu_core::{SharedStorageAccountingId, SharedStorageAttachmentError};
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -24,9 +24,9 @@ mod identity;
 pub use identity::{HostMetadataIdentity, HostMetadataKey};
 
 enum MetadataAttachments {
-    Ordinary(Mutex<Vec<Attachment>>),
+    Ordinary(Mutex<MetadataEntries>),
     OriginalText {
-        entries: Mutex<Vec<Attachment>>,
+        entries: Mutex<MetadataEntries>,
         // Vec and every boxed registration retire before raw control custody.
         custody: crate::working_memory::OriginalTextMetadataCustody,
     },
@@ -37,8 +37,25 @@ enum MetadataAttachments {
 }
 
 struct Attachment {
-    domain: SharedStorageDomain,
+    domain: SharedStorageAccountingId,
     _custody: Box<dyn Send + Sync>,
+}
+
+#[derive(Default)]
+struct MetadataEntries {
+    fixed: Vec<Attachment>,
+    ordinary: eredu_core::SharedStorageAttachmentTable,
+}
+impl std::ops::Deref for MetadataEntries {
+    type Target = Vec<Attachment>;
+    fn deref(&self) -> &Self::Target {
+        &self.fixed
+    }
+}
+impl std::ops::DerefMut for MetadataEntries {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fixed
+    }
 }
 
 /// Closed layout/input owners and the fixed slot metadata token construct this custody.
@@ -59,7 +76,7 @@ impl MetadataCustody {
         Self {
             identity: HostMetadataIdentity::ordinary(),
             initialized: std::sync::atomic::AtomicBool::new(false),
-            attachments: MetadataAttachments::Ordinary(Mutex::new(Vec::new())),
+            attachments: MetadataAttachments::Ordinary(Mutex::new(MetadataEntries::default())),
             reset: None,
             preparation: None,
         }
@@ -72,7 +89,7 @@ impl MetadataCustody {
         let result = Self {
             identity,
             initialized: std::sync::atomic::AtomicBool::new(true),
-            attachments: MetadataAttachments::Ordinary(Mutex::new(Vec::new())),
+            attachments: MetadataAttachments::Ordinary(Mutex::new(MetadataEntries::default())),
             reset: None,
             preparation: Some(authority.clone()),
         };
@@ -106,7 +123,7 @@ impl MetadataCustody {
             identity: HostMetadataIdentity::ordinary(),
             initialized: std::sync::atomic::AtomicBool::new(false),
             attachments: MetadataAttachments::OriginalText {
-                entries: Mutex::new(Vec::new()),
+                entries: Mutex::new(MetadataEntries::default()),
                 custody,
             },
             reset: None,
@@ -133,19 +150,23 @@ impl MetadataCustody {
     }
     pub(crate) fn original_attachment_ready(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         use crate::working_memory::WorkingMemoryError as E;
         match &self.attachments {
             MetadataAttachments::OriginalPrepared { custody, .. } => {
-                if custody.pool().shared_storage_domain().same_identity(domain) {
+                if custody
+                    .pool()
+                    .shared_storage_accounting_id()
+                    .same_identity(domain)
+                {
                     Ok(())
                 } else {
                     Err(E::IdentityMismatch)
                 }
             }
             MetadataAttachments::OriginalText { custody, .. } => {
-                if custody.matches_domain(domain) {
+                if custody.matches_accounting_owner(domain) {
                     Ok(())
                 } else {
                     Err(E::IdentityMismatch)
@@ -157,7 +178,9 @@ impl MetadataCustody {
                     return Err(E::UnknownBound);
                 }
                 let entries = storage.try_lock().map_err(|_| E::UnknownBound)?;
-                if entries.iter().any(|e| e.domain == *domain) {
+                if entries.iter().any(|e| e.domain == *domain)
+                    || entries.ordinary.has_accounting_custody(domain)
+                {
                     Ok(())
                 } else {
                     Err(E::UnknownBound)
@@ -185,12 +208,12 @@ impl MetadataCustody {
         [
             size_of::<Self>(),
             size_of::<HostMetadataIdentity>(),
-            size_of::<Mutex<Vec<Attachment>>>(),
-            size_of::<MutexGuard<'static, Vec<Attachment>>>(),
+            size_of::<Mutex<MetadataEntries>>(),
+            size_of::<MutexGuard<'static, MetadataEntries>>(),
             size_of::<
                 Result<
-                    MutexGuard<'static, Vec<Attachment>>,
-                    PoisonError<MutexGuard<'static, Vec<Attachment>>>,
+                    MutexGuard<'static, MetadataEntries>,
+                    PoisonError<MutexGuard<'static, MetadataEntries>>,
                 >,
             >(),
         ]
@@ -205,7 +228,7 @@ impl MetadataCustody {
         Self {
             identity,
             initialized: std::sync::atomic::AtomicBool::new(false),
-            attachments: MetadataAttachments::Ordinary(Mutex::new(Vec::new())),
+            attachments: MetadataAttachments::Ordinary(Mutex::new(MetadataEntries::default())),
             reset: Some(custody),
             preparation: None,
         }
@@ -250,18 +273,19 @@ impl MetadataCustody {
         }
     }
     pub(crate) fn original_prepared_matches(
-        &self, expected: &crate::working_memory::PreparedInputHostCustody,
+        &self,
+        expected: &crate::working_memory::PreparedInputHostCustody,
     ) -> bool {
         matches!(&self.attachments, MetadataAttachments::OriginalPrepared { custody, .. }
             if custody.same_account(expected))
     }
     pub(crate) fn original_prepared_residence(
         &self,
-        pool: &crate::working_memory::WorkingMemoryPool,
+        pool: &crate::working_memory::MemoryLedger,
     ) -> Option<Result<(), crate::working_memory::WorkingMemoryError>> {
         match &self.attachments {
             MetadataAttachments::OriginalPrepared { custody, source } => {
-                Some(if custody.pool().same_domain(pool) {
+                Some(if custody.pool().same_ledger(pool) {
                     source.validate_pool(pool)
                 } else {
                     Err(crate::working_memory::WorkingMemoryError::IdentityMismatch)
@@ -270,11 +294,17 @@ impl MetadataCustody {
             _ => None,
         }
     }
-    pub(crate) fn original_prepared_domain(&self, domain: &SharedStorageDomain) -> Option<bool> {
+    pub(crate) fn original_prepared_domain(
+        &self,
+        domain: &SharedStorageAccountingId,
+    ) -> Option<bool> {
         match &self.attachments {
-            MetadataAttachments::OriginalPrepared { custody, .. } => {
-                Some(custody.pool().shared_storage_domain().same_identity(domain))
-            }
+            MetadataAttachments::OriginalPrepared { custody, .. } => Some(
+                custody
+                    .pool()
+                    .shared_storage_accounting_id()
+                    .same_identity(domain),
+            ),
             _ => None,
         }
     }
@@ -284,7 +314,7 @@ impl MetadataCustody {
 
     pub(crate) fn prepare_copy_attachment(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         use crate::working_memory::WorkingMemoryError as E;
         if self.preparation.is_none() {
@@ -314,14 +344,68 @@ impl MetadataCustody {
     }
     pub(crate) fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.try_attach_mode(domain, acquire, false)
     }
+    pub(crate) fn try_attach_owned_prepared<T: eredu_core::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            eredu_core::SharedStorageAttachmentLayout,
+        ) -> Result<eredu_core::SharedStorageOwner<T>, E>,
+    ) -> Result<bool, SharedStorageAttachmentError<E>> {
+        let storage = match &self.attachments {
+            MetadataAttachments::OriginalPrepared { custody, .. } => {
+                return if custody
+                    .pool()
+                    .shared_storage_accounting_id()
+                    .same_identity(owner)
+                {
+                    Ok(false)
+                } else {
+                    Err(SharedStorageAttachmentError::AttachmentMismatch)
+                };
+            }
+            MetadataAttachments::OriginalText { entries, custody } => {
+                if !custody.matches_accounting_owner(owner) {
+                    return Err(SharedStorageAttachmentError::AttachmentMismatch);
+                }
+                entries
+            }
+            MetadataAttachments::Ordinary(storage) => storage,
+        };
+        // This source gate serializes fixed-slot and ordinary-node publication.
+        // It allocates no attachment backing and is released before captures or
+        // callback errors can be destroyed.
+        let mut acquire = Some(acquire);
+        let result = (|| {
+            let mut entries = storage
+                .lock()
+                .map_err(|_| SharedStorageAttachmentError::Poisoned)?;
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::Release);
+            if entries.iter().any(|entry| entry.domain == *owner) {
+                return Ok(false);
+            }
+            let mut inserted = false;
+            let attached = entries.ordinary.try_attach_owned(owner, |layout| {
+                let value = acquire.take().expect("single provider")(layout)?;
+                inserted = true;
+                Ok(value)
+            })?;
+            drop(entries);
+            drop(attached);
+            Ok(inserted)
+        })();
+        drop(acquire);
+        result
+    }
+
     pub(crate) fn try_attach_prepared_copy<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         if self.preparation.is_none() {
@@ -331,7 +415,7 @@ impl MetadataCustody {
     }
     fn try_attach_mode<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
         prepared_copy: bool,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
@@ -339,7 +423,11 @@ impl MetadataCustody {
         // branch before any lazy lock, Vec reserve or provider invocation.
         let storage = match &self.attachments {
             MetadataAttachments::OriginalPrepared { custody, .. } => {
-                return if custody.pool().shared_storage_domain().same_identity(domain) {
+                return if custody
+                    .pool()
+                    .shared_storage_accounting_id()
+                    .same_identity(domain)
+                {
                     Ok(false) // existing source residence, never a registration proof
                 } else {
                     Err(SharedStorageAttachmentError::AttachmentMismatch)
@@ -347,37 +435,45 @@ impl MetadataCustody {
             }
             MetadataAttachments::Ordinary(storage) => storage,
             MetadataAttachments::OriginalText { entries, custody } => {
-                if !custody.matches_domain(domain) {
+                if !custody.matches_accounting_owner(domain) {
                     return Err(SharedStorageAttachmentError::AttachmentMismatch);
                 }
                 entries
             }
         };
-        let mut attachments = storage
-            .lock()
-            .map_err(|_| SharedStorageAttachmentError::Poisoned)?;
-        self.initialized
-            .store(true, std::sync::atomic::Ordering::Release);
-        if attachments.iter().any(|entry| entry.domain == *domain) {
-            return Ok(false);
-        }
-        // Acquisition may create a charge. Reserve its infallible publication
-        // slot first, so no later allocation can lose that returned handle.
-        if prepared_copy || matches!(&self.attachments, MetadataAttachments::OriginalText { .. }) {
+        let mut acquire = Some(acquire);
+        let result = (|| {
+            let mut attachments = storage
+                .lock()
+                .map_err(|_| SharedStorageAttachmentError::Poisoned)?;
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::Release);
+            if attachments.iter().any(|entry| entry.domain == *domain)
+                || attachments.ordinary.has_accounting_custody(domain)
+            {
+                return Ok(false);
+            }
+            if !prepared_copy
+                && !matches!(&self.attachments, MetadataAttachments::OriginalText { .. })
+            {
+                return attachments
+                    .ordinary
+                    .try_attach(domain, |_| acquire.take().expect("single provider")());
+            }
+            // The fixed original copy slot was allocated under its constructor H.
             if attachments.len() == attachments.capacity() {
                 return Err(SharedStorageAttachmentError::AttachmentMismatch);
             }
-        } else {
-            attachments
-                .try_reserve(1)
-                .map_err(SharedStorageAttachmentError::Allocation)?;
-        }
-        let handle = acquire().map_err(SharedStorageAttachmentError::Provider)?;
-        attachments.push(Attachment {
-            domain: domain.clone(),
-            _custody: handle,
-        });
-        Ok(true)
+            let handle = acquire.take().expect("single provider")()
+                .map_err(SharedStorageAttachmentError::Provider)?;
+            attachments.push(Attachment {
+                domain: domain.clone(),
+                _custody: handle,
+            });
+            Ok(true)
+        })();
+        drop(acquire);
+        result
     }
 }
 
@@ -438,7 +534,7 @@ impl SharedHostMetadata {
     /// text constructor's unused fixed slot. No allocator or provider runs.
     pub fn validate_original_attachment(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         match self {
             Self::Layout(v) => v.original_attachment_ready(domain),
@@ -446,20 +542,37 @@ impl SharedHostMetadata {
             Self::ObservationPaths(v) => v.original_attachment_ready(domain),
         }
     }
-    /// Attaches accounting custody once per exact domain. Returns `false`
-    /// without calling the provider when that domain is already attached.
-    /// The publication slot is reserved before provider acquisition; rejection
+    /// Attaches a closed owner after its provider admits the exact new node
+    /// and its own concrete owner allocation. Reuse allocates nothing and does
+    /// not invoke the provider. This does not grant native execution authority.
+    pub fn try_attach_owned_prepared<T: eredu_core::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            eredu_core::SharedStorageAttachmentLayout,
+        ) -> Result<eredu_core::SharedStorageOwner<T>, E>,
+    ) -> Result<bool, SharedStorageAttachmentError<E>> {
+        match self {
+            Self::Layout(value) => value.try_attach_owned_prepared(owner, acquire),
+            Self::Input(value) => value.try_attach_owned_prepared(owner, acquire),
+            Self::ObservationPaths(value) => value.try_attach_owned_prepared(owner, acquire),
+        }
+    }
+
+    /// Attaches accounting custody once per exact accounting owner. Returns `false`
+    /// without calling the provider when that accounting owner is already attached.
+    /// The publication provider runs before the node allocation; rejection
     /// preserves every earlier attachment and alias.
     ///
     /// The provider runs under the owner lock and must perform only closed
     /// accounting operations, without owner reentry, native work or callbacks.
     /// Its handle must not retain this payload owner directly or indirectly;
-    /// use the separate identity/domain keys to avoid a registration cycle.
+    /// use the separate identity/accounting owner keys to avoid a registration cycle.
     /// Handles retire after the payload and outside the owner lock. An earlier
     /// provider panic poisons custody and rejects subsequent attachment.
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         match self {

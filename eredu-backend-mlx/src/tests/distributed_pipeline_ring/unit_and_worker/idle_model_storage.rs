@@ -1,13 +1,13 @@
 mod idle_model_storage_tests {
     use super::*;
     use crate::backend::runtime::residency::storage::RetainedStorage;
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
 
     #[test]
     fn enclosing_coverage_and_decoder_growth_remain_separate() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let backend = crate::native::backend(&stream, &stream)
-            .with_memory_pool(WorkingMemoryPool::new(u64::MAX, 0).unwrap());
+            .with_memory_ledger(crate::memory_fixture::ledger(u64::MAX, 0).unwrap());
         let checkpoint =
             crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
         let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default())
@@ -73,7 +73,7 @@ mod idle_model_storage_tests {
     fn retained_blueprint_source_aliases_count_once() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let backend = crate::native::backend(&stream, &stream)
-            .with_memory_pool(WorkingMemoryPool::new(u64::MAX, 0).unwrap());
+            .with_memory_ledger(crate::memory_fixture::ledger(u64::MAX, 0).unwrap());
         let checkpoint = tempfile::tempdir().unwrap();
         let path = checkpoint.path().join("model.gguf");
         write_llama_compatible_gguf(&path, "llama");
@@ -156,7 +156,7 @@ mod idle_model_storage_tests {
     fn dormant_prediction_is_included_and_erased_observer_payload_stays_unknown() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let backend = crate::native::backend(&stream, &stream)
-            .with_memory_pool(WorkingMemoryPool::new(u64::MAX, 0).unwrap());
+            .with_memory_ledger(crate::memory_fixture::ledger(u64::MAX, 0).unwrap());
         let checkpoint = tempfile::tempdir().unwrap();
         write_deepseek_fixture_with_prediction(checkpoint.path(), 2, 1);
         let mut executable = load_model(&backend, checkpoint.path(), MlxLoadRequest::default())

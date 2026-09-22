@@ -1,9 +1,9 @@
 //! One actual shared cache owner; stream handles and cache rows are separate.
 use super::cache::Index;
 use eredu_runtime::working_memory::{
-    OriginalHostMetadataCustody, SharedNativeInitializationCustody,
+    MemoryLedger, OriginalHostMetadataCustody, SharedNativeInitializationCustody,
     SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-    WorkingMemoryPool, WorkingMemoryReservation,
+    WorkingMemoryReservation,
 };
 use std::{
     alloc::Layout,
@@ -75,7 +75,7 @@ impl CacheHandle {
             }),
         }
     }
-    pub(crate) fn prepare(pool: &WorkingMemoryPool) -> Result<Self, CacheInitializationError> {
+    pub(crate) fn prepare(pool: &MemoryLedger) -> Result<Self, CacheInitializationError> {
         let initialized = pool
             .initialize_shared_native(Initializer)
             .map_err(CacheInitializationError)?;
@@ -84,7 +84,7 @@ impl CacheHandle {
         Ok(initialized.output().clone())
     }
     pub(crate) fn required_storage_bytes() -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::shared_native_initialization_required_bytes(&Initializer)
+        MemoryLedger::shared_native_initialization_required_bytes(&Initializer)
     }
     /// Fixed identity/validation transports. The caller prices this beside its
     /// lookup/install frames, not again in the cache's shared birth allowance.
@@ -98,7 +98,7 @@ impl CacheHandle {
             size_of::<Option<&SharedNativeInitializationCustody>>(),
             size_of::<&SharedNativeInitializationCustody>(),
             size_of::<&WorkingMemoryReservation>(),
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<WorkingMemoryError>(),
             size_of::<bool>(),
@@ -113,7 +113,7 @@ impl CacheHandle {
             other.0.as_ref().expect("live cache"),
         )
     }
-    pub(crate) fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub(crate) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.body()
             .origin
             .as_ref()
@@ -150,7 +150,7 @@ impl SharedNativeInitializer for Initializer {
             size_of::<Option<SharedNativeInitializationCustody>>(),
             size_of::<Arc<Body>>(),
             size_of::<CacheHandle>(),
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<LockResult<MutexGuard<'static, Index>>>(),
             size_of::<MutexGuard<'static, Index>>(),
             size_of::<std::sync::PoisonError<MutexGuard<'static, Index>>>(),

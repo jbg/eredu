@@ -2,7 +2,7 @@
 
 use super::{ControllerStorageContract, ControllerStorageError, RegisteredControllerStorage};
 use crate::working_memory::{
-    WorkingMemoryError, WorkingMemoryPool, WorkingMemoryStorage, WorkspaceReportError,
+    MemoryLedger, WorkingMemoryError, WorkingMemoryStorage, WorkspaceReportError,
     WorkspaceReportMetadata, residual::RegisteredStoragePin,
 };
 use eredu_core::{
@@ -52,7 +52,7 @@ impl From<WorkingMemoryError> for ControllerWorkspaceMetadataError {
 pub struct ControllerWorkspaceContribution {
     geometry: InferenceGeometry,
     controller: TextControllerContract,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     full_additional: u64,
     incremental_additional: u64,
     registered: Option<WorkingMemoryStorage<eredu_core::SharedStorageIdentity>>,
@@ -67,7 +67,7 @@ impl ControllerWorkspaceContribution {
         workspace: TextControllerWorkspace<'_>,
         output_width: usize,
         storage_contract: &ControllerStorageContract,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         registered: Option<&RegisteredControllerStorage>,
     ) -> Result<Self, ControllerStorageError> {
         Self::new_metadata(
@@ -88,7 +88,7 @@ impl ControllerWorkspaceContribution {
         workspace: TextControllerWorkspace<'_>,
         output_width: usize,
         storage_contract: &ControllerStorageContract,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         registered: Option<&RegisteredControllerStorage>,
         metadata: WorkspaceReportMetadata<'_>,
     ) -> Result<Self, ControllerWorkspaceMetadataError> {
@@ -102,22 +102,25 @@ impl ControllerWorkspaceContribution {
         storage_contract.validate_workspace(workspace)?;
         storage_contract.validate_original_pool(pool)?;
         let source_bytes = if let Some(registered) = registered {
-            if !registered.pool.same_domain(pool) || &registered.contract != storage_contract {
+            if !registered.pool.same_ledger(pool) || &registered.contract != storage_contract {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
             registered.source_bytes()
         } else {
             0
         };
-        let incremental_additional = workspace
+        let full_additional = workspace
             .additional_host_bytes
+            .checked_add(storage_contract.publication_control_bytes()?)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let incremental_additional = full_additional
             .checked_sub(source_bytes)
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         Ok(Self {
             geometry,
             controller,
             pool: pool.clone(),
-            full_additional: workspace.additional_host_bytes,
+            full_additional,
             incremental_additional,
             registered: registered.map(|source| source.registration.clone()),
         })
@@ -151,11 +154,23 @@ impl ControllerWorkspaceContribution {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         let mut full = metadata.clone_execution(&outside)?;
+        if let Some(domains) = &mut full.physical_domains {
+            domains
+                .retained
+                .add_allocation(self.full_additional, self.pool.host_placement())
+                .map_err(|e| WorkingMemoryError::from(e))?;
+        }
         add_retained(&mut full.retained, self.full_additional, false, metadata)?;
         let incremental = if self.full_additional == self.incremental_additional {
             metadata.clone_execution(&full)?
         } else {
             let mut incremental = outside;
+            if let Some(domains) = &mut incremental.physical_domains {
+                domains
+                    .retained
+                    .add_allocation(self.incremental_additional, self.pool.host_placement())
+                    .map_err(|e| WorkingMemoryError::from(e))?;
+            }
             add_retained(
                 &mut incremental.retained,
                 self.incremental_additional,
@@ -213,7 +228,7 @@ pub struct ControllerWorkspaceEstimate {
     full: ExecutionWorkspaceEstimate,
     incremental: ExecutionWorkspaceEstimate,
     controller: TextControllerContract,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     pin: Option<RegisteredStoragePin>,
 }
 
@@ -238,7 +253,7 @@ impl ControllerWorkspaceEstimate {
         &self.controller
     }
 
-    pub(in crate::working_memory) fn pool(&self) -> &WorkingMemoryPool {
+    pub(in crate::working_memory) fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
 

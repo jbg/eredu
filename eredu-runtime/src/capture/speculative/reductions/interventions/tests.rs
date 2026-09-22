@@ -1,10 +1,8 @@
 use super::super::construction_tests::{geometry, origin, source, summary, values};
 use super::*;
-use crate::working_memory::{
-    InferenceExecutionIdentity, WorkingMemoryPool,
-};
+use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use eredu_core::{
-    ObservationSupportStatus, TensorObservation, TensorObservationData, intervention::*,
+    intervention::*, ObservationSupportStatus, TensorObservation, TensorObservationData,
 };
 fn plan(capture: &AdmittedCapturePlan) -> AdmittedInterventionPlan {
     let point = &capture.points()[0];
@@ -169,11 +167,11 @@ fn source_owned_evidence_aggregates_preserve_sides_values_and_funded_retirement(
     let capture = source();
     let admitted = plan(&capture);
     let scopes = [SpeculativeCaptureScope::Target; 2];
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let source = pool
         .compile_intervention_source(PreparedInterventionPlanCopy::inspect(&admitted).unwrap())
         .unwrap();
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.payload_used_bytes().unwrap();
     let mut ordinary_ledger = CaptureLedger::new(&capture);
     let mut ordinary = report();
     let lanes = Interventions::create_shared(
@@ -188,7 +186,10 @@ fn source_owned_evidence_aggregates_preserve_sides_values_and_funded_retirement(
     .unwrap();
     let expected = finish(lanes, ordinary, &source);
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 26)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 26),
+        )
         .unwrap();
     let mut ledger = CaptureLedger::new(&capture);
     let mut original = report();
@@ -229,12 +230,12 @@ fn source_owned_evidence_aggregates_preserve_sides_values_and_funded_retirement(
             matches!(value.data(),TensorObservationData::F32(data) if data.as_slice()==&values[..5])
         );
     }
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.payload_used_bytes().unwrap();
     assert!(charged > baseline);
     // The enclosing original aggregate owner retains funding behind all records.
     let escaped = (actual, funding);
     drop(source);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

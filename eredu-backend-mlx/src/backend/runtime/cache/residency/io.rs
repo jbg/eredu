@@ -20,6 +20,7 @@ struct DiskLocationData {
     // Declared last: paths/verification and worker payloads retire before the
     // final source owner removes an ephemeral file. Persistent files have none.
     live_source: Option<LiveCacheBlockSource>,
+    persistent_source: Option<eredu_runtime::cache::PersistentCacheBlockSource>,
 }
 
 impl std::ops::Deref for DiskLocation {
@@ -36,8 +37,11 @@ impl DiskLocation {
         }
     }
 }
+#[path = "io/file_source.rs"]
+mod file_source;
 #[path = "io/location.rs"]
 mod location;
+pub(crate) use file_source::{CacheFileReadFailure, CacheFileSource, PreparedCacheFileRead};
 
 enum DiskTask {
     PreparedWrite(manager::PreparedDiskWrite),
@@ -447,11 +451,13 @@ fn disk_worker_error(error: CacheIoWorkerError) -> CacheResidencyError {
 mod manager;
 pub use manager::{
     CacheBlockLease, CacheBlockPrefetch, CacheResidencyManager, LoadedPromptCacheStateTensor,
-    PromptCacheStateArray, load_prompt_cache_state_tensors, open_prompt_cache,
+    PromptCacheStateArray,
 };
 use manager::{
     CacheManagerState, load_host_cache_block_direct, update_report_totals, write_live_block,
 };
+pub(crate) use manager::{CacheTransferStreamError, PreparedCacheTransferStream, PromptCacheTail};
+pub(crate) use manager::{PromptCacheMaterialization, load_prompt_cache_state_tensors_funded};
 
 pub(crate) use manager::{
     CacheBlockSource, CacheBlockSourceLoan, CacheDiskSource, CacheSourceError, CacheSourceFailure,
@@ -460,24 +466,41 @@ pub(crate) use manager::{
 };
 
 pub(crate) use manager::{
-    CacheBlockMetadata, CatalogInstallFailure, InstalledManagerCatalog,
+    CacheBlockMetadata, CatalogInstallFailure, InstalledManagerCatalog, PreparedCacheDiscard,
     PreparedFloatingBlockMetadata, PreparedManagerCatalog,
 };
 
 pub(crate) use manager::{PagedArrayCopyLayout, PreparedPagedArrayCopy};
 
-pub(crate) use manager::{PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots};
+pub(crate) use manager::{
+    PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots, PreparedHostPromotion,
+    PreparedHostReturn, PreparedOrdinaryCacheHostPromotion,
+};
 
-pub(crate) use manager::{PreparedCacheHostDemotion, StoredCacheHostSource};
+pub(crate) use manager::{
+    PreparedCacheHostDemotion, PreparedCacheTransferSource, PreparedHostEviction,
+    PreparedOrdinaryCacheHostDemotion, StoredCacheHostSource,
+};
 
 pub(crate) use manager::PreparedDiskWrite;
 
-pub(crate) use manager::PreparedDiskWriteDestination;
+pub(crate) use manager::{OrdinaryWrittenCacheHostSource, PreparedDiskWriteHostRetirement};
+pub(crate) use manager::{PreparedCacheDiskWriteSource, PreparedDiskWriteDestination};
 
-pub(crate) use manager::{DiskWriteOperation, InstalledDiskWorker, PreparedDiskWorker};
+pub(crate) use manager::{
+    DiskWriteOperation, DiskWriteOperationFailure, InstalledDiskWorker, PreparedDiskWorker,
+};
 
 pub(crate) use manager::{DiskReadBinding, PreparedDiskReadDestination, disk_read_source_facts};
 
-pub(crate) use manager::{DiskReadOperation, PreparedDiskReadSource};
+pub(crate) use manager::{
+    DiskReadFinishFailure, DiskReadOperation, DiskReadOperationFailure, PreparedDiskReadSource,
+};
 
 pub(crate) use manager::PreparedInitialDiskReturn;
+pub(crate) use manager::{CacheHistoryOwner, PreparedCacheHistory};
+
+pub(crate) use manager::{OrdinaryDiskReadSource, OrdinaryReadCacheHostSource};
+
+#[cfg(test)]
+pub use manager::{load_prompt_cache_state_tensors, open_prompt_cache};

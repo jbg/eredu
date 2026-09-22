@@ -14,13 +14,14 @@ mod sampling;
 mod snapshot;
 pub use choice::{
     PreparedControllerCause, PreparedControllerDecision, PreparedControllerSource,
-    PreparedTokenChoiceError,
-    PreparedForbiddenDecision, PreparedPlainDecision, PreparedGrammarChoice, PreparedGrammarChoiceCause, PreparedGrammarChoiceError, TokenChoiceController, TokenChoiceError,
+    PreparedForbiddenDecision, PreparedGrammarChoice, PreparedGrammarChoiceCause,
+    PreparedGrammarChoiceError, PreparedPlainDecision, PreparedTokenChoiceError,
+    TokenChoiceController, TokenChoiceError,
 };
 pub use sampling::{
-    SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
-    ValidatedSamplingOverride, apply_prepared_sampling_override, apply_sampling_override,
-    validate_sampling_override, prepare_sampling_override,
+    apply_prepared_sampling_override, apply_sampling_override, prepare_sampling_override,
+    validate_sampling_override, SamplingOverride, SamplingOverrideError, SamplingStateFacts,
+    TextSamplingControlBackend, ValidatedSamplingOverride,
 };
 
 /// Logical owned storage of the audited serialized intervention request DTO.
@@ -32,9 +33,9 @@ pub fn intervention_plan_storage_bytes(
 }
 pub(crate) mod storage;
 pub use snapshot::{
-    ManagedTextContinuation, PendingSnapshotResumeRetention, PreparedTextHostCopy, PreparedTextHostJournal,
-    RetainedSnapshotBackendError, SamplingCopyPolicy, SnapshotTokenController, TextBranchRequest,
-    TextContinuationBranch, TextContinuationSnapshot, TextHostCopyError, TextSnapshotBackend,
+    ManagedTextContinuation, PendingSnapshotResumeRetention, PreparedTextHostCopy,
+    PreparedTextHostJournal, RetainedSnapshotBackendError, SamplingCopyPolicy,
+    SnapshotTokenController, TextContinuationSnapshot, TextHostCopyError, TextSnapshotBackend,
     TextSnapshotError,
 };
 
@@ -160,7 +161,10 @@ impl GenerationLifecycle {
     /// Completes termination without a newly committed prediction. Cancellation
     /// and an already complete semantic constraint use the same transition.
     /// Call only after verifying a completed, drained native boundary.
-    pub fn finish_without_prediction(&mut self, reason: FinishReason) -> Result<(), ExecutionControlError> {
+    pub fn finish_without_prediction(
+        &mut self,
+        reason: FinishReason,
+    ) -> Result<(), ExecutionControlError> {
         if self.status() != GenerationStatus::Running {
             return Err(self.invalid(GenerationStatus::Completed));
         }
@@ -194,7 +198,10 @@ impl GenerationLifecycle {
     /// cancelled branch. The native owner must separately prove quiescence.
     /// Copying or restoring a cancelled branch remains disallowed.
     pub fn validate_placement(&self) -> Result<(), ExecutionControlError> {
-        if matches!(self.status(), GenerationStatus::Running | GenerationStatus::Failed) {
+        if matches!(
+            self.status(),
+            GenerationStatus::Running | GenerationStatus::Failed
+        ) {
             return Err(self.invalid(GenerationStatus::Paused));
         }
         Ok(())
@@ -266,14 +273,22 @@ impl SnapshotBudget {
         funding: &eredu_core::HostMetadataFunding,
     ) -> Result<Self, eredu_core::HostMetadataFundingError> {
         use eredu_core::{HostMetadataFundingError as E, HostPreparationAuthority};
-        let bytes = Self::construction_bytes().ok_or(E::Unavailable)?
-            .checked_add(HostPreparationAuthority::retention_bytes::<eredu_core::HostMetadataFunding>()
-                .ok_or(E::Overflow)?)
+        let bytes = Self::construction_bytes()
+            .ok_or(E::Unavailable)?
+            .checked_add(
+                HostPreparationAuthority::retention_bytes::<eredu_core::HostMetadataFunding>()
+                    .ok_or(E::Overflow)?,
+            )
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Result<Self, E>>()))
-            .and_then(|bytes| bytes.checked_add(eredu_core::HostMetadataFunding::reservation_control_bytes()))
+            .and_then(|bytes| {
+                bytes.checked_add(eredu_core::HostMetadataFunding::reservation_control_bytes())
+            })
             .ok_or(E::Overflow)?;
         funding.reserve_metadata(bytes)?;
-        Ok(Self::new_with_host(limits, HostPreparationAuthority::retain(funding.clone())))
+        Ok(Self::new_with_host(
+            limits,
+            HostPreparationAuthority::retain(funding.clone()),
+        ))
     }
     fn inner(&self) -> &Arc<BudgetOwner> {
         self.0.as_ref().expect("live snapshot budget")

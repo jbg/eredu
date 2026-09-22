@@ -42,9 +42,17 @@ impl<'a> EmbeddedCaptureHostPlan<'a> {
             size_of::<Option<super::interventions::StepPlan<'_>>>(),
             size_of::<(&Self, &super::super::OriginalInterventionSource, &[bool])>(),
             size_of::<Result<(), CaptureAxisError>>(),
-            size_of::<Option<&[[Option<CaptureSkipReason>;2]]>>(),
-            size_of::<(&Self,&super::super::OriginalInterventionSource,&[bool],Option<&[[Option<CaptureSkipReason>;2]]>)>(),
-            size_of::<(&Self, &crate::working_memory::OriginalEmbeddedCaptureLineage)>(),
+            size_of::<Option<&[[Option<CaptureSkipReason>; 2]]>>(),
+            size_of::<(
+                &Self,
+                &super::super::OriginalInterventionSource,
+                &[bool],
+                Option<&[[Option<CaptureSkipReason>; 2]]>,
+            )>(),
+            size_of::<(
+                &Self,
+                &crate::working_memory::OriginalEmbeddedCaptureLineage,
+            )>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             CaptureRunLedger::inspection_control_bytes()?,
         ];
@@ -105,7 +113,10 @@ impl<'a> EmbeddedCaptureHostPlan<'a> {
                 .ok_or(WorkingMemoryError::Overflow)?,
             CaptureRunLedger::inspection_control_bytes().ok_or(WorkingMemoryError::Overflow)?,
             size_of::<(CaptureUsage, Option<CaptureUsage>)>(),
-            size_of::<(&Self, &crate::working_memory::OriginalEmbeddedCaptureLineage)>(),
+            size_of::<(
+                &Self,
+                &crate::working_memory::OriginalEmbeddedCaptureLineage,
+            )>(),
             size_of::<Result<(), WorkingMemoryError>>(),
         ];
         let controls = controls
@@ -139,26 +150,36 @@ impl<'a> EmbeddedCaptureHostPlan<'a> {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         lineage.validate_source(self.source)?;
-        self.peak = self.peak.checked_sub(CaptureRunLedger::control_bytes()?)
+        self.peak = self
+            .peak
+            .checked_sub(CaptureRunLedger::control_bytes()?)
             .ok_or(WorkingMemoryError::Overflow)?;
         self.lineage = Some(lineage);
         Ok(self)
     }
-    pub(in crate::working_memory) fn lineage(&self) -> Option<&crate::working_memory::OriginalEmbeddedCaptureLineage> {
+    pub(in crate::working_memory) fn lineage(
+        &self,
+    ) -> Option<&crate::working_memory::OriginalEmbeddedCaptureLineage> {
         self.lineage
     }
     /// Add exact source-owned static activation outcomes to this model role.
     /// The scope mask is copied only by the funded constructor. The native
     /// consumer still must quote/validate the actual shape, dtype and edit work.
-    pub fn with_interventions(self,source:&'a super::super::OriginalInterventionSource,selected:&'a [bool])->Result<Self,CaptureRunHostError> {
-        self.with_intervention_evidence(source,selected,None)
+    pub fn with_interventions(
+        self,
+        source: &'a super::super::OriginalInterventionSource,
+        selected: &'a [bool],
+    ) -> Result<Self, CaptureRunHostError> {
+        self.with_intervention_evidence(source, selected, None)
     }
     /// Same source/mask with exact logical evidence skip rows from the retained
     /// invocation. The funded constructor copies this metadata into its bank.
     pub fn with_intervention_evidence(
-        mut self,source:&'a super::super::OriginalInterventionSource,selected:&'a [bool],
-        skipped:Option<&'a [[Option<CaptureSkipReason>;2]]>,
-    )->Result<Self,CaptureRunHostError> {
+        mut self,
+        source: &'a super::super::OriginalInterventionSource,
+        selected: &'a [bool],
+        skipped: Option<&'a [[Option<CaptureSkipReason>; 2]]>,
+    ) -> Result<Self, CaptureRunHostError> {
         if self.intervention.is_some() {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
@@ -211,7 +232,7 @@ impl<'a> EmbeddedCaptureHostPlan<'a> {
     pub(in crate::working_memory) fn validate(
         &self,
         workspace: EmbeddedInvocationWorkspace,
-        pool: &super::super::WorkingMemoryPool,
+        pool: &super::super::MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         if self.workspace != workspace {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -256,44 +277,86 @@ impl PreparedEmbeddedCapture<'_> {
             lineage,
         } = self;
         let custody = role.budget_custody();
-        let result = (|| {
-            role.validate_invocation(plan.workspace.invocation())?;
-            plan.source.validate_pool(custody.pool())?;
-            if let Some(intervention) = &plan.intervention {
-                intervention.source.validate_pool(custody.pool())?;
-            }
-            let run = super::construct_selected(
-                plan.run,
-                plan.intervention.as_ref().map(|plan| plan.source),
-                plan.intervention.as_ref().and_then(|plan| plan.selected),
-                plan.intervention.as_ref().and_then(|plan| plan.evidence_skips),
-                CaptureTensorCustody::Model(custody.clone()),
-            )?;
-            Ok(crate::capture::FundedEmbeddedCaptureInvocation::from_run(
-                run,
-                lineage,
-                plan.source.clone(),
-                role,
-                plan.origin,
-            ))
-        })();
-        result.map_err(|cause| EmbeddedCapturePreparationError {
-            cause,
-            _custody: custody,
-        })
+        role.validate_invocation(plan.workspace.invocation())
+            .map_err(|cause| ModelCapturePreparationError {
+                cause: cause.into(),
+                _custody: custody.clone(),
+            })?;
+        construct_model(
+            plan.run,
+            plan.intervention,
+            lineage,
+            plan.source,
+            role,
+            plan.origin,
+            custody,
+        )
+    }
+}
+/// Typed refusal from the shared frame or its source-bound fragment constructor.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelCapturePreparationCause {
+    /// The shared frame, claim or fixed Host constructor refused.
+    #[error(transparent)]
+    Host(#[from] CaptureRunHostError),
+    /// A source-bound fragment constructor refused and retains its paid prefix.
+    #[error(transparent)]
+    Fragment(#[from] crate::working_memory::PartitionFragmentHostPreparationError),
+}
+impl From<WorkingMemoryError> for ModelCapturePreparationCause {
+    fn from(value: WorkingMemoryError) -> Self {
+        Self::Host(value.into())
     }
 }
 /// Original host construction failure retaining its exact model account.
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
-pub struct EmbeddedCapturePreparationError {
+pub struct ModelCapturePreparationError {
     #[source]
-    cause: CaptureRunHostError,
-    _custody: OriginalSpeculativeBudgetCustody,
+    pub(super) cause: ModelCapturePreparationCause,
+    pub(super) _custody: OriginalSpeculativeBudgetCustody,
 }
-impl EmbeddedCapturePreparationError {
+/// Embedded constructor failure retaining the same accepted model account.
+pub type EmbeddedCapturePreparationError = ModelCapturePreparationError;
+impl ModelCapturePreparationError {
     /// Original typed cause; inspecting it returns no reusable authority.
-    pub fn cause(&self) -> &CaptureRunHostError {
+    pub fn cause(&self) -> &ModelCapturePreparationCause {
         &self.cause
     }
+}
+
+/// Both model schedules enter the same host constructor with their actual role.
+pub(super) fn construct_model<R>(
+    plan: CaptureRunHostPlan<'_>,
+    intervention: Option<super::interventions::StepPlan<'_>>,
+    lineage: CaptureRunLedger,
+    source: &OriginalCaptureSource,
+    role: R,
+    origin: SpeculativeActivationOrigin,
+    custody: OriginalSpeculativeBudgetCustody,
+) -> Result<crate::capture::FundedModelCaptureInvocation<R>, ModelCapturePreparationError> {
+    let result = (|| -> Result<_, CaptureRunHostError> {
+        source.validate_pool(custody.pool())?;
+        if let Some(intervention) = &intervention {
+            intervention.source.validate_pool(custody.pool())?;
+        }
+        let run = super::construct_selected(
+            plan,
+            intervention.as_ref().map(|plan| plan.source),
+            intervention.as_ref().and_then(|plan| plan.selected),
+            intervention.as_ref().and_then(|plan| plan.evidence_skips),
+            CaptureTensorCustody::Model(custody.clone()),
+        )?;
+        Ok(crate::capture::FundedModelCaptureInvocation::from_run(
+            run,
+            lineage,
+            source.clone(),
+            role,
+            origin,
+        ))
+    })();
+    result.map_err(|cause| ModelCapturePreparationError {
+        cause: cause.into(),
+        _custody: custody,
+    })
 }

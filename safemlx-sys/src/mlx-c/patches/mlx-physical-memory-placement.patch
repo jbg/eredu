@@ -1,0 +1,161 @@
+diff --git a/mlx/allocator.h b/mlx/allocator.h
+--- a/mlx/allocator.h
++++ b/mlx/allocator.h
+@@ -60,6 +60,16 @@
+     return ptr_;
+   };
+ };
++
++// Allocation placement is read from the backing mechanism, never a stream.
++// Managed candidates are host plus every registered GPU [0, device_count).
++struct MemoryPlacement {
++  uint32_t kind{0}; // 0 unknown, 1 host, 2 fixed device, 3 CUDA managed
++  int32_t device{-1};
++  uint32_t device_count{0};
++};
++MLX_API MemoryPlacement memory_placement(Buffer) noexcept;
++MLX_API bool memory_device_shares_host(int device);
+ 
+ class Allocator;
+ // Alternate ordinary allocation contracts have not joined the bound budget.
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -451,3 +451,8 @@
+ namespace mlx::core::allocator {
+ bool original_buffer_zero_has_backing(bool& out) noexcept { out = true; return true; }
+ }
++
++namespace mlx::core::allocator {
++MemoryPlacement memory_placement(Buffer) noexcept { return {1, -1, 0}; }
++bool memory_device_shares_host(int) { return false; }
++} // namespace mlx::core::allocator
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -468,3 +468,17 @@
+ namespace mlx::core::allocator {
+ bool original_buffer_zero_has_backing(bool& out) noexcept { out = false; return true; }
+ }
++
++namespace mlx::core::allocator {
++MemoryPlacement memory_placement(Buffer buffer) noexcept {
++  auto* backing = static_cast<MTL::Buffer*>(buffer.ptr());
++  if (!backing) return {1, -1, 0};
++  // Shared storage physically resides in host memory on discrete devices too.
++  if (backing->storageMode() == MTL::StorageModeShared) return {1, -1, 0};
++  if (backing->storageMode() == MTL::StorageModePrivate) return {2, 0, 0};
++  return {}; // Managed Metal resources need both copies attributed explicitly.
++}
++bool memory_device_shares_host(int index) {
++  return index == 0 && metal::device(mlx::core::Device::gpu).mtl_device()->hasUnifiedMemory();
++}
++} // namespace mlx::core::allocator
+diff --git a/mlx/backend/cuda/allocator.h b/mlx/backend/cuda/allocator.h
+--- a/mlx/backend/cuda/allocator.h
++++ b/mlx/backend/cuda/allocator.h
+@@ -21,7 +21,8 @@
+ struct CudaBuffer {
+   void* data;
+   size_t size;
+-  int device; // -1 for managed
++  int device; // -1 for managed or pinned host
++  allocator::MemoryPlacement placement{};
+ };
+ 
+ class SmallSizePool {
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -140,6 +140,8 @@
+   b->buf.data = static_cast<char*>(data_) + i * small_block_size;
+   b->buf.size = small_block_size;
+   b->buf.device = -1;
++  b->buf.placement = {supports_managed_memory() ? 3u : 1u, -1,
++      supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u};
+   return &b->buf;
+ }
+ 
+@@ -230,7 +232,10 @@
+         msg << "[malloc] Unable to allocate " << size << " bytes.";
+         throw std::runtime_error(msg.str());
+       }
+-      buf = new CudaBuffer{data, size, device};
++      buf = new CudaBuffer{data, size, device,
++          device >= 0 ? allocator::MemoryPlacement{2, device, 0}
++          : allocator::MemoryPlacement{supports_managed_memory() ? 3u : 1u, -1,
++              supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u}};
+     }
+     lock.lock();
+ 
+@@ -283,7 +288,10 @@
+   } else {
+     CHECK_CUDA_ERROR(cudaMallocHost(&data, allocation_size));
+   }
+-  return Buffer{new CudaBuffer{data, allocation_size, -1}};
++  return Buffer{new CudaBuffer{data, allocation_size, -1,
++      {policy == allocator::HostTransferPolicy::managed ? 3u : 1u, -1,
++       policy == allocator::HostTransferPolicy::managed
++           ? static_cast<uint32_t>(gpu::device_count()) : 0u}}};
+ }
+ 
+ void CudaAllocator::free_host_transfer(
+@@ -361,6 +369,8 @@
+   }
+   buf.data = data;
+   buf.device = -1;
++  buf.placement = {supports_managed_memory() ? 3u : 1u, -1,
++      supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u};
+ }
+ 
+ // This must be called with mutex_ acquired
+@@ -512,3 +522,18 @@
+ namespace mlx::core::allocator {
+ bool original_buffer_zero_has_backing(bool& out) noexcept { return false; }
+ }
++
++namespace mlx::core::allocator {
++MemoryPlacement memory_placement(Buffer buffer) noexcept {
++  auto* backing = static_cast<const cu::CudaBuffer*>(buffer.ptr());
++  return backing && backing->data ? backing->placement : MemoryPlacement{1, -1, 0};
++}
++bool memory_device_shares_host(int index) {
++  // CUDA exposes independent allocation domains. Integrated-device sharing is
++  // accepted only when the runtime explicitly reports an integrated GPU.
++  int integrated = 0;
++  if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, index) != cudaSuccess)
++    throw std::runtime_error("Unable to establish CUDA physical memory topology.");
++  return integrated != 0;
++}
++} // namespace mlx::core::allocator
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -22,6 +22,7 @@
+ 
+ /** Exact physical host-transfer owner, retained by a buffer or array. */
+ struct MLX_API HostTransferAllocationInfo {
++  allocator::MemoryPlacement placement;
+   uint64_t identity;
+   size_t capacity;
+   bool prepared_source;
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -337,6 +337,7 @@
+     return std::nullopt;
+   }
+   return HostTransferAllocationInfo{
++      allocator::memory_placement(retained->owner->buffer()),
+       retained->owner->allocation_generation(), retained->owner->capacity(),
+       retained->owner->prepared_source()};
+ }
+@@ -381,7 +382,7 @@
+ 
+ std::optional<HostTransferAllocationInfo> HostTransferBuffer::allocation_info() const noexcept {
+   if (!storage_ || !storage_->allocation_generation()) return std::nullopt;
+-  return HostTransferAllocationInfo{storage_->allocation_generation(),
++  return HostTransferAllocationInfo{allocator::memory_placement(storage_->buffer()), storage_->allocation_generation(),
+       storage_->capacity(), storage_->prepared_source()};
+ }
+ 

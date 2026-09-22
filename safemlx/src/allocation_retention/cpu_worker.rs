@@ -246,6 +246,8 @@ impl InitializedCpuWorker {
     }
 
     /// Authenticate the same worker source without creating a worker or task.
+    /// This immutable identity check is valid inside either execution mode; it
+    /// grants no submission, completion, or allocation authority.
     pub fn try_borrow(&self) -> Result<(), CpuWorkerCause> {
         let Some(_loan) = runtime_lock::try_enter_for_recovery() else {
             return Err(CpuWorkerCause::Busy);

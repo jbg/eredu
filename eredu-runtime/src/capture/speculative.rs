@@ -10,9 +10,11 @@ use std::{cell::RefCell, collections::VecDeque};
 
 mod control;
 mod original;
+pub(crate) use original::requires_sequence_readout;
 pub use original::{
     OriginalSpeculativeCapture, OriginalSpeculativeCaptureError,
     OriginalSpeculativeCaptureInvocation, OriginalSpeculativeCapturePrefix,
+    OriginalSpeculativeCapturePreview, OriginalSpeculativeCaptureProspect,
 };
 mod observer;
 mod provider;
@@ -338,13 +340,22 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
                     self.next_invocation,
                 )?;
                 let delivery = if group.is_some() {
-                    use eredu_core::{HostPreparationAuthority, speculative::PreparedSpeculativePrefillReductions};
+                    use eredu_core::{
+                        HostPreparationAuthority, speculative::PreparedSpeculativePrefillReductions,
+                    };
                     let host = self.session.owner.retained()?;
-                    let bytes = PreparedSpeculativePrefillReductions::retained_control_bytes::<HostPreparationAuthority>()
-                        .ok_or(CaptureError::Overflow)?;
-                    self.session.ledger.reserve_quota(CaptureUsage { host_bytes: bytes, ..Default::default() })?;
+                    let bytes = PreparedSpeculativePrefillReductions::retained_control_bytes::<
+                        HostPreparationAuthority,
+                    >()
+                    .ok_or(CaptureError::Overflow)?;
+                    self.session.ledger.reserve_quota(CaptureUsage {
+                        host_bytes: bytes,
+                        ..Default::default()
+                    })?;
                     Some(PreparedSpeculativePrefillReductions::retain(host))
-                } else { None };
+                } else {
+                    None
+                };
                 self.reductions = group;
                 self.reduction_delivery = delivery;
             }
@@ -434,7 +445,9 @@ where
     fn finish_prefill_reductions(&mut self, success: bool) {
         let had_reductions = self.reductions.is_some();
         let report = self.reductions.take().map(|group| {
-            self.reduction_delivery.take().expect("prepared reduction owner")
+            self.reduction_delivery
+                .take()
+                .expect("prepared reduction owner")
                 .finish(group.finish(success))
         });
         if let Some(mut last) = self.held_prefill.take() {
@@ -525,7 +538,9 @@ where
         let step = self.session.take_step_inner();
         if let (Some((invocation, origin, phase)), Some(mut captures)) = (self.active.take(), step)
         {
-            if !success { captures.outcome = CaptureStepOutcome::Aborted; }
+            if !success {
+                captures.outcome = CaptureStepOutcome::Aborted;
+            }
             if let Some(group) = &mut self.reductions {
                 group.finish_window(
                     &captures.records,

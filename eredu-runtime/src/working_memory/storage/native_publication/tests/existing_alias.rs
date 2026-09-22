@@ -3,8 +3,8 @@ use super::*;
 #[test]
 fn canonical_alias_derives_closed_donor_origin_and_survives_both_final_drop_orders() {
     for drop_donor_first in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
-        let namespace = pool.register_storage([(0u32, 0)]).unwrap();
+        let pool = test_ledger(1_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(0u32, 0)]).unwrap();
         let (a, ar, ap) = account(&pool);
         let a_scope = ar.scope().unwrap();
         let donor = publish(&ap, &a_scope, vec![test_native(1, 64, &ap)]);
@@ -12,7 +12,7 @@ fn canonical_alias_derives_closed_donor_origin_and_survives_both_final_drop_orde
         // No original installation pair, explicit partition alias or live A
         // execution is available when B recognizes this existing allocation.
         drop((ar, a, ap));
-        assert_eq!(balances(&pool), (100, 0));
+        assert_eq!(balances(&pool), (36, 64));
         let (b, br, bp) = account(&pool);
         let b_scope = br.scope().unwrap();
         let aliases = publish(
@@ -21,21 +21,21 @@ fn canonical_alias_derives_closed_donor_origin_and_survives_both_final_drop_orde
             vec![test_existing_native(1, 64), test_existing_native(1, 64)],
         );
         assert_eq!(aliases.len(), 1);
-        assert_eq!(aliases[0].bytes(), 64);
-        assert_eq!(balances(&pool), (300, 0));
+        assert_eq!(aliases[0].bytes(), Some(64));
+        assert_eq!(balances(&pool), (236, 64));
         b_scope.certify().unwrap();
         drop((br, b, bp));
-        assert_eq!(pool.used_bytes().unwrap(), 100);
+        assert_eq!(pool.native_payload_bytes().unwrap(), 100);
         if drop_donor_first {
             drop(donor);
-            assert_eq!(pool.used_bytes().unwrap(), 100);
+            assert_eq!(pool.native_payload_bytes().unwrap(), 100);
             drop(aliases);
         } else {
             drop(aliases);
-            assert_eq!(pool.used_bytes().unwrap(), 100);
+            assert_eq!(pool.native_payload_bytes().unwrap(), 100);
             drop(donor);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.native_payload_bytes().unwrap(), 0);
         assert!(pool.0.usage.lock().unwrap().funding.is_empty());
         drop(namespace);
     }
@@ -43,8 +43,8 @@ fn canonical_alias_derives_closed_donor_origin_and_survives_both_final_drop_orde
 
 #[test]
 fn existing_route_refuses_missing_ordinary_and_same_batch_new_birth_without_committing_prefix() {
-    let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
-    let ordinary = pool.register_storage([(7u32, 64)]).unwrap();
+    let pool = test_ledger(1_000, 0).unwrap();
+    let ordinary = pool.register_host_storage([(7u32, 64)]).unwrap();
     let (metadata, run, partition) = account(&pool);
     let scope = run.scope().unwrap();
     let cases = [
@@ -73,13 +73,13 @@ fn existing_route_refuses_missing_ordinary_and_same_batch_new_birth_without_comm
     }
     scope.certify().unwrap();
     drop((run, metadata, partition, ordinary));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.native_payload_bytes().unwrap(), 0);
 }
 
 #[test]
 fn mixed_duplicate_native_claims_use_canonical_origin_and_charge_only_new_ordinary_storage() {
-    let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
-    let namespace = pool.register_storage([(0u32, 0)]).unwrap();
+    let pool = test_ledger(1_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(0u32, 0)]).unwrap();
     let (a, ar, ap) = account(&pool);
     let (b, br, bp) = account(&pool);
     let a_scope = ar.scope().unwrap();
@@ -94,8 +94,8 @@ fn mixed_duplicate_native_claims_use_canonical_origin_and_charge_only_new_ordina
         duplicate.push(NativePublicationInput::Ordinary(2, 30));
         let result = publish(&bp, &b_scope, duplicate);
         assert_eq!(result.len(), 2);
-        assert_eq!((result[0].bytes(), result[1].bytes()), (64, 30));
-        assert_eq!(balances(&pool), (370, 30));
+        assert_eq!((result[0].bytes(), result[1].bytes()), (Some(64), Some(30)));
+        assert_eq!(balances(&pool), (306, 94));
         aliases.push(result);
     }
     for existing_first in [false, true] {
@@ -115,19 +115,19 @@ fn mixed_duplicate_native_claims_use_canonical_origin_and_charge_only_new_ordina
                 Err(WorkingMemoryError::IdentityMismatch)
             );
             assert!(attempt.take(0).is_none());
-            assert_eq!(balances(&pool), (370, 30));
+            assert_eq!(balances(&pool), (306, 94));
         }
     }
     a_scope.certify().unwrap();
     b_scope.certify().unwrap();
     drop((aliases, donor, ar, br, a, b, ap, bp, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.native_payload_bytes().unwrap(), 0);
 }
 
 #[test]
 fn existing_alias_capacity_mismatch_retains_typed_cause_and_does_not_publish_ordinary_prefix() {
-    let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
-    let namespace = pool.register_storage([(0u32, 0)]).unwrap();
+    let pool = test_ledger(1_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(0u32, 0)]).unwrap();
     let (a, ar, ap) = account(&pool);
     let (b, br, bp) = account(&pool);
     let a_scope = ar.scope().unwrap();
@@ -147,20 +147,20 @@ fn existing_alias_capacity_mismatch_retains_typed_cause_and_does_not_publish_ord
             actual_bytes: 65,
         })
     );
-    assert_eq!(balances(&pool), (400, 0));
+    assert_eq!(balances(&pool), (336, 64));
     assert!(attempt.take(0).is_none());
     assert!(pool.pin_registered_storage([(2u32, 30)]).is_err());
     a_scope.certify().unwrap();
     b_scope.certify().unwrap();
     drop((attempt, donor, ar, br, a, b, ap, bp, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.native_payload_bytes().unwrap(), 0);
 }
 
 #[test]
 fn canonical_alias_checks_donor_and_publisher_health_independently() {
     for quarantine_donor in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
-        let namespace = pool.register_storage([(0u32, 0)]).unwrap();
+        let pool = test_ledger(1_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(0u32, 0)]).unwrap();
         let (a, ar, ap) = account(&pool);
         let (b, br, bp) = account(&pool);
         let a_scope = ar.scope().unwrap();
@@ -177,19 +177,19 @@ fn canonical_alias_checks_donor_and_publisher_health_independently() {
             attempt.publish(&b_scope),
             Err(WorkingMemoryError::ExecutionFenced)
         );
-        assert_eq!(balances(&pool), (400, 0));
+        assert_eq!(balances(&pool), (336, 64));
         assert!(attempt.take(0).is_none());
         a_scope.certify().unwrap();
         b_scope.certify().unwrap();
         drop((attempt, donor, ar, br, a, b, ap, bp, namespace));
-        assert_eq!(pool.used_bytes().unwrap(), 200);
+        assert_eq!(pool.native_payload_bytes().unwrap(), 200);
     }
 }
 
 #[test]
 fn derived_donor_custody_survives_later_refusal_and_unlocked_provider_retirement() {
     for panic_on_drop in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
+        let pool = test_ledger(1_000, 0).unwrap();
         let events = Arc::new(Events {
             pool: pool.clone(),
             armed: AtomicBool::new(false),
@@ -216,7 +216,7 @@ fn derived_donor_custody_survives_later_refusal_and_unlocked_provider_retirement
                 events.clone()
             },
         };
-        let namespace = pool.register_storage([(key(0), 0)]).unwrap();
+        let namespace = pool.register_host_storage([(key(0), 0)]).unwrap();
         let (a, ar, ap) = account(&pool);
         let (b, br, bp) = account(&pool);
         let a_scope = ar.scope().unwrap();
@@ -238,14 +238,14 @@ fn derived_donor_custody_survives_later_refusal_and_unlocked_provider_retirement
             Err(WorkingMemoryError::IdentityMismatch)
         );
         assert!(attempt.take(0).is_none());
-        assert_eq!(balances(&pool), (400, 0));
+        assert_eq!(balances(&pool), (336, 64));
         a_scope.certify().unwrap();
         b_scope.certify().unwrap();
         let retained_donor = panic_on_drop.then(|| ap.clone());
         drop((donor, ar, br, a, b, ap, bp));
         // The canonical row and both original request owners are gone. The
         // failed transaction itself still pins A while its provider keys live.
-        assert_eq!(pool.used_bytes().unwrap(), 200);
+        assert_eq!(pool.native_payload_bytes().unwrap(), 200);
         events.armed.store(true, AtomicOrdering::SeqCst);
         missing_events.armed.store(true, AtomicOrdering::SeqCst);
         events
@@ -262,9 +262,9 @@ fn derived_donor_custody_survives_later_refusal_and_unlocked_provider_retirement
             );
             drop(usage);
             drop(alias);
-            assert_eq!(pool.used_bytes().unwrap(), 200);
+            assert_eq!(pool.native_payload_bytes().unwrap(), 200);
         } else {
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.native_payload_bytes().unwrap(), 0);
         }
         drop(namespace);
     }

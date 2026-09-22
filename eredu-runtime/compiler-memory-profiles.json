@@ -1,0 +1,162 @@
+{
+  "release": "1.98.0",
+  "commit": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
+  "manifest": "https://static.rust-lang.org/dist/channel-rust-1.98.0.toml",
+  "archives": [
+    {
+      "package": "rustc",
+      "target": "x86_64-unknown-linux-gnu",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rustc-1.98.0-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "0e37cb339f447fc44d6d781073bacacebfdc5612f2600e4c7e84c266f5f3aced",
+      "files": [
+        {
+          "path": "rustc/bin/rustc",
+          "sha256": "3690cc576ede140504698405d5d8fa3826aaadbe71699c6c4ed0a565d6f493e2"
+        },
+        {
+          "path": "rustc/lib/librustc_driver-28a98848f7a7c026.so",
+          "sha256": "56047570f302ba09b1abf3b2996bd1d76560c06f3c95c0fcfa7dc3decd2faa2c"
+        }
+      ]
+    },
+    {
+      "package": "rustc",
+      "target": "x86_64-pc-windows-msvc",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rustc-1.98.0-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "a29cdefc01c747e15270ec64878adba4b0a88afaa7f19e3abf9231106fbd381b",
+      "files": [
+        {
+          "path": "rustc/bin/rustc.exe",
+          "sha256": "777119d5feeca3d9fc163dc0e0d8be896cfcb65c45255328cef214d833546c6a"
+        },
+        {
+          "path": "rustc/bin/rustc_driver-7a414a5d7a84f668.dll",
+          "sha256": "57dc9e3d7476497b1e643febf6851f75854c9341e8fcb2feb3a2d0792e67dd8a"
+        }
+      ]
+    },
+    {
+      "package": "rust-std",
+      "target": "x86_64-unknown-linux-gnu",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rust-std-1.98.0-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "f5022e6c95a5ad23cca2513dc8281200f585fa188de6370aa37b128a43f876a3",
+      "files": [
+        {
+          "path": "rust-std-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-2e38004a9ef1deab.rlib",
+          "sha256": "c72b308614b215194d09d3bb7369dfd9acd33225333dd44b85574d7af726403f"
+        },
+        {
+          "path": "rust-std-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/liballoc-ca14532e0afe7a5d.rlib",
+          "sha256": "2730ec537c47f62737c175c0fa8f43c60636c5887da80933be1b3c91ac708401"
+        }
+      ]
+    },
+    {
+      "package": "rust-std",
+      "target": "x86_64-pc-windows-msvc",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rust-std-1.98.0-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "81d123f834111ebeaf8b1eed0e93b0b66ea4bcf4cc1d3836d9a0314d4ea94a73",
+      "files": [
+        {
+          "path": "rust-std-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/lib/liballoc-4156d10c4dacbf83.rlib",
+          "sha256": "3bb0b9d4e5fc6db6d4a8d748dbc5c07b030a2bbdb426cc277970a2f5bb032b8f"
+        },
+        {
+          "path": "rust-std-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/lib/libstd-f01d16aa207effe6.rlib",
+          "sha256": "1bab1898f49a7dafbd6f23fb021d16bf02bb883337c35fd2899f679cdac8fdaa"
+        }
+      ]
+    },
+    {
+      "package": "rust-src",
+      "target": "*",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rust-src-1.98.0.tar.xz",
+      "sha256": "0e977492aed5ff137815bf9b4b796e8a85b80fb2367ed64e82d5c5839870f2bf",
+      "files": []
+    },
+    {
+      "package": "rustc",
+      "target": "aarch64-apple-darwin",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rustc-1.98.0-aarch64-apple-darwin.tar.xz",
+      "sha256": "287edbc2e285b9c23ef7b085413b90cb8539909eda9c4b49f2a55ec0b52819d4",
+      "files": "Qualified installed artifact digests are in build.rs."
+    },
+    {
+      "package": "rust-std",
+      "target": "aarch64-apple-darwin",
+      "url": "https://static.rust-lang.org/dist/2026-08-20/rust-std-1.98.0-aarch64-apple-darwin.tar.xz",
+      "sha256": "48c05269ed36fb5f0a8438065156891fe59fcb868d90cfed9b7209540d54b2ce",
+      "files": "Qualified installed artifact digests are in build.rs."
+    }
+  ],
+  "reviewed_source_files": [
+    {
+      "path": "library/alloc/src/alloc.rs",
+      "sha256": "699c02fe7844cd9490905545e503fec56552be2a34d50a79242852739483889b"
+    },
+    {
+      "path": "library/alloc/src/vec/mod.rs",
+      "sha256": "09171c3c4c767a5c0716a85786f7670e5e149f75325fc1b27f5dbce14f16711f"
+    },
+    {
+      "path": "library/alloc/src/raw_vec/mod.rs",
+      "sha256": "a262b9e494236a00270be0dd0c57be5259d62bc1e538c56506f7f0ce8debccc0"
+    },
+    {
+      "path": "library/alloc/src/slice.rs",
+      "sha256": "b1f0a5f6e3d104d6176699cf05efdfe1725095cd984fdf4422ddc3093726361c"
+    },
+    {
+      "path": "library/alloc/src/sync.rs",
+      "sha256": "5df6230fefb967e2059a97de56d50bf2452f4805b22009f603faaa89c027a0d1"
+    },
+    {
+      "path": "library/alloc/src/rc.rs",
+      "sha256": "eca4c0e4167b883ac1d5d1396f9e3e4209228fc9d92968d06f202411b10f84e0"
+    },
+    {
+      "path": "library/alloc/src/wtf8/mod.rs",
+      "sha256": "0a1250f80ba7b052502eee04f23770fc7619054e5641f94a26bfa4375d82cfd1"
+    },
+    {
+      "path": "library/std/src/sys/os_str/bytes.rs",
+      "sha256": "b8db748fa98d57b9c5358dd0ad48c4950691defea188786b0d17c2c23533a721"
+    },
+    {
+      "path": "library/std/src/sys/os_str/wtf8.rs",
+      "sha256": "1345f107303fe61afd5e2465c9c6c52c592348cfcc6290a867f4f9ea25e07678"
+    },
+    {
+      "path": "library/std/src/sys/sync/mutex/mod.rs",
+      "sha256": "1c715675a2bc34471b96de58f7aaaf2db411289cf838d17edc61cb2d6b006aa2"
+    },
+    {
+      "path": "library/std/src/sys/sync/mutex/futex.rs",
+      "sha256": "bb566c9097ec2c4478427de576e5335b7dfb60a2ff41f24beae2eea99d3209bf"
+    },
+    {
+      "path": "library/std/src/sys/sync/mutex/pthread.rs",
+      "sha256": "1aa80435780abe34a365179635e92fb5935894fb9b4f615eb45b336958c28035"
+    },
+    {
+      "path": "library/std/src/sys/sync/condvar/mod.rs",
+      "sha256": "af88b86441a57ae779ae0a01528bc4e8b0068f1e72978547c1a08ac4d7107c2d"
+    },
+    {
+      "path": "library/std/src/sys/sync/condvar/futex.rs",
+      "sha256": "18037d0dbba53a96fac7331308bb34bb5e3ab99c71256d305086cb71e29a9aa1"
+    },
+    {
+      "path": "library/std/src/sys/sync/condvar/pthread.rs",
+      "sha256": "515dac39964e931abbcf56fa963254adab34cbd7a76916ccd03fd4d863acfd4f"
+    },
+    {
+      "path": "library/std/src/sys/pal/unix/sync/mutex.rs",
+      "sha256": "1df3c112f84ccfa7ff048aa88a604dc6029b405f59e0aa96d35381b589aa9b17"
+    },
+    {
+      "path": "library/std/src/sys/pal/unix/sync/condvar.rs",
+      "sha256": "d9ee3e1dfed50235c9c3963f6a585aa359b6d2cb8cc524e27295c6ed8e1a6804"
+    }
+  ]
+}

@@ -55,7 +55,7 @@ TEST_CASE("CPU original empty Slice retires source backing while its zero Data s
   unsigned retired=0;
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void* p){++*static_cast<unsigned*>(p);})==0);
+      [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> source,escaped;
   mlx_original_buffer_population_layout zero{};
   REQUIRE(mlx_original_buffer_request_layout_for(&zero,runtime,0)==0);
@@ -103,7 +103,7 @@ TEST_CASE("CPU empty Slice admits exact allocator backing and refuses one byte s
     unsigned retired=0;
     struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,
-        physical.capacity-size_t(short_budget),&retired,[](void* p){++*static_cast<unsigned*>(p);})==0);
+        physical.capacity-size_t(short_budget),&retired,[](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);

@@ -13,8 +13,8 @@ use eredu_text::stop_storage::{OwnedStopStorage, PreparedStopSource, StopStorage
 use std::{
     any::Any,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -270,7 +270,7 @@ impl OriginalGenerationDecoderSource {
     /// inputs retain their fixed typed rejection without consuming the source.
     pub fn take_original(
         claim: &GenerationSequencePreparation<'_, '_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Option<Self>, BackendFailure> {
         DecoderBinding::terminal_text_bytes(claim).map_err(|_| {
             GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure()
@@ -318,7 +318,7 @@ impl OriginalGenerationDecoderSource {
             .map(Some)
             .ok_or_else(|| GenerationSequenceBankRejection::Unavailable.into_backend_failure())
     }
-    pub(super) fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub(super) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.storage.validate_pool(pool)?;
         if let Some(stops) = &self.stops {
             stops.validate_pool(pool)?;
@@ -379,7 +379,7 @@ fn input_binding(input: &dyn GenerationDecoderInput) -> Option<DecoderBinding> {
                 .map(|i| i.binding)
         })
 }
-pub(super) use crate::working_memory::decoder_transition::{transition_error, stop_error};
+pub(super) use crate::working_memory::decoder_transition::{stop_error, transition_error};
 
 impl OriginalGenerationDecoderSource {
     pub(super) fn copy_required_bytes(&self) -> Option<usize> {

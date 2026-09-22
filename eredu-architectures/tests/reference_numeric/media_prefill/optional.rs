@@ -506,7 +506,7 @@ fn partition_case_with_input(
             let report=actual.media_prefill.as_mut().unwrap()(input,schedule).unwrap();trace_with_vision_rows(family,&report,schedule,rank_topology.owns_output_head(),rank_topology.owns_embedding(),image,audio,vision_rows);same_state(&report.state,&before);
             if cancel_after!=Some(2){same_encoder_trace(family,&encoders(family,&report.trace.projections[0]),&original_encoders);}
             if let Some(output)=&report.output{nonzero(output);assert_tensor_close(output,expected.as_ref().unwrap(),"optional-media selected ordinary versus shared");}
-            assert_eq!(report.cached.len(),3);for(token,output)in [2,6,1].into_iter().zip(&report.cached){let expected=reference.forward(&numeric_text_prepared_input(&[token]),false).unwrap();nonzero(output);assert_tensor_close(output,&expected,"optional-media cancelled-prefix cached state");}same_state(&report.final_state,&reference.snapshot().unwrap());report
+            assert_eq!(report.cached.len(),3);for(token,output)in [2,6,1].into_iter().zip(&report.cached){let expected=if token==2&&cancel_after.is_some(){(reference.restart_after_cancel)(token,cancel_after.unwrap()).unwrap()}else{reference.forward(&numeric_text_prepared_input(&[token]),false).unwrap()};nonzero(output);assert_tensor_close(output,&expected,"optional-media cancelled-prefix cached state");}same_state(&report.final_state,&reference.snapshot().unwrap());report
         }).expect("spawn reference optional-media rank worker")}).collect::<Vec<_>>();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });

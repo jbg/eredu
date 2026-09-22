@@ -155,7 +155,9 @@ impl InferenceWorkspaceObserver for Observer {
         let position = match span {
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.position,
             InferenceWorkspaceSpan::Decode { position, .. } => *position,
-            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
+            InferenceWorkspaceSpan::Sampling(_) => {
+                unreachable!("model equation scheduler emits only prefill/decode spans")
+            }
         };
         context.validate_values(self.retained.iter())?;
         self.spans.push((prediction, position));
@@ -195,9 +197,11 @@ fn cause<'a, T: std::error::Error + 'static>(
 #[test]
 fn actual_resident_and_layerwise_equations_bind_shared_paths_map_origin_and_keep_full_logits() {
     let (artifact, values) = prepared_adapter::payload_fixture_config(&model_config(), 1.0);
-    assert!(values
-        .values()
-        .any(|(_, bits)| bits.iter().any(|bits| f32::from_bits(*bits) != 0.0)));
+    assert!(
+        values
+            .values()
+            .any(|(_, bits)| bits.iter().any(|bits| f32::from_bits(*bits) != 0.0))
+    );
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let residencies = [
         None,
@@ -319,9 +323,11 @@ fn actual_resident_and_layerwise_equations_bind_shared_paths_map_origin_and_keep
                             .filter(|(name, _)| name == path)
                             .collect::<Vec<_>>();
                         assert_eq!(points.len(), observer.logits.len());
-                        assert!(points
-                            .iter()
-                            .all(|(_, pointer)| *pointer == path.as_ptr() as usize));
+                        assert!(
+                            points
+                                .iter()
+                                .all(|(_, pointer)| *pointer == path.as_ptr() as usize)
+                        );
                     }
                 }
             }
@@ -345,7 +351,8 @@ fn observed_configured_and_populated_sampling_index_after_full_sequence_without_
         let context = WorkspaceContext::new(facts.clone());
         let (state, paths) = state_and_paths(&sources, &context, 4);
         let config = config_sampling(adaptive);
-        let mut sampler = eredu_runtime::ConfiguredTextSampler::from_config(config).unwrap();
+        let mut sampler =
+            eredu_runtime::ConfiguredTextSampler::from_config(config.clone()).unwrap();
         for token in [3, 5, 7, 11, 13] {
             match &mut sampler {
                 eredu_runtime::ConfiguredTextSampler::Standard(s) => s.accept_token(token),
@@ -389,7 +396,7 @@ fn observed_configured_and_populated_sampling_index_after_full_sequence_without_
                         request(3),
                         &state,
                         &context,
-                        config,
+                        config.clone(),
                         &TokenFilter::All,
                         &paths,
                         &mut observer,
@@ -412,16 +419,31 @@ fn observed_configured_and_populated_sampling_index_after_full_sequence_without_
         assert_eq!(sampler.history_len(), 5);
         assert_eq!(sampler.history_capacity(), 8);
         let operations = facts.operations.lock().unwrap();
-        assert!(operations.iter().any(|op| matches!(
-            &op.kind,
-            WorkspaceOperationKind::StaticSlice { starts, ends, strides }
-                if starts == &[0, 4, 0] && ends == &[1, 5, 17] && strides == &[1, 1, 1]
-        ) && op.inputs.first().is_some_and(|value| value.shape() == [1, 5, 17])
-            && op.outputs.first().is_some_and(|value| value.shape() == [1, 1, 17])));
-        assert!(operations.iter().any(|op| matches!(
-            &op.kind, WorkspaceOperationKind::View("squeeze")
-        ) && op.inputs.first().is_some_and(|value| value.shape() == [1, 1, 17])
-            && op.outputs.first().is_some_and(|value| value.shape() == [1, 17])));
+        assert!(operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                WorkspaceOperationKind::StaticSlice { starts, ends, strides }
+                    if starts == &[0, 4, 0] && ends == &[1, 5, 17] && strides == &[1, 1, 1]
+            ) && op
+                .inputs
+                .first()
+                .is_some_and(|value| value.shape() == [1, 5, 17])
+                && op
+                    .outputs
+                    .first()
+                    .is_some_and(|value| value.shape() == [1, 1, 17])
+        }));
+        assert!(operations.iter().any(|op| {
+            matches!(&op.kind, WorkspaceOperationKind::View("squeeze"))
+                && op
+                    .inputs
+                    .first()
+                    .is_some_and(|value| value.shape() == [1, 1, 17])
+                && op
+                    .outputs
+                    .first()
+                    .is_some_and(|value| value.shape() == [1, 17])
+        }));
     }
 }
 
@@ -539,16 +561,18 @@ fn incompatible_geometry_foreign_retained_sources_and_typed_callback_failure_rem
         )
         .unwrap(),
     );
-    assert!(sources
-        .inference_blueprint()
-        .quote_replicated_resident_text_observed(
-            request(3),
-            &state,
-            &context,
-            &paths,
-            &mut observer
-        )
-        .is_err());
+    assert!(
+        sources
+            .inference_blueprint()
+            .quote_replicated_resident_text_observed(
+                request(3),
+                &state,
+                &context,
+                &paths,
+                &mut observer
+            )
+            .is_err()
+    );
     assert!(observer.logits.is_empty());
     assert!(state.as_ref().iter().all(|lane| lane.position() == 4));
     #[derive(Debug)]
@@ -557,6 +581,23 @@ fn incompatible_geometry_foreign_retained_sources_and_typed_callback_failure_rem
         omit_projection: bool,
     }
     impl WorkspaceMechanisms for MissingFacts {
+        fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+            Some(crate::memory_fixture::topology())
+        }
+        fn output_placement(
+            &self,
+            _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+            _: usize,
+        ) -> Option<&eredu_core::MemoryPlacement> {
+            Some(crate::memory_fixture::placement())
+        }
+        fn scratch_placement(
+            &self,
+            _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        ) -> Option<&eredu_core::MemoryPlacement> {
+            Some(crate::memory_fixture::placement())
+        }
+
         fn operation_bound(
             &self,
             operation: &WorkspaceOperation,
@@ -604,3 +645,114 @@ fn incompatible_geometry_foreign_retained_sources_and_typed_callback_failure_rem
 
 #[path = "observed/causal.rs"]
 mod causal;
+
+#[test]
+fn observed_partial_prefill_requires_the_exact_current_invocation_span() {
+    struct SpanObserver {
+        inner: Observer,
+        mode: u8,
+        span: Option<eredu_runtime::prefill::PrefillChunk>,
+    }
+    impl ActivationObserver<WorkspaceTensor, Error> for SpanObserver {
+        fn requires_sequence_readout(&self) -> bool {
+            true
+        }
+        fn observe(&mut self, path: &str, value: &WorkspaceTensor) -> Result<(), Error> {
+            self.inner.observe(path, value)
+        }
+        fn observe_generated(
+            &mut self,
+            path: &str,
+            prototype: &WorkspaceTensor,
+            source: &eredu_core::capture::GeneratedCaptureSource,
+            construct: &mut dyn FnMut() -> Result<WorkspaceTensor, Error>,
+        ) -> Result<(), Error> {
+            self.inner
+                .observe_generated(path, prototype, source, construct)
+        }
+    }
+    impl InferenceWorkspaceObserver for SpanObserver {
+        fn prefill_invocation_span(&self) -> Option<&eredu_runtime::prefill::PrefillChunk> {
+            self.span.as_ref()
+        }
+        fn begin_span(
+            &mut self,
+            geometry: InferenceGeometry,
+            span: &InferenceWorkspaceSpan,
+            prediction: u64,
+            context: &WorkspaceContext,
+        ) -> Result<bool, Error> {
+            self.span = match span {
+                InferenceWorkspaceSpan::Prefill(chunk) if self.mode != 0 => Some(chunk.clone()),
+                _ => None,
+            };
+            if let Some(chunk) = &mut self.span {
+                match self.mode {
+                    1 => chunk.position += 1,
+                    2 => chunk.input.end += 1,
+                    3 => chunk.output = OutputDemand::StateOnly,
+                    _ => {}
+                }
+            }
+            self.inner.begin_span(geometry, span, prediction, context)
+        }
+        fn visit_retained(&self, visit: &mut dyn FnMut(&WorkspaceTensor)) {
+            self.inner.visit_retained(visit)
+        }
+        fn end_span(
+            &mut self,
+            span: &InferenceWorkspaceSpan,
+            context: &WorkspaceContext,
+        ) -> Result<(), Error> {
+            self.inner.end_span(span, context)
+        }
+    }
+    let (artifact, _) = prepared_adapter::payload_fixture_config(&model_config(), 1.0);
+    let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+    let sources = prepared_adapter::prepare(
+        &inspection,
+        &prepared_adapter::plan(None),
+        &prepared_adapter::NumericPreparationProvider { addressable: false },
+    )
+    .unwrap();
+    for mode in 0..5 {
+        let context = WorkspaceContext::new(Facts::default());
+        let (state, paths) = state_and_paths(&sources, &context, 4);
+        let mut observer = SpanObserver {
+            inner: Observer::new(&context, vec![0]),
+            mode,
+            span: None,
+        };
+        let result = sources
+            .inference_blueprint()
+            .quote_replicated_resident_text_observed(
+                InferenceGeometry {
+                    prefill_chunk_positions: 2,
+                    ..request(1)
+                },
+                &state,
+                &context,
+                &paths,
+                &mut observer,
+            );
+        if mode != 4 {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                cause::<InferenceObservationError>(inner_error(&error)),
+                Some(InferenceObservationError::PartialPrefill)
+            ));
+            assert!(observer.inner.logits.is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(
+                observer.inner.logits,
+                [
+                    (0, vec![1, 2, 17]),
+                    (0, vec![1, 2, 17]),
+                    (0, vec![1, 1, 17]),
+                ]
+            );
+            assert_eq!(observer.inner.ended, 3);
+        }
+    }
+}

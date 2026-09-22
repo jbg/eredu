@@ -1,9 +1,7 @@
 //! A finite constructor partition of the same accepted reset account.
 use super::*;
 use eredu_core::BackendFailure;
-use eredu_nn::workspace::{
-    HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
-};
+use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug)]
 struct Account {

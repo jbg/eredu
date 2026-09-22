@@ -51,8 +51,10 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
             lanes,
             scheduler,
         } = request;
-        let validation =
-            self.validate_speculative_settings(source, lanes.iter().map(|lane| lane.text.settings));
+        let validation = self.validate_speculative_settings(
+            source,
+            lanes.iter().map(|lane| lane.text.settings.clone()),
+        );
         let request = self.prepare_speculative_batch(
             drafting,
             lanes.into_iter(),

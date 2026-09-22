@@ -63,7 +63,6 @@ fn admitted() -> AdmittedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: transforms.iter().map(CaptureTransform::kind).collect(),
         max_histogram_bins: 4,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = ObservationSupportReport {
@@ -115,7 +114,6 @@ fn admitted() -> AdmittedCapturePlan {
         limits: CaptureLimits {
             per_step: all,
             cumulative: all,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -137,12 +135,10 @@ fn child_limit_copy_preserves_declarations_and_uses_canonical_identity() {
     let source = SharedCapturePlan::new(admitted());
     let mut limits = source.plan().limits.clone();
     limits.cumulative.captures = 41;
-    let capabilities = CaptureCapabilities {
-        transformations: vec![], max_histogram_bins: 0,
-        physical_native_limit: false, conditions: vec![],
-    };
-    let copy = PreparedCapturePlanCopy::inspect_limit_revision(&source, limits.clone(), &capabilities).unwrap()
-        .copy(HostPreparationAuthority::unmanaged()).unwrap();
+    let copy = PreparedCapturePlanCopy::inspect_limit_revision(&source, limits.clone())
+        .unwrap()
+        .copy(HostPreparationAuthority::unmanaged())
+        .unwrap();
     assert_eq!(copy.plan().limits, limits);
     assert_eq!(copy.plan().selections, source.plan().selections);
     assert_eq!(copy.admission().request(), source.request());
@@ -151,11 +147,11 @@ fn child_limit_copy_preserves_declarations_and_uses_canonical_identity() {
     assert!(copy.is_limit_revision_of(&source));
     assert!(!copy.is_limit_revision_of(&SharedCapturePlan::new(source.admission().clone())));
     let bytes = serde_json::to_vec(&(copy.plan(), &source.points, source.request())).unwrap();
-    let reference: String = Sha256::digest(bytes).iter().map(|n| format!("{n:02x}")).collect();
+    let reference: String = Sha256::digest(bytes)
+        .iter()
+        .map(|n| format!("{n:02x}"))
+        .collect();
     assert_eq!(copy.admission().identity(), reference);
-    limits.physical_native_bytes = Some(1);
-    assert!(matches!(PreparedCapturePlanCopy::inspect_limit_revision(&source, limits, &capabilities),
-        Err(CapturePlanCopyError::Capability)));
 }
 
 fn grow<T>(values: &mut Vec<T>) -> u64 {
@@ -293,8 +289,8 @@ fn earlier_aliases_keep_per_domain_custody_until_all_nested_payload_retires() {
     let alias = shared.clone();
     let key = shared.storage_identity().clone();
     let domains = [
-        SharedStorageDomain::default(),
-        SharedStorageDomain::default(),
+        SharedStorageAccountingId::default(),
+        SharedStorageAccountingId::default(),
     ];
     for domain in &domains {
         assert!(shared
@@ -324,7 +320,7 @@ fn earlier_aliases_keep_per_domain_custody_until_all_nested_payload_retires() {
 #[test]
 fn rejected_and_panicking_attachment_preserve_existing_source_custody() {
     let (shared, retired, count) = owner();
-    let first = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
     shared
         .try_attach(&first, || {
             Ok::<_, &'static str>(Box::new(Charge {
@@ -333,7 +329,7 @@ fn rejected_and_panicking_attachment_preserve_existing_source_custody() {
             }))
         })
         .unwrap();
-    let second = SharedStorageDomain::default();
+    let second = SharedStorageAccountingId::default();
     assert!(matches!(
         shared.try_attach(&second, || Err("original typed rejection")),
         Err(SharedStorageAttachmentError::Provider(
@@ -416,7 +412,7 @@ fn escaped_source_and_concurrent_final_aliases_retire_shell_and_attachment_alloc
     }))));
     // Actual existing attachment storage must also be destroyed before the host.
     source
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<_, ()>(Box::new(17_u64))
         })
         .unwrap();
@@ -493,4 +489,13 @@ fn incoming_host_panic_keeps_pending_tail_on_consuming_retirement_path() {
         observed.load(Ordering::SeqCst),
         "the remaining node's allocation retired before its token during unwind"
     );
+}
+
+#[test]
+fn logical_capture_limits_reject_undeclared_allocator_ceilings() {
+    let mut wire = serde_json::to_value(admitted().plan().limits.clone()).unwrap();
+    wire.as_object_mut()
+        .unwrap()
+        .insert("physical_native_bytes".into(), 1.into());
+    assert!(serde_json::from_value::<CaptureLimits>(wire).is_err());
 }

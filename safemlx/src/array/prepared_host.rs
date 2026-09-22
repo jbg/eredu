@@ -419,9 +419,15 @@ impl<T: ArrayElement + Send + 'static, C: Send + 'static> PreparedOwnedHostCopy<
             prepared_owner: ptr::null_mut(),
         };
         let mut birth = safemlx_sys::mlx_original_buffer_info {
+            host_control_bytes: 0,
             known: false,
             identity: 0,
             charged_bytes: 0,
+            placement: safemlx_sys::mlx_memory_placement {
+                kind: 0,
+                device: -1,
+                device_count: 0,
+            },
         };
         let status = {
             let Some(_guard) = runtime_lock::try_enter_for_recovery() else {
@@ -514,7 +520,12 @@ impl CompletedOwnedHostCopy {
     /// Actual successful birth; None is the producer's allocation-free zero copy.
     pub fn allocation(&self) -> Option<crate::AllocationInfo> {
         self.birth.known.then(|| {
-            crate::AllocationInfo::from_native(self.birth.identity, self.birth.charged_bytes, false)
+            crate::AllocationInfo::from_native(
+                self.birth.identity,
+                self.birth.charged_bytes,
+                self.birth.placement,
+            )
+            .with_host_controls(self.birth.host_control_bytes)
         })
     }
     /// Reobserve this retained Array and require the exact successful generation
@@ -543,7 +554,9 @@ impl CompletedOwnedHostCopy {
     }
     /// Borrow the actual immutable completed copy without constructing an alias.
     /// Its source owner and successful birth facts remain retained by this value.
-    pub fn array(&self) -> &Array { &self.array }
+    pub fn array(&self) -> &Array {
+        &self.array
+    }
     /// Extract the actual Array; this operation supplies no publication authority.
     pub fn into_array(self) -> Array {
         self.array

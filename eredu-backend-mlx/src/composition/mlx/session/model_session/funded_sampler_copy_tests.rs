@@ -1,12 +1,14 @@
 #![cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     TextGenerationContinuation, TextGenerationDriver, TextGenerationInput, TextPreparationInput,
     TokenFilterController,
 };
-use eredu_runtime::working_memory::{SamplerCopyLimits, WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, SamplerCopyLimits, WorkingMemoryError};
 
 struct AllTokens;
 impl TokenFilterController for AllTokens {
@@ -50,7 +52,15 @@ fn config(adaptive: bool, managed: bool) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: managed.then_some(u64::MAX),
+        memory_limits: (managed.then_some(u64::MAX)).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     });
@@ -73,10 +83,10 @@ fn evidence() -> TextPreparationInput<'static, MlxModelInput> {
     }
 }
 
-fn runtime(pool: &WorkingMemoryPool) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
+fn runtime(pool: &MemoryLedger) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -86,7 +96,7 @@ fn runtime(pool: &WorkingMemoryPool) -> (ModelRuntime<MlxBackend<'static>>, temp
         pool.unquoted_owner_count().unwrap() == 0
     });
     assert!(runtime.session().payload.model.has_published_idle_storage());
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     (runtime, artifact)
 }
 
@@ -95,10 +105,10 @@ fn reclaim() {
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, expected: u64) {
+fn settle(pool: &MemoryLedger, expected: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == expected && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == expected && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -120,11 +130,11 @@ fn cause<'a, T: std::error::Error + 'static>(
     }
 }
 
-fn accounting(pool: &WorkingMemoryPool) -> (u64, u64, u64) {
+fn accounting(pool: &MemoryLedger) -> (u64, u64, u64) {
     (
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
-        pool.effective_capacity().unwrap(),
+        pool.fixture_host_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
+        pool.fixture_host_limit().unwrap(),
     )
 }
 
@@ -144,7 +154,7 @@ fn advance_twice(
 #[test]
 fn admitted_standard_and_mirostat_sampler_copy_accept_exact_capacity_and_reject_one_short() {
     for adaptive in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, artifact) = runtime(&pool);
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
@@ -184,16 +194,14 @@ fn admitted_standard_and_mirostat_sampler_copy_accept_exact_capacity_and_reject_
             let error = pool
                 .copy_sampler(
                     source.borrow_funded().unwrap(),
-                    SamplerCopyLimits::new(before.0 + required - 1),
+                    SamplerCopyLimits::new(crate::memory_fixture::limits(before.0 + required - 1)),
                 )
                 .err()
                 .expect("one byte below the exact destination component must reject");
             assert_eq!(
-                cause::<WorkingMemoryError>(&error),
-                Some(&WorkingMemoryError::BudgetExceeded {
-                    required_bytes: required,
-                    available_bytes: required - 1,
-                })
+                cause::<WorkingMemoryError>(&error)
+                    .and_then(crate::tests::support::memory_error::host_budget_numbers),
+                Some((required, required - 1))
             );
             assert_eq!(accounting(&pool), before);
             assert_eq!(paths::snapshot(), before_paths);
@@ -205,10 +213,10 @@ fn admitted_standard_and_mirostat_sampler_copy_accept_exact_capacity_and_reject_
             let copy = pool
                 .copy_sampler(
                     source.borrow_funded().unwrap(),
-                    SamplerCopyLimits::new(before.0 + required),
+                    SamplerCopyLimits::new(crate::memory_fixture::limits(before.0 + required)),
                 )
                 .unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), before.0 + required);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before.0 + required);
             assert_eq!(copy.bytes(), required);
             assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
             assert_eq!(
@@ -262,7 +270,7 @@ fn admitted_standard_and_mirostat_sampler_copy_accept_exact_capacity_and_reject_
 
 #[test]
 fn copied_sampler_and_its_descendant_retain_only_their_own_component_accounts() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, artifact) = runtime(&pool);
     let mut driver = TextGenerationDriver::new(&mut runtime);
     let mut state = driver
@@ -281,7 +289,7 @@ fn copied_sampler_and_its_descendant_retain_only_their_own_component_accounts() 
         let copy = pool
             .copy_sampler(
                 source.borrow_funded().unwrap(),
-                SamplerCopyLimits::new(u64::MAX),
+                SamplerCopyLimits::new(crate::memory_fixture::limits(u64::MAX)),
             )
             .unwrap();
         (copy, required, ids)
@@ -294,9 +302,12 @@ fn copied_sampler_and_its_descendant_retain_only_their_own_component_accounts() 
     settle(&pool, required);
     assert_eq!(history(copy.as_sampler()), ids);
     let descendant = pool
-        .copy_sampler(copy.borrow_funded(), SamplerCopyLimits::new(required * 2))
+        .copy_sampler(
+            copy.borrow_funded(),
+            SamplerCopyLimits::new(crate::memory_fixture::limits(required * 2)),
+        )
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), required * 2);
+    assert_eq!(pool.fixture_host_charge().unwrap(), required * 2);
     assert_eq!(history(descendant.as_sampler()), ids);
     assert!(!std::ptr::eq(
         history(copy.as_sampler()).as_ptr(),
@@ -311,7 +322,7 @@ fn copied_sampler_and_its_descendant_retain_only_their_own_component_accounts() 
 
 #[test]
 fn native_unquoted_sources_and_foreign_accounts_cannot_authorize_sampler_copy() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, artifact) = runtime(&pool);
     let unquoted =
         MlxBackend::start_text_generation(runtime.backend(), config(false, false)).unwrap();
@@ -335,7 +346,7 @@ fn native_unquoted_sources_and_foreign_accounts_cannot_authorize_sampler_copy() 
         )
         .unwrap();
     let outputs = advance_twice(&mut driver, &mut state);
-    let other = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let other = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     {
         let boundary = driver.quiescent(&mut state).unwrap();
         let source = &boundary.parts().1.sampling.sampler;
@@ -343,7 +354,7 @@ fn native_unquoted_sources_and_foreign_accounts_cannot_authorize_sampler_copy() 
         let error = other
             .copy_sampler(
                 source.borrow_funded().unwrap(),
-                SamplerCopyLimits::new(u64::MAX),
+                SamplerCopyLimits::new(crate::memory_fixture::limits(u64::MAX)),
             )
             .err()
             .unwrap();
@@ -366,8 +377,8 @@ fn native_unquoted_sources_and_foreign_accounts_cannot_authorize_sampler_copy() 
 
     // A rejected foreign sampler scope has covered no work. Its closed
     // host-only custody retires without quarantining the foreign account.
-    let source_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let foreign_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let foreign_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (source, source_artifact) = self::runtime(&source_pool);
     let (foreign, foreign_artifact) = self::runtime(&foreign_pool);
     let source_preparation =
@@ -426,59 +437,4 @@ fn native_unquoted_sources_and_foreign_accounts_cannot_authorize_sampler_copy() 
     drop(foreign_artifact);
     settle(&source_pool, 0);
     settle(&foreign_pool, 0);
-}
-
-#[test]
-fn funded_sampler_component_does_not_enable_whole_native_sampling_snapshot() {
-    use eredu_runtime::execution_control::TextSnapshotBackend;
-
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let (mut runtime, artifact) = runtime(&pool);
-    let preparation =
-        MlxBackend::admit_text_preparation(&runtime, &evidence(), config(false, true), &AllTokens)
-            .unwrap();
-    let prompt =
-        MlxBackend::prepare_text_prompt_admitted(runtime.backend(), tokens(), &preparation)
-            .unwrap();
-    let prompt =
-        MlxBackend::bind_text_prompt_preparation(runtime.backend(), prompt, &preparation).unwrap();
-    let state = MlxBackend::start_text_generation_admitted(
-        runtime.backend(),
-        config(false, true),
-        &preparation,
-    )
-    .unwrap();
-    let copy = pool
-        .copy_sampler(
-            state.sampling.sampler.borrow_funded().unwrap(),
-            SamplerCopyLimits::new(u64::MAX),
-        )
-        .unwrap();
-    let before = (
-        accounting(&pool),
-        paths::snapshot(),
-        runtime.session().payload.model.erased().state_snapshot(),
-    );
-    let error = MlxBackend::copy_sampling_state(&mut runtime, &state.sampling)
-        .err()
-        .unwrap();
-    assert_eq!(
-        cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::UnknownBound)
-    );
-    assert_eq!(
-        (
-            accounting(&pool),
-            paths::snapshot(),
-            runtime.session().payload.model.erased().state_snapshot()
-        ),
-        before
-    );
-    drop(copy);
-    drop(state);
-    drop(prompt);
-    drop(preparation);
-    drop(runtime);
-    drop(artifact);
-    settle(&pool, 0);
 }

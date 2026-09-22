@@ -1,8 +1,11 @@
 use super::*;
 
+mod autoregressive_transaction;
+mod cache_binding;
 pub(super) mod binding;
 mod composite;
 mod mechanisms;
+pub(in crate::composition::mlx) mod parameter_reset;
 pub(super) mod prepared_parameters;
 mod replicated;
 
@@ -133,7 +136,7 @@ fn require_native_control_policy(
 
 pub(crate) use mechanisms::{
     NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
-    SealedOpeningRows,
+    SealedOpeningRows, ordinary_model_completion_call_controls,
 };
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;

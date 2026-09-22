@@ -51,7 +51,7 @@ fn gpu_stream_birth_preserves_short_source_and_factory_accounts_execute_nonzero(
             if !qualified() {
                 return;
             }
-            let pool = super::super::domain();
+            let pool = super::super::ledger();
             super::super::input_allocator::prepare_admitted(&pool).unwrap();
             let target = GpuStreamTarget::for_initialized(
                 super::super::metal_device::admitted_owner(&pool).unwrap(),
@@ -60,28 +60,41 @@ fn gpu_stream_birth_preserves_short_source_and_factory_accounts_execute_nonzero(
             .unwrap();
             let layout = PreparedGpuStream::<SharedNativeInitializationCustody>::layout().unwrap();
             let plan = Initializer { layout, target };
-            let bytes =
-                WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
-            let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+            let bytes = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
+            let short = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
             let failure = short.initialize_shared_native(plan).unwrap_err();
             assert!(matches!(
                 failure.accounting_failure(),
-                Some(WorkingMemoryError::BudgetExceeded { .. })
+                Some(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
             ));
             assert!(failure.rejected_plan().is_some());
             assert!(failure.constructor_failure().is_none());
-            assert_eq!(short.used_bytes().unwrap(), 0);
+            assert_eq!(short.fixture_host_charge().unwrap(), 0);
             let public = MlxGpuStreamError(Failure::Constructor(failure)).into_backend_failure();
-            let diagnostic = std::error::Error::source(&public).unwrap()
-                .downcast_ref::<eredu_runtime::working_memory::SharedNativeInitializationFailure<(), GpuStreamRegistrationCause>>().unwrap();
+            let diagnostic = std::error::Error::source(&public)
+                .unwrap()
+                .downcast_ref::<eredu_runtime::working_memory::SharedNativeInitializationFailure<
+                    (),
+                    GpuStreamRegistrationCause,
+                >>()
+                .unwrap();
             assert!(diagnostic.constructor_failure().is_none());
-            assert!(matches!(diagnostic.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
-            assert!(std::error::Error::source(diagnostic).unwrap().is::<WorkingMemoryError>());
-            assert_eq!(short.used_bytes().unwrap(), 0);
+            assert!(matches!(
+                diagnostic.accounting_failure(),
+                Some(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
+            ));
+            assert!(std::error::Error::source(diagnostic)
+                .unwrap()
+                .is::<WorkingMemoryError>());
+            assert_eq!(short.fixture_host_charge().unwrap(), 0);
             drop(public);
 
             super::super::router::prepare_before_native_construction();
-            let before = pool.used_bytes().unwrap();
+            let before = pool.fixture_host_charge().unwrap();
             let streams = PreparedExecutionStreams::for_factory(&pool)
                 .unwrap()
                 .expect("qualified fresh creator");
@@ -92,12 +105,14 @@ fn gpu_stream_birth_preserves_short_source_and_factory_accounts_execute_nonzero(
                     WorkingMemoryError::IdentityMismatch
                 ))
             ));
-            let ExecutionStream::Gpu(execution)=&streams.execution else{panic!("actual GPU execution owner")};
+            let ExecutionStream::Gpu(execution) = &streams.execution else {
+                panic!("actual GPU execution owner")
+            };
             let held = execution.0.original_bytes()
                 + streams.source.registration_owner().original_bytes()
                 + streams.worker.worker_owner().original_bytes();
             assert_eq!(execution.0.original_bytes(), bytes);
-            assert_eq!(pool.used_bytes().unwrap(), before + held);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before + held);
             let identity = MlxDeviceIdentity::from_realized_device(
                 &Device::new(DeviceType::Gpu, 0),
                 Some(MlxAcceleratorFamily::Metal),
@@ -130,9 +145,10 @@ fn gpu_stream_birth_preserves_short_source_and_factory_accounts_execute_nonzero(
                 ))
             ));
             drop((borrowed, cpu, gpu, left, right, backend));
+            safemlx::memory::clear_cache().unwrap();
             safemlx::reclaim_allocation_owners();
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 before + held,
                 "process registry/worker still retain birth custody"
             );
@@ -150,7 +166,7 @@ fn ordinary_gpu_predecessor_keeps_factory_compatibility_without_original_authori
             }
             let device = Device::new(DeviceType::Gpu, 0);
             let ordinary = Stream::try_new_with_device(&device).unwrap();
-            let pool = super::super::domain();
+            let pool = super::super::ledger();
             assert!(PreparedExecutionStreams::for_factory(&pool)
                 .unwrap()
                 .is_none());
@@ -174,113 +190,204 @@ fn ordinary_gpu_predecessor_keeps_factory_compatibility_without_original_authori
 
 #[test]
 fn retained_copy_environment_outlives_backend_and_keeps_exact_pool_and_host() {
-    isolated("retained_copy_environment_outlives_backend_and_keeps_exact_pool_and_host", || {
-        if !qualified() { return; }
-        use crate::backend::{PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError,
-            OriginalCopyEnvironmentError};
-        use eredu_core::HostPreparationAuthority;
-        use eredu_runtime::working_memory::InferenceExecutionIdentity;
-        let pool = super::super::domain();
-        super::super::input_allocator::prepare_admitted(&pool).unwrap();
-        let streams = PreparedExecutionStreams::for_factory(&pool).unwrap().unwrap();
-        let identity = MlxDeviceIdentity::from_realized_device(
-            &Device::new(DeviceType::Gpu, 0), Some(MlxAcceleratorFamily::Metal)).unwrap();
-        let backend = MlxBackend::for_prepared_execution_plan(streams, identity);
-        let baseline = pool.used_bytes().unwrap();
-        // The policy ceiling covers the actual existing native-source domain;
-        // this fixture adds 16 MiB for its separately retained host descriptors.
-        let ceiling = baseline.checked_add(1 << 24).unwrap();
-        let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), ceiling).unwrap();
-        funding.reserve_metadata(HostPreparationAuthority::retention_bytes::<
-            eredu_nn::workspace::HostMetadataFunding>().unwrap()).unwrap();
-        let host = HostPreparationAuthority::retain(funding.clone());
-        let environment = backend.original_copy_environment().unwrap();
-        let source_index = environment.stream().get_index().unwrap();
-        let source_wrapper = environment.stream().as_ptr().ctx;
-        let owner = PreparedOriginalCopyEnvironment::prepare(&environment, &host, &funding).unwrap();
-        let alias = owner.clone();
-        drop(environment);
-        drop((backend, host, funding));
-        let loan = alias.loan(&pool).unwrap();
-        assert_eq!(loan.stream().get_index().unwrap(), source_index);
-        assert_ne!(loan.stream().as_ptr().ctx, source_wrapper);
-        drop(loan);
-        let other = WorkingMemoryPool::new(1 << 24, 0).unwrap();
-        assert!(matches!(alias.loan(&other), Err(PreparedOriginalCopyEnvironmentError::Environment(
-            OriginalCopyEnvironmentError::Memory(WorkingMemoryError::IdentityMismatch)))));
-        let held = pool.used_bytes().unwrap();
-        assert!(held > baseline);
-        drop(owner);
-        safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), held, "last alias retains actual wrapper and metadata");
-        drop(alias);
-        safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), baseline, "metadata retires after native wrapper ownership");
-    });
+    isolated(
+        "retained_copy_environment_outlives_backend_and_keeps_exact_pool_and_host",
+        || {
+            if !qualified() {
+                return;
+            }
+            use crate::backend::{
+                OriginalCopyEnvironmentError, PreparedOriginalCopyEnvironment,
+                PreparedOriginalCopyEnvironmentError,
+            };
+            use eredu_core::HostPreparationAuthority;
+            use eredu_runtime::working_memory::InferenceExecutionIdentity;
+            let pool = super::super::ledger();
+            super::super::input_allocator::prepare_admitted(&pool).unwrap();
+            let streams = PreparedExecutionStreams::for_factory(&pool)
+                .unwrap()
+                .unwrap();
+            let identity = MlxDeviceIdentity::from_realized_device(
+                &Device::new(DeviceType::Gpu, 0),
+                Some(MlxAcceleratorFamily::Metal),
+            )
+            .unwrap();
+            let backend = MlxBackend::for_prepared_execution_plan(streams, identity);
+            let baseline = pool.fixture_host_charge().unwrap();
+            // The policy ceiling covers the actual existing native-source domain;
+            // this fixture adds 16 MiB for its separately retained host descriptors.
+            let ceiling = baseline.checked_add(1 << 24).unwrap();
+            let funding = pool
+                .prepare_workspace_metadata(
+                    &InferenceExecutionIdentity::default(),
+                    crate::memory_fixture::resolved_limits(ceiling),
+                )
+                .unwrap();
+            funding
+                .reserve_metadata(
+                    HostPreparationAuthority::retention_bytes::<
+                        eredu_nn::workspace::HostMetadataFunding,
+                    >()
+                    .unwrap(),
+                )
+                .unwrap();
+            let host = HostPreparationAuthority::retain(funding.clone());
+            let environment = backend.original_copy_environment().unwrap();
+            let source_index = environment.stream().get_index().unwrap();
+            let source_wrapper = environment.stream().as_ptr().ctx;
+            let owner =
+                PreparedOriginalCopyEnvironment::prepare(&environment, &host, &funding).unwrap();
+            let alias = owner.clone();
+            drop(environment);
+            drop((backend, host, funding));
+            let loan = alias.loan(&pool).unwrap();
+            assert_eq!(loan.stream().get_index().unwrap(), source_index);
+            assert_ne!(loan.stream().as_ptr().ctx, source_wrapper);
+            drop(loan);
+            let other = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
+            assert!(matches!(
+                alias.loan(&other),
+                Err(PreparedOriginalCopyEnvironmentError::Environment(
+                    OriginalCopyEnvironmentError::Memory(WorkingMemoryError::IdentityMismatch)
+                ))
+            ));
+            let held = pool.fixture_host_charge().unwrap();
+            assert!(held > baseline);
+            drop(owner);
+            safemlx::reclaim_allocation_owners();
+            assert_eq!(
+                pool.fixture_host_charge().unwrap(),
+                held,
+                "last alias retains actual wrapper and metadata"
+            );
+            drop(alias);
+            safemlx::reclaim_allocation_owners();
+            assert_eq!(
+                pool.fixture_host_charge().unwrap(),
+                baseline,
+                "metadata retires after native wrapper ownership"
+            );
+        },
+    );
 }
 
 #[test]
 fn cpu_factory_retains_actual_stream_worker_and_copy_environment() {
-    isolated("cpu_factory_retains_actual_stream_worker_and_copy_environment",||{
-        if !qualified(){return;}
-        let pool=super::super::domain();
-        super::super::input_allocator::prepare_admitted(&pool).unwrap();
-        let before=pool.used_bytes().unwrap();
-        let streams=PreparedExecutionStreams::for_cpu_factory(&pool).unwrap().unwrap();
-        let ExecutionStream::Cpu(execution)=&streams.execution else{panic!("actual CPU execution owner")};
-        let held=execution.original_bytes()+streams.source.registration_owner().original_bytes()
-            +streams.worker.worker_owner().original_bytes();
-        assert_eq!(pool.used_bytes().unwrap(),before+held);
-        let marker=safemlx::StreamCopyPlan::<()>::capture(streams.execution()).unwrap();
-        assert_eq!(marker.device_type(),DeviceType::Cpu);
-        assert_eq!(marker.device_index(),0);
-        assert!(!marker.matches_source(streams.source()));
-        streams.observe_idle(&pool).unwrap();
-        let foreign=WorkingMemoryPool::new(held,0).unwrap();
-        assert!(streams.validate_pool(&foreign).is_err());
-        let identity=MlxDeviceIdentity::from_realized_device(&Device::new(DeviceType::Cpu,0),None).unwrap();
-        let backend=MlxBackend::for_prepared_execution_plan(streams,identity);
-        backend.validate_original_stream_owners().unwrap();
-        let environment=backend.original_copy_environment().unwrap();
-        assert!(marker.matches_source(environment.stream()));
-        assert!(environment.pool().same_domain(&pool));
-        // This validates native ownership, not qualification for a CPU model.
-        drop(environment);
-        drop(backend);
-        safemlx::reclaim_allocation_owners();
-        assert!(pool.used_bytes().unwrap() > before, "actual process registrations retain native birth custody");
-    });
+    isolated(
+        "cpu_factory_retains_actual_stream_worker_and_copy_environment",
+        || {
+            if !qualified() {
+                return;
+            }
+            let pool = super::super::ledger();
+            super::super::input_allocator::prepare_admitted(&pool).unwrap();
+            let before = pool.fixture_host_charge().unwrap();
+            let streams = PreparedExecutionStreams::for_cpu_factory(&pool)
+                .unwrap()
+                .unwrap();
+            let ExecutionStream::Cpu(execution) = &streams.execution else {
+                panic!("actual CPU execution owner")
+            };
+            let held = execution.original_bytes()
+                + streams.source.registration_owner().original_bytes()
+                + streams.worker.worker_owner().original_bytes();
+            assert_eq!(pool.fixture_host_charge().unwrap(), before + held);
+            let marker = safemlx::StreamCopyPlan::<()>::capture(streams.execution()).unwrap();
+            assert_eq!(marker.device_type(), DeviceType::Cpu);
+            assert_eq!(marker.device_index(), 0);
+            assert!(!marker.matches_source(streams.source()));
+            streams.observe_idle(&pool).unwrap();
+            let foreign = crate::memory_fixture::ledger(held, 0).unwrap();
+            assert!(streams.validate_pool(&foreign).is_err());
+            let identity =
+                MlxDeviceIdentity::from_realized_device(&Device::new(DeviceType::Cpu, 0), None)
+                    .unwrap();
+            let backend = MlxBackend::for_prepared_execution_plan(streams, identity);
+            backend.validate_original_stream_owners().unwrap();
+            let environment = backend.original_copy_environment().unwrap();
+            assert!(marker.matches_source(environment.stream()));
+            assert!(environment.pool().same_ledger(&pool));
+            // This validates native ownership, not qualification for a CPU model.
+            drop(environment);
+            drop(backend);
+            safemlx::reclaim_allocation_owners();
+            assert!(
+                pool.fixture_host_charge().unwrap() > before,
+                "actual process registrations retain native birth custody"
+            );
+        },
+    );
 }
 
 #[test]
 fn cpu_factory_retains_selected_matmul_context_and_exact_copy_account() {
-    isolated("cpu_factory_retains_selected_matmul_context_and_exact_copy_account",||{
-        if !qualified(){return;}
-        let pool=super::super::domain();
-        super::super::input_allocator::prepare_admitted(&pool).unwrap();
-        let choice=crate::backend::nn::workspace::MlxCpuMatmulMechanism::select(
-            eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
-        let geometry=choice.selected().geometry(2,17,19,23,1).unwrap();
-        assert!(choice.eval_layout(geometry,false).unwrap().backing_births()==1);
-        let before=pool.used_bytes().unwrap();
-        let streams=PreparedExecutionStreams::for_cpu_factory_with_matmul(&pool,choice).unwrap().unwrap();
-        let ExecutionStream::Cpu(execution)=&streams.execution else{panic!("actual CPU execution owner")};
-        let held=execution.original_bytes()+streams.source.registration_owner().original_bytes()
-            +streams.worker.worker_owner().original_bytes();
-        assert_eq!(pool.used_bytes().unwrap(),before+held);
-        let selected=safemlx::StreamCopyPlan::<()>::capture(streams.execution()).unwrap();
-        let retiring=execution.wrapper_control_bytes();
-        assert_eq!(selected.cpu_matmul(),safemlx::CpuMatmulKernel::Float32Tiles);
-        assert_eq!(safemlx::StreamCopyPlan::<()>::capture(streams.source()).unwrap().cpu_matmul(),safemlx::CpuMatmulKernel::PlatformDefault);
-        streams.observe_idle(&pool).unwrap();
-        let foreign=WorkingMemoryPool::new(held,0).unwrap();assert!(streams.validate_pool(&foreign).is_err());
-        let identity=MlxDeviceIdentity::from_realized_device(&Device::new(DeviceType::Cpu,0),None).unwrap();
-        let backend=MlxBackend::for_prepared_execution_plan(streams,identity);
-        let environment=backend.original_copy_environment().unwrap();
-        assert!(selected.matches_source(environment.stream()));
-        assert_eq!(safemlx::StreamCopyPlan::<()>::capture(environment.stream()).unwrap().cpu_matmul(),safemlx::CpuMatmulKernel::Float32Tiles);
-        drop(environment);drop(backend);safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(),before+held-retiring,
+    isolated(
+        "cpu_factory_retains_selected_matmul_context_and_exact_copy_account",
+        || {
+            if !qualified() {
+                return;
+            }
+            let pool = super::super::ledger();
+            super::super::input_allocator::prepare_admitted(&pool).unwrap();
+            let choice = crate::backend::nn::workspace::MlxCpuMatmulMechanism::select(
+                eredu_nn::CpuMatmulImplementation::Float32Tiles,
+            )
+            .unwrap();
+            let geometry = choice.selected().geometry(2, 17, 19, 23, 1).unwrap();
+            assert!(
+                choice
+                    .eval_layout(geometry, false)
+                    .unwrap()
+                    .backing_births()
+                    == 1
+            );
+            let before = pool.fixture_host_charge().unwrap();
+            let streams = PreparedExecutionStreams::for_cpu_factory_with_matmul(&pool, choice)
+                .unwrap()
+                .unwrap();
+            let ExecutionStream::Cpu(execution) = &streams.execution else {
+                panic!("actual CPU execution owner")
+            };
+            let held = execution.original_bytes()
+                + streams.source.registration_owner().original_bytes()
+                + streams.worker.worker_owner().original_bytes();
+            assert_eq!(pool.fixture_host_charge().unwrap(), before + held);
+            let selected = safemlx::StreamCopyPlan::<()>::capture(streams.execution()).unwrap();
+            let retiring = execution.wrapper_control_bytes();
+            assert_eq!(
+                selected.cpu_matmul(),
+                safemlx::CpuMatmulKernel::Float32Tiles
+            );
+            assert_eq!(
+                safemlx::StreamCopyPlan::<()>::capture(streams.source())
+                    .unwrap()
+                    .cpu_matmul(),
+                safemlx::CpuMatmulKernel::PlatformDefault
+            );
+            streams.observe_idle(&pool).unwrap();
+            let foreign = crate::memory_fixture::ledger(held, 0).unwrap();
+            assert!(streams.validate_pool(&foreign).is_err());
+            let identity =
+                MlxDeviceIdentity::from_realized_device(&Device::new(DeviceType::Cpu, 0), None)
+                    .unwrap();
+            let backend = MlxBackend::for_prepared_execution_plan(streams, identity);
+            let environment = backend.original_copy_environment().unwrap();
+            assert!(selected.matches_source(environment.stream()));
+            assert_eq!(
+                safemlx::StreamCopyPlan::<()>::capture(environment.stream())
+                    .unwrap()
+                    .cpu_matmul(),
+                safemlx::CpuMatmulKernel::Float32Tiles
+            );
+            drop(environment);
+            drop(backend);
+            safemlx::reclaim_allocation_owners();
+            assert_eq!(pool.fixture_host_charge().unwrap(),before+held-retiring,
             "both local wrapper accounts retire; registered CPU stream and worker accounts survive");
-    });
+        },
+    );
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -2,14 +2,16 @@
 use super::*;
 use eredu_runtime::{
     execution_control::PreparedControllerSource,
-    working_memory::{OriginalForbiddenSource, OriginalTokenTrieSource, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{
+        MemoryLedger, OriginalForbiddenSource, OriginalTokenTrieSource, WorkingMemoryError,
+    },
 };
 pub(in super::super) fn controller_source_control_bytes() -> Option<usize> {
     let parts = [
         OriginalForbiddenSource::validation_control_bytes()?,
-        WorkingMemoryPool::shared_controller_source_validation_control_bytes()?,
+        MemoryLedger::shared_controller_source_validation_control_bytes()?,
         size_of::<PreparedControllerSource<'_>>(),
-        size_of::<(&WorkingMemoryPool, PreparedControllerSource<'_>)>(),
+        size_of::<(&MemoryLedger, PreparedControllerSource<'_>)>(),
         size_of::<Result<(), Error>>(),
         size_of::<Option<&OriginalForbiddenSource>>(),
         size_of::<&[eredu_core::SharedTokenFilter]>(),
@@ -20,7 +22,7 @@ pub(in super::super) fn controller_source_control_bytes() -> Option<usize> {
 }
 pub(in super::super) fn validate_controller_source(
     source: PreparedControllerSource<'_>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<(), Error> {
     match source {
         PreparedControllerSource::Plain(plain) => {
@@ -47,15 +49,29 @@ pub(in super::super) fn validate_controller_source(
 }
 
 pub(in super::super) fn grammar_source_control_bytes() -> Option<usize> {
-    let parts = [OriginalTokenTrieSource::grammar_validation_control_bytes()?,
+    let parts = [
+        OriginalTokenTrieSource::grammar_validation_control_bytes()?,
         size_of::<eredu_core::speculative::PreparedGrammarSource<'_>>(),
-        size_of::<(eredu_core::speculative::PreparedGrammarSource<'_>, &WorkingMemoryPool)>(),
-        size_of::<Option<&OriginalTokenTrieSource>>(), size_of::<Result<(), Error>>()];
-    parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        size_of::<(
+            eredu_core::speculative::PreparedGrammarSource<'_>,
+            &MemoryLedger,
+        )>(),
+        size_of::<Option<&OriginalTokenTrieSource>>(),
+        size_of::<Result<(), Error>>(),
+    ];
+    parts
+        .into_iter()
+        .try_fold(size_of_val(&parts), usize::checked_add)
 }
-pub(in super::super) fn validate_grammar_source(source: eredu_core::speculative::PreparedGrammarSource<'_>, pool: &WorkingMemoryPool)
-    -> Result<(), Error> {
-    let original = source.tokenizer().downcast_ref::<OriginalTokenTrieSource>()
+pub(in super::super) fn validate_grammar_source(
+    source: eredu_core::speculative::PreparedGrammarSource<'_>,
+    pool: &MemoryLedger,
+) -> Result<(), Error> {
+    let original = source
+        .tokenizer()
+        .downcast_ref::<OriginalTokenTrieSource>()
         .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-    original.validate_grammar_source(source, pool).map_err(Error::PrefillControl)
+    original
+        .validate_grammar_source(source, pool)
+        .map_err(Error::PrefillControl)
 }

@@ -1,11 +1,11 @@
 use super::*;
-use eredu_core::SharedStorageDomain;
+use eredu_core::SharedStorageAccountingId;
 use serde_json::json;
 use std::{
     convert::Infallible,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -268,12 +268,10 @@ fn absent_and_empty_optional_sections_remain_distinct_with_exact_empty_iterators
 #[test]
 fn mismatched_token_metadata_and_checked_geometry_reject_without_partial_cursor_changes() {
     let mismatch = ConstraintRecipe::new(None, &grammar(), &[], &[], &["x".into()], &[], &[], None);
-    assert!(
-        mismatch
-            .unwrap_err()
-            .to_string()
-            .contains("differ in length")
-    );
+    assert!(mismatch
+        .unwrap_err()
+        .to_string()
+        .contains("differ in length"));
     let mut cursor = usize::MAX;
     assert!(take_span(&mut cursor, 1).is_err());
     assert_eq!(cursor, usize::MAX);
@@ -306,24 +304,20 @@ fn preexisting_recipe_and_source_aliases_share_attachment_until_the_final_source
     );
     let alias = recipe.clone();
     let source = recipe.source().clone();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let drops = Arc::new(AtomicUsize::new(0));
-    assert!(
-        recipe
-            .source()
-            .try_attach(&domain, || {
-                Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Retired(Arc::clone(&drops))))
-            })
-            .unwrap()
-    );
-    assert!(
-        !alias
-            .source()
-            .try_attach(&domain, || -> Result<Box<dyn Send + Sync>, Infallible> {
-                panic!("a preexisting alias must share the attached domain");
-            })
-            .unwrap()
-    );
+    assert!(recipe
+        .source()
+        .try_attach(&domain, || {
+            Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Retired(Arc::clone(&drops))))
+        })
+        .unwrap());
+    assert!(!alias
+        .source()
+        .try_attach(&domain, || -> Result<Box<dyn Send + Sync>, Infallible> {
+            panic!("a preexisting alias must share the attached domain");
+        })
+        .unwrap());
     drop(recipe);
     drop(alias);
     assert_eq!(drops.load(Ordering::SeqCst), 0);

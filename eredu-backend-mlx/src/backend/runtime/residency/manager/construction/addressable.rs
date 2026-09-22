@@ -13,7 +13,7 @@ impl ResidencyManager {
         units: &[OffloadUnit],
         source_stream: &Stream,
         execution_stream: &Stream,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Option<Self>, OriginalManagerError> {
         if units.is_empty() && plan.units().is_empty() {
             return Ok(None);
@@ -38,8 +38,16 @@ impl ResidencyManager {
         // installs ordinary materialization resources, and initializes the
         // supplementary source. Only target-specific setup is absent.
         Self::prepare_original_layerwise_impl(
-            primary, BTreeMap::new(), plan, units, &[], None,
-            source_stream, execution_stream, pool, true,
+            primary,
+            BTreeMap::new(),
+            plan,
+            units,
+            &[],
+            None,
+            source_stream,
+            execution_stream,
+            pool,
+            true,
         )
     }
 }

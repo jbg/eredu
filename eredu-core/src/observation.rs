@@ -128,8 +128,8 @@ impl TensorObservation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ObservationValue {
-    /// Materialized tensor.
-    Tensor(TensorObservation),
+    /// Shared materialized tensor retaining its original host allocation owner.
+    Tensor(SharedTensorObservation),
     /// Floating-point scalar, including timings and ratios.
     Float(f64),
     /// Signed integer scalar.

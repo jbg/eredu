@@ -22,7 +22,7 @@ pub(crate) fn inspect_prediction_module_plan<A, P>(
     parameters: &PredictionParameterStorage,
     validations: usize,
     stream: &Stream,
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
     context: &WorkspaceContext,
 ) -> Result<Option<PredictionModulePlan>, Error>
 where
@@ -42,24 +42,36 @@ where
             _physical: usize,
             module: &MlxPredictionModule<U>,
         ) -> Result<(), Error> {
-            let manager = module.manager.get().ok_or_else(|| identity().at_speculative_stage("prediction module manager"))?;
-            let source = manager
-                .supplementary_residency_source()
-                .ok_or_else(|| identity().at_speculative_stage("prediction supplementary source"))?;
+            let manager = module
+                .manager
+                .get()
+                .ok_or_else(|| identity().at_speculative_stage("prediction module manager"))?;
+            let source = manager.supplementary_residency_source().ok_or_else(|| {
+                identity().at_speculative_stage("prediction supplementary source")
+            })?;
             if let Some(previous) = &self.manager {
                 previous
                     .validate_supplementary_source(source)
-                    .map_err(|_| identity().at_speculative_stage("prediction supplementary manager identity"))?;
+                    .map_err(|_| {
+                        identity().at_speculative_stage("prediction supplementary manager identity")
+                    })?;
             } else {
                 self.manager = Some(manager.clone());
             }
             let ordinal = source
-                .ordinal(module.id.as_ref().ok_or_else(|| identity().at_speculative_stage("prediction module physical identity"))?)
-                .ok_or_else(|| identity().at_speculative_stage("prediction module source ordinal"))?;
+                .ordinal(module.id.as_ref().ok_or_else(|| {
+                    identity().at_speculative_stage("prediction module physical identity")
+                })?)
+                .ok_or_else(|| {
+                    identity().at_speculative_stage("prediction module source ordinal")
+                })?;
             self.context
                 .reserve_metadata_vec(&mut self.ordinals, 1)
                 .map_err(Error::from)?;
-            let copies = module.placeholders.len().checked_add(module.replacements.len())
+            let copies = module
+                .placeholders
+                .len()
+                .checked_add(module.replacements.len())
                 .ok_or_else(overflow)?;
             self.ordinals.push((ordinal, copies));
             Ok(())
@@ -105,10 +117,16 @@ where
             let mut out = context.metadata_vec(calls.len())?;
             for call in calls {
                 out.push(PredictionModuleCall {
-                    source_ordinal: source.ordinals.get(call.module)
-                        .ok_or(WorkspaceMetadataError::Unqualified)?.0,
-                    retained_parameter_copies: source.ordinals.get(call.module)
-                        .ok_or(WorkspaceMetadataError::Unqualified)?.1,
+                    source_ordinal: source
+                        .ordinals
+                        .get(call.module)
+                        .ok_or(WorkspaceMetadataError::Unqualified)?
+                        .0,
+                    retained_parameter_copies: source
+                        .ordinals
+                        .get(call.module)
+                        .ok_or(WorkspaceMetadataError::Unqualified)?
+                        .1,
                     retained_roots: call
                         .retained_roots
                         .ok_or(WorkspaceMetadataError::Unqualified)?,
@@ -252,20 +270,45 @@ impl<U: Parameterized<MlxTensor>> MlxPredictionModule<U> {
     }
 }
 
+trait OriginalValues {
+    fn len(&self) -> usize;
+    fn get(&self, name: &str) -> Option<&MlxTensor>;
+}
+impl OriginalValues for BTreeMap<String, MlxTensor> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn get(&self, name: &str) -> Option<&MlxTensor> {
+        self.get(name)
+    }
+}
+impl OriginalValues for eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn get(&self, name: &str) -> Option<&MlxTensor> {
+        self.get(name)
+    }
+}
+
 /// Same named slot replacement with fallible native handle sharing. An original
 /// failure never escapes through the ordinary infallible Array::clone panic.
-fn publish_original<U: Parameterized<MlxTensor>>(
+fn publish_original<U: Parameterized<MlxTensor>, V: OriginalValues + ?Sized>(
     module: &mut U,
-    values: &BTreeMap<String, MlxTensor>,
+    values: &V,
     binding_rows: usize,
     source: &dyn PreparedPredictionInvocationRoots<MlxTensor>,
 ) -> Result<(), Error> {
-    struct PublishOriginal<'a> {
-        values: &'a BTreeMap<String, MlxTensor>,
+    struct PublishOriginal<'a, V: ?Sized> {
+        values: &'a V,
         failure: Option<safemlx::error::Exception>,
     }
-    impl<'a> ParameterVisitorMut<'a, MlxTensor> for PublishOriginal<'_> {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    impl<'a, V: OriginalValues + ?Sized> ParameterVisitorMut<'a, MlxTensor> for PublishOriginal<'_, V> {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut MlxTensor,
+        ) {
             if self.failure.is_some() {
                 return;
             }
@@ -278,7 +321,7 @@ fn publish_original<U: Parameterized<MlxTensor>>(
         }
     }
     let frames = [
-        size_of::<PublishOriginal<'_>>(),
+        size_of::<PublishOriginal<'_, V>>(),
         size_of::<Result<(), Error>>(),
         size_of::<Result<safemlx::Array, safemlx::error::Exception>>(),
         size_of::<ParameterMetadata>(),

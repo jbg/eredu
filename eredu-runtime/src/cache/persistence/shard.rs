@@ -1,7 +1,7 @@
 //! One immutable source/header layout for ordinary and paid live-cache I/O.
 use super::*;
 use eredu_checkpoint::safetensors::{SafetensorsHeaderError, SafetensorsHeaderPlan};
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding};
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError};
 use safetensors::tensor::{Dtype, TensorInfo};
 use std::mem::{size_of, size_of_val};
 
@@ -14,6 +14,9 @@ pub enum CacheShardError {
     /// Original source/header metadata was not admitted.
     #[error(transparent)]
     Metadata(#[from] WorkspaceMetadataError),
+    /// Retained allocation-source failure from a paid metadata destination.
+    #[error(transparent)]
+    Source(#[from] eredu_nn::Error),
     /// Payload lengths differ from the immutable source declarations.
     #[error("cache shard payload length differs from its source layout")]
     Payload,
@@ -38,7 +41,7 @@ struct Layout {
     header: Vec<u8>,
     file_bytes: usize,
 }
-/// Immutable actual writer layout. Every shared alias retires its bytes and
+/// Immutable encoded or authenticated imported layout. Every shared alias retires its bytes and
 /// declarations before the metadata accounts; this supplies no I/O/native grant.
 #[derive(Clone, Debug)]
 pub struct CacheShardLayout {
@@ -242,20 +245,122 @@ impl CacheShardMetadata {
     }
 }
 impl CacheShardLayout {
+    /// Retains the actual parsed header and offsets of an authenticated import.
+    /// This private producer does not re-encode the header or claim writer origin.
+    pub(super) fn imported(
+        representation: CacheRepresentation,
+        metadata: &safetensors::tensor::Metadata,
+        tensor_count: usize,
+        header: Vec<u8>,
+        file_bytes: usize,
+        context: &WorkspaceContext,
+    ) -> Result<Self, CacheShardError> {
+        use eredu_nn::workspace::WorkspaceMetadataAllocation;
+        let funding = context
+            .metadata_funding()
+            .ok_or(WorkspaceMetadataError::Unqualified)?;
+        context.charge_metadata(size_of::<(
+            Self,
+            [&TensorInfo; 2],
+            [TensorInfo; 2],
+            [usize; 2],
+            Vec<u8>,
+            Result<Self, CacheShardError>,
+        )>())?;
+        let names = cache_shard_tensor_names(representation);
+        let first = metadata.info(names[0]).ok_or(CacheShardError::Header)?;
+        let second = metadata.info(names[1]).ok_or(CacheShardError::Header)?;
+        if tensor_count != 2
+            || header.len() < 8
+            || u64::from_le_bytes(
+                header[..8]
+                    .try_into()
+                    .map_err(|_| CacheShardError::Header)?,
+            ) != u64::try_from(header.len() - 8).map_err(|_| CacheShardError::Header)?
+        {
+            return Err(CacheShardError::Header);
+        }
+        let infos = [first, second];
+        let mut order = [0, 1];
+        if first.data_offsets > second.data_offsets {
+            order.swap(0, 1);
+        }
+        let payload = file_bytes
+            .checked_sub(header.len())
+            .ok_or(CacheShardError::Header)?;
+        let mut offset = 0;
+        for index in order {
+            let info = infos[index];
+            let bits = info
+                .shape
+                .iter()
+                .try_fold(info.dtype.bitsize(), |n, dimension| {
+                    n.checked_mul(*dimension)
+                })
+                .ok_or(CacheShardError::Payload)?;
+            if bits % 8 != 0
+                || info.data_offsets.0 != offset
+                || info.data_offsets.1.checked_sub(offset) != Some(bits / 8)
+            {
+                return Err(CacheShardError::Payload);
+            }
+            offset = info.data_offsets.1;
+        }
+        if offset != payload {
+            return Err(CacheShardError::Payload);
+        }
+        let mut copied = [Vec::new(), Vec::new()];
+        for index in 0..2 {
+            copied[index] = context.metadata_vec(infos[index].shape.len())?;
+            copied[index].extend_from_slice(&infos[index].shape);
+        }
+        let [left, right] = copied;
+        let mut entries = [
+            (
+                names[0],
+                TensorInfo {
+                    dtype: first.dtype,
+                    shape: left,
+                    data_offsets: first.data_offsets,
+                },
+            ),
+            (
+                names[1],
+                TensorInfo {
+                    dtype: second.dtype,
+                    shape: right,
+                    data_offsets: second.data_offsets,
+                },
+            ),
+        ];
+        if order[0] == 1 {
+            entries.swap(0, 1);
+        }
+        Ok(Self {
+            inner: context.metadata_arc(Layout {
+                entries,
+                order,
+                header,
+                file_bytes,
+            })?,
+            source_funding: Some(funding.clone()),
+            header_funding: Some(funding),
+        })
+    }
     /// Actual header plus payload file extent, never inferred from a caller quota.
     pub fn file_bytes(&self) -> usize {
         self.inner.file_bytes
     }
-    /// Tests whether both declarations share this exact immutable writer layout.
+    /// Tests whether both declarations share this exact immutable layout.
     /// Equal shapes or byte lengths cannot substitute for the retained owner.
     pub fn same_layout(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
-    /// The exact header produced once by the shared schema encoder.
+    /// The exact header emitted by the encoder or retained from verified parsing.
     pub fn header(&self) -> &[u8] {
         &self.inner.header
     }
-    /// Borrows this writer's actual shape, scalar encoding and payload length
+    /// Borrows the actual shape, scalar encoding and payload length
     /// in portable representation order. This declares destination geometry;
     /// reading still requires the exact file-version and header validation.
     pub fn tensor_metadata(&self) -> [(&[usize], Dtype, usize); 2] {
@@ -278,12 +383,63 @@ impl CacheShardLayout {
                 return Err(CacheShardError::Payload);
             }
         }
-        file.write_all(&self.inner.header)?;
-        for source in self.inner.order {
-            file.write_all(payloads[source])?;
+        self.write_with(file, |source, file| {
+            file.write_all(payloads[source])
+                .map_err(CacheShardError::from)
+        })
+    }
+
+    /// Writes the same canonical header and payload order from borrowed sources.
+    /// The callback writes one logical tensor to the supplied file. The shared
+    /// worker checks each actual file-position increment against the retained
+    /// layout, including when the source streams bounded readback chunks.
+    /// Source authentication, funding and failed-file cleanup belong to the
+    /// caller; this writer grants no storage or native execution authority.
+    pub fn write_with<E, F>(&self, file: &mut File, mut payload: F) -> Result<(), E>
+    where
+        E: From<CacheShardError>,
+        F: FnMut(usize, &mut File) -> Result<(), E>,
+    {
+        use std::io::Seek as _;
+        let io = |cause| E::from(CacheShardError::Io(cause));
+        file.write_all(&self.inner.header).map_err(io)?;
+        for (entry, source) in self.inner.entries.iter().zip(self.inner.order) {
+            let start = file.stream_position().map_err(io)?;
+            let bytes = u64::try_from(entry.1.data_offsets.1 - entry.1.data_offsets.0)
+                .map_err(|_| E::from(CacheShardError::Payload))?;
+            let end = start
+                .checked_add(bytes)
+                .ok_or_else(|| E::from(CacheShardError::Payload))?;
+            payload(source, file)?;
+            if file.stream_position().map_err(io)? != end {
+                return Err(E::from(CacheShardError::Payload));
+            }
         }
-        file.flush()?;
+        file.flush().map_err(io)?;
         Ok(())
+    }
+
+    /// Fixed controls for the same borrowed-payload writer. The callback's own
+    /// source/readback controls and any destination storage are separate.
+    pub fn write_with_control_bytes<E, F>() -> Option<usize> {
+        let frames = [
+            size_of::<(&Self, &mut File)>(),
+            size_of::<F>(),
+            size_of::<Result<(), E>>(),
+            size_of::<Result<(), std::io::Error>>(),
+            size_of::<Result<u64, std::io::Error>>(),
+            size_of::<[u64; 3]>(),
+            size_of::<(&(&'static str, TensorInfo), usize)>(),
+            size_of::<
+                std::iter::Zip<
+                    std::slice::Iter<'_, (&'static str, TensorInfo)>,
+                    std::array::IntoIter<usize, 2>,
+                >,
+            >(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
     }
     /// Validates this writer's complete actual header/extent and lends tensors
     /// in the original portable representation order, without parsing a new map.

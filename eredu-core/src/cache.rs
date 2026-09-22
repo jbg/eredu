@@ -5,6 +5,8 @@
 
 mod policy;
 mod prompt;
+mod shared_manifest;
+pub use shared_manifest::{PreparedPromptCacheManifest, SharedPromptCacheManifest};
 
 pub use policy::{
     CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,

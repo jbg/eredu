@@ -20,8 +20,8 @@ use safemlx::{
 };
 
 use super::{
-    ResidencyError, ResidencyManager, ResidentHostOwner, ResidentLeaseStorage, ResidentUnitLease, RetainedHostBuffer,
-    transfer::ManagerState,
+    ResidencyError, ResidencyManager, ResidentHostOwner, ResidentLeaseStorage, ResidentUnitLease,
+    RetainedHostBuffer, transfer::ManagerState,
 };
 use crate::backend::{
     nn::workspace::NativeAllocationFacts,
@@ -210,7 +210,7 @@ struct HostPinLeases {
     // A qualified resident source may have only a Device ledger row. Its exact
     // immutable host backup remains owned here without creating Host residency.
     _snapshot: Option<HostCopyWorkspace>,
-    _custody: Option<eredu_runtime::working_memory::OriginalOperationMetadataCustody>,
+    _custody: Option<super::ResidencyControlCustody>,
 }
 
 impl std::fmt::Debug for HostCopySourcePins {
@@ -222,6 +222,9 @@ impl std::fmt::Debug for HostCopySourcePins {
 }
 
 impl HostCopyWorkspace {
+    pub(crate) fn destination_device_index(&self) -> i32 {
+        self.destination.device_index()
+    }
     pub(crate) fn destination_device_type(&self) -> safemlx::DeviceType {
         self.destination.device_type()
     }
@@ -296,9 +299,11 @@ impl HostCopyWorkspace {
         &self,
         manager: &ResidencyManager,
     ) -> Result<(), HostCopyWorkspaceError> {
-        let state = manager.inner.state.lock().map_err(|_| {
-            HostCopyWorkspaceError::Residency(ResidencyError::StatePoisoned)
-        })?;
+        let state = manager
+            .inner
+            .state
+            .lock()
+            .map_err(|_| HostCopyWorkspaceError::Residency(ResidencyError::StatePoisoned))?;
         self.validate_sources_locked(manager, &state)
     }
 
@@ -340,7 +345,29 @@ impl HostCopyWorkspace {
             .ok_or(HostCopyWorkspaceError::Storage(
                 WorkingMemoryError::UnknownBound,
             ))?;
-        self.pin_sources_impl(manager, Some(custody))
+        self.pin_sources_impl(manager, Some(custody.into()))
+    }
+
+    /// Ordinary request installation pays the same pin destinations and keeps
+    /// the actual immutable source at its published tier until completion.
+    /// This supplies host custody only, with no original-operation observer.
+    pub(crate) fn pin_retained_sources_with_host(
+        &self,
+        manager: &ResidencyManager,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<HostCopySourcePins, HostCopyWorkspaceError> {
+        let bytes = self
+            .retained_pin_control_bytes()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(HostCopyWorkspaceError::Storage(
+                WorkingMemoryError::Overflow,
+            ))?;
+        funding.reserve_metadata(bytes).map_err(|cause| {
+            HostCopyWorkspaceError::Storage(WorkingMemoryError::MetadataConstruction(
+                eredu_nn::workspace::WorkspaceMetadataError::Funding(cause),
+            ))
+        })?;
+        self.pin_sources_impl(manager, Some(funding.clone().into()))
     }
 
     /// One initial-quote pin through the accepted quote controls. Mapping a
@@ -392,7 +419,11 @@ impl HostCopyWorkspace {
             .ok()?
             .size()
             .checked_add(Layout::array::<ResidentUnitLease>(count).ok()?.size())?
-            .checked_add(Layout::array::<(MemoryTier, ResidentLeaseStorage)>(count).ok()?.size())?;
+            .checked_add(
+                Layout::array::<(MemoryTier, ResidentLeaseStorage)>(count)
+                    .ok()?
+                    .size(),
+            )?;
         let names = self.units.iter().try_fold(0usize, |sum, unit| {
             sum.checked_add(Layout::array::<u8>(unit.id().as_str().len()).ok()?.size())
         })?;
@@ -407,14 +438,16 @@ impl HostCopyWorkspace {
             size_of::<Result<HostCopySourcePins, HostCopyWorkspaceError>>(),
             size_of::<Result<(), std::collections::TryReserveError>>(),
             size_of::<std::collections::TryReserveError>(),
-            size_of::<Option<eredu_runtime::working_memory::OriginalOperationMetadataCustody>>(),
-            size_of::<eredu_runtime::working_memory::OriginalOperationMetadataCustody>(),
+            size_of::<Option<super::ResidencyControlCustody>>(),
+            size_of::<super::ResidencyControlCustody>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<std::sync::MutexGuard<'static, ManagerState>>(),
         ]
         .into_iter()
         .try_fold(
-            vectors.checked_add(names)?.checked_add(self.source_validation_control_bytes()?)?,
+            vectors
+                .checked_add(names)?
+                .checked_add(self.source_validation_control_bytes()?)?,
             usize::checked_add,
         )?;
         u64::try_from(controls)
@@ -440,7 +473,8 @@ impl HostCopyWorkspace {
             let definition = state.control.unit(unit.id()).ok_or_else(|| {
                 HostCopyWorkspaceError::mismatch("retained host unit disappeared")
             })?;
-            let host = manager.host_workspace_source(state, unit.id())
+            let host = manager
+                .host_workspace_source(state, unit.id())
                 .ok_or_else(|| {
                     HostCopyWorkspaceError::mismatch("retained host store disappeared")
                 })?;
@@ -484,7 +518,12 @@ impl HostCopyWorkspace {
     ) -> Option<usize> {
         use std::mem::{size_of, size_of_val};
         let controls = [
-            size_of::<(&Self, &ResidencyManager, &ManagerState, Result<(), HostCopyWorkspaceError>)>(),
+            size_of::<(
+                &Self,
+                &ResidencyManager,
+                &ManagerState,
+                Result<(), HostCopyWorkspaceError>,
+            )>(),
             size_of::<(&ResidencyManager, &ManagerState, &OffloadUnitId)>(),
             size_of::<Option<&ResidentHostOwner>>(),
             size_of::<(&Self, &ResidencyManager)>(),
@@ -524,7 +563,7 @@ impl HostCopyWorkspace {
     fn pin_sources_impl(
         &self,
         manager: &ResidencyManager,
-        custody: Option<eredu_runtime::working_memory::OriginalOperationMetadataCustody>,
+        custody: Option<super::ResidencyControlCustody>,
     ) -> Result<HostCopySourcePins, HostCopyWorkspaceError> {
         // Put custody behind the deferred owner before any fallible prefix.
         let mut leases = OrdinaryRetirement::new(HostPinLeases {
@@ -560,7 +599,10 @@ impl HostCopyWorkspace {
             .require_initialized()
             .map_err(|error| HostCopyWorkspaceError::Residency(error.into()))?;
         for id in &ids {
-            let host_ready = state.control.ledger().copy_status(id, MemoryTier::Host)
+            let host_ready = state
+                .control
+                .ledger()
+                .copy_status(id, MemoryTier::Host)
                 .map_err(|error| HostCopyWorkspaceError::Residency(error.into()))?
                 .is_some_and(|copy| copy.in_flight().is_none());
             let tier = if host_ready {
@@ -571,21 +613,42 @@ impl HostCopyWorkspace {
                 // Host ledger row or an unowned ordinary checkpoint fallback.
                 MemoryTier::Device
             } else {
-                return Err(HostCopyWorkspaceError::unknown("host source is not ready for pinning"));
+                return Err(HostCopyWorkspaceError::unknown(
+                    "host source is not ready for pinning",
+                ));
             };
-            let copy = state.control.ledger().copy_status(id, tier)
+            let copy = state
+                .control
+                .ledger()
+                .copy_status(id, tier)
                 .map_err(|error| HostCopyWorkspaceError::Residency(error.into()))?
                 .filter(|copy| copy.in_flight().is_none())
-                .ok_or_else(|| HostCopyWorkspaceError::unknown("source storage is not ready for pinning"))?;
-            copy.pins().checked_add(1)
+                .ok_or_else(|| {
+                    HostCopyWorkspaceError::unknown("source storage is not ready for pinning")
+                })?;
+            copy.pins()
+                .checked_add(1)
                 .ok_or_else(|| HostCopyWorkspaceError::unknown("source pin count overflow"))?;
-            let row = state.storage.get(id)
-                .ok_or_else(|| HostCopyWorkspaceError::mismatch("validated source store disappeared"))?;
+            let row = state.storage.get(id).ok_or_else(|| {
+                HostCopyWorkspaceError::mismatch("validated source store disappeared")
+            })?;
             let retained = match tier {
-                MemoryTier::Host => ResidentLeaseStorage::Host(row.host.as_ref()
-                    .ok_or_else(|| HostCopyWorkspaceError::mismatch("validated host store disappeared"))?.clone()),
-                MemoryTier::Device => ResidentLeaseStorage::Device(row.device.as_ref()
-                    .ok_or_else(|| HostCopyWorkspaceError::mismatch("validated device store disappeared"))?.clone()),
+                MemoryTier::Host => ResidentLeaseStorage::Host(
+                    row.host
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostCopyWorkspaceError::mismatch("validated host store disappeared")
+                        })?
+                        .clone(),
+                ),
+                MemoryTier::Device => ResidentLeaseStorage::Device(
+                    row.device
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostCopyWorkspaceError::mismatch("validated device store disappeared")
+                        })?
+                        .clone(),
+                ),
                 MemoryTier::Disk => unreachable!("source pins use a published memory tier"),
             };
             storage.push((tier, retained));
@@ -603,7 +666,10 @@ impl HostCopyWorkspace {
         // All fallible validation and allocations precede the first pin.
         for (id, (tier, storage)) in ids.into_iter().zip(storage) {
             leases.values.push(ResidentUnitLease::with_owner(
-                id, tier, storage, manager.inner.downgrade(),
+                id,
+                tier,
+                storage,
+                manager.inner.downgrade(),
             ));
         }
         drop(state);
@@ -678,10 +744,7 @@ impl ResidencyManager {
         self.host_copy_workspace_locked(&state, ids, allocation)
     }
 
-    fn validate_host_copy_state(
-        &self,
-        state: &ManagerState,
-    ) -> Result<(), HostCopyWorkspaceError> {
+    fn validate_host_copy_state(&self, state: &ManagerState) -> Result<(), HostCopyWorkspaceError> {
         if self.inner.failed_transfer.load(Ordering::Acquire) {
             return Err(HostCopyWorkspaceError::unknown(
                 "manager has failed transfer ownership",
@@ -713,7 +776,10 @@ impl ResidencyManager {
         state: &'a ManagerState,
         id: &OffloadUnitId,
     ) -> Option<&'a ResidentHostOwner> {
-        state.storage.get(id).and_then(|row| row.host.as_ref())
+        state
+            .storage
+            .get(id)
+            .and_then(|row| row.host.as_ref())
             .or_else(|| self.inner.sources.prepared_host(id))
     }
 
@@ -741,10 +807,9 @@ impl ResidencyManager {
                 .control
                 .unit(id)
                 .ok_or_else(|| HostCopyWorkspaceError::mismatch("unknown requested unit"))?;
-            let host = self.host_workspace_source(state, id)
-                .ok_or_else(|| {
-                    HostCopyWorkspaceError::unknown("requested unit has no initialized host store")
-                })?;
+            let host = self.host_workspace_source(state, id).ok_or_else(|| {
+                HostCopyWorkspaceError::unknown("requested unit has no initialized host store")
+            })?;
             if host.buffers.len() != definition.bindings().len() {
                 return Err(HostCopyWorkspaceError::mismatch(
                     "host binding names differ from unit definition",
@@ -773,7 +838,8 @@ impl ResidencyManager {
         for unit in &mut units {
             let id = unit.id();
             let definition = state.control.unit(id).expect("validated locked unit");
-            let host = self.host_workspace_source(state, id)
+            let host = self
+                .host_workspace_source(state, id)
                 .expect("validated locked host store");
             let start = copies.len();
             let mut unit_capacity = 0;
@@ -950,9 +1016,10 @@ impl ResidencyManager {
 /// authenticated by the selected native copy-layout query.
 pub(super) fn copy_shape_is_supported(device: safemlx::DeviceType, shape: &[i32]) -> bool {
     device != safemlx::DeviceType::Cpu
-        || shape.iter().try_fold(1_i32, |n, &d| {
-            (d > 0).then(|| n.checked_mul(d)).flatten()
-        }).is_some()
+        || shape
+            .iter()
+            .try_fold(1_i32, |n, &d| (d > 0).then(|| n.checked_mul(d)).flatten())
+            .is_some()
 }
 
 #[cfg(all(

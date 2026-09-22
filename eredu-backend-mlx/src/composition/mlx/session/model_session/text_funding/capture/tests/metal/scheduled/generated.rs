@@ -1,5 +1,6 @@
 use super::*;
 use crate::composition::mlx::session::capture_workspace::CaptureWorkspaceObserver;
+use crate::memory_fixture::LedgerFixture;
 use crate::{
     backend::nn::linear::{NativeProjectionInputObserver, PhysicalLinear},
     module::Module,
@@ -55,7 +56,6 @@ fn selected_source(width: usize, preview: Option<u64>, empty: bool) -> SharedCap
                     CaptureTransformKind::Preview,
                 ],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             },
             a.request().clone(),
@@ -114,7 +114,7 @@ fn geometry() -> InferenceGeometry {
         output: OutputDemand::LastPosition,
     }
 }
-fn native_quote(input: &Array, source: &SharedCapturePlan) -> u64 {
+fn native_quote(input: &Array, source: &SharedCapturePlan) -> (u64, usize) {
     let c = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
     let mut p = ExistingArrayProjection::new(&c);
     let input = p.project(input).unwrap();
@@ -157,7 +157,7 @@ fn native_quote(input: &Array, source: &SharedCapturePlan) -> u64 {
     assert!(report.unpriced_host_operations.is_empty());
     let bytes = report.total_bytes.unwrap();
     o.end_span(&decode, &c).unwrap();
-    bytes
+    (bytes, report.closing_storage.maximum_allocations)
 }
 struct Count<'a> {
     factory: &'a mut dyn RetainedGeneratedTensorFactory<Array, Error>,
@@ -277,7 +277,7 @@ fn fixture_generated(
     empty: bool,
     stream: &Stream,
 ) -> (SessionFixture, PhysicalLinear) {
-    let bootstrap = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let bootstrap = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let bootstrap_owner = NativeMemoryOwner::acquire(&bootstrap).unwrap();
     let input = Array::from_slice(
         &(0..2 * width)
@@ -301,7 +301,14 @@ fn fixture_generated(
     let h = CaptureRunHostPlan::prepare(&plan)
         .unwrap()
         .initialization_peak_bytes();
-    let n = native_quote(&input, &plan);
+    let (native, closing) = native_quote(&input, &plan);
+    let (ordinary, ordinary_controls) =
+        OrdinaryPublicationPlan::fixture(closing.checked_mul(2).unwrap().checked_add(1).unwrap());
+    let n = native
+        .checked_add(ordinary_controls)
+        .unwrap()
+        .checked_add(capture_publication_allowance(1))
+        .unwrap();
     let mut initial = RetainedStorage::default();
     initial.include_array(&input).unwrap();
     initial.include_array(&module.weight.value).unwrap();
@@ -309,8 +316,7 @@ fn fixture_generated(
         .include_array(module.weight_scale_inv.value.as_ref().unwrap())
         .unwrap();
     initial.include_capture_plan(plan.clone()).unwrap();
-    let baseline = initial.byte_bound().unwrap().unwrap();
-    let pool = WorkingMemoryPool::new(baseline + h + n, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let sources = initial.publish_unquoted(&owner).unwrap();
     drop((owner, bootstrap_owner));
@@ -318,7 +324,7 @@ fn fixture_generated(
     let bank = run
         .prepare_capture_run(&r, CaptureRunHostPlan::prepare(&plan).unwrap())
         .unwrap();
-    let work = FundedWork::new(run.scope().unwrap());
+    let work = FundedWork::new_ordinary(run.scope().unwrap(), ordinary).unwrap();
     (
         SessionFixture {
             pool,
@@ -341,25 +347,39 @@ fn actual_fp8_generated_capture_uses_original_account_and_shared_f32_custody() {
         for dtype in [Dtype::Float16, Dtype::Bfloat16] {
             let stream = stream();
             let (mut f, mut module) = fixture_generated(width, dtype, None, false, &stream);
-            let ceiling = f.pool.effective_capacity().unwrap();
-            assert_eq!(f.pool.used_bytes().unwrap(), ceiling);
+            let ceiling = f.pool.fixture_host_limit().unwrap();
+            let requirement = f
+                .pool
+                .reservation_requirements(f._reservation.admission(), None)
+                .unwrap()
+                .get(f.pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap();
             // Reuse the actual component's admitted diagnostics at a strictly short
             // independent ceiling. This creates no native state or copy permission.
-            let short = WorkingMemoryPool::new(f.h + f.n - 1, 0).unwrap();
+            let short = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+            let exact = short
+                .fixture_host_current()
+                .unwrap()
+                .checked_add(requirement)
+                .unwrap();
             assert!(matches!(
                 short.reserve_with_capacity(
                     &InferenceExecutionIdentity::default(),
                     f._reservation.admission(),
-                    short.effective_capacity().unwrap()
+                    crate::memory_fixture::physical_host_limits(&short, exact - 1)
                 ),
-                Err(WorkingMemoryError::BudgetExceeded { .. })
+                Err(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
             ));
             let (output, calls) = execute(&mut f, &mut module, &stream).unwrap();
             assert_eq!(calls, 1);
             assert!(f.work.roots.borrow().len() >= 10);
             assert!(f.work.scope.borrow().is_some());
             assert!(!f.work.published.get());
-            assert!(f.pool.used_bytes().unwrap() <= ceiling);
+            assert!(f.pool.fixture_host_charge().unwrap() <= ceiling);
             retire_native(&f.work);
             let step = f.capture.take_shared_step().unwrap().unwrap();
             assert_eq!(
@@ -435,6 +455,6 @@ fn late_native_failure_keeps_generated_roots_and_original_error_without_certific
         let pool = f.pool.clone();
         drop((step, module, f));
         retire_records();
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
     }
 }

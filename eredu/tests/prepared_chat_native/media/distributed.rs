@@ -1,6 +1,6 @@
 //! The same public image/tool request through actual tensor and pipeline ranks.
 use super::*;
-use safemlx::{DeviceType, distributed};
+use safemlx::{distributed, DeviceType};
 use std::{
     ops::ControlFlow,
     process::{Command, Stdio},
@@ -176,7 +176,12 @@ fn image_tools_rank() {
             "DISTRIBUTED_MEDIA TP{tensor}/PP{pipeline} rank={rank} choice={choice:?} source policy"
         );
         let chat = model
-            .prepare_chat(&source, &image_policy(choice), CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &image_policy(choice),
+                &native_limits(CAPACITY),
+                &cancel,
+            )
             .unwrap_or_else(fail)
             .unwrap();
         let encoded = tokenizer.encode(chat.rendered_prompt(), false).unwrap();
@@ -209,7 +214,10 @@ fn image_tools_rank() {
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(CAPACITY),
+                memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(CAPACITY),
+                )]),
                 prefill_chunk_positions: NonZeroU64::new(chunk),
                 ..Default::default()
             },
@@ -225,7 +233,7 @@ fn image_tools_rank() {
                 model
                     .prepare_reset_ordinary()
                     .unwrap_or_else(fail)
-                    .reset_admitted(eredu_core::SessionResetLimits::new(CAPACITY))
+                    .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(CAPACITY)))
                     .unwrap_or_else(fail);
                 model.synchronize().unwrap_or_else(fail);
             }

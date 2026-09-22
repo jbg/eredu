@@ -1,16 +1,16 @@
 use super::*;
-use crate::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use crate::working_memory::{MemoryLedger, WorkingMemoryError};
 use eredu_core::{capture::SharedCapturePlan, HostPreparationAuthority};
 
 fn shared() -> SharedCapturePlan {
     SharedCapturePlan::new(plan_for(CaptureTransform::Slice, false))
 }
-fn attach(source: &SharedCapturePlan, pool: &WorkingMemoryPool) {
+fn attach(source: &SharedCapturePlan, pool: &MemoryLedger) {
     let key = source.storage_identity().clone();
     let bytes = source.capacity_bytes().unwrap();
     assert!(source
-        .try_attach(pool.shared_storage_domain(), || {
-            let registration = pool.register_storage([(key, bytes)])?;
+        .try_attach(pool.shared_storage_accounting_id(), || {
+            let registration = pool.register_host_storage([(key, bytes)])?;
             Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(Box::new(registration))
         })
         .unwrap());
@@ -46,7 +46,7 @@ fn sessions_keep_actual_registered_plan_buffers_and_late_attachment_across_alias
     let points = source.admission().points().as_ptr();
     let bytes = source.capacity_bytes().unwrap();
     assert!(bytes > 0);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     let first = CaptureSession::new(source.clone());
     let second = CaptureSession::new(source.clone());
     assert_eq!(first.plan().plan().selections.as_ptr(), pointer);
@@ -55,11 +55,11 @@ fn sessions_keep_actual_registered_plan_buffers_and_late_attachment_across_alias
     attach(&source, &pool); // Both sessions predate source publication.
     let alias = first.shared_plan_source().clone();
     drop((source, first, second));
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert_eq!(alias.admission().plan().selections.as_ptr(), pointer);
     assert_eq!(alias.admission().points().as_ptr(), points);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -70,21 +70,21 @@ fn equal_sources_are_independent_and_two_domains_follow_actual_alias_lifetime() 
     assert!(!a.same_storage(&b));
     let a_bytes = a.capacity_bytes().unwrap();
     let b_bytes = b.capacity_bytes().unwrap();
-    let first = WorkingMemoryPool::new(a_bytes + b_bytes, 0).unwrap();
-    let second = WorkingMemoryPool::new(a_bytes, 0).unwrap();
+    let first = capture_storage_ledger(a_bytes + b_bytes, 2);
+    let second = capture_storage_ledger(a_bytes, 1);
     attach(&a, &first);
     attach(&b, &first);
     attach(&a, &second);
     let session = CaptureSession::new(a.clone());
     let other = CaptureSession::new(b.clone());
     drop((a, b));
-    assert_eq!(first.used_bytes().unwrap(), a_bytes + b_bytes);
+    assert_eq!(first.payload_used_bytes().unwrap(), a_bytes + b_bytes);
     drop(other);
-    assert_eq!(first.used_bytes().unwrap(), a_bytes);
-    assert_eq!(second.used_bytes().unwrap(), a_bytes);
+    assert_eq!(first.payload_used_bytes().unwrap(), a_bytes);
+    assert_eq!(second.payload_used_bytes().unwrap(), a_bytes);
     drop(session);
-    assert_eq!(first.used_bytes().unwrap(), 0);
-    assert_eq!(second.used_bytes().unwrap(), 0);
+    assert_eq!(first.payload_used_bytes().unwrap(), 0);
+    assert_eq!(second.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn dense_sum_and_routed_receipts_retain_the_original_shared_source() {
     for sum in [false, true] {
         let source = shared();
         let bytes = source.capacity_bytes().unwrap();
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let pool = capture_storage_ledger(bytes, 1);
         let mut ledger = CaptureLedger::new(source.admission());
         let receipt = if sum {
             PartitionCaptureReceiptPlan::new_sum(
@@ -117,22 +117,18 @@ fn dense_sum_and_routed_receipts_retain_the_original_shared_source() {
         };
         assert!(receipt.shared_plan_source().same_storage(&source));
         assert_eq!(
-            receipt
-                .shared_plan_source()
-                .admission()
-                .points()
-                .as_ptr(),
+            receipt.shared_plan_source().admission().points().as_ptr(),
             source.admission().points().as_ptr()
         );
         attach(&source, &pool);
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         drop(receipt);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     let source = SharedCapturePlan::new(super::super::super::routed::plan(false));
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     let mut ledger = CaptureLedger::new(source.admission());
     let producers = super::super::super::routed::producers(source.admission(), false);
     let world = producers.len();
@@ -149,19 +145,19 @@ fn dense_sum_and_routed_receipts_retain_the_original_shared_source() {
     attach(&source, &pool);
     let delivery = receipt.into_delivery();
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(delivery);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 struct RetiredAfterSource {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     drops: Arc<AtomicUsize>,
 }
 impl Drop for RetiredAfterSource {
     fn drop(&mut self) {
         assert_eq!(
-            self.pool.used_bytes().unwrap(),
+            self.pool.payload_used_bytes().unwrap(),
             0,
             "all plan source aliases retire before final preparation custody"
         );
@@ -173,7 +169,7 @@ impl Drop for RetiredAfterSource {
 fn live_partition_work_outlives_session_and_retires_source_before_preparation_authority() {
     let source = shared();
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     let mut session = configured_shared(source.clone());
     let transport = transport(world(1), 0, Fault::None);
     session
@@ -189,11 +185,11 @@ fn live_partition_work_outlives_session_and_retires_source_before_preparation_au
     });
     session.retain_host_preparation(&authority).unwrap();
     drop((source, session, authority));
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(work.global_reserved().host_bytes > 0);
     drop(work);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
 }
@@ -249,7 +245,7 @@ fn independent_and_shared_sources_produce_equal_partition_results_and_usage() {
 fn checkpoints_copy_destination_payload_but_keep_original_source_and_custody_separate() {
     let source = shared();
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     let session = CaptureSession::new(source.clone());
     let catalog = discovery(source.admission());
     let saved = session.checkpoint(&catalog).unwrap();
@@ -276,14 +272,14 @@ fn checkpoints_copy_destination_payload_but_keep_original_source_and_custody_sep
     });
     session.retain_host_preparation(&authority).unwrap();
     drop((source, session, saved, authority));
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(
         copy.copied_plan_for_test().plan().selections.as_ptr(),
         second
     );
     drop(copy);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -291,7 +287,7 @@ fn checkpoints_copy_destination_payload_but_keep_original_source_and_custody_sep
 fn child_readmission_is_independent_and_failed_preflight_does_not_publish_an_alias() {
     let source = shared();
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     attach(&source, &pool);
     let mut parent = CaptureSession::new(source.clone());
     let catalog = discovery(source.admission());
@@ -302,13 +298,13 @@ fn child_readmission_is_independent_and_failed_preflight_does_not_publish_an_ali
         limits: source.admission().plan().limits.clone(),
         intervention: None,
     };
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert!(saved
         .fork(fork_request(), |_, _, _| Err(CaptureError::Unsupported(
             "injected preflight".into()
         )))
         .is_err());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let mut child = saved
         .fork(fork_request(), |_, _, _| Ok(CaptureUsage::default()))
         .unwrap();
@@ -321,7 +317,7 @@ fn child_readmission_is_independent_and_failed_preflight_does_not_publish_an_ali
     parent.restore(&saved).unwrap();
     drop((parent, saved, source));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         0,
         "the child owns a distinct admission rather than the original source charge"
     );
@@ -333,7 +329,7 @@ fn child_readmission_is_independent_and_failed_preflight_does_not_publish_an_ali
 fn rejected_shared_receipt_and_checkpoint_keep_original_source_usable() {
     let source = shared();
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     attach(&source, &pool);
     let mut ledger = CaptureLedger::new(source.admission());
     let mut wrong = context(source.admission());
@@ -347,14 +343,14 @@ fn rejected_shared_receipt_and_checkpoint_keep_original_source_usable() {
         &mut ledger,
     )
     .is_err());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     let session = CaptureSession::new(source.clone());
     let mut wrong = discovery(source.admission());
     wrong.catalog.points[0].meaning.push_str(" changed");
     assert!(session.checkpoint(&wrong).is_err());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert!(session.checkpoint(&discovery(source.admission())).is_ok());
     assert!(session.shared_plan_source().same_storage(&source));
     drop((session, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

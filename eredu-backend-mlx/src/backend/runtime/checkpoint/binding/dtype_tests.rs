@@ -12,20 +12,25 @@ use safemlx::{Device, DeviceType, Dtype};
 
 struct Parameter(crate::MlxTensor, ParameterSpec);
 impl Parameter {
-    fn new(value: crate::MlxTensor) -> Self { Self(value, ParameterSpec::trainable("weight").unwrap()) }
+    fn new(value: crate::MlxTensor) -> Self {
+        Self(value, ParameterSpec::trainable("weight").unwrap())
+    }
 }
 
 impl Parameterized<crate::MlxTensor> for Parameter {
-    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, crate::MlxTensor>>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError> {
- let mut __source_result = Ok(());
+    fn visit_parameter_sources<'a, V: eredu_nn::ParameterSourceVisitor<'a, crate::MlxTensor>>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), eredu_nn::ParameterSourceError> {
+        let mut __source_result = Ok(());
 
         visitor.parameter(
             eredu_nn::ParameterMetadataView::from_spec(&self.1, true),
             &self.0,
         );
 
- __source_result
-}
+        __source_result
+    }
 
     fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, crate::MlxTensor>>(
         &'a mut self,
@@ -292,13 +297,31 @@ fn direct_groups_survive_fallbacks_and_parameter_count_boundaries() {
     use safetensors::tensor::{serialize_to_file, TensorView};
     let directory = tempfile::tempdir().unwrap();
     let values = (0..66u8)
-        .map(|value| (format!("weight{value:02}"), vec![value; 2]))
+        .map(|value| {
+            (
+                format!("weight{value:02}"),
+                if value == 65 {
+                    vec![65, 66, 67, 68]
+                } else {
+                    vec![value; 2]
+                },
+            )
+        })
         .collect::<Vec<_>>();
     serialize_to_file(
         values.iter().map(|(name, data)| {
             (
                 name.as_str(),
-                TensorView::new(safetensors::Dtype::U8, vec![1, 2], data).unwrap(),
+                TensorView::new(
+                    safetensors::Dtype::U8,
+                    if data.len() == 4 {
+                        vec![2, 2]
+                    } else {
+                        vec![1, 2]
+                    },
+                    data,
+                )
+                .unwrap(),
             )
         }),
         None,
@@ -321,7 +344,7 @@ fn direct_groups_survive_fallbacks_and_parameter_count_boundaries() {
                 )),
                 axes: vec![1, 0],
             },
-            2,
+            4,
         )
         .unwrap(),
     );
@@ -331,10 +354,10 @@ fn direct_groups_survive_fallbacks_and_parameter_count_boundaries() {
     for (name, expected) in &values[..65] {
         assert_eq!(arrays[name].evaluated().unwrap().as_slice::<u8>(), expected);
     }
-    assert_eq!(arrays["transposed"].shape(), [2, 1]);
+    assert_eq!(arrays["transposed"].shape(), [2, 2]);
     assert_eq!(
         arrays["transposed"].evaluated().unwrap().as_slice::<u8>(),
-        [65, 65]
+        [65, 67, 66, 68]
     );
     #[cfg(unix)]
     assert_eq!(store.source_diagnostics().unwrap().physical_reads, 3);

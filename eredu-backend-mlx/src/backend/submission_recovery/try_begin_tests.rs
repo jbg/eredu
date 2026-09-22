@@ -1,8 +1,6 @@
 use super::*;
 use eredu_core::*;
-use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, InferenceRequest, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, InferenceRequest, MemoryLedger};
 use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Stream};
 use std::{
     cell::Cell,
@@ -14,7 +12,7 @@ use std::{
 };
 
 // A charge-lifetime fixture only, not a numerical bound for the native arrays.
-fn request() -> (WorkingMemoryPool, InferenceRequest, u64) {
+fn request() -> (MemoryLedger, InferenceRequest, u64) {
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -27,9 +25,8 @@ fn request() -> (WorkingMemoryPool, InferenceRequest, u64) {
         input: InputTokenCount::text(3),
         max_output_tokens: 1,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(0),
+        memory_limits: Default::default(),
     };
     let capabilities = ModelCapabilities {
         effective_model_type: "try-begin custody fixture".into(),
@@ -56,23 +53,34 @@ fn request() -> (WorkingMemoryPool, InferenceRequest, u64) {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: bound(),
-        attention: bound(),
-        vocabulary: bound(),
-        state_update: bound(),
-        materialization: bound(),
-        retained: bound(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: bound(),
+            attention: bound(),
+            vocabulary: bound(),
+            state_update: bound(),
+            materialization: bound(),
+            retained: bound(),
+        },
+    ))
     .unwrap();
     let AdmissionResult::Admitted(admission) =
-        apply_admission_policy(&capabilities, request, state, None).unwrap()
+        apply_admission_policy(&capabilities, request, crate::memory_fixture::state(state))
+            .unwrap()
     else {
         panic!("fixture admission")
     };
-    let charge = admission.incremental_required_bytes;
-    let pool = WorkingMemoryPool::new(charge, 0).unwrap();
+    let charge = admission.incremental_required_bytes.unwrap();
+    let seed = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let full = seed.reservation_requirements(&admission, None).unwrap();
+    let host_bytes = full
+        .get(seed.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let pool = crate::memory_fixture::ledger(host_bytes, 0).unwrap();
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &admission)
         .unwrap();
@@ -157,7 +165,7 @@ fn busy_returns_the_exact_resource_owner_and_request_without_copy_or_reap() {
     assert!(matches!(error.cause(), SubmissionScopeBeginError::Busy));
     assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charge);
     assert_eq!(error.retention().arrays.as_ptr(), ptr);
     error
         .retention()
@@ -179,7 +187,7 @@ fn busy_returns_the_exact_resource_owner_and_request_without_copy_or_reap() {
     assert_eq!(resources.request.geometry().input_positions, 3);
     drop(resources);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -190,14 +198,14 @@ fn dropping_busy_error_releases_only_its_unused_owner() {
     let alias = resources.arrays[0].clone();
     let allocation = alias.try_metadata_snapshot().unwrap().allocation();
     let error = with_foreign_runtime(|| Recovery::try_begin(resources)).unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charge);
     assert!(std::error::Error::source(&error)
         .unwrap()
         .downcast_ref::<SubmissionScopeBeginError>()
         .is_some());
     drop(error);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     assert_eq!(
         alias.try_metadata_snapshot().unwrap().allocation(),
         allocation
@@ -231,7 +239,7 @@ fn successful_try_begin_keeps_resources_until_explicit_reap_after_real_completio
     // finished. Actual event completion is observed only after recovery Drop.
     with_foreign_runtime(|| drop(recovery));
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charge);
     completion.synchronize().unwrap();
     let before = HOUSEKEEPING.with(Cell::get);
     let ordinary = Array::from_slice(&[11_i32], &[1]);
@@ -243,7 +251,7 @@ fn successful_try_begin_keeps_resources_until_explicit_reap_after_real_completio
         0,
         "try_begin registered an automatic reaper"
     );
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charge);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while drops.load(Ordering::SeqCst) == 0 {
         reap();
@@ -254,7 +262,7 @@ fn successful_try_begin_keeps_resources_until_explicit_reap_after_real_completio
         std::thread::yield_now();
     }
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     assert_eq!(
         output.evaluated().unwrap().as_slice::<f32>(),
         &[4., 9., 25., 49.]
@@ -306,7 +314,7 @@ fn nested_and_outer_abandon_pending_without_failure_or_blocked_completion() {
         "one bounded retirement attempt per owner, never Recovery::finish"
     );
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(pool.used_bytes().unwrap(), charge);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charge);
     // Only independent completion evidence permits release. A deadline alone did not.
     status.set(Status {
         settled: true,
@@ -320,57 +328,43 @@ fn nested_and_outer_abandon_pending_without_failure_or_blocked_completion() {
         }
     }
     assert_eq!(drops.load(Ordering::SeqCst), 2);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
 fn ordinary_prefill_busy_retires_only_unused_request_and_preserves_native_cause() {
     let _hook = Hook::install();
-    // Unreserved ordinary completion creates a fresh thread-local empty root
-    // owner. Reserved compatibility has no collector. Neither has submitted.
-    for reserved in [false, true] {
-        let (pool, paid, charge) = request();
-        let request = if reserved {
-            paid
-        } else {
-            let request = InferenceRequest::without_memory_budget(
-                &InferenceExecutionIdentity::default(),
-                paid.geometry(),
-            )
-            .unwrap();
-            drop(paid);
-            request
-        };
-        let identity = request.clone();
-        let error = with_foreign_runtime(|| prefill::begin_ordinary(request)).unwrap_err();
-        let crate::backend::error::Error::Other(owner) = &error else {
-            panic!("ordinary prefill lost the supplied request")
-        };
-        let owner = owner
-            .downcast_ref::<RecoveryBeginError<prefill::PrefillRequestRetention>>()
-            .unwrap();
-        owner
-            .retention()
-            .0
-            .validate_same_request(&identity)
-            .unwrap();
-        assert!(matches!(
-            std::error::Error::source(owner)
-                .unwrap()
-                .downcast_ref::<SubmissionScopeBeginError>(),
-            Some(SubmissionScopeBeginError::Busy)
-        ));
-        assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
-        drop(identity);
-        assert_eq!(
-            pool.used_bytes().unwrap(),
-            if reserved { charge } else { 0 }
-        );
-        // The error owns the request, but neither roots nor accepted work.
-        // Last-owner retirement on another thread proves no Rc escaped.
-        fn requires_send_sync<T: Send + Sync>(_: &T) {}
-        requires_send_sync(&error);
-        std::thread::spawn(move || drop(error)).join().unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
+    let (pool, request, charge) = request();
+    let identity = request.clone();
+    let error = with_foreign_runtime(|| prefill::begin_ordinary(request)).unwrap_err();
+    let crate::backend::error::Error::Other(owner) = &error else {
+        panic!("ordinary prefill lost the supplied request")
+    };
+    let owner = owner
+        .downcast_ref::<RecoveryBeginError<prefill::PrefillRequestRetention>>()
+        .unwrap();
+    owner
+        .retention()
+        .0
+        .validate_same_request(&identity)
+        .unwrap();
+    assert!(matches!(
+        std::error::Error::source(owner)
+            .unwrap()
+            .downcast_ref::<SubmissionScopeBeginError>(),
+        Some(SubmissionScopeBeginError::Busy)
+    ));
+    assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
+    drop(identity);
+    assert_eq!(pool.fixture_host_charge().unwrap(), charge);
+    // The error owns the request, but neither roots nor accepted work.
+    // Last-owner retirement on another thread proves no Rc escaped.
+    fn requires_send_sync<T: Send + Sync>(_: &T) {}
+    requires_send_sync(&error);
+    std::thread::spawn(move || drop(error)).join().unwrap();
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

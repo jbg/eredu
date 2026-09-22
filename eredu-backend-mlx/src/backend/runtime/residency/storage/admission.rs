@@ -4,16 +4,17 @@ use super::*;
 use crate::backend::error::Error;
 use crate::backend::ordinary_retirement::OrdinaryRetirement;
 use eredu_runtime::working_memory::{
-    UnquotedOriginalSlotSources, WorkingMemoryError, WorkingMemoryPool, WorkingMemoryStorage,
+    MemoryLedger, StorageAllocation, UnquotedOriginalSlotSources, WorkingMemoryError,
+    WorkingMemoryStorage,
 };
 
 mod publication;
 mod source_pin;
-pub(crate) use source_pin::SourcePinPlan;
 pub(crate) use publication::{
-    PendingCopyPublication, CopyPublicationLayout, PendingNativePublication,
-    RetainedStoragePublication, retain_copy_publication_failure,
+    retain_copy_publication_failure, CopyPublicationLayout, PendingCopyPublication,
+    PendingNativePublication, RetainedStoragePublication,
 };
+pub(crate) use source_pin::SourcePinPlan;
 
 /// Pin the Arc allocation's address while it is used as an accounting key.
 /// Weak ownership does not keep the strong payload alive; for an inline byte
@@ -52,6 +53,7 @@ impl Ord for ByteStorageIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum StorageIdentity {
     Native(safemlx::AllocationIdentity),
+    NativeControl(safemlx::AllocationIdentity),
     GroupBuffer(safemlx::distributed::GroupBufferIdentity),
     Source(eredu_checkpoint::store::SourceStorageIdentity),
     Bytes(ByteStorageIdentity),
@@ -74,7 +76,12 @@ impl eredu_runtime::working_memory::HostSlotStorageKey for StorageIdentity {
     fn host_slot_identity(&self) -> Option<&eredu_runtime::HostMetadataKey> {
         match self {
             Self::HostMetadata(identity) => Some(identity),
-            Self::Native(_) | Self::GroupBuffer(_) | Self::Source(_) | Self::Bytes(_) | Self::CapturePlan(_) => None,
+            Self::Native(_)
+            | Self::NativeControl(_)
+            | Self::GroupBuffer(_)
+            | Self::Source(_)
+            | Self::Bytes(_)
+            | Self::CapturePlan(_) => None,
         }
     }
 }
@@ -116,7 +123,7 @@ impl RetainedStorageReservation {
 
     /// Full inventory capacity, including aliases shared with other registrations.
     /// Only the pool's used-byte report gives total domain usage.
-    pub fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> Option<u64> {
         self.0.charge.bytes()
     }
 }
@@ -166,27 +173,52 @@ impl RetainedStorage {
     /// are supplied separately by the selected lowering, never a byte cap.
     pub(crate) fn original_publication_rows(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Option<usize>, Error> {
         if let Some(census) = &self.census {
-            return Ok((!self.incomplete).then_some(census.rows));
+            if census.overflowed {
+                return Err(Error::PrefillControl(WorkingMemoryError::Overflow));
+            }
+            return Ok((census.original && !self.incomplete).then_some(census.rows));
         }
-        if self.byte_bound()?.is_none()
+        if self.validate_inventory_completeness().is_err()
             || !self.byte_buffers.is_empty()
             || !self.capture_plans.is_empty()
         {
             return Ok(None);
         }
         for (identity, bytes) in self.source_capacities() {
-            match pool.validate_retained_source_inventory(&StorageIdentity::Source(identity), bytes) {
+            match pool.validate_retained_source_inventory(&StorageIdentity::Source(identity), bytes)
+            {
                 Ok(()) => {}
                 Err(WorkingMemoryError::UnknownBound) => return Ok(None),
                 Err(cause) => return Err(Error::PrefillControl(cause)),
             }
         }
+        let controls = self
+            .array_entries()
+            .try_fold(0usize, |count, (_, (_, array))| {
+                let facts = array
+                    .try_allocation_info()
+                    .map_err(array_inspection_error)?
+                    .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+                count
+                    .checked_add(usize::from(facts.host_control_bytes() != 0))
+                    .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))
+            })?;
+        let host_controls = self
+            .host_entries()
+            .try_fold(0usize, |count, (_, (_, host))| {
+                let facts = host.try_allocation_info().map_err(host_inspection_error)?;
+                count
+                    .checked_add(usize::from(facts.host_control_bytes() != 0))
+                    .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))
+            })?;
         // Counting both sides of a captured alias is conservative and uses
         // actual rows. Registry commit still deduplicates physical identities.
         [
+            controls,
+            host_controls,
             self.array_entries().count(),
             self.group_buffer_entries().count(),
             self.host_entries().count(),
@@ -205,7 +237,7 @@ impl RetainedStorage {
     /// This performs no witness collection or registration mutation.
     pub(crate) fn validate_original_table(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         expected: Option<&eredu_runtime::working_memory::OriginalResidentResetSource>,
     ) -> Result<(), Error> {
         self.validate_original_sources(pool, expected, None)
@@ -216,11 +248,11 @@ impl RetainedStorage {
     /// authenticating residence alone never permits an unrelated original source.
     pub(crate) fn validate_original_sources(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         expected: Option<&eredu_runtime::working_memory::OriginalResidentResetSource>,
         prepared: Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>,
     ) -> Result<(), Error> {
-        if prepared.is_some_and(|source| !source.pool().same_domain(pool)) {
+        if prepared.is_some_and(|source| !source.pool().same_ledger(pool)) {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
         }
         for (_, (_, metadata)) in self.metadata_entries() {
@@ -239,8 +271,7 @@ impl RetainedStorage {
                 }
             }
         }
-        self.byte_bound()?
-            .ok_or_else(|| Error::text_admission(WorkingMemoryError::UnknownBound))?;
+        self.validate_inventory_completeness()?;
         if let Some(expected) = expected {
             pool.pin_original_reset_slots(expected.metadata())
                 .map_err(|e| Error::Other(Box::new(e)))?;
@@ -270,10 +301,18 @@ impl RetainedStorage {
     /// retains actual payload ownership through copying and native recovery.
     pub(crate) fn pin_registered(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<WorkingMemoryStorage<StorageIdentity>, Error> {
-        let (entries, mut original) = self.source_entries(pool, None)?;
-        pool.pin_registered_storage(entries)
+        let maximum = self.generic_publication_rows(pool)?;
+        let prepared = prepare_storage_publication(pool, maximum).map_err(Error::PrefillControl)?;
+        let (entries, mut original) =
+            self.source_entries_prepared(pool, None, maximum, prepared.host_authority())?;
+        prepared
+            .pin_registered_storage(
+                entries
+                    .into_iter()
+                    .map(|(key, allocation)| (key, allocation.capacity_bytes())),
+            )
             .and_then(|storage| storage.with_original_reset_sources(&mut original))
             .map_err(|error| original_source_failure(Error::Other(Box::new(error)), original))
     }
@@ -283,19 +322,22 @@ impl RetainedStorage {
     /// custody; they never become ordinary registrations or new capacity credit.
     pub(crate) fn pin_registered_with_host(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         host: &eredu_core::HostPreparationAuthority,
     ) -> Result<WorkingMemoryStorage<StorageIdentity>, Error> {
         self.source_pin_plan(pool)?.pin(self, pool, host)
     }
 
-    /// Registers certified existing payloads atomically against the same domain
-    /// that admits requests. Separate model/source inventories share charges for
+    /// Registers certified existing payloads atomically in the ledger that
+    /// admits requests. Separate model/source inventories share charges for
     /// identical backing, including host/device aliases on unified memory.
     /// Unknown storage is rejected before accounting changes or native work.
-    pub fn register(self, pool: &WorkingMemoryPool) -> Result<RetainedStorageReservation, Error> {
-        let (entries, mut original) = self.source_entries(pool, None)?;
-        let charge = pool
+    pub fn register(self, pool: &MemoryLedger) -> Result<RetainedStorageReservation, Error> {
+        let maximum = self.generic_publication_rows(pool)?;
+        let prepared = prepare_storage_publication(pool, maximum).map_err(Error::PrefillControl)?;
+        let (entries, mut original) =
+            self.source_entries_prepared(pool, None, maximum, prepared.host_authority())?;
+        let charge = prepared
             .register_storage_with_gguf_sources(entries)
             .and_then(|storage| storage.with_original_reset_sources(&mut original))
             .map_err(|error| original_source_failure(Error::Other(Box::new(error)), original))?;
@@ -311,11 +353,47 @@ impl RetainedStorage {
     // ordinary participant. Pool-only/funded callers reject before any Vec.
     fn source_entries(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         owner: Option<&crate::backend::managed_memory::NativeMemoryOwner>,
-    ) -> Result<(Vec<(StorageIdentity, u64)>, UnquotedOriginalSlotSources), Error> {
-        self.byte_bound()?
-            .ok_or_else(|| Error::text_admission(WorkingMemoryError::UnknownBound))?;
+    ) -> Result<
+        (
+            Vec<(StorageIdentity, StorageAllocation)>,
+            UnquotedOriginalSlotSources,
+        ),
+        Error,
+    > {
+        self.source_entries_inner(pool, owner, None)
+    }
+
+    fn source_entries_prepared(
+        &self,
+        pool: &MemoryLedger,
+        owner: Option<&crate::backend::managed_memory::NativeMemoryOwner>,
+        maximum: usize,
+        host: &eredu_core::HostPreparationAuthority,
+    ) -> Result<
+        (
+            Vec<(StorageIdentity, StorageAllocation)>,
+            UnquotedOriginalSlotSources,
+        ),
+        Error,
+    > {
+        self.source_entries_inner(pool, owner, Some((maximum, host)))
+    }
+
+    fn source_entries_inner(
+        &self,
+        pool: &MemoryLedger,
+        owner: Option<&crate::backend::managed_memory::NativeMemoryOwner>,
+        preparation: Option<(usize, &eredu_core::HostPreparationAuthority)>,
+    ) -> Result<
+        (
+            Vec<(StorageIdentity, StorageAllocation)>,
+            UnquotedOriginalSlotSources,
+        ),
+        Error,
+    > {
+        self.validate_inventory_completeness()?;
         // Every originally constructed cache remains an explicit inventory
         // owner. Ordinary publication can consume its authenticated residence;
         // pool-only/funded callers need D's separate source profile first.
@@ -325,7 +403,7 @@ impl RetainedStorage {
                     result.map_err(|error| Error::Other(Box::new(error)))?;
                     let owner = owner
                         .ok_or_else(|| Error::text_admission(WorkingMemoryError::UnknownBound))?;
-                    if !owner.pool().same_domain(pool) {
+                    if !owner.pool().same_ledger(pool) {
                         return Err(Error::Other(Box::new(WorkingMemoryError::IdentityMismatch)));
                     }
                 }
@@ -341,10 +419,13 @@ impl RetainedStorage {
         let mut original = if has_original {
             let owner =
                 owner.ok_or_else(|| Error::text_admission(WorkingMemoryError::UnknownBound))?;
-            if !owner.pool().same_domain(pool) {
+            if !owner.pool().same_ledger(pool) {
                 return Err(Error::Other(Box::new(WorkingMemoryError::IdentityMismatch)));
             }
-            UnquotedOriginalSlotSources::prepare(&owner.unquoted_lease()?)
+            let (maximum, host) =
+                preparation.ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+            UnquotedOriginalSlotSources::prepare(&owner.unquoted_lease()?, maximum, host)
+                .map_err(Error::PrefillControl)?
         } else {
             UnquotedOriginalSlotSources::default()
         };
@@ -367,7 +448,9 @@ impl RetainedStorage {
                 }
             }
         }
-        let mut entries = match self.storage_entries() {
+        let mut entries = match self
+            .placed_storage_entries_bounded(pool, preparation.map(|(maximum, _)| maximum))
+        {
             Ok(entries) => entries,
             Err(error) => return Err(original_source_failure(error, original)),
         };
@@ -381,16 +464,200 @@ impl RetainedStorage {
         Ok((entries, original))
     }
 
+    /// Counts every possible row from borrowed allocation facts without allocating.
+    pub(crate) fn generic_publication_rows(&self, pool: &MemoryLedger) -> Result<usize, Error> {
+        if let Some(census) = &self.census {
+            if census.overflowed {
+                return Err(Error::PrefillControl(WorkingMemoryError::Overflow));
+            }
+            if !census.pool.same_ledger(pool) {
+                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            }
+            return (!self.incomplete)
+                .then_some(census.rows)
+                .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound));
+        }
+        self.validate_physical_attribution(pool)?;
+        let mut rows = 0usize;
+        let mut add = |n| {
+            rows = rows
+                .checked_add(n)
+                .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+            Ok::<_, Error>(())
+        };
+        for (_, (_, array)) in self.array_entries() {
+            let facts = array
+                .try_allocation_info()
+                .map_err(array_inspection_error)?
+                .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+            add(1 + usize::from(facts.host_control_bytes() != 0))?;
+        }
+        for (identity, (_, host)) in self.host_entries() {
+            if self.array_entry(identity).is_none() {
+                let facts = host.try_allocation_info().map_err(host_inspection_error)?;
+                add(1 + usize::from(facts.host_control_bytes() != 0))?;
+            }
+        }
+        for count in [
+            self.group_buffer_entries().count(),
+            self.source_capacities().count(),
+            self.byte_values().count(),
+            self.metadata_entries().count(),
+            self.slot_entries().count(),
+            self.capture_entries().count(),
+        ] {
+            add(count)?;
+        }
+        Ok(rows)
+    }
+
     fn storage_entries(&self) -> Result<Vec<(StorageIdentity, u64)>, Error> {
         self.storage_entries_with_capacity(self.original_maximum_rows())
+    }
+
+    /// Validates each original backing's physical attribution without forming
+    /// an aggregate byte total or allocating a second inventory.
+    pub(crate) fn validate_physical_attribution(&self, pool: &MemoryLedger) -> Result<(), Error> {
+        self.validate_inventory_completeness()?;
+        for (identity, (bytes, array)) in self.array_entries() {
+            let info = array
+                .allocation_info()?
+                .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+            if info.identity() != *identity || u64::try_from(info.bytes()).ok() != Some(*bytes) {
+                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            }
+            crate::backend::managed_memory::allocation_placement_handle(&info, pool)
+                .map_err(|cause| Error::PrefillControl(cause.into()))?;
+        }
+        for (identity, (bytes, host)) in self.host_entries() {
+            let info = host.allocation_info()?;
+            if info.identity() != *identity || u64::try_from(info.bytes()).ok() != Some(*bytes) {
+                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            }
+            crate::backend::managed_memory::allocation_placement_handle(&info, pool)
+                .map_err(|cause| Error::PrefillControl(cause.into()))?;
+        }
+        for (_, (_, buffer)) in self.group_buffer_entries() {
+            if buffer.allocation_placement() != safemlx::AllocationPlacement::Host {
+                return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
+            }
+        }
+        // Remaining rows are controlled host allocations; publication uses the
+        // same host placement and authenticates their source identities.
+        Ok(())
+    }
+
+    pub(crate) fn has_no_payload(&self) -> Result<bool, Error> {
+        self.validate_inventory_completeness()?;
+        Ok(!self.array_entries().any(|(_, (bytes, _))| *bytes != 0)
+            && !self.host_entries().any(|(_, (bytes, _))| *bytes != 0)
+            && !self
+                .group_buffer_entries()
+                .any(|(_, (bytes, _))| *bytes != 0)
+            && !self.metadata_entries().any(|(_, (bytes, _))| *bytes != 0)
+            && !self.slot_entries().any(|(_, (bytes, _))| *bytes != 0)
+            && !self.source_capacities().any(|(_, bytes)| bytes != 0)
+            && !self.byte_values().any(|bytes| !bytes.is_empty())
+            && !self.capture_entries().any(|(_, (bytes, _))| *bytes != 0))
+    }
+
+    fn validate_inventory_completeness(&self) -> Result<(), Error> {
+        if self.census.is_some()
+            || self.incomplete
+            || !self.unknown_arrays.is_empty()
+            || self
+                .original
+                .as_ref()
+                .is_some_and(|v| !v.has_complete_capacity_facts())
+            || !self.unknown_metadata.is_empty()
+            || !self.unknown_slot_metadata.is_empty()
+            || !self.unknown_capture_plans.is_empty()
+        {
+            return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
+        }
+        Ok(())
+    }
+
+    fn placed_storage_entries(
+        &self,
+        pool: &MemoryLedger,
+    ) -> Result<Vec<(StorageIdentity, StorageAllocation)>, Error> {
+        self.placed_storage_entries_bounded(pool, None)
+    }
+
+    fn placed_storage_entries_bounded(
+        &self,
+        pool: &MemoryLedger,
+        maximum: Option<usize>,
+    ) -> Result<Vec<(StorageIdentity, StorageAllocation)>, Error> {
+        let entries = if let Some(maximum) = maximum {
+            self.storage_entries_with_capacity_mode(Some(maximum), false)?
+        } else {
+            self.storage_entries()?
+        };
+        let mut placed = Vec::new();
+        placed
+            .try_reserve_exact(entries.capacity())
+            .map_err(|cause| {
+                Error::PrefillControl(WorkingMemoryError::ControlStorageReserve(cause))
+            })?;
+        if placed.capacity() != entries.capacity() {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
+        for (key, bytes) in entries {
+            let placement = match &key {
+                StorageIdentity::Native(identity) => {
+                    let info = if let Some((_, array)) = self.array_entry(identity) {
+                        array
+                            .allocation_info()?
+                            .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?
+                    } else if let Some((_, host)) = self.host_entry(identity) {
+                        host.allocation_info()?
+                    } else {
+                        return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+                    };
+                    if info.identity() != *identity
+                        || u64::try_from(info.bytes()).ok() != Some(bytes)
+                    {
+                        return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+                    }
+                    crate::backend::managed_memory::allocation_placement_handle(&info, pool)
+                        .map_err(|cause| Error::PrefillControl(cause.into()))?
+                }
+                StorageIdentity::GroupBuffer(identity) => {
+                    let (_, (_, buffer)) = self
+                        .group_buffer_entries()
+                        .find(|(id, _)| *id == identity)
+                        .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
+                    if buffer.allocation_placement() != safemlx::AllocationPlacement::Host {
+                        return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
+                    }
+                    pool.host_placement_handle()
+                }
+                StorageIdentity::NativeControl(_)
+                | StorageIdentity::Source(_)
+                | StorageIdentity::Bytes(_)
+                | StorageIdentity::HostMetadata(_)
+                | StorageIdentity::CapturePlan(_) => pool.host_placement_handle(),
+            };
+            placed.push((key, StorageAllocation::new(bytes, placement)));
+        }
+        Ok(placed)
     }
 
     fn storage_entries_with_capacity(
         &self,
         maximum: Option<usize>,
     ) -> Result<Vec<(StorageIdentity, u64)>, Error> {
-        self.byte_bound()?
-            .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+        self.storage_entries_with_capacity_mode(maximum, maximum.is_some())
+    }
+
+    fn storage_entries_with_capacity_mode(
+        &self,
+        maximum: Option<usize>,
+        original_only: bool,
+    ) -> Result<Vec<(StorageIdentity, u64)>, Error> {
+        self.validate_inventory_completeness()?;
         let mut entries = Vec::new();
         if let Some(rows) = maximum {
             entries
@@ -413,20 +680,43 @@ impl RetainedStorage {
                 entries.push((key, bytes));
                 Ok(())
             };
-        for (identity,(bytes,_)) in self.group_buffer_entries(){push(StorageIdentity::GroupBuffer(*identity),*bytes)?;}
-        for (identity, (bytes, _)) in self.array_entries() {
-            push(StorageIdentity::Native(*identity), *bytes)?;
+        for (identity, (bytes, _)) in self.group_buffer_entries() {
+            push(StorageIdentity::GroupBuffer(*identity), *bytes)?;
         }
-        for (identity, (bytes, _)) in self.host_entries() {
+        for (identity, (bytes, array)) in self.array_entries() {
+            push(StorageIdentity::Native(*identity), *bytes)?;
+            let facts = array
+                .try_allocation_info()
+                .map_err(array_inspection_error)?
+                .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
+            if facts.identity() != *identity || u64::try_from(facts.bytes()).ok() != Some(*bytes) {
+                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            }
+            let controls = checked_bytes(facts.host_control_bytes())?;
+            if controls != 0 {
+                push(StorageIdentity::NativeControl(*identity), controls)?;
+            }
+        }
+        for (identity, (bytes, host)) in self.host_entries() {
             if self.array_entry(identity).is_none() {
                 push(StorageIdentity::Native(*identity), *bytes)?;
+                let facts = host.try_allocation_info().map_err(host_inspection_error)?;
+                if facts.identity() != *identity
+                    || u64::try_from(facts.bytes()).ok() != Some(*bytes)
+                {
+                    return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+                }
+                let controls = checked_bytes(facts.host_control_bytes())?;
+                if controls != 0 {
+                    push(StorageIdentity::NativeControl(*identity), controls)?;
+                }
             }
         }
         for (identity, bytes) in self.source_capacities() {
             push(StorageIdentity::Source(identity), bytes)?;
         }
         for bytes in self.byte_values() {
-            if fixed {
+            if original_only {
                 return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
             }
             push(
@@ -447,7 +737,7 @@ impl RetainedStorage {
             )?;
         }
         for (identity, (bytes, _)) in self.capture_entries() {
-            if fixed {
+            if original_only {
                 return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
             }
             push(StorageIdentity::CapturePlan(identity.clone()), *bytes)?;
@@ -476,3 +766,69 @@ impl eredu_runtime::working_memory::GgufSourceStorageKey for StorageIdentity {
         }
     }
 }
+
+/// Shared producer quotation for generic descriptors, publication attachments,
+/// and their retained native owner. Original prepared publication has its own layout.
+pub(crate) fn generic_storage_publication_layout(
+    maximum: usize,
+) -> Result<
+    eredu_runtime::working_memory::StoragePublicationLayout<StorageIdentity>,
+    WorkingMemoryError,
+> {
+    use std::{alloc::Layout, mem::size_of};
+    let descriptors = Layout::array::<(StorageIdentity, u64)>(maximum)
+        .map_err(|_| WorkingMemoryError::Overflow)?
+        .size()
+        .checked_add(
+            Layout::array::<(StorageIdentity, StorageAllocation)>(maximum)
+                .map_err(|_| WorkingMemoryError::Overflow)?
+                .size(),
+        )
+        .ok_or(WorkingMemoryError::Overflow)?;
+    let registered = Layout::new::<[usize; 2]>()
+        .extend(Layout::new::<OrdinaryRetirement<RegisteredStorage>>())
+        .map_err(|_| WorkingMemoryError::Overflow)?
+        .0
+        .pad_to_align()
+        .size();
+    let extra = u64::try_from(descriptors)
+        .map_err(|_| WorkingMemoryError::Overflow)?
+        .checked_add(
+            publication::publication_control_bytes(maximum)
+                .ok_or(WorkingMemoryError::UnknownBound)?,
+        )
+        .and_then(|n| {
+            n.checked_add(publication::generic_native_attachment_control_bytes(
+                maximum,
+            )?)
+        })
+        .and_then(|n| n.checked_add(registered as u64))
+        .and_then(|n| n.checked_add(size_of::<RegisteredStorage>() as u64))
+        .and_then(|n| n.checked_add(OrdinaryRetirement::<RegisteredStorage>::control_bytes()?))
+        .and_then(|n| n.checked_add(UnquotedOriginalSlotSources::constructor_bytes(maximum).ok()?))
+        .ok_or(WorkingMemoryError::Overflow)?;
+    eredu_runtime::working_memory::StoragePublicationLayout::new(maximum)?
+        .with_additional_host_metadata(extra)
+}
+pub(crate) fn prepare_storage_publication(
+    pool: &MemoryLedger,
+    maximum: usize,
+) -> Result<
+    eredu_runtime::working_memory::PreparedStoragePublication<StorageIdentity>,
+    WorkingMemoryError,
+> {
+    generic_storage_publication_layout(maximum)?.fund(pool)
+}
+pub(crate) fn prepare_funded_storage_publication(
+    scope: &eredu_runtime::working_memory::WorkingMemoryFundingScope,
+    maximum: usize,
+) -> Result<
+    eredu_runtime::working_memory::PreparedStoragePublication<StorageIdentity>,
+    WorkingMemoryError,
+> {
+    generic_storage_publication_layout(maximum)?.fund_from(scope)
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

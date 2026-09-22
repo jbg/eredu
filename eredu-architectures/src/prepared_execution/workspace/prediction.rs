@@ -20,6 +20,7 @@ use std::{
     mem::{size_of, size_of_val},
 };
 mod construction;
+mod partitioned;
 mod roots;
 
 /// Source-specific scalar input and actual post-equation readout. These are
@@ -35,7 +36,13 @@ pub trait WorkspacePredictionEquationTails {
     /// Reports the exact post-equation state iterator used by physical
     /// completion. Output roots and explicit driver completion points remain
     /// separate; this scalar conveys neither storage nor native authority.
-    fn completed_state_roots(&mut self, _count: usize, _context: &WorkspaceContext) -> Result<(), Error> { Ok(()) }
+    fn completed_state_roots(
+        &mut self,
+        _count: usize,
+        _context: &WorkspaceContext,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
     /// Models the actual logits-row/output tail. Raw equation roots remain live
     /// independently. Reserve each exact row through `context` before appending;
     /// every appended view is retained through the completed report.
@@ -118,7 +125,10 @@ pub struct EmbeddedPredictionWorkspaceObservation<'a> {
 impl<'a> EmbeddedPredictionWorkspaceObservation<'a> {
     /// Borrows the selected observer without allocating or granting execution.
     pub fn new(observer: &'a mut dyn InferenceWorkspaceObserver, prediction: u64) -> Self {
-        Self { observer, prediction }
+        Self {
+            observer,
+            prediction,
+        }
     }
 }
 
@@ -129,6 +139,7 @@ struct Quote<'a, 'observer, P: WorkspacePredictionParameterSource, Q> {
     target: &'a ResidentState,
     context: &'a WorkspaceContext,
     target_parameters: Option<&'a dyn WorkspaceLayerwiseParameters>,
+    communication: Option<&'a eredu_runtime::RetainedCommunicationSource>,
     parameters: RefCell<Option<P::Context<'a>>>,
     project: RefCell<Option<Q>>,
     tails: RefCell<&'a mut dyn WorkspacePredictionEquationTails>,
@@ -152,6 +163,10 @@ impl PreparedInferenceBlueprint {
     /// readout companions, and native source owners. No placement is published;
     /// neither this report nor its descriptor grants native execution authority.
     /// Target transaction/copy/transport/native completion remain distinct owners.
+    /// A partitioned selection requires its retained communication source and
+    /// the selected rank-local target state. Replicated selections require no
+    /// communication source. The same typed target operations and prediction
+    /// equation worker are traced; source descriptions grant no native authority.
     #[allow(clippy::too_many_arguments)]
     pub fn quote_embedded_prediction_invocation<'a, 'observer, P, Q>(
         &'a self,
@@ -160,6 +175,7 @@ impl PreparedInferenceBlueprint {
         target_state: &'a ResidentState,
         context: &'a WorkspaceContext,
         target_parameters: Option<&'a dyn WorkspaceLayerwiseParameters>,
+        communication: Option<&'a eredu_runtime::RetainedCommunicationSource>,
         prediction_parameters: P::Context<'a>,
         project_state: Q,
         observation: Option<EmbeddedPredictionWorkspaceObservation<'observer>>,
@@ -215,6 +231,7 @@ impl PreparedInferenceBlueprint {
             target: target_state,
             context,
             target_parameters,
+            communication,
             parameters: RefCell::new(Some(prediction_parameters)),
             project: RefCell::new(Some(project_state)),
             tails: RefCell::new(tails),
@@ -289,7 +306,10 @@ where
             ) => {
                 hidden(source, positions)
                     && tokens(ids, positions)
-                    && target_capture.shape().get(1).is_some_and(|&n| n > 0 && hidden(target_capture, n))
+                    && target_capture
+                        .shape()
+                        .get(1)
+                        .is_some_and(|&n| n > 0 && hidden(target_capture, n))
             }
             (
                 PredictionEquation::Sequential {
@@ -321,7 +341,7 @@ where
     fn run<A>(
         &self,
         modules: crate::replicated_text::PreparedReplicatedTextModules<A>,
-        mut extension: <A as crate::prediction_extension::MaterializedPredictionTarget<
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<
             WorkspaceBackend,
         >>::Extension<WorkspacePredictionMaterializer<P>>,
         current: WorkspacePredictionState,
@@ -332,9 +352,39 @@ where
             + 'static,
         A::StaticModules: Clone,
     {
+        self.context.charge_metadata(size_of::<(
+            crate::replicated_text::PreparedReplicatedTextModules<A>,
+            Result<EquationQuote, Error>,
+        )>())?;
+        if self.target.layout() != modules.contract().selected().state().layout() {
+            return Err(self.invalid());
+        }
+        let runtime = EquationRuntime::from_prepared(
+            modules,
+            self.target_parameters,
+            self.context,
+            None,
+            false,
+        )?;
+        self.run_equation(TargetRuntime::Replicated(runtime), extension, current)
+    }
+
+    fn run_equation<A>(
+        &self,
+        mut runtime: TargetRuntime<'_, A>,
+        mut extension: <A as crate::prediction_extension::MaterializedPredictionTarget<
+            WorkspaceBackend,
+        >>::Extension<WorkspacePredictionMaterializer<P>>,
+        current: WorkspacePredictionState,
+    ) -> Result<EquationQuote, Error>
+    where
+        A: eredu_runtime::LayeredArchitecture<WorkspaceBackend, ResidentState, Error = Error>
+            + crate::prediction_extension::MaterializedPredictionTarget<WorkspaceBackend>
+            + 'static,
+    {
         type WM<P> = WorkspacePredictionMaterializer<P>;
         let parts = [
-            size_of::<EquationRuntime<'_, A>>(),
+            size_of::<TargetRuntime<'_, A>>(),
             size_of::<ResidentState>(),
             size_of::<WorkspacePredictionState>(),
             size_of::<PredictionEquationOutput<WorkspaceTensor>>(),
@@ -377,9 +427,6 @@ where
                 .try_fold(size_of_val(&parts), usize::checked_add)
                 .ok_or(WorkspaceMetadataError::Overflow)?,
         )?;
-        if self.target.layout() != modules.contract().selected().state().layout() {
-            return Err(self.invalid());
-        }
         let mut lane = current.prepare_current_lane::<A, _, P>(&extension, self.context)?;
         if extension
             .equation_frontier(&mut lane, &self.equation.as_ref())
@@ -393,36 +440,43 @@ where
             PredictionEquation::Fused { .. } if !matches!(extension.occurrence_shape(), Some(eredu_runtime::speculative::embedded_occurrence::EmbeddedPredictionShape::Fused { .. })) => return Err(self.invalid()),
             _ => {}
         }
-        let mut runtime =
-            EquationRuntime::from_prepared(modules, self.target_parameters, self.context, None, false)?;
         let mut target = self.target.try_clone_workspace(self.context)?;
         let mut ran = false;
-        let equations = quote_inference_workspace_with_context(
-            self.workspace.geometry(),
-            self.context,
-            |span| {
-                if ran {
-                    return Err(self.context.metadata_source(QuoteError::Consumed));
-                }
-                ran = true;
-                let observed = match self.observer.borrow_mut().as_mut() {
-                    Some(observer) => observer.begin_span(
-                        self.workspace.geometry(), span,
-                        self.observation_prediction.expect("observer retains its logical coordinate"),
-                        self.context,
-                    )?,
-                    None => false,
-                };
-                let mut opening = self.context.metadata_vec(0)?;
-                roots::append_target(&target, &mut opening, self.context)?;
-                roots::append_lane::<A, P, _>(&extension, &lane, &mut opening, self.context)?;
-                if let Some(observer) = self.observer.borrow().as_ref() {
-                    roots::append_observer(&**observer, &mut opening, self.context)?;
-                }
-                self.context.begin_state_span(opening.iter())?;
-                let mut observer = self.observer.borrow_mut();
-                let output =
-                    execute_prediction_equation::<A, WorkspaceBackend, ResidentState, WM<P>, _, _>(
+        let equations =
+            quote_inference_workspace_with_context(
+                self.workspace.geometry(),
+                self.context,
+                |span| {
+                    if ran {
+                        return Err(self.context.metadata_source(QuoteError::Consumed));
+                    }
+                    ran = true;
+                    let observed = match self.observer.borrow_mut().as_mut() {
+                        Some(observer) => observer.begin_span(
+                            self.workspace.geometry(),
+                            span,
+                            self.observation_prediction
+                                .expect("observer retains its logical coordinate"),
+                            self.context,
+                        )?,
+                        None => false,
+                    };
+                    let mut opening = self.context.metadata_vec(0)?;
+                    roots::append_target(&target, &mut opening, self.context)?;
+                    roots::append_lane::<A, P, _>(&extension, &lane, &mut opening, self.context)?;
+                    if let Some(observer) = self.observer.borrow().as_ref() {
+                        roots::append_observer(&**observer, &mut opening, self.context)?;
+                    }
+                    self.context.begin_state_span(opening.iter())?;
+                    let mut observer = self.observer.borrow_mut();
+                    let output = execute_prediction_equation::<
+                        A,
+                        WorkspaceBackend,
+                        ResidentState,
+                        WM<P>,
+                        _,
+                        _,
+                    >(
                         self.equation.as_ref(),
                         &mut extension,
                         &mut Invoker {
@@ -436,66 +490,97 @@ where
                         }),
                         |id| self.tails.borrow_mut().token(id, self.context),
                     )?;
-                drop(observer);
-                let completion_controls = [
-                    size_of::<usize>(), size_of::<Result<usize, Error>>(),
-                    size_of::<&mut dyn Iterator<Item=&WorkspaceTensor>>(),
-                    size_of::<fn(&mut dyn Iterator<Item=&WorkspaceTensor>)->Result<usize,Error>>(),
-                ];
-                self.context.charge_metadata(completion_controls.into_iter().try_fold(size_of_val(&completion_controls), usize::checked_add).ok_or(WorkspaceMetadataError::Overflow)?)?;
-                let state_roots = extension.with_state_values(&mut lane, |values| {
-                    let mut count=0usize;
-                    for _ in values { count=count.checked_add(1).ok_or(WorkspaceMetadataError::Overflow)?; }
-                    Ok::<_,Error>(count)
-                })?;
-                self.tails.borrow_mut().completed_state_roots(state_roots,self.context)?;
-                let mut rows = self.context.metadata_vec(0)?;
-                self.tails
-                    .borrow_mut()
-                    .readout(&output, &mut rows, self.context)?;
-                let mut retained = self.context.metadata_vec(0)?;
-                roots::append_target(&target, &mut retained, self.context)?;
-                roots::append_lane::<A, P, _>(&extension, &lane, &mut retained, self.context)?;
-                if let Some(observer) = self.observer.borrow().as_ref() {
-                    roots::append_observer(&**observer, &mut retained, self.context)?;
-                }
-                roots::append_tails(&**self.tails.borrow(), &mut retained, self.context)?;
-                let retained_roots = retained.len();
-                let mut outputs = self.context.metadata_vec(2)?;
-                output.visit_roots(|value| outputs.push(value.clone()));
-                self.context
-                    .reserve_metadata_vec(&mut outputs, rows.len())?;
-                outputs.extend(rows);
-                let output_roots = outputs.len();
-                let population = self.context.report_scalars(&outputs)?.closing_storage;
-                self.context
-                    .reserve_metadata_vec(&mut retained, outputs.len())?;
-                retained.extend(outputs);
-                let report = self.context.finish_report(&retained)?;
-                self.trace.borrow_mut().observe_prepared_with_storage(
-                    span,
-                    &report,
-                    retained_roots,
-                    output_roots,
-                    None,
-                    Some(population),
-                )?;
-                if observed {
-                    self.observer.borrow_mut().as_mut().expect("active observer").end_span(span, self.context)?;
-                }
-                Ok(report)
-            },
-        )
-        .map_err(|cause| self.context.metadata_source(cause))?;
+                    drop(observer);
+                    let completion_controls = [
+                        size_of::<usize>(),
+                        size_of::<Result<usize, Error>>(),
+                        size_of::<&mut dyn Iterator<Item = &WorkspaceTensor>>(),
+                        size_of::<
+                            fn(&mut dyn Iterator<Item = &WorkspaceTensor>) -> Result<usize, Error>,
+                        >(),
+                    ];
+                    self.context.charge_metadata(
+                        completion_controls
+                            .into_iter()
+                            .try_fold(size_of_val(&completion_controls), usize::checked_add)
+                            .ok_or(WorkspaceMetadataError::Overflow)?,
+                    )?;
+                    let state_roots = extension.with_state_values(&mut lane, |values| {
+                        let mut count = 0usize;
+                        for _ in values {
+                            count = count
+                                .checked_add(1)
+                                .ok_or(WorkspaceMetadataError::Overflow)?;
+                        }
+                        Ok::<_, Error>(count)
+                    })?;
+                    self.tails
+                        .borrow_mut()
+                        .completed_state_roots(state_roots, self.context)?;
+                    let mut rows = self.context.metadata_vec(0)?;
+                    self.tails
+                        .borrow_mut()
+                        .readout(&output, &mut rows, self.context)?;
+                    let mut retained = self.context.metadata_vec(0)?;
+                    roots::append_target(&target, &mut retained, self.context)?;
+                    roots::append_lane::<A, P, _>(&extension, &lane, &mut retained, self.context)?;
+                    if let Some(observer) = self.observer.borrow().as_ref() {
+                        roots::append_observer(&**observer, &mut retained, self.context)?;
+                    }
+                    roots::append_tails(&**self.tails.borrow(), &mut retained, self.context)?;
+                    let retained_roots = retained.len();
+                    let mut outputs = self.context.metadata_vec(2)?;
+                    output.visit_roots(|value| outputs.push(value.clone()));
+                    self.context
+                        .reserve_metadata_vec(&mut outputs, rows.len())?;
+                    outputs.extend(rows);
+                    let output_roots = outputs.len();
+                    let population = self.context.report_scalars(&outputs)?.closing_storage;
+                    self.context
+                        .reserve_metadata_vec(&mut retained, outputs.len())?;
+                    retained.extend(outputs);
+                    let report = self.context.finish_report(&retained)?;
+                    self.trace.borrow_mut().observe_prepared_with_storage(
+                        span,
+                        &report,
+                        retained_roots,
+                        output_roots,
+                        None,
+                        Some(population),
+                    )?;
+                    if observed {
+                        self.observer
+                            .borrow_mut()
+                            .as_mut()
+                            .expect("active observer")
+                            .end_span(span, self.context)?;
+                    }
+                    Ok(report)
+                },
+            )
+            .map_err(|cause| self.context.metadata_source(cause))?;
         Ok((equations, None))
     }
+}
+
+// Prediction-only operations use the actual selected executor's target. Native
+// partition executors call the same typed operation directly with their TP context.
+enum TargetRuntime<'a, A>
+where
+    A: eredu_runtime::LayeredArchitecture<WorkspaceBackend, ResidentState, Error = Error>,
+{
+    Replicated(EquationRuntime<'a, A>),
+    Partitioned {
+        architecture: A,
+        parallel: Option<eredu_nn::workspace::WorkspaceParallelContext>,
+    },
 }
 
 struct Invoker<'a, 'parameters, A>
 where
     A: eredu_runtime::LayeredArchitecture<WorkspaceBackend, ResidentState, Error = Error>,
 {
-    runtime: &'a mut EquationRuntime<'parameters, A>,
+    runtime: &'a mut TargetRuntime<'parameters, A>,
     state: &'a mut ResidentState,
     context: &'a WorkspaceContext,
 }
@@ -508,8 +593,19 @@ where
     where
         O: eredu_runtime::PredictionTargetOperation<A, WorkspaceBackend, ResidentState>,
     {
-        self.runtime
-            .prediction_operation(self.state, operation, self.context)
+        match self.runtime {
+            TargetRuntime::Replicated(runtime) => {
+                runtime.prediction_operation(self.state, operation, self.context)
+            }
+            TargetRuntime::Partitioned {
+                architecture,
+                parallel,
+            } => {
+                self.context
+                    .charge_metadata(size_of::<(O, Result<O::Output, Error>)>())?;
+                operation.apply(architecture, self.state, parallel.as_ref(), self.context)
+            }
+        }
     }
     fn invalid_arguments(&self, message: std::fmt::Arguments<'_>) -> Error {
         self.context.metadata_error(message)
@@ -520,4 +616,4 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

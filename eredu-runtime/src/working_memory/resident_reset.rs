@@ -1,26 +1,28 @@
 //! Original flat or nested resident table construction. Native publication is separate.
 use super::{
-    HostSlotStorageKey, InferenceExecutionIdentity, InferenceStateRetention, WorkingMemoryError,
-    WorkingMemoryPool, WorkingMemoryStorage,
+    HostSlotStorageKey, InferenceExecutionIdentity, InferenceStateRetention, MemoryLedger,
+    WorkingMemoryError, WorkingMemoryStorage,
 };
-use crate::{DenseHostSlotInitialization, HostSlotTable, SelectedStateRealization, SharedStateLayout};
-use eredu_core::{cache::LayerCachePolicy, SessionResetClaim, SessionResetRejection};
+use crate::{
+    DenseHostSlotInitialization, HostSlotTable, SelectedStateRealization, SharedStateLayout,
+};
+use eredu_core::{SessionResetClaim, SessionResetRejection, cache::LayerCachePolicy};
 use std::{
     alloc::Layout,
     fmt,
     mem::size_of,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 mod account;
 mod construction;
 mod empty;
 mod publication;
-pub use empty::{PreparedResidentEmptyState, ResidentEmptyStateError};
 pub(crate) use account::ResetCustody;
-pub(in crate::working_memory) use account::{capacity, Entry, Pending};
+pub(in crate::working_memory) use account::{Entry, Pending, capacity};
+pub use empty::{PreparedResidentEmptyState, ResidentEmptyStateError};
 pub use publication::{
-    ResidentResetDisplaced, ResidentResetInstallation, ResidentResetProjection,
-    ResidentResetPublicationCustody, ResidentResetPublicationProfile,
+    PreparedParameterStateReset, ResidentResetDisplaced, ResidentResetInstallation,
+    ResidentResetProjection, ResidentResetPublicationCustody, ResidentResetPublicationProfile,
 };
 
 /// Concrete fixed-table reset representation. Every outer/child table is borrowed
@@ -43,20 +45,26 @@ pub trait ResidentTableResetState: InferenceStateRetention + Sized + Send + Sync
     }
     /// Runs only after the same reset comparison. No native work is authorized.
     fn prepare_resident_reset_context(
-        &self, _plan: &Self::ResetPlan,
+        &self,
+        _plan: &Self::ResetPlan,
         _funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<Self::ResetContext, eredu_core::BackendFailure> {
         Ok(Self::ResetContext::default())
     }
     /// Checks the actual component's source-qualified selected placement within its layer.
     fn validate_resident_reset_placement(
-        _layer: &Self::Layer, _role: eredu_core::cache::StateComponentRole,
+        _layer: &Self::Layer,
+        _role: eredu_core::cache::StateComponentRole,
         placement: crate::StateComponentPlacement,
-    ) -> bool { placement == crate::StateComponentPlacement::Device }
+    ) -> bool {
+        placement == crate::StateComponentPlacement::Device
+    }
     /// Same empty layer worker, with optional source-derived host context.
     fn empty_resident_reset_layer_prepared(
-        _context: &mut Self::ResetContext, _source: &Self::Layer,
-        policy: &LayerCachePolicy, child: Option<HostSlotTable<Self::Child>>,
+        _context: &mut Self::ResetContext,
+        _source: &Self::Layer,
+        policy: &LayerCachePolicy,
+        child: Option<HostSlotTable<Self::Child>>,
     ) -> Result<Self::Layer, eredu_core::BackendFailure> {
         Ok(Self::empty_resident_reset_layer_with_child(policy, child))
     }
@@ -113,7 +121,7 @@ pub struct ResidentResetSource<'a, S> {
     pub(crate) state: &'a S,
     pub(crate) selected: &'a SelectedStateRealization,
     pub(crate) execution: &'a InferenceExecutionIdentity,
-    pub(crate) control: &'a Arc<()>,
+    pub(crate) control: &'a crate::replicated_session::ParameterControlIdentity,
     pub(crate) revision: Option<&'a super::InferenceStateRevision>,
 }
 impl<'a, S> ResidentResetSource<'a, S> {
@@ -127,7 +135,7 @@ impl<'a, S> ResidentResetSource<'a, S> {
         std::ptr::eq(self.state, other.state)
             && std::ptr::eq(self.selected, other.selected)
             && Arc::ptr_eq(&self.execution.0, &other.execution.0)
-            && Arc::ptr_eq(self.control, other.control)
+            && self.control.matches(other.control)
             && self.revision == other.revision
     }
 }
@@ -163,21 +171,34 @@ enum TableSource<'a, K: HostSlotStorageKey> {
     },
 }
 
+// Both entries construct only source-derived empty host state. The explicit
+// reset entry carries the core claim; parameter publication supplies its current
+// executable and the same selected session's exclusive source validation.
+enum ResetRequest<'a> {
+    Session(SessionResetClaim<'a>),
+    Parameter {
+        execution: &'a InferenceExecutionIdentity,
+        limits: &'a eredu_core::MemoryLimits,
+    },
+}
+
 /// Closed source-derived fixed destination plan.
 ///
 /// ```compile_fail
-/// use eredu_runtime::working_memory::{PreparedResidentKvReset, ResidentTableResetState, ResidentResetSession, HostSlotStorageKey, WorkingMemoryPool};
+/// use eredu_runtime::working_memory::{PreparedResidentKvReset, ResidentTableResetState, ResidentResetSession, HostSlotStorageKey, MemoryLedger};
 /// use eredu_core::SessionResetClaim;
-/// fn twice<S, K, T>(plan: PreparedResidentKvReset<'_, S, K>, session: &T, claim: SessionResetClaim<'_>, pool: &WorkingMemoryPool)
+/// fn twice<S, K, T>(plan: PreparedResidentKvReset<'_, S, K>, session: &T, claim: SessionResetClaim<'_>, pool: &MemoryLedger)
 /// where S: ResidentTableResetState, K: HostSlotStorageKey, T: ResidentResetSession<S> {
 ///     let _ = plan.construct(session, claim, pool);
 ///     let _ = plan.construct(session, claim, pool);
 /// }
 /// ```
 /// No allocating initializer runs
-/// until a genuine core reset claim and the same domain accept this demand.
+/// until the selected session validates its actual source and the ledger accepts
+/// the explicit reset claim or enclosing parameter-publication demand.
 pub struct PreparedResidentKvReset<'a, S: ResidentTableResetState, K: HostSlotStorageKey> {
     source: ResidentResetSource<'a, S>,
+    pool: &'a MemoryLedger,
     slots: DenseHostSlotInitialization<'a, S::Layer>,
     table_source: TableSource<'a, K>,
     bytes: u64,
@@ -194,6 +215,7 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
         source: ResidentResetSource<'a, S>,
         table: K,
         layout: K,
+        pool: &'a MemoryLedger,
     ) -> Result<Self, ResidentResetError<S>> {
         let metadata = source.state.resident_reset_layers().metadata();
         if metadata.original_reset_custody().is_some()
@@ -211,7 +233,7 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
                 WorkingMemoryError::IdentityMismatch,
             ));
         }
-        Self::prepare_source(source, TableSource::Registered { table, layout })
+        Self::prepare_source(source, TableSource::Registered { table, layout }, pool)
     }
 
     /// Uses the session-issued actual source and existing complete registration.
@@ -220,6 +242,7 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
     pub fn prepare(
         source: ResidentResetSource<'a, S>,
         registration: &'a WorkingMemoryStorage<K>,
+        pool: &'a MemoryLedger,
     ) -> Result<Self, ResidentResetError<S>> {
         let table = source.state.resident_reset_layers().metadata();
         if table.original_reset_custody().is_some() {
@@ -242,7 +265,7 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
                 )
                 .map_err(ResidentResetError::rejected)?,
         };
-        Self::prepare_source(source, table_source)
+        Self::prepare_source(source, table_source, pool)
     }
 
     /// Plans from a table produced by an earlier genuine original reset. Its
@@ -250,18 +273,20 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
     /// before comparison, and no predecessor account survives successful fill.
     pub fn prepare_original(
         source: ResidentResetSource<'a, S>,
+        pool: &'a MemoryLedger,
     ) -> Result<Self, ResidentResetError<S>> {
         let metadata = source.state.resident_reset_layers().metadata();
         let custody = metadata
             .original_reset_custody()
             .filter(|_| metadata.original_source_is_live())
             .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::IdentityMismatch))?;
-        Self::prepare_source(source, TableSource::Original { metadata, custody })
+        Self::prepare_source(source, TableSource::Original { metadata, custody }, pool)
     }
 
     fn prepare_source(
         source: ResidentResetSource<'a, S>,
         table_source: TableSource<'a, K>,
+        pool: &'a MemoryLedger,
     ) -> Result<Self, ResidentResetError<S>> {
         let state = source.state;
         let _layout = state.resident_reset_layout();
@@ -286,13 +311,23 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
             .prepare_copy_slots()
             .and_then(|p| p.for_dense_destination())
             .map_err(|_| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
-        let (context_plan, context_bytes) = state.resident_reset_plan()
+        let (context_plan, context_bytes) = state
+            .resident_reset_plan()
             .map_err(ResidentResetError::rejected)?;
         let context_controls = construction::control_bytes(context_bytes)
+            .and_then(|n| n.checked_add(size_of::<ResetRequest<'_>>()))
+            .and_then(|n| {
+                n.checked_add(size_of::<(
+                    eredu_core::DomainMemoryRequirements,
+                    eredu_core::MemoryLimits,
+                )>())
+            })
             .and_then(|n| n.checked_add(size_of::<S::ResetPlan>()))
             .and_then(|n| n.checked_add(size_of::<S::ResetContext>()))
             .and_then(|n| n.checked_add(size_of::<&mut S::ResetContext>()))
-            .and_then(|n| n.checked_add(size_of::<Result<S::ResetContext, eredu_core::BackendFailure>>()))
+            .and_then(|n| {
+                n.checked_add(size_of::<Result<S::ResetContext, eredu_core::BackendFailure>>())
+            })
             .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
         let controls = control_bytes::<S, K>(matches!(&table_source, TableSource::Ordinary { .. }))
             .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
@@ -306,29 +341,36 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
         .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
         let bytes = slots
             .initialization_peak_bytes()
-            .checked_add(child_bytes)
+            .checked_add(
+                account::domain_control_bytes(pool.topology())
+                    .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?,
+            )
+            .and_then(|n| n.checked_add(child_bytes))
             .and_then(|n| n.checked_add(u64::try_from(context_controls).ok()?))
             .and_then(|n| n.checked_add(u64::try_from(membership).ok()?))
             .and_then(|n| n.checked_add(u64::try_from(controls).ok()?))
             .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
         Ok(Self {
             source,
+            pool,
             slots,
             table_source,
             bytes,
             child_tables,
-            context_plan, context_bytes,
+            context_plan,
+            context_bytes,
         })
     }
     /// Whether two borrowed plans name the exact same source and session
     /// revision. Equal policy/values alone cannot establish this identity.
     pub fn same_source(&self, other: &Self) -> bool {
-        self.context_plan == other.context_plan
+        self.pool.same_ledger(other.pool)
+            && self.context_plan == other.context_plan
             && self.context_bytes == other.context_bytes
             && std::ptr::eq(self.source.state, other.source.state)
             && std::ptr::eq(self.source.selected, other.source.selected)
             && Arc::ptr_eq(&self.source.execution.0, &other.source.execution.0)
-            && Arc::ptr_eq(self.source.control, other.source.control)
+            && self.source.control.matches(other.source.control)
             && self.source.revision == other.source.revision
             && self
                 .slots
@@ -348,33 +390,75 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
         self,
         session: &T,
         claim: SessionResetClaim<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<S, ResidentResetError<S>> {
-        self.construct_prepared(session, claim, pool, |_, _| ())
+        self.construct_prepared(session, ResetRequest::Session(claim), pool, |_, _| ())
             .map(|(state, ())| state)
     }
 
     fn construct_prepared<T: ResidentResetSession<S>, P>(
         self,
         session: &T,
-        claim: SessionResetClaim<'_>,
-        pool: &WorkingMemoryPool,
+        request: ResetRequest<'_>,
+        pool: &MemoryLedger,
         prepare: impl FnOnce(&ResidentResetSource<'_, S>, &ResetCustody) -> P,
     ) -> Result<(S, P), ResidentResetError<S>> {
-        claim
-            .validate_session(session)
-            .map_err(ResidentResetError::claim)?;
+        if !self.pool.same_ledger(pool) {
+            return Err(ResidentResetError::rejected(
+                WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        match &request {
+            ResetRequest::Session(claim) => claim
+                .validate_session(session)
+                .map_err(ResidentResetError::claim)?,
+            ResetRequest::Parameter { execution, limits } => {
+                if !self.source.execution.same_execution(execution) {
+                    return Err(ResidentResetError::rejected(
+                        WorkingMemoryError::IdentityMismatch,
+                    ));
+                }
+                limits
+                    .validate(pool.topology())
+                    .map_err(|cause| ResidentResetError::rejected(cause.into()))?;
+            }
+        }
         session
             .validate_resident_reset_source(&self.source)
             .map_err(ResidentResetError::rejected)?;
-        let current = self.source.state.resident_reset_plan()
+        let current = self
+            .source
+            .state
+            .resident_reset_plan()
             .map_err(ResidentResetError::rejected)?;
         if current.0 != self.context_plan || current.1 != self.context_bytes {
-            return Err(ResidentResetError::rejected(WorkingMemoryError::IdentityMismatch));
+            return Err(ResidentResetError::rejected(
+                WorkingMemoryError::IdentityMismatch,
+            ));
         }
-        let acceptance = claim
-            .compare(self.bytes)
-            .map_err(ResidentResetError::claim)?;
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero(pool.topology());
+        requirements
+            .add_allocation(
+                self.bytes,
+                &eredu_core::MemoryPlacement::fixed(pool.topology(), pool.topology().host_domain())
+                    .map_err(|e| ResidentResetError::rejected(e.into()))?,
+            )
+            .map_err(|e| ResidentResetError::rejected(e.into()))?;
+        let (requirements, limits) = match request {
+            ResetRequest::Session(claim) => claim
+                .compare(pool.topology(), requirements)
+                .map_err(ResidentResetError::claim)?
+                .into_parts(),
+            ResetRequest::Parameter { limits, .. } => {
+                for (domain, charge) in requirements.iter() {
+                    limits
+                        .get(domain)
+                        .and_then(|limit| limit.check(domain, 0, charge.total()?))
+                        .map_err(|cause| ResidentResetError::rejected(cause.into()))?;
+                }
+                (requirements, limits.clone())
+            }
+        };
         let state = self.source.state;
         let table = state.resident_reset_layers().metadata();
         let layout = state.resident_reset_layout();
@@ -393,7 +477,8 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
                     ResidentResetError::rejected(WorkingMemoryError::UnknownBound)
                 })?,
             ),
-            acceptance,
+            requirements,
+            limits,
         )
         .map_err(ResidentResetError::admission)?;
         // Both finite control vectors are allocated only under this account.
@@ -448,15 +533,17 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
         let result = (|| {
             let funding = construction::prepare(self.context_bytes, &admission.custody)
                 .map_err(ResidentResetError::construction)?;
-            let mut context = state.prepare_resident_reset_context(&self.context_plan, funding.as_ref())
+            let mut context = state
+                .prepare_resident_reset_context(&self.context_plan, funding.as_ref())
                 .map_err(ResidentResetError::construction)?;
             construct_slots::<S>(
-            self.slots,
-            state.resident_reset_layers(),
-            layout,
-            state.resident_reset_global_start(),
-            &admission.custody, &mut context,
-        )
+                self.slots,
+                state.resident_reset_layers(),
+                layout,
+                state.resident_reset_global_start(),
+                &admission.custody,
+                &mut context,
+            )
         })();
         match result {
             Ok(mut value) => {
@@ -534,7 +621,10 @@ fn source_geometry_control_bytes<S: ResidentTableResetState, E>(callback: usize)
         >(),
         size_of::<Option<&HostSlotTable<S::Child>>>(),
         size_of::<&[eredu_core::cache::StateComponentPolicy]>(),
-        size_of::<(eredu_core::cache::StateComponentRole, crate::StateComponentPlacement)>(),
+        size_of::<(
+            eredu_core::cache::StateComponentRole,
+            crate::StateComponentPlacement,
+        )>(),
         size_of::<&[crate::replicated_text::SelectedStateComponentRealization]>(),
         size_of::<Result<(), E>>(),
         size_of::<Option<usize>>(),
@@ -587,7 +677,11 @@ fn validate_source_geometry<S: ResidentTableResetState, E>(
         if realized.iter().zip(expected).any(|(actual, expected)| {
             actual.layer() != index
                 || actual.component() != expected
-                || !S::validate_resident_reset_placement(layer, actual.component().role(), actual.placement())
+                || !S::validate_resident_reset_placement(
+                    layer,
+                    actual.component().role(),
+                    actual.placement(),
+                )
         }) {
             return Err(error(WorkingMemoryError::UnknownBound));
         }
@@ -623,7 +717,7 @@ fn construct_slots<S: ResidentTableResetState>(
                 source: None,
                 source_children: Vec::new(),
                 custody: None,
-            })
+            });
         }
     };
     for (layer, policy) in source.slots().iter().zip(layout.layout().layers().iter()) {
@@ -655,15 +749,22 @@ fn construct_slots<S: ResidentTableResetState>(
                     source: None,
                     source_children: Vec::new(),
                     custody: None,
-                })
+                });
             }
         };
         let value = match S::empty_resident_reset_layer_prepared(context, layer, policy, child) {
             Ok(value) => value,
-            Err(cause) => return Err(ResidentResetError {
-                cause: ResetCause::Construction(cause), partial: builder.into_partial_values(),
-                state: None, entry: None, source: None, source_children: Vec::new(), custody: None,
-            }),
+            Err(cause) => {
+                return Err(ResidentResetError {
+                    cause: ResetCause::Construction(cause),
+                    partial: builder.into_partial_values(),
+                    state: None,
+                    entry: None,
+                    source: None,
+                    source_children: Vec::new(),
+                    custody: None,
+                });
+            }
         };
         assert!(builder.push(value).is_ok(), "validated exact reset extent");
     }
@@ -679,11 +780,16 @@ fn construct_slots<S: ResidentTableResetState>(
                 source: None,
                 source_children: Vec::new(),
                 custody: None,
-            })
+            });
         }
     };
     let table = HostSlotTable::original_reset(values.into_boxed_slice(), identity, custody.clone());
-    Ok(S::from_resident_reset(context, layout.clone(), global_start, table))
+    Ok(S::from_resident_reset(
+        context,
+        layout.clone(),
+        global_start,
+        table,
+    ))
 }
 
 fn table_member(metadata: &crate::HostSlotMetadata) -> (crate::HostMetadataKey, u64) {
@@ -774,8 +880,15 @@ pub struct ResidentResetError<S: ResidentTableResetState> {
 }
 impl<S: ResidentTableResetState> ResidentResetError<S> {
     fn construction(cause: eredu_core::BackendFailure) -> Self {
-        Self { cause: ResetCause::Construction(cause), partial: Vec::new(), state: None,
-            entry: None, source: None, source_children: Vec::new(), custody: None }
+        Self {
+            cause: ResetCause::Construction(cause),
+            partial: Vec::new(),
+            state: None,
+            entry: None,
+            source: None,
+            source_children: Vec::new(),
+            custody: None,
+        }
     }
     fn admission(failure: account::AdmissionFailure) -> Self {
         Self {
@@ -859,7 +972,9 @@ fn arc_bytes<T>() -> Option<usize> {
             .size(),
     )
 }
-fn control_bytes<S: ResidentTableResetState, K: HostSlotStorageKey>(grouped: bool) -> Option<usize> {
+fn control_bytes<S: ResidentTableResetState, K: HostSlotStorageKey>(
+    grouped: bool,
+) -> Option<usize> {
     [
         source_geometry_control_bytes::<S, ResidentResetError<S>>(
             size_of::<(&mut usize, &mut u64)>(),
@@ -874,8 +989,11 @@ fn control_bytes<S: ResidentTableResetState, K: HostSlotStorageKey>(grouped: boo
         size_of::<ResidentResetSource<'_, S>>(),
         size_of::<crate::DenseHostSlotInitializationBuilder<S::Layer>>(),
         size_of::<(
-            &mut S::ResetContext, &S::Layer, &LayerCachePolicy,
-            Option<HostSlotTable<S::Child>>, Result<S::Layer, eredu_core::BackendFailure>,
+            &mut S::ResetContext,
+            &S::Layer,
+            &LayerCachePolicy,
+            Option<HostSlotTable<S::Child>>,
+            Result<S::Layer, eredu_core::BackendFailure>,
         )>(),
         size_of::<OriginalResidentResetSource>(),
         size_of::<HostSlotSource>(),
@@ -911,7 +1029,53 @@ fn control_bytes<S: ResidentTableResetState, K: HostSlotStorageKey>(grouped: boo
 /// Policy-only layer constructor used by the portable DeviceState adapter.
 /// Empty construction may move inline scalars/None values only; no allocation
 /// or native work is permitted. This is a backend implementation contract.
-pub trait ResidentKvResetLayer: Send + Sync + 'static {
+pub trait ResidentResetLayer: Send + Sync + 'static {
+    /// Exact source-derived descriptor for host-only construction.
+    type ResetPlan: Default + PartialEq;
+    /// Host-only context constructed after the reset admission succeeds.
+    type ResetContext: Default;
+    /// Inspects all actual layer owners without allocating or cloning them.
+    fn reset_plan(_layers: &[Self]) -> Result<(Self::ResetPlan, usize), WorkingMemoryError>
+    where
+        Self: Sized,
+    {
+        Ok((Self::ResetPlan::default(), 0))
+    }
+    /// Constructs the inspected host context using the original reset funding.
+    fn prepare_reset_context(
+        _layers: &[Self],
+        _plan: &Self::ResetPlan,
+        _funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Result<Self::ResetContext, eredu_core::BackendFailure>
+    where
+        Self: Sized,
+    {
+        Ok(Self::ResetContext::default())
+    }
+    /// Validates the actual source placement of each selected component.
+    fn matches_reset_placement(
+        &self,
+        _role: eredu_core::cache::StateComponentRole,
+        placement: crate::StateComponentPlacement,
+    ) -> bool {
+        placement == crate::StateComponentPlacement::Device
+    }
+    /// Builds an empty layer from the exact source and prepared host context.
+    fn empty_reset_prepared(
+        &self,
+        _context: &mut Self::ResetContext,
+        policy: &LayerCachePolicy,
+    ) -> Result<Self, eredu_core::BackendFailure>
+    where
+        Self: Sized,
+    {
+        Ok(Self::empty_resident_reset(policy))
+    }
+    /// Whether this is already the exact empty inline constructor state.
+    fn reset_source_is_empty(&self) -> bool {
+        false
+    }
+
     /// Checks the existing physical policy, without reading/copying tensor data.
     fn matches_resident_reset(&self, policy: &LayerCachePolicy) -> bool;
     /// Constructs the validated empty layer through the existing policy worker.
@@ -934,7 +1098,7 @@ impl OriginalResidentResetSource {
         &self.metadata
     }
     /// Compares constructor ownership only. Each candidate table must first be
-    /// authenticated by `WorkingMemoryPool::classify_host_slot_source`; this
+    /// authenticated by `MemoryLedger::classify_host_slot_source`; this
     /// comparison cannot authorize an unpublished table or replace its capacity
     /// and liveness validation. It lets a checked inventory retain sibling tables
     /// under their existing single account without registering them again.
@@ -954,7 +1118,7 @@ impl OriginalResidentResetSource {
             .bytes()
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Pins the concrete reset source registry after successful fixed construction.
     /// No allocation, adoption, accounting increment or new budget is performed.
     /// A metadata token alone still cannot supply source values to a copy/reset.
@@ -1003,7 +1167,7 @@ impl HostSlotSource {
         }
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Allocation-free classification. Original tables must still be live,
     /// completed, and match this pool's exact original entry and capacity.
     /// The caller retains its actual table borrow for any subsequent access.
@@ -1027,7 +1191,7 @@ impl WorkingMemoryPool {
 impl OriginalResidentResetSource {
     pub(super) fn validate_in(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &super::Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.metadata
@@ -1046,15 +1210,28 @@ pub struct UnquotedOriginalSlotSources(Option<UnquotedSlotPopulation>);
 struct UnquotedSlotPopulation {
     sources: Vec<OriginalResidentResetSource>,
     lease: super::WorkingMemoryUnquotedLease,
+    _host: eredu_core::HostPreparationAuthority,
 }
 impl UnquotedOriginalSlotSources {
-    /// Reuses the supplied participant; this allocates nothing and never
-    /// acquires another lease. Subsequent Vec construction remains unquoted.
-    pub fn prepare(lease: &super::WorkingMemoryUnquotedLease) -> Self {
-        Self(Some(UnquotedSlotPopulation {
-            sources: Vec::new(),
+    /// Exact bounded source-vector and owner controls, paid before construction.
+    pub fn constructor_bytes(maximum: usize) -> Result<u64, WorkingMemoryError> {
+        super::qualified_storage::array_bytes::<OriginalResidentResetSource>(maximum)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+            .and_then(|n| n.checked_add(std::mem::size_of::<UnquotedSlotPopulation>() as u64))
+            .ok_or(WorkingMemoryError::Overflow)
+    }
+    /// Reuses the genuine participant and retains its already funded host envelope.
+    pub fn prepare(
+        lease: &super::WorkingMemoryUnquotedLease,
+        maximum: usize,
+        host: &eredu_core::HostPreparationAuthority,
+    ) -> Result<Self, WorkingMemoryError> {
+        let sources = super::qualified_storage::vector(maximum, true)?;
+        Ok(Self(Some(UnquotedSlotPopulation {
+            sources,
             lease: lease.clone(),
-        }))
+            _host: host.clone(),
+        })))
     }
     /// Retains one actual original table. Foreign, retired, or duplicate
     /// sources reject before Vec growth, preserving the existing population.
@@ -1063,13 +1240,24 @@ impl UnquotedOriginalSlotSources {
             .0
             .as_mut()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        let source = population.lease.0.pool.pin_original_reset_slots(metadata)?;
+        let source = population
+            .lease
+            .inner()
+            .pool
+            .pin_original_reset_slots(metadata)?;
         if population
             .sources
             .iter()
             .any(|old| old.metadata.same_storage(metadata))
         {
             return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        if population.sources.len() == population.sources.capacity() {
+            return Err(WorkingMemoryError::CollectorCapacity {
+                kind: super::CollectorCapacityKind::PublicationEntries,
+                used: population.sources.len(),
+                capacity: population.sources.capacity(),
+            });
         }
         population.sources.push(source);
         Ok(())
@@ -1087,10 +1275,10 @@ impl UnquotedOriginalSlotSources {
     pub fn is_empty(&self) -> bool {
         self.sources().is_empty()
     }
-    pub(super) fn same_domain(&self, pool: &WorkingMemoryPool) -> bool {
+    pub(super) fn same_ledger(&self, pool: &MemoryLedger) -> bool {
         self.0
             .as_ref()
-            .is_some_and(|p| p.lease.0.pool.same_domain(pool))
+            .is_some_and(|p| p.lease.inner().pool.same_ledger(pool))
     }
     pub(super) fn take(&mut self) -> Self {
         Self(self.0.take())

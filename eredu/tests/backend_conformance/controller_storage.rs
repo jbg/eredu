@@ -84,7 +84,12 @@ fn controlled_semantic_setup_uses_original_receipt_and_refuses_mismatched_capaci
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         };
@@ -96,9 +101,9 @@ fn controlled_semantic_setup_uses_original_receipt_and_refuses_mismatched_capaci
             ..Default::default()
         };
         let pool = model.original_pool().clone();
-        let before = pool.used_bytes().unwrap();
-        let mut configured = original_sources::settings(settings);
-        configured.inference.managed_memory_capacity_bytes = Some(1);
+        let before = pool.live_charge_bytes().unwrap();
+        let mut configured = original_sources::settings(settings.clone());
+        configured.inference.memory_limits = crate::memory::limits(1);
         let mut request = eredu::api::PreparedChatRequest::new(&chat, configured);
         request.input = eredu::api::PreparedChatPrompt::TokenIds(&[0]);
         let error = model
@@ -116,9 +121,11 @@ fn controlled_semantic_setup_uses_original_receipt_and_refuses_mismatched_capaci
         assert!(error.session_failure().unwrap().input_rejection().is_some());
         drop(error);
         // Attempted cold controls spend their original account until its source retires.
-        assert!(pool.used_bytes().unwrap() >= before);
-        let mut request =
-            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        assert!(pool.live_charge_bytes().unwrap() >= before);
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(settings.clone()),
+        );
         request.input = eredu::api::PreparedChatPrompt::TokenIds(&[0]);
         let run = model
             .start_controlled_chat(
@@ -136,6 +143,6 @@ fn controlled_semantic_setup_uses_original_receipt_and_refuses_mismatched_capaci
         drop(run);
         drop(chat);
         drop(model);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

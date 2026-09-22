@@ -88,7 +88,8 @@ fn strides(shape: &[usize]) -> Result<[usize; 32]> {
 /// Construction and fragment iteration allocate no shape, index or data payload.
 /// No caller supplies a shape, source offset, destination offset or scalar count.
 /// The actual admission remains borrowed; identity-equivalent independent plans
-/// are not substituted. Context, TokenRows, media and multiple Sequence axes
+/// are not substituted. TokenRows uses the same mapping for a single batch.
+/// Context, media and multiple row axes
 /// require separately specified assembly semantics and are rejected here.
 #[derive(Debug)]
 pub struct CapturePrefillRowAssembly<'a> {
@@ -157,6 +158,10 @@ impl<'a> CapturePrefillRowAssembly<'a> {
                     count += 1;
                     axis = index;
                 }
+                SymbolicDimension::TokenRows if inference.batch_size == 1 => {
+                    count += 1;
+                    axis = index;
+                }
                 SymbolicDimension::Known(_) | SymbolicDimension::Batch => {}
                 _ => return Err(CapturePrefillGeometryError::UnsupportedAxis { axis: index }),
             }
@@ -202,60 +207,126 @@ impl<'a> CapturePrefillRowAssembly<'a> {
     /// producer which owns only some prompt rows needs a distinct schedule.
     /// This supplies geometry only, never a final claim or native permission.
     pub fn prepare_partition(
-        source: &'a AdmittedCapturePlan, selection: usize, inference: InferenceGeometry,
-        projection: &CaptureSlicePartition, fragment: usize, combination: PartitionCaptureCombination,
+        source: &'a AdmittedCapturePlan,
+        selection: usize,
+        inference: InferenceGeometry,
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+        combination: PartitionCaptureCombination,
     ) -> Result<Self> {
         let assembly = Self::prepare(source, selection, inference)?;
-        let logical = CaptureTensorGeometry::prepare_partition(source, selection,
-            CapturePhase::Prefill, 0, None, projection, fragment, combination)?;
-        Self::from_partition_geometry(logical,inference,assembly.axis)
+        let logical = CaptureTensorGeometry::prepare_partition(
+            source,
+            selection,
+            CapturePhase::Prefill,
+            0,
+            None,
+            projection,
+            fragment,
+            combination,
+        )?;
+        Self::from_partition_geometry(logical, inference, assembly.axis)
     }
     /// Raw source for an additive Summary/Histogram: every original selected
     /// F32 term is retained across chunks before the final nonlinear reduction.
     /// No shard-local nonlinear statistic is substituted for that raw tensor.
-    pub fn prepare_additive_transform_partition(source: &'a AdmittedCapturePlan, selection: usize,
-        inference: InferenceGeometry, projection: &CaptureSlicePartition, fragment: usize)
-        -> std::result::Result<Self,CapturePrefillPartitionError>
-    {
-        let plan=CapturePrefillTransformPlan::prepare_partition(source,selection,inference,projection,fragment,
-            PartitionCaptureCombination::SumF64ToF32)?;
-        let logical=CaptureTensorGeometry::prepare_partition(source,selection,CapturePhase::Prefill,0,None,
-            projection,fragment,PartitionCaptureCombination::SumF64ToF32)?;
-        Self::from_partition_geometry(logical,inference,plan.window().axis()).map_err(Into::into)
+    pub fn prepare_additive_transform_partition(
+        source: &'a AdmittedCapturePlan,
+        selection: usize,
+        inference: InferenceGeometry,
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+    ) -> std::result::Result<Self, CapturePrefillPartitionError> {
+        let plan = CapturePrefillTransformPlan::prepare_partition(
+            source,
+            selection,
+            inference,
+            projection,
+            fragment,
+            PartitionCaptureCombination::SumF64ToF32,
+        )?;
+        let logical = CaptureTensorGeometry::prepare_partition(
+            source,
+            selection,
+            CapturePhase::Prefill,
+            0,
+            None,
+            projection,
+            fragment,
+            PartitionCaptureCombination::SumF64ToF32,
+        )?;
+        Self::from_partition_geometry(logical, inference, plan.window().axis()).map_err(Into::into)
     }
-    fn from_partition_geometry(logical:CaptureTensorGeometry<'a>,inference:InferenceGeometry,axis:usize)->Result<Self> {
-        if axis>=logical.source_shape().len() || logical.source_shape()[axis]!=host(inference.input_positions)? {
-            return Err(CapturePrefillGeometryError::UnsupportedAxis{axis});
+    fn from_partition_geometry(
+        logical: CaptureTensorGeometry<'a>,
+        inference: InferenceGeometry,
+        axis: usize,
+    ) -> Result<Self> {
+        if axis >= logical.source_shape().len()
+            || logical.source_shape()[axis] != host(inference.input_positions)?
+        {
+            return Err(CapturePrefillGeometryError::UnsupportedAxis { axis });
         }
-        product(logical.source_shape())?;let rank=logical.source_shape().len();
-        let mut starts=[0;32];let mut steps=[1;32];let mut selected_shape=[0;32];
+        product(logical.source_shape())?;
+        let rank = logical.source_shape().len();
+        let mut starts = [0; 32];
+        let mut steps = [1; 32];
+        let mut selected_shape = [0; 32];
         for axis in 0..rank {
-            starts[axis]=host(logical.starts()[axis])?;steps[axis]=host(logical.strides()[axis])?;
-            selected_shape[axis]=host((logical.ends()[axis]-logical.starts()[axis]).div_ceil(logical.strides()[axis]))?;
+            starts[axis] = host(logical.starts()[axis])?;
+            steps[axis] = host(logical.strides()[axis])?;
+            selected_shape[axis] = host(
+                (logical.ends()[axis] - logical.starts()[axis]).div_ceil(logical.strides()[axis]),
+            )?;
         }
-        let selected_elements=product(&selected_shape[..rank])?;let selected_strides=strides(&selected_shape[..rank])?;
-        Ok(Self{logical,inference,axis,selected_shape,starts,steps,selected_strides,selected_elements})
+        let selected_elements = product(&selected_shape[..rank])?;
+        let selected_strides = strides(&selected_shape[..rank])?;
+        Ok(Self {
+            logical,
+            inference,
+            axis,
+            selected_shape,
+            starts,
+            steps,
+            selected_strides,
+            selected_elements,
+        })
     }
     /// Fixed transports for the additive transform source and common raw worker.
-    pub fn additive_partition_preparation_control_bytes()->Option<usize> {
+    pub fn additive_partition_preparation_control_bytes() -> Option<usize> {
         use std::mem::size_of;
         Self::partition_preparation_control_bytes()?
             .checked_add(CapturePrefillTransformPlan::partition_preparation_control_bytes()?)?
             .checked_add(size_of::<CapturePrefillTransformPlan<'_>>())?
-            .checked_add(size_of::<std::result::Result<Self,CapturePrefillPartitionError>>())
+            .checked_add(size_of::<
+                std::result::Result<Self, CapturePrefillPartitionError>,
+            >())
     }
     /// Exact fixed constructor transports in addition to the original geometry
     /// source. A funded caller reserves these before this partition adapter.
     pub fn partition_preparation_control_bytes() -> Option<usize> {
-        use std::mem::{size_of,size_of_val};
-        let parts = [size_of::<Self>() * 3, size_of::<CaptureTensorGeometry<'_>>() * 2,
-            size_of::<Result<Self>>(), size_of::<CapturePrefillGeometryError>(),
-            size_of::<(&AdmittedCapturePlan,usize,InferenceGeometry,&CaptureSlicePartition,usize,PartitionCaptureCombination)>(),
-            size_of::<(usize,usize)>(), size_of::<[usize;32]>()*4,
-            size_of::<(CaptureTensorGeometry<'_>,InferenceGeometry,usize)>(),
+        use std::mem::{size_of, size_of_val};
+        let parts = [
+            size_of::<Self>() * 3,
+            size_of::<CaptureTensorGeometry<'_>>() * 2,
+            size_of::<Result<Self>>(),
+            size_of::<CapturePrefillGeometryError>(),
+            size_of::<(
+                &AdmittedCapturePlan,
+                usize,
+                InferenceGeometry,
+                &CaptureSlicePartition,
+                usize,
+                PartitionCaptureCombination,
+            )>(),
+            size_of::<(usize, usize)>(),
+            size_of::<[usize; 32]>() * 4,
+            size_of::<(CaptureTensorGeometry<'_>, InferenceGeometry, usize)>(),
             CaptureTensorGeometry::partition_preparation_control_bytes()?,
         ];
-        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Exact borrowed full-request output geometry, including global Preview.

@@ -34,6 +34,7 @@ fn with_materialization(
                 Vec::new(),
                 Vec::new(),
                 Some((ready, observer.clone())),
+                None,
             )
             .unwrap();
             operation(owner, observer);

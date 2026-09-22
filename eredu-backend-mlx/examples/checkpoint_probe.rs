@@ -469,7 +469,7 @@ fn copy_logits(
 ) -> Result<(Vec<f32>, usize)> {
     let observations = session.observe_output(backend, output)?;
     let tensor = match observations.get(eredu_core::MODEL_LOGITS_OBSERVATION_PATH) {
-        Some(ObservationValue::Tensor(tensor)) => tensor,
+        Some(ObservationValue::Tensor(tensor)) => tensor.as_observation(),
         Some(_) => anyhow::bail!(
             "{} observation is not a tensor",
             eredu_core::MODEL_LOGITS_OBSERVATION_PATH

@@ -416,6 +416,9 @@ impl ParameterBankStatisticsTable {
     pub(super) fn iter(&self)->impl Iterator<Item=(&usize,&ParameterBankStatistics)> {
         self.rows.iter().map(|(bank,value)|(bank,value))
     }
+    pub(super) fn iter_mut(&mut self)->impl Iterator<Item=(&usize,&mut ParameterBankStatistics)> {
+        self.rows.iter_mut().map(|(bank,value)|(&*bank,value))
+    }
     /// Retained mutable counter destination, reported independently of native
     /// storage and source/manager authority. No caller obtains a credit here.
     pub(super) fn storage_bytes(&self)->Option<usize> {

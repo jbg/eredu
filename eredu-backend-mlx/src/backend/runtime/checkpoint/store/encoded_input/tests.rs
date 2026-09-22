@@ -6,7 +6,7 @@ use eredu_checkpoint::{
         TensorSelection,
     },
 };
-use safetensors::tensor::{Dtype as SafeDtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
 fn bytes() -> Vec<u8> {
     (0..256)
@@ -68,20 +68,18 @@ fn encoded_input_admits_before_read_and_alias_keeps_source_account() {
             PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32).unwrap();
         let required = plan.required_bytes().unwrap();
         assert_eq!(source.source_diagnostics().unwrap(), before);
-        let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+        let short = crate::memory_fixture::ledger(required - 1, 0).unwrap();
         let error = plan.prepare(&short).unwrap_err();
         assert!(
-            matches!(error.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded {
-            required_bytes, available_bytes,
-        }) if *required_bytes == required && *available_bytes == required - 1)
+            matches!(error.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == required && limit_bytes.checked_sub(*existing_bytes).unwrap() == required - 1)
         );
         assert!(error.rejected_plan().is_some());
         assert!(error.constructor_failure().is_none());
         assert_eq!(source.source_diagnostics().unwrap(), before);
         drop(error);
-        assert_eq!(short.used_bytes().unwrap(), 0);
+        assert_eq!(short.fixture_host_charge().unwrap(), 0);
 
-        let exact = WorkingMemoryPool::new(required, 0).unwrap();
+        let exact = crate::memory_fixture::ledger(required, 0).unwrap();
         let prepared = PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32)
             .unwrap()
             .prepare(&exact)
@@ -97,11 +95,11 @@ fn encoded_input_admits_before_read_and_alias_keeps_source_account() {
         assert_selected(&alias);
         drop(prepared);
         safemlx::reclaim_allocation_owners();
-        assert_eq!(exact.used_bytes().unwrap(), required);
+        assert_eq!(exact.fixture_host_charge().unwrap(), required);
         assert_selected(&alias);
         drop(alias);
         safemlx::reclaim_allocation_owners();
-        assert_eq!(exact.used_bytes().unwrap(), 0);
+        assert_eq!(exact.fixture_host_charge().unwrap(), 0);
     }
 }
 
@@ -131,7 +129,7 @@ fn encoded_input_source_failure_publishes_nothing_and_retains_error_account() {
         let shape = [2, 64];
         let plan = PreparedEncodedInputPlan::new(&read, &runtime, &shape, Dtype::Float32).unwrap();
         let required = plan.required_bytes().unwrap();
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(required, 0).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(directory.path().join("model.safetensors"))
@@ -146,12 +144,10 @@ fn encoded_input_source_failure_publishes_nothing_and_retains_error_account() {
     // The retained typed failure no longer borrows the read, shape or runtime.
     fn require_static<T: 'static>(_: &T) {}
     require_static(&error);
-    assert!(
-        std::error::Error::source(&error)
-            .unwrap()
-            .downcast_ref::<EncodedInputConstructionError>()
-            .is_some()
-    );
+    assert!(std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<EncodedInputConstructionError>()
+        .is_some());
     assert!(matches!(
         error.constructor_failure(),
         Some(EncodedInputConstructionError::Read(EncodedReadFailure {
@@ -160,10 +156,10 @@ fn encoded_input_source_failure_publishes_nothing_and_retains_error_account() {
         }))
     ));
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.fixture_host_charge().unwrap(), required);
     drop(error);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 // Runtime and source birth are fixture prerequisites. Every key, read record,
@@ -185,7 +181,7 @@ macro_rules! compiled_input {
                     indices: vec![7, 1],
                 },
             };
-            let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(1 << 26, 0).unwrap();
             let keys = pool
                 .initialize_shared_native(EncodedRecipeKeysPlan::new(&recipe).unwrap().unwrap())
                 .unwrap();
@@ -196,24 +192,24 @@ macro_rules! compiled_input {
             drop((keys, recipe));
             assert_eq!(read.output().shape(), [2, 64]);
             assert_eq!(source.source_diagnostics().unwrap().physical_read_bytes, 0);
-            let read_bytes = pool.used_bytes().unwrap();
+            let read_bytes = pool.fixture_host_charge().unwrap();
             assert!(read_bytes > 0);
             let plan =
                 PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32).unwrap();
             let required = plan.required_bytes().unwrap();
             let input = plan.prepare(&pool).unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), read_bytes + required);
+            assert_eq!(pool.fixture_host_charge().unwrap(), read_bytes + required);
             let alias = input.output().try_prepared_source_array().unwrap();
             drop(input);
             safemlx::reclaim_allocation_owners();
-            assert_eq!(pool.used_bytes().unwrap(), read_bytes + required);
+            assert_eq!(pool.fixture_host_charge().unwrap(), read_bytes + required);
             drop((read, source));
             safemlx::reclaim_allocation_owners();
-            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_eq!(pool.fixture_host_charge().unwrap(), required);
             assert_selected(&alias);
             drop(alias);
             safemlx::reclaim_allocation_owners();
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         }
     };
 }
@@ -227,3 +223,7 @@ compiled_input!(
     file(),
     SafetensorsEncodedReadPlan
 );
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

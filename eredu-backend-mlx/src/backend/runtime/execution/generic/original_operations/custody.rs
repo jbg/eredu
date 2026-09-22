@@ -1,6 +1,9 @@
 //! Exact outer bank identity, separate from account-only slot storage.
 use super::*;
-use eredu_runtime::working_memory::{OriginalSpeculativeRole, OriginalEmbeddedSpeculativeRole, OriginalExternalSpeculativeRole, OriginalSpeculativeBudgetCustody, OriginalHostSourceBank};
+use eredu_runtime::working_memory::{
+    OriginalEmbeddedSpeculativeRole, OriginalExternalSpeculativeRole, OriginalHostSourceBank,
+    OriginalSpeculativeBudgetCustody, OriginalSpeculativeRole,
+};
 
 #[derive(Debug, Clone)]
 pub(super) enum OperationControls {
@@ -12,15 +15,18 @@ impl OperationControls {
     fn validate_registry(&self, registry: &Registry) -> Result<(), Error> {
         match (self, &registry.request) {
             (Self::Text(controls), OperationRequest::Text(request)) => controls
-                .validate_reservation(request.memory_reservation().ok_or_else(identity)?)
+                .validate_reservation(request.memory_reservation())
                 .map_err(memory),
             (Self::Speculative(role), OperationRequest::Speculative(actual))
                 if role.same_role(actual) =>
             {
                 Ok(())
             }
-            (Self::Realtime(custody),OperationRequest::Realtime(actual))
-                if custody.same_account(actual)=>Ok(()),
+            (Self::Realtime(custody), OperationRequest::Realtime(actual))
+                if custody.same_account(actual) =>
+            {
+                Ok(())
+            }
             _ => Err(identity()),
         }
     }
@@ -39,7 +45,7 @@ impl OperationRequest {
         &self,
     ) -> Option<&eredu_runtime::working_memory::WorkingMemoryReservation> {
         match self {
-            Self::Text(request) => request.memory_reservation(),
+            Self::Text(request) => Some(request.memory_reservation()),
             Self::Speculative(_) | Self::Realtime(_) => None,
         }
     }
@@ -68,21 +74,35 @@ pub(in crate::backend::runtime::execution::generic) enum SpeculativeOperationRol
     External(OriginalExternalSpeculativeRole),
 }
 impl SpeculativeOperationRole {
-    pub(super) fn same_role(&self, other:&Self)->bool {
-        match (self,other) {
-            (Self::Autoregressive(a),Self::Autoregressive(b))=>a.same_role(b),
-            (Self::Embedded(a),Self::Embedded(b))=>a.same_role(b),
-            (Self::External(a),Self::External(b))=>a.same_role(b),
-            _=>false,
+    pub(super) fn same_role(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Autoregressive(a), Self::Autoregressive(b)) => a.same_role(b),
+            (Self::Embedded(a), Self::Embedded(b)) => a.same_role(b),
+            (Self::External(a), Self::External(b)) => a.same_role(b),
+            _ => false,
         }
     }
-    pub(super) fn budget_custody(&self)->OriginalSpeculativeBudgetCustody {
-        match self {Self::Autoregressive(role)=>role.budget_custody(),Self::Embedded(role)=>role.budget_custody(),Self::External(role)=>role.budget_custody()}
+    pub(super) fn budget_custody(&self) -> OriginalSpeculativeBudgetCustody {
+        match self {
+            Self::Autoregressive(role) => role.budget_custody(),
+            Self::Embedded(role) => role.budget_custody(),
+            Self::External(role) => role.budget_custody(),
+        }
     }
-    pub(super) fn claim_neural_bank(&self,controls:u64)->Result<(),WorkingMemoryError> {
-        match self {Self::Autoregressive(role)=>role.claim_neural_bank(controls),Self::Embedded(role)=>role.claim_neural_bank(controls),Self::External(role)=>role.claim_neural_bank(controls)}
+    pub(super) fn claim_neural_bank(&self, controls: u64) -> Result<(), WorkingMemoryError> {
+        match self {
+            Self::Autoregressive(role) => role.claim_neural_bank(controls),
+            Self::Embedded(role) => role.claim_neural_bank(controls),
+            Self::External(role) => role.claim_neural_bank(controls),
+        }
     }
-    pub(super) fn take_host_source_constructions(&self)->Result<Option<OriginalHostSourceBank>,WorkingMemoryError> {
-        match self {Self::Autoregressive(role)=>role.take_host_source_constructions(),Self::Embedded(role)=>role.take_host_source_constructions(),Self::External(role)=>role.take_host_source_constructions()}
+    pub(super) fn take_host_source_constructions(
+        &self,
+    ) -> Result<Option<OriginalHostSourceBank>, WorkingMemoryError> {
+        match self {
+            Self::Autoregressive(role) => role.take_host_source_constructions(),
+            Self::Embedded(role) => role.take_host_source_constructions(),
+            Self::External(role) => role.take_host_source_constructions(),
+        }
     }
 }

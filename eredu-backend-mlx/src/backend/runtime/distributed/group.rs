@@ -27,6 +27,7 @@ pub(crate) use status::independent_status_members;
 pub use collectives::{all_gather, all_sum, all_to_all_v};
 pub(crate) use collectives::{
     all_gather_for, all_gather_unchecked, all_sum_for, payload_free_all_sum_for,
+    ordinary_local_variable_control_bytes,
 };
 pub use handle::Group;
 pub(crate) use point_to_point::recv_like;

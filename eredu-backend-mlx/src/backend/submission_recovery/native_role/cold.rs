@@ -2,8 +2,8 @@
 use super::*;
 use eredu_core::HostPreparationAuthority;
 use eredu_runtime::working_memory::{
-    SharedNativeInitializationCustody, SharedNativeInitializationError, SharedNativeInitializer,
-    WorkingMemoryError, WorkingMemoryPool,
+    MemoryLedger, SharedNativeInitializationCustody, SharedNativeInitializationError,
+    SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{PreparedInputRuntime, PreparedOriginalBufferBudget};
 use std::{cell::RefCell, convert::Infallible};
@@ -21,6 +21,8 @@ pub(crate) struct Plan<'a, I, F> {
     pipeline: Option<safemlx::PreparedPipelineCachePlan>,
     invocation: I,
     operation: F,
+    parent: Option<OriginalScopeObserver>,
+    timeout: Option<std::time::Duration>,
 }
 
 /// The shared initializer publishes by borrowing. The private cell transfers
@@ -123,11 +125,25 @@ where
             pipeline,
             invocation,
             operation,
+            parent: None,
+            timeout: None,
         }
     }
 
+    /// An already source-qualified protocol occurrence can be a child of its
+    /// exact current role. This retains no replacement allocation authority.
+    pub(crate) fn with_parent(
+        mut self,
+        parent: Option<OriginalScopeObserver>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.parent = parent;
+        self.timeout = Some(timeout);
+        self
+    }
+
     pub(crate) fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::shared_native_initialization_required_bytes(self)
+        MemoryLedger::shared_native_initialization_required_bytes(self)
     }
 
     /// Compares once before constructing any native owner. Rejection retains
@@ -136,7 +152,7 @@ where
     /// the constructor wrapper without waiting for completion.
     pub(crate) fn submit(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Submission<I, T, E>, SharedNativeInitializationError<Self>> {
         let initialized = pool.initialize_shared_native(self)?;
         let result = initialized
@@ -183,14 +199,18 @@ where
     type Error = eredu_core::BackendFailure;
 
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        if self.runtime.allocation_placement() != safemlx::AllocationPlacement::Host {
+            return Err(WorkingMemoryError::UnknownBound);
+        }
         let controls = [
+            OriginalScopeObserver::control_bytes().ok_or(WorkingMemoryError::Overflow)?,
             Custody::retention_bytes::<SharedNativeInitializationCustody>()
                 .ok_or(WorkingMemoryError::Overflow)?,
             size_of::<Custody>(),
             size_of::<HostMetadataFunding>(),
             size_of::<Result<HostMetadataFunding, HostMetadataFundingError>>(),
             size_of::<Result<Option<OriginalScopeObserver>, safemlx::error::Exception>>(),
-            size_of::<(&WorkingMemoryPool, &PreparedInputRuntime)>(),
+            size_of::<(&MemoryLedger, &PreparedInputRuntime)>(),
             size_of::<Self::Output>(),
             size_of::<Option<Submission<I, T, E>>>(),
             size_of::<Result<Submission<I, T, Infallible>, FailedSubmission<I, E>>>(),
@@ -217,12 +237,16 @@ where
             .map_err(|cause| fail(RoleCause::Backend(Error::PrefillControl(cause))))?;
         let funding = HostMetadataFunding::from_prepaid(metadata, custody.clone())
             .map_err(|cause| fail(RoleCause::Backend(Error::WorkspacePlanning(cause))))?;
-        // A cold root cannot infer a relationship with an active original
-        // request. Nested operations use the existing explicit-parent entry.
-        if let Some(parent) =
-            OriginalScopeObserver::try_current().map_err(|cause| fail(RoleCause::Native(cause)))?
-        {
-            return Err(fail(RoleCause::Native(parent.domain_error())));
+        let current =
+            OriginalScopeObserver::try_current().map_err(|cause| fail(RoleCause::Native(cause)))?;
+        if match (&current, &self.parent) {
+            (None, None) => false,
+            (Some(current), Some(parent)) => !current.same_scope(parent),
+            _ => true,
+        } {
+            return Err(fail(RoleCause::Backend(Error::PrefillControl(
+                WorkingMemoryError::IdentityMismatch,
+            ))));
         }
         let buffer_controls = self
             .buffer_controls()
@@ -254,7 +278,7 @@ where
             RoleBudget::Cold(budget),
             &custody,
             &funding,
-            None,
+            self.timeout,
             self.operation,
         )
         .map(|(result, pending)| Output(RefCell::new(Some(Submission { result, pending }))))

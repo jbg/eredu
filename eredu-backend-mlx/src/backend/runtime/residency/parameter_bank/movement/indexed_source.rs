@@ -20,7 +20,16 @@ mod binding_layouts;
 pub(crate) use binding_layouts::{IndexedBindingLayout,IndexedBindingStorage,IndexedBindingIdentity};
 #[path = "indexed_source/request.rs"]
 mod request;
-pub(crate) use request::{IndexedRequestSource,IndexedRequestInstallation};
+pub(crate) use request::{IndexedRequestSource,IndexedRequestInstallation,IndexedResidencyFactory};
+#[path = "indexed_source/ordinary_residency.rs"]
+mod ordinary_residency;
+pub(crate) use ordinary_residency::{OrdinaryIndexedResidencyFacts, OrdinaryResidencyMissing, OrdinaryResidencyPhysical};
+#[path = "indexed_source/ordinary.rs"]
+mod ordinary;
+pub(crate) use ordinary::{OrdinaryIndexedChunkSource,OrdinaryIndexedResidencyFactory,OrdinaryIndexedResidencyInvocation};
+#[path = "indexed_source/ordinary_request.rs"]
+mod ordinary_request;
+pub(crate) use ordinary_request::{OrdinaryIndexedOccurrence, OrdinaryIndexedRequestProgram, OrdinaryIndexedRequestOwner, OrdinaryIndexedLocalSource};
 pub(super) type IndexedBankBinding=IndexedBankSource;
 impl std::ops::Deref for IndexedBankSource {
     type Target=SharedAddressableParameterBank;
@@ -28,6 +37,9 @@ impl std::ops::Deref for IndexedBankSource {
 }
 impl IndexedBankSource {
     pub(crate) fn storage(&self)->&SharedAddressableParameterBank{&self.bank}
+    pub(crate) fn prefill_compact_bank_target_bytes(&self) -> u64 {
+        self.options.prefill_compact_bank_target_bytes()
+    }
 
     pub(crate) fn new(bank:SharedAddressableParameterBank,options:eredu_runtime::ParameterBankLoadOptions)->Self {
         Self{bank,options,request:Rc::new(request::Channel::default())}
@@ -89,6 +101,8 @@ enum Cause {
     Budget(#[source] eredu_runtime::working_memory::HostDestinationCause),
     #[error("addressable accepted source memory: {0}")]
     Memory(#[source] eredu_runtime::working_memory::WorkingMemoryError),
+    #[error("addressable compact member rows: {0}")]
+    Compact(#[source] crate::backend::runtime::residency::parameter_bank::parameters::CompactRowsError),
     #[error("addressable indexed consumer: {0}")]
     Consumer(#[source] Error),
 }

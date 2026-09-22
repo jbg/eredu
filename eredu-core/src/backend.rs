@@ -1,8 +1,8 @@
 //! High-level contract implemented once per execution backend.
 
-mod capture_delivery;
 mod branch;
-pub use branch::{TextBranchSource, TextGenerationBranch, TextBranchFenced};
+mod capture_delivery;
+pub use branch::{TextBranchFenced, TextBranchSource, TextGenerationBranch};
 mod continuation;
 mod controller_workspace;
 mod failure;
@@ -14,13 +14,11 @@ mod prepared_control;
 pub use prepared_control::*;
 mod reset_preparation;
 mod resume;
+mod sampling_boundary;
 mod shared_filter;
 mod shared_storage;
 mod text_step;
 mod token_choice;
-mod sampling_boundary;
-pub use sampling_boundary::TextSamplingBoundary;
-pub use token_choice::{ProspectiveTokenController, TextTokenChoiceBoundary};
 pub use continuation::{
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
     TextGenerationContinuation, TextGenerationDriver, TextSnapshotSource,
@@ -43,24 +41,29 @@ pub use preparation::{
 pub use reset_preparation::{
     PreparedSessionReset, SessionResetPreparationBackend, SessionResetReadiness,
 };
-pub use resume::{OriginalTextResumeKind, OriginalTextResumeOptions, TextResumeBackend, TextResumeFacts, TextResumeSourceFacts, text_resume_control_bytes};
+pub use resume::{
+    text_resume_control_bytes, OriginalTextResumeKind, OriginalTextResumeOptions,
+    TextResumeBackend, TextResumeFacts, TextResumeSourceFacts,
+};
+pub use sampling_boundary::TextSamplingBoundary;
 pub use shared_filter::SharedTokenFilter;
 pub(crate) use shared_storage::SharedStorageCustody;
 pub use shared_storage::{
     ControllerDeclarationData, ErasedSharedStorageOwner, SharedControllerBytes,
-    SharedControllerDeclaration, SharedControllerSource, SharedStorageAttachmentError,
-    SharedStorageDomain, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
+    SharedControllerDeclaration, SharedControllerSource, SharedStorageAccountingId,
+    SharedStorageAttachmentError, SharedStorageAttachmentLayout, SharedStorageAttachmentTable,
+    SharedStorageAttachments, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
 };
 pub use text_step::{TextContextError, TextPolicyIdentity, TextRunIdentity, TextStepContext};
+pub use token_choice::{ProspectiveTokenController, TextTokenChoiceBoundary};
 
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::Path};
 
 use crate::{
-    PreparationAdmission,
     artifact::{
-        ArtifactError, ArtifactInspection, ModelConfigurationResolver, ModelPreparationPlan,
-        inspect_artifact_with_prepared_gguf_headers,
+        inspect_artifact_with_prepared_gguf_headers, ArtifactError, ArtifactInspection,
+        ModelConfigurationResolver, ModelPreparationPlan,
     },
     capability::{
         CapabilityError, InputTokenCount, ModelCapabilities, RuntimeStateEstimate,
@@ -70,6 +73,7 @@ use crate::{
     generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
     observation::{InspectedOutput, ObservationRequest, ObservationSet},
+    PreparationAdmission,
 };
 
 /// Stable, extensible description of an execution backend.
@@ -629,7 +633,11 @@ impl DistributedCommitEpoch {
 
     /// Creates a positive durable epoch identity.
     pub const fn new(value: u64) -> Option<Self> {
-        if value == 0 { None } else { Some(Self(value)) }
+        if value == 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
     }
 
     /// Stable serialized epoch value.
@@ -960,9 +968,16 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// Adapters may supply neutral source admission from their existing pool;
     /// format dispatch and model semantics remain in the portable inspection.
     fn inspect_model_artifact(
-        &self, path: &std::path::Path,
-    ) -> Result<ArtifactInspection<<Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan>, ModelLoadError<Self::Error>> {
-        inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver()).map_err(Into::into)
+        &self,
+        path: &std::path::Path,
+    ) -> Result<
+        ArtifactInspection<
+            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+        >,
+        ModelLoadError<Self::Error>,
+    > {
+        inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver())
+            .map_err(Into::into)
     }
 
     /// Intersects normalized architecture requirements and the caller request
@@ -1520,7 +1535,7 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
         let claim = crate::SessionResetClaim::new(
             &self.session,
             &self.admission,
-            crate::SessionResetLimits::new(u64::MAX),
+            crate::SessionResetLimits::default(),
         );
         B::reset_session(&self.backend, &mut self.session, claim)
     }
@@ -1567,7 +1582,7 @@ impl<B: ModelLoadingBackend> ModelRuntime<B> {
 }
 
 /// Portable sampling inputs for one text-generation session.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextGenerationConfig {
     sampling: ResolvedGenerationConfig,
     seed: u64,
@@ -1602,7 +1617,7 @@ impl TextGenerationConfig {
             strategy: TextSamplingStrategy::Standard,
             inference: crate::TextInferencePolicy {
                 prefill_chunk_positions: None,
-                managed_memory_capacity_bytes: None,
+                memory_limits: crate::MemoryLimitDeclarations::unlimited(),
                 submission_tracking_capacity_bytes: None,
                 graph_metadata_capacity_bytes: None,
             },
@@ -1618,14 +1633,14 @@ impl TextGenerationConfig {
     /// Applies the same execution limits to ordinary and controlled startup.
     /// Admission validates finite output allowance and complete memory bounds
     /// before native prompt or sampling-state construction.
-    pub const fn with_inference_policy(mut self, policy: crate::TextInferencePolicy) -> Self {
+    pub fn with_inference_policy(mut self, policy: crate::TextInferencePolicy) -> Self {
         self.inference = policy;
         self
     }
 
     /// Requested execution limits, before admission selects a smaller chunk.
-    pub const fn inference_policy(&self) -> crate::TextInferencePolicy {
-        self.inference
+    pub const fn inference_policy(&self) -> &crate::TextInferencePolicy {
+        &self.inference
     }
 
     /// Selects adaptive Mirostat V2 sampling, requiring positive temperature.
@@ -2019,7 +2034,9 @@ impl<'a> TextControllerStorage<'a> {
     /// ownership is unknown or any non-mask source would be omitted.
     pub fn shared_filters(self) -> Option<&'a [SharedTokenFilter]> {
         match self {
-            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) | Self::RunOwnedWithPreparedSemantic { .. } => None,
+            Self::Unknown
+            | Self::RunOwnedWithOriginalTokenDomain(_)
+            | Self::RunOwnedWithPreparedSemantic { .. } => None,
             Self::RunOwned => Some(&[]),
             Self::RunOwnedWithSharedFilters(filters) => Some(filters),
             Self::RunOwnedWithSharedStorage { filters, bytes } if bytes.is_empty() => Some(filters),
@@ -2042,7 +2059,9 @@ impl<'a> TextControllerStorage<'a> {
             &'a [SharedControllerBytes],
             &'a [SharedControllerDeclaration],
         ) = match self {
-            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) | Self::RunOwnedWithPreparedSemantic { .. } => return None,
+            Self::Unknown
+            | Self::RunOwnedWithOriginalTokenDomain(_)
+            | Self::RunOwnedWithPreparedSemantic { .. } => return None,
             Self::RunOwned => (&[], &[], &[]),
             Self::RunOwnedWithSharedFilters(filters) => (filters, &[], &[]),
             Self::RunOwnedWithSharedStorage { filters, bytes } => (filters, bytes, &[]),
@@ -2132,22 +2151,30 @@ pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
 
     /// Borrows the complete paid grammar. Unknown and fixed controllers return
     /// None; they must not supply plain/forbidden and grammar sources together.
-    fn prepared_grammar(&self) -> Option<&Self::PreparedGrammar> { None }
+    fn prepared_grammar(&self) -> Option<&Self::PreparedGrammar> {
+        None
+    }
 
     /// Prospective payment for publishing a copied prepared grammar through
     /// this complete controller wrapper. The grammar copy is priced separately;
     /// absent or unknown publication producers return None.
-    fn prepared_grammar_replacement_bytes(&self) -> Option<usize> { None }
+    fn prepared_grammar_replacement_bytes(&self) -> Option<usize> {
+        None
+    }
 
     /// Publishes an independently prepared successor, retaining its exact inputs
     /// and supplied account. All allocation must be paid before construction;
     /// refusal retains the uninstalled successor. Ordinary Clone is not a copy
     /// producer for mutable grammar state.
     fn replace_prepared_grammar(
-        &self, grammar: Self::PreparedGrammar, funding: &crate::HostMetadataFunding,
+        &self,
+        grammar: Self::PreparedGrammar,
+        funding: &crate::HostMetadataFunding,
     ) -> Result<Self, crate::speculative::PreparedGrammarInstallError<Self::PreparedGrammar>> {
         Err(crate::speculative::PreparedGrammarInstallError::new(
-            crate::speculative::PreparedGrammarInstallCause::Unknown, grammar, funding,
+            crate::speculative::PreparedGrammarInstallCause::Unknown,
+            grammar,
+            funding,
         ))
     }
 
@@ -2325,9 +2352,9 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Quotes and admits one exact request before prompt/sampler allocation.
     /// This may inspect metadata and reserve shared capacity, but must not create
-    /// native tensors or advance the controller. Unknown required bounds must
-    /// reject an enforced policy. Explicit unbudgeted policy may return a unit
-    /// owner without claiming memory coverage.
+    /// native tensors or advance the controller. Unknown required bounds reject
+    /// admission under both finite and unlimited domain limits. The returned
+    /// owner retains the ordinary reservation and execution evidence.
     fn admit_text_preparation<C: TokenFilterController>(
         runtime: &ModelRuntime<Self>,
         input: &TextPreparationInput<'_, Self::Prompt>,
@@ -2482,8 +2509,8 @@ pub trait TextGenerationBackend: BackendProvider {
     /// The shared driver calls this once, at attempt zero, before prompt/sampler
     /// creation or mutable run exposure. It is part of the Admission readiness
     /// result. This cold hook must not create native values or advance a
-    /// controller. Quoted backends must retain and check this original context;
-    /// the default supports unbudgeted preparation and grants no budget proof.
+    /// controller. Backends retain and check this original context; the default
+    /// adds no backend-specific binding and grants no execution authority.
     /// Calling admission directly does not construct authentic run evidence.
     fn bind_text_preparation_run<C: TokenFilterController>(
         _runtime: &ModelRuntime<Self>,
@@ -2541,7 +2568,10 @@ pub trait TextGenerationBackend: BackendProvider {
         _runtime: &ModelRuntime<Self>,
         factory: impl FnOnce() -> Vec<u8>,
     ) -> Result<SharedControllerBytes, BackendFailure> {
-        Ok(SharedControllerBytes::new(factory(), crate::HostPreparationAuthority::unmanaged()))
+        Ok(SharedControllerBytes::new(
+            factory(),
+            crate::HostPreparationAuthority::unmanaged(),
+        ))
     }
 
     /// Creates an immutable declaration under the same source-accounting
@@ -2555,7 +2585,10 @@ pub trait TextGenerationBackend: BackendProvider {
         _runtime: &ModelRuntime<Self>,
         factory: impl FnOnce() -> Result<T, BackendFailure>,
     ) -> Result<SharedControllerDeclaration, BackendFailure> {
-        Ok(SharedControllerDeclaration::new(factory()?, HostPreparationAuthority::unmanaged()))
+        Ok(SharedControllerDeclaration::new(
+            factory()?,
+            HostPreparationAuthority::unmanaged(),
+        ))
     }
 
     /// Opaque prepared prompt, including any backend-owned multimodal values.
@@ -2640,7 +2673,9 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Content identity already established during source discovery. This cold
     /// borrowed query must not hash, reopen artifacts or allocate a discovery.
-    fn prepared_artifact_identity(_runtime: &ModelRuntime<Self>) -> Option<crate::artifact::ArtifactIdentity> {
+    fn prepared_artifact_identity(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Option<crate::artifact::ArtifactIdentity> {
         None
     }
 
@@ -3146,8 +3181,8 @@ where
 /// non-repeating core evidence issuer without a heap owner. A concrete
 /// original producer must add those actual populations before the same admission;
 /// this layout alone grants no storage, completeness or execution authority.
-pub fn text_generation_control_bytes<B: TextGenerationBackend, C: TokenFilterController>()
--> Option<usize> {
+pub fn text_generation_control_bytes<B: TextGenerationBackend, C: TokenFilterController>(
+) -> Option<usize> {
     use std::mem::size_of;
     [
         preparation::control_bytes::<B, C>()?,
@@ -3495,8 +3530,6 @@ where
             crate::run_preparation::TextCaptureSetupError::Preparation,
         )
     }
-
-
 }
 
 impl<B, C> TextGenerationMachine<B, C>
@@ -3570,15 +3603,21 @@ where
         ) = preparation::prepare(
             runtime,
             owned.input.take().expect("owned preparation input"),
-            config,
+            config.clone(),
             owned.controller.take().expect("owned controller"),
             &step_context,
             owned.options.as_ref(),
             owned.sequence.as_ref(),
         )?;
         Ok(Self {
-            capture_source: owned.options.as_ref().and_then(|options| options.capture.clone()),
-            intervention_source: owned.options.take().and_then(|options| options.interventions),
+            capture_source: owned
+                .options
+                .as_ref()
+                .and_then(|options| options.capture.clone()),
+            intervention_source: owned
+                .options
+                .take()
+                .and_then(|options| options.interventions),
             resume_host: None,
             prepared_sequence,
             preparation,
@@ -3693,7 +3732,8 @@ where
     ) -> Option<ControlledGenerationResult<B, C>> {
         if self.branch_fenced {
             return Some(Err(ControlledTextGenerationError::Preparation(
-                BackendFailure::new(BackendFailureKind::Other, TextBranchFenced))));
+                BackendFailure::new(BackendFailureKind::Other, TextBranchFenced),
+            )));
         }
         if let Err(error) = self.step_context.validate() {
             self.step = None;
@@ -4406,9 +4446,14 @@ mod tests {
             &LOADING_CONFIGURATION_RESOLVER
         }
 
-        fn inspect_model_artifact(&self, path: &std::path::Path) -> Result<ArtifactInspection, ModelLoadError<Self::Error>> {
-            self.inspections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver()).map_err(Into::into)
+        fn inspect_model_artifact(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<ArtifactInspection, ModelLoadError<Self::Error>> {
+            self.inspections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver())
+                .map_err(Into::into)
         }
 
         fn select_preparation(
@@ -4672,14 +4717,12 @@ mod tests {
                 &crate::StateMemoryLayout::new(
                     crate::LayerSchedule::new(
                         1,
-                        vec![
-                            crate::cache::LayerCachePolicy::key_only(
-                                crate::AttentionPolicy::Full,
-                                1,
-                                2,
-                            )
-                            .unwrap(),
-                        ],
+                        vec![crate::cache::LayerCachePolicy::key_only(
+                            crate::AttentionPolicy::Full,
+                            1,
+                            2,
+                        )
+                        .unwrap()],
                     )
                     .unwrap(),
                     vec![0],
@@ -4740,11 +4783,28 @@ mod tests {
         let backend = LoadingMock::default();
         let prepared = load_model(&backend, root.path(), 41).unwrap();
         assert_eq!(*prepared, 41);
-        assert_eq!(backend.inspections.load(std::sync::atomic::Ordering::Relaxed), 1);
-        let inspection = inspect_artifact_with_prepared_gguf_headers(root.path(), backend.configuration_resolver()).unwrap();
+        assert_eq!(
+            backend
+                .inspections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let inspection = inspect_artifact_with_prepared_gguf_headers(
+            root.path(),
+            backend.configuration_resolver(),
+        )
+        .unwrap();
         std::fs::remove_file(root.path().join("config.json")).unwrap();
-        assert_eq!(*prepare_inspected_model(&backend, inspection, 42).unwrap(), 42);
-        assert_eq!(backend.inspections.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            *prepare_inspected_model(&backend, inspection, 42).unwrap(),
+            42
+        );
+        assert_eq!(
+            backend
+                .inspections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         write_loading_fixture(root.path());
 
         let runtime = ModelRuntime::load(LoadingMock::default(), root.path(), 7).unwrap();
@@ -4797,12 +4857,10 @@ mod tests {
             1
         );
         let retained = backend.selected_gguf.borrow_mut().take().unwrap();
-        assert!(
-            retained
-                .shards()
-                .iter()
-                .all(|shard| shard.prepared_header().is_some())
-        );
+        assert!(retained
+            .shards()
+            .iter()
+            .all(|shard| shard.prepared_header().is_some()));
         let mut materializer = retained.into_materializer();
         let converted = materializer.converted_tensor("token_embd.weight").unwrap();
         let eredu_gguf::ConvertedTensor::Dense(dense) = converted.converted() else {
@@ -5044,7 +5102,10 @@ mod tests {
                 Err(TextContinuationError::NotQuiescent)
             ));
             assert_eq!(state.controller().committed, index + 1);
-            assert!(driver.take_completed_delivery(&mut state).unwrap().is_none());
+            assert!(driver
+                .take_completed_delivery(&mut state)
+                .unwrap()
+                .is_none());
             state.require_quiescent().unwrap();
         }
         assert!(driver.advance(&mut state).unwrap().is_none());
@@ -5146,12 +5207,10 @@ mod tests {
         let mut state = driver
             .start(vec![1, 2], continuation_config(3), PanickingFilter)
             .unwrap();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                driver.advance(&mut state)
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.advance(&mut state)
+        }))
+        .is_err());
         driver.take_completed_delivery(&mut state).unwrap();
         assert!(matches!(
             state.require_quiescent(),
@@ -5329,12 +5388,10 @@ mod tests {
             scope
         );
         assert!(DistributedSessionDescriptor::new(descriptor.world_size(), 6, Vec::new()).is_err());
-        assert!(
-            serde_json::from_str::<DistributedSessionDescriptor>(
-                r#"{"world_size":6,"rank":6,"groups":[]}"#
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_str::<DistributedSessionDescriptor>(
+            r#"{"world_size":6,"rank":6,"groups":[]}"#
+        )
+        .is_err());
     }
 
     #[test]

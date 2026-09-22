@@ -42,15 +42,16 @@ fn heterogeneous_logits_and_fixed_state_match_across_weight_and_state_residency(
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             let mut executable = model.into_executable();
-            let generic = executable.erased_mut();
             let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
             let parts = [input::token_ids_part(&prompt).unwrap()];
-            generic
+            executable
+                .erased_mut()
                 .prefill(input::ModelInput::new(&parts), &stream)
                 .unwrap()
                 .evaluated()
                 .unwrap();
-            let logits = generic
+            let logits = executable
+                .erased_mut()
                 .decode(&Array::from_slice(&[3_u32], &[1, 1]), &stream)
                 .unwrap()
                 .evaluated()
@@ -64,8 +65,11 @@ fn heterogeneous_logits_and_fixed_state_match_across_weight_and_state_residency(
             );
             results.push((
                 logits,
-                generic.state_snapshot(),
-                generic.fixed_numeric_state_snapshot().unwrap(),
+                executable.erased_mut().state_snapshot(),
+                executable
+                    .erased_mut()
+                    .fixed_numeric_state_snapshot()
+                    .unwrap(),
             ));
         }
         let (resident_logits, resident_semantics, resident_fixed) = &results[0];
@@ -209,10 +213,17 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
             "{name}"
         );
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
-        assert_eq!(generic.selected_residency(), residency.layers(), "{name}");
         assert_eq!(
-            generic.cache_residency_report().unwrap().is_some(),
+            executable.erased_mut().selected_residency(),
+            residency.layers(),
+            "{name}"
+        );
+        assert_eq!(
+            executable
+                .erased_mut()
+                .cache_residency_report()
+                .unwrap()
+                .is_some(),
             matches!(state_policy, CacheResidencyPolicy::Paged(_)),
             "{name}"
         );
@@ -220,13 +231,15 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
         let prefix = [1_u32, 2, 3];
         let prompt = Array::from_slice(&prefix, &[1, 3]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
-        generic
+        executable
+            .erased_mut()
             .prefill(input::ModelInput::new(&parts), &stream)
             .unwrap()
             .evaluated()
             .unwrap();
-        let saved_snapshot = generic.state_snapshot();
-        let saved_numeric = generic
+        let saved_snapshot = executable.erased_mut().state_snapshot();
+        let saved_numeric = executable
+            .erased_mut()
             .fixed_numeric_state_snapshot()
             .unwrap_or_else(|error| panic!("{name} numeric snapshot: {error}"));
         assert!(!saved_numeric.is_empty(), "{name}");
@@ -236,7 +249,10 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
             .all(|(_, present)| *present));
 
         let persisted = matches!(state_policy, CacheResidencyPolicy::Paged(_)).then(|| {
-            let identity = generic.prompt_cache_model_identity().clone();
+            let identity = executable
+                .erased_mut()
+                .prompt_cache_model_identity()
+                .clone();
             let descriptor = PromptCacheDescriptor::from_model_identity(
                 identity,
                 format!("{name}-checkpoint"),
@@ -246,26 +262,37 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
             .unwrap();
             let cache_root = tempfile::tempdir().unwrap();
             let destination = cache_root.path().join("cache");
-            generic
-                .save_prompt_cache(
+            with_prompt_cache_funding(&mut executable, |generic, funding| {
+                generic.save_prompt_cache(
+                    funding,
+                    None,
                     &destination,
                     descriptor.clone(),
                     &prefix,
                     &PromptCacheOptions::default(),
                 )
-                .unwrap();
+            })
+            .unwrap();
             (cache_root, destination, descriptor)
         });
         let continuation_token = Array::from_slice(&[4_u32], &[1, 1]);
         let persistence_baseline = persisted
             .as_ref()
-            .map(|_| generic.checkpoint_restore_probe(&continuation_token, &stream))
+            .map(|_| {
+                executable
+                    .erased_mut()
+                    .checkpoint_restore_probe(&continuation_token, &stream)
+            })
             .transpose()
             .unwrap_or_else(|error| panic!("{name} persistence baseline: {error}"));
-        generic.reset_cache().unwrap();
-        assert!(generic.state_snapshot().iter().all(|(position, fixed)| {
-            *position == 0 && fixed.iter().all(|(_, present)| !present)
-        }));
+        executable.erased_mut().reset_cache().unwrap();
+        assert!(executable
+            .erased_mut()
+            .state_snapshot()
+            .iter()
+            .all(|(position, fixed)| {
+                *position == 0 && fixed.iter().all(|(_, present)| !present)
+            }));
         if let Some((_cache_root, destination, descriptor)) = persisted {
             let incompatible = descriptor
                 .clone()
@@ -274,40 +301,76 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
                     descriptor.architecture_fingerprint()
                 ))
                 .unwrap();
-            assert!(generic
-                .load_prompt_cache(&destination, &incompatible, &prefix)
-                .is_err());
-            generic
-                .load_prompt_cache(&destination, &descriptor, &prefix)
-                .unwrap();
-        } else {
-            assert!(generic
-                .save_prompt_cache(
-                    tempfile::tempdir().unwrap().path(),
-                    PromptCacheDescriptor::from_model_identity(
-                        generic.prompt_cache_model_identity().clone(),
-                        format!("{name}-checkpoint"),
-                        "tokens:1,2,3",
-                        1,
+            assert!(with_prompt_cache_materialization(
+                &mut executable,
+                |generic, funding, materialization| {
+                    generic.load_prompt_cache(
+                        funding,
+                        materialization,
+                        None,
+                        &destination,
+                        &incompatible,
+                        &prefix,
                     )
-                    .unwrap(),
-                    &prefix,
-                    &PromptCacheOptions::default(),
-                )
-                .is_err());
-            generic
+                }
+            )
+            .is_err());
+            with_prompt_cache_materialization(
+                &mut executable,
+                |generic, funding, materialization| {
+                    generic.load_prompt_cache(
+                        funding,
+                        materialization,
+                        None,
+                        &destination,
+                        &descriptor,
+                        &prefix,
+                    )
+                },
+            )
+            .unwrap();
+        } else {
+            assert!(
+                with_prompt_cache_funding(&mut executable, |generic, funding| {
+                    generic.save_prompt_cache(
+                        funding,
+                        None,
+                        tempfile::tempdir().unwrap().path(),
+                        PromptCacheDescriptor::from_model_identity(
+                            generic.prompt_cache_model_identity().clone(),
+                            format!("{name}-checkpoint"),
+                            "tokens:1,2,3",
+                            1,
+                        )
+                        .unwrap(),
+                        &prefix,
+                        &PromptCacheOptions::default(),
+                    )
+                })
+                .is_err()
+            );
+            executable
+                .erased_mut()
                 .prefill(input::ModelInput::new(&parts), &stream)
                 .unwrap()
                 .evaluated()
                 .unwrap();
         }
-        assert_eq!(generic.state_snapshot(), saved_snapshot, "{name}");
         assert_eq!(
-            generic.fixed_numeric_state_snapshot().unwrap(),
+            executable.erased_mut().state_snapshot(),
+            saved_snapshot,
+            "{name}"
+        );
+        assert_eq!(
+            executable
+                .erased_mut()
+                .fixed_numeric_state_snapshot()
+                .unwrap(),
             saved_numeric,
             "{name} fixed tensors changed across prompt-cache restoration"
         );
-        let probe = generic
+        let probe = executable
+            .erased_mut()
             .checkpoint_restore_probe(&continuation_token, &stream)
             .unwrap_or_else(|error| panic!("{name} checkpoint/restore: {error}"));
         if let Some(baseline) = persistence_baseline {
@@ -331,16 +394,22 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
         assert_eq!(before_numeric, saved_numeric, "{name}");
         assert_ne!(advanced_numeric, before_numeric, "{name}");
         assert_eq!(restored_numeric, before_numeric, "{name}");
-        let replayed = generic.decode(&continuation_token, &stream).unwrap();
+        let replayed = executable
+            .erased_mut()
+            .decode(&continuation_token, &stream)
+            .unwrap();
         let replayed = replayed.evaluated().unwrap();
         assert_eq!(
             replayed.as_slice::<f32>(),
             continuation.as_slice(),
             "{name}"
         );
-        assert_eq!(generic.state_snapshot(), advanced, "{name}");
+        assert_eq!(executable.erased_mut().state_snapshot(), advanced, "{name}");
         assert_eq!(
-            generic.fixed_numeric_state_snapshot().unwrap(),
+            executable
+                .erased_mut()
+                .fixed_numeric_state_snapshot()
+                .unwrap(),
             advanced_numeric,
             "{name}"
         );
@@ -351,7 +420,8 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
             intervened: false,
             stream: stream.clone(),
         };
-        let replacement = generic
+        let replacement = executable
+            .erased_mut()
             .forward_with_observer(
                 &Array::from_slice(&[5_u32], &[1, 1]),
                 None,
@@ -440,9 +510,12 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
             )
         );
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
-        assert_eq!(generic.selected_residency(), residency.layers());
-        generic
+        assert_eq!(
+            executable.erased_mut().selected_residency(),
+            residency.layers()
+        );
+        executable
+            .erased_mut()
             .decode(&Array::from_slice(&[1_u32, 2], &[1, 2]), &stream)
             .unwrap()
             .evaluated()
@@ -454,7 +527,8 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
             intervened: false,
             stream: stream.clone(),
         };
-        let replacement = generic
+        let replacement = executable
+            .erased_mut()
             .forward_with_observer(
                 &Array::from_slice(&[3_u32], &[1, 1]),
                 None,
@@ -471,7 +545,10 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
             .iter()
             .all(|value| *value == 0.0));
 
-        let identity = generic.prompt_cache_model_identity().clone();
+        let identity = executable
+            .erased_mut()
+            .prompt_cache_model_identity()
+            .clone();
         let descriptor = PromptCacheDescriptor::from_model_identity(
             identity,
             "tiny-checkpoint",
@@ -482,20 +559,24 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
         let cache_root = tempfile::tempdir().unwrap();
         let destination = cache_root.path().join("cache");
         let prefix = [1_u32, 2, 3];
-        generic.reset_cache().unwrap();
-        generic
+        executable.erased_mut().reset_cache().unwrap();
+        executable
+            .erased_mut()
             .decode(&Array::from_slice(&prefix, &[1, 3]), &stream)
             .unwrap()
             .evaluated()
             .unwrap();
-        let manifest = generic
-            .save_prompt_cache(
+        let manifest = with_prompt_cache_funding(&mut executable, |generic, funding| {
+            generic.save_prompt_cache(
+                funding,
+                None,
                 &destination,
                 descriptor.clone(),
                 &prefix,
                 &PromptCacheOptions::default(),
             )
-            .unwrap();
+        })
+        .unwrap();
         assert_eq!(manifest.block_size_tokens, paged.block_size_tokens());
         let incompatible = descriptor
             .clone()
@@ -504,14 +585,38 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
                 descriptor.architecture_fingerprint()
             ))
             .unwrap();
-        assert!(generic
-            .load_prompt_cache(&destination, &incompatible, &prefix)
-            .is_err());
-        generic
-            .load_prompt_cache(&destination, &descriptor, &prefix)
-            .unwrap();
-        assert!(generic.cache_residency_report().unwrap().is_some());
-        generic
+        assert!(with_prompt_cache_materialization(
+            &mut executable,
+            |generic, funding, materialization| {
+                generic.load_prompt_cache(
+                    funding,
+                    materialization,
+                    None,
+                    &destination,
+                    &incompatible,
+                    &prefix,
+                )
+            }
+        )
+        .is_err());
+        with_prompt_cache_materialization(&mut executable, |generic, funding, materialization| {
+            generic.load_prompt_cache(
+                funding,
+                materialization,
+                None,
+                &destination,
+                &descriptor,
+                &prefix,
+            )
+        })
+        .unwrap();
+        assert!(executable
+            .erased_mut()
+            .cache_residency_report()
+            .unwrap()
+            .is_some());
+        executable
+            .erased_mut()
             .decode(&Array::from_slice(&[4_u32], &[1, 1]), &stream)
             .unwrap()
             .evaluated()
@@ -722,8 +827,8 @@ fn heterogeneous_generic_handoff_executes_selected_load_time_transforms() {
             .unwrap_or_else(|| panic!("{name}: no materialization report"));
         assert!(report.transformed_weights > 0, "{name}");
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
-        generic
+        executable
+            .erased_mut()
             .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
             .unwrap_or_else(|error| panic!("{name}: {error}"))
             .evaluated()

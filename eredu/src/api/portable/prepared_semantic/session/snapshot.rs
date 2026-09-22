@@ -3,31 +3,45 @@ use super::*;
 use crate::api::GenerationSnapshotError;
 use eredu_runtime::{
     execution_control::{
-        SnapshotBudget, TextContinuationSnapshot, TextSnapshotBackend, TextSnapshotError, PreparedTextHostJournal,
+        PreparedTextHostJournal, SnapshotBudget, TextContinuationSnapshot, TextSnapshotBackend,
+        TextSnapshotError,
     },
     working_memory::WorkspaceCopyLimits,
 };
 
 type SnapshotEnclosure<B, J> = (
-                PreparedChatSnapshot<B>,
-                GenerationSnapshotError,
-                Result<(PreparedChatSnapshot<B>, <J as PreparedTextHostJournal>::Copied), GenerationSnapshotError>,
-                Result<(PreparedChatSnapshot<B>, <J as PreparedTextHostJournal>::Copied), TextSnapshotError<BackendFailure>>,
-                J,
-                <J as PreparedTextHostJournal>::Copied,
-                Duration,
-                Option<Duration>,
-                WorkspaceCopyLimits,
-
+    PreparedChatSnapshot<B>,
+    GenerationSnapshotError,
+    Result<
+        (
+            PreparedChatSnapshot<B>,
+            <J as PreparedTextHostJournal>::Copied,
+        ),
+        GenerationSnapshotError,
+    >,
+    Result<
+        (
+            PreparedChatSnapshot<B>,
+            <J as PreparedTextHostJournal>::Copied,
+        ),
+        TextSnapshotError<BackendFailure>,
+    >,
+    J,
+    <J as PreparedTextHostJournal>::Copied,
+    Duration,
+    Option<Duration>,
+    WorkspaceCopyLimits,
 );
 /// Prospective execution limits for an exact saved continuation. Sampling,
 /// randomness, penalties and adaptive history come from the saved state.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PreparedChatResumeSettings {
     /// May shorten the saved output allowance; omission preserves it.
     pub max_new_tokens: Option<usize>,
-    /// Omission preserves the saved execution policy. A replacement is admitted
-    /// before restoring and must retain the same managed memory domain capacity.
+    /// Omission preserves the saved execution policy. Replacement domain limits
+    /// are admitted against the complete live charge before restoring. Raising
+    /// a live account's limits requires its backend's genuine successor authority;
+    /// independently retained semantic-source accounts keep their own limits.
     pub inference: Option<eredu_core::TextInferencePolicy>,
 }
 
@@ -48,16 +62,26 @@ pub struct PreparedChatSnapshot<B: TextSnapshotBackend> {
     preparation: PreparedSemanticSource,
 }
 impl<B: TextSnapshotBackend> PreparedChatSnapshot<B> {
-    pub(crate) fn storage_reservation(&self) -> &eredu_runtime::execution_control::SnapshotReservation {
+    pub(crate) fn storage_reservation(
+        &self,
+    ) -> &eredu_runtime::execution_control::SnapshotReservation {
         self.state.storage_reservation()
     }
-    pub(crate) fn host_preparation(&self) -> &eredu_core::HostPreparationAuthority { self.state.host_preparation() }
-    pub(crate) fn effective_config(&self) -> TextGenerationConfig { self.effective_config }
-    pub(crate) fn pending_forced_token(&self) -> Option<u32> { self.state.controller().pending_forced() }
+    pub(crate) fn host_preparation(&self) -> &eredu_core::HostPreparationAuthority {
+        self.state.host_preparation()
+    }
+    pub(crate) fn effective_config(&self) -> TextGenerationConfig {
+        self.effective_config.clone()
+    }
+    pub(crate) fn pending_forced_token(&self) -> Option<u32> {
+        self.state.controller().pending_forced()
+    }
     pub(crate) fn status(&self) -> eredu_core::execution_control::GenerationStatus {
         eredu_runtime::execution_control::GenerationLifecycle::fork(&self.lifecycle).status()
     }
-    pub(super) fn lifecycle(&self) -> &eredu_runtime::execution_control::GenerationBoundary { &self.lifecycle }
+    pub(super) fn lifecycle(&self) -> &eredu_runtime::execution_control::GenerationBoundary {
+        &self.lifecycle
+    }
     /// Exact committed prefix at the saved boundary.
     pub fn token_ids(&self) -> &[u32] {
         self.cursor.token_ids()
@@ -82,34 +106,68 @@ impl<B: TextSnapshotBackend> PreparedChatSnapshot<B> {
 impl<B: TextSnapshotBackend> PreparedChatSession<'_, B> {
     /// Cold estimate from the exact original native source and cursor/parser
     /// copy provider. The eventual snapshot rechecks it with its record journal.
-    pub(crate) fn snapshot_estimate(&mut self, capacity: u64)
-        -> Result<eredu_core::execution_control::SnapshotEstimate, GenerationSnapshotError> {
-        use eredu_runtime::execution_control::{PreparedTextHostCopy, SnapshotTokenController};
+    pub(crate) fn snapshot_estimate(
+        &mut self,
+        capacity: eredu_core::MemoryLimitDeclarations,
+    ) -> Result<eredu_core::execution_control::SnapshotEstimate, GenerationSnapshotError> {
         use eredu_core::execution_control::ExecutionControlError;
+        use eredu_runtime::execution_control::{PreparedTextHostCopy, SnapshotTokenController};
         let result = (|| {
-            self.lifecycle.checkpoint().map_err(TextSnapshotError::Control)?;
-            let mut boundary = self.source.generator.snapshot_source().map_err(|_| TextSnapshotError::Unsupported("chat source is not a completed drained boundary"))?;
-            let controller = boundary.controller().original_snapshot_storage_bytes()
+            self.lifecycle
+                .checkpoint()
+                .map_err(TextSnapshotError::Control)?;
+            let mut boundary = self.source.generator.snapshot_source().map_err(|_| {
+                TextSnapshotError::Unsupported("chat source is not a completed drained boundary")
+            })?;
+            let controller = boundary
+                .controller()
+                .original_snapshot_storage_bytes()
                 .ok_or(ExecutionControlError::UnknownEstimate)?;
             let (runtime, state, pending) = boundary.parts();
-            let preparation = B::original_saved_generation_preparation_bytes(runtime, state, pending.as_ref().map(|input| match input {
-                eredu_core::PendingTextInput::Prefill(prompt) => eredu_core::PendingTextInput::Prefill(*prompt),
-                eredu_core::PendingTextInput::Decode(token) => eredu_core::PendingTextInput::Decode(*token),
-            }))
-                .map_err(TextSnapshotError::HostAdmission)?.ok_or(ExecutionControlError::UnknownEstimate)?;
+            let preparation = B::original_saved_generation_preparation_bytes(
+                runtime,
+                state,
+                pending.as_ref().map(|input| match input {
+                    eredu_core::PendingTextInput::Prefill(prompt) => {
+                        eredu_core::PendingTextInput::Prefill(*prompt)
+                    }
+                    eredu_core::PendingTextInput::Decode(token) => {
+                        eredu_core::PendingTextInput::Decode(*token)
+                    }
+                }),
+            )
+            .map_err(TextSnapshotError::HostAdmission)?
+            .ok_or(ExecutionControlError::UnknownEstimate)?;
             let native = B::original_generation_snapshot_estimates(runtime, state, pending)
                 .ok_or(ExecutionControlError::UnknownEstimate)?;
-            let pool = B::original_snapshot_host_pool(runtime).ok_or(ExecutionControlError::UnknownEstimate)?;
+            let pool = B::original_snapshot_host_pool(runtime)
+                .ok_or(ExecutionControlError::UnknownEstimate)?;
             let host = self.cursor.prepare_semantic_snapshot_host_copy::<B, ChatController, SnapshotEnclosure<B, ()>, _>(
-                &self.semantic, pool, capacity.min(self.preparation.capacity_bytes()), preparation, ())
+                &self.semantic, pool, resolve_host_limits(&capacity, &self.preparation).map_err(TextSnapshotError::HostAdmission)?, preparation, ())
                 .map_err(TextSnapshotError::HostAdmission)?;
-            let bytes = host.storage_bytes().ok_or(ExecutionControlError::UnknownEstimate)?
-                .checked_add(controller).and_then(|n| n.checked_add(std::mem::size_of::<TextContinuationSnapshot<B, ChatController>>() as u64))
+            let bytes = host
+                .storage_bytes()
+                .ok_or(ExecutionControlError::UnknownEstimate)?
+                .checked_add(controller)
+                .and_then(|n| {
+                    n.checked_add(
+                        std::mem::size_of::<TextContinuationSnapshot<B, ChatController>>() as u64,
+                    )
+                })
                 .ok_or(ExecutionControlError::Overflow)?;
-            let mut total = eredu_core::execution_control::SnapshotEstimate { retained_bytes: bytes, copy_bytes: bytes };
+            let mut total = eredu_core::execution_control::SnapshotEstimate {
+                retained_bytes: bytes,
+                copy_bytes: bytes,
+            };
             for estimate in native {
-                total.retained_bytes = total.retained_bytes.checked_add(estimate.retained_bytes).ok_or(ExecutionControlError::Overflow)?;
-                total.copy_bytes = total.copy_bytes.checked_add(estimate.copy_bytes).ok_or(ExecutionControlError::Overflow)?;
+                total.retained_bytes = total
+                    .retained_bytes
+                    .checked_add(estimate.retained_bytes)
+                    .ok_or(ExecutionControlError::Overflow)?;
+                total.copy_bytes = total
+                    .copy_bytes
+                    .checked_add(estimate.copy_bytes)
+                    .ok_or(ExecutionControlError::Overflow)?;
             }
             Ok(total)
         })();
@@ -121,10 +179,10 @@ impl<B: TextSnapshotBackend> PreparedChatSession<'_, B> {
     pub fn snapshot(
         &mut self,
         budget: &SnapshotBudget,
-        host_capacity_bytes: u64,
+        host_memory_limits: eredu_core::MemoryLimitDeclarations,
         native: WorkspaceCopyLimits,
     ) -> Result<PreparedChatSnapshot<B>, GenerationSnapshotError> {
-        self.snapshot_with_host(budget, host_capacity_bytes, native, ())
+        self.snapshot_with_host(budget, host_memory_limits, native, ())
             .map(|(snapshot, ())| snapshot)
     }
     /// Composes a concrete borrowed record journal into the same original host
@@ -132,20 +190,24 @@ impl<B: TextSnapshotBackend> PreparedChatSession<'_, B> {
     pub(crate) fn snapshot_with_host<J: PreparedTextHostJournal>(
         &mut self,
         budget: &SnapshotBudget,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimitDeclarations,
         native: WorkspaceCopyLimits,
         journal: J,
     ) -> Result<(PreparedChatSnapshot<B>, J::Copied), GenerationSnapshotError> {
-        self.snapshot_inner(budget, capacity, native, journal).map_err(GenerationSnapshotError)
+        self.snapshot_inner(budget, capacity, native, journal)
+            .map_err(GenerationSnapshotError)
     }
     fn snapshot_inner<J: PreparedTextHostJournal>(
         &mut self,
         budget: &SnapshotBudget,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimitDeclarations,
         native: WorkspaceCopyLimits,
         journal: J,
     ) -> Result<(PreparedChatSnapshot<B>, J::Copied), TextSnapshotError<BackendFailure>> {
-        let lifecycle = self.lifecycle.checkpoint().map_err(TextSnapshotError::Control)?;
+        let lifecycle = self
+            .lifecycle
+            .checkpoint()
+            .map_err(TextSnapshotError::Control)?;
         let driver = self.source.generator.driver_identity();
         let mut boundary = self.source.generator.snapshot_source().map_err(|error| {
             use eredu_core::TextContinuationError as E;
@@ -180,7 +242,8 @@ impl<B: TextSnapshotBackend> PreparedChatSession<'_, B> {
             .prepare_semantic_snapshot_host_copy::<B, ChatController, SnapshotEnclosure<B, J>, _>(
                 &self.semantic,
                 pool,
-                capacity.min(self.preparation.capacity_bytes()),
+                resolve_host_limits(&capacity, &self.preparation)
+                    .map_err(TextSnapshotError::HostAdmission)?,
                 native_bytes,
                 journal,
             )
@@ -190,19 +253,22 @@ impl<B: TextSnapshotBackend> PreparedChatSession<'_, B> {
                 .map_err(|error| {
                     crate::api::control::map_snapshot_failure(error, B::into_backend_failure)
                 })?;
-        Ok((PreparedChatSnapshot {
-            driver,
-            state,
-            semantic,
-            effective_config: self.effective_config,
-            cursor,
-            lifecycle,
-            attribution: self.attribution.clone(),
-            active: self.active,
-            time_to_first_token: self.source.time_to_first_token,
-            input_funding: self.input_funding.clone(),
-            preparation: self.preparation.clone(),
-        }, journal))
+        Ok((
+            PreparedChatSnapshot {
+                driver,
+                state,
+                semantic,
+                effective_config: self.effective_config.clone(),
+                cursor,
+                lifecycle,
+                attribution: self.attribution.clone(),
+                active: self.active,
+                time_to_first_token: self.source.time_to_first_token,
+                input_funding: self.input_funding.clone(),
+                preparation: self.preparation.clone(),
+            },
+            journal,
+        ))
     }
 }
 impl<B> LoadedModel<B>
@@ -220,10 +286,10 @@ where
         &'a mut self,
         snapshot: &PreparedChatSnapshot<B>,
         settings: PreparedChatResumeSettings,
-        host_capacity_bytes: u64,
+        host_memory_limits: eredu_core::MemoryLimitDeclarations,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<PreparedChatSession<'a, B>>, PreparedChatSessionError> {
-        self.resume_prepared_chat(snapshot, settings, host_capacity_bytes, false, cancellation)
+        self.resume_prepared_chat(snapshot, settings, host_memory_limits, false, cancellation)
     }
     /// Starts an independent branch through the same restore worker, consuming
     /// its branch slot and cumulative copy allowance without changing the source.
@@ -231,16 +297,16 @@ where
         &'a mut self,
         snapshot: &PreparedChatSnapshot<B>,
         settings: PreparedChatResumeSettings,
-        host_capacity_bytes: u64,
+        host_memory_limits: eredu_core::MemoryLimitDeclarations,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<PreparedChatSession<'a, B>>, PreparedChatSessionError> {
-        self.resume_prepared_chat(snapshot, settings, host_capacity_bytes, true, cancellation)
+        self.resume_prepared_chat(snapshot, settings, host_memory_limits, true, cancellation)
     }
     fn resume_prepared_chat<'a>(
         &'a mut self,
         snapshot: &PreparedChatSnapshot<B>,
         settings: PreparedChatResumeSettings,
-        host_capacity: u64,
+        host_capacity: eredu_core::MemoryLimitDeclarations,
         branch: bool,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<PreparedChatSession<'a, B>>, PreparedChatSessionError> {
@@ -254,21 +320,37 @@ where
             input_funding: snapshot.input_funding.clone(),
         };
         let prepared = (|| -> Result<_, Cause> {
-            if !snapshot.preparation.tokenizer().matches_configuration(&self.tokenizer) {
+            if !snapshot
+                .preparation
+                .tokenizer()
+                .matches_configuration(&self.tokenizer)
+            {
                 return Err(TokenInputRejection::IdentityMismatch.into());
             }
-            snapshot.resume_configuration(&self.runtime, settings, cancellation)
-                .map(|config| config.map(|config| (config, host_capacity.min(snapshot.preparation.capacity_bytes()))))
-        })().map_err(&retain)?;
+            snapshot
+                .resume_configuration(&self.runtime, settings, cancellation)
+                .map(|config| config.map(|config| (config, host_capacity)))
+        })()
+        .map_err(&retain)?;
         let Some((config, capacity)) = prepared else {
             return Ok(None);
         };
         snapshot
-            .resume_with_host(&mut self.runtime, config, capacity, &eredu_core::OriginalTextResumeOptions {
-                terminal: snapshot.finish_reason().is_some(),
-                ..eredu_core::OriginalTextResumeOptions::new(if branch { eredu_core::OriginalTextResumeKind::Branch }
-                    else { eredu_core::OriginalTextResumeKind::Restore })
-            }, cancellation, ())
+            .resume_with_host(
+                &mut self.runtime,
+                config,
+                capacity,
+                &eredu_core::OriginalTextResumeOptions {
+                    terminal: snapshot.finish_reason().is_some(),
+                    ..eredu_core::OriginalTextResumeOptions::new(if branch {
+                        eredu_core::OriginalTextResumeKind::Branch
+                    } else {
+                        eredu_core::OriginalTextResumeKind::Restore
+                    })
+                },
+                cancellation,
+                (),
+            )
             .map(|result| result.map(|(session, ())| session))
             .map_err(|cause| retain(Cause::Snapshot(cause)))
     }
@@ -286,46 +368,77 @@ where
         self.state.resume_source_facts()
     }
     pub(super) fn resume_configuration(
-        &self, runtime: &ModelRuntime<B>, settings: PreparedChatResumeSettings,
+        &self,
+        runtime: &ModelRuntime<B>,
+        settings: PreparedChatResumeSettings,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<TextGenerationConfig>, Cause>
-    where B: OriginalChatBackend,
+    where
+        B: OriginalChatBackend,
     {
-        if cancellation.is_cancelled() { return Ok(None) }
-        let inference = settings.inference.unwrap_or(self.effective_config.inference_policy());
-        if inference.managed_memory_capacity_bytes != Some(self.preparation.capacity_bytes()) {
-            return Err(TokenInputRejection::IdentityMismatch.into());
+        if cancellation.is_cancelled() {
+            return Ok(None);
         }
+        let inference = settings
+            .inference
+            .unwrap_or_else(|| self.effective_config.inference_policy().clone());
+        inference.memory_limits.resolve(self.preparation.topology())?;
         B::validate_semantic_source(runtime, &self.preparation)?;
         let mut sampling = self.effective_config.sampling();
-        sampling.max_new_tokens = if self.finish_reason().is_some() { Some(0) } else { settings.max_new_tokens.or(self.remaining_tokens()) };
-        if sampling.max_new_tokens == Some(0) && self.finish_reason().is_none() { return Ok(None) }
-        Ok(Some(saved_configuration(self.effective_config, sampling, self.effective_config.seed(), inference)))
+        sampling.max_new_tokens = if self.finish_reason().is_some() {
+            Some(0)
+        } else {
+            settings.max_new_tokens.or(self.remaining_tokens())
+        };
+        if sampling.max_new_tokens == Some(0) && self.finish_reason().is_none() {
+            return Ok(None);
+        }
+        Ok(Some(saved_configuration(
+            self.effective_config.clone(),
+            sampling,
+            self.effective_config.seed(),
+            inference,
+        )))
     }
     pub(crate) fn resume_with_host<'a, J: PreparedTextHostJournal>(
         &self,
         runtime: &'a mut ModelRuntime<B>,
         config: TextGenerationConfig,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimitDeclarations,
         options: &eredu_core::OriginalTextResumeOptions<'_>,
         cancellation: &GenerationCancellationToken,
         journal: J,
-    ) -> Result<Option<(PreparedChatSession<'a, B>, J::Copied)>, TextSnapshotError<BackendFailure>> {
+    ) -> Result<Option<(PreparedChatSession<'a, B>, J::Copied)>, TextSnapshotError<BackendFailure>>
+    {
         self.resume_parts_with_host(runtime, config, capacity, options, cancellation, journal)
-            .map(|result| result.map(|(generation, displaced, host, copied)| {
-                drop(displaced);
-                (PreparedChatSession::from_host(generation, host), copied)
-            }))
+            .map(|result| {
+                result.map(|(generation, displaced, host, copied)| {
+                    drop(displaced);
+                    (PreparedChatSession::from_host(generation, host), copied)
+                })
+            })
     }
     pub(super) fn resume_parts_with_host<'a, J: PreparedTextHostJournal>(
-        &self, runtime: &'a mut ModelRuntime<B>, config: TextGenerationConfig,
-        capacity: u64, options: &eredu_core::OriginalTextResumeOptions<'_>, cancellation: &GenerationCancellationToken, journal: J,
-    ) -> Result<Option<(ControlledTextGeneration<'a, B, ChatController>, B::DisplacedState,
-        super::branch::PreparedChatHost, J::Copied)>, TextSnapshotError<BackendFailure>> {
+        &self,
+        runtime: &'a mut ModelRuntime<B>,
+        config: TextGenerationConfig,
+        capacity: eredu_core::MemoryLimitDeclarations,
+        options: &eredu_core::OriginalTextResumeOptions<'_>,
+        cancellation: &GenerationCancellationToken,
+        journal: J,
+    ) -> Result<
+        Option<(
+            ControlledTextGeneration<'a, B, ChatController>,
+            B::DisplacedState,
+            super::branch::PreparedChatHost,
+            J::Copied,
+        )>,
+        TextSnapshotError<BackendFailure>,
+    > {
         let started = Instant::now();
         let bytes = self
             .state
-            .original_resume_preparation_bytes(runtime, config, options)
+            .original_resume_preparation_bytes(runtime, config.clone(), options)
             .map_err(|error| {
                 crate::api::control::map_snapshot_failure(error, B::into_backend_failure)
             })?;
@@ -341,16 +454,26 @@ where
                 eredu_core::TextSamplingBoundary<'_, B>,
                 eredu_core::execution_control::SamplingOverride,
                 eredu_core::execution_control::SamplingStateFacts,
-                Result<eredu_core::execution_control::SamplingStateFacts,
-                    eredu_core::execution_control::SamplingOverrideError<B::Error>>,
+                Result<
+                    eredu_core::execution_control::SamplingStateFacts,
+                    eredu_core::execution_control::SamplingOverrideError<B::Error>,
+                >,
                 PreparedChatSessionError,
                 Result<Option<PreparedChatSession<'a, B>>, PreparedChatSessionError>,
-                Result<Option<(PreparedChatSession<'a, B>, J::Copied)>, TextSnapshotError<BackendFailure>>,
+                Result<
+                    Option<(PreparedChatSession<'a, B>, J::Copied)>,
+                    TextSnapshotError<BackendFailure>,
+                >,
                 J,
                 J::Copied,
                 Duration,
                 Option<Duration>,
-                (TextGenerationConfig, eredu_core::ResolvedGenerationConfig, u64, eredu_core::TextInferencePolicy),
+                (
+                    TextGenerationConfig,
+                    eredu_core::ResolvedGenerationConfig,
+                    u64,
+                    eredu_core::TextInferencePolicy,
+                ),
                 PreparedChatResumeSettings,
                 crate::api::request::TokenDeliveryFacts,
                 super::branch::PreparedChatHost,
@@ -359,37 +482,75 @@ where
                 B::DisplacedState,
                 eredu_core::OriginalTextResumeOptions<'_>,
                 bool,
-            ), _>(&self.semantic, pool, capacity.min(self.preparation.capacity_bytes()), bytes, journal)
+            ), _>(
+                &self.semantic,
+                pool,
+                resolve_host_limits(&capacity, &self.preparation)
+                    .map_err(TextSnapshotError::HostAdmission)?,
+                bytes,
+                journal,
+            )
             .map_err(TextSnapshotError::HostAdmission)?;
-        let result = self.state.resume_original_host_with_displaced(runtime, config, host, cancellation,
-            options)
-        .map_err(|error| {
-            crate::api::control::map_snapshot_failure(error, B::into_backend_failure)
-        })?;
-        Ok(result.map(|(generator, displaced, (mut cursor, semantic, journal))| {
-            let effective_config = {
-                let facts = generator.resume_facts();
-                let mut sampling = config.sampling();
-                sampling.temperature = facts.sampling_after.temperature;
-                sampling.do_sample = facts.sampling_after.temperature > 0.0;
-                saved_configuration(config, sampling,
-                    options.sampling.and_then(|request| request.reseed).unwrap_or(config.seed()),
-                    config.inference_policy())
-            };
-            if let Some(remaining) = config.sampling().max_new_tokens {
-                cursor.restrict_remaining(remaining);
-            }
-            (generator, displaced, super::branch::PreparedChatHost {
-                semantic,
-                effective_config,
-                cursor,
-                lifecycle: eredu_runtime::execution_control::GenerationLifecycle::fork(&self.lifecycle),
-                attribution: self.attribution.clone(),
-                active: self.active + started.elapsed(),
-                time_to_first_token: self.time_to_first_token,
-                input_funding: self.input_funding.clone(),
-                preparation: self.preparation.clone(),
-            }, journal)
-        }))
+        let result = self
+            .state
+            .resume_original_host_with_displaced(
+                runtime,
+                config.clone(),
+                host,
+                cancellation,
+                options,
+            )
+            .map_err(|error| {
+                crate::api::control::map_snapshot_failure(error, B::into_backend_failure)
+            })?;
+        Ok(
+            result.map(|(generator, displaced, (mut cursor, semantic, journal))| {
+                let effective_config = {
+                    let facts = generator.resume_facts();
+                    let mut sampling = config.sampling();
+                    sampling.temperature = facts.sampling_after.temperature;
+                    sampling.do_sample = facts.sampling_after.temperature > 0.0;
+                    saved_configuration(
+                        config.clone(),
+                        sampling,
+                        options
+                            .sampling
+                            .and_then(|request| request.reseed)
+                            .unwrap_or(config.seed()),
+                        config.inference_policy().clone(),
+                    )
+                };
+                if let Some(remaining) = config.sampling().max_new_tokens {
+                    cursor.restrict_remaining(remaining);
+                }
+                (
+                    generator,
+                    displaced,
+                    super::branch::PreparedChatHost {
+                        semantic,
+                        effective_config,
+                        cursor,
+                        lifecycle: eredu_runtime::execution_control::GenerationLifecycle::fork(
+                            &self.lifecycle,
+                        ),
+                        attribution: self.attribution.clone(),
+                        active: self.active + started.elapsed(),
+                        time_to_first_token: self.time_to_first_token,
+                        input_funding: self.input_funding.clone(),
+                        preparation: self.preparation.clone(),
+                    },
+                    journal,
+                )
+            }),
+        )
     }
+}
+
+fn resolve_host_limits(
+    limits: &eredu_core::MemoryLimitDeclarations,
+    preparation: &eredu_runtime::working_memory::PreparedSemanticSource,
+) -> Result<eredu_core::MemoryLimits, eredu_runtime::working_memory::WorkingMemoryError> {
+    Ok(limits
+        .resolve(preparation.topology())?
+        .intersection(preparation.limits())?)
 }

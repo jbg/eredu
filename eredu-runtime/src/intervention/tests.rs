@@ -1,11 +1,11 @@
 use super::*;
 use eredu_core::*;
 
+mod context_prefix;
 mod invocation;
 mod session;
 mod sparse;
 mod text_origin;
-mod context_prefix;
 
 #[test]
 fn global_component_masks_preserve_positions_and_empty_keep_semantics() {
@@ -552,7 +552,6 @@ fn plans(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -728,7 +727,8 @@ fn conditional_intervention_requires_actual_application_before_commitment() {
             .clone()
             .admit(&discovery, original.request(), original.session_id())
             .unwrap();
-        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
+        let mut session =
+            CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(capture.clone()));
         session
             .enable_interventions(intervention, std::sync::Arc::new(Estimates))
             .unwrap();
@@ -772,7 +772,9 @@ fn conditional_intervention_requires_actual_application_before_commitment() {
                 .plan()
                 .clone()
                 .admit(&discovery, original.request(), original.session_id()),
-            Err(CaptureError::Intervention(eredu_core::intervention::InterventionDeclarationError::Unsupported(_)))
+            Err(CaptureError::Intervention(
+                eredu_core::intervention::InterventionDeclarationError::Unsupported(_)
+            ))
         ));
     }
 }

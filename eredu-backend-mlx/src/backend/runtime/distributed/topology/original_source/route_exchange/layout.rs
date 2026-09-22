@@ -156,6 +156,9 @@ impl OriginalRouteLayoutRound<'_> {
     }
 }
 impl OwnedOriginalExchangeLayoutRound {
+    pub(crate) fn ordinary_controls(&self)->Option<safemlx::distributed::OrdinaryGroupControls>{
+        self.native.ordinary_controls()
+    }
     pub(crate) fn graph_capacity(&self)->usize{self.native.graph_capacity()}
     pub(crate) fn record_capacity(&self)->usize{self.native.record_capacity()}
     pub(crate) fn backing_capacity(&self)->usize{self.backing}

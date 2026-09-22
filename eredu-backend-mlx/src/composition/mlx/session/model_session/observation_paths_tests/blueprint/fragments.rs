@@ -1,6 +1,8 @@
 //! Actual loaded declarations; original-context equations only, no gate/admission.
 use super::*;
 use crate::composition::mlx::session::capture_workspace::CaptureWorkspaceObserver;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{capture::*, TextGenerationBackend};
 use eredu_nn::{
     workspace::*, LinearOperator, NeuralBackend, ProjectionInputObserver,
@@ -58,7 +60,7 @@ fn geometry(selection: &PreparedCaptureSelection) -> eredu_core::InferenceGeomet
         output: selection.physical_output(eredu_core::OutputDemand::LastPosition),
     }
 }
-fn retire(runtime: ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool, stream: &Stream) {
+fn retire(runtime: ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger, stream: &Stream) {
     runtime.synchronize().unwrap();
     drop(runtime);
     stream.synchronize().unwrap();
@@ -72,7 +74,7 @@ fn retire(runtime: ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool, strea
 fn actual_resident_host_disk_bound_body_and_readout_quotes_keep_original_state_and_source() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (runtime, _artifact) = match route {
             0 => host::runtime(&stream, &pool, None),
             1 => host::runtime(&stream, &pool, Some(1)),
@@ -102,7 +104,10 @@ fn actual_resident_host_disk_bound_body_and_readout_quotes_keep_original_state_a
                 .project_resident_workspace(std::num::NonZeroU32::new(1).unwrap(), &context)
                 .unwrap();
             let parameters = executable.layerwise_workspace().unwrap();
-            let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+            let before = (
+                pool.fixture_host_charge().unwrap(),
+                pool.fixture_host_peak().unwrap(),
+            );
             let frontier = executable.erased().state_snapshot();
             let (mut observer, h) = CaptureWorkspaceObserver::with_prefill(
                 selected.bind_geometry(g).unwrap(),
@@ -133,7 +138,10 @@ fn actual_resident_host_disk_bound_body_and_readout_quotes_keep_original_state_a
             assert_eq!(report.completed_spans(), 6);
             assert_eq!(executable.erased().state_snapshot(), frontier);
             assert_eq!(
-                (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+                (
+                    pool.fixture_host_charge().unwrap(),
+                    pool.fixture_host_peak().unwrap()
+                ),
                 before
             );
         }
@@ -230,7 +238,7 @@ fn linear(context: &WorkspaceContext, width: i32) -> WorkspaceLinear {
 #[test]
 fn bound_generated_projection_quotes_global_preview_and_all_intermediates_until_each_span_end() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = host::runtime(&stream, &pool, None);
     for preview in [0, 5] {
         for missing in [false, true] {
@@ -308,8 +316,8 @@ fn bound_generated_projection_quotes_global_preview_and_all_intermediates_until_
 #[test]
 fn changed_candidate_and_equal_content_foreign_paths_reject_before_equations() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let other_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let other_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = host::runtime(&stream, &pool, None);
     let (other, _other_artifact) = host::runtime(&stream, &other_pool, None);
     {

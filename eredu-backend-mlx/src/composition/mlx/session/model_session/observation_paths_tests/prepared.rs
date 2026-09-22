@@ -32,10 +32,10 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, Error> for BorrowedPath
 #[test]
 fn actual_native_prepared_traversal_preserves_full_logits_and_cached_decode_values() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let source_stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &source_stream).with_memory_pool(pool);
+    let backend = MlxBackend::new(&stream, &source_stream).with_memory_ledger(pool);
     let mut ordinary =
         eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
             .unwrap();

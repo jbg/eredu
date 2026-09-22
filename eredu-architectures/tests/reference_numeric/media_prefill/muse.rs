@@ -300,7 +300,9 @@ fn partition_case(
                 }
                 assert_eq!(report.cached.len(), 3);
                 for (token, output) in [2,6,1].into_iter().zip(&report.cached) {
-                    let expected = reference.forward(&numeric_text_prepared_input(&[token]), false).unwrap();
+                    let expected = if token == 2 && cancel_after.is_some() {
+                        (reference.restart_after_cancel)(token, cancel_after.unwrap()).unwrap()
+                    } else { reference.forward(&numeric_text_prepared_input(&[token]), false).unwrap() };
                     nonzero(output);assert_tensor_close(output, &expected, "Muse ordinary committed-prefix cached decode");
                 }
                 same_state(&report.final_state, &reference.snapshot().unwrap());

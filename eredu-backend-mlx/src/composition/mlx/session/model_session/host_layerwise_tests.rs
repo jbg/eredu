@@ -1,12 +1,14 @@
 use super::*;
 use crate::backend::nn::shared::MlxNeuralBackend;
 use crate::backend::runtime::residency::storage::RetainedStorage;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     ControlledTextGeneration, InferenceGeometry, OutputDemand, TextGeneration, TextGenerationInput,
     TextPreparationInput, TokenFilterController,
 };
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
 
 #[derive(Clone, Default)]
 struct Controller(Rc<Cell<(usize, usize)>>);
@@ -61,7 +63,15 @@ fn config(temperature: f32, capacity: Option<u64>) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: capacity,
+        memory_limits: (capacity).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -127,7 +137,7 @@ pub(super) fn artifact(model_type: &str) -> tempfile::TempDir {
 
 pub(super) fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     depth: Option<usize>,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     runtime_for(stream, pool, depth, "llama")
@@ -135,7 +145,7 @@ pub(super) fn runtime(
 
 pub(super) fn runtime_with_context(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     depth: Option<usize>,
     maximum_positions: usize,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
@@ -150,7 +160,7 @@ pub(super) fn runtime_with_context(
 
 fn runtime_for(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     depth: Option<usize>,
     model_type: &str,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
@@ -170,12 +180,12 @@ fn runtime_for(
 
 pub(super) fn runtime_from_artifact(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     depth: Option<usize>,
     artifact: tempfile::TempDir,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let residency = depth.map_or_else(eredu_runtime::WeightResidency::fully_resident, |depth| {
         eredu_runtime::WeightResidency::layerwise_host(eredu_runtime::LayerwiseLoadOptions::new(
             eredu_core::residency::OffloadConfig::new(Some(u64::MAX), Some(u64::MAX), depth)
@@ -251,19 +261,19 @@ fn reclaim() {
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
 fn exact_capacity(
     runtime: &ModelRuntime<MlxBackend<'_>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     temperature: f32,
 ) -> u64 {
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let preparation = MlxBackend::admit_text_preparation(
         runtime,
         &evidence(),
@@ -276,11 +286,27 @@ fn exact_capacity(
         .as_ref()
         .unwrap()
         .request()
-        .memory_reservation()
-        .unwrap();
-    assert!(reservation.bytes() > 0);
-    let capacity = pool.used_bytes().unwrap();
-    assert_eq!(capacity, baseline + reservation.bytes());
+        .memory_reservation();
+    assert!(
+        reservation
+            .requirements()
+            .get(pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap()
+            > 0
+    );
+    let capacity = pool.fixture_host_charge().unwrap();
+    assert_eq!(
+        capacity,
+        baseline
+            + reservation
+                .requirements()
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap()
+    );
     drop(preparation);
     settle(pool, baseline);
     capacity
@@ -364,7 +390,9 @@ fn cause<'a, T: std::error::Error + 'static>(
 
 #[test]
 fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     for depth in [1, 2] {
@@ -375,8 +403,8 @@ fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
         let before_resets = paths::session_reset_attempts();
         let before_sources = runtime.session().residency_report().unwrap();
         let before_state = runtime.session().payload.model.erased().state_snapshot();
-        let baseline = pool.used_bytes().unwrap();
-        let peak = pool.peak_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
+        let peak = pool.fixture_host_peak().unwrap();
         let mut quotes = Vec::new();
         for _ in 0..3 {
             let (quote, width) = text_quote::quote(
@@ -401,8 +429,8 @@ fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
             quotes.push(quote);
         }
         assert!(quotes.windows(2).all(|pair| pair[0] == pair[1]));
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        assert_eq!(pool.peak_bytes().unwrap(), peak);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_peak().unwrap(), peak);
 
         let capacity = exact_capacity(&runtime, &pool, 0.7);
         let failure = MlxBackend::fail_next_sampling_for_test(Error::ArchitectureModel(
@@ -427,7 +455,7 @@ fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
         };
         assert!(matches!(
             memory_error,
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ));
         assert!(TEST_SAMPLING_FAILURE.with(|slot| slot.borrow().is_some()));
         assert_eq!(controller.0.get(), (0, 0));
@@ -442,10 +470,10 @@ fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
             runtime.session().payload.model.erased().state_snapshot(),
             before_state
         );
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         drop(failure);
         let output = outputs(&mut runtime, 0.7, capacity, true);
-        assert!(pool.peak_bytes().unwrap() <= capacity);
+        assert!(pool.fixture_host_peak().unwrap() <= capacity);
         drop((output, runtime));
         settle(&pool, native_baseline);
     }
@@ -453,7 +481,9 @@ fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
 
 #[test]
 fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     for temperature in [0.0, 0.7] {
@@ -462,7 +492,7 @@ fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
             for controlled in [false, true] {
                 let (mut runtime, _artifact) = runtime(&stream, &pool, depth);
                 let capacity = exact_capacity(&runtime, &pool, temperature);
-                let previous_peak = pool.peak_bytes().unwrap();
+                let previous_peak = pool.fixture_host_peak().unwrap();
                 let before = paths::bounded_unit_acquisitions();
                 let output = outputs(&mut runtime, temperature, capacity, controlled);
                 let ids = output
@@ -484,7 +514,7 @@ fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
                     assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
                 }
                 assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-                assert!(pool.peak_bytes().unwrap() <= previous_peak.max(capacity));
+                assert!(pool.fixture_host_peak().unwrap() <= previous_peak.max(capacity));
                 drop((output, runtime));
                 settle(&pool, native_baseline);
             }
@@ -494,13 +524,19 @@ fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
 
 #[test]
 fn host_layerwise_source_window_and_escaped_token_retire_independently() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     for depth in [1, 2] {
         let (mut runtime, artifact) = runtime(&stream, &pool, Some(depth));
         let initial = live_bytes(Some(&runtime), &[]);
-        let retained_overhead = pool.used_bytes().unwrap().checked_sub(initial).unwrap();
+        let retained_overhead = pool
+            .fixture_host_charge()
+            .unwrap()
+            .checked_sub(initial)
+            .unwrap();
         let capacity = exact_capacity(&runtime, &pool, 0.7);
         let output = outputs(&mut runtime, 0.7, capacity, true);
         let value = output[0].token_id().unwrap();
@@ -535,12 +571,18 @@ fn host_layerwise_source_window_and_escaped_token_retire_independently() {
 
 #[test]
 fn host_layerwise_abandoned_controlled_run_releases_unused_workspace_after_completion() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     for depth in [1, 2] {
         let (mut runtime, artifact) = runtime(&stream, &pool, Some(depth));
-        let retained_overhead = pool.used_bytes().unwrap().checked_sub(live_bytes(Some(&runtime), &[])).unwrap();
+        let retained_overhead = pool
+            .fixture_host_charge()
+            .unwrap()
+            .checked_sub(live_bytes(Some(&runtime), &[]))
+            .unwrap();
         let capacity = exact_capacity(&runtime, &pool, 0.7);
         let controller = Controller::default();
         let mut run = ControlledTextGeneration::from_input(
@@ -556,7 +598,7 @@ fn host_layerwise_abandoned_controlled_run_releases_unused_workspace_after_compl
         // Three outputs remain authorized. Native completion alone must not
         // release workspace while the unique run owner can still submit them.
         reclaim();
-        assert_eq!(pool.used_bytes().unwrap(), capacity);
+        assert_eq!(pool.fixture_host_charge().unwrap(), capacity);
         drop(run);
 
         let arrays = [&output.value];
@@ -587,11 +629,13 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
     use crate::tests::support::provider_failure::{self, Operator};
 
     for depth in [1, 2] {
-        if !crate::tests::support::native_process::enter(&depth.to_string()) { continue; }
+        if !crate::tests::support::native_process::enter(&depth.to_string()) {
+            continue;
+        }
         let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
         let stream = streams.execution();
         let (mut runtime, artifact) = runtime_for(&stream, &pool, Some(depth), "qwen3_moe");
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
         let before = paths::snapshot();
         let controller = Controller::default();
         let preparation = MlxBackend::admit_text_preparation(
@@ -608,9 +652,12 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
             .unwrap()
             .request()
             .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
             .unwrap()
-            .bytes();
-        let capacity = pool.used_bytes().unwrap();
+            .total()
+            .unwrap();
+        let capacity = pool.fixture_host_charge().unwrap();
         drop(preparation);
         settle(&pool, baseline);
         let mut run = ControlledTextGeneration::from_input(
@@ -644,7 +691,7 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
         );
         assert_eq!(controller.0.get(), (1, 0));
         assert!(run.next().is_none());
-        assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
+        assert!(pool.fixture_host_charge().unwrap() >= native_baseline + charge);
         drop((fault, error, run));
         // Observe active-owner retirement without retaining the payload.
         // Injecting an Any semantic owner would make the inventory incomplete.
@@ -659,7 +706,7 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
         // certify this failed operation's complete physical inventory. Its
         // isolated funding account remains quarantined; dropping request
         // metadata and the model must not refund the unproved remainder.
-        assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
+        assert!(pool.fixture_host_charge().unwrap() >= native_baseline + charge);
     }
 }
 
@@ -695,14 +742,24 @@ pub(super) fn family_artifact(family: &str) -> tempfile::TempDir {
 }
 
 fn family_parity(family: &str) {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     let configuration = |capacity| {
         config(0.7, capacity).with_inference_policy(eredu_core::TextInferencePolicy {
             // Five positions exercise two full chunks and a shorter final chunk.
             prefill_chunk_positions: std::num::NonZeroU64::new(2),
-            managed_memory_capacity_bytes: capacity,
+            memory_limits: (capacity).map_or_else(
+                eredu_core::MemoryLimitDeclarations::unlimited,
+                |bytes| {
+                    eredu_core::MemoryLimitDeclarations::new([(
+                        "host".into(),
+                        eredu_core::MemoryLimit::Finite(bytes),
+                    )])
+                },
+            ),
             submission_tracking_capacity_bytes: None,
             graph_metadata_capacity_bytes: None,
         })
@@ -713,7 +770,11 @@ fn family_parity(family: &str) {
             eprintln!("host family parity: {family}, depth={depth:?}, controlled={controlled}");
             let (mut runtime, artifact) =
                 runtime_from_artifact(&stream, &pool, depth, family_artifact(family));
-            let retained_overhead = pool.used_bytes().unwrap().checked_sub(live_bytes(Some(&runtime), &[])).unwrap();
+            let retained_overhead = pool
+                .fixture_host_charge()
+                .unwrap()
+                .checked_sub(live_bytes(Some(&runtime), &[]))
+                .unwrap();
             let controller = Controller::default();
             let state_layout = runtime
                 .session()
@@ -760,7 +821,7 @@ fn family_parity(family: &str) {
                 before_sources,
                 "cold quoting cannot acquire source custody"
             );
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.fixture_host_charge().unwrap();
             let preparation = MlxBackend::admit_text_preparation(
                 &runtime,
                 &evidence(),
@@ -773,11 +834,27 @@ fn family_parity(family: &str) {
                 .as_ref()
                 .unwrap()
                 .request()
-                .memory_reservation()
-                .unwrap();
-            let capacity = pool.used_bytes().unwrap();
-            assert_eq!(capacity, baseline + reservation.bytes());
-            assert!(reservation.bytes() > 0);
+                .memory_reservation();
+            let capacity = pool.fixture_host_charge().unwrap();
+            assert_eq!(
+                capacity,
+                baseline
+                    + reservation
+                        .requirements()
+                        .get(pool.topology().host_domain())
+                        .unwrap()
+                        .total()
+                        .unwrap()
+            );
+            assert!(
+                reservation
+                    .requirements()
+                    .get(pool.topology().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap()
+                    > 0
+            );
             assert_eq!(
                 reservation
                     .admission()
@@ -898,12 +975,15 @@ fn family_parity(family: &str) {
                     .all(|id| layers.iter().any(|unit| unit.id() == id)));
             }
             assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-            assert!(pool.peak_bytes().unwrap() <= capacity);
+            assert!(pool.fixture_host_peak().unwrap() <= capacity);
             let arrays = outputs
                 .iter()
                 .map(|output| &output.value)
                 .collect::<Vec<_>>();
-            settle(&pool, retained_overhead + live_bytes(Some(&runtime), &arrays));
+            settle(
+                &pool,
+                retained_overhead + live_bytes(Some(&runtime), &arrays),
+            );
             drop(arrays);
             drop((outputs, runtime, artifact));
             settle(&pool, native_baseline);

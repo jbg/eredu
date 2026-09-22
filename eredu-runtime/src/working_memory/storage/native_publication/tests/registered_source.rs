@@ -3,7 +3,7 @@ use eredu_checkpoint::store::{CheckpointSource, MemoryWeightStore, SourceStorage
 
 #[test]
 fn original_source_alias_preserves_ordinary_load_charge_and_constructor_custody() {
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = test_ledger(10_000_000, 0).unwrap();
     let mut buffer = pool
         .allocate_memory_tensor_buffer(
             "weight",
@@ -18,15 +18,17 @@ fn original_source_alias_preserves_ordinary_load_charge_and_constructor_custody(
         .copy_from_slice(&[1.25f32, -3.5].map(f32::to_le_bytes).concat());
     let store = MemoryWeightStore::from_buffers([buffer]).unwrap();
     let mut inventory = Vec::new();
-    assert!(store
-        .visit_source_storage(&mut |source| {
-            inventory.push((source.identity(), source.bytes()));
-        })
-        .unwrap());
+    assert!(
+        store
+            .visit_source_storage(&mut |source| {
+                inventory.push((source.identity(), source.bytes()));
+            })
+            .unwrap()
+    );
     assert_eq!(inventory.len(), 1);
     let (key, physical) = inventory.pop().unwrap();
     assert_eq!(physical, 8);
-    let source_charge = pool.used_bytes().unwrap();
+    let source_charge = pool.native_payload_bytes().unwrap();
     assert!(source_charge > physical);
     let (metadata, run) = reservation(&pool, 200, 10_000_000).into_funding().unwrap();
     let partition = run.take_native_partition(test_receipt(&run, 100)).unwrap();
@@ -48,7 +50,7 @@ fn original_source_alias_preserves_ordinary_load_charge_and_constructor_custody(
         changed.push_source(&key, physical + 1, Some(&key), &pool),
         Err(WorkingMemoryError::StorageCapacityMismatch { .. })
     ));
-    let foreign = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let foreign = test_ledger(10_000_000, 0).unwrap();
     assert_eq!(
         changed.push_source(&key, physical, Some(&key), &foreign),
         Err(WorkingMemoryError::IdentityMismatch)
@@ -71,7 +73,9 @@ fn original_source_alias_preserves_ordinary_load_charge_and_constructor_custody(
     assert_eq!(balances(&pool), before);
     drop((wrong_account, funded));
 
-    let ordinary = pool.register_storage([(key.clone(), physical)]).unwrap();
+    let ordinary = pool
+        .register_host_storage([(key.clone(), physical)])
+        .unwrap();
     let before = balances(&pool);
     let mut alias = PreparedNativePublication::prepare_slots(partition.clone(), 2);
     for _ in 0..2 {
@@ -97,14 +101,17 @@ fn original_source_alias_preserves_ordinary_load_charge_and_constructor_custody(
     }
     scope.certify().unwrap();
     drop((alias, metadata, run, partition, ordinary, store, key));
-    assert_eq!(pool.used_bytes().unwrap(), source_charge + physical);
+    assert_eq!(
+        pool.native_payload_bytes().unwrap(),
+        source_charge + physical
+    );
     drop(retained);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.native_payload_bytes().unwrap(), 0);
 }
 
 #[test]
-fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_changed_or_retired_rows(
-) {
+fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_changed_or_retired_rows()
+ {
     // Actual ordinary load source: encoded logical length differs from the
     // retained allocation capacity. The source owner, not a test byte guess,
     // supplies the identity and full physical registration amount.
@@ -119,14 +126,16 @@ fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_cha
     )])
     .unwrap();
     let mut row = None;
-    assert!(source
-        .visit_source_storage(&mut |owner| {
-            assert!(row.replace((owner.identity(), owner.bytes())).is_none());
-        })
-        .unwrap());
+    assert!(
+        source
+            .visit_source_storage(&mut |owner| {
+                assert!(row.replace((owner.identity(), owner.bytes())).is_none());
+            })
+            .unwrap()
+    );
     let (key, physical) = row.unwrap();
     assert!(physical > 8);
-    let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
+    let pool = test_ledger(1_000, 0).unwrap();
     let (metadata, run, partition) = account(&pool);
     let scope = run.scope().unwrap();
     let native_balance = || {
@@ -159,12 +168,15 @@ fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_cha
     assert!(canonical().is_none());
 
     let existing = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
         .unwrap();
     pool.validate_retained_source_inventory(&key, physical)
         .unwrap();
     let before = (balances(&pool), native_balance());
-    let foreign = WorkingMemoryPool::new(1_000, 0).unwrap();
+    let foreign = test_ledger(1_000, 0).unwrap();
     let foreign_before = balances(&foreign);
     let mut wrong_pool = PreparedNativePublication::prepare_slots(partition.clone(), 1);
     assert_eq!(
@@ -211,7 +223,10 @@ fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_cha
     assert!(canonical().is_none());
 
     let existing = pool
-        .register_storage_with_gguf_sources([(key.clone(), physical)])
+        .register_storage_with_gguf_sources([(
+            key.clone(),
+            crate::working_memory::StorageAllocation::new(physical, pool.host_placement_handle()),
+        )])
         .unwrap();
     let before = (balances(&pool), native_balance());
     let (location, owners) = canonical().unwrap();
@@ -238,7 +253,7 @@ fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_cha
         "no Q or physical charge consumed"
     );
     let retained = alias.take_input(0).unwrap();
-    assert_eq!(retained.bytes(), physical);
+    assert_eq!(retained.bytes(), Some(physical));
     drop(existing);
     assert_eq!(
         canonical(),
@@ -250,7 +265,7 @@ fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_cha
     drop((
         missing, wrong_pool, changed, retired, alias, partition, metadata, run,
     ));
-    assert!(pool.used_bytes().unwrap() >= physical);
+    assert!(pool.native_payload_bytes().unwrap() >= physical);
     drop(retained);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.native_payload_bytes().unwrap(), 0);
 }

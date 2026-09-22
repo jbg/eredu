@@ -1,15 +1,16 @@
 //! Paid pending bytes and escaped events over the ordinary channel transitions.
 //! Decoder/stop orchestration remains in the shared speculative semantic owner.
 use super::{DependencyMemoryPolicy, OriginalSemanticChannelSource};
+use channels::JsonFrame;
+use channels::tagged::{TaggedCall, TaggedFrame};
 use eredu_core::{
-    HostPreparationAuthority, SpeculativeBuffer, SharedBackendFailure, BackendFailure, BackendFailureKind,
+    BackendFailure, BackendFailureKind, HostPreparationAuthority, SharedBackendFailure,
+    SpeculativeBuffer,
     generation::{SemanticEvent, SemanticText},
 };
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_text::semantic_channels::{self as channels, ChannelKind, Next, State};
 use std::mem::{size_of, size_of_val};
-use channels::JsonFrame;
-use channels::tagged::{TaggedCall, TaggedFrame};
 mod tagged;
 use tool_call::Call;
 #[derive(Debug, thiserror::Error)]
@@ -116,7 +117,9 @@ impl Cursor {
             ChannelKind::Text => program.text_channel.expect("retained text channel").suffix,
         };
         match self {
-            Self::Tool(_) | Self::Tagged(_) => unreachable!("tool state uses the shared JSON worker"),
+            Self::Tool(_) | Self::Tagged(_) => {
+                unreachable!("tool state uses the shared JSON worker")
+            }
             Self::Outside => State::Outside,
             Self::Prefilled(kind) => State::Prefilled {
                 kind,
@@ -142,7 +145,8 @@ impl OriginalSemanticChannelParser {
             channels::json_frame_control_bytes()?,
             tool::control_bytes()?,
             tagged::controls()?,
-            size_of::<Option<Call>>(), size_of::<JsonFrame>(),
+            size_of::<Option<Call>>(),
+            size_of::<JsonFrame>(),
             OriginalSemanticChannelSource::control_bytes()?,
             size_of::<Self>(),
             size_of::<OriginalSemanticChannelParserError>(),
@@ -150,11 +154,7 @@ impl OriginalSemanticChannelParser {
             size_of::<Result<Self, OriginalSemanticChannelParserError>>(),
             size_of::<Result<(), OriginalSemanticChannelParserError>>(),
             size_of::<Result<(), Cause>>(),
-            size_of::<(
-                &OriginalSemanticChannelSource,
-                usize,
-                &HostMetadataFunding,
-            )>(),
+            size_of::<(&OriginalSemanticChannelSource, usize, &HostMetadataFunding)>(),
             size_of::<(&mut Self, &str)>(),
             size_of::<std::str::Utf8Error>(),
             size_of::<Result<&str, std::str::Utf8Error>>(),
@@ -196,7 +196,12 @@ impl OriginalSemanticChannelParser {
         input_bytes: usize,
         funding: &HostMetadataFunding,
     ) -> Result<Self, OriginalSemanticChannelParserError> {
-        Self::prepare_with_dependency_memory(source, input_bytes, funding, DependencyMemoryPolicy::default())
+        Self::prepare_with_dependency_memory(
+            source,
+            input_bytes,
+            funding,
+            DependencyMemoryPolicy::default(),
+        )
     }
     /// Uses configurable host-dependency headroom in addition to exact pending
     /// and event-buffer admission. Tagged JSON work receives one estimate for
@@ -223,7 +228,11 @@ impl OriginalSemanticChannelParser {
         dependency_memory: DependencyMemoryPolicy,
     ) -> Result<Self, Cause> {
         if source.tagged_tools().is_some() {
-            funding.reserve_metadata(dependency_memory.estimate(input_bytes).ok_or(Cause::Overflow)?)?;
+            funding.reserve_metadata(
+                dependency_memory
+                    .estimate(input_bytes)
+                    .ok_or(Cause::Overflow)?,
+            )?;
         }
         let mut pending = Self::buffer(input_bytes, funding)?;
         pending
@@ -294,11 +303,15 @@ impl OriginalSemanticChannelParser {
     fn process(&mut self) -> Result<(), Cause> {
         loop {
             if let Cursor::Tool(frame) = self.state {
-                if self.process_tool(frame)? { return Ok(()); }
+                if self.process_tool(frame)? {
+                    return Ok(());
+                }
                 continue;
             }
             if let Cursor::Tagged(frame) = self.state {
-                if self.process_tagged(frame)? { return Ok(()); }
+                if self.process_tagged(frame)? {
+                    return Ok(());
+                }
                 continue;
             }
             let pending = std::str::from_utf8(&self.pending[..self.used])
@@ -323,11 +336,17 @@ impl OriginalSemanticChannelParser {
                 match next {
                     Ok(state) => self.state = state,
                     Err(()) => {
-                        if self.source.tool_validation().is_none() { return Err(Cause::ToolPayload); }
-                        self.state = if let Some(tools) = self.source.json_tools() { Cursor::Tool(JsonFrame::after_channel(tools)) }
-                        else if let Some(tools) = self.source.tagged_tools() { Cursor::Tagged(TaggedFrame::after_channel(tools)) }
-                        else { return Err(Cause::ToolPayload); };
-                    },
+                        if self.source.tool_validation().is_none() {
+                            return Err(Cause::ToolPayload);
+                        }
+                        self.state = if let Some(tools) = self.source.json_tools() {
+                            Cursor::Tool(JsonFrame::after_channel(tools))
+                        } else if let Some(tools) = self.source.tagged_tools() {
+                            Cursor::Tagged(TaggedFrame::after_channel(tools))
+                        } else {
+                            return Err(Cause::ToolPayload);
+                        };
+                    }
                 }
             }
             if wait {
@@ -369,19 +388,23 @@ impl OriginalSemanticChannelParser {
             return Ok(());
         }
         self.prepare_events()?;
-        let result = self
-            .process()
-            .and_then(|()| match self.state.kind() {
-                Some(kind) => self.emit(kind, self.used),
-                // Same ordinary finish semantics: an incomplete JSON envelope
-                // produces no fabricated ToolCallEnd or visible text.
-                None => {
-                    if matches!(self.state, Cursor::Tagged(TaggedFrame::Payload | TaggedFrame::AfterPayload))
-                        || (matches!(self.state, Cursor::Tagged(TaggedFrame::AfterEnvelope)) && self.used != 0) {
-                        Err(self.tool_failure(tool::ToolCause::Incomplete))
-                    } else { Ok(()) }
-                },
-            });
+        let result = self.process().and_then(|()| match self.state.kind() {
+            Some(kind) => self.emit(kind, self.used),
+            // Same ordinary finish semantics: an incomplete JSON envelope
+            // produces no fabricated ToolCallEnd or visible text.
+            None => {
+                if matches!(
+                    self.state,
+                    Cursor::Tagged(TaggedFrame::Payload | TaggedFrame::AfterPayload)
+                ) || (matches!(self.state, Cursor::Tagged(TaggedFrame::AfterEnvelope))
+                    && self.used != 0)
+                {
+                    Err(self.tool_failure(tool::ToolCause::Incomplete))
+                } else {
+                    Ok(())
+                }
+            }
+        });
         self.ended = true;
         self.failed = result.is_err();
         if result.is_ok() {
@@ -400,7 +423,11 @@ impl OriginalSemanticChannelParser {
         let parts = [
             Self::frames()?,
             self.call.as_ref().map_or(Some(0), Call::copy_bytes)?,
-            if self.source.tagged_tools().is_some() { self.dependency_memory.estimate(self.limit)? } else { 0 },
+            if self.source.tagged_tools().is_some() {
+                self.dependency_memory.estimate(self.limit)?
+            } else {
+                0
+            },
             SpeculativeBuffer::<u8>::retained_control_bytes(self.limit)?,
             SpeculativeBuffer::<SemanticEvent>::retained_control_bytes(self.limit.checked_add(1)?)?,
         ];
@@ -431,7 +458,9 @@ impl OriginalSemanticChannelParser {
         let mut copied =
             self.copy_prepaid(HostPreparationAuthority::retain(funding.clone()), true)?;
         copied.funding = funding.clone();
-        if let Some(call) = &mut copied.call { call.rebind_funding(funding); }
+        if let Some(call) = &mut copied.call {
+            call.rebind_funding(funding);
+        }
         Ok(copied)
     }
     pub(super) fn copy_prepaid(
@@ -453,9 +482,22 @@ impl OriginalSemanticChannelParser {
                     .try_extend(self.events.iter().cloned())
                     .map_err(|_| Cause::Capacity)?;
             }
-            let call = self.call.as_ref().map(|call| call.copy_prepaid(host.clone(), &self.funding))
-                .transpose().map_err(|cause| tool::retained(tool::ToolCause::Call(cause),
-                    SpeculativeBuffer::default(), None, None, HostPreparationAuthority::unmanaged(), &self.source, &self.funding))?;
+            let call = self
+                .call
+                .as_ref()
+                .map(|call| call.copy_prepaid(host.clone(), &self.funding))
+                .transpose()
+                .map_err(|cause| {
+                    tool::retained(
+                        tool::ToolCause::Call(cause),
+                        SpeculativeBuffer::default(),
+                        None,
+                        None,
+                        HostPreparationAuthority::unmanaged(),
+                        &self.source,
+                        &self.funding,
+                    )
+                })?;
             let tagged = self.tagged.clone();
             Ok(Self {
                 pending,

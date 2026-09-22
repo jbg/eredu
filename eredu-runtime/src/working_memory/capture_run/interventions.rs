@@ -3,14 +3,14 @@ use super::super::OriginalInterventionSource;
 use super::claims::ReceiptIdentity;
 use super::*;
 use eredu_core::intervention::*;
-mod routed;
 mod partition;
 mod prefill;
-pub use prefill::{InterventionPrefillCursor,InterventionPrefillFragment};
-pub use routed::{RoutedInterventionCursor,RoutedInterventionBatch};
+mod routed;
+pub use prefill::{InterventionPrefillCursor, InterventionPrefillFragment};
+pub use routed::{RoutedInterventionBatch, RoutedInterventionCursor};
 
 pub(in crate::working_memory) const DIAGNOSTIC_BYTES: usize = 256;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(in crate::working_memory) struct StepPlan<'a> {
     pub(in crate::working_memory) source: &'a OriginalInterventionSource,
     pub(in crate::working_memory) phase: CapturePhase,
@@ -45,14 +45,30 @@ impl<'a> StepPlan<'a> {
         shape: CaptureInvocationShape,
         selected: &'a [bool],
     ) -> Result<Self, CaptureRunHostError> {
-        Self::prepare_invocation_evidence(capture,source,phase,prediction,shape,selected,None,None)
+        Self::prepare_invocation_evidence(
+            capture, source, phase, prediction, shape, selected, None, None,
+        )
     }
     pub(in crate::working_memory) fn prepare_invocation_evidence(
-        capture:&SharedCapturePlan,source:&'a OriginalInterventionSource,phase:CapturePhase,prediction:u64,
-        shape:CaptureInvocationShape,selected:&'a [bool],window:Option<CaptureInvocationWindow>,
-        evidence_skips:Option<&'a [[Option<CaptureSkipReason>;2]]>,
-    )->Result<Self,CaptureRunHostError> {
-        Self::prepare_selected(capture,source,phase,prediction,Some(shape),Some(selected),window,evidence_skips)
+        capture: &SharedCapturePlan,
+        source: &'a OriginalInterventionSource,
+        phase: CapturePhase,
+        prediction: u64,
+        shape: CaptureInvocationShape,
+        selected: &'a [bool],
+        window: Option<CaptureInvocationWindow>,
+        evidence_skips: Option<&'a [[Option<CaptureSkipReason>; 2]]>,
+    ) -> Result<Self, CaptureRunHostError> {
+        Self::prepare_selected(
+            capture,
+            source,
+            phase,
+            prediction,
+            Some(shape),
+            Some(selected),
+            window,
+            evidence_skips,
+        )
     }
     fn prepare_selected(
         capture: &SharedCapturePlan,
@@ -75,9 +91,15 @@ impl<'a> StepPlan<'a> {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         let count = admitted.plan().operations.len();
-        if evidence_skips.is_some_and(|rows|rows.len()!=count) || invocation.is_none() && (window.is_some() || evidence_skips.is_some()) {return Err(CaptureRunHostError::ExplicitInvocation);}
-        if let Some(window)=window {
-            window.validate_fixed(invocation.ok_or(CaptureRunHostError::ExplicitInvocation)?).map_err(|_|CaptureRunHostError::Coordinate)?;
+        if evidence_skips.is_some_and(|rows| rows.len() != count)
+            || invocation.is_none() && (window.is_some() || evidence_skips.is_some())
+        {
+            return Err(CaptureRunHostError::ExplicitInvocation);
+        }
+        if let Some(window) = window {
+            window
+                .validate_fixed(invocation.ok_or(CaptureRunHostError::ExplicitInvocation)?)
+                .map_err(|_| CaptureRunHostError::Coordinate)?;
         }
         match (admitted.invocation_bounds(), invocation, selected) {
             (None, None, None) => (),
@@ -97,12 +119,29 @@ impl<'a> StepPlan<'a> {
                 + DIAGNOSTIC_BYTES
                 + size_of::<ClaimState>(),
         )?;
-        if admitted.points().iter().any(|point|point.routed_units.is_some()) {
-            peak=peak.checked_add(extent(count,size_of::<Option<RoutedInterventionCursor<'_>>>())?)
+        if admitted
+            .points()
+            .iter()
+            .any(|point| point.routed_units.is_some())
+        {
+            peak = peak
+                .checked_add(extent(
+                    count,
+                    size_of::<Option<RoutedInterventionCursor<'_>>>(),
+                )?)
                 .ok_or(WorkingMemoryError::Overflow)?;
         }
-        if invocation.is_none() && admitted.points().iter().any(crate::intervention::InterventionPrefillWindow::row_axis) {
-            peak=peak.checked_add(extent(count,size_of::<Option<InterventionPrefillCursor<'_>>>())?)
+        if invocation.is_none()
+            && admitted
+                .points()
+                .iter()
+                .any(crate::intervention::InterventionPrefillWindow::row_axis)
+        {
+            peak = peak
+                .checked_add(extent(
+                    count,
+                    size_of::<Option<InterventionPrefillCursor<'_>>>(),
+                )?)
                 .ok_or(WorkingMemoryError::Overflow)?;
         }
         for (index, (operation, point)) in admitted
@@ -112,32 +151,47 @@ impl<'a> StepPlan<'a> {
             .zip(admitted.points())
             .enumerate()
         {
+            let routing = point.stage == InterventionStage::RoutingBeforeDispatch
+                && point.routing.is_some()
+                && operation.action.dtype().is_none();
+            let activation = point.routing.is_none() && operation.action.dtype().is_some();
             let supported = if invocation.is_some() {
-                point.stage == InterventionStage::Activation
-                    && operation.action.dtype().is_some()
-                    && (operation.evidence == InterventionEvidence::None || evidence_skips.is_some())
+                (routing || point.stage == InterventionStage::Activation && activation)
+                    && (operation.evidence == InterventionEvidence::None
+                        || evidence_skips.is_some())
             } else {
-                matches!(point.stage,InterventionStage::Activation|InterventionStage::LogitsBeforeSampling)
-                    && operation.action.dtype().is_some()
+                routing
+                    || matches!(
+                        point.stage,
+                        InterventionStage::Activation | InterventionStage::LogitsBeforeSampling
+                    ) && activation
             };
             // Sparse rows use the existing one-use routed cursor. Their native
-            // source remains the backend's independent obligation; only explicit
-            // invocations without evidence have a completed cursor consumer.
-            if !supported || point.routing.is_some()
+            // source remains the backend's independent obligation. Scheduled
+            // prefill spans canonical chunks with that same cursor.
+            if !supported
                 || (point.routed_units.is_some()
-                    && (invocation.is_none() || operation.evidence != InterventionEvidence::None)) {
+                    && operation.evidence != InterventionEvidence::None)
+            {
                 return Err(CaptureStepError::UnsupportedIntervention { index }.into());
             }
-            if invocation.is_none() && phase==CapturePhase::Prefill
-                && operation.schedule.includes(phase,prediction)
-                && crate::intervention::InterventionPrefillWindow::row_axis(point) {
+            if invocation.is_none()
+                && phase == CapturePhase::Prefill
+                && operation.schedule.includes(phase, prediction)
+                && crate::intervention::InterventionPrefillWindow::row_axis(point)
+            {
                 // Host preparation prices the actual immutable companion only.
-                // The execution cursor still requires its closed partition owner.
-                if operation.evidence==InterventionEvidence::None {
-                    crate::intervention::InterventionPrefillWindow::validate_operation(admitted,index)
-                }else {
-                    crate::intervention::InterventionPrefillWindow::validate_partition_evidence_operation(source,index)
-                }.map_err(|_|CaptureStepError::UnsupportedIntervention{index})?;
+                // The execution cursor still requires its original companion frame.
+                if operation.evidence == InterventionEvidence::None {
+                    crate::intervention::InterventionPrefillWindow::validate_operation(
+                        admitted, index,
+                    )
+                } else {
+                    crate::intervention::InterventionPrefillWindow::validate_evidence_operation(
+                        source, index,
+                    )
+                }
+                .map_err(|_| CaptureStepError::UnsupportedIntervention { index })?;
             }
             match (&operation.evidence, source.plan().evidence(index)) {
                 (InterventionEvidence::None, None) => (),
@@ -145,7 +199,8 @@ impl<'a> StepPlan<'a> {
                     InterventionEvidence::Preview { .. } | InterventionEvidence::Summary,
                     Some(companion),
                 ) if companion.operation() == index
-                    && companion.geometry_source().plan().selections.len() == 2 =>
+                    && companion.geometry_source().plan().selections.len()
+                        == if routing { 4 } else { 2 } =>
                 {
                     ()
                 }
@@ -166,7 +221,13 @@ impl<'a> StepPlan<'a> {
         }
         peak = peak
             .checked_add(capture_step::interventions::evidence::source_peak(
-                source, phase, prediction, invocation, window, selected, evidence_skips,
+                source,
+                phase,
+                prediction,
+                invocation,
+                window,
+                selected,
+                evidence_skips,
             )?)
             .ok_or(WorkingMemoryError::Overflow)?;
         if selected.is_some() {
@@ -175,18 +236,22 @@ impl<'a> StepPlan<'a> {
                 .ok_or(WorkingMemoryError::Overflow)?;
         }
         if evidence_skips.is_some() {
-            peak=peak.checked_add(extent(count,size_of::<[Option<CaptureSkipReason>;2]>())?).ok_or(WorkingMemoryError::Overflow)?;
+            peak = peak
+                .checked_add(extent(count, size_of::<[Option<CaptureSkipReason>; 2]>())?)
+                .ok_or(WorkingMemoryError::Overflow)?;
         }
         let controls = [
             size_of::<Self>(),
             size_of::<Option<CaptureInvocationShape>>(),
             size_of::<Option<CaptureInvocationWindow>>(),
             size_of::<[CaptureUsage; 2]>(),
-            size_of::<Result<[CaptureUsage; 2], crate::capture::FundedCaptureError<WorkingMemoryError>>>(),
+            size_of::<
+                Result<[CaptureUsage; 2], crate::capture::FundedCaptureError<WorkingMemoryError>>,
+            >(),
             size_of::<Option<&[bool]>>(),
-            size_of::<Option<&[[Option<CaptureSkipReason>;2]]>>(),
-            size_of::<Option<Box<[[Option<CaptureSkipReason>;2]]>>>(),
-            size_of::<Vec<[Option<CaptureSkipReason>;2]>>(),
+            size_of::<Option<&[[Option<CaptureSkipReason>; 2]]>>(),
+            size_of::<Option<Box<[[Option<CaptureSkipReason>; 2]]>>>(),
+            size_of::<Vec<[Option<CaptureSkipReason>; 2]>>(),
             size_of::<Option<Box<[bool]>>>(),
             size_of::<Vec<bool>>(),
             size_of::<Result<(), CaptureAxisError>>(),
@@ -200,18 +265,27 @@ impl<'a> StepPlan<'a> {
             size_of::<CaptureInterventionClaim<'_>>(),
             size_of::<ClaimedIntervention>(),
             size_of::<InterventionPrefillCursor<'_>>(),
-            size_of::<InterventionPrefillFragment<'_,'_>>(),
+            size_of::<InterventionPrefillFragment<'_, '_>>(),
             size_of::<Vec<Option<InterventionPrefillCursor<'_>>>>(),
-            crate::intervention::InterventionPrefillWindow::control_bytes().ok_or(WorkingMemoryError::Overflow)?,
+            crate::intervention::InterventionPrefillWindow::control_bytes()
+                .ok_or(WorkingMemoryError::Overflow)?,
             size_of::<RoutedInterventionCursor<'_>>(),
             size_of::<Vec<Option<RoutedInterventionCursor<'_>>>>(),
             size_of::<RoutedInterventionBatch<'_, '_>>(),
+            size_of::<Option<crate::intervention::InterventionPrefillWindow>>() * 3,
+            size_of::<Option<(eredu_core::InferenceGeometry, crate::prefill::PrefillChunk)>>() * 2,
+            size_of::<[u64; 2]>() * 3,
             size_of::<Option<RoutedUnitInterventionReceipt>>(),
-            size_of::<Result<RoutedInterventionCursor<'_>,CaptureRunHostError>>(),
-            size_of::<Result<RoutedInterventionBatch<'_, '_>,CaptureRunHostError>>(),
-            size_of::<(Option<RoutedUnitInterventionReceipt>,u64,[u64;2])>(),
-            size_of::<(RoutedUnitInterventionReceipt,[u64;2],u64)>(),
-            size_of::<Result<RoutedUnitInterventionReceipt,crate::intervention::RoutedInterventionLoweringError>>(),
+            size_of::<Result<RoutedInterventionCursor<'_>, CaptureRunHostError>>(),
+            size_of::<Result<RoutedInterventionBatch<'_, '_>, CaptureRunHostError>>(),
+            size_of::<(Option<RoutedUnitInterventionReceipt>, u64, [u64; 2])>(),
+            size_of::<(RoutedUnitInterventionReceipt, [u64; 2], u64)>(),
+            size_of::<
+                Result<
+                    RoutedUnitInterventionReceipt,
+                    crate::intervention::RoutedInterventionLoweringError,
+                >,
+            >(),
             size_of::<ReceiptIdentity>(),
             size_of::<Result<ClaimedIntervention, CaptureRunHostError>>(),
             size_of::<Result<(), CaptureRunHostError>>(),
@@ -343,7 +417,9 @@ impl<'a> CaptureInterventionClaim<'a> {
         self.invocation
     }
     /// Exact logical row placement from this same frame, never a caller view.
-    pub fn invocation_window(&self) -> Option<CaptureInvocationWindow> { self.window }
+    pub fn invocation_window(&self) -> Option<CaptureInvocationWindow> {
+        self.window
+    }
     /// Authenticate the already admitted original model occurrence. This cannot
     /// relabel a numerical account or authorize any native operation itself.
     pub fn validate_model_custody(
@@ -366,6 +442,24 @@ impl<'a> CaptureInterventionClaim<'a> {
         }
         self.identity.custody.validate_scheduled_native(native)
     }
+    /// Records a validated routing source with no selected row in this window.
+    /// The backend still establishes source identity and enclosing completion.
+    pub fn finish_unmatched(
+        self,
+        charged: CaptureUsage,
+    ) -> Result<ClaimedIntervention, CaptureRunHostError> {
+        if self
+            .admission()
+            .points()
+            .get(self.index())
+            .is_none_or(|point| point.routing.is_none())
+        {
+            return Err(CaptureRunHostError::ReceiptMismatch);
+        }
+        let mut receipt = self.finish(charged)?;
+        receipt.unmatched = true;
+        Ok(receipt)
+    }
     /// Record successful construction by the existing edit worker. The enclosing
     /// numerical/model owner must complete every root before successful delivery;
     /// this provisional receipt grants no native execution or completion itself.
@@ -374,7 +468,8 @@ impl<'a> CaptureInterventionClaim<'a> {
         Ok(ClaimedIntervention {
             charged,
             identity: self.identity,
-            routed:None,
+            routed: None,
+            unmatched: false,
         })
     }
 }
@@ -383,7 +478,8 @@ impl<'a> CaptureInterventionClaim<'a> {
 pub struct ClaimedIntervention {
     charged: CaptureUsage,
     identity: ReceiptIdentity,
-    routed:Option<RoutedUnitInterventionReceipt>,
+    routed: Option<RoutedUnitInterventionReceipt>,
+    unmatched: bool,
 }
 impl<'a> ScheduledCaptureStep<'a> {
     /// Exact immutable declaration loan; no source, quota or native authority.
@@ -412,32 +508,47 @@ impl<'a> ScheduledCaptureStep<'a> {
         &mut self,
         index: usize,
     ) -> Result<CaptureInterventionClaim<'a>, CaptureRunHostError> {
-        self.take_intervention_inner(index,None)
+        self.take_intervention_inner(index, None)
     }
     /// Spend one routed operation once; its move-only cursor spans the actual
     /// provider batches. The initial marker cannot satisfy frame completion.
-    pub fn take_routed_intervention(&mut self,index:usize,source_tokens:u64)
-        ->Result<RoutedInterventionCursor<'a>,CaptureRunHostError>{
-        let claim=self.take_intervention_inner(index,Some(source_tokens))?;
-        Ok(RoutedInterventionCursor::new(claim,source_tokens))
+    pub fn take_routed_intervention(
+        &mut self,
+        index: usize,
+        source_tokens: u64,
+    ) -> Result<RoutedInterventionCursor<'a>, CaptureRunHostError> {
+        let claim = self.take_intervention_inner(index, Some(source_tokens))?;
+        Ok(RoutedInterventionCursor::new(claim, source_tokens))
     }
-    fn take_intervention_inner(&mut self,index:usize,routed_tokens:Option<u64>)
-        ->Result<CaptureInterventionClaim<'a>,CaptureRunHostError>{
-        self.take_intervention_inner_source(index,routed_tokens,false)
+    fn take_intervention_inner(
+        &mut self,
+        index: usize,
+        routed_tokens: Option<u64>,
+    ) -> Result<CaptureInterventionClaim<'a>, CaptureRunHostError> {
+        self.take_intervention_inner_source(index, routed_tokens, false)
     }
-    fn take_intervention_inner_source(&mut self,index:usize,routed_tokens:Option<u64>,prefill:bool)
-        ->Result<CaptureInterventionClaim<'a>,CaptureRunHostError>{
+    fn take_intervention_inner_source(
+        &mut self,
+        index: usize,
+        routed_tokens: Option<u64>,
+        prefill: bool,
+    ) -> Result<CaptureInterventionClaim<'a>, CaptureRunHostError> {
         self.claim.custody.validate()?;
         let source = self
             .claim
             .interventions
             .ok_or(CaptureRunHostError::ClaimUnavailable { index })?;
         let slot = self.intervention_slot(index)?;
-        let point=source.plan().admission().points().get(index)
-            .ok_or(CaptureRunHostError::ClaimUnavailable{index})?;
-        if routed_tokens.is_some_and(|n|n==0 || point.routed_units.is_none())
-            || routed_tokens.is_none() && point.routed_units.is_some() {
-            return Err(CaptureRunHostError::ClaimUnavailable{index});
+        let point = source
+            .plan()
+            .admission()
+            .points()
+            .get(index)
+            .ok_or(CaptureRunHostError::ClaimUnavailable { index })?;
+        if routed_tokens.is_some_and(|n| n == 0 || point.routed_units.is_none())
+            || routed_tokens.is_none() && point.routed_units.is_some()
+        {
+            return Err(CaptureRunHostError::ClaimUnavailable { index });
         }
         let target = source
             .plan()
@@ -451,16 +562,37 @@ impl<'a> ScheduledCaptureStep<'a> {
         // Architecture hooks execute in graph order. Only earlier operations at
         // this same hook constrain its declaration order; unrelated Missing rows
         // may belong to a later hook and remain mandatory at frame completion.
-        if self.frame.interventions().iter().take(index).enumerate().any(|(earlier,record)| {
-            record.target == target
-                && !crate::intervention::routed::progress::successful(record)
-                && !(prefill && record.outcome==InterventionOutcome::Missing
-                    && self.claim.prefill_interventions.get(earlier).is_some_and(Option::is_some)
-                    && self.intervention_slot(earlier).ok().and_then(|slot|self.claim.row.get(slot))==Some(&ClaimState::Spent))
-                && !(routed_tokens.is_some() && record.outcome==InterventionOutcome::Missing
-                    && record.routed_units.is_some()
-                    && self.intervention_slot(earlier).ok().and_then(|slot|self.claim.row.get(slot))==Some(&ClaimState::Spent))
-        }) {
+        if self
+            .frame
+            .interventions()
+            .iter()
+            .take(index)
+            .enumerate()
+            .any(|(earlier, record)| {
+                record.target == target
+                    && !crate::intervention::routed::progress::successful(record)
+                    && !(prefill
+                        && record.outcome == InterventionOutcome::Missing
+                        && self
+                            .claim
+                            .prefill_interventions
+                            .get(earlier)
+                            .is_some_and(Option::is_some)
+                        && self
+                            .intervention_slot(earlier)
+                            .ok()
+                            .and_then(|slot| self.claim.row.get(slot))
+                            == Some(&ClaimState::Spent))
+                    && !(routed_tokens.is_some()
+                        && record.outcome == InterventionOutcome::Missing
+                        && record.routed_units.is_some()
+                        && self
+                            .intervention_slot(earlier)
+                            .ok()
+                            .and_then(|slot| self.claim.row.get(slot))
+                            == Some(&ClaimState::Spent))
+            })
+        {
             return Err(CaptureRunHostError::ClaimUnavailable { index });
         }
         if self.claim.row.get(slot) != Some(&ClaimState::Available)
@@ -473,7 +605,9 @@ impl<'a> ScheduledCaptureStep<'a> {
             return Err(CaptureRunHostError::ClaimUnavailable { index });
         }
         self.claim.row[slot] = ClaimState::Spent;
-        if let Some(source_tokens)=routed_tokens { self.frame.begin_routed_intervention(index,source_tokens)?; }
+        if let Some(source_tokens) = routed_tokens {
+            self.frame.begin_routed_intervention(index, source_tokens)?;
+        }
         Ok(CaptureInterventionClaim {
             source,
             invocation: self.claim.invocation,
@@ -501,8 +635,12 @@ impl<'a> ScheduledCaptureStep<'a> {
         {
             return Err(CaptureRunHostError::ReceiptMismatch);
         }
-        self.frame
-            .record_intervention_result(identity.index, value.charged, value.routed)?;
+        self.frame.record_intervention_result(
+            identity.index,
+            value.charged,
+            value.routed,
+            value.unmatched,
+        )?;
         Ok(())
     }
     /// Mark the same spent edit failed using its preallocated diagnostic. Its

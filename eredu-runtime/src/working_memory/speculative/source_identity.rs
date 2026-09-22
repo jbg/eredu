@@ -7,14 +7,20 @@ use super::*;
 pub struct OriginalSpeculativeSourceIdentity {
     pub(super) schedule: ScheduleIdentity,
     pub(super) account: u64,
-    pub(super) pool: WorkingMemoryPool,
+    pub(super) pool: MemoryLedger,
 }
 impl OriginalSpeculativeRequest {
     /// Compares the exact retained executable without granting any invocation.
     /// An equal geometry or capacity from another execution is insufficient.
-    pub fn validate_execution(&self, execution: &InferenceExecutionIdentity) -> Result<(), WorkingMemoryError> {
-        if std::sync::Arc::ptr_eq(&self.execution.0, &execution.0) { Ok(()) }
-        else { Err(WorkingMemoryError::IdentityMismatch) }
+    pub fn validate_execution(
+        &self,
+        execution: &InferenceExecutionIdentity,
+    ) -> Result<(), WorkingMemoryError> {
+        if std::sync::Arc::ptr_eq(&self.execution.0, &execution.0) {
+            Ok(())
+        } else {
+            Err(WorkingMemoryError::IdentityMismatch)
+        }
     }
     /// Retain exact source identity for operations that outlive a callback loan.
     /// Consumers still require a separate accepted operation and source proof.
@@ -28,9 +34,10 @@ impl OriginalSpeculativeRequest {
 }
 impl OriginalSpeculativeSourceIdentity {
     /// Exact retained issuance identity; this comparison grants no operation.
-    pub fn same_identity(&self, other:&Self)->bool {
-        self.schedule==other.schedule && self.account==other.account
-            && self.pool.same_domain(&other.pool)
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.schedule == other.schedule
+            && self.account == other.account
+            && self.pool.same_ledger(&other.pool)
     }
 
     /// Same schedule, issuance account and pool as the actual request. A shared
@@ -39,11 +46,11 @@ impl OriginalSpeculativeSourceIdentity {
     pub fn belongs_to_request(&self, request: &OriginalSpeculativeRequest) -> bool {
         self.schedule == request.identity
             && self.account == request.ticket.id()
-            && self.pool.same_domain(request.ticket.pool())
+            && self.pool.same_ledger(request.ticket.pool())
     }
 
     /// Pool identity alone grants no source provenance or native permission.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    pub fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
 }

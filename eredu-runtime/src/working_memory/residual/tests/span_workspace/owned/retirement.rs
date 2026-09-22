@@ -9,7 +9,7 @@ enum LastOwner {
 }
 
 fn detach(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     raw: bool,
 ) -> (
     LastOwner,
@@ -39,11 +39,11 @@ fn detach(
 fn original_custody_concurrent_full_and_raw_final_owners_retire_the_same_hold_once() {
     for raw in [false, true] {
         for _ in 0..4 {
-            let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-            let source = pool.register_storage([(1u32, 64)]).unwrap();
+            let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+            let source = pool.register_host_storage([(1u32, 64)]).unwrap();
             let (last, reservation, run, held) = detach(&pool, raw);
             drop((reservation, run, source));
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             let ready = Arc::new(Barrier::new(5));
             let release = Arc::new(Barrier::new(5));
             std::thread::scope(|scope| {
@@ -66,13 +66,13 @@ fn original_custody_concurrent_full_and_raw_final_owners_retire_the_same_hold_on
                     .collect::<Vec<_>>();
                 drop(last);
                 ready.wait();
-                assert_eq!(pool.used_bytes().unwrap(), held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), held);
                 release.wait();
                 for worker in workers {
                     worker.join().unwrap();
                 }
             });
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -81,8 +81,8 @@ fn original_custody_concurrent_full_and_raw_final_owners_retire_the_same_hold_on
 fn original_custody_unwind_retirement_never_certifies_an_abandoned_native_scope() {
     for raw in [false, true] {
         for completed in [false, true] {
-            let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-            let source = pool.register_storage([(1u32, 64)]).unwrap();
+            let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+            let source = pool.register_host_storage([(1u32, 64)]).unwrap();
             let (last, reservation, run, held) = detach(&pool, raw);
             let native = run.scope().unwrap();
             if completed {
@@ -91,17 +91,20 @@ fn original_custody_unwind_retirement_never_certifies_an_abandoned_native_scope(
                 drop(native);
             }
             drop((reservation, run, source));
-            assert!(pool.used_bytes().unwrap() >= held);
+            assert!(pool.payload_used_bytes().unwrap() >= held);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _owner = last;
-                assert!(pool.used_bytes().unwrap() >= held);
+                assert!(pool.payload_used_bytes().unwrap() >= held);
                 panic!("unwind the actual last host owner");
             }));
             assert!(result.is_err());
             if completed {
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             } else {
-                assert!(pool.used_bytes().unwrap() > 0, "native quarantine survives");
+                assert!(
+                    pool.payload_used_bytes().unwrap() > 0,
+                    "native quarantine survives"
+                );
             }
         }
     }

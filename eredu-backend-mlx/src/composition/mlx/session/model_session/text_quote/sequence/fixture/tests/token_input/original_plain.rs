@@ -2,6 +2,8 @@
 //! stays in the facade; this test controller supplies only the identical neutral
 //! domain contract. Numerical reference uses the existing full logical K/V helper.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     BackendFailure, GenerationPlainTextOutput, GenerationSequenceConsumerLayout, GenerationTiming,
     OriginalSourceWitness, TextControllerStorage, TextControllerWorkspace, TokenFilter,
@@ -132,7 +134,7 @@ fn run_original(
         prefill_chunk_positions: std::num::NonZeroU64::new(2),
         graph_metadata_capacity_bytes: None,
         submission_tracking_capacity_bytes: tracking_capacity,
-        ..config(4, u64::MAX).inference_policy()
+        ..config(4, u64::MAX).inference_policy().clone()
     });
     assert!(encoded.matches_source(source));
     assert_eq!(encoded.ids(), expected_input);
@@ -255,10 +257,16 @@ fn run_original(
 }
 #[test]
 fn canonical_c_e_i_r_text_matches_four_predictions_and_full_kv_across_cached_residency_routes() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     compare_original(false);
 }
 #[test]
 fn original_j_h_chat_matches_four_predictions_and_full_kv_across_cached_residency_routes() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     compare_original(true);
 }
 fn compare_original(chat: bool) {
@@ -357,7 +365,7 @@ fn compare_original(chat: bool) {
             // A source declaration alone cannot enable a legacy/no-claim start.
             // Rejection precedes Prompt/Sampling, leaving the genuine C reusable.
             if residency == 0 && route == 0 {
-                let before = pool.used_bytes().unwrap();
+                let before = pool.fixture_host_charge().unwrap();
                 let result = ControlledTextGeneration::new(
                     &mut runtime,
                     expected_input.to_vec(),
@@ -369,7 +377,7 @@ fn compare_original(chat: bool) {
                     Err(eredu_core::ControlledTextGenerationError::Preparation(_))
                 ));
                 drop(result);
-                assert_eq!(pool.used_bytes().unwrap(), before);
+                assert_eq!(pool.fixture_host_charge().unwrap(), before);
             }
             let mut outputs = Vec::new();
             for (request, (expected, expected_kv)) in reference.iter().enumerate() {
@@ -440,8 +448,10 @@ fn compare_original(chat: bool) {
             assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
             let template_bytes = template.as_ref().map_or(0, |j| j.original_bytes());
             let tokenizer_bytes = source.original_bytes();
-            let with_sources = pool.used_bytes().unwrap();
-            let mut remaining = with_sources.checked_sub(baseline + tokenizer_bytes + template_bytes).unwrap();
+            let with_sources = pool.fixture_host_charge().unwrap();
+            let mut remaining = with_sources
+                .checked_sub(baseline + tokenizer_bytes + template_bytes)
+                .unwrap();
             // Q is exact but not the whole escaped charge: its numeric ledger
             // node also retains the separate H account that paid for that node.
             // This isolated balance is used only for alias lifetime checks; the
@@ -463,13 +473,26 @@ fn compare_original(chat: bool) {
                 drop(ids);
                 crate::backend::submission_recovery::wait_for_retirement(|| {
                     disk::reclaim();
-                    pool.used_bytes().unwrap() <= baseline + remaining - held
+                    pool.fixture_host_charge().unwrap() <= baseline + remaining - held
                 });
-                let after = pool.used_bytes().unwrap().checked_sub(baseline).unwrap();
-                assert!(after < remaining, "the final output alias must retire its actual accounts");
-                assert!(remaining - after >= held, "the complete original Q must retire with its final alias");
+                let after = pool
+                    .fixture_host_charge()
+                    .unwrap()
+                    .checked_sub(baseline)
+                    .unwrap();
+                assert!(
+                    after < remaining,
+                    "the final output alias must retire its actual accounts"
+                );
+                assert!(
+                    remaining - after >= held,
+                    "the complete original Q must retire with its final alias"
+                );
                 remaining_host -= held;
-                assert!(after >= remaining_host, "other live outputs retain their own original Q");
+                assert!(
+                    after >= remaining_host,
+                    "other live outputs retain their own original Q"
+                );
                 remaining = after;
             }
             settle(pool, baseline);
@@ -478,13 +501,13 @@ fn compare_original(chat: bool) {
 }
 
 fn first_original_resident_request(
-    load: impl Fn(&Stream, &WorkingMemoryPool) -> (Runtime, tempfile::TempDir),
+    load: impl Fn(&Stream, &MemoryLedger) -> (Runtime, tempfile::TempDir),
     snapshot: impl Fn(&Runtime, usize) -> Vec<(Vec<i32>, Vec<f32>)>,
     derive_tracking: bool,
 ) {
     let stream = stream();
     let input = [2, 5, 7, 3, 11];
-    let ordinary_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let ordinary_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut ordinary, _ordinary_artifact) = load(&stream, &ordinary_pool);
     // No managed sequence/control request participates in the ordinary
     // numerical reference. Both sides still use the shared text driver.
@@ -510,7 +533,7 @@ fn first_original_resident_request(
     finish(ordinary, &stream);
     settle(&ordinary_pool, 0);
 
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool);
     assert!(
         runtime
@@ -611,11 +634,17 @@ fn first_original_resident_request(
 
 #[test]
 fn first_original_resident_request_matches_ordinary_tokens_and_nonzero_kv() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     first_original_resident_request(|stream, pool| load(stream, pool, 0), logical_kv, false);
 }
 
 #[test]
 fn first_original_hybrid_resident_request_matches_ordinary_tokens_and_all_state() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     use crate::composition::mlx::replicated_text::tests::{
         qwen_hybrid_config, tiny_heterogeneous_artifact,
     };
@@ -684,6 +713,9 @@ fn first_original_hybrid_resident_request_matches_ordinary_tokens_and_all_state(
 
 #[test]
 fn native_recipe_roots_preserve_selected_layerwise_operation_obligations() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     let geometry = eredu_core::InferenceGeometry {
         batch_size: 1,
@@ -699,13 +731,13 @@ fn native_recipe_roots_preserve_selected_layerwise_operation_obligations() {
         .graph_metadata_capacity_bytes
         .unwrap();
     for residency in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (runtime, _artifact) = load(&stream, &pool, residency);
         let model = &runtime.session().payload.model;
         let (quote, storage, recipe) = model
             .quote_registered_resident_text_with_sampling_recipe(
                 geometry,
-                config,
+                config.clone(),
                 &TokenFilter::All,
                 &pool,
             )

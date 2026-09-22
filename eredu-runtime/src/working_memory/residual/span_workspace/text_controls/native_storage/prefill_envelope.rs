@@ -108,7 +108,9 @@ impl<'a> NativePrefillEnvelopeBuilder<'a> {
         }
         let prefill = matches!(span, InferenceWorkspaceSpan::Prefill(_));
         match span {
-            InferenceWorkspaceSpan::Sampling(_) => return Err(WorkingMemoryError::IdentityMismatch),
+            InferenceWorkspaceSpan::Sampling(_) => {
+                return Err(WorkingMemoryError::IdentityMismatch);
+            }
             InferenceWorkspaceSpan::Prefill(_) => {
                 if self.decode_started {
                     return Err(WorkingMemoryError::IdentityMismatch);
@@ -233,7 +235,10 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         if !self.plan.same_plan(&envelope.plan) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let layout = self.layout.get_mut().ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let layout = self
+            .layout
+            .get_mut()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if !layout.exact_storage
             || layout.equation_generations.is_some()
             || layout

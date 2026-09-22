@@ -383,7 +383,7 @@ fn demand_stalls_and_rank_local_selections_are_reported() {
         report.offload().peak_resident_bytes().get(MemoryTier::Host),
         fixture_host_capacity(2)
     );
-    assert!(report.weight_store().cache_hits > 0);
+    assert_eq!(report.weight_store().cache_hits, 0, "direct selected reads do not populate the artifact cache");
 }
 
 #[test]

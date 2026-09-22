@@ -495,6 +495,23 @@ fn point_to_point_worker() {
     } else {
         Array::zeros::<f32>(&[2], &stream).unwrap()
     };
+    let before_quote = super::group::native_collective_submissions();
+    let publication_controls = MlxNeuralBackend::ordinary_broadcast_call_controls(session_group, 0)
+        .expect("actual publication source has finite caller and retention controls");
+    let ordinary_controls = super::completion::MlxCommunicationCompletion::ordinary_collective_completion_call_controls(session_group, &[]).unwrap();
+    assert!(
+        publication_controls.metadata_bytes > ordinary_controls.metadata_bytes,
+        "publication keeps the additional contribution alias through completion"
+    );
+    assert!(
+        MlxNeuralBackend::ordinary_broadcast_call_controls(session_group, session_group.size())
+            .is_none()
+    );
+    assert_eq!(
+        super::group::native_collective_submissions(),
+        before_quote,
+        "cold caller quotation must not submit communication"
+    );
     let publication = <MlxNeuralBackend as BroadcastBackend>::broadcast(
         MlxTensor::from_array(publication_input),
         0,

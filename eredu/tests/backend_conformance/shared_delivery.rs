@@ -1,10 +1,7 @@
 //! Original capture custody through actual core/facade drivers. The independent
 //! ordinary low-level fixture also exercises caller-owned frame retirement.
 use super::*;
-use eredu::api::{
-    ControlledGenerationRecord, ObservedGenerationEvent as Event,
-    TraceLimits,
-};
+use eredu::api::{ControlledGenerationRecord, ObservedGenerationEvent as Event, TraceLimits};
 use eredu_core::{
     capture::*, TextContinuationError, TextGenerationDriver, TextGenerationInput,
     TokenFilterController,
@@ -86,15 +83,19 @@ pub(super) fn take(
         if let Some(failure) = p.fail.take() {
             return Err(MockError::Speculative(Box::new(DrainFailure(failure))));
         }
-        let original=state.funded.is_some();
+        let original = state.funded.is_some();
         let raw = state.take_capture()?;
         p.pending = false;
         Ok(raw.map(|step| {
             p.constructed += 1;
-            if original {step} else {SharedCapturedStep::retain(
-                step.as_step().clone(),
-                (step, Retired(p.retired.clone())),
-            )}
+            if original {
+                step
+            } else {
+                SharedCapturedStep::retain(
+                    step.as_step().clone(),
+                    (step, Retired(p.retired.clone())),
+                )
+            }
         }))
     })
 }
@@ -160,30 +161,72 @@ fn chat(model: &mut original_sources::Fixture<MockBackend>) -> PreparedChat {
             ..Default::default()
         };
         let cancellation = eredu_core::GenerationCancellationToken::new();
-        let source = model.chat_source(!request.tools.is_empty(), &cancellation).unwrap().unwrap();
-        model.prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation).unwrap().unwrap()
+        let source = model
+            .chat_source(!request.tools.is_empty(), &cancellation)
+            .unwrap()
+            .unwrap();
+        model
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
+            .unwrap()
+            .unwrap()
     }
 }
 
 fn run_capture_callbacks(
-    model:&mut original_sources::Fixture<MockBackend>,
-    request:eredu::api::PreparedChatRequest<'_,Prompt>,
-    cancellation:eredu_core::GenerationCancellationToken,
-    mut observe:impl FnMut(Event)->ControlFlow<()>,
-)->Result<eredu_core::GenerationOutput<(),eredu_core::generation::GenerationTokenIds>,eredu::api::PreparedChatSessionError> {
-    let session=model.start_prepared_chat(request,&cancellation)?.expect("uncancelled original source");
-    let positions=session.prompt_attribution().unwrap().attribution().decoder_positions;
-    let mut prediction=0;
-    let mut callback=|token,frame,seconds| {
-        let range=if prediction==0 {[0,positions]} else {[positions+prediction-1,positions+prediction]};
-        let event=match token {
-            Some(token_id)=>Some(Event::Token{token_id,forced:false,prediction_index:prediction,input_range:range,committed:true,rank:0,captures:frame,step_seconds:seconds}),
-            None=>frame.map(|captures|Event::CaptureFailure{prediction_index:prediction,input_range:range,captures,step_seconds:seconds}),
+    model: &mut original_sources::Fixture<MockBackend>,
+    request: eredu::api::PreparedChatRequest<'_, Prompt>,
+    cancellation: eredu_core::GenerationCancellationToken,
+    mut observe: impl FnMut(Event) -> ControlFlow<()>,
+) -> Result<
+    eredu_core::GenerationOutput<(), eredu_core::generation::GenerationTokenIds>,
+    eredu::api::PreparedChatSessionError,
+> {
+    let session = model
+        .start_prepared_chat(request, &cancellation)?
+        .expect("uncancelled original source");
+    let positions = session
+        .prompt_attribution()
+        .unwrap()
+        .attribution()
+        .decoder_positions;
+    let mut prediction = 0;
+    let mut callback = |token, frame, seconds| {
+        let range = if prediction == 0 {
+            [0, positions]
+        } else {
+            [positions + prediction - 1, positions + prediction]
         };
-        prediction+=u64::from(token.is_some());
-        if event.is_some_and(|event|observe(event).is_break()) {cancellation.cancel();}
+        let event = match token {
+            Some(token_id) => Some(Event::Token {
+                token_id,
+                forced: false,
+                prediction_index: prediction,
+                input_range: range,
+                committed: true,
+                rank: 0,
+                captures: frame,
+                step_seconds: seconds,
+            }),
+            None => frame.map(|captures| Event::CaptureFailure {
+                prediction_index: prediction,
+                input_range: range,
+                captures,
+                step_seconds: seconds,
+            }),
+        };
+        prediction += u64::from(token.is_some());
+        if event.is_some_and(|event| observe(event).is_break()) {
+            cancellation.cancel();
+        }
     };
-    session.with_capture_observer(&mut callback).run(&cancellation,&mut |_|{})
+    session
+        .with_capture_observer(&mut callback)
+        .run(&cancellation, &mut |_| {})
 }
 
 #[test]
@@ -193,33 +236,40 @@ fn actual_ordinary_and_controlled_callbacks_move_shared_frames_after_completion(
         let mut model = unicode_model(None);
         let chat = chat(&mut model);
         let capture = observed_mock::plan();
-    let mut prepared = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
-    prepared.capture = Some(&capture);
-    let prepared_trace = limits();
-    prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
+        prepared.capture = Some(&capture);
+        let prepared_trace = limits();
+        prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
         let _guard = arm();
-        let pool=model.original_pool().clone();
+        let pool = model.original_pool().clone();
         let mut events = Vec::new();
         let tokens = if controlled {
             let mut run = model
                 .start_controlled_chat(prepared, prepared_trace, Default::default(), |record| {
-                    if let Some(event) = record.event.progress() { events.push(event.clone()); }
+                    if let Some(event) = record.event.progress() {
+                        events.push(event.clone());
+                    }
                     ControlFlow::Continue(())
                 })
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             run.run(|record| {
-                if let Some(event) = record.event.progress() { events.push(event.clone()); }
+                if let Some(event) = record.event.progress() {
+                    events.push(event.clone());
+                }
                 ControlFlow::Continue(())
             })
             .unwrap();
             run.token_ids().to_vec()
         } else {
             run_capture_callbacks(&mut model, prepared, Default::default(), |event| {
-                    events.push(event);
-                    ControlFlow::Continue(())
-                })
-                .unwrap()
-                .token_ids.to_vec()
+                events.push(event);
+                ControlFlow::Continue(())
+            })
+            .unwrap()
+            .token_ids
+            .to_vec()
         };
         if let Some(expected) = &expected {
             assert_eq!(&tokens, expected);
@@ -245,11 +295,12 @@ fn actual_ordinary_and_controlled_callbacks_move_shared_frames_after_completion(
             .clone();
         assert!(clone.shared_captures().unwrap().same_storage(captured[0]));
         drop(captured);
-        drop(chat);drop(model);
+        drop(chat);
+        drop(model);
         drop(events);
-        assert!(pool.used_bytes().unwrap()>0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         drop(clone);
-        assert_eq!(pool.used_bytes().unwrap(),0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -331,10 +382,11 @@ fn facade_drain_failure_keeps_original_source_in_both_shared_drivers() {
         let mut model = unicode_model(None);
         let chat = chat(&mut model);
         let capture = observed_mock::plan();
-    let mut prepared = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
-    prepared.capture = Some(&capture);
-    let prepared_trace = limits();
-    prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
+        prepared.capture = Some(&capture);
+        let prepared_trace = limits();
+        prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
         let _guard = arm();
         let original = Arc::new(());
         PROBE.with(|p| p.borrow_mut().as_mut().unwrap().fail = Some(original.clone()));
@@ -344,10 +396,12 @@ fn facade_drain_failure_keeps_original_source_in_both_shared_drivers() {
                 .start_controlled_chat(prepared, prepared_trace, Default::default(), |_| {
                     ControlFlow::Continue(())
                 })
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             let error = run
                 .step(|record| {
-                    frames += usize::from(record.event.progress().and_then(Event::captures).is_some());
+                    frames +=
+                        usize::from(record.event.progress().and_then(Event::captures).is_some());
                     ControlFlow::Continue(())
                 })
                 .err()
@@ -355,11 +409,11 @@ fn facade_drain_failure_keeps_original_source_in_both_shared_drivers() {
             assert!(Arc::ptr_eq(&source(&error).0, &original));
         } else {
             let error = run_capture_callbacks(&mut model, prepared, Default::default(), |event| {
-                    frames += usize::from(event.captures().is_some());
-                    ControlFlow::Continue(())
-                })
-                .err()
-                .expect("drain fault");
+                frames += usize::from(event.captures().is_some());
+                ControlFlow::Continue(())
+            })
+            .err()
+            .expect("drain fault");
             assert!(Arc::ptr_eq(&source(&error).0, &original));
         }
         assert_eq!(frames, 0);
@@ -439,15 +493,8 @@ fn wire_diagnostics_preserve_nonfinite_policy_and_live_alias_custody() {
         assert!(decoded.captures().is_some());
         let controlled = record;
         let clone = controlled.clone();
-        assert!(clone
-
-            .shared_captures()
-            .unwrap()
-            .same_storage(&shared));
-        assert!(std::ptr::eq(
-            clone.captures().unwrap(),
-            shared.as_step()
-        ));
+        assert!(clone.shared_captures().unwrap().same_storage(&shared));
+        assert!(std::ptr::eq(clone.captures().unwrap(), shared.as_step()));
         let size = serde_json::to_vec(&controlled).unwrap().len() as u64;
         let mut exact = TraceBudget::new(TraceLimits {
             per_record_bytes: size,
@@ -485,14 +532,21 @@ fn settled_token_read_failure_delivers_shared_frame_without_replacing_original_e
             let chat = chat(&mut model);
             let mut settings = settings();
             settings.overrides.max_new_tokens = Some(1);
-            let ids=vec![1;999];
-            let capture=if empty {CapturePlan::none()} else {observed_mock::plan()};
-            let mut prepared=eredu::api::PreparedChatRequest::new(&chat,original_sources::settings(settings));
-            prepared.input=eredu::api::PreparedChatPrompt::TokenIds(&ids);
-            prepared.output_mode=eredu::api::PreparedChatOutputMode::Text;
-            prepared.capture=Some(&capture);
+            let ids = vec![1; 999];
+            let capture = if empty {
+                CapturePlan::none()
+            } else {
+                observed_mock::plan()
+            };
+            let mut prepared = eredu::api::PreparedChatRequest::new(
+                &chat,
+                original_sources::settings(settings.clone()),
+            );
+            prepared.input = eredu::api::PreparedChatPrompt::TokenIds(&ids);
+            prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
+            prepared.capture = Some(&capture);
             let _guard = arm();
-            let pool=model.original_pool().clone();
+            let pool = model.original_pool().clone();
             if fail_drain {
                 PROBE.with(|p| p.borrow_mut().as_mut().unwrap().fail = Some(Arc::new(())));
             }
@@ -515,17 +569,24 @@ fn settled_token_read_failure_delivers_shared_frame_without_replacing_original_e
                     .start_controlled_chat(prepared, limits(), Default::default(), |_| {
                         ControlFlow::Continue(())
                     })
-                    .unwrap().unwrap();
+                    .unwrap()
+                    .unwrap();
                 let error = run
-                    .step(|record| record.event.progress().map_or(ControlFlow::Continue(()), |event| observe(event.clone())))
+                    .step(|record| {
+                        record
+                            .event
+                            .progress()
+                            .map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
+                    })
                     .err()
                     .expect("token read failure");
                 check(&error);
                 assert!(run.token_ids().is_empty());
             } else {
-                let error = run_capture_callbacks(&mut model, prepared, Default::default(), &mut observe)
-                    .err()
-                    .expect("token read failure");
+                let error =
+                    run_capture_callbacks(&mut model, prepared, Default::default(), &mut observe)
+                        .err()
+                        .expect("token read failure");
                 check(&error);
             }
             drop(observe);
@@ -540,10 +601,11 @@ fn settled_token_read_failure_delivers_shared_frame_without_replacing_original_e
                     CaptureOutcome::Captured
                 ));
             }
-            drop(chat);drop(model);
-            assert_eq!(pool.used_bytes().unwrap()>0,count!=0);
+            drop(chat);
+            drop(model);
+            assert_eq!(pool.live_charge_bytes().unwrap() > 0, count != 0);
             drop(frames);
-            assert_eq!(pool.used_bytes().unwrap(),0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         }
     }
 }
@@ -554,12 +616,13 @@ fn callback_cancellation_retires_only_the_last_escaped_shared_alias() {
         let mut model = unicode_model(None);
         let chat = chat(&mut model);
         let capture = observed_mock::plan();
-    let mut prepared = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
-    prepared.capture = Some(&capture);
-    let prepared_trace = limits();
-    prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
+        let mut prepared =
+            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
+        prepared.capture = Some(&capture);
+        let prepared_trace = limits();
+        prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
         let _guard = arm();
-        let pool=model.original_pool().clone();
+        let pool = model.original_pool().clone();
         let mut escaped = None;
         let mut observe = |event: Event| {
             if event.shared_captures().is_some() {
@@ -573,21 +636,33 @@ fn callback_cancellation_retires_only_the_last_escaped_shared_alias() {
         if controlled {
             let mut run = model
                 .start_controlled_chat(prepared, prepared_trace, Default::default(), |record| {
-                    record.event.progress().map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
+                    record
+                        .event
+                        .progress()
+                        .map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
                 })
-                .unwrap().unwrap();
-            run.run(|record| record.event.progress().map_or(ControlFlow::Continue(()), |event| observe(event.clone()))).unwrap();
+                .unwrap()
+                .unwrap();
+            run.run(|record| {
+                record
+                    .event
+                    .progress()
+                    .map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
+            })
+            .unwrap();
             assert_eq!(run.token_ids().len(), 1);
             assert_eq!(run.finish_reason(), Some(FinishReason::Cancelled));
         } else {
-            let output = run_capture_callbacks(&mut model, prepared, Default::default(), &mut observe)
-                .unwrap();
+            let output =
+                run_capture_callbacks(&mut model, prepared, Default::default(), &mut observe)
+                    .unwrap();
             assert_eq!(output.token_ids.len(), 1);
             assert_eq!(output.finish_reason, FinishReason::Cancelled);
         }
         drop(observe);
         assert_eq!(counters(), (1, 1, 1, 1));
-        drop(chat);drop(model);
+        drop(chat);
+        drop(model);
         let escaped = escaped.unwrap();
         let alias = escaped.clone();
         assert!(alias
@@ -595,9 +670,9 @@ fn callback_cancellation_retires_only_the_last_escaped_shared_alias() {
             .unwrap()
             .same_storage(escaped.shared_captures().unwrap()));
         drop(escaped);
-        assert!(pool.used_bytes().unwrap()>0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         drop(alias);
-        assert_eq!(pool.used_bytes().unwrap(),0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -608,12 +683,13 @@ fn completed_no_output_cancellation_delivers_retained_terminal_frames() {
             let mut model = unicode_model(None);
             let chat = chat(&mut model);
             let capture = observed_mock::plan();
-    let mut prepared = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
-    prepared.capture = Some(&capture);
-    let prepared_trace = limits();
-    prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
+            let mut prepared =
+                eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings()));
+            prepared.capture = Some(&capture);
+            let prepared_trace = limits();
+            prepared.output_mode = eredu::api::PreparedChatOutputMode::Text;
             let _guard = arm();
-            let pool=model.original_pool().clone();
+            let pool = model.original_pool().clone();
             let mut events = Vec::new();
             PROBE.with(|p| {
                 let mut p = p.borrow_mut();
@@ -633,15 +709,26 @@ fn completed_no_output_cancellation_delivers_retained_terminal_frames() {
             if controlled {
                 let mut run = model
                     .start_controlled_chat(prepared, prepared_trace, control, |record| {
-                        record.event.progress().map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
+                        record
+                            .event
+                            .progress()
+                            .map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
                     })
-                    .unwrap().unwrap();
-                run.run(|record| record.event.progress().map_or(ControlFlow::Continue(()), |event| observe(event.clone()))).unwrap();
+                    .unwrap()
+                    .unwrap();
+                run.run(|record| {
+                    record
+                        .event
+                        .progress()
+                        .map_or(ControlFlow::Continue(()), |event| observe(event.clone()))
+                })
+                .unwrap();
                 assert!(run.token_ids().is_empty());
                 assert_eq!(run.finish_reason(), Some(FinishReason::Cancelled));
             } else {
-                let output = run_capture_callbacks(&mut model, prepared, cancellation.clone(), &mut observe)
-                    .unwrap();
+                let output =
+                    run_capture_callbacks(&mut model, prepared, cancellation.clone(), &mut observe)
+                        .unwrap();
                 assert!(output.token_ids.is_empty());
                 assert_eq!(output.finish_reason, FinishReason::Cancelled);
             }
@@ -649,17 +736,15 @@ fn completed_no_output_cancellation_delivers_retained_terminal_frames() {
             assert!(cancellation.is_cancelled());
             assert_eq!(events.len(), 1);
             assert!(events[0].shared_captures().is_some());
-            assert!(matches!(
-                &events[0],
-                Event::CaptureFailure { .. }
-            ));
+            assert!(matches!(&events[0], Event::CaptureFailure { .. }));
             assert_eq!(events[0].captures().unwrap().prediction_index, 0);
             assert_eq!(counters(), (1, 1, 1, 1));
             assert!(!pending());
-            drop(chat);drop(model);
-            assert!(pool.used_bytes().unwrap()>0);
+            drop(chat);
+            drop(model);
+            assert!(pool.live_charge_bytes().unwrap() > 0);
             drop(events);
-            assert_eq!(pool.used_bytes().unwrap(),0);
+            assert_eq!(pool.live_charge_bytes().unwrap(), 0);
         }
     }
 }

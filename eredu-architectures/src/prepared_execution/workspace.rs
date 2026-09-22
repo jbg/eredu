@@ -7,17 +7,16 @@ use crate::replicated_text::{
 };
 use eredu_core::{InferenceGeometry, TextFilterWorkspace, TextGenerationConfig};
 use eredu_nn::{
-    Error, Tensor,
     workspace::{WorkspaceBackend, WorkspaceContext, WorkspaceLayout, WorkspaceTensor},
+    Error, Tensor,
 };
 use eredu_runtime::{
+    working_memory::{
+        quote_inference_workspace_with_context, InferenceWorkspaceReport, InferenceWorkspaceSpan,
+        SamplingWorkspaceReport, WorkspaceResidentLayerState, WorkspaceResidentStateFactory,
+    },
     DeviceState, ReplicatedTextArchitecture, ResidentRuntime, RuntimeLayerState, RuntimeState,
     RuntimeStateComponents,
-    working_memory::{
-        InferenceWorkspaceReport, InferenceWorkspaceSpan, SamplingWorkspaceReport,
-        WorkspaceResidentLayerState, WorkspaceResidentStateFactory,
-        quote_inference_workspace_with_context,
-    },
 };
 
 mod autoregressive;
@@ -26,13 +25,14 @@ mod external;
 use external::{EquationCapture, ExternalTargetQuote};
 mod prediction;
 pub use embedded::EmbeddedTargetWorkspaceObservation;
+pub use observed::InvocationWorkspaceObservation;
 pub use prediction::{EmbeddedPredictionWorkspaceObservation, WorkspacePredictionEquationTails};
 mod composite;
 mod destinations;
 pub use destinations::{
-    ReplicatedTextBindingDestinations, project_replicated_text_binding_destinations,
-    PartitionedTextBindingDestinations, project_partitioned_text_binding_destinations,
-    AddressableBindingDestinations, project_addressable_binding_destinations,
+    project_addressable_binding_destinations, project_partitioned_text_binding_destinations,
+    project_replicated_text_binding_destinations, AddressableBindingDestinations,
+    PartitionedTextBindingDestinations, ReplicatedTextBindingDestinations,
 };
 mod media_input;
 mod media_trace;
@@ -178,7 +178,12 @@ pub trait InferenceEquationTraceObserver {
 
     /// Retains the actual score-source facts for consumers that later reprice
     /// sampling without running another model equation.
-    fn observe_sampling_input(&mut self, _input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> { Ok(()) }
+    fn observe_sampling_input(
+        &mut self,
+        _input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 
     fn observe_sampling(
         &mut self,
@@ -195,7 +200,10 @@ struct EquationTraceRef<'a, 'observer>(
 );
 
 impl eredu_runtime::working_memory::SamplingWorkspaceObserver for EquationTraceRef<'_, '_> {
-    fn observe_input(&mut self, input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan) -> Result<(), Error> {
+    fn observe_input(
+        &mut self,
+        input: eredu_runtime::working_memory::SamplingWorkspaceInputPlan,
+    ) -> Result<(), Error> {
         self.0.borrow_mut().observe_sampling_input(input)
     }
     fn observe(
@@ -232,7 +240,10 @@ impl PreparedInferenceBlueprint {
     pub fn plan_original_media_semantics<'s, 'h>(
         &'s self,
         source: &'h eredu_runtime::working_memory::OriginalPreparedHostInput,
-    ) -> Result<crate::media_plan::PreparedMediaSemanticCompile<'s, 'h>, crate::media_plan::MediaSemanticError> {
+    ) -> Result<
+        crate::media_plan::PreparedMediaSemanticCompile<'s, 'h>,
+        crate::media_plan::MediaSemanticError,
+    > {
         self.sources.plan_original_media_semantics(source)
     }
 
@@ -502,16 +513,17 @@ impl PreparedInferenceBlueprint {
         )
     }
 
-    /// Runs the same selected resident equations and sampling quotation while
+    /// Runs the selected resident or source-bound layerwise equations and sampling while
     /// borrowing each completed span into a mechanism's finite recipe producer.
     /// This performs no native work and cannot grant a missing bound.
-    pub fn quote_replicated_resident_text_with_sampling_and_trace<'a>(
+    pub fn quote_replicated_text_with_sampling_and_trace<'a>(
         &self,
         geometry: InferenceGeometry,
         state: &ResidentState,
         context: &WorkspaceContext,
         config: TextGenerationConfig,
         filter: impl Into<TextFilterWorkspace<'a>>,
+        parameters: Option<&dyn WorkspaceLayerwiseParameters>,
         observer: &mut dyn InferenceEquationTraceObserver,
     ) -> Result<PreparedTextGenerationWorkspace, PreparedExecutionError<Error>> {
         if geometry.batch_size != 1 || geometry.output != eredu_core::OutputDemand::LastPosition {
@@ -528,7 +540,7 @@ impl PreparedInferenceBlueprint {
             state,
             context,
             Some(TextSamplingInput::Configured(config, filter.into())),
-            None,
+            parameters,
             None,
             Some(EquationTraceRef(&observer)),
         )?;
@@ -585,6 +597,7 @@ impl PreparedInferenceBlueprint {
             false,
             routed_pass,
             None,
+            None,
         )
     }
 
@@ -601,19 +614,26 @@ impl PreparedInferenceBlueprint {
         target_capture: bool,
         routed_pass: Option<eredu_runtime::ExpertPass>,
         media: Option<MediaEquationRef<'_>>,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
     ) -> Result<EquationQuote, PreparedExecutionError<Error>> {
         context
-            .charge_metadata(std::mem::size_of::<(bool,Option<eredu_runtime::ExpertPass>)>())
+            .charge_metadata(std::mem::size_of::<(
+                bool,
+                Option<eredu_runtime::ExpertPass>,
+                Option<&eredu_runtime::RetainedCommunicationSource>,
+            )>())
             .map_err(|cause| PreparedExecutionError::Metadata(cause.into()))?;
         geometry
             .validate()
             .map_err(|error| preparation_message(context, format_args!("{error}")))?;
-        eredu_runtime::working_memory::validate_workspace_state_realization(
-            state,
-            self.selected().text_realization().state(),
-            context,
-        )
-        .map_err(PreparedExecutionError::Metadata)?;
+        if self.selected().execution().parallel_topology().is_none() {
+            eredu_runtime::working_memory::validate_workspace_state_realization(
+                state,
+                self.selected().text_realization().state(),
+                context,
+            )
+            .map_err(PreparedExecutionError::Metadata)?;
+        }
         if parameters.is_some()
             && !matches!(
                 self.selected().text_realization().residency(),
@@ -643,11 +663,41 @@ impl PreparedInferenceBlueprint {
             routed_pass,
             external_target: None,
         };
-        visitor.construct(self)
+        if self.selected().execution().parallel_topology().is_some() {
+            if target_capture && self.selected().prediction_extension().is_none() {
+                return Err(PreparedExecutionError::PredictionSourceMismatch);
+            }
+            let communication =
+                communication.ok_or(PreparedExecutionError::MissingCommunication)?;
+            if self.selected().communication_manifest() != Some(communication.manifest()) {
+                return Err(preparation_message(
+                    context,
+                    format_args!(
+                        "embedded target communication differs from its retained partition"
+                    ),
+                ));
+            }
+            let source = self
+                .sources
+                .construction_semantics()
+                .direct_partition
+                .get()
+                .ok_or_else(|| {
+                    preparation_message(
+                        context,
+                        format_args!("exact completed partition quote source is unavailable"),
+                    )
+                })?;
+            source
+                .quote_media(&self.sources, Some(communication), visitor)
+                .map_err(PreparedExecutionError::Metadata)
+        } else {
+            visitor.construct(self)
+        }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EquationVisitor<'a, 'observer, 'trace> {
     geometry: InferenceGeometry,
     state: &'a ResidentState,
@@ -685,11 +735,13 @@ impl ReplicatedTextArchitectureVisitor<WorkspaceBackend, ResidentState>
 }
 
 impl EquationVisitor<'_, '_, '_> {
-    fn execution_pass(&self,span:&InferenceWorkspaceSpan)->eredu_runtime::ExpertPass {
+    fn execution_pass(&self, span: &InferenceWorkspaceSpan) -> eredu_runtime::ExpertPass {
         self.routed_pass.unwrap_or(match span {
-                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
-            InferenceWorkspaceSpan::Prefill(_)=>eredu_runtime::ExpertPass::Prefill,
-            InferenceWorkspaceSpan::Decode{..}=>eredu_runtime::ExpertPass::Decode,
+            InferenceWorkspaceSpan::Sampling(_) => {
+                unreachable!("model equation scheduler emits only prefill/decode spans")
+            }
+            InferenceWorkspaceSpan::Prefill(_) => eredu_runtime::ExpertPass::Prefill,
+            InferenceWorkspaceSpan::Decode { .. } => eredu_runtime::ExpertPass::Decode,
         })
     }
 
@@ -706,7 +758,7 @@ impl EquationVisitor<'_, '_, '_> {
             .with_replicated(ReplicatedRoute::<WorkspaceBackend, _>::new(
                 self.context,
                 self.context,
-                SharedReplicatedTextVisitor::<WorkspaceResidentStateFactory, _>::new(self),
+                SharedReplicatedTextVisitor::<WorkspaceResidentStateFactory, _>::new(self.clone()),
             ))
             .with_routed(RoutedRoute::<
                 WorkspaceBackend,
@@ -716,12 +768,16 @@ impl EquationVisitor<'_, '_, '_> {
                 _,
                 _,
             >::new(
-                self.context, self.context, self, self, self
+                self.context,
+                self.context,
+                self.clone(),
+                self.clone(),
+                self.clone(),
             ))
             .with_composite(CompositeRoute::<WorkspaceBackend, ResidentState, _>::new(
                 self.context,
                 self.context,
-                self,
+                self.clone(),
             ));
         construct_prepared_execution_impl(
             blueprint.sources.clone(),
@@ -781,28 +837,30 @@ impl EquationVisitor<'_, '_, '_> {
             self.target_capture,
         )?;
         let hook_bytes = runtime.observation_host_peak_bytes(self.context)?;
-        self.quote_spans(hook_bytes, |tokens, state, demand, observer| {
-            runtime
-                .forward_with_capture(
-                    A::text_input(tokens, None),
-                    state,
-                    self.context,
-                    demand,
-                    observer,
-                    self.target_capture,
-                )
-                .map(|(scores, capture)| (scores, capture.map(EquationCapture::Embedded)))
-        })
+        self.clone()
+            .quote_spans(hook_bytes, |tokens, state, demand, observer| {
+                runtime
+                    .forward_with_capture(
+                        A::text_input(tokens, None),
+                        state,
+                        self.context,
+                        demand,
+                        observer,
+                        self.target_capture,
+                    )
+                    .map(|(scores, capture)| (scores, capture.map(EquationCapture::Embedded)))
+            })
     }
 
     fn quote_routed_modules<A>(
         self,
         modules: crate::replicated_text::PreparedReplicatedTextModules<A>,
-        mut provider:EquationRoutedProvider,
+        mut provider: EquationRoutedProvider,
     ) -> Result<EquationQuote, Error>
     where
         A: ReplicatedTextArchitecture<WorkspaceBackend, ResidentState, Error = Error>
-            + eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState> + 'static,
+            + eredu_runtime::RoutedLayeredArchitecture<WorkspaceBackend, ResidentState>
+            + 'static,
         A::StaticModules: Clone,
     {
         if self.media.is_some() || self.external_target.is_some() {
@@ -825,20 +883,21 @@ impl EquationVisitor<'_, '_, '_> {
             self.target_capture,
         )?;
         let hook_bytes = runtime.observation_host_peak_bytes(self.context)?;
-        self.quote_spans_with_span(hook_bytes, |tokens, state, demand, observer, span| {
-            runtime
-                .forward_routed_with_capture(
-                    A::text_input(tokens, None),
-                    state,
-                    self.context,
-                    demand,
-                    observer,
-                    self.target_capture,
-                    self.execution_pass(span),
-                    &mut provider,
-                )
-                .map(|(scores, capture)| (scores, capture.map(EquationCapture::Embedded)))
-        })
+        self.clone()
+            .quote_spans_with_span(hook_bytes, |tokens, state, demand, observer, span| {
+                runtime
+                    .forward_routed_with_capture(
+                        A::text_input(tokens, None),
+                        state,
+                        self.context,
+                        demand,
+                        observer,
+                        self.target_capture,
+                        self.execution_pass(span),
+                        &mut provider,
+                    )
+                    .map(|(scores, capture)| (scores, capture.map(EquationCapture::Embedded)))
+            })
     }
 
     fn quote_spans(
@@ -852,18 +911,22 @@ impl EquationVisitor<'_, '_, '_> {
         )
             -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>,
     ) -> Result<EquationQuote, Error> {
-        self.quote_spans_with_span(hook_bytes, |tokens,state,demand,observer,_span|
-            forward(tokens,state,demand,observer))
+        self.quote_spans_with_span(hook_bytes, |tokens, state, demand, observer, _span| {
+            forward(tokens, state, demand, observer)
+        })
     }
 
     fn quote_spans_with_span(
         self,
         hook_bytes: u64,
         forward: impl FnMut(
-            &WorkspaceTensor, &mut ResidentState, eredu_core::OutputDemand,
+            &WorkspaceTensor,
+            &mut ResidentState,
+            eredu_core::OutputDemand,
             Option<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
             &InferenceWorkspaceSpan,
-        ) -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>,
+        )
+            -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>,
     ) -> Result<EquationQuote, Error> {
         self.quote_spans_with_output_observation(hook_bytes, false, forward)
     }
@@ -875,10 +938,13 @@ impl EquationVisitor<'_, '_, '_> {
         self,
         hook_bytes: u64,
         forward: impl FnMut(
-            &WorkspaceTensor, &mut ResidentState, eredu_core::OutputDemand,
+            &WorkspaceTensor,
+            &mut ResidentState,
+            eredu_core::OutputDemand,
             Option<&mut dyn eredu_runtime::working_memory::InferenceWorkspaceObserver>,
             &InferenceWorkspaceSpan,
-        ) -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>,
+        )
+            -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>,
     ) -> Result<EquationQuote, Error> {
         self.quote_spans_with_output_observation(hook_bytes, true, forward)
     }
@@ -896,9 +962,14 @@ impl EquationVisitor<'_, '_, '_> {
         )
             -> Result<(Option<WorkspaceTensor>, Option<EquationCapture>), Error>,
     ) -> Result<EquationQuote, Error> {
-        self.context.charge_metadata(std::mem::size_of::<(Self,u64,bool)>()
-            .checked_add(std::mem::size_of_val(&forward))
-            .ok_or_else(||self.context.metadata_error(format_args!("observation adapter controls overflow")))?)?;
+        self.context.charge_metadata(
+            std::mem::size_of::<(Self, u64, bool)>()
+                .checked_add(std::mem::size_of_val(&forward))
+                .ok_or_else(|| {
+                    self.context
+                        .metadata_error(format_args!("observation adapter controls overflow"))
+                })?,
+        )?;
         let mut state = self.state.try_clone_workspace(self.context)?;
         let batch = i32::try_from(self.geometry.batch_size).map_err(|_| {
             workspace_message(
@@ -910,7 +981,9 @@ impl EquationVisitor<'_, '_, '_> {
         let equations =
             quote_inference_workspace_with_context(self.geometry, self.context, |span| {
                 let (position, count, mut demand) = match span {
-                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
+                    InferenceWorkspaceSpan::Sampling(_) => {
+                        unreachable!("model equation scheduler emits only prefill/decode spans")
+                    }
                     InferenceWorkspaceSpan::Prefill(chunk) => (
                         chunk.position,
                         chunk.input.end - chunk.input.start,
@@ -969,26 +1042,31 @@ impl EquationVisitor<'_, '_, '_> {
                 // source. Keep that source in the common span driver rather
                 // than invent an allocation that the native reducer must skip.
                 self.context.charge_metadata(std::mem::size_of::<(
-                    Option<usize>, WorkspaceTensor, &WorkspaceTensor, [i32; 2],
+                    Option<usize>,
+                    WorkspaceTensor,
+                    &WorkspaceTensor,
+                    [i32; 2],
                     Option<ExternalTargetQuote<'_>>,
                 )>())?;
                 let (input_operation, tokens) = match self.external_target {
                     Some(ExternalTargetQuote::Capture { input, .. }) => {
                         if input.shape() != [batch, count]
-                            || !matches!(input.layout().dtype(),
+                            || !matches!(
+                                input.layout().dtype(),
                                 eredu_nn::workspace::WorkspaceDtype::Int32
-                                    | eredu_nn::workspace::WorkspaceDtype::Uint32)
+                                    | eredu_nn::workspace::WorkspaceDtype::Uint32
+                            )
                         {
                             return Err(self.context.metadata_error(format_args!(
-                                "external prepared token source differs from the exact invocation")));
+                                "external prepared token source differs from the exact invocation"
+                            )));
                         }
                         (None, input.clone())
                     }
                     _ => {
                         let operation = self.context.operation_count();
-                        let tokens = prepared_text_tokens(
-                            &[batch, count], self.input_dtype, self.context,
-                        )?;
+                        let tokens =
+                            prepared_text_tokens(&[batch, count], self.input_dtype, self.context)?;
                         (Some(operation), tokens)
                     }
                 };
@@ -999,7 +1077,9 @@ impl EquationVisitor<'_, '_, '_> {
                         forward(&tokens, &mut state, demand, Some(&mut **observer), span)?;
                     let output = if output_observed_in_forward {
                         if output.is_none() && demand != eredu_core::OutputDemand::StateOnly {
-                            return Err(self.context.metadata_error(format_args!("partition output observation has no logits")));
+                            return Err(self.context.metadata_error(format_args!(
+                                "partition output observation has no logits"
+                            )));
                         }
                         observer.finish()?;
                         output
@@ -1064,6 +1144,7 @@ impl EquationVisitor<'_, '_, '_> {
                     report = observed::with_hook_workspace(report, hook_bytes, self.context)?;
                 }
                 if let Some(reason) = self.unpriced_execution {
+                    report.physical_domains = None;
                     // Resident equations do not bound a distinct addressable-bank
                     // execution strategy. Preserve diagnostics, never completeness.
                     report
@@ -1095,8 +1176,11 @@ impl EquationVisitor<'_, '_, '_> {
                                 &report,
                                 roots.len(),
                                 output_roots,
-                                input_operation.ok_or_else(|| self.context.metadata_error(
-                                    format_args!("embedded target lost its initialization operation")))?,
+                                input_operation.ok_or_else(|| {
+                                    self.context.metadata_error(format_args!(
+                                        "embedded target lost its initialization operation"
+                                    ))
+                                })?,
                                 output_population,
                                 capture,
                                 scores.as_ref(),
@@ -1121,8 +1205,11 @@ impl EquationVisitor<'_, '_, '_> {
                             &report,
                             roots.len(),
                             output_roots,
-                            input_operation.ok_or_else(|| self.context.metadata_error(
-                                format_args!("ordinary text equation lost its token input source")))?,
+                            input_operation.ok_or_else(|| {
+                                self.context.metadata_error(format_args!(
+                                    "ordinary text equation lost its token input source"
+                                ))
+                            })?,
                             output_population,
                         )?,
                     }
@@ -1173,8 +1260,8 @@ impl crate::routed_text::RoutedTextArchitectureVisitor<WorkspaceBackend, Residen
         A::StaticModules: Clone,
     {
         let (modules, residency, banks) = prepared.into_shared_parts();
-        let provider=EquationRoutedProvider::new(banks,residency,self.context)?;
-        self.quote_routed_modules(modules,provider)
+        let provider = EquationRoutedProvider::new(banks, residency, self.context)?;
+        self.quote_routed_modules(modules, provider)
     }
 }
 impl crate::routed_text::Relu2RoutedTextArchitectureVisitor<WorkspaceBackend, ResidentState>
@@ -1194,8 +1281,8 @@ impl crate::routed_text::Relu2RoutedTextArchitectureVisitor<WorkspaceBackend, Re
         A::StaticModules: Clone,
     {
         let (modules, residency, banks) = prepared.into_shared_parts();
-        let provider=EquationRoutedProvider::new(banks,residency,self.context)?;
-        self.quote_routed_modules(modules,provider)
+        let provider = EquationRoutedProvider::new(banks, residency, self.context)?;
+        self.quote_routed_modules(modules, provider)
     }
 }
 
@@ -1454,11 +1541,17 @@ fn validate_frontier_impl(
 // Source-specific external/assistant inputs take precedence over the selected
 // ordinary token producer. Portable contexts without that producer preserve
 // their existing I32 caller convention. The worker validates integer dtype.
-fn prepared_text_tokens(shape:&[i32],explicit:Option<eredu_nn::workspace::WorkspaceDtype>,
-    context:&WorkspaceContext)->Result<WorkspaceTensor,Error> {
-    context.charge_metadata(std::mem::size_of::<[Option<eredu_nn::workspace::WorkspaceDtype>;2]>()
-        +std::mem::size_of::<eredu_nn::workspace::WorkspaceDtype>())?;
-    let dtype=explicit.or_else(||context.prepared_text_input_dtype())
+fn prepared_text_tokens(
+    shape: &[i32],
+    explicit: Option<eredu_nn::workspace::WorkspaceDtype>,
+    context: &WorkspaceContext,
+) -> Result<WorkspaceTensor, Error> {
+    context.charge_metadata(
+        std::mem::size_of::<[Option<eredu_nn::workspace::WorkspaceDtype>; 2]>()
+            + std::mem::size_of::<eredu_nn::workspace::WorkspaceDtype>(),
+    )?;
+    let dtype = explicit
+        .or_else(|| context.prepared_text_input_dtype())
         .unwrap_or(eredu_nn::workspace::WorkspaceDtype::Int32);
-    WorkspaceTensor::prepared_token_input(shape,dtype,context)
+    WorkspaceTensor::prepared_token_input(shape, dtype, context)
 }

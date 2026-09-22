@@ -1,8 +1,8 @@
 //! Funded record delivery composed over the canonical prepared chat session.
 use super::{
-    ConstraintError, GenerationSnapshotError, LoadedModel, ObservedGenerationEvent,
-    PreparedChatOutputMode, PreparedChatRequest, PreparedChatSession, PreparedChatSessionError,
-    TraceLimits, observed::TraceBudget,
+    observed::TraceBudget, ConstraintError, GenerationSnapshotError, LoadedModel,
+    ObservedGenerationEvent, PreparedChatOutputMode, PreparedChatRequest, PreparedChatSession,
+    PreparedChatSessionError, TraceLimits,
 };
 use crate::runtime::generation::storage::SnapshotStorage;
 use eredu_core::generation::SemanticEvent;
@@ -28,7 +28,9 @@ use delivery::Delivery;
 pub use failure::ControlledSessionFailure;
 pub use records::*;
 use records::{BranchInfo, ControlEvent, PromptRecord, RecordContext, SnapshotInfo};
-pub use snapshot::{ControlledGenerationSnapshot, GenerationOutputCheckpoint, GenerationOutputCheckpointData};
+pub use snapshot::{
+    ControlledGenerationSnapshot, GenerationOutputCheckpoint, GenerationOutputCheckpointData,
+};
 
 /// Original preparation, execution, record or copy failure.
 #[derive(Debug, thiserror::Error)]
@@ -80,8 +82,12 @@ impl ControlledGenerationError {
             Self::Backend(error) => Some(error),
             Self::Snapshot(error) => match error.cause() {
                 eredu_runtime::execution_control::TextSnapshotError::Backend(error)
-                | eredu_runtime::execution_control::TextSnapshotError::HostPreparation(error) => Some(error),
-                error @ eredu_runtime::execution_control::TextSnapshotError::Resume(_) => error.resume_backend_failure(),
+                | eredu_runtime::execution_control::TextSnapshotError::HostPreparation(error) => {
+                    Some(error)
+                }
+                error @ eredu_runtime::execution_control::TextSnapshotError::Resume(_) => {
+                    error.resume_backend_failure()
+                }
                 eredu_runtime::execution_control::TextSnapshotError::RetainedBackend(error) => {
                     std::error::Error::source(error)?.downcast_ref()
                 }
@@ -100,7 +106,7 @@ pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
     failure: ControlledSessionFailure,
     tokenizer_identity: [u8; 32],
     snapshot_budget: Option<SnapshotBudget>,
-    snapshot_host_capacity: u64,
+    snapshot_host_capacity: eredu_core::MemoryLimitDeclarations,
     native_copy_limits: eredu_runtime::working_memory::WorkspaceCopyLimits,
     capabilities: ExecutionControlCapabilities,
     delivery: Delivery,

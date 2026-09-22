@@ -10,7 +10,6 @@ fn empty_source() -> crate::capture::SharedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: vec![],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = crate::ObservationSupportReport {
@@ -57,7 +56,8 @@ fn default_options_admission_rejects_even_empty_source_and_delegates_none() {
         vec![1, 2],
         config(),
         TextPreparationOptions {
-            interventions: None, capture: Some(source),
+            interventions: None,
+            capture: Some(source),
         },
     ) {
         Err(error) => error,

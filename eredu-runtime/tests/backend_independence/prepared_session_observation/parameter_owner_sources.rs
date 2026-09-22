@@ -1,6 +1,87 @@
 use super::*;
 use eredu_runtime::{DirectReplicatedTextExecution, ReplicatedTextExecutionStrategy};
 
+#[test]
+fn parameter_preparation_reaches_exact_policy_and_retains_loan_through_callback_failure() {
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+    ] {
+        let resident = matches!(residency, LayerWeightResidency::FullyResident);
+        let (mut session, counters) = session(residency);
+        let before = counters.snapshot();
+        let graph = eredu_runtime::ArchitectureExecutionGraph::single("decoder")
+            .unwrap()
+            .into_owned();
+        let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        let location = eredu_runtime::parameter_operations::PreparedParameterLocation::Unit {
+            ordinal: 0,
+            address: units.address(0).unwrap(),
+        };
+        let owner = ParameterPreparationProbe::default();
+        let preparation = FakeParameterPreparation { owner: &owner };
+        let identity = std::ptr::from_ref(&preparation).cast::<()>() as usize;
+
+        let error = session
+            .with_parameter_slots(
+                &location,
+                &mut |visit| {
+                    assert_eq!(owner.observed_identity.get(), Some(identity));
+                    assert!(owner.loan_active.get());
+                    visit(&mut Slots);
+                    owner.events.borrow_mut().push("callback failure");
+                    Err("parameter callback sentinel")
+                },
+                &(),
+                Some(&preparation),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            eredu_runtime::LayerwiseAcquireError::Policy("parameter callback sentinel")
+        ));
+        assert!(!owner.loan_active.get());
+        assert_eq!(
+            &*owner.events.borrow(),
+            &["acquire", "callback failure", "release"]
+        );
+
+        assert!(session
+            .with_parameter_slots(
+                &location,
+                &mut |visit| {
+                    assert_eq!(owner.observed_identity.get(), Some(identity));
+                    assert!(owner.loan_active.get());
+                    visit(&mut Slots);
+                    owner.events.borrow_mut().push("callback success");
+                    Ok(())
+                },
+                &(),
+                Some(&preparation),
+            )
+            .unwrap());
+        assert!(!owner.loan_active.get());
+        assert_eq!(
+            &*owner.events.borrow(),
+            &[
+                "acquire",
+                "callback failure",
+                "release",
+                "acquire",
+                "callback success",
+                "release"
+            ]
+        );
+        let after = counters.snapshot();
+        assert_eq!(
+            after.unit_constructions - before.unit_constructions,
+            if resident { 0 } else { 2 }
+        );
+        assert_eq!(after.forward_calls, before.forward_calls);
+        assert_eq!(after.publications, before.publications);
+    }
+}
+
 // Deliberately provides no static companion. Other required methods are never
 // used by this test and cannot fabricate an aggregate through a fallback.
 struct CustomStrategy;

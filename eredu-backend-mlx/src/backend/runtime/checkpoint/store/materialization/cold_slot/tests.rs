@@ -29,17 +29,17 @@ fn shape(inputs: usize) -> MaterializationPayloadShape {
 fn cold_slot_comparison_checkout_and_custody_precede_any_request() {
     let shape = shape(1);
     let bytes = ColdMaterializationSlot::required_bytes(shape).unwrap();
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
     let error = ColdMaterializationSlot::prepare(&short, shape).unwrap_err();
     assert!(
-        matches!(error.0.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == bytes && *available_bytes == bytes - 1)
+        matches!(error.0.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == bytes && limit_bytes.checked_sub(*existing_bytes).unwrap() == bytes - 1)
     );
     assert!(error.0.rejected_plan().is_some());
     assert!(error.0.constructor_failure().is_none());
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.fixture_host_charge().unwrap(), 0);
     drop(error);
 
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let exact = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let mut slot = ColdMaterializationSlot::prepare(&exact, shape).unwrap();
     assert!(matches!(
         slot.take(&short),
@@ -51,11 +51,13 @@ fn cold_slot_comparison_checkout_and_custody_precede_any_request() {
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop(slot);
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
     drop(ready);
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
-    crate::backend::submission_recovery::wait_for_retirement(|| exact.used_bytes() == Ok(0));
-    assert_eq!(exact.used_bytes().unwrap(), 0);
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        exact.fixture_host_charge() == Ok(0)
+    });
+    assert_eq!(exact.fixture_host_charge().unwrap(), 0);
     assert!(matches!(
         ColdMaterializationSlot::required_bytes(shape_with_overflow()),
         Err(WorkingMemoryError::Overflow)
@@ -172,7 +174,7 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
         PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32).unwrap();
     let input_bytes = input_plan.required_bytes().unwrap();
     let slot_bytes = ColdMaterializationSlot::required_bytes(shape(1)).unwrap();
-    let pool_cell = std::cell::OnceCell::<WorkingMemoryPool>::new();
+    let pool_cell = std::cell::OnceCell::<MemoryLedger>::new();
     let role_bytes = std::cell::Cell::new(0);
     let target = BoundedQuantizationTarget::direct("weight", "scales", Some("biases"))
         .unwrap()
@@ -198,7 +200,7 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
             .unwrap();
         drop(input);
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             role_bytes.get() + input_bytes + slot_bytes
         );
         assert_eq!(owner.inputs().as_ptr(), pointer);
@@ -214,7 +216,7 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
     });
     role_bytes.set(plan.required_bytes().unwrap());
     pool_cell
-        .set(WorkingMemoryPool::new(role_bytes.get() + input_bytes + slot_bytes, 0).unwrap())
+        .set(crate::memory_fixture::ledger(role_bytes.get() + input_bytes + slot_bytes, 0).unwrap())
         .unwrap();
     let pool = pool_cell.get().unwrap();
     let submission = plan.submit(pool).unwrap();
@@ -246,15 +248,15 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
     // Completed outputs escape the role constructor. Their native owners and
     // input aliases still retain both source accounts and the physical budget.
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         role_bytes.get() + input_bytes + slot_bytes
     );
     owner.finish().unwrap();
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes() == Ok(0)
+        pool.fixture_host_charge() == Ok(0)
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -264,7 +266,7 @@ fn cold_slot_refuses_input_capacity_before_a_source_is_created() {
     let _runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
     let runtime = PreparedInputRuntime::prepare().unwrap();
     let bytes = ColdMaterializationSlot::required_bytes(shape(0)).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let mut slot = ColdMaterializationSlot::prepare(&pool, shape(0)).unwrap();
     with_scope(layout, &runtime, |observer| {
         let ready = slot.take(&pool).unwrap();
@@ -279,9 +281,15 @@ fn cold_slot_refuses_input_capacity_before_a_source_is_created() {
             })
         ));
         assert!(owner.inputs().is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
         owner.finish().unwrap();
     });
-    crate::backend::submission_recovery::wait_for_retirement(|| pool.used_bytes() == Ok(0));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        pool.fixture_host_charge() == Ok(0)
+    });
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

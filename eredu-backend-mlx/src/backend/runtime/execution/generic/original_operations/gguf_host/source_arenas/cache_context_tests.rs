@@ -8,13 +8,13 @@ use eredu_core::residency::{
     MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy,
 };
 use eredu_runtime::residency::{OffloadUnit, WeightBinding};
-use eredu_runtime::working_memory::{WorkingMemoryPool, WorkingMemoryReservation};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryReservation};
 
 fn manager(
     source: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
     stream: &safemlx::Stream,
     cache: Option<CacheHandle>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> ResidencyManager {
     let source = source.into();
     let id = OffloadUnitId::new("cache.window").unwrap();
@@ -68,7 +68,7 @@ fn source_plan(
     SourceArenaPlan::prepare(manager, selected.windows(), &ids, population, runtime).unwrap()
 }
 // Zero-work reservations are used only to compare actual pool identities.
-fn reservation(pool: &WorkingMemoryPool) -> WorkingMemoryReservation {
+fn reservation_admission() -> eredu_core::Admission {
     use eredu_core::{
         Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
         InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound,
@@ -90,31 +90,46 @@ fn reservation(pool: &WorkingMemoryPool) -> WorkingMemoryReservation {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry: InferenceGeometry {
-            batch_size: 1,
-            input_positions: 1,
-            cached_positions: 0,
-            max_output_tokens: 0,
-            prefill_chunk_positions: 1,
-            output: OutputDemand::StateOnly,
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry: InferenceGeometry {
+                batch_size: 1,
+                input_positions: 1,
+                cached_positions: 0,
+                max_output_tokens: 0,
+                prefill_chunk_positions: 1,
+                output: OutputDemand::StateOnly,
+            },
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
         },
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    ))
     .unwrap();
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
+        requested_positions: 1,
+        state,
+        incremental_required_bytes: Some(0),
+    })
+}
+fn reservation_controls() -> u64 {
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    crate::memory_fixture::host_total(
+        &probe
+            .reservation_requirements(&reservation_admission(), None)
+            .unwrap(),
+    )
+}
+fn reservation(pool: &MemoryLedger) -> WorkingMemoryReservation {
     pool.reserve(
         &eredu_runtime::working_memory::InferenceExecutionIdentity::default(),
-        &Admission {
-            requested_positions: 1,
-            state,
-            incremental_required_bytes: 0,
-            available_memory_bytes: None,
-        },
+        &reservation_admission(),
     )
     .unwrap()
 }
@@ -139,8 +154,11 @@ fn selected_source_plan_retains_cache_origin_without_promoting_ordinary_facts() 
         .unwrap()
         .checked_add(all_stream_bytes)
         .unwrap();
-    let pool = WorkingMemoryPool::new(total, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(total.checked_add(reservation_controls()).unwrap(), 0)
+        .unwrap();
+    let foreign =
+        crate::memory_fixture::ledger(bytes.checked_add(reservation_controls()).unwrap(), 0)
+            .unwrap();
     let cache = CacheHandle::prepare(&pool).unwrap();
     let selected = manager(source.clone(), &stream, Some(cache.clone()), &pool);
     let ordinary = manager(source.clone(), &stream, None, &pool);
@@ -150,7 +168,7 @@ fn selected_source_plan_retains_cache_origin_without_promoting_ordinary_facts() 
         Some(CacheHandle::prepare(&pool).unwrap()),
         &pool,
     );
-    assert_eq!(pool.used_bytes().unwrap(), total);
+    assert_eq!(pool.fixture_host_charge().unwrap(), total);
     let plan = source_plan(&selected, &runtime);
     let ordinary_plan = source_plan(&ordinary, &runtime);
     assert_eq!(plan.facts(), ordinary_plan.facts());
@@ -186,9 +204,9 @@ fn selected_source_plan_retains_cache_origin_without_promoting_ordinary_facts() 
     // Reclaim outside every manager/cache loan before isolating the plan's
     // surviving cache ownership. Ordinary Stream drops may already drain it.
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     drop(plan);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -237,7 +255,7 @@ fn selected_source_plan_retains_actual_catalog_origin_through_manager_erasure() 
     let resolution = resolve_gguf_plan(&checkpoint, &schema).unwrap();
     let mapping = checkpoint.translated_outputs(str::to_owned).unwrap();
     let input = GgufCatalogPlan::new(checkpoint, &resolution, &mapping, 1);
-    let required = WorkingMemoryPool::gguf_catalog_required_bytes(&input);
+    let required = MemoryLedger::gguf_catalog_required_bytes(&input);
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG").is_some() {
         assert!(required.is_ok(), "{required:?}");
     }
@@ -254,8 +272,11 @@ fn selected_source_plan_retains_actual_catalog_origin_through_manager_erasure() 
     let retained_bytes = catalog_bytes.checked_add(cache_bytes).unwrap();
     let stream_bytes = PreparedMaterializationStreams::required_bytes(&stream, &stream).unwrap();
     let total = retained_bytes.checked_add(stream_bytes).unwrap();
-    let pool = WorkingMemoryPool::new(total, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(total, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(total.checked_add(reservation_controls()).unwrap(), 0)
+        .unwrap();
+    let foreign =
+        crate::memory_fixture::ledger(total.checked_add(reservation_controls()).unwrap(), 0)
+            .unwrap();
     let source = pool
         .compile_gguf_catalog(input)
         .unwrap()
@@ -284,12 +305,12 @@ fn selected_source_plan_retains_actual_catalog_origin_through_manager_erasure() 
         ordinary_plan.validate_catalog_origins(&local),
         Err(Error::PrefillControl(WorkingMemoryError::UnknownBound))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), total);
+    assert_eq!(pool.fixture_host_charge().unwrap(), total);
     drop((source, selected, ordinary, ordinary_plan, local, other));
     safemlx::reclaim_allocation_owners(); // no manager/cache loan remains
-    assert_eq!(pool.used_bytes().unwrap(), retained_bytes); // exact catalog + cache
+    assert_eq!(pool.fixture_host_charge().unwrap(), retained_bytes); // exact catalog + cache
     drop(plan);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -339,7 +360,7 @@ fn retained_reader_root_reaches_manager_registration_and_last_opaque_identity() 
     let mapping = checkpoint.translated_outputs(str::to_owned).unwrap();
     let input = || GgufCatalogPlan::new(checkpoint.clone(), &resolution, &mapping, 1);
     let ordinary_catalog = input().compile(()).unwrap();
-    let required = WorkingMemoryPool::gguf_source_required_bytes(&ordinary_catalog);
+    let required = MemoryLedger::gguf_source_required_bytes(&ordinary_catalog);
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE").is_some() {
         assert!(required.is_ok(), "{required:?}");
     }
@@ -348,7 +369,7 @@ fn retained_reader_root_reaches_manager_registration_and_last_opaque_identity() 
         Err(WorkingMemoryError::UnknownBound) => return,
         Err(error) => panic!("unexpected source qualification: {error}"),
     };
-    let catalog_bytes = WorkingMemoryPool::gguf_catalog_required_bytes(&input()).unwrap();
+    let catalog_bytes = MemoryLedger::gguf_catalog_required_bytes(&input()).unwrap();
     // Physical inventory does not depend on the custody type. Its authentic
     // prepaid origin is still issued only by compile_gguf_source below.
     let (physical, prepaid) = ordinary_catalog
@@ -358,14 +379,32 @@ fn retained_reader_root_reaches_manager_registration_and_last_opaque_identity() 
     drop(ordinary_catalog);
     assert!(prepaid > 0 && physical >= prepaid);
     let residual = physical - prepaid;
-    let erasure_bytes = WorkingMemoryPool::gguf_source_erasure_required_bytes().unwrap();
+    let erasure_bytes = MemoryLedger::gguf_source_erasure_required_bytes().unwrap();
     let constructor = catalog_bytes
         .checked_add(source_bytes)
         .unwrap()
         .checked_add(erasure_bytes)
         .unwrap();
-    let pool = WorkingMemoryPool::new(constructor.checked_add(residual).unwrap(), 0).unwrap();
-    let foreign = WorkingMemoryPool::new(physical, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(
+        constructor
+            .checked_add(residual)
+            .unwrap()
+            .checked_add(
+                crate::memory_fixture::publication_control_bytes(1)
+                    .checked_mul(2)
+                    .unwrap(),
+            )
+            .unwrap(),
+        0,
+    )
+    .unwrap();
+    let foreign = crate::memory_fixture::ledger(
+        physical
+            .checked_add(crate::memory_fixture::publication_control_bytes(1))
+            .unwrap(),
+        0,
+    )
+    .unwrap();
     let source = pool
         .compile_gguf_source(pool.compile_gguf_catalog(input()).unwrap().into_prepared())
         .unwrap();
@@ -376,7 +415,7 @@ fn retained_reader_root_reaches_manager_registration_and_last_opaque_identity() 
         foreign.validate_retained_source_controls(&source),
         Err(WorkingMemoryError::IdentityMismatch)
     );
-    assert_eq!(pool.used_bytes().unwrap(), constructor);
+    assert_eq!(pool.fixture_host_charge().unwrap(), constructor);
 
     // The existing native fixture owns unrelated runtime/stream setup. This
     // component's ordinary manager adds no admitted cache/stream allocation.
@@ -401,31 +440,38 @@ fn retained_reader_root_reaches_manager_registration_and_last_opaque_identity() 
         .unwrap()
         .register(&foreign)
         .unwrap();
-    assert_eq!(first.bytes(), physical);
-    assert_eq!(second.bytes(), physical);
-    assert_eq!(foreign_owner.bytes(), physical);
-    assert_eq!(pool.used_bytes().unwrap(), constructor + residual);
-    assert_eq!(foreign.used_bytes().unwrap(), physical);
+    assert_eq!(first.bytes(), Some(physical));
+    assert_eq!(second.bytes(), Some(physical));
+    assert_eq!(foreign_owner.bytes(), Some(physical));
+    assert_eq!(pool.fixture_host_charge().unwrap(), constructor + residual);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), physical);
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
 
     drop((selected, source));
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(pool.used_bytes().unwrap(), constructor + residual);
+    assert_eq!(pool.fixture_host_charge().unwrap(), constructor + residual);
     drop(first);
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(pool.used_bytes().unwrap(), constructor + residual);
+    assert_eq!(pool.fixture_host_charge().unwrap(), constructor + residual);
     drop(second);
     crate::backend::ordinary_retirement::reclaim_all();
     // B still owns the same source, but A's canonical registration retired.
-    assert_eq!(pool.used_bytes().unwrap(), constructor);
-    assert_eq!(foreign.used_bytes().unwrap(), physical);
+    assert_eq!(pool.fixture_host_charge().unwrap(), constructor);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), physical);
     drop(foreign_owner);
-    assert_eq!(foreign.used_bytes().unwrap(), physical); // queued host retirement
+    assert_eq!(foreign.fixture_host_charge().unwrap(), physical); // queued host retirement
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes + erasure_bytes);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), 0);
+    assert_eq!(
+        pool.fixture_host_charge().unwrap(),
+        source_bytes + erasure_bytes
+    );
     drop(key);
-    assert_eq!(pool.used_bytes().unwrap(), erasure_bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), erasure_bytes);
     drop(root_identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

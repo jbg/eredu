@@ -1,5 +1,5 @@
 use super::*;
-use eredu_runtime::{GenerationSampler, working_memory::WorkingMemoryPool};
+use eredu_runtime::{working_memory::MemoryLedger, GenerationSampler};
 
 type Sampling = MlxSpeculativeSampling<GenerationSampler>;
 
@@ -15,10 +15,21 @@ fn key_words(state: &MlxSpeculativeRandomState) -> Vec<u32> {
         .to_vec()
 }
 
+fn reserved_ledger() -> MemoryLedger {
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let controls = crate::memory_fixture::host_total(
+        &probe
+            .reservation_requirements(&zero_admission(), None)
+            .unwrap(),
+    );
+    crate::memory_fixture::ledger(controls, 0).unwrap()
+}
+
 fn zero_admission() -> eredu_core::Admission {
     use eredu_core::{
-        EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry, InputTokenCount,
-        LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound, cache::LayerCachePolicy,
+        cache::LayerCachePolicy, EstimationCompleteness, ExecutionWorkspaceEstimate,
+        InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout,
+        WorkspaceBound,
     };
     let geometry = InferenceGeometry {
         batch_size: 1,
@@ -45,22 +56,26 @@ fn zero_admission() -> eredu_core::Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    eredu_core::Admission {
+    crate::memory_fixture::admission(eredu_core::Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
 fn assert_reserved(error: &Exception) {
@@ -80,7 +95,7 @@ fn assert_reserved(error: &Exception) {
 #[test]
 fn control_seed_clones_retain_an_independent_preparation_owner() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let context = SpeculativeExecutionStreams::single(&stream).with_memory_owner(&owner);
     let seed = Sampling::control_seed(73, context).unwrap();
@@ -100,7 +115,7 @@ fn control_seed_clones_retain_an_independent_preparation_owner() {
 #[test]
 fn target_draft_and_position_clones_keep_ownership_and_randomness_after_root_drop() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let context = SpeculativeExecutionStreams::single(&stream).with_memory_owner(&owner);
     let seed = Sampling::control_seed(91, context).unwrap();
@@ -153,8 +168,8 @@ fn target_draft_and_position_clones_keep_ownership_and_randomness_after_root_dro
 #[test]
 fn raw_seed_is_bound_before_derivation_and_preserves_its_existing_allocation() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     let value = random::key(109).unwrap();
     let identity = value.allocation_info().unwrap().unwrap();
     let seed = Sampling::seed_from_array(value);
@@ -177,20 +192,18 @@ fn raw_seed_is_bound_before_derivation_and_preserves_its_existing_allocation() {
 #[test]
 fn failed_key_derivation_preserves_source_ownership_and_retires_after_error() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let context = SpeculativeExecutionStreams::single(&stream).with_memory_owner(&owner);
     let seed = Sampling::control_seed(113, context).unwrap();
     let mut root = Sampling::randomness_root(Some(seed), context).unwrap();
     let draft = Sampling::draft_randomness_from_root(&mut root, context).unwrap();
-    assert!(
-        Sampling::draft_randomness_at(
-            &draft,
-            SpeculativeDraftRandomPosition::new(usize::MAX),
-            context,
-        )
-        .is_err()
-    );
+    assert!(Sampling::draft_randomness_at(
+        &draft,
+        SpeculativeDraftRandomPosition::new(usize::MAX),
+        context,
+    )
+    .is_err());
     // The failure did not consume or mutate the reusable position root.
     let next =
         Sampling::draft_randomness_at(&draft, SpeculativeDraftRandomPosition::new(1), context)
@@ -209,11 +222,11 @@ fn failed_key_derivation_preserves_source_ownership_and_retires_after_error() {
 fn entering_another_domain_checks_reservation_before_mutating_source_randomness() {
     use eredu_runtime::working_memory::InferenceExecutionIdentity;
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool_a = WorkingMemoryPool::new(4096, 0).unwrap();
-    let pool_b = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool_a = crate::memory_fixture::ledger(4096, 0).unwrap();
+    let pool_b = reserved_ledger();
     let owner_a = NativeMemoryOwner::acquire(&pool_a).unwrap();
     let context_a = SpeculativeExecutionStreams::single(&stream).with_memory_owner(&owner_a);
-    let context_b = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool_b);
+    let context_b = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool_b);
     let seed = Sampling::seed_from_array(random::key(127).unwrap()).with_memory_owner(&owner_a);
     let mut root = Sampling::randomness_root(Some(seed), context_a).unwrap();
     let draft = Sampling::draft_randomness_from_root(&mut root, context_a).unwrap();
@@ -288,12 +301,12 @@ fn entering_another_domain_checks_reservation_before_mutating_source_randomness(
 #[test]
 fn sampling_merges_sampler_domain_before_acquiring_another_lease() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool_a = WorkingMemoryPool::new(4096, 0).unwrap();
-    let pool_b = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool_a = crate::memory_fixture::ledger(4096, 0).unwrap();
+    let pool_b = reserved_ledger();
     let owner_a = NativeMemoryOwner::acquire(&pool_a).unwrap();
     let owner_b = NativeMemoryOwner::acquire(&pool_b).unwrap();
     let context_a = SpeculativeExecutionStreams::single(&stream).with_memory_owner(&owner_a);
-    let context_b = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool_b);
+    let context_b = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool_b);
     let seed = Sampling::seed_from_array(random::key(131).unwrap()).with_memory_owner(&owner_a);
     let mut root = Sampling::randomness_root(Some(seed), context_a).unwrap();
     let sampler = Sampling::new(GenerationSampler::new()).with_memory_owner(&owner_b);

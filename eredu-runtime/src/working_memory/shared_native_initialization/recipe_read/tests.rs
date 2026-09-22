@@ -7,7 +7,7 @@ use eredu_checkpoint::{
 #[test]
 fn compiled_read_outlives_inputs_and_refuses_foreign_pool_without_leaking() {
     let probe = eredu_checkpoint::recipe::EncodedRecipeMappingPlan::source(0..1).unwrap();
-    let qualification = WorkingMemoryPool::shared_native_initialization_required_bytes(&probe);
+    let qualification = MemoryLedger::shared_native_initialization_required_bytes(&probe);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(qualification.is_ok(), "{qualification:?}");
     }
@@ -33,8 +33,8 @@ fn compiled_read_outlives_inputs_and_refuses_foreign_pool_without_leaking() {
                 indices: vec![5, 0, 5],
             },
         };
-        let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-        let other = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1 << 20, 0).unwrap();
+        let other = crate::working_memory::memory_fixture::host_ledger(1 << 20, 0).unwrap();
         let keys = pool
             .initialize_shared_native(EncodedRecipeKeysPlan::new(&recipe).unwrap().unwrap())
             .unwrap();
@@ -52,18 +52,18 @@ fn compiled_read_outlives_inputs_and_refuses_foreign_pool_without_leaking() {
                     WorkingMemoryError::IdentityMismatch
                 ))
             ));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         } else {
             let read = result.unwrap().unwrap();
             assert_eq!(read.output().shape(), [2, 3]);
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.payload_used_bytes().unwrap() > 0);
             let mut bytes = [0; 6];
             EncodedRecipeRead::read_many_borrowed_into(std::iter::once(&read), &mut [&mut bytes])
                 .unwrap();
             assert_eq!(bytes, [3, 1, 3, 6, 4, 6]);
             drop(read);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
-        assert_eq!(other.used_bytes().unwrap(), 0);
+        assert_eq!(other.payload_used_bytes().unwrap(), 0);
     }
 }

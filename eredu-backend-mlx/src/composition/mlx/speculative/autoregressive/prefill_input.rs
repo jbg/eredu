@@ -37,20 +37,31 @@ impl PreparedPrefillInput {
     /// The actual retained ingress can lend an earlier span's backing to a
     /// later decoder state. Keep its completed account facts with that state.
     pub(crate) fn visit_retained_media_roots(
-        &self, visitor: &mut dyn FnMut(&Array), funding: &HostMetadataFunding,
+        &self,
+        visitor: &mut dyn FnMut(&Array),
+        funding: &HostMetadataFunding,
     ) -> Result<(), Error> {
         use crate::composition::mlx::replicated_text::OriginalAutoregressiveMediaPrefill;
-        funding.reserve_metadata(size_of::<(
-            &Self, &mut dyn FnMut(&Array), &HostMetadataFunding,
-            std::cell::Ref<'_, Option<OriginalAutoregressiveMediaPrefill>>,
-            &OriginalAutoregressiveMediaPrefill, &dyn std::any::Any,
-            &mut dyn FnMut(&Array), &crate::MlxTensor,
-            Result<(), Error>,
-        )>()).map_err(Error::WorkspacePlanning)?;
+        funding
+            .reserve_metadata(size_of::<(
+                &Self,
+                &mut dyn FnMut(&Array),
+                &HostMetadataFunding,
+                std::cell::Ref<'_, Option<OriginalAutoregressiveMediaPrefill>>,
+                &OriginalAutoregressiveMediaPrefill,
+                &dyn std::any::Any,
+                &mut dyn FnMut(&Array),
+                &crate::MlxTensor,
+                Result<(), Error>,
+            )>())
+            .map_err(Error::WorkspacePlanning)?;
         if let Body::Media { source, .. } = &self.body {
-            let source = source.try_borrow()
+            let source = source
+                .try_borrow()
                 .map_err(|_| Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-            source.as_ref().ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            source
+                .as_ref()
+                .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
                 .visit_retained_roots(visitor);
         }
         Ok(())
@@ -110,6 +121,7 @@ impl PreparedPrefillInput {
         state: &mut MlxAutoregressiveState,
         span: &eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
         completion:&mut dyn crate::composition::mlx::replicated_text::AutoregressiveSequenceCompletion,
+        observer: &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
     ) -> Result<Option<Array>, Error> {
         let Body::Media { source, .. } = &self.body else {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
@@ -127,6 +139,7 @@ impl PreparedPrefillInput {
                 span,
                 &state.stream,
                 completion,
+                observer,
             )
     }
 
@@ -142,14 +155,15 @@ impl PreparedPrefillInput {
         initialized: &PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         funding: &HostMetadataFunding,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, Error> {
         let controls = [
             crate::backend::array_copy::OriginalPreparedArrayCopySource::control_bytes()
                 .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?,
             size_of::<Self>(),
             size_of::<eredu_architectures::media_plan::BoundPreparedMediaSemantics>(),
-            size_of::<Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error>>(),
+            size_of::<Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error>>(
+            ),
             size_of::<Option<crate::backend::array_copy::OriginalPreparedArrayCopySource<'_>>>(),
             size_of::<
                 Result<
@@ -244,10 +258,10 @@ impl PreparedPrefillInput {
                 initialized,
                 mechanisms,
                 funding,
-                capacity,
+                &capacity,
             )?,
             None => {
-                plan.copy_registered(environment, initialized, mechanisms, funding, capacity)?
+                plan.copy_registered(environment, initialized, mechanisms, funding, &capacity)?
             }
         };
         Ok(Self {

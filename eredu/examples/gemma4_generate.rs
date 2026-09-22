@@ -1,16 +1,19 @@
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use std::path::PathBuf;
 
-use anyhow::{Context, ensure};
+use anyhow::{ensure, Context};
 
 use eredu::{
     api::{
-        ChatSourceInput, LoadedModel, PreparedChatGenerationSettings, PreparedChatOutputMode,
-        PreparedChatRequest, TokenizerSourceInput, default_local_device, local_device_plan,
+        default_local_device, local_device_plan, ChatSourceInput, LoadedModel,
+        PreparedChatGenerationSettings, PreparedChatOutputMode, PreparedChatRequest,
+        TokenizerSourceInput,
     },
     runtime::chat::ChatTemplateRequest,
 };
 use eredu_architectures::ModelKind;
-use eredu_backend_mlx::{MlxBackendFactory, backend::MlxBackend};
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{
     ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides, TextInferencePolicy,
 };
@@ -21,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         .first()
         .map(PathBuf::from)
         .or_else(default_e4b_snapshot)
-        .expect("usage: cargo run -p eredu --example gemma4_generate -- <model-dir> [prompt] [temperature] [capacity-bytes]");
+        .expect("usage: cargo run -p eredu --example gemma4_generate -- <model-dir> [prompt] [temperature] [domain=bytes|unlimited]");
     let prompt = args
         .get(1)
         .cloned()
@@ -31,13 +34,9 @@ fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(0.0);
 
-    // Explicit per-request framework storage ceiling; override for longer prompts.
-    let capacity = args
-        .get(3)
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .unwrap_or(1024 * 1024 * 1024);
-    ensure!(capacity > 0, "capacity must be positive");
+    // Physical-domain limits apply during loading, preparation and generation.
+    let capacity =
+        physical_memory::parse(args.get(3).map(String::as_str).unwrap_or("host=unlimited"))?;
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
@@ -63,14 +62,14 @@ fn main() -> anyhow::Result<()> {
                 add_generation_prompt: true,
                 ..ChatTemplateRequest::default()
             },
-            capacity,
+            &capacity,
             &cancellation,
         )?
         .context("cancelled before chat preparation")?;
     println!("\n=== prompt ===\n{}\n", prepared.rendered_prompt());
-    println!("temperature: {temp}; capacity bytes: {capacity}");
+    println!("temperature: {temp}; physical memory limits: {capacity:?}");
 
-    print_first_token_distribution(&mut model, &prepared, capacity, &cancellation)?;
+    print_first_token_distribution(&mut model, &prepared, &capacity, &cancellation)?;
     model.reset()?;
     let maximum = model
         .resolve_generation_config(GenerationConfigOverrides {
@@ -80,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         .max_new_tokens
         .unwrap_or(120)
         .min(120);
-    let mut request = PreparedChatRequest::new(&prepared, settings(temp, maximum, capacity));
+    let mut request = PreparedChatRequest::new(&prepared, settings(temp, maximum, &capacity));
     request.output_mode = PreparedChatOutputMode::Text;
     request.skip_special_tokens = false;
     let output = model
@@ -106,7 +105,11 @@ fn gemma4_message(prompt: &str, model_family: ModelKind) -> serde_json::Value {
     }
 }
 
-fn settings(temperature: f32, maximum: usize, capacity: u64) -> PreparedChatGenerationSettings {
+fn settings(
+    temperature: f32,
+    maximum: usize,
+    capacity: &eredu_core::MemoryLimitDeclarations,
+) -> PreparedChatGenerationSettings {
     PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             temperature: Some(temperature),
@@ -114,7 +117,7 @@ fn settings(temperature: f32, maximum: usize, capacity: u64) -> PreparedChatGene
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: capacity.clone(),
             ..Default::default()
         },
         seed: 0,
@@ -125,7 +128,7 @@ fn settings(temperature: f32, maximum: usize, capacity: u64) -> PreparedChatGene
 fn print_first_token_distribution(
     model: &mut LoadedModel<MlxBackend<'_>>,
     chat: &eredu::runtime::chat::PreparedChat,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimitDeclarations,
     cancellation: &GenerationCancellationToken,
 ) -> anyhow::Result<()> {
     let mut request = PreparedChatRequest::new(chat, settings(0.0, 1, capacity));

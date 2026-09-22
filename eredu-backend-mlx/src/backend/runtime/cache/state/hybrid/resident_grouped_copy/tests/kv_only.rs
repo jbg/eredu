@@ -2,9 +2,10 @@ use super::*;
 use crate::backend::{
     nn::workspace::MlxMetalWorkspaceMechanisms, runtime::cache::kv::KeyValueCache,
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{
-    AttentionPolicy, LayerSchedule,
     cache::{MutableStateResidency, StateTensorDimension, StateTensorDtype, StateTensorPolicy},
+    AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::workspace::WorkspaceTensor;
 use eredu_runtime::RuntimeLayerState;
@@ -68,16 +69,12 @@ fn actual_outer_geometry_and_empty_children_prepare_without_native_work() {
         .unwrap()
         .for_dense_destination::<MlxHybridLayerState>()
         .unwrap();
-    assert!(
-        saved
-            .source_metadata()
-            .same_storage(source.layers.metadata())
-    );
-    assert!(
-        dense
-            .source_metadata()
-            .same_storage(source.layers.metadata())
-    );
+    assert!(saved
+        .source_metadata()
+        .same_storage(source.layers.metadata()));
+    assert!(dense
+        .source_metadata()
+        .same_storage(source.layers.metadata()));
     assert!(std::ptr::eq(
         saved.source_at(0).unwrap(),
         &source.layers.slots()[0]
@@ -104,11 +101,20 @@ fn actual_outer_geometry_and_empty_children_prepare_without_native_work() {
         .sum();
     assert_eq!(children, 0, "empty children have no inline slot payload");
     let child_controls = eredu_runtime::working_memory::RegisteredDecoderHostCopy::<
-        Slot, StorageIdentity,
-    >::preparation_control_bytes(true).unwrap().checked_mul(plan.len()).unwrap();
-    assert!(child_controls > 0, "each empty child still constructs metadata controls");
-    assert!(plan.host_copy_preparation_bytes().unwrap() > child_controls,
-        "the parent preparation also includes its outer table and group controls");
+        Slot,
+        StorageIdentity,
+    >::preparation_control_bytes(true)
+    .unwrap()
+    .checked_mul(plan.len())
+    .unwrap();
+    assert!(
+        child_controls > 0,
+        "each empty child still constructs metadata controls"
+    );
+    assert!(
+        plan.host_copy_preparation_bytes().unwrap() > child_controls,
+        "the parent preparation also includes its outer table and group controls"
+    );
     assert_eq!(
         plan.host_copy_initialization_peak_bytes().unwrap(),
         saved.initialization_peak_bytes() + children
@@ -133,13 +139,11 @@ fn actual_outer_geometry_and_empty_children_prepare_without_native_work() {
     );
     assert_eq!(plan.global_layer_start(), 17);
     assert!(plan.shared_layout().same_storage(&source.layout));
-    assert!(
-        source
-            .layers
-            .slots()
-            .iter()
-            .all(|s| s.fixed.is_empty() && s.fixed.payload_bytes() == Some(0))
-    );
+    assert!(source
+        .layers
+        .slots()
+        .iter()
+        .all(|s| s.fixed.is_empty() && s.fixed.payload_bytes() == Some(0)));
     assert_eq!(HOUSEKEEPING.get(), 0);
 }
 
@@ -203,16 +207,16 @@ fn arrays(attention: Option<&MlxHybridAttentionState>) -> Vec<&Array> {
 }
 #[test]
 fn numerical_group_copies_aliases_and_funds_each_empty_child_table() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let source = populated(&stream);
     super::publish(&source, &loading);
     drop(loading);
-    super::settle(&pool, pool.used_bytes().unwrap());
+    super::settle(&pool, pool.fixture_host_charge().unwrap());
     let (sampler, preparation, run) = super::sampler(&pool);
     let plan = PreparedHybridGroupedCopy::prepare(&source).unwrap();
-    let (sampling, ordinary_host, ordinary_complete, required) =
+    let (sampling, ordinary_host, ordinary_complete, _required) =
         super::prepared(&plan, sampler.borrow_funded(), &pool);
     drop((ordinary_host, ordinary_complete));
     // Payload accounting is zero for an empty table. Its actual header and
@@ -226,7 +230,7 @@ fn numerical_group_copies_aliases_and_funds_each_empty_child_table() {
         .include_metadata(SharedHostMetadata::Layout(plan.shared_layout().clone()))
         .unwrap();
     let source_pin = inventory.source_pin_plan(&pool).unwrap();
-    let metadata_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let metadata_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let controls = [
         plan.host_copy_preparation_bytes().unwrap(),
         source_pin.requested_bytes(),
@@ -234,28 +238,43 @@ fn numerical_group_copies_aliases_and_funds_each_empty_child_table() {
         WorkingMemoryStorage::<StorageIdentity>::copy_source_wrapper_bytes(
             1,
             1 + plan.registered_source_tables().unwrap(),
-        ).unwrap(),
+        )
+        .unwrap(),
         HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
-    ].into_iter().try_fold(0usize, usize::checked_add)
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .unwrap();
+    let funding = metadata_pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(u64::MAX),
+        )
         .unwrap();
-    let funding = metadata_pool.prepare_workspace_metadata(
-        &InferenceExecutionIdentity::default(), u64::MAX).unwrap();
-    let account_controls = metadata_pool.used_bytes().unwrap();
+    let account_controls = metadata_pool.fixture_host_charge().unwrap();
     funding.reserve_metadata(controls).unwrap();
-    assert_eq!(metadata_pool.used_bytes().unwrap(), account_controls + controls as u64);
+    assert_eq!(
+        metadata_pool.fixture_host_charge().unwrap(),
+        account_controls + controls as u64
+    );
     let preparation_owner = HostPreparationAuthority::retain(funding.clone());
     // Destination metadata uses the complete source's preparation authority.
     // Funding only the table-binding plans leaves the ordinary destination
     // constructor selected, so retain the same accepted owner on the real
     // existing-only source inventory as the production snapshot worker does.
-    let complete = inventory.pin_registered_with_host(&pool, &preparation_owner).unwrap();
-    let host = plan.host_copy_with_preparation(&pool, Some(&preparation_owner)).unwrap();
+    let complete = inventory
+        .pin_registered_with_host(&pool, &preparation_owner)
+        .unwrap();
+    let host = plan
+        .host_copy_with_preparation(&pool, Some(&preparation_owner))
+        .unwrap();
     let (copied_sampler, slots, account) = host
-        .admit(
+        .admit_exact_fixture(
             &pool,
             sampling,
             complete,
-            WorkspaceCopyLimits::new(pool.used_bytes().unwrap().checked_add(required).unwrap()),
+            super::publication_roots(&plan),
+            false,
         )
         .unwrap();
     let (custody, scope) = account.into_parts();
@@ -270,7 +289,12 @@ fn numerical_group_copies_aliases_and_funds_each_empty_child_table() {
         assert_eq!(copied.fixed.len(), 0);
         assert_eq!(copied.fixed.retained_bytes(), 0);
         assert_eq!(copied.fixed.protected_bytes(), 0);
-        let metadata = copied.fixed.prepare_copy_slots().unwrap().source_metadata().clone();
+        let metadata = copied
+            .fixed
+            .prepare_copy_slots()
+            .unwrap()
+            .source_metadata()
+            .clone();
         assert_eq!(metadata.capacity_bytes(), Some(0));
         assert!(!metadata.same_storage(source.layers.slots()[index].fixed.metadata()));
         escaped_children.push(metadata);
@@ -311,13 +335,17 @@ fn numerical_group_copies_aliases_and_funds_each_empty_child_table() {
         inventory,
     ));
     super::settle(&pool, 0);
-    assert!(metadata_pool.used_bytes().unwrap() > 0,
-        "escaped empty-child headers retain their actual preparation account");
+    assert!(
+        metadata_pool.fixture_host_charge().unwrap() > 0,
+        "escaped empty-child headers retain their actual preparation account"
+    );
     drop(escaped_children.pop());
-    assert!(metadata_pool.used_bytes().unwrap() > 0,
-        "either independently constructed child keeps the common preparation alive");
+    assert!(
+        metadata_pool.fixture_host_charge().unwrap() > 0,
+        "either independently constructed child keeps the common preparation alive"
+    );
     drop(escaped_children);
-    assert_eq!(metadata_pool.used_bytes().unwrap(), 0);
+    assert_eq!(metadata_pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -365,15 +393,13 @@ fn copied_workspace_uses_independent_roots_and_preserves_full_sliding_controls()
         "every copied role has an independent bounded root"
     );
     assert!(copied.copy.state.as_ref().unwrap().retained_bytes.is_some());
-    assert!(
-        copied
-            .copy
-            .state
-            .as_ref()
-            .unwrap()
-            .transient_bytes
-            .is_some()
-    );
+    assert!(copied
+        .copy
+        .state
+        .as_ref()
+        .unwrap()
+        .transient_bytes
+        .is_some());
     assert_eq!(
         eredu_nn::AttentionCache::offset(&source.layers.slots()[1]),
         3
@@ -399,12 +425,10 @@ fn all_kv_paged_ordinary_and_fixed_copy_inspect_the_same_source_without_native_w
     let fixed = PreparedResidentDecoderCopy::hybrid_fixed(&source).unwrap();
     assert!(ordinary.is_paged());
     assert!(fixed.is_paged());
-    assert!(
-        ordinary
-            .shared_layout()
-            .unwrap()
-            .same_storage(&source.layout)
-    );
+    assert!(ordinary
+        .shared_layout()
+        .unwrap()
+        .same_storage(&source.layout));
     assert!(fixed.shared_layout().unwrap().same_storage(&source.layout));
     assert_eq!(ordinary.global_layer_start(), Some(17));
     assert_eq!(fixed.global_layer_start(), Some(17));

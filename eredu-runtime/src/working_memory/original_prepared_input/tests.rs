@@ -45,13 +45,13 @@ fn parts<R>(f: impl FnOnce(&[HostInputPart<'_>]) -> R) -> R {
 }
 fn required() -> u64 {
     parts(|p| {
-        WorkingMemoryPool::prepared_host_input_required_bytes(
+        MemoryLedger::prepared_host_input_required_bytes(
             &PreparedHostInputPlan::prepare(p).unwrap(),
         )
         .unwrap()
     })
 }
-fn source(pool: &WorkingMemoryPool) -> OriginalPreparedHostInput {
+fn source(pool: &MemoryLedger) -> OriginalPreparedHostInput {
     parts(|p| {
         pool.compile_prepared_host_input(PreparedHostInputPlan::prepare(p).unwrap())
             .unwrap()
@@ -79,7 +79,7 @@ fn values(source: &OriginalPreparedHostInput) {
 #[test]
 fn exact_source_charge_precedes_all_reserves_and_outlives_borrowed_values() {
     let bytes = required();
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     let error = parts(|p| {
         short.compile_prepared_host_input_with(
             PreparedHostInputPlan::prepare(p).unwrap(),
@@ -89,16 +89,16 @@ fn exact_source_charge_precedes_all_reserves_and_outlives_borrowed_values() {
     })
     .unwrap_err();
     assert!(
-        matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if *required_bytes==bytes && *available_bytes==bytes-1)
+        matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==bytes && (limit_bytes - existing_bytes)==bytes-1)
     );
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let output = parts(|p| {
         pool.compile_prepared_host_input_with(
             PreparedHostInputPlan::prepare(p).unwrap(),
             || {
-                assert_eq!(pool.used_bytes().unwrap(), bytes);
+                assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
                 assert!(matches!(
                     pool.acquire_unquoted(),
                     Err(WorkingMemoryError::ReservedWorkActive)
@@ -110,17 +110,17 @@ fn exact_source_charge_precedes_all_reserves_and_outlives_borrowed_values() {
     .unwrap();
     values(&output);
     assert_eq!(output.slot_count(), 3);
-    drop(pool.acquire_unquoted().unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(output);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn every_failed_destination_retains_actual_prefix_through_closed_error_retirement() {
     let bytes = required();
     let mut previous = 0;
     for at in 0..8 {
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
         let error = parts(|p| {
             pool.compile_prepared_host_input_with(
                 PreparedHostInputPlan::prepare(p).unwrap(),
@@ -137,7 +137,7 @@ fn every_failed_destination_retains_actual_prefix_through_closed_error_retiremen
             assert!(heap > previous);
         }
         previous = heap;
-        drop(pool.acquire_unquoted().unwrap());
+        crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
         let error = BackendFailure::from_error(error);
         let concrete = error
             .source()
@@ -145,27 +145,27 @@ fn every_failed_destination_retains_actual_prefix_through_closed_error_retiremen
             .downcast_ref::<OriginalPreparedHostInputError>()
             .unwrap();
         assert_eq!(concrete.failed_prefix_bytes(), heap);
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn equal_content_is_not_source_authority_and_all_aliases_retire_the_same_charge() {
     let bytes = required();
-    let pool = WorkingMemoryPool::new(bytes * 2, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes * 2, 0).unwrap();
     let first = source(&pool);
     let second = source(&pool);
     assert_eq!(first.content_digest(), second.content_digest());
     assert!(!first.same_source(&second));
     let aliases = (0..8).map(|_| first.clone()).collect::<Vec<_>>();
     assert!(aliases.iter().all(|v| v.same_source(&first)));
-    let foreign = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     assert!(matches!(
         first.validate_pool(&foreign),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     drop(first);
     std::thread::scope(|scope| {
         for alias in aliases {
@@ -175,15 +175,15 @@ fn equal_content_is_not_source_authority_and_all_aliases_retire_the_same_charge(
             });
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     values(&second);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn unquoted_predecessor_and_unwind_preserve_real_exclusion_without_adoption() {
     let bytes = required();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let prior = pool.acquire_unquoted().unwrap();
     let error = parts(|p| {
         pool.compile_prepared_host_input_with(
@@ -208,11 +208,11 @@ fn unquoted_predecessor_and_unwind_preserve_real_exclusion_without_adoption() {
             ))))
         .is_err()
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let value = source(&pool);
     values(&value);
     drop(value);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn malformed_shapes_overflow_and_metadata_are_rejected_without_owned_preflight() {
@@ -237,14 +237,13 @@ fn malformed_shapes_overflow_and_metadata_are_rejected_without_owned_preflight()
             Err(HostInputPlanError::Structure { part: 1 })
         ));
         input[1] = parts[1];
-
     });
 }
 #[test]
 fn poisoned_settlement_retains_completed_or_partial_sources_without_false_refund() {
     for partial in [false, true] {
         let bytes = required();
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
         let error = parts(|p| {
             pool.compile_prepared_host_input_with(
                 PreparedHostInputPlan::prepare(p).unwrap(),
@@ -279,7 +278,7 @@ fn poisoned_settlement_retains_completed_or_partial_sources_without_false_refund
 #[test]
 fn concurrent_real_compilers_hold_independent_original_capacity_until_terminal_source_drop() {
     let bytes = required();
-    let pool = WorkingMemoryPool::new(bytes * 2, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes * 2, 0).unwrap();
     let (first, second, held, arrivals) = std::thread::scope(|scope| {
         let (notify, notified) = std::sync::mpsc::channel();
         let (release_a, resume_a) = std::sync::mpsc::channel::<()>();
@@ -309,7 +308,7 @@ fn concurrent_real_compilers_hold_independent_original_capacity_until_terminal_s
         let a = scope.spawn(move || make(other, resume_a));
         let b = scope.spawn(move || make(notify, resume_b));
         let arrivals = [notified.recv(), notified.recv()];
-        let held = (pool.used_bytes(), pool.acquire_unquoted().err());
+        let held = (pool.payload_used_bytes(), pool.acquire_unquoted().err());
         drop(release_a);
         drop(release_b);
         (a.join(), b.join(), held, arrivals)
@@ -326,9 +325,9 @@ fn concurrent_real_compilers_hold_independent_original_capacity_until_terminal_s
     values(&first);
     values(&second);
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parts(|p| pool
             .compile_prepared_host_input_with(
@@ -342,7 +341,7 @@ fn concurrent_real_compilers_hold_independent_original_capacity_until_terminal_s
             ))))
         .is_err()
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn metadata_key_order_is_canonical_but_actual_value_changes_and_source_identity_remain_distinct() {
@@ -375,7 +374,7 @@ fn metadata_key_order_is_canonical_but_actual_value_changes_and_source_identity_
         right[1].metadata = &b;
         let mut changed = base.to_vec();
         changed[1].metadata = &c;
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
         let first = pool
             .compile_prepared_host_input(PreparedHostInputPlan::prepare(&left).unwrap())
             .unwrap();
@@ -407,35 +406,46 @@ fn metadata_key_order_is_canonical_but_actual_value_changes_and_source_identity_
 
 #[test]
 fn boolean_audio_mask_source_copies_values_and_retains_exact_original_charge() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let source = {
         let frames = [0.25_f32, -0.5, 0.75, 1.0, -1.25];
         let flags = [true, true, false, true, false];
-        let metadata = [(InputMetadataKey::AudioMask, HostTensorView {
-            shape: &[1, 5], values: HostTensorValues::Bool(&flags),
-        })];
-        let parts = [HostInputPart { modality: InputModality::Audio,
+        let metadata = [(
+            InputMetadataKey::AudioMask,
+            HostTensorView {
+                shape: &[1, 5],
+                values: HostTensorValues::Bool(&flags),
+            },
+        )];
+        let parts = [HostInputPart {
+            modality: InputModality::Audio,
             kind: InputPayloadKind::Tensor,
-            payload: HostTensorView { shape: &[1, 5, 1], values: HostTensorValues::F32(&frames) },
-            metadata: &metadata, extents: &[InputExtent::AudioValidFrames(3)],
+            payload: HostTensorView {
+                shape: &[1, 5, 1],
+                values: HostTensorValues::F32(&frames),
+            },
+            metadata: &metadata,
+            extents: &[InputExtent::AudioValidFrames(3)],
         }];
         let plan = PreparedHostInputPlan::prepare(&parts).unwrap();
-        let required = WorkingMemoryPool::prepared_host_input_required_bytes(&plan).unwrap();
+        let required = MemoryLedger::prepared_host_input_required_bytes(&plan).unwrap();
         let source = pool.compile_prepared_host_input(plan).unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), required);
+        assert_eq!(pool.payload_used_bytes().unwrap(), required);
         source
     };
-    let retained = pool.used_bytes().unwrap();
+    let retained = pool.payload_used_bytes().unwrap();
     let alias = source.clone();
     assert!(source.same_source(&alias));
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), retained);
+    assert_eq!(pool.payload_used_bytes().unwrap(), retained);
     assert_eq!(alias.slot_count(), 2);
     let part = alias.parts().next().unwrap();
     let (key, mask) = part.metadata().next().unwrap();
     assert_eq!(key, InputMetadataKey::AudioMask);
-    assert_eq!(mask.shape, &[1,5]);
-    assert!(matches!(mask.values, HostTensorValues::Bool(values) if values == [true,true,false,true,false]));
+    assert_eq!(mask.shape, &[1, 5]);
+    assert!(
+        matches!(mask.values, HostTensorValues::Bool(values) if values == [true,true,false,true,false])
+    );
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

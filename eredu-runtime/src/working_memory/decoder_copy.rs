@@ -1,11 +1,11 @@
 //! Closed inline decoder slots joined to sampler and numerical copy custody.
 
 use super::{
+    AdmittedWorkspaceCopy, FundedSamplerCopy, InferenceExecutionIdentity, MemoryLedger,
+    RegisteredSamplingCopy, SamplingCopyAdmissionError, WorkingMemoryError, WorkingMemoryStorage,
+    WorkspaceCopyLimits,
     funding::{DecoderCopySource, WorkingMemoryDecoderHostScope},
     residual::RegisteredStoragePin,
-    AdmittedWorkspaceCopy, FundedSamplerCopy, InferenceExecutionIdentity, RegisteredSamplingCopy,
-    SamplingCopyAdmissionError, WorkingMemoryError, WorkingMemoryPool, WorkingMemoryStorage,
-    WorkspaceCopyLimits,
 };
 use crate::{
     HostMetadataIdentity, HostMetadataKey, HostSlotFinishError, HostSlotInitialization,
@@ -60,7 +60,7 @@ impl<'a, T, K: HostSlotStorageKey> RegisteredDecoderHostCopy<'a, T, K> {
     /// The provider's key projection must name this exact table, not another
     /// same-sized owner. Callers retain settled source access through copying.
     pub fn bind(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         plan: HostSlotInitialization<'a, T>,
         key: K,
     ) -> Result<Self, DecoderCopyAdmissionError> {
@@ -71,7 +71,8 @@ impl<'a, T, K: HostSlotStorageKey> RegisteredDecoderHostCopy<'a, T, K> {
             .source_metadata()
             .capacity_bytes()
             .ok_or(WorkingMemoryError::UnknownBound)?;
-        let source = pool.pin_registered_storage([(key, capacity)])?;
+        let prepared = super::StoragePublicationLayout::new(1)?.fund(pool)?;
+        let source = prepared.pin_registered_storage([(key, capacity)])?;
         Ok(Self {
             plan,
             source: DecoderSource::Registered(source),
@@ -129,7 +130,7 @@ pub struct RegisteredTextComponentsCopy<'a, T, K: Ord + Send + 'static> {
     sampling: RegisteredSamplingCopy<'a, K>,
     decoder: RegisteredDecoderHostCopy<'a, T, K>,
     complete_source: WorkingMemoryStorage<K>,
-    bytes: u64,
+    bytes: Option<u64>,
 }
 
 impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
@@ -143,8 +144,7 @@ impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
     ) -> Result<RegisteredTextComponentsCopy<'a, T, K>, DecoderCopyAdmissionError> {
         let bytes = self
             .required_bytes()
-            .checked_add(decoder.initialization_peak_bytes())
-            .ok_or(WorkingMemoryError::Overflow)?;
+            .and_then(|bytes| bytes.checked_add(decoder.initialization_peak_bytes()));
         Ok(RegisteredTextComponentsCopy {
             sampling: self,
             decoder,
@@ -156,7 +156,7 @@ impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
 
 impl<T, K: Ord + Send + 'static> RegisteredTextComponentsCopy<'_, T, K> {
     /// Combined host holds plus numerical demand, before a safety reserve.
-    pub fn required_bytes(&self) -> u64 {
+    pub fn required_bytes(&self) -> Option<u64> {
         self.bytes
     }
 }
@@ -184,16 +184,6 @@ pub enum DecoderCopyAdmissionError {
     /// Source custody, arithmetic or shared-domain admission failed.
     #[error("{0}")]
     Memory(#[from] WorkingMemoryError),
-    /// The complete incremental operation exceeds its application allowance.
-    #[error(
-        "text component copy needs {required_bytes} bytes; application limit is {budget_bytes}"
-    )]
-    ApplicationBudgetExceeded {
-        /// Both host holds, numerical demand and safety reserve.
-        required_bytes: u64,
-        /// Explicit application allowance.
-        budget_bytes: u64,
-    },
 }
 
 /// Admitted fixed destination whose values are filled in source order.
@@ -427,7 +417,7 @@ impl<T> fmt::Debug for FundedDecoderSlots<T> {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Commits one destination account after checking every source under the
     /// same pool lock, then copies the sampler and initializes fixed vacant slots.
     /// Both host scopes protect their own envelopes from native publication.
@@ -451,19 +441,41 @@ impl WorkingMemoryPool {
         ),
         DecoderCopyAdmissionError,
     > {
-        let bytes = copy
-            .bytes
-            .checked_add(limits.safety_reserve_bytes)
+        let host_bytes = copy
+            .sampling
+            .host_bytes
+            .checked_add(copy.decoder.initialization_peak_bytes())
             .ok_or(WorkingMemoryError::Overflow)?;
-        if let Some(budget_bytes) = limits.application_memory_budget_bytes {
-            if bytes > budget_bytes {
-                return Err(DecoderCopyAdmissionError::ApplicationBudgetExceeded {
-                    required_bytes: bytes,
-                    budget_bytes,
-                });
-            }
-        }
         let preparation = copy.complete_source.source_preparation().cloned();
+        let operands = copy.sampling.arrays.source().registration();
+        let direct_controls = decoder_controls::<T, K>(
+            preparation.is_some(),
+            matches!(copy.decoder.source, DecoderSource::Registered(_)),
+        )?;
+        let accepted = super::workspace_copy::prepare_copy_account(
+            self,
+            copy.sampling.sampler.execution(),
+            copy.sampling.arrays.incremental_requirements(),
+            host_bytes,
+            &limits,
+            direct_controls,
+            super::funding::CopyHostHolds::Paired {
+                sampler: copy.sampling.host_bytes,
+                decoder: copy.decoder.initialization_peak_bytes(),
+            },
+            |usage| {
+                if !self.same_ledger(copy.sampling.sampler.source().pool()) {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                copy.sampling
+                    .sampler
+                    .source()
+                    .validate(usage, copy.sampling.sampler.execution())?;
+                copy.decoder.source().validate(self, usage)?;
+                operands.validate_copy_source(self, usage)?;
+                copy.complete_source.validate_copy_source(self, usage)
+            },
+        )?;
         copy.decoder
             .prepare_destination_identity(preparation.as_ref())?;
         let execution = match preparation.as_ref() {
@@ -472,7 +484,6 @@ impl WorkingMemoryPool {
             }
             None => InferenceExecutionIdentity::default(),
         };
-        let operands = copy.sampling.arrays.source().registration();
         // Stage allocation/destruction of the entire accounting-only bundle
         // outside the lock. Quarantine owns this single complete pin bundle.
         let table_pin = match &copy.decoder.source {
@@ -490,7 +501,7 @@ impl WorkingMemoryPool {
         let pin = if copy.complete_source.has_source_preparation() {
             RegisteredStoragePin::aggregate_counted(pins, count)?
         } else {
-            RegisteredStoragePin::aggregate(pins)
+            RegisteredStoragePin::aggregate_exact(pins, count)?
         };
         let source_identity = copy.decoder.plan.source_metadata().identity().clone();
         let source_capacity = copy
@@ -502,19 +513,8 @@ impl WorkingMemoryPool {
         let retained = copy.decoder.retained_bytes();
         let protected = copy.decoder.initialization_peak_bytes();
         let host = copy.sampling.host_bytes;
-        let (funding, host_scope, decoder_scope, scope) = self.open_text_components_copy_account(
-            copy.sampling.sampler.source(),
-            copy.sampling.sampler.execution(),
-            copy.decoder.source(),
-            operands,
-            &copy.complete_source,
-            pin,
-            &execution,
-            bytes,
-            host,
-            protected,
-            limits.capacity_bytes,
-        )?;
+        let (requirements, funding, host_scope, decoder_scope, scope) =
+            accepted.paired(&execution, pin, host, protected)?;
         #[cfg(test)]
         tests::before_copy();
         let sampler = copy.sampling.sampler_plan.copy();
@@ -538,8 +538,60 @@ impl WorkingMemoryPool {
             protected,
             custody: decoder_scope,
         };
-        let native = AdmittedWorkspaceCopy::from_account(execution, bytes, funding, scope);
+        let native = AdmittedWorkspaceCopy::from_account(execution, requirements, funding, scope);
         Ok((sampler, slots, native))
+    }
+}
+
+fn decoder_controls<T, K: Ord + Send + Sync + 'static>(
+    prepared: bool,
+    registered: bool,
+) -> Result<usize, WorkingMemoryError> {
+    let count = 2 + usize::from(registered);
+    Ok(if !prepared {
+        super::WorkspaceCopyAccountLayout::decoder_table()?
+            .requested_bytes()
+            .checked_add(RegisteredStoragePin::ordinary_group_control_bytes::<K>(
+                count,
+            )?)
+            .and_then(|n| {
+                n.checked_add(crate::HostSlotInitialization::<T>::preparation_control_bytes()?)
+            })
+            .ok_or(WorkingMemoryError::Overflow)?
+    } else {
+        0
+    })
+}
+impl MemoryLedger {
+    /// Complete incremental domains for the sampler, decoder and native copy.
+    pub fn text_components_copy_requirements<T, K: Clone + Ord + Send + Sync + 'static>(
+        &self,
+        copy: &RegisteredTextComponentsCopy<'_, T, K>,
+        limits: &WorkspaceCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        let host = copy
+            .sampling
+            .host_bytes
+            .checked_add(copy.decoder.initialization_peak_bytes())
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let controls = decoder_controls::<T, K>(
+            copy.complete_source.has_source_preparation(),
+            matches!(copy.decoder.source, DecoderSource::Registered(_)),
+        )?;
+        super::workspace_copy::with_copy_projection(
+            self,
+            copy.sampling.arrays.incremental_requirements(),
+            host,
+            limits,
+            controls,
+            |mut projection, controls| {
+                projection.host_bytes = projection
+                    .host_bytes
+                    .checked_add(controls)
+                    .ok_or(WorkingMemoryError::Overflow)?;
+                projection.materialize(self.topology())
+            },
+        )
     }
 }
 

@@ -90,7 +90,6 @@ fn fixture(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -457,7 +456,6 @@ fn actual_source_and_schedule_stay_bound_without_changing_admission_identity() {
 fn unsupported_semantic_axes_and_independent_invocations_remain_typed() {
     for dimension in [
         SymbolicDimension::Context,
-        SymbolicDimension::TokenRows,
         SymbolicDimension::MediaPositions,
         SymbolicDimension::Unknown,
     ] {
@@ -477,6 +475,10 @@ fn unsupported_semantic_axes_and_independent_invocations_remain_typed() {
     for (dimensions, count) in [
         (vec![SymbolicDimension::Known(2)], 0),
         (
+            vec![SymbolicDimension::Sequence, SymbolicDimension::TokenRows],
+            2,
+        ),
+        (
             vec![SymbolicDimension::Sequence, SymbolicDimension::Sequence],
             2,
         ),
@@ -486,6 +488,18 @@ fn unsupported_semantic_axes_and_independent_invocations_remain_typed() {
             matches!(CapturePrefillRowAssembly::prepare(&source,0,geometry),Err(CapturePrefillGeometryError::SequenceAxes{actual}) if actual==count)
         );
     }
+    let (batched, _, geometry) = fixture(
+        vec![SymbolicDimension::TokenRows],
+        CaptureTransform::FullTensor,
+        &[],
+        2,
+        3,
+        2,
+    );
+    assert!(matches!(
+        CapturePrefillRowAssembly::prepare(&batched, 0, geometry),
+        Err(CapturePrefillGeometryError::UnsupportedAxis { axis: 0 })
+    ));
     let (source, discovery, geometry) = fixture(
         vec![SymbolicDimension::Sequence],
         CaptureTransform::FullTensor,
@@ -624,11 +638,9 @@ fn extreme_real_extents_and_strides_use_checked_indices_without_allocating_paylo
 fn compare_axis_cartesian(plan: &CapturePrefillRowAssembly<'_>) {
     for chunk in 0..plan.chunk_count() {
         let fragment = plan.fragment(chunk).unwrap();
-        assert!(
-            fragment
-                .selection_axis(fragment.source_shape().len())
-                .is_none()
-        );
+        assert!(fragment
+            .selection_axis(fragment.source_shape().len())
+            .is_none());
         assert!(fragment.selection_axis(usize::MAX).is_none());
         let axes = (0..fragment.source_shape().len())
             .map(|i| fragment.selection_axis(i).unwrap())
@@ -882,132 +894,361 @@ fn independent_windows_preserve_global_strides_and_nonzero_values_for_all_transf
             assert_eq!(actual, expected);
             assert_eq!(count, actual.len());
         }
-        assert!(
-            CaptureTensorGeometry::prepare_window(
-                &source,
-                0,
-                CapturePhase::Prefill,
-                0,
-                CaptureInvocationShape {
-                    batch: 1,
-                    sequence: 2,
-                    context: None
-                },
-                CaptureInvocationWindow {
-                    logical_sequence: 11,
-                    start: 10
-                },
-            )
-            .is_err()
-        );
+        assert!(CaptureTensorGeometry::prepare_window(
+            &source,
+            0,
+            CapturePhase::Prefill,
+            0,
+            CaptureInvocationShape {
+                batch: 1,
+                sequence: 2,
+                context: None
+            },
+            CaptureInvocationWindow {
+                logical_sequence: 11,
+                start: 10
+            },
+        )
+        .is_err());
     }
 }
 
 #[test]
 fn partition_prefill_rows_keep_original_spatial_projection_and_global_preview_order() {
     use crate::component::ComponentCoordinateMap;
-    for transform in [CaptureTransform::Slice,CaptureTransform::Preview{max_elements:5}] {
-        let (source,_,mut inference)=fixture(
-            vec![SymbolicDimension::Batch,SymbolicDimension::Sequence,SymbolicDimension::Known(7)],
-            transform.clone(),&[(1,1,5,2),(2,1,7,2)],2,5,4);
-        inference.prefill_chunk_positions=2;
-        let shape=[2,5,7];
-        let selected=resolve_slice(&source.points()[0],&source.plan().selections[0],&shape).unwrap();
-        for (range,combination) in [(0..3,PartitionCaptureCombination::Disjoint),
-            (3..7,PartitionCaptureCombination::Disjoint),(0..7,PartitionCaptureCombination::SumF64ToF32)] {
-            let members=ComponentCoordinateMap::range(7,range).unwrap();
-            let projection=CaptureSlicePartition::new(&shape,&selected,2,&members,1).unwrap();
-            let plan=CapturePrefillRowAssembly::prepare_partition(&source,0,inference,&projection,0,combination).unwrap();
-            assert!(std::ptr::eq(plan.logical_geometry().admission(),&source));
-            assert_eq!(plan.logical_geometry().source_shape(),projection.local_shape().iter().map(|n|*n as usize).collect::<Vec<_>>());
-            assert_eq!(plan.logical_geometry().starts(),projection.fragments()[0].local().starts);
-            let full_shape=plan.logical_geometry().source_shape();
-            let full:Vec<f32>=(0..full_shape.iter().product::<usize>()).map(|n|n as f32*0.125+0.75).collect();
-            let local=projection.fragments()[0].local();
-            let mut expected:Vec<_>=full.iter().enumerate().filter(|(flat,_)|coordinates(*flat,full_shape).iter().enumerate().all(|(axis,n)|
-                *n as u64>=local.starts[axis]&&(*n as u64)<local.ends[axis]&&(*n as u64-local.starts[axis])%local.strides[axis]==0))
-                .map(|(_,n)|*n).collect();
-            if let CaptureTransform::Preview{max_elements}=transform{expected.truncate(max_elements as usize);}
-            let mut output=vec![None;expected.len()];
-            for index in 0..plan.chunk_count(){
-                let fragment=plan.fragment(index).unwrap();
-                let physical:Vec<_>=full.iter().enumerate().filter(|(flat,_)|fragment.input().contains(&(coordinates(*flat,full_shape)[1] as u64)))
-                    .map(|(_,n)|*n).collect();
-                assert_eq!(physical.len(),fragment.source_shape().iter().product::<usize>());
-                assert_eq!(fragment.position(),4+index*2);
-                for entry in fragment.mappings(){assert!(output[entry.destination_index()].replace(physical[entry.source_index()]).is_none());}
+    for transform in [
+        CaptureTransform::Slice,
+        CaptureTransform::Preview { max_elements: 5 },
+    ] {
+        let (source, _, mut inference) = fixture(
+            vec![
+                SymbolicDimension::Batch,
+                SymbolicDimension::Sequence,
+                SymbolicDimension::Known(7),
+            ],
+            transform.clone(),
+            &[(1, 1, 5, 2), (2, 1, 7, 2)],
+            2,
+            5,
+            4,
+        );
+        inference.prefill_chunk_positions = 2;
+        let shape = [2, 5, 7];
+        let selected =
+            resolve_slice(&source.points()[0], &source.plan().selections[0], &shape).unwrap();
+        for (range, combination) in [
+            (0..3, PartitionCaptureCombination::Disjoint),
+            (3..7, PartitionCaptureCombination::Disjoint),
+            (0..7, PartitionCaptureCombination::SumF64ToF32),
+        ] {
+            let members = ComponentCoordinateMap::range(7, range).unwrap();
+            let projection = CaptureSlicePartition::new(&shape, &selected, 2, &members, 1).unwrap();
+            let plan = CapturePrefillRowAssembly::prepare_partition(
+                &source,
+                0,
+                inference,
+                &projection,
+                0,
+                combination,
+            )
+            .unwrap();
+            assert!(std::ptr::eq(plan.logical_geometry().admission(), &source));
+            assert_eq!(
+                plan.logical_geometry().source_shape(),
+                projection
+                    .local_shape()
+                    .iter()
+                    .map(|n| *n as usize)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                plan.logical_geometry().starts(),
+                projection.fragments()[0].local().starts
+            );
+            let full_shape = plan.logical_geometry().source_shape();
+            let full: Vec<f32> = (0..full_shape.iter().product::<usize>())
+                .map(|n| n as f32 * 0.125 + 0.75)
+                .collect();
+            let local = projection.fragments()[0].local();
+            let mut expected: Vec<_> = full
+                .iter()
+                .enumerate()
+                .filter(|(flat, _)| {
+                    coordinates(*flat, full_shape)
+                        .iter()
+                        .enumerate()
+                        .all(|(axis, n)| {
+                            *n as u64 >= local.starts[axis]
+                                && (*n as u64) < local.ends[axis]
+                                && (*n as u64 - local.starts[axis]) % local.strides[axis] == 0
+                        })
+                })
+                .map(|(_, n)| *n)
+                .collect();
+            if let CaptureTransform::Preview { max_elements } = transform {
+                expected.truncate(max_elements as usize);
             }
-            assert_eq!(output.into_iter().map(Option::unwrap).collect::<Vec<_>>(),expected);
-            assert!(CapturePrefillRowAssembly::prepare_partition(&source,0,inference,&projection,1,combination).is_err());
+            let mut output = vec![None; expected.len()];
+            for index in 0..plan.chunk_count() {
+                let fragment = plan.fragment(index).unwrap();
+                let physical: Vec<_> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(flat, _)| {
+                        fragment
+                            .input()
+                            .contains(&(coordinates(*flat, full_shape)[1] as u64))
+                    })
+                    .map(|(_, n)| *n)
+                    .collect();
+                assert_eq!(
+                    physical.len(),
+                    fragment.source_shape().iter().product::<usize>()
+                );
+                assert_eq!(fragment.position(), 4 + index * 2);
+                for entry in fragment.mappings() {
+                    assert!(output[entry.destination_index()]
+                        .replace(physical[entry.source_index()])
+                        .is_none());
+                }
+            }
+            assert_eq!(
+                output.into_iter().map(Option::unwrap).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(CapturePrefillRowAssembly::prepare_partition(
+                &source,
+                0,
+                inference,
+                &projection,
+                1,
+                combination
+            )
+            .is_err());
         }
-        let temporal=CaptureSlicePartition::new(&shape,&selected,1,&ComponentCoordinateMap::range(5,0..3).unwrap(),1).unwrap();
-        assert!(matches!(CapturePrefillRowAssembly::prepare_partition(&source,0,inference,&temporal,0,PartitionCaptureCombination::Disjoint),
-            Err(CapturePrefillGeometryError::UnsupportedAxis{axis:1})));
+        let temporal = CaptureSlicePartition::new(
+            &shape,
+            &selected,
+            1,
+            &ComponentCoordinateMap::range(5, 0..3).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            CapturePrefillRowAssembly::prepare_partition(
+                &source,
+                0,
+                inference,
+                &temporal,
+                0,
+                PartitionCaptureCombination::Disjoint
+            ),
+            Err(CapturePrefillGeometryError::UnsupportedAxis { axis: 1 })
+        ));
     }
 }
 
 #[test]
 fn partition_nonlinear_windows_keep_local_shapes_and_additive_raw_terms() {
     use crate::component::ComponentCoordinateMap;
-    for transform in [CaptureTransform::Summary,CaptureTransform::Histogram{edges:vec![-1.0,0.25,2.0]}] {
-        let (source,_,mut inference)=fixture(
-            vec![SymbolicDimension::Batch,SymbolicDimension::Sequence,SymbolicDimension::Known(7)],
-            transform.clone(),&[(1,1,5,2),(2,1,7,2)],2,5,4);
-        inference.prefill_chunk_positions=2;let shape=[2,5,7];
-        let selected=resolve_slice(&source.points()[0],&source.plan().selections[0],&shape).unwrap();
-        for (range,combination) in [(0..3,PartitionCaptureCombination::Disjoint),(3..7,PartitionCaptureCombination::Disjoint),
-            (0..7,PartitionCaptureCombination::SumF64ToF32)] {
-            let projection=CaptureSlicePartition::new(&shape,&selected,2,&ComponentCoordinateMap::range(7,range).unwrap(),1).unwrap();
-            let plan=CapturePrefillTransformPlan::prepare_partition(&source,0,inference,&projection,0,combination).unwrap();
-            assert!(std::ptr::eq(plan.admission(),&source));assert_eq!(plan.selection().transform,transform);
-            assert_eq!(&plan.window().source()[..3],projection.local_shape());
-            assert_eq!(&plan.window().selected()[..3],projection.fragments()[0].local().shape);
-            let mut count=0;
-            for index in 0..plan.chunk_count(){
-                let fragment=plan.fragment(index).unwrap();count+=fragment.selected_elements();
-                let mut physical=projection.local_shape().to_vec();physical[1]=(5-index*2).min(2);
-                assert_eq!(fragment.source_shape(),physical);assert_eq!(fragment.position(),4+index*2);
-                let local=projection.fragments()[0].local();
-                assert_eq!(fragment.starts()[2],local.starts[2]);assert_eq!(fragment.strides()[2],local.strides[2]);
-                if combination==PartitionCaptureCombination::Disjoint {
+    for transform in [
+        CaptureTransform::Summary,
+        CaptureTransform::Histogram {
+            edges: vec![-1.0, 0.25, 2.0],
+        },
+    ] {
+        let (source, _, mut inference) = fixture(
+            vec![
+                SymbolicDimension::Batch,
+                SymbolicDimension::Sequence,
+                SymbolicDimension::Known(7),
+            ],
+            transform.clone(),
+            &[(1, 1, 5, 2), (2, 1, 7, 2)],
+            2,
+            5,
+            4,
+        );
+        inference.prefill_chunk_positions = 2;
+        let shape = [2, 5, 7];
+        let selected =
+            resolve_slice(&source.points()[0], &source.plan().selections[0], &shape).unwrap();
+        for (range, combination) in [
+            (0..3, PartitionCaptureCombination::Disjoint),
+            (3..7, PartitionCaptureCombination::Disjoint),
+            (0..7, PartitionCaptureCombination::SumF64ToF32),
+        ] {
+            let projection = CaptureSlicePartition::new(
+                &shape,
+                &selected,
+                2,
+                &ComponentCoordinateMap::range(7, range).unwrap(),
+                1,
+            )
+            .unwrap();
+            let plan = CapturePrefillTransformPlan::prepare_partition(
+                &source,
+                0,
+                inference,
+                &projection,
+                0,
+                combination,
+            )
+            .unwrap();
+            assert!(std::ptr::eq(plan.admission(), &source));
+            assert_eq!(plan.selection().transform, transform);
+            assert_eq!(&plan.window().source()[..3], projection.local_shape());
+            assert_eq!(
+                &plan.window().selected()[..3],
+                projection.fragments()[0].local().shape
+            );
+            let mut count = 0;
+            for index in 0..plan.chunk_count() {
+                let fragment = plan.fragment(index).unwrap();
+                count += fragment.selected_elements();
+                let mut physical = projection.local_shape().to_vec();
+                physical[1] = (5 - index * 2).min(2);
+                assert_eq!(fragment.source_shape(), physical);
+                assert_eq!(fragment.position(), 4 + index * 2);
+                let local = projection.fragments()[0].local();
+                assert_eq!(fragment.starts()[2], local.starts[2]);
+                assert_eq!(fragment.strides()[2], local.strides[2]);
+                if combination == PartitionCaptureCombination::Disjoint {
                     match transform {
-                        CaptureTransform::Summary=>{
-                            let geometry=CaptureSummaryGeometry::prepare_partition(&source,0,CapturePhase::Prefill,0,None,&projection,0).unwrap()
-                                .fragment(&fragment).unwrap();
-                            assert_eq!(geometry.elements() as u64,fragment.selected_elements());
-                            assert_eq!(geometry.source_shape(),physical.iter().map(|n|*n as usize).collect::<Vec<_>>());
-                        },
-                        CaptureTransform::Histogram{..}=>{
-                            let geometry=CaptureHistogramGeometry::prepare_partition(&source,0,CapturePhase::Prefill,0,None,&projection,0).unwrap()
-                                .fragment(&fragment).unwrap();
-                            assert_eq!(geometry.elements() as u64,fragment.selected_elements());
-                            assert_eq!(geometry.source_shape(),physical.iter().map(|n|*n as usize).collect::<Vec<_>>());
-                        },_=>unreachable!(),
+                        CaptureTransform::Summary => {
+                            let geometry = CaptureSummaryGeometry::prepare_partition(
+                                &source,
+                                0,
+                                CapturePhase::Prefill,
+                                0,
+                                None,
+                                &projection,
+                                0,
+                            )
+                            .unwrap()
+                            .fragment(&fragment)
+                            .unwrap();
+                            assert_eq!(geometry.elements() as u64, fragment.selected_elements());
+                            assert_eq!(
+                                geometry.source_shape(),
+                                physical.iter().map(|n| *n as usize).collect::<Vec<_>>()
+                            );
+                        }
+                        CaptureTransform::Histogram { .. } => {
+                            let geometry = CaptureHistogramGeometry::prepare_partition(
+                                &source,
+                                0,
+                                CapturePhase::Prefill,
+                                0,
+                                None,
+                                &projection,
+                                0,
+                            )
+                            .unwrap()
+                            .fragment(&fragment)
+                            .unwrap();
+                            assert_eq!(geometry.elements() as u64, fragment.selected_elements());
+                            assert_eq!(
+                                geometry.source_shape(),
+                                physical.iter().map(|n| *n as usize).collect::<Vec<_>>()
+                            );
+                        }
+                        _ => unreachable!(),
                     }
                 }
             }
-            assert_eq!(count,projection.fragments()[0].local().shape.iter().product::<u64>());
-            if combination==PartitionCaptureCombination::SumF64ToF32 {
-                let raw=CapturePrefillRowAssembly::prepare_additive_transform_partition(&source,0,inference,&projection,0).unwrap();
-                assert!(std::ptr::eq(raw.logical_geometry().admission(),&source));
-                assert_eq!(raw.logical_geometry().native_transform(),&CaptureTransform::Slice);
-                let source_shape=raw.logical_geometry().source_shape();
-                let full:Vec<f32>=(0..source_shape.iter().product::<usize>()).map(|n|n as f32*0.125-2.25).collect();
-                let local=projection.fragments()[0].local();
-                let expected:Vec<_>=full.iter().enumerate().filter(|(flat,_)|coordinates(*flat,source_shape).iter().enumerate().all(|(axis,n)|
-                    *n as u64>=local.starts[axis]&&(*n as u64)<local.ends[axis]&&(*n as u64-local.starts[axis])%local.strides[axis]==0))
-                    .map(|(_,n)|*n).collect();
-                let mut output=vec![None;expected.len()];
-                for index in 0..raw.chunk_count(){let fragment=raw.fragment(index).unwrap();
-                    let physical:Vec<_>=full.iter().enumerate().filter(|(flat,_)|fragment.input().contains(&(coordinates(*flat,source_shape)[1] as u64)))
-                        .map(|(_,n)|*n).collect();
-                    for entry in fragment.mappings(){assert!(output[entry.destination_index()].replace(physical[entry.source_index()]).is_none());}
+            assert_eq!(
+                count,
+                projection.fragments()[0]
+                    .local()
+                    .shape
+                    .iter()
+                    .product::<u64>()
+            );
+            if combination == PartitionCaptureCombination::SumF64ToF32 {
+                let raw = CapturePrefillRowAssembly::prepare_additive_transform_partition(
+                    &source,
+                    0,
+                    inference,
+                    &projection,
+                    0,
+                )
+                .unwrap();
+                assert!(std::ptr::eq(raw.logical_geometry().admission(), &source));
+                assert_eq!(
+                    raw.logical_geometry().native_transform(),
+                    &CaptureTransform::Slice
+                );
+                let source_shape = raw.logical_geometry().source_shape();
+                let full: Vec<f32> = (0..source_shape.iter().product::<usize>())
+                    .map(|n| n as f32 * 0.125 - 2.25)
+                    .collect();
+                let local = projection.fragments()[0].local();
+                let expected: Vec<_> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(flat, _)| {
+                        coordinates(*flat, source_shape)
+                            .iter()
+                            .enumerate()
+                            .all(|(axis, n)| {
+                                *n as u64 >= local.starts[axis]
+                                    && (*n as u64) < local.ends[axis]
+                                    && (*n as u64 - local.starts[axis]) % local.strides[axis] == 0
+                            })
+                    })
+                    .map(|(_, n)| *n)
+                    .collect();
+                let mut output = vec![None; expected.len()];
+                for index in 0..raw.chunk_count() {
+                    let fragment = raw.fragment(index).unwrap();
+                    let physical: Vec<_> = full
+                        .iter()
+                        .enumerate()
+                        .filter(|(flat, _)| {
+                            fragment
+                                .input()
+                                .contains(&(coordinates(*flat, source_shape)[1] as u64))
+                        })
+                        .map(|(_, n)| *n)
+                        .collect();
+                    for entry in fragment.mappings() {
+                        assert!(output[entry.destination_index()]
+                            .replace(physical[entry.source_index()])
+                            .is_none());
+                    }
                 }
-                assert_eq!(output.into_iter().map(Option::unwrap).collect::<Vec<_>>(),expected);
+                assert_eq!(
+                    output.into_iter().map(Option::unwrap).collect::<Vec<_>>(),
+                    expected
+                );
             }
-            assert!(CapturePrefillTransformPlan::prepare_partition(&source,0,inference,&projection,1,combination).is_err());
+            assert!(CapturePrefillTransformPlan::prepare_partition(
+                &source,
+                0,
+                inference,
+                &projection,
+                1,
+                combination
+            )
+            .is_err());
         }
-        let temporal=CaptureSlicePartition::new(&shape,&selected,1,&ComponentCoordinateMap::range(5,0..3).unwrap(),1).unwrap();
-        assert!(CapturePrefillTransformPlan::prepare_partition(&source,0,inference,&temporal,0,PartitionCaptureCombination::Disjoint).is_err());
+        let temporal = CaptureSlicePartition::new(
+            &shape,
+            &selected,
+            1,
+            &ComponentCoordinateMap::range(5, 0..3).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(CapturePrefillTransformPlan::prepare_partition(
+            &source,
+            0,
+            inference,
+            &temporal,
+            0,
+            PartitionCaptureCombination::Disjoint
+        )
+        .is_err());
     }
 }

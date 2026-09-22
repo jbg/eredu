@@ -275,3 +275,120 @@ mod tests {
         assert!(!conditional(&source, &changed));
     }
 }
+
+pub(super) fn muse(
+    source: &crate::muse_glimmer::DecoderConfig,
+    actual: &crate::muse_glimmer::DecoderConfig,
+) -> bool {
+    let crate::muse_glimmer::DecoderConfig {
+        model_type: _,
+        hidden_size: _,
+        num_hidden_layers: _,
+        intermediate_size: _,
+        num_attention_heads: _,
+        rms_norm_eps: _,
+        post_norm_eps: _,
+        vocab_size: _,
+        num_key_value_heads: _,
+        max_position_embeddings: _,
+        rope_theta: _,
+        layer_uses_rope: _,
+        head_dim: _,
+        tie_word_embeddings: _,
+        rope_scaling: _,
+        hidden_act: _,
+        attention_dropout: _,
+        attention_bias: _,
+        mlp_bias: _,
+        moe_intermediate_size: _,
+        num_experts: _,
+        num_experts_per_tok: _,
+        norm_topk_prob: _,
+        attention_schedule: _,
+        qk_scale_factor: _,
+        output_multiplier: _,
+        final_logit_softcapping: _,
+        weight_convention: _,
+        quantization: _,
+        quantized_weights: _,
+        quantized_weight_configs: _,
+        vision_config: _,
+        image_token_id: _,
+        video_token_id: _,
+        vision_out_hidden_size: _,
+        projector_hidden_size: _,
+    } = source;
+    source.model_type == actual.model_type
+        && source.hidden_size == actual.hidden_size
+        && source.num_hidden_layers == actual.num_hidden_layers
+        && source.intermediate_size == actual.intermediate_size
+        && source.num_attention_heads == actual.num_attention_heads
+        && source.rms_norm_eps == actual.rms_norm_eps
+        && source.post_norm_eps == actual.post_norm_eps
+        && source.vocab_size == actual.vocab_size
+        && source.num_key_value_heads == actual.num_key_value_heads
+        && source.max_position_embeddings == actual.max_position_embeddings
+        && source.rope_theta == actual.rope_theta
+        && source.layer_uses_rope == actual.layer_uses_rope
+        && source.head_dim == actual.head_dim
+        && source.tie_word_embeddings == actual.tie_word_embeddings
+        && source.rope_scaling == actual.rope_scaling
+        && source.hidden_act == actual.hidden_act
+        && source.attention_dropout == actual.attention_dropout
+        && source.attention_bias == actual.attention_bias
+        && source.mlp_bias == actual.mlp_bias
+        && source.moe_intermediate_size == actual.moe_intermediate_size
+        && source.num_experts == actual.num_experts
+        && source.num_experts_per_tok == actual.num_experts_per_tok
+        && source.norm_topk_prob == actual.norm_topk_prob
+        && source.attention_schedule == actual.attention_schedule
+        && source.qk_scale_factor == actual.qk_scale_factor
+        && source.output_multiplier == actual.output_multiplier
+        && source.final_logit_softcapping == actual.final_logit_softcapping
+        && source.weight_convention == actual.weight_convention
+        && source.image_token_id == actual.image_token_id
+        && source.video_token_id == actual.video_token_id
+        && source.vision_out_hidden_size == actual.vision_out_hidden_size
+        && source.projector_hidden_size == actual.projector_hidden_size
+        && match (&source.vision_config, &actual.vision_config) {
+            (Some(source), Some(actual)) => muse_vision(source, actual),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+pub(super) fn muse_vision(
+    source: &crate::muse_glimmer::VisionConfig,
+    actual: &crate::muse_glimmer::VisionConfig,
+) -> bool {
+    let crate::muse_glimmer::VisionConfig {
+        hidden_size: _,
+        intermediate_size: _,
+        num_heads: _,
+        patch_size: _,
+        temporal_patch_size: _,
+        merge_size: _,
+        position_height: _,
+        position_width: _,
+        layer_norm_eps: _,
+        rope_theta: _,
+        schedule: _,
+        quantized_weight_configs: _,
+        weight_quantization: _,
+        language_hidden_size: _,
+        projector_hidden_size: _,
+    } = source;
+    source.hidden_size == actual.hidden_size
+        && source.intermediate_size == actual.intermediate_size
+        && source.num_heads == actual.num_heads
+        && source.patch_size == actual.patch_size
+        && source.temporal_patch_size == actual.temporal_patch_size
+        && source.merge_size == actual.merge_size
+        && source.position_height == actual.position_height
+        && source.position_width == actual.position_width
+        && source.layer_norm_eps == actual.layer_norm_eps
+        && source.rope_theta == actual.rope_theta
+        && source.schedule == actual.schedule
+        && source.language_hidden_size == actual.language_hidden_size
+        && source.projector_hidden_size == actual.projector_hidden_size
+}

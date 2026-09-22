@@ -60,21 +60,30 @@ impl FundedSpeculativeCaptureInvocation {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
-        self.run(backend,value,false).map(|_|())
+        self.run(backend, value, false).map(|_| ())
     }
     /// Observe the original source, then apply the same ordered intervention
     /// hook before sealing this frame. The replacement remains provisional until
     /// the enclosing numerical owner completes its full root union.
-    pub fn observe_and_intervene<T,E>(
-        &mut self,backend:&mut dyn ScheduledCaptureBackend<Tensor=T,Error=E>,value:&T,
-    )->Result<Option<T>,FundedCaptureError<E>>
-    where E:std::error::Error+Send+Sync+'static {
-        self.run(backend,value,true)
+    pub fn observe_and_intervene<T, E>(
+        &mut self,
+        backend: &mut dyn ScheduledCaptureBackend<Tensor = T, Error = E>,
+        value: &T,
+    ) -> Result<Option<T>, FundedCaptureError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.run(backend, value, true)
     }
-    fn run<T,E>(
-        &mut self,backend:&mut dyn ScheduledCaptureBackend<Tensor=T,Error=E>,value:&T,apply:bool,
-    )->Result<Option<T>,FundedCaptureError<E>>
-    where E:std::error::Error+Send+Sync+'static {
+    fn run<T, E>(
+        &mut self,
+        backend: &mut dyn ScheduledCaptureBackend<Tensor = T, Error = E>,
+        value: &T,
+        apply: bool,
+    ) -> Result<Option<T>, FundedCaptureError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
         let epoch = self.epoch;
         let pass = if self.prediction == 0 {
             crate::ExpertPass::Prefill
@@ -88,9 +97,13 @@ impl FundedSpeculativeCaptureInvocation {
                 guard
                     .observer
                     .observe(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, value)?;
-                let effective=if apply {
-                    guard.observer.intervene(eredu_core::MODEL_LOGITS_OBSERVATION_PATH,value)?
-                } else {None};
+                let effective = if apply {
+                    guard
+                        .observer
+                        .intervene(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, value)?
+                } else {
+                    None
+                };
                 guard.observer.complete_transaction(epoch)?;
                 guard.finish(true);
                 Ok(effective)
@@ -110,7 +123,9 @@ impl FundedSpeculativeCaptureInvocation {
     /// The native caller must retain all unresolved work in its existing recovery
     /// owner. A successful capture before a later policy error stays Untracked;
     /// an observation-transaction failure stays Aborted. No native value escapes.
-    pub fn take_failed_evidence(&mut self)->Result<Option<SharedCapturedStep>,FundedCaptureDrainError> {
+    pub fn take_failed_evidence(
+        &mut self,
+    ) -> Result<Option<SharedCapturedStep>, FundedCaptureDrainError> {
         self.session.take_failed_numerical_evidence()
     }
     /// Logical usage after the last attempted observation, including failures.

@@ -4,11 +4,11 @@ use crate::backend::runtime::cache::state::{
     SnapshotArraySources, SnapshotOperand, SnapshotProjectionCause,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::{mem::size_of, sync::Arc};
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum StoragePreparationCause {
+pub(in crate::composition::mlx::session) enum StoragePreparationCause {
     #[error(transparent)]
     Source(#[from] crate::backend::runtime::cache::state::SnapshotProjectionCause),
     #[error(transparent)]
@@ -24,7 +24,7 @@ pub(super) enum StoragePreparationCause {
 /// This describes only collector construction, not private trace/native copy fit.
 pub(super) struct DecoderStoragePlan<'a> {
     source: &'a DecoderCopyOwner,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     rows: usize,
     key: Option<&'a Array>,
     pending: Option<&'a Array>,
@@ -34,7 +34,7 @@ impl<'a> DecoderStoragePlan<'a> {
     fn new(
         source: &'a DecoderCopyOwner,
         prepared: &PreparedResidentDecoderCopy<'_>,
-        pool: &'a WorkingMemoryPool,
+        pool: &'a MemoryLedger,
         key: Option<&'a Array>,
         pending: Option<&'a Array>,
     ) -> Result<Self, StoragePreparationCause> {
@@ -77,7 +77,7 @@ impl<'a> DecoderStoragePlan<'a> {
                 size_of::<&mut dyn FnMut(SnapshotOperand<'_>) -> Result<(), SnapshotProjectionCause>>(),
                 size_of::<Result<(), SnapshotProjectionCause>>(),
                 size_of::<Arc<safemlx::ImmutableHostTransferBuffer>>(),
-                size_of::<(&DecoderCopyOwner, &WorkingMemoryPool, &mut RetainedStorage)>(),
+                size_of::<(&DecoderCopyOwner, &MemoryLedger, &mut RetainedStorage)>(),
                 size_of::<HostPreparationAuthority>(),
                 size_of::<
                     std::iter::Chain<std::option::IntoIter<&Array>, std::option::IntoIter<&Array>>,
@@ -151,15 +151,6 @@ struct StoragePreparationFailure {
     #[source]
     cause: StoragePreparationCause,
     _host: HostPreparationAuthority,
-}
-fn retain_preparation_failure(
-    cause: StoragePreparationCause,
-    host: &HostPreparationAuthority,
-) -> Error {
-    Error::StorageSource(BackendFailure::from_error(StoragePreparationFailure {
-        cause,
-        _host: host.clone(),
-    }))
 }
 
 impl DecoderCopyOwner {
@@ -252,23 +243,10 @@ impl DecoderCopyOwner {
         Ok(storage)
     }
 
-    pub(super) fn complete_storage_with_host(
-        &self,
-        pool: &WorkingMemoryPool,
-        host: &HostPreparationAuthority,
-    ) -> Result<RetainedStorage, Error> {
-        let prepared = self
-            .prepare()
-            .map_err(|cause| retain_failure(cause, host))?;
-        self.storage_plan(&prepared, pool)
-            .map_err(|cause| retain_preparation_failure(cause, host))?
-            .construct(host)
-    }
-
     pub(super) fn storage_plan<'a>(
         &'a self,
         prepared: &PreparedResidentDecoderCopy<'_>,
-        pool: &'a WorkingMemoryPool,
+        pool: &'a MemoryLedger,
     ) -> Result<DecoderStoragePlan<'a>, StoragePreparationCause> {
         self.storage_plan_with_sampling(prepared, pool, None, None)
     }
@@ -279,7 +257,7 @@ impl DecoderCopyOwner {
     pub(super) fn storage_plan_with_sampling<'a>(
         &'a self,
         prepared: &PreparedResidentDecoderCopy<'_>,
-        pool: &'a WorkingMemoryPool,
+        pool: &'a MemoryLedger,
         key: Option<&'a Array>,
         pending: Option<&'a Array>,
     ) -> Result<DecoderStoragePlan<'a>, StoragePreparationCause> {

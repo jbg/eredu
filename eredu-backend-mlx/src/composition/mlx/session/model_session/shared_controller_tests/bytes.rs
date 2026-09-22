@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::SharedControllerBytes;
 
 struct MixedController {
@@ -43,7 +45,10 @@ impl TokenFilterController for MixedController {
 
     fn current_decision(&mut self) -> Result<TokenSamplingDecision<'_>, Self::Error> {
         if self.replace_on_decision {
-            self.bytes[0] = SharedControllerBytes::new(payload(257), eredu_core::HostPreparationAuthority::unmanaged());
+            self.bytes[0] = SharedControllerBytes::new(
+                payload(257),
+                eredu_core::HostPreparationAuthority::unmanaged(),
+            );
             self.replace_on_decision = false;
         }
         let filter = self.filter.current_filter()?;
@@ -107,13 +112,16 @@ fn run(
 #[test]
 fn mixed_sources_preserve_each_domain_charge_in_ordinary_and_controlled_runs() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let source = SharedControllerBytes::new(payload(257), eredu_core::HostPreparationAuthority::unmanaged());
+    let source = SharedControllerBytes::new(
+        payload(257),
+        eredu_core::HostPreparationAuthority::unmanaged(),
+    );
     let identity = source.identity().clone();
     let pointer = source.as_ref().as_ptr();
     let bytes = source.capacity_bytes().unwrap();
     let mut pools = Vec::new();
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, artifact) = runtime(&stream, &pool);
         // This alias exists before the run attaches its domain's funding.
         let controller_source = source.clone();
@@ -146,7 +154,7 @@ fn mixed_sources_preserve_each_domain_charge_in_ordinary_and_controlled_runs() {
     }
     assert_eq!(source.as_ref(), &[11, 17, 29, 3]);
     for pool in &pools {
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     }
     drop(source);
     for pool in &pools {
@@ -159,9 +167,9 @@ fn mixed_sources_preserve_each_domain_charge_in_ordinary_and_controlled_runs() {
 #[test]
 fn byte_loading_hook_publishes_before_inference_and_rejects_an_active_run_factory() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, artifact) = runtime(&stream, &pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let factories = Cell::new(0);
     let original_pointer = Cell::new(std::ptr::null());
     let source = MlxBackend::prepare_shared_controller_bytes(&runtime, || {
@@ -175,7 +183,7 @@ fn byte_loading_hook_publishes_before_inference_and_rejects_an_active_run_factor
     assert_eq!(factories.get(), 1);
     assert_eq!(source.capacity_bytes(), Some(513));
     assert_eq!(source.as_ref().as_ptr(), original_pointer.get());
-    assert_eq!(pool.used_bytes().unwrap(), initial + 513);
+    assert_eq!(pool.fixture_host_charge().unwrap(), initial + 513);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let external = source.clone();
     let calls = Rc::new(Cell::new((0, 0)));
@@ -222,9 +230,12 @@ fn byte_loading_hook_publishes_before_inference_and_rejects_an_active_run_factor
 fn same_size_byte_owner_replacement_rejects_at_preflight_or_after_decision_before_native_work() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for during_decision in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, artifact) = runtime(&stream, &pool);
-        let source = SharedControllerBytes::new(payload(257), eredu_core::HostPreparationAuthority::unmanaged());
+        let source = SharedControllerBytes::new(
+            payload(257),
+            eredu_core::HostPreparationAuthority::unmanaged(),
+        );
         let external = source.clone();
         let calls = Rc::new(Cell::new((0, 0)));
         let mut controller = MixedController::new(source, calls.clone());
@@ -238,7 +249,10 @@ fn same_size_byte_owner_replacement_rejects_at_preflight_or_after_decision_befor
             )
             .unwrap();
         if !during_decision {
-            let replacement = SharedControllerBytes::new(payload(257), eredu_core::HostPreparationAuthority::unmanaged());
+            let replacement = SharedControllerBytes::new(
+                payload(257),
+                eredu_core::HostPreparationAuthority::unmanaged(),
+            );
             assert_eq!(replacement.capacity_bytes(), external.capacity_bytes());
             assert_ne!(replacement.identity(), external.identity());
             continuation.controller_mut().bytes[0] = replacement;

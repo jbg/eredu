@@ -2,6 +2,23 @@ use super::*;
 
 mod native_control;
 
+fn prepared_backend() -> crate::backend::MlxBackend<'static> {
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
+    let streams =
+        crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(
+            &pool,
+            safemlx::DeviceType::Cpu,
+        )
+        .unwrap()
+        .expect("qualified CPU execution streams");
+    let identity = crate::backend::MlxDeviceIdentity::from_realized_device(
+        &streams.execution().get_device().unwrap(),
+        None,
+    )
+    .unwrap();
+    crate::backend::MlxBackend::for_prepared_execution_plan(streams, identity)
+}
+
 struct IndependentMechanisms;
 
 impl eredu_architectures::PreparationMechanismProvider for IndependentMechanisms {
@@ -203,54 +220,137 @@ fn missing_artifact_is_returned_as_a_total_report() {
 
 #[test]
 fn discovery_supported_paths_match_native_prefill_and_decode_captures() {
-    use crate::backend::runtime::media::input::{token_ids_part, ModelInput};
+    if !crate::tests::support::native_process::enter("prepared-discovery-capture") {
+        return;
+    }
     use eredu_core::{
-        ModelRuntime, ObservationRequest, ObservationSelector, ObservationSupportStatus,
+        capture::*, ControlledTextGeneration, ObservationSupportStatus, TextGenerationBackend,
+        TextGenerationConfig,
     };
-    use safemlx::Array;
+    struct All;
+    impl eredu_core::TokenFilterController for All {
+        type Error = std::convert::Infallible;
+        fn inference_workspace_is_run_owned(&self) -> bool {
+            true
+        }
+        fn inference_workspace(&self, _: u64) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+            Some(eredu_core::TextControllerWorkspace {
+                filter: (&eredu_core::TokenFilter::All).into(),
+                additional_host_bytes: 0,
+            })
+        }
+        fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
+            Ok(eredu_core::TokenFilter::All)
+        }
+        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+    let backend = prepared_backend();
     let root = tempfile::tempdir().unwrap();
     write_safetensors_fixture(root.path());
-    let options = MlxInspectionOptions::default();
-    let report = inspect_model(root.path(), options).unwrap();
+    let report = inspect_model(root.path(), MlxInspectionOptions::default()).unwrap();
     let descriptor = report.architecture_descriptor.as_ref().unwrap();
     let support = report.observation_support.as_ref().unwrap();
-    let selectors = support
+    let paths = support
         .points
         .iter()
-        .filter(|p| {
-            p.prefill == ObservationSupportStatus::Supported
-                && p.decode == ObservationSupportStatus::Supported
+        .filter(|point| {
+            point.prefill == ObservationSupportStatus::Supported
+                && point.decode == ObservationSupportStatus::Supported
         })
-        .map(|p| ObservationSelector::Exact(p.path.clone()))
+        .map(|point| point.path.clone())
         .collect::<Vec<_>>();
-    assert_eq!(selectors.len(), descriptor.observations.points.len());
-    assert!(!selectors.is_empty());
-    let request = ObservationRequest::selected(selectors);
-    let stream = crate::test_stream();
-    let backend = crate::native::backend(stream, stream);
+    assert_eq!(paths.len(), descriptor.observations.points.len());
+    assert!(!paths.is_empty());
     let model = eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
-    let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-    let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-    let parts = [token_ids_part(&tokens).unwrap()];
-    let first = runtime
-        .inspect_prefill(ModelInput::new(&parts).into(), &request)
-        .unwrap();
-    let next = runtime
-        .inspect_decode(Array::from_slice(&[3_u32], &[1, 1]), &request)
-        .unwrap();
-    for observations in [first.observations, next.observations] {
-        for point in &descriptor.observations.points {
-            assert!(
-                observations.get(&point.path).is_some(),
-                "missing native capture {}",
-                point.path
-            );
+    let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
+    let discovery = crate::backend::MlxBackend::capture_discovery(&runtime).unwrap();
+    let usage = CaptureUsage {
+        captures: 1000,
+        retained_bytes: 1_000_000_000,
+        host_bytes: 10_000_000,
+        encoded_bytes: 10_000_000,
+    };
+    let plan = CapturePlan {
+        schema_version: 1,
+        selections: paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| CaptureSelection {
+                id: format!("discovered-{index}"),
+                path: path.clone(),
+                schedule: CaptureSchedule::default(),
+                slices: vec![],
+                transform: CaptureTransform::FullTensor,
+            })
+            .collect(),
+        limits: CaptureLimits {
+            per_step: usage,
+            cumulative: usage,
+            on_limit: CaptureLimitPolicy::Fail,
+        },
+    }
+    .admit(
+        &discovery.catalog,
+        &discovery.support,
+        &discovery.support.capture,
+        CaptureRequestShape {
+            batch: 1,
+            prompt_tokens: 2,
+            max_predictions: 2,
+        },
+    )
+    .unwrap();
+    let config = TextGenerationConfig::new(
+        eredu_core::resolve_generation_config(
+            None,
+            eredu_core::GenerationConfigOverrides {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let mut generation = ControlledTextGeneration::from_token_ids_with_sequence(
+        &mut runtime,
+        eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
+        config,
+        All,
+        Some(eredu_core::TextPreparationOptions {
+            capture: Some(SharedCapturePlan::new(plan)),
+            interventions: None,
+        }),
+        eredu_core::GenerationSequenceRequest::new(2, &[]),
+    )
+    .unwrap();
+    for prediction in 0..2 {
+        generation.next().unwrap().unwrap();
+        let delivery = generation.take_captured_delivery().unwrap().unwrap();
+        assert_eq!(delivery.prediction_index, prediction);
+        for path in &paths {
+            let record = delivery
+                .records
+                .iter()
+                .find(|record| &record.path == path)
+                .unwrap_or_else(|| panic!("missing native capture {path}"));
+            assert_eq!(record.outcome, CaptureOutcome::Captured);
+            assert!(matches!(
+                record.payload,
+                Some(CapturePayload::Tensor(_) | CapturePayload::SharedTensor(_))
+            ));
         }
     }
 }
 
 #[test]
 fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
+    if !crate::tests::support::native_process::enter("prepared-inspection") {
+        return;
+    }
     use eredu_core::{
         capture::*, ControlledTextGeneration, GenerationConfigOverrides, ModelRuntime,
         TextGenerationBackend, TextGenerationConfig,
@@ -258,6 +358,15 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     struct Unconstrained;
     impl eredu_core::TokenFilterController for Unconstrained {
         type Error = std::convert::Infallible;
+        fn inference_workspace_is_run_owned(&self) -> bool {
+            true
+        }
+        fn inference_workspace(&self, _: u64) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+            Some(eredu_core::TextControllerWorkspace {
+                filter: (&eredu_core::TokenFilter::All).into(),
+                additional_host_bytes: 0,
+            })
+        }
         fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
             Ok(eredu_core::TokenFilter::All)
         }
@@ -270,7 +379,6 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     }
     let root = tempfile::tempdir().unwrap();
     write_safetensors_fixture(root.path());
-    let stream = crate::test_stream();
     let config = eredu_core::resolve_generation_config(
         None,
         GenerationConfigOverrides {
@@ -282,7 +390,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     .unwrap();
     let mut results = Vec::new();
     for captured in [false, true] {
-        let backend = crate::native::backend(stream, stream);
+        let backend = prepared_backend();
         let prepared =
             eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
         let (mut model, capabilities) = prepared.into_parts();
@@ -331,7 +439,6 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
                 limits: CaptureLimits {
                     per_step: limits,
                     cumulative: limits,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             }
@@ -350,16 +457,19 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
         } else {
             None
         };
-        let mut generator = ControlledTextGeneration::new(
+        let mut generator = ControlledTextGeneration::from_token_ids_with_sequence(
             &mut runtime,
-            vec![1, 2],
+            eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
             TextGenerationConfig::new(config).with_seed(73),
             Unconstrained,
+            plan.as_ref()
+                .map(|plan| eredu_core::TextPreparationOptions {
+                    capture: Some(SharedCapturePlan::new(plan.clone())),
+                    interventions: None,
+                }),
+            eredu_core::GenerationSequenceRequest::new(4, &[]),
         )
         .unwrap();
-        if let Some(plan) = plan.as_ref() {
-            generator.enable_capture(plan.clone()).unwrap();
-        }
         let mut tokens = Vec::new();
         while let Some(token) = generator.next() {
             tokens.push(token.unwrap().token_id());
@@ -374,31 +484,37 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
         }
         assert_eq!(discovery_probe.identity_is_resolved(), captured);
         drop(generator);
-        runtime.parts_mut().1.reset().unwrap();
-        let mut following = ControlledTextGeneration::new(
+        runtime.reset().unwrap();
+        let mut following = ControlledTextGeneration::from_token_ids_with_sequence(
             &mut runtime,
-            vec![1, 2],
+            eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
             TextGenerationConfig::new(config).with_seed(73),
             Unconstrained,
+            None,
+            eredu_core::GenerationSequenceRequest::new(4, &[]),
         )
         .unwrap();
         assert_eq!(following.next().unwrap().unwrap().token_id(), tokens[0]);
         drop(following);
-        runtime.parts_mut().1.reset().unwrap();
+        runtime.reset().unwrap();
         if captured {
-            let mut early_drop = ControlledTextGeneration::new(
+            let mut early_drop = ControlledTextGeneration::from_token_ids_with_sequence(
                 &mut runtime,
-                vec![1, 2],
+                eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
                 TextGenerationConfig::new(config).with_seed(73),
                 Unconstrained,
+                Some(eredu_core::TextPreparationOptions {
+                    capture: Some(SharedCapturePlan::new(plan.unwrap())),
+                    interventions: None,
+                }),
+                eredu_core::GenerationSequenceRequest::new(4, &[]),
             )
             .unwrap();
-            early_drop.enable_capture(plan.unwrap()).unwrap();
             assert_eq!(early_drop.next().unwrap().unwrap().token_id(), tokens[0]);
             // Leave a completed host capture batch unconsumed. Dropping the
             // ordinary generator must settle retained native completion authority.
             drop(early_drop);
-            runtime.parts_mut().1.reset().unwrap();
+            runtime.reset().unwrap();
         }
         results.push(tokens);
     }
@@ -407,11 +523,13 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
 
 #[test]
 fn bounded_capture_native_failure_respects_recovery_and_retirement() {
+    if !crate::tests::support::native_process::enter("prepared-inspection") {
+        return;
+    }
     use eredu_core::{capture::*, ModelRuntime, TextGenerationBackend, TextGenerationConfig};
     let root = tempfile::tempdir().unwrap();
     write_safetensors_fixture_with_fill(root.path(), f32::NAN);
-    let stream = crate::test_stream();
-    let backend = crate::native::backend(stream, stream);
+    let backend = prepared_backend();
     let model = eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
     let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
     let discovery =
@@ -434,7 +552,6 @@ fn bounded_capture_native_failure_respects_recovery_and_retirement() {
         limits: CaptureLimits {
             per_step: budget,
             cumulative: budget,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -453,57 +570,74 @@ fn bounded_capture_native_failure_respects_recovery_and_retirement() {
         None,
         eredu_core::GenerationConfigOverrides {
             temperature: Some(0.0),
+            max_new_tokens: Some(2),
             ..Default::default()
         },
     )
     .unwrap();
-    let mut state = <crate::backend::MlxBackend as TextGenerationBackend>::start_text_generation(
-        runtime.backend(),
-        TextGenerationConfig::new(sampling),
-    )
-    .unwrap();
-    <crate::backend::MlxBackend as TextGenerationBackend>::configure_text_capture(
-        &runtime, &mut state, plan,
-    )
-    .unwrap();
-    let prompt = <crate::backend::MlxBackend as TextGenerationBackend>::prepare_text_prompt(
-        runtime.backend(),
-        vec![1, 2],
-    )
-    .unwrap();
-    let result = <crate::backend::MlxBackend as TextGenerationBackend>::submit_text_prefill(
+    let mut generator = eredu_core::TextGeneration::from_token_ids_with_sequence(
         &mut runtime,
-        prompt,
-        &eredu_core::TokenFilter::All,
-        &mut state,
-    );
-    let error = match result {
+        eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
+        TextGenerationConfig::new(sampling),
+        eredu_core::TokenFilter::All,
+        Some(eredu_core::TextPreparationOptions {
+            capture: Some(SharedCapturePlan::new(plan)),
+            interventions: None,
+        }),
+        eredu_core::GenerationSequenceRequest::new(2, &[]),
+    )
+    .unwrap();
+    let error = match generator.next().unwrap() {
         Err(error) => error,
         Ok(_) => panic!("non-finite candidate capture must fail explicitly"),
     };
     assert!(error.to_string().contains("finite"), "{error}");
-    let captures =
-        <crate::backend::MlxBackend as TextGenerationBackend>::try_take_text_capture(&mut state)
-            .unwrap().unwrap();
-    assert!(matches!(
-        captures.records[0].outcome,
-        CaptureOutcome::Failed {
-            reason: CaptureFailureReason::Native,
-            ..
+    match generator.take_captured_delivery() {
+        Ok(Some(captures)) => {
+            assert!(matches!(
+                captures.records[0].outcome,
+                CaptureOutcome::Failed {
+                    reason: CaptureFailureReason::Native,
+                    ..
+                }
+            ));
         }
-    ));
-    // A proven transactional rollback plus settled native work permits reuse.
-    // Otherwise the session must stay fenced; an error alone is not completion.
-    if runtime.parts_mut().1.reset().is_ok() {
-        assert!(error.model_state_preserved());
+        Ok(None) => panic!("failed native capture must retain its record or fence delivery"),
+        Err(delivery) => {
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&delivery);
+            let mut fenced = false;
+            while let Some(error) = cause {
+                fenced |= matches!(
+                    error.downcast_ref::<eredu_runtime::working_memory::WorkingMemoryError>(),
+                    Some(eredu_runtime::working_memory::WorkingMemoryError::ExecutionFenced)
+                );
+                fenced |= matches!(
+                    error.downcast_ref::<eredu_runtime::capture::FundedCaptureDrainError>(),
+                    Some(eredu_runtime::capture::FundedCaptureDrainError::Delivery(
+                        eredu_runtime::working_memory::CaptureStepError::Memory(
+                            eredu_runtime::working_memory::WorkingMemoryError::ExecutionFenced
+                        )
+                    ))
+                );
+                cause = error.source();
+            }
+            assert!(fenced, "unexpected failed-capture delivery: {delivery:?}");
+        }
+    };
+    drop(generator);
+    // Reset independently establishes completed source ownership before clearing
+    // state. Failed delivery alone never supplies that completion evidence.
+    if runtime.reset().is_ok() {
+        runtime.session().ensure_no_submission_in_flight().unwrap();
+        runtime.reset().unwrap();
     } else {
-        assert!(runtime.parts_mut().1.reset().is_err());
+        assert!(runtime.reset().is_err());
     }
     // Weak pointers themselves prevent Rc::get_mut, so install this probe only
     // after every attempted native operation, then observe final retirement.
     let payload_retired = runtime.session().test_payload_retirement_probe();
     assert!(!payload_retired());
-    drop(state);
+    drop(error);
     drop(runtime);
     crate::backend::submission_recovery::wait_for_retirement(&payload_retired);
     assert!(payload_retired());
@@ -543,6 +677,9 @@ fn invalid_configuration_is_returned_as_a_total_report() {
 
 #[test]
 fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits() {
+    if !crate::tests::support::native_process::enter("prepared-inspection") {
+        return;
+    }
     use eredu_core::{
         capture::*, intervention::*, ControlledTextGeneration, GenerationConfigOverrides,
         ModelRuntime, TextGenerationBackend, TextGenerationConfig,
@@ -550,6 +687,15 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
     struct Unconstrained;
     impl eredu_core::TokenFilterController for Unconstrained {
         type Error = std::convert::Infallible;
+        fn inference_workspace_is_run_owned(&self) -> bool {
+            true
+        }
+        fn inference_workspace(&self, _: u64) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+            Some(eredu_core::TextControllerWorkspace {
+                filter: (&eredu_core::TokenFilter::All).into(),
+                additional_host_bytes: 0,
+            })
+        }
         fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
             Ok(eredu_core::TokenFilter::All)
         }
@@ -562,8 +708,7 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
     }
     let root = tempfile::tempdir().unwrap();
     write_safetensors_fixture_with_fill(root.path(), 0.03);
-    let stream = crate::test_stream();
-    let backend = crate::native::backend(stream, stream);
+    let backend = prepared_backend();
     let model = eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
     let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
     let discovery =
@@ -588,7 +733,6 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         limits: CaptureLimits {
             per_step: budget,
             cumulative: budget,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -610,7 +754,7 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
     .unwrap();
     let mut results = Vec::new();
     for experiment in 0..3 {
-        runtime.parts_mut().1.reset().unwrap();
+        runtime.reset().unwrap();
         let operations = if experiment == 1 {
             discovery
                 .points
@@ -666,18 +810,32 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
             &runtime, &capture, &plan,
         )
         .unwrap();
-        let mut generator = ControlledTextGeneration::new(
+        let options = if experiment == 0 {
+            None
+        } else {
+            let interventions = runtime
+                .backend()
+                .memory_ledger()
+                .compile_intervention_source(
+                    eredu_core::intervention::PreparedInterventionPlanCopy::inspect(&plan).unwrap(),
+                )
+                .unwrap()
+                .plan()
+                .clone();
+            Some(eredu_core::TextPreparationOptions {
+                capture: Some(SharedCapturePlan::new(capture.clone())),
+                interventions: Some(interventions),
+            })
+        };
+        let mut generator = ControlledTextGeneration::from_token_ids_with_sequence(
             &mut runtime,
-            vec![1, 2],
+            eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
             TextGenerationConfig::new(sampling).with_seed(73),
             Unconstrained,
+            options,
+            eredu_core::GenerationSequenceRequest::new(4, &[]),
         )
         .unwrap();
-        if experiment != 0 {
-            generator
-                .enable_interventions(capture.clone(), plan)
-                .unwrap();
-        }
         let mut tokens = Vec::new();
         while let Some(token) = generator.next() {
             tokens.push(token.unwrap().token_id());
@@ -711,7 +869,7 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         "the ordinary sampler must consume the replacement logits"
     );
     for (fail_dtype, prompt_mismatch) in [(false, false), (true, false), (false, true)] {
-        runtime.parts_mut().1.reset().unwrap();
+        runtime.reset().unwrap();
         let plan = InterventionPlan {
             schema_version: 1,
             operations: vec![InterventionOperation {
@@ -732,46 +890,68 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         }
         .admit(&discovery, request, "native-test-session")
         .unwrap();
-        let mut generator = ControlledTextGeneration::new(
+        let interventions = runtime
+            .backend()
+            .memory_ledger()
+            .compile_intervention_source(
+                eredu_core::intervention::PreparedInterventionPlanCopy::inspect(&plan).unwrap(),
+            )
+            .unwrap()
+            .plan()
+            .clone();
+        let input: &[u32] = if prompt_mismatch { &[1] } else { &[1, 2] };
+        let prepared = ControlledTextGeneration::from_token_ids_with_sequence(
             &mut runtime,
-            if prompt_mismatch { vec![1] } else { vec![1, 2] },
+            eredu_core::TokenIdsInputPlan::new(input).unwrap(),
             TextGenerationConfig::new(sampling).with_seed(73),
             Unconstrained,
-        )
-        .unwrap();
-        generator
-            .enable_interventions(capture.clone(), plan.clone())
-            .unwrap();
-        let result = generator.next().unwrap();
+            Some(eredu_core::TextPreparationOptions {
+                capture: Some(SharedCapturePlan::new(capture.clone())),
+                interventions: Some(interventions),
+            }),
+            eredu_core::GenerationSequenceRequest::new(4, &[]),
+        );
         if prompt_mismatch {
-            assert!(result.is_err());
             assert!(
-                generator.take_captured_delivery().unwrap().is_none(),
-                "known prompt mismatch must fail before starting the native step"
+                prepared.is_err(),
+                "known prompt mismatch must fail during admission before native work"
             );
-        } else if fail_dtype {
-            assert!(result.is_err());
-            let step = generator.take_captured_delivery().unwrap().unwrap();
-            assert!(matches!(
-                step.interventions[0].outcome,
-                InterventionOutcome::Failed { .. }
-            ));
-        } else {
-            assert_eq!(result.unwrap().token_id(), results[0][0]);
-            assert!(
-                generator
-                    .enable_interventions(capture.clone(), plan)
-                    .is_err(),
-                "hot replacement after prefill must fail"
-            );
+            continue;
         }
+        if fail_dtype {
+            let error = prepared
+                .err()
+                .expect("known precision mismatch rejects cold admission");
+            let mut cause: &(dyn std::error::Error + 'static) = &error;
+            loop {
+                if matches!(
+                    cause.downcast_ref::<crate::backend::array_copy::CaptureTensorNativeError>(),
+                    Some(crate::backend::array_copy::CaptureTensorNativeError::ShapeMismatch)
+                ) {
+                    break;
+                }
+                cause = cause.source().unwrap_or_else(|| {
+                    panic!("typed native precision refusal is preserved: {error:?}")
+                });
+            }
+            continue;
+        }
+        let mut generator = prepared.unwrap();
+        let result = generator.next().unwrap();
+        assert_eq!(result.unwrap().token_id(), results[0][0]);
+        assert!(
+            generator
+                .enable_interventions(capture.clone(), plan)
+                .is_err(),
+            "hot replacement after prefill must fail"
+        );
         // Drop an unfinished run, including a failed forward that may have written
         // cache state. The native owner must settle work before reset can succeed.
         drop(generator);
         crate::backend::submission_recovery::wait_for_retirement(|| {
             runtime.session().ensure_no_submission_in_flight().is_ok()
         });
-        runtime.parts_mut().1.reset().unwrap();
+        runtime.reset().unwrap();
     }
-    runtime.parts_mut().1.reset().unwrap();
+    runtime.reset().unwrap();
 }

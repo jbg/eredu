@@ -1,10 +1,11 @@
 use super::*;
 pub(super) mod fragments;
-pub(super) mod replica;
 pub(super) mod generated;
 pub(super) mod interventions;
-pub(super) mod routed;
 mod prefill;
+pub(super) mod replica;
+pub(super) mod routed;
+pub(super) mod routing;
 use prefill::PrefillAggregation;
 
 enum Frame<'a> {
@@ -40,9 +41,10 @@ pub(super) struct FundedCaptureObserver<'a, T, E: std::error::Error + Send + Syn
     invocation_readout: Option<bool>,
     partition_delivered: bool,
     routed_selection: Option<usize>,
-    routed_intervention_selection:Option<usize>,
+    routed_intervention_selection: Option<usize>,
     routed_active: bool,
-    routed_partition_hooks:Option<crate::capture::partition::PartitionCaptureRoutedHooks>,
+    routed_partition_hooks: Option<crate::capture::partition::PartitionCaptureRoutedHooks>,
+    pending_routing: Option<routing::Pending<'a>>,
 }
 impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'a, T, E, N> {
     pub(super) fn new(
@@ -84,9 +86,10 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
             invocation_readout,
             partition_delivered: false,
             routed_selection: None,
-            routed_intervention_selection:None,
+            routed_intervention_selection: None,
             routed_active: false,
-            routed_partition_hooks:None,
+            routed_partition_hooks: None,
+            pending_routing: None,
         }
     }
     fn prepare(
@@ -213,28 +216,54 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
             let Frame::Active(frame) = &mut self.frame else {
                 return Err(CaptureProtocolError::Transaction.into());
             };
-            partition.prepare(source, phase, self.prediction, epoch, frame, &mut self.session.ledger)?;
+            partition.prepare(
+                source,
+                phase,
+                self.prediction,
+                epoch,
+                frame,
+                &mut self.session.ledger,
+            )?;
         }
         Ok(())
     }
-    fn coordinate_partition(&mut self, epoch: DistributedCommitEpoch) -> Result<(), FundedCaptureError<E>> {
-        if self.backend.partition_capture().is_none() { return Ok(()); }
-        let chunk = self.bound.map(|bound| self.current_fragment_chunk().map(|chunk| (bound, chunk))).transpose()?;
+    fn coordinate_partition(
+        &mut self,
+        epoch: DistributedCommitEpoch,
+    ) -> Result<(), FundedCaptureError<E>> {
+        if self.backend.partition_capture().is_none() {
+            return Ok(());
+        }
+        let chunk = self
+            .bound
+            .map(|bound| self.current_fragment_chunk().map(|chunk| (bound, chunk)))
+            .transpose()?;
         if let Some(partition) = self.backend.partition_capture() {
             partition.coordinate(epoch, &self.session.ledger)?;
             if let Some((bound, chunk)) = chunk {
-                let Frame::Active(frame) = &mut self.frame else { return Err(CaptureProtocolError::Transaction.into()); };
+                let Frame::Active(frame) = &mut self.frame else {
+                    return Err(CaptureProtocolError::Transaction.into());
+                };
                 partition.remote_prefill(frame, bound, &chunk)?;
             }
         }
         Ok(())
     }
     fn complete_partition_delivery(&mut self) -> Result<(), FundedCaptureError<E>> {
-        if self.partition_delivered { return Ok(()); }
+        if self.partition_delivered {
+            return Ok(());
+        }
         if let Some(partition) = self.backend.partition_capture() {
-            let Frame::Active(frame) = &mut self.frame else { return Err(CaptureProtocolError::Transaction.into()); };
+            let Frame::Active(frame) = &mut self.frame else {
+                return Err(CaptureProtocolError::Transaction.into());
+            };
             self.partition_delivered = true;
-            partition.deliver(frame)?;
+            // Receivers can have no local tensor hook. Their actual receipt
+            // decoding and frame publication still belong to capture time.
+            let started = std::time::Instant::now();
+            let result = partition.deliver(frame);
+            self.session.capture_seconds += started.elapsed().as_secs_f64();
+            result?;
         }
         Ok(())
     }
@@ -341,7 +370,9 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
                 continue;
             }
             if let Some(partition) = self.backend.partition_capture() {
-                if !partition.produces(index)? { continue; }
+                if !partition.produces(index)? {
+                    continue;
+                }
             }
             let started = std::time::Instant::now();
             let mut source_dtype = None;
@@ -381,13 +412,16 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
         dtype: &mut Option<TensorDtype>,
         charged: &mut CaptureUsage,
     ) -> Result<(), FundedCaptureError<E>> {
-        let projected=match self.backend.partition_capture(){
-            Some(program)=>program.take_invocation_projection(index)?,None=>None,
+        let projected = match self.backend.partition_capture() {
+            Some(program) => program.take_invocation_projection(index)?,
+            None => None,
         };
-        if let Some(hook)=projected {
-            let hook=hook.observe_invocation(self.backend,value)?;
-            self.backend.partition_capture().ok_or(CaptureProtocolError::Transaction)?
-                .return_invocation_projection(index,hook)?;
+        if let Some(hook) = projected {
+            let hook = hook.observe_invocation(self.backend, value)?;
+            self.backend
+                .partition_capture()
+                .ok_or(CaptureProtocolError::Transaction)?
+                .return_invocation_projection(index, hook)?;
             return Ok(());
         }
         let policy = CaptureObservationStep::with_invocation(
@@ -428,9 +462,11 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
             let Frame::Active(frame) = &mut self.frame else {
                 return Err(CaptureProtocolError::Transaction.into());
             };
-            let skipped=match self.backend.partition_capture() {
-                Some(partition)=>policy.reserve_value(partition.reservation(index,&actual,usage)?,usage)?,
-                None=>policy.reserve_value(&mut self.session.ledger,usage)?,
+            let skipped = match self.backend.partition_capture() {
+                Some(partition) => {
+                    policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?
+                }
+                None => policy.reserve_value(&mut self.session.ledger, usage)?,
             };
             if let Some(reason) = skipped {
                 frame.record_skip(index, reason, Some(actual), fragment)?;
@@ -464,9 +500,11 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
             let Frame::Active(frame) = &mut self.frame else {
                 return Err(CaptureProtocolError::Transaction.into());
             };
-            let skipped=match self.backend.partition_capture() {
-                Some(partition)=>policy.reserve_value(partition.reservation(index,&actual,usage)?,usage)?,
-                None=>policy.reserve_value(&mut self.session.ledger,usage)?,
+            let skipped = match self.backend.partition_capture() {
+                Some(partition) => {
+                    policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?
+                }
+                None => policy.reserve_value(&mut self.session.ledger, usage)?,
             };
             if let Some(reason) = skipped {
                 frame.record_skip(index, reason, Some(actual), fragment)?;
@@ -505,7 +543,9 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
                 return Err(CaptureProtocolError::Transaction.into());
             };
             let skipped = match self.backend.partition_capture() {
-                Some(partition) => policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?,
+                Some(partition) => {
+                    policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?
+                }
                 None => policy.reserve_value(&mut self.session.ledger, usage)?,
             };
             if let Some(reason) = skipped {
@@ -541,7 +581,9 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
                 return Err(CaptureProtocolError::Transaction.into());
             };
             let skipped = match self.backend.partition_capture() {
-                Some(partition) => policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?,
+                Some(partition) => {
+                    policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?
+                }
                 None => policy.reserve_value(&mut self.session.ledger, usage)?,
             };
             if let Some(reason) = skipped {
@@ -590,7 +632,9 @@ impl<'a, T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserv
             return Err(CaptureProtocolError::Transaction.into());
         };
         let skipped = match self.backend.partition_capture() {
-            Some(partition) => policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?,
+            Some(partition) => {
+                policy.reserve_value(partition.reservation(index, &actual, usage)?, usage)?
+            }
             None => policy.reserve_value(&mut self.session.ledger, usage)?,
         };
         if let Some(reason) = skipped {
@@ -636,33 +680,49 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
     for FundedCaptureObserver<'_, T, E, N>
 {
     fn routed_unit_observer(
-        &mut self, path: &str,
+        &mut self,
+        path: &str,
     ) -> Result<Option<&mut dyn crate::RoutedUnitObserver<T>>, N> {
         let index = self.session.plan.points().iter().position(|point|
             matches!(&point.value_type, eredu_core::ObservationValueType::RoutedUnits { routing, .. }
                 if routing == path));
-        let edit=match &self.frame {
-            Frame::Active(frame)=>frame.intervention_admission().and_then(|plan|plan.points().iter()
-                .position(|point|point.routed_units.as_ref().is_some_and(|routed|routed.routing==path))),
-            _=>None,
+        let edit = match &self.frame {
+            Frame::Active(frame) => frame.intervention_admission().and_then(|plan| {
+                plan.points().iter().enumerate().find_map(|(index, point)| {
+                    (point
+                        .routed_units
+                        .as_ref()
+                        .is_some_and(|routed| routed.routing == path)
+                        && frame.interventions()[index].outcome
+                            != eredu_core::intervention::InterventionOutcome::Inactive)
+                        .then_some(index)
+                })
+            }),
+            _ => None,
         };
-        if index.is_none() && edit.is_none(){return Ok(None);}
-        if self.routed_active && (self.routed_selection!=index || self.routed_intervention_selection!=edit) {
+        if index.is_none() && edit.is_none() {
+            return Ok(None);
+        }
+        if self.routed_active
+            && (self.routed_selection != index || self.routed_intervention_selection != edit)
+        {
             return Err((self.map_error)(CaptureProtocolError::Transaction.into()));
         }
-        // Prepared distributed/window-aggregation edits retain their own pending
-        // source joins; the completed direct invocation path is distinct.
-        if edit.is_some() && (self.prefill.is_some() || self.invocation.is_none()) {
-            return Err((self.map_error)(CaptureProtocolError::Transaction.into()));
-        }
-        if let Some(program)=self.backend.partition_capture() {
-            if edit.is_some(){return Err((self.map_error)(CaptureProtocolError::Transaction.into()));}
-            if let Some(index)=index {
-                if !program.routed_source(index).map_err(|cause|(self.map_error)(cause.into()))? {return Ok(None);}
+        if let Some(program) = self.backend.partition_capture() {
+            if edit.is_some() {
+                return Err((self.map_error)(CaptureProtocolError::Transaction.into()));
+            }
+            if let Some(index) = index {
+                if !program
+                    .routed_source(index)
+                    .map_err(|cause| (self.map_error)(cause.into()))?
+                {
+                    return Ok(None);
+                }
             }
         }
-        self.routed_selection=index;
-        self.routed_intervention_selection=edit;
+        self.routed_selection = index;
+        self.routed_intervention_selection = edit;
         Ok(Some(self))
     }
     fn admitted_prefill_capture(
@@ -720,7 +780,8 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
             self.continuation_announced = true;
             Ok(())
         } else {
-            self.begin_chunk(chunk).map_err(|error| (self.map_error)(error))
+            self.begin_chunk(chunk)
+                .map_err(|error| (self.map_error)(error))
         }
     }
     fn finish_prefill(&mut self, committed: bool) {
@@ -745,7 +806,8 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
             self.continuation_epoch = Some(context.epoch());
             Ok(None)
         } else {
-            self.prepare_retention(context).map_err(|error| (self.map_error)(error))
+            self.prepare_retention(context)
+                .map_err(|error| (self.map_error)(error))
         }
     }
     fn retire_prefill_chunk_retention(
@@ -762,26 +824,72 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
         epoch: DistributedCommitEpoch,
         pass: crate::ExpertPass,
     ) -> Result<(), N> {
-        self.prepare(epoch, pass).map_err(|error| (self.map_error)(error))
+        self.prepare(epoch, pass)
+            .map_err(|error| (self.map_error)(error))
     }
     fn coordinate_transaction(&mut self, epoch: DistributedCommitEpoch) -> Result<(), N> {
-        self.coordinate_partition(epoch).map_err(|error| (self.map_error)(error))
+        self.coordinate_partition(epoch)
+            .map_err(|error| (self.map_error)(error))
     }
     fn complete_transaction(&mut self, epoch: DistributedCommitEpoch) -> Result<(), N> {
-        self.prepare_delivery(epoch).map_err(|error| (self.map_error)(error))
+        self.prepare_delivery(epoch)
+            .map_err(|error| (self.map_error)(error))
     }
     fn finish_transaction(&mut self, epoch: DistributedCommitEpoch, committed: bool) {
         self.terminal(epoch, committed);
     }
     fn intervene(&mut self, path: &str, value: &T) -> Result<Option<T>, N> {
-        self.intervene_value(path, value).map_err(|error| (self.map_error)(error))
+        self.intervene_value(path, value)
+            .map_err(|error| (self.map_error)(error))
+    }
+    fn routing_control(
+        &mut self,
+        path: &str,
+        rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, N> {
+        self.routing_control_value(path, rows)
+            .map_err(self.map_error)
+    }
+    fn routing_unmodified_interest(&self, path: &str) -> crate::RoutingUnmodifiedInterest {
+        self.routing_unmodified_interest_value(path)
+    }
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: crate::RoutingDecision<'_, T>,
+    ) -> Result<(), N> {
+        if self.routing_unmodified_interest_value(path) == crate::RoutingUnmodifiedInterest::None {
+            return Ok(());
+        }
+        let original = crate::RoutingDecision {
+            ids: effective.ids,
+            coefficients: effective.coefficients,
+        };
+        self.routing_applied_value(path, Some(original), effective, true)
+            .map_err(self.map_error)
+    }
+    fn routing_applied(
+        &mut self,
+        path: &str,
+        original: Option<crate::RoutingDecision<'_, T>>,
+        effective: crate::RoutingDecision<'_, T>,
+    ) -> Result<(), N> {
+        self.routing_applied_value(path, original, effective, false)
+            .map_err(self.map_error)
+    }
+    fn routing_failed(&mut self, path: &str, message: &str) {
+        self.routing_failed_value(path, message)
     }
     fn observe(&mut self, path: &str, value: &T) -> Result<(), N> {
-        self.observe_value(path, value).map_err(|error| (self.map_error)(error))
+        self.observe_value(path, value)
+            .map_err(|error| (self.map_error)(error))
     }
     fn observe_replica(&mut self, path: &str, value: &T) -> Result<(), N> {
-        if self.backend.partition_capture().is_none() { return Ok(()); }
-        self.observe_value(path, value).map_err(|error| (self.map_error)(error))
+        if self.backend.partition_capture().is_none() {
+            return Ok(());
+        }
+        self.observe_value(path, value)
+            .map_err(|error| (self.map_error)(error))
     }
     fn observe_generated(
         &mut self,
@@ -790,7 +898,8 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> crate::ActivationObserv
         _source: &GeneratedCaptureSource,
         _generate: &mut dyn FnMut() -> Result<T, N>,
     ) -> Result<(), N> {
-        self.generated(path).map_err(|error| (self.map_error)(error))
+        self.generated(path)
+            .map_err(|error| (self.map_error)(error))
     }
     fn observe_generated_retained(
         &mut self,

@@ -28,7 +28,11 @@ fn capture_path<const UNIT: bool>() -> &'static str {
     }
 }
 fn capture_width<const UNIT: bool>() -> u64 {
-    if UNIT { 16 } else { 64 }
+    if UNIT {
+        16
+    } else {
+        64
+    }
 }
 fn capture_ids<const UNIT: bool>() -> [&'static str; 4] {
     if UNIT {
@@ -256,14 +260,17 @@ fn capture_loaded_plan_with_capacity(
             })
             .unwrap();
         let mut settings = settings(0.0);
-        settings.inference.managed_memory_capacity_bytes = Some(ORIGINAL_CAPACITY);
+        settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(ORIGINAL_CAPACITY),
+        )]);
         let prepared_prefix = vec![0, 1, 2, 3, 4];
         let prepared_capture = selected;
         let prepared_trace = TraceLimits {
             per_record_bytes: 1 << 20,
             total_bytes: 4 << 20,
         };
-        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+        let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
         prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
         prepared.output_mode = PreparedChatOutputMode::Text;
         prepared.capture = Some(&prepared_capture);
@@ -340,7 +347,10 @@ fn capture_loaded_plan_with_capacity(
     };
     let mut settings = settings(0.0);
     if let Some(capacity) = managed_capacity {
-        settings.inference.managed_memory_capacity_bytes = Some(capacity);
+        settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(capacity),
+        )]);
     }
     let output = if mode == "managed" {
         model
@@ -424,7 +434,11 @@ fn evidence_and_values<const REDUCTION: u8, const UNIT: bool>(
         assert_eq!(
             frame.partitions.len(),
             if partitioned {
-                if REDUCTION != 0 { 4 } else { 3 }
+                if REDUCTION != 0 {
+                    4
+                } else {
+                    3
+                }
             } else {
                 0
             }
@@ -438,12 +452,10 @@ fn evidence_and_values<const REDUCTION: u8, const UNIT: bool>(
             assert_eq!(evidence.producers, [0]);
             assert!(!evidence.receipt_plan_identity.is_empty());
             assert!(!evidence.contributions.is_empty());
-            assert!(
-                evidence
-                    .contributions
-                    .iter()
-                    .all(|part| part.producer_rank == 0)
-            );
+            assert!(evidence
+                .contributions
+                .iter()
+                .all(|part| part.producer_rank == 0));
             if let Some(first) = frame.partitions.first() {
                 assert_eq!(evidence.context.run_identity, first.context.run_identity);
                 assert_eq!(evidence.context.forward_epoch, first.context.forward_epoch);

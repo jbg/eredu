@@ -1,18 +1,16 @@
 //! Ordinary uploads from an original host source; never a managed media grant.
 use super::*;
-mod native;
 mod construction;
+mod native;
 pub(super) use construction::prepare_model_input;
 mod text_domain;
-pub(super) use text_domain::validate_text_domain;
-pub(super) use native::{RetiredMlxPreparedModelInputError, RetiredMlxPreparedModelInputBindError};
 use crate::backend::submission_recovery::{self, Retention, Status};
 use eredu_architectures::processor_execution::{
     lower_original_prepared_host_input, ProcessorExecutionError, ProcessorMechanisms,
 };
 use eredu_runtime::{
     input::host::HostInputPartView,
-    working_memory::{OriginalPreparedHostInput, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{MemoryLedger, OriginalPreparedHostInput, WorkingMemoryError},
     PreparedInputInspector,
 };
 pub(crate) use native::CompletedOriginalModelInput;
@@ -22,7 +20,9 @@ pub use native::{
     MlxPreparedModelInputBindError, MlxPreparedModelInputError, MlxPreparedModelInputPlan,
     MlxPreparedNativeInputError, MlxPreparedNativeInputPlan,
 };
+pub(super) use native::{RetiredMlxPreparedModelInputBindError, RetiredMlxPreparedModelInputError};
 use std::{cell::RefCell, convert::Infallible, rc::Rc};
+pub(super) use text_domain::validate_text_domain;
 
 /// Ordinary upload failure. Admission rejection is inline and precedes owned
 /// diagnostics/native work. Started failures retain original source and actual
@@ -55,15 +55,20 @@ impl MlxModelInput {
     /// The source must belong to the runtime's real pool. Successful arrays are
     /// independent copies and retain ordinary exclusion through their aliases;
     /// they cannot be adopted into original managed media admission afterward.
+    /// This is upload custody only, under both finite and unlimited limits.
+    /// For execution, use `MlxPreparedInputMaterializer::model_input_plan`, then
+    /// materialize and bind the complete prepared model-input source.
     pub fn from_original_host_input(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         source: &OriginalPreparedHostInput,
     ) -> Result<Self, MlxHostInputUploadError> {
-        upload(runtime.backend().memory_pool(), source)
+        upload(runtime.backend().memory_ledger(), source)
     }
     /// Consumes a cold original semantic body before ordinary native upload.
     /// The selected graph, processor and actual empty session are authenticated;
-    /// this enables the ordinary prepared-input driver, not managed media.
+    /// this authenticates upload semantics and custody, not execution admission
+    /// under finite or unlimited limits. Execution uses the complete source from
+    /// `MlxPreparedInputMaterializer::model_input_plan`, materialized and bound.
     pub fn from_original_host_input_with_semantics(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         original: eredu_architectures::media_plan::OriginalPreparedMediaSemantics<'_>,
@@ -73,6 +78,8 @@ impl MlxModelInput {
     /// Uses the exact completed original leaves with the originally compiled
     /// semantic source. Prompt/maps/cache/handle copies remain ordinary; native
     /// leaf values are not uploaded, evaluated or adopted a second time.
+    /// These leaf-only controls do not supply execution admission under finite
+    /// or unlimited limits; a complete model-input plan supplies that producer.
     pub fn from_original_native_input_with_semantics(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         native_input: MlxOriginalPreparedNativeInput,
@@ -88,11 +95,11 @@ fn upload_authenticated(
 ) -> Result<MlxModelInput, MlxHostInputUploadError> {
     let source = original.source().clone();
     let boundary = if source
-        .validate_pool(runtime.backend().memory_pool())
+        .validate_pool(runtime.backend().memory_ledger())
         .is_err()
         || native_input.as_ref().is_some_and(|n| {
             !n.source().same_source(&source)
-                || n.validate_pool(runtime.backend().memory_pool()).is_err()
+                || n.validate_pool(runtime.backend().memory_ledger()).is_err()
         }) {
         Some(WorkingMemoryError::IdentityMismatch)
     } else {
@@ -121,7 +128,7 @@ fn upload_authenticated(
         });
     }
     upload_with_native(
-        runtime.backend().memory_pool(),
+        runtime.backend().memory_ledger(),
         &source,
         Some((runtime, original)),
         native_input,
@@ -129,13 +136,13 @@ fn upload_authenticated(
 }
 
 fn upload(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &OriginalPreparedHostInput,
 ) -> Result<MlxModelInput, MlxHostInputUploadError> {
     upload_with_semantics(pool, source, None)
 }
 fn upload_with_semantics(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &OriginalPreparedHostInput,
     original: Option<(
         &ModelRuntime<MlxBackend<'_>>,
@@ -145,7 +152,7 @@ fn upload_with_semantics(
     upload_with_native(pool, source, original, None)
 }
 fn upload_with_native(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &OriginalPreparedHostInput,
     original: Option<(
         &ModelRuntime<MlxBackend<'_>>,

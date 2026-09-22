@@ -51,7 +51,8 @@ impl Drop for RegionCall {
 }
 impl OriginalParallelSource {
     pub(super) fn prepare_expert_occurrences(&self, operations: &[WorkspaceOperation],
-        mechanism: Option<ResidentExecutionMechanisms>, addressable: Option<&crate::backend::nn::workspace::AddressableSources>) -> Result<Vec<ExpertOccurrence>, Error> {
+        mechanism: Option<ResidentExecutionMechanisms>, addressable: Option<&crate::backend::nn::workspace::AddressableSources>,
+        ordinary: Option<&crate::backend::nn::workspace::OrdinaryAddressableSources>) -> Result<Vec<ExpertOccurrence>, Error> {
         let count=operations.iter().filter(|op|matches!(op.kind,WorkspaceOperationKind::ExpertRegion(_)|WorkspaceOperationKind::ExpertProviderWave(_)|WorkspaceOperationKind::ExpertInactiveWave(_))).count();
         reserve(self.funding(), &[size_of::<Vec<ExpertOccurrence>>(),size_of::<Result<Vec<ExpertOccurrence>,Error>>(),
             Layout::array::<ExpertOccurrence>(count).map_err(|_|overflow())?.size(),failure_control_bytes().ok_or_else(overflow)?])?;
@@ -62,7 +63,12 @@ impl OriginalParallelSource {
             let mechanism=mechanism.ok_or_else(||failure(Cause::Resource,self.declaration_source(),self.funding()))?;
             let quote=match &operation.kind{
                 WorkspaceOperationKind::ExpertRegion(_)=>ExpertOccurrenceQuote::Local(
-                    ExpertLocalQuote::prepare(self,operation.as_view(),mechanism,addressable).map_err(Error::Neural)?),
+                    if mechanism.uses_original_storage() {
+                        ExpertLocalQuote::prepare(self,operation.as_view(),mechanism,addressable)
+                    } else {
+                        if addressable.is_some() { return Err(failure(Cause::Identity,self.declaration_source(),self.funding())); }
+                        ExpertLocalQuote::prepare_ordinary(self,operation.as_view(),mechanism,ordinary)
+                    }.map_err(Error::Neural)?),
                 WorkspaceOperationKind::ExpertProviderWave(value)=>ExpertOccurrenceQuote::ProviderWave(
                     ExpertProviderWaveQuote::prepare(self,*value,mechanism).map_err(Error::Neural)?),
                 WorkspaceOperationKind::ExpertInactiveWave(value)=>ExpertOccurrenceQuote::InactiveWave(

@@ -10,6 +10,10 @@
 //! embedded-prediction case binds exact target/extension payloads through the
 //! complete prepared-execution driver and executes real scalar proposals.
 
+#[path = "../src/memory_fixture.rs"]
+#[allow(dead_code)]
+mod memory_fixture;
+
 use std::collections::BTreeSet;
 
 #[allow(

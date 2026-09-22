@@ -1,5 +1,7 @@
 //! Exercise the executable boundary used by admission, not a second equation driver.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::TokenFilter;
 use eredu_runtime::layered::PreparedCaptureSelectionError;
 use std::cell::Cell;
@@ -84,7 +86,7 @@ fn same_quote(
 fn model_bound_routes_keep_exact_source_and_sample_final_row_for_resident_host_disk() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = match route {
             0 => host::runtime(&stream, &pool, None),
             1 => host::runtime(&stream, &pool, Some(1)),
@@ -129,24 +131,29 @@ fn model_bound_routes_keep_exact_source_and_sample_final_row_for_resident_host_d
                 let bound = selected.bind_geometry(g).unwrap();
                 let executable = &runtime.session().payload.model;
                 let config = disk::config(0.0, 2, u64::MAX);
-                let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+                let before = (
+                    pool.fixture_host_charge().unwrap(),
+                    pool.fixture_host_peak().unwrap(),
+                );
                 let frontier = executable.erased().state_snapshot();
                 let cold = ColdGuard::new();
                 let (quote, h) = executable
                     .quote_replicated_resident_text_with_sampling_and_prefill_capture(
                         g,
-                        config,
+                        config.clone(),
                         &TokenFilter::All,
                         bound,
+                        None,
                     )
                     .unwrap();
                 let (registered, pin, rh) = executable
                     .quote_registered_resident_text_with_sampling_and_prefill_capture(
                         g,
-                        config,
+                        config.clone(),
                         &TokenFilter::All,
                         &pool,
                         bound,
+                        None,
                     )
                     .unwrap();
                 assert!(quote.equations.transient().bytes().is_some());
@@ -185,7 +192,10 @@ fn model_bound_routes_keep_exact_source_and_sample_final_row_for_resident_host_d
                 assert!(h.initialization_peak_bytes() > 0);
                 assert_eq!(executable.erased().state_snapshot(), frontier);
                 assert_eq!(
-                    (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+                    (
+                        pool.fixture_host_charge().unwrap(),
+                        pool.fixture_host_peak().unwrap()
+                    ),
                     before
                 );
                 drop((quote, registered, pin, h, rh));
@@ -207,10 +217,10 @@ fn model_bound_routes_keep_exact_source_and_sample_final_row_for_resident_host_d
 #[test]
 fn model_bound_routes_reject_changed_candidate_and_equal_content_foreign_path_owner() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let other_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let other_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (other, _other_artifact) = host::runtime(&stream, &other_pool, None);
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (runtime, _artifact) = match route {
             0 => host::runtime(&stream, &pool, None),
             1 => host::runtime(&stream, &pool, Some(1)),
@@ -227,7 +237,10 @@ fn model_bound_routes_reject_changed_candidate_and_equal_content_foreign_path_ow
             let g = geometry(&selected);
             let executable = &runtime.session().payload.model;
             let config = disk::config(0.0, 2, u64::MAX);
-            let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+            let before = (
+                pool.fixture_host_charge().unwrap(),
+                pool.fixture_host_peak().unwrap(),
+            );
             let frontier = executable.erased().state_snapshot();
             let cold = ColdGuard::new();
             for (candidate, bound) in [
@@ -248,9 +261,10 @@ fn model_bound_routes_reject_changed_candidate_and_equal_content_foreign_path_ow
                 let error = executable
                     .quote_replicated_resident_text_with_sampling_and_prefill_capture(
                         candidate,
-                        config,
+                        config.clone(),
                         &TokenFilter::All,
                         bound,
+                        None,
                     )
                     .unwrap_err();
                 assert!(has_cause::<PreparedCaptureSelectionError>(
@@ -260,10 +274,11 @@ fn model_bound_routes_reject_changed_candidate_and_equal_content_foreign_path_ow
                 let error = executable
                     .quote_registered_resident_text_with_sampling_and_prefill_capture(
                         candidate,
-                        config,
+                        config.clone(),
                         &TokenFilter::All,
                         &pool,
                         bound,
+                        None,
                     )
                     .unwrap_err();
                 assert!(has_cause::<PreparedCaptureSelectionError>(
@@ -273,7 +288,10 @@ fn model_bound_routes_reject_changed_candidate_and_equal_content_foreign_path_ow
             }
             assert_eq!(executable.erased().state_snapshot(), frontier);
             assert_eq!(
-                (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+                (
+                    pool.fixture_host_charge().unwrap(),
+                    pool.fixture_host_peak().unwrap()
+                ),
                 before
             );
             cold.assert_cold();
@@ -286,7 +304,7 @@ fn model_bound_routes_reject_changed_candidate_and_equal_content_foreign_path_ow
 #[test]
 fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_behavior() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = host::runtime(&stream, &pool, None);
     {
         let active = source(&runtime, eredu_core::MODEL_LOGITS_OBSERVATION_PATH, 5, 1);
@@ -308,15 +326,18 @@ fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_be
         assert_eq!(g.output, eredu_core::OutputDemand::LastPosition);
         let executable = &runtime.session().payload.model;
         let config = disk::config(0.0, 2, u64::MAX);
-        let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+        let before = (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
         let cold = ColdGuard::new();
         let plain = executable
-            .quote_replicated_resident_text_with_sampling(g, config, &TokenFilter::All)
+            .quote_replicated_resident_text_with_sampling(g, config.clone(), &TokenFilter::All)
             .unwrap();
         let (raw, raw_h) = executable
             .quote_replicated_resident_text_with_sampling_and_capture(
                 g,
-                config,
+                config.clone(),
                 &TokenFilter::All,
                 &source,
             )
@@ -324,9 +345,10 @@ fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_be
         let (bound, bound_h) = executable
             .quote_replicated_resident_text_with_sampling_and_prefill_capture(
                 g,
-                config,
+                config.clone(),
                 &TokenFilter::All,
                 selected.bind_geometry(g).unwrap(),
+                None,
             )
             .unwrap();
         // Bound p0 runs the prepared borrowed hook to advance fragment
@@ -367,7 +389,9 @@ fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_be
         for (plain, selected) in raw_spans.iter().zip(bound_spans) {
             assert_eq!(plain.span(), selected.span());
             let extra = match plain.span() {
-                eredu_runtime::working_memory::InferenceWorkspaceSpan::Sampling(_) => panic!("model scheduler emitted a sampling phase"),
+                eredu_runtime::working_memory::InferenceWorkspaceSpan::Sampling(_) => {
+                    panic!("model scheduler emitted a sampling phase")
+                }
                 eredu_runtime::working_memory::InferenceWorkspaceSpan::Prefill(_) => {
                     prefill_spans += 1;
                     hook
@@ -417,7 +441,7 @@ fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_be
         let error = executable
             .quote_replicated_resident_text_with_sampling_and_capture(
                 g,
-                config,
+                config.clone(),
                 &TokenFilter::All,
                 &active,
             )
@@ -430,11 +454,14 @@ fn model_bound_decode_only_agrees_with_raw_and_keeps_ordinary_and_raw_prefill_be
             )
         ));
         let after = executable
-            .quote_replicated_resident_text_with_sampling(g, config, &TokenFilter::All)
+            .quote_replicated_resident_text_with_sampling(g, config.clone(), &TokenFilter::All)
             .unwrap();
         same_quote(&plain, &after);
         assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+            (
+                pool.fixture_host_charge().unwrap(),
+                pool.fixture_host_peak().unwrap()
+            ),
             before
         );
         drop((plain, raw, raw_h, bound, bound_h, after));

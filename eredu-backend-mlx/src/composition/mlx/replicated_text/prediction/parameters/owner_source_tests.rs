@@ -44,7 +44,7 @@ fn module(stream: &Stream) -> MlxPredictionModule<Unit> {
         id: None,
         original: None,
         placeholders,
-        replacements: BTreeMap::new(),
+        replacements: Default::default(),
         stream: stream.clone(),
     }
 }
@@ -63,7 +63,7 @@ fn count(module: &MlxPredictionModule<Unit>) -> ParameterOwnerCounts {
 #[test]
 fn prediction_count_tracks_actual_registration_shared_manager_and_transfer_restoration() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let memory = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let memory = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let _loading = crate::backend::managed_memory::NativeMemoryOwner::acquire(&memory).unwrap();
     let mut module = module(&stream);
     let early_alias = module.clone();
@@ -190,9 +190,17 @@ fn prediction_count_tracks_actual_registration_shared_manager_and_transfer_resto
     );
     let replacement = MlxTensor::from_array(Array::from_slice(&[11_i32, 13], &[2]));
     let replacement_identity = replacement.as_array().allocation_info().unwrap();
-    module
-        .replacements
-        .insert("weight".into(), replacement.clone());
+    let (context, funding) = crate::memory_fixture::parameter_context();
+    crate::memory_fixture::publish_parameters(
+        [("weight".into(), replacement)],
+        true,
+        &context,
+        funding,
+        |visitor| {
+            visitor.replacement_source(&mut module.replacements);
+            Ok(true)
+        },
+    );
     let before_failure = count(&module);
     assert_eq!(
         before_failure
@@ -235,7 +243,10 @@ fn prediction_count_tracks_actual_registration_shared_manager_and_transfer_resto
         placeholder_identity
     );
     assert_eq!(
-        module.replacements["weight"]
+        module
+            .replacements
+            .get("weight")
+            .unwrap()
             .as_array()
             .allocation_info()
             .unwrap(),

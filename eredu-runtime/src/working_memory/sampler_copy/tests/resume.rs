@@ -1,29 +1,29 @@
 use super::super::resume::history_extent;
 use super::*;
 
-const CAPACITY: u64 = 16_384;
+const CAPACITY: u64 = ROOM;
 const PREFIX: [u32; 5] = [3, 11, 7, 19, 5];
 
-fn held(pool: &WorkingMemoryPool) -> u64 {
+fn held(pool: &MemoryLedger) -> u64 {
     pool.0
         .usage
         .lock()
         .unwrap()
         .funding
         .values()
-        .map(|state| state.host_held)
+        .map(|state| state.host_held.checked_sub(state.control_floor).unwrap())
         .sum()
 }
 
 fn seeded(
     adaptive: bool,
 ) -> (
-    WorkingMemoryPool,
+    MemoryLedger,
     RunOwnedTextSampler,
     InferenceTextPreparation,
     WorkingMemoryFundingRun,
 ) {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (mut source, preparation, run) = source(&pool, CAPACITY, 64, adaptive);
     grow(&mut source, &PREFIX);
     assert_eq!(
@@ -67,7 +67,10 @@ fn resumed_nonzero_history_requires_exact_preserved_and_future_envelope() {
                     assert_eq!(source.as_sampler().history_capacity(), 5);
                 }
                 let config = config(maximum, adaptive);
-                let plan = source.borrow_funded().prepare_resume(config).unwrap();
+                let plan = source
+                    .borrow_funded()
+                    .prepare_resume(config.clone())
+                    .unwrap();
                 let expected = inline + 4 * peak_slots;
                 assert_eq!(
                     (
@@ -85,28 +88,28 @@ fn resumed_nonzero_history_requires_exact_preserved_and_future_envelope() {
                 let before = (usage(&pool), held(&pool), attempts());
                 let original = format!("{:?}", source.as_sampler());
                 let result = preparation
-                    .claim_sampling(fresh)
+                    .claim_sampling(fresh.clone())
                     .unwrap()
                     .construct_resumed_sampler(plan, run.sampler_scope().unwrap());
                 if short {
                     assert!(
-                        matches!(result, Err(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
+                        matches!(result, Err(WorkingMemoryError::DomainAllowanceExceeded { required_bytes, available_bytes, .. })
                         if required_bytes == expected && available_bytes == available)
                     );
                     assert_eq!((usage(&pool), held(&pool), attempts()), before);
                     assert!(matches!(
-                        preparation.claim_sampling(fresh),
+                        preparation.claim_sampling(fresh.clone()),
                         Err(WorkingMemoryError::PreparationAlreadyStarted)
                     ));
                     assert_eq!(format!("{:?}", source.as_sampler()), original);
                     drop((preparation, run, source, source_preparation, source_run));
-                    assert_eq!(pool.used_bytes().unwrap(), 0);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
                     continue;
                 }
                 let (mut resumed, completion) = result.unwrap();
                 completion.finish().unwrap();
                 assert!(matches!(
-                    preparation.claim_sampling(fresh),
+                    preparation.claim_sampling(fresh.clone()),
                     Err(WorkingMemoryError::PreparationAlreadyStarted)
                 ));
                 assert_eq!(attempts(), before.2 + 1);
@@ -131,9 +134,9 @@ fn resumed_nonzero_history_requires_exact_preserved_and_future_envelope() {
                     if issued == maximum as u64 && limit == maximum as u64)
                 );
                 drop((source, source_preparation, source_run, preparation, run));
-                assert_eq!(pool.used_bytes().unwrap(), expected);
+                assert_eq!(pool.payload_used_bytes().unwrap(), expected);
                 drop(resumed);
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     }
@@ -149,7 +152,7 @@ fn resumed_attempts_are_new_but_dropped_permits_and_clearing_never_refund_them()
     let (preparation, run, config) =
         prepared_request_with_bytes(&pool, CAPACITY, 2, false, plan.required_host_bytes());
     let (mut resumed, completion) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_resumed_sampler(plan, run.sampler_scope().unwrap())
         .unwrap();
@@ -185,7 +188,7 @@ fn resumed_attempts_are_new_but_dropped_permits_and_clearing_never_refund_them()
         source_preparation,
         source_run,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -213,7 +216,7 @@ fn cleared_source_copies_spare_slots_and_current_adaptive_state() {
             let (preparation, run, config) =
                 prepared_request_with_bytes(&pool, CAPACITY, maximum, adaptive, expected);
             let (mut resumed, completion) = preparation
-                .claim_sampling(config)
+                .claim_sampling(config.clone())
                 .unwrap()
                 .construct_resumed_sampler(plan, run.sampler_scope().unwrap())
                 .unwrap();
@@ -244,7 +247,7 @@ fn cleared_source_copies_spare_slots_and_current_adaptive_state() {
                 source_preparation,
                 source_run,
             ));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -252,7 +255,7 @@ fn cleared_source_copies_spare_slots_and_current_adaptive_state() {
 #[test]
 fn resume_rejects_foreign_source_wrong_scope_prompt_and_repeat_claim() {
     let (pool, source, source_preparation, source_run) = seeded(false);
-    let foreign = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (preparation, run, config) = prepared_request(&foreign, CAPACITY, 3, false);
     let before = (
         usage(&pool),
@@ -263,10 +266,13 @@ fn resume_rejects_foreign_source_wrong_scope_prompt_and_repeat_claim() {
     );
     assert!(matches!(
         preparation
-            .claim_sampling(config)
+            .claim_sampling(config.clone())
             .unwrap()
             .construct_resumed_sampler(
-                source.borrow_funded().prepare_resume(config).unwrap(),
+                source
+                    .borrow_funded()
+                    .prepare_resume(config.clone())
+                    .unwrap(),
                 run.sampler_scope().unwrap()
             ),
         Err(WorkingMemoryError::IdentityMismatch)
@@ -282,7 +288,7 @@ fn resume_rejects_foreign_source_wrong_scope_prompt_and_repeat_claim() {
         before
     );
     drop((preparation, run));
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     let (preparation, run, config) = prepared_request(&pool, CAPACITY, 3, false);
     let (other, other_run, _) = prepared_request(&pool, CAPACITY, 3, false);
     let before = (usage(&pool), held(&pool), attempts());
@@ -291,7 +297,10 @@ fn resume_rejects_foreign_source_wrong_scope_prompt_and_repeat_claim() {
             .claim_prompt()
             .unwrap()
             .construct_resumed_sampler(
-                source.borrow_funded().prepare_resume(config).unwrap(),
+                source
+                    .borrow_funded()
+                    .prepare_resume(config.clone())
+                    .unwrap(),
                 run.sampler_scope().unwrap()
             ),
         Err(WorkingMemoryError::InvocationPhaseMismatch)
@@ -299,17 +308,20 @@ fn resume_rejects_foreign_source_wrong_scope_prompt_and_repeat_claim() {
     assert_eq!((usage(&pool), held(&pool), attempts()), before);
     assert!(matches!(
         preparation
-            .claim_sampling(config)
+            .claim_sampling(config.clone())
             .unwrap()
             .construct_resumed_sampler(
-                source.borrow_funded().prepare_resume(config).unwrap(),
+                source
+                    .borrow_funded()
+                    .prepare_resume(config.clone())
+                    .unwrap(),
                 other_run.sampler_scope().unwrap()
             ),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     assert_eq!((usage(&pool), held(&pool), attempts()), before);
     assert!(matches!(
-        preparation.claim_sampling(config),
+        preparation.claim_sampling(config.clone()),
         Err(WorkingMemoryError::PreparationAlreadyStarted)
     ));
     run.scope().unwrap().certify().unwrap();
@@ -323,7 +335,7 @@ fn resume_rejects_foreign_source_wrong_scope_prompt_and_repeat_claim() {
         source_preparation,
         source_run,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -332,7 +344,7 @@ fn policy_quota_and_exact_preparation_configuration_are_checked_before_copy() {
         let (pool, source, source_preparation, source_run) = seeded(adaptive);
         let normal = config(3, adaptive);
         let changed = if adaptive {
-            normal.with_mirostat_v2(4.1, 0.23).unwrap()
+            normal.clone().with_mirostat_v2(4.1, 0.23).unwrap()
         } else {
             TextGenerationConfig::new(ResolvedGenerationConfig {
                 top_k: 18,
@@ -365,7 +377,7 @@ fn policy_quota_and_exact_preparation_configuration_are_checked_before_copy() {
             let before = (usage(&pool), held(&pool), attempts());
             assert!(matches!(
                 preparation
-                    .claim_sampling(config)
+                    .claim_sampling(config.clone())
                     .unwrap()
                     .construct_resumed_sampler(
                         source.borrow_funded().prepare_resume(stale).unwrap(),
@@ -375,13 +387,13 @@ fn policy_quota_and_exact_preparation_configuration_are_checked_before_copy() {
             ));
             assert_eq!((usage(&pool), held(&pool), attempts()), before);
             assert!(matches!(
-                preparation.claim_sampling(config),
+                preparation.claim_sampling(config.clone()),
                 Err(WorkingMemoryError::PreparationAlreadyStarted)
             ));
             drop((preparation, run));
         }
         drop((source, source_preparation, source_run));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -391,7 +403,10 @@ fn source_or_destination_quarantine_after_planning_rejects_at_hold_boundary() {
         let (pool, source, source_preparation, source_run) = seeded(false);
         let (preparation, run, config) = prepared_request(&pool, CAPACITY, 3, false);
         let borrowed = source.borrow_funded();
-        let plan = source.borrow_funded().prepare_resume(config).unwrap();
+        let plan = source
+            .borrow_funded()
+            .prepare_resume(config.clone())
+            .unwrap();
         let mut host_scope = run.sampler_scope().unwrap();
         if quarantine_source {
             drop(source_run.scope().unwrap());
@@ -412,7 +427,7 @@ fn source_or_destination_quarantine_after_planning_rejects_at_hold_boundary() {
         assert_eq!((usage(&pool), held(&pool), attempts()), before);
         assert!(matches!(
             preparation
-                .claim_sampling(config)
+                .claim_sampling(config.clone())
                 .unwrap()
                 .construct_resumed_sampler(plan, host_scope),
             Err(WorkingMemoryError::ExecutionFenced)
@@ -424,7 +439,7 @@ fn source_or_destination_quarantine_after_planning_rejects_at_hold_boundary() {
             source_run.scope().unwrap().certify().unwrap();
         }
         drop((preparation, run, source, source_preparation, source_run));
-        assert_eq!(pool.used_bytes().unwrap(), SOURCE_BYTES);
+        assert_eq!(pool.payload_used_bytes().unwrap(), SOURCE_BYTES);
         assert!(matches!(
             pool.acquire_unquoted(),
             Err(WorkingMemoryError::ReservedWorkActive)
@@ -443,16 +458,16 @@ fn resumed_host_hold_is_unavailable_to_native_adoption_until_payload_retirement(
     let (preparation, run, config) =
         prepared_request_with_bytes(&pool, CAPACITY, 11, true, host + 17);
     let (resumed, completion) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_resumed_sampler(plan, run.sampler_scope().unwrap())
         .unwrap();
     completion.finish().unwrap();
     let native = run.scope().unwrap();
-    let first = native.adopt_storage_individually([(101_u32, 17)]).unwrap();
+    let first = adopt(&native, publication(&pool), [(101_u32, 17)]).unwrap();
     assert!(matches!(
-        native.adopt_storage_individually([(102_u32, 1)]),
-        Err(WorkingMemoryError::BudgetExceeded {
+        adopt(&native, publication(&pool), [(102_u32, 1)]),
+        Err(WorkingMemoryError::DomainAllowanceExceeded {
             available_bytes: 0,
             ..
         })
@@ -460,32 +475,33 @@ fn resumed_host_hold_is_unavailable_to_native_adoption_until_payload_retirement(
     drop((preparation, run));
     assert_eq!(history(resumed.as_sampler()), PREFIX);
     assert!(matches!(
-        native.adopt_storage_individually([(102_u32, host)]),
-        Err(WorkingMemoryError::BudgetExceeded {
+        adopt(&native, publication(&pool), [(102_u32, host)]),
+        Err(WorkingMemoryError::DomainAllowanceExceeded {
             available_bytes: 0,
             ..
         })
     ));
     drop(resumed);
-    let second = native
-        .adopt_storage_individually([(102_u32, host)])
-        .unwrap();
+    let second = adopt(&native, publication(&pool), [(102_u32, host)]).unwrap();
     native.certify().unwrap();
     drop((source, source_preparation, source_run));
-    assert_eq!(pool.used_bytes().unwrap(), host + 17);
+    assert_eq!(pool.payload_used_bytes().unwrap(), host + 17);
     drop((first, second));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn frozen_copy_is_an_authenticated_resume_source_after_original_owners_retire() {
     let (pool, source, source_preparation, source_run) = seeded(true);
     let frozen = pool
-        .copy_sampler(source.borrow_funded(), SamplerCopyLimits::new(CAPACITY))
+        .copy_sampler(
+            source.borrow_funded(),
+            SamplerCopyLimits::new(crate::working_memory::memory_fixture::host_limits(CAPACITY)),
+        )
         .unwrap();
     let original = format!("{:?}", frozen.as_sampler());
     drop((source, source_preparation, source_run));
-    assert_eq!(pool.used_bytes().unwrap(), frozen.bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), frozen.bytes());
     let plan = frozen
         .borrow_funded()
         .prepare_resume(config(11, true))
@@ -493,24 +509,24 @@ fn frozen_copy_is_an_authenticated_resume_source_after_original_owners_retire() 
     let host = plan.required_host_bytes();
     let (preparation, run, config) = prepared_request_with_bytes(&pool, CAPACITY, 11, true, host);
     let (mut resumed, completion) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_resumed_sampler(plan, run.sampler_scope().unwrap())
         .unwrap();
     completion.finish().unwrap();
     assert_eq!(format!("{:?}", resumed.as_sampler()), original);
     drop((frozen, preparation, run));
-    assert_eq!(pool.used_bytes().unwrap(), host);
+    assert_eq!(pool.payload_used_bytes().unwrap(), host);
     grow(&mut resumed, &[23, 29]);
     assert_eq!(history(resumed.as_sampler()), &[3, 11, 7, 19, 5, 23, 29]);
     assert_eq!(resumed.issued_samples, 2);
     drop(resumed);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn zero_quota_keeps_inline_and_history_payload_and_overflow_never_copies() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (source, source_preparation, source_run) = source(&pool, CAPACITY, 0, false);
     let plan = source
         .borrow_funded()
@@ -528,7 +544,7 @@ fn zero_quota_keeps_inline_and_history_payload_and_overflow_never_copies() {
     );
     let (preparation, run, config) = prepared_request_with_bytes(&pool, CAPACITY, 0, false, inline);
     let (mut resumed, completion) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_resumed_sampler(plan, run.sampler_scope().unwrap())
         .unwrap();
@@ -548,7 +564,7 @@ fn zero_quota_keeps_inline_and_history_payload_and_overflow_never_copies() {
         source_preparation,
         source_run,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 
     let (pool, source, source_preparation, source_run) = seeded(false);
     let before = (usage(&pool), held(&pool), attempts());
@@ -572,7 +588,7 @@ fn zero_quota_keeps_inline_and_history_payload_and_overflow_never_copies() {
     );
     assert_eq!((usage(&pool), held(&pool), attempts()), before);
     drop((source, source_preparation, source_run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -592,7 +608,7 @@ fn panic_after_hold_releases_only_host_custody_and_never_certifies_native_work()
         FAIL_COPY.with(|flag| assert!(!flag.replace(true)));
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = preparation
-                .claim_sampling(config)
+                .claim_sampling(config.clone())
                 .unwrap()
                 .construct_resumed_sampler(plan, run.sampler_scope().unwrap());
         }));
@@ -601,24 +617,24 @@ fn panic_after_hold_releases_only_host_custody_and_never_certifies_native_work()
         assert_eq!((usage(&pool), held(&pool)), (before.0, before.1));
         assert_eq!(format!("{:?}", source.as_sampler()), original);
         assert!(matches!(
-            preparation.claim_sampling(config),
+            preparation.claim_sampling(config.clone()),
             Err(WorkingMemoryError::PreparationAlreadyStarted)
         ));
         drop((preparation, run));
         if let Some(native) = native {
-            assert_eq!(pool.used_bytes().unwrap(), SOURCE_BYTES + host);
+            assert_eq!(pool.payload_used_bytes().unwrap(), SOURCE_BYTES + host);
             // The host-only cleanup cannot certify this independent scope.
             drop(native);
             drop((source, source_preparation, source_run));
-            assert_eq!(pool.used_bytes().unwrap(), host);
+            assert_eq!(pool.payload_used_bytes().unwrap(), host);
             assert!(matches!(
                 pool.acquire_unquoted(),
                 Err(WorkingMemoryError::ReservedWorkActive)
             ));
         } else {
-            assert_eq!(pool.used_bytes().unwrap(), SOURCE_BYTES);
+            assert_eq!(pool.payload_used_bytes().unwrap(), SOURCE_BYTES);
             drop((source, source_preparation, source_run));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }

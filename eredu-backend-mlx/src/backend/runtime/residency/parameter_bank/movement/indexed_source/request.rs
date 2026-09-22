@@ -4,6 +4,18 @@ use std::{cell::RefCell,rc::Weak};
 use eredu_nn::TensorParallelGroupedOutput;
 use eredu_runtime::expert::IndexedInvocationRequest;
 
+/// The selected invocation keeps its own native execution mechanism. A funded
+/// ordinary source supplies only host custody to the existing ordinary scope.
+pub(crate) enum IndexedResidencyFactory {
+    Original(OriginalIndexedResidencyFactory),
+    Ordinary(OrdinaryIndexedResidencyFactory),
+}
+impl IndexedResidencyFactory {
+    pub(crate) fn funding(&self)->&HostMetadataFunding {
+        match self {Self::Original(source)=>source.funding(),Self::Ordinary(source)=>source.funding()}
+    }
+}
+
 /// Actual accepted request source. The implementation owns native parent
 /// admission/completion and occurrence order; this trait grants none of them.
 pub(crate) trait IndexedRequestSource {
@@ -13,7 +25,7 @@ pub(crate) trait IndexedRequestSource {
     fn complete_local(&self, completed: bool) -> Result<(), Error>;
     fn abort_local(&self);
     fn with_region(&self,bank:&IndexedBankSource,request:IndexedInvocationRequest<'_,MlxTensor>,stream:&Stream,
-        run:&mut dyn FnMut(OriginalIndexedResidencyFactory)->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)
+        run:&mut dyn FnMut(IndexedResidencyFactory)->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)
         ->Result<TensorParallelGroupedOutput<MlxTensor>,Error>;
 }
 struct Activation {active:Cell<bool>}
@@ -67,7 +79,10 @@ impl IndexedLocalRequest<'_> {
         if !self.activation.active.get() {
             self.owner.abort_local();
             self.finished = true;
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(Error::OriginalSourceContract {
+                stage: "indexed local request completion has a retired installation",
+                cause: eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            });
         }
         let result = self.owner.complete_local(completed);
         self.finished = true;
@@ -106,7 +121,7 @@ impl IndexedBankSource {
         let frames=[callback_bytes,size_of::<std::cell::Ref<'_,Option<Binding>>>(),size_of::<Rc<dyn IndexedRequestSource>>(),
             size_of::<Rc<Activation>>(),size_of::<IndexedInvocationRequest<'_,MlxTensor>>(),
             size_of::<Result<TensorParallelGroupedOutput<MlxTensor>,Error>>(),
-            size_of::<(&Self,&Stream,&mut dyn FnMut(OriginalIndexedResidencyFactory)
+            size_of::<(&Self,&Stream,&mut dyn FnMut(IndexedResidencyFactory)
                 ->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)>()];
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
@@ -148,11 +163,14 @@ impl IndexedBankSource {
     /// The immutable channel borrow remains held through the lexical callback,
     /// so its installation cannot be replaced during native work.
     pub(crate) fn with_request_region(&self,request:IndexedInvocationRequest<'_,MlxTensor>,stream:&Stream,
-        run:&mut dyn FnMut(OriginalIndexedResidencyFactory)->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)
+        run:&mut dyn FnMut(IndexedResidencyFactory)->Result<TensorParallelGroupedOutput<MlxTensor>,Error>)
         ->Option<Result<TensorParallelGroupedOutput<MlxTensor>,Error>> {
         let slot=match self.request.binding.try_borrow() {
             Ok(slot)=>slot,
-            Err(_)=>return Some(Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))),
+            Err(_)=>return Some(Err(Error::OriginalSourceContract {
+                stage: "indexed request dispatch channel is mutably borrowed",
+                cause: eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            })),
         };
         let binding=slot.as_ref()?;
         let fail=|cause|failed(cause,&self.bank,&binding.funding,None);

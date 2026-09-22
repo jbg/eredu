@@ -28,8 +28,8 @@ impl OriginalChatConsumer {
         self.payload().allowance.bytes()
     }
     /// Authenticate this allowance and its original rendering in the same pool.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if !self.payload().allowance.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if !self.payload().allowance.pool().same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         self.render().validate_pool(pool)

@@ -1,11 +1,10 @@
 //! Public borrowed plain-text composition over the original C/S/E/I/R driver.
 mod prepared;
-pub use prepared::{ManagedPreparedInputRequest, ManagedModelInputError};
-use super::LoadedModel;
 use super::original_token_input::plain::{
-    OriginalDomainError, OriginalPlainSession, OriginalPlainStartError,
-    start_original_plain_string_with_options_for,
+    start_original_plain_string_with_options_for, OriginalDomainError, OriginalPlainSession,
+    OriginalPlainStartError,
 };
+use super::LoadedModel;
 use crate::api::PreparedChatGenerationSettings;
 use eredu_core::{
     BackendFailure, ControlledTextGenerationError, FinishReason, GenerationCancellationToken,
@@ -16,6 +15,7 @@ use eredu_runtime::working_memory::{
     OriginalTextSourceBudget, OriginalTextSourceError, OriginalTokenizer, OriginalTokenizerBackend,
     OriginalTokenizerSourceError,
 };
+pub use prepared::{ManagedModelInputError, ManagedPreparedInputRequest};
 
 /// Actual input to fresh tokenizer source preparation.
 #[derive(Debug)]
@@ -26,7 +26,9 @@ pub enum TokenizerSourceInput {
     RetainedConfiguration,
 }
 impl From<std::fs::File> for TokenizerSourceInput {
-    fn from(file: std::fs::File) -> Self { Self::File(file) }
+    fn from(file: std::fs::File) -> Self {
+        Self::File(file)
+    }
 }
 
 /// An originally compiled tokenizer and decoder, authenticated against loaded metadata.
@@ -50,7 +52,9 @@ impl ManagedPlainTextSourceError {
     /// Fixed source refusal, when construction or matching rejected its identity.
     pub fn input_rejection(&self) -> Option<TokenInputRejection> {
         match self {
-            Self::Input(cause) | Self::Source(OriginalTokenizerSourceError::Domain(cause)) => Some(*cause),
+            Self::Input(cause) | Self::Source(OriginalTokenizerSourceError::Domain(cause)) => {
+                Some(*cause)
+            }
             _ => None,
         }
     }
@@ -63,7 +67,7 @@ impl ManagedPlainTextSource {
 
 /// Borrowed input and policy for the managed plain-text driver.
 /// Chat rendering, tools and owned callback events use their existing separate APIs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ManagedPlainTextRequest<'a> {
     /// Complete caller-owned plain prompt, borrowed only during startup.
     pub input: &'a str,
@@ -119,9 +123,15 @@ pub struct ManagedPlainTextError {
     input_preparation: Option<eredu_runtime::input::OriginalModelInputCustody>,
 }
 impl ManagedPlainTextError {
-    pub(crate) fn from_step(cause: BackendFailure,
-        input_preparation: Option<eredu_runtime::input::OriginalModelInputCustody>) -> Self {
-        Self { cause: Cause::Backend(cause), source_budget: None, input_preparation }
+    pub(crate) fn from_step(
+        cause: BackendFailure,
+        input_preparation: Option<eredu_runtime::input::OriginalModelInputCustody>,
+    ) -> Self {
+        Self {
+            cause: Cause::Backend(cause),
+            source_budget: None,
+            input_preparation,
+        }
     }
     fn new(cause: Cause) -> Self {
         Self {
@@ -229,10 +239,17 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         input: impl Into<TokenizerSourceInput>,
     ) -> Result<ManagedPlainTextSource, ManagedPlainTextSourceError> {
         let source = match input.into() {
-            TokenizerSourceInput::File(file) => crate::api::tokenizer::compile_original_text_tokenizer_file(&self.runtime, file)?,
-            TokenizerSourceInput::RetainedConfiguration => B::compile_original_tokenizer_source_for_generation(
-                &self.runtime, eredu_runtime::working_memory::OriginalTokenizerInput::Configuration(&self.tokenizer),
-            )?,
+            TokenizerSourceInput::File(file) => {
+                crate::api::tokenizer::compile_original_text_tokenizer_file(&self.runtime, file)?
+            }
+            TokenizerSourceInput::RetainedConfiguration => {
+                B::compile_original_tokenizer_source_for_generation(
+                    &self.runtime,
+                    eredu_runtime::working_memory::OriginalTokenizerInput::Configuration(
+                        &self.tokenizer,
+                    ),
+                )?
+            }
         };
         if !source.matches_configuration(&self.tokenizer) {
             return Err(TokenInputRejection::IdentityMismatch.into());
@@ -241,7 +258,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
     }
 
     /// Starts an originally admitted plain-text request using the existing controlled driver.
-    /// The request must specify a managed capacity. Missing complete backend bounds still
+    /// Missing complete backend bounds still
     /// refuse before prompt/native preparation; this entry supplies no admission fallback.
     /// Pre-start cancellation returns None before source validation or request construction.
     pub fn start_managed_plain_text<'a>(
@@ -265,32 +282,18 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        if request
-            .settings
-            .inference
-            .managed_memory_capacity_bytes
-            .is_none()
-        {
-            return Err(ManagedPlainTextError::new(Cause::Input(
-                TokenInputRejection::Unsupported,
-            )));
-        }
         if !source.0.matches_configuration(&self.tokenizer) {
             return Err(ManagedPlainTextError::new(Cause::Input(
                 TokenInputRejection::IdentityMismatch,
             )));
         }
         let (config, _) = self
-            .resolve_text_generation_settings(request.settings)
+            .resolve_text_generation_settings(request.settings.clone())
             .map_err(|e| ManagedPlainTextError::new(Cause::Generation(e)))?;
         let source_budget = B::prepare_original_text_source_budget(
             &self.runtime,
             &source.0,
-            request
-                .settings
-                .inference
-                .managed_memory_capacity_bytes
-                .expect("checked capacity"),
+            &request.settings.inference.memory_limits,
         )
         .map_err(|error| ManagedPlainTextError::new(Cause::Source(error)))?;
         // The exact public request/error plus internal startup return share the genuine
@@ -332,10 +335,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         emit: &mut impl for<'e> FnMut(GenerationPlainTextEvent<'e>),
     ) -> Result<Option<GenerationPlainTextOutput>, ManagedPlainTextError> {
         self.start_managed_plain_text(source, request, cancellation)?
-            .map(|session| {
-                session
-                    .run(cancellation, emit)
-            })
+            .map(|session| session.run(cancellation, emit))
             .transpose()
     }
 }
@@ -388,11 +388,11 @@ impl<B: eredu_runtime::execution_control::TextSnapshotBackend> ManagedPlainTextS
     pub fn snapshot(
         &mut self,
         budget: &eredu_runtime::execution_control::SnapshotBudget,
-        host_capacity_bytes: u64,
+        host_memory_limits: eredu_core::MemoryLimitDeclarations,
         native: eredu_runtime::working_memory::WorkspaceCopyLimits,
     ) -> Result<ManagedPlainTextSnapshot<B>, GenerationSnapshotError> {
         self.0
-            .snapshot(budget, host_capacity_bytes, native)
+            .snapshot(budget, host_memory_limits, native)
             .map(ManagedPlainTextSnapshot)
             .map_err(GenerationSnapshotError)
     }
@@ -419,10 +419,10 @@ where
     /// Cancellation or an already terminal snapshot returns None without copying.
     pub fn restore_managed_plain_text<'a>(
         &'a mut self, snapshot: &ManagedPlainTextSnapshot<B>,
-        settings: PreparedChatGenerationSettings, host_capacity_bytes:u64,
+        settings: PreparedChatGenerationSettings, host_memory_limits: eredu_core::MemoryLimitDeclarations,
         cancellation:&GenerationCancellationToken,
     ) -> Result<Option<ManagedPlainTextSession<'a,B>>,ManagedPlainTextError> {
-        self.resume_managed_plain_snapshot(snapshot,settings,host_capacity_bytes,false,cancellation)
+        self.resume_managed_plain_snapshot(snapshot,settings,host_memory_limits,false,cancellation)
     }
 
     /// Starts an independent branch at the same saved frontier. This uses the
@@ -431,26 +431,25 @@ where
     /// cumulative copy budget; dropping a branch never refunds completed copies.
     pub fn fork_managed_plain_text<'a>(
         &'a mut self, snapshot:&ManagedPlainTextSnapshot<B>,
-        settings:PreparedChatGenerationSettings,host_capacity_bytes:u64,
+        settings:PreparedChatGenerationSettings,host_memory_limits: eredu_core::MemoryLimitDeclarations,
         cancellation:&GenerationCancellationToken,
     ) -> Result<Option<ManagedPlainTextSession<'a,B>>,ManagedPlainTextError> {
-        self.resume_managed_plain_snapshot(snapshot,settings,host_capacity_bytes,true,cancellation)
+        self.resume_managed_plain_snapshot(snapshot,settings,host_memory_limits,true,cancellation)
     }
 
     fn resume_managed_plain_snapshot<'a>(
         &'a mut self,snapshot:&ManagedPlainTextSnapshot<B>,
-        mut settings:PreparedChatGenerationSettings,host_capacity_bytes:u64,branch:bool,
+        mut settings:PreparedChatGenerationSettings,host_memory_limits: eredu_core::MemoryLimitDeclarations,branch:bool,
         cancellation:&GenerationCancellationToken,
     ) -> Result<Option<ManagedPlainTextSession<'a,B>>,ManagedPlainTextError> {
         if cancellation.is_cancelled() || snapshot.finish_reason().is_some() { return Ok(None); }
-        let capacity = settings.inference.managed_memory_capacity_bytes.ok_or_else(|| ManagedPlainTextError::new(Cause::Input(TokenInputRejection::Unsupported)))?;
         if !snapshot.0.source().matches_configuration(&self.tokenizer) {
             return Err(ManagedPlainTextError::new(Cause::Input(TokenInputRejection::IdentityMismatch)));
         }
         if settings.overrides.max_new_tokens.is_none() { settings.overrides.max_new_tokens = snapshot.0.remaining_tokens(); }
         if settings.overrides.max_new_tokens == Some(0) { return Ok(None); }
         let (config,_) = self.resolve_text_generation_settings(settings).map_err(|e| ManagedPlainTextError::new(Cause::Generation(e)))?;
-        snapshot.0.resume(&mut self.runtime,config,host_capacity_bytes.min(capacity),branch,cancellation)
+        snapshot.0.resume(&mut self.runtime,config,host_memory_limits,branch,cancellation)
             .map(|session| session.map(ManagedPlainTextSession))
             .map_err(|e| ManagedPlainTextError::new(Cause::Snapshot(e)))
     }

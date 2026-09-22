@@ -1,11 +1,11 @@
 //! Read-only validation against contexts issued by the ordinary core machine.
 use super::*;
 
-fn unchanged(pool: &WorkingMemoryPool) -> (u64, u64, u64) {
+fn unchanged(pool: &MemoryLedger) -> (u64, u64, u64) {
     (
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
-        pool.effective_capacity().unwrap(),
+        pool.funded_used_bytes().unwrap(),
+        pool.payload_peak_bytes().unwrap(),
+        pool.payload_effective_capacity().unwrap(),
     )
 }
 
@@ -60,7 +60,7 @@ fn ordinary_and_controlled_ready_checks_preserve_first_permit_and_outputs() {
         assert_eq!(facts.borrow().submissions, 3);
         assert_eq!(facts.borrow().attempts[0].attempt(), 0);
         drop((runtime, prepared));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
 }
 
@@ -197,7 +197,7 @@ fn active_completed_and_abandoned_steps_never_become_initial_ready_again() {
         }
         assert_eq!(unchanged(&pool), before);
         drop(prepared);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
 }
 
@@ -212,13 +212,13 @@ fn zero_allowance_and_separate_request_domain_checks_do_not_gain_authority() {
     }
     fn zero_preparation() -> (
         InferenceTextPreparation,
-        WorkingMemoryPool,
+        MemoryLedger,
         InferenceExecutionIdentity,
     ) {
         let mut g = geometry(3, OutputDemand::LastPosition);
         g.max_output_tokens = 0;
         let execution = InferenceExecutionIdentity::default();
-        let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+        let pool = memory::host_ledger(65536, 0).unwrap();
         let request = InferenceRequest::from(pool.reserve(&execution, &admission(g)).unwrap());
         let preparation = request.prepare_text(&execution, g, zero_config()).unwrap();
         (preparation, pool, execution)
@@ -237,11 +237,7 @@ fn zero_allowance_and_separate_request_domain_checks_do_not_gain_authority() {
     prepared.validate_initial_ready_context(&context).unwrap();
     let request = prepared.request();
     request.validate(&execution, request.geometry()).unwrap();
-    request
-        .memory_reservation()
-        .unwrap()
-        .validate_domain(&pool)
-        .unwrap();
+    request.memory_reservation().validate_ledger(&pool).unwrap();
     let (other, foreign_pool, foreign_execution) = zero_preparation();
     assert_eq!(
         request.validate_same_request(other.request()),
@@ -252,10 +248,7 @@ fn zero_allowance_and_separate_request_domain_checks_do_not_gain_authority() {
         Err(WorkingMemoryError::IdentityMismatch)
     );
     assert_eq!(
-        request
-            .memory_reservation()
-            .unwrap()
-            .validate_domain(&foreign_pool),
+        request.memory_reservation().validate_ledger(&foreign_pool),
         Err(WorkingMemoryError::IdentityMismatch)
     );
     let mut wrong_geometry = request.geometry();

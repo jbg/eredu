@@ -189,15 +189,23 @@ fn pipeline_ring_worker() {
             )
             .expect("Qwen3-VL JSON config")
         });
-    let local_layer_range =
-        if let Some(layers) = neutral_gemma_layers.or(neutral_prediction_target_layers) {
-            layers * pipeline_rank / pipeline_parallel_size
-                ..layers * (pipeline_rank + 1) / pipeline_parallel_size
-        } else if pipeline_parallel_size == 1 {
-            0..family.layer_count()
-        } else {
-            family.stage_range(pipeline_rank)
-        };
+    let ar_capture_layers = std::env::var_os(ORIGINAL_AR_CAPTURE).map(|_| {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture_root.join("config.json")).unwrap())
+                .unwrap();
+        config["num_hidden_layers"].as_u64().unwrap() as usize
+    });
+    let local_layer_range = if let Some(layers) = neutral_gemma_layers
+        .or(neutral_prediction_target_layers)
+        .or(ar_capture_layers)
+    {
+        layers * pipeline_rank / pipeline_parallel_size
+            ..layers * (pipeline_rank + 1) / pipeline_parallel_size
+    } else if pipeline_parallel_size == 1 {
+        0..family.layer_count()
+    } else {
+        family.stage_range(pipeline_rank)
+    };
     let public_output_owner = topology
         .topology()
         .rank_for(eredu_core::ParallelCoordinates::new(
@@ -218,6 +226,15 @@ fn pipeline_ring_worker() {
     // from their birth. An ordinary stream created first cannot be adopted by
     // the later bounded host or disk materializer.
     let prepared_backend = std::env::var_os(OPAQUE_SESSION).is_some().then(|| {
+        if std::env::var_os(ORIGINAL_AR_CAPTURE).is_some() && device_type == DeviceType::Cpu {
+            let streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_cpu_factory_with_matmul(
+                &crate::backend::managed_memory::ledger(),
+                crate::backend::nn::workspace::MlxCpuMatmulMechanism::select(
+                    eredu_nn::CpuMatmulImplementation::Float32Tiles,
+                ).unwrap(),
+            ).unwrap().unwrap();
+            return MlxBackend::with_prepared_distributed_world(streams, &native_group);
+        }
         crate::native::prepared_distributed_backend_on(&native_group, device_type)
             .expect("prepared Ring execution/source stream construction")
             .expect("selected Ring device has a qualified stream constructor")
@@ -276,11 +293,7 @@ fn pipeline_ring_worker() {
                     let depth = config["vision_config"]["num_hidden_layers"]
                         .as_u64()
                         .unwrap_or(0) as usize;
-                    if pipeline_rank == 0 {
-                        depth
-                    } else {
-                        0
-                    }
+                    if pipeline_rank == 0 { depth } else { 0 }
                 }
                 FixtureFamily::Qwen3Vl
                 | FixtureFamily::Qwen3VlMoe
@@ -385,6 +398,72 @@ fn pipeline_ring_worker() {
         let selected_paged = PagedCacheOptions::new(1, device_cache_bytes, host_cache_bytes, 1)
             .unwrap()
             .with_full_attention(true);
+        let selected_paged = if std::env::var_os(ORIGINAL_AR_CAPTURE).is_some() {
+            // One prepared K/V Host pair fits the per-manager tier. The actual
+            // paged source prepares all possible stores before numerical entry,
+            // alongside the live cache; those independent destinations share
+            // this larger pool without changing each manager's eviction policy.
+            let populations = crate::composition::mlx::speculative::autoregressive::capture_tests::prepared_cache_pool_populations(local_layer_range.len());
+            let device = device_cache_bytes.checked_mul(populations).unwrap();
+            let host = host_cache_bytes.checked_mul(populations).unwrap();
+            let transfer = device.max(host).checked_mul(2).unwrap();
+            selected_paged
+                .with_pool(eredu_runtime::cache::CacheResidencyPool::new(
+                    eredu_runtime::cache::CachePoolLimits::new(device, host, transfer, 0).unwrap(),
+                ))
+                .unwrap()
+        } else if std::env::var_os(OPAQUE_COMPONENT_CAPTURE).is_some() {
+            // Saved, branch and provisional cache copies retain independent
+            // namespaces. Original source preparation also retains destination
+            // buffers for the whole request before its first step. Preserve
+            // each manager's eviction tiers within this shared fixture pool.
+            let limits = component_snapshot_limits();
+            let owners = limits
+                .max_snapshots
+                .checked_add(limits.max_branches)
+                .and_then(|n| n.checked_add(2)) // live source and restore destination
+                .unwrap();
+            let prompt_positions = u64::try_from(component_capture_prompt_tokens().len()).unwrap();
+            let output_positions =
+                u64::try_from(component_snapshot_sampling().max_new_tokens.unwrap()).unwrap();
+            let prepared_frontiers = prompt_positions.checked_add(output_positions).unwrap();
+            let retained_tiers = owners.checked_mul(prepared_frontiers).unwrap();
+            let device = device_cache_bytes.checked_mul(retained_tiers).unwrap();
+            let host = host_cache_bytes.checked_mul(retained_tiers).unwrap();
+            let transfer = device.max(host).checked_mul(2).unwrap();
+            selected_paged
+                .with_pool(eredu_runtime::cache::CacheResidencyPool::new(
+                    eredu_runtime::cache::CachePoolLimits::new(device, host, transfer, 0).unwrap(),
+                ))
+                .unwrap()
+        } else if family == FixtureFamily::Qwen3Moe
+            && expert_parallel_size > 1
+            && pipeline_parallel_size == 1
+            && std::env::var_os(DENSE_STREAM).is_none()
+            && std::env::var_os(LAYERWISE_HOST).is_none()
+            && std::env::var_os(EXPERT_CACHE).is_none()
+        {
+            // Each admitted request retains prospective destinations alongside
+            // live state. Keep the per-manager eviction tiers unchanged while
+            // funding the shared pool for both owners at every bounded frontier.
+            let frontiers = (ADMITTED_EXPERT_PREFIX.len() as u64)
+                .checked_add(ADMITTED_EXPERT_PREDICTIONS as u64 - 1)
+                .unwrap();
+            let populations = (local_layer_range.len() as u64)
+                .checked_mul(frontiers)
+                .and_then(|n| n.checked_mul(2))
+                .unwrap();
+            let device = device_cache_bytes.checked_mul(populations).unwrap();
+            let host = host_cache_bytes.checked_mul(populations).unwrap();
+            let transfer = device.max(host).checked_mul(2).unwrap();
+            selected_paged
+                .with_pool(eredu_runtime::cache::CacheResidencyPool::new(
+                    eredu_runtime::cache::CachePoolLimits::new(device, host, transfer, 0).unwrap(),
+                ))
+                .unwrap()
+        } else {
+            selected_paged
+        };
         let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
         let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
         assert!(!(dense_stream && layerwise_host));
@@ -575,6 +654,7 @@ fn pipeline_ring_worker() {
                 selected_composite_fixture_counts(selected.neutral().execution())
             });
         let inspection = component_fixture_inspection(&checkpoint);
+        let text_output_width = inspection.architecture_plan().text_output_width();
         let admitted_payload_stores = inspection
             .validated_gguf()
             .map_or(1, |validated| 1 + validated.companions().count());
@@ -592,7 +672,7 @@ fn pipeline_ring_worker() {
                 );
                 return;
             }
-            Err(error) => panic!("failed to load Ring fixture: {error}"),
+            Err(error) => panic!("failed to load Ring fixture: {error:?}"),
         };
         if prove_prepared_communication_lifecycle {
             assert_eq!(
@@ -747,12 +827,16 @@ fn pipeline_ring_worker() {
                 streamed.len(),
                 local_residency_units + prediction_units.len()
             );
-            assert!(prediction_units
-                .iter()
-                .all(|id| streamed.iter().any(|unit| unit.id() == id)));
-            assert!(streamed
-                .iter()
-                .all(|unit| !unit.host_resident() && !unit.device_resident()));
+            assert!(
+                prediction_units
+                    .iter()
+                    .all(|id| streamed.iter().any(|unit| unit.id() == id))
+            );
+            assert!(
+                streamed
+                    .iter()
+                    .all(|unit| !unit.host_resident() && !unit.device_resident())
+            );
         }
         if layerwise_host {
             assert!(model.dense_stream_report().unwrap().is_none());
@@ -766,12 +850,16 @@ fn pipeline_ring_worker() {
                 layerwise.len(),
                 local_residency_units + prediction_units.len()
             );
-            assert!(prediction_units
-                .iter()
-                .all(|id| layerwise.iter().any(|unit| unit.id() == id)));
-            assert!(layerwise
-                .iter()
-                .all(|unit| unit.host_resident() && !unit.device_resident()));
+            assert!(
+                prediction_units
+                    .iter()
+                    .all(|id| layerwise.iter().any(|unit| unit.id() == id))
+            );
+            assert!(
+                layerwise
+                    .iter()
+                    .all(|unit| unit.host_resident() && !unit.device_resident())
+            );
         }
         if std::env::var_os(OPAQUE_DEEPSEEK_MTP_TARGET).is_some() {
             assert_eq!(
@@ -783,6 +871,13 @@ fn pipeline_ring_worker() {
             );
         }
         let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
+        if std::env::var_os(ORIGINAL_AR_CAPTURE).is_some() {
+            let (backend, session) = runtime.parts_mut();
+            crate::composition::mlx::speculative::autoregressive::capture_tests::verify_partition_provider(
+                backend, session, &checkpoint,
+            );
+            return;
+        }
         let distributed_view =
             <MlxBackend<'_> as eredu_core::DistributedBackend>::distributed_session(
                 runtime.session(),
@@ -808,10 +903,12 @@ fn pipeline_ring_worker() {
         if std::env::var_os(OPAQUE_COMPONENT_CAPTURE).is_some() {
             // Exercise cold source admission before the ordinary numerical
             // oracle mutates parameters or state and acquires unquoted owners.
-            runtime.session().verify_original_partition_capture_publication(
-                component_capture_prompt_tokens().len() as u64,
-            );
-            let backend = MlxBackend::new(&stream, &weights_stream);
+            runtime
+                .session()
+                .verify_original_partition_capture_publication(
+                    component_capture_prompt_tokens().len() as u64,
+                );
+            let backend = prepared_component_backend(&stream);
             let reference_path = if family == FixtureFamily::Qwen3MoeGguf {
                 checkpoint.parent().unwrap().join("independent-reference")
             } else {
@@ -923,9 +1020,9 @@ fn pipeline_ring_worker() {
                 }
             }
             if family == FixtureFamily::Qwen3 {
-                runtime
-                    .session_mut()
-                    .verify_partition_parameter_owner_for_test(&stream, &mut reference);
+                let (backend, session) = runtime.parts_mut();
+                let environment = backend.original_copy_environment().unwrap();
+                session.verify_partition_parameter_owner_for_test(&environment, &mut reference);
             }
             let loop_normalization = (family == FixtureFamily::Nanbeige).then_some((
                 "model.layers.0.feed_forward.residual",
@@ -1346,9 +1443,8 @@ fn pipeline_ring_worker() {
             }
             verify_loaded_component_capture(
                 &mut runtime,
-                &checkpoint,
+                &mut reference,
                 &stream,
-                &reference_load_options,
                 loop_normalization,
                 required_unit_points,
                 stream_readout.as_ref(),
@@ -1373,6 +1469,25 @@ fn pipeline_ring_worker() {
             .map(|token| token.unwrap().token_id().unwrap())
             .collect::<Vec<_>>();
             assert_eq!(generated.len(), 3);
+            return;
+        }
+        if family == FixtureFamily::Qwen3Moe
+            && expert_parallel_size > 1
+            && pipeline_parallel_size == 1
+            && !dense_stream
+            && !layerwise_host
+            && std::env::var_os(EXPERT_CACHE).is_none()
+        {
+            verify_admitted_expert_session(
+                &mut runtime,
+                &checkpoint,
+                MlxLoadRequest::from_normalized(reference_load_options.clone()),
+                &stream,
+                &prompt_cache_root,
+                expected_rank,
+                local_layer_range.len(),
+                family.comparison_tolerance(),
+            );
             return;
         }
         assert_eq!(
@@ -1435,23 +1550,31 @@ fn pipeline_ring_worker() {
             assert_eq!(state.fixed_state_bytes, 0);
         }
 
-        assert!(matches!(
-            eredu_core::apply_admission_policy(
-                &capabilities,
-                eredu_core::AdmissionRequest {
-                    input: counted,
-                    max_output_tokens: 2,
-                    batch_size: 1,
-                    safety_reserve_bytes: 0,
-                    application_memory_budget_bytes: None,
-                    require_complete_estimate: false,
-                },
-                state,
-                None,
-            )
-            .unwrap(),
-            eredu_core::AdmissionResult::Admitted(_)
-        ));
+        let admission_request = eredu_core::AdmissionRequest {
+            input: counted,
+            max_output_tokens: 2,
+            batch_size: 1,
+            additional_headroom: crate::memory_fixture::headroom(0),
+            memory_limits: Default::default(),
+        };
+        assert_eq!(
+            eredu_core::check_admission_context(&capabilities, admission_request.clone()).unwrap(),
+            None,
+        );
+        // Persistent-state geometry alone does not price the model equation.
+        // The executable below supplies and admits its actual workspace source.
+        assert!(state.execution_workspace.is_none());
+        let admission =
+            eredu_core::apply_admission_policy(&capabilities, admission_request, state).unwrap();
+        assert!(
+            matches!(
+                admission,
+                eredu_core::AdmissionResult::Rejected(
+                    eredu_core::AdmissionRejection::EstimationUnsupported { .. }
+                )
+            ),
+            "persistent-only admission: {admission:?}",
+        );
         let static_memory =
             <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::static_memory(&runtime)
                 .unwrap();
@@ -1837,9 +1960,18 @@ fn pipeline_ring_worker() {
                 assert!(runtime.synchronize().is_err());
                 return;
             }
-            let output = run_neutral_embedded_mtp(
+            let embedded_source = {
+                let model = runtime.session().original_model_source().unwrap();
+                crate::tests::support::plain_controller::controller_source(
+                    runtime.backend().memory_ledger(),
+                    model.erased().inference_execution_identity(),
+                    text_output_width.expect("retained text output domain"),
+                )
+            };
+            let output = run_admitted_embedded_tokens(
                 &mut runtime,
-                synthetic_prediction_input(&parts, &prefix_tokens),
+                &embedded_source,
+                &prefix_tokens,
                 SpeculativeConfig {
                     max_tokens,
                     max_draft_tokens: proposal_capacity,
@@ -1870,9 +2002,10 @@ fn pipeline_ring_worker() {
                 || qwen_hybrid_mtp_mode
                 || nemotron_h_mtp_mode
             {
-                let replay = run_neutral_embedded_mtp(
+                let replay = run_admitted_embedded_tokens(
                     &mut runtime,
-                    synthetic_prediction_input(&parts, &prefix_tokens),
+                    &embedded_source,
+                    &prefix_tokens,
                     SpeculativeConfig {
                         max_tokens,
                         max_draft_tokens: 1,
@@ -2520,70 +2653,53 @@ fn pipeline_ring_worker() {
     }
 }
 
-/// Every rank advances the same serial branch schedule through the public neutral
-/// state contract. Copies share weights, while mutable KV storage is independent.
+/// Every rank advances the same admitted serial branch schedule. The shared
+/// provider copies its exact sequence and all independently writable native state.
 fn verify_distributed_control_branches(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
-    owns_public_output: bool,
+    _owns_public_output: bool,
 ) {
-    use eredu_core::execution_control::{ControlSupport, NativeTextStateBackend};
-    assert_eq!(
-        MlxBackend::native_text_state_support(runtime),
-        ControlSupport::Supported
-    );
-    let estimate = MlxBackend::estimate_native_text_state(runtime, None)
-        .unwrap()
-        .unwrap();
-    assert!(estimate.copy_bytes > 0 && estimate.retained_bytes > 0);
-    let saved = MlxBackend::capture_native_text_state(runtime).unwrap();
-    let mut first = MlxBackend::copy_native_text_state(runtime, &saved).unwrap();
-    let mut second = MlxBackend::copy_native_text_state(runtime, &saved).unwrap();
+    let (mut state, mut provider) =
+        component_state_start(runtime, None, component_snapshot_sampling());
+    let budget = component_snapshot_budget();
+    let saved = component_capture_snapshot(&mut state, &mut provider, &budget);
     assert!(
-        MlxBackend::estimate_native_text_growth(runtime, &saved, 4)
-            .unwrap()
+        saved
+            .0
+            .native_continuation_growth(state.runtime(), 4)
             .unwrap()
             > 0
     );
-    let advance = |runtime: &mut ModelRuntime<MlxBackend<'_>>, tokens: &[u32]| {
-        tokens
-            .iter()
-            .map(|&token| {
-                let (backend, session) = runtime.parts_mut();
-                let output = session
-                    .decode(backend, Array::from_slice(&[token], &[1, 1]))
-                    .unwrap()
-                    .wait()
-                    .unwrap();
-                assert_eq!(output.logits().is_some(), owns_public_output);
-                output.logits().map(|logits| {
-                    logits
-                        .as_array()
-                        .evaluated()
-                        .unwrap()
-                        .as_slice::<f32>()
-                        .to_vec()
+    let options =
+        eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Branch);
+    let mut first = component_capture_fork(&mut state, &mut provider, &saved, &options);
+    let mut second = component_capture_fork(&mut state, &mut provider, &saved, &options);
+    let advance =
+        |state: &mut ComponentState<'_, '_>, provider: &mut ComponentProvider, count: usize| {
+            (0..count)
+                .map(|_| {
+                    let token = state.next().unwrap().unwrap().token_id();
+                    provider.observe_token(token);
+                    token
                 })
-            })
-            .collect::<Vec<_>>()
-    };
-    let baseline = advance(runtime, &[1, 2, 3, 4]);
-    MlxBackend::exchange_native_text_state(runtime, &mut first).unwrap();
+                .collect::<Vec<_>>()
+        };
+    let baseline = advance(&mut state, &mut provider, 4);
+    component_capture_exchange(&mut state, &mut provider, &mut first);
     drop(first);
-    assert_eq!(advance(runtime, &[1, 2]), baseline[..2]);
-    let mid = MlxBackend::capture_native_text_state(runtime).unwrap();
-    let mut resumed = MlxBackend::copy_native_text_state(runtime, &mid).unwrap();
+    assert_eq!(advance(&mut state, &mut provider, 2), baseline[..2]);
+    let mid = component_capture_snapshot(&mut state, &mut provider, &budget);
+    let mut resumed = component_capture_fork(&mut state, &mut provider, &mid, &options);
     drop(mid);
-    let _ = advance(runtime, &[5]);
-    MlxBackend::exchange_native_text_state(runtime, &mut second).unwrap();
+    let _ = advance(&mut state, &mut provider, 1);
+    component_capture_exchange(&mut state, &mut provider, &mut second);
     drop(second);
-    assert_eq!(advance(runtime, &[1, 2, 3, 4]), baseline);
-    MlxBackend::exchange_native_text_state(runtime, &mut resumed).unwrap();
+    assert_eq!(advance(&mut state, &mut provider, 4), baseline);
+    component_capture_exchange(&mut state, &mut provider, &mut resumed);
     drop(resumed);
-    assert_eq!(advance(runtime, &[3, 4]), baseline[2..]);
-    // Reusing an immutable snapshot after all descendants advanced remains exact.
-    let mut restored = MlxBackend::copy_native_text_state(runtime, &saved).unwrap();
-    MlxBackend::exchange_native_text_state(runtime, &mut restored).unwrap();
-    assert_eq!(advance(runtime, &[1, 2, 3, 4]), baseline);
+    assert_eq!(advance(&mut state, &mut provider, 2), baseline[2..]);
+    component_capture_restore(&mut state, &mut provider, &saved);
+    assert_eq!(advance(&mut state, &mut provider, 4), baseline);
 }
 
 fn verify_public_partition_parameter_access(
@@ -2738,27 +2854,31 @@ fn verify_public_partition_parameter_access(
         shape: descriptor.shape.iter().map(|n| (*n).min(2)).collect(),
     };
     // One peer exhausts its caller allowance before local metadata is built.
-    assert!(MlxBackend::query_parameter(
-        runtime,
-        &facts.identity,
-        target,
-        selected.clone(),
-        if rank == 1 { facts.usage } else { limits }
-    )
-    .is_err());
+    assert!(
+        MlxBackend::query_parameter(
+            runtime,
+            &facts.identity,
+            target,
+            selected.clone(),
+            if rank == 1 { facts.usage } else { limits }
+        )
+        .is_err()
+    );
     // One peer presents foreign local authority while every request intent matches.
-    assert!(MlxBackend::query_parameter(
-        runtime,
-        if rank == 1 {
-            "foreign-model"
-        } else {
-            &facts.identity
-        },
-        target,
-        selected,
-        limits
-    )
-    .is_err());
+    assert!(
+        MlxBackend::query_parameter(
+            runtime,
+            if rank == 1 {
+                "foreign-model"
+            } else {
+                &facts.identity
+            },
+            target,
+            selected,
+            limits
+        )
+        .is_err()
+    );
     for target in targets {
         let descriptor = facts.parameters.iter().find(|p| p.id == target).unwrap();
         let region = ParameterRegion {
@@ -2816,7 +2936,7 @@ fn verify_public_partition_parameter_access(
             .unwrap();
             assert_eq!(actual.shape, expected.shape);
             assert_eq!(actual.values.len(), expected.values.len());
-            for (actual, expected) in actual.values.iter().zip(expected.values) {
+            for (actual, expected) in actual.values.iter().zip(&expected.values) {
                 assert!(
                     (actual - expected).abs() < 2e-5,
                     "global projection {target} axis{axis}: {actual} vs {expected}"

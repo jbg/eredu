@@ -14,7 +14,11 @@ enum Case {
 }
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -500,8 +504,8 @@ mod native {
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[test]
 fn source_representation_controls_dense_projection_and_owned_borrowed_facts() {
-    use WorkspaceFloatingType as F;
     use eredu_nn::ParameterId;
+    use WorkspaceFloatingType as F;
 
     #[derive(Clone, Copy, Debug)]
     enum Source {

@@ -17,7 +17,7 @@ use std::{
     marker::PhantomData,
     mem::size_of,
     ops::Deref,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 /// Common immutable owner consumed by the existing media driver. Ordinary
@@ -94,7 +94,11 @@ impl OriginalEncoderTableProjection {
     }
     /// Borrows the original fixed tables; no numerical copy occurs.
     pub fn tables(&self) -> PatchEncoderTables<'_> {
-        self.0.as_deref().expect("live projection").tables().expect("completed encoder projection")
+        self.0
+            .as_deref()
+            .expect("live projection")
+            .tables()
+            .expect("completed encoder projection")
     }
 }
 impl Clone for OriginalEncoderTableProjection {
@@ -123,36 +127,53 @@ impl fmt::Debug for OriginalEncoderTableProjection {
 pub struct OriginalPreparedInputProjection(Option<Arc<dyn EncoderStorage>>);
 impl OriginalPreparedInputProjection {
     pub fn source(&self) -> &OriginalPreparedHostInput {
-        self.0.as_deref().expect("live prepared projection").source()
+        self.0
+            .as_deref()
+            .expect("live prepared projection")
+            .source()
     }
     pub fn identity(&self) -> &PreparedInputIdentity {
-        self.0.as_deref().expect("live prepared projection").identity()
+        self.0
+            .as_deref()
+            .expect("live prepared projection")
+            .identity()
     }
     /// Whether this same B contains the completed selected encoder tables.
     pub fn has_encoder_tables(&self) -> bool {
-        self.0.as_deref().expect("live prepared projection").tables().is_some()
+        self.0
+            .as_deref()
+            .expect("live prepared projection")
+            .tables()
+            .is_some()
     }
     /// Moves the same owner into its more restrictive table loan. Missing
     /// tables return the complete source without allocating or losing custody.
     pub fn into_encoder_tables(mut self) -> Result<OriginalEncoderTableProjection, Self> {
-        if !self.has_encoder_tables() { return Err(self); }
+        if !self.has_encoder_tables() {
+            return Err(self);
+        }
         Ok(OriginalEncoderTableProjection(self.0.take()))
     }
 }
 impl Clone for OriginalPreparedInputProjection {
     fn clone(&self) -> Self {
-        Self(Some(Arc::clone(self.0.as_ref().expect("live prepared projection"))))
+        Self(Some(Arc::clone(
+            self.0.as_ref().expect("live prepared projection"),
+        )))
     }
 }
 impl Drop for OriginalPreparedInputProjection {
     fn drop(&mut self) {
-        if let Some(value) = self.0.take() { value.retire(); }
+        if let Some(value) = self.0.take() {
+            value.retire();
+        }
     }
 }
 impl fmt::Debug for OriginalPreparedInputProjection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OriginalPreparedInputProjection")
-            .field("encoder_tables", &self.has_encoder_tables()).finish_non_exhaustive()
+            .field("encoder_tables", &self.has_encoder_tables())
+            .finish_non_exhaustive()
     }
 }
 struct SharedPrepared<T>(Option<Arc<PreparedPayload<T>>>);
@@ -201,14 +222,15 @@ impl<T> PreparedModelInputOwner<T> {
     // Only the shared original projection worker can obtain this account-only
     // alias. No native tensor or source payload is retained by the returned pin.
     pub(super) fn workspace_custody(&self) -> Option<PreparedInputHostCustody> {
-        self.workspace_custody_ref().map(PreparedInputHostCustody::share)
+        self.workspace_custody_ref()
+            .map(PreparedInputHostCustody::share)
     }
     pub(super) fn workspace_custody_ref(&self) -> Option<&PreparedInputHostCustody> {
         match &self.0 {
             PreparedOwner::Ordinary(_) => None,
-            PreparedOwner::Original(value) => Some(
-                &value.0.as_deref().expect("live prepared owner").custody,
-            ),
+            PreparedOwner::Original(value) => {
+                Some(&value.0.as_deref().expect("live prepared owner").custody)
+            }
         }
     }
     /// Fixed source-derived encoder tables installed by the same original B
@@ -244,9 +266,12 @@ impl<T> PreparedModelInputOwner<T> {
     /// Retains the exact completed B allocation, including any native slots,
     /// original host source and its paid account. Ordinary inputs have no loan.
     pub fn original_projection(&self) -> Option<OriginalPreparedInputProjection>
-    where T: Send + Sync + 'static,
+    where
+        T: Send + Sync + 'static,
     {
-        let PreparedOwner::Original(value) = &self.0 else { return None; };
+        let PreparedOwner::Original(value) = &self.0 else {
+            return None;
+        };
         let payload = value.0.as_ref().expect("live prepared owner");
         let shared = Arc::clone(payload);
         let erased: Arc<dyn EncoderStorage> = shared;
@@ -352,7 +377,7 @@ impl<T, U, N> PreparedModelInputSource<T, U, N> {
         self.body().native.as_ref()
     }
     /// Full B residence shared by this body and its escaped concrete owners.
-    pub fn original_bytes(&self) -> u64 {
+    pub fn original_bytes(&self) -> Option<u64> {
         self.body().custody.bytes()
     }
 }
@@ -441,7 +466,14 @@ fn extent_key(extent: InputExtent) -> Result<u32, WorkingMemoryError> {
             u32::try_from(v).map_err(|_| WorkingMemoryError::Overflow)?;
             Ok(1)
         }
-        InputExtent::VideoFrame { group, index, count, first_source_frame, last_source_frame, .. } => {
+        InputExtent::VideoFrame {
+            group,
+            index,
+            count,
+            first_source_frame,
+            last_source_frame,
+            ..
+        } => {
             for value in [group, index, count, first_source_frame, last_source_frame] {
                 u32::try_from(value).map_err(|_| WorkingMemoryError::Overflow)?;
             }
@@ -522,7 +554,10 @@ impl<'a, T, U, N, E: std::error::Error> PreparedModelInputSourcePlan<'a, T, U, N
             }
             if !matches!(
                 slot.values,
-                HostTensorValues::U32(_) | HostTensorValues::I32(_) | HostTensorValues::F32(_) | HostTensorValues::Bool(_)
+                HostTensorValues::U32(_)
+                    | HostTensorValues::I32(_)
+                    | HostTensorValues::F32(_)
+                    | HostTensorValues::Bool(_)
             ) {
                 return Err(WorkingMemoryError::UnknownBound);
             }

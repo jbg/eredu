@@ -4,7 +4,7 @@ use crate::composition::mlx::replicated_text::tests::{
     routed_deepseek_v4_config, tiny_artifact, tiny_heterogeneous_artifact,
 };
 use crate::tests::support::path_instrumentation as paths;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -31,17 +31,29 @@ fn artifact(v4: bool) -> tempfile::TempDir {
 }
 
 fn reclaim() {
+    safemlx::memory::clear_cache();
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
 }
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        let snapshot = pool.snapshot().unwrap();
+        pool.fixture_host_charge().unwrap() == bytes
+            && snapshot.unquoted_owners == 0
+            && (bytes != 0
+                || (snapshot.funding_accounts == 0
+                    && snapshot.reservations == 0
+                    && snapshot.domains.iter().all(|domain| {
+                        domain.current_charge_bytes == domain.fixed_baseline.total().unwrap()
+                    })))
     });
 }
-fn usage(pool: &WorkingMemoryPool) -> (u64, u64) {
-    (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap())
+fn usage(pool: &MemoryLedger) -> (u64, u64) {
+    (
+        pool.fixture_host_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
+    )
 }
 fn cause<'a, T: std::error::Error + 'static>(
     mut error: &'a (dyn std::error::Error + 'static),
@@ -57,7 +69,11 @@ fn cause<'a, T: std::error::Error + 'static>(
 #[derive(Default)]
 struct Parameters(BTreeMap<String, safemlx::AllocationIdentity>);
 impl eredu_nn::ParameterSlotVisitor<crate::MlxTensor> for Parameters {
-    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &crate::MlxTensor) {
+    fn visit_slot(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &crate::MlxTensor,
+    ) {
         let identity = value
             .as_array()
             .try_metadata_snapshot()
@@ -90,8 +106,8 @@ fn module_storage(model: &mut MlxModel) -> RetainedStorage {
 
 fn loaded_aliases(v4: bool) {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let root = artifact(v4);
     let mut model =
         eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default()).unwrap();
@@ -196,10 +212,17 @@ fn loaded_aliases(v4: bool) {
     // Loading also retains input-derived source-metadata reservations. The
     // physical inventory is a lower bound on that combined charge; the exact
     // helper-only charge and complete source retirement are checked below.
-    assert!(pool.used_bytes().unwrap() >= inventory.nonstate_bytes().unwrap().unwrap());
+    assert!(pool.fixture_host_charge().unwrap() >= inventory.nonstate_bytes().unwrap().unwrap());
     drop(inventory);
     let aliases = helpers.clone();
-    let helper_bytes: u64 = helper_facts.values().sum();
+    let helper_bytes = helpers
+        .iter()
+        .try_fold(0u64, |sum, helper| {
+            let backing = helper.allocation_info().unwrap().unwrap();
+            sum.checked_add(u64::try_from(backing.bytes()).unwrap())
+                .and_then(|n| n.checked_add(u64::try_from(backing.host_control_bytes()).unwrap()))
+        })
+        .unwrap();
     drop(runtime);
     stream.synchronize().unwrap();
     settle(&pool, helper_bytes);
@@ -244,8 +267,8 @@ impl Drop for FinalizationFailure {
 #[test]
 fn public_loading_failure_after_helper_submission_preserves_typed_cause_and_recovers() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let root = artifact(true);
     let dropped = Arc::new(AtomicBool::new(false));
     Executable::reject_next_loaded_helper_finalization_for_test(Error::Other(Box::new(
@@ -265,7 +288,7 @@ fn public_loading_failure_after_helper_submission_preserves_typed_cause_and_reco
         "loading reached actual parameter materialization"
     );
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         0,
         "failure precedes physical publication"
     );
@@ -280,7 +303,7 @@ mod generation {
     use super::*;
     use eredu_core::{
         ControlledTextGeneration, InferenceGeometry, OutputDemand, TextGeneration,
-        TextGenerationInput, TextPreparationInput, TokenFilterController,
+        TextGenerationInput, TokenFilterController,
     };
 
     #[derive(Clone, Default)]
@@ -333,29 +356,41 @@ mod generation {
         .with_seed(19)
         .with_inference_policy(eredu_core::TextInferencePolicy {
             prefill_chunk_positions: std::num::NonZeroU64::new(2),
-            managed_memory_capacity_bytes: capacity,
+            memory_limits: (capacity).map_or_else(
+                eredu_core::MemoryLimitDeclarations::unlimited,
+                |bytes| {
+                    eredu_core::MemoryLimitDeclarations::new([(
+                        "host".into(),
+                        eredu_core::MemoryLimit::Finite(bytes),
+                    )])
+                },
+            ),
             submission_tracking_capacity_bytes: None,
             graph_metadata_capacity_bytes: None,
         })
     }
-    fn evidence() -> TextPreparationInput<'static, MlxModelInput> {
-        let ids = tokens();
-        TextPreparationInput::TokenIds {
-            positions: ids.len() as u64,
-            capacity_bytes: (ids.capacity() * std::mem::size_of::<u32>()) as u64,
-        }
-    }
     #[test]
     fn v4_full_quote_admits_three_cached_decodes_in_both_drivers() {
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let source_stream =
-            Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        if !crate::tests::support::native_process::enter("ordinary-v4-loaded-helpers") {
+            return;
+        }
+        let startup = crate::tests::support::test_utils::initialize_original_sources();
+        let streams =
+            crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_factory(
+                &startup,
+            )
+            .unwrap()
+            .unwrap();
+        // Real load readiness owns these streams; the borrowed adapter and
+        // requests remain ordinary and carry no prepared inference source.
+        let stream = streams.execution();
+        let source_stream = streams.source();
         let mut reference = None;
         for bounded in [false, true] {
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                 let backend =
-                    MlxBackend::new(&stream, &source_stream).with_memory_pool(pool.clone());
+                    MlxBackend::new(&stream, &source_stream).with_memory_ledger(pool.clone());
                 let root = artifact(true);
                 let model =
                     eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
@@ -419,10 +454,13 @@ mod generation {
                             .peak_bytes()
                             .unwrap()
                             .is_some();
-                    assert!(complete,
+                    assert!(
+                        complete,
                         "V4 requires a complete finite quote: equations={:?}, sampling={:?}, prompt={:?}",
                         full_generation.equations.first_gap(),
-                        full_generation.sampling.first_gap, prompt.peak());
+                        full_generation.sampling.first_gap,
+                        prompt.peak()
+                    );
                     assert_eq!(
                         (
                             paths::snapshot(),
@@ -437,21 +475,19 @@ mod generation {
                         frontier
                     );
                     assert_eq!(runtime.session().residency_report().unwrap(), residency);
-                    let admitted = MlxBackend::admit_text_preparation(
-                        &runtime,
-                        &evidence(),
+                    let input = tokens();
+                    let preparation = ControlledTextGeneration::from_input(
+                        &mut runtime,
+                        TextGenerationInput::TokenIds(input),
                         config(Some(u64::MAX)),
-                        &controller,
-                    );
-                    let preparation = admitted.unwrap();
-                    let request = preparation.request.as_ref().unwrap().request();
-                    let reservation = request.memory_reservation().unwrap();
-                    assert!(reservation.bytes() > 0);
-                    let ceiling = before.3 .0.checked_add(reservation.bytes()).unwrap();
-                    assert_eq!(pool.used_bytes().unwrap(), ceiling);
-                    // This probe includes our instrumented controller; its
-                    // bound also covers the ordinary driver's default one.
-                    capacity = Some(ceiling);
+                        controller.clone(),
+                    )
+                    .unwrap();
+                    let snapshot = pool.snapshot().unwrap();
+                    assert!(snapshot.domains[0].outstanding_reservation_bytes > 0);
+                    // Include the actual transient preparation constructors as
+                    // well as the installed account in the finite rerun.
+                    capacity = Some(snapshot.domains[0].historical_peak_bytes);
                     drop(preparation);
                     settle(&pool, before.3 .0);
                 }
@@ -508,3 +544,7 @@ mod generation {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

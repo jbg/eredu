@@ -12,36 +12,83 @@ fn parameter_fixture_limits(
 }
 
 // Public distributed edits, real cached predictions, rollback and restoration.
+#[track_caller]
 fn parameter_fixture_forward(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
     prefill: bool,
 ) -> Option<Vec<f32>> {
-    use crate::backend::runtime::media::input::ModelInput;
-    let output = if prefill && std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some() {
-        let prompt = component_capture_prompt(runtime);
-        runtime.prefill(prompt).unwrap().wait().unwrap()
+    use eredu_core::{capture::*, TextGenerationBackend as _};
+    let media = prefill && std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some();
+    let tokens = if media {
+        component_capture_prompt_tokens()
     } else if prefill {
-        let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-        let parts = [text_input_part(&prompt)];
-        runtime
-            .prefill(ModelInput::new(&parts).into())
-            .unwrap()
-            .wait()
-            .unwrap()
+        vec![1, 2, 3]
     } else {
-        runtime
-            .decode(Array::from_slice(&[4u32], &[1, 1]))
-            .unwrap()
-            .wait()
-            .unwrap()
+        vec![4]
     };
-    output.logits().map(|value| {
-        value
-            .as_array()
-            .evaluated()
-            .unwrap()
-            .as_slice::<f32>()
-            .to_vec()
+    let discovery = MlxBackend::capture_discovery(runtime).unwrap();
+    let usage = CaptureUsage {
+        captures: 8,
+        retained_bytes: 64 << 20,
+        host_bytes: 64 << 20,
+        encoded_bytes: 64 << 20,
+    };
+    let plan = CapturePlan {
+        schema_version: 1,
+        selections: vec![CaptureSelection {
+            id: "parameter-logits".into(),
+            path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+            schedule: CaptureSchedule::default(),
+            slices: vec![],
+            transform: CaptureTransform::FullTensor,
+        }],
+        limits: CaptureLimits {
+            per_step: usage,
+            cumulative: usage,
+            on_limit: CaptureLimitPolicy::Fail,
+        },
+    }
+    .admit_with_text_origin(
+        &discovery.catalog,
+        &discovery.support,
+        &discovery.support.capture,
+        CaptureRequestShape {
+            batch: 1,
+            prompt_tokens: tokens.len() as u64,
+            max_predictions: 1,
+        },
+        CaptureTextOrigin {
+            cached_positions: runtime
+                .session()
+                .original_model_source()
+                .unwrap()
+                .erased()
+                .retained_inference_authority()
+                .unwrap()
+                .admission()
+                .map_or(0, |admission| admission.position()),
+        },
+    )
+    .unwrap();
+    let mut sampling = component_snapshot_sampling();
+    sampling.max_new_tokens = Some(1);
+    let (mut state, mut provider) =
+        component_state_start_with_tokens(runtime, Some(&plan), sampling, &tokens, media);
+    let (_, captured) = component_capture_step(&mut state, &mut provider);
+    captured.records.iter().find_map(|record| {
+        if record.path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+            return None;
+        }
+        record
+            .payload
+            .as_ref()
+            .and_then(CapturePayload::as_tensor)
+            .map(|tensor| {
+                let eredu_core::TensorObservationData::F32(values) = tensor.data() else {
+                    panic!("F32 fixture logits")
+                };
+                values.clone()
+            })
     })
 }
 
@@ -71,9 +118,7 @@ fn verify_public_partition_parameter_overlays(
     checkpoint: &Path,
     stream: &Stream,
 ) {
-    use eredu_core::{
-        capture::CaptureUsage, execution_control::NativeTextStateBackend, parameters::*,
-    };
+    use eredu_core::{capture::CaptureUsage, parameters::*};
     let facts = MlxBackend::parameter_discovery(runtime).unwrap();
     let ordinary = MlxBackend::parameter_discovery(reference).unwrap();
     let weights = facts
@@ -409,7 +454,7 @@ fn verify_public_partition_parameter_overlays(
         &baseline,
         family.comparison_tolerance(),
     );
-    let saved = MlxBackend::capture_native_text_state(runtime).unwrap();
+    let saved = component_compatibility_snapshot(runtime);
     // Completed budget rejection precedes all native edit work on every rank.
     assert!(MlxBackend::activate_parameter_overlay(
         runtime,
@@ -417,7 +462,7 @@ fn verify_public_partition_parameter_overlays(
         if rank == 1 { facts.usage } else { limits }
     )
     .is_err());
-    MlxBackend::validate_native_text_state(runtime, &saved).unwrap();
+    assert!(component_snapshot_compatible(runtime, &saved));
     // This failure occurs after native publication. Every owner restores its
     // weights, cached prefix and snapshot compatibility before the retry.
     if rank == 1 {
@@ -438,7 +483,7 @@ fn verify_public_partition_parameter_overlays(
             "{publication_error}"
         );
     }
-    MlxBackend::validate_native_text_state(runtime, &saved).unwrap();
+    assert!(component_snapshot_compatible(runtime, &saved));
     let rejected = MlxBackend::parameter_discovery(runtime).unwrap();
     assert_eq!(rejected.identity, facts.identity);
     assert_eq!(rejected.overlay_identity, None);
@@ -459,7 +504,7 @@ fn verify_public_partition_parameter_overlays(
         active.overlay_identity.as_deref(),
         Some(overlay.intent_identity())
     );
-    assert!(MlxBackend::validate_native_text_state(runtime, &saved).is_err());
+    assert!(!component_snapshot_compatible(runtime, &saved));
     for edit in &edits {
         // Each bounded query receives an explicit allowance on top of its
         // ledger. Larger rank counts charge more coordination for this pass.
@@ -550,7 +595,7 @@ fn verify_public_partition_parameter_overlays(
         &expected,
         family.comparison_tolerance(),
     );
-    let saved_active = MlxBackend::capture_native_text_state(runtime).unwrap();
+    let saved_active = component_compatibility_snapshot(runtime);
     assert!(MlxBackend::remove_parameter_overlay(
         runtime,
         if rank == 1 {
@@ -575,7 +620,7 @@ fn verify_public_partition_parameter_overlays(
             "{publication_error}"
         );
     }
-    MlxBackend::validate_native_text_state(runtime, &saved_active).unwrap();
+    assert!(component_snapshot_compatible(runtime, &saved_active));
     let rejected = MlxBackend::parameter_discovery(runtime).unwrap();
     assert_eq!(rejected.identity, active.identity);
     assert_eq!(rejected.overlay_identity, active.overlay_identity);
@@ -591,7 +636,7 @@ fn verify_public_partition_parameter_overlays(
     assert_ne!(restored.identity, active.identity);
     assert!(restored.overlay_identity.is_none());
     assert_eq!(restored.parameters, facts.parameters);
-    assert!(MlxBackend::validate_native_text_state(runtime, &saved_active).is_err());
+    assert!(!component_snapshot_compatible(runtime, &saved_active));
     // Restoration preserves all charged edit, query and coordination work.
     for edit in &edits {
         let limits = parameter_fixture_limits(runtime, phase_allowance);
@@ -633,8 +678,8 @@ fn verify_public_partition_parameter_overlays(
             family.comparison_tolerance(),
         );
     }
-    runtime.session_mut().reset().unwrap();
-    reference.session_mut().reset().unwrap();
+    runtime.reset().unwrap();
+    reference.reset().unwrap();
 }
 
 fn verify_active_parameter_capture_and_branches(
@@ -662,7 +707,6 @@ fn verify_active_parameter_capture_and_branches(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage.checked_mul(8).unwrap(),
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -688,8 +732,15 @@ fn verify_active_parameter_capture_and_branches(
     .unwrap();
     let run = |runtime: &mut ModelRuntime<MlxBackend<'_>>| {
         runtime.reset().unwrap();
-        let mut generation = component_capture_generation(runtime, sampling);
-        generation.enable_capture(plan.clone()).unwrap();
+        let mut generation = component_capture_generation(
+            runtime,
+            sampling,
+            Some(eredu_core::TextPreparationOptions {
+                capture: Some(eredu_core::capture::SharedCapturePlan::new(plan.clone())),
+                interventions: None,
+            }),
+        )
+        .unwrap();
         (0..3)
             .map(|_| {
                 let token = generation.next().unwrap().unwrap().token_id();
@@ -706,9 +757,16 @@ fn verify_active_parameter_capture_and_branches(
             step.partitions[0].context.overlay_identity.as_deref(),
             Some(overlay)
         );
-        let (Some(CapturePayload::Tensor(actual)), Some(CapturePayload::Tensor(expected))) =
-            (&step.records[0].payload, &expected_step.records[0].payload)
-        else {
+        let (Some(actual), Some(expected)) = (
+            step.records[0]
+                .payload
+                .as_ref()
+                .and_then(CapturePayload::as_tensor),
+            expected_step.records[0]
+                .payload
+                .as_ref()
+                .and_then(CapturePayload::as_tensor),
+        ) else {
             panic!("edited logits capture")
         };
         assert_eq!(actual.shape(), expected.shape());

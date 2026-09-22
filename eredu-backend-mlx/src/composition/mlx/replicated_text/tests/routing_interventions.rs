@@ -13,7 +13,11 @@ type B = crate::composition::MlxNeuralBackend;
 
 struct Fill;
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for Fill {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, tensor: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        tensor: &'a mut MlxTensor,
+    ) {
         let shape = tensor.shape().to_vec();
         let count = shape.iter().product::<i32>() as usize;
         let values = if metadata.id().as_str() == "model.layers.0.mlp.gate.weight" {
@@ -29,7 +33,7 @@ struct Probe {
     calls: usize,
     applied: Rc<Cell<bool>>,
     ids: Vec<u32>,
-    coefficients: Vec<f32>,
+    coefficients: eredu_core::HostTensorBuffer<f32>,
 }
 
 impl RoutedExpertProvider<B> for Probe {
@@ -101,8 +105,8 @@ struct Observer {
     applied: Rc<Cell<bool>>,
     stream: Stream,
     original_ids: Vec<u32>,
-    original_coefficients: Vec<f32>,
-    shared: Vec<f32>,
+    original_coefficients: eredu_core::HostTensorBuffer<f32>,
+    shared: eredu_core::HostTensorBuffer<f32>,
 }
 impl ActivationObserver<MlxTensor, eredu_nn::Error> for Observer {
     fn observe(&mut self, _: &str, _: &MlxTensor) -> Result<(), eredu_nn::Error> {
@@ -170,9 +174,9 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
         panic!()
     };
     let input = MlxTensor::from_array(Array::from_slice(&[1.0f32; 64], &[1, 2, 32]));
-    let mut baseline_shared = Vec::new();
+    let mut baseline_shared = eredu_core::HostTensorBuffer::new(Vec::new(), ());
     let mut baseline_ids = Vec::new();
-    let mut baseline_weights = Vec::new();
+    let mut baseline_weights = eredu_core::HostTensorBuffer::new(Vec::new(), ());
     let mut rank_bias_weights = Vec::new();
     let actions = [
         None,
@@ -217,18 +221,24 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
             applied: applied.clone(),
             stream: stream.clone(),
             original_ids: vec![],
-            original_coefficients: vec![],
-            shared: vec![],
+            original_coefficients: eredu_core::HostTensorBuffer::new(Vec::new(), ()),
+            shared: eredu_core::HostTensorBuffer::new(Vec::new(), ()),
         };
         let mut provider = Probe {
             calls: 0,
             applied,
             ids: vec![],
-            coefficients: vec![],
+            coefficients: eredu_core::HostTensorBuffer::new(Vec::new(), ()),
         };
         let output = moe
             .forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0), format_args!("{}", "model.layers.0.mlp"), 4, None).unwrap(),
+                eredu_runtime::RoutedObservationPoints::new(
+                    eredu_runtime::RoutedBankId::new(0),
+                    format_args!("{}", "model.layers.0.mlp"),
+                    4,
+                    None,
+                )
+                .unwrap(),
                 &input,
                 &stream,
                 &mut provider,
@@ -332,18 +342,24 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
             applied: applied.clone(),
             stream: stream.clone(),
             original_ids: vec![],
-            original_coefficients: vec![],
-            shared: vec![],
+            original_coefficients: eredu_core::HostTensorBuffer::new(Vec::new(), ()),
+            shared: eredu_core::HostTensorBuffer::new(Vec::new(), ()),
         };
         let mut provider = Probe {
             calls: 0,
             applied,
             ids: vec![],
-            coefficients: vec![],
+            coefficients: eredu_core::HostTensorBuffer::new(Vec::new(), ()),
         };
         assert!(moe
             .forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoints::new(eredu_runtime::RoutedBankId::new(0), format_args!("{}", "model.layers.0.mlp"), 4, None).unwrap(),
+                eredu_runtime::RoutedObservationPoints::new(
+                    eredu_runtime::RoutedBankId::new(0),
+                    format_args!("{}", "model.layers.0.mlp"),
+                    4,
+                    None
+                )
+                .unwrap(),
                 &input,
                 &stream,
                 &mut provider,
@@ -454,7 +470,6 @@ fn routing_intervention_loaded_discovery_admission_and_evidence_agree_for_qwen_f
             limits: CaptureLimits {
                 per_step: budget,
                 cumulative: budget,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }

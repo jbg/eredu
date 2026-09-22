@@ -158,6 +158,12 @@ where
 }
 
 impl<K, V> Map<K, V> {
+    /// Exact allocation requested for one inserted node, excluding its payload's
+    /// transitive allocations. This query allocates nothing.
+    pub fn node_allocation_layout() -> Layout {
+        Layout::new::<Node<K, V>>()
+    }
+
     pub const fn new() -> Self {
         Self { root: None, len: 0 }
     }
@@ -275,6 +281,17 @@ impl<K: Ord, V> Map<K, V> {
             }
             depth = depth.checked_add(1)?;
         }
+        Self::insertion_controls_for_depth(depth)
+    }
+
+    /// Finite insertion-control allowance for any addressable population.
+    /// An AVL tree has height below twice the base-two logarithm of its node
+    /// population plus one. Node populations are bounded by `usize`.
+    pub fn maximum_insertion_control_bytes() -> Option<usize> {
+        Self::insertion_controls_for_depth((usize::BITS as usize).checked_mul(2)?.checked_add(1)?)
+    }
+
+    fn insertion_controls_for_depth(depth: usize) -> Option<usize> {
         let lookup = mem::size_of::<(&Self, &K, Option<&Node<K, V>>, usize, Ordering)>();
         let insert_frame = mem::size_of::<(Link<K, V>, Box<Node<K, V>>, Box<Node<K, V>>, bool)>();
         let balance = mem::size_of::<(Box<Node<K, V>>, &Node<K, V>, i16)>();
@@ -608,6 +625,15 @@ impl<K, V> Iterator for IntoIter<K, V> {
         (self.map.len, Some(self.map.len))
     }
 }
+impl<K, V> Drop for IntoIter<K, V> {
+    fn drop(&mut self) {
+        // Each node allocation retires before its key and value, including
+        // unconsumed entries when a consumer exits or unwinds early.
+        while let Some(entry) = self.next() {
+            drop(entry);
+        }
+    }
+}
 impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let (root, node) = take_max(self.map.root.take()?);
@@ -845,11 +871,9 @@ mod tests {
         let mut other = [(1, 7), (2, 8), (3, 9)].into_iter().collect::<Map<_, _>>();
         actual.append(&mut other);
         assert!(other.is_empty());
-        assert!(
-            actual
-                .iter()
-                .eq([(1, 7), (2, 8), (3, 9)].iter().map(|(k, v)| (k, v)))
-        );
+        assert!(actual
+            .iter()
+            .eq([(1, 7), (2, 8), (3, 9)].iter().map(|(k, v)| (k, v))));
         let mut iter = actual.iter();
         assert_eq!(iter.next(), Some((&1, &7)));
         assert!(iter.clone().eq(iter));

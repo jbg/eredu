@@ -14,7 +14,7 @@ fn json() -> String {
 #[test]
 fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destinations() {
     let input = json();
-    let sizing = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let sizing = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let measured = source(&sizing, &input);
     assert_eq!(measured.token_id("<S>"), Some(5));
     assert_eq!(measured.spelling(5), Some("<S>"));
@@ -24,10 +24,12 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
     let c = measured.original_bytes();
     for text in [TEXT_NFC, "", "\u{344}"] {
         for special in [false, true] {
-            let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&measured, text, special)
-                .unwrap();
+            let e =
+                MemoryLedger::tokenizer_encode_required_bytes(&measured, text, special).unwrap();
             for short in [true, false] {
-                let pool = WorkingMemoryPool::new(c + e - u64::from(short), 0).unwrap();
+                let pool =
+                    crate::working_memory::memory_fixture::host_ledger(c + e - u64::from(short), 0)
+                        .unwrap();
                 let source = source(&pool, &input);
                 let result = pool.encode_tokenizer_ids_with(
                     &source,
@@ -36,7 +38,7 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
                     |p| p,
                     || {
                         assert!(!short);
-                        assert_eq!(pool.used_bytes().unwrap(), c + e);
+                        assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                         assert!(matches!(
                             pool.acquire_unquoted(),
                             Err(WorkingMemoryError::ReservedWorkActive)
@@ -49,10 +51,10 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
                     assert_eq!(error.retained_bytes(), 0);
                     assert!(!error.matches_source(&source));
                     assert!(
-                        matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if *required_bytes==e && *available_bytes==e-1)
+                        matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==e && (limit_bytes - existing_bytes)==e-1)
                     );
                     drop(source);
-                    assert_eq!(pool.used_bytes().unwrap(), 0);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
                 } else {
                     let output = result.unwrap();
                     let mut expected = if special { vec![5] } else { vec![] };
@@ -63,27 +65,27 @@ fn nfc_expansion_exact_one_short_and_alias_retirement_keep_source_and_all_destin
                     }
                     assert_eq!(output.ids(), expected);
                     assert!(output.matches_source(&source));
-                    drop(pool.acquire_unquoted().unwrap());
+                    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
                     let alias = source.clone();
                     drop(source);
                     drop(alias);
-                    assert_eq!(pool.used_bytes().unwrap(), c + e);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                     drop(output);
-                    assert_eq!(pool.used_bytes().unwrap(), 0);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
                 }
             }
         }
     }
     drop(measured);
-    assert_eq!(sizing.used_bytes().unwrap(), 0);
+    assert_eq!(sizing.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn nfc_foreign_operations_cannot_retain_source_or_admission() {
     let input = json();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let source = source(&pool, &input);
     let c = source.original_bytes();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let rejects: Vec<_> = (0..3)
         .map(|_| {
             foreign
@@ -96,21 +98,21 @@ fn nfc_foreign_operations_cannot_retain_source_or_admission() {
             .iter()
             .all(|error| error.retained_bytes() == 0 && !error.matches_source(&source))
     );
-    assert_eq!(pool.used_bytes().unwrap(), c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(rejects);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn nfc_missing_unknown_retains_source_and_operation_admission() {
     let input = json().replace("\"unk_token\":\"?\"", "\"unk_token\":\"missing\"");
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let source = source(&pool, &input);
     let c = source.original_bytes();
     let text = "hi<S>\u{344}";
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&source, text, true).unwrap();
+    let e = MemoryLedger::tokenizer_encode_required_bytes(&source, text, true).unwrap();
     let failure = pool.encode_tokenizer_ids(&source, text, true).unwrap_err();
     assert!(matches!(
         failure.encoding_failure().unwrap().cause(),
@@ -120,9 +122,9 @@ fn nfc_missing_unknown_retains_source_and_operation_admission() {
     assert_eq!(failure.retained_bytes(), e);
     assert!(failure.encoding_failure().unwrap().source().is_some());
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn independent_nfc_operations_share_only_immutable_source_and_one_atomic_capacity() {

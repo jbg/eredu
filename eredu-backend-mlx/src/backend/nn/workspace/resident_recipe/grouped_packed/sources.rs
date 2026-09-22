@@ -89,15 +89,20 @@ pub(super) fn counts(operation: WorkspaceOperationView<'_>) -> Option<[usize; 3]
                 let biases = operation.inputs.get(slot.checked_add(1)?)?;
                 slot = slot.checked_add(2)?;
                 let packed = k.checked_mul(config.bits)?;
-                if k <= 0 || k % config.group_size != 0 || packed % 32 != 0
+                if k <= 0
+                    || k % config.group_size != 0
+                    || packed % 32 != 0
                     || projection.format().scale().is_none()
                     || projection.format().affine_bias().is_none()
                     || weight.dtype() != WorkspaceDtype::Uint32
                     || weight.shape() != [spec.group_count(), n, packed / 32]
-                    || [scales, biases].iter().any(|value|
+                    || [scales, biases].iter().any(|value| {
                         value.dtype() != WorkspaceDtype::Float32
-                        || value.shape() != [spec.group_count(), n, k / config.group_size])
-                { return None; }
+                            || value.shape() != [spec.group_count(), n, k / config.group_size]
+                    })
+                {
+                    return None;
+                }
                 let kind = if config.group_size == 16 { 2 } else { 1 };
                 calls[kind] = calls[kind].checked_add(usize::from(active))?;
             }
@@ -134,8 +139,12 @@ pub(super) fn counts(operation: WorkspaceOperationView<'_>) -> Option<[usize; 3]
     };
     let chunks = if tokens > THRESHOLD as usize {
         tokens.div_ceil(CHUNK as usize)
-    } else { 1 };
-    Some([calls[0].checked_mul(chunks)?, calls[1].checked_mul(chunks)?,
-        calls[2].checked_mul(chunks)?])
+    } else {
+        1
+    };
+    Some([
+        calls[0].checked_mul(chunks)?,
+        calls[1].checked_mul(chunks)?,
+        calls[2].checked_mul(chunks)?,
+    ])
 }
-

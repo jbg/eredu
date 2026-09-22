@@ -137,6 +137,7 @@ impl SpeculativeNumericalRecipe {
                 .map_err(|_| invalid())?,
             kernels: 0,
             controls,
+            ordinary_calls: None,
         })
     }
 }

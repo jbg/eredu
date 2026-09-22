@@ -3,10 +3,10 @@ use crate::backend::runtime::cache::residency::{
     CacheBlockArrays, CacheResidencyError, CacheSourceFailureCause,
 };
 use eredu_core::{AttentionPolicy, LayerSchedule};
-use eredu_nn::{Error, Tensor, workspace::*};
+use eredu_nn::{workspace::*, Error, Tensor};
 use eredu_runtime::{
+    working_memory::{InferenceExecutionIdentity, MemoryLedger},
     CacheLifecycleError, PagedCacheOptions,
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryPool},
 };
 use safemlx::{Array, Device, DeviceType, Dtype, Stream};
 use std::{cell::Cell, collections::BTreeSet};
@@ -97,9 +97,12 @@ fn complete_paged_state_shares_dense_aliases_and_retires_failed_source_prefixes(
     }
     let report = manager.report().unwrap();
     let capacity = 1 << 25;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -247,11 +250,13 @@ fn complete_paged_state_shares_dense_aliases_and_retires_failed_source_prefixes(
         unreachable!()
     };
     cache.with_workspace_source(&context, |_| Ok(())).unwrap();
-    let accepted_sources = cold(|| projected.storage.take_paged_sources(&context)).unwrap().unwrap();
+    let accepted_sources = cold(|| projected.storage.take_paged_sources(&context))
+        .unwrap()
+        .unwrap();
     assert_eq!(accepted_sources.sources().len(), 2);
     assert!(projected.storage.paged_sources().is_empty());
     drop((native, input, context, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     for (identity, _, _) in projected.storage.iter() {
         let values = projected
             .storage
@@ -259,12 +264,10 @@ fn complete_paged_state_shares_dense_aliases_and_retires_failed_source_prefixes(
             .unwrap()
             .evaluated()
             .unwrap();
-        assert!(
-            values
-                .as_slice::<f32>()
-                .iter()
-                .all(|value| [0.25, 0.5, 0.75, 1.0, 1.25].contains(value))
-        );
+        assert!(values
+            .as_slice::<f32>()
+            .iter()
+            .all(|value| [0.25, 0.5, 0.75, 1.0, 1.25].contains(value)));
     }
     drop(projected);
     assert!(matches!(
@@ -280,17 +283,31 @@ fn complete_paged_state_shares_dense_aliases_and_retires_failed_source_prefixes(
         ))
     ));
     drop(failure);
-    assert!(matches!(manager.remove_block(&id), Err(CacheResidencyError::Lifecycle(CacheLifecycleError::BlockLeased(_)))));
+    assert!(matches!(
+        manager.remove_block(&id),
+        Err(CacheResidencyError::Lifecycle(
+            CacheLifecycleError::BlockLeased(_)
+        ))
+    ));
     let retained_role_alias = accepted_sources.clone();
     drop(accepted_sources);
-    assert!(matches!(manager.remove_block(&id), Err(CacheResidencyError::Lifecycle(CacheLifecycleError::BlockLeased(_)))));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(matches!(
+        manager.remove_block(&id),
+        Err(CacheResidencyError::Lifecycle(
+            CacheLifecycleError::BlockLeased(_)
+        ))
+    ));
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(retained_role_alias);
     manager.remove_block(&id).unwrap();
     unsupported_manager.remove_block(&unsupported_id).unwrap();
     // The legacy error keeps H but no longer pins unsubmitted native storage.
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(legacy_error);
     drop((manager, unsupported_manager));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

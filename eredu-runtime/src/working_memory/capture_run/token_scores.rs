@@ -386,53 +386,142 @@ impl<K: Ord + Send + 'static> ScheduledCaptureTokenScoresTransfer<'_, '_, '_, K>
 }
 
 impl<'a> ScheduledCaptureStep<'a> {
-    pub(crate) fn take_remote_prefill_token_scores<'c>(&'c mut self,index:usize)->Result<CaptureTokenScoreClaim<'a,'c>,CaptureRunHostError> {
+    pub(crate) fn take_remote_prefill_token_scores<'c>(
+        &'c mut self,
+        index: usize,
+    ) -> Result<CaptureTokenScoreClaim<'a, 'c>, CaptureRunHostError> {
         self.validate_remote_prefill_claim(index)?;
-        let rows=self.partition_terminal_rows(index)?.ok_or(CapturePrefillHostError::Identity)?;
-        let geometry=CaptureTokenScoreGeometry::prepare(self.claim.source.admission(),index,self.claim.phase,self.claim.prediction,None)
-            .and_then(|value|value.terminal_readout(rows)).map_err(CaptureStepError::from)?;
-        let plan=CaptureTokenScoreHostPlan::prepare(geometry)?;
+        let rows = self
+            .partition_terminal_rows(index)?
+            .ok_or(CapturePrefillHostError::Identity)?;
+        let geometry = CaptureTokenScoreGeometry::prepare(
+            self.claim.source.admission(),
+            index,
+            self.claim.phase,
+            self.claim.prediction,
+            None,
+        )
+        .and_then(|value| value.terminal_readout(rows))
+        .map_err(CaptureStepError::from)?;
+        let plan = CaptureTokenScoreHostPlan::prepare(geometry)?;
         self.begin_remote_terminal_claim(index)?;
-        Ok(CaptureTokenScoreClaim {plan,identity:claims::ReceiptIdentity {phase:self.claim.phase,prediction:self.claim.prediction,
-            index,custody:self.claim.custody.share_scheduled()},exclusive:PhantomData})
+        Ok(CaptureTokenScoreClaim {
+            plan,
+            identity: claims::ReceiptIdentity {
+                phase: self.claim.phase,
+                prediction: self.claim.prediction,
+                index,
+                custody: self.claim.custody.share_scheduled(),
+            },
+            exclusive: PhantomData,
+        })
     }
-    pub(crate) fn record_remote_prefill_token_scores(&mut self,value:ClaimedCaptureTokenScores,dtype:TensorDtype)->Result<(),CaptureRunHostError> {
-        let index=value.identity.index;self.validate_remote_prefill_record(index,&dtype)?;
-        self.record_token_scores(value,dtype,CaptureUsage::default())?;
+    pub(crate) fn record_remote_prefill_token_scores(
+        &mut self,
+        value: ClaimedCaptureTokenScores,
+        dtype: TensorDtype,
+    ) -> Result<(), CaptureRunHostError> {
+        let index = value.identity.index;
+        self.validate_remote_prefill_record(index, &dtype)?;
+        self.record_token_scores(value, dtype, CaptureUsage::default())?;
         self.finish_remote_terminal_record(index)
     }
 }
 
-impl<'a,'c> ScheduledCaptureTokenScores<'a,'c> {
-    pub(super) fn partition_source(&self)->(&'a AdmittedCapturePlan,usize,CapturePhase,u64,[usize;3]) {
-        let geometry=&self.plan.geometry;
-        (geometry.admission(),geometry.selection_index(),geometry.phase(),geometry.prediction(),*geometry.source_shape())
+impl<'a, 'c> ScheduledCaptureTokenScores<'a, 'c> {
+    pub(super) fn partition_source(
+        &self,
+    ) -> (
+        &'a AdmittedCapturePlan,
+        usize,
+        CapturePhase,
+        u64,
+        [usize; 3],
+    ) {
+        let geometry = &self.plan.geometry;
+        (
+            geometry.admission(),
+            geometry.selection_index(),
+            geometry.phase(),
+            geometry.prediction(),
+            *geometry.source_shape(),
+        )
     }
-    pub(super) fn partition_count(&self)->usize {self.plan.geometry.count()}
-    pub(super) fn partition_failure(self)->CaptureTokenScoreFailure {CaptureTokenScoreFailure {error:WorkingMemoryError::IdentityMismatch,values:self.values,custody:self.identity.custody}}
-    fn finish_partition(mut self,domain:Option<CandidateDomain>,log_partition:f64)->Result<ClaimedCaptureTokenScores,CaptureTokenScoreFailure> {
-        self.domain=domain;self.finish(log_partition)
+    pub(super) fn partition_count(&self) -> usize {
+        self.plan.geometry.count()
+    }
+    pub(super) fn partition_failure(self) -> CaptureTokenScoreFailure {
+        CaptureTokenScoreFailure {
+            error: WorkingMemoryError::IdentityMismatch,
+            values: self.values,
+            custody: self.identity.custody,
+        }
+    }
+    fn finish_partition(
+        mut self,
+        domain: Option<CandidateDomain>,
+        log_partition: f64,
+    ) -> Result<ClaimedCaptureTokenScores, CaptureTokenScoreFailure> {
+        self.domain = domain;
+        self.finish(log_partition)
     }
 }
 impl ClaimedCaptureTokenScores {
-    fn partition_failure(self)->CaptureTokenScoreFailure {CaptureTokenScoreFailure {error:WorkingMemoryError::IdentityMismatch,values:self.scores.scores,custody:self.identity.custody}}
+    fn partition_failure(self) -> CaptureTokenScoreFailure {
+        CaptureTokenScoreFailure {
+            error: WorkingMemoryError::IdentityMismatch,
+            values: self.scores.scores,
+            custody: self.identity.custody,
+        }
+    }
 }
-impl<'a,'c> CaptureTokenScoreClaim<'a,'c> {
+impl<'a, 'c> CaptureTokenScoreClaim<'a, 'c> {
     /// Fill the original fixed slots from one authenticated complete-producer receipt.
     /// Invalid receipts retain their initialized prefix and the spent original account.
-    pub fn decode_partition_receipt(self,bytes:&[u8],expected:PartitionCaptureTensorReceipt<'_>,
-        funding:&eredu_nn::workspace::HostMetadataFunding)->Result<ClaimedCaptureTokenScores,PartitionCaptureTensorDecodeError> {
-        let custody=self.identity.custody.share_scheduled();claims::prepare_vocabulary_decoder(&custody,funding)?;
-        let mut destination=self.prepare(None).map_err(|cause|claims::histogram_preparation_failure(cause,&custody,funding))?;
-        let (source,index,_,_,shape)=destination.partition_source();
-        let metadata=claims::decode_vocabulary_receipt(claims::VocabularyDestination::Scores(&mut destination),bytes,expected,&custody,funding);
-        let (domain,log_partition)=match metadata {Ok(value)=>value,Err(error)=>return Err(error.retaining_scores(destination.partition_failure()))};
-        let value=destination.finish_partition(domain,log_partition)
-            .map_err(|cause|PartitionCaptureTensorDecodeError::score_failure(cause,custody.share_scheduled(),funding))?;
-        let shape=shape.map(|n|n as u64);
-        if !crate::capture::partition::vocabulary_payload_valid(&source.plan().selections[index],source.points()[index].position,
-            &shape,crate::capture::partition::VocabularyPayload::Scores(value.observation())) {
-            return Err(PartitionCaptureTensorDecodeError::score_failure(value.partition_failure(),custody,funding));
+    pub fn decode_partition_receipt(
+        self,
+        bytes: &[u8],
+        expected: PartitionCaptureTensorReceipt<'_>,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<ClaimedCaptureTokenScores, PartitionCaptureTensorDecodeError> {
+        let custody = self.identity.custody.share_scheduled();
+        claims::prepare_vocabulary_decoder(&custody, funding)?;
+        let mut destination = self
+            .prepare(None)
+            .map_err(|cause| claims::histogram_preparation_failure(cause, &custody, funding))?;
+        let (source, index, _, _, shape) = destination.partition_source();
+        let metadata = claims::decode_vocabulary_receipt(
+            claims::VocabularyDestination::Scores(&mut destination),
+            bytes,
+            expected,
+            &custody,
+            funding,
+        );
+        let (domain, log_partition) = match metadata {
+            Ok(value) => value,
+            Err(error) => return Err(error.retaining_scores(destination.partition_failure())),
+        };
+        let value = destination
+            .finish_partition(domain, log_partition)
+            .map_err(|cause| {
+                PartitionCaptureTensorDecodeError::score_failure(
+                    cause,
+                    custody.share_scheduled(),
+                    funding,
+                )
+            })?;
+        let shape = shape.map(|n| n as u64);
+        if !crate::capture::partition::vocabulary_payload_valid(
+            &source.plan().selections[index],
+            source.points()[index].position,
+            &shape,
+            crate::capture::partition::VocabularyPayload::Scores(value.observation()),
+        ) {
+            return Err(PartitionCaptureTensorDecodeError::score_failure(
+                value.partition_failure(),
+                custody,
+                funding,
+            ));
         }
         Ok(value)
     }

@@ -160,6 +160,53 @@ impl RegisteredStoragePin {
             .ok_or(WorkingMemoryError::Overflow)
     }
 
+    pub(in crate::working_memory) fn ordinary_group_control_bytes<
+        K: Ord + Send + Sync + 'static,
+    >(
+        count: usize,
+    ) -> Result<usize, WorkingMemoryError> {
+        let singles = Self::single_control_bytes::<K>(false)?
+            .checked_mul(count)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        [
+            singles,
+            usize::try_from(qualified_storage::shared_bytes::<Vec<RegisteredStoragePin>>()?)
+                .map_err(|_| WorkingMemoryError::Overflow)?,
+            usize::try_from(qualified_storage::array_bytes::<RegisteredStoragePin>(
+                count,
+            )?)
+            .map_err(|_| WorkingMemoryError::Overflow)?,
+            usize::try_from(qualified_storage::vector_control_bytes::<
+                RegisteredStoragePin,
+            >()?)
+            .map_err(|_| WorkingMemoryError::Overflow)?,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(WorkingMemoryError::Overflow)
+    }
+    pub(in crate::working_memory) fn aggregate_exact(
+        pins: impl IntoIterator<Item = Self>,
+        count: usize,
+    ) -> Result<Self, WorkingMemoryError> {
+        let mut values = qualified_storage::vector(count, true)?;
+        for pin in pins {
+            if values.len() == count {
+                return Err(WorkingMemoryError::IdentityMismatch);
+            }
+            values.push(pin);
+        }
+        if values.len() != count {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        match values.iter().find_map(Self::preparation).cloned() {
+            Some(authority) => Ok(Self::prepared(
+                PreparedPinContents::Group(values),
+                authority,
+            )),
+            None => Ok(Self::Shared(Arc::new(values))),
+        }
+    }
     pub(in crate::working_memory) fn aggregate_counted(
         pins: impl IntoIterator<Item = Self>,
         count: usize,

@@ -63,7 +63,6 @@ fn admitted(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -78,7 +77,6 @@ fn admitted(
                 CaptureTransformKind::Summary,
             ],
             max_histogram_bins: 0,
-            physical_native_limit: false,
             conditions: vec![],
         },
         CaptureRequestShape {

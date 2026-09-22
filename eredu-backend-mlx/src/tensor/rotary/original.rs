@@ -99,6 +99,7 @@ pub(crate) struct PreparedRotaryProfile {
     pub(crate) cloned_handles: usize,
     pub(crate) maximum_operands: usize,
     row_bank: safemlx::ops::OriginalArrayRowsLayout,
+    row_capacity: usize,
     columns: usize,
     concatenations: usize,
 }
@@ -158,9 +159,18 @@ impl PreparedRotaryProfile {
             cloned_handles,
             maximum_operands: row_bank.maximum_operands(),
             row_bank,
+            row_capacity: capacity,
             columns,
             concatenations,
         })
+    }
+
+    pub(crate) fn ordinary_row_bytes(self) -> Option<usize> {
+        if self.row_capacity <= INLINE_VALUES {
+            Some(0)
+        } else {
+            self.row_capacity.checked_mul(size_of::<Array>())
+        }
     }
 
     pub(crate) fn control_bytes(self) -> Option<usize> {

@@ -3,11 +3,11 @@
 use super::*;
 use crate::backend::error::Error;
 use eredu_runtime::{
-    DenseHostSlotInitialization, HostSlotAttachmentError, HostSlotMetadata,
     working_memory::{
         FundedDenseHostSlots, InferencePromptCompletion, InferenceRetention,
         InitializedDenseDecoderSlots, RegisteredDenseDecoderInitialization,
     },
+    DenseHostSlotInitialization, HostSlotAttachmentError, HostSlotMetadata,
 };
 use std::fmt;
 
@@ -55,7 +55,7 @@ impl<'a> PreparedResidentKvCopy<'a> {
 
     pub(crate) fn dense_host_copy(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<
         RegisteredDenseDecoderInitialization<
             'a,
@@ -70,7 +70,7 @@ impl<'a> PreparedResidentKvCopy<'a> {
 
     pub(crate) fn dense_host_copy_with_preparation(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         preparation: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<
         RegisteredDenseDecoderInitialization<

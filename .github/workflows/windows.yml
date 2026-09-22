@@ -24,8 +24,11 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Install the repository Rust toolchain
-        run: rustup toolchain install
+      - name: Install the qualified Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0
+          rustup override set 1.98.0
+          "RUSTC=$(rustup which rustc --toolchain 1.98.0)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Configure the Visual Studio 2022 environment
         shell: cmd
         run: |
@@ -88,8 +91,11 @@ jobs:
       SAFEMLX_CUDA_ARCHITECTURES: "75"
     steps:
       - uses: actions/checkout@v4
-      - name: Install the repository Rust toolchain
-        run: rustup toolchain install
+      - name: Install the qualified Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0
+          rustup override set 1.98.0
+          "RUSTC=$(rustup which rustc --toolchain 1.98.0)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Record GPU and toolkit versions
         run: |
           nvidia-smi
@@ -98,8 +104,18 @@ jobs:
         if: inputs.full
         run: cargo test --release -p eredu-gguf
       - name: Run safemlx CUDA tests
-        run: cargo test --release -p safemlx --features cuda --lib --no-default-features
+        run: cargo test --release -p safemlx --features cuda --lib --no-default-features -- --test-threads=1
+      - name: Validate completed CUDA readback
+        run: cargo test --release -p safemlx --features cuda --no-default-features --lib completed_readback -- --test-threads=1 --include-ignored
+      - name: Record CUDA physical placement coverage
+        run: cargo test --release -p safemlx --features cuda --lib --no-default-features placement -- --test-threads=1 --nocapture
+      - name: Validate CUDA managed and transfer overlap
+        run: cargo test --release -p safemlx --features cuda --no-default-features --test host_transfer -- --test-threads=1 --include-ignored
+      - name: Validate physical backing and cache custody
+        run: cargo test --release -p safemlx --features cuda --no-default-features --test physical_backing -- --test-threads=1
+      - name: Validate process ledger and retained host exports
+        run: cargo test --release -p eredu-backend-mlx --no-default-features --features cuda --test physical_memory -- --test-threads=1
       - name: Run CUDA device and numerical smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke --no-default-features
       - name: Run Eredu MLX integration tests on CUDA
-        run: cargo test --release -p eredu --no-default-features --features cuda
+        run: cargo test --release -p eredu --no-default-features --features mlx,cuda

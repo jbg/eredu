@@ -7,10 +7,10 @@ use crate::{
 };
 use eredu_core::speculative::SpeculativeControlError;
 use eredu_core::{
-    BackendFailure, GenerationCancellationToken, GenerationError, HostMetadataFundingError,
-    HostPreparationAuthority, SpeculativeDraft, SpeculativeGenerationBackend,
-    SpeculativeGenerationOutput, SpeculativeGenerationVisitor, TokenInputRejection,
-    generation::SemanticEvent,
+    generation::SemanticEvent, BackendFailure, GenerationCancellationToken, GenerationError,
+    HostMetadataFundingError, HostPreparationAuthority, SpeculativeDraft,
+    SpeculativeGenerationBackend, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
+    TokenInputRejection,
 };
 use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{
@@ -95,7 +95,9 @@ impl ManagedPlainTextSpeculativeError {
     /// The selected backend failure with its original retained source chain.
     pub fn backend_failure(&self) -> Option<&BackendFailure> {
         match &self.cause {
-            Cause::Backend(error) | Cause::Control(SpeculativeControlError::Backend(error)) => Some(error),
+            Cause::Backend(error) | Cause::Control(SpeculativeControlError::Backend(error)) => {
+                Some(error)
+            }
             Cause::Preparation(error) => error.backend_failure(),
             _ => None,
         }
@@ -195,7 +197,7 @@ impl<B: OriginalTokenizerBackend + SpeculativeGenerationBackend> LoadedModel<B> 
                 funding: None,
             });
         }
-        self.validate_controlled_speculative_options(request.text.settings, &options)
+        self.validate_controlled_speculative_options(request.text.settings.clone(), &options)
             .map_err(|cause| ManagedPlainTextSpeculativeError {
                 cause,
                 funding: None,

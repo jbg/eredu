@@ -18,7 +18,7 @@ pub(super) struct StateCopyContext {
     initialized: safemlx::PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     identity: OriginalSpeculativeSourceIdentity,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     funding: HostMetadataFunding,
 }
 #[derive(Debug, thiserror::Error)]
@@ -40,9 +40,9 @@ impl StateCopyContext {
             .retain_prerequisites()
             .map_err(|cause| sources.retain_startup_error(cause))?;
         let controls = [
-            environment.control_bytes().ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?,
+            environment
+                .control_bytes()
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Result<Self, Error>>(),
@@ -53,9 +53,7 @@ impl StateCopyContext {
                 controls
                     .into_iter()
                     .try_fold(size_of_val(&controls), usize::checked_add)
-                    .ok_or(Error::WorkspacePlanning(
-                        HostMetadataFundingError::Overflow,
-                    ))?,
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             )
             .map_err(Error::WorkspacePlanning)?;
         Ok(Self {
@@ -68,7 +66,7 @@ impl StateCopyContext {
                 .workspace_mechanisms()
                 .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?,
             identity: sources.request().source_identity(),
-            capacity: sources.request().capacity_bytes(),
+            capacity: sources.request().limits().clone(),
             funding: funding.clone(),
         })
     }
@@ -95,9 +93,7 @@ impl StateCopyContext {
         let bytes = parts
             .into_iter()
             .try_fold(size_of_val(&parts), |n, part| n.checked_add(part?))
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         self.funding
             .reserve_metadata(bytes)
             .map_err(Error::WorkspacePlanning)?;
@@ -133,7 +129,7 @@ impl StateCopyContext {
                 .validate_pool(environment.pool())
                 .map_err(Error::PrefillControl)?;
         }
-        if !self.identity.pool().same_domain(&state.pool) {
+        if !self.identity.pool().same_ledger(&state.pool) {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
         }
         let StateStream::Original(stream) = &state.stream else {
@@ -154,9 +150,7 @@ impl StateCopyContext {
                     controls
                         .into_iter()
                         .try_fold(size_of_val(&controls), usize::checked_add)
-                        .ok_or(Error::WorkspacePlanning(
-                            HostMetadataFundingError::Overflow,
-                        ))?,
+                        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
                 )
                 .map_err(Error::WorkspacePlanning)?;
             let native = state.native.copy_original(
@@ -164,7 +158,7 @@ impl StateCopyContext {
                 &self.initialized,
                 self.mechanisms,
                 &self.funding,
-                self.capacity,
+                self.capacity.clone(),
             )?;
             Ok(MlxAutoregressiveState {
                 native,
@@ -205,9 +199,7 @@ impl StateCheckpoint {
                 .extend(Layout::new::<MlxAutoregressiveState>())
                 .ok()
                 .map(|layout| layout.0.pad_to_align().size())
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
             let parts = [
                 shared,
                 size_of::<MlxAutoregressiveState>(),
@@ -220,9 +212,7 @@ impl StateCheckpoint {
             let bytes = parts
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
             original
                 .funding
                 .reserve_metadata(bytes)

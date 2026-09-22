@@ -12,9 +12,9 @@ use sha2::{Digest, Sha256};
 mod candidate_tests;
 mod delivery;
 pub use delivery::CaptureDeliveryPending;
-mod invocation;
-mod identity;
 mod admission;
+mod identity;
+mod invocation;
 pub use admission::CaptureAdmissionStorageError;
 mod source_construction;
 pub use source_construction::CaptureSourceConstruction;
@@ -33,7 +33,9 @@ pub use record_wire::CaptureRecordWire;
 mod window_geometry;
 pub use window_geometry::{CaptureWindowError, CaptureWindowGeometry};
 mod prefill_transform;
-pub use prefill_transform::{CapturePrefillPartitionError, CapturePrefillTransformFragment, CapturePrefillTransformPlan};
+pub use prefill_transform::{
+    CapturePrefillPartitionError, CapturePrefillTransformFragment, CapturePrefillTransformPlan,
+};
 mod prefill_geometry;
 pub use prefill_geometry::{
     CapturePrefillAxisSlice, CapturePrefillElement, CapturePrefillFragment,
@@ -294,8 +296,6 @@ pub struct CaptureCapabilities {
     pub transformations: Vec<CaptureTransformKind>,
     /// Maximum admitted number of histogram bins.
     pub max_histogram_bins: u64,
-    /// Whether physical allocator/workspace limits can be enforced.
-    pub physical_native_limit: bool,
     /// Execution, precision, and memory-accounting conditions.
     pub conditions: Vec<String>,
 }
@@ -378,13 +378,12 @@ impl CaptureUsage {
 
 /// Independent per-step and cumulative limits with explicit failure policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureLimits {
     /// Limits reset at each prefill or decode step.
     pub per_step: CaptureUsage,
     /// Limits summed across all steps in the run.
     pub cumulative: CaptureUsage,
-    /// Optional physical allocator ceiling. Rejected if the backend cannot prove it.
-    pub physical_native_bytes: Option<u64>,
     /// Whether a value-budget miss fails execution or emits an explicit skip.
     pub on_limit: CaptureLimitPolicy,
 }
@@ -409,7 +408,6 @@ impl CapturePlan {
             limits: CaptureLimits {
                 per_step: CaptureUsage::default(),
                 cumulative: CaptureUsage::default(),
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -470,7 +468,10 @@ impl CapturePlan {
     /// Copies this borrowed declaration through the closed source-copy worker.
     /// The caller retains the funding owner until this destination or its failed
     /// construction has retired. This produces no admission or execution grant.
-    pub fn copy_with_funding(&self, funding: &crate::HostMetadataFunding) -> Result<Self, CaptureError> {
+    pub fn copy_with_funding(
+        &self,
+        funding: &crate::HostMetadataFunding,
+    ) -> Result<Self, CaptureError> {
         admission::allocation::Allocation(Some(funding)).plan(self)
     }
 
@@ -478,30 +479,64 @@ impl CapturePlan {
     /// The caller retains the actual account with the result and any failure;
     /// source buffers supplied by the caller remain caller-owned until copied.
     pub fn admit_with_funding(
-        self, catalog: &ObservationCatalog, support: &ObservationSupportReport,
-        capabilities: &CaptureCapabilities, request: CaptureRequestShape,
+        self,
+        catalog: &ObservationCatalog,
+        support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities,
+        request: CaptureRequestShape,
         funding: &crate::HostMetadataFunding,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        admission::admit_geometry(self,catalog,support,capabilities,request,None,
-            CaptureTextOrigin::default(),admission::allocation::Allocation(Some(funding)))
+        admission::admit_geometry(
+            self,
+            catalog,
+            support,
+            capabilities,
+            request,
+            None,
+            CaptureTextOrigin::default(),
+            admission::allocation::Allocation(Some(funding)),
+        )
     }
     /// Same funded admission with an exact cached opening origin.
     pub fn admit_with_text_origin_and_funding(
-        self, catalog: &ObservationCatalog, support: &ObservationSupportReport,
-        capabilities: &CaptureCapabilities, request: CaptureRequestShape,
-        origin: CaptureTextOrigin, funding: &crate::HostMetadataFunding,
+        self,
+        catalog: &ObservationCatalog,
+        support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities,
+        request: CaptureRequestShape,
+        origin: CaptureTextOrigin,
+        funding: &crate::HostMetadataFunding,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        admission::admit_geometry(self,catalog,support,capabilities,request,None,
-            origin,admission::allocation::Allocation(Some(funding)))
+        admission::admit_geometry(
+            self,
+            catalog,
+            support,
+            capabilities,
+            request,
+            None,
+            origin,
+            admission::allocation::Allocation(Some(funding)),
+        )
     }
     /// Same funded admission for independent invocation geometry.
     pub fn admit_invocations_with_funding(
-        self, catalog: &ObservationCatalog, support: &ObservationSupportReport,
-        capabilities: &CaptureCapabilities, bounds: CaptureInvocationBounds,
+        self,
+        catalog: &ObservationCatalog,
+        support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities,
+        bounds: CaptureInvocationBounds,
         funding: &crate::HostMetadataFunding,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        admission::admit_geometry(self,catalog,support,capabilities,bounds.request(),Some(bounds),
-            CaptureTextOrigin::default(),admission::allocation::Allocation(Some(funding)))
+        admission::admit_geometry(
+            self,
+            catalog,
+            support,
+            capabilities,
+            bounds.request(),
+            Some(bounds),
+            CaptureTextOrigin::default(),
+            admission::allocation::Allocation(Some(funding)),
+        )
     }
 
     fn admit_geometry(
@@ -513,7 +548,16 @@ impl CapturePlan {
         invocation_bounds: Option<CaptureInvocationBounds>,
         text_origin: CaptureTextOrigin,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        admission::admit_geometry(self, catalog, support, capabilities, request, invocation_bounds, text_origin, admission::allocation::Allocation(None))
+        admission::admit_geometry(
+            self,
+            catalog,
+            support,
+            capabilities,
+            request,
+            invocation_bounds,
+            text_origin,
+            admission::allocation::Allocation(None),
+        )
     }
 }
 
@@ -678,14 +722,15 @@ impl AdmittedCapturePlan {
 
 mod partition;
 pub use partition::{
-    CaptureContiguousProjectionError, CaptureContiguousProjectionPlan, CaptureCoordinateProjectionPlan, CaptureFragmentGeometry, CaptureSlicePartition,
+    CaptureContiguousProjectionError, CaptureContiguousProjectionPlan,
+    CaptureCoordinateProjectionPlan, CaptureFragmentGeometry, CaptureSlicePartition,
 };
 mod partition_wire;
 pub use partition_wire::{
+    BorrowedPartitionCaptureFragmentRecord, BorrowedPartitionCaptureProducerRecord,
     PARTITION_CAPTURE_SCHEMA_VERSION, PartitionCaptureCombination, PartitionCaptureContext,
     PartitionCaptureContributionRecord, PartitionCaptureEvidence, PartitionCaptureFragmentRecord,
-    PartitionCaptureProducerRecord, PartitionCaptureRegion,
-    BorrowedPartitionCaptureFragmentRecord, BorrowedPartitionCaptureProducerRecord,
+    PartitionCaptureInvocationWindow, PartitionCaptureProducerRecord, PartitionCaptureRegion,
 };
 
 /// Numeric axis slices resolved against an actual tensor before any retention/copy.
@@ -710,19 +755,28 @@ pub fn resolve_slice(
     selection: &CaptureSelection,
     shape: &[u64],
 ) -> Result<ResolvedCaptureSlice, CaptureError> {
-    resolve_slice_with(point, selection, shape, admission::allocation::Allocation(None))
+    resolve_slice_with(
+        point,
+        selection,
+        shape,
+        admission::allocation::Allocation(None),
+    )
 }
-fn resolve_slice_with(point: &ObservationPoint, selection: &CaptureSelection, shape: &[u64],
-    allocation: admission::allocation::Allocation<'_>) -> Result<ResolvedCaptureSlice, CaptureError> {
+fn resolve_slice_with(
+    point: &ObservationPoint,
+    selection: &CaptureSelection,
+    shape: &[u64],
+    allocation: admission::allocation::Allocation<'_>,
+) -> Result<ResolvedCaptureSlice, CaptureError> {
     let mut output = ResolvedCaptureSlice {
         starts: allocation.vector(shape.len())?,
         ends: allocation.vector(shape.len())?,
         strides: allocation.vector(shape.len())?,
         shape: allocation.vector(shape.len())?,
     };
-    output.starts.resize(shape.len(),0);
+    output.starts.resize(shape.len(), 0);
     output.ends.extend_from_slice(shape);
-    output.strides.resize(shape.len(),1);
+    output.strides.resize(shape.len(), 1);
     output.shape.extend_from_slice(shape);
     resolve_slice_into(
         point.axes.as_deref(),
@@ -1530,8 +1584,9 @@ mod tensor_geometry;
 pub use candidate_geometry::CaptureCandidateGeometry;
 mod token_score_geometry;
 pub use tensor_geometry::{
-    CaptureHistogramGeometry, CaptureRoutedUnitsGeometry, CaptureRoutedPrefillPlan, CaptureRoutedPrefillFragment, CaptureRoutedTokenWindow, CaptureSummaryGeometry, CaptureTensorGeometry,
-    CaptureTensorGeometryError,
+    CaptureHistogramGeometry, CaptureRoutedPrefillFragment, CaptureRoutedPrefillPlan,
+    CaptureRoutedTokenWindow, CaptureRoutedUnitsGeometry, CaptureSummaryGeometry,
+    CaptureTensorGeometry, CaptureTensorGeometryError,
 };
 pub use token_score_geometry::CaptureTokenScoreGeometry;
 

@@ -1,5 +1,5 @@
-//! Fixed output destinations of the actual packed-bank chunk loop. The existing
-//! original submission ingress prepares these before native graph construction.
+//! Fixed output destinations of the actual packed-bank chunk loop. Original
+//! ingress and ordinary workers prepare their exact tables before filling them.
 use super::*;
 use crate::backend::error::Error;
 use eredu_runtime::working_memory::WorkingMemoryError;
@@ -89,7 +89,8 @@ impl PreparedGroupedOutputs {
             .try_reserve_exact(limits.unit_observers)
             .map_err(reserve_error)?;
         if bank.unit_errors.capacity() != limits.unit_observers {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch).at_speculative_stage("grouped observer destination capacity"));
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
+                .at_speculative_stage("grouped observer destination capacity"));
         }
         for _ in 0..limits.unit_observers {
             bank.unit_errors.push(Some(PreparedGroupedUnitError::new(
@@ -101,7 +102,8 @@ impl PreparedGroupedOutputs {
             .try_reserve_exact(limits.calls)
             .map_err(reserve_error)?;
         if bank.slots.capacity() != limits.calls {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch).at_speculative_stage("grouped output call capacity"));
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
+                .at_speculative_stage("grouped output call capacity"));
         }
         for _ in 0..limits.calls {
             let mut output = GroupedChunkOutputs {
@@ -114,7 +116,8 @@ impl PreparedGroupedOutputs {
                 .try_reserve_exact(limits.chunks)
                 .map_err(reserve_error)?;
             if output.values.capacity() != limits.chunks {
-                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch).at_speculative_stage("grouped output value capacity"));
+                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
+                    .at_speculative_stage("grouped output value capacity"));
             }
             bank.slots.push(Some(output));
         }
@@ -147,13 +150,67 @@ pub(crate) struct GroupedChunkOutputs {
     // failure and the temporary C concatenation header's entire lifetime.
     _custody: Option<TokenValidationCustody>,
 }
+
+#[derive(Debug, thiserror::Error)]
+enum OrdinaryGroupedOutputCause {
+    #[error("grouped output table allocation failed")]
+    Reserve(#[source] std::collections::TryReserveError),
+    #[error("grouped output table differs from its quoted capacity")]
+    Capacity,
+    #[error("grouped output table exhausted")]
+    Exhausted,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+struct OrdinaryGroupedOutputFailure {
+    #[source]
+    cause: OrdinaryGroupedOutputCause,
+    _host: Option<eredu_core::HostPreparationAuthority>,
+}
+
+fn ordinary_failure(
+    cause: OrdinaryGroupedOutputCause,
+    host: Option<eredu_core::HostPreparationAuthority>,
+) -> Exception {
+    Exception::from_retained_source(OrdinaryGroupedOutputFailure { cause, _host: host })
+}
+
 impl GroupedChunkOutputs {
+    /// The ordinary chunk worker reserves this exact table before its first
+    /// output. Its metadata and any returned refusal keep the admitted host
+    /// owner; the enclosing submission keeps native completion custody.
+    pub(crate) fn ordinary_control_bytes(chunks: usize) -> Option<usize> {
+        let parts = [
+            Layout::array::<Array>(chunks).ok()?.size(),
+            Exception::retained_source_control_bytes::<OrdinaryGroupedOutputFailure>()?,
+            size_of::<Self>(),
+            size_of::<Vec<Array>>(),
+            size_of::<Result<(), std::collections::TryReserveError>>(),
+            size_of::<Option<eredu_core::HostPreparationAuthority>>(),
+            size_of::<Option<crate::backend::nn::shared::OrdinaryExecutionOwner>>(),
+            size_of::<Result<Self, Exception>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
+
     pub(crate) fn prepare(chunks: usize) -> Result<Self, Exception> {
         let Some(observer) = safemlx::OriginalScopeObserver::try_current()? else {
+            let host = crate::backend::nn::shared::current_ordinary_execution_owner()?
+                .map(|owner| owner.host().clone());
+            let mut values = Vec::new();
+            values.try_reserve_exact(chunks).map_err(|cause| {
+                ordinary_failure(OrdinaryGroupedOutputCause::Reserve(cause), host.clone())
+            })?;
+            if values.capacity() != chunks {
+                return Err(ordinary_failure(OrdinaryGroupedOutputCause::Capacity, host));
+            }
             return Ok(Self {
-                values: Vec::new(),
+                values,
                 limit: chunks,
-                _custody: None,
+                _custody: host.map(TokenValidationCustody::Ordinary),
             });
         };
         TOKEN_VALIDATION_SCOPE.with(|slot| {
@@ -167,10 +224,14 @@ impl GroupedChunkOutputs {
         })
     }
     pub(crate) fn push(&mut self, value: Array) -> Result<(), Exception> {
-        if self._custody.is_some()
-            && (self.values.len() >= self.limit || self.values.len() == self.values.capacity())
-        {
-            return Err(safemlx::OriginalScopeObserver::require_current()?.capacity_error());
+        if self.values.len() >= self.limit || self.values.len() == self.values.capacity() {
+            return Err(match &self._custody {
+                Some(TokenValidationCustody::Ordinary(host)) => {
+                    ordinary_failure(OrdinaryGroupedOutputCause::Exhausted, Some(host.clone()))
+                }
+                Some(_) => safemlx::OriginalScopeObserver::require_current()?.capacity_error(),
+                None => ordinary_failure(OrdinaryGroupedOutputCause::Exhausted, None),
+            });
         }
         self.values.push(value);
         Ok(())
@@ -180,6 +241,6 @@ impl GroupedChunkOutputs {
     }
 }
 
-#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
-#[path="sliding_attention_tests.rs"]
+#[cfg(all(test, target_vendor = "apple", not(feature = "cuda")))]
+#[path = "sliding_attention_tests.rs"]
 mod sliding_attention_tests;

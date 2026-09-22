@@ -50,6 +50,7 @@ fn reclaim_until(drops: &Arc<AtomicUsize>, expected: usize, stream: &Stream) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while drops.load(Ordering::SeqCst) != expected {
         stream.synchronize().unwrap();
+        crate::memory::clear_cache().unwrap();
         reclaim_allocation_owners();
         assert!(
             std::time::Instant::now() < deadline,
@@ -353,6 +354,7 @@ fn allocation_retention_generations_do_not_reuse_retired_storage_keys() {
         );
         array.retain_allocation_owner(Probe::new(&drops)).unwrap();
         drop(array);
+        crate::memory::clear_cache().unwrap();
         let buffer = HostTransferBuffer::new(&[4], Dtype::Uint32, HostTransferPolicy::Transfer)
             .unwrap()
             .freeze();

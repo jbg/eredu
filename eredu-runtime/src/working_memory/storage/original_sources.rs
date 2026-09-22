@@ -24,7 +24,7 @@ impl Source {
     }
     fn validate_in(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &super::super::Usage,
     ) -> Result<(), WorkingMemoryError> {
         match self {
@@ -73,7 +73,7 @@ impl OriginalStorageSourcesLayout {
     /// admitted. The caller must include this layout in its complete host plan.
     pub fn construct(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         authority: &HostPreparationAuthority,
     ) -> Result<RetainedOriginalStorageSources, OriginalStorageSourcesError> {
         let mut result = RetainedOriginalStorageSources(Some(Payload {
@@ -107,7 +107,7 @@ struct Payload {
     // Deallocate source capacity before releasing its enclosing host custody.
     sources: Vec<Source>,
     maximum: usize,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     _authority: HostPreparationAuthority,
 }
 
@@ -177,11 +177,11 @@ impl RetainedOriginalStorageSources {
     }
     pub(super) fn validate_in(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &super::super::Usage,
     ) -> Result<(), WorkingMemoryError> {
         let payload = self.payload()?;
-        if !payload.pool.same_domain(pool) {
+        if !payload.pool.same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         for source in &payload.sources {
@@ -205,7 +205,7 @@ impl OriginalSources {
     }
     pub(super) fn validate_in(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &super::super::Usage,
     ) -> Result<(), WorkingMemoryError> {
         match self {
@@ -228,6 +228,7 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
             .original_sources
             .as_ref()
             .and_then(OriginalSources::preparation)
+            .or_else(|| self.0.completed_source.as_ref().map(|source| source.host()))
     }
 }
 
@@ -258,9 +259,8 @@ impl<K: super::super::HostSlotStorageKey> WorkingMemoryStorage<K> {
             {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            bytes = bytes
-                .checked_add(source.bytes().ok_or(WorkingMemoryError::UnknownBound)?)
-                .ok_or(WorkingMemoryError::Overflow)?;
+            let source_bytes = source.bytes().ok_or(WorkingMemoryError::UnknownBound)?;
+            bytes = bytes.and_then(|bytes| bytes.checked_add(source_bytes));
         }
         {
             let usage = pool

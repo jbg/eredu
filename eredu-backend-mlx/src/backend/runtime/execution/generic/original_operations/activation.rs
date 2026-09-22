@@ -14,13 +14,20 @@ impl Drop for OriginalOperationActivation {
 impl OriginalOperationActivation {
     pub(crate) fn control_bytes() -> Option<usize> {
         let frames = [
-            size_of::<Self>(), size_of::<Option<Self>>(),
-            size_of::<Result<Self, Error>>(), size_of::<Result<Option<Self>, Error>>(),
-            size_of::<&OriginalOperationBankOwner>(), size_of::<&dyn ErasedOwner>(),
-            size_of::<&OperationControls>(), size_of::<&Registry>(),
-            size_of::<Rc<Registry>>(), size_of::<Result<(), Error>>(),
-            size_of::<Error>(), size_of::<Option<Error>>(),
-            size_of::<RegisteredScopeRetirementCause>(), size_of::<Option<RegisteredScopeRetirementCause>>(),
+            size_of::<Self>(),
+            size_of::<Option<Self>>(),
+            size_of::<Result<Self, Error>>(),
+            size_of::<Result<Option<Self>, Error>>(),
+            size_of::<&OriginalOperationBankOwner>(),
+            size_of::<&dyn ErasedOwner>(),
+            size_of::<&OperationControls>(),
+            size_of::<&Registry>(),
+            size_of::<Rc<Registry>>(),
+            size_of::<Result<(), Error>>(),
+            size_of::<Error>(),
+            size_of::<Option<Error>>(),
+            size_of::<RegisteredScopeRetirementCause>(),
+            size_of::<Option<RegisteredScopeRetirementCause>>(),
             size_of::<&Cell<Option<RegisteredScopeRetirementCause>>>(),
             size_of::<std::cell::Ref<'static, Vec<safemlx::OriginalScopeObserver>>>(),
             size_of::<std::cell::Ref<'static, Option<OriginalOperationBankOwner>>>(),
@@ -29,15 +36,24 @@ impl OriginalOperationActivation {
             size_of::<(&InferenceRequest, &InferenceTextStep)>(),
             size_of::<bool>(),
         ];
-        frames.into_iter().try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
     }
 }
 impl Registry {
     pub(super) fn require_idle(&self) -> Result<(), Error> {
         self.check_retirement()?;
-        if !self.active.get() { return Err(Error::PrefillScopeUnavailable); }
-        if self.entered.get() || !self.scopes.try_borrow()
-            .map_err(|_| Error::PrefillScopeReentrant)?.is_empty() {
+        if !self.active.get() {
+            return Err(Error::PrefillScopeUnavailable);
+        }
+        if self.entered.get()
+            || !self
+                .scopes
+                .try_borrow()
+                .map_err(|_| Error::PrefillScopeReentrant)?
+                .is_empty()
+        {
             return Err(Error::PrefillScopeReentrant);
         }
         Ok(())
@@ -45,22 +61,36 @@ impl Registry {
     pub(super) fn enter(self: &Rc<Self>) -> OriginalOperationActivation {
         let previous = self.entered.replace(true);
         debug_assert!(!previous);
-        OriginalOperationActivation { registry: Rc::clone(self) }
+        OriginalOperationActivation {
+            registry: Rc::clone(self),
+        }
     }
 }
 impl<U: 'static> Bank<U> {
     fn require_idle(&self) -> Result<(), Error> {
         self.registry.require_idle()?;
-        if !self.pending.try_borrow().map_err(|_| Error::PrefillScopeReentrant)?.is_empty() {
+        if !self
+            .pending
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?
+            .is_empty()
+        {
             return Err(Error::PrefillScopeReentrant);
         }
-        let background = self.background.try_borrow().map_err(|_| Error::PrefillScopeReentrant)?;
+        let background = self
+            .background
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
         if background.as_ref().is_some_and(|value| !value.is_idle()) {
             return Err(Error::PrefillScopeReentrant);
         }
         // A live preparation/access loan is not an idle source, even before it
         // has published a lease into the pending queue.
-        drop(self.prepared.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?);
+        drop(
+            self.prepared
+                .try_borrow_mut()
+                .map_err(|_| Error::PrefillScopeReentrant)?,
+        );
         Ok(())
     }
 }
@@ -69,7 +99,10 @@ impl<U: 'static> OriginalOperationSlot<U> {
         let view = self.take();
         let bank = view.as_ref().and_then(|view| view.value.upgrade());
         self.set(view);
-        match bank { Some(bank) => bank.require_idle(), None => Ok(()) }
+        match bank {
+            Some(bank) => bank.require_idle(),
+            None => Ok(()),
+        }
     }
 }
 impl OriginalOperationBankOwner {
@@ -78,9 +111,15 @@ impl OriginalOperationBankOwner {
     }
 }
 impl<U: 'static> OwnedBank<U> {
-    pub(super) fn activate_text(&self, controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
+    pub(super) fn activate_text(
+        &self,
+        controls: &OperationControls,
+    ) -> Result<OriginalOperationActivation, Error> {
         if self.registration.is_none() || !matches!(controls, OperationControls::Text(_)) {
-            return Err(identity());
+            return Err(Error::OriginalSourceContract {
+                stage: "text operation activation source",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         controls.validate(&self.bank.registry)?;
         self.bank.require_idle()?;
@@ -99,16 +138,31 @@ impl<U: 'static> OwnedBank<U> {
 
 pub(super) fn typed_control_bytes<U: 'static>() -> Option<usize> {
     let frames = [
-        size_of::<&Bank<U>>(), size_of::<&OwnedBank<U>>(), size_of::<&OriginalOperationSlot<U>>(),
-        size_of::<Option<OriginalOperationProjection<U>>>(), size_of::<OriginalOperationProjection<U>>(),
-        size_of::<Option<Rc<Bank<U>>>>(), size_of::<Rc<Bank<U>>>(),
+        size_of::<&Bank<U>>(),
+        size_of::<&OwnedBank<U>>(),
+        size_of::<&OriginalOperationSlot<U>>(),
+        size_of::<Option<OriginalOperationProjection<U>>>(),
+        size_of::<OriginalOperationProjection<U>>(),
+        size_of::<Option<Rc<Bank<U>>>>(),
+        size_of::<Rc<Bank<U>>>(),
         size_of::<std::cell::Ref<'static, VecDeque<MlxUnitLease<U>>>>(),
         size_of::<std::cell::RefMut<'static, PreparedStorage<U>>>(),
-        size_of::<std::cell::Ref<'static, Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>>>(),
-        size_of::<Option<&crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>>(),
+        size_of::<
+            std::cell::Ref<
+                'static,
+                Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+            >,
+        >(),
+        size_of::<
+            Option<&crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+        >(),
         size_of::<&crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>(),
-        size_of::<Result<(), Error>>(), size_of::<bool>(),
+        size_of::<Result<(), Error>>(),
+        size_of::<bool>(),
     ];
-    frames.into_iter().try_fold(OriginalOperationActivation::control_bytes()?
-        .checked_add(std::mem::size_of_val(&frames))?, usize::checked_add)
+    frames.into_iter().try_fold(
+        OriginalOperationActivation::control_bytes()?
+            .checked_add(std::mem::size_of_val(&frames))?,
+        usize::checked_add,
+    )
 }

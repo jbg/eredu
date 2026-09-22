@@ -3,11 +3,15 @@
 use super::*;
 
 mod append;
+mod checkpoint;
+mod truncate;
+pub(crate) use checkpoint::{OrdinaryPagedCheckpoint, PreparedPagedCheckpoint};
+mod ordinary_append;
 mod original_append;
-mod scan;
-mod source;
 mod original_copy;
 mod realtime;
+mod scan;
+mod source;
 pub(in crate::backend::runtime::cache) use realtime::RealtimePagedSource;
 mod visible;
 pub(crate) use source::{
@@ -97,6 +101,7 @@ pub struct PagedKeyValueCache {
     pub(super) tail_keys: Option<Array>,
     tail_values: Option<Array>,
     retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>,
+    ordinary_checkpoint: Option<OrdinaryPagedCheckpoint>,
     manager: CacheResidencyManager,
     global_layer: usize,
     rank: Option<CacheRankIdentity>,
@@ -372,22 +377,51 @@ impl PagedKeyValueCache {
                 .map(|array| array.contiguous(false, stream)?.deep_clone())
                 .transpose()
         };
-        Ok(self.copied_with_tails(self.manager.clone(), copy(&self.tail_keys)?, copy(&self.tail_values)?, self.retained_history.clone()))
+        Ok(self.copied_with_tails(
+            self.manager.clone(),
+            copy(&self.tail_keys)?,
+            copy(&self.tail_values)?,
+            self.retained_history.clone(),
+        ))
     }
 
     // Same ordinary metadata handoff for deep snapshots and registered copies.
-    fn copied_with_tails(&self, manager: CacheResidencyManager, tail_keys: Option<Array>,
-        tail_values: Option<Array>, retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>) -> Self {
-        Self { tail_keys, tail_values, retained_history, manager,
-            global_layer: self.global_layer, rank: self.rank, sliding_window: self.sliding_window,
-            key_only: self.key_only, prefix_tokens: self.prefix_tokens,
-            tail_start: self.tail_start, offset: self.offset }
+    fn copied_with_tails(
+        &self,
+        manager: CacheResidencyManager,
+        tail_keys: Option<Array>,
+        tail_values: Option<Array>,
+        retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>,
+    ) -> Self {
+        Self {
+            tail_keys,
+            tail_values,
+            retained_history,
+            ordinary_checkpoint: None,
+            manager,
+            global_layer: self.global_layer,
+            rank: self.rank,
+            sliding_window: self.sliding_window,
+            key_only: self.key_only,
+            prefix_tokens: self.prefix_tokens,
+            tail_start: self.tail_start,
+            offset: self.offset,
+        }
     }
 
     /// Snapshots append-only local state while retaining its exact array views.
     /// Appends replace tails rather than mutating them, so the shared views are
     /// immutable for the lifetime of the checkpoint.
     pub fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
+        if let Some(owner) = crate::backend::nn::shared::current_ordinary_execution_owner()? {
+            let work = owner
+                .paged()
+                .ok_or_else(|| checkpoint::unqualified_truncate(owner.host()))?;
+            let source = work.checkpoint(self, owner.host())?;
+            let mut checkpoint = self.clone();
+            checkpoint.ordinary_checkpoint = Some(source);
+            return Ok(checkpoint);
+        }
         let mut checkpoint = self.clone();
         if let Some(window) = self.sliding_window {
             let start = (self.offset - i64::from(window)).max(0);
@@ -447,8 +481,8 @@ impl PagedKeyValueCache {
         &mut self,
         checkpoint: &PagedKeyValueTransactionCheckpoint,
     ) -> Result<(), Exception> {
-        if let Some(original)=&checkpoint.original {
-            return self.rollback_original_transaction(checkpoint,original);
+        if let Some(original) = &checkpoint.original {
+            return self.rollback_original_transaction(checkpoint, original);
         }
         if checkpoint.session_id != self.manager.session_id()
             || checkpoint.global_layer != self.global_layer
@@ -572,6 +606,7 @@ impl PagedKeyValueCache {
             tail_start: offset,
             offset,
             retained_history: None,
+            ordinary_checkpoint: None,
         })
     }
 
@@ -590,9 +625,19 @@ impl PagedKeyValueCache {
     }
 
     pub(crate) fn matches_original_reset_policy(&self, window: Option<i32>) -> bool {
-        window.is_none() && self.sliding_window.is_none() && !self.key_only
-            && self.prefix_tokens >= 0 && self.retained_history.is_none()
+        window.is_none()
+            && self.sliding_window.is_none()
+            && !self.key_only
+            && self.prefix_tokens >= 0
+            && self.retained_history.is_none()
             && self.manager.options().full_attention_enabled()
+    }
+    pub(crate) fn matches_original_key_only_reset_policy(&self, window: i32) -> bool {
+        window > 0
+            && self.sliding_window == Some(window)
+            && self.key_only
+            && self.prefix_tokens >= 0
+            && self.retained_history.is_none()
     }
     /// Metadata-only form of the same empty layer constructor. The supplied
     /// manager was just built empty from this exact state's original source.
@@ -603,6 +648,49 @@ impl PagedKeyValueCache {
         value
     }
 
+    pub(crate) fn prompt_cache_import(
+        &self,
+        manager: CacheResidencyManager,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, super::super::residency::CacheResidencyError> {
+        context
+            .charge_metadata(std::mem::size_of::<(
+                Self,
+                i64,
+                Result<Self, super::super::residency::CacheResidencyError>,
+            )>())
+            .map_err(|cause| {
+                super::super::residency::CacheResidencyError::Preparation(cause.into())
+            })?;
+        let offset = manager.layer_end(self.global_layer, CacheRepresentation::KeyValue)?;
+        let mut value = self.copied_with_tails(manager, None, None, None);
+        value.tail_start = offset;
+        value.offset = offset;
+        Ok(value)
+    }
+
+    pub(crate) fn prompt_cache_tail(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        Option<super::super::residency::PromptCacheTail<'_>>,
+        super::super::residency::CacheSourceFailure,
+    > {
+        super::super::residency::PromptCacheTail::from_source(
+            &self.manager,
+            CacheBlockId {
+                session_id: self.manager.session_id(),
+                global_layer: self.global_layer,
+                representation: CacheRepresentation::KeyValue,
+                start: self.tail_start,
+                end: i64::from(self.offset),
+                rank: self.rank,
+            },
+            [self.tail_keys.as_ref(), self.tail_values.as_ref()],
+            context,
+        )
+    }
+
     /// Returns the shared model-wide residency manager.
     pub const fn manager(&self) -> &CacheResidencyManager {
         &self.manager
@@ -611,6 +699,7 @@ impl PagedKeyValueCache {
     pub(crate) fn rebind_paging_manager(&mut self, manager: CacheResidencyManager) {
         self.manager = manager;
         self.retained_history = None;
+        self.ordinary_checkpoint = None;
     }
 
     /// Returns whether another cache has the same immutable transaction
@@ -661,94 +750,7 @@ impl PagedKeyValueCache {
 
     /// Truncates this layer to an absolute token length.
     pub fn truncate(&mut self, len: i64, stream: &Stream) -> Result<(), Exception> {
-        if len < 0 || len > self.offset {
-            return Err(Exception::custom(format!(
-                "paged cache truncate length {len} is outside 0..{}",
-                self.offset
-            )));
-        }
-        if len >= self.tail_start {
-            let retained = i32::try_from(len - self.tail_start)
-                .map_err(|_| Exception::custom("paged cache truncate length overflow"))?;
-            let candidate_keys = self
-                .tail_keys
-                .as_ref()
-                .map(|keys| keys.try_index_device((.., .., ..retained, ..), stream))
-                .transpose()?;
-            let candidate_values = self
-                .tail_values
-                .as_ref()
-                .map(|values| values.try_index_device((.., .., ..retained, ..), stream))
-                .transpose()?;
-            let (candidate_keys, candidate_values) = if retained == 0 {
-                (None, None)
-            } else {
-                (candidate_keys, candidate_values)
-            };
-            let candidate_bytes = candidate_keys
-                .iter()
-                .chain(candidate_values.iter())
-                .map(|array| array.nbytes() as u64)
-                .sum();
-            self.manager
-                .set_tail_state(self.global_layer, candidate_bytes, len)
-                .map_err(cache_residency_exception)?;
-            self.tail_keys = candidate_keys;
-            self.tail_values = candidate_values;
-            self.offset = len;
-            return Ok(());
-        }
-
-        let ids = self
-            .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                0,
-                self.offset,
-                self.prefix_tokens as i64,
-            )
-            .map_err(cache_residency_exception)?;
-        let crossing = ids.into_iter().find(|id| id.start < len && id.end > len);
-        let replacement = if let Some(id) = crossing {
-            let lease = self
-                .manager
-                .lease_block(&id, stream)
-                .map_err(cache_residency_exception)?;
-            let retained = i32::try_from(len - id.start)
-                .map_err(|_| Exception::custom("paged cache truncate length overflow"))?;
-            let (keys, values) = match lease.arrays() {
-                CacheBlockArrays::KeyValue { keys, values } => (
-                    keys.try_index_device((.., .., ..retained, ..), stream)?,
-                    values.try_index_device((.., .., ..retained, ..), stream)?,
-                ),
-                _ => {
-                    return Err(Exception::custom(
-                        "paged key/value cache found an incompatible block representation",
-                    ));
-                }
-            };
-            safemlx::transforms::async_eval_with_event([&keys, &values])?.synchronize()?;
-            let keys = keys.contiguous(false, stream)?.deep_clone()?;
-            let values = values.contiguous(false, stream)?.deep_clone()?;
-            Some((lease, CacheBlockArrays::KeyValue { keys, values }))
-        } else {
-            None
-        };
-        self.manager
-            .truncate_layer_transaction(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                len,
-                replacement,
-                self.prefix_tokens as i64,
-            )
-            .map_err(cache_residency_exception)?;
-        self.tail_keys = None;
-        self.tail_values = None;
-        self.offset = len;
-        self.tail_start = len;
-        Ok(())
+        self.truncate_with_plan(len, stream)
     }
 
     /// Restores an earlier speculative frontier and atomically removes blocks
@@ -758,6 +760,9 @@ impl PagedKeyValueCache {
         checkpoint: &Self,
         stream: &Stream,
     ) -> Result<(), Exception> {
+        if let Some(source) = &checkpoint.ordinary_checkpoint {
+            return source.restore(self, checkpoint);
+        }
         if self.global_layer != checkpoint.global_layer
             || self.manager.session_id() != checkpoint.manager.session_id()
             || self.key_only != checkpoint.key_only
@@ -809,6 +814,7 @@ impl PagedKeyValueCache {
         self.tail_start = 0;
         self.offset = 0;
         self.retained_history = None;
+        self.ordinary_checkpoint = None;
         Ok(())
     }
 
@@ -877,7 +883,9 @@ impl PagedKeyValueCache {
         {
             return Err(match safemlx::OriginalScopeObserver::try_current()? {
                 Some(scope) => scope.invalid_input_error(),
-                None => Exception::custom("paged key-only cache expects matching rank-4 keys and zero-width values"),
+                None => Exception::custom(
+                    "paged key-only cache expects matching rank-4 keys and zero-width values",
+                ),
             });
         }
         let shape = [keys.dim(0), keys.dim(1), keys.dim(2), 1];
@@ -927,6 +935,9 @@ impl PagedKeyValueCache {
     ) -> Result<(), Exception> {
         if safemlx::OriginalScopeObserver::try_current()?.is_some() {
             return self.append_original(keys, values, retain_for_attention, stream);
+        }
+        if crate::backend::nn::shared::current_ordinary_execution_owner()?.is_some() {
+            return self.append_ordinary(keys, values, retain_for_attention, stream);
         }
         self.manager
             .bind_transfer_device(stream)
@@ -998,6 +1009,7 @@ impl PagedKeyValueCache {
                 values,
                 stream,
                 original: None,
+                ordinary: None,
             },
             retain_for_attention,
         )
@@ -1090,6 +1102,7 @@ impl Default for PagedKeyValueCache {
             tail_start: 0,
             offset: 0,
             retained_history: None,
+            ordinary_checkpoint: None,
         }
     }
 }
@@ -1228,12 +1241,19 @@ impl PagedKeyValueCache {
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         if safemlx::OriginalScopeObserver::try_current()?.is_some() {
-            return scan::original_scan(self, queries, scale, mask, sinks, softcap, arithmetic, relative, stream);
+            return scan::original_scan(
+                self, queries, scale, mask, sinks, softcap, arithmetic, relative, stream,
+            );
         }
         if self.key_only {
             return Err(Exception::custom(
                 "key-only paged caches require architecture-owned attention",
             ));
+        }
+        if let Some(owner) = crate::backend::nn::shared::current_ordinary_execution_owner()? {
+            return scan::ordinary_scan(
+                self, queries, scale, mask, sinks, softcap, arithmetic, relative, stream, owner,
+            );
         }
         let options = eredu_nn::BlockwiseAttentionOptions {
             arithmetic,
@@ -1278,5 +1298,21 @@ impl PagedKeyValueCache {
 }
 
 impl PagedKeyValueCache {
-    pub(crate) fn original_scan_control_bytes() -> Option<usize> { scan::original_control_bytes() }
+    pub(crate) fn ordinary_scan_control_bytes() -> Option<usize> {
+        scan::ordinary_control_bytes()
+    }
+    /// Fixed handle moves in the shared paged append, scan and transfer
+    /// traversal. Their enclosing owners separately retain completion custody.
+    pub(crate) fn ordinary_retention_control_bytes(roots: usize) -> Option<usize> {
+        if roots == 0 {
+            return None;
+        }
+        use std::mem::size_of;
+        size_of::<(Array, Option<Array>, Result<Array, Exception>)>()
+            .checked_add(size_of::<(&mut append::NativeAppend<'_, '_>, Array)>())?
+            .checked_mul(roots)
+    }
+    pub(crate) fn original_scan_control_bytes() -> Option<usize> {
+        scan::original_control_bytes()
+    }
 }

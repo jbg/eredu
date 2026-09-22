@@ -1,9 +1,9 @@
-//! Allocation-free output geometry for one admitted floating tensor selection.
+//! Allocation-free output geometry for one admitted typed tensor selection.
 use super::*;
 use crate::{ObservationDtype, ObservationValueType};
 mod partition;
 
-/// Rejection by the current closed F32 observation construction geometry.
+/// Rejection by the closed observation construction geometry.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureTensorGeometryError {
     /// The indexed selection is not part of this immutable admission.
@@ -15,8 +15,8 @@ pub enum CaptureTensorGeometryError {
     /// The selected point is not scheduled at the supplied coordinate.
     #[error("capture tensor selection is inactive")]
     Inactive,
-    /// Only raw floating tensor outputs are implemented by this primitive.
-    #[error("capture tensor construction requires a floating raw tensor transform")]
+    /// The declared scalar category or transform lacks a typed constructor.
+    #[error("capture tensor construction requires a supported typed tensor transform")]
     Unsupported,
     /// A fragment is not the exact selected global projection or additive term.
     #[error("capture partition differs from its admitted global projection")]
@@ -43,7 +43,7 @@ pub enum CaptureTensorGeometryError {
     Capture(#[from] CaptureError),
 }
 
-/// Borrowed immutable output geometry for Preview, Slice or FullTensor F32 data.
+/// Borrowed immutable output geometry for typed Preview, Slice or FullTensor data.
 ///
 /// This proves only the selected output extent. It does not establish actual
 /// tensor values, source backing, native conversion/transfer funding, capture
@@ -58,6 +58,8 @@ pub struct CaptureTensorGeometry<'a> {
     selection: usize,
     phase: CapturePhase,
     prediction: u64,
+    invocation: Option<CaptureInvocationShape>,
+    window: Option<PartitionCaptureInvocationWindow>,
     source_shape: [usize; 32],
     source_rank: usize,
     starts: [u64; 32],
@@ -77,6 +79,42 @@ enum GeometryTransform {
     RoutedUnits,
 }
 impl<'a> CaptureTensorGeometry<'a> {
+    /// Resolve the original selection using the receipt's exact logical and
+    /// physical invocation. This descriptive source grants no capture authority.
+    pub fn prepare_receipt(
+        source: &'a AdmittedCapturePlan,
+        context: &PartitionCaptureContext,
+    ) -> Result<Self, CaptureTensorGeometryError> {
+        Self::prepare_receipt_kind(source, context, GeometryTransform::Tensor)
+    }
+    fn prepare_receipt_kind(
+        source: &'a AdmittedCapturePlan,
+        context: &PartitionCaptureContext,
+        kind: GeometryTransform,
+    ) -> Result<Self, CaptureTensorGeometryError> {
+        if context.capture_plan_identity != source.identity() {
+            return Err(CaptureTensorGeometryError::Partition);
+        }
+        let selected = Self::prepare_kind(
+            source,
+            context.selection_index,
+            context.phase,
+            context.prediction,
+            context.invocation,
+            kind,
+        )?;
+        match context.invocation_window {
+            Some(interval) => {
+                if Some(interval.logical()?) != context.invocation {
+                    return Err(CaptureTensorGeometryError::Partition);
+                }
+                source.geometry_at(context.phase, context.prediction, Some(interval.physical))?;
+                selected.apply_window(interval.physical, interval.window)
+            }
+            None => Ok(selected),
+        }
+    }
+
     /// Derives exact known output axes from one actual admitted selection.
     pub fn prepare(
         source: &'a AdmittedCapturePlan,
@@ -161,6 +199,7 @@ impl<'a> CaptureTensorGeometry<'a> {
                 .checked_mul(self.shape[axis])
                 .ok_or(CaptureTensorGeometryError::Overflow)?;
         }
+        self.window = Some(PartitionCaptureInvocationWindow { physical, window });
         self.rank = self.source_rank;
         self.elements = elements;
         if let CaptureTransform::Preview { max_elements } = selection.transform {
@@ -177,12 +216,22 @@ impl<'a> CaptureTensorGeometry<'a> {
     pub fn preparation_control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};
         let frames = [
+            size_of::<(
+                &AdmittedCapturePlan,
+                &PartitionCaptureContext,
+                GeometryTransform,
+            )>(),
+            size_of::<Option<PartitionCaptureInvocationWindow>>(),
             // Both the window caller and shared physical-selection adapter
             // retain their moved arguments/results until the return frontier.
             size_of::<Self>() * 2,
             size_of::<Result<Self, CaptureTensorGeometryError>>() * 2,
             size_of::<CaptureWindowGeometry>() * 2,
-            size_of::<(CaptureInvocationShape, CaptureInvocationWindow, CaptureWindowGeometry)>(),
+            size_of::<(
+                CaptureInvocationShape,
+                CaptureInvocationWindow,
+                CaptureWindowGeometry,
+            )>(),
             size_of::<super::window_geometry::WindowSelection>(),
             size_of::<Result<super::window_geometry::WindowSelection, CaptureError>>(),
             size_of::<(
@@ -221,22 +270,38 @@ impl<'a> CaptureTensorGeometry<'a> {
         {
             return Err(CaptureTensorGeometryError::Inactive);
         }
-        if point.dtype != ObservationDtype::Floating
+        if !(point.dtype == ObservationDtype::Floating
+            || point.dtype == ObservationDtype::Integer
+                && matches!(
+                    transform,
+                    GeometryTransform::Tensor
+                        | GeometryTransform::AdditiveTensor
+                        | GeometryTransform::Summary
+                ))
             || !match transform {
-                GeometryTransform::RoutedUnits => matches!(point.value_type, ObservationValueType::RoutedUnits { .. }),
+                GeometryTransform::RoutedUnits => {
+                    matches!(point.value_type, ObservationValueType::RoutedUnits { .. })
+                }
                 _ => point.value_type == ObservationValueType::Tensor,
             }
             || !match transform {
-                GeometryTransform::RoutedUnits => matches!(selected.transform, CaptureTransform::RoutedUnits),
+                GeometryTransform::RoutedUnits => {
+                    matches!(selected.transform, CaptureTransform::RoutedUnits)
+                }
                 GeometryTransform::Summary => {
                     matches!(selected.transform, CaptureTransform::Summary)
                 }
                 GeometryTransform::Histogram => {
                     matches!(selected.transform, CaptureTransform::Histogram { .. })
                 }
-                GeometryTransform::AdditiveTensor => matches!(selected.transform,
-                    CaptureTransform::FullTensor | CaptureTransform::Slice | CaptureTransform::Preview { .. }
-                        | CaptureTransform::Summary | CaptureTransform::Histogram { .. }),
+                GeometryTransform::AdditiveTensor => matches!(
+                    selected.transform,
+                    CaptureTransform::FullTensor
+                        | CaptureTransform::Slice
+                        | CaptureTransform::Preview { .. }
+                        | CaptureTransform::Summary
+                        | CaptureTransform::Histogram { .. }
+                ),
                 GeometryTransform::Tensor => matches!(
                     selected.transform,
                     CaptureTransform::Preview { .. }
@@ -308,6 +373,8 @@ impl<'a> CaptureTensorGeometry<'a> {
             selection,
             phase,
             prediction,
+            invocation,
+            window: None,
             source_shape,
             source_rank: axes.len(),
             starts,
@@ -325,11 +392,18 @@ impl<'a> CaptureTensorGeometry<'a> {
         let transform = &self.source.plan().selections[self.selection].transform;
         if self.additive_term && !matches!(transform, CaptureTransform::Preview { .. }) {
             &CaptureTransform::Slice
-        } else { transform }
+        } else {
+            transform
+        }
     }
     /// Original immutable semantic admission; no clone or native source pin.
     pub fn admission(&self) -> &'a AdmittedCapturePlan {
         self.source
+    }
+    /// Semantic scalar category of the actual selected source. Integer host
+    /// construction uses unsigned U64 values and requires a matching native source.
+    pub fn value_dtype(&self) -> ObservationDtype {
+        self.source.points[self.selection].dtype
     }
     /// Selected point's index within the immutable admission.
     pub fn selection_index(&self) -> usize {
@@ -343,6 +417,16 @@ impl<'a> CaptureTensorGeometry<'a> {
     pub fn prediction(&self) -> u64 {
         self.prediction
     }
+    /// Independently admitted axes used before spatial or row projection.
+    /// This descriptive identity grants no source or execution authority.
+    pub fn invocation(&self) -> Option<CaptureInvocationShape> {
+        self.invocation
+    }
+    /// Exact original physical interval; equal widths do not identify a source.
+    pub fn invocation_window(&self) -> Option<PartitionCaptureInvocationWindow> {
+        self.window
+    }
+
     /// Resolved source axes before selection or Preview flattening. These are
     /// immutable geometry only, never evidence of actual numerical backing.
     pub fn source_shape(&self) -> &[usize] {
@@ -506,6 +590,9 @@ impl<'a> CaptureReductionGeometry<'a> {
     pub fn prediction(&self) -> u64 {
         self.selected.prediction()
     }
+    pub fn invocation(&self) -> Option<CaptureInvocationShape> {
+        self.selected.invocation()
+    }
     /// Actual source axes before the admitted slice.
     pub fn source_shape(&self) -> &[usize] {
         self.selected.source_shape()
@@ -542,6 +629,54 @@ macro_rules! reduction_geometry {
             inner: CaptureReductionGeometry<'a>,
         }
         impl<'a> $name<'a> {
+            /// Resolve the same reduction source with the receipt's physical window.
+            pub fn prepare_receipt(
+                source: &'a AdmittedCapturePlan,
+                context: &PartitionCaptureContext,
+            ) -> Result<Self, CaptureTensorGeometryError> {
+                let selected = CaptureTensorGeometry::prepare_receipt_kind(
+                    source,
+                    context,
+                    GeometryTransform::$kind,
+                )?;
+                Ok(Self {
+                    inner: CaptureReductionGeometry {
+                        starts: selected.starts,
+                        ends: selected.ends,
+                        strides: selected.strides,
+                        selected,
+                        fragment: None,
+                    },
+                })
+            }
+            /// Apply the retained spatial producer after the receipt's exact row interval.
+            pub fn prepare_receipt_partition(
+                source: &'a AdmittedCapturePlan,
+                context: &PartitionCaptureContext,
+                projection: &CaptureSlicePartition,
+                fragment: usize,
+            ) -> Result<Self, CaptureTensorGeometryError> {
+                let selected = CaptureTensorGeometry::prepare_receipt_kind(
+                    source,
+                    context,
+                    GeometryTransform::$kind,
+                )?
+                .apply_partition(
+                    projection,
+                    fragment,
+                    PartitionCaptureCombination::Disjoint,
+                )?;
+                Ok(Self {
+                    inner: CaptureReductionGeometry {
+                        starts: selected.starts,
+                        ends: selected.ends,
+                        strides: selected.strides,
+                        selected,
+                        fragment: None,
+                    },
+                })
+            }
+
             /// Fixed shared preparation/fragment representations; no allocation or authority.
             pub fn preparation_control_bytes() -> Option<usize> {
                 use std::mem::{size_of, size_of_val};
@@ -587,28 +722,76 @@ macro_rules! reduction_geometry {
             /// Exact disjoint fragment of the original global reduction.
             /// Additive receipts use raw tensor terms and reduce after assembly.
             pub fn prepare_partition(
-                source: &'a AdmittedCapturePlan, selection: usize, phase: CapturePhase,
-                prediction: u64, invocation: Option<CaptureInvocationShape>,
-                projection: &CaptureSlicePartition, fragment: usize,
+                source: &'a AdmittedCapturePlan,
+                selection: usize,
+                phase: CapturePhase,
+                prediction: u64,
+                invocation: Option<CaptureInvocationShape>,
+                projection: &CaptureSlicePartition,
+                fragment: usize,
             ) -> Result<Self, CaptureTensorGeometryError> {
-                let selected = CaptureTensorGeometry::prepare_kind(source, selection, phase,
-                    prediction, invocation, GeometryTransform::$kind)?
-                    .apply_partition(projection, fragment, PartitionCaptureCombination::Disjoint)?;
-                let starts = selected.starts; let ends = selected.ends; let strides = selected.strides;
-                Ok(Self { inner: CaptureReductionGeometry { selected, starts, ends, strides, fragment: None } })
+                let selected = CaptureTensorGeometry::prepare_kind(
+                    source,
+                    selection,
+                    phase,
+                    prediction,
+                    invocation,
+                    GeometryTransform::$kind,
+                )?
+                .apply_partition(
+                    projection,
+                    fragment,
+                    PartitionCaptureCombination::Disjoint,
+                )?;
+                let starts = selected.starts;
+                let ends = selected.ends;
+                let strides = selected.strides;
+                Ok(Self {
+                    inner: CaptureReductionGeometry {
+                        selected,
+                        starts,
+                        ends,
+                        strides,
+                        fragment: None,
+                    },
+                })
             }
             /// Compose the original disjoint spatial source with one physical
             /// row window; additive terms use the raw tensor source instead.
             pub fn prepare_partition_window(
-                source: &'a AdmittedCapturePlan, selection: usize, phase: CapturePhase,
-                prediction: u64, physical: CaptureInvocationShape, window: CaptureInvocationWindow,
-                projection: &CaptureSlicePartition, fragment: usize,
+                source: &'a AdmittedCapturePlan,
+                selection: usize,
+                phase: CapturePhase,
+                prediction: u64,
+                physical: CaptureInvocationShape,
+                window: CaptureInvocationWindow,
+                projection: &CaptureSlicePartition,
+                fragment: usize,
             ) -> Result<Self, CaptureTensorGeometryError> {
                 let selected = CaptureTensorGeometry::prepare_partition_window_kind(
-                    source, selection, phase, prediction, physical, window, projection,
-                    fragment, PartitionCaptureCombination::Disjoint, GeometryTransform::$kind)?;
-                let starts = selected.starts; let ends = selected.ends; let strides = selected.strides;
-                Ok(Self { inner: CaptureReductionGeometry { selected, starts, ends, strides, fragment: None } })
+                    source,
+                    selection,
+                    phase,
+                    prediction,
+                    physical,
+                    window,
+                    projection,
+                    fragment,
+                    PartitionCaptureCombination::Disjoint,
+                    GeometryTransform::$kind,
+                )?;
+                let starts = selected.starts;
+                let ends = selected.ends;
+                let strides = selected.strides;
+                Ok(Self {
+                    inner: CaptureReductionGeometry {
+                        selected,
+                        starts,
+                        ends,
+                        strides,
+                        fragment: None,
+                    },
+                })
             }
             /// Bind the same globally selected reduction to one actual invocation window.
             pub fn prepare_window(
@@ -667,6 +850,15 @@ macro_rules! reduction_geometry {
             pub fn prediction(&self) -> u64 {
                 self.inner.prediction()
             }
+            /// Independently admitted axes before spatial or row projection.
+            pub fn invocation(&self) -> Option<CaptureInvocationShape> {
+                self.inner.invocation()
+            }
+            /// Exact row interval retained by the same reduction source.
+            pub fn invocation_window(&self) -> Option<PartitionCaptureInvocationWindow> {
+                self.inner.selected.invocation_window()
+            }
+
             /// Physical source axes.
             pub fn source_shape(&self) -> &[usize] {
                 self.inner.source_shape()
@@ -715,4 +907,7 @@ impl<'a> CaptureHistogramGeometry<'a> {
 }
 
 mod routed;
-pub use routed::{CaptureRoutedUnitsGeometry, CaptureRoutedPrefillPlan, CaptureRoutedPrefillFragment, CaptureRoutedTokenWindow};
+pub use routed::{
+    CaptureRoutedPrefillFragment, CaptureRoutedPrefillPlan, CaptureRoutedTokenWindow,
+    CaptureRoutedUnitsGeometry,
+};

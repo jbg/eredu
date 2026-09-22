@@ -93,10 +93,25 @@ fn verify_loaded_routed_interventions(
                 )
                 .unwrap();
             MlxBackend::validate_text_interventions(runtime, capture, &admitted).unwrap();
-            let mut generation = component_capture_generation(runtime, sampling);
-            generation
-                .enable_interventions(capture.clone(), admitted)
-                .unwrap();
+            let interventions = runtime
+                .backend()
+                .memory_ledger()
+                .compile_intervention_source(
+                    eredu_core::intervention::PreparedInterventionPlanCopy::inspect(&admitted)
+                        .unwrap(),
+                )
+                .unwrap()
+                .plan()
+                .clone();
+            let mut generation = component_capture_generation(
+                runtime,
+                sampling,
+                Some(eredu_core::TextPreparationOptions {
+                    capture: Some(eredu_core::capture::SharedCapturePlan::new(capture.clone())),
+                    interventions: Some(interventions),
+                }),
+            )
+            .unwrap();
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
@@ -188,8 +203,10 @@ fn compare_sparse_trials(
                 actual.payload.as_ref().unwrap(),
                 expected.payload.as_ref().unwrap(),
             ) {
-                (CapturePayload::Tensor(actual), CapturePayload::Tensor(expected)) => {
-                    routed_close(actual, expected)
+                (actual, expected)
+                    if actual.as_tensor().is_some() && expected.as_tensor().is_some() =>
+                {
+                    routed_close(actual.as_tensor().unwrap(), expected.as_tensor().unwrap())
                 }
                 (CapturePayload::RoutedUnits(actual), CapturePayload::RoutedUnits(expected)) => {
                     assert_eq!(actual.geometry, expected.geometry);

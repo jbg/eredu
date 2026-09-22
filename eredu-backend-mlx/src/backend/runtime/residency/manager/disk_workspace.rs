@@ -6,15 +6,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Weak, atomic::Ordering},
+    sync::{atomic::Ordering, Arc, Weak},
 };
 
 use eredu_checkpoint::store::CheckpointSource;
 use eredu_core::residency::{MemoryTier, OffloadUnitId};
-use eredu_runtime::{OffloadUnit, WeightBinding, working_memory::WorkingMemoryError};
+use eredu_runtime::{working_memory::WorkingMemoryError, OffloadUnit, WeightBinding};
 use safemlx::{Array, ArrayAllocationInfo, Dtype, Stream};
 
-use super::{ManagerWeak, ResidencyError, ResidencyManager, transfer::ManagerState};
+use super::{transfer::ManagerState, ManagerWeak, ResidencyError, ResidencyManager};
 use crate::backend::{
     nn::workspace::NativeAllocationFacts,
     runtime::checkpoint::recipe::{PreparedDirectReadError, PreparedDirectReadPlan},
@@ -765,7 +765,7 @@ mod tests;
 
 mod route;
 pub(super) use route::{
-    DiskRouteActivation, materialize_admitted_disk, materialize_admitted_disk_into,
-    validate_admitted_disk_aliases, validate_disk_access, validate_disk_acquisition,
+    materialize_admitted_disk, materialize_admitted_disk_into, validate_admitted_disk_aliases,
+    validate_disk_access, validate_disk_acquisition, DiskRouteActivation,
 };
 pub(crate) use route::{DiskRouteGuard, DiskRouteReceipt};

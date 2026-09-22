@@ -404,6 +404,16 @@ extern "C" int mlx_host_transfer_buffer_attach_prepared_allocation_owner(
   }
 }
 
+extern "C" size_t mlx_host_transfer_buffer_prepared_owner_control_bytes(void) {
+  // This C adapter, HostTransferBuffer's source check, storage delegation and
+  // AllocationOwners::append_prepared all borrow the same supplied nodes.
+  return sizeof(int*) + sizeof(mlx_host_transfer_buffer) + sizeof(int) +
+      sizeof(const mlx::core::HostTransferBuffer*) + sizeof(std::exception*) +
+      4 * (sizeof(mlx::core::AllocationOwners::Node*) + sizeof(void*) +
+           sizeof(void (*)(void*))) + sizeof(mlx::core::AllocationOwners*) +
+      sizeof(uint64_t) + sizeof(bool);
+}
+
 extern "C" int mlx_host_transfer_buffer_retain_allocation_owner(
     bool* attached, mlx_host_transfer_buffer buffer, void* payload, void (*release)(void*)) {
   try {
@@ -449,7 +459,7 @@ MLX_HOST_BUFFER_GETTER(
 namespace {
 mlx::core::allocator::PreparedInputFacts prepared_host_facts(mlx_prepared_input_runtime runtime) noexcept {
   return {runtime.page_size,runtime.maximum,
-      static_cast<mlx::core::HostTransferStorageKind>(runtime.storage_kind),runtime.controls};
+      static_cast<mlx::core::HostTransferStorageKind>(runtime.storage_kind),runtime.controls, {runtime.placement.kind, runtime.placement.device, runtime.placement.device_count}};
 }
 bool prepared_host_dtype(mlx_dtype dtype) noexcept {
   return static_cast<unsigned>(dtype) <= MLX_COMPLEX64;

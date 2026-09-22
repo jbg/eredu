@@ -2,31 +2,48 @@
 //!
 //! These bounds cover MLX tensor-buffer capacities. They exclude allocator cache
 //! residency, Metal heaps/driver bookkeeping, JIT programs and unrelated process
-//! memory. Those domains cannot be advertised as covered by these bounds.
+//! memory. Those contributions are not covered by tensor-buffer bounds.
 //! Operation-owned host staging is a separate mandatory managed-workspace
-//! domain. Its facts remain partial, so tensor-buffer estimates alone cannot
-//! authorize strict admission through a completed equation trace.
+//! contribution. Its facts remain partial, so tensor-buffer estimates alone
+//! cannot authorize admission through a completed equation trace.
 
 use eredu_nn::{Error, workspace::*};
 
 mod cpu;
-pub(crate) use cpu::MlxCpuWorkspaceMechanisms;
+mod parameter_backings;
+pub(crate) use cpu::{MlxCpuWorkspaceMechanisms, OrdinaryCallControls};
+pub(crate) use parameter_backings::{
+    CompletedParameterSource, CompletedParameterSources, ParameterWorkspaceBackings,
+};
 mod cpu_matmul;
 pub use cpu_matmul::MlxCpuMatmulMechanism;
+mod addressable;
 mod attention;
 mod basic;
-mod addressable;
-pub(crate) use addressable::{AddressableParentSource, AddressableChildSource, AddressableQuote,AddressableSources,AddressableQuoteRef,AddressableInvocation,MlxAddressableWorkspaceMechanisms};
-pub(super) mod zero_fill;
+pub(crate) use addressable::{
+    AddressableChildSource, AddressableEquationSource, AddressableInvocation,
+    AddressableParentSource, AddressableQuote, AddressableQuoteRef, AddressableSources,
+    MlxAddressableWorkspaceMechanisms, OrdinaryAddressableProgram, OrdinaryAddressableSources,
+};
+pub(crate) mod host_array;
 mod parallel;
 mod pointwise_traversal;
+pub(super) mod zero_fill;
 pub(crate) use parallel::numerical as selected_parallel_numerical;
-pub(crate) use parallel::{ExpertLocalQuote,ExpertProviderWaveQuote,ExpertInactiveWaveQuote,ExpertCountQuote,ExpertTransportQuote,ExpertRegionAggregate,ExpertProviderQuote,ExpertMovementKind,ExpertTransferProfile,ExpertReorderEnvelope,ExpertLocalStage,ExpertLocalStageBound};
-pub(crate) use parallel::{MlxParallelWorkspace, MlxParallelWorkspaceMechanisms,PipelineBoundaryQuote,BoundaryStageCapacity,LogicalCollectiveQuote,LogicalCollectiveKind};
-mod resident_recipe;
+pub(crate) use parallel::{
+    BoundaryStageCapacity, LogicalCollectiveKind, LogicalCollectiveQuote, MlxParallelWorkspace,
+    MlxParallelWorkspaceMechanisms, PipelineBoundaryQuote,
+};
+pub(crate) use parallel::{
+    ExpertCountQuote, ExpertInactiveWaveQuote, ExpertLocalQuote, ExpertLocalStage,
+    ExpertLocalStageBound, ExpertMovementKind, ExpertProviderQuote, ExpertProviderWaveQuote,
+    ExpertRegionAggregate, ExpertReorderEnvelope, ExpertTransferProfile, ExpertTransportQuote,
+};
 mod resident_mechanism;
-pub(crate) use resident_mechanism::ResidentExecutionMechanisms;
+mod resident_recipe;
 pub(crate) use pointwise_traversal::PointwiseTraversalFactError;
+pub use resident_mechanism::MlxWorkspacePreparationError;
+pub(crate) use resident_mechanism::{ResidentExecutionMechanisms, ResidentFactError};
 #[cfg(all(
     test,
     target_vendor = "apple",
@@ -37,9 +54,11 @@ pub(crate) use resident_recipe::original_component_tests::{
     OriginalAttentionTestPlan, OriginalComponentTestPlan,
 };
 pub(crate) use resident_recipe::{
-    AutoregressiveEquationRecipe, AutoregressiveReadoutRecipe, EmbeddedEquationRecipe,
-    IsolatedCopyNativeLayout, ResidentCompletionRecipe, ResidentNativeRecipe,
-    ParallelRecipeRecorder, ResidentRecipeRecorder, ResidentSamplingProgram, ResidentSpanRecipe, SpeculativeNumericalRecipe, CpuCaptureLoan, AddressableNumericalPopulation,
+    AddressableNumericalPopulation, AutoregressiveEquationRecipe, AutoregressiveReadoutRecipe,
+    CpuCaptureLoan, EmbeddedEquationRecipe, IsolatedCopyNativeLayout, OrdinaryIndexedPrograms,
+    OrdinaryNativeControls, ParallelRecipeRecorder, ResidentCompletionRecipe, ResidentNativeRecipe,
+    ResidentRecipeRecorder, ResidentSamplingProgram, ResidentSpanRecipe,
+    SpeculativeNumericalRecipe,
 };
 #[cfg(all(
     test,
@@ -55,10 +74,11 @@ mod grouped;
 mod host;
 mod hyper;
 mod indexing;
-mod matrix;
 mod masked_scatter;
+mod matrix;
 mod normalization;
 mod packed;
+mod parameter_decode;
 mod pooling;
 mod projection;
 mod projection_observation;
@@ -93,6 +113,7 @@ mod text_prompt_tests;
 pub struct NativeAllocationFacts {
     page_size: u64,
     cpu_header: bool,
+    original_storage: bool,
 }
 impl NativeAllocationFacts {
     /// Captures the actual compiled allocator layout and host page size without
@@ -105,7 +126,17 @@ impl NativeAllocationFacts {
         Ok(Self {
             page_size: safemlx::memory::host_page_size().map_err(Error::backend)? as u64,
             cpu_header: !layout.requires_device,
+            original_storage: false,
         })
+    }
+    fn host_control_bytes(self) -> Option<u64> {
+        if self.original_storage {
+            Some(0)
+        } else {
+            u64::try_from(safemlx::physical_backing_control_bytes())
+                .ok()?
+                .checked_add(crate::backend::managed_memory::ordinary_root_metadata_bytes().ok()?)
+        }
     }
     /// Host page granularity used by original physical allocations.
     pub const fn page_size(self) -> u64 {
@@ -151,12 +182,106 @@ impl MlxMetalWorkspaceMechanisms {
             },
         })
     }
+    /// Selects the direct allocator whose records are prepaid in the native
+    /// original buffer arena. This is a quotation fact, never execution authority.
+    pub(crate) const fn original_storage(mut self) -> Self {
+        self.allocation.original_storage = true;
+        self
+    }
+    /// Selects the ordinary allocator, including its persistent root controls
+    /// and publication metadata. The selected operator implementation is unchanged.
+    pub(crate) const fn ordinary_storage(mut self) -> Self {
+        self.allocation.original_storage = false;
+        self
+    }
     /// The allocation rules retained by this mechanism selection.
     pub const fn allocation(self) -> NativeAllocationFacts {
         self.allocation
     }
 }
 impl WorkspaceMechanisms for MlxMetalWorkspaceMechanisms {
+    fn prepare_allocation_sources(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        context: &WorkspaceContext,
+    ) -> Result<Option<WorkspaceOperationAllocationSources>, Error> {
+        ResidentExecutionMechanisms::Metal(*self).prepare_allocation_sources(operation, context)
+    }
+
+    fn scratch_allocation_count(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<usize>, Error> {
+        self.scratch_births(operation)
+            .map_err(|cause| Error::backend_retained_source(cause))
+    }
+
+    fn completion_strategy(&self) -> WorkspaceCompletionStrategy {
+        if self.allocation.original_storage {
+            WorkspaceCompletionStrategy::EnclosingSubmission
+        } else {
+            WorkspaceCompletionStrategy::OperationSubmissions
+        }
+    }
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        crate::backend::managed_memory::cold_topology()
+    }
+    fn allocation_host_control_bytes(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<u64> {
+        self.allocation.host_control_bytes()
+    }
+    fn scratch_host_control_bytes(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<u64>, Error> {
+        self.scratch_controls(operation)
+            .map_err(MlxWorkspaceFactError::ordinary)
+    }
+
+    fn output_placement(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        // The typed slice worker adds only Copy, whose qualified GPU producer
+        // retains the eager seed's backing and its default-allocator placement.
+        if basic::is_unattributed_initializer(operation) {
+            None
+        } else if self.allocation.original_storage {
+            crate::backend::managed_memory::cold_original_allocator_placement()
+        } else if host_array::dtype(operation).is_some()
+            || host_array::slice_dtype(operation).is_some()
+            || basic::is_scalar_f32(operation)
+            || basic::is_scalar_u8(operation)
+            || matches!(
+                operation.kind,
+                WorkspaceOperationKindView::GeneratedF32Initialization
+            )
+        {
+            crate::backend::managed_memory::cold_default_placement()
+        } else {
+            crate::backend::managed_memory::cold_gpu_allocator_placement()
+        }
+    }
+    fn scratch_placement(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        if basic::is_unattributed_initializer(operation) {
+            None
+        } else if self.allocation.original_storage {
+            crate::backend::managed_memory::cold_original_allocator_placement()
+        } else if zero_fill::dtype(operation).is_some() {
+            // The typed Full worker's only scratch backing is its eager seed.
+            // The independently allocated fill result remains on the GPU source.
+            crate::backend::managed_memory::cold_default_placement()
+        } else {
+            crate::backend::managed_memory::cold_gpu_allocator_placement()
+        }
+    }
     fn output_representation(
         &self,
         operation: WorkspaceOperationView<'_>,
@@ -198,13 +323,87 @@ impl WorkspaceMechanisms for MlxMetalWorkspaceMechanisms {
 }
 
 impl WorkspaceFactMechanisms for MlxMetalWorkspaceMechanisms {
-    type Error = MlxWorkspaceFactError;
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        crate::backend::managed_memory::cold_topology()
+    }
+    fn allocation_host_control_bytes(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<u64> {
+        self.allocation.host_control_bytes()
+    }
+    fn scratch_host_control_bytes(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<u64>, Self::Error> {
+        self.scratch_controls(operation).map_err(Into::into)
+    }
 
+    fn output_placement(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        if basic::is_unattributed_initializer(operation) {
+            None
+        } else if self.allocation.original_storage {
+            crate::backend::managed_memory::cold_original_allocator_placement()
+        } else if host_array::dtype(operation).is_some()
+            || host_array::slice_dtype(operation).is_some()
+            || basic::is_scalar_f32(operation)
+            || basic::is_scalar_u8(operation)
+            || matches!(
+                operation.kind,
+                WorkspaceOperationKindView::GeneratedF32Initialization
+            )
+        {
+            crate::backend::managed_memory::cold_default_placement()
+        } else {
+            crate::backend::managed_memory::cold_gpu_allocator_placement()
+        }
+    }
+    fn scratch_placement(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        if basic::is_unattributed_initializer(operation) {
+            None
+        } else if self.allocation.original_storage {
+            crate::backend::managed_memory::cold_original_allocator_placement()
+        } else if zero_fill::dtype(operation).is_some() {
+            // The typed Full worker's only scratch backing is its eager seed.
+            // The independently allocated fill result remains on the GPU source.
+            crate::backend::managed_memory::cold_default_placement()
+        } else {
+            crate::backend::managed_memory::cold_gpu_allocator_placement()
+        }
+    }
+    type Error = MlxWorkspacePreparationError;
+    fn with_prepared_facts<T>(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        funding: Option<&HostMetadataFunding>,
+        visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T,
+    ) -> Result<T, Self::Error> {
+        ResidentExecutionMechanisms::Metal(*self).with_prepared_facts(operation, funding, visit)
+    }
+
+    fn with_prepared_facts_context<T>(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        context: &WorkspaceContext,
+        visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T,
+    ) -> Result<T, Self::Error> {
+        ResidentExecutionMechanisms::Metal(*self)
+            .with_prepared_facts_context(operation, context, visit)
+    }
     fn operation_facts(
         &self,
         operation: WorkspaceOperationView<'_>,
     ) -> Result<Option<WorkspaceOperationFacts>, Self::Error> {
         self.emit(operation, &mut facts::Emitter::count())
+            .map_err(Into::into)
     }
 
     fn write_operation_facts(
@@ -212,14 +411,14 @@ impl WorkspaceFactMechanisms for MlxMetalWorkspaceMechanisms {
         operation: WorkspaceOperationView<'_>,
         destination: WorkspaceEffectDestination<'_>,
     ) -> Result<Option<WorkspaceOperationFacts>, Self::Error> {
-        facts::write(|sink| self.emit(operation, sink), destination)
+        facts::write(|sink| self.emit(operation, sink), destination).map_err(Into::into)
     }
 
     fn host_facts(
         &self,
         operation: WorkspaceOperationView<'_>,
     ) -> Result<Option<WorkspaceHostFacts>, Self::Error> {
-        host::emit(operation, self, &mut facts::HostEmitter::count())
+        host::emit(operation, self, &mut facts::HostEmitter::count()).map_err(Into::into)
     }
 
     fn write_host_facts(
@@ -227,11 +426,52 @@ impl WorkspaceFactMechanisms for MlxMetalWorkspaceMechanisms {
         operation: WorkspaceOperationView<'_>,
         destination: WorkspaceHostDestination<'_>,
     ) -> Result<Option<WorkspaceHostFacts>, Self::Error> {
-        facts::write_host(|sink| host::emit(operation, self, sink), destination)
+        facts::write_host(|sink| host::emit(operation, self, sink), destination).map_err(Into::into)
     }
 }
 
 impl MlxMetalWorkspaceMechanisms {
+    fn scratch_births(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> facts::FactResult<Option<usize>> {
+        let mut emitted = facts::Emitter::count();
+        let Some(bound) = self.emit(operation, &mut emitted)? else {
+            return Ok(None);
+        };
+        if bound.scratch_bytes == 0 {
+            return Ok(Some(0));
+        }
+        let births = if matches!(operation.kind, WorkspaceOperationKindView::DeepCopy) {
+            // The ordinary eager clone may first materialize one contiguous
+            // source; its final independent backing is priced as an output.
+            1
+        } else {
+            let Some(births) = resident_recipe::allocation_births(operation) else {
+                return Ok(None);
+            };
+            births
+                .checked_sub(emitted.allocated_output_births())
+                .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?
+        };
+        Ok(Some(births))
+    }
+    fn scratch_controls(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> facts::FactResult<Option<u64>> {
+        if self.allocation.original_storage {
+            return Ok(Some(0));
+        }
+        let Some(births) = self.scratch_births(operation)? else {
+            return Ok(None);
+        };
+        let Some(control) = self.allocation.host_control_bytes() else {
+            return Ok(None);
+        };
+        Ok(Some(facts::mul(control, u64::try_from(births)?)?))
+    }
+
     fn emit(
         &self,
         operation: WorkspaceOperationView<'_>,
@@ -266,6 +506,9 @@ impl MlxMetalWorkspaceMechanisms {
             return Ok(Some(bound));
         }
         if let Some(bound) = packed::emit(operation, self.allocation, sink)? {
+            return Ok(Some(bound));
+        }
+        if let Some(bound) = parameter_decode::emit(operation, self.allocation, sink)? {
             return Ok(Some(bound));
         }
         if let Some(bound) = indexing::emit(operation, self.allocation, sink)? {
@@ -442,7 +685,11 @@ mod tests {
     fn audited_pointwise_has_explicit_host_fact_and_unknown_equations_stay_unknown() {
         use eredu_nn::Tensor;
         let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms {
-            allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
+            allocation: NativeAllocationFacts {
+                page_size: 16_384,
+                cpu_header: false,
+                original_storage: false,
+            },
             sdpa_blocks: None,
         });
         let input = WorkspaceTensor::unloaded_f32(&[2, 3], &context).unwrap();
@@ -450,13 +697,33 @@ mod tests {
         let report = context.report(&[output]).unwrap();
         assert!(report.tensor_buffers.total_bytes.unwrap() > 0);
         assert_eq!(report.host_workspace_bytes, Some(0));
-        assert_eq!(report.total_bytes, report.tensor_buffers.total_bytes);
+        assert_eq!(
+            report.total_bytes,
+            report
+                .tensor_buffers
+                .total_bytes
+                .map(|n| n + test_backing_controls(
+                    &MlxMetalWorkspaceMechanisms {
+                        allocation: NativeAllocationFacts {
+                            page_size: 16_384,
+                            cpu_header: false,
+                            original_storage: false
+                        },
+                        sdpa_blocks: None
+                    },
+                    &report
+                ))
+        );
         assert!(report.unpriced_operations.is_empty());
         assert!(report.unpriced_host_operations.is_empty());
         let mut unknown = report.operations.last().unwrap().clone();
         unknown.kind = WorkspaceOperationKind::Elementwise("unaudited_operation");
         let selected = MlxMetalWorkspaceMechanisms {
-            allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
+            allocation: NativeAllocationFacts {
+                page_size: 16_384,
+                cpu_header: false,
+                original_storage: false,
+            },
             sdpa_blocks: None,
         };
         assert!(selected.operation_bound(&unknown).unwrap().is_none());
@@ -465,7 +732,11 @@ mod tests {
     #[test]
     fn allocation_capacity_covers_exact_rounding_and_cache_acceptance_boundaries() {
         for page in [4096, 16384] {
-            let facts = NativeAllocationFacts { page_size: page, cpu_header: false };
+            let facts = NativeAllocationFacts {
+                page_size: page,
+                cpu_header: false,
+                original_storage: false,
+            };
             for requested in [
                 0,
                 1,
@@ -498,9 +769,13 @@ mod tests {
             }
         }
         assert!(
-            NativeAllocationFacts { page_size: 16384, cpu_header: false }
-                .buffer_capacity(u64::MAX)
-                .is_err()
+            NativeAllocationFacts {
+                page_size: 16384,
+                cpu_header: false,
+                original_storage: false
+            }
+            .buffer_capacity(u64::MAX)
+            .is_err()
         );
     }
 
@@ -511,6 +786,7 @@ mod tests {
             let facts = NativeAllocationFacts {
                 page_size: page,
                 cpu_header: true,
+                original_storage: false,
             };
             for requested in [
                 0,
@@ -536,6 +812,7 @@ mod tests {
         let facts = NativeAllocationFacts {
             page_size: 16384,
             cpu_header: true,
+            original_storage: false,
         };
         assert_eq!(facts.buffer_capacity(0).unwrap(), 32767);
         assert_eq!(facts.buffer_capacity(16384 - header).unwrap(), 32767);
@@ -593,7 +870,11 @@ mod tests {
     fn recurrent_workspace_prices_all_native_chunk_transitions_and_keeps_other_primitives_unknown()
     {
         let mechanism = MlxMetalWorkspaceMechanisms {
-            allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+            allocation: NativeAllocationFacts {
+                page_size: 16384,
+                cpu_header: false,
+                original_storage: false,
+            },
             sdpa_blocks: None,
         };
         let layout = |shape: &[i32]| WorkspaceLayout::new(shape, WorkspaceDtype::Float32).unwrap();
@@ -710,12 +991,116 @@ mod tests {
 }
 
 pub(crate) use projection::{
-    OriginalPagedAppendClaim, OriginalPagedVisibleClaim, OriginalPagedAttentionBlock, OriginalPagedBlockSource,
-    OriginalPagedDiskWriteSource, OriginalPagedHostEviction, OriginalPagedHostReturn,
-    OriginalPagedDiscard, OriginalPagedScanClaim, OriginalPagedScanSource, PagedAppendInput, PagedHostStoreDeclaration,
-    PagedScanInput, PagedScopeRetention, ProjectedPagedSources,
+    OrdinaryPagedAppend, OrdinaryPagedCause, OrdinaryPagedHostScan, OrdinaryPagedProgram,
+    OrdinaryPagedWork, OriginalPagedAppendClaim, OriginalPagedAttentionBlock,
+    OriginalPagedBlockSource, OriginalPagedDiscard, OriginalPagedDiskWriteSource,
+    OriginalPagedHostEviction, OriginalPagedHostReturn, OriginalPagedScanClaim,
+    OriginalPagedScanSource, OriginalPagedVisibleClaim, PagedAppendInput,
+    PagedHostStoreDeclaration, PagedMutationCause, PagedScanInput, PagedScopeRetention,
+    PreparedOrdinaryPagedScan, ProjectedPagedSources,
 };
 
 mod parallel_lookup;
 
 pub(crate) mod byte_view;
+
+/// Converts an original native root into the two authenticated registry rows
+/// retained by its one workspace backing identity.
+pub(crate) fn registered_storage_row(
+    identity: safemlx::AllocationIdentity,
+    root: &WorkspaceExistingStorage,
+) -> eredu_runtime::working_memory::RegisteredWorkspaceStorageRow<
+    crate::backend::runtime::residency::storage::StorageIdentity,
+> {
+    use crate::backend::runtime::residency::storage::StorageIdentity;
+    let row = eredu_runtime::working_memory::RegisteredWorkspaceStorageRow::new(
+        StorageIdentity::Native(identity),
+        root.clone(),
+    );
+    if root.host_control_bytes().is_some_and(|bytes| bytes != 0) {
+        row.with_host_controls(StorageIdentity::NativeControl(identity))
+    } else {
+        row
+    }
+}
+
+#[cfg(test)]
+fn test_operation_backing_controls(
+    selected: &impl WorkspaceMechanisms,
+    operation: &WorkspaceOperation,
+) -> u64 {
+    let bound = selected.operation_bound(operation).unwrap().unwrap();
+    let outputs = bound
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, effect)| {
+            matches!(
+                effect,
+                WorkspaceOutputStorage::Allocate(_)
+                    | WorkspaceOutputStorage::AllocateOrAliasInputs { .. }
+            )
+        })
+        .map(|(index, _)| {
+            selected
+                .allocation_host_control_bytes(operation.as_view(), index)
+                .expect("selected backing has a finite native control layout")
+        })
+        .sum::<u64>();
+    outputs
+        + if bound.scratch_bytes == 0 {
+            0
+        } else {
+            selected
+                .scratch_host_control_bytes(operation.as_view())
+                .unwrap()
+                .expect("selected scratch population has finite native controls")
+        }
+}
+
+#[cfg(test)]
+fn test_backing_controls(
+    selected: &impl WorkspaceMechanisms,
+    report: &WorkspaceTraceReport,
+) -> u64 {
+    report
+        .operations
+        .iter()
+        .map(|operation| test_operation_backing_controls(selected, operation))
+        .sum()
+}
+
+#[cfg(test)]
+fn test_backing_control_completeness(
+    selected: &impl WorkspaceMechanisms,
+    report: &WorkspaceTraceReport,
+) {
+    assert!(report.tensor_buffers.total_bytes.is_some());
+    assert!(report.unpriced_operations.is_empty());
+    let missing = report
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            let bound = selected.operation_bound(operation).unwrap().unwrap();
+            (bound.scratch_bytes != 0
+                && selected
+                    .scratch_host_control_bytes(operation.as_view())
+                    .unwrap()
+                    .is_none())
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        report.total_bytes.is_some(),
+        missing.is_empty(),
+        "missing backing controls: {missing:?}"
+    );
+    for index in missing {
+        assert!(
+            report.unpriced_host_operations.contains(&index),
+            "missing native backing controls must identify operation {index}: {:?}",
+            report.operations[index].kind
+        );
+    }
+}

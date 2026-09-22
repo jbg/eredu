@@ -8,6 +8,7 @@ pub struct PartitionInterventionLocalAllowance {
     pub(super) member: Member,
     pub(super) quota: CaptureQuota,
     pub(super) window: Option<InterventionPrefillWindow>,
+    pub(super) model: Option<ModelInvocation>,
     pub(super) index: usize,
     pub(super) epoch: DistributedCommitEpoch,
     pub(super) operation: usize,
@@ -41,10 +42,19 @@ impl PartitionInterventionLocalAllowance {
             claim.validate_source(&self.source)?;
             if claim.index() != self.operation
                 || claim.coordinate() != (self.phase, self.prediction)
-                || claim.invocation().is_some()
+                || claim
+                    .invocation()
+                    .map(|physical| (physical, claim.invocation_window()))
+                    != self.model
                 || window != self.window
                 || !projection.source().same_source(&self.source)
-                || projection.coordinate() != (self.operation, self.phase, self.prediction, None)
+                || projection.coordinate()
+                    != (
+                        self.operation,
+                        self.phase,
+                        self.prediction,
+                        logical_invocation(self.model)?,
+                    )
                 || projection.geometry_identity() != self.member.geometry
                 || execution_identity != self.member.execution
                 || shape != self.member.shape

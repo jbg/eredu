@@ -6,9 +6,9 @@ use eredu_architectures::external_assistant::{
     Gemma4AssistantArchitecture,
 };
 use eredu_core::{
-    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
-    InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound,
-    cache::LayerCachePolicy,
+    cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
+    InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout,
+    WorkspaceBound,
 };
 use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryError};
 
@@ -54,22 +54,26 @@ fn zero_admission() -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
 fn memory_error<'a>(
@@ -83,11 +87,12 @@ fn memory_error<'a>(
     }
 }
 
-fn reclaim(pool: &WorkingMemoryPool, stream: &Stream) {
+fn reclaim(pool: &MemoryLedger, stream: &Stream) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while pool.unquoted_owner_count().unwrap() != 0 {
         stream.synchronize().unwrap();
         submission_recovery::reap();
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
@@ -97,7 +102,7 @@ fn reclaim(pool: &WorkingMemoryPool, stream: &Stream) {
 #[test]
 fn autoregressive_host_only_checkpoints_keep_the_bound_domain_until_last_restore_drops() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let state = MlxAutoregressiveState {
         native: empty_state(&owner),
@@ -110,7 +115,7 @@ fn autoregressive_host_only_checkpoints_keep_the_bound_domain_until_last_restore
     drop(owner);
     let saved = MlxAutoregressiveMechanisms::checkpoint(&state).unwrap();
     assert_eq!(pool.unquoted_owner_count().unwrap(), 2);
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     let restored = MlxAutoregressiveMechanisms::restore(&saved, context).unwrap();
     assert_eq!(pool.unquoted_owner_count().unwrap(), 3);
     assert_eq!(restored.native.generation().unwrap(), 0);
@@ -118,21 +123,27 @@ fn autoregressive_host_only_checkpoints_keep_the_bound_domain_until_last_restore
     assert_eq!(pool.unquoted_owner_count().unwrap(), 3);
     drop(restored);
     reclaim(&pool, &stream);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
 fn external_snapshots_reject_reserved_destination_and_restore_preserves_installed_owners() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let source_pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let source = empty_state(&owner);
     drop(owner);
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let controls = crate::memory_fixture::host_total(
+        &probe
+            .reservation_requirements(&zero_admission(), None)
+            .unwrap(),
+    );
+    let pool = crate::memory_fixture::ledger(controls, 0).unwrap();
     let reserved = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     let error = <External as ExternalAssistantExecutionMechanisms<Family>>::control_checkpoint(
         &source, context,
     )
@@ -169,12 +180,12 @@ fn external_snapshots_reject_reserved_destination_and_restore_preserves_installe
 #[test]
 fn external_copied_tensor_keeps_its_new_owner_with_escaped_native_aliases() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let source_pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let source = MlxTensor::from_array(Array::from_slice(&[2_f32, 5., 11.], &[1, 3]));
     owner.retain_array(source.as_array()).unwrap();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     let copied = <External as ExternalAssistantExecutionMechanisms<Family>>::control_copy_tensor(
         &source,
         ExternalAssistantTensorPlacement::Target,
@@ -203,7 +214,7 @@ fn external_copied_tensor_keeps_its_new_owner_with_escaped_native_aliases() {
 
 #[test]
 fn exact_copy_funding_refusal_crosses_the_executor_boundary_without_reboxing() {
-    use eredu_nn::workspace::{WorkspaceMetadataError, HostMetadataFundingError};
+    use eredu_nn::workspace::{HostMetadataFundingError, WorkspaceMetadataError};
     use std::error::Error as _;
     let cause = HostMetadataFundingError::Capacity {
         required: 8193,
@@ -220,7 +231,9 @@ fn exact_copy_funding_refusal_crosses_the_executor_boundary_without_reboxing() {
             if let Some(retained) = source.downcast_ref::<HostMetadataFundingError>() {
                 break retained;
             }
-            source = source.source().expect("exact funding source remains reachable");
+            source = source
+                .source()
+                .expect("exact funding source remains reachable");
         };
         assert_eq!(retained, &cause);
         let failure = MlxAutoregressiveMechanisms::take_retained_failure(error).unwrap();
@@ -250,3 +263,7 @@ fn exact_copy_funding_refusal_crosses_the_executor_boundary_without_reboxing() {
         Err(Error::InvalidOperation("ordinary failure"))
     ));
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -59,6 +59,7 @@ impl ProjectedPagedCacheSource {
             size_of::<std::slice::Iter<'_, CacheBlockId>>(),
             size_of::<(usize, usize)>(),
             size_of::<Option<&ProjectedPagedSource>>(),
+            size_of::<Option<crate::backend::runtime::cache::residency::CacheFileSource>>(),
             size_of::<CacheSourceFailure>(),
             size_of::<(&Self, &PagedKeyValueSource<'_>, &WorkspaceContext)>(),
             size_of::<(
@@ -395,8 +396,8 @@ fn validate_paged_source(
             if block.phase() != CacheStoragePhase::DiskReady
                 || block
                     .disk()
-                    .and_then(|disk| disk.live_file())
-                    .is_none_or(|actual| !file.same_source(actual))
+                    .and_then(|disk| disk.file_source())
+                    .is_none_or(|actual| !file.same_source(&actual))
             {
                 return Err(CacheSourceError::Identity);
             }

@@ -266,7 +266,8 @@ impl OperationEvent {
         })
     }
     /// Reserve every physical Graph block before host equations start. The
-    /// current role is authenticated; no ordinary fallback or second bank exists.
+    /// current role is authenticated and another active construction bank is
+    /// refused. A subsequent bank consumes this same role's cumulative quota.
     pub fn prepare_resident_graph(
         layout: ResidentGraphLayout,
         observer: &OriginalScopeObserver,
@@ -433,6 +434,37 @@ impl OperationEvent {
         evaluations: usize,
         consumer_waits: usize,
     ) -> Option<ResidentGpuWorkerLayout> {
+        Self::resident_gpu_worker_layout_with_router_frontiers(
+            entries,
+            input_edges,
+            output_slots,
+            array_nodes,
+            backing_births,
+            maximum_rank,
+            maximum_operands,
+            additional_sort_kernels,
+            0,
+            evaluations,
+            consumer_waits,
+        )
+    }
+    /// The same retained GPU DAG with the actual admitted CPU router partition
+    /// population. Separate CPU bank/output births stay with their owning source;
+    /// this query retains the crossing synchronization and completion frontiers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resident_gpu_worker_layout_with_router_frontiers(
+        entries: usize,
+        input_edges: usize,
+        output_slots: usize,
+        array_nodes: usize,
+        backing_births: usize,
+        maximum_rank: usize,
+        maximum_operands: usize,
+        additional_sort_kernels: usize,
+        cpu_partitions: usize,
+        evaluations: usize,
+        consumer_waits: usize,
+    ) -> Option<ResidentGpuWorkerLayout> {
         let mut native = safemlx_sys::mlx_resident_gpu_worker_layout::default();
         // SAFETY: scalar query inputs and one writable fixed destination only.
         unsafe {
@@ -446,7 +478,7 @@ impl OperationEvent {
                 maximum_rank,
                 maximum_operands,
                 additional_sort_kernels,
-                0,
+                cpu_partitions,
                 evaluations,
                 consumer_waits,
             )
@@ -495,17 +527,19 @@ mod grouped_sort_tests {
             assert!(extended.allocation_extents() >= base.allocation_extents());
         }
         assert!(OperationEvent::resident_grouped_sort_additional_kernels(usize::MAX).is_none());
-        assert!(OperationEvent::resident_gpu_worker_layout_with_sorts(
-            3,
-            4,
-            3,
-            20,
-            50,
-            3,
-            4,
-            usize::MAX,
-        )
-        .is_none());
+        assert!(
+            OperationEvent::resident_gpu_worker_layout_with_sorts(
+                3,
+                4,
+                3,
+                20,
+                50,
+                3,
+                4,
+                usize::MAX,
+            )
+            .is_none()
+        );
     }
 }
 

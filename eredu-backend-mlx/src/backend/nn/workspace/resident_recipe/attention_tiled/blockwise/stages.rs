@@ -155,7 +155,9 @@ mod tests {
             // This primitive has no opening mutable cache state. Immutable
             // Q/K/V/mask/sink inputs are distinct from retained model state;
             // the inference report still requires this explicit empty seed.
-            context.begin_state_span(std::iter::empty::<&WorkspaceTensor>()).unwrap();
+            context
+                .begin_state_span(std::iter::empty::<&WorkspaceTensor>())
+                .unwrap();
             let options = BlockwiseAttentionOptions {
                 arithmetic,
                 softcap: Some(1.75),

@@ -8,7 +8,10 @@ use crate::working_memory::{
 use eredu_core::{DistributedCommitEpoch, checkpoint::TensorDtype};
 use std::{fmt, mem::size_of};
 mod embedded;
-pub use embedded::FundedEmbeddedCaptureInvocation;
+pub use embedded::{
+    FundedAutoregressiveCaptureInvocation, FundedEmbeddedCaptureInvocation,
+    FundedModelCaptureInvocation,
+};
 mod observer;
 use observer::FundedCaptureObserver;
 pub(crate) mod checkpoint;
@@ -24,10 +27,48 @@ pub use speculative::FundedSpeculativeCaptureInvocation;
 /// check/estimate must allocate no shape/data payload or retain a native handle.
 /// The transform consumes the exact coordinate claim and returns its sealed receipt.
 pub trait ScheduledCaptureBackend {
+    /// Logical controls and optional original-decision work for one authenticated
+    /// selector invocation. Native allocation authority remains in its existing
+    /// model or scheduled execution owner.
+    fn routing_intervention_usage(
+        &self,
+        _rows: u64,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: Option<crate::intervention::InterventionPrefillWindow>,
+    ) -> Result<CaptureUsage, FundedCaptureError<Self::Error>> {
+        Err(CaptureProtocolError::Transaction.into())
+    }
+    /// Copy the actual source control through its paid constructor after the
+    /// shared logical ledger accepts usage. An empty overlap returns no edit.
+    fn prepare_routing_intervention(
+        &mut self,
+        _rows: u64,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: Option<crate::intervention::InterventionPrefillWindow>,
+    ) -> Result<
+        Option<eredu_nn::routing_intervention::GroupSelectionControl>,
+        FundedCaptureError<Self::Error>,
+    > {
+        Err(CaptureProtocolError::Transaction.into())
+    }
+    /// Authenticate the completed selector descriptors against the same source,
+    /// row geometry and native owner before evidence or successful delivery.
+    fn validate_routing_intervention_result(
+        &self,
+        _rows: u64,
+        _original: Option<crate::RoutingDecision<'_, Self::Tensor>>,
+        _effective: crate::RoutingDecision<'_, Self::Tensor>,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: Option<crate::intervention::InterventionPrefillWindow>,
+    ) -> Result<(), FundedCaptureError<Self::Error>> {
+        Err(CaptureProtocolError::Transaction.into())
+    }
     /// Explicit retained partition program for this same logical frame. The
     /// default keeps ordinary local capture behavior. A native implementation
     /// must supply its independently admitted transport and exact placement.
-    fn partition_capture(&mut self) -> Option<&mut (dyn crate::capture::partition::ScheduledPartitionCapture + '_)> {
+    fn partition_capture(
+        &mut self,
+    ) -> Option<&mut (dyn crate::capture::partition::ScheduledPartitionCapture + '_)> {
         None
     }
     /// Convert the routed callback's typed failure without formatting a new
@@ -37,74 +78,89 @@ pub trait ScheduledCaptureBackend {
     }
     /// Validate the actual sparse provider source before quota or completion.
     fn validate_routed_prefill_source(
-        &self, _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
+        &self,
+        _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
         _fragment: &eredu_core::capture::CaptureRoutedPrefillFragment<'_, '_>,
     ) -> Result<TensorDtype, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::PrefillAttribution.into())
     }
     /// Existing full logical routed estimate, charged only by the shared ledger.
     fn estimate_routed_prefill(
-        &self, _geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
+        &self,
+        _geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
     ) -> Result<CaptureUsage, CaptureError> {
-        Err(CaptureError::Unsupported("routed prefill source is unavailable".into()))
+        Err(CaptureError::Unsupported(
+            "routed prefill source is unavailable".into(),
+        ))
     }
     /// Copy one actual provider batch through the existing stamped native carrier.
     fn transform_routed_prefill(
-        &mut self, _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
+        &mut self,
+        _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
         _writer: crate::working_memory::CaptureRoutedPrefillWriter<'_, '_, '_, '_>,
     ) -> Result<(), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::PrefillAttribution.into())
     }
     /// Validate a real ordinary/decode sparse batch against the admitted invocation.
     fn validate_routed_invocation_source(
-        &self, _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
+        &self,
+        _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
         _geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
     ) -> Result<TensorDtype, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::GeneratedSource.into())
     }
     /// Populate the existing original-account destination through a short source loan.
     fn transform_routed_batch(
-        &mut self, _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
+        &mut self,
+        _source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Self::Tensor>,
         _writer: crate::working_memory::CaptureRoutedBatchWriter<'_, '_>,
     ) -> Result<(), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::GeneratedSource.into())
     }
     /// Validate the actual provider input independently of selected overlap.
     fn validate_partition_routed_invocation(
-        &self, _invocation: &crate::RoutedUnitInvocation<'_, Self::Tensor>,
+        &self,
+        _invocation: &crate::RoutedUnitInvocation<'_, Self::Tensor>,
         _layout: &eredu_core::capture::PartitionRoutedUnitCaptureLayout<'_>,
     ) -> Result<(u64, TensorDtype), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::GeneratedSource.into())
     }
     /// Exact full fragment estimate, charged once by the retained shared ledger.
     fn estimate_partition_routed(
-        &self, _request: &eredu_core::capture::PartitionRoutedUnitCaptureRequest<'_>,
+        &self,
+        _request: &eredu_core::capture::PartitionRoutedUnitCaptureRequest<'_>,
     ) -> Result<CaptureUsage, CaptureError> {
-        Err(CaptureError::Unsupported("partition routed source is unavailable".into()))
+        Err(CaptureError::Unsupported(
+            "partition routed source is unavailable".into(),
+        ))
     }
     /// Validate a real routed batch without requiring selected overlap. The
     /// returned extent is the actual coefficient token-row count, checked with
     /// all five descriptors. An idle invocation has no batch or result witness.
     fn validate_partition_routed_batch_source(
-        &self, _source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
+        &self,
+        _source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
         _layout: &eredu_core::capture::PartitionRoutedUnitCaptureLayout<'_>,
         _actual_native_rows: u64,
-    ) -> Result<(TensorDtype,u64), FundedCaptureError<Self::Error>> {
+    ) -> Result<(TensorDtype, u64), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::GeneratedSource.into())
     }
     /// Check a real five-source batch against both global selection and actual
     /// provider invocation extent; prefill input token IDs restart each chunk.
     fn validate_partition_routed_source(
-        &self, _source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
+        &self,
+        _source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
         _request: &eredu_core::capture::PartitionRoutedUnitCaptureRequest<'_>,
-        _invocation_source_tokens: u64, _actual_native_rows: u64,
+        _invocation_source_tokens: u64,
+        _actual_native_rows: u64,
     ) -> Result<TensorDtype, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::GeneratedSource.into())
     }
     /// Bind existing native source/completion loans to the short original Host
     /// writer. The callback cannot fabricate a destination or a transport vote.
     fn transform_partition_routed_batch(
-        &mut self, _source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
+        &mut self,
+        _source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
         _writer: crate::working_memory::CapturePartitionRoutedWriter<'_, '_>,
     ) -> Result<(), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::GeneratedSource.into())
@@ -115,16 +171,20 @@ pub trait ScheduledCaptureBackend {
     type Error: std::error::Error + Send + Sync + 'static;
     /// Validate the exact local chunk whose selected spatial overlap is empty.
     /// Completion remains the existing independent source-settlement method.
-    fn validate_partition_prefill_source(&self,_source:&Self::Tensor,
-        _geometry:&crate::capture::partition::PartitionPrefillReceiverSource)
-        ->Result<TensorDtype,FundedCaptureError<Self::Error>> {
+    fn validate_partition_prefill_source(
+        &self,
+        _source: &Self::Tensor,
+        _geometry: &crate::capture::partition::PartitionPrefillReceiverSource,
+    ) -> Result<TensorDtype, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::PrefillAttribution.into())
     }
     /// Exact physical decode source for an empty selected overlap or replica.
     /// This supplies no new completion engine or native permission.
-    fn validate_partition_invocation_source(&self,_source:&Self::Tensor,
-        _geometry:&crate::capture::partition::PartitionInvocationReceiverSource)
-        ->Result<TensorDtype,FundedCaptureError<Self::Error>> {
+    fn validate_partition_invocation_source(
+        &self,
+        _source: &Self::Tensor,
+        _geometry: &crate::capture::partition::PartitionInvocationReceiverSource,
+    ) -> Result<TensorDtype, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Geometry.into())
     }
     /// Complete a selected receiver's actual local source before its peer enters
@@ -132,8 +192,10 @@ pub trait ScheduledCaptureBackend {
     /// selection/epoch first; the backend must retain the root in the existing
     /// model owner and authenticate its independently admitted native completion.
     /// This creates no capture record or logical capture charge.
-    fn complete_partition_source(&mut self, _source: &Self::Tensor)
-        -> Result<(), FundedCaptureError<Self::Error>> {
+    fn complete_partition_source(
+        &mut self,
+        _source: &Self::Tensor,
+    ) -> Result<(), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
     }
     /// Check the exact borrowed source and already-spent original operation.
@@ -141,27 +203,33 @@ pub trait ScheduledCaptureBackend {
     /// and all physical destinations remain in the numerical phase owner.
     /// Authenticate the actual local component/window program and original
     /// claim before the existing partition member preflight vote.
-    fn validate_partition_intervention_source(&self,_source:&Self::Tensor,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>,
-        _window:Option<crate::intervention::InterventionPrefillWindow>)
-        ->Result<(),FundedCaptureError<Self::Error>> {
+    fn validate_partition_intervention_source(
+        &self,
+        _source: &Self::Tensor,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: Option<crate::intervention::InterventionPrefillWindow>,
+    ) -> Result<(), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
     }
     /// Authenticate the actual before/after tensor against the retained original
     /// companion source. The runtime's existing receipt owns quota and delivery.
-    fn validate_partition_intervention_evidence_source(&self,_source:&Self::Tensor,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>,
-        _side:eredu_core::capture::InterventionEvidenceSide,
-        _window:Option<crate::intervention::InterventionPrefillWindow>)
-        ->Result<(),FundedCaptureError<Self::Error>> {
+    fn validate_partition_intervention_evidence_source(
+        &self,
+        _source: &Self::Tensor,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _side: eredu_core::capture::InterventionEvidenceSide,
+        _window: Option<crate::intervention::InterventionPrefillWindow>,
+    ) -> Result<(), FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
     }
     /// Run the shared local edit worker under its prepaid original allowance.
     /// The runtime retains and finishes the frame claim after both member votes.
-    fn apply_partition_intervention(&mut self,_source:&Self::Tensor,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>,
-        _allowance:&mut crate::capture::partition::PartitionInterventionLocalAllowance)
-        ->Result<Option<Self::Tensor>,FundedCaptureError<Self::Error>> {
+    fn apply_partition_intervention(
+        &mut self,
+        _source: &Self::Tensor,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _allowance: &mut crate::capture::partition::PartitionInterventionLocalAllowance,
+    ) -> Result<Option<Self::Tensor>, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
     }
     fn intervention_usage(
@@ -182,41 +250,77 @@ pub trait ScheduledCaptureBackend {
         Ok([CaptureUsage::default(); 2])
     }
     /// The same scheduled operation over one authenticated physical prompt span.
-    fn prefill_intervention_projection_usage(&self,_source:&Self::Tensor,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>,_window:crate::intervention::InterventionPrefillWindow)
-        ->Result<[CaptureUsage;2],FundedCaptureError<Self::Error>> {
+    fn prefill_intervention_projection_usage(
+        &self,
+        _source: &Self::Tensor,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: crate::intervention::InterventionPrefillWindow,
+    ) -> Result<[CaptureUsage; 2], FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::PrefillAttribution.into())
     }
-    fn prefill_intervention_usage(&self,_source:&Self::Tensor,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>,_window:crate::intervention::InterventionPrefillWindow)
-        ->Result<CaptureUsage,FundedCaptureError<Self::Error>> {
+    fn prefill_intervention_usage(
+        &self,
+        _source: &Self::Tensor,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: crate::intervention::InterventionPrefillWindow,
+    ) -> Result<CaptureUsage, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::PrefillAttribution.into())
     }
-    fn apply_prefill_intervention(&mut self,_source:&Self::Tensor,
-        _fragment:crate::working_memory::InterventionPrefillFragment<'_,'_>,_charged:CaptureUsage,_projection:[CaptureUsage;2])
-        ->Result<Option<Self::Tensor>,FundedCaptureError<Self::Error>> {
+    fn apply_prefill_intervention(
+        &mut self,
+        _source: &Self::Tensor,
+        _fragment: crate::working_memory::InterventionPrefillFragment<'_, '_>,
+        _charged: CaptureUsage,
+        _projection: [CaptureUsage; 2],
+    ) -> Result<Option<Self::Tensor>, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::PrefillAttribution.into())
     }
     /// Exact native routed chunk range from the actual five source descriptors.
     /// Every invocation and source is checked against this same spent claim.
-    fn routed_intervention_range(&self,_source:&RoutedUnitCaptureSource<'_,Self::Tensor>,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>)
-        ->Result<[u64;2],FundedCaptureError<Self::Error>> {
+    fn routed_intervention_range(
+        &self,
+        _source: &RoutedUnitCaptureSource<'_, Self::Tensor>,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+    ) -> Result<[u64; 2], FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
     }
     /// Existing full physical invocation edit cost, charged once before any
     /// source values are read. Numerical/Host admission is independent.
-    fn routed_intervention_usage(&self,_source:&RoutedUnitCaptureSource<'_,Self::Tensor>,
-        _claim:&crate::working_memory::CaptureInterventionClaim<'_>)
-        ->Result<CaptureUsage,FundedCaptureError<Self::Error>> {
+    fn routed_intervention_usage(
+        &self,
+        _source: &RoutedUnitCaptureSource<'_, Self::Tensor>,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+    ) -> Result<CaptureUsage, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
+    }
+    /// Actual provider range local to this canonical prompt chunk. The shared
+    /// cursor authenticates and maps it to the original logical prompt.
+    fn prefill_routed_intervention_range(
+        &self,
+        _source: &RoutedUnitCaptureSource<'_, Self::Tensor>,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: crate::intervention::InterventionPrefillWindow,
+    ) -> Result<[u64; 2], FundedCaptureError<Self::Error>> {
+        Err(CaptureProtocolError::PrefillAttribution.into())
+    }
+    /// Full logical prompt edit cost, accepted once before the first native
+    /// source read. This estimate is not physical allocation authority.
+    fn prefill_routed_intervention_usage(
+        &self,
+        _source: &RoutedUnitCaptureSource<'_, Self::Tensor>,
+        _claim: &crate::working_memory::CaptureInterventionClaim<'_>,
+        _window: crate::intervention::InterventionPrefillWindow,
+    ) -> Result<CaptureUsage, FundedCaptureError<Self::Error>> {
+        Err(CaptureProtocolError::PrefillAttribution.into())
     }
     /// Reuse the existing sparse lowerer and native selection/update worker.
     /// Successful implementations finish the exclusive batch with their exact
     /// paid lowering; leaving it unfinished poisons the operation cursor.
-    fn apply_routed_intervention(&mut self,_source:&RoutedUnitCaptureSource<'_,Self::Tensor>,
-        _batch:crate::working_memory::RoutedInterventionBatch<'_, '_>)
-        ->Result<Option<Self::Tensor>,FundedCaptureError<Self::Error>> {
+    fn apply_routed_intervention(
+        &mut self,
+        _source: &RoutedUnitCaptureSource<'_, Self::Tensor>,
+        _batch: crate::working_memory::RoutedInterventionBatch<'_, '_>,
+    ) -> Result<Option<Self::Tensor>, FundedCaptureError<Self::Error>> {
         Err(CaptureProtocolError::Transaction.into())
     }
     /// The same static worker with an explicit no-overlap acknowledgment.
@@ -228,9 +332,18 @@ pub trait ScheduledCaptureBackend {
         claim: crate::working_memory::CaptureInterventionClaim<'_>,
         charged: CaptureUsage,
         projection: [CaptureUsage; 2],
-    ) -> Result<(Option<Self::Tensor>, crate::working_memory::ClaimedIntervention), FundedCaptureError<Self::Error>> {
-        if projection != [CaptureUsage::default(); 2] { return Err(CaptureProtocolError::Transaction.into()); }
-        self.apply_intervention(source, claim, charged).map(|(value, receipt)| (Some(value), receipt))
+    ) -> Result<
+        (
+            Option<Self::Tensor>,
+            crate::working_memory::ClaimedIntervention,
+        ),
+        FundedCaptureError<Self::Error>,
+    > {
+        if projection != [CaptureUsage::default(); 2] {
+            return Err(CaptureProtocolError::Transaction.into());
+        }
+        self.apply_intervention(source, claim, charged)
+            .map(|(value, receipt)| (Some(value), receipt))
     }
     /// Apply the admitted action through the existing intervention worker. The
     /// receipt describes provisional successful construction. The enclosing
@@ -649,7 +762,9 @@ impl FundedCaptureSession {
         self.run.source()
     }
     /// Exact immutable intervention source retained by the admitted run.
-    pub fn intervention_source(&self) -> Option<&crate::working_memory::OriginalInterventionSource> {
+    pub fn intervention_source(
+        &self,
+    ) -> Option<&crate::working_memory::OriginalInterventionSource> {
         self.run.intervention_source()
     }
     /// Cumulative logical quota, including failed/aborted attempts.
@@ -847,8 +962,14 @@ impl FundedCaptureSession {
             },
         };
         self.session.checkpoint_ready = match (&step, self.session.transaction) {
-            (Some(step), _) => step.as_ref().outcome == CaptureStepOutcome::Committed
-                && !step.as_ref().records.iter().any(|r| matches!(r.outcome, CaptureOutcome::Failed { .. })),
+            (Some(step), _) => {
+                step.as_ref().outcome == CaptureStepOutcome::Committed
+                    && !step
+                        .as_ref()
+                        .records
+                        .iter()
+                        .any(|r| matches!(r.outcome, CaptureOutcome::Failed { .. }))
+            }
             (None, Some((_, CaptureTransactionStatus::Committed))) => !self.run.has_frame_claims(),
             (None, None) => self.session.checkpoint_ready,
             _ => false,
@@ -893,6 +1014,7 @@ pub(crate) fn control_bytes() -> Result<u64, WorkingMemoryError> {
     // retained within H. Source-witness/identity handles remain accounting metadata.
     let n = size_of::<Option<FundedCaptureSession>>()
         .checked_add(observer::routed::control_bytes().ok_or(WorkingMemoryError::Overflow)?)
+        .and_then(|n| n.checked_add(observer::routing::control_bytes()?))
         .ok_or(WorkingMemoryError::Overflow)?
         .checked_add(size_of::<CumulativeUpdate<'_>>())
         .and_then(|n| n.checked_add(size_of::<CaptureHostOwner>()))
@@ -912,12 +1034,18 @@ pub(crate) fn control_bytes() -> Result<u64, WorkingMemoryError> {
                 CaptureUsage, // actual physical fragment metadata, alive beside value usage
                 Result<Option<CaptureUsage>, CaptureError>,
                 Result<Option<CaptureSkipReason>, CaptureError>,
+                std::time::Instant,
+                std::time::Duration,
+                f64,
+                &mut dyn crate::capture::partition::ScheduledPartitionCapture,
+                &mut crate::working_memory::ScheduledCaptureStep<'_>,
+                Result<(), crate::capture::partition::PartitionCaptureProgramError>,
             )>())
         })
         .and_then(|n| n.checked_add(size_of::<observer::generated::GeneratedState<()>>()))
         .and_then(|n| n.checked_add(observer::replica::control_bytes()))
         .and_then(|n| n.checked_add(observer::fragments::projection_control_bytes()))
-        .and_then(|n| n.checked_add(observer::interventions::partition_control_bytes()?))
+        .and_then(|n| n.checked_add(observer::interventions::intervention_control_bytes()?))
         // Full logical FP8 reconstruction keeps this checked signed shape and
         // plan alive together while reserving the original one-time quota.
         .and_then(|n| n.checked_add(32 * size_of::<i32>()))

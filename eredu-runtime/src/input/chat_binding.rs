@@ -1,10 +1,10 @@
 //! Exact original-render association over the existing host-input compiler.
 use super::{
-    OriginalModelInput, OriginalModelInputBackend,
     host::{
         HostInputPart, HostInputPartView, HostInputPlanError, HostTensorValues,
         PreparedHostInputPlan,
     },
+    OriginalModelInput, OriginalModelInputBackend,
 };
 use crate::working_memory::{
     BoundCompositeSemanticStorage, CompositeChatProjection, CompositeSemanticPartRecord,
@@ -490,7 +490,18 @@ pub fn prepare_original_chat_model_input<B: OriginalChatBackend + OriginalModelI
         let content_digest = *plan.content_digest();
         // The existing compiler retains the actual source and architecture
         // records. All partial native construction remains under its own custody.
-        let input = B::prepare_original_model_input(runtime, plan, preparation.capacity_bytes())?;
+        let limit_metadata = preparation
+            .limits()
+            .named_initialization_bytes(preparation.topology())
+            .map_err(BackendFailure::from_error)?;
+        funding.reserve_metadata(
+            usize::try_from(limit_metadata).map_err(|_| HostMetadataFundingError::Overflow)?,
+        )?;
+        let limits = preparation
+            .limits()
+            .named(preparation.topology())
+            .map_err(BackendFailure::from_error)?;
+        let input = B::prepare_original_model_input(runtime, plan, &limits)?;
         let semantics = B::original_model_input_semantics(input.prompt());
         let mut coordinates = funding.metadata_vec(parts.len())?;
         if let Some(semantics) = semantics {

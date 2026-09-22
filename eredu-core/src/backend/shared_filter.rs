@@ -1,7 +1,7 @@
 //! Immutable filter payloads with independent, per-domain accounting custody.
 
 use super::{
-    shared_storage::SharedStorageCustody, SharedStorageAttachmentError, SharedStorageDomain,
+    shared_storage::SharedStorageCustody, SharedStorageAccountingId, SharedStorageAttachmentError,
     SharedStorageIdentity, TokenFilter,
 };
 use std::{fmt, ops::Deref, sync::Arc};
@@ -69,9 +69,26 @@ impl SharedTokenFilter {
     /// Checks the existing attachment without allocating, acquiring new custody
     /// or invoking a provider. The accounting domain must independently verify
     /// its canonical registration and exact capacity. This is not a grant.
-    pub fn has_accounting_custody(&self,domain:&SharedStorageDomain)
-        ->Result<bool,SharedStorageAttachmentError<std::convert::Infallible>> {
+    pub fn has_accounting_custody(
+        &self,
+        domain: &SharedStorageAccountingId,
+    ) -> Result<bool, SharedStorageAttachmentError<std::convert::Infallible>> {
         self.0.custody.has_accounting_custody(domain)
+    }
+
+    /// Attaches a concrete owner after admitting its prospective node layout.
+    /// Reuse preserves the same closed owner; a different owner type rejects.
+    pub fn try_attach_owned_prepared<T: super::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            super::SharedStorageAttachmentLayout,
+        ) -> Result<super::SharedStorageOwner<T>, E>,
+    ) -> Result<super::SharedStorageOwner<T>, SharedStorageAttachmentError<E>> {
+        self.0
+            .custody
+            .attachments
+            .try_attach_owned_nonblocking(owner, acquire)
     }
 
     /// Acquires accounting custody once per exact domain.
@@ -89,7 +106,7 @@ impl SharedTokenFilter {
     /// under the custody lock and outlive the filter's numerical payload.
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.0.custody.try_attach(domain, acquire)

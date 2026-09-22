@@ -10,7 +10,9 @@ use custody::Custody;
 
 pub(super) struct Census {
     pub(super) rows: usize,
-    pub(super) pool: eredu_runtime::working_memory::WorkingMemoryPool,
+    pub(super) pool: eredu_runtime::working_memory::MemoryLedger,
+    pub(super) original: bool,
+    pub(super) overflowed: bool,
 }
 impl Census {
     pub(super) fn add(&mut self) -> Result<(), ResidencyError> {
@@ -24,7 +26,7 @@ impl Census {
 
 pub(super) enum Value {
     Array((u64, RetainedArray)),
-    GroupBuffer((u64,safemlx::distributed::RetainedGroupBuffer)),
+    GroupBuffer((u64, safemlx::distributed::RetainedGroupBuffer)),
     Host((u64, RetainedHostBuffer)),
     Bytes(Arc<[u8]>),
     Metadata((u64, eredu_runtime::SharedHostMetadata)),
@@ -35,6 +37,8 @@ pub(super) enum Value {
     UnknownMetadata(eredu_runtime::SharedHostMetadata),
     UnknownSlot(eredu_runtime::HostSlotMetadata),
     UnknownCapture(eredu_core::capture::SharedCapturePlan),
+    ArrayReceipt(u64),
+    HostReceipt(u64),
 }
 impl Value {
     fn kind(&self) -> u8 {
@@ -51,16 +55,19 @@ impl Value {
             Self::UnknownMetadata(_) => 8,
             Self::UnknownSlot(_) => 9,
             Self::UnknownCapture(_) => 10,
+            Self::ArrayReceipt(_) => 0,
+            Self::HostReceipt(_) => 1,
         }
     }
     fn bytes(&self) -> Option<u64> {
         match self {
             Self::Array((n, _))
-            | Self::GroupBuffer((n,_))
+            | Self::GroupBuffer((n, _))
             | Self::Host((n, _))
             | Self::Metadata((n, _))
             | Self::Slot((n, _))
             | Self::Capture((n, _)) => Some(*n),
+            Self::ArrayReceipt(n) | Self::HostReceipt(n) => Some(*n),
             Self::Bytes(v) => u64::try_from(v.len()).ok(),
             Self::Source(v) => Some(v.bytes()),
             _ => None,
@@ -159,8 +166,15 @@ impl Inventory {
             .map(|i| &self.rows[i].value)
     }
     pub(super) fn get_mut(&mut self, kind: u8, key: &StorageIdentity) -> Option<&mut Value> {
-        self.rows.binary_search_by(|r| r.value.kind().cmp(&kind).then_with(|| r.key.as_ref().cmp(&Some(key))))
-            .ok().map(|i| &mut self.rows[i].value)
+        self.rows
+            .binary_search_by(|r| {
+                r.value
+                    .kind()
+                    .cmp(&kind)
+                    .then_with(|| r.key.as_ref().cmp(&Some(key)))
+            })
+            .ok()
+            .map(|i| &mut self.rows[i].value)
     }
     pub(super) fn custody(&self) -> &Custody {
         &self.custody
@@ -215,6 +229,9 @@ impl Inventory {
             .insert(position.unwrap_or_else(|i| i), Row { key, value });
         Ok(())
     }
+    pub(super) fn has_complete_capacity_facts(&self) -> bool {
+        self.refused.is_none() && self.rows.iter().all(|row| row.value.bytes().is_some())
+    }
     pub(super) fn byte_bound(&self) -> Result<Option<u64>, ResidencyError> {
         if self.refused.is_some() {
             return Ok(None);
@@ -236,7 +253,16 @@ impl Inventory {
         Ok(Some(total))
     }
     pub(super) fn finish(&mut self) {
-        self.rows.retain(|row| matches!(&row.value, Value::Bytes(_) | Value::Source(_) | Value::GroupBuffer(_)) ||
+        if self.custody.is_ordinary() {
+            for row in &mut self.rows {
+                match &row.value {
+                    Value::Array((bytes, _)) => row.value = Value::ArrayReceipt(*bytes),
+                    Value::Host((bytes, _)) => row.value = Value::HostReceipt(*bytes),
+                    _ => {}
+                }
+            }
+        }
+        self.rows.retain(|row| matches!(&row.value, Value::Bytes(_) | Value::Source(_) | Value::GroupBuffer(_) | Value::ArrayReceipt(_) | Value::HostReceipt(_)) ||
             matches!(&row.value, Value::Metadata((_, eredu_runtime::SharedHostMetadata::Input(v))) if v.original_source().is_some()));
     }
     pub(super) fn controls(rows: usize) -> Option<usize> {
@@ -274,7 +300,7 @@ impl Inventory {
             .checked_add(size_of::<std::slice::Iter<'static, Row>>())?
             .checked_add(size_of::<Custody>())?
             .checked_add(size_of::<StorageIdentity>())?
-            .checked_add(eredu_runtime::working_memory::WorkingMemoryPool::retained_source_inventory_control_bytes::<StorageIdentity>()?)?
+            .checked_add(eredu_runtime::working_memory::MemoryLedger::retained_source_inventory_control_bytes::<StorageIdentity>()?)?
             .checked_add(size_of::<
                 Result<OriginalTextMetadataCustody, WorkingMemoryError>,
             >())?
@@ -302,14 +328,23 @@ pub(super) fn failure(cause: WorkingMemoryError) -> ResidencyError {
 impl RetainedStorage {
     /// The private selected Work supplies the already accepted population and
     /// raw custody. No ordinary inventory is promoted after its construction.
-    pub(crate) fn original_census(pool: &eredu_runtime::working_memory::WorkingMemoryPool) -> Self {
+    pub(crate) fn original_census(pool: &eredu_runtime::working_memory::MemoryLedger) -> Self {
         Self {
             census: Some(Census {
                 rows: 0,
                 pool: pool.clone(),
+                original: true,
+                overflowed: false,
             }),
             ..Self::default()
         }
+    }
+    /// Counts borrowed ordinary publication rows without constructing an owning
+    /// inventory or granting original-source custody.
+    pub(crate) fn generic_census(pool: &eredu_runtime::working_memory::MemoryLedger) -> Self {
+        let mut inventory = Self::original_census(pool);
+        inventory.census.as_mut().expect("new census").original = false;
+        inventory
     }
     pub(crate) fn prepare_original(
         rows: usize,
@@ -320,12 +355,34 @@ impl RetainedStorage {
             ..Self::default()
         })
     }
+    pub(crate) fn prepare_ordinary(
+        rows: usize,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
+        host: &eredu_core::HostPreparationAuthority,
+    ) -> Result<Self, ResidencyError> {
+        Ok(Self {
+            original: Some(Inventory::new(
+                rows,
+                Custody::Ordinary {
+                    pool: pool.clone(),
+                    _host: host.clone(),
+                },
+            )?),
+            ..Self::default()
+        })
+    }
+    pub(super) fn has_array_receipt(&self, key: &StorageIdentity, bytes: u64) -> bool {
+        self.original.as_ref().is_some_and(|inventory| {
+            matches!(inventory.get(0, key), Some(Value::ArrayReceipt(n)) if *n == bytes)
+                || matches!(inventory.get(1, key), Some(Value::HostReceipt(n)) if *n == bytes)
+        })
+    }
     /// The caller has admitted the owning collector amount under this host
     /// authority. Source validation remains tied to the supplied source pool;
     /// this custody can never be projected into a native publication role.
     pub(crate) fn prepare_snapshot_collector(
         rows: usize,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         host: &eredu_core::HostPreparationAuthority,
     ) -> Result<Self, ResidencyError> {
         Ok(Self {
@@ -342,7 +399,7 @@ impl RetainedStorage {
 
     pub(crate) fn prepare_snapshot_publication(
         rows: usize,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         host: &eredu_core::HostPreparationAuthority,
     ) -> Result<Self, ResidencyError> {
         Ok(Self {
@@ -358,7 +415,7 @@ impl RetainedStorage {
     }
     pub(super) fn validate_snapshot_publication(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.original
             .as_ref()
@@ -374,6 +431,7 @@ impl RetainedStorage {
             .as_ref()
             .map(|value| value.custody.publication())
             .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn original_collector_control_bytes(rows: usize) -> Option<usize> {
@@ -437,19 +495,31 @@ impl RetainedStorage {
                 .custody
                 .validate_source_inventory(&key, source.bytes())
                 .map_err(|cause| failure(cause))?;
-            return original.insert(
-                Some(key),
-                Value::Source(source.retain()),
-            );
+            return original.insert(Some(key), Value::Source(source.retain()));
         }
         self.sources.include_ref(source)?;
         Ok(())
     }
 
-    pub(super) fn group_buffer_entries(&self)->impl Iterator<Item=(&safemlx::distributed::GroupBufferIdentity,&(u64,safemlx::distributed::RetainedGroupBuffer))>{
-        self.group_buffers.iter().chain(self.original.iter().flat_map(|source|source.values()).filter_map(|(key,value)|match(key,value){
-            (Some(StorageIdentity::GroupBuffer(key)),Value::GroupBuffer(value))=>Some((key,value)),_=>None,
-        }))
+    pub(super) fn group_buffer_entries(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &safemlx::distributed::GroupBufferIdentity,
+            &(u64, safemlx::distributed::RetainedGroupBuffer),
+        ),
+    > {
+        self.group_buffers.iter().chain(
+            self.original
+                .iter()
+                .flat_map(|source| source.values())
+                .filter_map(|(key, value)| match (key, value) {
+                    (Some(StorageIdentity::GroupBuffer(key)), Value::GroupBuffer(value)) => {
+                        Some((key, value))
+                    }
+                    _ => None,
+                }),
+        )
     }
     pub(super) fn array_entries(
         &self,
@@ -483,17 +553,23 @@ impl RetainedStorage {
                     }),
             )
     }
-    pub(super) fn array_entry(&self, id: &safemlx::AllocationIdentity) -> Option<&(u64, RetainedArray)> {
-        self.arrays.get(id).and_then(NativeEntry::owned).or_else(|| {
-            match self
-                .original
-                .as_ref()?
-                .get(0, &StorageIdentity::Native(*id))?
-            {
-                Value::Array(v) => Some(v),
-                _ => None,
-            }
-        })
+    pub(super) fn array_entry(
+        &self,
+        id: &safemlx::AllocationIdentity,
+    ) -> Option<&(u64, RetainedArray)> {
+        self.arrays
+            .get(id)
+            .and_then(NativeEntry::owned)
+            .or_else(|| {
+                match self
+                    .original
+                    .as_ref()?
+                    .get(0, &StorageIdentity::Native(*id))?
+                {
+                    Value::Array(v) => Some(v),
+                    _ => None,
+                }
+            })
     }
     pub(super) fn host_entry(
         &self,

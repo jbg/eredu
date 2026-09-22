@@ -33,6 +33,7 @@ fn report_error(
     funding: &eredu_core::HostMetadataFunding,
 ) -> WorkingMemoryError {
     match cause {
+        crate::working_memory::WorkspaceReportError::Domain(error) => error.into(),
         crate::working_memory::WorkspaceReportError::Policy(
             eredu_core::AdmissionPolicyError::ArithmeticOverflow { .. },
         ) => WorkingMemoryError::Overflow,
@@ -90,23 +91,14 @@ impl PendingSamplingExtension {
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let peak = report
-            .peak
-            .bytes()
+        let physical = report
+            .physical_domains
+            .as_ref()
             .ok_or(WorkingMemoryError::UnknownBound)?;
-        let tensor = report
-            .tensor_peak_bytes
-            .ok_or(WorkingMemoryError::UnknownBound)?;
-        let host = report
-            .host_peak_bytes
-            .ok_or(WorkingMemoryError::UnknownBound)?;
-        if tensor
-            .checked_add(host)
-            .ok_or(WorkingMemoryError::Overflow)?
-            != peak
-            || report.first_gap.is_some()
-        {
-            return Err(WorkingMemoryError::IdentityMismatch);
+        let peak = report.peak.bytes();
+        let tensor = report.tensor_peak_bytes;
+        if report.first_gap.is_some() {
+            return Err(WorkingMemoryError::UnknownBound);
         }
         let geometry = self.geometry();
         let zero = || {
@@ -114,6 +106,27 @@ impl PendingSamplingExtension {
             .map_err(|cause| report_error(cause, &funding))
         };
         let workspace = ExecutionWorkspaceEstimate {
+            physical_domains: Some(eredu_core::DomainExecutionWorkspaceEstimate {
+                geometry,
+                activations: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                attention: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                vocabulary: metadata
+                    .clone_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                state_update: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                materialization: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                retained: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+            }),
             geometry,
             activations: zero()?,
             attention: zero()?,
@@ -130,6 +143,18 @@ impl PendingSamplingExtension {
             .and_then(|n| n.checked_add(geometry.max_output_tokens))
             .ok_or(WorkingMemoryError::Overflow)?;
         let state = RuntimeStateEstimate {
+            physical_domains: Some(eredu_core::DomainRuntimeStateEstimate {
+                geometry,
+                decoder_state: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                media_embeddings: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+                media_workspace: metadata
+                    .empty_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+            }),
             fixed_state_bytes: 0,
             bytes_per_position_per_batch: 0,
             context_state_bytes: 0,
@@ -148,17 +173,18 @@ impl PendingSamplingExtension {
             },
             completeness: EstimationCompleteness::Complete,
         };
-        let reservation = self
-            .binding
-            .request()
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = self.binding.request().memory_reservation();
         let quote = IncrementalInferenceQuote {
             state: super::super::super::QuoteDiagnostics::new(state, metadata)
                 .map_err(|cause| report_error(cause, &funding))?,
             geometry,
             incremental_bytes: peak,
-            equation_incremental_bytes: Some(tensor),
+            incremental_requirements: Some(
+                metadata
+                    .clone_domain_requirements(physical)
+                    .map_err(|e| report_error(e, &funding))?,
+            ),
+            equation_incremental_bytes: tensor,
             pool: reservation.0.pool.clone(),
             pin: None,
             controller: None,
@@ -168,7 +194,17 @@ impl PendingSamplingExtension {
                 preparation: Some(0),
                 attention: Some(0),
                 materialization: Some(0),
-                sampling: Some(peak),
+                sampling: peak,
+                physical_outside: Some({
+                    metadata
+                        .admit::<(eredu_core::DomainMemoryRequirements, [usize; 2])>()
+                        .map_err(|e| report_error(e, &funding))?;
+                    Arc::new(
+                        metadata
+                            .empty_domain_requirements(physical)
+                            .map_err(|e| report_error(e, &funding))?,
+                    )
+                }),
                 text_controls: None,
             },
             span_seal: None,
@@ -237,12 +273,15 @@ impl SamplingExtensionQuote {
         Ok(self)
     }
     /// Complete currently composed requirement; reading it grants no capacity.
-    pub fn required_bytes(&self) -> u64 {
+    pub fn required_bytes(&self) -> Option<u64> {
         self.quote.incremental_bytes()
     }
     /// Reserve the complete fresh program against the same pool and execution,
     /// preserving the original request and every old spent role.
-    pub fn admit(self, capacity: u64) -> Result<OriginalTextSamplingExtension, WorkingMemoryError> {
+    pub fn admit(
+        self,
+        capacity: eredu_core::MemoryLimits,
+    ) -> Result<OriginalTextSamplingExtension, WorkingMemoryError> {
         self.pending.binding.validate_pending()?;
         if self.quote.span_seal.is_none() || self.quote.span_workspace.text_controls.is_none() {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -256,19 +295,15 @@ impl SamplingExtensionQuote {
                 Admission,
             )>()
             .map_err(|cause| report_error(cause, &funding))?;
-        let original = self
-            .pending
-            .binding
-            .request()
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let original = self.pending.binding.request().memory_reservation();
         let admission = Admission {
+            memory_limits: original.admission().memory_limits.clone(),
+            additional_headroom: original.admission().additional_headroom.clone(),
             requested_positions: original.admission().requested_positions,
             state: metadata
                 .clone_state(self.quote.state())
                 .map_err(|cause| report_error(cause, &funding))?,
             incremental_required_bytes: self.quote.incremental_bytes(),
-            available_memory_bytes: None,
         };
         let reservation = self.quote.reserve(
             &original.0.pool,

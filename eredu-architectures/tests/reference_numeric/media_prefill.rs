@@ -1,5 +1,5 @@
 //! Nonzero selected media execution through the one shared prefill driver.
-//! These are ordinary mechanisms; no native/original media admission is implied.
+//! Host numerical fixtures retain genuine source, metadata and request admission; they do not validate native hardware.
 use super::*;
 use eredu_architectures::composite_execution::{
     CompositeArchitecture, CompositeMediaIngressArchitecture, PreparedCompositeArchitecture,
@@ -12,6 +12,8 @@ use eredu_runtime::{
     replicated_session::SessionPrefill,
 };
 use std::rc::Rc;
+#[path = "media_prefill/source.rs"]
+mod source;
 
 type State = DeviceState<NumericBackend, NumericHybridLayerState>;
 type Input = eredu_runtime::PreparedModelInput<NumericTensor>;
@@ -75,6 +77,7 @@ pub(super) fn attach<A, D>(
     session: &Rc<RefCell<Session<A, D>>>,
     admission: &A::AdmissionConfig,
     context: &NumericContext,
+    sources: &eredu_architectures::prepared_sources::PreparedModelSources,
 ) -> Box<PartitionMedia>
 where
     A: CompositeMediaIngressArchitecture<NumericBackend, State, Error = Error> + 'static,
@@ -92,6 +95,7 @@ where
     let session = Rc::clone(session);
     let admission = admission.clone();
     let context = context.clone();
+    let sources = sources.clone();
     Box::new(move |input, schedule| {
         scheduled::<A, D>(
             &mut *session.borrow_mut(),
@@ -99,6 +103,7 @@ where
             input,
             &context,
             schedule,
+            &sources,
         )
     })
 }
@@ -145,12 +150,58 @@ where
         .map_err(|e| Error::backend(e.to_string()))
 }
 
+pub(super) fn restart_with_token<A, D>(
+    session: &mut Session<A, D>,
+    admission: &A::AdmissionConfig,
+    token: usize,
+    frontier: u64,
+    context: &NumericContext,
+) -> Result<NumericTensor, Error>
+where
+    A: CompositeArchitecture<NumericBackend, State, Error = Error> + 'static,
+    A::InputPartPlan: 'static,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        PreparedCompositeArchitecture<A>,
+        NumericBackend,
+        State,
+        NumericReplicatedPolicy<A::Unit>,
+        NumericReplicatedPolicy<A::Unit>,
+    >,
+{
+    let input = numeric_text_prepared_input(&[token]);
+    let admitted = A::admit_prepared_input(admission, &input, &NumericInputInspector)
+        .map_err(Error::backend)?;
+    let geometry = eredu_core::InferenceGeometry {
+        batch_size: 1,
+        cached_positions: frontier,
+        input_positions: 1,
+        max_output_tokens: 2,
+        prefill_chunk_positions: 1,
+        output: OutputDemand::LastPosition,
+    };
+    let source = eredu_architectures::prefill::PreparedExternalPrefill::from_prepared(
+        input,
+        admitted,
+        geometry,
+        admission.clone(),
+        NumericInputInspector,
+        true,
+    )
+    .map_err(Error::backend)?
+    .unwrap();
+    let mut observer = Observer(Rc::new(RefCell::new(Trace::default())));
+    ordinary::run_whole_source::<A, D, _>(session, source, geometry, context, &mut observer)
+        .map_err(Error::backend)?
+        .ok_or_else(|| Error::backend("resumed one-token prefill has no output"))
+}
+
 fn scheduled<A, D>(
     session: &mut Session<A, D>,
     admission: &A::AdmissionConfig,
     input: &Input,
     context: &NumericContext,
     schedule: Schedule,
+    sources: &eredu_architectures::prepared_sources::PreparedModelSources,
 ) -> Result<Report, Error>
 where
     A: CompositeMediaIngressArchitecture<NumericBackend, State, Error = Error> + 'static,
@@ -174,12 +225,19 @@ where
         prefill_chunk_positions: schedule.chunk.min(shape[1]),
         output: schedule.output,
     };
-    let plan = A::prepare_ingress_plan(admission, input.clone(), &NumericInputInspector, geometry)?;
-    let mut source = session
-        .prepare_media_prefill_unbudgeted(plan)
-        .map_err(|e| Error::backend(e.to_string()))?;
-    let request = source.request().expect("ordinary source retains its inference request").clone();
+    let mut source = source::prepare::<A, D>(session, admission, input, sources, geometry)
+        .map_err(|e| Error::backend(format!("media source construction: {e}")))?;
+    let request = source
+        .request()
+        .expect("ordinary source retains its inference request")
+        .clone();
     let execution = session.inference_execution_identity().clone();
+    let observation_source = session.shared_observation_paths().cloned();
+    if let Some(paths) = &observation_source {
+        session
+            .validate_prepared_observation_paths(paths)
+            .map_err(|cause| Error::backend(cause.to_string()))?;
+    }
     let cancellation = eredu_core::GenerationCancellationToken::new();
     let trace = Rc::new(RefCell::new(Trace::default()));
     let mut observer = Observer(Rc::clone(&trace));
@@ -223,7 +281,7 @@ where
         loop {
             match driver
                 .step(&mut executor)
-                .map_err(|e| Error::backend(e.to_string()))?
+                .map_err(|e| Error::backend(format!("media driver step: {e}")))?
             {
                 PrefillProgress::Chunk { chunk, output } => consume(chunk, output),
                 PrefillProgress::Complete => break PrefillOutcome::Complete,
@@ -234,7 +292,7 @@ where
     } else {
         driver
             .run(&mut executor, &mut consume)
-            .map_err(|e| Error::backend(e.to_string()))?
+            .map_err(|e| Error::backend(format!("media driver run: {e}")))?
     };
     drop(consume);
     if geometry.output == OutputDemand::Sequence && outcome == PrefillOutcome::Complete {
@@ -259,29 +317,44 @@ where
         assert_eq!(*context.media_completions.lock().unwrap(), roots);
     }
     drop(executor);
+    if let Some(paths) = &observation_source {
+        session
+            .validate_prepared_observation_paths(paths)
+            .map_err(|cause| {
+                Error::backend(format!(
+                    "media changed prepared observation binding: {cause}"
+                ))
+            })?;
+    }
     let state = snapshot::<A, D>(session)?;
     let mut cached = Vec::new();
-    // This entry is explicitly ordinary: unfunded requests do not install an
-    // InferenceStateAdmission. Preserve cached decode from the actually committed
-    // prefix; this fixture does not exercise funded prompt-end authority.
+    // A cancelled prefix retains its original authority. Starting new input
+    // obtains a fresh ordinary reservation at that committed frontier.
+    let restart = outcome == PrefillOutcome::Cancelled;
+    let frontier = geometry.cached_positions + driver.completed_positions();
     if schedule.follow_decode {
         let checkpoint = session
             .checkpoint_complete_distributed(context)
             .map_err(|e| Error::backend(e.to_string()))?;
-        for token in [2, 6, 1] {
-            cached.push(decode::<A, D>(session, admission, token, context)?);
+        for (index, token) in [2, 6, 1].into_iter().enumerate() {
+            cached.push(if restart && index == 0 {
+                restart_with_token::<A, D>(session, admission, token, frontier, context)?
+            } else {
+                decode::<A, D>(session, admission, token, context)?
+            });
         }
         let after = snapshot::<A, D>(session)?;
         session
             .rollback_complete_distributed(checkpoint, context)
             .map_err(|e| Error::backend(e.to_string()))?;
         same_state(&snapshot::<A, D>(session)?, &state);
-        for (token, expected) in [2, 6, 1].into_iter().zip(&cached) {
-            assert_tensor_close(
-                &decode::<A, D>(session, admission, token, context)?,
-                expected,
-                "restored media cached decode",
-            );
+        for (index, (token, expected)) in [2, 6, 1].into_iter().zip(&cached).enumerate() {
+            let actual = if restart && index == 0 {
+                restart_with_token::<A, D>(session, admission, token, frontier, context)?
+            } else {
+                decode::<A, D>(session, admission, token, context)?
+            };
+            assert_tensor_close(&actual, expected, "restored media cached decode");
         }
         same_state(&snapshot::<A, D>(session)?, &after);
     }

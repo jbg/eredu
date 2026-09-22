@@ -1,6 +1,6 @@
 //! Runtime policy for lazy checkpoint headers; metadata remains an estimate.
 use super::{
-    DependencyMemoryPolicy, WorkingMemoryError, WorkingMemoryPool, gguf_source::SourceAccount,
+    DependencyMemoryPolicy, MemoryLedger, WorkingMemoryError, gguf_source::SourceAccount,
     qualified_storage,
 };
 use eredu_checkpoint::{
@@ -111,8 +111,8 @@ impl SafetensorsHeaderAdmission for HeaderPolicy {
             return Err(self.exhausted.clone());
         }
         let reserve = || {
-            let quote = WorkingMemoryPool::safetensors_header_quote(request, self.metadata)?;
-            let pool = WorkingMemoryPool(
+            let quote = MemoryLedger::safetensors_header_quote(request, self.metadata)?;
+            let pool = MemoryLedger(
                 self.pool
                     .upgrade()
                     .ok_or(WorkingMemoryError::IdentityMismatch)?,
@@ -146,7 +146,7 @@ fn sum(values: impl IntoIterator<Item = u64>) -> Result<u64, WorkingMemoryError>
         .try_fold(0u64, u64::checked_add)
         .ok_or(WorkingMemoryError::Overflow)
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Price a header before reading its body. Metadata headroom is applied to
     /// JSON and path bytes; it is not a dependency-wide or process-wide ceiling.
     /// Source discovery, index/catalog storage and payload caches are separate.

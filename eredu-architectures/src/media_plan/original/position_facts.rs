@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn original_position_projection_validates_source_ranges_and_preserves_typed_tokens() {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let ids = [7i32, 11];
         let projected = [0.5f32; 12];
         let image = [1.5f32; 4];
@@ -262,7 +262,7 @@ mod tests {
         let source = pool
             .compile_prepared_host_input(PreparedHostInputPlan::prepare(&parts).unwrap())
             .unwrap();
-        let used = pool.used_bytes().unwrap();
+        let used = crate::memory_fixture::used(&pool).unwrap();
         let records = [
             CompositeSemanticPartRecord {
                 source_part: 0,
@@ -341,7 +341,7 @@ mod tests {
             .err()
             .unwrap()
             .is_overflow());
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), used);
         let values = source.part(0).unwrap().payload_view().values;
         assert!(matches!(values,HostTensorValues::I32(values) if values == [7,11]));
         let invalid_ids = [-1i32, 11];
@@ -360,6 +360,6 @@ mod tests {
             .unwrap();
         assert!(PreparedMediaPositionFacts::from_source(&negative, &records[..1], 2).is_err());
         drop(negative);
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(crate::memory_fixture::used(&pool).unwrap(), used);
     }
 }

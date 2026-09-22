@@ -5,7 +5,10 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
         return None;
     }
     super::super::pooling::gather_geometry(operation).ok()?;
-    if !matches!(operation.inputs.get(0)?.dtype(), WorkspaceDtype::Bool | WorkspaceDtype::Float32) {
+    if !matches!(
+        operation.inputs.get(0)?.dtype(),
+        WorkspaceDtype::Bool | WorkspaceDtype::Float32
+    ) {
         return None;
     }
     // Two ExpandDims, one explicit Broadcast, then take_along_axis's two

@@ -2,7 +2,7 @@
 //! and canonical publication worker. B emits no operation/new backing; its zero
 //! native allowance cannot originate A's prepaid-host source row.
 use super::*;
-use crate::backend::runtime::residency::storage::{StorageIdentity, native_storage as mlx};
+use crate::backend::runtime::residency::storage::{native_storage as mlx, StorageIdentity};
 use eredu_nn::workspace::WorkspaceExistingStorage;
 use eredu_runtime::working_memory::*;
 
@@ -17,6 +17,9 @@ impl OriginalNativeStorageMechanism for ExistingImmutable {
     type Observation<'a> = mlx::Observation<'a>;
     fn selection(&self) -> &NativeStorageSelection {
         self.0.selection()
+    }
+    fn uniform_budget_placement(&self) -> Option<std::sync::Arc<eredu_core::MemoryPlacement>> {
+        self.0.uniform_budget_placement()
     }
     fn key_clone_storage_bytes(&self) -> Option<u64> {
         // The closed observation below accepts only an actual immutable Native
@@ -38,7 +41,7 @@ impl OriginalNativeStorageMechanism for ExistingImmutable {
         if matches!(
             &actual,
             mlx::Observation::Immutable(_)
-                | mlx::Observation::Host(_)
+                | mlx::Observation::Host(..)
                 | mlx::Observation::HostBuffer(_, _)
                 | mlx::Observation::Empty
         ) {
@@ -49,6 +52,18 @@ impl OriginalNativeStorageMechanism for ExistingImmutable {
             ))
         }
     }
+    fn placement(
+        _: &Self::Observation<'_>,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<
+        std::sync::Arc<eredu_core::MemoryPlacement>,
+        eredu_runtime::working_memory::WorkingMemoryError,
+    > {
+        Ok(std::sync::Arc::new(eredu_core::MemoryPlacement::fixed(
+            topology,
+            topology.host_domain(),
+        )?))
+    }
     fn describe(actual: &Self::Observation<'_>) -> NativeStorageObservation<StorageIdentity> {
         mlx::MlxNativeStorage::describe(actual)
     }
@@ -56,7 +71,7 @@ impl OriginalNativeStorageMechanism for ExistingImmutable {
         &self,
         previous: &Self::Observation<'_>,
         current: &Self::Observation<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> bool {
         self.0.has_retained_attachment(previous, current, pool)
     }
@@ -84,7 +99,22 @@ struct LaterAlias {
     capabilities: ModelCapabilities,
 }
 impl LaterAlias {
-    fn prepare(pool: &WorkingMemoryPool, runtime: Rc<safemlx::PreparedInputRuntime>) -> Self {
+    fn required_bytes(&self) -> u64 {
+        let admission = eredu_core::Admission {
+            requested_positions: self
+                .geometry
+                .input_positions
+                .checked_add(self.geometry.max_output_tokens)
+                .unwrap(),
+            state: self.quote.state().clone(),
+            incremental_required_bytes: self.quote.incremental_bytes(),
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+        };
+        crate::memory_fixture::host_total(&self.quote.reservation_requirements(&admission).unwrap())
+    }
+
+    fn prepare(pool: &MemoryLedger, runtime: Rc<safemlx::PreparedInputRuntime>) -> Self {
         let selection = NativeStorageSelection::default();
         let mechanism = ExistingImmutable(mlx::MlxNativeStorage::new(&Ok(runtime), &selection));
         let geometry = InferenceGeometry {
@@ -95,7 +125,7 @@ impl LaterAlias {
             prefill_chunk_positions: 1,
             output: OutputDemand::StateOnly,
         };
-        let context = WorkspaceContext::new(EmptyWorkspace);
+        let context = WorkspaceContext::new(EmptyWorkspace(crate::memory_fixture::topology()));
         let storage = RegisteredWorkspaceStorage::bind(
             pool,
             &context,
@@ -111,9 +141,8 @@ impl LaterAlias {
             input: InputTokenCount::text(1),
             max_output_tokens: 1,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: crate::memory_fixture::headroom(0),
+            memory_limits: Default::default(),
         };
         let state_layout = StateMemoryLayout::new(
             LayerSchedule::empty(),
@@ -137,7 +166,8 @@ impl LaterAlias {
                 "existing immutable alias publication emits no native operation/backing",
             )
         };
-        let outside = ExecutionWorkspaceEstimate {
+        let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: empty(),
             attention: empty(),
@@ -145,12 +175,12 @@ impl LaterAlias {
             state_update: empty(),
             materialization: empty(),
             retained: empty(),
-        };
+        });
         let quote = ResidualInferenceQuote::compose(&report, state, outside, &storage)
             .unwrap()
             .into_incremental();
         assert_eq!(
-            quote.incremental_bytes(),
+            quote.incremental_bytes().unwrap(),
             0,
             "A's source is already protected; B cannot debit it again"
         );
@@ -197,12 +227,12 @@ impl LaterAlias {
             capabilities,
         }
     }
-    fn publish(self, pool: &WorkingMemoryPool, root: mlx::NativeStorageRoot<'_>) -> u64 {
+    fn publish(self, pool: &MemoryLedger, root: mlx::NativeStorageRoot<'_>) -> u64 {
         self.with_attempt(pool, None, |mut publication, scope| {
-            let before = pool.used_bytes().unwrap();
+            let before = pool.fixture_host_charge().unwrap();
             publication.publish(scope, [root, root], &[]).unwrap();
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 before,
                 "duplicate actual roots preserve A's sole backing charge"
             );
@@ -211,13 +241,14 @@ impl LaterAlias {
     }
     fn with_attempt<T>(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         ceiling: Option<u64>,
         operation: impl FnOnce(
             OriginalNativePublication<ExistingImmutable>,
             &WorkingMemoryFundingScope,
         ) -> T,
     ) -> (T, u64) {
+        let required = self.required_bytes();
         let Self {
             mechanism,
             quote,
@@ -225,30 +256,34 @@ impl LaterAlias {
             request,
             capabilities,
         } = self;
-        let before = pool.used_bytes().unwrap();
-        let exact = before + quote.incremental_bytes();
+        let before = pool.fixture_host_charge().unwrap();
+        let exact = pool
+            .fixture_host_current()
+            .unwrap()
+            .checked_add(required)
+            .unwrap();
         assert!(matches!(
             plan_prefill_incremental_with_capacity(
                 &InferenceExecutionIdentity::default(),
                 pool,
                 &capabilities,
-                request,
+                request.clone(),
                 geometry,
-                exact - 1,
+                crate::memory_fixture::physical_host_limits(pool, exact - 1),
                 |_| Ok(quote.clone())
             ),
             Err(PrefillPlanningError::Reservation(
-                WorkingMemoryError::BudgetExceeded { .. }
+                WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
             ))
         ));
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
         let (reservation, accepted) = plan_prefill_incremental_with_capacity(
             &InferenceExecutionIdentity::default(),
             pool,
             &capabilities,
-            request,
+            request.clone(),
             geometry,
-            ceiling.unwrap_or(exact),
+            crate::memory_fixture::physical_host_limits(pool, ceiling.unwrap_or(exact)),
             |_| Ok(quote.clone()),
         )
         .unwrap();
@@ -289,7 +324,7 @@ fn immutable_source_birth_survives_cache_retirement_and_generic_b_alias_publicat
         None,
         |pool| {
             let prepared = LaterAlias::prepare(pool, runtime.clone());
-            let bytes = prepared.quote.incremental_bytes();
+            let bytes = prepared.required_bytes();
             later = Some(prepared);
             bytes
         },
@@ -302,7 +337,7 @@ fn immutable_source_birth_survives_cache_retirement_and_generic_b_alias_publicat
         },
     );
     drop(fixture);
-    let original = pool.used_bytes().unwrap();
+    let original = pool.fixture_host_charge().unwrap();
     assert!(original > 0);
     let facts = match array.inspect_immutable_source().unwrap() {
         safemlx::ImmutableSourceInspection::Allocation(witness) => witness.allocation(),
@@ -314,7 +349,7 @@ fn immutable_source_birth_survives_cache_retirement_and_generic_b_alias_publicat
             facts.bytes() as u64,
         )])
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), original);
+    assert_eq!(pool.fixture_host_charge().unwrap(), original);
     drop(pin);
     drop(runtime);
     let b_host = later
@@ -322,7 +357,7 @@ fn immutable_source_birth_survives_cache_retirement_and_generic_b_alias_publicat
         .unwrap()
         .publish(&pool, mlx::NativeStorageRoot::Array(&array));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         original + b_host,
         "only B's sidecar controls are additionally protected"
     );
@@ -333,11 +368,11 @@ fn immutable_source_birth_survives_cache_retirement_and_generic_b_alias_publicat
 fn prepared_host_source_with<T>(
     runtime: &Rc<safemlx::PreparedInputRuntime>,
     caller_controls: u64,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
     retain: impl FnOnce(
         crate::backend::runtime::residency::storage::filled_host::PublishedHostSource,
     ) -> T,
-) -> (T, WorkingMemoryPool) {
+) -> (T, MemoryLedger) {
     use crate::backend::runtime::residency::storage::filled_host;
     let shape = [4];
     let plan = safemlx::PreparedHostTransferPlan::new(&runtime, &shape, safemlx::Dtype::Float32, 0)
@@ -379,11 +414,14 @@ fn prepared_host_source_with<T>(
 
 fn prepared_host_source(
     runtime: &Rc<safemlx::PreparedInputRuntime>,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
-) -> (safemlx::ImmutableHostTransferBuffer, WorkingMemoryPool) {
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
+) -> (safemlx::ImmutableHostTransferBuffer, MemoryLedger) {
     prepared_host_source_with(runtime, 0, additional_ceiling, |source| {
         let (buffer, facts, custody) = source.into_parts();
-        assert_eq!(buffer.try_allocation_info().unwrap(), facts.expect("nonempty source attachment").allocation());
+        assert_eq!(
+            buffer.try_allocation_info().unwrap(),
+            facts.expect("nonempty source attachment").allocation()
+        );
         drop(custody);
         buffer
     })
@@ -391,10 +429,10 @@ fn prepared_host_source(
 
 fn prepared_retained_host_source(
     runtime: &Rc<safemlx::PreparedInputRuntime>,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
 ) -> (
     crate::backend::runtime::residency::manager::RetainedHostBuffer,
-    WorkingMemoryPool,
+    MemoryLedger,
 ) {
     use crate::backend::runtime::residency::manager::RetainedHostBuffer;
     let controls = RetainedHostBuffer::storage_bytes().unwrap()
@@ -413,13 +451,13 @@ fn immutable_host_source_survives_closed_donor_and_generic_b_alias_publication()
     let mut later = None;
     let (source, pool) = prepared_host_source(&runtime, |pool| {
         let prepared = LaterAlias::prepare(pool, runtime.clone());
-        let bytes = prepared.quote.incremental_bytes();
+        let bytes = prepared.required_bytes();
         later = Some(prepared);
         bytes
     });
     // A's complete run, span, bank, and quote have retired. Only the actual
     // immutable source and its accounting attachments keep A's original hold.
-    let original = pool.used_bytes().unwrap();
+    let original = pool.fixture_host_charge().unwrap();
     assert!(original > 0);
     let observed = source.inspect_original_source().unwrap();
     assert!(observed.is_prepared_source());
@@ -431,14 +469,14 @@ fn immutable_host_source_survives_closed_donor_and_generic_b_alias_publication()
             physical.bytes() as u64,
         )])
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), original);
+    assert_eq!(pool.fixture_host_charge().unwrap(), original);
     drop(pin);
     drop(runtime);
     let b_host = later
         .take()
         .unwrap()
         .publish(&pool, mlx::NativeStorageRoot::Host(&source, None));
-    assert_eq!(pool.used_bytes().unwrap(), original + b_host);
+    assert_eq!(pool.fixture_host_charge().unwrap(), original + b_host);
     let values = source
         .as_bytes()
         .unwrap()
@@ -455,19 +493,17 @@ fn immutable_host_source_refuses_foreign_pool_without_new_birth_or_attempt_refun
     for receipt_supplied in [false, true] {
         let runtime = Rc::new(safemlx::PreparedInputRuntime::prepare().unwrap());
         let (source, donor) = prepared_retained_host_source(&runtime, |_| 0);
-        let donor_before = donor.used_bytes().unwrap();
-        assert!(
-            source
-                .inspect_original_source()
-                .unwrap()
-                .is_prepared_source()
-        );
-        let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let donor_before = donor.fixture_host_charge().unwrap();
+        assert!(source
+            .inspect_original_source()
+            .unwrap()
+            .is_prepared_source());
+        let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         LaterAlias::prepare(&foreign, runtime).with_attempt(
             &foreign,
             None,
             |mut publication, scope| {
-                let before = foreign.used_bytes().unwrap();
+                let before = foreign.fixture_host_charge().unwrap();
                 assert!(matches!(
                     publication.publish(
                         scope,
@@ -489,8 +525,8 @@ fn immutable_host_source_refuses_foreign_pool_without_new_birth_or_attempt_refun
                     publication.failure_site(),
                     "registry physical alias missing"
                 );
-                assert_eq!(foreign.used_bytes().unwrap(), before);
-                assert_eq!(donor.used_bytes().unwrap(), donor_before);
+                assert_eq!(foreign.fixture_host_charge().unwrap(), before);
+                assert_eq!(donor.fixture_host_charge().unwrap(), donor_before);
                 assert!(matches!(
                     publication.publish(
                         scope,
@@ -511,7 +547,7 @@ fn immutable_host_source_refuses_foreign_pool_without_new_birth_or_attempt_refun
             },
         );
         settle_pool(&foreign);
-        assert_eq!(donor.used_bytes().unwrap(), donor_before);
+        assert_eq!(donor.fixture_host_charge().unwrap(), donor_before);
         assert_eq!(source.as_bytes().unwrap().len(), 16);
         drop(source);
         settle_pool(&donor);
@@ -526,13 +562,19 @@ fn immutable_host_source_refuses_quarantined_donor_without_refunding_origin() {
         let (source, pool) = prepared_retained_host_source(&runtime, |pool| {
             let first = LaterAlias::prepare(pool, runtime.clone());
             let next = LaterAlias::prepare(pool, runtime.clone());
-            let bytes = first.quote.incremental_bytes() + next.quote.incremental_bytes();
+            let bytes = first.required_bytes() + next.required_bytes();
             aliases = Some((first, next));
             bytes
         });
-        let original = pool.used_bytes().unwrap();
+        let original = pool.fixture_host_charge().unwrap();
         let (first, next) = aliases.unwrap();
-        let ceiling = original + first.quote.incremental_bytes() + next.quote.incremental_bytes();
+        let ceiling = pool
+            .fixture_host_current()
+            .unwrap()
+            .checked_add(first.required_bytes())
+            .unwrap()
+            .checked_add(next.required_bytes())
+            .unwrap();
         // Both finite attempts are accepted before the real unwind. Quarantine
         // must reject reuse, rather than merely preventing a new request admission.
         next.with_attempt(&pool, Some(ceiling), |mut next_publication, next_scope| {
@@ -555,19 +597,15 @@ fn immutable_host_source_refuses_quarantined_donor_without_refunding_origin() {
                     assert!(caught.is_err());
                 },
             );
-            assert!(
-                source
-                    .inspect_original_source()
-                    .unwrap()
-                    .is_prepared_source()
-            );
-            assert!(
-                !source
-                    .attachment_receipt()
-                    .unwrap()
-                    .matches(source.try_allocation_info().unwrap(), &pool)
-            );
-            let before = pool.used_bytes().unwrap();
+            assert!(source
+                .inspect_original_source()
+                .unwrap()
+                .is_prepared_source());
+            assert!(!source
+                .attachment_receipt()
+                .unwrap()
+                .matches(source.try_allocation_info().unwrap(), &pool));
+            let before = pool.fixture_host_charge().unwrap();
             assert!(matches!(
                 next_publication.publish(
                     next_scope,
@@ -585,7 +623,7 @@ fn immutable_host_source_refuses_quarantined_donor_without_refunding_origin() {
                     WorkingMemoryError::ExecutionFenced
                 ))
             ));
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before);
             assert!(matches!(
                 next_publication.publish(
                     next_scope,
@@ -608,7 +646,7 @@ fn immutable_host_source_refuses_quarantined_donor_without_refunding_origin() {
         drop(source);
         safemlx::reclaim_allocation_owners();
         assert!(
-            pool.used_bytes().unwrap() >= original,
+            pool.fixture_host_charge().unwrap() >= original,
             "quarantine cannot refund the donor's original source account"
         );
     }
@@ -620,7 +658,7 @@ fn prepared_host_constructor_preserves_ordinary_origin_for_host_and_array_aliase
     use crate::backend::runtime::residency::storage::RetainedStorage;
     let runtime = Rc::new(safemlx::PreparedInputRuntime::prepare().unwrap());
     for array_alias in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         // This is the same actual prepared constructor used by load-time Host
         // managers. Its quota pays native metadata; publication pays backing.
@@ -640,12 +678,10 @@ fn prepared_host_constructor_preserves_ordinary_origin_for_host_and_array_aliase
             bytes.copy_from_slice(&value.to_ne_bytes());
         }
         let source = std::sync::Arc::new(source.freeze());
-        assert!(
-            source
-                .inspect_original_source()
-                .unwrap()
-                .is_prepared_source()
-        );
+        assert!(source
+            .inspect_original_source()
+            .unwrap()
+            .is_prepared_source());
         let capacity = source.allocation_info().unwrap().bytes() as u64;
         let array = source.try_prepared_source_array().unwrap();
         array.evaluated().unwrap();
@@ -658,14 +694,14 @@ fn prepared_host_constructor_preserves_ordinary_origin_for_host_and_array_aliase
         let publication = inventory.publish_unquoted(&loading).unwrap();
         drop((publication, loading, arena));
         crate::backend::ordinary_retirement::reclaim_all();
-        assert_eq!(pool.used_bytes().unwrap(), capacity);
+        assert_eq!(pool.fixture_host_charge().unwrap(), capacity);
         let root = if array_alias {
             mlx::NativeStorageRoot::Array(&array)
         } else {
             mlx::NativeStorageRoot::Host(&source, None)
         };
         let extra = LaterAlias::prepare(&pool, runtime.clone()).publish(&pool, root);
-        assert_eq!(pool.used_bytes().unwrap(), capacity + extra);
+        assert_eq!(pool.fixture_host_charge().unwrap(), capacity + extra);
         drop(source);
         assert_eq!(
             array.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
@@ -673,7 +709,7 @@ fn prepared_host_constructor_preserves_ordinary_origin_for_host_and_array_aliase
         );
         safemlx::reclaim_allocation_owners();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             capacity + extra,
             "the escaped Array still owns the entire original Host backing and alias controls"
         );
@@ -687,8 +723,8 @@ fn completed_host_receipt_releases_later_request_while_loaded_source_lives() {
     use crate::backend::managed_memory::NativeMemoryOwner;
     use crate::backend::runtime::residency::storage::RetainedStorage;
     let runtime = Rc::new(safemlx::PreparedInputRuntime::prepare().unwrap());
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let plan =
         safemlx::PreparedHostTransferPlan::new(&runtime, &[4], safemlx::Dtype::Float32, 1).unwrap();
@@ -709,9 +745,9 @@ fn completed_host_receipt_releases_later_request_while_loaded_source_lives() {
     inventory.include_host(host.clone()).unwrap();
     let receipt = inventory.publish_unquoted(&loading).unwrap();
     drop((loading, arena));
-    assert!(receipt.has_native_attachment(pool.shared_storage_domain(), facts));
-    assert!(!receipt.has_native_attachment(foreign.shared_storage_domain(), facts));
-    let baseline = pool.used_bytes().unwrap();
+    assert!(receipt.has_native_attachment(pool.shared_storage_accounting_id(), facts));
+    assert!(!receipt.has_native_attachment(foreign.shared_storage_accounting_id(), facts));
+    let baseline = pool.fixture_host_charge().unwrap();
     assert_eq!(baseline, facts.bytes() as u64);
     // Both native observations must take the same positive complete receipt;
     // neither later Q is allowed to survive on this loaded physical source.
@@ -727,7 +763,7 @@ fn completed_host_receipt_releases_later_request_while_loaded_source_lives() {
         crate::backend::ordinary_retirement::reclaim_all();
         safemlx::reclaim_allocation_owners();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             baseline,
             "the loaded Host survives but the later request's complete Q retires"
         );
@@ -749,10 +785,10 @@ fn completed_host_receipt_releases_later_request_while_loaded_source_lives() {
     let next_facts = next.allocation_info().unwrap();
     assert_eq!(next_facts.bytes(), facts.bytes());
     assert_ne!(next_facts.identity(), facts.identity());
-    assert!(!receipt.has_native_attachment(pool.shared_storage_domain(), next_facts));
+    assert!(!receipt.has_native_attachment(pool.shared_storage_accounting_id(), next_facts));
     drop((next, receipt));
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -764,20 +800,20 @@ fn published_lazy_host_receipt_releases_every_later_request_while_source_survive
         later.extend((0..2).map(|_| LaterAlias::prepare(pool, runtime.clone())));
         later
             .iter()
-            .map(|value| value.quote.incremental_bytes())
+            .map(|value| value.required_bytes())
             .max()
             .unwrap()
     });
     // The source constructor's complete run is closed. Its actual native owner
     // and final manager shell retain exactly A; no new registration pin exists.
-    let original = pool.used_bytes().unwrap();
+    let original = pool.fixture_host_charge().unwrap();
     assert!(original > 0);
     let facts = host.try_allocation_info().unwrap();
     let receipt = host
         .attachment_receipt()
         .expect("successful source attachment");
     assert!(receipt.matches(facts, &pool));
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     assert!(!receipt.matches(facts, &foreign));
     let unrelated = safemlx::HostTransferBuffer::new(
         &[4],
@@ -796,7 +832,7 @@ fn published_lazy_host_receipt_releases_every_later_request_while_source_survive
         crate::backend::ordinary_retirement::reclaim_all();
         safemlx::reclaim_allocation_owners();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             original,
             "persistent lazy backing retains A but never a later request's Q"
         );
@@ -811,3 +847,11 @@ fn published_lazy_host_receipt_releases_every_later_request_while_source_survive
     drop(host);
     settle_pool(&pool);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

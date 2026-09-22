@@ -1,6 +1,6 @@
 use super::*;
 use eredu_nn::workspace::{WorkspaceMechanisms, WorkspaceOperation, WorkspaceOperationBound};
-use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 
 #[derive(Debug)]
 struct NoEquations;
@@ -38,9 +38,12 @@ fn paid_manager_catalog_preserves_actual_backing_pins_and_failed_installation_cu
         )
         .unwrap();
     let selection = CacheBlockSelection::new(7, CacheRepresentation::KeyValue, 0, 2, 0);
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 24)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 24),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -93,8 +96,22 @@ fn paid_manager_catalog_preserves_actual_backing_pins_and_failed_installation_cu
         super::super::super::reporting::update_report_totals_prepared(&mut state).unwrap();
         assert_eq!(state.telemetry.report, reference_report);
         assert!(state.report_rows.as_ref().unwrap().is_empty());
-        assert!(state.report_rows.as_ref().unwrap().validate_prepared_population(1).is_ok());
-        assert!(state.report_rows.as_ref().unwrap().validate_prepared_population(2).is_err());
+        assert!(
+            state
+                .report_rows
+                .as_ref()
+                .unwrap()
+                .validate_prepared_population(1)
+                .is_ok()
+        );
+        assert!(
+            state
+                .report_rows
+                .as_ref()
+                .unwrap()
+                .validate_prepared_population(2)
+                .is_err()
+        );
     }
     drop(pins);
     let stale = manager
@@ -112,15 +129,15 @@ fn paid_manager_catalog_preserves_actual_backing_pins_and_failed_installation_cu
         CacheSourceFailureCause::Source(CacheSourceError::Identity)
     ));
     drop((context, funding, installed));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     // Both rejected destinations retain their original account after external
     // manager handles retire. They contain no cloned native backing.
     drop(manager);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(failure);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(stale);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 impl eredu_nn::workspace::WorkspaceFactMechanisms for NoEquations {
@@ -156,62 +173,109 @@ impl eredu_nn::workspace::WorkspaceFactMechanisms for NoEquations {
 #[test]
 #[ignore = "requires native cache arrays"]
 fn prepared_publication_metadata_validates_actual_arrays_and_outlives_catalog_failure() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 20).unwrap();
-    let context = WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 20),
+        )
+        .unwrap();
+    let context =
+        WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
     let arrays = CacheBlockArrays::KeyValue {
         keys: Array::from_slice(&[1.25f32, -2.5], &[1, 1, 2, 1]),
         values: Array::from_slice(&[3.5f32, 4.75], &[1, 1, 2, 1]),
     };
-    let metadata = CacheBlockMetadata::prepare_f32(CacheRepresentation::KeyValue,
-        [&[1, 1, 2, 1], &[1, 1, 2, 1]], &context).unwrap();
+    let metadata = CacheBlockMetadata::prepare_f32(
+        CacheRepresentation::KeyValue,
+        [&[1, 1, 2, 1], &[1, 1, 2, 1]],
+        &context,
+    )
+    .unwrap();
     metadata.validate_arrays(&arrays).unwrap();
     let wrong = CacheBlockArrays::KeyValue {
         keys: Array::from_slice(&[1_i32, 2], &[1, 1, 2, 1]),
         values: Array::from_slice(&[3_i32, 4], &[1, 1, 2, 1]),
     };
-    assert!(matches!(metadata.validate_arrays(&wrong), Err(CacheSourceError::Geometry)));
-    let manager = CacheResidencyManager::new(PagedCacheOptions::new(2, 1 << 20, 0, 1).unwrap()).unwrap();
-    let id = CacheBlockId { session_id: manager.session_id(), global_layer: 3, representation: CacheRepresentation::KeyValue,
-        start: 0, end: 2, rank: None };
+    assert!(matches!(
+        metadata.validate_arrays(&wrong),
+        Err(CacheSourceError::Geometry)
+    ));
+    let manager =
+        CacheResidencyManager::new(PagedCacheOptions::new(2, 1 << 20, 0, 1).unwrap()).unwrap();
+    let id = CacheBlockId {
+        session_id: manager.session_id(),
+        global_layer: 3,
+        representation: CacheRepresentation::KeyValue,
+        start: 0,
+        end: 2,
+        rank: None,
+    };
     // This record is deliberately never published. Its ID is descriptive and
     // carries no source/manager permission; escaped metadata still needs H.
     let record = metadata.into_record(id, arrays, false);
     assert_eq!(record.shapes, [vec![1, 1, 2, 1], vec![1, 1, 2, 1]]);
     assert_eq!(record.dtypes, ["Float32", "Float32"]);
     drop((context, funding, wrong, manager));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(record);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
-
 
 #[test]
 #[ignore = "requires native cache sources"]
-fn prepared_source_block_pin_preserves_demand_telemetry_foreign_refusal_and_escaped_lease_custody() {
+fn prepared_source_block_pin_preserves_demand_telemetry_foreign_refusal_and_escaped_lease_custody()
+{
     let make = || {
-        let manager = CacheResidencyManager::new(PagedCacheOptions::new(2, 1 << 20, 0, 1).unwrap().with_full_attention(true)).unwrap();
-        let id = manager.seal_block(7, 0, 2, None, CacheBlockArrays::KeyValue {
-            keys: Array::from_slice(&[1.25f32, -2.5], &[1, 1, 2, 1]),
-            values: Array::from_slice(&[3.5f32, 4.75], &[1, 1, 2, 1]),
-        }, false).unwrap();
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(2, 1 << 20, 0, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap();
+        let id = manager
+            .seal_block(
+                7,
+                0,
+                2,
+                None,
+                CacheBlockArrays::KeyValue {
+                    keys: Array::from_slice(&[1.25f32, -2.5], &[1, 1, 2, 1]),
+                    values: Array::from_slice(&[3.5f32, 4.75], &[1, 1, 2, 1]),
+                },
+                false,
+            )
+            .unwrap();
         (manager, id)
     };
     let (manager, id) = make();
     let (foreign, foreign_id) = make();
     let selection = CacheBlockSelection::new(7, CacheRepresentation::KeyValue, 0, 2, 0);
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
-    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 24).unwrap();
-    let context = WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
-    let (pin, prepared) = manager.with_source_loan(selection, &context, |mut loan| {
-        let prepared = loan.prepare_catalog(1, 0, &context)?;
-        context.charge_metadata(PinnedCacheBlock::fixed_controls().unwrap())
-            .map_err(|cause| CacheSourceFailure::metadata(cause.into(), &context))?;
-        assert!(matches!(loan.pin_prepared_block(&foreign_id, context.metadata_funding()), Err(CacheSourceError::Identity)));
-        let pin = loan.pin_prepared_block(&id, context.metadata_funding())
-            .map_err(|cause| CacheSourceFailure::source(cause, &context))?;
-        Ok((pin, prepared))
-    }).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 24),
+        )
+        .unwrap();
+    let context =
+        WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
+    let (pin, prepared) = manager
+        .with_source_loan(selection, &context, |mut loan| {
+            let prepared = loan.prepare_catalog(1, 0, &context)?;
+            context
+                .charge_metadata(PinnedCacheBlock::fixed_controls().unwrap())
+                .map_err(|cause| CacheSourceFailure::metadata(cause.into(), &context))?;
+            assert!(matches!(
+                loan.pin_prepared_block(&foreign_id, context.metadata_funding()),
+                Err(CacheSourceError::Identity)
+            ));
+            let pin = loan
+                .pin_prepared_block(&id, context.metadata_funding())
+                .map_err(|cause| CacheSourceFailure::source(cause, &context))?;
+            Ok((pin, prepared))
+        })
+        .unwrap();
     let installed = prepared.install().unwrap();
     assert_eq!(manager.report().unwrap().demand_hits, 0);
     let lease = pin.acquire().unwrap();
@@ -220,34 +284,59 @@ fn prepared_source_block_pin_preserves_demand_telemetry_foreign_refusal_and_esca
         let state = manager.inner.state.lock().unwrap();
         assert_eq!(state.lifecycle.lease_count(&id).unwrap(), 2);
     }
-    assert!(matches!(manager.remove_block(&id), Err(CacheResidencyError::Lifecycle(CacheLifecycleError::BlockLeased(_)))));
+    assert!(matches!(
+        manager.remove_block(&id),
+        Err(CacheResidencyError::Lifecycle(
+            CacheLifecycleError::BlockLeased(_)
+        ))
+    ));
     drop(pin);
     {
         let state = manager.inner.state.lock().unwrap();
         assert_eq!(state.lifecycle.lease_count(&id).unwrap(), 1);
     }
     drop((foreign, context, funding, installed, manager));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     // No array or native permission was fabricated by the count-only lease.
     // Its real manager/backing and host account survive every other owner.
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
-
 
 #[test]
 #[ignore = "requires native cache source workers"]
 fn paid_independent_manager_preserves_source_namespace_pool_and_last_owner_custody() {
-    let source = CacheResidencyManager::new(PagedCacheOptions::new(2, 1 << 20, 0, 1).unwrap()).unwrap();
-    let id = source.seal_block(7, 0, 2, None, CacheBlockArrays::KeyValue {
-        keys: Array::from_slice(&[1.25f32, -2.5], &[1,1,2,1]),
-        values: Array::from_slice(&[3.5f32, 4.75], &[1,1,2,1]),
-    }, false).unwrap();
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
-    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 24).unwrap();
-    let context = WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
-    let prepared = source.with_source_loan(CacheBlockSelection::new(7, CacheRepresentation::KeyValue, 0, 2, 0), &context,
-        |loan| loan.prepare_independent_manager(&context)).unwrap();
+    let source =
+        CacheResidencyManager::new(PagedCacheOptions::new(2, 1 << 20, 0, 1).unwrap()).unwrap();
+    let id = source
+        .seal_block(
+            7,
+            0,
+            2,
+            None,
+            CacheBlockArrays::KeyValue {
+                keys: Array::from_slice(&[1.25f32, -2.5], &[1, 1, 2, 1]),
+                values: Array::from_slice(&[3.5f32, 4.75], &[1, 1, 2, 1]),
+            },
+            false,
+        )
+        .unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 24),
+        )
+        .unwrap();
+    let context =
+        WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
+    let prepared = source
+        .with_source_loan(
+            CacheBlockSelection::new(7, CacheRepresentation::KeyValue, 0, 2, 0),
+            &context,
+            |loan| loan.prepare_independent_manager(&context),
+        )
+        .unwrap();
     assert!(prepared.matches_source(&source, 0));
     assert!(!prepared.matches_source(&source, 1));
     let destination = prepared.destination().clone();
@@ -257,24 +346,40 @@ fn paid_independent_manager_preserves_source_namespace_pool_and_last_owner_custo
     assert_eq!(source.pool().report().unwrap().managers, 2);
     assert_eq!(source.report().unwrap().key_value_blocks, 1);
     assert_eq!(destination.report().unwrap().key_value_blocks, 0);
-    assert!(Arc::ptr_eq(&source.inner.host_demotion_worker, &destination.inner.host_demotion_worker));
-    assert!(Arc::ptr_eq(source.inner.disk_worker.as_ref().unwrap(), destination.inner.disk_worker.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(
+        &source.inner.host_demotion_worker,
+        &destination.inner.host_demotion_worker
+    ));
+    assert!(Arc::ptr_eq(
+        source.inner.disk_worker.as_ref().unwrap(),
+        destination.inner.disk_worker.as_ref().unwrap()
+    ));
     {
         let state = destination.inner.state.lock().unwrap();
         state.blocks.validate_prepared_population(1).unwrap();
         assert!(state.blocks.validate_prepared_population(2).is_err());
     }
-    let duplicate = source.pool().prepare_manager_registration(&context).unwrap()
-        .register(destination.session_id()).unwrap_err();
-    assert!(matches!(duplicate.cause(), CachePoolError::DuplicateManager { manager } if *manager == destination.session_id()));
+    let duplicate = source
+        .pool()
+        .prepare_manager_registration(&context)
+        .unwrap()
+        .register(destination.session_id())
+        .unwrap_err();
+    assert!(
+        matches!(duplicate.cause(), CachePoolError::DuplicateManager { manager } if *manager == destination.session_id())
+    );
     // No source record or array is reidentified, copied or published by this
     // destination constructor. Numerical source/copy authority remains required.
     assert!(source.inner.state.lock().unwrap().blocks.contains_key(&id));
     drop((prepared, context, funding, source));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert_eq!(destination.pool().report().unwrap().managers, 1);
     drop(destination);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(duplicate);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -1,0 +1,630 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -291,6 +291,9 @@
+     return std::allocate_shared<array::Data>(
+         submission::GraphAllocator<array::Data>(birth), buffer, deleter);
+   }
++  auto physical = submission::current_physical_funding();
++  if (physical.get()) return std::allocate_shared<array::Data>(
++      submission::GraphAllocator<array::Data>(nullptr, std::move(physical)), buffer, deleter);
+   return std::make_shared<array::Data>(buffer, deleter);
+ }
+ } // namespace
+@@ -541,7 +544,7 @@
+         // Save an independent allocator lease before destroying every field.
+         // Its deallocate returns the block (including allocation custody) before
+         // this final local lease can retire the complete arena and original Q.
+-        submission::GraphAllocator<ArrayDesc> allocator(next->allocation_quota);
++        submission::GraphAllocator<ArrayDesc> allocator(next->allocation_quota, next->allocation_funding);
+         next->~ArrayDesc();
+         allocator.deallocate(next, 1);
+       }
+@@ -567,6 +570,7 @@
+     throw;
+   }
+   value->allocation_quota = allocator.resource();
++  value->allocation_funding = allocator.physical_funding();
+   // Control failure invokes this same deleter once. Object allocation custody
+   // is independent of allocator/control lifetime, including reentrant queuing.
+   return std::shared_ptr<ArrayDesc>(value, RetireDescriptor{}, allocator);
+@@ -588,6 +592,7 @@
+     throw;
+   }
+   value->allocation_quota = allocator.resource();
++  value->allocation_funding = allocator.physical_funding();
+   return std::shared_ptr<ArrayDesc>(value, RetireDescriptor{}, allocator);
+ }
+ 
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -677,6 +677,7 @@
+     RetirementPhase retirement_phase{RetirementPhase::Expand};
+     // The object block owns a separate allocation reference beyond its control.
+     submission::GraphQuota* allocation_quota{nullptr};
++    submission::PhysicalFundingRef allocation_funding;
+ 
+     ~ArrayDesc();
+ 
+diff --git a/mlx/backend/cpu/retention.h b/mlx/backend/cpu/retention.h
+--- a/mlx/backend/cpu/retention.h
++++ b/mlx/backend/cpu/retention.h
+@@ -112,7 +112,7 @@
+ };
+ struct TemporaryDeleter {
+   void operator()(TemporaryBatch* batch) const noexcept {
+-    submission::GraphAllocator<TemporaryBatch> allocator(batch->birth.get());
++    submission::GraphAllocator<TemporaryBatch> allocator(batch->birth.get(), batch->birth.physical_funding());
+     batch->~TemporaryBatch();
+     allocator.deallocate(batch, 1);
+   }
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -176,6 +176,8 @@
+         submission::NativeControlFailure::unsupported_backend);
+     event_ = std::allocate_shared<metal::EventImpl>(
+         submission::GraphAllocator<metal::EventImpl>(binding.graph), *device, failure_);
++  } else if (auto physical = submission::current_physical_funding(); physical.get()) {
++    event_ = std::allocate_shared<metal::EventImpl>(submission::GraphAllocator<metal::EventImpl>(nullptr, std::move(physical)), metal::device(stream.device), failure_);
+   } else event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device), failure_);
+ }
+ 
+diff --git a/mlx/backend/metal/persistent_storage.h b/mlx/backend/metal/persistent_storage.h
+--- a/mlx/backend/metal/persistent_storage.h
++++ b/mlx/backend/metal/persistent_storage.h
+@@ -16,7 +16,7 @@
+ // Keep it alive across payload destruction AND the physical block return.
+ template <class Node> struct EntryDeleter {
+   void operator()(Node *node) const noexcept {
+-    submission::GraphAllocator<Node> allocator(node->birth.get());
++    submission::GraphAllocator<Node> allocator(node->birth.get(), node->birth.physical_funding());
+     node->~Node();
+     allocator.deallocate(node, 1);
+   }
+diff --git a/mlx/backend/metal/receipt.h b/mlx/backend/metal/receipt.h
+--- a/mlx/backend/metal/receipt.h
++++ b/mlx/backend/metal/receipt.h
+@@ -49,7 +49,7 @@
+           static_cast<HandlerNode*>(node)->body(buffer);
+         }, [](Handler* base) noexcept {
+           auto* node = static_cast<HandlerNode*>(base);
+-          submission::GraphAllocator<HandlerNode> allocator(node->graph.get());
++          submission::GraphAllocator<HandlerNode> allocator(node->graph.get(), node->graph.physical_funding());
+           node->~HandlerNode();
+           allocator.deallocate(node, 1);
+         }, graph, std::move(failure)), body(std::forward<U>(body)) {}
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -70,6 +70,8 @@
+         submission::NativeControlFailure::unsupported_backend);
+     event_ = std::allocate_shared<EventCounter>(
+         submission::GraphAllocator<EventCounter>(binding.graph));
++  } else if (auto physical = submission::current_physical_funding(); physical.get()) {
++    event_ = std::allocate_shared<EventCounter>(submission::GraphAllocator<EventCounter>(nullptr, std::move(physical)));
+   } else {
+     auto dtor = [](void* ptr) { delete static_cast<EventCounter*>(ptr); };
+     event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -933,3 +933,109 @@
+ }
+ 
+ } // namespace mlx::core::submission
++
++namespace mlx::core::submission {
++namespace {
++struct OrdinaryControlHeader { allocator::PhysicalBacking* root; };
++size_t ordinary_alignment(size_t alignment) noexcept {
++  return std::max(alignment, alignof(OrdinaryControlHeader));
++}
++}
++bool ordinary_control_layout(size_t bytes, size_t alignment, OrdinaryControlLayout& out) noexcept {
++  if (!alignment || (alignment & (alignment - 1))) return false;
++  const auto selected = ordinary_alignment(alignment);
++  if (sizeof(OrdinaryControlHeader) > SIZE_MAX - (selected - 1)) return false;
++  const auto prefix = (sizeof(OrdinaryControlHeader) + selected - 1) & ~(selected - 1);
++  if (bytes > SIZE_MAX - prefix) return false;
++  const auto extent = prefix + bytes;
++  const auto frames = sizeof(OrdinaryControlLayout) + sizeof(allocator::PhysicalBackingOwner) +
++      sizeof(PhysicalFundingWorkerGuard) + sizeof(PhysicalFundingRef) + 5 * sizeof(size_t) +
++      2 * sizeof(void*);
++  if (extent > SIZE_MAX - frames || extent + frames > SIZE_MAX - allocator::physical_backing_control_bytes()) return false;
++  out = {extent, selected, extent + frames + allocator::physical_backing_control_bytes()};
++  return true;
++}
++void* allocate_ordinary_control(size_t bytes, size_t alignment, const PhysicalFundingRef& funding) {
++  if (!funding.get()) throw GraphQuotaError(GraphFailure::foreign_parent);
++  OrdinaryControlLayout layout;
++  if (!ordinary_control_layout(bytes, alignment, layout)) throw GraphQuotaError(GraphFailure::invalid_layout);
++  PhysicalFundingWorkerGuard source(funding);
++  allocator::PhysicalBackingOwner root(allocator::prepare_physical_backing(
++      0, allocator::MemoryPlacement{1, -1, 0}, layout.host_controls - allocator::physical_backing_control_bytes()));
++  auto* memory = static_cast<char*>(::operator new(layout.extent, std::align_val_t(layout.alignment)));
++  try {
++    root->pointer = memory;
++    allocator::publish_physical_backing(root.get());
++  } catch (...) {
++    ::operator delete(memory, std::align_val_t(layout.alignment));
++    throw;
++  }
++  ::new(memory) OrdinaryControlHeader{root.release()};
++  return memory + layout.extent - bytes;
++}
++void deallocate_ordinary_control(void* value, size_t alignment) noexcept {
++  const auto selected = ordinary_alignment(alignment);
++  const auto prefix = (sizeof(OrdinaryControlHeader) + selected - 1) & ~(selected - 1);
++  auto* memory = static_cast<char*>(value) - prefix;
++  auto* root = reinterpret_cast<OrdinaryControlHeader*>(memory)->root;
++  ::operator delete(memory, std::align_val_t(selected));
++  allocator::destroy_physical_backing(root);
++}
++}
++
++namespace mlx::core::submission {
++bool append_ordinary_control(OrdinaryControlPopulation& out, size_t bytes,
++    size_t alignment, size_t count) noexcept {
++  if (!count) return true;
++  OrdinaryControlLayout one{};
++  if (!ordinary_control_layout(bytes, alignment, one) ||
++      count > SIZE_MAX / one.host_controls ||
++      count * one.host_controls > SIZE_MAX - out.observed_host_controls ||
++      count > SIZE_MAX - out.control_allocations) return false;
++  out.observed_host_controls += count * one.host_controls;
++  out.control_allocations += count;
++  return true;
++}
++bool ordinary_cpu_dispatch_envelope(size_t extents, OrdinaryControlPopulation& out) noexcept {
++  size_t minimum;
++  OrdinaryControlLayout overhead{};
++  if (!GraphQuota::allocation_extent(0, 1, minimum) || !minimum ||
++      !ordinary_control_layout(0, alignof(std::max_align_t), overhead)) return false;
++  const size_t attempts = extents / minimum;
++  if (attempts > SIZE_MAX / overhead.host_controls ||
++      attempts * overhead.host_controls > SIZE_MAX - extents) return false;
++  out = {extents + attempts * overhead.host_controls, attempts, 0};
++  return true;
++}
++bool ordinary_array_vector_control_layout(size_t elements, OrdinaryControlPopulation& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  OrdinaryControlPopulation value;
++  if (elements) {
++    size_t capacity = 1;
++    for (;;) {
++      if (capacity > SIZE_MAX / sizeof(array) || capacity > size_t(PTRDIFF_MAX) ||
++          !append_ordinary_control(value, capacity * sizeof(array), alignof(array))) return false;
++      if (capacity >= elements) break;
++      if (capacity > SIZE_MAX / 2) return false;
++      capacity *= 2;
++    }
++  }
++  out = value; return true;
++#endif
++}
++bool ordinary_frontend_control_layout(size_t entries, size_t seeds,
++    size_t rank, size_t operands, OrdinaryControlPopulation& out) noexcept {
++  ResidentGraphLayout source;
++  if (!resident_graph_layout_with_shells(entries, seeds, rank, operands, 0, source)) return false;
++  OrdinaryControlPopulation value;
++  // Classes 0..5 are the shared native descriptor/control, primitive/seed Data,
++  // operand and rank-vector constructors. Classes 6/7 are original C-handle
++  // slots and original backing routing; neither executes in this source.
++  for (size_t i = 0; i < 6; ++i)
++    if (!append_ordinary_control(value, source.request_bytes[i],
++          source.request_alignments[i], source.request_counts[i])) return false;
++  out = value; return true;
++}
++}
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -11,6 +11,7 @@
+ #include <utility>
+ #include <vector>
+ #include "mlx/api.h"
++#include "mlx/ordinary_control.h"
+ 
+ class ThreadPool;
+ namespace mlx::core::scheduler { struct Task; }
+@@ -133,15 +134,20 @@
+ 
+ class GraphQuotaRef {
+  public:
+-  explicit GraphQuotaRef(GraphQuota* value = nullptr) noexcept : value_(value) {
++  explicit GraphQuotaRef(GraphQuota* value = nullptr) noexcept
++      : value_(value), physical_(value ? PhysicalFundingRef{} : current_physical_funding()) {
+     if (value_) value_->retain();
+   }
+-  GraphQuotaRef(const GraphQuotaRef& other) noexcept : GraphQuotaRef(other.value_) {}
++  GraphQuotaRef(const GraphQuotaRef& other) noexcept : value_(other.value_), physical_(other.physical_) {
++    if (value_) value_->retain();
++  }
+   GraphQuotaRef& operator=(const GraphQuotaRef&) = delete;
+   ~GraphQuotaRef() { if (value_) value_->release(); }
+   GraphQuota* get() const noexcept { return value_; }
++  const PhysicalFundingRef& physical_funding() const noexcept { return physical_; }
+  private:
+   GraphQuota* value_;
++  PhysicalFundingRef physical_;
+ };
+ 
+ // Allocation-only loan of an accepted native Task's retained Graph. The queue
+@@ -170,18 +176,22 @@
+   using is_always_equal = std::false_type;
+ 
+   GraphAllocator() noexcept : GraphAllocator(current_graph_quota()) {}
+-  explicit GraphAllocator(GraphQuota* value) noexcept : quota_(value) {
++  explicit GraphAllocator(GraphQuota* value) noexcept
++      : GraphAllocator(value, value ? PhysicalFundingRef{} : current_physical_funding()) {}
++  GraphAllocator(GraphQuota* value, PhysicalFundingRef physical) noexcept
++      : quota_(value), physical_(std::move(physical)) {
+     if (quota_) quota_->retain();
+   }
+-  GraphAllocator(const GraphAllocator& other) noexcept : GraphAllocator(other.quota_) {}
++  GraphAllocator(const GraphAllocator& other) noexcept : GraphAllocator(other.quota_, other.physical_) {}
+   // A move deliberately retains the source allocator's association. Containers
+   // remain valid after moving and may allocate again, even when initially empty.
+-  GraphAllocator(GraphAllocator&& other) noexcept : GraphAllocator(other.quota_) {}
++  GraphAllocator(GraphAllocator&& other) noexcept : GraphAllocator(other.quota_, other.physical_) {}
+   template<class U> GraphAllocator(const GraphAllocator<U>& other) noexcept
+-      : GraphAllocator(other.resource()) {}
++      : GraphAllocator(other.resource(), other.physical_funding()) {}
+   GraphAllocator& operator=(const GraphAllocator& other) noexcept {
+     auto* old = quota_;
+     quota_ = other.quota_;
++    physical_ = other.physical_;
+     if (quota_) quota_->retain();
+     if (old) old->release();
+     return *this;
+@@ -192,24 +202,28 @@
+     return GraphAllocator(); // new construction selects the active domain
+   }
+   GraphQuota* resource() const noexcept { return quota_; }
++  const PhysicalFundingRef& physical_funding() const noexcept { return physical_; }
+   T* allocate(size_t count) {
+     if (count > std::numeric_limits<size_t>::max() / sizeof(T))
+       throw GraphQuotaError(GraphFailure::invalid_layout);
+     if (quota_) return static_cast<T*>(quota_->allocate(count * sizeof(T), alignof(T)));
++    if (physical_.get()) return static_cast<T*>(allocate_ordinary_control(count * sizeof(T), alignof(T), physical_));
+     return std::allocator<T>{}.allocate(count);
+   }
+   void deallocate(T* p, size_t count) noexcept {
+     if (quota_) quota_->deallocate(p, count * sizeof(T), alignof(T));
++    else if (physical_.get()) deallocate_ordinary_control(p, alignof(T));
+     else std::allocator<T>{}.deallocate(p, count);
+   }
+   template<class U> bool operator==(const GraphAllocator<U>& other) const noexcept {
+-    return quota_ == other.resource();
++    return quota_ == other.resource() && physical_.get() == other.physical_funding().get();
+   }
+   template<class U> bool operator!=(const GraphAllocator<U>& other) const noexcept {
+     return !(*this == other);
+   }
+  private:
+   GraphQuota* quota_;
++  PhysicalFundingRef physical_;
+ };
+ 
+ // This concrete native container makes constructor and fixed-destination swap
+@@ -267,10 +281,10 @@
+   return std::allocate_shared<T>(GraphAllocator<T>{}, std::forward<Args>(args)...);
+ }
+ 
+-// A retained callback whose concrete object consumes the current Graph bank.
++// A retained callback paid by its actual Graph bank or ordinary physical source.
+ // std::function stores only this shared pointer in its pinned small buffer.
+-// The shared allocator and physical block keep the arena through the final
+-// callable destructor; the callable never owns a Scope or its parent primitive.
++// The shared allocator retains that allocation source through the final callback
++// alias. The callable never owns its parent primitive.
+ template<class F> struct GraphFunctionCapture {
+   std::shared_ptr<F> value;
+   template<class... Args> decltype(auto) operator()(Args&&... args) const {
+@@ -292,7 +306,7 @@
+ template<class Signature, class F>
+ std::function<Signature> make_graph_function(F&& callable) {
+   using Value = std::remove_cvref_t<F>;
+-  if (!current_graph_quota())
++  if (!current_graph_quota() && !current_physical_funding().get())
+     return std::function<Signature>(std::forward<F>(callable));
+   if (!graph_function_control_bytes<Signature, Value>())
+     throw GraphQuotaError(GraphFailure::invalid_layout);
+diff --git a/mlx/ordinary_control.h b/mlx/ordinary_control.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/ordinary_control.h
+@@ -0,0 +1,38 @@
++// Copyright © 2026 Eredu contributors.
++#pragma once
++#include <cstddef>
++#include "mlx/api.h"
++#include "mlx/physical_funding.h"
++namespace mlx::core::submission {
++struct OrdinaryControlLayout { size_t extent, alignment, host_controls; };
++// Exact one-allocation source. Container growth/occurrence populations belong
++// to the caller; this query supplies neither capacity nor execution authority.
++MLX_API bool ordinary_control_layout(size_t bytes, size_t alignment, OrdinaryControlLayout&) noexcept;
++MLX_API void* allocate_ordinary_control(size_t bytes, size_t alignment, const PhysicalFundingRef&);
++MLX_API void deallocate_ordinary_control(void*, size_t alignment) noexcept;
++}
++
++namespace mlx::core::submission {
++struct OrdinaryControlPopulation {
++  size_t observed_host_controls{0}, control_allocations{0}, platform_events{0};
++};
++MLX_API bool append_ordinary_control(OrdinaryControlPopulation&, size_t bytes,
++    size_t alignment, size_t count = 1) noexcept;
++// A conservative allowance from the selected SAME CPU worker's finite Graph
++// request sum. Original-only framing can overstate this ordinary allowance;
++// no original budget, observer, constructor or arena is created or authenticated.
++MLX_API bool ordinary_cpu_dispatch_envelope(size_t graph_extents,
++    OrdinaryControlPopulation&) noexcept;
++MLX_API bool ordinary_frontend_control_layout(size_t entries, size_t seeds,
++    size_t rank, size_t operands, OrdinaryControlPopulation&) noexcept;
++MLX_API bool ordinary_array_vector_control_layout(size_t elements,
++    OrdinaryControlPopulation&) noexcept;
++struct OrdinaryEvalPopulation {
++  size_t roots, arrays, tape, edges, outputs, streams, captures;
++};
++// Core CPU Eval only. Caller C shells, backend workers, payload backing and
++// platform-private event overhead remain separate source contributions.
++MLX_API bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation,
++    OrdinaryControlPopulation&) noexcept;
++MLX_API bool ordinary_cpu_wait_control_layout(OrdinaryControlPopulation&) noexcept;
++}
+diff --git a/mlx/record_quota.h b/mlx/record_quota.h
+--- a/mlx/record_quota.h
++++ b/mlx/record_quota.h
+@@ -13,6 +13,7 @@
+ #include <limits>
+ 
+ #include "mlx/api.h"
++#include "mlx/ordinary_control.h"
+ 
+ namespace mlx::core::submission {
+ 
+@@ -108,21 +109,25 @@
+ template<class T> class RecordAllocator {
+  public:
+   using value_type = T;
+-  RecordAllocator(RecordQuota* value = nullptr) noexcept : quota(value) {}
+-  template<class U> RecordAllocator(const RecordAllocator<U>& other) noexcept : quota(other.quota) {}
++  RecordAllocator(RecordQuota* value = nullptr) noexcept
++      : quota(value), physical(value ? PhysicalFundingRef{} : current_physical_funding()) {}
++  template<class U> RecordAllocator(const RecordAllocator<U>& other) noexcept : quota(other.quota), physical(other.physical) {}
+   T* allocate(size_t count) {
+     if (count > std::numeric_limits<size_t>::max() / sizeof(T))
+       throw RecordQuotaError(QuotaFailure::invalid_layout);
+     if (quota) return static_cast<T*>(quota->allocate(count * sizeof(T), alignof(T)));
++    if (physical.get()) return static_cast<T*>(allocate_ordinary_control(count * sizeof(T), alignof(T), physical));
+     return std::allocator<T>{}.allocate(count);
+   }
+   void deallocate(T* pointer, size_t count) noexcept {
+     if (quota) quota->deallocate(pointer, count * sizeof(T), alignof(T));
++    else if (physical.get()) deallocate_ordinary_control(pointer, alignof(T));
+     else std::allocator<T>{}.deallocate(pointer, count);
+   }
+-  template<class U> bool operator==(const RecordAllocator<U>& other) const noexcept { return quota == other.quota; }
+-  template<class U> bool operator!=(const RecordAllocator<U>& other) const noexcept { return quota != other.quota; }
++  template<class U> bool operator==(const RecordAllocator<U>& other) const noexcept { return quota == other.quota && physical.get() == other.physical.get(); }
++  template<class U> bool operator!=(const RecordAllocator<U>& other) const noexcept { return !(*this == other); }
+   RecordQuota* quota;
++  PhysicalFundingRef physical;
+ };
+ template<class T> using RecordVector = std::vector<T, RecordAllocator<T>>;
+ template<class T> using RecordDeque = std::deque<T, RecordAllocator<T>>;
+diff --git a/mlx/scheduler_task.h b/mlx/scheduler_task.h
+--- a/mlx/scheduler_task.h
++++ b/mlx/scheduler_task.h
+@@ -55,7 +55,7 @@
+                auto* node = static_cast<TaskNode*>(task);
+                // The allocator protects the header through callable/base
+                // destruction and block return, even on the final task alias.
+-               submission::GraphAllocator<TaskNode> allocator(node->graph.get());
++               submission::GraphAllocator<TaskNode> allocator(node->graph.get(), node->graph.physical_funding());
+                auto buffers = node->buffers;
+                auto physical_funding = node->physical_funding;
+                node->~TaskNode();
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -795,7 +795,7 @@
+       buffer_budget_(active_scope ? active_scope->original_buffer_budget() : nullptr),
+       buffer_scope_identity_(active_scope ? active_scope->identity() : 0),
+       quota_(allocation.quota), streams_(resource()), captures_(resource()),
+-      outputs_(resource()), storage_limits_(limits) {
++      outputs_(resource()), storage_limits_(limits), allocation_funding_(allocation.physical) {
+   if (limits && limits->captures < initial_capture_slots)
+     throw RecordQuotaError(QuotaFailure::invalid_layout);
+   captures_.reserve(limits ? limits->captures : initial_capture_slots);
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -280,8 +280,9 @@
+     Allocation(const Allocation&) = default;
+    private:
+     friend class Record;
+-    explicit Allocation(RecordQuota* value) : quota(value) {}
++    explicit Allocation(RecordQuota* value, PhysicalFundingRef source = {}) : quota(value), physical(std::move(source)) {}
+     RecordQuota* quota;
++    PhysicalFundingRef physical;
+   };
+   struct Deleter {
+     void operator()(Record* value) const noexcept { value->destroy(); }
+@@ -291,19 +292,24 @@
+     refuse_bound_buffer_worker_submission();
+     prepare_submission_owner();
+     auto* quota = current_record_quota();
++    auto physical = quota ? PhysicalFundingRef{} : current_physical_funding();
+     if (quota) quota->retain(); // protects object construction and its failure
+     void* storage = nullptr;
+     try {
+       storage = quota ? quota->allocate(sizeof(T), alignof(T))
++                      : physical.get() ? allocate_ordinary_control(sizeof(T), alignof(T), physical)
+                       : ::operator new(sizeof(T), std::align_val_t(alignof(T)));
+-      auto* value = ::new (storage) T(Allocation(quota), std::forward<Args>(args)...);
++      auto* value = ::new (storage) T(Allocation(quota, physical), std::forward<Args>(args)...);
+       value->destroy_ = [](Record* record) noexcept {
+         auto* concrete = static_cast<T*>(record);
+         auto* arena = record->quota_;
++        auto physical = record->allocation_funding_;
+         concrete->~T();
+         if (arena) {
+           arena->deallocate(concrete, sizeof(T), alignof(T));
+           arena->release();
++        } else if (physical.get()) {
++          deallocate_ordinary_control(concrete, alignof(T));
+         } else {
+           ::operator delete(concrete, std::align_val_t(alignof(T)));
+         }
+@@ -312,6 +318,7 @@
+     } catch (...) {
+       if (storage) {
+         if (quota) quota->deallocate(storage, sizeof(T), alignof(T));
++        else if (physical.get()) deallocate_ordinary_control(storage, alignof(T));
+         else ::operator delete(storage, std::align_val_t(alignof(T)));
+       }
+       if (quota) quota->release();
+@@ -417,6 +424,7 @@
+   RecordVector<std::shared_ptr<array::Data>> captures_;
+   RecordVector<PhysicalPin> outputs_;
+   std::optional<RecordStorageLimits> storage_limits_;
++  PhysicalFundingRef allocation_funding_;
+   Record* previous_capture_{nullptr};
+   bool capture_active_{false};
+   bool eval_prologue_active_{false};
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -2106,3 +2106,126 @@
+ }
+ 
+ } // namespace mlx::core
++
++namespace mlx::core::submission {
++namespace {
++bool ordinary_add(size_t a, size_t b, size_t& out) noexcept {
++  if (b > SIZE_MAX - a) return false;
++  out = a + b; return true;
++}
++template<class T> bool ordinary_items(OrdinaryControlPopulation& out,
++    size_t items, size_t occurrences = 1) noexcept {
++  if (items > SIZE_MAX / sizeof(T) || items > size_t(PTRDIFF_MAX)) return false;
++  return !items || append_ordinary_control(out, items * sizeof(T), alignof(T), occurrences);
++}
++template<class T> bool ordinary_deque(OrdinaryControlPopulation& out, size_t pushes) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106
++  if (!pushes) return true;
++  // Pinned libc++ deque's one-element push allocates at most one fixed block.
++  // Map capacity only grows geometrically and never shrinks during this worker.
++  // Counting one block per push is a conservative finite source allowance;
++  // actual block reuse is charged only once by the physical observer.
++  constexpr size_t block = std::__deque_block_size<T, ptrdiff_t>::value;
++  if (!ordinary_items<T>(out, block, pushes)) return false;
++  size_t capacity = 1;
++  for (;;) {
++    if (!ordinary_items<T*>(out, capacity)) return false;
++    if (capacity >= pushes) break;
++    if (capacity > SIZE_MAX / 2) return false;
++    capacity *= 2;
++  }
++  return true;
++#else
++  return false;
++#endif
++}
++template<class V> bool ordinary_hash(OrdinaryControlPopulation& out,
++    size_t nodes, size_t attempts) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106
++  using Value = std::__hash_value_type<uintptr_t, V>;
++  using Node = std::__hash_node<Value, void*>;
++  if (!ordinary_items<Node>(out, 1, attempts)) return false;
++  if (!nodes) return true;
++  // __node_insert_unique_prepare grows to next_prime(max(2*buckets+1,size))
++  // at load factor one. Bound every growth by the last possible request; the
++  // preceding capacity at a growth is less than the selected node population.
++  if (nodes > (SIZE_MAX - 1) / 2) return false;
++  size_t buckets;
++  try { buckets = std::__next_prime(2 * nodes + 1); } catch (...) { return false; }
++  size_t grows = 1, threshold = 2;
++  while (threshold < nodes) {
++    if (threshold > SIZE_MAX / 2 || grows == SIZE_MAX) return false;
++    threshold *= 2; ++grows;
++  }
++  return ordinary_items<void*>(out, buckets, grows);
++#else
++  return false;
++#endif
++}
++}
++bool ordinary_cpu_wait_control_layout(OrdinaryControlPopulation& out) noexcept {
++  CompletionWaitRecordLayout record;
++  EventDispatchControlLayout dispatch;
++  if (!completion_wait_record_layout(record) || !event_dispatch_control_layout(dispatch)) return false;
++  OrdinaryControlPopulation value;
++  if (!append_ordinary_control(value, record.object_bytes, record.object_alignment) ||
++      !append_ordinary_control(value, record.capture_bytes, record.capture_alignment) ||
++      !append_ordinary_control(value, record.stream_bytes, record.stream_alignment) ||
++      !append_ordinary_control(value, dispatch.cpu_wait_bytes, dispatch.cpu_wait_alignment)) return false;
++  out = value; return true;
++}
++bool ordinary_cpu_eval_control_layout(OrdinaryEvalPopulation p,
++    OrdinaryControlPopulation& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  if (!p.roots || !p.arrays || !p.tape || p.tape > p.arrays ||
++      p.streams != 1 || p.outputs < p.tape ||
++      p.roots > p.edges || p.arrays > size_t(INT_MAX) ||
++      p.edges > size_t(INT_MAX) || p.tape > size_t(INT_MAX)) return false;
++  RecordFrontierStorageLayout base;
++  EventControlLayout event;
++  EventDispatchControlLayout dispatch;
++  EvalGraphLayout graph;
++  if (!Record::frontier_storage_layout(p.streams, p.outputs, base) ||
++      !event_control_layout(event) || !event_dispatch_control_layout(dispatch) ||
++      !eval_graph_layout(graph)) return false;
++  OrdinaryControlPopulation value;
++  if (!append_ordinary_control(value, sizeof(EvalSubmissionRecord), alignof(EvalSubmissionRecord))) return false;
++  // Captures clear between primitives. libc++ emplace growth doubles the
++  // capacity, preserving every prior allocation's actual simultaneous lifetime.
++  size_t captures = base.fixed.capture_slots;
++  for (;;) {
++    if (!ordinary_items<std::shared_ptr<array::Data>>(value, captures)) return false;
++    if (captures >= p.captures) break;
++    if (captures > SIZE_MAX / 2) return false;
++    captures *= 2;
++  }
++  if (!append_ordinary_control(value, base.fixed.stream_bytes, base.fixed.stream_alignment) ||
++      !append_ordinary_control(value, base.output_bytes, base.output_alignment) ||
++      !ordinary_items<EvaluationStream>(value, p.streams) ||
++      !ordinary_items<std::shared_ptr<Primitive>>(value, p.tape) ||
++      !ordinary_deque<array>(value, p.tape) ||
++      !ordinary_hash<int>(value, p.arrays, p.arrays) ||
++      !ordinary_hash<EvalFenceValue>(value, p.arrays, p.edges)) return false;
++  size_t dfs_pushes;
++  if (!ordinary_add(p.arrays, p.edges, dfs_pushes) ||
++      !ordinary_deque<EvalDfsEntry>(value, dfs_pushes) ||
++      !ordinary_items<std::__tree_node<Stream, void*>>(value, 1, p.tape)) return false;
++  // Synchronizer, descriptor and shared descriptor owner. The fourth query
++  // request is its Event, included with the per-stream Event population below.
++  for (size_t i = 0; i < 3; ++i)
++    if (!append_ordinary_control(value, graph.request_bytes[i], graph.request_alignments[i])) return false;
++  if (!ordinary_items<array>(value, p.roots)) return false;
++  size_t events, waits;
++  if (!ordinary_add(p.streams, p.streams, events) ||
++      !ordinary_add(p.edges, p.streams, waits) ||
++      !append_ordinary_control(value, event.shared_bytes, event.shared_alignment, events) ||
++      !append_ordinary_control(value, dispatch.cpu_signal_bytes, dispatch.cpu_signal_alignment, events) ||
++      !append_ordinary_control(value, dispatch.cpu_wait_bytes, dispatch.cpu_wait_alignment, waits) ||
++      (event.platform_events && events > SIZE_MAX / event.platform_events)) return false;
++  value.platform_events = events * event.platform_events;
++  out = value; return true;
++#endif
++}
++}

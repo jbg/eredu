@@ -2,14 +2,16 @@
 use super::*;
 use crate::backend::runtime::distributed::topology::AcceptedCommunicationSource;
 impl ReadyCompletionResources {
-    pub(crate) fn submit_accepted(self,accepted:&AcceptedCommunicationSource<'_>)
-        ->Result<OriginalCommunicationCompletion,Error>{
+    pub(super) fn accepted_entry_control_bytes()->Option<usize> {
         let parts=[size_of::<(&Self,&AcceptedCommunicationSource<'_>)>(),
             size_of::<Result<OriginalCommunicationCompletion,Error>>(),
             size_of::<safemlx::OperationEvalTraversalLayout>(),size_of::<bool>(),
-            error_control_bytes().ok_or_else(overflow)?];
-        self.custody.funding.reserve_metadata(parts.into_iter()
-            .try_fold(size_of_val(&parts),usize::checked_add).ok_or_else(overflow)?)
+            error_control_bytes()?];
+        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+    }
+    pub(crate) fn submit_accepted(self,accepted:&AcceptedCommunicationSource<'_>)
+        ->Result<OriginalCommunicationCompletion,Error>{
+        self.custody.funding.reserve_metadata(Self::accepted_entry_control_bytes().ok_or_else(overflow)?)
             .map_err(Error::WorkspacePlanning)?;
         let exact=match &self.recovery {
             PreparedCompletionRecovery::Original{traversal,..}=>*traversal==accepted.traversal(),

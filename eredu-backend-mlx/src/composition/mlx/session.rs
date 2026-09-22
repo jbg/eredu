@@ -29,13 +29,10 @@ use crate::{
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::SpeculativeCapability;
-use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
+use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions};
 use eredu_runtime::CacheResidencyPolicy;
 
-use super::{
-    Executable, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,
-    execution::prefill_model,
-};
+use super::{Executable, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel};
 
 pub(crate) mod bounded_capture;
 pub(in crate::composition::mlx) mod capture_workspace;
@@ -53,12 +50,14 @@ pub(super) use crate::backend::submission_recovery as recovery;
 
 pub use generation::{MlxTextGenerationState, MlxTextSamplingState};
 pub(crate) use model_session::{CompletedOriginalModelInput, OriginalInterventionDeclaration};
-pub(in crate::composition::mlx) use model_session::SpeculativePartitionBinding;
 pub use model_session::{
-    MlxControlInput, MlxHostInputUploadError, MlxModelInput, MlxModelSession, MlxNativeTextState,
+    MlxHostInputUploadError, MlxModelInput, MlxModelSession, MlxNativeTextState,
     MlxOriginalPreparedModelInput, MlxOriginalPreparedNativeInput, MlxPreparedInputMaterializer,
     MlxPreparedModelInputBindError, MlxPreparedModelInputError, MlxPreparedModelInputPlan,
     MlxPreparedNativeInputError, MlxPreparedNativeInputPlan,
+};
+pub(in crate::composition::mlx) use model_session::{
+    OriginalModelPartitionPreparation, OriginalModelPartitionSource, SpeculativePartitionBinding,
 };
 pub use output_completion::{
     MlxModelOutput, MlxSessionCompletion, MlxTextCompletion, MlxTextToken,
@@ -75,3 +74,19 @@ use output_completion::MlxSessionCompletionKind;
 mod recovery_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+pub(in crate::composition::mlx) use model_session::saved_array_copy::decoder::tests as paired_copy_fixture;
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+pub(in crate::composition::mlx) use model_session::saved_array_copy::decoder::resume_driver::failure_tests as resume_failure_fixture;

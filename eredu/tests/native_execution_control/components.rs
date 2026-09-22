@@ -97,12 +97,10 @@ fn component_masks_with_device(
             eredu_core::ObservationSupportStatus::Supported
         );
         assert!(point.operations.contains(&InterventionKind::MaskComponents));
-        assert!(
-            !discovery
-                .points
-                .iter()
-                .any(|p| p.path == format!("{path}.effective"))
-        );
+        assert!(!discovery
+            .points
+            .iter()
+            .any(|p| p.path == format!("{path}.effective")));
     }
     let chat = model
         .source_chat(ChatTemplateRequest {
@@ -210,7 +208,6 @@ fn component_masks_with_device(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -236,7 +233,7 @@ fn component_masks_with_device(
     let baseline_prefix = prefix.clone();
     let baseline_capture = capture.clone();
     let baseline_trace = trace;
-    let mut baseline = PreparedChatRequest::new(&chat, original_settings(settings));
+    let mut baseline = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
     baseline.input = PreparedChatPrompt::TokenIds(&baseline_prefix);
     baseline.output_mode = PreparedChatOutputMode::Text;
     baseline.capture = Some(&baseline_capture);
@@ -272,7 +269,7 @@ fn component_masks_with_device(
     let trial_capture = capture.clone();
     let trial_trace = trace;
     let trial_intervention = plan.clone();
-    let mut trial = PreparedChatRequest::new(&chat, original_settings(settings));
+    let mut trial = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
     trial.input = PreparedChatPrompt::TokenIds(&trial_prefix);
     trial.output_mode = PreparedChatOutputMode::Text;
     trial.capture = Some(&trial_capture);
@@ -337,7 +334,7 @@ fn component_masks_with_device(
     let trial_capture = capture;
     let trial_trace = trace;
     let trial_intervention = plan;
-    let mut trial = PreparedChatRequest::new(&chat, original_settings(settings));
+    let mut trial = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
     trial.input = PreparedChatPrompt::TokenIds(&trial_prefix);
     trial.output_mode = PreparedChatOutputMode::Text;
     trial.capture = Some(&trial_capture);
@@ -360,7 +357,7 @@ fn component_masks_with_device(
                 retained_bytes: 64 << 20,
                 cumulative_copy_bytes: 256 << 20,
             },
-            ORIGINAL_CAPACITY,
+            native_limits(ORIGINAL_CAPACITY),
             copy_limits(),
         )
         .unwrap();

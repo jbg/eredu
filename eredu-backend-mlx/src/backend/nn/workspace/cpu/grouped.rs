@@ -4,12 +4,24 @@
 use super::*;
 use safemlx::Dtype;
 mod descriptor;
+mod ordinary;
 mod program;
-use descriptor::{Activation, Descriptor, Projection};
 use super::program::Program;
 
+pub(super) fn ordinary_call_controls(
+    operation: WorkspaceOperationView<'_>,
+) -> Option<super::ordinary_calls::OrdinaryCallControls> {
+    ordinary::inspect(operation, false)
+}
+pub(super) fn ordinary_metal_call_controls(
+    operation: WorkspaceOperationView<'_>,
+) -> Option<super::ordinary_calls::OrdinaryCallControls> {
+    ordinary::inspect(operation, true)
+}
+use descriptor::{Activation, Descriptor, Projection};
+
 fn invalid() -> MlxWorkspaceFactError {
-    MlxWorkspaceFactError::descriptor("CPU grouped source geometry differs")
+    MlxWorkspaceFactError::descriptor("dense grouped source geometry differs")
 }
 
 fn retained(d: Descriptor, mechanism: MlxCpuWorkspaceMechanisms) -> facts::FactResult<[u64; 4]> {
@@ -246,7 +258,15 @@ pub(super) fn inspect(
         rank: d.input_rank.max(3),
         parameter_shells: total.shells,
         seeds: total.seeds,
-        validations: total.validations,
+        // Ordinary packed gated/relu2 skip original_group_indices. Linear
+        // uses the shared ordinary token-domain assertion instead. The native
+        // Program retains its conservative predicate DAG as unused allowance,
+        // but completion collectors count only predicates actually registered.
+        validations: if mechanism.allocation.original_storage {
+            total.validations
+        } else {
+            usize::from(before && matches!(d.activation, Activation::Linear(_)))
+        },
     }))
 }
 

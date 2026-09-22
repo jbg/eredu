@@ -1,6 +1,6 @@
 //! A prospective sampler replacement bound to one quiescent original run.
-use super::*;
 use super::control::validate;
+use super::*;
 use eredu_core::HostMetadataFunding;
 use std::mem::{size_of, size_of_val};
 
@@ -159,10 +159,7 @@ impl SamplingExtensionBinding {
         step: &InferenceTextStep,
     ) -> Result<u64, WorkingMemoryError> {
         self.request.validate_same_request(step.request())?;
-        let reservation = self
-            .request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = self.request.memory_reservation();
         let (actual, attempt) = step.original_scope_identity(reservation)?;
         if !Arc::ptr_eq(
             &actual,

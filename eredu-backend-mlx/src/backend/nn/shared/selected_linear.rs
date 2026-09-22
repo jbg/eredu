@@ -20,6 +20,20 @@ pub struct MlxGroupedLinear {
 }
 
 impl MlxGroupedLinear {
+    pub(super) fn construction_metadata_bytes(spec: &GroupedLinearSpec) -> Option<usize> {
+        use super::grouped_construction::Constructor;
+        let projection = spec.projection();
+        let rows = Self::local_bindings(spec).into_iter().flatten().count();
+        let mut bytes = Constructor::control_bytes::<Self>(rows)?
+            .checked_add(Constructor::parameter_metadata_bytes(projection.weight(), None)?)?;
+        for source in [projection.format().scale(), projection.format().affine_bias()].into_iter().flatten() {
+            bytes = bytes.checked_add(Constructor::parameter_metadata_bytes(source, Some(projection.weight()))?)?;
+        }
+        if let Some(source) = projection.bias() {
+            bytes = bytes.checked_add(Constructor::parameter_metadata_bytes(source, None)?)?;
+        }
+        Some(bytes)
+    }
     pub(crate) fn original_fp8_control_bytes() -> Option<usize> {
         original::control_bytes()
     }

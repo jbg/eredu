@@ -5,9 +5,9 @@ use crate::working_memory::{
 };
 use crate::{ConfiguredTextSampler, PenaltyConfig, SamplingBackend, TokenDomain};
 use eredu_core::{
-    cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
-    InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig,
-    StateMemoryLayout, TextGenerationConfig, TokenFilter, WorkspaceBound,
+    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
+    InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig, StateMemoryLayout,
+    TextGenerationConfig, TokenFilter, WorkspaceBound, cache::LayerCachePolicy,
 };
 use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceDtype, WorkspaceExistingStorage, WorkspaceHostBound,
@@ -60,7 +60,7 @@ fn config(outputs: usize, adaptive: bool) -> TextGenerationConfig {
 // The generous source envelope covers this fixture's complete host work; it is
 // not a synthetic assertion about native model workspace or snapshot support.
 fn prepared_request(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     outputs: usize,
     adaptive: bool,
@@ -73,7 +73,7 @@ fn prepared_request(
 }
 
 fn prepared_request_with_bytes(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     outputs: usize,
     adaptive: bool,
@@ -109,8 +109,13 @@ fn prepared_request_with_bytes(
     )
     .unwrap();
     let bound = |bytes| WorkspaceBound::bounded(bytes, "portable scalar sampler host envelope");
-    let state = state
+    let mut state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: Some(crate::working_memory::memory_fixture::host_workspace(
+                pool,
+                geometry,
+                source_bytes,
+            )),
             geometry,
             activations: bound(source_bytes),
             attention: bound(0),
@@ -120,27 +125,35 @@ fn prepared_request_with_bytes(
             retained: bound(0),
         })
         .unwrap();
+    state.physical_domains = Some(crate::working_memory::memory_fixture::empty_state(
+        pool, geometry,
+    ));
     let reservation: WorkingMemoryReservation = pool
         .reserve_with_capacity(
             &execution,
             &Admission {
+                memory_limits: crate::working_memory::memory_fixture::host_limits(capacity),
+                additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
                 requested_positions: 1 + outputs as u64,
                 state,
-                incremental_required_bytes: source_bytes,
-                available_memory_bytes: None,
+                incremental_required_bytes: Some(source_bytes),
             },
-            capacity,
+            crate::working_memory::memory_fixture::host_limits(capacity)
+                .resolve(pool.topology())
+                .unwrap(),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let request = InferenceRequest::from(reservation);
     let config = config(outputs, adaptive);
-    let preparation = request.prepare_text(&execution, geometry, config).unwrap();
+    let preparation = request
+        .prepare_text(&execution, geometry, config.clone())
+        .unwrap();
     (preparation, run, config)
 }
 
 fn source(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     outputs: usize,
     adaptive: bool,
@@ -151,7 +164,7 @@ fn source(
 ) {
     let (preparation, run, config) = prepared_request(pool, capacity, outputs, adaptive);
     let (sampler, completion) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_sampler(run.sampler_scope().unwrap())
         .unwrap();
@@ -258,9 +271,40 @@ fn history(sampler: &ConfiguredTextSampler) -> &[u32] {
 struct Facts {
     missing_tensor: bool,
     missing_host: bool,
+    physical: Option<(
+        std::sync::Arc<eredu_core::MemoryTopology>,
+        eredu_core::MemoryPlacement,
+    )>,
+}
+
+impl Facts {
+    pub(super) fn with_pool(mut self, pool: &MemoryLedger) -> Self {
+        self.physical = Some((
+            pool.topology_handle(),
+            (*pool.host_placement_handle()).clone(),
+        ));
+        self
+    }
 }
 
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        self.physical.as_ref().map(|value| value.0.as_ref())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        self.physical.as_ref().map(|value| &value.1)
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        self.physical.as_ref().map(|value| &value.1)
+    }
+
     fn operation_bound(
         &self,
         operation: &WorkspaceOperation,
@@ -302,14 +346,19 @@ const COPY_BYTES: u64 = 48; // two padded outputs, two scratch and two host boun
 const ARRAY_SOURCE_BYTES: u64 = 64;
 
 fn plan_parts(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     key: u32,
     source_bytes: u64,
     copies: usize,
     facts: Facts,
 ) -> (WorkspaceIsolatedCopyPlan, RegisteredWorkspaceStorage<u32>) {
-    let context = WorkspaceContext::new(facts);
-    let root = WorkspaceExistingStorage::new(Some(source_bytes), &context);
+    let context = WorkspaceContext::new(facts.with_pool(pool));
+    let root = WorkspaceExistingStorage::try_new_placed(
+        Some(source_bytes),
+        &pool.host_placement_handle(),
+        &context,
+    )
+    .unwrap();
     let source = RegisteredWorkspaceStorage::bind(pool, &context, [(key, root.clone())]).unwrap();
     let sources = (0..copies)
         .map(|_| {
@@ -327,7 +376,7 @@ fn plan_parts(
 }
 
 fn copy_plan(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     key: u32,
     source_bytes: u64,
     copies: usize,
@@ -337,21 +386,38 @@ fn copy_plan(
     RegisteredWorkspaceCopy::bind(plan, source).unwrap()
 }
 
-fn usage(pool: &WorkingMemoryPool) -> (u64, u64, u64) {
+fn usage(pool: &MemoryLedger) -> (u64, u64, u64) {
     (
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
-        pool.effective_capacity().unwrap(),
+        pool.payload_used_bytes().unwrap(),
+        pool.payload_peak_bytes().unwrap(),
+        pool.payload_effective_capacity().unwrap(),
     )
 }
 
 fn joint<'a>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: BorrowedFundedSampler<'a>,
 ) -> RegisteredSamplingCopy<'a, u32> {
     RegisteredSamplingCopy::prepare(source, copy_plan(pool, 1, ARRAY_SOURCE_BYTES, 1)).unwrap()
 }
 
+fn current(pool: &MemoryLedger) -> u64 {
+    let snapshot = pool.snapshot().unwrap();
+    let host = snapshot
+        .domains
+        .iter()
+        .find(|d| d.domain == pool.topology().host_domain())
+        .unwrap();
+    host.current_charge_bytes - host.fixed_baseline.total().unwrap()
+}
+fn full_copy_bytes(pool: &MemoryLedger, copy: &RegisteredSamplingCopy<'_, u32>) -> u64 {
+    pool.sampling_copy_requirements(copy, &WorkspaceCopyLimits::default())
+        .unwrap()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap()
+}
 fn settle(copied: (FundedSamplerCopy, AdmittedWorkspaceCopy)) {
     let (sampler, arrays) = copied;
     let (custody, scope) = arrays.into_parts();
@@ -362,9 +428,11 @@ fn settle(copied: (FundedSamplerCopy, AdmittedWorkspaceCopy)) {
 #[test]
 fn exact_joint_admission_copies_real_standard_and_adaptive_history_once() {
     for adaptive in [false, true] {
-        let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-        let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-        let (mut sampler, preparation, run) = source(&pool, 8192, 8, adaptive);
+        let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+        let physical = pool
+            .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+            .unwrap();
+        let (mut sampler, preparation, run) = source(&pool, (1 << 20), 8, adaptive);
         grow(&mut sampler, &[3, 11, 7, 19, 5]);
         let plan = sampler.as_sampler().prepare_copy().unwrap();
         assert_eq!((plan.history_len(), plan.history_capacity()), (5, 8));
@@ -374,15 +442,18 @@ fn exact_joint_admission_copies_real_standard_and_adaptive_history_once() {
         let before_attempts = attempts();
         let bytes = host + COPY_BYTES;
         assert_eq!(
-            joint(&pool, sampler.borrow_funded()).required_bytes(),
+            joint(&pool, sampler.borrow_funded())
+                .required_bytes()
+                .unwrap(),
             bytes
         );
-        let capacity = before.0 + bytes;
+        let rejected = joint(&pool, sampler.borrow_funded());
+        let full = full_copy_bytes(&pool, &rejected);
+        let capacity = current(&pool) + full;
+        let before = usage(&pool);
         assert!(matches!(
-            pool.copy_sampling_components(joint(&pool, sampler.borrow_funded()), WorkspaceCopyLimits::new(capacity - 1)),
-            Err(SamplingCopyAdmissionError::Memory(WorkingMemoryError::BudgetExceeded {
-                required_bytes, available_bytes,
-            })) if required_bytes == bytes && available_bytes == bytes - 1
+            pool.copy_sampling_components(rejected, WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(capacity - 1))),
+            Err(SamplingCopyAdmissionError::Memory(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))) if required_bytes == full && limit_bytes - existing_bytes == full - 1
         ));
         assert_eq!(usage(&pool), before);
         assert_eq!(attempts(), before_attempts);
@@ -390,13 +461,26 @@ fn exact_joint_admission_copies_real_standard_and_adaptive_history_once() {
         let (copied, arrays) = pool
             .copy_sampling_components(
                 joint(&pool, sampler.borrow_funded()),
-                WorkspaceCopyLimits::new(capacity),
+                WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                    capacity,
+                )),
             )
             .unwrap();
         assert_eq!(pool.0.usage.lock().unwrap().funding.len(), accounts + 1);
         assert_eq!(attempts(), before_attempts + 1);
-        assert_eq!((copied.bytes(), arrays.bytes()), (host, bytes));
-        assert_eq!(usage(&pool), (capacity, capacity, capacity));
+        assert_eq!(
+            (
+                copied.bytes(),
+                arrays
+                    .requirements()
+                    .get(pool.topology().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap()
+            ),
+            (host, full)
+        );
+        assert_eq!(usage(&pool), (before.0 + bytes, capacity, capacity));
         assert_eq!(history(copied.as_sampler()), &[3, 11, 7, 19, 5]);
         assert_ne!(
             history(copied.as_sampler()).as_ptr(),
@@ -416,60 +500,88 @@ fn exact_joint_admission_copies_real_standard_and_adaptive_history_once() {
         grow(&mut sampler, &[29]);
         assert_eq!(history(copied.as_sampler()), &[3, 11, 7, 19, 5]);
         drop((sampler, preparation, run, physical));
-        assert_eq!(pool.used_bytes().unwrap(), ARRAY_SOURCE_BYTES + bytes);
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            ARRAY_SOURCE_BYTES + bytes
+        );
         let (custody, scope) = arrays.into_parts();
         scope.certify().unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         drop((copied, custody));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.effective_capacity().unwrap(), 8192);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_effective_capacity().unwrap(), (1 << 20));
     }
 }
 
 #[test]
-fn safety_and_application_limits_price_the_combined_account_before_copying() {
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let _physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, _preparation, _run) = source(&pool, 8192, 8, false);
-    let required = joint(&pool, sampler.borrow_funded()).required_bytes();
+fn domain_limits_and_headroom_price_the_combined_account_before_copying() {
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let _physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, _preparation, _run) = source(&pool, (1 << 20), 8, false);
+    let copy = joint(&pool, sampler.borrow_funded());
+    let payload = copy.required_bytes().unwrap();
+    let required = full_copy_bytes(&pool, &copy);
+    let initial = current(&pool);
     let before = usage(&pool);
     let before_attempts = attempts();
-    let mut limits = WorkspaceCopyLimits::new(8192);
-    limits.safety_reserve_bytes = 7;
-    limits.application_memory_budget_bytes = Some(required + 6);
-    assert!(matches!(
-        pool.copy_sampling_components(joint(&pool, sampler.borrow_funded()), limits),
-        Err(SamplingCopyAdmissionError::ApplicationBudgetExceeded { required_bytes, budget_bytes })
-            if required_bytes == required + 7 && budget_bytes == required + 6
+    let mut limits = WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+        (1 << 20),
     ));
-    limits.safety_reserve_bytes = u64::MAX;
+    limits.additional_headroom = eredu_core::MemoryHeadroomDeclarations::new([("host".into(), 7)]);
+    limits.memory_limits =
+        crate::working_memory::memory_fixture::host_limits(initial + required + 6);
     assert!(matches!(
-        pool.copy_sampling_components(joint(&pool, sampler.borrow_funded()), limits),
+        pool.copy_sampling_components(copy, limits.clone()),
+        Err(SamplingCopyAdmissionError::Memory(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })))
+            if required_bytes == required + 7 && limit_bytes - existing_bytes == required + 6
+    ));
+    limits.additional_headroom =
+        eredu_core::MemoryHeadroomDeclarations::new([("host".into(), u64::MAX)]);
+    assert!(matches!(
+        pool.copy_sampling_components(joint(&pool, sampler.borrow_funded()), limits.clone()),
         Err(SamplingCopyAdmissionError::Memory(
             WorkingMemoryError::Overflow
+                | WorkingMemoryError::Domain(eredu_core::MemoryDomainError::Overflow)
         ))
     ));
     assert_eq!(usage(&pool), before);
     assert_eq!(attempts(), before_attempts);
-    limits.safety_reserve_bytes = 7;
-    limits.application_memory_budget_bytes = Some(required + 7);
-    limits.capacity_bytes = before.0 + required + 7;
+    limits.additional_headroom = eredu_core::MemoryHeadroomDeclarations::new([("host".into(), 7)]);
+    limits.memory_limits =
+        crate::working_memory::memory_fixture::host_limits(initial + required + 7);
+    limits.memory_limits =
+        crate::working_memory::memory_fixture::host_limits(initial + required + 7);
     let copied = pool
-        .copy_sampling_components(joint(&pool, sampler.borrow_funded()), limits)
+        .copy_sampling_components(joint(&pool, sampler.borrow_funded()), limits.clone())
         .unwrap();
-    assert_eq!(copied.1.bytes(), required + 7);
-    assert_eq!(copied.0.bytes(), required - COPY_BYTES);
+    assert_eq!(
+        copied
+            .1
+            .requirements()
+            .get(pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
+        required + 7
+    );
+    assert_eq!(copied.0.bytes(), payload - COPY_BYTES);
     settle(copied);
-    assert_eq!(pool.used_bytes().unwrap(), before.0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before.0);
 }
 
 #[test]
 fn each_source_domain_is_checked_before_one_joint_commit() {
-    let a = WorkingMemoryPool::new(8192, 0).unwrap();
-    let b = WorkingMemoryPool::new(8192, 0).unwrap();
-    let _arrays_a = a.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let _arrays_b = b.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, _preparation, _run) = source(&a, 8192, 8, false);
+    let a = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let b = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let _arrays_a = a
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let _arrays_b = b
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, _preparation, _run) = source(&a, (1 << 20), 8, false);
     let before = (usage(&a), usage(&b), attempts());
     // A genuine sampler from A cannot be authenticated by B's array proof,
     // and A cannot admit the independently valid but foreign array proof.
@@ -480,7 +592,12 @@ fn each_source_domain_is_checked_before_one_joint_commit() {
         )
         .unwrap();
         assert!(matches!(
-            destination.copy_sampling_components(plan, WorkspaceCopyLimits::new(8192)),
+            destination.copy_sampling_components(
+                plan,
+                WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                    (1 << 20)
+                ))
+            ),
             Err(SamplingCopyAdmissionError::Memory(
                 WorkingMemoryError::IdentityMismatch
             ))
@@ -491,31 +608,42 @@ fn each_source_domain_is_checked_before_one_joint_commit() {
 
 #[test]
 fn either_source_quarantined_after_preparation_rejects_without_destination_mutation() {
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let _physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, _preparation, run) = source(&pool, 8192, 8, false);
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let _physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, _preparation, run) = source(&pool, (1 << 20), 8, false);
     let plan = joint(&pool, sampler.borrow_funded());
     drop(run.scope().unwrap());
     let before = (usage(&pool), attempts());
     assert!(matches!(
-        pool.copy_sampling_components(plan, WorkspaceCopyLimits::new(8192)),
+        pool.copy_sampling_components(
+            plan,
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20)
+            ))
+        ),
         Err(SamplingCopyAdmissionError::Memory(
             WorkingMemoryError::ExecutionFenced
         ))
     ));
     assert_eq!((usage(&pool), attempts()), before);
 
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let _physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, _preparation, _run) = source(&pool, 8192, 8, false);
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let _physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, _preparation, _run) = source(&pool, (1 << 20), 8, false);
     let origin = pool
         .admit_workspace_copy(
             copy_plan(&pool, 1, ARRAY_SOURCE_BYTES, 1),
-            WorkspaceCopyLimits::new(8192),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
         )
         .unwrap();
     let (origin, scope) = origin.into_parts();
-    let _registered = scope.adopt_storage_individually([(2u32, 16)]).unwrap();
+    let _registered = scope.publish_host_storage_fixture([(2u32, 16)]).unwrap();
     let plan = RegisteredSamplingCopy::prepare(sampler.borrow_funded(), copy_plan(&pool, 2, 16, 1))
         .unwrap();
     // The source was healthy during preparation. Admission must recheck its
@@ -523,7 +651,12 @@ fn either_source_quarantined_after_preparation_rejects_without_destination_mutat
     drop(scope);
     let before = (usage(&pool), attempts());
     assert!(matches!(
-        pool.copy_sampling_components(plan, WorkspaceCopyLimits::new(8192)),
+        pool.copy_sampling_components(
+            plan,
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20)
+            ))
+        ),
         Err(SamplingCopyAdmissionError::Memory(
             WorkingMemoryError::ExecutionFenced
         ))
@@ -534,9 +667,11 @@ fn either_source_quarantined_after_preparation_rejects_without_destination_mutat
 
 #[test]
 fn native_adoption_cannot_spend_history_hold_and_alias_credit_is_not_double_counted() {
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (mut sampler, preparation, run) = source(&pool, 8192, 8, false);
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (mut sampler, preparation, run) = source(&pool, (1 << 20), 8, false);
     grow(&mut sampler, &[3, 11, 7, 19, 5]);
     let host = sampler
         .as_sampler()
@@ -546,21 +681,24 @@ fn native_adoption_cannot_spend_history_hold_and_alias_credit_is_not_double_coun
     let (copied, native) = pool
         .copy_sampling_components(
             joint(&pool, sampler.borrow_funded()),
-            WorkspaceCopyLimits::new(8192),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
     drop((sampler, preparation, run, physical));
     let mut outputs = scope
-        .adopt_storage_individually([(1u32, ARRAY_SOURCE_BYTES), (2, COPY_BYTES)])
+        .publish_host_storage_fixture([(1u32, ARRAY_SOURCE_BYTES), (2, COPY_BYTES)])
         .unwrap();
     let alias = outputs.remove(&1).unwrap();
     let before = usage(&pool);
     assert!(matches!(
-        scope.adopt_storage_individually([(3u32, 1)]),
-        Err(WorkingMemoryError::BudgetExceeded {
+        scope.publish_host_storage_fixture([(3u32, 1)]),
+        Err(WorkingMemoryError::DomainAllowanceExceeded {
             required_bytes: 1,
-            available_bytes: 0
+            available_bytes: 0,
+            ..
         })
     ));
     assert_eq!(usage(&pool), before);
@@ -568,55 +706,69 @@ fn native_adoption_cannot_spend_history_hold_and_alias_credit_is_not_double_coun
     // host hold still blocks over-adoption when the credit is used again.
     drop(outputs);
     let output = scope
-        .adopt_storage_individually([(2u32, COPY_BYTES)])
+        .publish_host_storage_fixture([(2u32, COPY_BYTES)])
         .unwrap();
     assert!(matches!(
-        scope.adopt_storage_individually([(3u32, 1)]),
-        Err(WorkingMemoryError::BudgetExceeded {
+        scope.publish_host_storage_fixture([(3u32, 1)]),
+        Err(WorkingMemoryError::DomainAllowanceExceeded {
             available_bytes: 0,
             ..
         })
     ));
     drop(alias);
     scope.certify().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), host + COPY_BYTES);
+    assert_eq!(pool.payload_used_bytes().unwrap(), host + COPY_BYTES);
     assert!(matches!(
         pool.pin_registered_storage([(1u32, ARRAY_SOURCE_BYTES)]),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop(custody);
-    assert_eq!(pool.used_bytes().unwrap(), host + COPY_BYTES);
+    assert_eq!(pool.payload_used_bytes().unwrap(), host + COPY_BYTES);
     drop(copied);
-    assert_eq!(pool.used_bytes().unwrap(), COPY_BYTES);
+    assert_eq!(pool.payload_used_bytes().unwrap(), COPY_BYTES);
     drop(output);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn copied_sampler_keeps_destination_identity_after_native_custody_and_parent_retire() {
-    let pool = WorkingMemoryPool::new(16384, 0).unwrap();
-    let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (mut sampler, preparation, run) = source(&pool, 16384, 8, true);
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (mut sampler, preparation, run) = source(&pool, (1 << 20), 8, true);
     grow(&mut sampler, &[3, 11, 7, 19, 5]);
     let (copied, native) = pool
         .copy_sampling_components(
             joint(&pool, sampler.borrow_funded()),
-            WorkspaceCopyLimits::new(16384),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
         )
         .unwrap();
     let (custody, scope) = native.into_parts();
-    let output = scope.adopt_storage_individually([(2u32, 16)]).unwrap();
+    let output = scope.publish_host_storage_fixture([(2u32, 16)]).unwrap();
     scope.certify().unwrap();
     drop((custody, sampler, preparation, run, physical));
     // The source funding run is closed, but its immutable host scope is still
     // live. This needs the new account identity, not the original run identity.
     let second = pool
-        .copy_sampler(copied.borrow_funded(), SamplerCopyLimits::new(16384))
+        .copy_sampler(
+            copied.borrow_funded(),
+            SamplerCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
+        )
         .unwrap();
     let next = RegisteredSamplingCopy::prepare(copied.borrow_funded(), copy_plan(&pool, 2, 16, 1))
         .unwrap();
     let third = pool
-        .copy_sampling_components(next, WorkspaceCopyLimits::new(16384))
+        .copy_sampling_components(
+            next,
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
+        )
         .unwrap();
     assert_eq!(history(second.as_sampler()), &[3, 11, 7, 19, 5]);
     assert_eq!(history(third.0.as_sampler()), history(second.as_sampler()));
@@ -626,51 +778,65 @@ fn copied_sampler_keeps_destination_identity_after_native_custody_and_parent_ret
     );
     drop((copied, output));
     settle(third);
-    assert_eq!(pool.used_bytes().unwrap(), second.bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), second.bytes());
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn host_payload_can_retire_first_without_certifying_the_native_scope() {
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, preparation, run) = source(&pool, 8192, 8, false);
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, preparation, run) = source(&pool, (1 << 20), 8, false);
     let (copied, native) = pool
         .copy_sampling_components(
             joint(&pool, sampler.borrow_funded()),
-            WorkspaceCopyLimits::new(8192),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
         )
         .unwrap();
-    let bytes = native.bytes();
+    let bytes = copied.bytes() + COPY_BYTES;
     let (custody, scope) = native.into_parts();
     drop((sampler, preparation, run, physical, copied, custody));
-    assert_eq!(pool.used_bytes().unwrap(), ARRAY_SOURCE_BYTES + bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        ARRAY_SOURCE_BYTES + bytes
+    );
     // The payload has retired, so its former hold is spendable. Neither the
     // host-only cleanup nor closing custody has certified this native work.
-    let output = scope.adopt_storage_individually([(2u32, bytes)]).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), ARRAY_SOURCE_BYTES + bytes);
+    let output = scope.publish_host_storage_fixture([(2u32, bytes)]).unwrap();
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        ARRAY_SOURCE_BYTES + bytes
+    );
     scope.certify().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(output);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn partial_native_publication_quarantines_source_pin_even_after_host_retirement() {
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, preparation, run) = source(&pool, 8192, 8, false);
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, preparation, run) = source(&pool, (1 << 20), 8, false);
     let (copied, native) = pool
         .copy_sampling_components(
             joint(&pool, sampler.borrow_funded()),
-            WorkspaceCopyLimits::new(8192),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
         )
         .unwrap();
-    let bytes = native.bytes();
+    let bytes = copied.bytes() + COPY_BYTES;
     let (custody, scope) = native.into_parts();
     let mut outputs = scope
-        .adopt_storage_individually([(2u32, 16), (3, 16)])
+        .publish_host_storage_fixture([(2u32, 16), (3, 16)])
         .unwrap();
     let attached = outputs.remove(&2).unwrap();
     drop(outputs);
@@ -678,14 +844,22 @@ fn partial_native_publication_quarantines_source_pin_even_after_host_retirement(
     drop(scope);
     let before = (usage(&pool), attempts());
     assert!(matches!(
-        pool.copy_sampler(copied.borrow_funded(), SamplerCopyLimits::new(8192)),
+        pool.copy_sampler(
+            copied.borrow_funded(),
+            SamplerCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20)
+            ))
+        ),
         Err(crate::working_memory::SamplerCopyAdmissionError::Memory(
             WorkingMemoryError::ExecutionFenced
         ))
     ));
     assert_eq!((usage(&pool), attempts()), before);
     drop((copied, attached));
-    assert_eq!(pool.used_bytes().unwrap(), ARRAY_SOURCE_BYTES + bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        ARRAY_SOURCE_BYTES + bytes
+    );
     drop(
         pool.pin_registered_storage([(1u32, ARRAY_SOURCE_BYTES)])
             .unwrap(),
@@ -698,21 +872,30 @@ fn partial_native_publication_quarantines_source_pin_even_after_host_retirement(
 
 #[test]
 fn host_copy_unwind_keeps_committed_account_and_native_source_pin_quarantined() {
-    let pool = WorkingMemoryPool::new(8192, 0).unwrap();
-    let physical = pool.register_storage([(1u32, ARRAY_SOURCE_BYTES)]).unwrap();
-    let (sampler, preparation, run) = source(&pool, 8192, 8, false);
-    let bytes = joint(&pool, sampler.borrow_funded()).required_bytes();
+    let pool = crate::working_memory::memory_fixture::host_ledger((1 << 20), 0).unwrap();
+    let physical = pool
+        .register_host_storage([(1u32, ARRAY_SOURCE_BYTES)])
+        .unwrap();
+    let (sampler, preparation, run) = source(&pool, (1 << 20), 8, false);
+    let bytes = joint(&pool, sampler.borrow_funded())
+        .required_bytes()
+        .unwrap();
     FAIL_COPY.with(|flag| flag.set(true));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pool.copy_sampling_components(
             joint(&pool, sampler.borrow_funded()),
-            WorkspaceCopyLimits::new(8192),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                (1 << 20),
+            )),
         )
         .unwrap()
     }));
     assert!(result.is_err());
     drop((sampler, preparation, run, physical));
-    assert_eq!(pool.used_bytes().unwrap(), ARRAY_SOURCE_BYTES + bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        ARRAY_SOURCE_BYTES + bytes
+    );
     drop(
         pool.pin_registered_storage([(1u32, ARRAY_SOURCE_BYTES)])
             .unwrap(),

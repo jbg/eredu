@@ -1,5 +1,6 @@
 //! Backend-neutral sampler tests for facade-owned chat policy.
 
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use serde_json::json;
 
 use crate::api::ConstraintError;
@@ -970,11 +971,9 @@ fn text_controller_excludes_dominant_padding_before_sampling_and_after_snapshot(
 #[test]
 fn text_controller_clones_and_snapshots_retain_shared_accounting_custody() {
     use eredu_core::{
-        SharedStorageDomain, SharedTokenFilter, TextControllerStorage, TokenFilterController,
+        SharedStorageAccountingId, SharedTokenFilter, TextControllerStorage, TokenFilterController,
     };
-    use eredu_runtime::{
-        execution_control::SnapshotTokenController, working_memory::WorkingMemoryPool,
-    };
+    use eredu_runtime::{execution_control::SnapshotTokenController, working_memory::MemoryLedger};
 
     let mut mask = Vec::with_capacity(19);
     mask.extend([true, false, true]);
@@ -984,11 +983,11 @@ fn text_controller_clones_and_snapshots_retain_shared_accounting_custody() {
     let mut cloned = source.clone();
     let mut snapshot = source.fork_snapshot().unwrap();
     let prepared = crate::api::request::PreparedChatSpeculativeConstraint::new(source.clone());
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
-    let domain = SharedStorageDomain::default();
+    let pool = crate::memory_fixture::host_ledger(capacity, 0).unwrap();
+    let domain = SharedStorageAccountingId::default();
     validity
         .try_attach(&domain, || {
-            pool.register_storage([(validity.identity().clone(), capacity)])
+            pool.register_host_storage([(validity.identity().clone(), capacity)])
                 .map(|handle| Box::new(handle) as Box<dyn Send + Sync>)
         })
         .unwrap();
@@ -1042,13 +1041,13 @@ fn text_controller_clones_and_snapshots_retain_shared_accounting_custody() {
     drop(source);
     drop(cloned);
     drop(prepared);
-    assert_eq!(pool.used_bytes().unwrap(), capacity);
+    assert_eq!(pool.live_charge_bytes().unwrap(), capacity);
     assert_eq!(
         snapshot.current_filter().unwrap().allowed_mask(),
         Some(&[true, false, true][..])
     );
     drop(snapshot);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]

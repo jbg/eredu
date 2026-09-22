@@ -40,6 +40,20 @@ impl Drop for PreparationOwner {
 #[derive(Debug)]
 struct NoOperations;
 impl WorkspaceMechanisms for NoOperations {
+    fn memory_topology(&self) -> Option<&MemoryTopology> {
+        Some(crate::memory::topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+    fn scratch_placement(&self, _: WorkspaceOperationView<'_>) -> Option<&MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+
     fn operation_bound(
         &self,
         _: &WorkspaceOperation,
@@ -48,6 +62,20 @@ impl WorkspaceMechanisms for NoOperations {
     }
 }
 impl WorkspaceFactMechanisms for NoOperations {
+    fn memory_topology(&self) -> Option<&MemoryTopology> {
+        Some(crate::memory::topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+    fn scratch_placement(&self, _: WorkspaceOperationView<'_>) -> Option<&MemoryPlacement> {
+        Some(crate::memory::placement_ref())
+    }
+
     type Error = std::convert::Infallible;
     fn operation_facts(
         &self,
@@ -130,7 +158,11 @@ fn quote(
                 .map_err(|e| funded_error(e, funding))?;
             funding.reserve_metadata(layout.requested_bytes())?;
             layout
-                .construct(&env.pool, &context, std::iter::empty())
+                .construct(
+                    &env.pool,
+                    &context,
+                    std::iter::empty::<(u32, eredu_nn::workspace::WorkspaceExistingStorage)>(),
+                )
                 .map_err(|e| funded_error(e, funding))?
         }
         None => RegisteredWorkspaceStorage::bind(
@@ -177,6 +209,7 @@ fn quote(
     let zero =
         || WorkspaceBound::bounded(0, "the fixture has no neural storage or tensor operation");
     let outside = ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry,
         activations: zero(),
         attention: zero(),
@@ -188,10 +221,17 @@ fn quote(
         materialization: zero(),
         retained: WorkspaceBound::bounded(capture_bytes, "actual finite capture host schedule"),
     };
+    let mut state = state;
+    state.physical_domains = Some(DomainRuntimeStateEstimate {
+        geometry,
+        decoder_state: crate::memory::requirements(0),
+        media_embeddings: crate::memory::requirements(0),
+        media_workspace: crate::memory::requirements(0),
+    });
     ResidualInferenceQuote::compose_metadata(
         &report,
         state,
-        outside,
+        crate::memory::workspace(outside),
         &storage,
         funding.map_or_else(
             WorkspaceReportMetadata::ordinary,
@@ -212,11 +252,12 @@ impl Preparation {
     ) -> Result<PreparationOwner, BackendFailure> {
         let capacity = config
             .inference_policy()
-            .managed_memory_capacity_bytes
-            .ok_or_else(|| TokenInputRejection::Unsupported.into_backend_failure())?;
+            .memory_limits
+            .resolve(env.pool.topology())
+            .map_err(memory)?;
         let planning = env
             .pool
-            .prepare_workspace_metadata(&env.execution, capacity)?;
+            .prepare_workspace_metadata(&env.execution, capacity.clone())?;
         planning.reserve_metadata(
             size_of::<Self>()
                 + size_of::<IncrementalInferenceQuote>()
@@ -306,8 +347,9 @@ impl Preparation {
         };
         let capacity = config
             .inference_policy()
-            .managed_memory_capacity_bytes
-            .ok_or_else(|| TokenInputRejection::Unsupported.into_backend_failure())?;
+            .memory_limits
+            .resolve(env.pool.topology())
+            .map_err(memory)?;
         planning.reserve_metadata(
             "neutral public conformance fixture".len() + 2 * "no model context storage".len(),
         )?;
@@ -323,9 +365,8 @@ impl Preparation {
             input: InputTokenCount::text(geometry.input_positions),
             max_output_tokens: geometry.max_output_tokens,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: Default::default(),
+            memory_limits: config.inference_policy().memory_limits.clone(),
         };
         planning.reserve_metadata(
             size_of::<Option<BackendFailure>>()

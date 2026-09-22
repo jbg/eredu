@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::working_memory::{
-    funding::WorkingMemoryDecoderHostScope, HostSlotStorageKey, InferenceExecutionIdentity,
+    HostSlotStorageKey, InferenceExecutionIdentity, funding::WorkingMemoryDecoderHostScope,
 };
 use crate::{HostSlotAttachmentError, InitializedDenseHostSlots};
 use eredu_core::SharedStorageAttachmentError;
@@ -33,19 +33,36 @@ pub(in crate::working_memory) fn publish_dense_host_slots<T, K: HostSlotStorageK
         return Err(rejected(WorkingMemoryError::IdentityMismatch));
     }
     let pool = custody.pool().clone();
+    // Ordinary destinations convert their admitted constructor allowance before
+    // allocating registry staging, the attachment owner, or its map node.
+    let ordinary = host.is_none();
+    let dynamic_host = if ordinary {
+        let funding = custody
+            .prepare_storage_metadata(execution)
+            .map_err(|e| rejected(metadata_error(e)))?;
+        Some(
+            funding
+                .prepare_host_owner(ordinary_host_owner_bytes::<K>().map_err(rejected)?)
+                .map_err(|e| rejected(metadata_error(e)))?,
+        )
+    } else {
+        None
+    };
+    let staging_host = host.or(dynamic_host.as_ref());
     // Pending keys/handles belong to this outer staging frame, never the
     // provider closure. A rejected provider must release both token locks
     // before any of these destructors can reenter accounting or owner code.
-    let prepared = host
-        .map(|host| {
-            Ok::<_, WorkingMemoryError>((
-                RegistryBatch::prepare_copy_exact(1, host)?,
-                directory::PreparedNamespace::prepare_copy::<K>(host),
-            ))
-        })
-        .transpose()
-        .map_err(rejected)?;
-    let registration = if let Some(host) = host {
+    let prepared = Some(match staging_host {
+        Some(host) => (
+            RegistryBatch::prepare_copy_exact(1, host).map_err(rejected)?,
+            directory::PreparedNamespace::prepare_copy::<K>(host),
+        ),
+        None => (
+            RegistryBatch::prepare_source_registration(1),
+            directory::PreparedNamespace::prepare::<K>(None),
+        ),
+    });
+    let registration = if let Some(host) = staging_host {
         let mut keys =
             crate::working_memory::qualified_storage::vector(1, true).map_err(rejected)?;
         keys.push(key.clone());
@@ -61,16 +78,25 @@ pub(in crate::working_memory) fn publish_dense_host_slots<T, K: HostSlotStorageK
         retained,
         protected,
     };
-    let attached = if host.is_some() {
-        metadata
-            .prepare_copy_attachment(pool.shared_storage_domain())
-            .map_err(rejected)?;
-        metadata.try_attach_prepared_copy(pool.shared_storage_domain(), || {
-            transfer.commit(&pool, custody, execution)
+    let attached = if let Some(host) = dynamic_host.as_ref() {
+        metadata.try_attach_owned_prepared(pool.shared_storage_accounting_id(), |layout| {
+            if layout.requested_bytes() > ordinary_attachment_bytes::<K>()? {
+                return Err(WorkingMemoryError::Overflow);
+            }
+            let registration = transfer.commit(&pool, custody, execution)?;
+            Ok::<_, WorkingMemoryError>(eredu_core::SharedStorageOwner::new(DenseHostPublication {
+                registration: Some(registration),
+                _host: host.clone(),
+            }))
         })?
     } else {
-        metadata.try_attach(pool.shared_storage_domain(), || {
-            transfer.commit(&pool, custody, execution)
+        metadata
+            .prepare_copy_attachment(pool.shared_storage_accounting_id())
+            .map_err(rejected)?;
+        metadata.try_attach_prepared_copy(pool.shared_storage_accounting_id(), || {
+            transfer
+                .commit(&pool, custody, execution)
+                .map(|r| r as Box<dyn Send + Sync>)
         })?
     };
     if !attached {
@@ -81,7 +107,7 @@ pub(in crate::working_memory) fn publish_dense_host_slots<T, K: HostSlotStorageK
     Ok(())
 }
 
-struct PreparedTransfer<K: Ord + Send + 'static> {
+struct PreparedTransfer<K: Ord + Send + Sync + 'static> {
     // Keep an owner outside try_attach, including while BTreeMap::entry calls
     // provider Ord. Its temporary key can then unwind under the locks without
     // running K::drop there. HostSlotStorageKey already requires Send + Sync;
@@ -97,10 +123,10 @@ struct PreparedTransfer<K: Ord + Send + 'static> {
 impl<K: HostSlotStorageKey> PreparedTransfer<K> {
     fn commit(
         &mut self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         custody: &mut WorkingMemoryDecoderHostScope,
         execution: &InferenceExecutionIdentity,
-    ) -> Result<Box<dyn Send + Sync>, WorkingMemoryError> {
+    ) -> Result<Box<WorkingMemoryStorage<K>>, WorkingMemoryError> {
         let mut usage = pool
             .0
             .usage
@@ -128,7 +154,7 @@ impl<K: HostSlotStorageKey> PreparedTransfer<K> {
         }
         // Preserve the existing domain invariant. This operation shifts already
         // reserved coverage, including for a zero-byte table's origin lifetime.
-        let _ = pool.0.available(&usage, None)?;
+        let _ = pool.0.check_host_increment(&usage, 0)?;
         let state = usage.funding.get(&id).expect("validated host transfer");
         let remaining = state
             .remaining
@@ -162,18 +188,22 @@ impl<K: HostSlotStorageKey> PreparedTransfer<K> {
             return Err(WorkingMemoryError::Poisoned);
         }
         // All rejecting checks and provider comparisons precede counter commit.
-        // A vacant-entry insertion does not compare provider keys again. If
-        // entry search unwinds, the outer staged Arc remains the key's owner
+        // Linking prepared slots does not compare provider keys again. If
+        // source search unwinds, the outer staged Arc remains the key's owner
         // until both accounting and table attachment locks have unwound.
         if let Some((mut batch, namespace)) = self.prepared.take() {
             batch.entries[0] = Some((
                 RegistryKey::Shared(Arc::clone(&self.key)),
                 Entry {
                     reset_layout_id: None,
+                    placement: Arc::clone(&pool.0.host_placement),
                     prepaid: None,
                     bytes: self.retained,
                     owners: 1,
                     funding: Some(id),
+                    native_retired: false,
+                    pending_allocation: false,
+                    funding_allowance_bytes: 0,
                 },
             ));
             if usage.storage.get(&TypeId::of::<K>()).is_none() {
@@ -191,24 +221,7 @@ impl<K: HostSlotStorageKey> PreparedTransfer<K> {
                 .expect("typed storage registry")
                 .link(batch);
         } else {
-            let registry = usage
-                .storage
-                .entry(TypeId::of::<K>())
-                .or_insert_with(|| Box::new(Registry::<K>::new()))
-                .downcast_mut::<Registry<K>>()
-                .expect("typed storage registry");
-            match registry.entry(RegistryKey::Shared(Arc::clone(&self.key))) {
-                RegistryEntry::Vacant(slot) => slot.insert(Entry {
-                    reset_layout_id: None,
-                    prepaid: None,
-                    bytes: self.retained,
-                    owners: 1,
-                    funding: Some(id),
-                }),
-                RegistryEntry::Occupied(_) => {
-                    return Err(WorkingMemoryError::IdentityMismatch);
-                }
-            };
+            unreachable!("fresh transfer owns its prepared registry destinations");
         }
         let state = usage.funding.get_mut(&id).expect("validated host transfer");
         state.remaining = remaining;
@@ -225,6 +238,91 @@ impl<K: HostSlotStorageKey> PreparedTransfer<K> {
         // token's attachment slot was reserved before this provider ran.
         Ok(registration)
     }
+}
+
+struct DenseHostPublication<K: Ord + Send + Sync + 'static> {
+    registration: Option<Box<WorkingMemoryStorage<K>>>,
+    _host: eredu_core::HostPreparationAuthority,
+}
+impl<K: Ord + Send + Sync + 'static> eredu_core::SharedStorageRetirement
+    for DenseHostPublication<K>
+{
+    fn retire(self: Arc<Self>) {
+        drop(Arc::into_inner(self));
+    }
+}
+impl<K: Ord + Send + Sync + 'static> Drop for DenseHostPublication<K> {
+    fn drop(&mut self) {
+        if let Some(owner) = self.registration.take() {
+            drop(*owner);
+        }
+    }
+}
+fn metadata_error(error: eredu_core::HostMetadataFundingError) -> WorkingMemoryError {
+    WorkingMemoryError::MetadataConstruction(eredu_nn::workspace::WorkspaceMetadataError::Funding(
+        error,
+    ))
+}
+fn ordinary_attachment_bytes<K: HostSlotStorageKey>() -> Result<usize, WorkingMemoryError> {
+    eredu_core::SharedStorageAttachmentTable::owned_attachment_control_bytes::<
+        DenseHostPublication<K>,
+        WorkingMemoryError,
+    >()
+    .ok_or(WorkingMemoryError::Overflow)
+}
+fn ordinary_host_owner_bytes<K: HostSlotStorageKey>() -> Result<usize, WorkingMemoryError> {
+    let owner = usize::try_from(super::super::qualified_storage::shared_bytes::<
+        DenseHostPublication<K>,
+    >()?)
+    .map_err(|_| WorkingMemoryError::Overflow)?;
+    // Keys used by this closed transfer are cloned only from a caller-paid
+    // actual key; nested key payload remains the caller's separate quotation.
+    dense_host_transfer_control_bytes::<K>(0)?
+        .checked_add(ordinary_attachment_bytes::<K>()?)
+        .and_then(|n| n.checked_add(owner))
+        .ok_or(WorkingMemoryError::Overflow)
+}
+pub(in crate::working_memory) fn prepare_dense_host_metadata<S, D, K: HostSlotStorageKey>(
+    custody: &WorkingMemoryDecoderHostScope,
+    execution: &InferenceExecutionIdentity,
+) -> Result<eredu_core::HostPreparationAuthority, WorkingMemoryError> {
+    let bytes = ordinary_dense_preparation_owner_bytes::<S, D, K>()?;
+    let funding = custody
+        .prepare_storage_metadata(execution)
+        .map_err(metadata_error)?;
+    funding.prepare_host_owner(bytes).map_err(metadata_error)
+}
+fn ordinary_dense_preparation_owner_bytes<S, D, K: HostSlotStorageKey>()
+-> Result<usize, WorkingMemoryError> {
+    ordinary_host_owner_bytes::<K>()?
+        .checked_add(
+            crate::DenseHostSlotInitialization::<S, D>::preparation_control_bytes()
+                .ok_or(WorkingMemoryError::UnknownBound)?,
+        )
+        .ok_or(WorkingMemoryError::Overflow)
+}
+pub(in crate::working_memory) fn ordinary_dense_preparation_bytes<S, D, K: HostSlotStorageKey>()
+-> Result<u64, WorkingMemoryError> {
+    let bytes = super::super::StorageMetadataFunding::host_owner_bytes(
+        ordinary_dense_preparation_owner_bytes::<S, D, K>()?,
+    )
+    .map_err(metadata_error)?;
+    MemoryLedger::storage_metadata_control_bytes()?
+        .checked_add(u64::try_from(bytes).map_err(|_| WorkingMemoryError::Overflow)?)
+        .ok_or(WorkingMemoryError::Overflow)
+}
+
+/// Complete constructor allowance consumed from an ordinary dense prompt's
+/// unprotected host envelope before publication. Actual nested key cloning is
+/// quoted separately by the caller's concrete key producer.
+pub(in crate::working_memory) fn ordinary_dense_host_publication_bytes<K: HostSlotStorageKey>()
+-> Result<u64, WorkingMemoryError> {
+    let host =
+        super::super::StorageMetadataFunding::host_owner_bytes(ordinary_host_owner_bytes::<K>()?)
+            .map_err(metadata_error)?;
+    MemoryLedger::storage_metadata_control_bytes()?
+        .checked_add(u64::try_from(host).map_err(|_| WorkingMemoryError::Overflow)?)
+        .ok_or(WorkingMemoryError::Overflow)
 }
 
 pub(in crate::working_memory) fn dense_host_transfer_control_bytes<K: HostSlotStorageKey>(

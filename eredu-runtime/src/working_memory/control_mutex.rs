@@ -55,8 +55,8 @@ impl<T> fmt::Debug for ControlMutex<T> {
 
 // The audited Rust 1.98 selector uses inline queue/futex/no_threads storage on
 // every other selected target. SOLID lazily constructs a kernel object even for
-// try_write; it has no priced original constructor here. Ordinary callers keep
-// their existing no-bound route. This is a platform gap, never a family limit.
+// try_write; it has no priced constructor here. Admission rejects that missing
+// attribution under finite and unlimited limits.
 pub(super) fn require_known_layout() -> Result<(), WorkingMemoryError> {
     require_layout(!cfg!(target_os = "solid_asp3"))
 }

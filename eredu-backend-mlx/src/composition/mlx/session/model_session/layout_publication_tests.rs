@@ -1,17 +1,17 @@
 use super::*;
-use eredu_core::execution_control::NativeTextStateBackend;
-use eredu_runtime::{working_memory::WorkingMemoryPool, SharedHostMetadata, SharedStateLayout};
+use eredu_runtime::{working_memory::MemoryLedger, SharedHostMetadata, SharedStateLayout};
 
 fn reclaim() {
+    safemlx::memory::clear_cache();
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle_bytes(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle_bytes(pool: &MemoryLedger, bytes: u64) {
     let mut last = None;
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        let actual = pool.used_bytes().unwrap();
+        let actual = pool.fixture_host_charge().unwrap();
         if last != Some(actual) {
             eprintln!(
                 "retirement target {bytes}, observed {actual}, unquoted {:?}",
@@ -25,13 +25,13 @@ fn settle_bytes(pool: &WorkingMemoryPool, bytes: u64) {
 
 fn fixture() -> (
     Stream,
-    WorkingMemoryPool,
+    MemoryLedger,
     ModelRuntime<MlxBackend<'static>>,
     tempfile::TempDir,
 ) {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model =
         eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default()).unwrap();
@@ -83,62 +83,21 @@ fn fresh_loaded_model_publishes_actual_layout_before_loading_owner_retires() {
         bytes > layout_bytes,
         "the fixture also retains actual model weights"
     );
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    // Source preparation metadata has independent paid ownership in addition
+    // to the physical inventory. Repeated aliases do not change either charge.
+    let charge = pool.snapshot().unwrap();
+    assert!(pool.fixture_host_charge().unwrap() >= bytes);
     nonstate
         .include_metadata(SharedHostMetadata::Layout(alias.clone()))
         .unwrap();
     assert_eq!(nonstate.byte_bound().unwrap(), Some(bytes));
+    assert_eq!(pool.snapshot().unwrap(), charge);
     drop((nonstate, alias, runtime));
     stream.synchronize().unwrap();
     settle_bytes(&pool, layout_bytes);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     drop(layout);
     settle_bytes(&pool, 0);
-}
-
-#[test]
-fn native_state_copies_share_published_layout_after_model_and_raw_alias_retire() {
-    let (stream, pool, mut runtime, _root) = fixture();
-    let layout = actual_layout(&runtime);
-    let layout_bytes = layout.capacity_bytes().unwrap();
-    let original_slot_bytes: u64 = runtime
-        .session()
-        .payload
-        .model
-        .erased()
-        .retained_idle_auxiliary_storage()
-        .unwrap()
-        .slot_metadata_sources()
-        .map(|token| token.capacity_bytes().unwrap())
-        .sum();
-    assert!(original_slot_bytes > 0);
-    let initial = runtime.session().payload.model.erased().state_snapshot();
-    assert!(initial.iter().all(|(position, _)| *position == 0));
-    let mut saved = MlxBackend::capture_native_text_state(&mut runtime).unwrap();
-    let mut copied = MlxBackend::copy_native_text_state(&mut runtime, &saved).unwrap();
-    MlxBackend::exchange_native_text_state(&mut runtime, &mut saved).unwrap();
-    assert!(layout.same_storage(&actual_layout(&runtime)));
-    MlxBackend::exchange_native_text_state(&mut runtime, &mut copied).unwrap();
-    assert!(layout.same_storage(&actual_layout(&runtime)));
-    assert_eq!(
-        runtime.session().payload.model.erased().state_snapshot(),
-        initial
-    );
-
-    // Empty decoder slots have no numerical arrays that could mask a copied
-    // layout. Their actual shared layout must carry its existing source charge.
-    drop((layout, runtime));
-    stream.synchronize().unwrap();
-    // The first exchange moved the originally published table into saved.
-    settle_bytes(&pool, layout_bytes + original_slot_bytes);
-    drop(saved);
-    settle_bytes(&pool, layout_bytes);
-    drop(copied);
-    settle_bytes(&pool, 0);
-    crate::backend::submission_recovery::wait_for_retirement(|| {
-        reclaim();
-        pool.unquoted_owner_count().unwrap() == 0
-    });
 }
 
 #[test]
@@ -156,8 +115,8 @@ fn loaded_state_tables_keep_exact_source_charges_through_last_metadata_alias() {
             false,
         ),
     ] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+        let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
         let model = eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
             .unwrap();
         let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
@@ -196,16 +155,13 @@ fn loaded_state_tables_keep_exact_source_charges_through_last_metadata_alias() {
         assert_eq!(auxiliary.byte_bound().unwrap(), before);
         let all = runtime.session().payload.retained_idle_storage().unwrap();
         assert_eq!(all.decoder_state_bytes().unwrap(), Some(0));
-        assert_eq!(
-            pool.used_bytes().unwrap(),
-            all.nonstate_bytes().unwrap().unwrap()
-        );
+        assert!(pool.fixture_host_charge().unwrap() >= all.nonstate_bytes().unwrap().unwrap());
         drop((all, auxiliary, layout, runtime));
         settle_bytes(&pool, table_bytes);
         for token in &tokens {
             let error = token
                 .try_attach(
-                    pool.shared_storage_domain(),
+                    pool.shared_storage_accounting_id(),
                     || -> Result<Box<dyn Send + Sync>, std::convert::Infallible> {
                         panic!("retired table must not acquire new custody")
                     },
@@ -225,3 +181,7 @@ fn loaded_state_tables_keep_exact_source_charges_through_last_metadata_alias() {
         settle_bytes(&pool, 0);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

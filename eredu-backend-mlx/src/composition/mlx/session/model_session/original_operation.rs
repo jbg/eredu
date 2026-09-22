@@ -27,6 +27,10 @@ struct Failure {
 }
 
 fn failure(cause: Cause, funding: HostMetadataFunding) -> Error {
+    failure_with_preservation(cause, funding, false)
+}
+
+fn failure_with_preservation(cause: Cause, funding: HostMetadataFunding, preserved: bool) -> Error {
     let kind = match &cause {
         Cause::Operation(error) => error
             .retained_backend_failure_kind()
@@ -35,7 +39,7 @@ fn failure(cause: Cause, funding: HostMetadataFunding) -> Error {
     };
     Error::with_original_control_source(
         eredu_core::BackendFailure::new(kind, Failure { cause, funding }),
-        false,
+        preserved,
     )
 }
 
@@ -55,6 +59,7 @@ fn control_bytes<T>() -> Option<usize> {
         size_of::<eredu_core::BackendFailureKind>(),
         size_of::<eredu_core::BackendFailure>(),
         size_of::<Result<(), HostMetadataFundingError>>(),
+        size_of::<bool>(),
         eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?,
     ];
     controls
@@ -63,6 +68,28 @@ fn control_bytes<T>() -> Option<usize> {
 }
 
 impl MlxModelSession {
+    /// Unpublished parameter inspection may return a callback refusal after
+    /// native work succeeds. Carry that refusal through the same completion
+    /// worker before returning it; failed or unobservable native work retains
+    /// the existing recovery fencing. This entry must not publish parameters,
+    /// mutate decoder state or perform another semantic session transition.
+    pub(in crate::composition::mlx::session) fn with_model_inspection_funded<T>(
+        &mut self,
+        funding: HostMetadataFunding,
+        operation: impl FnOnce(&mut Executable) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        funding
+            .reserve_metadata(size_of::<(
+                HostMetadataFunding,
+                Result<T, Error>,
+                Result<Result<T, Error>, Error>,
+            )>())
+            .map_err(Error::WorkspacePlanning)?;
+        let callback =
+            self.with_model_operation_funded(funding.clone(), |model| Ok(operation(model)))?;
+        callback.map_err(|cause| failure_with_preservation(Cause::Operation(cause), funding, true))
+    }
+
     /// Cold loan of the actual idle executable for paired-source authentication.
     /// This neither acquires an ordinary lease nor reconstructs source storage.
     pub(crate) fn original_model_source(&self) -> Result<&Executable, WorkingMemoryError> {
@@ -93,9 +120,10 @@ impl MlxModelSession {
         self.original_model_source()
             .map_err(Error::PrefillControl)?;
         funding
-            .reserve_metadata(control_bytes::<T>().ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?)
+            .reserve_metadata(
+                control_bytes::<T>()
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            )
             .map_err(Error::WorkspacePlanning)?;
         // From this point one returned typed cause shell and all native/host
         // scope construction are prepaid. Refusal never enters ordinary memory.

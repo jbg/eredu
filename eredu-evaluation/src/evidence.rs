@@ -46,7 +46,11 @@ pub fn observe_f32_tensor<T: Tensor>(
 ) -> Result<TensorObservation, EvidenceError> {
     let shape = observation_shape(tensor.shape())?;
     let values = tensor.to_f32_vec(context)?;
-    TensorObservation::new(shape, TensorObservationData::F32(values)).map_err(Into::into)
+    TensorObservation::new(
+        shape,
+        TensorObservationData::F32(values.into_iter().collect()),
+    )
+    .map_err(Into::into)
 }
 
 /// Materializes a neutral tensor as signed integer evaluation evidence.
@@ -106,7 +110,7 @@ pub fn observe_realtime_frame(
     for diagnostic in frame.diagnostics() {
         observations.insert(
             format!("decisions.{}.logits", diagnostic.prediction()),
-            ObservationValue::Tensor(diagnostic.tensor().clone()),
+            ObservationValue::Tensor((diagnostic.tensor().clone()).into()),
         )?;
     }
     Ok(observations)
@@ -127,10 +131,13 @@ fn insert_realtime_tokens(
     }
     observations.insert(
         path,
-        ObservationValue::Tensor(TensorObservation::new(
-            vec![batch, tokens.len() / batch],
-            TensorObservationData::I64(tokens.iter().copied().map(i64::from).collect()),
-        )?),
+        ObservationValue::Tensor(
+            (TensorObservation::new(
+                vec![batch, tokens.len() / batch],
+                TensorObservationData::I64(tokens.iter().copied().map(i64::from).collect()),
+            )?)
+            .into(),
+        ),
     )?;
     Ok(())
 }

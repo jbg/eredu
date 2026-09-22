@@ -283,7 +283,7 @@ fn actual_model_and_scalar_failures_retain_ordinary_custody_through_cached_error
     }
     let context = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for scalar in [false, true] {
-        let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let host = eredu_core::HostPreparationAuthority::retain(pool.acquire_unquoted().unwrap());
         let (mut model, authority) = model(if scalar { 3 } else { 4 }, context.stream());
         model.retain_ordinary_capture(Some(host.clone()));

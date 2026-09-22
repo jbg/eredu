@@ -9,10 +9,11 @@ mod source_budget;
 pub use source_budget::{OriginalTextSourceBudget, OriginalTextSourceBudgetError};
 
 use super::loaded_decode_source::Allowance;
-use super::{WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError};
 use eredu_core::{BackendFailure, TokenFilter};
 use eredu_text::tokenizer_storage::{
-    PreparedTokenizer, TokenizerConstructionFailure, TokenizerPlan, InputPrefixPlan, InputPrefixFailure, TokenizerSourceError,
+    InputPrefixFailure, InputPrefixPlan, PreparedTokenizer, TokenizerConstructionFailure,
+    TokenizerPlan, TokenizerSourceError,
 };
 use std::{
     alloc::Layout,
@@ -45,8 +46,8 @@ struct Payload {
 /// fn raw(model:OriginalTokenizer) { let _ = model.source(); }
 /// ```
 /// ```compile_fail
-/// # use eredu_runtime::working_memory::{OriginalTokenizer,WorkingMemoryPool};
-/// fn adopt(pool:&WorkingMemoryPool,model:OriginalTokenizer) { let _ = pool.compile_tokenizer(model); }
+/// # use eredu_runtime::working_memory::{OriginalTokenizer,MemoryLedger};
+/// fn adopt(pool:&MemoryLedger,model:OriginalTokenizer) { let _ = pool.compile_tokenizer(model); }
 /// ```
 pub struct OriginalTokenizer(Option<Arc<Payload>>);
 impl OriginalTokenizer {
@@ -54,13 +55,32 @@ impl OriginalTokenizer {
     /// Identity removal aliases this exact source. A changed source reserves a
     /// full construction estimate and retains the original identity and payer.
     pub fn input_prefix_normalized_source(&self) -> Result<Self, OriginalTokenizerPrefixError> {
-        let plan = self.payload().model.input_prefix_plan().map_err(|error| OriginalTokenizerError {
-            cause: Cause::Source(error), settlement: None, _completed: None, domain: None,
-            input_prefix_root: Some(self.clone()), allowance: None,
-        })?;
-        let Some(plan) = plan else { return Ok(self.clone()); };
-        let extent = match self.payload().domain.as_ref() { Some(TokenFilter::Allowed(mask)) => Some(mask.len()), None => None, _ => unreachable!("original canonical domain is a dense mask") };
-        self.pool().compile_tokenizer_inner(PrefixSourcePlan { plan, extent }, || {}, false, Some(self))
+        let plan =
+            self.payload()
+                .model
+                .input_prefix_plan()
+                .map_err(|error| OriginalTokenizerError {
+                    cause: Cause::Source(error),
+                    settlement: None,
+                    _completed: None,
+                    domain: None,
+                    input_prefix_root: Some(self.clone()),
+                    allowance: None,
+                })?;
+        let Some(plan) = plan else {
+            return Ok(self.clone());
+        };
+        let extent = match self.payload().domain.as_ref() {
+            Some(TokenFilter::Allowed(mask)) => Some(mask.len()),
+            None => None,
+            _ => unreachable!("original canonical domain is a dense mask"),
+        };
+        self.pool().compile_tokenizer_inner(
+            PrefixSourcePlan { plan, extent },
+            || {},
+            false,
+            Some(self),
+        )
     }
 
     pub(super) fn tokenization_is_canonical(&self) -> bool {
@@ -112,8 +132,12 @@ impl OriginalTokenizer {
     pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.payload().model.ids()
     }
-    pub(super) fn pool(&self) -> &WorkingMemoryPool {
+    pub(super) fn pool(&self) -> &MemoryLedger {
         self.payload().allowance.pool()
+    }
+    /// Immutable physical topology of the ledger retaining this original source.
+    pub fn memory_topology(&self) -> &eredu_core::MemoryTopology {
+        self.pool().topology()
     }
     /// Borrows the same immutable decode program; no owner extraction or replacement.
     pub fn decode_source(&self) -> &eredu_text::decoder_storage::PreparedDecodeSource {
@@ -165,8 +189,8 @@ impl OriginalTokenizer {
         )
     }
     /// Checks the original domain without minting a request or another hold.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.payload().allowance.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.payload().allowance.pool().same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -277,7 +301,10 @@ impl<C: std::error::Error + Send + Sync + 'static> fmt::Debug for OriginalTokeni
             .field("cause", &self.cause)
             .field("settlement", &self.settlement)
             .field("completed", &self._completed.is_some())
-            .field("retains_input_prefix_root", &self.input_prefix_root.is_some())
+            .field(
+                "retains_input_prefix_root",
+                &self.input_prefix_root.is_some(),
+            )
             .field("retained_bytes", &self.retained_bytes())
             .finish()
     }
@@ -314,27 +341,52 @@ trait SourcePlan: Sized {
 }
 impl SourcePlan for TokenizerPlan<'_> {
     type Failure = TokenizerConstructionFailure;
-    fn generation_controls() -> Option<usize> { OriginalTokenizerSourceError::tokenizer_controls() }
-    fn required_bytes(&self) -> usize { self.requirements().required_bytes() }
-    fn domain_extent(&self) -> Option<usize> { self.generation_domain_extent() }
-    fn compile(self) -> Result<PreparedTokenizer, Self::Failure> { TokenizerPlan::compile(self) }
+    fn generation_controls() -> Option<usize> {
+        OriginalTokenizerSourceError::tokenizer_controls()
+    }
+    fn required_bytes(&self) -> usize {
+        self.requirements().required_bytes()
+    }
+    fn domain_extent(&self) -> Option<usize> {
+        self.generation_domain_extent()
+    }
+    fn compile(self) -> Result<PreparedTokenizer, Self::Failure> {
+        TokenizerPlan::compile(self)
+    }
 }
-struct PrefixSourcePlan<'a> { plan: InputPrefixPlan<'a>, extent: Option<usize> }
+struct PrefixSourcePlan<'a> {
+    plan: InputPrefixPlan<'a>,
+    extent: Option<usize>,
+}
 impl SourcePlan for PrefixSourcePlan<'_> {
     type Failure = InputPrefixFailure;
-    fn generation_controls() -> Option<usize> { Some(0) }
-    fn required_bytes(&self) -> usize { self.plan.requirements().required_bytes() }
-    fn domain_extent(&self) -> Option<usize> { self.extent }
-    fn compile(self) -> Result<PreparedTokenizer, Self::Failure> { self.plan.compile() }
+    fn generation_controls() -> Option<usize> {
+        Some(0)
+    }
+    fn required_bytes(&self) -> usize {
+        self.plan.requirements().required_bytes()
+    }
+    fn domain_extent(&self) -> Option<usize> {
+        self.extent
+    }
+    fn compile(self) -> Result<PreparedTokenizer, Self::Failure> {
+        self.plan.compile()
+    }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Source-derived construction estimate plus closed owner/error controls.
     /// This query grants no budget and takes no ownership of the borrowed plan.
     pub fn tokenizer_required_bytes(plan: &TokenizerPlan<'_>) -> Result<u64, WorkingMemoryError> {
-        Self::tokenizer_construction_required_bytes::<TokenizerPlan<'_>>(plan.requirements().required_bytes(), plan.generation_domain_extent())
+        Self::tokenizer_construction_required_bytes::<TokenizerPlan<'_>>(
+            plan.requirements().required_bytes(),
+            plan.generation_domain_extent(),
+        )
     }
-    fn tokenizer_construction_required_bytes<P: SourcePlan>(required: usize, domain_extent: Option<usize>) -> Result<u64, WorkingMemoryError> {
+    fn tokenizer_construction_required_bytes<P: SourcePlan>(
+        required: usize,
+        domain_extent: Option<usize>,
+    ) -> Result<u64, WorkingMemoryError> {
         let arc = Layout::new::<[AtomicUsize; 2]>()
             .extend(Layout::new::<Payload>())
             .map_err(|_| WorkingMemoryError::Overflow)?
@@ -378,10 +430,7 @@ impl WorkingMemoryPool {
         .ok_or(WorkingMemoryError::Overflow)?;
         let controls = if domain_extent.is_some() {
             controls
-                .checked_add(
-                    P::generation_controls()
-                        .ok_or(WorkingMemoryError::Overflow)?,
-                )
+                .checked_add(P::generation_controls().ok_or(WorkingMemoryError::Overflow)?)
                 .ok_or(WorkingMemoryError::Overflow)?
         } else {
             controls
@@ -420,7 +469,11 @@ impl WorkingMemoryPool {
         root: Option<&OriginalTokenizer>,
     ) -> Result<OriginalTokenizer, OriginalTokenizerError<P::Failure>> {
         let rejected = |cause| OriginalTokenizerError::rejected_with_root(cause, root);
-        let bytes = Self::tokenizer_construction_required_bytes::<P>(plan.required_bytes(), plan.domain_extent()).map_err(rejected)?;
+        let bytes = Self::tokenizer_construction_required_bytes::<P>(
+            plan.required_bytes(),
+            plan.domain_extent(),
+        )
+        .map_err(rejected)?;
         let mut allowance = self.admit_source_compiler(bytes).map_err(rejected)?;
         // Private test hook runs with the actual original guard installed; the
         // public entry supplies only a zero-sized no-op.
@@ -553,7 +606,7 @@ pub trait OriginalTokenizerBackend: eredu_core::TextGenerationBackend {
     fn prepare_semantic_source(
         _runtime: &eredu_core::ModelRuntime<Self>,
         _source: &OriginalTokenizer,
-        _capacity: u64,
+        _limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<super::PreparedSemanticSource, eredu_core::SpeculativeOutputError> {
         Err(eredu_core::SpeculativeOutputError::Storage(
             "prepared semantic source is unavailable",
@@ -589,7 +642,7 @@ pub trait OriginalTokenizerBackend: eredu_core::TextGenerationBackend {
     fn prepare_original_text_source_budget(
         _runtime: &eredu_core::ModelRuntime<Self>,
         _source: &OriginalTokenizer,
-        _capacity: u64,
+        _limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<OriginalTextSourceBudget, OriginalTextSourceError> {
         Err(eredu_core::TokenInputRejection::Unsupported.into())
     }

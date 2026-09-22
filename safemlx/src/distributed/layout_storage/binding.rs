@@ -36,7 +36,9 @@ pub enum GroupCpuBindingError {
     NativeSource(#[source] GroupStorageUnavailable),
     /// The first differing source field, including the exact allocation-class
     /// index when it comes from an array of request facts.
-    #[error("collective {population:?} field {field}, index {index:?}, differs: expected {expected}, actual {actual}")]
+    #[error(
+        "collective {population:?} field {field}, index {index:?}, differs: expected {expected}, actual {actual}"
+    )]
     Population {
         /// Native worker whose exact source differed.
         population: GroupCpuBindingPopulation,
@@ -60,34 +62,60 @@ pub enum GroupCpuBindingPopulation {
     Evaluation,
 }
 
-pub(super) fn geometry(expected: &[i32], dtype: Dtype, actual: &[i32], scalar: Dtype)
-    -> Result<(), GroupCpuBindingError>
-{
+pub(super) fn geometry(
+    expected: &[i32],
+    dtype: Dtype,
+    actual: &[i32],
+    scalar: Dtype,
+) -> Result<(), GroupCpuBindingError> {
     if expected.len() != actual.len() {
-        return Err(GroupCpuBindingError::Rank { expected: expected.len(), actual: actual.len() });
+        return Err(GroupCpuBindingError::Rank {
+            expected: expected.len(),
+            actual: actual.len(),
+        });
     }
     for (axis, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
         if expected != actual {
-            return Err(GroupCpuBindingError::Dimension { axis, expected, actual });
+            return Err(GroupCpuBindingError::Dimension {
+                axis,
+                expected,
+                actual,
+            });
         }
     }
     if dtype != scalar {
-        return Err(GroupCpuBindingError::Scalar { expected: dtype, actual: scalar });
+        return Err(GroupCpuBindingError::Scalar {
+            expected: dtype,
+            actual: scalar,
+        });
     }
     Ok(())
 }
 
 pub(super) fn control_bytes() -> Option<usize> {
     let frames = [
-        size_of::<GroupCpuBindingError>(), size_of::<Result<(), GroupCpuBindingError>>(),
+        size_of::<GroupCpuBindingError>(),
+        size_of::<Result<(), GroupCpuBindingError>>(),
         size_of::<(&[i32], Dtype, &[i32], Dtype)>(),
-        size_of::<std::iter::Enumerate<std::iter::Zip<std::slice::Iter<'_, i32>, std::slice::Iter<'_, i32>>>>(),
-        size_of::<Option<(usize, (&i32, &i32))>>(), size_of::<(usize, i32, i32)>(),
+        size_of::<
+            std::iter::Enumerate<
+                std::iter::Zip<std::slice::Iter<'_, i32>, std::slice::Iter<'_, i32>>,
+            >,
+        >(),
+        size_of::<Option<(usize, (&i32, &i32))>>(),
+        size_of::<(usize, i32, i32)>(),
         size_of::<(&[usize], &[usize])>(),
-        size_of::<std::iter::Enumerate<std::iter::Zip<std::slice::Iter<'_, usize>, std::slice::Iter<'_, usize>>>>(),
-        size_of::<Option<(usize, (&usize, &usize))>>(), size_of::<(usize, usize, usize)>(),
+        size_of::<
+            std::iter::Enumerate<
+                std::iter::Zip<std::slice::Iter<'_, usize>, std::slice::Iter<'_, usize>>,
+            >,
+        >(),
+        size_of::<Option<(usize, (&usize, &usize))>>(),
+        size_of::<(usize, usize, usize)>(),
     ];
-    frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
 }
 
 // Keep one comparison per source field. No diagnostic vector or clone is
@@ -117,9 +145,10 @@ macro_rules! arrays {
         }
     )*};
 }
-pub(super) fn constructor(a: &safemlx_sys::mlx_distributed_constructor_storage,
-    b: &safemlx_sys::mlx_distributed_constructor_storage) -> Result<(), GroupCpuBindingError>
-{
+pub(super) fn constructor(
+    a: &safemlx_sys::mlx_distributed_constructor_storage,
+    b: &safemlx_sys::mlx_distributed_constructor_storage,
+) -> Result<(), GroupCpuBindingError> {
     // Named inspection frames legitimately differ between layout and Array.
     // All semantic and allocation population facts must remain identical.
     fields!(Constructor, a, b; output_rank, output_elements, primitives,
@@ -128,9 +157,10 @@ pub(super) fn constructor(a: &safemlx_sys::mlx_distributed_constructor_storage,
     arrays!(Constructor, a, b; request_bytes, request_alignments, request_counts);
     Ok(())
 }
-pub(super) fn evaluation(a: &safemlx_sys::mlx_distributed_cpu_eval_storage,
-    b: &safemlx_sys::mlx_distributed_cpu_eval_storage) -> Result<(), GroupCpuBindingError>
-{
+pub(super) fn evaluation(
+    a: &safemlx_sys::mlx_distributed_cpu_eval_storage,
+    b: &safemlx_sys::mlx_distributed_cpu_eval_storage,
+) -> Result<(), GroupCpuBindingError> {
     fields!(Evaluation, a, b; operation, peer, input_rank, output_rank, inputs,
         tracer, possible_copy, backing_births, data_captures, temporary_batches,
         logical_backing_bytes, copy_backing_bytes, output_backing_bytes,
@@ -150,27 +180,52 @@ mod tests {
 
     #[test]
     fn exact_binding_reports_geometry_and_distinguishes_worker_population() {
-        assert_eq!(geometry(&[2, 3], Dtype::Float32, &[6], Dtype::Float32),
-            Err(GroupCpuBindingError::Rank { expected: 2, actual: 1 }));
-        assert_eq!(geometry(&[2, 3], Dtype::Float32, &[2, 4], Dtype::Float32),
-            Err(GroupCpuBindingError::Dimension { axis: 1, expected: 3, actual: 4 }));
-        assert!(matches!(geometry(&[2, 3], Dtype::Float32, &[2, 3], Dtype::Float16),
-            Err(GroupCpuBindingError::Scalar { .. })));
+        assert_eq!(
+            geometry(&[2, 3], Dtype::Float32, &[6], Dtype::Float32),
+            Err(GroupCpuBindingError::Rank {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            geometry(&[2, 3], Dtype::Float32, &[2, 4], Dtype::Float32),
+            Err(GroupCpuBindingError::Dimension {
+                axis: 1,
+                expected: 3,
+                actual: 4
+            })
+        );
+        assert!(matches!(
+            geometry(&[2, 3], Dtype::Float32, &[2, 3], Dtype::Float16),
+            Err(GroupCpuBindingError::Scalar { .. })
+        ));
         let a = safemlx_sys::mlx_distributed_constructor_storage::default();
         let mut b = a;
         b.named_control_bytes = 7;
         assert_eq!(constructor(&a, &b), Ok(()));
         b.request_counts[1] = 3;
-        assert_eq!(constructor(&a, &b), Err(GroupCpuBindingError::Population {
-            population: GroupCpuBindingPopulation::Constructor, field: "request_counts",
-            index: Some(1), expected: 0, actual: 3,
-        }));
+        assert_eq!(
+            constructor(&a, &b),
+            Err(GroupCpuBindingError::Population {
+                population: GroupCpuBindingPopulation::Constructor,
+                field: "request_counts",
+                index: Some(1),
+                expected: 0,
+                actual: 3,
+            })
+        );
         let a = safemlx_sys::mlx_distributed_cpu_eval_storage::default();
         let mut b = a;
         b.communication.pool_jobs = 2;
-        assert_eq!(evaluation(&a, &b), Err(GroupCpuBindingError::Population {
-            population: GroupCpuBindingPopulation::Evaluation, field: "communication.pool_jobs",
-            index: None, expected: 0, actual: 2,
-        }));
+        assert_eq!(
+            evaluation(&a, &b),
+            Err(GroupCpuBindingError::Population {
+                population: GroupCpuBindingPopulation::Evaluation,
+                field: "communication.pool_jobs",
+                index: None,
+                expected: 0,
+                actual: 2,
+            })
+        );
     }
 }

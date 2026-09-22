@@ -28,6 +28,7 @@ fn reclaim_until(drops: &Arc<AtomicUsize>, expected: usize, stream: &Stream) {
     stream.synchronize().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while drops.load(Ordering::SeqCst) != expected {
+        crate::memory::clear_cache().unwrap();
         reclaim_allocation_owners();
         assert!(std::time::Instant::now() < deadline, "owner did not retire");
         std::thread::yield_now();

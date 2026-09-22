@@ -16,7 +16,7 @@ fn source() -> MemoryWeightStore {
 }
 
 fn required<P: SharedNativeInitializer>(plan: &P) -> Option<u64> {
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -55,16 +55,16 @@ fn direct_source_inference_retains_output_after_borrowed_inputs_retire() {
     let Some(bytes) = required(&plan) else {
         return;
     };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let metadata = pool.initialize_shared_native(plan).unwrap();
     drop(catalog);
     drop((batch, keys, source, selection));
     assert_eq!(metadata.output().shape(), [2, 2]);
     assert_eq!(metadata.output().byte_len(), 4);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     metadata.validate_pool(&pool).unwrap();
     drop(metadata);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn invalid_permutation_keeps_owned_axes_and_charge_after_input_retirement() {
     let Some(bytes) = required(&plan) else {
         return;
     };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let failure = pool.initialize_shared_native(plan).unwrap_err();
     let (rejected, failure) = failure.into_parts();
     assert!(rejected.is_none());
@@ -105,7 +105,7 @@ fn invalid_permutation_keeps_owned_axes_and_charge_after_input_retirement() {
             .unwrap()
             .is::<RecipeInferenceError>()
     );
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

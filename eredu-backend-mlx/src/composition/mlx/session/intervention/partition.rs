@@ -1,4 +1,5 @@
 //! Paid component-then-window updates over actual local native source geometry.
+use super::model::NativeCustody;
 use super::{NativeInterventionEstimator, PreparedStaticActivation};
 use crate::backend::array_copy::{
     CaptureCompletion, CaptureNativePopulation, CaptureTensorNativeError as Failure,
@@ -6,31 +7,29 @@ use crate::backend::array_copy::{
 use eredu_architectures::component_partition::PartitionInterventionMemberLayout;
 use eredu_core::{capture::*, intervention::*};
 use eredu_nn::{
-    workspace::{
-        WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding, WorkspaceTensor,
-    },
     Tensor,
-};
-use eredu_runtime::{
-    capture::partition::PartitionInterventionLocalAllowance,
-    working_memory::{CaptureInterventionClaim, WorkingMemoryFundingScope},
+    workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError, WorkspaceTensor},
 };
 use eredu_runtime::{
     capture::CaptureProtocolError,
     intervention::{
-        intervention_window_metadata, InterventionPrefillWindow,
-        PartitionInterventionProjectionCost, PreparedPartitionInterventionProjection,
-        PreparedWindowInterventionPayload,
+        InterventionPrefillWindow, PartitionInterventionProjectionCost,
+        PreparedPartitionInterventionProjection, PreparedWindowInterventionPayload,
+        intervention_window_metadata,
     },
     working_memory::OriginalInterventionSource,
+};
+use eredu_runtime::{
+    capture::partition::PartitionInterventionLocalAllowance,
+    working_memory::{CaptureInterventionClaim, WorkingMemoryFundingScope},
 };
 use safemlx::{Array, OriginalScopeObserver, Stream};
 use std::{
     cell::RefCell,
     mem::{size_of, size_of_val},
 };
-mod identity;
 mod evidence;
+mod identity;
 pub(in crate::composition::mlx::session) use evidence::PreparedPartitionEvidenceSource;
 
 type Result<T> = std::result::Result<T, eredu_nn::Error>;
@@ -46,6 +45,8 @@ pub(crate) struct PreparedPartitionModelIntervention {
     shape: Vec<u64>,
     dtype: InterventionDtype,
     window: Option<InterventionPrefillWindow>,
+    invocation: Option<CaptureInvocationShape>,
+    invocation_window: Option<CaptureInvocationWindow>,
     updates: Vec<Update>,
     usage: CaptureUsage,
     projection_usage: [CaptureUsage; 2],
@@ -130,7 +131,7 @@ impl PreparedPartitionModelIntervention {
                 funding.clone(),
             )
             .map_err(|e| context.metadata_source(e))?;
-            Self::trace_projection(projection,window,input,wait,context,retained)
+            Self::trace_projection(projection, window, input, wait, context, retained)
         })();
         attempted.map_err(|cause| {
             context.metadata_source(SourceFailure {
@@ -142,65 +143,141 @@ impl PreparedPartitionModelIntervention {
     }
     /// Consume the previously bound paid component source at its actual hook.
     /// The pending owner is never reconstructed from a caller's local shape.
-    pub(crate) fn prepare_projection(projection: PreparedPartitionInterventionProjection,
-        window: Option<InterventionPrefillWindow>, physical_shape: &[u64],
-        wait: eredu_core::BoundedCompletionWait, context: &WorkspaceContext,
-        ) -> Result<Self> {
-        Self::prepare_projection_with_evidence(projection,window,physical_shape,wait,None,context)
+    pub(crate) fn prepare_projection(
+        projection: PreparedPartitionInterventionProjection,
+        window: Option<InterventionPrefillWindow>,
+        physical_shape: &[u64],
+        wait: eredu_core::BoundedCompletionWait,
+        context: &WorkspaceContext,
+    ) -> Result<Self> {
+        Self::prepare_projection_with_evidence(
+            projection,
+            window,
+            physical_shape,
+            wait,
+            None,
+            context,
+        )
     }
     pub(in crate::composition::mlx::session) fn prepare_projection_with_evidence(
-        projection:PreparedPartitionInterventionProjection,window:Option<InterventionPrefillWindow>,
-        physical_shape:&[u64],wait:eredu_core::BoundedCompletionWait,
-        evidence:Option<PreparedPartitionEvidenceSource>,context:&WorkspaceContext,
-    )->Result<Self> {
+        projection: PreparedPartitionInterventionProjection,
+        window: Option<InterventionPrefillWindow>,
+        physical_shape: &[u64],
+        wait: eredu_core::BoundedCompletionWait,
+        evidence: Option<PreparedPartitionEvidenceSource>,
+        context: &WorkspaceContext,
+    ) -> Result<Self> {
+        let invocation = projection.coordinate().3;
+        Self::prepare_model_projection_with_evidence(
+            projection,
+            window,
+            invocation,
+            None,
+            physical_shape,
+            wait,
+            evidence,
+            context,
+        )
+    }
+    /// The shared component-then-window worker with exact model coordinates.
+    pub(in crate::composition::mlx::session) fn prepare_model_projection_with_evidence(
+        projection: PreparedPartitionInterventionProjection,
+        window: Option<InterventionPrefillWindow>,
+        physical: Option<CaptureInvocationShape>,
+        invocation_window: Option<CaptureInvocationWindow>,
+        physical_shape: &[u64],
+        wait: eredu_core::BoundedCompletionWait,
+        evidence: Option<PreparedPartitionEvidenceSource>,
+        context: &WorkspaceContext,
+    ) -> Result<Self> {
         context.charge_metadata(Self::control_bytes().ok_or(WorkspaceMetadataError::Overflow)?)?;
-        let funding=context.metadata_funding().ok_or(WorkspaceMetadataError::Unqualified)?;
-        let source=projection.source().clone();
-        let attempted=(|| {
-            let (operation,phase,prediction,invocation)=projection.coordinate();
-            let plan=source.plan().admission();
-            let point=&plan.points()[operation];
-            let declaration=&plan.plan().operations[operation];
-            if point.routing.is_some() || point.routed_units.is_some()
-                || (declaration.evidence!=InterventionEvidence::None)!=evidence.is_some()
-                || evidence.as_ref().is_some_and(|source|!source.matches(&projection,physical_shape,window))
-                {return Err(context.metadata_source(CaptureProtocolError::Geometry));}
-            let dtype=declaration.action.dtype().ok_or_else(||context.metadata_source(Failure::ShapeMismatch))?;
-            let mut shape=context.metadata_vec(physical_shape.len())?;
+        let funding = context
+            .metadata_funding()
+            .ok_or(WorkspaceMetadataError::Unqualified)?;
+        let source = projection.source().clone();
+        let attempted = (|| {
+            let (operation, phase, prediction, invocation) = projection.coordinate();
+            let plan = source.plan().admission();
+            let point = &plan.points()[operation];
+            let declaration = &plan.plan().operations[operation];
+            if point.routing.is_some()
+                || point.routed_units.is_some()
+                || (declaration.evidence != InterventionEvidence::None) != evidence.is_some()
+                || evidence.as_ref().is_some_and(|source| {
+                    !source.matches_model(
+                        &projection,
+                        physical_shape,
+                        window,
+                        physical,
+                        invocation_window,
+                    )
+                })
+            {
+                return Err(context.metadata_source(CaptureProtocolError::Geometry));
+            }
+            let dtype = declaration
+                .action
+                .dtype()
+                .ok_or_else(|| context.metadata_source(Failure::ShapeMismatch))?;
+            let logical = physical
+                .map(|physical| match invocation_window {
+                    Some(window) => window.validate(physical),
+                    None => {
+                        physical.validate()?;
+                        Ok(physical)
+                    }
+                })
+                .transpose()
+                .map_err(|e| context.metadata_source(e))?;
+            if logical != invocation
+                || (window.is_some() && (physical.is_some() || invocation_window.is_some()))
+                || (physical.is_none() && invocation_window.is_some())
+            {
+                return Err(context.metadata_source(CaptureProtocolError::Invocation));
+            }
+            let row_window = match window {
+                Some(window) => Some((window.physical(), window.window())),
+                None => physical.zip(invocation_window),
+            };
+            let mut shape = context.metadata_vec(physical_shape.len())?;
             shape.extend_from_slice(physical_shape);
-            let row_axis = if let Some(window) = window {
+            if let Some(window) = window {
                 if invocation.is_some() || (phase, prediction) != (CapturePhase::Prefill, 0) {
                     return Err(context.metadata_source(CaptureProtocolError::Invocation));
                 }
                 window
                     .validate(plan)
                     .map_err(|e| context.metadata_source(e))?;
-                let valid=if evidence.is_some() {
-                    InterventionPrefillWindow::validate_partition_evidence_operation(&source,operation)
-                }else {InterventionPrefillWindow::validate_operation(plan,operation)};
-                valid.map_err(|e|context.metadata_source(e))?;
+                let valid = if evidence.is_some() {
+                    InterventionPrefillWindow::validate_evidence_operation(&source, operation)
+                } else {
+                    InterventionPrefillWindow::validate_operation(plan, operation)
+                };
+                valid.map_err(|e| context.metadata_source(e))?;
+            }
+            let row_axis = if let Some((physical, window)) = row_window {
                 if shape.len() != projection.local_shape().len()
-                    || shape.get(projection.component_axis()) != projection.local_shape().get(projection.component_axis())
+                    || shape.get(projection.component_axis())
+                        != projection.local_shape().get(projection.component_axis())
                 {
                     return Err(context.metadata_source(Failure::ShapeMismatch));
                 }
-                // Validate the actual local component extent first. The shared
-                // row validator then receives its retained global-axis geometry,
-                // not a fabricated WorkspaceTensor or completed-value witness.
                 let mut global_physical = context.metadata_vec(shape.len())?;
                 global_physical.extend_from_slice(&shape);
-                global_physical[projection.component_axis()] = projection.global_shape()[projection.component_axis()];
+                global_physical[projection.component_axis()] =
+                    projection.global_shape()[projection.component_axis()];
                 let mut global_logical = vector(shape.len(), context)?;
                 let (_, axis) = window
-                    .window()
                     .source_axes_into(
-                        window.physical(),
+                        physical,
                         Some(&point.axes),
                         &global_physical,
                         &mut global_logical,
                     )
                     .map_err(|e| context.metadata_source(e))?;
-                if global_logical != projection.global_shape() || axis == projection.component_axis() {
+                if global_logical != projection.global_shape()
+                    || axis == projection.component_axis()
+                {
                     return Err(context.metadata_source(Failure::ShapeMismatch));
                 }
                 Some(axis)
@@ -219,10 +296,13 @@ impl PreparedPartitionModelIntervention {
                     .update(region)
                     .ok_or_else(|| context.metadata_source(CaptureProtocolError::Geometry))?;
                 let (slice, payload) = if let Some(axis) = row_axis {
-                    let span = window.expect("validated row window");
+                    let (physical, span) = row_window.expect("validated row window");
                     let mut local = slice(shape.len(), context)?;
                     let mut destination = slice(shape.len(), context)?;
-                    let [start, end] = span.range();
+                    let start = span.start;
+                    let end = start
+                        .checked_add(physical.sequence)
+                        .ok_or(WorkspaceMetadataError::Overflow)?;
                     if !CaptureSlicePartition::contiguous_fragment_into(
                         projection.local_shape(),
                         original.slice,
@@ -277,7 +357,7 @@ impl PreparedPartitionModelIntervention {
                 projection
                     .projection_usage()
                     .map_err(|e| context.metadata_source(e))?,
-                if window.is_some() {
+                if row_window.is_some() {
                     intervention_window_metadata(declaration, point)
                         .and_then(|m| m.checked_add(window_cost.usage()))
                         .map_err(|e| context.metadata_source(e))?
@@ -295,92 +375,139 @@ impl PreparedPartitionModelIntervention {
                 shape,
                 dtype,
                 window,
+                invocation: physical,
+                invocation_window,
                 updates,
                 usage,
                 projection_usage,
                 source_usage,
                 execution_identity: [0; 32],
                 funding: funding.clone(),
-                traced:false,
+                traced: false,
                 evidence,
             };
             owner.execution_identity =
                 identity::identity(&owner).map_err(|e| context.metadata_source(e))?;
             Ok(owner)
         })();
-        attempted.map_err(|cause|context.metadata_source(SourceFailure {cause,_source:source,_funding:funding}))
+        attempted.map_err(|cause| {
+            context.metadata_source(SourceFailure {
+                cause,
+                _source: source,
+                _funding: funding,
+            })
+        })
     }
     /// Bind only the actual local tensor to a prepared immutable member source.
-    pub(crate) fn trace_projection(projection:PreparedPartitionInterventionProjection,
-        window:Option<InterventionPrefillWindow>,input:&WorkspaceTensor,wait:eredu_core::BoundedCompletionWait,
-        context:&WorkspaceContext,retained:&mut Vec<WorkspaceTensor>)
-        ->Result<(Self,Option<WorkspaceTensor>,CaptureNativePopulation)> {
-        if input.shape().len()>32 {return Err(context.metadata_source(Failure::ShapeMismatch));}
-        let mut shape=[0u64;32];
-        for (out,&actual) in shape.iter_mut().zip(input.shape()) {*out=u64::try_from(actual).map_err(|e|context.metadata_source(e))?;}
-        let mut owner=Self::prepare_projection(projection,window,&shape[..input.shape().len()],wait,context)?;
-        let (output,population)=owner.trace_bound(input,context,retained)?;
-        Ok((owner,output,population))
+    pub(crate) fn trace_projection(
+        projection: PreparedPartitionInterventionProjection,
+        window: Option<InterventionPrefillWindow>,
+        input: &WorkspaceTensor,
+        wait: eredu_core::BoundedCompletionWait,
+        context: &WorkspaceContext,
+        retained: &mut Vec<WorkspaceTensor>,
+    ) -> Result<(Self, Option<WorkspaceTensor>, CaptureNativePopulation)> {
+        if input.shape().len() > 32 {
+            return Err(context.metadata_source(Failure::ShapeMismatch));
+        }
+        let mut shape = [0u64; 32];
+        for (out, &actual) in shape.iter_mut().zip(input.shape()) {
+            *out = u64::try_from(actual).map_err(|e| context.metadata_source(e))?;
+        }
+        let mut owner = Self::prepare_projection(
+            projection,
+            window,
+            &shape[..input.shape().len()],
+            wait,
+            context,
+        )?;
+        let (output, population) = owner.trace_bound(input, context, retained)?;
+        Ok((owner, output, population))
     }
     /// A peer descriptor has no native binding. Only this actual local source
     /// trace can make the retained program usable by a native allowance.
-    pub(crate) fn trace_bound(&mut self,input:&WorkspaceTensor,context:&WorkspaceContext,
-        retained:&mut Vec<WorkspaceTensor>)->Result<(Option<WorkspaceTensor>,CaptureNativePopulation)> {
+    pub(crate) fn trace_bound(
+        &mut self,
+        input: &WorkspaceTensor,
+        context: &WorkspaceContext,
+        retained: &mut Vec<WorkspaceTensor>,
+    ) -> Result<(Option<WorkspaceTensor>, CaptureNativePopulation)> {
         context.charge_metadata(Self::control_bytes().ok_or(WorkspaceMetadataError::Overflow)?)?;
-        if self.traced || context.metadata_funding().is_none_or(|funding|!funding.same_account(&self.funding)) {
+        if self.traced
+            || context
+                .metadata_funding()
+                .is_none_or(|funding| !funding.same_account(&self.funding))
+        {
             return Err(context.metadata_source(Failure::SourceChanged));
         }
         context.validate_values([input])?;
-        PreparedStaticActivation::validate_workspace_source(input,self.dtype).map_err(|e|context.metadata_source(e))?;
-        if input.shape().len()!=self.shape.len() || input.shape().iter().zip(&self.shape)
-            .any(|(&a,&b)|u64::try_from(a).ok()!=Some(b)) {return Err(context.metadata_source(Failure::ShapeMismatch));}
-            let mut population = self.trace_boundary(input, context, retained)?;
-            population.controls = population
-                .controls
-                .checked_add(
-                    Self::execution_control_bytes().ok_or(WorkspaceMetadataError::Overflow)?,
-                )
+        PreparedStaticActivation::validate_workspace_source(input, self.dtype)
+            .map_err(|e| context.metadata_source(e))?;
+        if input.shape().len() != self.shape.len()
+            || input
+                .shape()
+                .iter()
+                .zip(&self.shape)
+                .any(|(&a, &b)| u64::try_from(a).ok() != Some(b))
+        {
+            return Err(context.metadata_source(Failure::ShapeMismatch));
+        }
+        let mut population = self.trace_boundary(input, context, retained)?;
+        population.controls = population
+            .controls
+            .checked_add(Self::execution_control_bytes().ok_or(WorkspaceMetadataError::Overflow)?)
+            .ok_or(WorkspaceMetadataError::Overflow)?;
+        if let Some(evidence) = &mut self.evidence {
+            population = population
+                .checked_add(evidence.trace(
+                    InterventionEvidenceSide::Before,
+                    input,
+                    context,
+                    retained,
+                )?)
                 .ok_or(WorkspaceMetadataError::Overflow)?;
-            if let Some(evidence)=&mut self.evidence {
-                population=population.checked_add(evidence.trace(InterventionEvidenceSide::Before,input,context,retained)?)
-                    .ok_or(WorkspaceMetadataError::Overflow)?;
-            }
-            let mut output = None;
-            for index in 0..self.updates.len() {
-                let program = self
-                    .program(index)
-                    .map_err(|e| context.metadata_source(e))?;
-                let native = program
-                    .population()
-                    .map_err(|e| context.metadata_source(e))?;
-                let next = program
-                    .trace(output.as_ref().unwrap_or(input), context, retained)
-                    .map_err(|e| context.metadata_source(e))?;
-                population = population
-                    .checked_add(CaptureNativePopulation {
-                        publications: 0,
-                        completions: native.completions,
-                        retained_roots: native.retained_roots,
-                        controls: native
-                            .controls
-                            .checked_add(native.host_bytes)
-                            .ok_or(WorkspaceMetadataError::Overflow)?,
-                    })
-                    .ok_or(WorkspaceMetadataError::Overflow)?;
-                output = Some(next);
-            }
-            if let Some(output) = &output {
-                population = population
-                    .checked_add(self.trace_boundary(output, context, retained)?)
-                    .ok_or(WorkspaceMetadataError::Overflow)?;
-            }
-            if let Some(evidence)=&mut self.evidence {
-                population=population.checked_add(evidence.trace(InterventionEvidenceSide::After,
-                    output.as_ref().unwrap_or(input),context,retained)?)
-                    .ok_or(WorkspaceMetadataError::Overflow)?;
-            }
-            self.traced=true;
-            Ok((output,population))
+        }
+        let mut output = None;
+        for index in 0..self.updates.len() {
+            let program = self
+                .program(index)
+                .map_err(|e| context.metadata_source(e))?;
+            let native = program
+                .population()
+                .map_err(|e| context.metadata_source(e))?;
+            let next = program
+                .trace(output.as_ref().unwrap_or(input), context, retained)
+                .map_err(|e| context.metadata_source(e))?;
+            population = population
+                .checked_add(CaptureNativePopulation {
+                    publications: 0,
+                    completions: native.completions,
+                    retained_roots: native.retained_roots,
+                    controls: native
+                        .controls
+                        .checked_add(native.host_bytes)
+                        .ok_or(WorkspaceMetadataError::Overflow)?,
+                })
+                .ok_or(WorkspaceMetadataError::Overflow)?;
+            output = Some(next);
+        }
+        if let Some(output) = &output {
+            population = population
+                .checked_add(self.trace_boundary(output, context, retained)?)
+                .ok_or(WorkspaceMetadataError::Overflow)?;
+        }
+        if let Some(evidence) = &mut self.evidence {
+            population = population
+                .checked_add(evidence.trace(
+                    InterventionEvidenceSide::After,
+                    output.as_ref().unwrap_or(input),
+                    context,
+                    retained,
+                )?)
+                .ok_or(WorkspaceMetadataError::Overflow)?;
+        }
+        self.traced = true;
+        Ok((output, population))
     }
     fn program(&self, index: usize) -> std::result::Result<PreparedStaticActivation<'_>, Failure> {
         let update = self.updates.get(index).ok_or(Failure::ClaimMismatch)?;
@@ -418,14 +545,24 @@ impl PreparedPartitionModelIntervention {
         claim: &CaptureInterventionClaim<'_>,
         scope: &WorkingMemoryFundingScope,
     ) -> std::result::Result<(), NativeFailure> {
-        if !self.traced {return Err(Failure::SourceChanged.into());}
-        claim.validate_native_custody(scope)?;
+        self.validate_with_custody(value, claim, NativeCustody::Scheduled(scope))
+    }
+    pub(in crate::composition::mlx::session) fn validate_with_custody(
+        &self,
+        value: &Array,
+        claim: &CaptureInterventionClaim<'_>,
+        custody: NativeCustody<'_>,
+    ) -> std::result::Result<(), NativeFailure> {
+        if !self.traced {
+            return Err(Failure::SourceChanged.into());
+        }
+        custody.validate(claim)?;
         claim.validate_source(self.projection.source())?;
-        let (operation, phase, prediction, invocation) = self.projection.coordinate();
+        let (operation, phase, prediction, _) = self.projection.coordinate();
         if claim.index() != operation
             || claim.coordinate() != (phase, prediction)
-            || claim.invocation() != invocation
-            || claim.invocation_window().is_some()
+            || claim.invocation() != self.invocation
+            || claim.invocation_window() != self.invocation_window
         {
             return Err(Failure::ClaimMismatch.into());
         }
@@ -460,7 +597,27 @@ impl PreparedPartitionModelIntervention {
         observer: &OriginalScopeObserver,
         roots: &RefCell<Vec<Array>>,
     ) -> std::result::Result<Option<Array>, NativeFailure> {
-        self.validate_source(value, claim, scope)?;
+        self.execute_with_custody(
+            value,
+            claim,
+            allowance,
+            NativeCustody::Scheduled(scope),
+            stream,
+            observer,
+            roots,
+        )
+    }
+    pub(in crate::composition::mlx::session) fn execute_with_custody(
+        &self,
+        value: &Array,
+        claim: &CaptureInterventionClaim<'_>,
+        allowance: &mut PartitionInterventionLocalAllowance,
+        custody: NativeCustody<'_>,
+        stream: &Stream,
+        observer: &OriginalScopeObserver,
+        roots: &RefCell<Vec<Array>>,
+    ) -> std::result::Result<Option<Array>, NativeFailure> {
+        self.validate_with_custody(value, claim, custody)?;
         allowance.validate(
             claim,
             &self.projection,
@@ -504,7 +661,7 @@ impl PreparedPartitionModelIntervention {
                 &Array,
                 &CaptureInterventionClaim<'_>,
                 &mut PartitionInterventionLocalAllowance,
-                &WorkingMemoryFundingScope,
+                NativeCustody<'_>,
                 &Stream,
                 &OriginalScopeObserver,
                 &RefCell<Vec<Array>>,
@@ -519,7 +676,9 @@ impl PreparedPartitionModelIntervention {
             .into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
     }
-    pub(in crate::composition::mlx::session) fn evidence(&self)->Option<&PreparedPartitionEvidenceSource> {
+    pub(in crate::composition::mlx::session) fn evidence(
+        &self,
+    ) -> Option<&PreparedPartitionEvidenceSource> {
         self.evidence.as_ref()
     }
     pub(crate) fn projection(&self) -> &PreparedPartitionInterventionProjection {
@@ -554,11 +713,20 @@ impl PreparedPartitionModelIntervention {
             size_of::<[Vec<u64>; 4]>(),
             size_of::<[ResolvedCaptureSlice; 2]>(),
             size_of::<Option<PreparedWindowInterventionPayload>>(),
+            size_of::<Option<CaptureInvocationShape>>() * 3,
+            size_of::<Option<CaptureInvocationWindow>>() * 2,
+            size_of::<Option<(CaptureInvocationShape, CaptureInvocationWindow)>>(),
             size_of::<PartitionInterventionMemberLayout<'_>>(),
             identity::control_bytes()?,
             PreparedPartitionEvidenceSource::control_bytes()?,
-            size_of::<(PreparedPartitionInterventionProjection,Option<InterventionPrefillWindow>,&[u64],
-                eredu_core::BoundedCompletionWait,Option<PreparedPartitionEvidenceSource>,&WorkspaceContext)>(),
+            size_of::<(
+                PreparedPartitionInterventionProjection,
+                Option<InterventionPrefillWindow>,
+                &[u64],
+                eredu_core::BoundedCompletionWait,
+                Option<PreparedPartitionEvidenceSource>,
+                &WorkspaceContext,
+            )>(),
             size_of::<(
                 &OriginalInterventionSource,
                 usize,

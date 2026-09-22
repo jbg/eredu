@@ -35,14 +35,15 @@ pub struct SpeculativeExecutionStreams<'a> {
     topology: SpeculativeExecutionTopology,
     capture: Option<&'a super::super::session::SpeculativePartitionBinding>,
     memory_owner: Option<&'a crate::backend::managed_memory::NativeMemoryOwner>,
-    memory_pool: Option<&'a eredu_runtime::working_memory::WorkingMemoryPool>,
+    memory_ledger: Option<&'a eredu_runtime::working_memory::MemoryLedger>,
     original: Option<OriginalExecution<'a>>,
     numerical: Option<OriginalNumericalExecution<'a>>,
     embedded: Option<&'a dyn EmbeddedInvocationSource>,
     external: Option<&'a dyn ExternalInvocationSource>,
     external_origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
     embedded_invocation: Option<&'a dyn EmbeddedNumericalInvocation>,
-    tensor_sources: Option<&'a [&'a eredu_architectures::speculative_execution::PreparedEmbeddedEvidence]>,
+    tensor_sources:
+        Option<&'a [&'a eredu_architectures::speculative_execution::PreparedEmbeddedEvidence]>,
     prefill_input: Option<&'a super::super::prepared_speculative::OriginalEmbeddedPrefillInput>,
     cache_preparation: Option<&'a super::super::replicated_text::OriginalEmbeddedCachePreparation>,
     // A finite immutable table constructed before the shared visitor. Selected
@@ -83,7 +84,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             topology,
             capture: None,
             memory_owner: None,
-            memory_pool: None,
+            memory_ledger: None,
             original: None,
             numerical: None,
             embedded: None,
@@ -118,7 +119,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             topology: SpeculativeExecutionTopology::Single,
             capture: None,
             memory_owner: None,
-            memory_pool: None,
+            memory_ledger: None,
             original: None,
             numerical: None,
             embedded: None,
@@ -141,7 +142,10 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         environment: &'a OriginalCopyEnvironment<'a>,
     ) -> Result<Self, Error> {
         self = self.with_original_numerical_sources(sources.numerical_sources(), environment)?;
-        self.original = Some(OriginalExecution { sources, environment });
+        self.original = Some(OriginalExecution {
+            sources,
+            environment,
+        });
         Ok(self)
     }
     /// Borrows the same admitted numerical source for any exact speculative
@@ -170,30 +174,51 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             // binder own independent by-value context/result transports.
             std::mem::size_of::<Self>(),
             std::mem::size_of::<Result<Self, Error>>(),
-            std::mem::size_of::<(&OriginalSpeculativeNumericalSources,
-                &OriginalCopyEnvironment<'_>, &OriginalCopyEnvironment<'_>)>(),
+            std::mem::size_of::<(
+                &OriginalSpeculativeNumericalSources,
+                &OriginalCopyEnvironment<'_>,
+                &OriginalCopyEnvironment<'_>,
+            )>(),
             std::mem::size_of::<Result<(), Error>>(),
-            eredu_core::BackendFailure::source_retention_peak_bytes::<eredu_runtime::working_memory::WorkingMemoryError>()
-                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?,
+            eredu_core::BackendFailure::source_retention_peak_bytes::<
+                eredu_runtime::working_memory::WorkingMemoryError,
+            >()
+            .ok_or(Error::WorkspacePlanning(
+                eredu_nn::workspace::HostMetadataFundingError::Overflow,
+            ))?,
         ];
-        let bytes=frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?;
-        sources.metadata_funding().reserve_metadata(bytes).map_err(Error::WorkspacePlanning)?;
+        let bytes = frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+            .ok_or(Error::WorkspacePlanning(
+                eredu_nn::workspace::HostMetadataFundingError::Overflow,
+            ))?;
+        sources
+            .metadata_funding()
+            .reserve_metadata(bytes)
+            .map_err(Error::WorkspacePlanning)?;
         sources.validate_environment(environment)?;
         if !std::ptr::eq(environment, draft_environment) {
             sources.validate_environment(draft_environment)?;
         }
-        if self.target != environment.stream() || self.draft != draft_environment.stream()
-            || !environment.pool().same_domain(draft_environment.pool())
-            || self.memory_owner.is_some() || self.capture.is_some()
-            || self.numerical.is_some() || self.original.is_some()
+        if self.target != environment.stream()
+            || self.draft != draft_environment.stream()
+            || !environment.pool().same_ledger(draft_environment.pool())
+            || self.memory_owner.is_some()
+            || self.capture.is_some()
+            || self.numerical.is_some()
+            || self.original.is_some()
         {
             return Err(sources.retain_startup_error(
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ));
         }
-        self.memory_pool=Some(environment.pool());
-        self.numerical=Some(OriginalNumericalExecution { sources, environment, draft_environment });
+        self.memory_ledger = Some(environment.pool());
+        self.numerical = Some(OriginalNumericalExecution {
+            sources,
+            environment,
+            draft_environment,
+        });
         Ok(self)
     }
     /// Binds the same accepted Embedded request and its monotonic occurrence
@@ -213,7 +238,8 @@ impl<'a> SpeculativeExecutionStreams<'a> {
 
     /// Borrows the exact separately materialized assistant request. No model
     /// invocation or native scope is created by this source handoff.
-    pub(crate) fn with_original_external_sources(self,
+    pub(crate) fn with_original_external_sources(
+        self,
         sources: &'a dyn ExternalInvocationSource,
         environment: &'a OriginalCopyEnvironment<'a>,
     ) -> Result<Self, Error> {
@@ -221,12 +247,14 @@ impl<'a> SpeculativeExecutionStreams<'a> {
     }
     /// Lends the actual per-side prerequisites for the already selected topology.
     /// This grants no transfer, model occurrence, or new source completion.
-    pub(crate) fn with_original_external_environments(mut self,
+    pub(crate) fn with_original_external_environments(
+        mut self,
         sources: &'a dyn ExternalInvocationSource,
         target: &'a OriginalCopyEnvironment<'a>,
         draft: &'a OriginalCopyEnvironment<'a>,
     ) -> Result<Self, Error> {
-        self = self.with_original_numerical_environments(sources.numerical_sources(), target, draft)?;
+        self =
+            self.with_original_numerical_environments(sources.numerical_sources(), target, draft)?;
         self.external = Some(sources);
         Ok(self)
     }
@@ -235,23 +263,38 @@ impl<'a> SpeculativeExecutionStreams<'a> {
     }
     /// Exact scheduler origin, supplied by the existing external executor hook.
     /// Reborrowing the same context preserves, rather than replaces, its origin.
-    pub(crate) fn with_external_origin(mut self,
+    pub(crate) fn with_external_origin(
+        mut self,
         origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
     ) -> Result<Self, Error> {
-        let Some(source) = self.external else { return Ok(self); };
+        let Some(source) = self.external else {
+            return Ok(self);
+        };
         let funding = source.numerical_sources().metadata_funding();
-        funding.reserve_metadata(std::mem::size_of::<(Self, Result<Self,Error>,
-            Option<eredu_core::speculative::SpeculativeActivationOrigin>)>())
+        funding
+            .reserve_metadata(std::mem::size_of::<(
+                Self,
+                Result<Self, Error>,
+                Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+            )>())
             .map_err(Error::WorkspacePlanning)?;
-        if origin.is_none() || self.external_origin.is_some_and(|prior| Some(prior) != origin) {
+        if origin.is_none()
+            || self
+                .external_origin
+                .is_some_and(|prior| Some(prior) != origin)
+        {
             return Err(source.numerical_sources().retain_startup_error(
-                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         self.external_origin = origin;
         Ok(self)
     }
-    pub(crate) fn external_origin(self)
-        -> Option<eredu_core::speculative::SpeculativeActivationOrigin> { self.external_origin }
+    pub(crate) fn external_origin(
+        self,
+    ) -> Option<eredu_core::speculative::SpeculativeActivationOrigin> {
+        self.external_origin
+    }
 
     /// Shortens the source context to one lexical native invocation. Comparing
     /// the actual borrowed source owner prevents a cross-request scalar producer.
@@ -259,12 +302,14 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         self,
         active: &'scope dyn EmbeddedNumericalInvocation,
     ) -> Result<SpeculativeExecutionStreams<'scope>, Error>
-    where 'a: 'scope,
+    where
+        'a: 'scope,
     {
         let (sources, _) = self.original_numerical().ok_or(Error::PrefillControl(
             eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
         ))?;
-        if self.embedded.is_none() || self.embedded_invocation.is_some()
+        if self.embedded.is_none()
+            || self.embedded_invocation.is_some()
             || !std::ptr::eq(sources, active.sources())
         {
             return Err(sources.retain_startup_error(
@@ -276,92 +321,153 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             std::mem::size_of::<Result<SpeculativeExecutionStreams<'scope>, Error>>(),
             std::mem::size_of::<&dyn EmbeddedNumericalInvocation>(),
         ];
-        sources.metadata_funding().reserve_metadata(
-            controls.into_iter().try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?,
-        ).map_err(Error::WorkspacePlanning)?;
+        sources
+            .metadata_funding()
+            .reserve_metadata(
+                controls
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+                    .ok_or(Error::WorkspacePlanning(
+                        eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                    ))?,
+            )
+            .map_err(Error::WorkspacePlanning)?;
         let mut shortened: SpeculativeExecutionStreams<'scope> = self;
         shortened.embedded_invocation = Some(active);
         Ok(shortened)
     }
     /// Lends a finite authenticated inventory to one external model call.
-    pub(crate) fn with_external_tensor_sources<'scope>(self,
+    pub(crate) fn with_external_tensor_sources<'scope>(
+        self,
         evidence: &'scope [&'scope eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
-    ) -> Result<SpeculativeExecutionStreams<'scope>, Error> where 'a: 'scope {
+    ) -> Result<SpeculativeExecutionStreams<'scope>, Error>
+    where
+        'a: 'scope,
+    {
         if self.external.is_none() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         self.with_tensor_sources(evidence)
     }
     /// Lends only the actual immutable packet evidence for one outer call.
     /// A model phase carries this loan forward; it cannot replace it in scope.
     pub(crate) fn with_embedded_tensor_sources<'scope>(
-        self, evidence: &'scope [&'scope eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
+        self,
+        evidence: &'scope [&'scope eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
     ) -> Result<SpeculativeExecutionStreams<'scope>, Error>
-    where 'a: 'scope,
+    where
+        'a: 'scope,
     {
         if self.embedded.is_none() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         self.with_tensor_sources(evidence)
     }
-    fn with_tensor_sources<'scope>(self,
+    fn with_tensor_sources<'scope>(
+        self,
         evidence: &'scope [&'scope eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
-    ) -> Result<SpeculativeExecutionStreams<'scope>, Error> where 'a: 'scope {
+    ) -> Result<SpeculativeExecutionStreams<'scope>, Error>
+    where
+        'a: 'scope,
+    {
         let (sources, environment) = self.original_numerical().ok_or(Error::PrefillControl(
             eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
         ))?;
-        if (self.embedded.is_none() && self.external.is_none()) || self.embedded_invocation.is_some() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        if (self.embedded.is_none() && self.external.is_none())
+            || self.embedded_invocation.is_some()
+        {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         let parts = [
             std::mem::size_of::<SpeculativeExecutionStreams<'scope>>(),
             std::mem::size_of::<Result<SpeculativeExecutionStreams<'scope>, Error>>(),
             std::mem::size_of_val(&evidence),
-            std::mem::size_of::<std::slice::Iter<'_, &eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>>(),
+            std::mem::size_of::<
+                std::slice::Iter<
+                    '_,
+                    &eredu_architectures::speculative_execution::PreparedEmbeddedEvidence,
+                >,
+            >(),
         ];
-        sources.metadata_funding().reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
+        sources
+            .metadata_funding()
+            .reserve_metadata(
+                parts
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+                    .ok_or(Error::WorkspacePlanning(
+                        eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                    ))?,
+            )
             .map_err(Error::WorkspacePlanning)?;
-        if self.tensor_sources.is_some_and(|prior|prior.len()>evidence.len()
-            || prior.iter().zip(evidence).any(|(a,b)|!std::ptr::eq(*a,*b))) {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        if self.tensor_sources.is_some_and(|prior| {
+            prior.len() > evidence.len()
+                || prior
+                    .iter()
+                    .zip(evidence)
+                    .any(|(a, b)| !std::ptr::eq(*a, *b))
+        }) {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         if self.external.is_some() {
-            super::tensor_sources::validate_external_tensor_sources(evidence,self)?;
+            super::tensor_sources::validate_external_tensor_sources(evidence, self)?;
         } else {
-            super::tensor_sources::validate_tensor_sources(evidence,sources,environment)?;
+            super::tensor_sources::validate_tensor_sources(evidence, sources, environment)?;
         }
         let mut shortened: SpeculativeExecutionStreams<'scope> = self;
         shortened.tensor_sources = Some(evidence);
         Ok(shortened)
     }
-    pub(crate) fn embedded_tensor_sources(self) -> &'a [&'a eredu_architectures::speculative_execution::PreparedEmbeddedEvidence] {
+    pub(crate) fn embedded_tensor_sources(
+        self,
+    ) -> &'a [&'a eredu_architectures::speculative_execution::PreparedEmbeddedEvidence] {
         self.tensor_sources.unwrap_or(&[])
     }
 
     /// Both model schedules lend the same completed B input source. The exact
     /// request/environment checks below remain independent of schedule kind.
-    pub(crate) fn with_original_prefill_input<'scope>(self,
-        input:&'scope super::super::prepared_speculative::OriginalEmbeddedPrefillInput,
-    )->Result<SpeculativeExecutionStreams<'scope>,Error>
-    where 'a:'scope,
+    pub(crate) fn with_original_prefill_input<'scope>(
+        self,
+        input: &'scope super::super::prepared_speculative::OriginalEmbeddedPrefillInput,
+    ) -> Result<SpeculativeExecutionStreams<'scope>, Error>
+    where
+        'a: 'scope,
     {
-        let (sources,environment)=self.original_numerical().ok_or(Error::PrefillControl(
-            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+        let (sources, environment) = self.original_numerical().ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        ))?;
         sources.validate_environment(environment)?;
         input.validate_request(sources)?;
-        if self.prefill_input.is_some() || (self.embedded.is_none() && self.external.is_none()) || self.embedded_invocation.is_some() {
-            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        if self.prefill_input.is_some()
+            || (self.embedded.is_none() && self.external.is_none())
+            || self.embedded_invocation.is_some()
+        {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
-        sources.metadata_funding().reserve_metadata(std::mem::size_of::<(
-            SpeculativeExecutionStreams<'scope>,Result<SpeculativeExecutionStreams<'scope>,Error>,
-        )>()).map_err(Error::WorkspacePlanning)?;
-        let mut scoped:SpeculativeExecutionStreams<'scope>=self;
-        scoped.prefill_input=Some(input);
+        sources
+            .metadata_funding()
+            .reserve_metadata(std::mem::size_of::<(
+                SpeculativeExecutionStreams<'scope>,
+                Result<SpeculativeExecutionStreams<'scope>, Error>,
+            )>())
+            .map_err(Error::WorkspacePlanning)?;
+        let mut scoped: SpeculativeExecutionStreams<'scope> = self;
+        scoped.prefill_input = Some(input);
         Ok(scoped)
     }
-    pub(crate) fn original_prefill_input(self)->Option<&'a super::super::prepared_speculative::OriginalEmbeddedPrefillInput> {
+    pub(crate) fn original_prefill_input(
+        self,
+    ) -> Option<&'a super::super::prepared_speculative::OriginalEmbeddedPrefillInput> {
         self.prefill_input
     }
 
@@ -369,40 +475,53 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         self.embedded_invocation
     }
 
-    pub(crate) fn original_numerical(self) -> Option<(
+    pub(crate) fn original_numerical(
+        self,
+    ) -> Option<(
         &'a OriginalSpeculativeNumericalSources,
         &'a OriginalCopyEnvironment<'a>,
     )> {
         self.original_numerical_for(SamplingPlacement::Target)
     }
     /// Selects a previously authenticated lexical owner; no stream is cloned.
-    pub(crate) fn original_numerical_for(self, placement: SamplingPlacement) -> Option<(
+    pub(crate) fn original_numerical_for(
+        self,
+        placement: SamplingPlacement,
+    ) -> Option<(
         &'a OriginalSpeculativeNumericalSources,
         &'a OriginalCopyEnvironment<'a>,
     )> {
-        self.numerical.and_then(|binding| Some((binding.sources, match placement {
-            SamplingPlacement::Target => binding.environment,
-            SamplingPlacement::Draft => binding.draft_environment,
-            _ => return None,
-        })))
+        self.numerical.and_then(|binding| {
+            Some((
+                binding.sources,
+                match placement {
+                    SamplingPlacement::Target => binding.environment,
+                    SamplingPlacement::Draft => binding.draft_environment,
+                    _ => return None,
+                },
+            ))
+        })
     }
     /// Adds only a one-use cache constructor to the exact common request.
     /// Later target/prediction completion evidence belongs to each cache state.
-    pub(crate) fn with_original_cache_preparation(mut self,
-        preparation:&'a super::super::replicated_text::OriginalEmbeddedCachePreparation,
-    )->Result<Self,eredu_core::BackendFailure> {
-        let _controls=preparation.binding_controls()?;
-        let Some((sources,_))=self.original_numerical() else {
+    pub(crate) fn with_original_cache_preparation(
+        mut self,
+        preparation: &'a super::super::replicated_text::OriginalEmbeddedCachePreparation,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        let _controls = preparation.binding_controls()?;
+        let Some((sources, _)) = self.original_numerical() else {
             return Err(preparation.reject_source());
         };
         preparation.validate_sources(sources)?;
         if self.cache_preparation.is_some() || self.original.is_some() {
             return Err(preparation.reject_source());
         }
-        self.cache_preparation=Some(preparation);
+        self.cache_preparation = Some(preparation);
         Ok(self)
     }
-    pub(crate) fn original_cache_preparation(self)->Option<&'a super::super::replicated_text::OriginalEmbeddedCachePreparation> {
+    pub(crate) fn original_cache_preparation(
+        self,
+    ) -> Option<&'a super::super::replicated_text::OriginalEmbeddedCachePreparation> {
         self.cache_preparation
     }
     pub(crate) fn original_request(
@@ -430,7 +549,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         owner: &'a crate::backend::managed_memory::NativeMemoryOwner,
     ) -> Self {
         self.memory_owner = Some(owner);
-        self.memory_pool = Some(owner.pool());
+        self.memory_ledger = Some(owner.pool());
         self
     }
 
@@ -440,23 +559,23 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         self.memory_owner
     }
 
-    /// Standalone native contexts use the same aggregate domain as production
-    /// backends. Prepared execution binds its actual backend domain explicitly.
-    pub(in crate::composition::mlx) fn memory_pool(
+    /// Standalone native contexts share the process ledger and its physical
+    /// topology. Prepared execution retains its selected ledger explicitly.
+    pub(in crate::composition::mlx) fn memory_ledger(
         self,
-    ) -> eredu_runtime::working_memory::WorkingMemoryPool {
-        self.memory_pool
+    ) -> eredu_runtime::working_memory::MemoryLedger {
+        self.memory_ledger
             .cloned()
-            .unwrap_or_else(crate::backend::managed_memory::domain)
+            .unwrap_or_else(crate::backend::managed_memory::ledger)
     }
 
     #[cfg(test)]
-    pub(in crate::composition::mlx) fn with_memory_pool(
+    pub(in crate::composition::mlx) fn with_memory_ledger(
         mut self,
-        pool: &'a eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &'a eredu_runtime::working_memory::MemoryLedger,
     ) -> Self {
         self.memory_owner = None;
-        self.memory_pool = Some(pool);
+        self.memory_ledger = Some(pool);
         self
     }
 
@@ -473,7 +592,10 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         self.capture
     }
 
-    pub(in crate::composition::mlx) fn coordinate_speculative_step<B: AsRef<[eredu_core::SpeculativeScheduleState]> + AsMut<[eredu_core::SpeculativeScheduleState]>>(
+    pub(in crate::composition::mlx) fn coordinate_speculative_step<
+        B: AsRef<[eredu_core::SpeculativeScheduleState]>
+            + AsMut<[eredu_core::SpeculativeScheduleState]>,
+    >(
         self,
         local: B,
     ) -> Result<B, eredu_core::BackendFailure> {

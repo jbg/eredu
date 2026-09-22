@@ -224,7 +224,8 @@ fn independently_edited_fixture_matrix(
         &original.region,
         &original.values,
     );
-    let mut weights = original.values;
+    // The independent numerical oracle edits its own application-owned export.
+    let mut weights = original.values.clone();
     for edit in edits {
         let member = facts
             .parameters

@@ -13,11 +13,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gpu_result = a.matmul(&b, &gpu)?.into_evaluated()?;
     let cpu_result = a.matmul(&b, &cpu)?.into_evaluated()?;
-    let gpu_values: &[f32] = gpu_result.as_slice();
-    let cpu_values: &[f32] = cpu_result.as_slice();
+    let mut gpu_values = [0.0f32; 4];
+    let mut cpu_values = [0.0f32; 4];
+    gpu_result.try_copy_into(&mut gpu_values)?;
+    cpu_result.try_copy_into(&mut cpu_values)?;
     if gpu_values
         .iter()
-        .zip(cpu_values)
+        .zip(&cpu_values)
         .any(|(gpu, cpu)| (gpu - cpu).abs() > 1e-4)
     {
         return Err(format!("CUDA result {gpu_values:?} != CPU result {cpu_values:?}").into());

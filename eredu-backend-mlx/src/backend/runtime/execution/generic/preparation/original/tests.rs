@@ -31,10 +31,13 @@ fn sources(
 
 #[test]
 fn selected_affine_conversion_reaches_native_loading_and_matches_resident_execution() {
+    if !crate::tests::support::native_process::enter("original-affine-source") {
+        return;
+    }
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let backend = MlxBackend::new(stream, stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, stream).with_memory_ledger(pool.clone());
     let host = eredu_runtime::LayerwiseLoadOptions::new(
         eredu_core::residency::OffloadConfig::new(Some(1 << 24), Some(1 << 24), 1).unwrap(),
     );
@@ -63,11 +66,14 @@ fn selected_affine_conversion_reaches_native_loading_and_matches_resident_execut
                     .store()
                     .same_source(sources.target()));
             }
+            let construction_sources = crate::composition::mlx::loading::PreparedNativeConstructionSources::prepare(
+                sources.selected().text_realization().state(), manager, backend.memory_ledger(), stream,
+            ).unwrap();
             let capabilities = sources.selected().session_capabilities();
             let model = backend
                 .materialize_after_communication(capabilities, None, None, |_| {
-                    crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
-                        sources, None, stream, stream, manager, None,
+                    crate::composition::mlx::loading::materialize_model_plan_with_construction_sources(
+                        sources, None, stream, stream, Some(construction_sources), None,
                     )
                 })
                 .unwrap()
@@ -100,10 +106,13 @@ fn selected_affine_conversion_reaches_native_loading_and_matches_resident_execut
 
 #[test]
 fn accepted_conversion_resource_failure_is_an_error_not_ordinary_fallback() {
+    if !crate::tests::support::native_process::enter("original-affine-source") {
+        return;
+    }
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let backend = MlxBackend::new(stream, stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, stream).with_memory_ledger(pool.clone());
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let host = eredu_runtime::LayerwiseLoadOptions::new(
         eredu_core::residency::OffloadConfig::new(Some(1 << 24), Some(1 << 24), 1).unwrap(),
@@ -113,7 +122,7 @@ fn accepted_conversion_resource_failure_is_an_error_not_ordinary_fallback() {
         root.path(),
         eredu_runtime::WeightResidency::layerwise_host(host),
     );
-    let foreign = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
     assert!(
         prepare_layerwise_manager(&sources, &foreign, stream, stream)
             .unwrap()

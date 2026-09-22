@@ -63,40 +63,44 @@ impl CaptureAxisError {
     pub(crate) fn legacy_parts(self, point: Option<(&str, &[crate::TensorAxis])>) -> CaptureError {
         self.legacy_parts_with(point, super::admission::allocation::Allocation(None))
     }
-    pub(crate) fn legacy_parts_with(self, point: Option<(&str, &[crate::TensorAxis])>,
-        allocation: super::admission::allocation::Allocation<'_>) -> CaptureError {
-        let result = (|| -> Result<CaptureError, CaptureError> { Ok(
-        match self {
-            Self::EmptyPredictionRange => {
-                CaptureError::Invalid(allocation.text("empty invocation prediction range")?)
-            }
-            Self::InvocationBounds => CaptureError::Invalid(
-                allocation.text("invocation exceeds admitted geometry or prediction range")?,
-            ),
-            Self::Empty => CaptureError::Invalid(allocation.text("empty invocation geometry")?),
-            Self::Overflow => CaptureError::Overflow,
-            Self::RankBound => {
-                CaptureError::Unsupported(allocation.text("capture rank exceeds the 32-axis metadata bound")?)
-            }
-            Self::Rank => CaptureError::Invalid(allocation.text("runtime rank differs from the catalog")?),
-            Self::Context => CaptureError::Unsupported(
-                allocation.text("selected context axis requires exact invocation context")?,
-            ),
-            Self::Extent {
-                index,
-                actual,
-                expected,
-            } => {
-                let (path, axes) = point.expect("extent diagnostic has declaration");
-                CaptureError::Invalid(allocation.format(format_args!(
+    pub(crate) fn legacy_parts_with(
+        self,
+        point: Option<(&str, &[crate::TensorAxis])>,
+        allocation: super::admission::allocation::Allocation<'_>,
+    ) -> CaptureError {
+        let result = (|| -> Result<CaptureError, CaptureError> {
+            Ok(match self {
+                Self::EmptyPredictionRange => {
+                    CaptureError::Invalid(allocation.text("empty invocation prediction range")?)
+                }
+                Self::InvocationBounds => CaptureError::Invalid(
+                    allocation.text("invocation exceeds admitted geometry or prediction range")?,
+                ),
+                Self::Empty => CaptureError::Invalid(allocation.text("empty invocation geometry")?),
+                Self::Overflow => CaptureError::Overflow,
+                Self::RankBound => CaptureError::Unsupported(
+                    allocation.text("capture rank exceeds the 32-axis metadata bound")?,
+                ),
+                Self::Rank => {
+                    CaptureError::Invalid(allocation.text("runtime rank differs from the catalog")?)
+                }
+                Self::Context => CaptureError::Unsupported(
+                    allocation.text("selected context axis requires exact invocation context")?,
+                ),
+                Self::Extent {
+                    index,
+                    actual,
+                    expected,
+                } => {
+                    let (path, axes) = point.expect("extent diagnostic has declaration");
+                    CaptureError::Invalid(allocation.format(format_args!(
                     "runtime extent for {}/{} is {actual}, expected {expected} from catalog/request",
                     path, axes[index].name
                 ))?)
-            }
-        }
-        ) })();
+                }
+            })
+        })();
         result.unwrap_or_else(|cause| cause)
-
     }
 }
 impl CaptureInvocationShape {
@@ -119,7 +123,10 @@ impl CaptureInvocationShape {
         }
         Ok(())
     }
-    pub(crate) fn extent_fixed(self, dimension: &SymbolicDimension) -> Result<Option<u64>, CaptureAxisError> {
+    pub(crate) fn extent_fixed(
+        self,
+        dimension: &SymbolicDimension,
+    ) -> Result<Option<u64>, CaptureAxisError> {
         use CaptureAxisError as E;
         Ok(match dimension {
             SymbolicDimension::Known(n) => Some(u64::try_from(*n).map_err(|_| E::Overflow)?),
@@ -246,14 +253,21 @@ impl CaptureInvocationShape {
     pub fn resolve(self, point: &ObservationPoint) -> Result<Option<Vec<u64>>, CaptureError> {
         self.resolve_with(point, super::admission::allocation::Allocation(None))
     }
-    pub(crate) fn resolve_with(self, point: &ObservationPoint,
-        allocation: super::admission::allocation::Allocation<'_>) -> Result<Option<Vec<u64>>, CaptureError> {
-        self.validate_fixed().map_err(|cause|cause.legacy_parts_with(None,allocation))?;
-        let Some(axes) = &point.axes else { return Ok(None); };
+    pub(crate) fn resolve_with(
+        self,
+        point: &ObservationPoint,
+        allocation: super::admission::allocation::Allocation<'_>,
+    ) -> Result<Option<Vec<u64>>, CaptureError> {
+        self.validate_fixed()
+            .map_err(|cause| cause.legacy_parts_with(None, allocation))?;
+        let Some(axes) = &point.axes else {
+            return Ok(None);
+        };
         let mut shape = allocation.vector(axes.len())?;
-        shape.resize(axes.len(),0);
-        let known = self.resolve_axes_into(axes, &mut shape)
-            .map_err(|cause|cause.legacy_parts_with(Some((&point.path,axes)),allocation))?;
+        shape.resize(axes.len(), 0);
+        let known = self
+            .resolve_axes_into(axes, &mut shape)
+            .map_err(|cause| cause.legacy_parts_with(Some((&point.path, axes)), allocation))?;
         Ok(known.then_some(shape))
     }
 }
@@ -269,12 +283,22 @@ pub struct CaptureInvocationWindow {
     pub start: u64,
 }
 impl CaptureInvocationWindow {
+    /// Whether this validated logical window covers the entire physical
+    /// invocation. This preserves the window coordinate; it grants no source,
+    /// result custody or execution authority.
+    pub fn covers_invocation(self, physical: CaptureInvocationShape) -> bool {
+        self.start == 0
+            && self
+                .validate_fixed(physical)
+                .is_ok_and(|logical| logical == physical)
+    }
     /// Checks the complete physical span before any source work.
     pub fn validate(
         self,
         physical: CaptureInvocationShape,
     ) -> Result<CaptureInvocationShape, CaptureError> {
-        self.validate_fixed(physical).map_err(|cause|cause.legacy(None))
+        self.validate_fixed(physical)
+            .map_err(|cause| cause.legacy(None))
     }
     /// Resolves one actual tensor and a contiguous row map using declared axes.
     /// Multiple/unknown row interpretations require their own composition contract.
@@ -284,12 +308,14 @@ impl CaptureInvocationWindow {
         point: &ObservationPoint,
         actual: &[u64],
     ) -> Result<(Vec<u64>, usize, crate::component::ComponentCoordinateMap), CaptureError> {
-        let plan=self.source_axes_plan(physical,point.axes.as_deref(),actual).map_err(|cause|cause.legacy(Some(point)))?;
-        let logical=plan.logical;
-        let axis=plan.axis;
-        let mut global=actual.to_vec();
-        global[axis]=logical.sequence;
-        logical.validate_actual(point,&global)?;
+        let plan = self
+            .source_axes_plan(physical, point.axes.as_deref(), actual)
+            .map_err(|cause| cause.legacy(Some(point)))?;
+        let logical = plan.logical;
+        let axis = plan.axis;
+        let mut global = actual.to_vec();
+        global[axis] = logical.sequence;
+        logical.validate_actual(point, &global)?;
         let host = |value| usize::try_from(value).map_err(|_| CaptureError::Overflow);
         let coordinates = crate::component::ComponentCoordinateMap::range(
             host(logical.sequence)?,

@@ -1,5 +1,6 @@
 mod tests {
-    use super::*;
+    use crate::memory_fixture::LedgerFixture;
+use super::*;
     use safemlx::{Device, DeviceType};
 
     fn bf16(value: f32) -> f32 {
@@ -17,9 +18,9 @@ mod tests {
             return;
         }
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let family = pool.initialize_shared_native(Initializer).unwrap();
-        let held = pool.used_bytes().unwrap();
+        let held = pool.fixture_host_charge().unwrap();
         assert!(held > 0);
         let mut observed_rounding = false;
         // Scalar-sized non-scalar inputs, both address classes, selected banks,
@@ -121,7 +122,7 @@ mod tests {
                     observed_rounding |= (f64::from(value) - expected).abs() > 1e-5;
                 }
             }
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.fixture_host_charge().unwrap(), held);
         }
         assert!(
             observed_rounding,
@@ -130,6 +131,6 @@ mod tests {
         drop(family);
         stream.synchronize().unwrap();
         safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }

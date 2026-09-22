@@ -6,7 +6,11 @@ use eredu_nn::{
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -112,7 +116,10 @@ fn hyper_workspace_prices_residual_cycles_and_retained_coefficients() {
                 let population = super::structure(operation.as_view()).unwrap().unwrap();
                 assert!(population.controls > 0);
                 if t == 0 && matches!(operation.kind, WorkspaceOperationKind::HyperCollapse(..)) {
-                    assert!(population.aliases > 0, "empty normalization retains exact aliases");
+                    assert!(
+                        population.aliases > 0,
+                        "empty normalization retains exact aliases"
+                    );
                 }
             }
             let current = total(&ops[0], mechanisms());
@@ -237,7 +244,7 @@ mod native {
         }
         array.reshape(l.shape(), stream).unwrap()
     }
-    fn values(a: &Array, stream: &Stream) -> Vec<f32> {
+    fn values(a: &Array, stream: &Stream) -> eredu_core::HostTensorBuffer<f32> {
         MlxTensor::from_array(a.clone()).to_f32_vec(stream).unwrap()
     }
     fn measure(

@@ -2,25 +2,36 @@
 use super::*;
 
 pub(super) fn control_bytes() -> usize {
-    std::mem::size_of::<(&ResidentExecutionMechanisms, WorkspaceOperationView<'_>, usize)>()
-        + std::mem::size_of::<Option<WorkspaceRepresentation>>()
+    std::mem::size_of::<(
+        &ResidentExecutionMechanisms,
+        WorkspaceOperationView<'_>,
+        usize,
+    )>() + std::mem::size_of::<Option<WorkspaceRepresentation>>()
         + std::mem::size_of::<WorkspaceRepresentation>()
         + std::mem::size_of::<bool>()
         + std::mem::size_of::<Option<usize>>()
 }
-pub(super) fn collective(mechanism: &ResidentExecutionMechanisms,
-    operation: WorkspaceOperationView<'_>, output: usize) -> Option<WorkspaceRepresentation> {
+pub(super) fn collective(
+    mechanism: &ResidentExecutionMechanisms,
+    operation: WorkspaceOperationView<'_>,
+    output: usize,
+) -> Option<WorkspaceRepresentation> {
     if output != 0 || operation.inputs.len() != 1 || operation.outputs.len() != 1 {
         return None;
     }
     let input = operation.inputs.get(0)?.representation()?;
-    if matches!(operation.kind,WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Boundary {..})) {
+    if matches!(
+        operation.kind,
+        WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Boundary { .. })
+    ) {
         // The sender returns this original value. The receiver's byte payload
         // is either already dense or materialized by the existing zero-add and
         // typed View before reshape. Preserve only common positive row/last-
         // axis facts; never transfer a sender's arbitrary physical strides.
-        return Some(WorkspaceRepresentation::new(input.dtype(),input.row_contiguous())
-            .with_last_axis_contiguous(input.last_axis_contiguous()));
+        return Some(
+            WorkspaceRepresentation::new(input.dtype(), input.row_contiguous())
+                .with_last_axis_contiguous(input.last_axis_contiguous()),
+        );
     }
 
     // CPU AllReduce donates an already row-contiguous input or makes the
@@ -37,15 +48,20 @@ pub(super) fn collective(mechanism: &ResidentExecutionMechanisms,
     // Its settled contribution therefore has the same complete output row as
     // the CPU model path; compute-device selection is not its storage policy.
     if matches!(mechanism, ResidentExecutionMechanisms::Cpu { .. })
-        || matches!(operation.kind, WorkspaceOperationKindView::Collective(
-            WorkspaceCollectiveView::Broadcast { .. }))
+        || matches!(
+            operation.kind,
+            WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Broadcast { .. })
+        )
     {
         let count = match operation.kind {
             WorkspaceOperationKindView::Collective(
                 WorkspaceCollectiveView::Sum { partitions, .. }
-                | WorkspaceCollectiveView::Broadcast { partitions, .. }
+                | WorkspaceCollectiveView::Broadcast { partitions, .. },
             ) => Some(partitions),
-            WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::GatherFirstAxis { peer_widths, .. }) => Some(peer_widths.len()),
+            WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::GatherFirstAxis {
+                peer_widths,
+                ..
+            }) => Some(peer_widths.len()),
             _ => None,
         };
         match count {
@@ -54,13 +70,18 @@ pub(super) fn collective(mechanism: &ResidentExecutionMechanisms,
             // one member. Preserve both actual stride facts of that alias.
             Some(1) => return Some(input),
             Some(_) => row_contiguous = true,
-            None => {},
+            None => {}
         }
     }
     Some(WorkspaceRepresentation::new(input.dtype(), row_contiguous))
 }
 
-#[cfg(all(test, target_vendor="apple", feature="metal", not(feature="cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod tests {
     use super::*;
     use eredu_nn::{NeuralBackend, Tensor};
@@ -72,85 +93,168 @@ mod tests {
         cpu: MlxCpuWorkspaceMechanisms,
     }
     impl WorkspaceMechanisms for CpuCollectiveGeometry {
-        fn output_representation(&self, operation: WorkspaceOperationView<'_>, output: usize)
-            -> Option<WorkspaceRepresentation> {
+        fn output_representation(
+            &self,
+            operation: WorkspaceOperationView<'_>,
+            output: usize,
+        ) -> Option<WorkspaceRepresentation> {
             if matches!(operation.kind, WorkspaceOperationKindView::Collective(_)) {
-                collective(&ResidentExecutionMechanisms::Cpu {
-                    ordinary:self.ordinary, cpu:self.cpu }, operation, output)
-            } else { self.cpu.output_representation(operation, output) }
+                collective(
+                    &ResidentExecutionMechanisms::Cpu {
+                        ordinary: self.ordinary,
+                        cpu: self.cpu,
+                    },
+                    operation,
+                    output,
+                )
+            } else {
+                self.cpu.output_representation(operation, output)
+            }
         }
-        fn operation_bound(&self, operation: &WorkspaceOperation)
-            -> Result<Option<WorkspaceOperationBound>, Error> {
+        fn operation_bound(
+            &self,
+            operation: &WorkspaceOperation,
+        ) -> Result<Option<WorkspaceOperationBound>, Error> {
             self.cpu.operation_bound(operation)
         }
-        fn host_workspace_bound(&self, operation: &WorkspaceOperation)
-            -> Result<Option<WorkspaceHostBound>, Error> {
+        fn host_workspace_bound(
+            &self,
+            operation: &WorkspaceOperation,
+        ) -> Result<Option<WorkspaceHostBound>, Error> {
             self.cpu.host_workspace_bound(operation)
         }
     }
     #[test]
     fn cpu_softplus_gate_supplies_exact_sum_input_representation() {
         let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        let selected = MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let selected =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
         let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), selected);
         let mechanism = ResidentExecutionMechanisms::Cpu { ordinary, cpu };
-        for dtype in [WorkspaceFloatingType::Float32, WorkspaceFloatingType::Bfloat16, WorkspaceFloatingType::Float16] {
+        for dtype in [
+            WorkspaceFloatingType::Float32,
+            WorkspaceFloatingType::Bfloat16,
+            WorkspaceFloatingType::Float16,
+        ] {
             let context = WorkspaceContext::new(cpu);
-            let input = WorkspaceTensor::existing(context.layout(&[1, 2, 8], WorkspaceDtype::Float32).unwrap()
-                .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
+            let input = WorkspaceTensor::existing(
+                context
+                    .layout(&[1, 2, 8], WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true))),
+                &context,
+            )
+            .unwrap();
             context.begin_span();
-            let output = WorkspaceBackend::softplus(input, std::f32::consts::LN_2, &context).unwrap();
+            let output =
+                WorkspaceBackend::softplus(input, std::f32::consts::LN_2, &context).unwrap();
             // The failing TP attention path applies its gate before the local
             // output projection, then all-sums that projection. Exercise the
             // actual F32 chain rather than assigning a collective input fact.
             let output = if dtype == WorkspaceFloatingType::Float32 {
-                let attended = WorkspaceTensor::existing(context.layout(&[1, 2, 8], WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
+                let attended = WorkspaceTensor::existing(
+                    context
+                        .layout(&[1, 2, 8], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(WorkspaceRepresentation::new(dtype, true))),
+                    &context,
+                )
+                .unwrap();
                 let gated = attended.multiply(&output, &context).unwrap();
-                let weight = WorkspaceTensor::existing(context.layout(&[8, 8], WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
+                let weight = WorkspaceTensor::existing(
+                    context
+                        .layout(&[8, 8], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(WorkspaceRepresentation::new(dtype, true))),
+                    &context,
+                )
+                .unwrap();
                 WorkspaceTensor::linear(&gated, &weight, None, &context).unwrap()
-            } else { output };
+            } else {
+                output
+            };
             let layouts = [output.layout().as_view()];
             let sum = WorkspaceOperationView {
-                kind: WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Sum { partitions: 2, rank: 0 }),
-                inputs: WorkspaceLayoutList::Views(&layouts), outputs: WorkspaceLayoutList::Views(&layouts),
+                kind: WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Sum {
+                    partitions: 2,
+                    rank: 0,
+                }),
+                inputs: WorkspaceLayoutList::Views(&layouts),
+                outputs: WorkspaceLayoutList::Views(&layouts),
             };
-            assert_eq!(collective(&mechanism, sum, 0), Some(WorkspaceRepresentation::new(dtype, true)));
+            assert_eq!(
+                collective(&mechanism, sum, 0),
+                Some(WorkspaceRepresentation::new(dtype, true))
+            );
             let unknown = [layouts[0].with_representation(None)];
-            assert!(collective(&mechanism, WorkspaceOperationView { inputs: WorkspaceLayoutList::Views(&unknown), ..sum }, 0).is_none());
+            assert!(
+                collective(
+                    &mechanism,
+                    WorkspaceOperationView {
+                        inputs: WorkspaceLayoutList::Views(&unknown),
+                        ..sum
+                    },
+                    0
+                )
+                .is_none()
+            );
             let report = context.finish_report(&[output]).unwrap();
-            assert!(report.unpriced_operations.is_empty() && report.unpriced_host_operations.is_empty());
-            SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context).unwrap();
+            assert!(
+                report.unpriced_operations.is_empty() && report.unpriced_host_operations.is_empty()
+            );
+            SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context)
+                .unwrap();
         }
     }
 
     #[test]
     fn uneven_vocabulary_gather_keeps_exact_slice_and_zero_fill_sources() {
-        let ordinary=MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        let choice=MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
-        let cpu=MlxCpuWorkspaceMechanisms::new(ordinary.allocation(),choice);
-        for widths in [[32usize,32usize],[17,15]] {
+        let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let choice =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), choice);
+        for widths in [[32usize, 32usize], [17, 15]] {
             for rank in 0..2 {
-                let context=WorkspaceContext::new(CpuCollectiveGeometry {ordinary,cpu});
-                let input=WorkspaceTensor::existing(context.layout(&[1,1,widths[rank] as i32],WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32,true))),&context).unwrap();
+                let context = WorkspaceContext::new(CpuCollectiveGeometry { ordinary, cpu });
+                let input = WorkspaceTensor::existing(
+                    context
+                        .layout(&[1, 1, widths[rank] as i32], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(WorkspaceRepresentation::new(
+                            WorkspaceFloatingType::Float32,
+                            true,
+                        ))),
+                    &context,
+                )
+                .unwrap();
                 context.begin_span();
-                let output=input.gather_uneven_axis(2,rank,&widths,&context).unwrap();
-                assert_eq!(output.shape(),[1,1,widths.iter().sum::<usize>() as i32]);
-                assert_eq!(output.layout().representation(),Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32,true)));
-                let report=context.report(&[output]).unwrap();
-                let slices:Vec<_>=report.operations.iter().filter(|op|matches!(op.kind,WorkspaceOperationKind::StaticSlice{..})).collect();
-                assert_eq!(slices.len(),2+usize::from(widths[0]!=widths[1]));
+                let output = input
+                    .gather_uneven_axis(2, rank, &widths, &context)
+                    .unwrap();
+                assert_eq!(output.shape(), [1, 1, widths.iter().sum::<usize>() as i32]);
+                assert_eq!(
+                    output.layout().representation(),
+                    Some(WorkspaceRepresentation::new(
+                        WorkspaceFloatingType::Float32,
+                        true
+                    ))
+                );
+                let report = context.report(&[output]).unwrap();
+                let slices: Vec<_> = report
+                    .operations
+                    .iter()
+                    .filter(|op| matches!(op.kind, WorkspaceOperationKind::StaticSlice { .. }))
+                    .collect();
+                assert_eq!(slices.len(), 2 + usize::from(widths[0] != widths[1]));
                 for op in &report.operations {
-                    if !matches!(op.kind,WorkspaceOperationKind::Collective(_)) {
-                        assert!(cpu.plan(op.as_view()).unwrap().is_some(),"{:?}",op.kind);
+                    if !matches!(op.kind, WorkspaceOperationKind::Collective(_)) {
+                        assert!(cpu.plan(op.as_view()).unwrap().is_some(), "{:?}", op.kind);
                     }
                 }
                 for op in slices {
-                    let plan=cpu.plan(op.as_view()).unwrap().unwrap();
-                    assert_eq!(plan.population.births,0);
-                    assert_eq!(plan.alias_input,Some(0));
+                    let plan = cpu.plan(op.as_view()).unwrap().unwrap();
+                    assert_eq!(plan.population.births, 0);
+                    assert_eq!(plan.alias_input, Some(0));
                 }
             }
         }
@@ -158,85 +262,292 @@ mod tests {
     #[test]
     fn cpu_sum_and_gather_output_rows_feed_actual_rms_and_projection_sources() {
         let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        let selected = MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let selected =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
         let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), selected);
         let mechanism = ResidentExecutionMechanisms::Cpu { ordinary, cpu };
-        for dtype in [WorkspaceFloatingType::Float32, WorkspaceFloatingType::Bfloat16] {
+        // The packed-world Sum worker extracts a view. Its zero new-allocation
+        // trace must still carry the entire completed world into the output.
+        let retained = {
+            use super::super::logical::{LogicalCollectiveKind, packed as source};
+            use crate::backend::nn::logical_collective::{Workspace, packed};
+            let context = WorkspaceContext::new(cpu);
+            let input = WorkspaceTensor::existing(
+                context
+                    .layout(&[1, 2, 17], WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(
+                        WorkspaceFloatingType::Float32,
+                        true,
+                    ))),
+                &context,
+            )
+            .unwrap();
+            context.begin_span();
+            let packed = packed::pack(&Workspace(&context), &input, 3, 8).unwrap();
+            let pack_source = context.new_allocation_scratch().unwrap().unwrap();
+            let world_layout = packed.layout().clone();
+            let pack_report = context.finish_report(&[packed]).unwrap();
+            let pack_recipe =
+                super::super::numerical(&pack_report, 1, mechanism, &context).unwrap();
+            assert!(pack_report.operations.iter().any(|operation| matches!(
+                operation.kind,
+                WorkspaceOperationKind::StaticSliceUpdate { .. }
+            )));
+            assert!(
+                pack_recipe.ordinary_calls.is_some(),
+                "the actual packing worker must retain its safe SliceUpdate caller census"
+            );
+            let world_bytes = mechanism
+                .allocation()
+                .fixed_buffer_capacity(world_layout.bytes().unwrap())
+                .unwrap();
+            let completed = WorkspaceTensor::existing(world_layout, &context).unwrap();
+            context.begin_span();
+            let view = packed::sum_result(&Workspace(&context), &completed, 3).unwrap();
+            assert_eq!(view.shape(), input.shape());
+            let result_source = context.new_allocation_scratch().unwrap().unwrap();
+            assert_eq!(result_source.backing_bytes(), Some(0));
+            let result_report = context.finish_report(&[view.clone()]).unwrap();
+            let result_recipe =
+                super::super::numerical(&result_report, 1, mechanism, &context).unwrap();
+            assert!(result_recipe.ordinary_calls.is_some());
+            let world_source = super::super::scratch::native_cpu(
+                &context,
+                mechanism,
+                usize::try_from(world_bytes).unwrap(),
+                1,
+            )
+            .unwrap();
+            let (scratch, output) = source::allocation_populations(
+                &context,
+                LogicalCollectiveKind::Sum,
+                &pack_source,
+                &world_source,
+                &result_source,
+            )
+            .unwrap();
+            assert_eq!(output.backing_bytes(), Some(world_bytes));
+            assert_eq!(scratch.backing_bytes(), pack_source.backing_bytes());
+            assert_eq!(
+                scratch.backing_bytes().unwrap() + output.backing_bytes().unwrap(),
+                pack_source.backing_bytes().unwrap() + world_bytes,
+                "the completed world belongs to one lifetime population",
+            );
+            let layouts = [input.layout().as_view()];
+            let operation = WorkspaceOperationView {
+                kind: WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Sum {
+                    partitions: 2,
+                    rank: 0,
+                }),
+                inputs: WorkspaceLayoutList::Views(&layouts),
+                outputs: WorkspaceLayoutList::Views(&layouts),
+            };
+            let prepared =
+                super::super::PreparedCollective::new(operation, scratch, Some(output.clone()))
+                    .unwrap();
+            let mut emitter = facts::Emitter::count();
+            prepared.emit(&mut emitter).unwrap().unwrap();
+            assert_eq!(
+                emitter.first_output(),
+                Some(WorkspaceOutputEffect::Allocate(world_bytes))
+            );
+            // Drop both the completed-world descriptor and its temporary source
+            // before observing the surviving output's retained capacity.
+            drop(prepared);
+            drop(world_source);
+            drop(completed);
+            drop(view);
+            output
+        };
+        assert!(retained.backing_bytes().unwrap() > 1 * 2 * 17 * 4);
+        drop(retained);
+        for dtype in [
+            WorkspaceFloatingType::Float32,
+            WorkspaceFloatingType::Bfloat16,
+        ] {
             for gather in [false, true] {
                 let context = WorkspaceContext::new(cpu);
-                let inputs = [WorkspaceLayoutView::new(&[1,2,17], WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(WorkspaceRepresentation::new(dtype, false)))];
-                let output_shape = if gather { [2,2,17] } else { [1,2,17] };
-                let outputs = [WorkspaceLayoutView::new(&output_shape, WorkspaceDtype::Float32).unwrap()];
-                let widths = [1,1];
+                let inputs = [
+                    WorkspaceLayoutView::new(&[1, 2, 17], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(WorkspaceRepresentation::new(dtype, false))),
+                ];
+                let output_shape = if gather { [2, 2, 17] } else { [1, 2, 17] };
+                let outputs =
+                    [WorkspaceLayoutView::new(&output_shape, WorkspaceDtype::Float32).unwrap()];
+                let widths = [1, 1];
                 let operation = WorkspaceOperationView {
                     kind: WorkspaceOperationKindView::Collective(if gather {
-                        WorkspaceCollectiveView::GatherFirstAxis { axis:0, rank:0, peer_widths:&widths }
-                    } else { WorkspaceCollectiveView::Sum { partitions:2, rank:0 } }),
-                    inputs: WorkspaceLayoutList::Views(&inputs), outputs: WorkspaceLayoutList::Views(&outputs),
+                        WorkspaceCollectiveView::GatherFirstAxis {
+                            axis: 0,
+                            rank: 0,
+                            peer_widths: &widths,
+                        }
+                    } else {
+                        WorkspaceCollectiveView::Sum {
+                            partitions: 2,
+                            rank: 0,
+                        }
+                    }),
+                    inputs: WorkspaceLayoutList::Views(&inputs),
+                    outputs: WorkspaceLayoutList::Views(&outputs),
                 };
                 let publication = WorkspaceOperationView {
-                    kind: WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Broadcast {
-                        group: eredu_core::CollectiveGroupId::new(1), root: 0, rank: 0, partitions: 2,
-                    }), outputs: WorkspaceLayoutList::Views(&inputs), ..operation
+                    kind: WorkspaceOperationKindView::Collective(
+                        WorkspaceCollectiveView::Broadcast {
+                            group: eredu_core::CollectiveGroupId::new(1),
+                            root: 0,
+                            rank: 0,
+                            partitions: 2,
+                        },
+                    ),
+                    outputs: WorkspaceLayoutList::Views(&inputs),
+                    ..operation
                 };
-                assert_eq!(collective(&mechanism, publication, 0),
-                    Some(WorkspaceRepresentation::new(dtype, true)));
-                assert_eq!(collective(&ResidentExecutionMechanisms::Metal(ordinary), publication, 0),
-                    Some(WorkspaceRepresentation::new(dtype, true)));
+                assert_eq!(
+                    collective(&mechanism, publication, 0),
+                    Some(WorkspaceRepresentation::new(dtype, true))
+                );
+                assert_eq!(
+                    collective(
+                        &ResidentExecutionMechanisms::Metal(ordinary),
+                        publication,
+                        0
+                    ),
+                    Some(WorkspaceRepresentation::new(dtype, true))
+                );
                 let representation = collective(&mechanism, operation, 0).unwrap();
                 assert_eq!(representation, WorkspaceRepresentation::new(dtype, true));
-                let input = WorkspaceTensor::existing(context.layout(&output_shape, WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(representation)), &context).unwrap();
-                let weight = |shape: &[i32]| WorkspaceTensor::existing(context.layout(shape, WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(WorkspaceRepresentation::new(dtype, true))), &context).unwrap();
-                let gain = weight(&[17]); let projection = weight(&[11,17]);
+                let input = WorkspaceTensor::existing(
+                    context
+                        .layout(&output_shape, WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(representation)),
+                    &context,
+                )
+                .unwrap();
+                let weight = |shape: &[i32]| {
+                    WorkspaceTensor::existing(
+                        context
+                            .layout(shape, WorkspaceDtype::Float32)
+                            .unwrap()
+                            .with_representation(Some(WorkspaceRepresentation::new(dtype, true))),
+                        &context,
+                    )
+                    .unwrap()
+                };
+                let gain = weight(&[17]);
+                let projection = weight(&[11, 17]);
                 context.begin_span();
-                let normalized = WorkspaceBackend::rms_norm_with_weight(&input, &gain, 1e-6, &context).unwrap();
-                let output = WorkspaceTensor::linear(&normalized, &projection, None, &context).unwrap();
-                assert_eq!(output.layout().representation(), Some(WorkspaceRepresentation::new(dtype, true)));
+                let normalized =
+                    WorkspaceBackend::rms_norm_with_weight(&input, &gain, 1e-6, &context).unwrap();
+                let output =
+                    WorkspaceTensor::linear(&normalized, &projection, None, &context).unwrap();
+                assert_eq!(
+                    output.layout().representation(),
+                    Some(WorkspaceRepresentation::new(dtype, true))
+                );
                 let report = context.report(&[output]).unwrap();
                 assert!(report.unpriced_operations.is_empty());
-                SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context).unwrap();
-                let strided = WorkspaceRepresentation::new(dtype, false).with_last_axis_contiguous(true);
+                SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context)
+                    .unwrap();
+                let strided =
+                    WorkspaceRepresentation::new(dtype, false).with_last_axis_contiguous(true);
                 let singleton_inputs = [inputs[0].with_representation(Some(strided))];
                 let singleton_widths = [1];
                 let singleton = WorkspaceOperationView {
                     kind: WorkspaceOperationKindView::Collective(if gather {
-                        WorkspaceCollectiveView::GatherFirstAxis { axis:0, rank:0, peer_widths:&singleton_widths }
-                    } else { WorkspaceCollectiveView::Sum { partitions:1, rank:0 } }),
+                        WorkspaceCollectiveView::GatherFirstAxis {
+                            axis: 0,
+                            rank: 0,
+                            peer_widths: &singleton_widths,
+                        }
+                    } else {
+                        WorkspaceCollectiveView::Sum {
+                            partitions: 1,
+                            rank: 0,
+                        }
+                    }),
                     inputs: WorkspaceLayoutList::Views(&singleton_inputs),
                     outputs: WorkspaceLayoutList::Views(&singleton_inputs),
                 };
                 assert_eq!(collective(&mechanism, singleton, 0), Some(strided));
                 let unknown = [inputs[0].with_representation(None)];
-                assert!(collective(&mechanism, WorkspaceOperationView {
-                    inputs: WorkspaceLayoutList::Views(&unknown), ..operation
-                }, 0).is_none());
-                assert_eq!(collective(&ResidentExecutionMechanisms::Metal(ordinary), operation, 0),
-                    Some(WorkspaceRepresentation::new(dtype, false)));
+                assert!(
+                    collective(
+                        &mechanism,
+                        WorkspaceOperationView {
+                            inputs: WorkspaceLayoutList::Views(&unknown),
+                            ..operation
+                        },
+                        0
+                    )
+                    .is_none()
+                );
+                assert_eq!(
+                    collective(&ResidentExecutionMechanisms::Metal(ordinary), operation, 0),
+                    Some(WorkspaceRepresentation::new(dtype, false))
+                );
             }
         }
     }
 }
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 #[test]
-fn framed_boundary_preserves_proved_rows_and_not_arbitrary_source_strides(){
-    let ordinary=MlxMetalWorkspaceMechanisms::current_host().unwrap();
-    let choice=MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
-    let cpu=MlxCpuWorkspaceMechanisms::new(ordinary.allocation(),choice);
-    for mechanism in [ResidentExecutionMechanisms::Cpu{ordinary,cpu},ResidentExecutionMechanisms::Metal(ordinary)] {
-        for dtype in [WorkspaceFloatingType::Float16,WorkspaceFloatingType::Bfloat16,WorkspaceFloatingType::Float32] {
-            for rows in [false,true] {
-                let known=WorkspaceRepresentation::new(dtype,rows).with_last_axis_contiguous(true);
-                let source=known.with_element_strides(&[64,32,1]).unwrap();
-                let layouts=[WorkspaceLayoutView::new(&[1,2,16],WorkspaceDtype::Float32).unwrap().with_representation(Some(source))];
-                let operation=WorkspaceOperationView{kind:WorkspaceOperationKindView::Collective(WorkspaceCollectiveView::Boundary{
-                    route:0,ordinal:0,header_bytes:77}),inputs:WorkspaceLayoutList::Views(&layouts),outputs:WorkspaceLayoutList::Views(&layouts)};
-                assert_eq!(collective(&mechanism,operation,0),Some(known));
-                let unknown=[layouts[0].with_representation(None)];
-                assert_eq!(collective(&mechanism,WorkspaceOperationView{inputs:WorkspaceLayoutList::Views(&unknown),..operation},0),None);
+fn framed_boundary_preserves_proved_rows_and_not_arbitrary_source_strides() {
+    let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+    let choice =
+        MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+    let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), choice);
+    for mechanism in [
+        ResidentExecutionMechanisms::Cpu { ordinary, cpu },
+        ResidentExecutionMechanisms::Metal(ordinary),
+    ] {
+        for dtype in [
+            WorkspaceFloatingType::Float16,
+            WorkspaceFloatingType::Bfloat16,
+            WorkspaceFloatingType::Float32,
+        ] {
+            for rows in [false, true] {
+                let known =
+                    WorkspaceRepresentation::new(dtype, rows).with_last_axis_contiguous(true);
+                let source = known.with_element_strides(&[64, 32, 1]).unwrap();
+                let layouts = [
+                    WorkspaceLayoutView::new(&[1, 2, 16], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(source)),
+                ];
+                let operation = WorkspaceOperationView {
+                    kind: WorkspaceOperationKindView::Collective(
+                        WorkspaceCollectiveView::Boundary {
+                            route: 0,
+                            ordinal: 0,
+                            header_bytes: 77,
+                        },
+                    ),
+                    inputs: WorkspaceLayoutList::Views(&layouts),
+                    outputs: WorkspaceLayoutList::Views(&layouts),
+                };
+                assert_eq!(collective(&mechanism, operation, 0), Some(known));
+                let unknown = [layouts[0].with_representation(None)];
+                assert_eq!(
+                    collective(
+                        &mechanism,
+                        WorkspaceOperationView {
+                            inputs: WorkspaceLayoutList::Views(&unknown),
+                            ..operation
+                        },
+                        0
+                    ),
+                    None
+                );
             }
         }
     }

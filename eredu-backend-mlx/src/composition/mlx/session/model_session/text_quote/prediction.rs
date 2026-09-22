@@ -168,12 +168,20 @@ fn role_facts() -> Result<[Option<u64>; 5], Error> {
         n.map(Some)
             .ok_or_else(|| memory(WorkingMemoryError::Overflow))
     };
-    Ok([known(model)?, known(sampling)?, known(event)?, known(validation)?, known(scalar)?])
+    Ok([
+        known(model)?,
+        known(sampling)?,
+        known(event)?,
+        known(validation)?,
+        known(scalar)?,
+    ])
 }
 
 pub(super) fn facts() -> Result<TextPredictionScopeFacts, Error> {
     let [model, sampling, event, validation, scalar] = role_facts()?;
-    Ok(TextPredictionScopeFacts::new(model, sampling, event, validation, scalar))
+    Ok(TextPredictionScopeFacts::new(
+        model, sampling, event, validation, scalar,
+    ))
 }
 pub(super) fn sampling_facts() -> Result<(Option<u64>, Option<u64>), Error> {
     let [_, sampling, event, _, _] = role_facts()?;

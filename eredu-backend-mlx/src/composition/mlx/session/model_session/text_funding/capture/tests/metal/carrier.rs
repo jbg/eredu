@@ -9,6 +9,7 @@ use crate::composition::mlx::replicated_text::prefill_retention_fixture::{
 use crate::composition::mlx::session::model_session::text_funding::{
     capture_carrier_control_bytes, copy_limits_with_work_controls, text_work_control_bytes,
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::checkpoint::TensorDtype;
 use eredu_runtime::{
     capture::{FundedCaptureError, FundedCaptureSession, ScheduledCaptureBackend},
@@ -213,7 +214,7 @@ struct Fixture {
     source: Option<Array>,
     plan: SharedCapturePlan,
     tokens: Arc<[i32]>,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     reservation: WorkingMemoryReservation,
     run: WorkingMemoryFundingRun,
     request: InferenceRequest,
@@ -227,14 +228,18 @@ struct Fixture {
 }
 fn fixture() -> Fixture {
     let stream = stream();
-    let bootstrap = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let bootstrap = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let bootstrap_owner = NativeMemoryOwner::acquire(&bootstrap).unwrap();
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let session = PrefillRetentionFixture::load(artifact.path(), &stream).unwrap();
     let source = Array::from_slice(&VALUES, &[3, 2]);
     source.evaluated().unwrap();
     stream.synchronize().unwrap();
-    let source_bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
+    let backing = source.allocation_info().unwrap().unwrap();
+    let source_bytes = u64::try_from(backing.bytes())
+        .unwrap()
+        .checked_add(u64::try_from(backing.host_control_bytes()).unwrap())
+        .unwrap();
     let source_dropped = Arc::new(AtomicBool::new(false));
     source
         .retain_allocation_owner(NativeDrop(source_dropped.clone()))
@@ -253,11 +258,24 @@ fn fixture() -> Fixture {
         prefill_chunk_positions: 3,
         output: OutputDemand::Sequence,
     };
-    let mut state = session.quote(geometry, &plan, &tokens).unwrap();
+    let (mut state, closing) = session.quote(geometry, &plan, &tokens).unwrap();
+    let mut initial = session.inventory().unwrap();
+    initial.include_array(&source).unwrap();
+    initial.include_capture_plan(plan.clone()).unwrap();
+    let initial_bytes = initial.byte_bound().unwrap().unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let ordinary = OrdinaryPublicationPlan::for_closing_population(
+        initial.generic_publication_rows(&pool).unwrap(),
+        closing,
+        1,
+    )
+    .unwrap();
     let mut workspace = state.execution_workspace.take().unwrap();
     let controls = text_work_control_bytes(geometry.max_output_tokens)
         .unwrap()
         .checked_add(capture_carrier_control_bytes(&plan, None).unwrap())
+        .unwrap()
+        .checked_add(ordinary.additional_bytes())
         .unwrap();
     workspace.retained = WorkspaceBound::bounded(
         workspace
@@ -268,6 +286,13 @@ fn fixture() -> Fixture {
             .unwrap(),
         "actual scheduled host plan plus measured original work/carrier controls",
     );
+    workspace
+        .physical_domains
+        .as_mut()
+        .unwrap()
+        .retained
+        .add_allocation(controls, &bootstrap.host_placement_handle())
+        .unwrap();
     let state = state.with_execution_workspace(workspace).unwrap();
     let admission = match eredu_core::apply_admission_policy(
         session.capabilities(),
@@ -275,12 +300,10 @@ fn fixture() -> Fixture {
             input: InputTokenCount::text(3),
             max_output_tokens: 4,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: crate::memory_fixture::headroom(0),
+            memory_limits: Default::default(),
         },
         state,
-        None,
     )
     .unwrap()
     {
@@ -289,34 +312,57 @@ fn fixture() -> Fixture {
             panic!("actual native equation admission rejected: {reason:?}")
         }
     };
-    let required = admission.incremental_required_bytes;
+    let required = admission.incremental_required_bytes.unwrap();
     assert!(
         required
             > CaptureRunHostPlan::prepare(&plan)
                 .unwrap()
                 .initialization_peak_bytes()
     );
-    let mut initial = session.inventory().unwrap();
-    initial.include_array(&source).unwrap();
-    initial.include_capture_plan(plan.clone()).unwrap();
-    let initial_bytes = initial.byte_bound().unwrap().unwrap();
-    let capacity = initial_bytes.checked_add(required).unwrap();
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     let sources = initial.publish_unquoted(&owner).unwrap();
     drop((owner, bootstrap_owner));
-    let before = pool.used_bytes().unwrap();
-    assert_eq!(before, initial_bytes);
+    let before = pool.snapshot().unwrap();
+    let existing = pool.fixture_host_current().unwrap();
+    assert!(pool.fixture_host_charge().unwrap() >= initial_bytes);
+    let increment = pool
+        .reservation_requirements(&admission, None)
+        .unwrap()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let capacity = existing.checked_add(increment).unwrap();
     assert!(matches!(
-        pool.reserve_with_capacity(session.identity(), &admission, capacity - 1),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        pool.reserve_with_capacity(
+            session.identity(),
+            &admission,
+            crate::memory_fixture::physical_host_limits(&pool, capacity - 1)
+        ),
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.snapshot().unwrap(), before);
     session.validate_frontier(0).unwrap();
     let (reservation, run) = pool
-        .reserve_with_capacity(session.identity(), &admission, capacity)
+        .reserve_with_capacity(
+            session.identity(),
+            &admission,
+            crate::memory_fixture::physical_host_limits(&pool, capacity),
+        )
         .unwrap()
         .into_funding()
+        .unwrap();
+    // Host capture records can retire independently after failure. The native
+    // envelope remains charged until its own completion has been established.
+    let required = required
+        .checked_sub(
+            CaptureRunHostPlan::prepare(&plan)
+                .unwrap()
+                .initialization_peak_bytes(),
+        )
         .unwrap();
     let request = InferenceRequest::from(&reservation);
     let bank = run
@@ -324,7 +370,7 @@ fn fixture() -> Fixture {
         .unwrap()
         .into_capture_session()
         .unwrap();
-    let work = FundedWork::new(run.scope().unwrap());
+    let work = FundedWork::new_ordinary(run.scope().unwrap(), ordinary).unwrap();
     let dropping_work = DroppingWork::new(&work);
     bank.validate_native_scope(work.scope.borrow().as_ref().unwrap())
         .unwrap();
@@ -398,7 +444,8 @@ fn execute(
     )
 }
 fn publish(f: &Fixture, scores: Option<&Array>) {
-    let mut storage = f.session.inventory().unwrap();
+    let mut storage = f.work.prepare_inventory().unwrap();
+    f.session.collect_inventory(&mut storage).unwrap();
     if let Some(scores) = scores {
         scores.evaluated().unwrap();
         storage.include_array(scores).unwrap();
@@ -441,6 +488,7 @@ fn canonical_native_prefill_retires_source_outside_loans_before_whole_work_certi
         f.work.scope.borrow().is_some(),
         "ticket never certifies whole native work"
     );
+    reclaim(&f.pool);
     assert!(
         f.source_dropped.load(Ordering::SeqCst),
         "carrier was the final native source owner"
@@ -451,7 +499,7 @@ fn canonical_native_prefill_retires_source_outside_loans_before_whole_work_certi
     publish(&f, result.scores.as_ref());
     f.work.certify().unwrap();
     assert!(f.work.scope.borrow().is_none());
-    assert!(f.pool.peak_bytes().unwrap() <= f.pool.effective_capacity().unwrap());
+    assert!(f.pool.fixture_host_peak().unwrap() <= f.pool.fixture_host_limit().unwrap());
     let pool = f.pool.clone();
     drop((result, step, f));
     DROPPING_WORK.with(|slot| assert!(slot.borrow().is_none()));
@@ -552,7 +600,7 @@ fn late_native_hook_failure_preserves_original_cause_and_uncertified_source_cust
     drop((step, error, f));
     reclaim(&pool);
     assert!(
-        pool.used_bytes().unwrap() >= required + source_bytes,
+        pool.fixture_host_current().unwrap() >= required + source_bytes,
         "unresolved carrier preserves its full native bound and source registration"
     );
 }
@@ -588,14 +636,14 @@ fn retirement_busy_aborts_sealed_frame_and_keeps_complete_original_carrier() {
     let source_bytes = f.source_bytes;
     drop((step, error, f));
     reclaim(&pool);
-    assert!(pool.used_bytes().unwrap() >= required + source_bytes);
+    assert!(pool.fixture_host_current().unwrap() >= required + source_bytes);
 }
 
 #[test]
 fn measured_carrier_controls_reject_arithmetic_overflow_without_native_work() {
     let before = EVALUATIONS.get();
-    let mut limits = WorkspaceCopyLimits::new(u64::MAX);
-    limits.safety_reserve_bytes = u64::MAX;
+    let mut limits = WorkspaceCopyLimits::new(crate::memory_fixture::limits(u64::MAX));
+    limits.additional_host_metadata_bytes = u64::MAX;
     for error in [
         text_work_control_bytes(u64::MAX).unwrap_err(),
         copy_limits_with_work_controls(limits).unwrap_err(),
@@ -620,6 +668,7 @@ fn scoped_closed_work_probe_resets_on_unwind_before_final_real_work_alias() {
     let (result, calls, _) = execute(&mut f, Failure::None, false);
     let result = result.unwrap();
     assert_eq!(calls, (1, 1, 1));
+    reclaim(&f.pool);
     assert!(f.source_dropped.load(Ordering::SeqCst));
     let frame = f.bank.take_shared_step().unwrap().unwrap();
     captured(&frame);
@@ -709,11 +758,11 @@ fn closed_failed_carrier_survives_work_alias_unwind_without_refunding_original_s
         assert!(!dropped.load(Ordering::SeqCst));
         assert!(work.certify().is_err());
         assert!(work.scope.try_borrow_mut().unwrap().is_some());
-        assert!(pool.used_bytes().unwrap() >= required);
+        assert!(pool.fixture_host_current().unwrap() >= required);
         drop(work);
         reclaim(&pool);
         // Closing the carrier allocation cannot certify its aborted source
         // segment or turn failed native work into a reusable/refunded account.
-        assert!(pool.used_bytes().unwrap() >= required);
+        assert!(pool.fixture_host_current().unwrap() >= required);
     }
 }

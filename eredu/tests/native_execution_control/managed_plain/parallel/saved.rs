@@ -32,11 +32,13 @@ fn native_managed_tensor_parallel_saved_state_matches_uninterrupted_future() {
     compare_selected_modes(CASE, MODE, RESULT, "TP saved state", 2, &["lifecycle"], run)
 }
 
-
 fn run_pipeline(mode: &str) -> serde_json::Value {
     assert!(matches!(mode, "serial" | "lifecycle"));
-    run_partitioned_with_lifecycle(mode,
-        eredu_core::ParallelTopology::new(1, 2, 1, 1).unwrap(), Some(lifecycle))
+    run_partitioned_with_lifecycle(
+        mode,
+        eredu_core::ParallelTopology::new(1, 2, 1, 1).unwrap(),
+        Some(lifecycle),
+    )
 }
 
 #[test]
@@ -51,8 +53,11 @@ fn native_managed_pipeline_parallel_saved_state_matches_uninterrupted_future() {
 
 fn run_combined(mode: &str) -> serde_json::Value {
     assert!(matches!(mode, "serial" | "lifecycle"));
-    run_partitioned_with_lifecycle(mode,
-        eredu_core::ParallelTopology::new(2, 2, 1, 1).unwrap(), Some(lifecycle))
+    run_partitioned_with_lifecycle(
+        mode,
+        eredu_core::ParallelTopology::new(2, 2, 1, 1).unwrap(),
+        Some(lifecycle),
+    )
 }
 
 #[test]
@@ -76,19 +81,25 @@ fn expert_saved_settings() -> PreparedChatGenerationSettings {
     // bytes, exceeding the generation-only 16 GiB positive fixture. Leave room
     // for the later independent branch; one-byte refusal/copy limits stay in
     // the shared lifecycle helper and production admission remains unchanged.
-    settings.inference.managed_memory_capacity_bytes = Some(32 * 1024 * 1024 * 1024);
+    settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(32 * 1024 * 1024 * 1024),
+    )]);
     settings
 }
-
 
 fn expert_pending(
     model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
     root: Fixture,
 ) -> serde_json::Value {
     super::super::snapshot::check_resume_loaded_with_settings(
-        model, root, 0, EXPERT_IDS,
+        model,
+        root,
+        0,
+        EXPERT_IDS,
         Some(&|| eprintln!("PUBLIC_EXPERT_SAVED_PHASE pending")),
-        "PUBLIC_EXPERT_SAVED_PHASE", expert_saved_settings(),
+        "PUBLIC_EXPERT_SAVED_PHASE",
+        expert_saved_settings(),
     )
 }
 
@@ -97,9 +108,13 @@ fn expert_committed(
     root: Fixture,
 ) -> serde_json::Value {
     super::super::snapshot::check_resume_loaded_with_settings(
-        model, root, 1, EXPERT_IDS,
+        model,
+        root,
+        1,
+        EXPERT_IDS,
         Some(&|| eprintln!("PUBLIC_EXPERT_SAVED_PHASE committed")),
-        "PUBLIC_EXPERT_SAVED_PHASE", expert_saved_settings(),
+        "PUBLIC_EXPERT_SAVED_PHASE",
+        expert_saved_settings(),
     )
 }
 

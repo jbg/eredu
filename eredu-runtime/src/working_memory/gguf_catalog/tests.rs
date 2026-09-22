@@ -72,7 +72,7 @@ impl Fixture {
         GgufCatalogPlan::new(self.checkpoint.clone(), &self.resolution, &self.mapping, 1)
     }
     fn requirement(&self) -> Option<u64> {
-        let result = WorkingMemoryPool::gguf_catalog_required_bytes(&self.plan());
+        let result = MemoryLedger::gguf_catalog_required_bytes(&self.plan());
         if std::env::var_os("EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG").is_some() {
             assert!(
                 result.is_ok(),
@@ -82,14 +82,14 @@ impl Fixture {
         match result {
             Ok(bytes) => Some(bytes),
             Err(WorkingMemoryError::UnknownBound) => {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
                 let error = pool.compile_gguf_catalog(self.plan()).unwrap_err();
                 assert!(matches!(
                     error.accounting_failure(),
                     Some(WorkingMemoryError::UnknownBound)
                 ));
                 assert!(error.rejected_input().is_some());
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
                 None
             }
             Err(error) => panic!("unexpected catalog qualification failure: {error}"),
@@ -110,7 +110,7 @@ fn original_immutable_catalog_exact_and_one_short_preserve_input_and_check_domai
     let Some(bytes) = fixture.requirement() else {
         return;
     };
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     let plan = fixture.plan();
     let address = plan.checkpoint().shards()[0].tensors()[0]
         .descriptor()
@@ -119,7 +119,9 @@ fn original_immutable_catalog_exact_and_one_short_preserve_input_and_check_domai
     let refused = short.compile_gguf_catalog(plan).unwrap_err();
     assert!(matches!(
         refused.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert_eq!(
         refused.rejected_input().unwrap().checkpoint().shards()[0].tensors()[0]
@@ -129,10 +131,10 @@ fn original_immutable_catalog_exact_and_one_short_preserve_input_and_check_domai
         address
     );
     assert!(refused.compilation_failure().is_none());
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let original = pool.compile_gguf_catalog(fixture.plan()).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     original.validate_pool(&pool).unwrap();
     assert!(matches!(
         original.validate_pool(&short),
@@ -149,7 +151,7 @@ fn original_immutable_catalog_exact_and_one_short_preserve_input_and_check_domai
     assert_eq!(source.diagnostics().unwrap().physical_reads, 0);
     assert_eq!(source.metadata("first").unwrap().logical_shape, [2]);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -158,7 +160,7 @@ fn original_immutable_catalog_lease_and_concurrent_aliases_share_one_charge_past
     let Some(bytes) = fixture.requirement() else {
         return;
     };
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let source = pool
         .compile_gguf_catalog(fixture.plan())
         .unwrap()
@@ -181,7 +183,7 @@ fn original_immutable_catalog_lease_and_concurrent_aliases_share_one_charge_past
         scope.spawn(move || drop(a));
         scope.spawn(move || drop(b));
     });
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     let converted = lease.materialize_portable().unwrap();
     assert_eq!(converted.output_names(), ["first"]);
     match converted.converted() {
@@ -195,18 +197,18 @@ fn original_immutable_catalog_lease_and_concurrent_aliases_share_one_charge_past
     }
     drop(converted);
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     // A weak StoreInner shell is separate; it must not retain/refund the catalog.
     assert_eq!(identity, retained_identity);
     drop(identity);
     drop(retained_identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_immutable_catalog_failed_prefix_and_unqualified_origins_cannot_promote() {
     let fixture = Fixture::new();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let ordinary = fixture.plan().compile(()).unwrap().build().unwrap();
     assert!(matches!(
         pool.validate_gguf_catalog_source(&ordinary),
@@ -244,8 +246,8 @@ fn original_immutable_catalog_failed_prefix_and_unqualified_origins_cannot_promo
         .descriptor()
         .name
         .as_ptr();
-    let bytes = WorkingMemoryPool::gguf_catalog_required_bytes(&plan).unwrap();
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::gguf_catalog_required_bytes(&plan).unwrap();
+    let exact = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let error = exact.compile_gguf_catalog(plan).unwrap_err();
     assert!(error.accounting_failure().is_none());
     assert_eq!(error.completed_rows(), Some(1));
@@ -256,8 +258,11 @@ fn original_immutable_catalog_failed_prefix_and_unqualified_origins_cannot_promo
             .as_ptr(),
         address
     );
-    assert_eq!(error.to_string(), "GGUF checkpoint operation failed for tensor \"second\": admitted GGUF tensor mapping omits a catalog output");
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
+    assert_eq!(
+        error.to_string(),
+        "GGUF checkpoint operation failed for tensor \"second\": admitted GGUF tensor mapping omits a catalog output"
+    );
+    assert_eq!(exact.payload_used_bytes().unwrap(), bytes);
     drop(error);
-    assert_eq!(exact.used_bytes().unwrap(), 0);
+    assert_eq!(exact.payload_used_bytes().unwrap(), 0);
 }

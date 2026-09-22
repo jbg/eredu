@@ -31,11 +31,21 @@ pub(super) struct Descriptor {
     pub(super) input_rank: usize,
     pub(super) index: Dtype,
 }
-fn floating(value: WorkspaceLayoutView<'_>) -> bool {
+fn floating(value: WorkspaceLayoutView<'_>, contiguous: bool) -> bool {
     value.dtype() == WorkspaceDtype::Float32
-        && value
-            .representation()
-            .is_some_and(|r| r.dtype() == WorkspaceFloatingType::Float32 && r.row_contiguous())
+        && value.representation().is_some_and(|r| {
+            r.dtype() == WorkspaceFloatingType::Float32 && (!contiguous || r.row_contiguous())
+        })
+}
+fn operand_floating(value: WorkspaceLayoutView<'_>, contiguous: bool) -> bool {
+    if contiguous {
+        return floating(value, true);
+    }
+    // The Metal caller accepts any supported floating operand and strides.
+    // Each selected parameter bank below must independently prove F32: this
+    // excludes the BF16 row kernel and makes GatherMM's promoted result F32.
+    // This does not establish a new representation on the source layout.
+    value.dtype() == WorkspaceDtype::Float32
 }
 fn projection(
     spec: &GroupedProjectionSpec,
@@ -44,6 +54,7 @@ fn projection(
     output: usize,
     operation: WorkspaceOperationView<'_>,
     slot: &mut usize,
+    contiguous: bool,
 ) -> facts::FactResult<Option<Projection>> {
     if spec.format().encoding() != eredu_checkpoint::LinearFormat::Dense
         || spec.format().scale().is_some()
@@ -56,7 +67,7 @@ fn projection(
     if weight.shape() != [groups as i32, output as i32, input as i32] {
         return Err(invalid());
     }
-    if !floating(weight) {
+    if !floating(weight, contiguous) {
         return Ok(None);
     }
     let bias = spec.bias().is_some();
@@ -66,7 +77,7 @@ fn projection(
         if value.shape() != [groups as i32, output as i32] {
             return Err(invalid());
         }
-        if !floating(value) {
+        if !floating(value, contiguous) {
             return Ok(None);
         }
     }
@@ -79,6 +90,20 @@ fn projection(
 impl Descriptor {
     pub(super) fn inspect(
         operation: WorkspaceOperationView<'_>,
+    ) -> facts::FactResult<Option<Self>> {
+        Self::inspect_layout(operation, true)
+    }
+    /// Geometry for the same positive F32 callers after independent Metal
+    /// allocation/dispatch qualification. Their safe signatures accept strides;
+    /// native internal copies stay in that selected Metal allocation envelope.
+    pub(super) fn inspect_metal_callers(
+        operation: WorkspaceOperationView<'_>,
+    ) -> facts::FactResult<Option<Self>> {
+        Self::inspect_layout(operation, false)
+    }
+    fn inspect_layout(
+        operation: WorkspaceOperationView<'_>,
+        contiguous: bool,
     ) -> facts::FactResult<Option<Self>> {
         let WorkspaceOperationKindView::Grouped {
             bank,
@@ -184,7 +209,7 @@ impl Descriptor {
             operation.inputs.get(3).unwrap(),
         ]
         .into_iter()
-        .all(floating)
+        .all(|value| operand_floating(value, contiguous))
         {
             return Ok(None);
         }
@@ -204,11 +229,14 @@ impl Descriptor {
         if read > i32::MAX as usize {
             return Ok(None);
         }
-        let Some(first) = projection(first, groups, input, read, operation, &mut slot)? else {
+        let Some(first) = projection(first, groups, input, read, operation, &mut slot, contiguous)?
+        else {
             return Ok(None);
         };
         let down = match down {
-            Some(spec) => match projection(spec, groups, units, output, operation, &mut slot)? {
+            Some(spec) => match projection(
+                spec, groups, units, output, operation, &mut slot, contiguous,
+            )? {
                 Some(value) => Some(value),
                 None => return Ok(None),
             },
@@ -233,7 +261,7 @@ impl Descriptor {
                 {
                     return Err(invalid());
                 }
-                if index == 0 && !floating(value) {
+                if index == 0 && !operand_floating(value, contiguous) {
                     return Ok(None);
                 }
                 if index != 0

@@ -1,7 +1,7 @@
 use super::*;
 use eredu_runtime::{
     input::host::{HostInputPart, PreparedHostInputPlan},
-    working_memory::WorkingMemoryPool,
+    working_memory::MemoryLedger,
 };
 use std::convert::Infallible;
 #[derive(Default)]
@@ -90,7 +90,7 @@ fn original_host_source_and_legacy_boolean_processor_share_value_preserving_lowe
             }],
         },
     ];
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let source = pool
         .compile_prepared_host_input(PreparedHostInputPlan::prepare(&parts).unwrap())
         .unwrap();
@@ -121,7 +121,7 @@ fn original_host_source_and_legacy_boolean_processor_share_value_preserving_lowe
     );
     assert_eq!(result.parts()[1].extents(), parts[1].extents);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
     let legacy = PreparedModelInput::new(
         vec![PreparedInputPart::new(
             InputModality::Audio,

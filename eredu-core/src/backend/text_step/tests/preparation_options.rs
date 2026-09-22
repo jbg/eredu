@@ -45,7 +45,6 @@ fn source() -> SharedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransform::FullTensor.kind()],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = crate::ObservationSupportReport {
@@ -77,7 +76,6 @@ fn source() -> SharedCapturePlan {
             limits: CaptureLimits {
                 per_step: all,
                 cumulative: all,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -114,7 +112,7 @@ pub(super) fn options(facts: &Rc<RefCell<Facts>>) -> (TextPreparationOptions, Ar
         facts.options.log.clone()
     };
     source
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<_, std::convert::Infallible>(Box::new(SourceRetirement {
                 alive: alive.clone(),
                 log,
@@ -123,7 +121,8 @@ pub(super) fn options(facts: &Rc<RefCell<Facts>>) -> (TextPreparationOptions, Ar
         .unwrap();
     (
         TextPreparationOptions {
-            interventions: None, capture: Some(source),
+            interventions: None,
+            capture: Some(source),
         },
         alive,
     )

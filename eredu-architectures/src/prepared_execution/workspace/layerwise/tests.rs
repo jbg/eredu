@@ -18,16 +18,26 @@ impl WorkspaceMechanisms for Facts {
                 .iter()
                 .map(|layout| layout.bytes().map(WorkspaceOutputStorage::Allocate))
                 .collect::<Result<_, _>>()?,
-            scratch_bytes: 5,
+            scratch_bytes: if matches!(operation.kind, WorkspaceOperationKind::ValueCompletion) {
+                0
+            } else {
+                5
+            },
             assumptions: "fixture output capacity and five bytes of simultaneous scratch".into(),
         }))
     }
     fn host_workspace_bound(
         &self,
-        _: &WorkspaceOperation,
+        operation: &WorkspaceOperation,
     ) -> Result<Option<WorkspaceHostBound>, Error> {
-        Ok((!self.missing_host).then(|| WorkspaceHostBound {
-            bytes: 3,
+        Ok((!self.missing_host
+            || matches!(operation.kind, WorkspaceOperationKind::ValueCompletion))
+        .then(|| WorkspaceHostBound {
+            bytes: if matches!(operation.kind, WorkspaceOperationKind::ValueCompletion) {
+                0
+            } else {
+                3
+            },
             assumptions: "three bytes of independent fixture staging".into(),
         }))
     }
@@ -152,7 +162,7 @@ fn every_prefill_and_decode_span_keeps_constructed_helpers_through_unit_completi
         // 48 tensor-output bytes, 30 scratch bytes and 18 disjoint host bytes.
         // Binding and unit Drop refund none of the constructor allocation.
         assert_eq!(report.total_bytes, Some(96));
-        assert_eq!(report.operations.len(), 6);
+        assert_eq!(report.operations.len(), 8);
         Ok::<_, Error>(report)
     })
     .unwrap();
@@ -273,23 +283,97 @@ fn legacy_parameter_provider_does_not_allocate_through_strict_default() {
 
 impl WorkspaceFactMechanisms for Facts {
     type Error = std::convert::Infallible;
-    fn operation_facts(&self, _: WorkspaceOperationView<'_>) -> Result<Option<WorkspaceOperationFacts>, Self::Error> { panic!("no constructor may run before source qualification") }
-    fn write_operation_facts(&self, _: WorkspaceOperationView<'_>, _: WorkspaceEffectDestination<'_>) -> Result<Option<WorkspaceOperationFacts>, Self::Error> { unreachable!() }
-    fn host_facts(&self, _: WorkspaceOperationView<'_>) -> Result<Option<WorkspaceHostFacts>, Self::Error> { unreachable!() }
-    fn write_host_facts(&self, _: WorkspaceOperationView<'_>, _: WorkspaceHostDestination<'_>) -> Result<Option<WorkspaceHostFacts>, Self::Error> { unreachable!() }
+    fn operation_facts(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Result<Option<WorkspaceOperationFacts>, Self::Error> {
+        panic!("no constructor may run before source qualification")
+    }
+    fn write_operation_facts(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: WorkspaceEffectDestination<'_>,
+    ) -> Result<Option<WorkspaceOperationFacts>, Self::Error> {
+        unreachable!()
+    }
+    fn host_facts(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Result<Option<WorkspaceHostFacts>, Self::Error> {
+        unreachable!()
+    }
+    fn write_host_facts(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: WorkspaceHostDestination<'_>,
+    ) -> Result<Option<WorkspaceHostFacts>, Self::Error> {
+        unreachable!()
+    }
 }
 
 #[test]
 fn checked_acquire_refuses_legacy_population_before_constructor() {
-    let context=WorkspaceContext::new_recording_facts(Facts {missing_host:false});
-    let provider=Provider::new(&context,1);
-    let mut policy=WorkspaceLayerwisePolicy::new(&provider,layout(1)).unwrap();
-    let built=Cell::new(false);
-    let result=policy.acquire(0,provider.layout.address(0).unwrap(),|context| {
-        built.set(true);
-        Unit::build(2,context)
-    },&context);
-    assert!(matches!(result,Err(LayerwiseAcquireError::Policy(_))));
+    let context = WorkspaceContext::new_recording_facts(Facts {
+        missing_host: false,
+    });
+    let provider = Provider::new(&context, 1);
+    let mut policy = WorkspaceLayerwisePolicy::new(&provider, layout(1)).unwrap();
+    let built = Cell::new(false);
+    let result = policy.acquire(
+        0,
+        provider.layout.address(0).unwrap(),
+        |context| {
+            built.set(true);
+            Unit::build(2, context)
+        },
+        &context,
+    );
+    assert!(matches!(result, Err(LayerwiseAcquireError::Policy(_))));
     assert!(!built.get());
-    assert_eq!(provider.calls.get(),0);
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
+fn layer_completion_retains_actual_state_and_context_handle_population() {
+    let context = WorkspaceContext::new(Facts {
+        missing_host: false,
+    });
+    let provider = Provider::new(&context, 1);
+    let mut policy = WorkspaceLayerwisePolicy::new(&provider, layout(1)).unwrap();
+    context
+        .begin_state_span(std::iter::empty::<&WorkspaceTensor>())
+        .unwrap();
+    let unit = policy
+        .acquire(
+            0,
+            provider.layout.address(0).unwrap(),
+            |context| Unit::build(2, context),
+            &context,
+        )
+        .unwrap();
+    let output = unit.helper.clone();
+    policy
+        .complete(
+            0,
+            provider.layout.address(0).unwrap(),
+            unit,
+            &output,
+            [&output, &output].into_iter(),
+            [&output; 5].into_iter(),
+            &context,
+        )
+        .unwrap();
+    let report = context.report(&[output]).unwrap();
+    let completion = report.operations.last().unwrap();
+    assert!(matches!(
+        completion.kind,
+        WorkspaceOperationKind::ValueCompletion
+    ));
+    assert_eq!(completion.inputs.len(), 8);
+    assert!(completion.outputs.is_empty());
+    assert_eq!(
+        report.state.unwrap().retained_bytes,
+        Some(8),
+        "completion handles retain one physical backing identity"
+    );
 }

@@ -59,17 +59,28 @@ struct FlagResolution {
 
 #[derive(Debug)]
 enum WordResolution {
-    Signed { output:Array,resolved:WordsResult<i32> },
-    Unsigned { output:Array,resolved:WordsResult<u32> },
+    Signed {
+        output: Array,
+        resolved: WordsResult<i32>,
+    },
+    Unsigned {
+        output: Array,
+        resolved: WordsResult<u32>,
+    },
 }
 impl WordResolution {
-    fn output(&self)->&Array { match self { Self::Signed{output,..}|Self::Unsigned{output,..}=>output } }
+    fn output(&self) -> &Array {
+        match self {
+            Self::Signed { output, .. } | Self::Unsigned { output, .. } => output,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct BoundaryHeaderResolution {
     pub(super) received: Array,
     pub(super) expected: Vec<u8>,
+    pub(super) ordinary_readback: Option<RefCell<Vec<u8>>>,
 }
 
 /// Deferred host words for a manifest-consensus collective.
@@ -103,6 +114,9 @@ pub(crate) struct MlxCommunicationFlag {
 impl MlxCommunicationFlag {
     pub(crate) fn resolve(self) -> Result<bool, safemlx::error::Exception> {
         self.resolved.get().ok_or_else(|| {
+            if let Some(host) = self.resolved.ordinary_host() {
+                return ordinary::failure(ordinary::Cause::Readout, host);
+            }
             safemlx::error::Exception::custom(
                 "communication flag was requested before exact completion",
             )
@@ -111,17 +125,25 @@ impl MlxCommunicationFlag {
 }
 
 impl MlxFailureAgreement {
-    pub(super) fn original(resolved:BoolResult)->Self {Self{resolved}}
+    pub(super) fn original(resolved: BoolResult) -> Self {
+        Self { resolved }
+    }
     /// The shared resolver preserves the paid original source on premature
     /// access, while ordinary callers retain the native Exception path.
-    pub(crate) fn resolve_neural(self)->Result<bool,Error> {
-        if let Some(custody)=self.resolved.original_custody() {
-            return self.resolved.get().ok_or_else(||prepared::error(prepared::Cause::Identity,custody));
+    pub(crate) fn resolve_neural(self) -> Result<bool, Error> {
+        if let Some(custody) = self.resolved.original_custody() {
+            return self
+                .resolved
+                .get()
+                .ok_or_else(|| prepared::error(prepared::Cause::Identity, custody));
         }
         self.resolve().map_err(Into::into)
     }
     pub(crate) fn resolve(self) -> Result<bool, safemlx::error::Exception> {
         self.resolved.get().ok_or_else(|| {
+            if let Some(host) = self.resolved.ordinary_host() {
+                return ordinary::failure(ordinary::Cause::Readout, host);
+            }
             safemlx::error::Exception::custom(
                 "failure-agreement result was requested before exact completion",
             )
@@ -195,7 +217,7 @@ pub(crate) fn release_forced_pending_orphans() {
 
 fn quarantine(mut work: MlxCommunicationCompletion) {
     let destination = work.orphan_destination.take();
-    if !work.recovery.is_original() {
+    if !work.recovery.is_original() && work.recovery.retention().ordinary.is_none() {
         safemlx::register_thread_runtime_housekeeping(reap_communication_orphans);
     }
     COMMUNICATION_ORPHANS.with(|orphans| {
@@ -225,29 +247,65 @@ pub(super) fn reap_communication_orphans() {
 /// registration or mutation. An unresolved orphan remains unavailable until the
 /// existing ordinary/qualified completion worker actually retires it.
 pub(crate) fn group_source_available(group: &Group) -> bool {
-    let live = NATIVE_RESOURCE_OWNERS.try_with(|owners| {
-        owners.try_borrow().map(|owners| !owners.iter().filter_map(std::rc::Weak::upgrade)
-            .any(|resources| resources.unavailable() && resources.groups.iter()
-                .any(|retained| retained.shares_native_world(group)))).unwrap_or(false)
-    }).unwrap_or(false);
-    live && COMMUNICATION_ORPHANS.try_with(|orphans| {
-        orphans.try_borrow().map(|orphans| !orphans.work.iter().any(|work|
-            work.recovery.retention().groups.iter().any(|retained|
-                retained.shares_native_world(group)))).unwrap_or(false)
-    }).unwrap_or(false)
+    let live = NATIVE_RESOURCE_OWNERS
+        .try_with(|owners| {
+            owners
+                .try_borrow()
+                .map(|owners| {
+                    !owners
+                        .iter()
+                        .filter_map(std::rc::Weak::upgrade)
+                        .any(|resources| {
+                            resources.unavailable()
+                                && resources
+                                    .groups
+                                    .iter()
+                                    .any(|retained| retained.shares_native_world(group))
+                        })
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    live && COMMUNICATION_ORPHANS
+        .try_with(|orphans| {
+            orphans
+                .try_borrow()
+                .map(|orphans| {
+                    !orphans.work.iter().any(|work| {
+                        work.recovery
+                            .retention()
+                            .groups
+                            .iter()
+                            .any(|retained| retained.shares_native_world(group))
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 pub(crate) fn group_source_controls() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
-    let controls = [size_of::<&Group>(), size_of::<(bool, bool)>(),
+    let controls = [
+        size_of::<&Group>(),
+        size_of::<(bool, bool)>(),
         size_of::<std::cell::Ref<'_, destinations::Destinations<std::rc::Weak<NativeResources>>>>(),
-        size_of::<Result<std::cell::Ref<'_, destinations::Destinations<std::rc::Weak<NativeResources>>>, std::cell::BorrowError>>(),
-        size_of::<Option<Rc<NativeResources>>>(), size_of::<destinations::Iter<'_, std::rc::Weak<NativeResources>>>(),
+        size_of::<
+            Result<
+                std::cell::Ref<'_, destinations::Destinations<std::rc::Weak<NativeResources>>>,
+                std::cell::BorrowError,
+            >,
+        >(),
+        size_of::<Option<Rc<NativeResources>>>(),
+        size_of::<destinations::Iter<'_, std::rc::Weak<NativeResources>>>(),
         size_of::<std::cell::Ref<'_, CommunicationOrphanQuarantine>>(),
-        size_of::<Result<std::cell::Ref<'_, CommunicationOrphanQuarantine>, std::cell::BorrowError>>(),
+        size_of::<Result<std::cell::Ref<'_, CommunicationOrphanQuarantine>, std::cell::BorrowError>>(
+        ),
         size_of::<std::slice::Iter<'_, Group>>(),
         size_of::<Result<bool, std::thread::AccessError>>(),
     ];
-    controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
+    controls
+        .into_iter()
+        .try_fold(size_of_val(&controls), usize::checked_add)
 }
 
 pub(crate) fn ensure_group_available(group: &Group) -> Result<(), Error> {
@@ -299,21 +357,43 @@ impl MlxCommunicationCompletion {
         routes: Vec<CommunicationRouteRealization>,
         streams: Vec<Stream>,
     ) -> Result<Self, safemlx::error::Exception> {
-        let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
+        let outputs = outputs.into_iter();
+        let ordinary = crate::backend::nn::shared::current_ordinary_execution_owner()?;
+        let (outputs, mut recovery, orphan_destination) = match ordinary {
+            Some(owner) => {
+                let (outputs, recovery, destination) = ordinary::prepare(
+                    owner,
+                    outputs,
+                    arrays,
+                    count_buffers,
+                    groups,
+                    routes,
+                    streams,
+                )?;
+                (outputs, recovery, Some(destination))
+            }
+            None => {
+                let outputs = outputs.cloned().collect::<Vec<_>>();
+                let recovery = Recovery::begin(NativeResources::new(
+                    arrays,
+                    count_buffers,
+                    groups,
+                    routes,
+                    streams,
+                ))?;
+                (outputs, recovery, None)
+            }
+        };
         #[cfg(test)]
         let submitted_outputs = outputs.len();
-        let mut recovery = Recovery::begin(NativeResources::new(
-            arrays,
-            count_buffers,
-            groups,
-            routes,
-            streams,
-        ))?;
         let event = async_eval_with_event(outputs.iter());
         recovery.seal();
         recovery.retention().host_failed.set(event.is_err());
         recovery.progress();
-        let event = Rc::new(event?);
+        let event = Rc::new(event.map_err(|cause| match &recovery.retention().ordinary {
+            Some(owner) => ordinary::failure(ordinary::Cause::Native(cause), owner.host()),
+            None => cause,
+        })?);
         *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
         check_native_status(&recovery)?;
         #[cfg(test)]
@@ -327,7 +407,7 @@ impl MlxCommunicationCompletion {
             boundary_headers: BoundaryHeaders::default(),
             authority: None,
             consumers: None,
-            orphan_destination: None,
+            orphan_destination,
             #[cfg(test)]
             submitted_outputs,
             #[cfg(test)]
@@ -339,15 +419,34 @@ impl MlxCommunicationCompletion {
         })
     }
 
-    pub(super) fn from_original(event: NativeEvent, recovery: CompletionRecovery,
-        destination: destinations::Destination<Self>, outputs: usize, consumers:Option<consumers::PreparedConsumers>) -> Self {
-        #[cfg(not(test))] let _ = outputs;
-        Self { event, recovery, agreement:None, flag:None, words:None,
-            boundary_headers:BoundaryHeaders::default(), authority:None, consumers, orphan_destination:Some(destination),
-            #[cfg(test)] submitted_outputs:outputs,
-            #[cfg(test)] force_pending:false,
-            #[cfg(test)] teardown_observed:None,
-            #[cfg(test)] owner_exit_completion_observed:None }
+    pub(super) fn from_original(
+        event: NativeEvent,
+        recovery: CompletionRecovery,
+        destination: destinations::Destination<Self>,
+        outputs: usize,
+        consumers: Option<consumers::PreparedConsumers>,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = outputs;
+        Self {
+            event,
+            recovery,
+            agreement: None,
+            flag: None,
+            words: None,
+            boundary_headers: BoundaryHeaders::default(),
+            authority: None,
+            consumers,
+            orphan_destination: Some(destination),
+            #[cfg(test)]
+            submitted_outputs: outputs,
+            #[cfg(test)]
+            force_pending: false,
+            #[cfg(test)]
+            teardown_observed: None,
+            #[cfg(test)]
+            owner_exit_completion_observed: None,
+        }
     }
 
     /// Joins this exact completion to the selected session poison authority.
@@ -379,7 +478,13 @@ impl MlxCommunicationCompletion {
         output: Array,
         member_count: i32,
     ) -> (MlxFailureAgreement, Self) {
-        let resolved = BoolResult::ordinary();
+        let resolved = BoolResult::ordinary_owned(
+            self.recovery
+                .retention()
+                .ordinary
+                .as_ref()
+                .map(|owner| owner.host().clone()),
+        );
         self.agreement = Some(FailureAgreementResolution {
             output,
             member_count,
@@ -398,7 +503,13 @@ impl MlxCommunicationCompletion {
     }
 
     pub(crate) fn with_f32_flag(mut self, output: Array) -> (MlxCommunicationFlag, Self) {
-        let resolved = BoolResult::ordinary();
+        let resolved = BoolResult::ordinary_owned(
+            self.recovery
+                .retention()
+                .ordinary
+                .as_ref()
+                .map(|owner| owner.host().clone()),
+        );
         self.flag = Some(FlagResolution {
             output,
             resolved: resolved.clone(),
@@ -411,89 +522,185 @@ impl MlxCommunicationCompletion {
         mut self,
         headers: impl IntoIterator<Item = (Array, Vec<u8>)>,
     ) -> Self {
-        self.boundary_headers.extend(
-            headers
-                .into_iter()
-                .map(|(received, expected)| BoundaryHeaderResolution { received, expected }),
-        );
+        let host = self
+            .recovery
+            .retention()
+            .ordinary
+            .as_ref()
+            .map(|owner| owner.host().clone());
+        let headers = headers.into_iter();
+        // This producer receives the actual Vec built by send_receive. Reserve
+        // its exact population before attaching any native header aliases.
+        self.boundary_headers.reserve_exact(headers.size_hint().0);
+        self.boundary_headers
+            .extend(headers.map(|(received, expected)| {
+                let ordinary_readback =
+                    host.as_ref().map(|_| RefCell::new(vec![0; expected.len()]));
+                BoundaryHeaderResolution {
+                    received,
+                    expected,
+                    ordinary_readback,
+                }
+            }));
+        self.boundary_headers.retain_ordinary(host);
         self
     }
 
-    fn completed_readout<'a>(&self,output:&'a Array)->Result<safemlx::EvaluatedArray<'a>,safemlx::error::Exception> {
+    fn completed_readout<'a>(
+        &self,
+        output: &'a Array,
+    ) -> Result<safemlx::EvaluatedArray<'a>, safemlx::error::Exception> {
         match self.event.original_observer() {
-            Some(observer)=>output.completed_in_original_scope(observer),
-            None=>output.evaluated(),
+            Some(observer) => output.completed_in_original_scope(observer),
+            None => output.evaluated(),
         }
     }
-    fn readout_error(&self,arguments:std::fmt::Arguments<'_>)->safemlx::error::Exception {
+    fn readout_error(&self, arguments: std::fmt::Arguments<'_>) -> safemlx::error::Exception {
+        if let Some(owner) = &self.recovery.retention().ordinary {
+            return ordinary::failure(ordinary::Cause::Readout, owner.host());
+        }
         match self.event.original_observer() {
-            Some(observer)=>observer.invalid_input_error(),
-            None=>safemlx::error::Exception::custom(arguments.to_string()),
+            Some(observer) => observer.invalid_input_error(),
+            None => safemlx::error::Exception::custom(arguments.to_string()),
         }
     }
-    pub(super) fn install_original_scalar(&mut self,output:Array,result:BoolResult,kind:scalar::ScalarKind) {
+    pub(super) fn install_original_scalar(
+        &mut self,
+        output: Array,
+        result: BoolResult,
+        kind: scalar::ScalarKind,
+    ) {
         match kind {
-            scalar::ScalarKind::Flag=>self.flag=Some(FlagResolution { output,resolved:result }),
-            scalar::ScalarKind::Agreement(member_count)=>self.agreement=Some(FailureAgreementResolution { output,resolved:result,member_count }),
+            scalar::ScalarKind::Flag => {
+                self.flag = Some(FlagResolution {
+                    output,
+                    resolved: result,
+                })
+            }
+            scalar::ScalarKind::Agreement(member_count) => {
+                self.agreement = Some(FailureAgreementResolution {
+                    output,
+                    resolved: result,
+                    member_count,
+                })
+            }
         }
     }
 
-    pub(super) fn install_original_words(&mut self,output:Array,result:WordsResult) {
-        self.words=Some(WordResolution::Signed { output,resolved:result });
+    pub(super) fn install_original_words(&mut self, output: Array, result: WordsResult) {
+        self.words = Some(WordResolution::Signed {
+            output,
+            resolved: result,
+        });
     }
-    pub(super) fn install_original_u32_words(&mut self,output:Array,result:WordsResult<u32>) {
-        self.words=Some(WordResolution::Unsigned { output,resolved:result });
+    pub(super) fn install_original_u32_words(&mut self, output: Array, result: WordsResult<u32>) {
+        self.words = Some(WordResolution::Unsigned {
+            output,
+            resolved: result,
+        });
     }
-    fn resolve_words<T:readouts::CommunicationWord>(&self,output:&Array,result:&WordsResult<T>)
-        ->Result<(),safemlx::error::Exception> {
-        let evaluated=self.completed_readout(output)?;
-        let stored=readouts::store_words(&evaluated,result).map_err(|error| {
-            self.readout_error(format_args!("communication word result differs from its prepared dtype: {error}"))
+    fn resolve_words<T: readouts::CommunicationWord>(
+        &self,
+        output: &Array,
+        result: &WordsResult<T>,
+    ) -> Result<(), safemlx::error::Exception> {
+        let evaluated = self.completed_readout(output)?;
+        let stored = readouts::store_words(&evaluated, result).map_err(|error| {
+            self.readout_error(format_args!(
+                "communication word result differs from its prepared dtype: {error}"
+            ))
         })?;
         if !stored {
-            return Err(self.readout_error(format_args!("communication word result differs from its prepared population")));
+            return Err(self.readout_error(format_args!(
+                "communication word result differs from its prepared population"
+            )));
         }
         Ok(())
     }
-    pub(super) fn install_original_header(&mut self,headers:BoundaryHeaders) { self.boundary_headers=headers; }
+    pub(super) fn install_original_header(&mut self, headers: BoundaryHeaders) {
+        self.boundary_headers = headers;
+    }
 
     fn resolve_host_results(&self) -> Result<(), safemlx::error::Exception> {
         if let Some(agreement) = &self.agreement {
-            let evaluated = self.completed_readout(&agreement.output)?;
-            let counts = evaluated.try_as_slice::<i32>().map_err(|error| {
-                self.readout_error(format_args!("failure-agreement result is not an i32 status count: {error}"))
-            })?;
-            let agreed = match counts {
-                [successes] => *successes == agreement.member_count,
-                _ => {
-                    return Err(self.readout_error(format_args!("failure-agreement result is not one scalar status count")));
-                }
-            };
-            agreement.resolved.set(Some(agreed));
+            if let Some(owner) = &self.recovery.retention().ordinary {
+                let successes = ordinary::completed_scalar::<i32>(&agreement.output, owner.host())?;
+                agreement
+                    .resolved
+                    .set(Some(successes == agreement.member_count));
+            } else {
+                let evaluated = self.completed_readout(&agreement.output)?;
+                let counts = evaluated.try_as_slice::<i32>().map_err(|error| {
+                    self.readout_error(format_args!(
+                        "failure-agreement result is not an i32 status count: {error}"
+                    ))
+                })?;
+                let agreed = match counts {
+                    [successes] => *successes == agreement.member_count,
+                    _ => {
+                        return Err(self.readout_error(format_args!(
+                            "failure-agreement result is not one scalar status count"
+                        )));
+                    }
+                };
+                agreement.resolved.set(Some(agreed));
+            }
         }
         if let Some(flag) = &self.flag {
-            let evaluated = self.completed_readout(&flag.output)?;
-            let values = evaluated.try_as_slice::<f32>().map_err(|error| {
-                self.readout_error(format_args!("communication flag result is not f32: {error}"))
-            })?;
-            let value = match values {
-                [value] => *value != 0.0,
-                _ => {
-                    return Err(self.readout_error(format_args!("communication flag result is not one scalar")));
-                }
-            };
-            flag.resolved.set(Some(value));
+            if let Some(owner) = &self.recovery.retention().ordinary {
+                let value = ordinary::completed_scalar::<f32>(&flag.output, owner.host())?;
+                flag.resolved.set(Some(value != 0.0));
+            } else {
+                let evaluated = self.completed_readout(&flag.output)?;
+                let values = evaluated.try_as_slice::<f32>().map_err(|error| {
+                    self.readout_error(format_args!(
+                        "communication flag result is not f32: {error}"
+                    ))
+                })?;
+                let value = match values {
+                    [value] => *value != 0.0,
+                    _ => {
+                        return Err(self.readout_error(format_args!(
+                            "communication flag result is not one scalar"
+                        )));
+                    }
+                };
+                flag.resolved.set(Some(value));
+            }
         }
         if let Some(words) = &self.words {
             match words {
-                WordResolution::Signed{output,resolved}=>self.resolve_words(output,resolved)?,
-                WordResolution::Unsigned{output,resolved}=>self.resolve_words(output,resolved)?,
+                WordResolution::Signed { output, resolved } => {
+                    self.resolve_words(output, resolved)?
+                }
+                WordResolution::Unsigned { output, resolved } => {
+                    self.resolve_words(output, resolved)?
+                }
             }
         }
         for header in &self.boundary_headers {
+            if let Some(owner) = &self.recovery.retention().ordinary {
+                let Some(destination) = &header.ordinary_readback else {
+                    return Err(ordinary::failure(ordinary::Cause::Readout, owner.host()));
+                };
+                let mut destination = destination
+                    .try_borrow_mut()
+                    .map_err(|_| ordinary::failure(ordinary::Cause::Readout, owner.host()))?;
+                ordinary::completed_array(&header.received, owner.host())?
+                    .try_copy_into(destination.as_mut_slice())
+                    .map_err(|cause| {
+                        ordinary::failure(ordinary::Cause::Readback(cause), owner.host())
+                    })?;
+                if destination.as_slice() != header.expected {
+                    return Err(ordinary::failure(ordinary::Cause::Readout, owner.host()));
+                }
+                continue;
+            }
             let evaluated = self.completed_readout(&header.received)?;
             let actual = evaluated.try_as_slice::<u8>().map_err(|error| {
-                self.readout_error(format_args!("received boundary frame header is not U8: {error}"))
+                self.readout_error(format_args!(
+                    "received boundary frame header is not U8: {error}"
+                ))
             })?;
             if actual != header.expected {
                 return Err(self.readout_error(format_args!("received boundary frame header differs from the selected route/schema/role contract")));
@@ -503,10 +710,14 @@ impl MlxCommunicationCompletion {
     }
 
     fn observe_completion(&self) -> Result<bool, safemlx::error::Exception> {
-        if self.event.original_observer().is_some() {
+        if self.event.original_observer().is_some() || self.recovery.retention().ordinary.is_some()
+        {
             // Only closed prepaid adapters attach original host readouts. Each
             // one borrows completed storage; none starts another evaluation.
-            return self.event.try_with_complete(||self.resolve_host_results()).map(|ready|ready.is_some());
+            return self
+                .event
+                .try_with_complete(|| self.resolve_host_results())
+                .map(|ready| ready.is_some());
         }
         let arrays = self
             .agreement
@@ -571,7 +782,10 @@ impl MlxCommunicationCompletion {
     ) -> Result<eredu_core::BoundedSubmissionOutcome<Self>, safemlx::error::Exception> {
         COMMUNICATION_ORPHANS.with(|orphans| orphans.borrow_mut().reap());
         let Some(deadline) = std::time::Instant::now().checked_add(policy.timeout()) else {
-            let cause = self.event.refusal("bounded communication deadline exceeds the host monotonic clock range; live work was quarantined safely");
+            let cause = self.recovery.retention().ordinary.as_ref().map_or_else(
+                || self.event.refusal("bounded communication deadline exceeds the host monotonic clock range; live work was quarantined safely"),
+                |owner| ordinary::failure(ordinary::Cause::Deadline, owner.host()),
+            );
             quarantine(self);
             return Err(cause);
         };
@@ -598,9 +812,14 @@ impl MlxCommunicationCompletion {
                 let selected = policy.cancellation();
                 self.mark_authority_failure("bounded communication deadline exceeded");
                 let cause = (selected != eredu_core::CompletionCancellationMode::QuarantineUntilComplete).then(||
-                    self.event.refusal("MLX communication has no native cancellation; timed-out work was quarantined safely"));
+                    self.recovery.retention().ordinary.as_ref().map_or_else(
+                        || self.event.refusal("MLX communication has no native cancellation; timed-out work was quarantined safely"),
+                        |owner| ordinary::failure(ordinary::Cause::Cancellation, owner.host()),
+                    ));
                 quarantine(self);
-                if let Some(cause) = cause { return Err(cause); }
+                if let Some(cause) = cause {
+                    return Err(cause);
+                }
                 return Ok(eredu_core::BoundedSubmissionOutcome::DeadlineExceeded {
                     cancellation: eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
                 });
@@ -611,15 +830,18 @@ impl MlxCommunicationCompletion {
 }
 
 impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
-    fn wait_bounded(self, policy: eredu_core::BoundedCompletionWait)
-        -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+    fn wait_bounded(
+        self,
+        policy: eredu_core::BoundedCompletionWait,
+    ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
         match self.wait_bounded_retaining(policy)? {
             eredu_core::BoundedSubmissionOutcome::Completed(completion) => {
                 drop(completion);
                 Ok(eredu_core::BoundedCompletionOutcome::Completed)
             }
-            eredu_core::BoundedSubmissionOutcome::DeadlineExceeded { cancellation } =>
-                Ok(eredu_core::BoundedCompletionOutcome::DeadlineExceeded { cancellation }),
+            eredu_core::BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
+                Ok(eredu_core::BoundedCompletionOutcome::DeadlineExceeded { cancellation })
+            }
         }
     }
 }
@@ -632,8 +854,10 @@ impl eredu_core::Completion for MlxCommunicationCompletion {
         if self.force_pending {
             return false;
         }
-        if let Some(consumers)=&self.consumers {
-            let Some(observer)=self.event.original_observer() else { return false; };
+        if let Some(consumers) = &self.consumers {
+            let Some(observer) = self.event.original_observer() else {
+                return false;
+            };
             use crate::backend::submission_recovery::observed::RetirementAttempt;
             match consumers.retire_completed(observer) {
                 Ok(RetirementAttempt::Retired) => {}

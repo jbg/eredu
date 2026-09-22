@@ -5,8 +5,8 @@ use crate::backend::runtime::checkpoint::store::{
     PreparedMaterializationSourceStream, PreparedMaterializationSourceWorker,
 };
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     GpuStreamRegistrationCause, GpuStreamRegistrationError, GpuStreamRegistrationLayout,
@@ -73,12 +73,14 @@ impl MlxGpuStreamError {
             Failure::CpuExecution(error) => error.into_backend_failure(),
             Failure::Source(error) => error.into_backend_failure(),
             Failure::Worker(error) => error.into_backend_failure(),
-            Failure::Constructor(error) => BackendFailure::from_error(
-                error.into_parts().1.retire_output_and_map_error(|error| match error {
-                    ConstructorFailure::Preparation(error) => error.cause(),
-                    ConstructorFailure::Native(error) => error.cause(),
-                }),
-            ),
+            Failure::Constructor(error) => {
+                BackendFailure::from_error(error.into_parts().1.retire_output_and_map_error(
+                    |error| match error {
+                        ConstructorFailure::Preparation(error) => error.cause(),
+                        ConstructorFailure::Native(error) => error.cause(),
+                    },
+                ))
+            }
         }
     }
 }
@@ -108,8 +110,8 @@ enum Failure {
 #[derive(Debug)]
 pub(crate) struct PreparedExecutionStream(InitializedSharedNative<RegisteredGpuStream>);
 impl PreparedExecutionStream {
-    pub(crate) fn prepare(pool: &WorkingMemoryPool) -> Result<Self, MlxGpuStreamError> {
-        if !pool.same_domain(&super::domain()) {
+    pub(crate) fn prepare(pool: &MemoryLedger) -> Result<Self, MlxGpuStreamError> {
+        if !pool.same_ledger(&super::ledger()) {
             return Err(Failure::Accounting(WorkingMemoryError::IdentityMismatch).into());
         }
         let layout = PreparedGpuStream::<SharedNativeInitializationCustody>::layout()
@@ -127,7 +129,7 @@ impl PreparedExecutionStream {
             .map(Self)
             .map_err(|error| Failure::Constructor(error).into())
     }
-    pub(crate) fn for_factory(pool: &WorkingMemoryPool) -> Result<Option<Self>, MlxGpuStreamError> {
+    pub(crate) fn for_factory(pool: &MemoryLedger) -> Result<Option<Self>, MlxGpuStreamError> {
         match Self::prepare(pool) {
             Ok(stream) => Ok(Some(stream)),
             Err(MlxGpuStreamError(Failure::Native(GpuStreamRegistrationCause::UnknownLayout))) => {
@@ -142,10 +144,7 @@ impl PreparedExecutionStream {
     pub(crate) fn as_stream(&self) -> &Stream {
         self.0.output().as_stream()
     }
-    pub(crate) fn validate_pool(
-        &self,
-        pool: &WorkingMemoryPool,
-    ) -> Result<(), MlxStreamOwnershipError> {
+    pub(crate) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), MlxStreamOwnershipError> {
         self.0
             .validate_pool(pool)
             .map_err(MlxStreamOwnershipError::Accounting)?;
@@ -162,18 +161,30 @@ enum ExecutionStream {
     Cpu(cpu::PreparedCpuExecution),
 }
 impl ExecutionStream {
-    fn as_stream(&self)->&Stream {match self {Self::Gpu(value)=>value.as_stream(),Self::Cpu(value)=>value.stream()}}
-    fn validate_pool(&self,pool:&WorkingMemoryPool)->Result<(),MlxStreamOwnershipError>{
-        match self {Self::Gpu(value)=>value.validate_pool(pool),Self::Cpu(value)=>value.validate_pool(pool)}
-    }
-    fn observe_idle(&self,pool:&WorkingMemoryPool)->Result<(),MlxStreamOwnershipError>{
+    fn as_stream(&self) -> &Stream {
         match self {
-            Self::Gpu(value)=>value.0.output().try_observe_idle().map_err(MlxStreamOwnershipError::Gpu),
-            Self::Cpu(value)=>value.observe_idle(pool),
+            Self::Gpu(value) => value.as_stream(),
+            Self::Cpu(value) => value.stream(),
+        }
+    }
+    fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), MlxStreamOwnershipError> {
+        match self {
+            Self::Gpu(value) => value.validate_pool(pool),
+            Self::Cpu(value) => value.validate_pool(pool),
+        }
+    }
+    fn observe_idle(&self, pool: &MemoryLedger) -> Result<(), MlxStreamOwnershipError> {
+        match self {
+            Self::Gpu(value) => value
+                .0
+                .output()
+                .try_observe_idle()
+                .map_err(MlxStreamOwnershipError::Gpu),
+            Self::Cpu(value) => value.observe_idle(pool),
         }
     }
 }
-/// Actual same-domain execution and weight-stream owners retained by the backend.
+/// Execution and weight-stream owners retained by the backend under one ledger.
 #[derive(Debug)]
 pub(crate) struct PreparedExecutionStreams {
     execution: ExecutionStream,
@@ -181,18 +192,20 @@ pub(crate) struct PreparedExecutionStreams {
     worker: PreparedMaterializationSourceWorker,
 }
 impl PreparedExecutionStreams {
-    pub(crate) fn for_factory(pool: &WorkingMemoryPool) -> Result<Option<Self>, MlxGpuStreamError> {
+    pub(crate) fn for_factory(pool: &MemoryLedger) -> Result<Option<Self>, MlxGpuStreamError> {
         let Some(execution) = PreparedExecutionStream::for_factory(pool)? else {
             return Ok(None);
         };
-        Self::finish_factory(ExecutionStream::Gpu(execution),pool).map(Some)
+        Self::finish_factory(ExecutionStream::Gpu(execution), pool).map(Some)
     }
     /// Only CPU stream and worker ownership is supplied here. Native equation
     /// and physical-copy source consumers retain their own device qualification.
     /// Shared cold selection for plan and distributed native construction.
     /// This choice is made before either ordinary or managed execution begins.
-    pub(crate) fn for_device_factory(pool: &WorkingMemoryPool, device: safemlx::DeviceType)
-        -> Result<Option<Self>, MlxGpuStreamError> {
+    pub(crate) fn for_device_factory(
+        pool: &MemoryLedger,
+        device: safemlx::DeviceType,
+    ) -> Result<Option<Self>, MlxGpuStreamError> {
         match device {
             safemlx::DeviceType::Gpu => Self::for_factory(pool),
             safemlx::DeviceType::Cpu => {
@@ -206,37 +219,47 @@ impl PreparedExecutionStreams {
         }
     }
 
-    pub(crate) fn for_cpu_factory(pool:&WorkingMemoryPool)->Result<Option<Self>,MlxGpuStreamError>{
-        Self::for_cpu_factory_selected(pool,None)
+    pub(crate) fn for_cpu_factory(pool: &MemoryLedger) -> Result<Option<Self>, MlxGpuStreamError> {
+        Self::for_cpu_factory_selected(pool, None)
     }
     /// Use the same source/worker factory with an explicit cold matrix choice.
     /// This grants no whole-equation or cross-device source qualification.
-    pub(crate) fn for_cpu_factory_with_matmul(pool:&WorkingMemoryPool,choice:crate::backend::nn::workspace::MlxCpuMatmulMechanism)->Result<Option<Self>,MlxGpuStreamError>{
-        Self::for_cpu_factory_selected(pool,Some(choice))
+    pub(crate) fn for_cpu_factory_with_matmul(
+        pool: &MemoryLedger,
+        choice: crate::backend::nn::workspace::MlxCpuMatmulMechanism,
+    ) -> Result<Option<Self>, MlxGpuStreamError> {
+        Self::for_cpu_factory_selected(pool, Some(choice))
     }
-    fn for_cpu_factory_selected(pool:&WorkingMemoryPool,choice:Option<crate::backend::nn::workspace::MlxCpuMatmulMechanism>)->Result<Option<Self>,MlxGpuStreamError>{
+    fn for_cpu_factory_selected(
+        pool: &MemoryLedger,
+        choice: Option<crate::backend::nn::workspace::MlxCpuMatmulMechanism>,
+    ) -> Result<Option<Self>, MlxGpuStreamError> {
         match super::input_allocator::prepare_admitted(pool) {
-            Ok(_)=>{},
-            Err(cause) if cause.permits_ordinary_stream()=>return Ok(None),
-            Err(cause)=>return Err(Failure::Runtime(cause).into()),
+            Ok(_) => {}
+            Err(cause) if cause.permits_ordinary_stream() => return Ok(None),
+            Err(cause) => return Err(Failure::Runtime(cause).into()),
         }
-        let execution=match choice {
-            Some(choice)=>cpu::PreparedCpuExecution::prepare_with_matmul(pool,choice)?,
-            None=>cpu::PreparedCpuExecution::prepare(pool)?,
+        let execution = match choice {
+            Some(choice) => cpu::PreparedCpuExecution::prepare_with_matmul(pool, choice)?,
+            None => cpu::PreparedCpuExecution::prepare(pool)?,
         };
-        Self::finish_factory(ExecutionStream::Cpu(execution),pool).map(Some)
+        Self::finish_factory(ExecutionStream::Cpu(execution), pool).map(Some)
     }
-    fn finish_factory(execution:ExecutionStream,pool:&WorkingMemoryPool)->Result<Self,MlxGpuStreamError>{
+    fn finish_factory(
+        execution: ExecutionStream,
+        pool: &MemoryLedger,
+    ) -> Result<Self, MlxGpuStreamError> {
         let source = PreparedMaterializationSourceStream::prepare(pool).map_err(Failure::Source)?;
         let worker = source.prepare_cpu_worker(pool).map_err(Failure::Worker)?;
-        Ok(Self {execution,source,worker})
+        Ok(Self {
+            execution,
+            source,
+            worker,
+        })
     }
     /// Pure readiness snapshot of the exact retained source worker and encoder.
     /// The caller separately excludes all aliases able to mutate its session.
-    pub(crate) fn observe_idle(
-        &self,
-        pool: &WorkingMemoryPool,
-    ) -> Result<(), MlxStreamOwnershipError> {
+    pub(crate) fn observe_idle(&self, pool: &MemoryLedger) -> Result<(), MlxStreamOwnershipError> {
         self.validate_pool(pool)?;
         self.worker
             .worker_owner()
@@ -252,16 +275,26 @@ impl PreparedExecutionStreams {
             ExecutionStream::Gpu(_) => 0,
         }
     }
+    /// Actual initializer accounts retained by the native process registries.
+    #[cfg(test)]
+    pub(crate) fn permanent_registry_bytes(&self) -> Option<u64> {
+        let execution = match &self.execution {
+            ExecutionStream::Cpu(execution) => execution
+                .original_bytes()
+                .checked_sub(execution.wrapper_control_bytes())?,
+            ExecutionStream::Gpu(execution) => execution.0.original_bytes(),
+        };
+        execution
+            .checked_add(self.source.registration_owner().original_bytes())?
+            .checked_add(self.worker.worker_owner().original_bytes())
+    }
     pub(crate) fn execution(&self) -> &Stream {
         self.execution.as_stream()
     }
     pub(crate) fn source(&self) -> &Stream {
         self.source.as_stream()
     }
-    pub(crate) fn validate_pool(
-        &self,
-        pool: &WorkingMemoryPool,
-    ) -> Result<(), MlxStreamOwnershipError> {
+    pub(crate) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), MlxStreamOwnershipError> {
         self.execution.validate_pool(pool)?;
         let source = self.source.registration_owner();
         source

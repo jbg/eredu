@@ -66,7 +66,6 @@ fn admitted(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -81,7 +80,6 @@ fn admitted(
                 CaptureTransformKind::Summary,
             ],
             max_histogram_bins: 0,
-            physical_native_limit: false,
             conditions: vec![],
         },
         CaptureRequestShape {
@@ -103,9 +101,7 @@ impl WorkspaceMechanisms for Facts {
         op: &WorkspaceOperation,
     ) -> Result<Option<WorkspaceOperationBound>, eredu_nn::Error> {
         let storage = match &op.kind {
-            WorkspaceOperationKind::StaticSlice { .. } => {
-                WorkspaceOutputStorage::AliasInput(0)
-            }
+            WorkspaceOperationKind::StaticSlice { .. } => WorkspaceOutputStorage::AliasInput(0),
             WorkspaceOperationKind::View("reshape") => {
                 WorkspaceOutputStorage::AllocateOrAliasInputs {
                     bytes: op.outputs[0].bytes()?,
@@ -224,8 +220,17 @@ fn imported_alias_keeps_full_backing_and_existing_span_and_borrowed_identity() {
     drop(storage);
     let report = context.report(std::slice::from_ref(&output)).unwrap();
     assert_eq!(report.operations.len(), 3);
-    let WorkspaceOperationKind::StaticSlice {starts,ends,strides}=&report.operations[2].kind else {panic!("actual selection coordinates lost");};
-    assert_eq!(starts,&[0,1]);assert_eq!(ends,&[2,3]);assert_eq!(strides,&[1,1]);
+    let WorkspaceOperationKind::StaticSlice {
+        starts,
+        ends,
+        strides,
+    } = &report.operations[2].kind
+    else {
+        panic!("actual selection coordinates lost");
+    };
+    assert_eq!(starts, &[0, 1]);
+    assert_eq!(ends, &[2, 3]);
+    assert_eq!(strides, &[1, 1]);
     assert_eq!(casts(&report), 1);
     assert_eq!(report.tensor_buffers.total_bytes, Some(4));
     let state = report.state.as_ref().unwrap();

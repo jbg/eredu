@@ -1,8 +1,8 @@
 //! Complete selected floating terms, assembled before nonlinear observation transforms.
 use super::*;
 use eredu_core::{
-    checkpoint::TensorDtype, ObservationDtype, ObservationPoint, ObservationValueType,
-    TensorObservation, TensorObservationData,
+    ObservationDtype, ObservationPoint, ObservationValueType, TensorObservation,
+    TensorObservationData, checkpoint::TensorDtype,
 };
 
 fn invalid(message: &str) -> CaptureError {
@@ -122,7 +122,9 @@ pub(super) fn payload_usage(
 }
 
 mod numeric;
-pub(crate) use numeric::{sum_f32_at, summarize_f32, summarize_f32_values, fill_histogram_f32, numeric_control_bytes};
+pub(crate) use numeric::{
+    fill_histogram_f32, numeric_control_bytes, sum_f32_at, summarize_f32, summarize_f32_values,
+};
 
 pub(super) fn assemble(
     receipt: &PartitionCaptureReceiptPlan,
@@ -133,7 +135,7 @@ pub(super) fn assemble(
     let context = &receipt.context;
     let selection = &plan.plan().selections[context.selection_index];
     let point = &plan.points()[context.selection_index];
-    let slice = resolve_slice(point, selection, &receipt.global_shape)?;
+    let slice = super::receipt::geometry::source_slice(plan, context, &receipt.global_shape)?;
     let count = elements(&slice.shape)?;
     let emitted = match selection.transform {
         CaptureTransform::Preview { max_elements } => count.min(max_elements),
@@ -200,8 +202,12 @@ pub(super) fn assemble(
     let mut values = Vec::with_capacity(emitted);
     for index in 0..emitted {
         let terms = fragments.iter().map(|fragment| {
-            let Some(CapturePayload::Tensor(tensor)) = &fragment.record.payload else { unreachable!() };
-            let TensorObservationData::F32(terms) = tensor.data() else { unreachable!() };
+            let Some(CapturePayload::Tensor(tensor)) = &fragment.record.payload else {
+                unreachable!()
+            };
+            let TensorObservationData::F32(terms) = tensor.data() else {
+                unreachable!()
+            };
             terms.as_slice()
         });
         values.push(sum_f32_at(terms, index).expect("validated complete F32 terms"));
@@ -275,7 +281,7 @@ fn transform(
         _ => {
             return Err(CaptureError::Unsupported(
                 "summed activation transform".into(),
-            ))
+            ));
         }
     })
 }

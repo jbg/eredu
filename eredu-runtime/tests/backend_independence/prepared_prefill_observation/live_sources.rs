@@ -214,7 +214,7 @@ fn setup(
     LiveSession,
     ReplicatedSessionCounters,
     Rc<Cell<usize>>,
-    WorkingMemoryPool,
+    MemoryLedger,
     InferenceRequest,
 ) {
     let counters = ReplicatedSessionCounters::default();
@@ -283,7 +283,7 @@ fn setup(
         prefill_chunk_positions: 2,
         output: OutputDemand::LastPosition,
     };
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -357,7 +357,7 @@ fn live_state_and_current_execution_are_borrowed_before_each_uneven_chunk() {
     assert_eq!(f.0.borrow().epochs.len(), 3);
     f.settled();
     drop((session, request, f));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn opt_out_performs_no_execution_visit_or_mechanism_callback() {
@@ -385,7 +385,7 @@ fn opt_out_performs_no_execution_visit_or_mechanism_callback() {
     assert_eq!(counters.snapshot().forward_calls, 3);
     f.settled();
     drop((session, request, f));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn typed_mechanism_failure_preserves_prior_chunk_and_stops_later_preparation() {
@@ -412,7 +412,7 @@ fn typed_mechanism_failure_preserves_prior_chunk_and_stops_later_preparation() {
     assert_eq!(session.report().unwrap().state_report(), &[6]);
     f.settled();
     drop((session, request, f));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn incomplete_execution_preserves_partial_visits_and_rejects_before_source() {
@@ -435,7 +435,7 @@ fn incomplete_execution_preserves_partial_visits_and_rejects_before_source() {
     assert_eq!(session.report().unwrap().state_report(), &[4]);
     f.settled();
     drop((session, request, f));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn mechanism_failure_enters_existing_partition_input_agreement() {
@@ -458,7 +458,7 @@ fn mechanism_failure_enters_existing_partition_input_agreement() {
         prefill_chunk_positions: 1,
         output: OutputDemand::LastPosition,
     };
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -496,5 +496,5 @@ fn mechanism_failure_enters_existing_partition_input_agreement() {
     assert_eq!(f.0.borrow().events, [Log::Begin(0), Log::Finish(false)]);
     f.settled();
     drop((session, request, f));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

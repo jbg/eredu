@@ -110,7 +110,7 @@ fn run_request(mode: &str, active: bool, auto_tool: bool) -> serde_json::Value {
         output_mode: PreparedChatOutputMode::Semantic,
         skip_special_tokens: true,
         drafting: drafting.as_speculative_draft().unwrap(),
-        settings: chat_settings(&chat, settings),
+        settings: chat_settings(&chat, settings.clone()),
         options,
         caller_stop_sequences: &[],
         cancellation: Default::default(),
@@ -194,11 +194,9 @@ fn run_request(mode: &str, active: bool, auto_tool: bool) -> serde_json::Value {
         1
     );
     if !auto_tool {
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SemanticEvent::TextDelta(text) if !text.is_empty()))
-        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::TextDelta(text) if !text.is_empty())));
     }
     if mode == "controlled" {
         assert_eq!(committed, output.token_ids());

@@ -34,7 +34,14 @@ pub struct OriginalTextResumeOptions<'a> {
 impl OriginalTextResumeOptions<'_> {
     /// Preserves every saved policy under the selected cumulative-budget intent.
     pub const fn new(kind: OriginalTextResumeKind) -> Self {
-        Self { kind, terminal: false, session_id: None, capture_limits: None, intervention: None, sampling: None }
+        Self {
+            kind,
+            terminal: false,
+            session_id: None,
+            capture_limits: None,
+            intervention: None,
+            sampling: None,
+        }
     }
 }
 
@@ -112,10 +119,15 @@ pub trait TextResumeBackend: TextGenerationBackend {
     /// saved state supplies no transport or model admission. Failure may not
     /// fall back to ordinary consensus and retains unresolved native custody.
     fn prepare_text_resume_control(
-        _runtime:&ModelRuntime<Self>,_saved:&Self::ResumeSource,
-        _config:TextGenerationConfig,_context:&TextStepContext,
-        _host:&HostPreparationAuthority,_options:&OriginalTextResumeOptions<'_>,
-    )->Result<Option<Self::TextPreparationControl>,BackendFailure> { Ok(None) }
+        _runtime: &ModelRuntime<Self>,
+        _saved: &Self::ResumeSource,
+        _config: TextGenerationConfig,
+        _context: &TextStepContext,
+        _host: &HostPreparationAuthority,
+        _options: &OriginalTextResumeOptions<'_>,
+    ) -> Result<Option<Self::TextPreparationControl>, BackendFailure> {
+        Ok(None)
+    }
 
     /// Fresh original preparation under an independently admitted host-copy
     /// constructor account. H is lifetime custody only: the backend must admit
@@ -147,7 +159,9 @@ pub trait TextResumeBackend: TextGenerationBackend {
     /// A returned alias retains the same original source; it grants no edit.
     fn text_resume_intervention_source(
         _state: &Self::TextGenerationState,
-    ) -> Option<&crate::intervention::SharedInterventionPlan> { None }
+    ) -> Option<&crate::intervention::SharedInterventionPlan> {
+        None
+    }
 
     /// Constructs the new prompt and provisional decoder under the admitted
     /// prompt stage, without exchanging installed state. Copies and publication
@@ -191,7 +205,9 @@ pub trait TextResumeBackend: TextGenerationBackend {
     /// Borrowing keeps staged custody in the ordered core owner if this hook
     /// unwinds. Keep custody there until returned preparation/state owns it;
     /// never drop the last authority before their payloads on unwind.
-    fn finish_text_resume(prepared: &mut Self::ResumePreparation) -> (Self::TextPreparation, Self::DisplacedState);
+    fn finish_text_resume(
+        prepared: &mut Self::ResumePreparation,
+    ) -> (Self::TextPreparation, Self::DisplacedState);
 }
 
 impl<B: TextResumeBackend, C: TokenFilterController> TextGenerationMachine<B, C> {
@@ -210,7 +226,13 @@ impl<B: TextResumeBackend, C: TokenFilterController> TextGenerationMachine<B, C>
             cancellation,
             None,
             &OriginalTextResumeOptions::new(OriginalTextResumeKind::Restore),
-        ).map(|result| result.map(|(machine, displaced)| { drop(displaced); machine }))
+        )
+        .map(|result| {
+            result.map(|(machine, displaced)| {
+                drop(displaced);
+                machine
+            })
+        })
     }
 
     fn from_resume_with_host(
@@ -221,41 +243,59 @@ impl<B: TextResumeBackend, C: TokenFilterController> TextGenerationMachine<B, C>
         cancellation: &crate::GenerationCancellationToken,
         host: Option<&HostPreparationAuthority>,
         options: &OriginalTextResumeOptions<'_>,
-    ) -> Result<Option<(Self, B::DisplacedState)>, ControlledTextGenerationError<B::Error, C::Error>> {
+    ) -> Result<Option<(Self, B::DisplacedState)>, ControlledTextGenerationError<B::Error, C::Error>>
+    {
         let step_context = TextStepContext::new();
         step_context
             .validate()
             .map_err(ControlledTextGenerationError::Preparation)?;
-        let Some(((controller, prompt, backend_state, prepared_sequence, preparation, preparation_control), displaced)) =
-            preparation::prepare_resume(
-                runtime,
-                saved,
-                config,
+        let Some((
+            (
                 controller,
-                &step_context,
-                cancellation,
-                host,
-                options,
-            )?
+                prompt,
+                backend_state,
+                prepared_sequence,
+                preparation,
+                preparation_control,
+            ),
+            displaced,
+        )) = preparation::prepare_resume(
+            runtime,
+            saved,
+            config.clone(),
+            controller,
+            &step_context,
+            cancellation,
+            host,
+            options,
+        )?
         else {
             return Ok(None);
         };
-        Ok(Some((Self {
-            capture_source: B::text_resume_capture_source(&backend_state).cloned(),
-            intervention_source: B::text_resume_intervention_source(&backend_state).cloned(),
-            resume_host: host.cloned(),
-            prepared_sequence,
-            controller,
-            step: if options.terminal { drop(prompt); None } else { Some(PendingTextInput::Prefill(prompt)) },
-            completions: Vec::new(),
-            remaining_tokens: config.sampling().max_new_tokens,
-            branch_owner: step_context.run_identity().clone(),
-            branch_fenced: false,
-            step_context,
-            backend_state,
-            preparation,
-            preparation_control,
-        }, displaced)))
+        Ok(Some((
+            Self {
+                capture_source: B::text_resume_capture_source(&backend_state).cloned(),
+                intervention_source: B::text_resume_intervention_source(&backend_state).cloned(),
+                resume_host: host.cloned(),
+                prepared_sequence,
+                controller,
+                step: if options.terminal {
+                    drop(prompt);
+                    None
+                } else {
+                    Some(PendingTextInput::Prefill(prompt))
+                },
+                completions: Vec::new(),
+                remaining_tokens: config.sampling().max_new_tokens,
+                branch_owner: step_context.run_identity().clone(),
+                branch_fenced: false,
+                step_context,
+                backend_state,
+                preparation,
+                preparation_control,
+            },
+            displaced,
+        )))
     }
 }
 
@@ -311,21 +351,35 @@ impl<'a, B: TextResumeBackend, C: TokenFilterController> ControlledTextGeneratio
         host: &HostPreparationAuthority,
         options: &OriginalTextResumeOptions<'_>,
     ) -> Result<Option<Self>, ControlledTextGenerationError<B::Error, C::Error>> {
-        Self::resume_saved_original_with_displaced(runtime, saved, config, controller,
-            cancellation, host, options).map(|result| result.map(|(generation, displaced)| {
+        Self::resume_saved_original_with_displaced(
+            runtime,
+            saved,
+            config,
+            controller,
+            cancellation,
+            host,
+            options,
+        )
+        .map(|result| {
+            result.map(|(generation, displaced)| {
                 drop(displaced);
                 generation
-            }))
+            })
+        })
     }
 
     /// Same admitted resume, retaining the actual displaced native owner for
     /// serial branch composition. No state copy or second admission is added.
     pub fn resume_saved_original_with_displaced(
-        runtime: &'a mut ModelRuntime<B>, saved: &B::ResumeSource,
-        config: TextGenerationConfig, controller: C,
+        runtime: &'a mut ModelRuntime<B>,
+        saved: &B::ResumeSource,
+        config: TextGenerationConfig,
+        controller: C,
         cancellation: &crate::GenerationCancellationToken,
-        host: &HostPreparationAuthority, options: &OriginalTextResumeOptions<'_>,
-    ) -> Result<Option<(Self, B::DisplacedState)>, ControlledTextGenerationError<B::Error, C::Error>> {
+        host: &HostPreparationAuthority,
+        options: &OriginalTextResumeOptions<'_>,
+    ) -> Result<Option<(Self, B::DisplacedState)>, ControlledTextGenerationError<B::Error, C::Error>>
+    {
         let inner = TextGenerationMachine::from_resume_with_host(
             runtime,
             saved,

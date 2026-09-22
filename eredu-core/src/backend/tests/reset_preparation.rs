@@ -148,9 +148,11 @@ impl<const MODE: u8> TextGenerationBackend for ResetBackend<MODE> {
         backend.0.note("ordinary_reset");
         claim.validate_session(session).unwrap();
         claim
-            .validate_capabilities(<ResetSession as BackendSession<Self>>::capabilities(session))
+            .validate_capabilities(<ResetSession as BackendSession<Self>>::capabilities(
+                session,
+            ))
             .unwrap();
-        assert_eq!(claim.limits(), crate::SessionResetLimits::new(u64::MAX));
+        assert_eq!(claim.limits(), &crate::SessionResetLimits::default());
         session.state = 0;
         Ok(())
     }
@@ -220,10 +222,30 @@ fn apply(
         ));
     }
     session.audit.note("compare");
+    let topology = crate::MemoryTopology::new(vec![crate::MemoryDomainDescription {
+        name: "host".into(),
+        locations: vec![crate::MemoryLocation::Host],
+    }])
+    .unwrap();
+    let mut requirements = crate::DomainMemoryRequirements::zero(&topology);
+    requirements
+        .add_allocation(
+            REQUIRED,
+            &crate::MemoryPlacement::fixed(&topology, topology.host_domain()).unwrap(),
+        )
+        .unwrap();
     let accepted = claim
-        .compare(REQUIRED)
+        .compare(&topology, requirements)
         .map_err(|e| BackendFailure::new(BackendFailureKind::Other, e))?;
-    assert!(accepted.required_bytes() >= REQUIRED);
+    assert!(
+        accepted
+            .requirements()
+            .get(topology.host_domain())
+            .unwrap()
+            .total()
+            .unwrap()
+            >= REQUIRED
+    );
     session.audit.note("publish");
     session.state = 0;
     Ok(())
@@ -302,9 +324,11 @@ fn fixture<const MODE: u8>() -> (Rc<Audit>, ModelRuntime<ResetBackend<MODE>>) {
 }
 fn limits(bytes: u64) -> crate::SessionResetLimits {
     crate::SessionResetLimits {
-        capacity_bytes: 4096,
-        application_memory_budget_bytes: Some(bytes),
-        safety_reserve_bytes: 0,
+        memory_limits: crate::MemoryLimitDeclarations::new([(
+            "host".into(),
+            crate::MemoryLimit::Finite(bytes),
+        )]),
+        additional_headroom: Default::default(),
     }
 }
 fn changed() -> SessionCapabilities {
@@ -362,7 +386,7 @@ fn real_borrowed_ready_owner_carries_genuine_exact_and_short_claims() {
         .unwrap_err();
     assert!(
         matches!(error.source().unwrap().downcast_ref::<crate::SessionResetRejection>(),
-        Some(crate::SessionResetRejection::ApplicationBudgetExceeded { required_bytes: REQUIRED, budget_bytes }) if *budget_bytes == REQUIRED - 1)
+        Some(crate::SessionResetRejection::MemoryDomain(crate::MemoryDomainError::BudgetExceeded { requested_bytes: REQUIRED, limit_bytes, .. })) if *limit_bytes == REQUIRED - 1)
     );
     assert_eq!(
         audit.take(),

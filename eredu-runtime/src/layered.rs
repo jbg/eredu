@@ -9,15 +9,16 @@ mod ordered_completion;
 mod resident_construction;
 pub use resident_construction::ordinary_addressed_units;
 mod metadata;
-pub use metadata::LayeredMetadata;
 use invocation::{LayeredInvocation, OrdinaryLayeredInput};
+pub use metadata::LayeredMetadata;
 use ordered_completion::BackendLayerwiseCompletion;
 pub use ordered_completion::OrderedLayerwiseCompletion;
 
 use observation_paths::ObservationBinding;
 pub use observation_paths::{
-    BoundCaptureSelection, ObservationBinding as LayeredObservationBinding, PrefillObservationDeclaration, PrefillReadoutStage,
-    PreparedCaptureSelection, PreparedCaptureSelectionError, PreparedLayeredObservationError,
+    BoundCaptureSelection, ObservationBinding as LayeredObservationBinding,
+    PrefillObservationDeclaration, PrefillReadoutStage, PreparedCaptureSelection,
+    PreparedCaptureSelectionError, PreparedLayeredObservationError,
     PreparedLayeredObservationPaths, PreparedObservationBindingIdentity,
     SharedLayeredObservationPaths,
 };
@@ -67,20 +68,26 @@ pub trait ArchitectureParameters<B: NeuralBackend> {
 
     /// Constructs the authoritative geometry in the supplied metadata destination.
     /// `None` selects ordinary construction; checked callers supply their actual producer.
-    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>)
-        -> Result<StateLayout, Self::DefinitionError>;
+    fn state_layout(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<StateLayout, Self::DefinitionError>;
 
     /// Declares cache identity for the exact rank-local layout and global offset.
     /// Identity text, validation errors and fixed controls share the destination.
-    fn state_identity(&self, state: &crate::PartitionState,
+    fn state_identity(
+        &self,
+        state: &crate::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
         metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<crate::ModelStateIdentity, Self::DefinitionError>;
 
     /// Borrows the retained immutable description or constructs it through the
     /// backend context's metadata destination. Owning consumers copy explicitly.
-    fn parameter_description(&self, context: &<B::Tensor as eredu_nn::Tensor>::Context)
-        -> Result<std::borrow::Cow<'_, crate::ArchitectureParameterDescription>, Self::DefinitionError>;
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, crate::ArchitectureParameterDescription>, Self::DefinitionError>;
 
     /// Returns architecture-owned checkpoint rewrites for pinned parameters.
     fn static_parameter_recipes(
@@ -186,35 +193,78 @@ impl<'a> LayeredPipelineSchedule<'a> {
     /// roots. Mandatory encoders, decoder ingress, and finalization always run;
     /// structural merge activity is derived from dependency activity; and
     /// prediction is a later phase.
-    pub fn try_new<E>(graph: &'a ExecutionGraph,
+    pub fn try_new<E>(
+        graph: &'a ExecutionGraph,
         group_contracts: impl IntoIterator<Item = (ArchitectureGroupKind, bool)>,
-        request_group_active: impl FnMut(usize) -> Result<bool,E>) -> Result<Self,E>
-    where E: From<LayeredPipelineScheduleError> {
-        let contracts=group_contracts.into_iter().collect::<Vec<_>>();
-        let active=Self::activity_for(graph,&contracts,vec![false;contracts.len()],request_group_active)?;
-        Ok(Self{graph,schedule:ExecutionGroupSchedule::new(graph),active,completed:0})
+        request_group_active: impl FnMut(usize) -> Result<bool, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<LayeredPipelineScheduleError>,
+    {
+        let contracts = group_contracts.into_iter().collect::<Vec<_>>();
+        let active = Self::activity_for(
+            graph,
+            &contracts,
+            vec![false; contracts.len()],
+            request_group_active,
+        )?;
+        Ok(Self {
+            graph,
+            schedule: ExecutionGroupSchedule::new(graph),
+            active,
+            completed: 0,
+        })
     }
 
-    pub(crate) fn try_new_with_metadata<E>(graph: &'a ExecutionGraph,
-        contracts:&[(ArchitectureGroupKind,bool)], request_group_active:impl FnMut(usize)->Result<bool,E>,
-        context:&eredu_nn::workspace::WorkspaceContext)->Result<Result<Self,E>,eredu_nn::Error>
-    where E:From<LayeredPipelineScheduleError> {
-        context.charge_metadata(std::mem::size_of::<(Self,E,Result<Self,E>,
-            Result<Result<Self,E>,eredu_nn::Error>,&[(ArchitectureGroupKind,bool)])>()
+    pub(crate) fn try_new_with_metadata<E>(
+        graph: &'a ExecutionGraph,
+        contracts: &[(ArchitectureGroupKind, bool)],
+        request_group_active: impl FnMut(usize) -> Result<bool, E>,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Result<Self, E>, eredu_nn::Error>
+    where
+        E: From<LayeredPipelineScheduleError>,
+    {
+        context.charge_metadata(
+            std::mem::size_of::<(
+                Self,
+                E,
+                Result<Self, E>,
+                Result<Result<Self, E>, eredu_nn::Error>,
+                &[(ArchitectureGroupKind, bool)],
+            )>()
             .checked_add(std::mem::size_of_val(&request_group_active))
-            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
-        let mut active=context.metadata_vec(contracts.len())?;active.resize(contracts.len(),false);
-        let active=match Self::activity_for(graph,contracts,active,request_group_active){
-            Ok(active)=>active,Err(cause)=>return Ok(Err(cause)),
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
+        )?;
+        let mut active = context.metadata_vec(contracts.len())?;
+        active.resize(contracts.len(), false);
+        let active = match Self::activity_for(graph, contracts, active, request_group_active) {
+            Ok(active) => active,
+            Err(cause) => return Ok(Err(cause)),
         };
-        Ok(Ok(Self{graph,schedule:ExecutionGroupSchedule::new_with_metadata(graph,context)?,active,completed:0}))
+        Ok(Ok(Self {
+            graph,
+            schedule: ExecutionGroupSchedule::new_with_metadata(graph, context)?,
+            active,
+            completed: 0,
+        }))
     }
 
-    fn activity_for<E>(graph:&ExecutionGraph,group_contracts:&[(ArchitectureGroupKind,bool)],
-        mut active:Vec<bool>,mut request_group_active:impl FnMut(usize)->Result<bool,E>)->Result<Vec<bool>,E>
-    where E:From<LayeredPipelineScheduleError> {
-        if group_contracts.len()!=graph.groups().len(){
-            return Err(LayeredPipelineScheduleError::GroupContractCount{graph:graph.groups().len(),declared:group_contracts.len()}.into());
+    fn activity_for<E>(
+        graph: &ExecutionGraph,
+        group_contracts: &[(ArchitectureGroupKind, bool)],
+        mut active: Vec<bool>,
+        mut request_group_active: impl FnMut(usize) -> Result<bool, E>,
+    ) -> Result<Vec<bool>, E>
+    where
+        E: From<LayeredPipelineScheduleError>,
+    {
+        if group_contracts.len() != graph.groups().len() {
+            return Err(LayeredPipelineScheduleError::GroupContractCount {
+                graph: graph.groups().len(),
+                declared: group_contracts.len(),
+            }
+            .into());
         }
         for &group in graph.execution_order() {
             let (kind, request_optional) = group_contracts[group];
@@ -291,8 +341,13 @@ impl<'a> LayeredPipelineSchedule<'a> {
         self.schedule.started(group).map_err(Into::into)
     }
 
-    pub(crate) fn started_without_release(&mut self,group:usize)->Result<(),LayeredPipelineScheduleError>{
-        self.schedule.started_with_release(group,|_|{}).map_err(Into::into)
+    pub(crate) fn started_without_release(
+        &mut self,
+        group: usize,
+    ) -> Result<(), LayeredPipelineScheduleError> {
+        self.schedule
+            .started_with_release(group, |_| {})
+            .map_err(Into::into)
     }
 
     /// Commits one successfully submitted group and unlocks its dependents.
@@ -583,34 +638,85 @@ where
 
 /// A borrowed hook delegates to its existing owner without rebuilding paths.
 impl<B, C, E, H> LayeredTraversalHook<B, C, E> for &mut H
-where B: NeuralBackend, H: LayeredTraversalHook<B, C, E> + ?Sized,
+where
+    B: NeuralBackend,
+    H: LayeredTraversalHook<B, C, E> + ?Sized,
 {
-    fn retained_media_cut(&mut self, roots: &mut dyn FnMut(&mut dyn FnMut(&B::Tensor)), context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+    fn retained_media_cut(
+        &mut self,
+        roots: &mut dyn FnMut(&mut dyn FnMut(&B::Tensor)),
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
         (**self).retained_media_cut(roots, context)
     }
-    fn observes_activations(&self) -> bool { (**self).observes_activations() }
+    fn observes_activations(&self) -> bool {
+        (**self).observes_activations()
+    }
     fn observe_activation(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
         (**self).observe_activation(path, value)
     }
-    fn observe_generated_activation(&mut self, path: &str, prototype: &B::Tensor, source: &eredu_core::capture::GeneratedCaptureSource, generate: &mut dyn FnMut() -> Result<B::Tensor, E>) -> Result<(), E> {
+    fn observe_generated_activation(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
+    ) -> Result<(), E> {
         (**self).observe_generated_activation(path, prototype, source, generate)
     }
-    fn observe_generated_activation_retained(&mut self, path: &str, prototype: &B::Tensor, source: &eredu_core::capture::GeneratedCaptureSource, factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>) -> Result<(), E> {
+    fn observe_generated_activation_retained(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>,
+    ) -> Result<(), E> {
         (**self).observe_generated_activation_retained(path, prototype, source, factory)
     }
-    fn intervene_activation(&mut self, path: &str, value: &B::Tensor) -> Result<Option<B::Tensor>, E> {
+    fn intervene_activation(
+        &mut self,
+        path: &str,
+        value: &B::Tensor,
+    ) -> Result<Option<B::Tensor>, E> {
         (**self).intervene_activation(path, value)
     }
-    fn before_unit(&mut self, group: usize, index: usize, remaining_units: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<LayeredUnitAction, E> {
+    fn before_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        remaining_units: usize,
+        value: &mut B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredUnitAction, E> {
         (**self).before_unit(group, index, remaining_units, value, forward, context)
     }
-    fn after_group_begin(&mut self, group: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+    fn after_group_begin(
+        &mut self,
+        group: usize,
+        value: &mut B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
         (**self).after_group_begin(group, value, forward, context)
     }
-    fn after_unit(&mut self, group: usize, index: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        value: &mut B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
         (**self).after_unit(group, index, value, forward, context)
     }
-    fn after_group(&mut self, group: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+    fn after_group(
+        &mut self,
+        group: usize,
+        value: &mut B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
         (**self).after_group(group, value, forward, context)
     }
 }
@@ -1000,7 +1106,9 @@ where
     /// causal prefix, no supplied attention mask or activation interventions.
     /// Construction/rebinding occurs under loading/preparation authority.
     fn prefill_observation_declarations(
-        &self, _metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
+        &self,
+        _metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
         Ok(Vec::new())
     }
 
@@ -1008,7 +1116,9 @@ where
     /// ingress. This never declares encoder axes or intervention equivalence.
     /// The session must authenticate the actual source/ingress plan before use.
     fn media_prefill_observation_declarations(
-        &self, _metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
+        &self,
+        _metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
         Ok(Vec::new())
     }
 
@@ -1087,12 +1197,21 @@ where
 
     /// Returns the number of ordered execution units in one graph group.
     /// The optional destination funds all produced diagnostics and controls.
-    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error>;
+    fn group_unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Self::Error>;
 
-/// Returns the stable architecture-owned path of one group-local execution unit.
-    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error>;
+    /// Returns the stable architecture-owned path of one group-local execution unit.
+    fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Self::Error>;
 
-/// Whether observed unit execution owns both input/output capture and
+    /// Whether observed unit execution owns both input/output capture and
     /// intervention, including their effective companions. The traversal omits
     /// its outer copies of those exact seams. This includes observed provider
     /// and parallel entry points and preserves in-unit state/capture timing.
@@ -1101,16 +1220,24 @@ where
     }
 
     /// Architecture-owned ingress name in the selected metadata destination.
-    fn group_input_observation_path(&self, _group: usize, _metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+    fn group_input_observation_path(
+        &self,
+        _group: usize,
+        _metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
         Ok(None)
     }
 
     /// Architecture-owned completion name in the selected metadata destination.
-    fn group_output_observation_path(&self, _group: usize, _metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+    fn group_output_observation_path(
+        &self,
+        _group: usize,
+        _metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
         Ok(None)
     }
 
-/// Borrows pinned modules for parameter discovery and binding.
+    /// Borrows pinned modules for parameter discovery and binding.
     fn static_modules(&self) -> &Self::StaticModules;
 
     /// Mutably borrows pinned modules for parameter binding.
@@ -1513,8 +1640,10 @@ where
 
     /// Derives the complete transport schema in the supplied metadata destination.
     /// Checked callers supply their actual producer; refusal never changes destination.
-    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>)
-        -> Result<Self::Boundary, Self::Error>;
+    fn boundary_schema(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self::Boundary, Self::Error>;
 
     /// Prepares a replicated partition from tokens or upstream hidden state.
     fn begin_partition<'a>(
@@ -2131,34 +2260,31 @@ where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         self.forward_with_invocation_and_unit_executor(
-            invocation, state, context, hook, demand,
+            invocation,
+            state,
+            context,
+            hook,
+            demand,
             |architecture, group, index, unit, hidden, state, forward, context, hook| {
                 if hook.observes_activations() {
-                        architecture.forward_unit_observed(
-                            group,
-                            index,
-                            unit,
-                            hidden,
-                            state,
-                            forward,
-                            context,
-                            &mut TraversalActivationObserver {
-                                hook,
-                                types: std::marker::PhantomData,
-                            },
-                        )
-                    } else {
-                        architecture.forward_unit(
-                            group,
-                            index,
-                            unit,
-                            hidden,
-                            state,
-                            forward,
-                            context,
-                        )
-                    }
-            })
+                    architecture.forward_unit_observed(
+                        group,
+                        index,
+                        unit,
+                        hidden,
+                        state,
+                        forward,
+                        context,
+                        &mut TraversalActivationObserver {
+                            hook,
+                            types: std::marker::PhantomData,
+                        },
+                    )
+                } else {
+                    architecture.forward_unit(group, index, unit, hidden, state, forward, context)
+                }
+            },
+        )
     }
 
     pub(crate) fn forward_with_invocation_and_unit_executor<I, H, E>(
@@ -2172,13 +2298,24 @@ where
     ) -> Result<(Option<B::Tensor>, A::ForwardContext), A::Error>
     where
         I: LayeredInvocation<A, B, S>,
-        E: FnMut(&mut A, usize, usize, &mut A::Unit, &B::Tensor, &mut S,
-            &mut A::ForwardContext, &<B::Tensor as Tensor>::Context, &mut H)
-            -> Result<B::Tensor, A::Error>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as Tensor>::Context,
+            &mut H,
+        ) -> Result<B::Tensor, A::Error>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         let forward = invocation.begin(&mut self.architecture, state, context, hook)?;
-        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(&self.architecture, &forward.context));
+        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(
+            &self.architecture,
+            &forward.context,
+        ));
         metadata.controls::<(
             E,
             Vec<Option<B::Tensor>>,
@@ -2264,8 +2401,17 @@ where
                     {
                         break;
                     }
-                    hidden = execute(&mut self.architecture, group, index, unit, &hidden,
-                        state, &mut forward_context, context, hook)?;
+                    hidden = execute(
+                        &mut self.architecture,
+                        group,
+                        index,
+                        unit,
+                        &hidden,
+                        state,
+                        &mut forward_context,
+                        context,
+                        hook,
+                    )?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, context)?;
                 }
             }
@@ -2440,6 +2586,8 @@ where
         _build: F,
         _operation: V,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
     where
         F: FnOnce(&<B::Tensor as eredu_nn::Tensor>::Context) -> Result<U, E>,
@@ -2448,14 +2596,10 @@ where
         Ok(false)
     }
 
-    /// Publishes completed immutable replacements for resident and future loaded units.
-    /// `active` retains overrides on future reloads; false restores prepared sources.
-    /// False means no publication occurred. Implementations must validate before
-    /// replacing any handles, and must not perform fallible work after publication.
-    fn publish_parameter_replacements(
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn visit_parameter_publication(
         &mut self,
-        _values: &std::collections::BTreeMap<String, B::Tensor>,
-        _active: bool,
+        _publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
@@ -2727,30 +2871,44 @@ where
         visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
     ) -> bool {
         crate::parameter_operations::visit_loaded_parameters_in_parts::<A, B, S, P>(
-            &mut self.architecture, &mut self.policy, visitor,
+            &mut self.architecture,
+            &mut self.policy,
+            visitor,
         )
     }
     fn with_parameter_slots(
         &mut self,
         location: &crate::parameter_operations::PreparedParameterLocation,
-        operation: &mut crate::parameter_operations::ParameterSlotOperation<'_, B::Tensor, P::Error>,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            P::Error,
+        >,
         context: &<B::Tensor as Tensor>::Context,
+
+        _preparation: Option<&B::ParameterPreparation<'_>>,
     ) -> Result<bool, LayerwiseAcquireError<A::Error, P::Error>> {
         crate::parameter_operations::with_parameter_slots_in_parts::<A, B, S, P>(
-            &mut self.architecture, &mut self.policy, location, operation, context,
-        )
-    }
-    fn publish_parameter_replacements(
-        &mut self,
-        values: &BTreeMap<String, B::Tensor>,
-        active: bool,
-    ) -> Result<bool, P::Error> {
-        self.observation_binding.invalidate();
-        crate::parameter_operations::publish_parameter_replacements_in_parts::<A, B, S, P>(
-            &mut self.architecture, &mut self.policy, values, active,
+            &mut self.architecture,
+            &mut self.policy,
+            location,
+            operation,
+            context,
+            _preparation,
         )
     }
 
+    /// Lends the actual retained slots and future sources to a prepared publication pass.
+    fn visit_parameter_publication(
+        &mut self,
+        publication: &mut dyn crate::parameter_operations::ParameterPublication<B::Tensor>,
+    ) -> Result<bool, P::Error> {
+        crate::parameter_operations::visit_parameter_publication_in_parts::<A, B, S, P>(
+            &mut self.architecture,
+            &mut self.policy,
+            publication,
+        )
+    }
 }
 
 impl<A, B, S, P> LayerwiseRuntime<A, B, S, P>
@@ -2864,6 +3022,7 @@ where
             |context| architecture.build_unit(address.group(), address.index(), context),
             operation,
             context,
+            None,
         )
     }
 
@@ -3193,8 +3352,11 @@ where
         let graph = match self.prepared_geometry.as_ref() {
             Some(geometry) => geometry.graph(),
             None => {
-                ordinary_graph = self.architecture.execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
+                ordinary_graph = self
+                    .architecture
+                    .execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?
+                    .into_owned();
                 &ordinary_graph
             }
         };
@@ -3679,7 +3841,8 @@ where
                 let graph = self
                     .architecture
                     .execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
+                    .map_err(LayerwiseRuntimeError::Architecture)?
+                    .into_owned();
                 let counts = (0..graph.groups().len())
                     .map(|group| {
                         self.architecture
@@ -3710,10 +3873,21 @@ where
         let forward = invocation
             .begin(&mut self.architecture, state, context, hook)
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(&self.architecture, &forward.context));
+        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(
+            &self.architecture,
+            &forward.context,
+        ));
         if preserve_observation_binding && !observe_unit_internals {
-            metadata.controls::<(E, E, &mut H,
-                Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>)>()
+            metadata
+                .controls::<(
+                    E,
+                    E,
+                    &mut H,
+                    Result<
+                        (Option<B::Tensor>, A::ForwardContext),
+                        LayerwiseRuntimeError<A::Error, P::Error>,
+                    >,
+                )>()
                 .map_err(LayerwiseRuntimeError::Architecture)?;
         }
         metadata
@@ -4078,7 +4252,11 @@ where
         A: ParallelLayeredArchitecture<B, S>,
     {
         self.forward_parallel_fixed_with_readout(
-            input, state, parallel, context, eredu_core::OutputDemand::Sequence,
+            input,
+            state,
+            parallel,
+            context,
+            eredu_core::OutputDemand::Sequence,
         )
         .map(|(output, _)| output.expect("sequence readout returns scores"))
     }
@@ -4190,18 +4368,32 @@ where
     /// caller-supplied unit/context mutation hook. Its retained geometry remains
     /// valid across spans, just as for the fixed observed entry.
     pub fn forward_parallel_fixed_with_readout<'a>(
-        &mut self, input:A::Input<'a>, state:&mut S, parallel:&B::ParallelContext,
-        context:&<B::Tensor as Tensor>::Context, demand:eredu_core::OutputDemand,
-    )->Result<(Option<B::Tensor>,A::ForwardContext),LayerwiseRuntimeError<A::Error,P::Error>>
-    where A:ParallelLayeredArchitecture<B,S> {
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+    {
         // `true` preserves the checked geometry and observation binding. The no-op
         // hook observes no activations, so the worker calls only the ordinary numerical
         // input/unit/readout methods and creates no observation path owner.
         self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
-            input,state,parallel,context,
-            |architecture,group,index,unit,hidden,state,forward,parallel,context|
-                architecture.forward_unit_parallel(group,index,unit,hidden,state,forward,parallel,context),
-            &mut NoopLayeredTraversalHook,true,demand,
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                architecture.forward_unit_parallel(
+                    group, index, unit, hidden, state, forward, parallel, context,
+                )
+            },
+            &mut NoopLayeredTraversalHook,
+            true,
+            demand,
         )
     }
 
@@ -4356,8 +4548,11 @@ where
         let graph = match self.prepared_geometry.as_ref() {
             Some(geometry) => geometry.graph(),
             None => {
-                ordinary_graph = self.architecture.execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
+                ordinary_graph = self
+                    .architecture
+                    .execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?
+                    .into_owned();
                 &ordinary_graph
             }
         };
@@ -4755,10 +4950,27 @@ where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         self.forward_parallel_with_unit_executor_and_invocation_hook(
-            invocation, state, parallel, context,
-            |architecture, group, index, unit, hidden, state, forward, parallel, context, _hook|
-                execute(architecture, group, index, unit, hidden, state, forward, parallel, context),
-            hook, observe_unit_internals, false, demand,
+            invocation,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context, _hook| {
+                execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    parallel,
+                    context,
+                )
+            },
+            hook,
+            observe_unit_internals,
+            false,
+            demand,
         )
     }
 
@@ -4805,7 +5017,8 @@ where
                 let graph = self
                     .architecture
                     .execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
+                    .map_err(LayerwiseRuntimeError::Architecture)?
+                    .into_owned();
                 let counts = (0..graph.groups().len())
                     .map(|group| {
                         self.architecture
@@ -4836,10 +5049,22 @@ where
         let forward = invocation
             .begin_parallel(&mut self.architecture, state, parallel, context, hook)
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(&self.architecture, &forward.context));
+        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(
+            &self.architecture,
+            &forward.context,
+        ));
         if retained_unit_selection {
-            metadata.controls::<(E, E, &mut H, bool,
-                Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>)>()
+            metadata
+                .controls::<(
+                    E,
+                    E,
+                    &mut H,
+                    bool,
+                    Result<
+                        (Option<B::Tensor>, A::ForwardContext),
+                        LayerwiseRuntimeError<A::Error, P::Error>,
+                    >,
+                )>()
                 .map_err(LayerwiseRuntimeError::Architecture)?;
         }
         metadata

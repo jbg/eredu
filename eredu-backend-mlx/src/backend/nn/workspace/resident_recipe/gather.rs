@@ -13,11 +13,15 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
     let output = operation.outputs.get(0)?;
     let extent = *source.shape().get(axis)?;
     let count = indices.elements().ok()?;
-    if !matches!(indices.dtype(), WorkspaceDtype::Int32 | WorkspaceDtype::Uint32 | WorkspaceDtype::Uint8)
-        || (extent <= 0 && count != 0)
+    if !matches!(
+        indices.dtype(),
+        WorkspaceDtype::Int32 | WorkspaceDtype::Uint32 | WorkspaceDtype::Uint8
+    ) || (extent <= 0 && count != 0)
         || source.dtype() != output.dtype()
-        || !output.shape().iter().eq(source.shape()[..axis].iter()
-            .chain(indices.shape()).chain(&source.shape()[axis + 1..]))
+        || !output.shape().iter().eq(source.shape()[..axis]
+            .iter()
+            .chain(indices.shape())
+            .chain(&source.shape()[axis + 1..]))
     {
         return None;
     }

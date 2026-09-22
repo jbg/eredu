@@ -131,6 +131,81 @@ extern "C" int mlx_submission_scope_new_retaining(
   }
 }
 
+namespace {
+struct ScopedPhysicalObserver {
+  std::atomic<size_t> references{1};
+  void* context;
+  mlx_physical_backing_observer callback;
+  void (*release)(void*);
+  bool retain_in_cache;
+  bool reuse_cached_backing;
+};
+bool observe_scoped_backing(void* opaque, uint64_t identity, size_t capacity,
+    size_t controls, mlx::core::allocator::MemoryPlacement placement,
+    void** owner, void (**release)(void*), mlx::core::allocator::PhysicalBackingPublish* publish) {
+  const auto* observer = static_cast<const ScopedPhysicalObserver*>(opaque);
+  return observer->callback(observer->context, identity, capacity, controls,
+      {placement.kind, placement.device, placement.device_count}, owner, release, publish);
+}
+void release_scoped_backing(void* opaque) {
+  auto* value = static_cast<ScopedPhysicalObserver*>(opaque);
+  if (value->references.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+  auto* context = value->context;
+  const auto release = value->release;
+  delete value;
+  release(context);
+}
+}
+extern "C" size_t mlx_submission_scope_physical_observer_control_bytes(void) {
+  return sizeof(ScopedPhysicalObserver);
+}
+static int make_scoped_physical_observer(mlx_scoped_physical_observer* out,
+    void* context, mlx_physical_backing_observer callback, void (*release)(void*),
+    bool retain_in_cache, bool reuse_cached_backing) {
+  if (!out || out->ctx || !context || !callback || !release) return 1;
+  try {
+    out->ctx = new ScopedPhysicalObserver{{1}, context, callback, release, retain_in_cache, reuse_cached_backing};
+    return 0;
+  } catch (...) { return 1; }
+}
+extern "C" int mlx_scoped_physical_observer_new(mlx_scoped_physical_observer* out,
+    void* context, mlx_physical_backing_observer callback, void (*release)(void*)) {
+  return make_scoped_physical_observer(out, context, callback, release, true, true);
+}
+extern "C" int mlx_scoped_physical_observer_new_uncached(mlx_scoped_physical_observer* out,
+    void* context, mlx_physical_backing_observer callback, void (*release)(void*)) {
+  return make_scoped_physical_observer(out, context, callback, release, false, true);
+}
+extern "C" int mlx_scoped_physical_observer_new_fresh(mlx_scoped_physical_observer* out,
+    void* context, mlx_physical_backing_observer callback, void (*release)(void*)) {
+  return make_scoped_physical_observer(out, context, callback, release, false, false);
+}
+extern "C" void mlx_scoped_physical_observer_retain(mlx_scoped_physical_observer value) {
+  if (auto* observer = static_cast<ScopedPhysicalObserver*>(value.ctx))
+    observer->references.fetch_add(1, std::memory_order_relaxed);
+}
+extern "C" void mlx_scoped_physical_observer_free(mlx_scoped_physical_observer value) {
+  if (value.ctx) release_scoped_backing(value.ctx);
+}
+extern "C" bool mlx_scoped_physical_observer_is_current(mlx_scoped_physical_observer value) {
+  const auto current = mlx::core::submission::current_physical_observer();
+  return value.ctx && current.context == value.ctx &&
+      current.callback == observe_scoped_backing;
+}
+extern "C" bool mlx_scoped_physical_observer_has_current(void) {
+  return mlx::core::submission::current_physical_observer().callback != nullptr;
+}
+extern "C" int mlx_submission_scope_bind_physical_observer(
+    mlx_submission_scope scope, mlx_scoped_physical_observer value) {
+  auto* native = get_scope(scope);
+  if (!native || !value.ctx) return 1;
+  if (!native->bind_physical_observer(value.ctx, observe_scoped_backing, release_scoped_backing,
+      static_cast<ScopedPhysicalObserver*>(value.ctx)->retain_in_cache,
+      static_cast<ScopedPhysicalObserver*>(value.ctx)->reuse_cached_backing)) return 1;
+  mlx_scoped_physical_observer_retain(value);
+  return 0;
+}
+
 extern "C" int mlx_submission_scope_seal(mlx_submission_scope scope) {
   if (auto* value = get_scope(scope)) {
     value->seal();

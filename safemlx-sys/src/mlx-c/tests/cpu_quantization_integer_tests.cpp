@@ -18,7 +18,7 @@ void exercise(Stream stream, size_t bytes, size_t rank, Make make, Check check,
   } budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime,
       physical.capacity - size_t(short_budget), &retired,
-      [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+      [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
   std::optional<array> escaped;
   {
     Role role;

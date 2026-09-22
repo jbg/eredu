@@ -13,12 +13,16 @@ use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceDtype, WorkspaceExistingStorage, WorkspaceLayout, WorkspaceTensor,
 };
 use std::{cell::RefCell, collections::BTreeMap};
-mod parameter_sources;
+mod materialization;
 mod parameter_representations;
+pub(crate) use materialization::OrdinaryWindowMaterialization;
+mod parameter_sources;
+mod replacements;
 mod supplementary;
 use eredu_runtime::working_memory::{WorkspaceParameterLifetime, WorkspaceParameterRows};
 
-/// Payload-free witness used to reject a different policy or host source graph.
+/// Retained witness used to reject a different policy, host source graph or
+/// completed replacement owner. Replacement arrays keep their existing custody.
 #[derive(Debug)]
 pub(crate) struct LayerwiseWorkspaceIdentity {
     policy: Arc<()>,
@@ -26,6 +30,7 @@ pub(crate) struct LayerwiseWorkspaceIdentity {
     parameter_locations: Option<Arc<[(ExecutionUnitAddress, ExecutionUnitAddress)]>>,
     excluded: Option<MlxParameterExclusions>,
     manager_unit_constructors: bool,
+    replacements: eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,8 +97,10 @@ type ParameterRoots = BTreeMap<(OffloadUnitId, String), WorkspaceExistingStorage
 
 impl PartialEq for LayerwiseWorkspaceIdentity {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.policy, &other.policy) && self.geometry == other.geometry
+        Arc::ptr_eq(&self.policy, &other.policy)
+            && self.geometry == other.geometry
             && self.manager_unit_constructors == other.manager_unit_constructors
+            && self.replacements.same_source(&other.replacements)
             && self.parameter_locations == other.parameter_locations
             && match (&self.excluded, &other.excluded) {
                 (Some(left), Some(right)) => left == right,
@@ -104,6 +111,23 @@ impl PartialEq for LayerwiseWorkspaceIdentity {
 }
 impl Eq for LayerwiseWorkspaceIdentity {}
 
+#[derive(Clone, Debug)]
+pub(crate) struct LayerwiseConstructorTrace(std::rc::Rc<LayerwiseSpanTrace>);
+#[derive(Debug, Default)]
+struct LayerwiseSpanTrace {
+    constructors: std::cell::Cell<super::ParameterConstructors>,
+    ordinals: RefCell<Vec<usize>>,
+}
+impl LayerwiseConstructorTrace {
+    pub(crate) fn current(&self) -> super::ParameterConstructors {
+        self.0.constructors.get()
+    }
+    pub(crate) fn complete_span(&self) -> Vec<usize> {
+        self.0.constructors.set(Default::default());
+        std::mem::take(&mut *self.0.ordinals.borrow_mut())
+    }
+}
+
 /// Exact native sources for cold projection and selected original installation.
 /// A quote prices its retained controls without creating admission or source
 /// credit. Legacy quotes move only the identity and retire this snapshot.
@@ -111,9 +135,12 @@ pub(crate) struct LayerwiseWorkspace {
     manager: ResidencyManager,
     identity: LayerwiseWorkspaceIdentity,
     copies: LayerwiseCopies,
+    replacement_rows: Vec<replacements::ReplacementRow>,
+    replacement_rows_funded: bool,
     persistent_roots: RefCell<Option<(WorkspaceContext, ParameterRoots)>>,
     materialization: LayerwiseMaterialization,
     execution_trace: RefCell<Option<Vec<usize>>>,
+    constructor_trace: RefCell<Option<LayerwiseConstructorTrace>>,
     speculative_foreground:
         std::cell::OnceCell<super::original_operations::PreparedSpeculativeForegroundSource>,
 }
@@ -156,7 +183,10 @@ pub(crate) enum OriginalLayerwiseSourceCustody {
 impl LayerwiseWorkspace {
     /// The original manager retains the full unloaded-module population,
     /// independently of the smaller set of rows populated by its leases.
-    pub(crate) fn parameter_constructors(&self, ordinal: usize) -> Option<super::ParameterConstructors> {
+    pub(crate) fn parameter_constructors(
+        &self,
+        ordinal: usize,
+    ) -> Option<super::ParameterConstructors> {
         if self.identity.manager_unit_constructors {
             self.manager.parameter_constructors(ordinal)
         } else {
@@ -165,11 +195,17 @@ impl LayerwiseWorkspace {
     }
 
     pub(crate) fn has_parameter_exclusions(&self) -> bool {
-        self.identity.excluded.as_ref().is_some_and(|names| !names.names().is_empty())
+        self.identity
+            .excluded
+            .as_ref()
+            .is_some_and(|names| !names.names().is_empty())
     }
 
     pub(crate) fn excludes_parameter(&self, name: &str) -> bool {
-        self.identity.excluded.as_ref().is_some_and(|names| names.contains(name))
+        self.identity
+            .excluded
+            .as_ref()
+            .is_some_and(|names| names.contains(name))
     }
 
     pub(crate) fn destination_device_type(&self) -> safemlx::DeviceType {
@@ -181,31 +217,142 @@ impl LayerwiseWorkspace {
             LayerwiseCopies::Disk { .. } => safemlx::DeviceType::Gpu,
         }
     }
+    /// Shares the paid constructor census and exact unit visits in each span.
+    pub(crate) fn begin_constructor_trace(
+        &self,
+        context: &WorkspaceContext,
+    ) -> Result<LayerwiseConstructorTrace, eredu_nn::Error> {
+        let mut current = self
+            .constructor_trace
+            .try_borrow_mut()
+            .map_err(|cause| context.metadata_source(cause))?;
+        if current
+            .as_ref()
+            .is_some_and(|trace| std::rc::Rc::strong_count(&trace.0) != 1)
+        {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
+        let allocation = std::alloc::Layout::new::<[usize; 2]>()
+            .extend(std::alloc::Layout::new::<LayerwiseSpanTrace>())
+            .map_err(|cause| context.metadata_source(cause))?
+            .0
+            .pad_to_align()
+            .size();
+        let controls = allocation
+            .checked_add(std::mem::size_of::<(
+                LayerwiseConstructorTrace,
+                &Self,
+                &WorkspaceContext,
+                std::alloc::Layout,
+                std::cell::RefMut<'_, Option<LayerwiseConstructorTrace>>,
+                Result<LayerwiseConstructorTrace, eredu_nn::Error>,
+            )>())
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        context.charge_metadata(controls)?;
+        let trace = LayerwiseConstructorTrace(std::rc::Rc::new(LayerwiseSpanTrace::default()));
+        *current = Some(trace.clone());
+        Ok(trace)
+    }
+
     /// Enables one exact shared-driver unit visit. The source retains each
     /// logical ordinal separately even when its checkpoint owner is shared.
-    pub(crate) fn begin_execution_trace(&self,context:&WorkspaceContext)->Result<(),eredu_nn::Error> {
-        context.charge_metadata(std::mem::size_of::<(Self,&WorkspaceContext,
-            std::cell::RefMut<'_,Option<Vec<usize>>>,Result<(),eredu_nn::Error>)>())?;
-        let mut trace=self.execution_trace.try_borrow_mut().map_err(|cause|context.metadata_source(cause))?;
-        if trace.is_some(){return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());}
-        *trace=Some(context.metadata_vec(self.layout().len())?);Ok(())
+    pub(crate) fn begin_execution_trace(
+        &self,
+        context: &WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(
+            Self,
+            &WorkspaceContext,
+            std::cell::RefMut<'_, Option<Vec<usize>>>,
+            Result<(), eredu_nn::Error>,
+        )>())?;
+        let mut trace = self
+            .execution_trace
+            .try_borrow_mut()
+            .map_err(|cause| context.metadata_source(cause))?;
+        if trace.is_some() {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
+        *trace = Some(context.metadata_vec(self.layout().len())?);
+        Ok(())
     }
     /// Borrows the recorded invocation if enabled; ordinary whole-forward
     /// source users retain the existing full-layout census.
-    pub(crate) fn with_execution_ordinals<T>(&self,visit:impl FnOnce(Option<&[usize]>)->T)->T {
-        let trace=self.execution_trace.borrow();visit(trace.as_deref())
+    pub(crate) fn with_execution_ordinals<T>(
+        &self,
+        visit: impl FnOnce(Option<&[usize]>) -> T,
+    ) -> T {
+        let trace = self.execution_trace.borrow();
+        visit(trace.as_deref())
     }
-    fn observe_execution_acquire(&self,ordinal:usize,address:ExecutionUnitAddress,
-        context:&WorkspaceContext)->Result<(),eredu_nn::Error> {
-        let mut trace=self.execution_trace.try_borrow_mut().map_err(|cause|context.metadata_source(cause))?;
-        let Some(trace)=trace.as_mut()else{return Ok(());};
-        context.charge_metadata(std::mem::size_of::<(usize,ExecutionUnitAddress,&WorkspaceContext,
-            std::cell::RefMut<'_,Option<Vec<usize>>>,Result<(),eredu_nn::Error>)>())?;
-        if self.execution_address(ordinal)!=Some(address) || trace.len()==trace.capacity()
-            || trace.last().is_some_and(|previous|*previous>=ordinal) {
-            return Err(context.metadata_error(format_args!("layerwise invocation order differs from its retained source")));
+    fn observe_execution_acquire(
+        &self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        context: &WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        if let Some(trace) = self.constructor_trace.borrow().as_ref() {
+            context.charge_metadata(std::mem::size_of::<(
+                super::ParameterConstructors,
+                Option<super::ParameterConstructors>,
+                usize,
+                ExecutionUnitAddress,
+                &WorkspaceContext,
+                std::cell::RefMut<'_, Vec<usize>>,
+            )>())?;
+            if self.execution_address(ordinal) != Some(address) {
+                return Err(context.metadata_source(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                ));
+            }
+            let unit = self.parameter_constructors(ordinal).ok_or_else(|| {
+                context.metadata_source(
+                    eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+                )
+            })?;
+            let mut ordinals = trace
+                .0
+                .ordinals
+                .try_borrow_mut()
+                .map_err(|cause| context.metadata_source(cause))?;
+            if ordinals.last().is_some_and(|previous| *previous >= ordinal) {
+                return Err(context.metadata_error(format_args!(
+                    "layerwise span acquisition order differs from its retained source"
+                )));
+            }
+            context.reserve_metadata_vec(&mut ordinals, 1)?;
+            ordinals.push(ordinal);
+            trace.0.constructors.set(
+                trace
+                    .current()
+                    .checked_merge(unit)
+                    .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?,
+            );
         }
-        trace.push(ordinal);Ok(())
+        let mut trace = self
+            .execution_trace
+            .try_borrow_mut()
+            .map_err(|cause| context.metadata_source(cause))?;
+        let Some(trace) = trace.as_mut() else {
+            return Ok(());
+        };
+        context.charge_metadata(std::mem::size_of::<(
+            usize,
+            ExecutionUnitAddress,
+            &WorkspaceContext,
+            std::cell::RefMut<'_, Option<Vec<usize>>>,
+            Result<(), eredu_nn::Error>,
+        )>())?;
+        if self.execution_address(ordinal) != Some(address)
+            || trace.len() == trace.capacity()
+            || trace.last().is_some_and(|previous| *previous >= ordinal)
+        {
+            return Err(context.metadata_error(format_args!(
+                "layerwise invocation order differs from its retained source"
+            )));
+        }
+        trace.push(ordinal);
+        Ok(())
     }
     pub(crate) fn speculative_foreground(
         &self,
@@ -243,17 +390,34 @@ impl LayerwiseWorkspace {
         self.manager.detached_physical_read_bytes(source)
     }
 
-    pub(crate) fn visit_native_copy_layouts<E>(&self,
-        mut visit:impl FnMut(usize,safemlx::Dtype)->Result<(),E>)
-        ->Result<bool,E> {
+    #[cfg(test)]
+    pub(crate) fn test_evict_completed_parameter_alias(
+        &self,
+    ) -> crate::backend::runtime::residency::manager::CanonicalArrayOwner {
+        self.manager
+            .test_evict_completed_parameter_alias()
+            .unwrap()
+            .expect("actual authenticated parameter source in the Device cache")
+    }
+
+    pub(crate) fn visit_native_copy_layouts<E>(
+        &self,
+        mut visit: impl FnMut(usize, safemlx::Dtype) -> Result<(), E>,
+    ) -> Result<bool, E> {
         match &self.copies {
-            LayerwiseCopies::Host(source)=>for unit in source.units() {
-                for copy in source.copies(unit) {visit(copy.shape().len(),copy.dtype())?;}
-            },
-            LayerwiseCopies::Foreground(source)=>for (shape,dtype) in source.source().native_reads() {
-                visit(shape.len(),dtype)?;
-            },
-            LayerwiseCopies::Disk{..}=>return Ok(false),
+            LayerwiseCopies::Host(source) => {
+                for unit in source.units() {
+                    for copy in source.copies(unit) {
+                        visit(copy.shape().len(), copy.dtype())?;
+                    }
+                }
+            }
+            LayerwiseCopies::Foreground(source) => {
+                for (shape, dtype) in source.source().native_reads() {
+                    visit(shape.len(), dtype)?;
+                }
+            }
+            LayerwiseCopies::Disk { .. } => return Ok(false),
         }
         Ok(true)
     }
@@ -265,7 +429,10 @@ impl LayerwiseWorkspace {
         match &self.copies {
             LayerwiseCopies::Host(copies) => recipe.bind_host_copies(copies),
             LayerwiseCopies::Foreground(identity) => {
-                if recipe.matches_foreground_disk_source(identity.source(), identity.destination_device_type()) {
+                if recipe.matches_foreground_disk_source(
+                    identity.source(),
+                    identity.destination_device_type(),
+                ) {
                     Ok(())
                 } else {
                     Err(Error::PrefillControl(
@@ -286,8 +453,23 @@ impl LayerwiseWorkspace {
     pub(crate) fn known_retained_control_bytes(&self, retain_sources: bool) -> Option<u64> {
         use std::alloc::Layout;
         crate::backend::runtime::residency::storage::native_storage::Bank::shared_borrowed_owner_bytes()?;
-        let mut bytes = self.identity.excluded.as_ref()
+        let mut bytes = self
+            .identity
+            .excluded
+            .as_ref()
             .map_or(Some(0), MlxParameterExclusions::unfunded_retained_bytes)?;
+        if !self.replacement_rows_funded {
+            bytes = bytes.checked_add(
+                Layout::array::<replacements::ReplacementRow>(self.replacement_rows.capacity())
+                    .ok()?
+                    .size(),
+            )?;
+            for row in &self.replacement_rows {
+                bytes = bytes
+                    .checked_add(row.name.capacity())?
+                    .checked_add(Layout::array::<i32>(row.shape.capacity()).ok()?.size())?;
+            }
+        }
         match (&self.identity.geometry, &self.copies) {
             (LayerwiseGeometry::PreparedHost(_), LayerwiseCopies::Host(_)) => {
                 // Immutable snapshot and identity backing were constructed once
@@ -312,7 +494,8 @@ impl LayerwiseWorkspace {
                 bytes = bytes.checked_add(layout.cloned_payload_bytes()?)?;
                 if retain_sources {
                     bytes = bytes.checked_add(match self.materialization() {
-                        WorkspaceBound::Bounded { assumptions, .. } => assumptions.capacity(),
+                        WorkspaceBound::Bounded { assumptions, .. }
+                        | WorkspaceBound::PerDomain { assumptions } => assumptions.capacity(),
                         WorkspaceBound::Unknown { reason } => reason.capacity(),
                     })?;
                 }
@@ -548,27 +731,136 @@ impl LayerwiseWorkspace {
         context: Option<&WorkspaceContext>,
     ) -> Result<Self, Error> {
         if let Some(context) = context {
-            context.charge_metadata(std::mem::size_of::<(
-                Self, Arc<[(ExecutionUnitAddress, ExecutionUnitAddress)]>,
-                Option<&WorkspaceContext>, usize, ExecutionUnitAddress, ExecutionUnitAddress,
-                Result<Self, Error>,
-            )>()).map_err(|cause| Error::Neural(cause.into()))?;
+            context
+                .charge_metadata(std::mem::size_of::<(
+                    Self,
+                    Arc<[(ExecutionUnitAddress, ExecutionUnitAddress)]>,
+                    Option<&WorkspaceContext>,
+                    usize,
+                    ExecutionUnitAddress,
+                    ExecutionUnitAddress,
+                    Result<Self, Error>,
+                )>())
+                .map_err(|cause| Error::Neural(cause.into()))?;
         }
-        let mismatch = || Error::PrefillControl(
-            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch);
+        let mismatch = || {
+            Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            )
+        };
         if self.identity.parameter_locations.is_some() || locations.len() != self.layout().len() {
             return Err(mismatch());
         }
         for (ordinal, &(global, local)) in locations.iter().enumerate() {
-            if self.layout().address(ordinal) != Some(local) || global.group() != local.group()
-                || locations[..ordinal].iter().any(|&(prior, _)| prior == global)
-            { return Err(mismatch()); }
+            if self.layout().address(ordinal) != Some(local)
+                || global.group() != local.group()
+                || locations[..ordinal]
+                    .iter()
+                    .any(|&(prior, _)| prior == global)
+            {
+                return Err(mismatch());
+            }
         }
         self.identity.parameter_locations = Some(locations);
         Ok(self)
     }
     pub(crate) fn materialization(&self) -> &WorkspaceBound {
         self.materialization.bound()
+    }
+
+    fn materialization_placement(&self) -> Option<&'static eredu_core::MemoryPlacement> {
+        match &self.copies {
+            LayerwiseCopies::Host(source) => crate::backend::managed_memory::cold_copy_placement(
+                source.destination_device_type(),
+                source.destination_device_index(),
+            ),
+            LayerwiseCopies::Foreground(source) => {
+                crate::backend::managed_memory::cold_copy_placement(
+                    source.destination_device_type(),
+                    source.destination_device_index(),
+                )
+            }
+            LayerwiseCopies::Disk { .. } => {
+                crate::backend::managed_memory::cold_gpu_allocator_placement()
+            }
+        }
+    }
+
+    /// Reduces actual destination capacities under the selected completed-window
+    /// schedule after resolving their allocation mechanism's physical placement.
+    pub(crate) fn materialization_requirements(
+        &self,
+        metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
+    ) -> Result<Option<eredu_core::DomainMemoryRequirements>, Error> {
+        let (Some(topology), Some(placement)) = (
+            crate::backend::managed_memory::cold_topology(),
+            self.materialization_placement(),
+        ) else {
+            return Ok(None);
+        };
+        let report_error = |e| Error::Neural(metadata.error(e));
+        let zero = || {
+            metadata
+                .placed_requirements(topology, 0, placement)
+                .map_err(report_error)
+        };
+        let persistent = |id: &OffloadUnitId| match &self.copies {
+            LayerwiseCopies::Host(_) => false,
+            LayerwiseCopies::Foreground(identity) => {
+                identity.persistent_units().any(|candidate| candidate == id)
+            }
+            LayerwiseCopies::Disk { copies, .. } => copies.persistent_units().contains(id),
+        };
+        let mut retained = zero()?;
+        for unit_index in 0..self.unit_count() {
+            let unit = self
+                .unit(unit_index)
+                .map_err(|e| Error::Neural(metadata.source(e)))?;
+            if persistent(unit.id) {
+                let unit = metadata
+                    .placed_requirements(topology, unit.fresh_capacity_bytes, placement)
+                    .map_err(report_error)?;
+                retained = metadata
+                    .combine_domain_requirements(&retained, &unit, true)
+                    .map_err(report_error)?;
+            }
+        }
+        let mut peak = zero()?;
+        let depth =
+            std::num::NonZeroUsize::new(self.identity.depth()).ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ))?;
+        for ordinal in 0..self.layout().len() {
+            let mut current = zero()?;
+            for index in self
+                .layout()
+                .window_range(ordinal, depth)
+                .expect("validated ordinal")
+            {
+                let index = self
+                    .requested_unit(index)
+                    .map_err(|e| Error::Neural(metadata.source(e)))?;
+                let unit = self
+                    .unit(index)
+                    .map_err(|e| Error::Neural(metadata.source(e)))?;
+                if !persistent(unit.id) {
+                    let unit = metadata
+                        .placed_requirements(topology, unit.fresh_capacity_bytes, placement)
+                        .map_err(report_error)?;
+                    current = metadata
+                        .combine_domain_requirements(&current, &unit, true)
+                        .map_err(report_error)?;
+                }
+            }
+            peak = metadata
+                .combine_domain_requirements(&peak, &current, false)
+                .map_err(report_error)?;
+        }
+        Ok(Some(
+            metadata
+                .combine_domain_requirements(&peak, &retained, true)
+                .map_err(report_error)?,
+        ))
     }
 
     /// Future device destinations can allocate or share their source. Each
@@ -602,7 +894,31 @@ impl LayerwiseWorkspace {
                         .map_err(eredu_nn::Error::backend_retained_source)?;
                     let layout = WorkspaceLayout::new(row.shape, row.dtype)?
                         .with_representation(row.representation);
-                    let root = WorkspaceExistingStorage::new(Some(row.capacity_bytes), context);
+                    if self.replacement_row(row.binding.name()).is_some() {
+                        let root = context
+                            .retained_parameter_backing(row.binding.name(), layout.as_view())?
+                            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)?;
+                        return Ok((
+                            eredu_nn::ParameterId::new(row.binding.name())
+                                .map_err(eredu_nn::Error::backend_retained_source)?,
+                            WorkspaceTensor::existing_with_storage(layout, &root, context)?,
+                        ));
+                    }
+                    let root = match self.materialization_placement() {
+                        Some(placement) => WorkspaceExistingStorage::try_new_placed(
+                            Some(row.capacity_bytes),
+                            placement,
+                            context,
+                        )?,
+                        None if context.memory_topology().is_none() => {
+                            WorkspaceExistingStorage::try_new(Some(row.capacity_bytes), context)?
+                        }
+                        None => {
+                            return Err(
+                                eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into()
+                            );
+                        }
+                    };
                     Ok((
                         eredu_nn::ParameterId::new(row.binding.name())
                             .map_err(eredu_nn::Error::backend_retained_source)?,
@@ -625,6 +941,19 @@ impl LayerwiseWorkspace {
                         let row = self
                             .row(unit, index)
                             .map_err(eredu_nn::Error::backend_retained_source)?;
+                        if self.replacement_row(row.binding.name()).is_some() {
+                            let layout = context
+                                .layout(row.shape, row.dtype)?
+                                .with_representation(row.representation);
+                            let root = context
+                                .retained_parameter_backing(row.binding.name(), layout.as_view())?
+                                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)?;
+                            return Ok((
+                                eredu_nn::ParameterId::new(row.binding.name())
+                                    .map_err(eredu_nn::Error::backend_retained_source)?,
+                                WorkspaceTensor::existing_with_storage(layout, &root, context)?,
+                            ));
+                        }
                         let owner_unit = self
                             .unit(row.owner.unit)
                             .map_err(eredu_nn::Error::backend_retained_source)?;
@@ -637,9 +966,28 @@ impl LayerwiseWorkspace {
                             &mut local
                         };
                         let key = (owner_unit.id.clone(), owner_row.binding.name().to_owned());
-                        let root = map.entry(key).or_insert_with(|| {
-                            WorkspaceExistingStorage::new(Some(row.capacity_bytes), context)
-                        });
+                        let root = match map.entry(key) {
+                            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(match self.materialization_placement() {
+                                    Some(placement) => WorkspaceExistingStorage::try_new_placed(
+                                        Some(row.capacity_bytes),
+                                        placement,
+                                        context,
+                                    )?,
+                                    None if context.memory_topology().is_none() => {
+                                        WorkspaceExistingStorage::try_new(
+                                            Some(row.capacity_bytes),
+                                            context,
+                                        )?
+                                    }
+                                    None => return Err(
+                                        eredu_nn::workspace::WorkspaceMetadataError::Unqualified
+                                            .into(),
+                                    ),
+                                })
+                            }
+                        };
                         if root.capacity_bytes() != Some(row.capacity_bytes) {
                             return Err(eredu_nn::Error::backend(
                                 "canonical disk owner capacity differs between aliases",
@@ -676,7 +1024,9 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             std::mem::size_of::<Result<LayerwiseWorkspace, Error>>(),
             std::mem::size_of::<Option<&WorkspaceContext>>(),
             std::mem::size_of::<(
-                &P, Option<&MlxParameterExclusions>, Option<MlxParameterExclusions>,
+                &P,
+                Option<&MlxParameterExclusions>,
+                Option<MlxParameterExclusions>,
             )>(),
             std::mem::size_of::<HostCopyWorkspace>(),
             std::mem::size_of::<
@@ -719,11 +1069,20 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
         };
         if !self.pending.is_empty()
             || !self.populator.preserves_prepared_parameter_source()
-            || (context.is_some() && self.populator.prepared_parameter_exclusions()
-                .is_some_and(|names| !names.is_source_funded()))
+            || (context.is_some()
+                && self
+                    .populator
+                    .prepared_parameter_exclusions()
+                    .is_some_and(|names| !names.is_source_funded()))
         {
             return Err(unknown());
         }
+        let replacements = self
+            .populator
+            .prepared_parameter_replacements()
+            .cloned()
+            .unwrap_or_default();
+        let replacement_rows = replacements::snapshot(&replacements, context)?;
         if let Some(dense) = &self.dense {
             // Original background execution borrows this same exact Device
             // declaration; its separate Host window/worker is retained by the
@@ -746,24 +1105,28 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
                 }
                 return Ok(LayerwiseWorkspace {
                     manager: self.residency.clone(),
+                    replacement_rows,
+                    replacement_rows_funded: context.is_some(),
                     identity: LayerwiseWorkspaceIdentity {
                         policy: Arc::clone(&self.workspace_identity),
-                    parameter_locations: None,
-                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
-                    manager_unit_constructors: true,
+                        parameter_locations: None,
+                        excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                        manager_unit_constructors: true,
+                        replacements: replacements.clone(),
                         geometry: LayerwiseGeometry::PreparedForeground(identity.clone()),
                     },
                     copies: LayerwiseCopies::Foreground(identity.clone()),
                     persistent_roots: RefCell::new(None),
                     speculative_foreground: std::cell::OnceCell::new(),
                     execution_trace: RefCell::new(None),
+                    constructor_trace: RefCell::new(None),
                     materialization: LayerwiseMaterialization::PreparedForeground(identity.clone()),
                 });
             }
             if context.is_some() || prepared_background {
                 return Err(unknown());
             }
-            return self.disk_workspace(allocation);
+            return self.disk_workspace(allocation, replacements, replacement_rows);
         }
         let copies = match context {
             Some(context) => self
@@ -783,18 +1146,22 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             }
             return Ok(LayerwiseWorkspace {
                 manager: self.residency.clone(),
+                replacement_rows,
+                replacement_rows_funded: context.is_some(),
                 identity: LayerwiseWorkspaceIdentity {
                     policy: Arc::clone(&self.workspace_identity),
                     parameter_locations: None,
                     excluded: self.populator.prepared_parameter_exclusions().cloned(),
                     manager_unit_constructors: true,
+                    replacements: replacements.clone(),
                     geometry: LayerwiseGeometry::PreparedHost(identity.clone()),
                 },
                 materialization: LayerwiseMaterialization::PreparedHost(identity.clone()),
                 copies: LayerwiseCopies::Host(copies),
                 persistent_roots: RefCell::new(None),
                 speculative_foreground: std::cell::OnceCell::new(),
-                    execution_trace: RefCell::new(None),
+                execution_trace: RefCell::new(None),
+                constructor_trace: RefCell::new(None),
             });
         }
         if context.is_some() {
@@ -832,11 +1199,14 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             .collect();
         Ok(LayerwiseWorkspace {
             manager: self.residency.clone(),
+            replacement_rows,
+            replacement_rows_funded: false,
             identity: LayerwiseWorkspaceIdentity {
                 policy: Arc::clone(&self.workspace_identity),
-                    parameter_locations: None,
-                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
-                    manager_unit_constructors: true,
+                parameter_locations: None,
+                excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                manager_unit_constructors: true,
+                replacements: replacements.clone(),
                 geometry: LayerwiseGeometry::Owned {
                     layout: self.layout.clone(),
                     depth: self.window_depth,
@@ -846,7 +1216,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             copies: LayerwiseCopies::Host(copies),
             persistent_roots: RefCell::new(None),
             speculative_foreground: std::cell::OnceCell::new(),
-                    execution_trace: RefCell::new(None),
+            execution_trace: RefCell::new(None),
+            constructor_trace: RefCell::new(None),
             materialization: LayerwiseMaterialization::Owned(materialization),
         })
     }
@@ -856,6 +1227,8 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
     fn disk_workspace(
         &self,
         allocation: NativeAllocationFacts,
+        replacements: eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
+        replacement_rows: Vec<replacements::ReplacementRow>,
     ) -> Result<LayerwiseWorkspace, Error> {
         use eredu_runtime::working_memory::WorkingMemoryError;
         let plans = self
@@ -919,11 +1292,14 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
         );
         Ok(LayerwiseWorkspace {
             manager: self.residency.clone(),
+            replacement_rows,
+            replacement_rows_funded: false,
             identity: LayerwiseWorkspaceIdentity {
                 policy: Arc::clone(&self.workspace_identity),
-                    parameter_locations: None,
-                    excluded: self.populator.prepared_parameter_exclusions().cloned(),
-                    manager_unit_constructors: true,
+                parameter_locations: None,
+                excluded: self.populator.prepared_parameter_exclusions().cloned(),
+                manager_unit_constructors: true,
+                replacements: replacements.clone(),
                 geometry: LayerwiseGeometry::Owned {
                     layout: self.layout.clone(),
                     depth: self.window_depth,
@@ -933,12 +1309,12 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
             copies: LayerwiseCopies::Disk { copies, receipt },
             persistent_roots: RefCell::new(None),
             speculative_foreground: std::cell::OnceCell::new(),
-                    execution_trace: RefCell::new(None),
+            execution_trace: RefCell::new(None),
+            constructor_trace: RefCell::new(None),
             materialization: LayerwiseMaterialization::Owned(materialization),
         })
     }
 }
-
 
 // The source itself implements the portable loan. Composition wrappers need
 // not reopen private model modules or copy their parameter/source directory.
@@ -947,19 +1323,35 @@ impl eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters for L
         LayerwiseWorkspace::excludes_parameter(self, name)
     }
 
-    fn observe_acquire(&self,ordinal:usize,address:ExecutionUnitAddress,context:&WorkspaceContext)
-        ->Result<(),eredu_nn::Error> {self.observe_execution_acquire(ordinal,address,context)}
-
-    fn layout(&self)->&eredu_runtime::ExecutionUnitLayout { LayerwiseWorkspace::layout(self) }
-    fn execution_address(&self,ordinal:usize)->Option<eredu_runtime::ExecutionUnitAddress> {
-        LayerwiseWorkspace::execution_address(self,ordinal)
+    fn observe_acquire(
+        &self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        context: &WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        self.observe_execution_acquire(ordinal, address, context)
     }
-    fn parameter_source(&self)->Result<eredu_runtime::working_memory::WorkspaceParameterSourceLoan<'_>,
-        eredu_runtime::working_memory::WorkspaceParameterSourceError> {
+
+    fn layout(&self) -> &eredu_runtime::ExecutionUnitLayout {
+        LayerwiseWorkspace::layout(self)
+    }
+    fn execution_address(&self, ordinal: usize) -> Option<eredu_runtime::ExecutionUnitAddress> {
+        LayerwiseWorkspace::execution_address(self, ordinal)
+    }
+    fn parameter_source(
+        &self,
+    ) -> Result<
+        eredu_runtime::working_memory::WorkspaceParameterSourceLoan<'_>,
+        eredu_runtime::working_memory::WorkspaceParameterSourceError,
+    > {
         Ok(LayerwiseWorkspace::parameter_source(self))
     }
-    fn parameters(&self,ordinal:usize,address:eredu_runtime::ExecutionUnitAddress,context:&WorkspaceContext)
-        ->Result<BTreeMap<eredu_nn::ParameterId,WorkspaceTensor>,eredu_nn::Error> {
-        LayerwiseWorkspace::parameters(self,ordinal,address,context)
+    fn parameters(
+        &self,
+        ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &WorkspaceContext,
+    ) -> Result<BTreeMap<eredu_nn::ParameterId, WorkspaceTensor>, eredu_nn::Error> {
+        LayerwiseWorkspace::parameters(self, ordinal, address, context)
     }
 }

@@ -4,61 +4,6 @@ use eredu_runtime::working_memory::{
 };
 use half::{bf16, f16};
 
-// This fixture quotes the real cumulative host schedule plus the one native
-// coordinate exercised below. It is not a model or full native-run quote.
-fn fresh_result(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
-) -> Result<(WorkingMemoryReservation, WorkingMemoryFundingRun), WorkingMemoryError> {
-    let geometry = InferenceGeometry {
-        batch_size: 1,
-        cached_positions: 0,
-        input_positions: 3,
-        max_output_tokens: 4,
-        prefill_chunk_positions: 3,
-        output: OutputDemand::LastPosition,
-    };
-    let layout = StateMemoryLayout::new(
-        LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
-        vec![0],
-        1,
-        1,
-        EstimationCompleteness::Complete,
-    )
-    .unwrap();
-    let state = estimate_runtime_state(
-        &layout,
-        InputTokenCount::text(3),
-        4,
-        1,
-        NonZeroU8::new(4).unwrap(),
-    )
-    .unwrap();
-    let bound = |bytes| WorkspaceBound::bounded(bytes, "portable parent-account fixture");
-    let state = state
-        .with_execution_workspace(ExecutionWorkspaceEstimate {
-            geometry,
-            activations: bound(bytes),
-            attention: bound(0),
-            vocabulary: bound(0),
-            state_update: bound(0),
-            materialization: bound(0),
-            retained: bound(0),
-        })
-        .unwrap();
-    pool.reserve_with_capacity(
-        &InferenceExecutionIdentity::default(),
-        &Admission {
-            state,
-            requested_positions: 7,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        pool.effective_capacity().unwrap(),
-    )?
-    .into_funding()
-}
-
 fn all_usage() -> CaptureUsage {
     CaptureUsage {
         captures: u64::MAX,
@@ -95,7 +40,10 @@ fn native_bound<'a>(source: &'a Array, leaf: &PreparedCaptureTensor<'a>) -> u64 
     assert!(report.unpriced_host_operations.is_empty());
     report.total_bytes.unwrap()
 }
-fn root_entries(roots: &RefCell<Vec<Array>>) -> BTreeMap<StorageIdentity, u64> {
+fn root_entries(
+    roots: &RefCell<Vec<Array>>,
+    pool: &MemoryLedger,
+) -> BTreeMap<StorageIdentity, eredu_runtime::working_memory::StorageAllocation> {
     roots
         .borrow()
         .iter()
@@ -104,7 +52,11 @@ fn root_entries(roots: &RefCell<Vec<Array>>) -> BTreeMap<StorageIdentity, u64> {
             let info = root.try_metadata_snapshot().unwrap().allocation().unwrap();
             (info.bytes() != 0).then_some((
                 StorageIdentity::Native(info.identity()),
-                info.bytes() as u64,
+                eredu_runtime::working_memory::StorageAllocation::new(
+                    info.bytes() as u64,
+                    crate::backend::managed_memory::allocation_placement_handle(&info, pool)
+                        .unwrap(),
+                ),
             ))
         })
         .collect()
@@ -173,21 +125,50 @@ fn run_case(
     let n = native_bound(source, &leaf);
     // The actual original reservation rejects the combined H+N one byte short,
     // before any claim bank, host destination or selected native work exists.
-    let short = WorkingMemoryPool::new(source_bytes + h + n - 1, 0).unwrap();
+    let short = parent_ledger(source_bytes + h + n - 1, source, 1).unwrap();
     let short_source = register(&short, source);
-    let before = (short.used_bytes().unwrap(), short.peak_bytes().unwrap());
-    let error = fresh_result(&short, h + n).unwrap_err();
-    assert!(matches!(error, WorkingMemoryError::BudgetExceeded { .. }));
+    let before = (
+        short.fixture_host_charge().unwrap(),
+        short.fixture_host_peak().unwrap(),
+    );
+    let admission = parent_admission(h + n);
+    let required = short
+        .reservation_requirements(&admission, None)
+        .unwrap()
+        .get(short.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let ceiling = crate::memory_fixture::physical_host_limits(
+        &short,
+        short.fixture_host_current().unwrap() + required - 1,
+    );
+    let error = short
+        .reserve_with_capacity(&InferenceExecutionIdentity::default(), &admission, ceiling)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
+    ));
     assert_eq!(
-        (short.used_bytes().unwrap(), short.peak_bytes().unwrap()),
+        (
+            short.fixture_host_charge().unwrap(),
+            short.fixture_host_peak().unwrap()
+        ),
         before
     );
     drop(short_source);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.fixture_host_charge().unwrap(), 0);
 
-    let pool = WorkingMemoryPool::new(source_bytes + h + n, 0).unwrap();
+    let publication_bytes = eredu_runtime::working_memory::StoragePublicationLayout::<
+        StorageIdentity,
+    >::new(leaf.recovery_descriptors())
+    .unwrap()
+    .requested_bytes()
+        + MemoryLedger::storage_metadata_control_bytes().unwrap();
+    let pool = parent_ledger(source_bytes + h + n + publication_bytes, source, 1).unwrap();
     let registered = register(&pool, source);
-    let (reservation, run) = fresh_result(&pool, h + n).unwrap();
+    let (reservation, run) = fresh_result(&pool, h + n + publication_bytes).unwrap();
     let mut native = run.scope().unwrap();
     let mut bank = run
         .prepare_capture_run(&reservation, CaptureRunHostPlan::prepare(&shared).unwrap())
@@ -195,7 +176,7 @@ fn run_case(
     assert_eq!(bank.protected_bytes(), h);
     let roots = RefCell::new(Vec::with_capacity(leaf.recovery_descriptors()));
     let capacity = roots.borrow().capacity();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_current().unwrap();
     let mut frame = bank
         .begin_step(CapturePhase::Prefill, 0)
         .unwrap()
@@ -204,7 +185,7 @@ fn run_case(
     let receipt = leaf
         .transfer_scheduled(frame.take_tensor(0).unwrap(), &mut native, stream, &roots)
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_current().unwrap(), before);
     assert_eq!(roots.borrow().capacity(), capacity);
     assert_eq!(
         receipt.observation().shape(),
@@ -222,18 +203,25 @@ fn run_case(
         .record_tensor(receipt, dtype(source.dtype()), CaptureUsage::default())
         .unwrap();
     let frame = frame_finish(frame);
-    let entries = root_entries(&roots);
-    assert!(entries.values().sum::<u64>() <= source_bytes + n);
+    let entries = root_entries(&roots, &pool);
+    assert!(
+        entries
+            .values()
+            .map(|allocation| allocation.capacity_bytes())
+            .sum::<u64>()
+            <= source_bytes + n
+    );
     // Exact completed native allocations fit alongside all still-protected H.
     // A second child hold would have exhausted this deliberately exact account.
+    let before_publication = pool.fixture_host_current().unwrap();
     let publication = native.adopt_storage_individually(entries).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_current().unwrap(), before_publication);
     settle(&roots);
     native.certify().unwrap();
     drop((publication, frame, bank, reservation, run, registered));
-    assert!(pool.used_bytes().unwrap() >= h);
+    assert!(pool.fixture_host_charge().unwrap() >= h);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     assert_eq!(source.try_metadata_snapshot().unwrap(), source_metadata);
 }
 
@@ -378,7 +366,7 @@ fn scheduled_independent_admission_selection_phase_and_prediction_mismatch_stop_
             .unwrap()
             .initialization_peak_bytes();
         let bytes = snapshot.allocation().unwrap().bytes() as u64;
-        let pool = WorkingMemoryPool::new(bytes + h, 0).unwrap();
+        let pool = parent_ledger(bytes + h, &source, 1).unwrap();
         let registration = register(&pool, &source);
         let (reservation, run) = fresh_result(&pool, h).unwrap();
         let mut native = run.scope().unwrap();
@@ -404,7 +392,7 @@ fn scheduled_independent_admission_selection_phase_and_prediction_mismatch_stop_
         };
         let leaf = PreparedCaptureTensor::new(&source, geometry).unwrap();
         let roots = RefCell::new(vec![]);
-        let before = pool.used_bytes().unwrap();
+        let before = pool.fixture_host_charge().unwrap();
         FAIL_AFTER_SLICE.set(true);
         let error = leaf
             .transfer_scheduled(frame.take_tensor(0).unwrap(), &mut native, &stream, &roots)
@@ -418,13 +406,13 @@ fn scheduled_independent_admission_selection_phase_and_prediction_mismatch_stop_
         drop(error);
         assert!(FAIL_AFTER_SLICE.replace(false));
         assert!(roots.borrow().is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
         assert!(frame.take_tensor(0).is_err());
         assert_eq!(source.try_metadata_snapshot().unwrap(), snapshot);
         drop(frame);
         native.certify().unwrap();
         drop((bank, reservation, run, registration));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
 
@@ -438,7 +426,7 @@ fn scheduled_foreign_scope_and_borrowed_collector_reject_without_ops_or_second_c
         .unwrap()
         .initialization_peak_bytes();
     let bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-    let pool = WorkingMemoryPool::new(bytes + 2 * h, 0).unwrap();
+    let pool = parent_ledger(bytes + 2 * h, &source, 2).unwrap();
     let registration = register(&pool, &source);
     let (reservation, run) = fresh_result(&pool, h).unwrap();
     let (other_reservation, other_run) = fresh_result(&pool, h).unwrap();
@@ -453,7 +441,7 @@ fn scheduled_foreign_scope_and_borrowed_collector_reject_without_ops_or_second_c
         .prepare()
         .unwrap();
     let roots = RefCell::new(vec![]);
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let error =
         PreparedCaptureTensor::new(&source, at(shared.admission(), 0, CapturePhase::Prefill, 0))
             .unwrap()
@@ -486,7 +474,7 @@ fn scheduled_foreign_scope_and_borrowed_collector_reject_without_ops_or_second_c
         drop(error);
     }
     assert!(roots.borrow().is_empty());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert!(frame.take_tensor(0).is_err());
     assert!(frame.take_tensor(1).is_err());
     drop(frame);
@@ -500,7 +488,7 @@ fn scheduled_foreign_scope_and_borrowed_collector_reject_without_ops_or_second_c
         other_run,
         registration,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -517,7 +505,7 @@ fn scheduled_cast_evaluation_failure_and_unwind_keep_roots_and_exact_scope_quara
         let leaf = PreparedCaptureTensor::new(&source, host(shared.admission())).unwrap();
         let n = native_bound(&source, &leaf);
         let bytes = snapshot.allocation().unwrap().bytes() as u64;
-        let pool = WorkingMemoryPool::new(bytes + h + n, 0).unwrap();
+        let pool = parent_ledger(bytes + h + n, &source, 1).unwrap();
         let registered = register(&pool, &source);
         let (reservation, run) = fresh_result(&pool, h + n).unwrap();
         let mut native = run.scope().unwrap();
@@ -562,7 +550,10 @@ fn scheduled_cast_evaluation_failure_and_unwind_keep_roots_and_exact_scope_quara
         drop(frame);
         sibling.certify().unwrap();
         drop(registered);
-        assert_eq!(pool.used_bytes().unwrap(), bytes + h + n);
+        assert_eq!(
+            pool.fixture_host_charge().unwrap(),
+            bytes + source_controls(&source) + h + n
+        );
         assert_eq!(source.try_metadata_snapshot().unwrap(), snapshot);
         // Actual retained work is settled independently. Deliberately abandon
         // the exact scope afterward to verify conservative quarantine, even
@@ -570,7 +561,10 @@ fn scheduled_cast_evaluation_failure_and_unwind_keep_roots_and_exact_scope_quara
         settle(&roots);
         drop(native);
         drop((bank, reservation, run));
-        assert_eq!(pool.used_bytes().unwrap(), bytes + h + n);
+        assert_eq!(
+            pool.fixture_host_charge().unwrap(),
+            bytes + source_controls(&source) + h + n
+        );
         assert!(pool.acquire_unquoted().is_err());
     }
 }
@@ -587,7 +581,7 @@ fn scheduled_failed_finish_retains_borrowed_host_owner_until_explicit_retirement
     let leaf = PreparedCaptureTensor::new(&source, host(shared.admission())).unwrap();
     let n = native_bound(&source, &leaf);
     let bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-    let pool = WorkingMemoryPool::new(bytes + h + n, 0).unwrap();
+    let pool = parent_ledger(bytes + h + n, &source, 1).unwrap();
     let registered = register(&pool, &source);
     let (reservation, run) = fresh_result(&pool, h + n).unwrap();
     let mut native = run.scope().unwrap();
@@ -623,7 +617,10 @@ fn scheduled_failed_finish_retains_borrowed_host_owner_until_explicit_retirement
             .and_then(|e| e.downcast_ref::<WorkingMemoryError>()),
         Some(WorkingMemoryError::ExecutionFenced)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), bytes + h + n);
+    assert_eq!(
+        pool.fixture_host_charge().unwrap(),
+        bytes + source_controls(&source) + h + n
+    );
     sibling.certify().unwrap();
     // Retire the borrowed error before touching the exact native scope.
     drop(error);
@@ -631,7 +628,7 @@ fn scheduled_failed_finish_retains_borrowed_host_owner_until_explicit_retirement
     settle(&roots);
     native.certify().unwrap();
     drop((bank, reservation, registered));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -681,3 +678,7 @@ fn source_geometry_validation_accepts_lazy_metadata_without_settling_or_authoriz
         drop(leaf);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

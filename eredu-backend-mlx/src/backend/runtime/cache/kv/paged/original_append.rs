@@ -103,7 +103,7 @@ impl PagedKeyValueCache {
                         return Err(claim.error(CacheSourceError::Geometry));
                     }
                 }
-                manager.begin_original_append(claim, self.tail_bytes(), stream)?;
+                manager.begin_prepared_append(claim, self.tail_bytes(), stream)?;
                 run(self, claim, keys, values)
             },
         )
@@ -141,6 +141,7 @@ impl PagedKeyValueCache {
                 values,
                 stream,
                 original: Some(&mut *claim),
+                ordinary: None,
             },
             retain_for_attention,
         );
@@ -150,10 +151,10 @@ impl PagedKeyValueCache {
             self.tail_start = previous_start;
             self.offset = previous_offset;
             return Err(
-                match manager.rollback_original_append(claim, self.tail_bytes(), previous_offset) {
+                match manager.rollback_prepared_append(claim, self.tail_bytes(), previous_offset) {
                     Ok(()) => cause,
                     Err(rollback) => {
-                        CacheResidencyManager::original_append_rollback_error(cause, rollback)
+                        CacheResidencyManager::prepared_append_rollback_error(cause, rollback)
                     }
                 },
             );
@@ -187,7 +188,7 @@ impl PagedKeyValueCache {
         let end = id.end;
         if let Err(cause) = self
             .manager
-            .publish_original_tail(claim, 0, end, true, false)
+            .publish_prepared_tail(claim, 0, end, true, false)
         {
             self.tail_keys = Some(keys);
             self.tail_values = Some(values);
@@ -198,7 +199,7 @@ impl PagedKeyValueCache {
                 keys: keys.try_clone_handle()?,
                 values: values.try_clone_handle()?,
             };
-            self.manager.seal_original_block(claim, id, arrays, stream)
+            self.manager.seal_prepared_block(claim, id, arrays, stream)
         })();
         if let Err(cause) = result {
             self.tail_keys = Some(keys);
@@ -206,11 +207,11 @@ impl PagedKeyValueCache {
             return Err(
                 match self
                     .manager
-                    .publish_original_tail(claim, self.tail_bytes(), end, false, true)
+                    .publish_prepared_tail(claim, self.tail_bytes(), end, false, true)
                 {
                     Ok(()) => cause,
                     Err(rollback) => {
-                        CacheResidencyManager::original_append_rollback_error(cause, rollback)
+                        CacheResidencyManager::prepared_append_rollback_error(cause, rollback)
                     }
                 },
             );

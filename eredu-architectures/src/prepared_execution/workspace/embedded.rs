@@ -8,29 +8,8 @@ use eredu_runtime::{
 };
 use std::cell::RefCell;
 
-/// Actual observation source and logical prediction coordinate for one target
-/// invocation. This borrows the same observer/path contracts as ordinary text
-/// quoting; it grants neither a capture source nor native execution authority.
-/// The coordinate comes from the caller's actual invocation provenance, not its
-/// physical target-cache position or this equation's zero future-output count.
-pub struct EmbeddedTargetWorkspaceObservation<'a> {
-    paths: &'a SharedLayeredObservationPaths,
-    observer: &'a mut dyn InferenceWorkspaceObserver,
-    prediction: u64,
-}
-impl<'a> EmbeddedTargetWorkspaceObservation<'a> {
-    pub fn new(
-        paths: &'a SharedLayeredObservationPaths,
-        observer: &'a mut dyn InferenceWorkspaceObserver,
-        prediction: u64,
-    ) -> Self {
-        Self {
-            paths,
-            observer,
-            prediction,
-        }
-    }
-}
+/// Observation source for a selected embedded target invocation.
+pub type EmbeddedTargetWorkspaceObservation<'a> = observed::InvocationWorkspaceObservation<'a>;
 
 impl PreparedInferenceBlueprint {
     /// Traces one target prefill span, verification or target replay through the
@@ -38,6 +17,9 @@ impl PreparedInferenceBlueprint {
     /// The selected embedded source pairing is validated without constructing its
     /// prediction extension or changing its classification/placement. `state`
     /// must project the actual target at the descriptor's frontier into `context`.
+    /// A partitioned selection requires its retained communication source and
+    /// rank-local selected state geometry. Replicated selections require no
+    /// communication source. These descriptions grant no communication authority.
     ///
     /// Vocabulary demand comes from the descriptor. The actual target hidden
     /// capture is retained independently, including state-only prefill spans,
@@ -55,6 +37,7 @@ impl PreparedInferenceBlueprint {
         state: &ResidentState,
         context: &WorkspaceContext,
         parameters: Option<&dyn WorkspaceLayerwiseParameters>,
+        communication: Option<&eredu_runtime::RetainedCommunicationSource>,
         observation: Option<EmbeddedTargetWorkspaceObservation<'_>>,
         trace: &mut dyn InferenceEquationTraceObserver,
     ) -> Result<InferenceWorkspaceReport, PreparedExecutionError<Error>> {
@@ -62,6 +45,7 @@ impl PreparedInferenceBlueprint {
             std::mem::size_of::<EmbeddedInvocationWorkspace>(),
             std::mem::size_of::<Result<EmbeddedInvocationWorkspace, EmbeddedOccurrenceError>>(),
             std::mem::size_of::<Option<&dyn WorkspaceLayerwiseParameters>>(),
+            std::mem::size_of::<Option<&eredu_runtime::RetainedCommunicationSource>>(),
             std::mem::size_of::<Option<EmbeddedTargetWorkspaceObservation<'_>>>(),
             std::mem::size_of::<
                 Option<(
@@ -132,7 +116,10 @@ impl PreparedInferenceBlueprint {
                 .map_err(PreparedExecutionError::Backend)?;
         }
         let trace = RefCell::new(trace);
-        context.charge_metadata(std::mem::size_of::<RefCell<Option<OriginalMediaWorkspaceInput>>>())
+        context
+            .charge_metadata(std::mem::size_of::<
+                RefCell<Option<OriginalMediaWorkspaceInput>>,
+            >())
             .map_err(|cause| PreparedExecutionError::Metadata(cause.into()))?;
         let has_media = media.is_some();
         let media = RefCell::new(media);
@@ -147,7 +134,11 @@ impl PreparedInferenceBlueprint {
             Some(input_dtype),
             true,
             None,
-            has_media.then_some(MediaEquationRef { input: &media, intervals: None }),
+            has_media.then_some(MediaEquationRef {
+                input: &media,
+                intervals: None,
+            }),
+            communication,
         )
         .map(|(report, _)| report)
     }

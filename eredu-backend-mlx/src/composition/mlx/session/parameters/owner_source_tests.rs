@@ -10,18 +10,14 @@ fn displaced_source_borrows_real_maps_and_preserves_empty_and_unknown_states() {
     empty.evaluated().unwrap();
     let mut state = NativeParameterState::default();
     state.active = Some("descriptive-active-overlay".into());
-    state
-        .originals
-        .insert("old".into(), MlxTensor::from_array(value.clone()));
-    state
-        .originals
-        .insert("old-alias".into(), MlxTensor::from_array(value));
-    state
-        .published
-        .insert("empty".into(), MlxTensor::from_array(empty));
-    state
-        .published
-        .insert("lazy".into(), MlxTensor::from_array(lazy.clone()));
+    state.originals = fixture_rows([
+        ("old", MlxTensor::from_array(value.clone())),
+        ("old-alias", MlxTensor::from_array(value)),
+    ]);
+    state.published = fixture_rows([
+        ("empty", MlxTensor::from_array(empty)),
+        ("lazy", MlxTensor::from_array(lazy.clone())),
+    ]);
     let mut guard = safemlx::RuntimeCallDeadline::new(Duration::from_secs(5))
         .unwrap()
         .enter()
@@ -38,7 +34,7 @@ fn displaced_source_borrows_real_maps_and_preserves_empty_and_unknown_states() {
     assert_eq!(
         old.role(ParameterOwnerRole::DisplacedOriginal)
             .map_key_bytes,
-        "oldold-alias".len()
+        0
     );
     assert_eq!(
         old.role(ParameterOwnerRole::PublishedOverlay)

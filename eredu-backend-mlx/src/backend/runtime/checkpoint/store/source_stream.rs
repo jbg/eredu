@@ -1,8 +1,8 @@
 //! A new source stream's registration/CPU encoder through the existing account.
 //! Worker/TLS/event initialization is deliberately a separate requirement.
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     CpuStreamRegistrationLayout, PreparedCpuStream, RegisteredCpuStream, Stream,
@@ -24,7 +24,7 @@ impl SharedNativeInitializer for Initializer {
     type Error = ConstructorFailure;
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         let controls = [
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<PreparedMaterializationSourceStream>(),
             size_of::<MaterializationSourceStreamError>(),
             size_of::<Result<Self::Output, Self::Error>>(),
@@ -57,12 +57,14 @@ impl MaterializationSourceStreamError {
         match self.0 {
             Failure::Layout(error) | Failure::Native(error) => BackendFailure::from_error(error),
             Failure::Accounting(error) => BackendFailure::from_error(error),
-            Failure::Initialization(error) => BackendFailure::from_error(
-                error.into_parts().1.retire_output_and_map_error(|error| match error {
-                    ConstructorFailure::Preparation(error) => error.cause(),
-                    ConstructorFailure::Native(error) => error.cause(),
-                }),
-            ),
+            Failure::Initialization(error) => {
+                BackendFailure::from_error(error.into_parts().1.retire_output_and_map_error(
+                    |error| match error {
+                        ConstructorFailure::Preparation(error) => error.cause(),
+                        ConstructorFailure::Native(error) => error.cause(),
+                    },
+                ))
+            }
         }
     }
 }
@@ -97,12 +99,12 @@ impl PreparedMaterializationSourceStream {
     /// Module statics belong to the separately priced native-domain baseline.
     pub fn required_bytes() -> Result<u64, MaterializationSourceStreamError> {
         let plan = Self::initializer()?;
-        WorkingMemoryPool::shared_native_initialization_required_bytes(&plan)
+        MemoryLedger::shared_native_initialization_required_bytes(&plan)
             .map_err(|e| MaterializationSourceStreamError(Failure::Accounting(e)))
     }
     /// Cold explicit birth: qualification and source comparison precede the
     /// owner node, C wrapper and native registration. No worker fallback runs.
-    pub fn prepare(pool: &WorkingMemoryPool) -> Result<Self, MaterializationSourceStreamError> {
+    pub fn prepare(pool: &MemoryLedger) -> Result<Self, MaterializationSourceStreamError> {
         let plan = Self::initializer()?;
         pool.initialize_shared_native(plan)
             .map(Self)
@@ -117,7 +119,7 @@ impl PreparedMaterializationSourceStream {
     /// prepared materialization context. This is not submission authority.
     pub fn validate_pool(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), MaterializationSourceStreamError> {
         self.0
             .validate_pool(pool)

@@ -7,8 +7,8 @@ use eredu_runtime::{
         HostInputPart, HostInputPlanError, HostTensorValues, HostTensorView, PreparedHostInputPlan,
     },
     working_memory::{
-        OriginalPreparedHostInput, OriginalPreparedHostInputError,
-        PreparedSemanticSource, WorkingMemoryError,
+        OriginalPreparedHostInput, OriginalPreparedHostInputError, PreparedSemanticSource,
+        WorkingMemoryError,
     },
 };
 use std::{
@@ -44,13 +44,13 @@ fn failure<E: std::error::Error + Send + Sync + 'static>(
             cause,
             _funding: funding.clone(),
         },
-    ).with_operation("prepare original speculative prompt")
+    )
+    .with_operation("prepare original speculative prompt")
 }
 fn accounting_kind(cause: Option<&WorkingMemoryError>) -> BackendFailureKind {
     match cause {
         Some(
-            WorkingMemoryError::BudgetExceeded { .. }
-            | WorkingMemoryError::CapacityBelowUsage { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
             | WorkingMemoryError::Overflow,
         ) => BackendFailureKind::ResourceExhausted,
         Some(
@@ -114,11 +114,13 @@ pub(super) fn prepare(
         }
         .into_backend_failure()
     })?;
-    let pool = runtime.backend().memory_pool();
+    let pool = runtime.backend().memory_ledger();
     preparation
         .validate(pool, model.erased().inference_execution_identity())
         .map_err(|_| TokenInputRejection::IdentityMismatch.into_backend_failure())?;
-    let domain = preparation.tokenizer().generation_domain()
+    let domain = preparation
+        .tokenizer()
+        .generation_domain()
         .ok_or_else(|| TokenInputRejection::IdentityMismatch.into_backend_failure())?;
     let ids = input.tokens();
     if ids.iter().any(|&id| !domain.allows(id)) {

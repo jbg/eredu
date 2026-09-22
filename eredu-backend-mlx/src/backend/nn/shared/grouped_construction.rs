@@ -5,7 +5,7 @@ use super::parameters::{
 };
 use super::*;
 use crate::backend::nn::grouped::ParameterFactory;
-use eredu_nn::{Parameter, workspace::HostMetadataFunding};
+use eredu_nn::{workspace::HostMetadataFunding, Parameter};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Clone, Copy)]
@@ -80,6 +80,24 @@ impl<'stream, 'names> Constructor<'stream, 'names> {
         }
         let funding = values.funding().clone();
         Ok(Self::Prepared { values, funding })
+    }
+    /// Recursive copies made by the same declared physical parameter rows.
+    pub fn parameter_metadata_bytes(
+        source: &ParameterSpec,
+        weight: Option<&ParameterSpec>,
+    ) -> Option<usize> {
+        match weight {
+            Some(weight) => HostMetadataFunding::parameter_companion_clone_bytes(weight, source),
+            None => HostMetadataFunding::parameter_spec_clone_bytes(source),
+        }
+    }
+    pub fn named_metadata_bytes<T>(rows: &[Option<Declaration<'_>>]) -> Option<usize> {
+        let count = rows.iter().flatten().count();
+        rows.iter().flatten().try_fold(
+            Self::control_bytes::<T>(count)?
+                .checked_add(NativeParameterTable::control_bytes(count)?)?,
+            |bytes, row| bytes.checked_add(Self::parameter_metadata_bytes(row.source, row.weight)?),
+        )
     }
     pub fn clone_parameter(
         &self,
@@ -158,3 +176,146 @@ impl ParameterFactory for Constructor<'_, '_> {
 }
 
 use eredu_nn::workspace::ParameterMetadataAllocation;
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+    use eredu_nn::GroupedLinearSpec;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[derive(Debug)]
+    struct Owner(Arc<AtomicBool>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    fn exact_constructor<T>(
+        bytes: usize,
+        rows: Vec<(&'static str, Array)>,
+        build: impl FnOnce(&HostMetadataFunding, PreparedCompactBindings<'_>) -> Result<T, ComputeError>,
+    ) {
+        let retired = Arc::new(AtomicBool::new(false));
+        let funding = HostMetadataFunding::from_prepaid(
+            HostMetadataFunding::prepaid_control_bytes().unwrap()
+                + bytes
+                + PreparedCompactBindings::layout_bytes(rows.len()).unwrap(),
+            eredu_core::HostPreparationAuthority::retain(Owner(retired.clone())),
+        )
+        .unwrap();
+        let mut bindings = PreparedCompactBindings::new(rows.len(), &funding).unwrap();
+        for (name, array) in rows {
+            bindings.push(name, array).unwrap();
+        }
+        let model = build(&funding, bindings).unwrap();
+        assert!(
+            funding.reserve_metadata(1).is_err(),
+            "constructor consumed its exact quotation"
+        );
+        drop(funding);
+        assert!(
+            !retired.load(Ordering::SeqCst),
+            "constructed owner retains its payer"
+        );
+        drop(model);
+        assert!(retired.load(Ordering::SeqCst));
+    }
+    fn projection(name: &str, bias: bool) -> eredu_nn::GroupedProjectionSpec {
+        eredu_nn::GroupedProjectionSpec::new(
+            ParameterSpec::trainable(name).unwrap(),
+            bias.then(|| ParameterSpec::trainable(format!("{name}_bias")).unwrap()),
+            eredu_nn::LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap(),
+        )
+        .unwrap()
+    }
+    fn array(shape: &[i32]) -> Array {
+        let count: usize = shape.iter().map(|&n| usize::try_from(n).unwrap()).product();
+        let values: Vec<_> = (0..count).map(|n| (n as f32 + 1.0) / 16.0).collect();
+        Array::from_slice(&values, shape)
+    }
+    #[test]
+    fn compact_constructor_quotes_cover_exact_metadata_and_retained_payers() {
+        let linear = GroupedLinearSpec::new(
+            2,
+            2,
+            3,
+            eredu_nn::GroupedLinearActivation::Identity,
+            projection("weight", true),
+        )
+        .unwrap();
+        let bytes = HostMetadataFunding::grouped_linear_clone_bytes(&linear).unwrap()
+            + MlxNeuralBackend::grouped_linear_construction_bytes(&linear).unwrap();
+        exact_constructor(
+            bytes,
+            vec![
+                ("weight", array(&[2, 3, 2])),
+                ("weight_bias", array(&[2, 3])),
+            ],
+            |funding, bindings| {
+                MlxNeuralBackend::grouped_linear_from_bindings(
+                    funding.clone_grouped_linear(&linear)?,
+                    bindings,
+                )
+            },
+        );
+
+        let gated = GroupedGatedProductSpec::new(
+            2,
+            2,
+            3,
+            2,
+            eredu_nn::GatedProductPolicy::ordinary_silu(),
+            eredu_nn::GatedProductGroupLayout::Packed {
+                gate_up: projection("read", true),
+                down: projection("write", true),
+            },
+        )
+        .unwrap();
+        let bytes = HostMetadataFunding::grouped_gated_product_clone_bytes(&gated).unwrap()
+            + MlxNeuralBackend::grouped_gated_product_construction_bytes(&gated)
+                .unwrap()
+                .unwrap();
+        exact_constructor(
+            bytes,
+            vec![
+                ("down_proj", array(&[2, 2, 3])),
+                ("down_proj_bias", array(&[2, 2])),
+                ("gate_up_proj", array(&[2, 6, 2])),
+                ("gate_up_proj_bias", array(&[2, 6])),
+            ],
+            |funding, bindings| {
+                MlxNeuralBackend::grouped_gated_product_from_bindings(
+                    funding.clone_grouped_gated_product(&gated)?,
+                    bindings,
+                )
+            },
+        );
+
+        let relu = GroupedRelu2Spec::new(
+            2,
+            2,
+            3,
+            projection("read", false),
+            projection("write", false),
+        )
+        .unwrap();
+        let bytes = HostMetadataFunding::grouped_relu2_clone_bytes(&relu).unwrap()
+            + MlxNeuralBackend::grouped_relu2_construction_bytes(&relu).unwrap();
+        exact_constructor(
+            bytes,
+            vec![
+                ("down_proj", array(&[2, 2, 3])),
+                ("up_proj", array(&[2, 3, 2])),
+            ],
+            |funding, bindings| {
+                MlxNeuralBackend::grouped_relu2_from_bindings(
+                    funding.clone_grouped_relu2(&relu)?,
+                    bindings,
+                )
+            },
+        );
+    }
+}

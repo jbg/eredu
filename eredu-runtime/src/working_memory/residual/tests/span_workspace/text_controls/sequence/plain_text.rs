@@ -40,7 +40,8 @@ fn actual_plain_source_admission_and_borrowed_stop_output_share_all_three_routes
             let equal_foreign = self::source(5, &[" é"]);
             let changed_stops = self::source(5, &["hello"]);
             let options = capture.then(|| TextPreparationOptions {
-                interventions: None, capture: Some(capture_source_for_geometry(InferenceGeometry {
+                interventions: None,
+                capture: Some(capture_source_for_geometry(InferenceGeometry {
                     max_output_tokens: 5,
                     ..geometry()
                 })),
@@ -93,15 +94,15 @@ fn actual_plain_source_admission_and_borrowed_stop_output_share_all_three_routes
             let (pool, held) = retire_request(&state);
             drop(runtime);
             drop((source, equal_foreign, changed_stops));
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             let tokens = sequence.into_token_ids();
             assert_eq!(tokens.as_ptr(), address);
             let mut iterator = tokens.clone().into_iter();
             drop(tokens);
             assert_eq!(iterator.next(), Some(0));
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(iterator);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -116,7 +117,7 @@ fn original_stop_extents_have_exact_admission_delta_and_minus_one_rejects_before
         drop(sequence);
         let (pool, _) = retire_request(&state);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     // Four more immutable UTF-8 bytes and four more proper-prefix work bytes;
     // one same-shape index entry and every named control are unchanged.
@@ -130,7 +131,7 @@ fn original_stop_extents_have_exact_admission_delta_and_minus_one_rejects_before
     let error = extract_decoder(&mut runtime, 0, 5, &input, &consumer(), None).unwrap_err();
     assert_eq!(state.borrow().order, ["admit"]);
     assert_eq!(state.borrow().votes, [(Stage::Admission, Status::Failed)]);
-    assert_eq!(state.borrow().pool.used_bytes().unwrap(), 64);
+    assert_eq!(state.borrow().pool.payload_used_bytes().unwrap(), 64);
     drop(error);
     state.borrow_mut().mode.short = false;
     let replay = extract_decoder(&mut runtime, 0, 5, &input, &consumer(), None).unwrap_err();
@@ -156,7 +157,7 @@ fn original_stop_extents_have_exact_admission_delta_and_minus_one_rejects_before
     drop(sequence);
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn foreign_combined_source_stays_cold_and_original_error_retains_only_its_own_bank() {
@@ -185,10 +186,10 @@ fn foreign_combined_source_stays_cold_and_original_error_retains_only_its_own_ba
     let (new_pool, _) = retire_request(&new);
     drop(second);
     drop((a, b));
-    assert_eq!(new_pool.used_bytes().unwrap(), 0);
-    assert_eq!(old_pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(new_pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(old_pool.payload_used_bytes().unwrap(), held + 64);
     drop(error);
-    assert_eq!(old_pool.used_bytes().unwrap(), 0);
+    assert_eq!(old_pool.payload_used_bytes().unwrap(), 0);
     drop(initial);
 }
 #[test]
@@ -206,12 +207,12 @@ fn original_plain_dormant_cancel_and_failed_preparation_keep_consuming_custody()
         let (pool, held) = retire_request(&state);
         drop(runtime);
         drop(input);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         let tokens = sequence.into_token_ids();
         assert!(tokens.is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         drop(tokens);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     let (mut runtime, state) = runtime(Mode {
         explicit_source: true,
@@ -232,9 +233,9 @@ fn original_plain_dormant_cancel_and_failed_preparation_keep_consuming_custody()
     drop(input);
     let error = sequence.prepare_storage().unwrap_err();
     assert!(error.cause().source().unwrap().is::<WorkingMemoryError>());
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     let error = error.into_sequence().prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

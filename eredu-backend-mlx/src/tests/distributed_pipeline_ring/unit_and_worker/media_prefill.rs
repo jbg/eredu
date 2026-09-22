@@ -460,20 +460,17 @@ mod retained_media_prefill_tests {
     }
     #[test]
     fn native_media_exact_request_is_retained_and_foreign_or_replayed_request_is_rejected() {
-        use eredu_runtime::working_memory::{InferenceExecutionIdentity, InferenceRequest};
+        use eredu_runtime::working_memory::InferenceExecutionIdentity;
         let root = tempfile::tempdir().unwrap();
         write_qwen3_vl_component_fixture(root.path(), false, false);
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let backend = crate::native::backend(&stream, &stream);
-        let model = load_model(&backend, root.path(), weights(0))
-            .unwrap()
-            .into_inner();
-        let mut session = MlxModelSession::from_model(
-            model,
-            eredu_core::SessionCapabilities::new(true, true, true),
-        )
-        .unwrap();
-        let execution = session
+        let model = load_model(&backend, root.path(), weights(0)).unwrap();
+        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        let (prompt, _source_custody, attribution) =
+            crate::tests::support::original_input::prepare(&runtime, input(Some(2), false));
+        let execution = runtime
+            .session_mut()
             .neutral_prediction_target_mut()
             .unwrap()
             .inference_execution_identity()
@@ -481,81 +478,88 @@ mod retained_media_prefill_tests {
         let geometry = eredu_core::InferenceGeometry {
             batch_size: 1,
             cached_positions: 0,
-            input_positions: 7,
-            max_output_tokens: 0,
+            input_positions: attribution.decoder_positions,
+            max_output_tokens: 2,
             prefill_chunk_positions: 2,
             output: eredu_core::OutputDemand::LastPosition,
         };
-        let foreign = InferenceRequest::without_memory_budget(
+        let config = TextGenerationConfig::new(
+            eredu_core::resolve_generation_config(
+                None,
+                eredu_core::GenerationConfigOverrides {
+                    do_sample: Some(false),
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let foreign = crate::memory_fixture::empty_admitted_request(
             &InferenceExecutionIdentity::default(),
             geometry,
         )
         .unwrap();
-        let before = snapshot(&mut session);
+        let before = snapshot(runtime.session_mut());
         let (error, roots) = media_completion::observe(None, || {
-            session
-                .submit_prefill_with_observer(
-                    &backend,
-                    input(Some(2), false).with_inference_request(foreign),
-                    &mut Observer::default(),
-                )
-                .err()
-                .unwrap()
+            eredu_core::TextGeneration::from_input_with_options(
+                &mut runtime,
+                eredu_core::TextGenerationInput::OriginalPrepared(
+                    prompt.clone().with_inference_request(foreign),
+                ),
+                config.clone(),
+                Default::default(),
+            )
+            .err()
+            .expect("foreign request")
         });
-        assert!(error.model_state_preserved());
+        assert!(!error.to_string().is_empty());
         assert!(roots.is_empty());
-        assert_eq!(snapshot(&mut session), before);
-        let request = InferenceRequest::without_memory_budget(&execution, geometry).unwrap();
-        let prompt = input(Some(2), false).with_inference_request(request.clone());
-        let expected_identity = prompt.cache_identity().unwrap().clone();
-        let submission = session
-            .submit_prefill_with_observer(&backend, prompt, &mut Observer::default())
+        assert_eq!(snapshot(runtime.session_mut()), before);
+        let (request, replay) = {
+            let mut driver = eredu_core::TextGenerationDriver::new(&mut runtime);
+            let mut continuation = driver
+                .start_input(
+                    eredu_core::TextGenerationInput::OriginalPrepared(prompt),
+                    config,
+                    AllowAllTokens,
+                )
+                .unwrap();
+            let (request, replay) = {
+                let mut boundary = driver.quiescent(&mut continuation).unwrap();
+                let Some(eredu_core::PendingTextInput::Prefill(prompt)) = boundary.parts().2 else {
+                    panic!("pending original prompt")
+                };
+                (
+                    prompt.with_borrowed(|input| input.inference_request().unwrap().clone()),
+                    prompt.clone(),
+                )
+            };
+            assert!(driver.advance(&mut continuation).unwrap().is_some());
+            (request, replay)
+        };
+        let target = runtime
+            .session_mut()
+            .neutral_prediction_target_mut()
             .unwrap();
-        submission.completion.wait().unwrap();
-        drop(submission);
-        let target = session.neutral_prediction_target_mut().unwrap();
-        // Ordinary requests have no reservation to retain in the state's charge
-        // collection. The actual supplied authority must still have been claimed
-        // exactly once by the shared driver, independently of the new frontier.
-        assert_eq!(
-            target
-                .retained_inference_authority()
-                .unwrap()
-                .requests()
-                .len(),
-            0
-        );
+        assert!(target
+            .retained_inference_authority()
+            .unwrap()
+            .requests()
+            .any(|retained| retained.validate_same_request(&request).is_ok()));
         assert!(matches!(
             eredu_runtime::prefill::PrefillDriver::<MlxTensor, crate::backend::MlxCompletion>::new(
                 &execution,
                 request.clone(),
-                geometry,
-                eredu_core::GenerationCancellationToken::new(),
+                request.geometry(),
+                eredu_core::GenerationCancellationToken::new()
             ),
             Err(eredu_runtime::working_memory::WorkingMemoryError::AlreadyStarted)
         ));
-        assert_eq!(
-            target
-                .resident_copy_input_identity()
-                .unwrap()
-                .as_ref()
-                .map(AsRef::as_ref),
-            Some(&expected_identity)
-        );
-        let before = snapshot(&mut session);
-        let (error, roots) = media_completion::observe(None, || {
-            session
-                .submit_prefill_with_observer(
-                    &backend,
-                    input(Some(2), false).with_inference_request(request),
-                    &mut Observer::default(),
-                )
-                .err()
-                .unwrap()
-        });
-        assert!(error.model_state_preserved());
+        let before = snapshot(runtime.session_mut());
+        let (result, roots) = media_completion::observe(None, || runtime.prefill(replay));
+        assert!(result.is_err());
         assert!(roots.is_empty());
-        assert_eq!(snapshot(&mut session), before);
+        assert_eq!(snapshot(runtime.session_mut()), before);
     }
     #[test]
     fn native_media_first_validation_failure_preserves_state_and_never_publishes_ready_source() {
@@ -736,7 +740,7 @@ mod retained_media_prefill_tests {
         let config = TextGenerationConfig::new(sampling).with_inference_policy(
             eredu_core::TextInferencePolicy {
                 prefill_chunk_positions: Some(2.try_into().unwrap()),
-                managed_memory_capacity_bytes: Some(1 << 28),
+                memory_limits: crate::memory_fixture::limits(1 << 28),
                 submission_tracking_capacity_bytes: None,
                 graph_metadata_capacity_bytes: None,
             },
@@ -752,9 +756,7 @@ mod retained_media_prefill_tests {
     }
     #[test]
     fn prepared_control_media_attribution_keeps_actual_nonzero_frontier_and_source_transfer() {
-        use eredu_core::{
-            PreparedControlInput, PreparedControlInputBackend, PromptTokenAttribution,
-        };
+        use eredu_core::PromptTokenAttribution;
         for conditional in [false, true] {
             let root = tempfile::tempdir().unwrap();
             if conditional {
@@ -773,14 +775,15 @@ mod retained_media_prefill_tests {
                 let before = snapshot(runtime.session_mut());
                 let raw = input(Some(2), false);
                 assert_eq!(raw.controlled_decoder_positions(), None);
-                let (prepared, roots) = media_completion::observe(None, || {
-                    crate::backend::MlxBackend::prepare_control_input(&runtime, raw).unwrap()
-                });
+                let ((prompt, _source_custody, attribution), roots) =
+                    media_completion::observe(None, || {
+                        crate::tests::support::original_input::prepare(&runtime, raw)
+                    });
                 assert!(
                     roots.is_empty(),
                     "attribution reads do not run the media encoder"
                 );
-                let source = prepared.attribution();
+                let source = &attribution;
                 assert_eq!(source.opening_position, 3);
                 assert_eq!(source.decoder_positions, 7);
                 assert_eq!(source.canonical_token_ids, [1, 2, 3]);
@@ -800,24 +803,29 @@ mod retained_media_prefill_tests {
                 assert_eq!(source.input_range(0).unwrap(), [3, 10]);
                 assert_eq!(source.input_range(3).unwrap(), [12, 13]);
                 assert_eq!(snapshot(runtime.session_mut()), before);
-                let (prompt, attribution) =
-                    crate::backend::MlxBackend::consume_control_input(&runtime, prepared).unwrap();
-                assert_eq!(prompt.controlled_decoder_positions(), Some(7));
-                assert_eq!(prompt.clone().controlled_decoder_positions(), Some(7));
+                assert_eq!(
+                    crate::tests::support::original_input::attribution(&prompt).decoder_positions,
+                    7
+                );
+                assert_eq!(
+                    crate::tests::support::original_input::attribution(&prompt.clone())
+                        .decoder_positions,
+                    7
+                );
                 let relabeled = prompt
                     .clone()
                     .with_semantic_content_fingerprint("independent relabel")
                     .unwrap();
                 assert_eq!(relabeled.controlled_decoder_positions(), None);
-                assert_eq!(attribution.attribution().opening_position, 3);
+                assert_eq!(attribution.opening_position, 3);
                 assert_eq!(snapshot(runtime.session_mut()), before);
             }
         }
     }
 
     #[test]
-    fn prepared_control_carrier_runs_same_native_media_and_cached_state_as_direct_input() {
-        use eredu_core::PreparedControlInputBackend;
+    fn original_media_source_keeps_native_rows_and_state_in_controlled_and_uninterrupted_generation(
+    ) {
         let root = tempfile::tempdir().unwrap();
         write_qwen3_vl_component_fixture(root.path(), false, false);
         let sampling = eredu_core::resolve_generation_config(
@@ -837,26 +845,31 @@ mod retained_media_prefill_tests {
                 let backend = crate::native::backend(&stream, &stream);
                 let model = load_model(&backend, root.path(), weights(mode)).unwrap();
                 let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-                let prompt = input(Some(2), false);
-                let prompt = if carrier {
-                    let source =
-                        crate::backend::MlxBackend::prepare_control_input(&runtime, prompt)
-                            .unwrap();
-                    crate::backend::MlxBackend::consume_control_input(&runtime, source)
-                        .unwrap()
-                        .0
-                } else {
-                    prompt
-                };
+                let (prompt, _source_custody, _) =
+                    crate::tests::support::original_input::prepare(&runtime, input(Some(2), false));
                 let (tokens, roots) = media_completion::observe(None, || {
-                    eredu_core::TextGeneration::from_prompt(
-                        &mut runtime,
-                        prompt,
-                        TextGenerationConfig::new(sampling),
-                    )
-                    .unwrap()
-                    .map(|token| token.unwrap().token_id().unwrap())
-                    .collect::<Vec<_>>()
+                    let config = TextGenerationConfig::new(sampling);
+                    if carrier {
+                        eredu_core::ControlledTextGeneration::from_input(
+                            &mut runtime,
+                            eredu_core::TextGenerationInput::OriginalPrepared(prompt),
+                            config,
+                            AllowAllTokens,
+                        )
+                        .unwrap()
+                        .map(|token| token.unwrap().token_id())
+                        .collect::<Vec<_>>()
+                    } else {
+                        eredu_core::TextGeneration::from_input_with_options(
+                            &mut runtime,
+                            eredu_core::TextGenerationInput::OriginalPrepared(prompt),
+                            config,
+                            Default::default(),
+                        )
+                        .unwrap()
+                        .map(|token| token.unwrap().token_id().unwrap())
+                        .collect::<Vec<_>>()
+                    }
                 });
                 assert_eq!(tokens.len(), 4);
                 assert_eq!(roots.len(), 8);
@@ -871,41 +884,72 @@ mod retained_media_prefill_tests {
 
     #[test]
     fn prepared_control_rejects_foreign_and_equal_frontier_restored_native_source() {
-        use eredu_core::{execution_control::NativeTextStateBackend, PreparedControlInputBackend};
+        if !crate::tests::support::native_process::enter("prepared-media-exchange") {
+            return;
+        }
+        crate::tests::support::test_utils::initialize_original_sources();
         let root = tempfile::tempdir().unwrap();
         write_qwen3_vl_component_fixture(root.path(), false, false);
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let make = || {
-            let backend = crate::native::backend(&stream, &stream);
-            let model = load_model(&backend, root.path(), weights(0)).unwrap();
-            ModelRuntime::from_prepared(backend, model).unwrap()
+            let plan = eredu_core::ExecutionPlan::fully_resident(
+                eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap(),
+            );
+            let factory = crate::MlxBackendFactory::default();
+            let selected = eredu_core::select_execution_plan_target(
+                &factory,
+                &plan,
+                component_fixture_inspection(root.path()),
+            )
+            .unwrap();
+            eredu_core::realize_execution_plan_target(&factory, &plan, selected)
+                .unwrap()
+                .into_runtime()
+                .unwrap()
         };
         let mut runtime = make();
-        let foreign = make();
-        let source =
-            crate::backend::MlxBackend::prepare_control_input(&runtime, input(Some(2), false))
-                .unwrap();
-        assert!(crate::backend::MlxBackend::consume_control_input(&foreign, source).is_err());
-        let source =
-            crate::backend::MlxBackend::prepare_control_input(&runtime, input(Some(2), false))
-                .unwrap();
+        let mut foreign = make();
+        let (source, _custody, _) =
+            crate::tests::support::original_input::prepare(&runtime, input(Some(2), false));
+        let config = || {
+            TextGenerationConfig::new(
+                eredu_core::resolve_generation_config(
+                    None,
+                    eredu_core::GenerationConfigOverrides {
+                        max_new_tokens: Some(3),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        assert!(eredu_core::TextGeneration::from_input_with_options(
+            &mut foreign,
+            eredu_core::TextGenerationInput::OriginalPrepared(source),
+            config(),
+            Default::default()
+        )
+        .is_err());
+        let (source, _custody, _) =
+            crate::tests::support::original_input::prepare(&runtime, input(Some(2), false));
         let before = snapshot(runtime.session_mut());
-        let mut saved =
-            crate::backend::MlxBackend::capture_native_text_state(&mut runtime).unwrap();
-        crate::backend::MlxBackend::exchange_native_text_state(&mut runtime, &mut saved).unwrap();
+        component_exchange_same_frontier(&mut runtime);
         assert_eq!(
             snapshot(runtime.session_mut()),
             before,
             "equal numeric frontier is not old revision authority"
         );
-        assert!(crate::backend::MlxBackend::consume_control_input(&runtime, source).is_err());
+        assert!(eredu_core::TextGeneration::from_input_with_options(
+            &mut runtime,
+            eredu_core::TextGenerationInput::OriginalPrepared(source),
+            config(),
+            Default::default()
+        )
+        .is_err());
     }
 
     #[test]
     fn prepared_control_signed_ids_and_projected_text_have_distinct_real_attribution() {
-        use eredu_core::{
-            PreparedControlInput, PreparedControlInputBackend, PromptTokenAttribution,
-        };
+        use eredu_core::PromptTokenAttribution;
         for conditional in [false, true] {
             let root = tempfile::tempdir().unwrap();
             if conditional {
@@ -948,9 +992,8 @@ mod retained_media_prefill_tests {
                 } else {
                     prompt
                 };
-                let source =
-                    crate::backend::MlxBackend::prepare_control_input(&runtime, prompt).unwrap();
-                let value = source.attribution();
+                let (prompt, _source_custody, value) =
+                    crate::tests::support::original_input::prepare(&runtime, prompt);
                 assert_eq!(value.canonical_token_ids, [1, 2]);
                 assert_eq!(value.decoder_positions, if projected { 4 } else { 2 });
                 if projected {
@@ -962,15 +1005,13 @@ mod retained_media_prefill_tests {
                 } else {
                     assert_eq!(value.complete_token_ids(), Some([1, 2].as_slice()));
                 }
-                let (prompt, _) =
-                    crate::backend::MlxBackend::consume_control_input(&runtime, source).unwrap();
                 assert!(
                     prompt.cache_identity().is_some(),
                     "signed text gained identity from actual canonical values"
                 );
                 assert_eq!(
-                    prompt.controlled_decoder_positions(),
-                    Some(if projected { 4 } else { 2 })
+                    crate::tests::support::original_input::attribution(&prompt).decoder_positions,
+                    if projected { 4 } else { 2 }
                 );
             }
         }

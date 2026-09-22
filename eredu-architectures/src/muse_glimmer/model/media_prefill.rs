@@ -1,18 +1,30 @@
-//! Muse's normalized raster-media cut and ordinary one-dimensional decoder spans.
+//! Authenticated Muse raster-media roots and exact decoder spans.
 use super::*;
 use eredu_runtime::media_prefill::{MediaIngressError, PrefillIngressArchitecture};
 use eredu_runtime::{PreparedInputInspector, PreparedModelInput, SharedPreparedInputCacheIdentity};
 
-/// One admitted ordered Muse input, retained without replacing its placeholders.
+/// Actual family admission and original ordered semantic input.
 pub struct MediaPrefillPlan<T> {
-    prepared: PreparedModelInput<T>,
-    admitted: crate::media_plan::AdmittedCompositeInput<MuseGlimmerInputPartPlan>,
+    prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
+    admitted: Option<crate::media_plan::AdmittedCompositeInput<MuseGlimmerInputPartPlan>>,
+    original: Option<crate::media_plan::BoundPreparedMediaSemantics>,
+    workspace: Option<(
+        eredu_runtime::input::OriginalPreparedInputProjection,
+        eredu_runtime::input::OriginalPreparedWorkspaceSource,
+        Option<eredu_runtime::working_memory::WorkingMemoryUnquotedLease>,
+    )>,
     geometry: eredu_core::InferenceGeometry,
     fingerprint: String,
     identity: Option<SharedPreparedInputCacheIdentity>,
+    // All source and native/metadata payload owners retire before their funding.
+    _workspace_funding: (
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+        Option<eredu_nn::workspace::HostMetadataFunding>,
+    ),
+    metadata: Option<eredu_nn::workspace::WorkspaceContext>,
 }
 impl<T: Tensor> MediaPrefillPlan<T> {
-    /// Uses the existing Muse image/video admission and exact decoder extent.
+    /// Applies unchanged Muse admission, including independent optional roots.
     pub fn prepare(
         args: &DecoderConfig,
         prepared: PreparedModelInput<T>,
@@ -22,40 +34,99 @@ impl<T: Tensor> MediaPrefillPlan<T> {
         geometry.validate().map_err(Error::backend)?;
         let admitted = crate::media_plan::admit_muse_glimmer_input(args, &prepared, inspector)
             .map_err(Error::backend)?;
+        Self::prepare_admitted(args, prepared, admitted, geometry)
+    }
+    pub fn prepare_admitted(
+        args: &DecoderConfig,
+        prepared: PreparedModelInput<T>,
+        admitted: crate::media_plan::AdmittedCompositeInput<MuseGlimmerInputPartPlan>,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self, Error> {
+        geometry.validate().map_err(Error::backend)?;
+        PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::backend)?;
         if admitted.decoder_shape() != [geometry.batch_size, geometry.input_positions]
             || geometry.batch_size != 1
-            || !admitted
-                .parts()
-                .iter()
-                .any(|part| matches!(part, MuseGlimmerInputPartPlan::Vision { .. }))
         {
             return Err(Error::backend(
-                "Muse retained media geometry differs from actual raw-media admission",
+                "Muse retained source geometry differs from admission",
             ));
         }
         Ok(Self {
-            prepared,
-            admitted,
+            prepared: prepared.into(),
+            admitted: Some(admitted),
+            original: None,
+            workspace: None,
             geometry,
             fingerprint: args.architecture_fingerprint(),
             identity: None,
+            _workspace_funding: (None, None),
+            metadata: None,
         })
     }
-    /// Associates the existing exact whole-input identity; no new source proof.
+    fn input(&self) -> Result<PreparedCompositeInput<'_, T, MuseGlimmerInputPartPlan>, String> {
+        self.input_with_diagnostic(str::to_owned)
+    }
+    fn input_with_diagnostic<E>(
+        &self,
+        diagnostic: impl FnOnce(&'static str) -> E,
+    ) -> Result<PreparedCompositeInput<'_, T, MuseGlimmerInputPartPlan>, E> {
+        let input = match (&self.admitted, &self.original) {
+            (Some(admitted), None) => {
+                PreparedCompositeInput::new_with_diagnostic(&self.prepared, admitted, diagnostic)
+            }
+            (None, Some(original)) => PreparedCompositeInput::from_original_with_diagnostic(
+                &self.prepared,
+                original,
+                diagnostic,
+            ),
+            _ => unreachable!("closed Muse semantic plan"),
+        }?;
+        Ok(input.with_metadata_loan(self.metadata.as_ref()))
+    }
+    fn from_original(
+        prepared: eredu_runtime::input::PreparedModelInputOwner<T>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self, eredu_runtime::working_memory::OriginalCompositeSemanticStorageError> {
+        if !original.is_muse()
+            || geometry.batch_size != 1
+            || geometry.cached_positions != 0
+            || geometry.input_positions != original.decoder_positions() as u64
+            || prepared.len() != original.records().len()
+            || geometry.validate_fixed().is_err()
+        {
+            return Err(
+                original.reject(crate::media_plan::MediaSemanticError::input(
+                    "compiled Muse media source geometry mismatch",
+                )),
+            );
+        }
+        Ok(Self {
+            prepared,
+            admitted: None,
+            original: Some(original),
+            workspace: None,
+            geometry,
+            fingerprint: String::new(),
+            identity: None,
+            _workspace_funding: (None, None),
+            metadata: None,
+        })
+    }
+    /// Associates the existing original whole-input identity.
     pub fn with_shared_cache_identity(
         mut self,
         identity: SharedPreparedInputCacheIdentity,
     ) -> Result<Self, Error> {
         if identity.prepared() != self.prepared.identity() {
             return Err(Error::backend(
-                "Muse cache identity differs from original prepared input",
+                "Muse cache identity differs from prepared input",
             ));
         }
         self.identity = Some(identity);
         Ok(self)
     }
 }
-
 /// Complete normalized projected image/video rows plus original semantic tokens.
 pub struct MediaIngress<T> {
     pending: PreparedCompositeIngress<T>,
@@ -73,33 +144,70 @@ where
     fn ingress_geometry(plan: &Self::IngressPlan) -> eredu_core::InferenceGeometry {
         plan.geometry
     }
+    fn ingress_session_binding(
+        plan: &Self::IngressPlan,
+    ) -> Option<&eredu_runtime::working_memory::MediaSessionBinding> {
+        plan.original.as_ref().map(|original| original.binding())
+    }
     fn ingress_cache_identity(
         plan: &Self::IngressPlan,
     ) -> Option<SharedPreparedInputCacheIdentity> {
         plan.identity.clone()
     }
-    fn ingress_execution_graph(&self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>)
-        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+    fn ingress_execution_graph(
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, Option<&eredu_nn::workspace::WorkspaceContext>, eredu_runtime::ArchitectureExecutionGraph<'_>)>()?;
-        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(&self.execution_graph))
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            eredu_runtime::ArchitectureExecutionGraph<'_>,
+        )>()?;
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
+            &self.execution_graph,
+        ))
     }
-    fn validate_ingress_plan(&self, plan: &Self::IngressPlan, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(), Error> {
+    fn validate_ingress_plan(
+        &self,
+        plan: &Self::IngressPlan,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(), Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, &Self::IngressPlan, Option<&eredu_nn::workspace::WorkspaceContext>,
-            PreparedCompositeInput<'_, B::Tensor, MuseGlimmerInputPartPlan>, String)>()?;
-        let identity_metadata = crate::decoder::identity::Metadata::new(metadata_context);
-        let fingerprint = match metadata_context { Some(context) => self.args.architecture_fingerprint_with_metadata(context)?, None => self.args.architecture_fingerprint() };
-        if fingerprint != plan.fingerprint {
-            return Err(metadata.error(format_args!("Muse media source belongs to another architecture")));
+        metadata.controls::<(
+            &Self,
+            &Self::IngressPlan,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            PreparedCompositeInput<'_, B::Tensor, MuseGlimmerInputPartPlan>,
+            String,
+        )>()?;
+        if let Some(original) = &plan.original {
+            if !original.is_muse() {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+        } else {
+            let fingerprint = match metadata_context {
+                Some(context) => self.args.architecture_fingerprint_with_metadata(context)?,
+                None => self.args.architecture_fingerprint(),
+            };
+            if fingerprint != plan.fingerprint {
+                return Err(metadata.error(format_args!(
+                    "Muse media source belongs to another architecture"
+                )));
+            }
         }
-        PreparedCompositeInput::new_with_diagnostic(&plan.prepared, &plan.admitted,
-            |message| metadata.error(format_args!("{message}")))?;
+        plan.input_with_diagnostic(|message| metadata.error(format_args!("{message}")))?;
         Ok(())
     }
-    fn ingress_error(error: MediaIngressError, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Error {
+    fn ingress_error(
+        error: MediaIngressError,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Error {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        if let Err(refusal) = metadata.controls::<(MediaIngressError, Option<&eredu_nn::workspace::WorkspaceContext>)>() {
+        if let Err(refusal) = metadata.controls::<(
+            MediaIngressError,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>() {
             return refusal;
         }
         metadata.source(error)
@@ -111,20 +219,26 @@ where
         _parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(plan.metadata.as_ref());
+        metadata.controls::<(&MediaPrefillPlan<B::Tensor>,)>()?;
         self.validate_media_state(plan, state)?;
         let mut pending = prepare_composite_ingress::<B>(
-            PreparedCompositeInput::new(&plan.prepared, &plan.admitted).map_err(Error::backend)?,
+            plan.input_with_diagnostic(|cause| metadata.error(format_args!("{cause}")))?,
             context,
         )?;
         let pixels = pending
             .pixels
             .take()
-            .ok_or_else(|| Error::backend("Muse media source has no patches"))?;
+            .ok_or_else(|| metadata.error(format_args!("Muse media source has no patches")))?;
         let (hidden, vision) = self
             .static_modules
             .vision
             .as_mut()
-            .ok_or_else(|| Error::backend("Muse media source has no selected vision owner"))?
+            .ok_or_else(|| {
+                metadata.error(format_args!(
+                    "Muse media source has no selected vision owner"
+                ))
+            })?
             .begin(
                 VisionInput {
                     pixels: &pixels,
@@ -153,9 +267,11 @@ where
         _parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        let metadata = crate::decoder::ModuleMetadata::destination(plan.metadata.as_ref());
+        metadata.controls::<(&MediaPrefillPlan<B::Tensor>,)>()?;
         self.validate_media_state(plan, state)?;
         let mut pending = prepare_composite_ingress::<B>(
-            PreparedCompositeInput::new(&plan.prepared, &plan.admitted).map_err(Error::backend)?,
+            plan.input_with_diagnostic(|cause| metadata.error(format_args!("{cause}")))?,
             context,
         )?;
         // The actual boundary is already embedded and permuted. Rebuild only
@@ -167,7 +283,9 @@ where
                     .vision
                     .as_ref()
                     .ok_or_else(|| {
-                        Error::backend("Muse encoder continuation has no selected vision owner")
+                        metadata.error(format_args!(
+                            "Muse encoder continuation has no selected vision owner"
+                        ))
                     })?
                     .continuation_state(&pending.grid, context)?,
             )
@@ -188,29 +306,31 @@ where
     }
     fn retain_ingress(
         &mut self,
-        _plan: &Self::IngressPlan,
+        plan: &Self::IngressPlan,
         forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Ingress, Error> {
-        let pending = forward
-            .pending_media
-            .as_ref()
-            .ok_or_else(|| Error::backend("Muse cut has no original semantic input"))?;
-        let projected = forward
-            .media_output
-            .as_ref()
-            .ok_or_else(|| Error::backend("Muse cut has no completed normalized media"))?;
+        let metadata = crate::decoder::ModuleMetadata::destination(plan.metadata.as_ref());
+        metadata.controls::<(&MediaPrefillPlan<B::Tensor>,)>()?;
+        let pending = forward.pending_media.as_ref().ok_or_else(|| {
+            metadata.error(format_args!("Muse cut has no original semantic input"))
+        })?;
+        let projected = forward.media_output.as_ref().ok_or_else(|| {
+            metadata.error(format_args!("Muse cut has no completed normalized media"))
+        })?;
         let rows = pending
             .tokens
             .iter()
             .zip(&pending.media)
             .filter(|(_, media)| **media)
             .try_fold(0i32, |total, (tokens, _)| total.checked_add(tokens.dim(1)))
-            .ok_or_else(|| Error::backend("Muse retained media row count overflows"))?;
+            .ok_or_else(|| {
+                metadata.error(format_args!("Muse retained media row count overflows"))
+            })?;
         if projected.shape() != [rows, self.args.hidden_size] {
-            return Err(Error::backend(
-                "Muse cut has incomplete projected media geometry",
-            ));
+            return Err(metadata.error(format_args!(
+                "Muse cut has incomplete projected media geometry"
+            )));
         }
         Ok(MediaIngress {
             pending: forward
@@ -235,13 +355,22 @@ where
     where
         B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
-        let start = i32::try_from(span.input.start).map_err(Error::backend)?;
-        let end = i32::try_from(span.input.end).map_err(Error::backend)?;
+        let metadata = crate::decoder::ModuleMetadata::destination(plan.metadata.as_ref());
+        metadata.controls::<(&MediaPrefillPlan<B::Tensor>,)>()?;
+        let start = i32::try_from(span.input.start)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))?;
+        let end = i32::try_from(span.input.end)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))?;
         if start < 0 || end <= start || end as u64 > plan.geometry.input_positions {
-            return Err(Error::backend("Muse decoder span exceeds original input"));
+            return Err(metadata.error(format_args!("Muse decoder span exceeds original input")));
         }
-        let mut parts = Vec::new();
-        let mut media = Vec::new();
+        metadata.controls::<(
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            i32,
+            i32,
+        )>()?;
+        let mut parts = metadata.vector(ingress.pending.tokens.len())?;
+        let mut media = metadata.vector(ingress.pending.tokens.len())?;
         let mut position = 0i32;
         let mut media_position = 0i32;
         for (original, is_media) in ingress.pending.tokens.iter().zip(&ingress.pending.media) {
@@ -282,11 +411,11 @@ where
             }
             position = position
                 .checked_add(count)
-                .ok_or_else(|| Error::backend("Muse decoder position overflows"))?;
+                .ok_or_else(|| metadata.error(format_args!("Muse decoder position overflows")))?;
             if *is_media {
                 media_position = media_position
                     .checked_add(count)
-                    .ok_or_else(|| Error::backend("Muse media position overflows"))?;
+                    .ok_or_else(|| metadata.error(format_args!("Muse media position overflows")))?;
             }
         }
         let media = match media.len() {
@@ -332,14 +461,22 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
+        let metadata = crate::decoder::ModuleMetadata::destination(plan.metadata.as_ref());
+        metadata.controls::<(&MediaPrefillPlan<B::Tensor>,)>()?;
         self.validate_partition_state(state)?;
         if !state.layout().is_empty()
-            && u64::try_from(state.layer(0).map_err(Error::backend)?.offset()).ok()
+            && u64::try_from(
+                state
+                    .layer(0)
+                    .map_err(|cause| metadata.error(format_args!("{cause}")))?
+                    .offset(),
+            )
+            .ok()
                 != Some(plan.geometry.cached_positions)
         {
-            return Err(Error::backend(
-                "Muse source cached position differs from actual selected state",
-            ));
+            return Err(metadata.error(format_args!(
+                "Muse source cached position differs from actual selected state"
+            )));
         }
         Ok(())
     }
@@ -358,11 +495,94 @@ where
     ) -> Result<Self::IngressPlan, Error> {
         MediaPrefillPlan::prepare(admission, input, inspector, geometry)
     }
+    fn prepare_ingress_plan_admitted(
+        admission: &Self::AdmissionConfig,
+        input: PreparedModelInput<B::Tensor>,
+        admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        _inspector: &impl PreparedInputInspector<B::Tensor>,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self::IngressPlan, Error> {
+        MediaPrefillPlan::prepare_admitted(admission, input, admitted, geometry)
+    }
+    fn bind_original_media_semantics(
+        admission: &Self::AdmissionConfig,
+        original: crate::media_plan::OriginalPreparedMediaSemantics<'_>,
+        blueprint: &crate::prepared_execution::PreparedInferenceBlueprint,
+        source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
+        binding: eredu_runtime::working_memory::MediaSessionBinding,
+    ) -> Result<
+        crate::media_plan::BoundPreparedMediaSemantics,
+        eredu_runtime::working_memory::OriginalCompositeSemanticStorageError,
+    > {
+        original.bind_muse(admission, blueprint, source, binding)
+    }
+    fn prepare_bound_original_ingress_plan(
+        input: crate::processor_execution::OriginalHostLowering<B::Tensor>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<
+        Self::IngressPlan,
+        eredu_runtime::working_memory::OriginalCompositeSemanticStorageError,
+    > {
+        if !input.source().same_source(original.source()) {
+            return Err(
+                original.reject(crate::media_plan::MediaSemanticError::input(
+                    "lowered source differs from compiled source",
+                )),
+            );
+        }
+        MediaPrefillPlan::from_original(input.into_prepared(), original, geometry)
+    }
+    fn prepare_bound_original_ingress_plan_with_metadata(
+        input: crate::processor_execution::OriginalHostLowering<B::Tensor>,
+        original: crate::media_plan::BoundPreparedMediaSemantics,
+        geometry: eredu_core::InferenceGeometry,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self::IngressPlan, Error> {
+        let mut plan = <Self as crate::composite_execution::CompositeMediaIngressArchitecture<
+            B,
+            S,
+        >>::prepare_bound_original_ingress_plan(input, original, geometry)
+        .map_err(|cause| context.metadata_source(cause))?;
+        plan.metadata = Some(context.clone());
+        Ok(plan)
+    }
+    fn prepare_original_workspace_ingress_plan(
+        input: crate::prepared_execution::OriginalMediaWorkspaceInput,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<Self::IngressPlan, Self::Error>
+    where
+        B: eredu_nn::NeuralBackend<Tensor = eredu_nn::workspace::WorkspaceTensor>,
+    {
+        let (mut plan, workspace, funding) = input
+            .construct_source_plan(None, |prepared, original| {
+                MediaPrefillPlan::from_original(prepared, original, geometry)
+            })?;
+        plan.workspace = Some(workspace);
+        plan._workspace_funding = funding;
+        Ok(plan)
+    }
+    fn prepare_original_workspace_ingress_plan_with_metadata(
+        input: crate::prepared_execution::OriginalMediaWorkspaceInput,
+        geometry: eredu_core::InferenceGeometry,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self::IngressPlan, Self::Error>
+    where
+        B: eredu_nn::NeuralBackend<Tensor = eredu_nn::workspace::WorkspaceTensor>,
+    {
+        let (mut plan, workspace, funding) = input
+            .construct_source_plan(Some(context), |prepared, original| {
+                MediaPrefillPlan::from_original(prepared, original, geometry)
+            })?;
+        plan.workspace = Some(workspace);
+        plan._workspace_funding = funding;
+        plan.metadata = Some(context.clone());
+        Ok(plan)
+    }
     fn prepared_ingress_input(
         plan: &Self::IngressPlan,
     ) -> PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan> {
-        PreparedCompositeInput::new(&plan.prepared, &plan.admitted)
-            .expect("plan retains exact original admission")
+        plan.input().expect("retained Muse admission")
     }
     fn media_group_collective_waves(
         &self,
@@ -375,35 +595,93 @@ where
         <Self as CompositeArchitecture<B,S>>::prepared_group_collective_waves(self, group,
             <Self as crate::composite_execution::CompositeMediaIngressArchitecture<B,S>>::prepared_ingress_input(plan), tensor_partitions, pipeline_stages, None).map_err(|error|error.to_string())
     }
+    fn media_group_collective_waves_with_metadata(
+        &self,
+        plan: &Self::IngressPlan,
+        group: usize,
+        tensor_partitions: usize,
+        pipeline_stages: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, Error>
+    {
+        <Self as CompositeArchitecture<B, S>>::prepared_group_collective_waves(
+            self,
+            group,
+            plan.input_with_diagnostic(|cause| context.metadata_error(format_args!("{cause}")))?,
+            tensor_partitions,
+            pipeline_stages,
+            Some(context),
+        )
+    }
     fn media_primary_ingress_collectives(
         &self,
         plan: &Self::IngressPlan,
         span: &eredu_runtime::prefill::PrefillChunk,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
-        let mut offset = 0u64;
-        let mut positions = Vec::new();
-        for part in plan.admitted.parts() {
-            let (length, text) = match part {
-                MuseGlimmerInputPartPlan::TextTokens { positions } => (*positions, true),
-                MuseGlimmerInputPartPlan::Vision { ingress, .. } => {
-                    (ingress.placeholder_count, false)
-                }
-            };
-            let end = offset
-                .checked_add(length)
-                .ok_or("Muse span position overflows")?;
-            let start = offset.max(span.input.start);
-            let stop = end.min(span.input.end);
-            if text && start < stop {
-                positions.push(stop - start);
-            }
-            offset = end;
-        }
-        crate::composite_execution::segmented_token_ingress_collectives(
-            positions,
+        media_ingress_waves(
+            plan,
+            span,
             self.args.hidden_size,
             tensor_partitions,
+            crate::composite_execution::graph::Destination(None),
+        )
+        .map_err(|error| error.to_string())
+    }
+    fn media_primary_ingress_collectives_with_metadata(
+        &self,
+        plan: &Self::IngressPlan,
+        span: &eredu_runtime::prefill::PrefillChunk,
+        tensor_partitions: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
+        media_ingress_waves(
+            plan,
+            span,
+            self.args.hidden_size,
+            tensor_partitions,
+            crate::composite_execution::graph::Destination(Some(context)),
         )
     }
+}
+
+fn media_ingress_waves<T: Tensor>(
+    plan: &MediaPrefillPlan<T>,
+    span: &eredu_runtime::prefill::PrefillChunk,
+    hidden: i32,
+    tensor_partitions: usize,
+    destination: crate::composite_execution::graph::Destination<'_>,
+) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
+    destination.controls::<(
+        u64,
+        Vec<u64>,
+        PreparedCompositeInput<'_, T, MuseGlimmerInputPartPlan>,
+    )>()?;
+    let input =
+        plan.input_with_diagnostic(|message| destination.error(format_args!("{message}")))?;
+    let mut positions = destination.vector(plan.prepared.len())?;
+    let mut offset = 0u64;
+    for part in input.admitted().muse_parts() {
+        let (length, text) = match part {
+            MuseInputPartRef::TextTokens { positions } => (positions, true),
+            MuseInputPartRef::Vision {
+                placeholder_count, ..
+            } => (placeholder_count, false),
+        };
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| destination.error(format_args!("Muse span position overflow")))?;
+        let start = offset.max(span.input.start);
+        let stop = end.min(span.input.end);
+        if text && start < stop {
+            positions.push(stop - start);
+        }
+        offset = end;
+    }
+    crate::composite_execution::segmented_token_ingress_collectives_in(
+        positions,
+        hidden,
+        tensor_partitions,
+        destination,
+    )
 }

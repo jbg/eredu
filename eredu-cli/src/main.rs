@@ -18,7 +18,8 @@ use eredu::{
         LoadedModel, LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
         LocalRuntimeConfiguration, ManagedPlainTextRequest, PreparedChatGenerationSettings,
         PreparedChatOutputMode, PreparedChatPrompt, PreparedChatRequest,
-        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeRequest, TokenizerSourceInput,
+        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeRequest,
+        TokenizerSourceInput,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -38,6 +39,9 @@ use eredu_core::{
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
 use serde::{Deserialize, Serialize};
+
+mod memory_limits;
+use memory_limits::CliMemoryLimit;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExpertCacheEviction {
@@ -264,9 +268,9 @@ struct Cli {
     #[arg(long, value_name = "BYTES")]
     mlx_cache_limit_bytes: Option<u64>,
 
-    /// Managed source and generation capacity in bytes, separate from weight residency.
-    #[arg(long, default_value_t = 1_073_741_824, value_name = "BYTES")]
-    managed_memory_capacity_bytes: u64,
+    /// Limit total live charge in a reported physical domain; omitted domains are unlimited.
+    #[arg(long = "memory-limit", value_name = "DOMAIN=BYTES|unlimited")]
+    memory_limits: Vec<CliMemoryLimit>,
 
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
@@ -1554,7 +1558,7 @@ fn isolated_benchmark_trial(
     tokens: usize,
     timeout_seconds: u64,
     prompt: &str,
-    managed_capacity: u64,
+    memory_limits: &[CliMemoryLimit],
 ) -> AutoBenchmarkTrial {
     let plan_path = temporary_trial_path("plan", candidate, run);
     let telemetry_path = temporary_trial_path("telemetry", candidate, run);
@@ -1586,8 +1590,11 @@ fn isolated_benchmark_trial(
             .arg(&telemetry_path)
             .arg("--max-tokens")
             .arg(tokens.to_string())
-            .arg("--managed-memory-capacity-bytes")
-            .arg(managed_capacity.to_string())
+            .args(
+                memory_limits
+                    .iter()
+                    .flat_map(|limit| ["--memory-limit".to_owned(), limit.to_string()]),
+            )
             .arg("--raw")
             .arg(prompt)
             .stdin(Stdio::null())
@@ -1681,7 +1688,7 @@ fn benchmark_automatic_plans(
     runs: usize,
     timeout_seconds: u64,
     prompt: &str,
-    managed_capacity: u64,
+    memory_limits: &[CliMemoryLimit],
 ) -> Result<AutoBenchmarkReport> {
     let plans = automatic_benchmark_candidates(model_path, &heuristic)?;
     let candidate_count = plans.len();
@@ -1704,7 +1711,7 @@ fn benchmark_automatic_plans(
                     tokens,
                     timeout_seconds,
                     prompt,
-                    managed_capacity,
+                    memory_limits,
                 )
             })
             .collect::<Vec<_>>();
@@ -2001,6 +2008,14 @@ fn main() -> Result<()> {
     }
     let original_args = args.clone();
     validate_args(&args)?;
+    let memory_limits = memory_limits::declarations(&args.memory_limits);
+    configure_local_runtime(
+        &LocalRuntimeConfiguration::default().with_memory_limits(memory_limits.clone()),
+    )
+    .context("failed to configure physical-domain memory limits")?;
+    if args.verbose {
+        memory_limits::report(&mut io::stderr().lock())?;
+    }
     let (resolved_model, resolved_draft) = resolve_model_pair(
         &args.model,
         args.draft_model.as_deref(),
@@ -2067,7 +2082,7 @@ fn main() -> Result<()> {
                         args.auto_benchmark_runs,
                         args.auto_benchmark_timeout_seconds,
                         args.prompt.as_deref().unwrap_or(AUTO_BENCHMARK_PROMPT),
-                        args.managed_memory_capacity_bytes,
+                        &args.memory_limits,
                     )?;
                     if let Some(path) = &args.auto_cache {
                         write_auto_plan_cache(
@@ -2145,7 +2160,9 @@ fn main() -> Result<()> {
     if let Some(bytes) = args.mlx_cache_limit_bytes {
         let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
         configure_local_runtime(
-            &LocalRuntimeConfiguration::default().with_allocator_cache_limit(bytes),
+            &LocalRuntimeConfiguration::default()
+                .with_memory_limits(memory_limits.clone())
+                .with_allocator_cache_limit(bytes),
         )
         .context("failed to set the local allocator-cache limit")?;
     }
@@ -2301,7 +2318,7 @@ fn main() -> Result<()> {
             .prepare_chat(
                 &source,
                 &request,
-                args.managed_memory_capacity_bytes,
+                &memory_limits::declarations(&args.memory_limits),
                 &cancellation,
             )?
             .context("cancelled before chat preparation")?;
@@ -2403,7 +2420,7 @@ fn main() -> Result<()> {
             ..generation_overrides
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(args.managed_memory_capacity_bytes),
+            memory_limits: memory_limits::declarations(&args.memory_limits),
             ..Default::default()
         },
         seed: args.seed,
@@ -2578,6 +2595,7 @@ fn main() -> Result<()> {
     let total_elapsed = total_started.elapsed();
 
     if args.verbose {
+        memory_limits::report(&mut io::stderr().lock())?;
         let allocator = allocator_telemetry
             .as_ref()
             .expect("verbose execution collected allocator telemetry");
@@ -2880,8 +2898,14 @@ fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkS
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
-    if args.managed_memory_capacity_bytes == 0 {
-        bail!("--managed-memory-capacity-bytes must be greater than zero");
+    let mut domains = HashSet::new();
+    for declaration in &args.memory_limits {
+        if !domains.insert(&declaration.domain) {
+            bail!(
+                "--memory-limit repeats physical domain '{}'",
+                declaration.domain
+            );
+        }
     }
     if args.max_tokens == Some(0) {
         bail!("--max-tokens must be greater than zero");
@@ -4353,28 +4377,37 @@ mod tests {
     }
 
     #[test]
-    fn validates_managed_capacity_without_changing_generation_overrides() {
+    fn validates_domain_limits_without_changing_generation_overrides() {
         let args = Cli::try_parse_from([
             "eredu",
             "--model",
             "model-id",
-            "--managed-memory-capacity-bytes",
-            "4096",
+            "--memory-limit",
+            "host=0",
+            "--memory-limit",
+            "mlx-gpu-1=unlimited",
             "prompt",
         ])
         .unwrap();
         validate_args(&args).unwrap();
-        assert_eq!(args.managed_memory_capacity_bytes, 4096);
+        assert_eq!(
+            args.memory_limits[0].limit,
+            eredu_core::MemoryLimit::Finite(0)
+        );
+        assert_eq!(
+            args.memory_limits[1].limit,
+            eredu_core::MemoryLimit::Unlimited
+        );
         assert_eq!(
             args.generation_overrides(),
             eredu_core::GenerationConfigOverrides::default()
         );
         let mut args = args;
-        args.managed_memory_capacity_bytes = 0;
+        args.memory_limits.push("host=4096".parse().unwrap());
         assert!(validate_args(&args)
             .unwrap_err()
             .to_string()
-            .contains("--managed-memory-capacity-bytes"));
+            .contains("--memory-limit repeats physical domain 'host'"));
     }
 
     #[test]

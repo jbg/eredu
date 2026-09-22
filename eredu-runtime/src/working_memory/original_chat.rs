@@ -4,14 +4,21 @@ mod operation;
 mod profile;
 mod render;
 pub use file::OriginalChatFileError;
-pub use operation::{OriginalChatBackend, OriginalChatSourceError, OriginalChatRenderOperationError};
+pub use operation::{
+    OriginalChatBackend, OriginalChatRenderOperationError, OriginalChatSourceError,
+};
 pub use profile::{OriginalChatProfileError, OriginalChatProfilePreparation};
 mod controller;
-pub use controller::{ControllerCompilationOutput, ControllerCompilationSources, OriginalControllerCompiler, OriginalControllerCompilation, OriginalControllerCompilationError};
-pub use render::{OriginalChatRenderError, OriginalRenderedChat, OriginalChatConsumer, OriginalChatConsumerError};
+pub use controller::{
+    ControllerCompilationOutput, ControllerCompilationSources, OriginalControllerCompilation,
+    OriginalControllerCompilationError, OriginalControllerCompiler,
+};
+pub use render::{
+    OriginalChatConsumer, OriginalChatConsumerError, OriginalChatRenderError, OriginalRenderedChat,
+};
 
 use super::loaded_decode_source::Allowance;
-use super::{WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError};
 use eredu_text::chat_storage::{ChatTemplateFailure, ChatTemplatePlan, PreparedChatTemplate};
 use std::{
     alloc::Layout,
@@ -56,9 +63,14 @@ impl OriginalChatTemplate {
     }
     /// Authenticates the exact request's ordinary named-template selection.
     pub fn matches_selection(
-        &self, template: &eredu_text::tokenizer::ModelChatTemplate, model_id: &str, has_tools: bool,
+        &self,
+        template: &eredu_text::tokenizer::ModelChatTemplate,
+        model_id: &str,
+        has_tools: bool,
     ) -> bool {
-        self.payload().source.matches_selection(template, model_id, has_tools)
+        self.payload()
+            .source
+            .matches_selection(template, model_id, has_tools)
     }
     /// Entire original allowance, retained through final source/control retirement.
     pub fn original_bytes(&self) -> u64 {
@@ -72,8 +84,8 @@ impl OriginalChatTemplate {
         )
     }
     /// Authenticate the same real original pool without adding a registry hold.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.payload().allowance.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.payload().allowance.pool().same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -176,7 +188,7 @@ fn arc_bytes<T>() -> Result<usize, WorkingMemoryError> {
         .map(|(layout, _)| layout.pad_to_align().size())
         .map_err(|_| WorkingMemoryError::Overflow)
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Concrete J compiler/owner/error layouts before its single comparison.
     pub fn chat_template_required_bytes(
         plan: &ChatTemplatePlan<'_>,

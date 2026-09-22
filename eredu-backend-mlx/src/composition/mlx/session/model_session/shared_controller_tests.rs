@@ -1,5 +1,7 @@
 #![cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 mod bytes;
 
 use super::*;
@@ -8,9 +10,7 @@ use eredu_core::{
     ControlledTextGeneration, SharedTokenFilter, TextControllerStorage, TextGeneration,
     TextGenerationDriver, TextGenerationInput, TokenFilterController, TokenSamplingDecision,
 };
-use eredu_runtime::working_memory::{
-    ControllerStorageError, WorkingMemoryError, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{ControllerStorageError, MemoryLedger, WorkingMemoryError};
 
 struct SharedController {
     masks: [SharedTokenFilter; 1],
@@ -104,7 +104,15 @@ fn config(capacity: Option<u64>) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: capacity,
+        memory_limits: (capacity).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -112,10 +120,10 @@ fn config(capacity: Option<u64>) -> TextGenerationConfig {
 
 fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -133,10 +141,10 @@ fn reclaim() {
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -161,7 +169,7 @@ struct NoWork {
 }
 
 impl NoWork {
-    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) -> Self {
+    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) -> Self {
         Self {
             paths: paths::snapshot(),
             inputs: paths::session_input_creation_attempts(),
@@ -175,12 +183,12 @@ impl NoWork {
                 .unwrap()
                 .revision()
                 .clone(),
-            bytes: pool.used_bytes().unwrap(),
-            peak: pool.peak_bytes().unwrap(),
+            bytes: pool.fixture_host_charge().unwrap(),
+            peak: pool.fixture_host_peak().unwrap(),
         }
     }
 
-    fn assert_unchanged(&self, runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) {
+    fn assert_unchanged(&self, runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) {
         assert_eq!(paths::snapshot(), self.paths);
         assert_eq!(paths::session_input_creation_attempts(), self.inputs);
         assert_eq!(paths::session_reset_attempts(), self.resets);
@@ -190,8 +198,8 @@ impl NoWork {
             model.retained_inference_authority().unwrap().revision(),
             &self.revision
         );
-        assert_eq!(pool.used_bytes().unwrap(), self.bytes);
-        assert_eq!(pool.peak_bytes().unwrap(), self.peak);
+        assert_eq!(pool.fixture_host_charge().unwrap(), self.bytes);
+        assert_eq!(pool.fixture_host_peak().unwrap(), self.peak);
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     }
 }
@@ -202,7 +210,7 @@ fn shared_controller_matches_ordinary_output_and_preexisting_alias_owns_exact_fi
     let mut expected = None;
     let mut ordinary_filter = None;
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = runtime(&stream, &pool);
         let source = mask(193);
         let external = source.clone(); // The alias predates accounting attachment.
@@ -264,7 +272,7 @@ fn shared_controller_matches_ordinary_output_and_preexisting_alias_owns_exact_fi
         settle(&pool, 0);
     }
 
-    let reference_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let reference_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut reference, _artifact) = self::runtime(&stream, &reference_pool);
     let reference_outputs = TextGeneration::with_token_filter(
         &mut reference,
@@ -290,7 +298,7 @@ fn shared_controller_matches_ordinary_output_and_preexisting_alias_owns_exact_fi
 fn changed_shared_identity_rejects_before_native_work_at_preflight_and_decision() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for during_decision in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = runtime(&stream, &pool);
         let original = mask(193);
         let external = original.clone();
@@ -333,7 +341,7 @@ fn changed_shared_identity_rejects_before_native_work_at_preflight_and_decision(
 #[test]
 fn rejected_reservation_never_attaches_shared_controller_storage() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let original = mask(193);
     let external = original.clone();
@@ -349,7 +357,9 @@ fn rejected_reservation_never_attaches_shared_controller_storage() {
     .unwrap();
     assert!(matches!(
         cause::<WorkingMemoryError>(&error),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert_eq!(calls.get(), (0, 0));
     before.assert_unchanged(&runtime, &pool);
@@ -361,7 +371,7 @@ fn rejected_reservation_never_attaches_shared_controller_storage() {
 #[test]
 fn shared_inventory_must_fit_its_own_declared_workspace_before_reservation() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let original = mask(193);
     let external = original.clone();
@@ -397,7 +407,7 @@ fn shared_inventory_must_fit_its_own_declared_workspace_before_reservation() {
 #[test]
 fn shared_controller_charge_survives_later_readiness_rejection() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let original = mask(193);
     let external = original.clone();
@@ -431,7 +441,7 @@ fn shared_controller_preserves_forced_choice_provenance_through_multiple_native_
     use eredu_runtime::execution_control::TokenChoiceController;
 
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let mut values = Vec::with_capacity(193);
     values.resize(64, false);
@@ -483,9 +493,9 @@ fn shared_controller_preserves_forced_choice_provenance_through_multiple_native_
 #[test]
 fn loading_hook_registers_shared_mask_before_inference_and_rejects_active_run_factories() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
-    let initial_bytes = pool.used_bytes().unwrap();
+    let initial_bytes = pool.fixture_host_charge().unwrap();
     let factory_calls = Cell::new(0);
     let prepared = MlxBackend::prepare_shared_token_filter(&runtime, || {
         factory_calls.set(factory_calls.get() + 1);
@@ -498,7 +508,7 @@ fn loading_hook_registers_shared_mask_before_inference_and_rejects_active_run_fa
     .unwrap();
     assert_eq!(factory_calls.get(), 1);
     assert_eq!(prepared.capacity_bytes(), Some(193));
-    assert_eq!(pool.used_bytes().unwrap(), initial_bytes + 193);
+    assert_eq!(pool.fixture_host_charge().unwrap(), initial_bytes + 193);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let external = prepared.clone();
     let calls = Rc::new(Cell::new((0, 0)));

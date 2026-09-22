@@ -99,8 +99,15 @@ fn verify_loaded_routed_capture(
     MlxBackend::validate_text_capture(runtime, &plan).unwrap();
     let run = |runtime: &mut ModelRuntime<MlxBackend<'_>>, plan: &AdmittedCapturePlan| {
         runtime.reset().unwrap();
-        let mut generation = component_capture_generation(runtime, sampling);
-        generation.enable_capture(plan.clone()).unwrap();
+        let mut generation = component_capture_generation(
+            runtime,
+            sampling,
+            Some(eredu_core::TextPreparationOptions {
+                capture: Some(eredu_core::capture::SharedCapturePlan::new(plan.clone())),
+                interventions: None,
+            }),
+        )
+        .unwrap();
         (0..3)
             .map(|_| {
                 let token = generation.next().unwrap().unwrap().token_id();
@@ -169,8 +176,10 @@ fn verify_loaded_routed_capture(
                         routed_close(&row.values, &expected.values);
                     }
                 }
-                (CapturePayload::Tensor(actual), CapturePayload::Tensor(expected)) => {
-                    routed_close(actual, expected)
+                (actual, expected)
+                    if actual.as_tensor().is_some() && expected.as_tensor().is_some() =>
+                {
+                    routed_close(actual.as_tensor().unwrap(), expected.as_tensor().unwrap())
                 }
                 _ => panic!("sparse units or final logits"),
             }

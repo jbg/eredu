@@ -49,9 +49,9 @@ impl Backend {
             let c = self.contention.as_ref().unwrap();
             c.key.0.armed.store(true, AtomicOrdering::SeqCst);
             let key = c.key.clone();
-            let pool = scope.pool().clone();
+            let prepared = c.publication.lock().unwrap().take().unwrap();
             let worker =
-                std::thread::spawn(move || pool.pin_registered_storage([(key, 1)]).unwrap());
+                std::thread::spawn(move || prepared.pin_registered_storage([(key, 1)]).unwrap());
             c.entered
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();

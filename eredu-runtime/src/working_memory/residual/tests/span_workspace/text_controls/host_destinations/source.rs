@@ -2,16 +2,19 @@ use super::*;
 use crate::working_memory::HostSourceConstructionFacts;
 
 fn source_request(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
     attempts: usize,
     partitions: usize,
 ) -> Option<IncrementalInferenceQuote> {
-    source_request_with_facts(pool, HostSourceConstructionFacts::new(bytes, attempts, partitions).unwrap())
+    source_request_with_facts(
+        pool,
+        HostSourceConstructionFacts::new(bytes, attempts, partitions).unwrap(),
+    )
 }
 
 fn source_request_with_facts(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: HostSourceConstructionFacts,
 ) -> Option<IncrementalInferenceQuote> {
     let facts = match HostDestinationFacts::new(4, 1) {
@@ -41,18 +44,17 @@ fn source_request_with_facts(
 
 #[test]
 fn source_component_is_reserved_before_debit_and_retains_the_actual_accepted_hold() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = source_request(&pool, 24, 2, 0) else {
         return;
     };
-    let total = 64 + quote.incremental_bytes();
+    let total = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, total - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (r, accepted) = sealed_plan(&pool, &quote, total).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
@@ -75,15 +77,78 @@ fn source_component_is_reserved_before_debit_and_retains_the_actual_accepted_hol
     values.try_fill(1, [0x12345678]).unwrap();
     assert_eq!(values.as_slice(), &[0x12345678]);
     drop((quote, values, span, source, host, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(receipt);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+}
+
+#[test]
+fn source_receipt_retains_its_raw_account_without_pinning_prior_request_sources() {
+    for refused in [false, true] {
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+        let Some(plain) = source_request(&pool, 24, 1, 0) else {
+            return;
+        };
+        let host_facts = HostDestinationFacts::new(4, 1)
+            .unwrap()
+            .with_source_constructions(HostSourceConstructionFacts::new(24, 1, 0).unwrap())
+            .unwrap();
+        let quote = replacement_quote(&pool, geometry(), 0)
+            .into_incremental()
+            .with_registered_sources(root.clone())
+            .unwrap();
+        let controls = PreparedTextControlWorkspace::prepare_controls(
+            geometry(),
+            quote.span_workspace().plan(),
+            super::facts(),
+        )
+        .unwrap()
+        .with_host_destinations(host_facts)
+        .unwrap();
+        let quote = quote
+            .with_span_workspace_and_text_controls(controls)
+            .unwrap();
+        let (reservation, run, accepted) = accept(&pool, quote);
+        let (mut span, witness) = accepted
+            .into_funded_text_span_workspace(&run, &reservation)
+            .unwrap();
+        let protected = span.protected_host_bytes();
+        let mut host = span.take_host_destinations().unwrap().unwrap();
+        let mut source = host.take_source_constructions().unwrap();
+        let receipt = source.try_debit(if refused { 25 } else { 24 });
+        if let Ok(receipt) = &receipt {
+            assert!(receipt.belongs_to(&span.control_guard()));
+            // Equal geometry on this same ledger is a different accepted account.
+            let (other_reservation, other_run, other_accepted) = accept(&pool, plain);
+            let (other_span, _) = other_accepted
+                .into_funded_text_span_workspace(&other_run, &other_reservation)
+                .unwrap();
+            assert!(!receipt.belongs_to(&other_span.control_guard()));
+            drop((other_span, other_reservation, other_run));
+        } else {
+            assert!(receipt.as_ref().unwrap_err().retains_receipt());
+            drop(plain);
+        }
+        drop((source, host, span, witness, reservation, run, root));
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected);
+        assert!(
+            matches!(
+                pool.pin_registered_storage([(1u32, 64)]),
+                Err(WorkingMemoryError::IdentityMismatch)
+            ),
+            "a spent constructor receipt does not retain the earlier source pin"
+        );
+        drop(receipt);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(pool.snapshot().unwrap().funding_accounts, 0);
+    }
 }
 
 #[test]
 fn source_split_conserves_bytes_attempts_and_cannot_refill_after_retirement() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = source_request(&pool, 24, 3, 2) else {
         return;
     };
@@ -135,13 +200,13 @@ fn source_split_conserves_bytes_attempts_and_cannot_refill_after_retirement() {
     drop((
         b_receipt, error, exhausted, b, source, host, span, r, run, root,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn source_one_short_refuses_before_constructor_and_owning_failures_are_finite() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = source_request(&pool, 7, 1, 0) else {
         return;
     };
@@ -173,16 +238,16 @@ fn source_one_short_refuses_before_constructor_and_owning_failures_are_finite() 
     let exhausted: Vec<_> = (0..16).map(|_| source.try_debit(0).unwrap_err()).collect();
     assert!(exhausted.iter().all(|e| !e.retains_receipt()));
     drop((source, host, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(exhausted);
 }
 
 #[test]
 fn source_checks_real_account_health_before_constructor_and_preserves_attempt_custody() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = source_request(&pool, 12, 1, 1) else {
         return;
     };
@@ -217,17 +282,17 @@ fn source_checks_real_account_health_before_constructor_and_preserves_attempt_cu
         (12, 0)
     );
     drop((source, host, span, r, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn source_zero_attempts_issue_no_owner_and_equal_foreign_banks_do_not_match() {
-    let a = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let b = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let ar = a.register_storage([(1u32, 64)]).unwrap();
-    let br = b.register_storage([(1u32, 64)]).unwrap();
+    let a = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let b = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let ar = a.register_host_storage([(1u32, 64)]).unwrap();
+    let br = b.register_host_storage([(1u32, 64)]).unwrap();
     let Some(aq) = source_request(&a, 0, 0, 0) else {
         return;
     };
@@ -243,15 +308,21 @@ fn source_zero_attempts_issue_no_owner_and_equal_foreign_banks_do_not_match() {
     let error = source.try_debit(0).unwrap_err();
     assert!(!error.retains_receipt());
     drop((source, host, a_span, b_span, ra, rb, run_a, run_b, ar, br));
-    assert_eq!((a.used_bytes().unwrap(), b.used_bytes().unwrap()), (0, 0));
+    assert_eq!(
+        (
+            a.payload_used_bytes().unwrap(),
+            b.payload_used_bytes().unwrap()
+        ),
+        (0, 0)
+    );
     drop(error);
 }
 
 #[test]
 fn prefill_source_join_extends_same_host_binding_once_without_accepting_unknown_operations() {
     use crate::working_memory::{GraphMetadataFacts, TextPrefillScopeFacts};
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let original = replacement_quote(&pool, geometry(), 0).into_incremental();
     let host = match HostDestinationFacts::new(4, 1) {
         Ok(facts) => facts,
@@ -319,17 +390,17 @@ fn prefill_source_join_extends_same_host_binding_once_without_accepting_unknown_
     assert!(host.take_source_constructions().is_none());
     let receipt = source.try_debit(32).unwrap();
     drop((source, host, roles, span, r, run, root, base, plain));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(receipt);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod publication;
 
 #[test]
 fn metadata_retention_preserves_admitted_backing_and_only_the_original_host_hold() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1_u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1_u32, 64)]).unwrap();
     let Some(quote) = source_request(&pool, 24, 1, 0) else {
         assert!(matches!(
             crate::working_memory::OriginalHostMetadataCustody::boxed_storage_bytes(
@@ -339,13 +410,12 @@ fn metadata_retention_preserves_admitted_backing_and_only_the_original_host_hold
         ));
         return;
     };
-    let total = 64 + quote.incremental_bytes();
+    let total = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, total - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (reservation, accepted) = sealed_plan(&pool, &quote, total).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
@@ -371,11 +441,11 @@ fn metadata_retention_preserves_admitted_backing_and_only_the_original_host_hold
         (0, 0)
     );
     drop((quote, span, source, host, reservation, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop((raw, alias));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(metadata);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod program;
@@ -383,25 +453,49 @@ mod program;
 #[test]
 fn retained_text_origin_accepts_closed_source_and_refuses_foreign_or_quarantined_account() {
     for quarantine in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
-        let Some(quote) = source_request(&pool, 24, 1, 0) else { return; };
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+        let Some(quote) = source_request(&pool, 24, 1, 0) else {
+            return;
+        };
         let (reservation, run, accepted) = accept(&pool, quote);
-        let (span, _) = accepted.into_funded_text_span_workspace(&run, &reservation).unwrap();
+        let (span, _) = accepted
+            .into_funded_text_span_workspace(&run, &reservation)
+            .unwrap();
         let custody: crate::working_memory::OriginalOperationMetadataCustody =
             span.control_guard().metadata_custody().into();
         custody.validate_retained_origin(&pool).unwrap();
-        assert_eq!(custody.validate_retained_origin(&foreign), Err(WorkingMemoryError::IdentityMismatch));
+        assert_eq!(
+            custody.validate_retained_origin(&foreign),
+            Err(WorkingMemoryError::IdentityMismatch)
+        );
         let native = run.scope().unwrap();
-        if quarantine { drop(native); } else { native.certify().unwrap(); }
+        if quarantine {
+            drop(native);
+        } else {
+            native.certify().unwrap();
+        }
         drop((span, reservation, run, root));
-        let held = pool.used_bytes().unwrap();
+        let held = pool.payload_used_bytes().unwrap();
         assert!(held > 0);
-        assert_eq!(custody.validate_retained_origin(&pool),
-            if quarantine { Err(WorkingMemoryError::ExecutionFenced) } else { Ok(()) });
-        assert_eq!(pool.used_bytes().unwrap(), held, "validation grants no credit or refund");
+        assert_eq!(
+            custody.validate_retained_origin(&pool),
+            if quarantine {
+                Err(WorkingMemoryError::ExecutionFenced)
+            } else {
+                Ok(())
+            }
+        );
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            held,
+            "validation grants no credit or refund"
+        );
         drop(custody);
-        assert_eq!(pool.used_bytes().unwrap(), if quarantine { held } else { 0 });
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            if quarantine { held } else { 0 }
+        );
     }
 }

@@ -2,21 +2,20 @@
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 mod metal {
     use eredu_runtime::working_memory::{
-        InitializedSharedNative, SharedNativeInitializationCustody,
+        InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
         SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-        WorkingMemoryPool,
     };
     use safemlx::fast::{
         BorrowedKernelOutput, KernelDefinitionCause, KernelDefinitionError, KernelFamilyLayout,
         KernelInputClass, KernelInputSignature, KernelSpecialization, MetalKernelDefinitionPlan,
         MetalKernelFamilyPlan, PreparedMetalKernelFamily,
     };
-    use safemlx::{Array, Dtype, OriginalScopeObserver, Stream, error::Exception};
+    use safemlx::{error::Exception, Array, Dtype, OriginalScopeObserver, Stream};
     use std::{
         mem::{size_of, size_of_val},
         sync::{
-            OnceLock,
             atomic::{AtomicBool, Ordering},
+            OnceLock,
         },
     };
 
@@ -581,8 +580,8 @@ mod metal {
         #[error("FP8 kernel initialization is busy")]
         Busy,
     }
-    pub(crate) fn prepare_admitted(pool: &WorkingMemoryPool) -> Result<(), MlxFp8KernelError> {
-        if !pool.same_domain(&crate::backend::managed_memory::domain()) {
+    pub(crate) fn prepare_admitted(pool: &MemoryLedger) -> Result<(), MlxFp8KernelError> {
+        if !pool.same_ledger(&crate::backend::managed_memory::ledger()) {
             return Err(MlxFp8KernelError::Policy(
                 WorkingMemoryError::IdentityMismatch,
             ));

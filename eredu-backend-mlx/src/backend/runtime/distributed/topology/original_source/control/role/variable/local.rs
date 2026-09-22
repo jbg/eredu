@@ -79,7 +79,7 @@ impl Local<'_> {
         let peer = Peer { input, receive_like, layout, order: self.order, value, step,
             claim, completed_source: self.matrix.completed_source().cloned(),
             owner: OriginalParallelControlOwner(self.owner.0.clone()), custody: c.clone() };
-        run_native_role(peer, capacity, &self.owner.owner().bank, &self.owner.owner().controls, c,
+        run_native_role(peer, capacity, &self.owner.owner().native, c,
             |peer, observer| Ok(peer.run(observer).and_then(|value| finish(value, observer))))
             .map_err(|cause| Error::with_original_control_source(cause, false))?
     }

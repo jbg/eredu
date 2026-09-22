@@ -29,13 +29,17 @@ fn source(bfloat: bool, shape: &[i32]) -> Array {
     }
 }
 fn reference(selected: &Array, stream: &Stream) -> Vec<u32> {
-    // This is the existing observation conversion, including its native cast
-    // and compaction. Empty observe_tensor returns before conversion.
+    // Compare the capture mechanism with its selected native cast, including
+    // NaN normalization. Empty capture skips conversion.
     if selected.size() == 0 {
         return vec![];
     }
-    crate::MlxTensor::from_array(selected.clone())
-        .to_f32_vec(stream)
+    selected
+        .as_type::<f32>(stream)
+        .unwrap()
+        .evaluated()
+        .unwrap()
+        .try_to_vec::<f32>()
         .unwrap()
         .into_iter()
         .map(f32::to_bits)
@@ -100,9 +104,15 @@ fn run_case(
     let n = report.total_bytes.unwrap();
     let source_info = snapshot.allocation().unwrap();
     let bytes = source_info.bytes() as u64;
-    let pool = WorkingMemoryPool::new(bytes + h + n, 0).unwrap();
+    let publication_bytes = eredu_runtime::working_memory::StoragePublicationLayout::<
+        StorageIdentity,
+    >::new(plan.recovery_descriptors())
+    .unwrap()
+    .requested_bytes()
+        + MemoryLedger::storage_metadata_control_bytes().unwrap();
+    let pool = parent_ledger(bytes + h + n + publication_bytes, source, 1).unwrap();
     let registration = register(&pool, source);
-    let (reservation, run) = fresh(&pool, h + n);
+    let (reservation, run) = fresh(&pool, h + n + publication_bytes);
     let mut native = run.scope().unwrap();
     let roots = RefCell::new(Vec::with_capacity(plan.recovery_descriptors()));
     let capacity = roots.borrow().capacity();
@@ -138,22 +148,32 @@ fn run_case(
             let info = a.allocation_info().unwrap().unwrap();
             (
                 StorageIdentity::Native(info.identity()),
-                info.bytes() as u64,
+                eredu_runtime::working_memory::StorageAllocation::new(
+                    info.bytes() as u64,
+                    crate::backend::managed_memory::allocation_placement_handle(&info, &pool)
+                        .unwrap(),
+                ),
             )
         })
-        .filter(|(_, bytes)| *bytes != 0)
+        .filter(|(_, allocation)| allocation.capacity_bytes() != 0)
         .collect::<BTreeMap<_, _>>();
-    assert!(inventory.values().sum::<u64>() <= bytes + n);
-    let before_publication = pool.used_bytes().unwrap();
+    assert!(
+        inventory
+            .values()
+            .map(|allocation| allocation.capacity_bytes())
+            .sum::<u64>()
+            <= bytes + n
+    );
+    let before_publication = pool.fixture_host_current().unwrap();
     let publication = pool.adopt_storage_individually(&native, inventory).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), before_publication);
+    assert_eq!(pool.fixture_host_current().unwrap(), before_publication);
     let alias = value.clone();
     settle(&roots);
     native.certify().unwrap();
     drop((publication, registration, run, reservation, value));
-    assert!(pool.used_bytes().unwrap() >= h);
+    assert!(pool.fixture_host_charge().unwrap() >= h);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     assert_eq!(source.try_metadata_snapshot().unwrap(), snapshot);
 }
 
@@ -515,29 +535,31 @@ fn half_short_parent_rejects_before_work_and_cast_failures_keep_actual_recovery(
         let plan = PreparedCaptureTensor::new(&source, host(&admitted)).unwrap();
         let output = plan.trace(&mut projection).unwrap();
         let n = context.report(&[output]).unwrap().total_bytes.unwrap();
-        let pool = WorkingMemoryPool::new(bytes + h + n, 0).unwrap();
+        let pool = parent_ledger(bytes + h + n, &source, 1).unwrap();
         let registration = register(&pool, &source);
         let (reservation, run) = fresh(&pool, h - 1);
         let mut native = run.scope().unwrap();
         let roots = RefCell::new(vec![]);
-        let before = pool.used_bytes().unwrap();
+        let before = pool.fixture_host_charge().unwrap();
         let error = plan
             .transfer(&run, &reservation, &mut native, &stream, &roots)
             .unwrap_err();
         assert!(matches!(
             error,
             CaptureTensorExecutionError::Mechanism(CaptureTensorNativeError::Host(
-                CaptureTensorConstructionError::Memory(WorkingMemoryError::BudgetExceeded { .. })
+                CaptureTensorConstructionError::Memory(
+                    WorkingMemoryError::DomainAllowanceExceeded { .. }
+                )
             ))
         ));
         drop(error);
         assert!(roots.borrow().is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
         native.certify().unwrap();
         drop((run, reservation, registration));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         for panic in [false, true] {
-            let pool = WorkingMemoryPool::new(bytes + h + n, 0).unwrap();
+            let pool = parent_ledger(bytes + h + n, &source, 1).unwrap();
             let registration = register(&pool, &source);
             let (reservation, run) = fresh(&pool, h + n);
             let mut native = run.scope().unwrap();
@@ -567,12 +589,19 @@ fn half_short_parent_rejects_before_work_and_cast_failures_keep_actual_recovery(
             assert_eq!(roots.borrow().len(), 3);
             assert_eq!(roots.borrow().last().unwrap().dtype(), Dtype::Float32);
             drop(registration);
-            assert_eq!(pool.used_bytes().unwrap(), bytes + h + n);
+            assert_eq!(
+                pool.fixture_host_charge().unwrap(),
+                bytes + source_controls(&source) + h + n
+            );
             settle(&roots);
             native.certify().unwrap();
             drop((run, reservation));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
             assert_eq!(reference(&source, &stream).len(), 16);
         }
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

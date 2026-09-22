@@ -5,7 +5,7 @@ impl Executable {
     pub(in crate::composition::mlx) fn prepare_addressable_workspace_sources(
         &self,
         mechanism: ResidentExecutionMechanisms,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         funding: &HostMetadataFunding,
     ) -> Result<Option<AddressableSources>, Error> {
         let Some(banks) = self

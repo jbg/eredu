@@ -42,24 +42,42 @@ impl EmbeddedEquationRecipe {
     /// Exact attempted module/state completion root counts, in invocation order.
     /// The caller moves the original quote-funded vector; it is never cloned.
     pub(crate) fn bind_prediction_boundaries(
-        &mut self, roots: Vec<usize>, consumers: usize,
+        &mut self,
+        roots: Vec<usize>,
+        consumers: usize,
     ) -> Result<(), crate::backend::error::Error> {
-        self.recipe.bind_prediction_boundaries(self.workspace.geometry(), roots, consumers)
+        self.recipe
+            .bind_prediction_boundaries(self.workspace.geometry(), roots, consumers)
     }
     /// One explicit shared target-session completion, independent of selected
     /// module/group boundaries. Reuses their exact root-distribution reducer.
-    pub(crate) fn bind_target_completion(&mut self, roots:Vec<usize>) -> Result<(),crate::backend::error::Error> {
+    pub(crate) fn bind_target_completion(
+        &mut self,
+        roots: Vec<usize>,
+    ) -> Result<(), crate::backend::error::Error> {
         use eredu_runtime::working_memory::WorkingMemoryError;
-        let target=EmbeddedInvocationWorkspace::target_with_readout(self.workspace.invocation(),self.workspace.geometry().output)
-            .map_err(|_|crate::backend::error::Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-        if target!=self.workspace || roots.len()!=1 || roots[0]==0 || self.recipe.records[0].prediction_roots.is_some() {
-            return Err(crate::backend::error::Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        let target = EmbeddedInvocationWorkspace::target_with_readout(
+            self.workspace.invocation(),
+            self.workspace.geometry().output,
+        )
+        .map_err(|_| {
+            crate::backend::error::Error::PrefillControl(WorkingMemoryError::IdentityMismatch)
+        })?;
+        if target != self.workspace
+            || roots.len() != 1
+            || roots[0] == 0
+            || self.recipe.records[0].prediction_roots.is_some()
+        {
+            return Err(crate::backend::error::Error::PrefillControl(
+                WorkingMemoryError::IdentityMismatch,
+            ));
         }
-        self.recipe.records[0].prediction_roots=Some(roots);
+        self.recipe.records[0].prediction_roots = Some(roots);
         Ok(())
     }
     pub(crate) fn matches_prediction_boundaries(&self, roots: &[usize], consumers: usize) -> bool {
-        self.recipe.matches_prediction_boundaries(self.workspace.geometry(), roots.len(), consumers)
+        self.recipe
+            .matches_prediction_boundaries(self.workspace.geometry(), roots.len(), consumers)
             && self.recipe.records[0].prediction_roots.as_deref() == Some(roots)
     }
     /// Borrowed exact attempted-root distribution; no second inventory is made.

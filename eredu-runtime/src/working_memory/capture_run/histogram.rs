@@ -59,20 +59,39 @@ pub struct CaptureHistogramClaim<'a, 'c> {
 impl<'a, 'c> CaptureHistogramClaim<'a, 'c> {
     /// Decode into this claim's fixed paid edges/bins using the canonical
     /// partition reader. Failed input retains its partial payload and account.
-    pub fn decode_partition_receipt(self, bytes: &[u8], expected: PartitionCaptureTensorReceipt<'_>,
+    pub fn decode_partition_receipt(
+        self,
+        bytes: &[u8],
+        expected: PartitionCaptureTensorReceipt<'_>,
         funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<ClaimedCaptureHistogram, PartitionCaptureTensorDecodeError> {
-        let custody=self.identity.custody.share_scheduled();
-        claims::prepare_histogram_decoder(&custody,funding)?;
-        let mut destination=self.prepare().map_err(|cause|
-            claims::histogram_preparation_failure(cause,&custody,funding))?;
-        if let Err(error)=claims::decode_histogram_receipt(&mut destination.value,bytes,expected,
-            destination.claim.geometry(),&custody,funding) {
+        let custody = self.identity.custody.share_scheduled();
+        claims::prepare_histogram_decoder(&custody, funding)?;
+        let mut destination = self
+            .prepare()
+            .map_err(|cause| claims::histogram_preparation_failure(cause, &custody, funding))?;
+        if let Err(error) = claims::decode_histogram_receipt(
+            &mut destination.value,
+            bytes,
+            expected,
+            destination.claim.geometry(),
+            &custody,
+            funding,
+        ) {
             return Err(error.retaining_histogram_payload(destination.value));
         }
-        let (below,above,non_finite)=(destination.value.below,destination.value.above,destination.value.non_finite);
-        destination.finish(below,above,non_finite).map_err(|cause|
-            PartitionCaptureTensorDecodeError::retaining_histogram_failure(cause,custody,funding))
+        let (below, above, non_finite) = (
+            destination.value.below,
+            destination.value.above,
+            destination.value.non_finite,
+        );
+        destination
+            .finish(below, above, non_finite)
+            .map_err(|cause| {
+                PartitionCaptureTensorDecodeError::retaining_histogram_failure(
+                    cause, custody, funding,
+                )
+            })
     }
 
     /// Exact geometry; edges borrow the immutable original admission.
@@ -151,10 +170,16 @@ impl<'a, 'c> CaptureHistogramClaim<'a, 'c> {
     ) -> Result<ScheduledCaptureHistogramTransfer<'a, 'c, 's, K>, CaptureRunHostError> {
         segment.validate_histogram_geometry(self.geometry())?;
         let rollback = if self.partition {
-            self.identity.custody.bind_projected_segment_source(native, segment, &source,
-                self.geometry().admission())?
+            self.identity.custody.bind_projected_segment_source(
+                native,
+                segment,
+                &source,
+                self.geometry().admission(),
+            )?
         } else {
-            self.identity.custody.bind_segment_source(native, segment, &source)?
+            self.identity
+                .custody
+                .bind_segment_source(native, segment, &source)?
         };
         let builder = self.prepare()?;
         let native = rollback.commit();
@@ -380,7 +405,8 @@ impl<'a> ScheduledCaptureStep<'a> {
                 index,
                 custody: self.claim.custody.share_scheduled(),
             },
-            partition: false, exclusive: PhantomData,
+            partition: false,
+            exclusive: PhantomData,
         })
     }
     /// Move a result only to the original bank and scheduling coordinate.
@@ -458,7 +484,8 @@ impl<'a> ScheduledCaptureStep<'a> {
                 index,
                 custody: self.claim.custody.share_scheduled(),
             },
-            partition: false, exclusive: PhantomData,
+            partition: false,
+            exclusive: PhantomData,
         })
     }
     /// Validate the entire scalar contribution before mutating the existing accumulator.
@@ -540,68 +567,138 @@ impl<'a> ScheduledCaptureStep<'a> {
 }
 
 impl<'a> ScheduledCaptureStep<'a> {
-    pub(crate) fn take_remote_prefill_histogram<'c>(&'c mut self,index:usize)
-        -> Result<CaptureHistogramClaim<'a,'c>,CaptureRunHostError> {
+    pub(crate) fn take_remote_prefill_histogram<'c>(
+        &'c mut self,
+        index: usize,
+    ) -> Result<CaptureHistogramClaim<'a, 'c>, CaptureRunHostError> {
         self.validate_remote_prefill_claim(index)?;
-        let geometry=self.claim.policy()?.histogram_geometry(index).map_err(CaptureStepError::from)?;
-        let plan=CaptureHistogramHostPlan::prepare(geometry)?;
+        let geometry = self
+            .claim
+            .policy()?
+            .histogram_geometry(index)
+            .map_err(CaptureStepError::from)?;
+        let plan = CaptureHistogramHostPlan::prepare(geometry)?;
         self.begin_remote_prefill_histogram_claim(index)?;
-        Ok(CaptureHistogramClaim {plan,chunk:None,partition:false,exclusive:PhantomData,
-            identity:claims::ReceiptIdentity {phase:self.claim.phase,prediction:self.claim.prediction,
-                index,custody:self.claim.custody.share_scheduled()}})
+        Ok(CaptureHistogramClaim {
+            plan,
+            chunk: None,
+            partition: false,
+            exclusive: PhantomData,
+            identity: claims::ReceiptIdentity {
+                phase: self.claim.phase,
+                prediction: self.claim.prediction,
+                index,
+                custody: self.claim.custody.share_scheduled(),
+            },
+        })
     }
-    pub(crate) fn record_remote_prefill_histogram(&mut self,receipt:ClaimedCaptureHistogram,
-        source_dtype:TensorDtype)->Result<(),CaptureRunHostError> {
-        let index=receipt.identity.index;
-        self.validate_remote_prefill_record(index,&source_dtype)?;
-        self.record_histogram(receipt,source_dtype,CaptureUsage::default())?;
+    pub(crate) fn record_remote_prefill_histogram(
+        &mut self,
+        receipt: ClaimedCaptureHistogram,
+        source_dtype: TensorDtype,
+    ) -> Result<(), CaptureRunHostError> {
+        let index = receipt.identity.index;
+        self.validate_remote_prefill_record(index, &source_dtype)?;
+        self.record_histogram(receipt, source_dtype, CaptureUsage::default())?;
         self.mark_remote_prefill_recorded(index)
     }
 }
 
-impl<'a,'c> CaptureHistogramClaim<'a,'c> {
-    pub(in crate::working_memory::capture_run) fn from_partition_plan(plan:CaptureHistogramHostPlan<'a>,identity:claims::ReceiptIdentity)->Self {
-        Self {plan,identity,chunk:None,partition:false,exclusive:PhantomData}
+impl<'a, 'c> CaptureHistogramClaim<'a, 'c> {
+    pub(in crate::working_memory::capture_run) fn from_partition_plan(
+        plan: CaptureHistogramHostPlan<'a>,
+        identity: claims::ReceiptIdentity,
+    ) -> Self {
+        Self {
+            plan,
+            identity,
+            chunk: None,
+            partition: false,
+            exclusive: PhantomData,
+        }
     }
 }
 impl ClaimedCaptureHistogram {
-    pub(in crate::working_memory::capture_run) fn partition_identity(&self)->&claims::ReceiptIdentity {&self.identity}
+    pub(in crate::working_memory::capture_run) fn partition_identity(
+        &self,
+    ) -> &claims::ReceiptIdentity {
+        &self.identity
+    }
 }
 
 impl CaptureHistogramClaim<'_, '_> {
-    pub(in crate::working_memory::capture_run) fn partition_identity(&self)->&claims::ReceiptIdentity {&self.identity}
+    pub(in crate::working_memory::capture_run) fn partition_identity(
+        &self,
+    ) -> &claims::ReceiptIdentity {
+        &self.identity
+    }
 }
 impl ScheduledCaptureHistogram<'_, '_> {
-    pub(in crate::working_memory::capture_run) fn merge_partition(&mut self,value:&CaptureHistogram)->Result<(),CaptureRunHostError> {
+    pub(in crate::working_memory::capture_run) fn merge_partition(
+        &mut self,
+        value: &CaptureHistogram,
+    ) -> Result<(), CaptureRunHostError> {
         self.claim.identity.custody.validate()?;
-        crate::capture::reduction::add_histogram_fixed(&mut self.value,value).map_err(CaptureStepError::from)?;
+        crate::capture::reduction::add_histogram_fixed(&mut self.value, value)
+            .map_err(CaptureStepError::from)?;
         Ok(())
     }
-    pub(in crate::working_memory::capture_run) fn fill_partition_sum(&mut self,values:&[f32])->Result<(),CaptureRunHostError> {
+    pub(in crate::working_memory::capture_run) fn fill_partition_sum(
+        &mut self,
+        values: &[f32],
+    ) -> Result<(), CaptureRunHostError> {
         self.claim.identity.custody.validate()?;
-        if values.len()!=self.claim.geometry().elements(){return Err(CaptureRunHostError::ReceiptMismatch);}
-        crate::capture::partition::fill_histogram_f32(values,&mut self.value).map_err(CaptureStepError::from)?;
+        if values.len() != self.claim.geometry().elements() {
+            return Err(CaptureRunHostError::ReceiptMismatch);
+        }
+        crate::capture::partition::fill_histogram_f32(values, &mut self.value)
+            .map_err(CaptureStepError::from)?;
         Ok(())
     }
-    pub(in crate::working_memory::capture_run) fn finish_partition(self)->Result<ClaimedCaptureHistogram,CaptureHistogramFailure> {
-        let (below,above,non_finite)=(self.value.below,self.value.above,self.value.non_finite);
-        self.finish(below,above,non_finite)
+    pub(in crate::working_memory::capture_run) fn finish_partition(
+        self,
+    ) -> Result<ClaimedCaptureHistogram, CaptureHistogramFailure> {
+        let (below, above, non_finite) =
+            (self.value.below, self.value.above, self.value.non_finite);
+        self.finish(below, above, non_finite)
     }
 }
 
-impl<'a,'c> CaptureHistogramClaim<'a,'c> {
+impl<'a, 'c> CaptureHistogramClaim<'a, 'c> {
     pub(in crate::working_memory::capture_run) fn from_partition_prefill_plan(
-        plan:CaptureHistogramHostPlan<'a>,identity:claims::ReceiptIdentity,chunk:u64,
-    )->Self {Self{plan,identity,chunk:Some(chunk),partition:true,exclusive:PhantomData}}
+        plan: CaptureHistogramHostPlan<'a>,
+        identity: claims::ReceiptIdentity,
+        chunk: u64,
+    ) -> Self {
+        Self {
+            plan,
+            identity,
+            chunk: Some(chunk),
+            partition: true,
+            exclusive: PhantomData,
+        }
+    }
     // The exact earlier-chunk buffer becomes the final receipt without another
     // bin allocation; use the same completed histogram validator as all workers.
     pub(in crate::working_memory::capture_run) fn finish_partition_accumulator(
-        self,value:CaptureHistogram,
-    )->Result<ClaimedCaptureHistogram,CaptureHistogramFailure>{
-        ScheduledCaptureHistogram{value,failure:None,claim:self}.finish_partition()
+        self,
+        value: CaptureHistogram,
+    ) -> Result<ClaimedCaptureHistogram, CaptureHistogramFailure> {
+        ScheduledCaptureHistogram {
+            value,
+            failure: None,
+            claim: self,
+        }
+        .finish_partition()
     }
 }
 impl ClaimedCaptureHistogram {
-    pub(in crate::working_memory::capture_run) fn partition_chunk(&self)->Option<u64>{self.chunk}
-    pub(in crate::working_memory::capture_run) fn into_partition_histogram(self)->CaptureHistogram{self.value}
+    pub(in crate::working_memory::capture_run) fn partition_chunk(&self) -> Option<u64> {
+        self.chunk
+    }
+    pub(in crate::working_memory::capture_run) fn into_partition_histogram(
+        self,
+    ) -> CaptureHistogram {
+        self.value
+    }
 }

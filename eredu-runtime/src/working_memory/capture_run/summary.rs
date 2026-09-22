@@ -3,7 +3,6 @@ use super::*;
 mod host;
 pub use host::CaptureHostF32;
 
-
 /// Pure layout of one immutable summary selection and its fixed receipt/error.
 #[derive(Debug)]
 pub struct CaptureSummaryHostPlan<'a> {
@@ -60,13 +59,17 @@ impl<'a, 'c> CaptureSummaryClaim<'a, 'c> {
     /// the same local summary validator checks counts and finite aggregates.
     /// Native completion and all-rank delivery agreement are separate obligations.
     pub fn decode_partition_receipt(
-        self, bytes: &[u8], expected: PartitionCaptureTensorReceipt<'_>,
+        self,
+        bytes: &[u8],
+        expected: PartitionCaptureTensorReceipt<'_>,
         funding: &eredu_nn::workspace::HostMetadataFunding,
     ) -> Result<ClaimedCaptureSummary, PartitionCaptureTensorDecodeError> {
         let custody = self.identity.custody.share_scheduled();
-        let value = claims::decode_summary_receipt(bytes, expected, self.geometry(), &custody, funding)?;
-        self.finish(value).map_err(|cause| PartitionCaptureTensorDecodeError::retaining_summary_failure(
-            cause, custody, funding))
+        let value =
+            claims::decode_summary_receipt(bytes, expected, self.geometry(), &custody, funding)?;
+        self.finish(value).map_err(|cause| {
+            PartitionCaptureTensorDecodeError::retaining_summary_failure(cause, custody, funding)
+        })
     }
 
     /// Actual source shape and original selected offsets.
@@ -160,10 +163,16 @@ impl<'a, 'c> CaptureSummaryClaim<'a, 'c> {
     ) -> Result<ScheduledCaptureSummaryTransfer<'a, 'c, 's, K>, CaptureRunHostError> {
         segment.validate_summary_geometry(self.geometry())?;
         let rollback = if self.partition {
-            self.identity.custody.bind_projected_segment_source(native, segment, &source,
-                self.geometry().admission())?
+            self.identity.custody.bind_projected_segment_source(
+                native,
+                segment,
+                &source,
+                self.geometry().admission(),
+            )?
         } else {
-            self.identity.custody.bind_segment_source(native, segment, &source)?
+            self.identity
+                .custody
+                .bind_segment_source(native, segment, &source)?
         };
         self.identity.custody.validate()?;
         let native = rollback.commit();
@@ -315,7 +324,8 @@ impl<'a> ScheduledCaptureStep<'a> {
                 index,
                 custody: self.claim.custody.share_scheduled(),
             },
-            partition: false, exclusive: PhantomData,
+            partition: false,
+            exclusive: PhantomData,
         })
     }
     /// Move a result only to the original bank and scheduling coordinate.
@@ -401,7 +411,8 @@ impl<'a> ScheduledCaptureStep<'a> {
                 index,
                 custody: self.claim.custody.share_scheduled(),
             },
-            partition: false, exclusive: PhantomData,
+            partition: false,
+            exclusive: PhantomData,
         })
     }
     /// Validate the entire scalar contribution before mutating the existing accumulator.
@@ -484,7 +495,8 @@ impl<'a, 'c> CaptureSummaryClaim<'a, 'c> {
             plan: CaptureSummaryHostPlan::prepare(geometry)?,
             identity,
             chunk: None,
-            partition: false, exclusive: PhantomData,
+            partition: false,
+            exclusive: PhantomData,
         })
     }
 }
@@ -505,18 +517,36 @@ impl ClaimedCaptureSummary {
 impl<'a> ScheduledCaptureStep<'a> {
     /// Spend the complete scalar destination only after all real remote prompt
     /// hooks have completed. The same original H owns both progress and result.
-    pub(crate) fn take_remote_prefill_summary<'c>(&'c mut self, index: usize)
-        -> Result<CaptureSummaryClaim<'a, 'c>, CaptureRunHostError> {
+    pub(crate) fn take_remote_prefill_summary<'c>(
+        &'c mut self,
+        index: usize,
+    ) -> Result<CaptureSummaryClaim<'a, 'c>, CaptureRunHostError> {
         self.validate_remote_prefill_claim(index)?;
-        let geometry = self.claim.policy()?.summary_geometry(index).map_err(CaptureStepError::from)?;
+        let geometry = self
+            .claim
+            .policy()?
+            .summary_geometry(index)
+            .map_err(CaptureStepError::from)?;
         let plan = CaptureSummaryHostPlan::prepare(geometry)?;
         self.begin_remote_prefill_summary_claim(index)?;
-        Ok(CaptureSummaryClaim { plan, chunk: None, partition: false, exclusive: PhantomData,
-            identity: claims::ReceiptIdentity { phase: self.claim.phase, prediction: self.claim.prediction,
-                index, custody: self.claim.custody.share_scheduled() } })
+        Ok(CaptureSummaryClaim {
+            plan,
+            chunk: None,
+            partition: false,
+            exclusive: PhantomData,
+            identity: claims::ReceiptIdentity {
+                phase: self.claim.phase,
+                prediction: self.claim.prediction,
+                index,
+                custody: self.claim.custody.share_scheduled(),
+            },
+        })
     }
-    pub(crate) fn record_remote_prefill_summary(&mut self, receipt: ClaimedCaptureSummary,
-        source_dtype: TensorDtype) -> Result<(), CaptureRunHostError> {
+    pub(crate) fn record_remote_prefill_summary(
+        &mut self,
+        receipt: ClaimedCaptureSummary,
+        source_dtype: TensorDtype,
+    ) -> Result<(), CaptureRunHostError> {
         let index = receipt.identity.index;
         self.validate_remote_prefill_record(index, &source_dtype)?;
         self.record_summary(receipt, source_dtype, CaptureUsage::default())?;
@@ -524,22 +554,52 @@ impl<'a> ScheduledCaptureStep<'a> {
     }
 }
 
-impl<'a,'c> CaptureSummaryClaim<'a,'c> {
-    pub(in crate::working_memory::capture_run) fn from_partition_plan(plan:CaptureSummaryHostPlan<'a>,identity:claims::ReceiptIdentity)->Self {
-        Self {plan,identity,chunk:None,partition:false,exclusive:PhantomData}
+impl<'a, 'c> CaptureSummaryClaim<'a, 'c> {
+    pub(in crate::working_memory::capture_run) fn from_partition_plan(
+        plan: CaptureSummaryHostPlan<'a>,
+        identity: claims::ReceiptIdentity,
+    ) -> Self {
+        Self {
+            plan,
+            identity,
+            chunk: None,
+            partition: false,
+            exclusive: PhantomData,
+        }
     }
 }
 
 impl CaptureSummaryClaim<'_, '_> {
-    pub(in crate::working_memory::capture_run) fn partition_identity(&self)->&claims::ReceiptIdentity {&self.identity}
-    pub(in crate::working_memory::capture_run) fn finish_partition(self,value:CaptureSummary)->Result<ClaimedCaptureSummary,CaptureSummaryFailure> {self.finish(value)}
+    pub(in crate::working_memory::capture_run) fn partition_identity(
+        &self,
+    ) -> &claims::ReceiptIdentity {
+        &self.identity
+    }
+    pub(in crate::working_memory::capture_run) fn finish_partition(
+        self,
+        value: CaptureSummary,
+    ) -> Result<ClaimedCaptureSummary, CaptureSummaryFailure> {
+        self.finish(value)
+    }
 }
 
-impl<'a,'c> CaptureSummaryClaim<'a,'c> {
+impl<'a, 'c> CaptureSummaryClaim<'a, 'c> {
     pub(in crate::working_memory::capture_run) fn from_partition_prefill_plan(
-        plan:CaptureSummaryHostPlan<'a>,identity:claims::ReceiptIdentity,chunk:u64,
-    )->Self {Self{plan,identity,chunk:Some(chunk),partition:true,exclusive:PhantomData}}
+        plan: CaptureSummaryHostPlan<'a>,
+        identity: claims::ReceiptIdentity,
+        chunk: u64,
+    ) -> Self {
+        Self {
+            plan,
+            identity,
+            chunk: Some(chunk),
+            partition: true,
+            exclusive: PhantomData,
+        }
+    }
 }
 impl ClaimedCaptureSummary {
-    pub(in crate::working_memory::capture_run) fn partition_chunk(&self)->Option<u64>{self.chunk}
+    pub(in crate::working_memory::capture_run) fn partition_chunk(&self) -> Option<u64> {
+        self.chunk
+    }
 }

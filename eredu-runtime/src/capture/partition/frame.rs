@@ -20,6 +20,18 @@ pub enum PartitionCaptureFrameKind {
     InterventionReceipt,
 }
 
+impl PartitionCaptureFrameKind {
+    /// Exact fixed protocol word population, or `None` for receipt-sized payloads.
+    /// This descriptive source creates no call, storage or transport authority.
+    pub const fn fixed_words(self) -> Option<usize> {
+        match self {
+            Self::Payload => None,
+            Self::InterventionReceipt => Some(18),
+            _ => Some(16),
+        }
+    }
+}
+
 /// Borrowed words produced by the shared capture protocol. This descriptive
 /// source grants no native allocation or execution permission. Its private
 /// constructor preserves the exact protocol population before backend entry.
@@ -43,11 +55,7 @@ impl<'a> PartitionCaptureFrame<'a> {
             .len()
             .checked_mul(participants)
             .ok_or(CaptureError::Overflow)?;
-        let fixed_width = match kind {
-            PartitionCaptureFrameKind::Payload => None,
-            PartitionCaptureFrameKind::InterventionReceipt => Some(18),
-            _ => Some(16),
-        };
+        let fixed_width = kind.fixed_words();
         if participants == 0
             || rank >= participants
             || words.is_empty()
@@ -128,12 +136,15 @@ impl<T> PartitionCaptureBuffer<T> {
             _funding: None,
         }
     }
-    /// Reserve and construct one exact destination through the existing counted
-    /// metadata vector producer. This grants no numerical/native backing.
-    pub fn funded(
-        capacity: usize,
-        funding: &HostMetadataFunding,
-    ) -> Result<Self, PartitionCaptureStorageError> {
+    /// Complete metadata requirement of the existing funded destination worker.
+    /// The exact vector request and its controls are included once; this query
+    /// neither reserves capacity nor creates a destination or native allowance.
+    pub fn funded_control_bytes(capacity: usize) -> Option<usize> {
+        Self::fixed_controls()?.checked_add(
+            eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<T>(capacity)?,
+        )
+    }
+    fn fixed_controls() -> Option<usize> {
         let controls = [
             size_of::<Self>(),
             size_of::<Option<HostMetadataFunding>>(),
@@ -141,9 +152,22 @@ impl<T> PartitionCaptureBuffer<T> {
             size_of::<PartitionCaptureStorageError>(),
             size_of::<(&HostMetadataFunding, usize)>(),
         ];
-        let bytes = controls
+        controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
+    }
+    /// Reserve and construct one exact destination through the existing counted
+    /// metadata vector producer. This grants no numerical/native backing.
+    pub fn funded(
+        capacity: usize,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, PartitionCaptureStorageError> {
+        let bytes = Self::funded_control_bytes(capacity)
+            .and_then(|total| {
+                total.checked_sub(eredu_nn::workspace::WorkspaceContext::metadata_vec_bytes::<
+                    T,
+                >(capacity)?)
+            })
             .ok_or_else(|| PartitionCaptureStorageError::Funding {
                 cause: HostMetadataFundingError::Overflow,
                 funding: funding.clone(),
@@ -213,8 +237,8 @@ mod tests {
     use super::*;
     use eredu_nn::workspace::HostMetadataAccount;
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[derive(Debug)]
@@ -249,7 +273,10 @@ mod tests {
             retired: retired.clone(),
         })
         .unwrap();
+        let before = used.load(Ordering::SeqCst);
+        let quoted = PartitionCaptureBuffer::<u32>::funded_control_bytes(4).unwrap();
         let mut words = PartitionCaptureBuffer::<u32>::funded(4, &funding).unwrap();
+        assert_eq!(used.load(Ordering::SeqCst)-before,quoted);
         words
             .extend_from_slice(&[17, 0x03bb, 65539, u32::MAX])
             .unwrap();
@@ -304,19 +331,17 @@ mod tests {
             PartitionCaptureFrame::new(PartitionCaptureFrameKind::Payload, 2, 3, &payload, 2)
                 .is_err()
         );
-        assert!(PartitionCaptureFrame::new(
-            PartitionCaptureFrameKind::Preparation,
-            0,
-            3,
-            &payload,
-            16
-        )
-        .is_err());
+        assert!(
+            PartitionCaptureFrame::new(PartitionCaptureFrameKind::Preparation, 0, 3, &payload, 16)
+                .is_err()
+        );
     }
 }
 
 impl<T> AsRef<[T]> for PartitionCaptureBuffer<T> {
-    fn as_ref(&self) -> &[T] { &self.values }
+    fn as_ref(&self) -> &[T] {
+        &self.values
+    }
 }
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;

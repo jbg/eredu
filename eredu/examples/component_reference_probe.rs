@@ -1,11 +1,13 @@
 //! Released-checkpoint capture/intervention parity through public APIs.
 //! Generate the oracle with eredu-evaluation/scripts/component_reference.py.
-use anyhow::{Context, ensure};
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
+use anyhow::{ensure, Context};
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::parameters::*;
-use eredu_core::{ExecutionPlan, GenerationConfigOverrides, capture::*, intervention::*};
+use eredu_core::{capture::*, intervention::*, ExecutionPlan, GenerationConfigOverrides};
 use std::ops::ControlFlow;
 
 #[path = "component_reference_analysis.rs"]
@@ -68,7 +70,12 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .prepare_chat(
+            &source,
+            &policy,
+            &physical_memory::finite_each(CAPACITY)?,
+            &cancellation,
+        )?
         .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -77,7 +84,10 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 17,
@@ -200,7 +210,6 @@ fn main() -> anyhow::Result<()> {
         limits: CaptureLimits {
             per_step: budget,
             cumulative: budget,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -309,7 +318,7 @@ fn main() -> anyhow::Result<()> {
             schema_version: INTERVENTION_SCHEMA_VERSION,
             operations,
         };
-        let mut request = PreparedChatRequest::new(&chat, settings);
+        let mut request = PreparedChatRequest::new(&chat, settings.clone());
         request.input = PreparedChatPrompt::TokenIds(&prefix);
         request.output_mode = PreparedChatOutputMode::Text;
         request.capture = Some(&capture);

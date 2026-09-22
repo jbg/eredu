@@ -2,9 +2,11 @@
 
 use super::*;
 use eredu_core::execution_control::SnapshotEstimate;
-use std::sync::Arc;
 mod branch;
-pub use branch::{ControlBranchSource, ControlBranchPlacement, ControlExchangeResult};
+#[cfg(test)]
+#[path = "parameter_control_identity/tests.rs"]
+mod parameter_identity_tests;
+pub use branch::{ControlBranchPlacement, ControlBranchSource, ControlExchangeResult};
 
 /// Native mechanisms for complete, independently writable ordinary state copies.
 /// Unlike rollback checkpoints, these copies must remain stable as any descendant
@@ -59,13 +61,13 @@ where
 
 /// Exact executable and parameter-snapshot identity at a resolved control boundary.
 ///
-/// Clones retain only an identity allocation, never model parameters, state,
+/// Clones retain an identity allocation and its parameter generation, never model parameters, state,
 /// requests or completion resources. This token proves neither source inventory
 /// completeness nor a byte bound, and grants no execution or allocation authority.
 /// An enclosing saved-source owner must bind it to the actual state being copied.
 #[derive(Clone, Debug)]
 pub struct ReplicatedTextControlOrigin {
-    owner: Arc<()>,
+    owner: crate::replicated_session::ParameterControlIdentity,
     // Captured state provenance is separate from executable/parameter identity.
     // A fixed origin loan never initializes a missing revision allocation.
     captured: Option<CapturedControlRevision>,
@@ -79,7 +81,7 @@ impl ReplicatedTextControlOrigin {
     /// Compares the retained executable/parameter identity only. Equality
     /// grants no source inventory, state compatibility or execution authority.
     pub fn same_origin(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.owner, &other.owner)
+        self.owner.matches(&other.owner)
     }
 }
 
@@ -152,7 +154,7 @@ pub enum PreparedControlExchangeError<A: std::fmt::Display, P: std::fmt::Display
 /// Slots share an exact executable owner and can be exchanged serially while
 /// keeping weights resident. Copying a slot requires the native copy mechanism.
 pub struct ReplicatedTextControlState<S> {
-    owner: Arc<()>,
+    owner: crate::replicated_session::ParameterControlIdentity,
     state: S,
     prompt_input_identity: Option<SharedPreparedInputCacheIdentity>,
     captured: Option<CapturedControlRevision>,
@@ -218,7 +220,7 @@ where
         self.inspect_runtime_execution_fixed(|_, _, _| Ok::<(), std::convert::Infallible>(()))
             .map(|_| ())?;
         Ok(ReplicatedTextControlOrigin {
-            owner: Arc::clone(&self.control_identity),
+            owner: self.control_identity.clone(),
             captured: self
                 .state
                 .inference_retention()
@@ -249,7 +251,7 @@ where
     ) -> Result<(), PreparedControlBindingError> {
         self.inspect_runtime_execution_fixed(|_, _, _| Ok::<(), std::convert::Infallible>(()))
             .map(|_| ())?;
-        if !Arc::ptr_eq(&self.control_identity, &origin.owner) {
+        if !self.control_identity.matches(&origin.owner) {
             return Err(PreparedControlBindingError::ForeignOrigin);
         }
         Ok(())
@@ -296,7 +298,7 @@ where
             return Err(PreparedControlBindingError::StateLayout);
         }
         Ok(ReplicatedTextControlState {
-            owner: Arc::clone(&origin.owner),
+            owner: origin.owner.clone(),
             state,
             prompt_input_identity,
             captured: origin.captured.clone(),
@@ -329,54 +331,6 @@ where
             retained_bytes: native.retained_bytes.checked_add(metadata)?,
             copy_bytes: native.copy_bytes.checked_add(metadata)?,
         })
-    }
-
-    /// Prepares an empty state without changing installed state or doing a
-    /// collective exchange. The enclosing parameter coordinator owns admission,
-    /// preparation agreement, publication, rollback and terminal fencing.
-    /// Call only after reserving `estimate_parameter_reset_state`.
-    pub fn prepare_parameter_reset_state(
-        &mut self,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<
-        ReplicatedTextControlState<M::State>,
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
-    > {
-        self.ensure_commit_resolved()?;
-        let selected = self.selected_state.state().ok_or_else(|| {
-            ReplicatedTextSessionError::Contract(
-                "parameter state reset requires selected state".into(),
-            )
-        })?;
-        let state = self
-            .mechanisms
-            .realize_state(selected, context)
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
-        self.validate_control_geometry(&state)?;
-        Ok(ReplicatedTextControlState {
-            owner: Arc::clone(&self.control_identity),
-            state,
-            prompt_input_identity: None,
-            captured: None,
-        })
-    }
-
-    /// Exchanges complete state under an enclosing parameter transaction, with
-    /// no nested collective or tensor copy. A second exchange restores the exact
-    /// original cache and prompt identity. Commit epochs are never rewound.
-    /// Invalidate snapshots only after every peer confirms publication.
-    pub fn exchange_parameter_reset_state(
-        &mut self,
-        slot: &mut ReplicatedTextControlState<M::State>,
-    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.validate_control_state(slot)?;
-        crate::working_memory::exchange_inference_state(&mut self.state, &mut slot.state);
-        slot.captured = None;
-        std::mem::swap(
-            &mut self.committed_prompt_input_identity,
-            &mut slot.prompt_input_identity,
-        );
-        Ok(())
     }
 
     /// Estimates another independent copy of an existing compatible slot.
@@ -449,7 +403,7 @@ where
         let mut state = state;
         state.inherit_inference_retention(&self.state);
         Ok(ReplicatedTextControlState {
-            owner: Arc::clone(&self.control_identity),
+            owner: self.control_identity.clone(),
             state,
             prompt_input_identity: self.committed_prompt_input_identity.clone(),
             captured: self
@@ -489,7 +443,7 @@ where
         let mut state = state;
         state.inherit_inference_retention(&saved.state);
         Ok(ReplicatedTextControlState {
-            owner: Arc::clone(&self.control_identity),
+            owner: self.control_identity.clone(),
             state,
             prompt_input_identity: saved.prompt_input_identity.clone(),
             captured: saved.captured.clone(),
@@ -575,7 +529,7 @@ where
         saved: &ReplicatedTextControlState<M::State>,
     ) -> Result<(), PreparedControlBindingError> {
         RuntimeInspectionBoundary::resolved(self.control_fence, self.last_commit_outcome)?;
-        if !Arc::ptr_eq(&self.control_identity, &saved.owner) {
+        if !self.control_identity.matches(&saved.owner) {
             return Err(PreparedControlBindingError::ForeignOrigin);
         }
         let selected = self
@@ -609,11 +563,11 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         metadata: Option<&eredu_nn::workspace::HostMetadataFunding>,
         media: Option<&crate::working_memory::MediaSessionBinding>,
-        branch: Option<(&crate::working_memory::PendingTextBranchExchange, &[ControlBranchSource; 2])>,
-    ) -> Result<
-        ControlExchangeResult,
-        PreparedControlExchangeError<A::Error, M::PolicyError>,
-    > {
+        branch: Option<(
+            &crate::working_memory::PendingTextBranchExchange,
+            &[ControlBranchSource; 2],
+        )>,
+    ) -> Result<ControlExchangeResult, PreparedControlExchangeError<A::Error, M::PolicyError>> {
         let validation = self
             .validate_control_state_fixed(slot)
             .map_err(PreparedControlExchangeError::Binding)
@@ -636,12 +590,16 @@ where
                         .map_err(PreparedControlExchangeError::Metadata)?;
                 }
                 if let Some((pending, sources)) = branch {
-                    if metadata.is_none() || media.is_some() { return Err(crate::working_memory::WorkingMemoryError::IdentityMismatch.into()); }
+                    if metadata.is_none() || media.is_some() {
+                        return Err(
+                            crate::working_memory::WorkingMemoryError::IdentityMismatch.into()
+                        );
+                    }
                     self.validate_branch_sources(slot, pending, sources)?;
                 }
                 if let Some(source) = media {
                     if metadata.is_none()
-                        || !Arc::ptr_eq(&self.control_identity, &source.control)
+                        || !self.control_identity.matches(&source.control)
                         || !slot.captured.as_ref().is_some_and(|captured| {
                             source.matches_snapshot(
                                 &self.prefill_identity,
@@ -663,13 +621,25 @@ where
                         );
                     }
                 }
-                let installed = metadata.map(crate::working_memory::InferenceStateRevision::prepare_metadata)
-                    .transpose().map_err(PreparedControlExchangeError::Metadata)?;
+                let installed = metadata
+                    .map(crate::working_memory::InferenceStateRevision::prepare_metadata)
+                    .transpose()
+                    .map_err(PreparedControlExchangeError::Metadata)?;
                 let displaced = if metadata.is_some() {
-                    Some(crate::working_memory::InferenceStateRevision::prepare_metadata(metadata.expect("validated original funding"))
-                        .map_err(PreparedControlExchangeError::Metadata)?)
-                } else { None };
-                let source = if metadata.is_some() && branch.is_none() { Some(self.control_branch_source(&self.state)?) } else { None };
+                    Some(
+                        crate::working_memory::InferenceStateRevision::prepare_metadata(
+                            metadata.expect("validated original funding"),
+                        )
+                        .map_err(PreparedControlExchangeError::Metadata)?,
+                    )
+                } else {
+                    None
+                };
+                let source = if metadata.is_some() && branch.is_none() {
+                    Some(self.control_branch_source(&self.state)?)
+                } else {
+                    None
+                };
                 Ok((installed, displaced, source))
             });
         RuntimeInspectionBoundary::resolved(self.control_fence, self.last_commit_outcome)
@@ -684,30 +654,55 @@ where
             PreparedControlExchangeError::Agreement,
             |phase| PreparedControlExchangeError::Remote { phase },
         )?;
-        let placements = branch.map(|(_, sources)| branch::placements(sources,
-            displaced.as_ref().expect("branch displaced revision").clone(),
-            revision.as_ref().expect("branch installed revision").clone()));
-        let displaced_placement = displaced_source.map(|source| branch::displaced(source,
-            displaced.as_ref().expect("funded displaced revision").clone()));
+        let placements = branch.map(|(_, sources)| {
+            branch::placements(
+                sources,
+                displaced
+                    .as_ref()
+                    .expect("branch displaced revision")
+                    .clone(),
+                revision
+                    .as_ref()
+                    .expect("branch installed revision")
+                    .clone(),
+            )
+        });
+        let displaced_placement = displaced_source.map(|source| {
+            branch::displaced(
+                source,
+                displaced
+                    .as_ref()
+                    .expect("funded displaced revision")
+                    .clone(),
+            )
+        });
         self.exchange_control_payload(slot);
-        if let Some(revision) = displaced { slot.state.inference_retention_mut().install_exchanged_revision(revision); }
+        if let Some(revision) = displaced {
+            slot.state
+                .inference_retention_mut()
+                .install_exchanged_revision(revision);
+        }
         if let Some(revision) = revision {
             self.state
                 .inference_retention_mut()
                 .install_exchanged_revision(revision);
         }
-        Ok(ControlExchangeResult { placements, displaced: displaced_placement, media: media.map(|source| {
-            crate::working_memory::CopiedMediaStateBinding::new(
-                source,
-                crate::working_memory::MediaSessionBinding {
-                    execution: self.prefill_identity.clone(),
-                    revision: self.state.inference_retention().revision().clone(),
-                    control: Arc::clone(&self.control_identity),
-                    // Checked on the exact slot before the infallible swap above.
-                    frontier: source.frontier,
-                },
-            )
-        }) })
+        Ok(ControlExchangeResult {
+            placements,
+            displaced: displaced_placement,
+            media: media.map(|source| {
+                crate::working_memory::CopiedMediaStateBinding::new(
+                    source,
+                    crate::working_memory::MediaSessionBinding {
+                        execution: self.prefill_identity.clone(),
+                        revision: self.state.inference_retention().revision().clone(),
+                        control: self.control_identity.clone(),
+                        // Checked on the exact slot before the infallible swap above.
+                        frontier: source.frontier,
+                    },
+                )
+            }),
+        })
     }
 
     /// Atomically exchanges complete state at an already completed boundary.

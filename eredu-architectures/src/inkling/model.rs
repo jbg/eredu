@@ -23,10 +23,9 @@ use eredu_runtime::{
 };
 
 use super::{
-    AudioInput, AudioTower, DecoderLayer, LocalGeometry, ModelArgs, MtpModel, MtpOutput,
-    VisionLayer, VisionStatic, composite_state_layout, layer_parameter_groups,
-    mtp_parameter_groups, mtp_state_layout, state_layout, static_parameter_groups,
-    vision_layer_parameter_groups,
+    composite_state_layout, layer_parameter_groups, mtp_parameter_groups, mtp_state_layout,
+    state_layout, static_parameter_groups, vision_layer_parameter_groups, AudioInput, AudioTower,
+    DecoderLayer, LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
 use crate::{
     composite_execution::{CompositeArchitecture, PreparedCompositeInput},
@@ -145,21 +144,67 @@ impl<T> PreparedInput<T> {
     }
 }
 
+fn visit_semantic_tokens<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, InklingInputPartPlan>,
+    visitor: &mut dyn FnMut(
+        crate::composite_execution::PredictionTokenPart<'_, T>,
+    ) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let metadata = crate::decoder::identity::Metadata::new(input.metadata());
+    metadata.controls::<(
+        InklingInputPartPlan,
+        crate::composite_execution::PredictionTokenPart<'_, T>,
+    )>()?;
+    for (part, plan) in input
+        .prepared()
+        .parts()
+        .iter()
+        .zip(input.admitted().inkling_parts())
+    {
+        let placeholder = match plan {
+            InklingInputPartPlan::TextTokens { .. } => None,
+            InklingInputPartPlan::Projected {
+                placeholder_token_id,
+                positions,
+                ..
+            } => Some((placeholder_token_id, positions)),
+            InklingInputPartPlan::Media { ingress, .. } => {
+                Some((ingress.placeholder_token_id, ingress.placeholder_count))
+            }
+        };
+        let token = if let Some((token, positions)) = placeholder {
+            crate::composite_execution::PredictionTokenPart::Repeated { token, positions }
+        } else {
+            match (part.modality(), part.payload()) {
+                (
+                    eredu_core::InputModality::Text,
+                    eredu_runtime::PreparedInputPayload::TokenIds(tokens),
+                ) => crate::composite_execution::PredictionTokenPart::Tokens(tokens),
+                _ => {
+                    return Err(
+                        metadata.error(format_args!("Inkling text part has no token identity"))
+                    )
+                }
+            }
+        };
+        visitor(token)?;
+    }
+    Ok(())
+}
+
 fn prepared_semantic_tokens<T: Tensor>(
     input: PreparedCompositeInput<'_, T, InklingInputPartPlan>,
     context: &T::Context,
 ) -> Result<Vec<T>, Error> {
-    crate::composite_execution::prepared_token_parts(input, context, |plan| match plan {
-        InklingInputPartPlan::TextTokens { .. } => None,
-        InklingInputPartPlan::Projected {
-            placeholder_token_id,
-            positions,
-            ..
-        } => Some((*placeholder_token_id, *positions)),
-        InklingInputPartPlan::Media { ingress, .. } => {
-            Some((ingress.placeholder_token_id, ingress.placeholder_count))
-        }
-    })
+    let metadata = crate::decoder::identity::Metadata::new(input.metadata());
+    let mut parts = metadata.vector(input.prepared().len())?;
+    visit_semantic_tokens(input, &mut |part| {
+        parts.push(crate::composite_execution::prediction_tokens::materialize(
+            part, context, metadata,
+        )?);
+        Ok(())
+    })?;
+    Ok(parts)
 }
 
 /// Materializes placeholders, retained media extents, and ordered segments from
@@ -168,24 +213,17 @@ pub fn prepare_input<T: Tensor>(
     input: PreparedCompositeInput<'_, T, InklingInputPartPlan>,
     context: &T::Context,
 ) -> Result<PreparedInput<T>, Error> {
+    let metadata = crate::decoder::ModuleMetadata::destination(input.metadata());
+    metadata.controls::<(PreparedInput<T>, InklingInputPartPlan, usize, i32)>()?;
     let prepared = input.prepared();
-    let admitted = input
-        .admitted()
-        .ordinary()
-        .expect("this family retains ordinary admission");
-    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
-        return Err(Error::backend(
-            "Inkling prepared input no longer matches its admission",
-        ));
-    }
-
+    let admitted = input.admitted();
     let tokens = prepared_semantic_tokens(input, context)?;
-    let mut modalities = Vec::with_capacity(prepared.len());
-    let mut projected = Vec::with_capacity(prepared.len());
-    let mut images = Vec::new();
-    let mut audio = Vec::new();
+    let mut modalities = metadata.vector(prepared.len())?;
+    let mut projected = metadata.vector(prepared.len())?;
+    let mut images = metadata.vector(prepared.len())?;
+    let mut audio = metadata.vector(prepared.len())?;
     let mut audio_frames = 0i32;
-    for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
+    for (part, plan) in prepared.parts().iter().zip(admitted.inkling_parts()) {
         match plan {
             InklingInputPartPlan::TextTokens { .. } => {
                 modalities.push(eredu_core::InputModality::Text);
@@ -198,7 +236,7 @@ pub fn prepare_input<T: Tensor>(
                     ));
                 };
 
-                modalities.push(*modality);
+                modalities.push(modality);
                 projected.push(Some(value.clone()));
             }
             InklingInputPartPlan::Media {
@@ -212,7 +250,7 @@ pub fn prepare_input<T: Tensor>(
                 let count = i32::try_from(ingress.placeholder_count)
                     .map_err(|_| Error::backend("Inkling media span exceeds I32"))?;
 
-                modalities.push(*modality);
+                modalities.push(modality);
                 projected.push(None);
                 match modality {
                     eredu_core::InputModality::Image => images.push(value.clone()),
@@ -223,7 +261,9 @@ pub fn prepare_input<T: Tensor>(
                                 context,
                             )?,
                         );
-                        audio_frames += count;
+                        audio_frames = audio_frames
+                            .checked_add(count)
+                            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
                     }
                     _ => {
                         return Err(Error::backend(
@@ -298,13 +338,11 @@ where
 
     fn visit_prepared_prediction_tokens(
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-        visitor: &mut dyn FnMut(crate::composite_execution::PredictionTokenPart<'_, B::Tensor>) -> Result<(), Error>,
+        visitor: &mut dyn FnMut(
+            crate::composite_execution::PredictionTokenPart<'_, B::Tensor>,
+        ) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        crate::composite_execution::prediction_tokens::visit(input, |plan| match plan {
-            InklingInputPartPlan::TextTokens { .. } => None,
-            InklingInputPartPlan::Projected { placeholder_token_id, positions, .. } => Some((*placeholder_token_id, *positions)),
-            InklingInputPartPlan::Media { ingress, .. } => Some((ingress.placeholder_token_id, ingress.placeholder_count)),
-        }, visitor)
+        visit_semantic_tokens(input, visitor)
     }
 
     fn should_execute_prepared_group(
@@ -313,36 +351,24 @@ where
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> bool {
         match group {
-            0 => input
-                .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
-                .any(|part| {
-                    matches!(
-                        part,
-                        InklingInputPartPlan::Media {
-                            modality: eredu_core::InputModality::Image,
-                            ..
-                        }
-                    )
-                }),
-            1 => input
-                .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
-                .any(|part| {
-                    matches!(
-                        part,
-                        InklingInputPartPlan::Media {
-                            modality: eredu_core::InputModality::Audio,
-                            ..
-                        }
-                    )
-                }),
+            0 => input.admitted().inkling_parts().any(|part| {
+                matches!(
+                    part,
+                    InklingInputPartPlan::Media {
+                        modality: eredu_core::InputModality::Image,
+                        ..
+                    }
+                )
+            }),
+            1 => input.admitted().inkling_parts().any(|part| {
+                matches!(
+                    part,
+                    InklingInputPartPlan::Media {
+                        modality: eredu_core::InputModality::Audio,
+                        ..
+                    }
+                )
+            }),
             2 => true,
             _ => false,
         }
@@ -361,26 +387,19 @@ where
             };
             input
                 .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
+                .inkling_parts()
                 .filter_map(|part| match part {
                     InklingInputPartPlan::Media {
                         modality: actual,
                         shape,
                         ..
-                    } if *actual == modality => Some(shape.decoder_positions),
+                    } if actual == modality => Some(shape.decoder_positions),
                     _ => None,
                 })
                 .try_fold(0u64, |n, v| n.checked_add(v))
                 .ok_or("Inkling boundary sequence overflowed")?
         } else {
-            input
-                .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .decoder_positions()
+            input.admitted().decoder_positions()
         };
         i32::try_from(positions).map_err(|_| "Inkling boundary sequence exceeds i32".to_owned())
     }
@@ -506,11 +525,21 @@ where
         // when their parameters are selected with TP-local ownership. The
         // explicit empty schedule prevents the generic driver from inventing
         // row reductions for this group.
-        let destination=crate::composite_execution::graph::Destination(context);
-        destination.controls::<(&Self,usize,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,
-            usize,usize,Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>)>()?;
-        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 { return Ok(None); }
-        destination.collect((0..pipeline_stages).map(|_| Vec::new())).map(Some)
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<(
+            &Self,
+            usize,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+            usize,
+            usize,
+            Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,
+        )>()?;
+        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
+            return Ok(None);
+        }
+        destination
+            .collect((0..pipeline_stages).map(|_| Vec::new()))
+            .map(Some)
     }
 
     fn prepared_primary_ingress_collectives(
@@ -519,17 +548,18 @@ where
         tensor_partitions: usize,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
-        let destination=crate::composite_execution::graph::Destination(context);
-        destination.controls::<(&Self,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,usize)>()?;
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<(
+            &Self,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+            usize,
+        )>()?;
         crate::composite_execution::segmented_token_ingress_collectives_in(
             input
                 .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
+                .inkling_parts()
                 .filter_map(|part| match part {
-                    InklingInputPartPlan::TextTokens { positions } => Some(*positions),
+                    InklingInputPartPlan::TextTokens { positions } => Some(positions),
                     InklingInputPartPlan::Projected { .. } | InklingInputPartPlan::Media { .. } => {
                         None
                     }
@@ -981,20 +1011,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 {
     type DefinitionError = Error;
 
-
     fn state_layout(
         &self,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<StateLayout, Self::DefinitionError> {
-match context { Some(context) => {
-        self.checked_units(context)?
-            .layouts
-            .composite()
-            .clone_workspace(context)
-    }, None => {
-        Ok(self.state_layouts()?.composite().clone())
-    } }
-}
+        match context {
+            Some(context) => self
+                .checked_units(context)?
+                .layouts
+                .composite()
+                .clone_workspace(context),
+            None => Ok(self.state_layouts()?.composite().clone()),
+        }
+    }
 
     fn state_identity(
         &self,
@@ -1002,27 +1031,26 @@ match context { Some(context) => {
         topology: PromptCacheTopology,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<ModelStateIdentity, Self::DefinitionError> {
-match context { Some(context) => {
-        let source = self.checked_units(context)?;
-        state_identity_with_count(
-            &self.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-            source.global_state_layers,
-            crate::decoder::identity::Metadata::new(Some(context)),
-        )
-    }, None => {
-        state_identity(
-            &self.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    } }
-}
-
-
+        match context {
+            Some(context) => {
+                let source = self.checked_units(context)?;
+                state_identity_with_count(
+                    &self.args,
+                    state.layout(),
+                    state.global_layer_offset(),
+                    topology,
+                    source.global_state_layers,
+                    crate::decoder::identity::Metadata::new(Some(context)),
+                )
+            }
+            None => state_identity(
+                &self.args,
+                state.layout(),
+                state.global_layer_offset(),
+                topology,
+            ),
+        }
+    }
 
     fn parameter_description(
         &self,
@@ -1040,14 +1068,14 @@ match context { Some(context) => {
             return Ok(std::borrow::Cow::Borrowed(&source.description));
         }
         (|| {
-        if B::construction_metadata(context)
-            .is_some_and(|metadata| metadata.uses_checked_metadata())
-        {
-            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
-        }
-        self.parameter_description_impl(context)
-    })()
-            .map(std::borrow::Cow::Owned)
+            if B::construction_metadata(context)
+                .is_some_and(|metadata| metadata.uses_checked_metadata())
+            {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+            self.parameter_description_impl(context)
+        })()
+        .map(std::borrow::Cow::Owned)
     }
 
     fn static_parameter_recipes(
@@ -1205,6 +1233,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         Self::from_source(source, None, context)
     }
 
+    pub(crate) fn new_parallel_with_source(
+        source: RetainedModelSource,
+        geometry: Arc<LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::require_construction(context)?;
+        geometry.validate_for(&source).map_err(Error::backend)?;
+        Self::from_source(source, Some(geometry), context)
+    }
+
     fn from_source(
         source: RetainedModelSource,
         geometry: Option<Arc<LocalGeometry>>,
@@ -1299,7 +1337,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = match B::construction_metadata(context) { Some(context) => self.execution_graph.clone_with_metadata(context)?, None => self.execution_graph.clone() };
+        let graph = match B::construction_metadata(context) {
+            Some(context) => self.execution_graph.clone_with_metadata(context)?,
+            None => self.execution_graph.clone(),
+        };
         let counts = [
             self.args
                 .vision_config
@@ -1988,25 +2029,44 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         audio: Option<&B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.assemble_with_metadata(
+            parts,
+            vision,
+            audio,
+            context,
+            crate::decoder::ModuleMetadata::new::<B>(context),
+        )
+    }
+    fn assemble_with_metadata(
+        &mut self,
+        parts: &[PreparedPart<B::Tensor>],
+        vision: Option<&B::Tensor>,
+        audio: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::ModuleMetadata<'_>,
+    ) -> Result<B::Tensor, Error> {
+        metadata.controls::<(B::Tensor, Vec<B::Tensor>, i32, i32, i32, i32, usize)>()?;
         let image_tokens =
             part_token_count(parts, |part| matches!(part, PreparedPart::Image { .. }));
         let audio_tokens =
             part_token_count(parts, |part| matches!(part, PreparedPart::Audio { .. }));
-        validate_component(
+        validate_component_with_metadata(
             "image",
             vision,
             image_tokens,
             self.args.text_config.hidden_size,
+            metadata,
         )?;
-        validate_component(
+        validate_component_with_metadata(
             "audio",
             audio,
             audio_tokens,
             self.args.text_config.hidden_size,
+            metadata,
         )?;
         let mut image_offset = 0;
         let mut audio_offset = 0;
-        let mut embeddings = Vec::with_capacity(parts.len());
+        let mut embeddings = metadata.vector(parts.len())?;
         for part in parts {
             match part {
                 PreparedPart::Text {
@@ -2040,7 +2100,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let batch = parts
             .first()
             .map(prepared_part_tokens)
-            .ok_or_else(|| Error::backend("Inkling input has no ordered parts"))?
+            .ok_or_else(|| metadata.error(format_args!("Inkling input has no ordered parts")))?
             .dim(0);
         for (index, (part, embeddings)) in parts.iter().zip(&embeddings).enumerate() {
             let tokens = prepared_part_tokens(part);
@@ -2051,7 +2111,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 || tokens.dim(1) != embeddings.dim(1)
                 || embeddings.dim(2) != self.args.text_config.hidden_size
             {
-                return Err(Error::backend(format!(
+                return Err(metadata.error(format_args!(
                     "Inkling ordered input part {index} has incompatible token/embedding shapes {:?} and {:?}",
                     tokens.shape(),
                     embeddings.shape()
@@ -2079,55 +2139,123 @@ where
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
     fn media_prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            usize,
+            usize,
+            String,
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            std::ops::Range<usize>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error>,
+        )>()?;
 
         // The validated ingress preserves media offsets and causal hMLP/attention state; encoder rows are not declared.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
+        let units =
+            <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
         let mut declarations = crate::decoder::media_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)), metadata_context)?;
+            (0..units).map(|index| {
+                <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)
+            }),
+            metadata_context,
+        )?;
         // The retained-media ingress changes decoder inputs and positions, but
         // executes the same row-local routed banks as the ordinary target.
         // Reuse those exact architecture declarations; encoder hooks remain
         // outside this decoder contract.
-        let ordinary=<Self as LayeredArchitecture<B,S>>::prefill_observation_declarations(self,metadata_context)?;
-        metadata.controls::<(Vec<eredu_runtime::layered::PrefillObservationDeclaration>,usize)>()?;
-        let selected = ordinary.iter().filter(|declaration| declaration.flattens_batch_tokens());
+        let ordinary = <Self as LayeredArchitecture<B, S>>::prefill_observation_declarations(
+            self,
+            metadata_context,
+        )?;
+        metadata.controls::<(
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            usize,
+        )>()?;
+        let selected = ordinary
+            .iter()
+            .filter(|declaration| declaration.flattens_batch_tokens());
         metadata.borrowed_controls(&selected)?;
         let count = selected.count();
-        if let Some(context) = metadata.context() { context.reserve_metadata_vec(&mut declarations, count)?; }
-        let selected = ordinary.into_iter().filter(|declaration| declaration.flattens_batch_tokens());
+        if let Some(context) = metadata.context() {
+            context.reserve_metadata_vec(&mut declarations, count)?;
+        }
+        let selected = ordinary
+            .into_iter()
+            .filter(|declaration| declaration.flattens_batch_tokens());
         metadata.borrowed_controls(&selected)?;
         declarations.extend(selected);
         Ok(declarations)
     }
 
     fn prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            usize,
+            usize,
+            String,
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            std::ops::Range<usize>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error>,
+        )>()?;
 
         // The ordinary target uses four causal convolutions and learned-relative
         // attention at each layer's absolute cache offset. Media and prediction
         // invocations receive no row proof from this target-group declaration.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
+        let units =
+            <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 2, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)),
-            true, metadata_context)?;
-        { if let Some(context)=metadata.context(){context.reserve_metadata_vec(&mut declarations,1)?;} declarations.push(
-            eredu_runtime::layered::PrefillObservationDeclaration::causal_ordinary_text(
-                "readout.scaled".into(),
-                1,
-                eredu_runtime::layered::PrefillReadoutStage::ReadoutInput,
-            ),
-        ); };
+            (0..units).map(|index| {
+                <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)
+            }),
+            true,
+            metadata_context,
+        )?;
+        {
+            if let Some(context) = metadata.context() {
+                context.reserve_metadata_vec(&mut declarations, 1)?;
+            }
+            declarations.push(
+                eredu_runtime::layered::PrefillObservationDeclaration::causal_ordinary_text(
+                    "readout.scaled".into(),
+                    1,
+                    eredu_runtime::layered::PrefillReadoutStage::ReadoutInput,
+                ),
+            );
+        };
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..units {
-            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)?;
-            if self.args.text_config.layer_schedule.get(index).is_some_and(|policy| policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe) {
-                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.routing"))?, metadata_context)?;
-                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.shared.routing"))?, metadata_context)?;
+            let path =
+                <Self as LayeredArchitecture<B, S>>::unit_path(self, 2, index, metadata_context)?;
+            if self
+                .args
+                .text_config
+                .layer_schedule
+                .get(index)
+                .is_some_and(|policy| {
+                    policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe
+                })
+            {
+                crate::decoder::append_routed_prefill_path(
+                    &mut declarations,
+                    &metadata.format(format_args!("{path}.routing"))?,
+                    metadata_context,
+                )?;
+                crate::decoder::append_routed_prefill_path(
+                    &mut declarations,
+                    &metadata.format(format_args!("{path}.shared.routing"))?,
+                    metadata_context,
+                )?;
             }
         }
         Ok(declarations)
@@ -2190,21 +2318,32 @@ where
         crate::transport::pipeline_with_output_state(2, target_layers, layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+    fn execution_graph(
+        &self,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
             &self.execution_graph,
         ))
     }
 
-
-
-    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+    fn group_unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
         if let Some(context) = metadata_context {
-            return self.checked_units(context)?.description.unit_layout().group_range(group)
-                .map(|range| range.len()).ok_or_else(|| metadata.error(format_args!("Inkling group is outside retained source")));
+            return self
+                .checked_units(context)?
+                .description
+                .unit_layout()
+                .group_range(group)
+                .map(|range| range.len())
+                .ok_or_else(|| {
+                    metadata.error(format_args!("Inkling group is outside retained source"))
+                });
         }
         match group {
             0 => Ok(self
@@ -2218,9 +2357,19 @@ where
         }
     }
 
-    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+    fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+        metadata.controls::<(
+            &Self,
+            usize,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>()?;
 
         let count = match group {
             0 => self
@@ -2230,7 +2379,9 @@ where
                 .map_or(0, |vision| vision.num_hidden_layers as usize),
             1 => 0,
             2 => self.args.text_config.num_hidden_layers as usize,
-            _ => return Err(metadata.error(format_args!("{}", "Inkling has three execution groups"))),
+            _ => {
+                return Err(metadata.error(format_args!("{}", "Inkling has three execution groups")))
+            }
         };
         if index >= count {
             return Err(metadata.error(format_args!("{}", "Inkling unit is outside its group")));
@@ -2242,14 +2393,24 @@ where
         }
     }
 
-    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+    fn group_input_observation_path(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
-        metadata.optional_path((group == 2).then_some(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH))
+        metadata.optional_path(
+            (group == 2).then_some(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH),
+        )
     }
 
-    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+    fn group_output_observation_path(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
@@ -2835,15 +2996,15 @@ fn state_identity_with_count(
 }
 
 fn ordered_tokens<T: Tensor>(parts: &[PreparedPart<T>], context: &T::Context) -> Result<T, Error> {
-    let tokens = parts
-        .iter()
-        .map(|part| match part {
-            PreparedPart::Text { tokens, .. }
-            | PreparedPart::Image { tokens }
-            | PreparedPart::Audio { tokens }
-            | PreparedPart::Projected { tokens, .. } => tokens.clone(),
-        })
-        .collect::<Vec<_>>();
+    ordered_tokens_with_metadata(parts, context, crate::decoder::ModuleMetadata::ordinary())
+}
+fn ordered_tokens_with_metadata<T: Tensor>(
+    parts: &[PreparedPart<T>],
+    context: &T::Context,
+    metadata: crate::decoder::ModuleMetadata<'_>,
+) -> Result<T, Error> {
+    let mut tokens = metadata.vector(parts.len())?;
+    tokens.extend(parts.iter().map(prepared_part_tokens).cloned());
     T::concatenate(&tokens, 1, context)
 }
 
@@ -2869,14 +3030,29 @@ fn validate_component<T: Tensor>(
     tokens: i32,
     hidden: i32,
 ) -> Result<(), Error> {
+    validate_component_with_metadata(
+        name,
+        value,
+        tokens,
+        hidden,
+        crate::decoder::ModuleMetadata::ordinary(),
+    )
+}
+fn validate_component_with_metadata<T: Tensor>(
+    name: &str,
+    value: Option<&T>,
+    tokens: i32,
+    hidden: i32,
+    metadata: crate::decoder::ModuleMetadata<'_>,
+) -> Result<(), Error> {
     match value {
         Some(value) if value.shape() == [1, tokens, hidden] => Ok(()),
         None if tokens == 0 => Ok(()),
-        Some(value) => Err(Error::backend(format!(
+        Some(value) => Err(metadata.error(format_args!(
             "Inkling {name} output has shape {:?}, expected [1, {tokens}, {hidden}]",
             value.shape()
         ))),
-        None => Err(Error::backend(format!(
+        None => Err(metadata.error(format_args!(
             "Inkling {name} placeholders require projected media"
         ))),
     }
@@ -2913,11 +3089,16 @@ where
 
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self::Boundary, Self::Error> {
         if let Some(metadata) = metadata {
             metadata.charge_metadata(std::mem::size_of::<(
-                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
-                Self::Boundary, Result<Self::Boundary, Self::Error>,
+                &Self,
+                Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary,
+                Result<Self::Boundary, Self::Error>,
             )>())?;
         }
 
@@ -3078,7 +3259,6 @@ mod state_layout_tests {
     }
 }
 
-
 // Keep unused ordinary declarations out of the retained-source constructor's
 // frame. The metadata gate remains in build_unit before this worker is called.
 #[inline(never)]
@@ -3088,58 +3268,56 @@ fn build_ordinary_unit<B>(
     index: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Unit<B>, Error>
-where B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-        match group {
-            0 => {
-                let vision = architecture
-                    .args
-                    .vision_config
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("Inkling has no vision config"))?;
-                Ok(Unit::Vision(VisionLayer::new(
-                    vision,
-                    index,
-                    vision.layer_specs()[index],
-                    context,
-                )?))
-            }
-            2 => {
-                let text = match &architecture.parallel_geometry {
-                    Some(geometry) => geometry.text_layer(index).ok_or_else(|| {
-                        Error::backend("missing rank-local Inkling text geometry")
-                    })?,
-                    None => &architecture.args.text_config,
-                };
-                let realization = architecture
-                    .expert_realization
-                    .as_ref()
-                    .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
-                    .cloned();
-                if architecture.expert_realization.is_some()
-                    && architecture
-                        .args
-                        .text_config
-                        .layer_policy(index)
-                        .is_some_and(|policy| {
-                            policy.feed_forward == super::FeedForwardPolicy::SparseMoe
-                        })
-                    && realization.is_none()
-                {
-                    return Err(Error::backend(format!(
-                        "Inkling expert realization omits text unit {index}"
-                    )));
-                }
-                Ok(Unit::Text(match realization {
-                    Some(realization) => DecoderLayer::new_with_expert_realization(
-                        text,
-                        index,
-                        realization,
-                        context,
-                    )?,
-                    None => DecoderLayer::new(text, index, context)?,
-                }))
-            }
-            _ => Err(Error::backend("Inkling has three execution groups")),
+    match group {
+        0 => {
+            let vision = architecture
+                .args
+                .vision_config
+                .as_ref()
+                .ok_or_else(|| Error::backend("Inkling has no vision config"))?;
+            Ok(Unit::Vision(VisionLayer::new(
+                vision,
+                index,
+                vision.layer_specs()[index],
+                context,
+            )?))
         }
+        2 => {
+            let text = match &architecture.parallel_geometry {
+                Some(geometry) => geometry
+                    .text_layer(index)
+                    .ok_or_else(|| Error::backend("missing rank-local Inkling text geometry"))?,
+                None => &architecture.args.text_config,
+            };
+            let realization = architecture
+                .expert_realization
+                .as_ref()
+                .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
+                .cloned();
+            if architecture.expert_realization.is_some()
+                && architecture
+                    .args
+                    .text_config
+                    .layer_policy(index)
+                    .is_some_and(|policy| {
+                        policy.feed_forward == super::FeedForwardPolicy::SparseMoe
+                    })
+                && realization.is_none()
+            {
+                return Err(Error::backend(format!(
+                    "Inkling expert realization omits text unit {index}"
+                )));
+            }
+            Ok(Unit::Text(match realization {
+                Some(realization) => {
+                    DecoderLayer::new_with_expert_realization(text, index, realization, context)?
+                }
+                None => DecoderLayer::new(text, index, context)?,
+            }))
+        }
+        _ => Err(Error::backend("Inkling has three execution groups")),
     }
+}

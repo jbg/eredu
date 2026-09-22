@@ -10,11 +10,11 @@ pub(super) fn json(implicit: bool) -> String {
 }
 fn sizes(implicit: bool) -> (u64, u64) {
     let text = if implicit { "hi12<S>hi ?" } else { TEXT };
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let source = source(&pool, &json(implicit));
     (
         source.original_bytes(),
-        WorkingMemoryPool::tokenizer_encode_required_bytes(&source, text, false).unwrap(),
+        MemoryLedger::tokenizer_encode_required_bytes(&source, text, false).unwrap(),
     )
 }
 #[test]
@@ -29,15 +29,17 @@ fn profile_case_0(implicit: bool) {
     let text = if implicit { "hi12<S>hi ?" } else { TEXT };
     let (c, e) = sizes(implicit);
     let json = json(implicit);
-    let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(c - 1, 0).unwrap();
     assert!(
         short
             .compile_tokenizer(TokenizerPlan::prepare_json(json.as_bytes()).unwrap())
             .is_err()
     );
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     for one_short in [true, false] {
-        let pool = WorkingMemoryPool::new(c + e - u64::from(one_short), 0).unwrap();
+        let pool =
+            crate::working_memory::memory_fixture::host_ledger(c + e - u64::from(one_short), 0)
+                .unwrap();
         let source = source(&pool, &json);
         let result = pool.encode_tokenizer_ids_with(
             &source,
@@ -46,7 +48,7 @@ fn profile_case_0(implicit: bool) {
             |p| p,
             || {
                 assert!(!one_short);
-                assert_eq!(pool.used_bytes().unwrap(), c + e);
+                assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                 assert!(matches!(
                     pool.acquire_unquoted(),
                     Err(WorkingMemoryError::ReservedWorkActive)
@@ -58,10 +60,10 @@ fn profile_case_0(implicit: bool) {
             let error = result.unwrap_err();
             assert_eq!(error.retained_bytes(), 0);
             assert!(
-                matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if *required_bytes==e && *available_bytes==e-1)
+                matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==e && (limit_bytes - existing_bytes)==e-1)
             );
             drop(source);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             drop(error);
         } else {
             let output = result.unwrap();
@@ -74,11 +76,11 @@ fn profile_case_0(implicit: bool) {
                 }
             );
             assert!(output.matches_source(&source));
-            drop(pool.acquire_unquoted().unwrap());
+            crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
             drop(source);
-            assert_eq!(pool.used_bytes().unwrap(), c + e);
+            assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
             drop(output);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -94,9 +96,9 @@ fn implicit_same_regex_source_has_independent_concurrent_original_workspaces_and
 fn profile_case_2(implicit: bool) {
     let text = if implicit { "hi12<S>hi ?" } else { TEXT };
     let (c, e) = sizes(implicit);
-    let pool = WorkingMemoryPool::new(c + 2 * e, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(c + 2 * e, 0).unwrap();
     let source = source(&pool, &json(implicit));
-    let foreign = WorkingMemoryPool::new(c + e, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(c + e, 0).unwrap();
     let rejects: Vec<_> = (0..16)
         .map(|_| {
             foreign
@@ -140,7 +142,7 @@ fn profile_case_2(implicit: bool) {
         let arrivals = [rx.recv(), rx.recv()];
         let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (
-                pool.used_bytes(),
+                pool.payload_used_bytes(),
                 pool.encode_tokenizer_ids(&source, text, false),
             )
         }));
@@ -157,10 +159,10 @@ fn profile_case_2(implicit: bool) {
     assert_ne!(a.ids().as_ptr(), b.ids().as_ptr());
     drop(source);
     drop(a);
-    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
     drop(b);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     drop(rejects);
 }
 
@@ -170,15 +172,15 @@ fn malformed_regex_compilation_retains_admission_and_its_upstream_error() {
     value["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = "[".into();
     let input = value.to_string();
     let plan = TokenizerPlan::prepare_json(input.as_bytes()).unwrap();
-    let c = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
-    let pool = WorkingMemoryPool::new(c, 0).unwrap();
+    let c = MemoryLedger::tokenizer_required_bytes(&plan).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(c, 0).unwrap();
     let error = pool.compile_tokenizer(plan).unwrap_err();
     assert_eq!(error.retained_bytes(), c);
     assert!(error.compiler_failure().unwrap().root_failure().is_some());
     assert!(error.source().is_some());
     drop(input);
-    drop(pool.acquire_unquoted().unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), c);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

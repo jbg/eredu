@@ -381,18 +381,18 @@ fn new_preparation(
     reserved: bool,
 ) -> (
     InferenceTextPreparation,
-    WorkingMemoryPool,
+    MemoryLedger,
     InferenceExecutionIdentity,
 ) {
     let mut g = geometry(3, OutputDemand::LastPosition);
     g.max_output_tokens = tokens;
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
-    let request = if reserved {
-        pool.reserve(&id, &admission(g)).unwrap().into()
+    let pool = if reserved {
+        memory::host_ledger(65536, 0).unwrap()
     } else {
-        InferenceRequest::without_memory_budget(&id, g).unwrap()
+        memory::unlimited_ledger(0)
     };
+    let request: InferenceRequest = pool.reserve(&id, &admission(g)).unwrap().into();
     let preparation = request
         .prepare_text(&id, g, config(tokens as usize))
         .unwrap();
@@ -468,9 +468,9 @@ fn shared_core_machine_consumes_sequential_receipts_for_ordinary_and_controlled_
         if controlled {
             assert_eq!(facts.borrow().commits, 3);
         }
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.funded_used_bytes().unwrap() > 0);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
 }
 
@@ -723,8 +723,8 @@ fn submitted_input_revalidation_rejects_swapped_receipts_without_changing_progre
         second.finish().unwrap();
         [first_receipt, second_receipt]
     });
-    let charged = pool.used_bytes().unwrap();
-    let peak = pool.peak_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
+    let peak = pool.payload_peak_bytes().unwrap();
     let step = preparation
         .claim_step(&contexts[2], PendingTextInput::Decode(&receipts[0][1]))
         .unwrap();
@@ -756,8 +756,8 @@ fn submitted_input_revalidation_rejects_swapped_receipts_without_changing_progre
             Err(WorkingMemoryError::TextStepActive)
         ));
     }
-    assert_eq!(pool.used_bytes().unwrap(), charged);
-    assert_eq!(pool.peak_bytes().unwrap(), peak);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), peak);
     step.finish().unwrap();
     assert!(matches!(
         preparation.claim_step(&contexts[3], PendingTextInput::Decode(&output)),
@@ -767,7 +767,7 @@ fn submitted_input_revalidation_rejects_swapped_receipts_without_changing_progre
         })
     ));
     drop(preparation);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -784,9 +784,9 @@ fn unfinished_step_fences_all_clones_and_provisional_receipts_never_authorize_an
     step.request()
         .validate_same_request(first.request())
         .unwrap();
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
     drop(step);
     assert!(matches!(
         saved.claim_step(&contexts[1], PendingTextInput::Decode(&provisional)),
@@ -812,7 +812,7 @@ fn unfinished_step_fences_all_clones_and_provisional_receipts_never_authorize_an
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop((saved, provisional));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -901,11 +901,11 @@ fn concurrent_claims_share_one_active_step_and_its_charge() {
     }
     let winner = winner.unwrap();
     let receipt = winner.receipt();
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
     drop(preparation);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
     winner.finish().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     assert_eq!(
         receipt.clone().attempt(),
         0,
@@ -915,7 +915,7 @@ fn concurrent_claims_share_one_active_step_and_its_charge() {
 
 fn preparation_in(
     execution: &InferenceExecutionIdentity,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     context: &TextStepContext,
 ) -> InferenceTextPreparation {
     let g = geometry(3, OutputDemand::LastPosition);
@@ -931,7 +931,7 @@ fn explicit_supersession_fences_all_predecessor_clones_without_refunding_charges
     let old_contexts = issued_contexts();
     let new_contexts = issued_contexts();
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let old = preparation_in(&id, &pool, &old_contexts[0]);
     let old_clone = old.clone();
     let first = old
@@ -941,19 +941,19 @@ fn explicit_supersession_fences_all_predecessor_clones_without_refunding_charges
     // Like a native escaped token, this independent owner keeps its original
     // charge. The receipt itself remains payload-free evidence.
     let escaped_token_charge = first.request().clone();
-    let old_bytes = pool.used_bytes().unwrap();
+    let old_bytes = pool.funded_used_bytes().unwrap();
     first.finish().unwrap();
     let new = preparation_in(&id, &pool, &new_contexts[0]);
     let replacement = new
         .claim_step(&new_contexts[0], PendingTextInput::Prefill(()))
         .unwrap();
-    let charged = pool.used_bytes().unwrap();
-    let peak = pool.peak_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
+    let peak = pool.payload_peak_bytes().unwrap();
     replacement
         .supersede_predecessor(old.request(), &id)
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), charged);
-    assert_eq!(pool.peak_bytes().unwrap(), peak);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), peak);
     // The predecessor still had two unused output slots. Only this explicit
     // transition retires them; completed evidence and clones cannot reopen it.
     for predecessor in [&old, &old_clone] {
@@ -977,10 +977,10 @@ fn explicit_supersession_fences_all_predecessor_clones_without_refunding_charges
         .finish()
         .unwrap();
     drop((old, old_clone, new));
-    assert_eq!(pool.used_bytes().unwrap(), old_bytes);
+    assert_eq!(pool.funded_used_bytes().unwrap(), old_bytes);
     assert_eq!(receipt.clone().attempt(), 0);
     drop(escaped_token_charge);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -988,7 +988,7 @@ fn rejected_supersession_preserves_both_runs_and_active_predecessor_permission()
     let old_contexts = issued_contexts();
     let new_contexts = issued_contexts();
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let old = preparation_in(&id, &pool, &old_contexts[0]);
     let old_first = old
         .claim_step(&old_contexts[0], PendingTextInput::Prefill(()))
@@ -999,7 +999,7 @@ fn rejected_supersession_preserves_both_runs_and_active_predecessor_permission()
     let replacement = new
         .claim_step(&new_contexts[0], PendingTextInput::Prefill(()))
         .unwrap();
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
     for (predecessor, execution) in [
         (old.request(), InferenceExecutionIdentity::default()),
         (new.request(), id.clone()),
@@ -1043,7 +1043,7 @@ fn rejected_supersession_preserves_both_runs_and_active_predecessor_permission()
     .finish()
     .unwrap();
     later.finish().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
 }
 
 #[test]
@@ -1051,7 +1051,7 @@ fn supersession_requires_bound_ready_distinct_runs_before_retiring_any_predecess
     let contexts = issued_contexts();
     let predecessor_contexts = issued_contexts();
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let new = preparation_in(&id, &pool, &contexts[0]);
     let replacement = new
         .claim_step(&contexts[0], PendingTextInput::Prefill(()))
@@ -1108,7 +1108,7 @@ fn supersession_requires_bound_ready_distinct_runs_before_retiring_any_predecess
 fn one_initial_permit_can_supersede_only_one_predecessor_under_concurrent_borrows() {
     let contexts = [issued_contexts(), issued_contexts(), issued_contexts()];
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let predecessors = [
         preparation_in(&id, &pool, &contexts[0][0]),
         preparation_in(&id, &pool, &contexts[1][0]),
@@ -1119,7 +1119,7 @@ fn one_initial_permit_can_supersede_only_one_predecessor_under_concurrent_borrow
             .unwrap(),
     );
     let barrier = Arc::new(std::sync::Barrier::new(2));
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.funded_used_bytes().unwrap();
     let handles = predecessors
         .iter()
         .map(|predecessor| {
@@ -1154,14 +1154,14 @@ fn one_initial_permit_can_supersede_only_one_predecessor_under_concurrent_borrow
         }
     }
     Arc::try_unwrap(replacement).unwrap().finish().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.funded_used_bytes().unwrap(), charged);
 }
 
 #[test]
 fn opposing_supersessions_reject_active_steps_without_deadlocking() {
     let contexts = [issued_contexts(), issued_contexts()];
     let id = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let preparations = [
         preparation_in(&id, &pool, &contexts[0][0]),
         preparation_in(&id, &pool, &contexts[1][0]),
@@ -1224,8 +1224,8 @@ fn reserved_receipts_can_escape_retirement_but_never_authenticate_a_later_accoun
     let aliases = [receipt.clone(), receipt.clone(), receipt.clone()];
     drop(preparation);
     // Read-only scalar receipts do not keep the reservation/preparation shells.
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.effective_capacity().unwrap(), 4096);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_effective_capacity().unwrap(), 65536);
     let next: InferenceRequest = pool
         .reserve(&execution, &admission(geometry))
         .unwrap()

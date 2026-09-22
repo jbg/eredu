@@ -18,14 +18,19 @@ fn pkey(key: &Key) -> PublicationKey {
     PublicationKey::Payload(key.clone())
 }
 fn publication_quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &SharedCapturePlan,
     root: &Key,
     g: InferenceGeometry,
     slots: usize,
 ) -> IncrementalInferenceQuote {
     let context = WorkspaceContext::new(Facts);
-    let backing = WorkspaceExistingStorage::new(Some(64), &context);
+    let backing = WorkspaceExistingStorage::try_new_placed(
+        Some(64),
+        crate::memory::placement_ref(),
+        &context,
+    )
+    .unwrap();
     let tensor = WorkspaceTensor::existing_with_storage(
         WorkspaceLayout::new(&[1], WorkspaceDtype::Float32).unwrap(),
         &backing,
@@ -40,7 +45,8 @@ fn publication_quote(
     })
     .unwrap();
     let b = |n| WorkspaceBound::bounded(n, "actual neutral publication fixture envelope");
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: b(384),
         attention: b(0),
@@ -50,7 +56,7 @@ fn publication_quote(
         retained: b(CaptureRunHostPlan::prepare(source)
             .unwrap()
             .initialization_peak_bytes()),
-    };
+    });
     let q = ResidualInferenceQuote::compose(
         &report,
         mock_inference_admission(g).state,
@@ -109,6 +115,10 @@ struct PublicationBackend {
     keys: Vec<Key>,
     outputs: Vec<BoundedPublishedAllocation<PublicationKey>>,
     ordinary: Vec<WorkingMemoryStorage<PublicationKey>>,
+    probes: Vec<(
+        PreparedStoragePublication<PublicationKey>,
+        PreparedStoragePublication<PublicationKey>,
+    )>,
     origin: Option<WorkingMemoryFundingScope>,
     mode: PublicationMode,
     failure: Option<BoundedPublicationError>,
@@ -150,7 +160,9 @@ impl ScheduledCaptureBackend for PublicationBackend {
         );
         if self.mode != PublicationMode::Empty {
             // Mixed legacy alias + new/fixed alias + genuine zero-byte key.
-            attempt.push_owned(pkey(&self.keys[0]), 64).unwrap();
+            attempt
+                .push_owned(pkey(&self.keys[0]), 64, crate::memory::placement())
+                .unwrap();
             attempt
                 .push_owned(
                     pkey(&self.keys[1]),
@@ -159,9 +171,12 @@ impl ScheduledCaptureBackend for PublicationBackend {
                     } else {
                         32
                     },
+                    crate::memory::placement(),
                 )
                 .unwrap();
-            attempt.push_owned(pkey(&self.keys[2]), 0).unwrap();
+            attempt
+                .push_owned(pkey(&self.keys[2]), 0, crate::memory::placement())
+                .unwrap();
             attempt
                 .push_owned(
                     pkey(&self.keys[0]),
@@ -170,14 +185,21 @@ impl ScheduledCaptureBackend for PublicationBackend {
                     } else {
                         64
                     },
+                    crate::memory::placement(),
                 )
                 .unwrap();
             if self.mode == PublicationMode::Capacity {
-                attempt.push_owned(pkey(&self.keys[3]), 17).unwrap();
+                attempt
+                    .push_owned(pkey(&self.keys[3]), 17, crate::memory::placement())
+                    .unwrap();
             } else {
-                attempt.push_owned(pkey(&self.keys[3]), 16).unwrap();
+                attempt
+                    .push_owned(pkey(&self.keys[3]), 16, crate::memory::placement())
+                    .unwrap();
             }
-            let rejected = attempt.push_owned(pkey(&self.keys[0]), 64).unwrap_err();
+            let rejected = attempt
+                .push_owned(pkey(&self.keys[0]), 64, crate::memory::placement())
+                .unwrap_err();
             assert_eq!(rejected, pkey(&self.keys[0]));
         }
         if matches!(
@@ -192,14 +214,14 @@ impl ScheduledCaptureBackend for PublicationBackend {
                 .panic_after
                 .store(1, AtomicOrdering::SeqCst);
         }
-        let used = scope.pool().used_bytes().unwrap();
-        let peak = scope.pool().peak_bytes().unwrap();
+        let used = scope.pool().payload_used_bytes().unwrap();
+        let peak = scope.pool().payload_peak_bytes().unwrap();
         let worker = self.contention.as_ref().map(|c| {
             c.key.0.armed.store(true, AtomicOrdering::SeqCst);
             let key = c.key.clone();
-            let pool = scope.pool().clone();
+            let prepared = c.publication.lock().unwrap().take().unwrap();
             let worker =
-                std::thread::spawn(move || pool.pin_registered_storage([(key, 1)]).unwrap());
+                std::thread::spawn(move || prepared.pin_registered_storage([(key, 1)]).unwrap());
             c.entered
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
@@ -211,11 +233,12 @@ impl ScheduledCaptureBackend for PublicationBackend {
             drop(worker.join().unwrap());
         }
         assert_eq!(
-            scope.pool().used_bytes().unwrap(),
+            scope.pool().payload_used_bytes().unwrap(),
             used,
             "adoption converts original charge only"
         );
-        assert_eq!(scope.pool().peak_bytes().unwrap(), peak);
+        assert_eq!(scope.pool().payload_peak_bytes().unwrap(), peak);
+        let (primary_probe, secondary_probe) = self.probes.pop().unwrap();
         match result {
             Ok(()) => {
                 assert_eq!(
@@ -252,8 +275,7 @@ impl ScheduledCaptureBackend for PublicationBackend {
                     // Both ordinary grouped and per-key aliases use the same fixed
                     // canonical entries; these may outlive every bounded wrapper.
                     self.ordinary.push(
-                        scope
-                            .pool()
+                        primary_probe
                             .pin_registered_storage([
                                 (pkey(&self.keys[1]), 32),
                                 (pkey(&self.keys[2]), 0),
@@ -261,9 +283,11 @@ impl ScheduledCaptureBackend for PublicationBackend {
                             .unwrap(),
                     );
                     self.ordinary.extend(
-                        scope
-                            .pool()
-                            .register_storage_individually([(pkey(&self.keys[1]), 32)])
+                        secondary_probe
+                            .register_storage_individually([(
+                                pkey(&self.keys[1]),
+                                StorageAllocation::new(32, scope.pool().host_placement_handle()),
+                            )])
                             .unwrap()
                             .into_values(),
                     );
@@ -277,8 +301,7 @@ impl ScheduledCaptureBackend for PublicationBackend {
                 assert!(attempt.take_allocation(0).is_none());
                 assert_eq!(attempt.retained_input_count(), 5);
                 assert!(
-                    scope
-                        .pool()
+                    primary_probe
                         .pin_registered_storage([(
                             pkey(&self.keys[1]),
                             if self.mode == PublicationMode::Budget {
@@ -291,18 +314,14 @@ impl ScheduledCaptureBackend for PublicationBackend {
                     "first new key did not leak from rejected mixed batch"
                 );
                 if self.mode == PublicationMode::LateZero {
-                    // This real zero-byte entry preceded the batch. Ordinary
-                    // pinning retains its existing registration; the bounded
-                    // publication's separate origin-health check rejected it.
-                    let prior = scope
-                        .pool()
-                        .pin_registered_storage([(pkey(&self.keys[2]), 0)])
-                        .unwrap();
-                    assert_eq!(prior.bytes(), 0);
-                    drop(prior);
+                    // A zero-capacity alias still needs the source account's
+                    // execution health, independently of its physical charge.
+                    assert!(matches!(
+                        secondary_probe.pin_registered_storage([(pkey(&self.keys[2]), 0)]),
+                        Err(WorkingMemoryError::ExecutionFenced)
+                    ));
                 } else {
-                    assert!(scope
-                        .pool()
+                    assert!(secondary_probe
                         .pin_registered_storage([(pkey(&self.keys[2]), 0)])
                         .is_err());
                 }
@@ -405,7 +424,7 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
     let paths = runtime.prepare_observation_paths().unwrap();
     let selected = paths.source().prepare_capture_selection(&source).unwrap();
     let bound = selected.bind_geometry(g).unwrap();
-    let pool = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let pool = crate::memory::host_ledger(8_000_000, 0).unwrap();
     let keys = vec![
         key(1, 64),
         key(
@@ -420,27 +439,69 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         key(4, 16),
     ];
     let weak = Arc::downgrade(&keys[1].payload);
-    let root = pool.register_storage([(pkey(&keys[0]), 64)]).unwrap();
+    let root = pool.register_host_storage([(pkey(&keys[0]), 64)]).unwrap();
+    let mut origin_admission = mock_inference_admission(g);
+    let population = if mode == PublicationMode::LateZero {
+        2
+    } else {
+        1
+    };
+    let controls = MemoryLedger::storage_metadata_control_bytes().unwrap()
+        + StoragePublicationLayout::<PublicationKey>::new(population)
+            .unwrap()
+            .requested_bytes();
+    origin_admission
+        .state
+        .execution_workspace
+        .as_mut()
+        .unwrap()
+        .physical_domains
+        .as_mut()
+        .unwrap()
+        .retained
+        .add_allocation(controls, pool.host_placement())
+        .unwrap();
+    origin_admission
+        .state
+        .execution_workspace
+        .as_mut()
+        .unwrap()
+        .retained = eredu_core::WorkspaceBound::bounded(
+        64 + controls,
+        "publication descriptors and owner controls",
+    );
+    origin_admission.incremental_required_bytes = Some(384 + controls);
     let (origin_r, origin_run) = pool
-        .reserve(
-            session.inference_execution_identity(),
-            &mock_inference_admission(g),
-        )
+        .reserve(session.inference_execution_identity(), &origin_admission)
         .unwrap()
         .into_funding()
         .unwrap();
     let origin = origin_run.scope().unwrap();
     let external = origin
-        .adopt_storage_individually(if mode == PublicationMode::LateZero {
+        .adopt_host_storage_individually(if mode == PublicationMode::LateZero {
             vec![(pkey(&keys[3]), 16), (pkey(&keys[2]), 0)]
         } else {
             vec![(pkey(&keys[3]), 16)]
         })
         .unwrap();
-    let contention = (mode == PublicationMode::Busy).then(contention);
+    let contention = (mode == PublicationMode::Busy).then(|| contention(&pool));
     let hold = contention
         .as_ref()
-        .map(|c| pool.register_storage([(c.key.clone(), 1)]).unwrap());
+        .map(|c| pool.register_host_storage([(c.key.clone(), 1)]).unwrap());
+    let probes = (0..rows)
+        .map(|_| {
+            (
+                StoragePublicationLayout::new(2)
+                    .unwrap()
+                    .fund(&pool)
+                    .unwrap(),
+                StoragePublicationLayout::new(1)
+                    .unwrap()
+                    .fund(&pool)
+                    .unwrap(),
+            )
+        })
+        .collect();
     let q = publication_quote(
         &pool,
         &source,
@@ -448,7 +509,7 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         g,
         if mode == PublicationMode::Empty { 0 } else { 5 },
     );
-    let exact = pool.used_bytes().unwrap() + q.incremental_bytes();
+    let exact = pool.live_charge_bytes().unwrap() + incremental_reservation_bytes(&pool, &q);
     let caps = ModelCapabilities {
         effective_model_type: "ordinary-text-fixture".into(),
         native_max_context: Observed::exact(128, "fixture"),
@@ -461,17 +522,16 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         input: InputTokenCount::text(rows),
         max_output_tokens: 1,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
     };
     assert!(plan_prefill_incremental_with_capacity(
         session.inference_execution_identity(),
         &pool,
         &caps,
-        shape,
+        shape.clone(),
         g,
-        exact - 1,
+        crate::memory::resolved_limits(exact - 1),
         |_| Ok(q.clone())
     )
     .is_err());
@@ -479,9 +539,9 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         session.inference_execution_identity(),
         &pool,
         &caps,
-        shape,
+        shape.clone(),
         g,
-        exact,
+        crate::memory::resolved_limits(exact),
         |_| Ok(q.clone()),
     )
     .unwrap();
@@ -512,6 +572,7 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         keys,
         outputs: vec![],
         ordinary: vec![],
+        probes,
         origin: Some(origin),
         mode,
         failure: None,
@@ -559,7 +620,7 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
     if mode == PublicationMode::Panic {
         assert!(result.is_err());
         assert_eq!(backend.attempt.as_ref().unwrap().retained_input_count(), 5);
-        assert!(pool.used_bytes().is_ok());
+        assert!(pool.payload_used_bytes().is_ok());
     } else if matches!(
         mode,
         PublicationMode::Capacity
@@ -576,8 +637,11 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
             (PublicationMode::Busy, BoundedPublicationError::Busy) => {}
             (
                 PublicationMode::Budget,
-                BoundedPublicationError::Storage(WorkingMemoryError::BudgetExceeded { .. }),
-            ) => {}
+                BoundedPublicationError::Storage(WorkingMemoryError::DomainAllowanceExceeded {
+                    domain,
+                    ..
+                }),
+            ) => assert_eq!(*domain, pool.topology().host_domain()),
             (
                 PublicationMode::LateHealth | PublicationMode::LateZero,
                 BoundedPublicationError::Storage(WorkingMemoryError::ExecutionFenced),
@@ -616,31 +680,31 @@ fn exercise_publication(mode: PublicationMode, rows: u64) {
         mode,
         PublicationMode::LateHealth | PublicationMode::LateZero
     ) {
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.payload_used_bytes().unwrap() > 0);
         drop((failed, outputs, ordinary));
         return;
     }
     if !outputs.is_empty() {
         // Escaped legacy output controls keep the original source witness free:
         // C can retire even while the new fixed entry's raw S custody survives.
-        assert_eq!(pool.used_bytes().unwrap(), protected + 112);
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected + 112);
         for output in &outputs {
             output.validate_source(&pool).unwrap();
         }
         assert_eq!(&*weak.upgrade().unwrap(), &[2u8; 32]);
         drop(outputs);
-        assert_eq!(pool.used_bytes().unwrap(), protected + 32);
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected + 32);
         assert!(pool.pin_registered_storage([(ckey, c)]).is_err());
         drop(ordinary);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert!(weak.upgrade().is_none());
     } else {
         drop((outputs, ordinary));
         if failed.is_some() {
-            assert!(pool.used_bytes().unwrap() >= protected);
+            assert!(pool.payload_used_bytes().unwrap() >= protected);
         }
         drop(failed);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]

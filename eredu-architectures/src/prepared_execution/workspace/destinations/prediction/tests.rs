@@ -19,7 +19,27 @@ impl WorkspaceMechanisms for NoPayload {
 
 #[test]
 fn cold_prediction_destinations_keep_source_and_do_not_publish_executable_placement() {
-    let (_directory, inspection) = inspected_config(prediction_config());
+    check_cold_prediction_destinations(prediction_config());
+}
+
+#[test]
+fn cold_component_prediction_destinations_preserve_supplementary_modules() {
+    check_cold_prediction_destinations(serde_json::json!({
+        "model_type": "nemotron_h", "architectures": ["NemotronHForCausalLM"],
+        "vocab_size":13,"hidden_size":12,"intermediate_size":18,"num_hidden_layers":4,
+        "hybrid_override_pattern":"M-**","num_attention_heads":6,"num_key_value_heads":2,
+        "head_dim":2,"max_position_embeddings":64,"sliding_window":3,
+        "layer_norm_epsilon":0.00001,"norm_eps":0.00001,
+        "mamba_num_heads":6,"mamba_head_dim":2,"n_groups":2,"ssm_state_size":2,
+        "conv_kernel":3,"chunk_size":2,"moe_intermediate_size":5,
+        "moe_shared_expert_intermediate_size":7,"n_routed_experts":2,"n_shared_experts":1,
+        "num_experts_per_tok":2,"n_group":1,"topk_group":1,"tie_word_embeddings":false,
+        "torch_dtype":"float32","num_nextn_predict_layers":1,"mtp_hybrid_override_pattern":"*"
+    }));
+}
+
+fn check_cold_prediction_destinations(config: serde_json::Value) {
+    let (_directory, inspection) = inspected_config(config);
     let request = NormalizedLoadRequest::default();
     let selected =
         select_preparation(&inspection, &request, &BoundedIndependentAdapter::default()).unwrap();

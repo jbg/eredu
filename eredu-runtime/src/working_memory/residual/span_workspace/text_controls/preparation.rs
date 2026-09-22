@@ -1,8 +1,8 @@
 //! Exactly two original preparation allocation roles, independent of output slots.
 use super::*;
 use crate::working_memory::{
-    funding::RawSpanHostOwner, InferencePreparationStage, InferenceSamplerCompletion,
-    InferenceTextPreparation,
+    InferencePreparationStage, InferenceSamplerCompletion, InferenceTextPreparation,
+    funding::RawSpanHostOwner,
 };
 use eredu_core::TextGenerationConfig;
 
@@ -45,7 +45,10 @@ pub struct OriginalPreparationScopeCustody {
 }
 impl OriginalPreparationScopeCustody {
     pub(super) fn sampling(controls: &OriginalTextControlGuard) -> Self {
-        Self { _role: PreparationScopeRole::Sampling, _raw: controls.custody.raw().clone() }
+        Self {
+            _role: PreparationScopeRole::Sampling,
+            _raw: controls.custody.raw().clone(),
+        }
     }
 }
 
@@ -62,8 +65,13 @@ pub struct OriginalTextPreparationScopes {
 impl PreparedTextControlWorkspace {
     /// Price the optional single reseed role of a pending sampling extension.
     /// No prompt construction role is issued for this origin.
-    pub fn with_sampling_reseed_scope(self, bytes: Option<u64>) -> Result<Self, WorkingMemoryError> {
-        if self.binding.sampling_extension.is_none() { return Err(WorkingMemoryError::IdentityMismatch); }
+    pub fn with_sampling_reseed_scope(
+        self,
+        bytes: Option<u64>,
+    ) -> Result<Self, WorkingMemoryError> {
+        if self.binding.sampling_extension.is_none() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         self.with_preparation_scopes(TextPreparationScopeFacts::new(Some(0), bytes))
     }
     /// Seal this fixed pair into original Q before reservation. The existing
@@ -72,7 +80,11 @@ impl PreparedTextControlWorkspace {
         mut self,
         facts: TextPreparationScopeFacts,
     ) -> Result<Self, WorkingMemoryError> {
-        cold_controls::<(Self, TextPreparationScopeFacts, Result<Self, WorkingMemoryError>)>(self.plan.metadata_funding().as_ref())?;
+        cold_controls::<(
+            Self,
+            TextPreparationScopeFacts,
+            Result<Self, WorkingMemoryError>,
+        )>(self.plan.metadata_funding().as_ref())?;
         if self.binding.preparation_scopes.is_some() {
             return Err(WorkingMemoryError::PreparationAlreadyStarted);
         }
@@ -126,10 +138,7 @@ impl OriginalTextPreparationScopes {
         &self,
         preparation: &InferenceTextPreparation,
     ) -> Result<(), WorkingMemoryError> {
-        let reservation = preparation
-            .request()
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = preparation.request().memory_reservation();
         if !reservation.0.same(&self.reservation.0)
             || preparation.request().geometry() != self.binding.geometry
         {

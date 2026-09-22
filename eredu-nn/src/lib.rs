@@ -12,16 +12,19 @@ use std::fmt::Debug;
 
 use eredu_checkpoint::LinearFormat;
 
+pub use eredu_core::{HostTensorBuffer, HostTensorBufferIntoIter};
 pub use eredu_nn_macros::Parameterized;
 
 mod cpu_matmul;
-pub use cpu_matmul::{CpuMatmulError, CpuMatmulFacts, CpuMatmulGeometry, CpuMatmulImplementation, SelectedCpuMatmul};
+pub use cpu_matmul::{
+    CpuMatmulError, CpuMatmulFacts, CpuMatmulGeometry, CpuMatmulImplementation, SelectedCpuMatmul,
+};
 mod construction_names;
 pub use construction_names::{
     LinearCompanionView, LinearFormatView, ParameterNameError, ParameterNameView,
 };
 mod parallel_gather;
-pub use parallel_gather::{ParallelGatherError, ParallelGatherOperations, gather_uneven_axis};
+pub use parallel_gather::{gather_uneven_axis, ParallelGatherError, ParallelGatherOperations};
 mod vocabulary_range;
 pub use vocabulary_range::{BalancedVocabularyWidths, VocabularyRangeError};
 mod fixed_validation;
@@ -38,19 +41,20 @@ mod generated_factory;
 mod grouped_linear;
 mod grouped_units;
 mod isolated_copy;
+pub mod parameter_values;
 pub use generated_factory::{
     GeneratedTensorProgram, GeneratedTensorRetentionSignal, GeneratedTensorSourceRole,
     MappedGeneratedTensorFactory, RetainedGeneratedTensorFactory,
 };
 mod projection_observation;
 pub use projection_observation::{
+    reconstruct_block_fp8_input, reconstruct_block_fp8_input_retained,
     BlockFp8InputReconstructionMechanism, BlockFp8InputReconstructionPlan,
-    ProjectionInputObservationMechanism, ProjectionObservationError, reconstruct_block_fp8_input,
-    reconstruct_block_fp8_input_retained,
+    ProjectionInputObservationMechanism, ProjectionObservationError,
 };
 mod linear_rows;
 pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
-pub use isolated_copy::{IsolatedCopyMechanism, WorkspaceIsolatedCopy, isolated_copy};
+pub use isolated_copy::{isolated_copy, IsolatedCopyMechanism, WorkspaceIsolatedCopy};
 pub use linear_rows::{LinearRowError, LinearRowLayout};
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
@@ -112,8 +116,6 @@ impl Error {
             storage: ErrorStorage::Message(message),
         }
     }
-
-
 }
 
 /// One axis of a backend-neutral tensor view.
@@ -128,7 +130,7 @@ pub enum Index {
 }
 
 mod axis_range;
-pub use axis_range::{TensorAxisRange,TensorAxisRangeError};
+pub use axis_range::{TensorAxisRange, TensorAxisRangeError};
 
 /// Padding behavior for convolutional architecture components.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -470,42 +472,36 @@ mod attention_state_source_tests {
 #[cfg(test)]
 mod recurrent_encoder_contract_tests {
     use super::{
-        NormalizationConstructionSpec, NormalizationScale, reference_expand_heads,
-        reference_segmented_attention, validate_segment_lengths,
+        reference_expand_heads, reference_segmented_attention, validate_segment_lengths,
+        NormalizationConstructionSpec, NormalizationScale,
     };
 
     #[test]
     fn normalization_construction_rejects_invalid_geometry_and_scalars() {
-        assert!(
-            NormalizationConstructionSpec {
-                groups: None,
-                dimensions: 8,
-                epsilon: 1e-6,
-                scale: NormalizationScale::Unit,
-            }
-            .validate()
-            .is_ok()
-        );
-        assert!(
-            NormalizationConstructionSpec {
-                groups: None,
-                dimensions: 0,
-                epsilon: 1e-6,
-                scale: NormalizationScale::Unit,
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            NormalizationConstructionSpec {
-                groups: None,
-                dimensions: 8,
-                epsilon: f32::NAN,
-                scale: NormalizationScale::Unit,
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(NormalizationConstructionSpec {
+            groups: None,
+            dimensions: 8,
+            epsilon: 1e-6,
+            scale: NormalizationScale::Unit,
+        }
+        .validate()
+        .is_ok());
+        assert!(NormalizationConstructionSpec {
+            groups: None,
+            dimensions: 0,
+            epsilon: 1e-6,
+            scale: NormalizationScale::Unit,
+        }
+        .validate()
+        .is_err());
+        assert!(NormalizationConstructionSpec {
+            groups: None,
+            dimensions: 8,
+            epsilon: f32::NAN,
+            scale: NormalizationScale::Unit,
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -891,8 +887,12 @@ pub trait Parameterized<T: 'static> {
     /// Borrows named declarations and all classified retained numerical fields.
     /// Every known child must be visited even when an earlier child is incomplete.
     /// An error prevents callers from claiming complete source coverage.
-    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
-    where V: ParameterSourceVisitor<'a, T>;
+    fn visit_parameter_sources<'a, V>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>;
 
     /// Stable maximum number of retained value visits for this actual topology.
     /// Includes optional physical fields ordinary execution can populate; aliases
@@ -908,10 +908,14 @@ pub trait Parameterized<T: 'static> {
     /// Projects named parameters from the canonical source traversal.
     /// The returned status preserves incomplete source coverage and topology errors.
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
-    where V: ParameterVisitor<'a, T> {
-        struct Named<'v,V>(&'v mut V);
-        impl<'a,T:'a,V:ParameterVisitor<'a,T>> ParameterSourceVisitor<'a,T> for Named<'_,V> {
-            fn parameter(&mut self, metadata: ParameterMetadataView<'a>, value: &'a T) { self.0.visit(metadata,value); }
+    where
+        V: ParameterVisitor<'a, T>,
+    {
+        struct Named<'v, V>(&'v mut V);
+        impl<'a, T: 'a, V: ParameterVisitor<'a, T>> ParameterSourceVisitor<'a, T> for Named<'_, V> {
+            fn parameter(&mut self, metadata: ParameterMetadataView<'a>, value: &'a T) {
+                self.0.visit(metadata, value);
+            }
             fn retained(&mut self, _: &'a T) {}
         }
         self.visit_parameter_sources(&mut Named(visitor))
@@ -937,10 +941,14 @@ pub trait Parameterized<T: 'static> {
     /// a backend must separately inspect and deduplicate physical backing. The
     /// projection uses the same source traversal and preserves its completeness status.
     fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
-        struct Values<'v,T>(&'v mut dyn FnMut(&T));
-        impl<'a,T:'a> ParameterSourceVisitor<'a,T> for Values<'_,T> {
-            fn parameter(&mut self, _: ParameterMetadataView<'a>, value: &'a T) { self.0(value); }
-            fn retained(&mut self, value: &'a T) { self.0(value); }
+        struct Values<'v, T>(&'v mut dyn FnMut(&T));
+        impl<'a, T: 'a> ParameterSourceVisitor<'a, T> for Values<'_, T> {
+            fn parameter(&mut self, _: ParameterMetadataView<'a>, value: &'a T) {
+                self.0(value);
+            }
+            fn retained(&mut self, value: &'a T) {
+                self.0(value);
+            }
         }
         self.visit_parameter_sources(&mut Values(visitor)).is_ok()
     }
@@ -2700,7 +2708,9 @@ pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<T, Error> {
         if observer.is_some() {
-            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(
+                GroupedUnitError::Unavailable,
+            ));
         }
         self.forward_grouped(input, selections, context)
     }
@@ -2731,7 +2741,9 @@ pub trait TensorParallelGroupedGatedProductOperator<T: Tensor>:
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<TensorParallelGroupedOutput<T>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(
+                GroupedUnitError::Unavailable,
+            ));
         }
         self.forward_grouped_tensor_parallel(input, selections, partitions, context)
     }
@@ -2827,7 +2839,9 @@ pub trait GroupedRelu2Operator<T: Tensor>: Clone + Debug + Parameterized<T> {
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<T, Error> {
         if observer.is_some() {
-            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(
+                GroupedUnitError::Unavailable,
+            ));
         }
         self.forward_grouped(input, selections, context)
     }
@@ -2856,7 +2870,9 @@ pub trait TensorParallelGroupedRelu2Operator<T: Tensor>: GroupedRelu2Operator<T>
         observer: Option<&mut dyn GroupedUnitObserver<T>>,
     ) -> Result<TensorParallelGroupedOutput<T>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(
+                GroupedUnitError::Unavailable,
+            ));
         }
         self.forward_grouped_tensor_parallel(input, selections, partitions, context)
     }
@@ -2871,11 +2887,19 @@ pub trait GroupedNeuralBackend: NeuralBackend {
     /// backends return None and execute the existing provider; WorkspaceBackend
     /// records the original source and borrows its prospective observer once.
     fn record_addressable_region_source(
-        _source:workspace::WorkspaceAddressableRegionView<'_>,_input:&Self::Tensor,
-        _routes:&GroupSelection<Self::Tensor>,_context:&<Self::Tensor as Tensor>::Context,
-        _observe:Option<&mut dyn FnMut(workspace::WorkspaceAddressableObservationView<'_>)
-            ->Result<workspace::WorkspaceAddressableObservationSource,Error>>)
-        ->Result<Option<TensorParallelGroupedOutput<Self::Tensor>>,Error>{Ok(None)}
+        _source: workspace::WorkspaceAddressableRegionView<'_>,
+        _input: &Self::Tensor,
+        _routes: &GroupSelection<Self::Tensor>,
+        _context: &<Self::Tensor as Tensor>::Context,
+        _observe: Option<
+            &mut dyn FnMut(
+                workspace::WorkspaceAddressableObservationView<'_>,
+            )
+                -> Result<workspace::WorkspaceAddressableObservationSource, Error>,
+        >,
+    ) -> Result<Option<TensorParallelGroupedOutput<Self::Tensor>>, Error> {
+        Ok(None)
+    }
 
     /// Encloses one independently addressable provider invocation, including its
     /// spec copy, normalization, selected chunks and output joins. The default
@@ -2889,8 +2913,12 @@ pub trait GroupedNeuralBackend: NeuralBackend {
         context: &<Self::Tensor as Tensor>::Context,
         run: F,
     ) -> Result<Result<TensorParallelGroupedOutput<Self::Tensor>, E>, Error>
-    where F: FnOnce(&mut P, Option<PreparedIndexedInvocationLoan<'_>>)
-        -> Result<TensorParallelGroupedOutput<Self::Tensor>, E> {
+    where
+        F: FnOnce(
+            &mut P,
+            Option<PreparedIndexedInvocationLoan<'_>>,
+        ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, E>,
+    {
         let _ = (source, input, routes, context);
         Ok(run(owner, None))
     }
@@ -3004,7 +3032,9 @@ pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
         observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
     ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(
+                GroupedUnitError::Unavailable,
+            ));
         }
         Self::gated_product_groups_tensor_parallel(groups, input, selections, partitions, context)
     }
@@ -3019,7 +3049,9 @@ pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
         observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
     ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
         if observer.is_some() {
-            return Err(Error::backend_retained_source(GroupedUnitError::Unavailable));
+            return Err(Error::backend_retained_source(
+                GroupedUnitError::Unavailable,
+            ));
         }
         Self::relu2_groups_tensor_parallel(groups, input, selections, partitions, context)
     }
@@ -3676,7 +3708,7 @@ pub trait CompressedAttentionCache<T: Tensor>: Debug {
     fn checkpoint(&self) -> Self::Checkpoint;
     /// Restores a previous checkpoint, removing any later paged state.
     fn restore(&mut self, checkpoint: &Self::Checkpoint, context: &T::Context)
-    -> Result<(), Error>;
+        -> Result<(), Error>;
     /// Seals mutable tails before prompt-cache snapshot persistence.
     fn finalize(&mut self) -> Result<(), Error>;
     /// Clears all resident or paged state.
@@ -3753,7 +3785,7 @@ pub trait PoolingAttentionCache<T: Tensor>: Debug {
     fn checkpoint(&self) -> Result<Self::Checkpoint, Error>;
     /// Restores a previous checkpoint.
     fn restore(&mut self, checkpoint: &Self::Checkpoint, context: &T::Context)
-    -> Result<(), Error>;
+        -> Result<(), Error>;
     /// Seals mutable local and pooled tails before persistence.
     fn finalize(&mut self) -> Result<(), Error>;
     /// Clears all local and pooling state.
@@ -4036,6 +4068,11 @@ pub trait NeuralBackend: Sized + 'static {
 
     /// Optional forward operators explicitly supported by this backend.
     const OPERATOR_CAPABILITIES: NeuralOperatorCapabilities = NeuralOperatorCapabilities::NONE;
+
+    /// Borrowed preparation for standalone parameter inspection. A concrete
+    /// realization carries its actual source, funding and completion prerequisites.
+    /// Forwarding this value never supplies token or inference authority.
+    type ParameterPreparation<'a>: ?Sized;
 
     /// Backend tensor handle.
     type Tensor: Tensor;
@@ -4787,18 +4824,14 @@ mod gated_delta_reference_tests {
         )
         .unwrap();
         actual.extend(tail);
-        assert!(
-            expected
-                .iter()
-                .zip(actual)
-                .all(|(left, right)| (left - right).abs() < 1e-6)
-        );
-        assert!(
-            expected_state
-                .iter()
-                .zip(actual_state)
-                .all(|(left, right)| (left - right).abs() < 1e-6)
-        );
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
+        assert!(expected_state
+            .iter()
+            .zip(actual_state)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
     }
 }
 
@@ -4867,18 +4900,14 @@ mod selective_state_space_reference_tests {
         )
         .unwrap();
         actual.extend(tail);
-        assert!(
-            expected
-                .iter()
-                .zip(actual)
-                .all(|(left, right)| (left - right).abs() < 1e-6)
-        );
-        assert!(
-            expected_state
-                .iter()
-                .zip(actual_state)
-                .all(|(left, right)| (left - right).abs() < 1e-6)
-        );
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
+        assert!(expected_state
+            .iter()
+            .zip(actual_state)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
     }
 }
 
@@ -4955,15 +4984,18 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "I32 tensor construction is not implemented by this backend",
         ))
     }
-    /// Explicitly materializes floating-point tensor values on the host.
-    fn to_f32_vec(&self, context: &Self::Context) -> Result<Vec<f32>, Error> {
+    /// Explicitly materializes floating-point values in retained host storage.
+    /// The returned buffer keeps its accounting owner through slice access and
+    /// consuming iteration, until the backing allocation is released.
+    fn to_f32_vec(&self, context: &Self::Context) -> Result<HostTensorBuffer<f32>, Error> {
         let _ = context;
         Err(Error::backend(
             "F32 host materialization is not implemented by this backend",
         ))
     }
-    /// Explicitly materializes signed 32-bit integer tensor values on the host.
-    fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
+    /// Explicitly materializes signed 32-bit integer values in retained host
+    /// storage, with the same backing and accounting lifetime as F32 readback.
+    fn to_i32_vec(&self, context: &Self::Context) -> Result<HostTensorBuffer<i32>, Error> {
         let _ = context;
         Err(Error::backend(
             "I32 host materialization is not implemented by this backend",
@@ -4986,7 +5018,9 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Creates an unsigned 32-bit integer tensor without changing token identity.
     fn full_u32(value: u32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         let _ = (value, shape, context);
-        Err(Error::backend("filled U32 tensor construction is not implemented by this backend"))
+        Err(Error::backend(
+            "filled U32 tensor construction is not implemented by this backend",
+        ))
     }
     /// Elementwise addition.
     fn add(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
@@ -5060,8 +5094,15 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// The axis and all other dimensions remain present. Implementations can
     /// publish exact slice source facts; the default uses the existing index
     /// worker with identical geometry, including empty intervals.
-    fn narrow_axis(&self, axis: usize, start: i32, end: i32, context: &Self::Context) -> Result<Self, Error> {
-        let range = TensorAxisRange::new(self.shape(), axis, start, end).map_err(Error::backend_retained_source)?;
+    fn narrow_axis(
+        &self,
+        axis: usize,
+        start: i32,
+        end: i32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let range = TensorAxisRange::new(self.shape(), axis, start, end)
+            .map_err(Error::backend_retained_source)?;
         self.index(&range.indexes().collect::<Vec<_>>(), context)
     }
     /// Takes rows along one axis using a backend index tensor.
@@ -5367,10 +5408,6 @@ impl<T: 'static> Parameterized<T> for Parameter<T> {
         Some(1)
     }
 
-
-
-
-
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, T>,
@@ -5403,10 +5440,6 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Vec<M> {
             n.checked_add(value.retained_value_slot_bound()?)
         })
     }
-
-
-
-
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -5441,10 +5474,6 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Option<M> {
         self.as_ref()
             .map_or(Some(0), <M as Parameterized<T>>::retained_value_slot_bound)
     }
-
-
-
-
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -5826,17 +5855,25 @@ mod grouped_contract_tests {
             GatedProductPolicy::new(GatedProductActivation::Silu, Some(0.0), None, 1.0, 0.0,)
                 .is_err()
         );
-        assert!(
-            GatedProductPolicy::new(GatedProductActivation::Silu, None, Some(f32::NAN), 1.0, 0.0,)
-                .is_err()
-        );
+        assert!(GatedProductPolicy::new(
+            GatedProductActivation::Silu,
+            None,
+            Some(f32::NAN),
+            1.0,
+            0.0,
+        )
+        .is_err());
         assert!(
             GatedProductPolicy::new(GatedProductActivation::Silu, None, None, 0.0, 0.0,).is_err()
         );
-        assert!(
-            GatedProductPolicy::new(GatedProductActivation::Silu, None, None, 1.0, f32::INFINITY,)
-                .is_err()
-        );
+        assert!(GatedProductPolicy::new(
+            GatedProductActivation::Silu,
+            None,
+            None,
+            1.0,
+            f32::INFINITY,
+        )
+        .is_err());
     }
 
     #[test]
@@ -5857,28 +5894,24 @@ mod grouped_contract_tests {
 
     #[test]
     fn independent_group_layout_requires_exact_cardinality() {
-        assert!(
-            GroupedGatedProductSpec::new(
-                2,
-                16,
-                8,
-                16,
-                eredu_nn::GatedProductPolicy::ordinary_silu(),
-                GatedProductGroupLayout::Independent(vec![parameters("e0"), parameters("e1")]),
-            )
-            .is_ok()
-        );
-        assert!(
-            GroupedGatedProductSpec::new(
-                2,
-                16,
-                8,
-                16,
-                eredu_nn::GatedProductPolicy::ordinary_silu(),
-                GatedProductGroupLayout::Independent(vec![parameters("e0")]),
-            )
-            .is_err()
-        );
+        assert!(GroupedGatedProductSpec::new(
+            2,
+            16,
+            8,
+            16,
+            eredu_nn::GatedProductPolicy::ordinary_silu(),
+            GatedProductGroupLayout::Independent(vec![parameters("e0"), parameters("e1")]),
+        )
+        .is_ok());
+        assert!(GroupedGatedProductSpec::new(
+            2,
+            16,
+            8,
+            16,
+            eredu_nn::GatedProductPolicy::ordinary_silu(),
+            GatedProductGroupLayout::Independent(vec![parameters("e0")]),
+        )
+        .is_err());
     }
 
     #[test]
@@ -5900,17 +5933,15 @@ mod grouped_contract_tests {
             )
         };
         assert!(LinearFormatSpec::unscaled(format).is_err());
-        assert!(
-            projection(
-                LinearFormatSpec::affine(
-                    format,
-                    ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
-                    ParameterSpec::trainable("unrelated.affine.identity").unwrap(),
-                )
-                .unwrap()
+        assert!(projection(
+            LinearFormatSpec::affine(
+                format,
+                ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
+                ParameterSpec::trainable("unrelated.affine.identity").unwrap(),
             )
-            .is_ok()
-        );
+            .unwrap()
+        )
+        .is_ok());
     }
 }
 
@@ -5959,10 +5990,6 @@ impl<T: 'static> Parameterized<T> for Linear<T> {
         // Both concrete parameter fields are bounded even before bias exists.
         Some(2)
     }
-
-
-
-
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
@@ -6038,10 +6065,6 @@ impl<T: 'static> Parameterized<T> for LayerNorm<T> {
         Some(2)
     }
 
-
-
-
-
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, T>,
@@ -6109,12 +6132,10 @@ mod parameter_topology_tests {
         );
 
         module.set_trainable(false);
-        assert!(
-            validate_parameter_topology::<i32, _>(&module)
-                .unwrap()
-                .iter()
-                .all(|entry| !entry.trainable)
-        );
+        assert!(validate_parameter_topology::<i32, _>(&module)
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.trainable));
 
         let choice = DerivedChoice::Present(parameter("choice.weight", 3));
         assert_eq!(
@@ -6123,11 +6144,9 @@ mod parameter_topology_tests {
                 .as_str(),
             "choice.weight"
         );
-        assert!(
-            validate_parameter_topology::<i32, _>(&DerivedChoice::Empty)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(validate_parameter_topology::<i32, _>(&DerivedChoice::Empty)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -6179,13 +6198,11 @@ mod fused_projection_layout_tests {
             [("query", 8), ("key", 4), ("value", 4)]
         );
         assert!(FusedProjectionLayout::new(Vec::new()).is_err());
-        assert!(
-            FusedProjectionLayout::new([
-                FusedProjectionSegment::new("same", 1).unwrap(),
-                FusedProjectionSegment::new("same", 1).unwrap(),
-            ])
-            .is_err()
-        );
+        assert!(FusedProjectionLayout::new([
+            FusedProjectionSegment::new("same", 1).unwrap(),
+            FusedProjectionSegment::new("same", 1).unwrap(),
+        ])
+        .is_err());
         assert!(FusedProjectionSegment::new("", 1).is_err());
         assert!(FusedProjectionSegment::new("bad", 0).is_err());
     }

@@ -180,7 +180,7 @@ fn populated_resident_sampling_preserves_equations_and_quotes_the_full_future_al
     let equation_trace = signatures(&equation_facts);
     for adaptive in [false, true] {
         let request = request(adaptive, 0.7);
-        let sampler = populated(request);
+        let sampler = populated(request.clone());
         let snapshot = source_snapshot(&sampler);
         let facts = Facts::default();
         let context = WorkspaceContext::new(facts.clone());
@@ -301,7 +301,7 @@ fn populated_layerwise_sampling_uses_the_same_host_and_disk_routed_traversal() {
             eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
         for adaptive in [false, true] {
             let request = request(adaptive, 0.7);
-            let sampler = populated(request);
+            let sampler = populated(request.clone());
             let snapshot = source_snapshot(&sampler);
             let reports = residencies().map(|residency| {
                 let sources = prepared_adapter::prepare(
@@ -356,7 +356,7 @@ fn populated_layerwise_sampling_uses_the_same_host_and_disk_routed_traversal() {
                         future(3),
                         &self::state(&sources, &old_context),
                         &old_context,
-                        request,
+                        request.clone(),
                         &TokenFilter::All,
                         &parameters,
                     )
@@ -378,6 +378,23 @@ fn populated_layerwise_sampling_uses_the_same_host_and_disk_routed_traversal() {
 #[derive(Debug)]
 struct MissingScoreFacts(Facts);
 impl WorkspaceMechanisms for MissingScoreFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+
     fn operation_bound(
         &self,
         op: &WorkspaceOperation,

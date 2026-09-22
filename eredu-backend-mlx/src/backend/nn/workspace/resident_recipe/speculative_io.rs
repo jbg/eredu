@@ -12,7 +12,7 @@ impl AutoregressiveReadoutRecipe {
         report: &WorkspaceTraceReport,
         rows: usize,
         positions: usize,
-        mechanism: MlxMetalWorkspaceMechanisms,
+        mechanism: super::super::ResidentExecutionMechanisms,
         context: &WorkspaceContext,
     ) -> Result<Self, Error> {
         let invalid =
@@ -28,7 +28,7 @@ impl AutoregressiveReadoutRecipe {
         {
             return Err(invalid());
         }
-        let recorder = ResidentRecipeRecorder::with_context(
+        let recorder = mechanism.recorder(
             InferenceGeometry {
                 batch_size: 1,
                 cached_positions: 0,
@@ -37,7 +37,6 @@ impl AutoregressiveReadoutRecipe {
                 prefill_chunk_positions: u64::try_from(positions).map_err(|_| invalid())?,
                 output: eredu_core::OutputDemand::Sequence,
             },
-            mechanism,
             context,
         )?;
         let reduced = recorder.reduce_trace(report, None, 0, rows)?;
@@ -64,6 +63,77 @@ impl AutoregressiveReadoutRecipe {
             controls,
         })
     }
+    /// Construction facts for the actual captured final-row Index, without
+    /// inventing another trace or a second completion frontier.
+    pub(crate) fn index_construction(
+        operation: &WorkspaceOperation,
+        mechanism: super::super::ResidentExecutionMechanisms,
+        context: &WorkspaceContext,
+    ) -> Result<safemlx::ResidentGraphLayout, Error> {
+        let invalid =
+            || context.metadata_error(format_args!("captured readout Index source is incomplete"));
+        if !matches!(
+            operation.kind,
+            WorkspaceOperationKind::Index { selected_axes: 1 }
+        ) || operation.inputs.len() != 1
+            || operation.outputs.len() != 1
+            || operation.inputs[0].shape().len() != 3
+            || operation.outputs[0].shape().len() != 2
+        {
+            return Err(invalid());
+        }
+        let (entries, seeds, rank, operands, shells, source_controls) = match mechanism {
+            super::super::ResidentExecutionMechanisms::Cpu { cpu, .. } => {
+                let plan = cpu
+                    .plan(operation.as_view())
+                    .map_err(|cause| context.metadata_source(cause))?
+                    .ok_or_else(invalid)?;
+                (
+                    plan.population.construction_entries,
+                    plan.seeds,
+                    plan.rank,
+                    plan.population.maximum_operands.max(4),
+                    plan.parameter_shells,
+                    plan.population.controls,
+                )
+            }
+            super::super::ResidentExecutionMechanisms::Metal(_) => {
+                let plan = lowering(operation.as_view()).ok_or_else(invalid)?;
+                let rank = operation
+                    .inputs
+                    .iter()
+                    .chain(&operation.outputs)
+                    .map(|value| value.shape().len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(plan.intermediate_rank);
+                (
+                    plan.primitives,
+                    plan.seeds,
+                    rank,
+                    plan.maximum_operands.max(4),
+                    backend_handle_shells(operation.as_view(), plan).ok_or_else(invalid)?,
+                    0,
+                )
+            }
+        };
+        let graph = safemlx::OperationEvent::resident_graph_layout_with_shells(
+            entries, seeds, rank, operands, shells,
+        )
+        .ok_or_else(invalid)?;
+        context.charge_metadata(
+            std::mem::size_of::<(
+                safemlx::ResidentGraphLayout,
+                Option<safemlx::ResidentGraphLayout>,
+                Result<safemlx::ResidentGraphLayout, Error>,
+                [usize; 6],
+            )>()
+            .checked_add(source_controls)
+            .and_then(|n| n.checked_add(graph.control_bytes()?))
+            .ok_or_else(invalid)?,
+        )?;
+        Ok(graph)
+    }
     pub(crate) fn completion(self) -> ResidentCompletionRecipe {
         self.completion
     }
@@ -76,10 +146,10 @@ impl AutoregressiveReadoutRecipe {
 }
 
 impl ResidentCompletionRecipe {
-    /// Union two actual programs executed on the same selected GPU stream.
-    /// Counts remain additive, including both Synchronizer alternatives and
-    /// root lists; this is neither a lifetime maximum nor a new role authority.
-    /// CPU entries, when present, remain in the original single CPU stream.
+    /// Compose programs for the same selected stream and enclosing completion.
+    /// Native workers and root lists remain additive; the CPU census excludes
+    /// each fragment's private Synchronizer and adds the one combined frontier.
+    /// Mixing CPU model and GPU model populations is not a valid source loan.
     pub(crate) fn checked_union(self, other: Self) -> Option<Self> {
         self.union_with_controls(other).map(|(value, _)| value)
     }
@@ -89,6 +159,15 @@ impl ResidentCompletionRecipe {
         if a.streams > 2 || b.streams > 2 {
             return None;
         }
+        let cpu = match (self.dispatch?.cpu_model, other.dispatch?.cpu_model) {
+            (Some(mut a), Some(b)) => {
+                a.add(b)?;
+                Some(a)
+            }
+            (None, None) => None,
+            _ => return None,
+        };
+        let shared_synchronizer = usize::from(cpu.is_some());
         let graph = safemlx::OperationEvent::resident_graph_layout_with_shells(
             self.graph
                 .primitives()
@@ -106,15 +185,73 @@ impl ResidentCompletionRecipe {
             safemlx::OperationEvalTraversalLimits {
                 roots: a.roots.checked_add(b.roots)?,
                 arrays: a.arrays.checked_add(b.arrays)?,
-                tape_entries: a.tape_entries.checked_add(b.tape_entries)?,
+                tape_entries: a
+                    .tape_entries
+                    .checked_add(b.tape_entries)?
+                    .checked_sub(shared_synchronizer)?,
                 input_edges: a.input_edges.checked_add(b.input_edges)?,
-                output_slots: a.output_slots.checked_add(b.output_slots)?,
+                output_slots: a
+                    .output_slots
+                    .checked_add(b.output_slots)?
+                    .checked_sub(shared_synchronizer)?,
                 streams: a.streams.max(b.streams),
                 captures: a.captures.checked_add(b.captures)?,
             },
         )?;
         let (a, b) = (self.dispatch?, other.dispatch?);
-        if a.cpu_model.is_some() || b.cpu_model.is_some() { return None; }
+        if let Some(cpu) = cpu {
+            if a.completion_streams()? != self.traversal.limits().streams
+                || b.completion_streams()? != other.traversal.limits().streams
+            {
+                return None;
+            }
+            let completion = safemlx::OperationEvent::cpu_completion_layout(traversal.roots())?;
+            if completion.backing_births() != 0 || completion.worker_graph_allocation_extents() != 0
+            {
+                return None;
+            }
+            let dispatch = ResidentDispatchPopulation {
+                cpu_model: Some(cpu),
+                cpu_entries: a.cpu_entries.checked_add(b.cpu_entries)?.checked_sub(1)?,
+                cpu_input_edges: a.cpu_input_edges.checked_add(b.cpu_input_edges)?,
+                cpu_siblings: a.cpu_siblings.checked_add(b.cpu_siblings)?.checked_sub(1)?,
+                parallel_entries: a.parallel_entries.checked_add(b.parallel_entries)?,
+                parallel_graph_extents: a
+                    .parallel_graph_extents
+                    .checked_add(b.parallel_graph_extents)?,
+                worker_rank: a.worker_rank.max(b.worker_rank),
+                ..a
+            };
+            if dispatch.completion_streams()? != traversal.limits().streams {
+                return None;
+            }
+            let controls = [
+                graph.control_bytes()?,
+                traversal.query_control_bytes()?,
+                completion.control_bytes()?,
+                size_of::<super::super::cpu::CpuPopulation>() * 3,
+                size_of::<Self>(),
+                size_of::<Option<Self>>(),
+                size_of::<ResidentDispatchPopulation>(),
+                size_of::<safemlx::OperationEvalTraversalLimits>() * 2,
+            ]
+            .into_iter()
+            .try_fold(0usize, usize::checked_add)?;
+            return Some((
+                Self {
+                    validation_roots: self.validation_roots.checked_add(other.validation_roots)?,
+                    grouped_outputs: self.grouped_outputs.merge(other.grouped_outputs)?,
+                    traversal,
+                    graph,
+                    dispatch: Some(dispatch),
+                    nested_completions: self
+                        .nested_completions
+                        .checked_add(other.nested_completions)?,
+                    nested_root_capacity: self.nested_root_capacity.max(other.nested_root_capacity),
+                },
+                controls,
+            ));
+        }
         let gpu_entries = a.gpu_entries.checked_add(b.gpu_entries)?;
         let gpu_edges = a.gpu_input_edges.checked_add(b.gpu_input_edges)?;
         let gpu_siblings = a.gpu_siblings.checked_add(b.gpu_siblings)?;
@@ -123,8 +260,10 @@ impl ResidentCompletionRecipe {
             .additional_sort_kernels
             .checked_add(b.additional_sort_kernels)?;
         let cpu_entries = a.cpu_entries.checked_add(b.cpu_entries)?;
-        let parallel_entries=a.parallel_entries.checked_add(b.parallel_entries)?;
-        let parallel_graph_extents=a.parallel_graph_extents.checked_add(b.parallel_graph_extents)?;
+        let parallel_entries = a.parallel_entries.checked_add(b.parallel_entries)?;
+        let parallel_graph_extents = a
+            .parallel_graph_extents
+            .checked_add(b.parallel_graph_extents)?;
         let worker_rank = a.worker_rank.max(b.worker_rank);
         let copy_rank_extents = a.copy_rank_extents.checked_add(b.copy_rank_extents)?;
         let worker = safemlx::OperationEvent::resident_gpu_worker_layout_with_router(
@@ -139,7 +278,7 @@ impl ResidentCompletionRecipe {
             cpu_entries.checked_sub(parallel_entries)?,
         )?;
         let dispatch = ResidentDispatchPopulation {
-                cpu_model: None,
+            cpu_model: None,
             gpu_entries: a.gpu_entries.checked_add(b.gpu_entries)?,
             gpu_input_edges: a.gpu_input_edges.checked_add(b.gpu_input_edges)?,
             gpu_siblings,
@@ -150,7 +289,10 @@ impl ResidentCompletionRecipe {
             cpu_siblings: a.cpu_siblings.checked_add(b.cpu_siblings)?,
             parallel_entries,
             parallel_graph_extents,
-            worker_graph_extents: worker.allocation_extents().checked_add(copy_rank_extents)?.checked_add(parallel_graph_extents)?,
+            worker_graph_extents: worker
+                .allocation_extents()
+                .checked_add(copy_rank_extents)?
+                .checked_add(parallel_graph_extents)?,
             worker_rank,
             copy_rank_extents,
             kernel_attempts: worker.kernel_attempts(),
@@ -207,10 +349,17 @@ fn bind_row(
     row: &mut ResidentSpanRecipe,
     readout: &AutoregressiveReadoutRecipe,
 ) -> Result<(), crate::backend::error::Error> {
-    let invalid = || crate::backend::error::Error::PrefillControl(
-        eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
-    );
+    let invalid = || {
+        crate::backend::error::Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        )
+    };
     if row.first_missing_operation.is_some() || row.unqualified_kernel_owner.is_some() {
+        #[cfg(test)]
+        eprintln!(
+            "AR source row missing={:?} detail={:?} kernel={:?}",
+            row.first_missing_operation, row.missing_operation_detail, row.unqualified_kernel_owner
+        );
         return Err(invalid());
     }
     let current = ResidentCompletionRecipe {
@@ -260,23 +409,33 @@ fn bind_row(
     Ok(())
 }
 
-
 pub(super) fn bind_prefill_input(
     row: &mut ResidentSpanRecipe,
     report: &WorkspaceTraceReport,
     geometry: InferenceGeometry,
-    mechanism: MlxMetalWorkspaceMechanisms,
+    mechanism: super::super::ResidentExecutionMechanisms,
     context: &WorkspaceContext,
 ) -> Result<(), crate::backend::error::Error> {
-    let invalid = || context.metadata_error(format_args!("speculative prefill input trace is incomplete"));
-    if report.operations.len() != 1 || !matches!(report.operations[0].kind,
-        WorkspaceOperationKind::StaticSlice { .. }) {
+    let invalid = || {
+        context.metadata_error(format_args!(
+            "speculative prefill input trace is incomplete"
+        ))
+    };
+    if report.operations.len() != 1
+        || !matches!(
+            report.operations[0].kind,
+            WorkspaceOperationKind::StaticSlice { .. }
+        )
+    {
         return Err(invalid().into());
     }
-    let recorder = ResidentRecipeRecorder::with_context(geometry, mechanism, context)?;
+    let recorder = mechanism.recorder(geometry, context)?;
     let reduced = recorder.reduce_trace(report, None, 0, 1)?;
-    if reduced.first_missing_operation.is_some() || reduced.unqualified_kernel_owner.is_some()
-        || reduced.validation_roots != 0 || reduced.nested_completions != 0 {
+    if reduced.first_missing_operation.is_some()
+        || reduced.unqualified_kernel_owner.is_some()
+        || reduced.validation_roots != 0
+        || reduced.nested_completions != 0
+    {
         return Err(invalid().into());
     }
     let fragment = AutoregressiveReadoutRecipe {
@@ -294,3 +453,12 @@ pub(super) fn bind_prefill_input(
     };
     bind_row(row, &fragment)
 }
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+#[path = "speculative_io_tests.rs"]
+mod tests;

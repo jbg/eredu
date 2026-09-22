@@ -86,12 +86,16 @@ fn snapshot_neither_reclaims_queued_owners_nor_retains_observed_backing() {
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     let snapshot = observed.try_metadata_snapshot().unwrap();
     assert_eq!(retired.load(Ordering::SeqCst), 0);
+    // The physical root remains owned by the allocator cache after its last
+    // Array disappears. Only explicit cache eviction queues that custody.
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     observed
         .retain_allocation_owner(Retired(Arc::clone(&retired)))
         .unwrap();
     drop(observed);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 2);
     assert!(snapshot.allocation().is_some());
@@ -151,6 +155,7 @@ fn inspection_clones_share_known_and_lazy_descriptors_without_housekeeping() {
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     drop(view_copy);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }
@@ -193,6 +198,7 @@ fn inspection_clone_does_not_reclaim_unrelated_queued_owners() {
     assert_eq!(HOUSEKEEPING_CALLS.with(Cell::get), 0);
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     drop(hook);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     drop(root);
@@ -265,9 +271,11 @@ fn allocation_only_inspection_neither_reclaims_nor_pins_native_owners() {
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert_eq!(HOUSEKEEPING_CALLS.with(Cell::get), 0);
     drop(hook);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     drop(observed);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 2);
     assert!(facts.bytes() >= 2 * std::mem::size_of::<i32>());
@@ -307,6 +315,7 @@ fn inspection_handle_size_is_cold_while_runtime_is_owned_and_retirement_is_pendi
     assert_eq!(housekeeping, 0);
     assert_eq!(reclaimed, 0);
     drop(hook);
+    crate::memory::clear_cache().unwrap();
     crate::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }

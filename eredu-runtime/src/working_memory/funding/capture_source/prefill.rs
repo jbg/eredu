@@ -18,13 +18,27 @@ pub(super) struct PrefillStamp {
 }
 impl PrefillStamp {
     fn matches_admission(&self, admission: &eredu_core::capture::AdmittedCapturePlan) -> bool {
-        std::ptr::eq(admission, self.source.admission()) || self.interventions.as_ref().is_some_and(|original| {
-            original.plan().admission().plan().operations.iter().enumerate().any(|(index, operation)| {
-                operation.schedule.includes(eredu_core::capture::CapturePhase::Prefill, 0)
-                    && original.plan().evidence(index).is_some_and(|companion|
-                        std::ptr::eq(admission, companion.shared_geometry_source().admission()))
+        std::ptr::eq(admission, self.source.admission())
+            || self.interventions.as_ref().is_some_and(|original| {
+                original
+                    .plan()
+                    .admission()
+                    .plan()
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .any(|(index, operation)| {
+                        operation
+                            .schedule
+                            .includes(eredu_core::capture::CapturePhase::Prefill, 0)
+                            && original.plan().evidence(index).is_some_and(|companion| {
+                                std::ptr::eq(
+                                    admission,
+                                    companion.shared_geometry_source().admission(),
+                                )
+                            })
+                    })
             })
-        })
     }
     pub(super) fn validate_context_coordinates(
         &self,
@@ -133,11 +147,8 @@ impl CaptureTensorCustody {
         native: &mut WorkingMemoryFundingScope,
         context: &PrefillChunkRetentionContext<'_>,
     ) -> Result<(CaptureSourceSegment, PreparedPrefillChunkRetention), WorkingMemoryError> {
-        let reservation = context
-            .request()
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if reservation.0.funding != Some(native.id) || !reservation.0.pool.same_domain(&native.pool)
+        let reservation = context.request().memory_reservation();
+        if reservation.0.funding != Some(native.id) || !reservation.0.pool.same_ledger(&native.pool)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -146,7 +157,8 @@ impl CaptureTensorCustody {
             let plan = original.plan().admission();
             if plan.request() != source.admission().request()
                 || plan.text_origin() != source.admission().text_origin()
-                || plan.invocation_bounds() != source.admission().invocation_bounds() {
+                || plan.invocation_bounds() != source.admission().invocation_bounds()
+            {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
         }
@@ -196,9 +208,13 @@ impl CaptureSourceSegment {
     // A separately paid projected destination must still come from this exact
     // retained admission. Equal declarations and another request do not match.
     pub(super) fn validate_projected_admission(
-        &self, admission: &eredu_core::capture::AdmittedCapturePlan,
+        &self,
+        admission: &eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), WorkingMemoryError> {
-        let stamp = self.identity.prefill.as_ref()
+        let stamp = self
+            .identity
+            .prefill
+            .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if !stamp.matches_admission(admission) {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -313,7 +329,8 @@ impl CaptureSourceSegment {
             .prefill
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !stamp.matches_admission(fragment.assembly().logical_geometry().admission()) || fragment.assembly().inference_geometry() != stamp.request.geometry()
+        if !stamp.matches_admission(fragment.assembly().logical_geometry().admission())
+            || fragment.assembly().inference_geometry() != stamp.request.geometry()
             || !fragment.matches_chunk(&stamp.chunk.input, stamp.chunk.position, stamp.chunk.output)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -327,9 +344,15 @@ impl CaptureSourceSegment {
         &self,
         fragment: &eredu_core::capture::CaptureRoutedPrefillFragment<'_, '_>,
     ) -> Result<(), WorkingMemoryError> {
-        let stamp = self.identity.prefill.as_ref().ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !std::ptr::eq(fragment.plan().geometry().admission(), stamp.source.admission())
-            || fragment.plan().inference_geometry() != stamp.request.geometry()
+        let stamp = self
+            .identity
+            .prefill
+            .as_ref()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        if !std::ptr::eq(
+            fragment.plan().geometry().admission(),
+            stamp.source.admission(),
+        ) || fragment.plan().inference_geometry() != stamp.request.geometry()
             || !fragment.matches_chunk(&stamp.chunk.input, stamp.chunk.position, stamp.chunk.output)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -486,11 +509,8 @@ impl CaptureSourceSegment {
         if let Some(context) = context {
             stamp.validate_context_coordinates(context)?;
         }
-        let reservation = stamp
-            .request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if reservation.0.funding != Some(native.id) || !reservation.0.pool.same_domain(&native.pool)
+        let reservation = stamp.request.memory_reservation();
+        if reservation.0.funding != Some(native.id) || !reservation.0.pool.same_ledger(&native.pool)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }

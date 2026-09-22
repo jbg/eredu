@@ -46,6 +46,7 @@ fn manager_drop_does_not_lock_worker_retained_state_and_final_owner_cleans_files
     let location = DiskLocation::ordinary(DiskLocationData {
         path: path.clone(),
         live_source: Some(live_source),
+        persistent_source: None,
         ..missing_location_data(directory.path(), "unused")
     });
     let manager =
@@ -459,6 +460,7 @@ fn queued_disk_read_keeps_published_file_after_manager_drop_until_task_release()
     let location = DiskLocation::ordinary(DiskLocationData {
         path: path.clone(),
         live_source: Some(file),
+        persistent_source: None,
         ..missing_location_data(directory.path(), "unused")
     });
     let manager =

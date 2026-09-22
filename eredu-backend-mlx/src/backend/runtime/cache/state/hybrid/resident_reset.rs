@@ -98,7 +98,12 @@ impl ResidentTableResetState for MlxHybridState {
                     Device
                 )
             ),
-            _ => false,
+            StateComponentRole::CompressedLatent | StateComponentRole::RotaryKeys => {
+                placement == Device
+                    && matches!(layer.attention.as_ref(),
+                        Some(MlxHybridAttentionState::Compressed(cache))
+                            if cache.matches_resident_reset_policy())
+            }
         }
     }
     fn empty_resident_reset_layer_prepared(
@@ -157,6 +162,9 @@ impl ResidentTableResetState for MlxHybridState {
                         Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
                             cache,
                         ))) => cache.resident_fork_is_empty(),
+                        Some(MlxHybridAttentionState::Compressed(cache)) => {
+                            cache.resident_fork_is_empty()
+                        }
                         _ => false,
                     }
             })
@@ -179,7 +187,17 @@ impl ResidentTableResetState for MlxHybridState {
             ) => attention
                 .sliding_window_i32()
                 .is_ok_and(|window| cache.matches_original_reset_policy(window)),
-            // Key-only/compressed variants need their own empty owner proof.
+            (
+                LayerCachePolicy::KeyOnly { attention, .. }
+                | LayerCachePolicy::KeyOnlyWithFixedState { attention, .. },
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))),
+            ) => attention
+                .sliding_window_i32()
+                .is_ok_and(|window| cache.matches_resident_key_only_reset_policy(window)),
+            (
+                LayerCachePolicy::CompressedLatentRotary { .. },
+                Some(MlxHybridAttentionState::Compressed(cache)),
+            ) => cache.matches_resident_reset_policy(),
             _ => false,
         };
         let slots = layer.fixed.table().slots();
@@ -216,6 +234,19 @@ impl ResidentTableResetState for MlxHybridState {
                     )),
                 ))
             }
+            LayerCachePolicy::KeyOnly { attention, .. }
+            | LayerCachePolicy::KeyOnlyWithFixedState { attention, .. } => {
+                let cache = match attention.sliding_window_i32().expect("validated window") {
+                    Some(window) => ConcatKeyValueCache::new_key_only_for_sliding_attention(window),
+                    None => ConcatKeyValueCache::new_key_only(),
+                };
+                Some(MlxHybridAttentionState::KeyValue(
+                    MlxKeyValueLayerState::Device(cache),
+                ))
+            }
+            LayerCachePolicy::CompressedLatentRotary { .. } => Some(
+                MlxHybridAttentionState::Compressed(CompressedLatentCache::new()),
+            ),
             _ => unreachable!("validated resident hybrid policy"),
         };
         MlxHybridLayerState {

@@ -459,7 +459,7 @@ impl CacheResidencyManager {
         initialized: &PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         context: &WorkspaceContext,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
     ) -> Result<PreparedPredictionCacheCopy<PreparedIndependentCacheManager>, NativeError> {
         self.copy_completed_paged_with(
             completed,
@@ -480,7 +480,7 @@ impl CacheResidencyManager {
         initialized: &PrefillRootsRuntime,
         mechanisms: MlxMetalWorkspaceMechanisms,
         context: &WorkspaceContext,
-        capacity: u64,
+        capacity: &eredu_core::MemoryLimits,
         tail_operands: usize,
         finish: F,
     ) -> Result<PreparedPredictionCacheCopy<C>, NativeError>

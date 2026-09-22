@@ -227,7 +227,7 @@ fn verify_partitioned_prediction_parameters(
         let values = (0..actual.values.len())
             .map(|i| 0.01 + (i % 5) as f32 * 0.003)
             .collect();
-        originals.push(actual.values);
+        originals.push(actual);
         edits.push(ParameterEdit {
             id: format!("coordinated-{}", edits.len()),
             parameter: parameter.id.clone(),
@@ -523,7 +523,7 @@ fn verify_partitioned_prediction_parameters(
         )
         .unwrap();
         for ((actual, original), added) in
-            actual.values.iter().zip(original).zip(edit.update.values())
+            actual.values.iter().zip(&original.values).zip(edit.update.values())
         {
             assert_eq!(*actual, *original + *added, "edited {}", edit.parameter);
         }
@@ -597,7 +597,7 @@ fn verify_partitioned_prediction_parameters(
             limits,
         )
         .unwrap();
-        assert_eq!(&actual.values, original, "restored {}", edit.parameter);
+        assert_eq!(&actual.values, &original.values, "restored {}", edit.parameter);
     }
     eprintln!("prediction parameter comparison rank={rank}: restored");
     assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], true), &baseline);

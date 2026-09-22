@@ -1,7 +1,7 @@
 use super::*;
 use eredu_core::{InferenceGeometry, OutputDemand, WorkspaceBound};
 use eredu_nn::workspace::*;
-use eredu_runtime::{ArchitectureStateFactory, working_memory::*};
+use eredu_runtime::{working_memory::*, ArchitectureStateFactory};
 use std::num::NonZeroU32;
 
 #[path = "prepared_workspace/layerwise.rs"]
@@ -17,14 +17,32 @@ struct Facts {
     omit_copies: bool,
 }
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+
     fn output_representation(
         &self,
         operation: WorkspaceOperationView<'_>,
         output: usize,
     ) -> Option<WorkspaceRepresentation> {
         // This mock allocates every floating output as contiguous F32.
-        (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32)
-            .then_some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true))
+        (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32).then_some(
+            WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true),
+        )
     }
 
     fn operation_bound(
@@ -277,7 +295,7 @@ fn prepared_sampling_workspace_uses_selected_score_geometry_and_shared_policy() 
                         geometry,
                         &state,
                         &context,
-                        request,
+                        request.clone(),
                         &eredu_core::TokenFilter::Allowed(vec![true, false, true]),
                     )
                     .unwrap();
@@ -320,6 +338,23 @@ struct AliasedScoreFacts {
     score_capacity: u64,
 }
 impl WorkspaceMechanisms for AliasedScoreFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+
     fn operation_bound(
         &self,
         operation: &WorkspaceOperation,
@@ -397,7 +432,7 @@ fn prepared_sampling_retains_actual_score_capacity_for_distinct_escaped_input_al
                 },
                 &state,
                 &context,
-                request,
+                request.clone(),
                 &eredu_core::TokenFilter::All,
             )
             .unwrap()
@@ -683,24 +718,20 @@ fn prepared_workspace_keeps_cached_transaction_copy_gaps_explicit() {
             // A complete successful-state estimate cannot substitute for missing
             // transient rollback costs. The borrowed starting state is unchanged.
             assert!(report.retained_peak_bytes().is_some());
-            assert!(
-                state
-                    .as_ref()
-                    .iter()
-                    .all(|lane| lane.position() == cached_positions as i32)
-            );
+            assert!(state
+                .as_ref()
+                .iter()
+                .all(|lane| lane.position() == cached_positions as i32));
             assert!(state.as_ref().iter().all(|lane| {
                 let WorkspaceResidentLayerState::Compressed(cache) = lane else {
                     return false;
                 };
                 cache.capacity() == if cached_positions == 0 { 0 } else { 7 }
             }));
-            assert!(
-                state
-                    .as_ref()
-                    .iter()
-                    .all(|lane| lane.retained_values().next().is_none() == (cached_positions == 0))
-            );
+            assert!(state
+                .as_ref()
+                .iter()
+                .all(|lane| lane.retained_values().next().is_none() == (cached_positions == 0)));
             assert_eq!(
                 facts
                     .operations
@@ -777,23 +808,19 @@ fn prepared_workspace_starts_from_exact_cached_storage_without_replaying_history
             assert!(report.tensor_transient_peak_bytes().unwrap() >= capacity);
         }
         assert!(state.as_ref().iter().all(|lane| lane.position() == 4));
-        assert!(
-            blueprint
-                .quote_replicated_resident_text(
-                    InferenceGeometry {
-                        cached_positions: 5,
-                        ..g
-                    },
-                    &state,
-                    &context
-                )
-                .is_err()
-        );
-        assert!(
-            blueprint
-                .quote_replicated_resident_text(g, &state, &WorkspaceContext::new(Facts::default()))
-                .is_err()
-        );
+        assert!(blueprint
+            .quote_replicated_resident_text(
+                InferenceGeometry {
+                    cached_positions: 5,
+                    ..g
+                },
+                &state,
+                &context
+            )
+            .is_err());
+        assert!(blueprint
+            .quote_replicated_resident_text(g, &state, &WorkspaceContext::new(Facts::default()))
+            .is_err());
     }
 }
 

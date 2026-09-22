@@ -41,7 +41,7 @@ pub(super) fn admit<C: TokenFilterController>(
     workspace: TextControllerWorkspace<'_>,
     storage_contract: ControllerStorageContract,
     original_exchange: Option<super::super::super::control_slot::PreparedControlExchange>,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     outputs: u64,
     planning_metadata: &Option<HostMetadataFunding>,
 ) -> Result<PendingSavedTextAdmission, Error> {
@@ -51,12 +51,18 @@ pub(super) fn admit<C: TokenFilterController>(
     let rows = diagnostic.take_text_interventions();
     let child_capture = diagnostic.take_child_capture();
     let capture = match (
-        child_capture.as_ref().map(ResumeCapture::checkpoint).or_else(|| source.capture_checkpoint()),
-        child_capture.as_ref().map(ResumeCapture::selection).or_else(|| source.capture_selection()),
+        child_capture
+            .as_ref()
+            .map(ResumeCapture::checkpoint)
+            .or_else(|| source.capture_checkpoint()),
+        child_capture
+            .as_ref()
+            .map(ResumeCapture::selection)
+            .or_else(|| source.capture_selection()),
         source.capture_witness(),
     ) {
-        (Some(checkpoint), Some(selection), Some(witness)) => {
-            Some(CaptureAdmission::from_checkpoint(
+        (Some(checkpoint), Some(selection), Some(witness)) => Some(
+            CaptureAdmission::from_checkpoint(
                 session,
                 geometry,
                 checkpoint,
@@ -65,12 +71,15 @@ pub(super) fn admit<C: TokenFilterController>(
                 eredu_runtime::working_memory::WorkspaceReportMetadata::with_funding(
                     planning_metadata.as_ref().ok_or_else(|| unknown())?,
                 ),
-            )?.with_saved_interventions(rows,geometry)?)
-        }
+            )?
+            .with_saved_interventions(rows, geometry)?,
+        ),
         (None, None, None) => {
-            if rows.is_some(){return Err(memory(WorkingMemoryError::IdentityMismatch));}
+            if rows.is_some() {
+                return Err(memory(WorkingMemoryError::IdentityMismatch));
+            }
             None
-        },
+        }
         _ => return Err(memory(WorkingMemoryError::IdentityMismatch)),
     };
     // The immutable pending kind and complete source matrix fix input geometry.
@@ -90,24 +99,22 @@ pub(super) fn admit<C: TokenFilterController>(
         input: diagnostic.state_input(),
         max_output_tokens: outputs,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
+        memory_limits: config.inference_policy().memory_limits.clone(),
     };
     let full = if let Some(funding) = planning_metadata.as_ref() {
         let metadata =
             eredu_runtime::working_memory::WorkspaceReportMetadata::with_funding(funding);
-        let incremental = metadata.bounded(
-            diagnostic.incremental().incremental_bytes(),
-            format_args!("sealed decoder/key copy source credit with full pending, host and future execution costs"),
-        ).map_err(|cause| Error::Neural(metadata.error(cause)))?;
+        let incremental = match diagnostic.incremental().incremental_bytes() {
+            Some(bytes) => metadata.bounded(bytes, format_args!("sealed decoder/key copy source credit with full pending, host and future execution costs")),
+            None => metadata.per_domain(format_args!("complete physical-domain copy demand has no aggregate u64 diagnostic")),
+        }.map_err(|cause| Error::Neural(metadata.error(cause)))?;
         match metadata
             .apply_admission_with_incremental(
                 capabilities.capabilities(),
                 request_policy,
                 diagnostic.full(),
                 &incremental,
-                None,
             )
             .map_err(|cause| Error::Neural(metadata.error(cause)))?
         {
@@ -123,12 +130,11 @@ pub(super) fn admit<C: TokenFilterController>(
             capabilities.capabilities(),
             request_policy,
             diagnostic.full().clone(),
-            &eredu_core::WorkspaceBound::bounded(
-                diagnostic.incremental().incremental_bytes(),
-                "sealed decoder/key copy source credit with full pending, host and future execution costs",
-            ),
-            None,
-        ).map_err(capability)? {
+            &match diagnostic.incremental().incremental_bytes() {
+                Some(bytes) => eredu_core::WorkspaceBound::bounded(bytes,
+                    "sealed decoder/key copy source credit with full pending, host and future execution costs"),
+                None => eredu_core::WorkspaceBound::PerDomain { assumptions: "complete physical-domain copy demand has no aggregate u64 diagnostic".into() },
+            }).map_err(capability)? {
             AdmissionResult::Admitted(admission) => admission,
             AdmissionResult::Rejected(rejection) => {
                 return Err(Error::Other(Box::new(PrefillPlanningError::Admission(rejection))));
@@ -168,7 +174,7 @@ pub(super) fn admit<C: TokenFilterController>(
     let mut reservation = diagnostic
         .incremental()
         .reserve_saved_source_with_capacity_handoff(
-            runtime.backend().memory_pool(),
+            runtime.backend().memory_ledger(),
             execution,
             &full,
             capacity,
@@ -209,7 +215,7 @@ pub(super) fn admit<C: TokenFilterController>(
             .map_err(Error::WorkspacePlanning)?;
         source
             .input_identity()
-            .and_then(|cache| cache.original_publication_source(runtime.backend().memory_pool()))
+            .and_then(|cache| cache.original_publication_source(runtime.backend().memory_ledger()))
             .transpose()
             .map_err(Error::PrefillControl)?
     } else {
@@ -228,7 +234,7 @@ pub(super) fn admit<C: TokenFilterController>(
         .push(funding.take_capacity_handoff().map_err(memory)?);
     let request = InferenceRequest::from(reservation);
     let preparation = request
-        .prepare_text(execution, geometry, config)
+        .prepare_text(execution, geometry, config.clone())
         .map_err(memory)?;
     preparation.bind_run(context).map_err(memory)?;
     let scope = funding.scope().map_err(memory)?;
@@ -249,10 +255,7 @@ pub(super) fn admit<C: TokenFilterController>(
             .prepare_original_source(
                 controller,
                 &funding,
-                preparation
-                    .request()
-                    .memory_reservation()
-                    .ok_or_else(|| unknown())?,
+                preparation.request().memory_reservation(),
             )
             .map_err(|error| Error::Other(Box::new(error)))?;
     } else {
@@ -311,8 +314,6 @@ pub(super) fn admit<C: TokenFilterController>(
     let native_storage = if let Some(controls) = &controls {
         use eredu_runtime::working_memory::OriginalNativeStorageMechanism as _;
         let mechanism = session
-            .payload
-            .model
             .native_storage_mechanism()?
             .ok_or_else(|| unknown())?;
         let mut bank = if let Some(capture) = &capture {
@@ -397,7 +398,14 @@ pub(super) fn admit<C: TokenFilterController>(
         None
     };
     let operation_registration = controls
-        .map(crate::backend::runtime::execution::generic::OriginalOperationRegistration::new);
+        .map(|controls| {
+            crate::backend::runtime::execution::generic::OriginalOperationRegistration::new(
+                controls,
+                native_storage.clone(),
+                planning_metadata.as_ref(),
+            )
+        })
+        .transpose()?;
     let layerwise = layerwise_workspace.map(|workspace| {
         if original {
             LayerwiseQuoteSources::Retained(workspace)
@@ -443,8 +451,8 @@ pub(super) fn admit<C: TokenFilterController>(
         controller: contract,
         storage_contract,
         session: Rc::clone(&session.poison),
-        model_pool: session.payload.memory_pool.clone(),
-        context_pool: runtime.backend().memory_pool().clone(),
+        model_pool: session.payload.memory_ledger.clone(),
+        context_pool: runtime.backend().memory_ledger().clone(),
         parameter_epoch,
         layerwise,
         _host_sources: host_sources,
@@ -467,6 +475,7 @@ pub(super) fn admit<C: TokenFilterController>(
         prepared_source,
         saved_cache_source,
         continuation_metadata,
+        ordinary_publication: None,
         original_table: None,
         planning_metadata: (*planning_metadata).clone(),
         funding: RefCell::new(Some(funding)),

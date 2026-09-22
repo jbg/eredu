@@ -27,7 +27,6 @@ fn limits() -> CaptureLimits {
     CaptureLimits {
         per_step: usage,
         cumulative: usage,
-        physical_native_bytes: None,
         on_limit: CaptureLimitPolicy::Fail,
     }
 }
@@ -69,7 +68,6 @@ fn binding_selected(
             CaptureTransformKind::Slice,
         ],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = ObservationSupportReport {
@@ -466,7 +464,6 @@ fn discovery(binding: &OrdinaryPrefillCapture) -> CaptureDiscovery {
                     CaptureTransformKind::Slice,
                 ],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             },
         },

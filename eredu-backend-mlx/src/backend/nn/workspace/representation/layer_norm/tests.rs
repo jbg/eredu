@@ -50,11 +50,9 @@ fn layer_norm_preserves_exact_affine_roles_and_refuses_missing_sources() {
                     output_scalar(&op),
                     Some(promote(promote(input, weight), bias))
                 );
-                assert!(
-                    !super::super::output(op.as_view(), 0)
-                        .unwrap()
-                        .row_contiguous()
-                );
+                assert!(!super::super::output(op.as_view(), 0)
+                    .unwrap()
+                    .row_contiguous());
                 for missing in 0..3 {
                     let mut unknown = values;
                     unknown[missing] = None;
@@ -82,7 +80,11 @@ fn layer_norm_preserves_exact_affine_roles_and_refuses_missing_sources() {
 #[test]
 fn layer_norm_then_projection_keeps_the_actual_collective_input_scalar() {
     let mechanism = MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     };
     let context = WorkspaceContext::new(mechanism);

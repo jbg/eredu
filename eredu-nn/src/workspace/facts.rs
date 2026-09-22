@@ -1,5 +1,5 @@
 //! Flat caller-owned destinations for cold operation and host facts.
-use super::{WorkspaceOperationView, WorkspaceOutputStorageView};
+use super::{WorkspaceAllocationPopulation, WorkspaceOperationView, WorkspaceOutputStorageView};
 
 pub(super) mod owned;
 
@@ -178,6 +178,63 @@ impl WorkspaceHostDestination<'_> {
 pub trait WorkspaceFactMechanisms {
     /// Fixed geometry/arithmetic/specification and exact-destination failures.
     type Error;
+    /// Actual immutable physical topology of this selected fact provider.
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        None
+    }
+    /// Placement of a prospective independent output backing.
+    fn output_placement(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _output: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        None
+    }
+    /// Placement of scratch retained through the operation completion.
+    fn scratch_placement(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        None
+    }
+    /// Source-owned scratch allocations retained through this operation's completion.
+    /// When present, these exact descriptors replace the homogeneous scratch
+    /// placement. Their checked byte sum must equal the operation's scratch fact.
+    /// Distinct occurrences are independent populations; this loan supplies no
+    /// physical owner, storage credit, or execution authority.
+    fn scratch_allocations(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<&WorkspaceAllocationPopulation>, Self::Error> {
+        Ok(None)
+    }
+    /// Actual simultaneous backing rows retained by one new output. The raw
+    /// source rows replace a homogeneous output placement and keep separate
+    /// storage identities under the existing alias/lifetime graph. Resolved
+    /// alternative requirement groups cannot substitute for backing identities.
+    fn output_allocations(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _output: usize,
+    ) -> Result<Option<&WorkspaceAllocationPopulation>, Self::Error> {
+        Ok(None)
+    }
+    /// Host controls owned by one newly allocated backing for its full lifetime.
+    /// Aliases reuse their backing's controls. `None` makes attribution incomplete.
+    fn allocation_host_control_bytes(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+        _output: usize,
+    ) -> Option<u64> {
+        Some(0)
+    }
+    /// Host controls retained by all temporary native scratch allocations.
+    fn scratch_host_control_bytes(
+        &self,
+        _operation: WorkspaceOperationView<'_>,
+    ) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(0))
+    }
 
     /// Prepares an exact source companion before the pure count/fill worker.
     /// The default lends these same immutable facts. A source-aware provider
@@ -200,6 +257,22 @@ pub trait WorkspaceFactMechanisms {
         Self: Sized,
     {
         Ok(visit(self))
+    }
+
+    /// Prepare lexical source facts using this exact caller's metadata recorder
+    /// and funding account. The default preserves existing preowned mechanisms;
+    /// allocating companions override it so cold recording and funded execution
+    /// count the same constructors without a separate bookkeeping context.
+    fn with_prepared_facts_context<T>(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        context: &super::WorkspaceContext,
+        visit: impl FnOnce(&dyn WorkspaceFactMechanisms<Error = Self::Error>) -> T,
+    ) -> Result<T, Self::Error>
+    where
+        Self: Sized,
+    {
+        self.with_prepared_facts(operation, context.metadata_funding().as_ref(), visit)
     }
 
     /// Validates the operation and counts its exact tensor fact populations.

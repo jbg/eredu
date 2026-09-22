@@ -84,35 +84,59 @@ pub(super) fn check_resume_after_commits(
     )
     .unwrap()
     .into_parts();
-    let expected: &[u32] = if hybrid { &[63, 32, 32, 32] } else { &[8, 38, 26, 1] };
-    check_resume_loaded(model, root, committed, expected, before_snapshot,
-        "PUBLIC_HOST_SAVED_PHASE");
+    let expected: &[u32] = if hybrid {
+        &[63, 32, 32, 32]
+    } else {
+        &[8, 38, 26, 1]
+    };
+    check_resume_loaded(
+        model,
+        root,
+        committed,
+        expected,
+        before_snapshot,
+        "PUBLIC_HOST_SAVED_PHASE",
+    );
 }
 
 pub(super) fn check_resume_loaded(
     model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
-    root: Fixture, committed: usize, expected: &[u32],
-    before_snapshot: Option<&dyn Fn()>, phase_prefix: &str,
+    root: Fixture,
+    committed: usize,
+    expected: &[u32],
+    before_snapshot: Option<&dyn Fn()>,
+    phase_prefix: &str,
 ) -> serde_json::Value {
-    check_resume_loaded_with_settings(model,root,committed,expected,before_snapshot,phase_prefix,settings(0.0))
+    check_resume_loaded_with_settings(
+        model,
+        root,
+        committed,
+        expected,
+        before_snapshot,
+        phase_prefix,
+        settings(0.0),
+    )
 }
 pub(super) fn check_resume_loaded_with_settings(
     mut model: LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
-    root: Fixture, committed: usize, expected: &[u32],
-    before_snapshot: Option<&dyn Fn()>, phase_prefix: &str,
-    generation:PreparedChatGenerationSettings,
+    root: Fixture,
+    committed: usize,
+    expected: &[u32],
+    before_snapshot: Option<&dyn Fn()>,
+    phase_prefix: &str,
+    generation: PreparedChatGenerationSettings,
 ) -> serde_json::Value {
-    assert!(committed < expected.len(), "snapshot retains a future decode");
+    assert!(
+        committed < expected.len(),
+        "snapshot retains a future decode"
+    );
     let source = model
         .compile_managed_plain_text_source(
             std::fs::File::open(root.0.join("tokenizer.json")).unwrap(),
         )
         .unwrap();
-    // Every copy account retains its shared-domain ceiling. Keep the positive
-    // request ceiling across saved and resumed owners, and express the separate
-    // per-copy allowance through application_memory_budget_bytes.
-    let host_capacity = generation.inference.managed_memory_capacity_bytes
-        .expect("managed saved-state fixture");
+    // Copies and fresh continuations retain the request's physical domain limits.
+    let host_capacity = generation.inference.memory_limits.clone();
     let cancellation = GenerationCancellationToken::new();
     let mut session = model
         .start_managed_plain_text(
@@ -138,11 +162,7 @@ pub(super) fn check_resume_loaded_with_settings(
         retained_bytes: 8 * 1024 * 1024 * 1024,
         cumulative_copy_bytes: 32 * 1024 * 1024 * 1024,
     });
-    let native = WorkspaceCopyLimits {
-        capacity_bytes: host_capacity,
-        application_memory_budget_bytes: Some(8 * 1024 * 1024 * 1024),
-        safety_reserve_bytes: 0,
-    };
+    let native = WorkspaceCopyLimits::new(host_capacity.clone());
     let phase = |name| {
         if before_snapshot.is_some() {
             eprintln!("{phase_prefix} {name}");
@@ -150,11 +170,13 @@ pub(super) fn check_resume_loaded_with_settings(
     };
     phase("snapshot");
     let saved = session
-        .snapshot(&budget, host_capacity, native)
+        .snapshot(&budget, host_capacity.clone(), native.clone())
         .unwrap_or_else(report_failure);
     assert_eq!(saved.remaining_tokens(), Some(4 - committed));
     phase("original-continuation");
-    let output = session.run(&cancellation, &mut |_| {}).unwrap_or_else(report_failure);
+    let output = session
+        .run(&cancellation, &mut |_| {})
+        .unwrap_or_else(report_failure);
     assert_eq!(output.token_ids.as_ref(), expected);
     let result = serde_json::json!({"ids":output.token_ids.as_ref(),"text":output.text.as_str()});
     drop(output);
@@ -165,16 +187,19 @@ pub(super) fn check_resume_loaded_with_settings(
     cancelled.cancel();
     phase("cancelled-restore");
     let before = budget.usage();
-    assert!(
-        model
-            .restore_managed_plain_text(&saved, resume.clone(), host_capacity, &cancelled)
-            .unwrap()
-            .is_none()
-    );
+    assert!(model
+        .restore_managed_plain_text(&saved, resume.clone(), host_capacity.clone(), &cancelled)
+        .unwrap()
+        .is_none());
     assert_eq!(budget.usage(), before);
 
     phase("refused-restore");
-    let rejected = match model.restore_managed_plain_text(&saved, resume, 1, &cancellation) {
+    let rejected = match model.restore_managed_plain_text(
+        &saved,
+        resume.clone(),
+        native_limits(1),
+        &cancellation,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("one byte cannot admit a fresh saved-state destination"),
     };
@@ -188,12 +213,14 @@ pub(super) fn check_resume_loaded_with_settings(
 
     phase("restore");
     let restored = model
-        .restore_managed_plain_text(&saved, resume.clone(), host_capacity, &cancellation)
+        .restore_managed_plain_text(&saved, resume.clone(), host_capacity.clone(), &cancellation)
         .unwrap_or_else(report_failure)
         .expect("fresh restored run");
     assert_eq!(restored.token_ids(), prefix);
     phase("restored-continuation");
-    let output = restored.run(&cancellation, &mut |_| {}).unwrap_or_else(report_failure);
+    let output = restored
+        .run(&cancellation, &mut |_| {})
+        .unwrap_or_else(report_failure);
     assert_eq!(output.token_ids.as_ref(), expected);
     assert_eq!(output.text.as_str(), result["text"].as_str().unwrap());
     drop(output);
@@ -204,7 +231,12 @@ pub(super) fn check_resume_loaded_with_settings(
 
     phase("refused-fork");
     let before_fork = budget.usage();
-    let rejected = match model.fork_managed_plain_text(&saved, resume.clone(), 1, &cancellation) {
+    let rejected = match model.fork_managed_plain_text(
+        &saved,
+        resume.clone(),
+        native_limits(1),
+        &cancellation,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("one byte cannot admit an independent saved-state branch"),
     };
@@ -219,12 +251,14 @@ pub(super) fn check_resume_loaded_with_settings(
 
     phase("fork");
     let branch = model
-        .fork_managed_plain_text(&saved, resume, host_capacity, &cancellation)
+        .fork_managed_plain_text(&saved, resume, host_capacity.clone(), &cancellation)
         .unwrap_or_else(report_failure)
         .expect("fresh independent branch");
     assert_eq!(budget.usage().branches, 1);
     phase("fork-continuation");
-    let output = branch.run(&cancellation, &mut |_| {}).unwrap_or_else(report_failure);
+    let output = branch
+        .run(&cancellation, &mut |_| {})
+        .unwrap_or_else(report_failure);
     assert_eq!(output.token_ids.as_ref(), expected);
     assert_eq!(output.text.as_str(), result["text"].as_str().unwrap());
     drop(output);
@@ -307,8 +341,8 @@ fn check_snapshot(after_commit: bool, hybrid: bool) {
         max_snapshots: 0,
         ..limits
     });
-    let native = WorkspaceCopyLimits::new(8 * 1024 * 1024 * 1024);
-    let error = match session.snapshot(&disabled, native.capacity_bytes, native) {
+    let native = WorkspaceCopyLimits::new(native_limits(8 * 1024 * 1024 * 1024));
+    let error = match session.snapshot(&disabled, native.memory_limits.clone(), native.clone()) {
         Err(e) => e,
         Ok(_) => panic!("logical count must refuse before copying"),
     };
@@ -318,7 +352,7 @@ fn check_snapshot(after_commit: bool, hybrid: bool) {
     ));
     assert_eq!(disabled.usage(), SnapshotUsage::default());
     let budget = SnapshotBudget::new(limits);
-    let error = match session.snapshot(&budget, 1, native) {
+    let error = match session.snapshot(&budget, native_limits(1), native.clone()) {
         Err(e) => e,
         Ok(_) => panic!("one byte cannot hold an independent cursor"),
     };
@@ -328,7 +362,7 @@ fn check_snapshot(after_commit: bool, hybrid: bool) {
     let failed_copy = budget.usage().cumulative_copy_bytes;
     assert!(failed_copy > 0);
     let saved = session
-        .snapshot(&budget, native.capacity_bytes, native)
+        .snapshot(&budget, native.memory_limits.clone(), native.clone())
         .unwrap_or_else(|cause| {
             eprintln!("PUBLIC_MANAGED_SNAPSHOT_CAPTURE_FAILURE: {cause:?}");
             report_failure(cause)

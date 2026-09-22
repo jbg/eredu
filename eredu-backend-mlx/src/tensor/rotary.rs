@@ -7,17 +7,25 @@ const INLINE_VALUES: usize = 4;
 type ArrayOwners = SmallVec<[Array; INLINE_VALUES]>;
 
 use super::*;
-use eredu_nn::multimodal::{MultiAxisRotarySpecRef, fill_rotary_axis_frequencies};
+use eredu_nn::multimodal::{fill_rotary_axis_frequencies, MultiAxisRotarySpecRef};
 
 #[cfg(test)]
-thread_local! { static PREPARED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    static PREPARED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREPARED_TWO_AXIS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 #[cfg(test)]
 pub(crate) fn reset_prepared_calls() {
     PREPARED_CALLS.set(0);
+    PREPARED_TWO_AXIS_CALLS.set(0);
 }
 #[cfg(test)]
 pub(crate) fn prepared_calls() -> usize {
     PREPARED_CALLS.get()
+}
+#[cfg(test)]
+pub(crate) fn prepared_two_axis_calls() -> usize {
+    PREPARED_TWO_AXIS_CALLS.get()
 }
 
 pub(super) fn execute(
@@ -37,6 +45,9 @@ pub(super) fn execute(
     #[cfg(test)]
     if prepared_frequencies.is_some() {
         PREPARED_CALLS.set(PREPARED_CALLS.get() + 1);
+        if axes == 2 {
+            PREPARED_TWO_AXIS_CALLS.set(PREPARED_TWO_AXIS_CALLS.get() + 1);
+        }
     }
     let rows =
         position_shape[..position_shape.len() - 1]

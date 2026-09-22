@@ -7,21 +7,56 @@ use std::{marker::PhantomData, mem::size_of};
 pub(super) enum PublicationOrigin {
     Prepaid(PrepaidStorageOrigin),
     Copy(WorkspaceCopyRetention),
+    Numerical {
+        account: crate::working_memory::OriginalNumericalBudgetCustody,
+        host: HostPreparationAuthority,
+    },
 }
 impl PublicationOrigin {
-    pub(super) fn same_source_account(&self, value: &crate::working_memory::OriginalHostMetadataCustody) -> bool {
+    pub(super) fn numerical(
+        &self,
+    ) -> Option<&crate::working_memory::OriginalNumericalBudgetCustody> {
+        match self {
+            Self::Numerical { account, .. } => Some(account),
+            _ => None,
+        }
+    }
+    pub(super) fn source_host_pool(&self) -> Result<&MemoryLedger, WorkingMemoryError> {
+        match self {
+            Self::Prepaid(PrepaidStorageOrigin::Immutable(origin)) => Ok(origin.raw().pool()),
+            _ => Err(WorkingMemoryError::IdentityMismatch),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_pool(&self) -> Result<&MemoryLedger, WorkingMemoryError> {
+        match self {
+            Self::Prepaid(PrepaidStorageOrigin::Native(origin)) => Ok(origin.pool()),
+            _ => self.source_host_pool(),
+        }
+    }
+
+    pub(super) fn same_source_account(
+        &self,
+        value: &crate::working_memory::OriginalHostMetadataCustody,
+    ) -> bool {
         matches!(self, Self::Prepaid(PrepaidStorageOrigin::Immutable(origin)) if origin.raw().same(value))
     }
     pub(super) fn immutable(&self) -> bool {
         matches!(self, Self::Prepaid(origin) if origin.immutable())
     }
     pub(super) fn same_origin(&self, other: &PrepaidStorageOrigin) -> bool {
-        matches!(self, Self::Prepaid(origin) if origin.same_origin(other))
+        match (self, other) {
+            (Self::Prepaid(origin), other) => origin.same_origin(other),
+            (Self::Numerical { account, .. }, PrepaidStorageOrigin::Numerical(other)) => {
+                account.same_account(&other.account)
+            }
+            _ => false,
+        }
     }
     pub(super) fn prepaid(&self) -> Result<&PrepaidStorageOrigin, WorkingMemoryError> {
         match self {
             Self::Prepaid(origin) => Ok(origin),
-            Self::Copy(_) => Err(WorkingMemoryError::IdentityMismatch),
+            Self::Copy(_) | Self::Numerical { .. } => Err(WorkingMemoryError::IdentityMismatch),
         }
     }
     pub(super) fn validate_capacity(&self, bytes: u64) -> Result<(), WorkingMemoryError> {
@@ -35,11 +70,13 @@ impl PublicationOrigin {
         match self {
             Self::Prepaid(origin) => origin.validate_publisher(scope, usage),
             Self::Copy(copy) => copy.validate_publication(scope, usage),
+            Self::Numerical { .. } => Err(WorkingMemoryError::IdentityMismatch),
         }
     }
     pub(super) fn preparation(&self) -> Option<&HostPreparationAuthority> {
         match self {
             Self::Copy(copy) => copy.preparation(),
+            Self::Numerical { host, .. } => Some(host),
             Self::Prepaid(_) => None,
         }
     }
@@ -112,11 +149,13 @@ impl<K: Clone + Ord + Send + Sync + 'static> WorkspaceCopyPublicationPlan<K> {
         // nodes and output registrations independently retain their host token.
         let inputs = crate::working_memory::qualified_storage::vector(self.slots, true)?;
         let rows = crate::working_memory::qualified_storage::vector(self.slots, true)?;
+        let placements = crate::working_memory::qualified_storage::vector(self.slots, true)?;
         let node = RegistryBatch::prepare_copy_exact(self.slots, host)?;
         let namespace = PreparedNamespace::prepare_copy::<K>(host);
         Ok(PreparedWorkspaceCopyPublication {
             inner: PreparedNativePublication {
                 inputs,
+                placements,
                 rows,
                 node: Some(node),
                 namespace: Some(namespace),
@@ -125,6 +164,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> WorkspaceCopyPublicationPlan<K> {
                 slots: self.slots,
                 exact_storage: true,
                 failure_site: "registry copy preparation",
+                missing_existing_input: None,
                 partition: PublicationOrigin::Copy(copy),
             },
         })
@@ -141,11 +181,16 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedWorkspaceCopyPublication<K>
     /// Supply a completed physical allocation's exact identity and capacity.
     /// Backend inspection is responsible for that fact, as on ordinary funded
     /// publication. Every new canonical byte is debited from this copy's scope.
-    pub fn push(&mut self, key: K, bytes: u64) -> Result<usize, WorkingMemoryError> {
-        self.inner
-            .push_observation(crate::working_memory::NativeStorageObservation::Ordinary(
-                key, bytes,
-            ))
+    pub fn push(
+        &mut self,
+        key: K,
+        bytes: u64,
+        placement: Arc<eredu_core::MemoryPlacement>,
+    ) -> Result<usize, WorkingMemoryError> {
+        self.inner.push_placed_observation(
+            crate::working_memory::NativeStorageObservation::Ordinary(key, bytes),
+            placement,
+        )
     }
     /// Atomic validation and publication. A refusal consumes the attempt while
     /// preserving every staged owner and the original typed cause.

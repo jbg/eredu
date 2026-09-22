@@ -9,8 +9,8 @@ use std::{
 use eredu_checkpoint::gguf_store::open_prepared_gguf_source_with_reader_buffers;
 use eredu_checkpoint::{
     store::{
-        CheckpointSource, RestrictedCheckpointSource,
-        RetainedCheckpointSource, StoreError, TensorMetadata,
+        CheckpointSource, RestrictedCheckpointSource, RetainedCheckpointSource, StoreError,
+        TensorMetadata,
     },
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
 };
@@ -163,10 +163,12 @@ struct PreparedPredictionDiscovery {
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
 }
 
-mod intervention_source;
 mod activation_source;
 mod component_source;
-pub use component_source::{PreparedComponentPartitionSource,ComponentPartitionSourceError,CaptureDiscoverySourceError};
+mod intervention_source;
+pub use component_source::{
+    CaptureDiscoverySourceError, ComponentPartitionSourceError, PreparedComponentPartitionSource,
+};
 
 impl PreparedModelDiscovery {
     /// Exact content identity only when prior source discovery established it.
@@ -332,7 +334,11 @@ impl PreparedModelDiscovery {
         Option<crate::component_partition::ComponentPartitionLayouts>,
         crate::component_partition::ComponentPartitionError,
     > {
-        self.component_layouts_worker(max_ranks,None,crate::component_partition::construction::Destination(None))
+        self.component_layouts_worker(
+            max_ranks,
+            None,
+            crate::component_partition::construction::Destination(None),
+        )
     }
 
     /// Combines target ownership with the actual prepared prediction modules.
@@ -346,12 +352,21 @@ impl PreparedModelDiscovery {
         Option<crate::component_partition::ComponentPartitionLayouts>,
         crate::component_partition::ComponentPartitionError,
     > {
-        self.component_layouts_worker(max_ranks,Some(execution),crate::component_partition::construction::Destination(None))
+        self.component_layouts_worker(
+            max_ranks,
+            Some(execution),
+            crate::component_partition::construction::Destination(None),
+        )
     }
 
     /// Borrow the exact selected capture declarations and collector support.
     /// No artifact identity is resolved, declaration copied or authority issued.
-    pub fn capture_parts(&self) -> (&eredu_core::ObservationCatalog, &eredu_core::ObservationSupportReport) {
+    pub fn capture_parts(
+        &self,
+    ) -> (
+        &eredu_core::ObservationCatalog,
+        &eredu_core::ObservationSupportReport,
+    ) {
         (&self.descriptor.observations, &self.support)
     }
 
@@ -396,7 +411,9 @@ impl PreparedModelDiscovery {
     pub fn capture(
         &self,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        let identity = self.identity.resolve()
+        let identity = self
+            .identity
+            .resolve()
             .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
         let construction = eredu_core::capture::CaptureSourceConstruction::new(None);
         Ok(eredu_core::capture::CaptureDiscovery {
@@ -409,13 +426,20 @@ impl PreparedModelDiscovery {
     /// Refines partition support using retained architecture placement and exact
     /// native collector facts. Existing selection/phase/mechanism gates still apply.
     pub fn capture_with_partition_support(
-        &self, layouts: &crate::component_partition::ComponentPartitionLayouts,
+        &self,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
         mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        let identity = self.identity.resolve()
+        let identity = self
+            .identity
+            .resolve()
             .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
-        self.capture_partition_worker(identity, layouts,
-            eredu_core::capture::CaptureSourceConstruction::new(None), |point, _| Ok(partition(point)))
+        self.capture_partition_worker(
+            identity,
+            layouts,
+            eredu_core::capture::CaptureSourceConstruction::new(None),
+            |point, _| Ok(partition(point)),
+        )
     }
 
     /// Compiles the exact original artifact identity and partition discovery
@@ -425,46 +449,83 @@ impl PreparedModelDiscovery {
     /// The collector callback constructs its status and errors under the supplied
     /// policy and reports only borrowed facts from the actual selected transport.
     pub fn capture_with_partition_source(
-        &self, layouts: &crate::component_partition::ComponentPartitionLayouts,
-        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
-        partition: impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
-            -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
-    ) -> Result<eredu_core::capture::CaptureDiscovery, CaptureDiscoverySourceError> {
-        construction.controls(std::mem::size_of::<(&Self,
-            &crate::component_partition::ComponentPartitionLayouts,
-            eredu_core::capture::CaptureSourceConstruction<'_>,
-            Result<eredu_core::capture::CaptureDiscovery, CaptureDiscoverySourceError>)>()
-            .checked_add(std::mem::size_of_val(&partition))
-            .ok_or(eredu_core::capture::CaptureError::Overflow)?)?;
-        let identity = match construction.funding() {
-            Some(funding) => self.prepare_capture_identity(funding)?,
-            None => self.identity.resolve().map_err(|error|
-                eredu_core::capture::CaptureError::Invalid(error.to_string()))?,
-        };
-        self.capture_partition_worker(identity, layouts, construction, partition).map_err(Into::into)
-    }
-    fn capture_partition_worker(
-        &self, identity: eredu_core::artifact::ArtifactIdentity,
+        &self,
         layouts: &crate::component_partition::ComponentPartitionLayouts,
         construction: eredu_core::capture::CaptureSourceConstruction<'_>,
-        mut partition: impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
-            -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+        partition: impl FnMut(
+            &eredu_core::ObservationPoint,
+            eredu_core::capture::CaptureSourceConstruction<'_>,
+        ) -> Result<
+            eredu_core::ObservationSupportStatus,
+            eredu_core::capture::CaptureError,
+        >,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, CaptureDiscoverySourceError> {
+        construction.controls(
+            std::mem::size_of::<(
+                &Self,
+                &crate::component_partition::ComponentPartitionLayouts,
+                eredu_core::capture::CaptureSourceConstruction<'_>,
+                Result<eredu_core::capture::CaptureDiscovery, CaptureDiscoverySourceError>,
+            )>()
+            .checked_add(std::mem::size_of_val(&partition))
+            .ok_or(eredu_core::capture::CaptureError::Overflow)?,
+        )?;
+        let identity = match construction.funding() {
+            Some(funding) => self.prepare_capture_identity(funding)?,
+            None => self
+                .identity
+                .resolve()
+                .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?,
+        };
+        self.capture_partition_worker(identity, layouts, construction, partition)
+            .map_err(Into::into)
+    }
+    fn capture_partition_worker(
+        &self,
+        identity: eredu_core::artifact::ArtifactIdentity,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+        mut partition: impl FnMut(
+            &eredu_core::ObservationPoint,
+            eredu_core::capture::CaptureSourceConstruction<'_>,
+        ) -> Result<
+            eredu_core::ObservationSupportStatus,
+            eredu_core::capture::CaptureError,
+        >,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
         use eredu_core::capture::{CaptureDiscovery, CaptureError};
-        construction.controls(std::mem::size_of::<(&Self, eredu_core::artifact::ArtifactIdentity,
-            &crate::component_partition::ComponentPartitionLayouts, CaptureDiscovery, Result<CaptureDiscovery, CaptureError>)>()
-            .checked_add(std::mem::size_of_val(&partition)).ok_or(CaptureError::Overflow)?)?;
+        construction.controls(
+            std::mem::size_of::<(
+                &Self,
+                eredu_core::artifact::ArtifactIdentity,
+                &crate::component_partition::ComponentPartitionLayouts,
+                CaptureDiscovery,
+                Result<CaptureDiscovery, CaptureError>,
+            )>()
+            .checked_add(std::mem::size_of_val(&partition))
+            .ok_or(CaptureError::Overflow)?,
+        )?;
         let artifact_identity = construction.format(format_args!("{identity}"))?;
         let catalog = construction.catalog(&self.descriptor.observations)?;
         let mut support = eredu_runtime::inspection::observation_support_with_partition_source(
-            &self.descriptor.observations, self.observation_context, construction,
-            |point, construction| match layouts.capture_hook_support_source(&point.path,
-                self.partition_hooks.unwrap_or_default(), construction)? {
-                    eredu_core::ObservationSupportStatus::Supported => partition(point, construction),
-                    status => Ok(status),
-                })?;
+            &self.descriptor.observations,
+            self.observation_context,
+            construction,
+            |point, construction| match layouts.capture_hook_support_source(
+                &point.path,
+                self.partition_hooks.unwrap_or_default(),
+                construction,
+            )? {
+                eredu_core::ObservationSupportStatus::Supported => partition(point, construction),
+                status => Ok(status),
+            },
+        )?;
         support.capture = construction.capabilities(&self.support.capture)?;
-        Ok(CaptureDiscovery { artifact_identity, catalog, support })
+        Ok(CaptureDiscovery {
+            artifact_identity,
+            catalog,
+            support,
+        })
     }
 
     /// Combines retained semantic points with current native intervention facts.
@@ -478,6 +539,26 @@ impl PreparedModelDiscovery {
             &self.capture()?,
             mechanisms,
         ))
+    }
+
+    /// Describes target hooks in the retained ordinary model traversal. This
+    /// projects discovery only: a selected independent schedule, source owner
+    /// and admitted model role are still required to execute an invocation.
+    pub fn autoregressive_activations(
+        &self,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+        session_identity: &str,
+        active_overlay: Option<&str>,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        self.speculative_activations(
+            &crate::speculative_execution::SpeculativeActivationExecution::ordinary_target(),
+            mechanisms,
+            session_identity,
+            active_overlay,
+        )
     }
 
     /// Projects invocation-scoped support from actual typed prediction hooks.
@@ -565,15 +646,30 @@ impl PreparedModelDiscovery {
                 ));
             }
         }
-        let prediction = self.prediction.as_ref().ok_or_else(|| {
-            CaptureError::Unsupported("prepared sources have no selected prediction catalog".into())
-        })?;
+        let (descriptor, intervention_points) = self
+            .activation_declarations(execution)
+            .ok_or_else(|| CaptureError::Unsupported(
+                "prepared sources have no selected invocation catalog".into(),
+            ))?;
         let mut captures = self.capture()?;
-        captures.catalog = prediction.descriptor.observations.clone();
+        captures.catalog = descriptor.observations.clone();
+        if execution.is_autoregressive() {
+            let mut retained = Vec::with_capacity(captures.catalog.points.len());
+            for point in captures.catalog.points {
+                let scope = crate::speculative_execution::speculative_capture_scope(
+                    descriptor, &point.node_id,
+                )?;
+                if scope == SpeculativeCaptureScope::Target {
+                    retained.push(point);
+                }
+            }
+            captures.catalog.points = retained;
+        }
+        let catalog = captures.catalog.clone();
         let mut bindings = std::collections::BTreeMap::new();
         for point in &mut captures.catalog.points {
             let scope = crate::speculative_execution::speculative_capture_scope(
-                &prediction.descriptor,
+                descriptor,
                 &point.node_id,
             )?;
             execution.validate_scope(scope)?;
@@ -617,15 +713,24 @@ impl PreparedModelDiscovery {
         captures.support.capture = self.support.capture.clone();
         // Keep the semantic declaration; only this report discharges its
         // prediction requirement for the scoped execution.
-        captures.catalog = prediction.descriptor.observations.clone();
+        captures.catalog = catalog;
+        let mut selected_interventions = Vec::with_capacity(intervention_points.len());
+        for point in intervention_points {
+            let scope = crate::speculative_execution::speculative_capture_scope(
+                descriptor, &point.node_id,
+            )?;
+            if !execution.is_autoregressive() || scope == SpeculativeCaptureScope::Target {
+                selected_interventions.push(point.clone());
+            }
+        }
         let mut interventions = eredu_runtime::inspection::intervention_support(
-            prediction.intervention_points.clone(),
+            selected_interventions,
             &captures,
             mechanisms,
         );
         for point in &interventions.points {
             let scope = crate::speculative_execution::speculative_capture_scope(
-                &prediction.descriptor,
+                descriptor,
                 &point.node_id,
             )?;
             bindings.insert(point.node_id.clone(), scope);
@@ -663,7 +768,9 @@ impl PreparedModelSources {
         self.shared().composite_requirements.as_ref()
     }
 
-    pub(crate) fn construction_semantics(&self) -> &crate::replicated_text::PreparedConstructionSemantics {
+    pub(crate) fn construction_semantics(
+        &self,
+    ) -> &crate::replicated_text::PreparedConstructionSemantics {
         &self.shared().construction
     }
 
@@ -798,7 +905,9 @@ impl PreparedModelSources {
 
     /// Exact target-only inspection already authenticated at source preparation.
     /// Its artifact admission/catalog and target architecture remain inseparable.
-    pub(crate) fn execution_inspection(&self) -> &eredu_core::ArtifactInspection<ArtifactArchitecturePlan> {
+    pub(crate) fn execution_inspection(
+        &self,
+    ) -> &eredu_core::ArtifactInspection<ArtifactArchitecturePlan> {
         &self.shared().execution_inspection
     }
 
@@ -860,7 +969,9 @@ impl PreparedModelSources {
     }
 
     /// Borrows the construction completed for this exact immutable source graph.
-    pub(crate) fn retained_prediction_placement(&self) -> Option<&Arc<crate::prediction_extension::PreparedPredictionPlacement>> {
+    pub(crate) fn retained_prediction_placement(
+        &self,
+    ) -> Option<&Arc<crate::prediction_extension::PreparedPredictionPlacement>> {
         self.shared().graph.prediction_placement.get()
     }
 
@@ -1035,7 +1146,7 @@ pub fn prepare_model_sources(
 pub fn prepare_model_sources_with_catalog_pool(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: SelectedPreparation,
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
 ) -> Result<PreparedModelSources, PreparedModelSourcesError> {
     prepare_model_sources_impl(plan, selected, Some(pool))
 }
@@ -1048,18 +1159,21 @@ pub fn prepare_model_sources_with_catalog_pool(
 pub fn prepare_model_sources_with_inspection_admission(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: SelectedPreparation,
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
 ) -> Result<PreparedModelSources, PreparedModelSourcesError> {
-    let admitted = plan.inspection().safetensors_shards()
+    let admitted = plan
+        .inspection()
+        .safetensors_shards()
         .map(|shards| pool.safetensors_shards_have_source_admission(shards))
-        .transpose()?.unwrap_or(false);
+        .transpose()?
+        .unwrap_or(false);
     prepare_model_sources_impl(plan, selected, admitted.then_some(pool))
 }
 
 fn prepare_model_sources_impl(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: SelectedPreparation,
-    catalog_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+    catalog_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
 ) -> Result<PreparedModelSources, PreparedModelSourcesError> {
     if !selected
         .admission_token()
@@ -1135,17 +1249,12 @@ fn prepare_model_sources_impl(
                 (requirements.architecture_identity().to_owned(), None)
             }
             crate::replicated_text::ReplicatedTextExecutionClass::Routed(requirements) => {
-                (
-                    requirements.text().architecture_identity().to_owned(),
-                    None,
-                )
+                (requirements.text().architecture_identity().to_owned(), None)
             }
-            crate::replicated_text::ReplicatedTextExecutionClass::Composite(requirements) => {
-                (
-                    requirements.execution().architecture_identity().to_owned(),
-                    Some(requirements),
-                )
-            }
+            crate::replicated_text::ReplicatedTextExecutionClass::Composite(requirements) => (
+                requirements.execution().architecture_identity().to_owned(),
+                Some(requirements),
+            ),
         };
     if execution_identity != expected_execution_identity {
         return Err(PreparedModelSourcesError::InvalidSelection(format!(
@@ -1256,7 +1365,7 @@ fn prepare_safetensors_sources(
     tensors: eredu_core::checkpoint::TensorCatalog,
     shards: eredu_checkpoint::safetensors::SafetensorsShards,
     max_cached_shards: usize,
-    catalog_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+    catalog_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     let target_architecture = architecture.safetensors_architecture().ok_or_else(|| {
         PreparedModelSourcesError::InvalidSelection(
@@ -1284,12 +1393,19 @@ fn prepare_safetensors_sources(
         .clone();
     let primary = match catalog_pool {
         Some(pool) => pool.prepare_safetensors_artifact(
-            &tensors, shards, &source_resolution, max_cached_shards,
+            &tensors,
+            shards,
+            &source_resolution,
+            max_cached_shards,
             eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
         )?,
         None => eredu_core::artifact::open_prepared_safetensors_artifact(
-            &tensors, shards, source_resolution.clone(), max_cached_shards,
-        )?.into(),
+            &tensors,
+            shards,
+            source_resolution.clone(),
+            max_cached_shards,
+        )?
+        .into(),
     };
     let complete = primary.clone();
     let (target, extension) = match prediction_extension.as_ref() {
@@ -1328,7 +1444,7 @@ fn compile_resolved_gguf_source(
     resolved: &ResolvedCheckpointPlan,
     mapping: &[eredu_gguf::TranslatedTensorLayout],
     maximum: usize,
-    pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+    pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
 ) -> Result<RetainedCheckpointSource, PreparedModelSourcesError> {
     match pool {
         Some(pool) => {
@@ -1354,7 +1470,7 @@ fn prepare_gguf_sources(
     validated: eredu_core::ValidatedGguf,
     max_cached_readers: usize,
     media_projector: MediaProjectorSourcePolicy,
-    catalog_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+    catalog_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     let primary_plan = architecture.gguf_plan().ok_or_else(|| {
         PreparedModelSourcesError::InvalidSelection(

@@ -52,18 +52,14 @@ fn supplementary_inventory_preserves_physical_ids_and_singleton_repeated_request
         ]
     );
     assert!(!source.ids.contains(&id("foreign")));
-    assert!(
-        source
-            .layout
-            .window_range(2, NonZeroUsize::new(1).unwrap())
-            .is_none()
-    );
-    assert!(
-        SupplementarySourcePlan::prepare(
-            &units,
-            &units.iter().map(|u| u.id().clone()).collect::<Vec<_>>()
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(source
+        .layout
+        .window_range(2, NonZeroUsize::new(1).unwrap())
+        .is_none());
+    assert!(SupplementarySourcePlan::prepare(
+        &units,
+        &units.iter().map(|u| u.id().clone()).collect::<Vec<_>>()
+    )
+    .unwrap()
+    .is_none());
 }

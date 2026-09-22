@@ -11,6 +11,15 @@ pub enum WorkspaceBorrowedStorageError {
     #[error("borrowed storage requires an exact known capacity")]
     /// A supplied root has no declared physical capacity.
     UnknownCapacity,
+    /// A nonzero backing has no physical placement in an attributed context.
+    #[error("borrowed storage has no physical placement")]
+    UnknownPlacement,
+    /// A backing has no finite host-control allocation facts.
+    #[error("borrowed storage has no host-control capacity")]
+    UnknownHostControls,
+    /// A backing names a foreign topology or overflows one physical domain.
+    #[error(transparent)]
+    Domain(#[from] eredu_core::MemoryDomainError),
     #[error("borrowed storage capacity sum overflow")]
     /// The capacity sum or constructor layout overflows.
     Overflow,
@@ -36,6 +45,9 @@ impl WorkspaceBorrowedStorageError {
             Self::UnknownCapacity => {
                 Error::backend("borrowed storage requires an exact known capacity")
             }
+            Self::UnknownPlacement => Error::backend_retained_source(Self::UnknownPlacement),
+            Self::UnknownHostControls => Error::backend_retained_source(Self::UnknownHostControls),
+            Self::Domain(cause) => Error::backend_retained_source(cause),
             Self::Overflow => workspace_overflow("borrowed storage capacity sum overflow"),
             Self::SelectionContext => {
                 Error::backend("borrowed selection belongs to another workspace context")
@@ -58,7 +70,7 @@ pub struct WorkspaceBorrowedStorage(Rc<BorrowedStorage>);
 struct BorrowedStorage {
     context: Rc<WorkspaceIdentity>,
     roots: Vec<WorkspaceExistingStorage>,
-    total_bytes: u64,
+    total_bytes: Option<u64>,
 }
 impl WorkspaceBorrowedStorage {
     /// Ordinary selection uses the same validation and first-occurrence order.
@@ -132,7 +144,7 @@ impl WorkspaceBorrowedStorage {
                 .try_reserve_exact(slots)
                 .map_err(WorkspaceBorrowedStorageError::Reserve)?;
         }
-        let mut total_bytes = 0u64;
+        let mut total_bytes = Some(0u64);
         for root in roots {
             if !Rc::ptr_eq(&root.context, &context.identity) {
                 return Err(WorkspaceBorrowedStorageError::Context);
@@ -143,9 +155,36 @@ impl WorkspaceBorrowedStorage {
             if retained.iter().any(|prior| prior.same_storage(root)) {
                 continue;
             }
-            total_bytes = total_bytes
-                .checked_add(bytes)
-                .ok_or(WorkspaceBorrowedStorageError::Overflow)?;
+            if let Some(topology) = context.memory_topology() {
+                if bytes != 0 {
+                    let placement = root
+                        .placement()
+                        .ok_or(WorkspaceBorrowedStorageError::UnknownPlacement)?;
+                    placement.validate(topology)?;
+                    for domain in placement.domains() {
+                        let mut charge = bytes;
+                        for prior in &retained {
+                            if prior
+                                .placement()
+                                .is_some_and(|p| p.domains().contains(domain))
+                            {
+                                charge = charge
+                                    .checked_add(
+                                        prior.capacity_bytes().expect("validated source capacity"),
+                                    )
+                                    .ok_or(WorkspaceBorrowedStorageError::Overflow)?;
+                            }
+                        }
+                    }
+                }
+                total_bytes = total_bytes.and_then(|total| total.checked_add(bytes));
+            } else {
+                total_bytes = Some(
+                    total_bytes
+                        .and_then(|total| total.checked_add(bytes))
+                        .ok_or(WorkspaceBorrowedStorageError::Overflow)?,
+                );
+            }
             if slots.is_some_and(|n| retained.len() == n) {
                 return Err(WorkspaceBorrowedStorageError::Slots);
             }
@@ -162,8 +201,81 @@ impl WorkspaceBorrowedStorage {
         &self.0.roots
     }
     /// Sum of unique declared capacities; never a scalar admission discount.
-    pub fn total_bytes(&self) -> u64 {
+    pub fn total_bytes(&self) -> Option<u64> {
         self.0.total_bytes
+    }
+    /// Resolves the original deduplicated roots without collapsing their domains.
+    /// The context funds every returned counter and candidate-basis allocation.
+    pub fn requirements(
+        &self,
+        context: &WorkspaceContext,
+    ) -> Result<eredu_core::DomainMemoryRequirements, Error> {
+        if !self.belongs_to(context) {
+            return Err(WorkspaceBorrowedStorageError::Context.into_ordinary());
+        }
+        let topology = context
+            .memory_topology()
+            .ok_or_else(|| context.metadata_source(WorkspacePlacementError::MissingTopology))?;
+        let mut candidates = 0usize;
+        let mut descriptions = 0u64;
+        for root in self.roots() {
+            if root.capacity_bytes() == Some(0) {
+                continue;
+            }
+            let placement = root.placement().ok_or_else(|| {
+                context.metadata_source(WorkspaceBorrowedStorageError::UnknownPlacement)
+            })?;
+            placement
+                .validate(topology)
+                .map_err(|cause| context.metadata_source(cause))?;
+            if matches!(
+                placement.kind(),
+                eredu_core::MemoryPlacementKind::Possible { .. }
+            ) {
+                candidates = candidates
+                    .checked_add(1)
+                    .ok_or(WorkspaceMetadataError::Overflow)?;
+                descriptions = descriptions
+                    .checked_add(
+                        placement
+                            .backing_bytes()
+                            .map_err(|cause| context.metadata_source(cause))?,
+                    )
+                    .ok_or(WorkspaceMetadataError::Overflow)?;
+            }
+        }
+        let bytes =
+            eredu_core::DomainMemoryRequirements::construction_backing_bytes(topology, candidates)
+                .map_err(|cause| context.metadata_source(cause))?
+                .checked_add(descriptions)
+                .ok_or(WorkspaceMetadataError::Overflow)?;
+        context.charge_metadata(
+            usize::try_from(bytes).map_err(|_| WorkspaceMetadataError::Overflow)?,
+        )?;
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero_with_allowance_capacity(
+            topology, candidates,
+        );
+        for root in self.roots() {
+            let bytes = root.capacity_bytes().ok_or_else(|| {
+                context.metadata_source(WorkspaceBorrowedStorageError::UnknownCapacity)
+            })?;
+            if bytes != 0 {
+                requirements
+                    .add_allocation(bytes, root.placement().expect("validated placement"))
+                    .map_err(|cause| context.metadata_source(cause))?;
+            }
+        }
+        let host = eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())
+            .map_err(|cause| context.metadata_source(cause))?;
+        for root in self.roots() {
+            let controls = root.host_control_bytes().ok_or_else(|| {
+                context.metadata_source(WorkspaceBorrowedStorageError::UnknownHostControls)
+            })?;
+            requirements
+                .add_allocation(controls, &host)
+                .map_err(|cause| context.metadata_source(cause))?;
+        }
+        Ok(requirements)
     }
     /// Same immutable selection token, irrespective of equal capacities.
     pub fn same_identity(&self, other: &Self) -> bool {

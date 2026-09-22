@@ -7,8 +7,16 @@ use std::fmt;
 /// overlap; this report grants no capacity or authority and is not additive.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkspaceQuoteComponents {
+    pub(crate) ordinary_native_observed_host: Option<u64>,
+    pub(crate) ordinary_native_control_allocations: Option<usize>,
+    pub(crate) ordinary_caller_observed_host: Option<u64>,
+    pub(crate) ordinary_caller_control_allocations: Option<usize>,
+    pub(crate) ordinary_ledger_controls: Option<u64>,
+    pub(crate) ordinary_native_host_requirement: Option<u64>,
+    pub(crate) ordinary_publication_controls: Option<u64>,
     pub(crate) before_seal: Option<u64>,
     pub(crate) after_seal: Option<u64>,
+    pub(crate) after_seal_host: Option<u64>,
     pub(crate) state: Option<u64>,
     pub(crate) activations: Option<u64>,
     pub(crate) vocabulary: Option<u64>,
@@ -37,17 +45,29 @@ pub struct WorkspaceQuoteComponents {
 
 impl WorkspaceQuoteComponents {
     /// Exact sealed incremental requirement, before policy safety reserves.
-    pub fn incremental_bytes(&self) -> Option<u64> { self.after_seal }
+    pub fn incremental_bytes(&self) -> Option<u64> {
+        self.after_seal
+    }
     /// Original cumulative native graph constructor allowance.
-    pub fn graph_bytes(&self) -> Option<u64> { self.graph }
+    pub fn graph_bytes(&self) -> Option<u64> {
+        self.graph
+    }
     /// Request-owned precompiled pipeline and selector allowance.
-    pub fn pipeline_bytes(&self) -> Option<u64> { self.pipeline }
+    pub fn pipeline_bytes(&self) -> Option<u64> {
+        self.pipeline
+    }
     /// Separate native publication/control allowance; excludes native payload.
-    pub fn native_control_bytes(&self) -> Option<u64> { self.native_controls }
+    pub fn native_control_bytes(&self) -> Option<u64> {
+        self.native_controls
+    }
     /// Selected native physical backing capacity.
-    pub fn native_capacity_bytes(&self) -> Option<u64> { self.native_capacity }
+    pub fn native_capacity_bytes(&self) -> Option<u64> {
+        self.native_capacity
+    }
     /// Certified shader lookup population, including selected completion policy.
-    pub fn kernel_attempts(&self) -> Option<usize> { self.kernel_attempts }
+    pub fn kernel_attempts(&self) -> Option<usize> {
+        self.kernel_attempts
+    }
 }
 
 /// The original typed refusal together with its already-funded scalar report.
@@ -62,32 +82,62 @@ pub struct WorkspaceCandidateRefusal {
 }
 impl WorkspaceCandidateRefusal {
     /// Geometry actually inspected for the last rejected candidate.
-    pub fn geometry(&self) -> InferenceGeometry { self.geometry }
+    pub fn geometry(&self) -> InferenceGeometry {
+        self.geometry
+    }
     /// Read-only component evidence from the original producer.
-    pub fn components(&self) -> &WorkspaceQuoteComponents { &self.components }
+    pub fn components(&self) -> &WorkspaceQuoteComponents {
+        &self.components
+    }
     /// First complete candidate, before any smaller-chunk retry.
-    pub fn initial(&self) -> Option<&(InferenceGeometry, WorkspaceQuoteComponents)> { self.initial.as_ref() }
-    /// Smallest complete requirement actually observed by the shared planner.
-    pub fn minimum(&self) -> Option<&(InferenceGeometry, WorkspaceQuoteComponents)> { self.minimum.as_ref() }
+    pub fn initial(&self) -> Option<&(InferenceGeometry, WorkspaceQuoteComponents)> {
+        self.initial.as_ref()
+    }
+    /// Smallest comparable aggregate requirement observed by the shared planner.
+    /// Per-domain-only candidates have no aggregate ordering in this diagnostic.
+    pub fn minimum(&self) -> Option<&(InferenceGeometry, WorkspaceQuoteComponents)> {
+        self.minimum.as_ref()
+    }
 }
 impl fmt::Display for WorkspaceCandidateRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}; candidate chunk={}, input={}, output={}: {:?}", self.cause,
-            self.geometry.prefill_chunk_positions, self.geometry.input_positions,
-            self.geometry.max_output_tokens, self.components)?;
+        write!(
+            f,
+            "{}; candidate chunk={}, input={}, output={}: {:?}",
+            self.cause,
+            self.geometry.prefill_chunk_positions,
+            self.geometry.input_positions,
+            self.geometry.max_output_tokens,
+            self.components
+        )?;
         if let Some((geometry, components)) = &self.initial {
             if *geometry != self.geometry {
-                write!(f, "; initial chunk={}: {:?}", geometry.prefill_chunk_positions, components)?;
+                write!(
+                    f,
+                    "; initial chunk={}: {:?}",
+                    geometry.prefill_chunk_positions, components
+                )?;
             }
         }
         if let Some((geometry, components)) = &self.minimum {
-            if *geometry != self.geometry && self.initial.as_ref().is_none_or(|(initial, _)| initial != geometry) {
-                write!(f, "; minimum chunk={}: {:?}", geometry.prefill_chunk_positions, components)?;
+            if *geometry != self.geometry
+                && self
+                    .initial
+                    .as_ref()
+                    .is_none_or(|(initial, _)| initial != geometry)
+            {
+                write!(
+                    f,
+                    "; minimum chunk={}: {:?}",
+                    geometry.prefill_chunk_positions, components
+                )?;
             }
         }
         Ok(())
     }
 }
 impl std::error::Error for WorkspaceCandidateRefusal {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.cause) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }

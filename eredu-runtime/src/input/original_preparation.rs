@@ -14,7 +14,8 @@ pub struct OriginalModelInput<P> {
 /// Keep this owner through prompt handoff, failure, and the consuming session.
 #[derive(Debug, Clone)]
 pub struct OriginalModelInputCustody {
-    pub(super) chat: Option<eredu_core::SharedStorageOwner<super::chat_binding::PreparedChatInputBinding>>,
+    pub(super) chat:
+        Option<eredu_core::SharedStorageOwner<super::chat_binding::PreparedChatInputBinding>>,
     funding: HostMetadataFunding,
 }
 impl<P> OriginalModelInput<P> {
@@ -97,12 +98,12 @@ pub trait OriginalModelInputBackend: TextGenerationBackend {
         None
     }
     /// The native implementation uses the loaded execution's retained semantic
-    /// source and exact input allocator. Caller policy supplies one total ceiling.
+    /// source and exact input allocator. Caller policy supplies domain limits.
     /// No ordinary source may be promoted; default invokes no constructor.
     fn prepare_original_model_input(
         _runtime: &ModelRuntime<Self>,
         _plan: PreparedHostInputPlan<'_>,
-        _capacity: u64,
+        _limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<OriginalModelInput<Self::Prompt>, BackendFailure> {
         Err(TokenInputRejection::Unsupported.into_backend_failure())
     }

@@ -4,11 +4,11 @@ mod invocation;
 mod session;
 use super::{LoadedModel, ManagedPlainTextSource};
 use eredu_core::{
-    GenerationCancellationToken, HostPreparationAuthority, SemanticStateOwner, SpeculativeBuffer,
-    SpeculativeBufferAllocationError, SpeculativeConfiguration,
-    SpeculativeEventCallback, SpeculativeGenerationLane,
+    generation::SemanticEvent, GenerationCancellationToken, HostPreparationAuthority,
+    SemanticStateOwner, SpeculativeBuffer, SpeculativeBufferAllocationError,
+    SpeculativeConfiguration, SpeculativeEventCallback, SpeculativeGenerationLane,
     SpeculativeOutputError, SpeculativeTokenFilterController, TextGenerationBackend,
-    TextGenerationConfig, generation::SemanticEvent,
+    TextGenerationConfig,
 };
 use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{
@@ -16,8 +16,11 @@ use eredu_runtime::working_memory::{
     PreparedSemanticSource,
 };
 use eredu_text::stop_storage::StopCompilePlan;
-pub use session::{PreparedChatOutputMode, PreparedChatPrompt, PreparedChatRequest, PreparedChatSession, PreparedChatResumeSettings, PreparedChatSnapshot, PreparedChatBranch};
 pub(crate) use session::PreparedSemanticInput;
+pub use session::{
+    PreparedChatBranch, PreparedChatOutputMode, PreparedChatPrompt, PreparedChatRequest,
+    PreparedChatResumeSettings, PreparedChatSession, PreparedChatSnapshot,
+};
 use std::mem::size_of;
 
 /// Borrowed stop declarations use the same source compiler without collecting
@@ -38,12 +41,16 @@ impl<'a> PreparedStops<'a> {
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
+    #[error("{0}")]
+    MemoryDomain(#[from] eredu_core::MemoryDomainError),
     #[error(transparent)]
     CaptureSource(#[from] eredu_runtime::working_memory::OriginalCaptureSourceError),
     #[error(transparent)]
     Record(#[from] crate::api::control::RecordConstructionError),
     #[error(transparent)]
-    Sampling(#[from] eredu_core::execution_control::SamplingOverrideError<eredu_core::BackendFailure>),
+    Sampling(
+        #[from] eredu_core::execution_control::SamplingOverrideError<eredu_core::BackendFailure>,
+    ),
     #[error("generation advancement produced neither a committed token nor termination")]
     MissingProgress,
     #[error(transparent)]
@@ -51,9 +58,16 @@ enum Cause {
     #[error(transparent)]
     Choice(#[from] eredu_runtime::execution_control::TokenChoiceError<crate::api::ConstraintError>),
     #[error(transparent)]
-    PreparedChoice(#[from] eredu_runtime::execution_control::PreparedTokenChoiceError<crate::runtime::chat::constraints::OriginalPreparedGrammarController>),
+    PreparedChoice(
+        #[from]
+        eredu_runtime::execution_control::PreparedTokenChoiceError<
+            crate::runtime::chat::constraints::OriginalPreparedGrammarController,
+        >,
+    ),
     #[error(transparent)]
-    Boundary(eredu_core::TextContinuationError<eredu_core::BackendFailure, session::ChatControllerError>),
+    Boundary(
+        eredu_core::TextContinuationError<eredu_core::BackendFailure, session::ChatControllerError>,
+    ),
     #[error("{0}")]
     Generation(#[from] eredu_core::GenerationError),
     #[error("{0}")]
@@ -67,7 +81,9 @@ enum Cause {
     #[error(transparent)]
     ChatInput(#[from] eredu_runtime::input::PreparedChatInputError),
     #[error(transparent)]
-    Snapshot(#[from] eredu_runtime::execution_control::TextSnapshotError<eredu_core::BackendFailure>),
+    Snapshot(
+        #[from] eredu_runtime::execution_control::TextSnapshotError<eredu_core::BackendFailure>,
+    ),
     #[error(transparent)]
     Output(#[from] SpeculativeOutputError),
     #[error(transparent)]
@@ -91,30 +107,50 @@ impl PreparedChatSessionError {
     /// constructed. Borrowing it preserves the error's original storage custody.
     pub fn committed_token_ids(&self) -> Option<&[u32]> {
         use std::error::Error;
-        self.backend_failure()?.source()?.downcast_ref::<session::CursorFailure>()
+        self.backend_failure()?
+            .source()?
+            .downcast_ref::<session::CursorFailure>()
             .map(session::CursorFailure::committed_token_ids)
     }
     /// Original attribution or record allocation refusal, with its retained payer.
     pub fn record_construction_failure(&self) -> Option<&crate::api::RecordConstructionError> {
-        match &self.cause { Cause::Record(error) => Some(error), _ => None }
+        match &self.cause {
+            Cause::Record(error) => Some(error),
+            _ => None,
+        }
     }
     /// Original snapshot or branch rejection, retaining its typed cause.
-    pub fn snapshot_failure(&self) -> Option<&eredu_runtime::execution_control::TextSnapshotError<eredu_core::BackendFailure>> {
-        match &self.cause { Cause::Snapshot(error) => Some(error), _ => None }
+    pub fn snapshot_failure(
+        &self,
+    ) -> Option<&eredu_runtime::execution_control::TextSnapshotError<eredu_core::BackendFailure>>
+    {
+        match &self.cause {
+            Cause::Snapshot(error) => Some(error),
+            _ => None,
+        }
     }
     /// Invalid prospective sampler policy, rejected without advancing state.
     pub fn sampling_rejection(&self) -> Option<&'static str> {
         match self.cause {
-            Cause::Sampling(eredu_core::execution_control::SamplingOverrideError::Invalid(reason)) => Some(reason),
+            Cause::Sampling(eredu_core::execution_control::SamplingOverrideError::Invalid(
+                reason,
+            )) => Some(reason),
             _ => None,
         }
     }
     /// Invalid lifecycle transition at a completed generation boundary.
-    pub fn control_rejection(&self) -> Option<&eredu_core::execution_control::ExecutionControlError> {
-        match &self.cause { Cause::Control(error) => Some(error), _ => None }
+    pub fn control_rejection(
+        &self,
+    ) -> Option<&eredu_core::execution_control::ExecutionControlError> {
+        match &self.cause {
+            Cause::Control(error) => Some(error),
+            _ => None,
+        }
     }
     /// Fixed prospective-choice refusal, preserving any nested source custody.
-    pub fn token_choice_rejection(&self) -> Option<eredu_runtime::execution_control::TokenChoiceError<std::convert::Infallible>> {
+    pub fn token_choice_rejection(
+        &self,
+    ) -> Option<eredu_runtime::execution_control::TokenChoiceError<std::convert::Infallible>> {
         match &self.cause {
             Cause::PreparedChoice(error) => error.rejection(),
             Cause::Choice(error) => error.rejection(),
@@ -141,18 +177,35 @@ impl PreparedChatSessionError {
     }
     /// Neutral backend failure with the provider's exact kind, operation and
     /// original source. Its retained cursor and funding retire with this error.
-    pub fn backend_failure(&self)->Option<&eredu_core::BackendFailure> {
+    pub fn backend_failure(&self) -> Option<&eredu_core::BackendFailure> {
         match &self.cause {
             Cause::Backend(error)
-            | Cause::Sampling(eredu_core::execution_control::SamplingOverrideError::Backend(error))
+            | Cause::Sampling(eredu_core::execution_control::SamplingOverrideError::Backend(
+                error,
+            ))
             | Cause::Boundary(eredu_core::TextContinuationError::Generation(
-                eredu_core::ControlledTextGenerationError::Backend(error)))
-            | Cause::Snapshot(eredu_runtime::execution_control::TextSnapshotError::Backend(error))
-            | Cause::Snapshot(eredu_runtime::execution_control::TextSnapshotError::HostPreparation(error)) => Some(error),
-            Cause::Snapshot(error @ eredu_runtime::execution_control::TextSnapshotError::Resume(_)) => error.resume_backend_failure(),
-            Cause::Snapshot(eredu_runtime::execution_control::TextSnapshotError::RetainedBackend(error)) => {
-                std::error::Error::source(error)?.downcast_ref()
-            }
+                eredu_core::ControlledTextGenerationError::Backend(error),
+            ))
+            | Cause::Snapshot(eredu_runtime::execution_control::TextSnapshotError::Backend(
+                error,
+            ))
+            | Cause::Snapshot(
+                eredu_runtime::execution_control::TextSnapshotError::HostPreparation(error),
+            ) => Some(error),
+            Cause::Snapshot(
+                error @ eredu_runtime::execution_control::TextSnapshotError::Resume(_),
+            ) => error.resume_backend_failure(),
+            Cause::Snapshot(
+                eredu_runtime::execution_control::TextSnapshotError::RetainedBackend(error),
+            ) => std::error::Error::source(error)?.downcast_ref(),
+            _ => None,
+        }
+    }
+
+    /// Exact rendered-token or media-coordinate association refusal.
+    pub fn chat_input_rejection(&self) -> Option<eredu_runtime::input::PreparedChatInputRejection> {
+        match &self.cause {
+            Cause::ChatInput(error) => error.association_rejection(),
             _ => None,
         }
     }
@@ -181,14 +234,14 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
     pub(crate) fn prepare_semantic_source(
         &self,
         source: &eredu_runtime::working_memory::OriginalTokenizer,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<PreparedSemanticSource, PreparedChatSessionError> {
         if !source.matches_configuration(&self.tokenizer) {
             return Err(PreparedChatSessionError::before(
                 eredu_core::TokenInputRejection::IdentityMismatch,
             ));
         }
-        let prepared = B::prepare_semantic_source(&self.runtime, source, capacity)
+        let prepared = B::prepare_semantic_source(&self.runtime, source, limits)
             .map_err(PreparedChatSessionError::before)?;
         let funding = prepared.metadata_funding().clone();
         let result = (|| -> Result<_, Cause> {
@@ -221,13 +274,13 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
     fn prepare_original_speculative_plain_semantic(
         &self,
         source: &ManagedPlainTextSource,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
         maximum: usize,
         maximum_draft: usize,
         stops: PreparedStops<'_>,
         skip_special: bool,
     ) -> Result<(SemanticStateOwner, PreparedSemanticSource), PreparedChatSessionError> {
-        let prepared = self.prepare_semantic_source(source.original(), capacity)?;
+        let prepared = self.prepare_semantic_source(source.original(), limits)?;
         let funding = prepared.metadata_funding().clone();
         let result = (|| {
             let parts = [
@@ -325,7 +378,6 @@ impl<'a> PreparedOriginalSpeculativeHost<'a> {
             input_funding: None,
         })
     }
-
 }
 fn sum(parts: &[usize]) -> Option<usize> {
     parts
@@ -363,7 +415,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
     pub(super) fn prepare_original_speculative_plain_host<'a, F: FnMut(SemanticEvent) + 'a>(
         &self,
         source: &ManagedPlainTextSource,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
         maximum: usize,
         maximum_draft: usize,
         temperature: f32,
@@ -374,7 +426,7 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
     ) -> Result<PreparedOriginalSpeculativeHost<'a>, PreparedChatSessionError> {
         let (semantic, preparation) = self.prepare_original_speculative_plain_semantic(
             source,
-            capacity,
+            limits,
             maximum,
             maximum_draft,
             stops,

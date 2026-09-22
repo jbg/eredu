@@ -1,18 +1,18 @@
 //! Original source contracts shared by the neutral public conformance backends.
 //! These fixtures use the runtime's actual account and source constructors.
 use eredu_core::{ModelRuntime, TextGenerationBackend};
-use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 
 pub(super) struct Environment {
-    pub pool: WorkingMemoryPool,
+    pub pool: MemoryLedger,
     pub execution: InferenceExecutionIdentity,
     pub output_width: std::cell::Cell<usize>,
 }
 impl Environment {
-    pub fn new(pool: Option<WorkingMemoryPool>) -> Self {
+    pub fn new(pool: Option<MemoryLedger>) -> Self {
         Self {
             pool: pool
-                .unwrap_or_else(|| WorkingMemoryPool::new(32 * 1024 * 1024 * 1024, 0).unwrap()),
+                .unwrap_or_else(|| crate::memory::host_ledger(32 * 1024 * 1024 * 1024, 0).unwrap()),
             execution: InferenceExecutionIdentity::default(),
             output_width: std::cell::Cell::new(0),
         }
@@ -20,8 +20,19 @@ impl Environment {
 }
 pub(super) trait SourceBackend: TextGenerationBackend {
     fn source_environment(runtime: &ModelRuntime<Self>) -> &Environment;
-    fn capture_facts(_: &ModelRuntime<Self>) -> Option<(&eredu_core::ObservationCatalog, &eredu_core::ObservationSupportReport)> { None }
-    fn intervention_facts(_: &ModelRuntime<Self>) -> Option<&eredu_core::intervention::InterventionDiscovery> { None }
+    fn capture_facts(
+        _: &ModelRuntime<Self>,
+    ) -> Option<(
+        &eredu_core::ObservationCatalog,
+        &eredu_core::ObservationSupportReport,
+    )> {
+        None
+    }
+    fn intervention_facts(
+        _: &ModelRuntime<Self>,
+    ) -> Option<&eredu_core::intervention::InterventionDiscovery> {
+        None
+    }
     fn before_semantic_prompt(_: &ModelRuntime<Self>) -> Result<(), eredu_core::BackendFailure> {
         Ok(())
     }
@@ -34,33 +45,65 @@ struct SourceFailure<E: std::error::Error + Send + Sync + 'static> {
     cause: E,
     _funding: eredu_core::HostMetadataFunding,
 }
-fn retained_error<E: std::error::Error + Send + Sync + 'static>(cause: E, funding: &eredu_core::HostMetadataFunding) -> eredu_core::BackendFailure {
+fn retained_error<E: std::error::Error + Send + Sync + 'static>(
+    cause: E,
+    funding: &eredu_core::HostMetadataFunding,
+) -> eredu_core::BackendFailure {
     use eredu_core::{BackendFailure, HostMetadataFundingError};
-    let Some(bytes) = BackendFailure::source_retention_peak_bytes::<SourceFailure<E>>() else { return HostMetadataFundingError::Overflow.into(); };
-    if let Err(cause) = funding.reserve_metadata(bytes) { return cause.into(); }
-    BackendFailure::from_error(SourceFailure { cause, _funding: funding.clone() })
+    let Some(bytes) = BackendFailure::source_retention_peak_bytes::<SourceFailure<E>>() else {
+        return HostMetadataFundingError::Overflow.into();
+    };
+    if let Err(cause) = funding.reserve_metadata(bytes) {
+        return cause.into();
+    }
+    BackendFailure::from_error(SourceFailure {
+        cause,
+        _funding: funding.clone(),
+    })
 }
 pub(super) fn compile_intervention<B: SourceBackend>(
-    runtime: &ModelRuntime<B>, raw: &eredu_core::intervention::InterventionPlan,
-    capture: &eredu_core::capture::SharedCapturePlan, session: &str,
+    runtime: &ModelRuntime<B>,
+    raw: &eredu_core::intervention::InterventionPlan,
+    capture: &eredu_core::capture::SharedCapturePlan,
+    session: &str,
     funding: &eredu_core::HostMetadataFunding,
 ) -> Result<eredu_runtime::working_memory::OriginalInterventionSource, eredu_core::BackendFailure> {
-    use eredu_core::{HostPreparationAuthority, HostMetadataFunding, HostMetadataFundingError,
-        intervention::{PreparedInterventionAdmission, PreparedInterventionPlanCopy}};
-    let facts = B::intervention_facts(runtime).ok_or_else(|| eredu_core::TokenInputRejection::Unsupported.into_backend_failure())?;
+    use eredu_core::{
+        intervention::{PreparedInterventionAdmission, PreparedInterventionPlanCopy},
+        HostMetadataFunding, HostMetadataFundingError, HostPreparationAuthority,
+    };
+    let facts = B::intervention_facts(runtime)
+        .ok_or_else(|| eredu_core::TokenInputRejection::Unsupported.into_backend_failure())?;
     let capture = capture.admission();
     let bytes = PreparedInterventionAdmission::inspection_control_bytes()
         .and_then(|n| n.checked_add(PreparedInterventionPlanCopy::inspection_control_bytes()?))
-        .and_then(|n| n.checked_add(HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()?))
+        .and_then(|n| {
+            n.checked_add(HostPreparationAuthority::retention_bytes::<
+                HostMetadataFunding,
+            >()?)
+        })
         .ok_or(HostMetadataFundingError::Overflow)?;
     funding.reserve_metadata(bytes)?;
-    let plan = PreparedInterventionAdmission::inspect(raw, facts, capture.request(), capture.invocation_bounds(),
-        capture.text_origin().unwrap_or_default(), session).map_err(|e| retained_error(e, funding))?;
+    let plan = PreparedInterventionAdmission::inspect(
+        raw,
+        facts,
+        capture.request(),
+        capture.invocation_bounds(),
+        capture.text_origin().unwrap_or_default(),
+        session,
+    )
+    .map_err(|e| retained_error(e, funding))?;
     funding.reserve_metadata(plan.required_bytes())?;
     let host = HostPreparationAuthority::retain(funding.clone());
-    let admission = plan.construct(&host).map_err(|e| retained_error(e, funding))?;
-    let copy = PreparedInterventionPlanCopy::inspect(&admission).map_err(|e| retained_error(e, funding))?;
-    B::source_environment(runtime).pool.compile_intervention_source(copy).map_err(|e| retained_error(e, funding))
+    let admission = plan
+        .construct(&host)
+        .map_err(|e| retained_error(e, funding))?;
+    let copy = PreparedInterventionPlanCopy::inspect(&admission)
+        .map_err(|e| retained_error(e, funding))?;
+    B::source_environment(runtime)
+        .pool
+        .compile_intervention_source(copy)
+        .map_err(|e| retained_error(e, funding))
 }
 
 macro_rules! implement {
@@ -84,13 +127,17 @@ macro_rules! implement {
                 fn prepare_semantic_source(
                     runtime: &ModelRuntime<Self>,
                     source: &OriginalTokenizer,
-                    capacity: u64,
+                    limits: &MemoryLimitDeclarations,
                 ) -> Result<PreparedSemanticSource, SpeculativeOutputError> {
                     let env = Self::source_environment(runtime);
                     source
                         .validate_pool(&env.pool)
                         .map_err(|_| SpeculativeOutputError::Storage("foreign source"))?;
-                    PreparedSemanticSource::new(source, &env.execution, capacity)
+                    PreparedSemanticSource::new(
+                        source,
+                        &env.execution,
+                        limits.resolve(env.pool.topology())?,
+                    )
                 }
                 fn prepare_semantic_prompt(
                     runtime: &ModelRuntime<Self>,
@@ -102,8 +149,9 @@ macro_rules! implement {
                     source
                         .validate(&env.pool, &env.execution)
                         .map_err(BackendFailure::from_error)?;
-                    let domain = source.tokenizer().generation_domain()
-                        .ok_or_else(|| TokenInputRejection::IdentityMismatch.into_backend_failure())?;
+                    let domain = source.tokenizer().generation_domain().ok_or_else(|| {
+                        TokenInputRejection::IdentityMismatch.into_backend_failure()
+                    })?;
                     if input.tokens().iter().any(|&id| !domain.allows(id)) {
                         return Err(TokenInputRejection::InvalidToken.into_backend_failure());
                     }
@@ -113,14 +161,17 @@ macro_rules! implement {
                 fn prepare_original_text_source_budget(
                     runtime: &ModelRuntime<Self>,
                     source: &OriginalTokenizer,
-                    capacity: u64,
+                    limits: &MemoryLimitDeclarations,
                 ) -> Result<OriginalTextSourceBudget, OriginalTextSourceError> {
                     let env = Self::source_environment(runtime);
                     source
                         .validate_pool(&env.pool)
                         .map_err(|_| TokenInputRejection::IdentityMismatch)?;
                     source
-                        .prepare_text_source_budget(&env.execution, capacity)
+                        .prepare_text_source_budget(
+                            &env.execution,
+                            limits.resolve(env.pool.topology())?,
+                        )
                         .map_err(Into::into)
                 }
                 fn validate_original_tokenizer_source(
@@ -191,20 +242,35 @@ macro_rules! implement {
             }
             impl OriginalChatBackend for $backend {
                 fn compile_original_capture_declaration(
-                    runtime: &ModelRuntime<Self>, plan: &eredu_core::capture::CapturePlan,
-                    request: eredu_core::capture::CaptureRequestShape, funding: &HostMetadataFunding,
+                    runtime: &ModelRuntime<Self>,
+                    plan: &eredu_core::capture::CapturePlan,
+                    request: eredu_core::capture::CaptureRequestShape,
+                    funding: &HostMetadataFunding,
                 ) -> Result<OriginalCaptureSource, OriginalCaptureSourceError> {
-                    let (catalog, support) = Self::capture_facts(runtime)
-                        .ok_or_else(|| OriginalCaptureSourceError::rejected(WorkingMemoryError::UnknownBound))?;
-                    Self::source_environment(runtime).pool.compile_capture_declaration(
-                        plan, catalog, support, request, Default::default(), funding)
+                    let (catalog, support) = Self::capture_facts(runtime).ok_or_else(|| {
+                        OriginalCaptureSourceError::rejected(WorkingMemoryError::UnknownBound)
+                    })?;
+                    Self::source_environment(runtime)
+                        .pool
+                        .compile_capture_declaration(
+                            plan,
+                            catalog,
+                            support,
+                            request,
+                            Default::default(),
+                            funding,
+                        )
                 }
                 fn compile_original_intervention_declaration(
-                    runtime: &ModelRuntime<Self>, raw: &eredu_core::intervention::InterventionPlan,
-                    capture: &eredu_core::capture::SharedCapturePlan, session_id: &str,
+                    runtime: &ModelRuntime<Self>,
+                    raw: &eredu_core::intervention::InterventionPlan,
+                    capture: &eredu_core::capture::SharedCapturePlan,
+                    session_id: &str,
                     funding: &HostMetadataFunding,
                 ) -> Result<OriginalInterventionSource, BackendFailure> {
-                    super::original_sources::compile_intervention::<Self>(runtime, raw, capture, session_id, funding)
+                    super::original_sources::compile_intervention::<Self>(
+                        runtime, raw, capture, session_id, funding,
+                    )
                 }
                 fn compile_original_forbidden_source(
                     runtime: &ModelRuntime<Self>,
@@ -227,13 +293,13 @@ macro_rules! implement {
                     runtime: &ModelRuntime<Self>,
                     template: &OriginalChatTemplate,
                     tokenizer: &OriginalTokenizer,
-                    capacity: u64,
+                    limits: &MemoryLimitDeclarations,
                 ) -> Result<OriginalChatProfilePreparation, OriginalChatProfileError> {
                     OriginalChatProfilePreparation::new(
                         template,
                         tokenizer,
                         &Self::source_environment(runtime).execution,
-                        capacity,
+                        limits.resolve(Self::source_environment(runtime).pool.topology())?,
                     )
                 }
                 fn validate_original_chat_sources(
@@ -296,7 +362,7 @@ use eredu_core::{BackendFailure, HostMetadataFunding};
 use eredu_runtime::working_memory::{OriginalTextMetadataCustody, OwnedPromptTokenIds};
 use std::{
     alloc::Layout,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 #[derive(Debug)]
@@ -372,7 +438,9 @@ impl Prompt {
         self.resume_token = Some(token);
         self
     }
-    pub fn resume_token(&self) -> Option<u32> { self.resume_token }
+    pub fn resume_token(&self) -> Option<u32> {
+        self.resume_token
+    }
     /// Called only after the fixture's text-control quote admits this exact shell.
     pub fn original(input: OwnedPromptTokenIds, custody: OriginalTextMetadataCustody) -> Self {
         Self::publish(Tokens::Original(input), Custody::Text(custody))
@@ -422,7 +490,9 @@ impl PartialEq for Prompt {
 }
 impl Eq for Prompt {}
 impl PartialEq<Vec<u32>> for Prompt {
-    fn eq(&self, other: &Vec<u32>) -> bool { self.as_ref() == other.as_slice() }
+    fn eq(&self, other: &Vec<u32>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
 }
 impl AsRef<[u32]> for Prompt {
     fn as_ref(&self) -> &[u32] {
@@ -459,7 +529,7 @@ pub(super) struct Fixture<B: TextGenerationBackend> {
     template_kwargs: serde_json::Map<String, serde_json::Value>,
     template: Option<eredu_text::tokenizer::ModelChatTemplate>,
     tokenizer_source: Option<eredu::api::ManagedPlainTextSource>,
-    original_pool: Option<eredu_runtime::working_memory::WorkingMemoryPool>,
+    original_pool: Option<eredu_runtime::working_memory::MemoryLedger>,
 }
 impl<B: SourceBackend> Fixture<B> {
     /// Retains caller fixture artifacts alongside an independently loaded model.
@@ -469,7 +539,14 @@ impl<B: SourceBackend> Fixture<B> {
         template: Option<eredu_text::tokenizer::ModelChatTemplate>,
         template_kwargs: serde_json::Map<String, serde_json::Value>,
     ) -> Self {
-        Self { model, tokenizer_json, template, template_kwargs, tokenizer_source: None, original_pool: None }
+        Self {
+            model,
+            tokenizer_json,
+            template,
+            template_kwargs,
+            tokenizer_source: None,
+            original_pool: None,
+        }
     }
     pub fn from_runtime(
         runtime: ModelRuntime<B>,
@@ -496,8 +573,10 @@ impl<B: SourceBackend> Fixture<B> {
             original_pool: Some(original_pool),
         })
     }
-    pub fn original_pool(&self) -> &eredu_runtime::working_memory::WorkingMemoryPool {
-        self.original_pool.as_ref().expect("fixture original runtime pool")
+    pub fn original_pool(&self) -> &eredu_runtime::working_memory::MemoryLedger {
+        self.original_pool
+            .as_ref()
+            .expect("fixture original runtime pool")
     }
     pub fn tokenizer_source(&self) -> &eredu::api::ManagedPlainTextSource {
         self.tokenizer_source
@@ -532,11 +611,11 @@ impl<B: eredu_runtime::working_memory::OriginalChatBackend> Fixture<B> {
             Some(eredu_text::tokenizer::ModelChatTemplate::Single(s)) => {
                 serde_json::Value::String(s.clone())
             }
-            Some(eredu_text::tokenizer::ModelChatTemplate::Named(map)) => {
-                serde_json::Value::Array(map.iter().map(|(name, template)| {
-                    serde_json::json!({"name": name, "template": template})
-                }).collect())
-            }
+            Some(eredu_text::tokenizer::ModelChatTemplate::Named(map)) => serde_json::Value::Array(
+                map.iter()
+                    .map(|(name, template)| serde_json::json!({"name": name, "template": template}))
+                    .collect(),
+            ),
         };
         let mut config = self.template_kwargs.clone();
         config.insert("chat_template".into(), template);
@@ -582,6 +661,8 @@ pub(super) const CAPACITY: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) fn settings(
     mut settings: eredu::api::PreparedChatGenerationSettings,
 ) -> eredu::api::PreparedChatGenerationSettings {
-    settings.inference.managed_memory_capacity_bytes.get_or_insert(CAPACITY);
+    if settings.inference.memory_limits == Default::default() {
+        settings.inference.memory_limits = crate::memory::limits(CAPACITY);
+    }
     settings
 }

@@ -60,17 +60,17 @@ fn terminal_text_uses_same_r_payload_and_stop_byte_conservation_on_all_core_rout
             let text_address = text.as_str().as_ptr();
             let extra = text.clone();
             drop((runtime, input, source, stops));
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             assert_eq!(text.as_str(), visible);
             let mut iterator = tokens.into_iter();
             assert_eq!(iterator.next(), Some(2));
             drop(text);
             assert_eq!(extra.as_str().as_ptr(), text_address);
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(extra);
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(iterator);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -90,16 +90,18 @@ fn terminal_target_reserve_is_real_partial_failure_and_repeated_prepare_cannot_r
     let input = AggregateGenerationDecoderInput::new_plain_text(&source, &stops, 5, true).unwrap();
     let sequence = extract_decoder(&mut runtime, 1, 5, &input, &terminal(), None).unwrap();
     let failed = sequence.prepare_storage().unwrap_err();
-    assert!(failed
-        .cause()
-        .source()
-        .unwrap()
-        .is::<std::collections::TryReserveError>());
+    assert!(
+        failed
+            .cause()
+            .source()
+            .unwrap()
+            .is::<std::collections::TryReserveError>()
+    );
     // Injection reaches the terminal Vec's actual reserve after token slots,
     // decoder buffers and stop destination have all returned successful prepare.
     let (_, held) = retire_request(&state);
     drop((runtime, input, source, stops));
-    assert_eq!(pool.used_bytes().unwrap(), cold + held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
     let failed = failed.into_sequence().prepare_storage().unwrap_err();
     assert!(
         !failed
@@ -109,9 +111,9 @@ fn terminal_target_reserve_is_real_partial_failure_and_repeated_prepare_cannot_r
             .is::<std::collections::TryReserveError>(),
         "core terminal-attempt rejection, no second allocator call"
     );
-    assert_eq!(pool.used_bytes().unwrap(), cold + held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
     drop(failed);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn terminal_empty_cancel_retains_zero_text_without_preparation_and_plain_mode_cannot_upgrade() {
@@ -135,7 +137,7 @@ fn terminal_empty_cancel_retains_zero_text_without_preparation_and_plain_mode_ca
         let (_, held) = retire_request(&state);
         let ids = sequence.into_token_ids();
         drop((runtime, input, source, stops));
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         assert_eq!(ids.terminal_text().is_some(), terminal_mode);
         if terminal_mode {
             let output = GenerationPlainTextOutput::from_retained(
@@ -150,7 +152,7 @@ fn terminal_empty_cancel_retains_zero_text_without_preparation_and_plain_mode_ca
         } else {
             drop(ids);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -209,8 +211,8 @@ fn utf8_pending_flush_and_mismatch_exceed_one_call_capacity_but_fit_selected_ter
         let ids = sequence.into_token_ids();
         assert_eq!(ids.terminal_text().unwrap().as_str(), expected);
         drop((runtime, input, stops, source));
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         drop(ids);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

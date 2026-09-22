@@ -1,8 +1,8 @@
 use super::*;
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };

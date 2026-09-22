@@ -4,13 +4,30 @@ use eredu_core::{
     InferenceGeometry, InputModalities, InputTokenCount, LayerSchedule, ModelCapabilities,
     Observed, OutputDemand, StateMemoryLayout,
 };
-use eredu_nn::{workspace::*, Error, Tensor};
+use eredu_nn::{Error, Tensor, workspace::*};
 
 #[derive(Debug)]
 struct Facts {
     host: Option<u64>,
 }
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     fn operation_bound(
         &self,
         op: &WorkspaceOperation,
@@ -50,9 +67,8 @@ fn request(geometry: InferenceGeometry) -> AdmissionRequest {
         input: InputTokenCount::text(geometry.input_positions),
         max_output_tokens: geometry.max_output_tokens,
         batch_size: geometry.batch_size,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
     }
 }
 fn capabilities() -> ModelCapabilities {
@@ -91,15 +107,25 @@ fn quote(
         1,
         EstimationCompleteness::Complete,
     )?;
-    let state = eredu_core::estimate_runtime_state(
+    let mut state = eredu_core::estimate_runtime_state(
         &layout,
         request(geometry).input,
         geometry.max_output_tokens,
         1,
         std::num::NonZeroU8::new(4).unwrap(),
     )?;
+    let empty = || eredu_core::DomainMemoryRequirements::zero(context.memory_topology().unwrap());
+    state.physical_domains = Some(eredu_core::DomainRuntimeStateEstimate {
+        geometry,
+        decoder_state: empty(),
+        media_embeddings: empty(),
+        media_workspace: empty(),
+    });
     let zero = || {
-        WorkspaceBound::bounded(0,"test execution has no state or untraced preparation, sampling, materialization or retained resources")
+        WorkspaceBound::bounded(
+            0,
+            "test execution has no state or untraced preparation, sampling, materialization or retained resources",
+        )
     };
     with_equation_workspace(
         state,
@@ -111,18 +137,29 @@ fn quote(
             state_update: zero(),
             materialization: zero(),
             retained: zero(),
+            physical_domains: Some(eredu_core::DomainExecutionWorkspaceEstimate {
+                geometry,
+                activations: empty(),
+                attention: empty(),
+                vocabulary: empty(),
+                state_update: empty(),
+                materialization: empty(),
+                retained: empty(),
+            }),
         },
         &report,
     )
 }
 #[test]
-fn missing_host_facts_reject_strict_or_budgeted_admission_despite_known_tensor_peak() {
+fn missing_host_facts_reject_finite_and_unlimited_admission_despite_known_tensor_peak() {
     let geometry = geometry();
-    for (strict, budget) in [(true, None), (false, Some(u64::MAX))] {
+    for budget in [None, Some(u64::MAX)] {
         let mut request = request(geometry);
-        request.require_complete_estimate = strict;
-        request.application_memory_budget_bytes = budget;
-        request.safety_reserve_bytes = 1_000_000;
+        request.memory_limits = budget
+            .map(crate::working_memory::memory_fixture::host_limits)
+            .unwrap_or_default();
+        request.additional_headroom =
+            eredu_core::MemoryHeadroomDeclarations::new([("host".into(), 1_000_000)]);
         let state = quote(geometry, None).unwrap();
         assert_eq!(
             state.completeness,
@@ -135,7 +172,7 @@ fn missing_host_facts_reject_strict_or_budgeted_admission_despite_known_tensor_p
         };
         assert!(reason.contains("managed-host operation indices: [0]"));
         assert!(matches!(
-            eredu_core::apply_admission_policy(&capabilities(), request, state, None).unwrap(),
+            eredu_core::apply_admission_policy(&capabilities(), request, state).unwrap(),
             AdmissionResult::Rejected(eredu_core::AdmissionRejection::EstimationUnsupported { .. })
         ));
     }
@@ -143,7 +180,7 @@ fn missing_host_facts_reject_strict_or_budgeted_admission_despite_known_tensor_p
 #[test]
 fn unknown_host_workspace_cannot_reserve_capacity_or_be_fixed_by_smaller_chunks() {
     let geometry = geometry();
-    let pool = crate::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let mut attempts = vec![];
     let result = crate::working_memory::plan_prefill(
         &crate::working_memory::InferenceExecutionIdentity::default(),
@@ -163,7 +200,7 @@ fn unknown_host_workspace_cannot_reserve_capacity_or_be_fixed_by_smaller_chunks(
         ))
     ));
     assert_eq!(attempts, [2, 1]);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn complete_host_and_tensor_bounds_share_one_enforced_capacity_and_choose_a_smaller_chunk() {
@@ -177,7 +214,25 @@ fn complete_host_and_tensor_bounds_share_one_enforced_capacity_and_choose_a_smal
             .unwrap(),
         Some(42)
     ); // 24 tensor + 7 tensor scratch + 11 host
-    let pool = crate::working_memory::WorkingMemoryPool::new(72, 0).unwrap();
+    let probe = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let quote_bytes = |g| {
+        let AdmissionResult::Admitted(mut admission) = eredu_core::apply_admission_policy(
+            &capabilities(),
+            request(g),
+            quote(g, Some(11)).unwrap(),
+        )
+        .unwrap() else {
+            panic!("complete attribution")
+        };
+        crate::working_memory::memory_fixture::reservation_bytes(&probe, &admission)
+    };
+    let first_bytes = quote_bytes(geometry);
+    let second_bytes = quote_bytes(InferenceGeometry {
+        prefill_chunk_positions: 1,
+        ..geometry
+    });
+    let pool =
+        crate::working_memory::memory_fixture::host_ledger(first_bytes + second_bytes, 0).unwrap();
     let identity = crate::working_memory::InferenceExecutionIdentity::default();
     let (first, reservation) = crate::working_memory::plan_prefill(
         &identity,
@@ -188,8 +243,15 @@ fn complete_host_and_tensor_bounds_share_one_enforced_capacity_and_choose_a_smal
         |g| quote(g, Some(11)),
     )
     .unwrap();
-    assert_eq!(first.incremental_required_bytes, 42);
-    assert_eq!(reservation.bytes(), 42);
+    assert_eq!(first.incremental_required_bytes, Some(42));
+    assert_eq!(
+        reservation
+            .requirements()
+            .get(crate::working_memory::memory_fixture::host_topology_ref().host_domain())
+            .ok()
+            .and_then(|charge| charge.total().ok()),
+        Some(first_bytes)
+    );
     let (second, second_reservation) = crate::working_memory::plan_prefill(
         &identity,
         &pool,
@@ -208,38 +270,50 @@ fn complete_host_and_tensor_bounds_share_one_enforced_capacity_and_choose_a_smal
             .prefill_chunk_positions,
         1
     );
-    assert_eq!(second_reservation.bytes(), 30);
-    assert_eq!(pool.used_bytes().unwrap(), 72);
-    assert!(crate::working_memory::plan_prefill(
-        &identity,
-        &pool,
-        &capabilities(),
-        request(geometry),
-        geometry,
-        |g| quote(g, Some(11))
-    )
-    .is_err());
+    assert_eq!(
+        second_reservation
+            .requirements()
+            .get(crate::working_memory::memory_fixture::host_topology_ref().host_domain())
+            .ok()
+            .and_then(|charge| charge.total().ok()),
+        Some(second_bytes)
+    );
+    assert_eq!(pool.payload_used_bytes().unwrap(), 72);
+    assert!(
+        crate::working_memory::plan_prefill(
+            &identity,
+            &pool,
+            &capabilities(),
+            request(geometry),
+            geometry,
+            |g| quote(g, Some(11))
+        )
+        .is_err()
+    );
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 30);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 30);
     drop(second_reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn diagnostic_only_admission_with_unknown_host_cannot_be_reserved_for_execution() {
     let geometry = geometry();
     let mut request = request(geometry);
-    request.require_complete_estimate = false;
-    let AdmissionResult::Admitted(admission) = eredu_core::apply_admission_policy(
+    let AdmissionResult::Admitted(mut admission) = eredu_core::apply_admission_policy(
         &capabilities(),
         request,
-        quote(geometry, None).unwrap(),
-        None,
+        quote(geometry, Some(11)).unwrap(),
     )
     .unwrap() else {
-        panic!("non-strict diagnostic report")
+        panic!("complete diagnostic report")
     };
-    let pool = crate::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let workspace = admission.state.execution_workspace.as_mut().unwrap();
+    workspace.activations = WorkspaceBound::Unknown {
+        reason: "host mechanism fact unavailable".into(),
+    };
+    workspace.physical_domains = None;
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     assert!(matches!(
         pool.reserve(
             &crate::working_memory::InferenceExecutionIdentity::default(),
@@ -247,5 +321,5 @@ fn diagnostic_only_admission_with_unknown_host_cannot_be_reserved_for_execution(
         ),
         Err(crate::working_memory::WorkingMemoryError::UnknownBound)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

@@ -91,7 +91,25 @@ impl WorkingMemoryFundingRun {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
+    /// Rejects an ineligible ceiling succession before constructing planning
+    /// metadata. This read-only observation grants no reservation or execution
+    /// authority; reservation repeats the same validation under its commit lock.
+    pub fn preflight_capacity_handoff(
+        &self,
+        execution: &InferenceExecutionIdentity,
+        requested: &MemoryLimits,
+        handoffs: &[WorkingMemoryCapacityHandoff],
+    ) -> Result<(), WorkingMemoryError> {
+        let usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        CapacityHandoffPlan::prepare(self, execution, &usage, Some(requested), handoffs)?;
+        Ok(())
+    }
+
     /// Identity-only preflight for candidate planners. Eligibility and exact
     /// live account identity are still checked atomically during reservation.
     pub(in super::super) fn validate_capacity_handoff_identities(
@@ -118,83 +136,114 @@ impl WorkingMemoryPool {
 /// Borrowed checked numeric transaction. No map clone, raise vector or source
 /// callback is needed; the exact same lock covers validation and scalar commit.
 pub(in super::super) struct CapacityHandoffPlan<'h> {
-    capacity: u64,
-    requested: Option<u64>,
+    requested: Option<&'h MemoryLimits>,
     handoffs: &'h [WorkingMemoryCapacityHandoff],
 }
 impl<'h> CapacityHandoffPlan<'h> {
     pub(in super::super) fn prepare(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
         usage: &Usage,
-        requested: Option<u64>,
+        requested: Option<&'h MemoryLimits>,
         handoffs: &'h [WorkingMemoryCapacityHandoff],
     ) -> Result<Self, WorkingMemoryError> {
+        if let Some(limits) = requested {
+            limits.validate(pool.topology())?;
+        }
         pool.validate_capacity_handoff_identities(execution, handoffs)?;
         for handoff in handoffs {
             if handoff.id >= usage.next_funding {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
             let Some(state) = usage.funding.get(&handoff.id) else {
-                let retiring = usage.funding.live_identity(handoff.id).or_else(|| {
-                    usage
-                        .account_retiring
-                        .as_ref()
-                        .and_then(|node| node.identity(handoff.id))
-                });
-                let retiring = retiring.or_else(|| {
-                    usage
-                        .pending_original
-                        .as_ref()
-                        .and_then(|node| node.identity(handoff.id))
-                });
+                let retiring = usage
+                    .funding
+                    .live_identity(handoff.id)
+                    .or_else(|| {
+                        usage
+                            .account_retiring
+                            .as_ref()
+                            .and_then(|node| node.identity(handoff.id))
+                    })
+                    .or_else(|| {
+                        usage
+                            .pending_original
+                            .as_ref()
+                            .and_then(|node| node.identity(handoff.id))
+                    });
                 if let Some(identity) = retiring {
-                    if identity != handoff.execution.as_ptr() as usize {
-                        return Err(WorkingMemoryError::IdentityMismatch);
-                    }
-                    return Err(WorkingMemoryError::ExecutionFenced);
+                    return Err(if identity != handoff.execution.as_ptr() as usize {
+                        WorkingMemoryError::IdentityMismatch
+                    } else {
+                        WorkingMemoryError::ExecutionFenced
+                    });
                 }
                 continue;
             };
             if !Weak::ptr_eq(&state.execution, &handoff.execution) {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            let (Some(current), Some(next)) = (state.capacity, requested) else {
-                continue;
-            };
-            if current >= next {
-                continue;
+            let mut raises = false;
+            for (domain, _) in pool.topology().domains() {
+                let next = requested
+                    .map(|c| c.get(domain))
+                    .transpose()?
+                    .unwrap_or(MemoryLimit::Unlimited);
+                raises |= state.limit(domain)?.is_raised_by(next);
             }
-            if state.run_open
-                || state.scopes != 0
-                || state.quarantined
-                || state.native_held.is_some()
-                || state.remaining != state.control_floor
+            if raises
+                && (state.run_open
+                    || state.scopes != 0
+                    || state.quarantined
+                    || state
+                        .domains
+                        .iter()
+                        .any(|balance| balance.native_held.is_some())
+                    || state.domains.iter().enumerate().any(|(slot, balance)| {
+                        balance.remaining
+                            != if slot == state.host_slot {
+                                state.control_floor
+                            } else {
+                                0
+                            }
+                    }))
             {
                 return Err(WorkingMemoryError::ExecutionFenced);
             }
         }
         Ok(Self {
-            capacity: crate::working_memory::resident_reset::capacity(usage)
-                .min(usage.funding.capacity_after(requested, handoffs))
-                .min(
-                    usage
-                        .account_retiring
-                        .as_ref()
-                        .map_or(u64::MAX, RetiringAccount::capacity),
-                ),
             requested,
             handoffs,
         })
     }
     pub(in super::super) fn effective_capacity(
         &self,
-        configured: u64,
-        requested: Option<u64>,
-    ) -> u64 {
-        configured
-            .min(self.capacity)
-            .min(requested.unwrap_or(u64::MAX))
+        pool: &MemoryLedger,
+        usage: &Usage,
+        domain: MemoryDomainId,
+    ) -> Result<MemoryLimit, WorkingMemoryError> {
+        let mut limit = pool
+            .0
+            .limits
+            .get(domain)?
+            .minimum(
+                usage
+                    .funding
+                    .capacity_after(domain, self.requested, self.handoffs)?,
+            );
+        if usage.account_retiring.is_some() {
+            limit = limit.minimum(usage.domains[pool.topology().slot(domain)?].retiring_limit);
+        }
+        if let Some(account) = &usage.pending_original {
+            limit = limit.minimum(account.capacity(domain)?);
+        }
+        limit = limit.minimum(crate::working_memory::resident_reset::capacity(
+            usage, domain,
+        )?);
+        if let Some(requested) = self.requested {
+            limit = limit.minimum(requested.get(domain)?);
+        }
+        Ok(limit)
     }
     pub(in super::super) fn commit(self, usage: &mut Usage) {
         usage.funding.commit_handoffs(self.requested, self.handoffs);

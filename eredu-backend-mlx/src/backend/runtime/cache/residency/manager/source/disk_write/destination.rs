@@ -4,6 +4,24 @@ use crate::backend::nn::workspace::{OriginalPagedDiskWriteSource, PagedHostStore
 use eredu_runtime::cache::PreparedCachePoolReservation;
 use safemlx::{PreparedHostTransferPlan, PreparedInputRuntime};
 
+/// A selected itinerary supplies its real context, canonical source and pin
+/// population. Equal geometry or a destination's capacity supplies no authority.
+pub(crate) trait PreparedCacheDiskWriteSource {
+    fn id(&self) -> &CacheBlockId;
+    fn context(&self) -> &WorkspaceContext;
+    fn validate(&self, loan: &CacheBlockSourceLoan<'_>) -> Result<usize, Exception>;
+}
+impl PreparedCacheDiskWriteSource for OriginalPagedDiskWriteSource<'_, '_> {
+    fn id(&self) -> &CacheBlockId {
+        OriginalPagedDiskWriteSource::id(self)
+    }
+    fn context(&self) -> &WorkspaceContext {
+        self.source().context()
+    }
+    fn validate(&self, loan: &CacheBlockSourceLoan<'_>) -> Result<usize, Exception> {
+        OriginalPagedDiskWriteSource::validate(self, loan)
+    }
+}
 /// This owns only actual prepared destinations and immutable declarations.
 /// A task exists only after exact canonical Host buffers and source pins bind.
 pub(crate) struct PreparedDiskWriteDestination {
@@ -35,6 +53,37 @@ impl CacheBlockSourceLoan<'_> {
         additional_reservations: usize,
         context: &WorkspaceContext,
     ) -> Result<PreparedDiskWriteDestination, CacheSourceFailure> {
+        self.prepare_declared_disk_write_for(
+            source,
+            runtime,
+            additional_reservations,
+            context,
+            false,
+        )
+    }
+    pub(crate) fn prepare_declared_ordinary_disk_write(
+        &self,
+        source: &PagedHostStoreDeclaration<'_>,
+        runtime: &PreparedInputRuntime,
+        additional_reservations: usize,
+        context: &WorkspaceContext,
+    ) -> Result<PreparedDiskWriteDestination, CacheSourceFailure> {
+        self.prepare_declared_disk_write_for(
+            source,
+            runtime,
+            additional_reservations,
+            context,
+            true,
+        )
+    }
+    fn prepare_declared_disk_write_for(
+        &self,
+        source: &PagedHostStoreDeclaration<'_>,
+        runtime: &PreparedInputRuntime,
+        additional_reservations: usize,
+        context: &WorkspaceContext,
+        ordinary: bool,
+    ) -> Result<PreparedDiskWriteDestination, CacheSourceFailure> {
         let fail = |cause| CacheSourceFailure::source(cause, context);
         source.validate_loan(self, context).map_err(fail)?;
         context
@@ -57,7 +106,21 @@ impl CacheBlockSourceLoan<'_> {
         let mut bytes = [0; 2];
         let mut capacities = [0; 2];
         for index in 0..2 {
-            if source.requires_store() {
+            if source.requires_store() && ordinary {
+                let width = CacheBlockMetadata::floating_dtype_bytes(dtypes[index])
+                    .ok_or_else(|| fail(CacheSourceError::Geometry))?;
+                let logical = shapes[index]
+                    .iter()
+                    .try_fold(width, |n, dimension| {
+                        n.checked_mul(u64::try_from(*dimension).ok().filter(|n| *n > 0)?)
+                    })
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+                bytes[index] = logical;
+                capacities[index] = HostTransferBuffer::ordinary_capacity(runtime, logical)
+                    .map_err(|cause| fail(CacheSourceError::HostInput(cause)))?
+                    .0;
+            } else if source.requires_store() {
                 let plan = PreparedHostTransferPlan::new(runtime, &shapes[index], dtypes[index], 0)
                     .map_err(|cause| fail(CacheSourceError::HostInput(cause)))?;
                 context
@@ -198,16 +261,41 @@ pub(super) fn prepare(
     })
 }
 impl PreparedDiskWriteDestination {
+    pub(crate) fn ordinary_call_controls<P: PreparedCacheDiskWriteSource>(
+        &self,
+        publication_controls: usize,
+    ) -> Option<crate::backend::nn::workspace::OrdinaryCallControls> {
+        let frames = [
+            PreparedDiskWrite::fixed_control_bytes()?,
+            control_bytes()?,
+            DiskWriteOperation::control_bytes()?,
+            publication_controls.checked_mul(6)?,
+            PreparedCachePoolReservation::admission_control_bytes()?.checked_mul(2)?,
+            size_of::<(Self, &mut CacheBlockSourceLoan<'_>, &P)>(),
+            size_of::<Result<PreparedDiskWrite, CacheSourceFailure>>(),
+            size_of::<Result<usize, Exception>>(),
+        ];
+        Some(crate::backend::nn::workspace::OrdinaryCallControls {
+            metadata_bytes: u64::try_from(
+                frames
+                    .into_iter()
+                    .try_fold(size_of_val(&frames), usize::checked_add)?,
+            )
+            .ok()?,
+            observed: crate::backend::nn::workspace::OrdinaryNativeControls::default(),
+        })
+    }
+
     pub(crate) fn read_layout(&self) -> &CacheShardLayout {
         &self.layout
     }
 
-    pub(crate) fn bind(
+    pub(crate) fn bind<P: PreparedCacheDiskWriteSource>(
         self,
         loan: &mut CacheBlockSourceLoan<'_>,
-        source: &OriginalPagedDiskWriteSource<'_, '_>,
+        source: &P,
     ) -> Result<PreparedDiskWrite, CacheSourceFailure> {
-        if source.id() != &self.id || !self.context.shares_trace(source.source().context()) {
+        if source.id() != &self.id || !self.context.shares_trace(source.context()) {
             return Err(CacheSourceFailure::source(
                 CacheSourceError::Identity,
                 &self.context,
@@ -301,18 +389,20 @@ impl PreparedDiskWriteDestination {
                     .map_err(|_| fail(CacheSourceError::Overflow))?,
                 ..CachePoolUsage::default()
             })
-            .map_err(|cause| fail(CacheSourceError::DiskAdmission(cause)))?;
+            .map_err(|cause| fail(CacheSourceError::ReservationAdmission(cause)))?;
         let transfer = self
             .transfer
             .reserve(CachePoolUsage {
                 transfer_in_flight_bytes: transfer_bytes,
                 ..CachePoolUsage::default()
             })
-            .map_err(|cause| fail(CacheSourceError::DiskAdmission(cause)))?;
+            .map_err(|cause| fail(CacheSourceError::ReservationAdmission(cause)))?;
+        let reservation = Mutex::new(Some(transfer));
+        drop(reservation.lock().expect("new unshared occupancy mutex"));
         let transfer = DiskWriteOccupancy {
             inner: context
                 .metadata_arc(Occupancy {
-                    reservation: Mutex::new(transfer),
+                    reservation,
                     host_bytes: transfer_bytes,
                 })
                 .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?,
@@ -336,7 +426,7 @@ impl PreparedDiskWriteDestination {
                 publication: Some(self.publication),
                 layout: self.layout,
                 location: self.location,
-                host,
+                host: Some(host),
                 descriptors,
                 id: self.id,
                 generation: self.generation,

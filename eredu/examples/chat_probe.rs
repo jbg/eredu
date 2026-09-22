@@ -1,10 +1,13 @@
 //! Compare semantic constraints with ordinary generation on the same chat prompt.
-//! Usage: chat_probe CHECKPOINT OUTPUT_PREFIX [MAX_TOKENS] [TEMPERATURE] [cpu|metal] [CAPACITY_BYTES]
+//! Usage: chat_probe CHECKPOINT OUTPUT_PREFIX [MAX_TOKENS] [TEMPERATURE] [cpu|metal] [MEMORY_LIMITS]
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use anyhow::Context;
 use eredu::{
     api::{
-        ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings,
-        PreparedChatOutputMode, PreparedChatRequest, TokenizerSourceInput, local_device_plan,
+        local_device_plan, ChatSourceInput, LoadedModel, LocalDevice,
+        PreparedChatGenerationSettings, PreparedChatOutputMode, PreparedChatRequest,
+        TokenizerSourceInput,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -19,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     anyhow::ensure!(
         args.len() >= 2,
-        "usage: chat_probe CHECKPOINT OUTPUT_PREFIX [MAX_TOKENS] [TEMPERATURE] [cpu|metal] [CAPACITY_BYTES]"
+        "usage: chat_probe CHECKPOINT OUTPUT_PREFIX [MAX_TOKENS] [TEMPERATURE] [cpu|metal] [MEMORY_LIMITS]"
     );
     let max_tokens: usize = args.get(2).map(String::as_str).unwrap_or("2048").parse()?;
     let temperature: f32 = args.get(3).map(String::as_str).unwrap_or("0").parse()?;
@@ -28,12 +31,8 @@ fn main() -> anyhow::Result<()> {
         "metal" => LocalDevice::Accelerator(0),
         other => anyhow::bail!("unknown device {other}"),
     };
-    let capacity: u64 = args
-        .get(5)
-        .map(String::as_str)
-        .unwrap_or("1073741824")
-        .parse()?;
-    anyhow::ensure!(capacity > 0, "capacity must be positive");
+    let capacity =
+        physical_memory::parse(args.get(5).map(String::as_str).unwrap_or("host=unlimited"))?;
     let plan = ExecutionPlan::fully_resident(local_device_plan(device)?);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &args[0], &plan)?
@@ -63,7 +62,7 @@ fn main() -> anyhow::Result<()> {
                 add_generation_prompt: true,
                 ..Default::default()
             },
-            capacity,
+            &capacity,
             &cancellation,
         )?
         .context("cancelled before chat preparation")?;
@@ -80,7 +79,7 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: capacity.clone(),
             ..Default::default()
         },
         seed: 0,
@@ -90,7 +89,7 @@ fn main() -> anyhow::Result<()> {
         model.reset()?;
         let mut events = Vec::<SemanticEvent>::new();
         let start = std::time::Instant::now();
-        let mut request = PreparedChatRequest::new(&prepared, settings);
+        let mut request = PreparedChatRequest::new(&prepared, settings.clone());
         request.output_mode = if mode == "ordinary" {
             PreparedChatOutputMode::Text
         } else {
@@ -117,7 +116,7 @@ fn main() -> anyhow::Result<()> {
             "mode":mode, "checkpoint":args[0], "messages":messages,
             "prompt":prepared.rendered_prompt(), "prompt_ids":prompt_ids,
             "temperature":temperature, "top_k":40, "top_p":0.95, "min_p":0.05, "repetition_penalty":1.0,
-            "seed":0, "max_new_tokens":max_tokens, "capacity_bytes":capacity, "plan":plan,
+            "seed":0, "max_new_tokens":max_tokens, "memory_limits":capacity, "plan":plan,
             "profile":prepared.format_profile_identity(),
             "token_ids":&*token_ids, "decoded":decoded, "events":events,
             "finish_reason":finish_reason, "elapsed_seconds":start.elapsed().as_secs_f64(),

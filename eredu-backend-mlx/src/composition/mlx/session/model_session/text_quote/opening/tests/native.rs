@@ -1,5 +1,7 @@
 use super::super::super::*;
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{TextGenerationDriver, TextGenerationInput, TokenFilter, TokenFilterController};
 use safemlx::{Device, DeviceType, Stream};
@@ -45,7 +47,10 @@ fn config() -> TextGenerationConfig {
     )
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: Some(u64::MAX),
+        memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(u64::MAX),
+        )]),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -56,10 +61,10 @@ fn evidence() -> TextPreparationInput<'static, MlxModelInput> {
         capacity_bytes: 8,
     }
 }
-fn runtime(pool: &WorkingMemoryPool) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
+fn runtime(pool: &MemoryLedger) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let source = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -75,10 +80,10 @@ fn reclaim() {
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
 }
-fn settle(pool: &WorkingMemoryPool) {
+fn settle(pool: &MemoryLedger) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == 0 && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == 0 && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 fn cause<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a WorkingMemoryError> {
@@ -92,14 +97,22 @@ fn cause<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Wor
 
 #[test]
 fn ordinary_quote_seals_immediately_and_private_pending_quote_rejects_work() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     // Both actual models load before finite request preparation.
     let (runtime, artifact) = runtime(&pool);
     let (foreign, foreign_artifact) = self::runtime(&pool);
-    let (preparation, mut quote) =
-        admit_inner(&runtime, &evidence(), config(), &All, None, false, None, None)
-            .map_err(sequence::AdmissionFailure::into_backend)
-            .unwrap();
+    let (preparation, mut quote) = admit_inner(
+        &runtime,
+        &evidence(),
+        config(),
+        &All,
+        None,
+        false,
+        None,
+        None,
+    )
+    .map_err(sequence::AdmissionFailure::into_backend)
+    .unwrap();
     let retained = runtime
         .session()
         .payload
@@ -111,8 +124,8 @@ fn ordinary_quote_seals_immediately_and_private_pending_quote_rejects_work() {
     quote.validate_opening(&retained).unwrap();
     assert!(quote.predecessor().unwrap().is_none());
     let before = (
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
         paths::snapshot(),
     );
     assert_eq!(
@@ -170,8 +183,8 @@ fn ordinary_quote_seals_immediately_and_private_pending_quote_rejects_work() {
     );
     assert_eq!(
         (
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
             paths::snapshot()
         ),
         before
@@ -190,7 +203,7 @@ fn ordinary_quote_seals_immediately_and_private_pending_quote_rejects_work() {
 
 #[test]
 fn ordinary_successor_keeps_exact_predecessor_and_rejects_a_later_revision() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, artifact) = runtime(&pool);
     let mut driver = TextGenerationDriver::new(&mut runtime);
     let mut state = driver
@@ -216,10 +229,18 @@ fn ordinary_successor_keeps_exact_predecessor_and_rejects_a_later_revision() {
             .retained_inference_authority()
             .unwrap();
         assert_eq!(retained.admission().unwrap().position(), 6);
-        let (preparation, quote) =
-            admit_inner(runtime, &evidence(), config(), &All, None, false, None, None)
-                .map_err(sequence::AdmissionFailure::into_backend)
-                .unwrap();
+        let (preparation, quote) = admit_inner(
+            runtime,
+            &evidence(),
+            config(),
+            &All,
+            None,
+            false,
+            None,
+            None,
+        )
+        .map_err(sequence::AdmissionFailure::into_backend)
+        .unwrap();
         quote.validate_opening(&retained).unwrap();
         quote.validate_opening(&retained.clone()).unwrap();
         quote

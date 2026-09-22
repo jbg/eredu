@@ -11,7 +11,10 @@ use crate::{
 use eredu_nn::{ParameterVisitor, Parameterized};
 use std::collections::BTreeMap;
 mod partitioned;
-pub use partitioned::{PartitionedTextBindingDestinations, project_partitioned_text_binding_destinations};
+pub(in crate::prepared_execution::workspace) use partitioned::project_partitioned_text_binding_destinations_for;
+pub use partitioned::{
+    PartitionedTextBindingDestinations, project_partitioned_text_binding_destinations,
+};
 mod prediction;
 mod routed;
 pub use prediction::PredictionBindingDestination;
@@ -67,30 +70,43 @@ pub fn project_replicated_text_binding_destinations(
     context: &WorkspaceContext,
 ) -> Result<ReplicatedTextBindingDestinations, PreparedExecutionError<Error>> {
     let routes = PreparedExecutionRoutes::new()
-        .with_replicated(ReplicatedRoute::<WorkspaceBackend, _>::new(
-            context,
-            context,
-            SharedReplicatedTextVisitor::<WorkspaceResidentStateFactory, _>::new(
-                DestinationVisitor(context),
+        .with_replicated(
+            ReplicatedRoute::<WorkspaceBackend, _>::new(
+                context,
+                context,
+                SharedReplicatedTextVisitor::<WorkspaceResidentStateFactory, _>::new(
+                    DestinationVisitor(context),
+                ),
+            )
+            .with_prediction::<ProjectionMaterializer, _, _>(
+                |prepared, _store| prediction::materialize(prepared, context),
+                |_| DestinationVisitor(context),
             ),
-        ).with_prediction::<ProjectionMaterializer, _, _>(
-            |prepared, _store| prediction::materialize(prepared, context),
-            |_| DestinationVisitor(context),
-        ))
-        .with_routed(RoutedRoute::<WorkspaceBackend, ResidentState, ResidentState, _, _, _>::new(
-            context, context, DestinationVisitor(context), DestinationVisitor(context), DestinationVisitor(context),
-        ).with_prediction::<ProjectionMaterializer, _, _>(
-            |prepared, _store| prediction::materialize(prepared, context),
-            |_| DestinationVisitor(context),
-        ))
-        .with_composite(CompositeRoute::<WorkspaceBackend, ResidentState, _>::new(
-            context,
-            context,
-            DestinationVisitor(context),
-        ).with_prediction::<ProjectionMaterializer, _, _>(
-            |prepared, _store| prediction::materialize(prepared, context),
-            |_| DestinationVisitor(context),
-        ));
+        )
+        .with_routed(
+            RoutedRoute::<WorkspaceBackend, ResidentState, ResidentState, _, _, _>::new(
+                context,
+                context,
+                DestinationVisitor(context),
+                DestinationVisitor(context),
+                DestinationVisitor(context),
+            )
+            .with_prediction::<ProjectionMaterializer, _, _>(
+                |prepared, _store| prediction::materialize(prepared, context),
+                |_| DestinationVisitor(context),
+            ),
+        )
+        .with_composite(
+            CompositeRoute::<WorkspaceBackend, ResidentState, _>::new(
+                context,
+                context,
+                DestinationVisitor(context),
+            )
+            .with_prediction::<ProjectionMaterializer, _, _>(
+                |prepared, _store| prediction::materialize(prepared, context),
+                |_| DestinationVisitor(context),
+            ),
+        );
     construct_prepared_execution_impl(
         sources.clone(),
         None::<()>,
@@ -206,7 +222,11 @@ fn collect(
         duplicate: Option<String>,
     }
     impl<'a> ParameterVisitor<'a, WorkspaceTensor> for Collector {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a WorkspaceTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a WorkspaceTensor,
+        ) {
             let name = metadata.id().as_str().to_owned();
             if self
                 .values
@@ -218,7 +238,9 @@ fn collect(
         }
     }
     let mut collector = Collector::default();
-    module.visit_parameters(&mut collector).map_err(Error::backend_retained_source)?;
+    module
+        .visit_parameters(&mut collector)
+        .map_err(Error::backend_retained_source)?;
     if let Some(parameter) = collector.duplicate {
         return Err(Error::backend_retained_source(
             eredu_runtime::ModuleBindingPlanError::DuplicateParameter { parameter },

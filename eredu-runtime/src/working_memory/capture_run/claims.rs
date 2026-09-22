@@ -1,33 +1,49 @@
 use super::*;
 mod evidence;
 mod pending;
+pub(crate) use evidence::InterventionEvidenceFrame;
 pub use evidence::{
     CaptureInterventionEvidenceClaim, CaptureInterventionEvidenceKind, ClaimedInterventionEvidence,
     InterventionEvidenceReceipt,
 };
-pub(crate) use evidence::PartitionInterventionEvidenceFrame;
 mod prefill;
 pub use prefill::*;
 
 mod delivery;
 mod partition;
-pub(super) use partition::{decode_summary_receipt, decode_histogram_receipt, histogram_preparation_failure, prepare_histogram_decoder};
-pub use partition::{PartitionCaptureTensorDecodeError, PartitionCaptureTensorReceipt, PreparedPartitionTensorDelivery, PartitionCaptureTensorDeliveryError};
+pub use partition::{
+    PartitionCaptureTensorDecodeError, PartitionCaptureTensorDeliveryError,
+    PartitionCaptureTensorReceipt, PreparedPartitionTensorDelivery,
+};
+pub(super) use partition::{
+    decode_histogram_receipt, decode_summary_receipt, histogram_preparation_failure,
+    prepare_histogram_decoder,
+};
 
 /// An original run lends its finite row. An intervention companion already has
-/// its fixed frame and owns exactly two side slots plus its spent frame slot.
+/// its fixed frame and up to four evidence fields plus its spent frame slot.
 /// Both variants are private, move-only and use the same issuance checks.
 #[derive(Debug)]
 pub(in crate::working_memory) enum CaptureClaimRow<'a> {
     Run(&'a mut [ClaimState]),
-    Evidence([ClaimState; 3]),
+    Evidence([ClaimState; 5]),
 }
 impl std::ops::Deref for CaptureClaimRow<'_> {
     type Target = [ClaimState];
-    fn deref(&self) -> &[ClaimState] { match self { Self::Run(row) => row, Self::Evidence(row) => row } }
+    fn deref(&self) -> &[ClaimState] {
+        match self {
+            Self::Run(row) => row,
+            Self::Evidence(row) => row,
+        }
+    }
 }
 impl std::ops::DerefMut for CaptureClaimRow<'_> {
-    fn deref_mut(&mut self) -> &mut [ClaimState] { match self { Self::Run(row) => row, Self::Evidence(row) => row } }
+    fn deref_mut(&mut self) -> &mut [ClaimState] {
+        match self {
+            Self::Run(row) => row,
+            Self::Evidence(row) => row,
+        }
+    }
 }
 
 /// One spent frame constructor, borrowing the run exclusively until its partial
@@ -35,10 +51,10 @@ impl std::ops::DerefMut for CaptureClaimRow<'_> {
 pub struct CaptureStepClaim<'a> {
     pub(super) source: &'a SharedCapturePlan,
     pub(super) interventions: Option<&'a super::super::OriginalInterventionSource>,
-    pub(super) routed_interventions:Vec<Option<RoutedInterventionCursor<'a>>>,
-    pub(super) prefill_interventions:Vec<Option<InterventionPrefillCursor<'a>>>,
+    pub(super) routed_interventions: Vec<Option<RoutedInterventionCursor<'a>>>,
+    pub(super) prefill_interventions: Vec<Option<InterventionPrefillCursor<'a>>>,
     pub(super) intervention_selected: Option<&'a [bool]>,
-    pub(super) intervention_evidence_skips: Option<&'a [[Option<CaptureSkipReason>;2]]>,
+    pub(super) intervention_evidence_skips: Option<&'a [[Option<CaptureSkipReason>; 2]]>,
     pub(super) row: CaptureClaimRow<'a>,
     pub(super) phase: CapturePhase,
     pub(super) prediction: u64,
@@ -77,16 +93,18 @@ impl<'a> CaptureStepClaim<'a> {
         let mut frame = capture_step::allocate(plan, self.custody.share_scheduled())?;
         if let Some(source) = self.interventions {
             let plan = match (self.invocation, self.intervention_selected) {
-                (Some(shape), Some(selected)) => interventions::StepPlan::prepare_invocation_evidence(
-                    self.source,
-                    source,
-                    self.phase,
-                    self.prediction,
-                    shape,
-                    selected,
-                    self.window,
-                    self.intervention_evidence_skips,
-                )?,
+                (Some(shape), Some(selected)) => {
+                    interventions::StepPlan::prepare_invocation_evidence(
+                        self.source,
+                        source,
+                        self.phase,
+                        self.prediction,
+                        shape,
+                        selected,
+                        self.window,
+                        self.intervention_evidence_skips,
+                    )?
+                }
                 (None, None) => interventions::StepPlan::prepare(
                     self.source,
                     source,
@@ -95,16 +113,28 @@ impl<'a> CaptureStepClaim<'a> {
                 )?,
                 _ => return Err(CaptureRunHostError::ExplicitInvocation),
             };
-            if source.plan().admission().points().iter().any(|point|point.routed_units.is_some()) {
-                let count=source.plan().admission().plan().operations.len();
-                self.routed_interventions=Vec::with_capacity(count);
-                self.routed_interventions.resize_with(count,||None);
+            if source
+                .plan()
+                .admission()
+                .points()
+                .iter()
+                .any(|point| point.routed_units.is_some())
+            {
+                let count = source.plan().admission().plan().operations.len();
+                self.routed_interventions = Vec::with_capacity(count);
+                self.routed_interventions.resize_with(count, || None);
             }
-            if self.invocation.is_none() && source.plan().admission().points().iter()
-                .any(crate::intervention::InterventionPrefillWindow::row_axis) {
-                let count=source.plan().admission().plan().operations.len();
-                self.prefill_interventions=Vec::with_capacity(count);
-                self.prefill_interventions.resize_with(count,||None);
+            if self.invocation.is_none()
+                && source
+                    .plan()
+                    .admission()
+                    .points()
+                    .iter()
+                    .any(crate::intervention::InterventionPrefillWindow::row_axis)
+            {
+                let count = source.plan().admission().plan().operations.len();
+                self.prefill_interventions = Vec::with_capacity(count);
+                self.prefill_interventions.resize_with(count, || None);
             }
             frame.install_interventions(plan)?;
         }
@@ -128,6 +158,17 @@ pub struct ScheduledCaptureStep<'a> {
     pub(super) claim: CaptureStepClaim<'a>,
 }
 impl<'a> ScheduledCaptureStep<'a> {
+    pub(crate) fn matches_partition_context(
+        &self,
+        source: &SharedCapturePlan,
+        context: &eredu_core::capture::PartitionCaptureContext,
+    ) -> bool {
+        self.claim.source.same_storage(source)
+            && self.claim.phase == context.phase
+            && self.claim.prediction == context.prediction
+            && context.matches_invocation(self.claim.invocation, self.claim.window)
+    }
+
     pub(crate) fn prefill_source_bootstrap(
         &self,
     ) -> Result<CapturePrefillSourceBootstrap<'_>, WorkingMemoryError> {
@@ -425,6 +466,22 @@ impl<'a, 'c> CaptureTensorClaim<'a, 'c> {
             exclusive,
         })
     }
+
+    /// Consumes this claim to pin one source backing and its optional native
+    /// control allocation using the original program's prepaid host allowance.
+    /// The supplied custody must belong to the same active native account.
+    pub fn prepare_with_original_source<'s, K: Clone + Ord + Send + Sync + 'static>(
+        self,
+        native: &'s mut WorkingMemoryFundingScope,
+        custody: &crate::working_memory::OriginalTextMetadataCustody,
+        source: [Option<(K, u64)>; 2],
+    ) -> Result<ScheduledCaptureTensorTransfer<'a, 'c, 's, K>, CaptureRunHostError> {
+        self.validate_native_scope(native)?;
+        let pin = native
+            .pool()
+            .pin_original_capture_source(native, custody, source)?;
+        self.prepare_with_source(native, pin)
+    }
     /// Construct the same fixed host destination while attaching complete
     /// source origins only to the exact scheduled segment. Permanent scope pins
     /// remain untouched, including additions made between segment transfers.
@@ -496,8 +553,12 @@ impl ScheduledCaptureTensor<'_, '_> {
     pub fn is_empty(&self) -> bool {
         self.builder.is_empty()
     }
-    pub(in crate::working_memory) fn replace_initialized_f32(&mut self,index:usize,value:f32)->Result<(),WorkingMemoryError> {
-        self.builder.replace_initialized_f32(index,value)
+    pub(in crate::working_memory) fn replace_initialized_f32(
+        &mut self,
+        index: usize,
+        value: f32,
+    ) -> Result<(), WorkingMemoryError> {
+        self.builder.replace_initialized_f32(index, value)
     }
     /// Installed values; storage never grows.
     pub fn initialized_count(&self) -> usize {
@@ -506,6 +567,10 @@ impl ScheduledCaptureTensor<'_, '_> {
     /// Fill an already owned F32 value after rechecking parent health.
     pub fn push_f32(&mut self, value: f32) -> Result<(), WorkingMemoryError> {
         self.builder.push_f32(value)
+    }
+    /// Copies one unsigned scalar into the same fixed, source-bound destination.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), WorkingMemoryError> {
+        self.builder.push_u64(value)
     }
 }
 impl<'a, 'c> ScheduledCaptureTensor<'a, 'c> {
@@ -613,6 +678,10 @@ impl<K: Ord + Send + 'static> ScheduledCaptureTensorTransfer<'_, '_, '_, K> {
     /// not prove native settlement; the closed backend worker is responsible.
     pub fn push_f32(&mut self, value: f32) -> Result<(), WorkingMemoryError> {
         self.builder.push_f32(value)
+    }
+    /// Copies one unsigned scalar into the same fixed, source-bound destination.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), WorkingMemoryError> {
+        self.builder.push_u64(value)
     }
 }
 impl<'a, 'c, 's, K: Ord + Send + 'static> ScheduledCaptureTensorTransfer<'a, 'c, 's, K> {
@@ -735,11 +804,23 @@ impl std::error::Error for ScheduledCaptureTensorFailure {
     }
 }
 
-pub(super) use partition::{VocabularyDestination,prepare_vocabulary_decoder,decode_vocabulary_receipt};
+pub(super) use partition::{
+    VocabularyDestination, decode_vocabulary_receipt, prepare_vocabulary_decoder,
+};
 
-pub use partition::{PartitionFragmentHostPlan, PreparedPartitionFragmentDestinations, PartitionFragmentDestination, NativePartitionFragmentDestination, PartitionFragmentValue, PartitionFragmentDestinationError, PreparedPartitionFragmentHostFunding, PartitionFragmentHostBindingError, PartitionFragmentHostPreparationError};
 pub(in crate::working_memory) use partition::FragmentHostPlan;
+pub use partition::{
+    NativePartitionFragmentDestination, OwnedPartitionFragmentHostPlan,
+    PartitionFragmentDestination, PartitionFragmentDestinationError,
+    PartitionFragmentHostBindingError, PartitionFragmentHostPlan,
+    PartitionFragmentHostPreparationError, PartitionFragmentValue,
+    PreparedPartitionFragmentDestinations, PreparedPartitionFragmentHostFunding,
+};
 
-pub(crate) use partition::{PartitionCaptureRankSource, PreparedPartitionFragmentDelivery, PartitionFragmentDelivered};
+pub(crate) use partition::{
+    PartitionCaptureRankSource, PartitionFragmentDelivered, PreparedPartitionFragmentDelivery,
+};
 
-pub(crate) use partition::{PartitionLocalCaptureHook,PartitionCaptureHookContinuation,PartitionCaptureHookReturnError};
+pub(crate) use partition::{
+    PartitionCaptureHookContinuation, PartitionCaptureHookReturnError, PartitionLocalCaptureHook,
+};

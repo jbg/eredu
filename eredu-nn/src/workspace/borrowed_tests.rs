@@ -21,7 +21,9 @@ impl WorkspaceMechanisms for Mechanism {
                 .iter()
                 .map(|layout| {
                     Ok(match operation.kind {
-                        WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) => WorkspaceOutputStorage::AliasInput(0),
+                        WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) => {
+                            WorkspaceOutputStorage::AliasInput(0)
+                        }
                         WorkspaceOperationKind::Contiguous => {
                             WorkspaceOutputStorage::AllocateOrAliasInputs {
                                 bytes: layout.bytes()?,
@@ -81,7 +83,7 @@ fn borrowed_selection_validates_atomically_and_pins_exact_metadata_roots() {
     }
     let selected = WorkspaceBorrowedStorage::new(&context, [&first, &alias, &second]).unwrap();
     assert_eq!(selected.roots().len(), 2);
-    assert_eq!(selected.total_bytes(), 128);
+    assert_eq!(selected.total_bytes(), Some(128));
     assert!(selected.roots()[0].same_storage(&first));
     assert!(selected.same_identity(&selected.clone()));
     assert!(!selected
@@ -137,14 +139,20 @@ fn residual_union_traverses_possible_aliases_and_keeps_equal_capacity_roots_dist
         );
         assert_eq!(residual.displaced_bytes, Some(0));
         assert_eq!(residual.transient_bytes, Some(24));
-        assert_eq!(residual.opening_storage, Some(WorkspaceStoragePopulation {
-            bytes: Some(if borrow_actual { 64 } else { 192 }),
-            maximum_allocations: if borrow_actual { 1 } else { 2 },
-        }));
-        assert_eq!(residual.closing_storage, Some(WorkspaceStoragePopulation {
-            bytes: Some(if borrow_actual { 128 } else { 256 }),
-            maximum_allocations: if borrow_actual { 3 } else { 4 },
-        }));
+        assert_eq!(
+            residual.opening_storage,
+            Some(WorkspaceStoragePopulation {
+                bytes: Some(if borrow_actual { 64 } else { 192 }),
+                maximum_allocations: if borrow_actual { 1 } else { 2 },
+            })
+        );
+        assert_eq!(
+            residual.closing_storage,
+            Some(WorkspaceStoragePopulation {
+                bytes: Some(if borrow_actual { 128 } else { 256 }),
+                maximum_allocations: if borrow_actual { 3 } else { 4 },
+            })
+        );
     }
 }
 
@@ -189,8 +197,14 @@ fn replacement_checkpoint_and_rollback_copies_stay_incremental_across_span_reset
     let residual = context.report(&[]).unwrap().residual.unwrap();
     assert!(residual.borrowed_storage.same_identity(&selected));
     assert_eq!(residual.total_bytes, Some(0));
-    assert_eq!(residual.opening_storage, Some(WorkspaceStoragePopulation::EMPTY));
-    assert_eq!(residual.closing_storage, Some(WorkspaceStoragePopulation::EMPTY));
+    assert_eq!(
+        residual.opening_storage,
+        Some(WorkspaceStoragePopulation::EMPTY)
+    );
+    assert_eq!(
+        residual.closing_storage,
+        Some(WorkspaceStoragePopulation::EMPTY)
+    );
 }
 
 #[test]
@@ -204,7 +218,7 @@ fn explicit_empty_selection_reports_full_union_and_missing_selection_stays_absen
         .is_none());
     let empty = WorkspaceBorrowedStorage::new(&context, []).unwrap();
     context.set_borrowed_storage(empty.clone()).unwrap();
-    assert_eq!(empty.total_bytes(), 0);
+    assert_eq!(empty.total_bytes(), Some(0));
     context.begin_state_span([&existing]).unwrap();
     let closing_only = super::tests::existing_f32(&[4], &context).unwrap();
     let report = context.report(&[existing, closing_only]).unwrap();
@@ -253,7 +267,10 @@ fn residual_diagnostics_preserve_missing_native_host_state_and_capacity_facts() 
     let residual = context.report(&[old]).unwrap().residual.unwrap();
     assert_eq!(residual.total_bytes, None);
     assert_eq!(residual.retained_bytes, None);
-    let unknown = Some(WorkspaceStoragePopulation { bytes: None, maximum_allocations: 1 });
+    let unknown = Some(WorkspaceStoragePopulation {
+        bytes: None,
+        maximum_allocations: 1,
+    });
     assert_eq!(residual.opening_storage, unknown);
     assert_eq!(residual.closing_storage, unknown);
 }

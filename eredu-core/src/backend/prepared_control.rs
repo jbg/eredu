@@ -1,6 +1,6 @@
 //! Source-derived diagnostic attribution for an opaque ordinary controlled input.
 
-use super::{BackendFailure, HostPreparationAuthority, ModelRuntime, TextGenerationBackend};
+use super::{BackendFailure, HostPreparationAuthority};
 use crate::{InputModality, InputPayloadKind, PreparedInputIdentity};
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
@@ -180,17 +180,32 @@ impl SharedPromptAttribution {
     pub fn construction_bytes() -> Option<usize> {
         use std::{alloc::Layout, mem::size_of, sync::atomic::AtomicUsize};
         let shell = Layout::new::<[AtomicUsize; 2]>()
-            .extend(Layout::new::<AttributionOwner>()).ok()?.0.pad_to_align().size();
-        let parts = [shell, size_of::<AttributionOwner>(),
-            size_of::<PreparedPromptAttribution>(), size_of::<Self>(),
+            .extend(Layout::new::<AttributionOwner>())
+            .ok()?
+            .0
+            .pad_to_align()
+            .size();
+        let parts = [
+            shell,
+            size_of::<AttributionOwner>(),
+            size_of::<PreparedPromptAttribution>(),
+            size_of::<Self>(),
             size_of::<Result<Self, PreparedControlInputError>>(),
             size_of::<Result<(), PreparedControlInputError>>(),
             size_of::<(u64, u64, usize)>(),
-            size_of::<std::iter::Enumerate<std::iter::Zip<
-                std::slice::Iter<'static, PreparedPromptSegment>,
-                std::slice::Iter<'static, crate::InputPartDescriptor>>>>(),
-            size_of::<(&PreparedPromptSegment, &crate::InputPartDescriptor)>()];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+            size_of::<
+                std::iter::Enumerate<
+                    std::iter::Zip<
+                        std::slice::Iter<'static, PreparedPromptSegment>,
+                        std::slice::Iter<'static, crate::InputPartDescriptor>,
+                    >,
+                >,
+            >(),
+            size_of::<(&PreparedPromptSegment, &crate::InputPartDescriptor)>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
     /// Provider publication after acquiring custody before constructing the payload.
     /// This checks diagnostic structure only; the provider separately authenticates
@@ -250,50 +265,6 @@ impl Serialize for SharedPromptAttribution {
         self.attribution().serialize(s)
     }
 }
-
-/// Provider-owned one-use input. Implementations expose only borrowed diagnostics.
-pub trait PreparedControlInput: Sized {
-    type Prompt;
-    fn attribution(&self) -> &PreparedPromptAttribution;
-    /// Borrows the closed metadata owner for safe ordinary error retention.
-    /// Cloning this value grants no source, execution or resource authority.
-    fn shared_attribution(&self) -> &SharedPromptAttribution;
-}
-
-/// Optional ordinary prepared-input startup; existing text backend APIs are unchanged.
-/// An opaque preparation cannot be consumed twice.
-/// ```compile_fail
-/// use eredu_core::{ModelRuntime, PreparedControlInputBackend};
-/// fn twice<B: PreparedControlInputBackend>(runtime: &ModelRuntime<B>, input: B::ControlInput) {
-///     let _ = B::consume_control_input(runtime, input);
-///     let _ = B::consume_control_input(runtime, input);
-/// }
-/// ```
-pub trait PreparedControlInputBackend: TextGenerationBackend {
-    type ControlInput: PreparedControlInput<Prompt = Self::Prompt>;
-    /// Acquire real ordinary host/native custody before new preparation allocations.
-    fn prepare_control_input(
-        runtime: &ModelRuntime<Self>,
-        prompt: Self::Prompt,
-    ) -> Result<Self::ControlInput, BackendFailure>;
-    /// Bind one ordinarily admitted shared capture source to this exact input.
-    /// Default rejection does not promote it to original managed authority.
-    fn bind_control_input_capture(
-        _runtime: &ModelRuntime<Self>,
-        _input: Self::ControlInput,
-        _config: super::TextGenerationConfig,
-        _source: crate::capture::SharedCapturePlan,
-    ) -> Result<Self::ControlInput, BackendFailure> {
-        Err(PreparedControlInputError::InstrumentationUnavailable.into_backend_failure())
-    }
-    /// Authenticate exact source, selected executable and current state revision,
-    /// then move the same input and immutable attribution into the shared driver.
-    fn consume_control_input(
-        runtime: &ModelRuntime<Self>,
-        input: Self::ControlInput,
-    ) -> Result<(Self::Prompt, SharedPromptAttribution), BackendFailure>;
-}
-
 impl PreparedControlInputError {
     /// Fixed typed rejection before ordinary custody or source construction.
     pub fn into_backend_failure(self) -> BackendFailure {

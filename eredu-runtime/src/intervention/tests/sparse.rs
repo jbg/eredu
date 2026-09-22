@@ -691,65 +691,130 @@ fn independent_cached_invocations_edit_sparse_units_using_physical_token_rows() 
 
 #[test]
 fn original_sparse_rows_share_lowering_and_retain_source_and_partial_funding() {
-    use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
     use eredu_nn::workspace::WorkspaceContext;
-    let source_pool=WorkingMemoryPool::new(1<<22,11).unwrap();
-    let (_,plan)=plans_for(vec![mask(vec![3,4],false),InterventionAction::Scale{
-        dtype:InterventionDtype::Float32,factor:-2.0}]);
-    let source=source_pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&plan).unwrap()).unwrap();
-    let host_pool=WorkingMemoryPool::new(1<<22,17).unwrap();
-    let execution=InferenceExecutionIdentity::default();
-    let funding=host_pool.prepare_workspace_metadata(&execution,1<<22).unwrap();
-    let initial=host_pool.used_bytes().unwrap();
-    let mut escaped=Vec::new();
+    let source_pool = crate::working_memory::memory_fixture::host_ledger(1 << 22, 11).unwrap();
+    let (_, plan) = plans_for(vec![
+        mask(vec![3, 4], false),
+        InterventionAction::Scale {
+            dtype: InterventionDtype::Float32,
+            factor: -2.0,
+        },
+    ]);
+    let source = source_pool
+        .compile_intervention_source(PreparedInterventionPlanCopy::inspect(&plan).unwrap())
+        .unwrap();
+    let host_pool = crate::working_memory::memory_fixture::host_ledger(1 << 22, 17).unwrap();
+    let execution = InferenceExecutionIdentity::default();
+    let funding = host_pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&host_pool, 1 << 22),
+        )
+        .unwrap();
+    let initial = host_pool.payload_used_bytes().unwrap();
+    let mut escaped = Vec::new();
     for index in 0..2 {
-        let declared=&plan.plan().operations[index].action;
-        let ordinary=lower_routed_intervention(geometry(),&locations(),&full(),declared).unwrap();
-        let before=host_pool.used_bytes().unwrap();
-        let bound=PreparedRoutedInterventionRows::required_bytes(&source,index,4).unwrap() as u64;
-        let mut rows=PreparedRoutedInterventionRows::prepare(&source,index,CapturePhase::Prefill,0,
-            None,None,2,[0,2],4,funding.clone()).unwrap();
-        for row in locations().rows {rows.push_row(row).unwrap();}
-        let prepared=rows.finish().unwrap();
-        assert_eq!(prepared.indices(),ordinary.indices);
-        assert_eq!(prepared.action(),ordinary.action.as_ref());
-        assert_eq!(prepared.coordinates(),(index,CapturePhase::Prefill,0));
+        let declared = &plan.plan().operations[index].action;
+        let ordinary =
+            lower_routed_intervention(geometry(), &locations(), &full(), declared).unwrap();
+        let before = host_pool.payload_used_bytes().unwrap();
+        let bound =
+            PreparedRoutedInterventionRows::required_bytes(&source, index, 4).unwrap() as u64;
+        let mut rows = PreparedRoutedInterventionRows::prepare(
+            &source,
+            index,
+            CapturePhase::Prefill,
+            0,
+            None,
+            None,
+            2,
+            [0, 2],
+            4,
+            funding.clone(),
+        )
+        .unwrap();
+        for row in locations().rows {
+            rows.push_row(row).unwrap();
+        }
+        let prepared = rows.finish().unwrap();
+        assert_eq!(prepared.indices(), ordinary.indices);
+        assert_eq!(prepared.action(), ordinary.action.as_ref());
+        assert_eq!(prepared.coordinates(), (index, CapturePhase::Prefill, 0));
         assert!(prepared.source().same_source(&source));
-        assert!(host_pool.used_bytes().unwrap()-before<=bound);
+        assert!(host_pool.payload_used_bytes().unwrap() - before <= bound);
         escaped.push(prepared);
     }
-    let mut bad=PreparedRoutedInterventionRows::prepare(&source,0,CapturePhase::Prefill,0,
-        None,None,2,[0,2],4,funding.clone()).unwrap();
-    let mut row=locations().rows[0];row.token=2;
+    let mut bad = PreparedRoutedInterventionRows::prepare(
+        &source,
+        0,
+        CapturePhase::Prefill,
+        0,
+        None,
+        None,
+        2,
+        [0, 2],
+        4,
+        funding.clone(),
+    )
+    .unwrap();
+    let mut row = locations().rows[0];
+    row.token = 2;
     assert!(bad.push_row(row).is_err());
-    assert!(bad.push_row(locations().rows[0]).is_err(),"a failed writer cannot be retried");
-    let failed=bad.finish().unwrap_err();
-    let source_charge=source_pool.used_bytes().unwrap();
-    let host_charge=host_pool.used_bytes().unwrap();
-    assert!(source_charge>11 && host_charge>initial);
-    drop(source);drop(plan);drop(funding);drop(escaped);
-    assert_eq!(source_pool.used_bytes().unwrap(),source_charge);
-    assert_eq!(host_pool.used_bytes().unwrap(),host_charge);
+    assert!(
+        bad.push_row(locations().rows[0]).is_err(),
+        "a failed writer cannot be retried"
+    );
+    let failed = bad.finish().unwrap_err();
+    let source_charge = source_pool.payload_used_bytes().unwrap();
+    let host_charge = host_pool.payload_used_bytes().unwrap();
+    assert!(source_charge > 11 && host_charge > initial);
+    drop(source);
+    drop(plan);
+    drop(funding);
+    drop(escaped);
+    assert_eq!(source_pool.payload_used_bytes().unwrap(), source_charge);
+    assert_eq!(host_pool.payload_used_bytes().unwrap(), host_charge);
     drop(failed);
-    assert_eq!(source_pool.used_bytes().unwrap(),11);
-    assert_eq!(host_pool.used_bytes().unwrap(),17);
+    assert_eq!(source_pool.payload_used_bytes().unwrap(), 11);
+    assert_eq!(host_pool.payload_used_bytes().unwrap(), 17);
 
     // The same immutable source can be retained by a refused second allocation.
-    let (_,plan)=plans_for(vec![mask(vec![3],false)]);
-    let source=source_pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&plan).unwrap()).unwrap();
-    let capacity=initial+PreparedRoutedInterventionRows::control_bytes().unwrap() as u64
+    let (_, plan) = plans_for(vec![mask(vec![3], false)]);
+    let source = source_pool
+        .compile_intervention_source(PreparedInterventionPlanCopy::inspect(&plan).unwrap())
+        .unwrap();
+    let capacity = initial
+        + PreparedRoutedInterventionRows::control_bytes().unwrap() as u64
         + WorkspaceContext::metadata_vec_bytes::<u64>(2).unwrap() as u64;
-    let partial=WorkingMemoryPool::new(capacity,17).unwrap();
-    let funding=partial.prepare_workspace_metadata(&execution,capacity).unwrap();
-    assert_eq!(partial.used_bytes().unwrap(),initial);
-    let failure=PreparedRoutedInterventionRows::prepare(&source,0,CapturePhase::Prefill,0,
-        None,None,2,[0,2],4,funding).unwrap_err();
-    assert_eq!(partial.used_bytes().unwrap(),capacity);
-    drop(source);drop(plan);
-    assert!(source_pool.used_bytes().unwrap()>11);
+    let partial = crate::working_memory::memory_fixture::host_ledger(capacity, 17).unwrap();
+    let funding = partial
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&partial, capacity),
+        )
+        .unwrap();
+    assert_eq!(partial.payload_used_bytes().unwrap(), initial);
+    let failure = PreparedRoutedInterventionRows::prepare(
+        &source,
+        0,
+        CapturePhase::Prefill,
+        0,
+        None,
+        None,
+        2,
+        [0, 2],
+        4,
+        funding,
+    )
+    .unwrap_err();
+    assert_eq!(partial.payload_used_bytes().unwrap(), capacity);
+    drop(source);
+    drop(plan);
+    assert!(source_pool.payload_used_bytes().unwrap() > 11);
     drop(failure);
-    assert_eq!(partial.used_bytes().unwrap(),17);
-    assert_eq!(source_pool.used_bytes().unwrap(),11);
+    assert_eq!(partial.payload_used_bytes().unwrap(), 17);
+    assert_eq!(source_pool.payload_used_bytes().unwrap(), 11);
 }
 
 #[test]

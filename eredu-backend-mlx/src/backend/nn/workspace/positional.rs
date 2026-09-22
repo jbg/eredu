@@ -40,13 +40,7 @@ pub(super) fn emit(
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     match &op.kind {
-        WorkspaceOperationKindView::RelativeAttention {
-            ..
-        } => relative(
-            op,
-            a,
-            sink,
-        ),
+        WorkspaceOperationKindView::RelativeAttention { .. } => relative(op, a, sink),
         WorkspaceOperationKindView::MultiAxisRotary(spec)
         | WorkspaceOperationKindView::PreparedMultiAxisRotary(spec) => rotary(op, a, *spec, sink),
         _ => Ok(None),
@@ -64,11 +58,19 @@ pub(super) struct RelativeGeometry {
 
 /// Same fixed descriptor validation feeds physical buffers and native graph
 /// construction. A valid but unqualified dtype remains an explicit absence.
-pub(super) fn relative_geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<RelativeGeometry>> {
+pub(super) fn relative_geometry(
+    op: WorkspaceOperationView<'_>,
+) -> FactResult<Option<RelativeGeometry>> {
     let WorkspaceOperationKindView::RelativeAttention {
-        query_offset: qo, key_offset: ko, window,
-        log_scaling_floor: floor, log_scaling_alpha: alpha,
-    } = op.kind else { return Ok(None); };
+        query_offset: qo,
+        key_offset: ko,
+        window,
+        log_scaling_floor: floor,
+        log_scaling_alpha: alpha,
+    } = op.kind
+    else {
+        return Ok(None);
+    };
     if op.inputs.len() != 4 || op.outputs.len() != 1 {
         return Err(invalid());
     }
@@ -118,7 +120,9 @@ fn relative(
     a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
-    let Some(g) = relative_geometry(op)? else { return Ok(None); };
+    let Some(g) = relative_geometry(op)? else {
+        return Ok(None);
+    };
     let q = &g.q;
     let k = &g.k;
     let [b, h, n, d] = g.q;
@@ -148,6 +152,10 @@ fn relative(
             )?,
         )?;
     }
+    // Outer causal zero, five bias clip/validity/fill sources, query
+    // scale and masked negative infinity; optional window and log-scale seeds.
+    let sources = 8 + usize::from(g.windowed) + 5 * usize::from(g.scaled);
+    sink.default_scratch(mul(u64::try_from(sources)?, scalar)?, sources)?;
     let scaled = g.scaled;
     if scaled {
         // I32 positions/add, F32 cast/divide/max/log/multiply/add, reshape, five
@@ -186,20 +194,29 @@ fn relative(
 /// The native worker casts positions to F32, multiplies stored F32
 /// frequencies, and applies cosine/sine before reshaping. Reuse its exact
 /// geometry validation; this scalar fact grants no allocation or submission.
-pub(super) fn rotary_representation(op: WorkspaceOperationView<'_>, output: usize)
-    -> Option<WorkspaceRepresentation> {
+pub(super) fn rotary_representation(
+    op: WorkspaceOperationView<'_>,
+    output: usize,
+) -> Option<WorkspaceRepresentation> {
     let spec = match op.kind {
         WorkspaceOperationKindView::MultiAxisRotary(spec)
         | WorkspaceOperationKindView::PreparedMultiAxisRotary(spec) => spec,
         _ => return None,
     };
-    if output >= 2 { return None; }
+    if output >= 2 {
+        return None;
+    }
     rotary_geometry(op, spec).ok()??;
-    Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false))
+    Some(WorkspaceRepresentation::new(
+        WorkspaceFloatingType::Float32,
+        false,
+    ))
 }
 
-fn rotary_geometry(op: WorkspaceOperationView<'_>, spec: MultiAxisRotarySpecRef<'_>)
-    -> FactResult<Option<(u64, i32)>> {
+fn rotary_geometry(
+    op: WorkspaceOperationView<'_>,
+    spec: MultiAxisRotarySpecRef<'_>,
+) -> FactResult<Option<(u64, i32)>> {
     let dimensions = spec.dimensions()?;
     if op.inputs.len() != 1 || op.outputs.len() != 2 {
         return Err(invalid());
@@ -236,7 +253,9 @@ fn rotary(
     spec: MultiAxisRotarySpecRef<'_>,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
-    let Some((rows, dimensions)) = rotary_geometry(op, spec)? else { return Ok(None); };
+    let Some((rows, dimensions)) = rotary_geometry(op, spec)? else {
+        return Ok(None);
+    };
     let input = op.inputs.get(0).expect("validated rotary geometry");
     let full = capacity(a, mul(rows, dimensions as u64)?)?;
     let half = dimensions as u64 / 2;
@@ -246,10 +265,23 @@ fn rotary(
     // saturate via I64 add/min/max; U32 needs fewer operations and is bounded by
     // the same envelope. Include all native integer endpoint scalars.
     let column = add(mul(5, wide(a, rows)?)?, mul(4, wide(a, 1)?)?)?;
+    // Signed coordinates upload offset, both saturation endpoints and minimum;
+    // U32 coordinates widen to I64 but omit the signed saturation endpoints.
+    let column_sources = if input.dtype() == WorkspaceDtype::Int32 {
+        4
+    } else {
+        2
+    };
     match spec.layout {
         MultiAxisRotaryLayout::IndependentAxes | MultiAxisRotaryLayout::SplitHalves => {
             for axis in spec.axes {
                 let frequencies = axis.dimensions as u64 / 2;
+                sink.default_scratch(
+                    add(mul(column_sources, wide(a, 1)?)?, capacity(a, frequencies)?)?,
+                    usize::try_from(column_sources)?
+                        .checked_add(1)
+                        .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+                )?;
                 total = add(total, add(column, capacity(a, rows)?)?)?;
                 // From-slice host/shared native storage and its stream copy;
                 // the Rust frequency vector is a distinct host bound below.
@@ -264,6 +296,13 @@ fn rotary(
             }
         }
         MultiAxisRotaryLayout::RoundRobinSections => {
+            let sources = mul(half, column_sources)?;
+            sink.default_scratch(
+                add(mul(sources, wide(a, 1)?)?, capacity(a, half)?)?,
+                usize::try_from(sources)?
+                    .checked_add(1)
+                    .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+            )?;
             // Only the selected integer column graph is constructed per global
             // frequency; unused independent-axis frequency graphs are omitted.
             total = add(total, mul(half, column)?)?;

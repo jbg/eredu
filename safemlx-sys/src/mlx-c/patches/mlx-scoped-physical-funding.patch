@@ -1,0 +1,256 @@
+diff -ruN before/mlx/physical_backing.cpp after/mlx/physical_backing.cpp
+--- before/mlx/physical_backing.cpp	2026-09-21 18:13:08
++++ after/mlx/physical_backing.cpp	2026-09-21 18:13:08
+@@ -2,6 +2,7 @@
+ #include "mlx/host_transfer.h"
+ #include "mlx/allocator.h"
+ #include "mlx/array.h"
++#include "mlx/physical_funding.h"
+ #include <mutex>
+ #include <memory>
+ 
+@@ -43,7 +44,10 @@
+   void* payload = nullptr;
+   void (*release)(void*) = nullptr;
+   PhysicalBackingPublish publish = nullptr;
+-  if (observer && !observer(observer_context, identity, capacity, controls, placement, &payload, &release, &publish))
++  const auto scoped = submission::current_physical_observer();
++  const auto selected = scoped.callback ? scoped.callback : observer;
++  void* selected_context = scoped.callback ? scoped.context : observer_context;
++  if (selected && !selected(selected_context, identity, capacity, controls, placement, &payload, &release, &publish))
+     throw PhysicalBackingAdmissionError(payload, release);
+   PhysicalBacking* root = nullptr;
+   try { root = new PhysicalBacking(identity, capacity, controls, placement); }
+diff -ruN before/mlx/physical_funding.h after/mlx/physical_funding.h
+--- before/mlx/physical_funding.h	1970-01-01 01:00:00
++++ after/mlx/physical_funding.h	2026-09-21 18:13:08
+@@ -0,0 +1,36 @@
++// Copyright © 2026 Eredu contributors.
++#pragma once
++#include "mlx/api.h"
++#include "mlx/allocator.h"
++namespace mlx::core::submission {
++class Scope;
++// Retains only an actual configured scope; no allocator or execution authority
++// can be constructed from a stream, identity, or byte count.
++class MLX_API PhysicalFundingRef final {
++ public:
++  PhysicalFundingRef() noexcept = default;
++  PhysicalFundingRef(const PhysicalFundingRef&) noexcept;
++  PhysicalFundingRef(PhysicalFundingRef&&) noexcept;
++  PhysicalFundingRef& operator=(PhysicalFundingRef) noexcept;
++  ~PhysicalFundingRef();
++  Scope* get() const noexcept { return scope_; }
++ private:
++  friend PhysicalFundingRef current_physical_funding() noexcept;
++  explicit PhysicalFundingRef(Scope*) noexcept;
++  Scope* scope_{nullptr};
++};
++MLX_API PhysicalFundingRef current_physical_funding() noexcept;
++struct PhysicalFundingObserver {
++  void* context{nullptr};
++  allocator::PhysicalBackingObserver callback{nullptr};
++};
++MLX_API PhysicalFundingObserver current_physical_observer() noexcept;
++class MLX_API PhysicalFundingWorkerGuard final {
++ public:
++  explicit PhysicalFundingWorkerGuard(const PhysicalFundingRef&) noexcept;
++  ~PhysicalFundingWorkerGuard();
++  PhysicalFundingWorkerGuard(const PhysicalFundingWorkerGuard&) = delete;
++ private:
++  Scope* previous_;
++};
++} // namespace mlx::core::submission
+diff -ruN before/mlx/scheduler.h after/mlx/scheduler.h
+--- before/mlx/scheduler.h	2026-09-21 18:13:08
++++ after/mlx/scheduler.h	2026-09-21 18:13:08
+@@ -183,6 +183,8 @@
+       try {
+         // The local binding outlives the full callable/header retirement. Only
+         // the actual accepted Task can install its allocation-only context.
++        auto physical_funding = selected->physical_funding;
++        submission::PhysicalFundingWorkerGuard physical(physical_funding);
+         auto buffers = selected->buffers;
+         submission::BufferWorkerGuard allocation(buffers, failure.get());
+         try { selected->invoke(selected); }
+diff -ruN before/mlx/scheduler_task.h after/mlx/scheduler_task.h
+--- before/mlx/scheduler_task.h	2026-09-21 18:13:08
++++ after/mlx/scheduler_task.h	2026-09-21 18:13:08
+@@ -5,6 +5,7 @@
+ #include "mlx/failure.h"
+ #include "mlx/graph_quota.h"
+ #include "mlx/original_buffer.h"
++#include "mlx/physical_funding.h"
+ 
+ namespace mlx::core::scheduler {
+ class MLX_API Scheduler;
+@@ -18,6 +19,7 @@
+   submission::GraphQuotaRef graph;
+   FailureCarrierRef failure;
+   allocator::OriginalBufferBinding buffers;
++  submission::PhysicalFundingRef physical_funding;
+   Scheduler* scheduler;
+   bool counted;
+ 
+@@ -26,7 +28,7 @@
+        Scheduler* scheduler, bool counted,
+        const allocator::OriginalBufferBinding& buffers) noexcept
+       : invoke(call), destroy(drop), graph(arena), failure(std::move(owner)),
+-        buffers(buffers), scheduler(scheduler), counted(counted) {}
++        buffers(buffers), physical_funding(submission::current_physical_funding()), scheduler(scheduler), counted(counted) {}
+ };
+ 
+ class TaskOwner {
+@@ -55,6 +57,7 @@
+                // destruction and block return, even on the final task alias.
+                submission::GraphAllocator<TaskNode> allocator(node->graph.get());
+                auto buffers = node->buffers;
++               auto physical_funding = node->physical_funding;
+                node->~TaskNode();
+                allocator.deallocate(node, 1);
+              }, graph, std::move(failure), scheduler, counted, buffers),
+diff -ruN before/mlx/submission.cpp after/mlx/submission.cpp
+--- before/mlx/submission.cpp	2026-09-21 18:13:08
++++ after/mlx/submission.cpp	2026-09-21 18:13:08
+@@ -10,6 +10,7 @@
+ namespace mlx::core::submission {
+ namespace {
+ thread_local Scope* active_scope = nullptr;
++thread_local Scope* physical_worker_scope = nullptr;
+ thread_local const GraphWorkerAllocationLoan* active_graph_worker = nullptr;
+ thread_local Record* active_capture = nullptr;
+ thread_local Record* active_dispatch = nullptr;
+@@ -124,7 +125,7 @@
+   const size_t module = sizeof(registry_owner) + sizeof(next_scope_identity) +
+       sizeof(next_owner_identity);
+   const size_t thread = sizeof(active_scope) + sizeof(active_capture) +
+-      sizeof(active_dispatch) + sizeof(active_buffer_worker) +
++      sizeof(physical_worker_scope) + sizeof(active_dispatch) + sizeof(active_buffer_worker) +
+       sizeof(active_buffer_worker_failure) + sizeof(owner_identity);
+ #if MLX_CONSTANT_SUBMISSION_REGISTRY
+   return {module + sizeof(static_registry), thread, 0, true};
+@@ -207,6 +208,8 @@
+   allocator::OriginalBufferBudget* buffer_budget;
+   void* owner;
+   void (*retire)(void*);
++  void* physical_context;
++  void (*physical_release)(void*);
+ };
+ } // namespace
+ 
+@@ -224,7 +227,7 @@
+ 
+ void Scope::release() noexcept {
+   if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+-    const ScopeRetirement retirement{std::move(failure_), parent_, quota_, graph_, buffer_budget_, retained_owner_, retire_owner_};
++    const ScopeRetirement retirement{std::move(failure_), parent_, quota_, graph_, buffer_budget_, retained_owner_, retire_owner_, physical_context_, physical_release_};
+     parent_ = nullptr;
+     quota_ = nullptr;
+     graph_ = nullptr;
+@@ -232,6 +235,7 @@
+     retained_owner_ = nullptr;
+     retire_owner_ = nullptr;
+     delete this;
++    if (retirement.physical_release) retirement.physical_release(retirement.physical_context);
+     // Child storage is gone before an ancestor can release its own custody.
+     if (retirement.parent) {
+       retirement.parent->release();
+@@ -246,6 +250,49 @@
+     }
+   }
+ }
++
++bool Scope::bind_physical_observer(void* context, allocator::PhysicalBackingObserver callback,
++    void (*release)(void*)) noexcept {
++  if (!context || !callback || !release || active_scope != this || !active_ ||
++      !on_owner_thread() || original_required_ || physical_callback_ ||
++      native_construction_started_ || activity_.load(std::memory_order_acquire) ||
++      pending_records_.load(std::memory_order_acquire)) return false;
++  physical_context_ = context;
++  physical_callback_ = callback;
++  physical_release_ = release;
++  return true;
++}
++PhysicalFundingObserver Scope::physical_observer() const noexcept {
++  for (auto* scope = this; scope; scope = scope->parent_) {
++    if (scope->physical_callback_) return {scope->physical_context_, scope->physical_callback_};
++  }
++  return {};
++}
++PhysicalFundingRef::PhysicalFundingRef(Scope* value) noexcept : scope_(value) {
++  if (scope_) scope_->retain();
++}
++PhysicalFundingRef::PhysicalFundingRef(const PhysicalFundingRef& other) noexcept
++    : PhysicalFundingRef(other.scope_) {}
++PhysicalFundingRef::PhysicalFundingRef(PhysicalFundingRef&& other) noexcept
++    : scope_(std::exchange(other.scope_, nullptr)) {}
++PhysicalFundingRef& PhysicalFundingRef::operator=(PhysicalFundingRef other) noexcept {
++  std::swap(scope_, other.scope_); return *this;
++}
++PhysicalFundingRef::~PhysicalFundingRef() { if (scope_) scope_->release(); }
++PhysicalFundingRef current_physical_funding() noexcept {
++  auto* scope = physical_worker_scope ? physical_worker_scope :
++      (active_dispatch ? active_dispatch->scope_ : active_scope);
++  if (!scope || !scope->physical_observer().callback) return {};
++  return PhysicalFundingRef(scope);
++}
++PhysicalFundingObserver current_physical_observer() noexcept {
++  auto* scope = physical_worker_scope ? physical_worker_scope :
++      (active_dispatch ? active_dispatch->scope_ : active_scope);
++  return scope ? scope->physical_observer() : PhysicalFundingObserver{};
++}
++PhysicalFundingWorkerGuard::PhysicalFundingWorkerGuard(const PhysicalFundingRef& funding) noexcept
++    : previous_(physical_worker_scope) { physical_worker_scope = funding.get(); }
++PhysicalFundingWorkerGuard::~PhysicalFundingWorkerGuard() { physical_worker_scope = previous_; }
+ 
+ void Scope::seal() noexcept {
+   if (!active_) {
+diff -ruN before/mlx/submission.h after/mlx/submission.h
+--- before/mlx/submission.h	2026-09-21 18:13:08
++++ after/mlx/submission.h	2026-09-21 18:13:08
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "mlx/physical_funding.h"
+ 
+ #include <atomic>
+ #include <cstdint>
+@@ -101,6 +102,10 @@
+   allocator::OriginalBufferBudget* original_buffer_budget() const noexcept { return buffer_budget_; }
+   bool original_buffer_required() const noexcept { return required_buffer_origin_ != nullptr; }
+ 
++  // Configure once on the empty current ordinary scope. Owner release follows
++  // destruction of the native Scope, and precedes its enclosing retirement.
++  bool bind_physical_observer(void*, allocator::PhysicalBackingObserver, void (*)(void*)) noexcept;
++  PhysicalFundingObserver physical_observer() const noexcept;
+   uint64_t identity() const noexcept { return identity_; }
+   ScopedProgress progress_scoped() noexcept;
+   // A retained observation of the actual configured current role. It neither
+@@ -119,6 +124,9 @@
+ 
+  private:
+   friend class Record;
++  friend class PhysicalFundingRef;
++  friend PhysicalFundingRef current_physical_funding() noexcept;
++  friend PhysicalFundingObserver current_physical_observer() noexcept;
+   friend void mark_native_control_construction() noexcept;
+   Scope(void*, void (*)(void*), RecordQuota*, GraphQuota*, Scope* expected_parent);
+   ~Scope();
+@@ -155,6 +163,9 @@
+   allocator::OriginalBufferBudget* buffer_budget_{nullptr};
+   // Borrowed through retained parent ancestry, or this Scope's own budget.
+   allocator::OriginalBufferBudget* required_buffer_origin_{nullptr};
++  void* physical_context_{nullptr};
++  allocator::PhysicalBackingObserver physical_callback_{nullptr};
++  void (*physical_release_)(void*){nullptr};
+   void* retained_owner_{nullptr};
+   void (*retire_owner_)(void*){nullptr};
+ };
+@@ -354,6 +365,8 @@
+  private:
+   friend class Scope;
+   friend class RecordDispatchGuard;
++  friend PhysicalFundingRef current_physical_funding() noexcept;
++  friend PhysicalFundingObserver current_physical_observer() noexcept;
+   friend class FixedEvalPrologueGuard;
+   friend bool fixed_gpu_eval_prologue_required() noexcept;
+   friend GraphConstructionContext current_graph_construction_context() noexcept;

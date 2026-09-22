@@ -1,8 +1,8 @@
 //! Prepaid bounded receipt transport with a final all-rank delivery decision.
 use super::*;
 use eredu_core::{
-    consensus::BoundedConsensusTransport, BackendFailure, BoundedCompletion, BoundedCompletionWait,
-    BoundedSubmissionOutcome, Completion, CompletionCancellationMode,
+    BackendFailure, BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Completion,
+    CompletionCancellationMode, consensus::BoundedConsensusTransport,
 };
 
 mod delivery;
@@ -28,21 +28,34 @@ pub trait PartitionCaptureTransport: BoundedConsensusTransport {
     fn estimate_capture_gather(&self, local_words: usize) -> Result<CaptureUsage, CaptureError>;
     /// Allocate the actual payload writer before encoding. Original adapters
     /// override this with the retained metadata account; ordinary storage is unchanged.
-    fn capture_word_destination(&self, capacity: usize)
-        -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError> {
-        Ok(PartitionCaptureBuffer::ordinary(Vec::with_capacity(capacity)))
+    fn capture_word_destination(
+        &self,
+        capacity: usize,
+    ) -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError> {
+        Ok(PartitionCaptureBuffer::ordinary(Vec::with_capacity(
+            capacity,
+        )))
     }
     /// Allocate the actual receipt decoder's byte scratch before reconstruction.
-    fn capture_byte_destination(&self, capacity: usize)
-        -> Result<PartitionCaptureBuffer<u8>, PartitionCaptureExchangeError> {
-        Ok(PartitionCaptureBuffer::ordinary(Vec::with_capacity(capacity)))
+    fn capture_byte_destination(
+        &self,
+        capacity: usize,
+    ) -> Result<PartitionCaptureBuffer<u8>, PartitionCaptureExchangeError> {
+        Ok(PartitionCaptureBuffer::ordinary(Vec::with_capacity(
+            capacity,
+        )))
     }
     /// Execute one exact shared protocol frame. Original adapters use their
     /// explicitly lent request source and independent authenticated child role.
     /// The default keeps the ordinary bounded submission/completion worker.
-    fn gather_capture_frame(&self, frame: &PartitionCaptureFrame<'_>, wait: BoundedCompletionWait)
-        -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError>
-    where Self: Sized, Self::Error: Send + Sync + 'static,
+    fn gather_capture_frame(
+        &self,
+        frame: &PartitionCaptureFrame<'_>,
+        wait: BoundedCompletionWait,
+    ) -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError>
+    where
+        Self: Sized,
+        Self::Error: Send + Sync + 'static,
         <Self::Completion as Completion>::Error: Send + Sync + 'static,
     {
         ordinary_gather_capture_words(self, wait, frame)
@@ -155,7 +168,9 @@ where
     pub(super) fn transport(&self) -> &'a T {
         self.transport
     }
-    pub(crate) const fn local_rank(&self) -> usize { self.rank }
+    pub(crate) const fn local_rank(&self) -> usize {
+        self.rank
+    }
     /// Reserves both control rounds and the largest allowed payload gather before
     /// native work. Credits cannot be refunded, cloned, or consumed a second time.
     /// Decoding and assembly retain their ordinary separate ledger reservations;
@@ -235,19 +250,32 @@ where
     pub(crate) fn take_hook_receipt(&mut self) -> Option<PartitionCaptureReceiptPlan> {
         self.receipt.take()
     }
-    pub(crate) fn restore_hook_receipt(&mut self, receipt: PartitionCaptureReceiptPlan)
-        -> Result<(), PartitionCaptureReceiptPlan> {
-        if self.receipt.is_some() || receipt.world_size()!=self.participants
-            || word_count(receipt.max_record_bytes()).ok()!=Some(self.payload_words)
-            || receipt.identity().len()!=64 {
+    pub(crate) fn restore_hook_receipt(
+        &mut self,
+        receipt: PartitionCaptureReceiptPlan,
+    ) -> Result<(), PartitionCaptureReceiptPlan> {
+        if self.receipt.is_some()
+            || receipt.world_size() != self.participants
+            || word_count(receipt.max_record_bytes()).ok() != Some(self.payload_words)
+            || receipt.identity().len() != 64
+        {
             return Err(receipt);
         }
         // The same exact SHA-256 words that admitted all protocol frames.
-        for (expected,bytes) in self.digest.iter().zip(receipt.identity().as_bytes().chunks_exact(8)) {
-            let actual=std::str::from_utf8(bytes).ok().and_then(|text|u32::from_str_radix(text,16).ok());
-            if actual!=Some(*expected){return Err(receipt);}
+        for (expected, bytes) in self
+            .digest
+            .iter()
+            .zip(receipt.identity().as_bytes().chunks_exact(8))
+        {
+            let actual = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|text| u32::from_str_radix(text, 16).ok());
+            if actual != Some(*expected) {
+                return Err(receipt);
+            }
         }
-        self.receipt=Some(receipt);Ok(())
+        self.receipt = Some(receipt);
+        Ok(())
     }
 
     /// Nonrefundable transport reservation, separate from producer/decode charges.
@@ -265,8 +293,10 @@ where
         local: Result<Option<Vec<u8>>, PartitionCaptureExchangeError>,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<ReceivedPartitionCapture, PartitionCaptureExchangeError> {
-        self.exchange_into(local.map(|bytes|bytes.map(PartitionCaptureBuffer::ordinary)),
-            delivery::OrdinaryDecoder { ledger })
+        self.exchange_into(
+            local.map(|bytes| bytes.map(PartitionCaptureBuffer::ordinary)),
+            delivery::OrdinaryDecoder { ledger },
+        )
     }
 
     /// Same protocol worker for a closed original destination. Decoder controls
@@ -340,7 +370,7 @@ where
                 _ => {
                     return Err(PartitionCaptureExchangeError::Protocol(
                         "producer readiness or byte bound",
-                    ))
+                    ));
                 }
             }
         }
@@ -363,9 +393,18 @@ where
             }
         }
         let received = self.gather(PartitionCaptureFrameKind::Payload, &payload)?;
-        let receipt = self.receipt.take().expect("one exchange consumes its receipt once");
-        let payload = PartitionCapturePayload::new(self.transport, &gathered, &received, width,
-            self.rank, local.as_deref());
+        let receipt = self
+            .receipt
+            .take()
+            .expect("one exchange consumes its receipt once");
+        let payload = PartitionCapturePayload::new(
+            self.transport,
+            &gathered,
+            &received,
+            width,
+            self.rank,
+            local.as_deref(),
+        );
         let result = decoder.decode(receipt, payload);
         // Credits were reserved before any producer work or parser reservation;
         // even an exhausted ledger can participate in this final decision.
@@ -411,72 +450,119 @@ where
     }
 
     fn header(&self, phase: u32, status: u32, length: u64) -> [u32; HEADER_WORDS] {
-        protocol_header(self.rank, self.participants, &self.digest, phase, status, length)
+        protocol_header(
+            self.rank,
+            self.participants,
+            &self.digest,
+            phase,
+            status,
+            length,
+        )
     }
 
-    fn validate_header(&self, frame: &[u32], rank: usize, phase: u32)
-        -> Result<(), PartitionCaptureExchangeError> {
+    fn validate_header(
+        &self,
+        frame: &[u32],
+        rank: usize,
+        phase: u32,
+    ) -> Result<(), PartitionCaptureExchangeError> {
         validate_protocol_header(frame, rank, self.participants, &self.digest, phase)
     }
 
-    fn gather(&self, kind: PartitionCaptureFrameKind, words: &[u32])
-        -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError> {
-        let maximum = if kind == PartitionCaptureFrameKind::Payload { self.payload_words } else { HEADER_WORDS };
+    fn gather(
+        &self,
+        kind: PartitionCaptureFrameKind,
+        words: &[u32],
+    ) -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError> {
+        let maximum = if kind == PartitionCaptureFrameKind::Payload {
+            self.payload_words
+        } else {
+            HEADER_WORDS
+        };
         let frame = PartitionCaptureFrame::new(kind, self.rank, self.participants, words, maximum)?;
         gather_capture_words(self.transport, self.wait, &frame)
     }
 }
 
 // One canonical writer/validator for fixed receipt and producer-source frames.
-pub(super) fn protocol_header(rank: usize, participants: usize, digest: &[u32; 8],
-    phase: u32, status: u32, length: u64) -> [u32; HEADER_WORDS] {
+pub(super) fn protocol_header(
+    rank: usize,
+    participants: usize,
+    digest: &[u32; 8],
+    phase: u32,
+    status: u32,
+    length: u64,
+) -> [u32; HEADER_WORDS] {
     let mut words = [0; HEADER_WORDS];
     words[..5].copy_from_slice(&[MAGIC, VERSION, phase, rank as u32, participants as u32]);
     words[5..13].copy_from_slice(digest);
     words[13..].copy_from_slice(&[status, length as u32, (length >> 32) as u32]);
     words
 }
-pub(super) fn validate_protocol_header(frame: &[u32], rank: usize, participants: usize,
-    digest: &[u32; 8], phase: u32) -> Result<(), PartitionCaptureExchangeError> {
+pub(super) fn validate_protocol_header(
+    frame: &[u32],
+    rank: usize,
+    participants: usize,
+    digest: &[u32; 8],
+    phase: u32,
+) -> Result<(), PartitionCaptureExchangeError> {
     if frame.len() != HEADER_WORDS
         || frame[..5] != [MAGIC, VERSION, phase, rank as u32, participants as u32]
-        || frame[5..13] != *digest {
-        return Err(PartitionCaptureExchangeError::Protocol("receipt identity, phase, or sender"));
+        || frame[5..13] != *digest
+    {
+        return Err(PartitionCaptureExchangeError::Protocol(
+            "receipt identity, phase, or sender",
+        ));
     }
     Ok(())
 }
 
 pub(super) fn gather_capture_words<T: PartitionCaptureTransport>(
-    transport: &T, wait: BoundedCompletionWait, frame: &PartitionCaptureFrame<'_>,
+    transport: &T,
+    wait: BoundedCompletionWait,
+    frame: &PartitionCaptureFrame<'_>,
 ) -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError>
-where T::Error: Send + Sync + 'static,
+where
+    T::Error: Send + Sync + 'static,
     <T::Completion as Completion>::Error: Send + Sync + 'static,
 {
     let gathered = transport.gather_capture_frame(frame, wait)?;
     if gathered.len() != frame.gathered_words() {
-        return Err(PartitionCaptureExchangeError::Protocol("rank-major gather length"));
+        return Err(PartitionCaptureExchangeError::Protocol(
+            "rank-major gather length",
+        ));
     }
     Ok(gathered)
 }
 
 fn ordinary_gather_capture_words<T: PartitionCaptureTransport>(
-    transport: &T, wait: BoundedCompletionWait, frame: &PartitionCaptureFrame<'_>,
+    transport: &T,
+    wait: BoundedCompletionWait,
+    frame: &PartitionCaptureFrame<'_>,
 ) -> Result<PartitionCaptureBuffer<u32>, PartitionCaptureExchangeError>
-where T::Error: Send + Sync + 'static,
+where
+    T::Error: Send + Sync + 'static,
     <T::Completion as Completion>::Error: Send + Sync + 'static,
 {
-    let submission = transport.submit_all_gather_words(frame.words()).map_err(BackendFailure::from_error)?;
-    let output = match submission.wait_bounded(wait).map_err(BackendFailure::from_error)? {
+    let submission = transport
+        .submit_all_gather_words(frame.words())
+        .map_err(BackendFailure::from_error)?;
+    let output = match submission
+        .wait_bounded(wait)
+        .map_err(BackendFailure::from_error)?
+    {
         BoundedSubmissionOutcome::Completed(output) => output,
         BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
-            return Err(PartitionCaptureExchangeError::Deadline { cancellation })
+            return Err(PartitionCaptureExchangeError::Deadline { cancellation });
         }
     };
-    let gathered = transport.resolve_all_gather_words(output).map_err(BackendFailure::from_error)?;
+    let gathered = transport
+        .resolve_all_gather_words(output)
+        .map_err(BackendFailure::from_error)?;
     Ok(PartitionCaptureBuffer::ordinary(gathered))
 }
 
-fn word_count(bytes: u64) -> Result<usize, CaptureError> {
+pub(super) fn word_count(bytes: u64) -> Result<usize, CaptureError> {
     usize::try_from(add(bytes, 3)? / 4).map_err(|_| CaptureError::Overflow)
 }
 

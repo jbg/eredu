@@ -2,12 +2,10 @@
 use super::{
     PreparedInputInspector, PreparedInputPart, PreparedModelInput, PreparedModelInputOwner,
 };
-use crate::working_memory::{PreparedInputHostCustody, WorkingMemoryError, WorkingMemoryPool};
+use crate::working_memory::{MemoryLedger, PreparedInputHostCustody, WorkingMemoryError};
 use eredu_nn::{
+    workspace::{HostMetadataFunding, WorkspaceBorrowedStorage, WorkspaceContext, WorkspaceTensor},
     Error, Tensor,
-    workspace::{
-        WorkspaceBorrowedStorage, WorkspaceContext, HostMetadataFunding, WorkspaceTensor,
-    },
 };
 use std::mem::{size_of, size_of_val};
 
@@ -83,7 +81,7 @@ impl OriginalPreparedWorkspaceSource {
         self.roots.as_ref()
     }
     /// The B account's actual pool; no registry entry or second charge is created.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    pub fn pool(&self) -> &MemoryLedger {
         self.custody.pool()
     }
     pub(crate) fn account_pin(&self) -> PreparedInputHostCustody {
@@ -128,11 +126,16 @@ impl<T: PreparedMediaWorkspaceTensor> PreparedModelInputOwner<T> {
     /// Metadata slots and other parts are not credited to this payload loan.
     /// The source witness retains the same complete original B account.
     pub fn project_payload_with_metadata<'a>(
-        &'a self, index: usize, context: &'a WorkspaceContext,
+        &'a self,
+        index: usize,
+        context: &'a WorkspaceContext,
     ) -> Result<(WorkspaceTensor, OriginalPreparedWorkspaceSource), Error> {
-        let custody = self.workspace_custody()
+        let custody = self
+            .workspace_custody()
             .ok_or_else(|| context.metadata_source(WorkingMemoryError::IdentityMismatch))?;
-        let part = self.parts().get(index)
+        let part = self
+            .parts()
+            .get(index)
             .ok_or_else(|| context.metadata_source(WorkingMemoryError::IdentityMismatch))?;
         context.charge_metadata(size_of::<(
             T::Projection<'a>,
@@ -148,12 +151,13 @@ impl<T: PreparedMediaWorkspaceTensor> PreparedModelInputOwner<T> {
             .value()
             .project_workspace_slot(&mut projection)?;
         let roots = T::finish_workspace_projection(projection, context)?;
-        if roots
-            .as_ref()
-            .is_none_or(|roots| roots.total_bytes() > custody.bytes())
-        {
-            return Err(context.metadata_source(WorkingMemoryError::IdentityMismatch));
-        }
+        validate_projected_requirements(
+            roots
+                .as_ref()
+                .ok_or_else(|| context.metadata_source(WorkingMemoryError::IdentityMismatch))?,
+            &custody,
+            context,
+        )?;
         Ok((
             value,
             OriginalPreparedWorkspaceSource {
@@ -227,11 +231,8 @@ impl<T: PreparedMediaWorkspaceTensor> PreparedModelInputOwner<T> {
             )));
         }
         let roots = T::finish_workspace_projection(projection, context)?;
-        if roots
-            .as_ref()
-            .is_some_and(|roots| roots.total_bytes() > custody.bytes())
-        {
-            return Err(context.metadata_source(WorkingMemoryError::IdentityMismatch));
+        if let Some(roots) = &roots {
+            validate_projected_requirements(roots, &custody, context)?;
         }
         Ok((
             prepared,
@@ -242,4 +243,27 @@ impl<T: PreparedMediaWorkspaceTensor> PreparedModelInputOwner<T> {
             },
         ))
     }
+}
+
+fn validate_projected_requirements(
+    roots: &WorkspaceBorrowedStorage,
+    custody: &PreparedInputHostCustody,
+    context: &WorkspaceContext,
+) -> Result<(), Error> {
+    let requirements = roots.requirements(context)?;
+    requirements
+        .validate(custody.pool().topology())
+        .map_err(|e| context.metadata_source(e))?;
+    for (domain, projected) in requirements.iter() {
+        let retained = custody
+            .requirements()
+            .get(domain)
+            .map_err(|e| context.metadata_source(e))?;
+        if projected.total().map_err(|e| context.metadata_source(e))?
+            > retained.total().map_err(|e| context.metadata_source(e))?
+        {
+            return Err(context.metadata_source(WorkingMemoryError::IdentityMismatch));
+        }
+    }
+    Ok(())
 }

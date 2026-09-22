@@ -6,8 +6,8 @@ use eredu_architectures::{
 };
 use eredu_core::{capture::*, speculative::*};
 use eredu_runtime::capture::{
-    partition::*, CaptureExecutionError, PartitionCaptureBackendProvider,
-    SpeculativeCaptureObserver,
+    CaptureExecutionError, PartitionCaptureBackendProvider, SpeculativeCaptureObserver,
+    partition::*,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -49,7 +49,10 @@ impl MlxModelSession {
     }
 }
 impl SpeculativePartitionBinding {
-    pub(in crate::composition::mlx) fn coordinate_speculative_step<B: AsRef<[eredu_core::SpeculativeScheduleState]> + AsMut<[eredu_core::SpeculativeScheduleState]>>(
+    pub(in crate::composition::mlx) fn coordinate_speculative_step<
+        B: AsRef<[eredu_core::SpeculativeScheduleState]>
+            + AsMut<[eredu_core::SpeculativeScheduleState]>,
+    >(
         &self,
         local: B,
     ) -> Result<B, eredu_core::BackendFailure> {
@@ -156,14 +159,25 @@ impl SpeculativePartitionBinding {
         >,
         SpeculativeControlError,
     > {
-        self.observer_with_error(plan,request,stream,
-            |error:&CaptureExecutionError<Error>|Exception::custom(error.to_string()))
+        self.observer_with_error(
+            plan,
+            request,
+            stream,
+            |error: &CaptureExecutionError<Error>| Exception::custom(error.to_string()),
+        )
     }
-    pub(in crate::composition::mlx) fn observer_with_error<E:'static,F>(
-        &self,plan:&AdmittedSpeculativeActivations,request:eredu_core::SpeculativeRequestId,
-        stream:&Stream,map_error:F,
-    )->Result<Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor,E>>>,SpeculativeControlError>
-    where F:eredu_runtime::capture::SpeculativeCaptureErrorTransport<Error,E>+'static,
+    pub(in crate::composition::mlx) fn observer_with_error<E: 'static, F>(
+        &self,
+        plan: &AdmittedSpeculativeActivations,
+        request: eredu_core::SpeculativeRequestId,
+        stream: &Stream,
+        map_error: F,
+    ) -> Result<
+        Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, E>>>,
+        SpeculativeControlError,
+    >
+    where
+        F: eredu_runtime::capture::SpeculativeCaptureErrorTransport<Error, E> + 'static,
     {
         if plan.is_empty() {
             return Ok(None);
@@ -205,12 +219,12 @@ impl SpeculativePartitionBinding {
         )?
         .map(|observer| {
             Box::new(observer)
-                as Box<
-                    dyn eredu_runtime::inspection::SpeculativeActivationObserver<
-                        MlxTensor,
-                        E,
-                    >,
-                >
+                as Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, E>>
         }))
     }
 }
+
+mod original;
+pub(in crate::composition::mlx) use original::{
+    OriginalModelPartitionPreparation, OriginalModelPartitionSource,
+};

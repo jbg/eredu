@@ -166,7 +166,11 @@ fn neural_factories_price_each_packed_companion_in_its_native_placeholder_dtype(
         // Ordinary mutable parameter replacement does not construct a new seed.
         struct Replace<'a>(&'a WorkspaceContext);
         impl<'a> crate::ParameterVisitorMut<'a, WorkspaceTensor> for Replace<'_> {
-            fn visit_mut(&mut self, _: crate::ParameterMetadataView<'_>, value: &'a mut WorkspaceTensor) {
+            fn visit_mut(
+                &mut self,
+                _: crate::ParameterMetadataView<'_>,
+                value: &'a mut WorkspaceTensor,
+            ) {
                 *value = WorkspaceTensor::existing(value.layout().clone(), self.0).unwrap();
             }
         }
@@ -255,16 +259,21 @@ fn named_unloaded_parameters_preserve_only_exact_retained_representation() {
     let context = context();
     let spec = slot("learned.scalar");
     let expected = WorkspaceRepresentation::new(WorkspaceFloatingType::Bfloat16, true);
-    context.install_parameter_representations(vec![
-        WorkspaceParameterRepresentation::new(
+    context
+        .install_parameter_representations(vec![WorkspaceParameterRepresentation::new(
             spec.id.clone(),
-            context.layout(&[1], WorkspaceDtype::Float32).unwrap()
+            context
+                .layout(&[1], WorkspaceDtype::Float32)
+                .unwrap()
                 .with_representation(Some(expected)),
-        ),
-    ]).unwrap();
-    let scalar = crate::Parameter::<WorkspaceTensor>::unloaded(spec.clone(), &[1], &context).unwrap();
-    let changed_shape = crate::Parameter::<WorkspaceTensor>::unloaded(spec, &[2], &context).unwrap();
-    let other = crate::Parameter::<WorkspaceTensor>::unloaded(slot("other.scalar"), &[1], &context).unwrap();
+        )])
+        .unwrap();
+    let scalar =
+        crate::Parameter::<WorkspaceTensor>::unloaded(spec.clone(), &[1], &context).unwrap();
+    let changed_shape =
+        crate::Parameter::<WorkspaceTensor>::unloaded(spec, &[2], &context).unwrap();
+    let other = crate::Parameter::<WorkspaceTensor>::unloaded(slot("other.scalar"), &[1], &context)
+        .unwrap();
     let anonymous = WorkspaceTensor::unloaded_f32(&[1], &context).unwrap();
     assert_eq!(scalar.as_ref().layout().representation(), Some(expected));
     assert_eq!(changed_shape.as_ref().layout().representation(), None);
@@ -276,31 +285,117 @@ fn named_unloaded_parameters_preserve_only_exact_retained_representation() {
 
 #[test]
 fn grouped_parameter_sources_require_complete_bank_geometry() {
-    for dtype in [WorkspaceFloatingType::Float32, WorkspaceFloatingType::Float16,
-        WorkspaceFloatingType::Bfloat16] {
+    for dtype in [
+        WorkspaceFloatingType::Float32,
+        WorkspaceFloatingType::Float16,
+        WorkspaceFloatingType::Bfloat16,
+    ] {
         let context = context();
         let expected = WorkspaceRepresentation::new(dtype, true);
-        context.install_parameter_representations(vec![
-            WorkspaceParameterRepresentation::new(slot("up").id,
-                context.layout(&[7,32,64],WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(expected))),
-            WorkspaceParameterRepresentation::new(slot("down").id,
-                context.layout(&[7,64,32],WorkspaceDtype::Float32).unwrap()
-                    .with_representation(Some(expected))),
-        ]).unwrap();
-        let projection=|name| GroupedProjectionSpec::new(slot(name), None,
-            LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap()).unwrap();
-        for (groups, name, supplied) in [(7,"up",true),(8,"up",false),(7,"other",false)] {
-            let bank=WorkspaceBackend::grouped_relu2(GroupedRelu2Spec::new(groups,64,32,
-                projection(name),projection("down")).unwrap(),&context).unwrap();
-            let mut actual=Vec::new();
-            assert!(bank.visit_retained_values(&mut |value|
-                actual.push(value.layout().representation())));
-            assert_eq!(actual, [supplied.then_some(expected),
-                (groups==7).then_some(expected)]);
+        context
+            .install_parameter_representations(vec![
+                WorkspaceParameterRepresentation::new(
+                    slot("up").id,
+                    context
+                        .layout(&[7, 32, 64], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(expected)),
+                ),
+                WorkspaceParameterRepresentation::new(
+                    slot("down").id,
+                    context
+                        .layout(&[7, 64, 32], WorkspaceDtype::Float32)
+                        .unwrap()
+                        .with_representation(Some(expected)),
+                ),
+            ])
+            .unwrap();
+        let projection = |name| {
+            GroupedProjectionSpec::new(
+                slot(name),
+                None,
+                LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap(),
+            )
+            .unwrap()
+        };
+        for (groups, name, supplied) in [(7, "up", true), (8, "up", false), (7, "other", false)] {
+            let bank = WorkspaceBackend::grouped_relu2(
+                GroupedRelu2Spec::new(groups, 64, 32, projection(name), projection("down"))
+                    .unwrap(),
+                &context,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            assert!(bank
+                .visit_retained_values(&mut |value| actual.push(value.layout().representation())));
+            assert_eq!(
+                actual,
+                [
+                    supplied.then_some(expected),
+                    (groups == 7).then_some(expected)
+                ]
+            );
         }
         // Complete parameter geometry changes neither the placeholder count
         // nor its source-independent scalar construction.
-        assert_eq!(scalar_dtypes(&context), [WorkspaceDtype::Float32;6]);
+        assert_eq!(scalar_dtypes(&context), [WorkspaceDtype::Float32; 6]);
     }
+}
+
+#[test]
+fn parameter_views_keep_full_backing_and_only_original_identity_deduplicates() {
+    let context = context();
+    let backing = WorkspaceExistingStorage::try_new(Some(64), &context).unwrap();
+    let copy = WorkspaceExistingStorage::try_new(Some(64), &context).unwrap();
+    let row = |name: &str, root: &WorkspaceExistingStorage| {
+        WorkspaceParameterRepresentation::new(
+            slot(name).id,
+            context.layout(&[1], WorkspaceDtype::Float32).unwrap(),
+        )
+        .with_backing(root.clone())
+    };
+    context
+        .install_parameter_representations(vec![
+            row("first", &backing),
+            row("view", &backing),
+            row("copy", &copy),
+        ])
+        .unwrap();
+    let first =
+        crate::Parameter::<WorkspaceTensor>::unloaded(slot("first"), &[1], &context).unwrap();
+    let view = crate::Parameter::<WorkspaceTensor>::unloaded(slot("view"), &[1], &context).unwrap();
+    let independent =
+        crate::Parameter::<WorkspaceTensor>::unloaded(slot("copy"), &[1], &context).unwrap();
+    context
+        .begin_state_span([first.as_ref(), view.as_ref(), independent.as_ref()])
+        .unwrap();
+    let report = context
+        .report(&[
+            first.as_ref().clone(),
+            view.as_ref().clone(),
+            independent.as_ref().clone(),
+        ])
+        .unwrap();
+    assert_eq!(report.state.as_ref().unwrap().retained_bytes, Some(128));
+    assert!(Rc::ptr_eq(&first.as_ref().storage, &view.as_ref().storage));
+    assert!(!Rc::ptr_eq(
+        &first.as_ref().storage,
+        &independent.as_ref().storage
+    ));
+
+    // A matching name or shape in another trace cannot import this backing.
+    let foreign = self::context();
+    let declaration = || {
+        WorkspaceParameterRepresentation::new(
+            slot("first").id,
+            foreign.layout(&[1], WorkspaceDtype::Float32).unwrap(),
+        )
+        .with_backing(backing.clone())
+    };
+    assert!(foreign
+        .install_parameter_representations(vec![declaration()])
+        .is_err());
+    assert!(foreign
+        .extend_parameter_representations(vec![declaration()])
+        .is_err());
 }

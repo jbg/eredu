@@ -13,7 +13,7 @@ use std::{cell::RefCell, error::Error as _, rc::Rc};
 mod bank;
 mod consumer;
 mod harness;
-use harness::{config, runtime, Backend, Mode, State};
+use harness::{Backend, Mode, State, config, diagnostic_pin, runtime};
 
 struct Controller;
 impl TokenFilterController for Controller {
@@ -72,7 +72,7 @@ fn extract(
         Ok(sequence)
     }
 }
-fn retire_request(state: &Rc<RefCell<State>>) -> (WorkingMemoryPool, u64) {
+fn retire_request(state: &Rc<RefCell<State>>) -> (MemoryLedger, u64) {
     let mut state = state.borrow_mut();
     let pool = state.pool.clone();
     let held = state.held;
@@ -91,7 +91,8 @@ fn original_sequence_exact_admission_and_shared_phase_order_for_optional_capture
                     ..Mode::default()
                 });
                 let options = capture.then(|| TextPreparationOptions {
-                    interventions: None, capture: Some(capture_source()),
+                    interventions: None,
+                    capture: Some(capture_source()),
                 });
                 let sequence =
                     extract(&mut runtime, 2, &[9, 7, 9], controlled, owned, options).unwrap();
@@ -132,7 +133,7 @@ fn original_sequence_exact_admission_and_shared_phase_order_for_optional_capture
                 let (pool, held) = retire_request(&state);
                 drop(runtime);
                 assert_eq!(
-                    pool.used_bytes().unwrap(),
+                    pool.payload_used_bytes().unwrap(),
                     held,
                     "mutable provider retains the host hold; the closed run releases its decoder pin"
                 );
@@ -141,7 +142,7 @@ fn original_sequence_exact_admission_and_shared_phase_order_for_optional_capture
                     Err(WorkingMemoryError::IdentityMismatch)
                 ));
                 drop(sequence);
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     }
@@ -155,7 +156,7 @@ fn original_sequence_exact_admission_and_shared_phase_order_for_optional_capture
         state.borrow().votes,
         vec![(Stage::Admission, Status::Failed)]
     );
-    assert_eq!(state.borrow().pool.used_bytes().unwrap(), 64);
+    assert_eq!(state.borrow().pool.payload_used_bytes().unwrap(), 64);
 }
 #[test]
 fn original_sequence_payload_freezes_without_copy_and_partial_iterator_keeps_r() {
@@ -185,12 +186,12 @@ fn original_sequence_payload_freezes_without_copy_and_partial_iterator_keeps_r()
     assert_eq!(iterator.next(), Some(5));
     let (pool, held) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     assert_eq!(iterator.next_back(), Some(7));
     drop(iterator);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn original_sequence_zero_output_and_dormant_cancel_keep_one_original_owner() {
@@ -225,9 +226,9 @@ fn original_sequence_zero_output_and_dormant_cancel_keep_one_original_owner() {
         assert!(ids.is_empty());
         let (pool, held) = retire_request(&state);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         drop(ids);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -267,7 +268,7 @@ fn original_sequence_abandoned_extraction_blocks_new_and_owned_prompt_paths() {
         let (pool, held) = retire_request(&state);
         drop(runtime);
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             held,
             "consumed error retains original metadata and host custody, not the retired decoder pin"
         );
@@ -276,7 +277,7 @@ fn original_sequence_abandoned_extraction_blocks_new_and_owned_prompt_paths() {
             Err(WorkingMemoryError::IdentityMismatch)
         ));
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -301,14 +302,14 @@ fn original_sequence_foreign_core_claim_cannot_take_an_earlier_bank() {
     let (pool, _) = retire_request(&old);
     drop(first);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         0,
         "replayed rejection holds no original custody"
     );
     drop(error);
     let (pool, _) = retire_request(&new);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn original_sequence_preparation_failure_owns_error_until_after_run_close() {
@@ -333,15 +334,15 @@ fn original_sequence_preparation_failure_owns_error_until_after_run_close() {
     ));
     let (pool, held) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     assert!(matches!(
         pool.pin_registered_storage([(1u32, 64)]),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     let sequence = error.into_sequence();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(sequence);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn original_sequence_explicit_source_survives_run_close_and_retires_at_freeze() {
@@ -352,21 +353,21 @@ fn original_sequence_explicit_source_survives_run_close_and_retires_at_freeze() 
     let mut sequence = extract(&mut runtime, 2, &[], false, false, None).unwrap();
     let (pool, held) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     // This source is explicitly declared on the accepted quote. Its full guard
     // outlives the run's separate credited decoder pin and the fixture root.
-    drop(pool.pin_registered_storage([(1u32, 64)]).unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    drop(diagnostic_pin(&state, &pool).unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     assert!(sequence.cancel());
     let ids = sequence.into_token_ids();
     assert!(ids.is_empty());
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     assert!(matches!(
-        pool.pin_registered_storage([(1u32, 64)]),
+        diagnostic_pin(&state, &pool),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     drop(ids);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -391,11 +392,14 @@ fn original_sequence_source_quarantine_is_checked_before_dormant_token_allocatio
     let source_envelope = state.borrow().source_envelope;
     let (pool, held) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), source_envelope + held + 64);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        source_envelope + held + 64
+    );
     drop(error);
     assert_eq!(
-        pool.used_bytes().unwrap(),
-        source_envelope + 64,
+        pool.payload_used_bytes().unwrap(),
+        source_envelope + publication_controls() + 64,
         "original source quarantine preserves its borrowed root after R retires"
     );
 }
@@ -414,7 +418,7 @@ fn original_sequence_actual_result_aliases_retire_concurrently_after_request() {
     drop(ids);
     let (pool, held) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     std::thread::scope(|scope| {
         let workers = aliases
             .into_iter()
@@ -429,7 +433,7 @@ fn original_sequence_actual_result_aliases_retire_concurrently_after_request() {
             worker.join().unwrap();
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -442,7 +446,7 @@ fn original_sequence_controls_reject_unknown_foreign_plan_and_overflow_before_ac
     drop(sequence);
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -470,7 +474,7 @@ fn original_sequence_owner_unwind_retires_actual_provider_without_refunding_live
     drop(state_ref);
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod decoder;

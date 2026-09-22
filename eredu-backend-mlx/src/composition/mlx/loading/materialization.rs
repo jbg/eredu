@@ -5,10 +5,10 @@ use crate::backend::{
     runtime::cache::state::{MlxHybridState, MlxPoolingAttentionState},
 };
 use eredu_architectures::prepared_execution::{
-    CompositeRoute, PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute,
-    PredictionBinding, PreparedExecutableAssembler, PreparedExecutableParts,
-    PreparedExecutionError, PreparedExecutionRoutes, PreparedPartitionPredictionResources,
-    PreparedPartitionResources, ReplicatedRoute, RoutedRoute, construct_prepared_execution,
+    construct_prepared_execution, CompositeRoute, PartitionedCompositeRoute, PartitionedDenseRoute,
+    PartitionedRoutedRoute, PredictionBinding, PreparedExecutableAssembler,
+    PreparedExecutableParts, PreparedExecutionError, PreparedExecutionRoutes,
+    PreparedPartitionPredictionResources, PreparedPartitionResources, ReplicatedRoute, RoutedRoute,
 };
 
 pub(crate) fn materialize_model_plan(
@@ -17,27 +17,34 @@ pub(crate) fn materialize_model_plan(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
-    materialize_model_plan_with_layerwise_manager(
+    let ledger = crate::backend::managed_memory::try_ledger()?;
+    let construction_sources = super::PreparedNativeConstructionSources::prepare(
+        sources.selected().text_realization().state(),
+        None,
+        &ledger,
+        stream,
+    )?;
+    materialize_model_plan_with_construction_sources(
         sources,
         distributed,
         stream,
         weights_stream,
+        Some(construction_sources),
         None,
-            None,
-        )
+    )
 }
 
 /// Receives source preparation completed before ordinary native load ownership.
 /// The move-only manager reaches the same typed binder as ordinary loading.
-pub(crate) fn materialize_model_plan_with_layerwise_manager(
+pub(crate) fn materialize_model_plan_with_construction_sources(
     sources: PreparedModelSources,
     distributed: Option<MlxDistributedSession>,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<
-        crate::backend::runtime::execution::generic::PreparedLayerwiseManager,
+    construction_sources: Option<super::PreparedNativeConstructionSources>,
+    addressable_manager: Option<
+        crate::backend::runtime::residency::parameter_bank::PreparedAddressableSource,
     >,
-    addressable_manager: Option<crate::backend::runtime::residency::parameter_bank::PreparedAddressableSource>,
 ) -> Result<MlxModel, Error> {
     let capture_discovery = sources.prepare_discovery(
         eredu_core::ObservationMechanisms {
@@ -53,20 +60,20 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
     let materialize = |prepared, source: eredu_checkpoint::store::RetainedCheckpointSource| {
         binding::materialize_prediction_extension(prepared, source, stream, weights_stream)
     };
-    let layerwise_manager = std::cell::Cell::new(layerwise_manager);
+    let construction_sources = std::cell::Cell::new(construction_sources);
     let addressable_manager = std::cell::Cell::new(addressable_manager);
     let prediction_visitor = |facts: PredictionBinding| binding::PredictionBindingVisitor {
         addressable_manager: Some(&addressable_manager),
         stream,
         weights_stream,
-        layerwise_manager: Some(&layerwise_manager),
+        construction_sources: Some(&construction_sources),
         selected: facts.selected().clone(),
         capability: facts.capability().clone(),
     };
     let partition_prediction_visitor =
         |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| {
             binding::PartitionedPredictionBindingVisitor {
-                layerwise_manager: Some(&layerwise_manager),
+                construction_sources: Some(&construction_sources),
                 addressable_manager: Some(&addressable_manager),
                 stream,
                 weights_stream,
@@ -84,7 +91,7 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
                 stream, weights_stream,
                 eredu_architectures::replicated_text::SharedReplicatedTextVisitor::<
                     binding::MlxReplicatedStateProfiles, _
-                >::new(binding::BindingVisitor { stream, weights_stream, layerwise_manager: Some(&layerwise_manager) }),
+                >::new(binding::BindingVisitor { stream, weights_stream, construction_sources: Some(&construction_sources) }),
             ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
                 materialize, prediction_visitor,
             )
@@ -93,11 +100,11 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             RoutedRoute::<MlxNeuralBackend, MlxHybridState, MlxPoolingAttentionState, _, _, _>::new(
                 stream, weights_stream,
                 binding::RoutedBindingVisitor {
-        addressable_manager: Some(&addressable_manager), stream, weights_stream, layerwise_manager: Some(&layerwise_manager) },
+        addressable_manager: Some(&addressable_manager), stream, weights_stream, construction_sources: Some(&construction_sources) },
                 binding::Relu2RoutedBindingVisitor {
-        addressable_manager: Some(&addressable_manager), stream, weights_stream, layerwise_manager: Some(&layerwise_manager) },
+        addressable_manager: Some(&addressable_manager), stream, weights_stream, construction_sources: Some(&construction_sources) },
                 binding::PoolingRoutedBindingVisitor {
-        addressable_manager: Some(&addressable_manager), stream, weights_stream, layerwise_manager: Some(&layerwise_manager) },
+        addressable_manager: Some(&addressable_manager), stream, weights_stream, construction_sources: Some(&construction_sources) },
             ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
                 materialize, prediction_visitor,
             )
@@ -105,7 +112,7 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
         .with_composite(
             CompositeRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
                 stream, weights_stream, binding::CompositeBindingVisitor {
-        addressable_manager: Some(&addressable_manager), stream, weights_stream, layerwise_manager: Some(&layerwise_manager) },
+        addressable_manager: Some(&addressable_manager), stream, weights_stream, construction_sources: Some(&construction_sources) },
             ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
                 materialize, prediction_visitor,
             )
@@ -114,7 +121,7 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             PartitionedDenseRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
                 stream, weights_stream, |resources: PreparedPartitionResources<MlxDistributedSession>| {
                     binding::PartitionedDenseDecoderBindingVisitor {
-                        layerwise_manager: Some(&layerwise_manager),
+                        construction_sources: Some(&construction_sources),
                         distributed: resources.communication().clone(),
                         additional_claimed_sources: resources.extension_sources().clone(),
                         stream, weights_stream,
@@ -128,14 +135,14 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             PartitionedRoutedRoute::<MlxNeuralBackend, MlxHybridState, MlxPoolingAttentionState, _, _>::new(
                 stream, weights_stream,
                 |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedRoutedDecoderBindingVisitor {
-                    layerwise_manager: Some(&layerwise_manager),
+                    construction_sources: Some(&construction_sources),
                     addressable_manager: Some(&addressable_manager),
                     distributed: resources.communication().clone(),
                     additional_claimed_sources: resources.extension_sources().clone(),
                     stream, weights_stream,
                 },
                 |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedPoolingRoutedDecoderBindingVisitor {
-                    layerwise_manager: Some(&layerwise_manager),
+                    construction_sources: Some(&construction_sources),
                     addressable_manager: Some(&addressable_manager),
                     distributed: resources.into_communication(), stream, weights_stream,
                 },
@@ -147,7 +154,7 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             PartitionedCompositeRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
                 stream, weights_stream,
                 |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedCompositeBindingVisitor {
-                    layerwise_manager: Some(&layerwise_manager),
+                    construction_sources: Some(&construction_sources),
                     addressable_manager: Some(&addressable_manager),
                     store: resources.target().clone(),
                     distributed: resources.into_communication(), stream, weights_stream,
@@ -155,7 +162,7 @@ pub(crate) fn materialize_model_plan_with_layerwise_manager(
             ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
                 materialize,
                 |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| binding::PartitionedCompositePredictionBindingVisitor {
-                    layerwise_manager: Some(&layerwise_manager),
+                    construction_sources: Some(&construction_sources),
                     addressable_manager: Some(&addressable_manager),
                     store: facts.partition().target().clone(),
                     distributed: facts.partition().communication().clone(),
@@ -252,11 +259,15 @@ pub(in crate::composition::mlx) fn bind_replicated_text(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Box<dyn super::super::replicated_text::ErasedReplicatedTextExecutable>, Error> {
+    let ledger = crate::backend::managed_memory::try_ledger()?;
+    let construction_sources = std::cell::Cell::new(Some(
+        super::PreparedNativeConstructionSources::prepare(selected.state(), None, &ledger, stream)?,
+    ));
     let store = store.into();
     let visitor = super::super::replicated_text::BindingVisitor {
         stream,
         weights_stream,
-        layerwise_manager: None,
+        construction_sources: Some(&construction_sources),
     };
     eredu_architectures::replicated_text::dispatch_replicated_text_architecture::<
         crate::backend::nn::shared::MlxNeuralBackend,
@@ -313,11 +324,14 @@ fn selected_workspace_mechanisms(
 ) -> Result<Option<crate::backend::nn::workspace::ResidentExecutionMechanisms>, Error> {
     #[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
     {
-        use crate::backend::nn::workspace::{MlxMetalWorkspaceMechanisms, ResidentExecutionMechanisms};
+        use crate::backend::nn::workspace::{
+            MlxMetalWorkspaceMechanisms, ResidentExecutionMechanisms,
+        };
         let ordinary = MlxMetalWorkspaceMechanisms::current_host()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        return ResidentExecutionMechanisms::from_cold_stream(ordinary, _stream)
-            .map(Some).map_err(|error| Error::ArchitectureModel(error.to_string()));
+        return ResidentExecutionMechanisms::from_cold_stream(ordinary.original_storage(), _stream)
+            .map(Some)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()));
     }
     #[cfg(not(all(target_vendor = "apple", not(feature = "cuda"))))]
     Ok(None)

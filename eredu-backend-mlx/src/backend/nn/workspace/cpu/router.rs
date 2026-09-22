@@ -6,8 +6,37 @@ use super::*;
 use eredu_nn::{GroupScoring, RoutingPrecision, TopKGroupSelectorSpec};
 use safemlx::{CpuUnaryOperation, Dtype};
 
+mod control;
+mod ordinary;
+pub(super) fn ordinary_call_controls(
+    operation: WorkspaceOperationView<'_>,
+) -> facts::FactResult<Option<super::ordinary_calls::OrdinaryCallControls>> {
+    ordinary::ordinary_call_controls(operation, false)
+}
+pub(super) fn ordinary_metal_call_controls(
+    operation: WorkspaceOperationView<'_>,
+) -> facts::FactResult<Option<super::ordinary_calls::OrdinaryCallControls>> {
+    ordinary::ordinary_call_controls(operation, true)
+}
+pub(in crate::backend::nn::workspace) fn nested_completions(
+    op: WorkspaceOperationView<'_>,
+    mechanism: MlxCpuWorkspaceMechanisms,
+) -> facts::FactResult<usize> {
+    if !matches!(
+        op.kind,
+        WorkspaceOperationKindView::GroupSelection {
+            control: Some(_),
+            ..
+        }
+    ) {
+        return Ok(0);
+    }
+    let g = geometry(op)?.ok_or_else(invalid)?;
+    control::nested_completions(op, mechanism, g)
+}
+
 fn invalid() -> MlxWorkspaceFactError {
-    MlxWorkspaceFactError::descriptor("CPU selector source geometry differs")
+    MlxWorkspaceFactError::descriptor("selector source geometry differs")
 }
 #[derive(Clone, Copy)]
 struct Geometry<'a> {
@@ -33,15 +62,22 @@ impl Geometry<'_> {
     }
 }
 fn geometry(op: WorkspaceOperationView<'_>) -> facts::FactResult<Option<Geometry<'_>>> {
+    geometry_with_projection_cast(op, false)
+}
+// An explicit F32 projection and score cast fixes the compound worker's dtype
+// without asserting physical precision or strides for its borrowed source.
+fn geometry_with_projection_cast(
+    op: WorkspaceOperationView<'_>,
+    metal: bool,
+) -> facts::FactResult<Option<Geometry<'_>>> {
     let (spec, supplied, groups, selected, shared) = match op.kind {
         WorkspaceOperationKindView::GroupSelection {
             spec,
             supplied_indices,
-            control,
+            ..
         } => {
             spec.validate_fixed()?;
-            if control.is_some()
-                || spec.format().encoding() != eredu_checkpoint::LinearFormat::Dense
+            if spec.format().encoding() != eredu_checkpoint::LinearFormat::Dense
                 || spec.selection().selection_partitions() != 1
                 || spec.selection().selected_groups() != 1
             {
@@ -63,7 +99,13 @@ fn geometry(op: WorkspaceOperationView<'_>) -> facts::FactResult<Option<Geometry
         }
         _ => return Ok(None),
     };
-    if op.outputs.len() != 3 {
+    let decisions = match op.kind {
+        WorkspaceOperationKindView::GroupSelection { control, .. } => {
+            1 + usize::from(control.is_some_and(|c| c.capture_original))
+        }
+        _ => 1,
+    };
+    if op.outputs.len() != 3 * decisions {
         return Err(invalid());
     }
     let input = op.inputs.get(0).ok_or_else(invalid)?;
@@ -126,9 +168,14 @@ fn geometry(op: WorkspaceOperationView<'_>) -> facts::FactResult<Option<Geometry
                 return Err(invalid());
             }
         } else if value.dtype() != WorkspaceDtype::Float32
-            || !value
-                .representation()
-                .is_some_and(|r| r.dtype() == WorkspaceFloatingType::Float32 && r.row_contiguous())
+            || !(metal
+                && spec.is_some_and(|spec| {
+                    spec.arithmetic().projection == RoutingPrecision::Float32
+                        && spec.arithmetic().scores == RoutingPrecision::Float32
+                }))
+                && !value.representation().is_some_and(|r| {
+                    r.dtype() == WorkspaceFloatingType::Float32 && (metal || r.row_contiguous())
+                })
         {
             return Ok(None);
         }
@@ -142,6 +189,7 @@ fn geometry(op: WorkspaceOperationView<'_>) -> facts::FactResult<Option<Geometry
         WorkspaceDtype::Uint32
     };
     for (index, output) in op.outputs.iter().enumerate() {
+        let index = index % 3;
         let expected_width = if index == 2 && spec.is_none() {
             shared
         } else {
@@ -353,12 +401,10 @@ impl Program {
     }
 }
 
-fn selector(p: &mut Program, op: WorkspaceOperationView<'_>, g: Geometry<'_>) -> Option<()> {
+fn selector_projection(p: &mut Program, g: Geometry<'_>) -> Option<()> {
     let spec = g.spec?;
-    let policy = spec.selection();
     let input = g.count(g.width)?;
     let logits = g.count(g.groups)?;
-    let selected = g.count(g.selected)?;
     p.reshape(g.rank, 2)?;
     if let Some(transform) = spec.input_transform() {
         p.unary(CpuUnaryOperation::Square, Dtype::Float32, 2, input)?;
@@ -426,6 +472,19 @@ fn selector(p: &mut Program, op: WorkspaceOperationView<'_>, g: Geometry<'_>) ->
         )?;
     }
     p.cast(Dtype::Float32, Dtype::Float32, 2, logits)?; // projection precision
+    p.controls(
+        size_of::<(
+            &mut Program,
+            Geometry<'_>,
+            &TopKGroupSelectorSpec,
+            Option<()>,
+        )>() + size_of::<usize>() * 2,
+    )
+}
+fn selector_transform(p: &mut Program, g: Geometry<'_>) -> Option<()> {
+    let spec = g.spec?;
+    let policy = spec.selection();
+    let logits = g.count(g.groups)?;
     p.cast(Dtype::Float32, Dtype::Float32, 2, logits)?; // scores precision
     match policy.scoring() {
         GroupScoring::Softmax => p.router_softmax(g.rows, g.groups)?,
@@ -438,32 +497,59 @@ fn selector(p: &mut Program, op: WorkspaceOperationView<'_>, g: Geometry<'_>) ->
         }
         _ => return None,
     }
-    if g.supplied {
-        // [-1,k] resolves to the existing [rows,k] shape. The native
-        // reshape planner preserves every source stride and its entire Data.
-        p.reshape(2, 2)?;
-    } else {
-        if spec.correction_bias().is_some() {
-            p.binary(
-                CpuBinaryOperation::Add,
-                Dtype::Float32,
-                2,
-                logits,
-                2,
-                1,
-                logits,
-                g.groups,
-            )?;
-        }
-        // CPU uses the unchanged value-only ArgPartition directly. The GPU
-        // crossing-tie branch and its second stream are not part of this call.
-        p.controls(safemlx::OriginalScopeObserver::control_bytes()?)?;
-        p.controls(safemlx::Stream::device_type_control_bytes()?)?;
-        p.scalar_binary(CpuBinaryOperation::Multiply, Dtype::Float32, 2, logits)?;
-        p.router_partition(logits)?;
-        p.slice(2)?;
-        p.reshape(2, 2)?;
+    p.controls(
+        size_of::<(
+            &mut Program,
+            Geometry<'_>,
+            &TopKGroupSelectorSpec,
+            Option<()>,
+        )>() + size_of::<usize>() * 1,
+    )
+}
+fn selector_ranking(p: &mut Program, g: Geometry<'_>) -> Option<()> {
+    let spec = g.spec?;
+    let logits = g.count(g.groups)?;
+    if spec.correction_bias().is_some() {
+        p.binary(
+            CpuBinaryOperation::Add,
+            Dtype::Float32,
+            2,
+            logits,
+            2,
+            1,
+            logits,
+            g.groups,
+        )?;
     }
+    p.controls(
+        size_of::<(
+            &mut Program,
+            Geometry<'_>,
+            &TopKGroupSelectorSpec,
+            Option<()>,
+        )>() + size_of::<usize>() * 1,
+    )
+}
+fn selector_indices(p: &mut Program, g: Geometry<'_>) -> Option<()> {
+    let logits = g.count(g.groups)?;
+    // CPU uses the unchanged value-only ArgPartition directly. The GPU
+    // crossing-tie branch and its second stream are not part of this call.
+    p.controls(safemlx::OriginalScopeObserver::control_bytes()?)?;
+    p.controls(safemlx::Stream::device_type_control_bytes()?)?;
+    p.scalar_binary(CpuBinaryOperation::Multiply, Dtype::Float32, 2, logits)?;
+    p.router_partition(logits)?;
+    p.slice(2)?;
+    p.reshape(2, 2)?;
+    p.controls(size_of::<(&mut Program, Geometry<'_>, usize, Option<()>)>())
+}
+fn selector_weights(
+    p: &mut Program,
+    op: WorkspaceOperationView<'_>,
+    g: Geometry<'_>,
+) -> Option<()> {
+    let spec = g.spec?;
+    let policy = spec.selection();
+    let selected = g.count(g.selected)?;
     p.router_gather_axis(selected)?;
     if policy.scoring() == GroupScoring::SelectedSoftmax {
         p.router_softmax(g.rows, g.selected)?;
@@ -532,6 +618,25 @@ fn selector(p: &mut Program, op: WorkspaceOperationView<'_>, g: Geometry<'_>) ->
         )?;
     }
     p.cast(Dtype::Float32, Dtype::Float32, 2, selected)?;
+    p.controls(
+        size_of::<(
+            &mut Program,
+            Geometry<'_>,
+            &TopKGroupSelectorSpec,
+            Option<()>,
+        )>() + size_of::<usize>() * 1,
+    )
+}
+fn selector(p: &mut Program, op: WorkspaceOperationView<'_>, g: Geometry<'_>) -> Option<()> {
+    selector_projection(p, g)?;
+    selector_transform(p, g)?;
+    if g.supplied {
+        p.reshape(2, 2)?;
+    } else {
+        selector_ranking(p, g)?;
+        selector_indices(p, g)?;
+    }
+    selector_weights(p, op, g)?;
     p.controls(
         size_of::<(
             &mut Program,
@@ -620,6 +725,15 @@ pub(super) fn inspect(
     let Some(g) = geometry(op)? else {
         return Ok(None);
     };
+    if matches!(
+        op.kind,
+        WorkspaceOperationKindView::GroupSelection {
+            control: Some(_),
+            ..
+        }
+    ) {
+        return control::inspect(op, mechanism, g);
+    }
     let (_, retained) = storage(g, mechanism.allocation)?;
     let mut p = Program::new(mechanism);
     if (if g.spec.is_some() {
@@ -661,7 +775,7 @@ pub(super) fn inspect(
     .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
     if g.spec.is_some() {
         p.controls(
-            crate::backend::nn::grouped::TopKGroupSelector::cpu_selection_control_bytes(g.supplied)
+            crate::backend::nn::grouped::TopKGroupSelector::selection_control_bytes(g.supplied)
                 .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
         )
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
@@ -690,6 +804,15 @@ pub(super) fn emit_outputs(
     sink: &mut facts::Emitter<'_>,
 ) -> facts::FactResult<()> {
     let g = geometry(op)?.ok_or_else(invalid)?;
+    if matches!(
+        op.kind,
+        WorkspaceOperationKindView::GroupSelection {
+            control: Some(_),
+            ..
+        }
+    ) {
+        return control::emit_outputs(op, mechanism, g, sink);
+    }
     for output in storage(g, mechanism.allocation)?.0 {
         sink.output(output)?;
     }
@@ -700,7 +823,7 @@ pub(super) fn representation(
     index: usize,
 ) -> Option<WorkspaceRepresentation> {
     let g = geometry(op).ok()??;
-    if index == 0 || index > 2 {
+    if index % 3 == 0 || index >= op.outputs.len() {
         return None;
     }
     if g.spec.is_some() {

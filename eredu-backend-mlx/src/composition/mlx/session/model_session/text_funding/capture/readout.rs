@@ -59,24 +59,13 @@ impl FundedWork {
         PreparedCaptureTensor::validate_stream(stream).map_err(error)?;
         {
             let mut values = roots.try_borrow_mut().map_err(error)?;
-            match completion {
-                CaptureCompletion::Ordinary => {
-                    values.try_reserve_exact(retained_roots).map_err(error)?
-                }
-                CaptureCompletion::Original(_)
-                    if values.capacity().saturating_sub(values.len()) < retained_roots =>
-                {
-                    return Err(error(WorkingMemoryError::UnknownBound));
-                }
-                CaptureCompletion::Original(_) => (),
+            if values
+                .capacity()
+                .checked_sub(values.len())
+                .is_none_or(|remaining| remaining < retained_roots)
+            {
+                return Err(error(WorkingMemoryError::UnknownBound));
             }
-        }
-        if matches!(completion, CaptureCompletion::Ordinary) {
-            publications
-                .try_borrow_mut()
-                .map_err(error)?
-                .try_reserve_exact(1)
-                .map_err(error)?;
         }
         let mut scope_owner = publication_scope::OwnedScope::take(&self.scope)?;
         let scope = scope_owner.get_mut();
@@ -99,26 +88,30 @@ impl FundedWork {
         self.published.set(false);
         drop(completion.settle(source, stream).map_err(error)?);
         let publication = self.publish_capture_source(source, scope, completion)?;
-        // Only the pure-native path attaches all custody to backing sidecars;
-        // keep this local owner through the exact source pin and callback.
-        let _publication = match completion {
-            CaptureCompletion::Original(_) => Some(publication),
-            CaptureCompletion::Ordinary => {
-                publications.borrow_mut().push(publication);
-                None
-            }
-        };
+        // The source pin protects attached native charges through the callback.
+        // This receipt has its own paid one-row collector and stays lexical.
+        let _publication = publication;
         let observed = source.try_metadata_snapshot().map_err(error)?;
         let allocation = observed
             .allocation()
             .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?;
-        let pin = scope
-            .pool()
-            .pin_registered_storage([(
+        let prepared = eredu_runtime::working_memory::StoragePublicationLayout::new(2)
+            .and_then(|layout| layout.fund_from(scope))
+            .map_err(error)?;
+        let rows = [
+            (allocation.bytes() != 0).then_some((
                 StorageIdentity::Native(allocation.identity()),
                 u64::try_from(allocation.bytes())
                     .map_err(|_| error(WorkingMemoryError::Overflow))?,
-            )])
+            )),
+            (allocation.host_control_bytes() != 0).then_some((
+                StorageIdentity::NativeControl(allocation.identity()),
+                u64::try_from(allocation.host_control_bytes())
+                    .map_err(|_| error(WorkingMemoryError::Overflow))?,
+            )),
+        ];
+        let pin = prepared
+            .pin_registered_storage(rows.into_iter().flatten())
             .map_err(error)?;
         operation(claim, scope, segment, pin, &mut retain)
     }
@@ -166,3 +159,7 @@ pub(super) fn control_bytes<C: ReadoutClaim, R>() -> Option<usize> {
         .into_iter()
         .try_fold(size_of_val(&frames), usize::checked_add)
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

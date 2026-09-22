@@ -121,7 +121,6 @@ fn prove_bounded(device: DeviceType) {
                         captures: maximum,
                         ..per_step.checked_mul(8).unwrap()
                     },
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             }

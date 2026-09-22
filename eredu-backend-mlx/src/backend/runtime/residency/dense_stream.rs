@@ -6,8 +6,8 @@
 //! next layer may continue transferring independently.
 
 mod coordinator;
-pub(crate) use coordinator::{BackgroundHostCoordinator, PreparedBackgroundForward};
 pub use coordinator::BackgroundCoordinatorFailure;
+pub(crate) use coordinator::{BackgroundHostCoordinator, PreparedBackgroundForward};
 mod prepared_host;
 pub(crate) use prepared_host::{BackgroundHostReadService, BackgroundHostServiceError};
 
@@ -205,6 +205,8 @@ mod tests {
         tensors: Vec<(String, Dtype, Vec<u8>)>,
         host_budget: u64,
     ) -> (tempfile::TempDir, ResidencyManager, Vec<OffloadUnitId>) {
+        #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+        crate::tests::support::test_utils::initialize_original_sources();
         let directory = tempfile::tempdir().unwrap();
         serialize_to_file(
             tensors.iter().map(|(name, dtype, bytes)| {
@@ -289,6 +291,8 @@ mod tests {
 
     #[test]
     fn duplicate_background_requests_coalesce_and_join_demand() {
+        #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+        crate::tests::support::test_utils::initialize_original_sources();
         let directory = tempfile::tempdir().unwrap();
         let bytes = [1i32, 2]
             .into_iter()

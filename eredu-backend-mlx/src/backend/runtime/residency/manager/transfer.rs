@@ -28,8 +28,10 @@ use std::{
 
 /// Shared lease and transfer owner for a residency manager.
 pub struct ManagerInner {
-    pub(super) parameter_constructors: Option<Vec<crate::backend::runtime::execution::generic::ParameterConstructors>>,
-    pub(super) parameter_exclusions: Option<crate::backend::runtime::execution::generic::MlxParameterExclusions>,
+    pub(super) parameter_constructors:
+        Option<Vec<crate::backend::runtime::execution::generic::ParameterConstructors>>,
+    pub(super) parameter_exclusions:
+        Option<crate::backend::runtime::execution::generic::MlxParameterExclusions>,
     pub(super) sources: ResidencySources,
     pub(super) dense_controller:
         std::sync::OnceLock<crate::backend::runtime::execution::layerwise::PreparedDenseController>,
@@ -191,6 +193,7 @@ struct TransferStatus {
 
 struct TransferApplication {
     leases: OnceCell<ResidentLeaseCollection>,
+    completion_roots: RefCell<Vec<Array>>,
     owner: RefCell<ManagerWeak>,
     ids: Vec<OffloadUnitId>,
     tier: MemoryTier,
@@ -199,12 +202,14 @@ struct TransferApplication {
     failed_transfer: Option<FailureFlag>,
     // Retained through the actual separately deferred manager/lease payload.
     _custody: Option<OriginalOperationMetadataCustody>,
+    _host_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl TransferApplication {
     fn new(ids: Vec<OffloadUnitId>, tier: MemoryTier, failed_transfer: FailureFlag) -> Self {
         Self {
             leases: OnceCell::new(),
+            completion_roots: RefCell::new(Vec::new()),
             owner: RefCell::new(ManagerWeak::new()),
             ids,
             tier,
@@ -212,12 +217,14 @@ impl TransferApplication {
             status: TransferStatus::default(),
             failed_transfer: Some(failed_transfer),
             _custody: None,
+            _host_funding: None,
         }
     }
 
     fn prepared(custody: OriginalOperationMetadataCustody) -> Self {
         Self {
             leases: OnceCell::new(),
+            completion_roots: RefCell::new(Vec::new()),
             owner: RefCell::new(ManagerWeak::new()),
             ids: Vec::new(),
             tier: MemoryTier::Device,
@@ -225,6 +232,22 @@ impl TransferApplication {
             status: TransferStatus::default(),
             failed_transfer: None,
             _custody: Some(custody),
+            _host_funding: None,
+        }
+    }
+
+    fn host(funding: eredu_nn::workspace::HostMetadataFunding) -> Self {
+        Self {
+            leases: OnceCell::new(),
+            completion_roots: RefCell::new(Vec::new()),
+            owner: RefCell::new(ManagerWeak::new()),
+            ids: Vec::new(),
+            tier: MemoryTier::Device,
+            generation: Cell::new(0),
+            status: TransferStatus::default(),
+            failed_transfer: None,
+            _custody: None,
+            _host_funding: Some(funding),
         }
     }
 
@@ -243,15 +266,50 @@ impl TransferApplication {
         let Some(owner) = self.owner.borrow().upgrade() else {
             return Ok(());
         };
-        owner.resolve_transfer(
-            &self.ids,
-            self.tier,
-            generation,
-            self.status.settled.get()
-                && !self.status.failed.get()
-                && self.status.children.get() == 0,
-        )?;
+        let mut succeeded = self.status.settled.get()
+            && !self.status.failed.get()
+            && self.status.children.get() == 0;
+        // Ordinary transfers can reach retirement without an explicit
+        // synchronize call. Their exact completed submission covers every
+        // published output, including unused companion parameters. Detach the
+        // completed descriptors before publishing a ready residency generation;
+        // cold allocation inspection must never perform that native transition.
+        let mut completion_error = None;
+        if succeeded && self._custody.is_none() && self.tier == MemoryTier::Device {
+            for value in self.completion_roots.borrow().iter() {
+                if let Err(source) = value.evaluated() {
+                    self.mark_failed();
+                    succeeded = false;
+                    completion_error = Some(transfer_error("resident array completion", source));
+                    break;
+                }
+            }
+            if let Some(leases) = self.leases.get().filter(|_| succeeded) {
+                for lease in leases.as_slice() {
+                    for name in lease.binding_names() {
+                        let completed = lease.device_value(name).and_then(|value| {
+                            value.evaluated().map(|_| ()).map_err(|source| {
+                                transfer_error("resident array completion", source)
+                            })
+                        });
+                        if let Err(error) = completed {
+                            self.mark_failed();
+                            succeeded = false;
+                            completion_error = Some(error);
+                            break;
+                        }
+                    }
+                    if !succeeded {
+                        break;
+                    }
+                }
+            }
+        }
+        owner.resolve_transfer(&self.ids, self.tier, generation, succeeded)?;
         self.generation.set(0);
+        if let Some(error) = completion_error {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -268,6 +326,19 @@ impl Retention for ResidentTransferResources {
         self.application.status.settled.set(status.settled);
         if status.failed || status.blocked {
             self.application.mark_failed();
+        }
+    }
+}
+
+impl Drop for ResidentTransferResources {
+    fn drop(&mut self) {
+        if self.application._custody.is_none() {
+            // The submitted closure can contain canonical alias owners absent
+            // from the caller's selected leases. Move its existing root vector
+            // to the ordinary unlocked application retirement; do not allocate
+            // a second inventory or invoke native work from this destructor.
+            *self.application.completion_roots.borrow_mut() =
+                std::mem::take(&mut self.retained_arrays);
         }
     }
 }
@@ -374,6 +445,43 @@ pub(super) fn validate_original_observer(
 }
 
 impl ResidentTransfer {
+    pub(super) fn host_immediate_control_bytes() -> Option<usize> {
+        let frames = [
+            eredu_nn::workspace::WorkspaceContext::metadata_rc_bytes::<
+                OrdinaryRetirement<TransferApplication>,
+            >()?,
+            usize::try_from(OrdinaryRetirement::<TransferApplication>::control_bytes()?).ok()?,
+            size_of::<Self>(),
+            size_of::<TransferApplication>(),
+            size_of::<ResidentLeaseCollection>(),
+            size_of::<Result<Self, ResidencyError>>(),
+            size_of::<(&ResidencyManager, MemoryTier)>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
+    /// Same warm transfer owner, with the actual manager failure flag and paid
+    /// lease collection. The caller debits its shell before acquiring pins.
+    pub(super) fn immediate_host_paid(
+        leases: ResidentLeaseCollection,
+        tier: MemoryTier,
+        manager: &ResidencyManager,
+    ) -> Self {
+        let app = TransferApplication::new(Vec::new(), tier, manager.inner.failed_transfer.clone());
+        let _ = app.leases.set(leases);
+        app.status.settled.set(true);
+        Self {
+            original: None,
+            consumer: RefCell::new(None),
+            consumer_issued: Cell::new(false),
+            retirement_transferred: false,
+            retained: None,
+            application: Rc::new(OrdinaryRetirement::new(app)),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn mark_failed_for_test(&self) {
         self.application.mark_failed();
@@ -462,9 +570,9 @@ impl ResidentTransfer {
                     .map_err(ResidencyError::OriginalNative)?
                 {
                     RetirementAttempt::Retired => {
-                    // The child's successful native lifetime proof precedes
-                    // TransferObservation::drop decrementing children.
-                    consumer.take();
+                        // The child's successful native lifetime proof precedes
+                        // TransferObservation::drop decrementing children.
+                        consumer.take();
                     }
                     RetirementAttempt::Pending => {}
                     RetirementAttempt::Stopped(cause) => {
@@ -570,6 +678,20 @@ impl ResidentTransfer {
             self.consumer_issued.set(true);
         }
         let owner = retained.retention();
+        let host_funding = if original.is_none() {
+            owner.application._host_funding.as_ref()
+        } else {
+            None
+        };
+        if let Some(funding) = host_funding {
+            let bytes =
+                Self::host_consumer_control_bytes().ok_or(ResidencyError::HostMetadataFunding(
+                    eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                ))?;
+            funding
+                .reserve_metadata(bytes)
+                .map_err(ResidencyError::HostMetadataFunding)?;
+        }
         let _unwind = TransferUnwind(&owner.application);
         let count = &owner.application.status.children;
         let next = count.get().checked_add(1).ok_or_else(|| {
@@ -586,6 +708,9 @@ impl ResidentTransfer {
         };
         let mut observation = match ready {
             Some((ready, observer)) => ready.activate(value, observer),
+            None if host_funding.is_some() => {
+                host::prepare_host_consumer(value, host_funding.expect("selected host account"))?
+            }
             None => ResidentRecovery::ordinary(
                 Recovery::begin(value)
                     .map_err(|error| transfer_error("prepare transfer consumer", error))?,
@@ -737,6 +862,16 @@ impl ResidentTransfer {
         // here, at the synchronous execution boundary, before a cold inventory
         // observes them. Never poll or evaluate on the accounting query's behalf.
         if self.application.tier == MemoryTier::Device {
+            if self.original.is_none() {
+                if let Some(retained) = &self.retained {
+                    for value in &retained.retention().retained_arrays {
+                        if let Err(source) = value.evaluated() {
+                            self.application.mark_failed();
+                            return Err(transfer_error("resident array completion", source));
+                        }
+                    }
+                }
+            }
             for lease in self.leases() {
                 for name in lease.binding_names() {
                     let value = lease.device_value(name)?;
@@ -772,9 +907,16 @@ impl ResidentTransfer {
                     use crate::backend::submission_recovery::observed::FinishRetainingError;
                     return Err(match cause {
                         FinishRetainingError::Native(cause) => operation_error(
-                            self.original.is_some(), "resident transfer retirement", cause),
-                        FinishRetainingError::Retirement(cause) => ResidencyError::OriginalRetirement(cause),
-                        FinishRetainingError::Observation(_) => ResidencyError::OriginalOperationRetirementTransferred,
+                            self.original.is_some(),
+                            "resident transfer retirement",
+                            cause,
+                        ),
+                        FinishRetainingError::Retirement(cause) => {
+                            ResidencyError::OriginalRetirement(cause)
+                        }
+                        FinishRetainingError::Observation(_) => {
+                            ResidencyError::OriginalOperationRetirementTransferred
+                        }
                     });
                 }
             };
@@ -859,6 +1001,7 @@ pub(super) fn ensure_many_resident(
         None,
         None,
         None,
+        None,
     )
     .map(|(flags, submitted)| (flags.into_ordinary(), submitted))
 }
@@ -873,8 +1016,11 @@ pub(super) fn ensure_many_resident_with_operations(
     manager: Option<&ManagerOwner>,
     mut original: Option<(&mut OriginalResidencySlots<'_>, &OriginalScopeObserver)>,
     controller: Option<PreparedControllerAttempt>,
+    mut host: Option<&mut super::host_acquisition::PreparedHostAcquisition>,
 ) -> Result<(AcquisitionResult, Option<SubmittedResidentTransfer>), ResidencyError> {
-    if original.is_some() != controller.is_some() {
+    if (original.is_some() && host.is_some())
+        || (original.is_some() || host.is_some()) != controller.is_some()
+    {
         return Err(ResidencyError::OriginalOperationDomain);
     }
     if let Some((_, observer)) = &original {
@@ -891,6 +1037,18 @@ pub(super) fn ensure_many_resident_with_operations(
             super::closure_ids::PreparedClosureIds::take(
                 slots.closure_ids,
                 manager.ok_or(ResidencyError::OriginalOperationDomain)?,
+                &closure,
+            )?
+        }
+        None if host.is_some() => {
+            let host = host.as_mut().expect("ordinary prepared acquisition");
+            let closure = state
+                .control
+                .operation_closure(ids, &mut host.scratch)
+                .map_err(ResidencyError::OperationClosure)?;
+            super::closure_ids::PreparedClosureIds::take(
+                &mut host.closure,
+                manager.ok_or(ResidencyError::StatePoisoned)?,
                 &closure,
             )?
         }
@@ -924,6 +1082,7 @@ pub(super) fn ensure_many_resident_with_operations(
         manager,
         original,
         controller,
+        host,
     )?;
     aliases::pin_owners(state, closure_ids, tier)?;
     // Same caller order/cardinality; prepared flags retain their final owner.
@@ -943,6 +1102,7 @@ fn prepare_closure(
     manager: Option<&ManagerOwner>,
     mut original: Option<(&mut OriginalResidencySlots<'_>, &OriginalScopeObserver)>,
     mut controller: Option<PreparedControllerAttempt>,
+    mut host: Option<&mut super::host_acquisition::PreparedHostAcquisition>,
 ) -> Result<(AcquisitionResult, Option<SubmittedResidentTransfer>), ResidencyError> {
     if let Some((_, observer)) = &original {
         validate_original_observer(observer)?;
@@ -1126,7 +1286,7 @@ fn prepare_closure(
     let result = admitted.and_then(|()| {
         (|| -> Result<Option<SubmittedResidentTransfer>, ResidencyError> {
             if tier == MemoryTier::Host {
-                if let Some((slots, _)) = original.as_mut() {
+                if let Some((slots, observer)) = original.as_mut() {
                     let host = slots
                         .background_host
                         .as_mut()
@@ -1142,13 +1302,16 @@ fn prepare_closure(
                         created,
                         host.reads,
                         started,
+                        &mut slots.materialization,
+                        slots.materialized_recipe,
+                        observer,
                     )?;
                     state
                         .control
                         .touch_acquisition_hits_ref(acquisition, tier)?;
                     return Ok(None);
                 }
-                let mut prepared = Vec::new();
+                let mut prepared = Vec::with_capacity(ids.len());
                 for (id, is_missing) in ids.iter().zip(created) {
                     if !is_missing {
                         continue;
@@ -1157,13 +1320,23 @@ fn prepare_closure(
                         .control
                         .unit(id)
                         .ok_or(ResidencyError::StatePoisoned)?
-                        .bindings()
-                        .to_vec();
+                        .bindings();
                     let shared = BTreeMap::new();
-                    let local_aliases = local_aliases_for_unit(state, id)?;
                     let buffers = if let Some(source) = sources.foreground() {
-                        source.read_ordinary_host(id)?
+                        source.read_ordinary_host_with_metadata(
+                            id,
+                            host.as_ref().map(|host| &host.funding),
+                            Some(state.materialization.view()),
+                        )?
+                    } else if let Some(source) = sources.prepared_host(id) {
+                        aliases::retain_host_source_rows(
+                            state,
+                            id,
+                            source,
+                            host.as_ref().map(|value| &value.funding),
+                        )?
                     } else {
+                        let local_aliases = local_aliases_for_unit(state, id)?;
                         materialize_host_buffers(
                             id,
                             sources.source(id),
@@ -1175,7 +1348,7 @@ fn prepare_closure(
                         )?
                     };
                     let logical = host_buffers_nbytes(&buffers, &bindings)?;
-                    let planned = state.control.ledger_mut().spec(id)?.bytes();
+                    let planned = state.control.ledger().spec(id)?.bytes();
                     if logical != planned {
                         return Err(ResidencyError::UnitByteMismatch {
                             id: id.clone(),
@@ -1212,7 +1385,11 @@ fn prepare_closure(
                         .storage
                         .get_mut(&id)
                         .ok_or(ResidencyError::StatePoisoned)?
-                        .host = Some(Arc::new(buffers).into());
+                        .host = Some(if let Some(host) = host.as_ref() {
+                        ResidentHostOwner::ordinary_with_metadata(buffers, host.funding.clone())
+                    } else {
+                        Arc::new(buffers).into()
+                    });
                 }
                 state
                     .control
@@ -1236,6 +1413,13 @@ fn prepare_closure(
                 Some((ready, observer)) => {
                     ready.activate(ids, created, tier, state.failed_transfer.clone(), observer)?
                 }
+                None if host.is_some() => host
+                    .as_mut()
+                    .expect("paid ordinary acquisition")
+                    .transfer
+                    .take()
+                    .ok_or(ResidencyError::StatePoisoned)?
+                    .activate(ids, created, tier, state.failed_transfer.clone())?,
                 None => {
                     let application_ids = ids
                         .iter()
@@ -1274,19 +1458,20 @@ fn prepare_closure(
                     .unit(id)
                     .ok_or(ResidencyError::StatePoisoned)?
                     .bindings();
-                let bindings = if original.is_some() {
+                let prepared_destination = original.is_some() || host.is_some();
+                let bindings = if prepared_destination {
                     std::borrow::Cow::Borrowed(bindings)
                 } else {
                     std::borrow::Cow::Owned(bindings.to_vec())
                 };
                 let store = sources.source(id);
                 let shared = BTreeMap::new();
-                let local_aliases = if original.is_some() {
+                let local_aliases = if prepared_destination {
                     BTreeMap::new()
                 } else {
                     local_aliases_for_unit(state, id)?
                 };
-                let mut destination = if original.is_some() {
+                let mut destination = if prepared_destination {
                     let unit = state
                         .control
                         .unit(id)
@@ -1314,7 +1499,12 @@ fn prepare_closure(
                                 state, id, arrays, resources,
                             ) {
                             result.map(|()| TransferDirection::DiskToDevice)
-                        } else if let Some(host) = state.storage[id].host.as_ref().cloned() {
+                        } else if let Some(host) = state.storage[id]
+                            .host
+                            .as_ref()
+                            .or_else(|| sources.prepared_host(id))
+                            .cloned()
+                        {
                             super::materialization::prepare_copy_to_device_into(
                                 id,
                                 &bindings,
@@ -1339,6 +1529,8 @@ fn prepare_closure(
                             };
                             let read = match foreground {
                                 Some((batch, reservation, observer)) => {
+                                    let slots =
+                                        &mut *original.as_mut().expect("selected Original slots").0;
                                     super::materialization::prepare_foreground_disk_into(
                                         batch,
                                         manager.ok_or(ResidencyError::OriginalOperationDomain)?,
@@ -1347,8 +1539,37 @@ fn prepare_closure(
                                         state.materialization.view().execution_stream(),
                                         arrays,
                                         resources,
+                                        state.materialization.view(),
+                                        &mut slots.materialization,
+                                        slots.materialized_recipe,
                                     )
                                     .map_err(ResidencyError::from)
+                                }
+                                None if original.is_none() && sources.foreground().is_some() => {
+                                    let buffer = sources
+                                        .foreground()
+                                        .expect("selected foreground source")
+                                        .read_ordinary_host_with_metadata(
+                                            id,
+                                            host.as_ref().map(|host| &host.funding),
+                                            Some(state.materialization.view()),
+                                        )?;
+                                    let buffer = match host.as_ref() {
+                                        Some(host) => ResidentHostOwner::ordinary_with_metadata(
+                                            buffer,
+                                            host.funding.clone(),
+                                        ),
+                                        None => Arc::new(buffer).into(),
+                                    };
+                                    super::materialization::prepare_copy_to_device_into(
+                                        id,
+                                        &bindings,
+                                        buffer,
+                                        &state.device_stream,
+                                        arrays,
+                                        resources,
+                                        None,
+                                    )
                                 }
                                 None => super::materialization::prepare_from_disk_into(
                                     store,
@@ -1381,7 +1602,11 @@ fn prepare_closure(
                                     )
                                 {
                                     result
-                                } else if let Some(host) = state.storage[id].host.as_ref().cloned()
+                                } else if let Some(host) = state.storage[id]
+                                    .host
+                                    .as_ref()
+                                    .or_else(|| sources.prepared_host(id))
+                                    .cloned()
                                 {
                                     prepare_copy_to_device(
                                         id,
@@ -1647,7 +1872,9 @@ fn prepare_closure(
     }
 }
 
+mod host;
 mod operation_slots;
+pub(super) use host::PreparedHostTransfer;
 mod publication;
 pub(crate) use operation_slots::{
     PreparedResidentTransfer, PreparedTransferDestinationCause, PreparedTransferObservation,
@@ -1655,6 +1882,7 @@ pub(crate) use operation_slots::{
 };
 
 pub(super) mod aliases;
+pub(super) use aliases::retained_host_source_control_bytes;
 
 #[cfg(test)]
 pub(super) fn bind_device_for_test(
@@ -1665,4 +1893,6 @@ pub(super) fn bind_device_for_test(
 }
 
 mod lease_collection;
-pub(super) use lease_collection::{LeaseBuilder, PreparedLeaseCollection, ResidentLeaseCollection};
+pub(super) use lease_collection::{
+    LeaseBuilder, LeasePreparationCause, PreparedLeaseCollection, ResidentLeaseCollection,
+};

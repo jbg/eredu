@@ -27,17 +27,6 @@ pub(super) struct RootCollectorPlan {
 }
 
 impl RootCollectorPlan {
-    pub(super) fn new(sources: usize, operands: usize) -> Result<Self, Error> {
-        let overflow = || memory(WorkingMemoryError::Overflow);
-        // Each borrowed source is retained once. The shared isolated-copy leaf
-        // retains its contiguous and deep-copy results before fallible work.
-        let roots = operands
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(sources))
-            .ok_or_else(overflow)?;
-        Self::from_root_count(roots)
-    }
-
     pub(super) fn from_root_count(roots: usize) -> Result<Self, Error> {
         Self::from_root_count_fixed(roots).map_err(memory)
     }
@@ -98,19 +87,34 @@ impl RootCollectorPlan {
         self.known_bytes
     }
 
-    pub(super) fn copy_control_bytes(self) -> Result<u64, Error> {
-        text_funding::work_control_bytes()?
-            .checked_add(self.known_bytes)
-            .ok_or_else(|| memory(WorkingMemoryError::Overflow))
+    pub(super) fn publication_control_bytes(self) -> Result<u64, WorkingMemoryError> {
+        crate::backend::runtime::residency::storage::generic_storage_publication_layout(
+            self.roots
+                .checked_mul(2)
+                .ok_or(WorkingMemoryError::Overflow)?,
+        )?
+        .requested_bytes()
+        .checked_add(eredu_runtime::working_memory::MemoryLedger::storage_metadata_control_bytes()?)
+        .ok_or(WorkingMemoryError::Overflow)
     }
 
-    pub(super) fn limits(self, limits: WorkspaceCopyLimits) -> Result<WorkspaceCopyLimits, Error> {
+    pub(super) fn limits(
+        self,
+        limits: WorkspaceCopyLimits,
+        generic_publication: bool,
+    ) -> Result<WorkspaceCopyLimits, Error> {
         // Existing transport field, with a measured contribution; the caller's
         // reserve stays additive and the same account owns the entire amount.
+        let publication = if generic_publication {
+            self.publication_control_bytes().map_err(memory)?
+        } else {
+            0
+        };
         let mut limits = text_funding::copy_limits_with_work_controls(limits)?;
-        limits.safety_reserve_bytes = limits
-            .safety_reserve_bytes
+        limits.additional_host_metadata_bytes = limits
+            .additional_host_metadata_bytes
             .checked_add(self.known_bytes)
+            .and_then(|bytes| bytes.checked_add(publication))
             .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
         Ok(limits)
     }

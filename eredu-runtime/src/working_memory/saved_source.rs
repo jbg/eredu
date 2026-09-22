@@ -1,9 +1,9 @@
 //! Full request reservation while retaining an authenticated saved component.
 
 use super::{
-    residual::RegisteredStoragePin, Admission, FundedSamplerCopy, InferenceExecutionIdentity,
-    Usage, WorkingMemoryCapacityHandoff, WorkingMemoryError, WorkingMemoryPool,
-    WorkingMemoryReservation, WorkingMemoryStorage, WorkspaceCopyCustody,
+    Admission, FundedSamplerCopy, InferenceExecutionIdentity, MemoryLedger, Usage,
+    WorkingMemoryCapacityHandoff, WorkingMemoryError, WorkingMemoryReservation,
+    WorkingMemoryStorage, WorkspaceCopyCustody, residual::RegisteredStoragePin,
 };
 
 /// Actual immutable sampler and native-copy custody from one saved account,
@@ -57,17 +57,18 @@ impl WorkspaceCopyCustody {
 // The trait and module are private. External callers cannot provide a callback
 // into Usage or replace either source-owner/origin validation at the commit.
 pub(super) trait SavedSourceValidation {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError>;
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError>;
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError>;
     fn pin(&self) -> RegisteredStoragePin;
 }
 
 impl<K: Clone + Ord + Send + Sync + 'static> SavedSourceValidation
     for RegisteredSavedSamplingSource<'_, K>
 {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         let sampler = self.sampler.borrow_funded();
         let native = self.native.funding_source();
-        if !pool.same_domain(self.native.pool())
+        if !pool.same_ledger(self.native.pool())
             || !native.same_account(sampler.source())
             || !std::sync::Arc::ptr_eq(&self.native.execution().0, &sampler.execution().0)
         {
@@ -81,9 +82,39 @@ impl<K: Clone + Ord + Send + Sync + 'static> SavedSourceValidation
     fn pin(&self) -> RegisteredStoragePin {
         RegisteredStoragePin::new(self.registered.clone())
     }
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        RegisteredStoragePin::single_control_bytes::<K>(self.registered.has_source_preparation())
+    }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
+    /// Quotes the complete reservation, including the authenticated saved-source
+    /// pin and the fixed join used by an incremental source-credit reservation.
+    /// This descriptor grants no reservation or source execution authority.
+    pub fn saved_source_reservation_requirements<K: Clone + Ord + Send + Sync + 'static>(
+        &self,
+        admission: &Admission,
+        incremental: Option<&eredu_core::DomainMemoryRequirements>,
+        source: &RegisteredSavedSamplingSource<'_, K>,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        if !self.same_ledger(source.native.pool()) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let mut requirements = self.reservation_requirements(admission, incremental)?;
+        let pin = source
+            .pin_control_bytes()?
+            .checked_add(if incremental.is_some() {
+                RegisteredStoragePin::pair_control_bytes(true)?
+            } else {
+                0
+            })
+            .ok_or(WorkingMemoryError::Overflow)?;
+        requirements.add_allocation(
+            u64::try_from(pin).map_err(|_| WorkingMemoryError::Overflow)?,
+            &self.host_placement_handle(),
+        )?;
+        Ok(requirements)
+    }
     /// Reserves a complete full request bound, retaining its actual saved source
     /// registrations without discounting any source-inclusive term. Both saved
     /// owners and every supplied registration origin are checked atomically
@@ -98,7 +129,7 @@ impl WorkingMemoryPool {
         &self,
         execution: &InferenceExecutionIdentity,
         admission: &Admission,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         handoffs: &[WorkingMemoryCapacityHandoff],
         source: &RegisteredSavedSamplingSource<'_, K>,
     ) -> Result<WorkingMemoryReservation, WorkingMemoryError> {

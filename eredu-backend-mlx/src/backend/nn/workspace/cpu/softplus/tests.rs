@@ -42,7 +42,10 @@ fn trace(shape: &[i32], dtype: WorkspaceFloatingType) -> SpeculativeNumericalRec
             .unwrap(),
         "logical output floor for shape={shape:?} dtype={dtype:?}",
     );
-    assert_eq!(report.tensor_buffers.retained_bytes, Some(plan.output_bytes));
+    assert_eq!(
+        report.tensor_buffers.retained_bytes,
+        Some(plan.output_bytes)
+    );
     assert_eq!(plan.population.primitives, 28);
     assert_eq!(plan.population.input_edges, 33);
     assert_eq!(plan.population.births, 19);
@@ -99,20 +102,18 @@ fn cpu_softplus_refuses_unknown_source_and_malformed_geometry() {
         assert!(cpu.output_representation(op, 0).is_none());
     }
     let wrong_shape = [WorkspaceLayoutView::new(&[2, 8], WorkspaceDtype::Float32).unwrap()];
-    assert!(
-        cpu.plan(WorkspaceOperationView {
+    assert!(cpu
+        .plan(WorkspaceOperationView {
             outputs: WorkspaceLayoutList::Views(&wrong_shape),
             ..operation
         })
-        .is_err()
-    );
-    assert!(
-        cpu.plan(WorkspaceOperationView {
+        .is_err());
+    assert!(cpu
+        .plan(WorkspaceOperationView {
             inputs: WorkspaceLayoutList::Views(&[]),
             ..operation
         })
-        .is_err()
-    );
+        .is_err());
     let context = WorkspaceContext::new(cpu);
     for beta in [0.0, -1.0, f32::INFINITY, f32::NAN] {
         let value = WorkspaceTensor::existing(

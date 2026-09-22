@@ -63,7 +63,6 @@ pub(super) fn source_with_transform(
             CaptureTransformKind::TokenScores,
         ],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let mut raw = CapturePlan::none();
@@ -131,7 +130,7 @@ fn candidates_are_one_terminal_receipt_with_original_h_and_no_earlier_claim() {
                     .requires_sequence_readout()
             );
             let h = plan(&source).initialization_peak_bytes();
-            let pool = WorkingMemoryPool::new(h, 0).unwrap();
+            let pool = capture_test_ledger(h, 0).unwrap();
             let (reservation, run) = fresh(&pool, h);
             let mut bank = run
                 .prepare_capture_run(&reservation, plan(&source))
@@ -215,9 +214,9 @@ fn candidates_are_one_terminal_receipt_with_original_h_and_no_earlier_claim() {
             assert!(cold.finished());
             drop(frame);
             drop((bank, reservation, run));
-            assert_eq!(pool.used_bytes().unwrap(), h);
+            assert_eq!(pool.payload_used_bytes().unwrap(), h);
             drop(alias);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -225,7 +224,7 @@ fn candidates_are_one_terminal_receipt_with_original_h_and_no_earlier_claim() {
 fn candidate_original_exact_short_foreign_receipt_and_partial_failure_do_not_refill() {
     let source = source(3, 2);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h * 2, 0).unwrap();
+    let pool = capture_test_ledger(h * 2, 0).unwrap();
     let (short, short_run) = fresh(&pool, h - 1);
     let before = CLAIM_ALLOCATIONS.get();
     assert!(
@@ -265,16 +264,16 @@ fn candidate_original_exact_short_foreign_receipt_and_partial_failure_do_not_ref
     assert!(sb.take_candidates(0).is_err());
     drop((sa, sb));
     drop((a, b, reservation, run));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn missing_terminal_and_late_abort_never_finish_the_candidate_progression_twice() {
     for emit in [false, true] {
         let source = source(5, 2);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
         let mut step = bank
@@ -318,7 +317,7 @@ fn missing_terminal_and_late_abort_never_finish_the_candidate_progression_twice(
             drop(step);
         }
         drop((bank, r, run));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -361,7 +360,7 @@ fn candidate_skip_fail_and_bad_fill_keep_terminal_attempt_once_only() {
     }
     let source = source(3, 2);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -376,7 +375,7 @@ fn candidate_skip_fail_and_bad_fill_keep_terminal_attempt_once_only() {
     let error = partial.finish().unwrap_err();
     drop(step);
     drop((bank, r, run));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

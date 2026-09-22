@@ -38,6 +38,7 @@ impl CacheResidencyManager {
                 host_demotion_worker,
                 disk_worker,
                 pool_membership,
+                transfer_stream: Mutex::new(None),
                 _metadata_funding: None,
             }),
         })
@@ -101,6 +102,16 @@ impl CacheResidencyManager {
             (blocks, tails)
         };
         let fork = Self::new(options)?;
+        *fork
+            .inner
+            .transfer_stream
+            .lock()
+            .map_err(|_| CacheResidencyError::ManagerPoisoned)? = self
+            .inner
+            .transfer_stream
+            .lock()
+            .map_err(|_| CacheResidencyError::ManagerPoisoned)?
+            .clone();
         for (id, protected) in blocks {
             let lease = self.lease_block(&id, stream)?;
             let arrays = if copy_arrays {
@@ -204,7 +215,7 @@ impl CacheResidencyManager {
         }
         let representation = arrays.representation();
         validate_block_arrays(&arrays, end - start)?;
-        eval(arrays.arrays()).map_err(|source| CacheResidencyError::Runtime(source.to_string()))?;
+        evaluate_cache_arrays(arrays.arrays()).map_err(CacheResidencyError::NativeEvaluation)?;
         let id = CacheBlockId {
             session_id: self.session_id,
             global_layer,
@@ -329,8 +340,8 @@ impl CacheResidencyManager {
                 ));
             }
             validate_block_arrays(arrays, end - old_id.start)?;
-            eval(arrays.arrays())
-                .map_err(|source| CacheResidencyError::Runtime(source.to_string()))?;
+            evaluate_cache_arrays(arrays.arrays())
+                .map_err(CacheResidencyError::NativeEvaluation)?;
         }
 
         let mut state = self.lock()?;
@@ -483,7 +494,15 @@ impl CacheResidencyManager {
             .blocks
             .iter()
             .filter(|(id, record)| {
-                discard_candidate(&state, id, record, layer, representation, visible_start, prefix_tokens)
+                discard_candidate(
+                    &state,
+                    id,
+                    record,
+                    layer,
+                    representation,
+                    visible_start,
+                    prefix_tokens,
+                )
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -642,13 +661,15 @@ pub(super) fn discard_candidate(
     id.global_layer == layer
         && id.representation == representation
         && eredu_runtime::cache::CacheBlockSelection::outside_retained_window(
-            id.start, id.end, visible_start, prefix_tokens,
+            id.start,
+            id.end,
+            visible_start,
+            prefix_tokens,
         )
         && state.lifecycle.lease_count(id).ok() == Some(0)
         && !record.imported
-        && !state.history_retentions.iter().any(|entry| {
-            entry.upgrade().is_some_and(|retained| retained.contains(id))
-        })
+        && !retained_by_history(state,id)
+
 }
 
 pub(super) fn take_discarded_record(
@@ -667,8 +688,16 @@ pub(super) fn take_discarded_record(
 
 /// One lease-checked removal used by ordinary retirement and original rollback.
 /// The caller must drop the returned native/source payload after unlocking.
-pub(super) fn take_unleased_record(state: &mut CacheManagerState, id: &CacheBlockId)
-    -> Result<Option<CacheBlockRecord>, CacheResidencyError> {
+pub(super) fn take_unleased_record(
+    state: &mut CacheManagerState,
+    id: &CacheBlockId,
+) -> Result<Option<CacheBlockRecord>, CacheResidencyError> {
     state.lifecycle.remove(id)?;
     Ok(state.blocks.remove(id))
+}
+
+/// The same history predicate for ordinary retirement and prepared rollback.
+pub(super) fn retained_by_history(state:&CacheManagerState,id:&CacheBlockId)->bool {
+    state.history_retentions.iter().any(|entry|entry.upgrade().is_some_and(|retained|retained.contains(id)))
+        || state.prepared_history.as_ref().is_some_and(|entries|entries.retains(id))
 }

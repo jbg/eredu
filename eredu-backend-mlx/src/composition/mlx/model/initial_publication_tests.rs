@@ -1,13 +1,14 @@
 use super::*;
 use eredu_core::load_model;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::{sync::mpsc, time::Duration};
 
 #[test]
 fn contended_initial_publication_keeps_actual_loading_owner_and_source_storage() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let backend = crate::backend::MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let backend =
+        crate::backend::MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let prepared = load_model(&backend, root.path(), crate::MlxLoadRequest::default()).unwrap();
     let owner = prepared.memory_owner().unwrap().clone();
@@ -22,7 +23,7 @@ fn contended_initial_publication_keeps_actual_loading_owner_and_source_storage()
     let source_allocations = before.nonstate.array_allocation_facts();
     assert!(!source_allocations.is_empty());
     let positions = executable.erased().state_snapshot();
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.fixture_host_charge().unwrap();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -41,12 +42,14 @@ fn contended_initial_publication_keeps_actual_loading_owner_and_source_storage()
     worker.join().unwrap();
     assert!(!result.unwrap());
     assert!(elapsed < Duration::from_secs(1));
-    assert!(executable
-        ._memory_owner
-        .as_ref()
-        .unwrap()
-        .same_authority(&owner));
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert!(
+        executable
+            ._memory_owner
+            .as_ref()
+            .unwrap()
+            .same_authority(&owner)
+    );
+    assert_eq!(pool.fixture_host_charge().unwrap(), charged);
     assert_eq!(executable.erased().state_snapshot(), positions);
     drop(owner);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
@@ -58,9 +61,11 @@ fn contended_initial_publication_keeps_actual_loading_owner_and_source_storage()
     assert!(after.has_empty_decoder_storage().unwrap());
     assert_eq!(after.nonstate.array_allocation_facts(), source_allocations);
     let owner = executable._memory_owner.as_ref().unwrap().clone();
-    assert!(executable
-        .publish_initial_idle_storage(RetainedStorage::default(), &owner)
-        .unwrap());
+    assert!(
+        executable
+            .publish_initial_idle_storage(RetainedStorage::default(), &owner)
+            .unwrap()
+    );
     assert!(executable._memory_owner.is_none());
     drop(owner);
     crate::backend::submission_recovery::wait_for_retirement(|| {
@@ -68,11 +73,16 @@ fn contended_initial_publication_keeps_actual_loading_owner_and_source_storage()
     });
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     // Source-metadata estimates remain charged in addition to physical storage.
-    assert!(pool.used_bytes().unwrap() >= bytes);
+    assert!(pool.fixture_host_charge().unwrap() >= bytes);
     drop((before, after, executable));
     crate::backend::ordinary_retirement::reclaim_all();
     safemlx::reclaim_allocation_owners();
-    crate::backend::submission_recovery::wait_for_retirement(|| pool.used_bytes().unwrap() == 0);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
+        crate::backend::ordinary_retirement::reclaim_all();
+        safemlx::reclaim_allocation_owners();
+        pool.fixture_host_charge().unwrap() == 0
+    });
 }
 
 #[test]
@@ -144,3 +154,7 @@ fn optional_publication_recognizes_actual_wrapped_busy_but_keeps_native_boundary
             .expect("same actual native query source is retained");
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -3,21 +3,24 @@
 use super::*;
 
 mod original_paged_copy;
+mod prompt_cache;
 mod realtime_branch;
 pub(crate) use realtime_branch::RealtimeKvBranchPlan;
 mod prepared_copy;
-pub(crate) use prepared_copy::ResidentKvPreparationError;
-pub(in crate::backend::runtime::cache::state) use prepared_copy::{PagedWork, PreparedPagedStorageCopy};
 pub(in crate::backend::runtime::cache::state) use prepared_copy::copy_resident_kv_layer_retained;
+pub(crate) use prepared_copy::ResidentKvPreparationError;
 pub(crate) use prepared_copy::{
     DenseResidentKvPublishError, InitializedPagedDenseCopy, PreparedDenseResidentKvState,
     PreparedResidentKvCopy, PublishedDenseResidentKvState, ResidentKvCopyError,
     SavedResidentKvCopy,
 };
+pub(in crate::backend::runtime::cache::state) use prepared_copy::{
+    PagedWork, PreparedPagedStorageCopy,
+};
 mod workspace;
-pub(crate) use workspace::CompleteStateProjectionFailure;
 pub(in crate::backend::runtime::cache::state) use workspace::project_layers;
-pub(in crate::backend::runtime::cache::state) use workspace::{SourceCounts, project_complete};
+pub(crate) use workspace::CompleteStateProjectionFailure;
+pub(in crate::backend::runtime::cache::state) use workspace::{project_complete, SourceCounts};
 
 #[cfg(test)]
 mod slot_tests;
@@ -421,6 +424,29 @@ impl eredu_runtime::working_memory::ResidentTableResetState for MlxKeyValueState
 }
 
 impl MlxKeyValueState {
+    /// Inventories actual process registrations without accepting model or
+    /// request charges as a new cleanup baseline. Shared transfer owners count once.
+    #[cfg(test)]
+    pub(crate) fn permanent_transfer_registry_bytes(&self) -> Option<u64> {
+        let mut owners = std::collections::BTreeMap::new();
+        for layer in self.layers.slots() {
+            if let MlxKeyValueLayerState::Paged(cache) = layer {
+                let (identity, bytes) = cache
+                    .manager()
+                    .prepared_transfer_stream()
+                    .ok()?
+                    .registry_owner_account()?;
+                if owners
+                    .insert(identity, bytes)
+                    .is_some_and(|prior| prior != bytes)
+                {
+                    return None;
+                }
+            }
+        }
+        owners.into_values().try_fold(0u64, u64::checked_add)
+    }
+
     /// Includes absent future KV fields and the actual immutable host tables.
     /// Manager catalogs and external metadata are separate unknown domains.
     pub(crate) fn retained_owner_slot_counts(&self) -> Option<NativeStateSlotCounts> {
@@ -450,22 +476,26 @@ impl MlxKeyValueState {
     }
 
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
-        self.layers
-            .slots()
-            .iter()
-            .try_fold(0, |bound, layer| match layer {
-                MlxKeyValueLayerState::Stateless => Some(bound),
-                MlxKeyValueLayerState::Device(cache) => {
-                    Some(bound.max(cache.continuation_capacity_bound(additional)?))
-                }
-                MlxKeyValueLayerState::Paged(cache) => Some(
-                    bound.max(
-                        u64::try_from(KeyValueCache::offset(cache))
-                            .ok()?
-                            .checked_add(additional)?,
-                    ),
+        Self::layer_capacity_bound(self.layers.slots().iter(), additional)
+    }
+
+    pub(in crate::backend::runtime::cache::state) fn layer_capacity_bound<'a>(
+        mut layers: impl Iterator<Item = &'a MlxKeyValueLayerState>,
+        additional: u64,
+    ) -> Option<u64> {
+        layers.try_fold(0, |bound, layer| match layer {
+            MlxKeyValueLayerState::Stateless => Some(bound),
+            MlxKeyValueLayerState::Device(cache) => {
+                Some(bound.max(cache.continuation_capacity_bound(additional)?))
+            }
+            MlxKeyValueLayerState::Paged(cache) => Some(
+                bound.max(
+                    u64::try_from(KeyValueCache::offset(cache))
+                        .ok()?
+                        .checked_add(additional)?,
                 ),
-            })
+            ),
+        })
     }
 
     /// Creates contiguous execution-device state for every declared layer.
@@ -673,7 +703,37 @@ impl MlxKeyValueState {
     }
 
     /// Creates an independently advanceable speculative fork.
+    pub(crate) fn ordinary_checkpoint_program(
+        &self,
+        plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram,
+        crate::backend::error::Error,
+    > {
+        crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram::prepare(&self.layout, self.layers.metadata(), self.layers.slots(), std::iter::empty(),
+            &self.inference_retention, plan, context)
+    }
+
+    /// Captures the actual checkpoint fields with their retained state sources.
     pub fn deep_clone_state(&self) -> Result<Self, Exception> {
+        if let Some(loan) = super::ordinary_checkpoint::begin(
+            &self.layout,
+            self.layers.metadata(),
+            std::iter::empty(),
+            &self.inference_retention,
+        )? {
+            let layers =
+                loan.table(self.layers.slots(), MlxKeyValueLayerState::deep_clone_state)?;
+            let inference_retention = loan.retention(&self.inference_retention)?;
+            return Ok(Self {
+                layout: self.layout.clone(),
+                global_layer_start: self.global_layer_start,
+                layers,
+                inference_retention,
+                paged_transaction_branch: self.paged_transaction_branch,
+            });
+        }
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
@@ -728,12 +788,16 @@ impl MlxKeyValueState {
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
+        Self::layer_auxiliary_growth(self.layers.slots().iter(), additional)
+    }
+
+    pub(in crate::backend::runtime::cache::state) fn layer_auxiliary_growth<'a>(
+        layers: impl Iterator<Item = &'a MlxKeyValueLayerState>,
+        additional: u64,
+    ) -> Option<u64> {
         // At most one new block per token per layer. This conservative catalog
         // bound also covers partial tails becoming sealed during advancement.
-        let paged = self
-            .layers
-            .slots()
-            .iter()
+        let paged = layers
             .filter(|layer| matches!(layer, MlxKeyValueLayerState::Paged(_)))
             .count() as u64;
         additional
@@ -881,6 +945,7 @@ impl MlxKeyValueState {
     }
 
     /// Finalizes paged tails and atomically persists a completed prefix.
+    #[cfg(test)]
     pub fn save_prompt_cache(
         &mut self,
         destination: impl AsRef<Path>,
@@ -1102,7 +1167,9 @@ mod original_reset;
 #[path = "key_value/snapshot_source.rs"]
 mod snapshot_source;
 pub(crate) use snapshot_source::PagedSnapshotSource;
-pub(in crate::backend::runtime::cache::state) use snapshot_source::{PagedSnapshotLayer, PagedSnapshotState};
+pub(in crate::backend::runtime::cache::state) use snapshot_source::{
+    PagedSnapshotLayer, PagedSnapshotState,
+};
 
 pub(crate) use prepared_copy::{
     InitializedPagedKvCopy, PagedKvPreparationError, PreparedPagedKvCopy, PreparedPagedKvHostCopy,

@@ -83,16 +83,12 @@ fn rows(
     shared: bool,
     kind: CaptureKind,
 ) -> serde_json::Value {
-    assert!(
-        records
-            .iter()
-            .any(|r| r.role == SpeculativeCaptureRole::Target)
-    );
-    assert!(
-        records
-            .iter()
-            .any(|r| r.role == SpeculativeCaptureRole::Draft)
-    );
+    assert!(records
+        .iter()
+        .any(|r| r.role == SpeculativeCaptureRole::Target));
+    assert!(records
+        .iter()
+        .any(|r| r.role == SpeculativeCaptureRole::Draft));
     if matches!(kind, CaptureKind::Readouts | CaptureKind::PartialScale) {
         for role in [
             SpeculativeCaptureRole::Target,
@@ -149,12 +145,11 @@ fn rows(
         }
         if kind == CaptureKind::PartialScale {
             partial_scale::compare(values, &step.interventions, record.position);
-            result.last_mut().unwrap()["edits"] = serde_json::json!(
-                step.interventions
-                    .iter()
-                    .map(|edit| &edit.operation_id)
-                    .collect::<Vec<_>>()
-            );
+            result.last_mut().unwrap()["edits"] = serde_json::json!(step
+                .interventions
+                .iter()
+                .map(|edit| &edit.operation_id)
+                .collect::<Vec<_>>());
         }
     }
     result.into()
@@ -202,7 +197,10 @@ fn run_capture_on(
     let options = loaded.speculative_generation_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
     let plan = model
-        .prepare_speculative_capture(settings, raw_plan(if replay { 2 } else { 128 }, kind))
+        .prepare_speculative_capture(
+            settings.clone(),
+            raw_plan(if replay { 2 } else { 128 }, kind),
+        )
         .unwrap_or_else(report_failure);
     let mut edits = if kind == CaptureKind::PartialScale {
         Some(
@@ -260,7 +258,7 @@ fn run_capture_on(
             output_mode: eredu::api::PreparedChatOutputMode::Text,
             skip_special_tokens: true,
             drafting: drafting.as_speculative_draft().unwrap(),
-            settings: chat_settings(&chat, settings),
+            settings: chat_settings(&chat, settings.clone()),
             options,
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -294,7 +292,7 @@ fn run_capture_on(
         )
         .unwrap_or_else(report_failure);
     let request = ManagedPlainTextSpeculativeRequest {
-        text: ManagedPlainTextRequest::new(PROMPT, settings),
+        text: ManagedPlainTextRequest::new(PROMPT, settings.clone()),
         drafting: drafting.as_speculative_draft().unwrap(),
         options,
         cancellation: Default::default(),

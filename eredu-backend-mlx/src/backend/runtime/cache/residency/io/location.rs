@@ -8,6 +8,56 @@ use eredu_runtime::cache::{PreparedLiveCachePublication, cache_shard_tensor_name
 use std::mem::{size_of, size_of_val};
 
 impl DiskLocation {
+    /// Publishes only the immutable descriptor of an authenticated persistent
+    /// import. Its file has no live-writer reservation or unlink owner.
+    pub(crate) fn prepare_persistent(
+        source: eredu_runtime::cache::PersistentCacheBlockSource,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        let funding = context
+            .metadata_funding()
+            .ok_or(WorkspaceMetadataError::Unqualified)?;
+        let names = source.layout().names();
+        let frames = [
+            size_of::<Self>(),
+            size_of::<DiskLocationData>(),
+            size_of::<eredu_runtime::cache::PersistentCacheBlockSource>(),
+            size_of::<Result<Self, Error>>(),
+            size_of::<[u8; 64]>(),
+            size_of::<(&WorkspaceContext, [&str; 2])>(),
+            source.path().as_os_str().len(),
+            names[0].len(),
+            names[1].len(),
+            64,
+        ];
+        context.charge_metadata(
+            frames
+                .into_iter()
+                .try_fold(size_of_val(&frames), usize::checked_add)
+                .ok_or(WorkspaceMetadataError::Overflow)?,
+        )?;
+        let mut digest = String::with_capacity(64);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in source.payload_digest() {
+            digest.push(char::from(HEX[usize::from(byte >> 4)]));
+            digest.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        let data = DiskLocationData {
+            path: source.path().to_path_buf(),
+            first_name: names[0].to_owned(),
+            second_name: names[1].to_owned(),
+            persistent: true,
+            buffered: None,
+            payload_sha256: Some(digest),
+            payload_verification: context.metadata_arc(OnceLock::new())?,
+            live_source: None,
+            persistent_source: Some(source),
+        };
+        Ok(Self {
+            inner: context.metadata_arc(data)?,
+            funding: Some(funding),
+        })
+    }
     pub(super) fn original_control_bytes(
         path: &Path,
         representation: CacheRepresentation,
@@ -71,6 +121,7 @@ impl DiskLocation {
             payload_sha256: None,
             payload_verification: verification,
             live_source: None,
+            persistent_source: None,
         };
         Ok(Self {
             inner: context.metadata_arc(data)?,

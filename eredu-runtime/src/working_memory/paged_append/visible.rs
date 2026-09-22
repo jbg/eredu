@@ -130,6 +130,11 @@ impl PagedVisibleMechanisms for Visible<'_> {
         self.push(&pair, range)
     }
     fn submit_block(&mut self) -> Result<(), Error> {
+        if self.context.completion_strategy()
+            == eredu_nn::workspace::WorkspaceCompletionStrategy::OperationSubmissions
+        {
+            return Ok(());
+        }
         self.context.charge_metadata(size_of::<(
             &mut Self,
             [&WorkspaceTensor; 2],
@@ -262,6 +267,11 @@ impl PagedLocalUpdateMechanisms for Update<'_> {
         Ok(pair)
     }
     fn prepare_append(&mut self, visible: &Self::Pair) -> Result<(), Error> {
+        if self.context.completion_strategy()
+            == eredu_nn::workspace::WorkspaceCompletionStrategy::OperationSubmissions
+        {
+            return Ok(());
+        }
         self.context.charge_metadata(size_of::<(
             &mut Self,
             &[WorkspaceTensor; 2],

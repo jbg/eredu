@@ -1,5 +1,7 @@
 //! Read-only erasure forwards actual stored token validation, never a rebind.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation;
 
 fn binding_error(error: &Error) {
@@ -22,13 +24,13 @@ fn replicated_and_composite_erasure_validate_actual_path_owner_and_stale_token_c
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let source_stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for family in ["llama", "gemma4"] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let artifact = if family == "llama" {
             crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true)
         } else {
             super::super::host_layerwise_tests::family_artifact(family)
         };
-        let backend = MlxBackend::new(&stream, &source_stream).with_memory_pool(pool.clone());
+        let backend = MlxBackend::new(&stream, &source_stream).with_memory_ledger(pool.clone());
         let mut first =
             eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
                 .unwrap();
@@ -54,41 +56,52 @@ fn replicated_and_composite_erasure_validate_actual_path_owner_and_stale_token_c
             .expect("actual decoder unit in the prepared traversal");
         let original_path = a.unit_paths(group, 0).unwrap().0.as_ptr();
         let before = path_instrumentation::snapshot();
-        let used = pool.used_bytes().unwrap();
+        let used = pool.fixture_host_charge().unwrap();
         let owners = pool.unquoted_owner_count().unwrap();
         first
             .executable_mut()
             .erased()
-            .validate_prepared_observation_paths(&a, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
+            .validate_prepared_observation_paths(
+                &a,
+                eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+            )
             .unwrap();
         second
             .executable_mut()
             .erased()
-            .validate_prepared_observation_paths(&b, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
+            .validate_prepared_observation_paths(
+                &b,
+                eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+            )
             .unwrap();
         binding_error(
             &first
                 .executable_mut()
                 .erased()
-                .validate_prepared_observation_paths(&b, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
+                .validate_prepared_observation_paths(
+                    &b,
+                    eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+                )
                 .unwrap_err(),
         );
         assert_eq!(path_instrumentation::snapshot(), before);
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
         assert_eq!(pool.unquoted_owner_count().unwrap(), owners);
         // Replacement publication invalidates the existing runtime token,
         // including an empty replacement set.
         let _ = first
             .executable_mut()
             .erased_mut()
-            .publish_parameter_replacements(&Default::default(), false)
-            .unwrap();
+            .finalize_parameter_publication();
         let stale_before = path_instrumentation::snapshot();
         binding_error(
             &first
                 .executable_mut()
                 .erased()
-                .validate_prepared_observation_paths(&a, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
+                .validate_prepared_observation_paths(
+                    &a,
+                    eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+                )
                 .unwrap_err(),
         );
         assert_eq!(path_instrumentation::snapshot(), stale_before);

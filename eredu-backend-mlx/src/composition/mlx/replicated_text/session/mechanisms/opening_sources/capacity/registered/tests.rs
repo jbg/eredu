@@ -21,7 +21,7 @@ where
         session: &eredu_runtime::ReplicatedTextSession<A, MlxNeuralBackend, Self>,
         source: &eredu_core::capture::SharedCapturePlan,
         q: IncrementalInferenceQuote,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         caps: &ModelCapabilities,
         capacity: Option<u64>,
     ) -> Result<OpeningPinSetup, Error> {
@@ -73,33 +73,34 @@ where
             input: InputTokenCount::text(geometry.cached_positions + geometry.input_positions),
             max_output_tokens: geometry.max_output_tokens,
             batch_size: geometry.batch_size,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: crate::memory_fixture::headroom(0),
+            memory_limits: Default::default(),
         };
-        let before = pool.used_bytes().unwrap();
-        let exact = before.checked_add(q.incremental_bytes()).unwrap();
+        let before = pool.fixture_host_charge().unwrap();
+        let exact = before
+            .checked_add(q.incremental_bytes().expect("finite fixture diagnostic"))
+            .unwrap();
         let short = plan_prefill_incremental_with_capacity(
             session.inference_execution_identity(),
             pool,
             caps,
             request.clone(),
             geometry,
-            exact - 1,
+            crate::memory_fixture::resolved_limits(exact - 1),
             |_| Ok(q.clone()),
         );
         assert!(
             short.is_err(),
             "one byte short must reject before native snapshot allocation"
         );
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
         let (reservation, accepted) = plan_prefill_incremental_with_capacity(
             session.inference_execution_identity(),
             pool,
             caps,
             request,
             geometry,
-            capacity.unwrap_or(exact),
+            crate::memory_fixture::resolved_limits(capacity.unwrap_or(exact)),
             |_| Ok(q.clone()),
         )
         .map_err(|e| Error::Other(Box::new(e)))?;
@@ -157,12 +158,14 @@ fn derived_slots_are_checked_and_native_zero_does_not_erase_real_source_origin()
     ));
     let empty = Array::from_slice::<f32>(&[], &[0]);
     let _ = empty.evaluated().unwrap();
-    assert!(storage_entry(OpeningEntry::Array(
-        &empty,
-        empty.try_allocation_info().unwrap().unwrap()
-    ))
-    .unwrap()
-    .is_none());
+    assert!(
+        storage_entry(OpeningEntry::Array(
+            &empty,
+            empty.try_allocation_info().unwrap().unwrap()
+        ))
+        .unwrap()
+        .is_none()
+    );
     let source = Arc::new(Vec::<u8>::new());
     let entry = eredu_checkpoint::store::SourceStorageRef::new(&source, 0);
     let (key, bytes) = storage_entry(OpeningEntry::Source(entry)).unwrap().unwrap();
@@ -190,7 +193,7 @@ fn arbitrary_pin_layout_cannot_replace_derived_native_proposal() {
     let paths = execution.prepare_observation_paths().unwrap();
     let selected = paths.source().prepare_capture_selection(&source).unwrap();
     let store = eredu_checkpoint::store::MemoryWeightStore::default();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let q = fixture::quote(&pool);
     let plan = NativeOpeningCapacityPlan::prepare(
         &state,
@@ -229,7 +232,7 @@ fn arbitrary_pin_layout_cannot_replace_derived_native_proposal() {
     );
     assert!(failure.inventory.owners.retained_counts().arrays > 0);
     drop((failure, owned, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -241,7 +244,7 @@ fn incomplete_handoff_retains_capsule_and_foreign_binding_does_not_take_bank() {
     let paths = execution.prepare_observation_paths().unwrap();
     let selected = paths.source().prepare_capture_selection(&source).unwrap();
     let store = eredu_checkpoint::store::MemoryWeightStore::default();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let q = fixture::quote(&pool);
     let plan = NativeOpeningCapacityPlan::prepare(
         &state,
@@ -273,7 +276,7 @@ fn incomplete_handoff_retains_capsule_and_foreign_binding_does_not_take_bank() {
     assert!(matches!(failure.cause, OpeningError::Incomplete));
     let mut capsule = failure.inventory;
     capsule.collect().unwrap();
-    let foreign_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let other = fixture::quote(&foreign_pool);
     let other_plan = NativeOpeningCapacityPlan::prepare(
         &state,
@@ -307,8 +310,8 @@ fn incomplete_handoff_retains_capsule_and_foreign_binding_does_not_take_bank() {
         .unwrap_or_else(|e| panic!("{}", e.cause));
     assert!(snapshot.paths.same_storage(paths.source()));
     drop((snapshot, owned, run, other_owned, other_run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
+    assert_eq!(foreign_pool.fixture_host_charge().unwrap(), 0);
 }
 
 impl PreparedOpeningPins {
@@ -330,3 +333,11 @@ impl PreparedOpeningPins {
         self.bank.spent_rows()
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

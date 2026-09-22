@@ -56,13 +56,14 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
 ))]
 mod tests {
     use super::*;
-    use eredu_runtime::working_memory::{
-        quote_sampling_workspace_with_observer,
-    };
+    use eredu_runtime::working_memory::quote_sampling_workspace_with_observer;
     use eredu_runtime::{ConfiguredTextSampler, GenerationSampler};
 
     #[test]
     fn actual_penalty_windows_join_complete_sampling_constructors() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
         let qualified = safemlx::PreparedPipelineCachePlan::new(0)

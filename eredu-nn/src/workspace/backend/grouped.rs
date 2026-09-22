@@ -139,10 +139,12 @@ fn projection_parameters(
             // retained identity and complete geometry after constructing that
             // axis; the temporary ungrouped projection cannot establish its
             // native scalar or stride facts.
-            parameter.replace(WorkspaceTensor::existing(
-                context.parameter_layout(&parameter.spec, &shape, dtype)?,
-                context,
-            )?);
+            let layout = context.parameter_layout(&parameter.spec, &shape, dtype)?;
+            let value = match context.parameter_backing(&parameter.spec, &layout)? {
+                Some(root) => WorkspaceTensor::existing_with_storage(layout, &root, context)?,
+                None => WorkspaceTensor::existing(layout, context)?,
+            };
+            parameter.replace(value);
         }
     }
     Ok(parameters)
@@ -304,8 +306,11 @@ impl<S: super::super::policy_clone::MetadataClone + Into<WorkspaceGroupedBank>> 
         Ok(context.clone_metadata(&self.spec)?.into())
     }
     fn trace(
-        &self, input: &WorkspaceTensor, selection: &GroupSelection<WorkspaceTensor>,
-        partitions: Option<usize>, context: &WorkspaceContext,
+        &self,
+        input: &WorkspaceTensor,
+        selection: &GroupSelection<WorkspaceTensor>,
+        partitions: Option<usize>,
+        context: &WorkspaceContext,
         observer: Option<&mut dyn GroupedUnitObserver<WorkspaceTensor>>,
     ) -> Result<TensorParallelGroupedOutput<WorkspaceTensor>, Error> {
         let bank = self.bank(context)?;
@@ -315,16 +320,26 @@ impl<S: super::super::policy_clone::MetadataClone + Into<WorkspaceGroupedBank>> 
     }
 }
 impl WorkspaceGroupedBank {
-    fn kind(&self, phase: WorkspaceGroupedPhase, partitions: Option<usize>, context: &WorkspaceContext)
-        -> Result<WorkspaceOperationKind, Error> {
-        context.charge_metadata(super::super::policy_clone::controls::<WorkspaceGroupedBank>()
-            .ok_or(WorkspaceMetadataError::Overflow)?)?;
+    fn kind(
+        &self,
+        phase: WorkspaceGroupedPhase,
+        partitions: Option<usize>,
+        context: &WorkspaceContext,
+    ) -> Result<WorkspaceOperationKind, Error> {
+        context.charge_metadata(
+            super::super::policy_clone::controls::<WorkspaceGroupedBank>()
+                .ok_or(WorkspaceMetadataError::Overflow)?,
+        )?;
         let bank = match self {
             Self::Linear(spec) => Self::Linear(context.clone_metadata(spec)?),
             Self::GatedProduct(spec) => Self::GatedProduct(context.clone_metadata(spec)?),
             Self::Relu2(spec) => Self::Relu2(context.clone_metadata(spec)?),
         };
-        Ok(WorkspaceOperationKind::Grouped { bank: context.box_metadata(bank)?, phase, partitions })
+        Ok(WorkspaceOperationKind::Grouped {
+            bank: context.box_metadata(bank)?,
+            phase,
+            partitions,
+        })
     }
     /// The ordinary grouped recorder with an exact borrowed parameter projection.
     /// Dynamic region sources use this same equation after binding actual rows.
@@ -536,22 +551,37 @@ group_operator!(
 );
 
 impl GroupedNeuralBackend for WorkspaceBackend {
-    fn record_addressable_region_source(source:WorkspaceAddressableRegionView<'_>,input:&WorkspaceTensor,
-        routes:&GroupSelection<WorkspaceTensor>,context:&WorkspaceContext,
-        observe:Option<&mut dyn FnMut(WorkspaceAddressableObservationView<'_>)->Result<WorkspaceAddressableObservationSource,Error>>)
-        ->Result<Option<TensorParallelGroupedOutput<WorkspaceTensor>>,Error>{
-        record_addressable_region_with_observation(source,input,routes,context,observe).map(Some)
+    fn record_addressable_region_source(
+        source: WorkspaceAddressableRegionView<'_>,
+        input: &WorkspaceTensor,
+        routes: &GroupSelection<WorkspaceTensor>,
+        context: &WorkspaceContext,
+        observe: Option<
+            &mut dyn FnMut(
+                WorkspaceAddressableObservationView<'_>,
+            ) -> Result<WorkspaceAddressableObservationSource, Error>,
+        >,
+    ) -> Result<Option<TensorParallelGroupedOutput<WorkspaceTensor>>, Error> {
+        record_addressable_region_with_observation(source, input, routes, context, observe)
+            .map(Some)
     }
 
     fn with_addressable_region<P, E, F>(
-        source: WorkspaceAddressableRegionView<'_>, owner: &mut P,
-        input: &WorkspaceTensor, routes: &GroupSelection<WorkspaceTensor>,
-        context: &WorkspaceContext, _run: F,
-    ) -> Result<Result<TensorParallelGroupedOutput<WorkspaceTensor>,E>,Error>
-    where F: FnOnce(&mut P, Option<crate::PreparedIndexedInvocationLoan<'_>>)
-        -> Result<TensorParallelGroupedOutput<WorkspaceTensor>,E> {
+        source: WorkspaceAddressableRegionView<'_>,
+        owner: &mut P,
+        input: &WorkspaceTensor,
+        routes: &GroupSelection<WorkspaceTensor>,
+        context: &WorkspaceContext,
+        _run: F,
+    ) -> Result<Result<TensorParallelGroupedOutput<WorkspaceTensor>, E>, Error>
+    where
+        F: FnOnce(
+            &mut P,
+            Option<crate::PreparedIndexedInvocationLoan<'_>>,
+        ) -> Result<TensorParallelGroupedOutput<WorkspaceTensor>, E>,
+    {
         let _ = owner;
-        record_addressable_region(source,input,routes,context).map(Ok)
+        record_addressable_region(source, input, routes, context).map(Ok)
     }
 
     type LinearGroups = WorkspaceGroups<GroupedLinearSpec>;

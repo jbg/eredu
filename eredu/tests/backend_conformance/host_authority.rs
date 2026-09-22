@@ -1,11 +1,11 @@
 use super::MockError;
 use eredu_core::{BackendFailure, HostPreparationAuthority};
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::cell::RefCell;
 
 #[derive(Default)]
 pub(crate) struct Probe {
-    pub pool: Option<WorkingMemoryPool>,
+    pub pool: Option<MemoryLedger>,
     pub attempts: usize,
     pub reject_at: Option<usize>,
     pub copies: Vec<&'static str>,
@@ -68,7 +68,7 @@ pub(crate) fn copy(operation: &'static str) -> Result<(), MockError> {
 pub(crate) struct Guard;
 
 impl Guard {
-    pub fn new(pool: &WorkingMemoryPool) -> Self {
+    pub fn new(pool: &MemoryLedger) -> Self {
         PROBE.with(|slot| {
             let mut slot = slot.borrow_mut();
             assert!(slot.is_none());
@@ -91,6 +91,6 @@ impl Drop for Guard {
     }
 }
 
-pub(super) fn source_pool() -> Option<WorkingMemoryPool> {
+pub(super) fn source_pool() -> Option<MemoryLedger> {
     PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.pool.clone()))
 }

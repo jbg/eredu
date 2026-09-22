@@ -4,6 +4,8 @@ mod candidates;
 mod carrier;
 mod histogram;
 mod observer;
+mod ordinary;
+pub(in crate::composition::mlx::session::model_session) use ordinary::control_bytes as ordinary_publication_control_bytes;
 mod readout;
 mod summary;
 mod token_scores;
@@ -11,12 +13,14 @@ mod transient;
 use crate::backend::array_copy::{
     CaptureCompletion, PreparedCaptureTensor, ScheduledCaptureTensorExecutionError,
 };
-pub(super) use carrier::{CaptureCarrierOwner, active_control_bytes, common_control_bytes};
+pub(super) use carrier::{active_control_bytes, common_control_bytes, CaptureCarrierOwner};
 use eredu_core::capture::CaptureTensorGeometry;
 use eredu_runtime::working_memory::{
     CaptureTensorClaim, CaptureTensorHostPlan, ClaimedCaptureTensor,
 };
-pub(super) fn replica_control_bytes() -> Option<usize> { observer::replica_control_bytes() }
+pub(super) fn replica_control_bytes() -> Option<usize> {
+    observer::replica_control_bytes()
+}
 pub(super) fn observer_error_control_bytes() -> Option<usize> {
     observer::error_control_bytes()?
         .checked_add(token_scores::control_bytes()?)?
@@ -60,7 +64,7 @@ impl FundedWork {
     ) -> Result<RetainedStoragePublication, Error> {
         match completion {
             CaptureCompletion::Ordinary => {
-                let mut storage = RetainedStorage::default();
+                let mut storage = ordinary::prepare(scope)?;
                 storage.include_array(source)?;
                 storage.publish_funded(scope)
             }
@@ -124,18 +128,6 @@ impl FundedWork {
         // Reserve descriptor/publication slots before retaining or evaluating.
         // No native root is dropped if a later fallible step rejects. These are
         // existing native recovery bookkeeping, not numerical allocation grants.
-        if matches!(completion, CaptureCompletion::Ordinary) {
-            self.roots
-                .try_borrow_mut()
-                .map_err(|error| Error::Other(Box::new(error)))?
-                .try_reserve_exact(1)
-                .map_err(|error| Error::Other(Box::new(error)))?;
-            self.publications
-                .try_borrow_mut()
-                .map_err(|error| Error::Other(Box::new(error)))?
-                .try_reserve_exact(1)
-                .map_err(|error| Error::Other(Box::new(error)))?;
-        }
         self.retain(source);
         if let Some(cause) = self.take_collection_failure() {
             return Err(cause);
@@ -151,16 +143,9 @@ impl FundedWork {
             .validate_native_scope(scope)
             .map_err(|error| Error::Other(Box::new(error)))?;
         let publication = self.publish_capture_source(source, scope, completion)?;
-        // Original pure-native publication attaches the charge to the backing.
-        // The lexical owner stays through the source pin and complete transfer;
-        // it cannot consume either final publication inventory/slot.
-        let _publication = match completion {
-            CaptureCompletion::Original(_) => Some(publication),
-            CaptureCompletion::Ordinary => {
-                self.publications.borrow_mut().push(publication);
-                None
-            }
-        };
+        // Native charges attach to the backing. Keep the paid collector receipt
+        // through the source pin and complete transfer without another Work slot.
+        let _publication = publication;
         // Source publication alone must not hide unsettled unrelated work or
         // clear its recovery roots. Source pins attach to this very same scope
         // in the scheduled leaf and survive all subsequent transfer failures.
@@ -176,7 +161,14 @@ impl FundedWork {
         let prepared = PreparedCaptureTensor::new(source, host)
             .map_err(|error| Error::Other(Box::new(error)))?;
         prepared
-            .transfer_scheduled_with_completion(claim, scope, stream, &self.roots, completion)
+            .transfer_scheduled_with_completion(
+                claim,
+                scope,
+                stream,
+                &self.roots,
+                completion,
+                self.original_metadata_custody().as_ref(),
+            )
             .map_err(|error| match error {
                 ScheduledCaptureTensorExecutionError::Mechanism(error) => {
                     Error::Other(Box::new(error))

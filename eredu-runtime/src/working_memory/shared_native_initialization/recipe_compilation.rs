@@ -33,11 +33,11 @@ impl<M> SharedNativeInitializer for EncodedRecipeChildrenPlan<M> {
 /// branches, byte mappings and selection semantics remain checkpoint-owned.
 /// Source birth, recipe declarations, read scratch and output are prerequisites.
 pub struct AdmittedRecipeConstruction<'a> {
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
 }
 impl<'a> AdmittedRecipeConstruction<'a> {
     /// Borrow the pool used for each actual constructor and retained output.
-    pub fn new(pool: &'a WorkingMemoryPool) -> Self {
+    pub fn new(pool: &'a MemoryLedger) -> Self {
         Self { pool }
     }
 }
@@ -116,7 +116,7 @@ impl EncodedRecipeConstruction for AdmittedRecipeConstruction<'_> {
             .pool
             .initialize_shared_native(plan)
             .map_err(|error| Self::Error::Children(error.into_parts().1))?;
-        Ok(output.with_custody(SharedNativeInitializationCustody(account)))
+        Ok(output.with_custody(SharedNativeInitializationCustody(account, None)))
     }
 }
 

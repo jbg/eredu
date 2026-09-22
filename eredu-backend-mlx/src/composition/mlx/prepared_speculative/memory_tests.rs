@@ -6,9 +6,7 @@ use eredu_core::{
     TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenFilterController,
     WorkspaceBound,
 };
-use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -40,22 +38,26 @@ fn zero_admission() -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
 fn config(temperature: f32) -> TextGenerationConfig {
@@ -73,15 +75,16 @@ fn config(temperature: f32) -> TextGenerationConfig {
     .with_seed(19)
 }
 
-fn settle(pool: &WorkingMemoryPool, expected: usize) {
+fn settle(pool: &MemoryLedger, expected: usize) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
         MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
         pool.unquoted_owner_count().unwrap() == expected
     });
 }
 
-fn assert_unquoted(pool: &WorkingMemoryPool, expected: usize) {
+fn assert_unquoted(pool: &MemoryLedger, expected: usize) {
     settle(pool, expected);
     assert!(matches!(
         pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
@@ -162,25 +165,25 @@ impl SemanticState for UnenteredSemantic {
 #[test]
 fn prepared_speculation_rejects_a_reserved_domain_before_lane_setup_and_respects_other_domains() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let reserved_pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let other_pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let reserved_pool = crate::memory_fixture::ledger(0, 0).unwrap();
+    let other_pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let reservation = reserved_pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    for same_domain in [true, false] {
-        let selected_pool = if same_domain {
+    for same_ledger in [true, false] {
+        let selected_pool = if same_ledger {
             &reserved_pool
         } else {
             &other_pool
         };
-        let model_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let loader = MlxBackend::new(&stream, &stream).with_memory_pool(model_pool);
+        let model_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+        let loader = MlxBackend::new(&stream, &stream).with_memory_ledger(model_pool);
         let root = super::super::replicated_text::tests::tiny_artifact("llama", true);
         let model =
             eredu_core::load_model(&loader, root.path(), crate::MlxLoadRequest::default()).unwrap();
         let prompt = MlxBackend::prepare_text_prompt(&loader, vec![1, 2, 3]).unwrap();
         let mut runtime = ModelRuntime::from_prepared(
-            MlxBackend::new(&stream, &stream).with_memory_pool(selected_pool.clone()),
+            MlxBackend::new(&stream, &stream).with_memory_ledger(selected_pool.clone()),
             model,
         )
         .unwrap();
@@ -207,7 +210,7 @@ fn prepared_speculation_rejects_a_reserved_domain_before_lane_setup_and_respects
         )
         .err()
         .unwrap();
-        if same_domain {
+        if same_ledger {
             assert_eq!(
                 memory_error(&error),
                 Some(&WorkingMemoryError::ReservedWorkActive)
@@ -220,8 +223,8 @@ fn prepared_speculation_rejects_a_reserved_domain_before_lane_setup_and_respects
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         settle(selected_pool, 0);
-        assert_eq!(selected_pool.used_bytes().unwrap(), 0);
-        assert_eq!(selected_pool.peak_bytes().unwrap(), 0);
+        assert_eq!(selected_pool.fixture_host_charge().unwrap(), 0);
+        assert_eq!(selected_pool.fixture_host_peak().unwrap(), 0);
         drop(runtime);
     }
     drop(reservation);
@@ -230,7 +233,7 @@ fn prepared_speculation_rejects_a_reserved_domain_before_lane_setup_and_respects
 #[test]
 fn bound_greedy_and_stochastic_sampler_clones_keep_their_domain_owner() {
     for temperature in [0.0, 0.7] {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(0, 0).unwrap();
         let owner = NativeMemoryOwner::acquire(&pool).unwrap();
         let (seed, policy) = MlxSpeculativeSession::prepare_mlx_speculative_sampling(
             config(temperature),
@@ -260,7 +263,7 @@ fn copied_speculative_tensor_has_distinct_backing_and_retains_fresh_authority_th
             continue;
         }
         let stream = Stream::new_with_device(&safemlx::Device::new(device, 0));
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(0, 0).unwrap();
         let owner = NativeMemoryOwner::acquire(&pool).unwrap();
         let context = SpeculativeExecutionStreams::single(&stream).with_memory_owner(&owner);
         let source =
@@ -293,13 +296,13 @@ fn copied_speculative_tensor_has_distinct_backing_and_retains_fresh_authority_th
 }
 
 #[test]
-fn speculative_control_seed_rejects_same_domain_reservation_before_allocation() {
+fn speculative_control_seed_rejects_same_ledger_reservation_before_allocation() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     let error =
         <MlxSpeculativeSampling<MlxTextSampler> as SpeculativeSampling>::control_seed(19, context)
             .err()
@@ -309,8 +312,8 @@ fn speculative_control_seed_rejects_same_domain_reservation_before_allocation() 
         Some(&WorkingMemoryError::ReservedWorkActive)
     );
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
+    assert_eq!(pool.fixture_host_peak().unwrap(), 0);
     drop(reservation);
 }
 
@@ -365,7 +368,7 @@ fn target_state_values(
 fn empty_and_populated_embedded_state_copies_keep_fresh_authority_through_clone_and_restore() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for populated in [false, true] {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(0, 0).unwrap();
         let owner = NativeMemoryOwner::acquire(&pool).unwrap();
         let source = target_state(populated, &stream);
         assert_eq!(source.retained_arrays().is_empty(), !populated);
@@ -415,7 +418,7 @@ fn empty_and_populated_embedded_state_copies_keep_fresh_authority_through_clone_
 fn embedded_state_copy_rejects_a_reserved_domain_without_changing_empty_or_populated_source() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for populated in [false, true] {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(0, 0).unwrap();
         let source = target_state(populated, &stream);
         let expected = target_state_values(&source, &stream);
         let allocations = source
@@ -427,7 +430,7 @@ fn embedded_state_copy_rejects_a_reserved_domain_without_changing_empty_or_popul
         let reservation = pool
             .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
             .unwrap();
-        let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+        let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
         let error = copy_control_state(&source, context).unwrap_err();
         assert_eq!(
             memory_error(&error),
@@ -444,8 +447,12 @@ fn embedded_state_copy_rejects_a_reserved_domain_without_changing_empty_or_popul
             allocations,
         );
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.peak_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
+        assert_eq!(pool.fixture_host_peak().unwrap(), 0);
         drop(reservation);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

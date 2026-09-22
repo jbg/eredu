@@ -67,9 +67,11 @@ impl DiskReadFinishFailure {
         output: PreparedDiskReadOutput,
     ) -> Self {
         let funding = output.funding.clone();
+        let retained = Mutex::new(body);
+        drop(retained.lock().expect("new unshared read-failure mutex"));
         Self {
             cause,
-            retained: Some(Mutex::new(body)),
+            retained: Some(retained),
             output,
             funding,
         }
@@ -122,17 +124,30 @@ impl PreparedDiskReadOutput {
 impl ReadBody {
     fn finish(&mut self) -> Result<(), FinishCause> {
         for index in 0..2 {
-            self.filling[index]
-                .as_mut()
-                .ok_or(FinishCause::Identity)?
-                .completed_mut()
-                .freeze()
-                .map_err(FinishCause::Freeze)?;
-            let source = filled_host::finish(self.filling[index].take().expect("frozen destination"))
-                .map_err(FinishCause::Publication)?;
-            let allocation = source.allocation();
-            let (buffer, _proof, source_custody) = source.into_parts();
-            drop(source_custody);
+            if let Some(Filling::Original(pending)) = self.filling[index].as_mut() {
+                pending
+                    .completed_mut()
+                    .freeze()
+                    .map_err(FinishCause::Freeze)?;
+            }
+            let (buffer, allocation) =
+                match self.filling[index].take().ok_or(FinishCause::Identity)? {
+                    Filling::Original(pending) => {
+                        let source =
+                            filled_host::finish(pending).map_err(FinishCause::Publication)?;
+                        let allocation = source.allocation();
+                        let (buffer, _proof, custody) = source.into_parts();
+                        drop(custody);
+                        (buffer, Some(allocation))
+                    }
+                    Filling::Ordinary(writer) => match writer.try_return() {
+                        Ok(buffer) => (buffer.freeze(), None),
+                        Err(writer) => {
+                            self.filling[index] = Some(Filling::Ordinary(writer));
+                            return Err(FinishCause::Identity);
+                        }
+                    },
+                };
             // Two exact immutable Arc shells were priced before native entry.
             self.ready[index] = Some(Arc::new(buffer));
             let descriptor = self.ready[index]
@@ -142,10 +157,21 @@ impl ReadBody {
                 .map_err(FinishCause::Descriptor)?;
             if descriptor.shape() != self.shapes[index]
                 || descriptor.dtype() != self.dtypes[index]
-                || descriptor.allocation() != allocation
-                || allocation.bytes() != self.capacities[index]
+                || allocation.is_some_and(|expected| descriptor.allocation() != expected)
+                || descriptor.allocation().bytes() != self.capacities[index]
                 || descriptor.policy() != HostTransferPolicy::Transfer
-                || descriptor.storage_kind() != safemlx::HostTransferStorageKind::MetalShared
+                || match &self.ordinary_placements {
+                    Some(placements) => {
+                        self.ordinary_identity.is_none()
+                            || self.source_custody.is_some()
+                            || descriptor.allocation().placement() != placements[index]
+                    }
+                    None => {
+                        allocation.is_none()
+                            || descriptor.storage_kind()
+                                != safemlx::HostTransferStorageKind::MetalShared
+                    }
+                }
             {
                 return Err(FinishCause::Identity);
             }
@@ -192,8 +218,13 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<Result<CompletedDiskRead, DiskReadFinishFailure>>(),
         size_of::<Result<(), FinishCause>>(),
         size_of::<ReadBody>(),
+        size_of::<Filling>(),
+        size_of::<Option<safemlx::AllocationInfo>>(),
+        size_of::<(ImmutableHostTransferBuffer, Option<safemlx::AllocationInfo>)>(),
+        size_of::<Result<safemlx::HostTransferBuffer, safemlx::PreparedHostTransferWriter>>(),
         size_of::<Mutex<Option<ReadBody>>>(),
         size_of::<Mutex<ReadBody>>(),
+        initialized_mutex_control_bytes::<ReadBody>()?,
         size_of::<MutexGuard<'_, Option<ReadBody>>>(),
         size_of::<Result<BodyLoan<'_>, TryLockError<BodyLoan<'_>>>>(),
         size_of::<Option<ReadBody>>(),
@@ -202,14 +233,13 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<(FinishCause, ReadBody, PreparedDiskReadOutput)>(),
         size_of::<(FinishCause, &PreparedDiskReadOutput)>(),
         size_of::<(&mut ReadBody, usize, safemlx::AllocationInfo)>(),
-        size_of::<
-            Result<
-                filled_host::PublishedHostSource,
-                filled_host::SourceError,
-            >,
-        >(),
+        size_of::<Result<filled_host::PublishedHostSource, filled_host::SourceError>>(),
         size_of::<filled_host::PublishedHostSource>(),
-        size_of::<(ImmutableHostTransferBuffer, Option<crate::backend::runtime::residency::storage::PublishedAllocation>, eredu_runtime::working_memory::OriginalOperationMetadataCustody)>(),
+        size_of::<(
+            ImmutableHostTransferBuffer,
+            Option<crate::backend::runtime::residency::storage::PublishedAllocation>,
+            eredu_runtime::working_memory::OriginalOperationMetadataCustody,
+        )>(),
         size_of::<Option<crate::backend::runtime::residency::storage::PublishedAllocation>>(),
         size_of::<Result<(), filled_host::SourceCause>>(),
         size_of::<HostCacheBlock>(),

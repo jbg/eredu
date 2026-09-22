@@ -1,9 +1,9 @@
 //! Backend-generic speculative execution over architecture-owned prediction strategies.
 
-use std::marker::PhantomData;
 use crate::prediction_extension::equation::{
     execute_prediction_equation, PredictionEquation, PredictionEquationOutput,
 };
+use std::marker::PhantomData;
 
 use eredu_core::speculative::{
     AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationOrigin,
@@ -22,20 +22,26 @@ mod observation;
 mod prefill_source;
 pub use captured_prefill::PrefillValues as EmbeddedPrefillValues;
 mod prediction_phase;
-pub use prediction_phase::{PredictionCompletionPoint, PredictionCompletionSources, OrdinaryPredictionPhase, PredictionPhaseRoots, PredictionPhaseState, PredictionPhaseEvidence, ReplicatedPredictionPhase};
+pub use prediction_phase::{
+    OrdinaryPredictionPhase, PredictionCompletionPoint, PredictionCompletionSources,
+    PredictionPhaseEvidence, PredictionPhaseRoots, PredictionPhaseState, ReplicatedPredictionPhase,
+};
 pub use prefill_source::{
     AdmittedPredictionPrefill, CompositePredictionPrefill, PredictionPrefillPlan,
     PredictionPrefillSource, TextPredictionPrefill,
 };
-mod snapshot;
-mod prepared_copy;
 mod logit_block;
 mod outer_observer;
-pub use outer_observer::observe_embedded_tensor_ordinary;
-pub use logit_block::{EmbeddedPredictionLogitBlock, EmbeddedPredictionTensor};
-pub use prepared_copy::{PreparedEmbeddedCopy, PreparedEmbeddedCopyError, PreparedEmbeddedCopyProvider, PreparedEmbeddedEvidence, PreparedEmbeddedPayload, PreparedEmbeddedState};
+mod prepared_copy;
+mod snapshot;
+pub(crate) use capture::{resolve_scope, ScopeError};
 pub use capture::{speculative_capture_scope, SpeculativeActivationExecution};
-pub(crate) use capture::{resolve_scope,ScopeError};
+pub use logit_block::{EmbeddedPredictionLogitBlock, EmbeddedPredictionTensor};
+pub use outer_observer::observe_embedded_tensor_ordinary;
+pub use prepared_copy::{
+    PreparedEmbeddedCopy, PreparedEmbeddedCopyError, PreparedEmbeddedCopyProvider,
+    PreparedEmbeddedEvidence, PreparedEmbeddedPayload, PreparedEmbeddedState,
+};
 
 /// Observation path for the physical target capture consumed by embedded prediction.
 pub const EMBEDDED_TARGET_CAPTURE_PATH: &str = "embedded_prediction.target_capture";
@@ -76,7 +82,9 @@ impl<T, L, E> EmbeddedPredictionObservers<T, L, E> {
         ) -> Box<dyn eredu_runtime::ActivationObserver<N, E>>,
     ) -> EmbeddedPredictionObservers<T, N, E> {
         EmbeddedPredictionObservers {
-            tensors: self.tensors, logits: adapt(self.logits), internal: self.internal,
+            tensors: self.tensors,
+            logits: adapt(self.logits),
+            internal: self.internal,
         }
     }
 
@@ -110,20 +118,28 @@ impl<T, L, E> EmbeddedPredictionObservers<T, L, E> {
     }
 
     fn tensor<'a, M>(
-        &mut self, path: &str, value: T,
-        chunk: Option<&eredu_runtime::prefill::PrefillChunk>, context: M::Context<'a>,
+        &mut self,
+        path: &str,
+        value: T,
+        chunk: Option<&eredu_runtime::prefill::PrefillChunk>,
+        context: M::Context<'a>,
     ) -> Result<T, E>
-    where M: SpeculativeTensorMechanisms<Tensor = T, Error = E>,
+    where
+        M: SpeculativeTensorMechanisms<Tensor = T, Error = E>,
     {
         let observer = match self.tensors.as_mut() {
-            Some(observer) => Some(&mut **observer as &mut dyn eredu_runtime::ActivationObserver<T, E>),
+            Some(observer) => {
+                Some(&mut **observer as &mut dyn eredu_runtime::ActivationObserver<T, E>)
+            }
             None => None,
         };
         M::observe_outer_tensor(value, path, chunk, observer, context)
     }
 
     fn supports_tensor_prefill_spans(&self) -> bool {
-        self.tensors.as_ref().is_none_or(|observer| observer.supports_prefill_spans())
+        self.tensors
+            .as_ref()
+            .is_none_or(|observer| observer.supports_prefill_spans())
     }
 
     fn logits(&mut self, value: &L) -> Result<L, E>
@@ -176,32 +192,51 @@ impl<T, L> EmbeddedPredictionCache<T, L> {
     /// Installs actual prepared target and prediction copies with their exact
     /// source providers. No ordinary state is adopted into this constructor.
     pub fn from_prepared(
-        target: PreparedEmbeddedState<T>, prediction: PreparedEmbeddedState<L>,
+        target: PreparedEmbeddedState<T>,
+        prediction: PreparedEmbeddedState<L>,
     ) -> Result<Self, eredu_core::BackendFailure> {
         let bytes = std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<Result<Self, eredu_core::BackendFailure>>())
             .ok_or_else(|| target.copy.reject(PreparedEmbeddedCopyError::Overflow))?;
         let metadata_host = target.copy.prepare_host(bytes)?;
-        Ok(Self { target: Some(target.value), prediction: prediction.value,
-            prepared_input: None, capture_generation: None,
+        Ok(Self {
+            target: Some(target.value),
+            prediction: prediction.value,
+            prepared_input: None,
+            capture_generation: None,
             prepared: Some(prepared_copy::CacheOwnership {
-                target: target.copy, prediction: prediction.copy,
-                target_evidence: target.evidence, prediction_evidence: prediction.evidence,
-                target_host: target.host, prediction_host: prediction.host, metadata_host,
-            }) })
+                target: target.copy,
+                prediction: prediction.copy,
+                target_evidence: target.evidence,
+                prediction_evidence: prediction.evidence,
+                target_host: target.host,
+                prediction_host: prediction.host,
+                metadata_host,
+            }),
+        })
     }
 
     /// Installs the actual target completion/source witness before the next copy.
     /// Returns false for ordinary storage, which has no original provider.
-    pub fn retain_target_evidence<E: 'static>(&mut self, evidence: E) -> Result<bool, eredu_core::BackendFailure> {
-        let Some(prepared) = &mut self.prepared else { return Ok(false); };
+    pub fn retain_target_evidence<E: 'static>(
+        &mut self,
+        evidence: E,
+    ) -> Result<bool, eredu_core::BackendFailure> {
+        let Some(prepared) = &mut self.prepared else {
+            return Ok(false);
+        };
         let evidence = prepared.target.retain_evidence(evidence)?;
         prepared.target_evidence = Some(evidence);
         Ok(true)
     }
     /// Installs prediction state evidence after its actual successful completion.
-    pub fn retain_prediction_evidence<E: 'static>(&mut self, evidence: E) -> Result<bool, eredu_core::BackendFailure> {
-        let Some(prepared) = &mut self.prepared else { return Ok(false); };
+    pub fn retain_prediction_evidence<E: 'static>(
+        &mut self,
+        evidence: E,
+    ) -> Result<bool, eredu_core::BackendFailure> {
+        let Some(prepared) = &mut self.prepared else {
+            return Ok(false);
+        };
         let evidence = prepared.prediction.retain_evidence(evidence)?;
         prepared.prediction_evidence = Some(evidence);
         Ok(true)
@@ -210,14 +245,18 @@ impl<T, L> EmbeddedPredictionCache<T, L> {
     /// Exact most recently completed target source, borrowed before it is copied
     /// into a particular output owner. Later state mutations cannot replace that copy.
     pub fn target_logit_evidence(&self) -> Option<&PreparedEmbeddedEvidence> {
-        self.prepared.as_ref().and_then(|prepared| prepared.target_evidence.as_ref())
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.target_evidence.as_ref())
     }
 
     /// Borrows only the target witness slot while its state is in the session.
     pub fn target_phase_evidence(&mut self) -> PredictionPhaseEvidence<'_, T> {
-        PredictionPhaseEvidence::new(self.prepared.as_mut().map(|prepared| {
-            (&prepared.target, &mut prepared.target_evidence)
-        }))
+        PredictionPhaseEvidence::new(
+            self.prepared
+                .as_mut()
+                .map(|prepared| (&prepared.target, &mut prepared.target_evidence)),
+        )
     }
 
     /// Borrows opaque target storage when it is not temporarily installed in a session.
@@ -247,9 +286,12 @@ impl<T, L> EmbeddedPredictionCache<T, L> {
 
     /// Lends this branch's state and exact evidence destination to one phase.
     pub fn prediction_phase_state(&mut self) -> PredictionPhaseState<'_, L> {
-        PredictionPhaseState::new(&mut self.prediction, self.prepared.as_mut().map(|prepared| {
-            (&prepared.prediction, &mut prepared.prediction_evidence)
-        }))
+        PredictionPhaseState::new(
+            &mut self.prediction,
+            self.prepared
+                .as_mut()
+                .map(|prepared| (&prepared.prediction, &mut prepared.prediction_evidence)),
+        )
     }
 
     /// Binds the lane to the exact prepared description and semantic content.
@@ -258,35 +300,77 @@ impl<T, L> EmbeddedPredictionCache<T, L> {
         identity: Option<&eredu_runtime::PreparedInputCacheIdentity>,
     ) -> Result<(), EmbeddedPredictionCacheError> {
         if let Some(prepared) = &mut self.prepared {
-            let identity = identity.ok_or_else(|| EmbeddedPredictionCacheError::Prepared(
-                prepared.target.reject(PreparedEmbeddedCopyError::MissingPreparedInput)))?;
+            let identity = identity.ok_or_else(|| {
+                EmbeddedPredictionCacheError::Prepared(
+                    prepared
+                        .target
+                        .reject(PreparedEmbeddedCopyError::MissingPreparedInput),
+                )
+            })?;
             let prefix = "prepared-input/";
             let suffix = identity.prefix_content_fingerprint();
             if let Some(bound) = self.prepared_input.as_ref() {
-                return if bound.as_str().strip_prefix(prefix) == Some(suffix) { Ok(()) }
-                else { Err(EmbeddedPredictionCacheError::Prepared(prepared.target.reject(PreparedEmbeddedCopyError::SourceMismatch))) };
+                return if bound.as_str().strip_prefix(prefix) == Some(suffix) {
+                    Ok(())
+                } else {
+                    Err(EmbeddedPredictionCacheError::Prepared(
+                        prepared
+                            .target
+                            .reject(PreparedEmbeddedCopyError::SourceMismatch),
+                    ))
+                };
             }
-            let capacity = prefix.len().checked_add(suffix.len()).ok_or_else(||
-                EmbeddedPredictionCacheError::Prepared(prepared.target.reject(PreparedEmbeddedCopyError::Overflow)))?;
-            let parts = [capacity, std::mem::size_of::<String>(),
+            let capacity = prefix.len().checked_add(suffix.len()).ok_or_else(|| {
+                EmbeddedPredictionCacheError::Prepared(
+                    prepared.target.reject(PreparedEmbeddedCopyError::Overflow),
+                )
+            })?;
+            let parts = [
+                capacity,
+                std::mem::size_of::<String>(),
                 std::mem::size_of::<Option<eredu_runtime::SpeculativeIdentity>>(),
                 std::mem::size_of::<std::collections::TryReserveError>(),
-                std::mem::size_of::<Result<(), std::collections::TryReserveError>>()];
-            let bytes = parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
-                .ok_or_else(|| EmbeddedPredictionCacheError::Prepared(prepared.target.reject(PreparedEmbeddedCopyError::Overflow)))?;
-            let host = prepared.target.prepare_host(bytes).map_err(EmbeddedPredictionCacheError::Prepared)?;
+                std::mem::size_of::<Result<(), std::collections::TryReserveError>>(),
+            ];
+            let bytes = parts
+                .into_iter()
+                .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+                .ok_or_else(|| {
+                    EmbeddedPredictionCacheError::Prepared(
+                        prepared.target.reject(PreparedEmbeddedCopyError::Overflow),
+                    )
+                })?;
+            let host = prepared
+                .target
+                .prepare_host(bytes)
+                .map_err(EmbeddedPredictionCacheError::Prepared)?;
             let mut text = String::new();
-            text.try_reserve_exact(capacity).map_err(|cause|
-                EmbeddedPredictionCacheError::Prepared(prepared.target.allocation_failure(cause)))?;
-            text.push_str(prefix); text.push_str(suffix);
+            text.try_reserve_exact(capacity).map_err(|cause| {
+                EmbeddedPredictionCacheError::Prepared(prepared.target.allocation_failure(cause))
+            })?;
+            text.push_str(prefix);
+            text.push_str(suffix);
             let identity = eredu_runtime::SpeculativeIdentity::new(text).map_err(|_| {
-                EmbeddedPredictionCacheError::Prepared(prepared.target.reject(PreparedEmbeddedCopyError::SourceMismatch))
+                EmbeddedPredictionCacheError::Prepared(
+                    prepared
+                        .target
+                        .reject(PreparedEmbeddedCopyError::SourceMismatch),
+                )
             })?;
             match self.prepared_input.as_ref() {
-                Some(bound) if bound != &identity => return Err(EmbeddedPredictionCacheError::Prepared(
-                    prepared.target.reject(PreparedEmbeddedCopyError::SourceMismatch))),
+                Some(bound) if bound != &identity => {
+                    return Err(EmbeddedPredictionCacheError::Prepared(
+                        prepared
+                            .target
+                            .reject(PreparedEmbeddedCopyError::SourceMismatch),
+                    ))
+                }
                 Some(_) => return Ok(()),
-                None => { self.prepared_input = Some(identity); prepared.metadata_host = host; return Ok(()); }
+                None => {
+                    self.prepared_input = Some(identity);
+                    prepared.metadata_host = host;
+                    return Ok(());
+                }
             }
         }
         let identity = identity.ok_or(EmbeddedPredictionCacheError::MissingPreparedInput)?;
@@ -334,13 +418,22 @@ impl<T, L> EmbeddedPredictionCache<T, L> {
 
     /// Borrows the exact selected/input owners at this target frontier.
     pub fn lane_identity_ref<'a, E>(
-        &'a self, selected: &'a eredu_runtime::SelectedSpeculativeRealization,
+        &'a self,
+        selected: &'a eredu_runtime::SelectedSpeculativeRealization,
         generation: impl FnOnce(&T) -> Result<u64, E>,
-    ) -> Result<eredu_runtime::SpeculativeLaneIdentityRef<'a>, EmbeddedPredictionCacheAccessError<E>> {
-        let prepared = self.prepared_input.as_ref().ok_or(EmbeddedPredictionCacheError::CaptureBeforePreparedInput)?;
+    ) -> Result<eredu_runtime::SpeculativeLaneIdentityRef<'a>, EmbeddedPredictionCacheAccessError<E>>
+    {
+        let prepared = self
+            .prepared_input
+            .as_ref()
+            .ok_or(EmbeddedPredictionCacheError::CaptureBeforePreparedInput)?;
         let generation = match &self.target {
-            Some(target) => generation(target).map_err(EmbeddedPredictionCacheAccessError::Native)?,
-            None => self.capture_generation.ok_or(EmbeddedPredictionCacheError::MissingCaptureGeneration)?,
+            Some(target) => {
+                generation(target).map_err(EmbeddedPredictionCacheAccessError::Native)?
+            }
+            None => self
+                .capture_generation
+                .ok_or(EmbeddedPredictionCacheError::MissingCaptureGeneration)?,
         };
         Ok(selected.lane_identity_ref(prepared, generation))
     }
@@ -369,23 +462,46 @@ impl<T, L: Clone> EmbeddedPredictionCache<T, L> {
         clone_target: impl FnOnce(&T) -> Result<T, E>,
     ) -> Result<Self, EmbeddedPredictionCacheAccessError<E>> {
         if let Some(prepared) = &self.prepared {
-            let target = self.target.as_ref().map(|state| prepared.target.copy_state(state, prepared.target_evidence.as_ref()))
-                .transpose().map_err(EmbeddedPredictionCacheAccessError::Prepared)?;
-            let prediction = prepared.prediction.copy_state(&self.prediction, prepared.prediction_evidence.as_ref())
+            let target = self
+                .target
+                .as_ref()
+                .map(|state| {
+                    prepared
+                        .target
+                        .copy_state(state, prepared.target_evidence.as_ref())
+                })
+                .transpose()
                 .map_err(EmbeddedPredictionCacheAccessError::Prepared)?;
-            let (prepared_input, metadata_host) = prepared_copy::identity::<_, Self>(&self.prepared_input, &prepared.target)
+            let prediction = prepared
+                .prediction
+                .copy_state(&self.prediction, prepared.prediction_evidence.as_ref())
                 .map_err(EmbeddedPredictionCacheAccessError::Prepared)?;
+            let (prepared_input, metadata_host) =
+                prepared_copy::identity::<_, Self>(&self.prepared_input, &prepared.target)
+                    .map_err(EmbeddedPredictionCacheAccessError::Prepared)?;
             let (target, target_evidence, target_host) = match target {
                 Some(value) => (Some(value.value), value.evidence, value.host),
-                None => (None, prepared.target_evidence.clone(), prepared.target_host.clone()),
+                None => (
+                    None,
+                    prepared.target_evidence.clone(),
+                    prepared.target_host.clone(),
+                ),
             };
-            return Ok(Self { target, prediction: prediction.value, prepared_input,
+            return Ok(Self {
+                target,
+                prediction: prediction.value,
+                prepared_input,
                 capture_generation: self.capture_generation,
                 prepared: Some(prepared_copy::CacheOwnership {
-                    target: prepared.target.clone(), prediction: prepared.prediction.clone(),
-                    target_evidence, prediction_evidence: prediction.evidence,
-                    target_host, prediction_host: prediction.host, metadata_host,
-                }) });
+                    target: prepared.target.clone(),
+                    prediction: prepared.prediction.clone(),
+                    target_evidence,
+                    prediction_evidence: prediction.evidence,
+                    target_host,
+                    prediction_host: prediction.host,
+                    metadata_host,
+                }),
+            });
         }
         let target = self
             .target
@@ -403,29 +519,50 @@ impl<T, L: Clone> EmbeddedPredictionCache<T, L> {
     }
 
     /// Forks prediction-local state without transferring ordinary target storage.
-    pub fn prediction_fork(&self) -> Result<EmbeddedPredictionDraftCache<L>, eredu_core::BackendFailure> {
+    pub fn prediction_fork(
+        &self,
+    ) -> Result<EmbeddedPredictionDraftCache<L>, eredu_core::BackendFailure> {
         if let Some(prepared) = &self.prepared {
-            let prediction = prepared.prediction.copy_state(&self.prediction, prepared.prediction_evidence.as_ref())?;
-            let (prepared_input, metadata_host) = prepared_copy::identity::<_, EmbeddedPredictionDraftCache<L>>(
-                &self.prepared_input, &prepared.prediction)?;
+            let prediction = prepared
+                .prediction
+                .copy_state(&self.prediction, prepared.prediction_evidence.as_ref())?;
+            let (prepared_input, metadata_host) =
+                prepared_copy::identity::<_, EmbeddedPredictionDraftCache<L>>(
+                    &self.prepared_input,
+                    &prepared.prediction,
+                )?;
             return Ok(EmbeddedPredictionDraftCache {
-                prediction: prediction.value, prepared_input, capture_generation: self.capture_generation,
-                prepared: Some(prepared_copy::PredictionOwnership { copy: prepared.prediction.clone(),
-                    evidence: prediction.evidence, payload_host: prediction.host, metadata_host }),
+                prediction: prediction.value,
+                prepared_input,
+                capture_generation: self.capture_generation,
+                prepared: Some(prepared_copy::PredictionOwnership {
+                    copy: prepared.prediction.clone(),
+                    evidence: prediction.evidence,
+                    payload_host: prediction.host,
+                    metadata_host,
+                }),
             });
         }
         Ok(EmbeddedPredictionDraftCache {
-            prediction: self.prediction.clone(), prepared_input: self.prepared_input.clone(),
-            capture_generation: self.capture_generation, prepared: None,
+            prediction: self.prediction.clone(),
+            prepared_input: self.prepared_input.clone(),
+            capture_generation: self.capture_generation,
+            prepared: None,
         })
     }
 
     /// Commits a successful prediction-local transaction.
-    pub fn commit_prediction(&mut self, draft: &EmbeddedPredictionDraftCache<L>) -> Result<(), eredu_core::BackendFailure> {
+    pub fn commit_prediction(
+        &mut self,
+        draft: &EmbeddedPredictionDraftCache<L>,
+    ) -> Result<(), eredu_core::BackendFailure> {
         match (&mut self.prepared, &draft.prepared) {
             (Some(current), Some(source)) if current.prediction.same_source(&source.copy) => {
-                let prediction = source.copy.copy_state(&draft.prediction, source.evidence.as_ref())?;
-                let (identity, metadata_host) = prepared_copy::identity::<_, Self>(&draft.prepared_input, &source.copy)?;
+                let prediction = source
+                    .copy
+                    .copy_state(&draft.prediction, source.evidence.as_ref())?;
+                let (identity, metadata_host) =
+                    prepared_copy::identity::<_, Self>(&draft.prepared_input, &source.copy)?;
                 // Both fallible destinations complete before replacing canonical state.
                 self.prediction = prediction.value;
                 self.prepared_input = identity;
@@ -435,8 +572,12 @@ impl<T, L: Clone> EmbeddedPredictionCache<T, L> {
                 current.metadata_host = metadata_host;
                 Ok(())
             }
-            (Some(current), _) => Err(current.prediction.reject(PreparedEmbeddedCopyError::SourceMismatch)),
-            (_, Some(source)) => Err(source.copy.reject(PreparedEmbeddedCopyError::SourceMismatch)),
+            (Some(current), _) => Err(current
+                .prediction
+                .reject(PreparedEmbeddedCopyError::SourceMismatch)),
+            (_, Some(source)) => Err(source
+                .copy
+                .reject(PreparedEmbeddedCopyError::SourceMismatch)),
             (None, None) => {
                 self.prediction.clone_from(&draft.prediction);
                 self.prepared_input.clone_from(&draft.prepared_input);
@@ -448,12 +589,23 @@ impl<T, L: Clone> EmbeddedPredictionCache<T, L> {
 
     /// Restores a completed provisional checkpoint by moving its existing paid
     /// destinations. Recovery cannot require another copy after a failed action.
-    pub fn rollback_prediction(&mut self, checkpoint: EmbeddedPredictionDraftCache<L>) -> Result<(), eredu_core::BackendFailure> {
+    pub fn rollback_prediction(
+        &mut self,
+        checkpoint: EmbeddedPredictionDraftCache<L>,
+    ) -> Result<(), eredu_core::BackendFailure> {
         match (&self.prepared, &checkpoint.prepared) {
-            (Some(current), Some(source)) if current.prediction.same_source(&source.copy) => {},
-            (Some(current), _) => return Err(current.prediction.reject(PreparedEmbeddedCopyError::SourceMismatch)),
-            (_, Some(source)) => return Err(source.copy.reject(PreparedEmbeddedCopyError::SourceMismatch)),
-            (None, None) => {},
+            (Some(current), Some(source)) if current.prediction.same_source(&source.copy) => {}
+            (Some(current), _) => {
+                return Err(current
+                    .prediction
+                    .reject(PreparedEmbeddedCopyError::SourceMismatch))
+            }
+            (_, Some(source)) => {
+                return Err(source
+                    .copy
+                    .reject(PreparedEmbeddedCopyError::SourceMismatch))
+            }
+            (None, None) => {}
         }
         self.prediction = checkpoint.prediction;
         self.prepared_input = checkpoint.prepared_input;
@@ -473,17 +625,37 @@ impl<T, L: Clone> EmbeddedPredictionCache<T, L> {
         restore_target: impl FnOnce(&mut T, &T) -> Result<(), E>,
     ) -> Result<(), EmbeddedPredictionCacheAccessError<E>> {
         match (&self.prepared, &checkpoint.prepared) {
-            (Some(current), Some(source)) if current.target.same_source(&source.target)
-                && current.prediction.same_source(&source.prediction) => {
+            (Some(current), Some(source))
+                if current.target.same_source(&source.target)
+                    && current.prediction.same_source(&source.prediction) =>
+            {
                 if self.target.is_some() != checkpoint.target.is_some() {
-                    return Err(EmbeddedPredictionCacheAccessError::Prepared(current.target.reject(PreparedEmbeddedCopyError::SourceMismatch)));
+                    return Err(EmbeddedPredictionCacheAccessError::Prepared(
+                        current
+                            .target
+                            .reject(PreparedEmbeddedCopyError::SourceMismatch),
+                    ));
                 }
-                let replacement = checkpoint.checkpoint(|_| -> Result<T, E> { unreachable!("prepared copy owns its target worker") })?;
+                let replacement = checkpoint.checkpoint(|_| -> Result<T, E> {
+                    unreachable!("prepared copy owns its target worker")
+                })?;
                 *self = replacement;
                 return Ok(());
             }
-            (Some(current), _) => return Err(EmbeddedPredictionCacheAccessError::Prepared(current.target.reject(PreparedEmbeddedCopyError::SourceMismatch))),
-            (_, Some(source)) => return Err(EmbeddedPredictionCacheAccessError::Prepared(source.target.reject(PreparedEmbeddedCopyError::SourceMismatch))),
+            (Some(current), _) => {
+                return Err(EmbeddedPredictionCacheAccessError::Prepared(
+                    current
+                        .target
+                        .reject(PreparedEmbeddedCopyError::SourceMismatch),
+                ))
+            }
+            (_, Some(source)) => {
+                return Err(EmbeddedPredictionCacheAccessError::Prepared(
+                    source
+                        .target
+                        .reject(PreparedEmbeddedCopyError::SourceMismatch),
+                ))
+            }
             (None, None) => {}
         }
         match (&mut self.target, &checkpoint.target) {
@@ -513,15 +685,22 @@ pub struct EmbeddedPredictionDraftCache<L> {
 
 impl<L> EmbeddedPredictionDraftCache<L> {
     /// Installs this branch's actual prediction completion/source witness.
-    pub fn retain_evidence<E: 'static>(&mut self, evidence: E) -> Result<bool, eredu_core::BackendFailure> {
-        let Some(prepared) = &mut self.prepared else { return Ok(false); };
+    pub fn retain_evidence<E: 'static>(
+        &mut self,
+        evidence: E,
+    ) -> Result<bool, eredu_core::BackendFailure> {
+        let Some(prepared) = &mut self.prepared else {
+            return Ok(false);
+        };
         let evidence = prepared.copy.retain_evidence(evidence)?;
         prepared.evidence = Some(evidence);
         Ok(true)
     }
     /// Borrow the actual completed invocation source for this branch's output.
     pub fn logit_evidence(&self) -> Option<&PreparedEmbeddedEvidence> {
-        self.prepared.as_ref().and_then(|prepared| prepared.evidence.as_ref())
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.evidence.as_ref())
     }
 
     /// Borrows prediction-local storage.
@@ -536,16 +715,26 @@ impl<L> EmbeddedPredictionDraftCache<L> {
 
     /// Lends this fork's state and its own completed-source witness slot.
     pub fn prediction_phase_state(&mut self) -> PredictionPhaseState<'_, L> {
-        PredictionPhaseState::new(&mut self.prediction, self.prepared.as_mut().map(|prepared| {
-            (&prepared.copy, &mut prepared.evidence)
-        }))
+        PredictionPhaseState::new(
+            &mut self.prediction,
+            self.prepared
+                .as_mut()
+                .map(|prepared| (&prepared.copy, &mut prepared.evidence)),
+        )
     }
 
     /// Borrows this prediction branch's exact selected/input identity.
-    pub fn lane_identity_ref<'a>(&'a self, selected: &'a eredu_runtime::SelectedSpeculativeRealization)
-        -> Result<eredu_runtime::SpeculativeLaneIdentityRef<'a>, EmbeddedPredictionCacheError> {
-        let prepared = self.prepared_input.as_ref().ok_or(EmbeddedPredictionCacheError::CaptureBeforePreparedInput)?;
-        let generation = self.capture_generation.ok_or(EmbeddedPredictionCacheError::MissingCaptureGeneration)?;
+    pub fn lane_identity_ref<'a>(
+        &'a self,
+        selected: &'a eredu_runtime::SelectedSpeculativeRealization,
+    ) -> Result<eredu_runtime::SpeculativeLaneIdentityRef<'a>, EmbeddedPredictionCacheError> {
+        let prepared = self
+            .prepared_input
+            .as_ref()
+            .ok_or(EmbeddedPredictionCacheError::CaptureBeforePreparedInput)?;
+        let generation = self
+            .capture_generation
+            .ok_or(EmbeddedPredictionCacheError::MissingCaptureGeneration)?;
         Ok(selected.lane_identity_ref(prepared, generation))
     }
 
@@ -569,15 +758,29 @@ impl<L: Clone> EmbeddedPredictionDraftCache<L> {
     /// Copies current state with its retained provider, preserving ordinary behavior.
     pub fn try_copy(&self) -> Result<Self, eredu_core::BackendFailure> {
         if let Some(prepared) = &self.prepared {
-            let prediction = prepared.copy.copy_state(&self.prediction, prepared.evidence.as_ref())?;
-            let (prepared_input, metadata_host) = prepared_copy::identity::<_, Self>(&self.prepared_input, &prepared.copy)?;
-            return Ok(Self { prediction: prediction.value, prepared_input,
+            let prediction = prepared
+                .copy
+                .copy_state(&self.prediction, prepared.evidence.as_ref())?;
+            let (prepared_input, metadata_host) =
+                prepared_copy::identity::<_, Self>(&self.prepared_input, &prepared.copy)?;
+            return Ok(Self {
+                prediction: prediction.value,
+                prepared_input,
                 capture_generation: self.capture_generation,
-                prepared: Some(prepared_copy::PredictionOwnership { copy: prepared.copy.clone(),
-                    evidence: prediction.evidence, payload_host: prediction.host, metadata_host }) });
+                prepared: Some(prepared_copy::PredictionOwnership {
+                    copy: prepared.copy.clone(),
+                    evidence: prediction.evidence,
+                    payload_host: prediction.host,
+                    metadata_host,
+                }),
+            });
         }
-        Ok(Self { prediction: self.prediction.clone(), prepared_input: self.prepared_input.clone(),
-            capture_generation: self.capture_generation, prepared: None })
+        Ok(Self {
+            prediction: self.prediction.clone(),
+            prepared_input: self.prepared_input.clone(),
+            capture_generation: self.capture_generation,
+            prepared: None,
+        })
     }
 }
 
@@ -625,29 +828,44 @@ pub enum EmbeddedPredictionCacheAccessError<E> {
 }
 
 /// Fixed protocol diagnostics for the shared embedded prediction driver.
-#[derive(Clone,Copy,Debug,thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum EmbeddedPredictionContractError {
     /// The erased value did not match the executor's declared concrete type.
     #[error("embedded executor carried a mismatched erased {value}")]
-    ErasedValue { /// Declared boundary value.
-        value: &'static str },
+    ErasedValue {
+        /// Declared boundary value.
+        value: &'static str,
+    },
     /// A commit exceeds the actual provisional block.
     #[error("cannot commit {verified} embedded-prediction inputs from a block of {available}")]
-    Commit { /// Requested prefix.
-        verified:usize, /// Actual provisional length.
-        available:usize },
+    Commit {
+        /// Requested prefix.
+        verified: usize,
+        /// Actual provisional length.
+        available: usize,
+    },
     /// A completed output disagrees with the declared sequence geometry.
     #[error("embedded prediction output lengths disagree: logits={logits}, capture={capture}, tokens={tokens}, expected={expected:?}")]
-    Output { /// Readout rows.
-        logits:usize, /// Captured rows.
-        capture:usize, /// Input positions.
-        tokens:usize, /// Requested rows, when fixed.
-        expected:Option<usize> },
+    Output {
+        /// Readout rows.
+        logits: usize,
+        /// Captured rows.
+        capture: usize,
+        /// Input positions.
+        tokens: usize,
+        /// Requested rows, when fixed.
+        expected: Option<usize>,
+    },
     /// Fused output is shorter than the selected proposal count.
-    #[error("fused embedded prediction block has {available} rows, but {requested} were requested")]
-    FusedCapacity { /// Selected proposal count.
-        requested:usize, /// Actual rows.
-        available:usize },
+    #[error(
+        "fused embedded prediction block has {available} rows, but {requested} were requested"
+    )]
+    FusedCapacity {
+        /// Selected proposal count.
+        requested: usize,
+        /// Actual rows.
+        available: usize,
+    },
 }
 
 /// Tensor, token, transfer, and completion mechanisms needed by embedded prediction.
@@ -668,7 +886,11 @@ pub trait SpeculativeTensorMechanisms: 'static {
 
     /// Moves an already retained source error into the public neutral boundary.
     /// Ordinary errors remain in their native domain for the existing adapter.
-    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error> {Err(error)}
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
+        Err(error)
+    }
 
     /// Coordinates host scheduler facts without executing a model equation.
     fn coordinate_speculative_step<'a>(
@@ -701,14 +923,19 @@ pub trait SpeculativeTensorMechanisms: 'static {
     /// Validates outer callback ownership before even querying its optional
     /// prefill capabilities. This check invokes no caller callback.
     fn validate_outer_tensor_observer<'a>(
-        _has_caller: bool, _context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> { Ok(()) }
+        _has_caller: bool,
+        _context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Observes an owned outer tensor through the existing callback worker.
     /// An absent callback is structural: original backends may move the value
     /// after validating their context, while ordinary execution keeps its clone.
     fn observe_outer_tensor<'a>(
-        value: Self::Tensor, path: &str, chunk: Option<&eredu_runtime::prefill::PrefillChunk>,
+        value: Self::Tensor,
+        path: &str,
+        chunk: Option<&eredu_runtime::prefill::PrefillChunk>,
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Self::Tensor, Self::Error>>,
         _context: Self::Context<'a>,
     ) -> Result<Self::Tensor, Self::Error> {
@@ -732,12 +959,18 @@ pub trait SpeculativeTensorMechanisms: 'static {
 
     /// Durable immutable seed ownership. Ordinary snapshots keep their existing
     /// independent tensor copy; original packets may share their completed value.
-    fn control_tensor_packet_estimate(value:&EmbeddedPredictionTensor<Self::Tensor>)
-        ->Option<eredu_core::execution_control::SnapshotEstimate>{Self::control_tensor_estimate(value)}
+    fn control_tensor_packet_estimate(
+        value: &EmbeddedPredictionTensor<Self::Tensor>,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        Self::control_tensor_estimate(value)
+    }
     /// Copies or shares the seed through its selected immutable ownership policy.
-    fn control_tensor_packet_snapshot<'a>(value:&EmbeddedPredictionTensor<Self::Tensor>,context:Self::Context<'a>)
-        ->Result<Option<EmbeddedPredictionTensor<Self::Tensor>>,SpeculativeControlError>{
-        Self::control_tensor_snapshot(value,context).map(|value|value.map(EmbeddedPredictionTensor::ordinary))
+    fn control_tensor_packet_snapshot<'a>(
+        value: &EmbeddedPredictionTensor<Self::Tensor>,
+        context: Self::Context<'a>,
+    ) -> Result<Option<EmbeddedPredictionTensor<Self::Tensor>>, SpeculativeControlError> {
+        Self::control_tensor_snapshot(value, context)
+            .map(|value| value.map(EmbeddedPredictionTensor::ordinary))
     }
 
     /// Binds an admitted portable collector to native capture mechanisms. Scopes
@@ -796,9 +1029,13 @@ pub trait SpeculativeTensorMechanisms: 'static {
     /// Selects from one retained completed output proof; the ordinary backend
     /// keeps its original row worker. Evidence grants no new model invocation.
     fn logits_row_with_source<'a>(
-        value: &Self::Tensor, row: usize, _source: Option<&PreparedEmbeddedEvidence>,
+        value: &Self::Tensor,
+        row: usize,
+        _source: Option<&PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> { Self::logits_row(value, row, context) }
+    ) -> Result<Self::Logits, Self::Error> {
+        Self::logits_row(value, row, context)
+    }
 
     /// Selects who owns the final prefill score-row operation. A source-bound
     /// implementation may retain selected positions and use its existing paid
@@ -813,48 +1050,74 @@ pub trait SpeculativeTensorMechanisms: 'static {
     /// SelectedPositions requires the implementation to select and complete the
     /// final causal row under that source's own execution authority.
     fn selected_prefill_logits_with_source<'a>(
-        value: Self::Tensor, _source: Option<&PreparedEmbeddedEvidence>,
+        value: Self::Tensor,
+        _source: Option<&PreparedEmbeddedEvidence>,
         _context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> { Self::selected_prefill_logits(value) }
+    ) -> Result<Self::Logits, Self::Error> {
+        Self::selected_prefill_logits(value)
+    }
 
     /// Retains one immutable block; original backends pay the shared fixed
     /// destination before construction and validate the supplied output source.
     fn retain_logit_block<'a>(
-        value: Self::Tensor, _source: Option<PreparedEmbeddedEvidence>,
+        value: Self::Tensor,
+        _source: Option<PreparedEmbeddedEvidence>,
         _context: Self::Context<'a>,
     ) -> Result<EmbeddedPredictionLogitBlock<Self::Tensor>, Self::Error> {
         Ok(EmbeddedPredictionLogitBlock::ordinary(value))
     }
 
     /// A completed capture uses the same immutable owner as fused logits.
-    fn retain_tensor_packet<'a>(value:Self::Tensor,source:Option<PreparedEmbeddedEvidence>,context:Self::Context<'a>)
-        ->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{Self::retain_logit_block(value,source,context)}
+    fn retain_tensor_packet<'a>(
+        value: Self::Tensor,
+        source: Option<PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::retain_logit_block(value, source, context)
+    }
     /// The returned row retains this exact output's source independently of cache mutation.
-    fn tensor_row_with_source<'a>(value:&Self::Tensor,row:usize,_source:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'a>)
-        ->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        Self::tensor_row(value,row,context).map(EmbeddedPredictionTensor::ordinary)
+    fn tensor_row_with_source<'a>(
+        value: &Self::Tensor,
+        row: usize,
+        _source: Option<&PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::tensor_row(value, row, context).map(EmbeddedPredictionTensor::ordinary)
     }
     /// A prefix retains the particular output proof supplied by its owner.
-    fn tensor_prefix_with_source<'a>(value:&Self::Tensor,end:usize,_source:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'a>)
-        ->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        Self::tensor_prefix(value,end,context).map(EmbeddedPredictionTensor::ordinary)
+    fn tensor_prefix_with_source<'a>(
+        value: &Self::Tensor,
+        end: usize,
+        _source: Option<&PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::tensor_prefix(value, end, context).map(EmbeddedPredictionTensor::ordinary)
     }
     /// Views of existing immutable packets also retain their earlier operation custody.
-    fn tensor_row_packet<'a>(value:&EmbeddedPredictionTensor<Self::Tensor>,row:usize,context:Self::Context<'a>)
-        ->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        Self::tensor_row_with_source(value,row,value.evidence(),context)
+    fn tensor_row_packet<'a>(
+        value: &EmbeddedPredictionTensor<Self::Tensor>,
+        row: usize,
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::tensor_row_with_source(value, row, value.evidence(), context)
     }
     /// A prefix of an owned packet preserves its predecessor custody.
-    fn tensor_prefix_packet<'a>(value:&EmbeddedPredictionTensor<Self::Tensor>,end:usize,context:Self::Context<'a>)
-        ->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        Self::tensor_prefix_with_source(value,end,value.evidence(),context)
+    fn tensor_prefix_packet<'a>(
+        value: &EmbeddedPredictionTensor<Self::Tensor>,
+        end: usize,
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::tensor_prefix_with_source(value, end, value.evidence(), context)
     }
     /// Ordinary realization remains the caller's existing tensor worker. An
     /// original realization executes only its fixed, source-bound numerical cut.
-    fn tensor_concatenate_packet<'a>(left:&EmbeddedPredictionTensor<Self::Tensor>,right:&EmbeddedPredictionTensor<Self::Tensor>,
-        _context:Self::Context<'a>,ordinary:impl FnOnce(&Self::Tensor,&Self::Tensor)->Result<Self::Tensor,Self::Error>)
-        ->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        ordinary(left,right).map(EmbeddedPredictionTensor::ordinary)
+    fn tensor_concatenate_packet<'a>(
+        left: &EmbeddedPredictionTensor<Self::Tensor>,
+        right: &EmbeddedPredictionTensor<Self::Tensor>,
+        _context: Self::Context<'a>,
+        ordinary: impl FnOnce(&Self::Tensor, &Self::Tensor) -> Result<Self::Tensor, Self::Error>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        ordinary(left, right).map(EmbeddedPredictionTensor::ordinary)
     }
 
     /// Selects one sequence row while retaining its sequence dimension.
@@ -894,35 +1157,52 @@ pub trait SpeculativeTensorMechanisms: 'static {
 
     /// Source-carrying token input. Ordinary mechanisms retain their existing
     /// producer; original mechanisms return the actual completed tensor owner.
-    fn target_tokens_packet<'a>(tokens: &[u32], context: Self::Context<'a>)
-        -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+    fn target_tokens_packet<'a>(
+        tokens: &[u32],
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
         Self::target_tokens(tokens, context).map(EmbeddedPredictionTensor::ordinary)
     }
     /// Borrows the exact admitted prefill token packet. Ordinary sources keep
     /// their existing handle clone; original sources must supply their owner.
-    fn prefill_token_packet<'a>(value:&Self::Tensor,prepared:Option<&EmbeddedPredictionTensor<Self::Tensor>>,
-        _context:Self::Context<'a>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
-        Ok(prepared.cloned().unwrap_or_else(||EmbeddedPredictionTensor::ordinary(value.clone())))
+    fn prefill_token_packet<'a>(
+        value: &Self::Tensor,
+        prepared: Option<&EmbeddedPredictionTensor<Self::Tensor>>,
+        _context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Ok(prepared
+            .cloned()
+            .unwrap_or_else(|| EmbeddedPredictionTensor::ordinary(value.clone())))
     }
     /// Static token view retaining its particular immutable source packet.
-    fn token_range_packet<'a>(value: &EmbeddedPredictionTensor<Self::Tensor>, start: usize, end: usize,
-        context: Self::Context<'a>) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+    fn token_range_packet<'a>(
+        value: &EmbeddedPredictionTensor<Self::Tensor>,
+        start: usize,
+        end: usize,
+        context: Self::Context<'a>,
+    ) -> Result<EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
         Self::token_range(value, start, end, context).map(EmbeddedPredictionTensor::ordinary)
     }
     /// Lends this actual input's evidence only for the callback's model call.
     /// The callback cannot return a borrow of its shortened execution context.
     fn with_tensor_source<R>(
-        source: Option<&PreparedEmbeddedEvidence>, context: Self::Context<'_>,
+        source: Option<&PreparedEmbeddedEvidence>,
+        context: Self::Context<'_>,
         run: impl for<'scope> FnOnce(Self::Context<'scope>) -> Result<R, Self::Error>,
     ) -> Result<R, Self::Error> {
-        match source {Some(source)=>Self::with_tensor_sources(&[source],context,run),
-            None=>Self::with_tensor_sources(&[],context,run)}
+        match source {
+            Some(source) => Self::with_tensor_sources(&[source], context, run),
+            None => Self::with_tensor_sources(&[], context, run),
+        }
     }
     /// Extends an existing lexical input loan without replacing its sources.
     fn with_tensor_sources<R>(
-        _sources:&[&PreparedEmbeddedEvidence],context:Self::Context<'_>,
-        run:impl for<'scope> FnOnce(Self::Context<'scope>)->Result<R,Self::Error>,
-    )->Result<R,Self::Error>{run(context)}
+        _sources: &[&PreparedEmbeddedEvidence],
+        context: Self::Context<'_>,
+        run: impl for<'scope> FnOnce(Self::Context<'scope>) -> Result<R, Self::Error>,
+    ) -> Result<R, Self::Error> {
+        run(context)
+    }
 
     /// Selects one row from a fused proposal block.
     fn fused_logits_row<'a>(
@@ -933,15 +1213,21 @@ pub trait SpeculativeTensorMechanisms: 'static {
 
     /// Lazily selects only the requested fused row from its own completed source.
     fn fused_logits_row_with_source<'a>(
-        value: &Self::Tensor, row: usize, _source: Option<&PreparedEmbeddedEvidence>,
+        value: &Self::Tensor,
+        row: usize,
+        _source: Option<&PreparedEmbeddedEvidence>,
         context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> { Self::fused_logits_row(value, row, context) }
+    ) -> Result<Self::Logits, Self::Error> {
+        Self::fused_logits_row(value, row, context)
+    }
 
     /// An original target phase may already have completed its actual roots;
     /// the backend validates and retains that output's own source evidence.
     fn submit_verification_completion_with_source<'a>(
-        output: &EmbeddedPredictionOutput<Self::Tensor>, inputs: &Self::Tensor,
-        _source: Option<&PreparedEmbeddedEvidence>, context: Self::Context<'a>,
+        output: &EmbeddedPredictionOutput<Self::Tensor>,
+        inputs: &Self::Tensor,
+        _source: Option<&PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
     ) -> Result<Self::Completion, Self::Error> {
         Self::submit_verification_completion(output, inputs, context)
     }
@@ -976,7 +1262,11 @@ impl<T> EmbeddedPredictionOutput<T> {
     }
     /// Keeps the exact immutable input packet rather than cloning its native value.
     pub const fn with_tokens(logits: T, capture: T, tokens: EmbeddedPredictionTensor<T>) -> Self {
-        Self { logits, capture, tokens }
+        Self {
+            logits,
+            capture,
+            tokens,
+        }
     }
 
     /// Borrows target logits.
@@ -1010,12 +1300,19 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
     type Telemetry: SpeculativeTelemetry;
 
     /// Borrow the just-completed target proof for a particular returned output.
-    fn target_logit_evidence<'a>(&self, _cache: &'a Self::TargetCache)
-        -> Option<&'a PreparedEmbeddedEvidence> { None }
+    fn target_logit_evidence<'a>(
+        &self,
+        _cache: &'a Self::TargetCache,
+    ) -> Option<&'a PreparedEmbeddedEvidence> {
+        None
+    }
     /// Exact completed prediction output, separate from target output evidence.
-    fn prediction_tensor_evidence<'a>(&self,_cache:&'a Self::PredictionCache)
-        ->Option<&'a PreparedEmbeddedEvidence>{None}
-
+    fn prediction_tensor_evidence<'a>(
+        &self,
+        _cache: &'a Self::PredictionCache,
+    ) -> Option<&'a PreparedEmbeddedEvidence> {
+        None
+    }
 
     /// Complete durable target-lane estimate, including canonical prediction state.
     fn control_target_estimate(
@@ -1059,13 +1356,19 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
 
     /// Native invocation adapters may require scheduler provenance independently
     /// of optional internal observation. Ordinary strategies retain no origin.
-    fn requires_activation_origin(&self) -> bool { false }
+    fn requires_activation_origin(&self) -> bool {
+        false
+    }
     fn set_activation_origin(&mut self, _origin: Option<SpeculativeActivationOrigin>) {}
 
     /// Prepares the concrete two-cause error destination before an operation
     /// can mutate target state. A failed restoration must retain both causes.
-    fn prepare_rollback_failure<'context: 'context>(context: M::Context<'context>)
-        -> Result<impl FnOnce(eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>) -> M::Error, M::Error>;
+    fn prepare_rollback_failure<'context: 'context>(
+        context: M::Context<'context>,
+    ) -> Result<
+        impl FnOnce(eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>) -> M::Error,
+        M::Error,
+    >;
 
     /// Creates a fallible exact checkpoint of ordinary target and prediction state.
     fn checkpoint_target(cache: &Self::TargetCache) -> Result<Self::TargetCache, M::Error>;
@@ -1137,13 +1440,17 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
     ) -> Result<(), M::Error>;
 
     /// Forks prediction-local state from the authoritative target lane.
-    fn prediction_cache(&self, cache: &Self::TargetCache)
-        -> Result<Self::PredictionCache, M::Error>;
+    fn prediction_cache(
+        &self,
+        cache: &Self::TargetCache,
+    ) -> Result<Self::PredictionCache, M::Error>;
 
     /// Copies an existing prediction fork before independent advancement.
     /// Retained implementations use the same source-bound copy provider as checkpoints.
-    fn copy_prediction_cache(&self, cache: &Self::PredictionCache)
-        -> Result<Self::PredictionCache, M::Error>;
+    fn copy_prediction_cache(
+        &self,
+        cache: &Self::PredictionCache,
+    ) -> Result<Self::PredictionCache, M::Error>;
 
     /// Commits prediction-local state into the authoritative target lane.
     fn commit_prediction_cache(
@@ -1303,16 +1610,31 @@ where
     ) -> M::Context<'a>;
     /// Returns the ordinary target tensor context selected by composition.
     fn target_context<'a>(context: M::Context<'a>) -> &'a <B::Tensor as eredu_nn::Tensor>::Context;
+    /// Retains the actual admitted speculative issuer for shared prefill
+    /// scheduling. Each executing span still needs its own native role.
+    fn prefill_schedule_authority(
+        context: M::Context<'_>,
+    ) -> Result<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority, M::Error> {
+        Err(Self::session_cause_with_context(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            context,
+        ))
+    }
     fn with_prefill_source<I, P, R>(
         lowerer: &mut I,
         input: Self::Input,
         context: M::Context<'_>,
-        operation: impl for<'source> FnOnce(Result<P, M::Error>, M::Context<'source>) -> Result<R, M::Error>,
+        operation: impl for<'source> FnOnce(
+            Result<P, M::Error>,
+            M::Context<'source>,
+        ) -> Result<R, M::Error>,
     ) -> Result<R, M::Error>
     where
         I: ReplicatedPredictionInput<A, B, S, M::Error, Input = Self::Input, Prefill = P>,
     {
-        lowerer.with_prefill_source(input, Self::target_context(context), |source|operation(source,context))
+        lowerer.with_prefill_source(input, Self::target_context(context), |source| {
+            operation(source, context)
+        })
     }
 
     fn prepare_prefill_chunk<P>(
@@ -1338,26 +1660,44 @@ where
             + eredu_nn::GroupedNeuralBackend
             + eredu_nn::HyperNeuralBackend;
     /// Whether the execution context requires the source-funded cache producer.
-    fn uses_prepared_cache(_context:M::Context<'_>)->bool {false}
+    fn uses_prepared_cache(_context: M::Context<'_>) -> bool {
+        false
+    }
     /// Pays concrete shared cache/erasure controls before their construction.
-    fn prepared_cache_metadata(_bytes:Option<usize>,_context:M::Context<'_>)->Result<eredu_core::HostPreparationAuthority,eredu_core::BackendFailure> {
+    fn prepared_cache_metadata(
+        _bytes: Option<usize>,
+        _context: M::Context<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, eredu_core::BackendFailure> {
         Ok(eredu_core::HostPreparationAuthority::unmanaged())
     }
     /// Pays and retains the concrete typed preparation failure without formatting.
-    fn prepared_cache_error<E:std::error::Error+Send+Sync+'static>(cause:E,_context:M::Context<'_>)->eredu_core::BackendFailure {
+    fn prepared_cache_error<E: std::error::Error + Send + Sync + 'static>(
+        cause: E,
+        _context: M::Context<'_>,
+    ) -> eredu_core::BackendFailure {
         eredu_core::BackendFailure::from_error(cause)
     }
     /// Copies the actual canonical target and consumes the paid prediction lane.
     /// It runs only inside the shared mutating target-preparation transaction.
-    fn prepared_cache<P>(source:&S,extension:&P,selected:&eredu_runtime::SelectedSpeculativeRealization,context:M::Context<'_>)
-        ->Result<EmbeddedPredictionCache<S,P::LaneState>,eredu_core::BackendFailure>
-    where Self:Sized+crate::prediction_extension::PredictionExtensionMaterializer<B>,
-        S:'static,
-        B:eredu_nn::BlockwiseAttentionBackend+eredu_nn::DistributedNeuralBackend+eredu_nn::GroupedNeuralBackend+eredu_nn::HyperNeuralBackend,
-        P:crate::prediction_extension::MaterializedPredictionExecutor<A,B,Self>,
+    fn prepared_cache<P>(
+        source: &S,
+        extension: &P,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        context: M::Context<'_>,
+    ) -> Result<EmbeddedPredictionCache<S, P::LaneState>, eredu_core::BackendFailure>
+    where
+        Self: Sized + crate::prediction_extension::PredictionExtensionMaterializer<B>,
+        S: 'static,
+        B: eredu_nn::BlockwiseAttentionBackend
+            + eredu_nn::DistributedNeuralBackend
+            + eredu_nn::GroupedNeuralBackend
+            + eredu_nn::HyperNeuralBackend,
+        P: crate::prediction_extension::MaterializedPredictionExecutor<A, B, Self>,
     {
-        let _=(source,extension,selected,context);
-        Err(eredu_core::BackendFailure::from_error(PreparedEmbeddedCopyError::SourceMismatch))
+        let _ = (source, extension, selected, context);
+        Err(eredu_core::BackendFailure::from_error(
+            PreparedEmbeddedCopyError::SourceMismatch,
+        ))
     }
     /// Creates an exact native target-state checkpoint.
     fn checkpoint(state: &S) -> Result<S, M::Error>;
@@ -1385,10 +1725,7 @@ where
     /// Returns the current target-state frontier.
     fn generation(state: &S) -> Result<u64, M::Error>;
     /// Constructs a one-token tensor for an architecture prediction operation.
-    fn token(
-        token: u32,
-        context: M::Context<'_>,
-    ) -> Result<B::Tensor, M::Error>;
+    fn token(token: u32, context: M::Context<'_>) -> Result<B::Tensor, M::Error>;
     /// Returns the physical shape used to close the selected capture contract.
     fn shape(tensor: &B::Tensor) -> &[i32];
     /// Completes the actual architecture-selected state/output values using the
@@ -1403,12 +1740,15 @@ where
     ) -> Result<(), M::Error>
     where
         Self: Sized + crate::prediction_extension::PredictionExtensionMaterializer<B>,
-        B: eredu_nn::BlockwiseAttentionBackend + eredu_nn::DistributedNeuralBackend
-            + eredu_nn::GroupedNeuralBackend + eredu_nn::HyperNeuralBackend,
+        B: eredu_nn::BlockwiseAttentionBackend
+            + eredu_nn::DistributedNeuralBackend
+            + eredu_nn::GroupedNeuralBackend
+            + eredu_nn::HyperNeuralBackend,
         P: crate::prediction_extension::MaterializedPredictionExecutor<A, B, Self>,
     {
         let _ = (point, sources);
-        extension.complete_state(state, outputs, Self::target_context(context))
+        extension
+            .complete_state(state, outputs, Self::target_context(context))
             .map_err(Self::session_failure)
     }
     /// Runs an operation inside the backend's deferred-validation transaction.
@@ -1426,7 +1766,9 @@ where
     fn validate_captured_span<T>(
         _context: M::Context<'_>,
         operation: impl FnOnce() -> Result<T, M::Error>,
-    ) -> Result<T, M::Error> { Self::validate(operation) }
+    ) -> Result<T, M::Error> {
+        Self::validate(operation)
+    }
     /// Maps a neutral-session failure into the backend error domain.
     fn session_error(error: impl std::fmt::Display) -> M::Error;
     /// Preserves an owned native/session cause across the prediction error domain.
@@ -1434,9 +1776,12 @@ where
     /// Preserves a typed session/policy cause using the actual source context.
     /// Native implementations pay their existing retained error transport;
     /// allocation refusal remains a typed error, not formatted fallback text.
-    fn session_cause_with_context<E:std::error::Error+Send+Sync+'static>(
-        error:E,_context:M::Context<'_>,
-    )->M::Error {Self::session_error(error)}
+    fn session_cause_with_context<E: std::error::Error + Send + Sync + 'static>(
+        error: E,
+        _context: M::Context<'_>,
+    ) -> M::Error {
+        Self::session_error(error)
+    }
 
     /// Prepares one concrete session-error conversion before the fallible
     /// operation begins. Consuming this callback retains the original cause;
@@ -1453,17 +1798,23 @@ where
     }
 
     /// Constructs a rejected operation diagnostic from borrowed arguments.
-    fn session_arguments_with_context(arguments: std::fmt::Arguments<'_>, _context:M::Context<'_>) -> M::Error {
+    fn session_arguments_with_context(
+        arguments: std::fmt::Arguments<'_>,
+        _context: M::Context<'_>,
+    ) -> M::Error {
         Self::session_error(arguments)
     }
 
     /// Crosses the shared neural driver boundary, preserving typed custody.
-    fn neural_cause_with_context<E:std::error::Error+Send+Sync+'static>(error:E, _context:M::Context<'_>) -> eredu_nn::Error {
+    fn neural_cause_with_context<E: std::error::Error + Send + Sync + 'static>(
+        error: E,
+        _context: M::Context<'_>,
+    ) -> eredu_nn::Error {
         eredu_nn::Error::backend_retained_source(error)
     }
 
     /// The observer bridge retains the actual failure separately from its marker.
-    fn neural_observer_error(error:&M::Error, _context:M::Context<'_>) -> eredu_nn::Error {
+    fn neural_observer_error(error: &M::Error, _context: M::Context<'_>) -> eredu_nn::Error {
         eredu_nn::Error::backend(error.to_string())
     }
 
@@ -1472,8 +1823,19 @@ where
 }
 
 /// Architecture-owned embedded strategy over one typed replicated session and paired extension.
-pub struct ReplicatedMaterializedPredictionStrategy<'a, A, B, S, SM, D, P, I, N, M, H = OrdinaryPredictionPhase>
-where
+pub struct ReplicatedMaterializedPredictionStrategy<
+    'a,
+    A,
+    B,
+    S,
+    SM,
+    D,
+    P,
+    I,
+    N,
+    M,
+    H = OrdinaryPredictionPhase,
+> where
     B: eredu_runtime::SubmissionBackend<
         Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     >,
@@ -1542,9 +1904,17 @@ where
         input: I,
         cache_context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Self
-    where H: Default,
+    where
+        H: Default,
     {
-        Self::new_with_phase(session, extension, selected, input, cache_context, H::default())
+        Self::new_with_phase(
+            session,
+            extension,
+            selected,
+            input,
+            cache_context,
+            H::default(),
+        )
     }
 
     /// Supplies typed backend invocation mechanics after architecture pairing.
@@ -1583,87 +1953,124 @@ where
             Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, A::Error>>,
             M::Context<'execution>,
         ) -> Result<R, M::Error>,
-        complete: impl for<'execution> FnOnce(&P, &mut P::LaneState, &R, M::Context<'execution>) -> Result<(), M::Error>,
+        complete: impl for<'execution> FnOnce(
+            &P,
+            &mut P::LaneState,
+            &R,
+            M::Context<'execution>,
+        ) -> Result<(), M::Error>,
     ) -> Result<R, M::Error>
     where
         R: PredictionPhaseRoots<B::Tensor, M::Logits>,
         N: ReplicatedPredictionNative<A, B, S, M>,
     {
         self.phase.run(
-            self.session, self.extension, lane, pass, equation,
-            observer.is_some().then_some(PredictionCompletionPoint::ObservedEquation),
-            None, context, observer,
+            self.session,
+            self.extension,
+            lane,
+            pass,
+            equation,
+            observer
+                .is_some()
+                .then_some(PredictionCompletionPoint::ObservedEquation),
+            None,
+            context,
+            observer,
             |session, extension, lane, observer, context| {
-        let tensor_context = N::target_context(context);
-        N::validate_with_context(context, || {
-            let Some(observer) = observer else {
-                return execute(
-                    extension,
-                    &mut ReplicatedPredictionInvoker {
-                        session,
-                        context: tensor_context,
-                        execution_context: context,
-                        _native: PhantomData,
-                    },
-                    lane,
-                    None,
-                    context,
-                );
-            };
-            session.with_prediction_observation(
-                pass,
-                tensor_context,
-                observer,
-                &mut (extension, lane),
-                |session, (extension, lane), observer| {
-                    execute(
-                        extension,
-                        &mut ReplicatedPredictionInvoker {
-                            session,
-                            context: tensor_context,
-                        execution_context: context,
-                            _native: PhantomData,
+                let tensor_context = N::target_context(context);
+                N::validate_with_context(context, || {
+                    let Some(observer) = observer else {
+                        return execute(
+                            extension,
+                            &mut ReplicatedPredictionInvoker {
+                                session,
+                                context: tensor_context,
+                                execution_context: context,
+                                _native: PhantomData,
+                            },
+                            lane,
+                            None,
+                            context,
+                        );
+                    };
+                    session.with_prediction_observation(
+                        pass,
+                        tensor_context,
+                        observer,
+                        &mut (extension, lane),
+                        |session, (extension, lane), observer| {
+                            execute(
+                                extension,
+                                &mut ReplicatedPredictionInvoker {
+                                    session,
+                                    context: tensor_context,
+                                    execution_context: context,
+                                    _native: PhantomData,
+                                },
+                                lane,
+                                Some(observer),
+                                context,
+                            )
                         },
-                        lane,
-                        Some(observer),
-                        context,
+                        |_, (extension, lane), output| complete(extension, lane, output, context),
+                        |error| N::session_cause_with_context(error, context),
                     )
-                },
-                |_, (extension, lane), output| {
-                    complete(extension, lane, output, context)
-                },
-                |error| N::session_cause_with_context(error, context),
-            )
-        })
+                })
             },
         )
     }
 
     /// Context-bearing original construction preserves the existing shared
     /// target preparation agreement and retains typed failures directly.
-    pub fn new_cache_with_context(&mut self,context:M::Context<'_>)
-        ->Result<EmbeddedPredictionCache<S,P::LaneState>,eredu_core::BackendFailure>
-    where N:ReplicatedPredictionNative<A,B,S,M>,S:'static {
+    pub fn new_cache_with_context(
+        &mut self,
+        context: M::Context<'_>,
+    ) -> Result<EmbeddedPredictionCache<S, P::LaneState>, eredu_core::BackendFailure>
+    where
+        N: ReplicatedPredictionNative<A, B, S, M>,
+        S: 'static,
+    {
         if !N::uses_prepared_cache(context) {
-            return self.new_cache().map_err(eredu_core::BackendFailure::from_error);
+            return self
+                .new_cache()
+                .map_err(eredu_core::BackendFailure::from_error);
         }
-        let parts=[
-            std::mem::size_of::<EmbeddedPredictionCache<S,P::LaneState>>(),
-            std::mem::size_of::<Result<EmbeddedPredictionCache<S,P::LaneState>,eredu_core::BackendFailure>>(),
-            std::mem::size_of::<eredu_runtime::replicated_session::ReplicatedTextSessionError<A::Error,SM::PolicyError,SM::Error>>(),
-            std::mem::size_of::<eredu_runtime::replicated_session::PredictionTargetPreparationError>(),
-            std::mem::size_of::<(&P,&eredu_runtime::SelectedSpeculativeRealization,M::Context<'_>)>(),
+        let parts = [
+            std::mem::size_of::<EmbeddedPredictionCache<S, P::LaneState>>(),
+            std::mem::size_of::<
+                Result<EmbeddedPredictionCache<S, P::LaneState>, eredu_core::BackendFailure>,
+            >(),
+            std::mem::size_of::<
+                eredu_runtime::replicated_session::ReplicatedTextSessionError<
+                    A::Error,
+                    SM::PolicyError,
+                    SM::Error,
+                >,
+            >(),
+            std::mem::size_of::<eredu_runtime::replicated_session::PredictionTargetPreparationError>(
+            ),
+            std::mem::size_of::<(
+                &P,
+                &eredu_runtime::SelectedSpeculativeRealization,
+                M::Context<'_>,
+            )>(),
         ];
-        let controls=parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add);
-        let _host=N::prepared_cache_metadata(controls,context)?;
-        let extension=&*self.extension;
-        let selected=self.selected;
+        let controls = parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add);
+        let _host = N::prepared_cache_metadata(controls, context)?;
+        let extension = &*self.extension;
+        let selected = self.selected;
         self.session.prepare_prediction_target_state_with(
             N::target_context(context),
-            |_,source,_|N::prepared_cache(source,extension,selected,context),
-            |cache|cache.target().expect("prepared constructor retains target state"),
-            |cause|N::prepared_cache_error(cause,context),
-            |cause|N::prepared_cache_error(cause,context),
+            |_, source, _| N::prepared_cache(source, extension, selected, context),
+            |cache| {
+                cache
+                    .target()
+                    .expect("prepared constructor retains target state")
+            },
+            |cause| N::prepared_cache_error(cause, context),
+            |cause| N::prepared_cache_error(cause, context),
         )
     }
 
@@ -1689,10 +2096,10 @@ struct PredictionContractFailure(&'static str);
 
 #[derive(Debug, thiserror::Error)]
 #[error("prediction target state exchange failed: {exchange}; local ownership recovery failed: {recovery}")]
-struct TargetStateRecoveryFailure<E:std::error::Error+'static,R:std::error::Error+'static> {
+struct TargetStateRecoveryFailure<E: std::error::Error + 'static, R: std::error::Error + 'static> {
     #[source]
-    exchange:E,
-    recovery:R,
+    exchange: E,
+    recovery: R,
 }
 
 struct ReplicatedPredictionInvoker<'a, 'context, A, B, S, SM, D, N, M>
@@ -1754,14 +2161,14 @@ where
     {
         self.session
             .apply_prediction_target_operation(operation, self.context)
-            .map_err(|error| N::session_cause_with_context(error,self.execution_context))
+            .map_err(|error| N::session_cause_with_context(error, self.execution_context))
     }
 
     fn invalid(message: String) -> Self::Error {
         N::session_error(message)
     }
-    fn invalid_arguments(&self, arguments:std::fmt::Arguments<'_>)->Self::Error {
-        N::session_arguments_with_context(arguments,self.execution_context)
+    fn invalid_arguments(&self, arguments: std::fmt::Arguments<'_>) -> Self::Error {
+        N::session_arguments_with_context(arguments, self.execution_context)
     }
 }
 
@@ -1797,27 +2204,46 @@ where
     type Input = I::Input;
     type TargetCache = EmbeddedPredictionCache<S, P::LaneState>;
     type PredictionCache = EmbeddedPredictionDraftCache<P::LaneState>;
-    fn target_logit_evidence<'a>(&self, cache: &'a Self::TargetCache)
-        -> Option<&'a PreparedEmbeddedEvidence> { cache.target_logit_evidence() }
-    fn prediction_tensor_evidence<'a>(&self,cache:&'a Self::PredictionCache)
-        ->Option<&'a PreparedEmbeddedEvidence>{cache.logit_evidence()}
-
+    fn target_logit_evidence<'a>(
+        &self,
+        cache: &'a Self::TargetCache,
+    ) -> Option<&'a PreparedEmbeddedEvidence> {
+        cache.target_logit_evidence()
+    }
+    fn prediction_tensor_evidence<'a>(
+        &self,
+        cache: &'a Self::PredictionCache,
+    ) -> Option<&'a PreparedEmbeddedEvidence> {
+        cache.logit_evidence()
+    }
 
     type Telemetry = N::Telemetry;
-    fn prepare_rollback_failure<'context: 'context>(context: M::Context<'context>)
-        -> Result<impl FnOnce(eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>) -> M::Error, M::Error> {
+    fn prepare_rollback_failure<'context: 'context>(
+        context: M::Context<'context>,
+    ) -> Result<
+        impl FnOnce(eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>) -> M::Error,
+        M::Error,
+    > {
         use std::mem::{size_of, size_of_val};
         let controls = [
-            size_of::<(M::Error, &mut Self::TargetCache, &Self::TargetCache, M::Context<'context>)>(),
+            size_of::<(
+                M::Error,
+                &mut Self::TargetCache,
+                &Self::TargetCache,
+                M::Context<'context>,
+            )>(),
             size_of::<Result<(), M::Error>>(),
             size_of::<M::Error>(),
             size_of::<eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>>(),
             size_of::<Option<usize>>(),
         ];
-        N::prepare_session_cause(context,
-            controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add))
+        N::prepare_session_cause(
+            context,
+            controls
+                .into_iter()
+                .try_fold(size_of_val(&controls), usize::checked_add),
+        )
     }
-
 
     fn requires_activation_origin(&self) -> bool {
         self.phase.requires_activation_origin()
@@ -1856,13 +2282,20 @@ where
             return Ok(None);
         }
         if cache.prepared.is_some() {
-            return cache.checkpoint(|_| -> Result<S, std::convert::Infallible> {
-                unreachable!("prepared snapshot uses its retained copy provider")
-            }).map(Some).map_err(|cause| match cause {
-                EmbeddedPredictionCacheAccessError::Prepared(cause) => SpeculativeControlError::Backend(cause),
-                EmbeddedPredictionCacheAccessError::Native(never) => match never {},
-                EmbeddedPredictionCacheAccessError::Cache(_) => unreachable!("prepared checkpoint does not validate a new binding"),
-            });
+            return cache
+                .checkpoint(|_| -> Result<S, std::convert::Infallible> {
+                    unreachable!("prepared snapshot uses its retained copy provider")
+                })
+                .map(Some)
+                .map_err(|cause| match cause {
+                    EmbeddedPredictionCacheAccessError::Prepared(cause) => {
+                        SpeculativeControlError::Backend(cause)
+                    }
+                    EmbeddedPredictionCacheAccessError::Native(never) => match never {},
+                    EmbeddedPredictionCacheAccessError::Cache(_) => {
+                        unreachable!("prepared checkpoint does not validate a new binding")
+                    }
+                });
         }
         let Some(target) = cache.target.as_ref() else {
             return Ok(None);
@@ -1893,7 +2326,10 @@ where
         context: M::Context<'a>,
     ) -> Result<Option<Self::PredictionCache>, SpeculativeControlError> {
         if cache.prepared.is_some() {
-            return cache.try_copy().map(Some).map_err(SpeculativeControlError::Backend);
+            return cache
+                .try_copy()
+                .map(Some)
+                .map_err(SpeculativeControlError::Backend);
         }
         let Some(prediction) = self
             .extension
@@ -1923,10 +2359,12 @@ where
     }
 
     fn checkpoint_target(cache: &Self::TargetCache) -> Result<Self::TargetCache, M::Error> {
-        cache.checkpoint(N::checkpoint).map_err(|error| match error {
-            EmbeddedPredictionCacheAccessError::Prepared(cause) => N::session_failure(cause),
-            other => N::session_error(other),
-        })
+        cache
+            .checkpoint(N::checkpoint)
+            .map_err(|error| match error {
+                EmbeddedPredictionCacheAccessError::Prepared(cause) => N::session_failure(cause),
+                other => N::session_error(other),
+            })
     }
 
     fn take_telemetry(&mut self) -> Result<Self::Telemetry, M::Error> {
@@ -1978,40 +2416,70 @@ where
                 .bind_prepared_input(identity)
                 .map_err(|error| match error {
                     EmbeddedPredictionCacheError::Prepared(cause) => N::session_failure(cause),
-                    other => N::session_cause_with_context(other,context),
+                    other => N::session_cause_with_context(other, context),
                 })?;
             let session_error = N::prepare_session_cause(context, Some(0))?;
-            let mut lane = cache
-                .take_target()
-                .ok_or_else(|| N::session_cause_with_context(EmbeddedPredictionCacheError::TargetStateActive,context))?;
-            if let Err(error) =
-                session.exchange_prediction_target_state(&mut lane, tensor_context)
+            let mut lane = cache.take_target().ok_or_else(|| {
+                N::session_cause_with_context(
+                    EmbeddedPredictionCacheError::TargetStateActive,
+                    context,
+                )
+            })?;
+            if let Err(error) = session.exchange_prediction_target_state(&mut lane, tensor_context)
             {
                 cache.restore_target(lane);
-                return Err(N::session_cause_with_context(error,context));
+                return Err(N::session_cause_with_context(error, context));
             }
-            let result = observation::neural_with_error(observer, SpeculativeActivationPhase::TargetPrefill,
-                sequence, |cause|N::session_cause_with_context(cause,context), |error|N::neural_observer_error(error,context), |observer| phase_adapter.run_target(
-                    session, cache.target_phase_evidence(), Some(&tokens),
-                    SpeculativeActivationPhase::TargetPrefill, eredu_core::OutputDemand::Sequence, None,
-                    context, observer,
-                    |session, observer, phase_context| N::validate_with_context(phase_context, || {
-                    match observer {
-                        Some(observer) => session.prefill_input_prediction_target_observed(prepared, tensor_context, observer),
-                        None => session.prefill_input_prediction_target(prepared, tensor_context),
-                    }
-                    .map(|(logits, capture)| (logits, capture))
-                    .map_err(session_error)
-                })));
-            let restored = match session
-                .exchange_prediction_target_state(&mut lane, tensor_context)
+            let result = observation::neural_with_error(
+                observer,
+                SpeculativeActivationPhase::TargetPrefill,
+                sequence,
+                |cause| N::session_cause_with_context(cause, context),
+                |error| N::neural_observer_error(error, context),
+                |observer| {
+                    phase_adapter.run_target(
+                        session,
+                        cache.target_phase_evidence(),
+                        Some(&tokens),
+                        SpeculativeActivationPhase::TargetPrefill,
+                        eredu_core::OutputDemand::Sequence,
+                        None,
+                        context,
+                        observer,
+                        |session, observer, phase_context| {
+                            N::validate_with_context(phase_context, || {
+                                match observer {
+                                    Some(observer) => session
+                                        .prefill_input_prediction_target_observed(
+                                            prepared,
+                                            tensor_context,
+                                            observer,
+                                        ),
+                                    None => session
+                                        .prefill_input_prediction_target(prepared, tensor_context),
+                                }
+                                .map(|(logits, capture)| (logits, capture))
+                                .map_err(session_error)
+                            })
+                        },
+                    )
+                },
+            );
+            let restored = match session.exchange_prediction_target_state(&mut lane, tensor_context)
             {
                 Ok(()) => Ok(()),
-                Err(error) => match session.recover_prediction_target_state_after_failure(&mut lane) {
-                    Ok(()) => Err(N::session_cause_with_context(error, context)),
-                    Err(recovery) => Err(N::session_cause_with_context(
-                        TargetStateRecoveryFailure { exchange:error, recovery }, context)),
-                },
+                Err(error) => {
+                    match session.recover_prediction_target_state_after_failure(&mut lane) {
+                        Ok(()) => Err(N::session_cause_with_context(error, context)),
+                        Err(recovery) => Err(N::session_cause_with_context(
+                            TargetStateRecoveryFailure {
+                                exchange: error,
+                                recovery,
+                            },
+                            context,
+                        )),
+                    }
+                }
             };
             cache.restore_target(lane);
             let output = match (result, restored) {
@@ -2021,14 +2489,14 @@ where
             };
             let lane = cache
                 .lane_identity_ref(selected, N::generation)
-                .map_err(|cause|N::session_cause_with_context(cause,context))?;
+                .map_err(|cause| N::session_cause_with_context(cause, context))?;
             let output = EmbeddedPredictionOutput::new(output.0, output.1, tokens);
             extension
                 .validate_capture(selected, &lane, N::shape(output.capture()))
-                .map_err(|cause|N::session_cause_with_context(cause,context))?;
+                .map_err(|cause| N::session_cause_with_context(cause, context))?;
             cache
                 .retain_capture_generation(N::generation)
-                .map_err(|cause|N::session_cause_with_context(cause,context))?;
+                .map_err(|cause| N::session_cause_with_context(cause, context))?;
             Ok(output)
         })
     }
@@ -2042,69 +2510,105 @@ where
         phase: SpeculativeActivationPhase,
     ) -> Result<EmbeddedPredictionOutput<B::Tensor>, M::Error> {
         M::with_tensor_source(tokens.evidence(), context, |context| {
-        let sequence = M::sequence_len(tokens)?;
-        let tensor_context = N::target_context(context);
-        let retained = tokens.clone();
-        let Self {
-            session,
-            extension,
-            selected,
-            input: lowerer,
-            phase: phase_adapter,
-            ..
-        } = self;
-        lowerer.with_decode(tokens, tensor_context, |prepared| {
-            let session_error = N::prepare_session_cause(context, Some(0))?;
-            let mut lane = cache
-                .take_target()
-                .ok_or_else(|| N::session_cause_with_context(EmbeddedPredictionCacheError::TargetStateActive,context))?;
-            if let Err(error) =
-                session.exchange_prediction_target_state(&mut lane, tensor_context)
-            {
+            let sequence = M::sequence_len(tokens)?;
+            let tensor_context = N::target_context(context);
+            let retained = tokens.clone();
+            let Self {
+                session,
+                extension,
+                selected,
+                input: lowerer,
+                phase: phase_adapter,
+                ..
+            } = self;
+            lowerer.with_decode(tokens, tensor_context, |prepared| {
+                let session_error = N::prepare_session_cause(context, Some(0))?;
+                let mut lane = cache.take_target().ok_or_else(|| {
+                    N::session_cause_with_context(
+                        EmbeddedPredictionCacheError::TargetStateActive,
+                        context,
+                    )
+                })?;
+                if let Err(error) =
+                    session.exchange_prediction_target_state(&mut lane, tensor_context)
+                {
+                    cache.restore_target(lane);
+                    return Err(N::session_cause_with_context(error, context));
+                }
+                let result = observation::neural_with_error(
+                    observer,
+                    phase,
+                    sequence,
+                    |cause| N::session_cause_with_context(cause, context),
+                    |error| N::neural_observer_error(error, context),
+                    |observer| {
+                        phase_adapter.run_target(
+                            session,
+                            cache.target_phase_evidence(),
+                            Some(&**tokens),
+                            phase,
+                            eredu_core::OutputDemand::Sequence,
+                            None,
+                            context,
+                            observer,
+                            |session, observer, phase_context| {
+                                N::validate_with_context(phase_context, || {
+                                    match observer {
+                                        Some(observer) => session
+                                            .decode_input_prediction_target_observed(
+                                                prepared,
+                                                tensor_context,
+                                                observer,
+                                            ),
+                                        None => session.decode_input_prediction_target(
+                                            prepared,
+                                            tensor_context,
+                                        ),
+                                    }
+                                    .map(|(logits, capture)| {
+                                        EmbeddedPredictionOutput::with_tokens(
+                                            logits, capture, retained,
+                                        )
+                                    })
+                                    .map_err(session_error)
+                                })
+                            },
+                        )
+                    },
+                );
+                let restored =
+                    match session.exchange_prediction_target_state(&mut lane, tensor_context) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            match session.recover_prediction_target_state_after_failure(&mut lane) {
+                                Ok(()) => Err(N::session_cause_with_context(error, context)),
+                                Err(recovery) => Err(N::session_cause_with_context(
+                                    TargetStateRecoveryFailure {
+                                        exchange: error,
+                                        recovery,
+                                    },
+                                    context,
+                                )),
+                            }
+                        }
+                    };
                 cache.restore_target(lane);
-                return Err(N::session_cause_with_context(error,context));
-            }
-            let result = observation::neural_with_error(observer, phase, sequence, |cause|N::session_cause_with_context(cause,context),
-            |error|N::neural_observer_error(error,context),
-                |observer| phase_adapter.run_target(
-                    session, cache.target_phase_evidence(), Some(&**tokens),
-                    phase, eredu_core::OutputDemand::Sequence, None,
-                    context, observer,
-                    |session, observer, phase_context| N::validate_with_context(phase_context, || {
-                    match observer {
-                        Some(observer) => session.decode_input_prediction_target_observed(prepared, tensor_context, observer),
-                        None => session.decode_input_prediction_target(prepared, tensor_context),
-                    }
-                    .map(|(logits, capture)| EmbeddedPredictionOutput::with_tokens(logits, capture, retained))
-                    .map_err(session_error)
-                })));
-            let restored = match session
-                .exchange_prediction_target_state(&mut lane, tensor_context)
-            {
-                Ok(()) => Ok(()),
-                Err(error) => match session.recover_prediction_target_state_after_failure(&mut lane) {
-                    Ok(()) => Err(N::session_cause_with_context(error, context)),
-                    Err(recovery) => Err(N::session_cause_with_context(
-                        TargetStateRecoveryFailure { exchange:error, recovery }, context)),
-                },
-            };
-            cache.restore_target(lane);
-            let output = match (result, restored) {
-                (Err(error), _) => return Err(error),
-                (Ok(output), Ok(())) => output,
-                (Ok(_), Err(error)) => return Err(error),
-            };
-            let lane = cache
-                .lane_identity_ref(selected, N::generation)
-                .map_err(|cause|N::session_cause_with_context(cause,context))?;
-            extension
-                .validate_capture(selected, &lane, N::shape(output.capture()))
-                .map_err(|cause|N::session_cause_with_context(cause,context))?;
-            cache
-                .retain_capture_generation(N::generation)
-                .map_err(|cause|N::session_cause_with_context(cause,context))?;
-            Ok(output)
-        })
+                let output = match (result, restored) {
+                    (Err(error), _) => return Err(error),
+                    (Ok(output), Ok(())) => output,
+                    (Ok(_), Err(error)) => return Err(error),
+                };
+                let lane = cache
+                    .lane_identity_ref(selected, N::generation)
+                    .map_err(|cause| N::session_cause_with_context(cause, context))?;
+                extension
+                    .validate_capture(selected, &lane, N::shape(output.capture()))
+                    .map_err(|cause| N::session_cause_with_context(cause, context))?;
+                cache
+                    .retain_capture_generation(N::generation)
+                    .map_err(|cause| N::session_cause_with_context(cause, context))?;
+                Ok(output)
+            })
         })
     }
 
@@ -2119,62 +2623,96 @@ where
         let sequence = M::sequence_len(tokens)?;
         let lane_identity = cache
             .lane_identity_ref(self.selected, N::generation)
-            .map_err(|cause|N::session_cause_with_context(cause,context))?;
+            .map_err(|cause| N::session_cause_with_context(cause, context))?;
         self.extension
             .validate_capture(self.selected, &lane_identity, N::shape(output.capture()))
-            .map_err(|cause|N::session_cause_with_context(cause,context))?;
+            .map_err(|cause| N::session_cause_with_context(cause, context))?;
         let prediction_sequence = self.extension.prefill_sequence_len(sequence);
         if prediction_sequence == 0 {
             return Ok(());
         }
-        let target_source=cache.target_logit_evidence().cloned();
-        let hidden = M::tensor_prefix_with_source(output.capture(),sequence.saturating_sub(1),target_source.as_ref(),context)?;
-        let tokens=M::prefill_token_packet(tokens,Some(&output.tokens),context)?;
-        let next = M::token_range_packet(&tokens,1,sequence,context)?;
+        let target_source = cache.target_logit_evidence().cloned();
+        let hidden = M::tensor_prefix_with_source(
+            output.capture(),
+            sequence.saturating_sub(1),
+            target_source.as_ref(),
+            context,
+        )?;
+        let tokens = M::prefill_token_packet(tokens, Some(&output.tokens), context)?;
+        let next = M::token_range_packet(&tokens, 1, sequence, context)?;
         let checkpoint = cache.prediction_fork().map_err(N::session_failure)?;
         let _tensor_context = N::target_context(context);
-        let equation = PredictionEquation::Prefill { target_capture: output.capture(), hidden: &*hidden, tokens: &*next };
-        let result = M::with_tensor_source(target_source.as_ref(),context,|context|
-            M::with_tensor_source(hidden.evidence(),context,|context|
-            M::with_tensor_source(next.evidence(),context,|context|observation::neural_with_error(
-            observer,
-            SpeculativeActivationPhase::PredictionPrefill,
-            prediction_sequence,
-            |cause|N::session_cause_with_context(cause,context),
-            |error|N::neural_observer_error(error,context),
-            |observer| {
-                self.prediction_phase(
-                    cache.prediction_phase_state(),
-                    eredu_runtime::ExpertPass::Prefill,
-                    context,
-                    &equation,
-                    observer,
-                    |extension, invoker, lane, observer, phase_context| {
-                        execute_prediction_equation::<A, B, S, N, _, _>(
-                            equation, extension, invoker, lane, observer,
-                            |token| N::token(token, phase_context),
-                        ).map(|output| {
-                            let PredictionEquationOutput::StateOnly = output else { unreachable!("prefill equation result") };
-                        })
-                    },
-                    |extension, lane, _, phase_context| N::complete_prediction_state(
-                        extension, lane, &[], PredictionCompletionPoint::ObservedEquation,
-                        PredictionCompletionSources::default(), phase_context,
-                    ),
-                )
-            },
-        ))));
+        let equation = PredictionEquation::Prefill {
+            target_capture: output.capture(),
+            hidden: &*hidden,
+            tokens: &*next,
+        };
+        let result = M::with_tensor_source(target_source.as_ref(), context, |context| {
+            M::with_tensor_source(hidden.evidence(), context, |context| {
+                M::with_tensor_source(next.evidence(), context, |context| {
+                    observation::neural_with_error(
+                        observer,
+                        SpeculativeActivationPhase::PredictionPrefill,
+                        prediction_sequence,
+                        |cause| N::session_cause_with_context(cause, context),
+                        |error| N::neural_observer_error(error, context),
+                        |observer| {
+                            self.prediction_phase(
+                                cache.prediction_phase_state(),
+                                eredu_runtime::ExpertPass::Prefill,
+                                context,
+                                &equation,
+                                observer,
+                                |extension, invoker, lane, observer, phase_context| {
+                                    execute_prediction_equation::<A, B, S, N, _, _>(
+                                        equation,
+                                        extension,
+                                        invoker,
+                                        lane,
+                                        observer,
+                                        |token| N::token(token, phase_context),
+                                    )
+                                    .map(|output| {
+                                        let PredictionEquationOutput::StateOnly = output else {
+                                            unreachable!("prefill equation result")
+                                        };
+                                    })
+                                },
+                                |extension, lane, _, phase_context| {
+                                    N::complete_prediction_state(
+                                        extension,
+                                        lane,
+                                        &[],
+                                        PredictionCompletionPoint::ObservedEquation,
+                                        PredictionCompletionSources::default(),
+                                        phase_context,
+                                    )
+                                },
+                            )
+                        },
+                    )
+                })
+            })
+        });
         if result.is_err() {
-            cache.rollback_prediction(checkpoint).map_err(N::session_failure)?;
+            cache
+                .rollback_prediction(checkpoint)
+                .map_err(N::session_failure)?;
         }
         result
     }
 
-    fn prediction_cache(&self, cache: &Self::TargetCache) -> Result<Self::PredictionCache, M::Error> {
+    fn prediction_cache(
+        &self,
+        cache: &Self::TargetCache,
+    ) -> Result<Self::PredictionCache, M::Error> {
         cache.prediction_fork().map_err(N::session_failure)
     }
 
-    fn copy_prediction_cache(&self, cache: &Self::PredictionCache) -> Result<Self::PredictionCache, M::Error> {
+    fn copy_prediction_cache(
+        &self,
+        cache: &Self::PredictionCache,
+    ) -> Result<Self::PredictionCache, M::Error> {
         cache.try_copy().map_err(N::session_failure)
     }
 
@@ -2183,7 +2721,9 @@ where
         cache: &mut Self::TargetCache,
         prediction: &Self::PredictionCache,
     ) -> Result<(), M::Error> {
-        cache.commit_prediction(prediction).map_err(N::session_failure)
+        cache
+            .commit_prediction(prediction)
+            .map_err(N::session_failure)
     }
 
     fn restore_target_checkpoint<'a>(
@@ -2197,7 +2737,7 @@ where
             })
             .map_err(|error| match error {
                 EmbeddedPredictionCacheAccessError::Prepared(cause) => N::session_failure(cause),
-                other => N::session_cause_with_context(other,context),
+                other => N::session_cause_with_context(other, context),
             })
     }
 
@@ -2211,13 +2751,17 @@ where
         observer: Option<&mut dyn SpeculativeActivationObserver<B::Tensor, M::Error>>,
     ) -> Result<(M::Logits, B::Tensor), M::Error> {
         let _tensor_context = N::target_context(context);
-        let equation = PredictionEquation::Sequential { hidden: capture, token: last_token, depth };
+        let equation = PredictionEquation::Sequential {
+            hidden: capture,
+            token: last_token,
+            depth,
+        };
         observation::neural_with_error(
             observer,
             SpeculativeActivationPhase::Proposal { depth },
             1,
-            |cause|N::session_cause_with_context(cause,context),
-            |error|N::neural_observer_error(error,context),
+            |cause| N::session_cause_with_context(cause, context),
+            |error| N::neural_observer_error(error, context),
             |observer| {
                 self.prediction_phase(
                     cache.prediction_phase_state(),
@@ -2228,16 +2772,29 @@ where
                     |extension, invoker, lane, observer, phase_context| {
                         let observed = observer.is_some();
                         let output = execute_prediction_equation::<A, B, S, N, _, _>(
-                            equation, extension, invoker, lane, observer,
+                            equation,
+                            extension,
+                            invoker,
+                            lane,
+                            observer,
                             |token| N::token(token, phase_context),
                         )?;
-                        let PredictionEquationOutput::Sequential { logits, hidden } = output else { unreachable!("sequential equation result") };
+                        let PredictionEquationOutput::Sequential { logits, hidden } = output else {
+                            unreachable!("sequential equation result")
+                        };
                         let row = M::logits_row(&logits, 0, phase_context)?;
                         Ok((row, hidden, observed.then_some(logits)))
                     },
                     |extension, lane, (_, hidden, logits), phase_context| {
                         let logits = logits.as_ref().expect("observed output retains its logits");
-                        N::complete_prediction_state(extension, lane, &[logits, hidden], PredictionCompletionPoint::ObservedEquation, PredictionCompletionSources::default(), phase_context)
+                        N::complete_prediction_state(
+                            extension,
+                            lane,
+                            &[logits, hidden],
+                            PredictionCompletionPoint::ObservedEquation,
+                            PredictionCompletionSources::default(),
+                            phase_context,
+                        )
                     },
                 )
                 .map(|(row, hidden, _)| (row, hidden))
@@ -2256,10 +2813,10 @@ where
     ) -> Result<Option<EmbeddedPredictionLogitBlock<B::Tensor>>, M::Error> {
         let lane = cache
             .lane_identity_ref(self.selected)
-            .map_err(|cause|N::session_cause_with_context(cause,context))?;
+            .map_err(|cause| N::session_cause_with_context(cause, context))?;
         self.extension
             .validate_capture(self.selected, &lane, N::shape(capture))
-            .map_err(|cause|N::session_cause_with_context(cause,context))?;
+            .map_err(|cause| N::session_cause_with_context(cause, context))?;
         if self.selected.requirements().strategy().class()
             == eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential
         {
@@ -2268,7 +2825,10 @@ where
             return Ok(None);
         }
         let _tensor_context = N::target_context(context);
-        let equation = PredictionEquation::Fused { anchor: last_token, capacity };
+        let equation = PredictionEquation::Fused {
+            anchor: last_token,
+            capacity,
+        };
         if observer.is_some() {
             // Retain all temporary proposal cache members through the same
             // completion/commit protocol as sequential prediction phases. The
@@ -2278,8 +2838,8 @@ where
                 observer,
                 SpeculativeActivationPhase::FusedProposal,
                 capacity,
-                |cause|N::session_cause_with_context(cause,context),
-            |error|N::neural_observer_error(error,context),
+                |cause| N::session_cause_with_context(cause, context),
+                |error| N::neural_observer_error(error, context),
                 |observer| {
                     self.prediction_phase(
                         proposal.prediction_phase_state(),
@@ -2289,24 +2849,44 @@ where
                         observer,
                         |extension, invoker, lane, observer, phase_context| {
                             let output = execute_prediction_equation::<A, B, S, N, _, _>(
-                                equation, extension, invoker, lane, observer,
+                                equation,
+                                extension,
+                                invoker,
+                                lane,
+                                observer,
                                 |token| N::token(token, phase_context),
                             )?;
-                            let PredictionEquationOutput::Fused(output) = output else { unreachable!("fused equation result") };
+                            let PredictionEquationOutput::Fused(output) = output else {
+                                unreachable!("fused equation result")
+                            };
                             Ok(output)
                         },
                         |extension, lane, logits, phase_context| match logits {
-                            Some(logits) => {
-                                N::complete_prediction_state(extension, lane, &[logits], PredictionCompletionPoint::ObservedEquation, PredictionCompletionSources::default(), phase_context)
-                            }
-                            None => N::complete_prediction_state(extension, lane, &[], PredictionCompletionPoint::ObservedEquation, PredictionCompletionSources::default(), phase_context),
+                            Some(logits) => N::complete_prediction_state(
+                                extension,
+                                lane,
+                                &[logits],
+                                PredictionCompletionPoint::ObservedEquation,
+                                PredictionCompletionSources::default(),
+                                phase_context,
+                            ),
+                            None => N::complete_prediction_state(
+                                extension,
+                                lane,
+                                &[],
+                                PredictionCompletionPoint::ObservedEquation,
+                                PredictionCompletionSources::default(),
+                                phase_context,
+                            ),
                         },
                     )
                 },
             )?;
-            return output.map(|value| M::retain_logit_block(
-                value, proposal.logit_evidence().cloned(), context,
-            )).transpose();
+            return output
+                .map(|value| {
+                    M::retain_logit_block(value, proposal.logit_evidence().cloned(), context)
+                })
+                .transpose();
         }
         let output = self.prediction_phase(
             cache.prediction_phase_state(),
@@ -2316,17 +2896,23 @@ where
             None,
             |extension, invoker, lane, observer, phase_context| {
                 let output = execute_prediction_equation::<A, B, S, N, _, _>(
-                    equation, extension, invoker, lane, observer,
+                    equation,
+                    extension,
+                    invoker,
+                    lane,
+                    observer,
                     |token| N::token(token, phase_context),
                 )?;
-                let PredictionEquationOutput::Fused(output) = output else { unreachable!("fused equation result") };
+                let PredictionEquationOutput::Fused(output) = output else {
+                    unreachable!("fused equation result")
+                };
                 Ok(output)
             },
             |_, _, _, _| unreachable!("unobserved phase has no observation completion"),
         )?;
-        output.map(|value| M::retain_logit_block(
-            value, cache.logit_evidence().cloned(), context,
-        )).transpose()
+        output
+            .map(|value| M::retain_logit_block(value, cache.logit_evidence().cloned(), context))
+            .transpose()
     }
 
     fn advance_prediction_cache<'a>(
@@ -2339,18 +2925,18 @@ where
     ) -> Result<(), M::Error> {
         let lane = cache
             .lane_identity_ref(self.selected)
-            .map_err(|cause|N::session_cause_with_context(cause,context))?;
+            .map_err(|cause| N::session_cause_with_context(cause, context))?;
         self.extension
             .validate_capture(self.selected, &lane, N::shape(captures))
-            .map_err(|cause|N::session_cause_with_context(cause,context))?;
+            .map_err(|cause| N::session_cause_with_context(cause, context))?;
         let _tensor_context = N::target_context(context);
         let equation = PredictionEquation::Replay { captures, tokens };
         observation::neural_with_error(
             observer,
             SpeculativeActivationPhase::PredictionReplay,
             M::sequence_len(tokens)?,
-            |cause|N::session_cause_with_context(cause,context),
-            |error|N::neural_observer_error(error,context),
+            |cause| N::session_cause_with_context(cause, context),
+            |error| N::neural_observer_error(error, context),
             |observer| {
                 self.prediction_phase(
                     cache.prediction_phase_state(),
@@ -2360,16 +2946,29 @@ where
                     observer,
                     |extension, invoker, lane, observer, phase_context| {
                         execute_prediction_equation::<A, B, S, N, _, _>(
-                            equation, extension, invoker, lane, observer,
+                            equation,
+                            extension,
+                            invoker,
+                            lane,
+                            observer,
                             |token| N::token(token, phase_context),
-                        ).map(|output| {
-                            let PredictionEquationOutput::StateOnly = output else { unreachable!("replay equation result") };
+                        )
+                        .map(|output| {
+                            let PredictionEquationOutput::StateOnly = output else {
+                                unreachable!("replay equation result")
+                            };
                         })
                     },
-                    |extension, lane, _, phase_context| N::complete_prediction_state(
-                        extension, lane, &[], PredictionCompletionPoint::ObservedEquation,
-                        PredictionCompletionSources::default(), phase_context,
-                    ),
+                    |extension, lane, _, phase_context| {
+                        N::complete_prediction_state(
+                            extension,
+                            lane,
+                            &[],
+                            PredictionCompletionPoint::ObservedEquation,
+                            PredictionCompletionSources::default(),
+                            phase_context,
+                        )
+                    },
                 )
             },
         )
@@ -2411,13 +3010,23 @@ where
     fn new_cache(&mut self) -> Result<Self::Cache, Self::Error> {
         self.strategy_mut().new_cache()
     }
-    fn new_cache_with_context<'a>(&mut self,context:Self::Context<'a>)->Result<Self::Cache,eredu_core::BackendFailure>
-    where Self:'a {
+    fn new_cache_with_context<'a>(
+        &mut self,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Cache, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
         self.strategy_mut().new_cache_with_context(context)
     }
-    fn cache_metadata<'a>(bytes:Option<usize>,context:Self::Context<'a>)->Result<eredu_core::HostPreparationAuthority,eredu_core::BackendFailure>
-    where Self:'a {
-        N::prepared_cache_metadata(bytes,context)
+    fn cache_metadata<'a>(
+        bytes: Option<usize>,
+        context: Self::Context<'a>,
+    ) -> Result<eredu_core::HostPreparationAuthority, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
+        N::prepared_cache_metadata(bytes, context)
     }
 
     fn bind_context<'a>(
@@ -2479,14 +3088,17 @@ pub trait EmbeddedExecutorTypes: 'static {
         _request: eredu_core::generation::SpeculativeRequestId,
         context: Self::Context<'a>,
     ) -> Result<Self::Context<'a>, Self::Error>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
         Ok(context)
     }
     /// Actual host construction for the shared driver after typed pairing.
     /// Original backends debit the same request source before every birth.
-    fn driver_buffer<V>(capacity: usize, _context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<V>, Self::Error> {
+    fn driver_buffer<V>(
+        capacity: usize,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<V>, Self::Error> {
         Ok(eredu_core::SpeculativeBuffer::with_capacity(capacity))
     }
     /// Exact query for the same host buffer producer.
@@ -2494,19 +3106,27 @@ pub trait EmbeddedExecutorTypes: 'static {
         eredu_core::SpeculativeBuffer::<V>::retained_control_bytes(capacity)
     }
     /// Non-vector payload and erasure controls; an unknown original bound refuses.
-    fn driver_host_metadata(_bytes: Option<usize>, _context: Self::Context<'_>)
-        -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
+    fn driver_host_metadata(
+        _bytes: Option<usize>,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
         Ok(eredu_core::HostPreparationAuthority::unmanaged())
     }
     /// Same source-owned logical identity for initial and restored driver state.
-    fn driver_identity(_context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
+    fn driver_identity(
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
         Ok(eredu_core::SpeculativeRequestIdentity::new())
     }
     /// Copy the actual fixed canonical sequence through its existing provider.
-    fn copy_sequence(source: eredu_core::SpeculativeSequenceRef<'_>, _context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>> {
-        source.copy_ordinary().map_err(eredu_core::SpeculativeDriverError::Preparation)
+    fn copy_sequence(
+        source: eredu_core::SpeculativeSequenceRef<'_>,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
+    {
+        source
+            .copy_ordinary()
+            .map_err(eredu_core::SpeculativeDriverError::Preparation)
     }
     /// Logical snapshot cost for the same copied sequence provider.
     fn sequence_copy_bytes(source: &eredu_core::SpeculativeSequence) -> Option<u64> {
@@ -2520,19 +3140,29 @@ pub trait EmbeddedExecutorTypes: 'static {
     fn coordinate_retained_buffer(
         _local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
         _context: Self::Context<'_>,
-    ) -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+    ) -> Result<
+        eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        eredu_core::BackendFailure,
+    > {
         Err(eredu_core::HostMetadataFundingError::Unavailable.into())
     }
     /// Fund one authenticated restored future before mutable copies begin.
     /// The original occurrence source remains outside all snapshot branches.
     fn prepare_control_continuation(
-        _committed: usize, _status: eredu_core::generation::SpeculativeRequestStatus,
+        _committed: usize,
+        _status: eredu_core::generation::SpeculativeRequestStatus,
         _context: Self::Context<'_>,
-    ) -> Result<(), SpeculativeControlError> { Ok(()) }
+    ) -> Result<(), SpeculativeControlError> {
+        Ok(())
+    }
 
     /// Moves an already retained source error into the public neutral boundary.
     /// Ordinary errors remain in their native domain for the existing adapter.
-    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error> {Err(error)}
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
+        Err(error)
+    }
 
     /// Constructs the stable failure for an internally inconsistent erased value.
     fn erased_type_mismatch(value: &'static str) -> Self::Error;
@@ -2555,13 +3185,26 @@ pub trait EmbeddedExecutorCacheFactory<T: EmbeddedExecutorTypes>: SpeculativeExe
     fn new_cache(&mut self) -> Result<Self::Cache, Self::Error>;
 
     /// Context-bearing prepared constructor, retaining its typed source failure.
-    fn new_cache_with_context<'a>(&mut self,_context:Self::Context<'a>)->Result<Self::Cache,eredu_core::BackendFailure>
-    where Self:'a {
-        self.new_cache().map_err(eredu_core::BackendFailure::from_error)
+    fn new_cache_with_context<'a>(
+        &mut self,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::Cache, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
+        self.new_cache()
+            .map_err(eredu_core::BackendFailure::from_error)
     }
     /// Concrete erasure shell and fixed controls paid before Box construction.
-    fn cache_metadata<'a>(_bytes:Option<usize>,_context:Self::Context<'a>)->Result<eredu_core::HostPreparationAuthority,eredu_core::BackendFailure>
-    where Self:'a {Ok(eredu_core::HostPreparationAuthority::unmanaged())}
+    fn cache_metadata<'a>(
+        _bytes: Option<usize>,
+        _context: Self::Context<'a>,
+    ) -> Result<eredu_core::HostPreparationAuthority, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
+        Ok(eredu_core::HostPreparationAuthority::unmanaged())
+    }
 
     /// Binds the backend's fixed scheduler context to this exact typed executor.
     fn bind_context<'a>(context: T::Context<'a>) -> Self::Context<'a>;
@@ -2587,12 +3230,15 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
         context: T::Context<'a>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>;
     /// Preserves mandatory loaded validation through executable erasure.
-    fn validate_activation_readmission(&self, plan: &AdmittedSpeculativeActivations,
+    fn validate_activation_readmission(
+        &self,
+        plan: &AdmittedSpeculativeActivations,
         discovery: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
     ) -> Result<(), SpeculativeControlError> {
         plan.validate(discovery.ok_or(SpeculativeControlError::Unsupported(
             "loaded execution has no internal activation discovery",
-        ))?).map_err(Into::into)
+        ))?)
+        .map_err(Into::into)
     }
     /// Installs validated prospective internal edits through the typed collector.
     fn readmit_activation_interventions(
@@ -2654,8 +3300,12 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
     /// Realizes one lane cache.
     fn new_cache(&mut self) -> Result<DynEmbeddedCache, T::Error>;
     /// Uses the exact context for prepared payload and erasure destinations.
-    fn new_cache_with_context<'a>(&mut self,context:T::Context<'a>)->Result<DynEmbeddedCache,eredu_core::BackendFailure>
-    where Self:'a;
+    fn new_cache_with_context<'a>(
+        &mut self,
+        context: T::Context<'a>,
+    ) -> Result<DynEmbeddedCache, eredu_core::BackendFailure>
+    where
+        Self: 'a;
     /// Prefills one lane.
     fn prefill<'a>(
         &mut self,
@@ -2682,7 +3332,8 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
         state: &DynEmbeddedDraftState,
         context: T::Context<'a>,
     ) -> Result<DynEmbeddedDraftState, T::Error>
-    where Self: 'a;
+    where
+        Self: 'a;
     /// Forks a proposal branch.
     fn begin_proposal<'a>(
         &mut self,
@@ -2701,8 +3352,11 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
     /// Captures an exact target-cache checkpoint.
     fn checkpoint(&self, cache: &DynEmbeddedCache) -> Result<DynEmbeddedCheckpoint, T::Error>;
     /// The same checkpoint with paid erasure and request identity.
-    fn checkpoint_with_context<'a>(&self,cache:&DynEmbeddedCache,context:T::Context<'a>)
-        ->Result<DynEmbeddedCheckpoint,T::Error>;
+    fn checkpoint_with_context<'a>(
+        &self,
+        cache: &DynEmbeddedCache,
+        context: T::Context<'a>,
+    ) -> Result<DynEmbeddedCheckpoint, T::Error>;
     /// Restores an exact checkpoint.
     fn restore_checkpoint<'a>(
         &mut self,
@@ -2737,16 +3391,27 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
     ) -> Result<SpeculativeCommit<DynEmbeddedTargetState>, T::Error>;
 }
 
-fn erased_host<V, T: EmbeddedExecutorTypes>(context:T::Context<'_>)
-    ->Result<eredu_core::HostPreparationAuthority,T::Error> {
-    use std::mem::{size_of,size_of_val};
-    let parts=[size_of::<V>(),size_of::<Box<V>>(),size_of::<Box<dyn std::any::Any>>(),
+fn erased_host<V, T: EmbeddedExecutorTypes>(
+    context: T::Context<'_>,
+) -> Result<eredu_core::HostPreparationAuthority, T::Error> {
+    use std::mem::{size_of, size_of_val};
+    let parts = [
+        size_of::<V>(),
+        size_of::<Box<V>>(),
+        size_of::<Box<dyn std::any::Any>>(),
         size_of::<eredu_core::HostPreparationAuthority>(),
-        size_of::<(Box<dyn std::any::Any>,eredu_core::HostPreparationAuthority)>(),
-        size_of::<Result<V,T::Error>>(),
-        size_of::<Result<eredu_core::HostPreparationAuthority,T::Error>>(),
-        size_of::<T::Context<'_>>(),size_of::<Option<usize>>()];
-    T::driver_host_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add),context)
+        size_of::<(Box<dyn std::any::Any>, eredu_core::HostPreparationAuthority)>(),
+        size_of::<Result<V, T::Error>>(),
+        size_of::<Result<eredu_core::HostPreparationAuthority, T::Error>>(),
+        size_of::<T::Context<'_>>(),
+        size_of::<Option<usize>>(),
+    ];
+    T::driver_host_metadata(
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add),
+        context,
+    )
 }
 
 fn erased_ref<'a, T: 'static, E: EmbeddedExecutorTypes>(
@@ -2784,7 +3449,9 @@ where
     E::CacheCheckpoint: 'static,
     E::Verification: 'static,
 {
-    fn validate_activation_readmission(&self, plan: &AdmittedSpeculativeActivations,
+    fn validate_activation_readmission(
+        &self,
+        plan: &AdmittedSpeculativeActivations,
         discovery: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
     ) -> Result<(), SpeculativeControlError> {
         SpeculativeExecutor::validate_activation_readmission(self, plan, discovery)
@@ -2821,10 +3488,12 @@ where
             .map_err(SpeculativeControlError::backend)?;
         let state = erased_ref::<E::TargetState, T>(&state.0, "snapshot seed")
             .map_err(SpeculativeControlError::backend)?;
-        let checkpoint_host=erased_host::<E::CacheCheckpoint,T>(context)
-            .map_err(|cause|SpeculativeControlError::backend_with_retained(cause,T::take_retained_failure))?;
-        let seed_host=erased_host::<E::TargetState,T>(context)
-            .map_err(|cause|SpeculativeControlError::backend_with_retained(cause,T::take_retained_failure))?;
+        let checkpoint_host = erased_host::<E::CacheCheckpoint, T>(context).map_err(|cause| {
+            SpeculativeControlError::backend_with_retained(cause, T::take_retained_failure)
+        })?;
+        let seed_host = erased_host::<E::TargetState, T>(context).map_err(|cause| {
+            SpeculativeControlError::backend_with_retained(cause, T::take_retained_failure)
+        })?;
         SpeculativeExecutor::control_snapshot(
             self,
             cache,
@@ -2834,8 +3503,8 @@ where
         .map(|pair| {
             pair.map(|(cache, state)| {
                 (
-                    DynEmbeddedCheckpoint(Box::new(cache),checkpoint_host),
-                    DynEmbeddedTargetState(Box::new(state),seed_host),
+                    DynEmbeddedCheckpoint(Box::new(cache), checkpoint_host),
+                    DynEmbeddedTargetState(Box::new(state), seed_host),
                 )
             })
         })
@@ -2853,8 +3522,9 @@ where
             .map_err(SpeculativeControlError::backend)?;
         let state = erased_ref::<E::TargetState, T>(&state.0, "snapshot seed")
             .map_err(SpeculativeControlError::backend)?;
-        let host=erased_host::<E::TargetState,T>(context)
-            .map_err(|cause|SpeculativeControlError::backend_with_retained(cause,T::take_retained_failure))?;
+        let host = erased_host::<E::TargetState, T>(context).map_err(|cause| {
+            SpeculativeControlError::backend_with_retained(cause, T::take_retained_failure)
+        })?;
         SpeculativeExecutor::restore_control_snapshot(
             self,
             cache,
@@ -2862,7 +3532,7 @@ where
             state,
             <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context),
         )
-        .map(|state| state.map(|state| DynEmbeddedTargetState(Box::new(state),host)))
+        .map(|state| state.map(|state| DynEmbeddedTargetState(Box::new(state), host)))
     }
     fn coordinate_speculative_step<'a>(
         &mut self,
@@ -2948,20 +3618,35 @@ where
     }
 
     fn new_cache(&mut self) -> Result<DynEmbeddedCache, T::Error> {
-        EmbeddedExecutorCacheFactory::<T>::new_cache(self)
-            .map(|cache| DynEmbeddedCache(Box::new(cache),eredu_core::HostPreparationAuthority::unmanaged()))
+        EmbeddedExecutorCacheFactory::<T>::new_cache(self).map(|cache| {
+            DynEmbeddedCache(
+                Box::new(cache),
+                eredu_core::HostPreparationAuthority::unmanaged(),
+            )
+        })
     }
 
-    fn new_cache_with_context<'a>(&mut self,context:T::Context<'a>)->Result<DynEmbeddedCache,eredu_core::BackendFailure>
-    where Self:'a {
-        let context=<E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        let parts=[std::mem::size_of::<E::Cache>(),std::mem::size_of::<DynEmbeddedCache>(),
-            std::mem::size_of::<Box<E::Cache>>(),std::mem::size_of::<Box<dyn std::any::Any>>(),
-            std::mem::size_of::<Result<DynEmbeddedCache,eredu_core::BackendFailure>>()];
-        let bytes=parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add);
-        let host=<E as EmbeddedExecutorCacheFactory<T>>::cache_metadata(bytes,context)?;
-        let cache=<E as EmbeddedExecutorCacheFactory<T>>::new_cache_with_context(self,context)?;
-        Ok(DynEmbeddedCache(Box::new(cache),host))
+    fn new_cache_with_context<'a>(
+        &mut self,
+        context: T::Context<'a>,
+    ) -> Result<DynEmbeddedCache, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
+        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
+        let parts = [
+            std::mem::size_of::<E::Cache>(),
+            std::mem::size_of::<DynEmbeddedCache>(),
+            std::mem::size_of::<Box<E::Cache>>(),
+            std::mem::size_of::<Box<dyn std::any::Any>>(),
+            std::mem::size_of::<Result<DynEmbeddedCache, eredu_core::BackendFailure>>(),
+        ];
+        let bytes = parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add);
+        let host = <E as EmbeddedExecutorCacheFactory<T>>::cache_metadata(bytes, context)?;
+        let cache = <E as EmbeddedExecutorCacheFactory<T>>::new_cache_with_context(self, context)?;
+        Ok(DynEmbeddedCache(Box::new(cache), host))
     }
 
     fn copy_draft_state<'a>(
@@ -2969,13 +3654,14 @@ where
         state: &DynEmbeddedDraftState,
         context: T::Context<'a>,
     ) -> Result<DynEmbeddedDraftState, T::Error>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
         let state = erased_ref::<E::DraftState, T>(&state.0, "draft state")?;
-        let host=erased_host::<E::DraftState,T>(context)?;
+        let host = erased_host::<E::DraftState, T>(context)?;
         let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
         SpeculativeExecutor::copy_draft_state(self, state, context)
-            .map(|state| DynEmbeddedDraftState(Box::new(state),host))
+            .map(|state| DynEmbeddedDraftState(Box::new(state), host))
     }
 
     fn prefill<'a>(
@@ -2985,13 +3671,13 @@ where
         context: T::Context<'a>,
     ) -> Result<SpeculativePrefill<DynEmbeddedTargetState, T::Logits>, T::Error> {
         let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let host=erased_host::<E::TargetState,T>(context)?;
+        let host = erased_host::<E::TargetState, T>(context)?;
         let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
         SpeculativeExecutor::prefill(self, input, cache, context).map(|prefill| {
             let (logits, state, target_tokens) = prefill.into_parts();
             SpeculativePrefill::new(
                 logits,
-                DynEmbeddedTargetState(Box::new(state),host),
+                DynEmbeddedTargetState(Box::new(state), host),
                 target_tokens,
             )
         })
@@ -3010,7 +3696,7 @@ where
         T::Error,
     > {
         let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let host=erased_host::<E::TargetState,T>(context)?;
+        let host = erased_host::<E::TargetState, T>(context)?;
         let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
         SpeculativeExecutor::prefill_cancellable(self, input, cache, cancellation, context).map(
             |outcome| {
@@ -3018,7 +3704,7 @@ where
                     let (logits, state, target_tokens) = prefill.into_parts();
                     SpeculativePrefill::new(
                         logits,
-                        DynEmbeddedTargetState(Box::new(state),host),
+                        DynEmbeddedTargetState(Box::new(state), host),
                         target_tokens,
                     )
                 })
@@ -3034,10 +3720,10 @@ where
         context: T::Context<'a>,
     ) -> Result<DynEmbeddedDraftState, T::Error> {
         let state = erased_ref::<E::TargetState, T>(&state.0, "target state")?;
-        let host=erased_host::<E::DraftState,T>(context)?;
+        let host = erased_host::<E::DraftState, T>(context)?;
         let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
         SpeculativeExecutor::begin_proposal(self, state, last_token, proposal_capacity, context)
-            .map(|state| DynEmbeddedDraftState(Box::new(state),host))
+            .map(|state| DynEmbeddedDraftState(Box::new(state), host))
     }
 
     fn proposal_logits<'a>(
@@ -3056,19 +3742,28 @@ where
 
     fn checkpoint(&self, cache: &DynEmbeddedCache) -> Result<DynEmbeddedCheckpoint, T::Error> {
         if !cache.1.is_unmanaged() {
-            return Err(T::erased_type_mismatch("prepared checkpoint requires its execution context"));
+            return Err(T::erased_type_mismatch(
+                "prepared checkpoint requires its execution context",
+            ));
         }
         let cache = erased_ref::<E::Cache, T>(&cache.0, "target cache")?;
-        SpeculativeExecutor::checkpoint(self, cache)
-            .map(|checkpoint| DynEmbeddedCheckpoint(Box::new(checkpoint),eredu_core::HostPreparationAuthority::unmanaged()))
+        SpeculativeExecutor::checkpoint(self, cache).map(|checkpoint| {
+            DynEmbeddedCheckpoint(
+                Box::new(checkpoint),
+                eredu_core::HostPreparationAuthority::unmanaged(),
+            )
+        })
     }
-    fn checkpoint_with_context<'a>(&self,cache:&DynEmbeddedCache,context:T::Context<'a>)
-        ->Result<DynEmbeddedCheckpoint,T::Error> {
-        let cache=erased_ref::<E::Cache,T>(&cache.0,"target cache")?;
-        let host=erased_host::<E::CacheCheckpoint,T>(context)?;
-        let context=<E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::checkpoint_with_context(self,cache,context)
-            .map(|checkpoint|DynEmbeddedCheckpoint(Box::new(checkpoint),host))
+    fn checkpoint_with_context<'a>(
+        &self,
+        cache: &DynEmbeddedCache,
+        context: T::Context<'a>,
+    ) -> Result<DynEmbeddedCheckpoint, T::Error> {
+        let cache = erased_ref::<E::Cache, T>(&cache.0, "target cache")?;
+        let host = erased_host::<E::CacheCheckpoint, T>(context)?;
+        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
+        SpeculativeExecutor::checkpoint_with_context(self, cache, context)
+            .map(|checkpoint| DynEmbeddedCheckpoint(Box::new(checkpoint), host))
     }
 
     fn restore_checkpoint<'a>(
@@ -3090,11 +3785,11 @@ where
         context: T::Context<'a>,
     ) -> Result<Submission<DynEmbeddedVerification, T::Completion>, T::Error> {
         let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let host=erased_host::<E::Verification,T>(context)?;
+        let host = erased_host::<E::Verification, T>(context)?;
         let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
         SpeculativeExecutor::submit_verification(self, input_tokens, cache, context).map(
             |submission| Submission {
-                output: DynEmbeddedVerification(Box::new(submission.output),host),
+                output: DynEmbeddedVerification(Box::new(submission.output), host),
                 completion: submission.completion,
             },
         )
@@ -3130,7 +3825,7 @@ where
             .map_err(|_| T::erased_type_mismatch("draft state"))?;
         let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
         let checkpoint = erased_ref::<E::CacheCheckpoint, T>(&checkpoint.0, "target checkpoint")?;
-        let host=erased_host::<E::TargetState,T>(context)?;
+        let host = erased_host::<E::TargetState, T>(context)?;
         let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
         SpeculativeExecutor::commit_verification(
             self,
@@ -3143,7 +3838,7 @@ where
         )
         .map(|commit| {
             let (state, replayed) = commit.into_parts();
-            SpeculativeCommit::new(DynEmbeddedTargetState(Box::new(state),host), replayed)
+            SpeculativeCommit::new(DynEmbeddedTargetState(Box::new(state), host), replayed)
         })
     }
 }
@@ -3164,8 +3859,13 @@ impl<'a, T: EmbeddedExecutorTypes> DynEmbeddedExecutor<'a, T> {
         self.inner.new_cache()
     }
     /// Constructs the lane through the same typed factory with actual funding.
-    pub fn new_cache_with_context<'c>(&mut self,context:T::Context<'c>)->Result<DynEmbeddedCache,eredu_core::BackendFailure>
-    where Self:'c {
+    pub fn new_cache_with_context<'c>(
+        &mut self,
+        context: T::Context<'c>,
+    ) -> Result<DynEmbeddedCache, eredu_core::BackendFailure>
+    where
+        Self: 'c,
+    {
         self.inner.new_cache_with_context(context)
     }
 }
@@ -3181,7 +3881,8 @@ impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T
         state: &Self::DraftState,
         context: Self::Context<'a>,
     ) -> Result<Self::DraftState, Self::Error>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
         self.inner.copy_draft_state(state, context)
     }
@@ -3193,53 +3894,84 @@ impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T
     type Completion = T::Completion;
     type Telemetry = T::Telemetry;
     type Error = T::Error;
-    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error> {
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
         T::take_retained_failure(error)
     }
 
-    fn driver_buffer<V>(&self, capacity: usize, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<V>, Self::Error> {
+    fn driver_buffer<V>(
+        &self,
+        capacity: usize,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<V>, Self::Error> {
         T::driver_buffer(capacity, context)
     }
     fn driver_buffer_bytes<V>(&self, capacity: usize) -> Option<usize> {
         T::driver_buffer_bytes::<V>(capacity)
     }
-    fn driver_host_metadata(&self, bytes: Option<usize>, context: Self::Context<'_>)
-        -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
+    fn driver_host_metadata(
+        &self,
+        bytes: Option<usize>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
         T::driver_host_metadata(bytes, context)
     }
-    fn request_context<'a>(&self, request: eredu_core::generation::SpeculativeRequestId,
-        context: Self::Context<'a>) -> Result<Self::Context<'a>, Self::Error>
-    where Self: 'a,
+    fn request_context<'a>(
+        &self,
+        request: eredu_core::generation::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Context<'a>, Self::Error>
+    where
+        Self: 'a,
     {
         T::request_context(request, context)
     }
-    fn driver_identity(&self, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
+    fn driver_identity(
+        &self,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
         T::driver_identity(context)
     }
-    fn copy_sequence(&self, source: eredu_core::SpeculativeSequenceRef<'_>, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>> {
+    fn copy_sequence(
+        &self,
+        source: eredu_core::SpeculativeSequenceRef<'_>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
+    {
         T::copy_sequence(source, context)
     }
     fn sequence_copy_bytes(&self, source: &eredu_core::SpeculativeSequence) -> Option<u64> {
         T::sequence_copy_bytes(source)
     }
-    fn coordinate_speculative_buffer<'a>(&mut self,
-        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, context: Self::Context<'a>,
-    ) -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+    fn coordinate_speculative_buffer<'a>(
+        &mut self,
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        eredu_core::BackendFailure,
+    > {
         match local.try_into_ordinary() {
-            Ok(local) => self.inner.coordinate_speculative_step(local, context).map(Into::into),
+            Ok(local) => self
+                .inner
+                .coordinate_speculative_step(local, context)
+                .map(Into::into),
             Err(local) => T::coordinate_retained_buffer(local, context),
         }
     }
-    fn prepare_control_continuation<'a>(&mut self, committed: usize,
-        status: eredu_core::generation::SpeculativeRequestStatus, context: Self::Context<'a>,
+    fn prepare_control_continuation<'a>(
+        &mut self,
+        committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus,
+        context: Self::Context<'a>,
     ) -> Result<(), SpeculativeControlError> {
         T::prepare_control_continuation(committed, status, context)
     }
 
-    fn validate_activation_readmission(&self, plan: &AdmittedSpeculativeActivations,
+    fn validate_activation_readmission(
+        &self,
+        plan: &AdmittedSpeculativeActivations,
         discovery: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
     ) -> Result<(), SpeculativeControlError> {
         self.inner.validate_activation_readmission(plan, discovery)
@@ -3386,9 +4118,12 @@ impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
         self.inner.checkpoint(cache)
     }
-    fn checkpoint_with_context<'c>(&self,cache:&Self::Cache,context:Self::Context<'c>)
-        ->Result<Self::CacheCheckpoint,Self::Error>{
-        self.inner.checkpoint_with_context(cache,context)
+    fn checkpoint_with_context<'c>(
+        &self,
+        cache: &Self::Cache,
+        context: Self::Context<'c>,
+    ) -> Result<Self::CacheCheckpoint, Self::Error> {
+        self.inner.checkpoint_with_context(cache, context)
     }
     fn restore_checkpoint<'a>(
         &mut self,
@@ -3509,11 +4244,16 @@ where
         retain: F,
     ) -> M::Error
     where
-        F: FnOnce(eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>) -> M::Error,
+        F: FnOnce(
+            eredu_core::speculative::SpeculativeRollbackFailure<M::Error, M::Error>,
+        ) -> M::Error,
     {
         match S::restore_target_checkpoint(cache, checkpoint, context) {
             Ok(()) => operation,
-            Err(rollback) => retain(eredu_core::speculative::SpeculativeRollbackFailure { operation, rollback }),
+            Err(rollback) => retain(eredu_core::speculative::SpeculativeRollbackFailure {
+                operation,
+                rollback,
+            }),
         }
     }
 
@@ -3564,9 +4304,11 @@ where
         state: &Self::DraftState,
         _context: Self::Context<'a>,
     ) -> Result<Self::DraftState, Self::Error>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
-        let prediction_cache = state.prediction_cache
+        let prediction_cache = state
+            .prediction_cache
             .try_copy(|cache| self.strategy.copy_prediction_cache(cache))?;
         Ok(EmbeddedPredictionDraftState {
             capture: state.capture.clone(),
@@ -3585,7 +4327,9 @@ where
     type Completion = M::Completion;
     type Telemetry = S::Telemetry;
     type Error = M::Error;
-    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error> {
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
         M::take_retained_failure(error)
     }
 
@@ -3667,14 +4411,18 @@ where
         Ok(Some(seed))
     }
 
-    fn validate_activation_readmission(&self, plan: &AdmittedSpeculativeActivations,
+    fn validate_activation_readmission(
+        &self,
+        plan: &AdmittedSpeculativeActivations,
         discovery: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
     ) -> Result<(), SpeculativeControlError> {
         match self.observers.internal.as_ref() {
             Some(observer) => observer.validate_activation_readmission(plan, discovery),
-            None => plan.validate(discovery.ok_or(SpeculativeControlError::Unsupported(
-            "loaded execution has no internal activation discovery",
-        ))?).map_err(Into::into),
+            None => plan
+                .validate(discovery.ok_or(SpeculativeControlError::Unsupported(
+                    "loaded execution has no internal activation discovery",
+                ))?)
+                .map_err(Into::into),
         }
     }
 
@@ -3833,7 +4581,13 @@ where
                 // Shared registration owns agreed cancellation rollback.
                 Ok(eredu_core::SpeculativePrefillOutcome::Cancelled { evaluated_tokens })
             }
-            Err(operation) => Err(Self::restore_target_failure(operation, cache, &checkpoint, context, rollback_failure)),
+            Err(operation) => Err(Self::restore_target_failure(
+                operation,
+                cache,
+                &checkpoint,
+                context,
+                rollback_failure,
+            )),
         }
     }
 
@@ -3844,13 +4598,20 @@ where
         proposal_capacity: usize,
         context: M::Context<'_>,
     ) -> Result<Self::DraftState, Self::Error> {
-        let mut prediction_cache = DraftStateTransaction::try_fork(
-            &state.prediction_cache,
-            |cache| self.strategy.copy_prediction_cache(cache),
-        )?;
-        let fused_logits = M::with_tensor_source(state.capture.evidence(),context,|context|self.strategy.fused_logits(
-            &state.capture,last_token,proposal_capacity,prediction_cache.draft_mut(),context,self.observers.internal(),
-        ))?;
+        let mut prediction_cache =
+            DraftStateTransaction::try_fork(&state.prediction_cache, |cache| {
+                self.strategy.copy_prediction_cache(cache)
+            })?;
+        let fused_logits = M::with_tensor_source(state.capture.evidence(), context, |context| {
+            self.strategy.fused_logits(
+                &state.capture,
+                last_token,
+                proposal_capacity,
+                prediction_cache.draft_mut(),
+                context,
+                self.observers.internal(),
+            )
+        })?;
         if let Some(logits) = &fused_logits {
             let available = M::sequence_len(logits)?;
             if available < proposal_capacity {
@@ -3889,12 +4650,27 @@ where
                 .adjust_fused_logits(logits, last_token, context)?;
             return self.observers.logits(&logits);
         }
-        let (logits, capture) = M::with_tensor_source(state.capture.evidence(),context,|context|self.strategy.sequential_logits(
-            &state.capture,last_token,state.depth,state.prediction_cache.draft_mut(),context,self.observers.internal(),
-        ))?;
-        let capture = self.observers.tensor::<M>(EMBEDDED_PREDICTION_OUTPUT_PATH,capture,None,context)?;
-        state.capture = M::retain_tensor_packet(capture,
-            self.strategy.prediction_tensor_evidence(state.prediction_cache.draft()).cloned(),context)?;
+        let (logits, capture) =
+            M::with_tensor_source(state.capture.evidence(), context, |context| {
+                self.strategy.sequential_logits(
+                    &state.capture,
+                    last_token,
+                    state.depth,
+                    state.prediction_cache.draft_mut(),
+                    context,
+                    self.observers.internal(),
+                )
+            })?;
+        let capture =
+            self.observers
+                .tensor::<M>(EMBEDDED_PREDICTION_OUTPUT_PATH, capture, None, context)?;
+        state.capture = M::retain_tensor_packet(
+            capture,
+            self.strategy
+                .prediction_tensor_evidence(state.prediction_cache.draft())
+                .cloned(),
+            context,
+        )?;
         state.depth += 1;
         self.observers.logits(&logits)
     }
@@ -3929,19 +4705,30 @@ where
             self.observers.internal(),
             SpeculativeActivationPhase::Verification,
         )?;
-        output.logits = self
-            .observers
-            .tensor::<M>(EMBEDDED_VERIFICATION_LOGITS_PATH, output.logits, None, context)?;
-        output.capture = self
-            .observers
-            .tensor::<M>(EMBEDDED_TARGET_CAPTURE_PATH, output.capture, None, context)?;
+        output.logits = self.observers.tensor::<M>(
+            EMBEDDED_VERIFICATION_LOGITS_PATH,
+            output.logits,
+            None,
+            context,
+        )?;
+        output.capture = self.observers.tensor::<M>(
+            EMBEDDED_TARGET_CAPTURE_PATH,
+            output.capture,
+            None,
+            context,
+        )?;
         Self::validate_output(&output, Some(input_tokens.len()))?;
         let completion = M::submit_verification_completion_with_source(
-            &output, &inputs, self.strategy.target_logit_evidence(cache), context,
+            &output,
+            &inputs,
+            self.strategy.target_logit_evidence(cache),
+            context,
         )?;
         Ok(Submission {
             output: EmbeddedPredictionVerification {
-                output, inputs, logits_source: self.strategy.target_logit_evidence(cache).cloned(),
+                output,
+                inputs,
+                logits_source: self.strategy.target_logit_evidence(cache).cloned(),
             },
             completion,
         })
@@ -3953,7 +4740,12 @@ where
         index: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
-        M::logits_row_with_source(output.output.logits(), index, output.logits_source.as_ref(), context)
+        M::logits_row_with_source(
+            output.output.logits(),
+            index,
+            output.logits_source.as_ref(),
+            context,
+        )
     }
 
     fn commit_verification(
@@ -3973,22 +4765,39 @@ where
                 return Err(M::invalid_prediction_commit(verified_inputs, input_len));
             }
             if verified_inputs > 1 {
-                let captures = M::tensor_prefix_with_source(output.output.capture(),verified_inputs-1,output.logits_source.as_ref(),context)?;
-                let tokens = M::token_range_packet(&output.inputs,1,verified_inputs,context)?;
-                M::with_tensor_source(captures.evidence(),context,|context|
-                    M::with_tensor_source(tokens.evidence(),context,|context|self.strategy.advance_prediction_cache(
-                        &captures,&tokens,draft_state.prediction_cache.draft_mut(),context,self.observers.internal(),
-                    )))?;
+                let captures = M::tensor_prefix_with_source(
+                    output.output.capture(),
+                    verified_inputs - 1,
+                    output.logits_source.as_ref(),
+                    context,
+                )?;
+                let tokens = M::token_range_packet(&output.inputs, 1, verified_inputs, context)?;
+                M::with_tensor_source(captures.evidence(), context, |context| {
+                    M::with_tensor_source(tokens.evidence(), context, |context| {
+                        self.strategy.advance_prediction_cache(
+                            &captures,
+                            &tokens,
+                            draft_state.prediction_cache.draft_mut(),
+                            context,
+                            self.observers.internal(),
+                        )
+                    })
+                })?;
             }
             let (committed, committed_source, replayed_tokens) = if verified_inputs == input_len {
                 (output.output, output.logits_source, 0)
             } else {
                 S::restore_target_checkpoint(cache, &checkpoint.cache, context)?;
                 let retained = M::token_range_packet(&output.inputs, 0, verified_inputs, context)?;
-                let replayed=self.strategy.verify_target(&retained,cache,context,
-                    self.observers.internal(),SpeculativeActivationPhase::TargetReplay)?;
-                let replayed_source=self.strategy.target_logit_evidence(cache).cloned();
-                (replayed,replayed_source,verified_inputs)
+                let replayed = self.strategy.verify_target(
+                    &retained,
+                    cache,
+                    context,
+                    self.observers.internal(),
+                    SpeculativeActivationPhase::TargetReplay,
+                )?;
+                let replayed_source = self.strategy.target_logit_evidence(cache).cloned();
+                (replayed, replayed_source, verified_inputs)
             };
             self.strategy
                 .commit_prediction_cache(cache, draft_state.prediction_cache.draft())?;
@@ -4003,7 +4812,13 @@ where
         })();
         match result {
             Ok(commit) => Ok(commit),
-            Err(operation) => Err(Self::restore_target_failure(operation, cache, &checkpoint.cache, context, rollback_failure)),
+            Err(operation) => Err(Self::restore_target_failure(
+                operation,
+                cache,
+                &checkpoint.cache,
+                context,
+                rollback_failure,
+            )),
         }
     }
 }

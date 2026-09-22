@@ -1,8 +1,8 @@
 //! Borrowed exact immutable Host backing, with positive constructor provenance.
 use super::ImmutableHostTransferBuffer;
 use crate::{
-    AllocationInfo, OriginalBufferCause, OriginalBufferError, PreparedAllocationOwner,
-    utils::runtime_lock,
+    utils::runtime_lock, AllocationInfo, OriginalBufferCause, OriginalBufferError,
+    PreparedAllocationOwner,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -26,8 +26,9 @@ impl ImmutableHostTransferWitness<'_> {
         AllocationInfo::from_native(
             self.facts.backing.identity,
             self.facts.backing.charged_bytes,
-            true,
+            self.facts.backing.placement,
         )
+        .with_host_controls(self.facts.backing.host_control_bytes)
     }
     /// Positive native constructor classification; false denotes actual ordinary
     /// Host allocation, not an unknown descriptor or a missing prepared tag.
@@ -80,9 +81,15 @@ impl ImmutableHostTransferBuffer {
             runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
         let mut facts = safemlx_sys::mlx_immutable_host_transfer_info {
             backing: safemlx_sys::mlx_original_buffer_info {
+                host_control_bytes: 0,
                 known: false,
                 identity: 0,
                 charged_bytes: 0,
+                placement: safemlx_sys::mlx_memory_placement {
+                    kind: 0,
+                    device: -1,
+                    device_count: 0,
+                },
             },
             prepared_source: false,
         };

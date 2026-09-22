@@ -73,8 +73,8 @@ impl CopiedTextComponents {
         session.authority.try_borrow()?.require_idle()?;
         if !runtime
             .backend()
-            .memory_pool()
-            .same_domain(self.sampling.arrays.custody.pool())
+            .memory_ledger()
+            .same_ledger(self.sampling.arrays.custody.pool())
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
@@ -115,10 +115,11 @@ impl CopiedTextComponents {
         self.validate_resume_origin_fixed(runtime).ok()?;
         // These plans borrow only. Configuration validation does not spend the
         // old sampler account or include future history growth in copy work.
-        self.sampling
+        let _ = self
+            .sampling
             .sampler
             .borrow_funded()
-            .prepare_resume(config)
+            .prepare_resume(config.clone())
             .ok()?;
         let history = self.sampling.sampler.as_sampler().prepare_copy().ok()?;
         Some(LogicalResumeSource {

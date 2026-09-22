@@ -1,14 +1,12 @@
 //! Exact native sources retained through the shared prediction equation quote.
-use super::source_bindings::SourceBindings;
 use super::super::{
-    MlxEmbeddedPredictionMaterializer, MlxWorkspacePredictionParameterSource,
-    NativePredictionParameters, PredictionParameterStorage, prepare_prediction_parameters,
+    prepare_prediction_parameters, MlxEmbeddedPredictionMaterializer,
+    MlxWorkspacePredictionParameterSource, NativePredictionParameters, PredictionParameterStorage,
 };
-use super::{ProjectedPredictionState, project_prediction_state};
+use super::source_bindings::SourceBindings;
+use super::{project_prediction_state, ProjectedPredictionState};
 use crate::{
-    MlxTensor,
     backend::{
-        OriginalCopyEnvironment,
         error::Error,
         nn::{
             shared::MlxNeuralBackend,
@@ -18,29 +16,29 @@ use crate::{
             },
         },
         runtime::execution::generic::LayerwiseWorkspace,
+        OriginalCopyEnvironment,
     },
     composition::mlx::{
         replicated_text::{
-            MlxArchitectureLayerwisePolicy, MlxStateMechanisms,
-            session::MlxReplicatedTextMechanisms,
+            session::MlxReplicatedTextMechanisms, MlxArchitectureLayerwisePolicy,
+            MlxStateMechanisms,
         },
         speculative::OriginalSpeculativeNumericalSources,
     },
+    MlxTensor,
 };
 use eredu_architectures::prediction_extension::{
-    MaterializedPredictionExecutor, equation::PredictionEquation,
-    workspace::WorkspacePredictionState,
+    equation::PredictionEquation, workspace::WorkspacePredictionState,
+    MaterializedPredictionExecutor,
 };
 use eredu_nn::{
+    workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError, WorkspaceTensor},
     Parameterized,
-    workspace::{
-        WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding, WorkspaceTensor,
-    },
 };
 use eredu_runtime::{
-    LayeredArchitecture, ReplicatedTextExecutionStrategy, ReplicatedTextSession,
     speculative::embedded_occurrence::EmbeddedInvocationWorkspace,
     working_memory::{InferenceWorkspaceReport, WorkingMemoryError},
+    LayeredArchitecture, ReplicatedTextExecutionStrategy, ReplicatedTextSession,
 };
 use std::{
     marker::PhantomData,
@@ -91,7 +89,10 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
         environment: &OriginalCopyEnvironment<'_>,
         funding: &HostMetadataFunding,
         observation: Option<super::capture::CaptureWorkspaceInput<'_, '_>>,
-        bind_sources: impl FnOnce(&WorkspaceContext, &[&ProjectedNativeStorage]) -> Result<SourceBindings, Error>,
+        bind_sources: impl FnOnce(
+            &WorkspaceContext,
+            &[&ProjectedNativeStorage],
+        ) -> Result<SourceBindings, Error>,
     ) -> Result<Self, Error>
     where
         S: MlxStateMechanisms,
@@ -99,12 +100,12 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
         A::StaticModules: Parameterized<MlxTensor>,
         A::Unit: Parameterized<MlxTensor> + 'static,
         D: ReplicatedTextExecutionStrategy<
-                A,
-                MlxNeuralBackend,
-                S,
-                MlxArchitectureLayerwisePolicy<A, S>,
-                MlxArchitectureLayerwisePolicy<A, S>,
-            >,
+            A,
+            MlxNeuralBackend,
+            S,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+        >,
         P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>
             + 'static,
     {
@@ -143,7 +144,20 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
                     eredu_nn::Error,
                 >,
             >(),
-            size_of::<ResidentRecipeRecorder>(),
+            size_of::<Option<ResidentRecipeRecorder>>(),
+            size_of::<Option<crate::backend::nn::workspace::ParallelRecipeRecorder>>(),
+            size_of::<
+                Result<
+                    Option<crate::backend::nn::workspace::ParallelRecipeRecorder>,
+                    eredu_nn::Error,
+                >,
+            >(),
+            size_of::<&mut dyn crate::composition::mlx::model::CaptureRecorder>(),
+            size_of::<Option<crate::composition::mlx::model::NativeLayerwiseParameters<'_>>>(),
+            size_of::<
+                Option<&dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>,
+            >(),
+            size_of::<Option<&eredu_runtime::RetainedCommunicationSource>>(),
             size_of::<Result<ResidentRecipeRecorder, eredu_nn::Error>>(),
             size_of::<
                 Result<
@@ -177,6 +191,7 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
             batch,
             mechanism,
             addressable,
+            parallel,
         } = super::target_sources::ProjectedTargetEquationSources::inspect(
             session,
             workspace,
@@ -214,13 +229,31 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
         }
         let mut prediction_storage = None;
         let mut source_bindings = None;
-        let mut recorder =
-            mechanism.recorder(workspace.geometry(), &context)
+        let mut local_recorder = if parallel.is_none() {
+            let mut recorder = mechanism
+                .recorder(workspace.geometry(), &context)
                 .map_err(|cause| sources.retain_startup_error(cause))?;
-        if let Some(source)=addressable {
-            recorder.bind_addressable_sources(source)
-                .map_err(|cause|sources.retain_startup_error(cause))?;
-        }
+            if let Some(source) = addressable {
+                recorder
+                    .bind_addressable_sources(source)
+                    .map_err(|cause| sources.retain_startup_error(cause))?;
+            }
+            Some(recorder)
+        } else {
+            None
+        };
+        let mut parallel_recorder = parallel
+            .as_ref()
+            .map(|source| source.recorder(workspace.geometry()))
+            .transpose()
+            .map_err(|cause| sources.retain_startup_error(cause))?;
+        let recorder: &mut dyn crate::composition::mlx::model::CaptureRecorder =
+            match (local_recorder.as_mut(), parallel_recorder.as_mut()) {
+                (Some(recorder), None) => recorder,
+                (None, Some(recorder)) => recorder,
+                _ => return Err(sources.retain_startup_error(WorkingMemoryError::IdentityMismatch)),
+            };
+
         let transfers =
             std::cell::Cell::new(crate::backend::array_copy::CaptureNativePopulation::default());
         let logical_prediction = observation
@@ -231,6 +264,14 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
             .transpose()?;
         let observation = capture_observer.as_mut().zip(logical_prediction).map(|(observer, prediction)|
             eredu_architectures::prepared_execution::EmbeddedPredictionWorkspaceObservation::new(observer, prediction));
+        let target_parameters = parallel
+            .as_ref()
+            .and(layerwise.as_ref())
+            .map(crate::composition::mlx::model::NativeLayerwiseParameters);
+        let target_parameters = target_parameters.as_ref().map(|parameters| {
+            parameters as &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
+        });
+        let communication = parallel.as_ref().map(|source| source.declaration_source());
         // Exact unloaded slots/copies are bound separately from numerical Eval;
         // no ParameterPlaceholder operation is imported into the equation trace.
         let report = sources
@@ -240,16 +281,26 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
                 equation,
                 &target.state,
                 &context,
-                None,
+                target_parameters,
+                communication,
                 parameters,
                 |layout, context| {
                     let projected = project_prediction_state::<A, P>(lane, layout, batch, context)?;
                     if !projected.storage.is_complete() {
                         return Err(context.metadata_source(WorkingMemoryError::UnknownBound));
                     }
-                    source_bindings = Some(bind_sources(context, &[
-                        &target.storage, &projected.storage, &inputs, parameter_storage.storage(),
-                    ]).map_err(|cause| context.metadata_source(cause))?);
+                    source_bindings = Some(
+                        bind_sources(
+                            context,
+                            &[
+                                &target.storage,
+                                &projected.storage,
+                                &inputs,
+                                parameter_storage.storage(),
+                            ],
+                        )
+                        .map_err(|cause| context.metadata_source(cause))?,
+                    );
                     prediction_storage = Some(projected.storage);
                     Ok(match projected.state {
                         ProjectedPredictionState::Sequential(state) => {
@@ -265,19 +316,26 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
                 },
                 observation,
                 &mut io,
-                &mut recorder,
+                recorder,
             )
             .map_err(|cause| sources.retain_startup_error(cause))?;
         io.finish_quote()
             .map_err(|cause| sources.retain_startup_error(cause))?;
         let capture = transfers.get();
         recorder
-            .record_capture_population(capture)
+            .capture_population(capture)
             .map_err(|cause| sources.retain_startup_error(cause))?;
         drop(capture_observer);
-        let recipe = recorder
-            .finish_embedded(report.span_workspace_plan(), workspace)
-            .map_err(|cause| sources.retain_startup_error(cause))?;
+        let recipe = match (local_recorder, parallel_recorder) {
+            (Some(recorder), None) => {
+                recorder.finish_embedded(report.span_workspace_plan(), workspace)
+            }
+            (None, Some(recorder)) => {
+                recorder.finish_embedded(report.span_workspace_plan(), workspace)
+            }
+            _ => return Err(sources.retain_startup_error(WorkingMemoryError::IdentityMismatch)),
+        }
+        .map_err(|cause| sources.retain_startup_error(cause))?;
         let prediction_storage = prediction_storage
             .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
         Ok(Self {
@@ -292,7 +350,9 @@ impl<'source> PreparedPredictionEquationQuote<'source> {
                 layerwise,
                 io,
                 context,
-                bindings: source_bindings.ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?,
+                bindings: source_bindings.ok_or_else(|| {
+                    sources.retain_startup_error(WorkingMemoryError::UnknownBound)
+                })?,
                 funding: funding.clone(),
             },
             sources,

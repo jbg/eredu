@@ -1,9 +1,48 @@
 //! Single-assignment opening identity; numerical provenance stays with its owner.
 
+use eredu_nn::workspace::WorkspaceMetadataAllocation;
 use eredu_runtime::working_memory::{
     InferenceRequest, InferenceRetention, InferenceStateRevision, WorkingMemoryError,
 };
 use std::cell::{OnceCell, RefCell, RefMut};
+
+/// Reads the actual quiescent state frontier. A retained request, when present,
+/// must describe that same state; its absence does not make imported state empty.
+pub(in crate::composition::mlx::session::model_session) fn actual_frontier(
+    model: &dyn crate::composition::mlx::replicated_text::ErasedReplicatedTextExecutable,
+    retained: &InferenceRetention,
+    funding: &eredu_core::HostMetadataFunding,
+) -> Result<u64, crate::backend::error::Error> {
+    use crate::backend::error::Error;
+    use crate::composition::mlx::replicated_text::OriginalTextFrontierError;
+    use std::mem::size_of;
+
+    funding
+        .reserve_metadata(size_of::<(
+            &dyn crate::composition::mlx::replicated_text::ErasedReplicatedTextExecutable,
+            &InferenceRetention,
+            &eredu_core::HostMetadataFunding,
+            Option<u64>,
+            Option<&eredu_runtime::working_memory::InferenceStateAdmission>,
+            Result<Option<u64>, OriginalTextFrontierError>,
+            Result<u64, Error>,
+            WorkingMemoryError,
+        )>())
+        .map_err(Error::WorkspacePlanning)?;
+    let actual = model
+        .original_text_frontier()
+        .map_err(|cause| Error::Neural(funding.metadata_source(cause)))?;
+    let admitted = retained.admission().map(|admission| admission.position());
+    if let (Some(expected), Some(actual)) = (admitted, actual) {
+        if expected != actual {
+            return Err(Error::Neural(funding.metadata_source(
+                WorkingMemoryError::StateFrontierMismatch { expected, actual },
+            )));
+        }
+    }
+    // Stateless ranks retain their logical progress in the admitted request.
+    Ok(actual.or(admitted).unwrap_or(0))
+}
 
 #[derive(Debug)]
 struct Opening {
@@ -76,12 +115,20 @@ impl OpeningSeal {
         self.validate_source(retained.revision(), retained.admission(), cached_positions)
     }
 
-    pub(super) fn validate_source(&self, revision: &InferenceStateRevision,
-        admission: Option<&eredu_runtime::working_memory::InferenceStateAdmission>, cached_positions: u64)
-        -> Result<(), WorkingMemoryError> {
+    pub(super) fn validate_source(
+        &self,
+        revision: &InferenceStateRevision,
+        admission: Option<&eredu_runtime::working_memory::InferenceStateAdmission>,
+        cached_positions: u64,
+    ) -> Result<(), WorkingMemoryError> {
         let opening = self.get()?;
-        let placement = self.placement.try_borrow().map_err(|_| WorkingMemoryError::PreparationNotReady)?;
-        if placement.as_ref().unwrap_or(&opening.revision) != revision { return Err(WorkingMemoryError::IdentityMismatch); }
+        let placement = self
+            .placement
+            .try_borrow()
+            .map_err(|_| WorkingMemoryError::PreparationNotReady)?;
+        if placement.as_ref().unwrap_or(&opening.revision) != revision {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         match (&opening.predecessor, admission) {
             (None, None) => Ok(()),
             (Some(expected), Some(actual)) if actual.position() == cached_positions => {
@@ -92,8 +139,12 @@ impl OpeningSeal {
     }
 
     /// Reserve the private destination loan before the atomic native exchange.
-    pub(super) fn placement_slot(&self) -> Result<RefMut<'_, Option<InferenceStateRevision>>, WorkingMemoryError> {
-        self.placement.try_borrow_mut().map_err(|_| WorkingMemoryError::PreparationNotReady)
+    pub(super) fn placement_slot(
+        &self,
+    ) -> Result<RefMut<'_, Option<InferenceStateRevision>>, WorkingMemoryError> {
+        self.placement
+            .try_borrow_mut()
+            .map_err(|_| WorkingMemoryError::PreparationNotReady)
     }
 
     /// Only TextExecutionQuote's runtime-reading endpoint calls this after its

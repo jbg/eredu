@@ -57,7 +57,7 @@ TEST_CASE("CPU MXFP4 payload refusal retains a typed composed evaluation failure
     unsigned retired=0;
     struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity,&retired,
-        [](void* p){++*static_cast<unsigned*>(p);})==0);
+        [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     {
       Role role;Observer observer;Bank bank;Outputs outputs;
       REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);

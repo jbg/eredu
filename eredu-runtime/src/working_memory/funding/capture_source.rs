@@ -44,11 +44,16 @@ pub(super) type CaptureSourceEntries = Vec<Arc<dyn SavedSourceValidation + Send 
 // callback executes under Usage; it is exactly the existing storage check.
 struct Source<K: Ord + Send + 'static>(WorkingMemoryStorage<K>);
 impl<K: Clone + Ord + Send + Sync + 'static> SavedSourceValidation for Source<K> {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         self.0.validate_copy_source(pool, usage)
     }
     fn pin(&self) -> RegisteredStoragePin {
         RegisteredStoragePin::new(self.0.clone())
+    }
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        crate::working_memory::residual::RegisteredStoragePin::single_control_bytes::<K>(
+            self.0.has_source_preparation(),
+        )
     }
 }
 
@@ -68,7 +73,7 @@ impl std::fmt::Debug for CaptureSourceSlot {
 impl CaptureSourceSlot {
     pub(super) fn validate(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         self.validate_sources(pool, usage)?;
@@ -79,7 +84,7 @@ impl CaptureSourceSlot {
     }
     fn validate_sources(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         for source in &self.sources {
@@ -236,7 +241,8 @@ impl CaptureTensorCustody {
     // exact canonical fragment. Their destination H is independently paid;
     // the original source channel still belongs to the global scheduled bank.
     pub(in crate::working_memory) fn bind_projected_segment_source<
-        's, K: Clone + Ord + Send + Sync + 'static,
+        's,
+        K: Clone + Ord + Send + Sync + 'static,
     >(
         &self,
         native: &'s mut WorkingMemoryFundingScope,
@@ -271,7 +277,9 @@ impl CaptureTensorCustody {
             .lock()
             .map_err(|_| WorkingMemoryError::Poisoned)?;
         self.validate_scheduled_native_locked(native, &usage)?;
-        segment.custody.validate_scheduled_native_locked(native, &usage)?;
+        segment
+            .custody
+            .validate_scheduled_native_locked(native, &usage)?;
         // Opening pins are independent of the rollback-owned transform list.
         if let Some(opening) = &previous.opening {
             opening.validate_origins(&pool, &usage)?;

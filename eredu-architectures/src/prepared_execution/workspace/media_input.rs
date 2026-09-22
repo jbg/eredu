@@ -2,9 +2,9 @@
 use super::*;
 use crate::media_plan::BoundPreparedMediaSemantics;
 use eredu_runtime::{
-    PreparedModelInput,
     input::{OriginalPreparedInputProjection, PreparedModelInputOwner},
     working_memory::WorkingMemoryUnquotedLease,
+    PreparedModelInput,
 };
 
 pub use eredu_runtime::input::PreparedMediaWorkspaceTensor;
@@ -145,28 +145,53 @@ impl OriginalMediaWorkspaceInput {
     pub(crate) fn construct_plan<P>(
         self,
         context: Option<&WorkspaceContext>,
-        construct: impl FnOnce(PreparedModelInputOwner<WorkspaceTensor>, BoundPreparedMediaSemantics)
-            -> Result<P, eredu_runtime::working_memory::OriginalCompositeSemanticStorageError>,
-    ) -> Result<(
-        P,
-        (eredu_runtime::input::OriginalEncoderTableProjection,
-         eredu_runtime::input::OriginalPreparedWorkspaceSource, Option<WorkingMemoryUnquotedLease>),
-        (Option<eredu_nn::workspace::HostMetadataFunding>, Option<eredu_nn::workspace::HostMetadataFunding>),
-    ), Error> {
+        construct: impl FnOnce(
+            PreparedModelInputOwner<WorkspaceTensor>,
+            BoundPreparedMediaSemantics,
+        ) -> Result<
+            P,
+            eredu_runtime::working_memory::OriginalCompositeSemanticStorageError,
+        >,
+    ) -> Result<
+        (
+            P,
+            (
+                eredu_runtime::input::OriginalEncoderTableProjection,
+                eredu_runtime::input::OriginalPreparedWorkspaceSource,
+                Option<WorkingMemoryUnquotedLease>,
+            ),
+            (
+                Option<eredu_nn::workspace::HostMetadataFunding>,
+                Option<eredu_nn::workspace::HostMetadataFunding>,
+            ),
+        ),
+        Error,
+    > {
         if !self.tables.has_encoder_tables() {
-            return Err(self.reject(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into()));
+            return Err(
+                self.reject(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+            );
         }
         let controls = std::mem::size_of::<(
-            P, OriginalPreparedInputProjection, eredu_runtime::input::OriginalEncoderTableProjection,
-            eredu_runtime::input::OriginalPreparedWorkspaceSource, Option<WorkingMemoryUnquotedLease>,
-            (Option<eredu_nn::workspace::HostMetadataFunding>, Option<eredu_nn::workspace::HostMetadataFunding>),
+            P,
+            OriginalPreparedInputProjection,
+            eredu_runtime::input::OriginalEncoderTableProjection,
+            eredu_runtime::input::OriginalPreparedWorkspaceSource,
+            Option<WorkingMemoryUnquotedLease>,
+            (
+                Option<eredu_nn::workspace::HostMetadataFunding>,
+                Option<eredu_nn::workspace::HostMetadataFunding>,
+            ),
         )>();
         match context {
             Some(context) => context.charge_metadata(controls)?,
             None => self.charge_retained_metadata(controls)?,
         }
-        let (plan, (tables, storage, ordinary), funding) = self.construct_source_plan(context, construct)?;
-        let tables = tables.into_encoder_tables().expect("checked immutable encoder tables");
+        let (plan, (tables, storage, ordinary), funding) =
+            self.construct_source_plan(context, construct)?;
+        let tables = tables
+            .into_encoder_tables()
+            .expect("checked immutable encoder tables");
         Ok((plan, (tables, storage, ordinary), funding))
     }
 
@@ -320,7 +345,7 @@ impl OriginalMediaWorkspaceInput {
         source: &'a PreparedModelInputOwner<T>,
         original: BoundPreparedMediaSemantics,
         context: &'a WorkspaceContext,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Self, OriginalMediaWorkspaceInputError> {
         Self::project_with_custody(source, original, context, None, |original| {
             if context.metadata_funding().is_none() {

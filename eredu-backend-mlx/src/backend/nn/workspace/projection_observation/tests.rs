@@ -4,7 +4,11 @@ use eredu_nn::{LinearOperator, LinearSpec, NeuralBackend, ParameterSpec, Tensor}
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -166,6 +170,7 @@ fn actual_selected_reconstruction_and_prepare_roots_coexist_with_finish_output()
         report.total_bytes.unwrap(),
         observer.before_finish.unwrap()
             + bound_total(&facts.operation_bound(finish).unwrap().unwrap())
+            + crate::backend::nn::workspace::test_operation_backing_controls(&facts, finish)
     );
     assert_eq!(report.host_workspace_bytes, Some(0));
     let only_output = context.report(&[output]).unwrap().retained_bytes.unwrap();

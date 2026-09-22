@@ -2,21 +2,20 @@
 #[cfg(not(feature = "cuda"))]
 mod implementation {
     use eredu_runtime::working_memory::{
-        InitializedSharedNative, SharedNativeInitializationCustody,
+        InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
         SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-        WorkingMemoryPool,
     };
     use safemlx::fast::{
         BorrowedKernelOutput, KernelDefinitionCause, KernelDefinitionError, KernelFamilyLayout,
         KernelInputClass, KernelInputSignature, KernelSpecialization, MetalKernelDefinitionPlan,
         MetalKernelFamilyPlan, PreparedMetalKernelFamily,
     };
-    use safemlx::{Array, Dtype, OriginalScopeObserver, Stream, error::Exception};
+    use safemlx::{error::Exception, Array, Dtype, OriginalScopeObserver, Stream};
     use std::{
         mem::size_of,
         sync::{
-            OnceLock,
             atomic::{AtomicBool, Ordering},
+            OnceLock,
         },
     };
 
@@ -250,10 +249,8 @@ mod implementation {
         #[error("recurrent kernel initialization is busy")]
         Busy,
     }
-    pub(crate) fn prepare_admitted(
-        pool: &WorkingMemoryPool,
-    ) -> Result<(), MlxRecurrentKernelError> {
-        if !pool.same_domain(&super::super::domain()) {
+    pub(crate) fn prepare_admitted(pool: &MemoryLedger) -> Result<(), MlxRecurrentKernelError> {
+        if !pool.same_ledger(&super::super::ledger()) {
             return Err(MlxRecurrentKernelError::Policy(
                 WorkingMemoryError::IdentityMismatch,
             ));

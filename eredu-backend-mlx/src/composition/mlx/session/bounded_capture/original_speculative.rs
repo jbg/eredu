@@ -66,13 +66,12 @@ pub(in crate::composition::mlx) fn prepare(
         size_of::<Observer>(),
         size_of::<Option<OriginalInterventionSource>>(),
         size_of::<&[SpeculativeCaptureScope]>(),
-        OriginalInterventionSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?,
-        size_of::<eredu_runtime::working_memory::OriginalEmbeddedCaptureLineage>(),
+        OriginalInterventionSource::validation_control_bytes()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+        size_of::<eredu_runtime::working_memory::OriginalModelCaptureLineage>(),
         size_of::<
             Result<
-                eredu_runtime::working_memory::OriginalEmbeddedCaptureLineage,
+                eredu_runtime::working_memory::OriginalModelCaptureLineage,
                 eredu_runtime::working_memory::SpeculativeRequestError,
             >,
         >(),
@@ -94,18 +93,15 @@ pub(in crate::composition::mlx) fn prepare(
             SpeculativeRequestId,
             &OriginalSpeculativeNumericalSources,
         )>(),
-        OriginalCaptureSource::validation_control_bytes().ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?,
+        OriginalCaptureSource::validation_control_bytes()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
     funding
         .reserve_metadata(
             controls
                 .into_iter()
                 .try_fold(size_of_val(&controls), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         )
         .map_err(Error::WorkspacePlanning)?;
     source
@@ -113,7 +109,7 @@ pub(in crate::composition::mlx) fn prepare(
         .map_err(|cause| sources.retain_startup_error(cause))?;
     let lineage = sources
         .request()
-        .prepare_embedded_capture_lineage(&source)
+        .prepare_model_capture_lineage(&source)
         .map_err(|cause| sources.retain_startup_error(cause))?;
     let state =
         OriginalSpeculativeCapture::prepare(source, scopes, identity, request, funding.clone())
@@ -154,6 +150,11 @@ impl ActivationObserver<MlxTensor, Error> for Observer {
     fn original_speculative_capture(&self) -> Option<OriginalSpeculativeCaptureInvocation<'_>> {
         self.state.invocation()
     }
+    fn original_speculative_capture_preview(
+        &self,
+    ) -> Option<eredu_runtime::capture::OriginalSpeculativeCapturePreview<'_>> {
+        self.state.preview()
+    }
     fn retain_original_speculative_capture(
         &mut self,
         capture: SpeculativeActivationCapture,
@@ -179,39 +180,81 @@ impl ActivationObserver<MlxTensor, Error> for Observer {
 }
 impl SpeculativeActivationObserver<MlxTensor, Error> for Observer {
     fn activation_checkpoint_bytes(&self) -> Option<u64> {
-        if self.failure.is_some() { return None; }
+        if self.failure.is_some() {
+            return None;
+        }
         self.state.control_storage_bytes()
     }
-    fn activation_checkpoint(&self) -> Result<eredu_runtime::capture::SpeculativeActivationCheckpoint, SpeculativeControlError> {
-        if self.failure.is_some() { return Err(SpeculativeControlError::Invalid("failed internal capture boundary")); }
-        self.state.save_control().map_err(|cause| SpeculativeControlError::Backend(
-            retain_planning_error(cause, self.funding.clone()).into_backend_failure()))
-    }
-    fn prepare_activation_restore<'a>(&'a mut self, saved: &eredu_runtime::capture::SpeculativeActivationCheckpoint)
-        -> Result<Box<dyn eredu_runtime::capture::PreparedSpeculativeActivationRestore + 'a>, SpeculativeControlError>
+    fn activation_checkpoint(
+        &self,
+    ) -> Result<eredu_runtime::capture::SpeculativeActivationCheckpoint, SpeculativeControlError>
     {
-        if self.failure.is_some() { return Err(SpeculativeControlError::Invalid("failed internal capture boundary")); }
-        let funding = self.funding.clone();
-        self.state.prepare_control(saved).map_err(move |cause| SpeculativeControlError::Backend(
-            retain_planning_error(cause, funding).into_backend_failure()))
+        if self.failure.is_some() {
+            return Err(SpeculativeControlError::Invalid(
+                "failed internal capture boundary",
+            ));
+        }
+        self.state.save_control().map_err(|cause| {
+            SpeculativeControlError::Backend(
+                retain_planning_error(cause, self.funding.clone()).into_backend_failure(),
+            )
+        })
     }
-    fn validate_activation_readmission(&self, plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+    fn prepare_activation_restore<'a>(
+        &'a mut self,
+        saved: &eredu_runtime::capture::SpeculativeActivationCheckpoint,
+    ) -> Result<
+        Box<dyn eredu_runtime::capture::PreparedSpeculativeActivationRestore + 'a>,
+        SpeculativeControlError,
+    > {
+        if self.failure.is_some() {
+            return Err(SpeculativeControlError::Invalid(
+                "failed internal capture boundary",
+            ));
+        }
+        let funding = self.funding.clone();
+        self.state.prepare_control(saved).map_err(move |cause| {
+            SpeculativeControlError::Backend(
+                retain_planning_error(cause, funding).into_backend_failure(),
+            )
+        })
+    }
+    fn validate_activation_readmission(
+        &self,
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
         _: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
     ) -> Result<(), SpeculativeControlError> {
-        if self.failure.is_some() { return Err(SpeculativeControlError::Invalid("failed internal capture boundary")); }
-        self.control.validate(&self.state, plan)
+        if self.failure.is_some() {
+            return Err(SpeculativeControlError::Invalid(
+                "failed internal capture boundary",
+            ));
+        }
+        self.control
+            .validate(&self.state, plan)
             .map_err(|cause| SpeculativeControlError::Backend(cause.into_backend_failure()))
     }
-    fn readmit_activation_interventions(&mut self, plan: eredu_core::speculative::AdmittedSpeculativeActivations)
-        -> Result<(), SpeculativeControlError>
-    {
-        if self.failure.is_some() { return Err(SpeculativeControlError::Invalid("failed internal capture boundary")); }
-        let (source, inherited) = self.control.candidate(&self.state, &plan)
+    fn readmit_activation_interventions(
+        &mut self,
+        plan: eredu_core::speculative::AdmittedSpeculativeActivations,
+    ) -> Result<(), SpeculativeControlError> {
+        if self.failure.is_some() {
+            return Err(SpeculativeControlError::Invalid(
+                "failed internal capture boundary",
+            ));
+        }
+        let (source, inherited) = self
+            .control
+            .candidate(&self.state, &plan)
             .map_err(|cause| SpeculativeControlError::Backend(cause.into_backend_failure()))?;
         let funding = self.funding.clone();
-        self.state.prepare_readmitted_control(&plan, source, self.control.pool(), inherited)
-            .map_err(move |cause| SpeculativeControlError::Backend(
-                retain_planning_error(cause, funding).into_backend_failure()))?.commit();
+        self.state
+            .prepare_readmitted_control(&plan, source, self.control.pool(), inherited)
+            .map_err(move |cause| {
+                SpeculativeControlError::Backend(
+                    retain_planning_error(cause, funding).into_backend_failure(),
+                )
+            })?
+            .commit();
         Ok(())
     }
     fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>) {

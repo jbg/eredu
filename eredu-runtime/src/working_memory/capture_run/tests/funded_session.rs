@@ -134,7 +134,7 @@ impl CaptureBackend for Backend {
 }
 fn session(
     source: &SharedCapturePlan,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     r: &WorkingMemoryReservation,
     run: &WorkingMemoryFundingRun,
 ) -> FundedCaptureSession {
@@ -144,7 +144,7 @@ fn session(
         .into_capture_session()
         .unwrap();
     assert!(s.source().same_storage(source));
-    assert_eq!(ledger(pool).2, plan(source).initialization_peak_bytes());
+    assert_eq!(ledger(pool).1, plan(source).initialization_peak_bytes());
     s
 }
 fn forward(
@@ -177,7 +177,7 @@ fn forward(
 fn exact_factory_and_legacy_prefill_decode_wire_quota_parity() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (short_r, short_run) = fresh(&pool, h - 1);
     let before = ledger(&pool);
     let allocations = CLAIM_ALLOCATIONS.get();
@@ -227,7 +227,7 @@ fn exact_factory_and_legacy_prefill_decode_wire_quota_parity() {
         assert_eq!(a, b);
         assert!(!funded.has_pending_step());
         assert_eq!(funded.spent_steps(), p as usize + 1);
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
     }
     assert_eq!(fb.calls, lb.calls);
     assert_eq!(funded.usage().captures, 10);
@@ -236,7 +236,7 @@ fn exact_factory_and_legacy_prefill_decode_wire_quota_parity() {
 fn exact_source_and_payload_aliases_outlive_closed_session() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -256,18 +256,18 @@ fn exact_source_and_payload_aliases_outlive_closed_session() {
     drop(source);
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(tensor);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn original_error_and_unwind_keep_aborted_frame_and_spent_coordinates() {
     for panic in [false, true] {
         let source = source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut funded = session(&source, &pool, &r, &run);
         let mut backend = Backend {
@@ -321,7 +321,7 @@ fn sealed_delivery_survives_close_but_aborted_drain_keeps_failed_owner() {
     for seal in [false, true] {
         let source = source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut funded = session(&source, &pool, &r, &run);
         let mut backend = Backend::default();
@@ -354,7 +354,7 @@ fn sealed_delivery_survives_close_but_aborted_drain_keeps_failed_owner() {
         }
         drop(funded);
         drop(r);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -364,7 +364,7 @@ fn skipped_quota_and_schedule_do_not_call_native_worker() {
     raw.limits.on_limit = CaptureLimitPolicy::Skip;
     let source = admit(raw, point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -392,7 +392,7 @@ fn failed_metadata_start_is_terminal_without_unpriced_frame_or_retry() {
     raw.limits.per_step.host_bytes = 1;
     let source = admit(raw, point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -423,7 +423,7 @@ fn failed_metadata_start_is_terminal_without_unpriced_frame_or_retry() {
 fn missing_duplicate_and_repeated_terminal_follow_same_transaction_rules() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -467,7 +467,7 @@ fn missing_duplicate_and_repeated_terminal_follow_same_transaction_rules() {
 fn factory_rejects_spent_or_closed_bank() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     drop(bank.begin_step(CapturePhase::Prefill, 0).unwrap());
@@ -477,7 +477,7 @@ fn factory_rejects_spent_or_closed_bank() {
     ));
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let (r, run) = fresh(&pool, h);
     let bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     drop(run);
@@ -486,7 +486,7 @@ fn factory_rejects_spent_or_closed_bank() {
         Err(CaptureRunHostError::Memory(_))
     ));
     drop(r);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -495,7 +495,7 @@ fn encoding_rejection_and_failed_sealing_leave_original_charged_delivery() {
     large.axes.as_mut().unwrap()[1].dimension = SymbolicDimension::Known(4096);
     let source = admit(raw(), large, 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -542,14 +542,14 @@ fn encoding_rejection_and_failed_sealing_leave_original_charged_delivery() {
     assert!(funded.has_pending_step());
     drop(funded);
     drop(r);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn source_mismatch_and_generated_source_reject_before_worker_or_factory() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -604,7 +604,7 @@ fn empty_plan_uses_no_frame_but_still_requires_terminal_drain_and_fresh_phase() 
     raw.selections.clear();
     let source = admit(raw, point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -612,13 +612,13 @@ fn empty_plan_uses_no_frame_but_still_requires_terminal_drain_and_fresh_phase() 
     assert!(funded.has_pending_step());
     assert!(funded.prepare_checkpoint().is_err());
     assert!(funded.take_shared_step().unwrap().is_none());
-    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(),1);
+    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(), 1);
     assert!(funded.take_shared_step().unwrap().is_none());
-    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(),1);
+    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(), 1);
     forward(&mut funded, &mut backend, 1, true).unwrap();
     assert!(funded.take_shared_step().unwrap().is_none());
-    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(),2);
-    forward(&mut funded,&mut backend,2,false).unwrap();
+    assert_eq!(funded.prepare_checkpoint().unwrap().next_prediction(), 2);
+    forward(&mut funded, &mut backend, 2, false).unwrap();
     assert!(funded.take_shared_step().unwrap().is_none());
     assert!(funded.prepare_checkpoint().is_err());
     assert!(funded.take_shared_step().unwrap().is_none());
@@ -635,7 +635,7 @@ fn schedule_skipped_generated_hook_is_lazy_and_delivers_metadata_only() {
     raw.selections = vec![skipped];
     let source = admit(raw, point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut funded = session(&source, &pool, &r, &run);
     let mut backend = Backend::default();
@@ -684,7 +684,7 @@ fn shared_step_policy_matches_funded_delivery_and_preparation_readout() {
         raw.limits.cumulative.captures = 2;
         let source = admit(raw, point(), 4, false);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut funded = session(&source, &pool, &r, &run);
         let mut backend = Backend::default();
@@ -760,7 +760,7 @@ fn funded_checkpoint_inherits_quota_and_fresh_absolute_claims_without_rewinding_
     raw.limits.on_limit = CaptureLimitPolicy::Skip;
     let source = admit(raw.clone(), point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (reservation, funding) = fresh(&pool, h);
     let mut parent = session(&source, &pool, &reservation, &funding);
     let mut backend = Backend::default();
@@ -787,7 +787,7 @@ fn funded_checkpoint_inherits_quota_and_fresh_absolute_claims_without_rewinding_
         .continuation_host_plan(4)
         .unwrap()
         .initialization_peak_bytes();
-    let child_pool = WorkingMemoryPool::new(short_bytes, 0).unwrap();
+    let child_pool = capture_test_ledger(short_bytes, 0).unwrap();
     let (short_reservation, short_funding) = fresh(&child_pool, short_bytes - 1);
     let allocations = CLAIM_ALLOCATIONS.get();
     assert!(
@@ -839,7 +839,7 @@ fn funded_checkpoint_inherits_quota_and_fresh_absolute_claims_without_rewinding_
     // Identical declarations are not the same physical capture source.
     let other_source = admit(raw, point(), 4, false);
     let other_h = plan(&other_source).initialization_peak_bytes();
-    let other_pool = WorkingMemoryPool::new(other_h, 0).unwrap();
+    let other_pool = capture_test_ledger(other_h, 0).unwrap();
     let (other_reservation, other_funding) = fresh(&other_pool, other_h);
     let mut other = session(
         &other_source,
@@ -856,7 +856,7 @@ fn funded_checkpoint_inherits_quota_and_fresh_absolute_claims_without_rewinding_
         .unwrap();
     let other_plan = other_checkpoint.continuation_host_plan(4).unwrap();
     let other_child_h = other_plan.initialization_peak_bytes();
-    let other_child_pool = WorkingMemoryPool::new(other_child_h, 0).unwrap();
+    let other_child_pool = capture_test_ledger(other_child_h, 0).unwrap();
     let (other_child_reservation, other_child_funding) = fresh(&other_child_pool, other_child_h);
     let other_bank = other_child_funding
         .prepare_capture_run(&other_child_reservation, other_plan)
@@ -888,14 +888,14 @@ fn funded_capture_restore_keeps_post_snapshot_spending_and_fork_is_independent()
         saved: &FundedCaptureCheckpoint,
         restore: bool,
     ) -> (
-        WorkingMemoryPool,
+        MemoryLedger,
         WorkingMemoryReservation,
         WorkingMemoryFundingRun,
         FundedCaptureSession,
     ) {
         let plan = saved.continuation_host_plan(4).unwrap();
         let h = plan.initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (reservation, funding) = fresh(&pool, h);
         let bank = funding.prepare_capture_run(&reservation, plan).unwrap();
         let session = if restore {
@@ -910,7 +910,7 @@ fn funded_capture_restore_keeps_post_snapshot_spending_and_fork_is_independent()
     raw.limits.cumulative.captures = 2;
     let source = admit(raw, point(), 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (reservation, funding) = fresh(&pool, h);
     let mut parent = session(&source, &pool, &reservation, &funding);
     let mut backend = Backend::default();
@@ -997,25 +997,40 @@ fn derived_child_limits_keep_saved_spending_and_reject_unrelated_parent() {
     raw.selections.truncate(1);
     raw.limits.cumulative.captures = 1;
     let source = admit(raw.clone(), point(), 4, false);
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let pool = capture_test_ledger(64 << 20, 0).unwrap();
     let h = plan(&source).initialization_peak_bytes();
     let (reservation, run) = fresh(&pool, h);
     let mut parent = session(&source, &pool, &reservation, &run);
     forward(&mut parent, &mut Backend::default(), 0, true).unwrap();
     drop(parent.take_shared_step().unwrap());
-    let saved = parent.prepare_checkpoint().unwrap().construct(&HostPreparationAuthority::default()).unwrap();
-    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 64 << 20).unwrap();
+    let saved = parent
+        .prepare_checkpoint()
+        .unwrap()
+        .construct(&HostPreparationAuthority::default())
+        .unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 64 << 20),
+        )
+        .unwrap();
     let mut limits = raw.limits.clone();
     limits.cumulative.captures = 2;
-    let capabilities = CaptureCapabilities::default();
-    let revised = pool.compile_capture_source(PreparedCapturePlanCopy::inspect_limit_revision(
-        &source, limits.clone(), &capabilities).unwrap()).unwrap();
-    let child = saved.with_branch_capture_source(&revised, &pool, &funding).unwrap();
+    let revised = pool
+        .compile_capture_source(
+            PreparedCapturePlanCopy::inspect_limit_revision(&source, limits.clone()).unwrap(),
+        )
+        .unwrap();
+    let child = saved
+        .with_branch_capture_source(&revised, &pool, &funding)
+        .unwrap();
     assert_eq!(child.inherited_usage().captures, 1);
     assert_eq!(child.next_prediction(), 1);
     let continuation = child.continuation_host_plan(4).unwrap();
     let (child_reservation, child_run) = fresh(&pool, continuation.initialization_peak_bytes());
-    let bank = child_run.prepare_capture_run(&child_reservation, continuation).unwrap();
+    let bank = child_run
+        .prepare_capture_run(&child_reservation, continuation)
+        .unwrap();
     let mut installed = child.into_continuation(bank).unwrap();
     let mut backend = Backend::default();
     forward(&mut installed, &mut backend, 1, true).unwrap();
@@ -1027,27 +1042,52 @@ fn derived_child_limits_keep_saved_spending_and_reject_unrelated_parent() {
 
     // A fresh equal declaration is neither the snapshot's parent nor a grant.
     let other = admit(raw, point(), 4, false);
-    let foreign = pool.compile_capture_source(PreparedCapturePlanCopy::inspect_limit_revision(
-        &other, limits.clone(), &capabilities).unwrap()).unwrap();
-    assert!(saved.with_branch_capture_source(&foreign, &pool, &funding).is_err());
+    let foreign = pool
+        .compile_capture_source(
+            PreparedCapturePlanCopy::inspect_limit_revision(&other, limits.clone()).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        saved
+            .with_branch_capture_source(&foreign, &pool, &funding)
+            .is_err()
+    );
     limits.cumulative.captures = 0;
-    let short = pool.compile_capture_source(PreparedCapturePlanCopy::inspect_limit_revision(
-        &source, limits, &capabilities).unwrap()).unwrap();
-    assert!(saved.with_branch_capture_source(&short, &pool, &funding).is_err());
+    let short = pool
+        .compile_capture_source(
+            PreparedCapturePlanCopy::inspect_limit_revision(&source, limits).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        saved
+            .with_branch_capture_source(&short, &pool, &funding)
+            .is_err()
+    );
     assert_eq!(saved.inherited_usage().captures, 1);
     let restore_plan = child.continuation_host_plan(4).unwrap();
     let (restore_reservation, restore_run) = fresh(&pool, restore_plan.initialization_peak_bytes());
-    let restore_bank = restore_run.prepare_capture_run(&restore_reservation, restore_plan).unwrap();
+    let restore_bank = restore_run
+        .prepare_capture_run(&restore_reservation, restore_plan)
+        .unwrap();
     assert!(child.into_restoration(restore_bank).is_err());
-    drop((parent, installed, child, saved, revised, foreign, short, funding));
-    drop((run, child_run, restore_run, reservation, child_reservation, restore_reservation));
+    drop((
+        parent, installed, child, saved, revised, foreign, short, funding,
+    ));
+    drop((
+        run,
+        child_run,
+        restore_run,
+        reservation,
+        child_reservation,
+        restore_reservation,
+    ));
     assert_eq!(ledger(&pool).0, 0);
 }
 
 #[test]
 fn terminal_capture_restore_has_no_claim_and_keeps_live_spending() {
     let source = source();
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let pool = capture_test_ledger(64 << 20, 0).unwrap();
     let (reservation, run) = fresh(&pool, plan(&source).initialization_peak_bytes());
     let mut parent = session(&source, &pool, &reservation, &run);
     for first in [0, 1] {
@@ -1055,16 +1095,35 @@ fn terminal_capture_restore_has_no_claim_and_keeps_live_spending() {
             forward(&mut parent, &mut Backend::default(), 0, true).unwrap();
             drop(parent.take_shared_step().unwrap());
         }
-        let saved = parent.prepare_checkpoint().unwrap().construct(&HostPreparationAuthority::default()).unwrap();
+        let saved = parent
+            .prepare_checkpoint()
+            .unwrap()
+            .construct(&HostPreparationAuthority::default())
+            .unwrap();
         let geometry = InferenceGeometry {
-            batch_size: 1, cached_positions: if first == 0 { 2 } else { 5 },
-            input_positions: 0, max_output_tokens: 0, prefill_chunk_positions: 0,
+            batch_size: 1,
+            cached_positions: if first == 0 { 2 } else { 5 },
+            input_positions: 0,
+            max_output_tokens: 0,
+            prefill_chunk_positions: 0,
             output: OutputDemand::StateOnly,
         };
         let terminal = saved.continuation_host_plan_for(geometry).unwrap();
         let (copy_reservation, copy_run) = fresh(&pool, terminal.initialization_peak_bytes());
-        let mut bank = copy_run.prepare_capture_run(&copy_reservation, terminal).unwrap();
-        assert!(bank.begin_step(if first == 0 { CapturePhase::Prefill } else { CapturePhase::Decode }, first).is_err());
+        let mut bank = copy_run
+            .prepare_capture_run(&copy_reservation, terminal)
+            .unwrap();
+        assert!(
+            bank.begin_step(
+                if first == 0 {
+                    CapturePhase::Prefill
+                } else {
+                    CapturePhase::Decode
+                },
+                first
+            )
+            .is_err()
+        );
         let restored = saved.into_restoration(bank).unwrap();
         assert_eq!(restored.usage(), parent.usage());
         assert_eq!(restored.spent_steps(), 0);
@@ -1079,43 +1138,101 @@ fn terminal_capture_restore_has_no_claim_and_keeps_live_spending() {
 
 #[test]
 fn child_intervention_source_keeps_absolute_frontier_and_exact_owner() {
-    use eredu_core::intervention::{InterventionDiscovery, InterventionPlan,
-        PreparedInterventionPlanCopy, INTERVENTION_SCHEMA_VERSION};
+    use eredu_core::intervention::{
+        INTERVENTION_SCHEMA_VERSION, InterventionDiscovery, InterventionPlan,
+        PreparedInterventionPlanCopy,
+    };
     let source = source();
-    let pool = WorkingMemoryPool::new(64 << 20, 0).unwrap();
+    let pool = capture_test_ledger(64 << 20, 0).unwrap();
     let (reservation, run) = fresh(&pool, plan(&source).initialization_peak_bytes());
     let mut parent = session(&source, &pool, &reservation, &run);
     forward(&mut parent, &mut Backend::default(), 0, true).unwrap();
     drop(parent.take_shared_step().unwrap());
-    let saved = parent.prepare_checkpoint().unwrap().construct(&HostPreparationAuthority::default()).unwrap();
-    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 64 << 20).unwrap();
-    let discovery = InterventionDiscovery { schema_version: INTERVENTION_SCHEMA_VERSION,
-        artifact_identity: "fixture-artifact".into(), session_identity: Some("loaded-fixture".into()), points: vec![] };
+    let saved = parent
+        .prepare_checkpoint()
+        .unwrap()
+        .construct(&HostPreparationAuthority::default())
+        .unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 64 << 20),
+        )
+        .unwrap();
+    let discovery = InterventionDiscovery {
+        schema_version: INTERVENTION_SCHEMA_VERSION,
+        artifact_identity: "fixture-artifact".into(),
+        session_identity: Some("loaded-fixture".into()),
+        points: vec![],
+    };
     let make = |request, origin, session| {
-        let admitted = InterventionPlan::none().admit_with_text_origin(&discovery, request, origin, session).unwrap();
-        pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&admitted).unwrap()).unwrap()
+        let admitted = InterventionPlan::none()
+            .admit_with_text_origin(&discovery, request, origin, session)
+            .unwrap();
+        pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&admitted).unwrap())
+            .unwrap()
     };
     let capture = source.admission();
-    let edits = make(capture.request(), capture.text_origin().unwrap(), "child-one");
-    let child = saved.with_branch_intervention_source(&edits, &pool, &funding).unwrap();
+    let edits = make(
+        capture.request(),
+        capture.text_origin().unwrap(),
+        "child-one",
+    );
+    let child = saved
+        .with_branch_intervention_source(&edits, &pool, &funding)
+        .unwrap();
     assert!(child.intervention_source().unwrap().same_source(&edits));
-    assert_eq!(child.intervention_source().unwrap().plan().admission().session_id(), "child-one");
+    assert_eq!(
+        child
+            .intervention_source()
+            .unwrap()
+            .plan()
+            .admission()
+            .session_id(),
+        "child-one"
+    );
     assert_eq!(child.next_prediction(), saved.next_prediction());
     assert_eq!(child.inherited_usage(), saved.inherited_usage());
     let foreign_origin = make(capture.request(), CaptureTextOrigin::default(), "child-one");
-    assert!(saved.with_branch_intervention_source(&foreign_origin, &pool, &funding).is_err());
+    assert!(
+        saved
+            .with_branch_intervention_source(&foreign_origin, &pool, &funding)
+            .is_err()
+    );
     let mut wrong_request = capture.request();
     wrong_request.max_predictions += 1;
     let foreign_shape = make(wrong_request, capture.text_origin().unwrap(), "child-one");
-    assert!(saved.with_branch_intervention_source(&foreign_shape, &pool, &funding).is_err());
-    let equal = make(capture.request(), capture.text_origin().unwrap(), "child-one");
-    let wrong_plan = CaptureRunHostPlan::prepare_range(child.source(), child.next_prediction(), 4, true)
-        .unwrap().with_interventions(&equal).unwrap();
+    assert!(
+        saved
+            .with_branch_intervention_source(&foreign_shape, &pool, &funding)
+            .is_err()
+    );
+    let equal = make(
+        capture.request(),
+        capture.text_origin().unwrap(),
+        "child-one",
+    );
+    let wrong_plan =
+        CaptureRunHostPlan::prepare_range(child.source(), child.next_prediction(), 4, true)
+            .unwrap()
+            .with_interventions(&equal)
+            .unwrap();
     let (wrong_reservation, wrong_run) = fresh(&pool, wrong_plan.initialization_peak_bytes());
-    let wrong_bank = wrong_run.prepare_capture_run(&wrong_reservation, wrong_plan).unwrap();
+    let wrong_bank = wrong_run
+        .prepare_capture_run(&wrong_reservation, wrong_plan)
+        .unwrap();
     assert!(child.into_continuation(wrong_bank).is_err());
     assert!(saved.intervention_source().is_none());
-    drop((parent, saved, child, edits, equal, foreign_origin, foreign_shape, funding));
+    drop((
+        parent,
+        saved,
+        child,
+        edits,
+        equal,
+        foreign_origin,
+        foreign_shape,
+        funding,
+    ));
     drop((run, reservation, wrong_run, wrong_reservation));
     assert_eq!(ledger(&pool).0, 0);
 }

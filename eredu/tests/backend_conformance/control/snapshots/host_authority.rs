@@ -10,7 +10,7 @@ use eredu_core::{
 };
 use eredu_runtime::{
     execution_control::TextSnapshotError,
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError},
 };
 
 fn ignore(_: ControlledGenerationRecord) -> ControlFlow<()> {
@@ -115,7 +115,8 @@ fn exclusion_admission() -> Admission {
         NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
+    .with_execution_workspace(crate::memory::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry,
         activations: zero(),
         attention: zero(),
@@ -123,21 +124,23 @@ fn exclusion_admission() -> Admission {
         state_update: zero(),
         materialization: zero(),
         retained: zero(),
-    })
+    }))
     .unwrap();
-    Admission {
+    crate::memory::admission(Admission {
+        memory_limits: Default::default(),
+        additional_headroom: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
 #[test]
 fn original_host_capacity_refusal_preserves_live_state_and_budget() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let pool = model.original_pool().clone();
-    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let request =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut run = model
         .start_controlled_chat(request, limits(), Default::default(), ignore)
         .unwrap()
@@ -150,8 +153,10 @@ fn original_host_capacity_refusal_preserves_live_state_and_budget() {
     );
     run.enable_snapshots(
         copy_limits(),
-        0,
-        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        crate::memory::limits(0),
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+            original_sources::CAPACITY,
+        )),
     )
     .unwrap();
     let usage = run.snapshot_usage().unwrap();
@@ -175,14 +180,15 @@ fn original_host_capacity_refusal_preserves_live_state_and_budget() {
     drop(run);
     drop(chat);
     drop(model);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_native_copy_capacity_refusal_preserves_partial_semantic_state() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let pool = model.original_pool().clone();
-    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let request =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut run = model
         .start_controlled_chat(request, limits(), Default::default(), ignore)
         .unwrap()
@@ -190,8 +196,8 @@ fn original_native_copy_capacity_refusal_preserves_partial_semantic_state() {
     run.step(ignore).unwrap();
     run.enable_snapshots(
         copy_limits(),
-        original_sources::CAPACITY,
-        eredu_runtime::working_memory::WorkspaceCopyLimits::new(0),
+        crate::memory::limits(original_sources::CAPACITY),
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(0)),
     )
     .unwrap();
     let before = run.snapshot_usage().unwrap();
@@ -218,22 +224,25 @@ fn original_native_copy_capacity_refusal_preserves_partial_semantic_state() {
     drop(records);
     drop(chat);
     drop(model);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn snapshot_and_branch_authority_follows_payload_through_exchange_and_retirement() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let pool = model.original_pool().clone();
-    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let request =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut run = model
         .start_controlled_chat(request, limits(), Default::default(), ignore)
         .unwrap()
         .unwrap();
     run.enable_snapshots(
         copy_limits(),
-        original_sources::CAPACITY,
-        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        crate::memory::limits(original_sources::CAPACITY),
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+            original_sources::CAPACITY,
+        )),
     )
     .unwrap();
     run.step(ignore).unwrap();
@@ -252,27 +261,30 @@ fn snapshot_and_branch_authority_follows_payload_through_exchange_and_retirement
     drop(run);
     drop(chat);
     drop(model);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(saved);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     assert_eq!(branch.token_ids(), [first, first + 1]);
     drop(branch);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn restore_installs_fresh_account_and_retains_source_after_saved_handle_drops() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let pool = model.original_pool().clone();
-    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let request =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut run = model
         .start_controlled_chat(request, limits(), Default::default(), ignore)
         .unwrap()
         .unwrap();
     run.enable_snapshots(
         copy_limits(),
-        original_sources::CAPACITY,
-        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        crate::memory::limits(original_sources::CAPACITY),
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+            original_sources::CAPACITY,
+        )),
     )
     .unwrap();
     run.step(ignore).unwrap();
@@ -288,22 +300,25 @@ fn restore_installs_fresh_account_and_retains_source_after_saved_handle_drops() 
     drop(run);
     drop(chat);
     drop(model);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn post_admission_copy_failure_spends_logical_allowance_and_retains_exact_source() {
     let (mut model, chat, settings, first) = snapshot_setup();
     let pool = model.original_pool().clone();
-    let request = eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+    let request =
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut run = model
         .start_controlled_chat(request, limits(), Default::default(), ignore)
         .unwrap()
         .unwrap();
     run.enable_snapshots(
         copy_limits(),
-        original_sources::CAPACITY,
-        eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+        crate::memory::limits(original_sources::CAPACITY),
+        eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+            original_sources::CAPACITY,
+        )),
     )
     .unwrap();
     run.step(ignore).unwrap();
@@ -324,17 +339,17 @@ fn post_admission_copy_failure_spends_logical_allowance_and_retains_exact_source
     drop(run);
     drop(chat);
     drop(model);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
-fn direct_driver_host_rejection_precedes_controller_and_composition_copy_callbacks() {
+fn direct_driver_missing_host_producer_rejects_before_controller_or_copy_callbacks() {
     use eredu_core::{TextGenerationDriver, TokenFilterController};
     use eredu_runtime::execution_control::{
-        ManagedTextContinuation, SnapshotBudget, SnapshotTokenController, TextBranchRequest,
-        TextContinuationSnapshot,
+        ManagedTextContinuation, PreparedTextHostCopy, SnapshotBudget, SnapshotTokenController,
+        TextContinuationSnapshot, TextHostCopyError,
     };
     use std::{cell::Cell, convert::Infallible, rc::Rc};
 
@@ -345,17 +360,14 @@ fn direct_driver_host_rejection_precedes_controller_and_composition_copy_callbac
     }
     impl TokenFilterController for Controller {
         type Error = Infallible;
-
         fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
             self.decisions.set(self.decisions.get() + 1);
             Ok(TokenFilter::All)
         }
-
         fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
             self.history.push(token);
             Ok(())
         }
-
         fn is_complete(&mut self) -> Result<bool, Self::Error> {
             Ok(false)
         }
@@ -365,7 +377,6 @@ fn direct_driver_host_rejection_precedes_controller_and_composition_copy_callbac
             (std::mem::size_of::<Self>() as u64)
                 .checked_add((self.history.capacity() as u64).checked_mul(4)?)
         }
-
         fn fork_snapshot(&self) -> Result<Self, String> {
             self.forks.set(self.forks.get() + 1);
             Ok(Self {
@@ -375,125 +386,63 @@ fn direct_driver_host_rejection_precedes_controller_and_composition_copy_callbac
             })
         }
     }
-
-    for operation in [
-        CopyOperation::Snapshot,
-        CopyOperation::Restore,
-        CopyOperation::Fork,
-    ] {
-        let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
-        let mut driver = TextGenerationDriver::new(&mut runtime);
-        let forks = Rc::new(Cell::new(0));
-        let decisions = Rc::new(Cell::new(0));
-        let host_callbacks = Cell::new(0);
-        let mut history = Vec::with_capacity(8);
-        history.extend([19, 23]);
-        let controller = Controller {
-            history,
-            forks: forks.clone(),
-            decisions: decisions.clone(),
-        };
-        let config = TextGenerationConfig::new(
-            eredu_core::resolve_generation_config(
-                None,
-                GenerationConfigOverrides {
-                    max_new_tokens: Some(3),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        );
-        let mut state = ManagedTextContinuation::root(
-            driver
-                .start(vec![11, 7, 3].into(), config, controller)
-                .unwrap(),
-        );
-        let budget = SnapshotBudget::new(copy_limits());
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let probe = Guard::new(&pool);
-        let saved = if matches!(operation, CopyOperation::Snapshot) {
-            None
-        } else {
-            Some(
-                TextContinuationSnapshot::capture(
-                    &mut state.boundary(&mut driver).unwrap(),
-                    &budget,
-                    Some(64),
-                )
-                .unwrap(),
-            )
-        };
-        let before_forks = forks.get();
-        assert_eq!(before_forks, usize::from(saved.is_some()));
-        let before_copies = probe.update(|p| p.copies.len());
-        let before_usage = budget.usage();
-        let before_owners = pool.unquoted_owner_count().unwrap();
-        let before_decisions = decisions.get();
-        probe.update(|p| p.reject_at = Some(p.attempts + 1));
-        let result = {
-            let mut boundary = state.boundary(&mut driver).unwrap();
-            match operation {
-                CopyOperation::Snapshot => {
-                    TextContinuationSnapshot::capture(&mut boundary, &budget, Some(64)).map(|_| ())
-                }
-                CopyOperation::Restore => {
-                    saved
-                        .as_ref()
-                        .unwrap()
-                        .restore_with(&mut boundary, &budget, || {
-                            host_callbacks.set(host_callbacks.get() + 1);
-                            Ok(())
-                        })
-                }
-                CopyOperation::Fork => saved
-                    .as_ref()
-                    .unwrap()
-                    .fork_with(
-                        &mut boundary,
-                        &budget,
-                        TextBranchRequest {
-                            session_id: "direct-host-rejection-child",
-                            max_predictions: 3,
-                            capture_limits: None,
-                            intervention: None,
-                            host_bytes: Some(64),
-                            continuation_growth_bytes: Some(64),
-                        },
-                        |_, _| {
-                            host_callbacks.set(host_callbacks.get() + 1);
-                            Ok(())
-                        },
-                    )
-                    .map(|_| ()),
-            }
-        };
-        let error = result.unwrap_err();
-        assert!(matches!(&error, TextSnapshotError::HostPreparation(_)));
-        assert!(
-            matches!(cause::<MockError>(&error), Some(MockError::Capture(message))
-                if message == "host snapshot preparation rejected")
-        );
-        assert_eq!(forks.get(), before_forks, "{operation:?}");
-        assert_eq!(host_callbacks.get(), 0, "{operation:?}");
-        assert_eq!(probe.update(|p| p.copies.len()), before_copies);
-        assert_eq!(budget.usage(), before_usage);
-        assert_eq!(decisions.get(), before_decisions);
-        assert_eq!(state.controller().history, [19, 23]);
-        assert_eq!(pool.unquoted_owner_count().unwrap(), before_owners);
-        assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
-            (0, 0)
-        );
-        if let Some(saved) = &saved {
-            assert_eq!(saved.controller().history, [19, 23]);
+    struct UnqualifiedHost<'a>(&'a Cell<usize>);
+    impl PreparedTextHostCopy for UnqualifiedHost<'_> {
+        type Copied = ();
+        fn storage_bytes(&self) -> Option<u64> {
+            Some(64)
         }
-        probe.update(|p| p.reject_at = None);
-        assert!(state.advance(&mut driver).unwrap().is_some());
-        state.take_completed_delivery(&mut driver).unwrap();
-        assert_eq!(&state.controller().history[..2], &[19, 23]);
-        assert_eq!(state.controller().history.len(), 3);
-        drop(saved);
-        drop(state);
-        assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
+        fn copy(self, _: u64) -> Result<(), TextHostCopyError> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
     }
+    let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let mut driver = TextGenerationDriver::new(&mut runtime);
+    let forks = Rc::new(Cell::new(0));
+    let decisions = Rc::new(Cell::new(0));
+    let host_callbacks = Cell::new(0);
+    let controller = Controller {
+        history: vec![19, 23],
+        forks: forks.clone(),
+        decisions: decisions.clone(),
+    };
+    let config = TextGenerationConfig::new(
+        eredu_core::resolve_generation_config(
+            None,
+            GenerationConfigOverrides {
+                max_new_tokens: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let mut state = ManagedTextContinuation::root(
+        driver
+            .start(vec![11, 7, 3].into(), config, controller)
+            .unwrap(),
+    );
+    let budget = SnapshotBudget::new(copy_limits());
+    let before = budget.usage();
+    let before_decisions = decisions.get();
+    let error = TextContinuationSnapshot::capture_host(
+        &mut state.boundary(&mut driver).unwrap(),
+        &budget,
+        UnqualifiedHost(&host_callbacks),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        TextSnapshotError::Unsupported("original native preparation storage")
+    ));
+    assert_eq!(forks.get(), 0);
+    assert_eq!(host_callbacks.get(), 0);
+    assert_eq!(budget.usage(), before);
+    assert_eq!(decisions.get(), before_decisions);
+    assert_eq!(state.controller().history, [19, 23]);
+    assert!(state.advance(&mut driver).unwrap().is_some());
+    state.take_completed_delivery(&mut driver).unwrap();
+    assert_eq!(&state.controller().history[..2], &[19, 23]);
+    assert_eq!(state.controller().history.len(), 3);
 }

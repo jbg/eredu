@@ -1,0 +1,115 @@
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -230,6 +230,68 @@
+   return eps_ == a_other.eps_;
+ }
+ 
++namespace {
++// This named capture is the ordinary CPU fallback. Its pure source query
++// measures the same frames without constructing native arrays or streams.
++struct LayerNormFallback {
++  bool has_weight;
++  bool has_bias;
++  float eps;
++  Dtype out_type;
++  Stream s;
++  ArrayVector operator()(const ArrayVector& inputs) const {
++    auto x = astype(inputs[0], float32, s);
++
++    auto mu = mean(x, /* axis= */ -1, /* keepdims= */ true, s);
++    auto xc = subtract(x, mu, s);
++    auto v = mean(square(xc, s), /* axis= */ -1, /* keepdims= */ true, s);
++
++    x = multiply(xc, rsqrt(add(v, array(eps, float32), s), s), s);
++    x = astype(x, out_type, s);
++
++    // If the LN is affine then transform x according to the weight and bias
++    if (has_weight) {
++      x = multiply(x, inputs[1], s);
++    }
++    if (has_bias) {
++      x = add(x, inputs[2], s);
++    }
++
++    return ArrayVector{x};
++  }
++};
++}
++
++bool cpu_layer_norm_fallback_control_bytes(
++    Dtype dtype, size_t rank, size_t width, size_t rows, size_t& out) noexcept {
++  if ((dtype != float32 && dtype != float16 && dtype != bfloat16) ||
++      rank == 0 || rank > 4 || width == 0 || rows == 0 ||
++      width > size_t(INT_MAX) || rows > size_t(INT_MAX) / width) return false;
++  // ArrayVector storage uses the existing Graph constructor bank. Each mean
++  // has its actual axis/reduction argument frames; arithmetic workers report
++  // their own constructor/task storage separately.
++  const size_t parts[] = {
++      sizeof(LayerNormFallback), sizeof(std::optional<array>) * 2,
++      sizeof(std::tuple<const array&, const std::optional<array>&,
++          const std::optional<array>&, float, StreamOrDevice>),
++      sizeof(const ArrayVector&), sizeof(ArrayVector) * 2, sizeof(array) * 6,
++      sizeof(Stream), sizeof(StreamOrDevice), sizeof(Dtype),
++      sizeof(bool) * 2, sizeof(float),
++      sizeof(std::tuple<const array&, int, bool, StreamOrDevice>) * 2,
++      sizeof(std::tuple<const array&, AxisView, bool, StreamOrDevice>) * 2,
++      sizeof(std::tuple<const array&, Shape, bool, Dtype, StreamOrDevice>) * 2,
++      sizeof(Shape) * 4, sizeof(AxisView) * 2, sizeof(double) * 2, sizeof(int) * 6,
++      sizeof(std::tuple<Dtype, size_t, size_t, size_t, size_t&>),
++      sizeof(size_t) * 2};
++  size_t total = sizeof(parts);
++  for (auto bytes : parts) {
++    if (bytes > SIZE_MAX - total) return false;
++    total += bytes;
++  }
++  out = total;
++  return true;
++}
++
+ array layer_norm(
+     const array& x,
+     const std::optional<array>& weight,
+@@ -286,27 +348,7 @@
+   }
+ 
+   auto s = to_stream(s_);
+-  auto fallback = [has_weight, has_bias, eps, out_type, s](
+-                      const ArrayVector& inputs) {
+-    auto x = astype(inputs[0], float32, s);
+-
+-    auto mu = mean(x, /* axis= */ -1, /* keepdims= */ true, s);
+-    auto xc = subtract(x, mu, s);
+-    auto v = mean(square(xc, s), /* axis= */ -1, /* keepdims= */ true, s);
+-
+-    x = multiply(xc, rsqrt(add(v, array(eps, float32), s), s));
+-    x = astype(x, out_type, s);
+-
+-    // If the LN is affine then transform x according to the weight and bias
+-    if (has_weight) {
+-      x = multiply(x, inputs[1], s);
+-    }
+-    if (has_bias) {
+-      x = add(x, inputs[2], s);
+-    }
+-
+-    return ArrayVector{x};
+-  };
++  auto fallback = LayerNormFallback{has_weight, has_bias, eps, out_type, s};
+ 
+   auto passed_weight =
+       (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -29,6 +29,10 @@
+     const std::optional<array>& weight,
+     float eps,
+     StreamOrDevice s = {});
++
++// Pure controls of the shared CPU LayerNorm fallback.
++MLX_API bool cpu_layer_norm_fallback_control_bytes(
++    Dtype dtype, size_t rank, size_t width, size_t rows, size_t& out) noexcept;
+ 
+ MLX_API array layer_norm(
+     const array& x,

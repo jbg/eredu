@@ -182,7 +182,7 @@ impl OriginalParallelControlProjection {
     let capacity=child.quote.value().capacity;
     let kernels=child.recipe.kernels;
     run_native_role_with_pipeline(child,AgreementCapacity{graph:capacity.graph,records:capacity.records,backing:capacity.backing},
-        Some(safemlx::PreparedPipelineCachePlan::new(kernels)),&owner.owner().bank,&owner.owner().controls,c,
+        Some(safemlx::PreparedPipelineCachePlan::new(kernels)),&owner.owner().native,c,
         |child,observer| {
             let collector=child.collector.enter(observer)?;
             for input in &child.inputs {safemlx::OperationEvent::validate_traversal_leaf(input,observer)
@@ -274,7 +274,7 @@ impl OriginalParallelControlProjection {
                 recipe.completion.nested_traversal().and_then(|value|value.query_control_bytes()).ok_or_else(overflow)?,
                 roots.checked_mul(safemlx::OperationEvent::traversal_leaf_control_bytes().ok_or_else(overflow)?).ok_or_else(overflow)?])?;
             let completion=NestedRootCompletion::prepare_metadata(roots,recipe.completion.validation_roots,c.raw.clone().into(),&c.funding)?;
-            let collector=PreparedTokenChild::prepare(recipe.completion,&owner.owner().controls,&parent,&c.funding)?;
+            let collector=PreparedTokenChild::prepare_metadata(recipe.completion,c.raw.clone(),&parent,&c.funding)?;
             let plan=StreamCopyPlan::<Custody>::capture(stream).map_err(|_|fail())?;
             reserve(&c.funding,&[plan.control_bytes().ok_or_else(overflow)?,plan.native_wrapper_bytes(),plan.owner_node_layout().size(),
                 Layout::new::<[usize;2]>().extend(plan.shared_body_layout()).map_err(|_|overflow())?.0.pad_to_align().size()])?;

@@ -1,5 +1,9 @@
 //! Cold equation traces use the same modules as numerical conformance. The
 //! deliberately specified allocation mechanism here is independent of MLX.
+#[path = "../src/memory_fixture.rs"]
+#[allow(dead_code)]
+mod memory_fixture;
+
 use eredu_architectures::{decoder, llama, qwen, readout::execute_readout};
 use eredu_core::{
     AdmissionRequest, CacheStateStrategy, CapabilityError, EstimationCompleteness,
@@ -31,6 +35,23 @@ struct EquationMechanism {
     omit_attention: bool,
 }
 impl WorkspaceMechanisms for EquationMechanism {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::memory_fixture::placement())
+    }
+
     fn output_representation(
         &self,
         operation: WorkspaceOperationView<'_>,
@@ -39,11 +60,16 @@ impl WorkspaceMechanisms for EquationMechanism {
         // This independent fixture selects F32 storage for every floating
         // result. Metadata views alias it and need not be row-contiguous.
         (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32).then_some(
-            WorkspaceRepresentation::new(WorkspaceFloatingType::Float32,
-                !matches!(operation.kind, WorkspaceOperationKindView::View(_)
-                    | WorkspaceOperationKindView::Transpose(_)
-                    | WorkspaceOperationKindView::Index { .. }
-                    | WorkspaceOperationKindView::StaticSlice { .. })),
+            WorkspaceRepresentation::new(
+                WorkspaceFloatingType::Float32,
+                !matches!(
+                    operation.kind,
+                    WorkspaceOperationKindView::View(_)
+                        | WorkspaceOperationKindView::Transpose(_)
+                        | WorkspaceOperationKindView::Index { .. }
+                        | WorkspaceOperationKindView::StaticSlice { .. }
+                ),
+            ),
         )
     }
 
@@ -66,7 +92,10 @@ impl WorkspaceMechanisms for EquationMechanism {
         }
         let aliases = matches!(
             op.kind,
-            WorkspaceOperationKind::View(_) | WorkspaceOperationKind::Transpose(_) | WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
+            WorkspaceOperationKind::View(_)
+                | WorkspaceOperationKind::Transpose(_)
+                | WorkspaceOperationKind::Index { .. }
+                | WorkspaceOperationKind::StaticSlice { .. }
         );
         let scratch_bytes = if matches!(op.kind, WorkspaceOperationKind::Attention { .. }) {
             let q = op.inputs[0].shape();
@@ -153,9 +182,8 @@ fn request(g: InferenceGeometry) -> AdmissionRequest {
         input: InputTokenCount::text(g.cached_positions + g.input_positions),
         max_output_tokens: g.max_output_tokens,
         batch_size: g.batch_size,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
     }
 }
 fn capabilities() -> ModelCapabilities {
@@ -185,9 +213,18 @@ fn estimate<C: decoder::Config>(
         let mut caches = (0..blocks.len())
             .map(|_| {
                 let shape = [g.batch_size as i32, 2, g.cached_positions as i32, 8];
+                let existing = || {
+                    let layout = WorkspaceLayout::new(&shape, WorkspaceDtype::Float32)?;
+                    let backing = WorkspaceExistingStorage::try_new_placed(
+                        Some(layout.bytes()?),
+                        crate::memory_fixture::placement(),
+                        &context,
+                    )?;
+                    WorkspaceTensor::existing_with_storage(layout, &backing, &context)
+                };
                 Ok(AppendCache {
-                    keys: Some(WorkspaceTensor::unloaded_f32(&shape, &context)?),
-                    values: Some(WorkspaceTensor::unloaded_f32(&shape, &context)?),
+                    keys: Some(existing()?),
+                    values: Some(existing()?),
                     offset: g.cached_positions as i32,
                 })
             })
@@ -282,6 +319,15 @@ fn estimate<C: decoder::Config>(
         WorkspaceBound::bounded(0,"test execution has no additional untraced operations; all tensor outputs and scratch are in the equation trace")
     };
     let outside = ExecutionWorkspaceEstimate {
+        physical_domains: Some(eredu_core::DomainExecutionWorkspaceEstimate {
+            geometry: g,
+            activations: crate::memory_fixture::requirements(0),
+            attention: crate::memory_fixture::requirements(0),
+            vocabulary: crate::memory_fixture::requirements(0),
+            state_update: crate::memory_fixture::requirements(0),
+            materialization: crate::memory_fixture::requirements(0),
+            retained: crate::memory_fixture::requirements(0),
+        }),
         geometry: g,
         activations: zero(),
         attention: zero(),
@@ -387,7 +433,22 @@ fn equation_quotes_select_affordable_chunks_and_reserve_against_competing_admiss
                     .unwrap()
                     .unwrap()
     );
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let quotation = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let smaller_admission = eredu_core::Admission {
+        requested_positions: smaller.assumptions.requested_positions,
+        state: smaller,
+        incremental_required_bytes: Some(capacity),
+        memory_limits: Default::default(),
+        additional_headroom: Default::default(),
+    };
+    let capacity = quotation
+        .reservation_requirements(&smaller_admission, None)
+        .unwrap()
+        .get(quotation.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let identity = InferenceExecutionIdentity::default();
     let (admission, reservation) =
         plan_prefill(&identity, &pool, &capabilities(), request(g), g, |g| {
@@ -403,7 +464,7 @@ fn equation_quotes_select_affordable_chunks_and_reserve_against_competing_admiss
             .prefill_chunk_positions
             <= 2
     );
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(crate::memory_fixture::used(&pool).unwrap() > 0);
     assert!(
         plan_prefill(&identity, &pool, &capabilities(), request(g), g, |g| {
             estimate(&args, g, false).map(|result| result.0)
@@ -411,14 +472,14 @@ fn equation_quotes_select_affordable_chunks_and_reserve_against_competing_admiss
         .is_err()
     );
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }
 
 #[test]
 fn one_missing_native_primitive_prevents_strict_admission_at_every_chunk_size() {
     let args = llama::model_args_from_config_value(&config("llama", true, false)).unwrap();
     let g = geometry(7, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let mut attempts = Vec::new();
     let result = plan_prefill(
         &InferenceExecutionIdentity::default(),
@@ -438,7 +499,7 @@ fn one_missing_native_primitive_prevents_strict_admission_at_every_chunk_size() 
         ))
     ));
     assert_eq!(attempts, [7, 6, 5, 4, 3, 2, 1]);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }
 
 #[derive(Default)]

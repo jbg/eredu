@@ -206,6 +206,9 @@ mod tests {
     use eredu_nn::{NeuralBackend, PooledAttentionInput, Tensor};
     #[test]
     fn pooled_recipe_joins_actual_empty_banks_masks_and_fused_child() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
         for (local, pooled, mixed) in [(2, 0, false), (0, 3, true), (2, 3, true)] {
@@ -238,6 +241,8 @@ mod tests {
             let report = context.report(&[output]).unwrap();
             assert_eq!(report.operations.len(), 1);
             let op = report.operations[0].as_view();
+            let callers = mechanism.ordinary_call_controls(op).unwrap().unwrap();
+            assert!(callers.metadata_bytes > 0);
             let outer = lowering(op).unwrap();
             let child = with_child(op, |child, _| super::super::lowering(child)).unwrap();
             assert!(outer.primitives > child.primitives);

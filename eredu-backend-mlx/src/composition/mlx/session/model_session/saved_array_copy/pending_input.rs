@@ -39,7 +39,6 @@ impl<'a> PromptCopySource<'a> {
         super::super::text_step::validate_prompt_binding_fixed(prompt, quote)?;
         if quote.local_prediction_fixed(sampling.next_prediction)? != 0
             || prompt.controlled_attribution.is_some()
-            || prompt.prepared_capture.is_some()
         {
             return Err(PromptCopyCause::Geometry);
         }
@@ -52,8 +51,15 @@ impl<'a> PromptCopySource<'a> {
                 prompt,
                 kind: PromptCopyKind::Media(
                     packet,
-                    prompt.placement_semantics.as_ref().or_else(|| prompt
-                        .quote.as_ref().and_then(|quote| quote.copied_media_semantics()))
+                    prompt
+                        .placement_semantics
+                        .as_ref()
+                        .or_else(|| {
+                            prompt
+                                .quote
+                                .as_ref()
+                                .and_then(|quote| quote.copied_media_semantics())
+                        })
                         .unwrap_or_else(|| packet.borrowed_semantics()),
                 ),
                 positions: packet.shape()[1],

@@ -134,10 +134,10 @@ impl BackendSession<Backend> for Session {
 fn fixed_failure(value: Failure) -> BackendFailure {
     match value {
         Failure::Construction(error) => BackendFailure::from_error(error),
-        Failure::Rejected(BorrowedAdmissionRejection::MemoryBudgetExceeded { .. })
-        | Failure::Source(WorkingMemoryError::BudgetExceeded { .. }) => {
-            PreparedRequestRejection::CapacityExceeded.into_backend_failure()
-        }
+        Failure::Source(
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
+            | WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. }),
+        ) => PreparedRequestRejection::CapacityExceeded.into_backend_failure(),
         Failure::Policy(AdmissionPolicyError::ArithmeticOverflow { .. })
         | Failure::Source(WorkingMemoryError::Overflow) => {
             PreparedRequestRejection::Overflow.into_backend_failure()
@@ -248,7 +248,13 @@ impl TextGenerationBackend for Backend {
                 maximum_context: 32,
                 request: f.request(),
                 geometry: geometry(),
-                capacity: config.inference_policy().managed_memory_capacity_bytes,
+                capacity: Some(
+                    config
+                        .inference_policy()
+                        .memory_limits
+                        .resolve(f.pool.topology())
+                        .unwrap(),
+                ),
             },
             sources,
             |g| {
@@ -257,7 +263,12 @@ impl TextGenerationBackend for Backend {
             },
         )
         .map_err(fixed_failure)?;
-        f.facts.lock().unwrap().accepted_q = reservation.bytes();
+        f.facts.lock().unwrap().accepted_q = reservation
+            .requirements()
+            .get(crate::working_memory::memory_fixture::host_topology_ref().host_domain())
+            .ok()
+            .and_then(|charge| charge.total().ok())
+            .unwrap();
         let request: InferenceRequest = reservation.into();
         // Constructors now run under exactly that accepted Q. These are the
         // normal shared request/preparation owners, not independent grants.

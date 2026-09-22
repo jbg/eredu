@@ -36,7 +36,7 @@ impl TokenFilterController for HostController {
     }
 }
 
-fn host(pool: &WorkingMemoryPool) -> HostController {
+fn host(pool: &MemoryLedger) -> HostController {
     HostController {
         sources: [pool
             .prepare_shared_token_filter(|| {
@@ -48,8 +48,16 @@ fn host(pool: &WorkingMemoryPool) -> HostController {
     }
 }
 
+fn controller_controls() -> u64 {
+    crate::working_memory::controller::controller_publication_layout()
+        .unwrap()
+        .requested_bytes()
+        .checked_add(MemoryLedger::storage_metadata_control_bytes().unwrap())
+        .unwrap()
+}
+
 fn contribution(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     g: InferenceGeometry,
     host: &HostController,
     credited: bool,
@@ -70,10 +78,10 @@ fn contribution(
     .unwrap()
 }
 
-fn combined(pool: &WorkingMemoryPool, host: &HostController) -> IncrementalInferenceQuote {
+fn combined(pool: &MemoryLedger, host: &HostController) -> IncrementalInferenceQuote {
     let g = geometry();
     let context = WorkspaceContext::new(Facts::default());
-    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let root = placed_root(Some(64), &context);
     let registered =
         RegisteredWorkspaceStorage::bind(pool, &context, [(1u32, root.clone())]).unwrap();
     let equations = replacement_report(&context, &root, g);
@@ -84,36 +92,31 @@ fn combined(pool: &WorkingMemoryPool, host: &HostController) -> IncrementalInfer
 }
 
 fn plan_incremental_quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     quote: &IncrementalInferenceQuote,
     request: AdmissionRequest,
     capacity: u64,
-) -> Result<
-    (
-        WorkingMemoryReservation,
-        IncrementalInferenceQuote,
-    ),
-    PrefillPlanningError,
-> {
+) -> Result<(WorkingMemoryReservation, IncrementalInferenceQuote), PrefillPlanningError> {
+    let capacity = payload_capacity_with_quote(pool, quote, &request, capacity);
     plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &capabilities(),
         request,
         quote.geometry(),
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
         |_| Ok(quote.clone()),
     )
 }
 
 #[test]
 fn fixed_controller_credit_preserves_full_equations_and_combines_with_decoder_identity_credit() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let g = geometry();
     let context = WorkspaceContext::new(Facts::default());
-    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let root = placed_root(Some(64), &context);
     let registered =
         RegisteredWorkspaceStorage::bind(&pool, &context, [(1u32, root.clone())]).unwrap();
     let equations = replacement_report(&context, &root, g);
@@ -136,43 +139,74 @@ fn fixed_controller_credit_preserves_full_equations_and_combines_with_decoder_id
         &registered,
     )
     .unwrap();
-    assert_eq!(full.incremental_bytes(), 228);
-    assert_eq!(host_only.incremental_bytes(), 196);
-    assert_eq!(both.incremental_bytes(), 148);
+    assert_eq!(
+        full.incremental_bytes().unwrap(),
+        (228 + controller_controls())
+    );
+    assert_eq!(
+        host_only.incremental_bytes().unwrap(),
+        (196 + controller_controls())
+    );
+    assert_eq!(
+        both.incremental_bytes().unwrap(),
+        (148 + controller_controls())
+    );
     assert_eq!(full.state(), host_only.state());
     assert_eq!(full.state(), both.state());
-    assert!(both.registered_storage().pool().same_domain(&pool));
+    assert!(both.registered_storage().pool().same_ledger(&pool));
     let both = both.into_incremental();
-    assert!(both.pool().same_domain(&pool));
+    assert!(both.pool().same_ledger(&pool));
     assert_eq!(
         both.controller_contract().unwrap().additional_host_bytes(),
         44
     );
     assert_ne!(
-        both.incremental_bytes(),
-        full.incremental_bytes() - 64 - 32,
+        both.incremental_bytes().unwrap(),
+        full.incremental_bytes().unwrap() - 64 - 32,
         "decoder replacement overlap cannot be discounted from a scalar peak"
     );
     assert!(matches!(
-        plan_incremental_quote(&pool, &both, request(g), 243),
+        plan_incremental_quote(&pool, &both, request(g), (243 + controller_controls())),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded {
-                required_bytes: 148,
-                available_bytes: 147
-            }
-        ))
-    ));
-    assert_eq!(used(&pool), (96, 96));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((required, available)) if required == available + 1)));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 96);
     let (reservation, accepted) =
-        plan_incremental_quote(&pool, &both, request(g), 244).unwrap();
+        plan_incremental_quote(&pool, &both, request(g), (244 + controller_controls())).unwrap();
     assert_eq!(reservation.admission().state, *full.state());
-    assert_eq!(reservation.bytes(), 148);
+    assert_eq!(
+        reservation_payload_bytes(&reservation),
+        (148 + controller_controls())
+    );
     assert!(reservation.requires_funding_scope());
     assert!(matches!(
-        pool.reserve(&InferenceExecutionIdentity::default(), reservation.admission()),
+        pool.reserve(
+            &InferenceExecutionIdentity::default(),
+            reservation.admission()
+        ),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 244);
+    let mut complete = reservation.admission().clone();
+    complete.incremental_required_bytes = complete.state.requested_state_bytes.checked_add(
+        complete
+            .state
+            .execution_workspace
+            .as_ref()
+            .unwrap()
+            .peak_bytes()
+            .unwrap()
+            .unwrap(),
+    );
+    assert!(matches!(
+        pool.reserve(&InferenceExecutionIdentity::default(), &complete),
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
+    ));
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        (244 + controller_controls())
+    );
     drop((
         reservation,
         accepted,
@@ -183,48 +217,67 @@ fn fixed_controller_credit_preserves_full_equations_and_combines_with_decoder_id
         host,
         original,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn combined_pins_transfer_to_run_and_scopes_without_becoming_historical_metadata() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let quote = combined(&pool, &host);
-    let (reservation, accepted) =
-        plan_incremental_quote(&pool, &quote, request(geometry()), 244).unwrap();
+    let (reservation, accepted) = plan_incremental_quote(
+        &pool,
+        &quote,
+        request(geometry()),
+        (244 + controller_controls()),
+    )
+    .unwrap();
     drop((quote, accepted, host, original));
-    assert_eq!(pool.used_bytes().unwrap(), 244);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        (244 + controller_controls())
+    );
     let (metadata, run) = reservation.into_funding().unwrap();
     let first = run.scope().unwrap();
     let last = run.scope().unwrap();
     drop(run);
     first.certify().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 244);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        (244 + controller_controls())
+    );
     last.certify().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
     ));
     drop(metadata);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
 }
 
 #[test]
 fn abandoned_combined_work_quarantines_both_sources_after_request_metadata_drops() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let quote = combined(&pool, &host);
-    let (reservation, accepted) =
-        plan_incremental_quote(&pool, &quote, request(geometry()), 244).unwrap();
+    let (reservation, accepted) = plan_incremental_quote(
+        &pool,
+        &quote,
+        request(geometry()),
+        (244 + controller_controls()),
+    )
+    .unwrap();
     let (metadata, run) = reservation.into_funding().unwrap();
     let work = run.scope().unwrap();
     drop((metadata, run, quote, accepted, host, original));
     drop(work);
-    assert_eq!(pool.used_bytes().unwrap(), 244);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        (244 + controller_controls())
+    );
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
@@ -233,34 +286,36 @@ fn abandoned_combined_work_quarantines_both_sources_after_request_metadata_drops
 
 #[test]
 fn incremental_policy_keeps_full_completeness_geometry_and_safety_requirements() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let quote = combined(&pool, &host);
     let g = geometry();
     let mut req = request(g);
-    req.safety_reserve_bytes = 7;
-    req.application_memory_budget_bytes = Some(154);
+    req.additional_headroom = eredu_core::MemoryHeadroomDeclarations::new([("host".into(), 7)]);
+    req.memory_limits = crate::working_memory::memory_fixture::host_limits(0);
+    let exact = payload_capacity_with_quote(&pool, &quote, &req, (251 + controller_controls()));
+    req.memory_limits = crate::working_memory::memory_fixture::host_limits(exact - 1);
     assert!(matches!(
-        plan_incremental_quote(&pool, &quote, req, 1000),
-        Err(PrefillPlanningError::Admission(
-            AdmissionRejection::MemoryBudgetExceeded {
-                required_bytes: 155,
-                budget_bytes: 154
-            }
-        ))
-    ));
-    req.application_memory_budget_bytes = Some(155);
-    assert!(matches!(
-        plan_incremental_quote(&pool, &quote, req, 250),
+        plan_incremental_quote(&pool, &quote, req.clone(), 1000),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ))
     ));
-    let (reservation, accepted) = plan_incremental_quote(&pool, &quote, req, 251).unwrap();
-    assert_eq!(reservation.bytes(), 155);
+    req.memory_limits = crate::working_memory::memory_fixture::host_limits(exact);
+    assert!(matches!(
+        plan_incremental_quote(&pool, &quote, req.clone(), 250),
+        Err(PrefillPlanningError::Reservation(
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
+    let (reservation, accepted) =
+        plan_incremental_quote(&pool, &quote, req, (251 + controller_controls())).unwrap();
+    assert_eq!(
+        reservation_payload_bytes(&reservation),
+        155 + controller_controls()
+    );
     drop((reservation, accepted));
-    let foreign = WorkingMemoryPool::new(1000, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     assert!(matches!(
         plan_incremental_quote(&foreign, &quote, request(g), 1000),
         Err(PrefillPlanningError::Reservation(
@@ -269,7 +324,7 @@ fn incremental_policy_keeps_full_completeness_geometry_and_safety_requirements()
     ));
 
     let context = WorkspaceContext::new(Facts::default());
-    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let root = placed_root(Some(64), &context);
     let equations = replacement_report(&context, &root, g);
     let changed = InferenceGeometry {
         max_output_tokens: g.max_output_tokens + 1,
@@ -294,7 +349,6 @@ fn incremental_policy_keeps_full_completeness_geometry_and_safety_requirements()
     )
     .unwrap();
     let mut permissive = request(g);
-    permissive.require_complete_estimate = false;
     assert!(matches!(
         plan_incremental_quote(&pool, &partial, permissive, 1000),
         Err(PrefillPlanningError::Admission(
@@ -314,13 +368,13 @@ fn incremental_policy_keeps_full_completeness_geometry_and_safety_requirements()
         Err(ResidualQuoteError::IncompleteWorkspace(_))
     ));
     drop((partial, quote, host, original));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn combined_credit_uses_the_shared_smaller_chunk_planner() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let g = InferenceGeometry {
         input_positions: 3,
@@ -329,24 +383,20 @@ fn combined_credit_uses_the_shared_smaller_chunk_planner() {
         ..geometry()
     };
     let mut candidates = Vec::new();
-    let (reservation, quote) = plan_prefill_incremental_with_capacity(
-        &InferenceExecutionIdentity::default(),
-        &pool,
-        &capabilities(),
-        request(g),
-        g,
-        180,
-        |candidate| {
+    let mut provider =
+        |candidate: InferenceGeometry| -> Result<IncrementalInferenceQuote, PrefillPlanningError> {
             candidates.push(candidate.prefill_chunk_positions);
             let context = WorkspaceContext::new(Facts::default());
-            let root = WorkspaceExistingStorage::new(Some(64), &context);
+            let root = placed_root(Some(64), &context);
             let registered =
                 RegisteredWorkspaceStorage::bind(&pool, &context, [(1u32, root.clone())]).unwrap();
             let old = view(&context, &root, 2);
             let equations = quote_inference_workspace(candidate, |span| {
                 context.begin_state_span([&old])?;
                 let count = match span {
-            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
+                    InferenceWorkspaceSpan::Sampling(_) => {
+                        unreachable!("model-only traversal fixture")
+                    }
                     InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
                     InferenceWorkspaceSpan::Decode { .. } => 1,
                 };
@@ -362,23 +412,45 @@ fn combined_credit_uses_the_shared_smaller_chunk_planner() {
             )
             .unwrap()
             .into_incremental())
-        },
+        };
+    let probe = provider(InferenceGeometry {
+        prefill_chunk_positions: 2,
+        ..g
+    })
+    .unwrap();
+    let capacity =
+        payload_capacity_with_quote(&pool, &probe, &request(g), (180 + controller_controls()));
+    drop(probe);
+    let (reservation, quote) = plan_prefill_incremental_with_capacity(
+        &InferenceExecutionIdentity::default(),
+        &pool,
+        &capabilities(),
+        request(g),
+        g,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        &mut provider,
     )
     .unwrap();
-    assert_eq!(candidates, [3, 2]);
+    assert_eq!(candidates, [2, 3, 2]);
     assert_eq!(quote.geometry().prefill_chunk_positions, 2);
-    assert_eq!(reservation.bytes(), 84);
-    assert_eq!(pool.used_bytes().unwrap(), 180);
+    assert_eq!(
+        reservation_payload_bytes(&reservation),
+        (84 + controller_controls())
+    );
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        (180 + controller_controls())
+    );
     drop((quote, reservation, host, original));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn required_registered_inputs_preserve_the_original_controller_and_decoder_quote() {
-    let pool = WorkingMemoryPool::new(1000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
-    let source = pool.register_storage([(2u32, 24)]).unwrap();
+    let source = pool.register_host_storage([(2u32, 24)]).unwrap();
     let quote = combined(&pool, &host);
     let joined = quote
         .clone()
@@ -387,23 +459,34 @@ fn required_registered_inputs_preserve_the_original_controller_and_decoder_quote
     assert_eq!(joined.controller_contract(), quote.controller_contract());
     assert_eq!(joined.state(), quote.state());
     assert_eq!(joined.geometry(), quote.geometry());
-    assert_eq!(joined.incremental_bytes(), 148);
-    let (reservation, accepted) =
-        plan_incremental_quote(&pool, &joined, request(geometry()), 268).unwrap();
+    assert_eq!(
+        joined.incremental_bytes().unwrap(),
+        (148 + controller_controls())
+    );
+    let (reservation, accepted) = plan_incremental_quote(
+        &pool,
+        &joined,
+        request(geometry()),
+        (268 + controller_controls()),
+    )
+    .unwrap();
     drop((quote, joined, accepted, root, host, source));
-    assert_eq!(pool.used_bytes().unwrap(), 268);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        (268 + controller_controls())
+    );
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn retained_span_host_and_original_terms_receive_no_controller_or_decoder_discount() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let host = host(&pool);
     let g = geometry();
     let context = WorkspaceContext::new(Facts::default());
-    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let root = placed_root(Some(64), &context);
     let registered =
         RegisteredWorkspaceStorage::bind(&pool, &context, [(1u32, root.clone())]).unwrap();
     let equations = replacement_report(&context, &root, g);
@@ -421,18 +504,19 @@ fn retained_span_host_and_original_terms_receive_no_controller_or_decoder_discou
     )
     .unwrap()
     .into_incremental();
-    let full_before = full.incremental_bytes();
-    let credited_before = credited.incremental_bytes();
+    let full_before = full.incremental_bytes().unwrap();
+    let credited_before = credited.incremental_bytes().unwrap();
     assert!(credited_before < full_before);
     let h = full.span_workspace().retention_peak_bytes().unwrap();
     let full = full.with_span_workspace().unwrap();
     let credited = credited.with_span_workspace().unwrap();
-    assert_eq!(full.incremental_bytes() - full_before, h);
-    assert_eq!(credited.incremental_bytes() - credited_before, h);
-    assert!(full
-        .span_workspace()
-        .plan()
-        .same_plan(credited.span_workspace().plan()));
+    assert_eq!(full.incremental_bytes().unwrap() - full_before, h);
+    assert_eq!(credited.incremental_bytes().unwrap() - credited_before, h);
+    assert!(
+        full.span_workspace()
+            .plan()
+            .same_plan(credited.span_workspace().plan())
+    );
     assert_eq!(full.span_workspace().source_preparation_bytes(), Some(40));
     for i in 0..equations.span_workspace_plan().records().len() {
         assert_eq!(
@@ -441,9 +525,9 @@ fn retained_span_host_and_original_terms_receive_no_controller_or_decoder_discou
         );
     }
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         64 + host.sources[0].capacity_bytes().unwrap()
     );
     drop((full, credited, registered, original, host));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

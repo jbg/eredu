@@ -57,7 +57,12 @@ fn grammar_source_is_reused_without_registration_or_prompt_work_before_admission
         let cancel = eredu_core::GenerationCancellationToken::new();
         let source = model.chat_source(true, &cancel).unwrap().unwrap();
         let prepared = model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(calls.borrow().prompts, 0);
@@ -70,8 +75,8 @@ fn grammar_source_is_reused_without_registration_or_prompt_work_before_admission
             },
             ..Default::default()
         });
-        let mut stale = settings;
-        stale.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY - 1);
+        let mut stale = settings.clone();
+        stale.inference.memory_limits = crate::memory::limits(original_sources::CAPACITY - 1);
         let error = model
             .start_prepared_chat(PreparedChatRequest::new(&prepared, stale), &cancel)
             .err()
@@ -84,7 +89,10 @@ fn grammar_source_is_reused_without_registration_or_prompt_work_before_admission
         assert!(calls.borrow().configs.is_empty());
         assert_eq!(calls.borrow().scripted_tokens.len(), answer.len() + 1);
         let output = model
-            .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancel)
+            .start_prepared_chat(
+                PreparedChatRequest::new(&prepared, settings.clone()),
+                &cancel,
+            )
             .unwrap()
             .unwrap()
             .run(&cancel, &mut |_| {})

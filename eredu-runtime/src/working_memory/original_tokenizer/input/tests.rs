@@ -14,8 +14,8 @@ fn read(input: &[u8]) -> PreparedArtifactFileRead {
 }
 fn facts() -> (u64, u64) {
     (
-        WorkingMemoryPool::tokenizer_file_required_bytes(&read(JSON.as_bytes())).unwrap(),
-        WorkingMemoryPool::tokenizer_required_bytes(
+        MemoryLedger::tokenizer_file_required_bytes(&read(JSON.as_bytes())).unwrap(),
+        MemoryLedger::tokenizer_required_bytes(
             &TokenizerPlan::prepare_json(JSON.as_bytes()).unwrap(),
         )
         .unwrap(),
@@ -25,29 +25,26 @@ fn facts() -> (u64, u64) {
 #[test]
 fn exact_file_i_then_fresh_c_coexist_and_only_the_last_source_owner_retires_c() {
     let (i, c) = facts();
-    let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
     let source = pool
         .compile_tokenizer_file_with(
             read(JSON.as_bytes()),
             |_| {
-                assert_eq!(pool.used_bytes().unwrap(), i);
+                assert_eq!(pool.payload_used_bytes().unwrap(), i);
                 assert!(matches!(
                     pool.acquire_unquoted(),
                     Err(WorkingMemoryError::ReservedWorkActive)
                 ));
             },
             || {
-                assert_eq!(pool.used_bytes().unwrap(), i);
+                assert_eq!(pool.payload_used_bytes().unwrap(), i);
                 assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-                drop(pool.acquire_unquoted().unwrap());
+                crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
             },
             |pool, plan| {
-                assert_eq!(
-                    WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap(),
-                    c
-                );
+                assert_eq!(MemoryLedger::tokenizer_required_bytes(&plan).unwrap(), c);
                 pool.compile_tokenizer_with(plan, || {
-                    assert_eq!(pool.used_bytes().unwrap(), i + c);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), i + c);
                     assert!(matches!(
                         pool.acquire_unquoted(),
                         Err(WorkingMemoryError::ReservedWorkActive)
@@ -59,26 +56,26 @@ fn exact_file_i_then_fresh_c_coexist_and_only_the_last_source_owner_retires_c() 
     assert_eq!(source.token_id("hi"), Some(2));
     assert_eq!(source.spelling(4), Some("<S>"));
     assert_eq!(source.original_bytes(), c);
-    assert_eq!(pool.used_bytes().unwrap(), c);
-    assert_eq!(pool.peak_bytes().unwrap(), i + c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), i + c);
     let alias = source.clone();
     assert!(source.same_source(&alias));
     let witness = pool.clone();
     drop((pool, source));
-    assert_eq!(witness.used_bytes().unwrap(), c);
+    assert_eq!(witness.payload_used_bytes().unwrap(), c);
     assert_eq!(alias.spelling(2), Some("hi"));
     let peer = alias.clone();
     std::thread::scope(|threads| {
         threads.spawn(move || drop(alias));
         threads.spawn(move || drop(peer));
     });
-    assert_eq!(witness.used_bytes().unwrap(), 0);
+    assert_eq!(witness.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn one_short_i_never_reserves_and_one_short_c_keeps_actual_file_bytes_in_its_error() {
     let (i, c) = facts();
-    let pool = WorkingMemoryPool::new(i - 1, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(i - 1, 0).unwrap();
     let error = pool
         .compile_tokenizer_file_with(
             read(JSON.as_bytes()),
@@ -88,23 +85,23 @@ fn one_short_i_never_reserves_and_one_short_c_keeps_actual_file_bytes_in_its_err
         )
         .unwrap_err();
     assert!(
-        matches!(error.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == i && *available_bytes == i - 1)
+        matches!(error.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == i && (limit_bytes - existing_bytes) == i - 1)
     );
     assert_eq!(error.input_bytes(), 0);
     assert_eq!(error.input_capacity(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(i + c - 1, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(i + c - 1, 0).unwrap();
     let error = pool
         .compile_tokenizer_file(read(JSON.as_bytes()))
         .unwrap_err();
     assert!(
-        matches!(error.compiler_failure().unwrap().accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == c && *available_bytes == c - 1)
+        matches!(error.compiler_failure().unwrap().accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == c && (limit_bytes - existing_bytes) == c - 1)
     );
     assert_eq!(error.compiler_failure().unwrap().retained_bytes(), 0);
     assert_eq!(error.filled_bytes(), JSON.len());
     assert!(error.input_capacity() >= JSON.len());
     assert_eq!(error.input_bytes(), i);
-    assert_eq!(pool.used_bytes().unwrap(), i);
+    assert_eq!(pool.payload_used_bytes().unwrap(), i);
     let error = error.into_backend_failure();
     assert_eq!(error.kind(), BackendFailureKind::ResourceExhausted);
     assert_eq!(
@@ -117,13 +114,13 @@ fn one_short_i_never_reserves_and_one_short_c_keeps_actual_file_bytes_in_its_err
         i
     );
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn actual_input_target_overflow_os_read_failure_and_changed_handle_keep_original_i() {
     let (i, c) = facts();
-    let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
     let error = pool
         .compile_tokenizer_file_with(
             read(JSON.as_bytes()),
@@ -135,9 +132,9 @@ fn actual_input_target_overflow_os_read_failure_and_changed_handle_keep_original
     assert!(error.source().unwrap().is::<TryReserveError>());
     assert_eq!(error.input_capacity(), 0);
     assert_eq!(error.input_bytes(), i);
-    assert_eq!(pool.used_bytes().unwrap(), i);
+    assert_eq!(pool.payload_used_bytes().unwrap(), i);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("tokenizer.json");
     std::fs::write(&path, JSON).unwrap();
@@ -160,9 +157,9 @@ fn actual_input_target_overflow_os_read_failure_and_changed_handle_keep_original
     assert!(error.input_capacity() >= JSON.len());
     assert_eq!(error.kind(), BackendFailureKind::Io);
     let error = error.into_backend_failure();
-    assert_eq!(pool.used_bytes().unwrap(), i);
+    assert_eq!(pool.payload_used_bytes().unwrap(), i);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let file = file(JSON.as_bytes());
     let writer = file.try_clone().unwrap();
     let read = PreparedArtifactFileRead::new(file).unwrap();
@@ -181,14 +178,14 @@ fn actual_input_target_overflow_os_read_failure_and_changed_handle_keep_original
     assert_eq!(error.input_bytes(), i);
     assert_eq!(error.filled_bytes(), 0);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn decoder_reserve_failures_keep_input_and_source_admission_in_core_envelope() {
     let (i, c) = facts();
     for stage in 0..3 {
-        let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
         let error = pool
             .compile_tokenizer_file_with(
                 read(JSON.as_bytes()),
@@ -212,11 +209,11 @@ fn decoder_reserve_failures_keep_input_and_source_admission_in_core_envelope() {
             cause = error.source();
         }
         assert!(reserve, "actual target frontier {stage}");
-        drop(pool.acquire_unquoted().unwrap());
+        crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
         let error = error.into_backend_failure();
-        assert_eq!(pool.used_bytes().unwrap(), i + c);
+        assert_eq!(pool.payload_used_bytes().unwrap(), i + c);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -233,27 +230,28 @@ fn source_compile_errors_retain_distinct_file_and_construction_admission() {
     ] {
         assert!(TokenizerPlan::prepare_json(supported.as_bytes()).is_ok());
         let input = read(supported.as_bytes());
-        let i = WorkingMemoryPool::tokenizer_file_required_bytes(&input).unwrap();
-        let pool = WorkingMemoryPool::new(i, 0).unwrap();
+        let i = MemoryLedger::tokenizer_file_required_bytes(&input).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(i, 0).unwrap();
         let error = pool.compile_tokenizer_file(input).unwrap_err();
         assert!(error.planning_failure().is_none());
         assert!(matches!(
             error.compiler_failure().unwrap().accounting_failure(),
-            Some(WorkingMemoryError::BudgetExceeded { .. })
+            Some(WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
         ));
         assert_eq!(error.filled_bytes(), supported.len());
-        assert_eq!(pool.used_bytes().unwrap(), i);
+        assert_eq!(pool.payload_used_bytes().unwrap(), i);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     for bytes in [b"".as_slice(), b"invalid json".as_slice()] {
         let read = read(bytes);
-        let i = WorkingMemoryPool::tokenizer_file_required_bytes(&read).unwrap();
-        let c = WorkingMemoryPool::tokenizer_required_bytes(
-            &TokenizerPlan::prepare_json(bytes).unwrap(),
-        )
-        .unwrap();
-        let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+        let i = MemoryLedger::tokenizer_file_required_bytes(&read).unwrap();
+        let c =
+            MemoryLedger::tokenizer_required_bytes(&TokenizerPlan::prepare_json(bytes).unwrap())
+                .unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
         let error = pool.compile_tokenizer_file(read).unwrap_err();
         assert!(error.planning_failure().is_none());
         let compiler = error.compiler_failure().unwrap();
@@ -266,18 +264,18 @@ fn source_compile_errors_retain_distinct_file_and_construction_admission() {
         );
         assert_eq!(compiler.retained_bytes(), c);
         assert_eq!(error.filled_bytes(), bytes.len());
-        assert_eq!(pool.used_bytes().unwrap(), i + c);
+        assert_eq!(pool.payload_used_bytes().unwrap(), i + c);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     let invalid = JSON.replace("\"i\":1", "\"i\":0");
     let read = read(invalid.as_bytes());
-    let i = WorkingMemoryPool::tokenizer_file_required_bytes(&read).unwrap();
-    let c = WorkingMemoryPool::tokenizer_required_bytes(
+    let i = MemoryLedger::tokenizer_file_required_bytes(&read).unwrap();
+    let c = MemoryLedger::tokenizer_required_bytes(
         &TokenizerPlan::prepare_json(invalid.as_bytes()).unwrap(),
     )
     .unwrap();
-    let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
     let error = pool.compile_tokenizer_file(read).unwrap_err();
     assert!(
         error
@@ -286,16 +284,16 @@ fn source_compile_errors_retain_distinct_file_and_construction_admission() {
             .compiler_failure()
             .is_some()
     );
-    assert_eq!(pool.used_bytes().unwrap(), i + c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), i + c);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn unwind_destroys_file_destinations_before_healthy_i_refund() {
     let (i, c) = facts();
     for phase in 0..3 {
-        let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.compile_tokenizer_file_with(
                 read(JSON.as_bytes()),
@@ -313,7 +311,7 @@ fn unwind_destroys_file_destinations_before_healthy_i_refund() {
             )
         }));
         assert!(unwind.is_err());
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
     }
 }
@@ -321,7 +319,7 @@ fn unwind_destroys_file_destinations_before_healthy_i_refund() {
 #[test]
 fn concurrent_real_reads_and_compilers_preserve_each_active_and_idle_charge() {
     let (i, c) = facts();
-    let pool = WorkingMemoryPool::new(2 * (i + c), 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(2 * (i + c), 0).unwrap();
     let reads = [read(JSON.as_bytes()), read(JSON.as_bytes())];
     let (outputs, observed) = std::thread::scope(|threads| {
         let mut receivers = Vec::new();
@@ -360,7 +358,7 @@ fn concurrent_real_reads_and_compilers_preserve_each_active_and_idle_charge() {
             let mut observed = Vec::new();
             for _ in 0..3 {
                 let arrivals: Vec<_> = receivers.iter().map(|r| r.recv()).collect();
-                let used = pool.used_bytes();
+                let used = pool.payload_used_bytes();
                 let reservations = pool.0.usage.lock().unwrap().reservations;
                 let idle = match pool.acquire_unquoted() {
                     Ok(owner) => {
@@ -393,15 +391,15 @@ fn concurrent_real_reads_and_compilers_preserve_each_active_and_idle_charge() {
         .map(|o| o.unwrap().unwrap().unwrap())
         .collect();
     assert!(!sources[0].same_source(&sources[1]));
-    assert_eq!(pool.used_bytes().unwrap(), 2 * c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 2 * c);
     drop(sources);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn completed_aggregate_on_poison_keeps_both_original_allowances_quarantined() {
     let (i, c) = facts();
-    let pool = WorkingMemoryPool::new(i + c, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(i + c, 0).unwrap();
     let error = pool
         .compile_tokenizer_file_with(
             read(JSON.as_bytes()),
@@ -440,29 +438,31 @@ fn retained_configuration_uses_fresh_compiler_preserves_flags_and_keeps_input_fa
     use std::str::FromStr;
     let mut selected = eredu_text::tokenizer::Tokenizer::from_str(JSON).unwrap();
     selected.set_encode_special_tokens(true);
-    let pool = WorkingMemoryPool::new(64 * 1024 * 1024, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(64 * 1024 * 1024, 0).unwrap();
     let source = pool
         .compile_tokenizer_source_for_generation(OriginalTokenizerInput::Configuration(&selected))
         .unwrap();
     assert!(source.matches_configuration(&selected));
     assert!(source.generation_domain().is_some());
-    let peak = pool.peak_bytes().unwrap();
+    let peak = pool.payload_peak_bytes().unwrap();
     let compiled = source.original_bytes();
     assert!(peak > compiled);
-    assert_eq!(pool.used_bytes().unwrap(), compiled);
+    assert_eq!(pool.payload_used_bytes().unwrap(), compiled);
     let alias = source.clone();
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), compiled);
+    assert_eq!(pool.payload_used_bytes().unwrap(), compiled);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 
-    let short = WorkingMemoryPool::new(peak - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(peak - 1, 0).unwrap();
     let error = short
         .compile_tokenizer_source_for_generation(OriginalTokenizerInput::Configuration(&selected))
         .unwrap_err();
     assert!(matches!(
         error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert!(
         error.compiler_failure().is_some(),
@@ -470,18 +470,20 @@ fn retained_configuration_uses_fresh_compiler_preserves_flags_and_keeps_input_fa
     );
     assert!(error.filled_bytes() > 0);
     assert!(error.input_capacity() >= error.filled_bytes());
-    assert_eq!(short.used_bytes().unwrap(), error.input_bytes());
+    assert_eq!(short.payload_used_bytes().unwrap(), error.input_bytes());
     drop(error);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
 
-    let tiny = WorkingMemoryPool::new(1, 0).unwrap();
+    let tiny = crate::working_memory::memory_fixture::host_ledger(1, 0).unwrap();
     let error = tiny
         .compile_tokenizer_source_for_generation(OriginalTokenizerInput::Configuration(&selected))
         .unwrap_err();
     assert!(matches!(
         error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert_eq!(error.input_capacity(), 0);
-    assert_eq!(tiny.used_bytes().unwrap(), 0);
+    assert_eq!(tiny.payload_used_bytes().unwrap(), 0);
 }

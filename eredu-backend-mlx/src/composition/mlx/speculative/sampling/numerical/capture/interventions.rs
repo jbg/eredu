@@ -252,7 +252,7 @@ impl Edits {
     }
     pub(super) fn validate(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<(), eredu_runtime::working_memory::WorkingMemoryError> {
         self.source.validate_pool(pool)
     }

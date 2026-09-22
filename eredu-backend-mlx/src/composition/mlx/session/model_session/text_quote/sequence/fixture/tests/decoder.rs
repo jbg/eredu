@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_runtime::working_memory::OriginalGenerationDecoderInput;
 use eredu_text::{decoder_storage::PreparedDecodeSource, tokenizer::Tokenizer};
 
@@ -21,19 +23,25 @@ pub(super) fn input(maximum: usize) -> OriginalGenerationDecoderInput {
 }
 #[test]
 fn original_decoder_uses_actual_native_predictions_residency_and_capture_result_bank() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     super::run_real_prediction(true);
 }
 #[test]
 fn original_native_decoder_exact_minus_one_has_one_precandidate_source_take() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for (capture, rows) in [(false, false), (true, false), (true, true)] {
         let mut required = None;
         for pass in 0..3 {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::tests::support::test_utils::initialize_original_sources();
             let (mut runtime, _artifact) = load(&stream, &pool, 0);
             let source = capture.then(|| source(&runtime));
             let probe = Probe::new(&runtime, source.as_ref(), rows);
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.fixture_host_charge().unwrap();
             let before = paths::session_input_creation_attempts();
             let native = paths::snapshot();
             let decoder = input(4);
@@ -52,12 +60,14 @@ fn original_native_decoder_exact_minus_one_has_one_precandidate_source_take() {
                 let error = result.unwrap_err();
                 assert!(matches!(
                     cause::<WorkingMemoryError>(&error),
-                    WorkingMemoryError::BudgetExceeded { .. }
+                    WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    )
                 ));
                 assert!(probe.0.admitted.borrow().is_none());
                 assert_eq!(paths::session_input_creation_attempts(), before);
                 assert_eq!(paths::snapshot(), native);
-                assert_eq!(pool.used_bytes().unwrap(), baseline);
+                assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
                 // The source is terminally spent even though no original account
                 // was accepted. An increased capacity cannot refill this input.
                 let error = start_with_decoder(
@@ -72,7 +82,7 @@ fn original_native_decoder_exact_minus_one_has_one_precandidate_source_take() {
                 .unwrap_err();
                 assert_eq!(cause::<Rejection>(&error), &Rejection::Unavailable);
                 assert_eq!(probe.0.decoder_takes.get(), 1);
-                assert_eq!(pool.used_bytes().unwrap(), baseline);
+                assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
             } else {
                 let sequence = result.unwrap();
                 let facts = probe.facts();
@@ -92,6 +102,9 @@ fn original_native_decoder_exact_minus_one_has_one_precandidate_source_take() {
 }
 #[test]
 fn native_decoder_staging_destroys_source_before_accepted_owners_on_error_and_unwind() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for mode in [
         Mode::DecoderAcceptedError,
@@ -99,9 +112,9 @@ fn native_decoder_staging_destroys_source_before_accepted_owners_on_error_and_un
         Mode::DecoderFundingError,
         Mode::DecoderFundingPanic,
     ] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
         let probe = Probe::new(&runtime, None, false);
         probe.mode(mode);
         let decoder = input(4);
@@ -118,7 +131,7 @@ fn native_decoder_staging_destroys_source_before_accepted_owners_on_error_and_un
         assert_eq!(probe.0.decoder_takes.get(), 1);
         assert_eq!(probe.0.decoder_retirements.get(), 1);
         assert!(probe.0.decoder_expected.borrow().as_ref().unwrap().1 > baseline);
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         assert_eq!(paths::session_input_creation_attempts(), before);
         assert_eq!(paths::snapshot(), native);
         assert!(probe.0.admitted.borrow().is_none());

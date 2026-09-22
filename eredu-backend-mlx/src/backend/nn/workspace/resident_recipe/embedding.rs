@@ -37,26 +37,31 @@ fn dense() -> Lowering {
 }
 
 pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
-    if let WorkspaceOperationKindView::VocabularyParallelLookup{policy,..}=operation.kind {
-        let child=super::super::parallel_lookup::embedding(operation).ok()??;
-        let mut value=lowering(child)?;
+    if let WorkspaceOperationKindView::VocabularyParallelLookup { policy, .. } = operation.kind {
+        let child = super::super::parallel_lookup::embedding(operation).ok()??;
+        let mut value = lowering(child)?;
         // Same global validation and selected row kernel as strict lookup.
         // Local subtraction replaces the index zeros; final expand/zero/where
         // masks every nonlocal row. Global negative sentinel validation adds
         // only eq/or: ownership masking already zeros its output.
-        let sentinel=usize::from(matches!(policy,eredu_nn::EmbeddingLookupPolicy::ZeroSentinel(_)));
-        let primitives=13usize.checked_add(sentinel.checked_mul(10)?)?;
-        let edges=16usize.checked_add(sentinel.checked_mul(12)?)?;
-        let seeds=1usize.checked_add(sentinel)?;
-        value.primitives=value.primitives.checked_add(primitives)?;
-        value.edges=value.edges.checked_add(edges)?;
-        value.seeds=value.seeds.checked_add(seeds)?;
-        value.maximum_births=value.maximum_births.checked_add(primitives)?.checked_add(seeds)?;
+        let sentinel = usize::from(matches!(
+            policy,
+            eredu_nn::EmbeddingLookupPolicy::ZeroSentinel(_)
+        ));
+        let primitives = 13usize.checked_add(sentinel.checked_mul(10)?)?;
+        let edges = 16usize.checked_add(sentinel.checked_mul(12)?)?;
+        let seeds = 1usize.checked_add(sentinel)?;
+        value.primitives = value.primitives.checked_add(primitives)?;
+        value.edges = value.edges.checked_add(edges)?;
+        value.seeds = value.seeds.checked_add(seeds)?;
+        value.maximum_births = value
+            .maximum_births
+            .checked_add(primitives)?
+            .checked_add(seeds)?;
         return Some(value);
     }
 
-    let WorkspaceOperationKindView::Embedding(format, policy) = operation.kind
-    else {
+    let WorkspaceOperationKindView::Embedding(format, policy) = operation.kind else {
         return None;
     };
     policy.validate_fixed().ok()?;
@@ -83,7 +88,10 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
         value.primitives = value.primitives.checked_add(primitives)?;
         value.edges = value.edges.checked_add(edges)?;
         value.seeds = value.seeds.checked_add(seeds)?;
-        value.maximum_births = value.maximum_births.checked_add(primitives)?.checked_add(seeds)?;
+        value.maximum_births = value
+            .maximum_births
+            .checked_add(primitives)?
+            .checked_add(seeds)?;
     }
     Some(value)
 }
@@ -98,8 +106,12 @@ pub(super) fn token_validation_lowering(operation: WorkspaceOperationView<'_>) -
         return Some(Lowering::plain(1, 1, 0));
     }
     let reduction = if input.shape().is_empty() { 0 } else { 2 };
-    let mut value = reduction_lowering(2 + 3 * 5 + 2 + reduction,
-        2 + 3 * 6 + 2 + reduction, 2, reduction);
+    let mut value = reduction_lowering(
+        2 + 3 * 5 + 2 + reduction,
+        2 + 3 * 6 + 2 + reduction,
+        2,
+        reduction,
+    );
     value.validations = 1;
     Some(value)
 }

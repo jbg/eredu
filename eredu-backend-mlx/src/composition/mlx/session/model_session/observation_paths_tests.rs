@@ -1,17 +1,17 @@
 //! Actual selected executables retain and publish their original path source.
 use super::*;
 use eredu_runtime::{
-    working_memory::WorkingMemoryPool, SharedHostMetadata, SharedLayeredObservationPaths,
+    working_memory::MemoryLedger, SharedHostMetadata, SharedLayeredObservationPaths,
 };
 
 fn reclaim() {
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
 }
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 fn paths(runtime: &ModelRuntime<MlxBackend<'_>>) -> SharedLayeredObservationPaths {
@@ -52,8 +52,8 @@ fn strings(source: &SharedLayeredObservationPaths) -> Vec<String> {
 #[test]
 fn loaded_native_paths_share_prepublication_aliases_and_outlive_prepared_model_and_session() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let mut model =
         eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
@@ -121,7 +121,7 @@ mod metal {
         let mut expected_tokens = None;
         for route in 0..3 {
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                 let (mut runtime, _artifact) = match route {
                     0 => host::runtime(&stream, &pool, None),
                     1 => host::runtime(&stream, &pool, Some(1)),
@@ -131,7 +131,7 @@ mod metal {
                 let source_strings = strings(&source);
                 let retained = source.capacity_bytes().unwrap();
                 let input = disk::tokens();
-                let prior_peak = pool.peak_bytes().unwrap();
+                let prior_peak = pool.fixture_host_peak().unwrap();
                 let (capacity, _) = disk::exact_capacity(&runtime, &pool, &input, 0.0, 1);
                 let output = disk::outputs(
                     &mut runtime,
@@ -148,13 +148,13 @@ mod metal {
                 drop(output);
                 quiescent(&runtime);
                 let before = path_instrumentation::snapshot();
-                let inventory_before = pool.used_bytes().unwrap();
+                let inventory_before = pool.fixture_host_charge().unwrap();
                 let alias = paths(&runtime);
                 assert!(source.same_storage(&alias));
                 assert_eq!(strings(&alias), source_strings);
                 assert_eq!(path_instrumentation::snapshot(), before);
-                assert_eq!(pool.used_bytes().unwrap(), inventory_before);
-                assert!(pool.peak_bytes().unwrap() <= prior_peak.max(capacity));
+                assert_eq!(pool.fixture_host_charge().unwrap(), inventory_before);
+                assert!(pool.fixture_host_peak().unwrap() <= prior_peak.max(capacity));
                 drop((alias, runtime));
                 stream.synchronize().unwrap();
                 settle(&pool, retained);
@@ -167,12 +167,12 @@ mod metal {
     #[test]
     fn actual_composite_executables_have_independent_equal_path_sources_and_charges() {
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let artifact = host::family_artifact("gemma4");
         let source_stream =
             Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let load = || {
-            let backend = MlxBackend::new(&stream, &source_stream).with_memory_pool(pool.clone());
+            let backend = MlxBackend::new(&stream, &source_stream).with_memory_ledger(pool.clone());
             let model =
                 eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
                     .unwrap();
@@ -209,3 +209,7 @@ mod capture_quote;
 
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 mod validation;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

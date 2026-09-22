@@ -65,3 +65,43 @@ fn zeros_like_refuses_unknown_floating_precision_and_foreign_context() {
     assert!(first.report(&[]).unwrap().operations.is_empty());
     assert!(second.report(&[]).unwrap().operations.is_empty());
 }
+
+#[test]
+fn unsigned_full_preserves_its_scalar_constructor_for_zero_and_nonzero_values() {
+    for value in [0, 42, u32::MAX] {
+        for shape in [&[][..], &[0, 4][..], &[1, 4][..]] {
+            let context = context();
+            let output = WorkspaceTensor::full_u32(value, shape, &context).unwrap();
+            let report = context.report(&[output]).unwrap();
+            assert_eq!(report.operations.len(), 1);
+            let operation = &report.operations[0];
+            assert!(matches!(
+                operation.kind,
+                WorkspaceOperationKind::Elementwise("full_u32")
+            ));
+            assert!(operation.inputs.is_empty());
+            assert_eq!(operation.outputs[0].shape(), shape);
+            assert_eq!(operation.outputs[0].dtype(), WorkspaceDtype::Uint32);
+        }
+    }
+}
+
+#[test]
+fn signed_full_preserves_its_scalar_constructor_for_zero_and_nonzero_values() {
+    for value in [i32::MIN, -42, 0, i32::MAX] {
+        for shape in [&[][..], &[0, 4][..], &[1, 4][..]] {
+            let context = context();
+            let output = WorkspaceTensor::full_i32(value, shape, &context).unwrap();
+            let report = context.report(&[output]).unwrap();
+            assert_eq!(report.operations.len(), 1);
+            let operation = &report.operations[0];
+            assert!(matches!(
+                operation.kind,
+                WorkspaceOperationKind::Elementwise("full_i32")
+            ));
+            assert!(operation.inputs.is_empty());
+            assert_eq!(operation.outputs[0].shape(), shape);
+            assert_eq!(operation.outputs[0].dtype(), WorkspaceDtype::Int32);
+        }
+    }
+}

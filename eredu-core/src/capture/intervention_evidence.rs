@@ -15,6 +15,15 @@ pub enum InterventionEvidenceSide {
     After,
 }
 impl InterventionEvidenceSide {
+    /// Companion ordinal for the two actual routing fields on this side.
+    pub const fn routing_index(self, field: crate::RoutingObservationField) -> Option<usize> {
+        let field = match field {
+            crate::RoutingObservationField::SelectedExperts => 0,
+            crate::RoutingObservationField::Coefficients => 1,
+            _ => return None,
+        };
+        Some(self.index() * 2 + field)
+    }
     /// Fixed activation companion ordinal.
     pub const fn index(self) -> usize {
         match self {
@@ -153,6 +162,19 @@ impl InterventionEvidenceCompanion {
     pub const fn operation(&self) -> usize {
         self.operation
     }
+    /// Resolves the exact activation or routing field within this companion.
+    /// The geometry remains descriptive and does not grant an evidence claim.
+    pub fn field_index(
+        &self,
+        side: InterventionEvidenceSide,
+        field: Option<crate::RoutingObservationField>,
+    ) -> Option<usize> {
+        match (self.geometry_source().plan().selections.len(), field) {
+            (2, None) => Some(side.index()),
+            (4, Some(field)) => side.routing_index(field),
+            _ => None,
+        }
+    }
     /// Existing capture geometry and static before/after declarations. This
     /// zero-budget plan cannot create an independent evidence allowance.
     pub fn geometry_source(&self) -> &AdmittedCapturePlan {
@@ -173,11 +195,15 @@ impl InterventionEvidenceCompanion {
     }
     pub(crate) fn into_shared(self, host: crate::HostPreparationAuthority) -> Self {
         let geometry = match self.geometry {
-            EvidenceGeometry::Copied(plan) =>
-                EvidenceGeometry::Shared(SharedCapturePlan::from_prepared_copy(plan, host, None)),
+            EvidenceGeometry::Copied(plan) => {
+                EvidenceGeometry::Shared(SharedCapturePlan::from_prepared_copy(plan, host, None))
+            }
             EvidenceGeometry::Shared(plan) => EvidenceGeometry::Shared(plan),
         };
-        Self { operation: self.operation, geometry }
+        Self {
+            operation: self.operation,
+            geometry,
+        }
     }
     pub(crate) fn control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};

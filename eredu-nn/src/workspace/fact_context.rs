@@ -66,6 +66,29 @@ impl OperationFacts {
             Self::Finite(bound) => bound.output(index),
         }
     }
+    pub(super) fn take_output_population(
+        &mut self,
+        index: usize,
+    ) -> Option<WorkspaceAllocationPopulation> {
+        match self {
+            Self::Ordinary(_) => None,
+            Self::Finite(value) => value.output_sources.get_mut(index)?.take(),
+        }
+    }
+    pub(super) fn take_scratch_allocations(
+        &mut self,
+    ) -> Option<(
+        Vec<WorkspaceScratchAllocation>,
+        WorkspaceAllocationPopulation,
+    )> {
+        match self {
+            Self::Ordinary(_) => None,
+            Self::Finite(value) => value
+                .scratch_allocations
+                .take()
+                .zip(value.scratch_source.take()),
+        }
+    }
     pub(super) fn scratch_bytes(&self) -> u64 {
         match self {
             Self::Ordinary(v) => v.scratch_bytes,
@@ -177,7 +200,12 @@ impl WorkspaceContext {
         if let Some(facts) = &self.facts {
             let before = self.identity.fact_remaining.get();
             let mut remaining = before;
-            let result = facts.emit(operation.as_view(), &mut remaining, self.funding.as_ref());
+            let result = facts.emit(
+                operation.as_view(),
+                &mut remaining,
+                self.funding.as_ref(),
+                self,
+            );
             self.identity.fact_remaining.set(remaining);
             self.identity.fact_bytes.set(
                 self.identity

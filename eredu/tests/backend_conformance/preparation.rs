@@ -79,9 +79,10 @@ pub(super) fn admit(
             return Ok(None);
         };
         probe.lifecycle.push("admit");
-        probe
-            .inference_settings
-            .push((config.inference_policy(), config.sampling().max_new_tokens));
+        probe.inference_settings.push((
+            config.inference_policy().clone(),
+            config.sampling().max_new_tokens,
+        ));
         probe.admissions.push(match input {
             eredu_core::TextPreparationInput::TokenIds {
                 positions,
@@ -308,7 +309,12 @@ fn setup() -> (
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -322,7 +328,12 @@ fn setup() -> (
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -344,7 +355,7 @@ fn run(
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let capture = eredu_core::capture::CapturePlan::none();
     let mut request =
-        eredu::api::PreparedChatRequest::new(chat, original_sources::settings(settings));
+        eredu::api::PreparedChatRequest::new(chat, original_sources::settings(settings.clone()));
     request.capture = Some(&capture);
     request.output_mode = eredu::api::PreparedChatOutputMode::Text;
     let Some(mut run) = model.start_controlled_chat(
@@ -397,11 +408,11 @@ fn public_local_preparation_failure_votes_before_return_and_retry_matches_baseli
             Stage::Instrumentation,
         ] {
             let (mut model, chat, settings) = setup();
-            let baseline = run(&mut model, &chat, settings, controlled).unwrap();
+            let baseline = run(&mut model, &chat, settings.clone(), controlled).unwrap();
             assert!(!baseline.is_empty());
             model.reset().unwrap();
             let _guard = probe(Fault::Local(stage));
-            let error = run(&mut model, &chat, settings, controlled).unwrap_err();
+            let error = run(&mut model, &chat, settings.clone(), controlled).unwrap_err();
             let actual = snapshot();
             assert_eq!(actual.forwards, 0);
             assert_eq!(actual.votes.last(), Some(&(stage, Status::Failed)));
@@ -418,7 +429,7 @@ fn public_local_preparation_failure_votes_before_return_and_retry_matches_baseli
             PROBE.with(|probe| probe.borrow_mut().as_mut().unwrap().fault = Fault::None);
             model.reset().unwrap();
             assert_eq!(
-                run(&mut model, &chat, settings, controlled).unwrap(),
+                run(&mut model, &chat, settings.clone(), controlled).unwrap(),
                 baseline
             );
         }
@@ -440,7 +451,7 @@ fn public_peer_rejection_stops_every_preparation_boundary_before_model_work() {
         ] {
             let (mut model, chat, settings) = setup();
             let _guard = probe(Fault::Peer(stage));
-            let error = run(&mut model, &chat, settings, controlled).unwrap_err();
+            let error = run(&mut model, &chat, settings.clone(), controlled).unwrap_err();
             assert!(
                 has_source::<eredu_core::run_preparation::TextPreparationRejected>(error.as_ref()),
                 "{error}"
@@ -477,7 +488,7 @@ fn peer_initial_delivery_cancellation_stops_ordinary_and_controlled_runs() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
         let _guard = probe(Fault::Cancel(Stage::Delivery));
-        assert!(run(&mut model, &chat, settings, controlled)
+        assert!(run(&mut model, &chat, settings.clone(), controlled)
             .unwrap()
             .is_empty());
         assert_eq!(snapshot().forwards, 0);
@@ -509,8 +520,14 @@ fn asynchronous_public_token_generation_agrees_native_preparation() {
         let (mut model, _, _) = setup();
         let _guard = probe(Fault::Local(stage));
         let config = TextGenerationConfig::new(
-            eredu_core::resolve_generation_config(None, GenerationConfigOverrides::default())
-                .unwrap(),
+            eredu_core::resolve_generation_config(
+                None,
+                GenerationConfigOverrides {
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
         );
         let error = match model.generate_tokens(vec![1, 2], config) {
             Ok(_) => panic!("failed preparation cannot start an iterator"),
@@ -569,10 +586,10 @@ fn run_speculative_with_scheduler(
 fn speculative_prompt_failure_agrees_before_execution_and_retry_preserves_parity() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
-        let baseline = run_speculative(&mut model, &chat, settings, controlled).unwrap();
+        let baseline = run_speculative(&mut model, &chat, settings.clone(), controlled).unwrap();
         assert!(!baseline.is_empty());
         let _guard = probe(Fault::Local(Stage::Prompt));
-        let error = run_speculative(&mut model, &chat, settings, controlled).unwrap_err();
+        let error = run_speculative(&mut model, &chat, settings.clone(), controlled).unwrap_err();
         assert!(has_source::<MockError>(error.as_ref()));
         assert_eq!(snapshot().forwards, 0);
         assert_eq!(
@@ -617,7 +634,7 @@ fn speculative_peer_rejection_stops_host_prompt_and_controlled_instrumentation()
 fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
     let (mut model, chat, mut settings) = setup();
     settings.seed = 0;
-    let mut invalid = settings;
+    let mut invalid = settings.clone();
     invalid.overrides.temperature = Some(-1.0);
     let _guard = probe(Fault::None);
     let error = model
@@ -781,7 +798,7 @@ fn peer_cancellation_after_a_committed_token_stops_ordinary_and_controlled_runs(
             skip: 0,
             rejected: false,
         });
-        let tokens = run(&mut model, &chat, settings, controlled).unwrap();
+        let tokens = run(&mut model, &chat, settings.clone(), controlled).unwrap();
         assert_eq!(tokens.len(), 1);
         assert_eq!(snapshot().forwards, 1);
         assert_eq!(
@@ -800,7 +817,7 @@ fn peer_delivery_failure_after_a_committed_token_preserves_the_completed_prefix(
             skip: 0,
             rejected: true,
         });
-        let error = run(&mut model, &chat, settings, controlled).unwrap_err();
+        let error = run(&mut model, &chat, settings.clone(), controlled).unwrap_err();
         assert!(
             has_source::<eredu_core::run_preparation::TextPreparationRejected>(error.as_ref()),
             "{error}"
@@ -823,7 +840,7 @@ fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
         let (mut model, chat, settings) = setup();
         let capture = eredu_core::capture::CapturePlan::none();
         let request = || {
-            let mut r = eredu::api::PreparedChatRequest::new(&chat, settings);
+            let mut r = eredu::api::PreparedChatRequest::new(&chat, settings.clone());
             r.capture = Some(&capture);
             r.output_mode = eredu::api::PreparedChatOutputMode::Text;
             r
@@ -909,7 +926,7 @@ fn terminal_record_peer_failure_is_reported_after_the_completed_prediction() {
             skip: 1,
             rejected: true,
         });
-        let error = run(&mut model, &chat, settings, controlled).unwrap_err();
+        let error = run(&mut model, &chat, settings.clone(), controlled).unwrap_err();
         assert!(has_source::<
             eredu_core::run_preparation::TextPreparationRejected,
         >(error.as_ref()));
@@ -923,7 +940,7 @@ fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
         let (mut model, chat, settings) = setup();
         let capture = eredu_core::capture::CapturePlan::none();
         let request = || {
-            let mut r = eredu::api::PreparedChatRequest::new(&chat, settings);
+            let mut r = eredu::api::PreparedChatRequest::new(&chat, settings.clone());
             r.capture = Some(&capture);
             r.output_mode = eredu::api::PreparedChatOutputMode::Text;
             r

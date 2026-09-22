@@ -2,7 +2,9 @@
 use super::{OriginalJsonValue, OriginalJsonValueError, OriginalJsonValueKind};
 use eredu_core::{HostPreparationAuthority, SemanticText, SpeculativeBuffer};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
-use eredu_text::json_fragments::{JsonFieldNames, JsonFieldError, ObjectContext, ObjectCursor, ObjectSyntaxError};
+use eredu_text::json_fragments::{
+    JsonFieldError, JsonFieldNames, ObjectContext, ObjectCursor, ObjectSyntaxError,
+};
 use std::{
     mem::{size_of, size_of_val},
     ops::Range,
@@ -10,7 +12,8 @@ use std::{
 
 #[derive(Debug, thiserror::Error)]
 enum Cause {
-    #[error(transparent)] Field(#[from] JsonFieldError),
+    #[error(transparent)]
+    Field(#[from] JsonFieldError),
     #[error(transparent)]
     Funding(#[from] HostMetadataFundingError),
     #[error(transparent)]
@@ -106,10 +109,19 @@ impl ObjectContext for Data {
     }
 }
 impl Data {
-    fn value_with_fields(&mut self, key: usize, raw: Range<usize>, fields: Option<JsonFieldNames<'_>>) -> Result<(), Cause> {
+    fn value_with_fields(
+        &mut self,
+        key: usize,
+        raw: Range<usize>,
+        fields: Option<JsonFieldNames<'_>>,
+    ) -> Result<(), Cause> {
         let value = OriginalJsonValue::parse(&self.source()[raw.clone()], &self.funding)?;
         if let Some(fields) = fields {
-            fields.inspect(self.fields.get(key).ok_or(Cause::Source)?.key.as_str(), value.kind(), value.string())?;
+            fields.inspect(
+                self.fields.get(key).ok_or(Cause::Source)?.key.as_str(),
+                value.kind(),
+                value.string(),
+            )?;
         }
         let kind = value.kind();
         let text = value.into_string();
@@ -120,15 +132,28 @@ impl Data {
         Ok(())
     }
 }
-struct FieldContext<'a, 'p> { data: &'a mut Data, fields: JsonFieldNames<'p> }
+struct FieldContext<'a, 'p> {
+    data: &'a mut Data,
+    fields: JsonFieldNames<'p>,
+}
 impl ObjectContext for FieldContext<'_, '_> {
     type Key = usize;
     type Error = Cause;
-    fn raw_len(&self) -> usize { self.data.raw_len() }
-    fn append(&mut self, character: char) -> Result<(), Cause> { self.data.append(character) }
-    fn key(&mut self, raw: Range<usize>) -> Result<usize, Cause> { self.data.key(raw) }
-    fn value(&mut self, key: usize, raw: Range<usize>) -> Result<(), Cause> { self.data.value_with_fields(key, raw, Some(self.fields)) }
-    fn syntax(&self, cause: ObjectSyntaxError) -> Cause { self.data.syntax(cause) }
+    fn raw_len(&self) -> usize {
+        self.data.raw_len()
+    }
+    fn append(&mut self, character: char) -> Result<(), Cause> {
+        self.data.append(character)
+    }
+    fn key(&mut self, raw: Range<usize>) -> Result<usize, Cause> {
+        self.data.key(raw)
+    }
+    fn value(&mut self, key: usize, raw: Range<usize>) -> Result<(), Cause> {
+        self.data.value_with_fields(key, raw, Some(self.fields))
+    }
+    fn syntax(&self, cause: ObjectSyntaxError) -> Cause {
+        self.data.syntax(cause)
+    }
 }
 /// Finite raw/key/value destinations and the actual shared object cursor.
 /// This mechanism validates JSON syntax and fields, not tool names or schemas.
@@ -153,7 +178,8 @@ impl OriginalJsonObject {
             ObjectCursor::<usize>::control_bytes::<Data>()?,
             ObjectCursor::<usize>::control_bytes::<FieldContext<'_, '_>>()?,
             JsonFieldNames::control_bytes()?,
-            size_of::<FieldContext<'_, '_>>(), size_of::<Option<JsonFieldNames<'_>>>(),
+            size_of::<FieldContext<'_, '_>>(),
+            size_of::<Option<JsonFieldNames<'_>>>(),
             size_of::<Self>(),
             size_of::<Data>(),
             size_of::<OriginalJsonField>(),
@@ -191,7 +217,10 @@ impl OriginalJsonObject {
             .and_then(|n| n.checked_add(size_of::<Result<SpeculativeBuffer<T>, Cause>>()))
             .and_then(|n| n.checked_add(size_of::<(usize, &HostMetadataFunding)>()))
     }
-    fn buffer<T>(capacity: usize, funding: &HostMetadataFunding) -> Result<SpeculativeBuffer<T>, Cause> {
+    fn buffer<T>(
+        capacity: usize,
+        funding: &HostMetadataFunding,
+    ) -> Result<SpeculativeBuffer<T>, Cause> {
         let bytes = Self::buffer_bytes::<T>(capacity).ok_or(Cause::Overflow)?;
         funding.reserve_metadata(bytes)?;
         Ok(SpeculativeBuffer::try_new_retained(
@@ -238,17 +267,34 @@ impl OriginalJsonObject {
     pub fn push(self, input: &str) -> Result<(Self, usize, bool), OriginalJsonObjectError> {
         self.push_inner(input, None, true)
     }
-    pub(super) fn push_fields(self, input: &str, fields: JsonFieldNames<'_>) -> Result<(Self, usize, bool), OriginalJsonObjectError> {
+    pub(super) fn push_fields(
+        self,
+        input: &str,
+        fields: JsonFieldNames<'_>,
+    ) -> Result<(Self, usize, bool), OriginalJsonObjectError> {
         self.push_inner(input, Some(fields), false)
     }
-    fn push_inner(mut self, input: &str, fields: Option<JsonFieldNames<'_>>, validate_object: bool) -> Result<(Self, usize, bool), OriginalJsonObjectError> {
+    fn push_inner(
+        mut self,
+        input: &str,
+        fields: Option<JsonFieldNames<'_>>,
+        validate_object: bool,
+    ) -> Result<(Self, usize, bool), OriginalJsonObjectError> {
         let result = (|| {
             self.data
                 .funding
                 .reserve_metadata(Self::controls().ok_or(Cause::Overflow)?)?;
             let (consumed, complete) = if let Some(fields) = fields {
-                self.cursor.push(input, &mut FieldContext { data: &mut self.data, fields })?
-            } else { self.cursor.push(input, &mut self.data)? };
+                self.cursor.push(
+                    input,
+                    &mut FieldContext {
+                        data: &mut self.data,
+                        fields,
+                    },
+                )?
+            } else {
+                self.cursor.push(input, &mut self.data)?
+            };
             if validate_object && complete && !self.complete {
                 let value =
                     OriginalJsonValue::parse(self.data.source().trim(), &self.data.funding)?;
@@ -266,13 +312,20 @@ impl OriginalJsonObject {
     }
     pub(super) fn finish_object(mut self) -> Result<Self, OriginalJsonObjectError> {
         let result = (|| {
-            self.data.funding.reserve_metadata(Self::controls().ok_or(Cause::Overflow)?)?;
+            self.data
+                .funding
+                .reserve_metadata(Self::controls().ok_or(Cause::Overflow)?)?;
             let value = OriginalJsonValue::parse(self.data.source().trim(), &self.data.funding)?;
-            if value.kind() != OriginalJsonValueKind::Object { return Err(Cause::Source); }
+            if value.kind() != OriginalJsonValueKind::Object {
+                return Err(Cause::Source);
+            }
             self.complete = true;
             Ok::<_, Cause>(())
         })();
-        match result { Ok(()) => Ok(self), Err(cause) => Err(self.fail(cause)) }
+        match result {
+            Ok(()) => Ok(self),
+            Err(cause) => Err(self.fail(cause)),
+        }
     }
     /// Exact raw spelling retained by the same mutable parser owner.
     pub fn source(&self) -> &str {
@@ -292,36 +345,66 @@ impl OriginalJsonObject {
         Some((&self.data.fields.get(*key)?.key, &self.source()[raw]))
     }
     pub(super) fn copy_bytes(&self) -> Option<usize> {
-        Self::controls()?.checked_add(Self::buffer_bytes::<u8>(self.data.raw.capacity())?)?
-            .checked_add(Self::buffer_bytes::<OriginalJsonField>(self.data.fields.capacity())?)
+        Self::controls()?
+            .checked_add(Self::buffer_bytes::<u8>(self.data.raw.capacity())?)?
+            .checked_add(Self::buffer_bytes::<OriginalJsonField>(
+                self.data.fields.capacity(),
+            )?)
     }
     /// Copies fixed destinations under new funding. Existing immutable decoded
     /// text aliases retain their original account as well as the new copy owner.
-    pub fn try_copy(
-        &self,
-        funding: &HostMetadataFunding,
-    ) -> Result<Self, OriginalJsonObjectError> {
-        let bytes = self.copy_bytes().ok_or_else(|| OriginalJsonObjectError { cause: Cause::Overflow, prefix: None, funding: funding.clone() })?;
-        funding.reserve_metadata(bytes).map_err(|cause| OriginalJsonObjectError { cause: cause.into(), prefix: None, funding: funding.clone() })?;
+    pub fn try_copy(&self, funding: &HostMetadataFunding) -> Result<Self, OriginalJsonObjectError> {
+        let bytes = self.copy_bytes().ok_or_else(|| OriginalJsonObjectError {
+            cause: Cause::Overflow,
+            prefix: None,
+            funding: funding.clone(),
+        })?;
+        funding
+            .reserve_metadata(bytes)
+            .map_err(|cause| OriginalJsonObjectError {
+                cause: cause.into(),
+                prefix: None,
+                funding: funding.clone(),
+            })?;
         self.copy_prepaid(HostPreparationAuthority::retain(funding.clone()), funding)
     }
     pub(super) fn rebind_funding(&mut self, funding: &HostMetadataFunding) {
         self.data.funding = funding.clone();
     }
     /// Same fixed-destination copy worker after its owner has prepaid copy_bytes.
-    pub(super) fn copy_prepaid(&self, host: HostPreparationAuthority, funding: &HostMetadataFunding) -> Result<Self, OriginalJsonObjectError> {
+    pub(super) fn copy_prepaid(
+        &self,
+        host: HostPreparationAuthority,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, OriginalJsonObjectError> {
         let mut copy = Self {
-            cursor: self.cursor.clone(), complete: self.complete,
-            data: Data { raw: SpeculativeBuffer::default(), fields: SpeculativeBuffer::default(), funding: funding.clone() },
+            cursor: self.cursor.clone(),
+            complete: self.complete,
+            data: Data {
+                raw: SpeculativeBuffer::default(),
+                fields: SpeculativeBuffer::default(),
+                funding: funding.clone(),
+            },
         };
         let result = (|| {
-            copy.data.raw = SpeculativeBuffer::try_new_retained(self.data.raw.capacity(), host.clone())?;
-            copy.data.fields = SpeculativeBuffer::try_new_retained(self.data.fields.capacity(), host)?;
-            copy.data.raw.try_extend(self.data.raw.iter().copied()).map_err(|_| Cause::Capacity)?;
-            copy.data.fields.try_extend(self.data.fields.iter().cloned()).map_err(|_| Cause::Capacity)?;
+            copy.data.raw =
+                SpeculativeBuffer::try_new_retained(self.data.raw.capacity(), host.clone())?;
+            copy.data.fields =
+                SpeculativeBuffer::try_new_retained(self.data.fields.capacity(), host)?;
+            copy.data
+                .raw
+                .try_extend(self.data.raw.iter().copied())
+                .map_err(|_| Cause::Capacity)?;
+            copy.data
+                .fields
+                .try_extend(self.data.fields.iter().cloned())
+                .map_err(|_| Cause::Capacity)?;
             Ok::<_, Cause>(())
         })();
-        match result { Ok(()) => Ok(copy), Err(cause) => Err(copy.fail(cause)) }
+        match result {
+            Ok(()) => Ok(copy),
+            Err(cause) => Err(copy.fail(cause)),
+        }
     }
 }
 
@@ -330,8 +413,8 @@ mod tests {
     use super::*;
     use eredu_nn::workspace::HostMetadataAccount;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
     #[derive(Debug)]
     struct Account {
@@ -394,7 +477,7 @@ mod tests {
                     OriginalJsonNumber::I64(value) => Value::from(value),
                     OriginalJsonNumber::U64(value) => Value::from(value),
                     OriginalJsonNumber::F64(value) => Value::from(value),
-                    OriginalJsonNumber::Exact(value)=>Value::Number(value.clone()),
+                    OriginalJsonNumber::Exact(value) => Value::Number(value.clone()),
                 },
                 OriginalJsonValueKind::Bool => Value::Bool(node.boolean().unwrap()),
                 OriginalJsonValueKind::Null => Value::Null,
@@ -414,8 +497,13 @@ mod tests {
                 .unwrap()
                 .map(|(key, _)| key.unwrap())
                 .collect::<Vec<_>>(),
-            serde_json::from_str::<serde_json::Value>(tree_input).unwrap()
-                .as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>()
+            serde_json::from_str::<serde_json::Value>(tree_input)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
         );
         assert_eq!(tree.root().get("a").unwrap().string(), Some("last"));
         assert_eq!(tree.root().get("z").unwrap().children().unwrap().len(), 4);

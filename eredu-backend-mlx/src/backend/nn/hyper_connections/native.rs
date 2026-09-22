@@ -172,6 +172,28 @@ impl Worker for Native<'_> {
 }
 
 pub(crate) fn control_bytes(handles: usize, aliases: usize) -> Option<usize> {
+    let original = [
+        Exception::retained_source_control_bytes::<Refusal<Validation>>()?,
+        Exception::retained_source_control_bytes::<
+            Refusal<crate::backend::array_copy::CaptureTensorNativeError>,
+        >()?,
+        OriginalScopeObserver::control_bytes()?,
+        PreparedArrayClone::control_bytes()?
+            .checked_add(Array::inspection_clone_handle_bytes())?
+            .checked_mul(aliases)?,
+        Array::as_dtype_control_bytes()?,
+        Stream::device_type_control_bytes()?,
+    ];
+    original.into_iter().try_fold(
+        ordinary_control_bytes(handles)?.checked_add(size_of_val(&original))?,
+        usize::checked_add,
+    )
+}
+
+/// Fixed shared equation transports, with no Original clone/observer owners.
+/// Actual safe call wrappers and aliases are counted by the same Worker
+/// traversal; rank-four selection keeps both SmallVec shapes inline.
+pub(crate) fn ordinary_control_bytes(handles: usize) -> Option<usize> {
     let frames = [
         size_of::<Native<'_>>(),
         std::alloc::Layout::array::<(Array, Result<Array, Exception>)>(handles)
@@ -204,16 +226,6 @@ pub(crate) fn control_bytes(handles: usize, aliases: usize) -> Option<usize> {
         size_of::<Result<eredu_nn::HyperConnectionState<crate::MlxTensor>, eredu_nn::Error>>(),
         size_of::<Result<crate::MlxTensor, eredu_nn::Error>>(),
         eredu_nn::Error::retained_source_construction_bytes::<Exception>()?,
-        Exception::retained_source_control_bytes::<Refusal<Validation>>()?,
-        Exception::retained_source_control_bytes::<
-            Refusal<crate::backend::array_copy::CaptureTensorNativeError>,
-        >()?,
-        OriginalScopeObserver::control_bytes()?,
-        PreparedArrayClone::control_bytes()?
-            .checked_add(Array::inspection_clone_handle_bytes())?
-            .checked_mul(aliases)?,
-        Array::as_dtype_control_bytes()?,
-        Stream::device_type_control_bytes()?,
     ];
     frames
         .into_iter()

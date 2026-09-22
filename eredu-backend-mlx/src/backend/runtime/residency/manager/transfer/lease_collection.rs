@@ -18,7 +18,7 @@ struct LeaseReturnPayload {
     next: usize,
     // OrdinaryRetirement unboxes before destroying this payload. Custody is
     // last, after the final Vec/String and native storage owners are gone.
-    _custody: OriginalOperationMetadataCustody,
+    _custody: ResidencyControlCustody,
 }
 
 pub(in crate::backend::runtime::residency::manager) struct PreparedLeaseCollection {
@@ -69,6 +69,16 @@ impl PreparedLeaseCollection {
         tier: MemoryTier,
         custody: OriginalOperationMetadataCustody,
     ) -> Result<Self, LeasePreparationError> {
+        Self::try_new_with_custody(manager, roots, shape, tier, custody.into())
+    }
+
+    pub(in crate::backend::runtime::residency::manager) fn try_new_with_custody(
+        manager: &ResidencyManager,
+        roots: &[OffloadUnitId],
+        shape: TransferPayloadShape,
+        tier: MemoryTier,
+        custody: ResidencyControlCustody,
+    ) -> Result<Self, LeasePreparationError> {
         let mut ready = Self {
             payload: OrdinaryRetirement::new(LeaseReturnPayload {
                 leases: Vec::new(),
@@ -84,7 +94,9 @@ impl PreparedLeaseCollection {
                 .iter()
                 .try_fold(0usize, |sum, id| sum.checked_add(id.as_str().len()));
             if !matches!(tier, MemoryTier::Host | MemoryTier::Device)
-                || roots.len() != shape.leases || bytes != Some(shape.lease_id_bytes) {
+                || roots.len() != shape.leases
+                || bytes != Some(shape.lease_id_bytes)
+            {
                 return Err(LeasePreparationCause::Source(
                     NamedArrayError::InvalidSource,
                 ));
@@ -132,8 +144,15 @@ impl PreparedLeaseCollection {
         // additional phase-change, iterator and borrowed-ID return transports.
         let bytes = [
             size_of::<LeaseIds>(),
+            size_of::<ResidencyControlCustody>(),
             size_of::<MemoryTier>(),
-            size_of::<(&ResidencyManager, &[OffloadUnitId], TransferPayloadShape, MemoryTier, OriginalOperationMetadataCustody)>(),
+            size_of::<(
+                &ResidencyManager,
+                &[OffloadUnitId],
+                TransferPayloadShape,
+                MemoryTier,
+                OriginalOperationMetadataCustody,
+            )>(),
             size_of::<Vec<OffloadUnitId>>(),
             size_of::<std::vec::IntoIter<OffloadUnitId>>(),
             size_of::<&[OffloadUnitId]>(),

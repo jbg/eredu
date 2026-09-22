@@ -2,21 +2,20 @@
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 mod metal {
     use eredu_runtime::working_memory::{
-        InitializedSharedNative, SharedNativeInitializationCustody,
+        InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
         SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-        WorkingMemoryPool,
     };
     use safemlx::fast::{
         BorrowedKernelOutput, BorrowedKernelTemplate, KernelDefinitionCause, KernelDefinitionError,
         KernelInputClass, KernelInputSignature, KernelSpecialization, MetalKernelDefinitionPlan,
         MetalKernelFamilyPlan, PreparedMetalKernelFamily,
     };
-    use safemlx::{Array, Dtype, OriginalScopeObserver, Stream, error::Exception};
+    use safemlx::{error::Exception, Array, Dtype, OriginalScopeObserver, Stream};
     use std::{
         mem::size_of,
         sync::{
-            OnceLock,
             atomic::{AtomicBool, Ordering},
+            OnceLock,
         },
     };
 
@@ -222,8 +221,8 @@ mod metal {
         #[error("BF16 projection initialization is busy")]
         Busy,
     }
-    pub(crate) fn prepare_admitted(pool: &WorkingMemoryPool) -> Result<(), MlxBf16ProjectionError> {
-        if !pool.same_domain(&super::super::domain()) {
+    pub(crate) fn prepare_admitted(pool: &MemoryLedger) -> Result<(), MlxBf16ProjectionError> {
+        if !pool.same_ledger(&super::super::ledger()) {
             return Err(MlxBf16ProjectionError::Policy(
                 WorkingMemoryError::IdentityMismatch,
             ));

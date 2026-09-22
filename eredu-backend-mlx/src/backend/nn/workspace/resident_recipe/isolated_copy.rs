@@ -1,5 +1,5 @@
 //! Native populations of the shared contiguous-then-eager-copy program.
-use super::{ResidentDispatchPopulation, graph_capacity::ResidentGraphStorage};
+use super::{graph_capacity::ResidentGraphStorage, ResidentDispatchPopulation};
 use safemlx::{
     OperationEvalTraversalLayout, OperationEvalTraversalLimits, OperationEvent,
     ResidentGraphLayout, SubmissionGraphQuota, SubmissionRecordQuota,
@@ -8,7 +8,11 @@ use safemlx::{
 #[derive(Clone, Copy)]
 enum CpuCopyProgram {
     Arrays,
-    Pending { rank: usize, elements: usize, cast: bool },
+    Pending {
+        rank: usize,
+        elements: usize,
+        cast: bool,
+    },
 }
 
 /// No source or admission authority is created by these derived populations.
@@ -29,31 +33,82 @@ impl IsolatedCopyNativeLayout {
     /// Same array-only copy program on an authenticated CPU execution stream.
     /// Host transfers and pending cast/reshape tails retain their own selection.
     pub(crate) fn cpu(operands: usize, source_clones: usize, rank: usize) -> Option<Self> {
-        if operands == 0 { return None; }
-        Self::inspect_program(Some(CpuCopyProgram::Arrays), operands, source_clones, rank, 0, 0, 0, 0, 0)
+        if operands == 0 {
+            return None;
+        }
+        Self::inspect_program(
+            Some(CpuCopyProgram::Arrays),
+            operands,
+            source_clones,
+            rank,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
     }
 
     /// Completed media adds no pending producer. An empty state/key source has
     /// zero copy/completion attempts; retained descriptor shells remain exact.
-    pub(crate) fn cpu_completed(operands:usize,source_clones:usize,rank:usize)->Option<Self> {
-        Self::inspect_program(Some(CpuCopyProgram::Arrays),operands,source_clones,rank,0,0,0,0,0)
+    pub(crate) fn cpu_completed(
+        operands: usize,
+        source_clones: usize,
+        rank: usize,
+    ) -> Option<Self> {
+        Self::inspect_program(
+            Some(CpuCopyProgram::Arrays),
+            operands,
+            source_clones,
+            rank,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
     }
 
     /// The same completed isolate followed by the pending worker's actual
     /// reshape and optional signed cast. Complete matrices already have their
     /// target shape, so the ordinary reshape call returns the input directly.
     pub(crate) fn cpu_pending_input(rank: usize, elements: usize, cast: bool) -> Option<Self> {
-        Self::cpu_resume(1,1,rank,rank,elements,cast)
+        Self::cpu_resume(1, 1, rank, rank, elements, cast)
     }
 
     /// The existing repeated decoder/key isolate worker plus one final pending
     /// input frontier. Its own rank is distinct from the largest state operand.
-    pub(crate) fn cpu_resume(operands:usize,source_clones:usize,maximum_rank:usize,
-        pending_rank:usize,elements:usize,cast:bool)->Option<Self> {
-        if operands==0||source_clones==0||pending_rank>maximum_rank
-            ||elements==0||(pending_rank!=2&&elements!=1){return None;}
-        Self::inspect_program(Some(CpuCopyProgram::Pending{rank:pending_rank,elements,cast}),
-            operands,source_clones,maximum_rank,1+usize::from(cast),0,0,0,0)
+    pub(crate) fn cpu_resume(
+        operands: usize,
+        source_clones: usize,
+        maximum_rank: usize,
+        pending_rank: usize,
+        elements: usize,
+        cast: bool,
+    ) -> Option<Self> {
+        if operands == 0
+            || source_clones == 0
+            || pending_rank > maximum_rank
+            || elements == 0
+            || (pending_rank != 2 && elements != 1)
+        {
+            return None;
+        }
+        Self::inspect_program(
+            Some(CpuCopyProgram::Pending {
+                rank: pending_rank,
+                elements,
+                cast,
+            }),
+            operands,
+            source_clones,
+            maximum_rank,
+            1 + usize::from(cast),
+            0,
+            0,
+            0,
+            0,
+        )
     }
 
     pub(crate) fn inspect(operands: usize, source_clones: usize, rank: usize) -> Option<Self> {
@@ -73,7 +128,8 @@ impl IsolatedCopyNativeLayout {
         rank: usize,
         cast: bool,
     ) -> Option<Self> {
-        Self::inspect_program(None, 
+        Self::inspect_program(
+            None,
             operands,
             source_clones,
             rank,
@@ -100,7 +156,8 @@ impl IsolatedCopyNativeLayout {
         if host_loads > operands {
             return None;
         }
-        Self::inspect_program(None, 
+        Self::inspect_program(
+            None,
             operands,
             source_clones,
             rank,
@@ -127,7 +184,8 @@ impl IsolatedCopyNativeLayout {
         if loads > operands || stores > operands {
             return None;
         }
-        Self::inspect_program(None, 
+        Self::inspect_program(
+            None,
             operands,
             source_clones,
             rank,
@@ -175,7 +233,9 @@ impl IsolatedCopyNativeLayout {
         // MLX creates no Reshape primitive. Keep that shell separate from Eval.
         let tail_primitives = if let Some(CpuCopyProgram::Pending { rank, cast, .. }) = cpu {
             usize::from(rank != 2).checked_add(usize::from(cast))?
-        } else { pending_tail };
+        } else {
+            pending_tail
+        };
         let primitives = operands
             .checked_add(tail_primitives)?
             .checked_add(host_loads)?
@@ -223,17 +283,26 @@ impl IsolatedCopyNativeLayout {
         let mut tail = ResidentGraphStorage::default();
         let mut repeated = completion_attempts;
         let (kernel_attempts, worker_controls) = if let Some(cpu) = cpu {
-            if host_loads != 0 || host_stores != 0 { return None; }
+            if host_loads != 0 || host_stores != 0 {
+                return None;
+            }
             // Every occurrence uses the same installed traversal ceiling, but
             // the already-completed isolate is a leaf of the second frontier.
             one.include_cpu_copy_eval(traversal, source_rank)?;
-            let tail_controls = if let CpuCopyProgram::Pending { rank, elements, cast } = cpu {
+            let tail_controls = if let CpuCopyProgram::Pending {
+                rank,
+                elements,
+                cast,
+            } = cpu
+            {
                 tail.include_cpu_pending_eval(traversal, rank, elements, cast)?;
                 tail.add(OperationEvent::root_storage_layout(1)?.graph_request_extent())?;
                 repeated = operands;
                 usize::try_from(tail.control_bytes()?).ok()?
             } else {
-                if has_pending { return None; }
+                if has_pending {
+                    return None;
+                }
                 0
             };
             (0, tail_controls)
@@ -281,9 +350,19 @@ impl IsolatedCopyNativeLayout {
         let record_capacity = SubmissionRecordQuota::fresh_capacity_for_extents(record_extents)?;
         let parts = [
             host_controls,
-            std::mem::size_of::<(Option<CpuCopyProgram>, usize, usize, usize, usize, usize, usize, usize, usize)>(),
+            std::mem::size_of::<(
+                Option<CpuCopyProgram>,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+            )>(),
             std::mem::size_of::<CpuCopyProgram>(),
-            std::mem::size_of::<(usize,usize,usize,usize,usize,bool)>(),
+            std::mem::size_of::<(usize, usize, usize, usize, usize, bool)>(),
             std::mem::size_of::<Option<Self>>(),
             std::mem::size_of::<ResidentGraphStorage>(),
             std::mem::size_of::<usize>() * 4,
@@ -326,16 +405,23 @@ impl IsolatedCopyNativeLayout {
     }
 }
 
-
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod tests {
     use super::*;
 
     #[test]
     fn cpu_pending_input_prices_each_completed_frontier_without_duplicate_copy_workers() {
         for (rank, elements, cast, entries, primitives) in [
-            (0, 1, true, 3, 3), (1, 1, false, 2, 2),
-            (2, 7, true, 2, 2), (2, 7, false, 2, 1),
+            (0, 1, true, 3, 3),
+            (1, 1, false, 2, 2),
+            (2, 7, true, 2, 2),
+            (2, 7, false, 2, 1),
+            (6, 1, true, 3, 3),
         ] {
             let layout = IsolatedCopyNativeLayout::cpu_pending_input(rank, elements, cast).unwrap();
             assert_eq!(layout.completion_attempts, 2);
@@ -349,22 +435,30 @@ mod tests {
         }
         assert!(IsolatedCopyNativeLayout::cpu_pending_input(1, 7, true).is_none());
         assert!(IsolatedCopyNativeLayout::cpu_pending_input(2, 0, false).is_none());
-        assert!(IsolatedCopyNativeLayout::cpu_pending_input(6, 1, true).is_none());
+        assert!(IsolatedCopyNativeLayout::cpu_pending_input(6, 7, true).is_none());
     }
 }
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 #[test]
 fn cpu_saved_resume_keeps_pending_rank_separate_from_state_copy_rank() {
-    for (rank,elements,cast,primitives,entries) in [(2,7,false,6,2),(2,7,true,7,2),(0,1,true,8,3)] {
-        let layout=IsolatedCopyNativeLayout::cpu_resume(6,8,5,rank,elements,cast).unwrap();
-        assert_eq!(layout.graph.primitives(),primitives);
-        assert_eq!(layout.traversal.limits().tape_entries,entries);
-        assert_eq!(layout.completion_attempts,7);assert_eq!(layout.kernel_attempts,0);
-        let base=IsolatedCopyNativeLayout::cpu(6,8,5).unwrap();
-        assert!(layout.record_extents>base.record_extents);
-        assert!(layout.graph_extents>base.graph_extents);
+    for (rank, elements, cast, primitives, entries) in
+        [(2, 7, false, 6, 2), (2, 7, true, 7, 2), (0, 1, true, 8, 3)]
+    {
+        let layout = IsolatedCopyNativeLayout::cpu_resume(6, 8, 5, rank, elements, cast).unwrap();
+        assert_eq!(layout.graph.primitives(), primitives);
+        assert_eq!(layout.traversal.limits().tape_entries, entries);
+        assert_eq!(layout.completion_attempts, 7);
+        assert_eq!(layout.kernel_attempts, 0);
+        let base = IsolatedCopyNativeLayout::cpu(6, 8, 5).unwrap();
+        assert!(layout.record_extents > base.record_extents);
+        assert!(layout.graph_extents > base.graph_extents);
     }
-    assert!(IsolatedCopyNativeLayout::cpu_resume(6,8,1,2,7,true).is_none());
-    assert!(IsolatedCopyNativeLayout::cpu_resume(6,8,5,0,7,true).is_none());
+    assert!(IsolatedCopyNativeLayout::cpu_resume(6, 8, 1, 2, 7, true).is_none());
+    assert!(IsolatedCopyNativeLayout::cpu_resume(6, 8, 5, 0, 7, true).is_none());
 }

@@ -9,10 +9,10 @@ impl PagedKeyValueCache {
     /// every actual manager, page, invocation and native completion. The byte
     /// class only screens unsupported storage widths; it never selects F16
     /// versus BF16 for an empty cache or overrides any actual native dtype.
-    /// A declared fixed companion does not change the paged KV mechanism:
-    /// complete hybrid projection separately authenticates every actual fixed
-    /// role, dtype, extent and backing through the shared fixed-state worker.
-    /// Stable Host and own-writer Disk sources use the closed saved-copy and
+    /// Fixed companions and fixed-only sibling layers do not change the paged
+    /// KV mechanism: complete hybrid projection separately authenticates every
+    /// actual fixed role, dtype, extent and backing through the shared worker.
+    /// Stable Host and authenticated Disk sources use the closed saved-copy and
     /// retained-resume workers. Actual source phases, finite I/O destinations,
     /// source-backed roles and copy/completion custody remain mandatory.
     pub(crate) fn original_residency_supported(
@@ -52,20 +52,26 @@ impl PagedKeyValueCache {
             CacheResidencyPolicy::Paged(options) => {
                 matches!(floating_bytes.get(), 2 | 4)
                     && original_options_supported(options, host)
-                    && layout
-                        .iter()
-                        .any(|layer| matches!(layer, LayerCachePolicy::KeyValue { .. }
-                            | LayerCachePolicy::KeyValueWithFixedState { .. }))
+                    && layout.iter().any(|layer| {
+                        matches!(
+                            layer,
+                            LayerCachePolicy::KeyValue { .. }
+                                | LayerCachePolicy::KeyValueWithFixedState { .. }
+                        )
+                    })
                     && layout.iter().all(|layer| {
                         matches!(
                             layer,
                             LayerCachePolicy::NoState
+                                | LayerCachePolicy::FixedState { .. }
                                 | LayerCachePolicy::KeyValue {
-                                    attention: AttentionPolicy::Full | AttentionPolicy::Sliding { .. },
+                                    attention: AttentionPolicy::Full
+                                        | AttentionPolicy::Sliding { .. },
                                     ..
                                 }
                                 | LayerCachePolicy::KeyValueWithFixedState {
-                                    attention: AttentionPolicy::Full | AttentionPolicy::Sliding { .. },
+                                    attention: AttentionPolicy::Full
+                                        | AttentionPolicy::Sliding { .. },
                                     ..
                                 }
                         )

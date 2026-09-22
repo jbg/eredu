@@ -168,9 +168,7 @@ pub(in crate::api::control) fn intervention_request(
         CapturePlanCopyError::Allocation(_) | CapturePlanCopyError::Capacity => {
             RecordConstructionCause::HostAllocation
         }
-        CapturePlanCopyError::Capability | CapturePlanCopyError::Identity => {
-            RecordConstructionCause::Attribution
-        }
+        CapturePlanCopyError::Identity => RecordConstructionCause::Attribution,
     };
     controls(
         funding,

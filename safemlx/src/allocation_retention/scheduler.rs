@@ -93,7 +93,11 @@ impl<T> fmt::Display for SchedulerError<T> {
         self.cause.fmt(f)
     }
 }
-impl<T> std::error::Error for SchedulerError<T> {}
+impl<T> std::error::Error for SchedulerError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 /// Fixed module and existing first-caller identity storage, priced once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

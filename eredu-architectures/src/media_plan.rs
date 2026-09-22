@@ -11,7 +11,7 @@ use eredu_core::{
 use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedModelInput};
 
 pub(crate) mod admission;
-mod original;
+pub(crate) mod original;
 pub(crate) mod qwen;
 pub use original::{
     validate_selected_part, BoundPreparedMediaSemantics, OriginalPreparedMediaSemantics,
@@ -106,8 +106,10 @@ fn inspect_part<Tensor>(
 ) -> Result<MediaAdmissionInput, CapabilityError> {
     admission::inspect_shared(
         input,
-        |part| part.descriptor(&|tensor| inspector.identity(tensor))
-            .map_err(|error| CapabilityError::Observation(error.to_string())),
+        |part| {
+            part.descriptor(&|tensor| inspector.identity(tensor))
+                .map_err(|error| CapabilityError::Observation(error.to_string()))
+        },
         u64_shape,
         |tensor| inspector.i32_values(tensor),
         |tensor| inspector.bool_values(tensor),
@@ -523,7 +525,9 @@ where
     let identity = PreparedInputIdentity::new(descriptors)
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
     admission::complete_shared(
-        input, identity, &mut admit_part,
+        input,
+        identity,
+        &mut admit_part,
         |count| Ok(Vec::with_capacity(count)),
         admission::Rejection::ordinary,
     )
@@ -720,11 +724,8 @@ pub fn qwen_vl_input_part<Tensor>(
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenVlInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
-    let view = qwen::qwen_part(
-        admission::vl_policy(args),
-        inspected.qwen_ref(),
-    )
-    .map_err(|error| error.legacy(&args.model_type))?;
+    let view = qwen::qwen_part(admission::vl_policy(args), inspected.qwen_ref())
+        .map_err(|error| error.legacy(&args.model_type))?;
     admission::vl_plan(view, |rows| {
         Ok(rows.iter().map(|row| (row[0], row[1], row[2])).collect())
     })
@@ -806,19 +807,51 @@ pub fn gemma4_input_part<Tensor>(
 }
 
 #[cfg(test)]
-fn gemma_valid_patch_count(positions: &MetadataValues<i32>, architecture: &str) -> Result<u64, CapabilityError> {
-    admission::gemma::raw::gemma_valid_patch_count(positions, architecture, admission::inkling::Ordinary)
+fn gemma_valid_patch_count(
+    positions: &MetadataValues<i32>,
+    architecture: &str,
+) -> Result<u64, CapabilityError> {
+    admission::gemma::raw::gemma_valid_patch_count(
+        positions,
+        architecture,
+        admission::inkling::Ordinary,
+    )
 }
 #[cfg(test)]
-fn gemma_vision(config: &crate::gemma4::VisionConfig, text_hidden: u64, input: &MediaAdmissionInput, architecture: &str) -> Result<MediaShapePlan, CapabilityError> {
-    admission::gemma::raw::gemma_vision(config, text_hidden, input, architecture, admission::inkling::Ordinary)
+fn gemma_vision(
+    config: &crate::gemma4::VisionConfig,
+    text_hidden: u64,
+    input: &MediaAdmissionInput,
+    architecture: &str,
+) -> Result<MediaShapePlan, CapabilityError> {
+    admission::gemma::raw::gemma_vision(
+        config,
+        text_hidden,
+        input,
+        architecture,
+        admission::inkling::Ordinary,
+    )
 }
 #[cfg(test)]
-fn gemma_audio(config: &crate::gemma4::AudioConfig, text_hidden: u64, input: &MediaAdmissionInput, architecture: &str) -> Result<MediaShapePlan, CapabilityError> {
-    admission::gemma::raw::gemma_audio(config, text_hidden, input, architecture, admission::inkling::Ordinary)
+fn gemma_audio(
+    config: &crate::gemma4::AudioConfig,
+    text_hidden: u64,
+    input: &MediaAdmissionInput,
+    architecture: &str,
+) -> Result<MediaShapePlan, CapabilityError> {
+    admission::gemma::raw::gemma_audio(
+        config,
+        text_hidden,
+        input,
+        architecture,
+        admission::inkling::Ordinary,
+    )
 }
 /// Derives prepared Gemma 4 media geometry from normalized family policy.
-fn gemma4(args: &crate::gemma4::FamilyConfig, input: &MediaAdmissionInput) -> Result<MediaShapePlan, CapabilityError> {
+fn gemma4(
+    args: &crate::gemma4::FamilyConfig,
+    input: &MediaAdmissionInput,
+) -> Result<MediaShapePlan, CapabilityError> {
     admission::gemma::raw::gemma4(args, input, admission::inkling::Ordinary)
 }
 
@@ -846,99 +879,11 @@ fn muse_glimmer(
     args: &crate::muse_glimmer::DecoderConfig,
     input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    if input.modality() == InputModality::Audio
-        || (input.modality() == InputModality::Video
-            && args.weight_convention == crate::muse_glimmer::WeightConvention::Gguf)
-    {
-        return Err(unsupported(
-            &args.model_type,
-            format!(
-                "loaded Muse-Glimmer artifact does not support {}",
-                input.modality().as_str()
-            ),
-        ));
-    }
-    let vision = args.vision_config.as_ref().ok_or_else(|| {
-        unsupported(
-            &args.model_type,
-            "loaded Muse-Glimmer artifact has no vision projector",
-        )
-    })?;
-    let grid = input.patch_grid.as_ref().ok_or_else(|| {
-        unsupported(
-            &args.model_type,
-            "Muse-Glimmer media requires patch_grid metadata",
-        )
-    })?;
-    if grid.shape.len() != 2 || grid.shape[0] == 0 || grid.shape[1] != 3 {
-        return Err(unsupported(
-            &args.model_type,
-            format!(
-                "Muse-Glimmer patch_grid must be [items, 3], got {:?}",
-                grid.shape
-            ),
-        ));
-    }
-    let expected_values = checked_mul(grid.shape[0], 3, "Muse patch-grid scalar count")?;
-    if u64::try_from(grid.values.len()).ok() != Some(expected_values) {
-        return Err(unsupported(
-            &args.model_type,
-            "Muse-Glimmer patch_grid has an incomplete row",
-        ));
-    }
-    let merge = nonzero_positive(vision.merge_size, "Muse vision merge size")?;
-    let mut patches = 0u64;
-    let mut positions = 0u64;
-    for entry in grid.values.as_chunks::<3>().0 {
-        if entry.iter().any(|value| *value <= 0)
-            || u64::try_from(entry[1]).unwrap_or_default() % merge != 0
-            || u64::try_from(entry[2]).unwrap_or_default() % merge != 0
-        {
-            return Err(unsupported(
-                &args.model_type,
-                "Muse-Glimmer vision grids must be positive and merge-divisible",
-            ));
-        }
-        let t = entry[0] as u64;
-        let h = entry[1] as u64;
-        let w = entry[2] as u64;
-        patches = checked_add(
-            patches,
-            checked_mul(
-                checked_mul(t, h, "Muse vision t*h")?,
-                w,
-                "Muse vision patches",
-            )?,
-            "Muse vision patch total",
-        )?;
-        positions = checked_add(
-            positions,
-            checked_mul(
-                checked_mul(t, h / merge, "Muse merged t*h")?,
-                w / merge,
-                "Muse merged positions",
-            )?,
-            "Muse merged position total",
-        )?;
-    }
-    if input.payload_shape.first().copied() != Some(patches) {
-        return Err(unsupported(
-            &args.model_type,
-            format!(
-                "Muse-Glimmer payload has {} patches but metadata describes {patches}",
-                input.payload_shape.first().copied().unwrap_or_default()
-            ),
-        ));
-    }
-    let graph = checked_mul(
-        patches,
-        positive(vision.hidden_size, "Muse vision hidden size")?,
-        "Muse vision activation scalars",
-    )?;
-    Ok(MediaShapePlan {
-        decoder_positions: positions,
-        execution_workspace_scalars: checked_mul(graph, 8, "Muse vision graph multiplier")?,
-    })
+    admission::muse::media(
+        args,
+        admission::gemma::view::Input::legacy(input),
+        admission::inkling::Ordinary,
+    )
 }
 
 /// Validates one prepared Muse-Glimmer part and derives the exact placeholder,
@@ -2081,7 +2026,7 @@ mod original_semantic_kernel_tests {
     use eredu_runtime::input::host::{
         HostInputPart, HostTensorValues, HostTensorView, PreparedHostInputPlan,
     };
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     fn raw(policy: qwen::QwenPolicy<'_>, modality: InputModality, grid: &[i32]) {
         let vision = policy.vision.unwrap();
         let width = (vision.in_channels
@@ -2114,7 +2059,7 @@ mod original_semantic_kernel_tests {
             metadata: &metadata,
             extents: &[],
         }];
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let source = pool
             .compile_prepared_host_input(PreparedHostInputPlan::prepare(&parts).unwrap())
             .unwrap();
@@ -2289,7 +2234,7 @@ mod original_semantic_kernel_tests {
             metadata: &metadata,
             extents: &[],
         }];
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let source = pool
             .compile_prepared_host_input(PreparedHostInputPlan::prepare(&raw).unwrap())
             .unwrap();

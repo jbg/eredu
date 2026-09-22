@@ -10,17 +10,18 @@ use crate::working_memory::storage::bounded_publication::{
 use crate::working_memory::storage::capture_publication::{
     CapturePlanStorageKey, PreparedCapturePlanPublication, PublicationLayout,
 };
-use crate::working_memory::{WorkingMemoryFundingScope, WorkingMemoryPool};
+use crate::working_memory::{MemoryLedger, WorkingMemoryFundingScope};
 use eredu_core::capture::SharedCapturePlan;
 mod capture_publication;
 mod graph_metadata;
 mod host_destinations;
 mod native_storage;
 pub use host_destinations::{
-    HostDestinationCause, HostDestinationFacts, HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError,
-    OriginalHostDestinationBank, OriginalHostMetadataCustody, OriginalHostMetadataVec,
-    OriginalHostSourceBank, OriginalHostSourceConstruction, OriginalHostSourceError,
-    OriginalHostSourceFailure, OriginalHostSourceFailureCause, OriginalHostSourceReceipt,
+    HostDestinationCause, HostDestinationFacts, HostSourceConstructionFacts,
+    HostSourceConstructionProgram, OriginalHostDestinationBank, OriginalHostMetadataCustody,
+    OriginalHostMetadataVec, OriginalHostSourceBank, OriginalHostSourceConstruction,
+    OriginalHostSourceError, OriginalHostSourceFailure, OriginalHostSourceFailureCause,
+    OriginalHostSourceProgramBanks, OriginalHostSourceProgramError, OriginalHostSourceReceipt,
     OriginalHostSourceRefusal, OriginalHostVec, OriginalHostVecError,
 };
 pub use host_destinations::{
@@ -46,12 +47,12 @@ pub use tracking::{OriginalSubmissionTracking, SubmissionTrackingFacts};
 mod prefill_capture;
 mod preparation;
 mod sampling_extension;
-pub use sampling_extension::{SamplingExtensionQuote, OriginalTextSamplingExtension};
 pub use prediction::{
     OriginalPredictionNativeCustody, OriginalPredictionRecoveryCustody,
     OriginalPredictionScopeRole, OriginalTextPredictionScopeSet, OriginalTextPredictionScopes,
     TextPredictionScopeFacts,
 };
+pub use sampling_extension::{OriginalTextSamplingExtension, SamplingExtensionQuote};
 mod sequence;
 pub(in crate::working_memory) use sequence::OriginalTokenDomainBinding;
 mod token_input;
@@ -147,15 +148,17 @@ pub(in crate::working_memory) struct TextControlBinding {
     _metadata_funding: Option<eredu_core::HostMetadataFunding>,
 }
 impl TextControlBinding {
-    pub(in crate::working_memory) fn native_span_remainder(
+    pub(in crate::working_memory) fn native_span_domain_remainder(
         &self,
         workspace: &InferenceSpanWorkspace,
-        span: &InferenceWorkspaceSpan,
+        index: usize,
+        domain: eredu_core::MemoryDomainId,
         held: Option<u64>,
+        registered: u64,
     ) -> Result<Option<u64>, WorkingMemoryError> {
         self.native_storage
             .as_ref()
-            .map(|layout| layout.remainder(workspace, span, held))
+            .map(|layout| layout.domain_remainder(workspace, index, domain, held, registered))
             .transpose()
     }
     pub(in crate::working_memory) fn batch_layout(&self) -> Option<&Arc<BatchPublicationLayout>> {
@@ -484,49 +487,149 @@ impl IncrementalInferenceQuote {
         }
         if let Some(native) = controls.binding.native_storage.as_ref() {
             if let Some(generations) = native.equation_generations {
-                let old = self
-                    .equation_incremental_bytes
+                let placement = native
+                    .placement
+                    .as_ref()
                     .ok_or(WorkingMemoryError::UnknownBound)?;
-                let host = self
-                    .span_workspace
-                    .plan
-                    .records()
-                    .iter()
-                    .try_fold(0u64, |peak, record| {
-                        record.host_workspace_bytes().map(|bytes| peak.max(bytes))
-                    })
-                    .ok_or(WorkingMemoryError::UnknownBound)?;
-                // Sampling's complete host envelope is already in vocabulary;
-                // only its tensor term is replaced. Model equation quotations
-                // include their disjoint host peak in the replaced term itself.
-                let host = if self.span_workspace.sampling.is_some() { 0 } else { host };
-                let replacement = generations
-                    .checked_add(host)
-                    .ok_or(WorkingMemoryError::Overflow)?;
-                // Keep an independently larger old bound. This is a replacement
-                // of the same named owners, not an extra P charge or a discount
-                // inferred from current free capacity.
-                let extra = replacement.saturating_sub(old);
-                self.incremental_bytes = self
-                    .incremental_bytes
-                    .checked_add(extra)
-                    .ok_or(WorkingMemoryError::Overflow)?;
+                placement
+                    .validate(self.pool.topology())
+                    .map_err(WorkingMemoryError::from)?;
+                let mut old_native_peak = None;
+                for &domain in placement.domains() {
+                    let mut peak = 0u64;
+                    for record in self.span_workspace.plan.records() {
+                        let requirements = record
+                            .domain_native_allocations()
+                            .ok_or(WorkingMemoryError::UnknownBound)?;
+                        requirements
+                            .validate(self.pool.topology())
+                            .map_err(WorkingMemoryError::from)?;
+                        for (candidate, charge) in requirements.iter() {
+                            if charge.total().map_err(WorkingMemoryError::from)? != 0
+                                && !placement.domains().contains(&candidate)
+                            {
+                                return Err(WorkingMemoryError::IdentityMismatch.into());
+                            }
+                        }
+                        peak = peak.max(
+                            requirements
+                                .get(domain)
+                                .and_then(|charge| charge.total())
+                                .map_err(WorkingMemoryError::from)?,
+                        );
+                    }
+                    if old_native_peak.is_some_and(|old| old != peak) {
+                        return Err(WorkingMemoryError::IdentityMismatch.into());
+                    }
+                    old_native_peak = Some(peak);
+                }
+                let old = old_native_peak.ok_or(WorkingMemoryError::UnknownBound)?;
+                let extra = if generations > old {
+                    generations
+                        .checked_sub(old)
+                        .ok_or(WorkingMemoryError::Overflow)?
+                } else {
+                    0
+                };
                 let report_funding = self.span_workspace.plan.metadata_funding();
+                let metadata = report_funding.as_ref().map_or_else(
+                    crate::working_memory::WorkspaceReportMetadata::ordinary,
+                    crate::working_memory::WorkspaceReportMetadata::with_funding,
+                );
+                let report_error = |error| match &report_funding {
+                    Some(funding) => ResidualQuoteError::Storage(
+                        crate::working_memory::reservation_metadata::neural_error(
+                            metadata.error(error),
+                            funding,
+                        ),
+                    ),
+                    None => ResidualQuoteError::Estimate(error.into_capability()),
+                };
+                let allowance_count = usize::from(matches!(
+                    placement.kind(),
+                    eredu_core::MemoryPlacementKind::Possible { .. }
+                ));
+                let descriptor_bytes =
+                    eredu_core::DomainMemoryRequirements::construction_backing_bytes(
+                        self.pool.topology(),
+                        allowance_count,
+                    )
+                    .and_then(|bytes| {
+                        bytes
+                            .checked_add(if allowance_count == 0 {
+                                0
+                            } else {
+                                placement.backing_bytes()?
+                            })
+                            .ok_or(eredu_core::MemoryDomainError::Overflow)
+                    })
+                    .map_err(WorkingMemoryError::from)?;
+                metadata
+                    .admit::<eredu_core::DomainMemoryRequirements>()
+                    .map_err(&report_error)?;
+                metadata
+                    .charge(
+                        usize::try_from(descriptor_bytes)
+                            .map_err(|_| WorkingMemoryError::Overflow)?,
+                    )
+                    .map_err(&report_error)?;
+                let mut delta = eredu_core::DomainMemoryRequirements::zero_with_allowance_capacity(
+                    self.pool.topology(),
+                    allowance_count,
+                );
+                delta
+                    .add_allocation(extra, placement)
+                    .map_err(WorkingMemoryError::from)?;
+                self.incremental_requirements = Some(
+                    metadata
+                        .combine_domain_requirements(
+                            self.incremental_requirements
+                                .as_ref()
+                                .ok_or(WorkingMemoryError::UnknownBound)?,
+                            &delta,
+                            true,
+                        )
+                        .map_err(&report_error)?,
+                );
+                self.incremental_bytes =
+                    self.incremental_requirements
+                        .as_ref()
+                        .and_then(|requirements| {
+                            requirements.iter().try_fold(0u64, |sum, (_, charge)| {
+                                sum.checked_add(charge.total().ok()?)
+                            })
+                        });
                 let workspace = self
                     .state_mut()?
                     .execution_workspace
                     .as_mut()
                     .ok_or(WorkingMemoryError::UnknownBound)?;
-                let WorkspaceBound::Bounded { bytes, assumptions } = &mut workspace.activations
-                else {
-                    return Err(WorkingMemoryError::UnknownBound.into());
-                };
-                *bytes = bytes
-                    .checked_add(extra)
-                    .ok_or(WorkingMemoryError::Overflow)?;
-                append_assumptions(assumptions,
-                    "; registered equation peak replaced once by all selected native generations plus the original disjoint host peak",
-                    "", report_funding.as_ref())?;
+                let domains = workspace
+                    .physical_domains
+                    .as_mut()
+                    .ok_or(WorkingMemoryError::UnknownBound)?;
+                domains.activations = metadata
+                    .combine_domain_requirements(&domains.activations, &delta, true)
+                    .map_err(&report_error)?;
+                if let WorkspaceBound::Bounded { bytes, assumptions } = &mut workspace.activations {
+                    if let Some(updated) = domains
+                        .activations
+                        .iter()
+                        .try_fold(0u64, |sum, (_, charge)| {
+                            sum.checked_add(charge.total().ok()?)
+                        })
+                    {
+                        *bytes = updated;
+                        append_assumptions(
+                            assumptions,
+                            "; native equation generations retain their certified placement and the original host workspace",
+                            "",
+                            report_funding.as_ref(),
+                        )?;
+                    } else {
+                        workspace.activations = metadata.per_domain(format_args!("complete physical-domain requirements have no aggregate u64 diagnostic")).map_err(&report_error)?;
+                    }
+                }
             }
         }
         self.span_workspace.text_controls = Some(controls);
@@ -601,13 +704,27 @@ pub struct OriginalTextMetadataCustody {
     _raw: crate::working_memory::funding::RawSpanHostOwner,
 }
 impl OriginalTextMetadataCustody {
+    pub(in crate::working_memory) fn validate_capture_source_pin(
+        &self,
+        native: &WorkingMemoryFundingScope,
+    ) -> Result<(), WorkingMemoryError> {
+        let usage = native
+            .pool()
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        self._raw.validate_publication_locked(native, &usage)
+    }
     pub(in crate::working_memory) fn same_raw_account(
         &self,
         other: &crate::working_memory::funding::RawSpanHostOwner,
     ) -> bool {
         self._raw.same(other)
     }
-    pub(in crate::working_memory) fn same_account(&self, other: &Self) -> bool { self._raw.same(&other._raw) }
+    pub(in crate::working_memory) fn same_account(&self, other: &Self) -> bool {
+        self._raw.same(&other._raw)
+    }
     /// Whether this is the only remaining alias of this exact request's raw
     /// host custody. This test observation neither grants exclusive access nor
     /// proves native completion; callers must first settle the real work.
@@ -618,14 +735,15 @@ impl OriginalTextMetadataCustody {
         self._raw.is_sole_owner()
     }
     /// Compare only the existing shared accounting domain.
-    pub fn matches_domain(&self, domain: &eredu_core::SharedStorageDomain) -> bool {
+    pub fn matches_accounting_owner(&self, domain: &eredu_core::SharedStorageAccountingId) -> bool {
         self._raw
             .pool()
-            .shared_storage_domain()
+            .shared_storage_accounting_id()
             .same_identity(domain)
     }
     pub(in crate::working_memory) fn validate_initialization(
-        &self, source: &crate::working_memory::SharedNativeInitializationCustody,
+        &self,
+        source: &crate::working_memory::SharedNativeInitializationCustody,
     ) -> Result<(), WorkingMemoryError> {
         source.validate_pool(self._raw.pool())
     }
@@ -634,27 +752,33 @@ impl OriginalTextMetadataCustody {
         &self,
         metadata: &crate::SharedHostMetadata,
     ) -> Result<(), WorkingMemoryError> {
-        metadata.validate_original_attachment(self._raw.pool().shared_storage_domain())
+        metadata.validate_original_attachment(self._raw.pool().shared_storage_accounting_id())
     }
     /// Validate a fixed metadata token without growing attachment storage.
     pub fn validate_slot_metadata(
         &self,
         metadata: &crate::HostSlotMetadata,
     ) -> Result<(), WorkingMemoryError> {
-        metadata.validate_original_attachment(self._raw.pool().shared_storage_domain())
+        metadata.validate_original_attachment(self._raw.pool().shared_storage_accounting_id())
     }
     /// Validate already registered source payloads in the same raw account's
     /// pool without converting their original or ordinary accounting origin.
     pub fn validate_retained_source_inventory<K>(
-        &self, key: &K, bytes: u64,
+        &self,
+        key: &K,
+        bytes: u64,
     ) -> Result<(), WorkingMemoryError>
-    where K: Ord + Send + Sync + 'static + crate::working_memory::GgufSourceStorageKey {
-        self._raw.pool().validate_retained_source_inventory(key, bytes)
+    where
+        K: Ord + Send + Sync + 'static + crate::working_memory::GgufSourceStorageKey,
+    {
+        self._raw
+            .pool()
+            .validate_retained_source_inventory(key, bytes)
     }
 
     pub(in crate::working_memory) fn validate_retained_origin_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &crate::working_memory::Usage,
     ) -> Result<(), WorkingMemoryError> {
         self._raw.validate_origin_locked(pool, usage)
@@ -816,7 +940,7 @@ impl ReservedTextSpanWorkspace<'_> {
     }
     pub(in crate::working_memory) fn validate_locked(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         let binding = self

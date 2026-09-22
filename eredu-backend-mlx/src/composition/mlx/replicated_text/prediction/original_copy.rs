@@ -1,26 +1,25 @@
 //! Retained prerequisites for actual target/prediction cache copies.
 mod provider;
 mod target;
-pub(crate) use target::OriginalPredictionTarget;
-pub(crate) use provider::{OriginalEmbeddedCachePreparation, cache_metadata, cache_error, prepare_cache};
 use super::super::state::MlxStateMechanisms;
 use super::startup::{
     OriginalPredictionLane, OriginalPredictionStartupContext, PreparedLane, StartupCause,
 };
 use super::{MlxEmbeddedPredictionMaterializer, OwnedPredictionCache};
 use crate::backend::{
-    OriginalCopyEnvironment, PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError,
     error::Error,
     managed_memory::NativeMemoryRetention,
     nn::{shared::MlxNeuralBackend, workspace::MlxMetalWorkspaceMechanisms},
     runtime::cache::{
-        PreparedPredictionCacheCopy, copy_completed_compressed, copy_completed_pooling,
+        copy_completed_compressed, copy_completed_pooling,
         kv::CompressedLatentCache,
         state::{
-            CompletedResidentSource, MlxHybridState, MlxPoolingAttentionCache,
-            OriginalResidentState, PreparedResidentDecoderCopy, copy_completed_resident_state,
+            copy_completed_resident_state, CompletedResidentSource, MlxHybridState,
+            MlxPoolingAttentionCache, OriginalResidentState, PreparedResidentDecoderCopy,
         },
+        PreparedPredictionCacheCopy,
     },
+    OriginalCopyEnvironment, PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError,
 };
 use eredu_architectures::prediction_extension::{
     MaterializedPredictionExecutor, PredictionStateCopyFactory,
@@ -29,15 +28,17 @@ use eredu_core::HostPreparationAuthority;
 use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{
     replicated_session::ReplicatedTextControlOrigin,
-    working_memory::{
-        PreparedSemanticSource, WorkingMemoryError, WorkingMemoryPool,
-    },
+    working_memory::{MemoryLedger, PreparedSemanticSource, WorkingMemoryError},
+};
+pub(crate) use provider::{
+    cache_error, cache_metadata, prepare_cache, OriginalEmbeddedCachePreparation,
 };
 use safemlx::PrefillRootsRuntime;
 use std::{
     any::Any,
     mem::{size_of, size_of_val},
 };
+pub(crate) use target::OriginalPredictionTarget;
 
 fn memory(value: WorkingMemoryError) -> StartupCause {
     Error::PrefillControl(value).into()
@@ -53,7 +54,7 @@ fn add(a: usize, b: usize) -> Result<usize, StartupCause> {
 #[derive(Clone)]
 pub(crate) struct OriginalPredictionCopyContext {
     environment: PreparedOriginalCopyEnvironment,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     roots: PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     origin: ReplicatedTextControlOrigin,
@@ -72,8 +73,13 @@ impl OriginalPredictionCopyContext {
             size_of::<Self>(),
             size_of::<Result<Self, StartupCause>>(),
             size_of::<PreparedOriginalCopyEnvironment>(),
-            size_of::<Result<PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError>>(),
-            size_of::<(&OriginalCopyEnvironment<'_>, &HostPreparationAuthority, &HostMetadataFunding)>(),
+            size_of::<Result<PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError>>(
+            ),
+            size_of::<(
+                &OriginalCopyEnvironment<'_>,
+                &HostPreparationAuthority,
+                &HostMetadataFunding,
+            )>(),
             OriginalCopyEnvironment::control_bytes()?,
         ];
         parts
@@ -95,7 +101,10 @@ impl OriginalPredictionCopyContext {
             )
             .map_err(Error::WorkspacePlanning)?;
         let retained = PreparedOriginalCopyEnvironment::prepare(
-            environment, host, preparation.metadata_funding())?;
+            environment,
+            host,
+            preparation.metadata_funding(),
+        )?;
         Ok(Self {
             environment: retained,
             pool: environment.pool().clone(),
@@ -157,16 +166,31 @@ impl OriginalPredictionCopyContext {
         self.validate(&self.preparation, origin)?;
         let parts = [
             size_of::<PreparedResidentDecoderCopy<'_>>(),
-            size_of::<Result<PreparedResidentDecoderCopy<'_>, crate::backend::runtime::cache::state::ResidentDecoderPreparationError>>(),
+            size_of::<
+                Result<
+                    PreparedResidentDecoderCopy<'_>,
+                    crate::backend::runtime::cache::state::ResidentDecoderPreparationError,
+                >,
+            >(),
             size_of::<Result<S, OriginalResidentState>>(),
             size_of::<PreparedLane<S>>(),
             size_of::<Result<PreparedLane<S>, StartupCause>>(),
         ];
         self.reserve(parts.into_iter().try_fold(size_of_val(&parts), add)?)?;
         let environment = self.loan()?;
-        let copied = match source.copy_original_paged_state(completed, &environment, &self.roots,
-            self.mechanisms, self.preparation.metadata_funding(), &self.host, self.preparation.capacity_bytes())? {
-            Some(value) => PreparedLane { value, host: self.host.clone() },
+        let copied = match source.copy_original_paged_state(
+            completed,
+            &environment,
+            &self.roots,
+            self.mechanisms,
+            self.preparation.metadata_funding(),
+            &self.host,
+            self.preparation.limits().clone(),
+        )? {
+            Some(value) => PreparedLane {
+                value,
+                host: self.host.clone(),
+            },
             None => self.target_source(source.prepare_resident_decoder_copy_fixed()?, completed)?,
         };
         let value = match S::from_original_resident_copy(copied.value) {
@@ -176,7 +200,10 @@ impl OriginalPredictionCopyContext {
                 return Err(memory(WorkingMemoryError::IdentityMismatch));
             }
         };
-        Ok(PreparedLane { value, host: copied.host })
+        Ok(PreparedLane {
+            value,
+            host: copied.host,
+        })
     }
     /// Same independent admitted copy for the actual cold source before typed
     /// cache construction. Registered roots retain their canonical publication;
@@ -193,15 +220,26 @@ impl OriginalPredictionCopyContext {
             size_of::<Result<OriginalResidentState, Error>>(),
             size_of::<PreparedLane<OriginalResidentState>>(),
             size_of::<Result<PreparedLane<OriginalResidentState>, StartupCause>>(),
-            self.environment.control_bytes().ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
+            self.environment
+                .control_bytes()
+                .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
         ];
         self.reserve(parts.into_iter().try_fold(size_of_val(&parts), add)?)?;
         let environment = self.loan()?;
         let value = copy_completed_resident_state(
-            source, completed, &environment, &self.roots, self.mechanisms,
-            self.preparation.metadata_funding(), &self.host, self.preparation.capacity_bytes(),
+            source,
+            completed,
+            &environment,
+            &self.roots,
+            self.mechanisms,
+            self.preparation.metadata_funding(),
+            &self.host,
+            self.preparation.limits(),
         )?;
-        Ok(PreparedLane { value, host: self.host.clone() })
+        Ok(PreparedLane {
+            value,
+            host: self.host.clone(),
+        })
     }
     pub(super) fn prediction<A, P>(
         &self,
@@ -217,7 +255,8 @@ impl OriginalPredictionCopyContext {
         source: &P::LaneState,
         completed: Option<&CompletedResidentSource>,
     ) -> Result<PreparedLane<P::LaneState>, StartupCause>
-    where P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
+    where
+        P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
     {
         self.validate(&self.preparation, &self.origin)?;
         let parts = [
@@ -229,7 +268,13 @@ impl OriginalPredictionCopyContext {
                 .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
         ];
         self.reserve(parts.into_iter().try_fold(size_of_val(&parts), add)?)?;
-        P::prepare_copy_state(source, &mut CopyFactory { context: self, completed })
+        P::prepare_copy_state(
+            source,
+            &mut CopyFactory {
+                context: self,
+                completed,
+            },
+        )
     }
 }
 
@@ -252,7 +297,7 @@ impl CopyFactory<'_> {
             &PrefillRootsRuntime,
             MlxMetalWorkspaceMechanisms,
             &HostMetadataFunding,
-            u64,
+            &eredu_core::MemoryLimits,
         ) -> Result<PreparedPredictionCacheCopy<C>, Error>,
     ) -> Result<PreparedLane<Vec<OwnedPredictionCache<C>>>, StartupCause> {
         let member_bytes = add(
@@ -298,7 +343,7 @@ impl CopyFactory<'_> {
                 &self.context.roots,
                 self.context.mechanisms,
                 self.context.preparation.metadata_funding(),
-                self.context.preparation.capacity_bytes(),
+                self.context.preparation.limits(),
             )?
             .into_parts();
             members.push(host);
@@ -336,7 +381,8 @@ impl PredictionStateCopyFactory<MlxNeuralBackend, MlxEmbeddedPredictionMateriali
         &mut self,
         source: &MlxHybridState,
     ) -> Result<PreparedLane<MlxHybridState>, StartupCause> {
-        self.context.target(source, &self.context.origin, self.completed)
+        self.context
+            .target(source, &self.context.origin, self.completed)
     }
 }
 
@@ -382,7 +428,9 @@ impl OriginalPredictionLane {
     ) -> eredu_runtime::speculative::embedded_occurrence::EmbeddedPredictionShape {
         self.shape
     }
-    pub(crate) fn initial_frontier(&self) -> u64 { self.initial_frontier }
+    pub(crate) fn initial_frontier(&self) -> u64 {
+        self.initial_frontier
+    }
     pub(crate) fn prefill_alignment(&self) -> eredu_core::speculative::PredictionPrefillAlignment {
         self.alignment
     }

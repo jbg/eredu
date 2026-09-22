@@ -102,7 +102,11 @@ fn fixed_report_matches_independent_legacy_union_unknown_and_displacement_order(
                 vec![all[1].clone(), all[0].clone()]
             },
             scratch: 1,
+            scratch_overflow: false,
+            placed_scratch: vec![],
+            scratch_sources: vec![],
             host_workspace: 3,
+            host_staging_incomplete: mode & 128 != 0,
             operations: vec![WorkspaceOperation {
                 kind: WorkspaceOperationKind::Contiguous,
                 inputs: vec![],

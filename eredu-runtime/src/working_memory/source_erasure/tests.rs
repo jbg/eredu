@@ -9,7 +9,7 @@ use eredu_checkpoint::{
         CheckpointSource, GgufCompositePlan, ReadPolicy, SelectedGgufConversionPlan,
         SharedCheckpointSource, TensorReadRequest, TensorSelection,
     },
-    validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
+    validation::{ResolvedCheckpointPlan, resolve_gguf_plan},
 };
 use eredu_gguf::{Checkpoint, GgmlType, TensorInput, Writer};
 use std::{collections::BTreeMap, fs::File, sync::Arc};
@@ -64,7 +64,7 @@ impl Input {
     fn ordinary(&self) -> Arc<GgufWeightStore> {
         Arc::new(self.plan().compile(()).unwrap().build().unwrap())
     }
-    fn funded(&self, pool: &WorkingMemoryPool) -> GgufWeightStore {
+    fn funded(&self, pool: &MemoryLedger) -> GgufWeightStore {
         pool.compile_gguf_source(
             pool.compile_gguf_catalog(self.plan())
                 .unwrap()
@@ -73,14 +73,13 @@ impl Input {
         .unwrap()
     }
     fn bytes(&self) -> u64 {
-        WorkingMemoryPool::gguf_catalog_required_bytes(&self.plan()).unwrap()
-            + WorkingMemoryPool::gguf_source_required_bytes(&self.plan().compile(()).unwrap())
-                .unwrap()
+        MemoryLedger::gguf_catalog_required_bytes(&self.plan()).unwrap()
+            + MemoryLedger::gguf_source_required_bytes(&self.plan().compile(()).unwrap()).unwrap()
     }
 }
 
 fn requirement() -> Option<u64> {
-    let result = WorkingMemoryPool::gguf_source_erasure_required_bytes();
+    let result = MemoryLedger::gguf_source_erasure_required_bytes();
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE").is_some() {
         assert!(
             result.is_ok(),
@@ -91,7 +90,7 @@ fn requirement() -> Option<u64> {
         Ok(bytes) => Some(bytes),
         Err(WorkingMemoryError::UnknownBound) => {
             assert!(matches!(
-                WorkingMemoryPool::gguf_composite_erasure_required_bytes(),
+                MemoryLedger::gguf_composite_erasure_required_bytes(),
                 Err(WorkingMemoryError::UnknownBound)
             ));
             None
@@ -111,12 +110,12 @@ fn retained_source_exact_one_short_and_last_opaque_identity_refund_once() {
     let Some(bytes) = requirement() else { return };
     let input = Input::new("weight");
     let base = input.bytes();
-    let short = WorkingMemoryPool::new(base + bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(base + bytes - 1, 0).unwrap();
     let original = input.funded(&short);
     let failure = short.retain_gguf_source(original).unwrap_err();
     assert!(
-        matches!(failure.accounting_failure(), WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }
-        if *required_bytes == bytes && *available_bytes == bytes - 1)
+        matches!(failure.accounting_failure(), WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })
+        if *required_bytes == bytes && (limit_bytes - existing_bytes) == bytes - 1)
     );
     assert_eq!(
         failure
@@ -127,11 +126,11 @@ fn retained_source_exact_one_short_and_last_opaque_identity_refund_once() {
             .physical_reads,
         0
     );
-    assert_eq!(short.used_bytes().unwrap(), base);
+    assert_eq!(short.payload_used_bytes().unwrap(), base);
     drop(failure);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
 
-    let pool = WorkingMemoryPool::new(base + bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(base + bytes, 0).unwrap();
     let root = pool.retain_gguf_source(input.funded(&pool)).unwrap();
     pool.validate_retained_source_controls(&root).unwrap();
     let identity = root.identity();
@@ -139,19 +138,19 @@ fn retained_source_exact_one_short_and_last_opaque_identity_refund_once() {
     assert_eq!(identity, other_identity);
     let clone = root.clone();
     assert!(root.same_source(&clone));
-    assert_eq!(pool.used_bytes().unwrap(), base + bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), base + bytes);
     std::thread::scope(|scope| {
         scope.spawn(move || drop(root));
         scope.spawn(move || drop(clone));
     });
     // Nested source storage retires at last strong root; only outer shell and
     // its original control remain, independent of the inner catalog account.
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     std::thread::scope(|scope| {
         scope.spawn(move || drop(identity));
         scope.spawn(move || drop(other_identity));
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 
     let root = pool.retain_gguf_source(input.funded(&pool)).unwrap();
     let identity = root.identity();
@@ -171,24 +170,24 @@ fn retained_composite_routes_same_root_and_refuses_foreign_or_ordinary_promotion
     let first = Input::new("first");
     let second = Input::new("second");
     let base = first.bytes() + second.bytes();
-    let union = WorkingMemoryPool::gguf_composite_required_bytes(&GgufCompositePlan::new(
+    let union = MemoryLedger::gguf_composite_required_bytes(&GgufCompositePlan::new(
         first.ordinary(),
         second.ordinary(),
     ))
     .unwrap();
-    let outer = WorkingMemoryPool::gguf_composite_erasure_required_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(base + union + outer, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let outer = MemoryLedger::gguf_composite_erasure_required_bytes().unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(base + union + outer, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let failed = foreign.retain_gguf_source(first.funded(&pool)).unwrap_err();
     assert!(matches!(
         failed.accounting_failure(),
         WorkingMemoryError::IdentityMismatch
     ));
     assert!(failed.rejected_gguf().is_some());
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), first.bytes());
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), first.bytes());
     drop(failed);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let ordinary = first.plan().compile(()).unwrap().build().unwrap();
     let failed = pool.retain_gguf_source(ordinary).unwrap_err();
     assert!(matches!(
@@ -205,7 +204,7 @@ fn retained_composite_routes_same_root_and_refuses_foreign_or_ordinary_promotion
         Err(WorkingMemoryError::UnknownBound)
     ));
     drop(ordinary);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 
     let union_source = pool
         .compile_gguf_composite(GgufCompositePlan::new(
@@ -234,11 +233,11 @@ fn retained_composite_routes_same_root_and_refuses_foreign_or_ordinary_promotion
     );
     drop(root);
     drop(route);
-    assert_eq!(pool.used_bytes().unwrap(), base + union + outer);
+    assert_eq!(pool.payload_used_bytes().unwrap(), base + union + outer);
     drop(prepared);
-    assert_eq!(pool.used_bytes().unwrap(), outer);
+    assert_eq!(pool.payload_used_bytes().unwrap(), outer);
     drop(identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod safetensors;

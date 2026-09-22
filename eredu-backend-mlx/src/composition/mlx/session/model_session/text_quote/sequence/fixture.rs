@@ -52,7 +52,7 @@ struct Slot {
     decoder_location: Cell<usize>,
     decoder_takes: Cell<usize>,
     decoder_retirements: Cell<usize>,
-    decoder_expected: RefCell<Option<(WorkingMemoryPool, u64)>>,
+    decoder_expected: RefCell<Option<(MemoryLedger, u64)>>,
     facts: Cell<Option<Facts>>,
     installed: Cell<Option<InstalledFacts>>,
     sampling: RefCell<Option<MlxTextGenerationState>>,
@@ -201,8 +201,8 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn decoder_c
         return Ok(());
     }
     slot.mode.set(Mode::Normal); // one-shot, reset before rejection/unwind
-    let pool = runtime.session().payload.memory_pool.clone();
-    let expected = pool.used_bytes().unwrap();
+    let pool = runtime.session().payload.memory_ledger.clone();
+    let expected = pool.fixture_host_charge().unwrap();
     assert!(
         slot.decoder_expected
             .replace(Some((pool, expected)))
@@ -220,7 +220,7 @@ pub(super) fn decoder_retired(location: usize) {
     let expected = slot.decoder_expected.borrow().clone();
     if let Some((pool, expected)) = expected {
         // Source destruction already completed; its original charge still lives.
-        assert_eq!(pool.used_bytes().unwrap(), expected);
+        assert_eq!(pool.fixture_host_charge().unwrap(), expected);
         slot.decoder_retirements
             .set(slot.decoder_retirements.get() + 1);
     }
@@ -281,7 +281,14 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn record(
         }
     };
     slot.facts.set(Some(Facts {
-        required: quote.request().memory_reservation().unwrap().bytes(),
+        required: quote
+            .request()
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_topology().unwrap().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
         held,
         r,
         admission,
@@ -656,3 +663,7 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn record_pr
     };
     assert!(slot.context.replace(Some(context.clone())).is_none());
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

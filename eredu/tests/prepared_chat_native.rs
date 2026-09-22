@@ -6,13 +6,22 @@ use eredu::{
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    DevicePlan, ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides,
-    SemanticEvent, TextInferencePolicy, TextPreparationOptions, capture::*,
-    execution_control::SnapshotLimits,
+    capture::*, execution_control::SnapshotLimits, DevicePlan, ExecutionPlan,
+    GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent, TextInferencePolicy,
+    TextPreparationOptions,
 };
 use eredu_runtime::{execution_control::SnapshotBudget, working_memory::WorkspaceCopyLimits};
 use std::{io::Write, num::NonZeroU64};
-use tokenizers::{AddedToken, Tokenizer, decoders::byte_level::ByteLevel, models::bpe::BPE};
+use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken, Tokenizer};
+
+fn native_limits(bytes: u64) -> eredu_core::MemoryLimitDeclarations {
+    let topology = eredu::api::local_memory_topology().unwrap();
+    eredu_core::MemoryLimitDeclarations::new(
+        topology
+            .domains()
+            .map(|(_, domain)| (domain.name.clone(), eredu_core::MemoryLimit::Finite(bytes))),
+    )
+}
 
 const CAPACITY: u64 = 8 << 30;
 const PIECES: [&str; 5] = [
@@ -22,14 +31,14 @@ const PIECES: [&str; 5] = [
     "}}\n",
     "</tool_call>",
 ];
-#[path = "prepared_chat_native/media.rs"]
-mod media;
 #[path = "prepared_chat_native/audio.rs"]
 mod audio;
-#[path = "prepared_chat_native/sampling.rs"]
-mod sampling;
 #[path = "prepared_chat_native/capture_lifecycle.rs"]
 mod capture_lifecycle;
+#[path = "prepared_chat_native/media.rs"]
+mod media;
+#[path = "prepared_chat_native/sampling.rs"]
+mod sampling;
 
 fn fixture(multimodal: bool) -> (tempfile::TempDir, Tokenizer, Vec<u32>) {
     let root = tempfile::tempdir().unwrap();
@@ -58,10 +67,17 @@ fn fixture(multimodal: bool) -> (tempfile::TempDir, Tokenizer, Vec<u32>) {
         .add_tokens(PIECES.map(|value| AddedToken::from(value, false).normalized(false)))
         .unwrap();
     if multimodal {
-        tokenizer.add_special_tokens(
-            ["<|vision_start|>", "<|image_pad|>", "<|video_pad|>", "<|vision_end|>"]
+        tokenizer
+            .add_special_tokens(
+                [
+                    "<|vision_start|>",
+                    "<|image_pad|>",
+                    "<|video_pad|>",
+                    "<|vision_end|>",
+                ]
                 .map(|value| AddedToken::from(value, true).normalized(false)),
-        ).unwrap();
+            )
+            .unwrap();
     }
     let mut script = PIECES
         .map(|text| tokenizer.token_to_id(text).unwrap())
@@ -87,10 +103,12 @@ fn fixture(multimodal: bool) -> (tempfile::TempDir, Tokenizer, Vec<u32>) {
                 "num_position_embeddings":16,"in_channels":3,"patch_size":2,"spatial_merge_size":2,
                 "temporal_patch_size":1,"out_hidden_size":hidden,"deepstack_visual_indexes":[0,1]}
         })
-    } else { serde_json::json!({"model_type":"qwen2", "hidden_size":hidden,
+    } else {
+        serde_json::json!({"model_type":"qwen2", "hidden_size":hidden,
         "num_hidden_layers":2, "intermediate_size":32, "num_attention_heads":4,
         "num_key_value_heads":2, "rms_norm_eps":0.00001, "vocab_size":width,
-        "eos_token_id":eos, "max_position_embeddings":2048, "tie_word_embeddings":false}) };
+        "eos_token_id":eos, "max_position_embeddings":2048, "tie_word_embeddings":false})
+    };
     std::fs::write(
         root.path().join("config.json"),
         serde_json::to_vec(&config).unwrap(),
@@ -217,7 +235,7 @@ fn check(choice: ToolChoice, device: LocalDevice, capture: bool) {
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)
+        .prepare_chat(&source, &policy, &native_limits(CAPACITY), &cancellation)
         .unwrap_or_else(fail)
         .unwrap();
     let prompt = tokenizer.encode(chat.rendered_prompt(), false).unwrap();
@@ -231,7 +249,10 @@ fn check(choice: ToolChoice, device: LocalDevice, capture: bool) {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             prefill_chunk_positions: NonZeroU64::new(chunk),
             ..Default::default()
         },
@@ -241,43 +262,77 @@ fn check(choice: ToolChoice, device: LocalDevice, capture: bool) {
     if !capture {
         let mut events = Vec::new();
         let output = model
-            .start_prepared_chat(PreparedChatRequest::new(&chat, settings.clone()), &cancellation)
-            .unwrap_or_else(fail).unwrap()
-            .run(&cancellation, &mut |event| events.push(event)).unwrap_or_else(fail);
+            .start_prepared_chat(
+                PreparedChatRequest::new(&chat, settings.clone()),
+                &cancellation,
+            )
+            .unwrap_or_else(fail)
+            .unwrap()
+            .run(&cancellation, &mut |event| events.push(event))
+            .unwrap_or_else(fail);
         assert!(output.token_ids.starts_with(&script[..5]));
-        assert_eq!(output.finish_reason, eredu_core::FinishReason::GrammarComplete);
-        assert_eq!(events.iter().filter(|event| matches!(event,
-            SemanticEvent::ToolCallStart { name, .. } if name == "reading")).count(), 1);
-        let arguments: String = events.iter().filter_map(|event| match event {
-            SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.as_str()),
-            _ => None,
-        }).collect();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&arguments).unwrap(), serde_json::json!({"value":17}));
+        assert_eq!(
+            output.finish_reason,
+            eredu_core::FinishReason::GrammarComplete
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+            SemanticEvent::ToolCallStart { name, .. } if name == "reading"))
+                .count(),
+            1
+        );
+        let arguments: String = events
+            .iter()
+            .filter_map(|event| match event {
+                SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
+                    Some(json_fragment.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            serde_json::json!({"value":17})
+        );
         let ids = output.token_ids.to_vec();
         let finish = output.finish_reason;
         drop(output);
-        model.prepare_reset_ordinary().unwrap_or_else(fail)
-            .reset_admitted(eredu_core::SessionResetLimits::new(CAPACITY)).unwrap_or_else(fail);
+        model
+            .prepare_reset_ordinary()
+            .unwrap_or_else(fail)
+            .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(CAPACITY)))
+            .unwrap_or_else(fail);
         model.synchronize().unwrap_or_else(fail);
         sampling::check_recorded_child(&mut model, &chat, settings, &script, &ids, finish, &events);
         return;
     }
     let capture_lifecycle::Proof {
-        events, expected_ids, expected_finish, budget, spent, terminal_budget, terminal_spent,
+        events,
+        expected_ids,
+        expected_finish,
+        budget,
+        spent,
+        terminal_budget,
+        terminal_spent,
     } = capture_lifecycle::check(&mut model, &chat, &settings, &script, count, &cancellation);
-    model.prepare_reset_ordinary().unwrap_or_else(fail)
-        .reset_admitted(eredu_core::SessionResetLimits::new(CAPACITY)).unwrap_or_else(fail);
+    model
+        .prepare_reset_ordinary()
+        .unwrap_or_else(fail)
+        .reset_admitted(eredu_core::SessionResetLimits::new(native_limits(CAPACITY)))
+        .unwrap_or_else(fail);
     model.synchronize().unwrap_or_else(fail);
     sampling::check_recorded_child(
-        &mut model, &chat, settings, &script, &expected_ids, expected_finish, &events,
+        &mut model,
+        &chat,
+        settings,
+        &script,
+        &expected_ids,
+        expected_finish,
+        &events,
     );
-    drop((
-        events,
-        source,
-        tokenizer_source,
-        chat,
-        model,
-    ));
+    drop((events, source, tokenizer_source, chat, model));
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while budget.usage().retained_bytes != 0 || terminal_budget.usage().retained_bytes != 0 {
         eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
@@ -288,5 +343,8 @@ fn check(choice: ToolChoice, device: LocalDevice, capture: bool) {
         std::thread::yield_now();
     }
     assert_eq!(budget.usage().cumulative_copy_bytes, spent);
-    assert_eq!(terminal_budget.usage().cumulative_copy_bytes, terminal_spent);
+    assert_eq!(
+        terminal_budget.usage().cumulative_copy_bytes,
+        terminal_spent
+    );
 }

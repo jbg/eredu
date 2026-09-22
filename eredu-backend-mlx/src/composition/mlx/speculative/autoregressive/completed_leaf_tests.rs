@@ -3,9 +3,11 @@
 use super::*;
 use crate::backend::array_copy::IsolatedArrayCopy;
 use crate::composition::mlx::speculative::sampling::numerical::native_tests::{
-    REQUEST_CEILING, admitted_backend, load, settle, source_configs,
+    admitted_backend, load, settle, source_configs, REQUEST_CEILING,
 };
-use crate::composition::mlx::{MlxPreparedInputMaterializer, session::MlxModelSession};
+use crate::composition::mlx::{session::MlxModelSession, MlxPreparedInputMaterializer};
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     GenerationCancellationToken, SpeculativeConfig, SpeculativePrefillOutcome,
     SpeculativeSchedulerOptions,
@@ -91,60 +93,144 @@ fn identity_mismatch(error: &Error) {
 // Reuses the real completed-copy fixture. An aggregate receipt names only its
 // current roots even though it retains predecessor custody after publication.
 fn registered_current_roots(
-    first:&crate::backend::array_copy::RegisteredArrayCopy,
-    second:&crate::backend::array_copy::RegisteredArrayCopy,
-    pair:&AutoregressiveSourcePair, environment:&crate::backend::OriginalCopyEnvironment<'_>,
-    other_stream:&safemlx::Stream, foreign_context:SpeculativeExecutionStreams<'_>,
-)->eredu_architectures::speculative_execution::PreparedEmbeddedEvidence{
-    use crate::composition::mlx::speculative::{RegisteredTensorSource,retain_external_evidence_for_roots,tensor_sources};
+    first: &crate::backend::array_copy::RegisteredArrayCopy,
+    second: &crate::backend::array_copy::RegisteredArrayCopy,
+    pair: &AutoregressiveSourcePair,
+    environment: &crate::backend::OriginalCopyEnvironment<'_>,
+    other_stream: &safemlx::Stream,
+    foreign_context: SpeculativeExecutionStreams<'_>,
+) -> eredu_architectures::speculative_execution::PreparedEmbeddedEvidence {
+    use crate::composition::mlx::speculative::{
+        retain_external_evidence_for_roots, tensor_sources, RegisteredTensorSource,
+    };
     use eredu_architectures::speculative_execution::PreparedEmbeddedEvidence;
     use eredu_core::HostPreparationAuthority;
     use eredu_nn::workspace::HostMetadataFunding;
-    let funding=pair.metadata_funding();
-    let retain=|copy:&crate::backend::array_copy::RegisteredArrayCopy|{
-        let proof=RegisteredTensorSource::from_copy(copy,pair.request().source_identity(),environment.stream(),funding).unwrap();
-        assert!(proof.matches_completed_stream(environment.stream(),funding).unwrap());
-        assert!(!proof.matches_completed_stream(other_stream,funding).unwrap());
-        funding.reserve_metadata(PreparedEmbeddedEvidence::retained_control_bytes::<RegisteredTensorSource>().unwrap()
-            +HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap()).unwrap();
-        PreparedEmbeddedEvidence::from_prepared(proof,HostPreparationAuthority::retain(funding.clone()))
+    let funding = pair.metadata_funding();
+    let retain = |copy: &crate::backend::array_copy::RegisteredArrayCopy| {
+        let proof = RegisteredTensorSource::from_copy(
+            copy,
+            pair.request().source_identity(),
+            environment.stream(),
+            funding,
+        )
+        .unwrap();
+        assert!(proof
+            .matches_completed_stream(environment.stream(), funding)
+            .unwrap());
+        assert!(!proof
+            .matches_completed_stream(other_stream, funding)
+            .unwrap());
+        funding
+            .reserve_metadata(
+                PreparedEmbeddedEvidence::retained_control_bytes::<RegisteredTensorSource>()
+                    .unwrap()
+                    + HostPreparationAuthority::retention_bytes::<HostMetadataFunding>().unwrap(),
+            )
+            .unwrap();
+        PreparedEmbeddedEvidence::from_prepared(
+            proof,
+            HostPreparationAuthority::retain(funding.clone()),
+        )
     };
-    let first_proof=retain(first);let second_proof=retain(second);
-    let context=SpeculativeExecutionStreams::single(environment.stream())
-        .with_original_sources(pair,environment).unwrap();
-    let selected=tensor_sources::input_array_environment(&first_proof,first.array(),context,
-        eredu_core::speculative::SamplingPlacement::Target,funding).unwrap();
-    assert!(std::ptr::eq(selected,environment));
-    let foreign=tensor_sources::input_array_environment(&first_proof,first.array(),foreign_context,
-        eredu_core::speculative::SamplingPlacement::Target,funding).err().expect("foreign request is refused");
+    let first_proof = retain(first);
+    let second_proof = retain(second);
+    let context = SpeculativeExecutionStreams::single(environment.stream())
+        .with_original_sources(pair, environment)
+        .unwrap();
+    let selected = tensor_sources::input_array_environment(
+        &first_proof,
+        first.array(),
+        context,
+        eredu_core::speculative::SamplingPlacement::Target,
+        funding,
+    )
+    .unwrap();
+    assert!(std::ptr::eq(selected, environment));
+    let foreign = tensor_sources::input_array_environment(
+        &first_proof,
+        first.array(),
+        foreign_context,
+        eredu_core::speculative::SamplingPlacement::Target,
+        funding,
+    )
+    .err()
+    .expect("foreign request is refused");
     identity_mismatch(&foreign);
-    let empty=||crate::backend::runtime::cache::state::CompletedResidentSource::project_array_sources(
-        |_|{},&[],pair.request(),environment.stream(),funding).unwrap();
-    let both=[&first_proof,&second_proof];
-    let current=retain_external_evidence_for_roots(empty(),|visit|{visit(first.array());visit(first.array());},
-        &both,pair.numerical_sources(),environment).unwrap();
-    assert_eq!(tensor_sources::registered_tensor_sources(&current).count(),1);
-    assert!(tensor_sources::registered_source_for_array(&current,first.array(),funding).unwrap().is_some());
-    assert!(tensor_sources::registered_source_for_array(&current,second.array(),funding).unwrap().is_none());
+    let empty = || {
+        crate::backend::runtime::cache::state::CompletedResidentSource::project_array_sources(
+            |_| {},
+            &[],
+            pair.request(),
+            environment.stream(),
+            funding,
+        )
+        .unwrap()
+    };
+    let both = [&first_proof, &second_proof];
+    let current = retain_external_evidence_for_roots(
+        empty(),
+        |visit| {
+            visit(first.array());
+            visit(first.array());
+        },
+        &both,
+        pair.numerical_sources(),
+        environment,
+    )
+    .unwrap();
+    assert_eq!(
+        tensor_sources::registered_tensor_sources(&current).count(),
+        1
+    );
+    assert!(
+        tensor_sources::registered_source_for_array(&current, first.array(), funding)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        tensor_sources::registered_source_for_array(&current, second.array(), funding)
+            .unwrap()
+            .is_none()
+    );
     // The second copy occurs only in predecessor custody. It does not reappear
     // as a declared root through another publication or an empty root set.
-    let historical=retain_external_evidence_for_roots(empty(),|visit|visit(second.array()),
-        &[&current],pair.numerical_sources(),environment).unwrap();
-    assert_eq!(tensor_sources::registered_tensor_sources(&historical).count(),0);
-    let none=retain_external_evidence_for_roots(empty(),|_|{},&[&current],pair.numerical_sources(),environment).unwrap();
-    assert_eq!(tensor_sources::registered_tensor_sources(&none).count(),0);
-    drop((first_proof,second_proof,historical,none));
+    let historical = retain_external_evidence_for_roots(
+        empty(),
+        |visit| visit(second.array()),
+        &[&current],
+        pair.numerical_sources(),
+        environment,
+    )
+    .unwrap();
+    assert_eq!(
+        tensor_sources::registered_tensor_sources(&historical).count(),
+        0
+    );
+    let none = retain_external_evidence_for_roots(
+        empty(),
+        |_| {},
+        &[&current],
+        pair.numerical_sources(),
+        environment,
+    )
+    .unwrap();
+    assert_eq!(tensor_sources::registered_tensor_sources(&none).count(), 0);
+    drop((first_proof, second_proof, historical, none));
     current
 }
 
 #[test]
 #[ignore = "requires native Metal execution"]
 fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_custody() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let backend = admitted_backend(&pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let mut target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
@@ -199,7 +285,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let foreign = AutoregressiveSourcePair::prepare_funded(
@@ -207,16 +293,14 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
             draft.original_model_source().unwrap(),
             &foreign_schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
             pair.metadata_funding().clone(),
         )
         .unwrap();
-        assert!(
-            !pair
-                .request()
-                .source_identity()
-                .belongs_to_request(foreign.request())
-        );
+        assert!(!pair
+            .request()
+            .source_identity()
+            .belongs_to_request(foreign.request()));
         let environment = backend.original_copy_environment().unwrap();
         let context = SpeculativeExecutionStreams::single(backend.stream())
             .with_original_sources(&pair, &environment)
@@ -264,7 +348,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
                         roots,
                         mechanisms,
                         funding,
-                        REQUEST_CEILING,
+                        &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                     )
                     .err()
                     .expect("unregistered role-born source needs its completion evidence");
@@ -302,7 +386,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
                                 roots,
                                 mechanisms,
                                 funding,
-                                REQUEST_CEILING,
+                                &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                             )
                             .err()
                             .expect("one role's completed source cannot cover another backing");
@@ -336,7 +420,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
                             roots,
                             mechanisms,
                             funding,
-                            REQUEST_CEILING,
+                            &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                         )?;
                         let second = IsolatedArrayCopy::new(leaf).copy_completed(
                             completed,
@@ -344,7 +428,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
                             roots,
                             mechanisms,
                             funding,
-                            REQUEST_CEILING,
+                            &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                         )?;
                         // Published copy backing follows the existing registered path,
                         // even when an unrelated completed inventory is also supplied.
@@ -354,7 +438,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
                             roots,
                             mechanisms,
                             funding,
-                            REQUEST_CEILING,
+                            &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                         )?;
                         let evidence=registered_current_roots(&first,&second,&pair,&environment,backend.weights_stream(),foreign_context);
                         let copies = [first, second, branch];
@@ -389,7 +473,7 @@ fn completed_model_cache_leaf_copies_keep_independent_backing_and_exact_source_c
     // The actual copied payloads and failed-prefix diagnostics escape both
     // source requests and model sessions with their own Q/H retention.
     drop((target, draft, target_config, draft_config, selected));
-    assert!(pool.used_bytes().unwrap() > initial);
+    assert!(pool.fixture_host_charge().unwrap() > initial);
     for copy in &copies {
         assert_eq!(copy.array().evaluated().unwrap().as_slice::<f32>(), values);
     }

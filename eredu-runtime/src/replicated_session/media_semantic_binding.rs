@@ -20,11 +20,16 @@ where
     ) -> Result<MediaSessionBinding, OriginalMediaBindingError> {
         self.media_semantic_boundary()?;
         if !self.state.inference_retention().is_empty()
-            || self.mechanisms.original_prefill_state_frontier(&self.state)? != Some(0)
+            || self
+                .mechanisms
+                .original_prefill_state_frontier(&self.state)?
+                != Some(0)
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        self.state.inference_retention().initialize_metadata_revision(funding)?;
+        self.state
+            .inference_retention()
+            .initialize_metadata_revision(funding)?;
         self.original_request_media_binding().map_err(Into::into)
     }
 
@@ -53,7 +58,7 @@ where
         Ok(MediaSessionBinding {
             execution: self.prefill_identity.clone(),
             revision: revision.clone(),
-            control: std::sync::Arc::clone(&self.control_identity),
+            control: self.control_identity.clone(),
             frontier,
         })
     }
@@ -75,7 +80,7 @@ where
         Ok(MediaSessionBinding {
             execution: self.prefill_identity.clone(),
             revision: revision.clone(),
-            control: std::sync::Arc::clone(&self.control_identity),
+            control: self.control_identity.clone(),
             frontier,
         })
     }

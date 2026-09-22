@@ -1,12 +1,13 @@
 use super::*;
 use crate::working_memory::{
-    plan_prefill, PrefillPlanningError, WorkingMemoryError, WorkingMemoryPool,
+    InferenceExecutionIdentity, MemoryLedger, PrefillPlanningError, WorkingMemoryError,
+    plan_prefill,
 };
 use eredu_core::{
-    AdmissionRequest, CacheStateStrategy, EstimationCompleteness, InputModalities, InputTokenCount,
-    LayerSchedule, ModelCapabilities, Observed, StateMemoryLayout,
+    AdmissionRequest, AdmissionResult, CacheStateStrategy, EstimationCompleteness, InputModalities,
+    InputTokenCount, LayerSchedule, ModelCapabilities, Observed, StateMemoryLayout,
 };
-use eredu_nn::{workspace::*, Error, Tensor};
+use eredu_nn::{Error, Tensor, workspace::*};
 use std::num::NonZeroU8;
 
 #[derive(Debug)]
@@ -15,6 +16,23 @@ struct Facts {
     host: Option<u64>,
 }
 impl WorkspaceMechanisms for Facts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     fn operation_bound(
         &self,
         _: &WorkspaceOperation,
@@ -52,6 +70,17 @@ fn trace(tensor: u64, host: Option<u64>, retain: bool) -> WorkspaceTraceReport {
         })
         .unwrap()
 }
+fn fixture_requirements(bytes: u64) -> eredu_core::DomainMemoryRequirements {
+    let topology = crate::working_memory::memory_fixture::host_topology();
+    let mut result = eredu_core::DomainMemoryRequirements::zero(&topology);
+    result
+        .add_allocation(
+            bytes,
+            crate::working_memory::memory_fixture::host_placement(),
+        )
+        .unwrap();
+    result
+}
 fn geometry() -> InferenceGeometry {
     InferenceGeometry {
         batch_size: 2,
@@ -72,6 +101,15 @@ fn outside(geometry: InferenceGeometry) -> ExecutionWorkspaceEstimate {
         state_update: zero(),
         materialization: zero(),
         retained: zero(),
+        physical_domains: Some(eredu_core::DomainExecutionWorkspaceEstimate {
+            geometry,
+            activations: fixture_requirements(0),
+            attention: fixture_requirements(0),
+            vocabulary: fixture_requirements(0),
+            state_update: fixture_requirements(0),
+            materialization: fixture_requirements(0),
+            retained: fixture_requirements(0),
+        }),
     }
 }
 fn request(g: InferenceGeometry) -> AdmissionRequest {
@@ -79,9 +117,8 @@ fn request(g: InferenceGeometry) -> AdmissionRequest {
         input: InputTokenCount::text(g.cached_positions + g.input_positions),
         max_output_tokens: g.max_output_tokens,
         batch_size: g.batch_size,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: Some(100),
-        require_complete_estimate: true,
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
     }
 }
 fn state(g: InferenceGeometry) -> RuntimeStateEstimate {
@@ -116,11 +153,28 @@ fn capabilities() -> ModelCapabilities {
 #[test]
 fn request_quote_prices_overlapping_cache_generations_and_rejects_the_old_underestimate() {
     use crate::{ArchitectureStateFactory, RuntimeLayerState};
-    use eredu_core::{cache::LayerCachePolicy, AdmissionResult, AttentionPolicy};
+    use eredu_core::{AdmissionResult, AttentionPolicy, cache::LayerCachePolicy};
     use eredu_nn::AttentionCache;
     #[derive(Debug)]
     struct StateFacts;
     impl WorkspaceMechanisms for StateFacts {
+        fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+            Some(crate::working_memory::memory_fixture::host_topology_ref())
+        }
+        fn output_placement(
+            &self,
+            _: WorkspaceOperationView<'_>,
+            _: usize,
+        ) -> Option<&eredu_core::MemoryPlacement> {
+            Some(crate::working_memory::memory_fixture::host_placement())
+        }
+        fn scratch_placement(
+            &self,
+            _: WorkspaceOperationView<'_>,
+        ) -> Option<&eredu_core::MemoryPlacement> {
+            Some(crate::working_memory::memory_fixture::host_placement())
+        }
+
         fn operation_bound(
             &self,
             operation: &WorkspaceOperation,
@@ -202,26 +256,35 @@ fn request_quote_prices_overlapping_cache_generations_and_rejects_the_old_undere
     let estimate = report.compose(persistent, outside(g)).unwrap();
     let mut request = request(g);
     // Displaced state contributes to both persistent and transient demand.
-    request.application_memory_budget_bytes = Some(128);
+    request.memory_limits = crate::working_memory::memory_fixture::host_limits(128);
+    let AdmissionResult::Admitted(short) =
+        eredu_core::apply_admission_policy(&capabilities(), request.clone(), estimate.clone())
+            .unwrap()
+    else {
+        panic!("complete domain requirements")
+    };
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     assert!(matches!(
-        eredu_core::apply_admission_policy(&capabilities(), request, estimate.clone(), None)
-            .unwrap(),
-        AdmissionResult::Rejected(eredu_core::AdmissionRejection::MemoryBudgetExceeded { .. })
+        pool.reserve(&InferenceExecutionIdentity::default(), &short),
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
-    request.application_memory_budget_bytes = Some(192);
+    request.memory_limits = Default::default();
     let AdmissionResult::Admitted(admission) =
-        eredu_core::apply_admission_policy(&capabilities(), request, estimate, None).unwrap()
+        eredu_core::apply_admission_policy(&capabilities(), request, estimate).unwrap()
     else {
         panic!("complete overlap bound must fit exact capacity");
     };
-    assert_eq!(admission.incremental_required_bytes, 192);
-    let pool = WorkingMemoryPool::new(192, 0).unwrap();
+    assert_eq!(admission.incremental_required_bytes, Some(192));
+    let total = crate::working_memory::memory_fixture::reservation_bytes(&pool, &admission);
+    let pool = crate::working_memory::memory_fixture::host_ledger(total, 0).unwrap();
     let owner = pool
         .reserve(&InferenceExecutionIdentity::default(), &admission)
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 192);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 192);
     drop(owner);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -240,7 +303,7 @@ fn primitive_only_trace_cannot_authorize_an_inference_request() {
     assert_eq!(report.transient().bytes(), None);
     let estimate = report.compose(state(g), outside(g)).unwrap();
     assert!(matches!(
-        eredu_core::apply_admission_policy(&capabilities(), request(g), estimate, None).unwrap(),
+        eredu_core::apply_admission_policy(&capabilities(), request(g), estimate).unwrap(),
         eredu_core::AdmissionResult::Rejected(
             eredu_core::AdmissionRejection::EstimationUnsupported { .. }
         )
@@ -348,7 +411,6 @@ fn one_unpriced_late_decode_cannot_be_hidden_by_larger_complete_spans() {
         &capabilities(),
         request(g),
         report.compose(state(g), outside(g)).unwrap(),
-        None,
     )
     .unwrap();
     assert!(matches!(
@@ -366,13 +428,12 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
         ..geometry()
     };
     let execution = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
     let mut candidates = Vec::new();
     let mut quote = |g: InferenceGeometry| {
         candidates.push(g.prefill_chunk_positions);
         let report = quote_inference_workspace(g, |span| {
             let bytes = match span {
-            InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
+                InferenceWorkspaceSpan::Sampling(_) => unreachable!("model-only traversal fixture"),
                 InferenceWorkspaceSpan::Prefill(chunk) => match chunk.input.end - chunk.input.start
                 {
                     5 => 150,
@@ -389,6 +450,20 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
         .unwrap();
         report.compose(state(g), outside(g))
     };
+    let probe = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let sample_geometry = InferenceGeometry {
+        prefill_chunk_positions: 3,
+        ..g
+    };
+    let sample = quote(sample_geometry).unwrap();
+    let AdmissionResult::Admitted(sample) =
+        eredu_core::apply_admission_policy(&capabilities(), request(sample_geometry), sample)
+            .unwrap()
+    else {
+        panic!("complete fixture")
+    };
+    let metadata = crate::working_memory::memory_fixture::reservation_bytes(&probe, &sample) - 96;
+    let pool = crate::working_memory::memory_fixture::host_ledger(100 + metadata, 0).unwrap();
     let (_, first) = plan_prefill(
         &execution,
         &pool,
@@ -399,8 +474,16 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
     )
     .unwrap();
     assert_eq!(first.geometry().prefill_chunk_positions, 3);
-    assert_eq!(first.bytes(), 96);
-    assert_eq!(pool.used_bytes().unwrap(), 96);
+    assert_eq!(
+        first
+            .requirements()
+            .get(crate::working_memory::memory_fixture::host_topology_ref().host_domain())
+            .ok()
+            .and_then(|charge| charge.total().ok())
+            .unwrap(),
+        96 + metadata
+    );
+    assert_eq!(pool.payload_used_bytes().unwrap(), 96);
     assert!(matches!(
         plan_prefill(
             &execution,
@@ -411,14 +494,11 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
             &mut quote
         ),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded {
-                available_bytes: 4,
-                ..
-            }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ))
     ));
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let (_, next) = plan_prefill(
         &execution,
         &pool,
@@ -428,9 +508,16 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
         &mut quote,
     )
     .unwrap();
-    assert_eq!(next.bytes(), 96);
-    assert_eq!(&candidates[..3], &[5, 4, 3]);
-    assert_eq!(pool.peak_bytes().unwrap(), 96);
+    assert_eq!(
+        next.requirements()
+            .get(crate::working_memory::memory_fixture::host_topology_ref().host_domain())
+            .ok()
+            .and_then(|charge| charge.total().ok())
+            .unwrap(),
+        96 + metadata
+    );
+    assert_eq!(&candidates[1..4], &[5, 4, 3]);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), 96 + metadata);
     drop(next);
     // Smaller prompt chunks cannot eliminate an over-budget late cache update.
     // No reservation (and therefore no authorized preparation) may result.
@@ -456,14 +543,11 @@ fn full_request_quotes_select_chunks_and_reserve_against_concurrent_work() {
     );
     assert!(matches!(
         rejected,
-        Err(PrefillPlanningError::Admission(
-            eredu_core::AdmissionRejection::MemoryBudgetExceeded {
-                required_bytes: 120,
-                budget_bytes: 100
-            }
+        Err(PrefillPlanningError::Reservation(
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -491,29 +575,43 @@ fn failed_quote_stops_traversal_and_composition_keeps_geometry_and_state_guards(
         prefill_chunk_positions: 0,
         ..g
     };
-    assert!(quote_inference_workspace(
-        invalid_geometry,
-        |_| -> Result<WorkspaceTraceReport, Error> {
-            panic!("invalid geometry must not inspect equations")
-        }
-    )
-    .is_err());
-    let report = quote_inference_workspace(g, |_| Ok::<_, Error>(trace(4, Some(0), true))).unwrap();
     assert!(
-        report.compose(state(g), outside(g)).is_err(),
-        "retained state exceeds fixture's zero-state quote"
+        quote_inference_workspace(
+            invalid_geometry,
+            |_| -> Result<WorkspaceTraceReport, Error> {
+                panic!("invalid geometry must not inspect equations")
+            }
+        )
+        .is_err()
+    );
+    let report = quote_inference_workspace(g, |_| Ok::<_, Error>(trace(4, Some(0), true))).unwrap();
+    let actual = report.compose(state(g), outside(g)).unwrap();
+    assert_eq!(
+        actual
+            .physical_domains
+            .as_ref()
+            .unwrap()
+            .decoder_state
+            .get(crate::working_memory::memory_fixture::host_topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
+        4,
+        "canonical retained backing refines the logical state estimate"
     );
     let report =
         quote_inference_workspace(g, |_| Ok::<_, Error>(trace(4, Some(0), false))).unwrap();
-    assert!(report
-        .compose(
-            state(g),
-            outside(InferenceGeometry {
-                prefill_chunk_positions: 1,
-                ..g
-            })
-        )
-        .is_err());
+    assert!(
+        report
+            .compose(
+                state(g),
+                outside(InferenceGeometry {
+                    prefill_chunk_positions: 1,
+                    ..g
+                })
+            )
+            .is_err()
+    );
     let mut unknown = outside(g);
     unknown.materialization = WorkspaceBound::Unknown {
         reason: "fixture missing materialization".into(),
@@ -527,7 +625,7 @@ fn failed_quote_stops_traversal_and_composition_keeps_geometry_and_state_guards(
 #[test]
 fn invalid_request_identity_or_context_rejects_before_inspecting_equations() {
     let execution = InferenceExecutionIdentity::default();
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(100, 0).unwrap();
     let g = geometry();
     let mut wrong = request(g);
     wrong.batch_size += 1;
@@ -571,7 +669,7 @@ fn invalid_request_identity_or_context_rejects_before_inspecting_equations() {
             eredu_core::AdmissionRejection::EstimationUnsupported { .. }
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod span_workspace;
@@ -664,19 +762,38 @@ fn native_completed_equation_envelope_carries_escaped_scores_and_late_unknowns()
 #[test]
 fn terminal_copy_geometry_schedules_no_forward_or_sampling_attempt() {
     let geometry = InferenceGeometry {
-        batch_size: 1, cached_positions: 7, input_positions: 0,
-        max_output_tokens: 0, prefill_chunk_positions: 0, output: OutputDemand::StateOnly,
+        batch_size: 1,
+        cached_positions: 7,
+        input_positions: 0,
+        max_output_tokens: 0,
+        prefill_chunk_positions: 0,
+        output: OutputDemand::StateOnly,
     };
     geometry.validate_fixed().unwrap();
     let report = quote_inference_workspace(geometry, |_| -> Result<WorkspaceTraceReport, Error> {
         panic!("terminal state placement has no model equation");
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(report.completed_spans, 0);
     assert!(report.span_workspace_plan().records().is_empty());
-    assert_eq!(report.span_workspace_plan().generation_forward_count(), Some(0));
+    assert_eq!(
+        report.span_workspace_plan().generation_forward_count(),
+        Some(0)
+    );
     for invalid in [
-        InferenceGeometry { max_output_tokens: 1, ..geometry },
-        InferenceGeometry { prefill_chunk_positions: 1, ..geometry },
-        InferenceGeometry { output: OutputDemand::LastPosition, ..geometry },
-    ] { assert!(invalid.validate_fixed().is_err()); }
+        InferenceGeometry {
+            max_output_tokens: 1,
+            ..geometry
+        },
+        InferenceGeometry {
+            prefill_chunk_positions: 1,
+            ..geometry
+        },
+        InferenceGeometry {
+            output: OutputDemand::LastPosition,
+            ..geometry
+        },
+    ] {
+        assert!(invalid.validate_fixed().is_err());
+    }
 }

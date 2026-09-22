@@ -370,6 +370,8 @@ pub(crate) fn control_bytes<T: Retention>() -> Option<u64> {
         size_of::<Option<OriginalPredictionRecoveryCustody>>(),
         size_of::<Result<Recovery<T>, Error>>(),
         size_of::<T>(),
+        size_of::<(&mut safemlx::SubmissionScope, &T)>(),
+        size_of::<Result<(), safemlx::error::Exception>>(),
     ]
     .into_iter()
     .try_fold(0usize, usize::checked_add)?;

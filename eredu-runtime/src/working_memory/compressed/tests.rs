@@ -33,7 +33,10 @@ impl WorkspaceMechanisms for Facts {
         {
             return Ok(None);
         }
-        let alias = matches!(op.kind, WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. });
+        let alias = matches!(
+            op.kind,
+            WorkspaceOperationKind::Index { .. } | WorkspaceOperationKind::StaticSlice { .. }
+        );
         Ok(Some(WorkspaceOperationBound {
             outputs: op
                 .outputs
@@ -356,9 +359,11 @@ fn imported_state_validates_geometry_and_context_without_equations() {
         (pair(4, 2, &context), pair(5, 2, &context)),
         (pair(4, 2, &context), pair(2, 3, &context)),
     ] {
-        assert!(cache(4, &context)
-            .with_existing_state(storage, logical)
-            .is_err());
+        assert!(
+            cache(4, &context)
+                .with_existing_state(storage, logical)
+                .is_err()
+        );
     }
     assert!(context.report(&[]).unwrap().operations.is_empty());
 }
@@ -505,7 +510,7 @@ fn ordinary_fixed_and_pooling_transactions_share_and_deduplicate_existing_storag
     use crate::working_memory::{
         WorkspaceConcatStateFactory, WorkspacePoolingStateFactory, WorkspaceResidentLayerState,
     };
-    use eredu_core::{cache::*, AttentionPolicy};
+    use eredu_core::{AttentionPolicy, cache::*};
 
     let (context, _) = context(false);
     let storage = WorkspaceExistingStorage::new(Some(4096), &context);
@@ -657,7 +662,7 @@ fn empty_transaction_checkpoints_still_require_the_selected_context() {
     use crate::working_memory::{
         WorkspaceConcatStateFactory, WorkspacePoolingStateFactory, WorkspaceResidentLayerState,
     };
-    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy};
+    use eredu_core::{AttentionPolicy, cache::LayerCachePolicy};
 
     let (context, _) = context(false);
     let (foreign, _) = self::context(false);
@@ -690,12 +695,14 @@ fn empty_transaction_checkpoints_still_require_the_selected_context() {
     ] {
         assert!(state.retained_values().next().is_none());
         assert!(state.checkpoint_for_transaction(&foreign).is_err());
-        assert!(state
-            .checkpoint_for_transaction(&context)
-            .unwrap()
-            .retained_values()
-            .next()
-            .is_none());
+        assert!(
+            state
+                .checkpoint_for_transaction(&context)
+                .unwrap()
+                .retained_values()
+                .next()
+                .is_none()
+        );
     }
     assert!(context.report(&[]).unwrap().operations.is_empty());
     assert!(foreign.report(&[]).unwrap().operations.is_empty());

@@ -1,8 +1,6 @@
 mod prepared_capture {
     use super::*;
-    use eredu_core::{
-        capture::*, PreparedControlInput, PreparedControlInputBackend, TextGenerationBackend,
-    };
+    use eredu_core::{capture::*, TextGenerationBackend};
     fn prompt(family: usize, chunk: Option<u64>) -> MlxModelInput {
         prompt_length(family, chunk, false)
     }
@@ -160,25 +158,24 @@ mod prepared_capture {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
     }
     fn source(
         runtime: &ModelRuntime<MlxBackend<'_>>,
-        input: &impl PreparedControlInput,
+        input: &eredu_core::PreparedPromptAttribution,
         empty: bool,
     ) -> SharedCapturePlan {
         source_plan(runtime, input, plan(empty))
     }
     fn source_plan(
         runtime: &ModelRuntime<MlxBackend<'_>>,
-        input: &impl PreparedControlInput,
+        input: &eredu_core::PreparedPromptAttribution,
         selected: CapturePlan,
     ) -> SharedCapturePlan {
         let discovery = MlxBackend::capture_discovery(runtime).unwrap();
-        let a = input.attribution();
+        let a = input;
         SharedCapturePlan::new(
             selected
                 .admit_with_text_origin(
@@ -260,24 +257,12 @@ mod prepared_capture {
             )
             .unwrap(),
         );
-        let input = MlxBackend::prepare_control_input(&runtime, prompt_length(family, chunk, long))
-            .unwrap();
-        assert_eq!(
-            input.attribution().decoder_positions,
-            if long { 6 } else { 5 }
+        let (input, _input_custody, attribution) = crate::tests::support::original_input::prepare(
+            &runtime,
+            prompt_length(family, chunk, long),
         );
-        let source = selected.map(|plan| source_plan(&runtime, &input, plan));
-        let input = if let Some(source) = &source {
-            MlxBackend::bind_control_input_capture(&runtime, input, config, source.clone())
-                .unwrap_or_else(|error| {
-                    panic!("family {family}, mode {mode}, chunk {chunk:?}: {error:?}")
-                })
-        } else {
-            input
-        };
-        let input = MlxBackend::consume_control_input(&runtime, input)
-            .unwrap()
-            .0;
+        assert_eq!(attribution.decoder_positions, if long { 6 } else { 5 });
+        let source = selected.map(|plan| source_plan(&runtime, &attribution, plan));
         let cancellation = GenerationCancellationToken::new();
         if cancel == Some(0) {
             cancellation.cancel();
@@ -287,16 +272,18 @@ mod prepared_capture {
                 let mut ids = Vec::new();
                 let mut frames = Vec::new();
                 if manual {
-                    let mut generation = eredu_core::ControlledTextGeneration::from_input(
-                        &mut runtime,
-                        eredu_core::TextGenerationInput::Prepared(input),
-                        config,
-                        AllowAllTokens,
-                    )
-                    .unwrap();
-                    if let Some(source) = source {
-                        generation.enable_prepared_capture(source).unwrap();
-                    }
+                    let mut generation =
+                        eredu_core::ControlledTextGeneration::from_input_with_options(
+                            &mut runtime,
+                            eredu_core::TextGenerationInput::OriginalPrepared(input),
+                            config,
+                            AllowAllTokens,
+                            eredu_core::TextPreparationOptions {
+                                capture: source.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
                     while let Some(token) = generation.next_cancellable(&cancellation) {
                         ids.push(token.unwrap().token_id());
                         if captured {
@@ -308,12 +295,16 @@ mod prepared_capture {
                         }
                     }
                 } else {
-                    let mut generation =
-                        eredu_core::TextGeneration::from_prompt(&mut runtime, input, config)
-                            .unwrap();
-                    if let Some(source) = source {
-                        generation.enable_prepared_capture(source).unwrap();
-                    }
+                    let mut generation = eredu_core::TextGeneration::from_input_with_options(
+                        &mut runtime,
+                        eredu_core::TextGenerationInput::OriginalPrepared(input),
+                        config,
+                        eredu_core::TextPreparationOptions {
+                            capture: source.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
                     while let Some(token) = generation.next_cancellable(&cancellation) {
                         ids.push(token.unwrap().token_id().unwrap());
                         if captured {
@@ -579,9 +570,8 @@ mod prepared_capture {
                     true,
                 );
                 let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-                let pool =
-                    eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-                let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+                let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
                 let model = load_model(&backend, root.path(), weights(mode)).unwrap();
                 let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
                 let config = TextGenerationConfig::new(
@@ -595,9 +585,11 @@ mod prepared_capture {
                     )
                     .unwrap(),
                 );
-                let input =
-                    MlxBackend::prepare_control_input(&runtime, prompt_length(0, Some(2), true))
-                        .unwrap();
+                let (input, _input_custody, attribution) =
+                    crate::tests::support::original_input::prepare(
+                        &runtime,
+                        prompt_length(0, Some(2), true),
+                    );
                 let mut selected = plan(true);
                 selected.selections.push(CaptureSelection {
                     id: "failed global".into(),
@@ -609,13 +601,7 @@ mod prepared_capture {
                     slices: vec![],
                     transform,
                 });
-                let source = source_plan(&runtime, &input, selected);
-                let input =
-                    MlxBackend::bind_control_input_capture(&runtime, input, config, source.clone())
-                        .unwrap();
-                let input = MlxBackend::consume_control_input(&runtime, input)
-                    .unwrap()
-                    .0;
+                let source = source_plan(&runtime, &attribution, selected);
                 let native_error = Array::from_slice(&[1.0f32], &[1])
                     .reshape(&[2], &stream)
                     .unwrap_err();
@@ -624,14 +610,17 @@ mod prepared_capture {
                     if candidate { 0 } else { 1 },
                     native_error,
                 );
-                let mut generation = eredu_core::ControlledTextGeneration::from_input(
+                let mut generation = eredu_core::ControlledTextGeneration::from_input_with_options(
                     &mut runtime,
-                    eredu_core::TextGenerationInput::Prepared(input),
+                    eredu_core::TextGenerationInput::OriginalPrepared(input),
                     config,
                     AllowAllTokens,
+                    eredu_core::TextPreparationOptions {
+                        capture: Some(source.clone()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
-                generation.enable_prepared_capture(source).unwrap();
                 let error = match generation.next() {
                     Some(Err(error)) => error,
                     _ => panic!("selected global failure must not emit a token"),
@@ -921,21 +910,22 @@ mod prepared_capture {
             )
             .unwrap(),
         );
-        let input = MlxBackend::prepare_control_input(&runtime, prompt(0, Some(2))).unwrap();
-        let source = source(&runtime, &input, false);
+        let (input, _input_custody, attribution) =
+            crate::tests::support::original_input::prepare(&runtime, prompt(0, Some(2)));
+        let source = source(&runtime, &attribution, false);
         let substitute = SharedCapturePlan::new(source.admission().clone());
         assert!(!source.same_storage(&substitute));
-        let input =
-            MlxBackend::bind_control_input_capture(&runtime, input, config, source).unwrap();
-        let prompt = MlxBackend::consume_control_input(&runtime, input)
-            .unwrap()
-            .0;
+        let prompt = input;
         let (_, roots) = media_completion::observe(None, || {
-            let mut generation = eredu_core::ControlledTextGeneration::from_prompt(
+            let mut generation = eredu_core::ControlledTextGeneration::from_input_with_options(
                 &mut runtime,
-                prompt,
+                eredu_core::TextGenerationInput::OriginalPrepared(prompt),
                 config,
                 AllowAllTokens,
+                eredu_core::TextPreparationOptions {
+                    capture: Some(source),
+                    ..Default::default()
+                },
             )
             .unwrap();
             assert!(generation.enable_prepared_capture(substitute).is_err());
@@ -943,84 +933,15 @@ mod prepared_capture {
         assert!(roots.is_empty());
     }
     #[test]
-    fn native_prepared_capture_rejects_existing_mismatching_request_without_replacement_or_encoder()
-    {
-        use eredu_runtime::working_memory::{InferenceExecutionIdentity, InferenceRequest};
-        let root = tempfile::tempdir().unwrap();
-        fixture(root.path(), 0);
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let backend = crate::native::backend(&stream, &stream);
-        let model = load_model(&backend, root.path(), weights(0)).unwrap();
-        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-        let execution = runtime
-            .session_mut()
-            .neutral_prediction_target_mut()
-            .unwrap()
-            .inference_execution_identity()
-            .clone();
-        let config = TextGenerationConfig::new(
-            eredu_core::resolve_generation_config(
-                None,
-                eredu_core::GenerationConfigOverrides {
-                    max_new_tokens: Some(4),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        );
-        let expected = eredu_core::InferenceGeometry {
-            batch_size: 1,
-            cached_positions: 0,
-            input_positions: 5,
-            max_output_tokens: 4,
-            prefill_chunk_positions: 2,
-            output: eredu_core::OutputDemand::Sequence,
-        };
-        for wrong_identity in [false, true] {
-            let mut geometry = expected;
-            if !wrong_identity {
-                geometry.output = eredu_core::OutputDemand::LastPosition;
-            }
-            let supplied_execution = if wrong_identity {
-                InferenceExecutionIdentity::default()
-            } else {
-                execution.clone()
-            };
-            let request =
-                InferenceRequest::without_memory_budget(&supplied_execution, geometry).unwrap();
-            let pending = prompt(0, Some(2)).with_inference_request(request.clone());
-            let input = MlxBackend::prepare_control_input(&runtime, pending).unwrap();
-            let source = source(&runtime, &input, false);
-            let before = snapshot(runtime.session_mut());
-            let (result, roots) = media_completion::observe(None, || {
-                MlxBackend::bind_control_input_capture(&runtime, input, config, source)
-            });
-            assert!(result.is_err());
-            assert!(roots.is_empty());
-            assert_eq!(snapshot(runtime.session_mut()), before);
-            assert_eq!(request.geometry(), geometry);
-            // A rejected attachment neither consumed nor replaced the original
-            // ordinary request. Genuine preparation can still claim its start.
-            if wrong_identity {
-                assert!(request.validate(&execution, expected).is_err());
-            }
-            let prepared = request
-                .prepare_text(&supplied_execution, geometry, config)
-                .unwrap();
-            drop(prepared);
-        }
-    }
-
-    #[test]
     fn native_prepared_media_empty_and_tensor_frames_keep_actual_pool_owner_after_runtime() {
-        use eredu_runtime::working_memory::WorkingMemoryPool;
+        use eredu_runtime::working_memory::MemoryLedger;
         for empty in [false, true] {
             let root = tempfile::tempdir().unwrap();
             fixture(root.path(), 0);
             let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let frame = {
-                let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+                let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
                 let model = load_model(&backend, root.path(), weights(0)).unwrap();
                 let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
                 let config = TextGenerationConfig::new(
@@ -1034,23 +955,20 @@ mod prepared_capture {
                     )
                     .unwrap(),
                 );
-                let input =
-                    MlxBackend::prepare_control_input(&runtime, prompt(0, Some(2))).unwrap();
-                let source = source(&runtime, &input, empty);
-                let input =
-                    MlxBackend::bind_control_input_capture(&runtime, input, config, source.clone())
-                        .unwrap();
-                let input = MlxBackend::consume_control_input(&runtime, input)
-                    .unwrap()
-                    .0;
-                let mut generation = eredu_core::ControlledTextGeneration::from_input(
+                let (input, _input_custody, attribution) =
+                    crate::tests::support::original_input::prepare(&runtime, prompt(0, Some(2)));
+                let source = source(&runtime, &attribution, empty);
+                let mut generation = eredu_core::ControlledTextGeneration::from_input_with_options(
                     &mut runtime,
-                    eredu_core::TextGenerationInput::Prepared(input),
+                    eredu_core::TextGenerationInput::OriginalPrepared(input),
                     config,
                     AllowAllTokens,
+                    eredu_core::TextPreparationOptions {
+                        capture: Some(source.clone()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
-                generation.enable_prepared_capture(source).unwrap();
                 let mut frame = None;
                 for prediction in 0..2 {
                     assert!(generation.next().unwrap().is_ok());
@@ -1104,8 +1022,8 @@ mod prepared_capture {
         for mode in 0..3 {
             let baseline = run_plan(root.path(), 0, mode, Some(2), None, true, Some(1), true);
             let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-            let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-            let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+            let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
             let model = load_model(&backend, root.path(), weights(mode)).unwrap();
             let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
             let config = TextGenerationConfig::new(
@@ -1119,9 +1037,11 @@ mod prepared_capture {
                 )
                 .unwrap(),
             );
-            let input =
-                MlxBackend::prepare_control_input(&runtime, prompt_length(0, Some(2), true))
-                    .unwrap();
+            let (input, _input_custody, attribution) =
+                crate::tests::support::original_input::prepare(
+                    &runtime,
+                    prompt_length(0, Some(2), true),
+                );
             let mut selected = plan(true);
             selected.selections.push(CaptureSelection {
                 id: "failed global".into(),
@@ -1133,13 +1053,7 @@ mod prepared_capture {
                 slices: vec![],
                 transform: CaptureTransform::Summary,
             });
-            let source = source_plan(&runtime, &input, selected);
-            let input =
-                MlxBackend::bind_control_input_capture(&runtime, input, config, source.clone())
-                    .unwrap();
-            let input = MlxBackend::consume_control_input(&runtime, input)
-                .unwrap()
-                .0;
+            let source = source_plan(&runtime, &attribution, selected);
             let native_error = Array::from_slice(&[1.0f32], &[1])
                 .reshape(&[2], &stream)
                 .unwrap_err();
@@ -1148,14 +1062,17 @@ mod prepared_capture {
                 1,
                 native_error,
             );
-            let mut generation = eredu_core::ControlledTextGeneration::from_input(
+            let mut generation = eredu_core::ControlledTextGeneration::from_input_with_options(
                 &mut runtime,
-                eredu_core::TextGenerationInput::Prepared(input),
+                eredu_core::TextGenerationInput::OriginalPrepared(input),
                 config,
                 AllowAllTokens,
+                eredu_core::TextPreparationOptions {
+                    capture: Some(source.clone()),
+                    ..Default::default()
+                },
             )
             .unwrap();
-            generation.enable_prepared_capture(source).unwrap();
             let error = match generation.next() {
                 Some(Err(error)) => error,
                 _ => panic!("selected global failure must not emit a token"),

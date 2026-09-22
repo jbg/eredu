@@ -19,19 +19,39 @@ fn registered_copy_source_preserves_request_separation_and_escaped_account() {
         SpeculativeSchedulerOptions::default(),
     )
     .unwrap();
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
-    let other_pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
+    let other_pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request =
-        OriginalSpeculativeRequest::prepare(&pool, &execution, &schedule, 1 << 24).unwrap();
-    let other_request =
-        OriginalSpeculativeRequest::prepare(&pool, &execution, &schedule, 1 << 24).unwrap();
-    let foreign =
-        OriginalSpeculativeRequest::prepare(&other_pool, &execution, &schedule, 1 << 24).unwrap();
-    let registered = pool.register_storage([(7u32, 16)]).unwrap();
-    let baseline = pool.used_bytes().unwrap();
+    let request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &schedule,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
+    )
+    .unwrap();
+    let other_request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &schedule,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
+    )
+    .unwrap();
+    let foreign = OriginalSpeculativeRequest::prepare(
+        &other_pool,
+        &execution,
+        &schedule,
+        crate::working_memory::memory_fixture::resolved_host_limits(&other_pool, 1 << 24),
+    )
+    .unwrap();
+    let registered = pool.register_host_storage([(7u32, 16)]).unwrap();
+    let baseline = pool.payload_used_bytes().unwrap();
     let context = WorkspaceContext::new(ScalarSquare);
-    let root = WorkspaceExistingStorage::new(Some(16), &context);
+    let root = WorkspaceExistingStorage::try_new_placed(
+        Some(16),
+        crate::working_memory::memory_fixture::host_placement(),
+        &context,
+    )
+    .unwrap();
     let input = WorkspaceTensor::existing_with_storage(
         WorkspaceLayout::new(&[1, 4], WorkspaceDtype::Uint32).unwrap(),
         &root,
@@ -44,7 +64,7 @@ fn registered_copy_source_preserves_request_separation_and_escaped_account() {
     let copy = pool
         .admit_workspace_copy(
             RegisteredWorkspaceCopy::bind(plan, binding).unwrap(),
-            WorkspaceCopyLimits::new(1 << 24),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(1 << 24)),
         )
         .unwrap();
     let (custody, scope) = copy.into_parts();
@@ -63,12 +83,12 @@ fn registered_copy_source_preserves_request_separation_and_escaped_account() {
     // array ownership is manufactured by the provenance constructor.
     scope.certify().unwrap();
     drop((custody, retention));
-    assert!(pool.used_bytes().unwrap() > baseline);
+    assert!(pool.payload_used_bytes().unwrap() > baseline);
     request.close().unwrap();
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline);
     drop((registered, request, other_request, context));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(foreign);
-    assert_eq!(other_pool.used_bytes().unwrap(), 0);
+    assert_eq!(other_pool.payload_used_bytes().unwrap(), 0);
 }

@@ -17,7 +17,8 @@ fn framing(
 ) -> Option<crate::processor_plan::MediaFraming> {
     match policy {
         Policy::Gemma(_) => model.architecture().gemma4()?.framing(InputModality::Video),
-        _ => model.architecture().qwen()?.framing(),
+        Policy::Vl(_) | Policy::Conditional(_) => model.architecture().qwen()?.framing(),
+        Policy::Inkling(_) | Policy::Muse(_) => None,
     }
 }
 fn timestamp(origin: InputExtent, policy: Policy<'_>) -> Option<CompositeGeneratedText> {
@@ -63,6 +64,10 @@ pub(super) fn validate(
     };
     let mut previous: Option<(usize, usize, usize, usize, usize, u64)> = None;
     for (part_index, part) in source.parts().enumerate() {
+        // These processors retain their text framing as original token parts.
+        if matches!(policy, Policy::Inkling(_) | Policy::Muse(_)) {
+            continue;
+        }
         let Some(origin) = video_origin(&part) else {
             continue;
         };
@@ -195,6 +200,9 @@ pub(super) fn part(
             Projection::SourceTokens
         }
         (CompositeSemanticRole::Encoded | CompositeSemanticRole::Projected, modality) => {
+            if matches!(policy, Policy::Inkling(_) | Policy::Muse(_)) {
+                return Projection::Unavailable;
+            }
             if let Some(origin) = video_origin(&part) {
                 return match policy {
                     Policy::Gemma(_) => Projection::VideoMarker {

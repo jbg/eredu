@@ -6,6 +6,7 @@ use crate::backend::{
     nn::workspace::{ExistingArrayProjection, MlxMetalWorkspaceMechanisms},
     runtime::residency::storage::RetainedStorage,
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{
     cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
     InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig,
@@ -19,12 +20,7 @@ use eredu_runtime::working_memory::{
 use safemlx::{Device, DeviceType};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-fn fresh(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
-    capacity: u64,
-) -> Result<(InferenceTextPreparation, WorkingMemoryFundingRun), WorkingMemoryError> {
-    let execution = InferenceExecutionIdentity::default();
+fn fresh_admission(bytes: u64) -> Admission {
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -57,6 +53,7 @@ fn fresh(
     };
     let state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: bound(bytes),
             attention: bound(0),
@@ -66,15 +63,40 @@ fn fresh(
             retained: bound(0),
         })
         .unwrap();
+    crate::memory_fixture::admission(Admission {
+        requested_positions: 1,
+        state,
+        incremental_required_bytes: Some(bytes),
+        memory_limits: Default::default(),
+        additional_headroom: Default::default(),
+    })
+}
+
+fn fresh_requirements(pool: &MemoryLedger, bytes: u64) -> u64 {
+    crate::memory_fixture::host_total(
+        &pool
+            .reservation_requirements(&fresh_admission(bytes), None)
+            .unwrap(),
+    )
+}
+
+fn fresh(
+    pool: &MemoryLedger,
+    bytes: u64,
+    capacity: u64,
+) -> Result<(InferenceTextPreparation, WorkingMemoryFundingRun), WorkingMemoryError> {
+    let execution = InferenceExecutionIdentity::default();
+    let admission = fresh_admission(bytes);
+    let geometry = admission
+        .state
+        .execution_workspace
+        .as_ref()
+        .unwrap()
+        .geometry;
     let reservation = pool.reserve_with_capacity(
         &execution,
-        &Admission {
-            requested_positions: 1,
-            state,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        capacity,
+        &admission,
+        crate::memory_fixture::physical_host_limits(pool, capacity),
     )?;
     let (reservation, run) = reservation.into_funding()?;
     // The low-level preparation contract accepts zero outputs; no application
@@ -99,14 +121,25 @@ fn fresh(
 fn metal() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Gpu, 0))
 }
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9);
+    let mut reported = false;
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::ordinary_retirement::reclaim_all();
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        if !reported && std::time::Instant::now() >= deadline {
+            eprintln!(
+                "retirement expected funded={bytes}, actual={}, snapshot={:?}",
+                pool.fixture_funded_charge().unwrap(),
+                pool.snapshot().unwrap()
+            );
+            reported = true;
+        }
+        pool.fixture_funded_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
-fn arrays(pool: &WorkingMemoryPool) -> [Array; 2] {
+fn arrays(pool: &MemoryLedger) -> [Array; 2] {
     let owner = NativeMemoryOwner::acquire(pool).unwrap();
     let arrays = [
         Array::from_slice(&[0x1020_3040u32, 0x5060_7080], &[2]),
@@ -121,10 +154,7 @@ fn arrays(pool: &WorkingMemoryPool) -> [Array; 2] {
     drop(owner);
     arrays
 }
-fn quote(
-    pool: &WorkingMemoryPool,
-    arrays: &[Array; 2],
-) -> (u64, WorkingMemoryStorage<StorageIdentity>) {
+fn quote(pool: &MemoryLedger, arrays: &[Array; 2]) -> (u64, WorkingMemoryStorage<StorageIdentity>) {
     let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
     let mut projection = ExistingArrayProjection::new(&context);
     let inputs = arrays
@@ -138,12 +168,18 @@ fn quote(
         &context,
         storage
             .iter()
-            .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+            .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root)),
     )
     .unwrap();
     let plan = WorkspaceIsolatedCopyPlan::prepare(&context, registered.borrowed_storage(), &inputs)
         .unwrap();
-    let bytes = plan.incremental_bytes().unwrap();
+    let bytes = plan
+        .incremental_bytes()
+        .unwrap()
+        .checked_add(crate::memory_fixture::publication_control_bytes(
+            inputs.len().checked_mul(2).unwrap(),
+        ))
+        .unwrap();
     let mut complete = RetainedStorage::default();
     for array in arrays {
         complete.include_array(array).unwrap();
@@ -173,7 +209,7 @@ fn memory(error: &Error) -> &WorkingMemoryError {
 #[test]
 fn absent_prompt_exact_native_capacity_preserves_none_and_fresh_retention_from_live_or_saved() {
     for use_saved in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let stream = metal();
         let source_arrays = arrays(&pool);
         let mut original = Some(MlxPoolingAttentionState::stateless());
@@ -203,14 +239,26 @@ fn absent_prompt_exact_native_capacity_preserves_none_and_fresh_retention_from_l
         };
         let (required, complete) = quote(&pool, &source_arrays);
         assert!(required > 0);
-        let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
-        let capacity = before.0 + required;
+        let before = (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
+        let capacity = pool
+            .fixture_host_current()
+            .unwrap()
+            .checked_add(fresh_requirements(&pool, required))
+            .unwrap();
         assert!(matches!(
             fresh(&pool, required, capacity - 1),
-            Err(WorkingMemoryError::BudgetExceeded { .. })
+            Err(WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
         ));
         assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+            (
+                pool.fixture_funded_charge().unwrap(),
+                pool.fixture_host_peak().unwrap()
+            ),
             before
         );
         let (preparation, run) = fresh(&pool, required, capacity).unwrap();
@@ -255,7 +303,13 @@ fn absent_prompt_exact_native_capacity_preserves_none_and_fresh_retention_from_l
             assert_eq!(source.inference_retention().revision(), &old_revision);
         }
         let escaped = copied[0].clone();
-        let bytes = escaped.allocation_info().unwrap().unwrap().bytes() as u64;
+        let bytes = {
+            let info = escaped.allocation_info().unwrap().unwrap();
+            (info.bytes() as u64)
+                .checked_add(info.host_control_bytes() as u64)
+                .unwrap()
+        };
+        let account_controls = crate::memory_fixture::request_control_bytes(preparation.request());
         drop((
             copied,
             destination,
@@ -265,7 +319,7 @@ fn absent_prompt_exact_native_capacity_preserves_none_and_fresh_retention_from_l
             preparation,
             run,
         ));
-        settle(&pool, bytes);
+        settle(&pool, bytes + account_controls);
         assert_eq!(words(&escaped), vec![0x1020_3040, 0x5060_7080]);
         drop(escaped);
         settle(&pool, 0);
@@ -275,18 +329,28 @@ fn absent_prompt_exact_native_capacity_preserves_none_and_fresh_retention_from_l
 #[test]
 fn absent_prompt_wrong_actual_source_and_cancelled_claim_leave_no_native_roots() {
     for cancel in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let source_arrays = arrays(&pool);
         let source = MlxPoolingAttentionState::stateless();
         let other = MlxPoolingAttentionState::stateless();
         let plan = PreparedStatelessPoolingCopy::prepare(&source).unwrap();
         let (required, complete) = quote(&pool, &source_arrays);
-        let (preparation, run) =
-            fresh(&pool, required, pool.used_bytes().unwrap() + required).unwrap();
+        let (preparation, run) = fresh(
+            &pool,
+            required,
+            pool.fixture_host_current()
+                .unwrap()
+                .checked_add(fresh_requirements(&pool, required))
+                .unwrap(),
+        )
+        .unwrap();
         let (initialized, native) = plan
             .construct_prompt(preparation.claim_prompt().unwrap(), &run, complete)
             .unwrap();
-        let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+        let before = (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
         if cancel {
             drop(initialized);
         } else {
@@ -295,7 +359,10 @@ fn absent_prompt_wrong_actual_source_and_cancelled_claim_leave_no_native_roots()
             assert_eq!(memory(&error), &WorkingMemoryError::IdentityMismatch);
         }
         assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+            (
+                pool.fixture_funded_charge().unwrap(),
+                pool.fixture_host_peak().unwrap()
+            ),
             before
         );
         assert!(matches!(
@@ -321,14 +388,21 @@ struct AfterKey;
 #[test]
 fn absent_prompt_failure_or_unwind_retains_real_partials_until_explicit_settlement() {
     for unwind in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let stream = metal();
         let source_arrays = arrays(&pool);
         let source = MlxPoolingAttentionState::stateless();
         let plan = PreparedStatelessPoolingCopy::prepare(&source).unwrap();
         let (required, complete) = quote(&pool, &source_arrays);
-        let (preparation, run) =
-            fresh(&pool, required, pool.used_bytes().unwrap() + required).unwrap();
+        let (preparation, run) = fresh(
+            &pool,
+            required,
+            pool.fixture_host_current()
+                .unwrap()
+                .checked_add(fresh_requirements(&pool, required))
+                .unwrap(),
+        )
+        .unwrap();
         let (initialized, native) = plan
             .construct_prompt(preparation.claim_prompt().unwrap(), &run, complete)
             .unwrap();
@@ -352,9 +426,9 @@ fn absent_prompt_failure_or_unwind_retains_real_partials_until_explicit_settleme
         }
         assert_eq!(roots.borrow().len(), 2);
         assert_eq!(words(&source_arrays[1]), vec![23]);
-        let charged = pool.used_bytes().unwrap();
+        let charged = pool.fixture_funded_charge().unwrap();
         drop((prepared, preparation, run));
-        assert_eq!(pool.used_bytes().unwrap(), charged);
+        assert_eq!(pool.fixture_funded_charge().unwrap(), charged);
         for root in roots.borrow().iter() {
             root.evaluated().unwrap();
         }

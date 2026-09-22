@@ -1,14 +1,12 @@
 //! Consumed native preparation for the shared isolated-copy program.
 use super::*;
 use crate::backend::{
-    OriginalCopyEnvironment, OriginalCopyEnvironmentError,
     nn::workspace::IsolatedCopyNativeLayout,
     submission_recovery::{PreparedRecovery, Recovery, Retention},
+    OriginalCopyEnvironment, OriginalCopyEnvironmentError,
 };
 use eredu_core::BackendFailure;
-use eredu_runtime::working_memory::{
-    WorkingMemoryPool, WorkspaceCopyCustody, WorkspaceCopyRetention,
-};
+use eredu_runtime::working_memory::{MemoryLedger, WorkspaceCopyCustody, WorkspaceCopyRetention};
 use safemlx::{
     ArrayDescriptorError, DeviceType, Dtype, InitializedInputAllocator, OperationEvent,
     OriginalBufferBudget, OriginalBufferCause, OriginalNativeControlError, OriginalScopeObserver,
@@ -22,7 +20,7 @@ use safemlx::{
 use std::mem::{size_of, size_of_val};
 #[path = "original/realtime.rs"]
 mod realtime;
-pub(crate) use realtime::{RealtimeCopyPlan,RealtimeCopyContext};
+pub(crate) use realtime::{RealtimeCopyContext, RealtimeCopyPlan};
 #[path = "original/host_store.rs"]
 mod host_store;
 pub(crate) use host_store::{PreparedSavedHostCopy, SavedHostCopyPlan};
@@ -259,9 +257,10 @@ impl OriginalCopyLayoutBuilder {
             size_of::<usize>() * 4,
             size_of::<bool>(),
             size_of::<DeviceType>(),
-            size_of::<StreamCopyPlan<()>>()*2,
-            size_of::<Result<StreamCopyPlan<()>,StreamCopyCause>>(),
-            size_of::<StreamCopyCause>(),size_of::<(&Stream,)>(),
+            size_of::<StreamCopyPlan<()>>() * 2,
+            size_of::<Result<StreamCopyPlan<()>, StreamCopyCause>>(),
+            size_of::<StreamCopyCause>(),
+            size_of::<(&Stream,)>(),
             size_of::<(Self, &super::PreparedPendingTokenInput<'_>, &Stream)>(),
             size_of::<(Self, u64, &Stream)>(),
             size_of::<(Self, &super::PreparedPendingTokenInput<'_>, DeviceType)>(),
@@ -295,10 +294,13 @@ impl OriginalCopyLayoutBuilder {
         self.finish_resume_input_for(prepared, DeviceType::Gpu)
     }
 
-    pub(crate) fn finish_resume_input_on(self,prepared:&super::PreparedPendingTokenInput<'_>,stream:&Stream)
-        ->Result<OriginalResumeCopyPopulation,OriginalCopyCause> {
-        let source=StreamCopyPlan::<()>::capture(stream)?;
-        self.finish_resume_input_for(prepared,source.device_type())
+    pub(crate) fn finish_resume_input_on(
+        self,
+        prepared: &super::PreparedPendingTokenInput<'_>,
+        stream: &Stream,
+    ) -> Result<OriginalResumeCopyPopulation, OriginalCopyCause> {
+        let source = StreamCopyPlan::<()>::capture(stream)?;
+        self.finish_resume_input_for(prepared, source.device_type())
     }
 
     fn finish_resume_input_for(
@@ -321,11 +323,17 @@ impl OriginalCopyLayoutBuilder {
         let cast = facts.dtype() == Dtype::Int32;
         let layout = match device {
             DeviceType::Gpu => self.layout(1 + usize::from(cast)),
-            DeviceType::Cpu if self.host.operands==0 => IsolatedCopyNativeLayout::cpu_resume(
-                self.operands,self.source_clones,self.maximum_rank,facts.rank(),
-                usize::try_from(prepared.positions()).map_err(|_|OriginalCopyCause::Overflow)?,cast),
+            DeviceType::Cpu if self.host.operands == 0 => IsolatedCopyNativeLayout::cpu_resume(
+                self.operands,
+                self.source_clones,
+                self.maximum_rank,
+                facts.rank(),
+                usize::try_from(prepared.positions()).map_err(|_| OriginalCopyCause::Overflow)?,
+                cast,
+            ),
             _ => None,
-        }.ok_or(OriginalCopyCause::UnknownLayout)?;
+        }
+        .ok_or(OriginalCopyCause::UnknownLayout)?;
         let logical_bytes = self
             .logical_bytes
             .checked_mul(2)
@@ -365,23 +373,34 @@ impl OriginalCopyLayoutBuilder {
         self,
         positions: u64,
     ) -> Result<OriginalResumeCopyPopulation, OriginalCopyCause> {
-        self.finish_resume_completed_input_for(positions,DeviceType::Gpu)
+        self.finish_resume_completed_input_for(positions, DeviceType::Gpu)
     }
-    pub(crate) fn finish_resume_completed_input_on(self,positions:u64,stream:&Stream)
-        ->Result<OriginalResumeCopyPopulation,OriginalCopyCause> {
-        let source=StreamCopyPlan::<()>::capture(stream)?;
-        self.finish_resume_completed_input_for(positions,source.device_type())
+    pub(crate) fn finish_resume_completed_input_on(
+        self,
+        positions: u64,
+        stream: &Stream,
+    ) -> Result<OriginalResumeCopyPopulation, OriginalCopyCause> {
+        let source = StreamCopyPlan::<()>::capture(stream)?;
+        self.finish_resume_completed_input_for(positions, source.device_type())
     }
-    fn finish_resume_completed_input_for(self,positions:u64,device:DeviceType)
-        ->Result<OriginalResumeCopyPopulation,OriginalCopyCause> {
+    fn finish_resume_completed_input_for(
+        self,
+        positions: u64,
+        device: DeviceType,
+    ) -> Result<OriginalResumeCopyPopulation, OriginalCopyCause> {
         if !self.host_stores.empty() {
             return Err(OriginalCopyCause::UnknownLayout);
         }
         let layout = match device {
-            DeviceType::Gpu=>self.layout(0),
-            DeviceType::Cpu if self.host.operands==0=>IsolatedCopyNativeLayout::cpu_completed(self.operands,self.source_clones,self.maximum_rank),
-            _=>None,
-        }.ok_or(OriginalCopyCause::UnknownLayout)?;
+            DeviceType::Gpu => self.layout(0),
+            DeviceType::Cpu if self.host.operands == 0 => IsolatedCopyNativeLayout::cpu_completed(
+                self.operands,
+                self.source_clones,
+                self.maximum_rank,
+            ),
+            _ => None,
+        }
+        .ok_or(OriginalCopyCause::UnknownLayout)?;
         let logical_bytes = self
             .logical_bytes
             .checked_mul(2)
@@ -414,12 +433,7 @@ impl OriginalCopyLayoutBuilder {
         if self.operands == 0 && self.source_clones == 0 && self.host_stores.empty() {
             return Ok(None);
         }
-        if self.operands == 0
-            || !cfg!(all(
-                target_vendor = "apple",
-                not(feature = "cuda")
-            ))
-        {
+        if self.operands == 0 || !cfg!(all(target_vendor = "apple", not(feature = "cuda"))) {
             return Err(OriginalCopyCause::UnknownLayout);
         }
         let stream = StreamCopyPlan::<()>::capture(environment.stream())?;
@@ -453,10 +467,7 @@ impl OriginalCopyLayoutBuilder {
     ) -> Result<OriginalCopyPlan<'a>, OriginalCopyCause> {
         if self.operands != 0
             || self.source_clones != 1
-            || !cfg!(all(
-                target_vendor = "apple",
-                not(feature = "cuda")
-            ))
+            || !cfg!(all(target_vendor = "apple", not(feature = "cuda")))
         {
             return Err(OriginalCopyCause::UnknownLayout);
         }
@@ -500,8 +511,7 @@ impl OriginalCopyLayoutBuilder {
         let births = births
             .checked_add(self.host_stores.count)
             .ok_or(OriginalCopyCause::Overflow)?;
-        let population =
-            OriginalBufferBudget::population_layout(&runtime, logical_bytes, births)?;
+        let population = OriginalBufferBudget::population_layout(&runtime, logical_bytes, births)?;
         let buffer_bytes = population.capacity();
         let physical_bytes = buffer_bytes
             .checked_add(self.host_stores.backing)
@@ -609,7 +619,7 @@ impl OriginalResumeCopyPopulation {
 
 pub(crate) struct OriginalCopyPlan<'a> {
     stream: &'a Stream,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     allocator: &'static InitializedInputAllocator,
     layout: IsolatedCopyNativeLayout,
     pipeline: Option<PreparedPipelineCachePlan>,
@@ -641,6 +651,19 @@ impl OriginalCopyPlan<'_> {
     pub(crate) fn physical_bytes(&self) -> usize {
         self.physical_bytes
     }
+    /// Placement comes from the initialized allocator backing this selected
+    /// CPU/Metal copy worker, independently of the stream that submits it.
+    pub(crate) fn physical_domain(&self) -> Result<eredu_core::MemoryDomainId, OriginalCopyCause> {
+        let runtime = self
+            .allocator
+            .try_borrow_runtime()
+            .map_err(OriginalCopyEnvironmentError::from)?;
+        if runtime.allocation_placement() != safemlx::AllocationPlacement::Host {
+            return Err(OriginalCopyCause::UnknownLayout);
+        }
+        Ok(self.pool.topology().host_domain())
+    }
+
     pub(crate) fn stream(&self) -> &Stream {
         self.stream
     }
@@ -661,11 +684,17 @@ impl OriginalCopyPlan<'_> {
     ) -> Result<PreparedOriginalCopy, OriginalCopyFailure> {
         let retained = custody.retention();
         let result = (|| -> Result<PreparedOriginalCopy, OriginalCopyCause> {
-            if !custody.pool().same_domain(self.pool) {
+            if !custody.pool().same_ledger(self.pool) {
                 return Err(OriginalCopyCause::ForeignPool);
             }
+            let domain = self.physical_domain()?;
+            let allowance = custody
+                .requirements()
+                .get(domain)
+                .and_then(|charge| charge.total())
+                .map_err(|_| OriginalCopyCause::ForeignPool)?;
             if u64::try_from(self.physical_bytes).map_err(|_| OriginalCopyCause::Overflow)?
-                > custody.bytes()
+                > allowance
             {
                 return Err(OriginalCopyCause::Capacity);
             }

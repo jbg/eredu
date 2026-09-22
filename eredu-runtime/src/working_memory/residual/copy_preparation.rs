@@ -156,21 +156,58 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
         let full_copy = span
             .retained_bytes
             .zip(span.transient_bytes)
-            .ok_or(WorkingMemoryError::UnknownBound)?;
-        let full_copy = full_copy
-            .0
-            .checked_add(full_copy.1)
-            .ok_or(WorkingMemoryError::Overflow)?;
+            .and_then(|(retained, transient)| retained.checked_add(transient));
+        if full_copy.is_none() && self.report().physical_domains.is_none() {
+            return Err(WorkingMemoryError::UnknownBound.into());
+        }
         let mut full_outside = metadata.clone_execution(&outside_without_copy)?;
-        add_copy(&mut full_outside.state_update, full_copy, metadata)?;
+        let domains_complete = self.report().physical_domains.is_some()
+            && outside_without_copy.physical_domains.is_some();
+        add_copy(
+            &mut full_outside.state_update,
+            full_copy,
+            domains_complete,
+            metadata,
+        )?;
         let mut incremental_outside = outside_without_copy;
         add_copy(
             &mut incremental_outside.state_update,
             self.incremental_bytes(),
+            domains_complete,
             metadata,
         )?;
+        match self.report().physical_domains.as_ref() {
+            Some(copy) => {
+                if let Some(domains) = &mut full_outside.physical_domains {
+                    let full = metadata.combine_domain_requirements(
+                        copy.state_transient
+                            .as_ref()
+                            .ok_or(WorkingMemoryError::UnknownBound)?,
+                        copy.retained_state
+                            .as_ref()
+                            .ok_or(WorkingMemoryError::UnknownBound)?,
+                        true,
+                    )?;
+                    domains.state_update =
+                        metadata.combine_domain_requirements(&domains.state_update, &full, true)?;
+                }
+                if let Some(domains) = &mut incremental_outside.physical_domains {
+                    domains.state_update = metadata.combine_domain_requirements(
+                        &domains.state_update,
+                        copy.residual
+                            .as_ref()
+                            .ok_or(WorkingMemoryError::UnknownBound)?,
+                        true,
+                    )?;
+                }
+            }
+            None => {
+                full_outside.physical_domains = None;
+                incremental_outside.physical_domains = None;
+            }
+        }
         if let Some(prepared) = prepared {
-            if !prepared.pool().same_domain(self.source().pool()) {
+            if !prepared.pool().same_ledger(self.source().pool()) {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
             let mut proof = prepared.compose_copied_source_metadata(
@@ -193,9 +230,12 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
             return Ok(CopyPreparationInferenceQuote { proof, copy: self });
         }
         let state = equations.refine_state_backing_metadata(state, metadata)?;
-        let span_workspace =
-            InferenceSpanWorkspace::new_fixed(equations.span_workspace_plan(), &full_outside)
-                .map_err(crate::working_memory::WorkspaceReportError::from)?;
+        let span_workspace = InferenceSpanWorkspace::new_metadata(
+            equations.span_workspace_plan(),
+            &full_outside,
+            metadata,
+        )
+        .map_err(crate::working_memory::WorkspaceReportError::from)?;
         let full =
             equations.compose_metadata(metadata.clone_state(&state)?, full_outside, metadata)?;
         // Preserve provable full overflow and required-domain gaps even when
@@ -204,6 +244,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
         let incremental = equations.compose_metadata(state, incremental_outside, metadata)?;
         let incremental_bytes =
             full_requirement_with(&incremental, geometry, self.source().pool())?;
+        let incremental_requirements = full_domain_requirements(&incremental, metadata)?;
         let pin =
             RegisteredStoragePin::new_metadata(self.source().registration().clone(), metadata)
                 .map_err(crate::working_memory::WorkspaceReportError::from)?;
@@ -211,6 +252,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
             state: super::QuoteDiagnostics::new(full, metadata)?,
             geometry,
             incremental_bytes,
+            incremental_requirements,
             // The closed source discount applies only to the separate copy.
             // Future equations remain fully priced, so the named transient is
             // the exact term later replaced by retained native generations.
@@ -228,17 +270,35 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceCopy<K> {
 
 fn add_copy(
     bound: &mut WorkspaceBound,
-    copy: u64,
+    copy: Option<u64>,
+    domains_complete: bool,
     metadata: crate::working_memory::WorkspaceReportMetadata<'_>,
 ) -> Result<(), WorkspaceCopyCompositionError> {
-    if let WorkspaceBound::Bounded { bytes, assumptions } = bound {
-        *bytes = bytes
-            .checked_add(copy)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        metadata.append(
-            assumptions,
-            "; closed isolated-copy preparation with exact registered source association",
-        )?;
+    if matches!(bound, WorkspaceBound::Unknown { .. }) {
+        return Ok(());
+    }
+    let diagnostic = match (&*bound, copy) {
+        (WorkspaceBound::Bounded { bytes, .. }, Some(copy)) => bytes.checked_add(copy),
+        _ => None,
+    };
+    if let Some(total) = diagnostic {
+        if let WorkspaceBound::Bounded { bytes, assumptions } = bound {
+            *bytes = total;
+            metadata.append(
+                assumptions,
+                "; closed isolated-copy preparation with exact registered source association",
+            )?;
+        }
+    } else if domains_complete {
+        *bound = metadata.per_domain(format_args!(
+            "closed isolated-copy requirements are resolved independently per physical domain"
+        ))?;
+    } else if copy.is_none() || matches!(bound, WorkspaceBound::PerDomain { .. }) {
+        *bound = metadata.unknown(format_args!(
+            "copy requirements lack complete physical attribution"
+        ))?;
+    } else {
+        return Err(WorkingMemoryError::Overflow.into());
     }
     Ok(())
 }
@@ -330,11 +390,15 @@ impl<K: Clone + Ord + Send + Sync + 'static> CopyPreparationInferenceQuote<K> {
         self.proof.geometry()
     }
     /// Full new demand, excluding only the fixed copy's registered old roots.
-    pub fn incremental_bytes(&self) -> u64 {
+    pub fn incremental_bytes(&self) -> Option<u64> {
         self.proof.incremental_bytes()
     }
+    /// Placed incremental requirement retaining exact allocation provenance.
+    pub fn incremental_requirements(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.proof.incremental_requirements()
+    }
     /// Domain retaining the independently charged old roots.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    pub fn pool(&self) -> &MemoryLedger {
         self.proof.pool()
     }
 
@@ -345,14 +409,17 @@ impl<K: Clone + Ord + Send + Sync + 'static> CopyPreparationInferenceQuote<K> {
     /// cannot lower the minimum. Source pins survive funding and quarantine.
     pub fn reserve_saved_source_with_capacity_handoff(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
         admission: &Admission,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         handoffs: &[WorkingMemoryCapacityHandoff],
         saved: &RegisteredSavedSamplingSource<'_, K>,
     ) -> Result<WorkingMemoryReservation, WorkingMemoryError> {
-        if !pool.same_domain(self.pool()) || admission.state != *self.state() {
+        if !pool.same_ledger(self.pool())
+            || admission.state != *self.state()
+            || admission.incremental_required_bytes != self.incremental_bytes()
+        {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let joined = CopySourceValidation {
@@ -364,13 +431,17 @@ impl<K: Clone + Ord + Send + Sync + 'static> CopyPreparationInferenceQuote<K> {
             .pin
             .clone()
             .expect("closed copy always retains its source association");
+        let requirements = self
+            .proof
+            .incremental_requirements()
+            .ok_or(WorkingMemoryError::UnknownBound)?;
         // The future-generation proof owns its dynamic equation plan. Its
         // planning account is distinct from the sealed copied-source H/credit.
         let reservation = pool.reserve_limited_with_source_metadata(
             execution,
             admission,
             Some(capacity),
-            Some((self.incremental_bytes(), pin)),
+            Some((requirements, pin)),
             handoffs,
             Some(&joined),
             self.proof.metadata_funding(),
@@ -386,12 +457,15 @@ struct CopySourceValidation<'a, 's, K: Ord + Send + 'static> {
 impl<K: Clone + Ord + Send + Sync + 'static> SavedSourceValidation
     for CopySourceValidation<'_, '_, K>
 {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         self.saved.validate(pool, usage)?;
         self.copy.validate_copy_source(pool, usage)
     }
     fn pin(&self) -> RegisteredStoragePin {
         // The copy's own pin is independently carried by the sealed residual.
         self.saved.pin()
+    }
+    fn pin_control_bytes(&self) -> Result<usize, WorkingMemoryError> {
+        self.saved.pin_control_bytes()
     }
 }

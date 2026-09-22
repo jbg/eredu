@@ -170,7 +170,15 @@ fn requirements(plan: &InferenceSpanWorkspacePlan) -> SpeculativeInvocationRequi
     // This portable fixture creates no native Graph, Record, Scope or worker.
     // Account controls are priced by reserve_role itself; the real traced
     // scalar output provides its nonzero physical obligation.
-    SpeculativeInvocationRequirements::new(plan, physical, Some(0), Some(0), Some(0)).unwrap()
+    SpeculativeInvocationRequirements::new(
+        plan,
+        physical,
+        Some(0),
+        Some(0),
+        Some(0),
+        std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -207,14 +215,22 @@ fn embedded_account_binds_full_geometry_startup_and_numerical_source_identity() 
         let prediction_report = report(predicted.geometry());
         let equivalent = report(predicted.geometry());
         let capacity = 1 << 26;
-        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
         let execution = InferenceExecutionIdentity::default();
-        let request =
-            OriginalSpeculativeRequest::prepare_embedded(&pool, &execution, &schedule, capacity)
-                .unwrap();
-        let other =
-            OriginalSpeculativeRequest::prepare_embedded(&pool, &execution, &schedule, capacity)
-                .unwrap();
+        let request = OriginalSpeculativeRequest::prepare_embedded(
+            &pool,
+            &execution,
+            &schedule,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
+        let other = OriginalSpeculativeRequest::prepare_embedded(
+            &pool,
+            &execution,
+            &schedule,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
         let target_start = request
             .reserve_embedded_startup(OriginalEmbeddedSpeculativeSource::Target, 19)
             .unwrap();
@@ -238,7 +254,7 @@ fn embedded_account_binds_full_geometry_startup_and_numerical_source_identity() 
                 .is_err()
         );
         let mut cursor = schedule.into_cursor();
-        let before = pool.used_bytes().unwrap();
+        let before = pool.payload_used_bytes().unwrap();
         // Matching full geometry still cannot substitute another phase/source.
         let wrong = request
             .reserve_embedded_role(
@@ -266,7 +282,7 @@ fn embedded_account_binds_full_geometry_startup_and_numerical_source_identity() 
             WorkingMemoryError::IdentityMismatch
         ));
         drop(wrong);
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.payload_used_bytes().unwrap(), before);
         let role = request
             .reserve_embedded_role(
                 cursor.claim(prediction).unwrap(),
@@ -299,10 +315,19 @@ fn embedded_account_binds_full_geometry_startup_and_numerical_source_identity() 
         let bytes = role.physical_bytes();
         assert!(bytes > 0);
         let required = || {
-            SpeculativeNumericalRequirements::new(program, Some(bytes), Some(0), Some(0), Some(0))
-                .unwrap()
+            SpeculativeNumericalRequirements::new(
+                program,
+                Some(bytes),
+                Some(0),
+                Some(0),
+                Some(0),
+                std::sync::Arc::new(
+                    crate::working_memory::memory_fixture::host_placement().clone(),
+                ),
+            )
+            .unwrap()
         };
-        let used = pool.used_bytes().unwrap();
+        let used = pool.payload_used_bytes().unwrap();
         assert!(matches!(
             other
                 .reserve_numerical(required(), &[SpeculativeNumericalSource::Model(&source)])
@@ -310,22 +335,22 @@ fn embedded_account_binds_full_geometry_startup_and_numerical_source_identity() 
                 .cause(),
             WorkingMemoryError::IdentityMismatch
         ));
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.payload_used_bytes().unwrap(), used);
         let numerical = request
             .reserve_numerical(required(), &[SpeculativeNumericalSource::Model(&source)])
             .unwrap()
             .begin();
-        let cumulative = pool.used_bytes().unwrap();
+        let cumulative = pool.payload_used_bytes().unwrap();
         assert!(cumulative > used);
         drop(role);
         drop(prediction_start);
-        assert_eq!(pool.used_bytes().unwrap(), cumulative);
+        assert_eq!(pool.payload_used_bytes().unwrap(), cumulative);
         request.close().unwrap();
         drop(other);
         drop(request);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.payload_used_bytes().unwrap() > 0);
         drop((target_start, source, numerical, retained));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -343,17 +368,24 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
     let report = report(workspace.geometry());
     let limit = schedule.attempts(EmbeddedOccurrenceKind::FusedProposal);
     let capacity = 1 << 26;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request =
-        OriginalSpeculativeRequest::prepare_embedded(&pool, &execution, &schedule, capacity)
-            .unwrap();
+    let request = OriginalSpeculativeRequest::prepare_embedded(
+        &pool,
+        &execution,
+        &schedule,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
     let foreign_schedule = plan(&selected, 3, false);
     let mut foreign = foreign_schedule.into_cursor();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert!(matches!(
         request
             .reserve_embedded_role(
@@ -374,7 +406,7 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let mut cursor = schedule.into_cursor();
     // Refusal consumes one actual occurrence, but invents no accepted charge.
     let too_large = SpeculativeInvocationRequirements::new(
@@ -383,6 +415,7 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
         Some(0),
         Some(0),
         Some(0),
+        std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
     )
     .unwrap();
     assert!(
@@ -390,7 +423,7 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
             .reserve_embedded_role(cursor.claim(invocation).unwrap(), workspace, too_large)
             .is_err()
     );
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     for _ in 1..limit {
         request
             .reserve_embedded_role(
@@ -402,14 +435,17 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
     }
     assert!(cursor.claim(invocation).is_err());
     let spent = cursor.attempted();
-    let cumulative = pool.used_bytes().unwrap();
+    let cumulative = pool.payload_used_bytes().unwrap();
     let continuation = cursor
         .continuation(1, SpeculativeRequestStatus::ReadyToDraft)
         .unwrap();
     let competitor = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
-    let remaining = usize::try_from(capacity - pool.used_bytes().unwrap()).unwrap();
+    let remaining = usize::try_from(capacity - pool.payload_used_bytes().unwrap()).unwrap();
     competitor.reserve_metadata(remaining).unwrap();
     let destination = vec![0u8; remaining];
     assert!(matches!(
@@ -420,11 +456,11 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
     assert!(cursor.claim(invocation).is_err());
     drop(destination);
     drop(competitor);
-    assert_eq!(pool.used_bytes().unwrap(), cumulative);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cumulative);
     request
         .prepare_embedded_continuation(&continuation, &funding)
         .unwrap();
-    let extended = pool.used_bytes().unwrap();
+    let extended = pool.payload_used_bytes().unwrap();
     assert!(extended > cumulative);
     assert!(matches!(
         request.prepare_embedded_continuation(&continuation, &funding),
@@ -432,7 +468,7 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), extended);
+    assert_eq!(pool.payload_used_bytes().unwrap(), extended);
     cursor.install_continuation(continuation).unwrap();
     let claim = cursor.claim(invocation).unwrap();
     assert_eq!(claim.ordinal(), spent);
@@ -442,15 +478,15 @@ fn embedded_continuation_moves_spent_roles_and_retains_actual_account_after_requ
     let alias = role.budget_custody();
     role.claim_neural_bank(0).unwrap();
     assert!(role.clone().claim_neural_bank(0).is_err());
-    let final_used = pool.used_bytes().unwrap();
+    let final_used = pool.payload_used_bytes().unwrap();
     drop(role);
-    assert_eq!(pool.used_bytes().unwrap(), final_used);
+    assert_eq!(pool.payload_used_bytes().unwrap(), final_used);
     request.close().unwrap();
     drop(request);
     drop(funding);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod capture;

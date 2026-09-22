@@ -9,6 +9,8 @@ pub struct MlxIndexedMovement {
     binding: Option<indexed_source::IndexedBankBinding>,
     original: Option<indexed_source::OriginalIndexedChunkSource>,
     invocation: Option<indexed_source::OriginalIndexedResidencyInvocation>,
+    ordinary: Option<indexed_source::OrdinaryIndexedChunkSource>,
+    ordinary_invocation: Option<indexed_source::OrdinaryIndexedResidencyInvocation>,
 }
 impl std::fmt::Debug for MlxIndexedMovement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -18,7 +20,8 @@ impl std::fmt::Debug for MlxIndexedMovement {
 }
 #[path = "movement/indexed_source.rs"]
 mod indexed_source;
-pub(crate) use indexed_source::{IndexedChunkLayout, OriginalIndexedChunkSource, IndexedResidencyPlan, IndexedConstructorPartitions, OriginalIndexedResidencyInvocation, OriginalIndexedResidencyFactory, IndexedBankSource, IndexedBindingLayout, IndexedBindingStorage, IndexedBindingIdentity, IndexedRequestSource, IndexedRequestInstallation};
+pub(crate) use indexed_source::{OrdinaryIndexedResidencyFacts, OrdinaryResidencyMissing, OrdinaryResidencyPhysical, IndexedChunkLayout, OriginalIndexedChunkSource, IndexedResidencyPlan, IndexedConstructorPartitions, OriginalIndexedResidencyInvocation, OriginalIndexedResidencyFactory, IndexedBankSource, IndexedBindingLayout, IndexedBindingStorage, IndexedBindingIdentity, IndexedRequestSource, IndexedRequestInstallation};
+pub(crate) use indexed_source::{OrdinaryIndexedChunkSource,OrdinaryIndexedResidencyFactory,IndexedResidencyFactory, OrdinaryIndexedOccurrence, OrdinaryIndexedRequestProgram, OrdinaryIndexedRequestOwner, OrdinaryIndexedLocalSource};
 impl MlxIndexedMovement {
     /// The model binder retains this exact movement source, including its
     /// per-scope request channel. It never reconstructs a source from the pool.
@@ -26,12 +29,13 @@ impl MlxIndexedMovement {
     /// Retains the actual scoped cache and constructor-selected chunk policy.
     pub(crate) fn for_bank(bank: SharedAddressableParameterBank,
         options: eredu_runtime::ParameterBankLoadOptions) -> Self {
-        Self { binding: Some(IndexedBankSource::new(bank,options)), original: None, invocation: None }
+        Self { binding: Some(IndexedBankSource::new(bank,options)), ..Self::default() }
     }
 }
 
 #[path = "movement/invocation_callback.rs"]
 mod invocation_callback;
+pub(crate) mod indexed_numerical;
 
 impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
     type Error = Error;
@@ -50,6 +54,7 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
     where F:FnOnce(Option<eredu_runtime::expert::PreparedIndexedDemandLoan<'_>>)->Result<R,E> {
         use eredu_runtime::expert::IndexedDemandLoanError as Failure;
         if let Some(source)=&self.original {return source.with_demand_loan(demands,run).map_err(Failure::Backend);}
+        if let Some(source)=&self.ordinary {return source.with_demand_loan(demands,run).map_err(Failure::Backend);}
         indexed_source::require_ordinary().map_err(Failure::Backend)?;
         if demands.funding().is_some(){return Err(Failure::MissingProducer);}
         Ok(run(None))
@@ -58,6 +63,7 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
         stream:&Stream)->Result<MlxTensor,eredu_runtime::expert::IndexedDemandLoanError<Self::Error>> {
         use eredu_runtime::expert::IndexedDemandLoanError as Failure;
         if let Some(source)=&self.original {return source.copy_route_value(value,demands,stream).map_err(Failure::Backend);}
+        if let Some(source)=&self.ordinary {return source.copy_route_value(value,demands,stream).map_err(Failure::Backend);}
         indexed_source::require_ordinary().map_err(Failure::Backend)?;
         if demands.funding().is_some(){return Err(Failure::MissingProducer);}
         Ok(value.clone())
@@ -69,9 +75,13 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
         if let Some(invocation)=self.invocation.clone() {
             invocation.begin_chunk(self,indices,census,stream)?;
         }
+        if let Some(invocation)=self.ordinary_invocation.clone() {
+            invocation.begin_chunk(self,indices,census,stream)?;
+        }
         if let Some(source) = &self.original {
             return source.discover(self.binding.as_ref(), indices, census, stream);
         }
+        if let Some(source)=&self.ordinary {return source.discover(indices,census,stream);}
         indexed_source::require_ordinary()?;
         self.index_demands(indices, census.members(), stream)
             .map(eredu_runtime::expert::IndexedDemandSource::ordinary)
@@ -83,6 +93,7 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
         if let Some(original) = &self.original {
             return original.remap(self.binding.as_ref(), indices, mapping, source, stream);
         }
+        if let Some(ordinary)=&self.ordinary {return ordinary.remap(indices,mapping,source,stream);}
         indexed_source::require_ordinary()?;
         self.remap_indices(indices, mapping, stream)
     }
@@ -94,46 +105,8 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
         stream: &Stream,
     ) -> Result<Vec<(usize, u64)>, Self::Error> {
         indexed_source::require_ordinary()?;
-        if !matches!(
-            indices.as_array().dtype(),
-            Dtype::Int32 | Dtype::Uint32 | Dtype::Int64 | Dtype::Uint64
-        ) {
-            return Err(AddressableParameterBankError::InvalidSelectionDtype {
-                actual: indices.as_array().dtype(),
-            }
-            .into());
-        }
-        let upper = i32::try_from(upper_bound).map_err(|_| {
-            Error::ArchitectureModel("indexed movement upper bound exceeds MLX i32 indexing".into())
-        })?;
-        if upper == 0 {
-            return Err(Error::ArchitectureModel(
-                "indexed movement upper bound must be nonzero".into(),
-            ));
-        }
-        let flat = indices.as_array().reshape(&[-1], stream)?;
-        let below = flat.lt(Array::try_from_int(upper)?, stream)?;
-        let valid = if matches!(flat.dtype(), Dtype::Uint32 | Dtype::Uint64) {
-            below
-        } else {
-            flat.ge(Array::try_from_int(0)?, stream)?
-                .logical_and(below, stream)?
-        };
-        let invalid =
-            crate::backend::compaction::count_nonzero(&valid.logical_not(stream)?, stream)?;
-        let flat_i32 = if flat.dtype() == Dtype::Int32 {
-            flat
-        } else {
-            flat.as_dtype(Dtype::Int32, stream)?
-        };
-        let safe = r#where(
-            &valid,
-            flat_i32,
-            Array::zeros::<i32>(&[indices.as_array().size() as i32], stream)?,
-            stream,
-        )?;
-        let ones = Array::ones::<i32>(&[safe.size() as i32], stream)?;
-        let histogram = segment_sum(&ones, &safe, upper, 0, stream)?;
+        let indexed_numerical::Discovery { histogram, invalid } =
+            indexed_numerical::discover(&mut indexed_numerical::Native(stream), indices.as_array(), upper_bound)?;
         eval([&histogram, &invalid])?;
         let invalid_count = invalid.evaluated()?.as_slice::<i32>()[0];
         if invalid_count != 0 {
@@ -162,11 +135,15 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         indexed_source::require_ordinary()?;
-        let span = mapping
-            .iter()
-            .map(|(source, _)| source.saturating_add(1))
-            .max()
-            .ok_or_else(|| Error::ArchitectureModel("indexed remapping is empty".into()))?;
+        let span = mapping.iter().try_fold(0usize, |span, (source, _)| {
+            source.checked_add(1).map(|next| span.max(next)).ok_or_else(||
+                Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))
+        })?;
+        if span == 0 {
+            return Err(Error::ArchitectureModel("indexed remapping is empty".into()));
+        }
+        i32::try_from(span).map_err(|_| Error::ArchitectureModel(
+            "indexed remapping exceeds MLX i32 indexing".into()))?;
         let mut lookup = vec![-1i32; span];
         for &(source, destination) in mapping {
             let destination = i32::try_from(destination).map_err(|_| {
@@ -179,13 +156,8 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
             }
             lookup[source] = destination;
         }
-        let lookup = Array::try_from_slice(&lookup, &[span as i32])?.copy(stream)?;
-        let normalized = if indices.as_array().dtype() == Dtype::Int32 {
-            indices.as_array().clone()
-        } else {
-            indices.as_array().as_dtype(Dtype::Int32, stream)?
-        };
-        Ok(MlxTensor::from_array(lookup.take(&normalized, stream)?))
+        indexed_numerical::remap(&mut indexed_numerical::Native(stream), indices.as_array(), &lookup)
+            .map(MlxTensor::from_array)
     }
 
     fn select_rows(
@@ -406,6 +378,9 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
             if demands.funding().is_some(){return Err(Failure::MissingProducer);}
             return self.acquire(request,stream).map_err(Failure::Backend);
         };
+        if let Some(source)=loan.source::<OrdinaryIndexedChunkSource>() {
+            return source.acquire(self,request,demands,loan.funding(),stream).map_err(Failure::Backend);
+        }
         let source=loan.source::<OriginalIndexedChunkSource>().ok_or(Failure::MissingProducer)?;
         source.validate_acquisition_bank(self).map_err(Failure::Backend)?;
         source.acquire_from_demand(request,demands,loan.funding(),stream).map_err(Failure::Backend)
@@ -419,6 +394,10 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
     ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups, Self::Error> {
         if let Some(source)=&acquisition.original {
             source.validate_acquisition_bank(self)?;
+            return source.gated_product_groups(acquisition,spec,stream);
+        }
+        if let Some(source)=&acquisition.ordinary {
+            source.validate_bank(self)?;
             return source.gated_product_groups(acquisition,spec,stream);
         }
         self.inner
@@ -440,6 +419,10 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
             source.validate_acquisition_bank(self)?;
             return source.linear_groups(acquisition,spec,stream);
         }
+        if let Some(source)=&acquisition.ordinary {
+            source.validate_bank(self)?;
+            return source.linear_groups(acquisition,spec,stream);
+        }
         self.inner
             .lock()
             .map_err(|_| {
@@ -456,6 +439,10 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
     ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::Relu2Groups, Self::Error> {
         if let Some(source)=&acquisition.original {
             source.validate_acquisition_bank(self)?;
+            return source.relu2_groups(acquisition,spec,stream);
+        }
+        if let Some(source)=&acquisition.ordinary {
+            source.validate_bank(self)?;
             return source.relu2_groups(acquisition,spec,stream);
         }
         self.inner
@@ -475,6 +462,9 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
         if let Some(source) = acquisition.original.take() {
             source.validate_acquisition_bank(self)?;
             return source.complete_acquisition(acquisition, output, stream);
+        }
+        if let Some(source)=acquisition.ordinary_chunk.as_ref().cloned() {
+            return source.complete(self,acquisition,output,stream);
         }
         self.inner
             .lock()

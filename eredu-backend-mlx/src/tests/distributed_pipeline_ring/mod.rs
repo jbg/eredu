@@ -6,40 +6,40 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
 use crate::native::{ExecutionContext, MlxModelInput, MlxModelSession};
+use crate::{MlxLoadRequest, MlxTensor};
 use crate::{
     backend::runtime::{
         execution::layerwise::open_safetensors_weight_store,
-        media::{input::InputPayload, PreparedModelInput},
+        media::{PreparedModelInput, input::InputPayload},
     },
     backend::{
-        nn::shared::{
-            neutral_parameter_refs, neutral_parameter_refs_mut, MlxModule, MlxNeuralBackend,
-        },
         DeviceAssignment, MlxBackend,
+        nn::shared::{
+            MlxModule, MlxNeuralBackend, neutral_parameter_refs, neutral_parameter_refs_mut,
+        },
     },
     tests::support::checkpoint_fixtures,
 };
-use crate::{MlxLoadRequest, MlxTensor};
 use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions};
 use eredu_core::{
-    load_model, residency::OffloadConfig, BackendSession as _, DevicePlan, DraftPlacementPlan,
-    DraftingPlan, ExecutionPlan, ExternalDraftArtifact, FinishReason, GenerationCancellationToken,
-    InputExtent, InputMetadataKey, InputModality, ModelRuntime, ObservationRequest, SemanticEvent,
-    SpeculativeCapability, SpeculativeConfig, SpeculativeDraft, SpeculativeExecutionTopology,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeOutputError, SemanticState, SpeculativeTokenFilterController,
+    BackendSession as _, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
+    ExternalDraftArtifact, FinishReason, GenerationCancellationToken, InputExtent,
+    InputMetadataKey, InputModality, ModelRuntime, ObservationRequest, SemanticEvent,
+    SemanticState, SpeculativeCapability, SpeculativeConfig, SpeculativeDraft,
+    SpeculativeExecutionTopology, SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest,
+    SpeculativeGenerationLane, SpeculativeOutputError, SpeculativeTokenFilterController,
     TextGenerationConfig, TokenFilter, TokenFilterController, TokenOutput as _,
-    TokenizerCompatibilityProof,
+    TokenizerCompatibilityProof, load_model, residency::OffloadConfig,
 };
 use eredu_gguf::{
     GgmlType, MetadataArray, MetadataValue as GgufMetadataValue, TensorInput, Writer,
@@ -50,9 +50,9 @@ use eredu_runtime::{
     OrdinaryWeightResidency, PagedCacheOptions, ParameterBankLoadOptions, WeightResidency,
 };
 use safemlx::{
+    Array, Device, DeviceType, Dtype as MlxDtype, Stream,
     distributed::{self, Backend},
     ops::{indexing::TryIndexOp, stack_axis},
-    Array, Device, DeviceType, Dtype as MlxDtype, Stream,
 };
 
 fn ring_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
@@ -62,7 +62,7 @@ fn ring_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
     )
     .unwrap()
 }
-use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 
 const WORKER_RANK: &str = "EREDU_PIPELINE_RING_WORKER";
 const CHECKPOINT_DIR: &str = "EREDU_PIPELINE_CHECKPOINT";
@@ -83,6 +83,7 @@ const EXPECTED_UNSUPPORTED_DIRECT_PARTITION: &str =
 const OPAQUE_INSPECTION: &str = "EREDU_PIPELINE_OPAQUE_INSPECTION";
 const OPAQUE_TEXT_GENERATION: &str = "EREDU_PIPELINE_OPAQUE_TEXT_GENERATION";
 const OPAQUE_COMPONENT_CAPTURE: &str = "EREDU_PIPELINE_COMPONENT_CAPTURE";
+const ORIGINAL_AR_CAPTURE: &str = "EREDU_PIPELINE_ORIGINAL_AR_CAPTURE";
 const COMPONENT_CAPTURE_MEDIA: &str = "EREDU_PIPELINE_COMPONENT_CAPTURE_MEDIA";
 const COMPONENT_CAPTURE_PATCH_WIDTH: &str = "EREDU_PIPELINE_COMPONENT_CAPTURE_PATCH_WIDTH";
 const OPAQUE_PROVIDER_FAILURE: &str = "EREDU_PIPELINE_PROVIDER_FAILURE";
@@ -201,6 +202,77 @@ fn run_neutral_embedded_mtp<'world>(
     config: SpeculativeConfig,
 ) -> Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error> {
     execute_neutral_embedded_mtp(runtime, prompt, config).0
+}
+
+fn run_admitted_embedded_tokens<'world>(
+    runtime: &mut ModelRuntime<MlxBackend<'world>>,
+    source: &crate::tests::support::plain_controller::ControllerSource,
+    tokens: &[u32],
+    config: SpeculativeConfig,
+) -> Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error> {
+    use eredu_runtime::working_memory::OriginalTokenizerBackend;
+
+    let prepared = &source.prepared;
+    let controller = crate::tests::support::plain_controller::PlainController::from_prepared(
+        prepared,
+        source.validity.clone(),
+        config.max_tokens,
+    );
+    let semantic = prepared
+        .prepare(
+            &source.stops,
+            config.max_tokens,
+            config
+                .max_draft_tokens
+                .checked_add(1)
+                .and_then(std::num::NonZeroUsize::new)
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+    let configuration = prepared
+        .prepare_configuration(
+            config.max_tokens,
+            config.max_draft_tokens,
+            config.temperature,
+            &config.eos_token_ids,
+        )
+        .unwrap();
+    let callback = prepared.prepare_callback(|_| {}).unwrap();
+    let prompt = MlxBackend::prepare_semantic_prompt(
+        runtime,
+        prepared,
+        &eredu_core::TokenIdsInputPlan::new(tokens).unwrap(),
+        None,
+    )
+    .unwrap();
+    let sampling = eredu_core::resolve_generation_config(
+        None,
+        eredu_core::GenerationConfigOverrides {
+            max_new_tokens: Some(config.max_tokens),
+            temperature: Some(config.temperature),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    <MlxBackend<'world> as SpeculativeGenerationBackend>::with_speculative_execution(
+        runtime,
+        SpeculativeGenerationBatchRequest::new(
+            SpeculativeDraft::Embedded,
+            vec![SpeculativeGenerationLane::new(
+                prompt,
+                TextGenerationConfig::new(sampling),
+                configuration,
+                controller,
+                semantic,
+                GenerationCancellationToken::new(),
+                callback,
+            )],
+            [0; 32],
+        ),
+        eredu_runtime::RunSpeculativeGeneration::default(),
+    )
+    .map(|output| output.into_requests().into_iter().next().unwrap())
 }
 
 fn execute_neutral_embedded_mtp<'world>(

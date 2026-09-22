@@ -29,6 +29,8 @@ pub enum WorkspaceOperationKindView<'a> {
     /// Actual floating conversion, possibly aliasing when the source type matches.
     /// This is not a view; native facts must include the conversion allocation.
     CastFloating(WorkspaceFloatingType),
+    /// Standalone effective checkpoint decoding with exact companion roles.
+    ParameterDecode(crate::parameter_values::ParameterDecoding),
     /// Copy one retained immutable host value into independent device storage,
     /// preserving its exact floating type. The native source and completion
     /// account must be authenticated separately; this descriptor grants none.
@@ -46,7 +48,10 @@ pub enum WorkspaceOperationKindView<'a> {
     /// Raw terminal-row candidate extraction, distinct from sampling masks.
     /// One floating [1, rows, vocabulary] input; U32 IDs[count] and F32 scores[count]
     /// outputs. Full-row finite validation and the selected sort workspace are retained.
-    CandidateExtraction { vocabulary: u32, count: u32 },
+    CandidateExtraction {
+        vocabulary: u32,
+        count: u32,
+    },
     /// Named elementwise equation. Native facts must explicitly recognize names.
     Elementwise(&'static str),
     /// Metadata transformation; native facts decide whether storage can alias.
@@ -281,6 +286,8 @@ pub enum WorkspaceOperationKindView<'a> {
     /// phase. No new tensor storage or output value is constructed. This is a
     /// trace descriptor, not native submission or source authority.
     ValueCompletion,
+    /// Exact model-internal control source; native execution remains separately admitted.
+    CommunicationControl(super::WorkspaceModelControl),
     /// Keeps actual existing values in the enclosing completion root union.
     ValueRetention,
     /// Boolean mask with prompt and cached-key geometry.
@@ -312,8 +319,12 @@ impl WorkspaceOperationKind {
         use WorkspaceOperationKindView as V;
         match self {
             Self::ParameterPlaceholder => V::ParameterPlaceholder,
-            Self::ValueCompletion => V::ValueCompletion,
+            Self::ValueCompletion
+            | Self::CommunicationDependencies
+            | Self::CachePublicationCompletion
+            | Self::CacheScanCompletion => V::ValueCompletion,
             Self::ValueRetention => V::ValueRetention,
+            Self::CommunicationControl(control) => V::CommunicationControl(*control),
             Self::Initialize => V::Initialize,
             Self::InitializeFloating(dtype) => V::InitializeFloating(*dtype),
             Self::CastFloating(dtype) => V::CastFloating(*dtype),
@@ -338,7 +349,15 @@ impl WorkspaceOperationKind {
             Self::Index { selected_axes } => V::Index {
                 selected_axes: *selected_axes,
             },
-            Self::StaticSlice { starts, ends, strides } => V::StaticSlice { starts, ends, strides },
+            Self::StaticSlice {
+                starts,
+                ends,
+                strides,
+            } => V::StaticSlice {
+                starts,
+                ends,
+                strides,
+            },
             Self::SliceUpdate { starts } => V::SliceUpdate {
                 starts: starts.as_slice(),
             },
@@ -361,6 +380,7 @@ impl WorkspaceOperationKind {
             Self::Matmul => V::Matmul,
             Self::DenseLinear => V::DenseLinear,
             Self::Projection(a0) => V::Projection(a0),
+            Self::ParameterDecode(decoding) => V::ParameterDecode(*decoding),
             Self::ProjectionPrepare(a0) => V::ProjectionPrepare(a0),
             Self::ProjectionFinish(a0) => V::ProjectionFinish(a0),
             Self::BlockFp8ActivationDecode => V::BlockFp8ActivationDecode,
@@ -400,7 +420,10 @@ impl WorkspaceOperationKind {
             },
             Self::Reduction(a0, a1, a2) => V::Reduction(*a0, *a1, *a2),
             Self::Normalization(a0, a1) => V::Normalization(*a0, *a1),
-            Self::LayerNorm { weight, bias } => V::LayerNorm { weight: *weight, bias: *bias },
+            Self::LayerNorm { weight, bias } => V::LayerNorm {
+                weight: *weight,
+                bias: *bias,
+            },
             Self::ConstructedNormalization(a0) => V::ConstructedNormalization(a0),
             Self::GatedProduct(a0) => V::GatedProduct(*a0),
             Self::GatedDeltaScan => V::GatedDeltaScan,
@@ -569,8 +592,16 @@ impl WorkspaceCollective {
                 partitions: *partitions,
                 rank: *rank,
             },
-            Self::Broadcast {group,root,partitions,rank} => WorkspaceCollectiveView::Broadcast {
-                group:*group,root:*root,partitions:*partitions,rank:*rank,
+            Self::Broadcast {
+                group,
+                root,
+                partitions,
+                rank,
+            } => WorkspaceCollectiveView::Broadcast {
+                group: *group,
+                root: *root,
+                partitions: *partitions,
+                rank: *rank,
             },
             Self::GatherFirstAxis {
                 axis,

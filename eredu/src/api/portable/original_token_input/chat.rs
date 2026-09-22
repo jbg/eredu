@@ -63,7 +63,7 @@ impl OriginalChatError {
 #[derive(Debug)]
 pub(crate) struct PreparedChatRendering {
     render: OriginalRenderedChat,
-    capacity: u64,
+    limits: eredu_core::MemoryLimitDeclarations,
     profile: Option<PolicyOwner>,
     source_budget: OriginalTextSourceBudget,
 }
@@ -103,7 +103,7 @@ impl PreparedChatRendering {
         crate::runtime::chat::PreparedChat::publish(
             self.render,
             generation,
-            self.capacity,
+            self.limits,
             named_entry,
             policy,
             compilation,
@@ -163,7 +163,7 @@ pub(crate) fn prepare_original_chat<B: OriginalChatBackend>(
     request: &ChatTemplateRequest,
     defaults: Option<&serde_json::Map<String, serde_json::Value>>,
     eos: &[u32],
-    capacity: u64,
+    limits: &eredu_core::MemoryLimitDeclarations,
     grammar_memory: crate::runtime::chat::DependencyMemoryPolicy,
     cancellation: &GenerationCancellationToken,
 ) -> Result<
@@ -193,7 +193,7 @@ pub(crate) fn prepare_original_chat<B: OriginalChatBackend>(
         tokenizer,
         request,
         defaults,
-        capacity,
+        limits,
         cancellation,
         |profile| {
             crate::api::request::policy::compile_original(
@@ -216,7 +216,7 @@ pub(super) fn prepare_with_policy<B: OriginalChatBackend, P, F>(
     tokenizer: &OriginalTokenizer,
     request: &ChatTemplateRequest,
     defaults: Option<&serde_json::Map<String, serde_json::Value>>,
-    capacity: u64,
+    limits: &eredu_core::MemoryLimitDeclarations,
     cancellation: &GenerationCancellationToken,
     compile: F,
 ) -> Result<Option<(PreparedChatRendering, P)>, OriginalChatError>
@@ -229,11 +229,11 @@ where
     let context = context(request, defaults).map_err(OriginalChatError::before_render)?;
     B::validate_original_chat_sources(runtime, template, tokenizer)
         .map_err(OriginalChatError::before_render)?;
-    let source_budget = B::prepare_original_text_source_budget(runtime, tokenizer, capacity)
+    let source_budget = B::prepare_original_text_source_budget(runtime, tokenizer, limits)
         .map_err(OriginalChatError::before_render)?;
     // Recognition also supplies default generation behavior and history checks.
     // Its source and controls are admitted before any probe or request render.
-    let policy = match ProfileOperations::prepare(runtime, template, tokenizer, defaults, capacity)
+    let policy = match ProfileOperations::prepare(runtime, template, tokenizer, defaults, limits)
         .and_then(|mut operations| operations.prepare_policy(request))
     {
         Ok(policy) => policy,
@@ -331,7 +331,7 @@ where
     Ok(Some((
         PreparedChatRendering {
             render,
-            capacity,
+            limits: limits.clone(),
             profile,
             source_budget,
         },

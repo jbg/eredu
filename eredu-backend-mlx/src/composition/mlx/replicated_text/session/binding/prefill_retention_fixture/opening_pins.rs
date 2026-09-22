@@ -4,6 +4,8 @@ use super::super::super::mechanisms::{OpeningPinFailure, OpeningPinSetup, Prepar
 use super::*;
 use crate::backend::managed_memory::NativeMemoryOwner;
 use crate::backend::runtime::residency::storage::StorageIdentity;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{capture::*, *};
 use eredu_runtime::{
     capture::{FundedCaptureError, ScheduledCaptureBackend},
@@ -83,7 +85,7 @@ fn options(kind: usize) -> crate::MlxLoadRequest {
 }
 fn quote(
     f: &PrefillRetentionFixture,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     g: InferenceGeometry,
     source: &SharedCapturePlan,
 ) -> IncrementalInferenceQuote {
@@ -91,7 +93,12 @@ fn quote(
     // callback stops before preparing input; this is not a claim that omitted
     // layerwise materialization is covered for a successful host/disk forward.
     let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
-    let storage = RegisteredWorkspaceStorage::<u32>::bind(pool, &context, []).unwrap();
+    let storage = RegisteredWorkspaceStorage::<u32>::bind(
+        pool,
+        &context,
+        std::iter::empty::<eredu_runtime::working_memory::RegisteredWorkspaceStorageRow<u32>>(),
+    )
+    .unwrap();
     let equations = f.session.quote(&f.blueprint, g, &context).unwrap();
     let state = f.session.state_estimate(g, f.dtype).unwrap();
     let state = equations.refine_state_backing(state).unwrap();
@@ -101,7 +108,8 @@ fn quote(
             "pin callback rejects before input preparation/model/native capture work",
         )
     };
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: bound(),
         attention: bound(),
@@ -114,7 +122,7 @@ fn quote(
                 .initialization_peak_bytes(),
             "actual original scheduled bank",
         ),
-    };
+    });
     let outside = quote_text_prompt_workspace(g, Some(4), &context)
         .unwrap()
         .compose(outside)
@@ -282,7 +290,7 @@ fn settle_empty_callback(stream: &Stream, scope: WorkingMemoryFundingScope) {
 fn actual_resident_host_disk_first_opening_pins_loaded_owners_without_new_registration() {
     for kind in 0..3 {
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         let artifact =
             crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
@@ -306,13 +314,13 @@ fn actual_resident_host_disk_first_opening_pins_loaded_owners_without_new_regist
         );
         let bytes = unique.values().sum::<u64>();
         assert!(bytes > 0);
-        let registered_before = pool.used_bytes().unwrap();
+        let registered_before = pool.fixture_host_charge().unwrap();
         let (result, segment) = pin_in_real_callback(&mut f, &mut setup, &source, false);
         result.unwrap().unwrap();
         assert_eq!(setup.snapshot.registered_bytes(), Some(bytes));
         assert_eq!(setup.snapshot.issued_rows_for_test(), 1);
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             registered_before,
             "existing pins make no physical charge"
         );
@@ -328,14 +336,14 @@ fn actual_resident_host_disk_first_opening_pins_loaded_owners_without_new_regist
         drop(segment);
         let held = owned.protected_host_bytes();
         drop((owned, reservation, run));
-        assert!(pool.used_bytes().unwrap() >= held);
+        assert!(pool.fixture_host_charge().unwrap() >= held);
         drop((snapshot, publication, source, f, captured, unique));
         crate::backend::submission_recovery::wait_for_retirement(|| {
             crate::backend::ordinary_retirement::reclaim();
             // The final native drops enqueue accounting owners. No later native
             // entry is expected, so reclaim its separate unlocked host queue.
             safemlx::reclaim_allocation_owners();
-            pool.used_bytes().unwrap() == 0
+            pool.fixture_host_charge().unwrap() == 0
         });
     }
 }
@@ -352,7 +360,7 @@ impl ActivationObserver<Array, Error> for Quiet {
 #[test]
 fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_keys() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let mut f = PrefillRetentionFixture::load(artifact.path(), &stream).unwrap();
@@ -386,9 +394,7 @@ fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_
     );
     // Ordinary execution preserves the runtime binding independently of the
     // snapshot's retained owner identity and the later KV publication check.
-    f.session
-        .validate_opening_paths_after_forward()
-        .unwrap();
+    f.session.validate_opening_paths_after_forward().unwrap();
     // The first original native scope continues to retain its unregistered
     // successful state. A separately admitted pin-only request must not infer
     // publication from that native completion.
@@ -403,7 +409,7 @@ fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_
             .any(|key| !old_keys.iter().any(|(old, _)| old == key)),
         "real forward retained new backing"
     );
-    let registered = pool.used_bytes().unwrap();
+    let registered = pool.fixture_host_charge().unwrap();
     let (result, segment) = pin_in_real_callback(&mut f, &mut setup, &next, false);
     let error = result.unwrap().unwrap_err();
     assert!(matches!(
@@ -415,7 +421,7 @@ fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_
     assert_eq!(setup.snapshot.registered_bytes(), None);
     assert_eq!(setup.snapshot.issued_rows_for_test(), 1);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         registered,
         "missing late key commits no prefix"
     );
@@ -436,11 +442,11 @@ fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_
             .initialization_peak_bytes()
         + next.capacity_bytes().unwrap();
     drop((snapshot, owned, reservation, run, next));
-    let before_error_drop = pool.used_bytes().unwrap();
+    let before_error_drop = pool.fixture_host_charge().unwrap();
     assert!(before_error_drop >= held);
     drop(error);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         before_error_drop - held,
         "escaped failure owns original P+Q+S, stamped H and source C"
     );
@@ -470,7 +476,7 @@ fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_
 #[test]
 fn callback_panic_keeps_pinned_snapshot_outside_unwind_and_never_reissues() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let mut f = PrefillRetentionFixture::load(artifact.path(), &stream).unwrap();
@@ -491,7 +497,7 @@ fn callback_panic_keeps_pinned_snapshot_outside_unwind_and_never_reissues() {
     assert_eq!(setup.snapshot.issued_rows_for_test(), 1);
     // The actual shared session is fenced by its outer callback unwind. The
     // snapshot remains merely retained evidence and cannot clear that fence.
-    let request = InferenceRequest::without_memory_budget(f.identity(), geometry(0)).unwrap();
+    let request = crate::memory_fixture::empty_admitted_request(f.identity(), geometry(0)).unwrap();
     assert!(f
         .run(
             request,
@@ -511,6 +517,6 @@ fn callback_panic_keeps_pinned_snapshot_outside_unwind_and_never_reissues() {
     drop(segment);
     let held = owned.protected_host_bytes();
     drop((owned, reservation, run));
-    assert!(pool.used_bytes().unwrap() >= held);
+    assert!(pool.fixture_host_charge().unwrap() >= held);
     drop((snapshot, publication, source, f));
 }

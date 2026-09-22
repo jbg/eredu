@@ -1,7 +1,7 @@
 //! Explicit model-bound immutable bank sources and their paid quote directory.
 use super::*;
 use crate::backend::runtime::residency::parameter_bank::IndexedBankSource;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::{alloc::Layout, cell::RefCell, ops::Deref, rc::Rc};
 
 pub(crate) struct AddressableQuoteRef(Option<Rc<AddressableQuote>>, Option<Rc<LocalEnvelope>>);
@@ -13,21 +13,54 @@ pub(super) struct LocalEnvelope {
     pub(super) capture_publications: usize,
 }
 impl AddressableQuoteRef {
-    pub(crate) fn is_local(&self) -> bool { self.1.is_some() }
-    pub(crate) fn local_numerical(&self) -> Option<SpeculativeNumericalRecipe> { self.1.as_ref().map(|v| v.numerical) }
-    pub(crate) fn native_capacity(&self) -> BoundaryStageCapacity { self.1.as_ref().map_or(self.capacity, |v| v.capacity) }
-    pub(crate) fn host_capacity(&self) -> u64 { self.1.as_ref().map_or(self.host_bytes, |v| v.host_bytes) }
-    pub(crate) fn publications(&self) -> usize { self.1.as_ref().map_or(self.capture_publications, |v| v.capture_publications) }
-    pub(crate) fn select_rows(&self, rows: usize, funding: &HostMetadataFunding) -> Result<Self, Error> {
-        let envelope = self.1.as_deref().ok_or(WorkspaceMetadataError::Unqualified)?;
+    pub(crate) fn is_local(&self) -> bool {
+        self.1.is_some()
+    }
+    pub(crate) fn local_numerical(&self) -> Option<SpeculativeNumericalRecipe> {
+        self.1.as_ref().map(|v| v.numerical)
+    }
+    pub(crate) fn native_capacity(&self) -> BoundaryStageCapacity {
+        self.1.as_ref().map_or(self.capacity, |v| v.capacity)
+    }
+    pub(crate) fn host_capacity(&self) -> u64 {
+        self.1.as_ref().map_or(self.host_bytes, |v| v.host_bytes)
+    }
+    pub(crate) fn publications(&self) -> usize {
+        self.1
+            .as_ref()
+            .map_or(self.capture_publications, |v| v.capture_publications)
+    }
+    pub(crate) fn select_rows(
+        &self,
+        rows: usize,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, Error> {
+        let envelope = self
+            .1
+            .as_deref()
+            .ok_or(WorkspaceMetadataError::Unqualified)?;
         let value = self.deref().for_rows(rows, envelope, funding)?;
-        funding.reserve_metadata(shared_bytes::<AddressableQuote>().ok_or(WorkspaceMetadataError::Overflow)?).map_err(WorkspaceMetadataError::Funding)?;
+        funding
+            .reserve_metadata(
+                shared_bytes::<AddressableQuote>().ok_or(WorkspaceMetadataError::Overflow)?,
+            )
+            .map_err(WorkspaceMetadataError::Funding)?;
         Ok(Self(Some(Rc::new(value)), None))
     }
 }
 impl AddressableQuoteRef {
-    pub(crate) fn same_quote(&self,other:&Self)->bool {
-        match (&self.0,&other.0){(Some(a),Some(b))=>Rc::ptr_eq(a,b) && match (&self.1,&other.1) {(None,None)=>true,(Some(a),Some(b))=>Rc::ptr_eq(a,b),_=>false},_=>false}
+    pub(crate) fn same_quote(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => {
+                Rc::ptr_eq(a, b)
+                    && match (&self.1, &other.1) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
     }
 }
 impl Clone for AddressableQuoteRef {
@@ -43,7 +76,9 @@ impl Deref for AddressableQuoteRef {
 }
 impl Drop for AddressableQuoteRef {
     fn drop(&mut self) {
-        if let Some(rows) = self.1.take() { drop(Rc::into_inner(rows)); }
+        if let Some(rows) = self.1.take() {
+            drop(Rc::into_inner(rows));
+        }
         if let Some(value) = self.0.take() {
             drop(Rc::into_inner(value));
         }
@@ -79,7 +114,7 @@ struct Sources {
     quotes: RefCell<Vec<AddressableQuoteRef>>,
     mechanism: ResidentExecutionMechanisms,
     runtime: safemlx::PreparedInputRuntime,
-    pool: Option<WorkingMemoryPool>,
+    pool: Option<MemoryLedger>,
     funding: HostMetadataFunding,
 }
 pub(super) fn shared_bytes<T>() -> Option<usize> {
@@ -97,7 +132,7 @@ impl AddressableSources {
         banks: I,
         mechanism: ResidentExecutionMechanisms,
         runtime: &safemlx::PreparedInputRuntime,
-        pool: Option<&WorkingMemoryPool>,
+        pool: Option<&MemoryLedger>,
         funding: &HostMetadataFunding,
     ) -> Result<Self, Error>
     where
@@ -149,13 +184,22 @@ impl AddressableSources {
     pub(crate) fn mechanism(&self) -> ResidentExecutionMechanisms {
         self.inner().mechanism
     }
-    pub(crate) fn observation_layout(&self,source:WorkspaceAddressableRegionView<'_>,inputs:&[WorkspaceLayout],
-        context:&WorkspaceContext)->Result<WorkspaceAddressableObservationLayout,Error>{
-        if context.metadata_funding().is_none_or(|funding|!funding.same_account(self.funding())){
+    pub(crate) fn observation_layout(
+        &self,
+        source: WorkspaceAddressableRegionView<'_>,
+        inputs: &[WorkspaceLayout],
+        context: &WorkspaceContext,
+    ) -> Result<WorkspaceAddressableObservationLayout, Error> {
+        if context
+            .metadata_funding()
+            .is_none_or(|funding| !funding.same_account(self.funding()))
+        {
             return Err(WorkspaceMetadataError::Unqualified.into());
         }
-        let bank=self.bank(source.bank).ok_or(WorkspaceMetadataError::Unqualified)?;
-        super::observation::inspect(bank,source,inputs,self.mechanism(),self.funding())
+        let bank = self
+            .bank(source.bank)
+            .ok_or(WorkspaceMetadataError::Unqualified)?;
+        super::observation::inspect(bank, source, inputs, self.mechanism(), self.funding())
     }
     pub(crate) fn quote(
         &self,
@@ -210,73 +254,88 @@ impl AddressableSources {
     }
     /// Each completed receive-row count has an exact quote from the same
     /// physical bank. These are alternatives, not additional invocations.
-    pub(crate) fn local_quote(&self, operation: WorkspaceOperationView<'_>) -> Result<AddressableQuoteRef, Error> {
-        let context = WorkspaceContext::new_with_metadata_funding(MlxAddressableWorkspaceMechanisms::new(self.mechanism(), self.clone()), self.funding().clone())?;
-        let invalid = || context.metadata_error(format_args!("local indexed source differs from its retained expert region"));
-        context.charge_metadata(size_of::<(WorkspaceContext, WorkspaceOperationView<'_>,
-            Result<AddressableQuoteRef, Error>, Vec<AddressableQuoteRef>, Vec<WorkspaceTensor>,
-            WorkspaceTraceReport, Option<AddressableQuoteRef>, usize,
-            SpeculativeNumericalRecipe, LocalEnvelope)>() )?;
-        let WorkspaceOperationKindView::ExpertRegion(region) = operation.kind else { return Err(invalid()); };
-        let view = region.as_view();
-        view.validate()?;
-        let shape = ExpertRegionInputShape::inspect(operation.inputs.get(0).ok_or_else(invalid)?.shape(),
-            operation.inputs.get(1).ok_or_else(invalid)?.shape())?;
-        if usize::try_from(shape.rows).ok() != Some(view.source_rows)
-            || usize::try_from(shape.routes).ok() != Some(view.routes_per_row)
-            || shape.width != view.kernel.dimensions().0 { return Err(invalid()); }
-        let source = view.addressable.ok_or_else(invalid)?;
-        let maximum = view.maximum_received_rows().ok_or_else(invalid)?;
-        if maximum == 0 || source.chunks.rows != maximum || operation.inputs.len() != 4 { return Err(invalid()); }
-        // The last quote has maximum rows and authenticates all source/layout
-        // fields. Cache identity includes the complete initial operation.
-        let build = |rows: usize| -> Result<WorkspaceTraceReport, Error> {
-            let mut source = source;
-            source.chunks.rows = rows;
-            let mut inputs = context.metadata_vec(4)?;
-            for (index, input) in operation.inputs.iter().enumerate() {
-                let shape = [i32::try_from(rows).map_err(|_| invalid())?, if index == 0 { source.kernel.dimensions().0 } else { 1 }];
-                inputs.push(WorkspaceTensor::existing(context.layout(&shape, if index == 1 { WorkspaceDtype::Int32 } else { input.dtype() })?
-                    .with_representation(input.representation()), &context)?);
-            }
-            let routes = eredu_nn::GroupSelection::new(inputs[1].clone(), inputs[2].clone(), inputs[3].clone());
-            let mut observe = |_: eredu_nn::workspace::WorkspaceAddressableObservationView<'_>| {
-                let value = region.observation().ok_or_else(invalid)?;
-                Ok(eredu_nn::workspace::WorkspaceAddressableObservationSource {
-                    before: value.before, after: value.after, unit_dtype: value.unit_dtype,
-                })
-            };
-            context.begin_span();
-            let output = eredu_nn::workspace::record_addressable_region_with_observation(source, &inputs[0], &routes, &context,
-                if region.observation().is_some() { Some(&mut observe) } else { None })?;
-            let (value, bias) = output.into_parts();
-            let mut outputs = context.metadata_vec(1 + usize::from(bias.is_some()))?;
-            outputs.push(value); outputs.extend(bias);
-            context.finish_report(&outputs)
+    pub(crate) fn local_quote(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+    ) -> Result<AddressableQuoteRef, Error> {
+        let context = WorkspaceContext::new_with_metadata_funding(
+            MlxAddressableWorkspaceMechanisms::new(self.mechanism(), self.clone()),
+            self.funding().clone(),
+        )?;
+        let invalid = || {
+            context.metadata_error(format_args!(
+                "local indexed source differs from its retained expert region"
+            ))
         };
+        context.charge_metadata(size_of::<(
+            WorkspaceContext,
+            WorkspaceOperationView<'_>,
+            Result<AddressableQuoteRef, Error>,
+            Vec<AddressableQuoteRef>,
+            Vec<WorkspaceTensor>,
+            WorkspaceTraceReport,
+            Option<AddressableQuoteRef>,
+            usize,
+            SpeculativeNumericalRecipe,
+            LocalEnvelope,
+        )>())?;
+        let local = super::local::LocalAddressableSource::prepare(operation, &context)?;
+        let source = local.source;
+        let maximum = local.maximum;
+        let build = |rows| local.report(rows, &context);
         // The source-aware mechanism is needed for observed physical layouts.
         // Its ordinary facts do not mint another accepted source.
         let maximum_report = build(maximum)?;
-        let maximum_operation = maximum_report.operations.last().ok_or_else(invalid)?.as_view();
-        if maximum_report.operations.len() != 1 { return Err(invalid()); }
-        if let Some(quote) = self.inner().quotes.try_borrow().map_err(|_| invalid())?.iter()
-            .find(|quote| quote.is_local() && quote.matches(maximum_operation)) { return Ok(quote.clone()); }
+        let maximum_operation = maximum_report
+            .operations
+            .last()
+            .ok_or_else(invalid)?
+            .as_view();
+        if maximum_report.operations.len() != 1 {
+            return Err(invalid());
+        }
+        if let Some(quote) = self
+            .inner()
+            .quotes
+            .try_borrow()
+            .map_err(|_| invalid())?
+            .iter()
+            .find(|quote| quote.is_local() && quote.matches(maximum_operation))
+        {
+            return Ok(quote.clone());
+        }
         let maximum_quote = self.quote(maximum_operation)?;
-        let mut population = AddressableNumericalPopulation::from_recipe(maximum_quote.equation, false).ok_or_else(invalid)?;
+        let mut population =
+            AddressableNumericalPopulation::from_recipe(maximum_quote.equation, false)
+                .ok_or_else(invalid)?;
         let residual_host = |quote: &AddressableQuote| -> Result<u64, Error> {
             let native = crate::backend::submission_recovery::addressable::control_bytes(quote)
                 .map_err(|cause| context.metadata_source(cause))?;
-            quote.host_bytes.checked_sub(u64::try_from(native).map_err(|_| invalid())?).ok_or_else(invalid)
+            quote
+                .host_bytes
+                .checked_sub(u64::try_from(native).map_err(|_| invalid())?)
+                .ok_or_else(invalid)
         };
         let mut host_bytes = residual_host(&maximum_quote)?;
         let mut capture_publications = maximum_quote.capture_publications;
-        let candidates = super::row_candidates::local_row_candidates(source.kernel, maximum, source.chunks.chunk_rows, &context)?;
+        let candidates = super::row_candidates::local_row_candidates(
+            source.kernel,
+            maximum,
+            source.chunks.chunk_rows,
+            &context,
+        )?;
         for count in candidates {
             let report = build(count)?;
-            if report.operations.len() != 1 { return Err(invalid()); }
+            if report.operations.len() != 1 {
+                return Err(invalid());
+            }
             let quote = self.quote(report.operations[0].as_view())?;
-            population = population.union(AddressableNumericalPopulation::from_recipe(quote.equation, false)
-                .ok_or_else(invalid)?).ok_or_else(invalid)?;
+            population = population
+                .union(
+                    AddressableNumericalPopulation::from_recipe(quote.equation, false)
+                        .ok_or_else(invalid)?,
+                )
+                .ok_or_else(invalid)?;
             host_bytes = host_bytes.max(residual_host(&quote)?);
             capture_publications = capture_publications.max(quote.capture_publications);
         }
@@ -287,17 +346,40 @@ impl AddressableSources {
         // would mistake source constructors for numerical Eval entries.
         let equation = population.finish(maximum_quote.outputs.len(), 1, &context)?;
         let numerical = equation.with_indexed_source(&maximum_quote.residency, &context)?;
-        let backing = safemlx::OriginalBufferBudget::population_layout(self.runtime(),
-            usize::try_from(numerical.storage.mutable_bytes()).map_err(|_| invalid())?, numerical.storage.maximum_births())
-            .map_err(|cause| context.metadata_source(cause))?;
-        let capacity = BoundaryStageCapacity { graph: numerical.graph_capacity, records: numerical.record_capacity, backing: backing.capacity() };
-        let native = crate::backend::submission_recovery::addressable::envelope_control_bytes(&maximum_quote, numerical, capacity)
-            .map_err(|cause| context.metadata_source(cause))?;
-        host_bytes = host_bytes.checked_add(u64::try_from(native).map_err(|_| invalid())?).ok_or_else(invalid)?;
-        let envelope = LocalEnvelope { equation, numerical, capacity, host_bytes, capture_publications };
+        let backing = safemlx::OriginalBufferBudget::population_layout(
+            self.runtime(),
+            usize::try_from(numerical.storage.mutable_bytes()).map_err(|_| invalid())?,
+            numerical.storage.maximum_births(),
+        )
+        .map_err(|cause| context.metadata_source(cause))?;
+        let capacity = BoundaryStageCapacity {
+            graph: numerical.graph_capacity,
+            records: numerical.record_capacity,
+            backing: backing.capacity(),
+        };
+        let native = crate::backend::submission_recovery::addressable::envelope_control_bytes(
+            &maximum_quote,
+            numerical,
+            capacity,
+        )
+        .map_err(|cause| context.metadata_source(cause))?;
+        host_bytes = host_bytes
+            .checked_add(u64::try_from(native).map_err(|_| invalid())?)
+            .ok_or_else(invalid)?;
+        let envelope = LocalEnvelope {
+            equation,
+            numerical,
+            capacity,
+            host_bytes,
+            capture_publications,
+        };
         context.charge_metadata(shared_bytes::<LocalEnvelope>().ok_or_else(invalid)?)?;
         let quote = AddressableQuoteRef(maximum_quote.0.clone(), Some(Rc::new(envelope)));
-        let mut quotes = self.inner().quotes.try_borrow_mut().map_err(|_| invalid())?;
+        let mut quotes = self
+            .inner()
+            .quotes
+            .try_borrow_mut()
+            .map_err(|_| invalid())?;
         context.reserve_metadata_vec(&mut quotes, 1)?;
         quotes.push(quote.clone());
         Ok(quote)
@@ -320,7 +402,8 @@ impl AddressableSources {
         for (ordinal, op) in operations.iter().enumerate() {
             if matches!(op.kind, WorkspaceOperationKind::AddressableRegion(_)) {
                 occurrences.push((ordinal, self.quote(op.as_view())?));
-            } else if matches!(&op.kind, WorkspaceOperationKind::ExpertRegion(region) if region.as_view().addressable.is_some()) {
+            } else if matches!(&op.kind, WorkspaceOperationKind::ExpertRegion(region) if region.as_view().addressable.is_some())
+            {
                 occurrences.push((ordinal, self.local_quote(op.as_view())?));
             }
         }
@@ -336,12 +419,22 @@ pub(crate) struct AddressableInvocation {
     source: AddressableSources,
 }
 impl AddressableInvocation {
-    pub(crate) fn try_clone_for_retention(&self)->Result<Self,Error>{
-        let context=WorkspaceContext::new_with_metadata_funding(self.source.mechanism(),self.source.funding().clone())?;
-        context.charge_metadata(size_of::<(Self,Result<Self,Error>)>())?;
-        let mut occurrences=context.metadata_vec(self.occurrences.len())?;
-        occurrences.extend(self.occurrences.iter().map(|(ordinal,quote)|(*ordinal,quote.clone())));
-        Ok(Self{occurrences,source:self.source.clone()})
+    pub(crate) fn try_clone_for_retention(&self) -> Result<Self, Error> {
+        let context = WorkspaceContext::new_with_metadata_funding(
+            self.source.mechanism(),
+            self.source.funding().clone(),
+        )?;
+        context.charge_metadata(size_of::<(Self, Result<Self, Error>)>())?;
+        let mut occurrences = context.metadata_vec(self.occurrences.len())?;
+        occurrences.extend(
+            self.occurrences
+                .iter()
+                .map(|(ordinal, quote)| (*ordinal, quote.clone())),
+        );
+        Ok(Self {
+            occurrences,
+            source: self.source.clone(),
+        })
     }
 
     pub(crate) fn occurrences(&self) -> &[(usize, AddressableQuoteRef)] {

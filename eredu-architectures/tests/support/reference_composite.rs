@@ -85,6 +85,7 @@ impl ReferencePredictionSnapshotContext<'_> {
 struct ReferenceEmbeddedContext<'a> {
     stream: &'a (),
     snapshot: ReferencePredictionSnapshotContext<'a>,
+    schedule: Option<&'a eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority>,
 }
 
 impl Default for ReferenceEmbeddedContext<'_> {
@@ -92,6 +93,7 @@ impl Default for ReferenceEmbeddedContext<'_> {
         Self {
             stream: &(),
             snapshot: ReferencePredictionSnapshotContext::default(),
+            schedule: None,
         }
     }
 }
@@ -157,7 +159,11 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
             >,
         }
         impl<'a, 'r> ParameterVisitor<'a, ReferenceTensor> for Bindings<'r> {
-            fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a ReferenceTensor) {
+            fn visit(
+                &mut self,
+                metadata: eredu_nn::ParameterMetadataView<'_>,
+                value: &'a ReferenceTensor,
+            ) {
                 let bytes = value
                     .shape()
                     .iter()
@@ -179,7 +185,7 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
             missing: Vec::new(),
             recipes: &mut recipes,
         };
-        local.visit_parameters(&mut bindings);
+        local.visit_parameters(&mut bindings).map_err(Error::backend)?;
         let values = std::mem::take(&mut bindings.values);
         let missing = std::mem::take(&mut bindings.missing);
         drop(bindings);
@@ -269,6 +275,12 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
 
 struct ReferenceReplicatedMechanisms;
 
+#[allow(dead_code)]
+enum ReferencePrefillGuard {
+    Inference(eredu_runtime::working_memory::InferenceRequest),
+    Speculative(eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority),
+}
+
 impl<A> ReplicatedTextSessionMechanisms<A, ReferenceBackend> for ReferenceReplicatedMechanisms
 where
     A: eredu_runtime::LayeredArchitecture<ReferenceBackend, ReferenceState, Error = Error>,
@@ -281,12 +293,32 @@ where
             .transpose()
     }
 
-    type PrefillReservationGuard = eredu_runtime::working_memory::InferenceRequest;
+    type PrefillReservationGuard = ReferencePrefillGuard;
     fn begin_prefill_reservation(
         &mut self,
-        reservation: Self::PrefillReservationGuard,
+        reservation: eredu_runtime::working_memory::InferenceRequest,
     ) -> Result<Self::PrefillReservationGuard, Self::Error> {
-        Ok(reservation)
+        Ok(ReferencePrefillGuard::Inference(reservation))
+    }
+    fn coordinate_speculative_prefill_entry(
+        &mut self,
+        authority: &eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority,
+        role: Option<eredu_runtime::prefill::PrefillControlRole>,
+    ) -> Result<Option<Self::PrefillReservationGuard>, Self::Error> {
+        if matches!(
+            role,
+            None | Some(eredu_runtime::prefill::PrefillControlRole::FinalIndex)
+        ) {
+            return Ok(None);
+        }
+        let controls = std::mem::size_of::<Self::PrefillReservationGuard>()
+            + std::mem::size_of::<Option<Self::PrefillReservationGuard>>()
+            + std::mem::size_of::<Result<Option<Self::PrefillReservationGuard>, Error>>();
+        authority
+            .metadata_funding()
+            .reserve_metadata(controls)
+            .map_err(Error::backend_retained_source)?;
+        Ok(Some(ReferencePrefillGuard::Speculative(authority.clone())))
     }
     fn finish_prefill_reservation(
         &mut self,
@@ -295,6 +327,7 @@ where
         Ok(())
     }
 
+    type PromptCacheManifest = eredu_core::cache::PromptCacheManifest;
     type State = ReferenceState;
     type PolicyError = eredu_runtime::ResidentUnitWindowError;
     type ResidentPolicy = ResidentUnitWindow<A::Unit>;
@@ -393,6 +426,7 @@ where
 
     fn load_prompt_cache(
         &mut self,
+        _: &Self::State,
         _: &std::path::Path,
         _: &eredu_core::cache::PromptCacheDescriptor,
         _: &eredu_core::cache::PromptCacheModelIdentity,
@@ -476,6 +510,11 @@ struct ReferencePreparedInput {
     input: eredu_runtime::PreparedModelInput<ReferenceTensor>,
     identity: eredu_runtime::PreparedInputCacheIdentity,
     chunk: Option<std::num::NonZeroU64>,
+    external_schedule: Option<(
+        eredu_runtime::SelectedSpeculativeRealization,
+        eredu_runtime::speculative::external_occurrence::ExternalPredictionShape,
+        SpeculativeConfig,
+    )>,
 }
 
 impl ReferencePreparedInput {
@@ -498,6 +537,7 @@ impl ReferencePreparedInput {
             input,
             identity,
             chunk: None,
+            external_schedule: None,
         })
     }
 }
@@ -622,6 +662,16 @@ where
     type Input = ReferencePreparedInput;
     type Telemetry = ();
     type ExecutorTypes = ReferenceEmbeddedExecutorTypes;
+
+    fn prefill_schedule_authority(
+        context: ReferenceEmbeddedContext<'_>,
+    ) -> Result<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority, Error> {
+        context.schedule.cloned().ok_or_else(|| {
+            Error::backend_retained_source(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            )
+        })
+    }
 
     fn executor_context<'a>(
         context: <Self::ExecutorTypes as eredu_architectures::speculative_execution::EmbeddedExecutorTypes>::Context<'a>,
@@ -750,6 +800,12 @@ impl eredu_architectures::speculative_execution::SpeculativeTensorMechanisms
             .copied()
             .ok_or_else(|| Error::backend("reference embedded tensor has no sequence axis"))
             .and_then(|value| usize::try_from(value).map_err(Error::backend))
+    }
+
+    fn prefill_score_layout<'a>(
+        _: Self::Context<'a>,
+    ) -> eredu_runtime::replicated_session::PrefillScoreLayout {
+        eredu_runtime::replicated_session::PrefillScoreLayout::SelectedPositions
     }
 
     fn selected_prefill_logits(_: Self::Tensor) -> Result<Self::Logits, Self::Error> {
@@ -888,7 +944,9 @@ where
 {
     type Output = ReferenceTensor;
 
-    fn preserves_architecture_declarations(&self) -> bool { true }
+    fn preserves_architecture_declarations(&self) -> bool {
+        true
+    }
 
     fn apply(
         self,
@@ -934,6 +992,7 @@ trait ReferenceExternalTarget {
             Error,
         >,
         cancellation: &GenerationCancellationToken,
+        origin: eredu_core::speculative::SpeculativeActivationOrigin,
     ) -> Result<
         eredu_runtime::replicated_session::PrefillSourceProgress<Option<ReferenceTensor>>,
         Error,
@@ -1096,6 +1155,7 @@ where
             Error,
         >,
         cancellation: &GenerationCancellationToken,
+        origin: eredu_core::speculative::SpeculativeActivationOrigin,
     ) -> Result<
         eredu_runtime::replicated_session::PrefillSourceProgress<Option<ReferenceTensor>>,
         Error,
@@ -1111,9 +1171,31 @@ where
             eredu_architectures::prefill::is_prepared_token_input(&input.input),
         );
         let admission = self.admission.clone();
+        let cached_positions = u64::try_from(eredu_nn::AttentionCache::offset(
+            eredu_runtime::LayerRuntimeState::layer(cache, 0).map_err(Error::backend)?,
+        ))
+        .map_err(Error::backend)?;
         self.with_lane(cache, |session| {
+            let (selected, shape_kind, config) = input.external_schedule.as_ref()
+                .ok_or_else(|| Error::backend("reference external input has no selected schedule"))?;
+            let (authority, original) = reference_external_schedule(
+                selected, *shape_kind, config,
+                session.inference_execution_identity(),
+                eredu_core::InferenceGeometry {
+                    batch_size: shape[0],
+                    cached_positions,
+                    input_positions: shape[1],
+                    max_output_tokens: u64::try_from(config.max_tokens).map_err(Error::backend)?,
+                    prefill_chunk_positions: chunk
+                        .map_or(eredu_runtime::prefill::DEFAULT_PREFILL_CHUNK_POSITIONS,
+                            |value| value.get()).min(shape[1]),
+                    output: receiver.output_demand(),
+                },
+            )
+            .map_err(Error::backend)?;
             session
-                .try_prefill_unbudgeted_source_with_operation(
+                .try_prefill_speculative_source_with_operation(
+                    authority,
                     Some(shape),
                     chunk,
                     receiver.output_demand(),
@@ -1133,6 +1215,8 @@ where
                     ReferenceExternalSpan::<A> {
                         request,
                         receiver,
+                        original,
+                        origin,
                         _architecture: std::marker::PhantomData,
                     },
                 )
@@ -1481,7 +1565,11 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
         let mut module = A::module::<ReferenceBackend>(config.clone(), &())?;
         struct Bindings(Vec<eredu_runtime::WeightBinding>);
         impl<'a> ParameterVisitor<'a, ReferenceTensor> for Bindings {
-            fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a ReferenceTensor) {
+            fn visit(
+                &mut self,
+                metadata: eredu_nn::ParameterMetadataView<'_>,
+                value: &'a ReferenceTensor,
+            ) {
                 let expected_bytes = value
                     .shape()
                     .iter()
@@ -1495,7 +1583,9 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
                     eredu_runtime::WeightBinding::from_recipe(
                         metadata.id().as_str(),
                         eredu_checkpoint::recipe::DerivedWeightRecipe::source(
-                            metadata.id().as_str(),eredu_checkpoint::store::TensorSelection::Full),
+                            metadata.id().as_str(),
+                            eredu_checkpoint::store::TensorSelection::Full,
+                        ),
                         expected_bytes,
                     )
                     .unwrap(),
@@ -1503,7 +1593,7 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
             }
         }
         let mut bindings = Bindings(Vec::new());
-        module.visit_parameters(&mut bindings);
+        module.visit_parameters(&mut bindings).map_err(Error::backend)?;
         let materialized = eredu_runtime::materialize_bindings::<ReferenceBackend>(
             store.as_ref(),
             &bindings.0,
@@ -1714,6 +1804,7 @@ struct ReferenceExternalCompletion {
     remaining_incomplete_polls: Cell<usize>,
     retained: Vec<ReferenceTensor>,
     control: Option<Rc<ReferenceCompletionControl>>,
+    _original_role: Option<eredu_runtime::working_memory::OriginalExternalSpeculativeRole>,
 }
 
 impl ReferenceExternalCompletion {
@@ -1743,6 +1834,7 @@ impl ReferenceExternalCompletion {
             remaining_incomplete_polls: Cell::new(remaining_incomplete_polls),
             retained,
             control,
+            _original_role: REFERENCE_SPAN_ROLE.with(|role| role.borrow().clone()),
         }
     }
 }
@@ -1843,6 +1935,10 @@ impl Drop for ReferenceExternalCompletion {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct ReferenceExternalContext {
+    origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+}
 struct ReferenceExternalMechanisms;
 
 impl<A> eredu_architectures::ExternalAssistantExecutionMechanisms<A> for ReferenceExternalMechanisms
@@ -1858,14 +1954,24 @@ where
     type NativeCacheCheckpoint = ReferenceState;
     type Tensor = ReferenceTensor;
     type Logits = u32;
-    type Context<'a> = ();
+    type Context<'a> = ReferenceExternalContext;
+    fn requires_activation_origin() -> bool { true }
+    fn invocation_context<'a>(_: Self::Context<'a>, origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>) -> Result<Self::Context<'a>, Error> {
+        Ok(ReferenceExternalContext { origin })
+    }
     type Completion = ReferenceExternalCompletion;
     type Telemetry = ();
     type Error = Error;
 
-    fn source_context<'a, 'scope>(context: Self::Context<'a>,
+    fn source_context<'a, 'scope>(
+        context: Self::Context<'a>,
         _sources: &'scope [&'scope eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
-    ) -> Result<Self::Context<'scope>, Self::Error> where 'a: 'scope { Ok(context) }
+    ) -> Result<Self::Context<'scope>, Self::Error>
+    where
+        'a: 'scope,
+    {
+        Ok(context)
+    }
 
     fn config(assistant: &Self::Assistant) -> &A::Config {
         &assistant.config
@@ -1920,12 +2026,12 @@ where
             Self::Error,
         >,
         cancellation: &GenerationCancellationToken,
-        _: Self::Context<'a>,
+        context: Self::Context<'a>,
     ) -> Result<
         eredu_runtime::replicated_session::PrefillSourceProgress<Option<Self::Tensor>>,
         Self::Error,
     > {
-        target.prefill_spans(input, request, cache, receiver, cancellation)
+        target.prefill_spans(input, request, cache, receiver, cancellation, context.origin.ok_or_else(|| Error::backend("missing scheduler origin"))?)
     }
     fn supports_prefill_observation(assistant: &Self::Assistant, context: bool) -> bool {
         assistant.observers.supports_prefill(context)
@@ -2189,8 +2295,86 @@ struct ReferenceProductionOutcome {
     execution_stages: Vec<eredu_core::SpeculativeLifecycleStage>,
 }
 
+fn reference_embedded_schedule(
+    selected: &eredu_runtime::SelectedSpeculativeRealization,
+    execution: &eredu_runtime::working_memory::InferenceExecutionIdentity,
+    shape: eredu_runtime::speculative::embedded_occurrence::EmbeddedPredictionShape,
+    alignment: eredu_core::speculative::PredictionPrefillAlignment,
+    geometry: eredu_core::InferenceGeometry,
+    config: &SpeculativeConfig,
+) -> Result<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority, String> {
+    use eredu_runtime::working_memory::OriginalSpeculativeRequest;
+    let plan = eredu_runtime::speculative::embedded_occurrence::EmbeddedSchedulePlan::new(
+        selected,
+        shape,
+        alignment,
+        0,
+        eredu_runtime::prefill::PrefillControlPlan::new(geometry, true)
+            .map_err(|e| e.to_string())?,
+        geometry
+            .input_positions
+            .checked_add(geometry.max_output_tokens)
+            .ok_or("context overflow")?,
+        config,
+        SpeculativeSchedulerOptions::default().with_lookahead(false),
+    )
+    .map_err(|e| e.to_string())?;
+    let pool = crate::memory_fixture::ledger(1 << 30, 0).map_err(|e| e.to_string())?;
+    let limits = eredu_core::MemoryLimits::unlimited(pool.topology());
+    let request =
+        OriginalSpeculativeRequest::prepare_embedded(&pool, execution, &plan, limits.clone())
+            .map_err(|e| e.to_string())?;
+    let funding = pool
+        .prepare_workspace_metadata(execution, limits)
+        .map_err(|e| e.to_string())?;
+    request
+        .prepare_embedded_prefill_schedule(&plan, &funding)
+        .map_err(|e| e.to_string())
+}
+
+fn reference_external_schedule<'a>(
+    selected: &'a eredu_runtime::SelectedSpeculativeRealization,
+    shape: eredu_runtime::speculative::external_occurrence::ExternalPredictionShape,
+    config: &SpeculativeConfig,
+    execution: &eredu_runtime::working_memory::InferenceExecutionIdentity,
+    geometry: eredu_core::InferenceGeometry,
+) -> Result<(eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority,
+    ReferenceExternalSpanSource<'a>), String> {
+    let plan = eredu_runtime::speculative::external_occurrence::ExternalSchedulePlan::new(
+        selected, shape,
+        eredu_runtime::prefill::PrefillControlPlan::new(geometry, true)
+            .map_err(|e| e.to_string())?,
+        geometry.cached_positions.checked_add(geometry.input_positions)
+            .and_then(|n| n.checked_add(geometry.max_output_tokens))
+            .ok_or("context overflow")?,
+        config, SpeculativeSchedulerOptions::default().with_lookahead(false),
+    ).map_err(|e| e.to_string())?;
+    let pool = crate::memory_fixture::ledger(1 << 30, 0).map_err(|e| e.to_string())?;
+    let limits = eredu_core::MemoryLimits::unlimited(pool.topology());
+    let request = eredu_runtime::working_memory::OriginalSpeculativeRequest::prepare_external(
+        &pool, execution, &plan, limits.clone(),
+    ).map_err(|e| e.to_string())?;
+    let funding = pool.prepare_workspace_metadata(execution, limits)
+        .map_err(|e| e.to_string())?;
+    let authority = request.prepare_external_prefill_schedule(&plan, &funding)
+        .map_err(|e| e.to_string())?;
+    funding.reserve_metadata(std::mem::size_of::<ReferenceExternalSpanSource<'a>>())
+        .map_err(|e| e.to_string())?;
+    let metadata = eredu_nn::workspace::WorkspaceContext::new_with_metadata_funding(
+        ReferenceShapeOnlyFacts, funding,
+    ).map_err(|e| e.to_string())?;
+    Ok((authority, ReferenceExternalSpanSource {
+        pool: pool.clone(),
+        issuer: request, cursor: plan.into_cursor(), metadata,
+        placement: pool.host_placement_handle(),
+    }))
+}
+
 fn run_reference_embedded_scheduler(
     selected: &eredu_runtime::SelectedSpeculativeRealization,
+    execution: &eredu_runtime::working_memory::InferenceExecutionIdentity,
+    shape: eredu_runtime::speculative::embedded_occurrence::EmbeddedPredictionShape,
+    alignment: eredu_core::speculative::PredictionPrefillAlignment,
     executor: &mut eredu_architectures::speculative_execution::DynEmbeddedExecutor<
         '_,
         ReferenceEmbeddedExecutorTypes,
@@ -2226,15 +2410,40 @@ fn run_reference_embedded_scheduler(
         .unwrap_or_else(|| vec![9]);
     let mut input = ReferencePreparedInput::tokens(&tokens).map_err(|error| error.to_string())?;
     input.chunk = captured.and_then(|case| case.chunk);
+    let config = SpeculativeConfig {
+        max_tokens: if captured.is_some() { 13 } else { 3 },
+        max_draft_tokens: selected.requirements().strategy().proposal_capacity().get(),
+        temperature: 0.0,
+        eos_token_ids: Vec::new(),
+    };
+    let schedule = reference_embedded_schedule(
+        selected,
+        execution,
+        shape,
+        alignment,
+        eredu_core::InferenceGeometry {
+            batch_size: 1,
+            cached_positions: 0,
+            input_positions: tokens.len() as u64,
+            max_output_tokens: config.max_tokens as u64,
+            prefill_chunk_positions: input
+                .chunk
+                .map_or_else(|| if captured.is_some_and(|case| !case.span_supported) {
+                    tokens.len() as u64
+                } else { eredu_runtime::prefill::DEFAULT_PREFILL_CHUNK_POSITIONS },
+                    |n| n.get()).min(tokens.len() as u64),
+            output: if captured.is_some_and(|case| case.sequence) {
+                eredu_core::OutputDemand::Sequence
+            } else {
+                eredu_core::OutputDemand::LastPosition
+            },
+        },
+        &config,
+    )?;
     let lane = PreparedSpeculativeLane::new(
         &mut cache,
         input,
-        SpeculativeConfig {
-            max_tokens: if captured.is_some() { 13 } else { 3 },
-            max_draft_tokens: selected.requirements().strategy().proposal_capacity().get(),
-            temperature: 0.0,
-            eos_token_ids: Vec::new(),
-        },
+        config,
         runtime,
         SpeculativeRandomness::new(None, None),
     );
@@ -2244,7 +2453,10 @@ fn run_reference_embedded_scheduler(
         SpeculativeExecutionTopology::Single,
         false,
         false,
-        ReferenceEmbeddedContext::default(),
+        ReferenceEmbeddedContext {
+            schedule: Some(&schedule),
+            ..Default::default()
+        },
     )
     .map_err(|error| format!("{error:?}"))?;
     scheduler.submit(lane).map_err(|error| error.to_string())?;
@@ -2304,6 +2516,12 @@ impl
         let mut session = prepared
             .construct_resident_session(ReferenceReplicatedMechanisms, &())
             .map_err(|error| error.to_string())?;
+        use eredu_architectures::prediction_extension::MaterializedPredictionExecutor;
+        let execution = session.inference_execution_identity().clone();
+        let shape = extension
+            .occurrence_shape()
+            .ok_or("missing prediction shape")?;
+        let alignment = extension.prefill_alignment();
         let mut strategy =
             eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy::<
                 A,
@@ -2333,6 +2551,7 @@ impl
                     marker,
                     observed: Some(&observed),
                 },
+                schedule: None,
             };
             let snapshot = strategy
                 .control_target_snapshot(&cache, context(17))
@@ -2383,10 +2602,35 @@ impl
                 .map_err(|error| error.to_string())?;
             input.chunk = self.captured.as_ref().and_then(|case| case.chunk);
             clear_reference_trace();
+            let config = SpeculativeConfig {
+                max_tokens: 13,
+                max_draft_tokens: self
+                    .selected
+                    .requirements()
+                    .strategy()
+                    .proposal_capacity()
+                    .get(),
+                ..Default::default()
+            };
+            let schedule = reference_embedded_schedule(
+                &self.selected,
+                &execution,
+                shape,
+                alignment,
+                eredu_core::InferenceGeometry {
+                    batch_size: 1,
+                    cached_positions: 0,
+                    input_positions: 5,
+                    max_output_tokens: 13,
+                    prefill_chunk_positions: input.chunk.map_or(5, |n| n.get().min(5)),
+                    output: eredu_core::OutputDemand::LastPosition,
+                },
+                &config,
+            )?;
             let completed = strategy.prefill_cancellable(
                 input, &mut cache,
                 &mut eredu_architectures::speculative_execution::EmbeddedPredictionObservers::default(),
-                &GenerationCancellationToken::new(), ReferenceEmbeddedContext::default(),
+                &GenerationCancellationToken::new(), ReferenceEmbeddedContext { schedule: Some(&schedule), ..Default::default() },
             ).map_err(|error|error.to_string())?;
             assert!(matches!(
                 completed,
@@ -2428,7 +2672,14 @@ impl
         let mut executor = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
             ReferenceEmbeddedExecutorTypes,
         >::new(&mut executor);
-        run_reference_embedded_scheduler(&self.selected, &mut executor, self.captured.as_ref())
+        run_reference_embedded_scheduler(
+            &self.selected,
+            &execution,
+            shape,
+            alignment,
+            &mut executor,
+            self.captured.as_ref(),
+        )
     }
 }
 
@@ -2633,6 +2884,7 @@ struct RunReferenceExternal {
     target: Box<dyn ReferenceExternalTarget>,
     cache: eredu_architectures::external_assistant::ExternalAssistantCache<ReferenceState>,
     capture: ExternalPredictionCaptureRequest,
+    selected: eredu_runtime::SelectedSpeculativeRealization,
 }
 
 impl
@@ -2663,6 +2915,7 @@ impl
             RunReferenceScheduler {
                 cache: &mut self.cache,
                 spans: self.spans,
+                selected: self.selected,
             },
         )
     }
@@ -2674,6 +2927,12 @@ trait ReferenceProductionSamplingContext: Clone {
 
 impl ReferenceProductionSamplingContext for () {
     type Context<'a> = ();
+}
+
+#[derive(Clone, Default)]
+struct ReferenceExternalSamplingContext;
+impl ReferenceProductionSamplingContext for ReferenceExternalSamplingContext {
+    type Context<'a> = ReferenceExternalContext;
 }
 
 #[derive(Clone, Default)]
@@ -2827,6 +3086,7 @@ impl<C: ReferenceProductionSamplingContext> SpeculativeSampling for ReferencePro
 struct RunReferenceScheduler<'a> {
     spans: Option<ReferenceExternalCase>,
     cache: &'a mut eredu_architectures::external_assistant::ExternalAssistantCache<ReferenceState>,
+    selected: eredu_runtime::SelectedSpeculativeRealization,
 }
 
 impl<'a, A>
@@ -2848,7 +3108,7 @@ where
                     ReferenceState,
                 >,
                 Logits = u32,
-                Context<'run> = (),
+                Context<'run> = ReferenceExternalContext,
                 Completion = ReferenceExternalCompletion,
                 Telemetry = (),
                 Error = Error,
@@ -2858,7 +3118,7 @@ where
         let execution_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_execution = execution_stages.clone();
         let runtime = SpeculativeOutputRuntime::new(
-            ReferenceProductionSampling::<()>::default(),
+            ReferenceProductionSampling::<ReferenceExternalSamplingContext>::default(),
             GenerationSequence::new(if self.spans.is_some() { 13 } else { 3 }, []),
             Constraint,
             Publisher {
@@ -2874,6 +3134,12 @@ where
             record_reference_lifecycle(stage);
             Ok(())
         }));
+        let config = SpeculativeConfig {
+            max_tokens: if self.spans.is_some() { 13 } else { 3 },
+            max_draft_tokens: 2,
+            temperature: 0.0,
+            eos_token_ids: Vec::new(),
+        };
         let lane = PreparedSpeculativeLane::new(
             self.cache,
             {
@@ -2887,14 +3153,10 @@ where
                 let mut input = ReferencePreparedInput::tokens(tokens.as_deref().unwrap_or(&[9]))
                     .map_err(|e| e.to_string())?;
                 input.chunk = self.spans.as_ref().and_then(|case| case.chunk);
+                input.external_schedule = Some((self.selected, A::invocation_shape(), config.clone()));
                 input
             },
-            SpeculativeConfig {
-                max_tokens: if self.spans.is_some() { 13 } else { 3 },
-                max_draft_tokens: 2,
-                temperature: 0.0,
-                eos_token_ids: Vec::new(),
-            },
+            config,
             runtime,
             SpeculativeRandomness::new(None, None),
         );
@@ -2918,7 +3180,7 @@ where
             SpeculativeExecutionTopology::Single,
             false,
             false,
-            (),
+            ReferenceExternalContext::default(),
         )
         .map_err(|error| error.to_string())?;
         scheduler.submit(lane).map_err(|error| error.to_string())?;
@@ -3025,12 +3287,13 @@ fn run_reference_external_spans(
     let (_, mut assistant, native, (), transfer) = resources.into_parts();
     assert!(transfer.is_none());
     let cache =
-        eredu_architectures::external_assistant::ExternalAssistantCache::new(native, selected);
+        eredu_architectures::external_assistant::ExternalAssistantCache::new(native, selected.clone());
     let mut outcome = assistant.visit(RunReferenceExternal {
         target,
         spans,
         cache,
         capture,
+        selected,
     })?;
     outcome.construction_stages = construction_stages.lock().unwrap().clone();
     Ok(outcome)

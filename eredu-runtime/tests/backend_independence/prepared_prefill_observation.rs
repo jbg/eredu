@@ -5,7 +5,7 @@ use eredu_core::{GenerationCancellationToken, InferenceGeometry, OutputDemand};
 use eredu_runtime::{
     prefill::PrefillChunk,
     replicated_session::{PrefillSourceOutcome, PreparedPrefillSource},
-    working_memory::{InferenceRequest, WorkingMemoryPool},
+    working_memory::{InferenceRequest, MemoryLedger},
     ActivationObserver, ReplicatedTextSessionError,
 };
 
@@ -266,7 +266,7 @@ fn session() -> (Session, ReplicatedSessionCounters) {
 }
 fn request(
     execution: &eredu_runtime::working_memory::InferenceExecutionIdentity,
-) -> (WorkingMemoryPool, InferenceRequest) {
+) -> (MemoryLedger, InferenceRequest) {
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -275,7 +275,7 @@ fn request(
         prefill_chunk_positions: 1,
         output: OutputDemand::LastPosition,
     };
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request = pool
         .reserve(execution, &mock_inference_admission(geometry))
         .unwrap()
@@ -337,7 +337,7 @@ fn span_callback_precedes_preparation_and_one_terminal_success_follows_final_ind
         3
     );
     drop((observer, request, session));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn cancellation_after_intermediate_or_final_committed_chunk_aborts_outer_prefill
             last + 1
         );
         drop((observer, request, session));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -409,11 +409,15 @@ fn final_index_and_final_reservation_failure_abort_once_after_all_chunk_commits(
         });
         drop((observer, request, session));
         assert_eq!(
-            pool.used_bytes().unwrap(),
-            if fault == Fault::Settlement { 384 } else { 0 }
+            pool.live_charge_bytes().unwrap(),
+            if fault == Fault::Settlement {
+                mock_reservation_bytes()
+            } else {
+                0
+            }
         );
         drop(fixture); // independent mock teardown, not terminal callback certification
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -486,7 +490,7 @@ fn callback_failure_uses_existing_input_agreement_and_prevents_later_preparation
         );
         drop(trace);
         drop((observer, request, session));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 

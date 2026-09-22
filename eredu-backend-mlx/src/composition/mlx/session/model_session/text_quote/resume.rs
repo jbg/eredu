@@ -43,17 +43,27 @@ pub(in crate::composition::mlx::session) struct PendingSavedTextAdmission {
 
 impl PendingSavedTextAdmission {
     pub(in crate::composition::mlx::session) fn apply_child_sampling(
-        &self, runtime: &ModelRuntime<MlxBackend<'_>>, state: &mut generation::MlxTextSamplingState,
+        &self,
+        runtime: &ModelRuntime<MlxBackend<'_>>,
+        state: &mut generation::MlxTextSamplingState,
     ) -> Result<(), Error> {
-        let Some(change) = self.sampling_change else { return Ok(()); };
-        if !state.quote.as_ref().is_some_and(|quote| quote.same_owner(self.quote())) {
+        let Some(change) = self.sampling_change else {
+            return Ok(());
+        };
+        if !state
+            .quote
+            .as_ref()
+            .is_some_and(|quote| quote.same_owner(self.quote()))
+        {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
         self.source.validate_resume_origin(runtime)?;
-        self.quote().replace_saved_sampling(runtime, state, &self.context, change)
+        self.quote()
+            .replace_saved_sampling(runtime, state, &self.context, change)
     }
     pub(in crate::composition::mlx::session) fn resumed_has_rng(&self) -> bool {
-        self.sampling_change.is_some_and(|change| change.reseed().is_some())
+        self.sampling_change
+            .is_some_and(|change| change.reseed().is_some())
             || self.source.sampling().sampling_state_facts().has_rng
     }
     pub(in crate::composition::mlx::session) fn take_capture(
@@ -61,7 +71,10 @@ impl PendingSavedTextAdmission {
         runtime: &ModelRuntime<MlxBackend<'_>>,
     ) -> Result<Option<super::super::text_capture::InstalledCapture>, Error> {
         match (
-            self.child_capture.as_ref().map(ResumeCapture::checkpoint).or_else(|| self.source.capture_checkpoint()),
+            self.child_capture
+                .as_ref()
+                .map(ResumeCapture::checkpoint)
+                .or_else(|| self.source.capture_checkpoint()),
             self.quote().capture.as_ref(),
         ) {
             (Some(checkpoint), Some(capture)) => capture
@@ -189,7 +202,13 @@ impl PendingSavedTextAdmission {
         // The copy, exchange and native publication are complete. Bind the
         // actual installed independent manager before exposing this run.
         self.install_paged_sources(runtime)?;
-        match (self.source.sampling().pending_media().filter(|_| self.quote().request().geometry().max_output_tokens > 0), transition) {
+        match (
+            self.source
+                .sampling()
+                .pending_media()
+                .filter(|_| self.quote().request().geometry().max_output_tokens > 0),
+            transition,
+        ) {
             (Some(media), Some(transition)) => {
                 self.quote()
                     .seal_copied_media(runtime, media.semantics(), transition)?
@@ -229,27 +248,6 @@ impl PendingSavedTextAdmission {
                 .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?,
         )
     }
-}
-
-/// This entry requires the final controller and the fresh context issued by the
-/// shared core resume driver. It performs no native work or source-history copy.
-pub(in crate::composition::mlx::session) fn admit_saved<C: TokenFilterController>(
-    runtime: &ModelRuntime<MlxBackend<'_>>,
-    source: &CopiedTextComponentsOwner,
-    config: TextGenerationConfig,
-    controller: &C,
-    context: &TextStepContext,
-) -> Result<PendingSavedTextAdmission, BackendFailure> {
-    admit_saved_inner(
-        runtime,
-        source,
-        config,
-        controller,
-        context,
-        None,
-        &eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Restore),
-    )
-    .map_err(BackendFailure::from_error)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -313,7 +311,8 @@ fn admit_saved_inner<C: TokenFilterController>(
     let mut planning_metadata = None;
     let result = (|| {
         let original = host.is_some();
-        PreparedSavedTextResumeQuote::validate_resume_options(source, config, options).map_err(memory)?;
+        PreparedSavedTextResumeQuote::validate_resume_options(source, config.clone(), options)
+            .map_err(memory)?;
         if source.capture_checkpoint().is_some() && !original {
             return Err(unknown());
         }
@@ -324,11 +323,16 @@ fn admit_saved_inner<C: TokenFilterController>(
             }));
         }
         source.validate_resume_origin(runtime)?;
-        let sampling_change = options.sampling.map(|request| {
-            eredu_runtime::execution_control::validate_sampling_override::<Error>(
-                source.sampling().sampling_state_facts(), request)
+        let sampling_change = options
+            .sampling
+            .map(|request| {
+                eredu_runtime::execution_control::validate_sampling_override::<Error>(
+                    source.sampling().sampling_state_facts(),
+                    request,
+                )
                 .map_err(|cause| Error::Other(Box::new(cause)))
-        }).transpose()?;
+            })
+            .transpose()?;
         let session = runtime.session();
         session.ensure_healthy()?;
         let original_exchange = host
@@ -359,7 +363,10 @@ fn admit_saved_inner<C: TokenFilterController>(
         policy
             .validate(config.sampling().max_new_tokens)
             .map_err(capability)?;
-        let capacity = policy.managed_memory_capacity_bytes.ok_or_else(|| unknown())?;
+        let capacity = policy
+            .memory_limits
+            .resolve(runtime.backend().memory_ledger().topology())
+            .map_err(|cause| memory(cause.into()))?;
         let outputs = u64::try_from(config.sampling().max_new_tokens.ok_or_else(|| unknown())?)
             .map_err(|_| memory(WorkingMemoryError::Overflow))?;
         let workspace = controller
@@ -369,8 +376,12 @@ fn admit_saved_inner<C: TokenFilterController>(
             ControllerStorageContract::inspect_original_retained(
                 controller,
                 workspace,
-                runtime.backend().memory_pool(),
-                session.payload.model.erased().inference_execution_identity(),
+                runtime.backend().memory_ledger(),
+                session
+                    .payload
+                    .model
+                    .erased()
+                    .inference_execution_identity(),
                 outputs,
             )
             .map_err(Error::StorageSource)?
@@ -383,22 +394,44 @@ fn admit_saved_inner<C: TokenFilterController>(
             .map_err(|error| Error::Other(Box::new(error)))?;
         let diagnostic = match host {
             Some(host) => PreparedSavedTextResumeQuote::prepare_original(
-                runtime, source, config, workspace, host, options,
+                runtime,
+                source,
+                config.clone(),
+                workspace,
+                host,
+                options,
             )?,
-            None => PreparedSavedTextResumeQuote::prepare(runtime, source, config, workspace)?,
+            None => {
+                PreparedSavedTextResumeQuote::prepare(runtime, source, config.clone(), workspace)?
+            }
         };
         planning_metadata = diagnostic.planning_metadata();
         // Owner assembly has large by-value transports. It begins only after
         // the recursive cold quote returns, with its own prepaid controls.
         if let Some(funding) = planning_metadata.as_ref() {
-            funding.reserve_metadata(finish::control_bytes::<C>().ok_or_else(|| {
-                memory(WorkingMemoryError::Overflow)
-            })?).map_err(Error::WorkspacePlanning)?;
+            funding
+                .reserve_metadata(
+                    finish::control_bytes::<C>()
+                        .ok_or_else(|| memory(WorkingMemoryError::Overflow))?,
+                )
+                .map_err(Error::WorkspacePlanning)?;
         }
         finish::admit(
-            runtime, source, config, controller, context, host, options.kind, sampling_change,
-            diagnostic, workspace, storage_contract, original_exchange,
-            capacity, outputs, &planning_metadata,
+            runtime,
+            source,
+            config,
+            controller,
+            context,
+            host,
+            options.kind,
+            sampling_change,
+            diagnostic,
+            workspace,
+            storage_contract,
+            original_exchange,
+            capacity,
+            outputs,
+            &planning_metadata,
         )
     })();
     result.map_err(|cause| match planning_metadata {

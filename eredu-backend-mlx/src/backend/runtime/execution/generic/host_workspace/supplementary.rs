@@ -71,6 +71,8 @@ impl LayerwiseWorkspace {
         };
         Ok(Self {
             manager: manager.clone(),
+            replacement_rows: Vec::new(),
+            replacement_rows_funded: true,
             identity: LayerwiseWorkspaceIdentity {
                 policy: source.policy_identity().clone(),
                 parameter_locations: None,
@@ -78,12 +80,14 @@ impl LayerwiseWorkspace {
                 // Supplementary ordinals address their own complete rows,
                 // never the main manager's execution-unit constructor table.
                 manager_unit_constructors: false,
+                replacements: Default::default(),
                 geometry,
             },
             copies,
             materialization,
             persistent_roots: RefCell::new(None),
             execution_trace: RefCell::new(None),
+            constructor_trace: RefCell::new(None),
             speculative_foreground: std::cell::OnceCell::new(),
         })
     }

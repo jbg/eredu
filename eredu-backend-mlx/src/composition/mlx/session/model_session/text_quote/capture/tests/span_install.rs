@@ -1,5 +1,7 @@
 //! Actual original admission and custody, without enabling native execution.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_runtime::working_memory::InferenceWorkspaceSpan;
 
 fn active_source(runtime: &Runtime, path: &str, preview: u64) -> SharedCapturePlan {
@@ -43,12 +45,18 @@ pub(super) fn quoted(
     ids: &Vec<u32>,
     controller: &disk::Controller,
 ) -> IncrementalInferenceQuote {
-    let capture = CaptureAdmission::new(runtime.session(), geometry(), source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
+    let capture = CaptureAdmission::new(
+        runtime.session(),
+        geometry(),
+        source,
+        eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+    )
+    .unwrap();
     let mut g = geometry();
     g.output = capture.physical_output(g.output);
     let storage = ControllerStorageContract::inspect(controller).unwrap();
     let registered = storage
-        .pin_registered(controller, runtime.backend().memory_pool())
+        .pin_registered(controller, runtime.backend().memory_ledger())
         .unwrap();
     super::super::super::quote_incremental(
         runtime.session(),
@@ -58,7 +66,6 @@ pub(super) fn quoted(
         controller.inference_workspace(4).unwrap(),
         &storage,
         Some(&registered),
-        false,
         Some(&capture),
     )
     .unwrap()
@@ -78,16 +85,16 @@ fn original_bound_capture_admits_exact_physical_readout_and_plan_on_all_weight_r
                 OutputDemand::Sequence,
             ),
         ] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let (runtime, _artifact) = load(&stream, &pool, route);
             let source = active_source(&runtime, path, preview);
             let ids = vec![2, 5, 7];
             let controller = disk::Controller::default();
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.fixture_host_charge().unwrap();
             let before = path_instrumentation::snapshot();
             let frontier = runtime.session().payload.model.erased().state_snapshot();
             let quote = quoted(&runtime, &source, &ids, &controller);
-            let required = quote.incremental_bytes();
+            let required = quote.incremental_bytes().unwrap();
             let p = quote.span_workspace().retention_peak_bytes().unwrap();
             assert!(p > 0 && required > p);
             assert_eq!(quote.geometry().output, output);
@@ -96,13 +103,22 @@ fn original_bound_capture_admits_exact_physical_readout_and_plan_on_all_weight_r
             let error = admit(&runtime, &source, &ids, &controller, exact - 1).unwrap_err();
             assert!(matches!(
                 cause::<WorkingMemoryError>(&error),
-                WorkingMemoryError::BudgetExceeded { .. }
+                WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
             ));
-            assert_eq!(pool.used_bytes().unwrap(), baseline);
+            assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
             let (preparation, quote) = admit(&runtime, &source, &ids, &controller, exact).unwrap();
             let request = preparation.request();
             assert_eq!(request.geometry().output, output);
-            assert_eq!(request.memory_reservation().unwrap().bytes(), required);
+            assert_eq!(
+                request
+                    .memory_reservation()
+                    .requirements()
+                    .get(crate::memory_fixture::topology().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap(),
+                required
+            );
             let installed = quote
                 .take_capture_installation(runtime.session(), &source)
                 .unwrap();
@@ -110,9 +126,17 @@ fn original_bound_capture_admits_exact_physical_readout_and_plan_on_all_weight_r
             assert_eq!(bound.geometry(), request.geometry());
             assert!(bound.selection().source().same_storage(&source));
             let span = installed.span_workspace();
-            span.reservation().validate_domain(&pool).unwrap();
+            span.reservation().validate_ledger(&pool).unwrap();
             assert_eq!(span.reservation().geometry(), request.geometry());
-            assert_eq!(span.reservation().bytes(), required);
+            assert_eq!(
+                span.reservation()
+                    .requirements()
+                    .get(crate::memory_fixture::topology().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap(),
+                required
+            );
             assert_eq!(span.workspace().retention_peak_bytes(), Some(p));
             let q = span
                 .workspace()
@@ -151,7 +175,7 @@ fn original_bound_capture_admits_exact_physical_readout_and_plan_on_all_weight_r
                     .iter()
                     .all(|r| r.new_allocation_bytes().is_some())
             );
-            assert_eq!(pool.used_bytes().unwrap(), exact);
+            assert_eq!(pool.fixture_host_charge().unwrap(), exact);
             assert_eq!(path_instrumentation::snapshot(), before);
             assert_eq!(
                 runtime.session().payload.model.erased().state_snapshot(),
@@ -168,14 +192,20 @@ fn original_bound_capture_admits_exact_physical_readout_and_plan_on_all_weight_r
 #[test]
 fn original_selection_rejects_readout_downgrade_and_accepts_only_actual_shared_host_source() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = active_source(&runtime, eredu_core::MODEL_LOGITS_OBSERVATION_PATH, 0);
     let foreign = active_source(&runtime, eredu_core::MODEL_LOGITS_OBSERVATION_PATH, 0);
-    let capture = CaptureAdmission::new(runtime.session(), geometry(), &source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
+    let capture = CaptureAdmission::new(
+        runtime.session(),
+        geometry(),
+        &source,
+        eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+    )
+    .unwrap();
     let before = (
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
         path_instrumentation::snapshot(),
     );
     assert!(matches!(
@@ -195,8 +225,8 @@ fn original_selection_rejects_readout_downgrade_and_accepts_only_actual_shared_h
     ));
     assert_eq!(
         (
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
             path_instrumentation::snapshot()
         ),
         before
@@ -212,11 +242,11 @@ fn original_selection_rejects_readout_downgrade_and_accepts_only_actual_shared_h
 #[test]
 fn installed_span_alias_keeps_original_plan_charge_after_quote_and_collector_retire() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = active_source(&runtime, "readout.embedding", 5);
     let c = source.capacity_bytes().unwrap();
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let ids = vec![2, 5, 7];
     let (preparation, quote) = admit(
         &runtime,
@@ -247,7 +277,7 @@ fn installed_span_alias_keeps_original_plan_charge_after_quote_and_collector_ret
             .same_plan(&alias)
     );
     drop(installed);
-    assert!(pool.used_bytes().unwrap() >= baseline + c + p);
+    assert!(pool.fixture_host_charge().unwrap() >= baseline + c + p);
     assert_eq!(alias.geometry().output, OutputDemand::LastPosition);
     assert!(!alias.records().is_empty());
     assert_eq!(path_instrumentation::snapshot(), before);

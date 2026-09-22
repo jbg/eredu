@@ -1,7 +1,7 @@
 use super::*;
 use crate::input::host::{HostInputPart, HostTensorValues, HostTensorView, PreparedHostInputPlan};
 use eredu_core::{InputModality, InputPayloadKind};
-fn source(pool: &WorkingMemoryPool) -> OriginalPreparedHostInput {
+fn source(pool: &MemoryLedger) -> OriginalPreparedHostInput {
     let ids = [1_u32, 2, 3];
     let parts = [HostInputPart {
         modality: InputModality::Text,
@@ -17,7 +17,7 @@ fn source(pool: &WorkingMemoryPool) -> OriginalPreparedHostInput {
         .unwrap()
 }
 fn sizes() -> (u64, u64) {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let source = source(&pool);
     let recipe = PreparedCompositeSemanticRecipe::new(
         &(),
@@ -32,7 +32,7 @@ fn binding() -> MediaSessionBinding {
     MediaSessionBinding {
         execution: InferenceExecutionIdentity::default(),
         revision: super::super::InferenceRetention::new().revision().clone(),
-        control: Arc::new(()),
+        control: crate::replicated_session::ParameterControlIdentity::new(),
         frontier: 0,
     }
 }
@@ -44,12 +44,15 @@ fn independent_media_binding_requires_the_actual_initialized_cache_revision() {
     let binding = MediaSessionBinding {
         execution: execution.clone(),
         revision: retention.revision().clone(),
-        control: Arc::new(()),
+        control: crate::replicated_session::ParameterControlIdentity::new(),
         frontier: 0,
     };
     assert!(binding.matches_retained_state(&execution, &retention, 0));
     assert!(!binding.matches_retained_state(&execution, &foreign, 0));
-    assert!(foreign.initialized_revision().is_none(), "comparison cannot mint an identity");
+    assert!(
+        foreign.initialized_revision().is_none(),
+        "comparison cannot mint an identity"
+    );
     let _ = foreign.revision();
     assert!(!binding.matches_retained_state(&execution, &foreign, 0));
     assert!(!binding.matches_retained_state(&execution, &retention, 1));
@@ -59,7 +62,9 @@ fn independent_media_binding_requires_the_actual_initialized_cache_revision() {
 fn exact_semantic_capacity_and_short_rejection_preserve_original_host_residence() {
     let (host, bytes) = sizes();
     for short in [true, false] {
-        let pool = WorkingMemoryPool::new(host + bytes - u64::from(short), 0).unwrap();
+        let pool =
+            crate::working_memory::memory_fixture::host_ledger(host + bytes - u64::from(short), 0)
+                .unwrap();
         let input = source(&pool);
         let recipe = PreparedCompositeSemanticRecipe::new(
             &(),
@@ -72,10 +77,10 @@ fn exact_semantic_capacity_and_short_rejection_preserve_original_host_residence(
         if short {
             let error = result.err().expect("short rejected before reserve");
             assert!(
-                matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded {required_bytes,available_bytes}) if *required_bytes==bytes && *available_bytes==bytes-1)
+                matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==bytes && (limit_bytes - existing_bytes)==bytes-1)
             );
             assert_eq!(error.retained_bytes(), 0);
-            assert_eq!(pool.used_bytes().unwrap(), host);
+            assert_eq!(pool.payload_used_bytes().unwrap(), host);
         } else {
             let mut builder = result.ok().unwrap();
             assert!(matches!(
@@ -87,24 +92,24 @@ fn exact_semantic_capacity_and_short_rejection_preserve_original_host_residence(
                 .coordinates_mut()
                 .copy_from_slice(&[0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 0, 0]);
             let output = builder.finish().ok().unwrap();
-            drop(pool.acquire_unquoted().unwrap());
+            crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
             drop(input);
             assert_eq!(output.records()[0].end, 3);
             assert_eq!(output.coordinates()[2], 2);
-            assert_eq!(pool.used_bytes().unwrap(), host + bytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), host + bytes);
             drop(output);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             continue;
         }
         drop(input);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn both_actual_reserve_failures_retain_real_prefix_and_original_source() {
     let (host, bytes) = sizes();
     for at in 0..2 {
-        let pool = WorkingMemoryPool::new(host + bytes, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(host + bytes, 0).unwrap();
         let input = source(&pool);
         let layout = PreparedCompositeSemanticLayout::for_source(
             &input,
@@ -120,16 +125,16 @@ fn both_actual_reserve_failures_retain_real_prefix_and_original_source() {
         assert_eq!(error.retained_bytes(), bytes);
         assert_eq!(error.retained_heap_bytes() == 0, at == 0);
         drop(input);
-        assert_eq!(pool.used_bytes().unwrap(), host + bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), host + bytes);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn foreign_source_and_ordinary_owner_reject_before_semantic_destinations() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let input = source(&pool);
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let make = || {
         PreparedCompositeSemanticRecipe::new(&(), &input, 3, CompositeSemanticCoordinates::Ordinary)
             .unwrap()
@@ -140,7 +145,7 @@ fn foreign_source_and_ordinary_owner_reject_before_semantic_destinations() {
         Some(&WorkingMemoryError::IdentityMismatch)
     );
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     let ordinary = pool.acquire_unquoted().unwrap();
     let error = make().allocate(&pool).err().unwrap();
     assert_eq!(
@@ -153,7 +158,7 @@ fn foreign_source_and_ordinary_owner_reject_before_semantic_destinations() {
 #[test]
 fn unwind_before_finish_refunds_after_all_fixed_destinations_retire() {
     let (host, bytes) = sizes();
-    let pool = WorkingMemoryPool::new(host + bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(host + bytes, 0).unwrap();
     let input = source(&pool);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let builder = PreparedCompositeSemanticRecipe::new(
@@ -170,14 +175,14 @@ fn unwind_before_finish_refunds_after_all_fixed_destinations_retire() {
         panic!("after actual fixed destinations");
     }));
     assert!(result.is_err());
-    assert_eq!(pool.used_bytes().unwrap(), host);
+    assert_eq!(pool.payload_used_bytes().unwrap(), host);
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn final_arc_settlement_poison_retains_both_buffers_and_never_false_refunds() {
     let (host, bytes) = sizes();
-    let pool = WorkingMemoryPool::new(host + bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(host + bytes, 0).unwrap();
     let input = source(&pool);
     let builder = PreparedCompositeSemanticRecipe::new(
         &(),
@@ -208,7 +213,7 @@ fn final_arc_settlement_poison_retains_both_buffers_and_never_false_refunds() {
 #[test]
 fn concurrent_final_bound_aliases_preserve_payload_and_custody_until_last_owner() {
     let (host, bytes) = sizes();
-    let pool = WorkingMemoryPool::new(host + bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(host + bytes, 0).unwrap();
     let input = source(&pool);
     let owner = PreparedCompositeSemanticRecipe::new(
         &(),
@@ -233,10 +238,10 @@ fn concurrent_final_bound_aliases_preserve_payload_and_custody_until_last_owner(
             scope.spawn(move || drop(alias));
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), host + bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), host + bytes);
     assert_eq!(last.source().parts().len(), 1);
     drop(last);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -250,7 +255,7 @@ fn equal_numeric_frontier_never_substitutes_for_actual_revision_and_session_iden
     assert!(first.same_origin(&other));
     assert!(!first.matches(&other));
     let mut other = first.duplicate();
-    other.control = Arc::new(());
+    other.control = crate::replicated_session::ParameterControlIdentity::new();
     assert!(!first.same_origin(&other));
     let mut other = first.duplicate();
     other.execution = InferenceExecutionIdentity::default();

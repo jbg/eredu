@@ -24,6 +24,8 @@ pub(super) struct AcceptedInstallation<'a> {
     pub(super) native_recipe: Option<crate::backend::nn::workspace::ResidentNativeRecipe>,
     pub(super) prepared_source: Option<original_prepared::PreparedMediaQuoteSource>,
     pub(super) paged_sources: Option<crate::backend::nn::workspace::ProjectedPagedSources>,
+    pub(super) execution_metadata: Option<eredu_nn::workspace::WorkspaceContext>,
+    pub(super) ordinary_publication: Option<super::super::text_funding::OrdinaryPublicationPlan>,
     // Source and diagnostic fields retire before the accepted accounting owner.
     pub(super) reservation: eredu_runtime::working_memory::WorkingMemoryReservation,
     // Last: the actual planning account retains every moved cold destination.
@@ -54,6 +56,8 @@ impl<'a> AcceptedInstallation<'a> {
             native_recipe,
             prepared_source,
             paged_sources,
+            execution_metadata,
+            ordinary_publication,
             mut reservation,
             planning_metadata,
         } = self;
@@ -107,7 +111,7 @@ impl<'a> AcceptedInstallation<'a> {
             .prepare_text(
                 model.erased().inference_execution_identity(),
                 request.geometry(),
-                config,
+                config.clone(),
             )
             .map_err(memory)?;
         // Existing immutable masks can outlive this run through aliases created
@@ -133,10 +137,7 @@ impl<'a> AcceptedInstallation<'a> {
                 .prepare_original_source(
                     controller,
                     &funding,
-                    preparation
-                        .request()
-                        .memory_reservation()
-                        .ok_or_else(unknown)?,
+                    preparation.request().memory_reservation(),
                 )
                 .map_err(|error| Error::Other(Box::new(error)))?;
         } else {
@@ -224,7 +225,7 @@ impl<'a> AcceptedInstallation<'a> {
         }
         // Extract from the same accepted source before any original role begins.
         // Native creation runs after the capture/span interior borrow has ended.
-        let native_storage = if let Some(mechanism) = model.native_storage_mechanism()? {
+        let native_storage = if let Some(mechanism) = session.native_storage_mechanism()? {
             use eredu_runtime::working_memory::OriginalNativeStorageMechanism as _;
             let bank = if let Some(capture) = &capture {
                 capture.take_native_storage(&funding, mechanism.selection())?
@@ -315,8 +316,20 @@ impl<'a> AcceptedInstallation<'a> {
             .as_ref()
             .map(CaptureQuotation::control_guard)
             .or_else(|| sequence.as_ref().map(SequenceQuotation::control_guard))
-            .map(crate::backend::runtime::execution::generic::OriginalOperationRegistration::new);
-        #[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+            .map(|controls| {
+                crate::backend::runtime::execution::generic::OriginalOperationRegistration::new(
+                    controls,
+                    native_storage.clone(),
+                    planning_metadata.as_ref(),
+                )
+            })
+            .transpose()?;
+        #[cfg(all(
+            test,
+            target_vendor = "apple",
+            feature = "metal",
+            not(feature = "cuda")
+        ))]
         prefill_tests::capture_host_destinations(sequence.as_mut())?;
         let needs_host_bank = match &prefill_scopes {
             Some(scopes) => scopes
@@ -345,19 +358,29 @@ impl<'a> AcceptedInstallation<'a> {
                 LayerwiseQuoteSources::Identity(workspace.into_identity())
             }
         });
-        let parallel_control=match native_recipe.as_ref().map(|recipe|recipe.parallel_control_source()).transpose()?.flatten() {
-            Some(source)=>{
-                let controls=capture.as_ref().map(CaptureQuotation::control_guard)
-                    .or_else(||sequence.as_ref().map(SequenceQuotation::control_guard))
+        let parallel_control = match native_recipe
+            .as_ref()
+            .map(|recipe| recipe.parallel_control_source())
+            .transpose()?
+            .flatten()
+        {
+            Some(source) => {
+                let controls = capture
+                    .as_ref()
+                    .map(CaptureQuotation::control_guard)
+                    .or_else(|| sequence.as_ref().map(SequenceQuotation::control_guard))
                     .ok_or(Error::PrefillScopeUnavailable)?;
-                let bank=native_storage.as_ref().ok_or(Error::PrefillScopeUnavailable)?.clone();
+                let bank = native_storage
+                    .as_ref()
+                    .ok_or(Error::PrefillScopeUnavailable)?
+                    .clone();
                 Some(crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlOwner::new(
                     source.clone(),bank,preparation.request(),controls)?.with_token_sources(
                         if let Some(capture) = &capture { capture.take_output_source_constructions()? }
                         else { sequence.as_mut().ok_or(Error::PrefillScopeUnavailable)?.take_output_source_constructions()? }
                     )?)
             }
-            None=>None,
+            None => None,
         };
         let proof = TextExecutionQuoteOwner::new(TextExecutionQuote {
             config,
@@ -365,8 +388,8 @@ impl<'a> AcceptedInstallation<'a> {
             controller: controller_contract,
             storage_contract,
             session: Rc::clone(&session.poison),
-            model_pool: session.payload.memory_pool.clone(),
-            context_pool: runtime.backend().memory_pool().clone(),
+            model_pool: session.payload.memory_ledger.clone(),
+            context_pool: runtime.backend().memory_ledger().clone(),
             parameter_epoch,
             layerwise,
             _host_sources: host_sources,
@@ -386,14 +409,15 @@ impl<'a> AcceptedInstallation<'a> {
             record_quota,
             graph_quota,
             sampling_revision: RefCell::new(None),
-        native_recipe,
+            native_recipe,
             native_storage,
             parallel_control,
             addressable: RefCell::new(None),
-        paged_sources: RefCell::new(paged_sources),
+            paged_sources: RefCell::new(paged_sources),
             prepared_source,
             saved_cache_source: None,
-            continuation_metadata: None,
+            continuation_metadata: execution_metadata,
+            ordinary_publication,
             original_table,
             planning_metadata: planning_metadata.clone(),
         });

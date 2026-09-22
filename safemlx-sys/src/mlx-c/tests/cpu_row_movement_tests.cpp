@@ -9,7 +9,7 @@ struct Budget {
     mlx_prepared_input_runtime runtime{};
     REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     REQUIRE(mlx_original_buffer_budget_new_retaining(&value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   }
   void release(){mlx_original_buffer_budget_release(value);value={};}
 };

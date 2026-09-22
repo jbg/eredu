@@ -103,7 +103,7 @@ impl super::preparation::PreparedQuantization {
     /// output buffers, native resources and each submission need their own owners.
     pub(super) fn materialize_with_admitted_producer<P: TileProducer>(
         self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         device_type: safemlx::DeviceType,
         producer: &mut P,
     ) -> Result<(QuantizedCheckpoint, BoundedQuantizationPlan), PipelineAdmissionError<P::Error>>
@@ -170,11 +170,9 @@ impl super::preparation::PreparedQuantization {
         while !pending_tiles.is_empty() {
             write_oldest_tile(&mut pending_tiles, &mut output_shards, &mut allocator_cache)?;
         }
-        debug_assert!(
-            output_shards
-                .iter()
-                .all(|shard| shard.sealed && shard.pending_tiles == 0)
-        );
+        debug_assert!(output_shards
+            .iter()
+            .all(|shard| shard.sealed && shard.pending_tiles == 0));
         allocator_cache.finish()?;
 
         let transformed = MemoryWeightStore::from_buffers(

@@ -7,7 +7,8 @@ pub struct CacheBlockPrefetch {
     pub(super) manager: CacheResidencyManager,
     pub(super) ids: VecDeque<CacheBlockId>,
     pub(super) pending: VecDeque<CacheBlockLease>,
-    pub(super) transfer_stream: Stream,
+    pub(super) transfer_source: PreparedCacheTransferStream,
+    ledger: eredu_runtime::working_memory::MemoryLedger,
     pub(super) execution_stream: Stream,
 }
 
@@ -17,14 +18,53 @@ impl CacheBlockPrefetch {
         ids: Vec<CacheBlockId>,
         execution_stream: &Stream,
     ) -> Result<Self, CacheResidencyError> {
-        let device = execution_stream
-            .get_device()
-            .map_err(|source| transfer_error("inspect cache execution stream", source))?;
+        let ledger = crate::backend::managed_memory::try_ledger().map_err(|cause| {
+            CacheResidencyError::TransferOwnership(eredu_core::BackendFailure::from_error(cause))
+        })?;
+        let transfer_source = match manager.prepared_transfer_stream() {
+            Ok(source) => source,
+            Err(transfer_stream::CacheTransferStreamError::Unavailable) => {
+                // Native construction can establish a missing owner before an
+                // inference request. An active admitted request must borrow the
+                // source already included in its cold inventory.
+                if crate::backend::nn::shared::current_ordinary_execution_owner()
+                    .map_err(CacheResidencyError::NativeEvaluation)?
+                    .is_some()
+                {
+                    return Err(CacheResidencyError::TransferOwnership(
+                        eredu_core::BackendFailure::from_error(
+                            transfer_stream::CacheTransferStreamError::Unavailable,
+                        ),
+                    ));
+                }
+                manager
+                    .prepare_transfer_stream(&ledger, execution_stream)
+                    .map_err(CacheResidencyError::TransferOwnership)?;
+                manager.prepared_transfer_stream().map_err(|cause| {
+                    CacheResidencyError::TransferOwnership(eredu_core::BackendFailure::from_error(
+                        cause,
+                    ))
+                })?
+            }
+            Err(cause) => {
+                return Err(CacheResidencyError::TransferOwnership(
+                    eredu_core::BackendFailure::from_error(cause),
+                ))
+            }
+        };
+        transfer_source
+            .with_stream(&ledger, execution_stream, |_| ())
+            .map_err(|cause| {
+                CacheResidencyError::TransferOwnership(eredu_core::BackendFailure::from_error(
+                    cause,
+                ))
+            })?;
         Ok(Self {
             manager,
             ids: ids.into(),
             pending: VecDeque::with_capacity(PAGED_CACHE_PREFETCH_BLOCKS),
-            transfer_stream: Stream::new_with_device(&device),
+            transfer_source,
+            ledger,
             execution_stream: execution_stream.clone(),
         })
     }
@@ -39,10 +79,17 @@ impl CacheBlockPrefetch {
             if !self.pending.is_empty() && !self.window_has_capacity_for(id)? {
                 break;
             }
-            match self
-                .manager
-                .prepare_block_transfer(id, &self.transfer_stream)
-            {
+            let prepared = self
+                .transfer_source
+                .with_stream(&self.ledger, &self.execution_stream, |stream| {
+                    self.manager.prepare_block_transfer(id, stream)
+                })
+                .map_err(|cause| {
+                    CacheResidencyError::TransferOwnership(eredu_core::BackendFailure::from_error(
+                        cause,
+                    ))
+                })?;
+            match prepared {
                 Ok(lease) => {
                     self.ids.pop_front();
                     self.pending.push_back(lease);
@@ -65,17 +112,23 @@ impl CacheBlockPrefetch {
         let pending_bytes = self
             .pending
             .iter()
-            .fold(0u64, |total, lease| total.saturating_add(lease.bytes()));
+            .try_fold(0u64, |total, lease| total.checked_add(lease.bytes()))
+            .ok_or(CachePoolError::AccountingOverflow {
+                operation: "sum pending cache transfer window",
+            })?;
         let state = self.manager.lock()?;
         let next_bytes = state
             .blocks
             .get(id)
             .ok_or_else(|| CacheLifecycleError::MissingBlock(id.clone()))?
             .bytes;
-        Ok(
-            pending_bytes.saturating_add(next_bytes)
-                <= self.manager.options().device_budget_bytes(),
-        )
+        let required =
+            pending_bytes
+                .checked_add(next_bytes)
+                .ok_or(CachePoolError::AccountingOverflow {
+                    operation: "extend cache transfer window",
+                })?;
+        Ok(required <= self.manager.options().device_budget_bytes())
     }
 
     #[cfg(test)]
@@ -89,8 +142,15 @@ impl CacheBlockPrefetch {
             self.execution_stream
                 .get_index()
                 .map_err(|source| transfer_error("inspect cache execution stream", source))?,
-            self.transfer_stream
-                .get_index()
+            self.transfer_source
+                .with_stream(&self.ledger, &self.execution_stream, |stream| {
+                    stream.get_index()
+                })
+                .map_err(|cause| {
+                    CacheResidencyError::TransferOwnership(eredu_core::BackendFailure::from_error(
+                        cause,
+                    ))
+                })?
                 .map_err(|source| transfer_error("inspect cache transfer stream", source))?,
         ))
     }

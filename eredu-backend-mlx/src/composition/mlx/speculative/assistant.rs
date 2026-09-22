@@ -1,15 +1,18 @@
 mod evidence;
-pub(crate) use evidence::{ExternalCompletedSource, retain_external_evidence,retain_external_evidence_for_roots,retain_external_evidence_for_placement};
 use super::*;
+pub(crate) use evidence::{
+    retain_external_evidence, retain_external_evidence_for_placement,
+    retain_external_evidence_for_roots, ExternalCompletedSource,
+};
 mod original;
+mod phase;
 mod source;
 pub(crate) mod workspace;
-mod phase;
-pub(crate) use phase::execute as execute_original_assistant;
-pub(crate) use source::MlxExternalAssistantSource;
-use original::DrafterRecovery;
 use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use original::DrafterRecovery;
+pub(crate) use phase::execute as execute_original_assistant;
+pub(crate) use source::MlxExternalAssistantSource;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -59,7 +62,7 @@ pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistant
 pub(crate) struct MlxAssistantPreparationVisitor {
     pub(super) stream: Stream,
     pub(super) weights_stream: Stream,
-    pub(super) source_pool: Option<eredu_runtime::working_memory::WorkingMemoryPool>,
+    pub(super) source_pool: Option<eredu_runtime::working_memory::MemoryLedger>,
 }
 
 #[cfg(test)]
@@ -81,9 +84,13 @@ impl MlxAssistantPreparationVisitor {
     /// Retains ordinary source registration without exposing loader fields.
     pub(crate) fn for_native_source_test(
         stream: &Stream,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Self {
-        Self { stream: stream.clone(), weights_stream: stream.clone(), source_pool: Some(pool.clone()) }
+        Self {
+            stream: stream.clone(),
+            weights_stream: stream.clone(),
+            source_pool: Some(pool.clone()),
+        }
     }
 }
 
@@ -95,7 +102,12 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPr
         self,
         prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        materialize_external_assistant::<A>(prepared, &self.stream, &self.weights_stream, self.source_pool.as_ref())
+        materialize_external_assistant::<A>(
+            prepared,
+            &self.stream,
+            &self.weights_stream,
+            self.source_pool.as_ref(),
+        )
     }
 }
 
@@ -103,7 +115,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     stream: &Stream,
     weights_stream: &Stream,
-    source_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+    source_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
 ) -> Result<MlxExternalAssistant<A>, Error> {
     use crate::backend::runtime::{
         checkpoint::binding::{
@@ -185,19 +197,29 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     // Register their actual completed backing and the retained checkpoint source
     // in the selected backend pool. Later managed quotations only pin these
     // existing owners; they never invent source credit or materialize a weight.
-    let registered_storage = source_pool.map(|pool| {
-        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
-        for array in arrays.values() {
-            storage.include_array(array)?;
-        }
-        storage.include_sources(store.source_storage()?)?;
-        storage.register(pool)
-    }).transpose()?;
+    let registered_storage = source_pool
+        .map(|pool| {
+            let mut storage =
+                crate::backend::runtime::residency::storage::RetainedStorage::default();
+            for array in arrays.values() {
+                storage.include_array(array)?;
+            }
+            storage.include_sources(store.source_storage()?)?;
+            storage.register(pool)
+        })
+        .transpose()?;
     Ok(MlxExternalAssistant {
         config,
         module,
         source: MlxExternalAssistantSource::new(
-            store, checkpoint, artifact_identity, source_config, tasks, bindings, arrays, registered_storage,
+            store,
+            checkpoint,
+            artifact_identity,
+            source_config,
+            tasks,
+            bindings,
+            arrays,
+            registered_storage,
         ),
         observers: Default::default(),
     })
@@ -309,7 +331,8 @@ impl DrafterOperation<'_> {
             self.drafter.poisoned.set(true);
             if let Some(funding) = self.recovery.funding() {
                 return Err(original::failure(
-                    original::Cause::Unresolved(result.err()), funding.clone(),
+                    original::Cause::Unresolved(result.err()),
+                    funding.clone(),
                 ));
             }
             let message = match &result {
@@ -320,10 +343,14 @@ impl DrafterOperation<'_> {
         }
         let value = match result {
             Ok(value) => value,
-            Err(cause) => return Err(match self.recovery.funding() {
-                Some(funding) => original::failure(original::Cause::Operation(cause), funding.clone()),
-                None => cause,
-            }),
+            Err(cause) => {
+                return Err(match self.recovery.funding() {
+                    Some(funding) => {
+                        original::failure(original::Cause::Operation(cause), funding.clone())
+                    }
+                    None => cause,
+                })
+            }
         };
         self.completed = true;
         self.retained.take();
@@ -419,7 +446,7 @@ impl MlxDrafter {
     /// model construction, matching the target model's provider handoff.
     pub(crate) fn materialize_with_source_pool(
         preparation: eredu_architectures::PreparedExternalDraft,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
@@ -435,13 +462,13 @@ impl MlxDrafter {
     ) -> Result<Self, Error> {
         let stream = backend.stream().clone();
         let weights = backend.weights_stream().clone();
-        let pool = backend.memory_pool().clone();
+        let pool = backend.memory_ledger().clone();
         Self::materialize_impl(preparation, Some(&pool), &stream, &weights, Some(backend))
     }
 
     fn materialize_impl(
         preparation: eredu_architectures::PreparedExternalDraft,
-        pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
         stream: &Stream,
         weights_stream: &Stream,
         backend: Option<crate::backend::MlxBackend<'static>>,
@@ -459,9 +486,23 @@ impl MlxDrafter {
             _ => None,
         };
         let addressable_manager = match (&preparation, pool) {
-            (eredu_architectures::PreparedExternalDraft::Autoregressive(prepared), Some(pool)) =>
+            (eredu_architectures::PreparedExternalDraft::Autoregressive(prepared), Some(pool)) => {
                 crate::composition::mlx::loading::prepare_addressable_source(
-                    prepared.sources(), pool, weights_stream, stream)?,
+                    prepared.sources(),
+                    pool,
+                    weights_stream,
+                    stream,
+                )?
+            }
+            _ => None,
+        };
+        let construction_sources = match &preparation {
+            eredu_architectures::PreparedExternalDraft::Autoregressive(prepared) => {
+                let ledger = match pool { Some(ledger) => ledger.clone(), None => crate::backend::managed_memory::try_ledger()? };
+                Some(crate::composition::mlx::loading::PreparedNativeConstructionSources::prepare(
+                    prepared.sources().selected().text_realization().state(), layerwise_manager, &ledger, stream,
+                )?)
+            }
             _ => None,
         };
         let poisoned = Rc::new(Cell::new(false));
@@ -481,12 +522,12 @@ impl MlxDrafter {
             }
             eredu_architectures::PreparedExternalDraft::Autoregressive(p) => {
                 let (sources, selected, tokenizer) = p.into_parts();
-                let model = crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
+                let model = crate::composition::mlx::loading::materialize_model_plan_with_construction_sources(
                     sources,
                     None,
                     stream,
                     weights_stream,
-                    layerwise_manager,
+                    construction_sources,
             addressable_manager,
         )?;
                 DrafterExecution::Autoregressive {

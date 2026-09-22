@@ -1,0 +1,148 @@
+diff --git a/mlx/original_buffer.h b/mlx/original_buffer.h
+--- a/mlx/original_buffer.h
++++ b/mlx/original_buffer.h
+@@ -42,10 +42,13 @@
+ class MLX_API OriginalBufferBudget final {
+  public:
+   static OriginalBufferBudget* create(Allocator&, size_t capacity,
+-      void* owner = nullptr, void (*retire)(void*) = nullptr);
++      void* owner = nullptr, void (*retire)(void*) = nullptr,
++      void (*closed_occupancy)(void*, size_t) = nullptr);
+   static constexpr size_t control_bytes() noexcept;
+   void retain() noexcept;
+   void release() noexcept;
++  void retain_backing() noexcept;
++  void release_backing() noexcept;
+   size_t capacity() const noexcept { return capacity_; }
+   size_t occupied_bytes() const noexcept { return occupied_.load(std::memory_order_acquire); }
+   const PreparedInputFacts& facts() const noexcept { return facts_; }
+@@ -54,17 +57,20 @@
+  private:
+   friend struct OriginalBufferAllocation;
+   friend Buffer allocate_original(size_t, const class OriginalBufferBinding&);
+-  OriginalBufferBudget(Allocator&, PreparedInputFacts, size_t, void*, void (*)(void*)) noexcept;
++  OriginalBufferBudget(Allocator&, PreparedInputFacts, size_t, void*, void (*)(void*),
++      void (*)(void*, size_t)) noexcept;
+   ~OriginalBufferBudget() = default;
+   void debit(size_t);
+   void refund(size_t) noexcept;
+   std::atomic<size_t> references_{1};
++  std::atomic<size_t> producers_{1};
+   std::atomic<size_t> occupied_{0};
+   Allocator* allocator_;
+   const PreparedInputFacts facts_;
+   const size_t capacity_;
+   void* owner_;
+   void (*retire_)(void*);
++  void (*closed_occupancy_)(void*, size_t);
+ };
+ constexpr size_t OriginalBufferBudget::control_bytes() noexcept {
+   return sizeof(OriginalBufferBudget);
+@@ -72,16 +78,20 @@
+ 
+ class OriginalBufferBudgetRef {
+  public:
+-  explicit OriginalBufferBudgetRef(OriginalBufferBudget* p = nullptr) noexcept : value_(p) {
+-    if (value_) value_->retain();
++  explicit OriginalBufferBudgetRef(OriginalBufferBudget* p = nullptr, bool producer = true) noexcept
++      : value_(p), producer_(producer) {
++    if (value_) { if (producer_) value_->retain(); else value_->retain_backing(); }
+   }
+   OriginalBufferBudgetRef(const OriginalBufferBudgetRef& other) noexcept
+-      : OriginalBufferBudgetRef(other.value_) {}
++      : OriginalBufferBudgetRef(other.value_, other.producer_) {}
+   OriginalBufferBudgetRef& operator=(const OriginalBufferBudgetRef&) = delete;
+-  ~OriginalBufferBudgetRef() { if (value_) value_->release(); }
++  ~OriginalBufferBudgetRef() {
++    if (value_) { if (producer_) value_->release(); else value_->release_backing(); }
++  }
+   OriginalBufferBudget* get() const noexcept { return value_; }
+  private:
+   OriginalBufferBudget* value_;
++  bool producer_;
+ };
+ 
+ // Retains only the actual Graph and allowance. Scalar role identity is checked
+diff --git a/mlx/original_buffer.cpp b/mlx/original_buffer.cpp
+--- a/mlx/original_buffer.cpp
++++ b/mlx/original_buffer.cpp
+@@ -25,11 +25,13 @@
+   return "Original buffer allocation refused.";
+ }
+ OriginalBufferBudget::OriginalBufferBudget(Allocator& allocator, PreparedInputFacts facts,
+-    size_t capacity, void* owner, void (*retire)(void*)) noexcept
+-    : allocator_(&allocator), facts_(facts), capacity_(capacity), owner_(owner), retire_(retire) {}
++    size_t capacity, void* owner, void (*retire)(void*),
++    void (*closed_occupancy)(void*, size_t)) noexcept
++    : allocator_(&allocator), facts_(facts), capacity_(capacity), owner_(owner), retire_(retire),
++      closed_occupancy_(closed_occupancy) {}
+ 
+ OriginalBufferBudget* OriginalBufferBudget::create(Allocator& allocator, size_t capacity,
+-    void* owner, void (*retire)(void*)) {
++    void* owner, void (*retire)(void*), void (*closed_occupancy)(void*, size_t)) {
+   // Cold preparation invokes the actual allocator, not caller-supplied facts.
+   // Failure leaves owner with the caller, including allocation of this object.
+   PreparedInputFacts facts;
+@@ -37,13 +39,35 @@
+       (facts.page_size & (facts.page_size - 1)) ||
+       (facts.kind != HostTransferStorageKind::cpu &&
+        facts.kind != HostTransferStorageKind::metal_shared)) fail(Cause::unsupported);
+-  return new OriginalBufferBudget(allocator, facts, capacity, owner, retire);
+-}
++  return new OriginalBufferBudget(allocator, facts, capacity, owner, retire, closed_occupancy);
++}
++namespace {
++void checked_retain(std::atomic<size_t>& count) noexcept {
++  auto current = count.load(std::memory_order_relaxed);
++  do {
++    if (!current || current == std::numeric_limits<size_t>::max()) std::terminate();
++  } while (!count.compare_exchange_weak(current, current + 1,
++      std::memory_order_relaxed, std::memory_order_relaxed));
++}
++}
++void OriginalBufferBudget::retain_backing() noexcept { checked_retain(references_); }
+ void OriginalBufferBudget::retain() noexcept {
+-  references_.fetch_add(1, std::memory_order_relaxed);
++  retain_backing();
++  checked_retain(producers_);
+ }
+ void OriginalBufferBudget::release() noexcept {
+-  if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++  const auto previous = producers_.fetch_sub(1, std::memory_order_seq_cst);
++  if (!previous) std::terminate();
++  // Every Scope, Record and captured allocation binding retains a producer.
++  // Births retain only backing custody, so this transition proves no future debit.
++  if (previous == 1 && closed_occupancy_)
++    closed_occupancy_(owner_, occupied_.load(std::memory_order_seq_cst));
++  release_backing();
++}
++void OriginalBufferBudget::release_backing() noexcept {
++  const auto previous = references_.fetch_sub(1, std::memory_order_acq_rel);
++  if (!previous) std::terminate();
++  if (previous == 1) {
+     if (occupied_.load(std::memory_order_acquire)) std::terminate();
+     auto* owner = owner_;
+     auto retire = retire_;
+@@ -80,7 +104,12 @@
+   }
+ }
+ void OriginalBufferBudget::refund(size_t bytes) noexcept {
+-  if (occupied_.fetch_sub(bytes, std::memory_order_acq_rel) < bytes) std::terminate();
++  const auto previous = occupied_.fetch_sub(bytes, std::memory_order_seq_cst);
++  if (previous < bytes) std::terminate();
++  // The backing is already physically freed. Concurrent callbacks may arrive
++  // out of order; their certified values are decreasing upper bounds.
++  if (closed_occupancy_ && !producers_.load(std::memory_order_seq_cst))
++    closed_occupancy_(owner_, previous - bytes);
+ }
+ 
+ OriginalBufferBinding OriginalBufferBinding::capture(OriginalBufferBudget& expected) {
+@@ -105,7 +134,7 @@
+   uint64_t generation;
+   size_t charged;
+   OriginalBufferAllocation(OriginalBufferBudget* owner, submission::GraphQuota* arena,
+-      uint64_t id, size_t bytes) noexcept : budget(owner), graph(arena), generation(id), charged(bytes) {}
++      uint64_t id, size_t bytes) noexcept : budget(owner, false), graph(arena), generation(id), charged(bytes) {}
+   void destroy() noexcept {
+     // Both local owners survive field destruction and the final Graph return.
+     OriginalBufferBudgetRef allowance(budget);

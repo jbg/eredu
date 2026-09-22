@@ -4,6 +4,7 @@
 use super::*;
 mod declarations;
 mod foreground;
+mod selected;
 mod supplementary;
 use declarations::DeclarationCloneShape;
 use eredu_runtime::{
@@ -11,6 +12,7 @@ use eredu_runtime::{
     residency::{ResidencyClosureError, ResidencyClosureSlot},
 };
 pub(crate) use foreground::ForegroundDiskIdentity;
+pub(crate) use selected::SelectedResidencySource;
 use std::{alloc::Layout, collections::TryReserveError, mem::size_of, num::NonZeroUsize};
 pub(crate) use supplementary::SupplementaryResidencySource;
 
@@ -341,9 +343,14 @@ impl ResidencyManager {
         depth: usize,
     ) -> Result<&OriginalResidencySource, OperationSourceFailure> {
         let depth = NonZeroUsize::new(depth).ok_or(OperationSourceFailure::Layout)?;
-        let source = self.inner.background_operation_source.get().ok_or(OperationSourceFailure::Layout)?;
+        let source = self
+            .inner
+            .background_operation_source
+            .get()
+            .ok_or(OperationSourceFailure::Layout)?;
         if !source.matches_selection(ids, layout, depth)
-            || !self.owns_source_windows(source, &source.windows) {
+            || !self.owns_source_windows(source, &source.windows)
+        {
             return Err(OperationSourceFailure::Layout);
         }
         Ok(source)

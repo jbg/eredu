@@ -214,11 +214,40 @@ impl CacheBlockSourceLoan<'_> {
         let membership = context
             .metadata_arc(membership)
             .map_err(|cause| metadata(cause.into()))?;
-        let state =
-            CacheManagerState::empty(&options, pool, session_id, CacheResidencyTelemetry::new(1));
+        let state = Mutex::new(CacheManagerState::empty(
+            &options,
+            pool,
+            session_id,
+            CacheResidencyTelemetry::new(1),
+        ));
+        // Select each paid PAL allocation while the mutex is still unshared;
+        // competing lazy initialization candidates are not part of this source.
+        drop(
+            state
+                .lock()
+                .expect("new unshared independent-manager state mutex"),
+        );
         let state = context
-            .metadata_arc(Mutex::new(state))
+            .metadata_arc(state)
             .map_err(|cause| metadata(cause.into()))?;
+        let transfer_stream = Mutex::new(
+            source
+                .inner
+                .transfer_stream
+                .try_lock()
+                .map_err(|cause| {
+                    fail(match cause {
+                        TryLockError::WouldBlock => CacheSourceError::Busy,
+                        TryLockError::Poisoned(_) => CacheSourceError::Poisoned,
+                    })
+                })?
+                .clone(),
+        );
+        drop(
+            transfer_stream
+                .lock()
+                .expect("new unshared independent-manager transfer mutex"),
+        );
         let inner = context
             .metadata_arc(CacheResidencyManagerInner {
                 options,
@@ -226,6 +255,7 @@ impl CacheBlockSourceLoan<'_> {
                 host_demotion_worker: source.inner.host_demotion_worker.clone(),
                 disk_worker: source.inner.disk_worker.clone(),
                 pool_membership: membership,
+                transfer_stream,
                 _metadata_funding: context.metadata_funding(),
             })
             .map_err(|cause| metadata(cause.into()))?;
@@ -254,8 +284,13 @@ impl CacheBlockSourceLoan<'_> {
         })
     }
 }
+type IndependentConstructionControlParts = [usize; 25];
+type IndependentPlanParts = [Option<usize>; 13];
+
 fn controls() -> Option<usize> {
-    let frames = [
+    let frames: IndependentConstructionControlParts = [
+        initialized_mutex_control_bytes::<CacheManagerState>()?,
+        initialized_mutex_control_bytes::<Option<PreparedCacheTransferStream>>()?,
         CacheBlockSource::retained_disk_control_bytes(),
         size_of::<PreparedIndependentCacheManager>(),
         size_of::<(
@@ -294,6 +329,35 @@ fn controls() -> Option<usize> {
             >,
         >(),
         size_of::<eredu_runtime::cache::CacheRecordTableIter<'_, CacheBlockId, CacheBlockRecord>>(),
+    ];
+    frames
+        .into_iter()
+        .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+}
+
+// These are the census's own fixed transports, not the destination allocations
+// returned by independent_plan. The array aliases also type the producing rows.
+fn independent_inspection_control_bytes() -> Option<usize> {
+    let frames = [
+        size_of::<(&CacheResidencyManager, &WorkspaceContext)>(),
+        size_of::<(&CacheBlockSourceLoan<'_>, &WorkspaceContext)>(),
+        size_of::<IndependentCacheManagerPlan>(),
+        size_of::<Result<IndependentCacheManagerPlan, CacheSourceError>>(),
+        size_of::<Result<IndependentCacheManagerPlan, CacheSourceFailure>>(),
+        size_of::<Result<usize, eredu_runtime::cache::CachePoolError>>(),
+        size_of::<IndependentConstructionControlParts>(),
+        size_of::<std::array::IntoIter<usize, 25>>(),
+        size_of::<IndependentPlanParts>(),
+        size_of::<std::array::IntoIter<Option<usize>, 13>>(),
+        size_of::<(usize, usize, u64)>(),
+        size_of::<Option<usize>>(),
+        size_of::<(
+            &CacheBlockSourceLoan<'_>,
+            CacheStoragePhase,
+            Result<(), CacheSourceError>,
+        )>(),
+        size_of::<eredu_runtime::cache::CacheRecordTableIter<'_, CacheBlockId, CacheBlockRecord>>(),
+        CacheBlockSource::retained_disk_control_bytes(),
     ];
     frames
         .into_iter()
@@ -398,7 +462,7 @@ impl CacheBlockSourceLoan<'_> {
                     eredu_runtime::cache::CachePoolError::Poisoned => CacheSourceError::Poisoned,
                     _ => CacheSourceError::Overflow,
                 })?;
-        let frames = [
+        let frames: IndependentPlanParts = [
             controls(),
             self.independent_catalog_control_bytes(),
             Some(pool),
@@ -441,6 +505,30 @@ impl CacheResidencyManager {
             None,
             |cause| cause,
             |source| source.independent_plan(),
+        )
+    }
+    /// Pays the lexical source loan and this census's fixed query frames before
+    /// inspecting the real manager. Destination construction remains a separate
+    /// debit by prepare_empty_manager; the returned capacity is not spent here.
+    pub(crate) fn inspect_independent_manager_funded(
+        &self,
+        context: &WorkspaceContext,
+    ) -> Result<IndependentCacheManagerPlan, CacheSourceFailure> {
+        context
+            .charge_metadata(
+                independent_inspection_control_bytes().ok_or_else(|| {
+                    CacheSourceFailure::source(CacheSourceError::Overflow, context)
+                })?,
+            )
+            .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
+        self.with_source_loan(
+            CacheBlockSelection::new(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0),
+            context,
+            |source| {
+                source
+                    .independent_plan()
+                    .map_err(|cause| CacheSourceFailure::source(cause, context))
+            },
         )
     }
     pub(crate) fn prepare_empty_manager(

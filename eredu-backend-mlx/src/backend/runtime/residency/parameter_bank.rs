@@ -54,31 +54,46 @@ use catalog::{
 };
 
 mod telemetry;
-use telemetry::{ParameterBankStatistics,ParameterBankStatisticsTable};
 pub use telemetry::{
     BankPassStatistics, BankTierStatistics, ParameterBankResidencyReport,
     ParameterBanksResidencyReport,
 };
+use telemetry::{ParameterBankStatistics, ParameterBankStatisticsTable};
 
 mod acquisition;
-pub(crate) use acquisition::PreparedAddressableSource;
+pub(crate) use acquisition::{compact_transport_control_bytes, OrdinaryBankHostSource, PreparedAddressableSource};
 mod parameters;
 pub use acquisition::{
     AcquiredParameterGroups, AddressableParameterBank, SharedAddressableParameterBank,
 };
-pub(crate) use parameters::publish_bank_parameter_replacements;
+pub(crate) use parameters::with_bank_parameter_publication;
 
 mod source;
 pub(crate) use source::{AddressableBankSourceLoan, AddressableSourceFailure};
 
 mod movement;
 pub use movement::MlxIndexedMovement;
-pub(crate) use movement::{IndexedChunkLayout, OriginalIndexedChunkSource, IndexedResidencyPlan, IndexedConstructorPartitions, OriginalIndexedResidencyInvocation, OriginalIndexedResidencyFactory, IndexedBankSource, IndexedBindingLayout, IndexedBindingStorage, IndexedBindingIdentity, IndexedRequestSource, IndexedRequestInstallation};
+pub(crate) use movement::indexed_numerical;
+pub(crate) use movement::{
+    OrdinaryIndexedResidencyFacts, OrdinaryResidencyMissing, OrdinaryResidencyPhysical,
+    IndexedBankSource, IndexedBindingIdentity, IndexedBindingLayout, IndexedBindingStorage,
+    IndexedChunkLayout, IndexedConstructorPartitions, IndexedRequestInstallation,
+    IndexedRequestSource, IndexedResidencyPlan, OriginalIndexedChunkSource,
+    OriginalIndexedResidencyFactory, OriginalIndexedResidencyInvocation,
+    OrdinaryIndexedResidencyFactory, IndexedResidencyFactory,
+    OrdinaryIndexedOccurrence, OrdinaryIndexedRequestProgram, OrdinaryIndexedRequestOwner, OrdinaryIndexedLocalSource,
+};
 
 /// Structured sparse entry cache failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AddressableParameterBankError {
+    /// A finite host destination could not be funded by its request account.
+    #[error("parameter-bank host metadata: {0}")]
+    HostMetadata(#[source] eredu_nn::Error),
+    /// A selected finite host destination could not be allocated.
+    #[error("parameter-bank host allocation: {0}")]
+    HostAllocation(#[source] std::collections::TryReserveError),
     /// A compact operator cannot mix independently identified banks.
     #[error("compact parameter-bank demand mixes bank identities")]
     MixedBanks,

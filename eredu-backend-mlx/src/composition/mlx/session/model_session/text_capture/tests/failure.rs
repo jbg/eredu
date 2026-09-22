@@ -1,6 +1,8 @@
 //! Terminal controlled outcomes after real captured decode work. These tests use
 //! existing core cancellation/commit hooks, not native fault instrumentation.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     observation::TensorObservationData, ControlledTextGeneration, GenerationCancellationToken,
     TextPreparationOptions, TokenFilterController,
@@ -37,7 +39,7 @@ fn assert_decode(frame: &SharedCapturedStep) {
 fn retire_escaped(
     runtime: Runtime,
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: SharedCapturePlan,
     frame: SharedCapturedStep,
     original: CapturedFundingQuote,
@@ -59,7 +61,7 @@ fn retire_escaped(
     drop(frame);
     // The last frame alias retains original H, while the source independently
     // retains original P+Q+S+C. Transient workspace has retired.
-    assert_eq!(pool.used_bytes().unwrap(), retained);
+    assert_eq!(pool.fixture_host_charge().unwrap(), retained);
     assert_eq!(alias.records().as_ptr(), pointer);
     assert_eq!(alias.cumulative_usage(), usage);
     assert_decode(&alias);
@@ -72,7 +74,7 @@ fn retire_escaped(
 #[test]
 fn controlled_cancel_after_captured_decode_keeps_escaped_frame_and_stops_all_work() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = host::runtime(&stream, &pool, None);
     let source = source(&runtime);
     let controller = disk::Controller::default();
@@ -84,7 +86,8 @@ fn controlled_cancel_after_captured_decode_keeps_escaped_frame_and_stops_all_wor
         disk::config(0.0, 1, u64::MAX),
         controller.clone(),
         TextPreparationOptions {
-            interventions: None, capture: Some(source.clone()),
+            interventions: None,
+            capture: Some(source.clone()),
         },
     )
     .unwrap();
@@ -107,7 +110,7 @@ fn controlled_cancel_after_captured_decode_keeps_escaped_frame_and_stops_all_wor
     assert_eq!(controller.0.get(), (2, 2));
     let native = paths::snapshot();
     let inputs = paths::session_input_creation_attempts();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     cancellation.cancel();
     for _ in 0..2 {
         assert!(run.next_cancellable(&cancellation).is_none());
@@ -117,7 +120,7 @@ fn controlled_cancel_after_captured_decode_keeps_escaped_frame_and_stops_all_wor
         assert_eq!(controller.0.get(), (2, 2));
         assert_eq!(paths::snapshot(), native);
         assert_eq!(paths::session_input_creation_attempts(), inputs);
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
     }
     drop(run);
     retire_escaped(runtime, &stream, &pool, source, frame, original);
@@ -168,7 +171,7 @@ impl TokenFilterController for RejectSecondCommit {
 #[test]
 fn controlled_commit_failure_preserves_original_error_and_completed_decode_capture() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = host::runtime(&stream, &pool, None);
     let source = source(&runtime);
     let controller = RejectSecondCommit {
@@ -182,7 +185,8 @@ fn controlled_commit_failure_preserves_original_error_and_completed_decode_captu
         disk::config(0.0, 1, u64::MAX),
         controller.clone(),
         TextPreparationOptions {
-            interventions: None, capture: Some(source.clone()),
+            interventions: None,
+            capture: Some(source.clone()),
         },
     )
     .unwrap();
@@ -216,7 +220,7 @@ fn controlled_commit_failure_preserves_original_error_and_completed_decode_captu
     let frame = shared(run.take_captured_delivery().unwrap().unwrap());
     assert_decode(&frame);
     assert!(!run.capture_pending());
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let cancellation = GenerationCancellationToken::new();
     cancellation.cancel();
     for _ in 0..2 {
@@ -226,7 +230,7 @@ fn controlled_commit_failure_preserves_original_error_and_completed_decode_captu
         assert_eq!(paths::snapshot(), native);
         assert_eq!(paths::session_input_creation_attempts(), inputs);
         assert_eq!(controller.calls.get(), (2, 2, 1));
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
         assert!(Arc::ptr_eq(
             &cause::<CommitFailure>(&error).identity,
             &controller.identity

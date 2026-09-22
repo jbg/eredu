@@ -1,8 +1,8 @@
 use super::*;
 use eredu_checkpoint::{
-    StoredDtype,
     recipe::RecipeCatalog,
     store::{StoreError, TensorMetadata, TensorSelection},
+    StoredDtype,
 };
 use eredu_core::residency::{OffloadConfig, OffloadUnitSpec, ResidencyPolicy};
 use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
@@ -157,10 +157,11 @@ fn actual_cyclic_sources_and_group_cut_windows_produce_scalar_rows_without_sourc
                 + (controller.units().len() * size_of::<ResidencyClosureSlot>()) as u64
     );
     assert!(OriginalResidencySource::constructor_storage_bytes(usize::MAX, layout.len()).is_none());
-    assert!(
-        OriginalResidencySource::constructor_storage_bytes(controller.units().len(), usize::MAX)
-            .is_none()
-    );
+    assert!(OriginalResidencySource::constructor_storage_bytes(
+        controller.units().len(),
+        usize::MAX
+    )
+    .is_none());
     let retained = source.window_owner();
     drop(source);
     assert!(weak.upgrade().is_some());
@@ -194,14 +195,12 @@ fn repeated_roots_have_distinct_request_payload_but_one_canonical_owner_populati
         (4, 4, 2, 2)
     );
     // Cold closure does not change the existing runtime duplicate-batch refusal.
-    assert!(
-        WindowPopulation::collect(
-            &controller,
-            &[OffloadUnitId::new("foreign").unwrap()],
-            &mut scratch
-        )
-        .is_err()
-    );
+    assert!(WindowPopulation::collect(
+        &controller,
+        &[OffloadUnitId::new("foreign").unwrap()],
+        &mut scratch
+    )
+    .is_err());
 }
 
 #[test]

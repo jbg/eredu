@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+mod ordinary;
 mod source_witness;
 pub use source_witness::ImmutableHostTransferWitness;
 mod prepared_source;
@@ -7,9 +8,9 @@ mod prepared_destination;
 pub use prepared_destination::{PreparedHostCopyDestination, PreparedHostCopyError};
 
 use crate::{
-    Array, Dtype, Event, Stream,
     error::{self, Result},
-    utils::{SUCCESS, guard::Guarded, runtime_lock},
+    utils::{guard::Guarded, runtime_lock, SUCCESS},
+    Array, Dtype, Event, Stream,
 };
 
 /// Requested semantics for an MLX host transfer allocation.
@@ -749,7 +750,22 @@ impl ImmutableHostTransferBuffer {
         let bytes = usize::try_from_op(|output| unsafe {
             safemlx_sys::mlx_host_transfer_buffer_capacity(output, self.buffer.raw)
         })?;
-        Ok(crate::AllocationInfo::from_native(identity, bytes, true))
+        let mut facts =
+            std::mem::MaybeUninit::<safemlx_sys::mlx_immutable_host_transfer_info>::uninit();
+        // SAFETY: this immutable native host owner retains the actual backing.
+        let status = unsafe {
+            safemlx_sys::mlx_immutable_host_transfer_inspect(facts.as_mut_ptr(), self.buffer.raw)
+        };
+        if status != 0 {
+            return Err(error::Exception::custom(
+                "host allocation placement is unavailable",
+            ));
+        }
+        let facts = unsafe { facts.assume_init() };
+        Ok(
+            crate::AllocationInfo::from_native(identity, bytes, facts.backing.placement)
+                .with_host_controls(facts.backing.host_control_bytes),
+        )
     }
 
     /// Retains an owner with this physical host allocation and every native or
@@ -946,7 +962,7 @@ impl PendingDeviceTransfer {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
-    use crate::{Device, DeviceType, ops::indexing::TryIndexOp};
+    use crate::{ops::indexing::TryIndexOp, Device, DeviceType};
 
     #[test]
     fn allocation_info_preserves_host_transfer_aliases_and_owner_lifetimes() {

@@ -1,7 +1,7 @@
 //! One real embedded Device/default library owner in the same managed domain.
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     InitializedMetalDevice, MetalDeviceCause, MetalDeviceError, MetalDeviceLayout,
@@ -94,7 +94,7 @@ impl std::error::Error for MlxMetalDeviceInitializationError {
 }
 fn borrow(
     owner: &InitializedSharedNative<InitializedMetalDevice>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<(), MlxMetalDeviceInitializationError> {
     owner
         .validate_pool(pool)
@@ -108,9 +108,9 @@ fn borrow(
 /// identity check. CPU requires no Device. Runtime loans end before the caller
 /// begins input allocator construction. Later JIT/queue ownership is separate.
 pub(super) fn prepare_admitted(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<bool, MlxMetalDeviceInitializationError> {
-    if !pool.same_domain(&super::domain()) {
+    if !pool.same_ledger(&super::ledger()) {
         return Err(MlxMetalDeviceInitializationError(Failure::Policy(
             WorkingMemoryError::IdentityMismatch,
         )));
@@ -159,7 +159,7 @@ mod tests;
 
 /// Borrow the actual same-pool Device constructor; never initialize or promote an ordinary slot.
 pub(crate) fn admitted_owner(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<&'static InitializedMetalDevice, MlxMetalDeviceInitializationError> {
     let owner = INITIALIZED.get().ok_or_else(|| {
         MlxMetalDeviceInitializationError(Failure::Native(MetalDeviceCause::IdentityMismatch))

@@ -1,8 +1,8 @@
 //! Two explicitly immutable wrapper copies through the existing source account.
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, OriginalHostMetadataCustody, SharedNativeInitializationCustody,
-    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-    WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, OriginalHostMetadataCustody,
+    SharedNativeInitializationCustody, SharedNativeInitializationError, SharedNativeInitializer,
+    WorkingMemoryError,
 };
 use safemlx::{PreparedStreamCopy, Stream, StreamCopyCause, StreamCopyError, StreamCopyPlan};
 use std::mem::{size_of, size_of_val};
@@ -20,10 +20,20 @@ impl SharedNativeInitializer for Initializer {
             OriginalHostMetadataCustody::shared_storage_bytes(self.0.shared_body_layout())?;
         let node = OriginalHostMetadataCustody::boxed_storage_bytes(self.0.owner_node_layout())?;
         let controls = [
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<StreamCopyPlan<SharedNativeInitializationCustody>>(),
-            size_of::<Result<InitializedSharedNative<PreparedStreamCopy<SharedNativeInitializationCustody>>,PreparedMaterializationStreamError>>(),
-            size_of::<Result<PreparedStreamCopy<SharedNativeInitializationCustody>,PreparedMaterializationStreamError>>(),
+            size_of::<
+                Result<
+                    InitializedSharedNative<PreparedStreamCopy<SharedNativeInitializationCustody>>,
+                    PreparedMaterializationStreamError,
+                >,
+            >(),
+            size_of::<
+                Result<
+                    PreparedStreamCopy<SharedNativeInitializationCustody>,
+                    PreparedMaterializationStreamError,
+                >,
+            >(),
             size_of::<PreparedMaterializationStreams>(),
             size_of::<PreparedMaterializationStreamError>(),
             size_of::<crate::backend::runtime::residency::manager::ResidencyError>(),
@@ -81,20 +91,25 @@ impl PreparedMaterializationStreamError {
 /// The same admitted immutable-copy producer, for a single shared mechanism
 /// stream. No ordinary Stream clone or independent wrapper protocol is added.
 pub(crate) fn prepare_one_materialization_stream(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     source: &Stream,
 ) -> Result<PreparedStreamCopy<SharedNativeInitializationCustody>, PreparedMaterializationStreamError>
 {
-    let plan=StreamCopyPlan::capture(source).map_err(PreparedMaterializationStreamError::layout)?;
-    prepare_materialization_stream_from_plan(pool,plan).map(|owned|owned.output().clone())
+    let plan =
+        StreamCopyPlan::capture(source).map_err(PreparedMaterializationStreamError::layout)?;
+    prepare_materialization_stream_from_plan(pool, plan).map(|owned| owned.output().clone())
 }
 /// The same counted immutable-wrapper constructor with an already captured
 /// exact context plan. Selection cannot create a new queue/worker or grant.
 pub(crate) fn prepare_materialization_stream_from_plan(
-    pool:&WorkingMemoryPool,
-    plan:StreamCopyPlan<SharedNativeInitializationCustody>,
-)->Result<InitializedSharedNative<PreparedStreamCopy<SharedNativeInitializationCustody>>,PreparedMaterializationStreamError> {
-    pool.initialize_shared_native(Initializer(plan)).map_err(PreparedMaterializationStreamError::initialization)
+    pool: &MemoryLedger,
+    plan: StreamCopyPlan<SharedNativeInitializationCustody>,
+) -> Result<
+    InitializedSharedNative<PreparedStreamCopy<SharedNativeInitializationCustody>>,
+    PreparedMaterializationStreamError,
+> {
+    pool.initialize_shared_native(Initializer(plan))
+        .map_err(PreparedMaterializationStreamError::initialization)
 }
 
 /// Private original constructor output. Public ordinary materialization contexts
@@ -117,16 +132,16 @@ impl PreparedMaterializationStreams {
                 .map_err(PreparedMaterializationStreamError::layout)?,
         );
         let query = || {
-            WorkingMemoryPool::shared_native_initialization_required_bytes(&source)?
-                .checked_add(
-                    WorkingMemoryPool::shared_native_initialization_required_bytes(&execution)?,
-                )
+            MemoryLedger::shared_native_initialization_required_bytes(&source)?
+                .checked_add(MemoryLedger::shared_native_initialization_required_bytes(
+                    &execution,
+                )?)
                 .ok_or(WorkingMemoryError::Overflow)
         };
         query().map_err(|cause| PreparedMaterializationStreamError(Failure::Accounting(cause)))
     }
     pub(crate) fn prepare(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         source: &Stream,
         execution: &Stream,
     ) -> Result<Self, PreparedMaterializationStreamError> {
@@ -156,7 +171,7 @@ impl PreparedMaterializationStreams {
     pub(crate) fn execution_stream(&self) -> &Stream {
         self.execution.as_stream()
     }
-    pub(crate) fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub(crate) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.source.owner().validate_pool(pool)?;
         self.execution.owner().validate_pool(pool)
     }
@@ -179,7 +194,7 @@ impl ManagerMaterializationContext {
     pub(crate) fn prepared(
         streams: PreparedMaterializationStreams,
         cache: super::CacheHandle,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Self, WorkingMemoryError> {
         streams.validate_pool(pool)?;
         cache.validate_pool(pool)?;

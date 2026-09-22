@@ -23,7 +23,9 @@ impl OriginalEmbeddedSpeculativeStartup {
     pub fn source(&self) -> OriginalEmbeddedSpeculativeSource {
         match self.0.value().source {
             StartupSource::Embedded(source) => source,
-            StartupSource::Autoregressive(_) | StartupSource::External(_) => unreachable!("typed Embedded startup constructor"),
+            StartupSource::Autoregressive(_) | StartupSource::External(_) => {
+                unreachable!("typed Embedded startup constructor")
+            }
         }
     }
     /// Exact schedule, issuance account and pool, independent of equal funding.
@@ -33,16 +35,16 @@ impl OriginalEmbeddedSpeculativeStartup {
 }
 
 mod capture;
-pub use capture::OriginalEmbeddedCaptureLineage;
+pub use capture::{OriginalEmbeddedCaptureLineage, OriginalModelCaptureLineage};
 
 impl OriginalSpeculativeRequest {
     /// Reserve the exact selected Embedded occurrence bank before construction,
     /// through the same original account/exclusion worker as AR requests.
     pub fn prepare_embedded(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
         schedule: &EmbeddedSchedulePlan<'_>,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, SpeculativeRequestError> {
         let count = EmbeddedOccurrenceKind::ALL
             .into_iter()
@@ -55,7 +57,7 @@ impl OriginalSpeculativeRequest {
             capacity,
             count,
             size_of::<(
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 &InferenceExecutionIdentity,
                 &EmbeddedSchedulePlan<'_>,
                 u64,
@@ -99,7 +101,12 @@ impl OriginalSpeculativeRequest {
     pub fn embedded_capture_inspection_control_bytes() -> Option<usize> {
         let parts = [
             size_of::<(&Self, &crate::working_memory::OriginalCaptureSource)>(),
-            size_of::<(&Self, &crate::working_memory::OriginalCaptureSource, &OriginalEmbeddedCaptureLineage)>(),
+            size_of::<(
+                &Self,
+                &crate::working_memory::OriginalCaptureSource,
+                &OriginalEmbeddedCaptureLineage,
+                OriginalModelCaptureLineage,
+            )>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<std::sync::MutexGuard<'_, RoleSlots>>(),
             size_of::<Result<eredu_core::capture::CaptureUsage, WorkingMemoryError>>(),
@@ -172,7 +179,7 @@ impl OriginalSpeculativeRequest {
                 .controls
                 .checked_add(capture.initialization_peak_bytes())
                 .ok_or(WorkingMemoryError::Overflow)?;
-            requirements.bytes()?;
+            requirements.host_bytes()?;
         }
         let ScheduleIdentity::Embedded(identity) = self.identity else {
             return Err(WorkingMemoryError::IdentityMismatch.into());

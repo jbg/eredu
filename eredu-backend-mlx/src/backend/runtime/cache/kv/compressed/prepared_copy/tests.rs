@@ -2,13 +2,13 @@ use super::*;
 use crate::backend::runtime::cache::residency::CacheResidencyManager;
 use crate::composition::MlxNeuralBackend;
 use eredu_runtime::PagedCacheOptions;
-use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType};
+use safemlx::{Device, DeviceType, ops::indexing::TryIndexOp};
 use std::{
     cell::Cell,
     error::Error,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -306,6 +306,7 @@ fn aliased_logical_inputs_still_copy_twice_and_collector_retains_every_result() 
             .unwrap();
     }
     drop((copy, source, backing));
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     for root in roots.borrow().iter() {
@@ -313,6 +314,7 @@ fn aliased_logical_inputs_still_copy_twice_and_collector_retains_every_result() 
     }
     roots.borrow_mut().clear();
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         retired.load(Ordering::SeqCst) == 2
     });

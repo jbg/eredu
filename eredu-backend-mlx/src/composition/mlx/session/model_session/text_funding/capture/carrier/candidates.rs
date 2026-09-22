@@ -1,7 +1,7 @@
 //! Canonical terminal prefill carrier uses the shared typed candidate readout.
 use super::*;
-use eredu_core::capture::CaptureTokenDomain;
 use crate::backend::array_copy::CandidateExtraction;
+use eredu_core::capture::CaptureTokenDomain;
 use eredu_runtime::working_memory::{CaptureCandidateClaim, ClaimedCaptureCandidates};
 
 impl FundedWork {

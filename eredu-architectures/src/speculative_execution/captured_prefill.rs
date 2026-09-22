@@ -21,7 +21,8 @@ pub(super) fn legacy<S: EmbeddedPredictionStrategy<M> + ?Sized, M: SpeculativeTe
     context: M::Context<'_>,
 ) -> Result<PrefillValues<M::Tensor, M::Logits>, M::Error> {
     let mut output = strategy.prefill_target(input, cache, context, observers.internal())?;
-    output.capture = observers.tensor::<M>(EMBEDDED_TARGET_CAPTURE_PATH, output.capture, None, context)?;
+    output.capture =
+        observers.tensor::<M>(EMBEDDED_TARGET_CAPTURE_PATH, output.capture, None, context)?;
     let count = M::sequence_len(&output.tokens)?;
     let scores = M::sequence_len(&output.logits)?;
     let captures = M::sequence_len(&output.capture)?;
@@ -34,8 +35,18 @@ pub(super) fn legacy<S: EmbeddedPredictionStrategy<M> + ?Sized, M: SpeculativeTe
     let tokens = output.tokens.clone();
     strategy.seed_prediction_cache(&output, &tokens, cache, context, observers.internal())?;
     Ok(PrefillValues {
-        logits: M::logits_row_with_source(&output.logits, count - 1, strategy.target_logit_evidence(cache), context)?,
-        capture: M::tensor_row_with_source(&output.capture,count-1,strategy.target_logit_evidence(cache),context)?,
+        logits: M::logits_row_with_source(
+            &output.logits,
+            count - 1,
+            strategy.target_logit_evidence(cache),
+            context,
+        )?,
+        capture: M::tensor_row_with_source(
+            &output.capture,
+            count - 1,
+            strategy.target_logit_evidence(cache),
+            context,
+        )?,
         evaluated: count,
     })
 }
@@ -154,15 +165,17 @@ where
             ..
         } = self;
         let result = N::with_prefill_source(lowerer, input, context, |prepared, context| {
-            let tensor_context=N::target_context(context);
+            let tensor_context = N::target_context(context);
             let mut prepared = Some(prepared.and_then(|prepared| {
                 cache
                     .bind_prepared_input(prepared.identity())
                     .map_err(|error| match error {
                         EmbeddedPredictionCacheError::Prepared(cause) => N::session_failure(cause),
-                        other => N::session_cause_with_context(other,context),
+                        other => N::session_cause_with_context(other, context),
                     })?;
-                let shape = prepared.shape().map_err(|cause|N::session_cause_with_context(cause,context))?;
+                let shape = prepared
+                    .shape()
+                    .map_err(|cause| N::session_cause_with_context(cause, context))?;
                 Ok((prepared, shape))
             }));
             let shape = prepared
@@ -183,14 +196,18 @@ where
                 chunk
             };
             let session_error = N::prepare_session_cause(context, Some(0))?;
-            let mut target = cache
-                .take_target()
-                .ok_or_else(|| N::session_cause_with_context(EmbeddedPredictionCacheError::TargetStateActive,context))?;
+            let schedule_authority = N::prefill_schedule_authority(context)?;
+            let mut target = cache.take_target().ok_or_else(|| {
+                N::session_cause_with_context(
+                    EmbeddedPredictionCacheError::TargetStateActive,
+                    context,
+                )
+            })?;
             if let Err(error) =
                 session.exchange_prediction_target_state(&mut target, tensor_context)
             {
                 cache.restore_target(target);
-                return Err(N::session_cause_with_context(error,context));
+                return Err(N::session_cause_with_context(error, context));
             }
             let (target_evidence, prediction_evidence) = match &mut cache.prepared {
                 Some(prepared) => (
@@ -225,7 +242,8 @@ where
             } else {
                 eredu_core::OutputDemand::LastPosition
             };
-            let result = session.try_prefill_unbudgeted_source_with_operation(
+            let result = session.try_prefill_speculative_source_with_operation(
+                schedule_authority,
                 shape,
                 chunk,
                 demand,
@@ -234,12 +252,14 @@ where
                         return Err(N::neural_cause_with_context(
                             eredu_core::speculative::SpeculativeControlError::Unsupported(
                                 "observer does not support explicit prefill spans",
-                            ),context));
+                            ),
+                            context,
+                        ));
                     }
                     prepared
                         .take()
                         .expect("source factory called once")
-                        .map_err(|cause|N::neural_cause_with_context(cause,context))?
+                        .map_err(|cause| N::neural_cause_with_context(cause, context))?
                         .0
                         .into_source(geometry)
                 },
@@ -253,11 +273,18 @@ where
             let restored =
                 match session.exchange_prediction_target_state(&mut target, tensor_context) {
                     Ok(()) => Ok(()),
-                    Err(error) => match session.recover_prediction_target_state_after_failure(&mut target) {
-                        Ok(()) => Err(N::session_cause_with_context(error,context)),
-                        Err(recovery) => Err(N::session_cause_with_context(TargetStateRecoveryFailure { exchange:error,recovery },context)),
+                    Err(error) => {
+                        match session.recover_prediction_target_state_after_failure(&mut target) {
+                            Ok(()) => Err(N::session_cause_with_context(error, context)),
+                            Err(recovery) => Err(N::session_cause_with_context(
+                                TargetStateRecoveryFailure {
+                                    exchange: error,
+                                    recovery,
+                                },
+                                context,
+                            )),
+                        }
                     }
-
                 };
             cache.restore_target(target);
             let result = result.map_err(session_error);
@@ -265,8 +292,8 @@ where
                 (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
                 (Ok(value), Ok(())) => value,
             };
-            let evaluated =
-                usize::try_from(progress.completed_positions).map_err(|cause|N::session_cause_with_context(cause,context))?;
+            let evaluated = usize::try_from(progress.completed_positions)
+                .map_err(|cause| N::session_cause_with_context(cause, context))?;
             match progress.outcome {
                 PrefillSourceOutcome::Unavailable => {
                     if let Some(Err(error)) = prepared.take() {
@@ -282,11 +309,15 @@ where
                 PrefillSourceOutcome::Complete(scores) => {
                     cache
                         .retain_capture_generation(N::generation)
-                        .map_err(|cause|N::session_cause_with_context(cause,context))?;
+                        .map_err(|cause| N::session_cause_with_context(cause, context))?;
                     Ok(SpeculativePrefillOutcome::Complete(PrefillValues {
-                        logits: M::selected_prefill_logits_with_source(scores.ok_or_else(|| {
-                            M::observation_error("selected target prefill omitted final scores")
-                        })?, cache.target_logit_evidence(), context)?,
+                        logits: M::selected_prefill_logits_with_source(
+                            scores.ok_or_else(|| {
+                                M::observation_error("selected target prefill omitted final scores")
+                            })?,
+                            cache.target_logit_evidence(),
+                            context,
+                        )?,
                         capture: carry.ok_or_else(M::empty_prediction_input)?,
                         evaluated,
                     }))
@@ -329,6 +360,9 @@ where
 {
     fn score_layout(&self) -> eredu_runtime::replicated_session::PrefillScoreLayout {
         M::prefill_score_layout(self.context)
+    }
+    fn has_speculative_span_authority(&self) -> bool {
+        true
     }
 
     fn prepare(
@@ -644,7 +678,7 @@ fn span_neural<A, B, S, SM, D, N, M, R>(
     span: eredu_core::speculative::SpeculativePrefillSpan,
     span_protocol: bool,
     context: &<B::Tensor as Tensor>::Context,
-    execution_context:M::Context<'_>,
+    execution_context: M::Context<'_>,
     operation: impl FnOnce(
         &mut eredu_runtime::ReplicatedTextSession<A, B, SM, D>,
         Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, NeuralError>>,
@@ -672,14 +706,14 @@ where
     let Some(observer) = observer else {
         session
             .agree_prediction_prefill_preparation(Ok(()), context)
-            .map_err(|error| N::session_cause_with_context(error,execution_context))?;
+            .map_err(|error| N::session_cause_with_context(error, execution_context))?;
         let result = operation(session, None);
         return session
             .agree_prediction_prefill_preparation(
-                result.map_err(|cause|N::neural_cause_with_context(cause,execution_context)),
+                result.map_err(|cause| N::neural_cause_with_context(cause, execution_context)),
                 context,
             )
-            .map_err(|error| N::session_cause_with_context(error,execution_context));
+            .map_err(|error| N::session_cause_with_context(error, execution_context));
     };
     struct Invocation<'a, T, E> {
         observer: &'a mut dyn SpeculativeActivationObserver<T, E>,
@@ -704,14 +738,15 @@ where
     }
     let admission = invocation.observer.begin_activation_invocation(
         phase,
-        usize::try_from(span.sequence).map_err(|cause|N::session_cause_with_context(cause,execution_context))?,
+        usize::try_from(span.sequence)
+            .map_err(|cause| N::session_cause_with_context(cause, execution_context))?,
     );
     session
         .agree_prediction_prefill_preparation(
-            admission.map_err(|cause|N::neural_cause_with_context(cause,execution_context)),
+            admission.map_err(|cause| N::neural_cause_with_context(cause, execution_context)),
             context,
         )
-        .map_err(|error| N::session_cause_with_context(error,execution_context))?;
+        .map_err(|error| N::session_cause_with_context(error, execution_context))?;
     let mut operation = Some(operation);
     let mut output = None;
     let result = invocation
@@ -719,8 +754,8 @@ where
         .with_activation_observer(&mut |observer| {
             let mut bridge = eredu_runtime::inspection::ObserverErrorBridge::new(
                 observer,
-                |cause|N::session_cause_with_context(cause,execution_context),
-                |error: &M::Error| N::neural_observer_error(error,execution_context),
+                |cause| N::session_cause_with_context(cause, execution_context),
+                |error: &M::Error| N::neural_observer_error(error, execution_context),
             );
             let result =
                 operation.take().expect("one admitted forward")(session, Some(&mut bridge));
@@ -736,10 +771,10 @@ where
         });
     let output = session
         .agree_prediction_prefill_preparation(
-            completed.map_err(|cause|N::neural_cause_with_context(cause,execution_context)),
+            completed.map_err(|cause| N::neural_cause_with_context(cause, execution_context)),
             context,
         )
-        .map_err(|error| N::session_cause_with_context(error,execution_context))?;
+        .map_err(|error| N::session_cause_with_context(error, execution_context))?;
     invocation.success = true;
     Ok(output)
 }

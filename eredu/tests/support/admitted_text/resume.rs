@@ -51,8 +51,9 @@ impl Preparation {
         };
         let capacity = config
             .inference_policy()
-            .managed_memory_capacity_bytes
-            .ok_or_else(|| TokenInputRejection::Unsupported.into_backend_failure())?;
+            .memory_limits
+            .resolve(env.pool.topology())
+            .map_err(|error| funded_error(WorkingMemoryError::from(error), &funding))?;
         let kind = "neutral public conformance fixture";
         let context_reason = "no model context storage";
         funding.reserve_metadata(
@@ -75,9 +76,8 @@ impl Preparation {
             ),
             max_output_tokens: maximum,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: Default::default(),
+            memory_limits: config.inference_policy().memory_limits.clone(),
         };
         funding.reserve_metadata(
             size_of::<Option<BackendFailure>>()

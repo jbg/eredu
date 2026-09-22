@@ -2,9 +2,8 @@
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 mod metal {
     use eredu_runtime::working_memory::{
-        InitializedSharedNative, SharedNativeInitializationCustody,
+        InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
         SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
-        WorkingMemoryPool,
     };
     use safemlx::fast::{
         BorrowedKernelTemplate, KernelDefinitionError, KernelInputClass, KernelInputSignature,
@@ -12,8 +11,8 @@ mod metal {
         PreparedMetalKernelFamily,
     };
     use std::sync::{
-        OnceLock,
         atomic::{AtomicBool, Ordering},
+        OnceLock,
     };
 
     pub(crate) type Definition = PreparedMetalKernelFamily<SharedNativeInitializationCustody>;
@@ -130,10 +129,8 @@ mod metal {
         #[error("pointwise definition initialization is busy")]
         Busy,
     }
-    pub(crate) fn prepare_admitted(
-        pool: &WorkingMemoryPool,
-    ) -> Result<(), MlxPointwiseDefinitionError> {
-        if !pool.same_domain(&super::super::domain()) {
+    pub(crate) fn prepare_admitted(pool: &MemoryLedger) -> Result<(), MlxPointwiseDefinitionError> {
+        if !pool.same_ledger(&super::super::ledger()) {
             return Err(MlxPointwiseDefinitionError::Policy(
                 WorkingMemoryError::IdentityMismatch,
             ));
@@ -169,7 +166,7 @@ mod metal {
         size: i32,
         stream: &safemlx::Stream,
     ) -> Result<safemlx::Array, safemlx::error::Exception> {
-        use safemlx::{OriginalScopeObserver, fast::BorrowedKernelOutput};
+        use safemlx::{fast::BorrowedKernelOutput, OriginalScopeObserver};
         let observer = OriginalScopeObserver::try_current()?;
         if let Some(observer) = &observer {
             if input.ndim() > OUTPUT_DIMENSIONS || INITIALIZED.get().is_none() {
@@ -212,25 +209,25 @@ mod metal {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::memory_fixture::LedgerFixture;
         #[test]
         fn family_exact_admission_aliases_and_refusal_preserve_account() {
-            let bytes =
-                WorkingMemoryPool::shared_native_initialization_required_bytes(&Initializer);
+            let bytes = MemoryLedger::shared_native_initialization_required_bytes(&Initializer);
             if std::env::var_os("EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY").is_some() {
                 assert!(bytes.is_ok(), "pinned kernel definition must qualify");
             }
             let Ok(bytes) = bytes else { return };
-            let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+            let short = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
             let refused = short.initialize_shared_native(Initializer).unwrap_err();
             assert!(refused.accounting_failure().is_some());
             assert!(refused.rejected_plan().is_some());
             assert!(refused.completed_output().is_none());
-            assert_eq!(short.used_bytes().unwrap(), 0);
+            assert_eq!(short.fixture_host_charge().unwrap(), 0);
             drop(refused);
-            let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(bytes, 0).unwrap();
             let owner = pool.initialize_shared_native(Initializer).unwrap();
             assert_eq!(owner.original_bytes(), bytes);
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
             owner.validate_pool(&pool).unwrap();
             assert!(matches!(
                 owner.validate_pool(&short),
@@ -244,10 +241,10 @@ mod metal {
             let b = last.output() as *const _;
             assert_eq!(a, b);
             drop(first);
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
             drop(last);
             safemlx::reclaim_allocation_owners();
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         }
     }
 }

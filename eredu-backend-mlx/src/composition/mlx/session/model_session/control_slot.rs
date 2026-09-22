@@ -1,12 +1,12 @@
 //! Exact typed control-slot construction after fresh host admission.
 
 mod exchange;
-pub(crate) use exchange::{OriginalControlExchangePlan, PreparedControlExchange};
 use super::{MlxNativeTextState, NativeMemoryRetention};
 use crate::backend::error::Error;
 use crate::composition::mlx::replicated_text::PreparedDenseControlBindingError;
 use eredu_core::HostPreparationAuthority;
 use eredu_runtime::replicated_session::{PreparedControlBindingError, ReplicatedTextControlState};
+pub(crate) use exchange::{OriginalControlExchangePlan, PreparedControlExchange};
 
 /// Fixed local causes. The sealed native resume entry retains host custody on
 /// the resulting Error, including conversion/validation failures after inputs
@@ -88,18 +88,6 @@ impl MlxNativeTextState {
             displaced_placement: None,
             memory_retention: NativeMemoryRetention::default(),
             host_preparation: Some(host.clone()),
-        }
-    }
-
-    /// Ordinary callers already surround construction with their memory owner.
-    pub(in crate::composition::mlx::session) fn from_ordinary_prepared(
-        state: Box<dyn std::any::Any>,
-    ) -> Self {
-        Self {
-            state,
-            displaced_placement: None,
-            memory_retention: NativeMemoryRetention::default(),
-            host_preparation: None,
         }
     }
 }

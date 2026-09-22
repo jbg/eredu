@@ -8,8 +8,8 @@ use std::{
     error::Error as _,
     num::NonZeroU8,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 mod backend;
@@ -24,7 +24,7 @@ const TEXT: [u32; 3] = [2, 3, 1];
 const IMAGE: [f32; 4] = [0.5, -1., 2., 1.5];
 const WEIGHTS: [f32; 4] = [2., -0.5, 0.25, 1.5];
 
-fn source(pool: &WorkingMemoryPool, model: bool) -> OriginalPreparedHostInput {
+fn source(pool: &MemoryLedger, model: bool) -> OriginalPreparedHostInput {
     let data = if model { &WEIGHTS } else { &IMAGE };
     let text = HostInputPart {
         modality: InputModality::Text,
@@ -103,7 +103,7 @@ struct Facts {
     issued: [Option<TextStepContext>; OUTPUTS],
 }
 struct Fixture {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     sources: Sources,
     execution: InferenceExecutionIdentity,
     facts: Mutex<Facts>,
@@ -231,7 +231,15 @@ impl Fixture {
             + self.sources.selected_model.original_bytes();
         config().with_inference_policy(TextInferencePolicy {
             prefill_chunk_positions: std::num::NonZeroU64::new(2),
-            managed_memory_capacity_bytes: self.budget.map(|q| source_residence + q),
+            memory_limits: self
+                .budget
+                .map(|q| {
+                    eredu_core::MemoryLimitDeclarations::new([(
+                        "host".into(),
+                        eredu_core::MemoryLimit::Finite(source_residence + q),
+                    )])
+                })
+                .unwrap_or_default(),
             submission_tracking_capacity_bytes: None, // This synchronous scalar mechanism creates no registry.
             graph_metadata_capacity_bytes: None, // No native/lazy graph exists in the selected mechanism.
         })
@@ -249,9 +257,8 @@ impl Fixture {
             ),
             max_output_tokens: OUTPUTS as u64,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: self.budget,
-            require_complete_estimate: true,
+            additional_headroom: Default::default(),
+            memory_limits: self.config().inference_policy().memory_limits.clone(),
         }
     }
 }
@@ -266,13 +273,15 @@ fn selected_state_layout() -> (StateMemoryLayout, usize) {
     let shape_bytes = Layout::array::<StateTensorDimension>(shape.capacity())
         .unwrap()
         .size();
-    let tensors = vec![StateTensorPolicy::new_with_residency(
-        StateTensorRole::Recurrent,
-        shape,
-        StateTensorDtype::Float32,
-        StateResidencyClass::LayerScopedOffloadable,
-    )
-    .unwrap()];
+    let tensors = vec![
+        StateTensorPolicy::new_with_residency(
+            StateTensorRole::Recurrent,
+            shape,
+            StateTensorDtype::Float32,
+            StateResidencyClass::LayerScopedOffloadable,
+        )
+        .unwrap(),
+    ];
     let tensor_bytes = Layout::array::<StateTensorPolicy>(tensors.capacity())
         .unwrap()
         .size();
@@ -306,7 +315,8 @@ fn setup(manual_prefill: bool, budget: Option<u64>) -> (ModelRuntime<Backend>, A
         + arc_bytes::<()>()
         + arc_bytes::<std::sync::atomic::AtomicBool>()
         + if manual_prefill { arc_bytes::<()>() } else { 0 };
-    let pool = WorkingMemoryPool::new(1 << 24, baseline as u64).unwrap();
+    let pool =
+        crate::working_memory::memory_fixture::host_ledger(1 << 24, baseline as u64).unwrap();
     let fixture = Arc::new(Fixture {
         sources: Sources {
             report: None,
@@ -479,7 +489,7 @@ fn complete_original_neutral_request_matches_full_numerics_and_manual_driver_at_
     for manual in [false, true] {
         let q = probe_q(manual);
         let (mut runtime, f) = setup(manual, Some(q));
-        let baseline = f.pool.used_bytes().unwrap();
+        let baseline = f.pool.payload_used_bytes().unwrap();
         let expected = independent();
         let input = prompt(&f);
         let claim = GenerationSequenceRequest::new(OUTPUTS, &EOS);
@@ -489,7 +499,7 @@ fn complete_original_neutral_request_matches_full_numerics_and_manual_driver_at_
             let mut run = driver
                 .start_input_with_sequence(input, f.config(), AllController, None, claim)
                 .unwrap();
-            assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+            assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
             assert_eq!(f.facts.lock().unwrap().predictions, 0);
             let mut sequence = driver
                 .take_prepared_sequence(&mut run)
@@ -520,7 +530,7 @@ fn complete_original_neutral_request_matches_full_numerics_and_manual_driver_at_
                 claim,
             )
             .unwrap();
-            assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+            assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
             assert_eq!(f.facts.lock().unwrap().predictions, 0);
             let mut sequence = run
                 .take_prepared_sequence()
@@ -562,12 +572,12 @@ fn complete_original_neutral_request_matches_full_numerics_and_manual_driver_at_
         drop(facts);
         let alias = ids.clone();
         drop(ids);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
         drop(alias);
         // Scalar receipts can escape; they do not retain any request allocation.
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
         drop(receipts);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     }
 }
 
@@ -575,7 +585,7 @@ fn complete_original_neutral_request_matches_full_numerics_and_manual_driver_at_
 fn complete_original_neutral_q_minus_one_rejects_before_any_request_constructor_or_model_work() {
     let q = probe_q(false);
     let (mut runtime, f) = setup(false, Some(q - 1));
-    let before = f.pool.used_bytes().unwrap();
+    let before = f.pool.payload_used_bytes().unwrap();
     let issued = f.pool.0.usage.lock().unwrap().next_funding;
     let error = TextGeneration::from_input_with_sequence(
         &mut runtime,
@@ -594,7 +604,7 @@ fn complete_original_neutral_q_minus_one_rejects_before_any_request_constructor_
             .downcast_ref::<PreparedRequestRejection>(),
         Some(&PreparedRequestRejection::CapacityExceeded)
     );
-    assert_eq!(f.pool.used_bytes().unwrap(), before);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), before);
     assert_eq!(f.pool.0.usage.lock().unwrap().next_funding, issued);
     let facts = f.facts.lock().unwrap();
     assert_eq!(facts.quotes, 2); // Existing 2 -> 1 shared retry policy.
@@ -615,7 +625,7 @@ fn complete_original_diagnostic_failures_hold_each_real_prefix_through_neutral_e
     let mut previous = 0;
     for at in 0..8 {
         let (mut runtime, f) = setup(false, None);
-        let baseline = f.pool.used_bytes().unwrap();
+        let baseline = f.pool.payload_used_bytes().unwrap();
         let q = probe_q(false);
         diagnostics::fail_destination_for_test(at);
         let error = TextGeneration::from_input_with_sequence(
@@ -640,13 +650,15 @@ fn complete_original_diagnostic_failures_hold_each_real_prefix_through_neutral_e
             assert!(prefix > previous);
         }
         previous = prefix;
-        assert!(concrete
-            .source()
-            .unwrap()
-            .source()
-            .unwrap()
-            .is::<std::collections::TryReserveError>());
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+        assert!(
+            concrete
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<std::collections::TryReserveError>()
+        );
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
         assert!(f.pool.0.usage.lock().unwrap().pending_original.is_none());
         assert_eq!(f.facts.lock().unwrap().prepared, 0);
         // A retained partial error does not keep construction Busy. The same
@@ -660,11 +672,11 @@ fn complete_original_diagnostic_failures_hold_each_real_prefix_through_neutral_e
             GenerationSequenceRequest::new(OUTPUTS, &EOS),
         )
         .unwrap();
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + 2 * q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + 2 * q);
         drop(fresh);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
         drop(error);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     }
 }
 
@@ -705,13 +717,14 @@ fn complete_original_source_selection_domain_and_stale_state_reject_before_candi
             1 => input.selected_model = source(&f.pool, true), // equal parameters, another selection source
             2 => input.execution = InferenceExecutionIdentity::default(),
             3 => {
-                let foreign = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+                let foreign =
+                    crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
                 input.input = source(&foreign, false);
             }
             _ => Arc::get_mut(&mut f).unwrap().current_revision += 1,
         }
         let mut runtime = ModelRuntime::prepare(Backend(f.clone()), ()).unwrap();
-        let before = f.pool.used_bytes().unwrap();
+        let before = f.pool.payload_used_bytes().unwrap();
         // Retain any original substitute through the observation so its own
         // legitimate source retirement cannot be mistaken for request activity.
         let keep = (input.input.clone(), input.selected_model.clone());
@@ -732,7 +745,7 @@ fn complete_original_source_selection_domain_and_stale_state_reject_before_candi
                 .downcast_ref::<PreparedRequestRejection>(),
             Some(&PreparedRequestRejection::IdentityMismatch)
         );
-        assert_eq!(f.pool.used_bytes().unwrap(), before);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), before);
         let facts = f.facts.lock().unwrap();
         assert_eq!(
             (
@@ -752,7 +765,7 @@ fn complete_original_source_selection_domain_and_stale_state_reject_before_candi
 fn complete_original_cancellation_holds_future_media_and_stops_all_later_work() {
     for completed_spans in 0..=2 {
         let (mut runtime, f) = setup(false, None);
-        let baseline = f.pool.used_bytes().unwrap();
+        let baseline = f.pool.payload_used_bytes().unwrap();
         let q = probe_q(false);
         if completed_spans == 0 {
             f.cancel.cancel();
@@ -785,16 +798,16 @@ fn complete_original_cancellation_holds_future_media_and_stops_all_later_work() 
         }
         assert_eq!((facts.projections, facts.predictions), (0, 0));
         drop(facts);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
         drop(run);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     }
 }
 
 #[test]
 fn complete_original_terminal_aliases_share_one_charge_through_concurrent_last_retirement() {
     let (mut runtime, f) = setup(false, None);
-    let baseline = f.pool.used_bytes().unwrap();
+    let baseline = f.pool.payload_used_bytes().unwrap();
     let q = probe_q(false);
     let mut run = TextGeneration::from_input_with_sequence(
         &mut runtime,
@@ -824,7 +837,7 @@ fn complete_original_terminal_aliases_share_one_charge_through_concurrent_last_r
     let genuine_request = genuine_request.unwrap();
     let request_aliases: [InferenceRequest; 8] = std::array::from_fn(|_| genuine_request.clone());
     let reservation_aliases: [WorkingMemoryReservation; 8] =
-        std::array::from_fn(|_| genuine_request.memory_reservation().unwrap().clone());
+        std::array::from_fn(|_| genuine_request.memory_reservation().clone());
     drop(genuine_request);
     let ids = sequence.into_token_ids();
     let aliases: [GenerationTokenIds; 8] = std::array::from_fn(|_| ids.clone());
@@ -833,7 +846,7 @@ fn complete_original_terminal_aliases_share_one_charge_through_concurrent_last_r
     let source_bytes = f.sources.input.original_bytes() + f.sources.selected_model.original_bytes();
     drop(runtime);
     drop(f); // No caller/model alias remains; outputs own both real sources.
-    assert_eq!(pool.used_bytes().unwrap(), baseline + q);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline + q);
     // Test-owned thread synchronization is outside the managed evaluator. All
     // eight library owners are the same actual allocated output/source/Q body.
     let barrier = std::sync::Barrier::new(8);
@@ -843,13 +856,16 @@ fn complete_original_terminal_aliases_share_one_charge_through_concurrent_last_r
             let pool = &pool;
             scope.spawn(move || {
                 barrier.wait();
-                assert_eq!(pool.used_bytes().unwrap(), baseline + q);
+                assert_eq!(pool.payload_used_bytes().unwrap(), baseline + q);
                 assert_eq!(alias.len(), OUTPUTS);
                 drop(alias);
             });
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), baseline - source_bytes + q);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        baseline - source_bytes + q
+    );
     // Actual request and direct reservation aliases came from the same core
     // startup. Each owner family can retire concurrently without refunding Q
     // before the remaining family has destroyed its payload and Arc shell.
@@ -859,24 +875,33 @@ fn complete_original_terminal_aliases_share_one_charge_through_concurrent_last_r
             let pool = &pool;
             scope.spawn(move || {
                 barrier.wait();
-                assert_eq!(pool.used_bytes().unwrap(), baseline - source_bytes + q);
+                assert_eq!(
+                    pool.payload_used_bytes().unwrap(),
+                    baseline - source_bytes + q
+                );
                 drop(request);
             });
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), baseline - source_bytes + q);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        baseline - source_bytes + q
+    );
     std::thread::scope(|scope| {
         for reservation in reservation_aliases {
             let barrier = &barrier;
             let pool = &pool;
             scope.spawn(move || {
                 barrier.wait();
-                assert_eq!(pool.used_bytes().unwrap(), baseline - source_bytes + q);
+                assert_eq!(
+                    pool.payload_used_bytes().unwrap(),
+                    baseline - source_bytes + q
+                );
                 drop(reservation);
             });
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), baseline - source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline - source_bytes);
 }
 
 // Measure through the genuine generic startup path, including the actual private
@@ -884,7 +909,7 @@ fn complete_original_terminal_aliases_share_one_charge_through_concurrent_last_r
 // equality authenticates the concrete admission in the subsequently fresh pool.
 fn probe_q(manual: bool) -> u64 {
     let (mut runtime, f) = setup(manual, None);
-    let baseline = f.pool.used_bytes().unwrap();
+    let baseline = f.pool.payload_used_bytes().unwrap();
     if manual {
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let run = driver
@@ -911,7 +936,7 @@ fn probe_q(manual: bool) -> u64 {
         assert_eq!(f.facts.lock().unwrap().predictions, 0);
         drop(run);
     }
-    assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     let q = f.facts.lock().unwrap().accepted_q;
     assert!(q > 0);
     q
@@ -949,7 +974,7 @@ impl TokenFilterController for UndeclaredController {
 fn complete_original_unknown_or_shared_controller_rejects_before_candidate_or_callback() {
     for shared in [false, true] {
         let (mut runtime, f) = setup(true, None);
-        let before = f.pool.used_bytes().unwrap();
+        let before = f.pool.payload_used_bytes().unwrap();
         let issued = f.pool.0.usage.lock().unwrap().next_funding;
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let error = driver
@@ -972,7 +997,7 @@ fn complete_original_unknown_or_shared_controller_rejects_before_candidate_or_ca
             ),
             _ => panic!("fixed original controller rejection"),
         }
-        assert_eq!(f.pool.used_bytes().unwrap(), before);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), before);
         assert_eq!(f.pool.0.usage.lock().unwrap().next_funding, issued);
         let facts = f.facts.lock().unwrap();
         assert_eq!(
@@ -989,7 +1014,7 @@ fn complete_original_unknown_or_shared_controller_rejects_before_candidate_or_ca
     // its own mechanism, but this scalar producer does not implement that
     // mechanism. It cannot inherit the All profile's zero payload term.
     let (mut runtime, f) = setup(false, None);
-    let before = f.pool.used_bytes().unwrap();
+    let before = f.pool.payload_used_bytes().unwrap();
     let error = TextGeneration::from_input_with_sequence(
         &mut runtime,
         prompt(&f),
@@ -1007,7 +1032,7 @@ fn complete_original_unknown_or_shared_controller_rejects_before_candidate_or_ca
             .downcast_ref::<PreparedRequestRejection>(),
         Some(&PreparedRequestRejection::MissingController)
     );
-    assert_eq!(f.pool.used_bytes().unwrap(), before);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), before);
     let facts = f.facts.lock().unwrap();
     assert_eq!(
         (
@@ -1024,7 +1049,7 @@ fn complete_original_unknown_or_shared_controller_rejects_before_candidate_or_ca
 fn complete_original_filled_diagnostic_poison_retains_exact_error_source_and_conservative_q() {
     let q = probe_q(false);
     let (mut runtime, f) = setup(false, None);
-    let baseline = f.pool.used_bytes().unwrap();
+    let baseline = f.pool.payload_used_bytes().unwrap();
     diagnostics::set_after_fill_for_test(diagnostics::AfterFill::Poison);
     let error = TextGeneration::from_input_with_sequence(
         &mut runtime,
@@ -1055,7 +1080,13 @@ fn complete_original_filled_diagnostic_poison_retains_exact_error_source_and_con
     {
         let usage = f.pool.0.usage.lock().unwrap_err().into_inner();
         assert_eq!(
-            usage.reserved + usage.registered + f.pool.0.existing,
+            usage.reserved + usage.registered + f.pool.0.existing
+                - MemoryLedger::fixed_owner_bytes(
+                    f.pool.topology(),
+                    f.pool.configured_limits(),
+                    &f.pool.0.baseline
+                )
+                .unwrap(),
             baseline + q
         );
         assert!(usage.pending_original.is_none());
@@ -1064,7 +1095,13 @@ fn complete_original_filled_diagnostic_poison_retains_exact_error_source_and_con
     // Sticky lock failure is not a certificate of safe account cleanup.
     let usage = f.pool.0.usage.lock().unwrap_err().into_inner();
     assert_eq!(
-        usage.reserved + usage.registered + f.pool.0.existing,
+        usage.reserved + usage.registered + f.pool.0.existing
+            - MemoryLedger::fixed_owner_bytes(
+                f.pool.topology(),
+                f.pool.configured_limits(),
+                &f.pool.0.baseline
+            )
+            .unwrap(),
         baseline + q
     );
     let facts = f.facts.lock().unwrap();
@@ -1076,7 +1113,7 @@ fn complete_original_filled_diagnostic_poison_retains_exact_error_source_and_con
 #[test]
 fn complete_original_filled_diagnostic_unwind_retires_buffers_before_same_q() {
     let (mut runtime, f) = setup(false, None);
-    let baseline = f.pool.used_bytes().unwrap();
+    let baseline = f.pool.payload_used_bytes().unwrap();
     diagnostics::set_after_fill_for_test(diagnostics::AfterFill::Unwind);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         TextGeneration::from_input_with_sequence(
@@ -1090,7 +1127,7 @@ fn complete_original_filled_diagnostic_unwind_retires_buffers_before_same_q() {
         .map(drop)
     }));
     assert!(outcome.is_err());
-    assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     assert!(f.pool.0.usage.lock().unwrap().pending_original.is_none());
     let fresh = TextGeneration::from_input_with_sequence(
         &mut runtime,
@@ -1102,7 +1139,7 @@ fn complete_original_filled_diagnostic_unwind_retires_buffers_before_same_q() {
     )
     .unwrap();
     drop(fresh);
-    assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
 }
 
 #[test]
@@ -1139,7 +1176,7 @@ fn original_post_q_window_plan_copies_before_source_borrow_ends_and_keeps_real_f
         .unwrap()
         .sliding_windows;
         assert_eq!(windows.iter().collect::<Vec<_>>(), [2, 4]);
-        let baseline = f.pool.used_bytes().unwrap();
+        let baseline = f.pool.payload_used_bytes().unwrap();
         if let Some(at) = failure {
             diagnostics::fail_destination_for_test(at);
         }
@@ -1169,7 +1206,7 @@ fn original_post_q_window_plan_copies_before_source_borrow_ends_and_keeps_real_f
         );
         // Success and owning errors cannot retain an unowned report/layout loan.
         drop(layout);
-        let charged = f.pool.used_bytes().unwrap();
+        let charged = f.pool.payload_used_bytes().unwrap();
         assert!(charged > baseline);
         match result {
             Ok((sources, reservation)) => {
@@ -1193,12 +1230,12 @@ fn original_post_q_window_plan_copies_before_source_borrow_ends_and_keeps_real_f
                     .downcast_ref::<ConstructionFailure<Sources>>()
                     .unwrap();
                 assert_eq!(exact.prefix_bytes() == 0, failure == Some(0));
-                assert_eq!(f.pool.used_bytes().unwrap(), charged);
+                assert_eq!(f.pool.payload_used_bytes().unwrap(), charged);
                 drop(error);
             }
             other => panic!("unexpected window construction result: {other:?}"),
         }
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     }
 }
 

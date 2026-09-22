@@ -2,8 +2,8 @@
 use super::*;
 use crate::HostSlotTable;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 mod dense;
@@ -261,7 +261,7 @@ pub struct RegisteredTextComponentsGroupCopy<'a, OS, OD, CS, CD, K: Ord + Send +
     sampling: RegisteredSamplingCopy<'a, K>,
     group: RegisteredDecoderTableGroup<'a, OS, OD, CS, CD, K>,
     complete_source: WorkingMemoryStorage<K>,
-    bytes: u64,
+    bytes: Option<u64>,
 }
 impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
     /// Joins actual two-level tables and mandatory complete registered native
@@ -274,8 +274,7 @@ impl<'a, K: Clone + Ord + Send + Sync + 'static> RegisteredSamplingCopy<'a, K> {
     {
         let bytes = self
             .required_bytes()
-            .checked_add(group.protected)
-            .ok_or(WorkingMemoryError::Overflow)?;
+            .and_then(|bytes| bytes.checked_add(group.protected));
         Ok(RegisteredTextComponentsGroupCopy {
             sampling: self,
             group,
@@ -288,7 +287,7 @@ impl<OS, OD, CS, CD, K: Ord + Send + 'static>
     RegisteredTextComponentsGroupCopy<'_, OS, OD, CS, CD, K>
 {
     /// Combined destination demand, excluding independently charged source/safety.
-    pub fn required_bytes(&self) -> u64 {
+    pub fn required_bytes(&self) -> Option<u64> {
         self.bytes
     }
 }
@@ -438,7 +437,7 @@ impl<D> fmt::Debug for InitializedDecoderGroupChild<D> {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// One same-lock source check/account commit for sampler, outer, all children,
     /// operands and full source inventory. Only native scope owns the pin bundle.
     /// All table P holds precede the first initializer; native adoption cannot
@@ -455,26 +454,61 @@ impl WorkingMemoryPool {
         ),
         DecoderCopyAdmissionError,
     > {
-        let bytes = copy
-            .bytes
-            .checked_add(limits.safety_reserve_bytes)
+        let host_bytes = copy
+            .sampling
+            .host_bytes
+            .checked_add(copy.group.protected)
             .ok_or(WorkingMemoryError::Overflow)?;
-        if let Some(budget_bytes) = limits.application_memory_budget_bytes {
-            if bytes > budget_bytes {
-                return Err(DecoderCopyAdmissionError::ApplicationBudgetExceeded {
-                    required_bytes: bytes,
-                    budget_bytes,
-                });
-            }
-        }
         let preparation = copy.complete_source.source_preparation().cloned();
+        let operands = copy.sampling.arrays.source().registration();
+        let tables = copy
+            .group
+            .len()
+            .checked_add(1)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let registered = std::iter::once(&copy.group.outer.source)
+            .chain(copy.group.children.iter().map(|child| &child.source))
+            .filter(|source| matches!(source, DecoderSource::Registered(_)))
+            .count();
+        let pin_count = registered
+            .checked_add(2)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let direct_controls = group_controls(&copy, preparation.is_some(), tables, pin_count)?;
+        let accepted = super::super::workspace_copy::prepare_copy_account(
+            self,
+            copy.sampling.sampler.execution(),
+            copy.sampling.arrays.incremental_requirements(),
+            host_bytes,
+            &limits,
+            direct_controls,
+            super::super::funding::CopyHostHolds::Grouped {
+                sampler: copy.sampling.host_bytes,
+                decoder: copy.group.protected,
+                tables,
+            },
+            |usage| {
+                if !self.same_ledger(copy.sampling.sampler.source().pool()) {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                copy.sampling
+                    .sampler
+                    .source()
+                    .validate(usage, copy.sampling.sampler.execution())?;
+                copy.group.outer.source().validate(self, usage)?;
+                for child in &copy.group.children {
+                    child.source().validate(self, usage)?;
+                }
+                operands.validate_copy_source(self, usage)?;
+                copy.complete_source.validate_copy_source(self, usage)
+            },
+        )?;
         copy.group
             .outer
             .prepare_destination_identity(preparation.as_ref())?;
         for child in &mut copy.group.children {
             child.prepare_destination_identity(preparation.as_ref())?;
         }
-        let exact = preparation.is_some();
+        let exact = true;
         let execution = match preparation.as_ref() {
             Some(preparation) => {
                 let tables = copy
@@ -495,21 +529,10 @@ impl WorkingMemoryPool {
             .checked_add(1)
             .ok_or(WorkingMemoryError::Overflow)?;
         let mut holds = super::super::qualified_storage::vector(count, exact)?;
-        let mut sources = super::super::qualified_storage::vector(count, exact)?;
         holds.push(copy.group.outer.initialization_peak_bytes());
-        sources.push(copy.group.outer.source());
         for child in &copy.group.children {
             holds.push(child.initialization_peak_bytes());
-            sources.push(child.source());
         }
-        let operands = copy.sampling.arrays.source().registration();
-        let registered = std::iter::once(&copy.group.outer.source)
-            .chain(copy.group.children.iter().map(|child| &child.source))
-            .filter(|source| matches!(source, DecoderSource::Registered(_)))
-            .count();
-        let count = 2usize
-            .checked_add(registered)
-            .ok_or(WorkingMemoryError::Overflow)?;
         let pins = [
             Some(RegisteredStoragePin::new(operands.clone())),
             Some(RegisteredStoragePin::new(copy.complete_source.clone())),
@@ -519,28 +542,17 @@ impl WorkingMemoryPool {
         .chain(copy.group.children.iter().map(|p| p.registered_pin()))
         .flatten();
         let pin = if copy.complete_source.has_source_preparation() {
-            RegisteredStoragePin::aggregate_counted(pins, count)?
+            RegisteredStoragePin::aggregate_counted(pins, pin_count)?
         } else {
-            RegisteredStoragePin::aggregate(pins)
+            RegisteredStoragePin::aggregate_exact(pins, pin_count)?
         };
         let host = copy.sampling.host_bytes;
-        let (funding, host_scope, scopes, scope) = self.open_grouped_text_components_account(
-            copy.sampling.sampler.source(),
-            copy.sampling.sampler.execution(),
-            &sources,
-            &holds,
-            operands,
-            &copy.complete_source,
-            pin,
-            &execution,
-            bytes,
-            host,
-            limits.capacity_bytes,
-        )?;
-        drop(sources);
+        let (requirements, funding, host_scope, scopes, scope) =
+            accepted.grouped(&execution, pin, host, &holds)?;
         // The native custody is created before any fallible payload work; unwind
         // keeps complete source pins quarantined while actual payload fields retire.
-        let native = AdmittedWorkspaceCopy::from_account(execution.clone(), bytes, funding, scope);
+        let native =
+            AdmittedWorkspaceCopy::from_account(execution.clone(), requirements, funding, scope);
         #[cfg(test)]
         tests::before_initialize();
         let sampler = copy.sampling.sampler_plan.copy();
@@ -570,6 +582,88 @@ impl WorkingMemoryPool {
             },
             native,
         ))
+    }
+}
+
+fn group_controls<OS, OD, CS, CD, K: Ord + Send + Sync + 'static>(
+    copy: &RegisteredTextComponentsGroupCopy<'_, OS, OD, CS, CD, K>,
+    prepared: bool,
+    tables: usize,
+    pin_count: usize,
+) -> Result<usize, WorkingMemoryError> {
+    Ok(if !prepared {
+        let group = RegisteredDecoderTableGroup::<OS, OD, CS, CD, K>::preparation_control_bytes(
+            copy.group.len(),
+        )
+        .map_err(|_| WorkingMemoryError::Overflow)?;
+        let child = crate::HostSlotInitialization::<CS, CD>::preparation_control_bytes()
+            .ok_or(WorkingMemoryError::UnknownBound)?
+            .checked_mul(copy.group.len())
+            .ok_or(WorkingMemoryError::Overflow)?;
+        super::super::WorkspaceCopyAccountLayout::decoder_group(tables)?
+            .requested_bytes()
+            .checked_add(RegisteredStoragePin::ordinary_group_control_bytes::<K>(
+                pin_count,
+            )?)
+            .and_then(|n| n.checked_add(group))
+            .and_then(|n| n.checked_add(child))
+            .and_then(|n| {
+                n.checked_add(crate::HostSlotInitialization::<OS, OD>::preparation_control_bytes()?)
+            })
+            .ok_or(WorkingMemoryError::Overflow)?
+    } else {
+        0
+    })
+}
+impl MemoryLedger {
+    /// Complete per-domain demand for every host table, sampler and native copy.
+    pub fn text_components_group_copy_requirements<
+        OS,
+        OD,
+        CS,
+        CD,
+        K: Clone + Ord + Send + Sync + 'static,
+    >(
+        &self,
+        copy: &RegisteredTextComponentsGroupCopy<'_, OS, OD, CS, CD, K>,
+        limits: &WorkspaceCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        let tables = copy
+            .group
+            .len()
+            .checked_add(1)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let registered = std::iter::once(&copy.group.outer.source)
+            .chain(copy.group.children.iter().map(|c| &c.source))
+            .filter(|s| matches!(s, DecoderSource::Registered(_)))
+            .count();
+        let controls = group_controls(
+            copy,
+            copy.complete_source.has_source_preparation(),
+            tables,
+            registered
+                .checked_add(2)
+                .ok_or(WorkingMemoryError::Overflow)?,
+        )?;
+        let host = copy
+            .sampling
+            .host_bytes
+            .checked_add(copy.group.protected)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        super::super::workspace_copy::with_copy_projection(
+            self,
+            copy.sampling.arrays.incremental_requirements(),
+            host,
+            limits,
+            controls,
+            |mut projection, controls| {
+                projection.host_bytes = projection
+                    .host_bytes
+                    .checked_add(controls)
+                    .ok_or(WorkingMemoryError::Overflow)?;
+                projection.materialize(self.topology())
+            },
+        )
     }
 }
 

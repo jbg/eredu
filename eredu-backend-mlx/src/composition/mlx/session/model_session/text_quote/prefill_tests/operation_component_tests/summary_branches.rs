@@ -1,6 +1,8 @@
 //! Shorter actual Summary branches retain the full cold numerical allowance.
 use super::*;
 use crate::backend::array_copy::{CaptureCompletion, SummaryProgram};
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::capture::CaptureSummary;
 
 fn oracle(values: &[f32]) -> CaptureSummary {
@@ -119,7 +121,7 @@ fn original_summary_zero_nonfinite_and_mixed_branches_retire_under_full_recipe()
         let quote = plan.quote();
         POINTWISE_CONTROLS.with(|slot| assert!(slot.replace(Some(plan.control_bytes())).is_none()));
         let controls_reset = PointwiseControlsReset;
-        let baseline = prepared.pool.used_bytes().unwrap();
+        let baseline = prepared.pool.fixture_host_charge().unwrap();
         let unquoted = prepared.pool.unquoted_owner_count().unwrap();
         let actual = with_prepared_original_operation_controls(
             None,
@@ -176,7 +178,7 @@ fn original_summary_zero_nonfinite_and_mixed_branches_retire_under_full_recipe()
         drop((quote, controls_reset, input));
         crate::backend::submission_recovery::wait_for_retirement(|| {
             disk::reclaim();
-            prepared.pool.used_bytes().unwrap() == baseline
+            prepared.pool.fixture_host_charge().unwrap() == baseline
                 && prepared.pool.unquoted_owner_count().unwrap() == unquoted
         });
     }

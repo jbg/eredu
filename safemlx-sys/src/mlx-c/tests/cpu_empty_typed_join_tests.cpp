@@ -35,7 +35,7 @@ TEST_CASE("CPU empty Broadcast and Full preserve typed zero-data source and orig
     unsigned retired=0;
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -112,7 +112,7 @@ template<class T>void check(Dtype dtype,Stream stream,const std::vector<int>& co
   unsigned retired=0;
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);

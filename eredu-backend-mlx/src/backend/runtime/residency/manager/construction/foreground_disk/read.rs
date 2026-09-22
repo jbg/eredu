@@ -5,11 +5,13 @@ use eredu_runtime::working_memory::{
     OriginalHostSourceCustody, OriginalOperationMetadataCustody, WorkingMemoryReservation,
 };
 use safemlx::{
-    ImmutableHostTransferBuffer, InitializedInputAllocator,
-    InputAllocatorCause, PreparedInputArena, PreparedInputCause, PreparedSubmissionGraphQuota,
-    RetirementCapacityCause, RetirementCapacityOwner, RetirementCapacityPermit,
+    ImmutableHostTransferBuffer, InitializedInputAllocator, InputAllocatorCause,
+    PreparedInputArena, PreparedInputCause, PreparedSubmissionGraphQuota, RetirementCapacityCause,
+    RetirementCapacityOwner, RetirementCapacityPermit,
 };
 use std::mem::size_of_val;
+mod materialized;
+pub(crate) use materialized::Population as ForegroundMaterializationPopulation;
 mod publication;
 use eredu_runtime::working_memory::OriginalHostSourceBank;
 
@@ -22,12 +24,14 @@ pub(crate) struct ForegroundDiskReadLayout {
     pub(crate) source_backing_bytes: usize,
     pub(crate) output_logical_bytes: usize,
     pub(crate) outputs: usize,
+    pub(crate) sources: usize,
+    pub(crate) materialized: ForegroundMaterializationPopulation,
     pub(crate) maximum_rank: usize,
 }
 /// Borrowed actual source and initialized allocator; no grant or payload read.
 pub(crate) struct ForegroundDiskReadPlan<'a> {
     source: &'a ForegroundDiskDescriptors,
-    domain: &'a eredu_core::SharedStorageDomain,
+    domain: &'a eredu_core::SharedStorageAccountingId,
     initializer: &'static InitializedInputAllocator,
     unit: usize,
     layout: ForegroundDiskReadLayout,
@@ -41,10 +45,12 @@ pub(crate) struct PreparedForegroundDiskRead {
     source: ForegroundDiskDescriptors,
     unit: usize,
     ready: Vec<publication::PublishedHostSource>,
+    recipes: Vec<materialized::PreparedRecipeSource>,
     names: Vec<String>,
     named: Vec<(String, RetainedHostBuffer)>,
     initializer: &'static InitializedInputAllocator,
     outputs: usize,
+    sources: usize,
     source_backing_bytes: usize,
     output_logical_bytes: u64,
     completed_capacity_bytes: u64,
@@ -58,6 +64,10 @@ enum ReadCause {
     SourceBank(#[source] eredu_runtime::working_memory::HostDestinationCause),
     #[error("foreground source publication: {0}")]
     Publication(#[from] publication::SourceError),
+    #[error("foreground source destination: {0}")]
+    Source(#[from] publication::SourceCause),
+    #[error("foreground transformed source: {0}")]
+    Materialized(#[from] eredu_core::BackendFailure),
     #[error("foreground disk read geometry or state mismatch")]
     Identity,
     #[error("foreground disk request custody: {0}")]
@@ -90,7 +100,7 @@ impl ForegroundDiskDescriptors {
     pub(crate) fn read_plan<'a>(
         &'a self,
         id: &OffloadUnitId,
-        pool: &'a WorkingMemoryPool,
+        pool: &'a MemoryLedger,
     ) -> Result<ForegroundDiskReadPlan<'a>, WorkingMemoryError> {
         self._custody.validate_pool(pool)?;
         let initializer =
@@ -110,7 +120,7 @@ impl ForegroundDiskDescriptors {
         let read = self
             .value
             .source
-            .read_slice(row.own_reads.clone())
+            .read_slice(row.own_leaves.clone())
             .and_then(|reads| reads.read_layout())
             .ok_or(WorkingMemoryError::UnknownBound)?;
         let mut layout = ForegroundDiskReadLayout {
@@ -119,16 +129,43 @@ impl ForegroundDiskDescriptors {
             source_backing_bytes: 0,
             output_logical_bytes: 0,
             outputs: count,
+            sources: count,
+            materialized: ForegroundMaterializationPopulation::default(),
             maximum_rank: 0,
         };
+        let leaf_count = row
+            .own_reads
+            .clone()
+            .try_fold(0usize, |sum, index| {
+                sum.checked_add(
+                    self.value.native_reads[index]
+                        .materialized
+                        .as_ref()
+                        .map_or(0, |plan| plan.leaves.len()),
+                )
+            })
+            .ok_or_else(overflow)?;
+        let recipe_count = row
+            .own_reads
+            .clone()
+            .filter(|&index| self.value.native_reads[index].materialized.is_some())
+            .count();
+        layout.sources = count.checked_add(leaf_count).ok_or_else(overflow)?;
         let transfer_controls = crate::backend::runtime::residency::manager::materialization::foreground_disk_control_bytes().ok_or_else(overflow)?;
         let controls = [
-            Layout::array::<publication::Pending>(count)
+            Layout::array::<publication::Pending>(layout.sources)
                 .map_err(|_| overflow())?
                 .size(),
             Layout::array::<publication::PublishedHostSource>(count)
                 .map_err(|_| overflow())?
                 .size(),
+            Layout::array::<materialized::PreparedRecipeSource>(recipe_count)
+                .map_err(|_| overflow())?
+                .size(),
+            Layout::array::<publication::PublishedHostSource>(leaf_count)
+                .map_err(|_| overflow())?
+                .size(),
+            size_of::<Vec<materialized::PreparedRecipeSource>>(),
             Layout::array::<String>(count)
                 .map_err(|_| overflow())?
                 .size(),
@@ -149,14 +186,17 @@ impl ForegroundDiskDescriptors {
                 >,
             >(),
             size_of::<std::slice::Iter<'_, WeightBinding>>(),
-            Layout::array::<&mut [u8]>(count)
+            Layout::array::<&mut [u8]>(row.own_leaves.len())
                 .map_err(|_| overflow())?
                 .size(),
             size_of::<ForegroundDiskReadPlan<'_>>(),
             size_of::<ForegroundDiskReadLayout>(),
             size_of::<PreparedForegroundDiskRead>(),
             size_of::<PreparedForegroundDiskIo>(),
-            size_of::<(&mut PreparedForegroundDiskRead, &mut Vec<publication::Pending>)>(),
+            size_of::<(
+                &mut PreparedForegroundDiskRead,
+                &mut Vec<publication::Pending>,
+            )>(),
             size_of::<&mut PreparedForegroundDiskIo>(),
             size_of::<Result<(), publication::SourceCause>>(),
             size_of::<Result<PreparedForegroundDiskIo, ForegroundDiskReadError>>(),
@@ -235,10 +275,39 @@ impl ForegroundDiskDescriptors {
                 .checked_add(plan.logical_bytes())
                 .ok_or_else(overflow)?;
             layout.maximum_rank = layout.maximum_rank.max(native.shape.len());
+            if let Some(recipe) = &native.materialized {
+                layout.materialized = layout
+                    .materialized
+                    .checked_add(materialized::population(recipe, &runtime)?)
+                    .ok_or_else(overflow)?;
+                for leaf in &recipe.leaves {
+                    let plan = PreparedHostTransferPlan::new(
+                        &runtime,
+                        leaf.read.shape(),
+                        leaf.read.dtype(),
+                        0,
+                    )
+                    .map_err(|_| WorkingMemoryError::UnknownBound)?;
+                    layout.source_control_bytes = layout
+                        .source_control_bytes
+                        .checked_add(publication::control_bytes(&plan)?)
+                        .ok_or_else(overflow)?;
+                    layout.source_backing_bytes = layout
+                        .source_backing_bytes
+                        .checked_add(plan.backing_bytes())
+                        .ok_or_else(overflow)?;
+                    layout.maximum_rank = layout.maximum_rank.max(leaf.read.shape().len());
+                }
+            }
+        }
+        let declared = crate::backend::runtime::residency::manager::operation_population::MaterializationPopulation::bindings(row.definition.bindings())
+            .ok_or_else(overflow)?;
+        if layout.materialized.validations != declared.validation_materializations {
+            return Err(WorkingMemoryError::IdentityMismatch);
         }
         Ok(ForegroundDiskReadPlan {
             source: self,
-            domain: pool.shared_storage_domain(),
+            domain: pool.shared_storage_accounting_id(),
             initializer,
             unit,
             layout,
@@ -267,7 +336,10 @@ impl ForegroundDiskReadPlan<'_> {
     ) -> Result<PreparedForegroundDiskRead, ForegroundDiskReadError> {
         // No source clone, vector reservation or native allocation precedes
         // matching both the source domain and the exact accepted request.
-        if !custody.metadata_custody().matches_domain(self.domain) {
+        if !custody
+            .metadata_custody()
+            .matches_accounting_owner(self.domain)
+        {
             return Err(ForegroundDiskReadError {
                 cause: ReadCause::Identity,
                 _custody: custody,
@@ -289,7 +361,7 @@ impl ForegroundDiskReadPlan<'_> {
             });
         }
         let source_bank = capacity
-            .source_bank(self.layout.source_control_bytes as u64, self.layout.outputs)
+            .source_bank(self.layout.source_control_bytes as u64, self.layout.sources)
             .map_err(|cause| ForegroundDiskReadError {
                 cause: ReadCause::SourceBank(cause),
                 _custody: custody.clone(),
@@ -298,10 +370,12 @@ impl ForegroundDiskReadPlan<'_> {
             source: self.source.clone(),
             unit: self.unit,
             ready: Vec::new(),
+            recipes: Vec::new(),
             names: Vec::new(),
             named: Vec::new(),
             initializer: self.initializer,
             outputs: self.layout.outputs,
+            sources: self.layout.sources,
             source_backing_bytes: self.layout.source_backing_bytes,
             output_logical_bytes: u64::try_from(self.layout.output_logical_bytes).map_err(
                 |_| ForegroundDiskReadError {
@@ -316,6 +390,9 @@ impl ForegroundDiskReadPlan<'_> {
         };
         let result = (|| -> Result<(), ReadCause> {
             batch.ready.try_reserve_exact(self.layout.outputs)?;
+            batch
+                .recipes
+                .try_reserve_exact(self.layout.materialized.recipes)?;
             batch.names.try_reserve_exact(self.layout.outputs)?;
             batch.named.try_reserve_exact(self.layout.outputs)?;
             for binding in batch.source.value.units[batch.unit]
@@ -369,62 +446,91 @@ impl PreparedForegroundDiskRead {
         self.allocate()?.read_payload()?.finish()
     }
     fn allocate_into(&mut self, filling: &mut Vec<publication::Pending>) -> Result<(), ReadCause> {
-            let unit = &self.source.value.units[self.unit];
-            if self.outputs != unit.own_reads.len()
-                || !self.ready.is_empty()
-                || self.ready.capacity() < self.outputs
-            {
+        let unit = &self.source.value.units[self.unit];
+        if self.outputs != unit.own_reads.len()
+            || !self.ready.is_empty()
+            || self.ready.capacity() < self.outputs
+        {
+            return Err(ReadCause::Identity);
+        }
+        filling.try_reserve_exact(self.sources)?;
+        // Charge the complete unit before any native quota/backing allocation.
+        // Split only transfers that charge. A failed prefix returns unused
+        // bytes now and submitted source bytes only at final native release.
+        let mut permit = self.capacity.try_acquire(self.source_backing_bytes)?;
+        let runtime = self.initializer.try_borrow_runtime()?;
+        let mut actual_backing = 0usize;
+        for index in unit.own_reads.clone() {
+            let native = &self.source.value.native_reads[index];
+            let plan = PreparedHostTransferPlan::new(&runtime, &native.shape, native.dtype, 0)?;
+            let metadata = self.source.read_output(index).ok_or(ReadCause::Identity)?;
+            if u64::try_from(plan.logical_bytes()).ok() != Some(metadata.byte_len()) {
                 return Err(ReadCause::Identity);
             }
-            filling.try_reserve_exact(self.outputs)?;
-            // Charge the complete unit before any native quota/backing allocation.
-            // Split only transfers that charge. A failed prefix returns unused
-            // bytes now and submitted source bytes only at final native release.
-            let mut permit = self.capacity.try_acquire(self.source_backing_bytes)?;
-            let runtime = self.initializer.try_borrow_runtime()?;
-            // Validate every selected output/layout and the complete byte sum
-            // before the first per-buffer transaction performs payload I/O.
-            let mut actual_backing = 0usize;
-            for index in unit.own_reads.clone() {
-                let native = &self.source.value.native_reads[index];
-                let plan = PreparedHostTransferPlan::new(&runtime, &native.shape, native.dtype, 0)?;
-                let metadata = self
-                    .source
-                    .value
-                    .source
-                    .read_output(index)
-                    .ok_or(ReadCause::Identity)?;
-                if u64::try_from(plan.logical_bytes()).ok() != Some(metadata.byte_len())
-                    || self
-                        .source
-                        .value
-                        .source
-                        .read_slice(index..index + 1)
-                        .and_then(|read| read.read_layout())
-                        .is_none()
-                {
+            actual_backing = actual_backing
+                .checked_add(plan.backing_bytes())
+                .ok_or(ReadCause::Identity)?;
+            if let Some(recipe) = &native.materialized {
+                if native.leaves.len() != recipe.leaves.len() {
                     return Err(ReadCause::Identity);
                 }
-                actual_backing = actual_backing
-                    .checked_add(plan.backing_bytes())
-                    .ok_or(ReadCause::Identity)?;
-            }
-            if actual_backing != self.source_backing_bytes {
+                for (leaf_index, leaf) in native.leaves.clone().zip(&recipe.leaves) {
+                    if self.source.value.source.read_output(leaf_index)
+                        != Some(leaf.read.encoded().output())
+                    {
+                        return Err(ReadCause::Identity);
+                    }
+                    let plan = PreparedHostTransferPlan::new(
+                        &runtime,
+                        leaf.read.shape(),
+                        leaf.read.dtype(),
+                        0,
+                    )?;
+                    actual_backing = actual_backing
+                        .checked_add(plan.backing_bytes())
+                        .ok_or(ReadCause::Identity)?;
+                }
+            } else if native.leaves.len() != 1 {
                 return Err(ReadCause::Identity);
             }
-            for index in unit.own_reads.clone() {
-                let native = &self.source.value.native_reads[index];
-                let plan = PreparedHostTransferPlan::new(&runtime, &native.shape, native.dtype, 0)?;
-                let part = permit.try_split(plan.backing_bytes())?;
-                filling.push(publication::begin(
-                    &mut self.source_bank,
-                    plan,
-                    &self.capacity,
-                    part,
-                    &self._custody,
-                )?);
+        }
+        if actual_backing != self.source_backing_bytes {
+            return Err(ReadCause::Identity);
+        }
+        for index in unit.own_reads.clone() {
+            let native = &self.source.value.native_reads[index];
+            if let Some(recipe) = &native.materialized {
+                for leaf in &recipe.leaves {
+                    let plan = PreparedHostTransferPlan::new(
+                        &runtime,
+                        leaf.read.shape(),
+                        leaf.read.dtype(),
+                        0,
+                    )?;
+                    let part = permit.try_split(plan.backing_bytes())?;
+                    filling.push(publication::begin(
+                        &mut self.source_bank,
+                        plan,
+                        &self.capacity,
+                        part,
+                        &self._custody,
+                    )?);
+                }
             }
-            Ok(())
+            let plan = PreparedHostTransferPlan::new(&runtime, &native.shape, native.dtype, 0)?;
+            let part = permit.try_split(plan.backing_bytes())?;
+            filling.push(publication::begin(
+                &mut self.source_bank,
+                plan,
+                &self.capacity,
+                part,
+                &self._custody,
+            )?);
+        }
+        if filling.len() != self.sources {
+            return Err(ReadCause::Identity);
+        }
+        Ok(())
     }
     /// Allocate all exact final destinations on the calling thread before the
     /// prepared job becomes visible to a worker or performs any file I/O.
@@ -432,8 +538,15 @@ impl PreparedForegroundDiskRead {
         let mut filling = Vec::new();
         let result = self.allocate_into(&mut filling);
         match result {
-            Ok(()) => Ok(PreparedForegroundDiskIo { filling, read: self, initialized: false }),
-            Err(cause) => Err(ForegroundDiskReadError { cause, _custody: self._custody.clone() }),
+            Ok(()) => Ok(PreparedForegroundDiskIo {
+                filling,
+                read: self,
+                initialized: false,
+            }),
+            Err(cause) => Err(ForegroundDiskReadError {
+                cause,
+                _custody: self._custody.clone(),
+            }),
         }
     }
 }
@@ -448,39 +561,95 @@ pub(crate) struct PreparedForegroundDiskIo {
 }
 impl PreparedForegroundDiskIo {
     fn read_into(&mut self) -> Result<(), ReadCause> {
-            if self.initialized { return Err(ReadCause::Identity); }
-            let mut destinations = Vec::new();
-            destinations.try_reserve_exact(self.filling.len())?;
-            for pending in &mut self.filling {
-                destinations.push(pending.completed_mut().bytes_mut());
+        if self.initialized {
+            return Err(ReadCause::Identity);
+        }
+        let unit = &self.read.source.value.units[self.read.unit];
+        let mut destinations = Vec::new();
+        destinations.try_reserve_exact(unit.own_leaves.len())?;
+        let mut filling = self.filling.iter_mut();
+        for index in unit.own_reads.clone() {
+            let native = &self.read.source.value.native_reads[index];
+            for _ in native.leaves.clone() {
+                destinations.push(
+                    filling
+                        .next()
+                        .ok_or(ReadCause::Identity)?
+                        .completed_mut()
+                        .bytes_mut(),
+                );
             }
-            let unit = &self.read.source.value.units[self.read.unit];
-            self.read.source.value.source.read_slice(unit.own_reads.clone())
-                .ok_or(ReadCause::Identity)?.read_many_into(&mut destinations)?;
-            Ok(())
+            if native.materialized.is_some() {
+                let _unfilled_destination = filling.next().ok_or(ReadCause::Identity)?;
+            }
+        }
+        if filling.next().is_some() {
+            return Err(ReadCause::Identity);
+        }
+        self.read
+            .source
+            .value
+            .source
+            .read_slice(unit.own_leaves.clone())
+            .ok_or(ReadCause::Identity)?
+            .read_many_into(&mut destinations)?;
+        Ok(())
     }
     /// File I/O only: no native allocator, lock, registration or finalizer.
     pub(crate) fn read_payload(mut self) -> Result<Self, ForegroundDiskReadError> {
         let result = self.read_into();
         match result {
-            Ok(()) => { self.initialized = true; Ok(self) }
-            Err(cause) => Err(ForegroundDiskReadError { cause, _custody: self.read._custody.clone() }),
+            Ok(()) => {
+                self.initialized = true;
+                Ok(self)
+            }
+            Err(cause) => Err(ForegroundDiskReadError {
+                cause,
+                _custody: self.read._custody.clone(),
+            }),
         }
     }
     fn publish(&mut self) -> Result<(), ReadCause> {
-            if !self.initialized { return Err(ReadCause::Identity); }
-            for pending in &mut self.filling {
-                pending.completed_mut().freeze().map_err(|_| ReadCause::Identity)?;
-            }
-            for pending in self.filling.drain(..) {
+        if !self.initialized {
+            return Err(ReadCause::Identity);
+        }
+        let unit = &self.read.source.value.units[self.read.unit];
+        let mut filling = self.filling.drain(..);
+        for (ordinal, index) in unit.own_reads.clone().enumerate() {
+            let native = &self.read.source.value.native_reads[index];
+            if let Some(plan) = &native.materialized {
+                let mut leaves = Vec::new();
+                leaves.try_reserve_exact(plan.leaves.len())?;
+                for _ in &plan.leaves {
+                    let mut pending = filling.next().ok_or(ReadCause::Identity)?;
+                    pending.completed_mut().freeze()?;
+                    leaves.push(publication::finish(pending)?);
+                }
+                self.read.recipes.push(materialized::PreparedRecipeSource {
+                    ordinal,
+                    plan: plan.clone(),
+                    leaves,
+                    output: Some(filling.next().ok_or(ReadCause::Identity)?),
+                });
+            } else {
+                let mut pending = filling.next().ok_or(ReadCause::Identity)?;
+                pending.completed_mut().freeze()?;
                 let buffer = publication::finish(pending)?;
-                let allocation = buffer.allocation();
-                let bytes = u64::try_from(allocation.bytes()).map_err(|_| ReadCause::Identity)?;
-                self.read.completed_capacity_bytes = self.read.completed_capacity_bytes
-                    .checked_add(bytes).ok_or(ReadCause::Identity)?;
+                self.read.completed_capacity_bytes = self
+                    .read
+                    .completed_capacity_bytes
+                    .checked_add(
+                        u64::try_from(buffer.allocation().bytes())
+                            .map_err(|_| ReadCause::Identity)?,
+                    )
+                    .ok_or(ReadCause::Identity)?;
                 self.read.ready.push(buffer);
             }
-            Ok(())
+        }
+        if filling.next().is_some() {
+            return Err(ReadCause::Identity);
+        }
+        Ok(())
     }
     /// Complete the existing source transaction on the caller, after the actual
     /// worker callback returned. Failed publication never reopens the read slot.
@@ -493,7 +662,10 @@ impl PreparedForegroundDiskIo {
                 drop(self.filling);
                 Ok(ReadForegroundDiskBatch(self.read))
             }
-            Err(cause) => Err(ForegroundDiskReadError { cause, _custody: self.read._custody.clone() }),
+            Err(cause) => Err(ForegroundDiskReadError {
+                cause,
+                _custody: self.read._custody.clone(),
+            }),
         }
     }
 }
@@ -511,6 +683,52 @@ const _: () = {
     let _ = sendable::<Result<ReadForegroundDiskBatch, ForegroundDiskReadError>>;
 };
 impl ReadForegroundDiskBatch {
+    pub(in crate::backend::runtime::residency::manager) fn materialize(
+        mut self,
+        context: crate::backend::runtime::checkpoint::store::MaterializationView<'_>,
+        slots: &mut crate::backend::runtime::checkpoint::store::OriginalMaterializationSlots<'_>,
+        loan: Option<crate::backend::runtime::residency::manager::OriginalMaterializedLoan<'_>>,
+        parent: &safemlx::OriginalScopeObserver,
+    ) -> Result<Self, ForegroundDiskReadError> {
+        if self.0.recipes.is_empty() {
+            return Ok(self);
+        }
+        let result = (|| -> Result<(), ReadCause> {
+            let loan = loan.ok_or(ReadCause::Identity)?;
+            let runtime = self.0.initializer.try_borrow_runtime()?;
+            for source in self.0.recipes.drain(..) {
+                let ordinal = source.ordinal;
+                let pending = materialized::execute(
+                    source,
+                    context,
+                    slots,
+                    loan,
+                    parent,
+                    &runtime,
+                    &self.0._custody.metadata_custody(),
+                )?;
+                let buffer = publication::finish(pending)?;
+                self.0.completed_capacity_bytes = self
+                    .0
+                    .completed_capacity_bytes
+                    .checked_add(
+                        u64::try_from(buffer.allocation().bytes())
+                            .map_err(|_| ReadCause::Identity)?,
+                    )
+                    .ok_or(ReadCause::Identity)?;
+                if ordinal > self.0.ready.len() || self.0.ready.len() == self.0.ready.capacity() {
+                    return Err(ReadCause::Identity);
+                }
+                self.0.ready.insert(ordinal, buffer);
+            }
+            Ok(())
+        })();
+        result.map_err(|cause| ForegroundDiskReadError {
+            cause,
+            _custody: self.0._custody.clone(),
+        })?;
+        Ok(self)
+    }
     /// These facts come from the same successful source publication: logical
     /// bytes were validated before read, capacity is the actual observed union
     /// of this unit's own canonical buffers. Aliases contribute no new backing.
@@ -531,7 +749,8 @@ impl ReadForegroundDiskBatch {
     pub(in crate::backend::runtime::residency::manager) fn into_host(
         mut self,
     ) -> Result<ResidentHostOwner, ForegroundDiskReadError> {
-        if self.0.names.len() != self.0.outputs
+        if !self.0.recipes.is_empty()
+            || self.0.names.len() != self.0.outputs
             || self.0.ready.len() != self.0.outputs
             || !self.0.named.is_empty()
             || self.0.named.capacity() < self.0.outputs
@@ -542,10 +761,9 @@ impl ReadForegroundDiskBatch {
             });
         }
         for (name, buffer) in self.0.names.drain(..).zip(self.0.ready.drain(..)) {
-            self.0.named.push((
-                name,
-                RetainedHostBuffer::request(buffer),
-            ));
+            self.0
+                .named
+                .push((name, RetainedHostBuffer::request(buffer)));
         }
         let rows = rows::Rows::from_sorted(std::mem::take(&mut self.0.named));
         Ok(ResidentHostOwner::request(

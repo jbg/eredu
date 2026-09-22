@@ -40,6 +40,18 @@ impl<'a> From<&'a WorkspaceLayout> for WorkspaceSamplingInput<'a> {
 pub struct WorkspaceSamplingSource<'a> {
     input: WorkspaceSamplingInput<'a>,
     maximum_allocations: Option<usize>,
+    physical_domains: Option<&'a eredu_core::DomainMemoryRequirements>,
+}
+impl<'a> WorkspaceSamplingSource<'a> {
+    /// Placement established by the actual score producer's backing inventory.
+    /// It applies to every allocation in this complete backing envelope.
+    pub fn with_physical_domains(
+        mut self,
+        physical_domains: Option<&'a eredu_core::DomainMemoryRequirements>,
+    ) -> Self {
+        self.physical_domains = physical_domains;
+        self
+    }
 }
 impl<'a> WorkspaceSamplingInput<'a> {
     /// Preserve the actual source's complete possible backing count when its
@@ -51,6 +63,7 @@ impl<'a> WorkspaceSamplingInput<'a> {
         WorkspaceSamplingSource {
             input: self,
             maximum_allocations: Some(maximum_allocations),
+            physical_domains: None,
         }
     }
 }
@@ -60,7 +73,11 @@ impl<'a> From<WorkspaceSamplingInput<'a>> for WorkspaceSamplingSource<'a> {
         // Preserve its ordinary byte equation while keeping new native rounding
         // evidence unknown unless the input is an observed empty population.
         let count = (input.backing_capacity_bytes == Some(0)).then_some(0);
-        Self { input, maximum_allocations: count }
+        Self {
+            input,
+            maximum_allocations: count,
+            physical_domains: None,
+        }
     }
 }
 impl<'a> From<&'a WorkspaceLayout> for WorkspaceSamplingSource<'a> {
@@ -73,32 +90,45 @@ impl<'a> From<&'a WorkspaceLayout> for WorkspaceSamplingSource<'a> {
 /// Exact score descriptor supplied to the shared sampling worker. Its checked
 /// one-row rank is at most three, so retention needs no allocated shape buffer.
 /// These descriptive facts supply neither source custody nor execution rights.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SamplingWorkspaceInputPlan {
     shape: [i32; 3],
     rank: usize,
     representation: Option<eredu_nn::workspace::WorkspaceRepresentation>,
     backing_capacity_bytes: Option<u64>,
     maximum_allocations: Option<usize>,
+    physical_domains: Option<std::sync::Arc<eredu_core::DomainMemoryRequirements>>,
 }
 impl SamplingWorkspaceInputPlan {
     /// Actual source dimensions, without normalizing or guessing its rank.
-    pub fn shape(&self) -> &[i32] { &self.shape[..self.rank] }
+    pub fn shape(&self) -> &[i32] {
+        &self.shape[..self.rank]
+    }
     /// Reconstructs the observed geometry and physical evidence under the
     /// caller's metadata account. Unknown representation stays unknown.
     pub fn layout(&self, context: &WorkspaceContext) -> Result<WorkspaceLayout, Error> {
-        Ok(context.layout(self.shape(), WorkspaceDtype::Float32)?
+        Ok(context
+            .layout(self.shape(), WorkspaceDtype::Float32)?
             .with_representation(self.representation))
     }
     /// Reconstructs the same source descriptor over a separately paid layout.
-    pub fn source<'a>(&self, layout: &'a WorkspaceLayout) -> Result<WorkspaceSamplingSource<'a>, Error> {
-        if layout.shape() != self.shape() || layout.dtype() != WorkspaceDtype::Float32
-            || layout.representation() != self.representation {
+    pub fn source<'a>(
+        &'a self,
+        layout: &'a WorkspaceLayout,
+    ) -> Result<WorkspaceSamplingSource<'a>, Error> {
+        if layout.shape() != self.shape()
+            || layout.dtype() != WorkspaceDtype::Float32
+            || layout.representation() != self.representation
+        {
             return Err(WorkspaceMetadataError::Unqualified.into());
         }
         Ok(WorkspaceSamplingSource {
-            input: WorkspaceSamplingInput { layout, backing_capacity_bytes: self.backing_capacity_bytes },
+            input: WorkspaceSamplingInput {
+                layout,
+                backing_capacity_bytes: self.backing_capacity_bytes,
+            },
             maximum_allocations: self.maximum_allocations,
+            physical_domains: self.physical_domains.as_deref(),
         })
     }
 }
@@ -118,6 +148,9 @@ pub struct SamplingWorkspaceReport {
     /// Holding the host envelope for the sampler's lifetime therefore still
     /// leaves room for later emitted buffers, even when the peaks differ.
     pub peak: WorkspaceBound,
+    /// Complete physical envelope from each phase's original allocation walk.
+    /// The held host peak is added after reducing native lifetimes by domain.
+    pub physical_domains: Option<eredu_core::DomainMemoryRequirements>,
     /// Native buffer peak, including both old and newly split random keys.
     pub tensor_peak_bytes: Option<u64>,
     /// Managed host peak, including all live and replacement history payloads.
@@ -125,6 +158,9 @@ pub struct SamplingWorkspaceReport {
     /// First invocation whose native or host mechanism lacks a bound. Zero also
     /// identifies missing initialization coverage, including an unused seed key.
     pub first_gap: Option<u64>,
+    /// Maximum backing population of the actual closing random state and all
+    /// emitted outputs. Missing score-source population remains unknown.
+    pub maximum_closing_storage_allocations: Option<usize>,
     /// Final retained history payload, including spare capacity.
     pub final_history_bytes: u64,
 }
@@ -145,7 +181,9 @@ pub enum SamplingWorkspacePhase {
 pub trait SamplingWorkspaceObserver {
     /// Observes the actual score source before preparation/step traces. The
     /// default is appropriate for consumers that do not later reprice sampling.
-    fn observe_input(&mut self, _input: SamplingWorkspaceInputPlan) -> Result<(), Error> { Ok(()) }
+    fn observe_input(&mut self, _input: SamplingWorkspaceInputPlan) -> Result<(), Error> {
+        Ok(())
+    }
     /// The report includes existing roots, retained prior outputs and the
     /// operations for this phase. Distinguish new producers from those roots
     /// when computing cumulative generations or replacement contributions.
@@ -246,8 +284,9 @@ fn quote_with_sampler(
             "configured sampling requires one score row of rank 1, 2 or 3",
         )));
     }
-    context.charge_metadata(std::mem::size_of::<SamplingWorkspaceInputPlan>()
-        + std::mem::size_of::<[i32; 3]>())?;
+    context.charge_metadata(
+        std::mem::size_of::<SamplingWorkspaceInputPlan>() + std::mem::size_of::<[i32; 3]>(),
+    )?;
     let mut shape = [0; 3];
     shape[..logits.layout.shape().len()].copy_from_slice(logits.layout.shape());
     let input_plan = SamplingWorkspaceInputPlan {
@@ -256,8 +295,21 @@ fn quote_with_sampler(
         representation: logits.layout.representation(),
         backing_capacity_bytes: logits.backing_capacity_bytes,
         maximum_allocations: source.maximum_allocations,
+        physical_domains: source
+            .physical_domains
+            .map(|requirements| {
+                context.charge_metadata(2 * std::mem::size_of::<usize>())?;
+                let metadata = super::super::WorkspaceReportMetadata::new(context);
+                let retained = metadata
+                    .clone_domain_requirements(requirements)
+                    .map_err(|e| metadata.error(e))?;
+                Ok::<_, Error>(std::sync::Arc::new(retained))
+            })
+            .transpose()?,
     };
-    if let Some(observer) = observer.as_deref_mut() { observer.observe_input(input_plan)?; }
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.observe_input(input_plan.clone())?;
+    }
     if !temperature.is_finite() || temperature < 0.0 {
         return Err(context.metadata_error(format_args!(
             "sampling temperature must be finite and nonnegative",
@@ -268,8 +320,11 @@ fn quote_with_sampler(
         .map_err(|cause| context.metadata_source(cause))?;
     context.validate_values(random.into_iter().map(|state| state.key()))?;
     sampler.validate_steps(steps, context)?;
-    let filter_bytes = filter.mask_capacity_bytes().map_err(|cause| context.metadata_source(cause))?;
-    let fixed = bytes_add(context,
+    let filter_bytes = filter
+        .mask_capacity_bytes()
+        .map_err(|cause| context.metadata_source(cause))?;
+    let fixed = bytes_add(
+        context,
         std::mem::size_of::<ConfiguredTextSampler>() as u64,
         filter_bytes,
     )?;
@@ -290,26 +345,20 @@ fn quote_with_sampler(
         // caller's metadata key is untouched.
         random = Some(WorkspaceSamplingRandomState::from_seed(context)?);
     }
-    let initial_closing = if observer.is_some() {
-        Some(
-            context
-                .report_scalars(
-                    random
-                        .as_ref()
-                        .map(|state| std::slice::from_ref(state.key()))
-                        .unwrap_or(&[]),
-                )?
-                .closing_storage,
-        )
-    } else {
-        None
-    };
+    let initial_closing = context
+        .report_scalars(
+            random
+                .as_ref()
+                .map(|state| std::slice::from_ref(state.key()))
+                .unwrap_or(&[]),
+        )?
+        .closing_storage;
     let initial = context.finish_report(&[])?;
     if let Some(observer) = observer.as_deref_mut() {
         observer.observe_with_storage(
             SamplingWorkspacePhase::Preparation,
             &initial,
-            initial_closing.expect("observed closing roots"),
+            initial_closing,
         )?;
     }
     let initial_tensor = initial
@@ -321,21 +370,31 @@ fn quote_with_sampler(
                 .as_ref()
                 .and_then(|state| state.displaced_bytes),
         )
-        .map(|(new, old)| bytes_add(context, new, old))
-        .transpose()?;
+        .map(|(new, old)| diagnostic_add(context, new, old, initial.physical_domains.is_some()))
+        .transpose()?
+        .flatten();
     let initial_host = initial
         .host_workspace_bytes
         .map(|bytes| {
-            bytes_add(context,
+            bytes_add(
+                context,
                 bytes,
-                bytes_add(context, initial_fixed, history_bytes(context, sampler.history_capacity())?)?,
+                bytes_add(
+                    context,
+                    initial_fixed,
+                    history_bytes(context, sampler.history_capacity())?,
+                )?,
             )
         })
         .transpose()?;
     let initial_peak = initial_tensor
         .zip(initial_host)
-        .map(|(tensor, host)| bytes_add(context, tensor, host))
-        .transpose()?;
+        .map(|(tensor, host)| {
+            diagnostic_add(context, tensor, host, initial.physical_domains.is_some())
+        })
+        .transpose()?
+        .flatten();
+    let mut native_domains = sampling_native_domains(&initial, context)?;
     let mut report = SamplingWorkspaceReport {
         input: input_plan,
         output_width: vocabulary,
@@ -353,9 +412,11 @@ fn quote_with_sampler(
                 ))?,
             },
         },
+        physical_domains: None,
         tensor_peak_bytes: initial_tensor,
         host_peak_bytes: initial_host,
-        first_gap: initial_peak.is_none().then_some(0),
+        first_gap: (initial_peak.is_none() && native_domains.is_none()).then_some(0),
+        maximum_closing_storage_allocations: Some(initial_closing.maximum_allocations),
         final_history_bytes: history_bytes(context, sampler.history_capacity())?,
     };
     let mut known_peak = initial_peak.unwrap_or(0);
@@ -363,14 +424,7 @@ fn quote_with_sampler(
     for index in 0..steps {
         let old_history = history_bytes(context, sampler.history_capacity())?;
         context.begin_state_span(random.iter().map(|state| state.key()).chain(emitted.iter()))?;
-        let storage = match source.maximum_allocations {
-            Some(maximum_allocations) => WorkspaceExistingStorage::try_new_population(
-                eredu_nn::workspace::WorkspaceStoragePopulation {
-                    bytes: logits.backing_capacity_bytes, maximum_allocations,
-                }, context)?,
-            None => WorkspaceExistingStorage::try_new(logits.backing_capacity_bytes, context)?,
-        };
-        let input = WorkspaceTensor::existing_with_storage(logits.layout.clone(), &storage, context)?;
+        let input = sampling_score_input(source, context)?;
         let filtered = apply_workspace_token_filter(&input, filter, context)?;
         let token = sampler.sample(&filtered, temperature, random.as_mut(), context)?;
         // No roots are excluded: this component prices its complete retained
@@ -380,29 +434,42 @@ fn quote_with_sampler(
         // them; an emitted alias can keep that backing alive for later spans.
         context.reserve_metadata_vec(&mut emitted, 1)?;
         emitted.push(token);
-        let closing = if observer.is_some() {
-            // Temporarily borrow the same existing output directory for the
-            // optional RNG root; no numerical source or history is copied.
-            if let Some(random) = &random {
-                context.reserve_metadata_vec(&mut emitted, 1)?;
-                emitted.push(random.key().clone());
-            }
-            let closing = context.report_scalars(&emitted);
-            if random.is_some() {
-                emitted.pop();
-            }
-            let mut closing = closing?.closing_storage;
-            if source.maximum_allocations.is_none() { closing.bytes = None; }
-            Some(closing)
+        // This is the same closing-root lifetime walk used by native recipe
+        // observers. Publication population remains available without an observer.
+        if let Some(random) = &random {
+            context.reserve_metadata_vec(&mut emitted, 1)?;
+            emitted.push(random.key().clone());
+        }
+        let closing = context.report_scalars(&emitted);
+        if random.is_some() {
+            emitted.pop();
+        }
+        let mut closing = closing?.closing_storage;
+        if source.maximum_allocations.is_none() {
+            closing.bytes = None;
+            report.maximum_closing_storage_allocations = None;
         } else {
-            None
-        };
+            report.maximum_closing_storage_allocations = report
+                .maximum_closing_storage_allocations
+                .map(|count| count.max(closing.maximum_allocations));
+        }
         let trace = context.finish_report(&[])?;
+        native_domains = match (
+            native_domains.as_ref(),
+            sampling_native_domains(&trace, context)?,
+        ) {
+            (Some(previous), Some(next)) => Some(
+                super::super::WorkspaceReportMetadata::new(context)
+                    .combine_domain_requirements(previous, &next, false)
+                    .map_err(|e| super::super::WorkspaceReportMetadata::new(context).error(e))?,
+            ),
+            _ => None,
+        };
         if let Some(observer) = observer.as_deref_mut() {
             observer.observe_with_storage(
                 SamplingWorkspacePhase::Step { index },
                 &trace,
-                closing.expect("observed closing roots"),
+                closing,
             )?;
         }
         let new_history = history_bytes(context, sampler.history_capacity())?;
@@ -419,14 +486,18 @@ fn quote_with_sampler(
             .tensor_buffers
             .total_bytes
             .zip(trace.state.as_ref().and_then(|state| state.displaced_bytes))
-            .map(|(new, old)| bytes_add(context, new, old))
-            .transpose()?;
+            .map(|(new, old)| diagnostic_add(context, new, old, trace.physical_domains.is_some()))
+            .transpose()?
+            .flatten();
         report.tensor_peak_bytes = maximum(report.tensor_peak_bytes, tensor);
         report.host_peak_bytes = maximum(report.host_peak_bytes, host);
         match tensor
             .zip(host)
-            .map(|(tensor, host)| bytes_add(context, tensor, host))
+            .map(|(tensor, host)| {
+                diagnostic_add(context, tensor, host, trace.physical_domains.is_some())
+            })
             .transpose()?
+            .flatten()
         {
             Some(bytes) if report.first_gap.is_none() && bytes >= known_peak => {
                 known_peak = bytes;
@@ -438,7 +509,7 @@ fn quote_with_sampler(
                     ))?,
                 );
             }
-            None if report.first_gap.is_none() => {
+            None if report.first_gap.is_none() && native_domains.is_none() => {
                 report.first_gap = Some(index);
                 report.peak = WorkspaceBound::Unknown {
                     reason: context.metadata_string(format_args!(
@@ -446,26 +517,149 @@ fn quote_with_sampler(
                     ))?,
                 };
             }
+            None if native_domains.is_some() => {
+                report.peak = WorkspaceBound::PerDomain { assumptions: context.metadata_string(format_args!(
+                    "aggregate sampling diagnostic is unavailable; independently checked physical-domain requirements remain complete"))? };
+            }
             _ => {}
         }
         report.final_history_bytes = new_history;
     }
+    report.physical_domains = match (
+        native_domains,
+        report.host_peak_bytes,
+        context.memory_topology(),
+    ) {
+        (Some(mut native), Some(host), Some(topology)) => {
+            native
+                .add_allocation(
+                    host,
+                    &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())
+                        .map_err(|e| context.metadata_source(e))?,
+                )
+                .map_err(|e| context.metadata_source(e))?;
+            Some(native)
+        }
+        _ => None,
+    };
     if let (None, Some(tensor), Some(host)) = (
         report.first_gap,
         report.tensor_peak_bytes,
         report.host_peak_bytes,
     ) {
-        let combined = tensor.checked_add(host).ok_or_else(|| {
-            context.metadata_source(crate::working_memory::WorkingMemoryError::Overflow)
-        })?;
-        if let WorkspaceBound::Bounded { bytes, assumptions } = &mut report.peak {
+        let combined = diagnostic_add(context, tensor, host, report.physical_domains.is_some())?;
+        if let (Some(combined), WorkspaceBound::Bounded { bytes, assumptions }) =
+            (combined, &mut report.peak)
+        {
             *bytes = combined;
             *assumptions = context.metadata_string(format_args!(
                 "{}; separate tensor and host maxima are added conservatively so the complete host envelope, including boxed history replacement overlap, can stay held while later emitted buffers accumulate", assumptions,
             ))?;
+        } else if combined.is_none() {
+            report.peak = WorkspaceBound::PerDomain { assumptions: context.metadata_string(format_args!(
+                "aggregate sampling diagnostic exceeds u64; physical requirements remain separately attributed"))? };
         }
     }
     Ok(report)
+}
+
+fn sampling_score_input(
+    source: WorkspaceSamplingSource<'_>,
+    context: &WorkspaceContext,
+) -> Result<WorkspaceTensor, Error> {
+    let Some(requirements) = source.physical_domains else {
+        let storage = match source.maximum_allocations {
+            Some(maximum_allocations) => WorkspaceExistingStorage::try_new_population(
+                eredu_nn::workspace::WorkspaceStoragePopulation {
+                    bytes: source.input.backing_capacity_bytes,
+                    maximum_allocations,
+                },
+                context,
+            )?,
+            None => {
+                WorkspaceExistingStorage::try_new(source.input.backing_capacity_bytes, context)?
+            }
+        };
+        return WorkspaceTensor::existing_with_storage(
+            source.input.layout.clone(),
+            &storage,
+            context,
+        );
+    };
+    let topology = context
+        .memory_topology()
+        .ok_or(WorkspaceMetadataError::Unqualified)?;
+    requirements
+        .validate(topology)
+        .map_err(|e| context.metadata_source(e))?;
+    let maximum_allocations = source
+        .maximum_allocations
+        .ok_or(WorkspaceMetadataError::Unqualified)?;
+    let count = requirements
+        .iter()
+        .len()
+        .checked_mul(2)
+        .ok_or(WorkspaceMetadataError::Overflow)?;
+    let mut roots = context.metadata_vec(count)?;
+    for (domain, charge) in requirements.iter() {
+        if charge.estimated_overhead_bytes != 0 || charge.headroom_bytes != 0 {
+            return Err(WorkspaceMetadataError::Unqualified.into());
+        }
+        if charge.accounted_bytes != 0 {
+            let placement = eredu_core::MemoryPlacement::fixed(topology, domain)
+                .map_err(|e| context.metadata_source(e))?;
+            roots.push(WorkspaceExistingStorage::try_new_population_placed(
+                eredu_nn::workspace::WorkspaceStoragePopulation {
+                    bytes: Some(charge.accounted_bytes),
+                    maximum_allocations,
+                },
+                &placement,
+                context,
+            )?);
+        }
+        if charge.placement_allowance_bytes != 0 {
+            let mut candidates = context.metadata_vec(1)?;
+            candidates.push(domain);
+            let basis = context.metadata_string(format_args!(
+                "prospective score-backing envelope from the actual completed-span per-domain reducer; original candidate-placement evidence: {:?}",
+                requirements.placement_allowances()))?;
+            let placement = eredu_core::MemoryPlacement::possible(topology, candidates, basis)
+                .map_err(|e| context.metadata_source(e))?;
+            roots.push(WorkspaceExistingStorage::try_new_population_placed(
+                eredu_nn::workspace::WorkspaceStoragePopulation {
+                    bytes: Some(charge.placement_allowance_bytes),
+                    maximum_allocations,
+                },
+                &placement,
+                context,
+            )?);
+        }
+    }
+    WorkspaceTensor::existing_with_storages(source.input.layout.clone(), &roots, context)
+}
+
+fn sampling_native_domains(
+    trace: &WorkspaceTraceReport,
+    context: &WorkspaceContext,
+) -> Result<Option<eredu_core::DomainMemoryRequirements>, Error> {
+    let (Some(domains), Some(topology), Some(host)) = (
+        &trace.physical_domains,
+        context.memory_topology(),
+        trace.host_workspace_bytes,
+    ) else {
+        return Ok(None);
+    };
+    let Some(transient) = &domains.state_transient else {
+        return Ok(None);
+    };
+    let metadata = super::super::WorkspaceReportMetadata::new(context);
+    let mut native = metadata
+        .clone_domain_requirements(transient)
+        .map_err(|e| metadata.error(e))?;
+    native
+        .subtract_accounted(topology.host_domain(), host)
+        .map_err(|e| context.metadata_source(e))?;
+    Ok(Some(native))
 }
 
 fn maximum(old: Option<u64>, next: Option<u64>) -> Option<u64> {
@@ -479,6 +673,18 @@ fn history_bytes(context: &WorkspaceContext, capacity: usize) -> Result<u64, Err
 fn bytes_add(context: &WorkspaceContext, left: u64, right: u64) -> Result<u64, Error> {
     left.checked_add(right)
         .ok_or_else(|| context.metadata_error(format_args!("sampling workspace byte overflow")))
+}
+fn diagnostic_add(
+    context: &WorkspaceContext,
+    left: u64,
+    right: u64,
+    attributed: bool,
+) -> Result<Option<u64>, Error> {
+    match left.checked_add(right) {
+        Some(bytes) => Ok(Some(bytes)),
+        None if attributed => Ok(None),
+        None => Err(context.metadata_source(super::super::WorkingMemoryError::Overflow)),
+    }
 }
 
 // The production cursor holds no numerical history. A test-only real sampler
@@ -500,7 +706,8 @@ impl QuoteSampler for SamplerWorkspaceProjection<'_> {
         SamplerWorkspaceProjection::history_capacity(self)
     }
     fn validate_steps(&self, steps: u64, context: &WorkspaceContext) -> Result<(), Error> {
-        SamplerWorkspaceProjection::validate_steps(self, steps).map_err(|cause| context.metadata_source(cause))
+        SamplerWorkspaceProjection::validate_steps(self, steps)
+            .map_err(|cause| context.metadata_source(cause))
     }
     fn sample(
         &mut self,
@@ -552,7 +759,8 @@ impl QuoteSampler for SamplerWorkspaceProjection<'_> {
                 (token, Some(probability))
             }
         };
-        self.advance(probability).map_err(|cause| context.metadata_source(cause))?;
+        self.advance(probability)
+            .map_err(|cause| context.metadata_source(cause))?;
         Ok(token)
     }
 }
@@ -622,7 +830,9 @@ impl std::fmt::Display for Assumptions<'_> {
 
 impl SamplingWorkspaceReport {
     /// Exact original score geometry/backing facts retained by this report.
-    pub fn input_plan(&self) -> SamplingWorkspaceInputPlan { self.input }
+    pub fn input_plan(&self) -> SamplingWorkspaceInputPlan {
+        self.input.clone()
+    }
     /// Adds this actual sampling report to the enclosing vocabulary contribution.
     /// Equations, prompt preparation and controller storage remain separate.
     /// This is the same composition used by text and prepared-media consumers.
@@ -633,6 +843,14 @@ impl SamplingWorkspaceReport {
     ) -> Result<eredu_core::ExecutionWorkspaceEstimate, super::super::WorkspaceReportError> {
         use eredu_core::{AdmissionPolicyError, WorkspaceBound};
         metadata.admit::<eredu_core::ExecutionWorkspaceEstimate>()?;
+        outside.physical_domains = match (outside.physical_domains.take(), &self.physical_domains) {
+            (Some(mut outside), Some(sampling)) => {
+                outside.vocabulary =
+                    metadata.combine_domain_requirements(&outside.vocabulary, sampling, true)?;
+                Some(outside)
+            }
+            _ => None,
+        };
         outside.vocabulary = match (&outside.vocabulary, &self.peak) {
             (
                 WorkspaceBound::Bounded {
@@ -643,15 +861,23 @@ impl SamplingWorkspaceReport {
                     bytes: sampling,
                     assumptions: sampling_assumptions,
                 },
-            ) => metadata.bounded(
-                old.checked_add(*sampling)
-                    .ok_or(AdmissionPolicyError::ArithmeticOverflow {
+            ) => match old.checked_add(*sampling) {
+                Some(bytes) => metadata
+                    .bounded(bytes, format_args!("{assumptions}; {sampling_assumptions}"))?,
+                None if outside.physical_domains.is_some() => {
+                    metadata.per_domain(format_args!("{assumptions}; {sampling_assumptions}"))?
+                }
+                None => {
+                    return Err(AdmissionPolicyError::ArithmeticOverflow {
                         operation: "sampling and enclosing vocabulary workspace",
-                    })?,
-                format_args!("{assumptions}; {sampling_assumptions}"),
-            )?,
+                    }
+                    .into());
+                }
+            },
             (WorkspaceBound::Unknown { .. }, _) => outside.vocabulary,
             (_, unknown @ WorkspaceBound::Unknown { .. }) => metadata.clone_bound(unknown)?,
+            (bound @ WorkspaceBound::PerDomain { .. }, _) => metadata.clone_bound(bound)?,
+            (_, bound @ WorkspaceBound::PerDomain { .. }) => metadata.clone_bound(bound)?,
         };
         Ok(outside)
     }

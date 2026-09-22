@@ -1,7 +1,7 @@
 # Bounded inference
 
-Eredu admits framework-managed inference allocations against an explicit shared
-capacity before preparing or submitting the affected work. One execution engine
+Eredu admits framework-managed inference allocations against the limits of their
+physical memory domains before preparing or submitting the affected work. One execution engine
 serves ordinary and controlled sessions; speculation consumes the same preparation
 and commitment mechanisms with additional proposal/verification state. The
 [architecture guide](backend-architecture.md) defines crate ownership and
@@ -26,14 +26,14 @@ request and hardware configuration, not arbitrary application memory policy.
 ## Public request and source identity
 
 The public sequence is to compile retained tokenizer/template sources, prepare a
-chat at an explicit capacity, then start `PreparedChatRequest` through
+chat with `MemoryLimitDeclarations`, then start `PreparedChatRequest` through
 `start_prepared_chat`. `PreparedChatSession::advance` and `run` share the same
 cursor. `start_controlled_chat` adds a bounded record journal to that session.
 See [prepared chat](prepared-chat.md) and
 [the ordinary integration example](../eredu/examples/prepared_chat_generate.rs).
 
 The prepared chat owns its render, output/controller policy, original compilation
-receipt and capacity. Startup validates tokenizer/template/model/execution identity
+receipt and domain limits. Startup validates tokenizer/template/model/execution identity
 and resolved settings. Equal token IDs, matching hashes, copied diagnostic values
 or a caller-supplied range do not substitute for authenticated ownership.
 
@@ -43,21 +43,65 @@ from `prepare_chat_input`, which composes architecture framing and semantic
 coordinates with the original host/native input producer. Foreign, stale or
 mismatched sources refuse before execution.
 
-The capacity supplied by the application is a limit, not an estimate. Source
+Low-level native upload constructors authenticate uploaded storage and its
+custody. They do not create an inference preparation or a native execution
+permit. Execution consumes the original prepared input producer with its finite
+output envelope; raw uploaded arrays lacking that proof are rejected under both
+finite and unlimited limits.
+
+Each application limit constrains the total live charge in its physical domain,
+including existing storage and concurrent work. Unspecified domains default to
+`MemoryLimit::Unlimited`; `Finite(u64::MAX)` remains finite. Unlimited admission
+uses the same ownership, completeness, bounded-output, reservation and completion
+contracts, and every arithmetic operation remains checked. Source
 compilation reserves its own concrete destinations before expensive tokenizer,
 template, grammar/schema and semantic preparation. Runtime quotes the selected
-execution separately and atomically reserves its remaining shared-domain demand.
+execution separately and atomically reserves its remaining per-domain demand.
 The public error boundary stays backend-neutral and preserves typed causes.
+
+The CLI accepts one `--memory-limit <domain>=<bytes|unlimited>` entry per
+physical domain. `--verbose` reports coherent per-domain configured and effective
+limits, current charges, historical peaks, and accounting categories before loading
+and after generation. Placement allowances include their conservative basis and
+are distinct from measured residency. Diagnostic report containers belong to the
+caller outside admitted execution storage; observing the ledger grants no
+allocation authority or process-memory ceiling. The `host` domain includes physically
+unified accelerators; separate MLX accelerators have names such as `mlx-gpu-0`.
+For a topology reporting both names:
+
+```sh
+eredu --model /path/to/model --verbose \
+  --memory-limit host=8589934592 \
+  --memory-limit mlx-gpu-0=17179869184 \
+  "Explain physical memory domains."
+```
+
+On a unified host/accelerator topology, configure only `host`; a device name
+does not create another physical domain. Omitted domains are unlimited, and an
+explicit entry such as `--memory-limit host=unlimited` has the same capacity
+semantics. Unknown names and repeated declarations are rejected. Limits apply
+to total live domain charges across sessions sharing the process ledger.
 
 ## What the bound covers
 
-| Domain | Admission and lifetime |
+| Accounting scope | Admission and lifetime |
 | --- | --- |
 | Host preparation | Source reads/compilation, tokenizer/template outputs, grammar/controller/parser state, masks and concrete report/record destinations are paid before construction. |
 | Execution | Actual selected equations, backing, intermediates, native graph/descriptors, sampling, materialization, transfers and retained outputs are quoted before submission. |
 | Observation | Capture transformation, transport, host result and record storage are admitted with their actual schedules and geometry. |
 | Continuation | Saved native/controller/semantic state and journals require complete copy estimates and independently funded destinations. |
 | Shared storage | Exact source identities count a physical allocation once while all aliases retain its owner. |
+
+The process ledger uses backend facts to map host and accelerator locations to
+physical domains. Unified locations consume one domain's capacity; separate host
+and accelerator memory have independent limits. Independently allocated buffers
+remain distinct charges in either topology. Domain limits, allocation publication
+and ceiling succession update all participating domains in one transaction.
+
+CUDA managed allocations retain their full capacity as a conservative allowance
+in each distinct candidate domain. These allowances state a placement estimate;
+their sum is not measured residency. Transfers retain the source charge while
+reserving staging and destination charges for their overlapping lifetimes.
 
 Persistent model/cache storage, transient execution workspace and source metadata
 have different lifetimes. A scalar total is not enough to claim credit for an
@@ -66,11 +110,20 @@ capacity. A narrow view keeps its backing allocation's full capacity charged.
 Replacement state includes old/new overlap until completed retirement.
 
 Framework-managed bounds are distinct from process RSS, physical footprint and
-system memory. Application buffers and copies, allocator caches, unrelated tasks,
+system memory. Registered MLX backing stays charged through allocator cache
+retention and retires on physical eviction. Application buffers and copies, unrelated tasks,
 and opaque platform/compiler/driver internals need separate policy. Native memory
 telemetry can validate a mechanism but cannot create an enforceable upper bound.
-A safety reserve likewise cannot turn an unknown required contribution into a
+Additional headroom identifies its physical domain and cannot turn an unknown required contribution into a
 known one.
+
+`MemoryOverheadPolicy` remains a separate neutral evaluator. Inference admission
+uses workspace completeness, authenticated storage and execution evidence; an
+unlimited limit does not replace any of those requirements.
+Low-level text calls without the required admitted request return a typed
+completeness error before native input construction, observer callbacks or acquiring
+operation ownership. Controlled and uninterrupted generation enter through the
+same admitted text driver.
 
 ## Selected readout and prefill
 
@@ -118,15 +171,16 @@ handles and native descriptors remain separately priced. All output positions in
 the allowance must be covered, including nonmonotone decode growth. Independent
 span peaks cannot be added or discounted without their actual lifetime relation.
 
-The admission policy compares borrowed scalar requirements. Owning diagnostics
-are then constructed through the same funded report destination as quotation.
-Incremental admission no longer uses an uncharged clone of its full state report.
+The admission policy checks borrowed geometry and completeness facts. The ledger
+compares domain requirements with the complete live charge under one lock.
+Owning diagnostics are constructed through the same funded report destination
+as quotation, including the retained state report for incremental admission.
 The planner returns the reservation and quote; admission diagnostics are borrowed
 from the reservation and cannot escape as an independently funded copy.
-Escaping diagnostic errors keep that producer account; fixed scalar refusals need
-no unrelated payload owner. The focused report tests and the 244-case
-residual-admission checkpoint cover refusal before reservation, final-owner
-retirement and unchanged smaller-candidate classification; commands and scope are
+Escaping diagnostic errors keep that producer account; fixed typed refusals need
+no unrelated payload owner. Report and residual-admission tests cover refusal
+before reservation, final-owner retirement and smaller-candidate classification;
+commands and scope are
 in [public conformance](prepared-chat-conformance.md).
 
 A complete incremental quote may credit exact already registered decoder roots

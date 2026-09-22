@@ -17,6 +17,11 @@ pub(in crate::composition::mlx::session::model_session) struct TextWorkspaceCand
         Option<original_prepared::PreparedMediaQuoteSource>,
     pub(in crate::composition::mlx::session::model_session) paged_sources:
         Option<crate::backend::nn::workspace::ProjectedPagedSources>,
+    pub(in crate::composition::mlx::session::model_session) ordinary_publication:
+        Option<super::super::text_funding::OrdinaryPublicationPlan>,
+    // The accepted constructor context carries paid host metadata only.
+    pub(in crate::composition::mlx::session::model_session) execution_metadata:
+        Option<eredu_nn::workspace::WorkspaceContext>,
     // Last: all candidate diagnostics retire before their planning account.
     pub(in crate::composition::mlx::session::model_session) planning_metadata:
         Option<eredu_nn::workspace::HostMetadataFunding>,
@@ -29,11 +34,11 @@ pub(in crate::composition::mlx::session::model_session) struct TextWorkspaceCand
 #[cfg(test)]
 pub(super) fn plan_candidates(
     execution: &InferenceExecutionIdentity,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capabilities: &eredu_core::ModelCapabilities,
     request: AdmissionRequest,
     geometry: InferenceGeometry,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     controller: TextControllerWorkspace<'_>,
     quote: impl FnMut(InferenceGeometry) -> Result<TextWorkspaceCandidate, Error>,
 ) -> Result<(WorkingMemoryReservation, TextControllerContract), Error> {
@@ -52,32 +57,43 @@ pub(super) fn plan_candidates(
 
 pub(super) fn plan_candidates_with_handoff(
     execution: &InferenceExecutionIdentity,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capabilities: &eredu_core::ModelCapabilities,
     request: AdmissionRequest,
     geometry: InferenceGeometry,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     controller: TextControllerWorkspace<'_>,
     handoffs: &[WorkingMemoryCapacityHandoff],
     quote: impl FnMut(InferenceGeometry) -> Result<TextWorkspaceCandidate, Error>,
 ) -> Result<(WorkingMemoryReservation, TextControllerContract), Error> {
-    let (reservation, controller, accepted, native_recipe, prepared_source, paged_sources, planning_metadata) =
-        plan_candidates_with_handoff_retained(
-            execution,
-            pool,
-            capabilities,
-            request,
-            geometry,
-            capacity,
-            controller,
-            handoffs,
-            quote,
-        )?;
+    let (
+        reservation,
+        controller,
+        accepted,
+        native_recipe,
+        prepared_source,
+        paged_sources,
+        execution_metadata,
+        ordinary_publication,
+        planning_metadata,
+    ) = plan_candidates_with_handoff_retained(
+        execution,
+        pool,
+        capabilities,
+        request,
+        geometry,
+        capacity,
+        controller,
+        handoffs,
+        quote,
+    )?;
     // Preserve ordinary ownership: historical request metadata keeps no cold
     // diagnostic source pins beyond the already-created reservation.
     drop(native_recipe);
     drop(prepared_source);
     drop(paged_sources);
+    drop(execution_metadata);
+    let _ = ordinary_publication;
     drop(accepted);
     drop(planning_metadata);
     Ok((reservation, controller))
@@ -87,11 +103,11 @@ pub(super) fn plan_candidates_with_handoff(
 /// post-publication source check, then extracts accounting-only validation.
 pub(super) fn plan_candidates_with_handoff_retained(
     execution: &InferenceExecutionIdentity,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capabilities: &eredu_core::ModelCapabilities,
     request: AdmissionRequest,
     geometry: InferenceGeometry,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     controller: TextControllerWorkspace<'_>,
     handoffs: &[WorkingMemoryCapacityHandoff],
     mut quote: impl FnMut(InferenceGeometry) -> Result<TextWorkspaceCandidate, Error>,
@@ -103,6 +119,8 @@ pub(super) fn plan_candidates_with_handoff_retained(
         Option<crate::backend::nn::workspace::ResidentNativeRecipe>,
         Option<original_prepared::PreparedMediaQuoteSource>,
         Option<crate::backend::nn::workspace::ProjectedPagedSources>,
+        Option<eredu_nn::workspace::WorkspaceContext>,
+        Option<super::super::text_funding::OrdinaryPublicationPlan>,
         Option<eredu_nn::workspace::HostMetadataFunding>,
     ),
     Error,
@@ -118,13 +136,15 @@ pub(super) fn plan_candidates_with_handoff_retained(
         let mut native_recipe = None;
         let mut prepared_source = None;
         let mut paged_sources = None;
+        let mut execution_metadata = None;
+        let mut ordinary_publication = None;
         let planned = plan_prefill_incremental_with_capacity_handoff(
             execution,
             pool,
             capabilities,
             request,
             geometry,
-            capacity,
+            capacity.clone(),
             handoffs,
             |candidate| {
                 last_components = None;
@@ -133,6 +153,7 @@ pub(super) fn plan_candidates_with_handoff_retained(
                 drop(native_recipe.take());
                 drop(prepared_source.take());
                 drop(paged_sources.take());
+                drop(execution_metadata.take());
                 drop(planning_metadata.take());
                 let inspected = (|| {
                     let candidate = quote(candidate)?;
@@ -158,37 +179,82 @@ pub(super) fn plan_candidates_with_handoff_retained(
                     {
                         return Err(memory(WorkingMemoryError::IdentityMismatch));
                     }
-                    last_components = candidate.native_recipe.as_ref()
-                        .filter(|recipe| recipe.quote_components.after_seal.is_some())
-                        .map(|recipe| (candidate.quote.as_ref().expect("sealed candidate").geometry(),
-                            recipe.quote_components));
+                    last_components = candidate
+                        .native_recipe
+                        .as_ref()
+                        .map(|recipe| recipe.quote_components)
+                        .or_else(|| {
+                            candidate
+                                .ordinary_publication
+                                .as_ref()
+                                .map(|plan| plan.quote_components())
+                        })
+                        // A complete per-domain quote intentionally has no
+                        // aggregate byte amount. Retain its source diagnostics
+                        // using the successful quote, not an optional scalar.
+                        .filter(|_| candidate.quote.is_ok())
+                        .map(|components| {
+                            (
+                                candidate
+                                    .quote
+                                    .as_ref()
+                                    .expect("sealed candidate")
+                                    .geometry(),
+                                components,
+                            )
+                        });
                     if let Some(value) = last_components {
                         if initial_components.is_none() {
                             if planning_metadata.is_some() {
                                 // These scalar copies survive candidate retirement.
                                 // Give them their own small account instead of
                                 // keeping an entire rejected recipe account alive.
-                                let funding = pool.prepare_workspace_metadata(execution, capacity)
+                                let funding = pool
+                                    .prepare_workspace_metadata(execution, capacity.clone())
                                     .map_err(Error::WorkspacePlanning)?;
-                                funding.reserve_metadata(std::mem::size_of::<(
-                                    Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
-                                    Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
-                                    Option<(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)>,
-                                    Option<eredu_core::HostMetadataFunding>,
-                                    Result<(), eredu_nn::workspace::HostMetadataFundingError>,
-                                )>()).map_err(Error::WorkspacePlanning)?;
+                                funding
+                                    .reserve_metadata(std::mem::size_of::<(
+                                        Option<(
+                                            InferenceGeometry,
+                                            crate::backend::error::WorkspaceQuoteComponents,
+                                        )>,
+                                        Option<(
+                                            InferenceGeometry,
+                                            crate::backend::error::WorkspaceQuoteComponents,
+                                        )>,
+                                        Option<(
+                                            InferenceGeometry,
+                                            crate::backend::error::WorkspaceQuoteComponents,
+                                        )>,
+                                        Option<eredu_core::HostMetadataFunding>,
+                                        Result<(), eredu_nn::workspace::HostMetadataFundingError>,
+                                    )>())
+                                    .map_err(Error::WorkspacePlanning)?;
                                 diagnostic_metadata = Some(funding);
                             }
                             initial_components = Some(value);
                         }
-                        if minimum_components.as_ref().is_none_or(|(_, components): &(InferenceGeometry, crate::backend::error::WorkspaceQuoteComponents)|
-                            value.1.after_seal < components.after_seal) {
-                            minimum_components = Some(value);
+                        // Only aggregate amounts provide this report's total
+                        // ordering. A Host-domain diagnostic cannot order
+                        // candidates whose separate device charges differ.
+                        if let Some(amount) = value.1.after_seal {
+                            if minimum_components.as_ref().is_none_or(
+                                |(_, components): &(
+                                    InferenceGeometry,
+                                    crate::backend::error::WorkspaceQuoteComponents,
+                                )| {
+                                    components.after_seal.is_none_or(|prior| amount < prior)
+                                },
+                            ) {
+                                minimum_components = Some(value);
+                            }
                         }
                     }
                     native_recipe = candidate.native_recipe;
                     prepared_source = candidate.prepared_source;
                     paged_sources = candidate.paged_sources;
+                    execution_metadata = candidate.execution_metadata;
+                    ordinary_publication = candidate.ordinary_publication;
                     Ok(candidate.quote)
                 })();
                 match inspected {
@@ -224,8 +290,12 @@ pub(super) fn plan_candidates_with_handoff_retained(
             return Err(error);
         }
         let (reservation, accepted) = planned.map_err(|error| {
-            if matches!(&error, PrefillPlanningError::Reservation(
-                WorkingMemoryError::BudgetExceeded { .. })) {
+            if matches!(
+                &error,
+                PrefillPlanningError::Reservation(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
+            ) {
                 if let Some((geometry, components)) = last_components {
                     if let Some(funding) = &planning_metadata {
                         // The enclosing closed planning failure retains this
@@ -234,21 +304,30 @@ pub(super) fn plan_candidates_with_handoff_retained(
                             crate::backend::error::WorkspaceCandidateRefusal,
                             Box<crate::backend::error::WorkspaceCandidateRefusal>,
                             Result<(), eredu_nn::workspace::HostMetadataFundingError>,
-                        )>()) { return Error::WorkspacePlanning(cause); }
+                        )>()) {
+                            return Error::WorkspacePlanning(cause);
+                        }
                     }
-                    return Error::Other(Box::new(crate::backend::error::WorkspaceCandidateRefusal {
-                        geometry, components, initial: initial_components, minimum: minimum_components, cause: error,
-                        _funding: diagnostic_metadata.take(),
-                    }));
+                    return Error::Other(Box::new(
+                        crate::backend::error::WorkspaceCandidateRefusal {
+                            geometry,
+                            components,
+                            initial: initial_components,
+                            minimum: minimum_components,
+                            cause: error,
+                            _funding: diagnostic_metadata.take(),
+                        },
+                    ));
                 }
             }
             match error {
-            PrefillPlanningError::Reservation(
-                cause @ (WorkingMemoryError::SubmissionTrackingCapacity { .. }
-                | WorkingMemoryError::GraphMetadataCapacity { .. }),
-            ) => Error::PrefillControl(cause),
-            error => Error::Other(Box::new(error)),
-        }})?;
+                PrefillPlanningError::Reservation(
+                    cause @ (WorkingMemoryError::SubmissionTrackingCapacity { .. }
+                    | WorkingMemoryError::GraphMetadataCapacity { .. }),
+                ) => Error::PrefillControl(cause),
+                error => Error::Other(Box::new(error)),
+            }
+        })?;
         let (_, controller) =
             original.ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?;
         if accepted.controller_contract() != Some(&controller) {
@@ -267,6 +346,8 @@ pub(super) fn plan_candidates_with_handoff_retained(
             native_recipe,
             prepared_source,
             paged_sources,
+            execution_metadata,
+            ordinary_publication,
             planning_metadata.clone(),
         ))
     })();

@@ -1,6 +1,6 @@
 use super::*;
-use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
-use safemlx::{Device, DeviceType, Stream, ops::indexing::TryIndexOp};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
+use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType, Stream};
 use std::cell::Cell;
 
 #[derive(Debug)]
@@ -72,9 +72,12 @@ fn transient_projection_deduplicates_closed_loans_and_keeps_failed_prefix_custod
     excess.evaluated().unwrap();
     let id = root.try_allocation_info().unwrap().unwrap().identity();
     let capacity = 1 << 22;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -112,7 +115,7 @@ fn transient_projection_deduplicates_closed_loans_and_keeps_failed_prefix_custod
     ));
     drop(duplicate);
     drop((root, other, excess, context, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     let storage = destination.unwrap();
     assert_eq!(
         storage
@@ -127,9 +130,9 @@ fn transient_projection_deduplicates_closed_loans_and_keeps_failed_prefix_custod
     // account. Their enclosing state/context normally owns H; retire them while
     // this actual native storage owner still retains the same funding alias.
     drop((projected, whole));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(storage);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
@@ -159,9 +162,12 @@ fn actual_host_array_aliases_share_one_projection_root_and_retain_failed_prefix(
         let excess = Array::from_slice(&[3.0f32, 4.0], &[2]);
         excess.evaluated().unwrap();
         let capacity = 1 << 22;
-        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
         let funding = pool
-            .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+            .prepare_workspace_metadata(
+                &InferenceExecutionIdentity::default(),
+                crate::memory_fixture::resolved_limits(capacity),
+            )
             .unwrap();
         let context =
             WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -180,12 +186,10 @@ fn actual_host_array_aliases_share_one_projection_root_and_retain_failed_prefix(
                 cold(|| projection.project_host::<4>(&host)).unwrap()
             };
             assert_eq!(projection.storage().iter().len(), 1);
-            assert!(
-                projection
-                    .storage()
-                    .native_array(allocation.identity())
-                    .is_some()
-            );
+            assert!(projection
+                .storage()
+                .native_array(allocation.identity())
+                .is_some());
             assert!(Arc::ptr_eq(
                 projection
                     .storage()
@@ -204,7 +208,7 @@ fn actual_host_array_aliases_share_one_projection_root_and_retain_failed_prefix(
         };
         drop((array, host, excess, context, funding));
         assert!(weak.upgrade().is_some());
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         let storage = destination.unwrap();
         assert_eq!(
             storage
@@ -218,6 +222,10 @@ fn actual_host_array_aliases_share_one_projection_root_and_retain_failed_prefix(
         drop(symbols);
         drop(storage);
         assert!(weak.upgrade().is_none());
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

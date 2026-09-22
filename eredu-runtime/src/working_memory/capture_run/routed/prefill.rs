@@ -66,15 +66,27 @@ impl<'a> ScheduledCaptureStep<'a> {
     }
     /// Shared semantic progression acknowledges only a completed physical sparse writer.
     pub(crate) fn finish_routed_prefill_hook(
-        &mut self,index:usize,fragment:&CaptureRoutedPrefillFragment<'_,'_>,
-    )->Result<(),CaptureRunHostError>{self.finish_routed_progress(index,fragment,false)}
+        &mut self,
+        index: usize,
+        fragment: &CaptureRoutedPrefillFragment<'_, '_>,
+    ) -> Result<(), CaptureRunHostError> {
+        self.finish_routed_progress(index, fragment, false)
+    }
     /// The original partition target has no serial sparse payload; its final
     /// claim remains unavailable until all-rank assembly and delivery succeed.
     pub(crate) fn finish_partition_routed_prefill_hook(
-        &mut self,index:usize,fragment:&CaptureRoutedPrefillFragment<'_,'_>,
-    )->Result<(),CaptureRunHostError>{self.finish_routed_progress(index,fragment,true)}
-    fn finish_routed_progress(&mut self,index:usize,fragment:&CaptureRoutedPrefillFragment<'_,'_>,partition:bool)
-        ->Result<(),CaptureRunHostError>{
+        &mut self,
+        index: usize,
+        fragment: &CaptureRoutedPrefillFragment<'_, '_>,
+    ) -> Result<(), CaptureRunHostError> {
+        self.finish_routed_progress(index, fragment, true)
+    }
+    fn finish_routed_progress(
+        &mut self,
+        index: usize,
+        fragment: &CaptureRoutedPrefillFragment<'_, '_>,
+        partition: bool,
+    ) -> Result<(), CaptureRunHostError> {
         self.claim.custody.validate()?;
         let targets = self
             .frame
@@ -85,8 +97,11 @@ impl<'a> ScheduledCaptureStep<'a> {
             .slots
             .get_mut(index)
             .ok_or(CapturePrefillHostError::Target { index })?;
-        if if partition {slot.done || slot.state!=TargetState::Assembling || slot.routed.is_some()}
-            else{!slot.done || slot.state!=TargetState::Active || slot.routed.is_none()} {
+        if if partition {
+            slot.done || slot.state != TargetState::Assembling || slot.routed.is_some()
+        } else {
+            !slot.done || slot.state != TargetState::Active || slot.routed.is_none()
+        } {
             return Err(CapturePrefillHostError::Incomplete { index }.into());
         }
         let policy = crate::capture::CapturePrefillObservationPolicy::new(
@@ -200,14 +215,17 @@ impl CaptureRoutedPrefillWriter<'_, '_, '_, '_> {
             .as_mut()
             .expect("initialized routed target");
         owner.check()?;
-        let total=self.slot.routed_covered.checked_add(self.covered)
-            .filter(|n|*n<=self.fragment.source_tokens());
-        if owner.data.active.is_some() || self.covered==0 || total.is_none() {
+        let total = self
+            .slot
+            .routed_covered
+            .checked_add(self.covered)
+            .filter(|n| *n <= self.fragment.source_tokens());
+        if owner.data.active.is_some() || self.covered == 0 || total.is_none() {
             return owner.remember(Err(RoutedUnitValidationError::Incomplete.into()));
         }
-        self.slot.routed_covered=total.expect("checked source coverage");
+        self.slot.routed_covered = total.expect("checked source coverage");
         self.slot.state = TargetState::Active;
-        self.slot.done = self.slot.routed_covered==self.fragment.source_tokens();
+        self.slot.done = self.slot.routed_covered == self.fragment.source_tokens();
         self.finished = true;
         Ok(())
     }
@@ -238,10 +256,20 @@ impl<'t, 'f, 'p, 'a> CaptureRoutedPrefillWriter<'t, 'f, 'p, 'a> {
         source: WorkingMemoryStorage<K>,
     ) -> Result<CaptureRoutedPrefillTransfer<'t, 'f, 'p, 'a, 's, K>, CaptureRunHostError> {
         segment.validate_routed_prefill_fragment(self.fragment)?;
-        let rollback = self.slot.routed.as_ref().expect("initialized routed target")
-            .identity.custody.bind_segment_source(native, segment, &source)?;
-        Ok(CaptureRoutedPrefillTransfer { writer: self, source,
-            _segment: segment, native: rollback.commit() })
+        let rollback = self
+            .slot
+            .routed
+            .as_ref()
+            .expect("initialized routed target")
+            .identity
+            .custody
+            .bind_segment_source(native, segment, &source)?;
+        Ok(CaptureRoutedPrefillTransfer {
+            writer: self,
+            source,
+            _segment: segment,
+            native: rollback.commit(),
+        })
     }
 }
 impl<K: Ord + Send + 'static> CaptureRoutedPrefillTransfer<'_, '_, '_, '_, '_, K> {
@@ -251,39 +279,60 @@ impl<K: Ord + Send + 'static> CaptureRoutedPrefillTransfer<'_, '_, '_, '_, '_, K
     }
     /// Revalidate the original source origins and account around each copy.
     pub fn validate(&self) -> Result<(), CaptureRunHostError> {
-        self.writer.slot.routed.as_ref().expect("initialized routed target")
-            .identity.custody.validate_transfer(self.native, &self.source)?;
+        self.writer
+            .slot
+            .routed
+            .as_ref()
+            .expect("initialized routed target")
+            .identity
+            .custody
+            .validate_transfer(self.native, &self.source)?;
         if self.writer.slot.state == TargetState::Failed {
             return Err(CapturePrefillHostError::Identity.into());
         }
         Ok(())
     }
     /// Begin an already selected physical route; no row is allocated.
-    pub fn begin_row(&mut self, token: u64, slot: u64, expert: u64, coefficient: f32)
-        -> Result<(), CaptureRunHostError> {
+    pub fn begin_row(
+        &mut self,
+        token: u64,
+        slot: u64,
+        expert: u64,
+        coefficient: f32,
+    ) -> Result<(), CaptureRunHostError> {
         self.validate()?;
         self.writer.begin_row(token, slot, expert, coefficient)?;
         Ok(())
     }
     /// Copy one scalar into the paid row.
     pub fn push_f32(&mut self, value: f32) -> Result<(), CaptureRunHostError> {
-        self.validate()?;self.writer.push_f32(value)?;Ok(())
+        self.validate()?;
+        self.writer.push_f32(value)?;
+        Ok(())
     }
     /// Seal the initialized row.
     pub fn finish_row(&mut self) -> Result<(), CaptureRunHostError> {
-        self.validate()?;self.writer.finish_row()?;Ok(())
+        self.validate()?;
+        self.writer.finish_row()?;
+        Ok(())
     }
     /// Preserve the actual visited provider interval.
     pub fn source_chunk(&mut self, start: u64, end: u64) -> Result<(), CaptureRunHostError> {
-        self.validate()?;self.writer.source_chunk(start,end)?;Ok(())
+        self.validate()?;
+        self.writer.source_chunk(start, end)?;
+        Ok(())
     }
     /// Finish only the host copy, retaining every native obligation.
     pub fn finish(self) -> Result<(), CaptureRunHostError> {
-        self.validate()?;self.writer.finish()?;Ok(())
+        self.validate()?;
+        self.writer.finish()?;
+        Ok(())
     }
 }
 impl<K: Ord + Send + 'static> fmt::Debug for CaptureRoutedPrefillTransfer<'_, '_, '_, '_, '_, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CaptureRoutedPrefillTransfer").field("writer", &self.writer).finish_non_exhaustive()
+        f.debug_struct("CaptureRoutedPrefillTransfer")
+            .field("writer", &self.writer)
+            .finish_non_exhaustive()
     }
 }

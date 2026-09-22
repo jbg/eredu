@@ -1,7 +1,7 @@
 use super::*;
 use crate::working_memory::HostSourceConstructionFacts;
 
-fn paired(pool: &WorkingMemoryPool) -> Option<(IncrementalInferenceQuote, HostDestinationFacts)> {
+fn paired(pool: &MemoryLedger) -> Option<(IncrementalInferenceQuote, HostDestinationFacts)> {
     let host = match HostDestinationFacts::new(12, 3) {
         Ok(facts) => facts
             .with_partitions(2)
@@ -30,18 +30,17 @@ fn paired(pool: &WorkingMemoryPool) -> Option<(IncrementalInferenceQuote, HostDe
 
 #[test]
 fn paired_split_checks_both_populations_before_mutation_and_preserves_real_storage() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((quote, facts)) = paired(&pool) else {
         return;
     };
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (r, run, accepted) = accept(&pool, quote);
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     let protected = span.protected_host_bytes();
@@ -92,31 +91,31 @@ fn paired_split_checks_both_populations_before_mutation_and_preserves_real_stora
         }
     ));
     drop((tail, error, source, b_source, b, bank, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     assert_eq!(values.as_slice(), &[0x12345678, 0x87654321]);
     drop(values);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn paired_split_health_and_foreign_owner_checks_do_not_reissue_or_refund() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((quote, facts)) = paired(&pool) else {
         return;
     };
     let (r, run, accepted) = accept(&pool, quote);
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
     let mut bank = span.take_host_destinations().unwrap().unwrap();
-    let other = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let other_root = other.register_storage([(1u32, 64)]).unwrap();
+    let other = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let other_root = other.register_host_storage([(1u32, 64)]).unwrap();
     let (quote, _) = paired(&other).unwrap();
     let (or, of, oa) = accept(&other, quote);
     let (other_span, _) = oa.into_funded_text_span_workspace(&of, &or).unwrap();
     assert!(!bank.belongs_to(&other_span.control_guard()));
     assert!(bank.matches_facts(facts));
     drop((other_span, or, of, other_root));
-    assert_eq!(other.used_bytes().unwrap(), 0);
+    assert_eq!(other.payload_used_bytes().unwrap(), 0);
     drop(run);
     assert!(matches!(
         bank.split(8, 1, Some((8, 1))),
@@ -132,14 +131,14 @@ fn paired_split_health_and_foreign_owner_checks_do_not_reissue_or_refund() {
         Err(WorkingMemoryError::AlreadyStarted)
     ));
     drop((sources, bank, span, r, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn paired_prefill_binding_charges_whole_host_once_and_keeps_unknown_operations() {
     use crate::working_memory::{GraphMetadataFacts, TextPrefillScopeFacts};
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some((_, host)) = paired(&pool) else {
         return;
     };
@@ -193,5 +192,5 @@ fn paired_prefill_binding_charges_whole_host_once_and_keeps_unknown_operations()
         ))
     ));
     drop((combined, plain, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

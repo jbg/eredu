@@ -155,10 +155,7 @@ impl OriginalTokenInputBank {
     ) -> Result<(), WorkingMemoryError> {
         self.binding
             .validate(claim, preparation.request().geometry())?;
-        let actual = preparation
-            .request()
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let actual = preparation.request().memory_reservation();
         if !actual.0.same(&self.reservation.0) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }

@@ -11,13 +11,15 @@ use eredu_core::{
         SpeculativeCaptureScope, SpeculativePrefillSpan,
     },
 };
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding};
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError};
 use std::mem::{size_of, size_of_val};
 
 mod aggregate;
 pub(super) mod control;
 mod prefix;
+mod prospective;
 pub use prefix::OriginalSpeculativeCapturePrefix;
+pub use prospective::{OriginalSpeculativeCapturePreview, OriginalSpeculativeCaptureProspect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Active {
@@ -110,34 +112,14 @@ impl<'a> OriginalSpeculativeCaptureInvocation<'a> {
     /// Same selected readout predicate as the funded/cold capture worker.
     /// Context is supplied later by the actual model equation.
     pub fn requires_sequence_readout(self) -> Result<bool, CaptureProtocolError> {
-        if self.interventions.is_some_and(|(source, selected)| {
-            source
-                .plan()
-                .admission()
-                .plan()
-                .operations
-                .iter()
-                .zip(selected)
-                .any(|(operation, selected)| {
-                    *selected
-                        && operation
-                            .schedule
-                            .includes(self.capture_phase(), self.active.origin.prediction as u64)
-                })
-        }) {
-            return Ok(true);
-        }
-        CaptureObservationStep::with_invocation(
-            self.source.plan().admission(),
+        requires_sequence_readout(
+            self.source,
+            self.selected,
+            self.interventions,
             self.capture_phase(),
             self.active.origin.prediction as u64,
-            Some(CaptureInvocationShape {
-                batch: 1,
-                sequence: self.active.sequence,
-                context: None,
-            }),
-        )?
-        .requires_sequence_readout_for(self.selected)
+            self.active.sequence,
+        )
     }
     /// The shared ordinary envelope reservation, separate from physical H.
     /// Cold quotation and the funded ledger consume this same logical policy.
@@ -203,6 +185,41 @@ fn phase(phase: SpeculativeActivationPhase) -> CapturePhase {
         | SpeculativeActivationPhase::PredictionPrefill => CapturePhase::Prefill,
         _ => CapturePhase::Decode,
     }
+}
+
+pub(crate) fn requires_sequence_readout(
+    source: &OriginalCaptureSource,
+    selected: &[bool],
+    interventions: Option<(&OriginalInterventionSource, &[bool])>,
+    phase: CapturePhase,
+    prediction: u64,
+    sequence: u64,
+) -> Result<bool, CaptureProtocolError> {
+    if interventions.is_some_and(|(source, selected)| {
+        source
+            .plan()
+            .admission()
+            .plan()
+            .operations
+            .iter()
+            .zip(selected)
+            .any(|(operation, selected)| {
+                *selected && operation.schedule.includes(phase, prediction)
+            })
+    }) {
+        return Ok(true);
+    }
+    CaptureObservationStep::with_invocation(
+        source.plan().admission(),
+        phase,
+        prediction,
+        Some(CaptureInvocationShape {
+            batch: 1,
+            sequence: sequence,
+            context: None,
+        }),
+    )?
+    .requires_sequence_readout_for(selected)
 }
 
 /// A fixed or counted preparation failure retaining the source and host account.
@@ -601,7 +618,8 @@ impl OriginalSpeculativeCapture {
     /// Infallible final delivery after native completion or retained failure.
     /// Earlier invocation IDs and all source/role/capture spending remain spent.
     pub fn finish(&mut self, success: bool) {
-        self.checkpoint_ready = success && self.received.as_ref().is_some_and(|frame| frame.completed);
+        self.checkpoint_ready =
+            success && self.received.as_ref().is_some_and(|frame| frame.completed);
         self.active = None;
         self.prefix = None;
         if let Some(mut envelope) = self.received.take() {

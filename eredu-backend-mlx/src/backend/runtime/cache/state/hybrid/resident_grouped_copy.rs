@@ -1,5 +1,5 @@
 //! Actual two-level Hybrid payloads: one outer table and every fixed-role table.
-use super::fixed_slots::{Slot, copy_slot_retained};
+use super::fixed_slots::{copy_slot_retained, Slot};
 use super::*;
 use crate::backend::runtime::cache::state::ResidentDecoderPreparationError;
 use crate::backend::{
@@ -10,23 +10,24 @@ use crate::backend::{
 };
 use eredu_nn::workspace::{WorkspaceBackend, WorkspaceContext, WorkspaceTraceReport};
 use eredu_runtime::{
-    HostSlotMetadata, SharedStateLayout,
     working_memory::{
-        FundedDecoderSlots, InferenceRetention, WorkingMemoryError, WorkingMemoryPool,
+        FundedDecoderSlots, InferenceRetention, MemoryLedger, WorkingMemoryError,
         WorkspaceConcatStateFactory, WorkspaceResidentLayerState,
     },
+    HostSlotMetadata, SharedStateLayout,
 };
 use std::{cell::RefCell, num::NonZeroU32};
 
 mod dense;
 mod frozen;
+mod original_paged;
 mod paged;
-use paged::PreparedPagedStorageCopy;
 pub(crate) use dense::{
     InitializedHybridDenseGroup, PreparedDenseHybridGroupedState, PreparedHybridDenseGroup,
     PublishedDenseHybridGroupedState,
 };
 pub(crate) use frozen::{InitializedHybridGroupCopy, PreparedHybridGroupHostCopy};
+use paged::PreparedPagedStorageCopy;
 
 fn other(e: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::Other(Box::new(e))
@@ -89,6 +90,19 @@ pub(crate) struct SavedHybridGroupedCopy {
     protected: u64,
 }
 impl SavedHybridGroupedCopy {
+    pub(crate) fn continuation_bounds(&self, additional: u64) -> Option<(u64, u64)> {
+        Some((
+            MlxHybridState::layer_capacity_bound(
+                self.layers.iter().map(|layer| layer.attention.as_ref()),
+                additional,
+            )?,
+            MlxHybridState::layer_auxiliary_growth(
+                self.layers.iter().map(|layer| layer.attention.as_ref()),
+                additional,
+            )?,
+        ))
+    }
+
     pub(crate) fn prepare_copy(&self) -> Result<PreparedHybridGroupedCopy<'_>, Error> {
         self.prepare_copy_fixed()
             .map_err(ResidentDecoderPreparationError::into_error)

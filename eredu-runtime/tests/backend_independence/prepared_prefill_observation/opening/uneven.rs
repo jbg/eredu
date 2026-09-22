@@ -4,7 +4,10 @@ use super::*;
 struct Chunked(OrdinaryTextFixture);
 impl ArchitectureParameters<FakeBackend> for Chunked {
     type DefinitionError = Error;
-    fn state_layout(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<StateLayout, Error> {
+    fn state_layout(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<StateLayout, Error> {
         self.0.state_layout(metadata)
     }
     fn state_identity(
@@ -15,7 +18,10 @@ impl ArchitectureParameters<FakeBackend> for Chunked {
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
         self.0.state_identity(s, t, metadata)
     }
-    fn parameter_description(&self, c: &()) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
+    fn parameter_description(
+        &self,
+        c: &(),
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Error> {
         self.0.parameter_description(c)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<FakeBackend>>(
@@ -56,10 +62,19 @@ impl LayeredArchitecture<FakeBackend, State> for Chunked {
     fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
         self.0.execution_graph()
     }
-    fn group_unit_count(&self, g: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+    fn group_unit_count(
+        &self,
+        g: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Error> {
         self.0.group_unit_count(g, metadata_context)
     }
-    fn unit_path(&self, g: usize, i: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+    fn unit_path(
+        &self,
+        g: usize,
+        i: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Error> {
         self.0.unit_path(g, i, metadata_context)
     }
     fn static_modules(&self) -> &FakeOperator {
@@ -232,7 +247,7 @@ fn opening_state_tracks_real_uneven_chunks_and_nonzero_cached_frontier() {
         prefill_chunk_positions: 2,
         output: OutputDemand::LastPosition,
     };
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -281,5 +296,5 @@ fn opening_state_tracks_real_uneven_chunks_and_nonzero_cached_frontier() {
     assert_eq!(counters.snapshot().forward_calls, 3);
     scopes.settled();
     drop((observer, request, session));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

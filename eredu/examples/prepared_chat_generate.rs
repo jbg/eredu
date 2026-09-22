@@ -1,11 +1,16 @@
 //! Ordinary, source-funded semantic chat with optional authenticated host media.
 //!
-//! prepared_chat_generate CHECKPOINT REQUEST.json CAPACITY_BYTES [DEVICE]
+//! prepared_chat_generate CHECKPOINT REQUEST.json MEMORY_LIMITS [DEVICE]
 //! DEVICE defaults to metal:0. Output is one committed semantic event per line.
 //! Caller-owned JSON, processed host arrays and output I/O are outside the
 //! framework allocation domain; every framework copy uses the retained source.
-use anyhow::{Context, ensure};
-use eredu::api::{ChatSourceInput, LoadedModel, PreparedChatGenerationSettings, PreparedChatRequest, TokenizerSourceInput};
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
+use anyhow::{ensure, Context};
+use eredu::api::{
+    ChatSourceInput, LoadedModel, PreparedChatGenerationSettings, PreparedChatRequest,
+    TokenizerSourceInput,
+};
 use eredu::runtime::chat::{ChatTemplateRequest, ToolChoice};
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
@@ -82,13 +87,12 @@ impl Tensor {
 }
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "prepared_chat_generate CHECKPOINT REQUEST.json CAPACITY_BYTES [DEVICE]";
+    let usage = "prepared_chat_generate CHECKPOINT REQUEST.json MEMORY_LIMITS [DEVICE]";
     let checkpoint = PathBuf::from(args.next().context(usage)?);
     let input = File::open(args.next().context(usage)?)?;
-    let capacity: u64 = args.next().context(usage)?.parse()?;
+    let capacity = physical_memory::parse(&args.next().context(usage)?)?;
     let device = args.next().unwrap_or_else(|| "metal:0".into());
     ensure!(args.next().is_none(), "{usage}");
-    ensure!(capacity > 0, "capacity must be positive");
     let request: Request = serde_json::from_reader(input)?;
     ensure!(request.max_tokens > 0, "max_tokens must be positive");
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", device)?);
@@ -119,7 +123,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, capacity, &cancellation)?
+        .prepare_chat(&source, &policy, &capacity, &cancellation)?
         .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -128,14 +132,14 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: capacity.clone(),
             prefill_chunk_positions: request.prefill_chunk_positions,
             ..Default::default()
         },
         seed: request.seed,
         ..Default::default()
     };
-    let mut generation = PreparedChatRequest::new(&chat, settings);
+    let mut generation = PreparedChatRequest::new(&chat, settings.clone());
     generation.stop_sequences = &request.stop_sequences;
     if !request.prepared_parts.is_empty() {
         // These small borrowing views remain application-owned. The public
@@ -163,7 +167,8 @@ fn main() -> anyhow::Result<()> {
             })
             .collect();
         generation.input = eredu::api::PreparedChatPrompt::Media(
-            model.prepare_chat_input(&chat, &parts, &cancellation)?
+            model
+                .prepare_chat_input(&chat, &parts, &cancellation)?
                 .context("cancelled before media preparation")?,
         );
     }

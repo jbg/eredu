@@ -13,13 +13,15 @@ size_t transports() noexcept {
       sizeof(StreamRegistrationOwner) + 2 * sizeof(mlx_gpu_stream_target) +
       2 * sizeof(mlx_stream) + 2 * sizeof(Stream*) + sizeof(Stream) +
       sizeof(Cause) * 2 + sizeof(void*) + sizeof(void (*)(void*)) +
-      sizeof(std::shared_ptr<void>);
+      sizeof(std::shared_ptr<void>) + sizeof(bool);
 }
-Cause target(mlx_gpu_stream_target value) noexcept {
+Cause target(mlx_gpu_stream_target value, bool retained = false) noexcept {
   const auto device = metal::borrow_initialized_device(value.device_identity);
   if (device == metal::DeviceInitializationCause::busy) return Cause::busy;
   if (device != metal::DeviceInitializationCause::success) return Cause::identity_mismatch;
-  const auto scheduler = scheduler::borrow_initialized_scheduler(value.scheduler_identity);
+  const auto scheduler = retained
+      ? scheduler::borrow_retained_scheduler(value.scheduler_identity)
+      : scheduler::borrow_initialized_scheduler(value.scheduler_identity);
   if (scheduler == scheduler::SchedulerInitializationCause::busy) return Cause::busy;
   return scheduler == scheduler::SchedulerInitializationCause::success
       ? Cause::success : Cause::identity_mismatch;
@@ -72,7 +74,7 @@ extern "C" unsigned mlx_stream_register_gpu(mlx_stream* out,
 extern "C" unsigned mlx_stream_gpu_registration_borrow(mlx_stream stream,
     const void* owner, mlx_gpu_stream_target selected) {
   if (!stream.ctx || !owner) return unsigned(Cause::invalid);
-  const auto authenticated = target(selected);
+  const auto authenticated = target(selected, true);
   if (authenticated != Cause::success) return unsigned(authenticated);
   const auto& value = *static_cast<const Stream*>(stream.ctx);
   if (value.device != Device::gpu) return unsigned(Cause::identity_mismatch);
@@ -83,7 +85,7 @@ extern "C" unsigned mlx_stream_gpu_registration_borrow(mlx_stream stream,
 extern "C" unsigned mlx_stream_gpu_registration_observe_idle(mlx_stream stream,
     const void* owner, mlx_gpu_stream_target selected) {
   if (!stream.ctx || !owner) return unsigned(Cause::invalid);
-  const auto authenticated = target(selected);
+  const auto authenticated = target(selected, true);
   if (authenticated != Cause::success) return unsigned(authenticated);
   const auto& value = *static_cast<const Stream*>(stream.ctx);
   if (value.device != Device::gpu) return unsigned(Cause::identity_mismatch);

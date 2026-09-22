@@ -1,5 +1,5 @@
 use super::*;
-use crate::generation::{payload_copy_count, SamplerProjectionError};
+use crate::generation::{SamplerProjectionError, payload_copy_count};
 use crate::working_memory::sampling::request::quote_sampling_workspace_legacy;
 
 type Trace = Rc<RefCell<Vec<(String, Vec<WorkspaceLayout>, Vec<WorkspaceLayout>)>>>;
@@ -382,7 +382,7 @@ fn static_policy_comparison_allows_new_limits_without_resetting_history_or_adapt
         max_new_tokens: Some(4),
     };
     let initial = TextGenerationConfig::new(controls);
-    let mut standard = ConfiguredTextSampler::from_config(initial).unwrap();
+    let mut standard = ConfiguredTextSampler::from_config(initial.clone()).unwrap();
     let ConfiguredTextSampler::Standard(policy) = &mut standard else {
         unreachable!()
     };
@@ -397,7 +397,7 @@ fn static_policy_comparison_allows_new_limits_without_resetting_history_or_adapt
         .with_seed(99)
         .with_inference_policy(TextInferencePolicy {
             prefill_chunk_positions: std::num::NonZeroU64::new(1),
-            managed_memory_capacity_bytes: Some(9999),
+            memory_limits: crate::working_memory::memory_fixture::host_limits(9999),
             submission_tracking_capacity_bytes: None,
             graph_metadata_capacity_bytes: None,
         });
@@ -415,7 +415,7 @@ fn static_policy_comparison_allows_new_limits_without_resetting_history_or_adapt
         }
         assert!(!standard.matches_config_policy(TextGenerationConfig::new(changed)));
     }
-    let adaptive_config = initial.with_mirostat_v2(3.7, 0.23).unwrap();
+    let adaptive_config = initial.clone().with_mirostat_v2(3.7, 0.23).unwrap();
     let mut adaptive = ConfiguredTextSampler::from_config(adaptive_config).unwrap();
     let ConfiguredTextSampler::MirostatV2(policy) = &mut adaptive else {
         unreachable!()
@@ -429,17 +429,19 @@ fn static_policy_comparison_allows_new_limits_without_resetting_history_or_adapt
     let candidate = TextGenerationConfig::new(future)
         .with_mirostat_v2(3.7, 0.23)
         .unwrap();
-    assert!(adaptive.matches_config_policy(candidate));
-    assert!(!standard.matches_config_policy(candidate));
-    assert!(!adaptive.matches_config_policy(initial));
-    assert!(!adaptive.matches_config_policy(initial.with_mirostat_v2(4.7, 0.23).unwrap()));
-    assert!(!adaptive.matches_config_policy(initial.with_mirostat_v2(3.7, 0.33).unwrap()));
+    assert!(adaptive.matches_config_policy(candidate.clone()));
+    assert!(!standard.matches_config_policy(candidate.clone()));
+    assert!(!adaptive.matches_config_policy(initial.clone()));
+    assert!(!adaptive.matches_config_policy(initial.clone().with_mirostat_v2(4.7, 0.23).unwrap()));
+    assert!(!adaptive.matches_config_policy(initial.clone().with_mirostat_v2(3.7, 0.33).unwrap()));
     future.frequency_penalty = 0.5;
-    assert!(!adaptive.matches_config_policy(
-        TextGenerationConfig::new(future)
-            .with_mirostat_v2(3.7, 0.23)
-            .unwrap()
-    ));
+    assert!(
+        !adaptive.matches_config_policy(
+            TextGenerationConfig::new(future)
+                .with_mirostat_v2(3.7, 0.23)
+                .unwrap()
+        )
+    );
     let ConfiguredTextSampler::MirostatV2(policy) = &adaptive else {
         unreachable!()
     };

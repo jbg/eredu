@@ -4,8 +4,8 @@ use std::{
     cell::{Cell, RefCell},
     error::Error as _,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -169,7 +169,7 @@ fn repeated_reseed_errors_keep_sources_and_leave_sampling_and_tokens_unchanged()
             output_mode: eredu::api::PreparedChatOutputMode::Semantic,
             skip_special_tokens: true,
             drafting: SpeculativeDraft::Embedded,
-            settings,
+            settings: settings.clone(),
             options: Default::default(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),

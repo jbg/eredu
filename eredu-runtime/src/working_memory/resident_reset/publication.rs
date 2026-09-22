@@ -34,7 +34,7 @@ pub(crate) struct PublicationBinding {
     layout: crate::HostMetadataKey,
     global_start: usize,
     execution: InferenceExecutionIdentity,
-    control: Arc<()>,
+    control: crate::replicated_session::ParameterControlIdentity,
     revision: Option<super::super::InferenceStateRevision>,
 }
 impl PublicationBinding {
@@ -57,7 +57,7 @@ impl PublicationBinding {
                 .clone(),
             global_start: source.state.resident_reset_global_start(),
             execution: source.execution.clone(),
-            control: Arc::clone(source.control),
+            control: source.control.clone(),
             revision: source.revision.cloned(),
         }
     }
@@ -82,7 +82,7 @@ impl PublicationBinding {
                     .registry_key()
             && self.global_start == source.state.resident_reset_global_start()
             && Arc::ptr_eq(&self.execution.0, &source.execution.0)
-            && Arc::ptr_eq(&self.control, source.control)
+            && self.control.matches(source.control)
             && self.revision.as_ref() == source.revision
     }
     pub(crate) fn matches_state<S: ResidentTableResetState>(&self, state: &S) -> bool {
@@ -169,30 +169,42 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
             .checked_add(u64::try_from(host).ok()?)
     }
 
-    /// One original comparison, then preparation of the native host-retirement
-    /// slot and the fixed empty destination. Failed construction drops the empty
-    /// prepared owner outside Usage while its own same-account custody survives.
-    pub fn construct_for_publication<T, P>(
+    /// Complete fixed host demand for the reversible parameter publication slot.
+    pub fn parameter_publication_required_bytes<P: ResidentResetPublicationProfile>(
+        &self,
+    ) -> Option<u64> {
+        self.publication_required_bytes::<P>()?
+            .checked_add(parameter_exchange_bytes::<S>()?)
+    }
+
+    /// Host-only empty-state construction for an enclosing parameter publication.
+    /// The backend validates its actual idle session source and selected executable;
+    /// this creates no token, native allocation, or submission authority. Existing
+    /// table/layout pins and the reset account use the same worker as explicit reset.
+    pub fn construct_for_parameter_publication<T, P>(
         mut self,
         session: &T,
-        claim: SessionResetClaim<'_>,
-        pool: &WorkingMemoryPool,
+        execution: &InferenceExecutionIdentity,
+        limits: &eredu_core::MemoryLimits,
+        pool: &MemoryLedger,
     ) -> Result<(ResidentResetInstallation<S>, P), ResidentResetError<S>>
     where
         T: ResidentResetSession<S>,
         P: ResidentResetPublicationProfile,
     {
         self.bytes = self
-            .publication_required_bytes::<P>()
+            .parameter_publication_required_bytes::<P>()
             .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
-        let (state, prepared) =
-            self.construct_prepared(session, claim, pool, |source, custody| {
-                PreparedPublication {
-                    binding: PublicationBinding::new(source),
-                    owner: P::prepare(ResidentResetPublicationCustody(custody.clone())),
-                    custody: custody.clone(),
-                }
-            })?;
+        let (state, prepared) = self.construct_prepared(
+            session,
+            ResetRequest::Parameter { execution, limits },
+            pool,
+            |source, custody| PreparedPublication {
+                binding: PublicationBinding::new(source),
+                owner: P::prepare(ResidentResetPublicationCustody(custody.clone())),
+                custody: custody.clone(),
+            },
+        )?;
         Ok((
             ResidentResetInstallation {
                 state,
@@ -202,4 +214,135 @@ impl<'a, S: ResidentTableResetState, K: HostSlotStorageKey> PreparedResidentKvRe
             prepared.owner,
         ))
     }
+
+    /// One original comparison, then preparation of the native host-retirement
+    /// slot and the fixed empty destination. Failed construction drops the empty
+    /// prepared owner outside Usage while its own same-account custody survives.
+    pub fn construct_for_publication<T, P>(
+        mut self,
+        session: &T,
+        claim: SessionResetClaim<'_>,
+        pool: &MemoryLedger,
+    ) -> Result<(ResidentResetInstallation<S>, P), ResidentResetError<S>>
+    where
+        T: ResidentResetSession<S>,
+        P: ResidentResetPublicationProfile,
+    {
+        self.bytes = self
+            .publication_required_bytes::<P>()
+            .ok_or_else(|| ResidentResetError::rejected(WorkingMemoryError::Overflow))?;
+        let (state, prepared) = self.construct_prepared(
+            session,
+            ResetRequest::Session(claim),
+            pool,
+            |source, custody| PreparedPublication {
+                binding: PublicationBinding::new(source),
+                owner: P::prepare(ResidentResetPublicationCustody(custody.clone())),
+                custody: custody.clone(),
+            },
+        )?;
+        Ok((
+            ResidentResetInstallation {
+                state,
+                binding: prepared.binding,
+                custody: prepared.custody,
+            },
+            prepared.owner,
+        ))
+    }
+}
+
+/// Move-only reversible empty state for a prepared parameter transaction. Both
+/// table identities and revisions are retained before publication; the first
+/// exchange preserves the complete displaced state and prompt owner for rollback.
+/// This owner grants no native execution or completion permission.
+pub struct PreparedParameterStateReset<S: ResidentTableResetState> {
+    pub(crate) state: S,
+    pub(crate) prompt: Option<crate::SharedPreparedInputCacheIdentity>,
+    binding: PublicationBinding,
+    destination_table: crate::HostMetadataKey,
+    destination_revision: Option<super::super::InferenceStateRevision>,
+    pub(crate) exchanged: bool,
+    _custody: ResetCustody,
+}
+impl<S: ResidentTableResetState> PreparedParameterStateReset<S> {
+    /// Exact retained prompt owner displaced by the reversible exchange.
+    pub fn shared_prompt_input_identity(&self) -> Option<&crate::SharedPreparedInputCacheIdentity> {
+        self.prompt.as_ref()
+    }
+    pub(crate) fn from_installation(value: ResidentResetInstallation<S>) -> Self {
+        let destination_table = value
+            .state
+            .resident_reset_layers()
+            .metadata()
+            .identity()
+            .registry_key()
+            .clone();
+        let destination_revision = value
+            .state
+            .inference_retention()
+            .initialized_revision()
+            .cloned();
+        Self {
+            state: value.state,
+            prompt: None,
+            binding: value.binding,
+            destination_table,
+            destination_revision,
+            exchanged: false,
+            _custody: value.custody,
+        }
+    }
+    pub(crate) fn matches(&self, source: &ResidentResetSource<'_, S>) -> bool {
+        if !self.exchanged {
+            return self.binding.matches(source);
+        }
+        // The enclosing publication separately authenticates its current checked
+        // generation. A rollback restores the exact prepared table, never an
+        // arbitrary saved state sharing an executable or parameter label.
+        self.binding.state == std::ptr::from_ref(source.state).addr()
+            && self.binding.selected == std::ptr::from_ref(source.selected).addr()
+            && self.binding.layout
+                == *source
+                    .state
+                    .resident_reset_layout()
+                    .identity()
+                    .registry_key()
+            && self.binding.global_start == source.state.resident_reset_global_start()
+            && self.binding.execution.same_execution(source.execution)
+            && self.binding.control.same_owner(source.control)
+            && self.destination_table
+                == *source
+                    .state
+                    .resident_reset_layers()
+                    .metadata()
+                    .identity()
+                    .registry_key()
+            && self.destination_revision.as_ref() == source.revision
+    }
+}
+fn parameter_exchange_bytes<S: ResidentTableResetState>() -> Option<u64> {
+    let frames = [
+        size_of::<PreparedParameterStateReset<S>>(),
+        size_of::<
+            Result<
+                PreparedParameterStateReset<S>,
+                (WorkingMemoryError, ResidentResetInstallation<S>),
+            >,
+        >(),
+        size_of::<Option<crate::SharedPreparedInputCacheIdentity>>(),
+        size_of::<crate::HostMetadataKey>(),
+        size_of::<Option<super::super::InferenceStateRevision>>(),
+        size_of::<Result<(), WorkingMemoryError>>(),
+        size_of::<(
+            &ResidentResetSource<'_, S>,
+            &mut PreparedParameterStateReset<S>,
+        )>(),
+    ];
+    u64::try_from(
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)?,
+    )
+    .ok()
 }

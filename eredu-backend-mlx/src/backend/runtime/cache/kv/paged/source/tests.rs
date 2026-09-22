@@ -1,6 +1,6 @@
 use super::*;
 use eredu_nn::workspace::{WorkspaceMechanisms, WorkspaceOperation, WorkspaceOperationBound};
-use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use safemlx::{Device, DeviceType};
 use std::cell::Cell;
 
@@ -98,9 +98,12 @@ fn paged_source_keeps_exact_sealed_blocks_tail_rank_and_paid_geometry_after_reti
         [(0, 2), (2, 4)]
     );
     let capacity = 1 << 22;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -172,25 +175,28 @@ fn paged_source_keeps_exact_sealed_blocks_tail_rank_and_paid_geometry_after_reti
         )
     ));
     drop((context, funding, cache, stale, manager, foreign, ids));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     assert_eq!(geometry.blocks[1].id.start, 2);
     drop(geometry);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.fixture_host_charge().unwrap() > 0,
         "escaped source failure retains its independently paid host owner"
     );
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
-
 
 #[test]
 #[ignore = "requires native CPU cache producers"]
 fn pinned_paged_projection_keeps_aliases_canonical_leases_and_failed_source_custody() {
-    use crate::backend::runtime::cache::residency::{CacheBlockArrays, CacheResidencyError, CacheSourceFailureCause};
+    use crate::backend::runtime::cache::residency::{
+        CacheBlockArrays, CacheResidencyError, CacheSourceFailureCause,
+    };
     use eredu_runtime::CacheLifecycleError;
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let options = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap().with_full_attention(true);
+    let options = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+        .unwrap()
+        .with_full_attention(true);
     let manager = CacheResidencyManager::new(options.clone()).unwrap();
     let mut cache = PagedKeyValueCache::new_with_layout(manager.clone(), 3, None, 0, None).unwrap();
     let keys = Array::from_slice(&[1.25f32, 2.5, 3.75, 5.0, 6.25], &[1, 1, 5, 1]);
@@ -199,12 +205,22 @@ fn pinned_paged_projection_keeps_aliases_canonical_leases_and_failed_source_cust
     settle(&cache);
     let report = manager.report().unwrap();
     let capacity = 1 << 23;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
-    let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity).unwrap();
-    let context = WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
-    let bound = cold(|| cache.with_workspace_source(&context, |source| {
-        source.device_projection_control_bytes(&context)
-    })).unwrap() + PagedKeyValueCache::device_projection_loan_control_bytes().unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
+        .unwrap();
+    let context =
+        WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
+    let bound = cold(|| {
+        cache.with_workspace_source(&context, |source| {
+            source.device_projection_control_bytes(&context)
+        })
+    })
+    .unwrap()
+        + PagedKeyValueCache::device_projection_loan_control_bytes().unwrap();
     let before = context.metadata_census().unwrap().context_bytes();
     let projected = cold(|| cache.project_device_workspace(&context)).unwrap();
     assert!(context.metadata_census().unwrap().context_bytes() - before <= bound);
@@ -213,50 +229,93 @@ fn pinned_paged_projection_keeps_aliases_canonical_leases_and_failed_source_cust
     assert_eq!(projected.blocks()[0][0].layout().shape(), &[1, 1, 2, 1]);
     assert_eq!(projected.tail().unwrap()[0].layout().shape(), &[1, 1, 1, 1]);
     let second = cold(|| cache.project_device_workspace(&context)).unwrap();
-    cold(|| cache.with_workspace_source(&context, |source| {
-        projected.validate_source(&source, &context)?;
-        second.validate_source(&source, &context)
-    })).unwrap();
+    cold(|| {
+        cache.with_workspace_source(&context, |source| {
+            projected.validate_source(&source, &context)?;
+            second.validate_source(&source, &context)
+        })
+    })
+    .unwrap();
     for (identity, bytes, _) in projected.storage().iter() {
         let other = second.storage().native_array(identity).unwrap();
-        assert_eq!(other.try_allocation_info().unwrap().unwrap().bytes() as u64, bytes);
+        assert_eq!(
+            other.try_allocation_info().unwrap().unwrap().bytes() as u64,
+            bytes
+        );
     }
     assert_eq!(manager.report().unwrap().demand_hits, report.demand_hits);
-    assert_eq!(manager.report().unwrap().demand_misses, report.demand_misses);
+    assert_eq!(
+        manager.report().unwrap().demand_misses,
+        report.demand_misses
+    );
     let id = projected.geometry().blocks[0].id.clone();
-    assert!(matches!(manager.remove_block(&id), Err(CacheResidencyError::Lifecycle(CacheLifecycleError::BlockLeased(_)))));
+    assert!(matches!(
+        manager.remove_block(&id),
+        Err(CacheResidencyError::Lifecycle(
+            CacheLifecycleError::BlockLeased(_)
+        ))
+    ));
     drop(second);
-    assert!(matches!(manager.remove_block(&id), Err(CacheResidencyError::Lifecycle(CacheLifecycleError::BlockLeased(_)))));
+    assert!(matches!(
+        manager.remove_block(&id),
+        Err(CacheResidencyError::Lifecycle(
+            CacheLifecycleError::BlockLeased(_)
+        ))
+    ));
 
     // A real sealed native integer cache is a valid source, but the selected
     // workspace tensor representation refuses Int64. Pins accepted before the
     // import remain in the typed failure until the caller retires it.
     let unsupported_manager = CacheResidencyManager::new(options).unwrap();
-    let unsupported_id = unsupported_manager.seal_block(3, 0, 2, None, CacheBlockArrays::KeyValue {
-        keys: Array::from_slice(&[7i64, 13], &[1, 1, 2, 1]),
-        values: Array::from_slice(&[17i64, 19], &[1, 1, 2, 1]),
-    }, false).unwrap();
-    let unsupported = PagedKeyValueCache::new_with_layout(unsupported_manager.clone(), 3, None, 0, None).unwrap();
+    let unsupported_id = unsupported_manager
+        .seal_block(
+            3,
+            0,
+            2,
+            None,
+            CacheBlockArrays::KeyValue {
+                keys: Array::from_slice(&[7i64, 13], &[1, 1, 2, 1]),
+                values: Array::from_slice(&[17i64, 19], &[1, 1, 2, 1]),
+            },
+            false,
+        )
+        .unwrap();
+    let unsupported =
+        PagedKeyValueCache::new_with_layout(unsupported_manager.clone(), 3, None, 0, None).unwrap();
     let failure = match cold(|| unsupported.project_device_workspace(&context)) {
         Err(error) => error,
         Ok(_) => panic!("unsupported projection must refuse"),
     };
-    assert!(matches!(failure.cause().cause(), CacheSourceFailureCause::Projection(
-        crate::backend::nn::workspace::ProjectionSourceError::Dtype(Dtype::Int64)
-    )));
-    assert!(matches!(unsupported_manager.remove_block(&unsupported_id), Err(CacheResidencyError::Lifecycle(CacheLifecycleError::BlockLeased(_)))));
+    assert!(matches!(
+        failure.cause().cause(),
+        CacheSourceFailureCause::Projection(
+            crate::backend::nn::workspace::ProjectionSourceError::Dtype(Dtype::Int64)
+        )
+    ));
+    assert!(matches!(
+        unsupported_manager.remove_block(&unsupported_id),
+        Err(CacheResidencyError::Lifecycle(
+            CacheLifecycleError::BlockLeased(_)
+        ))
+    ));
     // The manager is unlocked even while an escaped failure retains its pin.
-    unsupported.with_workspace_source(&context, |_| Ok(())).unwrap();
+    unsupported
+        .with_workspace_source(&context, |_| Ok(()))
+        .unwrap();
     drop((cache, unsupported, context, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(projected);
     manager.remove_block(&id).unwrap();
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(failure);
     unsupported_manager.remove_block(&unsupported_id).unwrap();
     drop((manager, unsupported_manager));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[path = "tests/append.rs"]
 mod append;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

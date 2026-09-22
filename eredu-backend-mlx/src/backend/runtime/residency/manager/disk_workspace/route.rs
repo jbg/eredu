@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::backend::runtime::residency::manager::{
-    ResidencySources, ResidentTransferResources, materialization::PreparedResidentArrays,
+    materialization::PreparedResidentArrays, ResidencySources, ResidentTransferResources,
 };
 use std::thread::ThreadId;
 

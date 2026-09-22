@@ -126,7 +126,11 @@ fn write_deepseek_config_fixture(directory: &Path, config: serde_json::Value, co
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor MlxTensor,
+        ) {
             let name = metadata.id().to_string();
             let shape = parameter.as_array().shape().to_vec();
             let value = if self.components {
@@ -166,16 +170,19 @@ fn write_deepseek_config_fixture(directory: &Path, config: serde_json::Value, co
     };
     architecture
         .static_modules()
-        .visit_parameters(&mut collector);
+        .visit_parameters(&mut collector)
+        .unwrap();
     for layer in 0..usize::try_from(args.num_hidden_layers).unwrap() {
         eredu_architectures::deepseek::block::V3Block::<Backend>::new(&args, layer, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
     }
     for depth in 0..usize::try_from(args.num_nextn_predict_layers).unwrap() {
         eredu_architectures::deepseek::mtp::V3PredictionLayer::<Backend>::new(&args, depth, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
     }
     let mut arrays = Vec::new();
     let width = args.moe_intermediate_size;
@@ -424,7 +431,11 @@ fn write_gemma_fixture(directory: &Path) {
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor MlxTensor,
+        ) {
             let parameter = parameter.as_array();
             let value = if metadata.id().as_str().ends_with("norm.weight") {
                 Array::ones::<f32>(parameter.shape(), self.stream).unwrap()
@@ -443,7 +454,8 @@ fn write_gemma_fixture(directory: &Path) {
         crate::backend::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
-    .visit_parameters(&mut collector);
+    .visit_parameters(&mut collector)
+    .unwrap();
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
             crate::backend::nn::shared::MlxNeuralBackend,
@@ -456,7 +468,8 @@ fn write_gemma_fixture(directory: &Path) {
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
         }
     }
     let arrays = collector.arrays;

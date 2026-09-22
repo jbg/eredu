@@ -30,7 +30,15 @@ impl AdmittedInterventionPlan {
         dtype: InterventionDtype,
         destination: &mut ResolvedCaptureSlice,
     ) -> Result<(), InterventionGeometryError> {
-        self.resolve_prepared_geometry(index, phase, prediction, None, shape, dtype, destination)
+        self.resolve_prepared_geometry(
+            index,
+            phase,
+            prediction,
+            None,
+            shape,
+            Some(dtype),
+            destination,
+        )
     }
     /// Resolve the same shared slice/payload worker for one admitted physical
     /// invocation. The caller must separately authenticate its source and role.
@@ -50,7 +58,35 @@ impl AdmittedInterventionPlan {
             prediction,
             Some(invocation),
             shape,
-            dtype,
+            Some(dtype),
+            destination,
+        )
+    }
+    /// Resolve an admitted routing action into the same fixed slice destination.
+    /// Routing actions carry expert IDs or scores, never a dense activation dtype.
+    pub fn resolve_prepared_routing_at(
+        &self,
+        index: usize,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+        shape: &[u64],
+        destination: &mut ResolvedCaptureSlice,
+    ) -> Result<(), InterventionGeometryError> {
+        if self
+            .points
+            .get(index)
+            .is_none_or(|point| point.routing.is_none())
+        {
+            return Err(InterventionGeometryError::Coordinate);
+        }
+        self.resolve_prepared_geometry(
+            index,
+            phase,
+            prediction,
+            invocation,
+            shape,
+            None,
             destination,
         )
     }
@@ -61,7 +97,7 @@ impl AdmittedInterventionPlan {
         prediction: u64,
         invocation: Option<CaptureInvocationShape>,
         shape: &[u64],
-        dtype: InterventionDtype,
+        dtype: Option<InterventionDtype>,
         destination: &mut ResolvedCaptureSlice,
     ) -> Result<(), InterventionGeometryError> {
         use InterventionGeometryError as E;
@@ -69,7 +105,7 @@ impl AdmittedInterventionPlan {
         let point = self.points.get(index).ok_or(E::Coordinate)?;
         if prediction >= self.request.max_predictions
             || !operation.schedule.includes(phase, prediction)
-            || operation.action.dtype() != Some(dtype)
+            || operation.action.dtype() != dtype
         {
             return Err(E::Coordinate);
         }

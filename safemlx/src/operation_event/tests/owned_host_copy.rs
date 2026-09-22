@@ -1,9 +1,9 @@
 use super::*;
-use crate::array::{OwnedHostCopyCause, OwnedHostCopyPlan, OwnedHostCopyStrategy};
 use crate::PreparedInputRuntime;
+use crate::array::{OwnedHostCopyCause, OwnedHostCopyPlan, OwnedHostCopyStrategy};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 struct SourceCustody(Arc<AtomicUsize>);
@@ -276,9 +276,10 @@ fn owning_host_buffer_is_borrowed_before_native_loan_and_retired_after_copy_or_r
         } else {
             plan.unwrap()
         };
-        assert!(plan
-            .control_bytes_with_buffer::<SourceCustody, FixedBuffer>()
-            .is_some());
+        assert!(
+            plan.control_bytes_with_buffer::<SourceCustody, FixedBuffer>()
+                .is_some()
+        );
         let arena = PreparedSubmissionGraphQuota::try_new(
             plan.facts().metadata_bytes(),
             SourceCustody(source_retired.clone()),

@@ -1,0 +1,150 @@
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/backend/cpu/fp8_task.h"
+ // Copyright © 2023 Apple Inc.
+ 
+ #include "mlx/backend/cpu/quantize_storage.h"
+@@ -1594,35 +1595,8 @@
+   auto& encoder = cpu::get_command_encoder(stream());
+   encoder.set_input_array(in);
+   encoder.set_output_array(out);
+-  encoder.dispatch([in = array::unsafe_weak_copy(in),
+-                    out = array::unsafe_weak_copy(out),
+-                    to_fp8 = to_fp8_]() mutable {
+-    if (to_fp8) {
+-      switch (in.dtype()) {
+-        case float16:
+-          unary_op<float16_t, uint8_t>(in, out, detail::ToFP8());
+-          break;
+-        case bfloat16:
+-          unary_op<bfloat16_t, uint8_t>(in, out, detail::ToFP8());
+-          break;
+-        default:
+-          unary_op<float, uint8_t>(in, out, detail::ToFP8());
+-          break;
+-      }
+-    } else {
+-      switch (out.dtype()) {
+-        case float16:
+-          unary_op<uint8_t, float16_t>(in, out, detail::FromFP8());
+-          break;
+-        case bfloat16:
+-          unary_op<uint8_t, bfloat16_t>(in, out, detail::FromFP8());
+-          break;
+-        default:
+-          unary_op<uint8_t, float>(in, out, detail::FromFP8());
+-          break;
+-      }
+-    }
+-  });
++  encoder.dispatch(ConvertFP8Task{array::unsafe_weak_copy(in),
++      array::unsafe_weak_copy(out), to_fp8_});
+ }
+ 
+ void QQMatmul::eval_cpu(const ArrayVector& inputs, array& out) {
+diff --git a/mlx/backend/cpu/unary.cpp b/mlx/backend/cpu/unary.cpp
+--- a/mlx/backend/cpu/unary.cpp
++++ b/mlx/backend/cpu/unary.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/backend/cpu/fp8_task.h"
+ // Copyright © 2024 Apple Inc.
+ 
+ // Required for using M_LN2 in MSVC.
+@@ -299,6 +300,8 @@
+ bool unary_dispatch_storage(UnaryEvalKind selected, Dtype dtype, size_t rank,
+     EvalDispatchStorage& out) noexcept {
+   switch (selected) {
++    case UnaryEvalKind::from_fp8:
++      return dtype == float32 && unary_task_storage<ConvertFP8Task>(rank, out);
+ #define FLOATING(Kind, Op) case UnaryEvalKind::Kind: return floating_dtype(dtype, false) && unary_task_storage<UnaryFloatingTask<::mlx::core::detail::Op>>(rank, out);
+     FLOATING(exponential, Exp)
+     FLOATING(expm1, Expm1)
+diff --git a/mlx/backend/cpu/unary_storage.h b/mlx/backend/cpu/unary_storage.h
+--- a/mlx/backend/cpu/unary_storage.h
++++ b/mlx/backend/cpu/unary_storage.h
+@@ -7,7 +7,7 @@
+ // permission. Native construction matches the actual primitive, dtype and shape.
+ enum class UnaryEvalKind {
+   exponential, expm1, log, log2, log10, log1p, sigmoid, tanh, sine, cosine,
+-  sqrt, rsqrt, square, negative, erf, logical_not, absolute, round
++  sqrt, rsqrt, square, negative, erf, logical_not, absolute, round, from_fp8
+ };
+ struct UnaryEvalStorage : SingleOutputEvalStorage {
+   UnaryEvalKind kind{UnaryEvalKind::exponential};
+diff --git a/mlx/backend/cpu/unary_storage.cpp b/mlx/backend/cpu/unary_storage.cpp
+--- a/mlx/backend/cpu/unary_storage.cpp
++++ b/mlx/backend/cpu/unary_storage.cpp
+@@ -1,5 +1,6 @@
+ #include "mlx/backend/cpu/unary_storage.h"
+ #include "mlx/primitives.h"
++#include "mlx/fast_primitives.h"
+ #include "mlx/submission.h"
+ #include <climits>
+ #include <typeinfo>
+@@ -37,6 +38,10 @@
+       case Log::Base::ten: out = UnaryEvalKind::log10; return true;
+     }
+   }
++  if (typeid(primitive) == typeid(fast::ConvertFP8) &&
++      !static_cast<const fast::ConvertFP8&>(primitive).state()) {
++    out = UnaryEvalKind::from_fp8; return true;
++  }
+   return false;
+ }
+ } // namespace
+@@ -68,7 +73,10 @@
+   if (!is_unary_eval_primitive(output) || !kind(output.primitive(), selected) ||
+       !output.siblings().empty() || output.inputs().size() != 1) return false;
+   const auto& input = output.inputs()[0];
+-  if (input.dtype() != output.dtype() || input.shape() != output.shape()) return false;
++  if (input.shape() != output.shape() ||
++      (selected == UnaryEvalKind::from_fp8
++          ? (input.dtype() != uint8 || output.dtype() != float32)
++          : input.dtype() != output.dtype())) return false;
+   size_t size = 1;
+   for (auto dimension : input.shape()) {
+     if (dimension < 0 || (dimension && size > size_t(PTRDIFF_MAX) / size_t(dimension))) return false;
+diff --git a/mlx/backend/cpu/fp8_task.h b/mlx/backend/cpu/fp8_task.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/fp8_task.h
+@@ -0,0 +1,37 @@
++#pragma once
++#include "mlx/backend/cpu/unary.h"
++#include "mlx/backend/cpu/unary_ops.h"
++namespace mlx::core {
++// The ordinary conversion task, shared with its exact prospective layout.
++struct ConvertFP8Task {
++  array in, out;
++  bool to_fp8;
++  void operator()() {
++    if (to_fp8) {
++      switch (in.dtype()) {
++        case float16:
++          unary_op<float16_t, uint8_t>(in, out, detail::ToFP8());
++          break;
++        case bfloat16:
++          unary_op<bfloat16_t, uint8_t>(in, out, detail::ToFP8());
++          break;
++        default:
++          unary_op<float, uint8_t>(in, out, detail::ToFP8());
++          break;
++      }
++    } else {
++      switch (out.dtype()) {
++        case float16:
++          unary_op<uint8_t, float16_t>(in, out, detail::FromFP8());
++          break;
++        case bfloat16:
++          unary_op<uint8_t, bfloat16_t>(in, out, detail::FromFP8());
++          break;
++        default:
++          unary_op<uint8_t, float>(in, out, detail::FromFP8());
++          break;
++      }
++    }
++  }
++};
++} // namespace mlx::core

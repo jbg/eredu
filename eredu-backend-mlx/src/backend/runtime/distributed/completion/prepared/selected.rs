@@ -1,15 +1,19 @@
 //! Paid source selection and deep host retention before any native submission.
 use super::*;
 impl PreparedCompletionResources<'_, '_> {
-    fn selection_controls(&self)->Result<(),Error> {
+    /// Fixed source-selection transports used by the retained group/route
+    /// worker. Source validation and the selected deep copy are separate.
+    pub(crate) fn selection_control_bytes()->Option<usize> {
         let parts=[size_of::<(&Self,usize)>(),size_of::<Result<(),Error>>(),
             size_of::<Option<(&Group,&eredu_runtime::CommunicationGroupDescriptor,bool)>>(),
             size_of::<Option<(&CommunicationRouteRealization,&eredu_runtime::CommunicationRouteDescriptor,bool)>>(),
             size_of::<Result<Group,TryReserveError>>(),
             size_of::<Result<CommunicationRouteRealization,TryReserveError>>(),
-            size_of::<Option<usize>>(),error_control_bytes().ok_or_else(overflow)?];
-        self.custody.funding.reserve_metadata(parts.into_iter()
-            .try_fold(size_of_val(&parts),usize::checked_add).ok_or_else(overflow)?)
+            size_of::<Option<usize>>(),error_control_bytes()?];
+        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+    }
+    fn selection_controls(&self)->Result<(),Error> {
+        self.custody.funding.reserve_metadata(Self::selection_control_bytes().ok_or_else(overflow)?)
             .map_err(Error::WorkspacePlanning)?;
         self.source.validate()
     }

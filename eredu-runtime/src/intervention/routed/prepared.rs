@@ -1,9 +1,7 @@
 //! Original source custody around the ordinary sparse lowering worker.
 use super::*;
 use crate::working_memory::OriginalInterventionSource;
-use eredu_nn::workspace::{
-    WorkspaceContext, HostMetadataFunding, HostMetadataFundingError,
-};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError, WorkspaceContext};
 use std::mem::{size_of, size_of_val};
 use worker::{Allocation, RoutedInterventionLoweringError as Geometry, RowKey};
 
@@ -43,6 +41,7 @@ pub struct PreparedRoutedInterventionRows {
     source_tokens: u64,
     source_range: [u64; 2],
     logical_origin: u64,
+    receipt_source: Option<(u64, [u64; 2])>,
     expected_rows: usize,
     failed: Option<Geometry>,
     operation: usize,
@@ -58,8 +57,8 @@ pub struct PreparedRoutedInterventionRows {
 pub struct PreparedRoutedIntervention {
     lowered: LoweredRoutedIntervention,
     local: ResolvedCaptureSlice,
-    source_tokens:u64,
-    source_range:[u64;2],
+    source_tokens: u64,
+    source_range: [u64; 2],
     operation: usize,
     phase: CapturePhase,
     prediction: u64,
@@ -87,6 +86,58 @@ impl PreparedRoutedInterventionRows {
         source_tokens: u64,
         source_range: [u64; 2],
         actual_rows: usize,
+        funding: HostMetadataFunding,
+    ) -> Result<Self, PreparedRoutedInterventionError> {
+        Self::prepare_source(
+            source,
+            operation,
+            phase,
+            prediction,
+            invocation,
+            window,
+            source_tokens,
+            source_range,
+            actual_rows,
+            None,
+            funding,
+        )
+    }
+    /// The exact canonical scheduled window supplies physical native row
+    /// coordinates and full-prompt receipt coordinates without a model role.
+    pub fn prepare_scheduled_prefill(
+        source: &OriginalInterventionSource,
+        operation: usize,
+        span: crate::intervention::InterventionPrefillWindow,
+        source_range: [u64; 2],
+        actual_rows: usize,
+        funding: HostMetadataFunding,
+    ) -> Result<Self, PreparedRoutedInterventionError> {
+        let physical = span.physical();
+        Self::prepare_source(
+            source,
+            operation,
+            CapturePhase::Prefill,
+            0,
+            None,
+            Some(span.window()),
+            physical.sequence,
+            source_range,
+            actual_rows,
+            Some(span),
+            funding,
+        )
+    }
+    fn prepare_source(
+        source: &OriginalInterventionSource,
+        operation: usize,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+        window: Option<CaptureInvocationWindow>,
+        source_tokens: u64,
+        source_range: [u64; 2],
+        actual_rows: usize,
+        scheduled: Option<crate::intervention::InterventionPrefillWindow>,
         funding: HostMetadataFunding,
     ) -> Result<Self, PreparedRoutedInterventionError> {
         let result: Result<_, Cause> = (|| {
@@ -121,7 +172,28 @@ impl PreparedRoutedInterventionRows {
             {
                 return Err(Geometry::Coordinates.into());
             }
-            let (logical, logical_origin, logical_tokens) = if let Some(window) = window {
+            let receipt_source = if let Some(span) = scheduled {
+                span.validate(plan).map_err(|_| Geometry::Coordinates)?;
+                if invocation.is_some() || phase != CapturePhase::Prefill || prediction != 0 {
+                    return Err(Geometry::Coordinates.into());
+                }
+                Some((
+                    span.logical_positions(),
+                    [
+                        span.range()[0]
+                            .checked_add(source_range[0])
+                            .ok_or(Geometry::Overflow)?,
+                        span.range()[0]
+                            .checked_add(source_range[1])
+                            .ok_or(Geometry::Overflow)?,
+                    ],
+                ))
+            } else {
+                None
+            };
+            let (logical, logical_origin, logical_tokens) = if let Some(span) = scheduled {
+                (None, span.range()[0], span.logical_positions())
+            } else if let Some(window) = window {
                 let physical = invocation.ok_or(Geometry::Coordinates)?;
                 if physical
                     .batch
@@ -167,16 +239,17 @@ impl PreparedRoutedInterventionRows {
             }
             worker::validate_slice(geometry, &selected)?;
             let rows = funding.metadata_vec(actual_rows)?;
-            Ok((selected, rows, geometry, logical_origin))
+            Ok((selected, rows, geometry, logical_origin, receipt_source))
         })();
         match result {
-            Ok((selected, rows, geometry, logical_origin)) => Ok(Self {
+            Ok((selected, rows, geometry, logical_origin, receipt_source)) => Ok(Self {
                 selected,
                 rows,
                 geometry,
                 source_tokens,
                 source_range,
                 logical_origin,
+                receipt_source,
                 expected_rows: actual_rows,
                 failed: None,
                 operation,
@@ -255,8 +328,10 @@ impl PreparedRoutedInterventionRows {
             funding,
             source_tokens,
             source_range,
+            receipt_source,
             ..
         } = self;
+        let (source_tokens, source_range) = receipt_source.unwrap_or((source_tokens, source_range));
         let result: Result<_, Cause> = (|| {
             if let Some(cause) = failed {
                 return Err(cause.into());
@@ -294,7 +369,8 @@ impl PreparedRoutedInterventionRows {
             Ok((lowered, local)) => Ok(PreparedRoutedIntervention {
                 lowered,
                 local,
-                source_tokens,source_range,
+                source_tokens,
+                source_range,
                 operation,
                 phase,
                 prediction,
@@ -367,6 +443,8 @@ impl PreparedRoutedInterventionRows {
             size_of::<std::ops::Range<usize>>(),
             size_of::<[usize; 4]>(),
             size_of::<Self>(),
+            size_of::<Option<crate::intervention::InterventionPrefillWindow>>(),
+            size_of::<Option<(u64, [u64; 2])>>(),
             size_of::<PreparedRoutedIntervention>(),
             size_of::<PreparedRoutedInterventionError>(),
             size_of::<Cause>(),
@@ -453,7 +531,10 @@ fn slice_destination(
         Ok(values)
     };
     Ok(ResolvedCaptureSlice {
-        starts: vector()?, ends: vector()?, strides: vector()?, shape: vector()?,
+        starts: vector()?,
+        ends: vector()?,
+        strides: vector()?,
+        shape: vector()?,
     })
 }
 impl PreparedRoutedIntervention {
@@ -466,7 +547,9 @@ impl PreparedRoutedIntervention {
         (self.operation, self.phase, self.prediction)
     }
     /// Actual physical source extent and chunk consumed by the scalar reader.
-    pub fn source_chunk(&self)->(u64,[u64;2]){(self.source_tokens,self.source_range)}
+    pub fn source_chunk(&self) -> (u64, [u64; 2]) {
+        (self.source_tokens, self.source_range)
+    }
     /// Native flattened indices in original native row order.
     pub fn indices(&self) -> &[u64] {
         &self.lowered.indices

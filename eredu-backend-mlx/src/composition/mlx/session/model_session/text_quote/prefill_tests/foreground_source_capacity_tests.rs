@@ -28,7 +28,7 @@ fn foreground_source_capacity_refuses_another_request_in_the_same_pool() {
         &mut prepared,
         |controls, _observer, current_pool, bank, reservation| {
             assert!(bank.is_none());
-            assert!(current_pool.same_domain(&pool));
+            assert!(current_pool.same_ledger(&pool));
             assert!(matches!(
                 old.validate_reservation(reservation),
                 Err(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)

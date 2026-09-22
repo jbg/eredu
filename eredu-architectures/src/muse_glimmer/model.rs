@@ -55,21 +55,45 @@ pub(crate) fn vision_group_transport(
 
 /// Exact flattened patch or projected-media wire geometry for a vision edge.
 pub(crate) fn vision_partition_boundary_schema(
-    args: &DecoderConfig, continuation: bool,
+    args: &DecoderConfig,
+    continuation: bool,
     metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
 ) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
     use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
     let destination = crate::composite_execution::graph::Destination(metadata);
-    destination.controls::<(&DecoderConfig, bool, [Dim; 2], eredu_runtime::BoundaryTensorSpec,
-        eredu_runtime::BoundaryWireSchema, Vec<eredu_runtime::BoundaryTensorSpec>)>()?;
-    let vision = args.vision_config.as_ref().ok_or_else(|| destination.error(format_args!(
-        "Muse vision boundary has no vision configuration")))?;
-    let primary = destination.boundary_spec("hidden", &[
-        Dim::Sequence, Dim::Fixed(if continuation { vision.hidden_size } else { args.hidden_size }),
-    ], Dtype::Activation)?;
+    destination.controls::<(
+        &DecoderConfig,
+        bool,
+        [Dim; 2],
+        eredu_runtime::BoundaryTensorSpec,
+        eredu_runtime::BoundaryWireSchema,
+        Vec<eredu_runtime::BoundaryTensorSpec>,
+    )>()?;
+    let vision = args.vision_config.as_ref().ok_or_else(|| {
+        destination.error(format_args!(
+            "Muse vision boundary has no vision configuration"
+        ))
+    })?;
+    let primary = destination.boundary_spec(
+        "hidden",
+        &[
+            Dim::Sequence,
+            Dim::Fixed(if continuation {
+                vision.hidden_size
+            } else {
+                args.hidden_size
+            }),
+        ],
+        Dtype::Activation,
+    )?;
     destination.boundary_schema(
-        if continuation { "muse.vision_continuation" } else { "muse.vision_to_decoder" },
-        primary, destination.vector(0)?,
+        if continuation {
+            "muse.vision_continuation"
+        } else {
+            "muse.vision_to_decoder"
+        },
+        primary,
+        destination.vector(0)?,
     )
 }
 
@@ -144,6 +168,8 @@ impl<T> PreparedCompositeIngress<T> {
     }
 }
 
+use crate::media_plan::original::MuseInputPartRef;
+
 /// Interprets one admitted Muse-Glimmer input using neutral tensor operations.
 pub fn prepare_composite_ingress<B>(
     input: PreparedCompositeInput<'_, B::Tensor, MuseGlimmerInputPartPlan>,
@@ -152,45 +178,63 @@ pub fn prepare_composite_ingress<B>(
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
+    let metadata = crate::decoder::ModuleMetadata::destination(input.metadata());
+    metadata.controls::<(
+        PreparedCompositeInput<'_, B::Tensor, MuseGlimmerInputPartPlan>,
+        PreparedCompositeIngress<B::Tensor>,
+        B::Tensor,
+        usize,
+        i32,
+        u32,
+    )>()?;
     let prepared = input.prepared();
-    let admitted = input
-        .admitted()
-        .ordinary()
-        .expect("this family retains ordinary admission");
-    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
-        return Err(Error::backend(
-            "Muse-Glimmer prepared input no longer matches its admission",
-        ));
-    }
-
-    let mut tokens = Vec::with_capacity(prepared.len());
-    let mut media = Vec::with_capacity(prepared.len());
-    let mut pixels = Vec::new();
-    let mut grid = Vec::new();
-    for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
+    let admitted = input.admitted();
+    let mut tokens = metadata.vector(prepared.len())?;
+    let mut media = metadata.vector(prepared.len())?;
+    let mut pixels = metadata.vector(prepared.len())?;
+    let grid_len = admitted.muse_parts().try_fold(0usize, |total, part| {
+        let count = match part {
+            MuseInputPartRef::Vision { grid, .. } => grid.iter().len(),
+            _ => 0,
+        };
+        total
+            .checked_add(count)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)
+    })?;
+    let mut grid = metadata.vector(grid_len)?;
+    for (part, plan) in prepared.parts().iter().zip(admitted.muse_parts()) {
         match plan {
-            MuseGlimmerInputPartPlan::TextTokens { .. } => {
+            MuseInputPartRef::TextTokens { .. } => {
                 let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
-                    return Err(Error::backend(
-                        "Muse-Glimmer admitted text part lost its token payload",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "Muse-Glimmer admitted text part lost its token payload"
+                    )));
                 };
                 tokens.push(value.clone());
                 media.push(false);
             }
-            MuseGlimmerInputPartPlan::Vision { ingress, .. } => {
+            MuseInputPartRef::Vision {
+                placeholder_count,
+                placeholder_token_id,
+                grid: rows,
+                ..
+            } => {
                 let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
-                    return Err(Error::backend(
-                        "Muse-Glimmer admitted media part lost its tensor payload",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "Muse-Glimmer admitted media part lost its tensor payload"
+                    )));
                 };
-                let count = i32::try_from(ingress.placeholder_count)
-                    .map_err(|_| Error::backend("Muse-Glimmer media span exceeds I32"))?;
-                let token = ingress.placeholder_token_id;
-                tokens.push(B::Tensor::full_u32(token, &[1, count], context)?);
+                let count = i32::try_from(placeholder_count).map_err(|_| {
+                    metadata.error(format_args!("Muse-Glimmer media span exceeds I32"))
+                })?;
+                tokens.push(B::Tensor::full_u32(
+                    placeholder_token_id,
+                    &[1, count],
+                    context,
+                )?);
                 media.push(true);
                 pixels.push(value.clone());
-                grid.extend_from_slice(&ingress.patch_grid);
+                grid.extend(rows.iter());
             }
         }
     }
@@ -220,15 +264,19 @@ where
         self.args.clone()
     }
 
-    fn external_assistant_target_profile_ref(config:&Self::AdmissionConfig)
-        ->Option<crate::external_assistant::ExternalAssistantTargetProfileRef<'_>> {
+    fn external_assistant_target_profile_ref(
+        config: &Self::AdmissionConfig,
+    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfileRef<'_>> {
         Some(crate::external_assistant::ExternalAssistantTargetProfileRef::MuseGlimmer(config))
     }
 
     fn external_assistant_target_profile(
         config: &Self::AdmissionConfig,
     ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
-        Some(crate::external_assistant::ExternalAssistantTargetProfileRef::MuseGlimmer(config).to_owned())
+        Some(
+            crate::external_assistant::ExternalAssistantTargetProfileRef::MuseGlimmer(config)
+                .to_owned(),
+        )
     }
 
     fn admit_prepared_input(
@@ -250,11 +298,8 @@ where
         group != 0
             || input
                 .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
-                .any(|part| matches!(part, MuseGlimmerInputPartPlan::Vision { .. }))
+                .muse_parts()
+                .any(|part| matches!(part, MuseInputPartRef::Vision { .. }))
     }
 
     fn prepared_group_boundary_sequence(
@@ -265,24 +310,17 @@ where
         let positions = if group == 0 {
             input
                 .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
+                .muse_parts()
                 .filter_map(|part| match part {
-                    MuseGlimmerInputPartPlan::Vision { ingress, .. } => {
-                        Some(ingress.placeholder_count)
-                    }
+                    MuseInputPartRef::Vision {
+                        placeholder_count, ..
+                    } => Some(placeholder_count),
                     _ => None,
                 })
                 .try_fold(0_u64, |total, positions| total.checked_add(positions))
                 .ok_or_else(|| "Muse projected media positions overflowed".to_owned())?
         } else {
-            input
-                .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .decoder_positions()
+            input.admitted().decoder_positions()
         };
         i32::try_from(positions)
             .map_err(|_| "Muse prepared boundary sequence exceeds i32".to_owned())
@@ -298,16 +336,13 @@ where
         }
         let patches = input
             .admitted()
-            .ordinary()
-            .expect("this family retains ordinary admission")
-            .parts()
-            .iter()
+            .muse_parts()
             .filter_map(|part| match part {
-                MuseGlimmerInputPartPlan::Vision { ingress, .. } => Some(&ingress.patch_grid),
+                MuseInputPartRef::Vision { grid, .. } => Some(grid.iter()),
                 _ => None,
             })
             .flatten()
-            .try_fold(0_u64, |total, &(time, height, width)| {
+            .try_fold(0_u64, |total, (time, height, width)| {
                 [time, height, width]
                     .into_iter()
                     .try_fold(1_u64, |product, value| {
@@ -337,21 +372,39 @@ where
     }
 
     fn partition_boundary_schema(
-        &self, source_group: usize, destination_group: usize,
+        &self,
+        source_group: usize,
+        destination_group: usize,
         _selected: &eredu_runtime::ResolvedBoundaryWireSchema,
-        batch: i32, source_sequence: i32, _group_sequences: &[i32],
+        batch: i32,
+        source_sequence: i32,
+        _group_sequences: &[i32],
         continuation: Option<(i32, i32)>,
         metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
         let destination = crate::composite_execution::graph::Destination(metadata);
-        destination.controls::<(&Self, usize, usize, i32, i32, Option<(i32, i32)>,
-            eredu_runtime::BoundaryWireSchema, Option<eredu_runtime::ResolvedBoundaryWireSchema>)>()?;
+        destination.controls::<(
+            &Self,
+            usize,
+            usize,
+            i32,
+            i32,
+            Option<(i32, i32)>,
+            eredu_runtime::BoundaryWireSchema,
+            Option<eredu_runtime::ResolvedBoundaryWireSchema>,
+        )>()?;
         if source_group != 0 || !matches!(destination_group, 0 | 1) {
             return Ok(None);
         }
         let sequence = continuation.map_or(source_sequence, |(sequence, _)| sequence);
-        let schema = vision_partition_boundary_schema(&self.args, source_group == destination_group, metadata)?;
-        destination.resolve_boundary(&schema, batch, &[sequence]).map(Some)
+        let schema = vision_partition_boundary_schema(
+            &self.args,
+            source_group == destination_group,
+            metadata,
+        )?;
+        destination
+            .resolve_boundary(&schema, batch, &[sequence])
+            .map(Some)
     }
 
     fn accept_partition_boundary(
@@ -391,11 +444,21 @@ where
         // Muse-Glimmer's vision blocks and projector are replicated equations.
         // Under TP+PP they still execute on every tensor rank, but emit no tensor
         // collective; the explicit empty waves keep that fact architecture-owned.
-        let destination=crate::composite_execution::graph::Destination(context);
-        destination.controls::<(&Self,usize,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,
-            usize,usize,Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>)>()?;
-        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 { return Ok(None); }
-        destination.collect((0..pipeline_stages).map(|_| Vec::new())).map(Some)
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<(
+            &Self,
+            usize,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+            usize,
+            usize,
+            Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>,
+        )>()?;
+        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
+            return Ok(None);
+        }
+        destination
+            .collect((0..pipeline_stages).map(|_| Vec::new()))
+            .map(Some)
     }
 
     fn prepared_primary_ingress_collectives(
@@ -404,19 +467,17 @@ where
         tensor_partitions: usize,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, Error> {
-        let destination=crate::composite_execution::graph::Destination(context);
-        destination.controls::<(&Self,PreparedCompositeInput<'_,B::Tensor,Self::InputPartPlan>,usize)>()?;
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<(
+            &Self,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+            usize,
+        )>()?;
         crate::composite_execution::segmented_token_ingress_collectives_in(
-            input
-                .admitted()
-                .ordinary()
-                .expect("this family retains ordinary admission")
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    MuseGlimmerInputPartPlan::TextTokens { positions } => Some(*positions),
-                    MuseGlimmerInputPartPlan::Vision { .. } => None,
-                }),
+            input.admitted().muse_parts().filter_map(|part| match part {
+                MuseInputPartRef::TextTokens { positions } => Some(positions),
+                MuseInputPartRef::Vision { .. } => None,
+            }),
             self.args.hidden_size,
             tensor_partitions,
             destination,
@@ -448,7 +509,12 @@ where
         forward: &Self::ForwardContext,
         observed: Vec<B::Tensor>,
     ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
-        external_capture(request, forward, observed, crate::decoder::ModuleMetadata::ordinary())
+        external_capture(
+            request,
+            forward,
+            observed,
+            crate::decoder::ModuleMetadata::ordinary(),
+        )
     }
 
     fn external_prediction_capture_with_metadata(
@@ -457,7 +523,12 @@ where
         observed: Vec<B::Tensor>,
         context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Error> {
-        external_capture(request, forward, observed, crate::decoder::ModuleMetadata::funded(context))
+        external_capture(
+            request,
+            forward,
+            observed,
+            crate::decoder::ModuleMetadata::funded(context),
+        )
     }
 
     fn external_prediction_target_operation(
@@ -709,18 +780,36 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 {
     type DefinitionError = Error;
 
-    fn state_layout(&self,metadata:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<StateLayout,Self::DefinitionError>{
-        match (metadata,&self.parallel_geometry){
-            (Some(context),Some(geometry))=>geometry.state_layout().clone_workspace(context),
-            (Some(context),None)=>super::graph::state_layout_with_metadata(&self.args,context),
-            (None,_)=>self.state_layout_impl(),
+    fn state_layout(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<StateLayout, Self::DefinitionError> {
+        match (metadata, &self.parallel_geometry) {
+            (Some(context), Some(geometry)) => geometry.state_layout().clone_workspace(context),
+            (Some(context), None) => super::graph::state_layout_with_metadata(&self.args, context),
+            (None, _) => self.state_layout_impl(),
         }
     }
-    fn state_identity(&self,state:&eredu_runtime::PartitionState,topology:eredu_core::cache::PromptCacheTopology,metadata:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<eredu_runtime::ModelStateIdentity,Self::DefinitionError>{
-        super::state_identity_in(&self.args,state.layout(),state.global_layer_offset(),topology,crate::decoder::identity::Metadata::new(metadata))
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        super::state_identity_in(
+            &self.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+            crate::decoder::identity::Metadata::new(metadata),
+        )
     }
-    fn parameter_description(&self,context:&<B::Tensor as Tensor>::Context)->Result<std::borrow::Cow<'_,ArchitectureParameterDescription>,Self::DefinitionError>{
-        self.parameter_description_impl(B::construction_metadata(context)).map(std::borrow::Cow::Owned)
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        self.parameter_description_impl(B::construction_metadata(context))
+            .map(std::borrow::Cow::Owned)
     }
 
     fn static_parameter_recipes(
@@ -931,42 +1020,119 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Describes pinned multimodal modules and each vision/text graph unit with
     /// explicit neutral ownership.
-    fn parameter_description_impl(&self,context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<ArchitectureParameterDescription,Error>{
-        use crate::decoder::parameter_metadata::{DeclarationDestination,ParameterGroupError};
-        let context=context.filter(|context|context.uses_checked_metadata());
-        let destination=DeclarationDestination(context);
-        let metadata=crate::decoder::identity::Metadata::new(context);
-        metadata.controls::<(&Self,[usize;2],ExecutionGraph,ExecutionUnitLayout,Vec<OwnedParameterGroupSpec>,Vec<eredu_runtime::ParameterGroupSpec>,ParameterGroupOwner,ArchitectureParameterDescription,eredu_runtime::ExecutionGroupId,std::ops::Range<usize>,Vec<(eredu_runtime::ExecutionGroupId,usize)>,Vec<String>)>()?;
-        let graph=match context{Some(context)=>self.execution_graph.clone_with_metadata(context)?,None=>self.execution_graph.clone()};
-        let counts=[self.args.vision_config.as_ref().map_or(0,|vision|vision.layer_count()),self.args.num_hidden_layers as usize];
-        let layout=match context{Some(context)=>ExecutionUnitLayout::new_with_metadata(&graph,&counts,context)?,None=>ExecutionUnitLayout::new(&graph,counts).map_err(Error::backend)?};
-        let text_static=super::parallel::static_parameter_groups_in(&self.args,destination).map_err(ParameterGroupError::into_neural)?;
-        let vision_static=super::parallel::vision_static_parameter_groups_in(&self.args,destination).map_err(ParameterGroupError::into_neural)?;
-        let mut owned=metadata.vector(text_static.len()+vision_static.len())?;
-        for (index,group) in text_static.into_iter().enumerate(){
-            let owner=if index==0 && self.args.tie_word_embeddings {
-                let mut roles=metadata.vector(2)?;roles.push(metadata.text("embedding")?);roles.push(metadata.text("output")?);ParameterGroupOwner::StaticAnyOf(roles)
-            }else{ParameterGroupOwner::static_role(metadata.text(match index{0=>"embedding",1=>"norm",_=>"output"})?)};
-            owned.push(OwnedParameterGroupSpec::new(owner,group));
+    fn parameter_description_impl(
+        &self,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        use crate::decoder::parameter_metadata::{DeclarationDestination, ParameterGroupError};
+        let context = context.filter(|context| context.uses_checked_metadata());
+        let destination = DeclarationDestination(context);
+        let metadata = crate::decoder::identity::Metadata::new(context);
+        metadata.controls::<(
+            &Self,
+            [usize; 2],
+            ExecutionGraph,
+            ExecutionUnitLayout,
+            Vec<OwnedParameterGroupSpec>,
+            Vec<eredu_runtime::ParameterGroupSpec>,
+            ParameterGroupOwner,
+            ArchitectureParameterDescription,
+            eredu_runtime::ExecutionGroupId,
+            std::ops::Range<usize>,
+            Vec<(eredu_runtime::ExecutionGroupId, usize)>,
+            Vec<String>,
+        )>()?;
+        let graph = match context {
+            Some(context) => self.execution_graph.clone_with_metadata(context)?,
+            None => self.execution_graph.clone(),
+        };
+        let counts = [
+            self.args
+                .vision_config
+                .as_ref()
+                .map_or(0, |vision| vision.layer_count()),
+            self.args.num_hidden_layers as usize,
+        ];
+        let layout = match context {
+            Some(context) => ExecutionUnitLayout::new_with_metadata(&graph, &counts, context)?,
+            None => ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?,
+        };
+        let text_static = super::parallel::static_parameter_groups_in(&self.args, destination)
+            .map_err(ParameterGroupError::into_neural)?;
+        let vision_static =
+            super::parallel::vision_static_parameter_groups_in(&self.args, destination)
+                .map_err(ParameterGroupError::into_neural)?;
+        let mut owned = metadata.vector(text_static.len() + vision_static.len())?;
+        for (index, group) in text_static.into_iter().enumerate() {
+            let owner = if index == 0 && self.args.tie_word_embeddings {
+                let mut roles = metadata.vector(2)?;
+                roles.push(metadata.text("embedding")?);
+                roles.push(metadata.text("output")?);
+                ParameterGroupOwner::StaticAnyOf(roles)
+            } else {
+                ParameterGroupOwner::static_role(metadata.text(match index {
+                    0 => "embedding",
+                    1 => "norm",
+                    _ => "output",
+                })?)
+            };
+            owned.push(OwnedParameterGroupSpec::new(owner, group));
         }
-        let copy_id=|id:&eredu_runtime::ExecutionGroupId|eredu_runtime::ExecutionGroupId::new(metadata.text(id.as_str())?).map_err(|cause|metadata.source(cause));
+        let copy_id = |id: &eredu_runtime::ExecutionGroupId| {
+            eredu_runtime::ExecutionGroupId::new(metadata.text(id.as_str())?)
+                .map_err(|cause| metadata.source(cause))
+        };
         metadata.borrowed_controls(&copy_id)?;
         for group in vision_static {
-            let indices=super::parallel::vision_static_consumer_units(&self.args,group.members()[0].target()).expect("declared Muse vision static group has consumers");
-            let mut consumers=metadata.vector(indices.len())?;
-            for index in indices {consumers.push((copy_id(layout.group_id(0).expect("Muse vision group"))?,index));}
-            let owner=ParameterGroupOwner::StaticUnitConsumers{role:metadata.text("vision")?,consumers};
-            owned.push(OwnedParameterGroupSpec::new(owner,group));
+            let indices = super::parallel::vision_static_consumer_units(
+                &self.args,
+                group.members()[0].target(),
+            )
+            .expect("declared Muse vision static group has consumers");
+            let mut consumers = metadata.vector(indices.len())?;
+            for index in indices {
+                consumers.push((
+                    copy_id(layout.group_id(0).expect("Muse vision group"))?,
+                    index,
+                ));
+            }
+            let owner = ParameterGroupOwner::StaticUnitConsumers {
+                role: metadata.text("vision")?,
+                consumers,
+            };
+            owned.push(OwnedParameterGroupSpec::new(owner, group));
         }
-        for (group_index,&count) in counts.iter().enumerate(){
-            let owner=layout.group_id(group_index).expect("Muse layout group");
+        for (group_index, &count) in counts.iter().enumerate() {
+            let owner = layout.group_id(group_index).expect("Muse layout group");
             for index in 0..count {
-                let groups=if group_index==0 {super::parallel::vision_layer_parameter_groups_in(&self.args,index,destination)}else{super::parallel::layer_parameter_groups_in(&self.args,index,destination)}.map_err(ParameterGroupError::into_neural)?;
-                destination.reserve(&mut owned,groups.len()).map_err(ParameterGroupError::into_neural)?;
-                for group in groups {owned.push(OwnedParameterGroupSpec::new(ParameterGroupOwner::execution_unit(copy_id(owner)?,index),group));}
+                let groups = if group_index == 0 {
+                    super::parallel::vision_layer_parameter_groups_in(
+                        &self.args,
+                        index,
+                        destination,
+                    )
+                } else {
+                    super::parallel::layer_parameter_groups_in(&self.args, index, destination)
+                }
+                .map_err(ParameterGroupError::into_neural)?;
+                destination
+                    .reserve(&mut owned, groups.len())
+                    .map_err(ParameterGroupError::into_neural)?;
+                for group in groups {
+                    owned.push(OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::execution_unit(copy_id(owner)?, index),
+                        group,
+                    ));
+                }
             }
         }
-        match context {Some(context)=>ArchitectureParameterDescription::from_owned_with_metadata(graph,layout,owned,context),None=>ArchitectureParameterDescription::from_owned(graph,layout,owned).map_err(Error::backend)}
+        match context {
+            Some(context) => ArchitectureParameterDescription::from_owned_with_metadata(
+                graph, layout, owned, context,
+            ),
+            None => ArchitectureParameterDescription::from_owned(graph, layout, owned)
+                .map_err(Error::backend),
+        }
     }
 
     /// Returns the replicated or planner-derived mutable-state layout.
@@ -1528,48 +1694,99 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     fn media_prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            usize,
+            usize,
+            String,
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            std::ops::Range<usize>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error>,
+        )>()?;
 
         // The validated ingress preserves media-prefix placement and the same causal/sliding decoder cache offsets.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1, metadata_context)?;
+        let units =
+            <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1, metadata_context)?;
         let mut declarations = crate::decoder::media_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index, metadata_context)), metadata_context)?;
+            (0..units).map(|index| {
+                <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index, metadata_context)
+            }),
+            metadata_context,
+        )?;
         // The retained-media ingress changes decoder inputs and positions, but
         // executes the same row-local routed banks as the ordinary target.
         // Reuse those exact architecture declarations; encoder hooks remain
         // outside this decoder contract.
-        let ordinary=<Self as LayeredArchitecture<B,S>>::prefill_observation_declarations(self,metadata_context)?;
-        metadata.controls::<(Vec<eredu_runtime::layered::PrefillObservationDeclaration>,usize)>()?;
-        let selected = ordinary.iter().filter(|declaration| declaration.flattens_batch_tokens());
+        let ordinary = <Self as LayeredArchitecture<B, S>>::prefill_observation_declarations(
+            self,
+            metadata_context,
+        )?;
+        metadata.controls::<(
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            usize,
+        )>()?;
+        let selected = ordinary
+            .iter()
+            .filter(|declaration| declaration.flattens_batch_tokens());
         metadata.borrowed_controls(&selected)?;
         let count = selected.count();
-        if let Some(context) = metadata.context() { context.reserve_metadata_vec(&mut declarations, count)?; }
-        let selected = ordinary.into_iter().filter(|declaration| declaration.flattens_batch_tokens());
+        if let Some(context) = metadata.context() {
+            context.reserve_metadata_vec(&mut declarations, count)?;
+        }
+        let selected = ordinary
+            .into_iter()
+            .filter(|declaration| declaration.flattens_batch_tokens());
         metadata.borrowed_controls(&selected)?;
         declarations.extend(selected);
         Ok(declarations)
     }
 
     fn prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            usize,
+            usize,
+            String,
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            std::ops::Range<usize>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error>,
+        )>()?;
 
         // Ordinary text uses causal per-layer KV offsets/window masks and fixed
         // RoPE/NoPE, followed by row-local gates, norms and dense/routed experts.
         // Group 1 owns these real hooks; vision and external assistant equations
         // acquire no row declaration from this ordinary target companion.
-        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1, metadata_context)?;
+        let units =
+            <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1, metadata_context)?;
         let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
-            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index, metadata_context)),
-            true, metadata_context)?;
+            (0..units).map(|index| {
+                <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index, metadata_context)
+            }),
+            true,
+            metadata_context,
+        )?;
         // Same target bank invocation as observed execution; its expert equations are row-local.
         for index in 0..units {
-            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index, metadata_context)?;
+            let path =
+                <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index, metadata_context)?;
             if self.args.num_experts > 0 {
-                crate::decoder::append_routed_prefill_path(&mut declarations, &metadata.format(format_args!("{path}.routing"))?, metadata_context)?;
+                crate::decoder::append_routed_prefill_path(
+                    &mut declarations,
+                    &metadata.format(format_args!("{path}.routing"))?,
+                    metadata_context,
+                )?;
             }
         }
         Ok(declarations)
@@ -1664,13 +1881,19 @@ where
         crate::transport::pipeline_state(1, layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+    fn execution_graph(
+        &self,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
             &self.execution_graph,
         ))
     }
 
-    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+    fn group_unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
@@ -1689,9 +1912,19 @@ where
         }
     }
 
-    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+    fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+        metadata.controls::<(
+            &Self,
+            usize,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>()?;
 
         let count = match group {
             0 => self
@@ -1700,10 +1933,16 @@ where
                 .as_ref()
                 .map_or(0, |vision| vision.layer_count()),
             1 => self.args.num_hidden_layers as usize,
-            _ => return Err(metadata.error(format_args!("{}", "Muse-Glimmer has two execution groups"))),
+            _ => {
+                return Err(
+                    metadata.error(format_args!("{}", "Muse-Glimmer has two execution groups"))
+                )
+            }
         };
         if index >= count {
-            return Err(metadata.error(format_args!("{}", "Muse-Glimmer unit is outside its group")));
+            return Err(
+                metadata.error(format_args!("{}", "Muse-Glimmer unit is outside its group"))
+            );
         }
         match group {
             0 => metadata.text(format_args!("model.vision_tower.layers.{index}")),
@@ -1712,18 +1951,30 @@ where
         }
     }
 
-    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+    fn group_output_observation_path(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
-        metadata.optional_path((group == 0).then_some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH))
+        metadata.optional_path(
+            (group == 0).then_some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH),
+        )
     }
 
-    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
+    fn group_input_observation_path(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
-        metadata.optional_path((group == 1).then_some(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH))
+        metadata.optional_path(
+            (group == 1).then_some(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH),
+        )
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -2205,11 +2456,16 @@ where
 
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self::Boundary, Self::Error> {
         if let Some(metadata) = metadata {
             metadata.charge_metadata(std::mem::size_of::<(
-                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
-                Self::Boundary, Result<Self::Boundary, Self::Error>,
+                &Self,
+                Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary,
+                Result<Self::Boundary, Self::Error>,
             )>())?;
         }
 
@@ -2300,12 +2556,14 @@ where
     }
 }
 
-
 fn external_capture_paths(
     request: &ExternalPredictionCaptureRequest,
     metadata: crate::decoder::ModuleMetadata<'_>,
 ) -> Result<Option<Vec<String>>, Error> {
-    if !matches!(request, ExternalPredictionCaptureRequest::MuseGlimmerDFlash { .. }) {
+    if !matches!(
+        request,
+        ExternalPredictionCaptureRequest::MuseGlimmerDFlash { .. }
+    ) {
         return Ok(None);
     }
     request.collect_paths(metadata).map(Some)
@@ -2317,7 +2575,11 @@ fn external_capture<T: Clone>(
     observed: Vec<T>,
     metadata: crate::decoder::ModuleMetadata<'_>,
 ) -> Result<Option<ExternalPredictionTargetCapture<T>>, Error> {
-    metadata.controls::<(Vec<T>, ExternalPredictionTargetCapture<T>, &ForwardContext<T>)>()?;
+    metadata.controls::<(
+        Vec<T>,
+        ExternalPredictionTargetCapture<T>,
+        &ForwardContext<T>,
+    )>()?;
     let _ = forward;
     let ExternalPredictionCaptureRequest::MuseGlimmerDFlash { target_layers, .. } = request else {
         return Ok(None);
@@ -2325,8 +2587,11 @@ fn external_capture<T: Clone>(
     if observed.len() != target_layers.len() {
         return Err(metadata.error(format_args!(
             "Muse-Glimmer DFlash capture expected {} target states, received {}",
-            target_layers.len(), observed.len()
+            target_layers.len(),
+            observed.len()
         )));
     }
-    Ok(Some(ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states: observed }))
+    Ok(Some(ExternalPredictionTargetCapture::MuseGlimmerDFlash {
+        target_states: observed,
+    }))
 }

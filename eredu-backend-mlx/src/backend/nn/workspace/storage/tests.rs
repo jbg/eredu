@@ -3,7 +3,11 @@ use eredu_nn::{Index, Tensor};
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -31,10 +35,17 @@ fn storage_bounds_retain_capacity_and_count_shared_host_storage_once() {
     assert!(report.retained_bytes.unwrap() >= 2 * 256 * 8 * 4);
     assert!(report.unpriced_operations.is_empty());
     assert!(report.unpriced_host_operations.is_empty());
-    assert_eq!(report.total_bytes, report.tensor_buffers.total_bytes);
+    assert_eq!(
+        report.total_bytes,
+        report.tensor_buffers.total_bytes.map(
+            |n| n + crate::backend::nn::workspace::test_backing_controls(&selected(), &report)
+        )
+    );
     assert_eq!(
         report.transient_bytes,
-        report.tensor_buffers.transient_bytes
+        report.tensor_buffers.transient_bytes.map(|n| n
+            + crate::backend::nn::workspace::test_backing_controls(&selected(), &report)
+            - (report.retained_bytes.unwrap() - report.tensor_buffers.retained_bytes.unwrap()))
     );
     assert_eq!(report.host_workspace_bytes, Some(0));
     let independent = selected()
@@ -258,10 +269,15 @@ mod native {
                                 source.contiguous(false, &stream).unwrap()
                             }
                         });
-                        assert!(observed <= bound, "copy dtype={dtype:?} shape={shape:?} layout={layout:?} deep={deep}: {observed} exceeds {bound}");
+                        assert!(
+                            observed <= bound,
+                            "copy dtype={dtype:?} shape={shape:?} layout={layout:?} deep={deep}: {observed} exceeds {bound}"
+                        );
                         assert_eq!(output.shape(), shape);
                         assert_eq!(values(&output, &stream), expected);
-                        eprintln!("storage_copy dtype={dtype:?} shape={shape:?} layout={layout:?} deep={deep} observed={observed} bound={bound}");
+                        eprintln!(
+                            "storage_copy dtype={dtype:?} shape={shape:?} layout={layout:?} deep={deep} observed={observed} bound={bound}"
+                        );
                         cases += 1;
                     }
                 }
@@ -336,10 +352,15 @@ mod native {
                                     .unwrap();
                                 output
                             });
-                            assert!(observed <= bound, "update {source_dtype:?}/{update_dtype:?} {shape:?} {source_layout:?}/{update_layout:?} {start}+{count}: {observed} exceeds {bound}");
+                            assert!(
+                                observed <= bound,
+                                "update {source_dtype:?}/{update_dtype:?} {shape:?} {source_layout:?}/{update_layout:?} {start}+{count}: {observed} exceeds {bound}"
+                            );
                             assert_eq!(output.shape(), shape);
                             assert_eq!(values(&output, &stream), expected);
-                            eprintln!("storage_update dtypes={source_dtype:?}/{update_dtype:?} shape={shape:?} layouts={source_layout:?}/{update_layout:?} start={start} count={count} observed={observed} bound={bound}");
+                            eprintln!(
+                                "storage_update dtypes={source_dtype:?}/{update_dtype:?} shape={shape:?} layouts={source_layout:?}/{update_layout:?} start={start} count={count} observed={observed} bound={bound}"
+                            );
                             cases += 1;
                         }
                     }

@@ -1,8 +1,8 @@
 //! Immutable diagnostics from the actual completed equation schedule.
 use super::*;
 use crate::working_memory::{
-    funding::SpanHostOwner, ReservedInferenceSpanWorkspace, WorkingMemoryError,
-    WorkingMemoryFundingRun,
+    ReservedInferenceSpanWorkspace, WorkingMemoryError, WorkingMemoryFundingRun,
+    funding::SpanHostOwner,
 };
 use std::{
     mem::size_of,
@@ -15,12 +15,29 @@ pub use sampling::SamplingWorkspacePlanCollector;
 /// Opening roots receive no scalar credit: they were never new allocations.
 #[derive(Debug, Clone)]
 pub struct InferenceSpanWorkspaceRecord {
+    domain_allocations: Option<eredu_core::DomainMemoryRequirements>,
+    domain_native_allocations: Option<eredu_core::DomainMemoryRequirements>,
     span: InferenceWorkspaceSpan,
     new_allocation_bytes: Option<u64>,
     new_tensor_allocation_bytes: Option<u64>,
     host_workspace_bytes: Option<u64>,
+    closing_storage: eredu_nn::workspace::WorkspaceStoragePopulation,
 }
 impl InferenceSpanWorkspaceRecord {
+    /// Complete closing backing union from this span's original lifetime reducer.
+    /// Views share their backing count; possible aliases retain every candidate.
+    /// A known population does not establish capacity, custody or native readiness.
+    pub fn closing_storage(&self) -> eredu_nn::workspace::WorkspaceStoragePopulation {
+        self.closing_storage
+    }
+    /// New allocations and scratch resolved from the original span graph.
+    pub fn domain_allocations(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.domain_allocations.as_ref()
+    }
+    /// Native backings and scratch, excluding operation-owned host workspace.
+    pub fn domain_native_allocations(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.domain_native_allocations.as_ref()
+    }
     /// Actual ordinary prefill/decode invocation supplied to the quote visitor.
     pub fn span(&self) -> &InferenceWorkspaceSpan {
         &self.span
@@ -43,13 +60,30 @@ impl InferenceSpanWorkspaceRecord {
     pub fn host_workspace_bytes(&self) -> Option<u64> {
         self.host_workspace_bytes
     }
-    pub(super) fn new(span: InferenceWorkspaceSpan, trace: &WorkspaceTraceReport) -> Self {
-        Self {
+    pub(super) fn new(
+        span: InferenceWorkspaceSpan,
+        trace: &WorkspaceTraceReport,
+        metadata: super::super::WorkspaceReportMetadata<'_>,
+    ) -> Result<Self, eredu_nn::Error> {
+        Ok(Self {
+            domain_allocations: trace
+                .physical_domains
+                .as_ref()
+                .map(|v| metadata.clone_domain_requirements(&v.new_allocations))
+                .transpose()
+                .map_err(|e| metadata.error(e))?,
+            domain_native_allocations: trace
+                .physical_domains
+                .as_ref()
+                .map(|v| metadata.clone_domain_requirements(&v.native_allocations))
+                .transpose()
+                .map_err(|e| metadata.error(e))?,
             span,
             new_allocation_bytes: trace.inference_transient_bytes().and(trace.total_bytes),
             new_tensor_allocation_bytes: trace.tensor_buffers.total_bytes,
             host_workspace_bytes: trace.host_workspace_bytes,
-        }
+            closing_storage: trace.closing_storage,
+        })
     }
 }
 #[derive(Debug)]
@@ -235,6 +269,16 @@ impl InferenceSpanWorkspacePlan {
     pub fn records(&self) -> &[InferenceSpanWorkspaceRecord] {
         &self.inner().records
     }
+    /// Maximum closing backing population across these same scheduled spans.
+    /// Source owners outside the trace and native publication control rows remain
+    /// separate contributions. An empty schedule has no closing allocations.
+    pub fn maximum_closing_storage_allocations(&self) -> usize {
+        self.records()
+            .iter()
+            .map(|record| record.closing_storage.maximum_allocations)
+            .max()
+            .unwrap_or(0)
+    }
     /// Invocations for generation that samples its first token from prefill.
     /// The diagnostic records also include one conservative final decode; it
     /// stays in the workspace bound but has no generation submission. Scoring
@@ -250,16 +294,24 @@ impl InferenceSpanWorkspacePlan {
         &self,
     ) -> Option<impl Iterator<Item = &InferenceSpanWorkspaceRecord> + '_> {
         let geometry = self.geometry();
-        if self.records().iter().any(|record| matches!(record.span(), InferenceWorkspaceSpan::Sampling(_)))
-            || (geometry.max_output_tokens != 0 && geometry.output == OutputDemand::StateOnly) {
+        if self
+            .records()
+            .iter()
+            .any(|record| matches!(record.span(), InferenceWorkspaceSpan::Sampling(_)))
+            || (geometry.max_output_tokens != 0 && geometry.output == OutputDemand::StateOnly)
+        {
             return None;
         }
         let decodes = geometry.max_output_tokens.saturating_sub(1);
-        Some(self.records().iter().filter(move |record| match record.span() {
-            InferenceWorkspaceSpan::Sampling(_) => false,
-            InferenceWorkspaceSpan::Prefill(_) => true,
-            InferenceWorkspaceSpan::Decode { index, .. } => *index < decodes,
-        }))
+        Some(
+            self.records()
+                .iter()
+                .filter(move |record| match record.span() {
+                    InferenceWorkspaceSpan::Sampling(_) => false,
+                    InferenceWorkspaceSpan::Prefill(_) => true,
+                    InferenceWorkspaceSpan::Decode { index, .. } => *index < decodes,
+                }),
+        )
     }
     /// Whether these diagnostics alias the very same original traversal.
     pub fn same_plan(&self, other: &Self) -> bool {
@@ -268,14 +320,26 @@ impl InferenceSpanWorkspacePlan {
     /// Actual owned record capacity and fixed Arc payload/control. This is host
     /// storage, not native workspace; construction moves are priced by sealing.
     pub fn capacity_bytes(&self) -> Option<u64> {
-        self.inner()
+        let controls = self
+            .inner()
             .records
             .capacity()
             .checked_mul(size_of::<InferenceSpanWorkspaceRecord>())?
             .checked_add(size_of::<SpanPlan>())?
-            .checked_add(2 * size_of::<usize>())?
-            .try_into()
-            .ok()
+            .checked_add(2 * size_of::<usize>())?;
+        self.records()
+            .iter()
+            .try_fold(u64::try_from(controls).ok()?, |sum, record| {
+                [
+                    &record.domain_allocations,
+                    &record.domain_native_allocations,
+                ]
+                .into_iter()
+                .flatten()
+                .try_fold(sum, |sum, requirements| {
+                    sum.checked_add(requirements.backing_bytes().ok()?)
+                })
+            })
     }
     /// Storage still requiring admission when attaching this exact shared plan.
     /// A retained planning account already covers the original Vec and Arc;

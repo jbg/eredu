@@ -2,8 +2,8 @@
 #![cfg(feature = "mlx")]
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
-use eredu_core::{GenerationConfigOverrides, capture::*, execution_control::*};
-use safemlx::{DeviceType, distributed};
+use eredu_core::{capture::*, execution_control::*, GenerationConfigOverrides};
+use safemlx::{distributed, DeviceType};
 use std::{
     io::Write,
     ops::ControlFlow,
@@ -72,6 +72,15 @@ fn fixture(root: &Path, family: &str) {
     .unwrap();
 }
 
+fn baseline_failure<T>(error: eredu_core::BackendFailure) -> T {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(error) = cause {
+        eprintln!("{error}");
+        cause = error.source();
+    }
+    panic!("distributed baseline preparation failed; source chain printed above")
+}
+
 fn run_control_case(family: &str, residency: &str) {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path(), family);
@@ -88,8 +97,7 @@ fn run_control_case(family: &str, residency: &str) {
     drop(sockets);
     let mut children = vec![];
     for rank in 0..world {
-        let log =
-            std::fs::File::create(root.path().join(format!("rank-{rank}.log"))).unwrap();
+        let log = std::fs::File::create(root.path().join(format!("rank-{rank}.log"))).unwrap();
         children.push(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "k2_distributed_facade_worker", "--nocapture"])
@@ -104,7 +112,9 @@ fn run_control_case(family: &str, residency: &str) {
                 .unwrap(),
         );
     }
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // Eight Mova ranks run two complete sampling/snapshot/delivery matrices.
+    // Preserve a finite hang deadline while allowing their measured CPU work.
+    let deadline = Instant::now() + Duration::from_secs(240);
     while children
         .iter_mut()
         .any(|child| child.try_wait().unwrap().is_none())
@@ -124,8 +134,7 @@ fn run_control_case(family: &str, residency: &str) {
         if !status.success() {
             failures.push(format!(
                 "rank {rank}: {}",
-                std::fs::read_to_string(root.path().join(format!("rank-{rank}.log")))
-                    .unwrap()
+                std::fs::read_to_string(root.path().join(format!("rank-{rank}.log"))).unwrap()
             ));
         }
     }
@@ -163,9 +172,13 @@ fn is_cumulative_encoded_limit(error: &ControlledGenerationError) -> bool {
         | ControlledGenerationError::CaptureFailure { capture, .. } => capture,
         _ => return false,
     };
-    matches!(capture.cause(), CaptureError::Limit {
-        budget: CaptureBudget::Encoded, cumulative: true,
-    })
+    matches!(
+        capture.cause(),
+        CaptureError::Limit {
+            budget: CaptureBudget::Encoded,
+            cumulative: true,
+        }
+    )
 }
 
 fn reset_admitted(
@@ -174,16 +187,14 @@ fn reset_admitted(
 ) {
     let before = model.text_preparation_usage().unwrap();
     assert!(before.attempts > 0);
-    // Every participant refuses the same zero operation budget before any
+    // Every participant refuses the same zero host-domain limit before any
     // readiness producer or vote; no retry can recover spent preparation work.
-    let refused =
-        model
-            .prepare_reset_ordinary()
-            .unwrap()
-            .reset_admitted(eredu_core::SessionResetLimits {
-                application_memory_budget_bytes: Some(0),
-                ..eredu_core::SessionResetLimits::new(capacity)
-            });
+    let refused = model.prepare_reset_ordinary().unwrap().reset_admitted(
+        eredu_core::SessionResetLimits::new(eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(0),
+        )])),
+    );
     assert!(refused.is_err());
     drop(refused);
     assert_eq!(model.text_preparation_usage().unwrap(), before);
@@ -198,9 +209,16 @@ fn reset_admitted(
     model
         .prepare_reset_ordinary()
         .unwrap()
-        .reset_admitted(eredu_core::SessionResetLimits::new(capacity))
+        .reset_admitted(eredu_core::SessionResetLimits::new(
+            eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(capacity),
+            )]),
+        ))
         .unwrap();
     model.synchronize().unwrap();
+    safemlx::memory::clear_cache().unwrap();
+    eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     let after = model.text_preparation_usage().unwrap();
     assert_eq!(after.attempts, before.attempts + 2);
     assert_eq!(
@@ -210,6 +228,7 @@ fn reset_admitted(
     assert_eq!(after.host_bytes, before.host_bytes + 2 * host_per_attempt);
 }
 
+#[track_caller]
 fn load_fixture<'a>(
     root: &Path,
     family: &str,
@@ -301,14 +320,42 @@ fn k2_distributed_facade_worker() {
     let family = std::env::var("K2_CONTROL_FAMILY").unwrap();
     let residency = std::env::var("K2_CONTROL_RESIDENCY").unwrap();
     let rank = std::env::var("MLX_RANK").unwrap().parse().unwrap();
+    let started = Instant::now();
+    let stage = |name: &str| {
+        eprintln!(
+            "{family}/{residency} rank {rank} phase={name} elapsed={:?} memory={:?}",
+            started.elapsed(),
+            local_memory_snapshot(),
+        );
+    };
+    stage("communicator construction");
     let world = distributed::init(true, distributed::Backend::Ring).unwrap();
+    stage("reference model construction");
     let mut model = load_fixture(&root, &family, &residency, &world, rank);
-    const CAPACITY: u64 = 64 << 30;
+    stage("reference model ready");
+    // CPU evaluation quotes each nested frontier against the reachable graph,
+    // including conservative container growth and each control's ledger owner.
+    // This parity fixture admits those allowances for simultaneous branches;
+    // the limit is not an expected allocation volume or a process RSS bound.
+    const CAPACITY: u64 = 16 << 40;
+    let physical_limits = eredu_core::MemoryLimitDeclarations::new(
+        eredu_backend_mlx::memory_topology()
+            .unwrap()
+            .domains()
+            .map(|(_, domain)| {
+                (
+                    domain.name.clone(),
+                    eredu_core::MemoryLimit::Finite(CAPACITY),
+                )
+            }),
+    );
     let cancellation = eredu_core::GenerationCancellationToken::new();
-    // Finish ordinary numerical references before constructing retained paid
-    // sources. An ordinary allocation cannot coexist with active reservations.
+    // Reference outputs and each controlled trial use the same ordinary
+    // reservations while retaining their own native completion owners.
     let mut references = Vec::new();
     for temperature in [0.0, 0.8] {
+        eprintln!("rank {rank} reference temperature={temperature}");
+        stage("reference generation");
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(temperature),
@@ -317,7 +364,7 @@ fn k2_distributed_facade_worker() {
             },
             seed: 827,
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(CAPACITY),
+                memory_limits: physical_limits.clone(),
                 ..Default::default()
             },
             ..Default::default()
@@ -328,22 +375,39 @@ fn k2_distributed_facade_worker() {
                 eredu_core::TextGenerationConfig::new(
                     model.resolve_generation_config(settings.overrides).unwrap(),
                 )
-                .with_seed(settings.seed),
+                .with_seed(settings.seed)
+                .with_inference_policy(settings.inference.clone()),
             )
-            .unwrap()
-            .map(|token| token.unwrap().token_id().unwrap())
+            .unwrap_or_else(baseline_failure)
+            .map(|token| token.unwrap_or_else(baseline_failure).token_id().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(baseline.len(), 8);
+        stage("reference reset");
         model.reset().unwrap();
         references.push((settings, baseline));
     }
-    // The raw reference owns unquoted operation resources for its full model
-    // lifetime. Retire it before constructing the canonical model; all control
-    // trials below keep that one model and its cumulative agreement history.
+    // Retire the reference model before the controlled trials. Those trials
+    // share one model and its cumulative distributed agreement history.
     model.synchronize().unwrap();
     drop(model);
-    eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+    stage("reference retirement");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        safemlx::memory::clear_cache().unwrap();
+        eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        let retired = local_memory_snapshot().unwrap();
+        if retired.funding_accounts == 0 && retired.reservations == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reference model still retains request custody: {retired:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    stage("controlled model construction");
     let mut model = load_fixture(&root, &family, &residency, &world, rank);
+    stage("controlled model ready");
     let tokenizer = model
         .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
         .unwrap();
@@ -357,6 +421,11 @@ fn k2_distributed_facade_worker() {
         .unwrap()
         .unwrap();
     for (settings, baseline) in references {
+        eprintln!(
+            "rank {rank} controlled temperature={:?}",
+            settings.overrides.temperature
+        );
+        stage("chat preparation");
         let chat = model
             .prepare_chat(
                 &source,
@@ -364,7 +433,7 @@ fn k2_distributed_facade_worker() {
                     messages: vec![serde_json::json!({"role":"user","content":"word1 word2"})],
                     ..Default::default()
                 },
-                CAPACITY,
+                &physical_limits,
                 &cancellation,
             )
             .unwrap()
@@ -378,16 +447,20 @@ fn k2_distributed_facade_worker() {
             per_record_bytes: 16384,
             total_bytes: 1 << 20,
         };
-        let prepared = request(settings);
+        let prepared = request(settings.clone());
         let prepared_trace = trace;
         let emit = |_: ControlledGenerationRecord| ControlFlow::Continue(());
+        stage("snapshot trial preparation");
         let mut run = model
             .start_controlled_chat(prepared, prepared_trace, Default::default(), emit)
-            .unwrap_or_else(|error| panic!(
-                "{family}/{residency} rank {rank} snapshot trial at temperature {}: {error:?}",
-                settings.overrides.temperature.unwrap(),
-            ))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{family}/{residency} rank {rank} snapshot trial at temperature {}: {error:?}",
+                    settings.overrides.temperature.unwrap(),
+                )
+            })
             .expect("live control");
+        stage("snapshot trial ready");
         run.enable_snapshots(
             SnapshotLimits {
                 max_snapshots: 2,
@@ -395,20 +468,25 @@ fn k2_distributed_facade_worker() {
                 retained_bytes: 64 << 20,
                 cumulative_copy_bytes: 256 << 20,
             },
-            CAPACITY,
-            eredu_runtime::working_memory::WorkspaceCopyLimits::new(CAPACITY),
+            physical_limits.clone(),
+            eredu_runtime::working_memory::WorkspaceCopyLimits::new(physical_limits.clone()),
         )
         .unwrap();
         run.step(emit).unwrap();
         run.step(emit).unwrap();
+        stage("snapshot creation");
         let saved = run.snapshot(emit).unwrap();
         run.run(emit).unwrap();
+        stage("snapshot trial completed");
         assert_eq!(run.token_ids(), baseline);
         let before = run.snapshot_usage().unwrap().cumulative_copy_bytes;
+        stage("first snapshot restore");
         run.restore(&saved, emit).unwrap();
+        stage("first snapshot restored");
         assert!(run.snapshot_usage().unwrap().cumulative_copy_bytes > before);
         run.run(emit).unwrap();
         assert_eq!(run.token_ids(), baseline);
+        stage("snapshot fork");
         let mut child = run
             .fork(
                 &saved,
@@ -421,24 +499,31 @@ fn k2_distributed_facade_worker() {
                 emit,
             )
             .unwrap();
+        stage("snapshot forked");
         // Keep both branches unfinished while exchanging their actual request
         // banks. A live dormant branch retains sources and spent slots, but may
         // not prevent the other branch from activating its next prediction.
         let before = run.snapshot_usage().unwrap().cumulative_copy_bytes;
+        stage("second snapshot restore");
         run.restore(&saved, emit).unwrap();
+        stage("second snapshot restored");
         assert!(run.snapshot_usage().unwrap().cumulative_copy_bytes > before);
         run.step(emit).unwrap();
         assert_eq!(run.token_ids(), &baseline[..3]);
         run.exchange(&mut child, emit).unwrap();
+        stage("first branch exchange");
         run.step(emit).unwrap();
         assert_eq!(run.token_ids(), &baseline[..3]);
         run.exchange(&mut child, emit).unwrap();
+        stage("second branch exchange");
         run.step(emit).unwrap();
         assert_eq!(run.token_ids(), &baseline[..4]);
         run.exchange(&mut child, emit).unwrap();
+        stage("third branch exchange");
         run.run(emit).unwrap();
         assert_eq!(run.token_ids(), baseline);
         run.exchange(&mut child, emit).unwrap();
+        stage("fourth branch exchange");
         run.run(emit).unwrap();
         assert_eq!(run.token_ids(), baseline);
         let consumed = run.snapshot_usage().unwrap().cumulative_copy_bytes;
@@ -448,9 +533,13 @@ fn k2_distributed_facade_worker() {
             consumed
         );
         drop(run);
+        drop(saved);
+        stage("snapshot trial reset");
         reset_admitted(&mut model, CAPACITY);
         for controlled in [false, true] {
-            let prepared = request(settings);
+            eprintln!("rank {rank} cancellation controlled={controlled}");
+            stage("cancellation trial");
+            let prepared = request(settings.clone());
             let prepared_trace = trace;
             let before = model.text_preparation_usage().unwrap();
             let cancelled = if controlled {
@@ -510,7 +599,7 @@ fn k2_distributed_facade_worker() {
             reset_admitted(&mut model, CAPACITY);
 
             if controlled {
-                let prepared = request(settings);
+                let prepared = request(settings.clone());
                 let prepared_trace = trace;
                 let mut run = model
                     .start_controlled_chat(prepared, prepared_trace, Default::default(), emit)
@@ -539,16 +628,20 @@ fn k2_distributed_facade_worker() {
             }
 
             for boundary_record in [false, true] {
+                eprintln!(
+                    "rank {rank} delivery controlled={controlled} boundary={boundary_record}"
+                );
+                stage("delivery trial");
                 // Reject rank zero's first token or its following lifecycle/terminal
                 // record. Other participants retain their ordinary quota.
                 let trial_settings = if boundary_record && !controlled {
-                    let mut trial = settings;
+                    let mut trial = settings.clone();
                     trial.overrides.max_new_tokens = Some(1);
                     trial
                 } else {
-                    settings
+                    settings.clone()
                 };
-                let prepared = request(trial_settings);
+                let prepared = request(trial_settings.clone());
                 let prepared_trace = trace;
                 let mut initial_bytes = 0;
                 if controlled {
@@ -617,7 +710,7 @@ fn k2_distributed_facade_worker() {
                 } else {
                     trace
                 };
-                let prepared = request(trial_settings);
+                let prepared = request(trial_settings.clone());
                 let prepared_trace = limits;
                 let before = model.text_preparation_usage().unwrap();
                 let (local_limit, error): (bool, Box<dyn std::error::Error>) = if controlled {
@@ -670,7 +763,7 @@ fn k2_distributed_facade_worker() {
                 let after = model.text_preparation_usage().unwrap();
                 assert!(after.attempts > before.attempts);
                 reset_admitted(&mut model, CAPACITY);
-                let prepared = request(settings);
+                let prepared = request(settings.clone());
                 let prepared_trace = trace;
                 let retry = (|| -> Result<Vec<u32>, ControlledGenerationError> {
                     let mut emit = |_| ControlFlow::Continue(());
@@ -693,5 +786,27 @@ fn k2_distributed_facade_worker() {
                 reset_admitted(&mut model, CAPACITY);
             }
         }
+        stage("temperature completed");
     }
+    stage("controlled model retirement");
+    drop(source);
+    drop(tokenizer);
+    model.synchronize().unwrap();
+    drop(model);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        safemlx::memory::clear_cache().unwrap();
+        eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        let retired = local_memory_snapshot().unwrap();
+        if retired.funding_accounts == 0 && retired.reservations == 0 {
+            assert_eq!(retired.unquoted_owners, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "controlled model still retains request custody: {retired:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    stage("complete");
 }

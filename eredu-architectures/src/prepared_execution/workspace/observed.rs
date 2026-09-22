@@ -6,6 +6,30 @@ use eredu_runtime::{
 };
 use std::cell::RefCell;
 
+/// Actual observation source and logical prediction coordinate for one model
+/// invocation. This borrows the same observer/path contracts as ordinary text
+/// quoting; it grants neither a capture source nor native execution authority.
+/// The coordinate comes from the caller's actual invocation provenance, not its
+/// physical cache position or this equation's zero future-output count.
+pub struct InvocationWorkspaceObservation<'a> {
+    pub(super) paths: &'a SharedLayeredObservationPaths,
+    pub(super) observer: &'a mut dyn InferenceWorkspaceObserver,
+    pub(super) prediction: u64,
+}
+impl<'a> InvocationWorkspaceObservation<'a> {
+    pub fn new(
+        paths: &'a SharedLayeredObservationPaths,
+        observer: &'a mut dyn InferenceWorkspaceObserver,
+        prediction: u64,
+    ) -> Self {
+        Self {
+            paths,
+            observer,
+            prediction,
+        }
+    }
+}
+
 fn source_error<E: std::error::Error + Send + Sync + 'static>(
     context: &WorkspaceContext,
     cause: E,
@@ -59,14 +83,16 @@ impl ObservationRef<'_, '_> {
         let prediction = match self.invocation_prediction {
             Some(prediction) => Some(prediction),
             None => match span {
-                    InferenceWorkspaceSpan::Sampling(_) => unreachable!("model equation scheduler emits only prefill/decode spans"),
-            InferenceWorkspaceSpan::Prefill(_) => (geometry.max_output_tokens > 0).then_some(0),
-            InferenceWorkspaceSpan::Decode { index, .. } => Some(
-                index
-                    .checked_add(1)
-                    .ok_or_else(|| source_error(context, ObservationError::Overflow))?,
-            )
-            .filter(|prediction| *prediction < geometry.max_output_tokens),
+                InferenceWorkspaceSpan::Sampling(_) => {
+                    unreachable!("model equation scheduler emits only prefill/decode spans")
+                }
+                InferenceWorkspaceSpan::Prefill(_) => (geometry.max_output_tokens > 0).then_some(0),
+                InferenceWorkspaceSpan::Decode { index, .. } => Some(
+                    index
+                        .checked_add(1)
+                        .ok_or_else(|| source_error(context, ObservationError::Overflow))?,
+                )
+                .filter(|prediction| *prediction < geometry.max_output_tokens),
             },
         };
         let Some(prediction) = prediction else {
@@ -77,11 +103,13 @@ impl ObservationRef<'_, '_> {
             .observer
             .borrow_mut()
             .begin_span(geometry, span, prediction, context)?;
-        if active
-            && !bound_rows
-            && matches!(span,InferenceWorkspaceSpan::Prefill(chunk) if chunk.input.start!=0 || chunk.input.end!=geometry.input_positions)
-        {
-            return Err(source_error(context, ObservationError::PartialPrefill));
+        if active && !bound_rows {
+            if let InferenceWorkspaceSpan::Prefill(chunk) = span {
+                let partial = chunk.input.start != 0 || chunk.input.end != geometry.input_positions;
+                if partial && self.observer.borrow().prefill_invocation_span() != Some(chunk) {
+                    return Err(source_error(context, ObservationError::PartialPrefill));
+                }
+            }
         }
         Ok(active)
     }
@@ -132,7 +160,9 @@ pub(super) fn sampling_row(
         ));
     }
     let end = scores.shape()[1];
-    scores.narrow_axis(1, end - 1, end, context)?.squeeze_axes(&[1], context)
+    scores
+        .narrow_axis(1, end - 1, end, context)?
+        .squeeze_axes(&[1], context)
 }
 
 /// Private composition receives only the prepared borrowed-hook mechanism's
@@ -142,18 +172,36 @@ pub(super) fn with_hook_workspace(
     bytes: u64,
     context: &WorkspaceContext,
 ) -> Result<eredu_nn::workspace::WorkspaceTraceReport, Error> {
+    if let Some(domains) = &mut report.physical_domains {
+        domains
+            .add_host_workspace(
+                context.memory_topology().ok_or_else(|| {
+                    context.metadata_source(
+                        eredu_nn::workspace::WorkspacePlacementError::MissingTopology,
+                    )
+                })?,
+                bytes,
+            )
+            .map_err(|cause| context.metadata_source(cause))?;
+    }
+    let attributed = report.physical_domains.is_some();
     let add = |value: Option<u64>, bytes: u64| -> Result<Option<u64>, Error> {
         value
             .map(|value| {
-                value.checked_add(bytes).ok_or_else(|| {
-                    if context.uses_checked_metadata() {
-                        context.metadata_source(ObservationError::Overflow)
-                    } else {
-                        Error::backend_retained_source(ObservationError::Overflow)
-                    }
-                })
+                value
+                    .checked_add(bytes)
+                    .map(Some)
+                    .or(attributed.then_some(None))
+                    .ok_or_else(|| {
+                        if context.uses_checked_metadata() {
+                            context.metadata_source(ObservationError::Overflow)
+                        } else {
+                            Error::backend_retained_source(ObservationError::Overflow)
+                        }
+                    })
             })
             .transpose()
+            .map(Option::flatten)
     };
     report.host_workspace_bytes = add(report.host_workspace_bytes, bytes)?;
     report.total_bytes = add(report.total_bytes, bytes)?;

@@ -1,0 +1,13 @@
+diff --git a/mlx/backend/cpu/gather_storage.cpp b/mlx/backend/cpu/gather_storage.cpp
+--- a/mlx/backend/cpu/gather_storage.cpp
++++ b/mlx/backend/cpu/gather_storage.cpp
+@@ -42,7 +42,8 @@
+   size_t output_elements=0,bytes=0;
+   if(!((source==float32&&source.size()==4)||(source==bfloat16&&source.size()==2)||
+       (source==float16&&source.size()==2)||
+-      (source==int32&&source.size()==4)||(source==uint32&&source.size()==4))||
++      (source==int32&&source.size()==4)||(source==uint32&&source.size()==4)||
++      (source==bool_&&source.size()==1))||
+       !((index==uint32&&index.size()==4)||(index==int32&&index.size()==4))||
+       !source_rank||source_rank>4||index_rank>5-source_rank||
+       source_elements>size_t(INT_MAX)||(!source_elements&&index_elements)||

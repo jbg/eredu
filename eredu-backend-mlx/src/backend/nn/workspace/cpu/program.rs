@@ -26,7 +26,12 @@ impl Program {
         Some(())
     }
     pub(super) fn capacity(&self, elements: usize, dtype: Dtype) -> Option<u64> {
-        let item = if dtype == Dtype::Bool { 1 } else { 4 };
+        let item = match dtype {
+            Dtype::Bool => 1,
+            Dtype::Int64 | Dtype::Uint64 | Dtype::Float64 | Dtype::Complex64 => 8,
+            // The existing narrower sources retain their four-byte envelope.
+            _ => 4,
+        };
         self.mechanism
             .allocation
             .fixed_buffer_capacity((elements as u64).checked_mul(item)?)

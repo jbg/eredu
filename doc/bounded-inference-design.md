@@ -63,7 +63,9 @@ refusals. The [architecture guide](backend-architecture.md) defines crate and
 feature boundaries; [source contracts](bounded-source-contracts.md) describe
 admission and escaped ownership.
 
-Framework-managed bounds do not include application buffers, copied callbacks,
-allocator caches or unrelated process memory. A configured capacity is a ceiling,
-not measured RSS. [Validation](bounded-inference-validation.md) records the
+Framework-managed accounting includes registered MLX backing retained by its
+allocator cache. Application buffers, copied callbacks and unrelated process
+memory remain outside it; unpriced dependency internals remain unknown
+contributions. Physical-domain limits constrain the charged allocations and
+allowances, not measured RSS. [Validation](bounded-inference-validation.md) records the
 tested configurations, performance tradeoffs and hardware limitations.

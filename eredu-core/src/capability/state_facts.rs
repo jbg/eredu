@@ -69,6 +69,7 @@ impl RuntimeStateFacts<'_> {
 
     fn build_estimate(self, windows: Vec<u64>) -> RuntimeStateEstimate {
         RuntimeStateEstimate {
+            physical_domains: None,
             fixed_state_bytes: self.fixed_state_bytes,
             bytes_per_position_per_batch: self.bytes_per_position_per_batch,
             context_state_bytes: self.context_state_bytes,

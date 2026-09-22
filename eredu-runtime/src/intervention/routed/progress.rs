@@ -47,7 +47,7 @@ pub(crate) fn outcome(receipt: RoutedUnitInterventionReceipt) -> Result<Interven
 pub(crate) fn successful(record: &InterventionRecord) -> bool {
     match (&record.outcome, record.routed_units) {
         (InterventionOutcome::Inactive, _) => true,
-        (InterventionOutcome::Applied, None) => true,
+        (InterventionOutcome::Applied | InterventionOutcome::Unmatched, None) => true,
         (InterventionOutcome::Applied, Some(receipt)) => {
             outcome(receipt) == Ok(InterventionOutcome::Applied)
         }

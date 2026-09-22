@@ -398,6 +398,14 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
     const CAUSAL_PREFILL_ROWS: bool = true;
 
     type FeedForward = Projections<B>;
+    fn feed_forward_residual_observation(args: &ModelArgs, layer: usize) -> &'static str {
+        if args.is_sparse_layer(layer) {
+            "feed_forward.contribution"
+        } else {
+            "feed_forward.output"
+        }
+    }
+
     fn validate(args: &ModelArgs) -> Result<(), Error> {
         args.validate().map_err(Error::backend)
     }
@@ -471,7 +479,9 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
                 points: <ModelArgs as decoder::Config>::routed_observation_points(
                     global,
                     &format!("model.layers.{layer}"),
-                    layer, None)?,
+                    layer,
+                    None,
+                )?,
                 values,
                 feed_forward,
             },

@@ -3,8 +3,8 @@ use super::*;
 use crate::{replicated_text::*, routed_text::*};
 type WM<P> = WorkspacePredictionMaterializer<P>;
 
-struct Route<'q, 'a, 'observer, P: WorkspacePredictionParameterSource, Q>(
-    &'q Quote<'a, 'observer, P, Q>,
+pub(super) struct Route<'q, 'a, 'observer, P: WorkspacePredictionParameterSource, Q>(
+    pub(super) &'q Quote<'a, 'observer, P, Q>,
 );
 impl<P: WorkspacePredictionParameterSource, Q> Copy for Route<'_, '_, '_, P, Q> {}
 impl<P: WorkspacePredictionParameterSource, Q> Clone for Route<'_, '_, '_, P, Q> {
@@ -17,9 +17,9 @@ impl<P: WorkspacePredictionParameterSource, Q> crate::prepared_execution::sealed
 {
 }
 
-struct Visitor<'q, 'a, 'observer, P: WorkspacePredictionParameterSource, Q> {
-    quote: &'q Quote<'a, 'observer, P, Q>,
-    current: WorkspacePredictionState,
+pub(super) struct Visitor<'q, 'a, 'observer, P: WorkspacePredictionParameterSource, Q> {
+    pub(super) quote: &'q Quote<'a, 'observer, P, Q>,
+    pub(super) current: WorkspacePredictionState,
 }
 
 impl<'a, 'observer, P, Q> Quote<'a, 'observer, P, Q>
@@ -37,26 +37,30 @@ where
                 .with_replicated(route)
                 .with_routed(route)
                 .with_composite(route)
+                .with_partitioned_dense(route)
+                .with_partitioned_routed(route)
+                .with_partitioned_composite(route)
         })
         .map_err(PreparedExecutionError::Metadata)?;
         // This existing branch validates the retained prediction/source agreement
         // without preparing a second extension or publishing prediction placement.
         construct_prepared_execution_impl(
             self.blueprint.sources.clone(),
-            None::<()>,
+            self.communication,
             routes,
-            QuoteAssembler(
-                self.blueprint
+            super::partitioned::Assembler {
+                dtype: self
+                    .blueprint
                     .selected()
                     .text_realization()
                     .state()
                     .floating_dtype(),
-                self.context,
-            ),
+                context: self.context,
+            },
             ConstructionPurpose::TargetEquations,
         )
     }
-    fn materialize(
+    pub(super) fn materialize(
         &self,
     ) -> Result<
         (

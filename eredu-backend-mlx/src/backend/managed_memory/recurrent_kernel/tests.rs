@@ -1,5 +1,6 @@
 mod tests {
-    use super::*;
+    use crate::memory_fixture::LedgerFixture;
+use super::*;
     use safemlx::{Device, DeviceType};
 
     #[test]
@@ -16,9 +17,9 @@ mod tests {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
         for (length, vector) in [(1, false), (1, true), (64, false), (64, true)] {
             let kind = ScanKernel::select(length == 1, vector);
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let family = pool.initialize_shared_native(Initializer(kind)).unwrap();
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.fixture_host_charge().unwrap() > 0);
             let (heads, kd, vd) = (2usize, 3usize, 2usize);
             let generate = |count, scale: f32, shift| {
                 (0..count)
@@ -68,7 +69,7 @@ mod tests {
             // Both unevaluated sibling descriptors retain the actual family.
             drop(family);
             safemlx::reclaim_allocation_owners();
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.fixture_host_charge().unwrap() > 0);
             let mut expected_state: Vec<f64> = state_values.iter().map(|&v| f64::from(v)).collect();
             let mut expected = vec![0.0f64; length * heads * vd];
             for t in 0..length {
@@ -122,7 +123,7 @@ mod tests {
             drop(final_state);
             stream.synchronize().unwrap();
             safemlx::reclaim_allocation_owners();
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
         }
     }
 }

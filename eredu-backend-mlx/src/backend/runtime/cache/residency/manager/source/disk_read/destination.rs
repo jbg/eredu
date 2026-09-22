@@ -2,9 +2,11 @@
 use super::*;
 use crate::backend::nn::workspace::PagedHostStoreDeclaration;
 use eredu_runtime::cache::PreparedCacheIoTaskSlot;
+#[path = "destination/ordinary.rs"]
+mod ordinary;
 
 pub(crate) struct PreparedDiskReadDestination {
-    filling: [Option<filled_host::Pending>; 2],
+    filling: [Option<Filling>; 2],
     bytes: Vec<u8>,
     output: PreparedDiskReadOutput,
     task: PreparedCacheIoTaskSlot<DiskTask, DiskResult>,
@@ -14,9 +16,12 @@ pub(crate) struct PreparedDiskReadDestination {
     dtypes: [Dtype; 2],
     capacities: [usize; 2],
     source_bytes: u64,
+    source_read_controls: usize,
     source_custody: Option<OriginalHostSourceCustody>,
     reservation: DiskReadOccupancy,
-    transfer: CachePoolReservation,
+    transfer: Option<CachePoolReservation>,
+    ordinary: Option<super::filling::OrdinaryPreparation>,
+    observed: Option<crate::backend::nn::workspace::OrdinaryNativeControls>,
     manager: CacheResidencyManager,
     worker: Arc<DiskWorker>,
     id: CacheBlockId,
@@ -27,7 +32,7 @@ pub(crate) struct PreparedDiskReadDestination {
 pub(crate) struct DiskReadBinding {
     output: PreparedDiskReadOutput,
     location: DiskLocation,
-    source: LiveCacheBlockSource,
+    source: CacheFileSource,
     pin: PinnedCacheBlock,
 }
 impl CacheBlockSourceLoan<'_> {
@@ -64,6 +69,17 @@ pub(super) fn prepare(
     reservations: usize,
     context: &WorkspaceContext,
 ) -> Result<PreparedDiskReadDestination, CacheSourceFailure> {
+    prepare_for(loan, id, layout, runtime, reservations, context, false)
+}
+fn prepare_for(
+    loan: &CacheBlockSourceLoan<'_>,
+    id: &CacheBlockId,
+    layout: &CacheShardLayout,
+    runtime: &PreparedInputRuntime,
+    reservations: usize,
+    context: &WorkspaceContext,
+    ordinary: bool,
+) -> Result<PreparedDiskReadDestination, CacheSourceFailure> {
     let fail = |cause| CacheSourceFailure::source(cause, context);
     let funding = context
         .metadata_funding()
@@ -75,12 +91,24 @@ pub(super) fn prepare(
                 .ok_or_else(|| fail(CacheSourceError::Overflow))?,
         )
         .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
+    let source_read_controls = match loan
+        .blocks()
+        .find(|row| row.id() == id)
+        .and_then(|row| row.disk())
+        .and_then(|disk| disk.file_source())
+    {
+        Some(source) => source.read_control_bytes(),
+        None => LiveCacheBlockSource::read_control_bytes(),
+    }
+    .ok_or_else(|| fail(CacheSourceError::Overflow))?;
     let metadata = layout.tensor_metadata();
     let mut shapes = [[0i32; 4]; 2];
     let mut dtypes = [Dtype::Float32; 2];
     let mut capacities = [0usize; 2];
     let mut source_bytes = 0u64;
     let mut host_bytes = 0u64;
+    let mut placements = [safemlx::AllocationPlacement::Unknown; 2];
+    let mut observed = crate::backend::nn::workspace::OrdinaryNativeControls::default();
     for index in 0..2 {
         let (shape, stored, bytes) = metadata[index];
         if shape.len() != 4 {
@@ -95,27 +123,55 @@ pub(super) fn prepare(
             StoredDtype::BF16 => Dtype::Bfloat16,
             _ => return Err(fail(CacheSourceError::Geometry)),
         };
-        let plan = PreparedHostTransferPlan::new(runtime, &shapes[index], dtypes[index], 0)
-            .map_err(|cause| fail(CacheSourceError::HostInput(cause)))?;
-        if plan.logical_bytes() != bytes {
-            return Err(fail(CacheSourceError::Geometry));
-        }
-        context
-            .charge_metadata(
-                plan.control_bytes()
-                    .ok_or_else(|| fail(CacheSourceError::Overflow))?,
-            )
-            .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
-        capacities[index] = plan.backing_bytes();
-        source_bytes = source_bytes
-            .checked_add(source_component_bytes(&plan).map_err(|cause| {
-                CacheSourceFailure::metadata(context.metadata_source(cause), context)
-            })?)
-            .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+        capacities[index] = if ordinary {
+            let logical = shapes[index]
+                .into_iter()
+                .try_fold(
+                    CacheBlockMetadata::floating_dtype_bytes(dtypes[index])
+                        .ok_or_else(|| fail(CacheSourceError::Geometry))?,
+                    |n, d| n.checked_mul(u64::try_from(d).ok().filter(|v| *v != 0)?),
+                )
+                .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+            if usize::try_from(logical).ok() != Some(bytes) {
+                return Err(fail(CacheSourceError::Geometry));
+            }
+            let (capacity, placement) = HostTransferBuffer::ordinary_capacity(runtime, bytes)
+                .map_err(|cause| fail(CacheSourceError::HostInput(cause)))?;
+            placements[index] = placement;
+            observed = observed
+                .append(crate::backend::nn::workspace::OrdinaryNativeControls {
+                    observed_host_bytes: u64::try_from(
+                        HostTransferBuffer::ordinary_observed_control_bytes(runtime, 4)
+                            .ok_or_else(|| fail(CacheSourceError::Geometry))?,
+                    )
+                    .map_err(|_| fail(CacheSourceError::Overflow))?,
+                    control_allocations: 1,
+                    platform_events: 0,
+                })
+                .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+            capacity
+        } else {
+            let plan = PreparedHostTransferPlan::new(runtime, &shapes[index], dtypes[index], 0)
+                .map_err(|cause| fail(CacheSourceError::HostInput(cause)))?;
+            if plan.logical_bytes() != bytes {
+                return Err(fail(CacheSourceError::Geometry));
+            }
+            context
+                .charge_metadata(
+                    plan.control_bytes()
+                        .ok_or_else(|| fail(CacheSourceError::Overflow))?,
+                )
+                .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
+            source_bytes = source_bytes
+                .checked_add(source_component_bytes(&plan).map_err(|cause| {
+                    CacheSourceFailure::metadata(context.metadata_source(cause), context)
+                })?)
+                .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+            plan.backing_bytes()
+        };
         host_bytes = host_bytes
             .checked_add(
-                u64::try_from(plan.backing_bytes())
-                    .map_err(|_| fail(CacheSourceError::Overflow))?,
+                u64::try_from(capacities[index]).map_err(|_| fail(CacheSourceError::Overflow))?,
             )
             .ok_or_else(|| fail(CacheSourceError::Overflow))?;
     }
@@ -139,30 +195,52 @@ pub(super) fn prepare(
             .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?,
         funding: funding.clone(),
     };
-    let reservation = loan
+    let host = loan
         .pool()
         .prepare_reservation_population(reservations, context)
-        .map_err(|cause| fail(CacheSourceError::DiskReservation(cause)))?
-        .reserve(CachePoolUsage {
-            host_bytes,
-            ..CachePoolUsage::default()
-        })
-        .map_err(|cause| fail(CacheSourceError::DiskAdmission(cause)))?;
+        .map_err(|cause| fail(CacheSourceError::DiskReservation(cause)))?;
     let transfer = loan
         .pool()
         .prepare_reservation_population(reservations, context)
-        .map_err(|cause| fail(CacheSourceError::DiskReservation(cause)))?
-        .reserve(CachePoolUsage {
-            transfer_in_flight_bytes: host_bytes,
-            ..CachePoolUsage::default()
-        })
-        .map_err(|cause| fail(CacheSourceError::DiskAdmission(cause)))?;
-    let reservation = DiskReadOccupancy {
-        inner: context
-            .metadata_arc(Mutex::new(reservation))
-            .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?,
-        host_bytes,
-        funding: funding.clone(),
+        .map_err(|cause| fail(CacheSourceError::DiskReservation(cause)))?;
+    let (reservation, transfer, ordinary_preparation) = if ordinary {
+        let occupancy = Mutex::new(None);
+        drop(occupancy.lock().expect("new unshared read-occupancy mutex"));
+        let reservation = DiskReadOccupancy {
+            inner: context
+                .metadata_arc(occupancy)
+                .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?,
+            host_bytes,
+            funding: funding.clone(),
+        };
+        let preparation =
+            ordinary::prepare_owners(host, transfer, placements, &reservation, context)?;
+        (reservation, None, Some(preparation))
+    } else {
+        let reservation = host
+            .reserve(CachePoolUsage {
+                host_bytes,
+                ..CachePoolUsage::default()
+            })
+            .map_err(|cause| fail(CacheSourceError::ReservationAdmission(cause)))?;
+        let transfer = transfer
+            .reserve(CachePoolUsage {
+                transfer_in_flight_bytes: host_bytes,
+                ..CachePoolUsage::default()
+            })
+            .map_err(|cause| fail(CacheSourceError::ReservationAdmission(cause)))?;
+        let reservation = DiskReadOccupancy {
+            inner: context
+                .metadata_arc({
+                    let occupancy = Mutex::new(Some(reservation));
+                    drop(occupancy.lock().expect("new unshared read-occupancy mutex"));
+                    occupancy
+                })
+                .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?,
+            host_bytes,
+            funding: funding.clone(),
+        };
+        (reservation, Some(transfer), None)
     };
     let task = worker
         .inner
@@ -187,9 +265,12 @@ pub(super) fn prepare(
         dtypes,
         capacities,
         source_bytes,
+        source_read_controls,
         source_custody: None,
         reservation,
         transfer,
+        ordinary: ordinary_preparation,
+        observed: ordinary.then_some(observed),
         manager: loan.manager.clone(),
         worker,
         id: id.clone(),
@@ -200,6 +281,9 @@ pub(super) fn prepare(
 }
 impl PreparedDiskReadDestination {
     pub(crate) fn source_facts(&self) -> Result<HostSourceConstructionFacts, WorkingMemoryError> {
+        if self.ordinary.is_some() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         HostSourceConstructionFacts::new(self.source_bytes, 2, 0)
     }
     pub(crate) fn host_capacity(&self) -> u64 {
@@ -211,6 +295,12 @@ impl PreparedDiskReadDestination {
         bank: &mut OriginalHostSourceBank,
         custody: &OriginalHostSourceCustody,
     ) -> Result<(), CacheSourceFailure> {
+        if self.ordinary.is_some() {
+            return Err(CacheSourceFailure::source(
+                CacheSourceError::Identity,
+                &self.context,
+            ));
+        }
         begin_filling(
             Initialization {
                 filling: &mut self.filling,
@@ -244,17 +334,18 @@ impl PreparedDiskReadDestination {
             .ok_or_else(|| fail(CacheSourceError::Identity))?;
         let disk = row.disk().ok_or_else(|| fail(CacheSourceError::Identity))?;
         let file = disk
-            .live_file()
+            .file_source()
             .ok_or_else(|| fail(CacheSourceError::PromotionRequired))?;
         if row.phase() != CacheStoragePhase::DiskReady
             || row.host().is_some()
-            || disk.persistent()
+            || !file.owns_declared_backing()
+            || file.read_control_bytes() != Some(self.source_read_controls)
             || disk.buffered().is_some()
             || disk.names() != self.layout.names()
             || disk.path() != file.path()
             || file.file_bytes() != Some(self.layout.file_bytes())
             || file
-                .writer_layout()
+                .layout()
                 .is_none_or(|layout| !layout.same_layout(&self.layout))
         {
             return Err(fail(CacheSourceError::Identity));
@@ -307,6 +398,14 @@ impl PreparedDiskReadDestination {
                 &self.context,
             ));
         }
+        let transfer = self
+            .transfer
+            .ok_or_else(|| CacheSourceFailure::source(CacheSourceError::Identity, &self.context))?;
+        let (ordinary_identity, ordinary_placements) = self
+            .ordinary
+            .as_ref()
+            .map(|source| (Some(source.identity.clone()), Some(source.placements)))
+            .unwrap_or((None, None));
         Ok(PreparedDiskReadSource {
             task: PreparedDiskRead {
                 task: Some(self.task),
@@ -325,12 +424,14 @@ impl PreparedDiskReadDestination {
                     capacities: self.capacities,
                     source_bytes: self.source_bytes,
                     source_custody: self.source_custody,
+                    ordinary_identity,
+                    ordinary_placements,
                     manager: self.manager,
                     id: self.id,
                     generation: self.generation,
                     pin: binding.pin,
                     reservation: self.reservation,
-                    transfer: self.transfer,
+                    transfer,
                     funding: self.funding,
                 },
                 output: self.output,
@@ -341,7 +442,7 @@ impl PreparedDiskReadDestination {
     }
 }
 pub(super) struct Initialization<'a> {
-    pub(super) filling: &'a mut [Option<filled_host::Pending>; 2],
+    pub(super) filling: &'a mut [Option<Filling>; 2],
     pub(super) source_custody: &'a mut Option<OriginalHostSourceCustody>,
     pub(super) shapes: &'a [[i32; 4]; 2],
     pub(super) dtypes: [Dtype; 2],
@@ -372,6 +473,7 @@ pub(super) fn begin_filling(
                 DiskReadPermit(init.reservation.clone()),
                 custody,
             )
+            .map(Filling::Original)
             .map_err(output::FinishCause::Publication)?,
         );
     }

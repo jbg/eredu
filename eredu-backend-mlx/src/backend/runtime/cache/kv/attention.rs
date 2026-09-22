@@ -53,6 +53,36 @@ pub struct BlockwiseAttentionAccumulator {
 }
 
 impl BlockwiseAttentionAccumulator {
+    /// Scope, recovery node and fixed transports of one ordinary page's
+    /// settlement. Native graph/dispatch populations and caller ArrayVectors
+    /// are supplied independently by the selected blockwise stage.
+    pub(crate) fn ordinary_settlement_control_bytes() -> Option<usize> {
+        use crate::backend::submission_recovery::{Recovery, Status};
+        let scope = safemlx::PreparedSubmissionScopeOwner::<()>::layout()?;
+        let fields = [
+            usize::try_from(Recovery::<Vec<Array>>::node_control_bytes()?).ok()?,
+            scope.native_scope_bytes,
+            scope.native_retirement_control_bytes,
+            scope.begin_control_bytes,
+            scope.retirement_control_bytes,
+            size_of::<(&mut Self, &KeyValueAttentionBlock, Option<&Array>, &Stream)>(),
+            size_of::<Result<(), Exception>>(),
+            size_of::<Result<Recovery<Vec<Array>>, Exception>>(),
+            size_of::<
+                Result<
+                    Status,
+                    crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause,
+                >,
+            >(),
+            size_of::<[&Array; 3]>(),
+            size_of::<safemlx::SubmissionScope>(),
+            size_of::<Option<safemlx::OriginalScopeObserver>>(),
+        ];
+        fields
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&fields), usize::checked_add)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         queries: &Array,
@@ -214,8 +244,14 @@ impl BlockwiseAttentionAccumulator {
         Ok(())
     }
 
-    pub(crate) fn has_completed_recurrence(&self) -> bool { self.recurrence_completed }
-    pub(crate) fn accumulate_original_paged(&mut self, source: &crate::backend::nn::workspace::OriginalPagedAttentionBlock<'_, '_>, stream: &Stream) -> Result<(), Exception> {
+    pub(crate) fn has_completed_recurrence(&self) -> bool {
+        self.recurrence_completed
+    }
+    pub(crate) fn accumulate_original_paged(
+        &mut self,
+        source: &crate::backend::nn::workspace::OriginalPagedAttentionBlock<'_, '_>,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
         safemlx::OriginalScopeObserver::require_current()?;
         self.recurrence_completed = false;
         self.accumulate_settled(source.block(), None, stream, Some(source))?;
@@ -239,9 +275,17 @@ impl BlockwiseAttentionAccumulator {
             // caller mask. Causal paged blocks retain their separate source
             // producer; they cannot borrow this declared nested population.
             if let Some(source) = paged {
-                source.validate([self.batch, self.query_heads, self.query_len, self.head_dim], self.query_start,
-                    self.sliding_window, self.prefix_tokens, self.causal,
-                    eredu_nn::BlockwiseAttentionOptions { arithmetic: self.arithmetic, softcap: self.softcap })?;
+                source.validate(
+                    [self.batch, self.query_heads, self.query_len, self.head_dim],
+                    self.query_start,
+                    self.sliding_window,
+                    self.prefix_tokens,
+                    self.causal,
+                    eredu_nn::BlockwiseAttentionOptions {
+                        arithmetic: self.arithmetic,
+                        softcap: self.softcap,
+                    },
+                )?;
             } else if self.causal
                 || additive_bias.is_some()
                 || self.arithmetic != eredu_nn::AttentionArithmetic::InputScores
@@ -260,7 +304,9 @@ impl BlockwiseAttentionAccumulator {
         self.accumulate_equation_with_bias(block, additive_bias, stream)?;
         ownership.seal();
         let status = ownership.finish().map_err(|cause| match cause {
-            crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause::Native(cause) => cause,
+            crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause::Native(
+                cause,
+            ) => cause,
             // This ordinary Vec<Array> recovery never installs a registration.
             // Keep fixed refusal transport local to its ordinary Exception API.
             _ => Exception::custom("attention block ownership retirement refused"),
@@ -418,7 +464,10 @@ impl BlockwiseAttentionAccumulator {
                     stream,
                 )?;
             } else {
-                safemlx::transforms::eval(self.accumulator.iter())?;
+                super::super::residency::evaluate_cache_arrays([self
+                    .accumulator
+                    .as_ref()
+                    .expect("value-pass accumulator")])?;
             }
             return Ok(());
         }
@@ -494,7 +543,7 @@ impl BlockwiseAttentionAccumulator {
         if safemlx::OriginalScopeObserver::try_current()?.is_some() {
             safemlx::OperationEvent::complete_nested(roots, stream)?;
         } else {
-            safemlx::transforms::eval(roots)?;
+            super::super::residency::evaluate_cache_arrays(roots)?;
         }
         Ok(())
     }

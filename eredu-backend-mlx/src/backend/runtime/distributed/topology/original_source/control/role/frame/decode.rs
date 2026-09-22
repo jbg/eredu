@@ -42,7 +42,7 @@ impl OriginalParallelControlProjection {
                 OriginalParallelControlOwner(owner.0.clone()),c.clone())?);
             run_native_role_with_pipeline(plan.clone(),plan.capacity,
                 Some(safemlx::PreparedPipelineCachePlan::new(plan.recipe.kernels)),
-                &owner.owner().bank,&owner.owner().controls,c,
+                &owner.owner().native,c,
                 |value,observer|Ok(value.run(observer))).map_err(|cause|Error::with_original_control_source(cause,false))?
         })();
         if result.is_err(){owner.owner().failed.set(true);}

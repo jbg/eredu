@@ -1,7 +1,9 @@
 //! Borrowed parameter-source facts; these are not admission or readiness grants.
 use crate::{ExecutionUnitAddress, ExecutionUnitLayout, WeightBinding};
 use eredu_core::residency::OffloadUnitId;
-use eredu_nn::workspace::{WorkspaceDtype, WorkspaceLayoutError, WorkspaceLayoutView, WorkspaceRepresentation};
+use eredu_nn::workspace::{
+    WorkspaceDtype, WorkspaceLayoutError, WorkspaceLayoutView, WorkspaceRepresentation,
+};
 use std::ops::Range;
 
 /// Where a prospective metadata root may be reused.
@@ -102,9 +104,17 @@ type Result<T> = std::result::Result<T, WorkspaceParameterSourceError>;
 /// This contract conveys facts, not source registration or accounting authority.
 /// The native adapter implements it on the actual owning LayerwiseWorkspace.
 pub trait WorkspaceParameterRows {
+    /// This row uses an actual retained parameter backing installed by the
+    /// same immutable source, rather than a future materialization destination.
+    /// Borrowing this flag creates no storage or execution authority.
+    fn retained_parameter(&self, _unit: usize, _row: usize) -> bool {
+        false
+    }
     /// Exact selected parameters populated by an independent owner, rather than
     /// this unit source. Missing rows must never be used to infer exclusions.
-    fn excludes_parameter(&self, _name: &str) -> bool { false }
+    fn excludes_parameter(&self, _name: &str) -> bool {
+        false
+    }
     /// Retained selected execution layout.
     fn layout(&self) -> &ExecutionUnitLayout;
     /// Architecture address of a local requested slot. Pipeline storage can use
@@ -118,6 +128,11 @@ pub trait WorkspaceParameterRows {
     fn unit(&self, unit: usize) -> Result<WorkspaceParameterUnit<'_>>;
     /// Borrow one physical output declaration.
     fn row(&self, unit: usize, row: usize) -> Result<WorkspaceParameterRow<'_>>;
+    /// Physical placement supplied by the actual selected materialization
+    /// mechanism for this canonical output owner. Missing evidence is incomplete.
+    fn placement(&self, _unit: usize, _row: usize) -> Option<&eredu_core::MemoryPlacement> {
+        None
+    }
     /// Map one selected execution ordinal into the owner closure.
     fn requested_unit(&self, ordinal: usize) -> Result<usize>;
     /// Number of units in the actual permitted window for this ordinal.
@@ -201,8 +216,8 @@ impl WorkspaceParameterTypeLayout {
 /// The returned array and its own result representation are ordinary stack
 /// values, not a hidden allocation. Destination headers and source owners are
 /// intentionally absent from these component facts.
-pub const fn workspace_parameter_control_layouts(
-) -> [(&'static str, WorkspaceParameterTypeLayout); 19] {
+pub const fn workspace_parameter_control_layouts()
+-> [(&'static str, WorkspaceParameterTypeLayout); 19] {
     use WorkspaceParameterTypeLayout as L;
     [
         (
@@ -279,8 +294,10 @@ pub struct WorkspaceParameterRecord {
     representation: Option<WorkspaceRepresentation>,
     physical_bytes: u64,
     root: usize,
+    retained: bool,
 }
-/// A fixed prospective root prototype; not an actual storage allocation.
+/// A fixed source root prototype; not an actual storage allocation. Retained
+/// rows additionally require the producer's installed existing backing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceParameterRootRecord {
     owner: WorkspaceParameterOwner,
@@ -476,7 +493,8 @@ impl WorkspaceParameterTable<'_, '_> {
             .rows
             .get(row)
             .filter(|_| row < self.counts.rows)?;
-        WorkspaceLayoutView::new(&self.destination.shapes[r.shape.clone()], r.dtype?).ok()
+        WorkspaceLayoutView::new(&self.destination.shapes[r.shape.clone()], r.dtype?)
+            .ok()
             .map(|layout| layout.with_representation(r.representation))
     }
     /// Actual selected physical bytes; these need not equal represented bytes.
@@ -578,7 +596,12 @@ fn validate(source: &dyn WorkspaceParameterRows) -> Result<WorkspaceParameterCou
                 return Err(MissingIndex);
             }
             let canonical = source.row(owner.unit, owner.row)?;
-            if canonical.owner != owner || canonical.capacity_bytes != row.capacity_bytes {
+            if canonical.owner != owner
+                || canonical.capacity_bytes != row.capacity_bytes
+                || source.retained_parameter(owner.unit, owner.row)
+                    != source.retained_parameter(u, i)
+                || source.placement(owner.unit, owner.row) != source.placement(u, i)
+            {
                 return Err(SourceMismatch);
             }
             if owner.unit == u && owner.row == i {
@@ -664,6 +687,7 @@ fn write_validated(
                 representation: row.representation,
                 physical_bytes: row.physical_bytes,
                 root,
+                retained: source.retained_parameter(u, i),
             };
             if canonical {
                 d.roots[root] = WorkspaceParameterRootRecord {

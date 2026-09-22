@@ -15,7 +15,7 @@ use crate::working_memory::InferenceStateRetention;
 use crate::{
     prefill::{
         PrefillBoundary, PrefillChunk, PrefillControlPlan, PrefillControlRole, PrefillExecutor,
-        PrefillSpanControlPhase,
+        PrefillSchedulingAuthority, PrefillSpanControlPhase,
     },
     working_memory::{InferenceExecutionIdentity, InferenceRequest, WorkingMemoryError},
 };
@@ -54,10 +54,10 @@ where
 /// Completion returned only after both session state and its native reservation
 /// scope have settled. Retains the same request charge until the consumer drops it.
 #[derive(Debug)]
-pub struct SettledPrefillCompletion {
-    _reservation: InferenceRequest,
+pub struct SettledPrefillCompletion<R = InferenceRequest> {
+    _reservation: R,
 }
-impl Completion for SettledPrefillCompletion {
+impl<R> Completion for SettledPrefillCompletion<R> {
     type Error = std::convert::Infallible;
     fn is_complete(&self) -> Result<bool, Self::Error> {
         Ok(true)
@@ -73,8 +73,17 @@ impl Completion for SettledPrefillCompletion {
 /// Adapts one session and prepared ingress to [`crate::prefill::PrefillDriver`].
 /// The exclusive session loan prevents advancement, restore or mutation outside
 /// the driver. `step` and `run` use this same executor and transaction engine.
-pub struct SessionPrefill<'a, A, B, M, D, P, O: ?Sized, K = OrdinaryPrefillSpan>
-where
+pub struct SessionPrefill<
+    'a,
+    A,
+    B,
+    M,
+    D,
+    P,
+    O: ?Sized,
+    K = OrdinaryPrefillSpan,
+    R = InferenceRequest,
+> where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
     A: LayeredArchitecture<B, M::State>,
@@ -86,7 +95,7 @@ where
     source: P,
     geometry: InferenceGeometry,
     controls: PrefillControlPlan,
-    request: InferenceRequest,
+    request: R,
     observer: &'a mut O,
     context: &'a <B::Tensor as Tensor>::Context,
     // Issued only after canonical model/guard success. Drop never releases pins.
@@ -149,7 +158,8 @@ where
     }
 }
 
-impl<'a, A, B, M, D, P, O, K> SessionPrefill<'a, A, B, M, D, P, O, K>
+impl<'a, A, B, M, D, P, O, K, R: PrefillSchedulingAuthority>
+    SessionPrefill<'a, A, B, M, D, P, O, K, R>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
@@ -165,7 +175,7 @@ where
     fn new_with_operation(
         session: &'a mut ReplicatedTextSession<A, B, M, D>,
         source: P,
-        reservation: impl Into<InferenceRequest>,
+        reservation: impl Into<R>,
         context: &'a <B::Tensor as Tensor>::Context,
         observer: &'a mut O,
         operation: K,
@@ -185,11 +195,7 @@ where
         if session.control_fence.is_some() {
             return Err(WorkingMemoryError::ExecutionFenced);
         }
-        let controls = PrefillControlPlan::new(
-            geometry,
-            reservation.memory_reservation().is_some()
-                || session.state.inference_retention().admission().is_some(),
-        )?;
+        let controls = PrefillControlPlan::new(geometry, true)?;
         Ok(Self {
             session,
             source,
@@ -214,7 +220,7 @@ where
 
     fn agree_cancellation_at_boundary(
         &mut self,
-        reservation: InferenceRequest,
+        reservation: R,
         boundary: PrefillBoundary,
         locally_cancelled: impl FnOnce() -> bool,
     ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
@@ -228,7 +234,7 @@ where
 
     fn agree_cancellation_retained(
         &mut self,
-        reservation: InferenceRequest,
+        reservation: R,
         boundary: PrefillBoundary,
         locally_cancelled: impl FnOnce() -> bool,
     ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
@@ -244,19 +250,20 @@ where
         )?;
         let retained = self
             .session
-            .mechanisms
-            .coordinate_prefill_entry(reservation.clone(), Some(role));
+            .coordinate_scheduling_entry(&reservation, Some(role));
         let guard = match retained {
             Ok(guard) => guard,
             Err(error) => {
                 self.session
                     .fence_terminal(crate::DistributedExecutionPhase::PrefillReservation);
-                return Err(ReplicatedTextSessionError::Mechanism(error));
+                return Err(error);
             }
         };
         let retirement = match self.pending_retention.take() {
             Some(ticket) => ticket
-                .validate_request(&reservation)
+                .validate_request(reservation.inference_request().ok_or(
+                    ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::IdentityMismatch),
+                )?)
                 .map_err(ReplicatedTextSessionError::WorkingMemory)
                 .and_then(|()| {
                     if self.session.mechanisms.requires_prefill_opening_sources() {
@@ -264,7 +271,7 @@ where
                             ReplicatedTextSession::<A, B, M, D>::validated_prefill_source_paths(
                                 self.session.mechanisms.requires_prepared_prefill_sources(),
                                 &self.session.execution,
-                                self.session.observation_paths.as_ref(),
+                                self.session.observation_paths.get(),
                             )?;
                         let execution = crate::inspection::RuntimeOpeningExecution::new(
                             &self.session.execution,
@@ -321,7 +328,8 @@ where
     }
 }
 
-impl<A, B, M, D, P, O, K> PrefillExecutor for SessionPrefill<'_, A, B, M, D, P, O, K>
+impl<A, B, M, D, P, O, K, R: PrefillSchedulingAuthority> PrefillExecutor<R>
+    for SessionPrefill<'_, A, B, M, D, P, O, K, R>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
@@ -333,14 +341,14 @@ where
     K: SpanLifecycle<A, B, M, D, P, O>,
 {
     type Output = B::Tensor;
-    type Completion = SettledPrefillCompletion;
+    type Completion = SettledPrefillCompletion<R>;
     type Error = ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>;
 
     fn agree_cancellation_at(
         &mut self,
         boundary: PrefillBoundary,
         cancellation: &GenerationCancellationToken,
-        reservation: InferenceRequest,
+        reservation: R,
     ) -> Result<bool, Self::Error> {
         self.agree_cancellation_at_boundary(reservation, boundary, || cancellation.is_cancelled())
     }
@@ -348,7 +356,7 @@ where
     fn submit_chunk(
         &mut self,
         chunk: &PrefillChunk,
-        reservation: InferenceRequest,
+        reservation: R,
     ) -> Result<Submission<Option<Self::Output>, Self::Completion>, Self::Error> {
         self.with_terminal_unwind(
             crate::DistributedExecutionPhase::PrefillReservation,
@@ -357,7 +365,7 @@ where
     }
 }
 
-impl<A, B, M, D, P, O, K> SessionPrefill<'_, A, B, M, D, P, O, K>
+impl<A, B, M, D, P, O, K, R: PrefillSchedulingAuthority> SessionPrefill<'_, A, B, M, D, P, O, K, R>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
@@ -371,9 +379,9 @@ where
     fn submit_chunk_retained(
         &mut self,
         chunk: &PrefillChunk,
-        reservation: InferenceRequest,
+        reservation: R,
     ) -> Result<
-        Submission<Option<B::Tensor>, SettledPrefillCompletion>,
+        Submission<Option<B::Tensor>, SettledPrefillCompletion<R>>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.request
@@ -388,8 +396,8 @@ where
                 "bounded prefill requires exact state completion".into(),
             ));
         }
-        let guard = match self.session.mechanisms.coordinate_prefill_entry(
-            reservation.clone(),
+        let guard = match self.session.coordinate_scheduling_entry(
+            &reservation,
             Some(PrefillControlRole::for_chunk(
                 PrefillSpanControlPhase::SpanOuter,
                 chunk,
@@ -399,7 +407,7 @@ where
             Err(error) => {
                 self.session
                     .fence_terminal(crate::DistributedExecutionPhase::PrefillReservation);
-                return Err(ReplicatedTextSessionError::Mechanism(error));
+                return Err(error);
             }
         };
         let frontier = self
@@ -432,13 +440,19 @@ where
                     WorkingMemoryError::IdentityMismatch,
                 ));
             }
-            self.operation
-                .validate_admission(
-                    &self.source,
-                    self.session.state.inference_retention(),
-                    &reservation,
-                )
-                .map_err(ReplicatedTextSessionError::WorkingMemory)?;
+            if let Some(request) = reservation.inference_request() {
+                self.operation
+                    .validate_admission(
+                        &self.source,
+                        self.session.state.inference_retention(),
+                        request,
+                    )
+                    .map_err(ReplicatedTextSessionError::WorkingMemory)?;
+            } else {
+                self.operation
+                    .validate_speculative_admission(&self.source)
+                    .map_err(ReplicatedTextSessionError::WorkingMemory)?;
+            }
             Ok(epoch)
         })();
         let agreement = self.session.agree_execution_phase(
@@ -460,11 +474,13 @@ where
         // The resulting cache can outlive the executor and its completion. Keep
         // its charge with state before preparation, including failed mutations
         // and rollback. Native guards independently cover unresolved work.
-        self.operation.admit(
-            &mut self.source,
-            self.session.state.inference_retention_mut(),
-            &reservation,
-        );
+        if let Some(request) = reservation.inference_request() {
+            self.operation.admit(
+                &mut self.source,
+                self.session.state.inference_retention_mut(),
+                request,
+            );
+        }
         // Preparation belongs inside native retention, including failures before
         // the session receives a borrowed input. Keep owned views through settling.
         let identity = (chunk.input.end == self.geometry.input_positions)
@@ -473,7 +489,9 @@ where
         // The observer's span admission shares the original preparation guard.
         // Its error follows the existing input agreement on every rank before
         // any prepared chunk can enter the model transaction.
-        let retention_context = PrefillChunkRetentionContext::new(&reservation, chunk, epoch);
+        let retention_context = reservation
+            .inference_request()
+            .map(|request| PrefillChunkRetentionContext::new(request, chunk, epoch));
         let mut registration = None;
         let source = &mut self.source;
         let operation = &mut self.operation;
@@ -486,11 +504,12 @@ where
                     .begin_prefill_chunk(chunk)
                     .map_err(ReplicatedTextSessionError::Architecture)
                     .and_then(|()| {
+                        if let Some(retention_context) = &retention_context {
                         if session.mechanisms.requires_prefill_opening_sources() {
                             let paths = ReplicatedTextSession::<A, B, M, D>::validated_prefill_source_paths(
                                 session.mechanisms.requires_prepared_prefill_sources(),
                                 &session.execution,
-                                session.observation_paths.as_ref(),
+                                session.observation_paths.get(),
                             )?;
                             let execution = crate::inspection::RuntimeOpeningExecution::new(
                                 &session.execution,
@@ -505,10 +524,12 @@ where
                                 )
                                 .map_err(ReplicatedTextSessionError::Mechanism)?;
                         }
+                        }
                         // Both source loans end before observer retention or input work.
                         Ok(())
                     })
                     .and_then(|()| {
+                        let Some(retention_context) = &retention_context else { return Ok(None); };
                         let result = if observer.requires_prefill_opening_state() {
                             let source =
                                 crate::inspection::RuntimeOpeningState::<B, _>::new(&session.state);
@@ -525,7 +546,7 @@ where
                         registration = retained;
                         if let Some(retained) = &registration {
                             retained
-                                .validate_context(&retention_context)
+                                .validate_context(retention_context.as_ref().ok_or(ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::IdentityMismatch))?)
                                 .map_err(ReplicatedTextSessionError::WorkingMemory)?;
                         }
                         operation
@@ -583,12 +604,12 @@ where
         guard: M::PrefillReservationGuard,
         input: Result<&'s K::Chunk, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
         chunk: &PrefillChunk,
-        reservation: InferenceRequest,
+        reservation: R,
         epoch: DistributedCommitEpoch,
         registration: Option<PreparedPrefillChunkRetention>,
         pending: &mut Option<SettledPrefillChunkRetention>,
     ) -> Result<
-        Submission<Option<B::Tensor>, SettledPrefillCompletion>,
+        Submission<Option<B::Tensor>, SettledPrefillCompletion<R>>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         let role = PrefillControlRole::for_chunk(PrefillSpanControlPhase::InputTransaction, chunk);
@@ -617,12 +638,18 @@ where
         }
         let retention_ready = registration.as_ref().map_or(Ok(()), |retained| {
             retained.validate_commit(
-                &PrefillChunkRetentionContext::new(&reservation, chunk, epoch),
+                &PrefillChunkRetentionContext::new(
+                    reservation
+                        .inference_request()
+                        .ok_or(WorkingMemoryError::IdentityMismatch)?,
+                    chunk,
+                    epoch,
+                ),
                 target_commit,
             )
         });
-        let agreement_guard = match session.mechanisms.coordinate_prefill_entry(
-            reservation.clone(),
+        let agreement_guard = match session.coordinate_scheduling_entry(
+            &reservation,
             Some(PrefillControlRole::for_chunk(
                 PrefillSpanControlPhase::SettlementAgreement,
                 chunk,
@@ -633,7 +660,7 @@ where
                 session
                     .fence_terminal(crate::DistributedExecutionPhase::PrefillReservationCompletion);
                 retention_ready.map_err(ReplicatedTextSessionError::WorkingMemory)?;
-                return Err(ReplicatedTextSessionError::Mechanism(error));
+                return Err(error);
             }
         };
         let agreement = session.agree_execution_phase(
@@ -677,12 +704,71 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
+    fn coordinate_scheduling_entry<R: PrefillSchedulingAuthority>(
+        &mut self,
+        authority: &R,
+        role: Option<PrefillControlRole>,
+    ) -> Result<
+        M::PrefillReservationGuard,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        match (
+            authority.inference_request(),
+            authority.speculative_schedule(),
+        ) {
+            (Some(request), None) => self
+                .mechanisms
+                .coordinate_prefill_entry(request.clone(), role)
+                .map_err(ReplicatedTextSessionError::Mechanism),
+            (None, Some(external)) => self
+                .mechanisms
+                .coordinate_speculative_prefill_entry(external, role)
+                .map_err(ReplicatedTextSessionError::Mechanism)?
+                .ok_or(ReplicatedTextSessionError::WorkingMemory(
+                    WorkingMemoryError::UnknownBound,
+                )),
+            _ => Err(ReplicatedTextSessionError::WorkingMemory(
+                WorkingMemoryError::IdentityMismatch,
+            )),
+        }
+    }
+
+    fn validate_speculative_scheduling(
+        &self,
+        authority: &crate::working_memory::SpeculativePrefillScheduleAuthority,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        use crate::DistributedExecutionPhase as Phase;
+        for phase in [
+            Phase::PrefillSourcePreparation,
+            Phase::PrefillSourceSelection,
+            Phase::PrefillReservation,
+            Phase::PrefillCancellation,
+            Phase::PrefillReservationCompletion,
+        ] {
+            if D::parallel_control_operation(
+                &self.execution,
+                super::ParallelControlEvent::Phase(phase),
+            )
+            .is_some()
+            {
+                if !self
+                    .mechanisms
+                    .has_speculative_parallel_control(authority)
+                    .map_err(ReplicatedTextSessionError::Mechanism)?
+                {
+                    return Err(ReplicatedTextSessionError::WorkingMemory(
+                        WorkingMemoryError::UnknownBound,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Selects semantic ingress under the caller's exact request authority.
-    /// A supplied request is never replaced with unbudgeted authority or a
-    /// whole-input fallback. Its geometry and opening state are checked before
+    /// A supplied request retains its original authority and geometry. Its geometry and opening state are checked before
     /// source construction; the same charge remains with committed state and
-    /// governs later decode. `None` explicitly selects unbudgeted ingress
-    /// through the same source preparation and lifecycle worker.
+    /// governs later decode. Missing authority is a typed admission failure.
     ///
     /// This gateway returns ordinary final-position scores. Physical Sequence
     /// capture also requires its original accepted span/path view and current
@@ -759,84 +845,51 @@ where
         })
     }
 
-    /// Unbudgeted selected last-position prefill with exact completed-position
-    /// telemetry, including an agreed cancellation before any sampling.
-    pub fn try_prefill_unbudgeted_source_progress_cancellable<P, O>(
+    /// Runs externally admitted spans through the shared scheduling worker.
+    /// The scheduling issuer funds host control; each operation must retain its
+    /// independent native occurrence and completion custody.
+    pub fn try_prefill_speculative_source_with_operation<P, O, K>(
         &mut self,
+        authority: crate::working_memory::SpeculativePrefillScheduleAuthority,
         shape: Option<[u64; 2]>,
         max_chunk_positions: Option<std::num::NonZeroU64>,
+        output_demand: OutputDemand,
         make_source: impl FnOnce(InferenceGeometry) -> Result<Option<P>, A::Error>,
         cancellation: &GenerationCancellationToken,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
+        operation: K,
     ) -> Result<
-        PrefillSourceProgress<B::Tensor>,
+        PrefillSourceProgress<Option<B::Tensor>>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     >
     where
         P: PreparedPrefillSource<A, B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+        K: PrefillSpanOperation<A, B, M, D, P, O>,
     {
-        self.try_prefill_score_source_progress_cancellable(
-            None,
+        self.try_prefill_source_with_authority(
+            authority,
             shape,
             max_chunk_positions,
-            make_source,
+            output_demand,
+            |_, authority| {
+                make_source(authority.geometry()).map_err(ReplicatedTextSessionError::Architecture)
+            },
             cancellation,
             context,
             observer,
+            lifecycle::ExistingSpan(operation),
+            false,
+            None,
         )
     }
 
-    /// Executes state-only semantic ingress through the same selected source,
-    /// session transactions, completion, cancellation agreement and chunk driver.
-    /// No vocabulary result is created or indexed. This explicitly unbudgeted
-    /// mechanism adds no original admission or whole-input fallback.
-    pub fn try_prefill_unbudgeted_state_source_cancellable<P, O>(
+    /// Executes a custom span operation under an already admitted request.
+    /// Source selection, state advancement and completion use the shared driver.
+    pub fn try_prefill_admitted_source_with_operation<P, O, K>(
         &mut self,
-        shape: Option<[u64; 2]>,
-        max_chunk_positions: Option<std::num::NonZeroU64>,
-        make_source: impl FnOnce(InferenceGeometry) -> Result<Option<P>, A::Error>,
-        cancellation: &eredu_core::GenerationCancellationToken,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<
-        PrefillSourceProgress<()>,
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
-    >
-    where
-        P: PreparedPrefillSource<A, B, M::State>,
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-    {
-        let progress = self.try_prefill_source_output_cancellable(
-            None,
-            shape,
-            max_chunk_positions,
-            OutputDemand::StateOnly,
-            make_source,
-            cancellation,
-            context,
-            observer,
-        )?;
-        let outcome = match progress.outcome {
-            PrefillSourceOutcome::Unavailable => Ok(PrefillSourceOutcome::Unavailable),
-            PrefillSourceOutcome::Cancelled => Ok(PrefillSourceOutcome::Cancelled),
-            PrefillSourceOutcome::Complete(None) => Ok(PrefillSourceOutcome::Complete(())),
-            PrefillSourceOutcome::Complete(Some(_)) => Err(ReplicatedTextSessionError::Contract(
-                "state-only prefill unexpectedly produced scores".into(),
-            )),
-        }?;
-        Ok(PrefillSourceProgress {
-            outcome,
-            completed_positions: progress.completed_positions,
-        })
-    }
-
-    /// Runs an explicitly ordinary captured/auxiliary span operation under the
-    /// same source preparation, chunk guard and driver. This adds no original
-    /// managed admission; an admitted request cannot enter this operation mode.
-    pub fn try_prefill_unbudgeted_source_with_operation<P, O, K>(
-        &mut self,
+        admitted: &InferenceRequest,
         shape: Option<[u64; 2]>,
         max_chunk_positions: Option<std::num::NonZeroU64>,
         output_demand: OutputDemand,
@@ -855,7 +908,7 @@ where
         K: PrefillSpanOperation<A, B, M, D, P, O>,
     {
         self.try_prefill_source_output_with_operation(
-            None,
+            Some(admitted),
             shape,
             max_chunk_positions,
             output_demand,
@@ -962,32 +1015,84 @@ where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
         K: SpanLifecycle<A, B, M, D, P, O>,
     {
+        let request = admitted.ok_or_else(|| {
+            ReplicatedTextSessionError::BeforeStateMutation(Box::new(
+                ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::UnknownBound),
+            ))
+        })?;
+        self.try_prefill_source_with_authority(
+            request.clone(),
+            shape,
+            max_chunk_positions,
+            output_demand,
+            make_source,
+            cancellation,
+            context,
+            observer,
+            operation,
+            retained_media,
+            media_metadata,
+        )
+    }
+
+    pub(super) fn try_prefill_source_with_authority<P, O, K, R: PrefillSchedulingAuthority>(
+        &mut self,
+        request: R,
+        shape: Option<[u64; 2]>,
+        max_chunk_positions: Option<std::num::NonZeroU64>,
+        output_demand: OutputDemand,
+        make_source: impl FnOnce(
+            &Self,
+            &R,
+        ) -> Result<
+            Option<P>,
+            ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+        >,
+        cancellation: &eredu_core::GenerationCancellationToken,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        operation: K,
+        retained_media: bool,
+        media_metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<
+        PrefillSourceProgress<Option<B::Tensor>>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+        K: SpanLifecycle<A, B, M, D, P, O>,
+    {
         self.ensure_control_unfenced()?;
         let frontier = self.mechanisms.prefill_state_frontier(&self.state);
         // A failed original input still enters protocol selection with peers;
         // it returns to the ordinary result-bearing admission path below.
         let valid_shape = shape.filter(|shape| shape[0] > 0 && shape[1] > 0);
-        let [batch_size, input_positions] = valid_shape.unwrap_or([1, 1]);
-        let default_geometry = InferenceGeometry {
-            batch_size,
-            cached_positions: frontier.as_ref().ok().copied().flatten().unwrap_or(0),
-            input_positions,
-            max_output_tokens: 0,
-            prefill_chunk_positions: max_chunk_positions
-                .map(std::num::NonZeroU64::get)
-                .unwrap_or(crate::prefill::DEFAULT_PREFILL_CHUNK_POSITIONS)
-                .min(input_positions),
-            output: output_demand,
-        };
-        let request = match admitted {
-            Some(request) => request.clone(),
-            None => InferenceRequest::without_memory_budget(
-                self.inference_execution_identity(),
-                default_geometry,
-            )
-            .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?,
-        };
+        let ordinary = request.inference_request().is_some();
+        if !ordinary {
+            self.validate_speculative_scheduling(request.speculative_schedule().ok_or(
+                ReplicatedTextSessionError::WorkingMemory(WorkingMemoryError::IdentityMismatch),
+            )?)?;
+            if retained_media
+                || observer.transactional()
+                || observer.requires_prepared_traversal()
+                || observer.requires_sequence_readout()
+                || observer.requires_prefill_opening_state()
+                || operation.score_layout() != PrefillScoreLayout::SelectedPositions
+            {
+                return Err(ReplicatedTextSessionError::WorkingMemory(
+                    WorkingMemoryError::UnknownBound,
+                ));
+            }
+        }
         let geometry = request.geometry();
+        if geometry.output != output_demand && !ordinary {
+            return Err(ReplicatedTextSessionError::WorkingMemory(
+                WorkingMemoryError::OutputDemandMismatch {
+                    admitted: geometry.output,
+                    required: output_demand,
+                },
+            ));
+        }
         let execution = self.inference_execution_identity().clone();
         let reject_request = |error| {
             ReplicatedTextSessionError::BeforeStateMutation(Box::new(
@@ -1000,7 +1105,7 @@ where
         // This ordinary media path cannot reinterpret even a converted original
         // reservation as unbudgeted. Reject before its plan factory or driver claim.
         if retained_media
-            && request.memory_reservation().is_some()
+            && ordinary
             && media_metadata.is_none_or(|metadata| metadata.metadata_funding().is_none())
         {
             return Err(reject_request(WorkingMemoryError::UnknownBound));
@@ -1010,7 +1115,7 @@ where
         // These immutable loans end before any observer or source callback.
         let ordinary_capture = if let Some(capture) = observer.ordinary_prefill_capture() {
             if !retained_media
-                || request.memory_reservation().is_some()
+                || ordinary
                 || !observer.requires_prepared_traversal()
                 || !observer.transactional()
             {
@@ -1019,7 +1124,7 @@ where
             let paths = Self::validated_prefill_source_paths(
                 true,
                 &self.execution,
-                self.observation_paths.as_ref(),
+                self.observation_paths.get(),
             )
             .map_err(|error| ReplicatedTextSessionError::BeforeStateMutation(Box::new(error)))?
             .ok_or_else(|| reject_request(WorkingMemoryError::IdentityMismatch))?;
@@ -1031,18 +1136,24 @@ where
             false
         };
         let accepted_capture = if let Some(capture) = observer.admitted_prefill_capture() {
-            if admitted.is_none()
+            if !ordinary
                 || !observer.requires_prepared_traversal()
                 || !observer.transactional()
                 || (retained_media && !capture.selection().selection().is_prepared_media())
             {
                 return Err(reject_request(WorkingMemoryError::IdentityMismatch));
             }
-            capture.validate_request(&request).map_err(reject_request)?;
+            capture
+                .validate_request(
+                    request
+                        .inference_request()
+                        .ok_or_else(|| reject_request(WorkingMemoryError::IdentityMismatch))?,
+                )
+                .map_err(reject_request)?;
             let paths = Self::validated_prefill_source_paths(
                 true,
                 &self.execution,
-                self.observation_paths.as_ref(),
+                self.observation_paths.get(),
             )
             .map_err(|error| ReplicatedTextSessionError::BeforeStateMutation(Box::new(error)))?
             .expect("required current prepared paths");
@@ -1054,18 +1165,24 @@ where
             }
             true
         } else if let Some(capture) = observer.admitted_capture_continuation() {
-            if admitted.is_none()
+            if !ordinary
                 || !observer.requires_prepared_traversal()
                 || !observer.transactional()
                 || (retained_media && !capture.selection().is_prepared_media())
             {
                 return Err(reject_request(WorkingMemoryError::IdentityMismatch));
             }
-            capture.validate_request(&request).map_err(reject_request)?;
+            capture
+                .validate_request(
+                    request
+                        .inference_request()
+                        .ok_or_else(|| reject_request(WorkingMemoryError::IdentityMismatch))?,
+                )
+                .map_err(reject_request)?;
             let paths = Self::validated_prefill_source_paths(
                 true,
                 &self.execution,
-                self.observation_paths.as_ref(),
+                self.observation_paths.get(),
             )
             .map_err(|error| ReplicatedTextSessionError::BeforeStateMutation(Box::new(error)))?
             .ok_or_else(|| reject_request(WorkingMemoryError::IdentityMismatch))?;
@@ -1076,7 +1193,7 @@ where
         } else {
             ordinary_capture
         };
-        let mut admitted_driver = if admitted.is_some() {
+        let mut admitted_driver = {
             let check = (|| {
                 if !self.selected.exact_completion_available() {
                     return Err(WorkingMemoryError::CompletionUnavailable);
@@ -1093,8 +1210,15 @@ where
                 }
                 let output_supported = match geometry.output {
                     OutputDemand::LastPosition => !observer.requires_sequence_readout(),
-                    OutputDemand::Sequence => accepted_capture,
-                    OutputDemand::StateOnly => false,
+                    OutputDemand::Sequence => {
+                        accepted_capture
+                            || (!observer.requires_sequence_readout()
+                                && output_demand == OutputDemand::Sequence)
+                    }
+                    OutputDemand::StateOnly => {
+                        !observer.requires_sequence_readout()
+                            && output_demand == OutputDemand::StateOnly
+                    }
                 };
                 if !output_supported {
                     return Err(WorkingMemoryError::OutputDemandMismatch {
@@ -1121,22 +1245,20 @@ where
             // Claim one-use authority before invoking a potentially allocating
             // source factory. Retention clones cannot prepare a second request.
             Some(
-                crate::prefill::PrefillDriver::new(
+                crate::prefill::PrefillDriver::new_scheduled(
                     &execution,
-                    &request,
+                    request.clone(),
                     geometry,
                     cancellation.clone(),
                 )
                 .map_err(reject_request)?,
             )
-        } else {
-            None
         };
         let guard = match self.with_terminal_unwind(
             crate::DistributedExecutionPhase::PrefillSourcePreparation,
             |session| {
-                session.mechanisms.coordinate_prefill_entry(
-                    request.clone(),
+                session.coordinate_scheduling_entry(
+                    &request,
                     Some(PrefillControlRole::SourcePreparation),
                 )
             },
@@ -1144,10 +1266,10 @@ where
             Ok(guard) => guard,
             Err(error) => {
                 self.fence_terminal(crate::DistributedExecutionPhase::PrefillSourcePreparation);
-                return Err(ReplicatedTextSessionError::Mechanism(match frontier {
-                    Err(prior) => prior,
+                return Err(match frontier {
+                    Err(prior) => ReplicatedTextSessionError::Mechanism(prior),
                     Ok(_) => error,
-                }));
+                });
             }
         };
         let source = self.with_terminal_unwind(
@@ -1221,7 +1343,7 @@ where
             return Err(ReplicatedTextSessionError::Mechanism(error));
         }
         if !selected.map_err(widen_infallible)? {
-            if admitted.is_some() || retained_media {
+            if ordinary || retained_media {
                 return Err(reject_request(
                     WorkingMemoryError::PreparedSourceUnavailable,
                 ));
@@ -1241,7 +1363,7 @@ where
         let mut executor = SessionPrefill::new_with_operation(
             self,
             source,
-            &request,
+            request.clone(),
             context,
             &mut *observation.observer,
             operation,
@@ -1249,9 +1371,9 @@ where
         .map_err(ReplicatedTextSessionError::WorkingMemory)?;
         let mut driver = match admitted_driver.take() {
             Some(driver) => driver,
-            None => crate::prefill::PrefillDriver::new(
+            None => crate::prefill::PrefillDriver::new_scheduled(
                 &execution,
-                &request,
+                request.clone(),
                 geometry,
                 cancellation.clone(),
             )
@@ -1307,15 +1429,13 @@ where
         let guard = match self.with_terminal_unwind(
             crate::DistributedExecutionPhase::PrefillReservationCompletion,
             |session| {
-                session
-                    .mechanisms
-                    .coordinate_prefill_entry(request, Some(PrefillControlRole::FinalIndex))
+                session.coordinate_scheduling_entry(&request, Some(PrefillControlRole::FinalIndex))
             },
         ) {
             Ok(guard) => guard,
             Err(error) => {
                 self.fence_terminal(crate::DistributedExecutionPhase::PrefillReservationCompletion);
-                return Err(ReplicatedTextSessionError::Mechanism(error));
+                return Err(error);
             }
         };
         let output = self.with_terminal_unwind(

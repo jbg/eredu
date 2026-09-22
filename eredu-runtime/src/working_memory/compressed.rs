@@ -58,7 +58,10 @@ impl WorkspaceCompressedCache {
                 latent_dim,
                 rotary_dim,
             } if i32::try_from(latent_dim.get()).ok() == Some(self.latent_width)
-                && i32::try_from(rotary_dim.get()).ok() == Some(self.rotary_width) => Ok(()),
+                && i32::try_from(rotary_dim.get()).ok() == Some(self.rotary_width) =>
+            {
+                Ok(())
+            }
             _ => Err(context.metadata_error(format_args!(
                 "projected compressed state differs from its full-attention policy"
             ))),

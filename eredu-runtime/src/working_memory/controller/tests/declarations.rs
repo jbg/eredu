@@ -38,27 +38,43 @@ struct DeclaredController {
 fn estimated_declaration_admission_preserves_unknown_capacity_and_alias_custody() {
     struct Opaque;
     impl ControllerDeclarationData for Opaque {
-        fn owned_capacity_bytes(&self) -> Option<u64> { None }
-        fn admission_bytes(&self) -> Option<u64> { Some(73) }
+        fn owned_capacity_bytes(&self) -> Option<u64> {
+            None
+        }
+        fn admission_bytes(&self) -> Option<u64> {
+            Some(73)
+        }
     }
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
-    let source = pool.prepare_shared_controller_declaration(|| Ok(Opaque)).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
+    let source = pool
+        .prepare_shared_controller_declaration(|| Ok(Opaque))
+        .unwrap();
     assert_eq!(source.capacity_bytes(), None);
     assert_eq!(source.admission_bytes(), Some(73));
     let alias = source.clone();
-    let mut controller = DeclaredController { sources: vec![source.clone(), source], additional: 73 };
+    let mut controller = DeclaredController {
+        sources: vec![source.clone(), source],
+        additional: 73,
+    };
     let contract = ControllerStorageContract::inspect(&controller).unwrap();
     assert_eq!(contract.shared.len(), 1);
     assert_eq!(contract.shared_bytes, 73);
-    contract.validate_workspace(controller.inference_workspace(1).unwrap()).unwrap();
+    contract
+        .validate_workspace(controller.inference_workspace(1).unwrap())
+        .unwrap();
     controller.additional = 72;
-    assert!(matches!(contract.validate_workspace(controller.inference_workspace(1).unwrap()),
-        Err(ControllerStorageError::UnpricedSharedStorage { required_bytes: 73, available_bytes: 72 })));
-    assert_eq!(balances(&pool), (0, 73, 73));
+    assert!(matches!(
+        contract.validate_workspace(controller.inference_workspace(1).unwrap()),
+        Err(ControllerStorageError::UnpricedSharedStorage {
+            required_bytes: 73,
+            available_bytes: 72
+        })
+    ));
+    assert_eq!(balances(&pool), (0, 73));
     drop((contract, controller));
-    assert_eq!(balances(&pool), (0, 73, 73));
+    assert_eq!(balances(&pool), (0, 73));
     drop(alias);
-    assert_eq!(balances(&pool), (0, 0, 73));
+    assert_eq!(balances(&pool), (0, 0));
 }
 impl TokenFilterController for DeclaredController {
     type Error = Infallible;
@@ -88,7 +104,7 @@ impl TokenFilterController for DeclaredController {
 
 #[test]
 fn immutable_declaration_inventory_preserves_capacity_identity_and_final_alias_custody() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let retired = Arc::new(AtomicBool::new(false));
     let source = pool
         .prepare_shared_controller_declaration(|| {
@@ -101,7 +117,7 @@ fn immutable_declaration_inventory_preserves_capacity_identity_and_final_alias_c
         source.declaration::<Declaration>().unwrap().words,
         [3, 7, 11]
     );
-    assert_eq!(balances(&pool), (0, 52, 52));
+    assert_eq!(balances(&pool), (0, 52));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let escaped = source.clone();
     let mut controller = DeclaredController {
@@ -143,7 +159,10 @@ fn immutable_declaration_inventory_preserves_capacity_identity_and_final_alias_c
         ))
     ));
     let foreign_retired = Arc::new(AtomicBool::new(false));
-    let foreign = SharedControllerDeclaration::new(Declaration::new(13, &foreign_retired), eredu_core::HostPreparationAuthority::unmanaged());
+    let foreign = SharedControllerDeclaration::new(
+        Declaration::new(13, &foreign_retired),
+        eredu_core::HostPreparationAuthority::unmanaged(),
+    );
     assert!(!foreign.same_storage(&escaped));
     let replacement = DeclaredController {
         sources: vec![foreign],
@@ -160,30 +179,30 @@ fn immutable_declaration_inventory_preserves_capacity_identity_and_final_alias_c
         }
     }
     escaped
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(AfterPayload(retired.clone())))
         })
         .unwrap();
-    let (metadata, run) = funding(&pool, 128);
+    let (metadata, run) = funding(&pool, 128, 0);
     let scope = run.scope().unwrap();
     contract.adopt(&controller, &scope).unwrap();
-    assert_eq!(balances(&pool), (128, 52, 180));
+    assert_eq!(balances(&pool), (128, 52));
     scope.certify().unwrap();
     drop((run, controller));
-    assert_eq!(pool.used_bytes().unwrap(), 52);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 52);
     assert!(!retired.load(Ordering::SeqCst));
     drop(escaped);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     // Contract and reservation diagnostics contain no source/account aliases.
     drop((contract, metadata));
 }
 
 #[test]
 fn declaration_factory_rejection_and_failed_prefix_keep_their_exact_construction_exclusion() {
-    let pool = WorkingMemoryPool::new(512, 0).unwrap();
+    let pool = host_ledger(512, 0).unwrap();
     let reservation = pool
-        .reserve(&InferenceExecutionIdentity::default(), &admission(0))
+        .reserve(&InferenceExecutionIdentity::default(), &admission(&pool, 0))
         .unwrap();
     let calls = Cell::new(0);
     let retired = Arc::new(AtomicBool::new(false));
@@ -215,23 +234,27 @@ fn declaration_factory_rejection_and_failed_prefix_keep_their_exact_construction
         ControllerStorageError::Construction { .. }
     ));
     assert!(!retired.load(Ordering::SeqCst));
-    assert_eq!(balances(&pool), (0, 0, 0));
+    assert_eq!(balances(&pool), (0, 0));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     assert!(matches!(
-        pool.reserve(&InferenceExecutionIdentity::default(), &admission(0)),
+        pool.reserve(&InferenceExecutionIdentity::default(), &admission(&pool, 0)),
         Err(WorkingMemoryError::UnknownBound)
     ));
     drop(failure);
     assert!(retired.load(Ordering::SeqCst));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 
-    let short = WorkingMemoryPool::new(51, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(
+        51 + MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        0,
+    )
+    .unwrap();
     let retired = Arc::new(AtomicBool::new(false));
     let failure = short
         .prepare_shared_controller_declaration(|| Ok(Declaration::new(13, &retired)))
         .unwrap_err();
     assert!(retired.load(Ordering::SeqCst));
     assert_eq!(short.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     drop(failure);
 }

@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::backend::submission_recovery::observed::{
-    operation::OperationRecovery, FinishRetainingError, Observation, ObservedRecovery,
+    operation::OperationRecovery, CompletedObservedRetention, FinishRetainingError, Observation,
+    ObservedRecovery,
 };
 use crate::backend::{
     ordinary_retirement::OrdinaryRetirement,
@@ -87,6 +88,36 @@ impl<U: 'static> Retention for UnitRetention<U> {
 /// manager-lease destruction runs only at an ordinary unlocked host entry.
 pub struct MlxUnitLease<U: 'static> {
     recovery: UnitRecovery<U>,
+}
+
+/// A completed source loan whose module and residency pins remain live while
+/// a separately admitted consumer reads them outside the source scope.
+pub(super) struct CompletedUnitLease<U: 'static> {
+    retained: CompletedObservedRetention<UnitRetention<U>, OriginalOperationMetadataCustody>,
+}
+
+impl<U: 'static> CompletedUnitLease<U> {
+    pub(super) fn retained_leases(&self) -> &[ResidentUnitLease] {
+        match &self.retained.retention().resources()._transfer {
+            MlxUnitTransfer::Ordinary { _transfer } => _transfer.leases(),
+            MlxUnitTransfer::Dense { _transfer } => std::slice::from_ref(_transfer.lease()),
+        }
+    }
+    pub(super) fn unit_mut(&mut self) -> &mut U {
+        &mut self.retained.retention_mut().resources_mut().unit.inner
+    }
+
+    pub(super) fn retire(self) -> Result<(), Error> {
+        self.retained
+            .release_with(release_unit_payload::<U> as fn(&mut UnitRetention<U>))
+            .map(|_| ())
+            .map_err(|error| {
+                let cause = finish_error(error.cause);
+                drop(error.callback);
+                drop(error.pending);
+                cause
+            })
+    }
 }
 
 impl<U: 'static> MlxUnitLease<U> {
@@ -196,14 +227,31 @@ impl<U: 'static> MlxUnitLease<U> {
     /// callback still passes the common terminal-observation and unlocked
     /// retirement path; no polling failure is interpreted as completion.
     pub(super) fn complete_original(
-        mut self,
+        self,
         complete: impl FnOnce(&U, &safemlx::OriginalScopeObserver) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let observer = self.recovery.original_observer()
+        self.complete_original_retaining(complete)?.retire()
+    }
+
+    /// Certify this source's actual transfer and module completion, retaining
+    /// their existing payload and cleanup nodes through a later consumer.
+    pub(super) fn complete_original_retaining(
+        mut self,
+        complete: impl FnOnce(&U, &safemlx::OriginalScopeObserver) -> Result<(), Error>,
+    ) -> Result<CompletedUnitLease<U>, Error> {
+        let observer = self
+            .recovery
+            .original_observer()
             .ok_or(Error::PrefillScopeUnavailable)?;
         complete(&self.recovery.retention().resources().unit.inner, observer)?;
         self.recovery.seal();
-        self.finish_retired()
+        self.synchronize_transfer()?;
+        match self.recovery {
+            OperationRecovery::Original(value) => Ok(CompletedUnitLease {
+                retained: value.finish_retaining().map_err(finish_error)?,
+            }),
+            OperationRecovery::Ordinary(_) => Err(Error::PrefillScopeUnavailable),
+        }
     }
 
     pub(super) fn finish(self) -> Result<(), Error> {
@@ -211,11 +259,16 @@ impl<U: 'static> MlxUnitLease<U> {
         self.finish_retired()
     }
 
-    fn finish_retired(mut self) -> Result<(), Error> {
+    fn synchronize_transfer(&mut self) -> Result<(), Error> {
         match &mut self.recovery.retention_mut().resources_mut()._transfer {
             MlxUnitTransfer::Ordinary { _transfer } => _transfer.synchronize()?,
             MlxUnitTransfer::Dense { _transfer } => _transfer.synchronize()?,
         }
+        Ok(())
+    }
+
+    fn finish_retired(mut self) -> Result<(), Error> {
+        self.synchronize_transfer()?;
         match self.recovery {
             OperationRecovery::Ordinary(value) => {
                 let status = value.finish()?;
@@ -226,20 +279,10 @@ impl<U: 'static> MlxUnitLease<U> {
                 }
                 Ok(())
             }
-            OperationRecovery::Original(value) => {
-                let completed = value.finish_retaining().map_err(finish_error)?;
-                completed
-                    .release_with(release_unit_payload::<U> as fn(&mut UnitRetention<U>))
-                    .map(|_| ())
-                    .map_err(|error| {
-                        let cause = finish_error(error.cause);
-                        // Abandoned handoff puts T back in the SAME node. Its
-                        // original retirement hook preserves the payload cleanup.
-                        drop(error.callback);
-                        drop(error.pending);
-                        cause
-                    })
+            OperationRecovery::Original(value) => CompletedUnitLease {
+                retained: value.finish_retaining().map_err(finish_error)?,
             }
+            .retire(),
         }
     }
 }

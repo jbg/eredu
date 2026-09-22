@@ -1,0 +1,51 @@
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -17,6 +17,12 @@
+ using HostTransferStorageKind = allocator::HostTransferStorageKind;
+ 
+ class HostTransferStorage;
++
++// Describes the ordinary allocate_shared constructor. Observed controls are
++// debited by its existing physical observer; caller controls are independent.
++MLX_API bool ordinary_host_buffer_observed_controls(
++    allocator::Allocator&, size_t rank, size_t& controls) noexcept;
++
+ class PreparedInputArray;
+ struct DeviceTransfer;
+ 
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -222,6 +222,31 @@
+   AllocationOwners allocation_owners_;
+ };
+ 
++bool ordinary_host_buffer_observed_controls(
++    allocator::Allocator& selected, size_t rank, size_t& out) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  // Shape's existing inline constructor needs no heap destination here.
++  if (rank > Shape::inline_capacity) return false;
++  using Control = std::__shared_ptr_emplace<HostTransferStorage,
++      HostTransferControlAllocator<HostTransferStorage>>;
++  using Rebound = HostTransferControlAllocator<Control>;
++  const size_t fields[] = {
++      allocator::physical_backing_control_bytes(), Rebound::prefix,
++      sizeof(Control), selected.host_transfer_control_bytes(),
++      sizeof(HostTransferConstruction), sizeof(Rebound),
++      sizeof(std::shared_ptr<Control>), sizeof(size_t) * 4};
++  size_t total = 0;
++  for (auto field : fields) {
++    if (field > static_cast<size_t>(PTRDIFF_MAX) - total) return false;
++    total += field;
++  }
++  out = total;
++  return true;
++#else
++  return false;
++#endif
++}
++
+ namespace {
+ // A named owner lets cold inspection distinguish this exact allocation contract
+ // from arbitrary caller-provided deleters. Its lifetime semantics match the

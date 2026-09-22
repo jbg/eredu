@@ -19,7 +19,7 @@ impl ArrayObserverAllocationAuthority {
             _memory: memory,
             _reservations: inference
                 .requests()
-                .filter_map(|request| request.memory_reservation().cloned())
+                .map(|request| request.memory_reservation().clone())
                 .collect(),
         }))
     }
@@ -95,7 +95,7 @@ impl<'a> InspectionCollector<'a> {
             observations
                 .insert(
                     path,
-                    ObservationValue::Tensor(observe_tensor(&value, stream)?),
+                    ObservationValue::Tensor(observe_tensor_retained(&value, stream)?),
                 )
                 .map_err(Error::observation)?;
         }
@@ -131,95 +131,9 @@ impl RuntimeActivationObserver<MlxTensor, Error> for InspectionCollector<'_> {
     }
 }
 
-pub(super) fn observe_tensor(
-    value: &MlxTensor,
-    stream: &Stream,
-) -> Result<TensorObservation, Error> {
-    #[cfg(test)]
-    super::bounded_capture::record_host_read(value.as_array().size());
-    let shape = value
-        .shape()
-        .iter()
-        .map(|dimension| {
-            usize::try_from(*dimension).map_err(|_| {
-                Error::ArchitectureModel(format!(
-                    "observed tensor has negative dimension {dimension}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if shape.contains(&0) {
-        let data = match value.as_array().dtype() {
-            Dtype::Bool => TensorObservationData::Bool(Vec::new()),
-            Dtype::Uint8 | Dtype::Uint16 | Dtype::Uint32 | Dtype::Uint64 => {
-                TensorObservationData::U64(Vec::new())
-            }
-            Dtype::Int8 | Dtype::Int16 | Dtype::Int32 | Dtype::Int64 => {
-                TensorObservationData::I64(Vec::new())
-            }
-            Dtype::Float16 | Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 => {
-                TensorObservationData::F32(Vec::new())
-            }
-            Dtype::Complex64 => {
-                return Err(Error::ArchitectureModel(
-                    "complex activation observation is unsupported".into(),
-                ));
-            }
-        };
-        return TensorObservation::new(shape, data).map_err(Error::observation);
-    }
-    // Preserve the admitted payload capacity even for one-element results;
-    // collecting a generic iterator may otherwise use Vec's minimum growth size.
-    macro_rules! mapped_values {
-        ($ty:ty, $map:expr) => {{
-            let evaluated = value.as_array().evaluated()?;
-            let values = evaluated
-                .try_iter::<$ty>()
-                .map_err(eredu_nn::Error::backend_retained_source)?;
-            let mut output = Vec::with_capacity(values.len());
-            output.extend(values.map($map));
-            output
-        }};
-    }
-    let data = match value.as_array().dtype() {
-        Dtype::Bool => TensorObservationData::Bool(
-            value
-                .as_array()
-                .evaluated()?
-                .try_to_vec::<bool>()
-                .map_err(eredu_nn::Error::backend_retained_source)?,
-        ),
-        Dtype::Uint8 => TensorObservationData::U64(mapped_values!(u8, u64::from)),
-        Dtype::Uint16 => TensorObservationData::U64(mapped_values!(u16, u64::from)),
-        Dtype::Uint32 => TensorObservationData::U64(mapped_values!(u32, u64::from)),
-        Dtype::Uint64 => TensorObservationData::U64(
-            value
-                .as_array()
-                .evaluated()?
-                .try_to_vec::<u64>()
-                .map_err(eredu_nn::Error::backend_retained_source)?,
-        ),
-        Dtype::Int8 => TensorObservationData::I64(mapped_values!(i8, i64::from)),
-        Dtype::Int16 => TensorObservationData::I64(mapped_values!(i16, i64::from)),
-        Dtype::Int32 => TensorObservationData::I64(mapped_values!(i32, i64::from)),
-        Dtype::Int64 => TensorObservationData::I64(
-            value
-                .as_array()
-                .evaluated()?
-                .try_to_vec::<i64>()
-                .map_err(eredu_nn::Error::backend_retained_source)?,
-        ),
-        Dtype::Float16 | Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 => {
-            TensorObservationData::F32(value.to_f32_vec(stream)?)
-        }
-        Dtype::Complex64 => {
-            return Err(Error::ArchitectureModel(
-                "complex activation observation is unsupported".into(),
-            ));
-        }
-    };
-    TensorObservation::new(shape, data).map_err(Error::observation)
-}
+pub(super) mod readback;
+pub(super) use readback::observe_tensor;
+use readback::observe_tensor_retained;
 
 impl<O> RuntimeActivationObserver<Array, Error> for ArrayObserverAdapter<'_, O>
 where
@@ -231,8 +145,17 @@ where
     fn requires_sequence_readout(&self) -> bool {
         self.inner.requires_sequence_readout()
     }
-    fn original_speculative_capture(&self) -> Option<eredu_runtime::capture::OriginalSpeculativeCaptureInvocation<'_>> { self.inner.original_speculative_capture() }
-    fn retain_original_speculative_capture(&mut self, capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), eredu_runtime::capture::CaptureProtocolError> { self.inner.retain_original_speculative_capture(capture) }
+    fn original_speculative_capture(
+        &self,
+    ) -> Option<eredu_runtime::capture::OriginalSpeculativeCaptureInvocation<'_>> {
+        self.inner.original_speculative_capture()
+    }
+    fn retain_original_speculative_capture(
+        &mut self,
+        capture: eredu_core::speculative::SpeculativeActivationCapture,
+    ) -> Result<(), eredu_runtime::capture::CaptureProtocolError> {
+        self.inner.retain_original_speculative_capture(capture)
+    }
     fn admitted_prefill_capture(
         &self,
     ) -> Option<&eredu_runtime::working_memory::AdmittedPrefillCapture<'_>> {

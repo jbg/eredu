@@ -9,7 +9,7 @@ mod read;
 
 pub(super) struct GlobalParameterCatalog {
     pub(super) discovery: ParameterDiscovery,
-    layouts: BTreeMap<String, EffectiveLayout>,
+    pub(super) layouts: BTreeMap<String, EffectiveLayout>,
     global: PartitionParameterCatalog,
 }
 struct LocalCatalog {
@@ -50,6 +50,20 @@ const DISCOVERY_LIMIT: CaptureUsage = CaptureUsage {
 };
 
 impl MlxModelSession {
+    pub(super) fn prepared_parameter_transport<'a>(
+        &self,
+        transport: &'a crate::backend::distributed::MlxDistributedSession,
+    ) -> Result<crate::backend::distributed::PreparedParameterTransport<'a>, ParameterError> {
+        let ledger = &self.payload.memory_ledger;
+        crate::backend::distributed::PreparedParameterTransport::prepare(
+            transport,
+            ledger,
+            self.payload.model.erased().inference_execution_identity(),
+            ledger.configured_limits().clone(),
+        )
+        .map_err(failure)
+    }
+
     pub(super) fn partition_parameter_catalog(
         &mut self,
         limits: Option<CaptureUsage>,
@@ -58,6 +72,7 @@ impl MlxModelSession {
             ParameterError::Unsupported("partition has no retained communication owner".into())
         })?;
         let owner = transport.parameter_operations()?;
+        let prepared_transport = self.prepared_parameter_transport(&transport)?;
         let binding = self
             .payload
             .parameter_state
@@ -93,7 +108,7 @@ impl MlxModelSession {
         let mut encoding_budget = budget.clone();
         let mut assembly_budget = budget.clone();
         let result = owner.read(
-            &transport,
+            &prepared_transport,
             binding,
             &[0x63; 32],
             ParameterOperationKind::Catalog,

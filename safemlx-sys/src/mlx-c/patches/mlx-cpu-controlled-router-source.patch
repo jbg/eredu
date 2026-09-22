@@ -1,0 +1,55 @@
+diff --git a/mlx/backend/cpu/binary_storage.h b/mlx/backend/cpu/binary_storage.h
+--- a/mlx/backend/cpu/binary_storage.h
++++ b/mlx/backend/cpu/binary_storage.h
+@@ -4,7 +4,7 @@
+ namespace mlx::core::cpu {
+ enum class BinaryEvalKind {
+   add, subtract, multiply, divide, maximum, minimum, power,
+-  logical_and, logical_or, equal, not_equal, greater, greater_equal, less, less_equal, log_add_exp
++  logical_and, logical_or, equal, not_equal, greater, greater_equal, less, less_equal, log_add_exp, remainder
+ };
+ struct BinaryEvalStorage : SingleOutputEvalStorage {
+   BinaryEvalKind kind{BinaryEvalKind::add};
+diff --git a/mlx/backend/cpu/binary_storage.cpp b/mlx/backend/cpu/binary_storage.cpp
+--- a/mlx/backend/cpu/binary_storage.cpp
++++ b/mlx/backend/cpu/binary_storage.cpp
+@@ -15,6 +15,7 @@
+   SIMPLE(Minimum, minimum)
+   SIMPLE(Power, power)
+   SIMPLE(LogAddExp, log_add_exp)
++  SIMPLE(Remainder, remainder)
+   SIMPLE(LogicalAnd, logical_and)
+   SIMPLE(LogicalOr, logical_or)
+   SIMPLE(NotEqual, not_equal)
+diff --git a/mlx/backend/cpu/binary.cpp b/mlx/backend/cpu/binary.cpp
+--- a/mlx/backend/cpu/binary.cpp
++++ b/mlx/backend/cpu/binary.cpp
+@@ -349,6 +349,7 @@
+ #define ARITHMETIC(Kind, Op) case BinaryEvalKind::Kind: return binary_task_storage<BinaryTask<::mlx::core::detail::Op>>(rank,elements,out);
+     ARITHMETIC(add, Add)
+     ARITHMETIC(subtract, Subtract)
++    ARITHMETIC(remainder, Remainder)
+     ARITHMETIC(multiply, Multiply)
+     ARITHMETIC(divide, Divide)
+     ARITHMETIC(maximum, Maximum)
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -405,7 +405,7 @@
+   return static_update_eval_layout(1,elements,1,tracer,out);
+ }
+ static bool complete_update_row(const array& value,size_t rank) noexcept {
+-  if(value.ndim()!=rank || (value.dtype()!=float32 && value.dtype()!=int32 && value.dtype()!=float16 && value.dtype()!=bfloat16) || value.itemsize()!=(value.dtype()==float16 || value.dtype()==bfloat16 ? 2 : 4) ||
++  if(value.ndim()!=rank || (value.dtype()!=float32 && value.dtype()!=int32 && value.dtype()!=uint32 && value.dtype()!=float16 && value.dtype()!=bfloat16) || value.itemsize()!=(value.dtype()==float16 || value.dtype()==bfloat16 ? 2 : 4) ||
+       value.strides().size()!=rank || !value.flags().row_contiguous || value.data_size()!=value.size())return false;
+   size_t dense_stride=1;
+   for(size_t axis=rank;axis-->0;) {
+@@ -417,7 +417,7 @@
+ }
+ static bool static_update_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   const size_t rank=output.ndim();
+-  if(rank<1 || rank>4 || (output.dtype()!=float32 && output.dtype()!=int32 && output.dtype()!=float16 && output.dtype()!=bfloat16) || output.itemsize()!=(output.dtype()==float16 || output.dtype()==bfloat16 ? 2 : 4) ||
++  if(rank<1 || rank>4 || (output.dtype()!=float32 && output.dtype()!=int32 && output.dtype()!=uint32 && output.dtype()!=float16 && output.dtype()!=bfloat16) || output.itemsize()!=(output.dtype()==float16 || output.dtype()==bfloat16 ? 2 : 4) ||
+       output.inputs().size()!=2 || output.size()<2)return false;
+   const auto& source=output.inputs()[0];const auto& update=output.inputs()[1];
+   if(!complete_update_row(source,rank) || !complete_update_row(update,rank) ||

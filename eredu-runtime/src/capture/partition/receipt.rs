@@ -6,16 +6,27 @@ use std::sync::Arc;
 mod routed_ownership;
 pub(super) use routed_ownership::RoutedOwnership;
 mod writer;
-pub(crate) use writer::{encode_contiguous,encode_fragment_records};
+pub(crate) use writer::{
+    contiguous_metadata_bytes, encode_contiguous, encode_fragment_records,
+    fragment_records_metadata_bytes,
+};
 mod encoded_bound;
 mod evidence_budget;
+mod execution_metadata;
 pub(in crate::capture::partition) use evidence_budget::EvidenceBudgetSource;
 mod construction;
-pub use construction::{PartitionCaptureReceiptConstructionError, PartitionCaptureContiguousProducer, PartitionCaptureCoordinateProducer, PartitionCaptureRoutedProducerSource};
+pub(super) mod geometry;
 use construction::PreparedReceiptStorage;
 pub(in crate::capture::partition) use construction::component_adapter_error;
-pub(in crate::capture::partition) use construction::{copy_routed_ownership,Cause as ReceiptConstructionCause};
 pub(in crate::capture::partition) use construction::copy_context;
+pub(in crate::capture::partition) use construction::{
+    Cause as ReceiptConstructionCause, copy_routed_ownership,
+};
+pub use construction::{
+    PartitionCaptureContextMetadata, PartitionCaptureContiguousProducer,
+    PartitionCaptureCoordinateProducer, PartitionCaptureReceiptConstructionError,
+    PartitionCaptureRoutedProducerSource,
+};
 use eredu_nn::workspace::HostMetadataFunding;
 pub use writer::{PartitionCaptureEncodingError, PartitionCaptureRecordEncoding};
 
@@ -62,6 +73,7 @@ pub struct PartitionCaptureReceiptPlan {
     identity: String,
     world_size: usize,
     evidence_budget: Option<EvidenceBudgetSource>,
+    construction_metadata: Option<usize>,
     // Every owned geometry/context/identity destination retires before its account.
     _metadata: Option<HostMetadataFunding>,
 }
@@ -143,9 +155,9 @@ impl PartitionCaptureReceiptPlan {
     ) -> Result<CaptureUsage, CaptureError> {
         Self::routed_ownership_source_usage(producers.iter().map(|producer| &producer.ownership))
     }
-    fn routed_ownership_source_usage<'a>(mut ownership: impl Iterator<Item=&'a RoutedUnitCaptureOwnership>)
-        -> Result<CaptureUsage,CaptureError>
-    {
+    fn routed_ownership_source_usage<'a>(
+        mut ownership: impl Iterator<Item = &'a RoutedUnitCaptureOwnership>,
+    ) -> Result<CaptureUsage, CaptureError> {
         Ok(CaptureUsage {
             host_bytes: ownership.try_fold(4096u64, |bytes, owned| {
                 add(bytes, super::routed::ownership_bytes(owned)?)
@@ -168,11 +180,19 @@ impl PartitionCaptureReceiptPlan {
             })?;
         Self::preparation_population_usage(producers, rank, fragments)
     }
-    pub(super) fn preparation_population_usage(producers: u64, rank: usize, fragments: u64)
-        -> Result<CaptureUsage, CaptureError> {
+    pub(super) fn preparation_population_usage(
+        producers: u64,
+        rank: usize,
+        fragments: u64,
+    ) -> Result<CaptureUsage, CaptureError> {
         Ok(CaptureUsage {
-            host_bytes: add(4096, add(mul(producers, 2048)?,
-                mul(fragments, add(1024, mul(rank as u64, 256)?)?)?)?)?,
+            host_bytes: add(
+                4096,
+                add(
+                    mul(producers, 2048)?,
+                    mul(fragments, add(1024, mul(rank as u64, 256)?)?)?,
+                )?,
+            )?,
             ..Default::default()
         })
     }
@@ -339,23 +359,34 @@ impl PartitionCaptureReceiptPlan {
             &routed,
             limits.max_fragments,
         )?;
-        if let Some(rows)=prepared.as_ref().and_then(|storage|storage.terminal_rows) {
+        if let Some(rows) = prepared.as_ref().and_then(|storage| storage.terminal_rows) {
             // Only the paid terminal constructor carries this source fact. The
             // ordinary complete shape validator remains unchanged for other rows.
-            let geometry=super::CompleteVocabularyGeometry::prepare(&plan,context.selection_index,
-                context.phase,context.prediction,Some(rows))
-                .map_err(|_|invalid("terminal vocabulary source differs from admission"))?
-                .ok_or_else(||invalid("terminal rows require vocabulary capture"))?;
-            if context.invocation.is_some()||!geometry.matches(first.global_shape()) {
-                return Err(invalid("terminal vocabulary source differs from its retained rows").into());
+            let geometry = super::CompleteVocabularyGeometry::prepare(
+                &plan,
+                context.selection_index,
+                context.phase,
+                context.prediction,
+                Some(rows),
+            )
+            .map_err(|_| invalid("terminal vocabulary source differs from admission"))?
+            .ok_or_else(|| invalid("terminal rows require vocabulary capture"))?;
+            if context.invocation.is_some() || !geometry.matches(first.global_shape()) {
+                return Err(
+                    invalid("terminal vocabulary source differs from its retained rows").into(),
+                );
             }
         } else {
-            plan.geometry_at(context.phase, context.prediction, context.invocation)?
-                .validate_actual(point, first.global_shape())?;
+            plan.geometry_at(
+                context.phase,
+                context.prediction,
+                context.physical_invocation(),
+            )?
+            .validate_actual(point, first.global_shape())?;
         }
         let slice = match prepared.as_mut() {
             Some(storage) => storage.slice.take().expect("paid normalized selection"),
-            None => resolve_slice(point, selection, first.global_shape())?,
+            None => geometry::source_slice(&plan, &context, first.global_shape())?,
         };
         let mut fragments = 0usize;
         let mut covered = 0u64;
@@ -418,22 +449,34 @@ impl PartitionCaptureReceiptPlan {
         if routed.is_empty() {
             reserve(ledger, Self::preparation_usage(&producers)?)?;
         }
-        let (global_shape, identity_destination, metadata) = match prepared {
-            Some(storage) => (storage.global_shape, Some(storage.identity), Some(storage.metadata)),
-            None => (first.global_shape().to_vec(), None, None),
+        let (global_shape, identity_destination, metadata, construction_metadata) = match prepared {
+            Some(storage) => (
+                storage.global_shape,
+                Some(storage.identity),
+                Some(storage.metadata),
+                storage.construction_metadata,
+            ),
+            None => (first.global_shape().to_vec(), None, None, None),
         };
         let (funded, producers) = if metadata.is_some() {
             // Canonical world order uses only the already-paid Vec. Adjacent
             // insertion has a fixed local frame and no sorting scratch/heap.
             for index in 1..producers.len() {
-                let mut at=index;
-                while at>0&&producers[at-1].rank>producers[at].rank {
-                    producers.swap(at-1,at);at-=1;
+                let mut at = index;
+                while at > 0 && producers[at - 1].rank > producers[at].rank {
+                    producers.swap(at - 1, at);
+                    at -= 1;
                 }
             }
             (producers, BTreeMap::new())
         } else {
-            (Vec::new(), producers.into_iter().map(|p| (p.rank, p.projection)).collect())
+            (
+                Vec::new(),
+                producers
+                    .into_iter()
+                    .map(|p| (p.rank, p.projection))
+                    .collect(),
+            )
         };
         let identity = receipt_identity(
             &context,
@@ -460,40 +503,59 @@ impl PartitionCaptureReceiptPlan {
             identity,
             world_size,
             evidence_budget: None,
+            construction_metadata,
             _metadata: metadata,
         })
     }
 
     /// Original per-selection construction limits before receipt transport
     /// tightening. These remain descriptive and cannot issue native allowance.
-    pub(crate) const fn original_limits(&self)->PartitionCaptureReceiptLimits {
-        PartitionCaptureReceiptLimits { max_producers:self.limits.max_producers,
-            max_fragments:self.limits.max_fragments,max_record_bytes:self.host_record_ceiling }
+    pub(crate) const fn original_limits(&self) -> PartitionCaptureReceiptLimits {
+        PartitionCaptureReceiptLimits {
+            max_producers: self.limits.max_producers,
+            max_fragments: self.limits.max_fragments,
+            max_record_bytes: self.host_record_ceiling,
+        }
     }
 
     /// Actual fixed controls of the existing canonical producer iterators.
-    pub(crate) fn fragment_host_comparison_control_bytes(&self)->Option<usize> {
-        let parts=[std::mem::size_of_val(&self.producers()).checked_mul(2)?,
+    pub(crate) fn fragment_host_comparison_control_bytes(&self) -> Option<usize> {
+        let parts = [
+            std::mem::size_of_val(&self.producers()).checked_mul(2)?,
             std::mem::size_of_val(&self.routed.iter()).checked_mul(2)?,
-            std::mem::size_of::<(&Self,&Self)>(),std::mem::size_of::<(&PartitionCaptureContext,&PartitionCaptureContext)>(),
-            std::mem::size_of::<(&SharedCapturePlan,&SharedCapturePlan)>(),std::mem::size_of::<bool>()*4];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
+            std::mem::size_of::<(&Self, &Self)>(),
+            std::mem::size_of::<(&PartitionCaptureContext, &PartitionCaptureContext)>(),
+            std::mem::size_of::<(&SharedCapturePlan, &SharedCapturePlan)>(),
+            std::mem::size_of::<bool>() * 4,
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
     /// Same immutable fragment source across the later original run/forward
     /// binding. This is host destination compatibility only; the final receipt
     /// still supplies and authenticates its own run identity and forward epoch.
-    pub(crate) fn same_fragment_host_source(&self, other:&Self)->bool {
-        let (a,b)=(&self.context,&other.context);
-        self.shared_plan_source().same_storage(other.shared_plan_source())
-            && a.artifact_identity==b.artifact_identity && a.execution_identity==b.execution_identity
-            && a.overlay_identity==b.overlay_identity && a.capture_plan_identity==b.capture_plan_identity
-            && a.selection_index==b.selection_index && a.phase==b.phase && a.prediction==b.prediction
-            && a.invocation==b.invocation && self.world_size==other.world_size
-            && self.combination==other.combination && self.global_shape==other.global_shape
-            && self.fragments==other.fragments && self.routed.iter().eq(other.routed.iter())
-            && self.limits.max_producers==other.limits.max_producers
-            && self.limits.max_fragments==other.limits.max_fragments
-            && self.host_record_ceiling==other.host_record_ceiling
+    pub(crate) fn same_fragment_host_source(&self, other: &Self) -> bool {
+        let (a, b) = (&self.context, &other.context);
+        self.shared_plan_source()
+            .same_storage(other.shared_plan_source())
+            && a.artifact_identity == b.artifact_identity
+            && a.execution_identity == b.execution_identity
+            && a.overlay_identity == b.overlay_identity
+            && a.capture_plan_identity == b.capture_plan_identity
+            && a.selection_index == b.selection_index
+            && a.phase == b.phase
+            && a.prediction == b.prediction
+            && a.invocation == b.invocation
+            && a.invocation_window == b.invocation_window
+            && self.world_size == other.world_size
+            && self.combination == other.combination
+            && self.global_shape == other.global_shape
+            && self.fragments == other.fragments
+            && self.routed.iter().eq(other.routed.iter())
+            && self.limits.max_producers == other.limits.max_producers
+            && self.limits.max_fragments == other.limits.max_fragments
+            && self.host_record_ceiling == other.host_record_ceiling
             && self.producers().eq(other.producers())
     }
 
@@ -518,8 +580,12 @@ impl PartitionCaptureReceiptPlan {
     }
     /// Expected native geometry for an admitted producer.
     pub fn producer(&self, rank: usize) -> Option<&CaptureSlicePartition> {
-        self.producers.get(&rank).or_else(|| self.funded.binary_search_by_key(&rank, |producer| producer.rank)
-            .ok().map(|index| &self.funded[index].projection))
+        self.producers.get(&rank).or_else(|| {
+            self.funded
+                .binary_search_by_key(&rank, |producer| producer.rank)
+                .ok()
+                .map(|index| &self.funded[index].projection)
+        })
     }
     /// Exact sparse expert/source ownership, separate from the unit rectangle.
     pub fn routed_producer(&self, rank: usize) -> Option<&RoutedUnitCaptureOwnership> {
@@ -530,12 +596,45 @@ impl PartitionCaptureReceiptPlan {
         self.limits.max_record_bytes
     }
 
+    /// Maximum padded payload words from the same checked receipt exchange.
+    /// Native transport quotation can retain this immutable source population;
+    /// it grants no receipt attempt or communication permission.
+    pub fn maximum_payload_words(&self) -> Result<usize, CaptureError> {
+        super::exchange::word_count(self.max_record_bytes())
+    }
+
+    /// The admitted receipt exchange's preparation, payload and delivery frames.
+    /// An early refusal may stop at a prefix; reaching every stage never exceeds
+    /// these same source-derived widths. Source voting and frame coordination
+    /// remain separate occurrences owned by the enclosing scheduled program.
+    pub fn protocol_frames(
+        &self,
+    ) -> Result<std::array::IntoIter<(PartitionCaptureFrameKind, usize), 3>, CaptureError> {
+        use PartitionCaptureFrameKind as K;
+        Ok([
+            (
+                K::Preparation,
+                K::Preparation.fixed_words().expect("fixed protocol frame"),
+            ),
+            (K::Payload, self.maximum_payload_words()?),
+            (
+                K::Delivery,
+                K::Delivery.fixed_words().expect("fixed protocol frame"),
+            ),
+        ]
+        .into_iter())
+    }
+
     /// Expected producers, including empty selections, in canonical world order.
     pub fn producers(&self) -> impl Iterator<Item = (usize, &CaptureSlicePartition)> {
         self.producers
             .iter()
             .map(|(&rank, projection)| (rank, projection))
-            .chain(self.funded.iter().map(|producer| (producer.rank, &producer.projection)))
+            .chain(
+                self.funded
+                    .iter()
+                    .map(|producer| (producer.rank, &producer.projection)),
+            )
     }
 
     fn producer_count(&self) -> usize {
@@ -566,7 +665,7 @@ impl PartitionCaptureReceiptPlan {
         let slice = if let Some(producer) = self.funded.first() {
             producer.projection.global_slice()
         } else {
-            ordinary_slice = resolve_slice(point, selection, &self.global_shape)?;
+            ordinary_slice = geometry::source_slice(&self.plan, &self.context, &self.global_shape)?;
             &ordinary_slice
         };
         self.decoding_usage(self.limits.max_record_bytes)?
@@ -595,35 +694,75 @@ impl PartitionCaptureReceiptPlan {
 
     /// Existing receipt table component, separate from decoding and assembly.
     pub(crate) fn delivery_table_usage(&self) -> Result<CaptureUsage, CaptureError> {
-        Ok(CaptureUsage { host_bytes: add(
-            mul(self.fragments as u64, std::mem::size_of::<CapturedPartitionFragment>() as u64)?,
-            mul(self.producer_count() as u64, 8)?)?, ..Default::default() })
+        Ok(CaptureUsage {
+            host_bytes: add(
+                mul(
+                    self.fragments as u64,
+                    std::mem::size_of::<CapturedPartitionFragment>() as u64,
+                )?,
+                mul(self.producer_count() as u64, 8)?,
+            )?,
+            ..Default::default()
+        })
     }
 
     /// Exact ordinary assembly component of a retained dense receipt. The source
     /// projection already owns normalized coordinates; this query allocates none.
-    pub(crate) fn dense_assembly_usage(&self)->Result<Option<CaptureUsage>,CaptureError> {
-        let selection=&self.plan.plan().selections[self.context.selection_index];
-        if matches!(selection.transform,CaptureTransform::RoutedUnits|CaptureTransform::TopCandidates{..}|CaptureTransform::TokenScores{..}) {
+    pub(crate) fn dense_assembly_usage(&self) -> Result<Option<CaptureUsage>, CaptureError> {
+        let selection = &self.plan.plan().selections[self.context.selection_index];
+        if matches!(
+            selection.transform,
+            CaptureTransform::RoutedUnits
+                | CaptureTransform::TopCandidates { .. }
+                | CaptureTransform::TokenScores { .. }
+        ) {
             return Ok(None);
         }
-        let Some(projection)=self.funded.first() else {return Ok(None);};
-        let shape=&projection.projection.global_slice().shape;
-        Ok(Some(super::assembly::assembly_metadata_usage(selection,&self.plan.points()[self.context.selection_index],shape.len(),self.fragments)?
-            .checked_add(if self.combination==PartitionCaptureCombination::SumF64ToF32 {
-                super::sum::payload_usage(&selection.transform,elements(shape)?)?
-            }else{super::assembly::assembly_payload_usage(&selection.transform,elements(shape)?,self.fragments==0)?})?))
+        let Some(projection) = self.funded.first() else {
+            return Ok(None);
+        };
+        let shape = &projection.projection.global_slice().shape;
+        Ok(Some(
+            super::assembly::assembly_metadata_usage(
+                selection,
+                &self.plan.points()[self.context.selection_index],
+                shape.len(),
+                self.fragments,
+            )?
+            .checked_add(
+                if self.combination == PartitionCaptureCombination::SumF64ToF32 {
+                    super::sum::payload_usage(&selection.transform, elements(shape)?)?
+                } else {
+                    super::assembly::assembly_payload_usage(
+                        &selection.transform,
+                        elements(shape)?,
+                        self.fragments == 0,
+                    )?
+                },
+            )?,
+        ))
     }
 
     /// The same final record equation used by ordinary sparse/dense assembly.
     /// Retained global projection supplies geometry without re-resolving a slice.
-    pub(crate) fn fragment_assembly_usage(&self)->Result<Option<CaptureUsage>,CaptureError> {
-        let selection=&self.plan.plan().selections[self.context.selection_index];
-        if !matches!(selection.transform,CaptureTransform::RoutedUnits){return self.dense_assembly_usage();}
-        let Some((_,projection))=self.producers().next() else{return Ok(None);};
-        let slice=projection.global_slice();
-        Ok(Some(super::assembly::assembly_metadata_usage(selection,&self.plan.points()[self.context.selection_index],3,self.fragments)?
-            .checked_add(super::routed::payload_usage(self,slice)?)?))
+    pub(crate) fn fragment_assembly_usage(&self) -> Result<Option<CaptureUsage>, CaptureError> {
+        let selection = &self.plan.plan().selections[self.context.selection_index];
+        if !matches!(selection.transform, CaptureTransform::RoutedUnits) {
+            return self.dense_assembly_usage();
+        }
+        let Some((_, projection)) = self.producers().next() else {
+            return Ok(None);
+        };
+        let slice = projection.global_slice();
+        Ok(Some(
+            super::assembly::assembly_metadata_usage(
+                selection,
+                &self.plan.points()[self.context.selection_index],
+                3,
+                self.fragments,
+            )?
+            .checked_add(super::routed::payload_usage(self, slice)?)?,
+        ))
     }
 
     /// Conservative parser/decoded-record storage for an exact received byte count.
@@ -773,15 +912,12 @@ impl PartitionCaptureReceiptPlan {
                 "partition fragment record differs from its admitted selection or geometry",
             ));
         }
-        let limits = self.evidence_budget.as_ref().map_or(&self.plan.plan().limits, EvidenceBudgetSource::limits);
-        if record
-            .charged
-            .exceeded(limits.per_step)
-            .is_some()
-            || record
-                .charged
-                .exceeded(limits.cumulative)
-                .is_some()
+        let limits = self
+            .evidence_budget
+            .as_ref()
+            .map_or(&self.plan.plan().limits, EvidenceBudgetSource::limits);
+        if record.charged.exceeded(limits.per_step).is_some()
+            || record.charged.exceeded(limits.cumulative).is_some()
         {
             return Err(invalid(
                 "partition fragment reports work beyond its global admission",
@@ -818,8 +954,8 @@ impl PartitionCaptureReceiptPlan {
                             value.data(),
                         ) {
                             return Err(invalid(
-                            "partition raw payload representation disagrees with source precision",
-                        ));
+                                "partition raw payload representation disagrees with source precision",
+                            ));
                         }
                         if value.shape().len() != geometry.local().shape.len()
                             || value
@@ -868,7 +1004,7 @@ impl PartitionCaptureReceiptPlan {
                     _ => {
                         return Err(invalid(
                             "partition payload does not match its admitted transform",
-                        ))
+                        ));
                     }
                 }
             }
@@ -1059,7 +1195,7 @@ impl PartitionCaptureDelivery {
                 CaptureTransform::RoutedUnits => unreachable!("handled before dense assembly"),
                 CaptureTransform::Slice
                 | CaptureTransform::FullTensor
-                | CaptureTransform::Preview { .. } => assemble_tensor_fragments(
+                | CaptureTransform::Preview { .. } => super::assembly::assemble_tensor_source(
                     &self.plan.plan,
                     context.selection_index,
                     context.phase,
@@ -1067,9 +1203,10 @@ impl PartitionCaptureDelivery {
                     &self.plan.global_shape,
                     fragments,
                     ledger,
+                    Some(context),
                 )?,
                 CaptureTransform::Summary | CaptureTransform::Histogram { .. } => {
-                    assemble_reduced_fragments(
+                    super::assembly::assemble_reduced_source(
                         &self.plan.plan,
                         context.selection_index,
                         context.phase,
@@ -1077,6 +1214,7 @@ impl PartitionCaptureDelivery {
                         &self.plan.global_shape,
                         fragments,
                         ledger,
+                        Some(context),
                     )?
                 }
                 CaptureTransform::TokenScores { .. } | CaptureTransform::TopCandidates { .. } => {
@@ -1154,7 +1292,7 @@ impl PartitionCaptureReceiptPlan {
     ) -> Result<AssembledPartitionCapture, PartitionCaptureMergeError> {
         let selection = &self.plan.plan().selections[self.context.selection_index];
         let point = &self.plan.points()[self.context.selection_index];
-        let slice = resolve_slice(point, selection, &self.global_shape)?;
+        let slice = geometry::source_slice(&self.plan, &self.context, &self.global_shape)?;
         if elements(&slice.shape)? != 0 {
             return Err(invalid("nonempty capture has no native fragments").into());
         }
@@ -1240,7 +1378,7 @@ fn receipt_identity(
         numbers(hash, &value.shape);
     }
     let mut hash = Sha256::new();
-    hash.update(b"eredu.partition.capture.receipt.v2");
+    hash.update(b"eredu.partition.capture.receipt.v3");
     if let Some(source) = evidence_budget {
         hash.update(b"original.intervention.evidence.budget.v1");
         text(&mut hash, source.parent_identity());
@@ -1288,8 +1426,43 @@ fn receipt_identity(
     );
     word(&mut hash, context.prediction);
     word(&mut hash, context.forward_epoch);
-    for (rank, projection) in producers.iter().map(|(&rank, projection)| (rank, projection))
-        .chain(funded.iter().map(|producer| (producer.rank, &producer.projection))) {
+    word(&mut hash, u64::from(context.invocation.is_some()));
+    if let Some(shape) = context.invocation {
+        for value in [
+            shape.batch,
+            shape.sequence,
+            u64::from(shape.context.is_some()),
+        ] {
+            word(&mut hash, value);
+        }
+        if let Some(value) = shape.context {
+            word(&mut hash, value);
+        }
+    }
+    word(&mut hash, u64::from(context.invocation_window.is_some()));
+    if let Some(interval) = context.invocation_window {
+        for value in [
+            interval.physical.batch,
+            interval.physical.sequence,
+            u64::from(interval.physical.context.is_some()),
+            interval.window.logical_sequence,
+            interval.window.start,
+        ] {
+            word(&mut hash, value);
+        }
+        if let Some(value) = interval.physical.context {
+            word(&mut hash, value);
+        }
+    }
+    for (rank, projection) in producers
+        .iter()
+        .map(|(&rank, projection)| (rank, projection))
+        .chain(
+            funded
+                .iter()
+                .map(|producer| (producer.rank, &producer.projection)),
+        )
+    {
         word(&mut hash, rank as u64);
         word(&mut hash, projection.axis() as u64);
         numbers(&mut hash, projection.global_shape());
@@ -1344,10 +1517,12 @@ impl serde::Serialize for BorrowedFragments<'_> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for (fragment_index, fragment) in self.0.iter().enumerate() {
-            sequence.serialize_element(&eredu_core::capture::BorrowedPartitionCaptureFragmentRecord {
-                fragment_index,
-                record: &fragment.record,
-            })?;
+            sequence.serialize_element(
+                &eredu_core::capture::BorrowedPartitionCaptureFragmentRecord {
+                    fragment_index,
+                    record: &fragment.record,
+                },
+            )?;
         }
         sequence.end()
     }

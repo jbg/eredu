@@ -9,13 +9,16 @@ use sha2::{Digest, Sha256};
 
 mod coordination;
 mod partition;
+mod shared_values;
 pub use coordination::{
-    ParameterCoordinationError, ParameterCoordinationStage, ParameterCoordinationUsage,
+    ParameterCoordinationError, ParameterCoordinationFailure, ParameterCoordinationStage,
+    ParameterCoordinationUsage,
 };
 pub use partition::{
     ParameterCoordinateMap, ParameterProjectionFragment, ParameterRegionFragment,
     PartitionParameterRegion,
 };
+pub use shared_values::{SharedParameterProjectionValues, SharedParameterValues};
 
 #[cfg(test)]
 mod tests;
@@ -462,7 +465,10 @@ pub struct ParameterValues {
 pub enum ParameterError {
     /// Distributed agreement, completion or peer rejection.
     #[error(transparent)]
-    Coordination(Box<ParameterCoordinationError>),
+    Coordination(ParameterCoordinationFailure),
+    /// The actual host account refused protocol metadata before construction.
+    #[error(transparent)]
+    Metadata(#[from] crate::HostMetadataFundingError),
     /// Invalid geometry, dtype, payload or request.
     #[error("invalid parameter operation: {0}")]
     Invalid(String),
@@ -494,7 +500,7 @@ pub enum ParameterError {
 
 impl From<ParameterCoordinationError> for ParameterError {
     fn from(error: ParameterCoordinationError) -> Self {
-        Self::Coordination(Box::new(error))
+        Self::Coordination(ParameterCoordinationFailure::new(error))
     }
 }
 
@@ -513,7 +519,7 @@ pub trait ParameterBackend: crate::TextGenerationBackend {
         parameter: &str,
         region: ParameterRegion,
         limits: CaptureUsage,
-    ) -> Result<ParameterValues, ParameterError>;
+    ) -> Result<SharedParameterValues, ParameterError>;
     /// Projects effective weights natively, copying only bounded reduction output to the host.
     fn project_parameter(
         runtime: &mut crate::ModelRuntime<Self>,
@@ -521,7 +527,7 @@ pub trait ParameterBackend: crate::TextGenerationBackend {
         parameter: &str,
         projection: ParameterProjection,
         limits: CaptureUsage,
-    ) -> Result<ParameterProjectionValues, ParameterError>;
+    ) -> Result<SharedParameterProjectionValues, ParameterError>;
     /// Prepares every replacement before one atomic publication at an idle boundary.
     fn activate_parameter_overlay(
         runtime: &mut crate::ModelRuntime<Self>,

@@ -165,6 +165,19 @@ impl<'a, OS, OD, CS, CD, K: HostSlotStorageKey>
             pins,
         )?;
         drop(sources);
+        let prepared = (|| {
+            self.outer
+                .prepare_before_allocation(&scopes[0], &execution)?;
+            for (child, scope) in self.children.iter_mut().zip(scopes.iter().skip(1)) {
+                child.prepare_before_allocation(scope, &execution)?;
+            }
+            Ok::<_, WorkingMemoryError>(())
+        })();
+        if let Err(error) = prepared {
+            // No table or native operation has yet been constructed or exposed.
+            native.certify()?;
+            return Err(error.into());
+        }
         #[cfg(test)]
         super::tests::before_initialize();
         let mut scopes = scopes.into_iter();

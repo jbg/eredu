@@ -6,6 +6,8 @@ use super::fixed::{FixedOpeningOwners, OpeningEntry, OpeningError};
 use super::*;
 use crate::backend::runtime::residency::storage::StorageIdentity as Key;
 use eredu_runtime::{
+    PreparedLayeredObservationPaths, PreparedObservationBindingIdentity,
+    SharedLayeredObservationPaths,
     inspection::{PrefillOpeningExecution, SettledPrefillChunkRetention},
     prefill::PrefillChunk,
     working_memory::{
@@ -17,8 +19,6 @@ use eredu_runtime::{
         PreparedPrefillStoragePinPlan, PreparedPrefillStoragePublicationPlan,
         PreparedTextControlWorkspace, TextHostControlFacts, WorkingMemoryFundingScope,
     },
-    PreparedLayeredObservationPaths, PreparedObservationBindingIdentity,
-    SharedLayeredObservationPaths,
 };
 use safemlx::{PreparedAllocationOwner, PreparedAllocationOwnerCause};
 use std::{
@@ -67,6 +67,30 @@ impl NativeOpeningRowsPlan {
             selection,
             geometry: plan.selection.geometry(),
         })
+    }
+
+    /// The low-level row fixture publishes its final ordinary inventory through
+    /// the generic constructor. Its actual paired slot census bounds every
+    /// decoder/source row; score and active capture roots are additional.
+    #[cfg(test)]
+    pub(crate) fn completion_publication_bytes(&self) -> Result<u64, Error> {
+        use eredu_runtime::working_memory::WorkingMemoryError;
+        let rows = descriptor_count(self.slots)
+            .map_err(|e| Error::Other(Box::new(e)))?
+            .checked_add(self.slots.arrays)
+            .and_then(|n| n.checked_add(self.slots.hosts))
+            .and_then(|n| n.checked_add(4))
+            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))?;
+        let layout =
+            crate::backend::runtime::residency::storage::generic_storage_publication_layout(rows)
+                .map_err(Error::PrefillControl)?;
+        layout
+            .requested_bytes()
+            .checked_add(
+                eredu_runtime::working_memory::MemoryLedger::storage_metadata_control_bytes()
+                    .map_err(Error::PrefillControl)?,
+            )
+            .ok_or(Error::PrefillControl(WorkingMemoryError::Overflow))
     }
 
     /// Both inventories, all finite nodes and constructor/error overlap are
@@ -316,7 +340,7 @@ impl SealedOpeningRows {
                     cause,
                     plan: self,
                     custody,
-                })
+                });
             }
         };
         Ok(NativeOpeningRowsOwner::new(NativeOpeningRows {
@@ -569,11 +593,7 @@ impl NativeOpeningRows {
             return Err(self.fail(OpeningError::Identity.into()));
         }
         self.custody
-            .validate_reservation(
-                self.request
-                    .memory_reservation()
-                    .ok_or_else(|| self.fail(OpeningError::Identity.into()))?,
-            )
+            .validate_reservation(self.request.memory_reservation())
             .map_err(|e| self.fail(OpeningError::from(e).into()))
     }
     pub(crate) fn validate_prepared_scope(
@@ -815,7 +835,16 @@ impl NativeOpeningRows {
             let attempt = row.publication.as_mut().ok_or(OpeningError::Used)?;
             let mut ordinal = 0;
             let mut attachment = 0;
+            let ledger = native.pool();
             row.completed.visit(&mut |entry| -> Result<(), RowError> {
+                let placement = match &entry {
+                    OpeningEntry::Array(_, info) | OpeningEntry::Host(_, info) => {
+                        crate::backend::managed_memory::allocation_placement_handle(info, ledger)
+                            .map_err(eredu_runtime::working_memory::WorkingMemoryError::from)
+                            .map_err(OpeningError::from)?
+                    }
+                    _ => ledger.host_placement_handle(),
+                };
                 let native = matches!(&entry, OpeningEntry::Array(..) | OpeningEntry::Host(..));
                 let owner_index = OwnerIndex {
                     ordinal,
@@ -848,7 +877,7 @@ impl NativeOpeningRows {
                     row.rejected_key = Some(key);
                     return Err(OpeningError::Capacity.into());
                 }
-                if let Err(key) = attempt.push_owned(key, bytes) {
+                if let Err(key) = attempt.push_owned(key, bytes, placement) {
                     row.rejected_key = Some(key);
                     return Err(OpeningError::Capacity.into());
                 }
@@ -977,11 +1006,12 @@ thread_local! {
 #[cfg(test)]
 impl NativeOpeningRows {
     pub(crate) fn observe_retirement_for_test(&self, drops: std::rc::Rc<Cell<usize>>) {
-        assert!(self
-            .retirement_probe
-            .borrow_mut()
-            .replace(owner::RetirementProbe(drops))
-            .is_none());
+        assert!(
+            self.retirement_probe
+                .borrow_mut()
+                .replace(owner::RetirementProbe(drops))
+                .is_none()
+        );
     }
     /// Exact low-level fixture admission only; production uses its real claimed
     /// TextOperation/consumed InstalledCapture. No arbitrary guard or refill.

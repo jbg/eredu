@@ -54,8 +54,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install the repository Rust toolchain
-        run: rustup toolchain install
+      - name: Install the qualified Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0
+          rustup override set 1.98.0
+          echo "RUSTC=$(rustup which rustc --toolchain 1.98.0)" >> "$GITHUB_ENV"
       - name: Install MLX CPU build dependencies
         run: |
           sudo apt-get update
@@ -146,7 +149,7 @@ jobs:
           cargo test -j 1 --locked -p safemlx-tests --no-default-features --features nccl --no-run
       - name: Compile facade and MLX backend tests and residency example with CUDA
         run: |
-          cargo test -j 1 --locked -p eredu --no-default-features --features "nccl,image,audio" --lib --no-run
+          cargo test -j 1 --locked -p eredu --no-default-features --features "mlx,nccl,image,audio" --lib --no-run
           cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --test mimi_codec --no-run --timings
           cargo test -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency --no-run
       - name: Build and final-link the CUDA language-model CLI tests
@@ -163,9 +166,21 @@ jobs:
     runs-on: [self-hosted, linux, x64, cuda]
     steps:
       - uses: actions/checkout@v4
-      - name: Install the repository Rust toolchain
-        run: rustup toolchain install
+      - name: Install the qualified Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0
+          rustup override set 1.98.0
+          echo "RUSTC=$(rustup which rustc --toolchain 1.98.0)" >> "$GITHUB_ENV"
       - name: Run CUDA device smoke test
         run: cargo run --release -p safemlx --no-default-features --features cuda --example cuda_smoke
+      - name: Validate CUDA placement, aliases, and transfer custody
+        run: |
+          cargo test --release -p safemlx --no-default-features --features cuda --lib completed_readback -- --test-threads=1 --include-ignored
+          cargo test --release -p safemlx --no-default-features --features cuda --lib placement -- --test-threads=1 --nocapture
+          cargo test --release -p safemlx --no-default-features --features cuda --lib allocation_retention -- --test-threads=1
+          cargo test --release -p safemlx --no-default-features --features cuda --lib host_transfer -- --test-threads=1
+          cargo test --release -p safemlx --no-default-features --features cuda --test host_transfer -- --test-threads=1 --include-ignored
+          cargo test --release -p safemlx --no-default-features --features cuda --test physical_backing -- --test-threads=1
+          cargo test --release -p eredu-backend-mlx --no-default-features --features cuda --test physical_memory -- --test-threads=1
       - name: Run Eredu facade tests on CUDA
-        run: cargo test --release -p eredu --no-default-features --features cuda
+        run: cargo test --release -p eredu --no-default-features --features mlx,cuda

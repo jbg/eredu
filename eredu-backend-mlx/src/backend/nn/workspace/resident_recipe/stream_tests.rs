@@ -105,6 +105,21 @@ fn completion_stream_sources_reject_uncertified_or_inconsistent_populations() {
 
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 fn equation_recipe(cpu: bool) -> ResidentNativeRecipe {
+    recipe_with_geometry(
+        cpu,
+        InferenceGeometry {
+            batch_size: 1,
+            cached_positions: 0,
+            input_positions: 1,
+            max_output_tokens: 1,
+            prefill_chunk_positions: 1,
+            output: eredu_core::OutputDemand::Sequence,
+        },
+    )
+}
+
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+fn recipe_with_geometry(cpu: bool, geometry: InferenceGeometry) -> ResidentNativeRecipe {
     use eredu_nn::Tensor;
     let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
     let mechanism = if cpu {
@@ -122,14 +137,6 @@ fn equation_recipe(cpu: bool) -> ResidentNativeRecipe {
     let context = match mechanism {
         ResidentExecutionMechanisms::Cpu { cpu, .. } => WorkspaceContext::new(cpu),
         ResidentExecutionMechanisms::Metal(metal) => WorkspaceContext::new(metal),
-    };
-    let geometry = InferenceGeometry {
-        batch_size: 1,
-        cached_positions: 0,
-        input_positions: 1,
-        max_output_tokens: 1,
-        prefill_chunk_positions: 1,
-        output: eredu_core::OutputDemand::Sequence,
     };
     let mut recorder = mechanism.recorder(geometry, &context).unwrap();
     let quoted = eredu_runtime::working_memory::quote_inference_workspace_with_context(
@@ -166,12 +173,60 @@ fn equation_recipe(cpu: bool) -> ResidentNativeRecipe {
         None,
         &logits,
         &eredu_core::TokenFilter::All,
-        1,
+        geometry.max_output_tokens,
         &context,
         Some(&mut recorder),
     )
     .unwrap();
     recorder.finish(quoted.span_workspace_plan()).unwrap()
+}
+
+#[test]
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+fn completed_restore_recipe_retains_zero_work_neural_and_transfer_sources() {
+    use crate::backend::runtime::residency::manager::WindowPopulation;
+    let geometry = InferenceGeometry {
+        batch_size: 1,
+        cached_positions: 23,
+        input_positions: 0,
+        max_output_tokens: 0,
+        prefill_chunk_positions: 0,
+        output: eredu_core::OutputDemand::StateOnly,
+    };
+    let windows = [WindowPopulation {
+        requested: 1,
+        units: 2,
+        physical_bindings: 3,
+        bindings: 4,
+        physical_bytes: 96,
+        ..Default::default()
+    }];
+    for cpu in [true, false] {
+        let mut recipe = recipe_with_geometry(cpu, geometry);
+        assert!(recipe.records.is_empty());
+        assert_eq!(recipe.plan.generation_forward_count(), Some(0));
+        assert!(!recipe.matches_neural_boundaries(geometry, 0, 2));
+        assert!(!recipe.matches_host_transfer_population(0, 0, 0, 3, 2, &windows));
+        recipe.bind_neural_boundaries(geometry, 3, 2).unwrap();
+        recipe
+            .bind_host_transfer_population(geometry, 0, 0, 0, 3, 2, &windows)
+            .unwrap();
+        assert!(recipe.records.is_empty());
+        assert!(recipe.matches_neural_boundaries(geometry, 0, 2));
+        assert!(!recipe.matches_neural_boundaries(geometry, 1, 2));
+        assert!(!recipe.matches_neural_boundaries(geometry, 0, 1));
+        let mut foreign = geometry;
+        foreign.cached_positions += 1;
+        assert!(!recipe.matches_neural_boundaries(foreign, 0, 2));
+        assert!(recipe.matches_host_transfer_population(0, 0, 0, 3, 2, &windows));
+        assert!(!recipe.matches_host_transfer_population(0, 1, 0, 3, 2, &windows));
+        assert!(!recipe.matches_host_transfer_population(0, 0, 1, 3, 2, &windows));
+        assert!(!recipe.matches_host_transfer_population(0, 0, 0, 4, 2, &windows));
+        let mut foreign = windows;
+        foreign[0].physical_bytes += 4;
+        assert!(!recipe.matches_host_transfer_population(0, 0, 0, 3, 2, &foreign));
+        assert!(recipe.bind_neural_boundaries(geometry, 3, 2).is_err());
+    }
 }
 
 #[test]
@@ -185,8 +240,17 @@ fn retained_boundaries_use_source_stream_counts_and_keep_finite_attempts() {
             let mut recipe = equation_recipe(cpu);
             assert_eq!(recipe.records.len(), 2, "initial prefill and cached decode");
             let geometry = recipe.plan.geometry();
-            let submissions = recipe.plan.generation_forward_count().unwrap().checked_mul(3).unwrap();
-            let prior = recipe.records.iter().map(|row| (row.nested_completions, row.query_controls.unwrap())).collect::<Vec<_>>();
+            let submissions = recipe
+                .plan
+                .generation_forward_count()
+                .unwrap()
+                .checked_mul(3)
+                .unwrap();
+            let prior = recipe
+                .records
+                .iter()
+                .map(|row| (row.nested_completions, row.query_controls.unwrap()))
+                .collect::<Vec<_>>();
             for row in &mut recipe.records {
                 let dispatch = row.dispatch.as_mut().unwrap();
                 dispatch.parallel_entries += collectives;
@@ -200,7 +264,8 @@ fn retained_boundaries_use_source_stream_counts_and_keep_finite_attempts() {
                 limits.input_edges += collectives + routers;
                 limits.arrays += 2 * (collectives + routers);
                 limits.streams = streams - usize::from(wrong_streams);
-                row.traversal = Some(safemlx::OperationEvent::eval_traversal_layout(limits).unwrap());
+                row.traversal =
+                    Some(safemlx::OperationEvent::eval_traversal_layout(limits).unwrap());
             }
             let result = recipe.bind_neural_boundaries(geometry, 3, 2);
             if wrong_streams {
@@ -220,8 +285,13 @@ fn retained_boundaries_use_source_stream_counts_and_keep_finite_attempts() {
                 result.unwrap();
                 for (row, (completions, controls)) in recipe.records.iter().zip(&prior) {
                     assert_eq!(row.nested_completions, completions + 3);
-                    assert_eq!(row.query_controls,
-                        Some(controls + ResidentDispatchPopulation::completion_stream_control_bytes()));
+                    assert_eq!(
+                        row.query_controls,
+                        Some(
+                            controls
+                                + ResidentDispatchPopulation::completion_stream_control_bytes()
+                        )
+                    );
                 }
                 assert_eq!(recipe.neural_waits_per_forward(), 6);
                 assert!(recipe.matches_neural_boundaries(geometry, submissions, 2));

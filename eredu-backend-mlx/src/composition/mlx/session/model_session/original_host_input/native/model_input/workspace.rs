@@ -51,12 +51,10 @@ impl MlxModelInput {
         runtime: &ModelRuntime<MlxBackend<'_>>,
         geometry: eredu_core::InferenceGeometry,
     ) -> Result<OriginalMediaWorkspaceReport, MlxOriginalMediaWorkspaceError> {
-        let ordinary =
-            NativeMemoryOwner::acquire_typed(runtime.backend().memory_pool()).map_err(|e| {
-                MlxOriginalMediaWorkspaceError {
-                    cause: Cause::Boundary(e),
-                    _ordinary: None,
-                }
+        let ordinary = NativeMemoryOwner::acquire_typed(runtime.backend().memory_ledger())
+            .map_err(|e| MlxOriginalMediaWorkspaceError {
+                cause: Cause::Boundary(e),
+                _ordinary: None,
             })?;
         let result = (|| {
             let Some(input::OriginalMediaPacket::Original(packet)) = self.original_media.as_ref()
@@ -66,7 +64,7 @@ impl MlxModelInput {
             packet
                 .body
                 .source()
-                .validate_pool(runtime.backend().memory_pool())
+                .validate_pool(runtime.backend().memory_ledger())
                 .map_err(Cause::Boundary)?;
             let session = runtime.session();
             if session.poison.get() || session.authority.borrow().require_idle().is_err() {
@@ -93,6 +91,10 @@ impl MlxModelInput {
                 .resident_workspace_mechanisms()
                 .ok_or(Cause::Boundary(WorkingMemoryError::UnknownBound))?;
             let context = WorkspaceContext::new(facts);
+            let parameters = executable.layerwise_workspace().map_err(Cause::Native)?;
+            let _parameters = executable
+                .install_parameter_source(&context, parameters.as_ref())
+                .map_err(|cause| Cause::Native(Error::Other(Box::new(cause))))?;
             let lease = ordinary.unquoted_lease().map_err(Cause::Native)?;
             let input = OriginalMediaWorkspaceInput::project(
                 packet.body.prepared().expect("complete B prepared"),
@@ -110,7 +112,7 @@ impl MlxModelInput {
                 .erased()
                 .project_resident_workspace(batch, &context)
                 .map_err(Cause::Native)?;
-            let parameters = executable.layerwise_workspace().map_err(Cause::Native)?;
+
             match parameters.as_ref() {
                 Some(parameters) => blueprint.quote_original_media_ordinary(
                     input,

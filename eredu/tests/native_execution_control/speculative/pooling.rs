@@ -148,7 +148,7 @@ fn verify(device: LocalDevice) {
                 output_mode: eredu::api::PreparedChatOutputMode::Text,
                 skip_special_tokens: true,
                 drafting: eredu_core::SpeculativeDraft::Embedded,
-                settings: chat_settings(&chat, settings),
+                settings: chat_settings(&chat, settings.clone()),
                 options: generation.clone(),
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
@@ -162,7 +162,7 @@ fn verify(device: LocalDevice) {
             };
             let capture = model
                 .prepare_speculative_capture(
-                    settings,
+                    settings.clone(),
                     CapturePlan {
                         schema_version: CAPTURE_SCHEMA_VERSION,
                         selections: vec![CaptureSelection {
@@ -175,7 +175,6 @@ fn verify(device: LocalDevice) {
                         limits: CaptureLimits {
                             per_step: usage,
                             cumulative: usage,
-                            physical_native_bytes: None,
                             on_limit: CaptureLimitPolicy::Fail,
                         },
                     },
@@ -199,15 +198,13 @@ fn verify(device: LocalDevice) {
                 })
                 .unwrap();
             assert_eq!(baseline.token_ids().len(), 7);
-            assert!(
-                baseline_captures
-                    .iter()
-                    .flat_map(|c| &c.capture.as_step().records)
-                    .any(|record| {
-                        matches!(&record.payload, Some(CapturePayload::Candidates(values))
+            assert!(baseline_captures
+                .iter()
+                .flat_map(|c| &c.capture.as_step().records)
+                .any(|record| {
+                    matches!(&record.payload, Some(CapturePayload::Candidates(values))
                     if values.candidates.iter().any(|c| c.score != 0.0))
-                    })
-            );
+                }));
             let mut observed = Vec::new();
             let output = model
                 .with_controlled_prepared_chat_speculative(request(), options, |session| {

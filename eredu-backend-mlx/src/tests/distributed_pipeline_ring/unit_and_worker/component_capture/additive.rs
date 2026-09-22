@@ -104,10 +104,25 @@ fn verify_additive_component_interventions(
                     "native-additive-trial",
                 )
                 .unwrap();
-            let mut generation = component_capture_generation(runtime, sampling);
-            generation
-                .enable_interventions(capture.clone(), admitted)
-                .unwrap();
+            let interventions = runtime
+                .backend()
+                .memory_ledger()
+                .compile_intervention_source(
+                    eredu_core::intervention::PreparedInterventionPlanCopy::inspect(&admitted)
+                        .unwrap(),
+                )
+                .unwrap()
+                .plan()
+                .clone();
+            let mut generation = component_capture_generation(
+                runtime,
+                sampling,
+                Some(eredu_core::TextPreparationOptions {
+                    capture: Some(eredu_core::capture::SharedCapturePlan::new(capture.clone())),
+                    interventions: Some(interventions),
+                }),
+            )
+            .unwrap();
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();
@@ -122,9 +137,10 @@ fn verify_additive_component_interventions(
                 (&a.path, &a.outcome, &a.position),
                 (&b.path, &b.outcome, &b.position)
             );
-            let (Some(CapturePayload::Tensor(a)), Some(CapturePayload::Tensor(b))) =
-                (&a.payload, &b.payload)
-            else {
+            let (Some(a), Some(b)) = (
+                a.payload.as_ref().and_then(CapturePayload::as_tensor),
+                b.payload.as_ref().and_then(CapturePayload::as_tensor),
+            ) else {
                 panic!("measured additive evidence for action {action_index}: actual={a:?}, reference={b:?}")
             };
             assert_eq!(a.shape(), b.shape());
@@ -237,8 +253,15 @@ fn verify_additive_component_transforms(
             .unwrap();
         let run = |runtime: &mut ModelRuntime<MlxBackend<'_>>| {
             runtime.reset().unwrap();
-            let mut generation = component_capture_generation(runtime, sampling);
-            generation.enable_capture(plan.clone()).unwrap();
+            let mut generation = component_capture_generation(
+                runtime,
+                sampling,
+                Some(eredu_core::TextPreparationOptions {
+                    capture: Some(eredu_core::capture::SharedCapturePlan::new(plan.clone())),
+                    interventions: None,
+                }),
+            )
+            .unwrap();
             (0..3)
                 .map(|_| {
                     let token = generation.next().unwrap().unwrap().token_id();

@@ -2,6 +2,8 @@
 use super::*;
 use crate::backend::array_copy::IsolatedArrayCopy;
 use crate::composition::mlx::MlxPreparedInputMaterializer;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_runtime::input::host::{
     HostInputPart, HostTensorValues, HostTensorView, PreparedHostInputPlan,
 };
@@ -9,15 +11,18 @@ use eredu_runtime::input::host::{
 #[test]
 #[ignore = "requires native Metal execution"]
 fn original_registered_token_ranges_preserve_signed_bits_backing_and_escaped_custody() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let backend = admitted_backend(&pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
-    let loaded = pool.used_bytes().unwrap();
+    let loaded = pool.fixture_host_charge().unwrap();
     let config = SpeculativeConfig {
         max_tokens: 2,
         max_draft_tokens: 1,
@@ -41,7 +46,7 @@ fn original_registered_token_ranges_preserve_signed_bits_backing_and_escaped_cus
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let environment = backend.original_copy_environment().unwrap();
@@ -74,22 +79,36 @@ fn original_registered_token_ranges_preserve_signed_bits_backing_and_escaped_cus
                         roots,
                         mechanisms,
                         sources.metadata_funding(),
-                        REQUEST_CEILING,
+                        &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                     )
                     .unwrap()
             });
             let source = registered_copy_input(source, sources, &environment).unwrap();
             let proof = RegisteredTensorSource::from_value(&source, sources, &environment).unwrap();
             let kind = program::SpeculativeNumericalKind::TokenRange { start: 1, end: 4 };
-            let result=if source.value().array.dtype()==safemlx::Dtype::Uint32 {
-                NumericalProducer::execute(sources,&environment,roots,mechanisms,kind,&source,None)
+            let result = if source.value().array.dtype() == safemlx::Dtype::Uint32 {
+                NumericalProducer::execute(
+                    sources,
+                    &environment,
+                    roots,
+                    mechanisms,
+                    kind,
+                    &source,
+                    None,
+                )
             } else {
-                let context=SpeculativeExecutionStreams::single(environment.stream())
-                    .with_original_sources(&pair,&environment).unwrap();
+                let context = SpeculativeExecutionStreams::single(environment.stream())
+                    .with_original_sources(&pair, &environment)
+                    .unwrap();
                 // Selected Draft is the same actual stream in this assignment;
                 // signed bits and escaped backing must follow the shared worker.
-                NumericalProducer::execute_at(context,eredu_core::speculative::SamplingPlacement::Draft,
-                    kind,&source,None)
+                NumericalProducer::execute_at(
+                    context,
+                    eredu_core::speculative::SamplingPlacement::Draft,
+                    kind,
+                    &source,
+                    None,
+                )
             };
             let NumericalOutput::Tensor(output) = result.unwrap() else {
                 panic!("range lost tensor meaning")
@@ -121,7 +140,7 @@ fn original_registered_token_ranges_preserve_signed_bits_backing_and_escaped_cus
             (output, proof)
         })
     };
-    assert!(pool.used_bytes().unwrap() > loaded);
+    assert!(pool.fixture_host_charge().unwrap() > loaded);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     drop((target, draft));
     assert_eq!(

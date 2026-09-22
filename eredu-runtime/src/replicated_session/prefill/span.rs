@@ -14,7 +14,8 @@ pub enum PrefillScoreLayout {
 
 /// One span's selected target transaction and any dependent auxiliary work.
 /// Implementations must preserve input/phase agreement and complete every root
-/// before returning. The public custom-mode entry is explicitly unbudgeted.
+/// before returning. External scheduling requires its admitted issuer, and each
+/// executing span separately consumes its original native occurrence authority.
 /// Returning the target commit separately prevents auxiliary commits from being
 /// mistaken for the target's opening-retention receipt.
 pub trait PrefillSpanOperation<A, B, M, D, P, O>
@@ -28,6 +29,11 @@ where
     P: PreparedPrefillSource<A, B, M::State>,
     O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
 {
+    /// Confirms this operation obtains original native role authority for every
+    /// span instead of relying on a whole ordinary inference request.
+    fn has_speculative_span_authority(&self) -> bool {
+        false
+    }
     /// Chooses final score ownership before source preparation or execution.
     fn score_layout(&self) -> PrefillScoreLayout {
         PrefillScoreLayout::FinalScores

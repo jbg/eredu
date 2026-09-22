@@ -69,7 +69,7 @@ pub(super) fn parameter_logits<
 >(
     model: &mut LoadedModel<B>,
     prefix: &[u32],
-) -> (Vec<f32>, Option<String>) {
+) -> (Vec<f32>, Option<String>){
     parameter_logits_mode(model, prefix, false)
 }
 
@@ -86,7 +86,7 @@ pub(super) fn parameter_logits_mode<
     model: &mut LoadedModel<B>,
     prefix: &[u32],
     controlled: bool,
-) -> (Vec<f32>, Option<String>) {
+) -> (Vec<f32>, Option<String>){
     model.reset().unwrap();
     let chat = model
         .source_chat(ChatTemplateRequest {
@@ -144,7 +144,6 @@ pub(super) fn parameter_logits_mode<
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -155,7 +154,7 @@ pub(super) fn parameter_logits_mode<
         per_record_bytes: 1 << 20,
         total_bytes: 4 << 20,
     };
-    let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings));
+    let mut prepared = PreparedChatRequest::new(&chat, original_settings(settings.clone()));
     prepared.input = PreparedChatPrompt::TokenIds(&prepared_prefix);
     prepared.output_mode = PreparedChatOutputMode::Text;
     prepared.capture = Some(&prepared_capture);
@@ -179,7 +178,7 @@ pub(super) fn parameter_logits_mode<
                 retained_bytes: 64 << 20,
                 cumulative_copy_bytes: 256 << 20,
             },
-            ORIGINAL_CAPACITY,
+            native_limits(ORIGINAL_CAPACITY),
             copy_limits(),
         )
         .unwrap();
@@ -235,7 +234,11 @@ pub(super) fn parameter_logits_mode<
         }) = record.event.progress()
         {
             assert!(!forced);
-            let Some(tensor) = step.records[0].payload.as_ref().and_then(CapturePayload::as_tensor) else {
+            let Some(tensor) = step.records[0]
+                .payload
+                .as_ref()
+                .and_then(CapturePayload::as_tensor)
+            else {
                 panic!("missing logits: {:?}", step.records[0])
             };
             let eredu_core::TensorObservationData::F32(values) = tensor.data() else {
@@ -504,8 +507,7 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
             edits[0].region.clone(),
             limits,
         )
-        .unwrap()
-        .values;
+        .unwrap();
     overflowing.update = ParameterUpdate::Add {
         values: vec![f32::MAX; overflowing.update.values().len()],
     };
@@ -550,7 +552,7 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
             )
             .unwrap()
             .values,
-        before
+        before.values
     );
 }
 
@@ -600,7 +602,6 @@ pub(super) fn verify_shared_parameter_edits(residency: eredu_core::ResidencyPlan
         model
             .query_parameter(&facts.identity, id, region.clone(), limits)
             .unwrap()
-            .values
     };
     let prefix = [1, 2, 5, 7];
     let edit = ParameterEdit {
@@ -621,8 +622,8 @@ pub(super) fn verify_shared_parameter_edits(residency: eredu_core::ResidencyPlan
             .unwrap()
             .into_parts();
     assert_eq!(
-        query(&mut model, &first.id),
-        query(&mut model, &repeated.id)
+        query(&mut model, &first.id).values,
+        query(&mut model, &repeated.id).values
     );
     let baseline = parameter_logits(&mut model, &prefix).0;
     let plan = ParameterOverlayPlan {
@@ -644,13 +645,11 @@ pub(super) fn verify_shared_parameter_edits(residency: eredu_core::ResidencyPlan
     let active = model.activate_parameter_overlay(&overlay, limits).unwrap();
     let one = model
         .query_parameter(&active.identity, &first.id, region.clone(), limits)
-        .unwrap()
-        .values;
+        .unwrap();
     let two = model
         .query_parameter(&active.identity, &repeated.id, region, limits)
-        .unwrap()
-        .values;
-    assert_eq!(one, two);
+        .unwrap();
+    assert_eq!(one.values, two.values);
     let changed = parameter_logits_mode(&mut model, &prefix, true).0;
     assert_ne!(changed, baseline);
     assert_eq!(changed, parameter_logits(&mut expected, &prefix).0);
@@ -680,7 +679,7 @@ pub(super) fn parameter_decode_logits<
     model: &mut LoadedModel<B>,
     prefix: &[u32],
     controlled: bool,
-) -> Vec<ParameterDecodeStep> {
+) -> Vec<ParameterDecodeStep>{
     model.reset().unwrap();
     let chat = model
         .source_chat(ChatTemplateRequest {
@@ -708,7 +707,6 @@ pub(super) fn parameter_decode_logits<
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -802,7 +800,7 @@ pub(super) fn parameter_decode_logits<
                 retained_bytes: 64 << 20,
                 cumulative_copy_bytes: 256 << 20,
             },
-            ORIGINAL_CAPACITY,
+            native_limits(ORIGINAL_CAPACITY),
             copy_limits(),
         )
         .unwrap();

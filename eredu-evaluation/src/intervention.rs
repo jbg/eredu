@@ -8,9 +8,9 @@ mod tests;
 
 /// Runs exact F32 activation checks using the production shared driver. `read`
 /// materializes test evidence only; inference never uses this callback.
-pub fn activation_conformance<B: InterventionBackend>(
+pub fn activation_conformance<B: InterventionBackend, V: AsRef<[f32]>>(
     backend: &mut B,
-    read: impl Fn(&B::Tensor) -> Vec<f32>,
+    read: impl Fn(&B::Tensor) -> V,
 ) {
     let source = InterventionTensor {
         shape: vec![2, 4],
@@ -61,9 +61,9 @@ pub fn activation_conformance<B: InterventionBackend>(
     for (action, expected) in cases {
         let value = eredu_runtime::intervention::apply_activation(backend, &input, &action, &slice)
             .unwrap();
-        assert_eq!(read(&value), expected);
+        assert_eq!(read(&value).as_ref(), expected);
         assert_eq!(
-            read(&input),
+            read(&input).as_ref(),
             vec![1., 2., 3., 4., 5., 6., 7., 8.],
             "primitive mutated its source"
         );
@@ -81,7 +81,7 @@ pub fn activation_conformance<B: InterventionBackend>(
     let value =
         eredu_runtime::intervention::apply_activation(backend, &input, &mask, &row).unwrap();
     assert_eq!(
-        read(&value),
+        read(&value).as_ref(),
         vec![1., 2., 3., 4., 5., f32::NEG_INFINITY, 7., f32::NEG_INFINITY]
     );
     for (indices, keep_selected, expected) in [
@@ -97,8 +97,8 @@ pub fn activation_conformance<B: InterventionBackend>(
         };
         let value =
             eredu_runtime::intervention::apply_activation(backend, &input, &action, &row).unwrap();
-        assert_eq!(read(&value), expected);
-        assert_eq!(read(&input), vec![1., 2., 3., 4., 5., 6., 7., 8.]);
+        assert_eq!(read(&value).as_ref(), expected);
+        assert_eq!(read(&input).as_ref(), vec![1., 2., 3., 4., 5., 6., 7., 8.]);
         assert!(
             eredu_runtime::intervention::apply_activation(backend, &input, &action, &slice)
                 .is_err()
@@ -110,7 +110,7 @@ pub fn activation_conformance<B: InterventionBackend>(
     };
     let unchanged =
         eredu_runtime::intervention::apply_activation(backend, &input, &scale, &slice).unwrap();
-    assert_eq!(read(&unchanged), read(&input));
+    assert_eq!(read(&unchanged).as_ref(), read(&input).as_ref());
     assert!(eredu_runtime::intervention::apply_activation(backend, &input, &mask, &slice).is_err());
     for invalid in [
         InterventionAction::Replace {

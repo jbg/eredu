@@ -1,12 +1,14 @@
 //! The two actual packed projection banks share sorting, projections and Sum.
 //! Source facts distinguish their real activation, slices and chunk protocol.
 use super::*;
+mod affine;
 mod mxfp4;
 mod sources;
-mod affine;
 pub(super) use affine::{control_bytes as affine_control_bytes, uses_source as uses_affine_source};
 pub(super) fn affine_sources(operation: WorkspaceOperationView<'_>) -> Option<usize> {
-    if !affine::uses_source(operation) { return None; }
+    if !affine::uses_source(operation) {
+        return None;
+    }
     let counts = sources::counts(operation)?;
     counts[1].checked_add(counts[2])
 }
@@ -92,13 +94,25 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         // Positive TP adapters call this same packed forward worker. A down
         // bias then executes the actual full-route suffix below; the caller
         // separately adds that post-reduce value once after its collective.
-        let WorkspaceGroupedBank::GatedProduct(spec) = bank else { return None; };
-        let eredu_nn::GatedProductGroupLayout::Packed { down, .. } = spec.layout()
-            else { return None; };
-        if partitions == 0 { return None; }
+        let WorkspaceGroupedBank::GatedProduct(spec) = bank else {
+            return None;
+        };
+        let eredu_nn::GatedProductGroupLayout::Packed { down, .. } = spec.layout() else {
+            return None;
+        };
+        if partitions == 0 {
+            return None;
+        }
         if down.bias().is_some()
-            && operation.outputs.len() != if phase == WorkspaceGroupedPhase::Units { 4 } else { 2 }
-        { return None; }
+            && operation.outputs.len()
+                != if phase == WorkspaceGroupedPhase::Units {
+                    4
+                } else {
+                    2
+                }
+        {
+            return None;
+        }
     }
     let bank = Bank::new(bank)?;
     let gate_up = bank.first;
@@ -109,7 +123,11 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
     );
     let mxfp4 = mxfp4::uses_source(operation);
     let affine = affine::uses_source(operation);
-    let affine_counts = if affine { Some(sources::counts(operation)?) } else { None };
+    let affine_counts = if affine {
+        Some(sources::counts(operation)?)
+    } else {
+        None
+    };
     if affine {
         // The exact parameter roles and active per-phase workers were checked.
     } else if mxfp4 {
@@ -196,7 +214,11 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
     let primitives = chunks
         .checked_mul(p)?
         .checked_add(if before {
-            if bank.outer_validation { 32 } else { 1 }
+            if bank.outer_validation {
+                32
+            } else {
+                1
+            }
         } else {
             0
         })?
@@ -209,7 +231,11 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
     let edges = chunks
         .checked_mul(e)?
         .checked_add(if before {
-            if bank.outer_validation { 37 } else { 1 }
+            if bank.outer_validation {
+                37
+            } else {
+                1
+            }
         } else {
             0
         })?
@@ -311,8 +337,19 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         })?
         .checked_add(chunks.checked_mul(extra)?)?;
     value.streams = 1;
-    value.intermediate_rank = if fp8 || affine_counts.is_some_and(|counts| counts[2] != 0) { 4 } else { 3 };
-    value.maximum_operands = if after { chunks } else { 0 }.max(if affine_counts.is_some_and(|counts| counts[1] != 0) { 6 } else if fp8 || mxfp4 { 5 } else { 4 });
+    value.intermediate_rank = if fp8 || affine_counts.is_some_and(|counts| counts[2] != 0) {
+        4
+    } else {
+        3
+    };
+    value.maximum_operands =
+        if after { chunks } else { 0 }.max(if affine_counts.is_some_and(|counts| counts[1] != 0) {
+            6
+        } else if fp8 || mxfp4 {
+            5
+        } else {
+            4
+        });
     if fp8 {
         value.backend_shells = chunks.checked_mul(projections)?.checked_mul(3)?;
     }
@@ -337,14 +374,17 @@ pub(super) fn lower(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
         value.maximum_births = value.maximum_births.checked_add(59)?;
         // Bias ordering is over ALL selected rows, independent of forward's
         // per-chunk sorts; use the existing native sort geometry query.
-        value.additional_sort_kernels = value.additional_sort_kernels?
+        value.additional_sort_kernels = value
+            .additional_sort_kernels?
             .checked_add(grouped_sort_kernels(tokens.checked_mul(top_k)?)?);
     }
     // Every completed chunk uses the same selected arithmetic. The TP bias
     // correction, when present, invokes it once more over the full route table.
     let reductions = if after {
         chunks.checked_add(usize::from(partitions.is_some() && down.bias().is_some()))?
-    } else { 0 };
+    } else {
+        0
+    };
     grouped_reduction::extend(&mut value, bank.reduction, top_k, reductions)?;
     Some(value)
 }
@@ -488,91 +528,216 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod tensor_parallel_tests {
     use super::*;
     use eredu_nn::Tensor;
-    use eredu_nn::{GatedProductGroupLayout, GatedProductPolicy, GroupSelection,
-        GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
-        GroupedProjectionSpec, LinearFormatSpec, ParameterSpec, TensorParallelGroupedGatedProductOperator};
+    use eredu_nn::{
+        GatedProductGroupLayout, GatedProductPolicy, GroupSelection, GroupedGatedProductOperator,
+        GroupedGatedProductSpec, GroupedNeuralBackend, GroupedProjectionSpec, LinearFormatSpec,
+        ParameterSpec, TensorParallelGroupedGatedProductOperator,
+    };
 
     #[test]
     fn packed_tp_bias_quotes_full_route_suffix_and_two_actual_outputs() {
-        let projection = |name, bias| GroupedProjectionSpec::new(
-            ParameterSpec::trainable(name).unwrap(), bias,
-            LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap()).unwrap();
-        let spec = GroupedGatedProductSpec::new(2,8,2,8,GatedProductPolicy::ordinary_silu(),
-            GatedProductGroupLayout::Packed {gate_up:projection("read",None),
-                down:projection("write",Some(ParameterSpec::trainable("bias").unwrap()))}).unwrap();
+        let projection = |name, bias| {
+            GroupedProjectionSpec::new(
+                ParameterSpec::trainable(name).unwrap(),
+                bias,
+                LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap(),
+            )
+            .unwrap()
+        };
+        let spec = GroupedGatedProductSpec::new(
+            2,
+            8,
+            2,
+            8,
+            GatedProductPolicy::ordinary_silu(),
+            GatedProductGroupLayout::Packed {
+                gate_up: projection("read", None),
+                down: projection("write", Some(ParameterSpec::trainable("bias").unwrap())),
+            },
+        )
+        .unwrap();
         let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        for positions in [2,65] {
+        for positions in [2, 65] {
             let context = WorkspaceContext::new(mechanism);
-            let mut bank = WorkspaceBackend::grouped_gated_product(spec.clone(),&context).unwrap();
-            let input = WorkspaceTensor::unloaded_f32(&[1,positions,8],&context).unwrap();
-            let ids = WorkspaceTensor::existing(WorkspaceLayout::new(&[positions,2],WorkspaceDtype::Uint32).unwrap(),&context).unwrap();
-            let coefficients = WorkspaceTensor::unloaded_f32(&[positions,2],&context).unwrap();
-            let selection=GroupSelection::new(ids,coefficients.clone(),coefficients);
+            let mut bank = WorkspaceBackend::grouped_gated_product(spec.clone(), &context).unwrap();
+            let input = WorkspaceTensor::unloaded_f32(&[1, positions, 8], &context).unwrap();
+            let ids = WorkspaceTensor::existing(
+                WorkspaceLayout::new(&[positions, 2], WorkspaceDtype::Uint32).unwrap(),
+                &context,
+            )
+            .unwrap();
+            let coefficients = WorkspaceTensor::unloaded_f32(&[positions, 2], &context).unwrap();
+            let selection = GroupSelection::new(ids, coefficients.clone(), coefficients);
             context.begin_span();
-            let (reducible,bias)=bank.forward_grouped_tensor_parallel(&input,&selection,2,&context).unwrap().into_parts();
-            let bias=bias.expect("actual independent post-reduce bias");
-            assert_eq!(bias.shape(),reducible.shape());
-            let report=context.report(&[reducible,bias]).unwrap();
-            let op=report.operations.iter().find(|op|matches!(op.kind,WorkspaceOperationKind::Grouped{..})).unwrap();
-            assert_eq!(op.outputs.len(),2);
-            let lowering=lower(op.as_view()).unwrap();
-            let routes=(positions as usize)*2;
-            assert!(lowering.additional_sort_kernels.unwrap()>=grouped_sort_kernels(routes).unwrap());
-            let recorder=ResidentRecipeRecorder::new(InferenceGeometry{batch_size:1,cached_positions:0,
-                input_positions:positions as u64,max_output_tokens:1,prefill_chunk_positions:positions as u64,
-                output:eredu_core::OutputDemand::Sequence},mechanism);
-            let reduced=recorder.reduce_trace(&report,None,0,2).unwrap();
-            assert_eq!(reduced.first_missing_operation,None);
-            assert!(reduced.graph.is_some()&&reduced.dispatch.is_some()&&reduced.mutable_storage.is_some());
+            let (reducible, bias) = bank
+                .forward_grouped_tensor_parallel(&input, &selection, 2, &context)
+                .unwrap()
+                .into_parts();
+            let bias = bias.expect("actual independent post-reduce bias");
+            assert_eq!(bias.shape(), reducible.shape());
+            let report = context.report(&[reducible, bias]).unwrap();
+            let op = report
+                .operations
+                .iter()
+                .find(|op| matches!(op.kind, WorkspaceOperationKind::Grouped { .. }))
+                .unwrap();
+            assert_eq!(op.outputs.len(), 2);
+            let lowering = lower(op.as_view()).unwrap();
+            let routes = (positions as usize) * 2;
+            assert!(
+                lowering.additional_sort_kernels.unwrap() >= grouped_sort_kernels(routes).unwrap()
+            );
+            let recorder = ResidentRecipeRecorder::new(
+                InferenceGeometry {
+                    batch_size: 1,
+                    cached_positions: 0,
+                    input_positions: positions as u64,
+                    max_output_tokens: 1,
+                    prefill_chunk_positions: positions as u64,
+                    output: eredu_core::OutputDemand::Sequence,
+                },
+                mechanism,
+            );
+            let reduced = recorder.reduce_trace(&report, None, 0, 2).unwrap();
+            assert_eq!(reduced.first_missing_operation, None);
+            assert!(
+                reduced.graph.is_some()
+                    && reduced.dispatch.is_some()
+                    && reduced.mutable_storage.is_some()
+            );
         }
     }
 
     #[test]
     fn bias_free_packed_tp_keeps_the_actual_ordinary_worker_and_rejects_incomplete_bias_source() {
-        let projection = |name, bias| GroupedProjectionSpec::new(
-            ParameterSpec::trainable(name).unwrap(), bias,
-            LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap()).unwrap();
-        let spec = |bias| GroupedGatedProductSpec::new(2,8,2,8,GatedProductPolicy::ordinary_silu(),
-            GatedProductGroupLayout::Packed {gate_up:projection("read",None),down:projection("write",bias)}).unwrap();
+        let projection = |name, bias| {
+            GroupedProjectionSpec::new(
+                ParameterSpec::trainable(name).unwrap(),
+                bias,
+                LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap(),
+            )
+            .unwrap()
+        };
+        let spec = |bias| {
+            GroupedGatedProductSpec::new(
+                2,
+                8,
+                2,
+                8,
+                GatedProductPolicy::ordinary_silu(),
+                GatedProductGroupLayout::Packed {
+                    gate_up: projection("read", None),
+                    down: projection("write", bias),
+                },
+            )
+            .unwrap()
+        };
         let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        for positions in [1,2] {
+        for positions in [1, 2] {
             let trace = |partitions| {
                 let context = WorkspaceContext::new(mechanism);
-                let mut bank = WorkspaceBackend::grouped_gated_product(spec(None),&context).unwrap();
-                let input = WorkspaceTensor::unloaded_f32(&[1,positions,8],&context).unwrap();
-                let ids = WorkspaceTensor::existing(WorkspaceLayout::new(&[positions,1],WorkspaceDtype::Uint32).unwrap(),&context).unwrap();
-                let coefficients = WorkspaceTensor::unloaded_f32(&[positions,1],&context).unwrap();
-                let selection=GroupSelection::new(ids,coefficients.clone(),coefficients);
+                let mut bank =
+                    WorkspaceBackend::grouped_gated_product(spec(None), &context).unwrap();
+                let input = WorkspaceTensor::unloaded_f32(&[1, positions, 8], &context).unwrap();
+                let ids = WorkspaceTensor::existing(
+                    WorkspaceLayout::new(&[positions, 1], WorkspaceDtype::Uint32).unwrap(),
+                    &context,
+                )
+                .unwrap();
+                let coefficients =
+                    WorkspaceTensor::unloaded_f32(&[positions, 1], &context).unwrap();
+                let selection = GroupSelection::new(ids, coefficients.clone(), coefficients);
                 context.begin_span();
-                let output=match partitions {
-                    Some(count)=>{let (value,bias)=bank.forward_grouped_tensor_parallel(&input,&selection,count,&context).unwrap().into_parts();assert!(bias.is_none());value},
-                    None=>bank.forward_grouped(&input,&selection,&context).unwrap(),
+                let output = match partitions {
+                    Some(count) => {
+                        let (value, bias) = bank
+                            .forward_grouped_tensor_parallel(&input, &selection, count, &context)
+                            .unwrap()
+                            .into_parts();
+                        assert!(bias.is_none());
+                        value
+                    }
+                    None => bank.forward_grouped(&input, &selection, &context).unwrap(),
                 };
                 context.report(&[output]).unwrap()
             };
-            let ordinary=trace(None);
-            let ordinary_op=ordinary.operations.iter().find(|op|matches!(op.kind,WorkspaceOperationKind::Grouped{..})).unwrap();
-            let expected=lower(ordinary_op.as_view()).unwrap();
-            for partitions in [1,2] {
-                let report=trace(Some(partitions));
-                let op=report.operations.iter().find(|op|matches!(op.kind,WorkspaceOperationKind::Grouped{..})).unwrap();
-                let actual=lower(op.as_view()).unwrap();
-                assert_eq!((actual.primitives,actual.edges,actual.seeds,actual.maximum_births),
-                    (expected.primitives,expected.edges,expected.seeds,expected.maximum_births));
-                let recorder=ResidentRecipeRecorder::new(InferenceGeometry {batch_size:1,cached_positions:0,
-                    input_positions:positions as u64,max_output_tokens:1,prefill_chunk_positions:positions as u64,
-                    output:eredu_core::OutputDemand::Sequence},mechanism);
-                let reduced=recorder.reduce_trace(&report,None,0,1).unwrap();
-                assert_eq!(reduced.first_missing_operation,None);assert!(reduced.dispatch.is_some());
-                let view=op.as_view();
-                let WorkspaceOperationKindView::Grouped{bank,phase,..}=view.kind else{unreachable!()};
-                assert!(lower(WorkspaceOperationView{kind:WorkspaceOperationKindView::Grouped{bank,phase,partitions:Some(0)},..view}).is_none());
-                let biased=WorkspaceGroupedBank::GatedProduct(spec(Some(ParameterSpec::trainable("down.bias").unwrap())));
-                assert!(lower(WorkspaceOperationView{kind:WorkspaceOperationKindView::Grouped{bank:&biased,phase,partitions:Some(partitions)},..view}).is_none());
+            let ordinary = trace(None);
+            let ordinary_op = ordinary
+                .operations
+                .iter()
+                .find(|op| matches!(op.kind, WorkspaceOperationKind::Grouped { .. }))
+                .unwrap();
+            let expected = lower(ordinary_op.as_view()).unwrap();
+            for partitions in [1, 2] {
+                let report = trace(Some(partitions));
+                let op = report
+                    .operations
+                    .iter()
+                    .find(|op| matches!(op.kind, WorkspaceOperationKind::Grouped { .. }))
+                    .unwrap();
+                let actual = lower(op.as_view()).unwrap();
+                assert_eq!(
+                    (
+                        actual.primitives,
+                        actual.edges,
+                        actual.seeds,
+                        actual.maximum_births
+                    ),
+                    (
+                        expected.primitives,
+                        expected.edges,
+                        expected.seeds,
+                        expected.maximum_births
+                    )
+                );
+                let recorder = ResidentRecipeRecorder::new(
+                    InferenceGeometry {
+                        batch_size: 1,
+                        cached_positions: 0,
+                        input_positions: positions as u64,
+                        max_output_tokens: 1,
+                        prefill_chunk_positions: positions as u64,
+                        output: eredu_core::OutputDemand::Sequence,
+                    },
+                    mechanism,
+                );
+                let reduced = recorder.reduce_trace(&report, None, 0, 1).unwrap();
+                assert_eq!(reduced.first_missing_operation, None);
+                assert!(reduced.dispatch.is_some());
+                let view = op.as_view();
+                let WorkspaceOperationKindView::Grouped { bank, phase, .. } = view.kind else {
+                    unreachable!()
+                };
+                assert!(lower(WorkspaceOperationView {
+                    kind: WorkspaceOperationKindView::Grouped {
+                        bank,
+                        phase,
+                        partitions: Some(0)
+                    },
+                    ..view
+                })
+                .is_none());
+                let biased = WorkspaceGroupedBank::GatedProduct(spec(Some(
+                    ParameterSpec::trainable("down.bias").unwrap(),
+                )));
+                assert!(lower(WorkspaceOperationView {
+                    kind: WorkspaceOperationKindView::Grouped {
+                        bank: &biased,
+                        phase,
+                        partitions: Some(partitions)
+                    },
+                    ..view
+                })
+                .is_none());
             }
         }
     }

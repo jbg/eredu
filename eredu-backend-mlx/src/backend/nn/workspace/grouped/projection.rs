@@ -101,7 +101,12 @@ impl<'a> Projection<'a> {
     // Same dense branch selected by packed_grouped_linear when a reversible
     // overlay publishes floating weights. Its logical bank is independent of
     // the smaller retained packed U32 storage and its U8 companions.
-    fn dense_cost(&self, n: u64, a: NativeAllocationFacts) -> FactResult<Cost> {
+    fn dense_cost(
+        &self,
+        n: u64,
+        a: NativeAllocationFacts,
+        custom: bool,
+    ) -> FactResult<Option<Cost>> {
         let mut cost = Cost::new(a);
         let input = mul(n, self.columns)?;
         let output = mul(n, self.rows)?;
@@ -114,7 +119,12 @@ impl<'a> Projection<'a> {
         cost.buffers(n, 4)?; // default lhs IDs, casts and compact rhs IDs
         cost.buffers(output, 2)?; // kernel and result reshape
         cost.buffers(1, 2)?;
-        if self.columns % 32 == 0 && n != 0 {
+        if custom {
+            if !crate::backend::nn::matrix::bf16_row_width_supported(i32::try_from(self.columns)?)
+                || n == 0
+            {
+                return Ok(None);
+            }
             let mut custom = Cost::new(a);
             custom.buffers(input, 1)?;
             custom.buffers(mul(self.groups, mul(self.rows, self.columns)?)?, 1)?;
@@ -132,96 +142,105 @@ impl<'a> Projection<'a> {
             // and where. The existing comparison/sum terms stay live.
             custom.buffers(n, 3)?;
             custom.buffers(1, 1)?;
-            cost.tensor = cost.tensor.max(custom.tensor);
+            custom.default_scalars(if a.original_storage { 3 } else { 2 })?;
+            cost = custom;
         }
 
-        Ok(cost)
+        Ok(Some(cost))
     }
-    pub(super) fn cost(&self, n: u64, a: NativeAllocationFacts) -> FactResult<Cost> {
+    pub(super) fn cost(
+        &self,
+        n: u64,
+        a: NativeAllocationFacts,
+        source: usize,
+    ) -> FactResult<Option<Cost>> {
         let mut cost = Cost::new(a);
         let input = mul(n, self.columns)?;
         let output = mul(n, self.rows)?;
-        match self.format.encoding() {
-            LinearFormat::Dense => cost = self.dense_cost(n, a)?,
-            LinearFormat::Affine(config) if config.group_size == 16 => {
-                // This selected mechanism really gathers every packed expert
-                // matrix and companion before batched qmv. Count those replicas
-                // and subsequent promotions/compaction independently.
-                cost.buffers(input, 3)?;
-                let weight_row = self
-                    .weight
-                    .bytes()?
-                    .checked_div(self.groups)
-                    .ok_or_else(invalid)?;
-                cost.bytes(mul(n, weight_row)?, 2)?;
-                for companion in self.companions.iter() {
-                    let row = companion
+        let encoding = self.format.encoding();
+        let dense = match encoding {
+            LinearFormat::Dense if source < 2 => Some(source == 1),
+            LinearFormat::Affine(_) | LinearFormat::MxFp4 if source > 0 => Some(source == 2),
+            _ if source == 0 => None,
+            _ => return Ok(None),
+        };
+        if let Some(custom) = dense {
+            let Some(selected) = self.dense_cost(n, a, custom)? else {
+                return Ok(None);
+            };
+            cost = selected;
+        } else {
+            match encoding {
+                LinearFormat::Dense => unreachable!(),
+                LinearFormat::Affine(config) if config.group_size == 16 => {
+                    // This selected mechanism really gathers every packed expert
+                    // matrix and companion before batched qmv. Count those replicas
+                    // and subsequent promotions/compaction independently.
+                    cost.buffers(input, 3)?;
+                    let weight_row = self
+                        .weight
                         .bytes()?
                         .checked_div(self.groups)
                         .ok_or_else(invalid)?;
-                    cost.bytes(mul(n, row)?, 3)?;
+                    cost.bytes(mul(n, weight_row)?, 2)?;
+                    for companion in self.companions.iter() {
+                        let row = companion
+                            .bytes()?
+                            .checked_div(self.groups)
+                            .ok_or_else(invalid)?;
+                        cost.bytes(mul(n, row)?, 3)?;
+                    }
+                    cost.buffers(n, 2)?;
+                    cost.buffers(output, 2)?;
+                    cost.buffers(1, 2)?;
                 }
-                cost.buffers(n, 2)?;
-                cost.buffers(output, 2)?;
-                cost.buffers(1, 2)?;
-            }
-            LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
-                cost.buffers(input, 3)?;
-                cost.bytes(self.weight.bytes()?, 1)?;
-                for companion in self.companions.iter() {
-                    cost.bytes(
-                        companion.bytes()?,
-                        if companion.dtype() == WorkspaceDtype::Float32 {
-                            2
-                        } else {
-                            1
-                        },
-                    )?;
+                LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
+                    cost.buffers(input, 3)?;
+                    cost.bytes(self.weight.bytes()?, 1)?;
+                    for companion in self.companions.iter() {
+                        cost.bytes(
+                            companion.bytes()?,
+                            if companion.dtype() == WorkspaceDtype::Float32 {
+                                2
+                            } else {
+                                1
+                            },
+                        )?;
+                    }
+                    cost.buffers(n, 4)?; // explicit lhs arange, index casts and possible compaction
+                    cost.buffers(output, 2)?;
+                    cost.buffers(1, 2)?;
                 }
-                cost.buffers(n, 4)?; // explicit lhs arange, index casts and possible compaction
-                cost.buffers(output, 2)?;
-                cost.buffers(1, 2)?;
-                if self.format.encoding() == LinearFormat::MxFp4 {
-                    // Both branches are real, mutually exclusive native choices.
-                    // Retain the larger population, rather than adding them.
-                    cost.tensor = cost.tensor.max(self.dense_cost(n, a)?.tensor);
+                LinearFormat::GgufIQuant { .. } => {
+                    // All selected GGML kernels decode packed data in registers.
+                    // Custom-kernel preparation may compact each input once.
+                    cost.buffers(input, 1)?;
+                    cost.bytes(self.weight.bytes()?, 1)?;
+                    cost.buffers(n, 1)?;
+                    cost.buffers(output, 1)?;
+                }
+                LinearFormat::E4M3BlockFp8(config) => {
+                    cost.buffers(input, 1)?; // activation quantizer input compaction
+                    cost.bytes(input, 2)?; // quantized activation and possible projector copy
+                    cost.buffers(mul(n, self.columns.div_ceil(128))?, 2)?;
+                    cost.bytes(self.weight.bytes()?, 2)?; // partition-shape copy and projector compaction
+                    let scales = self.companions.get(0).unwrap().elements()?;
+                    cost.buffers(scales, 2)?; // partition-shape copy and projector compaction
+                    if config.scale_encoding == BlockFp8ScaleEncoding::Ue8m0 {
+                        // The shared scale decoder borrows its process-owned table.
+                        cost.buffers(256, 1)?;
+                        cost.buffers(scales, 2)?; // indices and decoded scale values
+                    }
+                    cost.buffers(n, 1)?; // group-ID custom-kernel compaction
+                    cost.buffers(output, 2)?; // F32 result and activation dtype restoration
+                    cost.buffers(1, 2)?;
                 }
             }
-            LinearFormat::GgufIQuant { .. } => {
-                // All selected GGML kernels decode packed data in registers.
-                // Custom-kernel preparation may compact each input once.
-                cost.buffers(input, 1)?;
-                cost.bytes(self.weight.bytes()?, 1)?;
-                cost.buffers(n, 1)?;
-                cost.buffers(output, 1)?;
-            }
-            LinearFormat::E4M3BlockFp8(config) => {
-                cost.buffers(input, 1)?; // activation quantizer input compaction
-                cost.bytes(input, 2)?; // quantized activation and possible projector copy
-                cost.buffers(mul(n, self.columns.div_ceil(128))?, 2)?;
-                cost.bytes(self.weight.bytes()?, 2)?; // partition-shape copy and projector compaction
-                let scales = self.companions.get(0).unwrap().elements()?;
-                cost.buffers(scales, 2)?; // partition-shape copy and projector compaction
-                if config.scale_encoding == BlockFp8ScaleEncoding::Ue8m0 {
-                    // The shared scale decoder borrows its process-owned table.
-                    cost.buffers(256, 1)?;
-                    cost.buffers(scales, 2)?; // indices and decoded scale values
-                }
-                cost.buffers(n, 1)?; // group-ID custom-kernel compaction
-                cost.buffers(output, 2)?; // F32 result and activation dtype restoration
-                cost.buffers(1, 2)?;
-            }
-        }
-        if matches!(self.format.encoding(), LinearFormat::Affine(_)) {
-            // The actual packed adapter accepts a published floating weight
-            // before inspecting companions, just like MXFP4. Its full logical
-            // dense bank is a mutually exclusive source, not packed byte reuse.
-            cost.tensor = cost.tensor.max(self.dense_cost(n, a)?.tensor);
         }
         if self.bias.is_some() {
             cost.buffers(output, 1)?; // direct bias gather
             cost.pointwise(output, 2)?;
         }
-        Ok(cost)
+        Ok(Some(cost))
     }
 }

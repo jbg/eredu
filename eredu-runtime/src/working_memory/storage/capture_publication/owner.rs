@@ -8,7 +8,7 @@ pub(in crate::working_memory) struct CaptureSourceOwner {
     // The identity alias retires before the actual source's original custody.
     owner: ErasedSharedStorageOwner,
     validate:
-        fn(&ErasedSharedStorageOwner, &WorkingMemoryPool, &Usage) -> Result<(), WorkingMemoryError>,
+        fn(&ErasedSharedStorageOwner, &MemoryLedger, &Usage) -> Result<(), WorkingMemoryError>,
 }
 impl CaptureSourceOwner {
     pub(in crate::working_memory) fn new<K: CapturePlanStorageKey>(
@@ -28,7 +28,7 @@ impl CaptureSourceOwner {
     }
     pub(in crate::working_memory) fn validate(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         (self.validate)(&self.owner, pool, usage)
@@ -36,7 +36,7 @@ impl CaptureSourceOwner {
 }
 fn validate<K: CapturePlanStorageKey>(
     owner: &ErasedSharedStorageOwner,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     usage: &Usage,
 ) -> Result<(), WorkingMemoryError> {
     owner

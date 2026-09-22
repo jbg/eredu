@@ -1,8 +1,8 @@
 use super::*;
-use crate::{reclaim_allocation_owners, PreparedOriginalBufferBudget};
+use crate::{PreparedOriginalBufferBudget, reclaim_allocation_owners};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 // Pinned native/Rust validation must set this flag; an unknown layout then
@@ -18,7 +18,9 @@ fn qualified_plan(runtime: &PreparedInputRuntime) -> Option<OriginalMutablePairP
                 Some("1".into()),
                 "pinned mutable-pair validation requires positive native qualification"
             );
-            eprintln!("mutable-pair qualification=native-layout-unknown; typed refusal before owner preparation");
+            eprintln!(
+                "mutable-pair qualification=native-layout-unknown; typed refusal before owner preparation"
+            );
             None
         }
     }
@@ -277,4 +279,145 @@ fn mutable_pair_runtime_busy_returns_the_same_prepared_prefix_without_native_ent
     drop((error, inspect));
     reclaim_allocation_owners();
     assert_eq!(observed(&retired), [1; 6]);
+}
+
+#[test]
+fn completed_budget_releases_staging_and_slack_while_destination_alias_survives() {
+    struct Observed(Arc<AtomicUsize>, Arc<AtomicUsize>);
+    impl crate::OriginalBufferLifetimeObserver for Observed {
+        fn closed_occupancy(&self, bytes: usize) {
+            self.0.fetch_min(bytes, Ordering::SeqCst);
+        }
+    }
+    impl Drop for Observed {
+        fn drop(&mut self) {
+            assert!(crate::can_reclaim_submission_resources());
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let runtime = PreparedInputRuntime::prepare().unwrap();
+    let Some(plan) = qualified_plan(&runtime) else {
+        return;
+    };
+    let bytes = plan.facts().backing_bytes();
+    let observed = Arc::new(AtomicUsize::new(usize::MAX));
+    let retired = Arc::new(AtomicUsize::new(0));
+    let budget = PreparedOriginalBufferBudget::try_new(
+        &runtime,
+        bytes.checked_mul(3).unwrap(),
+        Observed(observed.clone(), retired.clone()),
+    )
+    .unwrap()
+    .try_allocate_observed()
+    .unwrap();
+    let staging = plan
+        .prepare(
+            [17, 23],
+            budget.clone(),
+            OriginalMutablePairCustodies::new((), (), (), (), ()),
+        )
+        .unwrap()
+        .try_construct()
+        .unwrap();
+    let destination = OriginalMutablePairPlan::inspect(&runtime)
+        .unwrap()
+        .prepare(
+            [31, 47],
+            budget.clone(),
+            OriginalMutablePairCustodies::new((), (), (), (), ()),
+        )
+        .unwrap()
+        .try_construct()
+        .unwrap();
+    let alias = destination.clone();
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        usize::MAX,
+        "the live producer may still consume all admitted capacity"
+    );
+    assert_eq!(budget.occupied_bytes(), bytes * 2);
+    let inspection = budget.into_inspection().into_shared();
+    let inspection_alias = inspection.clone();
+    assert!(inspection.same_budget(&inspection_alias));
+    let lock = runtime_lock::coordinate_entry();
+    std::thread::scope(|scope| {
+        let inspection = &inspection;
+        let alias = &alias;
+        scope
+            .spawn(move || {
+                let clone = inspection.clone();
+                assert_eq!(clone.occupied_bytes(), bytes * 2);
+                assert_eq!(
+                    clone.inspect_array(alias).unwrap_err(),
+                    OriginalBufferCause::RuntimeBusy
+                );
+            })
+            .join()
+            .unwrap();
+    });
+    drop(lock);
+    std::thread::scope(|scope| {
+        let moved_inspection = inspection.clone();
+        let alias = &alias;
+        scope
+            .spawn(move || {
+                moved_inspection
+                    .inspect_array(alias)
+                    .unwrap()
+                    .unwrap()
+                    .validate_current()
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+    });
+    inspection
+        .inspect_array(&alias)
+        .unwrap()
+        .unwrap()
+        .validate_current()
+        .unwrap();
+    assert_eq!(
+        inspection
+            .inspect_array(&alias)
+            .unwrap()
+            .unwrap()
+            .allocation(),
+        inspection_alias
+            .inspect_array(&destination)
+            .unwrap()
+            .unwrap()
+            .allocation(),
+    );
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        bytes * 2,
+        "closed producers release unused allowance"
+    );
+    drop(staging);
+    assert_eq!(inspection.occupied_bytes(), bytes);
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        bytes,
+        "independent staging release does not await destination retirement"
+    );
+    drop(destination);
+    assert_eq!(observed.load(Ordering::SeqCst), bytes);
+    assert_eq!(
+        alias.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+        &[31, 47]
+    );
+    inspection_alias
+        .inspect_array(&alias)
+        .unwrap()
+        .unwrap()
+        .validate_current()
+        .unwrap();
+    drop(alias);
+    assert_eq!(observed.load(Ordering::SeqCst), 0);
+    assert_eq!(inspection.occupied_bytes(), 0);
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+    drop((inspection, inspection_alias));
+    reclaim_allocation_owners();
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
 }

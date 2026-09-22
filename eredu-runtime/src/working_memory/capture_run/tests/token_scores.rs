@@ -1,5 +1,5 @@
+use super::candidates::{g, source_with_transform, value_usage};
 use super::*;
-use super::candidates::{source_with_transform, g, value_usage};
 use crate::capture::{
     CaptureObservationStep, CapturePrefillHookDecision as D, CapturePrefillObservationPolicy,
 };
@@ -51,7 +51,7 @@ fn selected_scores_use_only_terminal_chunk_and_escape_with_original_host_custody
                     .requires_sequence_readout()
             );
             let h = plan(&source).initialization_peak_bytes();
-            let pool = WorkingMemoryPool::new(h, 0).unwrap();
+            let pool = capture_test_ledger(h, 0).unwrap();
             let (reservation, run) = fresh(&pool, h);
             let mut bank = run
                 .prepare_capture_run(&reservation, plan(&source))
@@ -132,9 +132,9 @@ fn selected_scores_use_only_terminal_chunk_and_escape_with_original_host_custody
             assert_eq!(frame.step_usage().captures, 1);
             drop(frame);
             drop((bank, reservation, run));
-            assert_eq!(pool.used_bytes().unwrap(), h);
+            assert_eq!(pool.payload_used_bytes().unwrap(), h);
             drop(alias);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -142,7 +142,7 @@ fn selected_scores_use_only_terminal_chunk_and_escape_with_original_host_custody
 fn ordered_score_claim_rejects_foreign_frame_and_poisoned_partial_fill_without_refund() {
     let source = source(3);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h * 2, 0).unwrap();
+    let pool = capture_test_ledger(h * 2, 0).unwrap();
     let (r, run) = fresh(&pool, h * 2);
     let mut a = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut b = run.prepare_capture_run(&r, plan(&source)).unwrap();
@@ -171,7 +171,7 @@ fn ordered_score_claim_rejects_foreign_frame_and_poisoned_partial_fill_without_r
     assert!(sb.take_token_scores(0).is_err());
     drop((sa, sb));
     drop((a, b, r, run));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

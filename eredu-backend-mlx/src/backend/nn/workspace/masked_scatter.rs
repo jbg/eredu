@@ -1,5 +1,5 @@
 //! The pinned MaskedScatter primitive, including its exclusive U32 mask scan.
-use super::facts::{Emitter, FactResult, Output, add, buffer_capacity, mul};
+use super::facts::{add, buffer_capacity, mul, Emitter, FactResult, Output};
 use super::*;
 
 pub(super) fn geometry(operation: WorkspaceOperationView<'_>) -> FactResult<Option<()>> {

@@ -1,7 +1,7 @@
 use super::*;
 use eredu::api::{ChatSourceInput, TokenizerSourceInput};
 use eredu::runtime::chat::{ChatTemplateRequest, ToolChoice};
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate};
 
 #[test]
@@ -10,7 +10,7 @@ fn retained_metaspace_decoder_runs_public_plain_source_without_reconstruction() 
         ManagedPlainTextRequest, PreparedChatGenerationSettings, TextInferencePolicy,
     };
     for scheme in ["always", "first", "never"] {
-        let pool = WorkingMemoryPool::new(original_sources::CAPACITY, 0).unwrap();
+        let pool = crate::memory::host_ledger(original_sources::CAPACITY, 0).unwrap();
         let config = serde_json::json!({"version":"1.0", "truncation":null, "padding":null,
             "added_tokens":[], "normalizer":null,
             "pre_tokenizer":{"type":"Metaspace", "replacement":"▁", "prepend_scheme":"first", "split":true},
@@ -45,7 +45,7 @@ fn retained_metaspace_decoder_runs_public_plain_source_without_reconstruction() 
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(original_sources::CAPACITY),
+                memory_limits: crate::memory::limits(original_sources::CAPACITY),
                 ..Default::default()
             },
             ..Default::default()
@@ -64,15 +64,15 @@ fn retained_metaspace_decoder_runs_public_plain_source_without_reconstruction() 
         assert_eq!(output.text.as_ref(), expected);
         drop((source, model));
         assert!(
-            pool.used_bytes().unwrap() > 0,
+            pool.live_charge_bytes().unwrap() > 0,
             "escaped output retains its actual source"
         );
         drop(output);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
-fn embedded_model(pool: &WorkingMemoryPool) -> LoadedModel<MockBackend> {
+fn embedded_model(pool: &MemoryLedger) -> LoadedModel<MockBackend> {
     use eredu_gguf::{MetadataArray as A, MetadataValue as V};
     let metadata = std::collections::HashMap::from([
         ("general.architecture".into(), V::String("qwen3".into())),
@@ -129,7 +129,7 @@ fn ordered_normalization_runs_public_plain_source_with_exact_retained_configurat
             {"type":"Sequence","normalizers":[{"type":"Lowercase"},{"type":"NFC"}]},
             {"type":"Replace","pattern":{"String":"é"},"content":""}]}),
     ] {
-        let pool = WorkingMemoryPool::new(original_sources::CAPACITY, 0).unwrap();
+        let pool = crate::memory::host_ledger(original_sources::CAPACITY, 0).unwrap();
         let config = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
             "added_tokens":[],"normalizer":normalizer,
             "pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
@@ -162,7 +162,7 @@ fn ordered_normalization_runs_public_plain_source_with_exact_retained_configurat
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(original_sources::CAPACITY),
+                memory_limits: crate::memory::limits(original_sources::CAPACITY),
                 ..Default::default()
             },
             ..Default::default()
@@ -179,9 +179,9 @@ fn ordered_normalization_runs_public_plain_source_with_exact_retained_configurat
         assert_eq!(output.token_ids.as_ref(), [2, 8]);
         assert_eq!(output.text.as_ref(), "hello world");
         drop((source, model));
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         drop(output);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -190,7 +190,7 @@ fn ordered_pretokenizers_run_public_plain_source_with_exact_retained_configurati
     use eredu::api::{
         ManagedPlainTextRequest, PreparedChatGenerationSettings, TextInferencePolicy,
     };
-    let pool = WorkingMemoryPool::new(original_sources::CAPACITY, 0).unwrap();
+    let pool = crate::memory::host_ledger(original_sources::CAPACITY, 0).unwrap();
     let config = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
         "added_tokens":[],"normalizer":{"type":"Lowercase"},
         "pre_tokenizer":{"type":"Sequence","pretokenizers":[
@@ -227,7 +227,7 @@ fn ordered_pretokenizers_run_public_plain_source_with_exact_retained_configurati
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(original_sources::CAPACITY),
+            memory_limits: crate::memory::limits(original_sources::CAPACITY),
             ..Default::default()
         },
         ..Default::default()
@@ -244,9 +244,9 @@ fn ordered_pretokenizers_run_public_plain_source_with_exact_retained_configurati
     assert_eq!(output.token_ids.as_ref(), [2, 8]);
     assert_eq!(output.text.as_ref(), "hello world");
     drop((source, model));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(output);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn regex_feature_selected_sources_preserve_public_plain_configuration_and_word_s
         serde_json::json!({"type":"Whitespace"}),
     ];
     for (index, pre) in variants.into_iter().enumerate() {
-        let pool = WorkingMemoryPool::new(original_sources::CAPACITY, 0).unwrap();
+        let pool = crate::memory::host_ledger(original_sources::CAPACITY, 0).unwrap();
         let config = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
             "added_tokens":[],"normalizer":null,"pre_tokenizer":pre,"post_processor":null,
             "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
@@ -303,7 +303,7 @@ fn regex_feature_selected_sources_preserve_public_plain_configuration_and_word_s
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(original_sources::CAPACITY),
+                memory_limits: crate::memory::limits(original_sources::CAPACITY),
                 ..Default::default()
             },
             ..Default::default()
@@ -327,18 +327,18 @@ fn regex_feature_selected_sources_preserve_public_plain_configuration_and_word_s
         assert_eq!(output.token_ids.as_ref(), [2]);
         assert_eq!(output.text.as_ref(), "hello");
         drop((source, model));
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         drop(output);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn retained_embedded_configuration_compiles_without_artifacts_and_matches_selected_template() {
-    let pool = WorkingMemoryPool::new(8 * 1024 * 1024 * 1024, 0).unwrap();
+    let pool = crate::memory::host_ledger(8 * 1024 * 1024 * 1024, 0).unwrap();
     let mut model = embedded_model(&pool);
     assert_eq!(model.encode("hello", true).unwrap(), [8, 0]);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.live_charge_bytes().unwrap();
     let tokenizer = model
         .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
         .unwrap();
@@ -368,7 +368,12 @@ fn retained_embedded_configuration_compiles_without_artifacts_and_matches_select
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&default, &request, original_sources::CAPACITY, &cancel)
+        .prepare_chat(
+            &default,
+            &request,
+            &crate::memory::limits(original_sources::CAPACITY),
+            &cancel,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(chat.rendered_prompt(), "hello|assistant");
@@ -378,7 +383,12 @@ fn retained_embedded_configuration_compiles_without_artifacts_and_matches_select
     );
     assert_eq!(
         model
-            .prepare_chat(&tools, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &tools,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel
+            )
             .unwrap_err()
             .input_rejection(),
         Some(eredu_core::TokenInputRejection::IdentityMismatch)
@@ -387,7 +397,12 @@ fn retained_embedded_configuration_compiles_without_artifacts_and_matches_select
     model.set_chat_template(Some("replacement {{ messages[0].content }}".into()));
     assert_eq!(
         model
-            .prepare_chat(&default, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &default,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel
+            )
             .unwrap_err()
             .input_rejection(),
         Some(eredu_core::TokenInputRejection::IdentityMismatch)
@@ -402,51 +417,53 @@ fn retained_embedded_configuration_compiles_without_artifacts_and_matches_select
         .unwrap()
         .unwrap();
     let chat = model
-        .prepare_chat(&replaced, &request, original_sources::CAPACITY, &cancel)
+        .prepare_chat(
+            &replaced,
+            &request,
+            &crate::memory::limits(original_sources::CAPACITY),
+            &cancel,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(chat.rendered_prompt(), "replacement hello");
     drop((chat, replaced, tools, default, tokenizer));
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.live_charge_bytes().unwrap(), baseline);
 }
 
 #[test]
 fn retained_sources_preserve_cancellation_foreign_pool_and_original_refusal() {
-    let pool = WorkingMemoryPool::new(8 * 1024 * 1024 * 1024, 0).unwrap();
+    let pool = crate::memory::host_ledger(8 * 1024 * 1024 * 1024, 0).unwrap();
     let model = embedded_model(&pool);
-    let loaded_bytes = pool.used_bytes().unwrap();
+    let loaded_bytes = pool.live_charge_bytes().unwrap();
+    let loading_peak = pool.payload_peak_bytes().unwrap();
     let tokenizer = model
         .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
         .unwrap();
     let cancel = eredu_core::GenerationCancellationToken::new();
     cancel.cancel();
-    let before = pool.used_bytes().unwrap();
-    assert!(
-        model
-            .compile_managed_chat_source(
-                &tokenizer,
-                ChatSourceInput::RetainedConfiguration,
-                false,
-                &cancel
-            )
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(pool.used_bytes().unwrap(), before);
-    let other = embedded_model(&WorkingMemoryPool::new(8 * 1024 * 1024 * 1024, 0).unwrap());
-    assert!(
-        other
-            .compile_managed_chat_source(
-                &tokenizer,
-                ChatSourceInput::RetainedConfiguration,
-                false,
-                &Default::default()
-            )
-            .is_err()
-    );
-    // Loading remains outside source admission; the fixed original input
-    // allowance fails before its serializer creates an output buffer.
-    let small = WorkingMemoryPool::new(loaded_bytes + 1, 0).unwrap();
+    let before = pool.live_charge_bytes().unwrap();
+    assert!(model
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &cancel
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(pool.live_charge_bytes().unwrap(), before);
+    let other = embedded_model(&crate::memory::host_ledger(8 * 1024 * 1024 * 1024, 0).unwrap());
+    assert!(other
+        .compile_managed_chat_source(
+            &tokenizer,
+            ChatSourceInput::RetainedConfiguration,
+            false,
+            &Default::default()
+        )
+        .is_err());
+    // The exact loading peak includes temporary metadata. The later source
+    // compiler must obtain an additional grant before serializing its input.
+    let small = crate::memory::host_ledger(loading_peak, 0).unwrap();
     let model = embedded_model(&small);
     let error = model
         .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
@@ -459,7 +476,7 @@ fn retained_sources_preserve_cancellation_foreign_pool_and_original_refusal() {
     };
     assert!(failure.accounting_failure().is_some());
     assert_eq!(failure.input_capacity(), 0);
-    assert_eq!(small.used_bytes().unwrap(), loaded_bytes);
+    assert_eq!(small.live_charge_bytes().unwrap(), loaded_bytes);
 }
 
 #[test]
@@ -497,7 +514,7 @@ fn retained_gemma_configuration_preserves_nontrivial_embedded_score_bits() {
         .unwrap()
         .get_ids()
         .to_vec();
-    let pool = WorkingMemoryPool::new(8 * 1024 * 1024 * 1024, 0).unwrap();
+    let pool = crate::memory::host_ledger(8 * 1024 * 1024 * 1024, 0).unwrap();
     let backend = MockBackend::default();
     backend.calls.borrow_mut().pool = Some(pool.clone());
     let model = LoadedModel::from_runtime(
@@ -514,15 +531,15 @@ fn retained_gemma_configuration_preserves_nontrivial_embedded_score_bits() {
     )
     .unwrap();
     assert_eq!(model.encode("hello\nhello", true).unwrap(), expected);
-    let before = pool.used_bytes().unwrap();
+    let before = pool.live_charge_bytes().unwrap();
     // Public source publication compares every actual f64 score bit, including
     // these exact f32-to-f64 metadata conversions; equality is never relaxed.
     let source = model
         .compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
         .unwrap();
-    assert!(pool.used_bytes().unwrap() > before);
+    assert!(pool.live_charge_bytes().unwrap() > before);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.live_charge_bytes().unwrap(), before);
 }
 
 /// Source-only qualification: no tensor payload is read or executed. Set the
@@ -550,7 +567,7 @@ fn pinned_gguf_retained_source_preserves_ids_template_and_retirement() {
     let mut selected = ChatTokenizer::from_tokenizer(loaded.tokenizer);
     selected.set_template_kwargs(loaded.template_kwargs);
     let load_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
     let start = std::time::Instant::now();
     let source = pool
         .compile_tokenizer_source_for_generation(OriginalTokenizerInput::Configuration(&selected))
@@ -619,10 +636,10 @@ fn pinned_gguf_retained_source_preserves_ids_template_and_retirement() {
         source.token_count(),
         source.original_bytes(),
         chat.original_bytes(),
-        pool.peak_bytes().unwrap(),
+        pool.payload_peak_bytes().unwrap(),
         texts.len() * 2,
         std::mem::size_of::<eredu_runtime::working_memory::OriginalTokenizerPrefixError>()
     );
     drop((source, chat, rendered));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

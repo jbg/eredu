@@ -51,25 +51,29 @@ fn zero_admission() -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
-fn settle(pool: &WorkingMemoryPool, expected: usize) {
+fn settle(pool: &MemoryLedger, expected: usize) {
     submission_recovery::wait_for_retirement(|| {
         MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
@@ -77,7 +81,7 @@ fn settle(pool: &WorkingMemoryPool, expected: usize) {
     });
 }
 
-fn blocked(pool: &WorkingMemoryPool) {
+fn blocked(pool: &MemoryLedger) {
     settle(pool, 1);
     assert!(matches!(
         pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
@@ -269,11 +273,11 @@ fn independent_copies(originals: Vec<&Array>, copies: Vec<&Array>) {
 #[test]
 fn empty_sequential_snapshot_authority_survives_clone_checkpoint_clear_and_restore() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let source = sequential(false, &stream);
     let copied = MlxEmbeddedPredictionMaterializer::sequential_snapshot(
         &source,
-        SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool),
+        SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool),
     )
     .unwrap()
     .unwrap();
@@ -298,11 +302,11 @@ fn empty_sequential_snapshot_authority_survives_clone_checkpoint_clear_and_resto
 #[test]
 fn empty_pooling_snapshot_authority_survives_clone_checkpoint_clear_and_restore() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
     let source = pooling(false, &stream);
     let copied = MlxEmbeddedPredictionMaterializer::pooling_snapshot(
         &source,
-        SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool),
+        SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool),
     )
     .unwrap()
     .unwrap();
@@ -327,14 +331,14 @@ fn empty_pooling_snapshot_authority_survives_clone_checkpoint_clear_and_restore(
 #[test]
 fn sequential_snapshot_copies_nonzero_components_and_raw_alias_keeps_its_domain() {
     for stream in copy_streams() {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(0, 0).unwrap();
         let source = sequential(true, &stream);
         let (latent, rotary) = source.inner().arrays().unwrap();
         let expected = numeric(vec![latent, rotary], &stream);
         assert_eq!(expected.len(), 2);
         let copied = MlxEmbeddedPredictionMaterializer::sequential_snapshot(
             &source,
-            SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool),
+            SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool),
         )
         .unwrap()
         .unwrap();
@@ -370,13 +374,13 @@ fn sequential_snapshot_copies_nonzero_components_and_raw_alias_keeps_its_domain(
 #[test]
 fn pooling_snapshot_copies_local_pending_pooled_and_overlap_frontiers_and_raw_alias_keeps_owner() {
     for stream in copy_streams() {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(0, 0).unwrap();
         let source = pooling(true, &stream);
         let expected = numeric(source.inner().retained_arrays(), &stream);
         assert_eq!(source.inner().prompt_cache_state_arrays(0).len(), 10);
         let copied = MlxEmbeddedPredictionMaterializer::pooling_snapshot(
             &source,
-            SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool),
+            SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool),
         )
         .unwrap()
         .unwrap();
@@ -425,8 +429,8 @@ fn pooling_snapshot_copies_local_pending_pooled_and_overlap_frontiers_and_raw_al
 #[test]
 fn reserved_prediction_snapshot_domain_rejects_all_cache_kinds_preserving_sources() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let other = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
+    let other = crate::memory_fixture::ledger(0, 0).unwrap();
     for populated in [false, true] {
         let sequential = sequential(populated, &stream);
         let pooling = pooling(populated, &stream);
@@ -475,7 +479,7 @@ fn reserved_prediction_snapshot_domain_rejects_all_cache_kinds_preserving_source
         let reservation = pool
             .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
             .unwrap();
-        let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+        let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
         let errors = [
             MlxEmbeddedPredictionMaterializer::sequential_snapshot(&sequential, context)
                 .unwrap_err(),
@@ -513,10 +517,10 @@ fn reserved_prediction_snapshot_domain_rejects_all_cache_kinds_preserving_source
             offsets
         );
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(pool.peak_bytes().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), 0);
+        assert_eq!(pool.fixture_host_peak().unwrap(), 0);
 
-        let other_context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&other);
+        let other_context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&other);
         let sequential_copy =
             MlxEmbeddedPredictionMaterializer::sequential_snapshot(&sequential, other_context)
                 .unwrap()
@@ -535,3 +539,7 @@ fn reserved_prediction_snapshot_domain_rejects_all_cache_kinds_preserving_source
         drop(reservation);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

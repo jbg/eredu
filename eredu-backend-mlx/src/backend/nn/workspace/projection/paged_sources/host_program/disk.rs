@@ -7,32 +7,44 @@ use crate::backend::runtime::cache::residency::{
 };
 use safemlx::error::Exception;
 
-pub(super) struct Worker {
+pub(in super::super) struct Worker {
     prepared: Option<PreparedDiskWorker>,
     installed: Option<InstalledDiskWorker>,
     source: usize,
 }
-pub(super) fn prepare_workers(
-    sources: &[ProjectedPagedSource],
-    stores: &[StoreSlot],
-    loads: &[LoadSlot],
+impl Worker {
+    pub(in super::super) fn source_index(&self) -> usize {
+        self.source
+    }
+
+    pub(in super::super) fn installed(&self) -> Option<&InstalledDiskWorker> {
+        self.installed.as_ref()
+    }
+}
+pub(in super::super) fn prepare_workers<'a, S, L>(
+    sources: &'a [ProjectedPagedSource],
+    stores: S,
+    loads: L,
     context: &WorkspaceContext,
-) -> Result<Vec<Worker>, CacheSourceFailure> {
+) -> Result<Vec<Worker>, CacheSourceFailure>
+where
+    S: Iterator<Item = &'a ProjectedPagedSource> + Clone,
+    L: Iterator<Item = &'a ProjectedPagedSource> + Clone,
+{
     let fail = |cause| CacheSourceFailure::source(cause, context);
     let frames = [
+        ProjectedPagedSource::retained_file_control_bytes(),
+        size_of::<std::slice::Iter<'_, crate::backend::runtime::cache::kv::PagedCacheBlockGeometry>>(
+        ),
         size_of::<Worker>(),
         size_of::<Vec<Worker>>(),
-        size_of::<(
-            &[ProjectedPagedSource],
-            &[StoreSlot],
-            &[LoadSlot],
-            &WorkspaceContext,
-        )>(),
+        size_of::<(&[ProjectedPagedSource], S, L, &WorkspaceContext)>(),
         size_of::<Result<Vec<Worker>, CacheSourceFailure>>(),
         size_of::<std::slice::Iter<'_, ProjectedPagedSource>>(),
-        size_of::<std::slice::Iter<'_, StoreSlot>>(),
-        size_of::<std::slice::Iter<'_, LoadSlot>>(),
+        size_of::<S>(),
+        size_of::<L>(),
         size_of::<(usize, usize, usize)>(),
+        size_of::<(&CacheResidencyManager, bool, bool, bool)>(),
     ];
     context
         .charge_metadata(
@@ -43,18 +55,27 @@ pub(super) fn prepare_workers(
         )
         .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
     let first = |index: usize| {
-        matches!(
-            sources[index].manager().options().live_disk_policy(),
+        let manager = sources[index].manager();
+        let writes = matches!(
+            manager.options().live_disk_policy(),
             eredu_runtime::LiveCacheDiskPolicy::Enabled { .. }
-        ) && stores.iter().any(|store| {
-            sources[store.source]
-                .manager()
-                .same_catalog(sources[index].manager())
-        }) && !sources[..index]
-            .iter()
-            .any(|prior| prior.manager().same_catalog(sources[index].manager()))
+        ) && stores
+            .clone()
+            .any(|source| source.manager().same_catalog(manager));
+        let reads = loads.clone().any(|source| {
+            source.manager().same_catalog(manager)
+                && source
+                    .geometry()
+                    .blocks
+                    .iter()
+                    .any(|block| source.retained_file(&block.id).is_some())
+        });
+        (writes || reads)
+            && !sources[..index]
+                .iter()
+                .any(|prior| prior.manager().same_catalog(manager))
     };
-    let managers = (0..sources.len()).filter(|index| first(*index));
+    let mut managers = (0..sources.len()).filter(|index| first(*index));
     context
         .charge_metadata(
             std::mem::size_of_val(&first)
@@ -69,7 +90,9 @@ pub(super) fn prepare_workers(
                 .ok_or_else(|| fail(CacheSourceError::Overflow))?,
         )
         .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
-    let count = managers.count();
+    let count = managers
+        .try_fold(0usize, |count, _| count.checked_add(1))
+        .ok_or_else(|| fail(CacheSourceError::Overflow))?;
     let mut workers = context
         .metadata_vec(count)
         .map_err(|cause| CacheSourceFailure::metadata(cause, context))?;
@@ -78,16 +101,16 @@ pub(super) fn prepare_workers(
         .enumerate()
         .filter(|(index, _)| first(*index))
     {
-        let writes_iter = stores.iter().filter(|store| {
-            sources[store.source]
-                .manager()
-                .same_catalog(source.manager())
-        });
-        let reads_iter = loads.iter().filter(|load| {
-            sources[stores[load.store].source]
-                .manager()
-                .same_catalog(source.manager())
-        });
+        let writes_enabled = matches!(
+            source.manager().options().live_disk_policy(),
+            eredu_runtime::LiveCacheDiskPolicy::Enabled { .. }
+        );
+        let mut writes_iter = stores
+            .clone()
+            .filter(|store| writes_enabled && store.manager().same_catalog(source.manager()));
+        let mut reads_iter = loads
+            .clone()
+            .filter(|load| load.manager().same_catalog(source.manager()));
         context
             .charge_metadata(
                 std::mem::size_of_val(&writes_iter)
@@ -95,8 +118,12 @@ pub(super) fn prepare_workers(
                     .ok_or_else(|| fail(CacheSourceError::Overflow))?,
             )
             .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
-        let writes = writes_iter.count();
-        let reads = reads_iter.count();
+        let writes = writes_iter
+            .try_fold(0usize, |count, _| count.checked_add(1))
+            .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+        let reads = reads_iter
+            .try_fold(0usize, |count, _| count.checked_add(1))
+            .ok_or_else(|| fail(CacheSourceError::Overflow))?;
         let maximum = writes
             .checked_add(reads)
             .ok_or_else(|| fail(CacheSourceError::Overflow))?;
@@ -113,7 +140,7 @@ pub(super) fn prepare_workers(
     }
     Ok(workers)
 }
-pub(super) fn install_workers(
+pub(in super::super) fn install_workers(
     workers: &mut [Worker],
     context: &WorkspaceContext,
 ) -> Result<(), CacheSourceFailure> {

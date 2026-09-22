@@ -318,6 +318,7 @@ pub fn estimate_runtime_state(
     // bounds to a complete estimate.
     let completeness = EstimationCompleteness::PersistentStateOnly;
     Ok(RuntimeStateEstimate {
+        physical_domains: None,
         fixed_state_bytes,
         bytes_per_position_per_batch: unbounded_per_position,
         context_state_bytes,

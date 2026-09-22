@@ -216,6 +216,78 @@ impl PreparedArtifactFileRead {
         .into_iter()
         .try_fold(0usize, usize::checked_add)
     }
+    /// Fixed streaming-copy frames, including its bounded stack byte buffer.
+    /// The caller separately pays source binding and destination file ownership.
+    pub fn copy_to_control_bytes<F>() -> Option<usize> {
+        let frames = [
+            Self::control_bytes()?,
+            size_of::<[u8; 4096]>(),
+            size_of::<F>(),
+            size_of::<(usize, usize, usize, &mut File)>(),
+            size_of::<Result<(), io::Error>>(),
+            size_of::<Result<usize, io::Error>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
+    /// Copies this exact source version through a bounded stack buffer. The
+    /// observer receives source-file offsets and completed destination chunks.
+    /// A failure retains the source handle and exact destination prefix length;
+    /// the caller retains or discards the provisional destination file.
+    pub fn copy_to_with<F>(
+        self,
+        destination: &mut File,
+        mut observe: F,
+    ) -> Result<(), ArtifactFileReadFailure>
+    where
+        F: FnMut(usize, &[u8]),
+    {
+        use std::io::Write as _;
+        let mut progress = ReadProgress { filled: 0 };
+        let result = (|| {
+            self.validate()?;
+            let mut bytes = [0u8; 4096];
+            while progress.filled < self.version.length {
+                let offset = progress.filled;
+                let capacity = (self.version.length - offset).min(bytes.len());
+                let read = read_at(&self.file, &mut bytes[..capacity], offset as u64)
+                    .map_err(ArtifactFileReadError::Io)?;
+                if read == 0 {
+                    return Err(ArtifactFileReadError::Truncated);
+                }
+                let mut written = 0;
+                while written < read {
+                    match destination.write(&bytes[written..read]) {
+                        Ok(0) => {
+                            return Err(ArtifactFileReadError::Io(io::ErrorKind::WriteZero.into()));
+                        }
+                        Ok(count) => {
+                            written += count;
+                            progress.filled += count;
+                        }
+                        Err(cause) if cause.kind() == io::ErrorKind::Interrupted => {}
+                        Err(cause) => return Err(ArtifactFileReadError::Io(cause)),
+                    }
+                }
+                observe(offset, &bytes[..read]);
+            }
+            let mut probe = [0u8; 1];
+            if read_at(&self.file, &mut probe, self.version.version.length)
+                .map_err(ArtifactFileReadError::Io)?
+                != 0
+            {
+                return Err(ArtifactFileReadError::Grown);
+            }
+            self.validate()
+        })();
+        result.map_err(|cause| ArtifactFileReadFailure {
+            cause,
+            progress,
+            _source: self,
+        })
+    }
+
     fn validate(&self) -> Result<(), ArtifactFileReadError> {
         self.version.validate(&self.file)
     }

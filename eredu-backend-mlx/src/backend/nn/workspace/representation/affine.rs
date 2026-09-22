@@ -11,7 +11,9 @@ pub(super) fn projection(
     operation: WorkspaceOperationView<'_>,
     format: &LinearFormatSpec,
 ) -> Option<F> {
-    let LinearFormat::Affine(config) = format.encoding() else { return None };
+    let LinearFormat::Affine(config) = format.encoding() else {
+        return None;
+    };
     config.validate_fixed().ok()?;
     format.scale()?;
     format.affine_bias()?;
@@ -23,21 +25,28 @@ pub(super) fn projection(
     let output = operation.outputs.get(0)?;
     let (width, input_prefix) = input.shape().split_last()?;
     let (rows, output_prefix) = output.shape().split_last()?;
-    if *width <= 0 || *rows <= 0 || input_prefix != output_prefix
-        || output.dtype() != WorkspaceDtype::Float32 {
+    if *width <= 0
+        || *rows <= 0
+        || input_prefix != output_prefix
+        || output.dtype() != WorkspaceDtype::Float32
+    {
         return None;
     }
     let mut result = floating(input)?;
     if weight.dtype() == WorkspaceDtype::Float32 {
         // The native physical worker chooses a floating replacement before
         // QMM. Retained packed companions do not participate in this product.
-        if weight.shape() != [*rows, *width] { return None; }
+        if weight.shape() != [*rows, *width] {
+            return None;
+        }
         result = promote(result, floating(weight)?);
     } else {
         let packed_bits = i64::from(*width).checked_mul(i64::from(config.bits))?;
-        if *width % config.group_size != 0 || packed_bits % 32 != 0
+        if *width % config.group_size != 0
+            || packed_bits % 32 != 0
             || weight.dtype() != WorkspaceDtype::Uint32
-            || weight.shape() != [*rows, i32::try_from(packed_bits / 32).ok()?] {
+            || weight.shape() != [*rows, i32::try_from(packed_bits / 32).ok()?]
+        {
             return None;
         }
         for ordinal in [2, 3] {
@@ -51,7 +60,9 @@ pub(super) fn projection(
         }
     }
     if let Some(bias) = operation.inputs.get(4) {
-        if bias.shape() != [*rows] { return None; }
+        if bias.shape() != [*rows] {
+            return None;
+        }
         result = promote(result, floating(bias)?);
     }
     // Only scalar evidence; no output stride, backing or completion authority.

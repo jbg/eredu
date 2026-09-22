@@ -17,11 +17,10 @@ fn two_phase_original_exact_one_short_empty_and_both_special_flags_keep_c_e_tail
 fn two_phase_foreign_pool_and_upstream_encoding_failure_keep_custody() {
     super::template::errors_case(&json(), INPUT);
     let input = json().replace("\"unk_token\":\"?\"", "\"unk_token\":\"missing\"");
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let original = source(&pool, &input);
     let c = original.original_bytes();
-    let e =
-        WorkingMemoryPool::tokenizer_encode_required_bytes(&original, "Mathiasz", true).unwrap();
+    let e = MemoryLedger::tokenizer_encode_required_bytes(&original, "Mathiasz", true).unwrap();
     let error = pool
         .encode_tokenizer_ids(&original, "Mathiasz", true)
         .unwrap_err();
@@ -31,9 +30,9 @@ fn two_phase_foreign_pool_and_upstream_encoding_failure_keep_custody() {
     ));
     assert!(error.matches_source(&original));
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn two_phase_concurrent_original_operations_share_source_without_destination_or_workspace_aliases()

@@ -400,54 +400,147 @@ impl<K: Ord + Send + 'static> ScheduledCaptureCandidatesTransfer<'_, '_, '_, K> 
 }
 
 impl<'a> ScheduledCaptureStep<'a> {
-    pub(crate) fn take_remote_prefill_candidates<'c>(&'c mut self,index:usize)->Result<CaptureCandidateClaim<'a,'c>,CaptureRunHostError> {
+    pub(crate) fn take_remote_prefill_candidates<'c>(
+        &'c mut self,
+        index: usize,
+    ) -> Result<CaptureCandidateClaim<'a, 'c>, CaptureRunHostError> {
         self.validate_remote_prefill_claim(index)?;
-        let rows=self.partition_terminal_rows(index)?.ok_or(CapturePrefillHostError::Identity)?;
-        let geometry=CaptureCandidateGeometry::prepare(self.claim.source.admission(),index,self.claim.phase,self.claim.prediction,None)
-            .and_then(|value|value.terminal_readout(rows)).map_err(CaptureStepError::from)?;
-        let plan=CaptureCandidateHostPlan::prepare(geometry)?;
+        let rows = self
+            .partition_terminal_rows(index)?
+            .ok_or(CapturePrefillHostError::Identity)?;
+        let geometry = CaptureCandidateGeometry::prepare(
+            self.claim.source.admission(),
+            index,
+            self.claim.phase,
+            self.claim.prediction,
+            None,
+        )
+        .and_then(|value| value.terminal_readout(rows))
+        .map_err(CaptureStepError::from)?;
+        let plan = CaptureCandidateHostPlan::prepare(geometry)?;
         self.begin_remote_terminal_claim(index)?;
-        Ok(CaptureCandidateClaim {plan,identity:claims::ReceiptIdentity {phase:self.claim.phase,prediction:self.claim.prediction,
-            index,custody:self.claim.custody.share_scheduled()},exclusive:PhantomData})
+        Ok(CaptureCandidateClaim {
+            plan,
+            identity: claims::ReceiptIdentity {
+                phase: self.claim.phase,
+                prediction: self.claim.prediction,
+                index,
+                custody: self.claim.custody.share_scheduled(),
+            },
+            exclusive: PhantomData,
+        })
     }
-    pub(crate) fn record_remote_prefill_candidates(&mut self,value:ClaimedCaptureCandidates,dtype:TensorDtype)->Result<(),CaptureRunHostError> {
-        let index=value.identity.index;self.validate_remote_prefill_record(index,&dtype)?;
-        self.record_candidates(value,dtype,CaptureUsage::default())?;
+    pub(crate) fn record_remote_prefill_candidates(
+        &mut self,
+        value: ClaimedCaptureCandidates,
+        dtype: TensorDtype,
+    ) -> Result<(), CaptureRunHostError> {
+        let index = value.identity.index;
+        self.validate_remote_prefill_record(index, &dtype)?;
+        self.record_candidates(value, dtype, CaptureUsage::default())?;
         self.finish_remote_terminal_record(index)
     }
 }
 
-impl<'a,'c> ScheduledCaptureCandidates<'a,'c> {
-    pub(super) fn partition_source(&self)->(&'a AdmittedCapturePlan,usize,CapturePhase,u64,[usize;3]) {
-        let geometry=&self.plan.geometry;
-        (geometry.admission(),geometry.selection_index(),geometry.phase(),geometry.prediction(),*geometry.source_shape())
+impl<'a, 'c> ScheduledCaptureCandidates<'a, 'c> {
+    pub(super) fn partition_source(
+        &self,
+    ) -> (
+        &'a AdmittedCapturePlan,
+        usize,
+        CapturePhase,
+        u64,
+        [usize; 3],
+    ) {
+        let geometry = &self.plan.geometry;
+        (
+            geometry.admission(),
+            geometry.selection_index(),
+            geometry.phase(),
+            geometry.prediction(),
+            *geometry.source_shape(),
+        )
     }
-    pub(super) fn partition_count(&self)->usize {self.plan.geometry.count()}
-    pub(super) fn partition_failure(self)->CaptureCandidateFailure {CaptureCandidateFailure {error:WorkingMemoryError::IdentityMismatch,candidates:CaptureCandidates {
-            stage:CandidateScoreStage::RawLogitsBeforeSampling,source:candidate_source(&self.plan.geometry),candidates:self.values,domain:self.domain},custody:self.identity.custody}}
-    fn finish_partition(mut self,domain:Option<CandidateDomain>,_log_partition:f64)->Result<ClaimedCaptureCandidates,CaptureCandidateFailure> {
-        self.domain=domain;self.finish()
+    pub(super) fn partition_count(&self) -> usize {
+        self.plan.geometry.count()
+    }
+    pub(super) fn partition_failure(self) -> CaptureCandidateFailure {
+        CaptureCandidateFailure {
+            error: WorkingMemoryError::IdentityMismatch,
+            candidates: CaptureCandidates {
+                stage: CandidateScoreStage::RawLogitsBeforeSampling,
+                source: candidate_source(&self.plan.geometry),
+                candidates: self.values,
+                domain: self.domain,
+            },
+            custody: self.identity.custody,
+        }
+    }
+    fn finish_partition(
+        mut self,
+        domain: Option<CandidateDomain>,
+        _log_partition: f64,
+    ) -> Result<ClaimedCaptureCandidates, CaptureCandidateFailure> {
+        self.domain = domain;
+        self.finish()
     }
 }
 impl ClaimedCaptureCandidates {
-    fn partition_failure(self)->CaptureCandidateFailure {CaptureCandidateFailure {error:WorkingMemoryError::IdentityMismatch,candidates:self.candidates,custody:self.identity.custody}}
+    fn partition_failure(self) -> CaptureCandidateFailure {
+        CaptureCandidateFailure {
+            error: WorkingMemoryError::IdentityMismatch,
+            candidates: self.candidates,
+            custody: self.identity.custody,
+        }
+    }
 }
-impl<'a,'c> CaptureCandidateClaim<'a,'c> {
+impl<'a, 'c> CaptureCandidateClaim<'a, 'c> {
     /// Fill the original fixed slots from one authenticated complete-producer receipt.
     /// Invalid receipts retain their initialized prefix and the spent original account.
-    pub fn decode_partition_receipt(self,bytes:&[u8],expected:PartitionCaptureTensorReceipt<'_>,
-        funding:&eredu_nn::workspace::HostMetadataFunding)->Result<ClaimedCaptureCandidates,PartitionCaptureTensorDecodeError> {
-        let custody=self.identity.custody.share_scheduled();claims::prepare_vocabulary_decoder(&custody,funding)?;
-        let mut destination=self.prepare(None).map_err(|cause|claims::histogram_preparation_failure(cause,&custody,funding))?;
-        let (source,index,_,_,shape)=destination.partition_source();
-        let metadata=claims::decode_vocabulary_receipt(claims::VocabularyDestination::Candidates(&mut destination),bytes,expected,&custody,funding);
-        let (domain,log_partition)=match metadata {Ok(value)=>value,Err(error)=>return Err(error.retaining_candidates(destination.partition_failure()))};
-        let value=destination.finish_partition(domain,log_partition)
-            .map_err(|cause|PartitionCaptureTensorDecodeError::candidate_failure(cause,custody.share_scheduled(),funding))?;
-        let shape=shape.map(|n|n as u64);
-        if !crate::capture::partition::vocabulary_payload_valid(&source.plan().selections[index],source.points()[index].position,
-            &shape,crate::capture::partition::VocabularyPayload::Candidates(value.observation())) {
-            return Err(PartitionCaptureTensorDecodeError::candidate_failure(value.partition_failure(),custody,funding));
+    pub fn decode_partition_receipt(
+        self,
+        bytes: &[u8],
+        expected: PartitionCaptureTensorReceipt<'_>,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<ClaimedCaptureCandidates, PartitionCaptureTensorDecodeError> {
+        let custody = self.identity.custody.share_scheduled();
+        claims::prepare_vocabulary_decoder(&custody, funding)?;
+        let mut destination = self
+            .prepare(None)
+            .map_err(|cause| claims::histogram_preparation_failure(cause, &custody, funding))?;
+        let (source, index, _, _, shape) = destination.partition_source();
+        let metadata = claims::decode_vocabulary_receipt(
+            claims::VocabularyDestination::Candidates(&mut destination),
+            bytes,
+            expected,
+            &custody,
+            funding,
+        );
+        let (domain, log_partition) = match metadata {
+            Ok(value) => value,
+            Err(error) => return Err(error.retaining_candidates(destination.partition_failure())),
+        };
+        let value = destination
+            .finish_partition(domain, log_partition)
+            .map_err(|cause| {
+                PartitionCaptureTensorDecodeError::candidate_failure(
+                    cause,
+                    custody.share_scheduled(),
+                    funding,
+                )
+            })?;
+        let shape = shape.map(|n| n as u64);
+        if !crate::capture::partition::vocabulary_payload_valid(
+            &source.plan().selections[index],
+            source.points()[index].position,
+            &shape,
+            crate::capture::partition::VocabularyPayload::Candidates(value.observation()),
+        ) {
+            return Err(PartitionCaptureTensorDecodeError::candidate_failure(
+                value.partition_failure(),
+                custody,
+                funding,
+            ));
         }
         Ok(value)
     }

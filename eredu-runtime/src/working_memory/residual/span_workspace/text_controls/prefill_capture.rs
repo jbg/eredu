@@ -41,8 +41,10 @@ impl PreparedTextControlWorkspace {
         checkpoint
             .validate_continuation_geometry(self.geometry())
             .map_err(checkpoint_geometry_error)?;
-        let terminal = self.geometry().input_positions == 0 && self.geometry().max_output_tokens == 0
-            && self.geometry().prefill_chunk_positions == 0 && self.geometry().output == eredu_core::OutputDemand::StateOnly;
+        let terminal = self.geometry().input_positions == 0
+            && self.geometry().max_output_tokens == 0
+            && self.geometry().prefill_chunk_positions == 0
+            && self.geometry().output == eredu_core::OutputDemand::StateOnly;
         if (!terminal && checkpoint.next_prediction() == 0)
             || (!terminal && self.geometry().input_positions != 1)
             || self.binding.prefill_paths.is_some()
@@ -93,8 +95,10 @@ impl AdmittedCaptureContinuation<'_> {
         let binding = workspace
             .control_binding()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        let terminal = self.geometry().input_positions == 0 && self.geometry().max_output_tokens == 0
-            && self.geometry().prefill_chunk_positions == 0 && self.geometry().output == eredu_core::OutputDemand::StateOnly;
+        let terminal = self.geometry().input_positions == 0
+            && self.geometry().max_output_tokens == 0
+            && self.geometry().prefill_chunk_positions == 0
+            && self.geometry().output == eredu_core::OutputDemand::StateOnly;
         if (!terminal && self.first == 0)
             || (!terminal && self.geometry().input_positions != 1)
             || binding.source.as_ref() != Some(self.selection.source().storage_identity())

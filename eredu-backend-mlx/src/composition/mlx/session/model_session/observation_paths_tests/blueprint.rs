@@ -3,6 +3,8 @@ use super::*;
 use crate::composition::mlx::session::model_session::{
     disk_layerwise_tests as disk, host_layerwise_tests as host,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_nn::workspace::{WorkspaceContext, WorkspaceTensor};
 use eredu_runtime::working_memory::{InferenceWorkspaceObserver, InferenceWorkspaceSpan};
 
@@ -80,7 +82,7 @@ impl InferenceWorkspaceObserver for BorrowedPaths<'_> {
 fn actual_native_source_is_rebound_by_metadata_quotes_without_copying_path_payloads() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (runtime, _artifact) = match route {
             0 => host::runtime(&stream, &pool, None),
             1 => host::runtime(&stream, &pool, Some(1)),
@@ -104,7 +106,10 @@ fn actual_native_source_is_rebound_by_metadata_quotes_without_copying_path_paylo
             output: eredu_core::OutputDemand::LastPosition,
         };
         let frontier = executable.erased().state_snapshot();
-        let usage = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+        let usage = (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+        );
         let mut observer = BorrowedPaths {
             source: &source,
             callbacks: 0,
@@ -133,7 +138,10 @@ fn actual_native_source_is_rebound_by_metadata_quotes_without_copying_path_paylo
         assert!(observer.callbacks >= 4);
         assert_eq!(executable.erased().state_snapshot(), frontier);
         assert_eq!(
-            (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+            (
+                pool.fixture_host_charge().unwrap(),
+                pool.fixture_host_peak().unwrap()
+            ),
             usage
         );
         assert!(source.same_storage(executable.erased().shared_observation_paths().unwrap()));

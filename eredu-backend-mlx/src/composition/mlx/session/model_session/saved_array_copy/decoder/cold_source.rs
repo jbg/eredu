@@ -6,8 +6,7 @@ use eredu_runtime::generation::{SamplerCopyError, SamplerCopyPlan};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
-pub(in crate::composition::mlx::session::model_session::saved_array_copy) enum PendingDescriptorCause
-{
+pub(in crate::composition::mlx::session) enum PendingDescriptorCause {
     #[error(transparent)]
     Native(#[from] safemlx::ArrayDescriptorError),
     #[error("pending snapshot token must be one integer scalar")]
@@ -84,7 +83,7 @@ pub(super) fn inspect_live(
         .ok_or(WorkingMemoryError::UnknownBound)?
         .validate_paired_capture_copy_with_source(capture)?;
     let _ = sampling.sampler.borrow_funded()?;
-    sampling.sampler.as_sampler().prepare_copy()?;
+    let _ = sampling.sampler.as_sampler().prepare_copy()?;
     if let Some(token) = pending {
         if !token.owner.is_healthy() || !token.owner.resources_releasable() {
             return Err(WorkingMemoryError::ExecutionFenced.into());
@@ -145,21 +144,6 @@ pub(super) fn retain_operation_failure(
 }
 
 impl PreparedTextComponentsCopy<'_> {
-    /// Cold composition of source metadata, tables/accounts, native execution
-    /// and destination publication for the same pinned source. The public
-    /// original snapshot hook remains a separate qualification decision.
-    pub(in crate::composition::mlx::session) fn known_preparation_component_bytes(
-        runtime: &ModelRuntime<MlxBackend<'_>>,
-        sampling: &super::super::super::super::generation::MlxTextSamplingState,
-        pending: Option<&MlxTextToken>,
-    ) -> Result<usize, WorkingMemoryError> {
-        Self::known_input_preparation_component_bytes(
-            runtime,
-            sampling,
-            pending.map(eredu_core::PendingTextInput::Decode),
-        )
-    }
-
     pub(in crate::composition::mlx::session) fn known_input_preparation_component_bytes(
         runtime: &ModelRuntime<MlxBackend<'_>>,
         sampling: &super::super::super::super::generation::MlxTextSamplingState,
@@ -213,7 +197,7 @@ impl PreparedTextComponentsCopy<'_> {
             prompt
                 .and_then(|prompt| prompt.tokens())
                 .or_else(|| decode.map(|token| &token.value)),
-            runtime.backend().memory_pool(),
+            runtime.backend().memory_ledger(),
             mechanisms,
             runtime.backend(),
         )

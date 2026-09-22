@@ -1,8 +1,8 @@
 # Source-funded semantic chat
 
 `LoadedModel::prepare_chat` compiles a request against retained tokenizer and chat
-template sources. `start_prepared_chat` consumes that result with an explicit
-managed-memory ceiling. It needs ordinary generation support only. The session's
+template sources. `start_prepared_chat` consumes that result with physical-domain
+memory limits. It needs ordinary generation support only. The session's
 `advance` and `run` methods use the same committed-token and semantic state.
 
 The executable example is `eredu/examples/prepared_chat_generate.rs`. It writes
@@ -39,13 +39,13 @@ Create a request file such as:
 }
 ```
 
-Run it against a supported checkpoint, using a capacity suitable for that model
+Run it against a supported checkpoint, using domain limits suitable for that model
 and request. Source compilation consumes the complete tokenizer and selected
 template retained by the loaded model:
 
 ```sh
 cargo run -p eredu --no-default-features --features mlx,metal \
-  --example prepared_chat_generate -- CHECKPOINT REQUEST.json 68719476736 metal:0
+  --example prepared_chat_generate -- CHECKPOINT REQUEST.json host=68719476736 metal:0
 ```
 
 This request passed with both required and automatic tool choice against the
@@ -54,14 +54,20 @@ pinned Qwen3.5-0.8B checkpoint at that 64 GiB ceiling; see
 commands and exact events. Other prompts and checkpoints require their own
 validation. Source compilation and generation retain their actual funding accounts;
 errors retain the accounts needed by their payloads. This ceiling describes
-framework-managed allocations. Application input buffers, event copies, output
-I/O, allocator caches and unrelated process memory need their own accounting.
+framework-managed allocations. Registered MLX backing stays charged while the
+allocator cache retains it. Application input buffers, event copies, output I/O
+and unrelated process memory need their own accounting; unpriced dependency
+internals remain unknown contributions.
 
 To integrate directly, retain the tokenizer/template sources, prepare the chat,
 and construct `PreparedChatRequest::new(&chat, settings)`. Set
-`settings.inference.managed_memory_capacity_bytes` to the same capacity used to
-prepare the chat. Pass a shared cancellation token to preparation and advancement.
-A request already cancelled returns `None` before generation starts.
+`settings.inference.memory_limits` to declarations that resolve to the same
+physical-domain limits as the prepared chat. Snapshot continuation can supply
+different declarations through `PreparedChatResumeSettings`. Admission checks
+total live domain charges and preserves the retained source accounts' constraints.
+Changing a declaration grants no capacity: an increase requires the runtime's
+authenticated, move-only successor transaction. Pass a shared cancellation token to preparation
+and advancement. A request already cancelled returns `None` before generation starts.
 
 For media, run the appropriate host processor and present its ordered text and
 media slots as `HostInputPart` values. Call
@@ -97,8 +103,8 @@ Supply `chat`, `input`, `settings`, `output_mode`, `skip_special_tokens`, an act
 committed-event callback. `generate_prepared_chat_speculative` and
 `with_controlled_prepared_chat_speculative` share this request and preparation.
 The latter adds controlled observation/snapshot options and a scoped driver.
-The request takes its tokenizer from the prepared chat. `chat.capacity()` reports
-the authenticated request ceiling. The comparison example
+The request takes its tokenizer from the prepared chat. `chat.limits()` reports
+the retained domain declarations. The comparison example
 `eredu/examples/gemma4_speculative_generate.rs` prepares one chat in its consuming
 model and uses it for ordinary and speculative generation.
 
@@ -145,8 +151,9 @@ establish released-model accuracy or application memory policy.
 Application integration still needs its own memory checks and allocator-cache
 policy. Include caller-owned request/media buffers, copied events and retained
 application results in those checks; the framework pool covers its admitted
-owners, not total process memory. Configure native allocator caches separately
-and measure loading, prefill, cached decode, reset and final retirement with the
-application's actual retention policy. Wait for native completion before treating
-retirement as available capacity. The public example demonstrates the API handoff;
+owners, including registered backing retained by MLX's allocator cache. Measure
+loading, prefill, cached decode, reset and final retirement with the application's
+actual retention policy. Native completion and release of the retained backing
+must both precede treating that storage as available capacity. The public example
+demonstrates the API handoff;
 external application call sites and their memory/cache changes are unverified.

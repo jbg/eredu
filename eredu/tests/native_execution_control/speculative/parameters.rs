@@ -73,7 +73,6 @@ pub(super) fn captures<
                 limits: CaptureLimits {
                     per_step: limit,
                     cumulative: limit.checked_mul(16).unwrap(),
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             },
@@ -137,11 +136,9 @@ pub(super) fn captures<
         r.phase,
         SpeculativeActivationPhase::Proposal { .. } | SpeculativeActivationPhase::FusedProposal
     )));
-    assert!(
-        records
-            .iter()
-            .all(|r| r.admission_identity.as_deref() == Some(identity.as_str()) && r.completed)
-    );
+    assert!(records
+        .iter()
+        .all(|r| r.admission_identity.as_deref() == Some(identity.as_str()) && r.completed));
     (
         output.token_ids().to_vec(),
         records
@@ -378,7 +375,7 @@ fn verify(device: LocalDevice) {
             let values = (0..queried.values.len())
                 .map(|i| 0.01 + (i % 5) as f32 * 0.003)
                 .collect();
-            originals.push(queried.values);
+            originals.push(queried);
             edits.push(ParameterEdit {
                 id: format!("edit{}", edits.len()),
                 parameter: parameter.id.clone(),
@@ -413,7 +410,12 @@ fn verify(device: LocalDevice) {
                     limits,
                 )
                 .unwrap();
-            for ((a, b), c) in before.iter().zip(edit.update.values()).zip(actual.values) {
+            for ((a, b), c) in before
+                .values
+                .iter()
+                .zip(edit.update.values())
+                .zip(actual.values.iter().copied())
+            {
                 assert_eq!(*a + *b, c);
             }
         }

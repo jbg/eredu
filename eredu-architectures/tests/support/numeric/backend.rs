@@ -5,6 +5,8 @@ struct NumericTensor {
     dtype: eredu_core::checkpoint::TensorDtype,
     // Test-only lifetime evidence, never used by scalar arithmetic.
     retirement_probe: Option<Arc<()>>,
+    // A prepared publication copy keeps its real metadata payer until it retires.
+    publication_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }
 
 impl NumericTensor {
@@ -16,6 +18,7 @@ impl NumericTensor {
             data,
             dtype: eredu_core::checkpoint::TensorDtype::F32,
             retirement_probe: None,
+            publication_funding: None,
         }
     }
 
@@ -31,6 +34,7 @@ impl NumericTensor {
             shape,
             dtype: eredu_core::checkpoint::TensorDtype::F32,
             retirement_probe: None,
+            publication_funding: None,
         }
     }
 
@@ -572,7 +576,7 @@ impl Tensor for NumericTensor {
         .with_dtype(eredu_core::checkpoint::TensorDtype::I32))
     }
 
-    fn to_i32_vec(&self, _: &NumericContext) -> Result<Vec<i32>, Error> {
+    fn to_i32_vec(&self, _: &NumericContext) -> Result<eredu_core::HostTensorBuffer<i32>, Error> {
         self.data
             .iter()
             .map(|value| {
@@ -582,7 +586,8 @@ impl Tensor for NumericTensor {
                 i32::try_from(*value as i64)
                     .map_err(|_| Error::backend("numeric integer is outside i32"))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| eredu_core::HostTensorBuffer::new(values, ()))
     }
 
     fn full_f32(value: f32, shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
@@ -4272,6 +4277,7 @@ impl BlockwiseAttentionBackend for NumericBackend {
 }
 
 impl NeuralBackend for NumericBackend {
+    type ParameterPreparation<'a> = ();
     const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
         eredu_nn::NeuralOperatorCapabilities::ALL;
 

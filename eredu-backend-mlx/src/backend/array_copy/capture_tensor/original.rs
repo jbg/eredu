@@ -53,13 +53,17 @@ impl CaptureCompletion<'_> {
     /// collector before the first settlement. Partial clone/settlement failure
     /// never releases the earlier roots or substitutes an ordinary readback.
     pub(crate) fn settle_retained<'v, const N: usize>(
-        self, inputs: [&'v Array; N], stream: &Stream, roots: &RefCell<Vec<Array>>,
+        self,
+        inputs: [&'v Array; N],
+        stream: &Stream,
+        roots: &RefCell<Vec<Array>>,
     ) -> Result<[EvaluatedArray<'v>; N], CaptureTensorNativeError> {
         self.validate_identity()?;
         self.reserve_roots(roots, N)?;
         for value in inputs {
             let retained = self.clone_array(value)?;
-            let mut destination = roots.try_borrow_mut()
+            let mut destination = roots
+                .try_borrow_mut()
                 .map_err(|_| CaptureTensorNativeError::CollectorBusy)?;
             if destination.len() == destination.capacity() {
                 return Err(WorkingMemoryError::UnknownBound.into());
@@ -74,19 +78,25 @@ impl CaptureCompletion<'_> {
     }
     pub(crate) fn retained_settlement_control_bytes<const N: usize>() -> Option<usize> {
         let frames = [
-            size_of::<[&Array; N]>(), size_of::<[Option<EvaluatedArray<'_>>; N]>(),
+            size_of::<[&Array; N]>(),
+            size_of::<[Option<EvaluatedArray<'_>>; N]>(),
             size_of::<[EvaluatedArray<'_>; N]>(),
             size_of::<Result<[EvaluatedArray<'_>; N], CaptureTensorNativeError>>(),
             size_of::<(Self, [&Array; N], &Stream, &RefCell<Vec<Array>>)>(),
             size_of::<std::cell::RefMut<'_, Vec<Array>>>(),
-            size_of::<std::cell::BorrowMutError>(), size_of::<Array>(),
+            size_of::<std::cell::BorrowMutError>(),
+            size_of::<Array>(),
             size_of::<Result<Array, CaptureTensorNativeError>>(),
             size_of::<Result<EvaluatedArray<'_>, CaptureTensorNativeError>>(),
-            PreparedArrayClone::control_bytes()?.checked_add(Array::inspection_clone_handle_bytes())?.checked_mul(N)?,
+            PreparedArrayClone::control_bytes()?
+                .checked_add(Array::inspection_clone_handle_bytes())?
+                .checked_mul(N)?,
             OperationEvent::nested_completion_control_bytes::<1>()?.checked_mul(N)?,
             OriginalScopeObserver::control_bytes()?,
         ];
-        frames.into_iter().try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
     }
     pub(crate) fn clone_array(self, value: &Array) -> Result<Array, CaptureTensorNativeError> {
         match self {
@@ -170,6 +180,8 @@ pub(crate) fn control_bytes() -> Option<usize> {
         .checked_add(size_of::<ArrayMetadataSnapshot>())?
         .checked_mul(3)?;
     let values = [
+        usize::try_from(MemoryLedger::capture_source_pin_control_bytes::<StorageIdentity>().ok()?)
+            .ok()?,
         OperationEvent::nested_completion_control_bytes::<1>()?.checked_mul(2)?,
         RetainedStorage::original_collector_control_bytes(1)?,
         // Source/carrier plus two selected-source clones and four possible
@@ -178,7 +190,11 @@ pub(crate) fn control_bytes() -> Option<usize> {
         snapshots,
         Stream::device_type_control_bytes()?.checked_mul(2)?,
         Array::descriptor_control_bytes()?.checked_mul(3)?,
-        EvaluatedArray::iteration_control_bytes::<f32>()?,
+        EvaluatedArray::iteration_control_bytes::<f32>()?
+            .max(EvaluatedArray::iteration_control_bytes::<u8>()?)
+            .max(EvaluatedArray::iteration_control_bytes::<u16>()?)
+            .max(EvaluatedArray::iteration_control_bytes::<u32>()?)
+            .max(EvaluatedArray::iteration_control_bytes::<u64>()?),
         size_of::<Selection>(),
         size_of::<Selection>(),
         size_of::<PreparedCaptureTensor<'static>>(),

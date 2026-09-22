@@ -38,7 +38,7 @@ impl SourcePinPlan {
                 size_of::<Result<WorkingMemoryStorage<StorageIdentity>, Error>>(),
                 size_of::<(
                     &RetainedStorage,
-                    &WorkingMemoryPool,
+                    &MemoryLedger,
                     &eredu_core::HostPreparationAuthority,
                 )>(),
                 eredu_core::BackendFailure::source_retention_peak_bytes::<
@@ -66,7 +66,7 @@ impl SourcePinPlan {
     pub(super) fn pin(
         self,
         inventory: &RetainedStorage,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         host: &eredu_core::HostPreparationAuthority,
     ) -> Result<WorkingMemoryStorage<StorageIdentity>, Error> {
         let mut original = self
@@ -122,7 +122,7 @@ impl RetainedStorage {
 
     /// Owning source pin/carrier contribution for the actual count-only census.
     /// The caller separately composes decoder-specific source wrapper topology.
-    pub(crate) fn source_pin_plan(&self, pool: &WorkingMemoryPool) -> Result<SourcePinPlan, Error> {
+    pub(crate) fn source_pin_plan(&self, pool: &MemoryLedger) -> Result<SourcePinPlan, Error> {
         let rows = match self.original_maximum_rows() {
             Some(rows) => rows,
             None => self

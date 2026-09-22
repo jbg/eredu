@@ -18,8 +18,12 @@ struct Source {
     windows: Vec<Vec<usize>>,
     addresses: Option<Vec<ExecutionUnitAddress>>,
     excluded: Vec<String>,
+    retained: Vec<(usize, usize)>,
 }
 impl WorkspaceParameterRows for Source {
+    fn retained_parameter(&self, unit: usize, row: usize) -> bool {
+        self.retained.contains(&(unit, row))
+    }
     fn excludes_parameter(&self, name: &str) -> bool {
         self.excluded.iter().any(|id| id == name)
     }
@@ -27,7 +31,10 @@ impl WorkspaceParameterRows for Source {
         &self.layout
     }
     fn execution_address(&self, ordinal: usize) -> Option<ExecutionUnitAddress> {
-        self.addresses.as_ref().map_or_else(|| self.layout.address(ordinal), |values| values.get(ordinal).copied())
+        self.addresses.as_ref().map_or_else(
+            || self.layout.address(ordinal),
+            |values| values.get(ordinal).copied(),
+        )
     }
     fn unit_count(&self) -> usize {
         self.units.len()
@@ -124,6 +131,7 @@ fn source() -> Source {
         windows: vec![vec![0, 1], vec![1], vec![2]],
         addresses: None,
         excluded: Vec::new(),
+        retained: Vec::new(),
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

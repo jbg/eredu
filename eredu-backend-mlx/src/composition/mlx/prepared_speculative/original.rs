@@ -63,12 +63,13 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
     // Its cumulative account was opened before facade semantic/lane births.
     request
         .preparation
-        .validate(backend.memory_pool(), identity)
+        .validate(backend.memory_ledger(), identity)
         .map_err(|_| Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-    let capacity_bytes = request.preparation.capacity_bytes();
+    let capacity_bytes = request.preparation.limits().clone();
     let funding = request.preparation.metadata_funding().clone();
     let parts = [
         size_of::<OriginalIndependentRequest<'_>>(),
+        size_of::<Option<crate::composition::mlx::session::OriginalModelPartitionPreparation>>(),
         size_of::<SpeculativeGenerationLane<'lane, MlxBackend<'world>, C>>(),
         size_of_val(&run),
         size_of::<AutoregressiveExecutor<'_, MlxAutoregressiveMechanisms>>(),
@@ -81,16 +82,13 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
         size_of::<SpeculativeExecutionStreams<'_>>(),
         size_of::<Result<T, Error>>(),
         size_of::<HostMetadataFunding>(),
-        crate::backend::OriginalCopyEnvironment::control_bytes().ok_or(
-            Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
-        )?,
+        crate::backend::OriginalCopyEnvironment::control_bytes()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
     ];
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     funding
         .reserve_metadata(bytes)
         .map_err(Error::WorkspacePlanning)?;
@@ -98,6 +96,7 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
         .original_copy_environment()
         .map_err(|cause| super::super::model::retain_planning_error(cause, funding.clone()))?;
     let intervention_declaration = session.original_intervention_declaration(&funding)?;
+    let partition = session.prepare_original_model_partition_source(&funding)?;
     session.with_model_operation_funded(funding.clone(), |target| {
         drafter.with_autoregressive_funded(funding.clone(), |draft, selected| {
             let capacity = selected.requirements().strategy().proposal_capacity();
@@ -111,19 +110,25 @@ pub(super) fn with_original_independent<'lane, 'world, C: SpeculativeTokenFilter
             )
             .map_err(|cause| super::super::model::retain_planning_error(cause, funding.clone()))?;
             funding
-                .reserve_metadata(schedule.control_bytes().ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?)
+                .reserve_metadata(
+                    schedule
+                        .control_bytes()
+                        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+                )
                 .map_err(Error::WorkspacePlanning)?;
             let sources = AutoregressiveSourcePair::prepare_funded(
                 target,
                 draft.executable(),
                 &schedule,
-                backend.memory_pool(),
+                backend.memory_ledger(),
                 capacity_bytes,
                 funding.clone(),
             )?
-            .with_intervention_declaration(intervention_declaration)?;
+            .with_intervention_declaration(intervention_declaration)?
+            .with_partition_source(
+                eredu_runtime::speculative::autoregressive::AutoregressiveSource::Target,
+                partition,
+            )?;
             let streams = SpeculativeExecutionStreams::single(backend.stream())
                 .with_original_sources(&sources, &environment)?;
             let mut executor =
@@ -168,11 +173,17 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
         size_of::<Result<MlxSpeculativeSeed, eredu_core::speculative::SpeculativeControlError>>(),
         size_of::<(
             &MlxModelInput,
-            &eredu_runtime::working_memory::WorkingMemoryPool,
+            &eredu_runtime::working_memory::MemoryLedger,
             &eredu_runtime::SharedPreparedInputCacheIdentity,
             Option<&eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>>,
-            Result<&eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>, WorkingMemoryError>,
-            Result<&eredu_runtime::working_memory::MediaSessionBinding, eredu_core::PreparedRequestRejection>,
+            Result<
+                &eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>,
+                WorkingMemoryError,
+            >,
+            Result<
+                &eredu_runtime::working_memory::MediaSessionBinding,
+                eredu_core::PreparedRequestRejection,
+            >,
         )>(),
     ];
     funding
@@ -180,9 +191,7 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
             parts
                 .into_iter()
                 .try_fold(size_of_val(&parts), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         )
         .map_err(Error::WorkspacePlanning)?;
     preparation
@@ -191,9 +200,13 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
     preparation
         .validate_callback(lane.event_callback())
         .map_err(|cause| sources.retain_startup_error(cause))?;
-    let generation = *lane.generation();
-    if generation.inference_policy().managed_memory_capacity_bytes
-        != Some(preparation.capacity_bytes())
+    let generation = lane.generation().clone();
+    if generation
+        .inference_policy()
+        .memory_limits
+        .resolve(preparation.topology())
+        .map_err(|cause| sources.retain_startup_error(WorkingMemoryError::from(cause)))?
+        != *preparation.limits()
     {
         return Err(sources.retain_startup_error(WorkingMemoryError::IdentityMismatch));
     }
@@ -213,9 +226,11 @@ fn prepare_lane<'a, 'world, C: SpeculativeTokenFilterController>(
     // copy descriptor is not the source contract for a media packet.
     prompt
         .original_prediction_source(sources.pool())
-        .map_err(|cause| sources.retain_startup_error(
-            Error::PrefillControl(cause).at_speculative_stage("lane original prompt source"),
-        ))?;
+        .map_err(|cause| {
+            sources.retain_startup_error(
+                Error::PrefillControl(cause).at_speculative_stage("lane original prompt source"),
+            )
+        })?;
     if let Some(chunk) = generation.inference_policy().prefill_chunk_positions {
         prompt = prompt.with_prefill_chunk_positions(chunk);
     }
@@ -317,9 +332,7 @@ where
             controls
                 .into_iter()
                 .try_fold(size_of_val(&controls), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         )
         .map_err(Error::WorkspacePlanning)?;
     // Any partially built lane/cache retires within this closure while the

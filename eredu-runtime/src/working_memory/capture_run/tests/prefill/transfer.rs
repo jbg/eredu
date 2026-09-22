@@ -2,8 +2,8 @@
 //! slots. They do not fabricate a canonical request/chunk stamp or native work.
 use super::*;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, TryLockError,
+    atomic::{AtomicUsize, Ordering},
 };
 
 fn segment(
@@ -31,9 +31,9 @@ fn fill<K: Ord + Send + 'static>(
     }
     transfer.finish().unwrap();
 }
-fn retained(pool: &WorkingMemoryPool, key: u32, bytes: u64, expected: bool) {
+fn retained(pool: &MemoryLedger, key: u32, bytes: u64, expected: bool) {
     assert_eq!(
-        pool.pin_registered_storage([(key, bytes)]).is_ok(),
+        pool.registered_capacity_for_test(&key).unwrap() == Some(bytes),
         expected
     );
 }
@@ -43,22 +43,22 @@ fn private_transfer_uses_exact_original_h_and_one_target_buffer_across_fragments
     let source = rows(5);
     let h = plan(&source).initialization_peak_bytes();
     for bytes in [h - 1, h] {
-        let pool = WorkingMemoryPool::new(h + 37, 0).unwrap();
-        let actual = pool.register_storage([(1u32, 37), (2, 0)]).unwrap();
+        let pool = capture_test_ledger(h + 37, 0).unwrap();
+        let actual = pool.register_host_storage([(1u32, 37), (2, 0)]).unwrap();
         let (r, run) = fresh(&pool, bytes);
         let mut native = run.scope().unwrap();
         let allocations = CLAIM_ALLOCATIONS.get();
         let result = run.prepare_capture_run(&r, plan(&source));
         if bytes < h {
             assert!(
-                matches!(result,Err(CaptureRunHostError::Memory(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==h&&available_bytes==bytes)
+                matches!(result,Err(CaptureRunHostError::Memory(WorkingMemoryError::DomainAllowanceExceeded{required_bytes,available_bytes, .. })) if required_bytes==h&&available_bytes==bytes)
             );
             assert_eq!(CLAIM_ALLOCATIONS.get(), allocations);
             drop(actual);
             drop(r);
             drop(run);
             native.certify().unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             continue;
         }
         let mut bank = result.unwrap();
@@ -104,7 +104,9 @@ fn private_transfer_uses_exact_original_h_and_one_target_buffer_across_fragments
         step.finish_prefill_targets().unwrap();
         assert_eq!(
             values(tensor(&step.records()[0])),
-            &[0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121.]
+            &[
+                0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121.
+            ]
         );
         assert_eq!(
             values(tensor(&step.records()[0])).as_ptr(),
@@ -127,9 +129,9 @@ fn private_transfer_uses_exact_original_h_and_one_target_buffer_across_fragments
         retained(&pool, 1, 37, false);
         retained(&pool, 2, 0, false);
         drop(frame);
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         drop(alias);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -138,10 +140,10 @@ fn sibling_scope_foreign_source_and_other_bank_reject_before_target_allocation()
     for failure in 0..3 {
         let source = rows(5);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(2 * h + 11, 0).unwrap();
-        let foreign = WorkingMemoryPool::new(11, 0).unwrap();
-        let actual = pool.register_storage([(1u32, 11)]).unwrap();
-        let unrelated = foreign.register_storage([(1u32, 11)]).unwrap();
+        let pool = capture_test_ledger(2 * h + 11, 0).unwrap();
+        let foreign = capture_test_ledger(11, 0).unwrap();
+        let actual = pool.register_host_storage([(1u32, 11)]).unwrap();
+        let unrelated = foreign.register_host_storage([(1u32, 11)]).unwrap();
         let (r, run) = fresh(&pool, 2 * h);
         let mut native = run.scope().unwrap();
         let mut sibling = run.scope().unwrap();
@@ -195,8 +197,8 @@ fn sibling_scope_foreign_source_and_other_bank_reject_before_target_allocation()
         drop(run);
         native.certify().unwrap();
         sibling.certify().unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        assert_eq!(foreign.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -205,7 +207,7 @@ fn wrong_actual_fragment_rejects_before_source_binding_or_claim_consumption() {
     let source = rows(5);
     let foreign = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut native = run.scope().unwrap();
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
@@ -242,7 +244,7 @@ fn wrong_actual_fragment_rejects_before_source_binding_or_claim_consumption() {
     drop(r);
     drop(run);
     native.certify().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -250,9 +252,9 @@ fn constructor_rollback_restores_prior_sources_but_entered_failure_keeps_new_ori
     for fail_constructor in [true, false] {
         let source = rows(5);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h + 24, 0).unwrap();
-        let a = pool.register_storage([(1u32, 11), (3, 0)]).unwrap();
-        let b = pool.register_storage([(2u32, 13)]).unwrap();
+        let pool = capture_test_ledger(h + 24, 0).unwrap();
+        let a = pool.register_host_storage([(1u32, 11), (3, 0)]).unwrap();
+        let b = pool.register_host_storage([(2u32, 13)]).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut native = run.scope().unwrap();
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
@@ -286,16 +288,18 @@ fn constructor_rollback_restores_prior_sources_but_entered_failure_keeps_new_ori
         if fail_constructor {
             PANIC_TRANSFER.set(true);
         }
-        assert!(catch_unwind(AssertUnwindSafe(|| {
-            let mut transfer = step
-                .take_prefill_fragment(0, &next)
-                .unwrap()
-                .prepare_segment_transfer(&mut native, &mut channel, b)
-                .unwrap();
-            transfer.push_f32(55.).unwrap();
-            panic!("after constructor and scalar");
-        }))
-        .is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut transfer = step
+                    .take_prefill_fragment(0, &next)
+                    .unwrap()
+                    .prepare_segment_transfer(&mut native, &mut channel, b)
+                    .unwrap();
+                transfer.push_f32(55.).unwrap();
+                panic!("after constructor and scalar");
+            }))
+            .is_err()
+        );
         let partial = step.prefill_storage(0).unwrap();
         assert_eq!(partial.0, before.0);
         assert_eq!(partial.3, if fail_constructor { 4 } else { 5 });
@@ -308,14 +312,14 @@ fn constructor_rollback_restores_prior_sources_but_entered_failure_keeps_new_ori
         drop(r);
         drop(run);
         let expected = h + if fail_constructor { 11 } else { 24 };
-        assert_eq!(pool.used_bytes().unwrap(), expected);
+        assert_eq!(pool.payload_used_bytes().unwrap(), expected);
         drop(native);
-        assert_eq!(pool.used_bytes().unwrap(), expected);
+        assert_eq!(pool.payload_used_bytes().unwrap(), expected);
         retained(&pool, 1, 11, true);
         retained(&pool, 3, 0, true);
         retained(&pool, 2, 13, !fail_constructor);
         drop(pending);
-        assert_eq!(pool.used_bytes().unwrap(), expected);
+        assert_eq!(pool.payload_used_bytes().unwrap(), expected);
         assert!(pool.acquire_unquoted().is_err());
     }
 }
@@ -325,11 +329,11 @@ fn all_prior_origin_health_is_rechecked_during_fill_and_before_later_constructio
     for quarantine_during_fill in [false, true] {
         let source = rows(5);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h + 19, 0).unwrap();
+        let pool = capture_test_ledger(h + 19, 0).unwrap();
         let (origin_r, origin) = fresh(&pool, 19);
         let origin_native = origin.scope().unwrap();
         let owned = origin_native
-            .adopt_storage_individually([(1u32, 19), (2, 0)])
+            .adopt_capture_host_storage([(1u32, 19), (2, 0)])
             .unwrap();
         let (r, run) = fresh(&pool, h);
         let mut native = run.scope().unwrap();
@@ -423,8 +427,8 @@ fn short_overlong_and_closed_parent_failures_are_terminal_and_preserve_partial_h
     for failure in 0..3 {
         let source = rows(5);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h + 7, 0).unwrap();
-        let actual = pool.register_storage([(1u32, 7)]).unwrap();
+        let pool = capture_test_ledger(h + 7, 0).unwrap();
+        let actual = pool.register_host_storage([(1u32, 7)]).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut run = Some(run);
         let mut native = run.as_ref().unwrap().scope().unwrap();
@@ -493,9 +497,9 @@ fn short_overlong_and_closed_parent_failures_are_terminal_and_preserve_partial_h
         retained(&pool, 1, 7, true);
         native.certify().unwrap();
         retained(&pool, 1, 7, false);
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         drop(pending);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -505,7 +509,7 @@ struct Key {
     probe: Arc<Probe>,
 }
 struct Probe {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     drops: AtomicUsize,
 }
 impl PartialEq for Key {
@@ -538,13 +542,13 @@ impl Drop for Key {
 fn source_key_retirement_stays_outside_usage_while_partial_target_keeps_h() {
     let source = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h + 7, 0).unwrap();
+    let pool = capture_test_ledger(h + 7, 0).unwrap();
     let probe = Arc::new(Probe {
         pool: pool.clone(),
         drops: AtomicUsize::new(0),
     });
     let actual = pool
-        .register_storage([(
+        .register_host_storage([(
             Key {
                 id: 1,
                 probe: probe.clone(),
@@ -583,17 +587,17 @@ fn source_key_retirement_stays_outside_usage_while_partial_target_keeps_h() {
     native.certify().unwrap();
     assert!(probe.drops.load(Ordering::SeqCst) > before);
     assert_eq!(pending.prefill_storage(0), Some(partial));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(pending);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn empty_fragment_still_validates_and_retains_zero_byte_source_origin() {
     let source = rows(0);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
-    let zero = pool.register_storage([(1u32, 0)]).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
+    let zero = pool.register_host_storage([(1u32, 0)]).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut native = run.scope().unwrap();
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
@@ -641,7 +645,7 @@ fn empty_fragment_still_validates_and_retains_zero_byte_source_origin() {
     drop(run);
     native.certify().unwrap();
     retained(&pool, 1, 0, false);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(frame);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

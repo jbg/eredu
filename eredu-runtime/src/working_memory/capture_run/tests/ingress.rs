@@ -4,8 +4,8 @@ use super::*;
 fn pre_evaluation_scope_check_rejects_foreign_accounts_without_storage_or_claim_refund() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h * 2, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h * 2, 0).unwrap();
+    let foreign = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let (other_r, other_run) = fresh(&pool, h);
     let (foreign_r, foreign_run) = fresh(&foreign, h);
@@ -41,8 +41,8 @@ fn pre_evaluation_scope_check_rejects_foreign_accounts_without_storage_or_claim_
     other.certify().unwrap();
     foreign_native.certify().unwrap();
     drop((r, run, other_r, other_run, foreign_r, foreign_run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn pre_evaluation_scope_check_rejects_closed_and_quarantined_parent() {
     for quarantine in [false, true] {
         let source = source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let native = run.scope().unwrap();
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
@@ -78,11 +78,11 @@ fn pre_evaluation_scope_check_rejects_closed_and_quarantined_parent() {
         if !quarantine {
             native.certify().unwrap();
             drop(r);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         } else {
             drop(native);
             drop(r);
-            assert_eq!(pool.used_bytes().unwrap(), h);
+            assert_eq!(pool.payload_used_bytes().unwrap(), h);
         }
     }
 }
@@ -91,7 +91,7 @@ fn pre_evaluation_scope_check_rejects_closed_and_quarantined_parent() {
 fn terminal_scalar_error_releases_borrow_but_retains_whole_original_hold() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -113,17 +113,17 @@ fn terminal_scalar_error_releases_borrow_but_retains_whole_original_hold() {
     drop((bank, r, run, source));
     // The terminal owner is 'static and carries H after the source/frame died.
     let erased: Box<dyn std::error::Error + Send + Sync> = Box::new(failure);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(erased);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn terminal_transfer_error_releases_exact_scope_borrow_without_certification() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h + 19, 0).unwrap();
-    let storage = pool.register_storage([(1u32, 19)]).unwrap();
+    let pool = capture_test_ledger(h + 19, 0).unwrap();
+    let storage = pool.register_host_storage([(1u32, 19)]).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut native = run.scope().unwrap();
     let sibling = run.scope().unwrap();
@@ -144,11 +144,11 @@ fn terminal_transfer_error_releases_exact_scope_borrow_without_certification() {
     assert!(step.take_tensor(0).is_err());
     drop(step);
     drop((bank, r, run, source));
-    assert_eq!(pool.used_bytes().unwrap(), h + 19);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h + 19);
     native.certify().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn terminal_rejections_move_original_typed_cause_and_never_resume_or_refund() {
     for transfer in [false, true] {
         let source = source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let storage = pool.register_storage::<u32>([]).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut native = run.scope().unwrap();
@@ -191,8 +191,8 @@ fn terminal_rejections_move_original_typed_cause_and_never_resume_or_refund() {
         drop(step);
         drop((bank, r));
         native.certify().unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         drop(failure);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

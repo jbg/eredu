@@ -10,7 +10,7 @@ use crate::backend::{
     },
 };
 use eredu_runtime::{
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError},
     HostSlotTable,
 };
 
@@ -20,7 +20,7 @@ use eredu_runtime::{
 struct LoadedSourceRecord {
     _manager: ResidencyManager,
     execution: InferenceExecutionIdentity,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     _publication: RetainedStoragePublication,
 }
 
@@ -34,10 +34,10 @@ impl LoadedRealtimeSource {
     pub(super) fn validate(
         &self,
         execution: &InferenceExecutionIdentity,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), Error> {
         let record = &self._record.slots()[0];
-        if !record.execution.same_execution(execution) || !record.pool.same_domain(pool) {
+        if !record.execution.same_execution(execution) || !record.pool.same_ledger(pool) {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
         }
         Ok(())

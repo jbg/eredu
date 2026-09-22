@@ -104,10 +104,10 @@ fn original_input_real_claim_all_routes_capture_zero_and_source_borrow_end() {
                 drop(original);
                 let (pool, held) = retire_request(&state);
                 drop(runtime);
-                assert_eq!(pool.used_bytes().unwrap(), held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), held);
                 drop(sequence);
                 assert_eq!(
-                    pool.used_bytes().unwrap(),
+                    pool.payload_used_bytes().unwrap(),
                     0,
                     "replay failures carry no cloned custody"
                 );
@@ -129,7 +129,7 @@ fn original_input_exact_short_and_spare_source_capacity_do_not_change_destinatio
         assert!(extract_input(&mut runtime, 0, &ids, 3, None).is_err());
         assert_eq!(state.borrow().input_builds, 0);
         assert_eq!(state.borrow().order, ["admit"]);
-        assert_eq!(state.borrow().pool.used_bytes().unwrap(), 64);
+        assert_eq!(state.borrow().pool.payload_used_bytes().unwrap(), 64);
         state.borrow_mut().mode.short = false;
         let sequence = extract_input(&mut runtime, 0, &ids, 3, None).unwrap();
         charges.push((state.borrow().held, state.borrow().input_bytes));
@@ -142,7 +142,7 @@ fn original_input_exact_short_and_spare_source_capacity_do_not_change_destinatio
         drop(sequence);
         let (pool, _) = retire_request(&state);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     assert_eq!(charges[0], charges[1]);
     let small = OriginalTokenInputLayout::prepare(&TokenIdsInputPlan::new(&[1]).unwrap()).unwrap();
@@ -183,10 +183,10 @@ fn consumed_foreign_input_bank_error_retains_only_original_account_not_new_sourc
     let (pool_a, held) = retire_request(&a);
     let (pool_b, _) = retire_request(&b);
     drop((old, new));
-    assert_eq!(pool_b.used_bytes().unwrap(), 0);
-    assert_eq!(pool_a.used_bytes().unwrap(), held);
+    assert_eq!(pool_b.payload_used_bytes().unwrap(), 0);
+    assert_eq!(pool_a.payload_used_bytes().unwrap(), held);
     drop(error);
-    assert_eq!(pool_a.used_bytes().unwrap(), 0);
+    assert_eq!(pool_a.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn real_input_reserve_failure_and_fenced_failure_escape_with_original_custody() {
@@ -222,10 +222,16 @@ fn real_input_reserve_failure_and_fenced_failure_escape_with_original_custody() 
         assert_eq!(state.borrow().input_builds, 0);
         let (pool, held) = retire_request(&state);
         drop(runtime);
-        assert!(pool.pin_registered_storage([(1u32, 64)]).is_ok());
-        assert_eq!(pool.used_bytes().unwrap(), held + 64);
+        assert!(
+            pool.snapshot()
+                .unwrap()
+                .domains
+                .iter()
+                .any(|domain| domain.registered_storage_bytes >= 64)
+        );
+        assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -250,7 +256,7 @@ fn input_postfill_unwind_spends_bank_and_retires_destination_before_original_hol
     );
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -279,7 +285,7 @@ fn original_input_is_borrowed_across_actual_adaptive_candidates_and_copied_once_
     drop(sequence);
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -351,7 +357,11 @@ fn original_encoded_input(profile: u8) {
                 audit_decoder: profile >= 3,
                 ..Mode::default()
             },
-            WorkingMemoryPool::new(if regex { u64::MAX } else { 1_000_000 }, 0).unwrap(),
+            crate::working_memory::memory_fixture::host_ledger(
+                if regex { u64::MAX } else { 1_000_000 },
+                0,
+            )
+            .unwrap(),
         );
         let pool = state.borrow().pool.clone();
         let source = pool
@@ -424,13 +434,13 @@ fn original_encoded_input(profile: u8) {
         drop(header);
         let (_, held) = retire_request(&state);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), c + held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), c + held);
         drop(source);
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             held + if profile >= 3 { c } else { 0 }
         );
         drop(sequence);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

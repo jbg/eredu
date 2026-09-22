@@ -2,20 +2,19 @@
 
 use std::path::Path;
 
-use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
+use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions, SharedPromptCacheManifest};
 use eredu_core::{SpeculativeCapability, SpeculativeDraftSource};
-use eredu_runtime::{
-    CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, layered::BoundCaptureSelection,
-};
+use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, layered::BoundCaptureSelection};
 use safemlx::{Array, Stream, error::Exception};
 
+mod cache_persistence;
 mod loaded_helpers;
 pub(in crate::composition) use loaded_helpers::settle_loaded_numerical_values;
 mod recipe_planning;
 pub(in crate::composition::mlx) use recipe_planning::capture::CaptureRecorder;
 pub(super) use recipe_planning::{
-    FundedResidentRecipePlanning, RecipeWorkspace, retain_planning_error, retain_planning_error_with_kind,
-    PreparedPlanningError, planning_error_has_funding,
+    FundedResidentRecipePlanning, PreparedPlanningError, RecipeWorkspace,
+    planning_error_has_funding, retain_planning_error, retain_planning_error_with_kind,
     retain_planning_failure,
 };
 
@@ -36,6 +35,14 @@ pub(crate) struct RetainedIdleModelStorage {
 }
 
 impl RetainedIdleModelStorage {
+    pub(crate) fn validate_physical_attribution(
+        &self,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
+    ) -> Result<(), Error> {
+        self.nonstate.validate_physical_attribution(pool)?;
+        self.decoder_state.validate_physical_attribution(pool)
+    }
+
     pub(crate) fn nonstate_bytes(&self) -> Result<Option<u64>, Error> {
         self.nonstate.byte_bound().map_err(Into::into)
     }
@@ -48,14 +55,66 @@ impl RetainedIdleModelStorage {
     /// managers. This does not infer a zero frontier: geometry must separately
     /// match the actual state projection, including host-only position state.
     pub(crate) fn has_empty_decoder_storage(&self) -> Result<bool, Error> {
-        Ok(self.decoder_state_bytes()? == Some(0))
+        self.decoder_state.has_no_payload()
+    }
+
+    /// Authenticates an existing decoder independently of any previous request.
+    /// Imported state retains its original allocation charges; this pin grants
+    /// no capacity, state succession, or native execution authority.
+    pub(crate) fn pin_registered_decoder_source(
+        &self,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<eredu_runtime::working_memory::WorkingMemoryStorage<StorageIdentity>, Error> {
+        use eredu_core::{HostMetadataFunding, HostPreparationAuthority};
+        use eredu_nn::workspace::WorkspaceMetadataAllocation;
+        use std::mem::size_of;
+
+        funding
+            .reserve_metadata(
+                HostPreparationAuthority::retention_bytes::<HostMetadataFunding>()
+                    .and_then(|bytes| {
+                        bytes.checked_add(size_of::<(
+                            &Self,
+                            &eredu_runtime::working_memory::MemoryLedger,
+                            &HostMetadataFunding,
+                            HostPreparationAuthority,
+                            Option<
+                                eredu_runtime::working_memory::WorkingMemoryStorage<
+                                    StorageIdentity,
+                                >,
+                            >,
+                            Result<
+                                eredu_runtime::working_memory::WorkingMemoryStorage<
+                                    StorageIdentity,
+                                >,
+                                Error,
+                            >,
+                        )>())
+                    })
+                    .ok_or(Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+                    ))?,
+            )
+            .map_err(Error::WorkspacePlanning)?;
+        let plan = self
+            .decoder_state
+            .source_pin_plan(pool)
+            .map_err(|cause| Error::Neural(funding.metadata_source(cause)))?;
+        funding
+            .reserve_metadata(plan.requested_bytes())
+            .map_err(Error::WorkspacePlanning)?;
+        let host = HostPreparationAuthority::retain(funding.clone());
+        self.decoder_state
+            .pin_registered_with_host(pool, &host)
+            .map_err(|cause| Error::Neural(funding.metadata_source(cause)))
     }
 
     /// Complete source validation for the single original whole-KV table.
     /// Decoder arrays cannot smuggle a second original fixed-table population.
     pub(crate) fn validate_original_table(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         expected: Option<&eredu_runtime::working_memory::OriginalResidentResetSource>,
     ) -> Result<(), Error> {
         self.nonstate.validate_original_table(pool, expected)?;
@@ -74,12 +133,16 @@ impl RetainedIdleModelStorage {
 /// workspace before copy/state spans. Consumed by the existing native quote;
 /// no alternate source query or numerical authority is carried by this owner.
 pub(in crate::composition::mlx) struct PreparedSavedParameterSource {
-    layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+    pub(in crate::composition::mlx) layerwise:
+        Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+    pub(in crate::composition::mlx) backings:
+        crate::backend::nn::workspace::ParameterWorkspaceBackings,
 }
 
 /// The single architecture-erased outer boundary for complete MLX execution.
 pub(crate) struct Executable {
     inner: Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>,
+    parameter_sources: crate::backend::nn::workspace::CompletedParameterSources,
     inference: Option<eredu_architectures::prepared_execution::PreparedInferenceBlueprint>,
     workspace: Option<crate::backend::nn::workspace::ResidentExecutionMechanisms>,
     _storage_publication:
@@ -103,11 +166,27 @@ impl Executable {
     ) -> Self {
         Self {
             inner,
+            parameter_sources: Default::default(),
             inference: None,
             workspace: None,
             _storage_publication: None,
             _memory_owner: None,
         }
+    }
+
+    pub(crate) fn parameter_sources(
+        &self,
+    ) -> &crate::backend::nn::workspace::CompletedParameterSources {
+        &self.parameter_sources
+    }
+
+    /// The prepared transaction swaps this alongside the immutable values.
+    /// Displaced source retirement remains with the transaction after unlocking.
+    pub(crate) fn exchange_parameter_sources(
+        &mut self,
+        sources: &mut crate::backend::nn::workspace::CompletedParameterSources,
+    ) {
+        std::mem::swap(&mut self.parameter_sources, sources);
     }
 
     pub(crate) fn retain_memory_owner(
@@ -251,12 +330,16 @@ impl Executable {
         &mut self,
         source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
         cache: &mut super::replicated_text::MlxPredictionTargetState,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         funding: &eredu_nn::workspace::HostMetadataFunding,
         stream: &safemlx::Stream,
     ) -> Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error> {
-        let blueprint = self.inference.as_ref().ok_or(Error::PrefillScopeUnavailable)?;
-        self.inner.prepare_autoregressive_media_semantics(source, cache, blueprint, pool, funding, stream)
+        let blueprint = self
+            .inference
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        self.inner
+            .prepare_autoregressive_media_semantics(source, cache, blueprint, pool, funding, stream)
     }
 
     pub(crate) fn inference_blueprint(
@@ -271,9 +354,19 @@ impl Executable {
         self._storage_publication.is_some() && self._memory_owner.is_none()
     }
 
-    pub(crate) fn native_storage_mechanism(&self) -> Result<Option<crate::backend::runtime::residency::storage::native_storage::MlxNativeStorage>, Error> {
+    pub(crate) fn native_storage_mechanism(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::storage::native_storage::MlxNativeStorage>,
+        Error,
+    > {
         Ok(self.erased().native_storage_mechanism()?.map(|mechanism| {
-            match self._storage_publication.as_ref().filter(|_| self._memory_owner.is_none()) {
+            let mechanism = mechanism.with_parameter_sources(self.parameter_sources.clone());
+            match self
+                ._storage_publication
+                .as_ref()
+                .filter(|_| self._memory_owner.is_none())
+            {
                 Some(publication) => mechanism.with_initial_publication(publication.clone()),
                 None => mechanism,
             }
@@ -288,7 +381,9 @@ impl Executable {
         publication: &crate::backend::runtime::residency::storage::RetainedStoragePublication,
     ) -> bool {
         self._memory_owner.is_none()
-            && self._storage_publication.as_ref()
+            && self
+                ._storage_publication
+                .as_ref()
                 .is_some_and(|retained| publication.can_retire_with(retained))
     }
 
@@ -308,7 +403,8 @@ impl Executable {
     pub(crate) fn workspace_mechanisms(
         &self,
     ) -> Option<crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms> {
-        self.workspace.map(crate::backend::nn::workspace::ResidentExecutionMechanisms::ordinary)
+        self.workspace
+            .map(crate::backend::nn::workspace::ResidentExecutionMechanisms::ordinary)
     }
 
     pub(crate) fn layerwise_workspace(
@@ -333,7 +429,7 @@ impl Executable {
                     ))
                 })?;
                 self.erased()
-                    .layerwise_workspace(facts.allocation())
+                    .layerwise_workspace(facts.ordinary_storage().allocation())
                     .map(Some)
             }
             _ => Err(Error::Other(Box::new(
@@ -383,8 +479,9 @@ impl Executable {
                 "selected native execution has no retained workspace mechanism facts".into(),
             )
         })?;
-        let context = eredu_nn::workspace::WorkspaceContext::new(facts);
-        self.erased().install_workspace_parameter_representations(&context)
+        let context = eredu_nn::workspace::WorkspaceContext::new(facts.ordinary_storage());
+        self.erased()
+            .install_workspace_parameter_representations(&context)
             .map_err(|cause| Error::Other(Box::new(cause)))?;
         let state = self.erased().project_resident_workspace(batch, &context)?;
         blueprint
@@ -405,7 +502,7 @@ impl Executable {
         filter: impl Into<eredu_core::TextFilterWorkspace<'a>>,
     ) -> Result<eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace, Error>
     {
-        self.quote_resident_sampling_impl(geometry, config, filter.into(), None)
+        self.quote_resident_sampling_impl(geometry, config, filter.into(), None, None)
             .map(|(quote, _)| quote)
     }
 
@@ -429,6 +526,7 @@ impl Executable {
             config,
             filter.into(),
             Some(CaptureQuoteSource::Raw(capture)),
+            None,
         )?;
         Ok((
             quote,
@@ -446,6 +544,7 @@ impl Executable {
         config: eredu_core::TextGenerationConfig,
         filter: impl Into<eredu_core::TextFilterWorkspace<'a>>,
         capture: BoundCaptureSelection<'capture>,
+        publications: Option<&std::cell::Cell<usize>>,
     ) -> Result<
         (
             eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace,
@@ -458,6 +557,7 @@ impl Executable {
             config,
             filter.into(),
             Some(CaptureQuoteSource::Bound(capture)),
+            publications,
         )?;
         Ok((
             quote,
@@ -471,6 +571,7 @@ impl Executable {
         config: eredu_core::TextGenerationConfig,
         filter: eredu_core::TextFilterWorkspace<'a>,
         capture: Option<CaptureQuoteSource<'capture>>,
+        publications: Option<&std::cell::Cell<usize>>,
     ) -> Result<
         (
             eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace,
@@ -494,11 +595,21 @@ impl Executable {
                 "selected native execution has no retained workspace mechanism facts".into(),
             )
         })?;
-        let context = eredu_nn::workspace::WorkspaceContext::new(facts);
-        self.erased().install_workspace_parameter_representations(&context)
+        let context = eredu_nn::workspace::WorkspaceContext::new(facts.ordinary_storage());
+        let layerwise = self.layerwise_workspace()?;
+        self.install_parameter_source(&context, layerwise.as_ref())
             .map_err(|cause| Error::Other(Box::new(cause)))?;
         let state = self.erased().project_resident_workspace(batch, &context)?;
-        self.quote_sampling_program(geometry, &state, &context, config, filter, capture)
+        self.quote_sampling_program(
+            geometry,
+            &state,
+            &context,
+            config,
+            filter,
+            capture,
+            layerwise.as_ref(),
+            publications,
+        )
     }
 
     /// Quotes an actual supplied saved-state projection and populated sampler
@@ -550,21 +661,40 @@ impl Executable {
         &self,
         context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<PreparedSavedParameterSource, Error> {
-        context.charge_metadata(std::mem::size_of::<(
-            PreparedSavedParameterSource,
-            Result<PreparedSavedParameterSource, Error>,
-            Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-            &Self,
-            &eredu_nn::workspace::WorkspaceContext,
-        )>()).map_err(|cause| recipe_planning::context_source(context, cause))?;
-        let layerwise = self.prepared_layerwise_workspace(context)?;
-        self.erased().install_workspace_parameter_representations(context)
+        context
+            .charge_metadata(std::mem::size_of::<(
+                PreparedSavedParameterSource,
+                Result<PreparedSavedParameterSource, Error>,
+                Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+                &Self,
+                &eredu_nn::workspace::WorkspaceContext,
+            )>())
             .map_err(|cause| recipe_planning::context_source(context, cause))?;
-        if let Some(source) = &layerwise {
-            source.extend_workspace_parameter_representations(context)
-                .map_err(|cause| recipe_planning::context_source(context, cause))?;
+        let layerwise = self.prepared_layerwise_workspace(context)?;
+        let backings = self
+            .install_parameter_source(context, layerwise.as_ref())
+            .map_err(|cause| recipe_planning::context_source(context, cause))?;
+        Ok(PreparedSavedParameterSource {
+            layerwise,
+            backings,
+        })
+    }
+
+    /// Installs static and actual retained replacement rows into one allocation
+    /// map before state projection or equation spans begin.
+    pub(in crate::composition::mlx) fn install_parameter_source(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+        layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+    ) -> Result<crate::backend::nn::workspace::ParameterWorkspaceBackings, eredu_nn::Error> {
+        let mut backings = self
+            .erased()
+            .install_workspace_parameter_representations(context)?;
+        if let Some(layerwise) = layerwise {
+            layerwise.install_replacement_parameter_representations(context, &mut backings)?;
         }
-        Ok(PreparedSavedParameterSource { layerwise })
+        backings.classify_completed(&self.parameter_sources, context)?;
+        Ok(backings)
     }
 
     /// Native recipe of the exact saved state and populated sampler, observed
@@ -579,13 +709,15 @@ impl Executable {
         >,
         context: &eredu_nn::workspace::WorkspaceContext,
         sampling: eredu_architectures::prepared_execution::BorrowedTextSamplingWorkspace<'_>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         capture: Option<(
             &eredu_runtime::capture::FundedCaptureCheckpoint,
             &eredu_runtime::layered::PreparedCaptureSelection,
         )>,
-        addressable:Option<&crate::backend::nn::workspace::AddressableSources>,
-        interventions: Option<crate::composition::mlx::session::intervention::TextInterventionQuote<'_>>,
+        addressable: Option<&crate::backend::nn::workspace::AddressableSources>,
+        interventions: Option<
+            crate::composition::mlx::session::intervention::TextInterventionQuote<'_>,
+        >,
         prepared_parameters: Option<PreparedSavedParameterSource>,
     ) -> Result<
         (
@@ -601,47 +733,45 @@ impl Executable {
         let facts = self.workspace.ok_or(Error::PrefillControl(
             eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
         ))?;
-        let layerwise = match (capture.is_some(), prepared_parameters) {
-            // The same owner installed static + unit facts before the saved
-            // Context's first copy span. Reinstalling or extending here is late.
-            (false, Some(source)) => source.layerwise,
-            (true, None) => {
-                let source = if context.uses_checked_metadata() {
-                    self.prepared_layerwise_workspace(context)?
-                } else {
-                    self.layerwise_workspace()?
-                };
-                // Observed quotation binds actual unit rows at its existing
-                // checked acquisitions; static rows precede its constructors.
-                self.erased().install_workspace_parameter_representations(context)
-                    .map_err(|cause| recipe_planning::context_source(context, cause))?;
-                source
-            }
-            _ => return Err(recipe_planning::context_source(context,
-                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)),
-        };
+        let layerwise = prepared_parameters
+            .ok_or_else(|| {
+                recipe_planning::context_source(
+                    context,
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                )
+            })?
+            .layerwise;
         // The capture trace consumes the retained source at ordinary unit
         // binding. Replaced constructor nodes are authenticated here and priced
         // once with the source-copy recipe after numerical quotation.
-        let mut recorder = facts.recorder(geometry, context)
-        .map_err(|cause| recipe_planning::context_source(context, cause))?;
-        if let Some(source)=addressable{recorder.bind_addressable_sources(source.clone()).map_err(|cause|recipe_planning::context_source(context,cause))?;}
-        context.charge_metadata(std::mem::size_of::<(
-            Option<PreparedSavedParameterSource>,
-            Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-            Option<NativeLayerwiseParameters<'_>>,
-            Option<crate::composition::mlx::session::intervention::TextInterventionQuote<'_>>,
-            Option<&dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>,
-        )>()).map_err(|cause| recipe_planning::context_source(context, cause))?;
-        let observed_source = layerwise.as_ref().filter(|_| capture.is_some());
-        if let Some(source) = observed_source {
-            recorder.bind_layerwise_constructor_source(source)
+        let mut recorder = facts
+            .recorder(geometry, context)
+            .map_err(|cause| recipe_planning::context_source(context, cause))?;
+        if let Some(source) = addressable {
+            recorder
+                .bind_addressable_sources(source.clone())
                 .map_err(|cause| recipe_planning::context_source(context, cause))?;
         }
-        let parameters = observed_source.map(NativeLayerwiseParameters);
+        context
+            .charge_metadata(std::mem::size_of::<(
+                Option<PreparedSavedParameterSource>,
+                Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+                Option<NativeLayerwiseParameters<'_>>,
+                Option<crate::composition::mlx::session::intervention::TextInterventionQuote<'_>>,
+                Option<&dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters>,
+            )>())
+            .map_err(|cause| recipe_planning::context_source(context, cause))?;
+        if let Some(source) = layerwise.as_ref() {
+            recorder
+                .bind_layerwise_span_constructor_source(source)
+                .map_err(|cause| recipe_planning::context_source(context, cause))?;
+        }
+        let parameters = layerwise.as_ref().map(NativeLayerwiseParameters);
         if capture.is_none() && interventions.is_some() {
-            return Err(recipe_planning::context_source(context,
-                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+            return Err(recipe_planning::context_source(
+                context,
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
         }
         let generation = match capture {
             Some((checkpoint, selection)) => recipe_planning::capture::quote_saved(
@@ -655,15 +785,20 @@ impl Executable {
                 selection,
                 interventions,
                 &mut recorder,
-                parameters.as_ref().map(|source| source as
-                    &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters),
+                parameters.as_ref().map(|source| {
+                    source as
+                    &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
+                }),
             ),
             None => blueprint.quote_replicated_text_with_existing_sampling_and_trace(
                 geometry,
                 state,
                 context,
                 sampling,
-                None,
+                parameters.as_ref().map(|source| {
+                    source as
+                    &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
+                }),
                 &mut recorder,
             ),
         }
@@ -671,8 +806,11 @@ impl Executable {
         let mut recipe = recorder
             .finish(generation.equations.span_workspace_plan())
             .map_err(|error| recipe_planning::context_source(context, error))?;
-        self.erased()
-            .bind_layerwise_neural_recipe(pool, &mut recipe, context.metadata_funding().as_ref())?;
+        self.erased().bind_layerwise_neural_recipe(
+            pool,
+            &mut recipe,
+            context.metadata_funding().as_ref(),
+        )?;
         if let Some(sources) = &layerwise {
             sources.bind_native_host_copies(&mut recipe)?;
         }
@@ -687,7 +825,7 @@ impl Executable {
         geometry: eredu_core::InferenceGeometry,
         config: eredu_core::TextGenerationConfig,
         filter: impl Into<eredu_core::TextFilterWorkspace<'a>>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<
         (
             eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace,
@@ -695,7 +833,7 @@ impl Executable {
         ),
         Error,
     > {
-        self.quote_registered_sampling_impl(geometry, config, filter.into(), pool, None)
+        self.quote_registered_sampling_impl(geometry, config, filter.into(), pool, None, None)
             .map(|(quote, storage, _)| (quote, storage))
     }
 
@@ -707,7 +845,7 @@ impl Executable {
         geometry: eredu_core::InferenceGeometry,
         config: eredu_core::TextGenerationConfig,
         filter: impl Into<eredu_core::TextFilterWorkspace<'a>>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         capture: &'capture eredu_core::capture::SharedCapturePlan,
     ) -> Result<
         (
@@ -723,6 +861,7 @@ impl Executable {
             filter.into(),
             pool,
             Some(CaptureQuoteSource::Raw(capture)),
+            None,
         )?;
         Ok((
             quote,
@@ -738,8 +877,9 @@ impl Executable {
         geometry: eredu_core::InferenceGeometry,
         config: eredu_core::TextGenerationConfig,
         filter: impl Into<eredu_core::TextFilterWorkspace<'a>>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         capture: BoundCaptureSelection<'capture>,
+        publications: Option<&std::cell::Cell<usize>>,
     ) -> Result<
         (
             eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace,
@@ -754,6 +894,7 @@ impl Executable {
             filter.into(),
             pool,
             Some(CaptureQuoteSource::Bound(capture)),
+            publications,
         )?;
         Ok((
             quote,
@@ -791,8 +932,9 @@ impl Executable {
         geometry: eredu_core::InferenceGeometry,
         config: eredu_core::TextGenerationConfig,
         filter: eredu_core::TextFilterWorkspace<'a>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         capture: Option<CaptureQuoteSource<'capture>>,
+        publications: Option<&std::cell::Cell<usize>>,
     ) -> Result<
         (
             eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace,
@@ -817,8 +959,20 @@ impl Executable {
                 "selected native execution has no retained workspace mechanism facts".into(),
             )
         })?;
-        let context = eredu_nn::workspace::WorkspaceContext::new(facts);
-        self.erased().install_workspace_parameter_representations(&context)
+        let funding = pool
+            .prepare_workspace_metadata(
+                self.erased().inference_execution_identity(),
+                pool.configured_limits().clone(),
+            )
+            .map_err(Error::WorkspacePlanning)?;
+        let context = eredu_nn::workspace::WorkspaceContext::new_with_metadata_funding(
+            facts.ordinary_storage(),
+            funding,
+        )
+        .map_err(|cause| Error::Neural(cause.into()))?;
+        let layerwise = self.layerwise_workspace()?;
+        let parameter_backings = self
+            .install_parameter_source(&context, layerwise.as_ref())
             .map_err(|cause| Error::Other(Box::new(cause)))?;
         let projected = self
             .erased()
@@ -828,15 +982,44 @@ impl Executable {
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             )));
         }
-        let storage = eredu_runtime::working_memory::RegisteredWorkspaceStorage::bind(
-            pool,
-            &context,
+        let roots = || {
             projected
                 .storage
                 .iter()
                 .filter(|(_, bytes, _)| *bytes != 0)
-                .map(|(identity, _, root)| (StorageIdentity::Native(identity), root.clone())),
-        )
+                .map(|(identity, _, root)| {
+                    crate::backend::nn::workspace::registered_storage_row(identity, root)
+                })
+                .chain(parameter_backings.roots())
+        };
+        let completed = parameter_backings
+            .completed_source(&context)
+            .map_err(Error::Neural)?;
+        let count = projected
+            .storage
+            .iter()
+            .filter(|(_, bytes, _)| *bytes != 0)
+            .count()
+            .checked_add(parameter_backings.len())
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+            ))?;
+        let layout = match &completed {
+            Some(source) => eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout::<
+                StorageIdentity,
+            >::new_with_completed_source(count, source),
+            None => eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout::<
+                StorageIdentity,
+            >::new(count),
+        }
+        .map_err(Error::PrefillControl)?;
+        context
+            .charge_metadata(layout.requested_bytes())
+            .map_err(|cause| Error::Neural(cause.into()))?;
+        let storage = match completed {
+            Some(source) => layout.construct_with_completed_source(pool, &context, roots(), source),
+            None => layout.construct(pool, &context, roots()),
+        }
         .map_err(|error| Error::Other(Box::new(error)))?;
         let (quote, host) = self.quote_sampling_program(
             geometry,
@@ -845,6 +1028,8 @@ impl Executable {
             config,
             filter,
             capture,
+            layerwise.as_ref(),
+            publications,
         )?;
         Ok((quote, storage, host))
     }
@@ -860,6 +1045,8 @@ impl Executable {
         config: eredu_core::TextGenerationConfig,
         filter: eredu_core::TextFilterWorkspace<'a>,
         capture: Option<CaptureQuoteSource<'capture>>,
+        layerwise: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        publications: Option<&std::cell::Cell<usize>>,
     ) -> Result<
         (
             eredu_architectures::prepared_execution::PreparedTextGenerationWorkspace,
@@ -870,7 +1057,6 @@ impl Executable {
         let blueprint = self.inference_blueprint().ok_or_else(|| {
             Error::ArchitectureModel("executable has no retained inference blueprint".into())
         })?;
-        let layerwise = self.layerwise_workspace()?;
         if let Some(capture) = capture {
             let paths = self.erased().shared_observation_paths().ok_or_else(|| {
                 Error::Other(Box::new(
@@ -878,7 +1064,10 @@ impl Executable {
                 ))
             })?;
             use super::session::capture_workspace::CaptureWorkspaceObserver;
-            let (mut observer, host) = match capture {
+            let counter = std::cell::Cell::new(
+                crate::backend::array_copy::CaptureNativePopulation::default(),
+            );
+            let (observer, host) = match capture {
                 CaptureQuoteSource::Raw(source) => {
                     CaptureWorkspaceObserver::new(source, geometry, context)
                 }
@@ -887,7 +1076,12 @@ impl Executable {
                 }
             }
             .map_err(|e| Error::Other(Box::new(e)))?;
-            let quote = match layerwise.as_ref() {
+            let mut observer = if publications.is_some() {
+                observer.with_transfer_counter(&counter)
+            } else {
+                observer
+            };
+            let quote = match layerwise {
                 Some(parameters) => blueprint
                     .quote_replicated_layerwise_text_with_sampling_observed(
                         geometry,
@@ -910,9 +1104,12 @@ impl Executable {
                 ),
             }
             .map_err(|e| Error::Other(Box::new(e)))?;
+            if let Some(publications) = publications {
+                publications.set(observer.publication_count().map_err(Error::Neural)?);
+            }
             Ok((quote, Some(host)))
         } else {
-            let quote = match layerwise.as_ref() {
+            let quote = match layerwise {
                 Some(parameters) => blueprint.quote_replicated_layerwise_text_with_sampling(
                     geometry,
                     state,
@@ -961,7 +1158,7 @@ impl Executable {
         eredu_runtime::working_memory::quote_text_prompt_workspace(
             geometry,
             source_capacity_bytes,
-            &eredu_nn::workspace::WorkspaceContext::new(facts),
+            &eredu_nn::workspace::WorkspaceContext::new(facts.ordinary_storage()),
         )
         .map_err(|error| Error::Other(Box::new(error)))
     }
@@ -1029,10 +1226,9 @@ impl Executable {
             Error,
         >,
     ) -> bool {
-        self.erased_mut()
-            .install_embedded_prediction_observers(
-                super::prepared_speculative::embedded_logits::observers(observers),
-            )
+        self.erased_mut().install_embedded_prediction_observers(
+            super::prepared_speculative::embedded_logits::observers(observers),
+        )
     }
 
     pub(crate) fn has_neutral_partitioned_control(&self) -> bool {
@@ -1047,42 +1243,61 @@ impl Executable {
 
     pub(crate) fn load_prompt_cache_distributed(
         &mut self,
+        funding: &eredu_runtime::cache::PromptCachePersistenceFunding,
+        materialization: &crate::backend::runtime::cache::residency::PromptCacheMaterialization,
+        control: Option<&crate::backend::runtime::distributed::topology::original_source::control::cache::CacheControlOwner>,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-    ) -> Result<Option<PromptCacheManifest>, Exception> {
-        self.erased_mut()
-            .load_prompt_cache_distributed(directory, expected, prefix_token_ids)
-            .map_err(|error| Exception::custom(error.to_string()))
+    ) -> Result<Option<SharedPromptCacheManifest>, Error> {
+        self.erased_mut().load_prompt_cache_distributed(
+            funding,
+            materialization,
+            control,
+            directory,
+            expected,
+            prefix_token_ids,
+        )
     }
 
     pub(crate) fn load_prompt_cache_for_input_distributed(
         &mut self,
+        funding: &eredu_runtime::cache::PromptCachePersistenceFunding,
+        materialization: &crate::backend::runtime::cache::residency::PromptCacheMaterialization,
+        control: Option<&crate::backend::runtime::distributed::topology::original_source::control::cache::CacheControlOwner>,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input_identity: eredu_runtime::SharedPreparedInputCacheIdentity,
-    ) -> Result<Option<PromptCacheManifest>, Exception> {
-        self.erased_mut()
-            .load_prompt_cache_for_input_distributed(
-                directory,
-                expected,
-                prefix_token_ids,
-                input_identity,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
+    ) -> Result<Option<SharedPromptCacheManifest>, Error> {
+        self.erased_mut().load_prompt_cache_for_input_distributed(
+            funding,
+            materialization,
+            control,
+            directory,
+            expected,
+            prefix_token_ids,
+            input_identity,
+        )
     }
 
     pub(crate) fn save_prompt_cache_distributed(
         &mut self,
+        funding: &eredu_runtime::cache::PromptCachePersistenceFunding,
+        control: Option<&crate::backend::runtime::distributed::topology::original_source::control::cache::CacheControlOwner>,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-    ) -> Result<Option<PromptCacheManifest>, Exception> {
-        self.erased_mut()
-            .save_prompt_cache_distributed(destination, descriptor, prefix_token_ids, options)
-            .map_err(|error| Exception::custom(error.to_string()))
+    ) -> Result<Option<SharedPromptCacheManifest>, Error> {
+        self.erased_mut().save_prompt_cache_distributed(
+            funding,
+            control,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+        )
     }
 
     pub fn speculative_capability(&self) -> SpeculativeCapability {
@@ -1153,47 +1368,58 @@ impl Executable {
 
     pub fn load_prompt_cache(
         &mut self,
+        funding: &eredu_runtime::cache::PromptCachePersistenceFunding,
+        materialization: &crate::backend::runtime::cache::residency::PromptCacheMaterialization,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
-        _stream: &Stream,
-    ) -> Result<PromptCacheManifest, Exception> {
-        self.erased_mut()
-            .load_prompt_cache(directory.as_ref(), expected, prefix_token_ids)
-            .map_err(|error| Exception::custom(error.to_string()))
+    ) -> Result<SharedPromptCacheManifest, Error> {
+        self.erased_mut().load_prompt_cache(
+            funding,
+            materialization,
+            None,
+            directory.as_ref(),
+            expected,
+            prefix_token_ids,
+        )
     }
 
     pub fn load_prompt_cache_for_input(
         &mut self,
+        funding: &eredu_runtime::cache::PromptCachePersistenceFunding,
+        materialization: &crate::backend::runtime::cache::residency::PromptCacheMaterialization,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input_identity: impl Into<eredu_runtime::SharedPreparedInputCacheIdentity>,
-        _options: PagedCacheOptions,
-        _stream: &Stream,
-    ) -> Result<PromptCacheManifest, Exception> {
-        self.erased_mut()
-            .load_prompt_cache_for_input(
-                directory.as_ref(),
-                expected,
-                prefix_token_ids,
-                input_identity.into(),
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
+    ) -> Result<SharedPromptCacheManifest, Error> {
+        self.erased_mut().load_prompt_cache_for_input(
+            funding,
+            materialization,
+            None,
+            directory.as_ref(),
+            expected,
+            prefix_token_ids,
+            input_identity.into(),
+        )
     }
 
     pub fn save_prompt_cache(
         &mut self,
+        funding: &eredu_runtime::cache::PromptCachePersistenceFunding,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        _stream: &Stream,
-    ) -> Result<PromptCacheManifest, Exception> {
-        self.erased_mut()
-            .save_prompt_cache(destination.as_ref(), descriptor, prefix_token_ids, options)
-            .map_err(|error| Exception::custom(error.to_string()))
+    ) -> Result<SharedPromptCacheManifest, Error> {
+        self.erased_mut().save_prompt_cache(
+            funding,
+            None,
+            destination.as_ref(),
+            descriptor,
+            prefix_token_ids,
+            options,
+        )
     }
 
     pub fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
@@ -1216,6 +1442,16 @@ pub(crate) struct NativeLayerwiseParameters<'a>(
 impl eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
     for NativeLayerwiseParameters<'_>
 {
+    fn observe_acquire(
+        &self,
+        ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters::observe_acquire(
+            self.0, ordinal, address, context,
+        )
+    }
     fn excludes_parameter(&self, name: &str) -> bool {
         self.0.excludes_parameter(name)
     }

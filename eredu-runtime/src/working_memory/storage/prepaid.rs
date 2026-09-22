@@ -1,7 +1,7 @@
 //! Disjoint existing coverage. These private owners cannot be minted from a key.
 use super::*;
-use funding::native_partition::NativePartition;
 use crate::working_memory::OriginalHostMetadataCustody;
+use funding::native_partition::NativePartition;
 
 #[derive(Clone, Debug)]
 pub(in crate::working_memory) struct PrepaidHostOrigin {
@@ -36,6 +36,7 @@ impl Drop for PrepaidHostOrigin {
 #[derive(Clone, Debug)]
 pub(in crate::working_memory) enum PrepaidStorageOrigin {
     Native(NativePartition),
+    Numerical(super::native_publication::numerical::NumericalOrigin),
     Immutable(PrepaidHostOrigin),
     Source(crate::working_memory::gguf_source::SourceInventoryOrigin),
 }
@@ -43,7 +44,7 @@ impl PrepaidStorageOrigin {
     pub(in crate::working_memory) fn buffer_kind(&self, immutable: bool) -> bool {
         matches!(
             (self, immutable),
-            (Self::Native(_), false) | (Self::Immutable(_), true)
+            (Self::Native(_) | Self::Numerical(_), false) | (Self::Immutable(_), true)
         )
     }
     pub(in crate::working_memory) fn residual_source_charge(&self) -> Option<u64> {
@@ -59,6 +60,7 @@ impl PrepaidStorageOrigin {
     pub(in crate::working_memory) fn same_origin(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Native(a), Self::Native(b)) => a.same_origin(b),
+            (Self::Numerical(a), Self::Numerical(b)) => a.same(b),
             (Self::Immutable(a), Self::Immutable(b)) => a.same(b),
             (Self::Source(a), Self::Source(b)) => a.same(b),
             _ => false,
@@ -70,17 +72,21 @@ impl PrepaidStorageOrigin {
     ) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Native(origin) => origin.validate_origin(usage),
+            Self::Numerical(origin) => origin
+                .account
+                .validate_copy_source(origin.account.pool(), usage),
             Self::Source(origin) => origin.validate(),
             Self::Immutable(origin) => origin.raw.validate_origin_locked(origin.raw.pool(), usage),
         }
     }
     pub(in crate::working_memory) fn validate_pool(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &crate::working_memory::Usage,
     ) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Native(origin) => origin.validate_pool(pool, usage),
+            Self::Numerical(origin) => origin.account.validate_copy_source(pool, usage),
             Self::Source(origin) => origin.validate_pool(pool),
             Self::Immutable(origin) => origin.raw.validate_origin_locked(pool, usage),
         }
@@ -91,6 +97,7 @@ impl PrepaidStorageOrigin {
     ) -> Result<(), WorkingMemoryError> {
         let valid = match self {
             Self::Native(origin) => bytes <= origin.capacity(),
+            Self::Numerical(origin) => bytes == origin.bytes,
             Self::Source(origin) => bytes == origin.total(),
             Self::Immutable(origin) => bytes == origin.bytes,
         };
@@ -107,9 +114,9 @@ impl PrepaidStorageOrigin {
     ) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Native(origin) => origin.validate_publisher(scope, usage),
-            Self::Source(_) => Err(WorkingMemoryError::IdentityMismatch),
+            Self::Source(_) | Self::Numerical(_) => Err(WorkingMemoryError::IdentityMismatch),
             Self::Immutable(origin) => {
-                if origin.raw.account() != scope.id || !origin.raw.pool().same_domain(scope.pool())
+                if origin.raw.account() != scope.id || !origin.raw.pool().same_ledger(scope.pool())
                 {
                     return Err(WorkingMemoryError::IdentityMismatch);
                 }

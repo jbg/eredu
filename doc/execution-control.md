@@ -9,7 +9,7 @@ ownership; [bounded inference](bounded-inference.md) defines the admission scope
 ## Public prepared-chat workflow
 
 Compile a chat against the loaded model's retained tokenizer and template sources
-with `prepare_chat`. Pass that `PreparedChat` and its admitted capacity through
+with `prepare_chat`. Pass that `PreparedChat` and its physical-domain limits through
 `PreparedChatRequest::new(&chat, settings)` to `start_prepared_chat`. This returns
 an optional `PreparedChatSession`: cancellation before startup returns no session.
 The session's consuming `advance` and `run` operations use the same committed-token
@@ -140,9 +140,40 @@ source unchanged, while work already attempted remains spent.
 Restore and fork never refund observation, transport, copy or attempt consumption.
 Record sequence/restore epoch provide consumer reconciliation; restoring model
 state does not erase externally delivered history. `PreparedChatResumeSettings`
-may shorten the remaining output allowance and admit a replacement execution
-policy within the same managed domain capacity. It cannot extend saved output
-credit or replace saved sampling history.
+may shorten the remaining output allowance or supply replacement per-domain
+request limits. The saved-source transaction compares the complete live charge;
+raising a retained account's limits requires its authentic move-only successor
+authority and a settled source. Independently retained semantic-source accounts
+keep their original constraints. Resume cannot extend saved output credit or
+replace sampling history. Separate host-copy limits intersect the saved
+preparation limits, and native copying retains its own physical admission.
+
+Physical limits for snapshot and resume copying are domain declarations. Host metadata has
+host placement, and native copy mechanisms supply the placements of destination
+buffers and scratch. The ledger checks their overlap with retained source storage
+atomically. Views and shared immutable backings retain one charge; independent
+copies reserve independent charges, including on unified-memory hardware.
+Snapshot budgets additionally track nonrefundable cumulative logical copy allowances
+and attempt counts. Their scalar copy quota is separate from physical capacity: a
+managed allocation may contribute an allowance in each candidate domain, and the
+quota conservatively counts those allowances without claiming measured residency.
+
+Unlimited domains use the same copy funding and completion custody. Raising a
+live predecessor's limit requires its move-only succession authority and leaves
+other live constraints effective.
+
+Prepared reset constructs fresh host state tables through the same ledger and
+retains the displaced state until its native owners retire. Resident key-only
+attention preserves its key-only and window configuration; resident compressed
+latent/rotary state preserves its allocation step. Their empty constructors
+allocate no native tensor. Existing snapshots continue owning their original
+backings and keep those charges through their last alias.
+
+Parameter changes use that same source-bound reset constructor. Preparation
+retains the installed state and prompt identity; publication exchanges the funded
+empty state together with prepared parameter handles and generation counters.
+Rollback restores those exact owners and counters. Finalization invalidates
+observation bindings after publication locks are released.
 
 Terminal snapshots remain terminal after admission. Their future execution geometry
 is empty StateOnly work with no output allowance. Restoring one does not schedule
@@ -152,10 +183,36 @@ sampling mutation still rejects completion. `preparation_report()` borrows the
 retained admission report, including a restored terminal branch's empty geometry.
 It describes that admission rather than current process memory or available pool
 capacity, and querying it creates no new authority.
+Cold workspace inspection also grants no execution authority. It supplies
+descriptive geometry to the shared prefill traversal, without constructing an
+inference request or consuming a session's one-shot prefill permission. Its
+reports remain inputs to the separate reservation and execution-admission path.
+Low-level raw host-upload constructors establish native storage and upload
+custody. They do not provide the selected model's complete prepared input source;
+passing such an upload directly to inference returns a typed completeness error.
+Model-bound token and media input plans supply that source through the shared
+admission path under finite and unlimited domain limits.
 Numerical equality of unchanged branches additionally requires deterministic native
 execution; copying RNG alone cannot make nondeterministic kernels deterministic.
 
 ## Capture, interventions and records
+
+Ordinary prefill intervention evidence retains one original before/after target
+across the canonical prompt chunks. Preview and summary use the same funded
+fragment worker and monotone progression as ordinary capture. Each logical side
+spends its full output quota once; physical fragment work retains its own native
+allowance and completion custody. Missing, repeated or abandoned hooks prevent
+successful evidence delivery. Controlled and uninterrupted execution share this
+path. Routing evidence retains separate expert-ID and coefficient fields on each
+side; integer IDs remain exact unsigned values in the host record. A routing
+operation with no selected rows reports `Unmatched` only after source validation
+and completion of every applicable chunk.
+
+Sparse unit edits retain one move-only operation cursor across provider batches
+and canonical prompt chunks. Native rows use their actual chunk coordinates;
+checked window offsets advance the original logical prompt receipt. The full
+logical edit quota is charged once. Missing ranges, abandoned batch loans, and
+changed source schedules prevent completion without refunding that charge.
 
 Completed capture frames are delivered before the associated token's semantic
 events. A failed or cancelled prediction may deliver an attributed frame without
@@ -189,11 +246,33 @@ runtime scheduler. Batch preparation agrees on all lane policies before prompt
 work. Speculation extends the common semantic preparation with actual proposal
 and verification state; it is not required for ordinary tools.
 
+Prefill scheduling retains a funded, one-use authority bound to the selected
+execution and exact schedule. Each numerical span retains its separately admitted
+native role through completion. Distributed scheduling agreements use the actual
+retained communication source and independently admitted native controls; host
+scheduling authority alone does not authorize collectives. Cold workspace tracing
+uses descriptive scheduling inputs and grants no execution authority.
+
 A speculative control step advances a scheduler action. Proposals are tentative
 and remain separate from committed output. Verification commits the accepted
 prefix plus any replacement/bonus at the declared boundary. The shared parser,
 controller and publisher see that committed sequence once. Rollback cannot refund
 observation or copy spending, and failure retains partially completed native work.
+
+Independent-decoder observation uses the existing invocation and completion
+workers. The executor preserves the collector's origin and drained snapshot
+authority; restoring model state does not refund cumulative capture usage.
+Prospective capture descriptors are cold source metadata, and cannot authorize
+a model call. A native adapter must supply the observed source producer for the
+actual role and physical span; otherwise the shared invocation rejects capture
+before entering the model worker.
+
+Partitioned independent invocations use the actual rank-local constructor,
+communication source and recorded equation row. Their completion-owned callback
+loan enters the shared model driver through a scoped mechanism binding. That
+binding retires on return, failure or unwind even when the session becomes fenced;
+the completion or recovery owner still retains pending native work. The cold
+partition quote describes the same source and grants no submission authority.
 
 Target and independent drafter have distinct authenticated prefill roles and span
 origins. Media must retain its real prepared payload through encoder ingress and
@@ -254,16 +333,20 @@ it, and external wall time still includes pauses and application processing.
 [Public conformance](prepared-chat-conformance.md) covers ordinary tools without
 speculation, reasoning, partial arguments, provider errors, manual/run parity,
 exact speculative prefixes and source refusals. The portable facade has 38
-passing cases with two external fixtures ignored; backend conformance has 126.
+passing cases with two external fixtures ignored; backend conformance has 128.
 
 Seven public native tools/media cases and six paged Device/Host/Disk cases cover
 snapshots, restore, fork, exchange, child sampling, preserved parent state and
-Host-backed Device-view retirement. TP2/PP2 media uses an 8 GiB capacity.
-Six Dense/Mova distributed CLI cases cover Resident/Host/Disk with both samplers,
-unfinished branch exchange, Hybrid reset and cumulative capture refusal under a
-64 GiB ceiling and 120-second deadline. Native tests use an explicit 64 MiB Rust
-test-thread stack and the build profiles in [validation](bounded-inference-validation.md).
-Default 2 MiB debug-stack execution is not established.
+Host-backed Device-view retirement. TP2/PP2 media uses an 8 GiB limit for the
+shared physical domain on the local unified-memory profile.
+The six-case Dense/Mova distributed CLI matrix exercises Resident/Host/Disk with
+both samplers, unfinished branch exchange, Hybrid reset and cumulative capture
+refusal. It uses a finite 16 TiB shared-domain allowance and a 240-second deadline.
+The allowance includes conservative native graph and control populations; it is
+not a measured memory requirement. Verified behavior and outstanding native cases
+are recorded in [physical memory validation](physical-memory-validation.md).
+Native tests use an explicit 64 MiB Rust test-thread stack. Default 2 MiB
+debug-stack execution is not established.
 
 [Released validation](prepared-chat-validation.md) separately covers the pinned
 text/image sensor request with Required and Auto. These scoped results do not

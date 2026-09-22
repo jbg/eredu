@@ -93,7 +93,6 @@ fn verify_native_partition_capture_fragments(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -152,6 +151,7 @@ fn verify_native_partition_capture_fragments(
                 phase: CapturePhase::Prefill,
                 prediction: 0,
                 forward_epoch: 11,
+                invocation_window: None,
             };
             let receipt_plan = PartitionCaptureReceiptPlan::new(
                 eredu_core::capture::SharedCapturePlan::new(plan.clone()),
@@ -930,7 +930,6 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -945,7 +944,9 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
             },
         )
         .unwrap();
-        let mut capture = eredu_runtime::capture::CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan));
+        let mut capture = eredu_runtime::capture::CaptureSession::new(
+            eredu_core::capture::SharedCapturePlan::new(plan),
+        );
         capture.begin_step(CapturePhase::Prefill, 0).unwrap();
         let tensor = MlxTensor::from_array(Array::from_slice(&logits, &[4]));
         let mut native = NativeCapture {
@@ -957,7 +958,10 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
             }),
         };
         capture.observe(&mut native, &path, &tensor).unwrap();
-        let step = capture.take_shared_step().map(|frame| frame.as_step().clone()).unwrap();
+        let step = capture
+            .take_shared_step()
+            .map(|frame| frame.as_step().clone())
+            .unwrap();
         let Some(CapturePayload::Candidates(result)) = &step.records[0].payload else {
             panic!()
         };

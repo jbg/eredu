@@ -26,8 +26,8 @@ pub(super) fn emit(
     if let Some(child) = parallel_lookup::embedding(operation)? {
         return emit(child, mechanisms, sink);
     }
-    use WorkspaceOperationKindView as K;
     use facts::mul;
+    use WorkspaceOperationKindView as K;
     if matches!(operation.kind, K::ParameterPlaceholder) {
         return basic::emit_parameter_placeholder_host(operation, sink).map(Some);
     }
@@ -56,7 +56,17 @@ pub(super) fn emit(
     if matches!(operation.kind, K::Sampling(_)) {
         return super::sampling::emit_host(operation, sink);
     }
+    if matches!(
+        operation.kind,
+        K::ParameterDecode(eredu_nn::parameter_values::ParameterDecoding {
+            format: LinearFormat::GgufIQuant { .. },
+            ..
+        })
+    ) {
+        return super::parameter_decode::gguf::emit_host(operation, sink);
+    }
     let (bytes, derivation) = match &operation.kind {
+        K::ParameterDecode(_) => (0, "standalone native dequantization borrows actual packed source and companions; CPU eager scalar/LUT arrays use native backing, with their constructor controls in the source recipe"),
         K::IndexedElementSelect | K::IndexedElementUpdate => (
             0,
             "sparse element workers borrow retained native I32 indices; the original producer separately pays host lowering and ingress",
@@ -64,6 +74,10 @@ pub(super) fn emit(
         K::IndexedRowAdd => (
             0,
             "ScatterAxis Sum reads retained native integer/update sources directly; host index construction belongs to its independently funded ingress",
+        ),
+        K::CommunicationControl(_) => (
+            0,
+            "descriptive model control event has no host numerical payload; its source table and actual agreement child retain separate funding",
         ),
         K::ValueCompletion | K::ValueRetention => (
             0,
@@ -105,19 +119,41 @@ pub(super) fn emit(
                 "Host payload and source registration belong to the exact accepted source bank; the native transfer workers create no additional host numerical staging vector",
             )
         }
-        K::Elementwise(_) if super::zero_fill::dtype(operation).is_some() =>
-            (0,"typed eager zero is copied directly; optional native Broadcast and Full have no Rust numerical payload vector"),
+        K::Elementwise(_) if super::host_array::dtype(operation).is_some()
+            || super::host_array::slice_dtype(operation).is_some() => (
+            0,
+            "one borrowed typed host slice is copied eagerly; its producer owns the source payload",
+        ),
+        K::Elementwise(_) if super::zero_fill::dtype(operation).is_some() => (
+            0,
+            "typed eager scalar is copied directly; optional native Broadcast and Full have no Rust numerical payload vector",
+        ),
         K::Elementwise("scalar_u8") => {
-            if !basic::is_scalar_u8(operation) { return Ok(None); }
-            (0, "one borrowed U8 scalar is copied directly; no Rust numerical payload vector")
+            if !basic::is_scalar_u8(operation) {
+                return Ok(None);
+            }
+            (
+                0,
+                "one borrowed U8 scalar is copied directly; no Rust numerical payload vector",
+            )
         }
         K::Elementwise("scalar_f32") => {
-            if !basic::is_scalar_f32(operation) { return Ok(None); }
-            (0, "one borrowed F32 scalar is copied directly; no Rust numerical payload vector")
+            if !basic::is_scalar_f32(operation) {
+                return Ok(None);
+            }
+            (
+                0,
+                "one borrowed F32 scalar is copied directly; no Rust numerical payload vector",
+            )
         }
         K::Elementwise("prepared_token_input") => {
-            if !basic::is_prepared_token_input(operation) { return Ok(None); }
-            (0, "prepared token payload belongs to the existing input producer; the model borrows its completed integer matrix")
+            if !basic::is_prepared_token_input(operation) {
+                return Ok(None);
+            }
+            (
+                0,
+                "prepared token payload belongs to the existing input producer; the model borrows its completed integer matrix",
+            )
         }
         K::Elementwise("masked_scatter") => (
             0,
@@ -128,8 +164,13 @@ pub(super) fn emit(
             "borrowed host input is copied directly into shared native storage; scalar fills and copies use the same allocator; the caller owns and separately prices the input payload",
         ),
         K::View(name) if super::byte_view::selected(name).is_some() => {
-            if super::byte_view::inspect(operation).is_none(){return Ok(None);}
-            (0,"byte reinterpretation uses shared storage or the same GPU general-copy worker; no numerical host vector")
+            if super::byte_view::inspect(operation).is_none() {
+                return Ok(None);
+            }
+            (
+                0,
+                "byte reinterpretation uses shared storage or the same GPU general-copy worker; no numerical host vector",
+            )
         }
         K::View("broadcast" | "squeeze" | "expand_dims" | "reshape")
         | K::Transpose(_)
@@ -198,11 +239,7 @@ pub(super) fn emit(
         ),
         K::Reduction("sum" | "sum_all" | "mean" | "min" | "max" | "softmax", ..)
         | K::Normalization(
-            "rms"
-            | "l2"
-            | "constructed_rms"
-            | "gated_group_rms_norm"
-            | "silu_gated_group_rms_norm",
+            "rms" | "l2" | "constructed_rms" | "gated_group_rms_norm" | "silu_gated_group_rms_norm",
             _,
         )
         | K::LayerNorm { .. }

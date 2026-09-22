@@ -1,15 +1,17 @@
 //! Complete facade workflow: cold discovery, bounded admission, ordinary sampling,
 //! attributed streaming, and cancellation. No native tensors or custom generation loop.
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use eredu::api::{
-    ChatSourceInput, LoadedModel, LocalDevice, ObservedGenerationEvent,
-    PreparedChatGenerationSettings, PreparedChatRequest, TokenizerSourceInput, TraceLimits,
-    inspect_architecture, local_device_plan,
+    inspect_architecture, local_device_plan, ChatSourceInput, LoadedModel, LocalDevice,
+    ObservedGenerationEvent, PreparedChatGenerationSettings, PreparedChatRequest,
+    TokenizerSourceInput, TraceLimits,
 };
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides,
-    ObservationSupportStatus, SessionCapabilities, capture::*,
+    capture::*, ExecutionPlan, GenerationCancellationToken, GenerationConfigOverrides,
+    ObservationSupportStatus, SessionCapabilities,
 };
 use std::ops::ControlFlow;
 
@@ -87,7 +89,6 @@ fn main() -> anyhow::Result<()> {
                 host_bytes: 32 * 1024 * 1024,
                 encoded_bytes: 2 * 1024 * 1024,
             },
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Skip,
         },
     };
@@ -109,7 +110,12 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .prepare_chat(
+            &source,
+            &policy,
+            &physical_memory::finite_each(CAPACITY)?,
+            &cancellation,
+        )?
         .ok_or_else(|| anyhow::anyhow!("cancelled before chat preparation"))?;
     let mut request = PreparedChatRequest::new(
         &chat,
@@ -120,7 +126,10 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             inference: eredu_core::TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(CAPACITY),
+                memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(CAPACITY),
+                )]),
                 ..Default::default()
             },
             seed: 42,

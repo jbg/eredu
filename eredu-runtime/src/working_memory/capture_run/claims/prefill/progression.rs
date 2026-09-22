@@ -1,4 +1,4 @@
-//! Closed host coupling. Private until architecture causal/readout activation.
+//! Progression for the architecture-bound capture and evidence targets.
 use super::*;
 use crate::capture::{
     CapturePrefillHookDecision, CapturePrefillObservationPolicy, CapturePrefillProgressError,
@@ -12,41 +12,68 @@ impl<'a> CaptureStepClaim<'a> {
         self,
         inference: InferenceGeometry,
     ) -> Result<ScheduledCaptureStep<'a>, CaptureRunHostError> {
-        // This private call provides no architecture semantics. Its future
-        // closed caller must carry the bound causal/readout companion.
-        let mut step=self.prepare_prefill(inference)?;
+        // The closed observer carries the bound causal/readout companion;
+        // preparing host targets alone grants no architecture semantics.
+        let mut step = self.prepare_prefill(inference)?;
         step.initialize_prefill_progression()?;
+        step.prepare_prefill_intervention_evidence(inference)?;
         Ok(step)
     }
 }
 impl ScheduledCaptureStep<'_> {
-    fn initialize_prefill_progression(&mut self)->Result<(),CaptureRunHostError> {
-        let inference=self.frame.prefill.as_ref().ok_or(CapturePrefillHostError::Identity)?.inference;
-        let policy=CapturePrefillObservationPolicy::new(self.claim.source,inference).map_err(progress_error)?;
-        for (index,slot) in self.frame.prefill.as_mut().expect("validated target source").slots.iter_mut().enumerate() {
-            if slot.progression.is_some(){return Err(CapturePrefillHostError::Identity.into());}
-            slot.progression=Some(policy.row(index).map_err(progress_error)?.initial_progress());
+    fn initialize_prefill_progression(&mut self) -> Result<(), CaptureRunHostError> {
+        let inference = self
+            .frame
+            .prefill
+            .as_ref()
+            .ok_or(CapturePrefillHostError::Identity)?
+            .inference;
+        let policy = CapturePrefillObservationPolicy::new(self.claim.source, inference)
+            .map_err(progress_error)?;
+        for (index, slot) in self
+            .frame
+            .prefill
+            .as_mut()
+            .expect("validated target source")
+            .slots
+            .iter_mut()
+            .enumerate()
+        {
+            if slot.progression.is_some() {
+                return Err(CapturePrefillHostError::Identity.into());
+            }
+            slot.progression = Some(
+                policy
+                    .row(index)
+                    .map_err(progress_error)?
+                    .initial_progress(),
+            );
         }
         self.claim.custody.validate()?;
         Ok(())
     }
     /// The already allocated original companion gains the same finite target
     /// headers. Repeated epochs retain its progressed state and allocate nothing.
-    pub(crate) fn prepare_existing_prefill_with_progression(&mut self,inference:InferenceGeometry)->Result<(),CaptureRunHostError> {
+    pub(crate) fn prepare_existing_prefill_with_progression(
+        &mut self,
+        inference: InferenceGeometry,
+    ) -> Result<(), CaptureRunHostError> {
         self.claim.custody.validate()?;
-        if let Some(actual)=self.frame.prefill.as_ref() {
-            if actual.inference!=inference || actual.slots.iter().any(|slot|slot.progression.is_none()) {
+        if let Some(actual) = self.frame.prefill.as_ref() {
+            if actual.inference != inference
+                || actual.slots.iter().any(|slot| slot.progression.is_none())
+            {
                 return Err(CapturePrefillHostError::Identity.into());
             }
             return Ok(());
         }
-        let captures=self.claim.validate_prefill_source(inference)?;
-        self.initialize_prefill_targets(inference,captures)?;
+        let captures = self.claim.validate_prefill_source(inference)?;
+        self.initialize_prefill_targets(inference, captures)?;
         self.initialize_prefill_progression()
     }
     /// Actual already initialized ordinary schedule; no inferred chunk geometry.
-    pub(crate) fn prefill_geometry(&self)->Option<InferenceGeometry> {
-        self.frame.prefill.as_ref().map(|targets|targets.inference)
+    pub(crate) fn prefill_geometry(&self) -> Option<InferenceGeometry> {
+        self.frame.prefill.as_ref().map(|targets| targets.inference)
     }
     pub(crate) fn begin_prefill_hook(
         &mut self,
@@ -72,16 +99,27 @@ impl ScheduledCaptureStep<'_> {
             .map_err(progress_error)
     }
     pub(crate) fn begin_routed_prefill_batch(
-        &mut self, index: usize, chunk: &PrefillChunk, path: &str,
+        &mut self,
+        index: usize,
+        chunk: &PrefillChunk,
+        path: &str,
     ) -> Result<CapturePrefillHookDecision, CaptureRunHostError> {
         self.claim.custody.validate()?;
-        let targets = self.frame.prefill.as_mut().ok_or(CapturePrefillHostError::Identity)?;
+        let targets = self
+            .frame
+            .prefill
+            .as_mut()
+            .ok_or(CapturePrefillHostError::Identity)?;
         let policy = CapturePrefillObservationPolicy::new(self.claim.source, targets.inference)
             .map_err(progress_error)?;
         let row = policy.row(index).map_err(progress_error)?;
-        let progress = targets.slots.get_mut(index).and_then(|slot| slot.progression.as_mut())
+        let progress = targets
+            .slots
+            .get_mut(index)
+            .and_then(|slot| slot.progression.as_mut())
             .ok_or(CapturePrefillHostError::Identity)?;
-        row.begin_routed_batch(progress, chunk, path).map_err(progress_error)
+        row.begin_routed_batch(progress, chunk, path)
+            .map_err(progress_error)
     }
     /// The same supplied full usage reaches the existing ledger and frame once.
     /// No scalar here affects the original physical H/native reservation.

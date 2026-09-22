@@ -1,8 +1,6 @@
 //! Cold source and geometry preflight and final output allocation before conversion.
 use super::layout::{output_layouts, OutputLayout, OutputShard};
-use super::preflight::{
-    checked_product, preflight_source_collisions, quantization_error,
-};
+use super::preflight::{checked_product, preflight_source_collisions, quantization_error};
 use super::workspace::QuantizerWorkspace;
 use super::*;
 
@@ -228,7 +226,7 @@ impl ColdQuantization {
     /// Plan/overlay metadata and native conversion work remain separately funded.
     pub(crate) fn allocate_original(
         self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         metadata_policy: eredu_runtime::working_memory::DependencyMemoryPolicy,
         stream: &Stream,
     ) -> Result<PreparedQuantization, Error> {

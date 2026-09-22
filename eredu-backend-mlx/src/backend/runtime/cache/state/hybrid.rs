@@ -3,6 +3,7 @@
 use super::*;
 
 mod fixed_slots;
+mod prompt_cache;
 mod resident_grouped_copy;
 pub(crate) use resident_grouped_copy::{
     InitializedHybridDenseGroup, InitializedHybridGroupCopy, PreparedDenseHybridGroupedState,
@@ -180,6 +181,22 @@ impl MlxHybridLayerState {
         })
     }
 
+    fn checkpoint_with_host_source(
+        &self,
+        loan: &super::ordinary_checkpoint::Loan,
+    ) -> Result<Self, Exception> {
+        let attention = self
+            .attention
+            .as_ref()
+            .map(MlxHybridAttentionState::deep_clone_state)
+            .transpose()?;
+        let fixed = self.fixed.checkpoint_with_host_source(loan)?;
+        Ok(Self {
+            attention,
+            fixed,
+            fixed_offset: self.fixed_offset,
+        })
+    }
     fn deep_clone_state(&self) -> Result<Self, Exception> {
         let attention = self
             .attention
@@ -686,30 +703,37 @@ impl MlxHybridState {
     }
 
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
-        self.layers
-            .slots()
-            .iter()
-            .try_fold(0, |bound, layer| match &layer.attention {
-                None
-                | Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Stateless)) => {
-                    Some(bound)
-                }
-                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))) => {
-                    Some(bound.max(cache.continuation_capacity_bound(additional)?))
-                }
-                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => {
-                    Some(
-                        bound.max(
-                            u64::try_from(KeyValueCache::offset(cache))
-                                .ok()?
-                                .checked_add(additional)?,
-                        ),
-                    )
-                }
-                Some(MlxHybridAttentionState::Compressed(cache)) => {
-                    Some(bound.max(cache.continuation_capacity_bound(additional)?))
-                }
-            })
+        Self::layer_capacity_bound(
+            self.layers
+                .slots()
+                .iter()
+                .map(|layer| layer.attention.as_ref()),
+            additional,
+        )
+    }
+
+    pub(in crate::backend::runtime::cache::state) fn layer_capacity_bound<'a>(
+        mut layers: impl Iterator<Item = Option<&'a MlxHybridAttentionState>>,
+        additional: u64,
+    ) -> Option<u64> {
+        layers.try_fold(0, |bound, attention| match attention {
+            None | Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Stateless)) => {
+                Some(bound)
+            }
+            Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))) => {
+                Some(bound.max(cache.continuation_capacity_bound(additional)?))
+            }
+            Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => Some(
+                bound.max(
+                    u64::try_from(KeyValueCache::offset(cache))
+                        .ok()?
+                        .checked_add(additional)?,
+                ),
+            ),
+            Some(MlxHybridAttentionState::Compressed(cache)) => {
+                Some(bound.max(cache.continuation_capacity_bound(additional)?))
+            }
+        })
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
@@ -751,14 +775,22 @@ impl MlxHybridState {
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
-        let paged = self
-            .layers
-            .slots()
-            .iter()
-            .filter(|layer| {
-                layer
-                    .attention
-                    .as_ref()
+        Self::layer_auxiliary_growth(
+            self.layers
+                .slots()
+                .iter()
+                .map(|layer| layer.attention.as_ref()),
+            additional,
+        )
+    }
+
+    pub(in crate::backend::runtime::cache::state) fn layer_auxiliary_growth<'a>(
+        layers: impl Iterator<Item = Option<&'a MlxHybridAttentionState>>,
+        additional: u64,
+    ) -> Option<u64> {
+        let paged = layers
+            .filter(|attention| {
+                attention
                     .and_then(MlxHybridAttentionState::manager)
                     .is_some()
             })
@@ -1101,7 +1133,54 @@ impl MlxHybridState {
     ///
     /// Mutable device arrays are copied. Paged forks share only immutable
     /// sealed blocks and the architecture-independent residency manager.
+    pub(crate) fn ordinary_checkpoint_program(
+        &self,
+        plan: &eredu_runtime::working_memory::InferenceSpanWorkspacePlan,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram,
+        crate::backend::error::Error,
+    > {
+        let mut nested = context
+            .metadata_vec(self.layers.len())
+            .map_err(|e| crate::backend::error::Error::Neural(e.into()))?;
+        for layer in self.layers.slots() {
+            nested.push((
+                layer.fixed.metadata(),
+                layer.fixed.checkpoint_host_bytes().ok_or(
+                    crate::backend::error::Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+                    ),
+                )?,
+            ));
+        }
+        crate::backend::runtime::cache::state::ordinary_checkpoint::OrdinaryCheckpointProgram::prepare(&self.layout, self.layers.metadata(), self.layers.slots(), nested.iter().copied(),
+            &self.inference_retention, plan, context)
+    }
+
+    /// Captures the actual checkpoint fields with their retained state sources.
     pub fn deep_clone_state(&self) -> Result<Self, Exception> {
+        if let Some(loan) = super::ordinary_checkpoint::begin(
+            &self.layout,
+            self.layers.metadata(),
+            self.layers
+                .slots()
+                .iter()
+                .map(|layer| layer.fixed.metadata()),
+            &self.inference_retention,
+        )? {
+            let layers = loan.table(self.layers.slots(), |layer| {
+                layer.checkpoint_with_host_source(&loan)
+            })?;
+            let inference_retention = loan.retention(&self.inference_retention)?;
+            return Ok(Self {
+                layout: self.layout.clone(),
+                global_layer_start: self.global_layer_start,
+                layers,
+                inference_retention,
+                manager: self.manager.clone(),
+            });
+        }
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
@@ -1396,6 +1475,7 @@ impl MlxHybridState {
     }
 
     /// Finalizes paged attention and persists every declared fixed component.
+    #[cfg(test)]
     pub fn save_prompt_cache(
         &mut self,
         destination: impl AsRef<Path>,

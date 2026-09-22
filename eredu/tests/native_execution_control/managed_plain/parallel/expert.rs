@@ -1,12 +1,15 @@
 //! Full public expert parallel dispatch/return through the existing text driver.
 use super::*;
 
-pub(super) fn positive_settings()->PreparedChatGenerationSettings {
-    let mut value=settings(0.0);
+pub(super) fn positive_settings() -> PreparedChatGenerationSettings {
+    let mut value = settings(0.0);
     // Recorded rank-local live owners + next admission require 10.64 GB for
     // TP/EP and 10.42 GB for saved EP. The positive path has a 16 GiB total;
     // exact low-capacity refusals remain in the shared lifecycle driver.
-    value.inference.managed_memory_capacity_bytes=Some(16*1024*1024*1024);
+    value.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+        "host".into(),
+        eredu_core::MemoryLimit::Finite(16 * 1024 * 1024 * 1024),
+    )]);
     value
 }
 
@@ -16,7 +19,11 @@ fn run_topology(mode: &str, tensor: usize, pipeline: usize) -> serde_json::Value
         eredu_core::ParallelTopology::new(tensor, pipeline, 2, 1).unwrap(),
         None,
         crate::routed_components::routed_fixture,
-        if tensor>1||pipeline>1 {positive_settings()}else{settings(0.0)},
+        if tensor > 1 || pipeline > 1 {
+            positive_settings()
+        } else {
+            settings(0.0)
+        },
     )
 }
 

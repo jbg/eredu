@@ -4,15 +4,18 @@ use crate::backend::runtime::residency::storage::filled_host;
 use eredu_nn::workspace::WorkspaceMetadataError;
 use eredu_runtime::working_memory::WorkingMemoryError;
 use eredu_runtime::{
-    cache::{CacheShardLayout, LiveCacheReadFailure, PreparedCacheIoTask, PreparedLiveCacheRead},
+    cache::{CacheShardLayout, PreparedCacheIoTask},
     working_memory::{
         HostSourceConstructionFacts, OriginalHostSourceBank, OriginalHostSourceCustody,
     },
 };
 use safemlx::{PreparedHostTransferPlan, PreparedInputRuntime};
 
+#[path = "disk_read/filling.rs"]
+mod filling;
 #[path = "disk_read/output.rs"]
 mod output;
+use filling::Filling;
 pub(crate) use output::{CompletedDiskRead, DiskReadFinishFailure};
 #[path = "disk_read/destination.rs"]
 mod destination;
@@ -36,19 +39,22 @@ pub(crate) struct PreparedDiskRead {
     worker: Arc<DiskWorker>,
 }
 struct ReadBody {
-    filling: [Option<filled_host::Pending>; 2],
+    filling: [Option<Filling>; 2],
     ready: [Option<Arc<ImmutableHostTransferBuffer>>; 2],
     host: Option<HostCacheBlock>,
     bytes: Vec<u8>,
-    read: Option<PreparedLiveCacheRead>,
+    read: Option<PreparedCacheFileRead>,
     location: DiskLocation,
     layout: CacheShardLayout,
-    source: LiveCacheBlockSource,
+    source: CacheFileSource,
     shapes: [[i32; 4]; 2],
     dtypes: [Dtype; 2],
     capacities: [usize; 2],
     source_bytes: u64,
     source_custody: Option<OriginalHostSourceCustody>,
+    // Only the ordinary constructor can retain its authentic cold source here.
+    ordinary_identity: Option<Arc<()>>,
+    ordinary_placements: Option<[safemlx::AllocationPlacement; 2]>,
     manager: CacheResidencyManager,
     id: CacheBlockId,
     generation: u64,
@@ -61,7 +67,7 @@ struct ReadBody {
 /// Actual physical Host reservation shared by source arenas, task and pending row.
 #[derive(Clone)]
 pub(crate) struct DiskReadOccupancy {
-    inner: Arc<Mutex<CachePoolReservation>>,
+    inner: Arc<Mutex<Option<CachePoolReservation>>>,
     host_bytes: u64,
     funding: HostMetadataFunding,
 }
@@ -118,7 +124,7 @@ pub(crate) enum DiskReadFailure {
     #[error(transparent)]
     Open(std::io::Error),
     #[error(transparent)]
-    Read(LiveCacheReadFailure),
+    Read(CacheFileReadFailure),
     #[error(transparent)]
     Shard(eredu_runtime::cache::CacheShardError),
 }
@@ -130,8 +136,7 @@ impl std::fmt::Debug for PreparedDiskReadOutput {
     }
 }
 impl CacheBlockSourceLoan<'_> {
-    /// Selects the actual stable own-writer file and its retained schema/version.
-    /// Persistent external shards still need their distinct parser/source producer.
+    /// Selects the authenticated retained file and its exact schema/version.
     /// All dynamic preparation precedes the final canonical source pin.
     pub(crate) fn prepare_disk_read(
         &mut self,
@@ -148,10 +153,10 @@ impl CacheBlockSourceLoan<'_> {
             .disk()
             .ok_or_else(|| fail(CacheSourceError::PromotionRequired))?;
         let source = disk
-            .live_file()
+            .file_source()
             .ok_or_else(|| fail(CacheSourceError::PromotionRequired))?;
         let layout = source
-            .writer_layout()
+            .layout()
             .ok_or_else(|| fail(CacheSourceError::PromotionRequired))?
             .clone();
         let destination = destination::prepare(self, id, &layout, runtime, 2, context)?;
@@ -161,6 +166,9 @@ impl CacheBlockSourceLoan<'_> {
 }
 impl PreparedDiskReadSource {
     pub(crate) fn source_facts(&self) -> Result<HostSourceConstructionFacts, WorkingMemoryError> {
+        if self.task.body.ordinary_identity.is_some() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         HostSourceConstructionFacts::new(self.task.body.source_bytes, 2, 0)
     }
     /// Caller-thread allocation/binding only. Failure retains every actual
@@ -173,6 +181,9 @@ impl PreparedDiskReadSource {
     ) -> Result<PreparedDiskRead, DiskReadFinishFailure> {
         let result = (|| {
             let body = &mut self.task.body;
+            if body.ordinary_identity.is_some() {
+                return Err(output::FinishCause::Identity);
+            }
             destination::begin_filling(
                 destination::Initialization {
                     filling: &mut body.filling,
@@ -202,7 +213,7 @@ impl PreparedDiskReadSource {
     pub(crate) fn open(mut self) -> Result<PreparedDiskRead, DiskReadFinishFailure> {
         let result = (|| {
             let body = &mut self.task.body;
-            if body.source_custody.is_none()
+            if (body.source_custody.is_some() == body.ordinary_identity.is_some())
                 || body.filling.iter().any(Option::is_none)
                 || body.read.is_some()
             {
@@ -252,13 +263,12 @@ impl PreparedDiskRead {
     }
     pub(crate) fn run(mut self) -> PreparedDiskReadOutput {
         let result = self.body.read_payload();
+        let body = Mutex::new(Some(self.body));
+        drop(body.lock().expect("new unshared read-body mutex"));
         if self
             .output
             .inner
-            .set(ReadCompletion {
-                result,
-                body: Mutex::new(Some(self.body)),
-            })
+            .set(ReadCompletion { result, body })
             .is_err()
         {
             unreachable!("one prepared disk read completion");
@@ -269,10 +279,12 @@ impl PreparedDiskRead {
         let frames = [
             size_of::<Self>(),
             size_of::<DiskReadOccupancy>(),
-            WorkspaceContext::metadata_arc_bytes::<Mutex<CachePoolReservation>>()?,
+            WorkspaceContext::metadata_arc_bytes::<Mutex<Option<CachePoolReservation>>>()?,
+            initialized_mutex_control_bytes::<Option<CachePoolReservation>>()?,
             size_of::<PreparedDiskReadSource>(),
             size_of::<ReadBody>(),
             size_of::<ReadCompletion>(),
+            initialized_mutex_control_bytes::<Option<ReadBody>>()?,
             size_of::<PreparedDiskReadOutput>(),
             size_of::<DiskReadFailure>(),
             size_of::<DiskReadFinishFailure>(),
@@ -317,6 +329,7 @@ impl PreparedDiskRead {
                 Arc<DiskWorker>,
             )>(),
             size_of::<(&mut ReadBody, [usize; 2], [&mut [u8]; 2])>(),
+            size_of::<(&mut Filling, &mut [u8])>().checked_mul(2)?,
             WorkspaceContext::metadata_arc_bytes::<OnceLock<ReadCompletion>>()?,
             WorkspaceContext::metadata_arc_bytes::<ImmutableHostTransferBuffer>()?
                 .checked_mul(2)?,
@@ -344,7 +357,7 @@ impl ReadBody {
             let destination = self.filling[index]
                 .as_mut()
                 .ok_or(DiskReadFailure::Source)?;
-            if destination.completed_mut().bytes_mut().len() != tensor.data().len() {
+            if destination.bytes_mut().len() != tensor.data().len() {
                 return Err(DiskReadFailure::Source);
             }
         }
@@ -352,7 +365,6 @@ impl ReadBody {
             self.filling[index]
                 .as_mut()
                 .expect("validated destination")
-                .completed_mut()
                 .bytes_mut()
                 .copy_from_slice(tensor.data());
         }
@@ -365,3 +377,5 @@ mod operation;
 pub(super) use operation::ReadCacheHostSource;
 pub(super) use operation::prepare_operation;
 pub(crate) use operation::{DiskReadOperation, DiskReadOperationFailure};
+
+pub(crate) use operation::{OrdinaryDiskReadSource, OrdinaryReadCacheHostSource};

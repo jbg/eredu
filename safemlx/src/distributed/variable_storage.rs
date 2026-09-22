@@ -82,6 +82,18 @@ impl Group {
     }
 }
 impl GroupCpuVariableEnvelope<'_> {
+    /// Ordinary counts, constructor, CPU worker and completion allowance for
+    /// the same finite row envelope. No matrix or execution role is invented.
+    pub fn ordinary_controls(&self) -> Option<super::OrdinaryGroupControls> {
+        let p = self.completion.traversal.limits;
+        super::ordinary::leaf(&self.constructor, &self.evaluation)?
+            .with_variable_call(self.group.size())?
+            .completion(crate::OperationEvalTraversalLimits {
+                roots: p.root_count, arrays: p.array_nodes, tape_entries: p.tape_entries,
+                input_edges: p.input_edges, output_slots: p.output_slots,
+                streams: p.stream_count, captures: p.capture_slots,
+            })
+    }
     /// Identity of the actual selected group wrapper, never equal metadata.
     pub fn is_for_group(&self,group:&Group)->bool {std::ptr::eq(self.group,group)}
     /// Global send shape, receiver row cap, and native scalar type.

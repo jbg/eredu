@@ -9,7 +9,10 @@ pub(crate) struct PendingNativePublication {
     // Physical/source owners precede duplicate keys and every unattached charge.
     // Work's recovery retains this entire value after any terminal refusal.
     inventory: Option<RetainedStorage>,
-    entries: Vec<(StorageIdentity, u64)>,
+    entries: Vec<(
+        StorageIdentity,
+        eredu_runtime::working_memory::StorageAllocation,
+    )>,
     original: Option<UnquotedOriginalSlotSources>,
     attempt: Option<OriginalNativePublication<MlxNativeStorage>>,
 }
@@ -19,7 +22,12 @@ impl PendingNativePublication {
     pub(crate) fn control_bytes(rows: usize) -> Option<u64> {
         use std::{alloc::Layout, mem::size_of};
         let keys = eredu_runtime::HostMetadataKey::maximum_clone_storage_bytes()?;
-        let entries = Layout::array::<(StorageIdentity, u64)>(rows).ok()?.size();
+        let entries = Layout::array::<(
+            StorageIdentity,
+            eredu_runtime::working_memory::StorageAllocation,
+        )>(rows)
+        .ok()?
+        .size();
         // Infer the actual borrowed iterator representation without constructing
         // an inventory, cloning a source, or invoking the iterator factory.
         fn iterator_bytes<T>(_: impl FnOnce(&'static RetainedStorage) -> T) -> usize {
@@ -27,13 +35,31 @@ impl PendingNativePublication {
         }
         let fixed = [
             entries,
+            Layout::array::<(StorageIdentity, u64)>(rows).ok()?.size(),
             iterator_bytes(borrowed_native_roots),
             size_of::<NativeStorageRoot<'static>>(),
             size_of::<&RetainedStorage>(),
             size_of::<Self>(),
             size_of::<Result<RetainedStoragePublication, Error>>(),
-            size_of::<(Vec<(StorageIdentity, u64)>, UnquotedOriginalSlotSources)>(),
-            size_of::<Result<(Vec<(StorageIdentity, u64)>, UnquotedOriginalSlotSources), Error>>(),
+            size_of::<(
+                Vec<(
+                    StorageIdentity,
+                    eredu_runtime::working_memory::StorageAllocation,
+                )>,
+                UnquotedOriginalSlotSources,
+            )>(),
+            size_of::<
+                Result<
+                    (
+                        Vec<(
+                            StorageIdentity,
+                            eredu_runtime::working_memory::StorageAllocation,
+                        )>,
+                        UnquotedOriginalSlotSources,
+                    ),
+                    Error,
+                >,
+            >(),
             size_of::<std::collections::TryReserveError>(),
             size_of::<StorageIdentity>(),
             size_of::<UnquotedOriginalSlotSources>(),
@@ -119,7 +145,9 @@ impl PendingNativePublication {
         let attempt = self.attempt.as_mut().expect("claimed exact scope");
         attempt
             .publish(scope, roots, &self.entries)
-            .map_err(|cause| retained_failure_at(cause, controls.clone(), false, attempt.failure_site()))?;
+            .map_err(|cause| {
+                retained_failure_at(cause, controls.clone(), false, attempt.failure_site())
+            })?;
         // The prepared registry remains the failure owner while each source
         // receives an independent clone. No map, key clone or result buffer is
         // allocated here, and a later attachment error keeps every original row.
@@ -132,7 +160,7 @@ impl PendingNativePublication {
             },
             self.original.as_ref().expect("validated source inventory"),
             fixed,
-            scope.pool().shared_storage_domain(),
+            scope.pool().shared_storage_accounting_id(),
             false,
             false,
         )?;
@@ -143,20 +171,24 @@ impl PendingNativePublication {
         Ok(inventory.finish_publication(
             || registrations,
             self.original.take().expect("source owner"),
-            scope.pool().shared_storage_domain(),
+            scope.pool().shared_storage_accounting_id(),
         ))
     }
 }
 
-
 pub(super) fn borrowed_native_roots(
     inventory: &RetainedStorage,
 ) -> impl Iterator<Item = NativeStorageRoot<'_>> {
-    inventory.array_entries()
+    inventory
+        .array_entries()
         .filter(|(identity, _)| inventory.host_entry(identity).is_none())
         .map(|(_, (_, array))| match array.canonical() {
             Some(cell) => NativeStorageRoot::CanonicalArray(cell),
             None => NativeStorageRoot::Array(array),
         })
-        .chain(inventory.host_entries().map(|(_, (_, host))| NativeStorageRoot::Host(host, host.attachment_receipt())))
+        .chain(
+            inventory
+                .host_entries()
+                .map(|(_, (_, host))| NativeStorageRoot::Host(host, host.attachment_receipt())),
+        )
 }

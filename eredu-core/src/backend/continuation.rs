@@ -20,8 +20,12 @@ impl Eq for TextContinuationIdentity {}
 #[derive(Clone, PartialEq, Eq)]
 pub struct TextDriverIdentity(TextRunIdentity);
 impl TextDriverIdentity {
-    fn validate(&self) -> Result<(), BackendFailure> { self.0.validate() }
-    pub(super) fn for_branch(identity: &TextRunIdentity) -> Self { Self(identity.clone()) }
+    fn validate(&self) -> Result<(), BackendFailure> {
+        self.0.validate()
+    }
+    pub(super) fn for_branch(identity: &TextRunIdentity) -> Self {
+        Self(identity.clone())
+    }
 }
 
 /// Failure to advance or settle a detached ordinary continuation.
@@ -175,19 +179,33 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
 
     /// Agrees delivery using this continuation's exact retained readiness source.
     /// Validation failure preserves the original local error when one exists.
-    pub fn finish_text_preparation_cancellable<C:TokenFilterController,T,E>(
-        &self,state:&TextGenerationContinuation<B,C>,
-        stage:crate::run_preparation::TextPreparationStage,local:Result<Option<T>,E>,
-        map_backend:impl FnOnce(BackendFailure)->E,
-    )->Result<Option<T>,E> {
-        let valid=if self.owner != state.owner || state.failed {
+    pub fn finish_text_preparation_cancellable<C: TokenFilterController, T, E>(
+        &self,
+        state: &TextGenerationContinuation<B, C>,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<Option<T>, E> {
+        let valid = if self.owner != state.owner || state.failed {
             Err(PreparedRequestRejection::RequestMismatch.into_backend_failure())
-        } else {state.inner.step_context.validate()};
-        if let Err(error)=valid {
-            return match local {Err(local)=>Err(local),Ok(value)=>{drop(value);Err(map_backend(error))}};
+        } else {
+            state.inner.step_context.validate()
+        };
+        if let Err(error) = valid {
+            return match local {
+                Err(local) => Err(local),
+                Ok(value) => {
+                    drop(value);
+                    Err(map_backend(error))
+                }
+            };
         }
-        self.runtime.finish_text_preparation_control_cancellable(state.inner.preparation_control.as_ref(),
-            stage,local,map_backend)
+        self.runtime.finish_text_preparation_control_cancellable(
+            state.inner.preparation_control.as_ref(),
+            stage,
+            local,
+            map_backend,
+        )
     }
 
     /// Starts the existing ordinary machine with an opaque prepared prompt.
@@ -210,7 +228,9 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         controller: C,
     ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
     {
-        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
+        self.owner
+            .validate()
+            .map_err(ControlledTextGenerationError::Preparation)?;
         let inner = TextGenerationMachine::new(self.runtime, input, config, controller)?;
         Ok(TextGenerationContinuation {
             owner: self.owner.clone(),
@@ -249,7 +269,9 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         options: TextPreparationOptions,
     ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
     {
-        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
+        self.owner
+            .validate()
+            .map_err(ControlledTextGenerationError::Preparation)?;
         // Obtain the validated fresh run before exposing its continuation identity.
         let inner = TextGenerationMachine::new_preparation(
             self.runtime,
@@ -279,7 +301,9 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         sequence: GenerationSequenceRequest<'_>,
     ) -> Result<TextGenerationContinuation<B, C>, ControlledTextGenerationError<B::Error, C::Error>>
     {
-        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
+        self.owner
+            .validate()
+            .map_err(ControlledTextGenerationError::Preparation)?;
         let inner = TextGenerationMachine::new_preparation_with_sequence(
             self.runtime,
             input,
@@ -332,7 +356,9 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     where
         B: TextResumeBackend,
     {
-        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
+        self.owner
+            .validate()
+            .map_err(ControlledTextGenerationError::Preparation)?;
         let inner = TextGenerationMachine::from_resume(
             self.runtime,
             saved,
@@ -354,7 +380,9 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         &self,
         state: &TextGenerationContinuation<B, C>,
     ) -> Result<(), TextContinuationError<B::Error, C::Error>> {
-        self.owner.validate().map_err(ControlledTextGenerationError::Preparation)?;
+        self.owner
+            .validate()
+            .map_err(ControlledTextGenerationError::Preparation)?;
         if self.owner != state.owner {
             return Err(TextContinuationError::IncompatibleDriver);
         }
@@ -432,10 +460,8 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     pub fn take_completed_delivery<C: TokenFilterController>(
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,
-    ) -> Result<
-        Option<crate::capture::SharedCapturedStep>,
-        TextContinuationError<B::Error, C::Error>,
-    > {
+    ) -> Result<Option<crate::capture::SharedCapturedStep>, TextContinuationError<B::Error, C::Error>>
+    {
         self.validate(state)?;
         let was_failed = state.failed;
         state.failed = true;
@@ -481,7 +507,8 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             // Failed backend setup can still leave a changed instrumentation state.
             B::configure_text_capture(self.runtime, &mut state.inner.backend_state, plan)
         };
-        self.runtime.finish_text_preparation_control(state.inner.preparation_control.as_ref(),
+        self.runtime.finish_text_preparation_control(
+            state.inner.preparation_control.as_ref(),
             crate::run_preparation::TextPreparationStage::Instrumentation,
             local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
             crate::run_preparation::TextCaptureSetupError::Preparation,
@@ -514,7 +541,8 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             .step_context
             .validate()
             .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
-        self.runtime.finish_text_preparation_control(state.inner.preparation_control.as_ref(),
+        self.runtime.finish_text_preparation_control(
+            state.inner.preparation_control.as_ref(),
             crate::run_preparation::TextPreparationStage::Instrumentation,
             local,
             crate::run_preparation::TextCaptureSetupError::Preparation,
@@ -549,7 +577,8 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
                 plan,
             )
         };
-        self.runtime.finish_text_preparation_control(state.inner.preparation_control.as_ref(),
+        self.runtime.finish_text_preparation_control(
+            state.inner.preparation_control.as_ref(),
             crate::run_preparation::TextPreparationStage::Instrumentation,
             local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
             crate::run_preparation::TextCaptureSetupError::Preparation,
@@ -635,7 +664,9 @@ impl<B: TextGenerationBackend, C: TokenFilterController> ControlledTextGeneratio
     pub fn snapshot_source(
         &mut self,
     ) -> Result<TextSnapshotSource<'_, B, C>, TextContinuationError<B::Error, C::Error>> {
-        if self.inner.branch_fenced { return Err(TextContinuationError::Failed) }
+        if self.inner.branch_fenced {
+            return Err(TextContinuationError::Failed);
+        }
         self.inner
             .step_context
             .validate()
@@ -817,7 +848,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
                 controller,
                 step: pending,
                 completions: Vec::new(),
-                    remaining_tokens,
+                remaining_tokens,
                 branch_owner: self.state.inner.branch_owner.clone(),
                 branch_fenced: false,
                 step_context,
@@ -855,7 +886,7 @@ impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'
 
     /// Estimates installed or saved native state at a completed continuation
     /// boundary. Portable composition adds all host-state estimates and reserves
-    /// resources before calling either copying operation below.
+    /// resources through the complete prepared continuation-copy producer.
     pub fn estimate_native_state<C: TokenFilterController>(
         &self,
         state: &TextGenerationContinuation<B, C>,
@@ -866,29 +897,6 @@ impl<B: crate::execution_control::NativeTextStateBackend> TextGenerationDriver<'
     > {
         self.validate_boundary(state)?;
         B::estimate_native_text_state(self.runtime, saved)
-            .map_err(|error| ControlledTextGenerationError::Backend(error).into())
-    }
-
-    /// Copies the installed model state through its existing completion owner.
-    /// Caller must first reserve the complete snapshot's resource estimate.
-    pub fn capture_native_state<C: TokenFilterController>(
-        &mut self,
-        state: &TextGenerationContinuation<B, C>,
-    ) -> Result<B::NativeTextState, TextContinuationError<B::Error, C::Error>> {
-        self.validate_boundary(state)?;
-        B::capture_native_text_state(self.runtime)
-            .map_err(|error| ControlledTextGenerationError::Backend(error).into())
-    }
-
-    /// Independently copies a compatible saved slot after resource reservation.
-    /// The currently installed continuation remains unchanged.
-    pub fn copy_native_state<C: TokenFilterController>(
-        &mut self,
-        state: &TextGenerationContinuation<B, C>,
-        saved: &B::NativeTextState,
-    ) -> Result<B::NativeTextState, TextContinuationError<B::Error, C::Error>> {
-        self.validate_boundary(state)?;
-        B::copy_native_text_state(self.runtime, saved)
             .map_err(|error| ControlledTextGenerationError::Backend(error).into())
     }
 
@@ -922,10 +930,13 @@ impl<B: crate::execution_control::NativeTextStateBackend, C: TokenFilterControll
             return Err(TextContinuationError::IncompatibleDriver);
         }
         other.require_quiescent()?;
-        B::exchange_text_branch(self.runtime,
+        B::exchange_text_branch(
+            self.runtime,
             TextBranchSource::from_machine(&mut self.state.inner),
-            TextBranchSource::from_machine(&mut other.inner), native)
-            .map_err(ControlledTextGenerationError::Backend)?;
+            TextBranchSource::from_machine(&mut other.inner),
+            native,
+        )
+        .map_err(ControlledTextGenerationError::Backend)?;
         std::mem::swap(self.state, other);
         Ok(())
     }

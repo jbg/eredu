@@ -2,7 +2,9 @@
 use super::*;
 use crate::working_memory::OriginalHostSourceCustody;
 mod program;
-pub use program::{HostSourceConstructionProgram,OriginalHostSourceProgramBanks,OriginalHostSourceProgramError};
+pub use program::{
+    HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError,
+};
 
 /// Disjoint cumulative source storage. Describes a request, never an allowance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +33,14 @@ impl HostSourceConstructionFacts {
                 >())
             })
             .and_then(|n| n.checked_add(size_of::<HostDestinationCause>()))
+            .and_then(|n| {
+                n.checked_add(size_of::<(
+                    &OriginalHostSourceCustody,
+                    super::OriginalHostMetadataCustody,
+                    &OriginalTextControlGuard,
+                    crate::working_memory::OriginalTextMetadataCustody,
+                )>())
+            })
             .ok_or(WorkingMemoryError::Overflow)?;
         // Root plus actual split banks; a refused split never creates custody.
         let banks = maximum_partitions
@@ -215,10 +225,15 @@ impl OriginalHostSourceBank {
     }
     /// Authenticate the same accepted account before allocating its capacity owner.
     pub fn validate_source_peak_selection(
-        &self, selection: HostSourcePeakSelection, controls: &OriginalHostSourceCustody,
+        &self,
+        selection: HostSourcePeakSelection,
+        controls: &OriginalHostSourceCustody,
     ) -> Result<(), WorkingMemoryError> {
         self.controls.validate_account(self.reservation.as_ref())?;
-        if self.peak != Some(selection) || self.peak_owner.is_some() || !self.belongs_to_source(controls) {
+        if self.peak != Some(selection)
+            || self.peak_owner.is_some()
+            || !self.belongs_to_source(controls)
+        {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         Ok(())
@@ -276,7 +291,9 @@ impl OriginalHostSourceBank {
             ));
         }
         if self.program.is_some() {
-            return Err(HostDestinationCause::Memory(WorkingMemoryError::IdentityMismatch));
+            return Err(HostDestinationCause::Memory(
+                WorkingMemoryError::IdentityMismatch,
+            ));
         }
         if self.partitions == 0 || attempts > self.attempts {
             return Err(HostDestinationCause::Attempts);
@@ -312,7 +329,10 @@ impl OriginalHostSourceBank {
         managed_bytes: u64,
     ) -> Result<OriginalHostSourceReceipt, OriginalHostSourceError> {
         if self.program.is_some() {
-            return Err(OriginalHostSourceError {cause:HostDestinationCause::Memory(WorkingMemoryError::IdentityMismatch),receipt:None});
+            return Err(OriginalHostSourceError {
+                cause: HostDestinationCause::Memory(WorkingMemoryError::IdentityMismatch),
+                receipt: None,
+            });
         }
         if self.attempts == 0 {
             return Err(OriginalHostSourceError {
@@ -322,7 +342,7 @@ impl OriginalHostSourceBank {
         }
         self.attempts -= 1;
         let receipt = OriginalHostSourceReceipt {
-            controls: self.controls.clone(),
+            controls: self.controls.accounting(),
         };
         let result = (|| {
             self.controls
@@ -351,21 +371,20 @@ impl OriginalHostSourceBank {
 /// The actual constructor keeps this after all charged storage in drop order.
 #[derive(Debug)]
 pub struct OriginalHostSourceReceipt {
-    controls: OriginalHostSourceCustody,
+    controls: super::OriginalHostMetadataCustody,
 }
 impl OriginalHostSourceReceipt {
     /// Consume already debited source custody into metadata-only retention.
     /// No payload/source/native owner is retained, and no capacity is granted,
     /// refunded or exposed. The constructor must retain this after its storage.
     pub fn into_metadata(self) -> super::OriginalHostMetadataCustody {
-        let metadata = self.controls.accounting();
-        drop(self);
-        metadata
+        self.controls
     }
 
     /// Authenticate the same accepted request before native owner construction.
     pub fn belongs_to(&self, controls: &OriginalTextControlGuard) -> bool {
-        self.controls.same_source(&controls.clone().into())
+        self.controls
+            .same(&super::OriginalHostMetadataCustody::from_guard(controls))
     }
 }
 

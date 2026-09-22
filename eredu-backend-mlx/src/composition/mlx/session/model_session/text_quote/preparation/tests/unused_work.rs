@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 
 fn deferred(
     runtime: &mut ModelRuntime<MlxBackend<'static>>,
@@ -26,9 +28,9 @@ fn deferred(
 #[test]
 fn unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissions() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let mut original_required = None;
     for pass in 0..4 {
         let capacity = original_required.map_or(u64::MAX, |required| baseline + required);
@@ -39,8 +41,11 @@ fn unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissio
             .unwrap()
             .request()
             .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
             .unwrap()
-            .bytes();
+            .total()
+            .unwrap();
         if let Some(original) = original_required {
             assert_eq!(required, original);
         } else {
@@ -60,7 +65,7 @@ fn unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissio
                 .unwrap_err(),
             );
             let same = prompt_state(scopes);
-            let used = pool.used_bytes().unwrap();
+            let used = pool.fixture_host_charge().unwrap();
             for _ in 0..3 {
                 busy(
                     MlxBackend::prepare_text_prompt_admitted(
@@ -71,7 +76,7 @@ fn unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissio
                     .unwrap_err(),
                 );
                 assert_eq!(prompt_state(scopes), same);
-                assert_eq!(pool.used_bytes().unwrap(), used);
+                assert_eq!(pool.fixture_host_charge().unwrap(), used);
             }
             let loan = scopes.prompt.borrow();
             let Slot::Pending(pending) = &*loan else {
@@ -96,7 +101,7 @@ fn unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissio
         drop(retained);
         fixture::settle(&pool, baseline);
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             baseline,
             "pass {pass} returns its own unexposed scope"
         );
@@ -117,7 +122,10 @@ fn unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissio
     let mut cause: &(dyn std::error::Error + 'static) = &failure;
     loop {
         if let Some(error) = cause.downcast_ref::<WorkingMemoryError>() {
-            assert!(matches!(error, WorkingMemoryError::BudgetExceeded { .. }));
+            assert!(matches!(
+                error,
+                WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
+            ));
             break;
         }
         cause = cause.source().expect("typed original quota failure");
@@ -175,7 +183,7 @@ fn begin(
 #[test]
 fn panic_after_native_begin_before_funding_exposure_cancels_only_unused_scope() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let (probe, preparation) = deferred(&mut runtime, u64::MAX);
     let held = probe.facts().held;
@@ -220,7 +228,7 @@ fn panic_after_native_begin_before_funding_exposure_cancels_only_unused_scope() 
 #[test]
 fn activated_original_work_keeps_actual_native_validation_error_and_ordinary_cleanup() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let (probe, preparation) = deferred(&mut runtime, u64::MAX);
     let (stage, work, ready) = original_pending(&preparation);
@@ -269,11 +277,18 @@ fn activated_original_work_keeps_actual_native_validation_error_and_ordinary_cle
 #[test]
 fn dropping_exposed_unresolved_work_keeps_canonical_quarantine_after_child_retirement() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let (probe, preparation) = deferred(&mut runtime, u64::MAX);
     let quote = preparation.quote.as_ref().unwrap();
-    let required = quote.request().memory_reservation().unwrap().bytes();
+    let required = quote
+        .request()
+        .memory_reservation()
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     let (stage, custody) = quote
         .preparation_scopes
         .as_ref()
@@ -308,7 +323,7 @@ fn dropping_exposed_unresolved_work_keeps_canonical_quarantine_after_child_retir
         quote
             .original_controls()
             .unwrap()
-            .validate_reservation(quote.request().memory_reservation().unwrap()),
+            .validate_reservation(quote.request().memory_reservation()),
         Err(WorkingMemoryError::ExecutionFenced)
     );
     child.seal();
@@ -317,7 +332,7 @@ fn dropping_exposed_unresolved_work_keeps_canonical_quarantine_after_child_retir
     submission_recovery::reap();
     safemlx::reclaim_allocation_owners();
     assert!(
-        pool.used_bytes().unwrap() >= required,
+        pool.fixture_host_charge().unwrap() >= required,
         "native lifetime retirement does not clear the exposed scope's original quarantine"
     );
     assert!(pool.acquire_unquoted().is_err());

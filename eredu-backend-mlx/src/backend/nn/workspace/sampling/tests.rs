@@ -11,7 +11,11 @@ use eredu_runtime::{
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -93,8 +97,13 @@ fn sampling_native_facts_cover_sort_growth_host_masks_and_retained_key_replaceme
     for count in [1, 2, 128, 2048, 2049, 8193] {
         op.outputs[0] = WorkspaceLayout::new(&[count, 2], WorkspaceDtype::Uint32).unwrap();
         let bound = selected().operation_bound(&op).unwrap().unwrap();
-        let expected = selected().allocation.buffer_capacity(count as u64 * 8).unwrap();
-        assert!(matches!(bound.outputs[0], WorkspaceOutputStorage::Allocate(actual) if actual == expected));
+        let expected = selected()
+            .allocation
+            .buffer_capacity(count as u64 * 8)
+            .unwrap();
+        assert!(
+            matches!(bound.outputs[0], WorkspaceOutputStorage::Allocate(actual) if actual == expected)
+        );
         assert_eq!(bound.scratch_bytes, 0);
     }
     op.outputs[0] = WorkspaceLayout::new(&[3], WorkspaceDtype::Uint32).unwrap();
@@ -160,7 +169,11 @@ fn optional_filter_facts_cover_masked_work_and_unfiltered_input_aliases() {
             let report = context.report(&output).unwrap();
             assert_eq!(
                 report.state.as_ref().unwrap().retained_bytes,
-                Some(existing_bytes + output_bytes)
+                Some(
+                    existing_bytes
+                        + output_bytes
+                        + selected().allocation.host_control_bytes().unwrap()
+                )
             );
             assert_eq!(report.state.as_ref().unwrap().displaced_bytes, Some(0));
             assert!(report.total_bytes.is_some());
@@ -231,7 +244,10 @@ fn metal_sampling_primitive_peaks_fit_cold_bounds_across_sort_thresholds() {
                         let observed = safemlx::memory::peak_memory()
                             .unwrap()
                             .saturating_sub(before) as u64;
-                        assert!(observed <= allowed, "sampling case={case} dtype={dtype:?} shape={shape:?} strided={transposed}: {observed} > {allowed}");
+                        assert!(
+                            observed <= allowed,
+                            "sampling case={case} dtype={dtype:?} shape={shape:?} strided={transposed}: {observed} > {allowed}"
+                        );
                         let actual = output.to_f32_vec(&stream).unwrap();
                         assert_eq!(actual.len(), count);
                         assert!(actual.iter().all(|value| !value.is_nan()));
@@ -255,7 +271,9 @@ fn metal_sampling_primitive_peaks_fit_cold_bounds_across_sort_thresholds() {
                                 );
                             }
                         }
-                        eprintln!("sampling case={case} dtype={dtype:?} shape={shape:?} strided={transposed} observed={observed} bound={allowed}");
+                        eprintln!(
+                            "sampling case={case} dtype={dtype:?} shape={shape:?} strided={transposed} observed={observed} bound={allowed}"
+                        );
                     }
                 }
             }
@@ -352,7 +370,11 @@ fn metal_configured_sampling_request_peaks_fit_shared_policy_quotes() {
                     sampler.history_capacity() as u64 * 4,
                     quote.final_history_bytes
                 );
-                eprintln!("configured sampling width={width} adaptive={adaptive} temperature={temperature} observed={observed} tensor_bound={:?} managed_bound={:?}", quote.tensor_peak_bytes, quote.peak.bytes());
+                eprintln!(
+                    "configured sampling width={width} adaptive={adaptive} temperature={temperature} observed={observed} tensor_bound={:?} managed_bound={:?}",
+                    quote.tensor_peak_bytes,
+                    quote.peak.bytes()
+                );
             }
         }
     }
@@ -368,13 +390,100 @@ fn uniform_facts_require_real_key_and_fixed_f32_draw_geometry() {
     let bound = selected().operation_bound(&op).unwrap().unwrap();
     let scalar = selected().allocation.buffer_capacity(4).unwrap();
     assert!(matches!(bound.outputs[0], WorkspaceOutputStorage::Allocate(bytes) if bytes == scalar));
-    assert!(bound.scratch_bytes >= 4 * scalar, "eager uniform sources must remain priced");
-    for (shape, dtype) in [(&[2][..], WorkspaceDtype::Float32),
-        (&[1][..], WorkspaceDtype::Uint32), (&[][..], WorkspaceDtype::Float32)] {
+    assert!(
+        bound.scratch_bytes >= 4 * scalar,
+        "eager uniform sources must remain priced"
+    );
+    for (shape, dtype) in [
+        (&[2][..], WorkspaceDtype::Float32),
+        (&[1][..], WorkspaceDtype::Uint32),
+        (&[][..], WorkspaceDtype::Float32),
+    ] {
         op.outputs[0] = WorkspaceLayout::new(shape, dtype).unwrap();
         assert!(selected().operation_bound(&op).is_err());
     }
     op.outputs[0] = WorkspaceLayout::new(&[1], WorkspaceDtype::Float32).unwrap();
     op.inputs[0] = WorkspaceLayout::new(&[2], WorkspaceDtype::Float32).unwrap();
     assert!(selected().operation_bound(&op).is_err());
+}
+
+#[test]
+fn sampling_source_populations_preserve_complete_charge_and_alias_lifetimes() {
+    // This native physical-report fixture establishes backend facts explicitly;
+    // ordinary cold tracing only borrows facts already present in the process.
+    let _ledger = crate::backend::managed_memory::try_ledger().unwrap();
+    use super::super::resident_mechanism::ResidentExecutionMechanisms;
+    let state = |report: &WorkspaceTraceReport| {
+        report.state.as_ref().map(|state| {
+            (
+                state.retained_bytes,
+                state.displaced_bytes,
+                state.transient_bytes,
+            )
+        })
+    };
+    let buffers = |report: &WorkspaceTraceReport| {
+        let buffers = &report.tensor_buffers;
+        (
+            buffers.total_bytes,
+            buffers.retained_bytes,
+            buffers.transient_bytes,
+        )
+    };
+    for case in 0..6 {
+        let mut reports = Vec::new();
+        for style in 0..4 {
+            for duplicate in [false, true] {
+                let context = match style {
+                    0 => WorkspaceContext::new(selected()),
+                    1 => WorkspaceContext::new(ResidentExecutionMechanisms::Metal(selected())),
+                    2 => WorkspaceContext::new_recording_facts(selected()),
+                    _ => WorkspaceContext::new_recording_facts(ResidentExecutionMechanisms::Metal(
+                        selected(),
+                    )),
+                };
+                let layout = WorkspaceLayout::new(&[1, 37], WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(
+                        WorkspaceFloatingType::Float32,
+                        true,
+                    )));
+                let placement = crate::backend::managed_memory::cold_default_placement().unwrap();
+                let source = WorkspaceExistingStorage::try_new_placed_with_host_controls(
+                    Some(4096),
+                    placement,
+                    Some(0),
+                    &context,
+                )
+                .unwrap();
+                let input =
+                    WorkspaceTensor::existing_with_storage(layout, &source, &context).unwrap();
+                context.begin_state_span([&input]).unwrap();
+                let output = apply::<WorkspaceSamplingBackend>(case, &input, &context).unwrap();
+                let roots = if duplicate {
+                    vec![output.clone(), output]
+                } else {
+                    vec![output]
+                };
+                let report = context.finish_report(&roots).unwrap();
+                assert!(
+                    report.physical_domains.is_some(),
+                    "case {case} style {style}"
+                );
+                reports.push(report);
+            }
+        }
+        // Source attribution partitions the same simultaneous child envelope.
+        // A second retained view cannot create another backing charge, and
+        // ordinary and recorded planning consume the same physical sources.
+        for report in &reports[1..] {
+            assert_eq!(buffers(&reports[0]), buffers(report), "case {case}");
+            assert_eq!(state(&reports[0]), state(report), "case {case}");
+            assert_eq!(
+                reports[0].physical_domains.as_ref().unwrap().domains,
+                report.physical_domains.as_ref().unwrap().domains,
+                "case {case}",
+            );
+        }
+    }
 }

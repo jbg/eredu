@@ -2,7 +2,7 @@
 use super::*;
 use eredu_runtime::{
     execution_control::{PreparedTextHostCopy, PreparedTextHostJournal, TextHostCopyError},
-    working_memory::{WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{MemoryLedger, WorkingMemoryError},
 };
 
 struct CursorHostCopy<P, S, D, const O: bool, const PLAIN: bool, const TEXT: bool> {
@@ -44,8 +44,13 @@ impl<S, D, const O: bool, const PLAIN: bool, const TEXT: bool> CursorCopyParts<S
         }
     }
 }
-impl<S, D, J, const O: bool, const PLAIN: bool, const TEXT: bool> CursorCopyParts<S, D, O, PLAIN, TEXT>
-    for (RetainedGenerationSequence, eredu_core::SemanticStateOwner, J)
+impl<S, D, J, const O: bool, const PLAIN: bool, const TEXT: bool>
+    CursorCopyParts<S, D, O, PLAIN, TEXT>
+    for (
+        RetainedGenerationSequence,
+        eredu_core::SemanticStateOwner,
+        J,
+    )
 {
     type Copied = (
         RetainedConsumerCursor<S, D, O, PLAIN, TEXT>,
@@ -58,7 +63,11 @@ impl<S, D, J, const O: bool, const PLAIN: bool, const TEXT: bool> CursorCopyPart
         finish_reason: Option<FinishReason>,
         failed: bool,
     ) -> Self::Copied {
-        (self.0.into_cursor(layout, finish_reason, failed), self.1, self.2)
+        (
+            self.0.into_cursor(layout, finish_reason, failed),
+            self.1,
+            self.2,
+        )
     }
 }
 impl<P, S, D, const O: bool, const PLAIN: bool, const TEXT: bool> PreparedTextHostCopy
@@ -106,19 +115,19 @@ where
     }
 }
 impl<
-    S: Error + Send + Sync + 'static,
-    D: Error + Send + Sync + 'static,
-    const O: bool,
-    const PLAIN: bool,
-    const TEXT: bool,
-> RetainedConsumerCursor<S, D, O, PLAIN, TEXT>
+        S: Error + Send + Sync + 'static,
+        D: Error + Send + Sync + 'static,
+        const O: bool,
+        const PLAIN: bool,
+        const TEXT: bool,
+    > RetainedConsumerCursor<S, D, O, PLAIN, TEXT>
 {
     /// Prepares this same cursor provider with the shared snapshot controls and
     /// the facade's concrete enclosing result/error representations.
     pub(crate) fn prepare_snapshot_host_copy<'a, B, C, E>(
         &'a self,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
         native_preparation_bytes: u64,
     ) -> Result<impl PreparedTextHostCopy<Copied = Self> + 'a, WorkingMemoryError>
     where
@@ -145,7 +154,7 @@ impl<
     }
 
     pub(crate) fn prepare_resume_host_copy<'a, B, C, E>(
-        &'a self, pool: &WorkingMemoryPool, capacity: u64, native_preparation_bytes: u64,
+        &'a self, pool: &MemoryLedger, capacity: eredu_core::MemoryLimits, native_preparation_bytes: u64,
     ) -> Result<impl PreparedTextHostCopy<Copied = Self> + 'a, WorkingMemoryError>
     where
         B: eredu_runtime::execution_control::TextSnapshotBackend + eredu_core::TextResumeBackend<ResumeSource = <B as eredu_runtime::execution_control::TextSnapshotBackend>::SavedTextComponents>,
@@ -175,8 +184,8 @@ impl<
     pub(crate) fn prepare_semantic_snapshot_host_copy<'a, B, C, E, J>(
         &'a self,
         semantic: &'a eredu_core::SemanticStateOwner,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
         native_preparation_bytes: u64,
         journal: J,
     ) -> Result<
@@ -211,7 +220,7 @@ impl<
     /// Restores cursor and semantic state under one nonrefundable resume lease.
     pub(crate) fn prepare_semantic_resume_host_copy<'a, B, C, E, J>(
         &'a self, semantic: &'a eredu_core::SemanticStateOwner,
-        pool: &WorkingMemoryPool, capacity: u64, native_preparation_bytes: u64,
+        pool: &MemoryLedger, capacity: eredu_core::MemoryLimits, native_preparation_bytes: u64,
         journal: J,
     ) -> Result<impl PreparedTextHostCopy<Copied = (Self, eredu_core::SemanticStateOwner, J::Copied)> + 'a, WorkingMemoryError>
     where B: eredu_runtime::execution_control::TextSnapshotBackend + eredu_core::TextResumeBackend<
@@ -253,8 +262,8 @@ impl<
     /// Caller must pass it through the shared nonrefundable snapshot transaction.
     pub(crate) fn prepare_host_copy<'a>(
         &'a self,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<impl PreparedTextHostCopy<Copied = Self> + 'a, WorkingMemoryError> {
         let sequence = self
             .cursor

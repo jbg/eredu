@@ -1,16 +1,20 @@
 use super::*;
 use eredu_checkpoint::AffineQuantization;
 use eredu_nn::{
+    GroupSelectionOperator, GroupedNeuralBackend, LinearFormatSpec, ParameterSpec,
+    RoutingArithmetic, SelectorInputTransformSpec, Tensor,
     routing_intervention::{
         GroupScoreStage, GroupSelectionAction, GroupSelectionControl, IntervenedGroupSelection,
     },
-    GroupSelectionOperator, GroupedNeuralBackend, LinearFormatSpec, ParameterSpec,
-    RoutingArithmetic, SelectorInputTransformSpec, Tensor,
 };
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -200,10 +204,9 @@ fn topk_routing_workspace_prices_all_encodings_policies_and_control_stages() {
             for shape in [&[0, 256][..], &[2, 2, 256][..], &[256][..]] {
                 for supplied in [false, true] {
                     let (_, report) = quote(&spec, shape, supplied, None);
-                    assert!(
-                        report.total_bytes.is_some(),
-                        "{encoding:?}: {:?}",
-                        report.unpriced_operations
+                    crate::backend::nn::workspace::test_backing_control_completeness(
+                        &mechanisms(),
+                        &report,
                     );
                     let expected_host = if supplied || shape[0] == 0 { 0 } else { 8 * 4 };
                     assert_eq!(report.host_workspace_bytes, Some(expected_host));
@@ -212,7 +215,10 @@ fn topk_routing_workspace_prices_all_encodings_policies_and_control_stages() {
             for capture in [false, true] {
                 for control in controls(&spec, capture) {
                     let (_, report) = quote(&spec, &[2, 2, 256], false, Some(&control));
-                    assert!(report.total_bytes.is_some());
+                    crate::backend::nn::workspace::test_backing_control_completeness(
+                        &mechanisms(),
+                        &report,
+                    );
                     assert_eq!(report.host_workspace_bytes, Some(32));
                 }
             }
@@ -239,6 +245,7 @@ fn topk_routing_workspace_preserves_shared_coefficients_and_supplied_index_roots
         Some(
             capacity(mechanisms().allocation, 16).unwrap()
                 + capacity(mechanisms().allocation, 4).unwrap()
+                + 2 * mechanisms().allocation.host_control_bytes().unwrap()
         )
     );
     let c = WorkspaceContext::new(mechanisms());
@@ -256,11 +263,17 @@ fn topk_routing_workspace_preserves_shared_coefficients_and_supplied_index_roots
     let report = c.report(&[out.group_indices().clone()]).unwrap();
     assert_eq!(
         report.state.as_ref().unwrap().retained_bytes,
-        Some(4096 + capacity(mechanisms().allocation, 4).unwrap())
+        Some(
+            4096 + capacity(mechanisms().allocation, 4).unwrap()
+                + mechanisms().allocation.host_control_bytes().unwrap()
+        )
     );
     assert_eq!(
         report.retained_bytes,
-        Some(capacity(mechanisms().allocation, 4).unwrap())
+        Some(
+            capacity(mechanisms().allocation, 4).unwrap()
+                + mechanisms().allocation.host_control_bytes().unwrap()
+        )
     );
 }
 
@@ -330,7 +343,11 @@ fn shared_routing_failure_preserves_one_wrapper_and_ordinary_source_behavior() {
     // Counter used by inspection. Arithmetic fails before projection; its
     // unused layout is not an admission or source-construction witness.
     let make = || Counter {
-        a: NativeAllocationFacts { page_size: 4096, cpu_header: false },
+        a: NativeAllocationFacts {
+            page_size: 4096,
+            cpu_header: false,
+            original_storage: false,
+        },
         spec: &spec,
         rows: u64::MAX,
         projection: WorkspaceOperationFacts {
@@ -342,7 +359,10 @@ fn shared_routing_failure_preserves_one_wrapper_and_ordinary_source_behavior() {
             scratch_bytes: 0,
         },
         projection_output: 0,
+        projection_calls: Cell::new(0),
         tensor: Cell::new(0),
+        default_bytes: Cell::new(0),
+        default_births: Cell::new(0),
         host: Cell::new(0),
         next: Cell::new(0),
     };
@@ -351,6 +371,7 @@ fn shared_routing_failure_preserves_one_wrapper_and_ordinary_source_behavior() {
         id: 0,
         elements: 4,
         storage: Output::AliasInput(0),
+        source: AllocationSource::Execution,
     };
     let fixed = match execute_routing_intervention_fixed(&mut fixed_counter, &input, &control) {
         Err(error) => intervention_error(error),
@@ -382,4 +403,118 @@ fn shared_routing_failure_preserves_one_wrapper_and_ordinary_source_behavior() {
     assert_eq!(mapped.to_string(), original.to_string());
     assert!(std::error::Error::source(&mapped).is_none());
     assert!(std::error::Error::source(&original).is_none());
+}
+
+#[test]
+fn routing_allocation_sources_keep_cutoff_force_and_shared_output_custody() {
+    let native = mechanisms();
+    let selected_spec = spec(
+        256,
+        8,
+        2,
+        1,
+        GroupScoring::SqrtSoftplus,
+        false,
+        LinearFormat::Dense,
+    )
+    .with_arithmetic(RoutingArithmetic::uniform(RoutingPrecision::Float32));
+    for capture in [false, true] {
+        let mut selected = controls(&selected_spec, capture);
+        selected.push(GroupSelectionControl {
+            expected: selected_spec.selection(),
+            learned_coefficient_scale: false,
+            first_row: 0,
+            end_row: 4,
+            row_stride: 1,
+            action: GroupSelectionAction::Force(vec![0, 1, 0, 1, 0, 1, 0, 1]),
+            capture_original: capture,
+        });
+        for control in selected.iter().map(Some).chain(std::iter::once(None)) {
+            let (op, _) = quote(&selected_spec, &[4, 256], false, control);
+            let (fact, source) = allocation_sources(op.as_view(), native.allocation())
+                .unwrap()
+                .unwrap();
+            assert!(source.default_bytes > 0);
+            assert!(source.default_births > 0);
+            assert_eq!(
+                source.total_bytes - source.output_bytes.iter().sum::<u64>(),
+                fact.scratch_bytes
+            );
+            let births = native.scratch_births(op.as_view()).unwrap().unwrap();
+            let output_count = source.output_bytes.iter().filter(|&&n| n != 0).count();
+            assert!(births + output_count >= source.default_births);
+            let choices = source.output_sources[..source.outputs]
+                .iter()
+                .zip(&source.output_bytes)
+                .filter(|(s, b)| **s == AllocationSource::CutoffChoice && **b != 0)
+                .count();
+            for branch in 0..1usize << choices {
+                let mut bytes = [
+                    source.default_bytes,
+                    source.total_bytes - source.default_bytes,
+                ];
+                let mut population = [
+                    source.default_births,
+                    births + output_count - source.default_births,
+                ];
+                let mut choice = 0;
+                for (&output, &owner) in source.output_bytes.iter().zip(&source.output_sources) {
+                    if output == 0 {
+                        continue;
+                    }
+                    let slot = match owner {
+                        AllocationSource::Execution => 1,
+                        AllocationSource::Default => 0,
+                        AllocationSource::CutoffChoice => {
+                            let slot = usize::from(branch & (1 << choice) == 0);
+                            choice += 1;
+                            slot
+                        }
+                    };
+                    bytes[slot] = bytes[slot]
+                        .checked_sub(output)
+                        .expect("returned backing belongs to this charged source");
+                    population[slot] = population[slot]
+                        .checked_sub(1)
+                        .expect("returned backing keeps its original allocation identity");
+                }
+                assert_eq!(bytes.iter().sum::<u64>(), fact.scratch_bytes);
+                assert_eq!(population.iter().sum::<usize>(), births);
+            }
+            if control.is_some_and(|value| {
+                matches!(value.action, GroupSelectionAction::Force(_)) && value.first_row == 0
+            }) {
+                assert_eq!(
+                    source.output_sources[if capture { 3 } else { 0 }],
+                    AllocationSource::Default
+                );
+            }
+        }
+    }
+    let plain = spec(
+        256,
+        8,
+        2,
+        1,
+        GroupScoring::SelectedSoftmax,
+        false,
+        LinearFormat::Dense,
+    );
+    let (op, _) = quote(&plain, &[4, 256], false, None);
+    let (_, source) = allocation_sources(op.as_view(), native.allocation())
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.output_sources[0], AllocationSource::CutoffChoice);
+    assert_eq!(
+        source.output_bytes[2], 0,
+        "selected scores and coefficients share one backing"
+    );
+    let (empty, _) = quote(&plain, &[0, 256], false, None);
+    let (_, source) = allocation_sources(empty.as_view(), native.allocation())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source.default_births, 1,
+        "empty native zeros retains its actual eager seed"
+    );
 }

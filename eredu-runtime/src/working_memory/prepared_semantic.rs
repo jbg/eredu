@@ -1,13 +1,12 @@
 //! Source-bound decoder, channel parser and event ownership for generation.
 use super::decoder_transition::{stop_error, transition_error};
-use super::{InferenceExecutionIdentity, OriginalStopSource, OriginalTokenizer, WorkingMemoryPool};
+use super::{InferenceExecutionIdentity, MemoryLedger, OriginalStopSource, OriginalTokenizer};
 use super::{OriginalSemanticChannelParser, OriginalSemanticChannelSource};
 use eredu_core::generation::SemanticEvent;
 use eredu_core::{
-    FinishReason, GenerationPlainText, GenerationPlainTextEvent,
-    GenerationPlainTextEvents, GenerationPlainTextProjection, HostMetadataFundingError,
-    HostPreparationAuthority, SemanticState, SemanticStateOwner, SemanticText, SpeculativeBuffer,
-    SpeculativeOutputError,
+    FinishReason, GenerationPlainText, GenerationPlainTextEvent, GenerationPlainTextEvents,
+    GenerationPlainTextProjection, HostMetadataFundingError, HostPreparationAuthority,
+    SemanticState, SemanticStateOwner, SemanticText, SpeculativeBuffer, SpeculativeOutputError,
 };
 use eredu_nn::workspace::HostMetadataFunding;
 use eredu_text::decoder_storage::{DecodeDestinations, DecodeStreamLayout};
@@ -21,7 +20,7 @@ use std::mem::size_of;
 pub struct PreparedSemanticSource {
     source: OriginalTokenizer,
     execution: InferenceExecutionIdentity,
-    capacity_bytes: u64,
+    limits: eredu_core::MemoryLimits,
     identity: eredu_core::SpeculativeRequestIdentity,
     // Source and identity aliases retire before this final account token.
     funding: HostMetadataFunding,
@@ -41,11 +40,11 @@ impl PreparedSemanticSource {
     pub fn new(
         source: &OriginalTokenizer,
         execution: &InferenceExecutionIdentity,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, SpeculativeOutputError> {
         let funding = source
             .pool()
-            .prepare_workspace_metadata(execution, capacity)?;
+            .prepare_workspace_metadata(execution, capacity.clone())?;
         let parts = [
             size_of::<Self>(),
             size_of::<InferenceExecutionIdentity>(),
@@ -63,7 +62,7 @@ impl PreparedSemanticSource {
         Ok(Self {
             source: source.clone(),
             execution: execution.clone(),
-            capacity_bytes: capacity,
+            limits: capacity,
             identity,
             funding,
         })
@@ -72,7 +71,7 @@ impl PreparedSemanticSource {
     /// This is allocation-free and grants no native execution permission.
     pub fn validate(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
     ) -> Result<(), super::WorkingMemoryError> {
         self.source.validate_pool(pool)?;
@@ -152,8 +151,12 @@ impl PreparedSemanticSource {
         ))
     }
     /// Actual ceiling accepted when this preparation account was created.
-    pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes
+    pub fn limits(&self) -> &eredu_core::MemoryLimits {
+        &self.limits
+    }
+    /// Immutable backend-established domains for this preparation.
+    pub fn topology(&self) -> &eredu_core::MemoryTopology {
+        self.source.pool().topology()
     }
     /// Borrowed original tokenizer used for all prepared semantic transitions.
     pub fn tokenizer(&self) -> &OriginalTokenizer {
@@ -361,14 +364,19 @@ impl PreparedSemanticState {
         }))
     }
     /// Exact successful decoder-call ceiling accepted before destination construction.
-    pub fn token_capacity(&self) -> usize { self.decoder.token_capacity() }
+    pub fn token_capacity(&self) -> usize {
+        self.decoder.token_capacity()
+    }
     /// Authenticates the state and its channel controller inputs without callbacks.
     pub(in crate::working_memory) fn validate_controller_source(
-        &self, source: eredu_core::PreparedControllerSource<'_>,
+        &self,
+        source: eredu_core::PreparedControllerSource<'_>,
     ) -> Result<(), super::WorkingMemoryError> {
         self.validate_pool(self.source.pool())?;
         if let Some(channels) = &self.channels {
-            channels.source().validate_controller_source(source, self.source.pool())?;
+            channels
+                .source()
+                .validate_controller_source(source, self.source.pool())?;
         }
         Ok(())
     }
@@ -377,7 +385,7 @@ impl PreparedSemanticState {
         &self.preparation
     }
     /// Authenticates actual source residence without allocating or minting a hold.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), super::WorkingMemoryError> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), super::WorkingMemoryError> {
         self.source.validate_pool(pool)?;
         self.stop_source.validate_pool(pool)?;
         if let Some(channels) = &self.channels {

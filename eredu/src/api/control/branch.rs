@@ -16,7 +16,7 @@ pub struct ControlledGenerationBranch<B: TextSnapshotBackend> {
     failure: ControlledSessionFailure,
     tokenizer_identity: [u8; 32],
     snapshot_budget: Option<SnapshotBudget>,
-    snapshot_host_capacity: u64,
+    snapshot_host_capacity: eredu_core::MemoryLimitDeclarations,
     native_copy_limits: eredu_runtime::working_memory::WorkspaceCopyLimits,
     capabilities: ExecutionControlCapabilities,
     delivery: Delivery,
@@ -199,12 +199,12 @@ where
             sampling: options.sampling,
         };
         let cancellation = self.delivery.control.cancellation().clone();
-        let capacity = self.snapshot_host_capacity;
+        let capacity = self.snapshot_host_capacity.clone();
         let child = self.active_mut()?.fork_with_host(
             &snapshot.snapshot,
             PreparedChatResumeSettings::default(),
             options_source,
-            capacity,
+            capacity.clone(),
             &cancellation,
             BranchJournal {
                 restored: snapshot::RestoreJournal {
@@ -291,7 +291,7 @@ where
             tokenizer_identity: self.tokenizer_identity,
             snapshot_budget: Some(budget),
             snapshot_host_capacity: capacity,
-            native_copy_limits: self.native_copy_limits,
+            native_copy_limits: self.native_copy_limits.clone(),
             capabilities,
             delivery,
             journal_destination: Some(destination),

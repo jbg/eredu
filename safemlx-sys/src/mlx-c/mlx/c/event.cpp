@@ -1045,7 +1045,7 @@ extern "C" bool mlx_operation_event_cpu_host_transfer_eval_layout(mlx_cpu_copy_e
 extern "C" bool mlx_operation_event_cpu_unary_eval_layout(mlx_cpu_unary_eval_layout* out,
     uint32_t operation, mlx_dtype dtype, size_t rank, bool tracer) {
   using namespace mlx::core;
-  if (!out || operation > uint32_t(cpu::UnaryEvalKind::round) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
+  if (!out || operation > uint32_t(cpu::UnaryEvalKind::from_fp8) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
   cpu::UnaryEvalStorage native;
   if (!cpu::unary_eval_layout(static_cast<cpu::UnaryEvalKind>(operation), mlx_dtype_to_cpp(dtype),
       rank, tracer, native)) return false;
@@ -1061,7 +1061,7 @@ extern "C" bool mlx_operation_event_cpu_unary_eval_layout(mlx_cpu_unary_eval_lay
 extern "C" bool mlx_operation_event_cpu_binary_eval_layout(mlx_cpu_binary_eval_layout* out,
     uint32_t operation, mlx_dtype dtype, size_t rank, size_t elements, bool tracer) {
   using namespace mlx::core;
-  if (!out || operation > uint32_t(cpu::BinaryEvalKind::log_add_exp) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
+  if (!out || operation > uint32_t(cpu::BinaryEvalKind::right_shift) || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
   cpu::BinaryEvalStorage native;
   if (!cpu::binary_eval_layout(static_cast<cpu::BinaryEvalKind>(operation), mlx_dtype_to_cpp(dtype),
       rank, elements, tracer, native)) return false;
@@ -1399,6 +1399,19 @@ extern "C" bool mlx_operation_event_cpu_tiled_matmul_eval_layout(mlx_cpu_copy_ev
   *out=value;return true;
 }
 
+extern "C" bool mlx_operation_event_cpu_tiled_addmm_eval_layout(mlx_cpu_copy_eval_layout* out,
+    size_t rank,size_t m,size_t n,size_t k,size_t batches,bool tracer) {
+  if(!out)return false;
+  mlx::core::cpu::CopyEvalStorage native;
+  if(!mlx::core::cpu::tiled_addmm_eval_layout(rank,m,n,k,batches,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(rank)+sizeof(m)+sizeof(n)+
+      sizeof(k)+sizeof(batches)+sizeof(tracer)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
+      native.backing_births,native.named_control_bytes+controls,0};
+  *out=value;return true;
+}
+
 extern "C" bool mlx_operation_event_cpu_tiled_matmul_copy_eval_layout(mlx_cpu_copy_eval_layout* out,
     size_t rank,size_t m,size_t n,size_t k,size_t batches,size_t copies,bool tracer) {
   if(!out)return false;
@@ -1493,7 +1506,7 @@ extern "C" bool mlx_operation_event_cpu_select_broadcast_eval_layout(mlx_cpu_cop
 extern "C" bool mlx_operation_event_cpu_typed_select_broadcast_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype dtype,size_t rank,size_t elements,bool tracer) {
   using namespace mlx::core;
-  if(!out || !(dtype==MLX_FLOAT32||dtype==MLX_FLOAT16||dtype==MLX_BFLOAT16||dtype==MLX_INT32))return false;
+  if(!out || !(dtype==MLX_FLOAT32||dtype==MLX_FLOAT16||dtype==MLX_BFLOAT16||dtype==MLX_INT32||dtype==MLX_BOOL))return false;
   cpu::CopyEvalStorage native;
   if(!cpu::typed_select_broadcast_eval_layout(mlx_dtype_to_cpp(dtype),rank,elements,tracer,native))return false;
   const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(dtype)+sizeof(Dtype)+sizeof(rank)+
@@ -1534,6 +1547,21 @@ extern "C" bool mlx_operation_event_cpu_rms_fallback_control_bytes(
 }
 
 #include "mlx/backend/cpu/concatenate_storage.h"
+extern "C" bool mlx_operation_event_cpu_layer_norm_fallback_control_bytes(
+    size_t* out, mlx_dtype dtype, size_t rank, size_t width, size_t rows) {
+  if (!out || (dtype != MLX_FLOAT32 && dtype != MLX_FLOAT16 && dtype != MLX_BFLOAT16)) return false;
+  size_t native = 0;
+  if (!mlx::core::fast::cpu_layer_norm_fallback_control_bytes(
+      mlx_dtype_to_cpp(dtype), rank, width, rows, native)) return false;
+  const size_t frames = sizeof(native) +
+      sizeof(std::tuple<size_t*, mlx_dtype, size_t, size_t, size_t>) +
+      sizeof(std::tuple<mlx_array*, mlx_array, mlx_array, mlx_array, float, mlx_stream>) +
+      sizeof(mlx::core::array);
+  if (native > SIZE_MAX - frames) return false;
+  *out = native + frames;
+  return true;
+}
+
 extern "C" bool mlx_operation_event_cpu_concatenate_eval_layout(mlx_cpu_copy_eval_layout* out,
     mlx_dtype dtype,size_t rank,size_t left,size_t right,bool tracer) {
   // Validate the conversion-table index; the native source owns supported types.
@@ -1647,6 +1675,19 @@ extern "C" bool mlx_operation_event_cpu_scatter_add_rows_eval_layout(mlx_cpu_cop
       native.backing_births,native.named_control_bytes+controls,0};
   *out=value;return true;
 }
+extern "C" bool mlx_operation_event_cpu_int32_histogram_eval_layout(mlx_cpu_copy_eval_layout* out,
+    mlx_dtype index,size_t output_elements,size_t update_elements,bool tracer) {
+  using namespace mlx::core;
+  if(!out||(index!=MLX_INT32&&index!=MLX_UINT32))return false;
+  cpu::CopyEvalStorage native;
+  if(!cpu::int32_histogram_eval_layout(mlx_dtype_to_cpp(index),output_elements,update_elements,tracer,native))return false;
+  const size_t controls=sizeof(native)+sizeof(*out)+sizeof(out)+sizeof(index)+
+      sizeof(output_elements)+sizeof(update_elements)+sizeof(tracer)+sizeof(size_t)+sizeof(Dtype);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  const mlx_cpu_copy_eval_layout value{native.allocation_extents,native.worker_graph_extents,
+      native.backing_births,native.named_control_bytes+controls,0};
+  *out=value;return true;
+}
 
 #include "mlx/backend/cpu/reduction_storage.h"
 
@@ -1727,5 +1768,32 @@ extern "C" bool mlx_operation_event_cpu_affine_quantized_eval_layout(
   if (native.named_control_bytes > SIZE_MAX - controls) return false;
   *out = {native.allocation_extents, native.worker_graph_extents,
       native.backing_births, native.named_control_bytes + controls, 0};
+  return true;
+}
+
+extern "C" bool mlx_operation_event_cpu_constant_pad_eval_layout(mlx_cpu_copy_eval_layout* out,
+    size_t rank,size_t elements,size_t input_elements,bool tracer) {
+  using namespace mlx::core;
+  if(!out)return false;
+  cpu::CopyEvalStorage native;
+  if(!cpu::constant_pad_eval_layout(rank,elements,input_elements,tracer,native))return false;
+  const size_t controls=sizeof(out)+sizeof(*out)+sizeof(rank)+sizeof(elements)+sizeof(input_elements)+
+      sizeof(tracer)+sizeof(native)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  *out={native.allocation_extents,native.worker_graph_extents,native.backing_births,
+      native.named_control_bytes+controls,0};
+  return true;
+}
+
+extern "C" bool mlx_operation_event_cpu_depthwise_convolution_eval_layout(
+    mlx_cpu_copy_eval_layout* out, mlx_dtype dtype, bool tracer) {
+  using namespace mlx::core;
+  if(!out || (dtype!=MLX_FLOAT32 && dtype!=MLX_FLOAT16 && dtype!=MLX_BFLOAT16))return false;
+  cpu::CopyEvalStorage native;
+  if(!cpu::depthwise_convolution_eval_layout(mlx_dtype_to_cpp(dtype),tracer,native))return false;
+  const size_t controls=sizeof(out)+sizeof(*out)+sizeof(dtype)+sizeof(tracer)+sizeof(native)+sizeof(size_t);
+  if(native.named_control_bytes>SIZE_MAX-controls)return false;
+  *out={native.allocation_extents,native.worker_graph_extents,native.backing_births,
+      native.named_control_bytes+controls,0};
   return true;
 }

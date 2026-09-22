@@ -9,21 +9,31 @@ mod revalidation;
 mod routed;
 
 #[derive(Clone)]
-struct PlanRetirementProbe(crate::working_memory::WorkingMemoryPool);
+struct PlanRetirementProbe(crate::working_memory::MemoryLedger);
 impl PlanRetirementProbe {
     fn is_retired(&self) -> bool {
-        self.0.used_bytes().unwrap() == 0
+        self.0.payload_used_bytes().unwrap() == 0
     }
 }
+fn capture_storage_ledger(bytes: u64, sources: u64) -> crate::working_memory::MemoryLedger {
+    use crate::working_memory::{MemoryLedger, StoragePublicationLayout};
+    let metadata = MemoryLedger::storage_metadata_control_bytes().unwrap()
+        + StoragePublicationLayout::<eredu_core::SharedStorageIdentity>::new(1)
+            .unwrap()
+            .requested_bytes();
+    crate::working_memory::memory_fixture::host_ledger(bytes + sources * metadata, 0).unwrap()
+}
 fn plan_retirement_probe(source: &SharedCapturePlan) -> PlanRetirementProbe {
-    use crate::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+    use crate::working_memory::{MemoryLedger, WorkingMemoryError};
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = capture_storage_ledger(bytes, 1);
     let identity = source.storage_identity().clone();
-    source.try_attach(pool.shared_storage_domain(), || {
-        let registration = pool.register_storage([(identity, bytes)])?;
-        Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(Box::new(registration))
-    }).unwrap();
+    source
+        .try_attach(pool.shared_storage_accounting_id(), || {
+            let registration = pool.register_host_storage([(identity, bytes)])?;
+            Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(Box::new(registration))
+        })
+        .unwrap();
     PlanRetirementProbe(pool)
 }
 
@@ -98,7 +108,6 @@ fn fixture(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -111,7 +120,6 @@ fn fixture(
             CaptureTransformKind::Histogram,
         ],
         max_histogram_bins: 8,
-        physical_native_limit: false,
         conditions: vec![],
     };
     (plan, catalog, support, capabilities)
@@ -229,7 +237,14 @@ fn none_is_not_legacy_capture_all() {
     let (_, catalog, support, capabilities) = fixture(CaptureTransform::Summary);
     let mut plan = CapturePlan::none();
     let refused = admit(plan.clone(), &catalog, &support, &capabilities).unwrap();
-    assert!(matches!(CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(refused)).begin_step(CapturePhase::Prefill, 0), Err(CaptureError::Limit { budget: CaptureBudget::Host, .. })));
+    assert!(matches!(
+        CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(refused))
+            .begin_step(CapturePhase::Prefill, 0),
+        Err(CaptureError::Limit {
+            budget: CaptureBudget::Host,
+            ..
+        })
+    ));
     // An explicitly requested empty receipt still owns its immutable envelope.
     plan.limits.per_step = policy::frame_usage().unwrap();
     plan.limits.cumulative = policy::frame_usage().unwrap();
@@ -253,8 +268,9 @@ fn conditional_capture_distinguishes_absence_from_measurement() {
     support.points[0].prefill =
         ObservationSupportStatus::Conditional("requires media input".into());
     for present in [false, true] {
-        let mut session =
-            CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan.clone(), &catalog, &support, &caps).unwrap()));
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+            admit(plan.clone(), &catalog, &support, &caps).unwrap(),
+        ));
         let mut backend = ProbeBackend {
             copies: Cell::new(0),
         };
@@ -339,13 +355,18 @@ fn runtime_budget_failure_or_skip_never_materializes() {
             match budget {
                 CaptureBudget::Captures => plan.limits.per_step.captures = 0,
                 CaptureBudget::Retention => plan.limits.per_step.retained_bytes = 99,
-                CaptureBudget::Host => plan.limits.per_step.host_bytes = metadata.host_bytes + policy::frame_usage().unwrap().host_bytes + 15,
+                CaptureBudget::Host => {
+                    plan.limits.per_step.host_bytes =
+                        metadata.host_bytes + policy::frame_usage().unwrap().host_bytes + 15
+                }
                 CaptureBudget::Encoded => {
                     plan.limits.per_step.encoded_bytes = metadata.encoded_bytes + 99
                 }
             }
             plan.limits.on_limit = policy;
-            let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+            let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+                admit(plan, &catalog, &support, &caps).unwrap(),
+            ));
             let mut backend = ProbeBackend {
                 copies: Cell::new(0),
             };
@@ -376,7 +397,9 @@ fn frequency_missing_cumulative_bounds_and_consumer_backpressure() {
     plan.selections[0].schedule.every = 2;
     plan.limits.cumulative.retained_bytes = 100;
     plan.limits.on_limit = CaptureLimitPolicy::Skip;
-    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+        admit(plan, &catalog, &support, &caps).unwrap(),
+    ));
     let mut backend = ProbeBackend {
         copies: Cell::new(0),
     };
@@ -438,7 +461,9 @@ fn dynamic_shape_is_checked_and_unknown_is_not_zero() {
         end: 5,
         stride: 2,
     });
-    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+        admit(plan, &catalog, &support, &caps).unwrap(),
+    ));
     let mut backend = ProbeBackend {
         copies: Cell::new(0),
     };
@@ -502,7 +527,9 @@ fn generated_capture_reserves_before_factory_and_reuses_it_for_multiple_selectio
     let mut second = plan.selections[0].clone();
     second.id = "second".into();
     plan.selections.push(second);
-    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+        admit(plan, &catalog, &support, &caps).unwrap(),
+    ));
     let mut backend = ProbeBackend {
         copies: Cell::new(0),
     };
@@ -541,7 +568,9 @@ fn absent_skipped_failed_and_overflowed_generated_capture_never_calls_factory() 
         if case == 1 {
             plan.limits.on_limit = CaptureLimitPolicy::Skip;
         }
-        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+            admit(plan, &catalog, &support, &caps).unwrap(),
+        ));
         let mut backend = ProbeBackend {
             copies: Cell::new(0),
         };
@@ -596,7 +625,9 @@ fn absent_skipped_failed_and_overflowed_generated_capture_never_calls_factory() 
 #[test]
 fn generated_capture_preserves_factory_failure_and_charges_work_without_host_copy() {
     let (plan, catalog, support, caps) = fixture(CaptureTransform::Preview { max_elements: 2 });
-    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+    let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+        admit(plan, &catalog, &support, &caps).unwrap(),
+    ));
     let mut backend = ProbeBackend {
         copies: Cell::new(0),
     };
@@ -669,7 +700,9 @@ fn source_precision_survives_export_and_deferred_generation_without_using_protot
         for fail in [false, true] {
             let (plan, catalog, support, caps) =
                 fixture(CaptureTransform::Preview { max_elements: 2 });
-            let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan, &catalog, &support, &caps).unwrap()));
+            let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+                admit(plan, &catalog, &support, &caps).unwrap(),
+            ));
             let mut backend = TypedProbe { fail };
             session.begin_step(CapturePhase::Prefill, 0).unwrap();
             let result = if generated {
@@ -719,8 +752,9 @@ fn source_precision_survives_export_and_deferred_generation_without_using_protot
     let (mut plan, catalog, support, caps) = fixture(CaptureTransform::Preview { max_elements: 2 });
     plan.limits.on_limit = CaptureLimitPolicy::Skip;
     for generated in [false, true] {
-        let mut session =
-            CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(admit(plan.clone(), &catalog, &support, &caps).unwrap()));
+        let mut session = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(
+            admit(plan.clone(), &catalog, &support, &caps).unwrap(),
+        ));
         session.begin_step(CapturePhase::Prefill, 0).unwrap();
         // Exhaust value retention while leaving envelope/output dimensions available.
         session

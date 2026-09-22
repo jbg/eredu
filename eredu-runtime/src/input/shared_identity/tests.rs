@@ -144,8 +144,8 @@ fn existing_aliases_share_domain_custody_and_identity_keys_do_not_pin_payload() 
     let weak = Arc::downgrade(owner.0.as_ref().expect("live cache"));
     let alias = owner.clone();
     let key = owner.identity().clone();
-    let a = SharedStorageDomain::default();
-    let b = SharedStorageDomain::default();
+    let a = SharedStorageAccountingId::default();
+    let b = SharedStorageAccountingId::default();
     let retired = Arc::new(AtomicUsize::new(0));
     assert!(owner
         .try_attach::<Infallible>(&a, || Ok(Box::new(Retired(retired.clone()))))
@@ -170,7 +170,7 @@ fn existing_aliases_share_domain_custody_and_identity_keys_do_not_pin_payload() 
 fn failed_attachment_preserves_payload_and_does_not_claim_domain() {
     let owner = SharedPreparedInputCacheIdentity::new(identity());
     let alias = owner.clone();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let key = owner.identity().clone();
     let before = (
         owner.capacity_bytes(),

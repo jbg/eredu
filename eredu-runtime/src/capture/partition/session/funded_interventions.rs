@@ -3,15 +3,13 @@ use super::*;
 use crate::intervention::{InterventionPrefillWindow, PreparedPartitionInterventionProjection};
 use crate::working_memory::{CaptureInterventionClaim, OriginalInterventionSource};
 use eredu_core::{BoundedCompletion, BoundedCompletionWait};
-use eredu_nn::workspace::{
-    WorkspaceContext, HostMetadataFunding, HostMetadataFundingError,
-};
+use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError, WorkspaceContext};
 use std::mem::{size_of, size_of_val};
 mod allowance;
-mod source;
 mod outcome;
-pub(crate) use outcome::PartitionInterventionOutcome;
+mod source;
 pub use allowance::PartitionInterventionLocalAllowance;
+pub(crate) use outcome::PartitionInterventionOutcome;
 pub use source::{
     PartitionInterventionInvocationSource, PartitionInterventionMemberSource,
     PreparedPartitionInterventionSource,
@@ -43,6 +41,20 @@ pub struct PartitionInterventionSourceError {
     cause: Cause,
     _source: OriginalInterventionSource,
     _metadata: HostMetadataFunding,
+}
+type ModelInvocation = (CaptureInvocationShape, Option<CaptureInvocationWindow>);
+fn logical_invocation(
+    model: Option<ModelInvocation>,
+) -> Result<Option<CaptureInvocationShape>, CaptureError> {
+    model
+        .map(|(physical, window)| match window {
+            Some(window) => window.validate(physical),
+            None => {
+                physical.validate()?;
+                Ok(physical)
+            }
+        })
+        .transpose()
 }
 #[derive(Debug)]
 struct Identity;
@@ -123,12 +135,25 @@ where
     pub(crate) fn operation(&self) -> usize {
         self.source.operation
     }
-    pub(crate) fn epoch(&self)->DistributedCommitEpoch {self.epoch}
-    pub(crate) fn member(&self,window:Option<InterventionPrefillWindow>)->Result<bool,PartitionInterventionSourceError> {
-        let index=self.window_index(window)?;Ok(self.source.invocations[index].local.is_some())
+    pub(crate) fn epoch(&self) -> DistributedCommitEpoch {
+        self.epoch
     }
-    pub(crate) fn local_window_complete(&self,window:Option<InterventionPrefillWindow>)->Result<bool,PartitionInterventionSourceError> {
-        let index=self.window_index(window)?;Ok(matches!(self.source.invocations[index].state,State::Absent|State::Accepted))
+    pub(crate) fn member(
+        &self,
+        window: Option<InterventionPrefillWindow>,
+    ) -> Result<bool, PartitionInterventionSourceError> {
+        let index = self.window_index(window)?;
+        Ok(self.source.invocations[index].local.is_some())
+    }
+    pub(crate) fn local_window_complete(
+        &self,
+        window: Option<InterventionPrefillWindow>,
+    ) -> Result<bool, PartitionInterventionSourceError> {
+        let index = self.window_index(window)?;
+        Ok(matches!(
+            self.source.invocations[index].state,
+            State::Absent | State::Accepted
+        ))
     }
     pub(crate) fn descriptor(&self) -> &[u8; 32] {
         &self.source.descriptor
@@ -219,6 +244,7 @@ where
                 member,
                 quota,
                 window,
+                model: self.source.model,
                 index,
                 epoch: self.epoch,
                 operation: self.source.operation,
@@ -251,6 +277,7 @@ where
                 || loan.operation != self.source.operation
                 || loan.phase != self.source.phase
                 || loan.prediction != self.source.prediction
+                || loan.model != self.source.model
             {
                 return Err(Cause::Source(
                     "local allowance belongs to another operation owner",

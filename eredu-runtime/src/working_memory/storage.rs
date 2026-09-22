@@ -1,7 +1,7 @@
 //! Atomic registration of retained physical storage in a shared request pool.
 
-use super::{WorkingMemoryError, WorkingMemoryFundingScope, WorkingMemoryPool, funding};
-use std::{any::TypeId, borrow::Borrow, cmp::Ordering, collections::BTreeMap, sync::Arc};
+use super::{MemoryLedger, WorkingMemoryError, WorkingMemoryFundingScope, funding};
+use std::{any::TypeId, borrow::Borrow, cmp::Ordering, sync::Arc};
 
 pub(in crate::working_memory) mod bounded_pin;
 pub(in crate::working_memory) mod bounded_publication;
@@ -18,10 +18,13 @@ use original_sources::OriginalSources;
 pub use original_sources::{
     OriginalStorageSourcesError, OriginalStorageSourcesLayout, RetainedOriginalStorageSources,
 };
+mod host_slots;
 mod host_transfer;
+pub use host_slots::PreparedStorageHostSlots;
 pub(in crate::working_memory) mod reset_layout;
 pub(super) use host_transfer::{
-    publish_dense_host_slots, dense_host_transfer_control_bytes,
+    dense_host_transfer_control_bytes, ordinary_dense_host_publication_bytes,
+    ordinary_dense_preparation_bytes, prepare_dense_host_metadata, publish_dense_host_slots,
 };
 
 #[cfg(test)]
@@ -29,46 +32,52 @@ mod pin_tests;
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone, Copy)]
-enum InventoryAdmission<'a> {
-    Register,
-    Funded {
-        scope: &'a WorkingMemoryFundingScope,
-        registrations: usize,
-    },
-    Pin,
-}
-
-impl InventoryAdmission<'_> {
-    fn capacity_matches(self, expected: u64, actual: u64) -> Result<(), WorkingMemoryError> {
-        same_capacity(expected, actual).map_err(|error| self.inventory_error(error))
-    }
-
-    fn inventory_error(self, error: WorkingMemoryError) -> WorkingMemoryError {
-        match (self, error) {
-            (Self::Pin, WorkingMemoryError::StorageCapacityMismatch { .. }) => {
-                WorkingMemoryError::IdentityMismatch
-            }
-            (_, error) => error,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Entry {
     // Assigned once when an original reset pins this canonical entry.
     reset_layout_id: Option<u64>,
     bytes: u64,
+    placement: Arc<eredu_core::MemoryPlacement>,
     owners: usize,
     funding: Option<u64>,
+    funding_allowance_bytes: u64,
+    native_retired: bool,
+    pending_allocation: bool,
     prepaid: Option<prepaid::PrepaidStorageOrigin>,
 }
 
 impl Entry {
-    fn charged(&self) -> Option<(u64, Option<u64>)> {
+    fn native_charge(
+        &self,
+    ) -> Option<(
+        funding::native_partition::NativePartition,
+        u64,
+        Arc<eredu_core::MemoryPlacement>,
+        u64,
+    )> {
         match &self.prepaid {
-            None => Some((self.bytes, self.funding)),
-            Some(origin) => origin.residual_source_charge().map(|bytes| (bytes, None)),
+            Some(prepaid::PrepaidStorageOrigin::Native(partition)) if !self.native_retired => {
+                Some((
+                    partition.clone(),
+                    self.bytes,
+                    Arc::clone(&self.placement),
+                    self.funding_allowance_bytes,
+                ))
+            }
+            _ => None,
+        }
+    }
+    fn charged(&self) -> Option<(u64, Option<u64>, Arc<eredu_core::MemoryPlacement>, u64)> {
+        match &self.prepaid {
+            None => Some((
+                self.bytes,
+                self.funding,
+                Arc::clone(&self.placement),
+                self.funding_allowance_bytes,
+            )),
+            Some(origin) => origin
+                .residual_source_charge()
+                .map(|bytes| (bytes, None, Arc::clone(&self.placement), 0)),
         }
     }
 }
@@ -114,12 +123,57 @@ impl<K: Ord> Ord for RegistryKey<K> {
 
 pub(in crate::working_memory) mod directory;
 pub(in crate::working_memory) mod native_publication;
-pub use native_publication::copy::{PreparedWorkspaceCopyPublication, WorkspaceCopyPublicationPlan};
+pub use native_publication::copy::{
+    PreparedWorkspaceCopyPublication, WorkspaceCopyPublicationPlan,
+};
+pub use native_publication::numerical::{
+    NumericalStoragePublicationPlan, NumericalStorageRegistration,
+    PreparedNumericalStoragePublication,
+};
 mod registry;
 mod source_inventory;
-use registry::{EntryLocator, Registry, RegistryBatch, RegistryEntry};
+use registry::{EntryLocator, Registry, RegistryBatch};
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
+    /// Observes the complete backing descriptor for a published storage identity.
+    /// This allocation-free diagnostic neither pins that storage nor grants
+    /// execution authority. Another owner may retire it after the observation.
+    pub fn registered_allocation<K: Ord + Send + 'static>(
+        &self,
+        key: &K,
+    ) -> Result<Option<StorageAllocation>, WorkingMemoryError> {
+        let usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        Ok(usage
+            .storage
+            .get(&TypeId::of::<K>())
+            .and_then(|value| value.downcast_ref::<Registry<K>>())
+            .and_then(|registry| registry.get(key))
+            .filter(|entry| !entry.pending_allocation && !entry.native_retired)
+            .map(|entry| StorageAllocation::new(entry.bytes, Arc::clone(&entry.placement))))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_capacity_for_test<K: Ord + Send + 'static>(
+        &self,
+        key: &K,
+    ) -> Result<Option<u64>, WorkingMemoryError> {
+        let usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        Ok(usage
+            .storage
+            .get(&TypeId::of::<K>())
+            .and_then(|value| value.downcast_ref::<Registry<K>>())
+            .and_then(|registry| registry.get(key))
+            .map(|entry| entry.bytes))
+    }
+
     /// Charges a complete physical inventory before admitting work that uses it.
     /// Equal keys of the same Rust type identify the same backing allocation;
     /// independent inventories and cloned registration handles count it once.
@@ -139,11 +193,17 @@ impl WorkingMemoryPool {
     /// It may also coexist with reservations within the shared capacity; callers
     /// must not use registration after allocation as permission to exceed an
     /// earlier reservation's bound.
-    pub fn register_storage<K: Clone + Ord + Send + 'static>(
+    #[cfg(test)]
+    pub(crate) fn register_host_storage<K: Clone + Ord + Send + 'static>(
         &self,
         storage: impl IntoIterator<Item = (K, u64)>,
     ) -> Result<WorkingMemoryStorage<K>, WorkingMemoryError> {
-        self.storage_grouped(storage, InventoryAdmission::Register)
+        self.register_storage(storage.into_iter().map(|(key, bytes)| {
+            (
+                key,
+                StorageAllocation::new(bytes, Arc::clone(&self.0.host_placement)),
+            )
+        }))
     }
 
     /// Pins a complete inventory only if every unique identity is already
@@ -152,266 +212,33 @@ impl WorkingMemoryPool {
     /// inventory with `IdentityMismatch`; no partial ownership is published.
     /// Equal keys share one pin, including zero-byte allocations.
     ///
-    /// This never charges new bytes or changes reserved balances, historical
-    /// peak or capacity ceilings. Pins preserve each allocation's existing
+    /// Payload bytes remain charged once; the new pin's host bookkeeping is
+    /// admitted atomically. Pins preserve each allocation's existing
     /// funding origin until its last registration retires; they do not create
     /// another funding account or grant permission to allocate. Keep physical
     /// identities valid as required by [`Self::register_storage`]. Key cloning
     /// happens before accounting is locked; key destruction precedes refunds
     /// outside that lock, including when this pin is the final owner.
-    pub fn pin_registered_storage<K: Clone + Ord + Send + 'static>(
+    #[cfg(test)]
+    pub(crate) fn pin_registered_storage<K: Clone + Ord + Send + 'static>(
         &self,
         storage: impl IntoIterator<Item = (K, u64)>,
     ) -> Result<WorkingMemoryStorage<K>, WorkingMemoryError> {
-        let (unique, bytes) = prepare_inventory(storage)
-            .map_err(|error| InventoryAdmission::Pin.inventory_error(error))?;
-        // Preserve ordinary provider Clone callbacks before accounting is locked.
-        // The finite owned-input route moves keys through the same commit worker.
-        let keys = unique.keys().cloned().collect();
-        let mut registration = WorkingMemoryStorage::pending(keys, bytes);
-        let mut rows = finite_pin::ordinals(unique.values().copied(), unique.len(), false)?;
-        self.commit_existing_pin(&mut registration, &mut rows)?;
-        Ok(registration)
-    }
-
-    fn storage_grouped<K: Clone + Ord + Send + 'static>(
-        &self,
-        storage: impl IntoIterator<Item = (K, u64)>,
-        admission: InventoryAdmission<'_>,
-    ) -> Result<WorkingMemoryStorage<K>, WorkingMemoryError> {
-        let (unique, bytes) =
-            prepare_inventory(storage).map_err(|error| admission.inventory_error(error))?;
-        // Key cloning is provider code; do it before touching shared accounting.
-        let keys = unique.keys().cloned().collect();
-        let mut registration = WorkingMemoryStorage::pending(keys, bytes);
-        self.commit_storage_inventory(unique, admission)?;
-        registration.activate(self.clone(), None);
-        Ok(registration)
-    }
-
-    /// Atomically charges a complete inventory and returns one independent
-    /// registration per unique allocation key. Retiring one handle releases
-    /// only that key; surviving handles do not retain unrelated allocations.
-    /// Equal keys share capacity with both grouped and individual registrations.
-    /// Duplicate keys must have the same certified capacity.
-    ///
-    /// The identity, physical-lifetime and admission requirements of
-    /// [`Self::register_storage`] also apply. Rejection publishes no handles and
-    /// changes neither current usage nor historical peak. Provider key cloning
-    /// and construction of the result map finish before accounting is locked.
-    /// Returned map keys are separate provider-owned identity clones. If keys
-    /// themselves pin physical storage, retain a registration until the
-    /// corresponding returned map key has also retired.
-    pub fn register_storage_individually<K: Clone + Ord + Send + 'static>(
-        &self,
-        storage: impl IntoIterator<Item = (K, u64)>,
-    ) -> Result<BTreeMap<K, WorkingMemoryStorage<K>>, WorkingMemoryError> {
-        self.storage_individually(storage, None)
-    }
-
-    /// Transfers a complete physical inventory from reserved funding into the
-    /// shared storage registry atomically. Only previously unregistered keys
-    /// consume the envelope; aliases transfer zero bytes. Total usage and peak
-    /// do not increase. Rejection changes neither funding nor storage accounting.
-    /// During a stamped span only its exact scope can publish on that account;
-    /// sibling inventories reject even when their incremental charge is zero.
-    ///
-    /// The provider must retain this scope through complete native settlement
-    /// and publication. Dropped handles return their allocation's credit to its
-    /// originating envelope while that run or its work remains active, including
-    /// quarantine after failed publication. After closure and certification,
-    /// final physical retirement releases the charge instead. Returned identity
-    /// keys obey the same pin-lifetime requirements as ordinary registrations.
-    pub fn adopt_storage_individually<K: Clone + Ord + Send + 'static>(
-        &self,
-        scope: &WorkingMemoryFundingScope,
-        storage: impl IntoIterator<Item = (K, u64)>,
-    ) -> Result<BTreeMap<K, WorkingMemoryStorage<K>>, WorkingMemoryError> {
-        scope.validate_domain(self)?;
-        scope.validate_native_purpose()?;
-        self.storage_individually(storage, Some(scope))
-    }
-
-    fn storage_individually<K: Clone + Ord + Send + 'static>(
-        &self,
-        storage: impl IntoIterator<Item = (K, u64)>,
-        funding: Option<&WorkingMemoryFundingScope>,
-    ) -> Result<BTreeMap<K, WorkingMemoryStorage<K>>, WorkingMemoryError> {
-        let (unique, _) = prepare_inventory(storage)?;
-        let mut registrations = unique
-            .iter()
-            .map(|(key, bytes)| {
-                (
-                    key.clone(),
-                    WorkingMemoryStorage::pending(vec![key.clone()], *bytes),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let admission = funding.map_or(InventoryAdmission::Register, |scope| {
-            InventoryAdmission::Funded {
-                scope,
-                registrations: registrations.len(),
-            }
-        });
-        self.commit_storage_inventory(unique, admission)?;
-        for registration in registrations.values_mut() {
-            registration.activate(self.clone(), funding.map(|scope| scope.id));
-        }
-        Ok(registrations)
-    }
-
-    fn commit_storage_inventory<K: Ord + Send + 'static>(
-        &self,
-        unique: BTreeMap<K, u64>,
-        admission: InventoryAdmission<'_>,
-    ) -> Result<(), WorkingMemoryError> {
-        let (scope, registrations) = match admission {
-            InventoryAdmission::Funded {
-                scope,
-                registrations,
-            } => (Some(scope), registrations),
-            _ => (None, 0),
-        };
-        let funding = scope.map(|scope| scope.id);
-        // Equal incoming keys are not inserted into the registry. Their Drop
-        // implementations may reenter accounting, so retain them until unlocked.
-        let mut duplicate_keys = Vec::with_capacity(unique.len());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        if let Some(id) = funding {
-            scope.expect("funded admission").validate_native_purpose()?;
-            let state = usage
-                .funding
-                .get(&id)
-                .ok_or(WorkingMemoryError::ExecutionFenced)?;
-            if state.native_scopes == 0 {
-                return Err(WorkingMemoryError::ExecutionFenced);
-            }
-            state.validate_span_spend(scope)?;
-        }
-        if unique.is_empty() {
-            return Ok(());
-        }
-        let registry = usage.storage.get(&TypeId::of::<K>()).map(|registry| {
-            registry
-                .downcast_ref::<Registry<K>>()
-                .expect("typed storage registry")
-        });
-        let mut incremental = 0u64;
-        let mut allocations = 0usize;
-        for (key, bytes) in &unique {
-            if let Some(prior) = registry.and_then(|registry| registry.get(key)) {
-                admission.capacity_matches(prior.bytes, *bytes)?;
-                if prior.prepaid.is_some() {
-                    // Raw aliases do not invent coverage or replace its origin.
-                    // Pure accounting pins retain their ordinary contract.
-                    if let Some(scope) = scope {
-                        validate_entry_origin(prior, &usage)?;
-                        usage
-                            .funding
-                            .get(&scope.id)
-                            .expect("validated scope")
-                            .validate_native_publication(scope)?;
-                    }
-                }
-                prior
-                    .owners
-                    .checked_add(1)
-                    .ok_or(WorkingMemoryError::Overflow)?;
-            } else {
-                if matches!(admission, InventoryAdmission::Pin) {
-                    return Err(WorkingMemoryError::IdentityMismatch);
-                }
-                allocations = allocations
-                    .checked_add(1)
-                    .ok_or(WorkingMemoryError::Overflow)?;
-                incremental = incremental
-                    .checked_add(*bytes)
-                    .ok_or(WorkingMemoryError::Overflow)?;
-            }
-        }
-        // Check the ordinary domain invariant for both paths. Funded adoption
-        // shifts existing coverage and needs no additional pool capacity.
-        let available = self.0.available(&usage, None)?;
-        let available = if let Some(id) = funding {
-            let state = usage.funding.get(&id).expect("validated funding scope");
-            state
-                .allocations
-                .checked_add(allocations)
-                .ok_or(WorkingMemoryError::Overflow)?;
-            state
-                .registrations
-                .checked_add(registrations)
-                .ok_or(WorkingMemoryError::Overflow)?;
-            state.spendable_remaining()?
-        } else {
-            available
-        };
-        if incremental > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
-                required_bytes: incremental,
-                available_bytes: available,
-            });
-        }
-        if let Some(id) = funding {
-            let state = usage.funding.get_mut(&id).expect("validated funding scope");
-            state.remaining -= incremental;
-            state.allocations += allocations;
-            state.registrations += registrations;
-            usage.reserved -= incremental;
-        }
-        usage.registered += incremental;
-        usage.peak = usage
-            .peak
-            .max(self.0.existing + usage.registered + usage.reserved);
-        let registry = usage
-            .storage
-            .entry(TypeId::of::<K>())
-            .or_insert_with(|| Box::new(Registry::<K>::new()))
-            .downcast_mut::<Registry<K>>()
-            .expect("typed storage registry");
-        for (key, bytes) in unique {
-            if let Some(entry) = registry.get_mut(&key) {
-                entry.owners += 1;
-                duplicate_keys.push(key);
-            } else {
-                registry.insert(
-                    RegistryKey::Owned(key),
-                    Entry {
-                        reset_layout_id: None,
-                        prepaid: None,
-                        bytes,
-                        owners: 1,
-                        funding,
-                    },
-                );
-            }
-        }
-        drop(usage);
-        drop(duplicate_keys);
-        Ok(())
+        let entries: Vec<_> = storage.into_iter().collect();
+        StoragePublicationLayout::new(entries.len())?
+            .fund(self)?
+            .pin_registered_storage(entries)
     }
 }
 
-fn prepare_inventory<K: Ord>(
-    storage: impl IntoIterator<Item = (K, u64)>,
-) -> Result<(BTreeMap<K, u64>, u64), WorkingMemoryError> {
-    let mut unique = BTreeMap::new();
-    for (key, bytes) in storage {
-        if let Some(prior) = unique.insert(key, bytes) {
-            same_capacity(prior, bytes)?;
-        }
-    }
-    let bytes = unique.values().try_fold(0u64, |total, bytes| {
-        total
-            .checked_add(*bytes)
-            .ok_or(WorkingMemoryError::Overflow)
-    })?;
-    Ok((unique, bytes))
-}
+mod cold_metadata;
+pub use cold_metadata::{StorageRegistrationValues, StorageRegistrations};
+mod prepared;
+pub use prepared::{PreparedStoragePublication, StoragePublicationLayout};
+mod pending_allocation;
+pub use pending_allocation::PendingStorageAllocation;
+mod physical;
+pub use physical::StorageAllocation;
 
 fn same_capacity(expected_bytes: u64, actual_bytes: u64) -> Result<(), WorkingMemoryError> {
     if expected_bytes == actual_bytes {
@@ -428,12 +255,14 @@ fn same_capacity(expected_bytes: u64, actual_bytes: u64) -> Result<(), WorkingMe
 struct Registration<K: Ord + Send + 'static> {
     // Result owners are staged before admission and activated after a successful
     // commit. A rejected batch must not retire keys it never registered.
-    pool: Option<WorkingMemoryPool>,
+    pool: Option<MemoryLedger>,
     keys: Vec<K>,
-    bytes: u64,
+    bytes: Option<u64>,
     funding: Option<u64>,
     // Library-owned ordinary preparation, not part of any reset grant.
     original_sources: Option<OriginalSources>,
+    completed_source: Option<super::workspace_copy::completed::CompletedSourceCustody>,
+    completed_numerical: Option<super::OriginalNumericalBudgetCustody>,
     // The prepared copy producer pays these key/Vec/Arc controls independently
     // of the physical B charge. Field-last through canonical row retirement.
     preparation: Option<eredu_core::HostPreparationAuthority>,
@@ -463,18 +292,36 @@ impl<K: Ord + Send + 'static> Drop for Registration<K> {
                 .entry
                 .as_ref()
                 .and_then(|(_, entry)| entry.charged());
+            let pending_released = retired
+                .entry
+                .as_ref()
+                .is_some_and(|(_, entry)| entry.pending_allocation);
+            let native_released = retired
+                .entry
+                .as_ref()
+                .and_then(|(_, entry)| entry.native_charge());
             // Identity keys can themselves pin inline physical payload bytes.
             // Destroy every key outside the lock, before refunding its charge.
             // A panic conservatively retains that charge. Reentrant registration
             // of the same identity may temporarily overlap it, never undercount it.
             retired.retire_with_key(key);
-            if let Some((bytes, origin)) = released {
-                let mut usage = funding::lock_for_retirement(pool);
-                if let Some(id) = origin {
-                    funding::retire_allocation(&mut usage, id, bytes);
-                } else {
-                    usage.registered -= bytes;
+            if let Some((partition, bytes, placement, allowance)) = native_released {
+                {
+                    let mut usage = funding::lock_for_retirement(pool);
+                    partition.retire_registered(&mut usage, bytes, &placement, allowance);
                 }
+                drop(partition);
+            }
+            if let Some((bytes, origin, placement, allowance)) = released {
+                let mut usage = funding::lock_for_retirement(pool);
+                funding::retire_placed_allocation_mode(
+                    &mut usage,
+                    origin,
+                    bytes,
+                    &placement,
+                    allowance,
+                    pending_released,
+                );
             }
         }
         if let Some(id) = self.funding {
@@ -523,6 +370,74 @@ impl<K: Ord + Send + 'static> Drop for StorageOwner<K> {
 }
 
 impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
+    pub(in crate::working_memory) fn validate_completed_numerical_custody(
+        &self,
+        account: &super::OriginalNumericalBudgetCustody,
+    ) -> Result<(), WorkingMemoryError> {
+        if !self.0.keys.is_empty()
+            || !self
+                .0
+                .completed_numerical
+                .as_ref()
+                .is_some_and(|origin| origin.same_account(account))
+        {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let pool = self
+            .0
+            .pool
+            .as_ref()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let usage = pool
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        self.validate_copy_source(pool, &usage)
+    }
+
+    /// Called only by the successfully attached native sidecar after the
+    /// backing's safe physical retirement. Stale accounting aliases keep the
+    /// authenticated descriptor, but cannot keep or replay its physical charge.
+    /// The closed numerical publisher also uses this to withdraw a fresh row
+    /// after an abandoned attachment. Numerical origins only lose discovery;
+    /// their existing native observer remains the sole payload refund owner.
+    pub(in crate::working_memory) fn retire_native_backing(&self) {
+        let Some(pool) = &self.0.pool else {
+            return;
+        };
+        for key in &self.0.keys {
+            let mut usage = funding::lock_for_retirement(pool);
+            let native = {
+                let Some(registry) = usage
+                    .storage
+                    .get_mut(&TypeId::of::<K>())
+                    .and_then(|registry| registry.downcast_mut::<Registry<K>>())
+                else {
+                    continue;
+                };
+                let Some((locator, entry)) = registry.locate(key) else {
+                    continue;
+                };
+                let native = entry.native_charge();
+                if native.is_some()
+                    || matches!(
+                        &entry.prepaid,
+                        Some(prepaid::PrepaidStorageOrigin::Numerical(_))
+                    )
+                {
+                    registry.at_mut(locator).native_retired = true;
+                }
+                native
+            };
+            if let Some((partition, bytes, placement, allowance)) = native {
+                partition.retire_registered(&mut usage, bytes, &placement, allowance);
+                drop(usage);
+                drop(partition);
+            }
+        }
+    }
+
     /// Whether these live registrations cover exactly the same registered
     /// keys and capacity in the same pool. Extra original-source custody is
     /// deliberately excluded. This observation neither transfers ownership nor
@@ -531,8 +446,16 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
     pub fn same_registered_storage(&self, other: &Self) -> bool {
         self.0.original_sources.is_none()
             && other.0.original_sources.is_none()
-            && self.0.pool.as_ref().zip(other.0.pool.as_ref())
-                .is_some_and(|(a, b)| a.same_domain(b))
+            && self.0.completed_source.is_none()
+            && other.0.completed_source.is_none()
+            && self.0.completed_numerical.is_none()
+            && other.0.completed_numerical.is_none()
+            && self
+                .0
+                .pool
+                .as_ref()
+                .zip(other.0.pool.as_ref())
+                .is_some_and(|(a, b)| a.same_ledger(b))
             && self.0.bytes == other.0.bytes
             && self.0.keys == other.0.keys
     }
@@ -542,19 +465,25 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
     // health rather than treating a cold identity snapshot as settled work.
     pub(super) fn validate_copy_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &super::Usage,
     ) -> Result<(), WorkingMemoryError> {
         if self
             .0
             .pool
             .as_ref()
-            .is_none_or(|source| !source.same_domain(pool))
+            .is_none_or(|source| !source.same_ledger(pool))
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         if let Some(sources) = &self.0.original_sources {
             sources.validate_in(pool, usage)?;
+        }
+        if let Some(source) = &self.0.completed_source {
+            source.validate(pool, usage)?;
+        }
+        if let Some(source) = &self.0.completed_numerical {
+            source.validate_copy_source(pool, usage)?;
         }
         if self.0.keys.is_empty() {
             return Ok(());
@@ -657,12 +586,17 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
     }
 
     fn pending(keys: Vec<K>, bytes: u64) -> Self {
+        Self::pending_domains(keys, Some(bytes))
+    }
+    fn pending_domains(keys: Vec<K>, bytes: Option<u64>) -> Self {
         Self(StorageOwner(Some(Arc::new(Registration {
             pool: None,
             keys,
             bytes,
             funding: None,
             original_sources: None,
+            completed_source: None,
+            completed_numerical: None,
             preparation: None,
         }))))
     }
@@ -679,7 +613,7 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
         value
     }
 
-    fn activate(&mut self, pool: WorkingMemoryPool, funding: Option<u64>) {
+    fn activate(&mut self, pool: MemoryLedger, funding: Option<u64>) {
         // Staged handles have not been published or cloned. Activation does not
         // invoke key code, allocate payloads or repeat shared-accounting checks.
         let registration = Arc::get_mut(&mut self.0).expect("unpublished storage registration");
@@ -707,13 +641,13 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?
             .clone();
-        if !sources.same_domain(&pool)
+        if !sources.same_ledger(&pool)
             || self.0.original_sources.is_some()
             || Arc::strong_count(&self.0) != 1
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let mut bytes = self.0.bytes;
+        let mut bytes = self.0.bytes.ok_or(WorkingMemoryError::Overflow)?;
         for source in sources.sources() {
             let key = source.metadata().identity().registry_key();
             if self
@@ -744,21 +678,51 @@ impl<K: Ord + Send + 'static> WorkingMemoryStorage<K> {
             }
         }
         let registration = Arc::get_mut(&mut self.0).expect("unpublished original-source carrier");
-        registration.bytes = bytes;
+        registration.bytes = Some(bytes);
         registration.original_sources = Some(OriginalSources::Unquoted(sources.take()));
+        Ok(self)
+    }
+
+    pub(in crate::working_memory) fn with_completed_source(
+        mut self,
+        custody: super::workspace_copy::completed::CompletedSourceCustody,
+        bytes: Option<u64>,
+    ) -> Result<Self, WorkingMemoryError> {
+        let pool = self
+            .0
+            .pool
+            .as_ref()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        if self.0.completed_source.is_some() || Arc::strong_count(&self.0) != 1 {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        {
+            let usage = pool
+                .0
+                .usage
+                .lock()
+                .map_err(|_| WorkingMemoryError::Poisoned)?;
+            custody.validate(pool, &usage)?;
+        }
+        let registration = Arc::get_mut(&mut self.0).expect("private completed source pin");
+        registration.bytes = registration
+            .bytes
+            .zip(bytes)
+            .and_then(|(a, b)| a.checked_add(b));
+        registration.completed_source = Some(custody);
         Ok(self)
     }
 
     /// Full unique capacity covered by this inventory, including aliases shared
     /// with other registrations. It is not an additional charge per handle.
-    pub fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> Option<u64> {
         self.0.bytes
     }
 }
 
 // Shared by ordinary source validation and the bounded existing-only commit.
 fn validate_entry_origin(entry: &Entry, usage: &super::Usage) -> Result<(), WorkingMemoryError> {
-    if entry.owners == 0 {
+    if entry.owners == 0 || entry.native_retired || entry.pending_allocation {
         return Err(WorkingMemoryError::IdentityMismatch);
     }
     if let Some(partition) = &entry.prepaid {

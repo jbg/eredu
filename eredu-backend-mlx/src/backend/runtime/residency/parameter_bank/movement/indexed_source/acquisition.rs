@@ -101,7 +101,7 @@ impl OriginalIndexedChunkSource {
             .map_err(|error|self.failure(Cause::Residency(error)))?;
         self.validate_completion_source("acquired parameter context","acquired parameter bank")?;
         b.acquired.set(true);
-        Ok(AcquiredParameterGroups { identities, demand:counts, scratch_bytes, pass, transfer, original:Some(self.clone()) })
+        Ok(AcquiredParameterGroups { identities, demand:counts, scratch_bytes, pass, transfer, original:Some(self.clone()), ordinary:None, ordinary_chunk:None })
     }
 
     pub(in crate::backend::runtime::residency::parameter_bank) fn validate_acquisition_bank(

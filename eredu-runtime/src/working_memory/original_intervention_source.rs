@@ -1,6 +1,6 @@
 //! Fresh immutable intervention declarations under the shared original source compiler.
 use super::original_declaration_source::Account;
-use super::{WorkingMemoryError, WorkingMemoryPool, loaded_decode_source::Allowance};
+use super::{MemoryLedger, WorkingMemoryError, loaded_decode_source::Allowance};
 use eredu_core::{
     HostPreparationAuthority,
     capture::CapturePlanCopyError,
@@ -25,7 +25,7 @@ impl OriginalInterventionSource {
     pub fn validation_control_bytes() -> Option<usize> {
         [
             size_of::<&Self>(),
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<std::sync::MutexGuard<'_, Allowance>>(),
             size_of::<WorkingMemoryError>(),
             size_of::<Result<(), WorkingMemoryError>>(),
@@ -36,7 +36,7 @@ impl OriginalInterventionSource {
     /// Check the exact source domain and its private owner mutex. Request/pool
     /// admission health is validated separately by the consuming request. This
     /// grants no publication, quote or execution.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.account.validate(pool)
     }
     /// Identity of the physical immutable source, never a semantic digest.
@@ -72,7 +72,7 @@ impl OriginalInterventionSourceError {
         }
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Exact source destination and closed-account controls. The borrowed plan
     /// determines every copied String/Vec; no caller amount is accepted.
     pub fn intervention_source_required_bytes(

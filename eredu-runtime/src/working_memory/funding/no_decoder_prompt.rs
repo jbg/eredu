@@ -10,7 +10,7 @@ impl WorkingMemoryFundingRun {
         reservation: &WorkingMemoryReservation,
         complete_source: WorkingMemoryStorage<K>,
     ) -> Result<WorkingMemoryFundingScope, WorkingMemoryError> {
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         // Build/retire the pin bundle outside the usage lock. It belongs only
@@ -53,6 +53,7 @@ impl WorkingMemoryFundingRun {
             borrowed_storage: Some(pins),
             capture_source: None,
             native_publication_identity: None,
+            allocation_funding: None,
         })
     }
 }

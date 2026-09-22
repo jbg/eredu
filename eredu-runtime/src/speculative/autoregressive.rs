@@ -3,17 +3,18 @@
 //! Models retain their ordinary equations, residency and state geometry. This
 //! mechanism owns only proposal isolation, verification and accepted-prefix replay.
 use eredu_core::{
-    execution_control::SnapshotEstimate, BoundedCompletion, SpeculativeCommit, SpeculativeExecutor,
-    SpeculativePrefill, SpeculativePrefillOutcome, Submission,
+    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill,
+    SpeculativePrefillOutcome, Submission, execution_control::SnapshotEstimate,
 };
 
 mod occurrence;
 mod occurrence_owners;
-use occurrence_owners::OccurrenceOwners;
 pub use occurrence::{
-    AutoregressiveContinuation, AutoregressiveInvocation, AutoregressiveInvocationDomain, AutoregressiveOccurrenceClaim, AutoregressiveOccurrenceCursor,
-    AutoregressiveOccurrenceError, AutoregressiveScheduleIdentity, AutoregressiveSchedulePlan, AutoregressiveSource,
+    AutoregressiveContinuation, AutoregressiveInvocation, AutoregressiveInvocationDomain,
+    AutoregressiveOccurrenceClaim, AutoregressiveOccurrenceCursor, AutoregressiveOccurrenceError,
+    AutoregressiveScheduleIdentity, AutoregressiveSchedulePlan, AutoregressiveSource,
 };
+use occurrence_owners::OccurrenceOwners;
 
 /// Attribution of a model invocation within an independent-draft transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,8 @@ pub trait AutoregressiveMechanisms {
     type Checkpoint: Clone;
     /// Complete sequence logits.
     type Output;
+    /// Tensor exposed by the same ordinary model observation hooks.
+    type Activation: 'static;
     /// One sampling distribution.
     type Logits;
     /// Selected native placement.
@@ -73,7 +76,8 @@ pub trait AutoregressiveMechanisms {
         _request: eredu_core::generation::SpeculativeRequestId,
         context: Self::Context<'a>,
     ) -> Result<Self::Context<'a>, Self::Error>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
         Ok(context)
     }
@@ -84,16 +88,18 @@ pub trait AutoregressiveMechanisms {
         None
     }
     /// Original host destination for shared proposal/history bookkeeping.
-    fn driver_buffer<T>(capacity: usize, _context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<T>, Self::Error>
-    {
+    fn driver_buffer<T>(
+        capacity: usize,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<T>, Self::Error> {
         Ok(eredu_core::SpeculativeBuffer::with_capacity(capacity))
     }
     /// Admits one concrete host metadata constructor. Managed mechanisms reject
     /// unknown storage before allocation; ordinary construction is unchanged.
-    fn driver_host_metadata(_bytes: Option<usize>, _context: Self::Context<'_>)
-        -> Result<eredu_core::HostPreparationAuthority, Self::Error>
-    {
+    fn driver_host_metadata(
+        _bytes: Option<usize>,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
         Ok(eredu_core::HostPreparationAuthority::unmanaged())
     }
     /// Exact query for the same actual host destination producer.
@@ -101,14 +107,20 @@ pub trait AutoregressiveMechanisms {
         eredu_core::SpeculativeBuffer::<T>::retained_control_bytes(capacity)
     }
     /// Creates an exact canonical request identity.
-    fn driver_identity(_context: Self::Context<'_>) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
+    fn driver_identity(
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
         Ok(eredu_core::SpeculativeRequestIdentity::new())
     }
     /// Copies the actual canonical sequence before a shared transaction.
-    fn copy_sequence(source: eredu_core::SpeculativeSequenceRef<'_>, _context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
+    fn copy_sequence(
+        source: eredu_core::SpeculativeSequenceRef<'_>,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
     {
-        source.copy_ordinary().map_err(eredu_core::SpeculativeDriverError::Preparation)
+        source
+            .copy_ordinary()
+            .map_err(eredu_core::SpeculativeDriverError::Preparation)
     }
     /// Complete provider copy request for controlled snapshot estimation.
     fn sequence_copy_bytes(source: &eredu_core::SpeculativeSequence) -> Option<u64> {
@@ -148,8 +160,13 @@ pub trait AutoregressiveMechanisms {
     }
     /// Keeps later lane cancellation/completion scheduling in the same agreement.
     /// Preserves an admitted scheduler destination through coordination.
-    fn coordinate_speculative_buffer(local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+    fn coordinate_speculative_buffer(
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<
+        eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        eredu_core::BackendFailure,
+    > {
         match local.try_into_ordinary() {
             Ok(local) => Self::coordinate_speculative_step(local, context).map(Into::into),
             Err(_) => Err(eredu_core::HostMetadataFundingError::Unavailable.into()),
@@ -207,7 +224,9 @@ pub trait AutoregressiveMechanisms {
     fn prepare_continuation(
         _continuation: &AutoregressiveContinuation,
         _context: Self::Context<'_>,
-    ) -> Result<(), Self::Error> { Ok(()) }
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Prepares the exact source/pass/width before the existing decoder can
     /// allocate inputs or mutate state. An original implementation consumes its
@@ -238,6 +257,103 @@ pub trait AutoregressiveMechanisms {
     ) -> Result<T, Self::Error> {
         Self::before_invocation(model, state, claim, context)?;
         run(model, state)
+    }
+
+    /// Source-aware form of the same invocation loan. Implementations must
+    /// authenticate and price observation before the once-only worker callback.
+    fn with_observed_invocation<T>(
+        model: &mut Self::Model,
+        state: &mut Self::State,
+        input: Option<&Self::Input>,
+        claim: AutoregressiveOccurrenceClaim<'_>,
+        context: Self::Context<'_>,
+        _phase: eredu_core::speculative::SpeculativeActivationPhase,
+        observer: Option<
+            &mut dyn crate::inspection::SpeculativeActivationObserver<Self::Activation, Self::Error>,
+        >,
+        run: impl FnOnce(
+            &mut Self::Model,
+            &mut Self::State,
+            Option<
+                &mut dyn crate::inspection::SpeculativeActivationObserver<
+                    Self::Activation,
+                    Self::Error,
+                >,
+            >,
+        ) -> Result<T, Self::Error>,
+    ) -> Result<T, Self::Error> {
+        if observer.is_some() {
+            return Err(Self::invalid(
+                "selected invocation has no observed source producer",
+            ));
+        }
+        Self::with_invocation(model, state, input, claim, context, |model, state| {
+            run(model, state, None)
+        })
+    }
+
+    /// Executes the same prefill worker, retaining the collector through every
+    /// exact physical span. The collector does not grant native role authority.
+    fn prefill_with_observer(
+        model: &mut Self::Model,
+        input: &Self::Input,
+        state: &mut Self::State,
+        pass: AutoregressivePass,
+        cancellation: &eredu_core::GenerationCancellationToken,
+        context: Self::Context<'_>,
+        observer: Option<
+            &mut dyn crate::inspection::SpeculativeActivationObserver<Self::Activation, Self::Error>,
+        >,
+    ) -> Result<SpeculativePrefillOutcome<AutoregressivePrefill<Self::Logits>>, Self::Error> {
+        if observer.is_some() {
+            return Err(Self::invalid(
+                "selected prefill has no observed source producer",
+            ));
+        }
+        Self::prefill(model, input, state, pass, cancellation, context)
+    }
+
+    /// Executes the same cached-sequence worker with its source-bound collector.
+    fn decode_with_observer(
+        model: &mut Self::Model,
+        tokens: &[u32],
+        state: &mut Self::State,
+        pass: AutoregressivePass,
+        context: Self::Context<'_>,
+        observer: Option<
+            &mut dyn crate::inspection::SpeculativeActivationObserver<Self::Activation, Self::Error>,
+        >,
+    ) -> Result<Self::Output, Self::Error> {
+        if observer.is_some() {
+            return Err(Self::invalid(
+                "selected decode has no observed source producer",
+            ));
+        }
+        Self::decode(model, tokens, state, pass, context)
+    }
+
+    /// Creates one admitted source-only collector before any model execution.
+    fn activation_observer(
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+        _request: eredu_core::SpeculativeRequestId,
+        _context: Self::Context<'_>,
+    ) -> Result<
+        Option<
+            Box<
+                dyn crate::inspection::SpeculativeActivationObserver<Self::Activation, Self::Error>,
+            >,
+        >,
+        eredu_core::speculative::SpeculativeControlError,
+    > {
+        if plan.is_empty() {
+            Ok(None)
+        } else {
+            Err(
+                eredu_core::speculative::SpeculativeControlError::Unsupported(
+                    "selected independent source has no internal capture collector",
+                ),
+            )
+        }
     }
 
     /// Retains immutable verification inputs before decoding can mutate a cache.
@@ -286,6 +402,7 @@ pub struct AutoregressiveCache<S> {
 
 /// Immutable joint rollback boundary.
 pub struct AutoregressiveCheckpoint<C> {
+    activations: Option<crate::capture::SpeculativeActivationCheckpoint>,
     target: C,
     draft: C,
 }
@@ -293,6 +410,7 @@ pub struct AutoregressiveCheckpoint<C> {
 /// Private draft branch. Cloning never shares mutable cache storage.
 #[derive(Clone)]
 pub struct AutoregressiveProposal<C> {
+    depth: usize,
     saved: C,
 }
 
@@ -308,6 +426,10 @@ pub struct AutoregressiveExecutor<'a, M: AutoregressiveMechanisms> {
     draft: &'a mut M::Model,
     capacity: std::num::NonZeroUsize,
     occurrences: OccurrenceOwners<'a>,
+    observer:
+        Option<Box<dyn crate::inspection::SpeculativeActivationObserver<M::Activation, M::Error>>>,
+    execution_started: bool,
+    capture_configured: bool,
 }
 
 impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
@@ -322,6 +444,9 @@ impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
             draft,
             capacity,
             occurrences: OccurrenceOwners::Uninstalled,
+            observer: None,
+            execution_started: false,
+            capture_configured: false,
         }
     }
     /// Borrows this exact selected independent-model execution to prepare its
@@ -375,7 +500,9 @@ impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
         context: M::Context<'_>,
     ) -> Result<Self, M::Error> {
         if !matches!(self.occurrences, OccurrenceOwners::Uninstalled) {
-            return Err(M::occurrence_error(AutoregressiveOccurrenceError::Selection));
+            return Err(M::occurrence_error(
+                AutoregressiveOccurrenceError::Selection,
+            ));
         }
         self.occurrences = OccurrenceOwners::prepare::<M>(plans, self.capacity, context)?;
         Ok(self)
@@ -386,7 +513,11 @@ impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
         &mut self,
         context: M::Context<'_>,
     ) -> Result<AutoregressiveCache<M::State>, M::Error> {
-        if let Some(cursor) = self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)? {
+        if let Some(cursor) = self
+            .occurrences
+            .select(M::occurrence_request(context))
+            .map_err(M::occurrence_error)?
+        {
             cursor
                 .try_borrow_mut()
                 .map_err(|_| M::occurrence_error(AutoregressiveOccurrenceError::Reentrant))?
@@ -424,38 +555,134 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
     type Telemetry = M::Telemetry;
     type Error = M::Error;
 
+    fn configure_activation_capture<'a>(
+        &mut self,
+        plan: eredu_core::speculative::AdmittedSpeculativeActivations,
+        request: eredu_core::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        if self.execution_started || self.capture_configured {
+            return Err(
+                eredu_core::speculative::SpeculativeControlError::Unsupported(
+                    "activation authority must be installed once before independent execution",
+                ),
+            );
+        }
+        self.observer = M::activation_observer(&plan, request, context)?;
+        self.capture_configured = true;
+        Ok(())
+    }
+    fn requires_activation_origin(&self) -> bool {
+        self.observer.is_some()
+    }
+    fn set_activation_origin(
+        &mut self,
+        origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+    ) {
+        if let Some(observer) = &mut self.observer {
+            observer.set_activation_origin(origin);
+        }
+    }
+    fn take_activation_capture(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
+        self.observer
+            .as_mut()
+            .and_then(|observer| observer.take_activation_capture())
+    }
+    fn take_activation_error(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeControlError> {
+        self.observer
+            .as_mut()
+            .and_then(|observer| observer.take_activation_error())
+    }
+    fn validate_activation_readmission(
+        &self,
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+        discovery: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        match &self.observer {
+            Some(observer) => observer.validate_activation_readmission(plan, discovery),
+            None => plan
+                .validate(discovery.ok_or(
+                    eredu_core::speculative::SpeculativeControlError::Unsupported(
+                        "loaded execution has no internal activation discovery",
+                    ),
+                )?)
+                .map_err(Into::into),
+        }
+    }
+    fn readmit_activation_interventions(
+        &mut self,
+        plan: eredu_core::speculative::AdmittedSpeculativeActivations,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        self.observer
+            .as_mut()
+            .ok_or(
+                eredu_core::speculative::SpeculativeControlError::Unsupported(
+                    "internal re-admission requires capture authority from run creation",
+                ),
+            )?
+            .readmit_activation_interventions(plan)
+    }
+
     fn take_retained_failure(
         error: Self::Error,
     ) -> Result<eredu_core::BackendFailure, Self::Error> {
         M::take_retained_failure(error)
     }
 
-    fn driver_buffer<T>(&self, capacity: usize, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeBuffer<T>, Self::Error>
-    {
+    fn driver_buffer<T>(
+        &self,
+        capacity: usize,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<T>, Self::Error> {
         M::driver_buffer(capacity, context)
     }
 
-    fn driver_host_metadata(&self, bytes: Option<usize>, context: Self::Context<'_>)
-        -> Result<eredu_core::HostPreparationAuthority, Self::Error>
-    {
+    fn driver_host_metadata(
+        &self,
+        bytes: Option<usize>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
         M::driver_host_metadata(bytes, context)
     }
-    fn driver_buffer_bytes<T>(&self, capacity: usize) -> Option<usize> { M::driver_buffer_bytes::<T>(capacity) }
-    fn request_context<'a>(&self, request: eredu_core::generation::SpeculativeRequestId,
-        context: Self::Context<'a>) -> Result<Self::Context<'a>, Self::Error>
-    where Self: 'a,
+    fn driver_buffer_bytes<T>(&self, capacity: usize) -> Option<usize> {
+        M::driver_buffer_bytes::<T>(capacity)
+    }
+    fn request_context<'a>(
+        &self,
+        request: eredu_core::generation::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Context<'a>, Self::Error>
+    where
+        Self: 'a,
     {
         M::request_context(request, context)
     }
-    fn driver_identity(&self, context: Self::Context<'_>) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> { M::driver_identity(context) }
-    fn coordinate_speculative_buffer<'a>(&mut self, local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, context: Self::Context<'a>)
-        -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+    fn driver_identity(
+        &self,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
+        M::driver_identity(context)
+    }
+    fn coordinate_speculative_buffer<'a>(
+        &mut self,
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        eredu_core::BackendFailure,
+    > {
         M::coordinate_speculative_buffer(local, context)
     }
 
-    fn copy_sequence(&self, source: eredu_core::SpeculativeSequenceRef<'_>, context: Self::Context<'_>)
-        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
+    fn copy_sequence(
+        &self,
+        source: eredu_core::SpeculativeSequenceRef<'_>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
     {
         M::copy_sequence(source, context)
     }
@@ -517,18 +744,28 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         SpeculativePrefillOutcome<SpeculativePrefill<Self::TargetState, Self::Logits>>,
         Self::Error,
     > {
+        self.execution_started = true;
         let target = match prefill_invocation::<M>(
-            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
+            self.occurrences
+                .select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)?,
             self.target,
             &input,
             &mut cache.target,
             AutoregressivePass::TargetPrefill,
             cancellation,
+            self.observer.as_mut().map(|observer| {
+                observer.as_mut()
+                    as &mut dyn crate::inspection::SpeculativeActivationObserver<
+                        M::Activation,
+                        M::Error,
+                    >
+            }),
             context,
         )? {
             SpeculativePrefillOutcome::Complete(target) => target,
             SpeculativePrefillOutcome::Cancelled { evaluated_tokens } => {
-                return Ok(SpeculativePrefillOutcome::Cancelled { evaluated_tokens })
+                return Ok(SpeculativePrefillOutcome::Cancelled { evaluated_tokens });
             }
         };
         if target.evaluated_tokens == 0 {
@@ -540,19 +777,28 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
             .logits
             .ok_or_else(|| M::invalid("target prefill has no selected logits"))?;
         let draft = match prefill_invocation::<M>(
-            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
+            self.occurrences
+                .select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)?,
             self.draft,
             &input,
             &mut cache.draft,
             AutoregressivePass::DraftPrefill,
             cancellation,
+            self.observer.as_mut().map(|observer| {
+                observer.as_mut()
+                    as &mut dyn crate::inspection::SpeculativeActivationObserver<
+                        M::Activation,
+                        M::Error,
+                    >
+            }),
             context,
         )? {
             SpeculativePrefillOutcome::Complete(draft) => draft,
             SpeculativePrefillOutcome::Cancelled { .. } => {
                 return Ok(SpeculativePrefillOutcome::Cancelled {
                     evaluated_tokens: target.evaluated_tokens,
-                })
+                });
             }
         };
         if draft.evaluated_tokens != target.evaluated_tokens || draft.logits.is_some() {
@@ -580,6 +826,7 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
             return Err(M::invalid("invalid independent draft proposal capacity"));
         }
         Ok(AutoregressiveProposal {
+            depth: 0,
             saved: state.clone(),
         })
     }
@@ -590,13 +837,28 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         last_token: u32,
         context: Self::Context<'_>,
     ) -> Result<Self::Logits, Self::Error> {
+        self.execution_started = true;
+        let depth = proposal.depth;
+        proposal.depth = depth
+            .checked_add(1)
+            .ok_or_else(|| M::invalid("proposal observation depth overflow"))?;
         let mut state = M::restore(&proposal.saved, context)?;
         let output = decode_invocation::<M>(
-            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
+            self.occurrences
+                .select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)?,
             self.draft,
             &[last_token],
             &mut state,
             AutoregressivePass::Proposal,
+            eredu_core::speculative::SpeculativeActivationPhase::Proposal { depth },
+            self.observer.as_mut().map(|observer| {
+                observer.as_mut()
+                    as &mut dyn crate::inspection::SpeculativeActivationObserver<
+                        M::Activation,
+                        M::Error,
+                    >
+            }),
             context,
         )?;
         proposal.saved = M::checkpoint(&state)?;
@@ -605,6 +867,7 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
         Ok(AutoregressiveCheckpoint {
+            activations: None,
             target: M::checkpoint(&cache.target)?,
             draft: M::checkpoint(&cache.draft)?,
         })
@@ -632,14 +895,25 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         if tokens.is_empty() || tokens.len() > self.capacity.get().saturating_add(1) {
             return Err(M::invalid("invalid independent draft verification width"));
         }
+        self.execution_started = true;
         // Refusal cannot follow a partially submitted verification transaction.
         let retained_tokens = M::verification_tokens(tokens, context)?;
         let output = decode_invocation::<M>(
-            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
+            self.occurrences
+                .select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)?,
             self.target,
             tokens,
             &mut cache.target,
             AutoregressivePass::Verification,
+            eredu_core::speculative::SpeculativeActivationPhase::Verification,
+            self.observer.as_mut().map(|observer| {
+                observer.as_mut()
+                    as &mut dyn crate::inspection::SpeculativeActivationObserver<
+                        M::Activation,
+                        M::Error,
+                    >
+            }),
             context,
         )?;
         let completion = M::completion(&output, context)?;
@@ -676,15 +950,26 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         if verified == 0 || verified > output.tokens.len() {
             return Err(M::invalid("invalid independent verification commitment"));
         }
+        self.execution_started = true;
         let tokens = &output.tokens[..verified];
         let replayed = if verified < output.tokens.len() {
             let mut state = M::restore(&saved.target, context)?;
             decode_invocation::<M>(
-                self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
+                self.occurrences
+                    .select(M::occurrence_request(context))
+                    .map_err(M::occurrence_error)?,
                 self.target,
                 tokens,
                 &mut state,
                 AutoregressivePass::TargetCommit,
+                eredu_core::speculative::SpeculativeActivationPhase::TargetReplay,
+                self.observer.as_mut().map(|observer| {
+                    observer.as_mut()
+                        as &mut dyn crate::inspection::SpeculativeActivationObserver<
+                            M::Activation,
+                            M::Error,
+                        >
+                }),
                 context,
             )?;
             cache.target = state;
@@ -694,11 +979,21 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         };
         let mut draft = M::restore(&saved.draft, context)?;
         decode_invocation::<M>(
-            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
+            self.occurrences
+                .select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)?,
             self.draft,
             tokens,
             &mut draft,
             AutoregressivePass::DraftCommit,
+            eredu_core::speculative::SpeculativeActivationPhase::PredictionReplay,
+            self.observer.as_mut().map(|observer| {
+                observer.as_mut()
+                    as &mut dyn crate::inspection::SpeculativeActivationObserver<
+                        M::Activation,
+                        M::Error,
+                    >
+            }),
             context,
         )?;
         let seed = M::checkpoint(&draft)?;
@@ -711,7 +1006,16 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         cache: &Self::Cache,
         state: &Self::TargetState,
     ) -> Option<SnapshotEstimate> {
+        let capture = self
+            .observer
+            .as_ref()
+            .map_or(Some(0), |observer| observer.activation_checkpoint_bytes())?
+            .checked_add(std::mem::size_of::<Self::CacheCheckpoint>() as u64)?;
         [
+            SnapshotEstimate {
+                retained_bytes: capture,
+                copy_bytes: capture,
+            },
             M::estimate_state(&cache.target)?,
             M::estimate_state(&cache.draft)?,
             M::estimate(state)?,
@@ -740,15 +1044,19 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         Option<(Self::CacheCheckpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
     > {
-        Ok(Some((
-            self.checkpoint(cache).map_err(|error| {
-                eredu_core::speculative::SpeculativeControlError::backend_with_retained(
-                    error,
-                    Self::take_retained_failure,
-                )
-            })?,
-            state.clone(),
-        )))
+        let activations = self
+            .observer
+            .as_ref()
+            .map(|observer| observer.activation_checkpoint())
+            .transpose()?;
+        let mut checkpoint = self.checkpoint(cache).map_err(|error| {
+            eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                error,
+                Self::take_retained_failure,
+            )
+        })?;
+        checkpoint.activations = activations;
+        Ok(Some((checkpoint, state.clone())))
     }
 
     fn prepare_control_continuation(
@@ -758,17 +1066,29 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         context: Self::Context<'_>,
     ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
         let prepare = || -> Result<(), M::Error> {
-            let Some(cursor) = self.occurrences.select(M::occurrence_request(context))
-                .map_err(M::occurrence_error)? else { return Ok(()); };
-            let mut cursor = cursor.try_borrow_mut()
+            let Some(cursor) = self
+                .occurrences
+                .select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)?
+            else {
+                return Ok(());
+            };
+            let mut cursor = cursor
+                .try_borrow_mut()
                 .map_err(|_| M::occurrence_error(AutoregressiveOccurrenceError::Reentrant))?;
-            let continuation = cursor.continuation(committed, status).map_err(M::occurrence_error)?;
+            let continuation = cursor
+                .continuation(committed, status)
+                .map_err(M::occurrence_error)?;
             M::prepare_continuation(&continuation, context)?;
             cursor.install_continuation(continuation);
             Ok(())
         };
-        prepare().map_err(|cause| eredu_core::speculative::SpeculativeControlError::backend_with_retained(
-            cause, M::take_retained_failure))
+        prepare().map_err(|cause| {
+            eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                cause,
+                M::take_retained_failure,
+            )
+        })
     }
 
     fn restore_control_snapshot(
@@ -778,13 +1098,27 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         state: &Self::TargetState,
         context: Self::Context<'_>,
     ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
-        self.restore_checkpoint(cache, saved, context)
-            .map_err(|error| {
-                eredu_core::speculative::SpeculativeControlError::backend_with_retained(
-                    error,
-                    Self::take_retained_failure,
-                )
-            })?;
+        let prepared = match (self.observer.as_mut(), saved.activations.as_ref()) {
+            (Some(observer), Some(saved)) => Some(observer.prepare_activation_restore(saved)?),
+            (None, None) => None,
+            _ => {
+                return Err(eredu_core::speculative::SpeculativeControlError::Invalid(
+                    "internal snapshot authority changed",
+                ));
+            }
+        };
+        let retain = |error| {
+            eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                error,
+                M::take_retained_failure,
+            )
+        };
+        let target = M::restore(&saved.target, context).map_err(retain)?;
+        let draft = M::restore(&saved.draft, context).map_err(retain)?;
+        *cache = AutoregressiveCache { target, draft };
+        if let Some(prepared) = prepared {
+            prepared.commit();
+        }
         Ok(Some(state.clone()))
     }
 }
@@ -798,17 +1132,30 @@ fn decode_invocation<M: AutoregressiveMechanisms>(
     tokens: &[u32],
     state: &mut M::State,
     pass: AutoregressivePass,
+    phase: eredu_core::speculative::SpeculativeActivationPhase,
+    observer: Option<
+        &mut dyn crate::inspection::SpeculativeActivationObserver<M::Activation, M::Error>,
+    >,
     context: M::Context<'_>,
 ) -> Result<M::Output, M::Error> {
     if let Some(occurrences) = occurrences {
         let invocation = AutoregressiveInvocation::decode(pass, tokens.len())
             .ok_or_else(|| M::invalid("invalid independent draft invocation geometry"))?;
         let claim = claim_invocation::<M>(occurrences, state, invocation)?;
-        return M::with_invocation(model, state, None, claim, context, |model, state| {
-            M::decode(model, tokens, state, pass, context)
-        });
+        return M::with_observed_invocation(
+            model,
+            state,
+            None,
+            claim,
+            context,
+            phase,
+            observer,
+            |model, state, observer| {
+                M::decode_with_observer(model, tokens, state, pass, context, observer)
+            },
+        );
     }
-    M::decode(model, tokens, state, pass, context)
+    M::decode_with_observer(model, tokens, state, pass, context, observer)
 }
 
 fn claim_invocation<'s, M: AutoregressiveMechanisms>(
@@ -831,6 +1178,9 @@ fn prefill_invocation<M: AutoregressiveMechanisms>(
     state: &mut M::State,
     pass: AutoregressivePass,
     cancellation: &eredu_core::GenerationCancellationToken,
+    observer: Option<
+        &mut dyn crate::inspection::SpeculativeActivationObserver<M::Activation, M::Error>,
+    >,
     context: M::Context<'_>,
 ) -> Result<SpeculativePrefillOutcome<AutoregressivePrefill<M::Logits>>, M::Error> {
     if let Some(occurrences) = occurrences {
@@ -839,9 +1189,26 @@ fn prefill_invocation<M: AutoregressiveMechanisms>(
         let invocation = AutoregressiveInvocation::prefill(pass, positions)
             .ok_or_else(|| M::occurrence_error(AutoregressiveOccurrenceError::Geometry))?;
         let claim = claim_invocation::<M>(occurrences, state, invocation)?;
-        return M::with_invocation(model, state, Some(input), claim, context, |model, state| {
-            M::prefill(model, input, state, pass, cancellation, context)
-        });
+        return M::with_observed_invocation(
+            model,
+            state,
+            Some(input),
+            claim,
+            context,
+            match pass {
+                AutoregressivePass::TargetPrefill => {
+                    eredu_core::speculative::SpeculativeActivationPhase::TargetPrefill
+                }
+                AutoregressivePass::DraftPrefill => {
+                    eredu_core::speculative::SpeculativeActivationPhase::PredictionPrefill
+                }
+                _ => return Err(M::invalid("non-prefill observation pass")),
+            },
+            observer,
+            |model, state, observer| {
+                M::prefill_with_observer(model, input, state, pass, cancellation, context, observer)
+            },
+        );
     }
-    M::prefill(model, input, state, pass, cancellation, context)
+    M::prefill_with_observer(model, input, state, pass, cancellation, context, observer)
 }

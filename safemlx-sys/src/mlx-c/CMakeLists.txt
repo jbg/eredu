@@ -240,7 +240,6 @@ else()
       mlx-cpu-strided-select-source.patch
       mlx-broadcast-result-reservation.patch
       mlx-resident-mxfp4-grouped-source.patch
-      mlx-eval-record-capacity-attribution.patch
       mlx-ring-variable-envelope.patch
     mlx-prepared-zero-source.patch
       mlx-masked-scatter-source.patch
@@ -272,7 +271,35 @@ else()
       mlx-cpu-mxfp4-construction.patch
       mlx-cpu-ranked-reshape.patch
       mlx-cpu-mxfp4-payload-layout.patch
-      mlx-cpu-prepared-host-storage.patch)
+      mlx-cpu-prepared-host-storage.patch
+      mlx-physical-memory-placement.patch
+      mlx-physical-memory-access.patch
+      mlx-physical-memory-default-placement.patch
+      mlx-physical-memory-gpu-envelope.patch
+      mlx-original-buffer-lifetime.patch
+      mlx-physical-backing-custody.patch
+      mlx-scoped-physical-funding.patch
+      mlx-cpu-mirostat-selection-source.patch
+      mlx-cpu-controlled-router-source.patch
+      mlx-worker-source-identity.patch
+      mlx-cpu-boolean-gather-source.patch
+      mlx-cpu-packed-decode-source.patch
+      mlx-cpu-addmm-source.patch
+      mlx-cpu-fp8-decode-source.patch
+      mlx-completed-foreign-readback.patch
+      mlx-cpu-copy-alias-source.patch
+      mlx-cpu-wide-position-source.patch
+      mlx-cpu-wide-trigonometry.patch
+      mlx-cpu-layer-norm-source.patch
+      mlx-cpu-indexed-histogram-source.patch
+      mlx-ordinary-host-buffer-source.patch
+      mlx-eval-traversal-capacity-causes.patch
+      mlx-ordinary-control-observation.patch
+      mlx-ordinary-metal-control-observation.patch
+      mlx-temporary-physical-cache-policy.patch
+      mlx-ordinary-cpu-fence-observation.patch
+      mlx-ordinary-metal-router-observation.patch
+      mlx-scoped-fresh-physical-backing.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
@@ -441,6 +468,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_record_readiness_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_scope_owner_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/ordinary_control_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_record_quota_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/graph_metadata_quota_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/prepared_input_tests.cpp
@@ -542,6 +570,10 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/fft.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/graph_utils.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/host_transfer.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ordinary_host_transfer.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ordinary_control.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ordinary_array_controls.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ordinary_fast_controls.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/io.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/io_types.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/linalg.cpp

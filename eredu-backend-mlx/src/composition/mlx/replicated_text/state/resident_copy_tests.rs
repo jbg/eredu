@@ -1,6 +1,5 @@
 use super::*;
 use eredu_core::{AttentionPolicy, LayerSchedule};
-use eredu_runtime::working_memory::WorkingMemoryError;
 use std::cell::Cell;
 
 thread_local! { static HOUSEKEEPING: Cell<usize> = const { Cell::new(0) }; }
@@ -27,15 +26,6 @@ fn layout() -> eredu_runtime::StateLayout {
     )
     .unwrap()
 }
-fn unknown(error: &Error) -> bool {
-    match error {
-        Error::Other(source) => {
-            source.downcast_ref::<WorkingMemoryError>() == Some(&WorkingMemoryError::UnknownBound)
-        }
-        _ => false,
-    }
-}
-
 #[test]
 fn typed_resident_source_keeps_lazy_operands_and_preexisting_layout_without_housekeeping() {
     use crate::backend::runtime::cache::kv::KeyValueCache;
@@ -121,8 +111,12 @@ fn native_representations_select_exact_supported_plans_without_housekeeping() {
             .same_storage(hybrid.shared_layout().unwrap())
     );
     let mut hybrid_operands = 0;
-    hybrid_plan.visit_operands(&mut |_| hybrid_operands += 1);
-    hybrid_plan.visit_retained_arrays(&mut |_| hybrid_operands += 1);
+    hybrid_plan
+        .visit_operands(&mut |_| hybrid_operands += 1)
+        .unwrap();
+    hybrid_plan
+        .visit_retained_arrays(&mut |_| hybrid_operands += 1)
+        .unwrap();
     assert_eq!(hybrid_operands, 0);
     assert!(hybrid_plan.into_dense_key_value().is_none());
     let pooling_plan = pooling.prepare_resident_decoder_copy().unwrap();
@@ -134,7 +128,7 @@ fn native_representations_select_exact_supported_plans_without_housekeeping() {
             .same_storage(pooling.shared_layout().unwrap())
     );
     let mut operands = 0;
-    pooling_plan.visit_operands(&mut |_| operands += 1);
+    pooling_plan.visit_operands(&mut |_| operands += 1).unwrap();
     assert_eq!(operands, 0);
     // Present but empty layers retain their actual table/layout. The actual
     // stateless source remains absent instead of registering an empty table.
@@ -143,13 +137,34 @@ fn native_representations_select_exact_supported_plans_without_housekeeping() {
     let stateless_plan = stateless.prepare_resident_decoder_copy().unwrap();
     assert!(stateless_plan.shared_layout().is_none());
     assert_eq!(stateless_plan.global_layer_start(), None);
-    stateless_plan.visit_operands(&mut |_| operands += 1);
-    stateless_plan.visit_retained_arrays(&mut |_| operands += 1);
+    stateless_plan
+        .visit_operands(&mut |_| operands += 1)
+        .unwrap();
+    stateless_plan
+        .visit_retained_arrays(&mut |_| operands += 1)
+        .unwrap();
     assert_eq!(operands, 0);
-    assert!(unknown(&paged.prepare_resident_decoder_copy().unwrap_err()));
-    assert!(unknown(
-        &paged_hybrid.prepare_resident_decoder_copy().unwrap_err()
-    ));
+    for (plan, source_layout) in [
+        (
+            paged.prepare_resident_decoder_copy().unwrap(),
+            paged.shared_layout().unwrap(),
+        ),
+        (
+            paged_hybrid.prepare_resident_decoder_copy().unwrap(),
+            paged_hybrid.shared_layout().unwrap(),
+        ),
+    ] {
+        assert!(plan.is_paged());
+        assert!(plan.dense_key_value().is_none());
+        assert!(plan.shared_layout().unwrap().same_storage(source_layout));
+        assert_eq!(plan.global_layer_start(), Some(0));
+        plan.visit_operands(&mut |_| operands += 1).unwrap();
+        plan.visit_retained_arrays(&mut |_| operands += 1).unwrap();
+    }
+    assert_eq!(
+        operands, 0,
+        "empty paged sources do not invent payload roots"
+    );
     assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
     drop(guard);
 }

@@ -9,13 +9,15 @@ use std::cell::RefCell;
 mod grouped_storage;
 mod grouped_unit_error;
 pub(crate) use grouped_unit_error::PreparedGroupedUnitError;
-mod validation_storage;
+mod ordinary_completion;
 mod original_child;
 mod original_role;
-pub(crate) use original_role::{TokenValidationParent, TokenValidationRole};
-pub(crate) use original_child::PreparedTokenChild;
+mod validation_storage;
 use grouped_storage::PreparedGroupedOutputs;
 pub(crate) use grouped_storage::{GroupedChunkOutputs, GroupedOutputStorage};
+pub(crate) use ordinary_completion::ordinary_validation_completion_controls;
+pub(crate) use original_child::PreparedTokenChild;
+pub(crate) use original_role::{TokenValidationParent, TokenValidationRole};
 pub(crate) use validation_storage::{
     request_control_bytes as token_validation_control_bytes, TokenValidationIngress,
 };
@@ -358,7 +360,7 @@ pub(crate) fn validate_active_token_validations() -> Result<(), Exception> {
         for validation in &validations.batch.validations {
             let invalid = validation.invalid.evaluated()?;
             if invalid.as_slice::<bool>().first().copied() == Some(true) {
-                return Err(Exception::custom(validation.failure.to_string()));
+                return Err(ordinary_completion::failure(validation.failure)?);
             }
         }
         Ok(())
@@ -561,6 +563,28 @@ pub(crate) fn validate_take_indices(
     )
 }
 
+/// Fixed source frames for the shared no-lengths causal-mask producer. The
+/// validated geometry uses inline coordinate shapes and actual safe calls;
+/// neither this query nor its caller constructs a host mask.
+pub(crate) fn ordinary_causal_mask_control_bytes() -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    let frames = [
+        size_of::<(i32, Option<i32>, Option<i32>, Option<Array>, &Stream)>(),
+        size_of::<eredu_nn::operation_geometry::CausalMaskGeometry>(),
+        size_of::<Result<eredu_nn::operation_geometry::CausalMaskGeometry, eredu_nn::Error>>(),
+        size_of::<Array>().checked_mul(8)?,
+        size_of::<Option<Array>>(),
+        size_of::<Result<Array, Exception>>(),
+        size_of::<[i32; 2]>().checked_mul(2)?,
+        size_of::<Option<i32>>().checked_mul(3)?,
+        size_of::<(i32, i32, Option<i32>, &Stream)>(),
+        size_of::<Result<crate::MlxTensor, eredu_nn::Error>>(),
+    ];
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
+}
+
 #[allow(non_snake_case)]
 /// Builds a causal attention mask with optional window and sequence lengths.
 pub fn create_causal_mask(
@@ -607,7 +631,12 @@ pub fn create_causal_mask(
     not(feature = "cuda")
 ))]
 mod grouped_original_tests;
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod row_movement_tests;
 #[cfg(all(
     test,

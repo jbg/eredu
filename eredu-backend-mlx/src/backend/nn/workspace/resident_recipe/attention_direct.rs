@@ -1,7 +1,7 @@
 //! The shared direct explicit attention worker, including its BF16 alternatives.
 //! Sliding and blockwise accumulation use their separate shared producer recipes.
 use super::*;
-use eredu_nn::{AttentionArithmetic, workspace::WorkspaceDtype};
+use eredu_nn::{workspace::WorkspaceDtype, AttentionArithmetic};
 
 struct Direct {
     softcap: bool,
@@ -206,6 +206,9 @@ mod tests {
     use eredu_nn::{AttentionRequest, NeuralBackend, Tensor};
     #[test]
     fn direct_attention_keeps_bf16_validation_and_actual_blockwise_boundary() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
         for (width, keys) in [(32, 4), (4, 3), (32, 8193)] {

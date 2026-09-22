@@ -5,10 +5,10 @@
 //! implementation in target and speculative-decoder code.
 
 use eredu_backend_mlx_macros::PhysicalParameters;
-use safemlx::{Array, Dtype, Stream, error::Exception};
+use safemlx::{error::Exception, Array, Dtype, Stream};
 mod native;
 pub(crate) mod worker;
-pub(crate) use native::control_bytes;
+pub(crate) use native::{control_bytes, ordinary_control_bytes};
 
 use crate::module::PhysicalParam;
 

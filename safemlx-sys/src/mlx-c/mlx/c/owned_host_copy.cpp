@@ -1,5 +1,6 @@
 #include "mlx/c/owned_host_copy.h"
 #include "mlx/c/private/enums.h"
+#include "mlx/c/private/memory_placement.h"
 #include "mlx/prepared_input.h"
 #include "mlx/submission.h"
 
@@ -8,7 +9,7 @@ namespace {
 using Cause = PreparedHostCopyCause;
 allocator::PreparedInputFacts facts(mlx_prepared_input_runtime runtime) noexcept {
   return {runtime.page_size, runtime.maximum,
-      static_cast<allocator::HostTransferStorageKind>(runtime.storage_kind), runtime.controls};
+      static_cast<allocator::HostTransferStorageKind>(runtime.storage_kind), runtime.controls, {runtime.placement.kind, runtime.placement.device, runtime.placement.device_count}};
 }
 bool dtype_valid(mlx_dtype dtype) noexcept {
   return static_cast<unsigned>(dtype) > MLX_BOOL &&
@@ -62,7 +63,8 @@ unsigned fill(mlx_array* out, mlx_original_buffer_info* birth,
     if (birth) {
       const auto* actual = published->value().data_shared_ptr().get();
       *birth = {actual->allocation_generation != 0, actual->allocation_generation,
-          actual->original_input->capacity};
+          actual->original_input->capacity,
+          mlx_placement_to_c(allocator::memory_placement(actual->original_input->buffer)), 0};
     }
     *out = mlx_array{&published->value(), published};
   }

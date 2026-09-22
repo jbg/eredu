@@ -3,16 +3,16 @@
 use std::num::NonZeroUsize;
 
 use eredu_core::{
-    SpeculativeSchedulerOptions, TokenFilter, TokenFilterController,
-    generation::GenerationConfigOverrides,
+    generation::GenerationConfigOverrides, SpeculativeSchedulerOptions, TokenFilter,
+    TokenFilterController,
 };
 use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 use super::{ConstraintError, TextModelError};
 use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintController};
 use crate::runtime::chat::{
-    CapabilitySupport, ChatTemplateRequest, PreparedChat, ProfileStrings, ToolChoice,
-    prepare_format_profile, resolve_structural_tokens,
+    prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatTemplateRequest,
+    PreparedChat, ProfileStrings, ToolChoice,
 };
 use crate::runtime::generation::streaming::CommittedTokenSource;
 
@@ -22,7 +22,7 @@ pub(crate) mod probes;
 pub(crate) mod profile;
 
 /// Model sampling and stopping settings for one prepared chat generation.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PreparedChatGenerationSettings {
     /// Typed overrides layered over checkpoint-declared generation settings.
     pub overrides: GenerationConfigOverrides,
@@ -251,15 +251,13 @@ pub(crate) struct ScopedBackendGenerationTokenSource<
 {
     source: &'step mut BackendGenerationTokenSource<'run, B, C>,
     observer: Option<
-        &'step mut (
-                       dyn FnMut(
+        &'step mut (dyn FnMut(
             Option<u32>,
             Option<eredu_core::capture::SharedCapturedStep>,
             f64,
             eredu_core::GenerationTiming,
             &C,
-        ) + 'callback
-                   ),
+        ) + 'callback),
     >,
     failure: Option<&'step dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
 }
@@ -272,15 +270,13 @@ where
     pub(crate) fn scoped<'step, 'callback>(
         &'step mut self,
         observer: Option<
-            &'step mut (
-                           dyn FnMut(
+            &'step mut (dyn FnMut(
                 Option<u32>,
                 Option<eredu_core::capture::SharedCapturedStep>,
                 f64,
                 eredu_core::GenerationTiming,
                 &C,
-            ) + 'callback
-                       ),
+            ) + 'callback),
         >,
         failure: Option<&'step dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
     ) -> ScopedBackendGenerationTokenSource<'step, 'run, 'callback, B, C> {
@@ -295,15 +291,13 @@ where
         &mut self,
         cancellation: &eredu_core::GenerationCancellationToken,
         mut observer: Option<
-            &mut (
-                     dyn FnMut(
+            &mut (dyn FnMut(
                 Option<u32>,
                 Option<eredu_core::capture::SharedCapturedStep>,
                 f64,
                 eredu_core::GenerationTiming,
                 &C,
-            ) + '_
-                 ),
+            ) + '_),
         >,
     ) -> Result<
         Option<u32>,
@@ -354,15 +348,13 @@ where
         capture: Option<eredu_core::capture::SharedCapturedStep>,
         started: Option<std::time::Instant>,
         observer: &mut Option<
-            &mut (
-                     dyn FnMut(
+            &mut (dyn FnMut(
                 Option<u32>,
                 Option<eredu_core::capture::SharedCapturedStep>,
                 f64,
                 eredu_core::GenerationTiming,
                 &C,
-            ) + '_
-                 ),
+            ) + '_),
         >,
     ) {
         if token.is_none() && capture.is_none() {
@@ -468,9 +460,9 @@ fn gemma_profile(
     recognition: probes::gemma::Recognition,
 ) -> crate::runtime::chat::PreparedFormatProfile {
     use crate::runtime::chat::{
-        GEMMA4_STRUCTURAL_TOOL_SPEC,
         dialect::{DialectParameters, GenerationPromptBehavior},
         gemma::{self, TOOL_RESPONSE_OPEN, TURN_CLOSE},
+        GEMMA4_STRUCTURAL_TOOL_SPEC,
     };
 
     let extra = [
@@ -519,9 +511,9 @@ fn inkling_profile(
     recognition: probes::inkling::Recognition,
 ) -> crate::runtime::chat::PreparedFormatProfile {
     use crate::runtime::chat::{
-        ReasoningTemplateControl,
         dialect::GenerationPromptBehavior,
         inkling::{self, END_SAMPLING},
+        ReasoningTemplateControl,
     };
 
     let structural_tokens = ProfileStrings::new(&probes::inkling::STRUCTURAL);
@@ -566,9 +558,9 @@ fn muse_profile(
     recognition: probes::muse::Recognition,
 ) -> crate::runtime::chat::PreparedFormatProfile {
     use crate::runtime::chat::{
-        ReasoningEffortControl, ReasoningTemplateControl,
         atem::{self, EOT},
         dialect::GenerationPromptBehavior,
+        ReasoningEffortControl, ReasoningTemplateControl,
     };
 
     let structural_tokens = ProfileStrings::new(&probes::muse::STRUCTURAL);

@@ -2,7 +2,7 @@
 use super::*;
 
 fn fresh(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     rows: usize,
 ) -> Option<(
     WorkingMemoryReservation,
@@ -14,7 +14,12 @@ fn fresh(
     let mut mechanism = Mechanism::new(pool);
     mechanism.nested_key_bytes = Some(0);
     let context = WorkspaceContext::new(Facts::default());
-    let storage = RegisteredWorkspaceStorage::<u32>::bind(pool, &context, []).unwrap();
+    let storage = RegisteredWorkspaceStorage::<u32>::bind(
+        pool,
+        &context,
+        std::iter::empty::<(u32, WorkspaceExistingStorage)>(),
+    )
+    .unwrap();
     let report = quote_inference_workspace(geometry(), |_| {
         context.begin_state_span([])?;
         context.report(&[])
@@ -58,13 +63,12 @@ fn fresh(
     };
     // Same quote, exact shared ceiling and one-short: the candidate layouts
     // enter admission before a provider call or namespace allocation occurs.
-    let exact = pool.used_bytes().unwrap() + q.incremental_bytes();
+    let exact = exact_capacity(pool, &q);
     assert!(matches!(
         sealed_plan(pool, &q, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     assert_eq!(mechanism.calls.get(), 0);
     let (probe, accepted_probe) = sealed_plan(pool, &q, exact).unwrap();
     drop((probe, accepted_probe));
@@ -81,7 +85,7 @@ fn fresh(
 
 #[test]
 fn fresh_namespace_keeps_only_original_metadata_after_birth_and_foreign_alias_retire() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let Some((ar, a_run, a_span, mut a, am)) = fresh(&pool, 1) else {
         return;
     };
@@ -100,16 +104,16 @@ fn fresh_namespace_keeps_only_original_metadata_after_birth_and_foreign_alias_re
     assert_eq!(root.values, [1.25, -3.5]);
     assert_eq!(
         balances(&pool),
-        before,
-        "native alias never charges P again"
+        (before.0 - 16, before.1 + 16),
+        "aliases share one canonical conversion of the native allowance"
     );
-    let ordinary = pool.register_storage([(8u32, 7)]).unwrap();
+    let ordinary = pool.register_host_storage([(8u32, 7)]).unwrap();
     ascope.certify().unwrap();
     bscope.certify().unwrap();
     drop((
         ap, bp, a, b, a_span, b_span, ar, br, a_run, b_run, am, bm, root,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), a_held + 7);
+    assert_eq!(pool.payload_used_bytes().unwrap(), a_held + 7);
     {
         let usage = pool.0.usage.lock().unwrap();
         assert_eq!(usage.storage.len(), 1);
@@ -120,14 +124,14 @@ fn fresh_namespace_keeps_only_original_metadata_after_birth_and_foreign_alias_re
         );
         let account = usage.funding.values().next().unwrap();
         assert_eq!(
-            account.protected_remaining().unwrap(),
+            account.protected_remaining().unwrap() - account.control_floor,
             a_held,
             "namespace must retain only H after the nonzero P partition retires"
         );
-        assert_eq!(account.host_held, a_held);
+        assert_eq!(account.host_held - account.control_floor, a_held);
     }
     drop(ordinary);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let usage = pool.0.usage.lock().unwrap();
     assert!(usage.storage.is_empty());
     assert!(usage.funding.is_empty());
@@ -135,7 +139,7 @@ fn fresh_namespace_keeps_only_original_metadata_after_birth_and_foreign_alias_re
 
 #[test]
 fn fresh_namespace_attachment_failure_retains_successful_prefix_and_exact_failed_owners() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let Some((r, run, span, mut bank, mechanism)) = fresh(&pool, 2) else {
         return;
     };
@@ -153,11 +157,11 @@ fn fresh_namespace_attachment_failure_retains_successful_prefix_and_exact_failed
     ));
     assert_eq!((first.attachments(), refused.attachments()), (1, 0));
     assert_eq!(pool.0.usage.lock().unwrap().storage.len(), 1);
-    assert_eq!(balances(&pool), before);
+    assert_eq!(balances(&pool), (before.0 - 32, before.1 + 32));
     scope.certify().unwrap();
     drop((first, refused, bank, span, r, run, mechanism));
-    assert_eq!(pool.used_bytes().unwrap(), held + 32);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 32);
     drop(attempt);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert!(pool.0.usage.lock().unwrap().storage.is_empty());
 }

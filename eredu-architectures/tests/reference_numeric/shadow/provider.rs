@@ -203,7 +203,7 @@ impl BackendSession<Provider> for Session {
         observations
             .insert(
                 eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-                eredu_core::ObservationValue::Tensor(value),
+                eredu_core::ObservationValue::Tensor(value.into()),
             )
             .map_err(Error::backend)?;
         Ok(observations)

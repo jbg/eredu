@@ -31,7 +31,7 @@ fn qualified() -> bool {
     match layout {
         Ok(_) => {
             let plan = Initializer::prepare().unwrap();
-            let bound = WorkingMemoryPool::shared_native_initialization_required_bytes(&plan);
+            let bound = MemoryLedger::shared_native_initialization_required_bytes(&plan);
             if std::env::var_os("EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION").is_some()
             {
                 assert!(bound.is_ok(), "{bound:?}");
@@ -39,13 +39,13 @@ fn qualified() -> bool {
             match bound {
                 Ok(_) => true,
                 Err(WorkingMemoryError::UnknownBound) => {
-                    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                     let error = pool.initialize_shared_native(plan).unwrap_err();
                     assert!(matches!(
                         error.accounting_failure(),
                         Some(WorkingMemoryError::UnknownBound)
                     ));
-                    assert_eq!(pool.used_bytes().unwrap(), 0);
+                    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
                     false
                 }
                 Err(error) => panic!("unexpected account qualification: {error}"),
@@ -70,21 +70,22 @@ fn actual_device_exact_admission_and_one_short_preserve_permanent_owner() {
                 return;
             }
             let plan = Initializer::prepare().unwrap();
-            let bytes =
-                WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
-            let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+            let bytes = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
+            let short = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
             let error = short.initialize_shared_native(plan).unwrap_err();
             assert!(matches!(
                 error.accounting_failure(),
-                Some(WorkingMemoryError::BudgetExceeded { .. })
+                Some(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
             ));
             assert!(error.rejected_plan().is_some());
-            assert_eq!(short.used_bytes().unwrap(), 0);
+            assert_eq!(short.fixture_host_charge().unwrap(), 0);
             drop(error);
-            let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+            let exact = crate::memory_fixture::ledger(bytes, 0).unwrap();
             let owner = exact.initialize_shared_native(plan).unwrap();
             assert_eq!(owner.original_bytes(), bytes);
-            assert_eq!(exact.used_bytes().unwrap(), bytes);
+            assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
             owner.validate_pool(&exact).unwrap();
             assert!(matches!(
                 owner.validate_pool(&short),
@@ -93,7 +94,7 @@ fn actual_device_exact_admission_and_one_short_preserve_permanent_owner() {
             owner.output().try_borrow().unwrap();
             // Public wrappers do not retire a permanent live Device/default library.
             drop(owner);
-            assert_eq!(exact.used_bytes().unwrap(), bytes);
+            assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
         },
     );
 }
@@ -105,8 +106,8 @@ fn actual_device_scheduler_allocator_join_share_the_exact_domain_once() {
             if !qualified() {
                 return;
             }
-            let pool = super::super::domain();
-            let before = pool.used_bytes().unwrap();
+            let pool = super::super::ledger();
+            let before = pool.fixture_host_charge().unwrap();
             assert!(super::super::scheduler::initialized_original_bytes(&pool).is_none());
             let scheduler_layout =
                 safemlx::PreparedScheduler::<SharedNativeInitializationCustody>::layout();
@@ -131,13 +132,13 @@ fn actual_device_scheduler_allocator_join_share_the_exact_domain_once() {
                 return;
             }
             scheduler_layout.unwrap();
-            let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let error = prepare_admitted(&foreign).unwrap_err();
             assert!(matches!(
                 error.0,
                 Failure::Policy(WorkingMemoryError::IdentityMismatch)
             ));
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before);
             let (runtime, coverage) =
                 super::super::input_allocator::prepare_admitted(&pool).unwrap();
             assert!(matches!(
@@ -147,7 +148,7 @@ fn actual_device_scheduler_allocator_join_share_the_exact_domain_once() {
                     device_admitted: true
                 }
             ));
-            let after = pool.used_bytes().unwrap();
+            let after = pool.fixture_host_charge().unwrap();
             let device = INITIALIZED.get().unwrap();
             let scheduler_bytes =
                 super::super::scheduler::initialized_original_bytes(&pool).unwrap();
@@ -159,9 +160,9 @@ fn actual_device_scheduler_allocator_join_share_the_exact_domain_once() {
             let (again, again_coverage) =
                 super::super::input_allocator::prepare_admitted(&pool).unwrap();
             assert_eq!(coverage, again_coverage);
-            assert_eq!(pool.used_bytes().unwrap(), after);
+            assert_eq!(pool.fixture_host_charge().unwrap(), after);
             drop((runtime, again));
-            assert_eq!(pool.used_bytes().unwrap(), after);
+            assert_eq!(pool.fixture_host_charge().unwrap(), after);
         },
     );
 }
@@ -174,8 +175,8 @@ fn ordinary_device_predecessor_is_not_promoted_into_the_source_account() {
                 return;
             }
             let runtime = safemlx::PreparedInputRuntime::prepare().unwrap();
-            let pool = super::super::domain();
-            let before = pool.used_bytes().unwrap();
+            let pool = super::super::ledger();
+            let before = pool.fixture_host_charge().unwrap();
             let error = prepare_admitted(&pool).unwrap_err();
             let Failure::Constructor(ref failure) = error.0 else {
                 panic!("{error:?}")
@@ -184,11 +185,15 @@ fn ordinary_device_predecessor_is_not_promoted_into_the_source_account() {
                 panic!("{error:?}")
             };
             assert_eq!(native.cause(), MetalDeviceCause::OrdinaryPredecessor);
-            assert!(pool.used_bytes().unwrap() > before); // failed node still owns its account
+            assert!(pool.fixture_host_charge().unwrap() > before); // failed node still owns its account
             assert!(INITIALIZED.get().is_none());
             drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before);
             drop(runtime);
         },
     );
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

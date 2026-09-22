@@ -1,10 +1,12 @@
 use super::*;
 use source::{BORROWED, CLOSE, NEW, OPEN};
 use std::mem::size_of;
+pub(super) mod domains;
 #[derive(Debug)]
 pub(super) struct Node<R> {
     identity: R,
     bytes: Option<u64>,
+    host_control_bytes: Option<u64>,
     maximum_allocations: usize,
     start: usize,
     len: usize,
@@ -26,6 +28,7 @@ pub(super) struct Scratch<R> {
     index: Vec<usize>,
     index_sorted: bool,
     layout: WorkspaceReportLayout,
+    diagnostic_overflow: bool,
 }
 impl<R> Scratch<R> {
     pub(super) fn new(
@@ -40,6 +43,7 @@ impl<R> Scratch<R> {
             index: Vec::new(),
             index_sorted: false,
             layout,
+            diagnostic_overflow: false,
         };
         if let Err(e) = layout.bytes_for::<R>() {
             return Err((s, ConstructionCause::Layout(e)));
@@ -79,10 +83,19 @@ impl<R> Scratch<R> {
             + self.index.capacity() * size_of::<usize>()
     }
 }
-fn add(a: Option<u64>, b: Option<u64>) -> Result<Option<u64>, WorkspaceReportError> {
+fn add(
+    a: Option<u64>,
+    b: Option<u64>,
+    diagnostic_overflow: bool,
+) -> Result<Option<u64>, WorkspaceReportError> {
     a.zip(b)
-        .map(|(a, b)| a.checked_add(b).ok_or(WorkspaceReportError::Overflow))
+        .map(|(a, b)| match a.checked_add(b) {
+            Some(value) => Ok(Some(value)),
+            None if diagnostic_overflow => Ok(None),
+            None => Err(WorkspaceReportError::Overflow),
+        })
         .transpose()
+        .map(Option::flatten)
 }
 const C: u8 = 1;
 const O: u8 = 2;
@@ -91,10 +104,14 @@ impl<R: Clone> Scratch<R> {
     fn find<G: Graph<Root = R>>(&self, s: &G, r: &R) -> Option<usize> {
         let mut end = self.index.len();
         while end != 0 {
-            let count = if self.index_sorted { end } else { 1 << end.trailing_zeros() };
+            let count = if self.index_sorted {
+                end
+            } else {
+                1 << end.trailing_zeros()
+            };
             let start = end - count;
-            if let Ok(position) = self.index[start..end]
-                .binary_search_by(|&i| s.compare(&self.nodes[i].identity, r))
+            if let Ok(position) =
+                self.index[start..end].binary_search_by(|&i| s.compare(&self.nodes[i].identity, r))
             {
                 return Some(self.index[start + position]);
             }
@@ -106,9 +123,13 @@ impl<R: Clone> Scratch<R> {
         self.work.clear();
         let (mut left, mut right) = (start, middle);
         while left < middle || right < end {
-            let take_left = right == end || (left < middle
-                && s.compare(&self.nodes[self.index[left]].identity,
-                    &self.nodes[self.index[right]].identity).is_le());
+            let take_left = right == end
+                || (left < middle
+                    && s.compare(
+                        &self.nodes[self.index[left]].identity,
+                        &self.nodes[self.index[right]].identity,
+                    )
+                    .is_le());
             let position = if take_left {
                 let position = left;
                 left += 1;
@@ -119,7 +140,10 @@ impl<R: Clone> Scratch<R> {
                 position
             };
             // At most the N admitted nodes, before DFS has begun.
-            self.work.push(Frame { node: self.index[position], next: 0 });
+            self.work.push(Frame {
+                node: self.index[position],
+                next: 0,
+            });
         }
         for (destination, source) in self.index[start..end].iter_mut().zip(&self.work) {
             *destination = source.node;
@@ -137,6 +161,7 @@ impl<R: Clone> Scratch<R> {
         let bytes = s.bytes(&r);
         self.nodes.push(Node {
             maximum_allocations: s.maximum_allocations(&r),
+            host_control_bytes: s.host_control_bytes(&r),
             identity: r,
             bytes,
             start: 0,
@@ -213,6 +238,7 @@ impl<R: Clone> Scratch<R> {
         s: &G,
         d: usize,
         bit: u8,
+        tally: bool,
     ) -> Result<Option<u64>, WorkspaceReportError> {
         self.work.clear();
         let mut sum = Some(0);
@@ -222,7 +248,7 @@ impl<R: Clone> Scratch<R> {
             if self.marks[i] & bit != 0 {
                 continue;
             }
-            self.enter(i, bit, &mut sum)?;
+            self.enter(i, bit, &mut sum, tally)?;
             while let Some(frame) = self.work.last_mut() {
                 if frame.next == 0 {
                     self.work.pop();
@@ -231,7 +257,7 @@ impl<R: Clone> Scratch<R> {
                 frame.next -= 1;
                 let child = self.edges[self.nodes[frame.node].start + frame.next];
                 if self.marks[child] & bit == 0 {
-                    self.enter(child, bit, &mut sum)?;
+                    self.enter(child, bit, &mut sum, tally)?;
                 }
             }
         }
@@ -242,10 +268,19 @@ impl<R: Clone> Scratch<R> {
         i: usize,
         bit: u8,
         sum: &mut Option<u64>,
+        tally: bool,
     ) -> Result<(), WorkspaceReportError> {
         self.marks[i] |= bit;
-        if bit == C || self.marks[i] & C == 0 {
-            *sum = add(*sum, self.nodes[i].bytes)?;
+        if tally && (bit == C || self.marks[i] & C == 0) {
+            *sum = add(
+                *sum,
+                add(
+                    self.nodes[i].bytes,
+                    self.nodes[i].host_control_bytes,
+                    self.diagnostic_overflow,
+                )?,
+                self.diagnostic_overflow,
+            )?;
         }
         if self.work.len() == self.layout.nodes {
             return Err(WorkspaceReportError::Capacity);
@@ -260,6 +295,14 @@ impl<R: Clone> Scratch<R> {
         &mut self,
         s: &G,
     ) -> Result<WorkspaceReportScalars, WorkspaceReportError> {
+        self.report_with_diagnostics(s, false)
+    }
+    pub(super) fn report_with_diagnostics<G: Graph<Root = R>>(
+        &mut self,
+        s: &G,
+        diagnostic_overflow: bool,
+    ) -> Result<WorkspaceReportScalars, WorkspaceReportError> {
+        self.diagnostic_overflow = diagnostic_overflow;
         if self.nodes.capacity() < self.layout.nodes
             || self.edges.capacity() < self.layout.edges
             || self.work.capacity() < self.layout.nodes
@@ -270,7 +313,7 @@ impl<R: Clone> Scratch<R> {
         }
         self.fill(s)?;
         let f = s.facts();
-        let retained_state = self.walk(s, CLOSE, C)?;
+        let retained_state = self.walk(s, CLOSE, C, true)?;
         let maximum_allocations = self
             .nodes
             .iter()
@@ -284,15 +327,27 @@ impl<R: Clone> Scratch<R> {
             bytes: retained_state,
             maximum_allocations,
         };
-        let mut total = Some(f.scratch);
+        let mut total = f.scratch;
         let mut persistent = Some(0);
+        let mut controls = s.scratch_host_control_bytes()?;
+        let mut retained_controls = Some(0);
         for i in 0..s.roots(NEW) {
             let n = self
                 .find(s, &s.root(NEW, i))
                 .ok_or(WorkspaceReportError::Source)?;
-            total = add(total, self.nodes[n].bytes)?;
+            total = add(total, self.nodes[n].bytes, self.diagnostic_overflow)?;
+            controls = add(
+                controls,
+                self.nodes[n].host_control_bytes,
+                self.diagnostic_overflow,
+            )?;
             if self.marks[n] & C != 0 {
-                persistent = add(persistent, self.nodes[n].bytes)?;
+                persistent = add(persistent, self.nodes[n].bytes, self.diagnostic_overflow)?;
+                retained_controls = add(
+                    retained_controls,
+                    self.nodes[n].host_control_bytes,
+                    self.diagnostic_overflow,
+                )?;
             }
         }
         if !f.complete {
@@ -303,14 +358,19 @@ impl<R: Clone> Scratch<R> {
             retained_bytes: persistent,
             transient_bytes: total.zip(persistent).map(|(a, b)| a - b),
         };
-        let total = add(total, f.host)?;
+        let total = add(
+            add(total, controls, self.diagnostic_overflow)?,
+            f.host,
+            self.diagnostic_overflow,
+        )?;
+        let persistent = add(persistent, retained_controls, self.diagnostic_overflow)?;
         let transient = total.zip(persistent).map(|(a, b)| a - b);
         let state = if f.seeded {
-            let displaced = self.walk(s, OPEN, O)?;
+            let displaced = self.walk(s, OPEN, O, true)?;
             Some(WorkspaceStateSpanReport {
                 retained_bytes: retained_state,
                 displaced_bytes: displaced,
-                transient_bytes: add(transient, displaced)?,
+                transient_bytes: add(transient, displaced, self.diagnostic_overflow)?,
             })
         } else {
             None
@@ -320,7 +380,15 @@ impl<R: Clone> Scratch<R> {
             let mut maximum_allocations = 0usize;
             for (node, marks) in self.nodes.iter().zip(&self.marks) {
                 if marks & O != 0 {
-                    bytes = bytes.zip(node.bytes).and_then(|(a, b)| a.checked_add(b));
+                    bytes = add(
+                        bytes,
+                        add(
+                            node.bytes,
+                            node.host_control_bytes,
+                            self.diagnostic_overflow,
+                        )?,
+                        self.diagnostic_overflow,
+                    )?;
                     maximum_allocations = maximum_allocations
                         .checked_add(node.maximum_allocations)
                         .ok_or(WorkspaceReportError::Overflow)?;
@@ -379,8 +447,13 @@ impl<R: Clone> Scratch<R> {
         // The paid index already has the exact identity order used by the
         // legacy residual fold. No repeated sort or new destination is needed.
         let f = s.facts();
-        let mut total = Some(f.scratch);
-        let mut transient = Some(f.scratch);
+        let scratch = add(
+            f.scratch,
+            s.scratch_host_control_bytes()?,
+            self.diagnostic_overflow,
+        )?;
+        let mut total = scratch;
+        let mut transient = scratch;
         let mut retained = Some(0);
         let mut displaced = Some(0);
         let mut opening_storage = WorkspaceStoragePopulation::EMPTY;
@@ -390,21 +463,25 @@ impl<R: Clone> Scratch<R> {
             if self.marks[i] & B != 0 {
                 continue;
             }
+            let bytes = add(n.bytes, n.host_control_bytes, self.diagnostic_overflow)?;
             if self.marks[i] & O != 0 {
-                opening_storage.bytes = opening_storage.bytes.zip(n.bytes)
-                    .and_then(|(a, b)| a.checked_add(b));
-                opening_storage.maximum_allocations = opening_storage.maximum_allocations
-                    .checked_add(n.maximum_allocations).ok_or(WorkspaceReportError::Overflow)?;
+                opening_storage.bytes =
+                    add(opening_storage.bytes, bytes, self.diagnostic_overflow)?;
+                opening_storage.maximum_allocations = opening_storage
+                    .maximum_allocations
+                    .checked_add(n.maximum_allocations)
+                    .ok_or(WorkspaceReportError::Overflow)?;
             }
-            total = add(total, n.bytes)?;
+            total = add(total, bytes, self.diagnostic_overflow)?;
             if self.marks[i] & C != 0 {
-                retained = add(retained, n.bytes)?;
-                closing_allocations = closing_allocations.checked_add(n.maximum_allocations)
+                retained = add(retained, bytes, self.diagnostic_overflow)?;
+                closing_allocations = closing_allocations
+                    .checked_add(n.maximum_allocations)
                     .ok_or(WorkspaceReportError::Overflow)?;
             } else {
-                transient = add(transient, n.bytes)?;
+                transient = add(transient, bytes, self.diagnostic_overflow)?;
                 if self.marks[i] & O != 0 {
-                    displaced = add(displaced, n.bytes)?;
+                    displaced = add(displaced, bytes, self.diagnostic_overflow)?;
                 }
             }
         }
@@ -414,11 +491,14 @@ impl<R: Clone> Scratch<R> {
         }
         Ok(WorkspaceReportResidual {
             opening_storage: Some(opening_storage),
-            closing_storage: Some(WorkspaceStoragePopulation { bytes: retained, maximum_allocations: closing_allocations }),
-            total_bytes: add(total, f.host)?,
+            closing_storage: Some(WorkspaceStoragePopulation {
+                bytes: retained,
+                maximum_allocations: closing_allocations,
+            }),
+            total_bytes: add(total, f.host, self.diagnostic_overflow)?,
             retained_bytes: retained,
             displaced_bytes: displaced,
-            transient_bytes: add(transient, f.host)?,
+            transient_bytes: add(transient, f.host, self.diagnostic_overflow)?,
         })
     }
 }

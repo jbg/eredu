@@ -1,10 +1,10 @@
 //! MLX realization of backend-neutral token-sampling primitives.
 
 use eredu_runtime::{PenaltyConfig, SamplingBackend, TokenDomain};
-use safemlx::{argmax_axis, error::Exception, random, Array, Dtype, Stream};
+use safemlx::{Array, Dtype, Stream, argmax_axis, error::Exception, random};
 
-use crate::backend::{nn::tensor::validate_token_domain, random::RandomState};
 use crate::MlxTensor;
+use crate::backend::{nn::tensor::validate_token_domain, random::RandomState};
 use eredu_core::TokenFilter;
 
 mod penalties;
@@ -20,19 +20,25 @@ impl SamplingBackend for MlxSamplingBackend {
     type Context = Stream;
     type Error = Exception;
 
-    fn clone_token_with_host_source(value:&Self::Token,
-        funding:&eredu_core::HostMetadataFunding,_context:&Self::Context)
-        ->Result<Self::Token,eredu_core::BackendFailure> {
+    fn clone_token_with_host_source(
+        value: &Self::Token,
+        funding: &eredu_core::HostMetadataFunding,
+        _context: &Self::Context,
+    ) -> Result<Self::Token, eredu_core::BackendFailure> {
         value.clone_with_host_source(funding)
     }
-    fn clone_logits_with_host_source(value:&Self::Logits,
-        funding:&eredu_core::HostMetadataFunding,_context:&Self::Context)
-        ->Result<Self::Logits,eredu_core::BackendFailure> {
+    fn clone_logits_with_host_source(
+        value: &Self::Logits,
+        funding: &eredu_core::HostMetadataFunding,
+        _context: &Self::Context,
+    ) -> Result<Self::Logits, eredu_core::BackendFailure> {
         value.clone_with_host_source(funding)
     }
-    fn clone_random_with_host_source(value:&Self::RandomState,
-        funding:&eredu_core::HostMetadataFunding,_context:&Self::Context)
-        ->Result<Self::RandomState,eredu_core::BackendFailure> {
+    fn clone_random_with_host_source(
+        value: &Self::RandomState,
+        funding: &eredu_core::HostMetadataFunding,
+        _context: &Self::Context,
+    ) -> Result<Self::RandomState, eredu_core::BackendFailure> {
         value.clone_with_host_source(funding)
     }
 
@@ -132,12 +138,16 @@ impl SamplingBackend for MlxSamplingBackend {
         filter: &TokenFilter,
         stream: &Stream,
     ) -> Result<MlxTensor, Exception> {
-        let plan=eredu_runtime::generation::TokenMaskPlan::new(filter,logits.as_array().shape(),None)
-            .map_err(|cause|Exception::custom(cause.to_string()))?;
-        if plan.is_identity() { return Ok(logits.clone()); }
-        let mut invalid=Vec::with_capacity(plan.elements());
-        plan.fill(&mut invalid).map_err(|cause|Exception::custom(cause.to_string()))?;
-        apply_token_mask(logits,&invalid,stream)
+        let plan =
+            eredu_runtime::generation::TokenMaskPlan::new(filter, logits.as_array().shape(), None)
+                .map_err(|cause| Exception::custom(cause.to_string()))?;
+        if plan.is_identity() {
+            return Ok(logits.clone());
+        }
+        let mut invalid = Vec::with_capacity(plan.elements());
+        plan.fill(&mut invalid)
+            .map_err(|cause| Exception::custom(cause.to_string()))?;
+        apply_token_mask(logits, &invalid, stream)
     }
 
     fn apply_mirostat(
@@ -312,8 +322,38 @@ pub(super) fn penalty_control_bytes() -> Option<usize> {
 
 /// Consumes the already-expanded exact invalid mask through the same native
 /// upload/where worker. The caller retains its paid Vec until upload completes.
-pub(crate) fn apply_token_mask(logits:&MlxTensor,invalid:&[bool],stream:&Stream)->Result<MlxTensor,Exception> {
-    mask_logits(Array::try_from_slice(invalid,logits.as_array().shape())?,logits.as_array().clone(),stream).map(MlxTensor::from_array)
+pub(crate) fn apply_token_mask(
+    logits: &MlxTensor,
+    invalid: &[bool],
+    stream: &Stream,
+) -> Result<MlxTensor, Exception> {
+    mask_logits(
+        Array::try_from_slice(invalid, logits.as_array().shape())?,
+        logits.as_array().clone(),
+        stream,
+    )
+    .map(MlxTensor::from_array)
+}
+
+/// Fixed source frames for both ordinary token-filter branches and the shared
+/// expanded-mask worker; the selected workspace report owns Vec payload bytes.
+pub(super) fn token_mask_control_bytes() -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    let parts = [
+        eredu_runtime::generation::TokenMaskPlan::control_bytes(),
+        size_of::<(&MlxTensor, &TokenFilter, &Stream)>(),
+        size_of::<(&MlxTensor, &[bool], &Stream)>(),
+        size_of::<(Array, Array, &Stream)>(),
+        size_of::<Vec<bool>>(),
+        size_of::<eredu_runtime::generation::TokenMaskPlan<'_>>(),
+        size_of::<[Array; 3]>(),
+        size_of::<MlxTensor>(),
+        size_of::<Result<MlxTensor, Exception>>(),
+        size_of::<Result<Array, Exception>>(),
+    ];
+    parts
+        .into_iter()
+        .try_fold(size_of_val(&parts), usize::checked_add)
 }
 
 fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {

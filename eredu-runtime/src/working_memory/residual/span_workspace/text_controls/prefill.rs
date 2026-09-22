@@ -236,7 +236,10 @@ impl OriginalTextPrefillScopeSet {
         expected: HostSourceConstructionFacts,
     ) -> Result<OriginalHostSourceBank, WorkingMemoryError> {
         self.validate_request(&self.request)?;
-        if self.next != 0 || self.source_component_extracted || self.facts.source_constructions != Some(expected) {
+        if self.next != 0
+            || self.source_component_extracted
+            || self.facts.source_constructions != Some(expected)
+        {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let facts = self
@@ -277,15 +280,20 @@ impl OriginalTextPrefillScopeSet {
         expected: HostSourceConstructionFacts,
     ) -> Result<(), WorkingMemoryError> {
         self.validate_request(&self.request)?;
-        if self.next != 0 || !self.source_component_extracted
+        if self.next != 0
+            || !self.source_component_extracted
             || self.facts.source_constructions.is_some()
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let reservation = self.request.memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = self.request.memory_reservation();
         let restored = OriginalHostDestinationBank::restore_source_component(
-            bank, source, expected, self.facts.host_destinations, &self.controls, reservation,
+            bank,
+            source,
+            expected,
+            self.facts.host_destinations,
+            &self.controls,
+            reservation,
         )?;
         self.facts.source_constructions = Some(expected);
         self.facts.host_destinations = Some(restored);
@@ -294,11 +302,8 @@ impl OriginalTextPrefillScopeSet {
     /// Validate the actual request before consuming or retrying native slots.
     pub fn validate_request(&self, request: &InferenceRequest) -> Result<(), WorkingMemoryError> {
         self.request.validate_same_request(request)?;
-        self.controls.validate_reservation(
-            request
-                .memory_reservation()
-                .ok_or(WorkingMemoryError::IdentityMismatch)?,
-        )
+        self.controls
+            .validate_reservation(request.memory_reservation())
     }
     /// Validate installation against the actual selected session identity. This
     /// only compares the original request; it creates no binding or grant.
@@ -317,11 +322,8 @@ impl OriginalTextPrefillScopeSet {
         if self.facts.plan.role(self.next) != Some(role) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        self.controls.validate_reservation(
-            self.request
-                .memory_reservation()
-                .ok_or(WorkingMemoryError::IdentityMismatch)?,
-        )?;
+        self.controls
+            .validate_reservation(self.request.memory_reservation())?;
         let original = OriginalPrefillScopeRole {
             role,
             native: OriginalPrefillNativeCustody {
@@ -478,18 +480,26 @@ fn bank_control_bytes() -> Option<usize> {
             HostSourceConstructionFacts,
         )>(),
         size_of::<Result<OriginalHostSourceBank, WorkingMemoryError>>(),
-        size_of::<(&mut OriginalTextPrefillScopeSet, &mut Option<OriginalHostDestinationBank>,
-            &mut Option<OriginalHostSourceBank>, HostSourceConstructionFacts)>(),
-        size_of::<(&mut Option<OriginalHostDestinationBank>, &mut Option<OriginalHostSourceBank>,
-            HostSourceConstructionFacts, Option<HostDestinationFacts>, &OriginalTextControlGuard,
-            &WorkingMemoryReservation)>(),
+        size_of::<(
+            &mut OriginalTextPrefillScopeSet,
+            &mut Option<OriginalHostDestinationBank>,
+            &mut Option<OriginalHostSourceBank>,
+            HostSourceConstructionFacts,
+        )>(),
+        size_of::<(
+            &mut Option<OriginalHostDestinationBank>,
+            &mut Option<OriginalHostSourceBank>,
+            HostSourceConstructionFacts,
+            Option<HostDestinationFacts>,
+            &OriginalTextControlGuard,
+            &WorkingMemoryReservation,
+        )>(),
         size_of::<(&OriginalHostSourceBank, &OriginalHostDestinationBank)>(),
         size_of::<(HostDestinationFacts, HostDestinationFacts)>(),
         size_of::<Result<HostDestinationFacts, WorkingMemoryError>>(),
         size_of::<Result<(), WorkingMemoryError>>(),
         size_of::<OriginalHostDestinationBank>(),
         size_of::<OriginalHostSourceBank>(),
-
         size_of::<(HostDestinationFacts, HostDestinationFacts, bool)>(),
         size_of::<Result<OriginalTextPrefillScopeSet, WorkingMemoryError>>(),
         size_of::<TextPrefillScopeFacts>(),

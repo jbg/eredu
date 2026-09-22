@@ -2,6 +2,9 @@
 use super::*;
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 
+pub(super) const CONTROL_PHASE: crate::DistributedExecutionPhase =
+    crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
+
 /// A scoped prediction-state loan failed before entry or while returning.
 /// Restoring the two local owner slots never clears this failure or its fence.
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +70,48 @@ where
     where
         F: FnOnce(&mut Self) -> Result<T, E>,
     {
-        let validate = |session: &mut Self, displaced: &M::State| {
+        let validate = Self::prediction_state_validator(context);
+        if let Some(funding) = funding {
+            let bytes = control_bytes::<Self, M::State, T, E, _, _, _>(&validate, &operation)
+                .ok_or(HostMetadataFundingError::Overflow)?;
+            funding.reserve_metadata(bytes)?;
+        }
+        with_state(
+            self,
+            replacement,
+            |session| &mut session.state,
+            validate,
+            operation,
+        )
+    }
+    /// Pure size query for the exact prediction-loan validation and callback
+    /// frames. The caller supplies its actual callback type; no loan is entered.
+    pub fn prediction_state_loan_control_bytes<'a, T, E, F>(&'a self) -> Option<usize>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+    {
+        fn describe<O, S, T, E, V, F, G, I>(_: impl FnOnce(I) -> G) -> Option<usize>
+        where
+            F: FnOnce(&mut O) -> Result<T, E>,
+            G: FnMut(&mut O, &S) -> Result<(), V>,
+        {
+            control_type_bytes::<O, S, T, E, V, F, G>()
+        }
+        describe::<Self, M::State, T, E, _, F, _, _>(
+            |context: &'a <B::Tensor as Tensor>::Context| Self::prediction_state_validator(context),
+        )
+    }
+
+    fn prediction_state_validator(
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> impl FnMut(
+        &mut Self,
+        &M::State,
+    ) -> Result<
+        (),
+        PredictionStateLoanError<ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+    > + '_ {
+        move |session: &mut Self, displaced: &M::State| {
             RuntimeInspectionBoundary::resolved(session.control_fence, session.last_commit_outcome)
                 .map_err(PredictionStateLoanError::Boundary)?;
             if let Some(epoch) = session.active_commit_epoch {
@@ -86,30 +130,14 @@ where
                 }
             };
             let agreed = session
-                .agree_execution_phase(
-                    crate::DistributedExecutionPhase::PredictionTargetStatePreparation,
-                    valid,
-                    context,
-                )
+                .agree_execution_phase(CONTROL_PHASE, valid, context)
                 .map_err(|cause| PredictionStateLoanError::Session(widen_infallible(cause)))?;
             match (valid, agreed) {
                 (false, _) => Err(PredictionStateLoanError::Layout),
                 (true, false) => Err(PredictionStateLoanError::Peer),
                 (true, true) => Ok(()),
             }
-        };
-        if let Some(funding) = funding {
-            let bytes = control_bytes::<Self, M::State, T, E, _, _, _>(&validate, &operation)
-                .ok_or(HostMetadataFundingError::Overflow)?;
-            funding.reserve_metadata(bytes)?;
         }
-        with_state(
-            self,
-            replacement,
-            |session| &mut session.state,
-            validate,
-            operation,
-        )
     }
 }
 
@@ -135,12 +163,17 @@ where
     F: FnOnce(&mut O) -> Result<T, E>,
     G: FnMut(&mut O, &S) -> Result<(), V>,
 {
+    let _ = (validate, operation);
+    control_type_bytes::<O, S, T, E, V, F, G>()
+}
+
+fn control_type_bytes<O, S, T, E, V, F, G>() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     let rows = [
         size_of::<S>(),
         size_of::<StateLoan<'_, O, S>>(),
-        size_of_val(validate),
-        size_of_val(operation),
+        size_of::<G>(),
+        size_of::<F>(),
         size_of::<Result<T, E>>(),
         size_of::<Result<(), V>>(),
         size_of::<Result<(Result<T, E>, Result<(), V>), V>>(),

@@ -2,6 +2,8 @@
 
 use super::*;
 use crate::backend::runtime::residency::storage::RetainedStorage;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     ControlledTextGeneration, SharedTokenFilter, TextControllerStorage, TextFilterWorkspace,
@@ -10,7 +12,7 @@ use eredu_core::{
 use eredu_runtime::{
     execution_control::TokenChoiceController,
     working_memory::{
-        InferenceStateRevision, WorkingMemoryError, WorkingMemoryPool, WorkingMemoryReservation,
+        InferenceStateRevision, MemoryLedger, WorkingMemoryError, WorkingMemoryReservation,
     },
     TokenDomain,
 };
@@ -93,12 +95,12 @@ fn filter(all: bool) -> TokenFilter {
     TokenFilter::allowed(values).unwrap()
 }
 
-fn prepared_mask(pool: &WorkingMemoryPool, all: bool) -> SharedTokenFilter {
-    let before = pool.used_bytes().unwrap();
+fn prepared_mask(pool: &MemoryLedger, all: bool) -> SharedTokenFilter {
+    let before = pool.fixture_host_charge().unwrap();
     let mask = pool.prepare_shared_token_filter(|| filter(all)).unwrap();
     assert_eq!(mask.capacity_bytes(), Some(MASK_BYTES));
     assert_eq!(mask.as_ref().allowed_mask().unwrap().len(), 64);
-    assert_eq!(pool.used_bytes().unwrap(), before + MASK_BYTES);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before + MASK_BYTES);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     mask
 }
@@ -122,7 +124,15 @@ fn config(capacity: Option<u64>) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: capacity,
+        memory_limits: (capacity).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -130,10 +140,10 @@ fn config(capacity: Option<u64>) -> TextGenerationConfig {
 
 fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -151,10 +161,10 @@ fn reclaim() {
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -182,7 +192,6 @@ fn reservation(preparation: &MlxTextPreparation) -> &WorkingMemoryReservation {
         .unwrap()
         .request()
         .memory_reservation()
-        .unwrap()
 }
 
 fn full_quote<C: TokenFilterController>(
@@ -191,7 +200,7 @@ fn full_quote<C: TokenFilterController>(
     geometry: eredu_core::InferenceGeometry,
     controller: &C,
 ) -> eredu_core::RuntimeStateEstimate {
-    let before = NoWork::capture(runtime, runtime.backend().memory_pool());
+    let before = NoWork::capture(runtime, runtime.backend().memory_ledger());
     let (state, width) = super::text_quote::quote(
         runtime.session(),
         geometry,
@@ -201,7 +210,7 @@ fn full_quote<C: TokenFilterController>(
     )
     .unwrap();
     assert_eq!(width, 64);
-    before.assert_unchanged(runtime, runtime.backend().memory_pool());
+    before.assert_unchanged(runtime, runtime.backend().memory_ledger());
     state
 }
 
@@ -262,7 +271,7 @@ fn ids(outputs: &[MlxTextToken]) -> Vec<u32> {
 }
 
 fn reference(stream: &Stream, prompt: Vec<u32>, all: bool) -> Vec<u32> {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(stream, &pool);
     let source = prepared_mask(&pool, all);
     let outputs = generate(
@@ -338,7 +347,7 @@ struct NoWork {
 }
 
 impl NoWork {
-    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) -> Self {
+    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) -> Self {
         Self {
             paths: paths::snapshot(),
             inputs: paths::session_input_creation_attempts(),
@@ -353,12 +362,12 @@ impl NoWork {
                 .unwrap()
                 .revision()
                 .clone(),
-            bytes: pool.used_bytes().unwrap(),
-            peak: pool.peak_bytes().unwrap(),
+            bytes: pool.fixture_host_charge().unwrap(),
+            peak: pool.fixture_host_peak().unwrap(),
         }
     }
 
-    fn assert_unchanged(&self, runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) {
+    fn assert_unchanged(&self, runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) {
         assert_eq!(paths::snapshot(), self.paths);
         assert_eq!(paths::session_input_creation_attempts(), self.inputs);
         assert_eq!(paths::session_reset_attempts(), self.resets);
@@ -368,8 +377,8 @@ impl NoWork {
             model.retained_inference_authority().unwrap().revision(),
             &self.revision
         );
-        assert_eq!(pool.used_bytes().unwrap(), self.bytes);
-        assert_eq!(pool.peak_bytes().unwrap(), self.peak);
+        assert_eq!(pool.fixture_host_charge().unwrap(), self.bytes);
+        assert_eq!(pool.fixture_host_peak().unwrap(), self.peak);
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     }
 }
@@ -387,7 +396,7 @@ fn cause<'a, T: std::error::Error + 'static>(
 
 fn reject_one_byte_short<C: TokenFilterController + Clone>(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     prompt: &Vec<u32>,
     controller: &C,
     charge: u64,
@@ -403,11 +412,9 @@ fn reject_one_byte_short<C: TokenFilterController + Clone>(
     .err()
     .unwrap();
     assert_eq!(
-        cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::BudgetExceeded {
-            required_bytes: charge,
-            available_bytes: charge - 1,
-        })
+        cause::<WorkingMemoryError>(&error)
+            .and_then(crate::tests::support::memory_error::host_budget_numbers),
+        Some((charge, charge - 1))
     );
     before.assert_unchanged(runtime, pool);
     exact
@@ -418,24 +425,36 @@ fn registered_controller_credit_preserves_full_diagnostics_and_exact_capacity_pa
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     let mut sequences = Vec::new();
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = runtime(&stream, &pool);
         let source = prepared_mask(&pool, false);
         let controller = Controller::new(source.clone(), false);
         let calls = controller.calls.clone();
         let prompt = vec![1, 2, 3, 4, 5];
-        let initial = pool.used_bytes().unwrap();
+        let initial = pool.fixture_host_charge().unwrap();
         let preparation = probe(&runtime, &prompt, &controller);
         let accepted = reservation(&preparation);
         let full = full_quote(&runtime, &prompt, accepted.geometry(), &controller);
         assert_eq!(accepted.admission().state, full);
         assert_eq!(
             accepted.admission().incremental_required_bytes,
-            accepted.bytes()
+            Some(
+                accepted
+                    .requirements()
+                    .get(crate::memory_fixture::topology().host_domain())
+                    .unwrap()
+                    .total()
+                    .unwrap()
+            )
         );
-        let charge = accepted.bytes();
+        let charge = accepted
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         assert_eq!(charge + MASK_BYTES, full_bytes(&full));
-        assert_eq!(pool.used_bytes().unwrap(), initial + charge);
+        assert_eq!(pool.fixture_host_charge().unwrap(), initial + charge);
         let historical = preparation.request.as_ref().unwrap().request().clone();
         drop(preparation);
         settle(&pool, initial);
@@ -445,7 +464,15 @@ fn registered_controller_credit_preserves_full_diagnostics_and_exact_capacity_pa
         let fallback = Controller::new(SharedTokenFilter::new(filter(false)), false);
         let unregistered = probe(&runtime, &prompt, &fallback);
         assert_eq!(reservation(&unregistered).admission().state, full);
-        assert_eq!(reservation(&unregistered).bytes(), full_bytes(&full));
+        assert_eq!(
+            reservation(&unregistered)
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+            full_bytes(&full)
+        );
         assert_eq!(fallback.calls.get(), (0, 0));
         drop(unregistered);
         drop(fallback);
@@ -484,7 +511,16 @@ fn registered_controller_credit_preserves_full_diagnostics_and_exact_capacity_pa
         drop(source);
         // Historical request metadata contains no source payload or storage pin.
         settle(&pool, 0);
-        assert_eq!(historical.memory_reservation().unwrap().bytes(), charge);
+        assert_eq!(
+            historical
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+            charge
+        );
     }
     assert_eq!(sequences[0], sequences[1]);
 }
@@ -492,14 +528,19 @@ fn registered_controller_credit_preserves_full_diagnostics_and_exact_capacity_pa
 #[test]
 fn native_preparation_keeps_registered_host_pin_after_all_filter_owners_drop() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = runtime(&stream, &pool);
-    let model_bytes = pool.used_bytes().unwrap();
+    let model_bytes = pool.fixture_host_charge().unwrap();
     let source = prepared_mask(&pool, false);
     let controller = Controller::new(source.clone(), false);
     let calls = controller.calls.clone();
     let preparation = probe(&runtime, &vec![1, 2, 3, 4, 5], &controller);
-    let charge = reservation(&preparation).bytes();
+    let charge = reservation(&preparation)
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     let historical = preparation.request.as_ref().unwrap().request().clone();
     let before = NoWork::capture(&runtime, &pool);
     assert_eq!(before.bytes, model_bytes + MASK_BYTES + charge);
@@ -513,13 +554,22 @@ fn native_preparation_keeps_registered_host_pin_after_all_filter_owners_drop() {
     settle(&pool, model_bytes);
     drop(runtime);
     settle(&pool, 0);
-    assert_eq!(historical.memory_reservation().unwrap().bytes(), charge);
+    assert_eq!(
+        historical
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
+        charge
+    );
 }
 
 #[test]
 fn cached_decoder_and_registered_controller_credits_compose_without_releasing_old_aliases() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let source = prepared_mask(&pool, false);
     let outputs_a = generate(
@@ -544,14 +594,24 @@ fn cached_decoder_and_registered_controller_credits_compose_without_releasing_ol
     assert_eq!(accepted.geometry().cached_positions, 7);
     let full = full_quote(&runtime, &prompt, accepted.geometry(), &controller);
     assert_eq!(accepted.admission().state, full);
-    let charge = accepted.bytes();
+    let charge = accepted
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     let historical = preparation.request.as_ref().unwrap().request().clone();
     drop(preparation);
     settle(&pool, initial);
 
     let fallback = Controller::new(SharedTokenFilter::new(filter(false)), false);
     let without_host_credit = probe(&runtime, &prompt, &fallback);
-    let decoder_only = reservation(&without_host_credit).bytes();
+    let decoder_only = reservation(&without_host_credit)
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     assert_eq!(reservation(&without_host_credit).admission().state, full);
     assert_eq!(charge + MASK_BYTES, decoder_only);
     assert!(
@@ -612,7 +672,16 @@ fn cached_decoder_and_registered_controller_credits_compose_without_releasing_ol
     settle(&pool, MASK_BYTES);
     drop(source);
     settle(&pool, 0);
-    assert_eq!(historical.memory_reservation().unwrap().bytes(), charge);
+    assert_eq!(
+        historical
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
+        charge
+    );
 }
 
 #[test]
@@ -621,7 +690,7 @@ fn registered_source_credit_preserves_optional_final_and_forced_preoverride_allo
     let baseline = reference(&stream, vec![1, 2, 3, 4, 5], true)[0];
     assert_ne!(baseline, FORCED_TOKEN);
     let suffix = reference(&stream, vec![1, 2, 3, 4, 5, FORCED_TOKEN], true);
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let source = prepared_mask(&pool, true);
     let plain = Controller::new(source.clone(), true);
@@ -630,14 +699,19 @@ fn registered_source_credit_preserves_optional_final_and_forced_preoverride_allo
     controller.force_next(FORCED_TOKEN).unwrap();
     assert_eq!(calls.get(), (1, 0));
     let prompt = vec![1, 2, 3, 4, 5];
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let preparation = probe(&runtime, &prompt, &controller);
     let accepted = reservation(&preparation);
     let full = full_quote(&runtime, &prompt, accepted.geometry(), &controller);
     let plain_full = full_quote(&runtime, &prompt, accepted.geometry(), &plain);
     assert_eq!(accepted.admission().state, full);
     assert_eq!(full_bytes(&full), full_bytes(&plain_full) + MASK_BYTES);
-    let charge = accepted.bytes();
+    let charge = accepted
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     assert_eq!(charge + MASK_BYTES, full_bytes(&full));
     assert_eq!(charge, full_bytes(&plain_full));
     assert_eq!(

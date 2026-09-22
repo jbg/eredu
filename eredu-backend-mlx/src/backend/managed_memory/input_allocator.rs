@@ -1,15 +1,15 @@
 //! Shared allocator birth in the actual managed domain. No Device promotion.
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     InitializedInputAllocator, InputAllocatorCause, InputAllocatorError, PreparedInputAllocator,
     PreparedInputRuntime,
 };
 use std::sync::{
-    OnceLock,
     atomic::{AtomicBool, Ordering},
+    OnceLock,
 };
 
 static INITIALIZED: OnceLock<InitializedSharedNative<InitializedInputAllocator>> = OnceLock::new();
@@ -140,7 +140,7 @@ impl std::error::Error for MlxInputAllocatorInitializationError {
 }
 fn borrow(
     owner: &InitializedSharedNative<InitializedInputAllocator>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     device_admitted: bool,
 ) -> Result<(PreparedInputRuntime, InputAllocatorCoverage), MlxInputAllocatorInitializationError> {
     owner
@@ -159,23 +159,12 @@ fn borrow(
     ))
 }
 
-/// Explicit original cold entry. The exact managed domain must already cover
-/// its fixed baseline. The Device initializer shares this exact pool and runs
-/// before the shared Scheduler, and both precede any allocator loan. Their
-/// actual successful owners survive a later failure. Active ordinary work
-/// still rejects through the existing Pool comparison; it is never bypassed.
-pub(crate) fn prepare_admitted(
-    pool: &WorkingMemoryPool,
-) -> Result<(PreparedInputRuntime, InputAllocatorCoverage), MlxInputAllocatorInitializationError> {
-    if !pool.same_domain(&super::domain()) {
-        return Err(MlxInputAllocatorInitializationError(Failure::Policy(
-            WorkingMemoryError::IdentityMismatch,
-        )));
-    }
-    let device_admitted = super::metal_device::prepare_admitted(pool)
-        .map_err(|error| MlxInputAllocatorInitializationError(Failure::Device(error)))?;
-    super::scheduler::prepare_admitted(pool)
-        .map_err(|error| MlxInputAllocatorInitializationError(Failure::Scheduler(error)))?;
+/// Shared finite kernel sources used by ordinary and prepared execution.
+/// Their admitted owners remain charged independently of request lifetimes.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn prepare_kernel_families(
+    pool: &MemoryLedger,
+) -> Result<(), MlxInputAllocatorInitializationError> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     super::pointwise_kernel::prepare_admitted(pool)
         .map_err(|error| MlxInputAllocatorInitializationError(Failure::Pointwise(error)))?;
@@ -191,6 +180,28 @@ pub(crate) fn prepare_admitted(
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     crate::backend::nn::fp8::kernel::prepare_admitted(pool)
         .map_err(|error| MlxInputAllocatorInitializationError(Failure::Fp8(error)))?;
+    Ok(())
+}
+
+/// Explicit original cold entry. The exact managed domain must already cover
+/// its fixed baseline. The Device initializer shares this exact pool and runs
+/// before the shared Scheduler, and both precede any allocator loan. Their
+/// actual successful owners survive a later failure. Active ordinary work
+/// still rejects through the existing Pool comparison; it is never bypassed.
+pub(crate) fn prepare_admitted(
+    pool: &MemoryLedger,
+) -> Result<(PreparedInputRuntime, InputAllocatorCoverage), MlxInputAllocatorInitializationError> {
+    if !pool.same_ledger(&super::ledger()) {
+        return Err(MlxInputAllocatorInitializationError(Failure::Policy(
+            WorkingMemoryError::IdentityMismatch,
+        )));
+    }
+    let device_admitted = super::metal_device::prepare_admitted(pool)
+        .map_err(|error| MlxInputAllocatorInitializationError(Failure::Device(error)))?;
+    super::scheduler::prepare_admitted(pool)
+        .map_err(|error| MlxInputAllocatorInitializationError(Failure::Scheduler(error)))?;
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    prepare_kernel_families(pool)?;
     if let Some(owner) = INITIALIZED.get() {
         return borrow(owner, pool, device_admitted);
     }
@@ -226,8 +237,8 @@ pub(crate) fn prepare_admitted(
 /// It retains ordinary initialization/housekeeping and never attempts admission
 /// or promotes a predecessor. The immutable completed slot can only document a
 /// real earlier admitted birth of this same global allocator.
-pub(crate) fn prepare_ordinary()
--> Result<(PreparedInputRuntime, InputAllocatorCoverage), safemlx::error::Exception> {
+pub(crate) fn prepare_ordinary(
+) -> Result<(PreparedInputRuntime, InputAllocatorCoverage), safemlx::error::Exception> {
     let runtime = PreparedInputRuntime::prepare()?;
     let coverage = match INITIALIZED.get() {
         Some(owner) => InputAllocatorCoverage::Admitted {
@@ -268,7 +279,7 @@ impl MlxInputAllocatorInitializationError {
 
 /// Borrow only the actual admitted allocator; never initialize under a live source constructor.
 pub(crate) fn borrow_admitted(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<PreparedInputRuntime, WorkingMemoryError> {
     admitted_initializer(pool)?
         .try_borrow_runtime()
@@ -280,7 +291,7 @@ pub(crate) fn borrow_admitted(
 /// current-thread runtime witness across execution boundaries. Actual borrowing
 /// still authenticates the native singleton and never initializes a fallback.
 pub(crate) fn admitted_initializer(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> Result<&'static InitializedInputAllocator, WorkingMemoryError> {
     let owner = INITIALIZED.get().ok_or(WorkingMemoryError::UnknownBound)?;
     owner.validate_pool(pool)?;

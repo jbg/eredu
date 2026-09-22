@@ -11,6 +11,8 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
 };
+mod output;
+use output::BindingOutput;
 
 #[derive(Clone, PartialEq, Eq)]
 struct CatalogEntry {
@@ -145,15 +147,17 @@ pub(super) struct DetachedCatalog {
     catalog: Option<CatalogOwner>,
     reads: Arc<DetachedEncodedReads<ManagerCustody>>,
     range: Range<usize>,
-    names: Vec<String>,
+    outputs: Vec<BindingOutput>,
 }
 impl DetachedCatalog {
     fn entry(&self, key: &str) -> Option<&CatalogEntry> {
         self.catalog.as_ref()?.value.entry(key)
     }
     fn output(&self, name: &str) -> Option<&RecipeMetadata> {
-        self.reads
-            .output(self.range.start + self.names.iter().position(|key| key == name)?)
+        self.outputs
+            .iter()
+            .find(|row| row.name() == name)?
+            .metadata(&self.reads)
     }
 }
 impl CheckpointSource for DetachedCatalog {
@@ -226,8 +230,11 @@ impl CheckpointSource for DetachedCatalog {
         })
     }
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
-        Ok(self.reads.slice(self.range.clone())
-            .expect("validated detached read range").diagnostics())
+        Ok(self
+            .reads
+            .slice(self.range.clone())
+            .expect("validated detached read range")
+            .diagnostics())
     }
 }
 pub(in crate::backend::runtime::residency::manager) struct OriginalReadSources {
@@ -310,23 +317,16 @@ impl OriginalReadSources {
         let Some(catalog) = self.catalogs.get(unit.id()) else {
             return Ok(false);
         };
-        let mut index = catalog.range.start;
-        for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
-            let recipe = binding.source_recipe();
-            let Some(read) = DirectRecipeRead::prepare(&recipe, source)? else {
-                return Ok(false);
-            };
-            if catalog
-                .names
-                .get(index - catalog.range.start)
-                .is_none_or(|name| name != binding.name())
-                || !self.reads.matches_read(index, read.encoded())
-            {
+        let bindings = unit.bindings().iter().filter(|binding| !binding.is_alias());
+        if bindings.clone().count() != catalog.outputs.len() {
+            return Ok(false);
+        }
+        for (binding, output) in bindings.zip(&catalog.outputs) {
+            if !output.matches(binding, source, &self.reads)? {
                 return Ok(false);
             }
-            index += 1;
         }
-        Ok(index == catalog.range.end)
+        Ok(true)
     }
     pub(in crate::backend::runtime::residency::manager) fn policy(
         &self,
@@ -361,7 +361,7 @@ impl OriginalReadSources {
                 .checked_add(catalog.clone_bytes().ok_or_else(overflow)?)
                 .ok_or_else(overflow)?;
         }
-        for unit in plan.units {
+        for (ordinal, unit) in plan.units.iter().enumerate() {
             let count = unit
                 .bindings()
                 .iter()
@@ -371,14 +371,17 @@ impl OriginalReadSources {
                 .checked_add(unit.id().as_str().len())
                 .ok_or_else(overflow)?
                 .checked_add(
-                    Layout::array::<String>(count)
+                    Layout::array::<BindingOutput>(count)
                         .map_err(|_| overflow())?
                         .size(),
                 )
                 .ok_or_else(overflow)?;
-            for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
+            for row in &plan.reads[plan.read_range(ordinal)] {
+                let binding = &unit.bindings()[row.binding];
                 bytes = bytes
-                    .checked_add(binding.name().len())
+                    .checked_add(
+                        BindingOutput::payload_bytes(row, binding.name()).ok_or_else(overflow)?,
+                    )
                     .ok_or_else(overflow)?;
             }
         }
@@ -389,6 +392,7 @@ impl OriginalReadSources {
             shared(erasure.source_body())?,
             shared(erasure.custody_body())?,
             erasure.control_bytes(),
+            BindingOutput::control_bytes().ok_or_else(overflow)?,
             size_of::<Self>(),
             size_of::<ReadSourcePlan<'_>>(),
             size_of::<DetachedCatalog>(),
@@ -414,7 +418,9 @@ impl OriginalReadSources {
         reads: DetachedEncodedReads<ManagerCustody>,
         custody: ManagerCustody,
     ) -> Result<Self, ConstructionCause> {
-        if plan.catalogs.units.len() != plan.units.len() || reads.len() != plan.reads.len() {
+        if plan.catalogs.units.len() != plan.units.len()
+            || Some(reads.len()) != plan.encoded_leaves().map(|leaves| leaves.len())
+        {
             return Err(ResidencyError::StatePoisoned.into());
         }
         let reads = Arc::new(reads);
@@ -429,8 +435,11 @@ impl OriginalReadSources {
         let mut catalogs = Vec::new();
         catalogs.try_reserve_exact(plan.units.len())?;
         for (ordinal, unit) in plan.units.iter().enumerate() {
-            let range = plan.read_range(ordinal);
-            if range.len()
+            let rows = plan.read_range(ordinal);
+            let range = plan
+                .leaf_range(rows.clone())
+                .ok_or(ResidencyError::StatePoisoned)?;
+            if rows.len()
                 != unit
                     .bindings()
                     .iter()
@@ -439,10 +448,19 @@ impl OriginalReadSources {
             {
                 return Err(ResidencyError::StatePoisoned.into());
             }
-            let mut names = Vec::new();
-            names.try_reserve_exact(range.len())?;
-            for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
-                names.push(binding.name().to_owned());
+            let mut outputs = Vec::new();
+            outputs.try_reserve_exact(rows.len())?;
+            let mut leaf = range.start;
+            for row in &plan.reads[rows] {
+                let end = leaf
+                    .checked_add(row.read.leaf_count())
+                    .ok_or(ResidencyError::StatePoisoned)?;
+                outputs.push(BindingOutput::construct(
+                    row,
+                    unit.bindings()[row.binding].name(),
+                    leaf..end,
+                )?);
+                leaf = end;
             }
             let catalog = owners
                 .get(
@@ -460,7 +478,7 @@ impl OriginalReadSources {
                     catalog: Some(catalog),
                     reads: reads.clone(),
                     range,
-                    names,
+                    outputs,
                 },
             ));
         }
@@ -470,7 +488,7 @@ impl OriginalReadSources {
                 catalog: Some(primary.clone()),
                 reads: reads.clone(),
                 range: 0..reads.len(),
-                names: Vec::new(),
+                outputs: Vec::new(),
             },
             custody.clone(),
         );
@@ -482,7 +500,7 @@ impl OriginalReadSources {
                 catalog: None,
                 reads: reads.clone(),
                 range: 0..0,
-                names: Vec::new(),
+                outputs: Vec::new(),
             },
             reads,
             _custody: custody,
@@ -688,7 +706,7 @@ mod tests {
             }),
             reads: Arc::new(reads),
             range: 0..0,
-            names: Vec::new(),
+            outputs: Vec::new(),
         };
         drop(source);
         assert!(weak.upgrade().is_none());
@@ -739,7 +757,7 @@ mod tests {
             catalog: owner,
             reads: reads.clone(),
             range: 0..0,
-            names: Vec::new(),
+            outputs: Vec::new(),
         };
         let ids = [
             OffloadUnitId::new("first").unwrap(),

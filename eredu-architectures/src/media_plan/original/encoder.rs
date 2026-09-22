@@ -24,8 +24,15 @@ fn failure(error: PatchEncoderTableError) -> MediaSemanticError {
 impl OriginalPreparedMediaSemantics<'_> {
     /// Selected encoders without Qwen's fixed lookup tables still retain the
     /// same original B/source population. No empty table substitute is minted.
-    pub fn optional_encoder_table_plan(&self) -> Result<Option<PreparedMediaEncoderTablePlan<'_>>, MediaSemanticError> {
-        if matches!(Policy::source(self.0.provenance())?, Policy::Gemma(_)) { return Ok(None); }
+    pub fn optional_encoder_table_plan(
+        &self,
+    ) -> Result<Option<PreparedMediaEncoderTablePlan<'_>>, MediaSemanticError> {
+        if matches!(
+            Policy::source(self.0.provenance())?,
+            Policy::Gemma(_) | Policy::Inkling(_) | Policy::Muse(_)
+        ) {
+            return Ok(None);
+        }
         self.encoder_table_plan().map(Some)
     }
     /// Measures the selected tower's complete source tables before B admission.
@@ -34,7 +41,14 @@ impl OriginalPreparedMediaSemantics<'_> {
         &self,
     ) -> Result<PreparedMediaEncoderTablePlan<'_>, MediaSemanticError> {
         let selected = Policy::source(self.0.provenance())?;
-        if matches!(selected, Policy::Gemma(_)) { return Err(MediaSemanticError::input("selected encoder has no Qwen table source")); }
+        if matches!(
+            selected,
+            Policy::Gemma(_) | Policy::Inkling(_) | Policy::Muse(_)
+        ) {
+            return Err(MediaSemanticError::input(
+                "selected encoder has no Qwen table source",
+            ));
+        }
         let policy = selected.qwen();
         let vision = policy.vision.ok_or(MediaSemanticError::input(
             "original media has no selected vision tower",

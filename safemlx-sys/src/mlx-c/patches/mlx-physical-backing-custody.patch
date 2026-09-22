@@ -1,0 +1,2043 @@
+diff -ruN a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
+--- a/mlx/CMakeLists.txt	2026-09-21 12:59:24
++++ b/mlx/CMakeLists.txt	2026-09-21 12:59:25
+@@ -20,6 +20,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/record_quota.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/graph_quota.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/original_buffer.cpp
++  physical_backing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/prepared_input.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/transforms.cpp
+diff -ruN a/mlx/allocator.h b/mlx/allocator.h
+--- a/mlx/allocator.h	2026-09-21 12:59:24
++++ b/mlx/allocator.h	2026-09-21 16:12:08
+@@ -6,8 +6,10 @@
+ #include <cstdint>
+ #include <limits>
+ #include <stdexcept>
++#include <memory>
+ 
+ #include "mlx/api.h"
++#include "mlx/allocation_owners.h"
+ 
+ namespace mlx::core::submission { class GraphQuota; }
+ 
+@@ -29,6 +31,57 @@
+   cuda_managed,
+ };
+ 
++// Allocation placement is read from the backing mechanism, never a stream.
++// Managed candidates are host plus every registered GPU [0, device_count).
++struct MemoryPlacement {
++  uint32_t kind{0}; // 0 unknown, 1 host, 2 fixed device, 3 CUDA managed
++  int32_t device{-1};
++  uint32_t device_count{0};
++};
++// One independently allocated physical root survives cache ownership and reuse.
++// Buffer handles borrow this record; only actual physical destruction retires it.
++using PhysicalBackingPublish = bool (*)(void*, void**, void (**)(void*));
++struct MLX_API PhysicalBacking {
++  uint64_t generation;
++  size_t capacity;
++  size_t host_controls;
++  MemoryPlacement placement;
++  AllocationOwners owners;
++  void* pointer{nullptr};
++  PhysicalBacking* cache_previous{nullptr};
++  PhysicalBacking* cache_next{nullptr};
++  PhysicalBacking* registry_previous{nullptr};
++  PhysicalBacking* registry_next{nullptr};
++  void* observation{nullptr};
++  void (*release_observation)(void*){nullptr};
++  PhysicalBackingPublish publish_observation{nullptr};
++  PhysicalBacking(uint64_t, size_t, size_t, MemoryPlacement) noexcept;
++ private:
++  friend void destroy_physical_backing(PhysicalBacking*) noexcept;
++  ~PhysicalBacking();
++};
++// Release observer custody only after the root block and its attachment nodes
++// have been destroyed, including failure paths before payload publication.
++MLX_API void destroy_physical_backing(PhysicalBacking*) noexcept;
++struct PhysicalBackingDeleter {
++  void operator()(PhysicalBacking* root) const noexcept { destroy_physical_backing(root); }
++};
++using PhysicalBackingOwner = std::unique_ptr<PhysicalBacking, PhysicalBackingDeleter>;
++class PhysicalBackingAdmissionError final : public std::runtime_error {
++ public:
++  std::shared_ptr<void> cause;
++  PhysicalBackingAdmissionError(void* owner, void (*release)(void*))
++      : std::runtime_error("Physical backing admission refused."), cause(owner, release) {}
++};
++using PhysicalBackingObserver = bool (*)(
++    void*, uint64_t, size_t, size_t, MemoryPlacement, void**, void (**)(void*), PhysicalBackingPublish*);
++MLX_API PhysicalBacking* prepare_physical_backing(size_t, MemoryPlacement, size_t = 0);
++MLX_API void publish_physical_backing(PhysicalBacking*);
++MLX_API bool observe_physical_backings(void*, PhysicalBackingObserver);
++MLX_API size_t physical_backing_control_bytes() noexcept;
++MLX_API size_t ordinary_allocation_control_bytes() noexcept;
++MLX_API size_t physical_backing_static_bytes() noexcept;
++
+ // Simple wrapper around buffer pointers
+ // WARNING: Only Buffer objects constructed from and those that wrap
+ //          raw pointers from mlx::allocator are supported.
+@@ -36,12 +89,15 @@
+  private:
+   void* ptr_;
+   OriginalBufferAllocation* original_{nullptr};
++  PhysicalBacking* physical_{nullptr};
+   Buffer(void* ptr, OriginalBufferAllocation* birth) noexcept : ptr_(ptr), original_(birth) {}
+   friend Buffer allocate_original(size_t, const OriginalBufferBinding&);
+   friend void free_original(Buffer) noexcept;
+ 
+  public:
+   explicit Buffer(void* ptr) : ptr_(ptr) {};
++  Buffer(void* ptr, PhysicalBacking* physical) noexcept : ptr_(ptr), physical_(physical) {}
++  PhysicalBacking* physical_backing() const noexcept { return physical_; }
+ 
+   // Borrowed provenance only. The existing physical owner must remain live.
+   bool has_original_allocation() const noexcept { return original_ != nullptr; }
+@@ -52,6 +108,9 @@
+   // Get the raw data pointer from the buffer
+   void* raw_ptr();
+ 
++  // Synchronous completed-storage export. Never relocates this backing.
++  int copy_to_host(void* destination, size_t offset, size_t bytes) const noexcept;
++
+   // Get the buffer pointer from the buffer
+   const void* ptr() const {
+     return ptr_;
+@@ -61,16 +120,10 @@
+   };
+ };
+ 
+-// Allocation placement is read from the backing mechanism, never a stream.
+-// Managed candidates are host plus every registered GPU [0, device_count).
+-struct MemoryPlacement {
+-  uint32_t kind{0}; // 0 unknown, 1 host, 2 fixed device, 3 CUDA managed
+-  int32_t device{-1};
+-  uint32_t device_count{0};
+-};
+ MLX_API MemoryPlacement memory_placement(Buffer) noexcept;
+ MLX_API MemoryPlacement default_memory_placement();
+ MLX_API MemoryPlacement gpu_memory_placement();
++MLX_API int physical_memory_device_count();
+ MLX_API bool memory_device_shares_host(int device);
+ // Once a charged owner is attached, implicit relocation cannot change placement.
+ MLX_API void retain_memory_placement(Buffer) noexcept;
+@@ -87,6 +140,7 @@
+   size_t maximum = 0;
+   HostTransferStorageKind kind = HostTransferStorageKind::cpu;
+   size_t controls = 0;
++  MemoryPlacement placement{1, -1, 0};
+ };
+ struct PreparedInputResidency {
+   PreparedInputResidency* previous = nullptr;
+@@ -95,6 +149,15 @@
+   bool wired = false;
+   bool installed = false;
+ };
++// Inline descriptor used by direct CUDA backing; its host storage belongs to
++// the already funded graph block, never an independent unquoted allocation.
++struct PreparedNativeBuffer {
++  void* data{nullptr};
++  size_t size{0};
++  int device{-1};
++  MemoryPlacement placement{};
++  bool placement_retained{false};
++};
+ // Stable source-arena block, owned by one shared Data. No source/array backedge.
+ struct MLX_API PreparedInputAllocation {
+   Allocator* allocator = nullptr;
+@@ -102,6 +165,7 @@
+   Buffer buffer{nullptr};
+   size_t capacity = 0;
+   PreparedInputResidency residency;
++  PreparedNativeBuffer native_buffer;
+   void destroy() noexcept;
+ };
+ 
+@@ -116,6 +180,9 @@
+     return Buffer{nullptr};
+   };
+   virtual void release(Buffer buffer) {}
++
++  // Additional independently allocated descriptor for host-transfer backing.
++  virtual size_t host_transfer_control_bytes() const noexcept { return 0; }
+ 
+   /** Allocate host-addressable storage suitable for backend transfers. */
+   virtual Buffer malloc_host_transfer(
+diff -ruN a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp	2026-09-21 12:59:24
++++ b/mlx/array.cpp	2026-09-21 13:00:17
+@@ -240,7 +240,7 @@
+   }
+   if (data->original_input && data->buffer.ptr() == data->original_input->buffer.ptr() &&
+       data->allocation_generation != 0) {
+-    if (!data->allocation_owners.contains(owners)) data->allocation_owners.push_back(owners);
++    if (!data->physical_allocation_owners().contains(owners)) data->physical_allocation_owners().push_back(owners);
+     return;
+   }
+   using NativeDeleter = void (*)(allocator::Buffer);
+@@ -250,10 +250,10 @@
+     throw std::runtime_error(
+         "Deferred allocation ownership requires certified owned backing.");
+   }
+-  if (data->allocation_owners.contains(owners)) {
++  if (data->physical_allocation_owners().contains(owners)) {
+     return;
+   }
+-  data->allocation_owners.push_back(owners);
++  data->physical_allocation_owners().push_back(owners);
+ }
+ 
+ void array::retain_deferred_allocation_owner(std::shared_ptr<void> owner) const {
+diff -ruN a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h	2026-09-21 12:59:24
++++ b/mlx/array.h	2026-09-21 13:00:17
+@@ -294,13 +294,18 @@
+     // Mutation is serialized by the embedding runtime before exposing aliases.
+     // Members retire after the destructor frees native backing.
+     AllocationOwners allocation_owners;
++    AllocationOwners& physical_allocation_owners() noexcept {
++      return buffer.physical_backing() ? buffer.physical_backing()->owners : allocation_owners;
++    }
+     // Physical-only submission pins never expose a logical array value. They
+     // preserve allocation lifetime without preventing ordered buffer donation.
+     std::atomic<size_t> recovery_pins{0};
+     std::atomic_flag recovery_pin_lock = ATOMIC_FLAG_INIT;
+     Data(allocator::Buffer buffer, Deleter d = allocator::free)
+         : buffer(buffer), d(d), allocation_generation(buffer.has_original_allocation()
+-              ? buffer.original_allocation_generation() : next_allocation_generation()) {}
++              ? buffer.original_allocation_generation()
++              : buffer.physical_backing() ? buffer.physical_backing()->generation
++              : next_allocation_generation()) {}
+     Data(allocator::PreparedInputAllocation* original, uint64_t generation) noexcept
+         : buffer(original->buffer), d(), original_input(original), allocation_generation(generation) {}
+     // Not copyable
+diff -ruN a/mlx/backend/common/buffer_cache.h b/mlx/backend/common/buffer_cache.h
+--- a/mlx/backend/common/buffer_cache.h	2026-09-21 12:59:24
++++ b/mlx/backend/common/buffer_cache.h	2026-09-21 16:11:25
+@@ -1,167 +1,83 @@
+ // Copyright © 2025 Apple Inc.
+-
++// Physical backing ownership integration © 2026 Eredu contributors.
+ #pragma once
+-
+ #include <algorithm>
+ #include <cassert>
++#include <climits>
+ #include <functional>
+-#include <map>
++#include "mlx/allocator.h"
+ 
+ namespace mlx::core {
+-
+-template <typename T>
+-class BufferCache {
++// The backing's intrusive links eliminate allocation in destructor/cache paths.
++// A cached root retains its identity and owners until physical eviction.
++template <typename T> class BufferCache {
+  public:
+-  BufferCache(
+-      size_t page_size,
+-      std::function<size_t(T*)> get_size,
+-      std::function<void(T*)> free)
+-      : page_size_(page_size),
+-        get_size_(std::move(get_size)),
+-        free_(std::move(free)) {}
+-
+-  ~BufferCache() {
+-    clear();
+-  }
+-
++  BufferCache(size_t page_size, std::function<size_t(T*)> size, std::function<void(T*)> free)
++      : page_size_(page_size), get_size_(std::move(size)), free_(std::move(free)) {}
++  ~BufferCache() { clear(); }
+   BufferCache(const BufferCache&) = delete;
+   BufferCache& operator=(const BufferCache&) = delete;
+-
+-  T* reuse_from_cache(size_t size) {
+-    // Find the closest buffer in pool.
+-    auto it = buffer_pool_.lower_bound(size);
+-    if (it == buffer_pool_.end() ||
+-        it->first >= std::min(2 * size, size + 2 * page_size_)) {
+-      return nullptr;
++  template <class Accept> allocator::Buffer reuse_from_cache(size_t size, Accept accept) {
++    allocator::PhysicalBacking* selected = nullptr;
++    size_t best = 0;
++    const size_t slack = std::min(size, page_size_ > SIZE_MAX / 2 ? SIZE_MAX : 2 * page_size_);
++    const size_t maximum = size > SIZE_MAX - slack ? SIZE_MAX : size + slack;
++    for (auto* root = head_; root; root = root->cache_next) {
++      const auto bytes = get_size_(static_cast<T*>(root->pointer));
++      if (bytes >= size && bytes < maximum && (!selected || bytes < best) &&
++          accept(static_cast<T*>(root->pointer))) { selected = root; best = bytes; }
+     }
+-
+-    // Collect from the cache.
+-    T* buf = it->second->buf;
+-    pool_size_ -= it->first;
+-
+-    // Remove from record.
+-    remove_from_list(it->second);
+-    buffer_pool_.erase(it);
+-    return buf;
++    if (!selected) return allocator::Buffer{nullptr};
++    unlink(selected);
++    pool_size_ -= best;
++    return allocator::Buffer{selected->pointer, selected};
+   }
+-
+-  void recycle_to_cache(T* buf) {
+-    assert(buf);
+-    size_t size = get_size_(buf);
+-    // Recycling occurs in buffer destructors. A cache is optional: allocation
+-    // failure must free the buffer, not throw during recovery unwinding or
+-    // leave a linked holder without its map entry.
+-    BufferHolder* bh = nullptr;
+-    try {
+-      bh = new BufferHolder(buf);
+-      buffer_pool_.emplace(size, bh);
+-    } catch (...) {
+-      delete bh;
+-      free_(buf);
+-      return;
+-    }
+-    add_at_head(bh);
+-    pool_size_ += size;
++  allocator::Buffer reuse_from_cache(size_t size) {
++    return reuse_from_cache(size, [](T*) { return true; });
+   }
+-
+-  int release_cached_buffers(size_t min_bytes_to_free) {
+-    if (min_bytes_to_free >= 0.9 * pool_size_) {
+-      return clear();
+-    } else {
+-      int n_release = 0;
+-      size_t total_bytes_freed = 0;
+-
+-      while (tail_ && (total_bytes_freed < min_bytes_to_free)) {
+-        // Release buffer.
+-        size_t size = get_size_(tail_->buf);
+-        total_bytes_freed += size;
+-        free_(tail_->buf);
+-        n_release++;
+-
+-        // Remove from record.
+-        auto its = buffer_pool_.equal_range(size);
+-        auto it = std::find_if(its.first, its.second, [this](const auto& el) {
+-          return el.second == tail_;
+-        });
+-        assert(it != buffer_pool_.end());
+-        buffer_pool_.erase(it);
+-        remove_from_list(tail_);
+-      }
+-
+-      pool_size_ -= total_bytes_freed;
+-      return n_release;
+-    }
++  void recycle_to_cache(allocator::Buffer buffer) noexcept {
++    auto* root = buffer.physical_backing();
++    assert(root && root->pointer == buffer.ptr());
++    auto bytes = get_size_(static_cast<T*>(root->pointer));
++    if (bytes > SIZE_MAX - pool_size_) std::terminate();
++    root->cache_previous = nullptr;
++    root->cache_next = head_;
++    if (head_) head_->cache_previous = root; else tail_ = root;
++    head_ = root;
++    pool_size_ += bytes;
+   }
+-
+-  int clear() {
+-    int n_release = 0;
+-    for (auto& [size, holder] : buffer_pool_) {
+-      free_(holder->buf);
+-      n_release++;
+-      delete holder;
++  int release_cached_buffers(size_t minimum) {
++    int count = 0;
++    size_t freed = 0;
++    while (tail_ && freed < minimum) {
++      auto* root = tail_;
++      const auto bytes = get_size_(static_cast<T*>(root->pointer));
++      unlink(root);
++      free_(static_cast<T*>(root->pointer));
++      allocator::destroy_physical_backing(root); // Accounting owners retire only after actual physical free.
++      pool_size_ -= bytes;
++      if (freed > SIZE_MAX - bytes || count == INT_MAX) std::terminate();
++      freed += bytes;
++      ++count;
+     }
+-    buffer_pool_.clear();
+-    pool_size_ = 0;
+-    head_ = nullptr;
+-    tail_ = nullptr;
+-    return n_release;
++    return count;
+   }
+-
+-  size_t cache_size() const {
+-    return pool_size_;
+-  }
+-
+-  size_t page_size() const {
+-    return page_size_;
+-  }
+-
++  int clear() { return release_cached_buffers(SIZE_MAX); }
++  size_t cache_size() const { return pool_size_; }
++  size_t page_size() const { return page_size_; }
+  private:
+-  struct BufferHolder {
+-   public:
+-    explicit BufferHolder(T* buf_) : buf(buf_) {}
+-
+-    BufferHolder* prev{nullptr};
+-    BufferHolder* next{nullptr};
+-    T* buf;
+-  };
+-
+-  void add_at_head(BufferHolder* to_add) {
+-    if (!head_) {
+-      head_ = to_add;
+-      tail_ = to_add;
+-    } else {
+-      head_->prev = to_add;
+-      to_add->next = head_;
+-      head_ = to_add;
+-    }
++  void unlink(allocator::PhysicalBacking* root) noexcept {
++    if (root->cache_previous) root->cache_previous->cache_next = root->cache_next;
++    else head_ = root->cache_next;
++    if (root->cache_next) root->cache_next->cache_previous = root->cache_previous;
++    else tail_ = root->cache_previous;
++    root->cache_previous = root->cache_next = nullptr;
+   }
+-
+-  void remove_from_list(BufferHolder* to_remove) {
+-    if (to_remove->prev && to_remove->next) { // if middle
+-      to_remove->prev->next = to_remove->next;
+-      to_remove->next->prev = to_remove->prev;
+-    } else if (to_remove->prev && to_remove == tail_) { // if tail
+-      tail_ = to_remove->prev;
+-      tail_->next = nullptr;
+-    } else if (to_remove == head_ && to_remove->next) { // if head
+-      head_ = to_remove->next;
+-      head_->prev = nullptr;
+-    } else if (to_remove == head_ && to_remove == tail_) { // if only element
+-      head_ = nullptr;
+-      tail_ = nullptr;
+-    }
+-
+-    delete to_remove;
+-  }
+-
+-  std::multimap<size_t, BufferHolder*> buffer_pool_;
+-  BufferHolder* head_{nullptr};
+-  BufferHolder* tail_{nullptr};
++  allocator::PhysicalBacking* head_{nullptr};
++  allocator::PhysicalBacking* tail_{nullptr};
+   size_t pool_size_{0};
+-
+   const size_t page_size_;
+   std::function<size_t(T*)> get_size_;
+   std::function<void(T*)> free_;
+ };
+-
+ } // namespace mlx::core
+diff -ruN a/mlx/backend/cpu/conv.cpp b/mlx/backend/cpu/conv.cpp
+--- a/mlx/backend/cpu/conv.cpp	2026-09-21 15:59:37
++++ b/mlx/backend/cpu/conv.cpp	2026-09-21 16:02:54
+@@ -5,6 +5,7 @@
+ #include <numeric>
+ 
+ #include "mlx/backend/cpu/copy.h"
++#include "mlx/backend/cpu/copy_storage.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/cpu/lapack.h"
+ #include "mlx/primitives.h"
+@@ -19,54 +20,17 @@
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ template <typename T>
+-void slow_conv_1D(
+-    const array& in,
+-    const array& wt,
+-    array out,
+-    AxisView padding_lo,
+-    AxisView padding_hi,
+-    AxisView wt_strides,
+-    AxisView wt_dilation,
+-    AxisView in_dilation,
+-    bool flip,
+-    Stream stream) {
+-  auto& encoder = cpu::get_command_encoder(stream);
+-  encoder.set_input_array(in);
+-  encoder.set_input_array(wt);
+-  encoder.set_output_array(out);
+-
+-  encoder.dispatch([start_wt_ptr = wt.data<T>(),
+-                    in_ptr = in.data<T>(),
+-                    out_ptr = out.data<T>(),
+-
+-                    N = in.shape(
+-                        0), // Batch size, should be the same as out.shape(0)
+-                    iH = 1 +
+-                        in_dilation[0] * (in.shape(1) - 1), // Input spatial dim
+-                    oH = out.shape(1), // Output spatial dim
+-                    wH = wt.shape(1), // Weight spatial dim
+-                    groups = in.shape(2) / wt.shape(2),
+-                    O = wt.shape(0), // Out channels
+-                    C_per_group = wt.shape(2),
+-
+-                    in_stride_N = in.strides()[0],
+-                    in_stride_H = in.strides()[1],
+-                    in_stride_C = in.strides()[2],
+-
+-                    wt_stride_O = wt.strides()[0],
+-                    wt_stride_H = wt.strides()[1],
+-                    wt_stride_C = wt.strides()[2],
+-
+-                    out_stride_N = out.strides()[0],
+-                    out_stride_H = out.strides()[1],
+-                    out_stride_O = out.strides()[2],
+-
+-                    flip,
+-                    padding_lo = padding_lo[0],
+-                    padding_hi = padding_hi[0],
+-                    wt_stride = wt_strides[0],
+-                    wt_dilation = wt_dilation[0],
+-                    in_dilation = in_dilation[0]]() mutable {
++struct SlowConv1DTask {
++  const T* start_wt_ptr;
++  const T* in_ptr;
++  T* out_ptr;
++  int N, iH, oH, wH, groups, O, C_per_group;
++  int64_t in_stride_N, in_stride_H, in_stride_C;
++  int64_t wt_stride_O, wt_stride_H, wt_stride_C;
++  int64_t out_stride_N, out_stride_H, out_stride_O;
++  bool flip;
++  int padding_lo, padding_hi, wt_stride, wt_dilation, in_dilation;
++  void operator()() {
+     auto O_per_group = O / groups;
+ 
+     for (int n = 0; n < N; ++n) {
+@@ -104,7 +68,33 @@
+       in_ptr += in_stride_N;
+       out_ptr += out_stride_N;
+     } // n
+-  });
++  }
++};
++
++template <typename T>
++void slow_conv_1D(
++    const array& in,
++    const array& wt,
++    array out,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
++    bool flip,
++    Stream stream) {
++  auto& encoder = cpu::get_command_encoder(stream);
++  encoder.set_input_array(in);
++  encoder.set_input_array(wt);
++  encoder.set_output_array(out);
++
++  encoder.dispatch(SlowConv1DTask<T>{wt.data<T>(), in.data<T>(), out.data<T>(),
++      in.shape(0), 1 + in_dilation[0] * (in.shape(1) - 1), out.shape(1),
++      wt.shape(1), in.shape(2) / wt.shape(2), wt.shape(0), wt.shape(2),
++      in.strides()[0], in.strides()[1], in.strides()[2],
++      wt.strides()[0], wt.strides()[1], wt.strides()[2],
++      out.strides()[0], out.strides()[1], out.strides()[2],
++      flip, padding_lo[0], padding_hi[0], wt_strides[0], wt_dilation[0], in_dilation[0]});
+ }
+ 
+ template <typename T>
+@@ -1181,6 +1171,14 @@
+     bool flip,
+     Stream stream) {
+   const int groups = in.shape().back() / wt.shape().back();
++  // Depthwise 1D uses the existing scalar reference worker directly. It needs
++  // no im2col buffer, BLAS workspace or hidden host task allocations.
++  if (wt.shape(2) == 1 && groups == wt.shape(0) &&
++      wt_strides[0] == 1 && padding_lo[0] == 0 && padding_hi[0] == 0 &&
++      wt_dilation[0] == 1 && in_dilation[0] == 1 && !flip) {
++    return dispatch_slow_conv_1D(in, wt, out, padding_lo, padding_hi,
++        wt_strides, wt_dilation, in_dilation, flip, stream);
++  }
+   if (wt_dilation[0] == 1 && in_dilation[0] == 1 && !flip) {
+     return explicit_gemm_conv_1D_cpu(
+         in, wt, out, padding_lo, padding_hi, wt_strides, wt_dilation, stream);
+@@ -1290,6 +1288,30 @@
+ }
+ 
+ } // namespace
++
++namespace cpu {
++namespace {
++template<typename T>
++bool depthwise_dispatch(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if (!CommandEncoder::dispatch_layout<SlowConv1DTask<T>>(task)) return false;
++  const size_t controls = sizeof(task) + sizeof(out) + sizeof(EvalDispatchStorage) +
++      sizeof(SlowConv1DTask<T>) * 2 + sizeof(const array*) * 4 + sizeof(array) * 2 +
++      sizeof(AxisView) * 10 + sizeof(Stream) * 2 + sizeof(CommandEncoder*) +
++      sizeof(int) * 18 + sizeof(size_t) * 9 + sizeof(T*) * 7 + sizeof(float) * 3 +
++      sizeof(std::div_t) + sizeof(bool) * 5;
++  if (task.controls > SIZE_MAX - controls) return false;
++  out = {task.task_bytes, task.task_alignment, 0, task.controls + controls};
++  return true;
++}
++}
++bool depthwise_convolution_dispatch_storage(Dtype dtype, EvalDispatchStorage& out) noexcept {
++  if (dtype == float32) return depthwise_dispatch<float>(out);
++  if (dtype == float16) return depthwise_dispatch<float16_t>(out);
++  if (dtype == bfloat16) return depthwise_dispatch<bfloat16_t>(out);
++  return false;
++}
++} // namespace cpu
+ 
+ void Convolution::eval_cpu(const ArrayVector& inputs, array& out) {
+   out.allocate_data(out.nbytes());
+diff -ruN a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp	2026-09-21 15:20:59
++++ b/mlx/backend/cpu/copy_storage.cpp	2026-09-21 16:00:05
+@@ -112,7 +112,8 @@
+ bool is_copy_eval_primitive(const array& output) noexcept {
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+       (exact_contiguous(output) || exact_cast(output) || exact_static_update(output) ||
+-       typeid(output.primitive())==typeid(View) ||
++       typeid(output.primitive())==typeid(View) || typeid(output.primitive())==typeid(Pad) ||
++       typeid(output.primitive())==typeid(Convolution) ||
+        typeid(output.primitive())==typeid(CopyToHostTransfer) ||
+        typeid(output.primitive())==typeid(CopyFromHostTransfer) || is_completion_synchronizer(output));
+ }
+@@ -431,11 +432,76 @@
+   }
+   return static_update_eval_layout(rank,source.size(),update.size(),output.is_tracer(),out);
+ }
++// Pad's Scalar fill and GeneralGeneral rectangular copy use the same two
++// copy tasks, weak descriptors and single output birth as static update.
++// The scalar fill has no worker heap; only the shaped copy needs iterators.
++bool constant_pad_eval_layout(size_t rank,size_t elements,size_t input_elements,
++    bool tracer,CopyEvalStorage& out) noexcept {
++  CopyEvalStorage value;
++  if(!static_update_eval_layout(rank,elements,input_elements,tracer,value))return false;
++  const size_t controls=sizeof(rank)+sizeof(elements)+sizeof(input_elements)+sizeof(tracer)+sizeof(out)+
++      sizeof(value)+sizeof(const array*)*4+sizeof(const Pad*)+sizeof(size_t)*12+sizeof(int)*4+
++      sizeof(std::tuple<const Shape&,const Shape&,const Shape&>)+sizeof(bool)*4;
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
++static bool constant_pad_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(output.inputs().size()!=2 || output.ndim()<1 || output.ndim()>4)return false;
++  const auto& input=output.inputs()[0];const auto& scalar=output.inputs()[1];
++  const auto rank=size_t(output.ndim());
++  if(!complete_update_row(input,rank) || scalar.size()!=1 ||
++      input.dtype()!=output.dtype() || scalar.dtype()!=output.dtype())return false;
++  const auto& [axes,lows,highs]=static_cast<const Pad&>(output.primitive()).borrowed_state();
++  if(axes.size()!=rank || lows.size()!=rank || highs.size()!=rank)return false;
++  size_t elements=1;
++  for(size_t axis=0;axis<rank;++axis) {
++    if(axes[axis]!=int(axis)||lows[axis]<0||highs[axis]<0 || output.shape(axis)<=0 ||
++        int64_t(input.shape(axis))+lows[axis]+highs[axis]!=output.shape(axis) ||
++        !multiply(elements,size_t(output.shape(axis)),elements))return false;
++  }
++  if(elements!=output.size())return false;
++  return constant_pad_eval_layout(rank,elements,input.size(),output.is_tracer(),out);
++}
++bool depthwise_convolution_eval_layout(Dtype dtype,bool tracer,CopyEvalStorage& out) noexcept {
++  EvalDispatchStorage dispatch;
++  SingleOutputEvalStorage common;
++  if(!depthwise_convolution_dispatch_storage(dtype,dispatch) ||
++      !single_output_raw_task_layout(3,2,tracer,dispatch,common))return false;
++  CopyEvalStorage value;
++  static_cast<SingleOutputEvalStorage&>(value)=common;
++  value.copy=true;
++  // Normalized conv1d construction stays within inline rank-three Shape axes.
++  // Its two dtype conversions are separately represented by the caller plan.
++  const size_t controls=sizeof(dtype)+sizeof(tracer)+sizeof(out)+sizeof(dispatch)+sizeof(common)+
++      sizeof(value)+sizeof(const array*)*8+sizeof(array)*4+sizeof(Convolution::Axes)*3+
++      sizeof(Shape)*9+sizeof(AxisView)*5+sizeof(Stream)+sizeof(StreamOrDevice)*2+
++      sizeof(Dtype)*3+sizeof(int)*24+sizeof(size_t)*14+sizeof(bool)*8+
++      sizeof(std::tuple<const Shape&,const Shape&,const Shape&,const Shape&,const Shape&,const int&,const bool&>);
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
++static bool depthwise_convolution_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(output.inputs().size()!=2 || output.ndim()!=3)return false;
++  const auto& input=output.inputs()[0];const auto& weight=output.inputs()[1];
++  if(!complete_update_row(input,3)||!complete_update_row(weight,3)||
++      input.dtype()!=output.dtype()||weight.dtype()!=output.dtype()||
++      input.shape(2)!=weight.shape(0)||weight.shape(2)!=1||input.shape(1)<weight.shape(1))return false;
++  const auto& [strides,low,high,dilation,input_dilation,groups,flip]=
++      static_cast<const Convolution&>(output.primitive()).borrowed_state();
++  if(strides.size()!=1||low.size()!=1||high.size()!=1||dilation.size()!=1||input_dilation.size()!=1||
++      strides[0]!=1||low[0]!=0||high[0]!=0||dilation[0]!=1||input_dilation[0]!=1||
++      groups!=input.shape(2)||flip)return false;
++  if(output.shape(0)!=input.shape(0)||output.shape(1)!=input.shape(1)-weight.shape(1)+1||
++      output.shape(2)!=input.shape(2)||output.size()>size_t(INT_MAX))return false;
++  return depthwise_convolution_eval_layout(output.dtype(),output.is_tracer(),out);
++}
+ bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
+   if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
+   if (typeid(output.primitive())==typeid(CopyToHostTransfer)||
+       typeid(output.primitive())==typeid(CopyFromHostTransfer))return host_transfer_eval_storage(output,out);
+   if (exact_static_update(output)) return static_update_eval_storage(output,out);
++  if(typeid(output.primitive())==typeid(Convolution))return depthwise_convolution_eval_storage(output,out);
++  if (typeid(output.primitive())==typeid(Pad)) return constant_pad_eval_storage(output,out);
+   if (typeid(output.primitive())==typeid(View))return byte_view_eval_storage(output,out);
+   const bool cast = exact_cast(output);
+   const bool copy = exact_contiguous(output) || cast;
+diff -ruN a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h	2026-09-21 15:20:59
++++ b/mlx/backend/cpu/copy_storage.h	2026-09-21 16:00:05
+@@ -30,6 +30,9 @@
+ // Existing rank-one F32 scalar overwrite: full-row copy plus shaped update.
+ MLX_API bool scalar_update_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool static_update_eval_layout(size_t rank,size_t elements,size_t update_elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool depthwise_convolution_eval_layout(Dtype,bool,CopyEvalStorage&) noexcept;
++bool depthwise_convolution_dispatch_storage(Dtype,EvalDispatchStorage&) noexcept;
++MLX_API bool constant_pad_eval_layout(size_t rank,size_t elements,size_t input_elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_copy_eval_primitive(const array&) noexcept;
+ MLX_API bool copy_eval_storage(const array&, CopyEvalStorage&) noexcept;
+ } // namespace mlx::core::cpu
+diff -ruN a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+--- a/mlx/backend/cuda/allocator.cpp	2026-09-21 12:59:24
++++ b/mlx/backend/cuda/allocator.cpp	2026-09-21 16:11:25
+@@ -1,4 +1,7 @@
++#include <cstring>
+ #include "mlx/input_allocator.h"
++#include "mlx/original_buffer.h"
++#include "mlx/submission.h"
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/cuda/allocator.h"
+@@ -38,18 +41,15 @@
+        host_transfer_allocation_granularity);
+ }
+ 
+-// Any allocations smaller than this will try to use the small pool
++// Minimum independent ordinary allocation extent
+ constexpr int small_block_size = 8;
+ 
+-// The small pool size in bytes. This should be a multiple of the host page
+-// size and small_block_size.
+-constexpr int small_pool_size = 4 * page_size;
+-
+ bool supports_managed_memory() {
+   static bool managed_memory = []() {
+     int device_count = gpu::device_count();
+     for (int i = 0; i < device_count; ++i) {
+-      auto& d = cu::device(i);
++      int concurrent = 0;
++      CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, i));
+       // Empirically on Windows (and WSL) if there is no concurrentManagedAccess
+       // the managed memory also does not work.
+       // The same has been observed on NVIDIA Tegra, typically on Jetson Orin
+@@ -60,7 +60,7 @@
+       // See:
+       //   https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#table-unified-memory-levels
+       //   https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html#um-legacy-devices
+-      if (!d.concurrent_managed_access()) {
++      if (!concurrent) {
+         return false;
+       }
+     }
+@@ -87,112 +87,30 @@
+   }
+ }
+ 
+-#if CUDART_VERSION >= 13000
+-inline cudaMemLocation cuda_mem_loc(int i) {
+-  cudaMemLocation loc;
+-  loc.type = cudaMemLocationTypeDevice;
+-  loc.id = i;
+-  return loc;
+-}
+-#else
+-inline int cuda_mem_loc(int i) {
+-  return i;
+-}
+-#endif // CUDART_VERSION >= 13000
+-
+-SmallSizePool::SmallSizePool() {
+-  auto num_blocks = small_pool_size / small_block_size;
+-  buffer_ = new Block[num_blocks];
+-  next_free_ = buffer_;
+-
+-  data_ = unified_malloc(small_pool_size);
+-  if (supports_managed_memory()) {
+-    int device_count = gpu::device_count();
+-    for (int i = 0; i < device_count; ++i) {
+-      if (device(i).concurrent_managed_access()) {
+-        auto loc = cuda_mem_loc(i);
+-        CHECK_CUDA_ERROR(cudaMemAdvise(
+-            data_, small_pool_size, cudaMemAdviseSetAccessedBy, loc));
+-      }
+-    }
+-  }
+-
+-  auto curr = next_free_;
+-  for (size_t i = 1; i < num_blocks; ++i) {
+-    curr->next = buffer_ + i;
+-    curr = curr->next;
+-  }
+-  curr->next = nullptr;
+-}
+-
+-SmallSizePool::~SmallSizePool() {
+-  unified_free(data_);
+-  delete[] buffer_;
+-}
+-
+-CudaBuffer* SmallSizePool::malloc() {
+-  if (next_free_ == nullptr) {
+-    return nullptr;
+-  }
+-  Block* b = next_free_;
+-  uint64_t i = next_free_ - buffer_;
+-  next_free_ = next_free_->next;
+-  b->buf.data = static_cast<char*>(data_) + i * small_block_size;
+-  b->buf.size = small_block_size;
+-  b->buf.device = -1;
+-  b->buf.placement_retained = false;
+-  b->buf.placement = {supports_managed_memory() ? 3u : 1u, -1,
+-      supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u};
+-  return &b->buf;
+-}
+-
+-void SmallSizePool::free(CudaBuffer* buf) {
+-  auto b = reinterpret_cast<Block*>(buf);
+-  b->next = next_free_;
+-  next_free_ = b;
+-}
+-
+-bool SmallSizePool::in_pool(CudaBuffer* buf) {
+-  constexpr int num_blocks = (small_pool_size / small_block_size);
+-  auto b = reinterpret_cast<Block*>(buf);
+-  int64_t block_num = b - buffer_;
+-  return block_num >= 0 && block_num < num_blocks;
+-}
+-
+ CudaAllocator::CudaAllocator()
+     : buffer_cache_(
+           page_size,
+-          [](CudaBuffer* buf) { return buf->size; },
+-          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
++          +[](CudaBuffer* buf) { return buf->size; },
++          &CudaAllocator::free_cuda_buffer) {
+   size_t free;
+   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
+   memory_limit_ = total_memory_ * 0.95;
+   free_limit_ = total_memory_ - memory_limit_;
+   max_pool_size_ = memory_limit_;
+ 
+-  int device_count = gpu::device_count();
+-  free_streams_.resize(device_count);
+-  mem_pools_.resize(device_count);
+-  for (int i = 0; i < device_count; ++i) {
+-    auto& d = device(i);
+-    if (d.memory_pools()) {
+-      free_streams_[i] = CudaStream(d);
+-      CHECK_CUDA_ERROR(cudaDeviceGetDefaultMemPool(&mem_pools_[i], i));
+-    }
+-  }
++
+ }
+ 
+ Buffer
+ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
+-  if (size == 0) {
+-    return Buffer{new CudaBuffer{nullptr, 0, -1}};
+-  }
++  if (size == 0) return Buffer{nullptr};
+ 
+   if (size <= small_block_size) {
+     size = 8;
+   } else if (size < page_size) {
+     size = next_power_of_2(size);
+   } else {
++    if (size > SIZE_MAX - (page_size - 1)) throw std::overflow_error("CUDA allocation size overflow.");
+     size = page_size * ((size + page_size - 1) / page_size);
+   }
+ 
+@@ -202,61 +120,60 @@
+ 
+   // Find available buffer from cache.
+   std::unique_lock lock(mutex_);
+-  CudaBuffer* buf = buffer_cache_.reuse_from_cache(size);
++  auto cached = buffer_cache_.reuse_from_cache(size, [device](CudaBuffer* value) {
++    return value->device == device;
++  });
++  auto* buf = static_cast<CudaBuffer*>(cached.ptr());
++  allocator::PhysicalBackingOwner root;
+   if (!buf) {
+     // If we have a lot of memory pressure try to reclaim memory from the cache.
+-    int64_t mem_to_free =
+-        get_active_memory() + get_cache_memory() + size - memory_limit_;
+-    if (mem_to_free > 0) {
+-      buffer_cache_.release_cached_buffers(mem_to_free);
+-    }
++    const auto active = get_active_memory();
++    const auto cached_bytes = get_cache_memory();
++    if (active > SIZE_MAX - cached_bytes || active + cached_bytes > SIZE_MAX - size)
++      throw std::overflow_error("CUDA allocation population overflow.");
++    const auto total = active + cached_bytes + size;
++    if (total > memory_limit_) buffer_cache_.release_cached_buffers(total - memory_limit_);
+ 
+-    // Try the scalar pool first
+-    if (size <= small_block_size) {
+-      buf = scalar_pool_.malloc();
+-    }
++    // Independent physical roots keep scalar capacities and lifetime explicit.
+     lock.unlock();
+     if (!buf) {
++      const allocator::MemoryPlacement placement = device >= 0
++          ? allocator::MemoryPlacement{2, device, 0}
++          : allocator::MemoryPlacement{supports_managed_memory() ? 3u : 1u, -1,
++              supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u};
++      root.reset(allocator::prepare_physical_backing(size, placement, sizeof(CudaBuffer)));
+       void* data = nullptr;
+       if (device == -1) {
+         data = unified_malloc(size);
+       } else {
+         cu::device(device).make_current();
+-        if (mem_pools_[device]) { // supports memory pools
+-          CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
+-        } else {
+-          CHECK_CUDA_ERROR(cudaMalloc(&data, size));
+-        }
++        CHECK_CUDA_ERROR(cudaMalloc(&data, size));
+       }
+       if (!data) {
+         std::ostringstream msg;
+         msg << "[malloc] Unable to allocate " << size << " bytes.";
+         throw std::runtime_error(msg.str());
+       }
+-      buf = new CudaBuffer{data, size, device,
+-          device >= 0 ? allocator::MemoryPlacement{2, device, 0}
+-          : allocator::MemoryPlacement{supports_managed_memory() ? 3u : 1u, -1,
+-              supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u}};
++      try { buf = new CudaBuffer{data, size, device, placement}; }
++      catch (...) {
++        if (device == -1) unified_free(data);
++        else cudaFree(data);
++        throw;
++      }
+     }
++    root->pointer = buf;
++    try { allocator::publish_physical_backing(root.get()); }
++    catch (...) { free_async(*buf); delete buf; throw; }
++    buf->placement_retained = true;
+     lock.lock();
+ 
+-    // If any cuda memory pool has too much reserved memory, clear some
+-    // memory from the cache. This prevents graph / kernel execution failing
+-    // from OOM
+-    if (get_cache_memory() > 0) {
+-      for (auto p : mem_pools_) {
+-        if (p) {
+-          size_t used = 0;
+-          CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
+-              p, cudaMemPoolAttrReservedMemCurrent, &used));
+-          if (used > (total_memory_ - free_limit_)) {
+-            buffer_cache_.release_cached_buffers(free_limit_);
+-            break;
+-          }
+-        }
+-      }
+-    }
++
+   }
++  if (buf->size > SIZE_MAX - active_memory_) {
++    free_cuda_buffer(buf);
++    if (root) root.reset(); else allocator::destroy_physical_backing(cached.physical_backing());
++    throw std::overflow_error("CUDA active memory overflow.");
++  }
+   active_memory_ += buf->size;
+   peak_memory_ = std::max(active_memory_, peak_memory_);
+ 
+@@ -265,12 +182,8 @@
+     buffer_cache_.release_cached_buffers(get_cache_memory() - max_pool_size_);
+   }
+   lock.unlock();
+-  buf->placement_retained = false;
+-  // Copy to unified memory here if the buffer is not on the right device.
+-  if (buf->device >= 0 && buf->device != device) {
+-    move_to_unified_memory(*buf, stream);
+-  }
+-  return Buffer{buf};
++  // Cache reuse preserves the established physical root and placement.
++  return root ? Buffer{buf, root.release()} : cached;
+ }
+ 
+ Buffer CudaAllocator::malloc(size_t size) {
+@@ -282,7 +195,10 @@
+     allocator::HostTransferPolicy policy) {
+   const auto allocation_size = host_transfer_allocation_size(size);
+   if (allocation_size == 0) {
+-    return Buffer{new CudaBuffer{nullptr, 0, -1}};
++    return Buffer{new CudaBuffer{nullptr, 0, -1,
++        {policy == allocator::HostTransferPolicy::managed ? 3u : 1u, -1,
++         policy == allocator::HostTransferPolicy::managed
++             ? static_cast<uint32_t>(gpu::device_count()) : 0u}}};
+   }
+   void* data = nullptr;
+   if (policy == allocator::HostTransferPolicy::managed) {
+@@ -290,10 +206,16 @@
+   } else {
+     CHECK_CUDA_ERROR(cudaMallocHost(&data, allocation_size));
+   }
+-  return Buffer{new CudaBuffer{data, allocation_size, -1,
+-      {policy == allocator::HostTransferPolicy::managed ? 3u : 1u, -1,
+-       policy == allocator::HostTransferPolicy::managed
+-           ? static_cast<uint32_t>(gpu::device_count()) : 0u}}};
++  try {
++    return Buffer{new CudaBuffer{data, allocation_size, -1,
++        {policy == allocator::HostTransferPolicy::managed ? 3u : 1u, -1,
++         policy == allocator::HostTransferPolicy::managed
++             ? static_cast<uint32_t>(gpu::device_count()) : 0u}}};
++  } catch (...) {
++    if (policy == allocator::HostTransferPolicy::managed) cudaFree(data);
++    else cudaFreeHost(data);
++    throw;
++  }
+ }
+ 
+ void CudaAllocator::free_host_transfer(
+@@ -337,11 +259,13 @@
+   }
+ 
+   std::unique_lock lock(mutex_);
++  if (active_memory_ < buf->size) std::terminate();
+   active_memory_ -= buf->size;
+-  if (get_cache_memory() < max_pool_size_) {
+-    buffer_cache_.recycle_to_cache(buf);
++  if (buffer.physical_backing() && get_cache_memory() <= max_pool_size_ && buf->size <= max_pool_size_ - get_cache_memory()) {
++    buffer_cache_.recycle_to_cache(buffer);
+   } else {
+     free_cuda_buffer(buf);
++    allocator::destroy_physical_backing(buffer.physical_backing());
+   }
+ }
+ 
+@@ -364,13 +288,8 @@
+   void* data = unified_malloc(buf.size);
+   cudaMemcpyKind kind =
+       supports_managed_memory() ? cudaMemcpyDefault : cudaMemcpyDeviceToHost;
+-  if (stream && mem_pools_[buf.device]) {
+-    CHECK_CUDA_ERROR(cudaMemcpyAsync(data, buf.data, buf.size, kind, stream));
+-    free_async(buf, stream);
+-  } else {
+-    CHECK_CUDA_ERROR(cudaMemcpy(data, buf.data, buf.size, kind));
+-    free_async(buf);
+-  }
++  CHECK_CUDA_ERROR(cudaMemcpy(data, buf.data, buf.size, kind));
++  free_async(buf);
+   buf.data = data;
+   buf.device = -1;
+   buf.placement = {supports_managed_memory() ? 3u : 1u, -1,
+@@ -379,28 +298,13 @@
+ 
+ // This must be called with mutex_ acquired
+ void CudaAllocator::free_cuda_buffer(CudaBuffer* buf) {
+-  if (scalar_pool_.in_pool(buf)) {
+-    scalar_pool_.free(buf);
+-  } else {
+-    free_async(*buf);
+-    delete buf;
+-  }
++  free_async(*buf);
++  delete buf;
+ }
+ 
+-void CudaAllocator::free_async(CudaBuffer& buf, cudaStream_t stream) {
+-  if (buf.device == -1) {
+-    unified_free(buf.data);
+-  } else {
+-    // Free asynchronously when memory pools is supported.
+-    if (mem_pools_[buf.device]) {
+-      if (!stream) {
+-        stream = free_streams_[buf.device];
+-      }
+-      CHECK_CUDA_ERROR(cudaFreeAsync(buf.data, stream));
+-    } else {
+-      CHECK_CUDA_ERROR(cudaFree(buf.data));
+-    }
+-  }
++void CudaAllocator::free_async(CudaBuffer& buf, cudaStream_t) {
++  if (buf.device == -1) unified_free(buf.data);
++  else { cu::device(buf.device).make_current(); CHECK_CUDA_ERROR(cudaFree(buf.data)); }
+ }
+ 
+ size_t CudaAllocator::get_active_memory() const {
+@@ -441,19 +345,74 @@
+   buffer_cache_.clear();
+ }
+ 
+-CudaAllocator& allocator() {
+-  static auto* allocator_ = []() {
+-    // Ensure scheduler is created before allocator.
+-    scheduler::scheduler();
+-    // By creating the |allocator_| on heap, the destructor of CudaAllocator
+-    // will not be called on exit and buffers in the cache will be leaked. This
+-    // can save some time at program exit.
+-    return new CudaAllocator();
+-  }();
+-  return *allocator_;
++namespace {
++MLX_INPUT_ALLOCATOR_CONSTINIT allocator::InputAllocatorSlot<CudaAllocator, true> cuda_allocator_slot{};
++struct CudaAllocatorFactory {
++  CudaAllocator* operator()(void*) const { return new CudaAllocator(); }
++};
+ }
++CudaAllocator& allocator() { return cuda_allocator_slot.ordinary(CudaAllocatorFactory{}); }
+ 
++bool CudaAllocator::prepare_input_runtime(allocator::PreparedInputFacts& facts) {
++  // CUDA unified addressing gives cudaMallocHost the same pointer on every
++  // participating GPU. Accessibility is checked here; physical storage is Host.
++  int count = 0;
++  if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) return false;
++  for (int ordinal = 0; ordinal < count; ++ordinal) {
++    int unified = 0;
++    if (cudaDeviceGetAttribute(&unified, cudaDevAttrUnifiedAddressing, ordinal) != cudaSuccess || !unified) return false;
++  }
++  const allocator::MemoryPlacement placement{1, -1, 0};
++  std::lock_guard guard(mutex_);
++  facts = {host_transfer_allocation_granularity, std::numeric_limits<size_t>::max(),
++      allocator::HostTransferStorageKind::cuda_pinned,
++      sizeof(std::lock_guard<std::mutex>) + sizeof(void*) + sizeof(size_t) * 3 + sizeof(cudaError_t), placement};
++  return true;
++}
++allocator::PreparedInputCause CudaAllocator::allocate_prepared_input(size_t bytes, allocator::PreparedInputAllocation& output) noexcept {
++  if (!bytes) return allocator::PreparedInputCause::invalid;
++  return allocate_prepared_buffer(bytes, output);
++}
++allocator::PreparedInputCause CudaAllocator::allocate_prepared_buffer(size_t bytes, allocator::PreparedInputAllocation& output) noexcept {
++  using Cause = allocator::PreparedInputCause;
++  if (!bytes) return Cause::success;
++  if (bytes > std::numeric_limits<size_t>::max() - (host_transfer_allocation_granularity - 1)) return Cause::invalid;
++  const auto capacity = (bytes + host_transfer_allocation_granularity - 1) & ~(host_transfer_allocation_granularity - 1);
++  try {
++    // Prepared sources and numerical births use an explicit pinned-host
++    // strategy. CUDA kernels address the same host allocation; it never migrates.
++    const allocator::MemoryPlacement placement{1, -1, 0};
++    std::lock_guard guard(mutex_);
++    if (active_memory_ > std::numeric_limits<size_t>::max() - capacity) return Cause::capacity;
++    void* data = nullptr;
++    const auto status = cudaMallocHost(&data, capacity);
++    if (status != cudaSuccess || !data) return Cause::allocation_failed;
++    output.native_buffer = {data, capacity, -1, placement, true};
++    output.buffer = Buffer{&output.native_buffer};
++    output.capacity = capacity;
++    output.allocator = this;
++    active_memory_ += capacity;
++    peak_memory_ = std::max(peak_memory_, active_memory_);
++    return Cause::success;
++  } catch (...) { return Cause::allocation_failed; }
++}
++void CudaAllocator::free_prepared_input(allocator::PreparedInputAllocation& input) noexcept {
++  auto* buffer = static_cast<CudaBuffer*>(input.buffer.ptr());
++  if (!buffer) return;
++  const auto status = buffer->placement.kind == 3 ? cudaFree(buffer->data) : cudaFreeHost(buffer->data);
++  if (status != cudaSuccess) std::terminate();
++  {
++    std::lock_guard guard(mutex_);
++    if (active_memory_ < input.capacity) std::terminate();
++    active_memory_ -= input.capacity;
++  }
++  input.buffer = Buffer{nullptr};
++  input.native_buffer = {};
++}
++
+ Buffer malloc_async(size_t size, CommandEncoder& encoder) {
++  const auto binding = submission::current_default_buffer_binding();
++  if (binding) return allocator::allocate_original(size, binding);
+   return allocator().malloc_async(
+       size, encoder.device().cuda_device(), encoder.stream());
+ }
+@@ -461,21 +420,52 @@
+ } // namespace cu
+ 
+ namespace allocator {
+-InputAllocatorLayout input_allocator_layout() noexcept { return {}; }
+-InputAllocatorCause initialize_input_allocator(
+-    InputAllocatorOwner, InitializedInputAllocator&) noexcept {
+-  return InputAllocatorCause::unsupported;
++InputAllocatorLayout input_allocator_layout() noexcept {
++  return {sizeof(cu::cuda_allocator_slot) + sizeof(next_input_allocator_identity), sizeof(cu::CudaAllocator),
++      decltype(cu::cuda_allocator_slot)::construction_controls() + sizeof(cu::CudaAllocatorFactory) +
++      sizeof(size_t) * 4 + sizeof(cudaError_t) + sizeof(std::function<size_t(cu::CudaBuffer*)>) +
++      sizeof(std::function<void(cu::CudaBuffer*)>), input_allocator_layout_qualified, false};
+ }
+-InputAllocatorCause borrow_input_allocator(
+-    uint64_t, InitializedInputAllocator&) noexcept {
+-  return InputAllocatorCause::unsupported;
++InputAllocatorCause initialize_input_allocator(InputAllocatorOwner owner, InitializedInputAllocator& output) noexcept {
++  if (!input_allocator_layout_qualified) return InputAllocatorCause::unsupported;
++  return cu::cuda_allocator_slot.initialize(cu::CudaAllocatorFactory{}, owner, output);
+ }
++InputAllocatorCause borrow_input_allocator(uint64_t identity, InitializedInputAllocator& output) noexcept {
++  return cu::cuda_allocator_slot.borrow(identity, output);
++}
+ 
+ 
+ Allocator& allocator() {
+   return cu::allocator();
+ }
+ 
++int Buffer::copy_to_host(void* destination, size_t offset, size_t bytes) const noexcept {
++  if (!bytes) return 0;
++  const auto* source = static_cast<const cu::CudaBuffer*>(ptr_);
++  if (!destination || !source || !source->data || offset > source->size ||
++      bytes > source->size - offset) return -1;
++  if (source->placement.kind == 1 || source->placement.kind == 3) {
++    std::memcpy(destination, static_cast<const char*>(source->data) + offset, bytes);
++    return 0;
++  }
++  if (source->placement.kind != 2 || source->device < 0) return -1;
++  int previous = -1;
++  auto status = cudaGetDevice(&previous);
++  if (status != cudaSuccess) return static_cast<int>(status);
++  if (previous != source->device) {
++    status = cudaSetDevice(source->device);
++    if (status != cudaSuccess) return static_cast<int>(status);
++  }
++  // CUDA's synchronous device-to-host return contract establishes completed
++  // destination access; this is not an asynchronous event-poll interpretation.
++  // https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html
++  // A returned native error remains an error, with no ongoing destination access.
++  const auto copied = cudaMemcpy(destination,
++      static_cast<const char*>(source->data) + offset, bytes, cudaMemcpyDeviceToHost);
++  const auto restored = previous == source->device ? cudaSuccess : cudaSetDevice(previous);
++  return static_cast<int>(copied != cudaSuccess ? copied : restored);
++}
++
+ void* Buffer::raw_ptr() {
+   if (!ptr_) {
+     return nullptr;
+@@ -524,7 +514,7 @@
+ } // namespace mlx::core
+ 
+ namespace mlx::core::allocator {
+-bool original_buffer_zero_has_backing(bool& out) noexcept { return false; }
++bool original_buffer_zero_has_backing(bool& out) noexcept { out = false; return true; }
+ }
+ 
+ namespace mlx::core::allocator {
+@@ -532,6 +522,11 @@
+   auto* backing = static_cast<const cu::CudaBuffer*>(buffer.ptr());
+   return backing && backing->data ? backing->placement : MemoryPlacement{1, -1, 0};
+ }
++int physical_memory_device_count() {
++  int count = 0;
++  CHECK_CUDA_ERROR(cudaGetDeviceCount(&count));
++  return count;
++}
+ bool memory_device_shares_host(int index) {
+   // CUDA exposes independent allocation domains. Integrated-device sharing is
+   // accepted only when the runtime explicitly reports an integrated GPU.
+@@ -556,6 +551,7 @@
+ }
+ 
+ namespace mlx::core::allocator {
++size_t ordinary_allocation_control_bytes() noexcept { return physical_backing_control_bytes() + sizeof(cu::CudaBuffer); }
+ MemoryPlacement default_memory_placement() {
+   return {cu::supports_managed_memory() ? 3u : 1u, -1, cu::supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u};
+ }
+diff -ruN a/mlx/backend/cuda/allocator.h b/mlx/backend/cuda/allocator.h
+--- a/mlx/backend/cuda/allocator.h	2026-09-21 12:59:24
++++ b/mlx/backend/cuda/allocator.h	2026-09-21 14:14:34
+@@ -17,44 +17,21 @@
+ 
+ using allocator::Buffer;
+ 
+-// Stores cuda-managed unified memory.
+-struct CudaBuffer {
+-  void* data;
+-  size_t size;
+-  int device; // -1 for managed or pinned host
+-  allocator::MemoryPlacement placement{};
+-  bool placement_retained{false};
+-};
++// Descriptor for fixed-device, pinned-host, or managed backing.
++using CudaBuffer = allocator::PreparedNativeBuffer;
+ 
+-class SmallSizePool {
+- private:
+-  union Block {
+-    Block* next;
+-    CudaBuffer buf;
+-  };
+-
+-  Block* buffer_{nullptr};
+-  void* data_{nullptr};
+-  Block* next_free_{nullptr};
+-
+- public:
+-  SmallSizePool();
+-  ~SmallSizePool();
+-
+-  SmallSizePool(const SmallSizePool&) = delete;
+-  SmallSizePool& operator=(const SmallSizePool&) = delete;
+-
+-  CudaBuffer* malloc();
+-  void free(CudaBuffer* buf);
+-  bool in_pool(CudaBuffer* buf);
+-};
+-
+ class CudaAllocator : public allocator::Allocator {
+  public:
++  CudaAllocator();
++  bool prepare_input_runtime(allocator::PreparedInputFacts&) override;
++  allocator::PreparedInputCause allocate_prepared_input(size_t, allocator::PreparedInputAllocation&) noexcept override;
++  allocator::PreparedInputCause allocate_prepared_buffer(size_t, allocator::PreparedInputAllocation&) noexcept override;
++  void free_prepared_input(allocator::PreparedInputAllocation&) noexcept override;
+   Buffer malloc(size_t size) override;
+   Buffer malloc_async(size_t size, int device, cudaStream_t stream);
+   void free(Buffer buffer) override;
+   size_t size(Buffer buffer) const override;
++  size_t host_transfer_control_bytes() const noexcept override { return sizeof(CudaBuffer); }
+   Buffer malloc_host_transfer(
+       size_t size,
+       allocator::HostTransferPolicy policy) override;
+@@ -81,10 +58,9 @@
+   void clear_cache();
+ 
+  private:
+-  void free_cuda_buffer(CudaBuffer* buf);
+-  void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
++  static void free_cuda_buffer(CudaBuffer* buf);
++  static void free_async(CudaBuffer& buf, cudaStream_t stream = nullptr);
+ 
+-  CudaAllocator();
+   friend CudaAllocator& allocator();
+ 
+   std::mutex mutex_;
+@@ -95,9 +71,7 @@
+   BufferCache<CudaBuffer> buffer_cache_;
+   size_t active_memory_{0};
+   size_t peak_memory_{0};
+-  std::vector<CudaStream> free_streams_;
+-  std::vector<cudaMemPool_t> mem_pools_;
+-  SmallSizePool scalar_pool_;
++
+ };
+ 
+ CudaAllocator& allocator();
+diff -ruN a/mlx/backend/cuda/fence.cpp b/mlx/backend/cuda/fence.cpp
+--- a/mlx/backend/cuda/fence.cpp	2026-09-21 17:39:44
++++ b/mlx/backend/cuda/fence.cpp	2026-09-21 17:39:44
+@@ -27,12 +27,13 @@
+   auto* fence = static_cast<FenceImpl*>(fence_.get());
+   if (cross_device) {
+     // Move to managed memory if there is a device switch
+-    auto& cbuf =
+-        *static_cast<cu::CudaBuffer*>(const_cast<array&>(a).buffer().ptr());
+-    if (cbuf.device != -1) {
++    auto* cbuf =
++        static_cast<cu::CudaBuffer*>(const_cast<array&>(a).buffer().ptr());
++    // A zero-sized array has no storage to relocate across the fence.
++    if (cbuf && cbuf->device != -1) {
+       auto& encoder = cu::get_command_encoder(s);
+       encoder.commit();
+-      cu::allocator().move_to_unified_memory(cbuf, encoder.stream());
++      cu::allocator().move_to_unified_memory(*cbuf, encoder.stream());
+     }
+   }
+   fence->count++;
+diff -ruN a/mlx/backend/cuda/utils.h b/mlx/backend/cuda/utils.h
+--- a/mlx/backend/cuda/utils.h	2026-09-21 17:39:44
++++ b/mlx/backend/cuda/utils.h	2026-09-21 17:39:44
+@@ -25,10 +25,10 @@
+ 
+ template <typename T>
+ inline T* gpu_ptr(array& arr) {
+-  return reinterpret_cast<T*>(
+-      static_cast<char*>(
+-          static_cast<cu::CudaBuffer*>(arr.buffer().ptr())->data) +
+-      arr.offset());
++  const auto* buffer = static_cast<cu::CudaBuffer*>(arr.buffer().ptr());
++  // Empty arrays have no backing or descriptor allocation.
++  if (!buffer || !buffer->data) return nullptr;
++  return reinterpret_cast<T*>(static_cast<char*>(buffer->data) + arr.offset());
+ }
+ 
+ // For const array, keep constness in pointer unless it is untyped.
+diff -ruN a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp	2026-09-21 12:59:24
++++ b/mlx/backend/metal/allocator.cpp	2026-09-21 16:11:25
+@@ -1,3 +1,4 @@
++#include <cstring>
+ // Copyright © 2023-2024 Apple Inc.
+ #include "mlx/backend/metal/allocator.h"
+ #include "mlx/backend/metal/allocator_device_info.h"
+@@ -25,6 +26,20 @@
+   return metal::allocator();
+ }
+ 
++int Buffer::copy_to_host(void* destination, size_t offset, size_t bytes) const noexcept {
++  if (!bytes) return 0;
++  if (!destination || !ptr_) return -1;
++  const auto* buffer = static_cast<const MTL::Buffer*>(ptr_);
++  const auto capacity = buffer->length();
++  if (buffer->storageMode() == MTL::StorageModePrivate || offset > capacity ||
++      bytes > capacity - offset) return -1;
++  auto copy = *this;
++  const auto* source = static_cast<const char*>(copy.raw_ptr());
++  if (!source) return -1;
++  std::memcpy(destination, source + offset, bytes);
++  return 0;
++}
++
+ void* Buffer::raw_ptr() {
+   if (!ptr_) {
+     return nullptr;
+@@ -65,20 +80,8 @@
+ }
+ 
+ void MetalAllocator::prepare_ordinary_heap() {
+-  if (ordinary_heap_initialized_) return;
+-  if (!virtual_machine_) {
+-    // These actual ordinary controls are outside the admitted input initializer.
+-    // Both native candidates retire locally on nil or residency insertion failure.
+-    auto descriptor = NS::TransferPtr(MTL::HeapDescriptor::alloc()->init());
+-    if (!descriptor) throw std::bad_alloc();
+-    descriptor->setResourceOptions(resource_options);
+-    descriptor->setSize(heap_size_);
+-    auto candidate = NS::TransferPtr(device_->newHeap(descriptor.get()));
+-    if (!candidate) throw std::bad_alloc();
+-    residency_set_.insert(candidate.get());
+-    // SharedPtr move/publish cannot throw after residency insertion.
+-    heap_ = std::move(candidate);
+-  }
++  // The physical-accounting allocator uses independent roots; it never creates
++  // a shared heap whose suballocations would hide the retained root capacity.
+   ordinary_heap_initialized_ = true;
+ }
+ 
+@@ -190,7 +193,9 @@
+   // ordinary callers share this one lazy transition under the allocator mutex.
+   std::unique_lock lk(mutex_);
+   prepare_ordinary_heap();
+-  MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
++  auto cached = buffer_cache_.reuse_from_cache(size);
++  auto* buf = static_cast<MTL::Buffer*>(cached.ptr());
++  allocator::PhysicalBackingOwner root;
+   if (!buf) {
+     size_t mem_required = get_active_memory() + get_cache_memory() + size;
+ 
+@@ -208,22 +213,21 @@
+       throw std::runtime_error(msg.str());
+     }
+     lk.unlock();
+-    if (size < small_size_ && heap_) {
+-      buf = heap_->newBuffer(size, resource_options);
+-    }
++    root.reset(allocator::prepare_physical_backing(size, {1, -1, 0}));
++    buf = device_->newBuffer(size, resource_options);
+     if (!buf) {
+-      buf = device_->newBuffer(size, resource_options);
+-    }
+-    if (!buf) {
+       std::ostringstream msg;
+       msg << "[malloc] Unable to allocate " << size << " bytes.";
+       throw std::runtime_error(msg.str());
+     }
++    if (buf->length() != size) { buf->release(); throw std::runtime_error("Unexpected Metal backing capacity."); }
++    root->pointer = buf;
++    try { allocator::publish_physical_backing(root.get()); }
++    catch (...) { buf->release(); throw; }
+     lk.lock();
++    try { residency_set_.insert(buf); }
++    catch (...) { lk.unlock(); buf->release(); throw; }
+     num_resources_++;
+-    if (!buf->heap()) {
+-      residency_set_.insert(buf);
+-    }
+   }
+ 
+   active_memory_ += buf->length();
+@@ -235,7 +239,7 @@
+         get_cache_memory() - max_pool_size_);
+   }
+ 
+-  return Buffer{static_cast<void*>(buf)};
++  return root ? Buffer{static_cast<void*>(buf), root.release()} : cached;
+ }
+ 
+ void MetalAllocator::clear_cache() {
+@@ -251,8 +255,8 @@
+   }
+   std::unique_lock lk(mutex_);
+   active_memory_ -= buf->length();
+-  if (get_cache_memory() < max_pool_size_) {
+-    buffer_cache_.recycle_to_cache(buf);
++  if (buffer.physical_backing() && get_cache_memory() <= max_pool_size_ && buf->length() <= max_pool_size_ - get_cache_memory()) {
++    buffer_cache_.recycle_to_cache(buffer);
+   } else {
+     num_resources_--;
+     if (!buf->heap()) {
+@@ -261,6 +265,7 @@
+     lk.unlock();
+     auto pool = metal::new_scoped_memory_pool();
+     buf->release();
++    allocator::destroy_physical_backing(buffer.physical_backing());
+   }
+ }
+ 
+@@ -478,8 +483,9 @@
+   if (backing->storageMode() == MTL::StorageModePrivate) return {2, 0, 0};
+   return {}; // Managed Metal resources need both copies attributed explicitly.
+ }
++int physical_memory_device_count() { return metal::physical_memory_device_available() ? 1 : 0; }
+ bool memory_device_shares_host(int index) {
+-  return index == 0 && metal::device(mlx::core::Device::gpu).mtl_device()->hasUnifiedMemory();
++  return index == 0 && metal::physical_memory_device_shares_host();
+ }
+ } // namespace mlx::core::allocator
+ 
+@@ -489,6 +495,7 @@
+ }
+ 
+ namespace mlx::core::allocator {
++size_t ordinary_allocation_control_bytes() noexcept { return physical_backing_control_bytes(); }
+ MemoryPlacement default_memory_placement() { return {1, -1, 0}; }
+ }
+ 
+diff -ruN a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp	2026-09-21 14:34:16
++++ b/mlx/backend/metal/device.cpp	2026-09-21 14:34:16
+@@ -382,6 +382,16 @@
+ 
+ } // namespace
+ 
++bool physical_memory_device_available() noexcept {
++  try { return static_cast<bool>(load_device()); } catch (...) { return false; }
++}
++bool physical_memory_device_shares_host() {
++  // Uses the same native hardware selection as Device construction, without
++  // initializing an MLX Device or consuming its admitted ownership provenance.
++  return load_device()->hasUnifiedMemory();
++}
++
++
+ // One concrete birth follows physical encoder, initial state and receipt
+ // controls. The callback may retain state after publishing its idle frontier.
+ struct EncoderBirth {
+diff -ruN a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h	2026-09-21 14:34:16
++++ b/mlx/backend/metal/device.h	2026-09-21 14:34:16
+@@ -27,6 +27,9 @@
+ 
+ namespace mlx::core::metal {
+ 
++MLX_API bool physical_memory_device_available() noexcept;
++MLX_API bool physical_memory_device_shares_host();
++
+ using MTLFCList =
+     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
+ 
+diff -ruN a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+--- a/mlx/backend/no_gpu/allocator.cpp	2026-09-21 12:59:24
++++ b/mlx/backend/no_gpu/allocator.cpp	2026-09-21 16:11:25
+@@ -1,3 +1,4 @@
++#include <cstring>
+ // Copyright © 2023-2026 Apple Inc.
+ 
+ #include <algorithm>
+@@ -235,23 +236,30 @@
+   allocator::refuse_original_buffer_bypass();
+   std::unique_lock lk(mutex_);
+   // Try cache first
+-  void* cached = buffer_cache_.reuse_from_cache(size);
+-  if (cached) {
+-    active_memory_ += get_buffer_size(cached);
++  auto cached = buffer_cache_.reuse_from_cache(size);
++  if (cached.ptr()) {
++    active_memory_ += get_buffer_size(cached.ptr());
+     peak_memory_ = std::max(active_memory_, peak_memory_);
+-    return Buffer{cached};
++    return cached;
+   }
+   lk.unlock();
+ 
+-  // Cache miss: allocate from OS
++  // The independently allocated root includes the native size header.
++  if (size > std::numeric_limits<size_t>::max() - sizeof(size_t))
++    throw std::overflow_error("CPU allocation capacity overflow.");
++  PhysicalBackingOwner root(prepare_physical_backing(size + sizeof(size_t), {1, -1, 0}));
+   void* ptr = std::malloc(size + sizeof(size_t));
+   if (ptr != nullptr) {
+     *static_cast<size_t*>(ptr) = size;
+   }
++  if (!ptr) throw std::bad_alloc();
++  root->pointer = ptr;
++  try { publish_physical_backing(root.get()); }
++  catch (...) { std::free(ptr); throw; }
+   lk.lock();
+   active_memory_ += size;
+   peak_memory_ = std::max(active_memory_, peak_memory_);
+-  return Buffer{ptr};
++  return Buffer{ptr, root.release()};
+ }
+ 
+ Buffer CommonAllocator::malloc_host_transfer(
+@@ -321,11 +329,12 @@
+   std::unique_lock lk(mutex_);
+   active_memory_ -= sz;
+ 
+-  if (sz > 0 && buffer_cache_.cache_size() + sz <= cache_limit_) {
+-    buffer_cache_.recycle_to_cache(buffer.ptr());
++  if (sz > 0 && buffer.physical_backing() && buffer_cache_.cache_size() <= cache_limit_ && sz <= cache_limit_ - buffer_cache_.cache_size()) {
++    buffer_cache_.recycle_to_cache(buffer);
+   } else {
+     lk.unlock();
+     std::free(buffer.ptr());
++    destroy_physical_backing(buffer.physical_backing());
+   }
+ }
+ 
+@@ -404,6 +413,18 @@
+   return common_allocator();
+ }
+ 
++int Buffer::copy_to_host(void* destination, size_t offset, size_t bytes) const noexcept {
++  if (!bytes) return 0;
++  if (!destination || !ptr_) return -1;
++  const auto capacity = *static_cast<const size_t*>(ptr_);
++  if (offset > capacity || bytes > capacity - offset) return -1;
++  auto copy = *this;
++  const auto* source = static_cast<const char*>(copy.raw_ptr());
++  if (!source) return -1;
++  std::memcpy(destination, source + offset, bytes);
++  return 0;
++}
++
+ void* Buffer::raw_ptr() {
+   if (!ptr_) {
+     return nullptr;
+@@ -454,6 +475,7 @@
+ 
+ namespace mlx::core::allocator {
+ MemoryPlacement memory_placement(Buffer) noexcept { return {1, -1, 0}; }
++int physical_memory_device_count() { return 0; }
+ bool memory_device_shares_host(int) { return false; }
+ } // namespace mlx::core::allocator
+ 
+@@ -463,6 +485,7 @@
+ }
+ 
+ namespace mlx::core::allocator {
++size_t ordinary_allocation_control_bytes() noexcept { return physical_backing_control_bytes(); }
+ MemoryPlacement default_memory_placement() { return {1, -1, 0}; }
+ }
+ 
+diff -ruN a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp	2026-09-21 13:35:14
++++ b/mlx/host_transfer.cpp	2026-09-21 16:11:25
+@@ -1,5 +1,10 @@
+ // Copyright © 2026 Apple Inc.
+ 
++#include "mlx/backend/gpu/device_info.h"
++#include <cstddef>
++#include <new>
++#include <mutex>
++
+ #include "mlx/host_transfer.h"
+ 
+ #include <array>
+@@ -27,6 +32,7 @@
+ };
+ 
+ std::array<HostTransferCounters, 4> host_transfer_counters;
++std::mutex host_transfer_counters_mutex;
+ 
+ size_t storage_kind_index(HostTransferStorageKind kind) {
+   switch (kind) {
+@@ -56,11 +62,15 @@
+     HostTransferStorageKind kind,
+     size_t capacity) {
+   auto& counters = host_transfer_counters[storage_kind_index(kind)];
+-  const auto bytes =
+-      counters.active_bytes.fetch_add(capacity, std::memory_order_relaxed) +
+-      capacity;
+-  const auto allocations =
+-      counters.active_allocations.fetch_add(1, std::memory_order_relaxed) + 1;
++  std::lock_guard guard(host_transfer_counters_mutex);
++  const auto previous_bytes = counters.active_bytes.load(std::memory_order_relaxed);
++  const auto previous_allocations = counters.active_allocations.load(std::memory_order_relaxed);
++  if (capacity > SIZE_MAX - previous_bytes || previous_allocations == SIZE_MAX)
++    throw std::overflow_error("Host transfer population overflow.");
++  const auto bytes = previous_bytes + capacity;
++  const auto allocations = previous_allocations + 1;
++  counters.active_bytes.store(bytes, std::memory_order_relaxed);
++  counters.active_allocations.store(allocations, std::memory_order_relaxed);
+   update_peak(counters.peak_bytes, bytes);
+   update_peak(counters.peak_allocations, allocations);
+ }
+@@ -69,23 +79,87 @@
+     HostTransferStorageKind kind,
+     size_t capacity) {
+   auto& counters = host_transfer_counters[storage_kind_index(kind)];
+-  counters.active_bytes.fetch_sub(capacity, std::memory_order_relaxed);
+-  counters.active_allocations.fetch_sub(1, std::memory_order_relaxed);
++  std::lock_guard guard(host_transfer_counters_mutex);
++  const auto bytes = counters.active_bytes.load(std::memory_order_relaxed);
++  const auto allocations = counters.active_allocations.load(std::memory_order_relaxed);
++  if (bytes < capacity || allocations == 0) std::terminate();
++  counters.active_bytes.store(bytes - capacity, std::memory_order_relaxed);
++  counters.active_allocations.store(allocations - 1, std::memory_order_relaxed);
+ }
+ 
+ } // namespace
+ 
++size_t host_transfer_static_bytes() noexcept {
++  return sizeof(host_transfer_counters) + sizeof(host_transfer_counters_mutex);
++}
++
++namespace {
++struct HostTransferConstruction {
++  allocator::Allocator& allocator;
++  size_t requested;
++  HostTransferPolicy policy;
++  HostTransferStorageKind kind;
++  size_t capacity;
++  allocator::MemoryPlacement placement;
++  allocator::PhysicalBacking* root{nullptr};
++};
++struct HostTransferControlHeader { allocator::PhysicalBacking* root; };
++// The public allocator callback sees the concrete rebound shared-control layout.
++// No assumption about a particular standard library's private header is needed.
++template<class T> class HostTransferControlAllocator {
++ public:
++  using value_type = T;
++  HostTransferConstruction* construction;
++  explicit HostTransferControlAllocator(HostTransferConstruction* value) noexcept : construction(value) {}
++  template<class U> HostTransferControlAllocator(const HostTransferControlAllocator<U>& value) noexcept : construction(value.construction) {}
++  static constexpr size_t alignment = alignof(T) > alignof(HostTransferControlHeader) ? alignof(T) : alignof(HostTransferControlHeader);
++  static constexpr size_t prefix = ((sizeof(HostTransferControlHeader) + alignment - 1) / alignment) * alignment;
++  T* allocate(size_t count) {
++    if (!construction || construction->root || count > (SIZE_MAX - prefix) / sizeof(T))
++      throw std::bad_alloc();
++    const auto extent = prefix + count * sizeof(T);
++    const auto descriptor = construction->allocator.host_transfer_control_bytes();
++    const auto frames = sizeof(HostTransferConstruction) + sizeof(*this) + sizeof(std::shared_ptr<T>) + sizeof(size_t) * 4;
++    if (descriptor > SIZE_MAX - extent || frames > SIZE_MAX - extent - descriptor) throw std::bad_alloc();
++    auto root = allocator::PhysicalBackingOwner(allocator::prepare_physical_backing(
++        construction->capacity, construction->placement, extent + descriptor + frames));
++    auto* memory = static_cast<char*>(::operator new(extent, std::align_val_t(alignment)));
++    auto* header = ::new(memory) HostTransferControlHeader{root.release()};
++    construction->root = header->root;
++    return reinterpret_cast<T*>(memory + prefix);
++  }
++  void deallocate(T* value, size_t) noexcept {
++    auto* memory = reinterpret_cast<char*>(value) - prefix;
++    auto* root = reinterpret_cast<HostTransferControlHeader*>(memory)->root;
++    // Physical storage was freed by HostTransferStorage's destructor. The last
++    // shared-control allocation retires before its accounting owner is released.
++    ::operator delete(memory, std::align_val_t(alignment));
++    allocator::destroy_physical_backing(root);
++  }
++  template<class U> bool operator==(const HostTransferControlAllocator<U>& other) const noexcept { return construction == other.construction; }
++  template<class U> bool operator!=(const HostTransferControlAllocator<U>& other) const noexcept { return !(*this == other); }
++};
++}
++
+ class HostTransferStorage {
+  public:
+-  HostTransferStorage(size_t size, HostTransferPolicy policy)
+-      : buffer_(allocator::allocator().malloc_host_transfer(size, policy)),
+-        policy_(policy),
+-        storage_kind_(
+-            allocator::allocator().host_transfer_storage_kind(policy)),
+-        capacity_(allocator::allocator().host_transfer_allocation_bytes(
+-            buffer_, policy_)),
+-        generation_(next_allocation_generation()) {
+-    record_host_transfer_allocation(storage_kind_, capacity_);
++  explicit HostTransferStorage(HostTransferConstruction& construction)
++      : buffer_(construction.allocator.malloc_host_transfer(construction.requested, construction.policy)),
++        policy_(construction.policy), storage_kind_(construction.kind),
++        capacity_(construction.allocator.host_transfer_allocation_bytes(buffer_, policy_)),
++        generation_(construction.root->generation), ordinary_root_(construction.root) {
++    bool recorded = false;
++    try {
++      if (capacity_ != construction.capacity) throw std::runtime_error("Host transfer capacity differs from its admitted mechanism.");
++      ordinary_root_->pointer = this;
++      record_host_transfer_allocation(storage_kind_, capacity_);
++      recorded = true;
++      allocator::publish_physical_backing(ordinary_root_);
++    } catch (...) {
++      construction.allocator.free_host_transfer(buffer_, policy_);
++      if (recorded) record_host_transfer_free(storage_kind_, capacity_);
++      throw;
++    }
+   }
+ 
+   HostTransferStorage(allocator::PreparedInputAllocation* allocation,
+@@ -103,6 +177,7 @@
+   }
+ 
+   bool prepared_source() const noexcept { return prepared_ != nullptr; }
++  size_t host_control_bytes() const noexcept { return ordinary_root_ ? ordinary_root_->host_controls : 0; }
+ 
+   uint64_t allocation_generation() const {
+     return generation_;
+@@ -142,6 +217,7 @@
+   size_t capacity_;
+   uint64_t generation_;
+   allocator::PreparedInputAllocation* prepared_{nullptr};
++  allocator::PhysicalBacking* ordinary_root_{nullptr};
+   // Released after free_host_transfer and the physical accounting update.
+   AllocationOwners allocation_owners_;
+ };
+@@ -205,7 +281,8 @@
+   if (!shape || !rank || rank > Shape::inline_capacity || !facts.page_size ||
+       (facts.page_size & (facts.page_size - 1)) ||
+       (facts.kind != HostTransferStorageKind::metal_shared &&
+-       facts.kind != HostTransferStorageKind::cpu)) return false;
++       facts.kind != HostTransferStorageKind::cpu &&
++       facts.kind != HostTransferStorageKind::cuda_pinned && facts.kind != HostTransferStorageKind::cuda_managed)) return false;
+   size_t bytes = size_of(dtype);
+   for (size_t i = 0; i < rank; ++i) {
+     if (shape[i] <= 0 || bytes > static_cast<size_t>(PTRDIFF_MAX) / static_cast<size_t>(shape[i])) return false;
+@@ -339,7 +416,7 @@
+   return HostTransferAllocationInfo{
+       allocator::memory_placement(retained->owner->buffer()),
+       retained->owner->allocation_generation(), retained->owner->capacity(),
+-      retained->owner->prepared_source()};
++      retained->owner->prepared_source(), retained->owner->host_control_bytes()};
+ }
+ 
+ bool retain_host_transfer_allocation_owner(
+@@ -383,7 +460,7 @@
+ std::optional<HostTransferAllocationInfo> HostTransferBuffer::allocation_info() const noexcept {
+   if (!storage_ || !storage_->allocation_generation()) return std::nullopt;
+   return HostTransferAllocationInfo{allocator::memory_placement(storage_->buffer()), storage_->allocation_generation(),
+-      storage_->capacity(), storage_->prepared_source()};
++      storage_->capacity(), storage_->prepared_source(), storage_->host_control_bytes()};
+ }
+ 
+ uint64_t HostTransferBuffer::allocation_identity() const {
+@@ -458,8 +535,19 @@
+   if (elements > std::numeric_limits<size_t>::max() / size_of(dtype_)) {
+     throw std::overflow_error("[HostTransferBuffer] Byte size overflow.");
+   }
+-  storage_ = std::make_shared<HostTransferStorage>(
+-      elements * size_of(dtype_), policy);
++  auto& selected = allocator::allocator();
++  const auto kind = selected.host_transfer_storage_kind(policy);
++  const auto requested = elements * size_of(dtype_);
++  const auto capacity = selected.host_transfer_capacity_upper_bound(requested, policy);
++  allocator::MemoryPlacement placement{1, -1, 0};
++  if (kind == HostTransferStorageKind::cuda_managed) {
++    const auto devices = gpu::device_count();
++    if (devices <= 0) throw std::runtime_error("Managed host transfer has no physical candidate devices.");
++    placement = {3, -1, static_cast<uint32_t>(devices)};
++  }
++  HostTransferConstruction construction{selected, requested, policy, kind, capacity, placement};
++  storage_ = std::allocate_shared<HostTransferStorage>(
++      HostTransferControlAllocator<HostTransferStorage>{&construction}, construction);
+ }
+ 
+ void* HostTransferBuffer::data() {
+@@ -534,7 +622,9 @@
+ // retain the shared-Metal contract; ordinary CPU pages are not GPU buffers.
+ bool original_host_storage_matches(const HostTransferBuffer& buffer, Stream selected) {
+   const auto kind = buffer.storage_kind();
+-  return (kind == HostTransferStorageKind::metal_shared &&
++  return ((kind == HostTransferStorageKind::metal_shared ||
++           kind == HostTransferStorageKind::cuda_pinned ||
++           kind == HostTransferStorageKind::cuda_managed) &&
+           (selected.device.type == Device::gpu || selected.device.type == Device::cpu)) ||
+       (kind == HostTransferStorageKind::cpu && selected.device.type == Device::cpu);
+ }
+diff -ruN a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h	2026-09-21 14:14:34
++++ b/mlx/host_transfer.h	2026-09-21 14:17:35
+@@ -20,12 +20,15 @@
+ class PreparedInputArray;
+ struct DeviceTransfer;
+ 
++MLX_API size_t host_transfer_static_bytes() noexcept;
++
+ /** Exact physical host-transfer owner, retained by a buffer or array. */
+ struct MLX_API HostTransferAllocationInfo {
+   allocator::MemoryPlacement placement;
+   uint64_t identity;
+   size_t capacity;
+   bool prepared_source;
++  size_t host_controls;
+ };
+ 
+ /** Cold inspection of certified host-transfer backing; never evaluates/polls. */
+diff -ruN a/mlx/original_buffer.cpp b/mlx/original_buffer.cpp
+--- a/mlx/original_buffer.cpp	2026-09-21 13:33:12
++++ b/mlx/original_buffer.cpp	2026-09-21 13:33:12
+@@ -38,7 +38,8 @@
+   if (!allocator.prepare_input_runtime(facts) || !facts.page_size ||
+       (facts.page_size & (facts.page_size - 1)) ||
+       (facts.kind != HostTransferStorageKind::cpu &&
+-       facts.kind != HostTransferStorageKind::metal_shared)) fail(Cause::unsupported);
++       facts.kind != HostTransferStorageKind::metal_shared &&
++       facts.kind != HostTransferStorageKind::cuda_pinned && facts.kind != HostTransferStorageKind::cuda_managed)) fail(Cause::unsupported);
+   return new OriginalBufferBudget(allocator, facts, capacity, owner, retire, closed_occupancy);
+ }
+ namespace {
+@@ -80,8 +81,9 @@
+     size_t bytes, size_t& capacity) noexcept {
+   if (!facts.page_size || (facts.page_size & (facts.page_size - 1)) ||
+       (facts.kind != HostTransferStorageKind::cpu &&
+-       facts.kind != HostTransferStorageKind::metal_shared)) return false;
+-  if (!bytes && facts.kind == HostTransferStorageKind::metal_shared) {
++       facts.kind != HostTransferStorageKind::metal_shared &&
++       facts.kind != HostTransferStorageKind::cuda_pinned && facts.kind != HostTransferStorageKind::cuda_managed)) return false;
++  if (!bytes && facts.kind != HostTransferStorageKind::cpu) {
+     capacity = 0; return true;
+   }
+   const auto header = facts.kind == HostTransferStorageKind::cpu ? sizeof(size_t) : 0;
+diff -ruN a/mlx/physical_backing.cpp b/mlx/physical_backing.cpp
+--- a/mlx/physical_backing.cpp	1970-01-01 01:00:00
++++ b/mlx/physical_backing.cpp	2026-09-21 16:11:25
+@@ -0,0 +1,88 @@
++// Copyright © 2026 Eredu contributors.
++#include "mlx/host_transfer.h"
++#include "mlx/allocator.h"
++#include "mlx/array.h"
++#include <mutex>
++#include <memory>
++
++namespace mlx::core::allocator {
++namespace {
++std::mutex roots_mutex;
++PhysicalBacking* roots = nullptr;
++PhysicalBackingObserver observer = nullptr;
++void* observer_context = nullptr;
++}
++PhysicalBacking::PhysicalBacking(uint64_t id, size_t bytes, size_t controls, MemoryPlacement where) noexcept
++    : generation(id), capacity(bytes), host_controls(controls), placement(where) {}
++PhysicalBacking::~PhysicalBacking() {
++  {
++    std::lock_guard lock(roots_mutex);
++    if (registry_previous) registry_previous->registry_next = registry_next;
++    else if (roots == this) roots = registry_next;
++    if (registry_next) registry_next->registry_previous = registry_previous;
++  }
++}
++void destroy_physical_backing(PhysicalBacking* root) noexcept {
++  if (!root) return;
++  auto* observation = root->observation;
++  const auto release = root->release_observation;
++  // Another host thread may drain the deferred Rust queue immediately. Keep
++  // its accounting owner private until operator delete has freed this block.
++  delete root;
++  if (release) release(observation);
++}
++size_t physical_backing_control_bytes() noexcept { return sizeof(PhysicalBacking); }
++size_t physical_backing_static_bytes() noexcept { return sizeof(roots_mutex) + sizeof(roots) + sizeof(observer) + sizeof(observer_context) + host_transfer_static_bytes(); }
++PhysicalBacking* prepare_physical_backing(size_t capacity, MemoryPlacement placement, size_t extra) {
++  if (extra > std::numeric_limits<size_t>::max() - sizeof(PhysicalBacking))
++    throw std::overflow_error("Physical backing control size overflow.");
++  const auto controls = sizeof(PhysicalBacking) + extra;
++  const auto identity = next_allocation_generation();
++  if (!identity) throw std::overflow_error("Physical backing identity exhausted.");
++  std::lock_guard lock(roots_mutex);
++  void* payload = nullptr;
++  void (*release)(void*) = nullptr;
++  PhysicalBackingPublish publish = nullptr;
++  if (observer && !observer(observer_context, identity, capacity, controls, placement, &payload, &release, &publish))
++    throw PhysicalBackingAdmissionError(payload, release);
++  PhysicalBacking* root = nullptr;
++  try { root = new PhysicalBacking(identity, capacity, controls, placement); }
++  catch (...) { if (release) release(payload); throw; }
++  root->observation = payload;
++  root->release_observation = release;
++  root->publish_observation = publish;
++  root->registry_next = roots;
++  if (roots) roots->registry_previous = root;
++  roots = root;
++  return root;
++}
++void publish_physical_backing(PhysicalBacking* root) {
++  if (!root || !root->publish_observation) return;
++  void* failure = nullptr;
++  void (*release)(void*) = nullptr;
++  if (!root->publish_observation(root->observation, &failure, &release))
++    throw PhysicalBackingAdmissionError(failure, release);
++  root->publish_observation = nullptr;
++}
++bool observe_physical_backings(void* context, PhysicalBackingObserver callback) {
++  std::lock_guard lock(roots_mutex);
++  if (observer) return observer == callback && observer_context == context;
++  // Installing observers precedes ledger admission. Refusal keeps already paid
++  // roots attached and leaves the observer uninstalled for an explicit retry.
++  for (auto* root = roots; root; root = root->registry_next) {
++    if (root->release_observation) continue;
++    void* payload = nullptr;
++    void (*release)(void*) = nullptr;
++    PhysicalBackingPublish publish = nullptr;
++    if (!callback(context, root->generation, root->capacity, root->host_controls,
++                  root->placement, &payload, &release, &publish)) throw PhysicalBackingAdmissionError(payload, release);
++    root->observation = payload;
++    root->release_observation = release;
++    root->publish_observation = publish;
++    publish_physical_backing(root);
++  }
++  observer = callback;
++  observer_context = context;
++  return true;
++}
++} // namespace mlx::core::allocator
+diff -ruN a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+--- a/mlx/prepared_input.cpp	2026-09-21 13:33:12
++++ b/mlx/prepared_input.cpp	2026-09-21 13:33:12
+@@ -207,7 +207,8 @@
+   if (!multiply(elements, dtype.size(), bytes) || bytes > static_cast<size_t>(PTRDIFF_MAX)) return false;
+   if (facts.kind == allocator::HostTransferStorageKind::cpu) {
+     if (!add(bytes, sizeof(size_t), bytes)) return false;
+-  } else if (facts.kind != allocator::HostTransferStorageKind::metal_shared) return false;
++  } else if (facts.kind != allocator::HostTransferStorageKind::metal_shared &&
++       facts.kind != allocator::HostTransferStorageKind::cuda_pinned && facts.kind != allocator::HostTransferStorageKind::cuda_managed) return false;
+   if (!add(bytes, facts.page_size - 1, rounded)) return false;
+   rounded &= ~(facts.page_size - 1);
+   if (rounded > facts.maximum) return false;
+@@ -366,7 +367,8 @@
+   if ((rank && !shape) || rank > static_cast<size_t>(INT_MAX) || dtype == bool_ ||
+       !facts.page_size || (facts.page_size & (facts.page_size - 1)) ||
+       (facts.kind != allocator::HostTransferStorageKind::cpu &&
+-       facts.kind != allocator::HostTransferStorageKind::metal_shared)) return false;
++       facts.kind != allocator::HostTransferStorageKind::metal_shared &&
++       facts.kind != allocator::HostTransferStorageKind::cuda_pinned && facts.kind != allocator::HostTransferStorageKind::cuda_managed)) return false;
+   size_t elements = 1;
+   for (size_t i = 0; i < rank; ++i) {
+     if (shape[i] < 0 || !multiply(elements, static_cast<size_t>(shape[i]), elements)) return false;
+diff -ruN a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h	2026-09-21 15:20:59
++++ b/mlx/primitives.h	2026-09-21 16:00:05
+@@ -797,6 +797,11 @@
+         flip_);
+   }
+ 
++  auto borrowed_state() const noexcept {
++    return std::tie(kernel_strides_, padding_lo_, padding_hi_,
++        kernel_dilation_, input_dilation_, groups_, flip_);
++  }
++
+   static Shape conv_out_shape(
+       const Shape& in_shape,
+       const Shape& wt_shape,
+@@ -1659,6 +1664,9 @@
+   DEFINE_GRADS()
+   DEFINE_NAME(Pad)
+   bool is_equivalent(const Primitive& other) const override;
++  auto borrowed_state() const noexcept {
++    return std::tie(axes_, low_pad_size_, high_pad_size_);
++  }
+   auto state() const {
+     // Preserve the ordinary public state/serializer type. Original execution
+     // does not materialize this diagnostic vector.

@@ -5,6 +5,9 @@
 //! speculative, realtime, distributed, automatic-planning, and residency
 //! realization call shapes.
 
+#[path = "support/memory.rs"]
+mod memory;
+use memory::{FundingFixture, LedgerFixture, StorageFixture};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -15,7 +18,7 @@ use std::{
 
 use eredu::{
     api::{
-        LoadedModel, LoadedTextModelConfig, ControlledGenerationError, ControlledGenerationRecord,
+        ControlledGenerationError, ControlledGenerationRecord, LoadedModel, LoadedTextModelConfig,
         PreparedChatGenerationSettings, PreparedChatSpeculativeBatchLane,
         PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeError,
         PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeRequest,
@@ -24,40 +27,40 @@ use eredu::{
 };
 use eredu_architectures::ModelKind;
 use eredu_core::{
-    AUTOMATIC_SCHEMA_VERSION, AdmissionRequest, AdmissionResult, ArtifactFormat,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningBackend, AutomaticPlanningError,
-    BackendDescriptor, BackendId, BackendProvider, BackendSession, BoundedCompletion,
-    BoundedCompletionOutcome, BoundedCompletionWait, BoundedResidencyRequirement,
-    CacheStateStrategy, CandidateAdmission, CapabilityError, CollectiveGroupDescriptor,
-    CollectiveGroupId, CollectiveScope, Completion, DeviceCapabilities, DeviceDescriptor,
-    DevicePlan, DistributedBackend, DistributedCapabilities, DistributedSession,
-    DistributedSessionDescriptor, DraftPlacementPlan, DraftingPlan, EstimationCompleteness,
-    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget,
-    ExecutionPlanTargetSelection, ExternalDraftArtifact, FinishReason, GenerationConfigOverrides,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    InputModalities, InputTokenCount, Media, ModelCapabilities, ModelCapabilityBackend,
-    ModelLoadingBackend, ModelResourceProfile, ModelRuntime, MultimodalPreparationBackend,
-    MultimodalPreparationFailure, MultimodalRequest, MultimodalSegment, ObservationSet,
-    ObservationValue, Observed, PhysicalMemorySemantics, PreparedModel, PreparedSpeculativeLane,
-    RealizedDrafting, ResidencyPlan, RgbImage, RuntimeStateEstimate, SamplingPlacement,
-    SelectedExecutionPlanTarget, SemanticEvent, SessionCapabilities, SpeculativeCallbackPublisher,
-    SpeculativeCapability, SpeculativeCommit, SpeculativeDraft, SpeculativeDraftRandomPosition,
-    SpeculativeDraftSource, SpeculativeExecutor, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationOutput, SpeculativeGenerationVisitor, SpeculativeOutputRuntime,
-    SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling, SpeculativeSemanticConstraint,
-    SpeculativeTokenFilterController, StateMemoryLayout, StaticMemoryReport, Submission,
-    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
     checkpoint::TensorDtype,
     residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedger,
         ResidencyPolicy,
     },
+    AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlanningBackend, AutomaticPlanningError, BackendDescriptor, BackendId,
+    BackendProvider, BackendSession, BoundedCompletion, BoundedCompletionOutcome,
+    BoundedCompletionWait, BoundedResidencyRequirement, CacheStateStrategy, CandidateAdmission,
+    CapabilityError, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope, Completion,
+    DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedBackend, DistributedCapabilities,
+    DistributedSession, DistributedSessionDescriptor, DraftPlacementPlan, DraftingPlan,
+    EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanReport,
+    ExecutionPlanTarget, ExecutionPlanTargetSelection, ExternalDraftArtifact, FinishReason,
+    GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, Media,
+    ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelResourceProfile,
+    ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
+    MultimodalSegment, ObservationSet, ObservationValue, Observed, PhysicalMemorySemantics,
+    PreparedModel, PreparedSpeculativeLane, RealizedDrafting, ResidencyPlan, RgbImage,
+    RuntimeStateEstimate, SamplingPlacement, SelectedExecutionPlanTarget, SemanticEvent,
+    SessionCapabilities, SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit,
+    SpeculativeDraft, SpeculativeDraftRandomPosition, SpeculativeDraftSource, SpeculativeExecutor,
+    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
+    SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
+    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout,
+    StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter,
+    TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 use tokenizers::{
-    AddedToken, Tokenizer, decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
-    pre_tokenizers::whitespace::Whitespace,
+    decoders::byte_level::ByteLevel, models::wordlevel::WordLevel,
+    pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
 };
 
 #[path = "support/admitted_text.rs"]
@@ -73,14 +76,21 @@ impl SourceBackend for MockBackend {
     fn before_semantic_prompt(_: &ModelRuntime<Self>) -> Result<(), eredu_core::BackendFailure> {
         preparation::native(eredu_core::run_preparation::TextPreparationStage::Prompt)
             .map_err(Self::into_backend_failure)
-    }    fn capture_facts(runtime: &ModelRuntime<Self>) -> Option<(&eredu_core::ObservationCatalog, &eredu_core::ObservationSupportReport)> {
+    }
+    fn capture_facts(
+        runtime: &ModelRuntime<Self>,
+    ) -> Option<(
+        &eredu_core::ObservationCatalog,
+        &eredu_core::ObservationSupportReport,
+    )> {
         let facts = &runtime.session().capture_discovery;
         Some((&facts.catalog, &facts.support))
     }
-    fn intervention_facts(runtime: &ModelRuntime<Self>) -> Option<&eredu_core::intervention::InterventionDiscovery> {
+    fn intervention_facts(
+        runtime: &ModelRuntime<Self>,
+    ) -> Option<&eredu_core::intervention::InterventionDiscovery> {
         Some(&runtime.session().intervention_discovery)
     }
-
 }
 
 const QWEN_TEMPLATE: &str =
@@ -312,7 +322,8 @@ impl BackendProvider for MockBackend {
         let capture_discovery = observed_mock::discovery();
         let intervention_discovery = observed_mock::intervention_discovery(&intervention_identity);
         Ok(MockSession {
-            capture_discovery, intervention_discovery,
+            capture_discovery,
+            intervention_discovery,
             artifact_identity: std::cell::Cell::new(Some(observed_mock::artifact_identity())),
             capture_artifact_identity: Some(observed_mock::artifact_identity()),
             original: Environment::new(host_authority::source_pool()),
@@ -348,7 +359,9 @@ impl BackendSession<MockBackend> for MockSession {
         backend: &MockBackend,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
-        if let Some(token) = input.resume_token() { return self.decode(backend, token); }
+        if let Some(token) = input.resume_token() {
+            return self.decode(backend, token);
+        }
         let lease = self.authority.begin_submission()?;
         shared_delivery::submitted();
         Ok(Submission {
@@ -503,7 +516,7 @@ impl TextGenerationBackend for MockBackend {
         let request = preparation.original.as_ref()?.request.request();
         Some(eredu_core::TextPreparationReport {
             geometry: request.geometry(),
-            admission: request.memory_reservation()?.admission(),
+            admission: request.memory_reservation().admission(),
         })
     }
     fn acquire_host_preparation(
@@ -576,13 +589,17 @@ impl TextGenerationBackend for MockBackend {
         options: Option<&eredu_core::TextPreparationOptions>,
         claim: &eredu_core::GenerationSequencePreparation<'_, '_>,
     ) -> Result<Self::TextPreparation, eredu_core::BackendFailure> {
-        if options.and_then(|options| options.capture.as_ref())
+        if options
+            .and_then(|options| options.capture.as_ref())
             .is_some_and(|source| !source.admission().plan().selections.is_empty())
         {
-            runtime.session().artifact_identity.set(runtime.session().capture_artifact_identity);
+            runtime
+                .session()
+                .artifact_identity
+                .set(runtime.session().capture_artifact_identity);
         }
-        let capture = observed_mock::funded_plan(runtime, options, config)?;
-        let probe = preparation::admit(input, config)?;
+        let capture = observed_mock::funded_plan(runtime, options, config.clone())?;
+        let probe = preparation::admit(input, config.clone())?;
         admitted_text::Preparation::admit(
             Self::source_environment(runtime),
             config,
@@ -639,16 +656,21 @@ impl TextGenerationBackend for MockBackend {
         Ok(prompt)
     }
     fn install_text_capture_admitted(
-        _: &ModelRuntime<Self>, state: &mut Self::TextGenerationState,
-        preparation: &Self::TextPreparation, source: &eredu_core::capture::SharedCapturePlan,
+        _: &ModelRuntime<Self>,
+        state: &mut Self::TextGenerationState,
+        preparation: &Self::TextPreparation,
+        source: &eredu_core::capture::SharedCapturePlan,
         _: &eredu_core::TextStepContext,
     ) -> Result<(), eredu_core::BackendFailure> {
         preparation::native(eredu_core::run_preparation::TextPreparationStage::Instrumentation)
             .map_err(Self::into_backend_failure)?;
-        let original = preparation.original.as_ref()
-            .ok_or_else(|| eredu_core::TokenInputRejection::IdentityMismatch.into_backend_failure())?;
+        let original = preparation.original.as_ref().ok_or_else(|| {
+            eredu_core::TokenInputRejection::IdentityMismatch.into_backend_failure()
+        })?;
         let bank = original.capture(source)?;
-        state.install_funded(bank, original.funding()).map_err(Self::into_backend_failure)?;
+        state
+            .install_funded(bank, original.funding())
+            .map_err(Self::into_backend_failure)?;
         Ok(())
     }
     fn start_text_generation_admitted(
@@ -657,7 +679,7 @@ impl TextGenerationBackend for MockBackend {
         p: &Self::TextPreparation,
     ) -> Result<Self::TextGenerationState, Self::Error> {
         if let Some(p) = &p.original {
-            p.request.claim_sampling(config)?.finish()?;
+            p.request.claim_sampling(config.clone())?.finish()?;
         }
         let mut state = Self::start_text_generation(backend, config)?;
         state.original = p.original.clone();
@@ -750,7 +772,9 @@ impl TextGenerationBackend for MockBackend {
         Ok(())
     }
 
-    fn prepared_artifact_identity(runtime: &ModelRuntime<Self>) -> Option<eredu_core::artifact::ArtifactIdentity> {
+    fn prepared_artifact_identity(
+        runtime: &ModelRuntime<Self>,
+    ) -> Option<eredu_core::artifact::ArtifactIdentity> {
         runtime.session().artifact_identity.get()
     }
     fn text_sampling_control_support(
@@ -807,7 +831,10 @@ impl TextGenerationBackend for MockBackend {
     fn capture_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        runtime.session().artifact_identity.set(runtime.session().capture_artifact_identity);
+        runtime
+            .session()
+            .artifact_identity
+            .set(runtime.session().capture_artifact_identity);
         Ok(observed_mock::discovery())
     }
     fn validate_text_capture(
@@ -833,7 +860,10 @@ impl TextGenerationBackend for MockBackend {
     }
     fn text_capture_pending(state: &Self::TextGenerationState) -> bool {
         shared_delivery::pending()
-            || state.funded.as_ref().is_some_and(eredu_runtime::capture::FundedCaptureSession::has_pending_step)
+            || state
+                .funded
+                .as_ref()
+                .is_some_and(eredu_runtime::capture::FundedCaptureSession::has_pending_step)
             || state
                 .capture
                 .as_ref()
@@ -875,13 +905,11 @@ impl TextGenerationBackend for MockBackend {
         let sequence = prompt.len();
         let phase = if prompt.resume_token().is_some() {
             eredu_core::capture::CapturePhase::Decode
-        } else { eredu_core::capture::CapturePhase::Prefill };
+        } else {
+            eredu_core::capture::CapturePhase::Prefill
+        };
         let submission = runtime.prefill(prompt)?;
-        let output = state.observe(
-            phase,
-            sequence,
-            submission.output,
-        )?;
+        let output = state.observe(phase, sequence, submission.output)?;
         Ok(Submission {
             output: MockToken::new(if submission.output == 999 {
                 999
@@ -985,14 +1013,12 @@ impl ModelCapabilityBackend for MockBackend {
             &StateMemoryLayout::new(
                 eredu_core::LayerSchedule::new(
                     1,
-                    vec![
-                        eredu_core::cache::LayerCachePolicy::key_only(
-                            eredu_core::AttentionPolicy::Full,
-                            1,
-                            2,
-                        )
-                        .unwrap(),
-                    ],
+                    vec![eredu_core::cache::LayerCachePolicy::key_only(
+                        eredu_core::AttentionPolicy::Full,
+                        1,
+                        2,
+                    )
+                    .unwrap()],
                 )
                 .unwrap(),
                 vec![0],
@@ -1033,8 +1059,14 @@ impl ModelLoadingBackend for MockBackend {
     }
 
     fn inspect_model_artifact(
-        &self, path: &std::path::Path,
-    ) -> Result<eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>, eredu_core::ModelLoadError<Self::Error>> {
+        &self,
+        path: &std::path::Path,
+    ) -> Result<
+        eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        eredu_core::ModelLoadError<Self::Error>,
+    > {
         LOADING_INSPECTIONS.with(|count| count.set(count.get() + 1));
         eredu_core::inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver())
             .map_err(eredu_core::ModelLoadError::Artifact)
@@ -1178,9 +1210,12 @@ impl ExecutionPlanBackendFactory for MockBackend {
     type Drafter = MockDrafter;
 
     fn inspect_loading_artifact<R: eredu_core::ModelConfigurationResolver>(
-        &self, path: &std::path::Path, resolver: &R,
+        &self,
+        path: &std::path::Path,
+        resolver: &R,
     ) -> Result<eredu_core::ArtifactInspection<R::ArtifactPlan>, AutomaticPlanningError>
-    where R::ArtifactPlan: Send + Sync + 'static,
+    where
+        R::ArtifactPlan: Send + Sync + 'static,
     {
         FACTORY_INSPECTIONS.with(|count| count.set(count.get() + 1));
         eredu_core::inspect_artifact_with_prepared_gguf_headers(path, resolver)
@@ -1372,7 +1407,11 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     type Error = MockError;
 
     fn max_proposals(&self) -> usize {
-        if self.reject_second { 3 } else { 1 }
+        if self.reject_second {
+            3
+        } else {
+            1
+        }
     }
 
     fn prefill<'a>(
@@ -1938,17 +1977,13 @@ fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, pre
     );
     assert!(matches!(
         model
-            .admit(
-                AdmissionRequest {
-                    input,
-                    max_output_tokens: 3,
-                    batch_size: 1,
-                    safety_reserve_bytes: 0,
-                    application_memory_budget_bytes: None,
-                    require_complete_estimate: true,
-                },
-                None,
-            )
+            .admit(AdmissionRequest {
+                input,
+                max_output_tokens: 3,
+                batch_size: 1,
+                additional_headroom: Default::default(),
+                memory_limits: Default::default(),
+            },)
             .unwrap(),
         AdmissionResult::Rejected(eredu_core::AdmissionRejection::EstimationUnsupported { .. })
     ));
@@ -1967,26 +2002,24 @@ fn speculative_client_code<
     ));
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_speculative(
-            eredu::api::PreparedChatSpeculativeRequest {
-                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
-                skip_special_tokens: true,
-                chat: prepared,
-                input: eredu::api::PreparedChatPrompt::Rendered,
-                drafting: SpeculativeDraft::Embedded,
-                settings: original_sources::settings(PreparedChatGenerationSettings {
-                    overrides: GenerationConfigOverrides {
-                        max_new_tokens: Some(2),
-                        ..Default::default()
-                    },
+        .generate_prepared_chat_speculative(eredu::api::PreparedChatSpeculativeRequest {
+            output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+            skip_special_tokens: true,
+            chat: prepared,
+            input: eredu::api::PreparedChatPrompt::Rendered,
+            drafting: SpeculativeDraft::Embedded,
+            settings: original_sources::settings(PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(2),
                     ..Default::default()
-                }),
-                options: PreparedChatSpeculativeGenerationOptions::default(),
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |event| events.push(event),
-            },
-        )
+                },
+                ..Default::default()
+            }),
+            options: PreparedChatSpeculativeGenerationOptions::default(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |event| events.push(event),
+        })
         .unwrap();
     (output, events)
 }
@@ -2000,29 +2033,27 @@ fn speculative_batch_client_code<
 ) -> (SpeculativeGenerationBatchOutput, Vec<SemanticEvent>) {
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_speculative_batch(
-            eredu::api::PreparedChatSpeculativeBatchRequest {
-                drafting: SpeculativeDraft::Embedded,
-                lanes: vec![eredu::api::PreparedChatSpeculativeBatchLane {
-                    output_mode: eredu::api::PreparedChatOutputMode::Semantic,
-                    skip_special_tokens: true,
-                    chat: prepared,
+        .generate_prepared_chat_speculative_batch(eredu::api::PreparedChatSpeculativeBatchRequest {
+            drafting: SpeculativeDraft::Embedded,
+            lanes: vec![eredu::api::PreparedChatSpeculativeBatchLane {
+                output_mode: eredu::api::PreparedChatOutputMode::Semantic,
+                skip_special_tokens: true,
+                chat: prepared,
                 input: eredu::api::PreparedChatPrompt::Rendered,
-                    settings: original_sources::settings(PreparedChatGenerationSettings {
-                        overrides: GenerationConfigOverrides {
-                            max_new_tokens: Some(2),
-                            ..Default::default()
-                        },
+                settings: original_sources::settings(PreparedChatGenerationSettings {
+                    overrides: GenerationConfigOverrides {
+                        max_new_tokens: Some(2),
                         ..Default::default()
-                    }),
-                    max_draft_tokens: NonZeroUsize::new(2).unwrap(),
-                    caller_stop_sequences: &[],
-                    cancellation: Default::default(),
-                    on_event: Box::new(|event| events.push(event)),
-                }],
-                scheduler: Default::default(),
-            },
-        )
+                    },
+                    ..Default::default()
+                }),
+                max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: Box::new(|event| events.push(event)),
+            }],
+            scheduler: Default::default(),
+        })
         .unwrap();
     (output, events)
 }
@@ -2037,8 +2068,8 @@ fn assert_single_lane_speculative_cardinality_is_validated(
     ] {
         let source = model.tokenizer_source().clone();
         SPECULATIVE_RESULT_FAULT.set(Some(fault));
-        let result = model.generate_prepared_chat_speculative(
-            eredu::api::PreparedChatSpeculativeRequest {
+        let result =
+            model.generate_prepared_chat_speculative(eredu::api::PreparedChatSpeculativeRequest {
                 output_mode: eredu::api::PreparedChatOutputMode::Semantic,
                 skip_special_tokens: true,
                 chat: prepared,
@@ -2055,8 +2086,7 @@ fn assert_single_lane_speculative_cardinality_is_validated(
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
-            },
-        );
+            });
         let Err(error) = result else {
             panic!("malformed backend cardinality must be rejected");
         };
@@ -2206,8 +2236,8 @@ where
     F::Backend: TextGenerationBackend,
     <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
         eredu_core::ModelConfigurationResolver<
-                ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-            >,
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
 {
     let request = AutomaticPlanRequest::new(
         model_path,
@@ -2254,12 +2284,10 @@ fn realize_residency_copy<R, E>(
         .publish_reserved(id, tier, spec.bytes(), Some(generation))
         .unwrap();
     assert!(resources.insert((id.clone(), tier), resource).is_none());
-    assert!(
-        ledger
-            .resolve_transfer(std::slice::from_ref(id), tier, generation, true)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(ledger
+        .resolve_transfer(std::slice::from_ref(id), tier, generation, true)
+        .unwrap()
+        .is_empty());
     Ok(())
 }
 
@@ -2497,8 +2525,10 @@ fn assert_automatic_planning_conformance() {
         .expect("generic plan loading realizes the external assistant");
     FACTORY_INSPECTIONS.with(|count| assert_eq!(count.get(), 1));
     let retained = eredu_core::inspect_artifact_with_prepared_gguf_headers(
-        artifact.path(), &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
-    ).unwrap();
+        artifact.path(),
+        &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+    )
+    .unwrap();
     let retained_model = LoadedModel::load_inspected_execution_plan(&backend, retained, &external)
         .expect("retained inspection uses the same loading worker");
     FACTORY_INSPECTIONS.with(|count| assert_eq!(count.get(), 1));
@@ -2717,7 +2747,12 @@ fn assert_prepared_generation_and_speculative_conformance() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -2801,9 +2836,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
     assert!(observed_output.2.time_to_first_token().is_some());
     assert!(output.timing().time_to_first_token().is_some());
     assert!(
-        trace
-            .iter()
-            .all(|record| record.artifact_identity == Some(observed_mock::artifact_identity().to_string())),
+        trace.iter().all(|record| record.artifact_identity
+            == Some(observed_mock::artifact_identity().to_string())),
         "trace records borrow the already retained artifact identity"
     );
     let observed_semantics: Vec<_> = trace
@@ -2927,8 +2961,14 @@ fn assert_prepared_generation_and_speculative_conformance() {
         })
     );
 
-    let token_config =
-        TextGenerationConfig::new(model.resolve_generation_config(Default::default()).unwrap());
+    let token_config = TextGenerationConfig::new(
+        model
+            .resolve_generation_config(GenerationConfigOverrides {
+                max_new_tokens: Some(1),
+                ..Default::default()
+            })
+            .unwrap(),
+    );
     let token = model
         .generate_tokens(vec![0; 999], token_config)
         .unwrap()
@@ -2961,7 +3001,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
     });
     let error = model
         .start_prepared_chat(
-            eredu::api::PreparedChatRequest::new(&prepared, settings),
+            eredu::api::PreparedChatRequest::new(&prepared, settings.clone()),
             &cancellation,
         )
         .unwrap()
@@ -3089,7 +3129,12 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
             .unwrap()
             .unwrap();
         probe
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -3103,7 +3148,12 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -3123,8 +3173,10 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
     let ordinary = {
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let mut on_event = |event| ordinary_events.push(event);
-        let mut request =
-            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(settings.clone()),
+        );
         request.stop_sequences = &[];
         model
             .start_prepared_chat(request, &cancellation)
@@ -3157,7 +3209,7 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
         total_bytes: 1024 * 1024,
     };
     let mut prepared =
-        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     prepared.capture = Some(&prepared_capture);
     let mut observed_events = Vec::new();
     let mut captured_steps = Vec::new();
@@ -3212,7 +3264,7 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
         total_bytes: 1024 * 1024,
     };
     let mut prepared =
-        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     prepared.capture = Some(&prepared_capture);
     let mut failure_records = Vec::new();
     let error = (|| -> Result<_, ControlledGenerationError> {
@@ -3264,7 +3316,7 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
         total_bytes: 1024 * 1024,
     };
     let mut prepared =
-        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     prepared.capture = Some(&prepared_capture);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = (|| -> Result<_, ControlledGenerationError> {
@@ -3298,8 +3350,10 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
     let recovered = {
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let mut on_event = |_| {};
-        let mut request =
-            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(settings.clone()),
+        );
         request.stop_sequences = &[];
         model
             .start_prepared_chat(request, &cancellation)

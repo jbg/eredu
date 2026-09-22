@@ -65,9 +65,11 @@ fn query<B: ParameterBackend>(
         region.starts[0] = row;
         region.shape[0] = 1;
     }
+    // The reference calculation owns an independent mutable host vector.
     Ok(model
         .query_parameter(&facts.identity, parameter, region, limits)?
-        .values)
+        .values
+        .clone())
 }
 
 fn measured<B: ParameterBackend>(
@@ -272,8 +274,10 @@ pub fn reconstruct<B: ParameterBackend>(
                 "component projection geometry"
             );
             let scale = group.residual_scale.value() as f64;
-            for (index, (activation, projection)) in
-                activations.iter().zip(projected.values).enumerate()
+            for (index, (activation, projection)) in activations
+                .iter()
+                .zip(projected.values.iter().copied())
+                .enumerate()
             {
                 let contribution = *activation as f64 * projection as f64 * scale;
                 if nested {

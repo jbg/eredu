@@ -5,7 +5,7 @@ mod capture;
 pub(super) use capture::validate_capture_entry;
 use eredu_core::{PendingTextInput, TextStepContext};
 use eredu_runtime::working_memory::{
-    InferenceRequest, InferenceTextStep, WorkingMemoryError, WorkingMemoryPool,
+    InferenceRequest, InferenceTextStep, MemoryLedger, WorkingMemoryError,
 };
 
 /// One prediction's allocation authority, held through controller commitment.
@@ -14,8 +14,8 @@ use eredu_runtime::working_memory::{
 /// core-issued run step. Historical request retention grants no permission.
 pub struct MlxTextStepPermit {
     session: Rc<Cell<bool>>,
-    model_pool: WorkingMemoryPool,
-    context_pool: WorkingMemoryPool,
+    model_pool: MemoryLedger,
+    context_pool: MemoryLedger,
     parameter_epoch: u64,
     prediction: u64,
     prefill: bool,
@@ -94,7 +94,9 @@ impl TextOperation<'_> {
         quoted.quote.claim_prediction_scopes(&quoted.step)
     }
 
-    pub(super) fn sampling_work(&self) -> Result<Option<super::text_funding::FundedWorkOwner>, Error> {
+    pub(super) fn sampling_work(
+        &self,
+    ) -> Result<Option<super::text_funding::FundedWorkOwner>, Error> {
         let quoted = self.permit.quoted.as_ref().expect("quoted operation");
         quoted.quote.sampling_work(&quoted.step)
     }
@@ -118,20 +120,29 @@ impl TextOperation<'_> {
 
     pub(super) fn parallel_control_installation(&self)
         ->Result<Option<(crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlInstallation,
-            crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection)>,Error>{
-        let quoted=self.permit.quoted.as_ref().expect("quoted operation");
+    crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection)>,Error>{
+        let quoted = self.permit.quoted.as_ref().expect("quoted operation");
         quoted.quote.install_parallel_control(&quoted.step)
     }
 
-    pub(super) fn activate_operation_bank(&self) -> Result<Option<crate::backend::runtime::execution::generic::OriginalOperationActivation>, Error> {
+    pub(super) fn activate_operation_bank(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::execution::generic::OriginalOperationActivation>,
+        Error,
+    > {
         let quoted = self.permit.quoted.as_ref().expect("quoted operation");
         quoted.quote.activate_operation_bank(&quoted.step)
     }
 
-    pub(super) fn partition_capture_frame(&self, session: &MlxModelSession)
-        -> Result<Option<text_quote::OriginalPartitionCaptureFrame>, Error> {
+    pub(super) fn partition_capture_frame(
+        &self,
+        session: &MlxModelSession,
+    ) -> Result<Option<text_quote::OriginalPartitionCaptureFrame>, Error> {
         let quoted = self.permit.quoted.as_ref().expect("quoted operation");
-        quoted.quote.prepare_partition_capture_frame(session, &quoted.step, self.permit.prediction)
+        quoted
+            .quote
+            .prepare_partition_capture_frame(session, &quoted.step, self.permit.prediction)
     }
 
     pub(super) fn model_execution_preparation(
@@ -202,12 +213,10 @@ impl TextOperation<'_> {
         &self,
         scope: eredu_runtime::working_memory::WorkingMemoryFundingScope,
     ) -> Result<super::text_funding::FundedWorkOwner, Error> {
-        self.permit
-            .quoted
-            .as_ref()
-            .expect("quoted operation")
+        let quoted = self.permit.quoted.as_ref().expect("quoted operation");
+        quoted
             .quote
-            .funded_work(scope)
+            .funded_work_for_step(scope, &quoted.step, self.permit.prefill)
     }
 
     pub(super) fn request(&self) -> &InferenceRequest {
@@ -230,8 +239,11 @@ impl TextOperation<'_> {
             || !self
                 .permit
                 .model_pool
-                .same_domain(&session.payload.memory_pool)
-            || !self.permit.context_pool.same_domain(backend.memory_pool())
+                .same_ledger(&session.payload.memory_ledger)
+            || !self
+                .permit
+                .context_pool
+                .same_ledger(backend.memory_ledger())
         {
             return Err(mismatch());
         }
@@ -239,12 +251,12 @@ impl TextOperation<'_> {
         if self.request().requires_funding_scope() && self.permit.funding.0.borrow().is_none() {
             return Err(mismatch());
         }
-        let reservation = self.request().memory_reservation().ok_or_else(|| mismatch())?;
+        let reservation = self.request().memory_reservation();
         reservation
-            .validate_domain(&session.payload.memory_pool)
+            .validate_ledger(&session.payload.memory_ledger)
             .map_err(|error| memory(error))?;
         reservation
-            .validate_domain(backend.memory_pool())
+            .validate_ledger(backend.memory_ledger())
             .map_err(|error| memory(error))?;
         Ok(())
     }
@@ -378,7 +390,7 @@ impl MlxTextStepPermit {
             }
             None => {
                 // A retained reservation without the cold quote remains unquoted.
-                let memory = session.operation_memory(Some(runtime.backend().memory_pool()))?;
+                let memory = session.operation_memory(Some(runtime.backend().memory_ledger()))?;
                 (None, memory)
             }
         };
@@ -398,8 +410,8 @@ impl MlxTextStepPermit {
 
         Ok(Self {
             session: Rc::clone(&session.poison),
-            model_pool: session.payload.memory_pool.clone(),
-            context_pool: runtime.backend().memory_pool().clone(),
+            model_pool: session.payload.memory_ledger.clone(),
+            context_pool: runtime.backend().memory_ledger().clone(),
             parameter_epoch: epoch.ok_or_else(|| mismatch())?,
             prediction: state.sampling.next_prediction,
             prefill: matches!(input, PendingTextInput::Prefill(_)),
@@ -440,10 +452,10 @@ impl MlxTextStepPermit {
         session.validate_backend(runtime.backend())?;
         if self.submitted
             || !Rc::ptr_eq(&self.session, &session.poison)
-            || !self.model_pool.same_domain(&session.payload.memory_pool)
+            || !self.model_pool.same_ledger(&session.payload.memory_ledger)
             || !self
                 .context_pool
-                .same_domain(runtime.backend().memory_pool())
+                .same_ledger(runtime.backend().memory_ledger())
             || self.prediction != state.sampling.next_prediction
             || self.prefill != matches!(input, PendingTextInput::Prefill(_))
         {
@@ -460,7 +472,10 @@ impl MlxTextStepPermit {
                     PendingTextInput::Decode(token.step_receipt().ok_or_else(|| mismatch())?)
                 }
             };
-            quoted.step.validate_input(actual_input).map_err(|error| memory(error))?;
+            quoted
+                .step
+                .validate_input(actual_input)
+                .map_err(|error| memory(error))?;
 
             validate_quote(
                 &quoted.quote,
@@ -476,7 +491,7 @@ impl MlxTextStepPermit {
                 .validate_sampling_decision(
                     quoted.quote.contract(),
                     decision,
-                    runtime.backend().memory_pool(),
+                    runtime.backend().memory_ledger(),
                 )
                 .map_err(|error| Error::Other(Box::new(error)))?;
         }
@@ -556,7 +571,7 @@ fn validate_request(
                 return Err(mismatch());
             }
         }
-        PendingTextInput::Decode(token) if request.memory_reservation().is_some() => {
+        PendingTextInput::Decode(token) => {
             if !token
                 .owner
                 .inference_retention()
@@ -566,14 +581,12 @@ fn validate_request(
                 return Err(mismatch());
             }
         }
-        PendingTextInput::Decode(_) => {}
     }
-    if request.memory_reservation().is_some()
-        && !state
-            .sampling
-            .inference_retention
-            .requests()
-            .any(matches_request)
+    if !state
+        .sampling
+        .inference_retention
+        .requests()
+        .any(matches_request)
     {
         return Err(mismatch());
     }
@@ -587,9 +600,15 @@ fn validate_quote(
     request: &InferenceRequest,
     input: PendingTextInput<&&MlxModelInput, &&MlxTextToken>,
 ) -> Result<(), Error> {
-    runtime.validate_session_admission().map_err(|error| error.at_text_admission())?;
-    quote.validate(runtime, request).map_err(|error| error.at_text_admission())?;
-    quote.validate_frontier(runtime, state.sampling.next_prediction).map_err(|error| error.at_text_admission())?;
+    runtime
+        .validate_session_admission()
+        .map_err(|error| error.at_text_admission())?;
+    quote
+        .validate(runtime, request)
+        .map_err(|error| error.at_text_admission())?;
+    quote
+        .validate_frontier(runtime, state.sampling.next_prediction)
+        .map_err(|error| error.at_text_admission())?;
     if !state
         .sampling
         .quote
@@ -650,7 +669,9 @@ pub(super) fn validate_prompt_binding_fixed(
         .quote
         .as_ref()
         .is_some_and(|actual| actual.same_owner(quote))
-        || prompt.prefill_chunk_positions.map_or(0, |chunk| chunk.get())
+        || prompt
+            .prefill_chunk_positions
+            .map_or(0, |chunk| chunk.get())
             != quote.request().geometry().prefill_chunk_positions
     {
         return Err(WorkingMemoryError::IdentityMismatch);

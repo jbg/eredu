@@ -7,6 +7,7 @@ use crate::speculative::numerical::SpeculativeNumericalProgram;
 pub struct SpeculativeNumericalRequirements {
     program: SpeculativeNumericalProgram,
     physical: u64,
+    placement: Arc<eredu_core::MemoryPlacement>,
     graph: u64,
     record: u64,
     controls: u64,
@@ -20,16 +21,18 @@ impl SpeculativeNumericalRequirements {
         graph: Option<u64>,
         record: Option<u64>,
         controls: Option<u64>,
+        placement: Arc<eredu_core::MemoryPlacement>,
     ) -> Result<Self, WorkingMemoryError> {
         let value = Self {
             program,
             physical: physical.ok_or(WorkingMemoryError::UnknownBound)?,
+            placement,
             graph: graph.ok_or(WorkingMemoryError::UnknownBound)?,
             record: record.ok_or(WorkingMemoryError::UnknownBound)?,
             controls: controls.ok_or(WorkingMemoryError::UnknownBound)?,
             capture: None,
         };
-        value.bytes()?;
+        value.host_bytes()?;
         Ok(value)
     }
     /// Add one exact capture destination to this real numerical occurrence.
@@ -48,11 +51,11 @@ impl SpeculativeNumericalRequirements {
             .checked_add(plan.initialization_peak_bytes())
             .ok_or(WorkingMemoryError::Overflow)?;
         self.capture = Some(plan.binding());
-        self.bytes()?;
+        self.host_bytes()?;
         Ok(self)
     }
-    fn bytes(&self) -> Result<u64, WorkingMemoryError> {
-        [self.physical, self.graph, self.record, self.controls]
+    fn host_bytes(&self) -> Result<u64, WorkingMemoryError> {
+        [self.graph, self.record, self.controls]
             .into_iter()
             .try_fold(0u64, u64::checked_add)
             .ok_or(WorkingMemoryError::Overflow)
@@ -94,6 +97,8 @@ impl From<WorkingMemoryError> for SpeculativeNumericalAdmissionError {
 pub enum SpeculativeNumericalSource<'a> {
     /// A completed selected target, independent draft, or Embedded prediction value.
     Model(&'a OriginalSpeculativeBudgetCustody),
+    /// Completed standalone work, with no request-bound speculative authority.
+    Standalone(&'a crate::working_memory::OriginalNumericalBudgetCustody),
     /// A completed prior numerical value.
     Numerical(&'a OriginalSpeculativeNumericalBudgetCustody),
     /// A published registered-copy input retaining its separate copy account.
@@ -113,9 +118,10 @@ impl SpeculativeNumericalSource<'_> {
         &self,
         schedule: ScheduleIdentity,
         request_account: u64,
-        request_pool: &WorkingMemoryPool,
+        request_pool: &MemoryLedger,
     ) -> bool {
         let (identity, account, pool) = match self {
+            Self::Standalone(_) => return false,
             Self::Registered(value) => {
                 let identity = value.identity();
                 (identity.schedule, identity.account, &identity.pool)
@@ -129,7 +135,7 @@ impl SpeculativeNumericalSource<'_> {
                 (value.request, value.request_account, value.ticket.pool())
             }
         };
-        identity == schedule && account == request_account && pool.same_domain(request_pool)
+        identity == schedule && account == request_account && pool.same_ledger(request_pool)
     }
 }
 #[derive(Debug)]
@@ -260,15 +266,19 @@ impl OriginalSpeculativeNumericalBudgetCustody {
     pub fn physical_bytes(&self) -> u64 {
         self.account.value().requirements.physical
     }
-    pub(in crate::working_memory) fn pool(&self) -> &WorkingMemoryPool {
+    /// Physical domains assigned to the native numerical allowance.
+    pub fn placement(&self) -> &eredu_core::MemoryPlacement {
+        &self.account.value().requirements.placement
+    }
+    pub(in crate::working_memory) fn pool(&self) -> &MemoryLedger {
         self.account.value().ticket.pool()
     }
     pub(in crate::working_memory) fn validate_copy_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &super::super::Usage,
     ) -> Result<(), WorkingMemoryError> {
-        if !self.pool().same_domain(pool) {
+        if !self.pool().same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         self.account.value().ticket.validate_in(usage)
@@ -314,19 +324,29 @@ impl OriginalSpeculativeRequest {
         let ordinal = slots.numerical.next;
         slots.numerical.next = ordinal.checked_add(1).ok_or(WorkingMemoryError::Overflow)?;
         let own = phase_control_bytes()?;
-        let bytes = requirements
-            .bytes()?
-            .checked_add(own)
-            .ok_or(WorkingMemoryError::Overflow)?;
         let controls = requirements
             .controls
             .checked_add(own)
             .ok_or(WorkingMemoryError::Overflow)?;
-        let ticket = accept(
-            self.ticket.pool(),
+        let pool = self.ticket.pool();
+        let mut domains = eredu_core::DomainMemoryRequirements::zero(pool.topology());
+        domains
+            .add_allocation(requirements.physical, &requirements.placement)
+            .map_err(WorkingMemoryError::from)?;
+        domains
+            .add_allocation(
+                requirements
+                    .host_bytes()?
+                    .checked_add(own)
+                    .ok_or(WorkingMemoryError::Overflow)?,
+                &pool.0.host_placement,
+            )
+            .map_err(WorkingMemoryError::from)?;
+        let ticket = accept_domains(
+            pool,
             &self.execution,
-            self.capacity,
-            bytes,
+            self.capacity.clone(),
+            domains,
             controls,
         )?;
         let account = Account(Some(Arc::new(Charge {

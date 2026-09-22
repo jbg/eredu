@@ -15,7 +15,11 @@ fn operation(kind: WorkspaceOperationKind, input: &[i32], output: &[i32]) -> Wor
 }
 
 fn compare(worker: Worker, operation: &WorkspaceOperation, scratch: u64, capacity: u64) {
-    let allocation = NativeAllocationFacts { page_size: 4096, cpu_header: false };
+    let allocation = NativeAllocationFacts {
+        page_size: 4096,
+        cpu_header: false,
+        original_storage: false,
+    };
     let run = |sink: &mut Emitter<'_>| worker(operation.as_view(), allocation, sink);
     let expected = run(&mut Emitter::count()).unwrap().unwrap();
     assert_eq!(expected.scratch_bytes, scratch);
@@ -111,7 +115,11 @@ fn actual_reduction_softmax_and_storage_workers_emit_the_same_exact_ordinary_fac
 
 #[test]
 fn actual_worker_rejects_every_inexact_destination_and_late_geometry_without_writes() {
-    let allocation = NativeAllocationFacts { page_size: 4096, cpu_header: false };
+    let allocation = NativeAllocationFacts {
+        page_size: 4096,
+        cpu_header: false,
+        original_storage: false,
+    };
     let mut op = operation(
         WorkspaceOperationKind::SliceUpdate { starts: vec![0, 0] },
         &[2, 3],
@@ -150,9 +158,11 @@ fn actual_worker_rejects_every_inexact_destination_and_late_geometry_without_wri
                 ),
                 Err(error) if matches!(error.cause(), MlxWorkspaceFactCause::Destination(_))
             ));
-            assert!(outputs
-                .iter()
-                .all(|value| *value == WorkspaceOutputEffect::AliasOutput(123)));
+            assert!(
+                outputs
+                    .iter()
+                    .all(|value| *value == WorkspaceOutputEffect::AliasOutput(123))
+            );
             assert!(aliases.iter().all(|value| *value == 456));
             assert!(text.iter().all(|value| *value == 0xA5));
         }
@@ -210,7 +220,11 @@ fn borrowed_reduction_has_no_rank_cap_and_unknown_emission_preserves_destination
         write(
             |sink| super::super::storage::emit(
                 unknown.as_view(),
-                NativeAllocationFacts { page_size: 4096, cpu_header: false },
+                NativeAllocationFacts {
+                    page_size: 4096,
+                    cpu_header: false,
+                    original_storage: false
+                },
                 sink
             ),
             WorkspaceEffectDestination {
@@ -264,7 +278,11 @@ fn closed_assumption_count_and_fill_preserve_utf8_and_scalar_formatting() {
 
 #[test]
 fn basic_fact_companion_preserves_full_alias_domain_empty_broadcast_and_seed_bytes() {
-    let allocation = NativeAllocationFacts { page_size: 4096, cpu_header: false };
+    let allocation = NativeAllocationFacts {
+        page_size: 4096,
+        cpu_header: false,
+        original_storage: false,
+    };
     let mut concatenate = operation(WorkspaceOperationKind::Concatenate, &[1], &[257]);
     concatenate.inputs = (0..257)
         .map(|_| WorkspaceLayout::new(&[1], WorkspaceDtype::Float32).unwrap())
@@ -376,7 +394,11 @@ fn observed_packed_fact_worker_preserves_compact_outputs_and_whole_envelope_at_h
         outputs: vec![score],
     };
     compare(super::super::packed::emit, &finish, 1387, 47);
-    let allocation = NativeAllocationFacts { page_size: 4096, cpu_header: false };
+    let allocation = NativeAllocationFacts {
+        page_size: 4096,
+        cpu_header: false,
+        original_storage: false,
+    };
     let run =
         |sink: &mut Emitter<'_>| super::super::packed::emit(prepare.as_view(), allocation, sink);
     let measured = run(&mut Emitter::count()).unwrap().unwrap();
@@ -407,10 +429,12 @@ fn observed_packed_fact_worker_preserves_compact_outputs_and_whole_envelope_at_h
     let ordinary = ordinary(run).unwrap().unwrap();
     assert_eq!(ordinary.scratch_bytes, 4101);
     assert_eq!(ordinary.assumptions.as_bytes(), text);
-    assert!(outputs
-        .iter()
-        .zip(&ordinary.outputs)
-        .all(|(a, b)| a.as_view(&[]) == Some(b.as_view())));
+    assert!(
+        outputs
+            .iter()
+            .zip(&ordinary.outputs)
+            .all(|(a, b)| a.as_view(&[]) == Some(b.as_view()))
+    );
 }
 
 #[test]
@@ -436,7 +460,11 @@ fn masked_readout_fixed_failures_preserve_sources_and_leave_every_destination_un
         top_centroids: 0,
         mask_margin: f32::NAN,
     };
-    let allocation = NativeAllocationFacts { page_size: 4096, cpu_header: false };
+    let allocation = NativeAllocationFacts {
+        page_size: 4096,
+        cpu_header: false,
+        original_storage: false,
+    };
     let mut outputs = [WorkspaceOutputEffect::AliasOutput(91)];
     let mut aliases = [73];
     let mut text = [0xA7; 3];
@@ -477,7 +505,11 @@ fn masked_readout_fixed_failures_preserve_sources_and_leave_every_destination_un
 #[test]
 fn selected_public_companion_retains_separate_host_payload_and_exact_destinations() {
     let selected = super::super::MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 4096, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 4096,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     };
     for (shape, bytes) in [(&[2, 3][..], 24), (&[][..], 4), (&[0, 7][..], 0)] {
@@ -540,6 +572,9 @@ fn selected_public_companion_retains_separate_host_payload_and_exact_destination
                     },
                 )
                 .unwrap_err();
+            let MlxWorkspacePreparationError::Fixed(error) = error else {
+                panic!("descriptor emission must retain the fixed equation cause")
+            };
             let MlxWorkspaceFactCause::Destination(cause) = error.cause() else {
                 panic!("wrong cause")
             };
@@ -575,7 +610,11 @@ fn selected_public_companion_retains_separate_host_payload_and_exact_destination
 #[test]
 fn selected_public_companion_keeps_unknown_and_late_error_before_any_destination_write() {
     let selected = super::super::MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 4096, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 4096,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     };
     let unknown = operation(WorkspaceOperationKind::Elementwise("unpriced"), &[3], &[3]);
@@ -625,6 +664,9 @@ fn selected_public_companion_keeps_unknown_and_late_error_before_any_destination
             },
         )
         .unwrap_err();
+    let MlxWorkspacePreparationError::Fixed(fixed) = fixed else {
+        panic!("descriptor emission must retain the fixed equation cause")
+    };
     assert_eq!(
         fixed,
         MlxWorkspaceFactError::descriptor("invalid Metal storage-transform descriptor")

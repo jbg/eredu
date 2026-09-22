@@ -13,22 +13,22 @@ use super::super::workspace::target_quote::{
     PreparedTargetEquationQuote, TargetEquationQuoteParts,
 };
 use super::*;
+use crate::backend::runtime::residency::manager::OriginalMaterializedLoan;
 use crate::backend::submission_recovery::prefill::nested::NestedCompletionOwner;
 use crate::backend::{
     OriginalCopyEnvironment,
     nn::workspace::{ProjectedNativeStorage, ProjectedResidentState},
     runtime::{
-        cache::state::{
-            CompletedResidentSource,
-        },
+        cache::state::CompletedResidentSource,
         execution::generic::{LayerwiseWorkspace, SpeculativeNeuralOwner},
     },
 };
+use crate::composition::mlx::speculative::embedded_native::AddressableModelSource;
 use crate::composition::mlx::speculative::embedded_native::{
     ActiveEmbeddedNativeInvocation, EmbeddedNativeLayout,
 };
 use eredu_core::{HostPreparationAuthority, OutputDemand};
-use eredu_nn::workspace::{WorkspaceContext, HostMetadataFunding};
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext};
 use eredu_runtime::{
     speculative::embedded_occurrence::EmbeddedInvocationWorkspace,
     working_memory::{
@@ -38,7 +38,6 @@ use eredu_runtime::{
 };
 use safemlx::{Array, OriginalBufferBudget, SubmissionScope};
 use std::mem::{size_of, size_of_val};
-use crate::composition::mlx::speculative::embedded_native::AddressableModelSource;
 
 type Session<A, S, D> =
     ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>;
@@ -50,10 +49,49 @@ type Work<'s, 'e, 'o, A, S, D, F> = (
     Option<OriginalEmbeddedSpeculativeRole>,
 );
 
+type ParallelArguments<'a, 'scope, 'observer, F> = (
+    F,
+    Option<&'observer mut dyn ActivationObserver<MlxTensor, eredu_nn::Error>>,
+    SpeculativeExecutionStreams<'a>,
+    Option<&'a super::capture::Capture>,
+    &'a ActiveEmbeddedNativeInvocation<'scope>,
+    &'a Stream,
+);
+fn execute_parallel<'a, 'scope, 'observer, A, S, D, R, F>(
+    session: &mut Session<A, S, D>,
+    args: ParallelArguments<'a, 'scope, 'observer, F>,
+) -> Result<R, Error>
+where
+    S: MlxStateMechanisms,
+    A: LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::Unit: 'static,
+    D: ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+        >,
+    F: for<'execution, 'observation> FnOnce(
+        &mut Session<A, S, D>,
+        Option<&'observation mut dyn ActivationObserver<MlxTensor, eredu_nn::Error>>,
+        SpeculativeExecutionStreams<'execution>,
+    ) -> Result<R, Error>,
+{
+    let (execute, observer, context, capture, active, stream) = args;
+    match capture {
+        Some(capture) => capture.run(active, stream, |observer| {
+            execute(session, Some(observer), context)
+        }),
+        None => execute(session, observer, context),
+    }
+}
+
 /// Both actual native projections and validated source custody survive recovery.
 /// The recipe is lent independently to the same native layout and bank compiler.
 struct Payload {
-    addressable:Option<AddressableModelSource>,
+    parallel_funding: HostMetadataFunding,
+    addressable: Option<AddressableModelSource>,
     completion: Option<NestedCompletionOwner>,
     capture: Option<super::capture::Capture>,
     _report: InferenceWorkspaceReport,
@@ -169,12 +207,23 @@ where
             }
         }),
         |quote_context, storage, prepared| {
-            crate::composition::mlx::speculative::validate_registered_tensor_inputs(context, storage[1])?;
+            crate::composition::mlx::speculative::validate_registered_tensor_inputs(
+                context, storage[1],
+            )?;
             let prior = super::prediction::priors(evidence.evidence(), context, funding)?;
-            SourceBindings::prepare(quote_context, storage, prepared, &prior, environment, funding, host)
-                .map_err(|cause| sources.retain_error(cause))
+            SourceBindings::prepare(
+                quote_context,
+                storage,
+                prepared,
+                &prior,
+                environment,
+                funding,
+                host,
+            )
+            .map_err(|cause| sources.retain_error(cause))
         },
-    ).map_err(|cause| sources.retain_error(cause))?
+    )
+    .map_err(|cause| sources.retain_error(cause))?
     .into_parts();
     let frames = [
         size_of::<Payload>(),
@@ -186,7 +235,7 @@ where
         size_of::<Option<OriginalEmbeddedSpeculativeRole>>(),
         size_of::<binding::Binding<'_>>(),
         size_of::<safemlx::StreamCopyPlan<HostMetadataFunding>>(),
-        size_of::<Result<safemlx::StreamCopyPlan<HostMetadataFunding>,safemlx::StreamCopyCause>>(),
+        size_of::<Result<safemlx::StreamCopyPlan<HostMetadataFunding>, safemlx::StreamCopyCause>>(),
     ];
     funding
         .reserve_metadata(
@@ -203,22 +252,41 @@ where
             cause: WorkingMemoryError::UnknownBound,
         }));
     }
-    let completion_roots=parts.completion_roots;
-    let validation_roots=parts.recipe.record().validation_roots()
-        .ok_or_else(||sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
-    let completion_capacity=completion_roots.checked_add(validation_roots)
-        .filter(|n|*n!=0).ok_or_else(||sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
-    let mut completion_distribution=funding.metadata_vec(1).map_err(Error::from)?;
+    let completion_roots = parts.completion_roots;
+    let validation_roots = parts
+        .recipe
+        .record()
+        .validation_roots()
+        .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
+    let completion_capacity = completion_roots
+        .checked_add(validation_roots)
+        .filter(|n| *n != 0)
+        .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
+    let mut completion_distribution = funding.metadata_vec(1).map_err(Error::from)?;
     completion_distribution.push(completion_capacity);
-    parts.recipe.bind_target_completion(completion_distribution).map_err(|cause|sources.retain_error(cause))?;
-    let completion_stream=safemlx::StreamCopyPlan::<HostMetadataFunding>::capture(environment.stream())
-        .map_err(|cause|sources.retain_startup_error(cause))?;
-    let completion_controls=NestedCompletionOwner::control_bytes(completion_roots,validation_roots,&completion_stream)
-        .and_then(|n|n.checked_add(size_of::<(Option<&MlxTensor>,&S,
-            Option<&eredu_runtime::media_prefill::RetainedMediaRoots<'_,MlxTensor>>,
-            &Stream,&mut dyn FnMut(&MlxTensor))>()))
-        .and_then(|n|u64::try_from(n).ok())
-        .ok_or_else(||sources.retain_startup_error(WorkingMemoryError::Overflow))?;
+    parts
+        .recipe
+        .bind_target_completion(completion_distribution)
+        .map_err(|cause| sources.retain_error(cause))?;
+    let completion_stream =
+        safemlx::StreamCopyPlan::<HostMetadataFunding>::capture(environment.stream())
+            .map_err(|cause| sources.retain_startup_error(cause))?;
+    let completion_controls = NestedCompletionOwner::control_bytes(
+        completion_roots,
+        validation_roots,
+        &completion_stream,
+    )
+    .and_then(|n| {
+        n.checked_add(size_of::<(
+            Option<&MlxTensor>,
+            &S,
+            Option<&eredu_runtime::media_prefill::RetainedMediaRoots<'_, MlxTensor>>,
+            &Stream,
+            &mut dyn FnMut(&MlxTensor),
+        )>())
+    })
+    .and_then(|n| u64::try_from(n).ok())
+    .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::Overflow))?;
     let (bank_controls, source_facts) =
         MlxReplicatedTextMechanisms::<A, S>::bind_session_embedded_neural_recipe(
             session,
@@ -226,13 +294,42 @@ where
             environment.pool(),
             funding,
             &mut parts.recipe,
-        ).map_err(|cause|sources.retain_error(cause))?;
+        )
+        .map_err(|cause| sources.retain_error(cause))?;
     // Tokens were produced and admitted by their exact input/numerical source.
     // This target invocation creates no input upload or auxiliary input graph.
-    let (addressable,source_facts,addressable_controls)=AddressableModelSource::prepare(
-        parts.recipe.native_recipe().records(),source_facts,funding)?;
-    let layout = EmbeddedNativeLayout::inspect(&parts.recipe, environment, 0, 0)
-        .map_err(|cause| sources.retain_startup_error(cause))?;
+    let (addressable, source_facts, addressable_controls) = AddressableModelSource::prepare(
+        parts.recipe.native_recipe().records(),
+        source_facts,
+        funding,
+    )?;
+    let model_control =
+        MlxReplicatedTextMechanisms::<A, S>::prepare_session_embedded_model_control(
+            session,
+            parts.recipe.native_recipe(),
+            sources.model_control_source(),
+            funding,
+        )?;
+    let parallel_controls =
+        MlxReplicatedTextMechanisms::<A, S>::session_embedded_parallel_control_bytes::<
+            D,
+            ParallelArguments<'_, '_, '_, F>,
+            R,
+        >(session)
+        .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::Overflow))?;
+    let parallel_funding =
+        crate::backend::submission_recovery::addressable::prepare_wrapper_funding(
+            parallel_controls,
+            funding,
+        )?;
+    let layout = EmbeddedNativeLayout::inspect_with_model_control(
+        &parts.recipe,
+        environment,
+        0,
+        0,
+        model_control,
+    )
+    .map_err(|cause| sources.retain_startup_error(cause))?;
     let TargetEquationQuoteParts {
         report,
         capture: capture_population,
@@ -246,6 +343,7 @@ where
         funding: quote_funding,
     } = parts;
     let mut payload = Payload {
+        parallel_funding,
         addressable,
         completion: None,
         capture: None,
@@ -260,9 +358,16 @@ where
     let mut work = (session, evidence, None, Some(execute), None);
     let bind = |work: &mut Work<'_, '_, 'observer, A, S, D, F>,
                 payload: &Payload,
-                scope: &SubmissionScope| {
-        let mut partition=|root|payload.addressable.as_ref().ok_or(Error::PrefillScopeUnavailable)?.accept(root);
-        let bank=MlxReplicatedTextMechanisms::<A, S>::prepare_session_embedded_neural_bank(
+                scope: &SubmissionScope,
+                materialized: OriginalMaterializedLoan<'_>| {
+        let mut partition = |root| {
+            payload
+                .addressable
+                .as_ref()
+                .ok_or(Error::PrefillScopeUnavailable)?
+                .accept(root)
+        };
+        let bank = MlxReplicatedTextMechanisms::<A, S>::prepare_session_embedded_neural_bank(
             work.0,
             payload.layerwise.as_ref(),
             &recipe,
@@ -270,18 +375,26 @@ where
                 .as_ref()
                 .ok_or(Error::PrefillScopeUnavailable)?
                 .clone(),
-            scope,payload.addressable.is_some().then_some(&mut partition),
+            scope,
+            payload.addressable.is_some().then_some(&mut partition),
+            Some(materialized),
         )?;
-        if let Some(source)=payload.addressable.as_ref(){source.bind(bank.as_ref().ok_or(Error::PrefillScopeUnavailable)?)?;}
+        if let Some(source) = payload.addressable.as_ref() {
+            source.bind(bank.as_ref().ok_or(Error::PrefillScopeUnavailable)?)?;
+        }
         Ok(bank)
     };
     let execute_handler = |work: &mut Work<'_, '_, 'observer, A, S, D, F>,
-               payload: &Payload,
-               active: &ActiveEmbeddedNativeInvocation<'_>| {
+                           payload: &Payload,
+                           active: &ActiveEmbeddedNativeInvocation<'_>| {
         active.begin_equation()?;
-        let completion=payload.completion.as_ref().ok_or(Error::PrefillScopeUnavailable)?;
-        let (projection, activation)=completion.activate(active.role(),active.observer(),environment.stream())?;
-        MlxReplicatedTextMechanisms::<A,S>::install_session_nested_completion(work.0,projection)?;
+        let completion = payload
+            .completion
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        let (projection, activation) =
+            completion.activate(active.role(), active.observer(), environment.stream())?;
+        MlxReplicatedTextMechanisms::<A, S>::install_session_nested_completion(work.0, projection)?;
         let binding = binding::Binding {
             active,
             sources,
@@ -291,14 +404,22 @@ where
         };
         let execution = context.with_embedded_invocation(&binding)?;
         let execute = work.3.take().ok_or(Error::PrefillScopeReentrant)?;
-        let output = match &payload.capture {
-            Some(capture) => capture.run(active, environment.stream(), |observer| {
-                execute(work.0, Some(observer), execution)
-            }),
-            None => execute(work.0, work.2.take(), execution),
-        };
+        let output = MlxReplicatedTextMechanisms::<A, S>::with_session_embedded_parallel(
+            work.0,
+            active.parallel_projection(),
+            &payload.parallel_funding,
+            (
+                execute,
+                work.2.take(),
+                execution,
+                payload.capture.as_ref(),
+                active,
+                environment.stream(),
+            ),
+            execute_parallel::<A, S, D, R, F>,
+        );
         drop(activation);
-        let output=output?;
+        let output = output?;
         completion.validate_complete()?;
         active.complete(|visitor| {
             visit_roots(work.0, &output, visitor)?;
@@ -309,12 +430,15 @@ where
         })?;
         Ok(output)
     };
-    let addressable_callbacks=AddressableModelSource::callback_controls::<_,Payload,_,R,_>(&execute_handler)
-        .ok_or_else(||sources.retain_startup_error(WorkingMemoryError::Overflow))?;
-    let run=|work:&mut Work<'_, '_, 'observer,A,S,D,F>,payload:&Payload,active:&ActiveEmbeddedNativeInvocation<'_>| {
-        match payload.addressable.as_ref(){
-            Some(source)=>source.run(work,payload,active,execute_handler),
-            None=>execute_handler(work,payload,active),
+    let addressable_callbacks =
+        AddressableModelSource::callback_controls::<_, Payload, _, R, _>(&execute_handler)
+            .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::Overflow))?;
+    let run = |work: &mut Work<'_, '_, 'observer, A, S, D, F>,
+               payload: &Payload,
+               active: &ActiveEmbeddedNativeInvocation<'_>| {
+        match payload.addressable.as_ref() {
+            Some(source) => source.run(work, payload, active, execute_handler),
+            None => execute_handler(work, payload, active),
         }
     };
     let publish = |work: &mut Work<'_, '_, 'observer, A, S, D, F>,
@@ -366,7 +490,12 @@ where
                     n.checked_add(size_of::<(
                         F,
                         SpeculativeExecutionStreams<'_>,
-                        &mut ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
+                        &mut ReplicatedTextSession<
+                            A,
+                            MlxNeuralBackend,
+                            MlxReplicatedTextMechanisms<A, S>,
+                            D,
+                        >,
                         &mut dyn ActivationObserver<MlxTensor, eredu_nn::Error>,
                     )>())
                 })
@@ -387,14 +516,17 @@ where
     .and_then(|n| n.checked_add(bank_controls))
     .and_then(|n| n.checked_add(completion_controls))
     .and_then(|n| n.checked_add(capture_controls))
-    .and_then(|n|n.checked_add(addressable_controls))
-    .and_then(|n|n.checked_add(addressable_callbacks));
+    .and_then(|n| n.checked_add(addressable_controls))
+    .and_then(|n| n.checked_add(addressable_callbacks));
     let requirements = SpeculativeInvocationRequirements::new(
         recipe.plan(),
         layout.physical_bytes(),
         Some(layout.graph_bytes()),
         Some(layout.record_bytes()),
         controls,
+        environment
+            .buffer_placement()
+            .map_err(|cause| sources.retain_startup_error(cause))?,
     )
     .map_err(|cause| sources.retain_startup_error(cause))?;
     let requirements = match source_facts {
@@ -432,8 +564,16 @@ where
         ),
         _ => return Err(sources.retain_startup_error(WorkingMemoryError::IdentityMismatch)),
     };
-    payload.completion=Some(NestedCompletionOwner::prepare(completion_roots,validation_roots,
-        &role,funding,completion_stream).map_err(|cause|sources.retain_error(cause))?);
+    payload.completion = Some(
+        NestedCompletionOwner::prepare(
+            completion_roots,
+            validation_roots,
+            &role,
+            funding,
+            completion_stream,
+        )
+        .map_err(|cause| sources.retain_error(cause))?,
+    );
     payload.capture = capture_owner
         .as_ref()
         .map(|owner| {
@@ -444,13 +584,15 @@ where
                 capture_edits.into_inner(),
             )
         })
-        .transpose().map_err(|cause|sources.retain_error(cause))?;
+        .transpose()
+        .map_err(|cause| sources.retain_error(cause))?;
     work.4 = Some(role.clone());
     let (roots, _) = sources.numerical_prerequisites();
     let result = layout.run(
         &recipe,
         environment,
         roots,
+        sources.request(),
         role,
         payload,
         funding.clone(),

@@ -9,7 +9,7 @@ fn total_holds(holds: &[u64]) -> Result<u64, WorkingMemoryError> {
         sum.checked_add(*n).ok_or(WorkingMemoryError::Overflow)
     })
 }
-fn host_scope(pool: &WorkingMemoryPool, id: u64, held: u64) -> WorkingMemoryDecoderHostScope {
+fn host_scope(pool: &MemoryLedger, id: u64, held: u64) -> WorkingMemoryDecoderHostScope {
     WorkingMemoryDecoderHostScope {
         scope: Some(WorkingMemoryFundingScope {
             purpose: ScopePurpose::Host,
@@ -19,14 +19,16 @@ fn host_scope(pool: &WorkingMemoryPool, id: u64, held: u64) -> WorkingMemoryDeco
             borrowed_storage: None,
             capture_source: None,
             native_publication_identity: None,
+            allocation_funding: None,
         }),
         held,
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     // Only actual typed group plans can call this private numeric bridge. Every
     // source origin is checked with all holds before the one account commit.
+    #[cfg(test)]
     pub(in crate::working_memory) fn open_grouped_text_components_account<
         K: Ord + Send + 'static,
     >(
@@ -39,9 +41,9 @@ impl WorkingMemoryPool {
         complete_source: &WorkingMemoryStorage<K>,
         pin: RegisteredStoragePin,
         destination: &InferenceExecutionIdentity,
-        bytes: u64,
+        requirements: &eredu_core::DomainMemoryRequirements,
         sampler_hold: u64,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<
         (
             WorkingMemoryFundingRun,
@@ -51,7 +53,7 @@ impl WorkingMemoryPool {
         ),
         WorkingMemoryError,
     > {
-        if !self.same_domain(sampler.pool()) || decoders.len() != holds.len() {
+        if !self.same_ledger(sampler.pool()) || decoders.len() != holds.len() {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let decoder = total_holds(holds)?;
@@ -61,32 +63,32 @@ impl WorkingMemoryPool {
             holds.len(),
             complete_source.source_preparation().is_some(),
         )?;
-        let mut node = Some(AccountNode::empty());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        sampler.validate(&usage, sampler_execution)?;
-        for source in decoders {
-            source.validate(self, &usage)?;
-        }
-        operands.validate_copy_source(self, &usage)?;
-        complete_source.validate_copy_source(self, &usage)?;
-        let id = commit_copy_account(
+        let declarations = capacity.named(self.topology())?;
+        let accepted = PreparedCopyAccount::accept(
             self,
-            &mut usage,
-            &mut node,
             destination,
-            bytes,
-            capacity,
+            crate::working_memory::transaction_buffers::RequirementProjection {
+                parts: &[requirements],
+                headroom: &eredu_core::MemoryHeadroomDeclarations::none(),
+                host_bytes: 0,
+            },
+            &declarations,
+            0,
             CopyHostHolds::Grouped {
                 sampler: sampler_hold,
                 decoder,
                 tables: holds.len(),
             },
+            |usage| {
+                sampler.validate(usage, sampler_execution)?;
+                for source in decoders {
+                    source.validate(self, usage)?;
+                }
+                operands.validate_copy_source(self, usage)?;
+                complete_source.validate_copy_source(self, usage)
+            },
         )?;
-        drop(usage);
+        let (_, id, _) = accepted.finish(destination)?;
         for &held in holds {
             scopes.push(host_scope(self, id, held));
         }
@@ -107,6 +109,7 @@ impl WorkingMemoryPool {
                     borrowed_storage: None,
                     capture_source: None,
                     native_publication_identity: None,
+                    allocation_funding: None,
                 }),
                 held: sampler_hold,
             },
@@ -119,6 +122,7 @@ impl WorkingMemoryPool {
                 borrowed_storage: Some(pin),
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }
@@ -143,7 +147,7 @@ impl WorkingMemoryFundingRun {
         WorkingMemoryError,
     > {
         if reservation.0.funding != Some(self.id)
-            || !self.pool.same_domain(&reservation.0.pool)
+            || !self.pool.same_ledger(&reservation.0.pool)
             || sources.len() != holds.len()
         {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -193,7 +197,8 @@ impl WorkingMemoryFundingRun {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: self.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -221,6 +226,7 @@ impl WorkingMemoryFundingRun {
                 borrowed_storage: Some(pins),
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }

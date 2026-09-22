@@ -42,10 +42,13 @@ pub(crate) fn joint_selection(
     let all_logits = compute(concatenate_axis(&[selected_logits, always_on], -1, context))?;
     let coefficients = compute(nn::log_sigmoid(all_logits, context))?;
     let coefficients = compute(softmax_axis(coefficients, -1, true, context))?;
-    let coefficients = compute(coefficients.multiply(
-        Array::try_from_f32(input.coefficient_scale()).map_err(ComputeError::backend_retained_source)?,
-        context,
-    ))?;
+    let coefficients = compute(
+        coefficients.multiply(
+            Array::try_from_f32(input.coefficient_scale())
+                .map_err(ComputeError::backend_retained_source)?,
+            context,
+        ),
+    )?;
     let coefficients = compute(coefficients.multiply(input.global_scale().as_array(), context))?;
     let primary_coefficients =
         compute(coefficients.try_index_device((.., ..input.top_k()), context))?;
@@ -61,6 +64,15 @@ pub(crate) fn joint_selection(
 /// Every returned native wrapper in the selected equation, including both
 /// log-sigmoid negatives and its integer zero, is independently retained.
 pub(crate) fn joint_selection_control_bytes() -> Option<usize> {
+    joint_selection_ordinary_frame_bytes()?
+        .checked_add(std::mem::size_of::<[usize; 2]>())?
+        .checked_add(safemlx::ops::concatenate_axis_control_bytes()?)?
+        .checked_add(safemlx::OriginalScopeObserver::control_bytes()?)
+}
+
+/// Fixed Rust frames and inline arguments of the shared joint equation. Safe
+/// operator wrappers, native graph controls and completion remain separate.
+pub(crate) fn joint_selection_ordinary_frame_bytes() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     let frames = [
         size_of::<JointGroupSelectionInput<'_, MlxTensor>>() * 2,
@@ -75,8 +87,6 @@ pub(crate) fn joint_selection_control_bytes() -> Option<usize> {
         size_of::<Array>() * 21,
         size_of::<Result<Array, Exception>>() * 21,
         size_of::<Result<Array, ComputeError>>() * 17,
-        safemlx::ops::concatenate_axis_control_bytes()?,
-        safemlx::OriginalScopeObserver::control_bytes()?,
     ];
     frames
         .into_iter()

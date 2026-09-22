@@ -94,7 +94,7 @@ impl OriginalExpertMovementSource {
             recipe.completion.nested_traversal().and_then(|value|value.query_control_bytes()).ok_or_else(overflow)?,
             safemlx::OperationEvent::traversal_leaf_control_bytes().ok_or_else(overflow)?])?;
         let completion=NestedRootCompletion::prepare_metadata(1,recipe.completion.validation_roots,c.raw.clone().into(),&c.funding)?;
-        let collector=PreparedTokenChild::prepare(recipe.completion,&owner.controls,&source.parent,&c.funding)?;
+        let collector=PreparedTokenChild::prepare_metadata(recipe.completion,c.raw.clone(),&source.parent,&c.funding)?;
         let plan=StreamCopyPlan::<Custody>::capture(stream).map_err(|_|fail())?;
         reserve(&c.funding,&[plan.control_bytes().ok_or_else(overflow)?,plan.native_wrapper_bytes(),plan.owner_node_layout().size(),
             Layout::new::<[usize;2]>().extend(plan.shared_body_layout()).map_err(|_|overflow())?.0.pad_to_align().size()])?;
@@ -104,7 +104,7 @@ impl OriginalExpertMovementSource {
         let child=Movement{inputs,completion:RefCell::new(completion),collector,source:self.clone(),
             stream:selected,kind,recipe,custody:c.clone()};
         let result=run_native_role_with_pipeline(child,AgreementCapacity{graph:capacity.graph,records:capacity.records,backing:capacity.backing},
-            Some(safemlx::PreparedPipelineCachePlan::new(recipe.kernels)),&owner.bank,&owner.controls,c,
+            Some(safemlx::PreparedPipelineCachePlan::new(recipe.kernels)),&owner.native,c,
             |child,observer|Ok(child.execute(observer)))
             .map_err(|cause|Error::with_original_control_source(cause,false))?;
         if result.is_err(){owner.failed.set(true);}

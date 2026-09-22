@@ -15,7 +15,7 @@ autoexamples = false
 include = [
     "src/**",
     "tests/**",
-    "examples/*.rs",
+    "examples/**",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",

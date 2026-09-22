@@ -72,6 +72,7 @@ pub(in super::super) struct CacheManagerState {
     pub(in super::super) lifecycle: CacheBlockLifecycle,
     pub(in super::super) blocks: CacheRecordTable<CacheBlockId, CacheBlockRecord>,
     pub(in super::super) history_retentions: Vec<Weak<CacheHistoryRetention>>,
+    pub(super) prepared_history: Option<super::history::CacheHistoryNode>,
     pub(in super::super) host_write_reservations:
         CacheRecordTable<CacheIoOperationKey, HostWriteReservation>,
     pub(in super::super) retiring_host_demotions: HashMap<u64, RetiringHostDemotion>,
@@ -105,6 +106,7 @@ impl CacheManagerState {
             lifecycle: CacheBlockLifecycle::new(),
             blocks: eredu_runtime::cache::CacheRecordTable::new(),
             history_retentions: Vec::new(),
+            prepared_history: None,
             host_write_reservations: CacheRecordTable::new(),
             retiring_host_demotions: HashMap::new(),
             retiring_disk_reads: HashMap::new(),
@@ -138,6 +140,7 @@ pub(super) struct CacheResidencyManagerInner {
     pub(super) host_demotion_worker: Arc<HostDemotionWorker>,
     pub(super) disk_worker: Option<Arc<DiskWorker>>,
     pub(super) pool_membership: Arc<CachePoolMembership>,
+    pub(super) transfer_stream: Mutex<Option<PreparedCacheTransferStream>>,
     // Both canonical state and worker aliases retire before construction H.
     pub(super) _metadata_funding: Option<eredu_nn::workspace::HostMetadataFunding>,
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::PreparedChatGenerationSettings;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 
 #[test]
 fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_budget() {
@@ -44,14 +45,17 @@ fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_
             .compile_managed_chat_source(&tokenizer, template_file, false, &cancellation)
             .unwrap()
             .unwrap();
-        let cold = pool.used_bytes().unwrap();
+        let cold = pool.live_charge_bytes().unwrap();
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(3),
                 ..Default::default()
             },
             inference: TextInferencePolicy {
-                managed_memory_capacity_bytes: Some(u64::MAX),
+                memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(u64::MAX),
+                )]),
                 ..Default::default()
             },
             ..Default::default()
@@ -95,29 +99,40 @@ fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_
                 .checked_add(u64::try_from(settings.overrides.max_new_tokens.unwrap()).unwrap())
                 .unwrap(),
         );
-        assert!(
-            model
-                .prepare_chat(&source, &chat, 1, &cancellation)
-                .is_err()
-        );
+        assert!(model
+            .prepare_chat(
+                &source,
+                &chat,
+                &crate::memory_fixture::limits(1),
+                &cancellation
+            )
+            .is_err());
         assert_eq!(facts.borrow().chat_renders, 0);
         assert_eq!(facts.borrow().encodes, 0);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.live_charge_bytes().unwrap(), cold);
 
         let cancelled = GenerationCancellationToken::new();
         cancelled.cancel();
-        assert!(
-            model
-                .prepare_chat(&source, &chat, u64::MAX, &cancelled)
-                .unwrap()
-                .is_none()
-        );
+        assert!(model
+            .prepare_chat(
+                &source,
+                &chat,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancelled
+            )
+            .unwrap()
+            .is_none());
         assert_eq!(facts.borrow().chat_renders, 0);
         model.set_chat_template(Some(eredu_text::tokenizer::ModelChatTemplate::Single(
             "changed".into(),
         )));
         let error = model
-            .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &chat,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap_err();
         assert_eq!(
             error.input_rejection(),
@@ -131,52 +146,62 @@ fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_
         reasoning.enable_thinking = Some(true);
         reasoning.allow_unparsed_reasoning = false;
         let error = model
-            .prepare_chat(&source, &reasoning, u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &reasoning,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap_err();
         assert_eq!(facts.borrow().encodes, 0);
         assert!(!facts.borrow().order.contains(&"submit"));
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.live_charge_bytes().unwrap(), cold);
 
         let prepared = model
-            .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &chat,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap()
             .unwrap();
-        let prepared_bytes = pool.used_bytes().unwrap();
+        let prepared_bytes = pool.live_charge_bytes().unwrap();
         assert!(prepared_bytes > cold);
-        assert!(
-            model
-                .start_prepared_chat(literal_request(&prepared, settings), &cancelled)
-                .unwrap()
-                .is_none()
-        );
+        assert!(model
+            .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancelled)
+            .unwrap()
+            .is_none());
         assert_eq!(facts.borrow().encodes, 0);
         model.set_chat_template(Some(eredu_text::tokenizer::ModelChatTemplate::Single(
             "changed".into(),
         )));
-        let error =
-            match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation) {
-                Err(error) => error,
-                Ok(_) => panic!("changed template must reject at execution too"),
-            };
+        let error = match model
+            .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("changed template must reject at execution too"),
+        };
         assert_eq!(
             error.input_rejection(),
             Some(TokenInputRejection::IdentityMismatch)
         );
         drop(error);
         model.set_chat_template(Some(selected));
-        assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+        assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
 
         facts.borrow_mut().short = true;
-        let error =
-            match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation) {
-                Err(error) => error,
-                Ok(_) => panic!("exact request one-short admission must refuse"),
-            };
-        assert!(pool.used_bytes().unwrap() > prepared_bytes);
+        let error = match model
+            .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("exact request one-short admission must refuse"),
+        };
+        assert!(pool.live_charge_bytes().unwrap() > prepared_bytes);
         assert!(!facts.borrow().order.contains(&"submit"));
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+        assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
         facts.borrow_mut().short = false;
         facts.borrow_mut().ids.clear();
 
@@ -187,7 +212,7 @@ fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_
             }
         };
         let mut session = model
-            .start_prepared_chat(literal_request(&prepared, settings), &cancellation)
+            .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
             .unwrap()
             .unwrap();
         let output = if manual {
@@ -210,11 +235,11 @@ fn public_prepared_chat_shares_cursor_authenticates_templates_and_retains_early_
         previous = Some((visible, output.token_ids.as_ref().to_vec()));
         drop((prepared, source, tokenizer, model));
         assert!(
-            pool.used_bytes().unwrap() > 0,
+            pool.live_charge_bytes().unwrap() > 0,
             "terminal token output retains original owners"
         );
         assert_eq!(output.token_ids.as_ref(), &[0, 8, 0]);
         drop(output);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

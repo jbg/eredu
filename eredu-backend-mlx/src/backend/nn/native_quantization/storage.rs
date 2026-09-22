@@ -553,7 +553,7 @@ impl NativeQuantizedTensor {
             vec![self.matrix_count, self.rows, self.columns]
         };
         let dense = Array::try_from_slice(&values, &shape)?.copy(stream)?;
-        eval([&dense])?;
+        crate::backend::runtime::cache::complete_values([&dense], stream)?;
         Ok(dense)
     }
 
@@ -652,3 +652,5 @@ impl NativeQuantizedTensor {
         Array::try_from_slice(&output, &shape)?.copy(stream)
     }
 }
+
+mod dequantize_layout;

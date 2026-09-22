@@ -28,7 +28,6 @@ where
                     &CaptureCapabilities {
                         transformations: vec![],
                         max_histogram_bins: 0,
-                        physical_native_limit: false,
                         conditions: vec![],
                     },
                     CaptureRequestShape {

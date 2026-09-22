@@ -44,6 +44,8 @@ pub(super) struct Structure {
 pub(super) struct Population {
     pub structure: Structure,
     pub bytes: u64,
+    pub default_bytes: u64,
+    pub default_births: usize,
     pub state: u64,
     pub output: u64,
 }
@@ -52,6 +54,8 @@ struct Counter {
     allocation: Option<NativeAllocationFacts>,
     p: Structure,
     bytes: u64,
+    default_bytes: u64,
+    default_births: usize,
 }
 struct Outputs {
     first: Option<Value>,
@@ -68,6 +72,11 @@ fn checked(a: usize, b: usize) -> FactResult<usize> {
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)
 }
 impl Counter {
+    fn default_scalar(&mut self) -> FactResult<()> {
+        self.default_bytes = add(self.default_bytes, self.capacity(Value::new(&[])?)?)?;
+        self.default_births = checked(self.default_births, 1)?;
+        Ok(())
+    }
     fn capacity(&self, value: Value) -> FactResult<u64> {
         self.allocation.map_or(Ok(0), |allocation| {
             buffer_capacity(allocation, mul(value.elements()?, 4)?)
@@ -123,10 +132,12 @@ impl Worker for Counter {
         self.record(*input, 1, 1, 0, 0, self.capacity(*input)?)
     }
     fn scalar(&mut self, _: f32) -> FactResult<Value> {
+        self.default_scalar()?;
         let value = Value::new(&[])?;
         self.record(value, 0, 0, 1, 0, self.capacity(value)?)
     }
     fn zeros(&mut self, shape: &[i32]) -> FactResult<Value> {
+        self.default_scalar()?;
         let value = Value::new(shape)?;
         // Existing scalar initialization envelope: both fill/copy candidates
         // plus the eager scalar; no alias/donation credit.
@@ -196,6 +207,7 @@ impl Worker for Counter {
         self.record(output, 2, 2, 0, 0, self.capacity(output)?)
     }
     fn softplus(&mut self, input: &Value) -> FactResult<Value> {
+        self.default_scalar()?;
         // layers::softplus is logaddexp(x, eager I32 zero), not beta-softplus.
         // The same floating binary worker casts/broadcasts both arguments.
         let scalar = self.capacity(Value::new(&[])?)?;
@@ -332,6 +344,8 @@ fn inspect_inner(
             ..Structure::default()
         },
         bytes: 0,
+        default_bytes: 0,
+        default_births: 0,
     };
     let (state, output) = scan::run(input, geometry, &mut counter)?;
     let state = counter.capacity(state)?;
@@ -345,6 +359,8 @@ fn inspect_inner(
     Ok(Some(Population {
         structure: counter.p,
         bytes: counter.bytes,
+        default_bytes: counter.default_bytes,
+        default_births: counter.default_births,
         state,
         output,
     }))
@@ -365,6 +381,7 @@ pub(super) fn emit(
     let Some(p) = inspect_inner(operation, Some(allocation))? else {
         return Ok(None);
     };
+    sink.default_scratch(p.default_bytes, p.default_births)?;
     sink.output(Output::Allocate(p.state))?;
     sink.output(Output::Allocate(p.output))?;
     let scratch = p

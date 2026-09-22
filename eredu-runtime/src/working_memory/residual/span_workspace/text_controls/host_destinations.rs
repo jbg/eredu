@@ -7,8 +7,9 @@ mod metadata;
 pub use metadata::{OriginalHostMetadataCustody, OriginalHostMetadataVec};
 mod source;
 pub use source::{
-    HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError, OriginalHostSourceBank, OriginalHostSourceConstruction,
-    OriginalHostSourceError, OriginalHostSourceFailure, OriginalHostSourceFailureCause,
+    HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceBank,
+    OriginalHostSourceConstruction, OriginalHostSourceError, OriginalHostSourceFailure,
+    OriginalHostSourceFailureCause, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError,
     OriginalHostSourceReceipt, OriginalHostSourceRefusal,
 };
 pub use source::{
@@ -272,18 +273,28 @@ impl OriginalHostDestinationBank {
     // Paired move used only by the original prefill source handoff. Empty
     // wrapper recreation carries zero vector capacity and the accepted account.
     pub(super) fn restore_source_component(
-        bank: &mut Option<Self>, source: &mut Option<OriginalHostSourceBank>,
-        expected: HostSourceConstructionFacts, remaining: Option<HostDestinationFacts>,
-        controls: &OriginalTextControlGuard, reservation: &WorkingMemoryReservation,
+        bank: &mut Option<Self>,
+        source: &mut Option<OriginalHostSourceBank>,
+        expected: HostSourceConstructionFacts,
+        remaining: Option<HostDestinationFacts>,
+        controls: &OriginalTextControlGuard,
+        reservation: &WorkingMemoryReservation,
     ) -> Result<HostDestinationFacts, WorkingMemoryError> {
         controls.validate_reservation(reservation)?;
-        let actual = source.as_ref().ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let actual = source
+            .as_ref()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if !actual.belongs_to(controls) || !actual.matches_facts(expected) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let facts = match (bank.as_ref(), remaining) {
-            (Some(bank), Some(facts)) if bank.belongs_to(controls) && bank.matches_facts(facts)
-                && facts.source_constructions().is_none() => facts,
+            (Some(bank), Some(facts))
+                if bank.belongs_to(controls)
+                    && bank.matches_facts(facts)
+                    && facts.source_constructions().is_none() =>
+            {
+                facts
+            }
             (None, None) => HostDestinationFacts::new(0, 0)?,
             _ => return Err(WorkingMemoryError::IdentityMismatch),
         };
@@ -292,8 +303,16 @@ impl OriginalHostDestinationBank {
         let actual = source.take().expect("validated original source component");
         match bank {
             Some(bank) => bank.sources = Some(actual),
-            None => *bank = Some(Self { sources: Some(actual), remaining: 0, attempts: 0,
-                partitions: 0, reservation: reservation.clone(), controls: controls.clone() }),
+            None => {
+                *bank = Some(Self {
+                    sources: Some(actual),
+                    remaining: 0,
+                    attempts: 0,
+                    partitions: 0,
+                    reservation: reservation.clone(),
+                    controls: controls.clone(),
+                })
+            }
         }
         Ok(restored)
     }
@@ -613,11 +632,26 @@ impl<T> std::error::Error for OriginalHostVecError<T> {
 impl PreparedTextControlWorkspace {
     /// Price a separately owned finite immutable-output source component before
     /// acceptance. It does not split or replace a cache/Host source allowance.
-    pub fn with_output_source_constructions(mut self, facts: HostSourceConstructionFacts) -> Result<Self, WorkingMemoryError> {
-        if !qualified_storage::qualified() { return Err(WorkingMemoryError::UnknownBound); }
-        if self.binding.output_sources.is_some() { return Err(WorkingMemoryError::AlreadyStarted); }
-        self.binding.facts.work = self.binding.facts.work
-            .map(|bytes| bytes.checked_add(facts.protected_bytes()).ok_or(WorkingMemoryError::Overflow)).transpose()?;
+    pub fn with_output_source_constructions(
+        mut self,
+        facts: HostSourceConstructionFacts,
+    ) -> Result<Self, WorkingMemoryError> {
+        if !qualified_storage::qualified() {
+            return Err(WorkingMemoryError::UnknownBound);
+        }
+        if self.binding.output_sources.is_some() {
+            return Err(WorkingMemoryError::AlreadyStarted);
+        }
+        self.binding.facts.work = self
+            .binding
+            .facts
+            .work
+            .map(|bytes| {
+                bytes
+                    .checked_add(facts.protected_bytes())
+                    .ok_or(WorkingMemoryError::Overflow)
+            })
+            .transpose()?;
         self.binding.output_sources = Some(facts);
         Ok(self)
     }
@@ -625,12 +659,23 @@ impl PreparedTextControlWorkspace {
 impl OwnedTextSpanWorkspace {
     /// Consume the independent immutable-output source bank once. Custody aliases
     /// and saved model state cannot recreate the bank or refund its attempts.
-    pub fn take_output_source_constructions(&mut self) -> Result<Option<OriginalHostSourceBank>, WorkingMemoryError> {
-        let facts = self.workspace().control_binding().ok_or(WorkingMemoryError::IdentityMismatch)?.output_sources;
-        let Some(facts) = facts else { return Ok(None); };
-        if self.output_sources_taken { return Err(WorkingMemoryError::AlreadyStarted); }
+    pub fn take_output_source_constructions(
+        &mut self,
+    ) -> Result<Option<OriginalHostSourceBank>, WorkingMemoryError> {
+        let facts = self
+            .workspace()
+            .control_binding()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?
+            .output_sources;
+        let Some(facts) = facts else {
+            return Ok(None);
+        };
+        if self.output_sources_taken {
+            return Err(WorkingMemoryError::AlreadyStarted);
+        }
         self.controls.validate_reservation(self.reservation())?;
-        let bank = OriginalHostSourceBank::new(facts, self.reservation().clone(), self.controls.clone());
+        let bank =
+            OriginalHostSourceBank::new(facts, self.reservation().clone(), self.controls.clone());
         self.output_sources_taken = true;
         Ok(Some(bank))
     }

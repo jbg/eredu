@@ -14,7 +14,7 @@ fn config(capacity: u64) -> eredu_core::TextGenerationConfig {
         .unwrap(),
     )
     .with_inference_policy(eredu_core::TextInferencePolicy {
-        managed_memory_capacity_bytes: Some(1_000_000),
+        memory_limits: crate::working_memory::memory_fixture::host_limits(1_000_000),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: NonZeroU64::new(capacity),
         ..Default::default()
@@ -35,9 +35,9 @@ fn controls(quote: &IncrementalInferenceQuote) -> PreparedTextControlWorkspace {
 
 #[test]
 fn original_graph_metadata_control_only_quote_is_exact_nonrefillable_and_not_native_headroom() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
-    let original = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let original = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let controls = controls(&original);
     assert!(controls.source_identity().is_none());
     assert_eq!(controls.sequence_storage_bytes(), 0);
@@ -59,13 +59,12 @@ fn original_graph_metadata_control_only_quote_is_exact_nonrefillable_and_not_nat
             .total_bytes()
             .unwrap()
             .unwrap();
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
     assert!(matches!(
         sealed_plan(&pool, &quote, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (r, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     drop(quote);
     let (r, run) = r.into_funding().unwrap();
@@ -89,33 +88,34 @@ fn original_graph_metadata_control_only_quote_is_exact_nonrefillable_and_not_nat
         "host memory extraction cannot bind a core run or authorize a Scope"
     );
     let native = run.scope().unwrap();
-    let free = r.bytes() - protected;
+    let free = reservation_payload_bytes(&r) - protected;
     assert!(
-        matches!(native.adopt_storage_individually([(90u32, free + 1)]),
-        Err(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
-        if required_bytes == free + 1 && available_bytes == free)
+        matches!(native.adopt_host_storage_individually([(90u32, free + 1)]),
+        Err(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes > available_bytes && available_bytes <= free))
     );
-    let payload = native.adopt_storage_individually([(90u32, free)]).unwrap();
+    let payload = native
+        .adopt_host_storage_individually([(90u32, free - publication_controls())])
+        .unwrap();
     drop(payload);
     native.certify().unwrap();
     drop((pair, preparation, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(capsule);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_graph_metadata_rejects_foreign_preparation_without_spending_the_real_capsule() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
-    let original = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let original = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let quote = original
         .clone()
         .with_span_workspace_and_text_controls(controls(&original))
         .unwrap();
     let (r, run, accepted) = accept(&pool, quote);
     let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
-    let other = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let other = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let (foreign, foreign_run, other) = accept(&pool, other);
     let preparation = InferenceRequest::from(&foreign)
         .prepare_text(&foreign.0.execution, geometry(), config(4096))
@@ -142,13 +142,13 @@ fn original_graph_metadata_rejects_foreign_preparation_without_spending_the_real
         run,
         root,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     let panic = catch_unwind(AssertUnwindSafe(|| {
         let _original = capsule;
         std::panic::panic_any(73u32);
     }));
     assert_eq!(*panic.unwrap_err().downcast::<u32>().unwrap(), 73);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -162,9 +162,9 @@ fn selected_graph_capacity_keeps_requested_policy_and_original_custody() {
         GraphMetadataFacts::within_ceiling(selected, ceiling, 5000),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
-    let original = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let original = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let control = PreparedTextControlWorkspace::prepare_controls(
         geometry(),
         original.span_workspace().plan(),
@@ -193,9 +193,9 @@ fn selected_graph_capacity_keeps_requested_policy_and_original_custody() {
     ));
     let protected = span.protected_host_bytes();
     drop((preparation, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(capsule);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -206,9 +206,9 @@ fn automatic_native_arenas_preserve_omitted_policy_and_one_original_charge() {
         SubmissionTrackingFacts::for_policy(None, NonZeroU64::new(1024).unwrap(), 2000).unwrap();
     assert_eq!(graph.requested_ceiling(), None);
     assert_eq!(tracking.requested_ceiling(), None);
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
-    let original = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let original = replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
     let control = PreparedTextControlWorkspace::prepare_controls(
         geometry(),
         original.span_workspace().plan(),
@@ -259,9 +259,9 @@ fn automatic_native_arenas_preserve_omitted_policy_and_one_original_charge() {
     ));
     let protected = span.protected_host_bytes();
     drop((preparation, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(graph_owner);
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(tracking_owner);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

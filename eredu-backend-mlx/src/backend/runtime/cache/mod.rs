@@ -8,9 +8,12 @@ pub mod state;
 
 mod original_copy;
 pub(crate) use original_copy::{
-    PreparedPredictionCacheCopy, copy_original_compressed, copy_original_pooling,
-    copy_completed_compressed, copy_completed_pooling,
+    copy_completed_compressed, copy_completed_pooling, copy_original_compressed,
+    copy_original_pooling, PreparedPredictionCacheCopy,
 };
 
 mod value_completion;
-pub(crate) use value_completion::{complete_values, control_bytes as value_completion_control_bytes};
+pub(crate) use value_completion::{
+    complete_and_borrow, complete_values, completed_borrow_control_bytes,
+    control_bytes as value_completion_control_bytes,
+};

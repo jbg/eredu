@@ -7,19 +7,30 @@ mod assembly;
 mod funded;
 pub(crate) use funded::PreparedPartitionRoutedLocalSource;
 mod funded_evidence;
-pub(crate) use funded_evidence::{PreparedPartitionCaptureEvidence, PartitionCaptureEvidenceError};
-pub use funded::{PreparedPartitionInterventionEvidence, PartitionCaptureProducerSource, PartitionCaptureProgramError,
-    PreparedPartitionCaptureProgram, PreparedPartitionCaptureRow, PreparedPartitionCaptureRunIdentity, ScheduledPartitionCapture, PartitionCaptureLocalHook,PartitionCaptureRoutedHooks, PreparedPartitionContiguousSource,PreparedPartitionRoutedSource,PartitionCaptureRoutedLocalSource,PartitionCaptureLocalSource};
+pub use funded::{
+    PartitionCaptureLocalHook, PartitionCaptureLocalSource, PartitionCaptureProducerSource,
+    PartitionCaptureProgramError, PartitionCaptureRoutedHooks, PartitionCaptureRoutedLocalSource,
+    PreparedPartitionCaptureProgram, PreparedPartitionCaptureRow,
+    PreparedPartitionCaptureRunIdentity, PreparedPartitionContiguousSource,
+    PreparedPartitionInterventionEvidence, PreparedPartitionRoutedSource,
+    ScheduledPartitionCapture,
+};
+pub(crate) use funded_evidence::{PartitionCaptureEvidenceError, PreparedPartitionCaptureEvidence};
 mod sum;
-pub(crate) use sum::{sum_f32_at, summarize_f32, summarize_f32_values, fill_histogram_f32, numeric_control_bytes};
 pub use assembly::{assemble_reduced_fragments, assemble_tensor_fragments};
+pub(crate) use sum::{
+    fill_histogram_f32, numeric_control_bytes, sum_f32_at, summarize_f32, summarize_f32_values,
+};
 mod exchange;
 pub(crate) use exchange::{PartitionCaptureDecoder, PartitionCapturePayload};
 mod frame;
-pub use frame::{PartitionCaptureBuffer, PartitionCaptureFrame, PartitionCaptureFrameKind, PartitionCaptureStorageError};
+pub use frame::{
+    PartitionCaptureBuffer, PartitionCaptureFrame, PartitionCaptureFrameKind,
+    PartitionCaptureStorageError,
+};
+mod intervention_receipt;
 mod observer;
 mod receipt;
-mod intervention_receipt;
 pub(crate) use intervention_receipt::PartitionInterventionReceipt;
 mod routed;
 pub use routed::PartitionRoutedCaptureProducer;
@@ -33,25 +44,37 @@ pub use exchange::{
     PartitionCaptureExchange, PartitionCaptureExchangeError, PartitionCaptureExchangeStage,
     PartitionCaptureTransport,
 };
-pub(crate) use receipt::{encode_contiguous,encode_fragment_records};
 pub use receipt::{
-    PartitionCaptureReceiptConstructionError, PartitionCaptureContiguousProducer, PartitionCaptureCoordinateProducer, PartitionCaptureRoutedProducerSource,
-    PartitionCaptureDelivery, PartitionCaptureProducer, PartitionCaptureReceiptLimits,
-    PartitionCaptureReceiptPlan, ReceivedPartitionCapture,
-    PartitionCaptureEncodingError, PartitionCaptureRecordEncoding,
+    PartitionCaptureContextMetadata, PartitionCaptureContiguousProducer,
+    PartitionCaptureCoordinateProducer, PartitionCaptureDelivery, PartitionCaptureEncodingError,
+    PartitionCaptureProducer, PartitionCaptureReceiptConstructionError,
+    PartitionCaptureReceiptLimits, PartitionCaptureReceiptPlan, PartitionCaptureRecordEncoding,
+    PartitionCaptureRoutedProducerSource, ReceivedPartitionCapture,
+};
+pub(crate) use receipt::{
+    contiguous_metadata_bytes, encode_contiguous, encode_fragment_records,
+    fragment_records_metadata_bytes,
 };
 pub(super) use session::PartitionCaptureRun;
-pub(crate) use session::{PreparedPartitionRemoteCharge,PreparedPartitionIntervention,PartitionInterventionOutcome};
-pub use session::{PreparedPartitionInterventionSource,PartitionInterventionInvocationSource,PartitionInterventionMemberSource,PartitionInterventionLocalAllowance,PartitionInterventionSourceError};
-pub(crate) use session::{PreparedPartitionFragmentSourceAllowance,SourceBindingError};
 pub use session::{
-    PreparedPartitionCaptureAllowance, PartitionCaptureAllowanceError,
-    PartitionCaptureRoutedFragmentGeometry,PartitionCaptureRoutedFragmentSource,PartitionCaptureFragmentGeometry,PartitionCaptureFragmentSource, PreparedPartitionFragmentAllowance, PreparedPartitionFragmentLoan, PartitionCaptureFragmentAllowanceError,
-    PreparedPartitionCaptureCoordination, PartitionCaptureCoordinationError,
-    PartitionCaptureHookTransport, PartitionCaptureIdentity, PartitionCaptureNativeEstimate,
-    SessionPartitionCapture, SessionPartitionCoordination, SessionPartitionHook,
-    SessionPartitionIntervention, SessionPartitionSource,
+    PartitionCaptureAllowanceError, PartitionCaptureCoordinationError,
+    PartitionCaptureFragmentAllowanceError, PartitionCaptureFragmentGeometry,
+    PartitionCaptureFragmentSource, PartitionCaptureHookTransport, PartitionCaptureIdentity,
+    PartitionCaptureNativeEstimate, PartitionCaptureRoutedFragmentGeometry,
+    PartitionCaptureRoutedFragmentSource, PreparedPartitionCaptureAllowance,
+    PreparedPartitionCaptureCoordination, PreparedPartitionFragmentAllowance,
+    PreparedPartitionFragmentLoan, SessionPartitionCapture, SessionPartitionCoordination,
+    SessionPartitionHook, SessionPartitionIntervention, SessionPartitionSource,
 };
+pub use session::{
+    PartitionInterventionInvocationSource, PartitionInterventionLocalAllowance,
+    PartitionInterventionMemberSource, PartitionInterventionSourceError,
+    PreparedPartitionInterventionSource,
+};
+pub(crate) use session::{
+    PartitionInterventionOutcome, PreparedPartitionIntervention, PreparedPartitionRemoteCharge,
+};
+pub(crate) use session::{PreparedPartitionFragmentSourceAllowance, SourceBindingError};
 
 /// Exact capture operation and validated native geometry for one fragment.
 pub struct PartitionCaptureRequest<'a> {
@@ -426,9 +449,7 @@ pub enum PartitionCaptureMergeError {
     #[error(transparent)]
     Capture(#[from] CaptureError),
     /// At least one selected global element has no producer.
-    #[error(
-        "partition capture is incomplete: {received_elements} of {expected_elements} elements"
-    )]
+    #[error("partition capture is incomplete: {received_elements} of {expected_elements} elements")]
     Incomplete {
         /// Complete requested value count.
         expected_elements: u64,
@@ -450,18 +471,32 @@ pub enum PartitionCaptureMergeError {
 
 pub(crate) use vocabulary::CompleteVocabularyGeometry;
 
-pub(crate) use vocabulary::{VocabularyPayload,payload_valid as vocabulary_payload_valid,payload_validation_control_bytes as vocabulary_validation_control_bytes};
+pub(crate) use vocabulary::{
+    VocabularyPayload, payload_valid as vocabulary_payload_valid,
+    payload_validation_control_bytes as vocabulary_validation_control_bytes,
+};
 
 pub(crate) use session::PreparedPartitionAssemblyCharge;
 
 mod prefill_source;
-pub use prefill_source::{PartitionPrefillCaptureGeometry,PartitionPrefillCapturePlan,PartitionPrefillCaptureKind,PartitionPrefillCaptureSourceError};
+pub use prefill_source::{
+    PartitionPrefillCaptureGeometry, PartitionPrefillCaptureKind, PartitionPrefillCapturePlan,
+    PartitionPrefillCaptureSourceError,
+};
 
 mod prefill_receiver;
 pub use prefill_receiver::PartitionPrefillReceiverSource;
 
 mod invocation_source;
-pub use invocation_source::{PartitionInvocationCaptureGeometry,PartitionInvocationCaptureKind,PartitionInvocationCaptureSourceError};
+pub use invocation_source::{
+    PartitionInvocationCaptureGeometry, PartitionInvocationCaptureKind,
+    PartitionInvocationCaptureSourceError,
+};
 
 mod invocation_receiver;
 pub use invocation_receiver::PartitionInvocationReceiverSource;
+
+mod transport_population;
+pub use transport_population::{
+    PartitionCaptureTransportDemand, partition_capture_coordination_demands,
+};

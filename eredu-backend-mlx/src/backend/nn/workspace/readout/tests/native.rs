@@ -37,7 +37,7 @@ fn floating(
     }
     array.reshape(layout.shape(), stream).unwrap()
 }
-fn values(a: &MlxTensor, stream: &Stream) -> Vec<f32> {
+fn values(a: &MlxTensor, stream: &Stream) -> eredu_core::HostTensorBuffer<f32> {
     a.to_f32_vec(stream).unwrap()
 }
 fn execute(x: &[MlxTensor], top: i32, stream: &Stream) -> MlxTensor {

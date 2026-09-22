@@ -4,27 +4,22 @@ use super::*;
 #[path = "partition_coordination_tests.rs"]
 mod coordination;
 
-fn host(value: &MlxTensor, stream: &Stream) -> Result<Vec<f32>, Error> {
-    Ok(value
-        .as_array()
-        .as_dtype(Dtype::Float32, stream)?
-        .contiguous(false, stream)?
-        .evaluated()?
-        .as_slice::<f32>()
-        .to_vec())
-}
-
 impl MlxModelSession {
     pub(crate) fn verify_partition_parameter_owner_for_test(
         &mut self,
-        stream: &Stream,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
         reference: &mut ModelRuntime<MlxBackend<'_>>,
     ) {
-        let facts = self.parameter_facts().unwrap();
-        assert!(facts
-            .parameters
-            .iter()
-            .any(|parameter| parameter.access().query));
+        let stream = environment.stream();
+        let catalog = self.partition_parameter_catalog(None).unwrap();
+        let (facts, layouts) = (catalog.discovery, catalog.layouts);
+        let operation = numerical::PreparedOperation::new(self, environment).unwrap();
+        assert!(
+            facts
+                .parameters
+                .iter()
+                .any(|parameter| parameter.access().query)
+        );
         let slots = self
             .payload
             .model
@@ -48,8 +43,8 @@ impl MlxModelSession {
                 .map(|ordinal| layout.address(ordinal).unwrap())
                 .collect::<Vec<_>>()
         };
-        let mut original = BTreeMap::new();
-        let mut changed = BTreeMap::new();
+        let mut original = operation.context.metadata_vec(slots.len()).unwrap();
+        let mut changed = operation.context.metadata_vec(slots.len()).unwrap();
         let mut expected = BTreeMap::new();
         let mut observed_nonzero = false;
         for slot in &slots {
@@ -69,7 +64,9 @@ impl MlxModelSession {
                         address,
                     },
                 ] {
-                    self.with_model_operation(|model| {
+                    let ids = [Some(slot.parameter.id.as_str())];
+                    let preparation = operation.preparation(&ids);
+                    self.with_model_operation_funded(operation.funding.clone(), |model| {
                         let result = model.erased_mut().with_parameter_slots(
                             &location,
                             &Default::default(),
@@ -79,6 +76,7 @@ impl MlxModelSession {
                                 )
                             },
                             stream,
+                            Some(&preparation),
                         );
                         assert!(
                             matches!(result, Err(Error::ArchitectureModel(_))),
@@ -90,62 +88,75 @@ impl MlxModelSession {
                 }
             }
             let id = slot.parameter.id.as_str();
-            let ids = BTreeSet::from([id.to_owned()]);
-            let (value, values) = self
-                .with_model_operation(|model| {
-                    // Complete an actual native read before a semantic callback
-                    // rejection. The next loan must still acquire the same owner.
-                    let rejected = with_selected_parameter_values(
-                        model.erased_mut(),
-                        &ids,
-                        stream,
-                        |selected| {
-                            let _ = host(&selected[id], stream)?;
-                            Err::<(), _>(Error::ArchitectureModel(
-                                "injected parameter callback rejection".into(),
-                            ))
-                        },
-                    );
-                    assert!(
-                        matches!(rejected, Err(Error::ArchitectureModel(ref message))
-                    if message == "injected parameter callback rejection"),
-                        "{id}: {rejected:?}"
-                    );
-                    with_selected_parameter_values(model.erased_mut(), &ids, stream, |selected| {
-                        let value = &selected[id];
-                        assert_eq!(
-                            value
-                                .shape()
-                                .iter()
-                                .map(|n| *n as usize)
-                                .collect::<Vec<_>>(),
-                            slot.materialized.shape
-                        );
-                        Ok((value.clone(), host(value, stream)?))
-                    })
-                })
+            let layout = &layouts[id];
+            let region = ParameterRegion {
+                starts: vec![0; layout.shape.len()],
+                shape: layout.shape.clone(),
+            };
+            let values = self
+                .read_resident_effective_parameter(
+                    id,
+                    layout,
+                    numerical::Request::Read(&region),
+                    environment,
+                )
+                .unwrap()
                 .unwrap();
             assert_eq!(
-                value.as_array().dtype(),
-                Dtype::Float32,
-                "dense Qwen fixture"
+                values.len(),
+                slot.materialized.shape.iter().product::<usize>()
+            );
+            let rejected = self.reject_parameter_callback_for_test(id, layout, &region, &operation);
+            let rejected = rejected.unwrap_err();
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&rejected);
+            let mut injected = false;
+            while let Some(cause) = source {
+                injected |= cause.is::<numerical::InjectedParameterCallbackFailure>();
+                source = cause.source();
+            }
+            assert!(
+                injected,
+                "callback failure must preserve its exact typed cause: {rejected:?}"
+            );
+            assert_eq!(
+                self.read_resident_effective_parameter(
+                    id,
+                    layout,
+                    numerical::Request::Read(&region),
+                    environment
+                )
+                .unwrap()
+                .unwrap(),
+                values
             );
             observed_nonzero |= values.iter().any(|n| n.abs() > 1e-4);
-            let replacement = values.iter().map(|value| value + 0.125).collect::<Vec<_>>();
-            let tensor = Array::from_slice(&replacement, &value.shape())
-                .as_dtype(value.as_array().dtype(), stream)
+            let update = ParameterUpdate::Add {
+                values: vec![0.125; values.len()],
+            };
+            let (before, after) = self
+                .prepare_parameter_update(id, layout, &[(&region, &update)], &operation)
                 .unwrap();
-            tensor.evaluated().unwrap();
-            changed.insert(id.to_owned(), MlxTensor::from_array(tensor));
-            expected.insert(id.to_owned(), replacement);
-            original.insert(id.to_owned(), value);
+            operation.context.charge_metadata(id.len() * 2).unwrap();
+            original.push((id.to_owned(), before));
+            changed.push((id.to_owned(), after));
+            expected.insert(
+                id.to_owned(),
+                values.iter().map(|value| value + 0.125).collect::<Vec<_>>(),
+            );
         }
         assert!(observed_nonzero);
         assert_eq!(original.len(), slots.len());
         assert_eq!(changed.len(), slots.len());
         assert_eq!(expected.len(), slots.len());
+        let original = parameter_rows(original, &operation).unwrap();
+        let changed = parameter_rows(changed, &operation).unwrap();
         self.verify_partition_parameter_coordination_for_test(
-            stream, reference, &original, &changed, false,
+            environment,
+            reference,
+            &original,
+            &changed,
+            false,
+            &operation,
         );
         self.ensure_no_submission_in_flight().unwrap();
         let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))
@@ -203,44 +214,53 @@ impl MlxModelSession {
 
         for slot in &slots {
             let id = slot.parameter.id.as_str();
-            self.with_model_operation(|model| {
-                with_selected_parameter_values(
-                    model.erased_mut(),
-                    &BTreeSet::from([id.to_owned()]),
-                    stream,
-                    |selected| {
-                        assert_eq!(
-                            host(&selected[id], stream)?,
-                            expected[id],
-                            "replacement {id}"
-                        );
-                        Ok(())
-                    },
+            let layout = &layouts[id];
+            let region = ParameterRegion {
+                starts: vec![0; layout.shape.len()],
+                shape: layout.shape.clone(),
+            };
+            let values = self
+                .read_resident_effective_parameter(
+                    id,
+                    layout,
+                    numerical::Request::Read(&region),
+                    environment,
                 )
-            })
-            .unwrap();
+                .unwrap()
+                .unwrap();
+            assert_eq!(values, expected[id], "replacement {id}");
         }
         self.verify_partition_parameter_coordination_for_test(
-            stream, reference, &original, &changed, true,
+            environment,
+            reference,
+            &original,
+            &changed,
+            true,
+            &operation,
         );
         for slot in &slots {
             let id = slot.parameter.id.as_str();
-            self.with_model_operation(|model| {
-                with_selected_parameter_values(
-                    model.erased_mut(),
-                    &BTreeSet::from([id.to_owned()]),
-                    stream,
-                    |selected| {
-                        assert_eq!(
-                            host(&selected[id], stream)?,
-                            host(&original[id], stream)?,
-                            "restoration {id}"
-                        );
-                        Ok(())
-                    },
+            let layout = &layouts[id];
+            let region = ParameterRegion {
+                starts: vec![0; layout.shape.len()],
+                shape: layout.shape.clone(),
+            };
+            let values = self
+                .read_resident_effective_parameter(
+                    id,
+                    layout,
+                    numerical::Request::Read(&region),
+                    environment,
                 )
-            })
-            .unwrap();
+                .unwrap()
+                .unwrap();
+            let before = expected[id]
+                .iter()
+                .map(|value| value - 0.125)
+                .collect::<Vec<_>>();
+            for (actual, expected) in values.iter().zip(before) {
+                assert!((actual - expected).abs() < 1e-6, "restoration {id}");
+            }
         }
         self.ensure_no_submission_in_flight().unwrap();
         let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))

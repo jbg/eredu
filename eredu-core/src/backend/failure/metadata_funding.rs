@@ -5,6 +5,16 @@ use super::{BackendFailure, BackendFailureKind, SourceOwner};
 /// never allocates, formats an error source, or grants native authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum HostMetadataFundingError {
+    /// Physical capacity or topology rejection from the process ledger.
+    #[error(transparent)]
+    Domain(#[from] crate::MemoryDomainError),
+    /// Assigned host allowance exhausted before a metadata constructor.
+    #[error("metadata in {domain:?} needs {required} bytes; its account has {available} bytes")]
+    DomainAllowance {
+        domain: crate::MemoryDomainId,
+        required: u64,
+        available: u64,
+    },
     /// The requested constructor does not fit the account's remaining capacity.
     #[error("workspace metadata funding requires {required} bytes, with {available} available")]
     Capacity {
@@ -16,6 +26,9 @@ pub enum HostMetadataFundingError {
     /// A constructor layout or accounting total cannot be represented.
     #[error("workspace metadata funding layout overflow")]
     Overflow,
+    /// Accounting uncertainty prevents safe reservation or reuse.
+    #[error("workspace metadata accounting is poisoned")]
+    Poisoned,
     /// The actual account cannot currently accept a metadata reservation.
     #[error("workspace metadata funding is unavailable")]
     Unavailable,
@@ -28,8 +41,15 @@ impl HostMetadataFundingError {
     pub fn into_backend_failure(self) -> BackendFailure {
         BackendFailure {
             kind: match self {
-                Self::Capacity { .. } | Self::Overflow => BackendFailureKind::ResourceExhausted,
-                Self::Unavailable => BackendFailureKind::Other,
+                Self::Capacity { .. }
+                | Self::DomainAllowance { .. }
+                | Self::Overflow
+                | Self::Domain(
+                    crate::MemoryDomainError::BudgetExceeded { .. }
+                    | crate::MemoryDomainError::Overflow,
+                ) => BackendFailureKind::ResourceExhausted,
+                Self::Domain(_) => BackendFailureKind::Other,
+                Self::Unavailable | Self::Poisoned => BackendFailureKind::Other,
             },
             operation: "host metadata preparation",
             source: SourceOwner::metadata_funding(self),

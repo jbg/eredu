@@ -69,7 +69,7 @@ struct BufferBudget {
     auto owner=std::make_unique<std::shared_ptr<std::atomic<unsigned>>>(retired);
     require(mlx_original_buffer_budget_new_retaining(&value,runtime,capacity,owner.get(),
         [](void* p){std::unique_ptr<std::shared_ptr<std::atomic<unsigned>>> held(
-            static_cast<std::shared_ptr<std::atomic<unsigned>>*>(p));(*held)->fetch_add(1);})==0,"buffer budget");
+            static_cast<std::shared_ptr<std::atomic<unsigned>>*>(p));(*held)->fetch_add(1);}, nullptr)==0,"buffer budget");
     owner.release();
   }
   ~BufferBudget(){mlx_original_buffer_budget_release(value);}

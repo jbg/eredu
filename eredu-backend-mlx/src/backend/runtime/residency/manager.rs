@@ -43,22 +43,27 @@ use eredu_runtime::residency::{
 };
 mod background;
 pub(crate) use background::{
-    BackgroundHostReadFailure, BackgroundHostReadOwner, BackgroundSourceAttempt, PreparedBackgroundHostReads,
-    PreparedHostProtection, PreparedHostPublication, PreparedBackgroundHostWindow,
+    BackgroundHostReadFailure, BackgroundHostReadOwner, BackgroundSourceAttempt,
+    PreparedBackgroundHostReads, PreparedBackgroundHostWindow, PreparedHostProtection,
+    PreparedHostPublication,
 };
 mod eviction;
+mod host_acquisition;
+pub use host_acquisition::HostAcquisitionFailure;
+pub(crate) use host_acquisition::OrdinaryMaterializedRequirements;
 mod parameter_source;
 pub(crate) use parameter_source::{ResidentParameterSource, ResidentParameterSourceError};
 mod construction;
 pub use construction::OriginalManagerError;
 pub(crate) use construction::{
     ForegroundDiskDescriptors, ForegroundDiskReadError, ForegroundDiskReadLayout,
-    ForegroundDiskReadPlan, ForegroundDiskSourceError, OriginalManagerPlan,
-    PreparedForegroundDiskIo, PreparedForegroundDiskRead, ReadForegroundDiskBatch, prepare_foreground_disk_descriptors,
+    ForegroundDiskReadPlan, ForegroundDiskSourceError, ForegroundMaterializationPopulation,
+    OriginalManagerPlan, PreparedForegroundDiskIo, PreparedForegroundDiskRead,
+    ReadForegroundDiskBatch, prepare_foreground_disk_descriptors,
 };
 mod owner;
 mod rows;
-pub(crate) use owner::{ManagerCustody};
+pub(crate) use owner::ManagerCustody;
 use owner::ManagerOwner;
 pub use owner::{ManagerWeak, ResidentHostOwner, RetainedHostBuffer};
 
@@ -71,6 +76,137 @@ pub enum ResidentLeaseStorage {
     Host(ResidentHostOwner),
     /// Materialized device arrays.
     Device(ResidentArraysOwner),
+}
+
+/// Prospective controls for binding completed source identity to real cached
+/// cells. The source window bounds both calls and cells before native execution.
+pub(crate) struct PreparedCompletedSourceRetention {
+    leases: usize,
+    cells: usize,
+}
+impl PreparedCompletedSourceRetention {
+    pub(crate) fn prepare(
+        leases: usize,
+        cells: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, crate::backend::Error> {
+        use crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource;
+        fn iterator_bytes<T>(_: impl FnOnce(&'static NamedArrays) -> T) -> usize {
+            std::mem::size_of::<T>()
+        }
+        let per_cell = safemlx::SharedOriginalBufferInspection::inspection_control_bytes()
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<(
+                    CompletedNumericalSource,
+                    Result<(), CompletedNumericalSource>,
+                )>())
+            });
+        let fixed = std::mem::size_of::<(
+            Self,
+            &ResidentLeaseStorage,
+            &CompletedNumericalSource,
+            &eredu_nn::workspace::WorkspaceContext,
+            super::storage::RetainedStorageRef<'_>,
+            Result<(), safemlx::OriginalBufferCause>,
+        )>();
+        let bytes = per_cell
+            .and_then(|n| n.checked_mul(cells))
+            .and_then(|n| {
+                fixed
+                    .checked_add(iterator_bytes(NamedArrays::retained_values))?
+                    .checked_mul(leases.checked_add(1)?)
+                    .and_then(|fixed| n.checked_add(fixed))
+            })
+            .ok_or_else(|| {
+                crate::backend::Error::Neural(
+                    eredu_nn::workspace::WorkspaceMetadataError::Overflow.into(),
+                )
+            })?;
+        context
+            .charge_metadata(bytes)
+            .map_err(|cause| crate::backend::Error::Neural(cause.into()))?;
+        Ok(Self { leases, cells })
+    }
+    pub(crate) fn retain(
+        &mut self,
+        storage: &ResidentLeaseStorage,
+        source: &crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), crate::backend::Error> {
+        let failure = || {
+            crate::backend::Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            )
+        };
+        self.leases = self.leases.checked_sub(1).ok_or_else(failure)?;
+        let ResidentLeaseStorage::Device(owner) = storage else {
+            return Ok(());
+        };
+        for value in owner.arrays.retained_values() {
+            if let super::storage::RetainedStorageRef::CanonicalArray(cell) = value {
+                self.cells = self.cells.checked_sub(1).ok_or_else(failure)?;
+                cell.retain_completed_numerical_source(source)
+                    .map_err(|cause| {
+                        crate::backend::Error::Neural(context.metadata_source(cause))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ResidentLeaseStorage {
+    pub(crate) fn completed_numerical_sources(
+        &self,
+    ) -> impl Iterator<Item = &crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource>{
+        let arrays = match self {
+            Self::Device(owner) => Some(owner.arrays.retained_values()),
+            Self::Host(_) => None,
+        };
+        arrays
+            .into_iter()
+            .flatten()
+            .filter_map(|value| match value {
+                super::storage::RetainedStorageRef::CanonicalArray(cell) => {
+                    cell.completed_numerical_source()
+                }
+                _ => None,
+            })
+    }
+    pub(crate) fn completed_numerical_source_control_bytes() -> Option<usize> {
+        fn iterator_bytes<T>(_: impl FnOnce(&'static ResidentLeaseStorage) -> T) -> usize {
+            std::mem::size_of::<T>()
+        }
+        iterator_bytes(Self::completed_numerical_sources).checked_add(std::mem::size_of::<(
+            &Self,
+            crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource,
+        )>())
+    }
+    /// Borrow only completed receipts carried by this exact acquired storage.
+    pub(crate) fn host_receipts(
+        &self,
+    ) -> impl Iterator<Item = super::storage::RetainedAllocationReceipt<'_>> {
+        let host = match self {
+            Self::Host(owner) => Some(owner.buffers.values()),
+            _ => None,
+        };
+        let device = match self {
+            Self::Device(owner) => Some(owner.arrays.host_sources()),
+            _ => None,
+        };
+        host.into_iter()
+            .flatten()
+            .chain(device.into_iter().flatten())
+            .filter_map(RetainedHostBuffer::attachment_receipt)
+    }
+    pub(crate) fn host_receipt_control_bytes() -> Option<usize> {
+        fn iterator_bytes<T>(_: impl FnOnce(&'static ResidentLeaseStorage) -> T) -> usize {
+            std::mem::size_of::<T>()
+        }
+        iterator_bytes(Self::host_receipts)
+            .checked_add(std::mem::size_of::<&Self>())?
+            .checked_add(RetainedHostBuffer::attachment_receipt_control_bytes()?)
+    }
 }
 
 /// Borrowed binding names from the actual host map or device destination.
@@ -158,6 +294,18 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// The ordinary request refused acquisition-control storage before mutation.
+    #[error("ordinary residency host funding: {0}")]
+    HostMetadataFunding(#[source] eredu_nn::workspace::HostMetadataFundingError),
+    /// The actual ordinary host constructor has no qualified control layout.
+    #[error("ordinary host transfer control source is unavailable")]
+    OrdinaryHostControlSource,
+    /// The paid ordinary Host destination could not allocate its named rows.
+    #[error("ordinary Host destination allocation: {0}")]
+    HostDestinationReserve(#[source] std::collections::TryReserveError),
+    /// Ordinary acquisition preserves its exact host payer through the cause.
+    #[error(transparent)]
+    HostAcquisition(#[from] HostAcquisitionFailure),
     /// Allocation-free native metadata refusal during a cold source census.
     #[error("cold retained array inspection: {0}")]
     OriginalArrayInspection(#[source] safemlx::ArrayMetadataError),
@@ -209,7 +357,9 @@ pub enum ResidencyError {
     OriginalNative(#[source] safemlx::error::Exception),
     /// Exact post-payload registered-role retirement refusal.
     #[error("original residency retirement: {0}")]
-    OriginalRetirement(#[from] crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause),
+    OriginalRetirement(
+        #[from] crate::backend::runtime::execution::generic::RegisteredScopeRetirementCause,
+    ),
     /// Fixed cache-origin refusal. It does not certify streams, sources or rows.
     #[error("original converted-cache owner: {0}")]
     OriginalCache(#[source] eredu_runtime::working_memory::WorkingMemoryError),
@@ -292,6 +442,12 @@ pub enum ResidencyError {
     /// The error preserves its detached source owner until the cause is released.
     #[error("detached disk read: {0}")]
     DetachedDiskRead(#[source] eredu_core::BackendFailure),
+    /// A transformed disk source requires its exact active ordinary execution owner.
+    #[error("ordinary materialized disk source has no matching execution owner")]
+    OrdinaryMaterializationSource,
+    /// The shared prepared-leaf equation retains its original failure custody.
+    #[error("materialized disk read: {0}")]
+    MaterializedDiskRead(#[source] eredu_core::BackendFailure),
     /// Exact foreground read/copy refusal, retaining its admitted source prefix.
     #[error("original foreground disk materialization: {0}")]
     OriginalForegroundDiskMaterialization(
@@ -463,6 +619,36 @@ fn preflight_residency_owner_bindings(
 }
 
 impl ResidencyManager {
+    #[cfg(test)]
+    pub(crate) fn test_evict_completed_parameter_alias(
+        &self,
+    ) -> Result<Option<CanonicalArrayOwner>, ResidencyError> {
+        let selected = {
+            let state = self.inner.state.lock().unwrap();
+            state.storage.iter().find_map(|(id, unit)| {
+                unit.device
+                    .as_ref()?
+                    .arrays
+                    .retained_values()
+                    .find_map(|value| match value {
+                        super::storage::RetainedStorageRef::CanonicalArray(cell)
+                            if cell.completed_numerical_source().is_some()
+                                || cell.test_host_source().is_some_and(|host| {
+                                    host.attachment_receipt().is_some()
+                                }) =>
+                        {
+                            Some((id.clone(), cell.clone()))
+                        }
+                        _ => None,
+                    })
+            })
+        };
+        let Some((id, alias)) = selected else {
+            return Ok(None);
+        };
+        assert!(self.evict(&id, MemoryTier::Device)?);
+        Ok(Some(alias))
+    }
     pub(crate) fn original_host_recipe(
         &self,
         unit: &OffloadUnitId,
@@ -619,8 +805,12 @@ impl ResidencyManager {
                 }
                 for array in device.arrays.retained_values() {
                     match array {
-                        super::storage::RetainedStorageRef::CanonicalArray(cell) => storage.include_canonical_array(cell)?,
-                        super::storage::RetainedStorageRef::Array(array) => storage.include_array(array)?,
+                        super::storage::RetainedStorageRef::CanonicalArray(cell) => {
+                            storage.include_canonical_array(cell)?
+                        }
+                        super::storage::RetainedStorageRef::Array(array) => {
+                            storage.include_array(array)?
+                        }
                         _ => unreachable!("array iterator"),
                     }
                 }
@@ -732,7 +922,7 @@ impl ResidencyManager {
         source_stream: Stream,
         device_stream: Stream,
         cache: crate::backend::runtime::checkpoint::store::CacheHandle,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Self, ResidencyError> {
         Self::new_shared_sources_impl(
             store.into(),
@@ -754,7 +944,7 @@ impl ResidencyManager {
         device_stream: Stream,
         cache: Option<(
             crate::backend::runtime::checkpoint::store::CacheHandle,
-            &eredu_runtime::working_memory::WorkingMemoryPool,
+            &eredu_runtime::working_memory::MemoryLedger,
         )>,
     ) -> Result<Self, ResidencyError> {
         let sources = ResidencySources::Ordinary {
@@ -1018,7 +1208,9 @@ impl ResidencyManager {
     ) -> Result<ResidentTransfer, ResidencyError> {
         // Host publication requires the exact admitted worker and one-use
         // destination. Other original acquisitions remain Device promotions.
-        if tier != MemoryTier::Device && !(tier == MemoryTier::Host && slots.background_host.is_some()) {
+        if tier != MemoryTier::Device
+            && !(tier == MemoryTier::Host && slots.background_host.is_some())
+        {
             return Err(ResidencyError::OriginalOperationDomain);
         }
         transfer::validate_original_observer(observer)?;
@@ -1037,6 +1229,7 @@ impl ResidencyManager {
             true,
             Some((slots, observer)),
             Some(prepared_leases),
+            None,
         )?;
         Ok(match submitted {
             None => ResidentTransfer::immediate_original(leases, tier, observer, immediate),
@@ -1056,7 +1249,7 @@ impl ResidencyManager {
         ),
         ResidencyError,
     > {
-        self.acquire_many_with_operations(requests, tier, return_transfer, None, None)
+        self.acquire_many_with_operations(requests, tier, return_transfer, None, None, None)
     }
 
     fn acquire_many_with_operations(
@@ -1069,6 +1262,7 @@ impl ResidencyManager {
             &safemlx::OriginalScopeObserver,
         )>,
         prepared_leases: Option<transfer::PreparedLeaseCollection>,
+        mut host: Option<&mut host_acquisition::PreparedHostAcquisition>,
     ) -> Result<
         (
             transfer::ResidentLeaseCollection,
@@ -1076,7 +1270,9 @@ impl ResidencyManager {
         ),
         ResidencyError,
     > {
-        if original.is_some() != prepared_leases.is_some() {
+        if (original.is_some() && host.is_some())
+            || (original.is_some() || host.is_some()) != prepared_leases.is_some()
+        {
             return Err(ResidencyError::OriginalOperationDomain);
         }
         if let Some(leases) = &prepared_leases {
@@ -1119,8 +1315,20 @@ impl ResidencyManager {
                 .validate(state.control.ledger(), ids, tier)?,
             ),
             None => {
-                state.control.ledger_mut().validate_batch(ids, tier)?;
-                None
+                if let Some(host) = host.as_mut() {
+                    Some(
+                        PreparedControllerAttempt::take(
+                            &mut host.controller,
+                            &self.inner,
+                            state.control.ledger(),
+                            ids.len(),
+                        )?
+                        .validate(state.control.ledger(), ids, tier)?,
+                    )
+                } else {
+                    state.control.ledger_mut().validate_batch(ids, tier)?;
+                    None
+                }
             }
         };
         loop {
@@ -1168,6 +1376,7 @@ impl ResidencyManager {
             Some(&self.inner),
             original,
             controller,
+            host,
         );
         if missing > 0 {
             state
@@ -1224,6 +1433,26 @@ impl ResidencyManager {
         validate_target(tier, "is_resident")?;
         let state = self.lock()?;
         Ok(state.control.ledger().is_resident(id, tier)?)
+    }
+
+    /// Fills caller-owned scalar rows from one coherent logical cache snapshot.
+    /// The identifiers borrow the retained catalog; no diagnostic inventory or
+    /// source description is allocated while the state lock is held.
+    pub(crate) fn fill_resident_capacities(
+        &self,
+        rows: &mut [(&OffloadUnitId, Option<u64>, Option<u64>)],
+    ) -> Result<(), ResidencyError> {
+        let state = self.lock()?;
+        let ledger = state.control.ledger();
+        for (id, host, device) in rows {
+            *host = ledger
+                .copy_status(id, MemoryTier::Host)?
+                .map(|copy| copy.bytes());
+            *device = ledger
+                .copy_status(id, MemoryTier::Device)?
+                .map(|copy| copy.bytes());
+        }
+        Ok(())
     }
 
     /// Replaces the protected window and synchronously prepares bounded lookahead.
@@ -1310,7 +1539,9 @@ impl ResidencyManager {
     /// the exact persistent alias owners of the admitted source. Callers first
     /// settle preceding consumers and replace their group-window protection.
     pub(crate) fn trim_device_units(
-        &self, units: &[OffloadUnitId], active: &[OffloadUnitId],
+        &self,
+        units: &[OffloadUnitId],
+        active: &[OffloadUnitId],
     ) -> Result<(), ResidencyError> {
         if let Some(persistent) = self.original_foreground_persistent_units() {
             for id in units {
@@ -1322,7 +1553,16 @@ impl ResidencyManager {
             let persistent = self.admitted_disk_persistent_units();
             for id in units {
                 if !active.contains(id) && !persistent.contains(id) {
-                    self.evict(id, MemoryTier::Device)?;
+                    // Ordinary aliases retain the canonical owner's explicit
+                    // logical pin independently of an admitted disk receipt.
+                    // Other live leases still pass through evict's refusal.
+                    let canonical_alias = self
+                        .lock()?
+                        .alias_owner_pins
+                        .contains(id, MemoryTier::Device);
+                    if !canonical_alias {
+                        self.evict(id, MemoryTier::Device)?;
+                    }
                 }
             }
         }
@@ -1370,8 +1610,8 @@ impl ResidencyManager {
         Ok(())
     }
 
-    /// Borrows the actual detached payload counter, independently of the
-    /// metadata-only catalog diagnostics returned by `report`.
+    /// Borrows the actual detached payload counter also exposed by the
+    /// catalog diagnostics returned by `report`.
     #[cfg(test)]
     pub(crate) fn detached_physical_read_bytes(&self, source: usize) -> Option<u64> {
         match &self.inner.sources {
@@ -1537,12 +1777,12 @@ pub use transfer::{
 };
 
 mod named_arrays;
+pub(crate) use named_arrays::CanonicalArrayOwner;
 use named_arrays::NamedArrays;
 pub(crate) use named_arrays::{
     NameCatalogOwner, NamePreparationError, NamedPreparationSource, NamedStorageLayout,
 };
 pub use named_arrays::{NamedArrayError, ResidentArraysOwner};
-pub(crate) use named_arrays::CanonicalArrayOwner;
 mod materialization;
 pub use materialization::host_capacity_upper_bound_for_bindings;
 pub(crate) use materialization::original_host_copy_control_bytes;
@@ -1571,7 +1811,9 @@ pub(crate) use transfer::{
 mod operation_population;
 pub(crate) use operation_population::MaterializationPopulation;
 
+mod control_custody;
 mod controller_attempt;
+use control_custody::ResidencyControlCustody;
 pub use controller_attempt::PreparedAdmissionFailure;
 pub(crate) use controller_attempt::{
     ControllerPreparationCause, ControllerPreparationError, PreparedControllerAttempt,
@@ -1594,10 +1836,12 @@ pub(crate) use closure_ids::{
 
 mod operation_slots;
 pub(crate) use operation_slots::{
-    ForegroundDiskPopulation, ForegroundDiskSourceCapacity, ForegroundDiskWindowPlan, ForegroundDiskSubsetCeiling, ForegroundDiskSourceSeries,
-    PreparedForegroundDiskSlots,
+    ForegroundDiskPopulation, ForegroundDiskSourceCapacity, ForegroundDiskSourceSeries,
+    ForegroundDiskSubsetCeiling, ForegroundDiskWindowPlan, PreparedForegroundDiskSlots,
 };
-pub(crate) use operation_slots::{OriginalHostPublicationSlots, OriginalResidencySlots};
+pub(crate) use operation_slots::{
+    OriginalHostPublicationSlots, OriginalMaterializedLoan, OriginalResidencySlots,
+};
 
 #[cfg(test)]
 pub(crate) use tests::exercise_original_capacity_retry;
@@ -1608,7 +1852,7 @@ pub(crate) use named_arrays::tests::NamedArraysFixture;
 mod operation_source;
 pub(crate) use operation_source::ForegroundDiskIdentity;
 pub(crate) use operation_source::{
-    OperationSourceFailure, OperationWindows, OriginalResidencySource,
+    OperationSourceFailure, OperationWindows, OriginalResidencySource, SelectedResidencySource,
     SupplementaryResidencySource, WindowPopulation,
 };
 

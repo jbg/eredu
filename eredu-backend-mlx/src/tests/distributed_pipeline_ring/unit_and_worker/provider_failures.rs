@@ -46,7 +46,6 @@ fn provider_failure_capture(
         limits: CaptureLimits {
             per_step: allowance,
             cumulative: allowance.checked_mul(4).unwrap(),
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }

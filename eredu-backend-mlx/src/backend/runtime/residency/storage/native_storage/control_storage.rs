@@ -44,9 +44,8 @@ impl MlxNativeStorage {
         let Some(bank) = Bank::shared_borrowed_owner_bytes() else {
             return Ok(None);
         };
-        let budget =
-            PreparedOriginalBufferBudget::<OriginalNativeBudgetCustody>::layout(runtime, capacity)
-                .map_err(NativeStorageCause::Fixed)?;
+        let budget = PreparedOriginalBufferBudget::<NativeBudgetOwner>::layout(runtime, capacity)
+            .map_err(NativeStorageCause::Fixed)?;
         let sidecar = PreparedAllocationOwner::<Registration>::layout();
         let sum = |parts: &[usize]| {
             parts
@@ -79,23 +78,35 @@ impl MlxNativeStorage {
                 sidecar.attachment_failure_bytes(),
                 sidecar.original_attachment_control_bytes(),
                 OriginalBufferAliasWitness::inspection_control_bytes()?,
+                crate::backend::nn::workspace::CompletedParameterSources::observation_control_bytes()?,
                 OrdinaryBufferWitness::inspection_control_bytes()?,
                 safemlx::ImmutableSourceWitness::inspection_control_bytes()?,
                 safemlx::HostTransferArrayAliasWitness::inspection_control_bytes()?,
                 safemlx::ImmutableHostTransferWitness::inspection_control_bytes()?,
                 size_of::<NativeStorageRoot<'static>>(),
                 Registration::metadata_origin_control_bytes()?,
+                Registration::completed_numerical_custody_control_bytes()?,
+                OriginalBufferWitness::validation_control_bytes()?,
                 super::super::super::manager::CanonicalArrayOwner::publication_control_bytes()?,
                 size_of::<CanonicalObservation<'static>>(),
                 size_of::<Option<CanonicalObservation<'static>>>(),
-                size_of::<(&safemlx::Array, Option<&super::super::super::manager::CanonicalArrayOwner>)>(),
+                size_of::<(
+                    &safemlx::Array,
+                    Option<&super::super::super::manager::CanonicalArrayOwner>,
+                )>(),
                 size_of::<super::super::PublishedAllocation>(),
                 size_of::<Option<super::super::PublishedAllocation>>(),
-                size_of::<Result<(), safemlx::OriginalBufferError<PreparedAllocationOwner<Registration>>>>(),
+                size_of::<
+                    Result<(), safemlx::OriginalBufferError<PreparedAllocationOwner<Registration>>>,
+                >(),
                 super::super::RetainedStoragePublication::attachment_lookup_control_bytes()?,
-                super::super::super::manager::RetainedHostBuffer::attachment_receipt_control_bytes()?,
+                super::super::super::manager::RetainedHostBuffer::attachment_receipt_control_bytes(
+                )?,
                 super::super::RetainedAllocationReceipt::control_bytes()?,
-                size_of::<(&super::super::RetainedAllocationReceipt<'static>, &super::super::RetainedAllocationReceipt<'static>)>(),
+                size_of::<(
+                    &super::super::RetainedAllocationReceipt<'static>,
+                    &super::super::RetainedAllocationReceipt<'static>,
+                )>(),
                 size_of::<Option<super::super::RetainedAllocationReceipt<'static>>>(),
                 size_of::<Observation<'static>>(),
                 size_of::<(&Observation<'static>, &Observation<'static>)>(),
@@ -103,6 +114,14 @@ impl MlxNativeStorage {
                 size_of::<Result<Observation<'static>, NativeStorageCause>>(),
                 size_of::<NativeStorageObservation<StorageIdentity>>(),
                 size_of::<MlxNativeStorage>(),
+                size_of::<(
+                    &MlxNativeStorage,
+                    &crate::backend::nn::workspace::CompletedParameterSources,
+                    crate::backend::nn::workspace::CompletedParameterSources,
+                    Option<MlxNativeStorage>,
+                    Result<Option<MlxNativeStorage>, crate::backend::error::Error>,
+                    Option<(OriginalBufferWitness<'static>, &'static eredu_runtime::working_memory::OriginalNumericalBudgetCustody)>,
+                )>(),
                 size_of::<safemlx::OriginalBufferBudget>(),
             ])
         })();

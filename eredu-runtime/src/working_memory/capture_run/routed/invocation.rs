@@ -145,8 +145,10 @@ impl CaptureRoutedBatchWriter<'_, '_> {
     }
     /// Authenticate the same actual model occurrence as dense model capture.
     /// This is not a scheduled account conversion or native source permission.
-    pub fn validate_model_custody(&self, expected: &crate::working_memory::OriginalSpeculativeBudgetCustody)
-        -> Result<(), WorkingMemoryError> {
+    pub fn validate_model_custody(
+        &self,
+        expected: &crate::working_memory::OriginalSpeculativeBudgetCustody,
+    ) -> Result<(), WorkingMemoryError> {
         self.owner.identity.custody.validate_model(expected)
     }
 
@@ -201,10 +203,15 @@ impl Drop for CaptureRoutedBatchWriter<'_, '_> {
 impl<'t, 'a> CaptureRoutedBatchWriter<'t, 'a> {
     /// Lend the fixed destination under its already-paid model account. Actual
     /// numerical roots/completion stay with that caller's original equation.
-    pub fn prepare_model<'s>(self, model: &'s crate::working_memory::OriginalSpeculativeBudgetCustody)
-        -> Result<CaptureRoutedModelTransfer<'t, 'a, 's>, WorkingMemoryError> {
+    pub fn prepare_model<'s>(
+        self,
+        model: &'s crate::working_memory::OriginalSpeculativeBudgetCustody,
+    ) -> Result<CaptureRoutedModelTransfer<'t, 'a, 's>, WorkingMemoryError> {
         self.validate_model_custody(model)?;
-        Ok(CaptureRoutedModelTransfer { writer: self, model })
+        Ok(CaptureRoutedModelTransfer {
+            writer: self,
+            model,
+        })
     }
 
     /// Bind independently admitted backing before lending this fixed destination.
@@ -299,27 +306,46 @@ pub struct CaptureRoutedModelTransfer<'t, 'a, 's> {
 }
 impl CaptureRoutedModelTransfer<'_, '_, '_> {
     /// Exact original source geometry.
-    pub fn geometry(&self) -> &CaptureRoutedUnitsGeometry<'_> { self.writer.geometry() }
+    pub fn geometry(&self) -> &CaptureRoutedUnitsGeometry<'_> {
+        self.writer.geometry()
+    }
     /// Selected token/slot membership.
-    pub fn selects(&self, token:u64, slot:u64)->bool { self.writer.selects(token,slot) }
+    pub fn selects(&self, token: u64, slot: u64) -> bool {
+        self.writer.selects(token, slot)
+    }
     /// Revalidate the original model account before every scalar write.
-    pub fn validate(&self)->Result<(),WorkingMemoryError> { self.writer.validate_model_custody(self.model) }
+    pub fn validate(&self) -> Result<(), WorkingMemoryError> {
+        self.writer.validate_model_custody(self.model)
+    }
     /// Start one selected source row.
-    pub fn begin_row(&mut self,token:u64,slot:u64,expert:u64,coefficient:f32)->Result<(),CaptureRoutedHostError> {
-        self.validate()?;self.writer.begin_row(token,slot,expert,coefficient)
+    pub fn begin_row(
+        &mut self,
+        token: u64,
+        slot: u64,
+        expert: u64,
+        coefficient: f32,
+    ) -> Result<(), CaptureRoutedHostError> {
+        self.validate()?;
+        self.writer.begin_row(token, slot, expert, coefficient)
     }
     /// Copy into the existing paid row.
-    pub fn push_f32(&mut self,value:f32)->Result<(),CaptureRoutedHostError> {
-        self.validate()?;self.writer.push_f32(value)
+    pub fn push_f32(&mut self, value: f32) -> Result<(), CaptureRoutedHostError> {
+        self.validate()?;
+        self.writer.push_f32(value)
     }
     /// Finish exactly one complete selected row.
-    pub fn finish_row(&mut self)->Result<(),CaptureRoutedHostError> {
-        self.validate()?;self.writer.finish_row()
+    pub fn finish_row(&mut self) -> Result<(), CaptureRoutedHostError> {
+        self.validate()?;
+        self.writer.finish_row()
     }
     /// Keep the actual source span, including an empty selected intersection.
-    pub fn source_chunk(&mut self,start:u64,end:u64)->Result<(),CaptureRoutedHostError> {
-        self.validate()?;self.writer.source_chunk(start,end)
+    pub fn source_chunk(&mut self, start: u64, end: u64) -> Result<(), CaptureRoutedHostError> {
+        self.validate()?;
+        self.writer.source_chunk(start, end)
     }
     /// End the short loan; the original frame still owns final coverage checks.
-    pub fn finish(self)->Result<(),CaptureRoutedHostError> { self.validate()?;self.writer.finish() }
+    pub fn finish(self) -> Result<(), CaptureRoutedHostError> {
+        self.validate()?;
+        self.writer.finish()
+    }
 }

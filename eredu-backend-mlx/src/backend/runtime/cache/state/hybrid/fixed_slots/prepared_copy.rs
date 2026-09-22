@@ -89,13 +89,18 @@ pub(in crate::backend::runtime::cache::state::hybrid) fn copy_slot_retained(
     stream: &Stream,
     roots: &RefCell<Vec<Array>>,
 ) -> Result<Slot, Exception> {
+    copy_slot_with(source, |value| copy_value(value, stream, Some(roots)))
+}
+
+/// Preserve the exact role and absence while the caller supplies its admitted
+/// numerical copy worker and retains that worker's completion custody.
+pub(in crate::backend::runtime::cache::state::hybrid) fn copy_slot_with<E>(
+    source: &Slot,
+    copy: impl FnOnce(&MlxTensor) -> Result<MlxTensor, E>,
+) -> Result<Slot, E> {
     Ok((
         source.0,
-        source
-            .1
-            .as_ref()
-            .map(|value| copy_value(value, stream, Some(roots)))
-            .transpose()?,
+        source.1.as_ref().map(copy).transpose()?,
     ))
 }
 

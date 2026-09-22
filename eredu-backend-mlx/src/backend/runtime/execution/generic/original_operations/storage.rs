@@ -1,7 +1,6 @@
 //! Concrete complete slot types. Population authority remains in the selected
 //! policy/source traversal, not this storage-only construction worker.
 use super::*;
-use eredu_runtime::working_memory::OriginalOperationMetadataCustody;
 use crate::backend::runtime::{
     checkpoint::store::{
         MaterializationPayloadShape, OriginalMaterializationSlots,
@@ -13,6 +12,7 @@ use crate::backend::runtime::{
         PreparedTransferObservation, TransferPayloadShape,
     },
 };
+use eredu_runtime::working_memory::OriginalOperationMetadataCustody;
 
 pub(super) mod foreground_disk;
 pub(in crate::backend::runtime::execution::generic) use foreground_disk::{
@@ -55,12 +55,16 @@ pub(super) fn unit_layout<U: 'static, F: FnMut(usize) -> Result<PreparedUnit<U>,
 }
 macro_rules! slot_factory {
     ($factory:ident,$layout:ident,$slot:ty) => {
-        slot_factory!($factory, $layout, $slot, OriginalTextControlGuard, |value| value);
+        slot_factory!(
+            $factory,
+            $layout,
+            $slot,
+            OriginalTextControlGuard,
+            |value| value
+        );
     };
     ($factory:ident,$layout:ident,$slot:ty,$custody:ty,$project:expr) => {
-        fn $factory(
-            controls: Option<$custody>,
-        ) -> impl FnMut(usize) -> Result<$slot, Infallible> {
+        fn $factory(controls: Option<$custody>) -> impl FnMut(usize) -> Result<$slot, Infallible> {
             move |_| {
                 Ok(<$slot>::new(($project)(
                     controls
@@ -209,7 +213,10 @@ struct NamedPreparationFailure {
     cause: NamedPreparationSource,
     controls: OriginalOperationMetadataCustody,
 }
-fn named_error(cause: NamedPreparationSource, controls: &OriginalOperationMetadataCustody) -> Error {
+fn named_error(
+    cause: NamedPreparationSource,
+    controls: &OriginalOperationMetadataCustody,
+) -> Error {
     Error::with_original_control_source(
         eredu_core::BackendFailure::from_error(NamedPreparationFailure {
             cause,
@@ -219,10 +226,16 @@ fn named_error(cause: NamedPreparationSource, controls: &OriginalOperationMetada
     )
 }
 pub(super) fn named_error_control_bytes() -> Option<u64> {
-    u64::try_from(eredu_core::BackendFailure::source_retention_peak_bytes::<
-        NamedPreparationFailure,
-    >()?.checked_add(size_of::<eredu_runtime::working_memory::OriginalOperationMetadataCustody>())?
-        .checked_add(size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>())?)
+    u64::try_from(
+        eredu_core::BackendFailure::source_retention_peak_bytes::<NamedPreparationFailure>()?
+            .checked_add(size_of::<
+                eredu_runtime::working_memory::OriginalOperationMetadataCustody,
+            >())?
+            .checked_add(size_of::<
+                eredu_runtime::working_memory::OriginalTextMetadataCustody,
+            >())?
+            .checked_add(NameCatalogOwner::custody_transport_bytes()?)?,
+    )
     .ok()
 }
 fn named_bank_error<F>(
@@ -257,9 +270,13 @@ slot_factory!(
     OriginalOperationMetadataCustody,
     |value| value
 );
-slot_factory!(host_factory, host_layout, PreparedHostMaterialization,
+slot_factory!(
+    host_factory,
+    host_layout,
+    PreparedHostMaterialization,
     OriginalOperationMetadataCustody,
-    |value| value);
+    |value| value
+);
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
 struct SourceBankFailure {
@@ -369,20 +386,44 @@ pub(super) struct PreparedStorage<U: 'static> {
     pub(super) neural: PreparedOperationBank<super::neural::PreparedNeuralSubmission>,
     windows: Vec<PreparedOperationBank<PreparedResidencyAttempt>>,
     host: Option<HostAcquisitions>,
-    pub(super) background: Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+    pub(super) background:
+        Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
 }
 struct HostAcquisitions {
     closure: Vec<eredu_runtime::residency::ResidencyClosureSlot>,
     windows: Vec<PreparedOperationBank<PreparedResidencyAttempt>>,
 }
-pub(super) fn background_acquisition_control_bytes(sources: &[crate::backend::runtime::residency::manager::WindowPopulation], forwards: usize, controller_units: usize) -> Option<u64> {
-    let fixed = [size_of::<HostAcquisitions>(), size_of::<Option<HostAcquisitions>>(),
-        Layout::array::<eredu_runtime::residency::ResidencyClosureSlot>(controller_units).ok()?.size(),
+pub(super) fn background_acquisition_control_bytes(
+    sources: &[crate::backend::runtime::residency::manager::WindowPopulation],
+    forwards: usize,
+    controller_units: usize,
+) -> Option<u64> {
+    let fixed = [
+        size_of::<HostAcquisitions>(),
+        size_of::<Option<HostAcquisitions>>(),
+        Layout::array::<eredu_runtime::residency::ResidencyClosureSlot>(controller_units)
+            .ok()?
+            .size(),
         size_of::<Vec<eredu_runtime::residency::ResidencyClosureSlot>>(),
-        size_of::<Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>>(),
-        size_of::<std::cell::RefMut<'_, Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>>>(),
-        size_of::<Result<(), Error>>()];
-    windows::layout(sources, forwards)?.checked_add(u64::try_from(fixed.into_iter().try_fold(size_of::<[usize;7]>(), usize::checked_add)?).ok()?)
+        size_of::<
+            Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+        >(),
+        size_of::<
+            std::cell::RefMut<
+                '_,
+                Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+            >,
+        >(),
+        size_of::<Result<(), Error>>(),
+    ];
+    windows::layout(sources, forwards)?.checked_add(
+        u64::try_from(
+            fixed
+                .into_iter()
+                .try_fold(size_of::<[usize; 7]>(), usize::checked_add)?,
+        )
+        .ok()?,
+    )
 }
 impl<U: 'static> PreparedStorage<U> {
     pub(super) fn new(
@@ -403,8 +444,21 @@ impl<U: 'static> PreparedStorage<U> {
         disk_source: Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
     ) -> Result<Self, Error> {
         let custody = controls.metadata_custody().into();
-        Self::new_with_custody(units, population, neural, gguf_host_runtime, sources,
-            manager, ids, &custody, Some(controls), disk, Some(reservation), source, disk_source.map(ForegroundDiskSourceTicket::Text))
+        Self::new_with_custody(
+            units,
+            population,
+            neural,
+            gguf_host_runtime,
+            sources,
+            manager,
+            ids,
+            &custody,
+            Some(controls),
+            disk,
+            Some(reservation),
+            source,
+            disk_source.map(ForegroundDiskSourceTicket::Text),
+        )
     }
 
     pub(super) fn new_with_custody(
@@ -425,8 +479,15 @@ impl<U: 'static> PreparedStorage<U> {
         )>,
         disk_source: Option<ForegroundDiskSourceTicket>,
     ) -> Result<Self, Error> {
-        if controls.is_none() && (reservation.is_some() || source.is_some()
-            || matches!(disk_source.as_ref(), Some(ForegroundDiskSourceTicket::Text(_))) || gguf_host_runtime.is_some()) {
+        if controls.is_none()
+            && (reservation.is_some()
+                || source.is_some()
+                || matches!(
+                    disk_source.as_ref(),
+                    Some(ForegroundDiskSourceTicket::Text(_))
+                )
+                || gguf_host_runtime.is_some())
+        {
             return Err(identity());
         }
         let mut closure = Vec::new();
@@ -461,23 +522,65 @@ impl<U: 'static> PreparedStorage<U> {
         )?;
         let host = if background.is_some() {
             let mut host_closure = Vec::new();
-            host_closure.try_reserve_exact(population.controller_units).map_err(|cause| reserve_error(cause, custody))?;
-            host_closure.resize(population.controller_units, eredu_runtime::residency::ResidencyClosureSlot::default());
-            let (host_windows, absent) = windows::prepare(disk.and_then(ForegroundDiskRequestPlan::background).ok_or_else(identity)?.host_acquisitions(), population.forwards, MemoryTier::Host, None, custody, controls, manager, &catalog,
-                ids, &mut host_closure, None, None, reservation, None)?;
+            host_closure
+                .try_reserve_exact(population.controller_units)
+                .map_err(|cause| reserve_error(cause, custody))?;
+            host_closure.resize(
+                population.controller_units,
+                eredu_runtime::residency::ResidencyClosureSlot::default(),
+            );
+            let (host_windows, absent) = windows::prepare(
+                disk.and_then(ForegroundDiskRequestPlan::background)
+                    .ok_or_else(identity)?
+                    .host_acquisitions(),
+                population.forwards,
+                MemoryTier::Host,
+                None,
+                custody,
+                controls,
+                manager,
+                &catalog,
+                ids,
+                &mut host_closure,
+                None,
+                None,
+                reservation,
+                None,
+            )?;
             debug_assert!(absent.is_none());
-            Some(HostAcquisitions { closure: host_closure, windows: host_windows })
-        } else { None };
-        Ok(Self { closure, units, neural, windows, host, background })
+            Some(HostAcquisitions {
+                closure: host_closure,
+                windows: host_windows,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            closure,
+            units,
+            neural,
+            windows,
+            host,
+            background,
+        })
     }
     pub(super) fn with_host_and_device<T>(
-        &mut self, index: usize, device: &mut PreparedResidencyAttempt,
+        &mut self,
+        index: usize,
+        device: &mut PreparedResidencyAttempt,
         reservation: Option<&eredu_runtime::working_memory::WorkingMemoryReservation>,
-        execute: impl FnOnce(&mut OriginalResidencySlots<'_>, &mut OriginalResidencySlots<'_>) -> Result<T, Error>,
+        execute: impl FnOnce(
+            &mut OriginalResidencySlots<'_>,
+            &mut OriginalResidencySlots<'_>,
+        ) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let host = self.host.as_mut().ok_or_else(identity)?;
-        let mut attempt = windows::checkout(&mut host.windows, index).map_err(|_| Error::PrefillScopeUnavailable)?;
-        execute(&mut attempt.residency(&mut host.closure, reservation), &mut device.residency(&mut self.closure, reservation))
+        let mut attempt = windows::checkout(&mut host.windows, index)
+            .map_err(|_| Error::PrefillScopeUnavailable)?;
+        execute(
+            &mut attempt.residency(&mut host.closure, reservation),
+            &mut device.residency(&mut self.closure, reservation),
+        )
     }
     pub(super) fn checkout_residency(
         &mut self,

@@ -10,7 +10,11 @@ pub(super) fn operation_bound(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Geometry { pub(super) vocabulary: u32, pub(super) count: u32, pub(super) rows: i32 }
+pub(super) struct Geometry {
+    pub(super) vocabulary: u32,
+    pub(super) count: u32,
+    pub(super) rows: i32,
+}
 
 /// Same exact worker input/output descriptor for both native mechanism quotes.
 pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<Geometry>> {
@@ -41,7 +45,11 @@ pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<Geom
     {
         return Err(invalid());
     }
-    Ok(Some(Geometry { vocabulary, count, rows: input.shape()[1] }))
+    Ok(Some(Geometry {
+        vocabulary,
+        count,
+        rows: input.shape()[1],
+    }))
 }
 
 pub(super) fn emit(
@@ -49,7 +57,12 @@ pub(super) fn emit(
     a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
-    let Some(Geometry { vocabulary, count, .. }) = geometry(op)? else { return Ok(None); };
+    let Some(Geometry {
+        vocabulary, count, ..
+    }) = geometry(op)?
+    else {
+        return Ok(None);
+    };
     let width = u64::from(vocabulary);
     // Direct row view; possible half->F32 cast. MLX isfinite expands into
     // two scalar infinities, isposinf/isneginf, their OR, isnan, a second
@@ -64,6 +77,7 @@ pub(super) fn emit(
     let is_nan = buffer_capacity(a, width)?;
     let is_nonfinite = buffer_capacity(a, width)?;
     let is_finite = buffer_capacity(a, width)?;
+    sink.default_scratch(add(positive_infinity, negative_infinity)?, 2)?;
     let mask = capacity(a, width)?;
     let sum = sum_cost(a, width, 1, width)?;
     let sorted = super::sampling::sort_fixed(a, width, 1, width)?;

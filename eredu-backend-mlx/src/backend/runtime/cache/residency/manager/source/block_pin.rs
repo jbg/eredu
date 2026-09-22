@@ -81,7 +81,7 @@ impl PinnedCacheBlock {
     pub(crate) fn fixed_controls() -> Option<usize> {
         let frames = [
             size_of::<Self>(),
-            CacheResidencyManager::original_discard_control_bytes()?,
+            CacheResidencyManager::discard_retirement_control_bytes()?,
             size_of::<PinnedCacheBlockLease>(),
             size_of::<CacheBlockId>(),
             size_of::<(

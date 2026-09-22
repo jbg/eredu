@@ -1,8 +1,8 @@
 //! One independently owned existing layout entry. No provider key escapes here.
 use super::*;
 use crate::{
-    working_memory::{HostSlotStorageKey, Usage},
     HostMetadataKey,
+    working_memory::{HostSlotStorageKey, Usage},
 };
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 /// namespace. None can call provider cloning/projection/comparison at retirement.
 #[derive(Debug)]
 pub(in crate::working_memory) struct ResetLayoutPin {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     identity: HostMetadataKey,
     bytes: u64,
     id: u64,
     namespace: TypeId,
     active: bool,
     acquire: fn(&mut Usage, u64, u64) -> Result<(), WorkingMemoryError>,
-    retire: fn(&WorkingMemoryPool, u64),
+    retire: fn(&MemoryLedger, u64),
 }
 impl ResetLayoutPin {
     /// Locate an existing canonical entry using an actual source-derived key.
@@ -56,7 +56,7 @@ impl ResetLayoutPin {
             || layout.active
             || table.namespace != TypeId::of::<K>()
             || layout.namespace != TypeId::of::<K>()
-            || !table.pool.same_domain(&layout.pool)
+            || !table.pool.same_ledger(&layout.pool)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -113,7 +113,7 @@ impl ResetLayoutPin {
     }
 
     pub(in crate::working_memory) fn prepare<K: HostSlotStorageKey>(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         identity: &HostMetadataKey,
         bytes: u64,
     ) -> Result<Self, WorkingMemoryError> {
@@ -137,7 +137,7 @@ impl ResetLayoutPin {
     /// Pins one exact source table already present in this typed namespace.
     /// Preparation and eventual retirement occur outside the Usage loan.
     pub(in crate::working_memory) fn pin_existing_host<K: HostSlotStorageKey>(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         metadata: &crate::HostSlotMetadata,
     ) -> Result<Self, WorkingMemoryError> {
         let bytes = metadata
@@ -186,12 +186,12 @@ impl ResetLayoutPin {
 
     pub(in crate::working_memory) fn prepare_again<K: HostSlotStorageKey>(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         identity: &HostMetadataKey,
         bytes: u64,
     ) -> Result<Self, WorkingMemoryError> {
         if !self.active
-            || !self.pool.same_domain(pool)
+            || !self.pool.same_ledger(pool)
             || self.namespace != TypeId::of::<K>()
             || &self.identity != identity
             || self.bytes != bytes
@@ -221,7 +221,7 @@ impl ResetLayoutPin {
                 .0
                 .pool
                 .as_ref()
-                .is_none_or(|pool| !pool.same_domain(&self.pool))
+                .is_none_or(|pool| !pool.same_ledger(&self.pool))
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -295,7 +295,7 @@ fn acquire<K: HostSlotStorageKey>(
         .owners = owners;
     Ok(())
 }
-fn retire<K: HostSlotStorageKey>(pool: &WorkingMemoryPool, id: u64) {
+fn retire<K: HostSlotStorageKey>(pool: &MemoryLedger, id: u64) {
     let retired = {
         let mut usage = funding::lock_for_retirement(pool);
         let registry = usage
@@ -314,16 +314,23 @@ fn retire<K: HostSlotStorageKey>(pool: &WorkingMemoryPool, id: u64) {
         .entry
         .as_ref()
         .and_then(|(_, entry)| entry.charged());
+    let native_released = retired
+        .entry
+        .as_ref()
+        .and_then(|(_, entry)| entry.native_charge());
     // Canonical key, detached batch and original raw owner all retire outside
     // Usage, in their established order. A panic conservatively keeps credit.
     drop(retired);
-    if let Some((bytes, origin)) = released {
-        let mut usage = funding::lock_for_retirement(pool);
-        if let Some(id) = origin {
-            funding::retire_allocation(&mut usage, id, bytes);
-        } else {
-            usage.registered -= bytes;
+    if let Some((partition, bytes, placement, allowance)) = native_released {
+        {
+            let mut usage = funding::lock_for_retirement(pool);
+            partition.retire_registered(&mut usage, bytes, &placement, allowance);
         }
+        drop(partition);
+    }
+    if let Some((bytes, origin, placement, allowance)) = released {
+        let mut usage = funding::lock_for_retirement(pool);
+        funding::retire_placed_allocation(&mut usage, origin, bytes, &placement, allowance);
     }
 }
 
@@ -381,7 +388,7 @@ mod pair_tests {
     #[test]
     fn second_existing_pin_overflow_and_shared_entry_overflow_are_atomic() {
         for shared in [false, true] {
-            let pool = WorkingMemoryPool::new(10_000, 0).unwrap();
+            let pool = crate::working_memory::memory_fixture::host_ledger(10_000, 0).unwrap();
             let left = crate::HostSlotTable::new(vec![1_u32].into_boxed_slice());
             let right = crate::HostSlotTable::new(vec![2_u32].into_boxed_slice());
             let left_key = Key(left.metadata().identity().registry_key().clone());
@@ -392,7 +399,7 @@ mod pair_tests {
             };
             let bytes = left.metadata().capacity_bytes().unwrap();
             let registration = pool
-                .register_storage([(left_key.clone(), bytes), (right_key.clone(), bytes)])
+                .register_host_storage([(left_key.clone(), bytes), (right_key.clone(), bytes)])
                 .unwrap();
             let mut table = ResetLayoutPin::prepare::<Key>(&pool, &left_key.0, bytes).unwrap();
             let mut layout = ResetLayoutPin::prepare::<Key>(&pool, &right_key.0, bytes).unwrap();
@@ -428,7 +435,7 @@ mod pair_tests {
                 assert!(!table.active && !layout.active);
             }
             drop((table, layout, registration));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }

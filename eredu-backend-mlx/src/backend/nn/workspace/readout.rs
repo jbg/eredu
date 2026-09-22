@@ -51,8 +51,12 @@ pub(super) fn ordinary_error(op: &WorkspaceOperation, error: MlxWorkspaceFactErr
 
 #[derive(Clone, Copy)]
 pub(super) struct ReadoutGeometry {
-    pub batch: i32, pub sequence: i32, pub hidden: i32,
-    pub vocabulary: i32, pub centroids: i32, pub selected: i32,
+    pub batch: i32,
+    pub sequence: i32,
+    pub hidden: i32,
+    pub vocabulary: i32,
+    pub centroids: i32,
+    pub selected: i32,
 }
 pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<ReadoutGeometry>> {
     let WorkspaceOperationKindView::MaskedOutputProjection {
@@ -93,8 +97,14 @@ pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<Read
     {
         return Ok(None);
     }
-    Ok(Some(ReadoutGeometry { batch:b, sequence:s, hidden:h,
-        vocabulary:v, centroids:c, selected }))
+    Ok(Some(ReadoutGeometry {
+        batch: b,
+        sequence: s,
+        hidden: h,
+        vocabulary: v,
+        centroids: c,
+        selected,
+    }))
 }
 
 pub(super) fn emit(
@@ -102,8 +112,17 @@ pub(super) fn emit(
     a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
-    let Some(ReadoutGeometry { batch:b, sequence:s, hidden:h,
-        vocabulary:v, centroids:c, selected }) = geometry(op)? else { return Ok(None); };
+    let Some(ReadoutGeometry {
+        batch: b,
+        sequence: s,
+        hidden: h,
+        vocabulary: v,
+        centroids: c,
+        selected,
+    }) = geometry(op)?
+    else {
+        return Ok(None);
+    };
     let centroids = op.inputs.get(2).unwrap();
     let output = op.outputs.get(0).unwrap();
     let r = |n| capacity(a, n);
@@ -135,6 +154,9 @@ pub(super) fn emit(
         bytes = add(bytes, add(mul(4, r(rows)?)?, mul(2, r(1)?)?)?)?;
         add(bytes, add(mul(2, out)?, r(ids)?)?)?
     };
+    // Empty zeros and the nonempty margin each construct one eager F32
+    // source; row/scalar casts remain allocations on the execution stream.
+    sink.default_scratch(r(1)?, 1)?;
     sink.output(Output::Allocate(out))?;
     sink.finish(total - out, format_args!("MLX Metal masked readout: full centroid partition backing, strided ordering/indices, selected weight replicas per position, dense products and copies/casts, per-position minimum, F32 fill/scatter; all child buffers retained through completion; page={} with bounded oversized reuse; no disjoint host payload", a.page_size())).map(Some)
 }

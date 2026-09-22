@@ -1,5 +1,5 @@
 //! Exact selected Embedded request and monotonic invocation custody.
-use super::{OriginalSpeculativeNumericalSources, OriginalSpeculativeNumericalPreparation};
+use super::{OriginalSpeculativeNumericalPreparation, OriginalSpeculativeNumericalSources};
 use crate::{
     backend::error::Error,
     composition::mlx::{model::retain_planning_error, model::Executable},
@@ -13,7 +13,7 @@ use eredu_runtime::{
     speculative::embedded_occurrence::{
         EmbeddedOccurrenceClaim, EmbeddedOccurrenceCursor, EmbeddedSchedulePlan,
     },
-    working_memory::{OriginalSpeculativeRequest, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{MemoryLedger, OriginalSpeculativeRequest, WorkingMemoryError},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -25,6 +25,8 @@ use std::{
 pub(crate) struct OriginalEmbeddedSources<'a> {
     cursor: RefCell<EmbeddedOccurrenceCursor<'a>>,
     scheduler_request: Cell<Option<SpeculativeRequestId>>,
+    prefill_scope:
+        RefCell<Option<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority>>,
     numerical: OriginalSpeculativeNumericalSources,
 }
 impl std::fmt::Debug for OriginalEmbeddedSources<'_> {
@@ -36,8 +38,8 @@ impl<'a> OriginalEmbeddedSources<'a> {
     pub(crate) fn prepare(
         target: &Executable,
         schedule: EmbeddedSchedulePlan<'a>,
-        pool: &WorkingMemoryPool,
-        capacity: u64,
+        pool: &MemoryLedger,
+        capacity: eredu_core::MemoryLimits,
         funding: HostMetadataFunding,
     ) -> Result<Self, Error> {
         let source = OriginalSpeculativeNumericalPreparation::prepare(target, pool, funding)?;
@@ -49,24 +51,20 @@ impl<'a> OriginalEmbeddedSources<'a> {
     pub(crate) fn prepare_from_source(
         source: OriginalSpeculativeNumericalPreparation,
         schedule: EmbeddedSchedulePlan<'a>,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, Error> {
         let parts = [
             size_of::<Self>(),
             size_of::<Result<Self, Error>>(),
             size_of::<EmbeddedSchedulePlan<'a>>(),
-            size_of::<(
-                OriginalSpeculativeNumericalPreparation,
-                u64,
-            )>(),
+            size_of::<(OriginalSpeculativeNumericalPreparation, u64)>(),
         ];
         let controls = parts
             .into_iter()
             .try_fold(size_of_val(&parts), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
-        source.metadata_funding()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
+        source
+            .metadata_funding()
             .reserve_metadata(controls)
             .map_err(Error::WorkspacePlanning)?;
         let request = OriginalSpeculativeRequest::prepare_embedded(
@@ -80,6 +78,7 @@ impl<'a> OriginalEmbeddedSources<'a> {
         Ok(Self {
             cursor: RefCell::new(schedule.into_cursor()),
             scheduler_request: Cell::new(None),
+            prefill_scope: RefCell::new(None),
             numerical,
         })
     }
@@ -100,28 +99,51 @@ impl<'a> OriginalEmbeddedSources<'a> {
     /// The cursor stays exclusively borrowed until paid slot replacement and
     /// exact limit installation both complete; snapshots never own this cursor.
     pub(crate) fn prepare_continuation(
-        &self, committed: usize, status: eredu_core::generation::SpeculativeRequestStatus,
+        &self,
+        committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus,
     ) -> Result<(), Error> {
-        use eredu_runtime::speculative::embedded_occurrence::{EmbeddedContinuation, EmbeddedOccurrenceError};
-        let funding=self.numerical.metadata_funding();
-        let parts=[size_of::<(&Self,usize,eredu_core::generation::SpeculativeRequestStatus)>(),
-            size_of::<EmbeddedContinuation>(),size_of::<Result<EmbeddedContinuation,EmbeddedOccurrenceError>>(),
-            size_of::<std::cell::RefMut<'_,EmbeddedOccurrenceCursor<'_>>>(),
-            size_of::<Result<(),Error>>(),size_of::<Result<(),EmbeddedOccurrenceError>>(),
-            size_of::<Result<(),eredu_runtime::working_memory::SpeculativeContinuationError>>(),
+        use eredu_runtime::speculative::embedded_occurrence::{
+            EmbeddedContinuation, EmbeddedOccurrenceError,
+        };
+        let funding = self.numerical.metadata_funding();
+        let parts = [
+            size_of::<(
+                &Self,
+                usize,
+                eredu_core::generation::SpeculativeRequestStatus,
+            )>(),
+            size_of::<EmbeddedContinuation>(),
+            size_of::<Result<EmbeddedContinuation, EmbeddedOccurrenceError>>(),
+            size_of::<std::cell::RefMut<'_, EmbeddedOccurrenceCursor<'_>>>(),
+            size_of::<Result<(), Error>>(),
+            size_of::<Result<(), EmbeddedOccurrenceError>>(),
+            size_of::<Result<(), eredu_runtime::working_memory::SpeculativeContinuationError>>(),
             size_of::<super::SpeculativeExecutionStreams<'_>>(),
-            size_of::<Result<(),eredu_core::speculative::SpeculativeControlError>>()];
-        funding.reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?)
+            size_of::<Result<(), eredu_core::speculative::SpeculativeControlError>>(),
+        ];
+        funding
+            .reserve_metadata(
+                parts
+                    .into_iter()
+                    .try_fold(size_of_val(&parts), usize::checked_add)
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            )
             .map_err(Error::WorkspacePlanning)?;
-        let mut cursor=self.cursor.try_borrow_mut().map_err(|_|self.numerical.retain_startup_error(
-            WorkingMemoryError::AccountConstructionBusy))?;
-        let continuation=cursor.continuation(committed,status)
-            .map_err(|cause|self.numerical.retain_startup_error(cause))?;
-        self.numerical.request().prepare_embedded_continuation(&continuation,funding)
-            .map_err(|cause|self.numerical.retain_startup_error(cause))?;
-        cursor.install_continuation(continuation)
-            .map_err(|cause|self.numerical.retain_startup_error(cause))
+        let mut cursor = self.cursor.try_borrow_mut().map_err(|_| {
+            self.numerical
+                .retain_startup_error(WorkingMemoryError::AccountConstructionBusy)
+        })?;
+        let continuation = cursor
+            .continuation(committed, status)
+            .map_err(|cause| self.numerical.retain_startup_error(cause))?;
+        self.numerical
+            .request()
+            .prepare_embedded_continuation(&continuation, funding)
+            .map_err(|cause| self.numerical.retain_startup_error(cause))?;
+        cursor
+            .install_continuation(continuation)
+            .map_err(|cause| self.numerical.retain_startup_error(cause))
     }
 
     /// Claims once before source-dependent quoting/admission. Exact request
@@ -150,9 +172,7 @@ impl<'a> OriginalEmbeddedSources<'a> {
                 parts
                     .into_iter()
                     .try_fold(size_of_val(&parts), usize::checked_add)
-                    .ok_or(Error::WorkspacePlanning(
-                        HostMetadataFundingError::Overflow,
-                    ))?,
+                    .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
             )
             .map_err(Error::WorkspacePlanning)?;
         if self
@@ -179,14 +199,19 @@ impl<'a> OriginalEmbeddedSources<'a> {
     }
 }
 
-
 /// Borrowed request access erases only the cursor's selected-source lifetime.
 /// The concrete owner keeps all issuance and source state; this interface lends
 /// claims, never manufactured model or native identities.
 pub(crate) trait EmbeddedInvocationSource: std::fmt::Debug {
     fn numerical_sources(&self) -> &OriginalSpeculativeNumericalSources;
-    fn prepare_continuation(&self, committed:usize,
-        status:eredu_core::generation::SpeculativeRequestStatus)->Result<(),Error>;
+    fn prefill_schedule(
+        &self,
+    ) -> Result<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority, Error>;
+    fn prepare_continuation(
+        &self,
+        committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus,
+    ) -> Result<(), Error>;
     fn claim(
         &self,
         phase: SpeculativeActivationPhase,
@@ -196,9 +221,35 @@ pub(crate) trait EmbeddedInvocationSource: std::fmt::Debug {
     ) -> Result<EmbeddedOccurrenceClaim<'_>, Error>;
 }
 impl EmbeddedInvocationSource for OriginalEmbeddedSources<'_> {
-    fn prepare_continuation(&self,committed:usize,
-        status:eredu_core::generation::SpeculativeRequestStatus)->Result<(),Error> {
-        self.prepare_continuation(committed,status)
+    fn prefill_schedule(
+        &self,
+    ) -> Result<eredu_runtime::working_memory::SpeculativePrefillScheduleAuthority, Error> {
+        let mut slot = self
+            .prefill_scope
+            .try_borrow_mut()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        if let Some(scope) = slot.as_ref() {
+            return Ok(scope.clone());
+        }
+        let cursor = self
+            .cursor
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        let scope = self
+            .numerical
+            .request()
+            .prepare_embedded_prefill_schedule(cursor.plan(), self.numerical.metadata_funding())
+            .map_err(|error| self.numerical.retain_startup_error(error))?;
+        self.numerical.bind_prefill_schedule(&scope)?;
+        *slot = Some(scope.clone());
+        Ok(scope)
+    }
+    fn prepare_continuation(
+        &self,
+        committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus,
+    ) -> Result<(), Error> {
+        self.prepare_continuation(committed, status)
     }
     fn numerical_sources(&self) -> &OriginalSpeculativeNumericalSources {
         self.numerical_sources()
@@ -218,23 +269,28 @@ impl EmbeddedInvocationSource for OriginalEmbeddedSources<'_> {
 /// the prepared token source and native scope when used by the shared equation.
 pub(crate) trait EmbeddedNumericalInvocation: std::fmt::Debug {
     fn sources(&self) -> &OriginalSpeculativeNumericalSources;
-    fn validate_scope(&self, stream:&safemlx::Stream)->Result<(), Error>;
-    fn token(&self, token:u32, stream:&safemlx::Stream)
-        ->Result<crate::MlxTensor, Error>;
+    fn validate_scope(&self, stream: &safemlx::Stream) -> Result<(), Error>;
+    fn token(&self, token: u32, stream: &safemlx::Stream) -> Result<crate::MlxTensor, Error>;
     fn complete_state<'values>(
         &self,
         _point: eredu_architectures::speculative_execution::PredictionCompletionPoint,
-        _values: &mut dyn Iterator<Item=&'values crate::MlxTensor>,
+        _values: &mut dyn Iterator<Item = &'values crate::MlxTensor>,
         _stream: &safemlx::Stream,
-    ) -> Result<(),Error> {
-        Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))
+    ) -> Result<(), Error> {
+        Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))
     }
     /// The actual quoted immediate row, retaining its own pending destination.
     /// A scalar-only binding cannot authorize a logit row as a side effect.
     fn logits_row(
-        &self, _value: &safemlx::Array, _row: usize, _stream: &safemlx::Stream,
+        &self,
+        _value: &safemlx::Array,
+        _row: usize,
+        _stream: &safemlx::Stream,
     ) -> Result<super::sampling::logits::IndependentLogits, Error> {
-        Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))
+        Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))
     }
-
 }

@@ -116,9 +116,10 @@ fn retire_erased<T: SharedStorageRetirement>(owner: AnyOwner) {
 
 // Actual attachment element plus typed/erased construction, lookup and concrete
 // retirement controls. Arc payload/header allocation is priced by its provider.
-pub(super) fn attachment_control_bytes<T: SharedStorageRetirement>() -> Option<usize> {
+pub(super) fn attachment_control_bytes<T: SharedStorageRetirement, E>() -> Option<usize> {
     [
-        size_of::<Attachment>(),
+        attachments::node_bytes(),
+        attachments::maximum_insertion_controls::<T, E>()?,
         size_of::<SharedStorageOwner<T>>(),
         size_of::<ErasedSharedStorageOwner>(),
         size_of::<Option<T>>(),

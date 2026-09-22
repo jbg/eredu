@@ -91,6 +91,19 @@ int mlx_host_transfer_capacity_upper_bound(
     size_t nbytes,
     mlx_host_transfer_policy policy);
 
+/** Ordinary constructor controls; no native allocation or execution grant. */
+unsigned mlx_ordinary_host_buffer_capacity(
+    size_t* capacity, mlx_memory_placement* placement,
+    mlx_prepared_input_runtime runtime, size_t bytes);
+
+bool mlx_ordinary_host_buffer_observed_controls(size_t*, mlx_prepared_input_runtime, size_t rank);
+size_t mlx_ordinary_host_buffer_wrapper_controls(size_t rank);
+/** Only the ordinary copy wrapper; graph/evaluation facts remain separate. */
+size_t mlx_ordinary_host_copy_wrapper_controls(void);
+size_t mlx_ordinary_array_to_host_wrapper_controls(void);
+size_t mlx_ordinary_event_wrapper_controls(void);
+size_t mlx_ordinary_stream_clone_wrapper_controls(void);
+
 /** Allocate an uninitialized typed host transfer buffer. */
 int mlx_host_transfer_buffer_new(
     mlx_host_transfer_buffer* buffer,
@@ -155,6 +168,8 @@ int mlx_host_transfer_buffer_allocation_identity(
 int mlx_host_transfer_buffer_attach_prepared_allocation_owner(
     int* outcome, mlx_host_transfer_buffer buffer, void* node,
     void* payload, void (*release)(void*));
+/* Fixed call transports only; prepared owner nodes are separately supplied. */
+size_t mlx_host_transfer_buffer_prepared_owner_control_bytes(void);
 
 /**
  * Attach directly to shared host storage without creating/evaluating an array.

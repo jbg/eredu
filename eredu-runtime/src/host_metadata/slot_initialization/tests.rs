@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::SharedStorageDomain;
+use eredu_core::SharedStorageAccountingId;
 use std::{
     cell::Cell,
     convert::Infallible,
@@ -218,7 +218,7 @@ fn dropping_incomplete_error_retires_only_inserted_payload() {
     assert_eq!(inserted_drops.load(Ordering::SeqCst), 1);
     assert_eq!(source_drops.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        metadata.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+        metadata.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
             panic!("retired partial slots cannot acquire custody")
         }),
         Err(crate::HostSlotAttachmentError::Retired)
@@ -352,7 +352,7 @@ fn partial_unwind_drops_values_before_last_metadata_custody() {
     let mut builder = source.prepare_copy_slots().unwrap().initialize();
     let token = builder.metadata().clone();
     token
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Charge {
                 values: values.clone(),
                 retired: retired.clone(),
@@ -380,7 +380,7 @@ fn partial_unwind_drops_values_before_last_metadata_custody() {
     assert_eq!(source_drops.load(Ordering::SeqCst), 0);
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        token.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+        token.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
             panic!("retired partial slots must not acquire")
         }),
         Err(crate::HostSlotAttachmentError::Retired)
@@ -506,7 +506,7 @@ fn distinct_destination_partial_error_retires_values_before_custody() {
         Some(2 * size_of::<Option<Dropped>>() as u64)
     );
     destination_metadata
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Charge {
                 values: values.clone(),
                 retired: retired.clone(),
@@ -523,7 +523,7 @@ fn distinct_destination_partial_error_retires_values_before_custody() {
     assert_eq!((error.expected(), error.initialized()), (2, 1));
     drop(source);
     assert!(matches!(
-        source_metadata.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+        source_metadata.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
             panic!("the destination does not retain the actual source table")
         }),
         Err(crate::HostSlotAttachmentError::Retired)
@@ -533,9 +533,10 @@ fn distinct_destination_partial_error_retires_values_before_custody() {
     assert_eq!(values.load(Ordering::SeqCst), 1);
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        destination_metadata.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
-            panic!("a retired partial destination cannot acquire custody")
-        }),
+        destination_metadata
+            .try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
+                panic!("a retired partial destination cannot acquire custody")
+            }),
         Err(crate::HostSlotAttachmentError::Retired)
     ));
     drop(destination_metadata);

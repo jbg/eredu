@@ -3,6 +3,7 @@
 // buffers intentionally match MLX affine quantization byte-for-byte.
 use crate::{Endian, Error, GgmlType, Result, TensorDescriptor, TensorDescriptorView};
 use half::f16;
+mod dequantize_layout;
 mod destination;
 mod plan;
 mod preparation;

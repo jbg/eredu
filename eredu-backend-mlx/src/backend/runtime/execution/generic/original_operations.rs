@@ -22,26 +22,34 @@ use std::{
 };
 
 mod custody;
-use custody::{OperationControls, OperationRequest};
 pub(super) use custody::SpeculativeOperationRole;
+use custody::{OperationControls, OperationRequest};
 mod prediction;
 pub(crate) use prediction::{
     ActivePredictionModuleBank, PredictionModuleCall, PredictionModulePlan,
     PredictionModuleProjection, PreparedPredictionModuleBank,
 };
-mod speculative;
 mod realtime;
-pub(crate) use realtime::{RealtimeLayerwisePlan,QualifiedRealtimeLayerwisePlan};
-mod registration;
+mod speculative;
+pub(crate) use realtime::{QualifiedRealtimeLayerwisePlan, RealtimeLayerwisePlan};
 mod activation;
+mod materialization;
+mod registration;
 pub(crate) use activation::OriginalOperationActivation;
 mod selected_access;
-pub(crate) use selected_access::{OriginalSelectedResidencyAccess,PreparedSelectedResidencyAccess};
 use registration::Registry;
-pub(crate) use registration::{OriginalOperationRegistration, RegisteredOriginalScope, RegisteredScopeRetirementFailure, RegisteredScopeRetirementCause};
+#[cfg(test)]
+pub(crate) use registration::OriginalOperationScopeCountProbe;
+pub(crate) use registration::{
+    OriginalOperationRegistration, RegisteredOriginalScope, RegisteredScopeRetirementCause,
+    RegisteredScopeRetirementFailure,
+};
+pub(crate) use selected_access::{
+    OriginalSelectedResidencyAccess, PreparedSelectedResidencyAccess,
+};
 mod storage;
-use storage::{PreparedStorage, ResidencyPopulation};
 pub(super) use storage::{ForegroundDiskRequestPlan, PreparedSpeculativeForegroundSource};
+use storage::{PreparedStorage, ResidencyPopulation};
 mod gguf_host;
 pub(crate) use gguf_host::typed as gguf_host_typed;
 mod neural;
@@ -52,9 +60,14 @@ use neural::{NeuralPopulation, NeuralProducerFit};
 /// The callback returns the exact target component to the selected loader.
 pub(crate) type SpeculativeSourcePartition<'a> = &'a mut dyn FnMut(
     Option<eredu_runtime::working_memory::OriginalHostSourceBank>,
-) -> Result<Option<eredu_runtime::working_memory::OriginalHostSourceBank>, Error>;
-pub(crate) use resident::{ResidentNeuralPlan, ResidentNeuralSlot, SpeculativeNeuralOwner,
-    RealtimeNeuralPlan,QualifiedRealtimeNeuralPlan,RealtimeNeuralOwner};
+) -> Result<
+    Option<eredu_runtime::working_memory::OriginalHostSourceBank>,
+    Error,
+>;
+pub(crate) use resident::{
+    QualifiedRealtimeNeuralPlan, RealtimeNeuralOwner, RealtimeNeuralPlan, ResidentNeuralPlan,
+    ResidentNeuralSlot, SpeculativeNeuralOwner,
+};
 
 fn memory(cause: WorkingMemoryError) -> Error {
     Error::PrefillControl(cause)
@@ -198,16 +211,26 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         retained_sources: Option<&'source super::host_workspace::LayerwiseWorkspace>,
         groups: eredu_runtime::GroupSubmissionMechanism,
     ) -> Result<OriginalOperationPlan<'source, U>, Error> {
-        let counts=operation_counts(self.layout.len(),geometry)?;
-        let neural=NeuralPopulation::from_execution(&self.layout,geometry,groups,true)?;
-        let residency=ResidencyPopulation::from_policy(self,geometry)?;
-        self.operation_plan_from_population(Some(geometry),counts,neural,residency,retained_sources)
+        let counts = operation_counts(self.layout.len(), geometry)?;
+        let neural = NeuralPopulation::from_execution(&self.layout, geometry, groups, true)?;
+        let residency = ResidencyPopulation::from_policy(self, geometry)?;
+        self.operation_plan_from_population(
+            Some(geometry),
+            counts,
+            neural,
+            residency,
+            retained_sources,
+        )
     }
-    fn operation_plan_from_population<'source>(&self,geometry:Option<eredu_core::InferenceGeometry>,
-        counts:OperationCounts,neural:NeuralPopulation,residency:Option<ResidencyPopulation>,
-        retained_sources:Option<&'source super::host_workspace::LayerwiseWorkspace>)
-        ->Result<OriginalOperationPlan<'source,U>,Error> {
-        let OperationCounts{units,scopes}=counts;
+    fn operation_plan_from_population<'source>(
+        &self,
+        geometry: Option<eredu_core::InferenceGeometry>,
+        counts: OperationCounts,
+        neural: NeuralPopulation,
+        residency: Option<ResidencyPopulation>,
+        retained_sources: Option<&'source super::host_workspace::LayerwiseWorkspace>,
+    ) -> Result<OriginalOperationPlan<'source, U>, Error> {
+        let OperationCounts { units, scopes } = counts;
         if !self.pending.is_empty()
             || self.dense.as_ref().is_some_and(|dense| {
                 dense.forward.is_some() || dense.windows.iter().any(Option::is_some)
@@ -218,7 +241,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
 
         let value = OriginalOperationPlan {
             retained_sources,
-            owned_sources:None,
+            owned_sources: None,
             slot: Rc::clone(&self.original_operations),
             identity: Arc::clone(&self.workspace_identity),
             sources: Arc::clone(&self.unit_ids),
@@ -248,12 +271,25 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             foreground_disk: None,
             foreground_disk_loan: None,
             preparation_funding: None,
-            background: self.dense.as_ref().and_then(|dense| dense.controller.original_background_options())
+            background: self
+                .dense
+                .as_ref()
+                .and_then(|dense| dense.controller.original_background_options())
                 .map(|options| {
-                    let source = self.residency.background_operation_source(self.unit_ids.as_slice(), &self.layout, options.host_lookahead())
+                    let source = self
+                        .residency
+                        .background_operation_source(
+                            self.unit_ids.as_slice(),
+                            &self.layout,
+                            options.host_lookahead(),
+                        )
                         .map_err(|_| identity())?;
-                    Ok::<_, Error>(storage::foreground_disk::BackgroundSelection::new(source.clone(), options))
-                }).transpose()?,
+                    Ok::<_, Error>(storage::foreground_disk::BackgroundSelection::new(
+                        source.clone(),
+                        options,
+                    ))
+                })
+                .transpose()?,
             named_catalog: self
                 .operation_source
                 .as_ref()
@@ -288,8 +324,13 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     ) {
         let source_owners = Arc::strong_count(&self.unit_ids);
         let slot_owners = Rc::strong_count(&self.original_operations);
-        let plan = self.original_operation_plan(geometry, None,
-            eredu_runtime::GroupSubmissionMechanism::LayeredGraph).unwrap();
+        let plan = self
+            .original_operation_plan(
+                geometry,
+                None,
+                eredu_runtime::GroupSubmissionMechanism::LayeredGraph,
+            )
+            .unwrap();
         assert!(Arc::ptr_eq(&plan.sources, &self.unit_ids));
         assert!(Arc::ptr_eq(&plan.identity, &self.workspace_identity));
         assert_eq!(plan.sources.len(), self.layout.len());
@@ -326,7 +367,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
 }
 
 impl<U: 'static> OriginalOperationPlan<'_, U> {
-    fn retained_source(&self)->Option<&super::host_workspace::LayerwiseWorkspace> {
+    fn retained_source(&self) -> Option<&super::host_workspace::LayerwiseWorkspace> {
         self.retained_sources.or(self.owned_sources.as_deref())
     }
 
@@ -355,13 +396,16 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
     /// Retain the actual cumulative host preparation account. Account-only Q
     /// custody cannot create this spending capability. It follows all cold
     /// declarations and the later background source/window producers.
-    pub(crate) fn with_preparation_funding(mut self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Self {
+    pub(crate) fn with_preparation_funding(
+        mut self,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Self {
         self.preparation_funding = funding.cloned();
         self
     }
     pub(crate) fn with_foreground_disk_reads(
         mut self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Self, Error> {
         if self
             .manager
@@ -371,14 +415,23 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             if self.source_arenas.is_some() {
                 return Err(identity());
             }
-            self.foreground_disk = Some(storage::ForegroundDiskRequestPlan::new_with_metadata(
-                &self.manager,
-                pool,
-                self.window_sources.as_ref().ok_or_else(unknown)?.as_slice(),
-                self.sources.as_slice(),
-                self.residency.ok_or_else(unknown)?,
-                self.preparation_funding.as_ref(),
-            )?.with_background(self.background.as_ref(), &self.manager, self.sources.as_slice(), self.window_sources.as_ref().ok_or_else(unknown)?.as_slice(), self.preparation_funding.as_ref())?);
+            self.foreground_disk = Some(
+                storage::ForegroundDiskRequestPlan::new_with_metadata(
+                    &self.manager,
+                    pool,
+                    self.window_sources.as_ref().ok_or_else(unknown)?.as_slice(),
+                    self.sources.as_slice(),
+                    self.residency.ok_or_else(unknown)?,
+                    self.preparation_funding.as_ref(),
+                )?
+                .with_background(
+                    self.background.as_ref(),
+                    &self.manager,
+                    self.sources.as_slice(),
+                    self.window_sources.as_ref().ok_or_else(unknown)?.as_slice(),
+                    self.preparation_funding.as_ref(),
+                )?,
+            );
         }
         Ok(self)
     }
@@ -392,7 +445,9 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
     pub(crate) fn foreground_disk_population(
         &self,
     ) -> Option<crate::backend::runtime::residency::manager::ForegroundDiskPopulation> {
-        self.foreground_disk_plan()?.forward_population()?.checked_mul(self.residency?.forwards)
+        self.foreground_disk_plan()?
+            .forward_population()?
+            .checked_mul(self.residency?.forwards)
     }
     pub(crate) fn foreground_disk_forward_population(
         &self,
@@ -536,7 +591,9 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             size_of::<Option<&eredu_runtime::working_memory::WorkingMemoryReservation>>(),
             size_of::<(&PreparedStorage<U>, &OriginalResidencyAttempt)>(),
             size_of::<eredu_runtime::working_memory::OriginalOperationMetadataCustody>(),
-            size_of::<PreparationFailure<eredu_runtime::working_memory::OriginalOperationMetadataCustody>>(),
+            size_of::<
+                PreparationFailure<eredu_runtime::working_memory::OriginalOperationMetadataCustody>,
+            >(),
             size_of::<(PreparedUnit<U>, safemlx::OriginalScopeObserver)>(),
             size_of::<Result<(PreparedUnit<U>, safemlx::OriginalScopeObserver), Error>>(),
             size_of::<Box<dyn ErasedOwner>>(),
@@ -549,10 +606,24 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             .checked_add(rc_layout::<OriginalOperationSlot<U>>()?)?
             .checked_add(arc_layout::<Vec<OffloadUnitId>>()?)?
             .checked_add(Layout::new::<OwnedBank<U>>().size())?
-            .checked_add(Layout::new::<PreparationFailure>().size().max(Layout::new::<PreparationFailure<eredu_runtime::working_memory::OriginalOperationMetadataCustody>>().size()))?;
+            .checked_add(
+                Layout::new::<PreparationFailure>().size().max(
+                    Layout::new::<
+                        PreparationFailure<
+                            eredu_runtime::working_memory::OriginalOperationMetadataCustody,
+                        >,
+                    >()
+                    .size(),
+                ),
+            )?;
         unit.checked_add(neural)?
             .checked_add(u64::try_from(activation::typed_control_bytes::<U>()?).ok()?)?
-            .checked_add(u64::try_from(eredu_core::BackendFailure::source_retention_peak_bytes::<neural::NeuralBoundaryFailure<OperationControls>>()?).ok()?)?
+            .checked_add(
+                u64::try_from(eredu_core::BackendFailure::source_retention_peak_bytes::<
+                    neural::NeuralBoundaryFailure<OperationControls>,
+                >()?)
+                .ok()?,
+            )?
             .checked_add(
                 u64::try_from(
                     self.selected_stream
@@ -570,13 +641,32 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                     gguf_host::runtime_control_bytes()?
                 },
             )?
-            .checked_add(if self.foreground_disk_plan().is_some_and(|plan| plan.background().is_some()) {
-                storage::background_acquisition_control_bytes(self.foreground_disk_plan()?.background()?.host_acquisitions(), self.residency?.forwards, self.residency?.controller_units)?
-            } else { 0 })?
+            .checked_add(
+                if self
+                    .foreground_disk_plan()
+                    .is_some_and(|plan| plan.background().is_some())
+                {
+                    storage::background_acquisition_control_bytes(
+                        self.foreground_disk_plan()?
+                            .background()?
+                            .host_acquisitions(),
+                        self.residency?.forwards,
+                        self.residency?.controller_units,
+                    )?
+                } else {
+                    0
+                },
+            )?
             .checked_add(self.source_control_bytes)?
             .checked_add(
                 self.foreground_disk_plan()
-                    .map(|plan| if self.foreground_disk_loan.is_some() { plan.operation_control_bytes() } else { plan.control_bytes() })
+                    .map(|plan| {
+                        if self.foreground_disk_loan.is_some() {
+                            plan.operation_control_bytes()
+                        } else {
+                            plan.control_bytes()
+                        }
+                    })
                     .unwrap_or(Some(0))?,
             )?
             .checked_add(
@@ -647,10 +737,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                     .residency
                     .as_ref()?
                     .prepared_foreground_payload_control_bytes(
-                        self.window_sources.as_ref()?,
-                        source,
-                        &self.manager,
-                    )?,
+                    self.window_sources.as_ref()?,
+                    source,
+                    &self.manager,
+                )?,
                 Some(source) => self
                     .residency
                     .as_ref()?
@@ -675,6 +765,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         controls: OriginalTextControlGuard,
         host_destinations: Option<eredu_runtime::working_memory::OriginalHostDestinationBank>,
     ) -> Result<OriginalOperationBankOwner, Error> {
+        let at_stage = |stage, error| match error {
+            Error::PrefillControl(cause) => Error::OriginalSourceContract { stage, cause },
+            other => other,
+        };
         original.validate_request(step.request()).map_err(memory)?;
         // Missing fit is not equality evidence: two None facts cannot authorize
         // constructing current-miss source arenas without their reservation.
@@ -682,24 +776,40 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         if Some(original.facts().plan().geometry()) != self.geometry
             || original.facts().operation_control_bytes() != Some(control_bytes)
         {
-            return Err(identity());
+            return Err(Error::OriginalSourceContract {
+                stage: "original operation geometry and control census",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
-        let reservation = step.request().memory_reservation().ok_or_else(identity)?;
-        controls.validate_reservation(reservation).map_err(memory)?;
+        let reservation = step.request().memory_reservation();
+        controls
+            .validate_reservation(reservation)
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "original operation control reservation",
+                cause,
+            })?;
         let source_plan = self
             .source_arenas
             .as_ref()
             .and_then(|plan| plan.as_ref().ok());
         let mut source_bank = host_destinations;
         if let Some(disk) = self.foreground_disk_plan() {
-            let bank = source_bank.as_ref().ok_or_else(identity)?;
+            disk.checked_source_facts()?;
+            disk.checked_host_facts()?;
+            let bank = source_bank.as_ref().ok_or(Error::OriginalSourceContract {
+                stage: "original operation missing disk destination bank",
+                cause: WorkingMemoryError::IdentityMismatch,
+            })?;
             if source_plan.is_some()
                 || original.facts().source_construction_facts() != disk.source_facts()
                 || original.facts().host_destination_facts() != disk.host_facts()
                 || !bank.belongs_to(&controls)
                 || !bank.matches_facts(disk.host_facts().ok_or_else(unknown)?)
             {
-                return Err(identity());
+                return Err(Error::OriginalSourceContract {
+                    stage: "original operation disk source bank",
+                    cause: WorkingMemoryError::IdentityMismatch,
+                });
             }
         } else if self.retained_source().is_some() {
             if source_plan.is_some()
@@ -707,7 +817,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                 || original.facts().source_construction_facts().is_some()
                 || original.facts().host_destination_facts().is_some()
             {
-                return Err(identity());
+                return Err(Error::OriginalSourceContract {
+                    stage: "original operation retained host source bank",
+                    cause: WorkingMemoryError::IdentityMismatch,
+                });
             }
         } else {
             let plan = source_plan.ok_or_else(unknown)?;
@@ -717,7 +830,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
                 || !bank.belongs_to(&controls)
                 || !bank.matches_facts(plan.host_facts())
             {
-                return Err(identity());
+                return Err(Error::OriginalSourceContract {
+                    stage: "original operation generated source bank",
+                    cause: WorkingMemoryError::IdentityMismatch,
+                });
             }
         }
         let residency = self.residency.ok_or_else(unknown)?;
@@ -725,7 +841,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             .manager
             .matches_operation_source(self.source_manager.as_ref().ok_or_else(unknown)?)
         {
-            return Err(identity());
+            return Err(Error::OriginalSourceContract {
+                stage: "original operation manager source",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         // Refuse replacement of live storage before any construction. A stale
         // weak installation can only be retired outside the slot's Cell access.
@@ -747,7 +866,11 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             plan.validate_catalog_origins(reservation)?;
             None
         };
-        let PreparedContainers { requests, scopes, pending } = self.prepare_containers(&controls)?;
+        let PreparedContainers {
+            requests,
+            scopes,
+            pending,
+        } = self.prepare_containers(&controls)?;
         let mut prepared = PreparedStorage::new(
             self.units,
             residency,
@@ -769,8 +892,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             } else {
                 None
             },
-        )?;
+        )
+        .map_err(|error| at_stage("original operation prepared storage", error))?;
         let registry = Rc::new(Registry {
+            materialized_recipe: RefCell::new(None),
             request: step.request().clone().into(),
             scopes: RefCell::new(scopes),
             scope_limit: self.scopes,
@@ -781,6 +906,10 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         });
         let background = prepared.background.take();
         let bank = Rc::new(Bank {
+            replacements: self
+                .retained_source()
+                .map(|source| source.replacement_values().clone())
+                .unwrap_or_default(),
             background: RefCell::new(background),
             prepared: RefCell::new(prepared),
             pending: RefCell::new(pending),
@@ -789,10 +918,15 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
             requests,
             registry,
             _retained_sources: retained_sources,
-            selected_stream: self.selected_stream.ok_or_else(identity)?,
+            selected_stream: self.selected_stream.ok_or(Error::OriginalSourceContract {
+                stage: "original operation missing selected stream",
+                cause: WorkingMemoryError::IdentityMismatch,
+            })?,
             identity: self.identity,
         });
-        registration.install(&bank.registry)?;
+        registration
+            .install(&bank.registry)
+            .map_err(|error| at_stage("original operation registry installation", error))?;
         let view = OriginalOperationProjection {
             value: Rc::downgrade(&bank),
             identity: Arc::clone(&bank.identity),
@@ -818,7 +952,8 @@ struct PreparedContainers<U: 'static> {
 }
 impl<U: 'static> OriginalOperationPlan<'_, U> {
     fn prepare_containers<C: Clone + std::fmt::Debug + Send + Sync + 'static>(
-        &self, controls: &C,
+        &self,
+        controls: &C,
     ) -> Result<PreparedContainers<U>, Error> {
         let mut requests = Vec::new();
         requests
@@ -837,14 +972,21 @@ impl<U: 'static> OriginalOperationPlan<'_, U> {
         pending
             .try_reserve_exact(self.pending)
             .map_err(|e| reserve_error(e, controls))?;
-        Ok(PreparedContainers { requests, scopes, pending })
+        Ok(PreparedContainers {
+            requests,
+            scopes,
+            pending,
+        })
     }
 }
 
 struct Bank<U: 'static> {
+    replacements: eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
     selected_stream: safemlx::StreamCopyPlan<()>,
     prepared: RefCell<PreparedStorage<U>>,
-    background: RefCell<Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>>,
+    background: RefCell<
+        Option<crate::backend::runtime::residency::dense_stream::BackgroundHostCoordinator>,
+    >,
     pending: RefCell<VecDeque<MlxUnitLease<U>>>,
     pending_limit: usize,
     binding_row_limit: usize,
@@ -860,10 +1002,16 @@ pub(crate) struct OriginalOperationBankOwner {
     controls: OperationControls,
 }
 trait ErasedOwner {
-    fn activate(&self, _controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
+    fn activate(
+        &self,
+        _controls: &OperationControls,
+    ) -> Result<OriginalOperationActivation, Error> {
         Err(identity())
     }
-    fn selected_residency_access(&self,_role:&SpeculativeOperationRole)->Result<OriginalSelectedResidencyAccess,Error> {
+    fn selected_residency_access(
+        &self,
+        _role: &SpeculativeOperationRole,
+    ) -> Result<OriginalSelectedResidencyAccess, Error> {
         Err(identity())
     }
 }
@@ -876,8 +1024,14 @@ impl<U: 'static> ErasedOwner for OwnedBank<U> {
     fn activate(&self, controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
         self.activate_text(controls)
     }
-    fn selected_residency_access(&self,role:&SpeculativeOperationRole)->Result<OriginalSelectedResidencyAccess,Error> {
-        OriginalSelectedResidencyAccess::registered(self.bank.registry.clone(),OperationControls::Speculative(role.clone()))
+    fn selected_residency_access(
+        &self,
+        role: &SpeculativeOperationRole,
+    ) -> Result<OriginalSelectedResidencyAccess, Error> {
+        OriginalSelectedResidencyAccess::registered(
+            self.bank.registry.clone(),
+            OperationControls::Speculative(role.clone()),
+        )
     }
 }
 impl<U: 'static> Drop for OwnedBank<U> {
@@ -892,7 +1046,9 @@ impl<U: 'static> Drop for OwnedBank<U> {
             self.slot.set(old);
         }
         self.bank.registry.active.set(false);
-        if let Some(registration) = &self.registration { registration.clear(&self.bank.registry); }
+        if let Some(registration) = &self.registration {
+            registration.clear(&self.bank.registry);
+        }
         // Fields retire after this method: actual bank/unused nodes first,
         // independent slot and registration, then erased outer Q custody last.
     }
@@ -956,6 +1112,19 @@ pub(crate) struct OriginalOperationAccess<U: 'static> {
     controls: OperationControls,
 }
 impl<U: 'static> OriginalOperationAccess<U> {
+    pub(crate) fn validate_parameter_replacements(
+        &self,
+        actual: Option<&eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>>,
+    ) -> Result<(), Error> {
+        self.bank.registry.authenticate()?;
+        if actual.map_or(self.bank.replacements.is_empty(), |actual| {
+            self.bank.replacements.same_source(actual)
+        }) {
+            Ok(())
+        } else {
+            Err(identity())
+        }
+    }
     pub(crate) fn binding_row_limit(&self) -> Result<usize, Error> {
         self.bank.registry.authenticate()?;
         Ok(self.bank.binding_row_limit)
@@ -1047,46 +1216,110 @@ impl<U: 'static> OriginalOperationAccess<U> {
             .try_borrow_mut()
             .map_err(|_| Error::PrefillScopeReentrant)?;
         self.controls.validate(&self.bank.registry)?;
-        operation(
-            &mut storage.residency(&mut attempt.value, self.bank.registry.request.memory_reservation()),
-            &observer,
-        )
+        let materialized = self.bank.registry.materialization_owner()?;
+        let mut slots = storage.residency(
+            &mut attempt.value,
+            self.bank.registry.request.memory_reservation(),
+        );
+        slots.materialized_recipe = materialized
+            .as_ref()
+            .map(materialization::MaterializationOwner::loan);
+        operation(&mut slots, &observer)
     }
 
     pub(crate) fn has_background(&self) -> Result<bool, Error> {
-        Ok(self.bank.background.try_borrow().map_err(|_| Error::PrefillScopeReentrant)?.is_some())
+        Ok(self
+            .bank
+            .background
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?
+            .is_some())
     }
     pub(crate) fn with_background_window<T, F>(&self, index: usize, execute: F) -> Result<T, Error>
-    where F: FnOnce(&crate::backend::runtime::residency::dense_stream::BackgroundHostReadService,
-        crate::backend::runtime::residency::manager::PreparedBackgroundHostWindow) -> Result<T, Error> {
+    where
+        F: FnOnce(
+            &crate::backend::runtime::residency::dense_stream::BackgroundHostReadService,
+            crate::backend::runtime::residency::manager::PreparedBackgroundHostWindow,
+        ) -> Result<T, Error>,
+    {
         self.bank.registry.authenticate()?;
         self.controls.validate(&self.bank.registry)?;
         // Successful earlier native leases must have passed the exact finish /
         // transfer synchronization / payload release worker before new reads.
-        if !self.pending_is_empty()? { self.fence(); return Err(Error::PrefillScopeUnavailable); }
-        let mut background = self.bank.background.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?;
-        background.as_mut().ok_or_else(identity)?.with_window(index, self.bank.registry.request.memory_reservation(), execute)
+        if !self.pending_is_empty()? {
+            self.fence();
+            return Err(Error::PrefillScopeUnavailable);
+        }
+        let mut background = self
+            .bank
+            .background
+            .try_borrow_mut()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        background.as_mut().ok_or_else(identity)?.with_window(
+            index,
+            self.bank.registry.request.memory_reservation(),
+            execute,
+        )
     }
-    pub(crate) fn with_host_and_device<T>(&self, index: usize, attempt: &mut OriginalResidencyAttempt,
-        operation: impl FnOnce(&mut crate::backend::runtime::residency::manager::OriginalResidencySlots<'_>,
-            &mut crate::backend::runtime::residency::manager::OriginalResidencySlots<'_>, &safemlx::OriginalScopeObserver) -> Result<T, Error>,
+    pub(crate) fn with_host_and_device<T>(
+        &self,
+        index: usize,
+        attempt: &mut OriginalResidencyAttempt,
+        operation: impl FnOnce(
+            &mut crate::backend::runtime::residency::manager::OriginalResidencySlots<'_>,
+            &mut crate::backend::runtime::residency::manager::OriginalResidencySlots<'_>,
+            &safemlx::OriginalScopeObserver,
+        ) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        if !Rc::ptr_eq(&attempt.registry, &self.bank.registry) { return Err(identity()); }
+        if !Rc::ptr_eq(&attempt.registry, &self.bank.registry) {
+            return Err(identity());
+        }
         let observer = self.bank.registry.authenticate()?;
         self.controls.validate(&self.bank.registry)?;
-        let mut storage = self.bank.prepared.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?;
-        storage.with_host_and_device(index, &mut attempt.value, self.bank.registry.request.memory_reservation(), |host, device| operation(host, device, &observer))
+        let materialized = self.bank.registry.materialization_owner()?;
+        let mut storage = self
+            .bank
+            .prepared
+            .try_borrow_mut()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        storage.with_host_and_device(
+            index,
+            &mut attempt.value,
+            self.bank.registry.request.memory_reservation(),
+            |host, device| {
+                let mut host = host.reborrow();
+                let mut device = device.reborrow();
+                host.materialized_recipe = materialized
+                    .as_ref()
+                    .map(materialization::MaterializationOwner::loan);
+                device.materialized_recipe = materialized
+                    .as_ref()
+                    .map(materialization::MaterializationOwner::loan);
+                operation(&mut host, &mut device, &observer)
+            },
+        )
     }
-    pub(crate) fn finish_background_forward(&self) -> Result<Option<eredu_core::residency::BackgroundPrefetchReport>, Error> {
+    pub(crate) fn finish_background_forward(
+        &self,
+    ) -> Result<Option<eredu_core::residency::BackgroundPrefetchReport>, Error> {
         if !self.pending_is_empty()? {
             if let Ok(background) = self.bank.background.try_borrow() {
-                if let Some(background) = background.as_ref() { background.close(); }
+                if let Some(background) = background.as_ref() {
+                    background.close();
+                }
             }
             return Err(Error::PrefillScopeUnavailable);
         }
         self.controls.validate(&self.bank.registry)?;
-        let mut background = self.bank.background.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?;
-        match background.as_mut() { Some(value) => value.finish_forward().map(Some), None => Ok(None) }
+        let mut background = self
+            .bank
+            .background
+            .try_borrow_mut()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        match background.as_mut() {
+            Some(value) => value.finish_forward().map(Some),
+            None => Ok(None),
+        }
     }
     pub(crate) fn push_pending(&self, lease: MlxUnitLease<U>) -> Result<(), Error> {
         let mut queue = self
@@ -1128,7 +1361,9 @@ impl<U: 'static> OriginalOperationAccess<U> {
     pub(crate) fn fence(&self) {
         self.bank.registry.active.set(false);
         if let Ok(background) = self.bank.background.try_borrow() {
-            if let Some(background) = background.as_ref() { background.close(); }
+            if let Some(background) = background.as_ref() {
+                background.close();
+            }
         }
     }
     pub(crate) fn discard_pending(&self) -> Result<(), Error> {
@@ -1162,7 +1397,10 @@ impl<C: std::fmt::Debug> std::error::Error for PreparationFailure<C> {
         Some(&self.cause)
     }
 }
-fn reserve_error<C: Clone + std::fmt::Debug + Send + Sync + 'static>(cause: TryReserveError, controls: &C) -> Error {
+fn reserve_error<C: Clone + std::fmt::Debug + Send + Sync + 'static>(
+    cause: TryReserveError,
+    controls: &C,
+) -> Error {
     Error::with_original_control_source(
         eredu_core::BackendFailure::from_error(PreparationFailure {
             cause,
@@ -1197,7 +1435,10 @@ pub(crate) enum SelectedOriginalOperationPlan<'a, U: 'static> {
     Resident(crate::backend::runtime::execution::generic::ResidentNeuralPlan<U>),
 }
 impl<'a, U: 'static> SelectedOriginalOperationPlan<'a, U> {
-    pub(crate) fn with_preparation_funding(self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Self {
+    pub(crate) fn with_preparation_funding(
+        self,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Self {
         match self {
             Self::Bounded(plan) => Self::Bounded(plan.with_preparation_funding(funding)),
             resident => resident,
@@ -1212,7 +1453,7 @@ impl<'a, U: 'static> SelectedOriginalOperationPlan<'a, U> {
 
     pub(crate) fn with_foreground_disk_reads(
         self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Self, Error> {
         match self {
             Self::Bounded(plan) => plan.with_foreground_disk_reads(pool).map(Self::Bounded),
@@ -1307,13 +1548,14 @@ fn selected_plan_control_bytes<U: 'static>() -> Option<u64> {
     let group_source = [
         // Both actual receivers are thin loans of sized runtime/executor
         // owners. The forwarding branch includes both hooks; direct uses one.
-        size_of::<(&(), Mechanism)>().max(
-            size_of::<(&(), Mechanism)>().checked_mul(2)?),
+        size_of::<(&(), Mechanism)>().max(size_of::<(&(), Mechanism)>().checked_mul(2)?),
         size_of::<Mechanism>(), // Selected policy's plan argument.
         // Resident policy then slot, or the single bounded policy entry.
         size_of::<Mechanism>().max(size_of::<Mechanism>().checked_mul(2)?),
         size_of::<Mechanism>(), // NeuralPopulation::from_execution argument.
-    ].into_iter().try_fold(0usize, usize::checked_add)?;
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)?;
     u64::try_from(
         size_of::<SelectedOriginalOperationPlan<'static, U>>()
             .checked_add(group_source)?
@@ -1326,24 +1568,43 @@ fn selected_plan_control_bytes<U: 'static>() -> Option<u64> {
     .ok()
 }
 
-impl<U:'static> OriginalOperationAccess<U> {
+impl<U: 'static> OriginalOperationAccess<U> {
     /// Narrow loan of this exact registered operation, independent of unit type.
-    pub(crate) fn selected_residency_access(&self)->Result<OriginalSelectedResidencyAccess,Error> {
-        OriginalSelectedResidencyAccess::registered(Rc::clone(&self.bank.registry),self.controls.clone())
+    pub(crate) fn selected_residency_access(
+        &self,
+    ) -> Result<OriginalSelectedResidencyAccess, Error> {
+        OriginalSelectedResidencyAccess::registered(
+            Rc::clone(&self.bank.registry),
+            self.controls.clone(),
+        )
     }
-    pub(crate) fn validate_selected_residency_bank(&self,bank:&eredu_runtime::working_memory::OriginalHostSourceBank)->Result<(),Error> {
+    pub(crate) fn validate_selected_residency_bank(
+        &self,
+        bank: &eredu_runtime::working_memory::OriginalHostSourceBank,
+    ) -> Result<(), Error> {
         self.selected_residency_access()?.validate_bank(bank)
     }
-    pub(crate) fn prepare_selected_residency(&self,manager:&ResidencyManager,
-        source:&crate::backend::runtime::residency::manager::SupplementaryResidencySource,
-        roots:&[OffloadUnitId],bank:&mut eredu_runtime::working_memory::OriginalHostSourceBank,
-    )->Result<OriginalSelectedResidencyAttempt,Error> {
-        self.selected_residency_access()?.prepare(manager,source,roots,bank,None)
+    pub(crate) fn prepare_selected_residency(
+        &self,
+        manager: &ResidencyManager,
+        source: &crate::backend::runtime::residency::manager::SupplementaryResidencySource,
+        roots: &[OffloadUnitId],
+        bank: &mut eredu_runtime::working_memory::OriginalHostSourceBank,
+    ) -> Result<OriginalSelectedResidencyAttempt, Error> {
+        self.selected_residency_access()?
+            .prepare(manager, source, roots, bank, None)
     }
-    pub(crate) fn with_selected_residency<T>(&self,attempt:&mut OriginalSelectedResidencyAttempt,
-        execute:impl FnOnce(&mut crate::backend::runtime::residency::manager::OriginalResidencySlots<'_>,
-            &safemlx::OriginalScopeObserver)->Result<T,Error>,
-    )->Result<T,Error> {self.selected_residency_access()?.with_residency(attempt,execute)}
+    pub(crate) fn with_selected_residency<T>(
+        &self,
+        attempt: &mut OriginalSelectedResidencyAttempt,
+        execute: impl FnOnce(
+            &mut crate::backend::runtime::residency::manager::OriginalResidencySlots<'_>,
+            &safemlx::OriginalScopeObserver,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.selected_residency_access()?
+            .with_residency(attempt, execute)
+    }
 }
 impl OriginalSelectedResidencyAttempt {
     /// The same window factory supplies native transfers, waits, root slots and retries.
@@ -1356,36 +1617,61 @@ impl OriginalSelectedResidencyAttempt {
     /// A caller's conservative population remains only a byte ceiling; runtime
     /// preparation recomputes the actual root closure before its second debit.
     pub(crate) fn construction_bytes(
-        source:&crate::backend::runtime::residency::manager::SupplementaryResidencySource,
-        population:crate::backend::runtime::residency::manager::WindowPopulation,
-    )->Option<u64> {
-        if population.controller_units!=source.source().controller_units {return None;}
-        storage::PreparedSelectedResidency::scratch_bytes(source)?
-            .checked_add(storage::PreparedSelectedResidency::window_bytes(population)?)
+        source: &crate::backend::runtime::residency::manager::SupplementaryResidencySource,
+        population: crate::backend::runtime::residency::manager::WindowPopulation,
+    ) -> Option<u64> {
+        if population.controller_units != source.source().controller_units {
+            return None;
+        }
+        storage::PreparedSelectedResidency::scratch_bytes(source)?.checked_add(
+            storage::PreparedSelectedResidency::window_bytes(population)?,
+        )
+    }
+    pub(crate) fn source_construction_bytes(
+        source: &crate::backend::runtime::residency::manager::SelectedResidencySource,
+        population: crate::backend::runtime::residency::manager::WindowPopulation,
+    ) -> Option<u64> {
+        if population.controller_units != source.source().controller_units {
+            return None;
+        }
+        storage::PreparedSelectedResidency::source_scratch_bytes(source)?.checked_add(
+            storage::PreparedSelectedResidency::window_bytes(population)?,
+        )
     }
     /// Scratch and exact final window each consume one finite attempt.
-    pub(crate) const fn construction_attempts()->usize {2}
+    pub(crate) const fn construction_attempts() -> usize {
+        2
+    }
 }
 
-impl<U:'static> OriginalOperationAccess<U> {
-    pub(crate) fn prepare_selected_disk_residency(&self,manager:&ResidencyManager,
-        source:&crate::backend::runtime::residency::manager::SupplementaryResidencySource,
-        roots:&[OffloadUnitId],bank:&mut eredu_runtime::working_memory::OriginalHostSourceBank,
-        pool:&eredu_runtime::working_memory::WorkingMemoryPool,
-        capacity:&crate::backend::runtime::residency::manager::ForegroundDiskSourceCapacity,
-        funding:&eredu_nn::workspace::HostMetadataFunding,
-    )->Result<OriginalSelectedResidencyAttempt,Error> {
-        self.selected_residency_access()?.prepare(manager,source,roots,bank,Some((pool,capacity,funding)))
+impl<U: 'static> OriginalOperationAccess<U> {
+    pub(crate) fn prepare_selected_disk_residency(
+        &self,
+        manager: &ResidencyManager,
+        source: &crate::backend::runtime::residency::manager::SupplementaryResidencySource,
+        roots: &[OffloadUnitId],
+        bank: &mut eredu_runtime::working_memory::OriginalHostSourceBank,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
+        capacity: &crate::backend::runtime::residency::manager::ForegroundDiskSourceCapacity,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<OriginalSelectedResidencyAttempt, Error> {
+        self.selected_residency_access()?.prepare(
+            manager,
+            source,
+            roots,
+            bank,
+            Some((pool, capacity, funding)),
+        )
     }
 }
 impl OriginalSelectedResidencyAttempt {
     /// Both quoted producer rows are derived from the same actual selected
     /// manager. Runtime still validates their descriptor source and root list.
     pub(crate) fn disk_construction_bytes(
-        source:&crate::backend::runtime::residency::manager::SupplementaryResidencySource,
-        population:crate::backend::runtime::residency::manager::WindowPopulation,
-        disk:&crate::backend::runtime::residency::manager::ForegroundDiskWindowPlan,
-    )->Option<u64> {
-        Self::construction_bytes(source,population)?.checked_add(disk.attempt_control_bytes()?)
+        source: &crate::backend::runtime::residency::manager::SupplementaryResidencySource,
+        population: crate::backend::runtime::residency::manager::WindowPopulation,
+        disk: &crate::backend::runtime::residency::manager::ForegroundDiskWindowPlan,
+    ) -> Option<u64> {
+        Self::construction_bytes(source, population)?.checked_add(disk.attempt_control_bytes()?)
     }
 }

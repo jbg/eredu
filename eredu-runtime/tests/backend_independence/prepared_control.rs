@@ -3,7 +3,7 @@ use super::*;
 mod prediction_loan;
 use eredu_runtime::{
     working_memory::{
-        InferenceExecutionIdentity, InferenceRequest, InferenceStateRetention, WorkingMemoryPool,
+        InferenceExecutionIdentity, InferenceRequest, InferenceStateRetention, MemoryLedger,
     },
     HostSlotAttachmentError, HostSlotMetadata, SharedPreparedInputCacheIdentity,
 };
@@ -67,13 +67,13 @@ fn state(position: i32, layers: usize, head_dim: i32) -> State {
     .unwrap()
 }
 
-fn retain_unquoted(state: &mut State, pool: &WorkingMemoryPool) {
+fn retain_unquoted(state: &mut State, pool: &MemoryLedger) {
     let owner = pool.acquire_unquoted().unwrap();
     state.inference_retention_mut().retain_unquoted(&owner);
 }
 
 fn request(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     execution: &InferenceExecutionIdentity,
     position: u64,
 ) -> InferenceRequest {
@@ -92,7 +92,7 @@ fn request(
 
 fn assert_retired(token: &HostSlotMetadata) {
     assert!(matches!(
-        token.try_attach(&eredu_core::SharedStorageDomain::default(), || {
+        token.try_attach(&eredu_core::SharedStorageAccountingId::default(), || {
             panic!("retired table cannot acquire new custody");
             #[allow(unreachable_code)]
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(()))
@@ -120,8 +120,8 @@ fn prompt_identity() -> SharedPreparedInputCacheIdentity {
 fn prepared_binding_moves_exact_table_and_prompt_without_old_retention_or_copy() {
     let (mut session, counters) = session();
     assert!(session.capture_control_state(&()).is_err());
-    let old_pool = WorkingMemoryPool::new(1024, 0).unwrap();
-    let new_pool = WorkingMemoryPool::new(1024, 0).unwrap();
+    let old_pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
+    let new_pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let old_request = request(&old_pool, &execution, 3);
     let new_request = request(&new_pool, &execution, 7);
@@ -195,15 +195,24 @@ fn prepared_binding_moves_exact_table_and_prompt_without_old_retention_or_copy()
         .unwrap()
         .same_storage(&prompt));
     drop(new_request);
-    assert_eq!(old_pool.used_bytes().unwrap(), 384);
-    assert_eq!(new_pool.used_bytes().unwrap(), 384);
+    assert_eq!(
+        old_pool.live_charge_bytes().unwrap(),
+        mock_reservation_bytes()
+    );
+    assert_eq!(
+        new_pool.live_charge_bytes().unwrap(),
+        mock_reservation_bytes()
+    );
     // The displaced state alone owns the old request; binding did not inherit it.
     drop(slot);
-    assert_eq!(old_pool.used_bytes().unwrap(), 0);
-    assert_eq!(new_pool.used_bytes().unwrap(), 384);
+    assert_eq!(old_pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(
+        new_pool.live_charge_bytes().unwrap(),
+        mock_reservation_bytes()
+    );
     session.validate_control_state_origin(&origin).unwrap();
     drop(session);
-    assert_eq!(new_pool.used_bytes().unwrap(), 0);
+    assert_eq!(new_pool.payload_used_bytes().unwrap(), 0);
     assert_retired(&table);
 }
 
@@ -214,8 +223,9 @@ fn foreign_and_invalidated_origins_reject_cold_then_drop_consumed_state() {
     let foreign_origin = foreign.control_state_origin().unwrap();
     let stale_origin = target.control_state_origin().unwrap();
     target.validate_control_state_origin(&stale_origin).unwrap();
-    target.invalidate_parameter_snapshots();
-    let pool = WorkingMemoryPool::new(1024, 0).unwrap();
+    let publication_pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
+    super::original_resident_reset::publication::publish_generation(&mut target, &publication_pool);
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let before = counters.snapshot();
     for origin in [&foreign_origin, &stale_origin] {
         let error = target.validate_control_state_origin(origin).unwrap_err();
@@ -228,8 +238,8 @@ fn foreign_and_invalidated_origins_reject_cold_then_drop_consumed_state() {
         let token = prepared.layer_slot_metadata().unwrap().clone();
         let bytes = token.capacity_bytes().unwrap();
         token
-            .try_attach(&eredu_core::SharedStorageDomain::default(), || {
-                pool.register_storage([(token.identity().clone(), bytes)])
+            .try_attach(&eredu_core::SharedStorageAccountingId::default(), || {
+                pool.register_host_storage([(token.identity().clone(), bytes)])
                     .map(|charge| Box::new(charge) as Box<dyn Send + Sync>)
             })
             .unwrap();
@@ -240,9 +250,9 @@ fn foreign_and_invalidated_origins_reject_cold_then_drop_consumed_state() {
         assert_retired(&token);
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
         // Escaped metadata retains conservative charge but no retired payload.
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         drop(token);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     assert_eq!(target.report().unwrap().state_report(), &[0]);
     assert_eq!(
@@ -265,7 +275,7 @@ fn foreign_and_invalidated_origins_reject_cold_then_drop_consumed_state() {
 fn prepared_binding_rejects_wrong_layer_geometry_and_absent_state_without_panicking() {
     let (session, counters) = session();
     let origin = session.control_state_origin().unwrap();
-    let pool = WorkingMemoryPool::new(1024, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let before = counters.snapshot();
     for mut prepared in [state(4, 2, 1), state(4, 1, 2), State::stateless()] {
         retain_unquoted(&mut prepared, &pool);
@@ -297,7 +307,7 @@ fn prepared_binding_rejects_wrong_layer_geometry_and_absent_state_without_panick
 #[test]
 fn origin_clones_do_not_retain_installed_payload_or_accounting_custody() {
     let (mut session, _) = session();
-    let pool = WorkingMemoryPool::new(1024, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let mut installed = state(5, 1, 1);
     retain_unquoted(&mut installed, &pool);
     let table = installed.layer_slot_metadata().unwrap().clone();
@@ -394,7 +404,7 @@ fn failed_control_agreement_fences_origin_validation_and_consumes_rejected_candi
     let before_calls = calls.borrow().len();
     assert!(session.control_state_origin().is_err());
     assert!(session.validate_control_state_origin(&origin).is_err());
-    let pool = WorkingMemoryPool::new(1024, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let mut prepared = state(6, 1, 1);
     retain_unquoted(&mut prepared, &pool);
     let token = prepared.layer_slot_metadata().unwrap().clone();

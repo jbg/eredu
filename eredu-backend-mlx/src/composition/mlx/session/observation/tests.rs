@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_runtime::{
     with_routed_unit_invocation, RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver,
 };
@@ -210,4 +211,88 @@ fn composed_observer_adapters_preserve_readout_demand_without_native_allocation(
         let neutral = crate::composition::NeutralActivationObserver::new(&mut arrays);
         assert_eq!(neutral.requires_sequence_readout(), sequence);
     }
+}
+
+#[test]
+fn retained_observation_aliases_share_host_charge_until_final_owner() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+    let value = MlxTensor::from_array(Array::from_slice(&[0.5f32, -1.25, 3.5, 7.0], &[2, 2]));
+    let current = || {
+        pool.snapshot()
+            .unwrap()
+            .domains
+            .iter()
+            .find(|domain| domain.domain == pool.topology().host_domain())
+            .unwrap()
+            .current_charge_bytes
+    };
+    let baseline = current();
+    let observed = readback::observe_tensor_in(&value, &stream, &pool).unwrap();
+    assert_eq!(
+        observed.data(),
+        &TensorObservationData::F32(vec![0.5, -1.25, 3.5, 7.0])
+    );
+    assert_eq!(observed.shape(), [2, 2]);
+    let charged = current();
+    assert!(charged > baseline + 4 * std::mem::size_of::<f32>() as u64);
+    drop(value);
+    let alias = observed.clone();
+    assert!(alias.same_storage(&observed));
+    assert_eq!(current(), charged);
+    drop(observed);
+    assert_eq!(current(), charged);
+    drop(alias);
+    assert_eq!(current(), baseline);
+}
+
+#[test]
+fn retained_observation_checks_host_limit_before_readback() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let pool = crate::memory_fixture::ledger(0, 0).unwrap();
+    let value = MlxTensor::from_array(Array::from_slice(&[0.5f32, -1.25], &[2]));
+    let before = pool.snapshot().unwrap();
+    let error = readback::observe_tensor_in(&value, &stream, &pool).unwrap_err();
+    let mut cause: &dyn std::error::Error = &error;
+    let mut budget = false;
+    loop {
+        if let Some(error) =
+            cause.downcast_ref::<eredu_runtime::working_memory::WorkingMemoryError>()
+        {
+            budget |= matches!(error, eredu_runtime::working_memory::WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { domain, .. }
+            ) if *domain == pool.topology().host_domain());
+        }
+        match cause.source() {
+            Some(source) => cause = source,
+            None => break,
+        }
+    }
+    assert!(budget, "{error:?}");
+    assert_eq!(pool.snapshot().unwrap(), before);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn retained_observation_copies_noncontiguous_metal_output() {
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let source = Array::from_slice(&[1_f32, 2., 3., 4., 5., 6.], &[2, 3]);
+    let produced = source
+        .add(&source, &stream)
+        .unwrap()
+        .transpose_axes(&[1, 0], &stream)
+        .unwrap();
+    let tensor = MlxTensor::from_array(produced);
+    let before = pool.fixture_host_current().unwrap();
+    let observed = readback::observe_tensor_in(&tensor, &stream, &pool).unwrap();
+    assert_eq!(observed.shape(), &[3, 2]);
+    assert_eq!(
+        observed.data(),
+        &TensorObservationData::F32(vec![2., 8., 4., 10., 6., 12.])
+    );
+    drop(tensor);
+    assert!(pool.fixture_host_current().unwrap() > before);
+    drop(observed);
+    assert_eq!(pool.fixture_host_current().unwrap(), before);
 }

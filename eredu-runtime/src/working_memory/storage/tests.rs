@@ -1,25 +1,31 @@
 use super::*;
+use crate::working_memory::memory_fixture::separate::*;
 use std::{
     cmp::Ordering,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
         Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     },
 };
 
 #[test]
 fn registered_storage_equality_requires_live_exact_same_pool_population() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
-    let retained = pool.register_storage([(1u32, 20)]).unwrap();
-    let alias = pool.register_storage([(1u32, 20)]).unwrap();
-    let added = pool.register_storage([(2u32, 20)]).unwrap();
-    let grouped = pool.register_storage([(1u32, 20), (2, 20)]).unwrap();
-    let foreign = WorkingMemoryPool::new(100, 0).unwrap();
-    let foreign_same = foreign.register_storage([(1u32, 20)]).unwrap();
-    let foreign_larger = WorkingMemoryPool::new(100, 0).unwrap()
-        .register_storage([(1u32, 21)]).unwrap();
+    let pool = device_ledger(100, 0).unwrap();
+    let retained = pool.register_device_storage([(1u32, 20)]).unwrap();
+    let alias = pool.register_device_storage([(1u32, 20)]).unwrap();
+    let added = pool.register_device_storage([(2u32, 20)]).unwrap();
+    let grouped = pool.register_device_storage([(1u32, 20), (2, 20)]).unwrap();
+    let foreign = device_ledger(100, 0).unwrap();
+    let foreign_same = foreign.register_device_storage([(1u32, 20)]).unwrap();
+    let foreign_larger = device_ledger(100, 0)
+        .unwrap()
+        .register_device_storage([(1u32, 21)])
+        .unwrap();
     let pending = WorkingMemoryStorage::pending(vec![1u32], 20);
-    let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+    let before = (
+        pool.device_used_bytes().unwrap(),
+        pool.device_peak_bytes().unwrap(),
+    );
     assert!(alias.same_registered_storage(&retained));
     assert!(retained.same_registered_storage(&alias));
     for distinct in [&added, &grouped, &foreign_same, &foreign_larger, &pending] {
@@ -27,20 +33,32 @@ fn registered_storage_equality_requires_live_exact_same_pool_population() {
         assert!(!retained.same_registered_storage(distinct));
     }
     assert!(!pending.same_registered_storage(&pending));
-    assert_eq!((pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()), before);
-    assert!(matches!(pool.register_storage([(1u32, 21)]),
-        Err(WorkingMemoryError::StorageCapacityMismatch { .. })));
+    assert_eq!(
+        (
+            pool.device_used_bytes().unwrap(),
+            pool.device_peak_bytes().unwrap()
+        ),
+        before
+    );
+    assert!(matches!(
+        pool.register_device_storage([(1u32, 21)]),
+        Err(WorkingMemoryError::StorageCapacityMismatch { .. })
+    ));
     drop((alias, added, grouped));
-    assert_eq!(pool.used_bytes().unwrap(), 20, "retained owner covers the same live key");
+    assert_eq!(
+        pool.device_used_bytes().unwrap(),
+        20,
+        "retained owner covers the same live key"
+    );
     drop(retained);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.device_used_bytes().unwrap(), 0);
     drop(foreign_same);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.device_used_bytes().unwrap(), 0);
 }
 
 struct ProviderKey {
     id: u32,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     clones: Arc<AtomicUsize>,
     panic_on_clone: usize,
 }
@@ -82,8 +100,8 @@ impl Ord for ProviderKey {
 #[test]
 fn provider_clone_failure_precedes_accounting_and_drops_only_unregistered_owners() {
     for individual in [false, true] {
-        let pool = WorkingMemoryPool::new(100, 5).unwrap();
-        let existing = pool.register_storage([(7u32, 10)]).unwrap();
+        let pool = device_ledger(100, 5).unwrap();
+        let existing = pool.register_device_storage([(7u32, 10)]).unwrap();
         let clones = Arc::new(AtomicUsize::new(0));
         let key = |id| ProviderKey {
             id,
@@ -96,28 +114,30 @@ fn provider_clone_failure_precedes_accounting_and_drops_only_unregistered_owners
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let inventory = [(key(1), 20), (key(2), 30)];
             if individual {
-                drop(pool.register_storage_individually(inventory));
+                drop(pool.register_device_storage_individually(inventory));
             } else {
-                drop(pool.register_storage(inventory));
+                drop(pool.register_device_storage(inventory));
             }
         }));
         assert!(failure.is_err());
-        assert_eq!(pool.used_bytes().unwrap(), 15);
-        assert_eq!(pool.peak_bytes().unwrap(), 15);
+        assert_eq!(pool.device_used_bytes().unwrap(), 15);
+        assert_eq!(pool.device_peak_bytes().unwrap(), 15);
         drop(existing);
-        assert_eq!(pool.used_bytes().unwrap(), 5);
-        let fresh = pool.register_storage_individually([(1u32, 95)]).unwrap();
-        assert_eq!(pool.used_bytes().unwrap(), 100);
+        assert_eq!(pool.device_used_bytes().unwrap(), 5);
+        let fresh = pool
+            .register_device_storage_individually([(1u32, 95)])
+            .unwrap();
+        assert_eq!(pool.device_used_bytes().unwrap(), 100);
         drop(fresh);
-        assert_eq!(pool.used_bytes().unwrap(), 5);
+        assert_eq!(pool.device_used_bytes().unwrap(), 5);
     }
 }
 
 #[test]
 fn individual_registration_rejects_poison_without_losing_existing_retirement() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = device_ledger(100, 0).unwrap();
     let mut owners = pool
-        .register_storage_individually([(1u32, 20), (2, 30)])
+        .register_device_storage_individually([(1u32, 20), (2, 30)])
         .unwrap();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = pool.0.usage.lock().unwrap();
@@ -126,31 +146,31 @@ fn individual_registration_rejects_poison_without_losing_existing_retirement() {
     assert!(failure.is_err());
     for inventory in [vec![], vec![(1u32, 20)], vec![(3, 10)]] {
         assert!(matches!(
-            pool.register_storage_individually(inventory.clone()),
+            pool.register_device_storage_individually(inventory.clone()),
             Err(WorkingMemoryError::Poisoned)
         ));
         assert!(matches!(
-            pool.register_storage(inventory),
+            pool.register_device_storage(inventory),
             Err(WorkingMemoryError::Poisoned)
         ));
     }
     drop(owners.remove(&1));
     {
         let usage = pool.0.usage.lock().unwrap_err().into_inner();
-        assert_eq!(usage.registered, 30);
-        assert_eq!(usage.peak, 50);
+        assert_eq!(usage.domains[1].registered, 30);
+        assert_eq!(usage.domains[1].peak, 50);
     }
     drop(owners);
     let usage = pool.0.usage.lock().unwrap_err().into_inner();
-    assert_eq!(usage.registered, 0);
-    assert_eq!(usage.peak, 50);
+    assert_eq!(usage.domains[1].registered, 0);
+    assert_eq!(usage.domains[1].peak, 50);
     assert!(usage.storage.is_empty());
 }
 
 #[test]
 fn per_key_owner_overflow_rejects_the_whole_inventory_before_commit() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
-    let original = pool.register_storage([(2u32, 40)]).unwrap();
+    let pool = device_ledger(100, 0).unwrap();
+    let original = pool.register_device_storage([(2u32, 40)]).unwrap();
     let set_owners = |owners| {
         pool.0
             .usage
@@ -167,22 +187,24 @@ fn per_key_owner_overflow_rejects_the_whole_inventory_before_commit() {
     };
     set_owners(usize::MAX);
     assert!(matches!(
-        pool.register_storage_individually([(1u32, 10), (2, 40)]),
+        pool.register_device_storage_individually([(1u32, 10), (2, 40)]),
         Err(WorkingMemoryError::Overflow)
     ));
     assert!(matches!(
-        pool.register_storage([(1u32, 10), (2, 40)]),
+        pool.register_device_storage([(1u32, 10), (2, 40)]),
         Err(WorkingMemoryError::Overflow)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 40);
-    assert_eq!(pool.peak_bytes().unwrap(), 40);
+    assert_eq!(pool.device_used_bytes().unwrap(), 40);
+    assert_eq!(pool.device_peak_bytes().unwrap(), 40);
     set_owners(1);
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    let replacement = pool.register_storage_individually([(1u32, 100)]).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 100);
+    assert_eq!(pool.device_used_bytes().unwrap(), 0);
+    let replacement = pool
+        .register_device_storage_individually([(1u32, 100)])
+        .unwrap();
+    assert_eq!(pool.device_used_bytes().unwrap(), 100);
     drop(replacement);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.device_used_bytes().unwrap(), 0);
 }
 
 #[derive(Default)]
@@ -196,13 +218,13 @@ struct KeyEvents {
 }
 
 struct PayloadPin {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     events: Arc<KeyEvents>,
 }
 
 impl Drop for PayloadPin {
     fn drop(&mut self) {
-        assert_eq!(self.pool.used_bytes().unwrap(), 60);
+        assert_eq!(self.pool.device_used_bytes().unwrap(), 60);
         self.events
             .payload_drops
             .fetch_add(1, AtomicOrdering::SeqCst);
@@ -239,7 +261,7 @@ impl Drop for PinnedKey {
             return;
         }
         assert!(self.pin.pool.0.usage.try_lock().is_ok());
-        assert!(self.pin.pool.used_bytes().unwrap() >= 60);
+        assert!(self.pin.pool.device_used_bytes().unwrap() >= 60);
         assert_eq!(events.payload_drops.load(AtomicOrdering::SeqCst), 0);
         events.key_drops.fetch_add(1, AtomicOrdering::SeqCst);
         assert!(
@@ -252,9 +274,9 @@ impl Drop for PinnedKey {
             let replacement = self
                 .pin
                 .pool
-                .register_storage([(self.clone(), 60)])
+                .register_device_storage([(self.clone(), 60)])
                 .unwrap();
-            assert_eq!(self.pin.pool.used_bytes().unwrap(), 120);
+            assert_eq!(self.pin.pool.device_used_bytes().unwrap(), 120);
             *events.replacement.lock().unwrap() = Some(replacement);
         }
     }
@@ -262,7 +284,7 @@ impl Drop for PinnedKey {
 
 #[test]
 fn provider_keys_drop_unlocked_before_payload_bytes_are_refunded() {
-    let pool = WorkingMemoryPool::new(120, 0).unwrap();
+    let pool = device_ledger(120, 0).unwrap();
     let events = Arc::new(KeyEvents::default());
     let pin = Arc::new(PayloadPin {
         pool: pool.clone(),
@@ -272,12 +294,12 @@ fn provider_keys_drop_unlocked_before_payload_bytes_are_refunded() {
         id: 1,
         pin: pin.clone(),
     };
-    let grouped = pool.register_storage([(key(), 60)]).unwrap();
+    let grouped = pool.register_device_storage([(key(), 60)]).unwrap();
     events.armed.store(true, AtomicOrdering::SeqCst);
     // Duplicate incoming provider keys must also be destroyed outside the
     // commit lock. The result map's identity key retires before its handle.
     let individual = pool
-        .register_storage_individually([(key(), 60)])
+        .register_device_storage_individually([(key(), 60)])
         .unwrap()
         .into_values()
         .next()
@@ -285,40 +307,42 @@ fn provider_keys_drop_unlocked_before_payload_bytes_are_refunded() {
     assert!(events.key_drops.load(AtomicOrdering::SeqCst) >= 2);
     drop(pin);
     drop(grouped);
-    assert_eq!(pool.used_bytes().unwrap(), 60);
+    assert_eq!(pool.device_used_bytes().unwrap(), 60);
     assert_eq!(events.payload_drops.load(AtomicOrdering::SeqCst), 0);
     events.reregister.store(true, AtomicOrdering::SeqCst);
     drop(individual);
-    assert_eq!(pool.used_bytes().unwrap(), 60);
-    assert_eq!(pool.peak_bytes().unwrap(), 120);
+    assert_eq!(pool.device_used_bytes().unwrap(), 60);
+    assert_eq!(pool.device_peak_bytes().unwrap(), 120);
     assert_eq!(events.payload_drops.load(AtomicOrdering::SeqCst), 0);
     let replacement = events.replacement.lock().unwrap().take().unwrap();
     drop(replacement);
     assert_eq!(events.payload_drops.load(AtomicOrdering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 120);
+    assert_eq!(pool.device_used_bytes().unwrap(), 0);
+    assert_eq!(pool.device_peak_bytes().unwrap(), 120);
 }
 
 #[test]
 fn provider_destructor_panic_retains_the_charge_without_poisoning_accounting() {
-    let pool = WorkingMemoryPool::new(120, 0).unwrap();
+    let pool = device_ledger(120, 0).unwrap();
     let events = Arc::new(KeyEvents::default());
     let pin = Arc::new(PayloadPin {
         pool: pool.clone(),
         events: events.clone(),
     });
     let owner = pool
-        .register_storage([(PinnedKey { id: 1, pin }, 60)])
+        .register_device_storage([(PinnedKey { id: 1, pin }, 60)])
         .unwrap();
     events.armed.store(true, AtomicOrdering::SeqCst);
     events.panic_on_drop.store(true, AtomicOrdering::SeqCst);
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(owner)));
     assert!(failure.is_err());
     assert_eq!(events.payload_drops.load(AtomicOrdering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 60);
-    assert_eq!(pool.peak_bytes().unwrap(), 60);
-    let next = pool.register_storage_individually([(2u32, 60)]).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 120);
+    assert_eq!(pool.device_used_bytes().unwrap(), 60);
+    assert_eq!(pool.device_peak_bytes().unwrap(), 60);
+    let next = pool
+        .register_device_storage_individually([(2u32, 60)])
+        .unwrap();
+    assert_eq!(pool.device_used_bytes().unwrap(), 120);
     drop(next);
-    assert_eq!(pool.used_bytes().unwrap(), 60);
+    assert_eq!(pool.device_used_bytes().unwrap(), 60);
 }

@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    MlxTensor,
     backend::{
-        MlxBackend, MlxDeviceIdentity, managed_memory::gpu_stream::PreparedExecutionStreams,
-        nn::shared::MlxNeuralBackend,
+        managed_memory::gpu_stream::PreparedExecutionStreams, nn::shared::MlxNeuralBackend,
+        MlxBackend, MlxDeviceIdentity,
     },
+    MlxTensor,
 };
 use eredu_nn::{GatedProductPolicy, NeuralBackend, Tensor};
 use safemlx::{Array, Device, DeviceType};
@@ -73,6 +73,9 @@ impl Operation {
 }
 #[test]
 fn cpu_gelu_sigmoid_and_mixed_gated_products_match_independent_arithmetic_and_retire() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
     let selected =

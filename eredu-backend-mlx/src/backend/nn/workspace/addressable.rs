@@ -1,20 +1,23 @@
-//! Original outer normalization, row slices and output joins for an addressable
+//! Shared outer normalization, row slices and output joins for an addressable
 //! invocation. Compact construction and each completed numerical child remain
 //! separate sources; this projection alone never establishes complete admission.
 use super::*;
 use eredu_nn::Tensor;
-use std::mem::{size_of,size_of_val};
+use std::mem::{size_of, size_of_val};
 mod child;
+mod facts;
+mod local;
 mod observation;
+mod ordinary;
 mod parameters;
 mod row_candidates;
 mod sources;
-mod facts;
-pub(crate) use sources::{AddressableSources,AddressableQuoteRef,AddressableInvocation};
 pub(crate) use facts::MlxAddressableWorkspaceMechanisms;
+pub(crate) use ordinary::{OrdinaryAddressableProgram, OrdinaryAddressableSources};
+pub(crate) use sources::{AddressableInvocation, AddressableQuoteRef, AddressableSources};
 mod quote;
-pub(crate) use quote::AddressableQuote;
 pub(crate) use child::AddressableChildSource;
+pub(crate) use quote::{AddressableEquationSource, AddressableQuote};
 
 pub(crate) struct AddressableParentSource {
     pub(crate) report: WorkspaceTraceReport,
@@ -46,8 +49,9 @@ impl AddressableParentSource {
             Vec<WorkspaceLayout>,
         )>())?;
         source.validate()?;
-        let invalid = || {
-            context.metadata_error(format_args!(
+        let invalid =
+            || {
+                context.metadata_error(format_args!(
                 "addressable parent differs from its original inputs or completed child outputs: \
                  group={} bank={} unit={} prefill={} chunks={:?} dimensions={:?} partitions={:?}; \
                  inputs={:?}; completed_children={:?}",
@@ -55,7 +59,7 @@ impl AddressableParentSource {
                 source.chunks, source.kernel.dimensions(), source.tensor_partitions,
                 inputs, child_outputs,
             ))
-        };
+            };
         let chunks = source.chunks.len().ok_or_else(invalid)?;
         let roles = 1 + usize::from(source.kernel.separate_bias(source.tensor_partitions));
         if inputs.len() != 4 || child_outputs.len() != roles || chunks == 0 {
@@ -159,5 +163,10 @@ impl AddressableParentSource {
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;
 
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod tests;

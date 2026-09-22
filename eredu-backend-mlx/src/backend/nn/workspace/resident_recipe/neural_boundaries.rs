@@ -29,30 +29,46 @@ impl ResidentNativeRecipe {
         consumers: usize,
     ) -> Result<(), Error> {
         self.bind_neural_boundaries_with_roots(
-            geometry, per_forward, consumers, None, BoundaryCompletion::RetainedEvent,
+            geometry,
+            per_forward,
+            consumers,
+            None,
+            BoundaryCompletion::RetainedEvent,
         )
     }
     /// Consumes an already paid exact root-list inventory from one prediction
     /// equation. This inventory is descriptive and carries no source authority.
     pub(super) fn bind_prediction_boundaries(
-        &mut self, geometry: InferenceGeometry, roots: Vec<usize>, consumers: usize,
+        &mut self,
+        geometry: InferenceGeometry,
+        roots: Vec<usize>,
+        consumers: usize,
     ) -> Result<(), Error> {
         if self.records.len() != 1 || roots.is_empty() || roots.contains(&0) || consumers != 0 {
             return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
         }
         self.bind_neural_boundaries_with_roots(
-            geometry, roots.len(), consumers, Some(roots), BoundaryCompletion::SynchronousPrediction,
+            geometry,
+            roots.len(),
+            consumers,
+            Some(roots),
+            BoundaryCompletion::SynchronousPrediction,
         )
     }
     fn bind_neural_boundaries_with_roots(
-        &mut self, geometry: InferenceGeometry, per_forward: usize, consumers: usize,
+        &mut self,
+        geometry: InferenceGeometry,
+        per_forward: usize,
+        consumers: usize,
         roots: Option<Vec<usize>>,
         completion: BoundaryCompletion,
     ) -> Result<(), Error> {
-        let error = |cause| Error::PrefillControl(cause).at_speculative_stage(match completion {
-            BoundaryCompletion::RetainedEvent => "retained-event neural boundary",
-            BoundaryCompletion::SynchronousPrediction => "synchronous prediction boundary",
-        });
+        let error = |cause| {
+            Error::PrefillControl(cause).at_speculative_stage(match completion {
+                BoundaryCompletion::RetainedEvent => "retained-event neural boundary",
+                BoundaryCompletion::SynchronousPrediction => "synchronous prediction boundary",
+            })
+        };
         if self.plan.geometry() != geometry || self.neural.is_some() || per_forward == 0 {
             return Err(error(WorkingMemoryError::IdentityMismatch));
         }
@@ -61,10 +77,14 @@ impl ResidentNativeRecipe {
             .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
         let source_controls = if completion == BoundaryCompletion::RetainedEvent {
             ResidentDispatchPopulation::completion_stream_control_bytes()
-        } else { 0 };
+        } else {
+            0
+        };
         if source_controls != 0 {
             if let Some(funding) = &self.planning_metadata {
-                funding.reserve_metadata(source_controls).map_err(Error::WorkspacePlanning)?;
+                funding
+                    .reserve_metadata(source_controls)
+                    .map_err(Error::WorkspacePlanning)?;
             }
         }
         // Both workers use run_nested_graph_event. Mixed CPU/GPU callbacks
@@ -93,7 +113,7 @@ impl ResidentNativeRecipe {
                 // with source-copy expansion and native Graph construction.
                 (completion == BoundaryCompletion::RetainedEvent
                     && dispatch.completion_streams() != Some(traversal.limits().streams))
-                    .then_some("completion stream population")
+                .then_some("completion stream population")
             };
             if let Some(requirement) = requirement {
                 return Err(Error::NeuralBoundarySource {
@@ -112,10 +132,12 @@ impl ResidentNativeRecipe {
                 .checked_add(per_forward)
                 .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
             if source_controls != 0 && self.planning_metadata.is_none() {
-                row.query_controls = Some(row.query_controls
-                    .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?
-                    .checked_add(source_controls)
-                    .ok_or_else(|| error(WorkingMemoryError::Overflow))?);
+                row.query_controls = Some(
+                    row.query_controls
+                        .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?
+                        .checked_add(source_controls)
+                        .ok_or_else(|| error(WorkingMemoryError::Overflow))?,
+                );
             }
         }
         safemlx::OperationEvent::wait_record_layout(waits).ok_or_else(|| {
@@ -143,15 +165,31 @@ impl ResidentNativeRecipe {
         submissions: usize,
         consumers: usize,
     ) -> bool {
-        self.matches_boundaries(geometry, submissions, consumers, BoundaryCompletion::RetainedEvent)
+        self.matches_boundaries(
+            geometry,
+            submissions,
+            consumers,
+            BoundaryCompletion::RetainedEvent,
+        )
     }
     pub(super) fn matches_prediction_boundaries(
-        &self, geometry: InferenceGeometry, submissions: usize, consumers: usize,
+        &self,
+        geometry: InferenceGeometry,
+        submissions: usize,
+        consumers: usize,
     ) -> bool {
-        self.matches_boundaries(geometry, submissions, consumers, BoundaryCompletion::SynchronousPrediction)
+        self.matches_boundaries(
+            geometry,
+            submissions,
+            consumers,
+            BoundaryCompletion::SynchronousPrediction,
+        )
     }
     fn matches_boundaries(
-        &self, geometry: InferenceGeometry, submissions: usize, consumers: usize,
+        &self,
+        geometry: InferenceGeometry,
+        submissions: usize,
+        consumers: usize,
         completion: BoundaryCompletion,
     ) -> bool {
         self.plan.geometry() == geometry

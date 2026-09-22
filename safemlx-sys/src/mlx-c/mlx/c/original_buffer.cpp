@@ -1,4 +1,5 @@
 #include "mlx/c/original_buffer.h"
+#include "mlx/c/private/memory_placement.h"
 #include "mlx/original_buffer.h"
 #include "mlx/array.h"
 #include "mlx/c/private/array.h"
@@ -70,7 +71,7 @@ unsigned inspect_storage(MutableBirth& out, mlx_array source) noexcept {
   }
   // No second Array lookup. Only this serialized, same Data's sidecar may change.
   out.data = const_cast<array::Data*>(data);
-  out.info = {true, descriptor.identity, descriptor.allocation_bytes};
+  out.info = {true, descriptor.identity, descriptor.allocation_bytes, descriptor.placement, descriptor.host_control_bytes};
   return MLX_ORIGINAL_BUFFER_OK;
 }
 unsigned inspect_immutable(MutableBirth& out, mlx_array source) noexcept {
@@ -91,7 +92,7 @@ unsigned inspect_immutable(MutableBirth& out, mlx_array source) noexcept {
   if (!descriptor.known || descriptor.identity != data->allocation_generation ||
       descriptor.allocation_bytes != input->capacity) return MLX_ORIGINAL_BUFFER_LAYOUT;
   out.data = const_cast<array::Data*>(data);
-  out.info = {true, descriptor.identity, descriptor.allocation_bytes};
+  out.info = {true, descriptor.identity, descriptor.allocation_bytes, descriptor.placement, descriptor.host_control_bytes};
   out.kind = StorageKind::immutable;
   return MLX_ORIGINAL_BUFFER_OK;
 }
@@ -120,10 +121,13 @@ unsigned attach_storage(mlx_array source, Budget* budget, StorageKind kind,
   if (budget && actual.data->buffer.original_buffer_budget() != budget)
     return MLX_ORIGINAL_BUFFER_FOREIGN;
   if (actual.info.identity != expected->identity ||
-      actual.info.charged_bytes != expected->charged_bytes) return MLX_ORIGINAL_BUFFER_CHANGED;
+      actual.info.charged_bytes != expected->charged_bytes ||
+      actual.info.host_control_bytes != expected->host_control_bytes ||
+      !mlx_same_placement(actual.info.placement, expected->placement)) return MLX_ORIGINAL_BUFFER_CHANGED;
   // All checks precede arming. This is the exact Data captured above, not a
   // re-query of an Array which might now describe different storage.
-  actual.data->allocation_owners.append_prepared(
+  allocator::retain_memory_placement(actual.data->buffer);
+  actual.data->physical_allocation_owners().append_prepared(
       static_cast<AllocationOwners::Node*>(node), payload, release);
   return MLX_ORIGINAL_BUFFER_OK;
 }
@@ -150,11 +154,13 @@ extern "C" unsigned mlx_original_buffer_population_layout_for(
   using Kind = allocator::HostTransferStorageKind;
   if (!out || !runtime.allocator) return MLX_ORIGINAL_BUFFER_LAYOUT;
   if (runtime.storage_kind != static_cast<unsigned>(Kind::metal_shared) &&
-      runtime.storage_kind != static_cast<unsigned>(Kind::cpu))
+      runtime.storage_kind != static_cast<unsigned>(Kind::cpu) &&
+      runtime.storage_kind != static_cast<unsigned>(Kind::cuda_pinned) &&
+      runtime.storage_kind != static_cast<unsigned>(Kind::cuda_managed))
     return MLX_ORIGINAL_BUFFER_UNSUPPORTED;
   const auto kind = static_cast<Kind>(runtime.storage_kind);
   const allocator::PreparedInputFacts facts{runtime.page_size, runtime.maximum,
-      kind, runtime.controls};
+      kind, runtime.controls, {runtime.placement.kind, runtime.placement.device, runtime.placement.device_count}};
   size_t quantum = 0;
   // Use the exact physical rounding worker used by malloc_original; this does
   // not initialize/query the allocator. A one-byte request occupies one page.
@@ -196,7 +202,7 @@ extern "C" unsigned mlx_original_buffer_request_layout_for(
   if(runtime.storage_kind!=static_cast<unsigned>(Kind::cpu) &&
       runtime.storage_kind!=static_cast<unsigned>(Kind::metal_shared))return MLX_ORIGINAL_BUFFER_UNSUPPORTED;
   const allocator::PreparedInputFacts facts{runtime.page_size,runtime.maximum,
-      static_cast<Kind>(runtime.storage_kind),runtime.controls};
+      static_cast<Kind>(runtime.storage_kind),runtime.controls, {runtime.placement.kind, runtime.placement.device, runtime.placement.device_count}};
   size_t capacity=0;
   if(!allocator::original_buffer_physical_capacity(facts,requested_bytes,capacity))return MLX_ORIGINAL_BUFFER_LAYOUT;
   *out={capacity,mlx_original_buffer_request_control_bytes()};
@@ -205,13 +211,13 @@ extern "C" unsigned mlx_original_buffer_request_layout_for(
 
 extern "C" unsigned mlx_original_buffer_budget_new_retaining(
     mlx_original_buffer_budget* out, mlx_prepared_input_runtime runtime,
-    size_t capacity, void* owner, void (*retire)(void*)) {
+    size_t capacity, void* owner, void (*retire)(void*), void (*closed_occupancy)(void*, size_t)) {
   if (!out || out->ctx || !runtime.allocator || !owner || !retire)
     return MLX_ORIGINAL_BUFFER_LAYOUT;
   if (!mlx_submission_runtime_preparation_allowed()) return MLX_ORIGINAL_BUFFER_SCOPE;
   try {
     out->ctx = Budget::create(*static_cast<allocator::Allocator*>(runtime.allocator),
-        capacity, owner, retire);
+        capacity, owner, retire, closed_occupancy);
     return MLX_ORIGINAL_BUFFER_OK;
   } catch (const allocator::OriginalBufferError& error) { return status(error.cause()); }
   catch (const std::bad_alloc&) { return MLX_ORIGINAL_BUFFER_ALLOCATION; }
@@ -222,6 +228,12 @@ extern "C" void mlx_original_buffer_budget_retain(mlx_original_buffer_budget val
 }
 extern "C" void mlx_original_buffer_budget_release(mlx_original_buffer_budget value) {
   if (auto* p = budget(value)) p->release();
+}
+extern "C" void mlx_original_buffer_inspection_retain(mlx_original_buffer_budget value) {
+  if (auto* p = budget(value)) p->retain_backing();
+}
+extern "C" void mlx_original_buffer_inspection_release(mlx_original_buffer_budget value) {
+  if (auto* p = budget(value)) p->release_backing();
 }
 extern "C" size_t mlx_original_buffer_budget_capacity(mlx_original_buffer_budget value) {
   return budget(value) ? budget(value)->capacity() : 0;
@@ -325,7 +337,7 @@ namespace {
 void host_source_facts(mlx_immutable_host_transfer_info& out,
     const std::optional<HostTransferAllocationInfo>& actual) noexcept {
   if (actual && actual->identity)
-    out = {{true, actual->identity, actual->capacity}, actual->prepared_source};
+    out = {{true, actual->identity, actual->capacity, mlx_placement_to_c(actual->placement), actual->host_controls}, actual->prepared_source};
 }
 }
 extern "C" unsigned mlx_immutable_host_transfer_inspect(
@@ -353,6 +365,8 @@ extern "C" unsigned mlx_immutable_host_transfer_attach(mlx_host_transfer_buffer 
   if (result) return result;
   if (actual.backing.identity != expected->backing.identity ||
       actual.backing.charged_bytes != expected->backing.charged_bytes ||
+      actual.backing.host_control_bytes != expected->backing.host_control_bytes ||
+      !mlx_same_placement(actual.backing.placement, expected->backing.placement) ||
       actual.prepared_source != expected->prepared_source) return MLX_ORIGINAL_BUFFER_CHANGED;
   return mlx_host_transfer_buffer_get_(source).retain_prepared_allocation_owner(
       static_cast<AllocationOwners::Node*>(node), payload, release)
@@ -381,6 +395,8 @@ extern "C" unsigned mlx_host_transfer_array_alias_attach(mlx_array source,
   if (status) return status;
   if (!actual.backing.known) return MLX_ORIGINAL_BUFFER_UNCERTIFIED;
   if (actual.backing.identity != expected->backing.identity || actual.backing.charged_bytes != expected->backing.charged_bytes ||
+      actual.backing.host_control_bytes != expected->backing.host_control_bytes ||
+      !mlx_same_placement(actual.backing.placement, expected->backing.placement) ||
       actual.prepared_source != expected->prepared_source)
     return MLX_ORIGINAL_BUFFER_CHANGED;
   // The caller holds the same exclusive runtime loan across inspection and this
@@ -408,7 +424,7 @@ unsigned inspect_host_view(mlx_host_transfer_view_info& out,
       !descriptor.data) return MLX_ORIGINAL_BUFFER_OK;
   const auto* actual = static_cast<const array::Data*>(descriptor.data);
   if (!actual->allocation_generation) return MLX_ORIGINAL_BUFFER_LAYOUT;
-  out = {{true, descriptor.identity, descriptor.allocation_bytes},
+  out = {{true, descriptor.identity, descriptor.allocation_bytes, descriptor.placement, descriptor.host_control_bytes},
       actual->allocation_generation};
   data = const_cast<array::Data*>(actual);
   return MLX_ORIGINAL_BUFFER_OK;
@@ -434,12 +450,14 @@ extern "C" unsigned mlx_host_transfer_array_view_attach(mlx_array source,
   if (!actual.backing.known) return MLX_ORIGINAL_BUFFER_UNCERTIFIED;
   if (actual.backing.identity != expected->backing.identity ||
       actual.backing.charged_bytes != expected->backing.charged_bytes ||
+      actual.backing.host_control_bytes != expected->backing.host_control_bytes ||
+      !mlx_same_placement(actual.backing.placement, expected->backing.placement) ||
       actual.view_identity != expected->view_identity)
     return MLX_ORIGINAL_BUFFER_CHANGED;
   // Append to the exact positively inspected Data, whose ordinary destructor
   // retires shared Device views before this payload. The immutable Host source
   // owns a separate storage object and cannot pin this view's residency charge.
-  data->allocation_owners.append_prepared(
+  data->physical_allocation_owners().append_prepared(
       static_cast<AllocationOwners::Node*>(node), payload, release);
   return MLX_ORIGINAL_BUFFER_OK;
 }

@@ -28,7 +28,12 @@ impl PreparedHostMaterialization {
     pub(crate) fn bank_layout<F, E>(count: usize) -> Option<BankLayout> {
         let node = PreparedObservedRecovery::<HostMaterialization, OriginalOperationMetadataCustody>
             ::control_bytes::<Exception>()?;
-        let node = node.checked_add(u64::try_from(size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>()).ok()?)?;
+        let node = node.checked_add(
+            u64::try_from(size_of::<
+                eredu_runtime::working_memory::OriginalTextMetadataCustody,
+            >())
+            .ok()?,
+        )?;
         let dispatch =
             OperationRecovery::<HostMaterialization, OriginalOperationMetadataCustody>::control_bytes()?;
         let native = u64::try_from(OriginalScopeObserver::control_bytes()?).ok()?;

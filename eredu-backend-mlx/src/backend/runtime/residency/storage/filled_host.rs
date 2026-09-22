@@ -47,6 +47,9 @@ pub(crate) struct PublishedHostSource {
     custody: OriginalOperationMetadataCustody,
 }
 impl PublishedHostSource {
+    pub(crate) fn buffer(&self) -> &ImmutableHostTransferBuffer {
+        &self.buffer
+    }
     pub(crate) fn allocation(&self) -> AllocationInfo {
         self.allocation
     }
@@ -76,10 +79,13 @@ impl Completed {
             .as_bytes_mut()
     }
     pub(crate) fn freeze(&mut self) -> Result<(), SourceCause> {
+        if self.ready.is_some() && self.filling.is_none() {
+            return Ok(());
+        }
         match self
             .filling
             .take()
-            .expect("one immutable handoff")
+            .ok_or(SourceCause::Identity)?
             .try_return()
         {
             Ok(buffer) => {
@@ -92,6 +98,46 @@ impl Completed {
             }
         }
     }
+
+    /// The caller's native recovery owns the destination before submission.
+    /// Only this producer can convert its exact I/O writer into that native
+    /// destination; no tensor or completion becomes part of the Send handoff.
+    pub(crate) fn copy_from_array(
+        &mut self,
+        source: &safemlx::Array,
+        stream: &safemlx::Stream,
+        observer: &safemlx::OriginalScopeObserver,
+        retained: &mut Option<safemlx::PreparedHostCopyDestination>,
+    ) -> Result<(), SourceCause> {
+        if retained.is_some() || self.ready.is_some() {
+            return Err(SourceCause::Identity);
+        }
+        let writer = self.filling.take().ok_or(SourceCause::Identity)?;
+        match safemlx::PreparedHostCopyDestination::from_writer(writer) {
+            Ok(destination) => *retained = Some(destination),
+            Err(writer) => {
+                self.filling = Some(writer);
+                return Err(SourceCause::Identity);
+            }
+        }
+        let destination = retained
+            .as_mut()
+            .expect("retained before native submission");
+        destination.submit(source, stream, observer)?;
+        destination.synchronize()?;
+        self.ready = Some(destination.take_completed()?);
+        Ok(())
+    }
+}
+pub(crate) fn native_copy_control_bytes() -> Option<usize> {
+    safemlx::PreparedHostCopyDestination::control_bytes()?.checked_add(size_of::<(
+        &mut Completed,
+        &safemlx::Array,
+        &safemlx::Stream,
+        &safemlx::OriginalScopeObserver,
+        &mut Option<safemlx::PreparedHostCopyDestination>,
+        Result<(), SourceCause>,
+    )>())
 }
 #[derive(thiserror::Error)]
 pub(crate) enum SourceCause {
@@ -101,6 +147,8 @@ pub(crate) enum SourceCause {
     Arena(#[from] safemlx::SubmissionGraphQuotaCause),
     #[error("source destination: {0}")]
     Destination(#[from] safemlx::error::Exception),
+    #[error("source native store: {0}")]
+    PreparedCopy(#[from] safemlx::PreparedHostCopyError),
     #[error("source observation: {0}")]
     Observation(#[from] HostTransferMetadataError),
     #[error("source attachment: {cause}")]
@@ -264,12 +312,16 @@ impl<P: HostFillPermit> OriginalHostSourceConstruction for Copy<'_, P> {
             })
     }
     fn into_output(completed: Self::Completed) -> Self::Output {
-        let allocation = completed.allocation.get().expect("observed completed allocation");
+        let allocation = completed
+            .allocation
+            .get()
+            .expect("observed completed allocation");
         PublishedHostSource {
             buffer: completed.ready.expect("observed completed source"),
             allocation,
             // Zero-capacity sources have no canonical row or attachment.
-            proof: (allocation.bytes() != 0).then(|| super::PublishedAllocation::attached(allocation)),
+            proof: (allocation.bytes() != 0)
+                .then(|| super::PublishedAllocation::attached(allocation)),
             custody: completed.custody,
         }
     }
@@ -311,7 +363,11 @@ pub(crate) fn control_bytes<P: HostFillPermit>(
         size_of::<Completed>(),
         size_of::<PublishedHostSource>(),
         size_of::<OriginalOperationMetadataCustody>(),
-        size_of::<(ImmutableHostTransferBuffer, Option<super::PublishedAllocation>, OriginalOperationMetadataCustody)>(),
+        size_of::<(
+            ImmutableHostTransferBuffer,
+            Option<super::PublishedAllocation>,
+            OriginalOperationMetadataCustody,
+        )>(),
         size_of::<AllocationInfo>(),
         size_of::<Option<super::PublishedAllocation>>(),
         size_of::<&AllocationInfo>(),
@@ -345,9 +401,7 @@ pub(crate) fn begin<'a, P: HostFillPermit>(
         error
     })
 }
-pub(crate) fn finish(
-    pending: Pending,
-) -> Result<PublishedHostSource, SourceError> {
+pub(crate) fn finish(pending: Pending) -> Result<PublishedHostSource, SourceError> {
     // Permit identity was consumed and validated before allocation. Every
     // producer uses this exact completed/observation/attachment worker; finish
     // cannot reopen construction or acquire a fresh source grant.

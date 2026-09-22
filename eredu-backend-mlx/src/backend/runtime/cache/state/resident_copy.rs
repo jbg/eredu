@@ -1,9 +1,8 @@
 //! Closed native decoder-copy dispatch, distinct from runnable model state.
 
 use super::{
-    MlxHybridState, MlxKeyValueLayerState, MlxKeyValueState,
-    MlxPoolingAttentionCache, MlxPoolingAttentionState, PreparedResidentKvCopy,
-    ResidentKvCopyError, SavedResidentKvCopy,
+    MlxHybridState, MlxKeyValueLayerState, MlxKeyValueState, MlxPoolingAttentionCache,
+    MlxPoolingAttentionState, PreparedResidentKvCopy, ResidentKvCopyError, SavedResidentKvCopy,
     hybrid::{
         InitializedHybridGroupCopy, PreparedHybridGroupHostCopy, PreparedHybridGroupedCopy,
         SavedHybridGroupedCopy,
@@ -18,8 +17,8 @@ use crate::backend::{error::Error, runtime::residency::storage::StorageIdentity}
 use eredu_runtime::{
     SharedStateLayout,
     working_memory::{
-        AdmittedWorkspaceCopy, FundedSamplerCopy, InitializedDecoderSlots,
-        RegisteredDecoderHostCopy, RegisteredSamplingCopy, WorkingMemoryError, WorkingMemoryPool,
+        AdmittedWorkspaceCopy, FundedSamplerCopy, InitializedDecoderSlots, MemoryLedger,
+        RegisteredDecoderHostCopy, RegisteredSamplingCopy, WorkingMemoryError,
         WorkingMemoryStorage, WorkspaceCopyLimits,
     },
 };
@@ -101,6 +100,14 @@ enum PreparedStorage<'a> {
 }
 
 impl<'a> PreparedResidentDecoderCopy<'a> {
+    /// Preserve the actual inspected live source for its existing independent
+    /// paged-manager copy worker, including an empty manager with no arrays.
+    fn live_paged_key_value(&self) -> Option<&'a MlxKeyValueState> {
+        match &self.storage {
+            PreparedStorage::Paged(source) => source.live_source(),
+            _ => None,
+        }
+    }
     pub(crate) fn is_paged(&self) -> bool {
         matches!(&self.storage, PreparedStorage::Paged(_))
             || matches!(&self.storage,PreparedStorage::HybridGrouped(plan) if plan.is_paged())
@@ -211,9 +218,9 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
         // Testing only nonzero role payloads would choose an outer-only copy
         // and leave newly constructed empty child identities unregistered.
         Ok(Self {
-            storage: PreparedStorage::HybridGrouped(
-                PreparedHybridGroupedCopy::prepare_fixed(source)?,
-            ),
+            storage: PreparedStorage::HybridGrouped(PreparedHybridGroupedCopy::prepare_fixed(
+                source,
+            )?),
         })
     }
 
@@ -305,7 +312,7 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
 
     pub(crate) fn host_copy_prepared(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         authority: &eredu_core::HostPreparationAuthority,
     ) -> Result<PreparedResidentDecoderHostCopy<'a>, Error> {
         self.host_copy_with_preparation(pool, Some(authority))
@@ -313,14 +320,14 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
 
     pub(crate) fn host_copy(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<PreparedResidentDecoderHostCopy<'a>, Error> {
         self.host_copy_with_preparation(pool, None)
     }
 
     pub(crate) fn host_copy_with_preparation(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         preparation: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<PreparedResidentDecoderHostCopy<'a>, Error> {
         Ok(PreparedResidentDecoderHostCopy {
@@ -357,9 +364,11 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
             }
             PreparedStorage::KeyValue(plan) => plan.visit_operands(visitor),
             PreparedStorage::HybridGrouped(plan) => {
-                if plan.is_paged(){return plan.visit_paged_arrays(visitor);}
+                if plan.is_paged() {
+                    return plan.visit_paged_arrays(visitor);
+                }
                 plan.visit_operands(visitor)
-            },
+            }
             PreparedStorage::Pooling(plan) => plan.visit_operands(visitor),
             PreparedStorage::StatelessPooling(_) => {}
         }
@@ -382,9 +391,11 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
             }
             PreparedStorage::KeyValue(plan) => plan.visit_operands(visitor),
             PreparedStorage::HybridGrouped(plan) => {
-                if plan.is_paged(){return plan.visit_paged_arrays(visitor);}
+                if plan.is_paged() {
+                    return plan.visit_paged_arrays(visitor);
+                }
                 plan.visit_retained_arrays(visitor)
-            },
+            }
             PreparedStorage::Pooling(plan) => plan.visit_retained_arrays(visitor),
             PreparedStorage::StatelessPooling(_) => {}
         }
@@ -456,7 +467,13 @@ impl<'a> PreparedResidentDecoderCopy<'a> {
                 SavedStorage::KeyValue(plan.copy_retained(slots, stream, roots).map_err(kv_error)?)
             }
             (PreparedStorage::HybridGrouped(plan), InitializedStorage::HybridGrouped(slots)) => {
-                SavedStorage::HybridGrouped(plan.copy_retained_with(slots, stream, roots, observe, observe_host)?)
+                SavedStorage::HybridGrouped(plan.copy_retained_with(
+                    slots,
+                    stream,
+                    roots,
+                    observe,
+                    observe_host,
+                )?)
             }
             (PreparedStorage::Pooling(plan), InitializedStorage::Pooling(slots)) => {
                 SavedStorage::Pooling(
@@ -507,7 +524,7 @@ impl<'a> PreparedResidentDecoderHostCopy<'a> {
 
     pub(crate) fn admit(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         sampling: RegisteredSamplingCopy<'a, StorageIdentity>,
         complete_source: WorkingMemoryStorage<StorageIdentity>,
         limits: WorkspaceCopyLimits,
@@ -577,7 +594,9 @@ impl InitializedResidentDecoderCopy<'_> {
     ) -> Result<(), Error> {
         match &mut self.storage {
             InitializedStorage::Paged(slots) => slots.prepare_host_destinations(copy, environment),
-            InitializedStorage::HybridGrouped(slots) => slots.prepare_host_destinations(copy, environment),
+            InitializedStorage::HybridGrouped(slots) => {
+                slots.prepare_host_destinations(copy, environment)
+            }
             _ => Ok(()),
         }
     }
@@ -604,6 +623,27 @@ enum SavedStorage {
 }
 
 impl SavedResidentDecoderCopy {
+    pub(crate) fn logical_continuation_growth(
+        &self,
+        frontier: u64,
+        additional: u64,
+    ) -> Option<u64> {
+        let (capacity, auxiliary) = match &self.storage {
+            SavedStorage::Paged(saved) => saved.continuation_bounds(additional)?,
+            SavedStorage::KeyValue(saved) => saved.continuation_bounds(additional)?,
+            SavedStorage::HybridGrouped(saved) => saved.continuation_bounds(additional)?,
+            SavedStorage::Pooling(saved) => saved.continuation_bounds(additional)?,
+            SavedStorage::StatelessPooling(_) => (0, 0),
+        };
+        super::snapshot_estimate::continuation_growth(
+            self.shared_layout()?.layout(),
+            frontier,
+            additional,
+            capacity,
+            auxiliary,
+        )
+    }
+
     pub(crate) fn visit_registered_child_metadata(
         &self,
         visitor: &mut dyn FnMut(&eredu_runtime::HostSlotMetadata) -> Result<(), Error>,

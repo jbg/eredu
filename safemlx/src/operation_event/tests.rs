@@ -1,13 +1,13 @@
 use super::*;
 
+mod affine_quantize_submission;
 mod eval_traversal;
 mod exact_roots;
 mod graph_construction;
-mod quantize_submission;
-mod affine_quantize_submission;
 mod original_array;
 mod owned_host_copy;
 mod prepared_clones;
+mod quantize_submission;
 mod scheduled_nested;
 use crate::{
     Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy, PrefillRootsRuntime,
@@ -123,35 +123,56 @@ fn settle(observer: &OriginalScopeObserver) {
     );
 }
 fn round_trip(stream: &Stream) {
+    round_trip_shape(stream, &[3]);
+}
+fn round_trip_shape(stream: &Stream, shape: &[i32]) {
     let source_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let _runtime = PrefillRootsRuntime::prepare_for_stream(stream, &source_stream).unwrap();
     let mut source =
-        HostTransferBuffer::new(&[3], Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
-    let expected = [2.0f32, -3.0, 7.0];
+        HostTransferBuffer::new(shape, Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
+    let elements = shape
+        .iter()
+        .map(|&n| usize::try_from(n).unwrap())
+        .product::<usize>();
+    let expected = (0..elements)
+        .map(|i| [2.0f32, -3.0, 7.0][i % 3] + (i / 3) as f32)
+        .collect::<Vec<_>>();
     for (destination, value) in source
         .as_bytes_mut()
         .unwrap()
         .chunks_exact_mut(4)
-        .zip(expected)
+        .zip(expected.iter().copied())
     {
         destination.copy_from_slice(&value.to_ne_bytes());
     }
     let source = source.freeze();
     let allocator = crate::PreparedInputRuntime::prepare().unwrap();
-    let physical = crate::OriginalBufferBudget::request_layout(&allocator, 3 * size_of::<f32>())
-        .unwrap()
-        .capacity();
+    let physical =
+        crate::OriginalBufferBudget::request_layout(&allocator, elements * size_of::<f32>())
+            .unwrap()
+            .capacity();
     let budget = crate::PreparedOriginalBufferBudget::try_new(&allocator, physical * 2, ())
         .unwrap()
         .try_allocate()
         .unwrap();
     let mut destinations = Vec::new();
-    for _ in 0..2 {
+    for from_writer in [false, true] {
         let plan =
-            crate::PreparedHostTransferPlan::new(&allocator, &[3], Dtype::Float32, 0).unwrap();
+            crate::PreparedHostTransferPlan::new(&allocator, shape, Dtype::Float32, 0).unwrap();
         let quota = PreparedSubmissionGraphQuota::try_new(plan.metadata_bytes(), ()).unwrap();
         let arena = crate::PreparedInputArena::try_allocate(quota).unwrap();
-        destinations.push(plan.construct_copy_destination(&arena).unwrap());
+        destinations.push(if from_writer {
+            let writer = plan.construct_writer(&arena).unwrap();
+            // A worker cannot turn its byte-only handoff into a native owner.
+            let writer = std::thread::spawn(move || {
+                crate::PreparedHostCopyDestination::from_writer(writer).unwrap_err()
+            })
+            .join()
+            .unwrap();
+            crate::PreparedHostCopyDestination::from_writer(writer).unwrap()
+        } else {
+            plan.construct_copy_destination(&arena).unwrap()
+        });
     }
     // Shared-Metal stores each select one actual vector-copy pipeline.
     let mut original = Original::for_stream(stream, 2);
@@ -159,7 +180,7 @@ fn round_trip(stream: &Stream) {
     let observer = OriginalScopeObserver::try_current().unwrap().unwrap();
     let baseline = original.graph.occupied_bytes();
     for mut destination in destinations {
-        let layout = OperationEvent::resident_graph_layout(3, 1, 1).unwrap();
+        let layout = OperationEvent::resident_graph_layout(3, 1, shape.len()).unwrap();
         let traversal = OperationEvent::eval_traversal_layout(OperationEvalTraversalLimits {
             roots: 1,
             arrays: 4,
@@ -204,6 +225,8 @@ fn round_trip(stream: &Stream) {
         drop(bank);
         destination.synchronize().unwrap();
         let copied = destination.take_completed().unwrap();
+        assert_eq!(value.shape(), shape);
+        assert_eq!(copied.shape().unwrap(), shape);
         producer.synchronize().unwrap();
         assert_eq!(
             value
@@ -233,19 +256,28 @@ fn original_operation_cpu_round_trip_reclaims_each_active_role_window_without_ho
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     round_trip(&stream);
 }
+#[test]
+fn original_operation_cpu_rank_five_host_round_trip_reclaims_all_owners() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    // Multiple nonunit axes exercise the actual General-copy shape and stride
+    // census in both directions while each request retains its full backing.
+    round_trip_shape(&stream, &[2, 1, 3, 1, 2]);
+}
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 // Prepared singleton ownership must precede ordinary fixture initialization.
 // Each selected test establishes those owners in its own process.
 fn with_prepared_metal_stream(test: &str, run: impl FnOnce(&Stream)) {
+    with_prepared_metal_registration(test, |source, _| run(source.as_stream()));
+}
+#[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
+fn with_prepared_metal_registration(
+    test: &str,
+    run: impl FnOnce(&crate::RegisteredGpuStream, crate::GpuStreamTarget),
+) {
     const CHILD: &str = "SAFEMLX_PREPARED_OPERATION_STREAM_CHILD";
     if std::env::var(CHILD).ok().as_deref() != Some(test) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                test,
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(CHILD, test)
             .output()
             .unwrap();
@@ -276,8 +308,62 @@ fn with_prepared_metal_stream(test: &str, run: impl FnOnce(&Stream)) {
         .try_initialize(target)
         .unwrap();
     stream.try_borrow().unwrap();
-    run(stream.as_stream());
+    run(&stream, target);
     stream.try_observe_idle().unwrap();
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
+#[test]
+fn retained_gpu_registration_keeps_identity_across_execution_contexts() {
+    with_prepared_metal_registration(
+        "operation_event::tests::retained_gpu_registration_keeps_identity_across_execution_contexts",
+        |stream, target| {
+            let layout = crate::PreparedGpuStream::<()>::layout().unwrap();
+            let pending = crate::PreparedGpuStream::with_layout(layout, ()).unwrap();
+            let mut ordinary = SubmissionScope::begin().unwrap();
+            stream.try_borrow().unwrap();
+            let rejected = pending.try_initialize(target).unwrap_err();
+            assert_eq!(rejected.cause(), crate::GpuStreamRegistrationCause::Invalid);
+            let (_, pending) = rejected.into_parts();
+            ordinary.seal();
+            drop(ordinary);
+            stream.try_borrow().unwrap();
+
+            let mut original = Original::for_stream(stream.as_stream(), 0);
+            let graph = original.graph.occupied_bytes();
+            let records = original._records.occupied_bytes();
+            crate::register_thread_runtime_housekeeping(hook);
+            let hooks = Hook;
+            HOOKS.with(|value| value.set(0));
+            stream.try_borrow().unwrap();
+            stream.try_observe_idle().unwrap();
+            let rejected = pending.try_initialize(target).unwrap_err();
+            assert_eq!(rejected.cause(), crate::GpuStreamRegistrationCause::Invalid);
+            let (_, pending) = rejected.into_parts();
+            stream.try_borrow().unwrap();
+            assert_eq!(original.graph.occupied_bytes(), graph);
+            assert_eq!(original._records.occupied_bytes(), records);
+            assert_eq!(HOOKS.with(Cell::get), 0);
+            drop(hooks);
+            {
+                let mut child = SubmissionScope::begin().unwrap();
+                stream.try_borrow().unwrap();
+                child.seal();
+            }
+            stream.try_borrow().unwrap();
+            original.scope.seal();
+            stream.try_borrow().unwrap();
+            drop(original);
+            // Both refusals preserved the same untransferred constructor token.
+            let fresh = pending.try_initialize(target).unwrap();
+            fresh.try_borrow().unwrap();
+            assert_ne!(
+                fresh.as_stream().get_index().unwrap(),
+                stream.as_stream().get_index().unwrap()
+            );
+            stream.try_borrow().unwrap();
+        },
+    );
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
@@ -570,10 +656,12 @@ fn eval_record_layout_qualified_or_unknown_contract() {
     assert_eq!(three.host_graph_blocks(), 4);
     let constructors = three.host_graph_requests();
     let owners = three.host_graph_owner_requests();
-    assert!(constructors
-        .iter()
-        .chain(&owners)
-        .all(|(bytes, align)| *bytes > 0 && align.is_power_of_two()));
+    assert!(
+        constructors
+            .iter()
+            .chain(&owners)
+            .all(|(bytes, align)| *bytes > 0 && align.is_power_of_two())
+    );
     let requested = constructors
         .iter()
         .chain(&owners)
@@ -603,3 +691,6 @@ fn eval_record_layout_qualified_or_unknown_contract() {
 }
 
 mod gpu_eval_prologue;
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+mod ordinary_metal_router;

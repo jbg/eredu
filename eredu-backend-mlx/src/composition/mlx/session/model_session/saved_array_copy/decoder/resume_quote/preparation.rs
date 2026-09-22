@@ -1,8 +1,8 @@
 //! Finite source registration and isolated-copy metadata for saved resume.
 use super::super::{preparation as projection, storage, *};
 use crate::backend::nn::workspace::{
-    ResidentExecutionMechanisms, MlxWorkspaceFactError, ProjectedNativeStorage,
-    ProjectionSourceLayout,
+    MlxWorkspaceFactError, ProjectedNativeStorage, ProjectionSourceLayout,
+    ResidentExecutionMechanisms, ResidentFactError,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::{
@@ -10,11 +10,11 @@ use eredu_nn::workspace::{
     WorkspaceCopyPreparationLayoutBuilder, WorkspaceIsolatedCopyPreparation,
 };
 use eredu_runtime::working_memory::{
-    RegisteredWorkspaceStorageLayout, WorkingMemoryPool, WorkspaceCopyAdmissionError,
+    MemoryLedger, RegisteredWorkspaceStorageLayout, WorkspaceCopyAdmissionError,
 };
 use std::mem::{size_of, size_of_val};
 
-type CopyError = WorkspaceCopyPreparationError<MlxWorkspaceFactError>;
+type CopyError = WorkspaceCopyPreparationError<ResidentFactError>;
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::composition::mlx::session) enum ResumeSourceCause {
@@ -111,7 +111,7 @@ impl ResumeSourceCause {
             | Self::PendingMetadata(PendingTokenMetadataError::Geometry(cause)) => {
                 layout_memory(cause)
             }
-            Self::Copy(CopyError::Mechanism(cause)) => fact_memory(cause),
+            Self::Copy(CopyError::Mechanism(ResidentFactError::Fixed(cause))) => fact_memory(cause),
             Self::Context(cause)
             | Self::PendingMetadata(PendingTokenMetadataError::Visitor(cause)) => {
                 context_memory(cause)
@@ -149,7 +149,7 @@ fn context_memory(
     cause: eredu_nn::workspace::WorkspaceContextMetadataError<MlxWorkspaceFactError>,
 ) -> WorkingMemoryError {
     use eredu_nn::workspace::{
-        WorkspaceContextMetadataError, WorkspaceMetadataError, HostMetadataFundingError,
+        HostMetadataFundingError, WorkspaceContextMetadataError, WorkspaceMetadataError,
         WorkspaceReportError,
     };
     match cause {
@@ -172,7 +172,7 @@ pub(super) struct ResumeSourcePreparation<'a> {
     projection: projection::SnapshotProjectionPlan<'a>,
     registration: RegisteredWorkspaceStorageLayout<StorageIdentity>,
     copy: WorkspaceCopyPreparationLayout,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     mechanisms: ResidentExecutionMechanisms,
     bytes: usize,
 }
@@ -200,7 +200,7 @@ impl<'a> ResumeSourcePreparation<'a> {
         decoder: &'a PreparedResidentDecoderCopy<'a>,
         key: Option<&'a Array>,
         pending: Option<&'a Array>,
-        pool: &'a WorkingMemoryPool,
+        pool: &'a MemoryLedger,
         mechanisms: ResidentExecutionMechanisms,
     ) -> Result<Self, ResumeSourceCause> {
         let source = owner.storage_plan_with_sampling(decoder, pool, key, pending)?;
@@ -247,7 +247,7 @@ impl<'a> ResumeSourcePreparation<'a> {
             size_of::<Result<RegisteredWorkspaceCopy<StorageIdentity>, WorkspaceCopyAdmissionError>>(
             ),
             size_of::<(
-                &mut WorkspaceCopyPreparationLayoutBuilder<MlxWorkspaceFactError>,
+                &mut WorkspaceCopyPreparationLayoutBuilder<ResidentFactError>,
                 &ResidentExecutionMechanisms,
             )>(),
             size_of::<(
@@ -299,10 +299,9 @@ impl<'a> ResumeSourcePreparation<'a> {
                 .construct(
                     self.pool,
                     &projected.context,
-                    projected
-                        .native
-                        .iter()
-                        .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+                    projected.native.iter().map(|(id, _, root)| {
+                        crate::backend::nn::workspace::registered_storage_row(id, root)
+                    }),
                 )
                 .map_err(memory)?;
             let program = WorkspaceIsolatedCopyPlan::prepare_finite_with_layout(

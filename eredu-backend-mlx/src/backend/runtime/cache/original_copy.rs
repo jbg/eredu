@@ -6,10 +6,10 @@ use super::{
     state::{CompletedResidentSource, MlxPoolingAttentionCache, PreparedPoolingAttentionCopy},
 };
 use crate::backend::{
-    OriginalCopyEnvironment,
     array_copy::{IsolatedArrayCopy, RegisteredArrayCopy, RegisteredArrayCopyCustody},
     error::Error,
     nn::workspace::MlxMetalWorkspaceMechanisms,
+    OriginalCopyEnvironment,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_nn::workspace::HostMetadataFunding;
@@ -47,8 +47,10 @@ struct Failure {
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Failure").field("cause", &self.cause)
-            .field("completed_copies", &self._copies.len()).finish_non_exhaustive()
+        f.debug_struct("Failure")
+            .field("cause", &self.cause)
+            .field("completed_copies", &self._copies.len())
+            .finish_non_exhaustive()
     }
 }
 fn memory(cause: WorkingMemoryError) -> Error {
@@ -70,7 +72,7 @@ pub(super) struct Worker<'a, 'environment> {
     initialized: &'a PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &'a HostMetadataFunding,
-    capacity: u64,
+    capacity: &'a eredu_core::MemoryLimits,
     completed: Option<&'a CompletedResidentSource>,
     copies: Vec<RegisteredArrayCopyCustody>,
     count: usize,
@@ -120,7 +122,7 @@ pub(super) fn construct<C, F>(
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
     preparation_controls: Option<usize>,
     operation: F,
 ) -> Result<PreparedPredictionCacheCopy<C>, Error>
@@ -215,9 +217,17 @@ pub(crate) fn copy_original_compressed(
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
 ) -> Result<PreparedPredictionCacheCopy<CompressedLatentCache>, Error> {
-    copy_completed_compressed(source, None, environment, initialized, mechanisms, funding, capacity)
+    copy_completed_compressed(
+        source,
+        None,
+        environment,
+        initialized,
+        mechanisms,
+        funding,
+        capacity,
+    )
 }
 
 pub(crate) fn copy_completed_compressed(
@@ -227,7 +237,7 @@ pub(crate) fn copy_completed_compressed(
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
 ) -> Result<PreparedPredictionCacheCopy<CompressedLatentCache>, Error> {
     construct(
         completed,
@@ -256,9 +266,17 @@ pub(crate) fn copy_original_pooling(
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
 ) -> Result<PreparedPredictionCacheCopy<MlxPoolingAttentionCache>, Error> {
-    copy_completed_pooling(source, None, environment, initialized, mechanisms, funding, capacity)
+    copy_completed_pooling(
+        source,
+        None,
+        environment,
+        initialized,
+        mechanisms,
+        funding,
+        capacity,
+    )
 }
 
 pub(crate) fn copy_completed_pooling(
@@ -268,7 +286,7 @@ pub(crate) fn copy_completed_pooling(
     initialized: &PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
     funding: &HostMetadataFunding,
-    capacity: u64,
+    capacity: &eredu_core::MemoryLimits,
 ) -> Result<PreparedPredictionCacheCopy<MlxPoolingAttentionCache>, Error> {
     construct(
         completed,

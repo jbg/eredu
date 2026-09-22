@@ -15,9 +15,6 @@ pub enum CapturePlanCopyError {
     /// The allocator did not supply the exact selected destination layout.
     #[error("capture source destination capacity differs from its plan")]
     Capacity,
-    /// A changed limit requests an unavailable physical allocator capability.
-    #[error("capture source limit requires unavailable physical support")]
-    Capability,
     /// The closed declaration could not be canonically serialized.
     #[error("capture source identity serialization failed")]
     Identity,
@@ -44,20 +41,19 @@ impl<'a> PreparedCapturePlanCopy<'a> {
             predecessor: None,
         })
     }
-    /// Derive only new logical/physical limits from the same admitted selectors,
+    /// Derive only new logical limits from the same admitted selectors,
     /// geometry and declarations. The caller must still authenticate current
     /// selected capabilities and inherited spending before installing a run.
     /// No arbitrary source, coordinate, selector or semantic identity is accepted.
     pub fn inspect_limit_revision(
-        source: &'a SharedCapturePlan, limits: CaptureLimits, capabilities: &CaptureCapabilities,
+        source: &'a SharedCapturePlan,
+        limits: CaptureLimits,
     ) -> Result<Self, CapturePlanCopyError> {
-        if limits.physical_native_bytes.is_some() && !capabilities.physical_native_limit {
-            return Err(CapturePlanCopyError::Capability);
-        }
         let mut prepared = Self::inspect(source.admission())?;
-        prepared.bytes = prepared.bytes.checked_add(identity::control_bytes()
-                .ok_or(CapturePlanCopyError::Overflow)?)
-                .ok_or(CapturePlanCopyError::Overflow)?;
+        prepared.bytes = prepared
+            .bytes
+            .checked_add(identity::control_bytes().ok_or(CapturePlanCopyError::Overflow)?)
+            .ok_or(CapturePlanCopyError::Overflow)?;
         prepared.limits = Some(limits);
         prepared.predecessor = Some(source);
         Ok(prepared)
@@ -96,18 +92,30 @@ impl<'a> PreparedCapturePlanCopy<'a> {
         if let Some(limits) = self.limits {
             worker.add(identity::control_bytes().ok_or(CapturePlanCopyError::Overflow)?)?;
             plan.plan.limits = limits;
-            let digest = identity::digest(&plan.plan, &plan.points, plan.request,
-                plan.invocation_bounds, plan.text_origin).map_err(|_| CapturePlanCopyError::Identity)?;
+            let digest = identity::digest(
+                &plan.plan,
+                &plan.points,
+                plan.request,
+                plan.invocation_bounds,
+                plan.text_origin,
+            )
+            .map_err(|_| CapturePlanCopyError::Identity)?;
             if plan.identity.capacity() < digest.len() {
                 return Err(CapturePlanCopyError::Capacity);
             }
             plan.identity.clear();
-            for byte in digest { plan.identity.push(char::from(byte)); }
+            for byte in digest {
+                plan.identity.push(char::from(byte));
+            }
         }
         if worker.bytes != self.bytes {
             return Err(CapturePlanCopyError::Capacity);
         }
-        Ok(SharedCapturePlan::from_prepared_copy(plan, host, self.predecessor.cloned()))
+        Ok(SharedCapturePlan::from_prepared_copy(
+            plan,
+            host,
+            self.predecessor.cloned(),
+        ))
     }
 }
 pub(crate) struct Worker {
@@ -229,10 +237,16 @@ impl Worker {
     }
     /// Constant-value scratch has no per-element descriptor construction. Its
     /// nonemitting census is constant time even for a large declared extent.
-    pub(crate) fn repeated<T: Copy>(&mut self, count: usize, value: T) -> Result<Vec<T>, CapturePlanCopyError> {
+    pub(crate) fn repeated<T: Copy>(
+        &mut self,
+        count: usize,
+        value: T,
+    ) -> Result<Vec<T>, CapturePlanCopyError> {
         self.add(size_of::<(&mut Self, usize, T)>())?;
         let mut output = self.vector_destination(count)?;
-        if self.emit { output.resize(count, value); }
+        if self.emit {
+            output.resize(count, value);
+        }
         Ok(output)
     }
     fn vector_destination<T>(&mut self, count: usize) -> Result<Vec<T>, CapturePlanCopyError> {
@@ -278,13 +292,17 @@ impl Worker {
             identity: self.text(identity)?,
         })
     }
-    pub(crate) fn raw_plan(&mut self, source: &CapturePlan) -> Result<CapturePlan, CapturePlanCopyError> {
+    pub(crate) fn raw_plan(
+        &mut self,
+        source: &CapturePlan,
+    ) -> Result<CapturePlan, CapturePlanCopyError> {
         Ok(CapturePlan {
             schema_version: source.schema_version,
-            limits: CaptureLimits { per_step: source.limits.per_step,
+            limits: CaptureLimits {
+                per_step: source.limits.per_step,
                 cumulative: source.limits.cumulative,
-                physical_native_bytes: source.limits.physical_native_bytes,
-                on_limit: source.limits.on_limit },
+                on_limit: source.limits.on_limit,
+            },
             selections: self.vector(&source.selections, Self::selection)?,
         })
     }

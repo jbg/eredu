@@ -1,23 +1,62 @@
 //! Cold execution of the authoritative intervention recipe. Native primitive
 //! facts below own allocation costs; the neutral driver owns action sequencing.
-use super::super::facts::{self, add, mul, Aliases, Emitter, FactResult, Output};
+use super::super::facts::{self, Aliases, Emitter, FactResult, Output, add, mul};
 use super::super::{reduction::capacity_fixed as capacity, sampling::sort_fixed as sort};
 use super::*;
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
-    routing_intervention::{
-        execute_routing_intervention_fixed, FixedRoutingExecutionError, RoutingMechanism,
-        RoutingRows,
-    },
     GroupScoring, GroupSelection, RoutingPrecision, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    routing_intervention::{
+        FixedRoutingExecutionError, RoutingMechanism, RoutingRows,
+        execute_routing_intervention_fixed,
+    },
 };
 use std::cell::Cell;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum AllocationSource {
+    Execution,
+    Default,
+    CutoffChoice,
+}
+
+/// Descriptors from the same charged routing traversal, before domain reduction.
+#[derive(Clone, Copy, Debug)]
+pub(in super::super) struct AllocationSources {
+    pub total_bytes: u64,
+    pub default_bytes: u64,
+    pub default_births: usize,
+    pub output_bytes: [u64; 6],
+    pub output_births: [bool; 6],
+    pub output_sources: [AllocationSource; 6],
+    pub outputs: usize,
+    pub projection_sources: Option<facts::DefaultScratchSources>,
+    pub projection_scratch: u64,
+    pub projection_calls: usize,
+}
+impl Default for AllocationSources {
+    fn default() -> Self {
+        Self {
+            total_bytes: 0,
+            default_bytes: 0,
+            default_births: 0,
+            output_bytes: [0; 6],
+            output_births: [false; 6],
+            output_sources: [AllocationSource::Execution; 6],
+            outputs: 0,
+            projection_sources: None,
+            projection_scratch: 0,
+            projection_calls: 0,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Value {
     id: usize,
     elements: u64,
     storage: Output<'static>,
+    source: AllocationSource,
 }
 struct Counter<'a> {
     a: NativeAllocationFacts,
@@ -25,7 +64,10 @@ struct Counter<'a> {
     rows: u64,
     projection: WorkspaceOperationFacts,
     projection_output: u64,
+    projection_calls: Cell<usize>,
     tensor: Cell<u64>,
+    default_bytes: Cell<u64>,
+    default_births: Cell<usize>,
     host: Cell<u64>,
     next: Cell<usize>,
 }
@@ -50,11 +92,39 @@ impl Counter<'_> {
             id,
             elements,
             storage,
+            source: AllocationSource::Execution,
         }
     }
     fn allocation(&self, n: u64) -> FactResult<Value> {
         self.buffers(n, 1)?;
         Ok(self.value(n, Output::Allocate(self.bytes(n)?)))
+    }
+    fn default_buffers(&self, n: u64, copies: u64) -> FactResult<()> {
+        let bytes = mul(copies, self.bytes(n)?)?;
+        self.charge(bytes)?;
+        self.default_bytes
+            .set(add(self.default_bytes.get(), bytes)?);
+        self.default_births.set(
+            self.default_births
+                .get()
+                .checked_add(usize::try_from(copies)?)
+                .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+        );
+        Ok(())
+    }
+    fn default_allocation(&self, n: u64) -> FactResult<Value> {
+        self.default_buffers(n, 1)?;
+        let mut value = self.value(n, Output::Allocate(self.bytes(n)?));
+        value.source = AllocationSource::Default;
+        Ok(value)
+    }
+    /// One actual eager scalar constructor, alongside the existing promotion
+    /// and result envelope of this same native pointwise call.
+    fn scalar_pointwise(&self, n: u64, operands: u64) -> FactResult<Value> {
+        self.buffers(n, operands)?;
+        self.default_buffers(1, 1)?;
+        self.buffers(1, operands.checked_sub(1).ok_or_else(invalid)?)?;
+        self.allocation(n)
     }
     fn pointwise(&self, n: u64, operands: u64) -> FactResult<Value> {
         // Possible promotion of each operand, one result and scalar operands.
@@ -82,7 +152,7 @@ impl Counter<'_> {
     fn largest(&self, rows: u64, width: u64, count: u64) -> FactResult<Value> {
         let n = mul(rows, width)?;
         let selected = mul(rows, count)?;
-        self.pointwise(n, 1)?; // negation by scalar, including possible cast
+        self.scalar_pointwise(n, 1)?; // actual eager F32 negative-one scalar
         self.charge(sort(self.a, n, rows, width)?)?;
         if count < width && rows != 0 {
             self.allocation(selected)?; // gather chosen scores
@@ -94,18 +164,22 @@ impl Counter<'_> {
             }
             self.pointwise(rows, 2)?; // more total ties than selected ties
             self.reduction(rows, 1, rows)?; // any, directly read scalar
-                                            // Data-dependent CPU fallback has another full native index output.
-                                            // std::nth_element mutates it in place: no host payload vector.
-            self.allocation(n)?;
+            // Data-dependent CPU fallback has another full native index output.
+            // std::nth_element mutates it in place: no host payload vector.
+            self.default_allocation(n)?;
             // Original routing preserves the same global crossing-tie decision
             // lazily. The three-operand Select may promote each operand and
             // owns its selected-sized result in addition to both index arrays.
             self.pointwise(selected, 3)?;
             // Both actual stream frontiers may use the fast-fence U32 backing.
             // Slow Event mode has no such payload; retain the larger alternative.
-            self.buffers(1, 2)?;
+            self.default_buffers(1, 2)?;
         }
-        Ok(self.value(selected, Output::Allocate(self.bytes(n)?)))
+        let mut value = self.value(selected, Output::Allocate(self.bytes(n)?));
+        if !self.a.original_storage && count < width && rows != 0 {
+            value.source = AllocationSource::CutoffChoice;
+        }
+        Ok(value)
     }
     fn all(&self, n: u64) -> FactResult<bool> {
         self.reduction(n, 1, n)?;
@@ -114,7 +188,7 @@ impl Counter<'_> {
     fn gathered_keep(&self, n: u64) -> FactResult<()> {
         let groups = self.spec.selection().group_count() as u64;
         self.host(groups); // exact Vec<bool> copied to native storage
-        self.allocation(groups)?;
+        self.default_allocation(groups)?;
         self.allocation(n)?; // direct gather
         self.pointwise(self.rows, 1)?; // complement of selected-row mask
         self.pointwise(n, 2)?;
@@ -140,9 +214,13 @@ impl RoutingMechanism for Counter<'_> {
             i32::try_from(n).map_err(|_| invalid())?;
         }
         self.allocation(self.rows)?; // native arange
-                                     // ge, lt, subtract, remainder, eq, two logical_and operations.
+        // ge, lt, subtract, remainder, eq, two logical_and operations.
         for operands in [1, 1, 1, 1, 1, 2, 2] {
-            self.pointwise(self.rows, operands)?;
+            if operands == 1 {
+                self.scalar_pointwise(self.rows, operands)?;
+            } else {
+                self.pointwise(self.rows, operands)?;
+            }
         }
         Ok(selection)
     }
@@ -155,8 +233,8 @@ impl RoutingMechanism for Counter<'_> {
                 self.rows,
                 self.spec.input_dimensions() as u64,
             )?;
-            self.pointwise(self.rows, 1)?; // mean division
-            self.pointwise(self.rows, 1)?; // epsilon
+            self.scalar_pointwise(self.rows, 1)?; // mean's eager divisor
+            self.scalar_pointwise(self.rows, 1)?; // eager RMS epsilon
             self.pointwise(self.rows, 1)?; // rsqrt
             self.pointwise(input.elements, 2)?; // normalization
         }
@@ -168,9 +246,15 @@ impl RoutingMechanism for Counter<'_> {
                 .unwrap()
                 .inverse_sqrt_dimensions()
             {
-                self.pointwise(input.elements, 1)?;
+                self.scalar_pointwise(input.elements, 1)?;
             }
         }
+        self.projection_calls.set(
+            self.projection_calls
+                .get()
+                .checked_add(1)
+                .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+        );
         self.charge(self.projection.scratch_bytes)?;
         self.charge(self.projection_output)?;
         // Projection-specific promotion and final precision boundary, in
@@ -194,7 +278,7 @@ impl RoutingMechanism for Counter<'_> {
                 self.allocation(n) // restore score dtype
             }
             GroupScoring::SqrtSoftplus => {
-                self.pointwise(n, 2)?; // logaddexp(x, 0)
+                self.scalar_pointwise(n, 2)?; // logaddexp(x, eager I32 zero)
                 self.pointwise(n, 1) // sqrt
             }
             _ => Err(invalid()),
@@ -216,6 +300,7 @@ impl RoutingMechanism for Counter<'_> {
             p.selected_groups() as u64,
         );
         if self.rows == 0 {
+            self.default_buffers(1, 1)?;
             return self.allocation(0);
         }
         if partitions != 1 {
@@ -233,13 +318,13 @@ impl RoutingMechanism for Counter<'_> {
             )?;
             self.largest(self.rows, partitions, chosen)?;
             self.host(mul(groups, 4)?);
-            self.allocation(groups)?; // partition-ID vector native copy
+            self.default_allocation(groups)?; // eager partition-ID host array
             let comparisons = mul(mul(self.rows, chosen)?, groups)?;
             self.pointwise(comparisons, 2)?;
             self.allocation(comparisons)?; // I32 mask
             self.reduction(comparisons, n, chosen)?;
-            self.pointwise(n, 1)?; // > zero
-            self.pointwise(n, 3)?; // where(mask, scores, -infinity)
+            self.scalar_pointwise(n, 1)?; // eager I32 zero
+            self.scalar_pointwise(n, 3)?; // eager F32 negative infinity
         }
         self.largest(self.rows, groups, k)
     }
@@ -256,12 +341,12 @@ impl RoutingMechanism for Counter<'_> {
             self.reduction(n, self.rows, p.top_k() as u64)?;
             self.allocation(self.rows)?; // reduction result dtype restore
             if p.normalization_epsilon() != 0. {
-                self.pointwise(self.rows, 1)?;
+                self.scalar_pointwise(self.rows, 1)?;
             }
             weights = self.pointwise(n, 2)?;
         }
         if p.coefficient_scale() != 1. {
-            weights = self.pointwise(n, 1)?;
+            weights = self.scalar_pointwise(n, 1)?;
         }
         if self.spec.coefficient_scale().is_some() {
             self.allocation(n)?; // direct learned-scale gather
@@ -278,25 +363,41 @@ impl RoutingMechanism for Counter<'_> {
     ) -> FactResult<Value> {
         let groups = self.spec.selection().group_count() as u64;
         self.host(mul(groups, 4)?);
-        self.buffers(groups, 2)?; // copied F32 host correction, then score dtype
+        self.default_buffers(groups, 1)?; // eager F32 host correction
+        self.buffers(groups, 1)?; // selected score dtype cast
         self.pointwise(value.elements, 2)?;
         self.pointwise(value.elements, 3) // row-conditioned selection
     }
     fn fill_columns(&self, value: &Value, _: &[u32], _: f32, _: &RoutingRows) -> FactResult<Value> {
         let groups = self.spec.selection().group_count() as u64;
         self.host(groups);
-        self.allocation(groups)?;
+        self.default_allocation(groups)?;
         self.pointwise(self.rows, 1)?;
         self.pointwise(value.elements, 2)?;
-        self.buffers(1, 2)?; // fill and dtype cast
+        self.default_buffers(1, 1)?; // eager fill scalar
+        self.buffers(1, 1)?; // selected dtype cast
         self.pointwise(value.elements, 3)
     }
-    fn replace_rows(&self, indices: &Value, ids: &[u32], _: &RoutingRows) -> FactResult<Value> {
-        self.buffers(ids.len() as u64, 2)?; // borrowed forced IDs copied/cast
-                                            // Slice update can copy the logical index array or donate its full
-                                            // partition backing; preserve the larger native capacity either way.
+    fn replace_rows(&self, indices: &Value, ids: &[u32], rows: &RoutingRows) -> FactResult<Value> {
+        self.default_buffers(ids.len() as u64, 1)?; // actual eager U32 source
+        self.buffers(ids.len() as u64, 1)?; // possible dtype conversion
+        if rows.first == 0 && rows.end == self.rows && rows.stride == 1 {
+            // The real worker returns forced U32 IDs directly. The selection's
+            // indices are U32 too, so the dtype boundary preserves this backing.
+            let mut value = self.value(
+                ids.len() as u64,
+                Output::Allocate(self.bytes(ids.len() as u64)?),
+            );
+            value.source = AllocationSource::Default;
+            return Ok(value);
+        }
+        // A partial SliceUpdate may donate the selected partition or allocate
+        // a replacement. The existing full-partition capacity is the bound for
+        // either result, and only the actual cutoff source can donate Host data.
         self.charge(allocated(&indices.storage))?;
-        Ok(self.value(indices.elements, indices.storage.clone()))
+        let mut value = self.value(indices.elements, indices.storage.clone());
+        value.source = indices.source;
+        Ok(value)
     }
     fn fill_gathered(
         &self,
@@ -307,7 +408,8 @@ impl RoutingMechanism for Counter<'_> {
         _: &RoutingRows,
     ) -> FactResult<Value> {
         self.gathered_keep(value.elements)?;
-        self.buffers(1, 2)?;
+        self.default_buffers(1, 1)?;
+        self.buffers(1, 1)?;
         self.pointwise(value.elements, 3)
     }
     fn excludes(&self, indices: &Value, _: &[u32], _: &RoutingRows) -> FactResult<bool> {
@@ -319,7 +421,7 @@ impl RoutingMechanism for Counter<'_> {
         self.all(value.elements)
     }
     fn nonnegative(&self, value: &Value) -> FactResult<bool> {
-        self.pointwise(value.elements, 1)?;
+        self.scalar_pointwise(value.elements, 1)?;
         self.all(value.elements)
     }
     fn positive_row_sums(&self, value: &Value) -> FactResult<bool> {
@@ -328,7 +430,7 @@ impl RoutingMechanism for Counter<'_> {
             self.rows,
             self.spec.selection().top_k() as u64,
         )?;
-        self.pointwise(self.rows, 1)?;
+        self.scalar_pointwise(self.rows, 1)?;
         self.all(self.rows)
     }
 }
@@ -384,32 +486,48 @@ pub(in super::super) fn with_projection<R>(
     op: WorkspaceOperationView<'_>,
     run: impl FnOnce(WorkspaceOperationView<'_>) -> R,
 ) -> FactResult<Option<R>> {
-    let WorkspaceOperationKindView::GroupSelection { spec, supplied_indices, .. } = op.kind else {
+    let WorkspaceOperationKindView::GroupSelection {
+        spec,
+        supplied_indices,
+        ..
+    } = op.kind
+    else {
         return Ok(None);
     };
     spec.validate_fixed()?;
     let hidden = op.inputs.get(0).ok_or_else(invalid)?;
     let width = spec.input_dimensions();
-    if width <= 0 || hidden.shape().last() != Some(&width) { return Err(invalid()); }
+    if width <= 0 || hidden.shape().last() != Some(&width) {
+        return Err(invalid());
+    }
     let rows = i32::try_from(hidden.elements()? / width as u64).map_err(|_| invalid())?;
     let start = 1 + usize::from(supplied_indices);
-    let parameters = 1 + usize::from(spec.format().scale().is_some())
-        + usize::from(spec.format().affine_bias().is_some()) + usize::from(spec.bias().is_some());
+    let parameters = 1
+        + usize::from(spec.format().scale().is_some())
+        + usize::from(spec.format().affine_bias().is_some())
+        + usize::from(spec.bias().is_some());
     let extra = usize::from(spec.correction_bias().is_some())
-        + usize::from(spec.input_transform().is_some()) + usize::from(spec.coefficient_scale().is_some());
-    if op.inputs.len() != start + parameters + extra { return Err(invalid()); }
+        + usize::from(spec.input_transform().is_some())
+        + usize::from(spec.coefficient_scale().is_some());
+    if op.inputs.len() != start + parameters + extra {
+        return Err(invalid());
+    }
     let input_shape = [rows, width];
     // Flatten alone preserves scalar precision. An optional input transform
     // has its own promotion and cannot borrow the pre-transform scalar fact.
     // Potential copies are paid outside; original strides do not describe this view.
     let input = WorkspaceLayoutView::new(&input_shape, hidden.dtype())?.with_representation(
-        spec.input_transform().is_none().then(|| hidden.representation()).flatten()
-            .map(|actual| WorkspaceRepresentation::new(actual.dtype(), false)));
+        spec.input_transform()
+            .is_none()
+            .then(|| hidden.representation())
+            .flatten()
+            .map(|actual| WorkspaceRepresentation::new(actual.dtype(), false)),
+    );
     let mut inputs = [input; 5];
     let weight = op.inputs.get(start).ok_or_else(invalid)?;
     let floating = weight.dtype() == WorkspaceDtype::Float32;
-    let dense_format = eredu_nn::LinearFormatSpec::unscaled(LinearFormat::Dense)
-        .map_err(|_| invalid())?;
+    let dense_format =
+        eredu_nn::LinearFormatSpec::unscaled(LinearFormat::Dense).map_err(|_| invalid())?;
     let (format, count) = if floating {
         inputs[1] = weight;
         if spec.bias().is_some() {
@@ -417,13 +535,22 @@ pub(in super::super) fn with_projection<R>(
         }
         (&dense_format, 2 + usize::from(spec.bias().is_some()))
     } else {
-        for (index, parameter) in op.inputs.slice(start..start + parameters).unwrap().iter().enumerate() {
+        for (index, parameter) in op
+            .inputs
+            .slice(start..start + parameters)
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
             inputs[index + 1] = parameter;
         }
         (spec.format(), parameters + 1)
     };
     let output_shape = [rows, spec.selection().group_count()];
-    let outputs = [WorkspaceLayoutView::new(&output_shape, WorkspaceDtype::Float32)?];
+    let outputs = [WorkspaceLayoutView::new(
+        &output_shape,
+        WorkspaceDtype::Float32,
+    )?];
     Ok(Some(run(WorkspaceOperationView {
         kind: WorkspaceOperationKindView::Projection(format),
         inputs: WorkspaceLayoutList::Views(&inputs[..count]),
@@ -435,6 +562,24 @@ pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
     a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
+) -> FactResult<Option<(WorkspaceOperationFacts, u64)>> {
+    emit_with_sources(op, a, sink, None)
+}
+
+pub(in super::super) fn allocation_sources(
+    op: WorkspaceOperationView<'_>,
+    a: NativeAllocationFacts,
+) -> FactResult<Option<(WorkspaceOperationFacts, AllocationSources)>> {
+    let mut sources = AllocationSources::default();
+    let result = emit_with_sources(op, a, &mut Emitter::count(), Some(&mut sources))?;
+    Ok(result.map(|(facts, _)| (facts, sources)))
+}
+
+fn emit_with_sources(
+    op: WorkspaceOperationView<'_>,
+    a: NativeAllocationFacts,
+    sink: &mut Emitter<'_>,
+    mut sources: Option<&mut AllocationSources>,
 ) -> FactResult<Option<(WorkspaceOperationFacts, u64)>> {
     let WorkspaceOperationKindView::GroupSelection {
         spec,
@@ -529,14 +674,18 @@ pub(super) fn emit(
     }
     let mut projection_sink = Emitter::count();
     let projection = with_projection(op, |projection_op| {
-        let WorkspaceOperationKindView::Projection(format) = projection_op.kind else { unreachable!() };
+        let WorkspaceOperationKindView::Projection(format) = projection_op.kind else {
+            unreachable!()
+        };
         if format.encoding() == LinearFormat::Dense {
             super::super::matrix::emit(projection_op, a, &mut projection_sink)
         } else {
             super::super::packed::emit(projection_op, a, &mut projection_sink)
         }
     })?;
-    let Some(projection) = projection else { return Ok(None); };
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
     let projection = projection?;
     let Some(projection) = projection else {
         return Ok(None);
@@ -555,7 +704,10 @@ pub(super) fn emit(
         rows,
         projection,
         projection_output,
+        projection_calls: Cell::new(0),
         tensor: Cell::new(0),
+        default_bytes: Cell::new(0),
+        default_births: Cell::new(0),
         host: Cell::new(0),
         next: Cell::new(0),
     };
@@ -602,10 +754,27 @@ pub(super) fn emit(
                     retained = add(retained, allocated(&value.storage))?;
                     value.storage
                 };
+            if let Some(sources) = sources.as_deref_mut() {
+                sources.output_bytes[root_count] = allocated(&storage);
+                sources.output_births[root_count] = matches!(
+                    storage,
+                    Output::Allocate(_) | Output::AllocateOrAliasInputs { .. }
+                );
+                sources.output_sources[root_count] = value.source;
+            }
             roots[root_count] = value.id;
             root_count += 1;
             sink.output(storage)?;
         }
+    }
+    if let Some(sources) = sources {
+        sources.total_bytes = counter.tensor.get();
+        sources.default_bytes = counter.default_bytes.get();
+        sources.default_births = counter.default_births.get();
+        sources.outputs = root_count;
+        sources.projection_sources = projection_sink.default_scratch_sources();
+        sources.projection_scratch = projection.scratch_bytes;
+        sources.projection_calls = counter.projection_calls.get();
     }
     let tensor = sink.finish(counter.tensor.get().checked_sub(retained).ok_or_else(invalid)?, format_args!("MLX Metal top-k router: shared dense/packed projection, input RMS, staged dtype/scoring policy, complete partition backing, all tie detection and possible CPU partition, grouped eligibility, gathered/normalized/scaled coefficients; intervention costs execute the authoritative neutral recipe including original capture and predicates; all child buffers retained through completion; page={} with bounded oversized reuse", a.page_size()))?;
     Ok(Some((tensor, counter.host.get())))

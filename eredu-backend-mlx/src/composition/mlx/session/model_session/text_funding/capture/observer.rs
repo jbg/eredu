@@ -1,9 +1,10 @@
 //! Lexical scheduled capture from an already admitted native text operation.
 use super::*;
 mod fragments;
-mod intervention;
 mod generated;
+mod intervention;
 mod routed_partition;
+use crate::composition::mlx::session::bounded_capture::partition::native as partition_native;
 use crate::composition::mlx::session::{
     bounded_capture::estimate_tensor_geometry, model_session::SessionOperation,
 };
@@ -14,6 +15,21 @@ use eredu_core::{
 use eredu_runtime::capture::{FundedCaptureError, FundedCaptureSession, ScheduledCaptureBackend};
 use eredu_runtime::working_memory::WorkingMemoryError;
 
+struct TextSourceRetainer<'a>(&'a FundedWork);
+impl partition_native::SourceRetainer for TextSourceRetainer<'_> {
+    type Error = Error;
+    fn retain(&self, source: &Array) -> Result<(), Error> {
+        self.0.retain(source);
+        match self.0.take_collection_failure() {
+            Some(cause) => Err(cause),
+            None => Ok(()),
+        }
+    }
+    fn native_error(cause: crate::backend::array_copy::CaptureTensorNativeError) -> Error {
+        Error::Other(Box::new(cause))
+    }
+}
+
 // Concrete borrowed controls only: this adapter owns no source/shape/data buffer,
 // scope, submission lease, reservation, or independent native allocation grant.
 pub(super) struct NativeScheduledCapture<'a> {
@@ -22,7 +38,8 @@ pub(super) struct NativeScheduledCapture<'a> {
     owner: Option<super::super::super::SubmissionResourcesOwner>,
     prefill: bool,
     domain: Option<CaptureTokenDomain<'a>>,
-    partition: Option<&'a mut (dyn eredu_runtime::capture::partition::ScheduledPartitionCapture + 'a)>,
+    partition:
+        Option<&'a mut (dyn eredu_runtime::capture::partition::ScheduledPartitionCapture + 'a)>,
 }
 #[cfg(test)]
 impl<'a> NativeScheduledCapture<'a> {
@@ -39,16 +56,16 @@ impl<'a> NativeScheduledCapture<'a> {
 }
 impl NativeScheduledCapture<'_> {
     fn capture_observer(&self) -> Result<Option<safemlx::OriginalScopeObserver>, Error> {
-        if self.work._controls.is_none() {
+        if self.work.ordinary.borrow().is_some() {
             return Ok(None);
         }
-        // Existing standalone carrier fixtures exercise the ordinary numerical
-        // leaf with paid metadata. They install no original native program.
-        // Production always supplies an owner and cannot take this branch.
-        #[cfg(test)]
-        if self.owner.is_none() && self.work.native_storage.is_none() {
-            return Ok(None);
-        }
+        // Host capture controls do not authenticate an original native program.
+        // The selected paid ordinary producer keeps ordinary completion; a
+        // native producer must supply its exact original scope observer.
+        self.work
+            .native_storage
+            .as_ref()
+            .ok_or(Error::PrefillScopeUnavailable)?;
         let owner = self.owner.as_ref().ok_or(Error::PrefillScopeUnavailable)?;
         if self.prefill {
             owner
@@ -75,60 +92,185 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
     type Tensor = Array;
     type Error = Error;
 
-    fn validate_partition_intervention_source(&self,source:&Array,
-        claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
-        window:Option<eredu_runtime::intervention::InterventionPrefillWindow>)
-        ->Result<(),FundedCaptureError<Error>> {self.partition_edit_validate(source,claim,window)}
-    fn validate_partition_intervention_evidence_source(&self,source:&Array,
-        claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
-        side:eredu_core::capture::InterventionEvidenceSide,
-        window:Option<eredu_runtime::intervention::InterventionPrefillWindow>)
-        ->Result<(),FundedCaptureError<Error>> {self.partition_evidence_validate(source,claim,side,window)}
-    fn apply_partition_intervention(&mut self,source:&Array,
-        claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
-        allowance:&mut eredu_runtime::capture::partition::PartitionInterventionLocalAllowance)
-        ->Result<Option<Array>,FundedCaptureError<Error>> {self.partition_edit_apply(source,claim,allowance)}
-    fn prefill_intervention_projection_usage(&self,source:&Array,
-        claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>,window:eredu_runtime::intervention::InterventionPrefillWindow)
-        ->Result<[CaptureUsage;2],FundedCaptureError<Error>> {
-        self.prefill_projection_usage(source,claim,window)
+    fn routing_intervention_usage(
+        &self,
+        rows: u64,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        window: Option<eredu_runtime::intervention::InterventionPrefillWindow>,
+    ) -> Result<CaptureUsage, FundedCaptureError<Error>> {
+        self.scheduled_routing_usage(rows, claim, window)
     }
-    fn prefill_intervention_usage(&self,source:&Array,
-        claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>,window:eredu_runtime::intervention::InterventionPrefillWindow)
-        ->Result<CaptureUsage,FundedCaptureError<Error>> {
-        self.prefill_edit_usage(source,claim,window)
+    fn prepare_routing_intervention(
+        &mut self,
+        rows: u64,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        window: Option<eredu_runtime::intervention::InterventionPrefillWindow>,
+    ) -> Result<
+        Option<eredu_nn::routing_intervention::GroupSelectionControl>,
+        FundedCaptureError<Error>,
+    > {
+        self.scheduled_routing_control(rows, claim, window)
     }
-    fn apply_prefill_intervention(&mut self,source:&Array,
-        fragment:eredu_runtime::working_memory::InterventionPrefillFragment<'_,'_>,charged:CaptureUsage,projection:[CaptureUsage;2])
-        ->Result<Option<Array>,FundedCaptureError<Error>> {
-        self.prefill_edit(source,fragment,charged,projection)
+    fn validate_routing_intervention_result(
+        &self,
+        rows: u64,
+        original: Option<eredu_runtime::RoutingDecision<'_, Array>>,
+        effective: eredu_runtime::RoutingDecision<'_, Array>,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        window: Option<eredu_runtime::intervention::InterventionPrefillWindow>,
+    ) -> Result<(), FundedCaptureError<Error>> {
+        self.scheduled_routing_result(rows, original, effective, claim, window)
     }
-    fn intervention_usage(&self,source:&Array,claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>)
-        ->Result<CaptureUsage,FundedCaptureError<Error>>{self.scheduled_intervention_usage(source,claim)}
-    fn intervention_projection_usage(&self,source:&Array,claim:&eredu_runtime::working_memory::CaptureInterventionClaim<'_>)
-        ->Result<[CaptureUsage;2],FundedCaptureError<Error>>{self.scheduled_intervention_projection_usage(source,claim)}
-    fn apply_intervention_projected(&mut self,source:&Array,claim:eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
-        charged:CaptureUsage,projection:[CaptureUsage;2])
-        ->Result<(Option<Array>,eredu_runtime::working_memory::ClaimedIntervention),FundedCaptureError<Error>>{
-        self.scheduled_intervention(source,claim,charged,projection)
+    fn validate_partition_intervention_source(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        window: Option<eredu_runtime::intervention::InterventionPrefillWindow>,
+    ) -> Result<(), FundedCaptureError<Error>> {
+        self.partition_edit_validate(source, claim, window)
     }
-    fn intervention_evidence_usage(&self,source:&Array,claim:&eredu_runtime::working_memory::CaptureInterventionEvidenceClaim<'_,'_>)
-        ->Result<(TensorDtype,CaptureUsage),FundedCaptureError<Error>>{self.scheduled_evidence_usage(source,claim)}
-    fn capture_intervention_evidence<'a>(&mut self,source:&Array,claim:eredu_runtime::working_memory::CaptureInterventionEvidenceClaim<'a,'_>)
-        ->Result<eredu_runtime::working_memory::ClaimedInterventionEvidence<'a>,FundedCaptureError<Error>>{
-        self.scheduled_evidence(source,claim)
+    fn validate_partition_intervention_evidence_source(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        side: eredu_core::capture::InterventionEvidenceSide,
+        window: Option<eredu_runtime::intervention::InterventionPrefillWindow>,
+    ) -> Result<(), FundedCaptureError<Error>> {
+        self.partition_evidence_validate(source, claim, side, window)
+    }
+    fn apply_partition_intervention(
+        &mut self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        allowance: &mut eredu_runtime::capture::partition::PartitionInterventionLocalAllowance,
+    ) -> Result<Option<Array>, FundedCaptureError<Error>> {
+        self.partition_edit_apply(source, claim, allowance)
+    }
+    fn prefill_intervention_projection_usage(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        window: eredu_runtime::intervention::InterventionPrefillWindow,
+    ) -> Result<[CaptureUsage; 2], FundedCaptureError<Error>> {
+        self.prefill_projection_usage(source, claim, window)
+    }
+    fn prefill_intervention_usage(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        window: eredu_runtime::intervention::InterventionPrefillWindow,
+    ) -> Result<CaptureUsage, FundedCaptureError<Error>> {
+        self.prefill_edit_usage(source, claim, window)
+    }
+    fn apply_prefill_intervention(
+        &mut self,
+        source: &Array,
+        fragment: eredu_runtime::working_memory::InterventionPrefillFragment<'_, '_>,
+        charged: CaptureUsage,
+        projection: [CaptureUsage; 2],
+    ) -> Result<Option<Array>, FundedCaptureError<Error>> {
+        self.prefill_edit(source, fragment, charged, projection)
+    }
+    fn intervention_usage(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+    ) -> Result<CaptureUsage, FundedCaptureError<Error>> {
+        self.scheduled_intervention_usage(source, claim)
+    }
+    fn intervention_projection_usage(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+    ) -> Result<[CaptureUsage; 2], FundedCaptureError<Error>> {
+        self.scheduled_intervention_projection_usage(source, claim)
+    }
+    fn apply_intervention_projected(
+        &mut self,
+        source: &Array,
+        claim: eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        charged: CaptureUsage,
+        projection: [CaptureUsage; 2],
+    ) -> Result<
+        (
+            Option<Array>,
+            eredu_runtime::working_memory::ClaimedIntervention,
+        ),
+        FundedCaptureError<Error>,
+    > {
+        self.scheduled_intervention(source, claim, charged, projection)
+    }
+    fn intervention_evidence_usage(
+        &self,
+        source: &Array,
+        claim: &eredu_runtime::working_memory::CaptureInterventionEvidenceClaim<'_, '_>,
+    ) -> Result<(TensorDtype, CaptureUsage), FundedCaptureError<Error>> {
+        self.scheduled_evidence_usage(source, claim)
+    }
+    fn capture_intervention_evidence<'a>(
+        &mut self,
+        source: &Array,
+        claim: eredu_runtime::working_memory::CaptureInterventionEvidenceClaim<'a, '_>,
+    ) -> Result<
+        eredu_runtime::working_memory::ClaimedInterventionEvidence<'a>,
+        FundedCaptureError<Error>,
+    > {
+        self.scheduled_evidence(source, claim)
     }
 
+    fn routed_intervention_range(
+        &self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+    ) -> Result<[u64; 2], FundedCaptureError<Error>> {
+        self.scheduled_routed_range(source, claim, None)
+    }
+    fn routed_intervention_usage(
+        &self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+    ) -> Result<CaptureUsage, FundedCaptureError<Error>> {
+        self.scheduled_routed_usage(source, claim, None)
+    }
+    fn prefill_routed_intervention_range(
+        &self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        span: eredu_runtime::intervention::InterventionPrefillWindow,
+    ) -> Result<[u64; 2], FundedCaptureError<Error>> {
+        self.scheduled_routed_range(source, claim, Some(span))
+    }
+    fn prefill_routed_intervention_usage(
+        &self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        claim: &eredu_runtime::working_memory::CaptureInterventionClaim<'_>,
+        span: eredu_runtime::intervention::InterventionPrefillWindow,
+    ) -> Result<CaptureUsage, FundedCaptureError<Error>> {
+        self.scheduled_routed_usage(source, claim, Some(span))
+    }
+    fn apply_routed_intervention(
+        &mut self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        batch: eredu_runtime::working_memory::RoutedInterventionBatch<'_, '_>,
+    ) -> Result<Option<Array>, FundedCaptureError<Error>> {
+        self.scheduled_routed_apply(source, batch)
+    }
     fn routed_error(&self, cause: FundedCaptureError<Error>) -> eredu_nn::Error {
         eredu_nn::Error::backend_retained_source(self.work.capture_error(observer_error(cause)))
     }
     fn validate_routed_prefill_source(
-        &self, source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        &self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
         fragment: &eredu_core::capture::CaptureRoutedPrefillFragment<'_, '_>,
     ) -> Result<TensorDtype, FundedCaptureError<Error>> {
         crate::backend::array_copy::CompletedRoutedCaptureSource::validate_borrowed(
-            source, fragment.plan().geometry().bank(), fragment.source_tokens())
-            .map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(Error::Other(Box::new(cause)))))?;
+            source,
+            fragment.plan().geometry().bank(),
+            fragment.source_tokens(),
+        )
+        .map_err(|cause| {
+            FundedCaptureError::Backend(self.work.capture_error(Error::Other(Box::new(cause))))
+        })?;
         Ok(match source.values.dtype() {
             safemlx::Dtype::Float32 => TensorDtype::F32,
             safemlx::Dtype::Float16 => TensorDtype::F16,
@@ -137,29 +279,40 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
         })
     }
     fn estimate_routed_prefill(
-        &self, geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
+        &self,
+        geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
     ) -> Result<CaptureUsage, CaptureError> {
         crate::composition::mlx::session::bounded_capture::estimate_routed_geometry(geometry)
     }
     fn transform_routed_prefill(
-        &mut self, source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        &mut self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
         writer: eredu_runtime::working_memory::CaptureRoutedPrefillWriter<'_, '_, '_, '_>,
     ) -> Result<(), FundedCaptureError<Error>> {
         let result = (|| {
             let observer = self.capture_observer()?;
-            let completion = observer.as_ref().map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
-            self.work.capture_prefill_routed(source, writer, self.stream, completion)
+            let completion = observer
+                .as_ref()
+                .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
+            self.work
+                .capture_prefill_routed(source, writer, self.stream, completion)
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
 
     fn validate_routed_invocation_source(
-        &self, source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        &self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
         geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
     ) -> Result<TensorDtype, FundedCaptureError<Error>> {
         crate::backend::array_copy::CompletedRoutedCaptureSource::validate_borrowed(
-            source, geometry.bank(), geometry.source_shape()[0] as u64)
-            .map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(Error::Other(Box::new(cause)))))?;
+            source,
+            geometry.bank(),
+            geometry.source_shape()[0] as u64,
+        )
+        .map_err(|cause| {
+            FundedCaptureError::Backend(self.work.capture_error(Error::Other(Box::new(cause))))
+        })?;
         Ok(match source.values.dtype() {
             safemlx::Dtype::Float32 => TensorDtype::F32,
             safemlx::Dtype::Float16 => TensorDtype::F16,
@@ -168,84 +321,120 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
         })
     }
     fn transform_routed_batch(
-        &mut self, source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
+        &mut self,
+        source: &eredu_core::capture::RoutedUnitCaptureSource<'_, Array>,
         writer: eredu_runtime::working_memory::CaptureRoutedBatchWriter<'_, '_>,
     ) -> Result<(), FundedCaptureError<Error>> {
         let result = (|| {
             let observer = self.capture_observer()?;
-            let completion = observer.as_ref().map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
-            self.work.capture_routed_batch(source, writer, self.stream, completion)
+            let completion = observer
+                .as_ref()
+                .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
+            self.work
+                .capture_routed_batch(source, writer, self.stream, completion)
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
 
     fn validate_partition_routed_invocation(
-        &self, input: &eredu_runtime::RoutedUnitInvocation<'_, Array>,
+        &self,
+        input: &eredu_runtime::RoutedUnitInvocation<'_, Array>,
         layout: &eredu_core::capture::PartitionRoutedUnitCaptureLayout<'_>,
     ) -> Result<(u64, TensorDtype), FundedCaptureError<Error>> {
         routed_partition::validate_invocation(self, input, layout)
     }
     fn estimate_partition_routed(
-        &self, request: &eredu_core::capture::PartitionRoutedUnitCaptureRequest<'_>,
+        &self,
+        request: &eredu_core::capture::PartitionRoutedUnitCaptureRequest<'_>,
     ) -> Result<CaptureUsage, CaptureError> {
-        crate::composition::mlx::session::bounded_capture::estimate_partition_routed_geometry(request)
+        crate::composition::mlx::session::bounded_capture::estimate_partition_routed_geometry(
+            request,
+        )
     }
     fn validate_partition_routed_source(
-        &self, source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Array>,
+        &self,
+        source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Array>,
         request: &eredu_core::capture::PartitionRoutedUnitCaptureRequest<'_>,
-        invocation_source_tokens: u64, actual_native_rows: u64,
+        invocation_source_tokens: u64,
+        actual_native_rows: u64,
     ) -> Result<TensorDtype, FundedCaptureError<Error>> {
-        routed_partition::validate_source(self, source, request, invocation_source_tokens, actual_native_rows)
+        routed_partition::validate_source(
+            self,
+            source,
+            request,
+            invocation_source_tokens,
+            actual_native_rows,
+        )
     }
     fn validate_partition_routed_batch_source(
-        &self, source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Array>,
+        &self,
+        source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Array>,
         layout: &eredu_core::capture::PartitionRoutedUnitCaptureLayout<'_>,
         actual_native_rows: u64,
     ) -> Result<(TensorDtype, u64), FundedCaptureError<Error>> {
         routed_partition::validate_batch(self, source, layout, actual_native_rows)
     }
     fn transform_partition_routed_batch(
-        &mut self, source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Array>,
+        &mut self,
+        source: &eredu_core::capture::PartitionRoutedUnitCaptureSource<'_, Array>,
         writer: eredu_runtime::working_memory::CapturePartitionRoutedWriter<'_, '_>,
     ) -> Result<(), FundedCaptureError<Error>> {
         let result = (|| {
             let observer = self.capture_observer()?;
-            let completion = observer.as_ref().map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
-            self.work.capture_partition_routed(source, writer, self.stream, completion, self.prefill)
+            let completion = observer
+                .as_ref()
+                .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
+            self.work.capture_partition_routed(
+                source,
+                writer,
+                self.stream,
+                completion,
+                self.prefill,
+            )
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
 
-    fn partition_capture(&mut self)
-        -> Option<&mut (dyn eredu_runtime::capture::partition::ScheduledPartitionCapture + '_)> {
-        match &mut self.partition { Some(program) => Some(&mut **program), None => None }
+    fn partition_capture(
+        &mut self,
+    ) -> Option<&mut (dyn eredu_runtime::capture::partition::ScheduledPartitionCapture + '_)> {
+        match &mut self.partition {
+            Some(program) => Some(&mut **program),
+            None => None,
+        }
     }
 
-    fn validate_partition_prefill_source(&self,source:&Array,
-        geometry:&eredu_runtime::capture::partition::PartitionPrefillReceiverSource)
-        ->Result<TensorDtype,FundedCaptureError<Error>> {
-        validate_projected_source(source,geometry.source_shape())
+    fn validate_partition_prefill_source(
+        &self,
+        source: &Array,
+        geometry: &eredu_runtime::capture::partition::PartitionPrefillReceiverSource,
+    ) -> Result<TensorDtype, FundedCaptureError<Error>> {
+        validate_projected_source(source, geometry.source_shape())
     }
-    fn validate_partition_invocation_source(&self,source:&Array,
-        geometry:&eredu_runtime::capture::partition::PartitionInvocationReceiverSource)
-        ->Result<TensorDtype,FundedCaptureError<Error>> {
-        validate_projected_source(source,geometry.source_shape())
+    fn validate_partition_invocation_source(
+        &self,
+        source: &Array,
+        geometry: &eredu_runtime::capture::partition::PartitionInvocationReceiverSource,
+    ) -> Result<TensorDtype, FundedCaptureError<Error>> {
+        validate_projected_source(source, geometry.source_shape())
     }
-    fn complete_partition_source(&mut self, source: &Array) -> Result<(), FundedCaptureError<Error>> {
+    fn complete_partition_source(
+        &mut self,
+        source: &Array,
+    ) -> Result<(), FundedCaptureError<Error>> {
         let result = (|| {
             let observer = self.capture_observer()?;
-            let completion = observer.as_ref()
+            let completion = observer
+                .as_ref()
                 .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
             self.work.validate_capture_completion(completion)?;
-            PreparedCaptureTensor::validate_stream(self.stream)
-                .map_err(|cause| Error::Other(Box::new(cause)))?;
-            completion.reserve_roots(&self.work.roots, 1)
-                .map_err(|cause| Error::Other(Box::new(cause)))?;
-            self.work.retain(source);
-            if let Some(cause) = self.work.take_collection_failure() { return Err(cause); }
-            drop(completion.settle(source, self.stream)
-                .map_err(|cause| Error::Other(Box::new(cause)))?);
-            Ok(())
+            partition_native::complete_source(
+                &TextSourceRetainer(self.work),
+                source,
+                self.stream,
+                &self.work.roots,
+                completion,
+            )
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
@@ -282,7 +471,11 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
                 safemlx::Dtype::Float32 => TensorDtype::F32,
                 safemlx::Dtype::Float16 => TensorDtype::F16,
                 safemlx::Dtype::Bfloat16 => TensorDtype::Bf16,
-                _ => unreachable!("closed source validator accepts only these precisions"),
+                safemlx::Dtype::Uint8 => TensorDtype::U8,
+                safemlx::Dtype::Uint16 => TensorDtype::U16,
+                safemlx::Dtype::Uint32 => TensorDtype::U32,
+                safemlx::Dtype::Uint64 => TensorDtype::U64,
+                _ => unreachable!("closed source validator accepts floating or unsigned values"),
             })
             .map_err(|error| Error::Other(Box::new(error)))
     }
@@ -342,7 +535,11 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
             safemlx::Dtype::Float32 => TensorDtype::F32,
             safemlx::Dtype::Float16 => TensorDtype::F16,
             safemlx::Dtype::Bfloat16 => TensorDtype::Bf16,
-            _ => unreachable!("closed floating dtype check"),
+            safemlx::Dtype::Uint8 => TensorDtype::U8,
+            safemlx::Dtype::Uint16 => TensorDtype::U16,
+            safemlx::Dtype::Uint32 => TensorDtype::U32,
+            safemlx::Dtype::Uint64 => TensorDtype::U64,
+            _ => unreachable!("validated fragment source dtype"),
         })
         .map_err(|e| FundedCaptureError::Backend(Error::Other(Box::new(e))))
     }
@@ -435,7 +632,10 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
                 safemlx::Dtype::Float32 => TensorDtype::F32,
                 safemlx::Dtype::Float16 => TensorDtype::F16,
                 safemlx::Dtype::Bfloat16 => TensorDtype::Bf16,
-                _ => unreachable!("closed floating source"),
+                safemlx::Dtype::Uint8 => TensorDtype::U8,
+                safemlx::Dtype::Uint16 => TensorDtype::U16,
+                safemlx::Dtype::Uint32 => TensorDtype::U32,
+                _ => unreachable!("validated summary source"),
             })
             .map_err(|error| {
                 FundedCaptureError::Backend(self.work.capture_error(Error::Other(Box::new(error))))
@@ -484,7 +684,10 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
                 safemlx::Dtype::Float32 => TensorDtype::F32,
                 safemlx::Dtype::Float16 => TensorDtype::F16,
                 safemlx::Dtype::Bfloat16 => TensorDtype::Bf16,
-                _ => unreachable!("closed floating source"),
+                safemlx::Dtype::Uint8 => TensorDtype::U8,
+                safemlx::Dtype::Uint16 => TensorDtype::U16,
+                safemlx::Dtype::Uint32 => TensorDtype::U32,
+                _ => unreachable!("validated summary source"),
             })
             .map_err(|error| {
                 FundedCaptureError::Backend(self.work.capture_error(Error::Other(Box::new(error))))
@@ -535,8 +738,13 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
             let completion = observer
                 .as_ref()
                 .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
-            self.work
-                .capture_candidates_with_completion(source, claim, self.stream, completion, self.domain)
+            self.work.capture_candidates_with_completion(
+                source,
+                claim,
+                self.stream,
+                completion,
+                self.domain,
+            )
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
@@ -578,8 +786,13 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
                 .as_ref()
                 .map_or(CaptureCompletion::Ordinary, CaptureCompletion::Original);
 
-            self.work
-                .capture_token_scores_with_completion(source, claim, self.stream, completion, self.domain)
+            self.work.capture_token_scores_with_completion(
+                source,
+                claim,
+                self.stream,
+                completion,
+                self.domain,
+            )
         })();
         result.map_err(|cause| FundedCaptureError::Backend(self.work.capture_error(cause)))
     }
@@ -648,7 +861,9 @@ impl<P: Probe> SessionOperation<'_, P> {
             &mut dyn RuntimeActivationObserver<Array, Error>,
         ) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        self.with_funded_capture_inner(backend, capture, prediction, None, None, false, domain, operation)
+        self.with_funded_capture_inner(
+            backend, capture, prediction, None, None, false, domain, operation,
+        )
     }
 
     /// Use the same work owner with the original installed prefill companion.
@@ -663,7 +878,16 @@ impl<P: Probe> SessionOperation<'_, P> {
             &mut dyn RuntimeActivationObserver<Array, Error>,
         ) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        self.with_funded_capture_inner(backend, capture, 0, Some(bound), None, true, domain, operation)
+        self.with_funded_capture_inner(
+            backend,
+            capture,
+            0,
+            Some(bound),
+            None,
+            true,
+            domain,
+            operation,
+        )
     }
 
     pub(in crate::composition::mlx::session::model_session) fn with_funded_continuation_capture<
@@ -735,8 +959,8 @@ impl<P: Probe> SessionOperation<'_, P> {
                 .as_ref()
                 .ok_or_else(|| Error::Other(Box::new(WorkingMemoryError::ExecutionFenced)))?;
             scope
-                .validate_domain(backend.memory_pool())
-                .and_then(|()| scope.validate_domain(&self.session.payload.memory_pool))
+                .validate_ledger(backend.memory_ledger())
+                .and_then(|()| scope.validate_ledger(&self.session.payload.memory_ledger))
                 .map_err(|error| Error::Other(Box::new(error)))?;
             capture
                 .validate_native_scope(scope)
@@ -750,11 +974,16 @@ impl<P: Probe> SessionOperation<'_, P> {
         // exclusive payload. The frame source retains only request/native control
         // authority; receipt/program destinations drop before this guard.
         let partition_owner = self.owner.clone();
-        let mut partition_frame = partition_owner.partition_capture.try_borrow_mut()
+        let mut partition_frame = partition_owner
+            .partition_capture
+            .try_borrow_mut()
             .map_err(|_| work.capture_error(Error::PrefillScopeReentrant))?;
-        let mut partition_program = partition_frame.as_mut()
-            .map(|frame| frame.program(capture, prediction)).transpose()
-            .map_err(|cause| work.capture_error(cause))?.flatten();
+        let mut partition_program = partition_frame
+            .as_mut()
+            .map(|frame| frame.program(capture, prediction))
+            .transpose()
+            .map_err(|cause| work.capture_error(cause))?
+            .flatten();
 
         let mut native = NativeScheduledCapture {
             work: &work,
@@ -762,8 +991,9 @@ impl<P: Probe> SessionOperation<'_, P> {
             owner: Some(self.owner.clone()),
             prefill: physical_prefill,
             domain,
-            partition: partition_program.as_mut().map(|program| program as
-                &mut dyn eredu_runtime::capture::partition::ScheduledPartitionCapture),
+            partition: partition_program.as_mut().map(|program| {
+                program as &mut dyn eredu_runtime::capture::partition::ScheduledPartitionCapture
+            }),
         };
         let retain_observer_error = |error| work.capture_error(observer_error(error));
         let execute = |observer: &mut dyn RuntimeActivationObserver<Array, Error>| {
@@ -800,11 +1030,21 @@ impl<P: Probe> SessionOperation<'_, P> {
 pub(super) fn replica_control_bytes() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     let values = [
+        partition_native::control_bytes::<TextSourceRetainer<'static>>()?,
         error_control_bytes()?,
         crate::backend::nn::tensor::TokenValidationScope::capture_observer_control_bytes()?,
-        size_of::<(&NativeScheduledCapture<'static>,&Array,&eredu_runtime::capture::partition::PartitionPrefillReceiverSource)>(),
-        size_of::<(&NativeScheduledCapture<'static>,&Array,&eredu_runtime::capture::partition::PartitionInvocationReceiverSource)>(),
-        size_of::<(&Array,&[usize])>(),size_of::<Result<TensorDtype,FundedCaptureError<Error>>>(),
+        size_of::<(
+            &NativeScheduledCapture<'static>,
+            &Array,
+            &eredu_runtime::capture::partition::PartitionPrefillReceiverSource,
+        )>(),
+        size_of::<(
+            &NativeScheduledCapture<'static>,
+            &Array,
+            &eredu_runtime::capture::partition::PartitionInvocationReceiverSource,
+        )>(),
+        size_of::<(&Array, &[usize])>(),
+        size_of::<Result<TensorDtype, FundedCaptureError<Error>>>(),
         safemlx::OperationEvent::nested_completion_control_bytes::<1>()?,
         safemlx::OriginalScopeObserver::control_bytes()?,
         safemlx::PreparedArrayClone::control_bytes()?,
@@ -813,7 +1053,12 @@ pub(super) fn replica_control_bytes() -> Option<usize> {
         size_of::<CaptureCompletion<'static>>(),
         size_of::<Option<safemlx::OriginalScopeObserver>>(),
         size_of::<safemlx::EvaluatedArray<'static>>(),
-        size_of::<Result<safemlx::EvaluatedArray<'static>, crate::backend::array_copy::CaptureTensorNativeError>>(),
+        size_of::<
+            Result<
+                safemlx::EvaluatedArray<'static>,
+                crate::backend::array_copy::CaptureTensorNativeError,
+            >,
+        >(),
         size_of::<crate::backend::array_copy::CaptureTensorNativeError>(),
         size_of::<Box<crate::backend::array_copy::CaptureTensorNativeError>>(),
         size_of::<Result<(), Error>>(),
@@ -821,13 +1066,15 @@ pub(super) fn replica_control_bytes() -> Option<usize> {
         size_of::<std::cell::BorrowMutError>(),
         size_of::<std::collections::TryReserveError>(),
     ];
-    values.into_iter().try_fold(size_of_val(&values), usize::checked_add)
+    values
+        .into_iter()
+        .try_fold(size_of_val(&values), usize::checked_add)
 }
 
-fn validate_projected_source(source:&Array,shape:&[usize])->Result<TensorDtype,FundedCaptureError<Error>> {
-        PreparedCaptureTensor::validate_borrowed_shape(source,shape)
-            .map(|dtype|match dtype {
-                safemlx::Dtype::Float32=>TensorDtype::F32,safemlx::Dtype::Float16=>TensorDtype::F16,
-                safemlx::Dtype::Bfloat16=>TensorDtype::Bf16,_=>unreachable!("validated floating source"),
-            }).map_err(|cause|FundedCaptureError::Backend(Error::Other(Box::new(cause))))
+fn validate_projected_source(
+    source: &Array,
+    shape: &[usize],
+) -> Result<TensorDtype, FundedCaptureError<Error>> {
+    partition_native::validate_source(source, shape)
+        .map_err(|cause| FundedCaptureError::Backend(Error::Other(Box::new(cause))))
 }

@@ -1,12 +1,15 @@
 //! Closed immutable original policy and its actual paid host-copy constructor.
 mod source;
 use super::*;
-pub(super) use source::{controller_source_control_bytes, validate_controller_source, grammar_source_control_bytes, validate_grammar_source};
+pub(super) use source::{
+    controller_source_control_bytes, grammar_source_control_bytes, validate_controller_source,
+    validate_grammar_source,
+};
 mod adaptive;
 mod control;
 mod grammar;
 use eredu_core::{
-    HostPreparationAuthority, capture::CaptureError, speculative::SpeculativeControlError,
+    capture::CaptureError, speculative::SpeculativeControlError, HostPreparationAuthority,
 };
 use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::generation::{
@@ -148,7 +151,7 @@ impl<S> CopyPlan<'_, S> {
     }
     fn validate_source(
         &self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<(), Error> {
         if let Self::Controller(plan) = self {
             let source = plan.controller_source().map_err(|_| {
@@ -264,8 +267,15 @@ fn controls<S, E, L>(copy: usize) -> Option<usize> {
 }
 impl<S: SpeculativeSampler<MlxSamplingBackend>> MlxSpeculativeSampling<S> {
     fn from_original_policy(inner: Policy<S>) -> Self {
-        Self { inner, capture: None, original_capture: None, original_interventions: None,
-            interventions: Vec::new(), memory_retention: None, error: std::marker::PhantomData }
+        Self {
+            inner,
+            capture: None,
+            original_capture: None,
+            original_interventions: None,
+            interventions: Vec::new(),
+            memory_retention: None,
+            error: std::marker::PhantomData,
+        }
     }
     /// Ordinary construction stays unchanged. Original construction copies the
     /// exact known host source before wrapping it; it never adopts its old box.
@@ -302,9 +312,7 @@ impl<S: SpeculativeSampler<MlxSamplingBackend>> MlxSpeculativeSampling<S> {
                     .into_iter()
                     .try_fold(bytes.checked_add(size_of_val(&parts))?, usize::checked_add)
             })
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         sources
             .metadata_funding()
             .reserve_metadata(bytes)
@@ -312,12 +320,12 @@ impl<S: SpeculativeSampler<MlxSamplingBackend>> MlxSpeculativeSampling<S> {
         plan.validate_source(environment.pool())?;
         let host = HostPreparationAuthority::retain(sources.metadata_funding().clone());
         let inner = copy_original(
-                plan,
-                host,
-                Some(sources.metadata_funding().clone()),
-                Some(numerical::SnapshotContext::prepare_for_context(context)?),
-            )
-            .map_err(Error::StorageSource)?;
+            plan,
+            host,
+            Some(sources.metadata_funding().clone()),
+            Some(numerical::SnapshotContext::prepare_for_context(context)?),
+        )
+        .map_err(Error::StorageSource)?;
         Ok(Self::from_original_policy(inner))
     }
 }
@@ -431,7 +439,9 @@ where
         }
         let plan = copy_plan(self.inner.source());
         if plan.is_none() && self.inner.source().prepared_grammar_controller().is_none() {
-            return Err(SpeculativeControlError::Unsupported("sampler has no paid host copy"));
+            return Err(SpeculativeControlError::Unsupported(
+                "sampler has no paid host copy",
+            ));
         }
         let copy_key = |key: &numerical::OriginalNumericalKey| {
             self.inner
@@ -480,7 +490,8 @@ where
                         self.inner.snapshot_context().cloned(),
                     ),
                     None => grammar::copy_snapshot::<S, E, L>(&self.inner, &host),
-                }.map_err(SpeculativeControlError::Backend)?,
+                }
+                .map_err(SpeculativeControlError::Backend)?,
                 capture: None,
                 original_capture: self.original_capture.clone(),
                 original_interventions: self.original_interventions.clone(),
@@ -544,9 +555,7 @@ where
                     eredu_nn::workspace::HostMetadataFunding,
                 >()?)
             })
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         let funding = value.validate_consumer(sources)?;
         funding
             .reserve_metadata(bytes)
@@ -584,9 +593,7 @@ where
             let bytes = parts
                 .into_iter()
                 .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?;
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
             funding
                 .reserve_metadata(bytes)
                 .map_err(Error::WorkspacePlanning)?;
@@ -611,8 +618,8 @@ mod tests {
     use super::*;
     use eredu_runtime::{ConfiguredTextSampler, GenerationSampler};
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
     struct Retires(Arc<AtomicBool>);
     impl Drop for Retires {

@@ -281,6 +281,7 @@ pub(super) fn composite(
     context: &NumericContext,
 ) -> Result<NumericCompositePartitionExecutable, String> {
     let communication = NumericPreparedCommunication::realize(&sources, context)?;
+    let retained_sources = sources.clone();
     let route = PartitionedCompositeRoute::<
         NumericBackend,
         DeviceState<NumericBackend, NumericHybridLayerState>,
@@ -292,6 +293,7 @@ pub(super) fn composite(
             let checkpoint = resources.target().clone();
             let native = resources.into_communication();
             NumericCompositePartitionVisitor {
+                sources: retained_sources.clone(),
                 world: native.world,
                 context: context.clone(),
                 checkpoint,

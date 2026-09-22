@@ -39,14 +39,6 @@ pub(super) struct ProvisionalTextResumePrompt {
 }
 
 impl ProvisionalTextResumePrompt {
-    pub(super) fn key(&self) -> Option<&Array> {
-        self.key.as_ref()
-    }
-
-    pub(super) fn prompt(&self) -> &MlxModelInput {
-        &self.prompt
-    }
-
     /// Move the settled parts and the input's original fresh request custody.
     /// The enclosing preparation still binds the prompt exactly once; this
     /// does not install state or issue readiness.
@@ -64,6 +56,7 @@ pub(super) fn construct_saved_resume_prompt(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
     admission: &PendingSavedTextAdmission,
 ) -> Result<ProvisionalTextResumePrompt, Error> {
+    let host = admission.host_preparation().ok_or_else(unknown)?;
     admission.with_funding(|funding| {
         construct_with_original(
             runtime,
@@ -72,14 +65,12 @@ pub(super) fn construct_saved_resume_prompt(
                 preparation: admission.preparation(),
                 funding,
             },
-            admission
-                .host_preparation()
-                .map(|host| OriginalPromptAuthority {
-                    host,
-                    quote: admission.quote(),
-                    registered: admission.registered_source(),
-                    source_native: admission.source_native(),
-                }),
+            OriginalPromptAuthority {
+                host,
+                quote: admission.quote(),
+                registered: admission.registered_source(),
+                source_native: admission.source_native(),
+            },
         )
     })
 }
@@ -110,9 +101,7 @@ impl ResumeFailure {
     }
 }
 
-// Construction is confined to the sealed entry above. Child tests may exercise
-// the native worker with an actual full source quote and fresh reservation,
-// without inventing core TextStepContext or a production admission constructor.
+// Construction is confined to the sealed actual-source admission above.
 struct PromptAuthority<'a> {
     source: &'a CopiedTextComponentsOwner,
     preparation: &'a InferenceTextPreparation,
@@ -126,35 +115,33 @@ struct OriginalPromptAuthority<'a> {
     registered: &'a WorkingMemoryStorage<StorageIdentity>,
 }
 
-#[cfg(test)]
-fn construct(
-    runtime: &mut ModelRuntime<MlxBackend<'_>>,
-    authority: PromptAuthority<'_>,
-) -> Result<ProvisionalTextResumePrompt, Error> {
-    construct_with_original(runtime, authority, None)
-}
-
 fn construct_with_original(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
     authority: PromptAuthority<'_>,
-    original: Option<OriginalPromptAuthority<'_>>,
+    original: OriginalPromptAuthority<'_>,
 ) -> Result<ProvisionalTextResumePrompt, Error> {
     let source = authority.source;
     source.validate_resume_origin(runtime)?;
     let session = runtime.session();
-    let pool = runtime.backend().memory_pool();
+    let pool = runtime.backend().memory_ledger();
     let request = authority.preparation.request();
     let geometry = request.geometry();
-    let terminal = geometry.input_positions == 0 && geometry.max_output_tokens == 0
-        && geometry.prefill_chunk_positions == 0 && geometry.output == eredu_core::OutputDemand::StateOnly;
-    let (positions, saved_chunk) = if terminal { (0, 0) } else { source.sampling.pending_geometry().map_err(memory)? };
+    let terminal = geometry.input_positions == 0
+        && geometry.max_output_tokens == 0
+        && geometry.prefill_chunk_positions == 0
+        && geometry.output == eredu_core::OutputDemand::StateOnly;
+    let (positions, saved_chunk) = if terminal {
+        (0, 0)
+    } else {
+        source.sampling.pending_geometry().map_err(memory)?
+    };
     if geometry.batch_size != 1
         || geometry.cached_positions != source.sampling.frontier()
         || geometry.input_positions != positions
         || (!terminal && geometry.prefill_chunk_positions == 0)
         || geometry.prefill_chunk_positions > saved_chunk
         || (!terminal && geometry.max_output_tokens == 0)
-        || !authority.funding.pool().same_domain(pool)
+        || !authority.funding.pool().same_ledger(pool)
     {
         return Err(mismatch());
     }
@@ -163,7 +150,6 @@ fn construct_with_original(
     // that complete geometry; the saved parent cannot prescribe child readout.
     request
         .memory_reservation()
-        .ok_or_else(unknown)?
         .validate(
             session
                 .payload
@@ -173,45 +159,29 @@ fn construct_with_original(
             geometry,
         )
         .map_err(memory)?;
-    let mut pending_plan = if terminal { None } else { source.sampling.prepare_pending_tokens().map_err(other)? };
+    let mut pending_plan = if terminal {
+        None
+    } else {
+        source.sampling.prepare_pending_tokens().map_err(other)?
+    };
     if let Some(pending) = &mut pending_plan {
         pending
             .select_chunk_positions(
                 std::num::NonZeroU64::new(geometry.prefill_chunk_positions).ok_or_else(mismatch)?,
             )
             .map_err(other)?;
-    } else if original.is_none() {
-        return Err(unknown());
     }
-    let plan = if original.is_some() {
-        source
-            .decoder
-            .native
-            .prepare_copy_fixed()
-            .map_err(other)?
-            .into_dense_fixed()
-            .map_err(other)?
-    } else {
-        source.decoder.native.prepare_copy()?.into_dense()?
-    };
+    let plan = source
+        .decoder
+        .native
+        .prepare_copy_fixed()
+        .map_err(other)?
+        .into_dense_fixed()
+        .map_err(other)?;
     let origin = source.decoder.origin.clone();
     let prompt_identity = source.decoder.input.clone();
-    let complete = if let Some(original) = &original {
-        source.validate_resume_account(original.registered)?;
-        original.registered.clone()
-    } else {
-        let mut complete = DecoderCopyOwner::Saved(source.decoder.clone()).complete_storage()?;
-        for array in source
-            .sampling
-            .arrays
-            .key
-            .iter()
-            .chain(source.sampling.arrays.pending.iter().filter(|_| !terminal))
-        {
-            complete.include_array(array)?;
-        }
-        complete.pin_registered(pool)?
-    };
+    source.validate_resume_account(original.registered)?;
+    let complete = original.registered.clone();
     let mut operands = Some(0usize);
     if plan.is_paged() {
         plan.visit_snapshot_operands(&mut |source| {
@@ -253,19 +223,15 @@ fn construct_with_original(
         pending_plan.is_some(),
     )
     .map_err(memory)?;
-    if original.as_ref().is_some_and(|original| {
-        original
-            .quote
-            .saved_copy_population()
-            .is_none_or(|copy| copy.roots() != root_count)
-    }) {
+    if original
+        .quote
+        .saved_copy_population()
+        .is_none_or(|copy| copy.roots() != root_count)
+    {
         return Err(mismatch());
     }
     let collector = RootCollectorPlan::from_root_count(root_count)?;
     let roots = collector.construct().map_err(other)?;
-    let owned_stream = original
-        .is_none()
-        .then(|| runtime.backend().stream().clone());
     // With no native operands, the shared dense table constructor is host-only.
     // Do not open Scope/Graph/Record or infer a completion from an empty marker.
     let native = operands != 0 || retained_count != 0 || key_count != 0 || pending_plan.is_some();
@@ -278,22 +244,12 @@ fn construct_with_original(
                 .map_err(other)
         })
         .transpose()?;
-    let (stage, native_custody) = match &original {
-        Some(original) => original.quote.claim_saved_prompt(authority.preparation)?,
-        None => (authority.preparation.claim_prompt().map_err(memory)?, None),
-    };
-    let (slots, scope) = match &original {
-        Some(original) => {
-            plan.construct_prepared(stage, authority.funding, complete, pool, original.host)?
-        }
-        None => plan.construct(stage, authority.funding, complete, pool)?,
-    };
+    let (stage, native_custody) = original.quote.claim_saved_prompt(authority.preparation)?;
+    let (slots, scope) =
+        plan.construct_prepared(stage, authority.funding, complete, pool, original.host)?;
     let (backend, session) = runtime.parts_mut();
-    let stream = owned_stream.as_ref().unwrap_or_else(|| backend.stream());
-    let funding = match &original {
-        Some(original) => original.quote.funded_work(scope)?,
-        None => text_funding::FundedWork::new(scope),
-    };
+    let stream = backend.stream();
+    let funding = original.quote.funded_work(scope)?;
     let (owner, mut operation) = if let Some(lease) = lease {
         let owner = SubmissionResources::with_purpose(
             lease,
@@ -305,13 +261,9 @@ fn construct_with_original(
         );
         owner.payload.replace(Some(session.payload.clone()));
         owner.funding.replace(Some(funding.clone()));
-        let recovery = match (&original, native_custody) {
-            (Some(original), Some(custody)) => {
-                original.quote.begin_saved_prompt(custody, owner.ticket())?
-            }
-            (None, None) => owner.recovery()?,
-            _ => return Err(mismatch()),
-        };
+        let recovery = original
+            .quote
+            .begin_saved_prompt(native_custody.ok_or_else(mismatch)?, owner.ticket())?;
         let operation = SessionOperation {
             session,
             owner: owner.clone(),
@@ -329,13 +281,10 @@ fn construct_with_original(
         // Its graph bank is active for every source/result C handle.
         let mut failure = None;
         if plan.is_paged() {
-            let native = original
-                .as_ref()
-                .and_then(|authority| authority.source_native)
-                .ok_or_else(mismatch)?;
+            let native = original.source_native.ok_or_else(mismatch)?;
             for (identity, _, _) in native.iter() {
                 if let Some(array) = native.native_array(identity) {
-                    retain_source(array, &roots, true)?;
+                    retain_source(array, &roots)?;
                 } else if native.native_host(identity).is_none() {
                     return Err(mismatch());
                 }
@@ -343,7 +292,7 @@ fn construct_with_original(
         } else {
             plan.visit_retained_arrays(&mut |array| {
                 if failure.is_none() {
-                    failure = retain_source(array, &roots, original.is_some()).err();
+                    failure = retain_source(array, &roots).err();
                 }
             })
             .map_err(crate::backend::runtime::cache::state::SnapshotProjectionCause::into_error)?;
@@ -356,7 +305,7 @@ fn construct_with_original(
             .chain(source.sampling.arrays.pending.iter().filter(|_| !terminal))
         {
             if failure.is_none() {
-                failure = retain_source(array, &roots, original.is_some()).err();
+                failure = retain_source(array, &roots).err();
             }
         }
         if let Some(cause) = failure {
@@ -368,7 +317,7 @@ fn construct_with_original(
             if let Some(cause) = funding.take_collection_failure() {
                 return Err(cause);
             }
-            completed(array, original.is_some())
+            completed(array)
         };
         let state = plan.copy_dense_retained_observed(slots, &stream, &roots, &mut observe)?;
         if !paged {
@@ -386,13 +335,7 @@ fn construct_with_original(
                 return Err(error);
             }
         }
-        #[cfg(all(
-            test,
-            target_vendor = "apple",
-            feature = "metal",
-            not(feature = "cuda")
-        ))]
-        tests::before_table_publication(state.slot_metadata(), authority.funding)?;
+
         // This publishes the host table only. Numerical completion is still
         // protected by this operation; binding is deferred until exact settle.
         let (state, completion) = state.publish_for_control().map_err(|error| {
@@ -400,18 +343,12 @@ fn construct_with_original(
             drop(owner); // every partial native descriptor remains in recovery
             other(cause)
         })?;
-        #[cfg(all(
-            test,
-            target_vendor = "apple",
-            feature = "metal",
-            not(feature = "cuda")
-        ))]
-        tests::after_table_publication(authority.funding)?;
+
         let host = match &pending_plan {
             Some(pending) => PendingPromptHost::Tokens(pending.prepare_host_with_authority(
                 completion,
                 authority.funding,
-                original.as_ref().map(|original| original.host),
+                Some(original.host),
             )?),
             None => PendingPromptHost::Media(completion),
         };
@@ -423,7 +360,7 @@ fn construct_with_original(
             .map(|array| {
                 let key = IsolatedArrayCopy::new(array).copy_retained(&stream, &roots)?;
                 funding.retain(&key);
-                completed(&key, original.is_some())?;
+                completed(&key)?;
                 Ok::<_, Error>(key)
             })
             .transpose()?;
@@ -432,15 +369,20 @@ fn construct_with_original(
                 let (prompt, completion) = pending.copy_into_prompt(host, &stream, &roots)?;
                 let tokens = prompt.parts.first().ok_or_else(mismatch)?.payload().value();
                 funding.retain(tokens);
-                completed(tokens, original.is_some())?;
+                completed(tokens)?;
                 (prompt, SavedPromptCompletion::Tokens(completion))
             }
             (None, PendingPromptHost::Media(completion)) if terminal => {
                 let prompt = MlxModelInput {
                     parts: super::super::super::pending_prompt::ModelInputParts::Owned(Vec::new()),
-                    controlled_attribution: None, prepared_capture: None, original_media: None,
-                    placement_semantics: None, cache_identity: None, prefill_chunk_positions: None,
-                    inference_request: Some(request.clone()), memory_owner: None, quote: None,
+                    controlled_attribution: None,
+                    original_media: None,
+                    placement_semantics: None,
+                    cache_identity: None,
+                    prefill_chunk_positions: None,
+                    inference_request: Some(request.clone()),
+                    memory_owner: None,
+                    quote: None,
                 };
                 (prompt, SavedPromptCompletion::Media(completion))
             }
@@ -455,19 +397,14 @@ fn construct_with_original(
             }
             _ => return Err(mismatch()),
         };
-        #[cfg(all(
-            test,
-            target_vendor = "apple",
-            feature = "metal",
-            not(feature = "cuda")
-        ))]
-        tests::after_pending_construction(authority.funding)?;
+
         debug_assert!(roots.borrow().len() <= root_count);
         Ok::<_, Error>((state, key, prompt, completion))
     };
-    let copied = match (&original, native) {
-        (Some(original), true) => original.quote.with_saved_prompt_construction(copy),
-        _ => copy(),
+    let copied = if native {
+        original.quote.with_saved_prompt_construction(copy)
+    } else {
+        copy()
     };
     let (state, key, prompt, completion): (
         PublishedResidentDecoderState,
@@ -481,13 +418,7 @@ fn construct_with_original(
     // The optional holder also carries the session lifetime. It is empty only
     // after the owning completion above has settled or returned its failure.
     drop(operation);
-    #[cfg(all(
-        test,
-        target_vendor = "apple",
-        feature = "metal",
-        not(feature = "cuda")
-    ))]
-    tests::before_final_publication(authority.funding)?;
+
     let mut host = funding.prepare_inventory()?;
     state.visit_registered_child_metadata(&mut |metadata| {
         host.include_slot_metadata(metadata.clone())
@@ -503,17 +434,12 @@ fn construct_with_original(
     // The lease is already resolved and every final numerical root has its
     // independent charge. No completion is inferred from marker destruction.
     let model = runtime.session().payload.model.erased();
-    let state = match &original {
-        Some(original) => model.bind_original_resident_control_state(
-            &origin,
-            state,
-            prompt_identity,
-            original.host,
-        )?,
-        None => MlxNativeTextState::from_ordinary_prepared(
-            model.bind_prepared_resident_control_state(&origin, state, prompt_identity)?,
-        ),
-    };
+    let state = model.bind_original_resident_control_state(
+        &origin,
+        state,
+        prompt_identity,
+        original.host,
+    )?;
     completion.finish().map_err(memory)?;
     Ok(ProvisionalTextResumePrompt { state, key, prompt })
 }
@@ -527,36 +453,7 @@ pub(super) fn preparation_control_bytes(
     has_key: bool,
 ) -> Result<usize, super::resume_quote::ResumeSourceCause> {
     use std::mem::size_of;
-    let mut operands = Some(0usize);
-    let mut retained = Some(0usize);
-    if decoder.is_paged() {
-        crate::backend::runtime::cache::state::SnapshotArraySources::visit_operands(
-            decoder,
-            &mut |source| {
-                if matches!(
-                    source,
-                    crate::backend::runtime::cache::state::SnapshotOperand::Array(_)
-                ) {
-                    operands = operands.and_then(|n| n.checked_add(1));
-                    retained = retained.and_then(|n| n.checked_add(1));
-                }
-                Ok(())
-            },
-        )?;
-    } else {
-        decoder.visit_operands(&mut |_| operands = operands.and_then(|n| n.checked_add(1)))?;
-        decoder
-            .visit_retained_arrays(&mut |_| retained = retained.and_then(|n| n.checked_add(1)))?;
-    }
-
-    let roots = recovery_root_count(
-        operands.ok_or(WorkingMemoryError::Overflow)?,
-        retained.ok_or(WorkingMemoryError::Overflow)?,
-        usize::from(has_key),
-        pending.map_or(0, PreparedPendingPrompt::retained_descriptor_count),
-        pending.is_some(),
-    )?;
-    let collector = RootCollectorPlan::from_root_count_fixed(roots)?;
+    let collector = collector_plan(decoder, pending, has_key)?;
     let parts = [
         usize::try_from(collector.retention_control_bytes())
             .map_err(|_| WorkingMemoryError::Overflow)?,
@@ -574,7 +471,6 @@ pub(super) fn preparation_control_bytes(
         size_of::<(MlxNativeTextState, Option<Array>, MlxModelInput)>(),
         size_of::<PromptAuthority<'_>>(),
         size_of::<OriginalPromptAuthority<'_>>(),
-        size_of::<Option<OriginalPromptAuthority<'_>>>(),
         size_of::<(
             PublishedResidentDecoderState,
             Option<Array>,
@@ -608,6 +504,51 @@ pub(super) fn preparation_control_bytes(
         .map_err(Into::into)
 }
 
+fn collector_plan(
+    decoder: &PreparedResidentDecoderCopy<'_>,
+    pending: Option<&PreparedPendingPrompt<'_>>,
+    has_key: bool,
+) -> Result<RootCollectorPlan, super::resume_quote::ResumeSourceCause> {
+    let mut operands = Some(0usize);
+    let mut retained = Some(0usize);
+    if decoder.is_paged() {
+        crate::backend::runtime::cache::state::SnapshotArraySources::visit_operands(
+            decoder,
+            &mut |source| {
+                if matches!(
+                    source,
+                    crate::backend::runtime::cache::state::SnapshotOperand::Array(_)
+                ) {
+                    operands = operands.and_then(|n| n.checked_add(1));
+                    retained = retained.and_then(|n| n.checked_add(1));
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        decoder.visit_operands(&mut |_| operands = operands.and_then(|n| n.checked_add(1)))?;
+        decoder
+            .visit_retained_arrays(&mut |_| retained = retained.and_then(|n| n.checked_add(1)))?;
+    }
+
+    let roots = recovery_root_count(
+        operands.ok_or(WorkingMemoryError::Overflow)?,
+        retained.ok_or(WorkingMemoryError::Overflow)?,
+        usize::from(has_key),
+        pending.map_or(0, PreparedPendingPrompt::retained_descriptor_count),
+        pending.is_some(),
+    )?;
+    Ok(RootCollectorPlan::from_root_count_fixed(roots)?)
+}
+
+pub(super) fn publication_control_bytes(
+    decoder: &PreparedResidentDecoderCopy<'_>,
+    pending: Option<&PreparedPendingPrompt<'_>>,
+    has_key: bool,
+) -> Result<u64, super::resume_quote::ResumeSourceCause> {
+    Ok(collector_plan(decoder, pending, has_key)?.publication_control_bytes()?)
+}
+
 fn recovery_root_count(
     operands: usize,
     retained: usize,
@@ -631,12 +572,8 @@ fn recovery_root_count(
         .ok_or(WorkingMemoryError::Overflow)
 }
 
-fn retain_source(array: &Array, roots: &RefCell<Vec<Array>>, original: bool) -> Result<(), Error> {
-    let retained = if original {
-        array.try_clone_handle()?
-    } else {
-        array.clone()
-    };
+fn retain_source(array: &Array, roots: &RefCell<Vec<Array>>) -> Result<(), Error> {
+    let retained = array.try_clone_handle()?;
     let mut roots = roots.try_borrow_mut().map_err(|_| mismatch())?;
     if roots.len() == roots.capacity() {
         return Err(mismatch());
@@ -644,24 +581,12 @@ fn retain_source(array: &Array, roots: &RefCell<Vec<Array>>, original: bool) -> 
     roots.push(retained);
     Ok(())
 }
-fn completed(array: &Array, original: bool) -> Result<(), Error> {
-    if original {
-        let observer = safemlx::OriginalScopeObserver::require_current()?;
-        array.completed_in_original_scope(&observer)?;
-    } else {
-        array.evaluated()?;
-    }
+fn completed(array: &Array) -> Result<(), Error> {
+    let observer = safemlx::OriginalScopeObserver::require_current()?;
+    array.completed_in_original_scope(&observer)?;
     Ok(())
 }
 
 fn other(error: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::Other(Box::new(error))
 }
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod tests;

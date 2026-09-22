@@ -14,7 +14,7 @@ pub(crate) struct PreparedControllerAttempt {
     pub(super) admission: Option<ResidencyAdmissionStorage>,
     manager: ManagerWeak,
     // All final allocations and source/manager aliases precede their custody.
-    _custody: OriginalOperationMetadataCustody,
+    _custody: ResidencyControlCustody,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ControllerPreparationCause {
@@ -112,6 +112,7 @@ impl PreparedControllerAttempt {
         ];
         let fixed = [
             size_of::<OriginalOperationMetadataCustody>(),
+            size_of::<ResidencyControlCustody>(),
             size_of::<eredu_runtime::working_memory::OriginalTextMetadataCustody>(),
             size_of::<Self>(),
             size_of::<Option<Self>>(),
@@ -140,6 +141,14 @@ impl ResidencyManager {
         &self,
         source: WindowPopulation,
         custody: OriginalOperationMetadataCustody,
+    ) -> Result<PreparedControllerAttempt, ControllerPreparationError> {
+        self.prepare_controller_with_custody(source, custody.into())
+    }
+
+    pub(super) fn prepare_controller_with_custody(
+        &self,
+        source: WindowPopulation,
+        custody: ResidencyControlCustody,
     ) -> Result<PreparedControllerAttempt, ControllerPreparationError> {
         let state = self
             .inner

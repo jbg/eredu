@@ -1,7 +1,9 @@
 //! Exact native representation dispatch; no conversion or extra prompt claim.
 use super::super::{
     hybrid::{
-        InitializedHybridDenseGroup, PreparedDenseHybridGroupedState, PublishedDenseHybridGroupedState, },
+        InitializedHybridDenseGroup, PreparedDenseHybridGroupedState,
+        PublishedDenseHybridGroupedState,
+    },
     key_value::{
         InitializedPagedDenseCopy, PreparedDenseResidentKvState, PublishedDenseResidentKvState,
     },
@@ -11,11 +13,11 @@ use super::*;
 use crate::backend::nn::workspace::ProjectedNativeStorage;
 use eredu_nn::workspace::{WorkspaceBackend, WorkspaceContext, WorkspaceTraceReport};
 use eredu_runtime::{
-    DeviceState, HostSlotAttachmentError, HostSlotMetadata,
     working_memory::{
         InferencePreparationStage, InferencePromptCompletion, InitializedDenseDecoderSlots,
         WorkingMemoryFundingRun, WorkingMemoryFundingScope, WorkspaceResidentLayerState,
     },
+    DeviceState, HostSlotAttachmentError, HostSlotMetadata,
 };
 use std::num::NonZeroU32;
 fn other(e: impl std::error::Error + Send + Sync + 'static) -> Error {
@@ -51,12 +53,12 @@ impl<'a> PreparedResidentDenseCopy<'a> {
             state_bytes,
             std::mem::size_of::<eredu_runtime::working_memory::InferenceRequest>() as u64,
         );
-        let manager=match self {
-            Self::Paged(plan)=>plan.logical_snapshot_manager_bytes(),
-            Self::HybridGrouped(plan)=>plan.logical_snapshot_manager_bytes(),
-            _=>Some(0),
+        let manager = match self {
+            Self::Paged(plan) => plan.logical_snapshot_manager_bytes(),
+            Self::HybridGrouped(plan) => plan.logical_snapshot_manager_bytes(),
+            _ => Some(0),
         };
-        total=total.and_then(|bytes|bytes.checked_add(manager?));
+        total = total.and_then(|bytes| bytes.checked_add(manager?));
         // Preserve the shared logical snapshot treatment of stored arrays and
         // views. Compact-source backing may exceed its copied logical view;
         // this remains conservative without treating physical Q as copy work.
@@ -104,8 +106,10 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         if let Self::Paged(source) = self {
             return source.snapshot_source().visit_operands(visitor);
         }
-        if let Self::HybridGrouped(source)=self {
-            if source.is_paged(){return SnapshotArraySources::visit_operands(source,visitor);}
+        if let Self::HybridGrouped(source) = self {
+            if source.is_paged() {
+                return SnapshotArraySources::visit_operands(source, visitor);
+            }
         }
         let mut failure = None;
         self.visit_retained_arrays(&mut |array| {
@@ -128,9 +132,11 @@ impl<'a> PreparedResidentDenseCopy<'a> {
             }
             Self::KeyValue(p) => p.visit_operands(visitor),
             Self::HybridGrouped(p) => {
-                if p.is_paged(){return p.visit_paged_arrays(visitor);}
+                if p.is_paged() {
+                    return p.visit_paged_arrays(visitor);
+                }
                 p.visit_operands(visitor)
-            },
+            }
             Self::Pooling(p) => p.visit_operands(visitor),
         };
         Ok(())
@@ -148,14 +154,16 @@ impl<'a> PreparedResidentDenseCopy<'a> {
             }
             Self::KeyValue(p) => p.visit_operands(visitor),
             Self::HybridGrouped(p) => {
-                if p.is_paged(){return p.visit_paged_arrays(visitor);}
+                if p.is_paged() {
+                    return p.visit_paged_arrays(visitor);
+                }
                 p.visit_retained_arrays(visitor)
-            },
+            }
             Self::Pooling(p) => p.visit_retained_arrays(visitor),
         };
         Ok(())
     }
-    pub(crate) fn initialization_peak_bytes(&self, pool: &WorkingMemoryPool) -> Result<u64, Error> {
+    pub(crate) fn initialization_peak_bytes(&self, pool: &MemoryLedger) -> Result<u64, Error> {
         match self {
             Self::Paged(p) => p
                 .dense_initialization_peak_bytes_fixed()
@@ -247,7 +255,7 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         stage: InferencePreparationStage,
         funding: &WorkingMemoryFundingRun,
         complete: WorkingMemoryStorage<StorageIdentity>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(InitializedDenseResidentCopy<'a>, WorkingMemoryFundingScope), Error> {
         self.construct_with_preparation(stage, funding, complete, pool, None)
     }
@@ -256,7 +264,7 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         stage: InferencePreparationStage,
         funding: &WorkingMemoryFundingRun,
         complete: WorkingMemoryStorage<StorageIdentity>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         host: &eredu_core::HostPreparationAuthority,
     ) -> Result<(InitializedDenseResidentCopy<'a>, WorkingMemoryFundingScope), Error> {
         self.construct_with_preparation(stage, funding, complete, pool, Some(host))
@@ -266,7 +274,7 @@ impl<'a> PreparedResidentDenseCopy<'a> {
         stage: InferencePreparationStage,
         funding: &WorkingMemoryFundingRun,
         complete: WorkingMemoryStorage<StorageIdentity>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         host: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<(InitializedDenseResidentCopy<'a>, WorkingMemoryFundingScope), Error> {
         match self {

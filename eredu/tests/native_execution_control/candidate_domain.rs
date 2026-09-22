@@ -30,7 +30,9 @@ fn candidates(event: &ObservedGenerationEvent) -> Option<(u32, u64, bool, &Captu
 
 fn captured_domain(records: &[CaptureRecord]) -> &CaptureCandidates {
     assert_eq!(records.len(), 2);
-    assert!(records.iter().all(|record| record.outcome == CaptureOutcome::Captured));
+    assert!(records
+        .iter()
+        .all(|record| record.outcome == CaptureOutcome::Captured));
     let Some(CapturePayload::Candidates(candidates)) = &records[0].payload else {
         panic!("candidate payload")
     };
@@ -42,28 +44,55 @@ fn captured_domain(records: &[CaptureRecord]) -> &CaptureCandidates {
     assert_eq!(scores.stage, candidates.stage);
     assert_eq!(scores.source, candidates.source);
     assert_eq!(scores.vocabulary, 64);
-    assert_eq!(scores.scores.iter().map(|score| score.target.token_id).collect::<Vec<_>>(),
-        [1, 2, 3, 61, 62]);
+    assert_eq!(
+        scores
+            .scores
+            .iter()
+            .map(|score| score.target.token_id)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 61, 62]
+    );
     // The independent full-vocabulary oracle includes the forbidden tool ID
     // and tokenizer hole. Domain annotations must not change raw normalization.
-    let maximum = candidates.candidates.iter().map(|value| f64::from(value.score))
+    let maximum = candidates
+        .candidates
+        .iter()
+        .map(|value| f64::from(value.score))
         .fold(f64::NEG_INFINITY, f64::max);
-    let partition = maximum + candidates.candidates.iter()
-        .map(|value| (f64::from(value.score) - maximum).exp()).sum::<f64>().ln();
+    let partition = maximum
+        + candidates
+            .candidates
+            .iter()
+            .map(|value| (f64::from(value.score) - maximum).exp())
+            .sum::<f64>()
+            .ln();
     assert!((scores.log_partition - partition).abs() < 2e-5);
     for score in &scores.scores {
-        let target = candidates.candidates.iter()
-            .find(|value| value.token_id == score.target.token_id).unwrap();
+        let target = candidates
+            .candidates
+            .iter()
+            .find(|value| value.token_id == score.target.token_id)
+            .unwrap();
         assert_eq!(&score.target, target);
         assert!((score.log_probability - (f64::from(target.score) - partition)).abs() < 2e-5);
-        let rank = 1 + candidates.candidates.iter().filter(|value| value.score > target.score).count() as u64;
+        let rank = 1 + candidates
+            .candidates
+            .iter()
+            .filter(|value| value.score > target.score)
+            .count() as u64;
         assert_eq!(score.rank, rank);
         let alternative = score.strongest_alternative.as_ref().unwrap();
         assert_ne!(alternative.token_id, target.token_id);
-        let expected = candidates.candidates.iter()
-            .find(|value| value.token_id == alternative.token_id).unwrap();
+        let expected = candidates
+            .candidates
+            .iter()
+            .find(|value| value.token_id == alternative.token_id)
+            .unwrap();
         assert_eq!(alternative, expected);
-        assert!(candidates.candidates.iter().filter(|value| value.token_id != target.token_id)
+        assert!(candidates
+            .candidates
+            .iter()
+            .filter(|value| value.token_id != target.token_id)
             .all(|value| value.score <= alternative.score));
     }
     candidates
@@ -136,23 +165,27 @@ fn verify_domains(device: LocalDevice) {
     };
     let capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
-        selections: vec![CaptureSelection {
-            id: "candidates".into(),
-            path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
-            schedule: Default::default(),
-            slices: vec![],
-            transform: CaptureTransform::TopCandidates { count: 64 },
-        }, CaptureSelection {
-            id: "scores".into(),
-            path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
-            schedule: Default::default(),
-            slices: vec![],
-            transform: CaptureTransform::TokenScores { token_ids: vec![1, 2, 3, 61, 62] },
-        }],
+        selections: vec![
+            CaptureSelection {
+                id: "candidates".into(),
+                path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                schedule: Default::default(),
+                slices: vec![],
+                transform: CaptureTransform::TopCandidates { count: 64 },
+            },
+            CaptureSelection {
+                id: "scores".into(),
+                path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                schedule: Default::default(),
+                slices: vec![],
+                transform: CaptureTransform::TokenScores {
+                    token_ids: vec![1, 2, 3, 61, 62],
+                },
+            },
+        ],
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -169,7 +202,7 @@ fn verify_domains(device: LocalDevice) {
         per_record_bytes: 64 << 10,
         total_bytes: 1 << 20,
     };
-    let request = || PreparedChatRequest::new(&chat, original_settings(settings));
+    let request = || PreparedChatRequest::new(&chat, original_settings(settings.clone()));
     let cancellation = eredu_core::GenerationCancellationToken::new();
     let expected = model
         .start_prepared_chat(request(), &cancellation)
@@ -222,11 +255,9 @@ fn verify_domains(device: LocalDevice) {
         ordinary, controlled,
         "capture must preserve sampling and match controlled execution"
     );
-    assert!(
-        controlled
-            .iter()
-            .any(|(_, prediction, _, _)| *prediction > 0)
-    );
+    assert!(controlled
+        .iter()
+        .any(|(_, prediction, _, _)| *prediction > 0));
     for (token, _, forced, capture) in controlled {
         assert!(!forced);
         assert_eq!(capture.source, CandidateLogitsSource::Original);
@@ -255,9 +286,10 @@ fn verify_domains(device: LocalDevice) {
             retained_bytes: 64 << 20,
             cumulative_copy_bytes: 256 << 20,
         },
-        ORIGINAL_CAPACITY,
+        native_limits(ORIGINAL_CAPACITY),
         copy_limits(),
-    ).unwrap();
+    )
+    .unwrap();
     run.force_next_token(1).unwrap();
     run.step(collect(&mut records)).unwrap();
     run.force_next_token(2).unwrap();
@@ -265,10 +297,14 @@ fn verify_domains(device: LocalDevice) {
     run.step(collect(&mut records)).unwrap();
     run.restore(&snapshot, collect(&mut records)).unwrap();
     run.step(collect(&mut records)).unwrap();
-    let replay = records.iter()
+    let replay = records
+        .iter()
         .filter_map(|record| record.event.progress().and_then(candidates))
         .collect::<Vec<_>>();
-    assert_eq!(replay[1], replay[2], "restore preserves the pre-forcing domain and raw candidates");
+    assert_eq!(
+        replay[1], replay[2],
+        "restore preserves the pre-forcing domain and raw candidates"
+    );
     assert_eq!(
         records
             .iter()

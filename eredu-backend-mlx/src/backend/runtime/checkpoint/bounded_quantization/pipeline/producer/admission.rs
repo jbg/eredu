@@ -5,8 +5,8 @@ use eredu_checkpoint::{
     store::{MetadataCloneLayout, RetainedCheckpointSource},
 };
 use eredu_runtime::working_memory::{
-    DependencyMemoryPolicy, SharedNativeInitializationCustody, SharedNativeInitializationFailure,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    DependencyMemoryPolicy, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationFailure, SharedNativeInitializer, WorkingMemoryError,
 };
 use std::{cell::Cell, mem::size_of};
 
@@ -15,10 +15,11 @@ use std::{cell::Cell, mem::size_of};
 pub(crate) struct ColdConversion<'a> {
     pub(crate) source: &'a RetainedCheckpointSource,
     pub(crate) plan: &'a BoundedQuantizationPlan,
-    pub(crate) pool: &'a WorkingMemoryPool,
+    pub(crate) pool: &'a MemoryLedger,
     pub(crate) resources: &'a cpu_resources::CpuTileResources,
     pub(crate) metadata_policy: DependencyMemoryPolicy,
-    pub(crate) destinations: Option<&'a std::collections::BTreeMap<String, eredu_runtime::ParameterBindingTarget>>,
+    pub(crate) destinations:
+        Option<&'a std::collections::BTreeMap<String, eredu_runtime::ParameterBindingTarget>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,10 +74,12 @@ impl ColdConversion<'_> {
         ConvertedQuantization,
         SharedNativeInitializationFailure<(), eredu_core::BackendFailure>,
     > {
-        let initialized = self
-            .pool
-            .initialize_shared_native(self)
-            .map_err(|error| error.into_parts().1.retire_output_and_map_error(ConstructionError::into_backend_failure))?;
+        let initialized = self.pool.initialize_shared_native(self).map_err(|error| {
+            error
+                .into_parts()
+                .1
+                .retire_output_and_map_error(ConstructionError::into_backend_failure)
+        })?;
         // This private output independently retains its account through both
         // the plan and source root. The generic initialized owner stays borrowed.
         Ok(initialized

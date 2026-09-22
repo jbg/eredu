@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     DeviceState,
-    working_memory::{InferenceStateRetention, WorkingMemoryPool, WorkingMemoryUnquotedLease},
+    working_memory::{InferenceStateRetention, MemoryLedger, WorkingMemoryUnquotedLease},
 };
 use eredu_nn::workspace::WorkspaceBackend;
 
@@ -15,7 +15,7 @@ fn slot(owner: &mut Owner) -> &mut State {
 fn valid(_: &mut Owner, _: &State) -> Result<(), &'static str> {
     Ok(())
 }
-fn owner(pool: &WorkingMemoryPool) -> State {
+fn owner(pool: &MemoryLedger) -> State {
     let mut state = State::stateless();
     state
         .inference_retention_mut()
@@ -25,7 +25,11 @@ fn owner(pool: &WorkingMemoryPool) -> State {
 
 #[test]
 fn placement_preserves_actual_revisions_and_backing_owners() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        100 + 3 * MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        0,
+    )
+    .unwrap();
     let mut installed = Owner {
         state: owner(&pool),
     };
@@ -60,7 +64,11 @@ fn placement_preserves_actual_revisions_and_backing_owners() {
 
 #[test]
 fn publication_advances_actual_lane_revision_even_when_callback_fails() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        100 + 3 * MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        0,
+    )
+    .unwrap();
     let mut installed = Owner {
         state: owner(&pool),
     };
@@ -110,7 +118,11 @@ fn publication_advances_actual_lane_revision_even_when_callback_fails() {
 
 #[test]
 fn rejected_entry_and_failed_return_preserve_exact_error_custody() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        100 + 4 * MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        0,
+    )
+    .unwrap();
     let mut installed = Owner {
         state: owner(&pool),
     };
@@ -177,7 +189,11 @@ fn rejected_entry_and_failed_return_preserve_exact_error_custody() {
 #[test]
 fn unwind_restores_owners_without_restoring_a_stale_revision() {
     for return_panics in [false, true] {
-        let pool = WorkingMemoryPool::new(100, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(
+            100 + 3 * MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+            0,
+        )
+        .unwrap();
         let mut installed = Owner {
             state: owner(&pool),
         };

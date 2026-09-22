@@ -72,7 +72,11 @@ impl FundedWork {
                 program
                     .read_with_completion(&ids, &scores, stream, completion, |id, score| {
                         destination
-                            .push(id, score, domain.is_none_or(|domain| domain.filter.allows(id)))
+                            .push(
+                                id,
+                                score,
+                                domain.is_none_or(|domain| domain.filter.allows(id)),
+                            )
                             .map_err(CaptureTensorNativeError::from)
                     })
                     .map_err(error)?;

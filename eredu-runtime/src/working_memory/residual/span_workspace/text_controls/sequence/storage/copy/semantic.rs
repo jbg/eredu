@@ -1,7 +1,7 @@
 //! Semantic state joins the same independently admitted cursor copy transaction.
 use super::*;
-use crate::working_memory::PreparedSemanticState;
 use crate::execution_control::PreparedTextHostJournal;
+use crate::working_memory::PreparedSemanticState;
 use eredu_core::{HostPreparationAuthority, SemanticStateOwner, SpeculativeOutputError};
 
 struct SemanticSequenceCopy<'a, J> {
@@ -16,9 +16,13 @@ struct SemanticCopyFailure {
     cause: SpeculativeOutputError,
     host: HostPreparationAuthority,
 }
-type Copied<J> = (RetainedGenerationSequence, SemanticStateOwner, <J as PreparedTextHostJournal>::Copied);
+type Copied<J> = (
+    RetainedGenerationSequence,
+    SemanticStateOwner,
+    <J as PreparedTextHostJournal>::Copied,
+);
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     #[cfg(test)]
     pub(in crate::working_memory) fn prepare_semantic_resume_provider_for_test<
         'a,
@@ -29,7 +33,7 @@ impl WorkingMemoryPool {
         &self,
         sequence: &'a RetainedGenerationSequence,
         semantic: &'a SemanticStateOwner,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         journal: J,
     ) -> Result<impl PreparedTextHostCopy<Copied = Copied<J>> + 'a, WorkingMemoryError> {
         let controls = crate::execution_control::PendingSnapshotResumeRetention::control_bytes()
@@ -45,7 +49,7 @@ impl WorkingMemoryPool {
         &self,
         sequence: &'a RetainedGenerationSequence,
         semantic: &'a SemanticStateOwner,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         native_preparation_bytes: u64,
         journal: J,
     ) -> Result<impl PreparedTextHostCopy<Copied = Copied<J>> + 'a, WorkingMemoryError>
@@ -66,7 +70,7 @@ impl WorkingMemoryPool {
     /// Every escaping alias retains the shared nonrefundable resume lease.
     pub fn prepare_semantic_generation_resume_host_copy<'a, C: 'static, E, B, D, J>(
         &self, sequence: &'a RetainedGenerationSequence, semantic: &'a SemanticStateOwner,
-        capacity: u64, native_preparation_bytes: u64, journal: J,
+        capacity: eredu_core::MemoryLimits, native_preparation_bytes: u64, journal: J,
     ) -> Result<impl PreparedTextHostCopy<Copied = Copied<J>> + 'a, WorkingMemoryError>
     where B: crate::execution_control::TextSnapshotBackend + eredu_core::TextResumeBackend<
             ResumeSource = <B as crate::execution_control::TextSnapshotBackend>::SavedTextComponents>,
@@ -117,17 +121,28 @@ impl<'a> RetainedSequenceHostCopy<'a> {
             .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(WorkingMemoryError::Overflow)?;
-        let journal_preparation = journal.preparation_bytes()
+        let journal_preparation = journal
+            .preparation_bytes()
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(WorkingMemoryError::UnknownBound)?;
-        let journal_logical = journal.storage_bytes().ok_or(WorkingMemoryError::UnknownBound)?;
-        self.bytes = self.bytes.checked_add(bytes)
+        let journal_logical = journal
+            .storage_bytes()
+            .ok_or(WorkingMemoryError::UnknownBound)?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
             .and_then(|bytes| bytes.checked_add(journal_preparation))
             .ok_or(WorkingMemoryError::Overflow)?;
-        self.logical_bytes = self.logical_bytes.checked_add(bytes)
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(bytes)
             .and_then(|bytes| bytes.checked_add(journal_logical))
             .ok_or(WorkingMemoryError::Overflow)?;
-        Ok(SemanticSequenceCopy { sequence: self, semantic, journal })
+        Ok(SemanticSequenceCopy {
+            sequence: self,
+            semantic,
+            journal,
+        })
     }
 }
 impl<J: PreparedTextHostJournal> SemanticSequenceCopy<'_, J> {

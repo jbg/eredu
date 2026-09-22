@@ -27,7 +27,6 @@ fn independent_model_capture_quotes_actual_context_scope_and_single_invocation()
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::FullTensor],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let mut plan = ordinary.plan().clone();

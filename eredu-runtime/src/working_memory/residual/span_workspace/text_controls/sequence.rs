@@ -215,10 +215,7 @@ impl OriginalGenerationSequenceBank {
             if self.decoder.as_ref().map(|d| d.binding) != self.binding.decoder {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            let reservation = preparation
-                .request()
-                .memory_reservation()
-                .ok_or(WorkingMemoryError::IdentityMismatch)?;
+            let reservation = preparation.request().memory_reservation();
             if !reservation.0.same(&self.reservation.0)
                 || preparation.request().geometry() != self.reservation.0.geometry
             {

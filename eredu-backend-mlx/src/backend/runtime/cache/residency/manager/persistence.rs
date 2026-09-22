@@ -22,6 +22,7 @@ pub(in super::super) fn write_live_block(
         payload_sha256: None,
         payload_verification: Arc::new(OnceLock::new()),
         live_source: Some(live_source),
+        persistent_source: None,
     }))
 }
 
@@ -217,16 +218,19 @@ pub(in super::super) fn load_host_cache_block_direct(
     location: &DiskLocation,
     representation: CacheRepresentation,
 ) -> Result<HostCacheBlock, CacheResidencyError> {
-    verify_disk_payload(location)?;
+    let authenticated = location.file_source();
+    if authenticated.is_none() {
+        verify_disk_payload(location)?;
+    }
     let owned;
     let bytes = if let Some(buffered) = &location.buffered {
         buffered.as_ref()
-    } else if let Some(source) = location.live_source.as_ref().filter(|_| cfg!(unix)) {
+    } else if let Some(source) = authenticated.as_ref().filter(|_| cfg!(unix)) {
         let bytes = source
             .file_bytes()
             .ok_or(eredu_runtime::cache::CacheShardError::Header)?;
         let file = File::open(source.path()).map_err(|source| CacheResidencyError::Io {
-            action: "open retained live cache shard",
+            action: "open authenticated cache shard",
             path: location.path.clone(),
             source,
         })?;
@@ -242,11 +246,7 @@ pub(in super::super) fn load_host_cache_block_direct(
         })?;
         owned.as_slice()
     };
-    if let Some(layout) = location
-        .live_source
-        .as_ref()
-        .and_then(|source| source.writer_layout())
-    {
+    if let Some(layout) = authenticated.as_ref().and_then(|source| source.layout()) {
         if layout.names() != [location.first_name.as_str(), location.second_name.as_str()]
             || layout.names() != eredu_runtime::cache::cache_shard_tensor_names(representation)
         {

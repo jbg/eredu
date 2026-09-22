@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "mlx/c/array.h"
+#include "mlx/c/memory_placement.h"
 #include "mlx/c/stream.h"
 #include <stdint.h>
 
@@ -92,6 +93,14 @@ void mlx_submission_record_quota_release(mlx_submission_record_quota quota);
 size_t mlx_submission_record_quota_occupied(mlx_submission_record_quota quota);
 /** Closed shared arena; capacity bounds only migrated graph-metadata storage. */
 typedef struct mlx_submission_graph_quota_ { void* ctx; } mlx_submission_graph_quota;
+/** One final cloned handle in an existing paid metadata arena. No Scope,
+ * descriptor, data backing or execution authority is created. */
+uint32_t mlx_array_clone_storage_arena_capacity(size_t* capacity);
+uint32_t mlx_array_clone_storage_new_in(void** storage, mlx_submission_graph_quota quota);
+void mlx_array_clone_storage_free_in(void* storage, mlx_submission_graph_quota quota);
+uint32_t mlx_array_clone_storage_fill_in(
+    mlx_array* output, void** storage, const mlx_array source, mlx_submission_graph_quota quota);
+size_t mlx_array_clone_storage_arena_control_bytes(void);
 typedef struct mlx_submission_graph_quota_layout_ {
   size_t capacity;
   size_t allocation_bytes;
@@ -129,6 +138,25 @@ int mlx_submission_scope_new_original_child(
     mlx_submission_record_quota records, mlx_submission_graph_quota graph,
     mlx_submission_observer parent);
 size_t mlx_submission_scope_original_child_control_bytes(void);
+// One prepaid shared observer; aliases and scope binding allocate no storage.
+// Constructor success consumes context. Scope installation grants no execution.
+typedef struct mlx_scoped_physical_observer_ { void* ctx; } mlx_scoped_physical_observer;
+size_t mlx_submission_scope_physical_observer_control_bytes(void);
+int mlx_scoped_physical_observer_new(mlx_scoped_physical_observer*, void*,
+    mlx_physical_backing_observer, void (*)(void*));
+// New backing retires at its last physical alias; cache hits keep their policy.
+int mlx_scoped_physical_observer_new_uncached(mlx_scoped_physical_observer*, void*,
+    mlx_physical_backing_observer, void (*)(void*));
+// Bypass cached roots and retire new backing at its last physical alias.
+int mlx_scoped_physical_observer_new_fresh(mlx_scoped_physical_observer*, void*,
+    mlx_physical_backing_observer, void (*)(void*));
+void mlx_scoped_physical_observer_retain(mlx_scoped_physical_observer);
+void mlx_scoped_physical_observer_free(mlx_scoped_physical_observer);
+/** Exact inherited current ordinary observer; no allocation or scope mutation. */
+bool mlx_scoped_physical_observer_is_current(mlx_scoped_physical_observer);
+bool mlx_scoped_physical_observer_has_current(void);
+int mlx_submission_scope_bind_physical_observer(mlx_submission_scope,
+    mlx_scoped_physical_observer);
 int mlx_submission_scope_seal(mlx_submission_scope scope);
 int mlx_submission_scope_query(
     mlx_submission_status* out, mlx_submission_scope scope);

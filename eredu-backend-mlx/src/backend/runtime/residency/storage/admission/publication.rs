@@ -4,9 +4,23 @@ use super::*;
 use crate::backend::managed_memory::NativeMemoryOwner;
 use eredu_runtime::working_memory::WorkingMemoryFundingScope;
 
+type GenericNativeCharge = (
+    WorkingMemoryStorage<StorageIdentity>,
+    Option<WorkingMemoryStorage<StorageIdentity>>,
+);
+
+fn prepare_native_charge(
+    charge: GenericNativeCharge,
+) -> Result<safemlx::PreparedAllocationOwner<GenericNativeCharge>, Error> {
+    safemlx::PreparedAllocationOwner::try_new(charge).map_err(|failure| {
+        let (cause, _unattached) = failure.into_parts();
+        Error::Other(Box::new(cause))
+    })
+}
+
 #[derive(Debug)]
 struct PublishedStorage {
-    domain: eredu_core::SharedStorageDomain,
+    domain: eredu_core::SharedStorageAccountingId,
     // Native arrays and host buffers are removed after successful attachment.
     // The remaining source/buffer roots retire outside native locks before
     // their registrations. Their weak identity tokens prevent address reuse.
@@ -33,7 +47,7 @@ impl RetainedStoragePublication {
         use std::mem::size_of;
         let parts = [
             size_of::<&Self>(),
-            size_of::<&eredu_core::SharedStorageDomain>(),
+            size_of::<&eredu_core::SharedStorageAccountingId>(),
             size_of::<safemlx::AllocationInfo>(),
             size_of::<safemlx::AllocationIdentity>(),
             size_of::<u64>(), // exact capacity forwarded to the scalar receipt lookup
@@ -42,12 +56,14 @@ impl RetainedStoragePublication {
             size_of::<bool>(), // Host receipt comparison
             size_of::<bool>(),
         ];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
 
     pub(crate) fn has_native_attachment(
         &self,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
         allocation: safemlx::AllocationInfo,
     ) -> bool {
         self.has_native_attachment_facts(domain, allocation.identity(), allocation.bytes() as u64)
@@ -55,12 +71,16 @@ impl RetainedStoragePublication {
 
     fn has_native_attachment_facts(
         &self,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
         identity: safemlx::AllocationIdentity,
         capacity: u64,
     ) -> bool {
         self.0.domain.same_identity(domain)
-            && (matches!(self.0._non_native.arrays.get(&identity),
+            && (self
+                .0
+                ._non_native
+                .has_array_receipt(&StorageIdentity::Native(identity), capacity)
+                || matches!(self.0._non_native.arrays.get(&identity),
                 Some(NativeEntry::Attached(bytes)) if *bytes == capacity)
                 || matches!(self.0._non_native.hosts.get(&identity),
                     Some(NativeEntry::Attached(bytes)) if *bytes == capacity))
@@ -72,7 +92,10 @@ impl RetainedStoragePublication {
     pub(crate) fn can_retire_with(&self, retained: &Self) -> bool {
         !self.0._original.has_custody()
             && self.0._registrations.iter().all(|charge| {
-                retained.0._registrations.iter()
+                retained
+                    .0
+                    ._registrations
+                    .iter()
                     .any(|other| charge.same_registered_storage(other))
             })
     }
@@ -84,11 +107,16 @@ impl RetainedStoragePublication {
             size_of::<Option<&Self>>(),
             size_of::<bool>(),
             size_of::<[Iter<'static, WorkingMemoryStorage<StorageIdentity>>; 2]>(),
-            size_of::<(&WorkingMemoryStorage<StorageIdentity>, &WorkingMemoryStorage<StorageIdentity>)>(),
-            size_of::<Option<(&WorkingMemoryPool, &WorkingMemoryPool)>>(),
+            size_of::<(
+                &WorkingMemoryStorage<StorageIdentity>,
+                &WorkingMemoryStorage<StorageIdentity>,
+            )>(),
+            size_of::<Option<(&MemoryLedger, &MemoryLedger)>>(),
             size_of::<[Iter<'static, StorageIdentity>; 2]>(),
         ];
-        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
 }
 
@@ -114,8 +142,13 @@ impl RetainedStorage {
         owner: &NativeMemoryOwner,
     ) -> Result<RetainedStoragePublication, Error> {
         self.publication_custody().map_err(Error::PrefillControl)?;
-        let (entries, original) = self.source_entries(owner.pool(), Some(owner))?;
-        let registrations = owner.pool().register_storage_individually(entries);
+        let maximum = self.generic_publication_rows(owner.pool())?;
+        let prepared =
+            prepare_storage_publication(owner.pool(), maximum).map_err(Error::PrefillControl)?;
+        let host = prepared.host_authority().clone();
+        let (entries, original) =
+            self.source_entries_prepared(owner.pool(), Some(owner), maximum, &host)?;
+        let registrations = prepared.register_storage_individually(entries);
         let registrations = match registrations {
             Ok(value) => value,
             Err(error) => {
@@ -129,7 +162,8 @@ impl RetainedStorage {
             registrations,
             original,
             None,
-            owner.pool().shared_storage_domain(),
+            owner.pool().shared_storage_accounting_id(),
+            host,
         )
     }
 
@@ -152,8 +186,13 @@ impl RetainedStorage {
         funding: &WorkingMemoryFundingScope,
     ) -> Result<RetainedStoragePublication, Error> {
         self.publication_custody().map_err(Error::PrefillControl)?;
-        let (entries, original) = self.source_entries(funding.pool(), None)?;
-        let registrations = funding.adopt_storage_individually(entries);
+        let maximum = self.generic_publication_rows(funding.pool())?;
+        let prepared =
+            prepare_funded_storage_publication(funding, maximum).map_err(Error::PrefillControl)?;
+        let host = prepared.host_authority().clone();
+        let (entries, original) =
+            self.source_entries_prepared(funding.pool(), None, maximum, &host)?;
+        let registrations = prepared.adopt_storage_individually(funding, entries);
         let registrations = match registrations {
             Ok(value) => value,
             Err(error) => {
@@ -167,7 +206,8 @@ impl RetainedStorage {
             registrations,
             original,
             None,
-            funding.pool().shared_storage_domain(),
+            funding.pool().shared_storage_accounting_id(),
+            host,
         )
     }
 
@@ -189,15 +229,25 @@ impl RetainedStorage {
         prepared: Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>,
     ) -> Result<RetainedStoragePublication, Error> {
         self.publication_custody().map_err(Error::PrefillControl)?;
-        let entries = self.original_publication_entries(funding.pool(), original, prepared)?;
-        let registrations = funding
-            .adopt_storage_individually(entries)
+        self.validate_original_sources(funding.pool(), original, prepared)?;
+        let maximum = self.generic_publication_rows(funding.pool())?;
+        let publication =
+            prepare_funded_storage_publication(funding, maximum).map_err(Error::PrefillControl)?;
+        let host = publication.host_authority().clone();
+        let mut entries = self.placed_storage_entries_bounded(funding.pool(), Some(maximum))?;
+        entries.retain(|(key, _)| {
+            !original.is_some_and(|source| self.is_original_table_entry(source, key))
+                && !prepared.is_some_and(|source| self.is_prepared_input_entry(source, key))
+        });
+        let registrations = publication
+            .adopt_storage_individually(funding, entries)
             .map_err(|e| Error::Other(Box::new(e)))?;
         self.attach_publication(
             registrations,
             UnquotedOriginalSlotSources::default(),
             original,
-            funding.pool().shared_storage_domain(),
+            funding.pool().shared_storage_accounting_id(),
+            host,
         )
     }
 
@@ -206,12 +256,12 @@ impl RetainedStorage {
     // actual inventory owners, but omit them from newly adopted entries.
     fn original_publication_entries(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         original: Option<&eredu_runtime::working_memory::OriginalResidentResetSource>,
         prepared: Option<&eredu_runtime::input::OriginalPreparedWorkspaceSource>,
-    ) -> Result<Vec<(StorageIdentity, u64)>, Error> {
+    ) -> Result<Vec<(StorageIdentity, StorageAllocation)>, Error> {
         self.validate_original_sources(pool, original, prepared)?;
-        let mut entries = self.storage_entries()?;
+        let mut entries = self.placed_storage_entries(pool)?;
         entries.retain(|(key, _)| {
             !original.is_some_and(|source| self.is_original_table_entry(source, key))
                 && !prepared.is_some_and(|source| self.is_prepared_input_entry(source, key))
@@ -249,10 +299,11 @@ impl RetainedStorage {
 
     fn attach_publication(
         mut self,
-        mut registrations: BTreeMap<StorageIdentity, WorkingMemoryStorage<StorageIdentity>>,
+        mut registrations: eredu_runtime::working_memory::StorageRegistrations<StorageIdentity>,
         original: UnquotedOriginalSlotSources,
         fixed: Option<&eredu_runtime::working_memory::OriginalResidentResetSource>,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
+        host: eredu_core::HostPreparationAuthority,
     ) -> Result<RetainedStoragePublication, Error> {
         if let Err(cause) = self.attach_prepared(
             |key| registrations.remove(key),
@@ -264,7 +315,14 @@ impl RetainedStorage {
         ) {
             return Err(original_source_failure(cause, original));
         }
-        Ok(self.finish_publication(|| registrations.into_values().collect(), original, domain))
+        let custody = self.publication_custody().map_err(Error::PrefillControl)?;
+        Ok(self.finish_publication_with_custody(
+            || registrations.into_values().collect(),
+            original,
+            custody,
+            Some(host),
+            domain,
+        ))
     }
 
     // Shared ordinary/source attachment worker. The selected native route has
@@ -274,7 +332,7 @@ impl RetainedStorage {
         mut registration: impl FnMut(&StorageIdentity) -> Option<WorkingMemoryStorage<StorageIdentity>>,
         original: &UnquotedOriginalSlotSources,
         fixed: Option<&eredu_runtime::working_memory::OriginalResidentResetSource>,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
         arrays: bool,
         prepared_copy: bool,
     ) -> Result<(), Error> {
@@ -282,10 +340,13 @@ impl RetainedStorage {
             for (identity, (_, array)) in self.array_entries() {
                 let charge = registration(&StorageIdentity::Native(*identity))
                     .expect("certified array has a registration");
-                array.retain_allocation_owner(charge).map_err(|failure| {
-                    let (error, _unattached) = failure.into_parts();
-                    Error::from(error)
-                })?;
+                let controls = registration(&StorageIdentity::NativeControl(*identity));
+                prepare_native_charge((charge, controls))?
+                    .try_attach(array)
+                    .map_err(|failure| {
+                        let (cause, _unattached) = failure.into_parts();
+                        Error::Other(Box::new(cause))
+                    })?;
             }
         }
         for (identity, (_, host)) in self.host_entries() {
@@ -297,9 +358,13 @@ impl RetainedStorage {
             // A certified host/array alias already has its single physical
             // charge attached through the shared host-storage owner.
             if let Some(charge) = registration(&StorageIdentity::Native(*identity)) {
-                host.retain_allocation_owner(charge).map_err(|failure| {
-                    let (error, _unattached) = failure.into_parts();
-                    Error::from(error)
+                let controls = registration(&StorageIdentity::NativeControl(*identity));
+                host.try_attach_prepared_allocation_owner(prepare_native_charge((
+                    charge, controls,
+                ))?)
+                .map_err(|failure| {
+                    let (cause, _unattached) = failure.into_parts();
+                    Error::Other(Box::new(cause))
                 })?;
             }
         }
@@ -362,12 +427,18 @@ impl RetainedStorage {
         mut self,
         registrations: impl FnOnce() -> Vec<WorkingMemoryStorage<StorageIdentity>>,
         original: UnquotedOriginalSlotSources,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
     ) -> RetainedStoragePublication {
         let metadata_custody = self
             .publication_custody()
             .expect("validated publication role");
-        self.finish_publication_with_custody(registrations, original, metadata_custody, None, domain)
+        self.finish_publication_with_custody(
+            registrations,
+            original,
+            metadata_custody,
+            None,
+            domain,
+        )
     }
     fn finish_publication_with_custody(
         mut self,
@@ -375,7 +446,7 @@ impl RetainedStorage {
         original: UnquotedOriginalSlotSources,
         metadata_custody: Option<eredu_runtime::working_memory::OriginalTextMetadataCustody>,
         host: Option<eredu_core::HostPreparationAuthority>,
-        domain: &eredu_core::SharedStorageDomain,
+        domain: &eredu_core::SharedStorageAccountingId,
     ) -> RetainedStoragePublication {
         if let Some(original) = self.original.as_mut() {
             original.finish();
@@ -431,7 +502,7 @@ mod capture_plan_tests;
 mod native;
 pub(crate) use native::PendingNativePublication;
 
-fn publication_control_bytes(rows: usize) -> Option<u64> {
+pub(super) fn publication_control_bytes(rows: usize) -> Option<u64> {
     use std::{alloc::Layout, mem::size_of};
     // Same pinned RcInner recipe qualified by the selected bank's owning query.
     // OrdinaryRetirement holds the raw inventory after this Rc is deallocated;
@@ -448,7 +519,13 @@ fn publication_control_bytes(rows: usize) -> Option<u64> {
     let fixed = [
         shared,
         size_of::<PublishedStorage>(),
-        size_of::<std::collections::btree_map::ValuesMut<'_, safemlx::AllocationIdentity, NativeEntry<RetainedHostBuffer>>>(),
+        size_of::<
+            std::collections::btree_map::ValuesMut<
+                '_,
+                safemlx::AllocationIdentity,
+                NativeEntry<RetainedHostBuffer>,
+            >,
+        >(),
         size_of::<&mut NativeEntry<RetainedHostBuffer>>(),
         size_of::<NativeEntry<RetainedHostBuffer>>(),
         size_of::<u64>(),
@@ -472,6 +549,35 @@ fn publication_control_bytes(rows: usize) -> Option<u64> {
     .checked_add(OrdinaryRetirement::<PublishedStorage>::control_bytes()?)
 }
 
+/// Generic publication can attach one exact native owner per bounded row.
+/// Original native/copy publications price their different owner types in their
+/// own prepared banks and do not construct these nodes.
+pub(super) fn generic_native_attachment_control_bytes(rows: usize) -> Option<u64> {
+    use std::mem::{size_of, size_of_val};
+    let layout = safemlx::PreparedAllocationOwner::<GenericNativeCharge>::layout();
+    let parts = [
+        layout.allocation_bytes()?,
+        layout.preparation_control_bytes(),
+        layout.prepared_bytes(),
+        layout.preparation_failure_bytes(),
+        layout.attachment_failure_bytes(),
+        layout.original_attachment_control_bytes(),
+        size_of::<GenericNativeCharge>(),
+        size_of::<Result<safemlx::PreparedAllocationOwner<GenericNativeCharge>, Error>>(),
+        size_of::<safemlx::PreparedAllocationOwnerCause>(),
+        size_of::<Box<safemlx::PreparedAllocationOwnerCause>>(),
+        size_of::<Result<(), Error>>(),
+    ];
+    let bytes = parts
+        .into_iter()
+        .try_fold(size_of_val(&parts), usize::checked_add)?;
+    u64::try_from(bytes.checked_mul(rows)?).ok()
+}
+
 mod copy;
 pub(crate) use copy::retain_failure as retain_copy_publication_failure;
 pub(crate) use copy::{CopyPublicationLayout, PendingCopyPublication};
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

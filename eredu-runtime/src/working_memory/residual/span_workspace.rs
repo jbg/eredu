@@ -5,8 +5,8 @@ use crate::working_memory::{
     funding::{SpanHostCustody, SpanHostOwner},
     saved_source::SavedSourceValidation,
 };
-use std::mem::size_of;
 use eredu_nn::workspace::WorkspaceMetadataAllocation;
+use std::mem::size_of;
 mod text_controls;
 pub(in crate::working_memory) use text_controls::OriginalTokenDomainBinding;
 #[cfg(test)]
@@ -14,27 +14,28 @@ pub(in crate::working_memory) use text_controls::SequenceExtractionError;
 pub(in crate::working_memory) use text_controls::TextControlBinding;
 pub use text_controls::{
     AdmittedCaptureContinuation, AdmittedPrefillCapture, AggregateGenerationDecoderInput,
-    SamplingExtensionQuote, OriginalTextSamplingExtension,
     FailedCapturePlanPublication, GraphMetadataFacts, HostDestinationCause, HostDestinationFacts,
-    HostSourceConstructionFacts, HostSourceConstructionProgram, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError, LoadedGenerationDecoderInput, NativeStorageError,
-    NativeStorageObservation, NativeStorageRegistration, NativeStorageSelection,
-    OriginalGenerationDecoderInput, OriginalGenerationDecoderSource,
+    HostSourceConstructionFacts, HostSourceConstructionProgram, LoadedGenerationDecoderInput,
+    NativeStorageError, NativeStorageObservation, NativeStorageRegistration,
+    NativeStorageSelection, OriginalGenerationDecoderInput, OriginalGenerationDecoderSource,
     OriginalGenerationSequenceBank, OriginalGraphMetadata, OriginalHostDestinationBank,
     OriginalHostMetadataCustody, OriginalHostMetadataVec, OriginalHostSourceBank,
     OriginalHostSourceConstruction, OriginalHostSourceError, OriginalHostSourceFailure,
-    OriginalHostSourceFailureCause, OriginalHostSourceReceipt, OriginalHostSourceRefusal,
-    OriginalHostVec, OriginalHostVecError, OriginalNativeBudgetCustody, OriginalNativePublication,
-    OriginalNativeStorageBank, OriginalNativeStorageMechanism, OriginalPredictionNativeCustody,
+    OriginalHostSourceFailureCause, OriginalHostSourceProgramBanks, OriginalHostSourceProgramError,
+    OriginalHostSourceReceipt, OriginalHostSourceRefusal, OriginalHostVec, OriginalHostVecError,
+    OriginalNativeBudgetCustody, OriginalNativePublication, OriginalNativeStorageBank,
+    OriginalNativeStorageMechanism, OriginalPredictionNativeCustody,
     OriginalPredictionRecoveryCustody, OriginalPredictionScopeRole, OriginalPrefillNativeCustody,
     OriginalPrefillRecoveryCustody, OriginalPrefillRootCustody,
     OriginalPrefillRootProjectionCustody, OriginalPrefillScopeRole,
     OriginalPreparationScopeCustody, OriginalSubmissionTracking, OriginalTextControlGuard,
     OriginalTextMetadataCustody, OriginalTextPredictionScopeSet, OriginalTextPredictionScopes,
     OriginalTextPrefillScopeSet, OriginalTextPrefillScopes, OriginalTextPreparationScopes,
-    OriginalTokenInputBank, OriginalTokenInputFailure, OriginalTokenInputLayout,
-    OwnedPromptTokenIds, OwnedTextSpanWorkspace, PendingCapturePlanPublication,
-    PreparedNativeStoragePlan, PreparedTextControlWorkspace, ReservedTextSpanWorkspace,
-    SubmissionTrackingFacts, TextHostControlFacts, TextPredictionScopeFacts, TextPrefillScopeFacts,
+    OriginalTextSamplingExtension, OriginalTokenInputBank, OriginalTokenInputFailure,
+    OriginalTokenInputLayout, OwnedPromptTokenIds, OwnedTextSpanWorkspace,
+    PendingCapturePlanPublication, PreparedNativeStoragePlan, PreparedTextControlWorkspace,
+    ReservedTextSpanWorkspace, SamplingExtensionQuote, SubmissionTrackingFacts,
+    TextHostControlFacts, TextPredictionScopeFacts, TextPrefillScopeFacts,
     TextPreparationScopeFacts,
 };
 pub use text_controls::{
@@ -54,6 +55,7 @@ pub struct InferenceSpanWorkspace {
     // A sampling-only program includes its original host/history and tensor
     // peaks, rather than invoking model preparation/attention mechanisms.
     sampling: Option<u64>,
+    physical_outside: Option<Arc<eredu_core::DomainMemoryRequirements>>,
     text_controls: Option<PreparedTextControlWorkspace>,
 }
 impl InferenceSpanWorkspace {
@@ -61,34 +63,78 @@ impl InferenceSpanWorkspace {
         plan: &InferenceSpanWorkspacePlan,
         full: &ExecutionWorkspaceEstimate,
     ) -> Result<Self, CapabilityError> {
-        Self::new_fixed(plan, full).map_err(Into::into)
+        Self::new_fixed(plan, full).map_err(super::super::WorkspaceReportError::into_capability)
     }
     pub(super) fn new_fixed(
         plan: &InferenceSpanWorkspacePlan,
         full: &ExecutionWorkspaceEstimate,
-    ) -> Result<Self, eredu_core::AdmissionPolicyError> {
+    ) -> Result<Self, super::super::WorkspaceReportError> {
+        Self::new_metadata(
+            plan,
+            full,
+            super::super::WorkspaceReportMetadata::ordinary(),
+        )
+    }
+    pub(super) fn new_metadata(
+        plan: &InferenceSpanWorkspacePlan,
+        full: &ExecutionWorkspaceEstimate,
+        metadata: super::super::WorkspaceReportMetadata<'_>,
+    ) -> Result<Self, super::super::WorkspaceReportError> {
         if plan.geometry() != full.geometry {
             return Err(eredu_core::AdmissionPolicyError::InvalidConfiguration {
                 field: "span_workspace",
                 detail: "original mechanism terms differ from equation geometry",
-            });
+            }
+            .into());
         }
-        let preparation = add_fixed(full.activations.bytes(), full.state_update.bytes())?;
+        let physical_outside = if !workspace_has_unknown(full) {
+            full.physical_domains
+                .as_ref()
+                .map(|domains| {
+                    let mut outside = metadata.clone_domain_requirements(&domains.activations)?;
+                    for term in [
+                        &domains.state_update,
+                        &domains.attention,
+                        &domains.materialization,
+                    ] {
+                        outside = metadata.combine_domain_requirements(&outside, term, true)?;
+                    }
+                    metadata.admit::<(eredu_core::DomainMemoryRequirements, [usize; 2])>()?;
+                    Ok::<_, super::super::WorkspaceReportError>(Arc::new(outside))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let physical_complete = physical_outside.is_some()
+            && plan
+                .records()
+                .iter()
+                .all(|record| record.domain_allocations().is_some());
+        let preparation = if physical_complete {
+            full.activations
+                .bytes()
+                .zip(full.state_update.bytes())
+                .and_then(|(a, b)| a.checked_add(b))
+        } else {
+            add_fixed(full.activations.bytes(), full.state_update.bytes())?
+        };
         let attention = full.attention.bytes();
         let materialization = full.materialization.bytes();
-        // Unknown terms must not conceal overflow among independently known terms.
-        let known = [
-            full.activations.bytes(),
-            full.state_update.bytes(),
-            attention,
-            materialization,
-        ]
-        .into_iter()
-        .flatten()
-        .try_fold(0u64, |a, b| checked_fixed(a, b))?;
-        for record in plan.records() {
-            if let Some(n) = record.new_allocation_bytes() {
-                checked_fixed(known, n)?;
+        if !physical_complete {
+            let known = [
+                full.activations.bytes(),
+                full.state_update.bytes(),
+                attention,
+                materialization,
+            ]
+            .into_iter()
+            .flatten()
+            .try_fold(0u64, checked_fixed)?;
+            for record in plan.records() {
+                if let Some(n) = record.new_allocation_bytes() {
+                    checked_fixed(known, n)?;
+                }
             }
         }
         Ok(Self {
@@ -97,8 +143,33 @@ impl InferenceSpanWorkspace {
             attention,
             materialization,
             sampling: None,
+            physical_outside,
             text_controls: None,
         })
+    }
+    /// Complete charge in one physical domain for this actual scheduled span.
+    /// The equation trace and outside mechanisms retain separate lifetime facts.
+    pub fn span_domain_bytes(
+        &self,
+        index: usize,
+        domain: eredu_core::MemoryDomainId,
+    ) -> Result<Option<u64>, WorkingMemoryError> {
+        let record = self
+            .plan
+            .records()
+            .get(index)
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let Some(native) = record.domain_allocations() else {
+            return Ok(None);
+        };
+        let equation = native.get(domain)?.total()?;
+        let Some(outside) = &self.physical_outside else {
+            return Ok(None);
+        };
+        equation
+            .checked_add(outside.get(domain)?.total()?)
+            .map(Some)
+            .ok_or(WorkingMemoryError::Overflow)
     }
     /// Exact original traversal, shared with the completed equation report.
     pub fn plan(&self) -> &InferenceSpanWorkspacePlan {
@@ -124,7 +195,10 @@ impl InferenceSpanWorkspace {
     /// Conservative new equation plus full original preparation/materialization
     /// terms. Sampling, controller and cumulative retained H remain separate.
     pub fn span_bytes(&self, index: usize) -> Option<u64> {
-        if matches!(self.plan.records().get(index)?.span(), crate::working_memory::InferenceWorkspaceSpan::Sampling(_)) {
+        if matches!(
+            self.plan.records().get(index)?.span(),
+            crate::working_memory::InferenceWorkspaceSpan::Sampling(_)
+        ) {
             return self.sampling;
         }
         self.plan
@@ -168,8 +242,23 @@ impl InferenceSpanWorkspace {
         } else {
             controls
         };
+        let outside = if self.plan.metadata_funding().is_none() {
+            if let Some(value) = &self.physical_outside {
+                value.backing_bytes().ok()?.checked_add(
+                    u64::try_from(
+                        size_of::<eredu_core::DomainMemoryRequirements>() + 2 * size_of::<usize>(),
+                    )
+                    .ok()?,
+                )?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         self.plan
             .unreserved_capacity_bytes()?
+            .checked_add(outside)?
             .checked_add(u64::try_from(controls).ok()?)
     }
 }
@@ -230,9 +319,7 @@ impl ReservedInferenceSpanWorkspace<'_> {
         &self,
         request: &crate::working_memory::InferenceRequest,
     ) -> Result<(), WorkingMemoryError> {
-        let reservation = request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let reservation = request.memory_reservation();
         if !reservation.0.same(&self.reservation.0) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -242,10 +329,10 @@ impl ReservedInferenceSpanWorkspace<'_> {
     // Borrowed, not cloned: no new pin/owner or independently supplied witness.
     pub(in crate::working_memory) fn validate_sources(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
-        if !self.reservation.0.pool.same_domain(pool) {
+        if !self.reservation.0.pool.same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         if let Some(sources) = self.sources {
@@ -299,18 +386,39 @@ impl IncrementalInferenceQuote {
             && geometry.output == eredu_core::OutputDemand::StateOnly
             && geometry.validate_fixed().is_ok();
         if (self.span_workspace.plan.records().is_empty() && !terminal)
-            || (0..self.span_workspace.plan.records().len())
-                .any(|i| self.span_workspace.span_bytes(i).is_none())
+            || (0..self.span_workspace.plan.records().len()).any(|i| {
+                self.span_workspace.span_bytes(i).is_none()
+                    && (self.span_workspace.physical_outside.is_none()
+                        || self.span_workspace.plan.records()[i]
+                            .domain_allocations()
+                            .is_none())
+            })
         {
             return Err(WorkingMemoryError::UnknownBound.into());
         }
+        if let Some(outside) = &self.span_workspace.physical_outside {
+            for index in 0..self.span_workspace.plan.records().len() {
+                for (domain, _) in outside.iter() {
+                    self.span_workspace
+                        .span_domain_bytes(index, domain)?
+                        .ok_or(WorkingMemoryError::UnknownBound)?;
+                }
+            }
+        }
         let funding = self.span_workspace.plan.metadata_funding();
         cold_controls::<(
-            Self, SpanWorkspaceSeal, SpanWorkspaceIdentity, Result<Self, ResidualQuoteError>,
-            InferenceGeometry, bool, Result<(), eredu_core::AdmissionPolicyError>,
+            Self,
+            SpanWorkspaceSeal,
+            SpanWorkspaceIdentity,
+            Result<Self, ResidualQuoteError>,
+            InferenceGeometry,
+            bool,
+            Result<(), eredu_core::AdmissionPolicyError>,
         )>(funding.as_ref())?;
         if let Some(funding) = &funding {
-            funding.reserve_metadata(shared_shell::<()>()?).map_err(crate::working_memory::reservation_metadata::funding_error)?;
+            funding
+                .reserve_metadata(shared_shell::<()>()?)
+                .map_err(crate::working_memory::reservation_metadata::funding_error)?;
         }
         let host = self.span_workspace.protected_peak_bytes()?;
         let source = self
@@ -323,33 +431,82 @@ impl IncrementalInferenceQuote {
             .ok_or(WorkingMemoryError::Overflow)?;
         let incremental = self
             .incremental_bytes
-            .checked_add(retained)
-            .ok_or(WorkingMemoryError::Overflow)?;
+            .and_then(|bytes| bytes.checked_add(retained));
+        if incremental.is_none() && self.incremental_requirements.is_none() {
+            return Err(WorkingMemoryError::Overflow.into());
+        }
+        let host_placement = eredu_core::MemoryPlacement::fixed(
+            self.pool.topology(),
+            self.pool.topology().host_domain(),
+        )
+        .map_err(|_| WorkingMemoryError::IdentityMismatch)?;
+        if let Some(required) = &mut self.incremental_requirements {
+            required
+                .add_allocation(retained, &host_placement)
+                .map_err(|_| WorkingMemoryError::Overflow)?;
+        }
         let has_text_controls = self.span_workspace.text_controls.is_some();
         let workspace = self
             .state_mut()?
             .execution_workspace
             .as_mut()
             .ok_or(WorkingMemoryError::UnknownBound)?;
-        let WorkspaceBound::Bounded { bytes, assumptions } = &mut workspace.retained else {
-            return Err(WorkingMemoryError::UnknownBound.into());
+        if let Some(domains) = &mut workspace.physical_domains {
+            domains
+                .retained
+                .add_allocation(retained, &host_placement)
+                .map_err(|_| WorkingMemoryError::Overflow)?;
+        }
+        let attributed = workspace.physical_domains.is_some();
+        match &mut workspace.retained {
+            WorkspaceBound::Bounded { bytes, assumptions } => {
+                if let Some(total) = bytes.checked_add(retained) {
+                    *bytes = total;
+                } else if attributed {
+                    workspace.retained = WorkspaceBound::PerDomain {
+                        assumptions: std::mem::take(assumptions),
+                    };
+                } else {
+                    return Err(WorkingMemoryError::Overflow.into());
+                }
+            }
+            WorkspaceBound::PerDomain { .. } if attributed => {}
+            _ => return Err(WorkingMemoryError::UnknownBound.into()),
+        }
+        let (WorkspaceBound::Bounded { assumptions, .. }
+        | WorkspaceBound::PerDomain { assumptions }) = &mut workspace.retained
+        else {
+            unreachable!("retained requirements were validated above")
         };
-        *bytes = bytes
-            .checked_add(retained)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        append_assumptions(assumptions,
+        append_assumptions(
+            assumptions,
             "; original immutable span schedule actual capacity and measured retained controls/moves",
             if has_text_controls {
                 "; original named Q, optional finite pin and single-C publication controls protected with P; exact new C reserved separately, without native capacity credit"
-            } else { "" }, funding.as_ref())?;
-        validate_requirement_with(&self.state, self.geometry).map_err(|error| match funding.as_ref() {
-            Some(funding) => ResidualQuoteError::Storage(crate::working_memory::reservation_metadata::neural_error(
-                error.into_workspace(crate::working_memory::WorkspaceReportMetadata::with_funding(funding)), funding)),
-            None => error.into_legacy(),
+            } else {
+                ""
+            },
+            funding.as_ref(),
+        )?;
+        validate_requirement_with(&self.state, self.geometry).map_err(|error| {
+            match funding.as_ref() {
+                Some(funding) => ResidualQuoteError::Storage(
+                    crate::working_memory::reservation_metadata::neural_error(
+                        error.into_workspace(
+                            crate::working_memory::WorkspaceReportMetadata::with_funding(funding),
+                        ),
+                        funding,
+                    ),
+                ),
+                None => error.into_legacy(),
+            }
         })?;
         self.incremental_bytes = incremental;
         self.span_seal = Some(SpanWorkspaceSeal {
-            identity: SpanWorkspaceIdentity { allocation: Arc::new(()), _funding: funding },
+            identity: SpanWorkspaceIdentity {
+                allocation: Arc::new(()),
+                _funding: funding,
+            },
         });
         Ok(self)
     }
@@ -365,7 +522,7 @@ impl IncrementalInferenceQuote {
             .span_seal
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !self.pool.same_domain(&reservation.0.pool)
+        if !self.pool.same_ledger(&reservation.0.pool)
             || self.geometry != reservation.0.geometry
             || !reservation
                 .0
@@ -425,12 +582,13 @@ impl OwnedInferenceSpanWorkspace {
     /// Current source/account health is still rechecked by the closed consumer;
     /// this conversion does not certify opening inventory or native completion.
     pub fn as_reserved_span_workspace(&self) -> ReservedInferenceSpanWorkspace<'_> {
-        debug_assert!(self
-            .reservation
-            .0
-            .span_workspace
-            .as_ref()
-            .is_some_and(|id| self.seal.identity.same(id)));
+        debug_assert!(
+            self.reservation
+                .0
+                .span_workspace
+                .as_ref()
+                .is_some_and(|id| self.seal.identity.same(id))
+        );
         ReservedInferenceSpanWorkspace {
             workspace: &self.workspace,
             reservation: &self.reservation,
@@ -524,6 +682,7 @@ impl IncrementalInferenceQuote {
             state,
             geometry: _,
             incremental_bytes: _,
+            incremental_requirements: _,
             equation_incremental_bytes: _,
             pool,
             pin,
@@ -556,27 +715,44 @@ pub use text_controls::{
 
 // Same cold producer in ordinary and source-paid plans. The existing account is
 // retained by the plan and every detached identity; these helpers mint no credit.
-fn cold_controls<T>(funding: Option<&eredu_core::HostMetadataFunding>) -> Result<(), WorkingMemoryError> {
+fn cold_controls<T>(
+    funding: Option<&eredu_core::HostMetadataFunding>,
+) -> Result<(), WorkingMemoryError> {
     if let Some(funding) = funding {
-        let bytes = [size_of::<T>(), size_of::<Result<(), WorkingMemoryError>>(),
+        let bytes = [
+            size_of::<T>(),
+            size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<Option<&eredu_core::HostMetadataFunding>>(),
-            eredu_core::HostMetadataFunding::reservation_control_bytes()]
-            .into_iter().try_fold(0usize, usize::checked_add).ok_or(WorkingMemoryError::Overflow)?;
-        funding.reserve_metadata(bytes).map_err(crate::working_memory::reservation_metadata::funding_error)?;
+            eredu_core::HostMetadataFunding::reservation_control_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(WorkingMemoryError::Overflow)?;
+        funding
+            .reserve_metadata(bytes)
+            .map_err(crate::working_memory::reservation_metadata::funding_error)?;
     }
     Ok(())
 }
 fn shared_shell<T>() -> Result<usize, WorkingMemoryError> {
     std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
-        .extend(std::alloc::Layout::new::<T>()).map(|layout| layout.0.pad_to_align().size())
+        .extend(std::alloc::Layout::new::<T>())
+        .map(|layout| layout.0.pad_to_align().size())
         .map_err(|_| WorkingMemoryError::Overflow)
 }
-fn append_assumptions(target: &mut String, first: &str, second: &str,
-    funding: Option<&eredu_core::HostMetadataFunding>) -> Result<(), WorkingMemoryError> {
+fn append_assumptions(
+    target: &mut String,
+    first: &str,
+    second: &str,
+    funding: Option<&eredu_core::HostMetadataFunding>,
+) -> Result<(), WorkingMemoryError> {
     cold_controls::<(&mut String, &str, &str, std::fmt::Arguments<'_>, String)>(funding)?;
     let value = match funding {
-        Some(funding) => funding.metadata_string(format_args!("{target}{first}{second}"))
-            .map_err(|error| crate::working_memory::reservation_metadata::neural_error(error, funding))?,
+        Some(funding) => funding
+            .metadata_string(format_args!("{target}{first}{second}"))
+            .map_err(|error| {
+                crate::working_memory::reservation_metadata::neural_error(error, funding)
+            })?,
         None => format!("{target}{first}{second}"),
     };
     *target = value;

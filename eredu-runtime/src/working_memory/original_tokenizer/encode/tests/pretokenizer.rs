@@ -21,11 +21,11 @@ fn json() -> String {
 fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication() {
     let input = json();
     let ordinary = eredu_text::tokenizer::Tokenizer::from_bytes(input.as_bytes()).unwrap();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let original = source(&pool, &input);
     assert!(original.matches_configuration(&ordinary));
     let c = original.original_bytes();
-    let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(c - 1, 0).unwrap();
     let error = short
         .compile_tokenizer_with(
             TokenizerPlan::prepare_json(input.as_bytes()).unwrap(),
@@ -33,15 +33,17 @@ fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication
         )
         .unwrap_err();
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     for text in ["", "HI12<S>hi ?", "hi 12", "é\n٣¼🙂", "İΣẞ", "\u{301}hi"] {
         let expected = ordinary.encode(text, false).unwrap();
         if text == "hi 12" {
             assert!(expected.get_ids().contains(&9));
         }
-        let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&original, text, false).unwrap();
+        let e = MemoryLedger::tokenizer_encode_required_bytes(&original, text, false).unwrap();
         for one_short in [true, false] {
-            let pool = WorkingMemoryPool::new(c + e - u64::from(one_short), 0).unwrap();
+            let pool =
+                crate::working_memory::memory_fixture::host_ledger(c + e - u64::from(one_short), 0)
+                    .unwrap();
             let source = source(&pool, &input);
             let result = pool.encode_tokenizer_ids_with(
                 &source,
@@ -50,7 +52,7 @@ fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication
                 |p| p,
                 || {
                     assert!(!one_short);
-                    assert_eq!(pool.used_bytes().unwrap(), c + e);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                 },
                 || {},
             );
@@ -59,7 +61,9 @@ fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication
                 assert_eq!(error.retained_bytes(), 0);
                 assert!(matches!(
                     error.accounting_failure(),
-                    Some(WorkingMemoryError::BudgetExceeded { .. })
+                    Some(WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    ))
                 ));
                 drop(source);
             } else {
@@ -68,10 +72,10 @@ fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication
                 assert!(output.matches_source(&source));
                 assert!(!output.matches_source(&original));
                 drop(source);
-                assert_eq!(pool.used_bytes().unwrap(), c + e);
+                assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                 drop(output);
             }
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
     // The whole ordered configuration remains authenticated, including repeats,
@@ -83,13 +87,13 @@ fn ordered_pretokenizers_match_ordinary_with_exact_c_e_and_source_authentication
         eredu_text::tokenizer::Tokenizer::from_bytes(changed.to_string().as_bytes()).unwrap();
     assert!(!original.matches_configuration(&changed));
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn ordered_pretokenizer_prefix_derivative_preserves_bytelevel_policy_and_root() {
     let input = json();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let original = source(&pool, &input);
     let derived = original.input_prefix_normalized_source().unwrap();
     let mut changed: serde_json::Value = serde_json::from_str(&input).unwrap();
@@ -111,9 +115,9 @@ fn ordered_pretokenizer_prefix_derivative_preserves_bytelevel_policy_and_root() 
             "{text:?}"
         );
     }
-    let bytes = pool.used_bytes().unwrap();
+    let bytes = pool.payload_used_bytes().unwrap();
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(derived);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

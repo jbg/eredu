@@ -1,10 +1,8 @@
 use super::*;
-use eredu::api::{
-    PreparedChatGenerationSettings,
-};
+use eredu::api::PreparedChatGenerationSettings;
 use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
 use eredu_core::{FinishReason, SemanticEvent};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const TEMPLATE: &str = include_str!("../fixtures/chat_templates/nanbeige4.2-0e137298.jinja");
 const TOKENIZER: &str =
@@ -110,7 +108,12 @@ fn official_nanbeige_reasoning_closing_token_is_selectable() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel,
+            )
             .map(|chat| chat.expect("active preparation"))
     }
     .unwrap();
@@ -150,7 +153,12 @@ fn official_nanbeige_bare_tool_marker_at_budget_exhaustion_cannot_execute() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel,
+            )
             .map(|chat| chat.expect("active preparation"))
     }
     .unwrap();
@@ -178,11 +186,9 @@ fn official_nanbeige_bare_tool_marker_at_budget_exhaustion_cannot_execute() {
             })
     };
     assert!(result.is_err());
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, SemanticEvent::ToolCallEnd | SemanticEvent::TextDelta(_)))
-    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, SemanticEvent::ToolCallEnd | SemanticEvent::TextDelta(_))));
 }
 
 #[test]
@@ -193,20 +199,23 @@ fn official_nanbeige_replay_rejects_unescaped_parameter_delimiters() {
         request.messages.push(json!({"role":"assistant", "content":"", "tool_calls":[{
             "id":"call_0", "type":"function", "function":{"name":"todo__todo_write", "arguments":{"content":content}}
         }]}));
-        assert!(
-            {
-                let request = request;
-                let cancel = eredu_core::GenerationCancellationToken::new();
-                let source = model
-                    .chat_source(!request.tools.is_empty(), &cancel)
-                    .unwrap()
-                    .unwrap();
-                model
-                    .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
-                    .map(|chat| chat.expect("active preparation"))
-            }
-            .is_err()
-        );
+        assert!({
+            let request = request;
+            let cancel = eredu_core::GenerationCancellationToken::new();
+            let source = model
+                .chat_source(!request.tools.is_empty(), &cancel)
+                .unwrap()
+                .unwrap();
+            model
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancel,
+                )
+                .map(|chat| chat.expect("active preparation"))
+        }
+        .is_err());
     }
 }
 
@@ -226,7 +235,12 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancel,
+                )
                 .map(|chat| chat.expect("active preparation"))
         }
         .unwrap();
@@ -260,11 +274,9 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
             args,
             vec![json!({"content":value}), json!({"content":value})]
         );
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, SemanticEvent::TextDelta(t) if !t.trim().is_empty()))
-        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, SemanticEvent::TextDelta(t) if !t.trim().is_empty())));
         req.messages.push(json!({"role":"assistant", "content":"", "reasoning_content":"Use the tool.", "tool_calls":[
             {"id":"call_0", "type":"function", "function":{"name":"todo__todo_write", "arguments":args[0]}},
             {"id":"call_1", "type":"function", "function":{"name":"todo__todo_write", "arguments":args[1]}}
@@ -281,20 +293,21 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancel,
+                )
                 .map(|chat| chat.expect("active preparation"))
         }
         .unwrap();
-        assert!(
-            replay
-                .rendered_prompt()
-                .contains(&format!("<parameter=content>\n{value}\n</parameter>"))
-        );
-        assert!(
-            replay
-                .rendered_prompt()
-                .contains("<tool_response>\nSaved two items.\n</tool_response>")
-        );
+        assert!(replay
+            .rendered_prompt()
+            .contains(&format!("<parameter=content>\n{value}\n</parameter>")));
+        assert!(replay
+            .rendered_prompt()
+            .contains("<tool_response>\nSaved two items.\n</tool_response>"));
         let (_, answer) = generate(
             &mut model,
             &replay,

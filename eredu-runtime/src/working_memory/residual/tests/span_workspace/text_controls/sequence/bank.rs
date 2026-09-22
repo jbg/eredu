@@ -23,11 +23,13 @@ fn original_bank_many_retained_rejections_do_not_retain_or_clone_custody() {
     let preparation = Rc::clone(state.borrow().active.as_ref().unwrap());
     let before = Arc::strong_count(preparation.owner.borrow().reservation().0.inner());
     let errors = std::array::from_fn::<_, 256, _>(|i| {
-        assert!(preparation
-            .owner
-            .borrow_mut()
-            .take_generation_sequence_bank()
-            .is_none());
+        assert!(
+            preparation
+                .owner
+                .borrow_mut()
+                .take_generation_sequence_bank()
+                .is_none()
+        );
         match i % 3 {
             0 => Rejection::Unavailable,
             1 => Rejection::Busy,
@@ -43,7 +45,7 @@ fn original_bank_many_retained_rejections_do_not_retain_or_clone_custody() {
     let (pool, _) = retire_request(&state);
     drop(runtime);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         0,
         "all rejection values still live"
     );
@@ -51,7 +53,7 @@ fn original_bank_many_retained_rejections_do_not_retain_or_clone_custody() {
         assert!(error.source().unwrap().is::<Rejection>());
     }
     drop(errors);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -65,11 +67,13 @@ fn original_bank_foreign_genuine_claim_spends_one_bank_and_escapes_with_its_owne
     assert!(initial.source().unwrap().is::<Rejection>());
     let original = Rc::clone(old.borrow().active.as_ref().unwrap());
     let bank = old.borrow_mut().pending_bank.take().unwrap();
-    assert!(original
-        .owner
-        .borrow_mut()
-        .take_generation_sequence_bank()
-        .is_none());
+    assert!(
+        original
+            .owner
+            .borrow_mut()
+            .take_generation_sequence_bank()
+            .is_none()
+    );
     let (mut second, new) = runtime(Mode::default());
     new.borrow_mut().foreign = Some(Rc::clone(&original));
     new.borrow_mut().pending_bank = Some(bank);
@@ -82,11 +86,13 @@ fn original_bank_foreign_genuine_claim_spends_one_bank_and_escapes_with_its_owne
     assert_eq!(new.borrow().order, vec!["admit", "bind", "extract"]);
     assert_eq!(new.borrow().votes, vec![(Stage::Admission, Status::Failed)]);
     let errors = std::array::from_fn::<_, 128, _>(|_| {
-        assert!(original
-            .owner
-            .borrow_mut()
-            .take_generation_sequence_bank()
-            .is_none());
+        assert!(
+            original
+                .owner
+                .borrow_mut()
+                .take_generation_sequence_bank()
+                .is_none()
+        );
         Rejection::Unavailable.into_backend_failure()
     });
     drop(original);
@@ -94,16 +100,16 @@ fn original_bank_foreign_genuine_claim_spends_one_bank_and_escapes_with_its_owne
     drop(first);
     let (new_pool, _) = retire_request(&new);
     drop(second);
-    assert_eq!(new_pool.used_bytes().unwrap(), 0);
-    assert_eq!(old_pool.used_bytes().unwrap(), old_held + 64);
-    drop(old_pool.pin_registered_storage([(1u32, 64)]).unwrap());
+    assert_eq!(new_pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(old_pool.payload_used_bytes().unwrap(), old_held + 64);
+    drop(diagnostic_pin(&old, &old_pool).unwrap());
     drop(error);
     assert!(matches!(
-        old_pool.pin_registered_storage([(1u32, 64)]),
+        diagnostic_pin(&old, &old_pool),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     assert_eq!(
-        old_pool.used_bytes().unwrap(),
+        old_pool.payload_used_bytes().unwrap(),
         0,
         "replays and initial static rejection still live"
     );
@@ -122,24 +128,26 @@ fn original_bank_fenced_consuming_error_owns_original_reservation_before_prompt(
         WorkingMemoryError::ExecutionFenced
     ));
     assert_eq!(state.borrow().order, vec!["admit", "bind", "extract"]);
-    assert!(state
-        .borrow()
-        .active
-        .as_ref()
-        .unwrap()
-        .owner
-        .borrow_mut()
-        .take_generation_sequence_bank()
-        .is_none());
+    assert!(
+        state
+            .borrow()
+            .active
+            .as_ref()
+            .unwrap()
+            .owner
+            .borrow_mut()
+            .take_generation_sequence_bank()
+            .is_none()
+    );
     let (pool, held) = retire_request(&state);
     drop(runtime);
     assert!(matches!(
-        pool.pin_registered_storage([(1u32, 64)]),
+        diagnostic_pin(&state, &pool),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -156,19 +164,21 @@ fn original_bank_unwind_after_take_cannot_restore_the_bank() {
         panic.downcast_ref::<&str>(),
         Some(&"consumed original sequence bank unwind")
     );
-    assert!(state
-        .borrow()
-        .active
-        .as_ref()
-        .unwrap()
-        .owner
-        .borrow_mut()
-        .take_generation_sequence_bank()
-        .is_none());
+    assert!(
+        state
+            .borrow()
+            .active
+            .as_ref()
+            .unwrap()
+            .owner
+            .borrow_mut()
+            .take_generation_sequence_bank()
+            .is_none()
+    );
     assert_eq!(state.borrow().order, vec!["admit", "bind", "extract"]);
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -195,7 +205,7 @@ fn original_bank_consuming_storage_error_retires_before_each_recovery() {
     let (pool, held) = retire_request(&state);
     drop(runtime);
     assert!(matches!(
-        pool.pin_registered_storage([(1u32, 64)]),
+        diagnostic_pin(&state, &pool),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     let mut sequence = error.into_sequence();
@@ -209,13 +219,13 @@ fn original_bank_consuming_storage_error_retires_before_each_recovery() {
                 .downcast_ref::<eredu_core::GenerationError>(),
             Some(eredu_core::GenerationError::StorageNotReady)
         ));
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         // The only way to recover the sole sequence destroys its previous
         // cause. No second live owning error can be accumulated by this loop.
         sequence = error.into_sequence();
     }
     drop(sequence);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -243,19 +253,23 @@ fn original_bank_busy_preflight_keeps_the_one_bank_without_retained_error_custod
     let (pool, held) = retire_request(&state);
     drop(runtime);
     assert!(matches!(
-        pool.pin_registered_storage([(1u32, 64)]),
+        diagnostic_pin(&state, &pool),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(bank);
-    assert_eq!(pool.used_bytes().unwrap(), 0, "Busy error still lives");
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        0,
+        "Busy error still lives"
+    );
     drop(error);
 }
 
 #[test]
 fn original_bank_absence_on_a_capture_only_span_creates_no_sequence_owner() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = quote(&pool, &source);
     let (reservation, run, accepted) = accept(&pool, q);
@@ -279,7 +293,7 @@ fn original_bank_absence_on_a_capture_only_span_creates_no_sequence_owner() {
     assert_eq!(Arc::strong_count(reservation.0.inner()), references);
     assert_eq!(account(&pool, &reservation), held);
     drop((witness, owner, reservation, run, root, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(errors);
 }
 
@@ -321,12 +335,12 @@ fn original_bank_nested_core_preparation_error_keeps_both_sources_and_actual_cus
     ));
     let (pool, held) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
-    drop(pool.pin_registered_storage([(1u32, 64)]).unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
+    drop(diagnostic_pin(&state, &pool).unwrap());
     drop(error);
     assert!(matches!(
-        pool.pin_registered_storage([(1u32, 64)]),
+        diagnostic_pin(&state, &pool),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

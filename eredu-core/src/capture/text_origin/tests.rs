@@ -68,7 +68,6 @@ fn fixture(dimensions: Vec<SymbolicDimension>) -> (CapturePlan, CaptureDiscovery
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };

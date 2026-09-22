@@ -38,12 +38,16 @@ pub(super) fn from_descriptor(
             if shape[axis] > 1 {
                 match u64::try_from(strides[axis]) {
                     Ok(stride) if stride > 0 && stride <= u32::MAX as u64 => actual[axis] = stride,
-                    _ => { qualified = false; break; }
+                    _ => {
+                        qualified = false;
+                        break;
+                    }
                 }
             }
         }
         if qualified {
-            representation = representation.with_element_strides(&actual[..shape.len()])
+            representation = representation
+                .with_element_strides(&actual[..shape.len()])
                 .unwrap_or(representation);
         }
     }

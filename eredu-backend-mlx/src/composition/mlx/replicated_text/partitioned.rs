@@ -357,7 +357,7 @@ impl<U: 'static> MlxSelectedLayerwisePolicy<U, MlxSelectiveUnitPopulator> {
                     None => policy.layerwise_workspace(allocation),
                 }?;
                 workspace.with_parameter_locations(Arc::clone(&self.parameter_locations), context)
-            },
+            }
             MlxSelectedLayerwisePolicyInner::Resident(_) => Err(match context {
                 Some(_) => Error::PrefillControl(
                     eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
@@ -489,20 +489,19 @@ where
         }
     }
 
-    fn publish_parameter_replacements(
+    fn visit_parameter_publication(
         &mut self,
-        values: &std::collections::BTreeMap<String, MlxTensor>,
-        active: bool,
+        visitor: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
     ) -> Result<bool, Error> {
         let mut policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
         })?;
         match &mut *policy {
             MlxSelectedLayerwisePolicyInner::Resident(policy) => {
-                policy.publish_parameter_replacements(values, active)
+                policy.visit_parameter_publication(visitor)
             }
             MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
-                policy.publish_parameter_replacements(values, active)
+                policy.visit_parameter_publication(visitor)
             }
         }
     }
@@ -526,6 +525,10 @@ where
         build: F,
         operation: V,
         context: &Stream,
+
+        _preparation: Option<
+            &crate::backend::runtime::execution::generic::MlxParameterPreparation<'_>,
+        >,
     ) -> Result<bool, eredu_runtime::LayerwiseAcquireError<E, Self::Error>>
     where
         F: FnOnce(&Stream) -> Result<U, E>,
@@ -550,10 +553,10 @@ where
         })?;
         match &mut *policy {
             MlxSelectedLayerwisePolicyInner::Resident(policy) => {
-                policy.inspect_unit(ordinal, local, build, operation, context)
+                policy.inspect_unit(ordinal, local, build, operation, context, _preparation)
             }
             MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
-                policy.inspect_unit(ordinal, local, build, operation, context)
+                policy.inspect_unit(ordinal, local, build, operation, context, _preparation)
             }
         }
     }

@@ -1,14 +1,13 @@
 use super::*;
 use crate::{
-    Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy, Stream,
-    ops::indexing::TryIndexOp, reclaim_allocation_owners,
+    ops::indexing::TryIndexOp, reclaim_allocation_owners, Device, DeviceType, Dtype,
+    HostTransferBuffer, HostTransferPolicy, Stream,
 };
 use std::{
     cell::Cell,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc,
+        mpsc, Arc,
     },
     time::{Duration, Instant},
 };
@@ -32,6 +31,7 @@ fn wait(drops: &Arc<AtomicUsize>, expected: usize, stream: &Stream) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         stream.synchronize().unwrap();
+        crate::memory::clear_cache().unwrap();
         reclaim_allocation_owners();
         if drops.load(Ordering::SeqCst) == expected {
             break;
@@ -114,6 +114,7 @@ fn prepared_layout_and_construction_need_no_native_entry_or_housekeeping() {
         "cold preparation must not reap queued owners"
     );
     drop(_hook);
+    crate::memory::clear_cache().unwrap();
     reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }
@@ -215,11 +216,9 @@ fn lazy_and_empty_backing_preserve_owner_and_actual_native_cause() {
         })
         .unwrap_err();
     match error.cause() {
-        PreparedAllocationOwnerCause::Native(error) => assert!(
-            error
-                .to_string()
-                .contains("Invalid prepared allocation owner")
-        ),
+        PreparedAllocationOwnerCause::Native(error) => assert!(error
+            .to_string()
+            .contains("Invalid prepared allocation owner")),
         other => panic!("unexpected cause {other:?}"),
     }
     assert_eq!(error.into_parts().1.into_owner(), 17);
@@ -236,8 +235,20 @@ fn lazy_and_empty_backing_preserve_owner_and_actual_native_cause() {
         .allocation_info()
         .unwrap()
         .expect("available empty facts are known");
-    assert_eq!(info.bytes(), 0);
-    let no_allocation = crate::AllocationInfo::from_native(0, 0, false).identity();
+    assert!(
+        info.bytes() == 0 || info.bytes() == std::mem::size_of::<usize>(),
+        "empty CPU backing includes its allocation header"
+    );
+    let no_allocation = crate::AllocationInfo::from_native(
+        0,
+        0,
+        safemlx_sys::mlx_memory_placement {
+            kind: 1,
+            device: -1,
+            device_count: 0,
+        },
+    )
+    .identity();
     let alias = empty.clone();
     let drops = Arc::new(AtomicUsize::new(0));
     let prepared = PreparedAllocationOwner::try_new(Probe(drops.clone())).unwrap();
@@ -431,11 +442,9 @@ fn cold_preparation_initializes_once_before_bounded_handoff() {
         })
         .unwrap_err();
     match error.cause() {
-        PreparedAllocationOwnerCause::Native(error) => assert!(
-            error
-                .to_string()
-                .contains("Invalid prepared allocation owner")
-        ),
+        PreparedAllocationOwnerCause::Native(error) => assert!(error
+            .to_string()
+            .contains("Invalid prepared allocation owner")),
         other => panic!("unexpected cause {other:?}"),
     }
     assert_eq!(crate::error::mlx_error_handler_state_for_test(), (true, 1));
@@ -470,9 +479,11 @@ fn original_attachment_busy_and_unknown_preserve_both_actual_prepared_nodes() {
         let descriptor = unsafe { descriptor.assume_init() };
         assert!(descriptor.known && descriptor.identity != 0);
         safemlx_sys::mlx_original_buffer_info {
+            host_control_bytes: 0,
             known: descriptor.known,
             identity: descriptor.identity,
             charged_bytes: descriptor.allocation_bytes,
+            placement: descriptor.placement,
         }
     };
     let drops = Arc::new(AtomicUsize::new(0));

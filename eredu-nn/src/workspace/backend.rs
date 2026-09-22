@@ -69,9 +69,15 @@ fn parameter(
     context: &WorkspaceContext,
 ) -> Result<Parameter<WorkspaceTensor>, Error> {
     let layout = context.parameter_layout(&spec, shape, dtype)?;
+    let backing = context.parameter_backing(&spec, &layout)?;
     Ok(Parameter::new(
         spec,
-        WorkspaceTensor::parameter_placeholder(layout, context)?,
+        match backing {
+            Some(backing) => {
+                WorkspaceTensor::parameter_placeholder_with_backing(layout, &backing, context)?
+            }
+            None => WorkspaceTensor::parameter_placeholder(layout, context)?,
+        },
     ))
 }
 
@@ -385,6 +391,7 @@ macro_rules! elementwise {
 }
 
 impl NeuralBackend for WorkspaceBackend {
+    type ParameterPreparation<'a> = ();
     fn construction_metadata(context: &WorkspaceContext) -> Option<&WorkspaceContext> {
         Some(context)
     }
@@ -721,8 +728,8 @@ impl NeuralBackend for WorkspaceBackend {
         parallel: &WorkspaceParallelContext,
         context: &WorkspaceContext,
     ) -> Result<WorkspaceTensor, Error> {
-        let local=linear.forward(input,context)?;
-        <Self as crate::DistributedNeuralBackend>::sum_parallel(local,parallel,context)
+        let local = linear.forward(input, context)?;
+        <Self as crate::DistributedNeuralBackend>::sum_parallel(local, parallel, context)
     }
     fn parallel_size(parallel: &WorkspaceParallelContext) -> usize {
         parallel.size()
@@ -816,11 +823,20 @@ impl NeuralBackend for WorkspaceBackend {
         context: &WorkspaceContext,
     ) -> Result<crate::SelectiveStateSpaceScanOutput<WorkspaceTensor>, Error> {
         let geometry = crate::operation_geometry::SelectiveScanGeometry::new(
-            [input.values.shape(), input.input_state.shape(), input.output_state.shape(),
-             input.time_step.shape(), input.time_step_bias.shape(), input.transition_log.shape(),
-             input.skip.shape()], input.initial_state.map(|value| value.shape()),
-            input.chunk_size, input.time_step_floor,
-        ).map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
+            [
+                input.values.shape(),
+                input.input_state.shape(),
+                input.output_state.shape(),
+                input.time_step.shape(),
+                input.time_step_bias.shape(),
+                input.transition_log.shape(),
+                input.skip.shape(),
+            ],
+            input.initial_state.map(|value| value.shape()),
+            input.chunk_size,
+            input.time_step_floor,
+        )
+        .map_err(|cause| context.metadata_error(format_args!("{cause}")))?;
         let state_shape = geometry.state();
         let mut inputs = context.metadata_vec(7 + usize::from(input.initial_state.is_some()))?;
         inputs.extend([
@@ -945,9 +961,8 @@ fn trace_attention(
     // general request mask; a previously constructed mask remains its own
     // recorded operation, rather than a fictitious sliding input edge.
     let mask = if window.is_some() { None } else { request.mask };
-    let mut inputs = context.metadata_vec(
-        3 + usize::from(mask.is_some()) + usize::from(request.sinks.is_some()),
-    )?;
+    let mut inputs = context
+        .metadata_vec(3 + usize::from(mask.is_some()) + usize::from(request.sinks.is_some()))?;
     inputs.extend([&request.queries, &request.keys, &request.values]);
     inputs.extend(mask);
     inputs.extend(request.sinks);

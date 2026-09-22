@@ -2,36 +2,42 @@ use super::*;
 use crate::input::host::{HostInputPart, HostTensorValues, HostTensorView, PreparedHostInputPlan};
 use eredu_core::{InputModality, InputPayloadKind};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 #[test]
 fn original_native_account_transition_has_only_one_armed_owner() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&pool);
     let calls = AtomicUsize::new(0);
     let dropped = Arc::new(AtomicUsize::new(0));
     let bytes =
-        WorkingMemoryPool::prepared_native_input_required_bytes(&plan(&i, &pool, &calls, &dropped))
+        MemoryLedger::prepared_native_input_required_bytes(&plan(&i, &pool, &calls, &dropped))
             .unwrap();
     let allowance = pool.admit_source_compiler(bytes).unwrap();
     let dormant = Account::new_unarmed(pool.clone(), bytes);
     drop(dormant);
-    assert_eq!(pool.used_bytes().unwrap(), i.original_bytes() + bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        i.original_bytes() + bytes
+    );
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
     ));
     let account = allowance.into_prepared_native_account();
-    assert_eq!(pool.used_bytes().unwrap(), i.original_bytes() + bytes);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        i.original_bytes() + bytes
+    );
     drop(account);
-    assert_eq!(pool.used_bytes().unwrap(), i.original_bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), i.original_bytes());
     drop(i);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
-fn source(pool: &WorkingMemoryPool) -> OriginalPreparedHostInput {
+fn source(pool: &MemoryLedger) -> OriginalPreparedHostInput {
     let values = [7u32, 11, 19];
     let part = HostInputPart {
         modality: InputModality::Text,
@@ -51,14 +57,14 @@ fn source(pool: &WorkingMemoryPool) -> OriginalPreparedHostInput {
 struct Failed;
 struct Output {
     bytes: Vec<u8>,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     held: u64,
     dropped: Arc<AtomicUsize>,
     owner: Option<OriginalPreparedInputCustody>,
 }
 impl Drop for Output {
     fn drop(&mut self) {
-        if let Ok(used) = self.pool.used_bytes() {
+        if let Ok(used) = self.pool.payload_used_bytes() {
             assert!(used >= self.held);
         }
         self.bytes.clear();
@@ -67,7 +73,7 @@ impl Drop for Output {
 }
 struct Plan<'a> {
     source: &'a OriginalPreparedHostInput,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     calls: &'a AtomicUsize,
     dropped: Arc<AtomicUsize>,
     escape: Option<&'a Mutex<Option<OriginalPreparedInputCustody>>>,
@@ -84,13 +90,24 @@ impl PreparedNativeInputCompiler for Plan<'_> {
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         Ok(32)
     }
+    fn required_storage_requirements(
+        &self,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero(topology);
+        requirements.add_allocation(
+            self.required_storage_bytes()? as u64,
+            &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())?,
+        )?;
+        Ok(requirements)
+    }
     fn compile(self, owner: OriginalPreparedInputCustody) -> Result<Output, (Output, Failed)> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(matches!(
             self.pool.acquire_unquoted(),
             Err(WorkingMemoryError::ReservedWorkActive)
         ));
-        let held = self.pool.used_bytes().unwrap();
+        let held = self.pool.payload_used_bytes().unwrap();
         let mut output = Output {
             bytes: Vec::new(),
             pool: self.pool.clone(),
@@ -120,7 +137,7 @@ impl PreparedNativeInputCompiler for Plan<'_> {
 }
 fn plan<'a>(
     source: &'a OriginalPreparedHostInput,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     calls: &'a AtomicUsize,
     dropped: &Arc<AtomicUsize>,
 ) -> Plan<'a> {
@@ -137,40 +154,41 @@ fn plan<'a>(
 }
 #[test]
 fn original_native_compare_is_exact_and_short_or_foreign_does_no_constructor_work() {
-    let seed = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let seed = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&seed);
     let calls = AtomicUsize::new(0);
     let dropped = Arc::new(AtomicUsize::new(0));
-    let b =
-        WorkingMemoryPool::prepared_native_input_required_bytes(&plan(&i, &seed, &calls, &dropped))
-            .unwrap();
+    let b = MemoryLedger::prepared_native_input_required_bytes(&plan(&i, &seed, &calls, &dropped))
+        .unwrap();
     let ibytes = i.original_bytes();
     drop(i);
     drop(seed);
     for short in [true, false] {
-        let pool = WorkingMemoryPool::new(ibytes + b - u64::from(short), 0).unwrap();
+        let pool =
+            crate::working_memory::memory_fixture::host_ledger(ibytes + b - u64::from(short), 0)
+                .unwrap();
         let i = source(&pool);
         let result = pool.compile_prepared_native_input(plan(&i, &pool, &calls, &dropped));
         if short {
             let e = result.unwrap_err();
-            assert_eq!(e.retained_bytes(), 0);
+            assert_eq!(e.retained_bytes(), Some(0));
             assert!(
-                matches!(e.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded {required_bytes,available_bytes}) if *required_bytes==b&&*available_bytes==b-1)
+                matches!(e.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==b&&(limit_bytes - existing_bytes)==b-1)
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert_eq!(pool.used_bytes().unwrap(), ibytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), ibytes);
         } else {
             let value = result.unwrap();
-            assert_eq!(value.original_bytes(), b);
+            assert_eq!(value.original_bytes(), Some(b));
             assert!(value.source().same_source(&i));
-            assert_eq!(pool.used_bytes().unwrap(), ibytes + b);
-            drop(pool.acquire_unquoted().unwrap());
+            assert_eq!(pool.payload_used_bytes().unwrap(), ibytes + b);
+            crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
             drop(value);
-            assert_eq!(pool.used_bytes().unwrap(), ibytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), ibytes);
         }
     }
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let other = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let other = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&pool);
     let before = calls.load(Ordering::SeqCst);
     let e = other
@@ -181,11 +199,11 @@ fn original_native_compare_is_exact_and_short_or_foreign_does_no_constructor_wor
         Some(&WorkingMemoryError::IdentityMismatch)
     );
     assert_eq!(calls.load(Ordering::SeqCst), before);
-    assert_eq!(other.used_bytes().unwrap(), 0);
+    assert_eq!(other.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn native_callback_and_rust_source_each_hold_the_same_original_charge_until_final_owner() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&pool);
     let calls = AtomicUsize::new(0);
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -193,27 +211,27 @@ fn native_callback_and_rust_source_each_hold_the_same_original_charge_until_fina
     let mut p = plan(&i, &pool, &calls, &dropped);
     p.escape = Some(&escape);
     let value = pool.compile_prepared_native_input(p).unwrap();
-    let held = pool.used_bytes().unwrap();
+    let held = pool.payload_used_bytes().unwrap();
     let owner = escape.lock().unwrap().take().unwrap();
     drop(value);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     let (release, wait) = std::sync::mpsc::channel::<()>();
     let worker = std::thread::spawn(move || {
         let _ = wait.recv();
         drop(owner);
     });
-    let still_held = pool.used_bytes().unwrap();
+    let still_held = pool.payload_used_bytes().unwrap();
     drop(release);
     worker.join().unwrap();
     assert_eq!(still_held, held);
-    assert_eq!(pool.used_bytes().unwrap(), i.original_bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), i.original_bytes());
     drop(i);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn failed_actual_prefix_and_unwind_retire_storage_before_original_account() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&pool);
     let calls = AtomicUsize::new(0);
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -221,23 +239,25 @@ fn failed_actual_prefix_and_unwind_retire_storage_before_original_account() {
     p.fail = true;
     let error = pool.compile_prepared_native_input(p).unwrap_err();
     assert!(error.compiler_failure().is_some());
-    assert!(error.retained_bytes() > 0);
+    assert!(error.retained_bytes().unwrap() > 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     drop(error);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    assert_eq!(pool.used_bytes().unwrap(), i.original_bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), i.original_bytes());
     let mut p = plan(&i, &pool, &calls, &dropped);
     p.unwind = true;
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || pool.compile_prepared_native_input(p)
-    ))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || pool.compile_prepared_native_input(p)
+        ))
+        .is_err()
+    );
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
-    assert_eq!(pool.used_bytes().unwrap(), i.original_bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), i.original_bytes());
 }
 #[test]
 fn completed_native_storage_is_retained_by_poisoned_settlement_error_without_refund() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&pool);
     let calls = AtomicUsize::new(0);
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -248,7 +268,7 @@ fn completed_native_storage_is_retained_by_poisoned_settlement_error_without_ref
         error.accounting_failure(),
         Some(&WorkingMemoryError::Poisoned)
     );
-    assert!(error.retained_bytes() > 0);
+    assert!(error.retained_bytes().unwrap() > 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     drop(error);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -259,27 +279,27 @@ fn completed_native_storage_is_retained_by_poisoned_settlement_error_without_ref
 
 #[test]
 fn retired_materialization_failure_drops_native_prefix_but_keeps_original_charge() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let input = source(&pool);
     let calls = AtomicUsize::new(0);
     let dropped = Arc::new(AtomicUsize::new(0));
     let mut prepared = plan(&input, &pool, &calls, &dropped);
     prepared.fail = true;
     let failure = pool.compile_prepared_native_input(prepared).unwrap_err();
-    let bytes = failure.retained_bytes();
-    let held = pool.used_bytes().unwrap();
+    let bytes = failure.retained_bytes().unwrap();
+    let held = pool.payload_used_bytes().unwrap();
     assert!(bytes > 0);
     let retired = failure.retire_storage();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    assert_eq!(retired.retained_bytes(), bytes);
+    assert_eq!(retired.retained_bytes(), Some(bytes));
     assert!(retired.source().same_source(&input));
     assert!(retired.compiler_failure().is_some());
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     // The public source accepts this Send + Sync accounting-only failure. Its
     // ordinary test shell does not change original I/B ownership.
     let failure = eredu_core::BackendFailure::from_error(retired);
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

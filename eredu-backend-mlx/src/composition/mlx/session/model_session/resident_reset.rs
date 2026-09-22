@@ -1,13 +1,13 @@
 //! Exclusive settled-session readiness followed by originally funded KV publication.
 use super::*;
 use crate::backend::runtime::{
-    cache::state::{MlxHybridState, MlxKeyValueState},
+    cache::state::{MlxHybridState, MlxKeyValueState, MlxPoolingAttentionState},
     residency::storage::StorageIdentity,
 };
 use eredu_runtime::working_memory::{
-    PreparedResidentKvReset, ResidentTableResetState, ResidentResetDisplaced,
-    ResidentResetPublicationCustody, ResidentResetPublicationProfile, ResidentResetSession,
-    ResidentResetSource, WorkingMemoryError, WorkingMemoryPool,
+    MemoryLedger, PreparedResidentKvReset, ResidentResetDisplaced, ResidentResetPublicationCustody,
+    ResidentResetPublicationProfile, ResidentResetSession, ResidentResetSource,
+    ResidentTableResetState, WorkingMemoryError,
 };
 
 type Plan<'a, S = MlxKeyValueState> = PreparedResidentKvReset<'a, S, StorageIdentity>;
@@ -40,14 +40,24 @@ impl<S: ResidentTableResetState> ResidentResetPublicationProfile for Prepared<S>
             size_of::<Result<(), BackendFailure>>(),
             size_of::<Option<crate::backend::distributed::MlxTextPreparationControl>>(),
             size_of::<eredu_core::run_preparation::TextPreparationStage>(),
-            size_of::<Result<(eredu_runtime::working_memory::ResidentResetInstallation<S>, Self), BackendFailure>>(),
+            size_of::<
+                Result<
+                    (
+                        eredu_runtime::working_memory::ResidentResetInstallation<S>,
+                        Self,
+                    ),
+                    BackendFailure,
+                >,
+            >(),
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Displaced<S>>(),
             size_of::<Option<Displaced<S>>>(),
             size_of::<Retirement<S>>(),
             size_of::<NativeMemoryRetention>(),
-            size_of::<Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>>(),
+            size_of::<
+                Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>,
+            >(),
             size_of::<
                 Result<
                     (),
@@ -144,6 +154,33 @@ impl StateProvider for MlxHybridState {
     }
 }
 
+impl StateProvider for MlxPoolingAttentionState {
+    fn source(
+        session: &MlxModelSession,
+    ) -> Result<ResidentResetSource<'_, Self>, WorkingMemoryError> {
+        session
+            .payload
+            .model
+            .erased()
+            .resident_pooling_reset_source()
+    }
+    fn install(
+        payload: &mut SessionPayload,
+        state: eredu_runtime::working_memory::ResidentResetInstallation<Self>,
+    ) -> Result<
+        ResidentResetDisplaced<Self>,
+        (
+            WorkingMemoryError,
+            eredu_runtime::working_memory::ResidentResetInstallation<Self>,
+        ),
+    > {
+        payload
+            .model
+            .erased_mut()
+            .install_resident_pooling_reset(state)
+    }
+}
+
 impl<S: StateProvider> ResidentResetSession<S> for MlxModelSession {
     fn validate_resident_reset_source(
         &self,
@@ -178,16 +215,19 @@ impl MlxModelSession {
             .map_err(|_| WorkingMemoryError::ResetAdmissionBusy)
     }
     #[cfg(test)]
-    fn resident_reset_plan(&self, pool: &WorkingMemoryPool) -> Result<Plan<'_>, BackendFailure> {
+    fn resident_reset_plan<'a>(
+        &'a self,
+        pool: &'a MemoryLedger,
+    ) -> Result<Plan<'a>, BackendFailure> {
         self.resident_reset_plan_for::<MlxKeyValueState>(pool)
     }
-    fn resident_reset_plan_for<S: StateProvider>(
-        &self,
-        pool: &WorkingMemoryPool,
-    ) -> Result<Plan<'_, S>, BackendFailure> {
+    fn resident_reset_plan_for<'a, S: StateProvider>(
+        &'a self,
+        pool: &'a MemoryLedger,
+    ) -> Result<Plan<'a, S>, BackendFailure> {
         self.check_reset_idle()
             .map_err(BackendFailure::from_error)?;
-        if !self.payload.memory_pool.same_domain(pool) {
+        if !self.payload.memory_ledger.same_ledger(pool) {
             return Err(BackendFailure::from_error(
                 WorkingMemoryError::IdentityMismatch,
             ));
@@ -209,9 +249,9 @@ impl MlxModelSession {
                     .registry_key()
                     .clone(),
             );
-            PreparedResidentKvReset::prepare_registered(source, table, layout)
+            PreparedResidentKvReset::prepare_registered(source, table, layout, pool)
         } else {
-            PreparedResidentKvReset::prepare_original(source)
+            PreparedResidentKvReset::prepare_original(source, pool)
         }
         .map_err(BackendFailure::from_error)
     }
@@ -222,7 +262,7 @@ impl MlxModelSession {
     /// global housekeeping.
     pub(super) fn publish_prepared_resident_reset(
         &mut self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         claim: eredu_core::SessionResetClaim<'_>,
     ) -> Result<(), BackendFailure> {
         use crate::composition::mlx::replicated_text::ResidentResetProfile;
@@ -233,12 +273,15 @@ impl MlxModelSession {
             Some(ResidentResetProfile::Hybrid) => {
                 self.publish_resident_reset_for::<MlxHybridState>(pool, claim)
             }
+            Some(ResidentResetProfile::Pooling) => {
+                self.publish_resident_reset_for::<MlxPoolingAttentionState>(pool, claim)
+            }
             None => Err(readiness_memory(WorkingMemoryError::UnknownBound)),
         }
     }
     fn publish_resident_reset_for<S: StateProvider>(
         &mut self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         claim: eredu_core::SessionResetClaim<'_>,
     ) -> Result<(), BackendFailure> {
         claim
@@ -253,18 +296,42 @@ impl MlxModelSession {
         }
         let plan = self.resident_reset_plan_for::<S>(pool)?;
         let control = if let Some(transport) = self.payload.distributed.as_ref() {
-            let bytes = plan.publication_required_bytes::<Prepared<S>>()
+            let bytes = plan
+                .publication_required_bytes::<Prepared<S>>()
                 .ok_or_else(|| readiness_memory(WorkingMemoryError::Overflow))?;
             let execution = self.payload.model.erased().inference_execution_identity();
-            let funding = pool.prepare_reset_metadata(self, &claim, execution, bytes)
+            let funding = pool
+                .prepare_reset_metadata(self, &claim, execution, bytes)
                 .map_err(BackendFailure::from_error)?;
-            let manifest = self.payload.model.inference_blueprint()
+            let manifest = self
+                .payload
+                .model
+                .inference_blueprint()
                 .and_then(|value| value.selected().communication_manifest())
                 .ok_or_else(|| readiness_memory(WorkingMemoryError::IdentityMismatch))?;
-            Some(transport.prepare_reset_readiness(manifest, transport.native_world(), pool,
-                execution, claim.limits().capacity_bytes, funding).map_err(Error::into_backend_failure)?)
-        } else { None };
-        let local = plan.construct_for_publication::<Self, Prepared<S>>(self, claim, pool)
+            Some(
+                transport
+                    .prepare_reset_readiness(
+                        manifest,
+                        transport.native_world(),
+                        pool,
+                        execution,
+                        claim
+                            .limits()
+                            .memory_limits
+                            .resolve(pool.topology())
+                            .map_err(|cause| {
+                                Error::PrefillControl(cause.into()).into_backend_failure()
+                            })?,
+                        funding,
+                    )
+                    .map_err(Error::into_backend_failure)?,
+            )
+        } else {
+            None
+        };
+        let local = plan
+            .construct_for_publication::<Self, Prepared<S>>(self, claim, pool)
             .map_err(BackendFailure::from_error);
         // Constructors above clone source metadata/custody, never this payload.
         // Still return the complete destination if a future change breaks that
@@ -285,24 +352,28 @@ impl MlxModelSession {
         let rejected = false;
         let local = local.and_then(|(installation, prepared)| {
             if rejected {
-                Err(BackendFailure::from_error(installation.into_error(WorkingMemoryError::ExecutionFenced)))
-            } else { Ok((installation, prepared)) }
+                Err(BackendFailure::from_error(
+                    installation.into_error(WorkingMemoryError::ExecutionFenced),
+                ))
+            } else {
+                Ok((installation, prepared))
+            }
         });
-        let (installation, mut prepared) = self.finish_reset_agreement(pool, control.as_ref(),
-            eredu_core::run_preparation::TextPreparationStage::SessionReset, local)?;
+        let (installation, mut prepared) = self.finish_reset_agreement(
+            pool,
+            control.as_ref(),
+            eredu_core::run_preparation::TextPreparationStage::SessionReset,
+            local,
+        )?;
         let installed = {
             match self.payload.get_mut() {
                 None => Err((WorkingMemoryError::ResetAdmissionBusy, installation)),
                 Some(payload) => {
                     // The paid comparison precedes mutation. Only this exact
                     // retained initial publication can cover the old charges.
-                    let covered = payload
-                        .nonstate_publication
-                        .get_mut()
-                        .as_ref()
-                        .is_some_and(|publication| {
-                            payload.model.covers_nonstate_publication(publication)
-                        });
+                    let covered = payload.nonstate_publication.get_mut().as_ref().is_some_and(
+                        |publication| payload.model.covers_nonstate_publication(publication),
+                    );
                     match S::install(payload, installation) {
                         Err(error) => Err(error),
                         Ok(state) => {
@@ -322,7 +393,7 @@ impl MlxModelSession {
                             Ok(())
                         }
                     }
-                },
+                }
             }
         };
         // All native session and state loans ended. This only queues the node;
@@ -331,25 +402,45 @@ impl MlxModelSession {
         let local = installed.map_err(|(cause, installation)| {
             BackendFailure::from_error(installation.into_error(cause))
         });
-        let result = self.finish_reset_agreement(pool, control.as_ref(),
-            eredu_core::run_preparation::TextPreparationStage::SessionResetPublication, local);
+        let result = self.finish_reset_agreement(
+            pool,
+            control.as_ref(),
+            eredu_core::run_preparation::TextPreparationStage::SessionResetPublication,
+            local,
+        );
         // Any disagreement after publication leaves the actual selected session
         // fenced. Neither state nor shared transport spending is rolled back.
         if result.is_err() && control.is_some() {
             self.poison.set(true);
-            if let Some(transport) = self.payload.distributed.as_ref() { transport.fence_reset_publication(); }
+            if let Some(transport) = self.payload.distributed.as_ref() {
+                transport.fence_reset_publication();
+            }
         }
         result
     }
-    fn finish_reset_agreement<T>(&self, pool: &WorkingMemoryPool,
+    fn finish_reset_agreement<T>(
+        &self,
+        pool: &MemoryLedger,
         control: Option<&crate::backend::distributed::MlxTextPreparationControl>,
-        stage: eredu_core::run_preparation::TextPreparationStage, local: Result<T, BackendFailure>)
-        -> Result<T, BackendFailure> {
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        local: Result<T, BackendFailure>,
+    ) -> Result<T, BackendFailure> {
         match (control, self.payload.distributed.as_ref()) {
             (None, None) => local,
-            (Some(control), Some(transport)) => eredu_core::run_preparation::finish_preparation(stage, local,
-                |status| control.agree(transport, pool, self.payload.model.erased().inference_execution_identity(), stage, status),
-                |cause| control.retain_reset_rejection(cause)),
+            (Some(control), Some(transport)) => eredu_core::run_preparation::finish_preparation(
+                stage,
+                local,
+                |status| {
+                    control.agree(
+                        transport,
+                        pool,
+                        self.payload.model.erased().inference_execution_identity(),
+                        stage,
+                        status,
+                    )
+                },
+                |cause| control.retain_reset_rejection(cause),
+            ),
             _ => Err(readiness_memory(WorkingMemoryError::IdentityMismatch)),
         }
     }
@@ -407,8 +498,8 @@ impl<'backend> eredu_core::SessionResetPreparationBackend for MlxBackend<'backen
         session.check_reset_idle().map_err(readiness_memory)?;
         if !session
             .payload
-            .memory_pool
-            .same_domain(backend.memory_pool())
+            .memory_ledger
+            .same_ledger(backend.memory_ledger())
             || !backend.matches_prepared_target(&session.payload.target)
         {
             return Err(readiness_memory(WorkingMemoryError::IdentityMismatch));
@@ -436,20 +527,23 @@ impl<'backend> eredu_core::SessionResetPreparationBackend for MlxBackend<'backen
             || session.payload.target.has_retained_world() != session.payload.distributed.is_some()
             || selected.prediction_extension().is_some()
             || model.erased().has_embedded_prediction()
-            || session.payload.parameter_state.active.is_some()
             || !model.has_published_idle_storage()
         {
             return Err(readiness_memory(WorkingMemoryError::UnknownBound));
         }
         // Validate the actual whole-state constructor through its typed native
-        // representation. Both profiles use the same neutral original worker.
+        // representation. All profiles use the same neutral original worker.
         use crate::composition::mlx::replicated_text::ResidentResetProfile;
         match model.erased().resident_reset_profile() {
             Some(ResidentResetProfile::KeyValue) => {
-                session.resident_reset_plan_for::<MlxKeyValueState>(backend.memory_pool())?;
+                session.resident_reset_plan_for::<MlxKeyValueState>(backend.memory_ledger())?;
             }
             Some(ResidentResetProfile::Hybrid) => {
-                session.resident_reset_plan_for::<MlxHybridState>(backend.memory_pool())?;
+                session.resident_reset_plan_for::<MlxHybridState>(backend.memory_ledger())?;
+            }
+            Some(ResidentResetProfile::Pooling) => {
+                session
+                    .resident_reset_plan_for::<MlxPoolingAttentionState>(backend.memory_ledger())?;
             }
             None => return Err(readiness_memory(WorkingMemoryError::UnknownBound)),
         }
@@ -458,7 +552,7 @@ impl<'backend> eredu_core::SessionResetPreparationBackend for MlxBackend<'backen
         // transfer completion. Reuse the actual complete borrowed inventory:
         // every retained array must expose certified completed backing, and
         // external/in-flight owners make these same collectors incomplete.
-        let pool = backend.memory_pool();
+        let pool = backend.memory_ledger();
         let mut nonstate =
             crate::backend::runtime::residency::storage::RetainedStorage::original_census(pool);
         let mut decoder =
@@ -500,7 +594,7 @@ impl<'backend> eredu_core::SessionResetPreparationBackend for MlxBackend<'backen
         // genuine claim before admission; there is no wait or global retirement.
         ready
             .session
-            .publish_prepared_resident_reset(backend.memory_pool(), claim)
+            .publish_prepared_resident_reset(backend.memory_ledger(), claim)
     }
 }
 

@@ -170,7 +170,7 @@ impl TextExecutionQuote {
         request: &InferenceTextPreparation,
     ) -> Result<(), Rejection> {
         if self.session.get()
-            || !self.context_pool.same_domain(backend.memory_pool())
+            || !self.context_pool.same_ledger(backend.memory_ledger())
             || self
                 .request
                 .validate_same_request(request.request())

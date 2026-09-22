@@ -39,11 +39,8 @@ impl OriginalNumericalWorkspaceCopy {
             size_of::<RegisteredStoragePin>(),
             size_of::<HostPreparationAuthority>(),
             size_of::<Result<(), WorkingMemoryError>>(),
-            size_of::<(
-                &WorkingMemoryPool,
-                &OriginalSpeculativeNumericalBudgetCustody,
-            )>(),
-            size_of::<(&WorkingMemoryPool, WorkspaceCopyLimits)>(),
+            size_of::<(&MemoryLedger, &OriginalSpeculativeNumericalBudgetCustody)>(),
+            size_of::<(&MemoryLedger, WorkspaceCopyLimits)>(),
         ];
         parts
             .into_iter()
@@ -51,7 +48,7 @@ impl OriginalNumericalWorkspaceCopy {
             .checked_add(OriginalCompletedWorkspaceCopy::<()>::control_bytes().ok()?)
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Uses the same validated-source copy account worker and exact capacity
     /// comparison. The numerical source's cumulative request charge is unchanged.
     pub fn admit_numerical_workspace_copy(

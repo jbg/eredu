@@ -336,8 +336,7 @@ impl<K: Clone + Ord + Send + Sync + 'static, C, A, E> OriginalHostSourcePending<
                     WorkingMemoryError::IdentityMismatch,
                 ));
             }
-            let origin =
-                PrepaidHostOrigin::from_source_attempt(backing, controls.accounting());
+            let origin = PrepaidHostOrigin::from_source_attempt(backing, controls.accounting());
             self.retained.registry = Some(
                 PreparedNativePublication::prepare_source_exact(origin)
                     .map_err(OriginalHostSourceFailureCause::Memory)?,
@@ -345,6 +344,7 @@ impl<K: Clone + Ord + Send + Sync + 'static, C, A, E> OriginalHostSourcePending<
             self.retained.attachment = Some(
                 M::prepare_attachment(NativeStorageRegistration {
                     registration: OnceLock::new(),
+                    native_attached: std::sync::atomic::AtomicBool::new(false),
                     _raw: controls.accounting(),
                 })
                 .map_err(OriginalHostSourceFailureCause::Native)?,
@@ -391,7 +391,13 @@ impl<K: Clone + Ord + Send + Sync + 'static, C, A, E> OriginalHostSourcePending<
                 ));
             }
             let attachment = self.retained.attachment.take().expect("one attach");
+            M::registration(&attachment)
+                .native_attached
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Err((cause, attachment)) = M::attach(observed, attachment) {
+                M::registration(&attachment)
+                    .native_attached
+                    .store(false, std::sync::atomic::Ordering::Release);
                 self.retained.attachment = Some(attachment);
                 return Err(OriginalHostSourceFailureCause::Native(cause));
             }

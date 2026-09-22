@@ -28,7 +28,6 @@ fn capture_with_evidence_budget(captures: u64) -> SharedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::FullTensor],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     SharedCapturePlan::new(
@@ -188,12 +187,12 @@ fn exercise(evidence: InterventionEvidence, limited: bool) {
             .workspace_geometry(2, pass, NonZeroU64::new(1).unwrap())
             .unwrap(),
     );
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let request = OriginalSpeculativeRequest::prepare(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        1 << 26,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 26),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
@@ -212,10 +211,10 @@ fn exercise(evidence: InterventionEvidence, limited: bool) {
         .admit(&discovery, source.admission().request(), "facade-session")
         .unwrap();
     let copy = PreparedInterventionPlanCopy::inspect(&caller).unwrap();
-    let required = WorkingMemoryPool::intervention_source_required_bytes(&copy).unwrap();
-    let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+    let required = MemoryLedger::intervention_source_required_bytes(&copy).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(required - 1, 0).unwrap();
     assert!(short.compile_intervention_source(copy).is_err());
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     let edit = pool
         .compile_intervention_source(PreparedInterventionPlanCopy::inspect(&caller).unwrap())
         .unwrap();
@@ -248,11 +247,17 @@ fn exercise(evidence: InterventionEvidence, limited: bool) {
     }
     let invoke = || {
         let host = host(&source, 1).with_interventions(&edit).unwrap();
-        let quote =
-            SpeculativeNumericalRequirements::new(program(1), Some(0), Some(0), Some(0), Some(0))
-                .unwrap()
-                .with_capture_destination(&host)
-                .unwrap();
+        let quote = SpeculativeNumericalRequirements::new(
+            program(1),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+        )
+        .unwrap()
+        .with_capture_destination(&host)
+        .unwrap();
         request
             .reserve_numerical(quote, &[SpeculativeNumericalSource::Model(&model)])
             .unwrap()
@@ -338,11 +343,9 @@ fn exercise(evidence: InterventionEvidence, limited: bool) {
             frame.as_ref().interventions[0].outcome,
             InterventionOutcome::Failed { .. }
         ));
-        assert!(
-            frame.as_ref().interventions[0].evidence[0]
-                .payload
-                .is_some()
-        );
+        assert!(frame.as_ref().interventions[0].evidence[0]
+            .payload
+            .is_some());
         assert!(matches!(
             frame.as_ref().interventions[0].evidence[1].outcome,
             CaptureOutcome::Failed { .. }
@@ -367,7 +370,7 @@ fn exercise(evidence: InterventionEvidence, limited: bool) {
         edit,
         source,
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop((escaped, failed));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

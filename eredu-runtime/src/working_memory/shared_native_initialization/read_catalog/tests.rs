@@ -16,7 +16,7 @@ fn tensors() -> [TensorMetadata; 3] {
     })
 }
 fn required(plan: &ReadBatchCatalogPlan<'_>) -> Option<u64> {
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -34,17 +34,19 @@ fn catalog_admission_preserves_borrowed_identity_and_ordinary_inference() {
     let Some(bytes) = required(&plan()) else {
         return;
     };
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     let error = short.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
         error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert!(error.rejected_plan().is_some());
     assert!(error.constructor_failure().is_none());
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     drop(error);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let exclusion = pool.acquire_unquoted().unwrap();
     let error = pool.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
@@ -79,7 +81,9 @@ fn catalog_admission_preserves_borrowed_identity_and_ordinary_inference() {
     let competitor = pool.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
         competitor.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     drop(competitor);
     let recipe = DerivedWeightRecipe::source("雪", TensorSelection::Full);
@@ -90,9 +94,9 @@ fn catalog_admission_preserves_borrowed_identity_and_ordinary_inference() {
             .unwrap();
     assert_eq!(inferred.shape, [7]);
     assert_eq!(inferred.byte_len, 7);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(catalog);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(tensors);
     assert_eq!(inferred.shape, [7]);
 }
@@ -128,8 +132,8 @@ fn later_failure_keeps_index_custody_and_borrowed_metadata() {
     let plan = ReadBatchCatalogPlan::new(&tensors).unwrap();
     let Some(_) = required(&plan) else { return };
     let plan = Later(plan);
-    let bytes = WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let (uncalled, failure) = pool
         .initialize_shared_native(plan)
         .unwrap_err()
@@ -143,7 +147,7 @@ fn later_failure_keeps_index_custody_and_borrowed_metadata() {
         catalog.tensor_metadata_borrowed("雪").unwrap(),
         &tensors[2]
     ));
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

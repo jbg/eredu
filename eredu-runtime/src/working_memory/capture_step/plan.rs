@@ -3,6 +3,28 @@ use super::*;
 const DIAGNOSTIC_CAPACITY: usize = 256;
 pub(super) const DIAGNOSTIC_BYTES: usize = DIAGNOSTIC_CAPACITY;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CaptureSkipRows<'a> {
+    Selections(&'a [Option<CaptureSkipReason>]),
+    EvidenceSides(&'a [Option<CaptureSkipReason>; 2], usize),
+}
+impl CaptureSkipRows<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Selections(rows) => rows.len(),
+            Self::EvidenceSides(_, fields) => 2 * fields,
+        }
+    }
+    pub(super) fn reason(self, index: usize) -> Option<CaptureSkipReason> {
+        match self {
+            Self::Selections(rows) => rows.get(index),
+            Self::EvidenceSides(rows, fields) => rows.get(index / fields),
+        }
+        .cloned()
+        .flatten()
+    }
+}
+
 /// Allocation-free description of one actual admitted tensor/candidate frame.
 ///
 /// Borrows the immutable admission and derives all record/string/buffer counts.
@@ -17,7 +39,7 @@ pub struct CaptureStepHostPlan<'a> {
     pub(super) invocation: Option<CaptureInvocationShape>,
     pub(super) window: Option<CaptureInvocationWindow>,
     pub(super) selected: Option<&'a [bool]>,
-    pub(super) skipped: Option<&'a [Option<CaptureSkipReason>]>,
+    pub(super) skipped: Option<CaptureSkipRows<'a>>,
     retained: u64,
     allocated: u64,
     peak: u64,
@@ -75,14 +97,57 @@ impl<'a> CaptureStepHostPlan<'a> {
         window: Option<CaptureInvocationWindow>,
         skipped: Option<&'a [Option<CaptureSkipReason>]>,
     ) -> Result<Self, CaptureStepError> {
+        Self::prepare_with_skips(
+            source,
+            phase,
+            prediction,
+            invocation,
+            selected,
+            window,
+            skipped.map(CaptureSkipRows::Selections),
+        )
+    }
+    pub(in crate::working_memory) fn prepare_intervention_window_skips(
+        source: &'a AdmittedCapturePlan,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+        selected: &'a [bool],
+        window: Option<CaptureInvocationWindow>,
+        skipped: Option<&'a [Option<CaptureSkipReason>; 2]>,
+    ) -> Result<Self, CaptureStepError> {
+        let fields = match source.plan().selections.len() {
+            2 => 1,
+            4 => 2,
+            _ => return Err(CaptureStepError::InvalidCompletion),
+        };
+        Self::prepare_with_skips(
+            source,
+            phase,
+            prediction,
+            invocation,
+            Some(selected),
+            window,
+            skipped.map(|rows| CaptureSkipRows::EvidenceSides(rows, fields)),
+        )
+    }
+    fn prepare_with_skips(
+        source: &'a AdmittedCapturePlan,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+        selected: Option<&'a [bool]>,
+        window: Option<CaptureInvocationWindow>,
+        skipped: Option<CaptureSkipRows<'a>>,
+    ) -> Result<Self, CaptureStepError> {
         if skipped.is_some_and(|rows| {
             rows.len() != source.plan().selections.len()
                 || selected.is_none_or(|mask| {
                     mask.len() != rows.len()
-                        || rows
+                        || mask
                             .iter()
-                            .zip(mask)
-                            .any(|(reason, active)| reason.is_some() && *active)
+                            .enumerate()
+                            .any(|(index, active)| rows.reason(index).is_some() && *active)
                 })
         }) {
             return Err(CaptureStepError::InvalidCompletion);
@@ -126,21 +191,27 @@ impl<'a> CaptureStepHostPlan<'a> {
             .enumerate()
         {
             if result.selected(index)
-                && (point.dtype != ObservationDtype::Floating
-                    || !matches!((&point.value_type, &selection.transform),
-                        (ObservationValueType::Tensor, _) |
-                        (ObservationValueType::RoutedUnits { .. }, CaptureTransform::RoutedUnits))
-                    || !matches!(
-                        selection.transform,
-                        CaptureTransform::FullTensor
-                            | CaptureTransform::Slice
-                            | CaptureTransform::Preview { .. }
-                            | CaptureTransform::TopCandidates { .. }
-                            | CaptureTransform::TokenScores { .. }
-                            | CaptureTransform::Summary
-                            | CaptureTransform::Histogram { .. }
-                            | CaptureTransform::RoutedUnits
-                    ))
+                && (!matches!(
+                    point.dtype,
+                    ObservationDtype::Floating | ObservationDtype::Integer
+                ) || !matches!(
+                    (&point.value_type, &selection.transform),
+                    (ObservationValueType::Tensor, _)
+                        | (
+                            ObservationValueType::RoutedUnits { .. },
+                            CaptureTransform::RoutedUnits
+                        )
+                ) || !matches!(
+                    selection.transform,
+                    CaptureTransform::FullTensor
+                        | CaptureTransform::Slice
+                        | CaptureTransform::Preview { .. }
+                        | CaptureTransform::TopCandidates { .. }
+                        | CaptureTransform::TokenScores { .. }
+                        | CaptureTransform::Summary
+                        | CaptureTransform::Histogram { .. }
+                        | CaptureTransform::RoutedUnits
+                ))
             {
                 return Err(CaptureStepError::UnsupportedSelection { index });
             }
@@ -170,7 +241,10 @@ impl<'a> CaptureStepHostPlan<'a> {
                 )?;
                 retained = add(retained, DIAGNOSTIC_CAPACITY as u64)?;
             } else if let Some(geometry) = result.routed_geometry(index)? {
-                retained = add(retained, extent(geometry.source_shape().len(), 2 * size_of::<u64>())?)?;
+                retained = add(
+                    retained,
+                    extent(geometry.source_shape().len(), 2 * size_of::<u64>())?,
+                )?;
                 retained = add(retained, DIAGNOSTIC_CAPACITY as u64)?;
             } else if result.candidate_geometry(index)?.is_some()
                 || result.token_score_geometry(index)?.is_some()

@@ -1,3 +1,4 @@
+use crate::memory_fixture::LedgerFixture;
 mod generated;
 use super::super::super::observer::NativeScheduledCapture;
 use super::*;
@@ -172,7 +173,7 @@ fn source_precheck_and_estimate_borrow_lazy_descriptor_without_housekeeping() {
 }
 
 struct SessionFixture {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     input: Array,
     _plan: SharedCapturePlan,
     _reservation: WorkingMemoryReservation,
@@ -304,7 +305,6 @@ fn restricted_plan(quota: bool) -> SharedCapturePlan {
             &CaptureCapabilities {
                 transformations: vec![CaptureTransformKind::FullTensor],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             },
             base.request(),
@@ -356,9 +356,19 @@ fn bridge_fixture(
     // The real loaded model is pre-existing registered storage. Only the actual
     // array-capture fixture's equations/H are priced here: no model forward,
     // core text permit, or observed generation support is claimed by this test.
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, artifact) = host_layerwise_tests::runtime(stream, &pool, None);
-    let f = fixture_in_pool(Dtype::Float32, shared(), Some(pool));
+    let (nonstate, decoder) = runtime
+        .session()
+        .payload
+        .retained_idle_storage()
+        .unwrap()
+        .into_parts();
+    let nonstate_rows = nonstate.generic_publication_rows(&pool).unwrap();
+    let decoder_rows = decoder.generic_publication_rows(&pool).unwrap();
+    let opening_rows = nonstate_rows.checked_add(decoder_rows).unwrap();
+    drop((nonstate, decoder));
+    let f = fixture_with_publication_allowance(Dtype::Float32, shared(), Some(pool), opening_rows);
     (runtime, artifact, SessionFixture::from(f))
 }
 
@@ -401,7 +411,7 @@ fn bridge_lends_exclusive_model_without_holding_native_scope_and_releases_observ
     let source = f.input.multiply(&f.input, &stream).unwrap();
     let expected_model = &runtime.session().payload.model as *const _;
     let state = runtime.session().payload.model.erased().state_snapshot();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(f.pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(f.pool.clone());
     let mut operation = installed_operation(runtime.session_mut(), Some(&f.work));
     operation
         .with_funded_capture(&backend, &mut f.capture, 0, None, |model, observer| {
@@ -437,7 +447,7 @@ fn bridge_lends_exclusive_model_without_holding_native_scope_and_releases_observ
 fn bridge_without_installed_funding_rejects_before_callback_or_claim() {
     let stream = stream();
     let (mut runtime, artifact, mut f) = bridge_fixture(&stream);
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(f.pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(f.pool.clone());
     let mut operation = installed_operation(runtime.session_mut(), None);
     let invoked = Cell::new(false);
     let error = operation
@@ -468,7 +478,7 @@ fn bridge_error_and_unwind_detach_aborted_frame_while_original_recovery_keeps_ro
     for panic in [false, true] {
         let stream = stream();
         let (mut runtime, artifact, mut f) = bridge_fixture(&stream);
-        let backend = MlxBackend::new(&stream, &stream).with_memory_pool(f.pool.clone());
+        let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(f.pool.clone());
         let source = f.input.multiply(&f.input, &stream).unwrap();
         let mut operation = installed_operation(runtime.session_mut(), Some(&f.work));
         if panic {
@@ -560,10 +570,13 @@ fn bridge_rejects_same_pool_foreign_bank_before_lending_model_or_spending_claim(
         .unwrap()
         .into_capture_session()
         .unwrap();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(f.pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(f.pool.clone());
     let mut operation = installed_operation(runtime.session_mut(), Some(&f.work));
     let invoked = Cell::new(false);
-    let before = (f.pool.used_bytes().unwrap(), f.pool.peak_bytes().unwrap());
+    let before = (
+        f.pool.fixture_host_charge().unwrap(),
+        f.pool.fixture_host_peak().unwrap(),
+    );
     let error = operation
         .with_funded_capture(&backend, &mut foreign, 0, None, |_, _| {
             invoked.set(true);
@@ -578,7 +591,10 @@ fn bridge_rejects_same_pool_foreign_bank_before_lending_model_or_spending_claim(
     assert_eq!(foreign.spent_steps(), 0);
     assert!(!foreign.has_pending_step());
     assert_eq!(
-        (f.pool.used_bytes().unwrap(), f.pool.peak_bytes().unwrap()),
+        (
+            f.pool.fixture_host_charge().unwrap(),
+            f.pool.fixture_host_peak().unwrap()
+        ),
         before
     );
     assert!(f.work.roots.borrow().is_empty());
@@ -612,7 +628,7 @@ fn bridge_rechecks_closed_or_quarantined_bank_before_model_callback() {
         } else {
             f._run.take().unwrap().close().unwrap();
         }
-        let backend = MlxBackend::new(&stream, &stream).with_memory_pool(f.pool.clone());
+        let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(f.pool.clone());
         let mut operation = installed_operation(runtime.session_mut(), Some(&f.work));
         let invoked = Cell::new(false);
         let error = operation

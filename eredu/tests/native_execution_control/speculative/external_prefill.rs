@@ -210,7 +210,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
                             prefill_chunk_positions: $chunk,
                             ..Default::default()
                         },
-                        ..settings
+                        ..settings.clone()
                     },
                 ),
                 options: options.clone(),
@@ -228,7 +228,7 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
     };
     let capture = model
         .prepare_speculative_capture(
-            settings,
+            settings.clone(),
             CapturePlan {
                 schema_version: CAPTURE_SCHEMA_VERSION,
                 selections: vec![CaptureSelection {
@@ -241,7 +241,6 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
                 limits: CaptureLimits {
                     per_step: usage,
                     cumulative: usage,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             },
@@ -377,12 +376,10 @@ fn gemma_external_context_attribution_cancellation_reuses_and_refusal_stays_type
             .collect::<Vec<_>>();
         assert_eq!(rows, [(0, 1)]);
         assert!(!trace.context.is_empty());
-        assert!(
-            trace
-                .context
-                .iter()
-                .all(|(end, _, shape)| *end == 6 && shape[2] == 6)
-        );
+        assert!(trace
+            .context
+            .iter()
+            .all(|(end, _, shape)| *end == 6 && shape[2] == 6));
     }
     for supported in [true, false] {
         let trace = Rc::new(RefCell::new(Trace::default()));

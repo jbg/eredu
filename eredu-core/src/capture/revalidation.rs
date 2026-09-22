@@ -10,7 +10,7 @@ pub enum CaptureRevalidationError {
     /// Selected declarations differ from this immutable admission.
     #[error("capture declaration differs from the selected source")]
     Declaration,
-    /// A requested transform or physical limit lacks current support.
+    /// A requested transform lacks current support.
     #[error("selected capture capability is unavailable")]
     Capability,
     /// Histogram edges exceed the current selected capability.
@@ -84,12 +84,7 @@ impl AdmittedCapturePlan {
         capabilities: &CaptureCapabilities,
         mut phase: impl FnMut(&ObservationPoint, CapturePhase) -> bool,
     ) -> Result<(), CaptureRevalidationError> {
-        check_schema(
-            &self.plan,
-            catalog.schema_version,
-            support_schema,
-            capabilities,
-        )?;
+        check_schema(&self.plan, catalog.schema_version, support_schema)?;
         if self.plan.selections.len() != self.points.len() {
             return Err(CaptureRevalidationError::Declaration);
         }
@@ -150,16 +145,12 @@ fn check_schema(
     plan: &CapturePlan,
     catalog_schema: u32,
     support_schema: u32,
-    capabilities: &CaptureCapabilities,
 ) -> Result<(), CaptureRevalidationError> {
     if plan.schema_version != CAPTURE_SCHEMA_VERSION
         || catalog_schema != crate::DISCOVERY_SCHEMA_VERSION
         || support_schema != crate::DISCOVERY_SCHEMA_VERSION
     {
         return Err(CaptureRevalidationError::Schema);
-    }
-    if plan.limits.physical_native_bytes.is_some() && !capabilities.physical_native_limit {
-        return Err(CaptureRevalidationError::Capability);
     }
     Ok(())
 }
@@ -191,52 +182,118 @@ fn check_histogram(
     Ok(())
 }
 
-pub(super) fn validate_schema(plan: &CapturePlan, catalog: &ObservationCatalog,
-    support: &ObservationSupportReport, capabilities: &CaptureCapabilities) -> Result<(), CaptureError> {
-    validate_schema_with(plan,catalog,support,capabilities,super::admission::allocation::Allocation(None))
+pub(super) fn validate_schema(
+    plan: &CapturePlan,
+    catalog: &ObservationCatalog,
+    support: &ObservationSupportReport,
+    capabilities: &CaptureCapabilities,
+) -> Result<(), CaptureError> {
+    validate_schema_with(
+        plan,
+        catalog,
+        support,
+        capabilities,
+        super::admission::allocation::Allocation(None),
+    )
 }
-pub(super) fn validate_schema_with(plan: &CapturePlan, catalog: &ObservationCatalog,
-    support: &ObservationSupportReport, capabilities: &CaptureCapabilities,
-    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
-    match check_schema(plan,catalog.schema_version,support.schema_version,capabilities) {
+pub(super) fn validate_schema_with(
+    plan: &CapturePlan,
+    catalog: &ObservationCatalog,
+    support: &ObservationSupportReport,
+    capabilities: &CaptureCapabilities,
+    allocation: super::admission::allocation::Allocation<'_>,
+) -> Result<(), CaptureError> {
+    match check_schema(plan, catalog.schema_version, support.schema_version) {
         Ok(()) => Ok(()),
-        Err(CaptureRevalidationError::Schema) => Err(CaptureError::Invalid(allocation.text("unsupported schema version")?)),
-        Err(_) => Err(CaptureError::Unsupported(allocation.text("physical native allocator/workspace bound")?)),
+        Err(CaptureRevalidationError::Schema) => Err(CaptureError::Invalid(
+            allocation.text("unsupported schema version")?,
+        )),
+        Err(_) => Err(CaptureError::Unsupported(
+            allocation.text("physical native allocator/workspace bound")?,
+        )),
     }
 }
-pub(super) fn validate_transform(selection: &CaptureSelection, capabilities: &CaptureCapabilities) -> Result<(), CaptureError> {
-    validate_transform_with(selection,capabilities,super::admission::allocation::Allocation(None))
+pub(super) fn validate_transform(
+    selection: &CaptureSelection,
+    capabilities: &CaptureCapabilities,
+) -> Result<(), CaptureError> {
+    validate_transform_with(
+        selection,
+        capabilities,
+        super::admission::allocation::Allocation(None),
+    )
 }
-pub(super) fn validate_transform_with(selection: &CaptureSelection, capabilities: &CaptureCapabilities,
-    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
-    if check_transform(selection,capabilities).is_err() {
-        return Err(CaptureError::Unsupported(allocation.format(format_args!("{:?}",selection.transform.kind()))?));
+pub(super) fn validate_transform_with(
+    selection: &CaptureSelection,
+    capabilities: &CaptureCapabilities,
+    allocation: super::admission::allocation::Allocation<'_>,
+) -> Result<(), CaptureError> {
+    if check_transform(selection, capabilities).is_err() {
+        return Err(CaptureError::Unsupported(
+            allocation.format(format_args!("{:?}", selection.transform.kind()))?,
+        ));
     }
     Ok(())
 }
-pub(super) fn validate_phase_support(selection: &CaptureSelection, support: &ObservationSupportReport) -> Result<(), CaptureError> {
-    validate_phase_support_with(selection,support,super::admission::allocation::Allocation(None))
+pub(super) fn validate_phase_support(
+    selection: &CaptureSelection,
+    support: &ObservationSupportReport,
+) -> Result<(), CaptureError> {
+    validate_phase_support_with(
+        selection,
+        support,
+        super::admission::allocation::Allocation(None),
+    )
 }
-pub(super) fn validate_phase_support_with(selection: &CaptureSelection, support: &ObservationSupportReport,
-    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
-    let phase_support=match support.points.iter().find(|p|p.path==selection.path) {
-        Some(value)=>value,
-        None=>return Err(CaptureError::Unsupported(allocation.format(format_args!("no selected support for {}",selection.path))?)),
+pub(super) fn validate_phase_support_with(
+    selection: &CaptureSelection,
+    support: &ObservationSupportReport,
+    allocation: super::admission::allocation::Allocation<'_>,
+) -> Result<(), CaptureError> {
+    let phase_support = match support.points.iter().find(|p| p.path == selection.path) {
+        Some(value) => value,
+        None => {
+            return Err(CaptureError::Unsupported(allocation.format(
+                format_args!("no selected support for {}", selection.path),
+            )?))
+        }
     };
-    for(enabled,status) in [(selection.schedule.prefill,&phase_support.prefill),(selection.schedule.decode,&phase_support.decode)] {
-        if enabled && !matches!(status,ObservationSupportStatus::Supported|ObservationSupportStatus::Conditional(_)) {
-            return Err(CaptureError::Unsupported(allocation.format(format_args!("{}: {status:?}",selection.path))?));
+    for (enabled, status) in [
+        (selection.schedule.prefill, &phase_support.prefill),
+        (selection.schedule.decode, &phase_support.decode),
+    ] {
+        if enabled
+            && !matches!(
+                status,
+                ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_)
+            )
+        {
+            return Err(CaptureError::Unsupported(
+                allocation.format(format_args!("{}: {status:?}", selection.path))?,
+            ));
         }
     }
     Ok(())
 }
-pub(super) fn validate_histogram(selection: &CaptureSelection, capabilities: &CaptureCapabilities) -> Result<(), CaptureError> {
-    validate_histogram_with(selection,capabilities,super::admission::allocation::Allocation(None))
+pub(super) fn validate_histogram(
+    selection: &CaptureSelection,
+    capabilities: &CaptureCapabilities,
+) -> Result<(), CaptureError> {
+    validate_histogram_with(
+        selection,
+        capabilities,
+        super::admission::allocation::Allocation(None),
+    )
 }
-pub(super) fn validate_histogram_with(selection: &CaptureSelection, capabilities: &CaptureCapabilities,
-    allocation: super::admission::allocation::Allocation<'_>) -> Result<(), CaptureError> {
-    if check_histogram(selection,capabilities).is_err() {
-        return Err(CaptureError::Invalid(allocation.text("histogram edges must be finite, increasing, and within the bin limit")?));
+pub(super) fn validate_histogram_with(
+    selection: &CaptureSelection,
+    capabilities: &CaptureCapabilities,
+    allocation: super::admission::allocation::Allocation<'_>,
+) -> Result<(), CaptureError> {
+    if check_histogram(selection, capabilities).is_err() {
+        return Err(CaptureError::Invalid(allocation.text(
+            "histogram edges must be finite, increasing, and within the bin limit",
+        )?));
     }
     Ok(())
 }

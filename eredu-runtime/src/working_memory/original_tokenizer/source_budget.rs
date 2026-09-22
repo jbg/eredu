@@ -60,27 +60,34 @@ impl OriginalTokenizer {
     pub fn prepare_text_source_budget(
         &self,
         execution: &InferenceExecutionIdentity,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<OriginalTextSourceBudget, OriginalTextSourceBudgetError> {
         let pool = self.pool();
         // The node is the only new heap allocation. Its complete constructor,
         // pending publication, by-value error and return controls share the hold.
         let bytes = OriginalTextSourceBudget::storage_bytes()
             .map_err(OriginalTextSourceBudgetError::rejected)?;
+        let retained_capacity = capacity.clone();
         let pending = {
             let mut usage = pool.0.usage.lock().map_err(|_| {
                 OriginalTextSourceBudgetError::rejected(WorkingMemoryError::Poisoned)
             })?;
-            let commit =
-                PreparedAccountCommit::prepare(pool, execution, &usage, bytes, Some(capacity), &[])
-                    .map_err(OriginalTextSourceBudgetError::rejected)?;
+            let commit = PreparedAccountCommit::prepare(
+                pool,
+                execution,
+                &usage,
+                bytes,
+                Some(&capacity),
+                &[],
+            )
+            .map_err(OriginalTextSourceBudgetError::rejected)?;
             PendingAccount::accept(
                 pool,
                 execution,
                 &mut usage,
                 commit,
                 bytes,
-                Some(capacity),
+                Some(retained_capacity),
                 bytes,
             )
             .map_err(OriginalTextSourceBudgetError::rejected)?

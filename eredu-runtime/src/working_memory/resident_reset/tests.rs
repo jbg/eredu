@@ -12,26 +12,67 @@ use std::{
     rc::Rc,
 };
 mod backend;
-mod direct;
-mod sources;
-mod empty;
 #[path = "tests/construction.rs"]
 mod construction;
+mod direct;
+mod empty;
+#[path = "tests/parameter.rs"]
+mod parameter;
 mod preparation;
+mod sources;
 use backend::Session;
 
+fn reset_headroom(limits: &SessionResetLimits, pool: &MemoryLedger) -> u64 {
+    limits
+        .additional_headroom
+        .resolve(pool.topology())
+        .unwrap()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .headroom_bytes
+}
+fn registry_controls(pool: &MemoryLedger) -> u64 {
+    pool.snapshot()
+        .unwrap()
+        .domains
+        .iter()
+        .map(|d| d.registry_metadata_bytes)
+        .sum()
+}
+fn source_registry_controls() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+        let fills = FILLS.get();
+        let failure = FAIL_AT.get();
+        let (_runtime, _data, _, _) = fixture_in_pool(pool.clone(), 2);
+        FILLS.set(fills);
+        FAIL_AT.set(failure);
+        registry_controls(&pool)
+    })
+}
+fn fixture_limit(
+    pool: &MemoryLedger,
+    bytes: u64,
+) -> Result<eredu_core::MemoryLimit, WorkingMemoryError> {
+    Ok(
+        crate::working_memory::memory_fixture::resolved_host_limits(pool, bytes)
+            .get(pool.topology().host_domain())
+            .unwrap(),
+    )
+}
 thread_local! {
     static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
-    static DROP_CHECK: RefCell<Option<(WorkingMemoryPool, u64, usize)>> = const { RefCell::new(None) };
+    static DROP_CHECK: RefCell<Option<(MemoryLedger, u64, usize)>> = const { RefCell::new(None) };
     static PANIC_AT: Cell<Option<usize>> = const { Cell::new(None) };
     static RETIRE_PAUSE: RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { RefCell::new(None) };
     static POISON_ENTRY: Cell<bool> = const { Cell::new(false) };
     static FORBID_KEY_CALLBACKS: Cell<bool> = const { Cell::new(false) };
-    static KEY_DROP_CHECK: RefCell<Option<(WorkingMemoryPool, u64, usize)>> = const { RefCell::new(None) };
+    static KEY_DROP_CHECK: RefCell<Option<(MemoryLedger, u64, usize)>> = const { RefCell::new(None) };
     static FILLS: Cell<usize> = const { Cell::new(0) };
-    static RETIRE_CHECK: RefCell<Option<(WorkingMemoryPool, u64)>> = const { RefCell::new(None) };
+    static RETIRE_CHECK: RefCell<Option<(MemoryLedger, u64)>> = const { RefCell::new(None) };
 }
-pub(super) fn before_entry_publication(pool: &WorkingMemoryPool) {
+pub(super) fn before_entry_publication(pool: &MemoryLedger) {
     if POISON_ENTRY.replace(false) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _usage = pool.0.usage.lock().unwrap();
@@ -42,7 +83,7 @@ pub(super) fn before_entry_publication(pool: &WorkingMemoryPool) {
 pub(super) fn fail_at(index: usize) -> bool {
     FAIL_AT.get() == Some(index)
 }
-pub(super) fn after_entry_retirement(pool: &WorkingMemoryPool) {
+pub(super) fn after_entry_retirement(pool: &MemoryLedger) {
     let pause = RETIRE_PAUSE.with_borrow_mut(Option::take);
     if let Some((ready, release)) = pause {
         ready.send(()).unwrap();
@@ -50,14 +91,14 @@ pub(super) fn after_entry_retirement(pool: &WorkingMemoryPool) {
     }
     RETIRE_CHECK.with_borrow(|value| {
         if let Some((expected, ceiling)) = value {
-            if expected.same_domain(pool) {
+            if expected.same_ledger(pool) {
                 let available = {
                     let usage = pool
                         .0
                         .usage
                         .try_lock()
                         .expect("entry retirement is outside Usage");
-                    assert_eq!(pool.0.capacity(&usage, None), *ceiling);
+                    assert_eq!(pool.0.capacity(&usage, None), fixture_limit(pool, *ceiling));
                     assert!(usage.reset_retiring_count > 0);
                     assert!(usage.reserved > 0);
                     pool.0.available(&usage, None).unwrap()
@@ -65,8 +106,10 @@ pub(super) fn after_entry_retirement(pool: &WorkingMemoryPool) {
                 // Without the retiring floor this independently attempted
                 // admission fits the pool's much higher configured ceiling.
                 assert!(matches!(
-                    pool.register_storage([(99_u16, available + 1)]),
-                    Err(WorkingMemoryError::BudgetExceeded { .. })
+                    pool.register_host_storage([(99_u16, available + 1)]),
+                    Err(WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    ))
                 ));
             }
         }
@@ -84,7 +127,7 @@ impl Drop for Slot {
             DROP_CHECK.with_borrow_mut(|slot| {
                 if let Some((pool, minimum, count)) = slot {
                     assert!(
-                        pool.used_bytes().unwrap() >= *minimum,
+                        pool.payload_used_bytes().unwrap() >= *minimum,
                         "partial payload precedes refund"
                     );
                     *count += 1;
@@ -117,13 +160,20 @@ impl ResidentTableResetState for State {
     fn resident_reset_plan(&self) -> Result<(Self::ResetPlan, usize), WorkingMemoryError> {
         if construction::enabled() {
             Ok(((self.global_start, self.layers.len()), construction::BYTES))
-        } else { Ok(((0, 0), 0)) }
+        } else {
+            Ok(((0, 0), 0))
+        }
     }
-    fn prepare_resident_reset_context(&self, plan: &Self::ResetPlan,
-        funding: Option<&eredu_nn::workspace::HostMetadataFunding>) -> Result<(), BackendFailure> {
+    fn prepare_resident_reset_context(
+        &self,
+        plan: &Self::ResetPlan,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Result<(), BackendFailure> {
         if construction::enabled() {
             if *plan != (self.global_start, self.layers.len()) {
-                return Err(BackendFailure::from_error(WorkingMemoryError::IdentityMismatch));
+                return Err(BackendFailure::from_error(
+                    WorkingMemoryError::IdentityMismatch,
+                ));
             }
             construction::prepare(funding.expect("accepted source context"))?;
         }
@@ -140,7 +190,10 @@ impl ResidentTableResetState for State {
         self.global_start
     }
     fn resident_fork_is_empty(&self) -> bool {
-        self.layers.slots().iter().all(|slot| slot.position == 0 && slot.values == [0; 4])
+        self.layers
+            .slots()
+            .iter()
+            .all(|slot| slot.position == 0 && slot.values == [0; 4])
     }
     fn validate_resident_reset_layer(layer: &Slot, policy: &LayerCachePolicy) -> bool {
         match policy {
@@ -234,10 +287,10 @@ struct Data {
     state: State,
     displaced: Option<State>,
     selected: SelectedStateRealization,
-    registration: WorkingMemoryStorage<Key>,
+    registration: Option<WorkingMemoryStorage<Key>>,
     execution: InferenceExecutionIdentity,
-    control: Arc<()>,
-    pool: WorkingMemoryPool,
+    control: crate::replicated_session::ParameterControlIdentity,
+    pool: MemoryLedger,
     foreign: bool,
     foreign_source: Option<Rc<RefCell<Data>>>,
     original_bytes: u64,
@@ -260,7 +313,7 @@ impl Data {
             .original_reset_custody()
             .is_some()
         {
-            PreparedResidentKvReset::prepare_original(source)
+            PreparedResidentKvReset::prepare_original(source, &self.pool)
         } else if direct::requested() {
             let table = Key(self
                 .state
@@ -270,9 +323,13 @@ impl Data {
                 .registry_key()
                 .clone());
             let layout = Key(self.state.layout.identity().registry_key().clone());
-            PreparedResidentKvReset::prepare_registered(source, table, layout)
+            PreparedResidentKvReset::prepare_registered(source, table, layout, &self.pool)
         } else {
-            PreparedResidentKvReset::prepare(source, &self.registration)
+            PreparedResidentKvReset::prepare(
+                source,
+                self.registration.as_ref().expect("ordinary source"),
+                &self.pool,
+            )
         }
         .unwrap()
     }
@@ -305,8 +362,14 @@ impl Backend {
             let plan = alternate.as_deref().unwrap_or(&data).plan();
             let held = plan
                 .required_bytes()
-                .checked_add(claim.limits().safety_reserve_bytes);
-            let _preparation = preparation::prepare(session, &claim, &data.pool, &data.execution, plan.required_bytes())?;
+                .checked_add(reset_headroom(claim.limits(), &data.pool));
+            let _preparation = preparation::prepare(
+                session,
+                &claim,
+                &data.pool,
+                &data.execution,
+                plan.required_bytes(),
+            )?;
             let foreign = Session(self.data.clone());
             let target = if data.foreign { &foreign } else { session };
             (
@@ -328,12 +391,18 @@ fn fixture(
     count: usize,
 ) -> (ModelRuntime<Backend>, Rc<RefCell<Data>>, u64, u64) {
     fixture_in_pool(
-        WorkingMemoryPool::new(capacity.unwrap_or(10_000_000), 0).unwrap(),
+        crate::working_memory::memory_fixture::host_ledger(
+            capacity
+                .map(|n| n.checked_add(source_registry_controls()).unwrap())
+                .unwrap_or(10_000_000),
+            0,
+        )
+        .unwrap(),
         count,
     )
 }
 fn fixture_in_pool(
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     count: usize,
 ) -> (ModelRuntime<Backend>, Rc<RefCell<Data>>, u64, u64) {
     FILLS.set(0);
@@ -360,7 +429,7 @@ fn fixture_in_pool(
     let source_bytes =
         state.layers.metadata().capacity_bytes().unwrap() + layout.capacity_bytes().unwrap();
     let registration = pool
-        .register_storage([
+        .register_host_storage([
             (
                 Key(state.layers.metadata().identity().registry_key().clone()),
                 state.layers.metadata().capacity_bytes().unwrap(),
@@ -375,9 +444,9 @@ fn fixture_in_pool(
         selected: crate::replicated_text::resident_reset_test_selection(layout.layout().clone()),
         state,
         displaced: None,
-        registration,
+        registration: Some(registration),
         execution: Default::default(),
-        control: Arc::new(()),
+        control: crate::replicated_session::ParameterControlIdentity::new(),
         pool,
         foreign: false,
         foreign_source: None,
@@ -394,33 +463,39 @@ fn genuine_original_reset_exact_and_one_short_preserve_source_before_constructio
         let (mut runtime, data, actual_source, actual_required) =
             fixture(Some(source + required - u64::from(short)), 3);
         assert_eq!((actual_source, actual_required), (source, required));
-        let result = runtime.reset_admitted(SessionResetLimits::new(source + required));
+        let ceiling = source + required + registry_controls(&data.borrow().pool);
+        let result = runtime.reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(ceiling),
+        ));
         assert_eq!(result.is_err(), short);
         let data = data.borrow();
         if short {
             assert_eq!(FILLS.get(), 0);
-            assert_eq!(data.pool.used_bytes().unwrap(), source);
-            assert!(data
-                .state
-                .layers
-                .slots()
-                .iter()
-                .all(|s| s.position == 19 && s.values[1] == 7));
+            assert_eq!(data.pool.payload_used_bytes().unwrap(), source);
+            assert!(
+                data.state
+                    .layers
+                    .slots()
+                    .iter()
+                    .all(|s| s.position == 19 && s.values[1] == 7)
+            );
         } else {
             assert_eq!(FILLS.get(), 3);
-            assert_eq!(data.pool.used_bytes().unwrap(), source + required);
+            assert_eq!(data.pool.payload_used_bytes().unwrap(), source + required);
             assert_eq!(data.state.global_start, 5);
             assert!(data.state.retention.is_empty());
-            assert!(data
-                .state
-                .layers
-                .slots()
-                .iter()
-                .all(|s| s.position == 0 && s.values == [0; 4]));
-            assert!(data
-                .state
-                .layout
-                .same_storage(&data.displaced.as_ref().unwrap().layout));
+            assert!(
+                data.state
+                    .layers
+                    .slots()
+                    .iter()
+                    .all(|s| s.position == 0 && s.values == [0; 4])
+            );
+            assert!(
+                data.state
+                    .layout
+                    .same_storage(&data.displaced.as_ref().unwrap().layout)
+            );
         }
     }
 }
@@ -428,7 +503,9 @@ fn genuine_original_reset_exact_and_one_short_preserve_source_before_constructio
 fn escaped_token_identity_and_payload_free_key_have_distinct_final_lifetimes() {
     let (mut runtime, data, _source, required) = fixture(None, 2);
     runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap();
     let (pool, token, identity, key) = {
         let data = data.borrow();
@@ -440,18 +517,20 @@ fn escaped_token_identity_and_payload_free_key_have_distinct_final_lifetimes() {
     let layout_bytes = data.borrow().state.layout.capacity_bytes().unwrap();
     drop(runtime);
     drop(data);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     assert!(matches!(
-        token.try_attach(pool.shared_storage_domain(), || Ok::<
+        token.try_attach(pool.shared_storage_accounting_id(), || Ok::<
             Box<dyn Send + Sync>,
             (),
-        >(Box::new(()))),
+        >(Box::new(
+            ()
+        ))),
         Err(crate::HostSlotAttachmentError::Retired)
     ));
     drop(token);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     drop(identity);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     // The still-live registry key cannot hold the original account or identity
     // allocation, and remains unique instead of allowing an address ABA.
     assert_eq!(key, key.clone());
@@ -462,7 +541,9 @@ fn every_partial_fill_frontier_keeps_real_capacity_error_and_original_prefix() {
         let (mut runtime, data, source, required) = fixture(None, 3);
         FAIL_AT.set(Some(frontier));
         let failure = runtime
-            .reset_admitted(SessionResetLimits::new(10_000_000))
+            .reset_admitted(SessionResetLimits::new(
+                crate::working_memory::memory_fixture::host_limits(10_000_000),
+            ))
             .unwrap_err();
         FAIL_AT.set(None);
         let exact = std::error::Error::source(&failure)
@@ -473,19 +554,20 @@ fn every_partial_fill_frontier_keeps_real_capacity_error_and_original_prefix() {
         assert_eq!(exact.retained_bytes(), required);
         assert!(matches!(exact.cause, ResetCause::Allocation(_)));
         let pool = data.borrow().pool.clone();
-        assert_eq!(pool.used_bytes().unwrap(), source + required);
-        assert!(data
-            .borrow()
-            .state
-            .layers
-            .slots()
-            .iter()
-            .all(|s| s.position == 19));
+        assert_eq!(pool.payload_used_bytes().unwrap(), source + required);
+        assert!(
+            data.borrow()
+                .state
+                .layers
+                .slots()
+                .iter()
+                .all(|s| s.position == 19)
+        );
         drop(runtime);
         drop(data);
-        assert_eq!(pool.used_bytes().unwrap(), source + required);
+        assert_eq!(pool.payload_used_bytes().unwrap(), source + required);
         drop(failure);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -495,7 +577,9 @@ fn foreign_genuine_claim_rejects_before_any_bank_or_constructor_and_next_claim_s
     let failures = (0..20)
         .map(|_| {
             let failure = runtime
-                .reset_admitted(SessionResetLimits::new(10_000_000))
+                .reset_admitted(SessionResetLimits::new(
+                    crate::working_memory::memory_fixture::host_limits(10_000_000),
+                ))
                 .unwrap_err();
             assert_eq!(
                 std::error::Error::source(&failure)
@@ -508,32 +592,36 @@ fn foreign_genuine_claim_rejects_before_any_bank_or_constructor_and_next_claim_s
             failure
         })
         .collect::<Vec<_>>();
-    assert_eq!(data.borrow().pool.used_bytes().unwrap(), source);
+    assert_eq!(data.borrow().pool.payload_used_bytes().unwrap(), source);
     assert_eq!(FILLS.get(), 0);
     data.borrow_mut().foreign = false;
     runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap();
     assert_eq!(FILLS.get(), 2);
     let pool = data.borrow().pool.clone();
     drop(runtime);
     drop(data);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(failures);
 }
 #[test]
 fn final_fixed_entry_retirement_preserves_old_ceiling_outside_usage_loan() {
     let (mut runtime, data, source, required) = fixture(None, 2);
-    let ceiling = source + required;
+    let ceiling = source + required + registry_controls(&data.borrow().pool);
     runtime
-        .reset_admitted(SessionResetLimits::new(ceiling))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(ceiling),
+        ))
         .unwrap();
     let pool = data.borrow().pool.clone();
     RETIRE_CHECK.with_borrow_mut(|slot| *slot = Some((pool.clone(), ceiling)));
     drop(runtime);
     drop(data);
     RETIRE_CHECK.with_borrow_mut(|slot| *slot = None);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -542,61 +630,74 @@ fn current_session_rejects_equal_geometry_foreign_source_before_original_accepta
     let (_foreign_runtime, foreign, foreign_source, _) = fixture(None, 3);
     data.borrow_mut().foreign_source = Some(foreign.clone());
     let failure = runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap_err();
     let error = std::error::Error::source(&failure)
         .unwrap()
         .downcast_ref::<ResidentResetError<State>>()
         .unwrap();
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(data.borrow().pool.used_bytes().unwrap(), source);
-    assert_eq!(foreign.borrow().pool.used_bytes().unwrap(), foreign_source);
+    assert_eq!(data.borrow().pool.payload_used_bytes().unwrap(), source);
+    assert_eq!(
+        foreign.borrow().pool.payload_used_bytes().unwrap(),
+        foreign_source
+    );
     assert_eq!(FILLS.get(), 0);
     data.borrow_mut().foreign_source = None;
     runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap();
     assert_eq!(FILLS.get(), 3);
 }
 #[test]
 fn application_safety_overflow_and_foreign_domain_reject_without_fill() {
     let (mut runtime, data, source, required) = fixture(None, 2);
-    for limits in [
-        SessionResetLimits {
-            capacity_bytes: 10_000_000,
-            application_memory_budget_bytes: Some(required),
-            safety_reserve_bytes: 1,
-        },
-        SessionResetLimits {
-            capacity_bytes: 10_000_000,
-            application_memory_budget_bytes: None,
-            safety_reserve_bytes: u64::MAX,
-        },
-    ] {
+    for headroom in [1, u64::MAX] {
+        let limits = SessionResetLimits {
+            memory_limits: crate::working_memory::memory_fixture::host_limits(source + required),
+            additional_headroom: eredu_core::MemoryHeadroomDeclarations::new([(
+                "host".into(),
+                headroom,
+            )]),
+        };
         let failure = runtime.reset_admitted(limits).unwrap_err();
         let error = std::error::Error::source(&failure)
             .unwrap()
             .downcast_ref::<ResidentResetError<State>>()
             .unwrap();
-        let expected = if limits.safety_reserve_bytes == u64::MAX {
-            SessionResetRejection::Overflow
+        if headroom == u64::MAX {
+            assert!(matches!(
+                &error.cause,
+                ResetCause::Claim(SessionResetRejection::MemoryDomain(
+                    eredu_core::MemoryDomainError::Overflow
+                ))
+            ));
         } else {
-            SessionResetRejection::ApplicationBudgetExceeded {
-                required_bytes: required + 1,
-                budget_bytes: required,
-            }
-        };
-        assert!(matches!(&error.cause, ResetCause::Claim(actual) if *actual == expected));
+            assert!(matches!(
+                &error.cause,
+                ResetCause::Memory(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
+            ));
+        }
         assert_eq!(error.retained_bytes(), 0);
     }
     let original = data.borrow().pool.clone();
-    let foreign = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     data.borrow_mut().pool = foreign.clone();
-    assert!(runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
-        .is_err());
-    assert_eq!(original.used_bytes().unwrap(), source);
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert!(
+        runtime
+            .reset_admitted(SessionResetLimits::new(
+                crate::working_memory::memory_fixture::host_limits(10_000_000)
+            ))
+            .is_err()
+    );
+    assert_eq!(original.payload_used_bytes().unwrap(), source);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     assert_eq!(FILLS.get(), 0);
 }
 #[test]
@@ -606,52 +707,58 @@ fn original_source_witness_and_new_revision_retain_actual_account_without_regist
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct HostCustody {
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         drops: Arc<AtomicUsize>,
     }
     impl Drop for HostCustody {
         fn drop(&mut self) {
             // The final carrier retires its source tokens before the enclosing
             // host-preparation authority. No source charge becomes a new grant.
-            assert_eq!(self.pool.used_bytes().unwrap(), 0);
+            assert_eq!(self.pool.payload_used_bytes().unwrap(), 0);
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     let (mut runtime, data, _source, required) = fixture(None, 2);
     runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap();
     let host_drops = Arc::new(AtomicUsize::new(0));
     let (pool, witness, revision, pin) = {
         let data = data.borrow();
         let metadata = data.state.layers.metadata();
-        assert!(!metadata
-            .try_attach(
-                data.pool.shared_storage_domain(),
-                || -> Result<Box<dyn Send + Sync>, ()> {
-                    panic!("original same-domain mode cannot invoke attachment provider")
-                }
-            )
-            .unwrap());
-        let foreign = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+        assert!(
+            !metadata
+                .try_attach(
+                    data.pool.shared_storage_accounting_id(),
+                    || -> Result<Box<dyn Send + Sync>, ()> {
+                        panic!("original same-ledger mode cannot invoke attachment provider")
+                    }
+                )
+                .unwrap()
+        );
+        let foreign = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
         assert!(matches!(
             metadata.try_attach(
-                foreign.shared_storage_domain(),
+                foreign.shared_storage_accounting_id(),
                 || -> Result<Box<dyn Send + Sync>, ()> {
-                    panic!("original foreign-domain mode cannot invoke attachment provider")
+                    panic!("original foreign-ledger mode cannot invoke attachment provider")
                 }
             ),
             Err(crate::HostSlotAttachmentError::OriginalDomainMismatch)
         ));
         let witness = data.pool.pin_original_reset_slots(metadata).unwrap();
         assert_eq!(witness.original_bytes(), required);
-        assert!(WorkingMemoryPool::new(10_000_000, 0)
-            .unwrap()
-            .pin_original_reset_slots(data.state.layers.metadata())
-            .is_err());
+        assert!(
+            crate::working_memory::memory_fixture::host_ledger(10_000_000, 0)
+                .unwrap()
+                .pin_original_reset_slots(data.state.layers.metadata())
+                .is_err()
+        );
 
-        let used = data.pool.used_bytes().unwrap();
+        let used = data.pool.payload_used_bytes().unwrap();
         let host = HostPreparationAuthority::retain(HostCustody {
             pool: data.pool.clone(),
             drops: host_drops.clone(),
@@ -678,7 +785,7 @@ fn original_source_witness_and_new_revision_retain_actual_account_without_regist
         ));
         assert!(!foreign_carrier.contains(key));
         drop(foreign_carrier);
-        assert_eq!(foreign.used_bytes().unwrap(), 0);
+        assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
 
         let mut carrier = OriginalStorageSourcesLayout::new(1)
             .unwrap()
@@ -712,10 +819,12 @@ fn original_source_witness_and_new_revision_retain_actual_account_without_regist
             !carrier.contains(key),
             "successful association moves custody"
         );
-        assert_eq!(pin.bytes(), metadata.capacity_bytes().unwrap());
-        assert!(!pin.same_registered_storage(&pin),
-            "registered-key equality cannot stand in for retained original table custody");
-        assert_eq!(data.pool.used_bytes().unwrap(), used);
+        assert_eq!(pin.bytes(), Some(metadata.capacity_bytes().unwrap()));
+        assert!(
+            !pin.same_registered_storage(&pin),
+            "registered-key equality cannot stand in for retained original table custody"
+        );
+        assert_eq!(data.pool.payload_used_bytes().unwrap(), used);
         drop(host);
         assert_eq!(host_drops.load(Ordering::SeqCst), 0);
         (
@@ -728,24 +837,24 @@ fn original_source_witness_and_new_revision_retain_actual_account_without_regist
     let layout_bytes = data.borrow().state.layout.capacity_bytes().unwrap();
     drop(runtime);
     drop(data);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     drop(witness);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     drop(revision);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     let pin_alias = pin.clone();
     drop(pin);
-    assert_eq!(pool.used_bytes().unwrap(), layout_bytes + required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), layout_bytes + required);
     assert_eq!(host_drops.load(Ordering::SeqCst), 0);
     drop(pin_alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     assert_eq!(host_drops.load(Ordering::SeqCst), 1);
 }
 #[test]
 fn exact_capacity_contenders_share_one_original_acceptance_without_overcommit() {
     let (_, _, source, required) = fixture(None, 2);
-    let capacity = source * 2 + required;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let capacity = source * 2 + required + source_registry_controls() * 2;
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let ready = Arc::new(std::sync::Barrier::new(2));
     let held = Arc::new(std::sync::Barrier::new(2));
     let workers = (0..2)
@@ -758,7 +867,9 @@ fn exact_capacity_contenders_share_one_original_acceptance_without_overcommit() 
                 assert_eq!((actual_source, actual_required), (source, required));
                 ready.wait();
                 let accepted = runtime
-                    .reset_admitted(SessionResetLimits::new(capacity))
+                    .reset_admitted(SessionResetLimits::new(
+                        crate::working_memory::memory_fixture::host_limits(capacity),
+                    ))
                     .is_ok();
                 held.wait();
                 accepted
@@ -772,7 +883,7 @@ fn exact_capacity_contenders_share_one_original_acceptance_without_overcommit() 
             .sum::<usize>(),
         1
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -780,7 +891,9 @@ fn post_acceptance_entry_failure_retains_actual_original_owner_and_poison_never_
     let (mut runtime, data, source, required) = fixture(None, 2);
     POISON_ENTRY.set(true);
     let failure = runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap_err();
     let exact = std::error::Error::source(&failure)
         .unwrap()
@@ -796,7 +909,7 @@ fn post_acceptance_entry_failure_retains_actual_original_owner_and_poison_never_
     {
         let usage = pool.0.usage.lock().unwrap_err().into_inner();
         assert_eq!(usage.reserved, required);
-        assert_eq!(usage.registered, source);
+        assert_eq!(usage.registered, source + source_registry_controls());
         assert!(usage.reset_pending.is_some());
     }
     assert_eq!(FILLS.get(), 0);
@@ -816,39 +929,50 @@ fn constructor_unwind_retires_partial_buffer_before_original_account_refund() {
     DROP_CHECK.with_borrow_mut(|slot| *slot = Some((pool.clone(), source + required, 0)));
     PANIC_AT.set(Some(2));
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = runtime.reset_admitted(SessionResetLimits::new(10_000_000));
+        let _ = runtime.reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ));
     }));
     PANIC_AT.set(None);
     assert_eq!(DROP_CHECK.with_borrow_mut(Option::take).unwrap().2, 2);
     assert!(unwind.is_err());
     assert_eq!(FILLS.get(), 2);
-    assert_eq!(pool.used_bytes().unwrap(), source);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    assert!(data
-        .borrow()
-        .state
-        .layers
-        .slots()
-        .iter()
-        .all(|slot| slot.position == 19));
+    assert!(
+        data.borrow()
+            .state
+            .layers
+            .slots()
+            .iter()
+            .all(|slot| slot.position == 19)
+    );
     runtime
-        .reset_admitted(SessionResetLimits::new(10_000_000))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(10_000_000),
+        ))
         .unwrap();
     drop(runtime);
     drop(data);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn concurrent_retirements_keep_lowest_ceiling_until_last_entry_refund() {
     let (_, _, source, required) = fixture(None, 2);
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
-    let low = source * 2 + required * 2 + 100;
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
+    let low = source * 2 + required * 2 + source_registry_controls() * 2 + 100;
     let high = low + 100_000;
     let (mut a, adata, _, _) = fixture_in_pool(pool.clone(), 2);
     let (mut b, bdata, _, _) = fixture_in_pool(pool.clone(), 2);
-    a.reset_admitted(SessionResetLimits::new(low)).unwrap();
-    b.reset_admitted(SessionResetLimits::new(high)).unwrap();
+    a.reset_admitted(SessionResetLimits::new(
+        crate::working_memory::memory_fixture::host_limits(low),
+    ))
+    .unwrap();
+    b.reset_admitted(SessionResetLimits::new(
+        crate::working_memory::memory_fixture::host_limits(high),
+    ))
+    .unwrap();
     let aowner = adata.borrow().state.layers.metadata().clone();
     let bowner = bdata.borrow().state.layers.metadata().clone();
     drop(a);
@@ -871,12 +995,14 @@ fn concurrent_retirements_keep_lowest_ceiling_until_last_entry_refund() {
     let reject_above_floor = || {
         let available = {
             let usage = pool.0.usage.lock().unwrap();
-            assert_eq!(pool.0.capacity(&usage, None), low);
+            assert_eq!(pool.0.capacity(&usage, None), fixture_limit(&pool, low));
             pool.0.available(&usage, None).unwrap()
         };
         assert!(matches!(
-            pool.register_storage([(71_u16, available + 1)]),
-            Err(WorkingMemoryError::BudgetExceeded { .. })
+            pool.register_host_storage([(71_u16, available + 1)]),
+            Err(WorkingMemoryError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            ))
         ));
     };
     reject_above_floor();
@@ -886,8 +1012,11 @@ fn concurrent_retirements_keep_lowest_ceiling_until_last_entry_refund() {
     reject_above_floor();
     brelease.send(()).unwrap();
     bworker.join().unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let usage = pool.0.usage.lock().unwrap();
     assert_eq!(usage.reset_retiring_count, 0);
-    assert_eq!(pool.0.capacity(&usage, None), 10_000_000);
+    assert_eq!(
+        pool.0.capacity(&usage, None),
+        fixture_limit(&pool, 10_000_000)
+    );
 }

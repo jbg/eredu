@@ -55,7 +55,7 @@ impl<B: TextSnapshotBackend> OriginalPlainSession<'_, B> {
     pub(crate) fn snapshot(
         &mut self,
         budget: &SnapshotBudget,
-        host_capacity: u64,
+        host_capacity: eredu_core::MemoryLimitDeclarations,
         native: WorkspaceCopyLimits,
     ) -> Result<OriginalPlainSnapshot<B>, TextSnapshotError<BackendFailure>> {
         let mut boundary = self.source.generator.snapshot_source().map_err(|error| {
@@ -101,7 +101,13 @@ impl<B: TextSnapshotBackend> OriginalPlainSession<'_, B> {
                 Duration,
                 Option<Duration>,
                 WorkspaceCopyLimits,
-            )>(pool, host_capacity, native_preparation_bytes)
+            )>(
+                pool,
+                host_capacity
+                    .resolve(pool.topology())
+                    .map_err(|cause| TextSnapshotError::HostAdmission(cause.into()))?,
+                native_preparation_bytes,
+            )
             .map_err(TextSnapshotError::HostAdmission)?;
         let (state, cursor) =
             TextContinuationSnapshot::capture_original_host(&mut boundary, budget, host, native)
@@ -136,7 +142,7 @@ where
         &self,
         runtime: &'a mut ModelRuntime<B>,
         config: TextGenerationConfig,
-        host_capacity: u64,
+        host_capacity: eredu_core::MemoryLimitDeclarations,
         branch: bool,
         cancellation: &GenerationCancellationToken,
     ) -> Result<Option<OriginalPlainSession<'a, B>>, TextSnapshotError<BackendFailure>> {
@@ -149,8 +155,15 @@ where
         let started = Instant::now();
         let preparation = self
             .state
-            .original_resume_preparation_bytes(runtime, config, &eredu_core::OriginalTextResumeOptions::new(
-                if branch { eredu_core::OriginalTextResumeKind::Branch } else { eredu_core::OriginalTextResumeKind::Restore }))
+            .original_resume_preparation_bytes(
+                runtime,
+                config.clone(),
+                &eredu_core::OriginalTextResumeOptions::new(if branch {
+                    eredu_core::OriginalTextResumeKind::Branch
+                } else {
+                    eredu_core::OriginalTextResumeKind::Restore
+                }),
+            )
             .map_err(|e| crate::api::control::map_snapshot_failure(e, B::into_backend_failure))?;
         let pool = B::original_snapshot_host_pool(runtime).ok_or(
             TextSnapshotError::Unsupported("original resume host domain"),
@@ -170,14 +183,28 @@ where
                 Option<Duration>,
                 TextGenerationConfig,
                 bool,
-            )>(pool, host_capacity, preparation)
+            )>(
+                pool,
+                host_capacity
+                    .resolve(pool.topology())
+                    .and_then(|limits| {
+                        limits.intersection(
+                            &config
+                                .inference_policy()
+                                .memory_limits
+                                .resolve(pool.topology())?,
+                        )
+                    })
+                    .map_err(|cause| TextSnapshotError::HostAdmission(cause.into()))?,
+                preparation,
+            )
             .map_err(TextSnapshotError::HostAdmission)?;
         let result = if branch {
             self.state
-                .fork_original_host(runtime, config, host, cancellation)
+                .fork_original_host(runtime, config.clone(), host, cancellation)
         } else {
             self.state
-                .restore_original_host(runtime, config, host, cancellation)
+                .restore_original_host(runtime, config.clone(), host, cancellation)
         }
         .map_err(|e| crate::api::control::map_snapshot_failure(e, B::into_backend_failure))?;
         Ok(result.map(|(generator, mut cursor)| {

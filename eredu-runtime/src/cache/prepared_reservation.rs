@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
+    workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError},
 };
 use std::{
     mem::size_of,
@@ -114,6 +114,13 @@ impl CacheResidencyPool {
     }
 }
 impl PreparedCachePoolReservation {
+    /// Fixed controls of the actual reservation admission and table installation.
+    /// The same worker frames are paid during destination preparation; this
+    /// query lets a later execution owner price its own call transports.
+    /// It neither reserves occupancy nor authenticates a cache pool.
+    pub fn admission_control_bytes() -> Option<usize> {
+        Self::fixed_controls()
+    }
     /// Commits an actual finite occupancy reservation into this same pool.
     /// Concurrent growth is revalidated before changing the canonical ledger.
     pub fn reserve(

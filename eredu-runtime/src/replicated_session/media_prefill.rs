@@ -105,14 +105,16 @@ where
             result
                 .map_err(|error| super::observation_paths::map_prepared(error, map_layerwise_error))
         } else {
+            // Both private callers execute the selected architecture/provider
+            // equations. Uncaptured media preserves their prepared path binding.
             match &mut self.kind {
                 ReplicatedTextRuntimeKind::Resident(runtime) => runtime
                     .forward_invocation_with_internal_observer(
-                        invocation, state, context, execute, observer, demand, false,
+                        invocation, state, context, execute, observer, demand, true,
                     ),
                 ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
                     .forward_invocation_with_internal_observer(
-                        invocation, state, context, execute, observer, demand, false,
+                        invocation, state, context, execute, observer, demand, true,
                     ),
             }
             .map_err(map_layerwise_error)
@@ -265,64 +267,8 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
-    /// Prepares one ordinary retained media source against the actual selected
-    /// session and current revision. This entry grants no finite media budget.
-    pub fn prepare_media_prefill_unbudgeted(
-        &self,
-        plan: A::IngressPlan,
-    ) -> Result<
-        PreparedMediaPrefill<A, B, M::State>,
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
-    > {
-        self.validate_media_preparation()?;
-        let geometry = A::ingress_geometry(&plan);
-        let request = InferenceRequest::without_memory_budget(&self.prefill_identity, geometry)
-            .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
-        self.prepare_media_prefill_with_request(plan, request)
-    }
-
-    fn prepare_media_prefill_with_request(
-        &self,
-        plan: A::IngressPlan,
-        request: InferenceRequest,
-    ) -> Result<
-        PreparedMediaPrefill<A, B, M::State>,
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
-    > {
-        if request.memory_reservation().is_some() {
-            return Err(ReplicatedTextSessionError::WorkingMemory(
-                crate::working_memory::WorkingMemoryError::UnknownBound,
-            ));
-        }
-        self.validate_media_preparation()?;
-        if let Some(original) = A::ingress_session_binding(&plan) {
-            let current = self.media_semantic_binding().map_err(|error| match error {
-                super::MediaSemanticBindingError::Boundary(error) => {
-                    ReplicatedTextSessionError::WorkingMemory(error)
-                }
-                super::MediaSemanticBindingError::Mechanism(error) => {
-                    ReplicatedTextSessionError::Mechanism(error)
-                }
-            })?;
-            if !original.matches(&current) {
-                return Err(ReplicatedTextSessionError::WorkingMemory(
-                    WorkingMemoryError::IdentityMismatch,
-                ));
-            }
-        }
-        let cut = D::prepare_media_cut(&self.execution, &plan)
-            .map_err(ReplicatedTextSessionError::Architecture)?;
-        PreparedMediaPrefill::new(
-            plan,
-            cut,
-            request,
-            &self.prefill_identity,
-            self.state.inference_retention().revision().clone(),
-        )
-        .map_err(ReplicatedTextSessionError::WorkingMemory)
-    }
-
-    fn prepare_media_prefill_with_metadata(
+    /// Constructs retained media from the accepted source binding and funded metadata context.
+    pub fn prepare_media_prefill_with_metadata(
         &self,
         plan: A::IngressPlan,
         request: InferenceRequest,
@@ -334,7 +280,7 @@ where
     where
         A: PrefillIngressArchitecture<B, M::State, Error = eredu_nn::Error>,
     {
-        if request.memory_reservation().is_none() || context.metadata_funding().is_none() {
+        if context.metadata_funding().is_none() {
             return Err(ReplicatedTextSessionError::WorkingMemory(
                 WorkingMemoryError::UnknownBound,
             ));
@@ -381,50 +327,6 @@ where
             ));
         }
         Ok(())
-    }
-
-    /// Runs explicitly ordinary retained media through the same source selection,
-    /// request claim, span executor and final output handling as text. A supplied
-    /// request is preserved; any original reservation is rejected before `make_plan`.
-    /// This entry grants no media allocation or observation authority.
-    pub fn try_prefill_media_source_cancellable<O>(
-        &mut self,
-        request: Option<&InferenceRequest>,
-        shape: Option<[u64; 2]>,
-        identity: Option<crate::SharedPreparedInputCacheIdentity>,
-        max_chunk_positions: Option<std::num::NonZeroU64>,
-        make_plan: impl FnOnce(eredu_core::InferenceGeometry) -> Result<A::IngressPlan, A::Error>,
-        cancellation: &eredu_core::GenerationCancellationToken,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<
-        super::PrefillSourceProgress<B::Tensor>,
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
-    >
-    where
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-    {
-        self.try_prefill_media_factory(
-            request,
-            shape,
-            max_chunk_positions,
-            |session, request| {
-                let plan = make_plan(request.geometry())
-                    .map_err(ReplicatedTextSessionError::Architecture)?;
-                session
-                    .prepare_media_prefill_with_request(plan, request.clone())
-                    .and_then(|source| {
-                        source
-                            .with_prompt_identity(identity)
-                            .map(Some)
-                            .map_err(ReplicatedTextSessionError::Architecture)
-                    })
-            },
-            None,
-            cancellation,
-            context,
-            observer,
-        )
     }
 
     /// Uses the accepted request and the actual retained planning Context for
@@ -544,51 +446,48 @@ where
     fn execute_media_span_before_publication<O>(
         &mut self,
         source: &mut PreparedMediaPrefill<A, B, M::State>,
-        input: Result<&PrefillChunk, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        input: Result<
+            &PrefillChunk,
+            ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+        >,
         demand: eredu_core::OutputDemand,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
         checkpoint: Option<M::StateCheckpoint>,
-    ) -> Result<(Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
-        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    where O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    ) -> Result<
+        (Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         let session = self;
         let batch_size = source.geometry().batch_size;
-            session.require_input_result_agreement(true)?;
-            let (output, checkpoint, forward) = session
-                .execute_input_operation_before_publication(
-                    input,
-                    ExpertPass::Prefill,
-                    context,
-                    observer,
-                    demand,
-                    checkpoint,
-                    |span| Ok(Some([batch_size, span.input.end - span.input.start])),
-                    |driver, execution, state, paths, span, observer, demand| {
-                        driver
-                            .forward_media_span(
-                                execution,
-                                source,
-                                span,
-                                state,
-                                context,
-                                observer,
-                                paths,
-                                demand,
-                            )
-                            .map_err(widen_infallible)
-                            .and_then(|result| {
-                                // This joins the existing execution vote, before
-                                // completion/publication. No second readiness phase.
-                                source.validate_complete_cut().map_err(|error| {
-                                    ReplicatedTextSessionError::Architecture(A::ingress_error(
-                                        error, None))
-                                })?;
-                                Ok(result)
-                            })
-                    },
-                )?;
+        session.require_input_result_agreement(true)?;
+        let (output, checkpoint, forward) = session.execute_input_operation_before_publication(
+            input,
+            ExpertPass::Prefill,
+            context,
+            observer,
+            demand,
+            checkpoint,
+            |span| Ok(Some([batch_size, span.input.end - span.input.start])),
+            |driver, execution, state, paths, span, observer, demand| {
+                driver
+                    .forward_media_span(
+                        execution, source, span, state, context, observer, paths, demand,
+                    )
+                    .map_err(widen_infallible)
+                    .and_then(|result| {
+                        // This joins the existing execution vote, before
+                        // completion/publication. No second readiness phase.
+                        source.validate_complete_cut().map_err(|error| {
+                            ReplicatedTextSessionError::Architecture(A::ingress_error(error, None))
+                        })?;
+                        Ok(result)
+                    })
+            },
+        )?;
         Ok((output, checkpoint, forward))
     }
 
@@ -644,7 +543,12 @@ where
                         WorkingMemoryError::IdentityMismatch,
                     ));
                 }
-                capture.validate_request(source.request().map_err(ReplicatedTextSessionError::WorkingMemory)?)
+                capture
+                    .validate_request(
+                        source
+                            .request()
+                            .map_err(ReplicatedTextSessionError::WorkingMemory)?,
+                    )
                     .map_err(ReplicatedTextSessionError::WorkingMemory)?;
             } else if let Some(capture) = observer.admitted_capture_continuation() {
                 if !capture.selection().is_prepared_media() {
@@ -652,7 +556,12 @@ where
                         WorkingMemoryError::IdentityMismatch,
                     ));
                 }
-                capture.validate_request(source.request().map_err(ReplicatedTextSessionError::WorkingMemory)?)
+                capture
+                    .validate_request(
+                        source
+                            .request()
+                            .map_err(ReplicatedTextSessionError::WorkingMemory)?,
+                    )
                     .map_err(ReplicatedTextSessionError::WorkingMemory)?;
             } else if observer.requires_prepared_traversal()
                 || observer.requires_sequence_readout()

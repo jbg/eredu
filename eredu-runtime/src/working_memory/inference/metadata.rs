@@ -4,7 +4,7 @@ use eredu_nn::{
     Error,
     workspace::{WorkspaceContext, WorkspaceMetadataError},
 };
-use std::{alloc::Layout, fmt, mem::size_of};
+use std::{fmt, mem::size_of};
 
 #[derive(Clone, Copy)]
 pub(super) struct Metadata<'a>(Option<&'a WorkspaceContext>);
@@ -13,10 +13,16 @@ impl<'a> Metadata<'a> {
         Self(None)
     }
     pub(super) fn from_context(context: &'a WorkspaceContext) -> Self {
-        Self(context.uses_checked_metadata().then_some(context))
+        Self(Some(context))
     }
     pub(super) fn context(self) -> Option<&'a WorkspaceContext> {
         self.0
+    }
+    pub(super) fn report(self) -> super::super::WorkspaceReportMetadata<'a> {
+        self.0.map_or_else(
+            super::super::WorkspaceReportMetadata::ordinary,
+            super::super::WorkspaceReportMetadata::new,
+        )
     }
     pub(super) fn validate_geometry<E>(
         self,
@@ -43,15 +49,6 @@ impl<'a> Metadata<'a> {
             None => super::invalid(detail).into(),
         }
     }
-    pub(super) fn prefill_error<E>(
-        self,
-        error: super::super::WorkingMemoryError,
-    ) -> InferenceWorkspaceError<E> {
-        match self.0 {
-            Some(context) => InferenceWorkspaceError::Metadata(context.metadata_source(error)),
-            None => super::invalid(&error.to_string()).into(),
-        }
-    }
     pub(super) fn reserve<T>(self, values: &mut Vec<T>, additional: usize) -> Result<(), Error> {
         if let Some(context) = self.0 {
             context.reserve_metadata_vec(values, additional)?;
@@ -62,24 +59,10 @@ impl<'a> Metadata<'a> {
         let Some(context) = self.0 else {
             return Ok(());
         };
-        let identity = Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
-            .extend(Layout::new::<()>())
-            .ok()
-            .map(|value| value.0.pad_to_align().size())
-            .ok_or(WorkspaceMetadataError::Overflow)?;
-        let request = super::super::InferenceRequest::unbudgeted_control_bytes()
-            .ok_or(WorkspaceMetadataError::Unqualified)?;
         let parts = [
-            identity,
-            usize::try_from(request).map_err(|_| WorkspaceMetadataError::Overflow)?,
-            GenerationCancellationToken::construction_bytes()
+            eredu_core::GenerationCancellationToken::construction_bytes()
                 .ok_or(WorkspaceMetadataError::Overflow)?,
-            super::super::control_mutex::operation_control_bytes::<
-                super::super::text_preparation::RequestStart,
-            >(),
-            size_of::<InferenceExecutionIdentity>(),
-            size_of::<InferenceRequest>(),
-            size_of::<PrefillDriver<(), ColdCompletion>>(),
+            size_of::<PrefillDriver<(), ColdCompletion, ()>>(),
             size_of::<ColdCompletion>(),
             size_of::<Inspection<'_, F>>(),
             size_of::<F>(),
@@ -94,8 +77,9 @@ impl<'a> Metadata<'a> {
             size_of::<Result<InferenceWorkspaceReport, InferenceWorkspaceError<E>>>(),
             size_of::<Result<PrefillOutcome, PrefillError<InferenceWorkspaceError<E>, Infallible>>>(
             ),
-            size_of::<Result<PrefillDriver<(), ColdCompletion>, super::super::WorkingMemoryError>>(
-            ),
+            size_of::<
+                Result<PrefillDriver<(), ColdCompletion, ()>, eredu_core::AdmissionPolicyError>,
+            >(),
         ];
         let bytes = parts
             .into_iter()

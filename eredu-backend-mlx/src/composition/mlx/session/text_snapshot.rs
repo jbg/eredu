@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::backend::managed_memory::{NativeMemoryOwner, NativeMemoryRetention};
-use eredu_core::{PendingTextInput, execution_control::SnapshotEstimate};
+use eredu_core::{execution_control::SnapshotEstimate, PendingTextInput};
 use eredu_runtime::{capture::CaptureSession, execution_control::TextSnapshotBackend};
-use generation::{MlxOrdinarySampler, MlxTextSamplingState, TextInferenceRetention};
+use generation::{MlxTextSamplingState, TextInferenceRetention};
 
 mod cold_estimate;
 mod pending_input;
@@ -67,18 +67,6 @@ fn sampling_storage_parts(
     })
 }
 
-fn copy_array(array: &Array, stream: &Stream, owner: &NativeMemoryOwner) -> Result<Array, Error> {
-    let copy = crate::backend::array_copy::IsolatedArrayCopy::new(array).copy(stream)?;
-    // A copied prompt can expose this backing through its borrowed input view.
-    // Complete the copy inside recovery before attaching physical ownership.
-    copy.evaluated()?;
-    owner.retain_array(&copy)?;
-    Ok(copy)
-}
-
-#[cfg(test)]
-mod sampling_copy_tests;
-
 impl eredu_core::TextSamplingControlBackend for MlxBackend<'_> {
     fn sampling_control_facts(
         state: &MlxTextGenerationState,
@@ -120,9 +108,11 @@ fn install_sampling_override(
             ));
         }
         let context = context.ok_or(Error::PrefillControl(
-            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        ))?;
         let quote = state.sampling.quote.clone().ok_or(Error::PrefillControl(
-            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        ))?;
         return quote.replace_sampling(runtime, &mut state.sampling, context, request);
     }
     let Some(seed) = request.reseed() else {
@@ -130,7 +120,7 @@ fn install_sampling_override(
         state.sampling.temperature = request.temperature();
         return Ok(());
     };
-    let owner = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
+    let owner = NativeMemoryOwner::acquire(runtime.backend().memory_ledger())?;
     let mut memory = state.sampling.memory_retention.clone();
     memory.retain(&owner);
     let replacement = super::recovery::detached_retained(
@@ -246,7 +236,9 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         // H0 follows the immutable saved source and its actual pending geometry.
         // Config/controller-dependent equations use the separately funded planning
         // context and fresh request; the shared provider owns controller copying.
-        saved.original_resume_preparation_bytes(runtime, config, options).map(Some)
+        saved
+            .original_resume_preparation_bytes(runtime, config, options)
+            .map(Some)
     }
 
     fn original_saved_components_resume_estimate(
@@ -272,27 +264,8 @@ impl TextSnapshotBackend for MlxBackend<'_> {
 
     fn original_snapshot_host_pool(
         runtime: &ModelRuntime<Self>,
-    ) -> Option<&eredu_runtime::working_memory::WorkingMemoryPool> {
-        Some(runtime.backend().memory_pool())
-    }
-
-    fn capture_saved_components(
-        runtime: &mut ModelRuntime<Self>,
-        sampling: &Self::SamplingState,
-        pending: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
-        policy: eredu_runtime::execution_control::SamplingCopyPolicy,
-    ) -> Result<Self::SavedTextComponents, Error> {
-        MlxSavedTextComponents::capture(runtime, sampling, pending, policy, None)
-    }
-
-    fn capture_saved_components_with_host(
-        runtime: &mut ModelRuntime<Self>,
-        sampling: &Self::SamplingState,
-        pending: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
-        policy: eredu_runtime::execution_control::SamplingCopyPolicy,
-        host: &eredu_core::HostPreparationAuthority,
-    ) -> Result<Self::SavedTextComponents, Error> {
-        MlxSavedTextComponents::capture(runtime, sampling, pending, policy, Some(host))
+    ) -> Option<&eredu_runtime::working_memory::MemoryLedger> {
+        Some(runtime.backend().memory_ledger())
     }
 
     fn capture_saved_generation_components_with_host(
@@ -305,16 +278,14 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         MlxSavedTextComponents::capture_generation(runtime, state, pending, policy, host)
     }
 
-    fn copy_saved_components(
-        runtime: &mut ModelRuntime<Self>,
-        saved: &Self::SavedTextComponents,
-        policy: eredu_runtime::execution_control::SamplingCopyPolicy,
-    ) -> Result<Self::SavedTextComponents, Error> {
-        saved.copy(runtime, policy)
-    }
-
     fn saved_sampling(saved: &Self::SavedTextComponents) -> &Self::SavedSamplingState {
         saved.sampling()
+    }
+
+    fn saved_capture_checkpoint(
+        saved: &Self::SavedTextComponents,
+    ) -> Option<&eredu_runtime::capture::FundedCaptureCheckpoint> {
+        saved.funded_source_fixed()?.capture_checkpoint()
     }
 
     fn validate_saved_components(
@@ -322,13 +293,6 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         saved: &Self::SavedTextComponents,
     ) -> Result<(), Error> {
         saved.validate(runtime)
-    }
-
-    fn estimate_saved_components(
-        runtime: &ModelRuntime<Self>,
-        saved: &Self::SavedTextComponents,
-    ) -> Result<Option<SnapshotEstimate>, Error> {
-        saved.estimate(runtime)
     }
 
     fn estimate_saved_native_growth(
@@ -339,46 +303,8 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         saved.native_growth(runtime, input_tokens)
     }
 
-    fn prepare_saved_components_resume(
-        runtime: &mut ModelRuntime<Self>,
-        saved: &Self::SavedTextComponents,
-    ) -> Result<
-        (
-            Self::NativeTextState,
-            Self::SamplingState,
-            Option<PendingTextInput<Self::Prompt, Self::Token>>,
-        ),
-        Error,
-    > {
-        saved.prepare_resume(runtime)
-    }
-
-    fn capture_saved_sampling(
-        runtime: &mut ModelRuntime<Self>,
-        sampling: &Self::SamplingState,
-        pending: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
-        policy: eredu_runtime::execution_control::SamplingCopyPolicy,
-    ) -> Result<Self::SavedSamplingState, Error> {
-        MlxSavedSamplingState::capture(runtime, sampling, pending, policy)
-    }
-
-    fn copy_saved_sampling(
-        runtime: &mut ModelRuntime<Self>,
-        saved: &Self::SavedSamplingState,
-        policy: eredu_runtime::execution_control::SamplingCopyPolicy,
-    ) -> Result<Self::SavedSamplingState, Error> {
-        saved.copy(runtime, policy)
-    }
-
     fn saved_sampling_prediction(saved: &Self::SavedSamplingState) -> u64 {
         saved.prediction()
-    }
-
-    fn estimate_saved_sampling(
-        runtime: &ModelRuntime<Self>,
-        saved: &Self::SavedSamplingState,
-    ) -> Result<Option<SnapshotEstimate>, Error> {
-        saved.estimate(runtime)
     }
 
     fn saved_input_tokens(saved: &Self::SavedSamplingState, predictions: u64) -> Option<u64> {
@@ -393,19 +319,6 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         // Logical continuation growth only. Fresh physical resume admission is
         // a separate fallible step, never authorized by this diagnostic.
         Ok(sampling_growth_estimate(predictions))
-    }
-
-    fn prepare_saved_sampling_resume(
-        runtime: &mut ModelRuntime<Self>,
-        saved: &Self::SavedSamplingState,
-    ) -> Result<
-        (
-            Self::SamplingState,
-            Option<PendingTextInput<Self::Prompt, Self::Token>>,
-        ),
-        Error,
-    > {
-        saved.prepare_resume(runtime)
     }
 
     fn continuation_input_tokens(
@@ -462,24 +375,21 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             funding: None,
         }
     }
-    fn rebind_pending_capture(
-        runtime: &ModelRuntime<Self>,
-        saved: Option<&eredu_runtime::capture::CaptureCheckpoint>,
-        capture: Option<&CaptureSession>,
-        pending: &mut Option<PendingTextInput<MlxModelInput, MlxTextToken>>,
-    ) -> Result<(), Error> {
-        let Some(PendingTextInput::Prefill(prompt)) = pending else {
-            return Ok(());
-        };
-        prompt.rebind_ordinary_capture(runtime, saved, capture)
-    }
-
     fn sampling_prediction(sampling: &MlxTextSamplingState) -> u64 {
         sampling.next_prediction
     }
     fn capture_run(state: &MlxTextGenerationState) -> Option<&CaptureSession> {
         state.capture.as_ref()
     }
+    fn capture_usage(state: &MlxTextGenerationState) -> eredu_core::capture::CaptureUsage {
+        state
+            .funded_capture
+            .as_ref()
+            .map(|capture| capture.collector().usage())
+            .or_else(|| state.capture.as_ref().map(CaptureSession::cumulative_usage))
+            .unwrap_or_default()
+    }
+
     fn capture_run_mut(state: &mut MlxTextGenerationState) -> Option<&mut CaptureSession> {
         state.capture.as_mut()
     }
@@ -510,55 +420,6 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         Ok(sampling_storage(sampling, array_storage))
     }
 
-    fn copy_sampling_state(
-        runtime: &mut ModelRuntime<Self>,
-        sampling: &MlxTextSamplingState,
-    ) -> Result<MlxTextSamplingState, Error> {
-        if sampling.quote.is_some() || sampling.sampler.is_funded() {
-            return Err(Error::Other(Box::new(
-                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
-            )));
-        }
-        // The plan borrows the exact history and controls through native copy
-        // preparation. It allocates nothing and grants no destination funding.
-        let sampler = sampling
-            .sampler
-            .prepare_copy()
-            .map_err(|error| Error::Other(Box::new(error)))?;
-        let owner = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
-        let memory = NativeMemoryRetention::from_owner(&owner);
-        let mut recovery_memory = sampling.memory_retention.clone();
-        recovery_memory.extend_from(&memory);
-        let stream = runtime.backend().stream().clone();
-        super::recovery::detached_retained(
-            TextInferenceRetention::new(sampling.inference_retention.clone(), recovery_memory),
-            || {
-                runtime.session_mut().with_model_operation(|_| {
-                    Ok((|| {
-                        let prng = sampling
-                            .prng
-                            .as_ref()
-                            .map(|random| {
-                                copy_array(random.as_array(), &stream, &owner)
-                                    .map(RandomState::from_key)
-                            })
-                            .transpose()?;
-                        Ok(MlxTextSamplingState {
-                            temperature: sampling.temperature,
-                            prng,
-                            sampler: MlxOrdinarySampler::Unquoted(sampler.copy()),
-                            next_prediction: sampling.next_prediction,
-                            parameter_epoch: sampling.parameter_epoch,
-                            inference_retention: sampling.inference_retention.clone(),
-                            memory_retention: memory,
-                            quote: sampling.quote.clone(),
-                        })
-                    })())
-                })?
-            },
-        )
-    }
-
     fn estimate_pending_input(
         _: &ModelRuntime<Self>,
         pending: Option<PendingTextInput<&MlxModelInput, &MlxTextToken>>,
@@ -581,126 +442,5 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             retained_bytes: bytes,
             copy_bytes: bytes,
         }))
-    }
-
-    fn copy_pending_input(
-        runtime: &mut ModelRuntime<Self>,
-        pending: Option<PendingTextInput<&MlxModelInput, &MlxTextToken>>,
-    ) -> Result<Option<PendingTextInput<MlxModelInput, MlxTextToken>>, Error> {
-        let pending = match pending {
-            None => return Ok(None),
-            Some(PendingTextInput::Prefill(prompt)) => {
-                if prompt.has_original_input_custody() {
-                    return Err(pending_input::unknown());
-                }
-                let plan = pending_input::PromptCopyPlan::prepare(prompt).ok_or_else(|| {
-                    Error::ArchitectureModel("ordinary snapshot input needs consumed source attribution or legacy text IDs".into())
-                })?;
-                return plan
-                    .copy(runtime)
-                    .map(|prompt| Some(PendingTextInput::Prefill(prompt)));
-            }
-            pending => pending,
-        };
-        if Self::estimate_pending_input(
-            runtime,
-            pending.as_ref().map(|input| match input {
-                PendingTextInput::Prefill(prompt) => PendingTextInput::Prefill(*prompt),
-                PendingTextInput::Decode(token) => PendingTextInput::Decode(*token),
-            }),
-        )?
-        .is_none()
-        {
-            return Err(Error::ArchitectureModel(
-                "snapshots require a single-sequence ordinary token-ID input".into(),
-            ));
-        }
-        let owner = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
-        let memory = NativeMemoryRetention::from_owner(&owner);
-        let stream = runtime.backend().stream().clone();
-        let mut retention = eredu_runtime::working_memory::InferenceRetention::new();
-        match pending.as_ref() {
-            Some(PendingTextInput::Decode(token)) => {
-                retention.extend_from(&token.owner.inference_retention())
-            }
-            Some(PendingTextInput::Prefill(prompt)) => prompt.with_borrowed(|input| {
-                if let Some(request) = input.inference_request() {
-                    retention.retain(request);
-                }
-            }),
-            None => {}
-        }
-        super::recovery::detached_retained(
-            TextInferenceRetention::new(retention, memory.clone()),
-            || {
-                runtime.session_mut().with_model_operation(|_| {
-                    Ok((|| {
-                        Ok(match pending {
-                            None => None,
-                            Some(PendingTextInput::Decode(token)) => {
-                                let value = copy_array(&token.value, &stream, &owner)?;
-                                token.owner.retain_memory(&memory);
-                                let mut copied = MlxTextToken::new_with_scalar_scope_and_capture(
-                                    value,
-                                    stream.clone(),
-                                    token.owner.clone(),
-                                    None,
-                                    token.ordinary_error_custody().cloned(),
-                                );
-                                if let Some(receipt) = token.step_receipt() {
-                                    copied
-                                        .attach_step_receipt(receipt.clone())
-                                        .map_err(|error| Error::Other(Box::new(error)))?;
-                                }
-                                Some(PendingTextInput::Decode(copied))
-                            }
-                            Some(PendingTextInput::Prefill(_)) => {
-                                unreachable!("prefill copy uses its exact borrowed plan")
-                            }
-                        })
-                    })())
-                })?
-            },
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eredu_runtime::working_memory::WorkingMemoryPool;
-
-    #[test]
-    fn copied_input_preserves_values_and_retains_escaped_backing_until_final_alias() {
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-        let owner = NativeMemoryOwner::acquire(&pool).unwrap();
-        let source = Array::from_slice(&[1_u32, 3, 5, 7, 9], &[1, 5]);
-        let cropped = source.try_index_device((.., 1..4), &stream).unwrap();
-        assert_eq!(cropped.allocation_info().unwrap(), None);
-        let copied = super::super::recovery::detached_retained(owner.clone(), || {
-            copy_array(&cropped, &stream, &owner)
-        })
-        .unwrap();
-        assert_eq!(copied.shape(), &[1, 3]);
-        assert_eq!(copied.evaluated().unwrap().as_slice::<u32>(), &[3, 5, 7]);
-        assert_ne!(
-            copied.allocation_info().unwrap().unwrap().identity(),
-            source.allocation_info().unwrap().unwrap().identity(),
-        );
-        let escaped = copied.try_index_device((.., ..2), &stream).unwrap();
-        drop((copied, cropped, source, owner));
-        safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
-        assert_eq!(escaped.evaluated().unwrap().as_slice::<u32>(), &[3, 5]);
-        drop(escaped);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pool.unquoted_owner_count().unwrap() != 0 {
-            stream.synchronize().unwrap();
-            safemlx::reclaim_allocation_owners();
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 }

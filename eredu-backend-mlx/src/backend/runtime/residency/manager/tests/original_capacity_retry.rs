@@ -141,7 +141,11 @@ pub(crate) fn exercise_original_capacity_retry(
     let roots = [id("0.left"), id("1.right")];
     let mut named_scratch = [eredu_runtime::residency::ResidencyClosureSlot::default(); 2];
     let catalog = manager
-        .prepare_name_catalog(&roots, &mut named_scratch, custody.metadata_custody().into())
+        .prepare_name_catalog(
+            &roots,
+            &mut named_scratch,
+            custody.metadata_custody().into(),
+        )
         .unwrap_or_else(|_| panic!("prepare exact test names"));
     let mut transfers = bank(2, || {
         PreparedResidentTransfer::try_new_for_window(
@@ -163,8 +167,12 @@ pub(crate) fn exercise_original_capacity_retry(
         )
         .unwrap_or_else(|_| panic!("prepare test transfer payload"))
     });
-    let mut observations = bank(0, || PreparedTransferObservation::new(custody.metadata_custody().into()));
-    let mut host = bank(0, || PreparedHostMaterialization::new(custody.metadata_custody().into()));
+    let mut observations = bank(0, || {
+        PreparedTransferObservation::new(custody.metadata_custody().into())
+    });
+    let mut host = bank(0, || {
+        PreparedHostMaterialization::new(custody.metadata_custody().into())
+    });
     let mut pending = bank(1, || PreparedPendingWeight::new(custody.clone()));
     let mut weights = bank(1, || {
         PreparedWeightMaterialization::try_new(
@@ -207,6 +215,7 @@ pub(crate) fn exercise_original_capacity_retry(
             &[(id("0.left"), 1), (id("1.right"), 1)],
             MemoryTier::Device,
             &mut OriginalResidencySlots {
+                materialized_recipe: None,
             background_host: None,
                 controller: &mut controller,
                 closure_ids: &mut closure_ids,

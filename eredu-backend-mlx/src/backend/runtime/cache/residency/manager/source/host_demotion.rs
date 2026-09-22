@@ -9,9 +9,15 @@ use safemlx::{
 
 #[path = "host_demotion/commit.rs"]
 mod commit;
+#[path = "host_demotion/ordinary.rs"]
+mod ordinary;
 #[path = "host_demotion/publication.rs"]
 mod publication;
+pub(crate) use commit::{
+    PreparedHostEviction, prepared_control_bytes as prepared_host_commit_control_bytes,
+};
 pub(super) use commit::{commit_host, control_bytes as commit_control_bytes};
+pub(crate) use ordinary::PreparedOrdinaryCacheHostDemotion;
 pub(super) use publication::SourceError as HostPublicationError;
 #[path = "host_demotion/stored.rs"]
 mod stored;
@@ -250,7 +256,9 @@ impl CacheBlockSourceLoan<'_> {
 }
 
 impl PreparedCacheHostDemotion {
-    pub(crate) fn reclaim_replaced_device(&mut self) { self.device_retirement.reclaim(); }
+    pub(crate) fn reclaim_replaced_device(&mut self) {
+        self.device_retirement.reclaim();
+    }
 
     pub(crate) fn host_capacity(&self) -> u64 {
         self.host_capacity
@@ -354,7 +362,10 @@ impl PreparedCacheHostDemotion {
                 .synchronize()
                 .map_err(|cause| source.error(CacheSourceError::HostStore(cause)))?;
             if let Some(root) = destination.output() {
-                proof.roots().retire_completed(root).map_err(|cause| source.error(cause))?;
+                proof
+                    .roots()
+                    .retire_completed(root)
+                    .map_err(|cause| source.error(cause))?;
             }
             let buffer = destination
                 .take_completed()
@@ -474,7 +485,9 @@ impl PreparedCacheHostDemotion {
                 rotary_key: Arc::clone(second),
             },
         };
-        self.device_retirement.attach(proof.arrays()).map_err(|cause| source.error(cause))?;
+        self.device_retirement
+            .attach(proof.arrays())
+            .map_err(|cause| source.error(cause))?;
         self.replaced = Some(commit_host(
             &self.manager,
             proof,

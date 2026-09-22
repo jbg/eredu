@@ -12,6 +12,8 @@ use eredu_core::{
 use sha2::{Digest, Sha256};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
+mod metadata;
+
 const MAGIC: u32 = 0x4552_504f;
 const VERSION: u32 = 1;
 /// Fixed control words, including exact setup and operation digests.
@@ -283,51 +285,62 @@ impl ParameterOperationCoordinator {
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
-        let mut operation = self.begin(transport, binding, intent, kind)?;
-        let local = local.and_then(|prepared| {
-            operation.geometry = prepared.geometry;
-            operation.max_words = prepared.max_words;
-            if kind.transaction() {
-                return Err(Error::Admission("transaction used as read").into());
+        metadata::reserve_operation::<T, P, O>(
+            transport,
+            &[
+                std::mem::size_of_val(&produce),
+                std::mem::size_of_val(&assemble),
+                std::mem::size_of::<ParameterReadPreparation<P>>(),
+            ],
+        )?;
+        let result = (|| {
+            let mut operation = self.begin(transport, binding, intent, kind)?;
+            let local = local.and_then(|prepared| {
+                operation.geometry = prepared.geometry;
+                operation.max_words = prepared.max_words;
+                if kind.transaction() {
+                    return Err(Error::Admission("transaction used as read").into());
+                }
+                if binding.catalog_only && kind != ParameterOperationKind::Catalog {
+                    return Err(
+                        Error::Admission("catalogue binding cannot read parameter values").into(),
+                    );
+                }
+                let cost = payload_cost(transport, prepared.max_words)?;
+                if let Some(CaptureSkipReason::Limit { budget, cumulative }) =
+                    reservation.reserve(cost)?
+                {
+                    return Err(CaptureError::Limit { budget, cumulative }.into());
+                }
+                Ok(prepared.value)
+            });
+            let prepared = match operation.agree(Stage::Admission, local) {
+                Ok(value) => value,
+                Err(error) => return operation.rejected(error),
+            };
+            let max_words = operation.max_words;
+            let produced = produce(prepared).and_then(|words| {
+                if words.len() > max_words {
+                    return Err(Error::Protocol("producer exceeded prepaid payload").into());
+                }
+                Ok(words)
+            });
+            let words = match operation.agree(Stage::Preparation, produced) {
+                Ok(words) => words,
+                Err(error) => return operation.rejected(error),
+            };
+            let output = operation
+                .payload(&words, max_words)
+                .and_then(|received| assemble(&received));
+            match operation.agree(Stage::Delivery, output) {
+                Ok(output) => {
+                    operation.finished = true;
+                    Ok(output)
+                }
+                Err(error) => operation.rejected(error),
             }
-            if binding.catalog_only && kind != ParameterOperationKind::Catalog {
-                return Err(
-                    Error::Admission("catalogue binding cannot read parameter values").into(),
-                );
-            }
-            let cost = payload_cost(transport, prepared.max_words)?;
-            if let Some(CaptureSkipReason::Limit { budget, cumulative }) =
-                reservation.reserve(cost)?
-            {
-                return Err(CaptureError::Limit { budget, cumulative }.into());
-            }
-            Ok(prepared.value)
-        });
-        let prepared = match operation.agree(Stage::Admission, local) {
-            Ok(value) => value,
-            Err(error) => return operation.rejected(error),
-        };
-        let max_words = operation.max_words;
-        let produced = produce(prepared).and_then(|words| {
-            if words.len() > max_words {
-                return Err(Error::Protocol("producer exceeded prepaid payload").into());
-            }
-            Ok(words)
-        });
-        let words = match operation.agree(Stage::Preparation, produced) {
-            Ok(words) => words,
-            Err(error) => return operation.rejected(error),
-        };
-        let output = operation
-            .payload(&words, max_words)
-            .and_then(|received| assemble(&received));
-        match operation.agree(Stage::Delivery, output) {
-            Ok(output) => {
-                operation.finished = true;
-                Ok(output)
-            }
-            Err(error) => operation.rejected(error),
-        }
+        })();
+        result.map_err(|error| metadata::retain(error, transport.metadata_funding()))
     }
 
     /// Prepares all replacements before any publication. On a completed peer
@@ -352,42 +365,53 @@ impl ParameterOperationCoordinator {
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
-        let mut operation = self.begin(transport, binding, intent, kind)?;
-        let local = local.and_then(|value| {
-            if !kind.transaction() {
-                return Err(Error::Admission("read used as transaction").into());
-            }
-            if binding.catalog_only {
-                return Err(
-                    Error::Admission("catalogue binding cannot edit parameter values").into(),
-                );
-            }
-            Ok(value)
-        });
-        let input = match operation.agree(Stage::Admission, local) {
-            Ok(input) => input,
-            Err(error) => return operation.rejected(error),
-        };
-        let mut prepared = match operation.agree(Stage::Preparation, prepare(input)) {
-            Ok(value) => value,
-            Err(error) => return operation.rejected(error),
-        };
-        match operation.agree(Stage::Publication, publish(&mut prepared)) {
-            Ok(()) => {
-                operation.finished = true;
-                Ok(prepared)
-            }
-            Err(error) if completed_rejection(&error) => {
-                match operation.agree(Stage::Restoration, restore(&mut prepared)) {
-                    Ok(()) => operation.rejected(error),
-                    Err(restoration) => {
-                        operation.fence(&Error::Protocol("parameter restoration failed"));
-                        Err(restoration)
+        metadata::reserve_operation::<T, P, R>(
+            transport,
+            &[
+                std::mem::size_of_val(&prepare),
+                std::mem::size_of_val(&publish),
+                std::mem::size_of_val(&restore),
+            ],
+        )?;
+        let result = (|| {
+            let mut operation = self.begin(transport, binding, intent, kind)?;
+            let local = local.and_then(|value| {
+                if !kind.transaction() {
+                    return Err(Error::Admission("read used as transaction").into());
+                }
+                if binding.catalog_only {
+                    return Err(
+                        Error::Admission("catalogue binding cannot edit parameter values").into(),
+                    );
+                }
+                Ok(value)
+            });
+            let input = match operation.agree(Stage::Admission, local) {
+                Ok(input) => input,
+                Err(error) => return operation.rejected(error),
+            };
+            let mut prepared = match operation.agree(Stage::Preparation, prepare(input)) {
+                Ok(value) => value,
+                Err(error) => return operation.rejected(error),
+            };
+            match operation.agree(Stage::Publication, publish(&mut prepared)) {
+                Ok(()) => {
+                    operation.finished = true;
+                    Ok(prepared)
+                }
+                Err(error) if completed_rejection(&error) => {
+                    match operation.agree(Stage::Restoration, restore(&mut prepared)) {
+                        Ok(()) => operation.rejected(error),
+                        Err(restoration) => {
+                            operation.fence(&Error::Protocol("parameter restoration failed"));
+                            Err(restoration)
+                        }
                     }
                 }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+        })();
+        result.map_err(|error| metadata::retain(error, transport.metadata_funding()))
     }
 
     fn begin<'a, T: ParameterOperationTransport>(
@@ -497,7 +521,11 @@ where
     T::Error: Send + Sync + 'static,
     <T::Completion as Completion>::Error: Send + Sync + 'static,
 {
-    fn gather(&mut self, words: &[u32]) -> Result<Vec<u32>, ParameterError> {
+    fn gather<O>(
+        &mut self,
+        words: &[u32],
+        validate: impl FnOnce(&[u32]) -> Result<O, ParameterError>,
+    ) -> Result<O, ParameterError> {
         let result = (|| {
             self.transport.ensure_parameter_active()?;
             let submitted = self
@@ -514,14 +542,14 @@ where
                 }
             };
             self.transport
-                .resolve_all_gather_words(output)
+                .with_resolved_all_gather_words(output, validate)
                 .map_err(BackendFailure::from_error)
                 .map_err(Error::from)
         })();
         result.map_err(|error| {
             self.fence(&error);
-            error.into()
-        })
+            ParameterError::from(error)
+        })?
     }
 
     fn agree<V>(
@@ -607,47 +635,50 @@ where
         frame: &[u32; PARAMETER_CONTROL_WORDS],
         confirmation: bool,
     ) -> Result<Option<usize>, ParameterError> {
-        let words = self.gather(frame)?;
         let count = self.owner.setup.participant_count();
-        if words.len() != count * PARAMETER_CONTROL_WORDS {
-            return Err(Error::Protocol("control frame length").into());
-        }
         let rank = self.transport.parameter_rank();
-        if words[rank * PARAMETER_CONTROL_WORDS..(rank + 1) * PARAMETER_CONTROL_WORDS] != frame[..]
-        {
-            return Err(Error::Protocol("local control echo").into());
-        }
-        let mut rejected = None;
-        let compare_prepared = if confirmation {
-            frame[8] == 0 && frame[9] == 0
-        } else {
-            frame[5] != stage_word(Stage::Admission)
-                || words
-                    .chunks_exact(PARAMETER_CONTROL_WORDS)
-                    .all(|peer| peer[8] == 0)
-        };
-        for (rank, peer) in words.chunks_exact(PARAMETER_CONTROL_WORDS).enumerate() {
-            if peer[..7] != frame[..7]
-                || peer[7] != rank as u32
-                || peer[11..28] != frame[11..28]
-                || peer[8] > 1
+        self.gather(frame, |words| {
+            if words.len() != count * PARAMETER_CONTROL_WORDS {
+                return Err(Error::Protocol("control frame length").into());
+            }
+            if words[rank * PARAMETER_CONTROL_WORDS..(rank + 1) * PARAMETER_CONTROL_WORDS]
+                != frame[..]
             {
-                return Err(Error::Protocol("setup, operation, phase or rank").into());
+                return Err(Error::Protocol("local control echo").into());
             }
-            if compare_prepared && (!confirmation || peer[8] == 0) && peer[28..] != frame[28..] {
-                return Err(Error::Protocol("prepared geometry or payload bound").into());
+            let mut rejected = None;
+            let compare_prepared = if confirmation {
+                frame[8] == 0 && frame[9] == 0
+            } else {
+                frame[5] != stage_word(Stage::Admission)
+                    || words
+                        .chunks_exact(PARAMETER_CONTROL_WORDS)
+                        .all(|peer| peer[8] == 0)
+            };
+            for (rank, peer) in words.chunks_exact(PARAMETER_CONTROL_WORDS).enumerate() {
+                if peer[..7] != frame[..7]
+                    || peer[7] != rank as u32
+                    || peer[11..28] != frame[11..28]
+                    || peer[8] > 1
+                {
+                    return Err(Error::Protocol("setup, operation, phase or rank").into());
+                }
+                if compare_prepared && (!confirmation || peer[8] == 0) && peer[28..] != frame[28..]
+                {
+                    return Err(Error::Protocol("prepared geometry or payload bound").into());
+                }
+                if !confirmation && peer[9..11] != [0, 0] {
+                    return Err(Error::Protocol("reserved control words").into());
+                }
+                if confirmation && peer[8] == 0 && frame[8] == 0 && peer[9..11] != frame[9..11] {
+                    return Err(Error::Protocol("completed control decision").into());
+                }
+                if peer[8] == 1 {
+                    rejected.get_or_insert(rank);
+                }
             }
-            if !confirmation && peer[9..11] != [0, 0] {
-                return Err(Error::Protocol("reserved control words").into());
-            }
-            if confirmation && peer[8] == 0 && frame[8] == 0 && peer[9..11] != frame[9..11] {
-                return Err(Error::Protocol("completed control decision").into());
-            }
-            if peer[8] == 1 {
-                rejected.get_or_insert(rank);
-            }
-        }
-        Ok(rejected)
+            Ok(rejected)
+        })
     }
     fn payload(
         &mut self,
@@ -657,7 +688,9 @@ where
         let stride = max_words
             .checked_add(PAYLOAD_HEADER)
             .ok_or(ParameterError::Overflow)?;
-        let mut frame = vec![0; stride];
+        let funding = self.transport.metadata_funding();
+        let mut frame = metadata::vector(funding, stride)?;
+        frame.resize(stride, 0);
         frame[..PAYLOAD_HEADER].copy_from_slice(&[
             MAGIC,
             VERSION,
@@ -669,30 +702,34 @@ where
             0,
         ]);
         frame[PAYLOAD_HEADER..PAYLOAD_HEADER + words.len()].copy_from_slice(words);
-        let gathered = self.gather(&frame)?;
-        if gathered.len() != stride * self.owner.setup.participant_count() {
-            return Err(Error::Protocol("payload length").into());
-        }
+        let participants = self.owner.setup.participant_count();
         let rank = self.transport.parameter_rank();
-        if gathered[rank * stride..(rank + 1) * stride] != frame {
-            return Err(Error::Protocol("local payload echo").into());
-        }
-        let mut output = Vec::with_capacity(self.owner.setup.participant_count());
-        for (rank, peer) in gathered.chunks_exact(stride).enumerate() {
-            if peer[..4] != frame[..4]
-                || peer[4] != rank as u32
-                || peer[6..8] != frame[6..8]
-                || peer[5] as usize > max_words
-            {
-                return Err(Error::Protocol("payload identity or extent").into());
+        self.gather(&frame, |gathered| {
+            if gathered.len() != stride * participants {
+                return Err(Error::Protocol("payload length").into());
             }
-            let end = PAYLOAD_HEADER + peer[5] as usize;
-            if peer[end..].iter().any(|word| *word != 0) {
-                return Err(Error::Protocol("nonzero payload padding").into());
+            if gathered[rank * stride..(rank + 1) * stride] != frame {
+                return Err(Error::Protocol("local payload echo").into());
             }
-            output.push(peer[PAYLOAD_HEADER..end].to_vec());
-        }
-        Ok(output)
+            let mut output = metadata::vector(funding, participants)?;
+            for (rank, peer) in gathered.chunks_exact(stride).enumerate() {
+                if peer[..4] != frame[..4]
+                    || peer[4] != rank as u32
+                    || peer[6..8] != frame[6..8]
+                    || peer[5] as usize > max_words
+                {
+                    return Err(Error::Protocol("payload identity or extent").into());
+                }
+                let end = PAYLOAD_HEADER + peer[5] as usize;
+                if peer[end..].iter().any(|word| *word != 0) {
+                    return Err(Error::Protocol("nonzero payload padding").into());
+                }
+                let mut row = metadata::vector(funding, end - PAYLOAD_HEADER)?;
+                row.extend_from_slice(&peer[PAYLOAD_HEADER..end]);
+                output.push(row);
+            }
+            Ok(output)
+        })
     }
 }
 fn payload_cost<T: ParameterOperationTransport>(

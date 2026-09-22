@@ -19,7 +19,8 @@ fn ordinary_result_original_exact_and_minus_one_use_real_admission_before_any_wo
         for capture in [false, true] {
             let options = || {
                 capture.then(|| TextPreparationOptions {
-                    interventions: None, capture: Some(capture_source()),
+                    interventions: None,
+                    capture: Some(capture_source()),
                 })
             };
             let (mut actual, state) = runtime(Mode {
@@ -35,9 +36,9 @@ fn ordinary_result_original_exact_and_minus_one_use_real_admission_before_any_wo
             );
             let (pool, held) = retire_request(&state);
             drop(actual);
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(sequence);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 
             let (mut baseline, base) = runtime(Mode {
                 capture,
@@ -61,12 +62,11 @@ fn ordinary_result_original_exact_and_minus_one_use_real_admission_before_any_wo
             let mut cause: &(dyn std::error::Error + 'static) = &error;
             let mut budget = false;
             loop {
-                if let Some(WorkingMemoryError::BudgetExceeded {
-                    required_bytes,
-                    available_bytes,
-                }) = cause.downcast_ref::<WorkingMemoryError>()
+                if let Some((required_bytes, available_bytes)) = cause
+                    .downcast_ref::<WorkingMemoryError>()
+                    .and_then(capacity_numbers)
                 {
-                    assert_eq!(*required_bytes, *available_bytes + 1);
+                    assert_eq!(required_bytes, available_bytes + 1);
                     budget = true;
                 }
                 match cause.source() {
@@ -81,7 +81,7 @@ fn ordinary_result_original_exact_and_minus_one_use_real_admission_before_any_wo
             let facts = rejected.borrow();
             assert_eq!(facts.order, ["admit"]);
             assert_eq!(facts.votes, [(Stage::Admission, Status::Failed)]);
-            assert_eq!(facts.pool.used_bytes().unwrap(), 64);
+            assert_eq!(facts.pool.payload_used_bytes().unwrap(), 64);
             assert!(facts.active.is_none());
         }
     }
@@ -104,21 +104,21 @@ fn ordinary_result_keeps_original_raw_tail_after_full_source_retirement_and_part
     let reason = sequence.finish_reason().unwrap();
     let (pool, held) = retire_request(&state);
     drop(actual);
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     let timing = GenerationTiming::new(Some(std::time::Duration::from_micros(7)));
     let output = GenerationOutput::from_retained(sequence.into_token_ids(), reason, timing);
     assert_eq!(output.token_ids(), [4, 5]);
     assert_eq!(output.token_ids().as_ptr(), pointer);
     assert_eq!(output.finish_reason(), eredu_core::FinishReason::MaxTokens);
     assert_eq!(*output.timing(), timing);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     assert!(matches!(
         pool.pin_registered_storage([(1u32, 64)]),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     let mut iter = output.token_ids.into_iter();
     assert_eq!(iter.next(), Some(4));
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     drop(iter);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

@@ -79,7 +79,7 @@ impl SupplementarySourcePlan {
             .map_err(|_| overflow())?)?;
         }
         for control in [
-            size_of::<(&Self, &mut ResidencyManager, &WorkingMemoryPool)>(),
+            size_of::<(&Self, &mut ResidencyManager, &MemoryLedger)>(),
             size_of::<Result<(), ConstructionCause>>(),
             size_of::<Option<HostCopyWorkspace>>(),
             size_of::<Result<HostCopyWorkspace, HostCopyWorkspaceError>>(),
@@ -94,7 +94,7 @@ impl SupplementarySourcePlan {
     pub(super) fn initialize(
         &self,
         manager: &mut ResidencyManager,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), ConstructionCause> {
         let custody = manager
             .original_source_custody()

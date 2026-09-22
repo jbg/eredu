@@ -33,7 +33,12 @@ fn chat(model: &mut original_sources::Fixture<MockBackend>) -> PreparedChat {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     }
@@ -89,8 +94,9 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
             } else {
                 let cancellation = GenerationCancellationToken::new();
                 let mut settings = settings();
-                settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
-                let mut request = PreparedChatRequest::new(&chat, settings);
+                settings.inference.memory_limits =
+                    crate::memory::limits(original_sources::CAPACITY);
+                let mut request = PreparedChatRequest::new(&chat, settings.clone());
                 let prefix = [0; 7];
                 request.input = PreparedChatPrompt::TokenIds(&prefix);
                 request.stop_sequences = &stops;
@@ -144,8 +150,9 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
                 terminal(output)
             } else {
                 let mut settings = settings();
-                settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
-                let mut request = PreparedChatRequest::new(&chat, settings);
+                settings.inference.memory_limits =
+                    crate::memory::limits(original_sources::CAPACITY);
+                let mut request = PreparedChatRequest::new(&chat, settings.clone());
                 let prefix = [0; 7];
                 request.input = PreparedChatPrompt::TokenIds(&prefix);
                 match model.start_prepared_chat(request, &cancellation).unwrap() {
@@ -258,12 +265,10 @@ fn speculative_ttft_counts_a_buffered_unicode_token_cancelled_before_text() {
         output.requests()[0].finish_reason(),
         FinishReason::Cancelled
     );
-    assert!(
-        output.requests()[0]
-            .timing()
-            .time_to_first_token()
-            .is_some()
-    );
+    assert!(output.requests()[0]
+        .timing()
+        .time_to_first_token()
+        .is_some());
     assert_eq!(output.requests()[1].timing().time_to_first_token(), None);
     assert_eq!(
         events,
@@ -287,8 +292,8 @@ fn observed_ttft_counts_a_buffered_unicode_token_before_record_delivery() {
     let mut model = unicode_model(Some(first));
     let chat = chat(&mut model);
     let mut settings = settings();
-    settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
-    let request = PreparedChatRequest::new(&chat, settings);
+    settings.inference.memory_limits = crate::memory::limits(original_sources::CAPACITY);
+    let request = PreparedChatRequest::new(&chat, settings.clone());
     let trace = eredu::api::TraceLimits {
         per_record_bytes: 65536,
         total_bytes: 1024 * 1024,

@@ -1,9 +1,22 @@
 //! Actual shared-session control occurrences, outside all saved model state.
-use crate::working_memory::WorkingMemoryError;
 use crate::DistributedExecutionPhase;
+use crate::working_memory::WorkingMemoryError;
 use std::{
     mem::{size_of, size_of_val},
     sync::atomic::{AtomicU64, Ordering},
+};
+
+mod cache;
+mod model;
+pub use model::{
+    SessionModelControlCursor, SessionModelControlOccurrence, SessionModelControlPlan,
+};
+mod transaction;
+pub use cache::{SessionCacheControlCursor, SessionCacheControlOperation, SessionCacheControlPlan};
+pub use transaction::{
+    ParallelControlCallbackVisitor, SessionTransactionControlCursor,
+    SessionTransactionControlError, SessionTransactionControlOccurrence,
+    SessionTransactionControlPlan,
 };
 
 static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);

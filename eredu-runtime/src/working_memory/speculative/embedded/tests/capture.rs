@@ -13,17 +13,14 @@ use eredu_core::{
     TensorAxis, TensorObservationData,
 };
 
-fn capture_source(pool: &WorkingMemoryPool) -> OriginalCaptureSource {
+fn capture_source(pool: &MemoryLedger) -> OriginalCaptureSource {
     capture_source_with_sequence(pool, 3)
 }
-fn capture_source_with_sequence(
-    pool: &WorkingMemoryPool,
-    max_sequence: u64,
-) -> OriginalCaptureSource {
+fn capture_source_with_sequence(pool: &MemoryLedger, max_sequence: u64) -> OriginalCaptureSource {
     capture_source_with_transform(pool, max_sequence, CaptureTransform::FullTensor, 1)
 }
 fn capture_source_with_transform(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     max_sequence: u64,
     transform: CaptureTransform,
     captures: u64,
@@ -73,7 +70,6 @@ fn capture_source_with_transform(
                 captures,
                 ..unlimited
             },
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -96,7 +92,6 @@ fn capture_source_with_transform(
         &CaptureCapabilities {
             transformations: vec![kind],
             max_histogram_bins: 0,
-            physical_native_limit: false,
             conditions: vec![],
         },
         CaptureInvocationBounds {
@@ -187,14 +182,14 @@ fn model_capture_roles_keep_exact_source_and_cumulative_usage_through_repeated_c
     let workspace = EmbeddedInvocationWorkspace::target(invocation).unwrap();
     let report = report(workspace.geometry());
     let capacity = 1 << 26;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let source = capture_source(&pool);
-    let source_baseline = pool.used_bytes().unwrap();
+    let source_baseline = pool.payload_used_bytes().unwrap();
     let request = OriginalSpeculativeRequest::prepare_embedded(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
@@ -257,7 +252,7 @@ fn model_capture_roles_keep_exact_source_and_cumulative_usage_through_repeated_c
         .unwrap();
     assert!(!second_role.same_role(&role));
     let mut second = pending.begin().unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     let mut second_backend = Backend {
         custody: second_role.budget_custody(),
         calls: 0,
@@ -265,7 +260,7 @@ fn model_capture_roles_keep_exact_source_and_cumulative_usage_through_repeated_c
     assert!(forward(&mut second, &mut second_backend, 2).is_err());
     assert_eq!(second_backend.calls, 0);
     assert_eq!(second.usage().captures, 1);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let failed = second.take_shared_step().unwrap().unwrap();
     assert_eq!(failed.as_ref().outcome, CaptureStepOutcome::Aborted);
     let foreign = capture_source(&pool);
@@ -283,7 +278,7 @@ fn model_capture_roles_keep_exact_source_and_cumulative_usage_through_repeated_c
         origin,
     )
     .unwrap();
-    let before_refusal = pool.used_bytes().unwrap();
+    let before_refusal = pool.payload_used_bytes().unwrap();
     let rejected = request
         .reserve_embedded_role_with_capture(
             cursor.claim(invocation).unwrap(),
@@ -296,7 +291,7 @@ fn model_capture_roles_keep_exact_source_and_cumulative_usage_through_repeated_c
         rejected.cause(),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before_refusal);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before_refusal);
     drop(rejected);
     drop(foreign);
     let CapturePayload::SharedTensor(payload) = first.records()[0].payload.as_ref().unwrap() else {
@@ -315,15 +310,15 @@ fn model_capture_roles_keep_exact_source_and_cumulative_usage_through_repeated_c
         second_backend,
         request,
     ));
-    assert!(pool.used_bytes().unwrap() > source_baseline);
+    assert!(pool.payload_used_bytes().unwrap() > source_baseline);
     let TensorObservationData::F32(values) = payload.data() else {
         panic!("F32 output")
     };
     assert_eq!(values, &[0.5, -1.0, 2.25, 3.5, -4.0, 5.75]);
     drop(payload);
-    assert_eq!(pool.used_bytes().unwrap(), source_baseline);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_baseline);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod interventions;

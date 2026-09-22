@@ -1,4 +1,5 @@
 use super::*;
+mod funding;
 use eredu_core::{
     consensus::ConsensusTransport, BoundedCompletionOutcome, CompletionCancellationMode, Submission,
 };

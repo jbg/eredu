@@ -7,7 +7,7 @@ use crate::composition::mlx::{
 use eredu_runtime::speculative::autoregressive::{
     AutoregressiveMechanisms, AutoregressivePass, AutoregressivePrefill, AutoregressiveSource,
 };
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::rc::Rc;
 pub(super) mod host_containers;
 pub(in crate::composition::mlx::speculative) mod input_readout;
@@ -29,7 +29,7 @@ pub(crate) use workspace::{
 pub(crate) struct MlxAutoregressiveState {
     native: MlxPredictionTargetState,
     stream: StateStream,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     // Exact model/parameter epoch at cache creation. A missing fixed source
     // remains ordinary-only; checkpoint/restore never manufactures an epoch.
     source_origin: Option<eredu_runtime::replicated_session::ReplicatedTextControlOrigin>,
@@ -90,6 +90,7 @@ impl MlxAutoregressiveOutput {
 }
 
 impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
+    type Activation = MlxTensor;
     type Model = Executable;
     type Input = MlxModelInput;
     type State = MlxAutoregressiveState;
@@ -100,8 +101,13 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
     type Completion = AutoregressiveCompletion;
     type Telemetry = scheduler::SpeculativeComponentTimings;
     type Error = Error;
-    fn request_context<'a>(request: eredu_core::SpeculativeRequestId, context: Self::Context<'a>)
-        -> Result<Self::Context<'a>, Self::Error> where Self: 'a {
+    fn request_context<'a>(
+        request: eredu_core::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Context<'a>, Self::Error>
+    where
+        Self: 'a,
+    {
         context.request_context(request)
     }
     fn occurrence_request(context: Self::Context<'_>) -> Option<eredu_core::SpeculativeRequestId> {
@@ -191,7 +197,7 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         };
         let owner = match context.memory_owner() {
             Some(owner) => owner.clone(),
-            None => NativeMemoryOwner::acquire(&context.memory_pool())?,
+            None => NativeMemoryOwner::acquire(&context.memory_ledger())?,
         };
         submission_recovery::detached_retained(owner.clone(), || {
             let source_origin = model
@@ -223,6 +229,20 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         context: Self::Context<'_>,
     ) -> Result<eredu_core::SpeculativePrefillOutcome<AutoregressivePrefill<Self::Logits>>, Error>
     {
+        Self::prefill_with_observer(model, input, state, pass, cancellation, context, None)
+    }
+    fn prefill_with_observer(
+        model: &mut Self::Model,
+        input: &Self::Input,
+        state: &mut Self::State,
+        pass: AutoregressivePass,
+        cancellation: &eredu_core::GenerationCancellationToken,
+        context: Self::Context<'_>,
+        observer: Option<
+            &mut dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Error>,
+        >,
+    ) -> Result<eredu_core::SpeculativePrefillOutcome<AutoregressivePrefill<Self::Logits>>, Error>
+    {
         if let Some((sources, environment)) = context.original_execution() {
             return (|| {
                 sources.validate_environment(environment)?;
@@ -231,7 +251,15 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
                 >(sources)?;
                 sources
                     .active_prefill()?
-                    .run_numerical(model, state, pass, cancellation, sources, environment)
+                    .run_numerical_observed(
+                        model,
+                        state,
+                        pass,
+                        cancellation,
+                        sources,
+                        environment,
+                        observer,
+                    )
                     .map(|outcome| {
                         outcome.map(|result| AutoregressivePrefill {
                             logits: result
@@ -243,34 +271,11 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
             })()
             .map_err(|cause| sources.retain_error(cause));
         }
-        let sample = match pass {
-            AutoregressivePass::TargetPrefill => true,
-            AutoregressivePass::DraftPrefill => false,
-            _ => {
-                return Err(Error::InvalidOperation(
-                    "non-prefill pass entered selected prefill",
-                ));
-            }
-        };
-        input
-            .with_borrowed(|input| {
-                model.erased_mut().autoregressive_prefill(
-                    input,
-                    &mut state.native,
-                    sample,
-                    cancellation,
-                    &state.stream,
-                )
-            })
-            .map(|outcome| {
-                outcome.map(|result| AutoregressivePrefill {
-                    logits: result
-                        .logits
-                        .map(super::sampling::logits::IndependentLogits::Ordinary),
-                    evaluated_tokens: result.evaluated_tokens,
-                })
-            })
+        Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))
     }
+
     fn decode(
         model: &mut Self::Model,
         tokens: &[u32],
@@ -282,12 +287,15 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
             let mut io = invocation.take_io()?;
             let tokens = io.input(tokens, pass, invocation.observer())?;
             invocation.begin_equation_construction()?;
-            let logits = model.erased_mut().autoregressive_forward_with_completion(
-                &tokens,
-                &mut state.native,
-                &state.stream,
-                &mut io.sequence_completion(&invocation),
-            )?;
+            let logits = invocation.with_observer(&state.stream, |observer| {
+                model.erased_mut().autoregressive_forward_with_completion(
+                    &tokens,
+                    &mut state.native,
+                    &state.stream,
+                    &mut io.sequence_completion(&invocation),
+                    observer,
+                )
+            })?;
             return io.finish(logits, &state.stream, &invocation);
         }
         let tokens = Array::from_slice(tokens, &[1, tokens.len() as i32]);
@@ -304,19 +312,35 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         continuation: &eredu_runtime::speculative::autoregressive::AutoregressiveContinuation,
         context: Self::Context<'_>,
     ) -> Result<(), Error> {
-        let Some((sources, environment)) = context.original_execution() else { return Ok(()); };
+        let Some((sources, environment)) = context.original_execution() else {
+            return Ok(());
+        };
         sources.validate_environment(environment)?;
         let controls = [
             std::mem::size_of::<SpeculativeExecutionStreams<'_>>(),
-            std::mem::size_of::<(&AutoregressiveSourcePair, &crate::backend::OriginalCopyEnvironment<'_>)>(),
+            std::mem::size_of::<(
+                &AutoregressiveSourcePair,
+                &crate::backend::OriginalCopyEnvironment<'_>,
+            )>(),
             std::mem::size_of::<Result<(), Error>>(),
-            std::mem::size_of::<Result<(), eredu_runtime::working_memory::SpeculativeContinuationError>>(),
+            std::mem::size_of::<
+                Result<(), eredu_runtime::working_memory::SpeculativeContinuationError>,
+            >(),
         ];
-        sources.metadata_funding().reserve_metadata(controls.into_iter()
-            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::HostMetadataFundingError::Overflow))?)
+        sources
+            .metadata_funding()
+            .reserve_metadata(
+                controls
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+                    .ok_or(Error::WorkspacePlanning(
+                        eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                    ))?,
+            )
             .map_err(Error::WorkspacePlanning)?;
-        sources.request().prepare_continuation(continuation, sources.metadata_funding())
+        sources
+            .request()
+            .prepare_continuation(continuation, sources.metadata_funding())
             .map_err(|cause| sources.retain_startup_error(cause))
     }
     fn occurrence_error(
@@ -328,9 +352,17 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         state.native.generation().map(Some)
     }
     fn invocation_input_positions(input: &Self::Input) -> Result<Option<usize>, Error> {
-        if let Some([batch,positions])=input.with_borrowed(|input| input.original_media().map(|packet|packet.shape())) {
-            if batch!=1 {return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));}
-            return usize::try_from(positions).map(Some).map_err(|_|Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow));
+        if let Some([batch, positions]) =
+            input.with_borrowed(|input| input.original_media().map(|packet| packet.shape()))
+        {
+            if batch != 1 {
+                return Err(Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                ));
+            }
+            return usize::try_from(positions).map(Some).map_err(|_| {
+                Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow)
+            });
         }
         inspect_plain_input(input)
             .map(|source| source.map(|(positions, _)| positions))
@@ -345,9 +377,43 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         context: Self::Context<'_>,
         run: impl FnOnce(&mut Self::Model, &mut Self::State) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        Self::with_observed_invocation(
+            model,
+            state,
+            input,
+            claim,
+            context,
+            eredu_core::speculative::SpeculativeActivationPhase::Verification,
+            None,
+            |model, state, _| run(model, state),
+        )
+    }
+    fn with_observed_invocation<T>(
+        model: &mut Self::Model,
+        state: &mut Self::State,
+        input: Option<&Self::Input>,
+        claim: eredu_runtime::speculative::autoregressive::AutoregressiveOccurrenceClaim<'_>,
+        context: Self::Context<'_>,
+        phase: eredu_core::speculative::SpeculativeActivationPhase,
+        observer: Option<
+            &mut dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Error>,
+        >,
+        run: impl FnOnce(
+            &mut Self::Model,
+            &mut Self::State,
+            Option<
+                &mut dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Error>,
+            >,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let Some((sources, environment)) = context.original_execution() else {
+            if observer.is_some() {
+                return Err(Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+                ));
+            }
             Self::before_invocation(model, state, claim, context)?;
-            return run(model, state);
+            return run(model, state, None);
         };
         (|| {
             sources.validate_environment(environment)?;
@@ -378,24 +444,109 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
                         &initialized,
                         mechanisms,
                         sources.metadata_funding(),
-                        sources.request().capacity_bytes(),
+                        sources.request().limits().clone(),
                     )?)
                 } else {
                     None
                 };
-            PreparedAutoregressiveInvocation::prepare(
-                sources,
-                model,
-                state,
-                input,
-                claim,
-                prepared_prefill,
-            )
-            .and_then(|prepared| prepared.run(environment, run))
+            let prefill = claim.invocation().execution_pass() == eredu_runtime::ExpertPass::Prefill;
+            let positions = claim.invocation().positions();
+            let prospect = observer
+                .as_ref()
+                .map(|observer| {
+                    let width = if prefill {
+                        positions.min(
+                            usize::try_from(
+                                input
+                                    .ok_or(Error::PrefillScopeUnavailable)?
+                                    .with_borrowed(|input| input.prefill_chunk_positions())
+                                    .map(std::num::NonZeroU64::get)
+                                    .unwrap_or(
+                                        eredu_runtime::prefill::DEFAULT_PREFILL_CHUNK_POSITIONS,
+                                    ),
+                            )
+                            .map_err(|_| {
+                                Error::PrefillControl(
+                                    eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+                                )
+                            })?,
+                        )
+                    } else {
+                        positions
+                    };
+                    let span = if prefill {
+                        Some(eredu_core::speculative::SpeculativePrefillSpan {
+                            prompt_tokens: positions as u64,
+                            input_start: 0,
+                            input_end: width as u64,
+                            position: claim.frontier(),
+                            hidden_start: 0,
+                            token_start: 0,
+                            sequence: width as u64,
+                            seed_start: claim.frontier(),
+                        })
+                    } else {
+                        None
+                    };
+                    observer
+                        .original_speculative_capture_preview()
+                        .ok_or(Error::PrefillControl(
+                            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                        ))?
+                        .prepare_invocation(phase, width, span, 0)
+                        .map_err(|cause| sources.retain_startup_error(cause))
+                })
+                .transpose()?;
+            if prefill {
+                PreparedAutoregressiveInvocation::prepare_observed(
+                    sources,
+                    model,
+                    state,
+                    input,
+                    claim,
+                    prepared_prefill,
+                    prospect.as_ref(),
+                )?
+                .run(environment, |model, state| run(model, state, observer))
+            } else {
+                eredu_runtime::inspection::with_speculative_activation(
+                    observer,
+                    phase,
+                    positions,
+                    |receiver| {
+                        PreparedAutoregressiveInvocation::prepare_observed(
+                            sources,
+                            model,
+                            state,
+                            input,
+                            claim,
+                            prepared_prefill,
+                            prospect.as_ref(),
+                        )?
+                        .run_observed(
+                            environment,
+                            receiver,
+                            |model, state| run(model, state, None),
+                        )
+                    },
+                )
+            }
         })()
         .map_err(|cause| sources.retain_error(cause))
     }
 
+    fn activation_observer(
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+        request: eredu_core::SpeculativeRequestId,
+        context: Self::Context<'_>,
+    ) -> Result<
+        Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Error>>>,
+        eredu_core::speculative::SpeculativeControlError,
+    > {
+        crate::composition::mlx::prepared_speculative::original_activation_observer(
+            plan, request, context,
+        )
+    }
     fn checkpoint(state: &Self::State) -> Result<Self::Checkpoint, Error> {
         let copy = if let Some(original) = &state.original_copy {
             original.copy(state, None)?
@@ -420,7 +571,7 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
             ));
         }
-        let pool = context.memory_pool();
+        let pool = context.memory_ledger();
         Ok(MlxAutoregressiveState {
             native: saved.native.control_copy(&saved.stream, &pool)?,
             stream: saved.stream.clone(),
@@ -544,14 +695,25 @@ fn reserve_logits_transport<T>(sources: &AutoregressiveSourcePair) -> Result<(),
     let bytes = parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     sources
         .metadata_funding()
         .reserve_metadata(bytes)
         .map_err(Error::WorkspacePlanning)
 }
 
-#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod completed_leaf_tests;
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+pub(crate) mod capture_tests;

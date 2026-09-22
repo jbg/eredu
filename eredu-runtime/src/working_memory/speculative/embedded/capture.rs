@@ -11,11 +11,13 @@ use eredu_core::{SharedStorageIdentity, capture::CaptureUsage};
 /// owner supplies no native scope, role, source publication or capture claim.
 /// Its fixed host account and spending survive all aliases without reset.
 #[derive(Debug, Clone)]
-pub struct OriginalEmbeddedCaptureLineage {
+pub struct OriginalModelCaptureLineage {
     source: SharedStorageIdentity,
     ledger: CaptureRunLedger,
 }
-impl OriginalEmbeddedCaptureLineage {
+/// Embedded spelling for the same request-owned cumulative capture lineage.
+pub type OriginalEmbeddedCaptureLineage = OriginalModelCaptureLineage;
+impl OriginalModelCaptureLineage {
     /// Compare the exact source storage, without accepting equal declarations.
     pub fn validate_source(
         &self,
@@ -51,17 +53,22 @@ impl OriginalSpeculativeRequest {
     /// existing owner. Repeated calls allocate nothing and never refund usage.
     /// The fixed ledger account is admitted by the same actual request capacity
     /// and original account worker as its model roles, with no role consumed.
-    pub fn prepare_embedded_capture_lineage(
+    pub fn prepare_model_capture_lineage(
         &self,
         source: &OriginalCaptureSource,
-    ) -> Result<OriginalEmbeddedCaptureLineage, SpeculativeRequestError> {
+    ) -> Result<OriginalModelCaptureLineage, SpeculativeRequestError> {
         source.validate_pool(self.ticket.pool())?;
         self.ticket.status()?;
         let mut slots = self
             .slots
             .try_lock()
             .map_err(|_| WorkingMemoryError::AccountConstructionBusy)?;
-        if slots.closed || !matches!(self.identity, ScheduleIdentity::Embedded(_)) {
+        if slots.closed
+            || !matches!(
+                self.identity,
+                ScheduleIdentity::Embedded(_) | ScheduleIdentity::Autoregressive(_)
+            )
+        {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         if let Some(current) = &slots.model_capture {
@@ -69,15 +76,15 @@ impl OriginalSpeculativeRequest {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
             current.ledger.inspect_usage()?;
-            return Ok(OriginalEmbeddedCaptureLineage {
+            return Ok(OriginalModelCaptureLineage {
                 source: current.source.clone(),
                 ledger: current.ledger.clone(),
             });
         }
         let controls = [
-            size_of::<OriginalEmbeddedCaptureLineage>(),
+            size_of::<OriginalModelCaptureLineage>(),
             size_of::<Cumulative>(),
-            size_of::<Result<OriginalEmbeddedCaptureLineage, SpeculativeRequestError>>(),
+            size_of::<Result<OriginalModelCaptureLineage, SpeculativeRequestError>>(),
             size_of::<(&Self, &OriginalCaptureSource)>(),
             size_of::<std::sync::MutexGuard<'_, RoleSlots>>(),
             size_of::<Result<CaptureUsage, WorkingMemoryError>>(),
@@ -97,7 +104,7 @@ impl OriginalSpeculativeRequest {
         let ticket = accept(
             self.ticket.pool(),
             &self.execution,
-            self.capacity,
+            self.capacity.clone(),
             bytes,
             bytes,
         )?;
@@ -107,7 +114,7 @@ impl OriginalSpeculativeRequest {
                 ticket: Some(ticket),
             });
         }
-        let lineage = OriginalEmbeddedCaptureLineage {
+        let lineage = OriginalModelCaptureLineage {
             source: source.plan().storage_identity().clone(),
             ledger: CaptureRunLedger::new_request(ticket),
         };
@@ -120,20 +127,49 @@ impl OriginalSpeculativeRequest {
 
     /// Read the settled usage only when the exact retained request and source
     /// still own this same lineage. This starts no claim or ledger mutation.
-    pub fn inspect_embedded_capture_lineage_usage(
+    pub fn inspect_model_capture_lineage_usage(
         &self,
         source: &OriginalCaptureSource,
-        lineage: &OriginalEmbeddedCaptureLineage,
+        lineage: &OriginalModelCaptureLineage,
     ) -> Result<CaptureUsage, WorkingMemoryError> {
         source.validate_pool(self.ticket.pool())?;
         let slots = self
             .slots
             .try_lock()
             .map_err(|_| WorkingMemoryError::AccountConstructionBusy)?;
-        if slots.closed || !matches!(self.identity, ScheduleIdentity::Embedded(_)) {
+        if slots.closed
+            || !matches!(
+                self.identity,
+                ScheduleIdentity::Embedded(_) | ScheduleIdentity::Autoregressive(_)
+            )
+        {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         lineage.validate_current(source, slots.model_capture.as_ref())?;
         lineage.ledger.inspect_usage()
+    }
+}
+
+impl OriginalSpeculativeRequest {
+    /// Prepare the shared request lineage only for a genuine Embedded schedule.
+    pub fn prepare_embedded_capture_lineage(
+        &self,
+        source: &OriginalCaptureSource,
+    ) -> Result<OriginalEmbeddedCaptureLineage, SpeculativeRequestError> {
+        if !matches!(self.identity, ScheduleIdentity::Embedded(_)) {
+            return Err(WorkingMemoryError::IdentityMismatch.into());
+        }
+        self.prepare_model_capture_lineage(source)
+    }
+    /// Inspect an Embedded request's exact shared source lineage.
+    pub fn inspect_embedded_capture_lineage_usage(
+        &self,
+        source: &OriginalCaptureSource,
+        lineage: &OriginalEmbeddedCaptureLineage,
+    ) -> Result<CaptureUsage, WorkingMemoryError> {
+        if !matches!(self.identity, ScheduleIdentity::Embedded(_)) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.inspect_model_capture_lineage_usage(source, lineage)
     }
 }

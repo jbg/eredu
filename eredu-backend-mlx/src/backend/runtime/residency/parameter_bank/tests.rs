@@ -15,6 +15,8 @@ use super::*;
 use crate::tests::support::grouped_provider::ParameterBankSelection;
 use eredu_core::residency::CacheEvictionPolicy;
 use eredu_runtime::WeightBinding;
+#[path = "tests/publication.rs"]
+mod publication;
 
 fn stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -85,22 +87,16 @@ fn retained_bank_storage_counts_shared_replacements_without_materialization() {
         .unwrap();
     let value = Array::from_slice(&[1.25f32, -2.5], &[1, 2]);
     let bytes = value.allocation_info().unwrap().unwrap().bytes() as u64;
-    pool.inner
-        .lock()
-        .unwrap()
-        .parameter_replacements
-        .insert("weight".into(), MlxTensor::from_array(value.clone()));
+    pool.inner.lock().unwrap().parameter_replacements =
+        publication::replacement_values(MlxTensor::from_array(value.clone()));
     std::fs::remove_file(dir.path().join("model.safetensors")).unwrap();
     let mut retained = scope.retained_storage().unwrap();
     retained.merge(pool.retained_storage().unwrap()).unwrap();
     retained.include_array(&value).unwrap();
     assert_eq!(retained.byte_bound().unwrap(), Some(before + bytes));
     let lazy = value.square(&stream()).unwrap();
-    pool.inner
-        .lock()
-        .unwrap()
-        .parameter_replacements
-        .insert("weight".into(), MlxTensor::from_array(lazy.clone()));
+    pool.inner.lock().unwrap().parameter_replacements =
+        publication::replacement_values(MlxTensor::from_array(lazy.clone()));
     assert_eq!(
         scope.retained_storage().unwrap().byte_bound().unwrap(),
         None
@@ -842,6 +838,24 @@ fn indexed_movement_validates_before_loading_and_bank_coalesces_demand() {
             }
         ))
     ));
+    for values in [
+        Array::from_slice(&[2i32, 0, 2, 0], &[2, 2]),
+        Array::from_slice(&[2u32, 0, 2, 0], &[2, 2]),
+        Array::from_slice(&[2i64, 0, 2, 0], &[2, 2]),
+        Array::from_slice(&[2u64, 0, 2, 0], &[2, 2]),
+    ] {
+        let indices = MlxTensor::from_array(values);
+        assert_eq!(
+            movement.index_demands(&indices, 3, &execution).unwrap(),
+            [(0, 2), (2, 2)]
+        );
+        let remapped = movement.remap_indices(&indices, &[(0, 1), (2, 0)], &execution).unwrap();
+        assert_eq!(remapped.as_array().evaluated().unwrap().as_slice::<i32>(), [0, 1, 0, 1]);
+        assert!(matches!(
+            movement.remap_indices(&indices, &[(usize::MAX, 0)], &execution),
+            Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))
+        ));
+    }
 }
 
 #[test]

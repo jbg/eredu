@@ -48,6 +48,7 @@ impl BoundedCompletion for Done {
 }
 struct Mechanisms;
 impl AutoregressiveMechanisms for Mechanisms {
+    type Activation = NumericTensor;
     type Model = Model;
     type Input = Vec<u32>;
     type State = State;
@@ -87,7 +88,7 @@ impl AutoregressiveMechanisms for Mechanisms {
             output,
         };
         let execution = InferenceExecutionIdentity::default();
-        let request = InferenceRequest::without_memory_budget(&execution, geometry)
+        let request = crate::memory_fixture::request(&execution, geometry)
             .map_err(Error::backend_retained_source)?;
         let mut driver = PrefillDriver::new(&execution, request, geometry, cancellation.clone())
             .map_err(Error::backend_retained_source)?;

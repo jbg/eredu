@@ -1,13 +1,15 @@
 //! Baseline/reset/modified experiment through the ordinary facade generator.
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use eredu::api::{
-    ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings, PreparedChatRequest,
-    TokenizerSourceInput, TraceLimits, local_device_plan,
+    local_device_plan, ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings,
+    PreparedChatRequest, TokenizerSourceInput, TraceLimits,
 };
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    ExecutionPlan, GenerationConfigOverrides, ObservationSupportStatus, SessionCapabilities,
-    capture::*, intervention::*,
+    capture::*, intervention::*, ExecutionPlan, GenerationConfigOverrides,
+    ObservationSupportStatus, SessionCapabilities,
 };
 use std::ops::ControlFlow;
 
@@ -65,7 +67,6 @@ fn main() -> anyhow::Result<()> {
         limits: CaptureLimits {
             per_step: budget,
             cumulative: budget,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -81,7 +82,10 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 42,
@@ -104,7 +108,12 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .prepare_chat(
+            &source,
+            &policy,
+            &physical_memory::finite_each(CAPACITY)?,
+            &cancellation,
+        )?
         .ok_or_else(|| anyhow::anyhow!("cancelled before chat preparation"))?;
     let emit = |record: eredu::api::ControlledGenerationRecord| {
         println!(
@@ -113,7 +122,7 @@ fn main() -> anyhow::Result<()> {
         );
         ControlFlow::Continue(())
     };
-    let mut request = PreparedChatRequest::new(&chat, settings);
+    let mut request = PreparedChatRequest::new(&chat, settings.clone());
     request.capture = Some(&capture);
     eprintln!("Baseline");
     let mut run = model
@@ -143,7 +152,7 @@ fn main() -> anyhow::Result<()> {
             evidence: InterventionEvidence::Preview { max_elements: 8 },
         }],
     };
-    let mut request = PreparedChatRequest::new(&chat, settings);
+    let mut request = PreparedChatRequest::new(&chat, settings.clone());
     request.capture = Some(&capture);
     request.intervention = Some(&plan);
     let mut modified = model

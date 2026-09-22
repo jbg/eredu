@@ -46,7 +46,7 @@ TEST_CASE("CPU MXFP4 construction uses its shared bank and exact constant backin
     unsigned retired=0;
     struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity,&retired,
-        [](void* p){++*static_cast<unsigned*>(p);})==0);
+        [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     affine_construction_tests::Outputs escaped;
     {
       Role role;affine_construction_tests::replace_graph(role,layout.graph.allocation_extents);
@@ -95,7 +95,7 @@ TEST_CASE("CPU MXFP4 construction retires every refused constant prefix"
     unsigned retired=0;
     struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
     REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity-1,&retired,
-        [](void* p){++*static_cast<unsigned*>(p);})==0);
+        [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     {
       Role role;Observer observer;Bank bank;affine_construction_tests::Outputs outputs;
       REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);

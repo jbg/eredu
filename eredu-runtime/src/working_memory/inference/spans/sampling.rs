@@ -109,7 +109,8 @@ impl SamplingWorkspaceObserver for SamplingWorkspacePlanCollector<'_> {
         self.records.push(InferenceSpanWorkspaceRecord::new(
             InferenceWorkspaceSpan::Sampling(phase),
             trace,
-        ));
+            crate::working_memory::WorkspaceReportMetadata::new(self.context),
+        )?);
         Ok(())
     }
 }

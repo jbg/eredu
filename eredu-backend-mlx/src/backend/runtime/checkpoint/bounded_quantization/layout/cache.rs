@@ -2,8 +2,8 @@ use super::super::preflight::quantization_error;
 use super::super::{memory, Error, BOUNDED_QUANTIZATION_MAX_CACHE_BYTES};
 use crate::backend::ordinary_retirement::OrdinaryRetirement;
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use std::{cell::Cell, convert::Infallible};
 
@@ -63,7 +63,10 @@ pub(in super::super) struct CacheAdmissionError(
 impl CacheAdmissionError {
     pub(in super::super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
         eredu_core::BackendFailure::from_error(
-            self.0.into_parts().1.retire_output_and_map_error(|never| -> Infallible { match never {} }),
+            self.0
+                .into_parts()
+                .1
+                .retire_output_and_map_error(|never| -> Infallible { match never {} }),
         )
     }
 }
@@ -80,7 +83,7 @@ impl BoundedAllocatorCache {
     }
 
     pub(in super::super) fn prepare_original(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         working_set_limit_bytes: u64,
         window_control_bytes: usize,
     ) -> Result<Self, CacheAdmissionError> {
@@ -99,7 +102,7 @@ impl BoundedAllocatorCache {
     pub(in super::super) fn required_original_bytes(
         window_control_bytes: usize,
     ) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::shared_native_initialization_required_bytes(&Initializer {
+        MemoryLedger::shared_native_initialization_required_bytes(&Initializer {
             window_control_bytes,
         })
     }

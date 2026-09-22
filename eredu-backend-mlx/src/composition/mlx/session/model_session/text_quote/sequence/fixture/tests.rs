@@ -2,6 +2,8 @@ use super::*;
 use crate::composition::mlx::session::model_session::{
     disk_layerwise_tests as disk, host_layerwise_tests as host, text_funding, text_quote,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     ControlledTextGeneration, ControlledTextGenerationError, GenerationSequenceRequest,
@@ -12,21 +14,41 @@ use std::error::Error as _;
 
 type Runtime = ModelRuntime<MlxBackend<'static>>;
 mod prepared_residency;
-pub(in crate::composition::mlx::session::model_session::text_quote) use prepared_residency::PreparedResidencyFixture;
+pub(in crate::composition::mlx::session::model_session) use prepared_residency::PreparedResidencyFixture;
+thread_local! { static PROCESS_SOURCE_BASELINE: Cell<u64> = const {Cell::new(0)}; }
 pub(in crate::composition::mlx::session::model_session::text_quote) fn stream() -> Stream {
-    Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
+    let streams =
+        crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_factory(&pool)
+            .unwrap()
+            .expect("original native stream factory");
+    let stream = streams.execution().clone();
+    disk::reclaim();
+    PROCESS_SOURCE_BASELINE.with(|baseline| {
+        if baseline.get() == 0 {
+            baseline.set(pool.fixture_host_charge().unwrap());
+        }
+    });
+    stream
 }
 pub(in crate::composition::mlx::session::model_session::text_quote) fn load(
-    stream: &Stream,
-    pool: &WorkingMemoryPool,
+    _stream: &Stream,
+    pool: &MemoryLedger,
     route: usize,
 ) -> (Runtime, tempfile::TempDir) {
-    match route {
-        0 => host::runtime(stream, pool, None),
-        1 => host::runtime(stream, pool, Some(1)),
-        2 => disk::load_runtime(stream, pool, true),
-        _ => unreachable!(),
-    }
+    assert!(pool.same_ledger(&crate::backend::managed_memory::ledger()));
+    disk::reclaim();
+    let before = pool.fixture_host_charge().unwrap();
+    let (target, artifact) = prepared_residency::target(route, None);
+    let after = pool.fixture_host_charge().unwrap();
+    let birth = after
+        .checked_sub(before)
+        .expect("factory source birth before model materialization");
+    PROCESS_SOURCE_BASELINE
+        .with(|baseline| baseline.set(baseline.get().checked_add(birth).unwrap()));
+    let runtime = target.into_runtime().unwrap();
+    runtime.backend().validate_original_stream_owners().unwrap();
+    (runtime, artifact)
 }
 pub(in crate::composition::mlx::session::model_session::text_quote) fn config(
     maximum: usize,
@@ -37,7 +59,7 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn config(
     sampling.max_new_tokens = Some(maximum);
     TextGenerationConfig::new(sampling)
         .with_seed(19)
-        .with_inference_policy(original.inference_policy())
+        .with_inference_policy(original.inference_policy().clone())
 }
 /// Explicit component ceilings shared by genuine C1/C2/C3 prefill fixtures.
 /// As in the existing native graph fixture, 1 MiB is an enforced caller Record
@@ -45,11 +67,11 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn config(
 pub(in crate::composition::mlx::session::model_session::text_quote) fn chunked_original(
     config: TextGenerationConfig,
 ) -> TextGenerationConfig {
-    let mut policy = config.inference_policy();
+    let mut policy = config.inference_policy().clone();
     policy.prefill_chunk_positions = std::num::NonZeroU64::new(2);
     policy.graph_metadata_capacity_bytes = std::num::NonZeroU64::new(4 << 20);
     policy.submission_tracking_capacity_bytes = std::num::NonZeroU64::new(1 << 20);
-    config.with_inference_policy(policy)
+    config.with_inference_policy(policy.clone())
 }
 pub(in crate::composition::mlx::session::model_session::text_quote) fn source(
     runtime: &Runtime,
@@ -103,9 +125,14 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn finish(
 }
 #[track_caller]
 pub(in crate::composition::mlx::session::model_session::text_quote) fn settle(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
 ) {
+    let bytes = if pool.same_ledger(&crate::backend::managed_memory::ledger()) {
+        bytes.checked_add(PROCESS_SOURCE_BASELINE.get()).unwrap()
+    } else {
+        bytes
+    };
     let caller = std::panic::Location::caller();
     let started = std::time::Instant::now();
     let mut reported = false;
@@ -114,12 +141,15 @@ pub(in crate::composition::mlx::session::model_session::text_quote) fn settle(
             .unwrap()
             .synchronize()
             .unwrap();
+        safemlx::memory::clear_cache();
         disk::reclaim();
-        let used = pool.used_bytes().unwrap();
+        let used = pool.fixture_host_charge().unwrap();
         let unquoted = pool.unquoted_owner_count().unwrap();
         let complete = used == bytes && unquoted == 0;
         if !complete && !reported && started.elapsed().as_secs() >= 9 {
-            eprintln!("native fixture retirement at {caller}: expected={bytes}, used={used}, unquoted={unquoted}");
+            eprintln!(
+                "native fixture retirement at {caller}: expected={bytes}, used={used}, unquoted={unquoted}"
+            );
             reported = true;
         }
         complete
@@ -154,9 +184,10 @@ fn start_with_decoder(
     capture: Option<&SharedCapturePlan>,
     decoder: Option<&dyn eredu_core::GenerationDecoderInput>,
 ) -> Result<RetainedGenerationSequence, BackendFailure> {
-    let input = TextGenerationInput::TokenIds(vec![2, 5, 7]);
+    let input = eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap();
     let options = capture.map(|source| TextPreparationOptions {
-        interventions: None, capture: Some(source.clone()),
+        interventions: None,
+        capture: Some(source.clone()),
     });
     let claim = GenerationSequenceRequest::new(maximum, eos);
     let claim = if let Some(decoder) = decoder {
@@ -166,7 +197,7 @@ fn start_with_decoder(
     };
     match route {
         0 => {
-            let mut run = TextGeneration::from_input_with_sequence(
+            let mut run = TextGeneration::from_token_ids_with_sequence(
                 runtime,
                 input,
                 config(maximum, capacity),
@@ -179,7 +210,7 @@ fn start_with_decoder(
             Ok(sequence)
         }
         1 => {
-            let mut run = ControlledTextGeneration::from_input_with_sequence(
+            let mut run = ControlledTextGeneration::from_token_ids_with_sequence(
                 runtime,
                 input,
                 config(maximum, capacity),
@@ -198,7 +229,7 @@ fn start_with_decoder(
         _ => {
             let mut driver = TextGenerationDriver::new(runtime);
             let mut run = driver
-                .start_input_with_sequence(
+                .start_token_ids_with_sequence(
                     input,
                     config(maximum, capacity),
                     disk::Controller::default(),
@@ -218,11 +249,14 @@ fn start_with_decoder(
 
 #[test]
 fn original_native_sequence_admission_uses_actual_core_drivers_and_residency() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for residency in 0..3 {
         for driver in 0..3 {
             for capture in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::tests::support::test_utils::initialize_original_sources();
                 let (mut runtime, _artifact) = load(&stream, &pool, residency);
                 let source = capture.then(|| source(&runtime));
                 let probe = Probe::new(&runtime, source.as_ref(), false);
@@ -276,16 +310,19 @@ fn original_native_sequence_admission_uses_actual_core_drivers_and_residency() {
 
 #[test]
 fn original_native_sequence_exact_quote_and_short_admission_precede_prompt() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for (capture, rows) in [(false, false), (true, false), (true, true)] {
         let mut required = None;
         let mut r = None;
         for pass in 0..3 {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::tests::support::test_utils::initialize_original_sources();
             let (mut runtime, _artifact) = load(&stream, &pool, 0);
             let source = capture.then(|| source(&runtime));
             let probe = Probe::new(&runtime, source.as_ref(), rows);
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.fixture_host_charge().unwrap();
             let inputs = paths::session_input_creation_attempts();
             let native = paths::snapshot();
             let capacity = required.map_or(u64::MAX, |required| {
@@ -296,13 +333,15 @@ fn original_native_sequence_exact_quote_and_short_admission_precede_prompt() {
                 let error = result.unwrap_err();
                 assert!(matches!(
                     cause::<WorkingMemoryError>(&error),
-                    WorkingMemoryError::BudgetExceeded { .. }
+                    WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    )
                 ));
                 assert!(probe.0.admitted.borrow().is_none());
                 assert_eq!(probe.0.calls.get(), 0);
                 assert_eq!(paths::session_input_creation_attempts(), inputs);
                 assert_eq!(paths::snapshot(), native);
-                assert_eq!(pool.used_bytes().unwrap(), baseline);
+                assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
             } else {
                 let sequence = result.unwrap();
                 let facts = probe.facts();
@@ -325,8 +364,11 @@ fn original_native_sequence_exact_quote_and_short_admission_precede_prompt() {
 
 #[test]
 fn native_sequence_replays_busy_and_foreign_preflight_retain_no_owner() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     let sequence = start(&mut runtime, 4, &[], 0, u64::MAX, None).unwrap();
@@ -340,7 +382,7 @@ fn native_sequence_replays_busy_and_foreign_preflight_retain_no_owner() {
             .iter()
             .all(|error| error.source().unwrap().is::<Rejection>())
     );
-    let other_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let other_pool = crate::tests::support::test_utils::initialize_original_sources();
     let (other, _other_artifact) = load(&stream, &other_pool, 0);
     let foreign = std::array::from_fn::<_, 128, _>(|_| {
         super::super::preflight(&other, preparation.request.as_ref().unwrap(), quote)
@@ -359,7 +401,7 @@ fn native_sequence_replays_busy_and_foreign_preflight_retain_no_owner() {
     settle(&pool, 0);
     settle(&other_pool, 0);
     drop((errors, foreign));
-    let busy_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let busy_pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut busy_runtime, _busy_artifact) = load(&stream, &busy_pool, 0);
     let busy_probe = Probe::new(&busy_runtime, None, false);
     busy_probe.mode(Mode::Busy);
@@ -386,8 +428,11 @@ fn native_sequence_replays_busy_and_foreign_preflight_retain_no_owner() {
 
 #[test]
 fn native_sequence_foreign_genuine_claim_consumes_only_the_original_bank() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::Defer);
@@ -426,9 +471,12 @@ fn native_sequence_foreign_genuine_claim_consumes_only_the_original_bank() {
 
 #[test]
 fn native_sequence_fenced_consumed_bank_and_provider_error_keep_original_hold() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for consumed in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
         let probe = Probe::new(&runtime, None, false);
         probe.mode(if consumed {
@@ -472,9 +520,12 @@ fn native_sequence_fenced_consumed_bank_and_provider_error_keep_original_hold() 
 
 #[test]
 fn native_sequence_zero_and_dormant_cancel_do_not_refund_original_result_storage() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for maximum in [0, 4] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
         let probe = Probe::new(&runtime, None, false);
         let mut sequence = start(&mut runtime, maximum, &[], 0, u64::MAX, None).unwrap();
@@ -498,6 +549,9 @@ fn native_sequence_zero_and_dormant_cancel_do_not_refund_original_result_storage
 
 #[test]
 fn native_sequence_real_predictions_and_capture_rows_share_original_result_bank() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     run_real_prediction(false);
 }
 fn run_real_prediction(with_decoder: bool) {
@@ -506,12 +560,13 @@ fn run_real_prediction(with_decoder: bool) {
     let mut reference = None;
     for residency in 0..3 {
         for capture in [false, true] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::tests::support::test_utils::initialize_original_sources();
             let (mut runtime, _artifact) = load(&stream, &pool, residency);
             let source = capture.then(|| source(&runtime));
             let probe = Probe::new(&runtime, source.as_ref(), capture && residency == 0);
             let options = source.as_ref().map(|source| TextPreparationOptions {
-                interventions: None, capture: Some(source.clone()),
+                interventions: None,
+                capture: Some(source.clone()),
             });
             let decoder = with_decoder.then(|| decoder::input(4));
             let mut claim = GenerationSequenceRequest::new(4, &[]);
@@ -521,11 +576,14 @@ fn run_real_prediction(with_decoder: bool) {
             let mut decoded = String::new();
             let mut driver = TextGenerationDriver::new(&mut runtime);
             let mut run = driver
-                .start_input_with_sequence(
-                    TextGenerationInput::TokenIds(vec![2, 5, 7]),
+                .start_token_ids_with_sequence(
+                    eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap(),
                     config(4, u64::MAX).with_inference_policy(eredu_core::TextInferencePolicy {
                         prefill_chunk_positions: std::num::NonZeroU64::new(2),
-                        managed_memory_capacity_bytes: Some(u64::MAX),
+                        memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                            "host".into(),
+                            eredu_core::MemoryLimit::Finite(u64::MAX),
+                        )]),
                         submission_tracking_capacity_bytes: None,
                         graph_metadata_capacity_bytes: None,
                     }),
@@ -627,8 +685,11 @@ fn run_real_prediction(with_decoder: bool) {
 
 #[test]
 fn native_sequence_taken_bank_stays_spent_after_unwind() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::PanicAfterTake);
@@ -664,10 +725,13 @@ fn native_sequence_taken_bank_stays_spent_after_unwind() {
 
 #[test]
 fn native_sequence_actual_claim_prices_exact_token_and_eos_requested_layout_delta() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     let mut small = None;
     for (maximum, eos) in [(2, vec![99, 97]), (5, vec![99, 97, 99, 101])] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
         let probe = Probe::new(&runtime, None, false);
         let mut sequence = start(&mut runtime, maximum, &eos, 0, u64::MAX, None).unwrap();
@@ -690,10 +754,12 @@ fn native_sequence_actual_claim_prices_exact_token_and_eos_requested_layout_delt
 
 #[test]
 fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
-    use crate::composition::mlx::session::model_session::saved_array_copy::PreparedTextArrayCopy;
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     // A stopped genuine admission still owns its unextracted original bank.
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::Defer);
@@ -701,14 +767,17 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
     let preparation = probe.take();
     let quote = preparation.quote.as_ref().unwrap();
     assert!(quote.sequence.as_ref().unwrap().pending.borrow().is_some());
-    let before = (pool.used_bytes().unwrap(), paths::snapshot());
+    let before = (pool.fixture_host_charge().unwrap(), paths::snapshot());
     let failure = quote.validate_capture_copy().unwrap_err();
     assert!(matches!(
         cause::<WorkingMemoryError>(&failure),
         WorkingMemoryError::UnknownBound
     ));
     assert!(quote.sequence.as_ref().unwrap().pending.borrow().is_some());
-    assert_eq!((pool.used_bytes().unwrap(), paths::snapshot()), before);
+    assert_eq!(
+        (pool.fixture_host_charge().unwrap(), paths::snapshot()),
+        before
+    );
     drop((preparation, probe));
     finish(runtime, &stream);
     settle(&pool, 0);
@@ -716,13 +785,13 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
 
     // The historical retained-sequence claim still rejects the public copy
     // boundary after its one result bank has moved out successfully.
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     let mut driver = TextGenerationDriver::new(&mut runtime);
     let mut run = driver
-        .start_input_with_sequence(
-            TextGenerationInput::TokenIds(vec![2, 5, 7]),
+        .start_token_ids_with_sequence(
+            eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap(),
             config(4, u64::MAX),
             disk::Controller::default(),
             None,
@@ -732,7 +801,7 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
     let mut sequence = driver.take_prepared_sequence(&mut run).unwrap().unwrap();
     let preparation = probe.take();
     let held = probe.facts().held;
-    let before = (pool.used_bytes().unwrap(), paths::snapshot());
+    let before = (pool.fixture_host_charge().unwrap(), paths::snapshot());
     let rejected = driver
         .quiescent(&mut run)
         .err()
@@ -741,7 +810,10 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
         cause::<eredu_core::GenerationSequenceAdmissionError>(&rejected),
         eredu_core::GenerationSequenceAdmissionError::CopyNotAdmitted
     ));
-    assert_eq!((pool.used_bytes().unwrap(), paths::snapshot()), before);
+    assert_eq!(
+        (pool.fixture_host_charge().unwrap(), paths::snapshot()),
+        before
+    );
     assert!(
         preparation
             .quote
@@ -767,7 +839,7 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
     // Intercept the actual completed native Sampling value at its return into
     // core. The typed setup failure ends the core borrow; it grants no live
     // continuation or copy permission. No replacement state is constructed.
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::TakeSampling);
@@ -776,11 +848,11 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
     sampling_config.temperature = 0.7;
     let config = TextGenerationConfig::new(sampling_config)
         .with_seed(initial.seed())
-        .with_inference_policy(initial.inference_policy());
+        .with_inference_policy(initial.inference_policy().clone());
     let mut driver = TextGenerationDriver::new(&mut runtime);
     let rejected = driver
-        .start_input_with_sequence(
-            TextGenerationInput::TokenIds(vec![2, 5, 7]),
+        .start_token_ids_with_sequence(
+            eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap(),
             config,
             disk::Controller::default(),
             None,
@@ -805,15 +877,18 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
             .allocation_info()
             .unwrap();
         let before = (
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
             paths::snapshot(),
             sampling.next_prediction,
         );
         for _ in 0..16 {
-            let failure = PreparedTextArrayCopy::prepare(&runtime, sampling, None)
-                .err()
-                .unwrap();
+            let failure = preparation
+                .quote
+                .as_ref()
+                .unwrap()
+                .validate_capture_copy()
+                .unwrap_err();
             assert!(matches!(
                 cause::<WorkingMemoryError>(&failure),
                 WorkingMemoryError::UnknownBound
@@ -821,8 +896,8 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
         }
         assert_eq!(
             (
-                pool.used_bytes().unwrap(),
-                pool.peak_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
+                pool.fixture_host_peak().unwrap(),
                 paths::snapshot(),
                 sampling.next_prediction
             ),
@@ -861,10 +936,13 @@ fn native_sequence_saved_copy_rejects_before_source_or_destination_work() {
 
 #[test]
 fn claimed_work_rejection_retains_original_error_and_quarantines_only_foreign_scope() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     // The fault swaps two real admitted scopes only after the actual native
     // permit claim. This is internal fault injection, not a public input route.
     let stream = stream();
-    let foreign_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut foreign_runtime, _foreign_artifact) = load(&stream, &foreign_pool, 0);
     let foreign_probe = Probe::new(&foreign_runtime, None, false);
     foreign_probe.mode(Mode::Defer);
@@ -875,15 +953,15 @@ fn claimed_work_rejection_retains_original_error_and_quarantines_only_foreign_sc
     let foreign_scope = foreign_run.scope().unwrap();
     drop((foreign_probe, rejected));
 
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::ReplaceWorkScope);
     probe.foreign_scope(foreign_scope);
     let mut driver = TextGenerationDriver::new(&mut runtime);
     let mut run = driver
-        .start_input_with_sequence(
-            TextGenerationInput::TokenIds(vec![2, 5, 7]),
+        .start_token_ids_with_sequence(
+            eredu_core::TokenIdsInputPlan::new(&[2, 5, 7]).unwrap(),
             config(4, u64::MAX),
             disk::Controller::default(),
             None,
@@ -922,7 +1000,7 @@ fn claimed_work_rejection_retains_original_error_and_quarantines_only_foreign_sc
         Err(WorkingMemoryError::ExecutionFenced)
     ));
     assert!(matches!(
-        foreign_run.validate_reservation(foreign_quote.request().memory_reservation().unwrap()),
+        foreign_run.validate_reservation(foreign_quote.request().memory_reservation()),
         Err(WorkingMemoryError::ExecutionFenced)
     ));
     assert!(
@@ -940,11 +1018,11 @@ fn claimed_work_rejection_retains_original_error_and_quarantines_only_foreign_sc
     drop((sequence, run, driver, preparation, probe));
     finish(runtime, &stream);
     settle(&pool, held);
-    let foreign_retained = foreign_pool.used_bytes().unwrap();
+    let foreign_retained = foreign_pool.fixture_host_charge().unwrap();
     drop(failure);
     settle(&pool, 0);
     assert_eq!(
-        foreign_pool.used_bytes().unwrap(),
+        foreign_pool.fixture_host_charge().unwrap(),
         foreign_retained,
         "original error never refunds or adopts the foreign quarantined account"
     );
@@ -955,8 +1033,11 @@ fn claimed_work_rejection_retains_original_error_and_quarantines_only_foreign_sc
 
 #[test]
 fn consumed_installation_error_keeps_original_source_and_replays_add_no_custody() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime);
     let source_bytes = source.capacity_bytes().unwrap();
@@ -1023,7 +1104,7 @@ fn consumed_installation_error_keeps_original_source_and_replays_add_no_custody(
         pool.pin_registered_storage([(paths_key.clone(), paths_bytes)])
             .unwrap(),
     );
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.fixture_host_charge().unwrap(), protected);
     drop(failure);
     settle(&pool, 0);
     assert!(matches!(
@@ -1040,14 +1121,17 @@ fn consumed_installation_error_keeps_original_source_and_replays_add_no_custody(
 
 #[test]
 fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admission() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     // Genuine core claim + private row proposal + original seal/installation.
     // No prediction is submitted: isolate the weak's accounting tail without
     // an independently surviving newly published KV backing or captured frame.
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     runtime.synchronize().unwrap();
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     // Retain only the detached key, never a second paths/source payload owner.
     // This registration precedes the original run and is already in baseline.
     let (paths_key, paths_bytes) = {
@@ -1071,7 +1155,7 @@ fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admiss
         pool.pin_registered_storage([(paths_key.clone(), paths_bytes)])
             .unwrap(),
     );
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     let mut required = None;
     for _ in 0..2 {
         let source = source(&runtime);
@@ -1172,7 +1256,7 @@ fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admiss
             ])
             .unwrap(),
         );
-        assert_eq!(pool.used_bytes().unwrap(), weak_tail);
+        assert_eq!(pool.fixture_host_charge().unwrap(), weak_tail);
         assert_eq!(
             runtime
                 .session()
@@ -1207,7 +1291,7 @@ fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admiss
                 .unwrap(),
             (true, false)
         );
-        assert_eq!(pool.used_bytes().unwrap(), weak_tail);
+        assert_eq!(pool.fixture_host_charge().unwrap(), weak_tail);
         // No native allocation/execution occurred under this actual lease.
         drop(lease);
         runtime.session().authority.borrow().require_idle().unwrap();
@@ -1230,7 +1314,7 @@ fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admiss
                 .unwrap(),
             (true, false)
         );
-        assert_eq!(pool.used_bytes().unwrap(), weak_tail);
+        assert_eq!(pool.fixture_host_charge().unwrap(), weak_tail);
         drop(busy);
         // Inject only the existing outer poison condition, with no failed
         // native submission or completion claim. The ordinary boundary must
@@ -1254,7 +1338,7 @@ fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admiss
                 .unwrap(),
             (true, false)
         );
-        assert_eq!(pool.used_bytes().unwrap(), weak_tail);
+        assert_eq!(pool.fixture_host_charge().unwrap(), weak_tail);
         drop(restore);
         runtime.synchronize().unwrap();
         assert_eq!(
@@ -1278,7 +1362,7 @@ fn expired_rows_release_only_at_explicit_idle_boundary_and_reuse_original_admiss
             pool.pin_registered_storage([(paths_key.clone(), paths_bytes)])
                 .unwrap(),
         );
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         assert_eq!(semantic_drops.get(), 1);
     }
     finish(runtime, &stream);
@@ -1294,3 +1378,7 @@ mod decoder;
 pub(in crate::composition::mlx::session::model_session::text_quote) mod token_input;
 
 mod scoped_completion;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

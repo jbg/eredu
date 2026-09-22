@@ -1,6 +1,6 @@
 //! Common concrete original file-byte destination, private to the two fresh
 //! tokenizer/chat constructors. No public adoption, extraction or callback API.
-use super::{loaded_decode_source::Allowance, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError, loaded_decode_source::Allowance};
 use eredu_checkpoint::artifact::{ArtifactFileReadFailure, PreparedArtifactFileRead};
 use std::{collections::TryReserveError, mem::size_of};
 
@@ -74,14 +74,14 @@ pub(super) fn control_bytes() -> Option<usize> {
 /// Admit the caller's concrete checked I population and execute the one actual
 /// reserve/read. Returns idle retained bytes so fresh J/C coexist in the pool.
 pub(super) fn read(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     read: PreparedArtifactFileRead,
     destination: Destination,
     after_admission: impl FnOnce(&mut usize),
 ) -> Result<Input, Failure> {
     let required = match destination {
-        Destination::Tokenizer => WorkingMemoryPool::tokenizer_file_required_bytes(&read),
-        Destination::Chat => WorkingMemoryPool::chat_template_file_required_bytes(&read),
+        Destination::Tokenizer => MemoryLedger::tokenizer_file_required_bytes(&read),
+        Destination::Chat => MemoryLedger::chat_template_file_required_bytes(&read),
     }
     .map_err(Failure::rejected)?;
     let allowance = pool

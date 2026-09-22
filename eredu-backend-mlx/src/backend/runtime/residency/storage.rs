@@ -7,24 +7,29 @@ use safemlx::{Array, ImmutableHostTransferBuffer};
 
 use super::manager::{ResidencyError, RetainedHostBuffer};
 
-pub(crate) mod filled_host;
-mod attachment;
 mod array;
+mod attachment;
+pub(crate) mod filled_host;
 pub(crate) use array::RetainedArray;
-pub(crate) use attachment::{PublishedAllocation, RetainedAllocationReceipt};
+pub(crate) use attachment::{
+    PublishedAllocation, RetainedAllocationReceipt, RetainedAllocationSource,
+};
 
 mod borrowed;
+pub(crate) use borrowed::{visit_checkpoint_storage, RetainedStorageVisitFailure};
 pub(crate) use borrowed::{RetainedStorageInspectionError, RetainedStorageRef};
-pub(crate) use borrowed::{RetainedStorageVisitFailure, visit_checkpoint_storage};
 
 mod admission;
 pub(crate) mod native_storage;
 mod original;
 pub use admission::RetainedStorageReservation;
-pub(crate) use admission::StorageIdentity;
 pub(crate) use admission::{
-    CopyPublicationLayout, PendingCopyPublication, PendingNativePublication,
-    RetainedStoragePublication, retain_copy_publication_failure,
+    generic_storage_publication_layout, prepare_funded_storage_publication,
+    prepare_storage_publication, StorageIdentity,
+};
+pub(crate) use admission::{
+    retain_copy_publication_failure, CopyPublicationLayout, PendingCopyPublication,
+    PendingNativePublication, RetainedStoragePublication,
 };
 
 /// A retained inventory of native arrays, immutable transfer buffers and exact
@@ -72,10 +77,15 @@ enum NativeEntry<T> {
 }
 impl<T> NativeEntry<T> {
     fn owned(&self) -> Option<&(u64, T)> {
-        match self { Self::Owned(value) => Some(value), Self::Attached(_) => None }
+        match self {
+            Self::Owned(value) => Some(value),
+            Self::Attached(_) => None,
+        }
     }
     fn bytes(&self) -> u64 {
-        match self { Self::Owned((bytes, _)) | Self::Attached(bytes) => *bytes }
+        match self {
+            Self::Owned((bytes, _)) | Self::Attached(bytes) => *bytes,
+        }
     }
 }
 
@@ -148,8 +158,14 @@ impl RetainedStorage {
         // A prepared clone shell belongs to this inventory's raw custody. Bare
         // extraction would let that shell outlive its charge. Keep the complete
         // input on refusal; census is observational and owns no array rows.
-        if self.original.is_some() || self.census.is_some()
-            || self.arrays.values().any(|entry| entry.owned().is_some_and(|(_, array)| array.canonical().is_some())) {
+        if self.original.is_some()
+            || self.census.is_some()
+            || self.arrays.values().any(|entry| {
+                entry
+                    .owned()
+                    .is_some_and(|(_, array)| array.canonical().is_some())
+            })
+        {
             return Err((
                 original::failure(
                     eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
@@ -160,7 +176,11 @@ impl RetainedStorage {
         Ok(self
             .arrays
             .into_values()
-            .filter_map(|entry| match entry { NativeEntry::Owned((_, RetainedArray::Plain(array))) => Some(array), NativeEntry::Attached(_) => None, NativeEntry::Owned(_) => unreachable!("canonical owners refused above") })
+            .filter_map(|entry| match entry {
+                NativeEntry::Owned((_, RetainedArray::Plain(array))) => Some(array),
+                NativeEntry::Attached(_) => None,
+                NativeEntry::Owned(_) => unreachable!("canonical owners refused above"),
+            })
             .chain(self.unknown_arrays))
     }
 
@@ -238,7 +258,12 @@ impl RetainedStorage {
             .map_err(array_inspection_error)?;
         if let Some(census) = &mut self.census {
             match info {
-                Some(info) if info.bytes() != 0 => census.add()?,
+                Some(info) if info.bytes() != 0 => {
+                    census.add()?;
+                    if info.host_control_bytes() != 0 {
+                        census.add()?;
+                    }
+                }
                 Some(_) => {}
                 None => self.incomplete = true,
             }
@@ -297,7 +322,12 @@ impl RetainedStorage {
                 .try_allocation_info()
                 .map_err(ResidencyError::OriginalArrayInspection)?
             {
-                Some(info) if info.bytes() != 0 => census.add()?,
+                Some(info) if info.bytes() != 0 => {
+                    census.add()?;
+                    if info.host_control_bytes() != 0 {
+                        census.add()?;
+                    }
+                }
                 Some(_) => {}
                 None => self.incomplete = true,
             }
@@ -344,7 +374,10 @@ impl RetainedStorage {
                     let retained = array
                         .try_clone_for_inspection()
                         .map_err(array_inspection_error)?;
-                    self.arrays.insert(info.identity(), NativeEntry::Owned((bytes, retained.into())));
+                    self.arrays.insert(
+                        info.identity(),
+                        NativeEntry::Owned((bytes, retained.into())),
+                    );
                 }
             }
             None => {
@@ -385,14 +418,17 @@ impl RetainedStorage {
         let identity = info.identity();
         let bytes = checked_bytes(info.bytes())?;
         if let Some(census) = &mut self.census {
-            if bytes != 0 {
+            if bytes != 0 || info.host_control_bytes() != 0 {
                 census.add()?;
+                if info.host_control_bytes() != 0 {
+                    census.add()?;
+                }
             }
             return Ok(());
         }
         self.check_backing_capacity(identity, bytes)?;
         if let Some(original) = self.original.as_mut() {
-            if bytes == 0 {
+            if bytes == 0 && info.host_control_bytes() == 0 {
                 return Ok(());
             }
             return original.insert(
@@ -402,8 +438,9 @@ impl RetainedStorage {
         }
         if let Some(prior) = self.hosts.get(&identity) {
             require_same_capacity(prior.bytes(), bytes)?;
-        } else if bytes != 0 {
-            self.hosts.insert(identity, NativeEntry::Owned((bytes, buffer)));
+        } else if bytes != 0 || info.host_control_bytes() != 0 {
+            self.hosts
+                .insert(identity, NativeEntry::Owned((bytes, buffer)));
         }
         Ok(())
     }
@@ -466,12 +503,25 @@ impl RetainedStorage {
     /// Retains an immutable byte allocation, such as a buffered cache shard.
     /// Arc slices have no spare payload capacity beyond their length.
     pub(crate) fn include_bytes(&mut self, bytes: Arc<[u8]>) {
-        if self.census.is_some() {
-            self.incomplete |= !bytes.is_empty();
+        if let Some(census) = &mut self.census {
+            if !bytes.is_empty() {
+                if census.original {
+                    self.incomplete = true;
+                } else if census.add().is_err() {
+                    census.overflowed = true;
+                }
+            }
             return;
         }
         if let Some(original) = self.original.as_mut() {
             if !bytes.is_empty() {
+                if original.custody().is_ordinary() {
+                    let key = StorageIdentity::from_bytes(&bytes);
+                    self.incomplete |= original
+                        .insert(Some(key), original::Value::Bytes(bytes))
+                        .is_err();
+                    return;
+                }
                 let _ = original.refuse(original::Value::Bytes(bytes));
                 self.incomplete = true;
             }
@@ -491,7 +541,15 @@ impl RetainedStorage {
         owner: eredu_runtime::SharedHostMetadata,
     ) -> Result<(), ResidencyError> {
         if let Some(census) = &mut self.census {
-            match owner.validate_original_attachment(census.pool.shared_storage_domain()) {
+            if !census.original {
+                if owner.capacity_bytes().is_some() {
+                    census.add()?;
+                } else {
+                    self.incomplete = true;
+                }
+                return Ok(());
+            }
+            match owner.validate_original_attachment(census.pool.shared_storage_accounting_id()) {
                 Ok(()) => {
                     if owner.capacity_bytes().is_some() {
                         census.add()?;
@@ -541,7 +599,15 @@ impl RetainedStorage {
         token: eredu_runtime::HostSlotMetadata,
     ) -> Result<(), ResidencyError> {
         if let Some(census) = &mut self.census {
-            match token.validate_original_attachment(census.pool.shared_storage_domain()) {
+            if !census.original {
+                if token.capacity_bytes().is_some() {
+                    census.add()?;
+                } else {
+                    self.incomplete = true;
+                }
+                return Ok(());
+            }
+            match token.validate_original_attachment(census.pool.shared_storage_accounting_id()) {
                 Ok(()) => {
                     if token.capacity_bytes().is_some() {
                         census.add()?;
@@ -590,11 +656,23 @@ impl RetainedStorage {
         &mut self,
         owner: eredu_core::capture::SharedCapturePlan,
     ) -> Result<(), ResidencyError> {
-        if self.census.is_some() {
-            self.incomplete = true;
+        if let Some(census) = &mut self.census {
+            if !census.original && owner.capacity_bytes().is_some() {
+                census.add()?;
+            } else {
+                self.incomplete = true;
+            }
             return Ok(());
         }
         if let Some(original) = self.original.as_mut() {
+            if original.custody().is_ordinary() {
+                let Some(bytes) = owner.capacity_bytes() else {
+                    self.incomplete = true;
+                    return original.insert(None, original::Value::UnknownCapture(owner));
+                };
+                let key = StorageIdentity::CapturePlan(owner.storage_identity().clone());
+                return original.insert(Some(key), original::Value::Capture((bytes, owner)));
+            }
             self.incomplete = true;
             return Err(original.refuse(original::Value::UnknownCapture(owner)));
         }

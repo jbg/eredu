@@ -1,13 +1,13 @@
 use super::*;
 use crate::{DeviceState, StateLayout};
 use eredu_core::{
-    cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
-    InferenceGeometry, InputTokenCount, LayerSchedule, StateMemoryLayout, WorkspaceBound,
+    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
+    InputTokenCount, LayerSchedule, StateMemoryLayout, WorkspaceBound, cache::LayerCachePolicy,
 };
 use eredu_nn::workspace::WorkspaceBackend;
 use std::{cell::Cell, rc::Rc};
 
-fn zero_admission() -> Admission {
+fn zero_admission(pool: &crate::working_memory::MemoryLedger) -> Admission {
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -34,6 +34,7 @@ fn zero_admission() -> Admission {
     )
     .unwrap()
     .with_execution_workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry,
         activations: zero(),
         attention: zero(),
@@ -43,12 +44,23 @@ fn zero_admission() -> Admission {
         retained: zero(),
     })
     .unwrap();
-    Admission {
-        requested_positions: 1,
-        state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+    crate::working_memory::memory_fixture::attribute_host_admission(
+        &pool,
+        Admission {
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+            requested_positions: 1,
+            state,
+            incremental_required_bytes: Some(0),
+        },
+    )
+}
+
+fn zero_request_ledger() -> crate::working_memory::MemoryLedger {
+    let probe = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    let bytes =
+        crate::working_memory::memory_fixture::reservation_bytes(&probe, &zero_admission(&probe));
+    crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap()
 }
 
 #[test]
@@ -63,7 +75,7 @@ fn revision_is_stable_for_cold_clones_and_charge_only_retention() {
         InferenceRetention::new().validate_revision(&revision),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
-    let pool = super::super::WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(65536, 0).unwrap();
     let lease = pool.acquire_unquoted().unwrap();
     copied.retain_unquoted(&lease);
     original.extend_from(&copied);
@@ -73,24 +85,25 @@ fn revision_is_stable_for_cold_clones_and_charge_only_retention() {
     assert!(copied.validate_revision(&revision).is_err());
     original.validate_revision(&revision).unwrap();
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop((lease, copied, original));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
 
 #[test]
 fn admission_commit_and_equal_frontier_restore_never_revive_saved_revision() {
-    let pool = super::super::WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(65536, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request = |reserve| {
-        let mut admission = zero_admission();
+    let request = |reserve: Option<u64>| {
+        let mut admission = zero_admission(&pool);
         // A nonzero safety reserve on an otherwise stateless fixture makes
         // charge lifetime observable without claiming any native allocation.
-        admission.incremental_required_bytes = reserve;
+        admission.additional_headroom =
+            eredu_core::MemoryHeadroomDeclarations::new([("host".into(), reserve.unwrap())]);
         InferenceRequest::from(pool.reserve(&execution, &admission).unwrap())
     };
-    let first = request(20);
-    let second = request(30);
+    let first = request(Some(20));
+    let second = request(Some(30));
     let mut installed = InferenceRetention::new();
     let fresh = installed.revision().clone();
     installed.retain(&first);
@@ -133,12 +146,27 @@ fn admission_commit_and_equal_frontier_restore_never_revive_saved_revision() {
     assert!(installed.validate_revision(&restored_again).is_err());
     assert_eq!(installed.admission().unwrap().position(), 0);
     assert_eq!(installed.requests().len(), 2);
-    assert_eq!(pool.used_bytes().unwrap(), 50);
-    assert_eq!(pool.peak_bytes().unwrap(), 50);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 50);
+    let host = pool.topology().host_domain();
+    let full = first
+        .memory_reservation()
+        .requirements()
+        .get(host)
+        .unwrap()
+        .total()
+        .unwrap()
+        + second
+            .memory_reservation()
+            .requirements()
+            .get(host)
+            .unwrap()
+            .total()
+            .unwrap();
+    assert_eq!(pool.payload_peak_bytes().unwrap(), full);
     drop((first, second, saved));
-    assert_eq!(pool.used_bytes().unwrap(), 50);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 50);
     drop(installed);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -156,7 +184,7 @@ fn restoring_an_empty_equal_branch_also_replaces_its_revision() {
 #[test]
 fn complete_state_exchange_invalidates_both_sides_without_retiring_their_owners() {
     type EmptyState = DeviceState<WorkspaceBackend, ()>;
-    let pool = super::super::WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(65536, 0).unwrap();
     let first_owner = pool.acquire_unquoted().unwrap();
     let second_owner = pool.acquire_unquoted().unwrap();
     let mut installed = EmptyState::stateless();
@@ -172,29 +200,35 @@ fn complete_state_exchange_invalidates_both_sides_without_retiring_their_owners(
     drop((first_owner, second_owner));
     exchange_inference_state(&mut installed, &mut displaced);
     for state in [&installed, &displaced] {
-        assert!(state
-            .inference_retention()
-            .validate_revision(&first)
-            .is_err());
-        assert!(state
-            .inference_retention()
-            .validate_revision(&second)
-            .is_err());
+        assert!(
+            state
+                .inference_retention()
+                .validate_revision(&first)
+                .is_err()
+        );
+        assert!(
+            state
+                .inference_retention()
+                .validate_revision(&second)
+                .is_err()
+        );
     }
     let swapped_first = installed.inference_retention().revision().clone();
     let swapped_second = displaced.inference_retention().revision().clone();
     exchange_inference_state(&mut installed, &mut displaced);
     for state in [&installed, &displaced] {
         for previous in [&first, &second, &swapped_first, &swapped_second] {
-            assert!(state
-                .inference_retention()
-                .validate_revision(previous)
-                .is_err());
+            assert!(
+                state
+                    .inference_retention()
+                    .validate_revision(previous)
+                    .is_err()
+            );
         }
         assert!(state.as_ref().is_empty());
     }
     assert_eq!(pool.unquoted_owner_count().unwrap(), 2);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(installed);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     drop(displaced);
@@ -203,7 +237,11 @@ fn complete_state_exchange_invalidates_both_sides_without_retiring_their_owners(
 
 #[test]
 fn unquoted_retention_deduplicates_lease_aliases_without_admitting_work() {
-    let pool = super::super::WorkingMemoryPool::new(100, 7).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(
+        100 + crate::working_memory::MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        7,
+    )
+    .unwrap();
     let owner = pool.acquire_unquoted().unwrap();
     let mut retention = InferenceRetention::new();
     retention.retain_unquoted(&owner);
@@ -218,19 +256,22 @@ fn unquoted_retention_deduplicates_lease_aliases_without_admitting_work() {
     retention.extend_from(&descendant);
     drop((owner, retention));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), 7);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 7);
     assert!(matches!(
-        pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
+        pool.reserve(
+            &InferenceExecutionIdentity::default(),
+            &zero_admission(&pool)
+        ),
         Err(WorkingMemoryError::UnknownBound)
     ));
     drop(descendant);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 7);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 7);
 }
 
 #[test]
 fn restoration_keeps_distinct_unquoted_owners_even_from_the_same_pool() {
-    let pool = super::super::WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(65536, 0).unwrap();
     let previous = pool.acquire_unquoted().unwrap();
     let current = pool.acquire_unquoted().unwrap();
     let mut snapshot = InferenceRetention::new();
@@ -253,7 +294,7 @@ fn restoration_keeps_distinct_unquoted_owners_even_from_the_same_pool() {
 #[test]
 fn stateless_device_state_clone_and_import_keep_unquoted_ownership() {
     type EmptyState = DeviceState<WorkspaceBackend, ()>;
-    let pool = super::super::WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = zero_request_ledger();
     let owner = pool.acquire_unquoted().unwrap();
     let mut original = EmptyState::stateless();
     original.inference_retention_mut().retain_unquoted(&owner);
@@ -268,24 +309,30 @@ fn stateless_device_state_clone_and_import_keep_unquoted_ownership() {
     drop((owner, original, snapshot));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     assert!(matches!(
-        pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
+        pool.reserve(
+            &InferenceExecutionIdentity::default(),
+            &zero_admission(&pool)
+        ),
         Err(WorkingMemoryError::UnknownBound)
     ));
     drop(imported);
     let reserved = pool
-        .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
+        .reserve(
+            &InferenceExecutionIdentity::default(),
+            &zero_admission(&pool),
+        )
         .unwrap();
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
     ));
     drop(reserved);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[derive(Debug)]
 struct HostLayer {
-    pool: super::super::WorkingMemoryPool,
+    pool: super::super::MemoryLedger,
     drops: Rc<Cell<usize>>,
     reject_clone: bool,
 }
@@ -310,7 +357,7 @@ impl Drop for HostLayer {
 
 #[test]
 fn failed_host_state_restore_keeps_both_owners_until_payload_retirement() {
-    let pool = super::super::WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(65536, 0).unwrap();
     let first = pool.acquire_unquoted().unwrap();
     let second = pool.acquire_unquoted().unwrap();
     let drops = Rc::new(Cell::new(0));
@@ -339,14 +386,18 @@ fn failed_host_state_restore_keeps_both_owners_until_payload_retirement() {
         installed.clone_from(&snapshot);
     }));
     assert!(failed.is_err());
-    assert!(installed
-        .inference_retention()
-        .validate_revision(&installed_revision)
-        .is_err());
-    assert!(installed
-        .inference_retention()
-        .validate_revision(&saved_revision)
-        .is_err());
+    assert!(
+        installed
+            .inference_retention()
+            .validate_revision(&installed_revision)
+            .is_err()
+    );
+    assert!(
+        installed
+            .inference_retention()
+            .validate_revision(&saved_revision)
+            .is_err()
+    );
     drop(snapshot);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 2);
     assert_eq!(drops.get(), 1);
@@ -356,3 +407,5 @@ fn failed_host_state_restore_keeps_both_owners_until_payload_retirement() {
 }
 
 mod empty;
+
+mod checkpoint;

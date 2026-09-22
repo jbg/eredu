@@ -40,9 +40,7 @@ use crate::{
         nn::tensor::{active_token_validation_arrays, validate_active_token_validations},
         runtime::{
             cache::{
-                residency::{
-                    CacheResidencyManager, load_prompt_cache_state_tensors, open_prompt_cache,
-                },
+                residency::CacheResidencyManager,
                 state::{
                     MlxHybridState, MlxKeyValueState, MlxPoolingAttentionCache,
                     MlxPoolingAttentionState, MlxPoolingAttentionStateFactory,
@@ -85,12 +83,15 @@ mod lowering;
 mod partitioned;
 mod prediction;
 mod session;
+pub(in crate::composition::mlx) use session::parameter_reset::exchange_parameter_reset_memory;
 mod state;
 
 pub(super) use capability::*;
 pub(super) use lowering::*;
 use partitioned::*;
 pub(super) use prediction::*;
+#[cfg(test)]
+pub(crate) use prediction::{ErasedReplicatedTextExecutable, OriginalTextFrontierError};
 pub(super) use session::binding::*;
 use session::*;
 pub(crate) use state::PreparedDenseControlBindingError;
@@ -101,5 +102,5 @@ pub(crate) mod tests;
 
 pub(crate) use session::{
     NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
-    SealedOpeningRows,
+    SealedOpeningRows, ordinary_model_completion_call_controls,
 };

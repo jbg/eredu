@@ -4,8 +4,8 @@ use eredu_checkpoint::{
     store::{EncodedReadFailure, EncodedReadLayout},
 };
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     Dtype, ImmutableHostTransferBuffer, PreparedHostTransferPlan, PreparedInputArena,
@@ -70,7 +70,7 @@ impl<'a, C> PreparedEncodedInputPlan<'a, C> {
 
     /// Includes this producer's original account and constructor-result controls.
     pub(crate) fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::shared_native_initialization_required_bytes(self)
+        MemoryLedger::shared_native_initialization_required_bytes(self)
     }
 
     /// A rejected comparison retains this uncalled borrowed plan. Native/source
@@ -78,7 +78,7 @@ impl<'a, C> PreparedEncodedInputPlan<'a, C> {
     /// Successful array aliases independently retain the same source account.
     pub(crate) fn prepare(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<
         InitializedSharedNative<ImmutableHostTransferBuffer>,
         SharedNativeInitializationError<Self>,

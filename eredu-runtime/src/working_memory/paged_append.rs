@@ -5,8 +5,8 @@ pub use host::{WorkspacePagedHostEntry, WorkspacePagedHostLoad, WorkspacePagedHo
 mod visible;
 use crate::cache::{PagedAppendMechanisms, PagedAppendPlan};
 use eredu_nn::{
-    Error, Index, Tensor,
     workspace::{WorkspaceContext, WorkspaceDtype, WorkspaceMetadataError, WorkspaceTensor},
+    Error, Index, Tensor,
 };
 
 /// Actual selected paging and array geometry. This descriptor grants no native
@@ -662,7 +662,7 @@ impl PagedAppendMechanisms for Append<'_> {
         // manager while retaining the original pair for rollback on failure.
         let publication = values.clone();
         self.context
-            .complete_values(&[&publication[0], &publication[1]])?;
+            .complete_cache_publication(&[&publication[0], &publication[1]])?;
         let values = self.state.tail.take().expect("validated complete tail");
         let start = self.state.geometry.tail_start;
         let end = start + i64::from(self.state.geometry.block_size);

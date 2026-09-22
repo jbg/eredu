@@ -428,26 +428,37 @@ where
             ));
         }
     }
-    // Router and component internals are not declared by the outer factory.
+    // Native collector support does not manufacture a component causality proof.
+    // Known hooks bind; remaining custom internals reject only active prefill selection.
     let catalog = discovery.capture().unwrap();
-    let internal = catalog
-        .catalog
-        .points
-        .iter()
-        .find(|point| {
-            point.prefill
-                && point.axes.as_ref().is_some_and(|axes| axes.len() == 3)
-                && paths.source().prefill_observation(&point.path).is_none()
-                && catalog.support.points.iter().any(|s| {
-                    s.path == point.path && s.prefill == ObservationSupportStatus::Supported
-                })
-        })
-        .unwrap();
-    let source = admission(&discovery, &[&internal.path], false, true);
-    assert!(matches!(
-        discovery.prepare_capture_selection(&source, paths.source()),
-        Err(SelectionError::Undeclared { index: 0 })
-    ));
+    for point in catalog.catalog.points.iter().filter(|point| {
+        point.prefill
+            && point.axes.as_ref().is_some_and(|axes| axes.len() == 3)
+            && catalog.support.points.iter().any(|support| {
+                support.path == point.path && support.prefill == ObservationSupportStatus::Supported
+            })
+    }) {
+        let source = admission(&discovery, &[&point.path], false, true);
+        match paths.source().prefill_observation(&point.path) {
+            Some(declaration) => {
+                let selected = discovery
+                    .prepare_capture_selection(&source, paths.source())
+                    .unwrap();
+                assert_eq!(selected.declaration(0).unwrap(), Some(declaration));
+            }
+            None => {
+                assert!(matches!(
+                    discovery.prepare_capture_selection(&source, paths.source()),
+                    Err(SelectionError::Undeclared { index: 0 })
+                ));
+                let inactive = admission(&discovery, &[&point.path], false, false);
+                let selected = discovery
+                    .prepare_capture_selection(&inactive, paths.source())
+                    .unwrap();
+                assert!(selected.declaration(0).unwrap().is_none());
+            }
+        }
+    }
     assert_eq!(
         before.physical_reads,
         sources

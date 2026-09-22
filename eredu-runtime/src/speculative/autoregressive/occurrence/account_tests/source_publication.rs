@@ -79,7 +79,7 @@ fn original_ticket_source_publication_and_failed_attachment_retain_exact_charge(
         }
         Err(cause) => panic!("source controls: {cause}"),
     };
-    for fail in [false, true] {
+    for (fail, funded_table) in [(false, false), (true, false), (false, true), (true, true)] {
         let selected = selected();
         let config = SpeculativeConfig {
             max_tokens: 3,
@@ -102,27 +102,57 @@ fn original_ticket_source_publication_and_failed_attachment_retain_exact_charge(
                 .workspace_geometry(2, invocation, NonZeroU64::new(1).unwrap())
                 .unwrap(),
         );
-        let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
         let request = OriginalSpeculativeRequest::prepare(
             &pool,
             &InferenceExecutionIdentity::default(),
             &schedule,
-            1 << 24,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
         )
         .unwrap();
         let mut cursor = schedule.into_cursor();
         let source = HostSourceConstructionFacts::new(bytes, 1, 1).unwrap();
+        let requirements = if funded_table {
+            let construction = pool.prepare_construction_metadata().unwrap();
+            let mut table = SpeculativeHostSourceSpans::new(1, construction.funding()).unwrap();
+            table.push(Some(source)).unwrap();
+            assert_eq!(table.push(None), Err(WorkingMemoryError::IdentityMismatch));
+            assert_eq!(table.as_slice(), &[Some(source)]);
+            let funding = construction.seal().unwrap();
+            let before_move = pool.payload_used_bytes().unwrap();
+            let raw = vec![Some(source)];
+            let raw_table_bytes = (raw.capacity()
+                * std::mem::size_of::<Option<HostSourceConstructionFacts>>())
+                as u64;
+            let raw_requirements = requirements(report.span_workspace_plan())
+                .with_host_source_spans(raw)
+                .unwrap();
+            let prepared = requirements(report.span_workspace_plan())
+                .with_funded_host_source_spans(table)
+                .unwrap();
+            assert_eq!(
+                raw_requirements.allocation_bytes()[3],
+                prepared.allocation_bytes()[3] + raw_table_bytes,
+                "only the separately prepaid table backing leaves the role allowance"
+            );
+            drop((raw_requirements, funding));
+            assert_eq!(
+                pool.payload_used_bytes().unwrap(),
+                before_move,
+                "moving the table retains its actual construction payer"
+            );
+            prepared
+        } else {
+            requirements(report.span_workspace_plan())
+                .with_host_source_constructions(source)
+                .unwrap()
+        };
         let role = request
-            .reserve_role(
-                cursor.claim(2, invocation).unwrap(),
-                requirements(report.span_workspace_plan())
-                    .with_host_source_constructions(source)
-                    .unwrap(),
-            )
+            .reserve_role(cursor.claim(2, invocation).unwrap(), requirements)
             .unwrap();
         role.claim_neural_bank(0).unwrap();
         let mut bank = role.take_host_source_constructions().unwrap().unwrap();
-        let before = pool.used_bytes().unwrap();
+        let before = pool.payload_used_bytes().unwrap();
         let result = bank.construct(Producer {
             custody: role.budget_custody().into(),
             key: 17,
@@ -130,7 +160,7 @@ fn original_ticket_source_publication_and_failed_attachment_retain_exact_charge(
             bytes,
         });
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             before,
             "prepaid publication does not charge source twice"
         );
@@ -142,7 +172,7 @@ fn original_ticket_source_publication_and_failed_attachment_retain_exact_charge(
         request.close().unwrap();
         drop((bank, role, request));
         assert!(
-            pool.used_bytes().unwrap() > 0,
+            pool.payload_used_bytes().unwrap() > 0,
             "source/error owns the exact accepted ticket"
         );
         match result {
@@ -154,7 +184,7 @@ fn original_ticket_source_publication_and_failed_attachment_retain_exact_charge(
                 let alias = pool.pin_registered_storage([(17u32, 16)]).unwrap();
                 drop(output);
                 assert!(
-                    pool.used_bytes().unwrap() > 0,
+                    pool.payload_used_bytes().unwrap() > 0,
                     "final canonical alias keeps the ticket"
                 );
                 drop(alias);
@@ -171,6 +201,6 @@ fn original_ticket_source_publication_and_failed_attachment_retain_exact_charge(
                 drop(retained);
             }
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

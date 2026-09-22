@@ -6,20 +6,20 @@
 pub(crate) mod identity;
 pub(crate) mod parameter_metadata;
 pub(crate) use parameter_metadata::static_groups as static_parallel_parameter_groups_with_metadata;
-mod module_metadata;
+pub(crate) mod construction_specs;
 #[cfg(test)]
 mod instrumentation_tests;
-pub(crate) mod construction_specs;
+mod module_metadata;
 pub(crate) use module_metadata::ModuleMetadata;
 mod prefill_observations;
 /// Borrowed declarations and shared ordering for actual pinned-module construction.
 pub mod static_construction;
-pub(crate) use static_construction::StaticModuleSpecView;
 pub(crate) use prefill_observations::{
-    media_prefill_observation_declarations, ordinary_prefill_observation_declarations,
-    append_routed_prefill_observations, append_routed_prefill_path,
-    append_dense_component_prefill_observations,
+    append_dense_component_prefill_observations, append_routed_prefill_observations,
+    append_routed_prefill_path, media_prefill_observation_declarations,
+    ordinary_prefill_observation_declarations,
 };
+pub(crate) use static_construction::StaticModuleSpecView;
 
 use parameter_metadata::{DeclarationDestination, NormalizationName, ParameterGroupError};
 use std::ops::Range;
@@ -84,7 +84,11 @@ impl<T: Clone> ComponentInstrumentation<'_, T> {
         observer: &'a mut dyn eredu_runtime::ActivationObserver<T, Error>,
     ) -> ComponentInstrumentation<'a, T> {
         ComponentInstrumentation {
-            observer: if observer.observes_activations() { Some(observer) } else { None },
+            observer: if observer.observes_activations() {
+                Some(observer)
+            } else {
+                None
+            },
             unit_path,
         }
     }
@@ -503,8 +507,20 @@ pub trait Config: 'static {
         BlockParameterFields::default()
     }
     /// Returns the canonical routed-observation point for one decoder layer.
-    fn routed_observation_points(&self,_unit_path:&str,_layer:usize,metadata_context:Option<&eredu_nn::workspace::WorkspaceContext>)->Result<Option<eredu_runtime::RoutedObservationPoints>,Error>{
-        crate::decoder::identity::Metadata::new(metadata_context).controls::<(&Self,&str,usize,Option<&eredu_nn::workspace::WorkspaceContext>,Option<eredu_runtime::RoutedObservationPoints>,Result<Option<eredu_runtime::RoutedObservationPoints>,eredu_nn::Error>)>()?;
+    fn routed_observation_points(
+        &self,
+        _unit_path: &str,
+        _layer: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Error> {
+        crate::decoder::identity::Metadata::new(metadata_context).controls::<(
+            &Self,
+            &str,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Option<eredu_runtime::RoutedObservationPoints>, eredu_nn::Error>,
+        )>()?;
         Ok(None)
     }
     /// Validates architecture-owned configuration policy.
@@ -2440,12 +2456,21 @@ pub trait DecoderProjectionOperator<B: NeuralBackend>: eredu_nn::Parameterized<B
     /// Custom/routed workers publish only their own actual internal hooks.
     fn append_component_prefill_observations(
         _unit_path: &str,
-        _declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(),Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&str,usize,&mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Option<&eredu_nn::workspace::WorkspaceContext>,String,Result<(),Error>)>()?;
+        _declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &str,
+            usize,
+            &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            String,
+            Result<(), Error>,
+        )>()?;
 
-Ok(())
-}
+        Ok(())
+    }
 
     /// Optionally projects mixed values from normalized attention input. The
     /// result has `[batch, tokens, local_kv_heads * head_width]` geometry.
@@ -2518,16 +2543,29 @@ pub trait TensorParallelProjectionOperator<B: NeuralBackend>: DecoderProjectionO
 impl<B: NeuralBackend> DecoderProjectionOperator<B> for Mlp<B> {
     fn append_component_prefill_observations(
         unit_path: &str,
-        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(),Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&str,usize,&mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Option<&eredu_nn::workspace::WorkspaceContext>,String,Result<(),Error>)>()?;
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &str,
+            usize,
+            &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            String,
+            Result<(), Error>,
+        )>()?;
 
         // hidden() is the same per-row gate/up product in ordinary and TP;
         // the shared residual block emits its completed down-projection write.
-        append_dense_component_prefill_observations(declarations, &metadata.format(format_args!("{unit_path}.feed_forward"))?, metadata_context)?;
+        append_dense_component_prefill_observations(
+            declarations,
+            &metadata.format(format_args!("{unit_path}.feed_forward"))?,
+            metadata_context,
+        )?;
 
-Ok(())
-}
+        Ok(())
+    }
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -3986,7 +4024,10 @@ impl SequentialPredictionGroups {
         target_units: usize,
         prediction_roots: impl IntoIterator<Item = String>,
     ) -> Result<Self, Error> {
-        let prediction_paths: Vec<Vec<String>> = prediction_roots.into_iter().map(|root| vec![root]).collect();
+        let prediction_paths: Vec<Vec<String>> = prediction_roots
+            .into_iter()
+            .map(|root| vec![root])
+            .collect();
         let execution_graph = Self::build_execution_graph(prediction_paths.len(), None)?;
         Ok(Self {
             target: SequentialGroup::new(
@@ -4025,8 +4066,15 @@ impl SequentialPredictionGroups {
         units_per_group: usize,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Self, Error> {
-        Self::new_indexed_with_metadata(target_parameter_root, target_units,
-            prediction_parameter_root, 0, prediction_groups, units_per_group, context)
+        Self::new_indexed_with_metadata(
+            target_parameter_root,
+            target_units,
+            prediction_parameter_root,
+            0,
+            prediction_groups,
+            units_per_group,
+            context,
+        )
     }
 
     /// Uses the same physical namespace worker with an explicit initial index.
@@ -4041,7 +4089,8 @@ impl SequentialPredictionGroups {
     ) -> Result<Self, Error> {
         let metadata = identity::Metadata::new(context);
         metadata.controls::<(Self, Vec<Vec<String>>, Vec<String>)>()?;
-        if (prediction_groups != 0 && units_per_group == 0) || prediction_parameter_root.is_empty() {
+        if (prediction_groups != 0 && units_per_group == 0) || prediction_parameter_root.is_empty()
+        {
             return Err(metadata.error(format_args!(
                 "prediction execution groups require non-empty names and units",
             )));
@@ -4051,13 +4100,16 @@ impl SequentialPredictionGroups {
             let start = group
                 .checked_mul(units_per_group)
                 .and_then(|offset| first_physical.checked_add(offset))
-                .ok_or_else(|| metadata.error(format_args!("prediction physical index overflowed")))?;
+                .ok_or_else(|| {
+                    metadata.error(format_args!("prediction physical index overflowed"))
+                })?;
             let mut paths = metadata.vector(units_per_group)?;
             for unit in 0..units_per_group {
                 let physical = start.checked_add(unit).ok_or_else(|| {
                     metadata.error(format_args!("prediction physical index overflowed"))
                 })?;
-                paths.push(metadata.format(format_args!("{prediction_parameter_root}.{physical}"))?);
+                paths
+                    .push(metadata.format(format_args!("{prediction_parameter_root}.{physical}"))?);
             }
             prediction_paths.push(paths);
         }
@@ -4068,7 +4120,9 @@ impl SequentialPredictionGroups {
                 target_units,
                 context,
             )?,
-            None => SequentialGroup::new(TARGET_EXECUTION_GROUP, target_parameter_root, target_units)?,
+            None => {
+                SequentialGroup::new(TARGET_EXECUTION_GROUP, target_parameter_root, target_units)?
+            }
         };
         Ok(Self {
             target,
@@ -4104,8 +4158,6 @@ impl SequentialPredictionGroups {
         destination.finish(groups, &output)
     }
 
-
-
     /// Returns stable prediction-group identities in prediction-depth order.
     pub fn prediction_execution_groups(&self) -> Vec<String> {
         (0..self.prediction_paths.len())
@@ -4114,7 +4166,11 @@ impl SequentialPredictionGroups {
     }
 
     /// Returns the number of units in one group.
-    pub fn unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+    pub fn unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
@@ -4131,25 +4187,32 @@ impl SequentialPredictionGroups {
     }
 
     /// Returns one stable target or prediction unit path.
-    pub fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+    pub fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+        metadata.controls::<(
+            &Self,
+            usize,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>()?;
 
         if group == 0 {
             return self.target.unit_path(0, index, metadata_context);
         }
         self.unit_count(group, metadata_context)?;
-        let path = &self.prediction_paths[group - 1]
-            .get(index)
-
-            .ok_or_else(|| {
-                metadata.error(format_args!(
-                    "unit {index} is outside {} units in prediction group {group}",
-                    self.prediction_paths[group - 1].len()
-                ))
-            })?;
+        let path = &self.prediction_paths[group - 1].get(index).ok_or_else(|| {
+            metadata.error(format_args!(
+                "unit {index} is outside {} units in prediction group {group}",
+                self.prediction_paths[group - 1].len()
+            ))
+        })?;
         metadata.text(format_args!("{path}"))
-}
+    }
 
     /// Selects the activation carried into a ready chain group.
     pub fn begin<T: Clone>(
@@ -4222,10 +4285,12 @@ impl SequentialGroup {
         eredu_runtime::ArchitectureExecutionGraph::single(self.name).map_err(Error::backend)
     }
 
-
-
     /// Validates the group ordinal and returns its unit count.
-    pub fn unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Error> {
+    pub fn unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
@@ -4239,9 +4304,19 @@ impl SequentialGroup {
     }
 
     /// Returns one validated stable unit path.
-    pub fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Error> {
+    pub fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+        metadata.controls::<(
+            &Self,
+            usize,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>()?;
 
         let count = self.unit_count(group, metadata_context)?;
         if index >= count {
@@ -4291,19 +4366,40 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
     type FeedForward: DecoderProjectionOperator<B>;
 
+    /// Exact residual hook of the configured projection worker. Dynamic
+    /// factories use the same branch as construction and execution.
+    fn feed_forward_residual_observation(_config: &C, _layer: usize) -> &'static str {
+        "feed_forward.output"
+    }
+
     /// Delegate exact internal row declarations to the actual selected worker.
     /// Dynamic factories override this using the same configuration branch as
     /// their construction; a tensor axis or matching path is not a proof.
     fn append_component_prefill_observations(
-        _config: &C, unit_path: &str, _layer: usize,
-        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(),Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&str,usize,&mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Option<&eredu_nn::workspace::WorkspaceContext>,String,Result<(),Error>)>()?;
+        _config: &C,
+        unit_path: &str,
+        _layer: usize,
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &str,
+            usize,
+            &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            String,
+            Result<(), Error>,
+        )>()?;
 
-        <Self::FeedForward as DecoderProjectionOperator<B>>::append_component_prefill_observations(unit_path, declarations, metadata_context)?;
+        <Self::FeedForward as DecoderProjectionOperator<B>>::append_component_prefill_observations(
+            unit_path,
+            declarations,
+            metadata_context,
+        )?;
 
-Ok(())
-}
+        Ok(())
+    }
 
     /// Validates configuration requirements specific to this block policy.
     fn validate(config: &C) -> Result<(), Error> {
@@ -4687,8 +4783,14 @@ where
     C: Config,
 {
     let metadata = module_metadata::ModuleMetadata::new::<B>(context);
-    metadata.controls::<(PartitionStaticModules<B>, Result<PartitionStaticModules<B>, Error>)>()?;
-    let embedding_name = metadata.text(format_args!("{}.embed_tokens.weight", config.parameter_root()))?;
+    metadata.controls::<(
+        PartitionStaticModules<B>,
+        Result<PartitionStaticModules<B>, Error>,
+    )>()?;
+    let embedding_name = metadata.text(format_args!(
+        "{}.embed_tokens.weight",
+        config.parameter_root()
+    ))?;
     let embeddings = (ownership.owns_input()
         || (ownership.owns_output() && config.tie_word_embeddings()))
     .then(|| {
@@ -4697,7 +4799,10 @@ where
                 vocabulary: config.vocabulary_size(),
                 dimensions: config.hidden_size(),
                 weight: metadata.plain_parameter(&embedding_name)?,
-                format: metadata.format(&embedding_name, metadata.linear_format(config, &embedding_name)?)?,
+                format: metadata.format(
+                    &embedding_name,
+                    metadata.linear_format(config, &embedding_name)?,
+                )?,
             },
             geometry.embedding_range.clone(),
             context,
@@ -4713,7 +4818,10 @@ where
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     scale: normalization_scale(
-                        metadata.named_parameter(format_args!("{}.norm.weight", config.parameter_root()))?,
+                        metadata.named_parameter(format_args!(
+                            "{}.norm.weight",
+                            config.parameter_root()
+                        ))?,
                         config.normalization_offset(),
                     ),
                 },
@@ -4725,7 +4833,9 @@ where
         .then(|| {
             let name = "lm_head.weight";
             let range = geometry.output_range.clone().ok_or_else(|| {
-                metadata.error(format_args!("untied decoder output owner has no vocabulary range"))
+                metadata.error(format_args!(
+                    "untied decoder output owner has no vocabulary range"
+                ))
             })?;
             B::vocabulary_parallel_linear(
                 LinearSpec {
@@ -4805,7 +4915,9 @@ where
             partition_static_modules(&args, &geometry, partition.ownership(), context)?;
         Ok(Self {
             source: std::sync::Arc::new(PartitionModelSource {
-                args, geometry, parameters: parameters.clone(),
+                args,
+                geometry,
+                parameters: parameters.clone(),
                 ownership: partition.ownership().clone(),
             }),
             static_modules,
@@ -4824,11 +4936,18 @@ where
         // Only from_partition can create the source. Reuse its validated
         // ownership, local geometry and parameters without a deep clone.
         let metadata = module_metadata::ModuleMetadata::new::<B>(context);
-        metadata.controls::<(Self, std::sync::Arc<PartitionModelSource<C>>, Result<Self, Error>)>()?;
-        let static_modules = partition_static_modules(
-            &source.args, &source.geometry, &source.ownership, context,
-        )?;
-        Ok(Self { source, static_modules, block_factory: std::marker::PhantomData })
+        metadata.controls::<(
+            Self,
+            std::sync::Arc<PartitionModelSource<C>>,
+            Result<Self, Error>,
+        )>()?;
+        let static_modules =
+            partition_static_modules(&source.args, &source.geometry, &source.ownership, context)?;
+        Ok(Self {
+            source,
+            static_modules,
+            block_factory: std::marker::PhantomData,
+        })
     }
 
     /// Returns normalized architecture configuration.
@@ -5032,21 +5151,25 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        let metadata=module_metadata::ModuleMetadata::new::<B>(context);
+        let metadata = module_metadata::ModuleMetadata::new::<B>(context);
         metadata.controls::<(
-            LayeredForwardState<B::Tensor,ForwardContext<B::Tensor>>,
-            Result<LayeredForwardState<B::Tensor,ForwardContext<B::Tensor>>,Error>,
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>,
             eredu_runtime::layered::LayeredMetadata<Error>,
         )>()?;
         if state.layout() != expected {
-            return Err(metadata.error(format_args!("decoder runtime state does not match partition state layout")));
+            return Err(metadata.error(format_args!(
+                "decoder runtime state does not match partition state layout"
+            )));
         }
         let sequence = hidden.dim(1);
         let allow_sliding_prefill = mask.is_none();
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
             None if sequence > 1 => {
-                let cache = state.layer(0).map_err(|cause|metadata.error(format_args!("{cause}")))?;
+                let cache = state
+                    .layer(0)
+                    .map_err(|cause| metadata.error(format_args!("{cause}")))?;
                 Some(B::causal_mask(sequence, cache.offset(), None, context)?)
             }
             None => None,
@@ -5057,7 +5180,9 @@ where
                 mask,
                 allow_sliding_prefill,
                 rotary_embeddings: None,
-                metadata: B::construction_metadata(context).filter(|c| c.uses_checked_metadata()).cloned(),
+                metadata: B::construction_metadata(context)
+                    .filter(|c| c.uses_checked_metadata())
+                    .cloned(),
             },
         })
     }
@@ -5130,18 +5255,19 @@ where
 {
     type DefinitionError = Error;
 
-
     fn state_layout(
         &self,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<StateLayout, Self::DefinitionError> {
-match context { Some(context) => {
-        self.source.geometry.complete_state_layout.clone_workspace(context)
-    }, None => {
-        Ok(self.source.geometry.complete_state_layout.clone())
-    } }
-}
-
+        match context {
+            Some(context) => self
+                .source
+                .geometry
+                .complete_state_layout
+                .clone_workspace(context),
+            None => Ok(self.source.geometry.complete_state_layout.clone()),
+        }
+    }
 
     fn state_identity(
         &self,
@@ -5149,25 +5275,29 @@ match context { Some(context) => {
         topology: eredu_core::cache::PromptCacheTopology,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-match context { Some(context) => {
-        state_identity_with(
-            &self.source.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-            identity::Metadata::new(Some(context)),
-        )
-    }, None => {
-        state_identity(
-            &self.source.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    } }
-}
+        match context {
+            Some(context) => state_identity_with(
+                &self.source.args,
+                state.layout(),
+                state.global_layer_offset(),
+                topology,
+                identity::Metadata::new(Some(context)),
+            ),
+            None => state_identity(
+                &self.source.args,
+                state.layout(),
+                state.global_layer_offset(),
+                topology,
+            ),
+        }
+    }
 
-    fn parameter_description(&self,_context:&<B::Tensor as Tensor>::Context)->Result<std::borrow::Cow<'_,ArchitectureParameterDescription>,Self::DefinitionError>{Ok(std::borrow::Cow::Borrowed(&self.source.parameters))}
+    fn parameter_description(
+        &self,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        Ok(std::borrow::Cow::Borrowed(&self.source.parameters))
+    }
 
     fn retained_static_value_slot_bound(&self) -> Option<usize> {
         eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
@@ -5219,16 +5349,46 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     fn prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            usize,
+            usize,
+            String,
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            std::ops::Range<usize>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error>,
+        )>()?;
 
         // Partitioning changes parameter/state ownership, not the ordinary
         // decoder's causal row semantics. Keep the complete global declaration
         // so inactive ranks can reserve the same remote observation receipt;
         // the separate retained placement still determines actual hook owners.
-        prefill_observations::declarations(&self.source.args, P::CAUSAL_PREFILL_ROWS,
-            |path, layer, declarations| <P as BlockFactory<B, C>>::append_component_prefill_observations(&self.source.args, path, layer, declarations, metadata_context), metadata_context)
+        prefill_observations::declarations(
+            &self.source.args,
+            P::CAUSAL_PREFILL_ROWS,
+            |layer| {
+                <P as BlockFactory<B, C>>::feed_forward_residual_observation(
+                    &self.source.args,
+                    layer,
+                )
+            },
+            |path, layer, declarations| {
+                <P as BlockFactory<B, C>>::append_component_prefill_observations(
+                    &self.source.args,
+                    path,
+                    layer,
+                    declarations,
+                    metadata_context,
+                )
+            },
+            metadata_context,
+        )
     }
 
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
@@ -5262,9 +5422,14 @@ where
         crate::transport::decoder_declaration().matches(expected)
     }
 
-    fn forward_metadata(&self, forward: &Self::ForwardContext)
-        -> Option<eredu_runtime::layered::LayeredMetadata<Error>> {
-        forward.metadata.as_ref().map(|context|eredu_runtime::layered::LayeredMetadata::new(context,|error|error))
+    fn forward_metadata(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Option<eredu_runtime::layered::LayeredMetadata<Error>> {
+        forward
+            .metadata
+            .as_ref()
+            .map(|context| eredu_runtime::layered::LayeredMetadata::new(context, |error| error))
     }
 
     fn primary_execution_group(&self) -> &str {
@@ -5278,37 +5443,61 @@ where
         crate::transport::pipeline_state(0, layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+    fn execution_graph(
+        &self,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
             self.source.parameters.graph(),
         ))
     }
 
-
-
-    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+    fn group_unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
         if group != 0 {
-            return Err(metadata.error(format_args!("{}", "decoder group is outside the text decoder")));
+            return Err(metadata.error(format_args!(
+                "{}",
+                "decoder group is outside the text decoder"
+            )));
         }
-        usize::try_from(self.source.args.num_hidden_layers()).map_err(|cause| metadata.source(cause))
+        usize::try_from(self.source.args.num_hidden_layers())
+            .map_err(|cause| metadata.source(cause))
     }
 
-    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+    fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+        metadata.controls::<(
+            &Self,
+            usize,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>()?;
 
         if group != 0
-            || index >= usize::try_from(self.source.args.num_hidden_layers()).map_err(|cause| metadata.source(cause))?
+            || index
+                >= usize::try_from(self.source.args.num_hidden_layers())
+                    .map_err(|cause| metadata.source(cause))?
         {
-            return Err(metadata.error(format_args!("{}", "decoder unit is outside the text decoder")));
+            return Err(metadata.error(format_args!(
+                "{}",
+                "decoder unit is outside the text decoder"
+            )));
         }
-        metadata.text(format_args!("{}.layers.{index}", self.source.args.parameter_root()))
+        metadata.text(format_args!(
+            "{}.layers.{index}",
+            self.source.args.parameter_root()
+        ))
     }
-
-
 
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
@@ -5686,7 +5875,10 @@ where
             ));
         }
         let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
-        Ok(self.source.args.routed_observation_points(&unit_path, index, None)?)
+        Ok(self
+            .source
+            .args
+            .routed_observation_points(&unit_path, index, None)?)
     }
 
     fn forward_unit_observed_with_provider<R, O>(
@@ -5708,7 +5900,10 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
-        let points = self.source.args.routed_observation_points(&path, index, None)?;
+        let points = self
+            .source
+            .args
+            .routed_observation_points(&path, index, None)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("routed decoder attempted an unowned unit"));
@@ -5809,7 +6004,10 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
-        let points = self.source.args.routed_observation_points(&path, index, None)?;
+        let points = self
+            .source
+            .args
+            .routed_observation_points(&path, index, None)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("routed decoder attempted an unowned unit"));
@@ -5893,11 +6091,16 @@ where
 
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
-    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self::Boundary, Self::Error> {
         if let Some(metadata) = metadata {
             metadata.charge_metadata(std::mem::size_of::<(
-                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
-                Self::Boundary, Result<Self::Boundary, Self::Error>,
+                &Self,
+                Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary,
+                Result<Self::Boundary, Self::Error>,
             )>())?;
         }
 
@@ -6764,21 +6967,18 @@ where
 {
     type DefinitionError = Error;
 
-
     fn state_layout(
         &self,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<StateLayout, Self::DefinitionError> {
-match context { Some(context) => {
-        match &self.parallel_geometry {
-            Some(geometry) => geometry.state_layout.clone_workspace(context),
-            None => state_layout_with_metadata(self.args(), context),
+        match context {
+            Some(context) => match &self.parallel_geometry {
+                Some(geometry) => geometry.state_layout.clone_workspace(context),
+                None => state_layout_with_metadata(self.args(), context),
+            },
+            None => self.state_layout_impl(),
         }
-    }, None => {
-        self.state_layout_impl()
-    } }
-}
-
+    }
 
     fn state_identity(
         &self,
@@ -6786,32 +6986,35 @@ match context { Some(context) => {
         topology: eredu_core::cache::PromptCacheTopology,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-match context { Some(context) => {
-        state_identity_with(
-            self.args(),
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-            identity::Metadata::new(Some(context)),
-        )
-    }, None => {
-        state_identity(
-            self.args(),
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    } }
-}
-
-    fn parameter_description(&self, context: &<B::Tensor as Tensor>::Context)
-        -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
-        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(
-            &Self, &<B::Tensor as Tensor>::Context, std::borrow::Cow<'_, ArchitectureParameterDescription>,
-        )>()?;
-        self.parameter_description_impl(context).map(std::borrow::Cow::Owned)
+        match context {
+            Some(context) => state_identity_with(
+                self.args(),
+                state.layout(),
+                state.global_layer_offset(),
+                topology,
+                identity::Metadata::new(Some(context)),
+            ),
+            None => state_identity(
+                self.args(),
+                state.layout(),
+                state.global_layer_offset(),
+                topology,
+            ),
+        }
     }
 
+    fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, ArchitectureParameterDescription>, Self::DefinitionError> {
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(
+            &Self,
+            &<B::Tensor as Tensor>::Context,
+            std::borrow::Cow<'_, ArchitectureParameterDescription>,
+        )>()?;
+        self.parameter_description_impl(context)
+            .map(std::borrow::Cow::Owned)
+    }
 
     fn retained_static_value_slot_bound(&self) -> Option<usize> {
         eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
@@ -6870,12 +7073,39 @@ where
     type Error = Error;
 
     fn prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        let metadata=crate::decoder::identity::Metadata::new(metadata_context);
-        metadata.controls::<(&Self,Option<&eredu_nn::workspace::WorkspaceContext>,usize,usize,String,Vec<eredu_runtime::layered::PrefillObservationDeclaration>,std::ops::Range<usize>,Option<eredu_runtime::RoutedObservationPoints>,Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>,Error>)>()?;
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata_context);
+        metadata.controls::<(
+            &Self,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+            usize,
+            usize,
+            String,
+            Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+            std::ops::Range<usize>,
+            Option<eredu_runtime::RoutedObservationPoints>,
+            Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error>,
+        )>()?;
 
-        prefill_observations::declarations(self.args(), P::CAUSAL_PREFILL_ROWS,
-            |path, layer, declarations| <P as BlockFactory<B, C>>::append_component_prefill_observations(self.args(), path, layer, declarations, metadata_context), metadata_context)
+        prefill_observations::declarations(
+            self.args(),
+            P::CAUSAL_PREFILL_ROWS,
+            |layer| {
+                <P as BlockFactory<B, C>>::feed_forward_residual_observation(self.args(), layer)
+            },
+            |path, layer, declarations| {
+                <P as BlockFactory<B, C>>::append_component_prefill_observations(
+                    self.args(),
+                    path,
+                    layer,
+                    declarations,
+                    metadata_context,
+                )
+            },
+            metadata_context,
+        )
     }
 
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
@@ -6905,14 +7135,18 @@ where
         crate::transport::pipeline_state(0, layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+    fn execution_graph(
+        &self,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         eredu_runtime::ArchitectureExecutionGraph::single(TEXT_DECODER_EXECUTION_GROUP)
             .map_err(Error::backend)
     }
 
-
-
-    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
+    fn group_unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
         metadata.controls::<(&Self, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
 
@@ -6924,22 +7158,36 @@ where
         usize::try_from(self.args.num_hidden_layers()).map_err(|cause| metadata.source(cause))
     }
 
-    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
+    fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Self::Error> {
         let metadata = crate::decoder::ModuleMetadata::destination(metadata_context);
-        metadata.controls::<(&Self, usize, usize, Option<&eredu_nn::workspace::WorkspaceContext>)>()?;
+        metadata.controls::<(
+            &Self,
+            usize,
+            usize,
+            Option<&eredu_nn::workspace::WorkspaceContext>,
+        )>()?;
 
         if group != 0 {
             return Err(metadata.error(format_args!(
                 "decoder execution group {group} is outside the text decoder"
             )));
         }
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(|cause| metadata.source(cause))?;
+        let count = usize::try_from(self.args.num_hidden_layers())
+            .map_err(|cause| metadata.source(cause))?;
         if index >= count {
             return Err(metadata.error(format_args!(
                 "decoder unit {index} is outside {count} decoder layers"
             )));
         }
-        metadata.text(format_args!("{}.layers.{index}", self.args.parameter_root()))
+        metadata.text(format_args!(
+            "{}.layers.{index}",
+            self.args.parameter_root()
+        ))
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -7278,11 +7526,16 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
 
-    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self::Boundary, Self::Error> {
         if let Some(metadata) = metadata {
             metadata.charge_metadata(std::mem::size_of::<(
-                &Self, Option<&eredu_nn::workspace::WorkspaceContext>,
-                Self::Boundary, Result<Self::Boundary, Self::Error>,
+                &Self,
+                Option<&eredu_nn::workspace::WorkspaceContext>,
+                Self::Boundary,
+                Result<Self::Boundary, Self::Error>,
             )>())?;
         }
 
@@ -7455,7 +7708,9 @@ where
         index: usize,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
         let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index, None)?;
-        Ok(self.args.routed_observation_points(&unit_path, index, None)?)
+        Ok(self
+            .args
+            .routed_observation_points(&unit_path, index, None)?)
     }
 
     fn forward_unit_observed_with_provider<R, O>(

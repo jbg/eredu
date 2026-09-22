@@ -1,0 +1,120 @@
+diff --git a/mlx/allocator.h b/mlx/allocator.h
+--- a/mlx/allocator.h
++++ b/mlx/allocator.h
+@@ -70,6 +70,9 @@
+ };
+ MLX_API MemoryPlacement memory_placement(Buffer) noexcept;
+ MLX_API bool memory_device_shares_host(int device);
++// Once a charged owner is attached, implicit relocation cannot change placement.
++MLX_API void retain_memory_placement(Buffer) noexcept;
++MLX_API void validate_memory_access(Buffer, int device);
+ 
+ class Allocator;
+ // Alternate ordinary allocation contracts have not joined the bound budget.
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -456,3 +456,8 @@
+ MemoryPlacement memory_placement(Buffer) noexcept { return {1, -1, 0}; }
+ bool memory_device_shares_host(int) { return false; }
+ } // namespace mlx::core::allocator
++
++namespace mlx::core::allocator {
++void retain_memory_placement(Buffer) noexcept {}
++void validate_memory_access(Buffer, int) {}
++}
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -482,3 +482,8 @@
+   return index == 0 && metal::device(mlx::core::Device::gpu).mtl_device()->hasUnifiedMemory();
+ }
+ } // namespace mlx::core::allocator
++
++namespace mlx::core::allocator {
++void retain_memory_placement(Buffer) noexcept {}
++void validate_memory_access(Buffer, int) {}
++}
+diff --git a/mlx/backend/cuda/allocator.h b/mlx/backend/cuda/allocator.h
+--- a/mlx/backend/cuda/allocator.h
++++ b/mlx/backend/cuda/allocator.h
+@@ -23,6 +23,7 @@
+   size_t size;
+   int device; // -1 for managed or pinned host
+   allocator::MemoryPlacement placement{};
++  bool placement_retained{false};
+ };
+ 
+ class SmallSizePool {
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -140,6 +140,7 @@
+   b->buf.data = static_cast<char*>(data_) + i * small_block_size;
+   b->buf.size = small_block_size;
+   b->buf.device = -1;
++  b->buf.placement_retained = false;
+   b->buf.placement = {supports_managed_memory() ? 3u : 1u, -1,
+       supports_managed_memory() ? static_cast<uint32_t>(gpu::device_count()) : 0u};
+   return &b->buf;
+@@ -357,6 +358,8 @@
+   if (buf.device == -1) {
+     return;
+   }
++  if (buf.placement_retained)
++    throw std::runtime_error("Accounted CUDA backing requires an admitted explicit transfer before physical relocation.");
+   void* data = unified_malloc(buf.size);
+   cudaMemcpyKind kind =
+       supports_managed_memory() ? cudaMemcpyDefault : cudaMemcpyDeviceToHost;
+@@ -537,3 +540,16 @@
+   return integrated != 0;
+ }
+ } // namespace mlx::core::allocator
++
++namespace mlx::core::allocator {
++void retain_memory_placement(Buffer buffer) noexcept {
++  auto* backing = static_cast<cu::CudaBuffer*>(buffer.ptr());
++  if (backing) backing->placement_retained = true;
++}
++void validate_memory_access(Buffer buffer, int device) {
++  const auto placement = memory_placement(buffer);
++  if (placement.kind == 0 || (placement.kind == 3 &&
++      (device < 0 || static_cast<uint32_t>(device) >= placement.device_count)))
++    throw std::runtime_error("CUDA access is outside the allocation's certified physical-memory candidates.");
++}
++}
+@@ -266,6 +266,7 @@
+   }
+   lock.unlock();
++  buf->placement_retained = false;
+   // Copy to unified memory here if the buffer is not on the right device.
+   if (buf->device >= 0 && buf->device != device) {
+     move_to_unified_memory(*buf, stream);
+   }
+diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
+--- a/mlx/backend/cuda/device.cpp
++++ b/mlx/backend/cuda/device.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/cuda/device.h"
++#include "mlx/allocator.h"
+ #include "mlx/backend/cuda/worker.h"
+ #include "mlx/backend/gpu/device_info.h"
+ #include "mlx/utils.h"
+@@ -234,6 +235,7 @@
+ }
+ 
+ void CommandEncoder::set_input_array(const array& arr) {
++  allocator::validate_memory_access(arr.buffer(), device_.cuda_device());
+   if (!use_cuda_graphs()) {
+     return;
+   }
+@@ -243,6 +245,7 @@
+ }
+ 
+ void CommandEncoder::set_output_array(const array& arr) {
++  allocator::validate_memory_access(arr.buffer(), device_.cuda_device());
+   if (!use_cuda_graphs()) {
+     return;
+   }

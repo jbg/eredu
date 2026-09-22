@@ -146,8 +146,12 @@ pub(super) fn control_bytes<B: TextGenerationBackend, C: TokenFilterController>(
 // callbacks. Ordinary preparation retains its existing immutable runtime API.
 trait Route<B: TextGenerationBackend, C: TokenFilterController> {
     fn runtime(&self) -> &ModelRuntime<B>;
-    fn restores_terminal(&self) -> bool { false }
-    fn requires_control(&self,_input:&Option<TextGenerationInput<B::Prompt>>)->bool { false }
+    fn restores_terminal(&self) -> bool {
+        false
+    }
+    fn requires_control(&self, _input: &Option<TextGenerationInput<B::Prompt>>) -> bool {
+        false
+    }
     fn cancellation(&self) -> Option<&crate::GenerationCancellationToken> {
         None
     }
@@ -200,9 +204,11 @@ struct Ordinary<'a, 'e, B: TextGenerationBackend> {
     sequence: Option<&'a GenerationSequenceRequest<'e>>,
 }
 impl<B: TextGenerationBackend, C: TokenFilterController> Route<B, C> for Ordinary<'_, '_, B> {
-    fn requires_control(&self,input:&Option<TextGenerationInput<B::Prompt>>)->bool {
-        matches!(input,Some(TextGenerationInput::OriginalTokenIds|TextGenerationInput::OriginalPrepared(_)))
-            && B::requires_original_preparation_control(self.runtime)
+    fn requires_control(&self, input: &Option<TextGenerationInput<B::Prompt>>) -> bool {
+        matches!(
+            input,
+            Some(TextGenerationInput::OriginalTokenIds | TextGenerationInput::OriginalPrepared(_))
+        ) && B::requires_original_preparation_control(self.runtime)
     }
     fn runtime(&self) -> &ModelRuntime<B> {
         self.runtime
@@ -249,12 +255,20 @@ impl<B: TextGenerationBackend, C: TokenFilterController> Route<B, C> for Ordinar
             }
             let claim = GenerationSequencePreparation::new(request, context);
             if original_prepared || request.token_input().is_some() {
-                *control=match B::prepare_text_preparation_control(self.runtime,&evidence,config,&claim) {
-                    Ok(source)=>source,
-                    Err(error)=>{*control_failed=true;return Err(error);}
+                *control = match B::prepare_text_preparation_control(
+                    self.runtime,
+                    &evidence,
+                    config.clone(),
+                    &claim,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        *control_failed = true;
+                        return Err(error);
+                    }
                 };
                 if control.is_none() && B::requires_original_preparation_control(self.runtime) {
-                    *control_failed=true;
+                    *control_failed = true;
                     return Err(TokenInputRejection::Unsupported.into_backend_failure());
                 }
             }
@@ -398,8 +412,10 @@ struct Resume<'r, 's, B: TextResumeBackend> {
     displaced: &'s mut Option<B::DisplacedState>,
 }
 impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, '_, B> {
-    fn restores_terminal(&self) -> bool { self.host.is_some() && self.options.terminal }
-    fn requires_control(&self,_input:&Option<TextGenerationInput<B::Prompt>>)->bool {
+    fn restores_terminal(&self) -> bool {
+        self.host.is_some() && self.options.terminal
+    }
+    fn requires_control(&self, _input: &Option<TextGenerationInput<B::Prompt>>) -> bool {
         self.host.is_some() && B::requires_original_preparation_control(self.runtime)
     }
     fn runtime(&self) -> &ModelRuntime<B> {
@@ -422,13 +438,23 @@ impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, 
         if self.options.terminal && config.sampling().max_new_tokens != Some(0) {
             return Err(crate::PreparedRequestRejection::RequestMismatch.into_backend_failure());
         }
-        if let Some(host)=self.host {
-            *control=match B::prepare_text_resume_control(self.runtime,self.source,config,context,host,self.options) {
-                Ok(source)=>source,
-                Err(error)=>{*control_failed=true;return Err(error);}
+        if let Some(host) = self.host {
+            *control = match B::prepare_text_resume_control(
+                self.runtime,
+                self.source,
+                config.clone(),
+                context,
+                host,
+                self.options,
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    *control_failed = true;
+                    return Err(error);
+                }
             };
             if control.is_none() && B::requires_original_preparation_control(self.runtime) {
-                *control_failed=true;
+                *control_failed = true;
                 return Err(TokenInputRejection::Unsupported.into_backend_failure());
             }
         }
@@ -487,9 +513,8 @@ impl<B: TextResumeBackend, C: TokenFilterController> Route<B, C> for Resume<'_, 
         )
     }
     fn finish(&mut self, preparation: &mut Option<B::TextPreparation>) {
-        let (finished, displaced) = B::finish_text_resume(
-            self.prepared.as_mut().expect("admitted resume"),
-        );
+        let (finished, displaced) =
+            B::finish_text_resume(self.prepared.as_mut().expect("admitted resume"));
         *preparation = Some(finished);
         *self.displaced = Some(displaced);
     }
@@ -508,9 +533,12 @@ fn agree<B: TextGenerationBackend, C: TokenFilterController, T>(
     stage: crate::run_preparation::TextPreparationStage,
     local: Result<Option<T>, PreparationError<B, C>>,
 ) -> Result<Option<T>, PreparationError<B, C>> {
-    if control_failed { return local; }
+    if control_failed {
+        return local;
+    }
     if route.cancellation().is_some() {
-        route.runtime().finish_text_preparation_control_cancellable(control,
+        route.runtime().finish_text_preparation_control_cancellable(
+            control,
             stage,
             local,
             ControlledTextGenerationError::Preparation,
@@ -519,7 +547,8 @@ fn agree<B: TextGenerationBackend, C: TokenFilterController, T>(
         // Preserve ordinary preparation's existing peer-cancellation error.
         route
             .runtime()
-            .finish_text_preparation_control(control,
+            .finish_text_preparation_control(
+                control,
                 stage,
                 local.map(|value| value.expect("ordinary preparation does not cancel")),
                 ControlledTextGenerationError::Preparation,
@@ -551,7 +580,7 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
         control_failed: false,
         route,
     };
-    let control_required=owned.route.requires_control(&owned.input);
+    let control_required = owned.route.requires_control(&owned.input);
     let admission = (|| {
         config
             .inference_policy()
@@ -563,8 +592,10 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
         }
         // A zero-output resume is Ready/no-work, not a cancellation vote. The
         // ordinary path deliberately keeps its existing zero-output behavior.
-        if owned.route.cancellation().is_some() && config.sampling().max_new_tokens == Some(0)
-            && !owned.route.restores_terminal() {
+        if owned.route.cancellation().is_some()
+            && config.sampling().max_new_tokens == Some(0)
+            && !owned.route.restores_terminal()
+        {
             return Ok(Some(false));
         }
         owned
@@ -575,14 +606,21 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
                 &mut owned.sequence,
                 &mut owned.control,
                 &mut owned.control_failed,
-                config,
+                config.clone(),
                 owned.controller.as_ref().expect("owned controller"),
                 context,
             )
             .map_err(ControlledTextGenerationError::Preparation)?;
         Ok(Some(true))
     })();
-    if agree::<B, C, _>(&owned.route, owned.control.as_ref(), owned.control_failed || (control_required && owned.control.is_none()), Stage::Admission, admission)? != Some(true) {
+    if agree::<B, C, _>(
+        &owned.route,
+        owned.control.as_ref(),
+        owned.control_failed || (control_required && owned.control.is_none()),
+        Stage::Admission,
+        admission,
+    )? != Some(true)
+    {
         return Ok(None);
     }
     let prompt = (|| {
@@ -593,7 +631,15 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
         owned.prompt = Some(prompt);
         Ok((!cancelled::<B, C>(&owned.route)).then_some(()))
     })();
-    if agree::<B, C, _>(&owned.route, owned.control.as_ref(), owned.control_failed || (control_required && owned.control.is_none()), Stage::Prompt, prompt)?.is_none() {
+    if agree::<B, C, _>(
+        &owned.route,
+        owned.control.as_ref(),
+        owned.control_failed || (control_required && owned.control.is_none()),
+        Stage::Prompt,
+        prompt,
+    )?
+    .is_none()
+    {
         return Ok(None);
     }
     let sampling = (|| {
@@ -620,7 +666,15 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
         // publication. A late local cancellation is observed by the next step.
         Ok(Some(()))
     })();
-    if agree::<B, C, _>(&owned.route, owned.control.as_ref(), owned.control_failed || (control_required && owned.control.is_none()), Stage::Sampling, sampling)?.is_none() {
+    if agree::<B, C, _>(
+        &owned.route,
+        owned.control.as_ref(),
+        owned.control_failed || (control_required && owned.control.is_none()),
+        Stage::Sampling,
+        sampling,
+    )?
+    .is_none()
+    {
         return Ok(None);
     }
     if owned.route.has_instrumentation() {
@@ -633,7 +687,15 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
             )
             .map(|()| Some(()))
             .map_err(ControlledTextGenerationError::Preparation);
-        if agree::<B, C, _>(&owned.route, owned.control.as_ref(), owned.control_failed || (control_required && owned.control.is_none()), Stage::Instrumentation, installed)?.is_none() {
+        if agree::<B, C, _>(
+            &owned.route,
+            owned.control.as_ref(),
+            owned.control_failed || (control_required && owned.control.is_none()),
+            Stage::Instrumentation,
+            installed,
+        )?
+        .is_none()
+        {
             return Ok(None);
         }
     }
@@ -697,7 +759,12 @@ pub(super) fn prepare_resume<B: TextResumeBackend, C: TokenFilterController>(
         controller,
         context,
     )?;
-    Ok(result.map(|machine| (machine, displaced.expect("successful resume displaced state"))))
+    Ok(result.map(|machine| {
+        (
+            machine,
+            displaced.expect("successful resume displaced state"),
+        )
+    }))
 }
 
 pub(super) fn resume_control_bytes<B: TextResumeBackend, C: TokenFilterController>() -> Option<usize>

@@ -1,23 +1,19 @@
 use super::*;
 use eredu_core::{
-    execution_control::NativeTextStateBackend, Admission, EstimationCompleteness,
-    ExecutionWorkspaceEstimate, InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand,
-    PendingTextInput, StateMemoryLayout, WorkspaceBound,
+    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
+    InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound,
 };
 use eredu_runtime::{
-    execution_control::{
-        SamplingOverride, TextSamplingControlBackend,
-        TextSnapshotBackend,
-    },
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool},
+    execution_control::{SamplingOverride, TextSamplingControlBackend},
+    working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError},
 };
 
 fn stream() -> Stream {
     Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))
 }
 
-fn backend(stream: &Stream, pool: &WorkingMemoryPool) -> MlxBackend<'static> {
-    MlxBackend::new(stream, stream).with_memory_pool(pool.clone())
+fn backend(stream: &Stream, pool: &MemoryLedger) -> MlxBackend<'static> {
+    MlxBackend::new(stream, stream).with_memory_ledger(pool.clone())
 }
 
 fn config(temperature: f32) -> TextGenerationConfig {
@@ -66,31 +62,35 @@ fn admission(bytes: u64) -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry: g,
-        activations: bound(bytes),
-        attention: bound(0),
-        vocabulary: bound(0),
-        state_update: bound(0),
-        materialization: bound(0),
-        retained: bound(0),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry: g,
+            activations: bound(bytes),
+            attention: bound(0),
+            vocabulary: bound(0),
+            state_update: bound(0),
+            materialization: bound(0),
+            retained: bound(0),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: g.input_positions + g.max_output_tokens,
         state,
-        incremental_required_bytes: bytes,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(bytes),
+    })
 }
 
 fn runtime(
     stream: &Stream,
-    preparation_pool: &WorkingMemoryPool,
+    preparation_pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     // The already loaded model belongs to a separate domain. This deliberately
     // isolates admission of the independent operation under test.
-    let model_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let model_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loader = backend(stream, &model_pool);
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model =
@@ -101,15 +101,16 @@ fn runtime(
     )
 }
 
-fn settle(pool: &WorkingMemoryPool, owners: usize) {
+fn settle(pool: &MemoryLedger, owners: usize) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
         pool.unquoted_owner_count().unwrap() == owners
     });
 }
 
-fn assert_unquoted(pool: &WorkingMemoryPool, owners: usize) {
+fn assert_unquoted(pool: &MemoryLedger, owners: usize) {
     settle(pool, owners);
     assert!(matches!(
         pool.reserve(&InferenceExecutionIdentity::default(), &admission(0)),
@@ -141,7 +142,7 @@ fn prompt_array(prompt: &MlxModelInput) -> Array {
 #[test]
 fn independent_prompt_clones_and_escaped_native_views_retain_memory_authority() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
     let backend = backend(&stream, &pool);
     let prompt = MlxBackend::prepare_text_prompt(&backend, vec![1, 2, 3, 4, 5]).unwrap();
     let clone = prompt.clone();
@@ -171,7 +172,7 @@ fn independent_prompt_clones_and_escaped_native_views_retain_memory_authority() 
 fn independent_greedy_and_stochastic_samplers_outlive_their_backend() {
     for temperature in [0.0, 0.7] {
         let stream = stream();
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
         let backend = backend(&stream, &pool);
         let sampler = MlxBackend::start_text_generation(&backend, config(temperature)).unwrap();
         assert_eq!(sampler.sampling.prng.is_some(), temperature > 0.0);
@@ -188,11 +189,12 @@ fn independent_greedy_and_stochastic_samplers_outlive_their_backend() {
 #[test]
 fn live_zero_byte_reservation_rejects_independent_preparation_before_sampling_factory() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
     let backend = backend(&stream, &pool);
     let reserved = pool
         .reserve(&InferenceExecutionIdentity::default(), &admission(0))
         .unwrap();
+    let before = pool.snapshot().unwrap();
     let failure = MlxBackend::fail_next_sampling_for_test(Error::ArchitectureModel(
         "sampling factory sentinel".into(),
     ));
@@ -212,8 +214,7 @@ fn live_zero_byte_reservation_rejects_independent_preparation_before_sampling_fa
     );
     assert!(TEST_SAMPLING_FAILURE.with(|slot| slot.borrow().is_some()));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 0);
+    assert_eq!(pool.snapshot().unwrap(), before);
     drop(reserved);
     let entered = MlxBackend::start_text_generation(&backend, config(0.7))
         .err()
@@ -225,9 +226,9 @@ fn live_zero_byte_reservation_rejects_independent_preparation_before_sampling_fa
 }
 
 #[test]
-fn admitted_preparation_uses_its_same_domain_reservation_without_unquoted_acquisition() {
+fn reservation_without_original_source_refuses_prompt_and_sampler_before_allocation() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(1 << 25, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 25, 0).unwrap();
     let (runtime, _root) = runtime(&stream, &pool);
     let identity = runtime
         .session()
@@ -246,308 +247,42 @@ fn admitted_preparation_uses_its_same_domain_reservation_without_unquoted_acquis
         chunk: None,
         quote: None,
     };
+    let before = pool.snapshot().unwrap();
     let prompt = MlxBackend::prepare_text_prompt_admitted(
         runtime.backend(),
         vec![1, 2, 3, 4, 5],
         &preparation,
     )
-    .unwrap();
-    let prompt =
-        MlxBackend::bind_text_prompt_preparation(runtime.backend(), prompt, &preparation).unwrap();
+    .err()
+    .expect("a reservation is not an original input producer");
+    assert_eq!(
+        memory_error(&prompt),
+        Some(&WorkingMemoryError::UnknownBound)
+    );
+    let factory = MlxBackend::fail_next_sampling_for_test(Error::ArchitectureModel(
+        "sampling factory sentinel".into(),
+    ));
     let sampler =
         MlxBackend::start_text_generation_admitted(runtime.backend(), config(0.7), &preparation)
-            .unwrap();
-    assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 1 << 24);
-    assert_eq!(
-        prompt_array(&prompt).evaluated().unwrap().as_slice::<u32>(),
-        &[1, 2, 3, 4, 5]
-    );
-    drop((request, preparation, runtime, prompt));
-    assert_eq!(pool.used_bytes().unwrap(), 1 << 24);
-    drop(sampler);
-    crate::backend::submission_recovery::wait_for_retirement(|| {
-        safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == 0
-    });
-}
-
-#[test]
-fn admitted_prompt_backing_retains_reservation_when_it_escapes_before_binding() {
-    let stream = stream();
-    let pool = WorkingMemoryPool::new(1 << 25, 0).unwrap();
-    let (runtime, _root) = runtime(&stream, &pool);
-    let identity = runtime
-        .session()
-        .payload
-        .model
-        .erased()
-        .inference_execution_identity();
-    let request: eredu_runtime::working_memory::InferenceRequest =
-        pool.reserve(identity, &admission(1 << 24)).unwrap().into();
-    let preparation = MlxTextPreparation {
-        request: Some(
-            request
-                .prepare_text(identity, geometry(), config(0.7))
-                .unwrap(),
-        ),
-        chunk: None,
-        quote: None,
-    };
-    let prompt = MlxBackend::prepare_text_prompt_admitted(
-        runtime.backend(),
-        vec![1, 2, 3, 4, 5],
-        &preparation,
-    )
-    .unwrap();
-    prompt.with_borrowed(|input| {
-        assert_eq!(
-            input
-                .inference_request()
-                .unwrap()
-                .validate_same_request(&request),
-            Ok(())
-        );
-    });
-    let escaped = prompt_array(&prompt);
-    // No bind call occurs: the native backing already owns its reservation.
-    drop((prompt, preparation, request, runtime));
-    settle(&pool, 0);
-    assert_eq!(pool.used_bytes().unwrap(), 1 << 24);
-    assert!(matches!(
-        pool.acquire_unquoted(),
-        Err(WorkingMemoryError::ReservedWorkActive)
-    ));
-    escaped.evaluated().unwrap();
-    let allocation = escaped.allocation_info().unwrap().unwrap();
-    let alias = escaped.try_index_device((.., 1..), &stream).unwrap();
-    alias.evaluated().unwrap();
-    assert_eq!(alias.allocation_info().unwrap(), Some(allocation));
-    drop(escaped);
-    safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), 1 << 24);
-    assert_eq!(alias.evaluated().unwrap().as_slice::<u32>(), &[2, 3, 4, 5]);
-    assert_eq!(alias.allocation_info().unwrap(), Some(allocation));
-    drop(alias);
-    crate::backend::submission_recovery::wait_for_retirement(|| {
-        safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == 0
-    });
-    let unquoted = pool.acquire_unquoted().unwrap();
-    drop(unquoted);
-}
-
-#[test]
-fn explicitly_unbudgeted_preparation_still_acquires_independent_memory_authority() {
-    for blocked in [false, true] {
-        let stream = stream();
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
-        let (runtime, _root) = runtime(&stream, &pool);
-        let identity = runtime
-            .session()
-            .payload
-            .model
-            .erased()
-            .inference_execution_identity();
-        let request = eredu_runtime::working_memory::InferenceRequest::without_memory_budget(
-            identity,
-            geometry(),
-        )
-        .unwrap();
-        assert!(request.memory_reservation().is_none());
-        let preparation = MlxTextPreparation {
-            request: Some(
-                request
-                    .prepare_text(identity, geometry(), config(0.7))
-                    .unwrap(),
-            ),
-            chunk: None,
-            quote: None,
-        };
-        let reserved = blocked.then(|| pool.reserve(identity, &admission(0)).unwrap());
-        if blocked {
-            let failure = MlxBackend::fail_next_sampling_for_test(Error::ArchitectureModel(
-                "unbudgeted sampling factory sentinel".into(),
-            ));
-            let prompt_error = MlxBackend::prepare_text_prompt_admitted(
-                runtime.backend(),
-                vec![1, 2, 3, 4, 5],
-                &preparation,
-            )
             .err()
-            .unwrap();
-            let sampler_error = MlxBackend::start_text_generation_admitted(
-                runtime.backend(),
-                config(0.7),
-                &preparation,
-            )
-            .err()
-            .unwrap();
-            for error in [prompt_error, sampler_error] {
-                assert_eq!(
-                    memory_error(&error),
-                    Some(&WorkingMemoryError::ReservedWorkActive)
-                );
-            }
-            assert!(TEST_SAMPLING_FAILURE.with(|slot| slot.borrow().is_some()));
-            assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
-            assert_eq!(pool.peak_bytes().unwrap(), 0);
-            drop(failure);
-            drop((reserved, preparation, request, runtime));
-        } else {
-            let prompt = MlxBackend::prepare_text_prompt_admitted(
-                runtime.backend(),
-                vec![1, 2, 3, 4, 5],
-                &preparation,
-            )
-            .unwrap();
-            let prompt =
-                MlxBackend::bind_text_prompt_preparation(runtime.backend(), prompt, &preparation)
-                    .unwrap();
-            let sampler = MlxBackend::start_text_generation_admitted(
-                runtime.backend(),
-                config(0.7),
-                &preparation,
-            )
-            .unwrap();
-            assert_unquoted(&pool, 2);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
-            drop((preparation, request, runtime));
-            assert_unquoted(&pool, 2);
-            assert_eq!(
-                prompt_array(&prompt).evaluated().unwrap().as_slice::<u32>(),
-                &[1, 2, 3, 4, 5]
-            );
-            drop(prompt);
-            assert_unquoted(&pool, 1);
-            drop(sampler);
-        }
-        settle(&pool, 0);
-    }
-}
-
-#[test]
-fn independent_prompt_and_sampler_copies_outlive_their_sources_and_runtime() {
-    let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let source_pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let source_backend = backend(&stream, &source_pool);
-    let (mut runtime, _root) = runtime(&stream, &pool);
-    let prompt = MlxBackend::prepare_text_prompt(&source_backend, vec![1, 2, 3, 4, 5]).unwrap();
-    let sampler = MlxBackend::start_text_generation(&source_backend, config(0.7)).unwrap();
-    let sampling_copy = MlxBackend::copy_sampling_state(&mut runtime, &sampler.sampling).unwrap();
-    let Some(PendingTextInput::Prefill(prompt_copy)) =
-        MlxBackend::copy_pending_input(&mut runtime, Some(PendingTextInput::Prefill(&prompt)))
-            .unwrap()
-    else {
-        panic!("copied prompt");
-    };
-    assert_unquoted(&pool, 2);
-    let escaped = prompt_array(&prompt_copy);
-    drop((prompt, sampler, source_backend, runtime, prompt_copy));
-    assert_unquoted(&pool, 2);
-    drop(sampling_copy);
-    assert_unquoted(&pool, 1);
+            .expect("a reservation is not an original sampler producer");
     assert_eq!(
-        escaped.evaluated().unwrap().as_slice::<u32>(),
-        &[1, 2, 3, 4, 5]
+        memory_error(&sampler),
+        Some(&WorkingMemoryError::UnknownBound)
     );
-    drop(escaped);
+    assert!(TEST_SAMPLING_FAILURE.with(|slot| slot.borrow().is_some()));
+    assert_eq!(pool.snapshot().unwrap(), before);
+    drop(factory);
+    drop((preparation, request, runtime));
     settle(&pool, 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
-fn independent_native_snapshots_and_copies_keep_distinct_memory_authorities() {
+fn reserved_ledger_rejects_unadmitted_reseed_without_mutating_sources() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let (mut runtime, _root) = runtime(&stream, &pool);
-    let submission = runtime
-        .decode(Array::from_slice(&[1_u32], &[1, 1]))
-        .unwrap();
-    submission.completion.wait().unwrap();
-    drop(submission);
-    let snapshot = MlxBackend::capture_native_text_state(&mut runtime).unwrap();
-    let copy = MlxBackend::copy_native_text_state(&mut runtime, &snapshot).unwrap();
-    // Installed ordinary state retains its operation owner independently of
-    // the two copied snapshots.
-    assert_unquoted(&pool, 3);
-    drop((snapshot, runtime));
-    assert_unquoted(&pool, 1);
-    drop(copy);
-    settle(&pool, 0);
-}
-
-#[test]
-fn native_state_exchange_moves_memory_authority_with_installed_and_displaced_state() {
-    for swap_back in [false, true] {
-        for runtime_first in [false, true] {
-            let stream = stream();
-            let model_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-            let snapshot_pool = WorkingMemoryPool::new(0, 0).unwrap();
-            let loader = backend(&stream, &model_pool);
-            let root =
-                crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
-            let prepared =
-                eredu_core::load_model(&loader, root.path(), crate::MlxLoadRequest::default())
-                    .unwrap();
-            let mut runtime =
-                ModelRuntime::from_prepared(backend(&stream, &snapshot_pool), prepared).unwrap();
-            drop(loader);
-            let submission = runtime
-                .decode(Array::from_slice(&[1_u32], &[1, 1]))
-                .unwrap();
-            submission.completion.wait().unwrap();
-            drop(submission);
-            let mut slot = MlxBackend::capture_native_text_state(&mut runtime).unwrap();
-            let submission = runtime
-                .decode(Array::from_slice(&[2_u32], &[1, 1]))
-                .unwrap();
-            submission.completion.wait().unwrap();
-            drop(submission);
-            MlxBackend::exchange_native_text_state(&mut runtime, &mut slot).unwrap();
-            assert_unquoted(&model_pool, 1);
-            assert_unquoted(&snapshot_pool, 2);
-            if swap_back {
-                MlxBackend::exchange_native_text_state(&mut runtime, &mut slot).unwrap();
-                assert_unquoted(&model_pool, 1);
-                assert_unquoted(&snapshot_pool, 2);
-            }
-            if runtime_first {
-                drop(runtime);
-                // The displaced state always retains the model's authority.
-                assert_unquoted(&model_pool, 1);
-                if swap_back {
-                    // A second exchange moves independently copied state back
-                    // into the detached slot, including fresh copy authority
-                    // and the ordinary operation authority inherited at exchange.
-                    assert_unquoted(&snapshot_pool, 2);
-                } else {
-                    // Displaced ordinary state keeps its context-domain owner.
-                    assert_unquoted(&snapshot_pool, 1);
-                }
-                drop(slot);
-            } else {
-                drop(slot);
-                assert_unquoted(&model_pool, 1);
-                if swap_back {
-                    assert_unquoted(&snapshot_pool, 1);
-                } else {
-                    assert_unquoted(&snapshot_pool, 2);
-                }
-                drop(runtime);
-            }
-            settle(&model_pool, 0);
-            settle(&snapshot_pool, 0);
-        }
-    }
-}
-
-#[test]
-fn reserved_domain_rejects_copy_capture_and_reseed_without_mutating_sources() {
-    let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let source_pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
     let source_backend = backend(&stream, &source_pool);
     let (mut runtime, _root) = runtime(&stream, &pool);
     // Populate the independent model domain without first admitting an ordinary
@@ -581,24 +316,17 @@ fn reserved_domain_rejects_copy_capture_and_reseed_without_mutating_sources() {
     let reserved = pool
         .reserve(&InferenceExecutionIdentity::default(), &admission(0))
         .unwrap();
-    let capture = MlxBackend::capture_native_text_state(&mut runtime)
-        .err()
-        .unwrap();
-    let sampling_copy = MlxBackend::copy_sampling_state(&mut runtime, &sampler.sampling)
-        .err()
-        .unwrap();
-    let input_copy =
-        MlxBackend::copy_pending_input(&mut runtime, Some(PendingTextInput::Prefill(&prompt)))
-            .err()
-            .unwrap();
+    let before = pool.snapshot().unwrap();
     let action = SamplingOverride {
-            temperature: Some(0.3),
-            reseed: Some(77),
-        };
+        temperature: Some(0.3),
+        reseed: Some(77),
+    };
     let eredu_core::SamplingOverrideError::Backend(reseed) =
         MlxBackend::apply_sampling_override(&mut runtime, &mut sampler, None, action).unwrap_err()
-        else { panic!("expected native reservation refusal") };
-    for error in [capture, sampling_copy, input_copy, reseed] {
+    else {
+        panic!("expected native reservation refusal")
+    };
+    for error in [reseed] {
         assert_eq!(
             memory_error(&error),
             Some(&WorkingMemoryError::ReservedWorkActive)
@@ -631,8 +359,11 @@ fn reserved_domain_rejects_copy_capture_and_reseed_without_mutating_sources() {
         &[1, 2, 3, 4, 5]
     );
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 0);
+    assert_eq!(pool.snapshot().unwrap(), before);
     drop(reserved);
     settle(&pool, 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

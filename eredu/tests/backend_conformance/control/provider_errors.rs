@@ -99,7 +99,7 @@ fn branch_options() -> GenerationBranchOptions {
 fn sampling_override_preserves_retained_provider_cause_and_invalid_control_branch() {
     let (mut model, chat, settings, _) = setup();
     let mut prepared =
-        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let mut run = model
         .start_controlled_chat(prepared, limits(), Default::default(), ignore)
         .unwrap()
@@ -148,8 +148,10 @@ fn sampling_override_preserves_retained_provider_cause_and_invalid_control_branc
 fn snapshot_capture_restore_and_branch_preserve_retained_provider_cause() {
     for at in ["capture", "copy", "growth"] {
         let (mut model, chat, settings, _) = super::snapshots::snapshot_setup();
-        let mut prepared =
-            eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        let mut prepared = eredu::api::PreparedChatRequest::new(
+            &chat,
+            original_sources::settings(settings.clone()),
+        );
         let mut run = model
             .start_controlled_chat(prepared, limits(), Default::default(), ignore)
             .unwrap()
@@ -157,8 +159,10 @@ fn snapshot_capture_restore_and_branch_preserve_retained_provider_cause() {
         let saved = {
             run.enable_snapshots(
                 copy_limits(),
-                original_sources::CAPACITY,
-                eredu_runtime::working_memory::WorkspaceCopyLimits::new(original_sources::CAPACITY),
+                crate::memory::limits(original_sources::CAPACITY),
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(crate::memory::limits(
+                    original_sources::CAPACITY,
+                )),
             )
             .unwrap();
             Some(run.snapshot(ignore).unwrap())
@@ -224,7 +228,7 @@ fn neutral_control_conversions_keep_classification_and_typed_host_failures() {
 fn controlled_start_preserves_retained_provider_cause_after_model_drop() {
     let (mut model, chat, settings, _) = setup();
     let mut prepared =
-        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+        eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings.clone()));
     let armed = Armed::new("start");
     let error = model
         .start_controlled_chat(prepared, limits(), Default::default(), no_record)

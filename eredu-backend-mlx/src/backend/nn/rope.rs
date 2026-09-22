@@ -422,6 +422,25 @@ pub(super) struct ElementwiseRotary {
     amplitude: f32,
 }
 
+/// Fixed caller transports of the shared explicit-product forward worker.
+/// Individual array calls and native backing have separate source quotations.
+pub(super) fn elementwise_rotary_control_bytes() -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    let frames = [
+        size_of::<(&ElementwiseRotary, &Array, i32, &Stream)>(),
+        size_of::<(&[i32], i32, i32, i32)>(),
+        size_of::<[Array; 13]>(),
+        size_of::<[Array; 2]>().checked_mul(2)?,
+        size_of::<(&Array, &Array)>(),
+        size_of::<Result<Array, Exception>>(),
+        size_of::<(i32, i32, &Stream)>(),
+        size_of::<Result<i32, Exception>>(),
+    ];
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
+}
+
 // Form each absolute coordinate as an integer before casting. Starting from an
 // already-rounded F32 offset can shift later positions above 2^24.
 fn position_rows(offset: i32, length: i32, stream: &Stream) -> Result<Array, Exception> {

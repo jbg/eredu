@@ -6,25 +6,22 @@ mod filter_workspace;
 pub use filter_workspace::TextFilterWorkspace;
 
 /// Execution limits for one ordinary or controlled text request.
-/// Memory capacity includes the shared managed domain's retained residency and
-/// concurrent admitted work. It is not a total process-memory guarantee.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Limits include retained residency and concurrent admitted work in each
+/// physical domain. They do not establish a total process-memory guarantee.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextInferencePolicy {
     /// Maximum positions per prefill submission. Absence uses runtime policy;
     /// admission may select a smaller chunk to satisfy the memory capacity.
     pub prefill_chunk_positions: Option<std::num::NonZeroU64>,
-    /// Enforced managed-domain capacity. Unknown required bounds must reject
-    /// before prompt or sampling construction. A zero capacity is valid and
-    /// rejects requests needing any managed storage.
+    /// Physical-domain limits resolved against the backend topology before
+    /// admission. Omitted domains are explicitly unlimited. Unknown required
+    /// bounds reject under both finite and unlimited limits.
     ///
-    /// A larger capacity on a later managed request in the same session
-    /// authorizes completed predecessor funding to adopt that ceiling when
-    /// the session retains the original owner's succession capability. All
-    /// native scopes must be certified and the funding run closed. Retained
-    /// outputs stay charged; fixed pool limits and unrelated requests still
-    /// constrain admission. The policy change commits with successful admission
-    /// and survives a subsequent preparation failure.
-    pub managed_memory_capacity_bytes: Option<u64>,
+    /// Relaxing a predecessor's live constraint requires the session's move-only
+    /// succession authority. Retained outputs remain charged, and configured
+    /// ledger limits and unrelated live requests continue to constrain admission.
+    #[serde(default)]
+    pub memory_limits: crate::MemoryLimitDeclarations,
     /// Explicit component ceiling for storage tracking submitted work. Native
     /// mechanisms enforce it before tracked allocation; exhaustion may refuse
     /// execution even after successful original admission. It is separate from
@@ -46,29 +43,13 @@ pub struct TextInferencePolicy {
 }
 
 impl TextInferencePolicy {
-    /// Enforced requests need a finite output allowance to price all decode,
+    /// Every request needs a finite output allowance to price all decode,
     /// sampling and retained-state work before the first native preparation.
-    pub fn validate(self, max_output_tokens: Option<usize>) -> Result<(), crate::CapabilityError> {
-        if self.submission_tracking_capacity_bytes.is_some()
-            && self.managed_memory_capacity_bytes.is_none()
-        {
-            return Err(crate::CapabilityError::InvalidConfiguration {
-                field: "submission_tracking_capacity_bytes",
-                detail: "submission tracking requires an original managed-domain capacity".into(),
-            });
-        }
-        if self.graph_metadata_capacity_bytes.is_some()
-            && self.managed_memory_capacity_bytes.is_none()
-        {
-            return Err(crate::CapabilityError::InvalidConfiguration {
-                field: "graph_metadata_capacity_bytes",
-                detail: "graph metadata requires an original managed-domain capacity".into(),
-            });
-        }
-        if self.managed_memory_capacity_bytes.is_some() && max_output_tokens.is_none() {
+    pub fn validate(&self, max_output_tokens: Option<usize>) -> Result<(), crate::CapabilityError> {
+        if max_output_tokens.is_none() {
             return Err(crate::CapabilityError::InvalidConfiguration {
                 field: "text_inference_policy",
-                detail: "enforced inference memory requires a finite output-token allowance".into(),
+                detail: "inference admission requires a finite output-token allowance".into(),
             });
         }
         Ok(())
@@ -176,9 +157,12 @@ impl InferenceGeometry {
     pub fn validate_fixed(self) -> Result<(), crate::AdmissionPolicyError> {
         // A completed saved-state placement has no next input or prediction.
         // Its copy work is separately admitted; this shape grants no forward.
-        if self.batch_size > 0 && self.input_positions == 0
-            && self.prefill_chunk_positions == 0 && self.max_output_tokens == 0
-            && self.output == OutputDemand::StateOnly {
+        if self.batch_size > 0
+            && self.input_positions == 0
+            && self.prefill_chunk_positions == 0
+            && self.max_output_tokens == 0
+            && self.output == OutputDemand::StateOnly
+        {
             return Ok(());
         }
         if self.batch_size == 0

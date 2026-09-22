@@ -14,9 +14,14 @@ enum Accounting {
     Text(RawSpanHostOwner),
     Speculative(crate::working_memory::OriginalSpeculativeBudgetCustody),
     Realtime(crate::working_memory::OriginalRealtimeBudgetCustody),
+    Numerical(crate::working_memory::OriginalNumericalBudgetCustody),
 }
 impl From<RawSpanHostOwner> for OriginalHostMetadataCustody {
-    fn from(value: RawSpanHostOwner) -> Self { Self { _raw: Accounting::Text(value) } }
+    fn from(value: RawSpanHostOwner) -> Self {
+        Self {
+            _raw: Accounting::Text(value),
+        }
+    }
 }
 impl OriginalHostMetadataCustody {
     pub(in crate::working_memory) fn matches_operation(
@@ -28,14 +33,15 @@ impl OriginalHostMetadataCustody {
             (Accounting::Text(a), Custody::Text(b)) => b.same_raw_account(a),
             (Accounting::Speculative(a), Custody::Speculative(b)) => a.same_account(b),
             (Accounting::Realtime(a), Custody::Realtime(b)) => a.same_account(b),
+            (Accounting::Numerical(a), Custody::Numerical(b)) => a.same_account(b),
             _ => false,
         }
     }
 
     pub(in crate::working_memory) fn operation_origin_control_bytes() -> Option<usize> {
         use crate::working_memory::{
-            operation_custody::Custody, OriginalRealtimeBudgetCustody,
-            OriginalSpeculativeBudgetCustody, OriginalTextMetadataCustody,
+            OriginalRealtimeBudgetCustody, OriginalSpeculativeBudgetCustody,
+            OriginalTextMetadataCustody, operation_custody::Custody,
         };
         use std::mem::{size_of, size_of_val};
         let frames = [
@@ -43,41 +49,89 @@ impl OriginalHostMetadataCustody {
             size_of::<(&Accounting, &Custody)>(),
             size_of::<(&OriginalTextMetadataCustody, &RawSpanHostOwner)>(),
             size_of::<(&RawSpanHostOwner, &RawSpanHostOwner)>(),
-            size_of::<(&OriginalSpeculativeBudgetCustody, &OriginalSpeculativeBudgetCustody)>(),
-            size_of::<(&OriginalRealtimeBudgetCustody, &OriginalRealtimeBudgetCustody)>(),
+            size_of::<(
+                &OriginalSpeculativeBudgetCustody,
+                &OriginalSpeculativeBudgetCustody,
+            )>(),
+            size_of::<(
+                &OriginalRealtimeBudgetCustody,
+                &OriginalRealtimeBudgetCustody,
+            )>(),
+            size_of::<(
+                &crate::working_memory::OriginalNumericalBudgetCustody,
+                &crate::working_memory::OriginalNumericalBudgetCustody,
+            )>(),
             size_of::<bool>(),
         ];
-        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
     }
 
-    pub(in crate::working_memory) fn from_realtime(value:crate::working_memory::OriginalRealtimeBudgetCustody)->Self {
-        Self{_raw:Accounting::Realtime(value)}
+    pub(in crate::working_memory) fn from_realtime(
+        value: crate::working_memory::OriginalRealtimeBudgetCustody,
+    ) -> Self {
+        Self {
+            _raw: Accounting::Realtime(value),
+        }
     }
-    pub(in crate::working_memory) fn from_budget(value: crate::working_memory::OriginalSpeculativeBudgetCustody) -> Self {
-        Self { _raw: Accounting::Speculative(value) }
+    pub(in crate::working_memory) fn from_numerical(
+        value: crate::working_memory::OriginalNumericalBudgetCustody,
+    ) -> Self {
+        Self {
+            _raw: Accounting::Numerical(value),
+        }
+    }
+    pub(in crate::working_memory) fn from_budget(
+        value: crate::working_memory::OriginalSpeculativeBudgetCustody,
+    ) -> Self {
+        Self {
+            _raw: Accounting::Speculative(value),
+        }
     }
     pub(in crate::working_memory) fn same(&self, other: &Self) -> bool {
         match (&self._raw, &other._raw) {
             (Accounting::Text(a), Accounting::Text(b)) => a.same(b),
             (Accounting::Speculative(a), Accounting::Speculative(b)) => a.same_account(b),
             (Accounting::Realtime(a), Accounting::Realtime(b)) => a.same_account(b),
+            (Accounting::Numerical(a), Accounting::Numerical(b)) => a.same_account(b),
             _ => false,
         }
     }
-    pub(in crate::working_memory) fn pool(&self) -> &crate::working_memory::WorkingMemoryPool {
-        match &self._raw { Accounting::Text(v) => v.pool(), Accounting::Speculative(v) => v.pool(), Accounting::Realtime(v) => v.pool() }
+    pub(in crate::working_memory) fn pool(&self) -> &crate::working_memory::MemoryLedger {
+        match &self._raw {
+            Accounting::Text(v) => v.pool(),
+            Accounting::Speculative(v) => v.pool(),
+            Accounting::Realtime(v) => v.pool(),
+            Accounting::Numerical(v) => v.pool(),
+        }
     }
     pub(in crate::working_memory) fn account(&self) -> u64 {
-        match &self._raw { Accounting::Text(v) => v.account(), Accounting::Speculative(v) => v.account_id(), Accounting::Realtime(v) => v.account_id() }
+        match &self._raw {
+            Accounting::Text(v) => v.account(),
+            Accounting::Speculative(v) => v.account_id(),
+            Accounting::Realtime(v) => v.account_id(),
+            Accounting::Numerical(v) => v.account_id(),
+        }
     }
     pub(in crate::working_memory) fn quarantine(&self) {
-        match &self._raw { Accounting::Text(v) => v.quarantine(), Accounting::Speculative(v) => v.quarantine(), Accounting::Realtime(v) => v.quarantine() }
+        match &self._raw {
+            Accounting::Text(v) => v.quarantine(),
+            Accounting::Speculative(v) => v.quarantine(),
+            Accounting::Realtime(v) => v.quarantine(),
+            Accounting::Numerical(v) => v.quarantine(),
+        }
     }
-    pub(in crate::working_memory) fn validate_origin_locked(&self, pool: &crate::working_memory::WorkingMemoryPool, usage: &crate::working_memory::Usage) -> Result<(), WorkingMemoryError> {
+    pub(in crate::working_memory) fn validate_origin_locked(
+        &self,
+        pool: &crate::working_memory::MemoryLedger,
+        usage: &crate::working_memory::Usage,
+    ) -> Result<(), WorkingMemoryError> {
         match &self._raw {
             Accounting::Text(v) => v.validate_origin_locked(pool, usage),
             Accounting::Speculative(v) => v.validate_copy_source(pool, usage),
             Accounting::Realtime(v) => v.validate_copy_source(pool, usage),
+            Accounting::Numerical(v) => v.validate_copy_source(pool, usage),
         }
     }
     pub(in crate::working_memory) fn from_guard(guard: &OriginalTextControlGuard) -> Self {

@@ -58,7 +58,12 @@ fn chat(model: &mut original_sources::Fixture<MockBackend>) -> PreparedChat {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel,
+            )
             .map(|chat| chat.expect("active preparation"))
     }
     .unwrap()
@@ -115,8 +120,10 @@ fn prepared_sampling_preserves_strategy_resolved_controls_and_vocabulary_masks()
         // The observed path shares the same strategy resolution and constraints.
         for observed in [false, true] {
             let cancel = eredu_core::GenerationCancellationToken::new();
-            let request =
-                eredu::api::PreparedChatRequest::new(&chat, original_sources::settings(settings));
+            let request = eredu::api::PreparedChatRequest::new(
+                &chat,
+                original_sources::settings(settings.clone()),
+            );
             let mut delivered = Vec::new();
             let mut observer =
                 |token, capture: Option<eredu_core::capture::SharedCapturedStep>, _| {
@@ -184,7 +191,7 @@ fn invalid_mirostat_is_rejected_before_backend_work() {
                 },
                 ..mirostat()
             };
-            assert_invalid_speculative_settings(None, settings, |error| {
+            assert_invalid_speculative_settings(None, settings.clone(), |error| {
                 assert!(matches!(
                     (error, tau_is_invalid),
                     (GenerationError::InvalidMirostatTau(_), true)
@@ -195,7 +202,7 @@ fn invalid_mirostat_is_rejected_before_backend_work() {
                 let cancel = Default::default();
                 let mut request = eredu::api::PreparedChatRequest::new(
                     &chat,
-                    original_sources::settings(settings),
+                    original_sources::settings(settings.clone()),
                 );
                 request.stop_sequences = &[];
                 model
@@ -429,7 +436,7 @@ fn assert_invalid_speculative_settings(
                     } else {
                         SpeculativeDraft::External(&mut drafter)
                     },
-                    settings: original_sources::settings(settings),
+                    settings: original_sources::settings(settings.clone()),
                     options: eredu::api::PreparedChatSpeculativeGenerationOptions {
                         scheduler: eredu_core::SpeculativeSchedulerOptions::default()
                             .with_lookahead(lookahead),
@@ -452,7 +459,7 @@ fn assert_invalid_speculative_settings(
                     },
                     lanes: [
                         original_sources::settings(PreparedChatGenerationSettings::default()),
-                        original_sources::settings(settings),
+                        original_sources::settings(settings.clone()),
                     ]
                     .into_iter()
                     .map(|settings| PreparedChatSpeculativeBatchLane {

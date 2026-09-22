@@ -2,8 +2,8 @@
 use super::{MaterializationSourceStreamError, PreparedMaterializationSourceStream};
 use crate::backend::managed_memory::scheduler::{self, MlxSchedulerInitializationError};
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{
     CpuWorkerCause, CpuWorkerError, CpuWorkerLayout, CpuWorkerTarget, InitializedCpuWorker,
@@ -43,7 +43,7 @@ fn requested(
     layout: CpuWorkerLayout<SharedNativeInitializationCustody>,
 ) -> Result<usize, WorkingMemoryError> {
     let controls = [
-        size_of::<&WorkingMemoryPool>(),
+        size_of::<&MemoryLedger>(),
         size_of::<&PreparedMaterializationSourceStream>(),
         size_of::<&safemlx::InitializedScheduler>(),
         size_of::<PreparedMaterializationSourceWorker>(),
@@ -71,12 +71,14 @@ impl MaterializationSourceWorkerError {
             Failure::Accounting(error) => BackendFailure::from_error(error),
             Failure::Stream(error) => error.into_backend_failure(),
             Failure::Scheduler(error) => BackendFailure::from_error(error),
-            Failure::Initialization(error) => BackendFailure::from_error(
-                error.into_parts().1.retire_output_and_map_error(|error| match error {
-                    ConstructorFailure::Preparation(error) => error.cause(),
-                    ConstructorFailure::Native(error) => error.cause(),
-                }),
-            ),
+            Failure::Initialization(error) => {
+                BackendFailure::from_error(error.into_parts().1.retire_output_and_map_error(
+                    |error| match error {
+                        ConstructorFailure::Preparation(error) => error.cause(),
+                        ConstructorFailure::Native(error) => error.cause(),
+                    },
+                ))
+            }
         }
     }
     pub(crate) fn is_busy(&self) -> bool {
@@ -110,7 +112,7 @@ impl PreparedMaterializationSourceWorker {
     /// its health, dispatch authority or capacity for subsequent work.
     pub fn validate_pool(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), MaterializationSourceWorkerError> {
         self.0
             .validate_pool(pool)
@@ -127,7 +129,7 @@ impl PreparedMaterializationSourceStream {
     /// worker is explicitly refused rather than being charged retroactively.
     pub fn prepare_cpu_worker(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<PreparedMaterializationSourceWorker, MaterializationSourceWorkerError> {
         self.validate_pool(pool)
             .map_err(|e| MaterializationSourceWorkerError(Failure::Stream(e)))?;
@@ -145,7 +147,7 @@ impl PreparedMaterializationSourceStream {
     /// This captures no new source allowance and performs no worker construction.
     pub fn cpu_worker_required_bytes(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<u64, MaterializationSourceWorkerError> {
         self.validate_pool(pool)
             .map_err(|e| MaterializationSourceWorkerError(Failure::Stream(e)))?;
@@ -155,11 +157,8 @@ impl PreparedMaterializationSourceStream {
             .map_err(|e| MaterializationSourceWorkerError(Failure::Native(e)))?;
         let target = CpuWorkerTarget::for_stream(scheduler, self.0.output())
             .map_err(|e| MaterializationSourceWorkerError(Failure::Native(e)))?;
-        WorkingMemoryPool::shared_native_initialization_required_bytes(&Initializer {
-            layout,
-            target,
-        })
-        .map_err(|e| MaterializationSourceWorkerError(Failure::Accounting(e)))
+        MemoryLedger::shared_native_initialization_required_bytes(&Initializer { layout, target })
+            .map_err(|e| MaterializationSourceWorkerError(Failure::Accounting(e)))
     }
 }
 
@@ -217,22 +216,22 @@ mod tests {
             }
             Err(other) => panic!("unexpected source preparation failure: {other:?}"),
         }
-        let pool = crate::backend::managed_memory::domain();
+        let pool = crate::backend::managed_memory::ledger();
         crate::backend::managed_memory::input_allocator::prepare_admitted(&pool).unwrap();
         let source = PreparedMaterializationSourceStream::prepare(&pool).unwrap();
         let quote = source.cpu_worker_required_bytes(&pool).unwrap();
-        let before = pool.used_bytes().unwrap();
-        let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let before = pool.fixture_host_charge().unwrap();
+        let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let wrong = source.prepare_cpu_worker(&foreign).unwrap_err();
         assert!(matches!(wrong.0, Failure::Stream(_)));
-        assert_eq!(foreign.used_bytes().unwrap(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(foreign.fixture_host_charge().unwrap(), 0);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
         drop(wrong);
         let worker = source.prepare_cpu_worker(&pool).unwrap();
         worker.validate_pool(&pool).unwrap();
         assert!(worker.validate_pool(&foreign).is_err());
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             before.checked_add(quote).unwrap()
         );
         let second = source.prepare_cpu_worker(&pool).unwrap_err();
@@ -246,14 +245,18 @@ mod tests {
         assert!(std::error::Error::source(error)
             .unwrap()
             .is::<CpuWorkerCause>());
-        assert!(pool.used_bytes().unwrap() > before + quote);
+        assert!(pool.fixture_host_charge().unwrap() > before + quote);
         drop(second);
-        assert_eq!(pool.used_bytes().unwrap(), before + quote);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before + quote);
         drop(source);
         worker.validate_pool(&pool).unwrap();
         drop(worker);
         safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), before + quote);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before + quote);
         println!("SOURCE_WORKER_COMPONENT_OK: actual birth/account custody");
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::nn::workspace::{NativeAllocationFacts, MlxMetalWorkspaceMechanisms};
+use crate::backend::nn::workspace::{MlxMetalWorkspaceMechanisms, NativeAllocationFacts};
 use eredu_checkpoint::store::{
     CheckpointSource, MemoryWeightStore, SafetensorsWeightStore, TensorSelection,
 };
@@ -265,24 +265,29 @@ fn forward_with_retirement_probe(
                 assert_eq!(retirement.load(Ordering::SeqCst), 0);
             }
         }
-        let lease =
-            f.policy
-                .acquire(
-                    index,
-                    address,
-                    |stream| {
-                        if let Some(retirement) = retirement.filter(|_| index == 1) {
-                            // Acquisition has drained and evicted, but has not built
-                            // this unit or refilled the window with unit two yet.
-                            safemlx::reclaim_allocation_owners();
-                            assert_eq!(retirement.load(Ordering::SeqCst), 1,
-                        "the old native backing must retire before the next constructor/refill");
-                        }
-                        build(unit, stream)
-                    },
-                    &f.stream,
-                )
-                .unwrap();
+        let lease = f
+            .policy
+            .acquire(
+                index,
+                address,
+                |stream| {
+                    if let Some(retirement) = retirement.filter(|_| index == 1) {
+                        // Acquisition has drained and evicted, but has not built
+                        // this unit or refilled the window with unit two yet.
+                        // Logical eviction leaves cached backing alive until native cache eviction.
+                        safemlx::memory::clear_cache().unwrap();
+                        safemlx::reclaim_allocation_owners();
+                        assert_eq!(
+                            retirement.load(Ordering::SeqCst),
+                            1,
+                            "the old native backing must retire before the next constructor/refill"
+                        );
+                    }
+                    build(unit, stream)
+                },
+                &f.stream,
+            )
+            .unwrap();
         let weight = parameter(&lease, "weight");
         if let Some(retirement) = retirement.filter(|_| index == 0) {
             weight.as_array().evaluated().unwrap();
@@ -415,10 +420,19 @@ fn canonical_owner_full_unit_is_priced_persistent_and_aliases_share_projection()
 fn ordinary_roomy_windows_evict_across_groups_and_repeated_forwards() {
     let mut f = fixture(false, 2);
     let units = u64::try_from(f.definitions.len()).unwrap();
-    let bytes: u64 = f.definitions.iter().flat_map(OffloadUnit::bindings)
-        .map(WeightBinding::expected_bytes).sum();
+    let bytes: u64 = f
+        .definitions
+        .iter()
+        .flat_map(OffloadUnit::bindings)
+        .map(WeightBinding::expected_bytes)
+        .sum();
     for _ in 0..2 {
-        let before = f.manager.report().unwrap().offload().transfer(TransferDirection::DiskToDevice);
+        let before = f
+            .manager
+            .report()
+            .unwrap()
+            .offload()
+            .transfer(TransferDirection::DiskToDevice);
         // No admitted receipt is installed: ordinary execution must enforce
         // the same selected depth even though all five units fit the budget.
         assert!(!f.manager.admitted_disk_route_active());
@@ -426,7 +440,13 @@ fn ordinary_roomy_windows_evict_across_groups_and_repeated_forwards() {
         let report = f.manager.report().unwrap();
         assert_eq!(resident(&f.manager), BTreeSet::from([id(4)]));
         assert!(report.active_window().is_empty());
-        assert_eq!(report.offload().peak_resident_units().get(MemoryTier::Device), 2);
+        assert_eq!(
+            report
+                .offload()
+                .peak_resident_units()
+                .get(MemoryTier::Device),
+            2
+        );
         // Direct window acquisition records each actual copy publication;
         // it does not call the separate prefetch hit/miss producer.
         let after = report.offload().transfer(TransferDirection::DiskToDevice);
@@ -443,27 +463,65 @@ fn ordinary_dense_group_switch_preserves_unconsumed_transfers_on_rejection() {
     let mut last = None;
     for index in 0..5 {
         let address = f.policy.layout.address(index).unwrap();
-        let lease = f.policy.acquire(index, address,
-            |stream| build(&f.definitions[index], stream), &f.stream).unwrap();
+        let lease = f
+            .policy
+            .acquire(
+                index,
+                address,
+                |stream| build(&f.definitions[index], stream),
+                &f.stream,
+            )
+            .unwrap();
         let weight = parameter(&lease, "weight");
         let output = weight.add(weight, &f.stream).unwrap();
-        assert!(output.as_array().evaluated().unwrap().as_slice::<i32>()
-            .iter().all(|value| *value == 2 * (index as i32 + 1)));
-        f.policy.complete(index, address, lease, &output,
-            std::iter::empty(), std::iter::empty(), &f.stream).unwrap();
+        assert!(output
+            .as_array()
+            .evaluated()
+            .unwrap()
+            .as_slice::<i32>()
+            .iter()
+            .all(|value| *value == 2 * (index as i32 + 1)));
+        f.policy
+            .complete(
+                index,
+                address,
+                lease,
+                &output,
+                std::iter::empty(),
+                std::iter::empty(),
+                &f.stream,
+            )
+            .unwrap();
         if index == 0 {
             let before = f.manager.report().unwrap();
             let wrong_group = f.policy.layout.address(3).unwrap();
-            let result = f.policy.acquire(3, wrong_group,
-                |stream| build(&f.definitions[3], stream), &f.stream);
-            assert!(matches!(result, Err(LayerwiseAcquireError::Policy(Error::Parallel(_)))));
+            let result = f.policy.acquire(
+                3,
+                wrong_group,
+                |stream| build(&f.definitions[3], stream),
+                &f.stream,
+            );
+            assert!(matches!(
+                result,
+                Err(LayerwiseAcquireError::Policy(Error::Parallel(_)))
+            ));
             let after = f.manager.report().unwrap();
             assert_eq!(resident(&f.manager), BTreeSet::from([id(0), id(1)]));
             assert_eq!(after.active_window(), before.active_window());
-            assert_eq!(after.offload().transfer(TransferDirection::DiskToDevice),
-                before.offload().transfer(TransferDirection::DiskToDevice));
-            assert!(after.units().iter().find(|unit| unit.id() == &id(1)).unwrap().device_pins() > 0,
-                "the unconsumed transfer must retain its actual lease");
+            assert_eq!(
+                after.offload().transfer(TransferDirection::DiskToDevice),
+                before.offload().transfer(TransferDirection::DiskToDevice)
+            );
+            assert!(
+                after
+                    .units()
+                    .iter()
+                    .find(|unit| unit.id() == &id(1))
+                    .unwrap()
+                    .device_pins()
+                    > 0,
+                "the unconsumed transfer must retain its actual lease"
+            );
         }
         last = Some(output);
     }
@@ -492,6 +550,7 @@ fn managed_inspection_and_wrong_address_reject_before_parameter_construction() {
         },
         |_| Ok(()),
         &f.stream,
+        None,
     );
     assert!(result.is_err());
     assert!(!called.get());
@@ -538,8 +597,13 @@ fn ordinary_source_loading_keeps_unquoted_execution_and_typed_unknown_quote() {
     // original source identity required by a paid construction context.
     let allocation = NativeAllocationFacts::current_host().unwrap();
     f.policy.layerwise_workspace(allocation).unwrap();
-    let context = eredu_nn::workspace::WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
-    let error = f.policy.layerwise_workspace_with_metadata(allocation, &context).unwrap_err();
+    let context = eredu_nn::workspace::WorkspaceContext::new(
+        MlxMetalWorkspaceMechanisms::current_host().unwrap(),
+    );
+    let error = f
+        .policy
+        .layerwise_workspace_with_metadata(allocation, &context)
+        .unwrap_err();
     let mut current: &(dyn std::error::Error + 'static) = &error;
     loop {
         if let Some(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound) =
@@ -644,37 +708,68 @@ mod parameter_source_tests {
         use eredu_nn::workspace::{WorkspaceContext, WorkspaceDtype, WorkspaceTensor};
         let f = fixture_with_host_capacity(true, 2, &[3, 2], true, 1_000_000);
         for definition in &f.definitions {
-            drop(f.manager.acquire(definition.id(), MemoryTier::Host).unwrap());
+            drop(
+                f.manager
+                    .acquire(definition.id(), MemoryTier::Host)
+                    .unwrap(),
+            );
         }
-        let selected = MlxSelectiveUnitPopulator::new(
-            ["independent.bank".to_owned()].into());
-        let host = Policy::new(f.manager.clone(), f.source.clone(),
-            (0..5).map(id).collect(), f.policy.layout.clone(), 2,
-            selected, Vec::new(), None, false, false).unwrap();
-        let workspace = host.layerwise_workspace(NativeAllocationFacts::current_host().unwrap()).unwrap();
+        let selected = MlxSelectiveUnitPopulator::new(["independent.bank".to_owned()].into());
+        let host = Policy::new(
+            f.manager.clone(),
+            f.source.clone(),
+            (0..5).map(id).collect(),
+            f.policy.layout.clone(),
+            2,
+            selected,
+            Vec::new(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let workspace = host
+            .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
+            .unwrap();
         assert!(workspace.excludes_parameter("independent.bank"));
         assert!(!workspace.excludes_parameter("missing.unit.weight"));
         let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
         let address = host.layout.address(0).unwrap();
         let rows = workspace.parameters(0, address, &context).unwrap();
-        let mut module = rows.into_iter().map(|(id, value)|
-            Parameter::new(ParameterSpec::trainable(id.as_str()).unwrap(), value)
-        ).collect::<Vec<_>>();
+        let mut module = rows
+            .into_iter()
+            .map(|(id, value)| {
+                Parameter::new(ParameterSpec::trainable(id.as_str()).unwrap(), value)
+            })
+            .collect::<Vec<_>>();
         let bank = WorkspaceTensor::existing(
-            context.layout(&[3], WorkspaceDtype::Float32).unwrap(), &context).unwrap();
-        module.push(Parameter::new(ParameterSpec::trainable("independent.bank").unwrap(), bank.clone()));
+            context.layout(&[3], WorkspaceDtype::Float32).unwrap(),
+            &context,
+        )
+        .unwrap();
+        module.push(Parameter::new(
+            ParameterSpec::trainable("independent.bank").unwrap(),
+            bank.clone(),
+        ));
         // Drop the native policy first: the source must retain its exact
         // immutable selection, not borrow a temporary filter or infer absence.
         drop(host);
         assert!(workspace.excludes_parameter("independent.bank"));
-        assert!(workspace.known_retained_control_bytes(true).unwrap() > 0,
-            "ordinary source retains its exact unpriced name payload in the quote");
-        let mut projection = workspace.parameter_source().prepare_projection(&context).unwrap();
+        assert!(
+            workspace.known_retained_control_bytes(true).unwrap() > 0,
+            "ordinary source retains its exact unpriced name payload in the quote"
+        );
+        let mut projection = workspace
+            .parameter_source()
+            .prepare_projection(&context)
+            .unwrap();
         projection.bind(&mut module, 0, address, &context).unwrap();
-        assert_eq!(retained(&context, &[bank, module.last().unwrap().as_ref().clone()]), 12);
+        assert_eq!(
+            retained(&context, &[bank, module.last().unwrap().as_ref().clone()]),
+            12
+        );
         drop(projection);
         drop(workspace);
-
     }
 
     #[test]

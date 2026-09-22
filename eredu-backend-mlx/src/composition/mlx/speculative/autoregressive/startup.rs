@@ -1,6 +1,8 @@
 //! Paid independent startup from the actual empty or populated canonical state.
 use super::*;
-use crate::backend::runtime::cache::state::{MlxHybridState, MlxKeyValueState};
+use crate::backend::runtime::cache::state::{
+    MlxHybridState, MlxKeyValueState, MlxPoolingAttentionState,
+};
 use crate::composition::mlx::replicated_text::ResidentResetProfile;
 use eredu_core::HostPreparationAuthority;
 use eredu_runtime::working_memory::{
@@ -17,16 +19,18 @@ use std::{
 enum StatePlan<'a> {
     KeyValue(PreparedResidentEmptyState<'a, MlxKeyValueState>),
     Hybrid(PreparedResidentEmptyState<'a, MlxHybridState>),
-    Populated(crate::backend::runtime::cache::state::PreparedResidentDecoderCopy<'a>),
+    Pooling(PreparedResidentEmptyState<'a, MlxPoolingAttentionState>),
+    Copy(crate::backend::runtime::cache::state::PreparedResidentDecoderCopy<'a>),
 }
 impl StatePlan<'_> {
     fn required_bytes(&self) -> Option<u64> {
         let (bytes, boxed) = match self {
             Self::KeyValue(plan) => (plan.required_bytes(), size_of::<MlxKeyValueState>()),
             Self::Hybrid(plan) => (plan.required_bytes(), size_of::<MlxHybridState>()),
+            Self::Pooling(plan) => (plan.required_bytes(), size_of::<MlxPoolingAttentionState>()),
             // The shared source copy pays its tables, outer box and numerical
             // account independently. This startup keeps only its stream costs.
-            Self::Populated(_) => (0, 0),
+            Self::Copy(_) => (0, 0),
         };
         bytes.checked_add(u64::try_from(boxed).ok()?)
     }
@@ -46,7 +50,11 @@ impl StatePlan<'_> {
                 .construct(host)
                 .map(MlxPredictionTargetState::new)
                 .map_err(|cause| sources.retain_startup_error(cause)),
-            Self::Populated(plan) => {
+            Self::Pooling(plan) => plan
+                .construct(host)
+                .map(MlxPredictionTargetState::new)
+                .map_err(|cause| sources.retain_startup_error(cause)),
+            Self::Copy(plan) => {
                 let initialized = model.erased().prefill_roots_runtime()?;
                 let mechanism = model
                     .workspace_mechanisms()
@@ -57,7 +65,7 @@ impl StatePlan<'_> {
                     &initialized,
                     mechanism,
                     sources.metadata_funding(),
-                    sources.request().capacity_bytes(),
+                    sources.request().limits().clone(),
                 )
             }
         }
@@ -92,7 +100,8 @@ pub(super) fn prepare(
         _ => return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)),
     };
     sources.validate_source(model, source_role)?;
-    let error = Error::PrefillControl;
+    let error =
+        |cause| Error::PrefillControl(cause).at_speculative_stage("AR startup state source");
     let source_origin = model
         .erased()
         .resident_control_origin_fixed()
@@ -105,8 +114,10 @@ pub(super) fn prepare(
     let mut populated = false;
     copy.visit_retained_arrays(&mut |_| populated = true)
         .map_err(|cause| sources.retain_startup_error(cause))?;
-    let plan = if populated {
-        StatePlan::Populated(copy)
+    // An empty paged state still owns a manager. Its independent destination
+    // uses the same admitted source-copy worker as a populated state.
+    let plan = if populated || copy.is_paged() {
+        StatePlan::Copy(copy)
     } else {
         match model.erased().resident_reset_profile() {
             Some(ResidentResetProfile::KeyValue) => StatePlan::KeyValue(
@@ -124,12 +135,24 @@ pub(super) fn prepare(
                 )
                 .map_err(error)?,
             ),
+            Some(ResidentResetProfile::Pooling) => StatePlan::Pooling(
+                PreparedResidentEmptyState::inspect(
+                    model
+                        .erased()
+                        .resident_pooling_reset_source()
+                        .map_err(error)?,
+                )
+                .map_err(error)?,
+            ),
             None => return Err(error(WorkingMemoryError::UnknownBound)),
         }
     };
     let stream = StreamCopyPlan::<HostPreparationAuthority>::capture(environment.stream())
         .map_err(|cause| sources.retain_startup_error(cause))?;
-    let bytes = controls(&plan, &stream).ok_or_else(|| error(WorkingMemoryError::UnknownBound))?;
+    let bytes = controls(&plan, &stream).ok_or_else(|| {
+        Error::PrefillControl(WorkingMemoryError::UnknownBound)
+            .at_speculative_stage("AR startup state and stream controls")
+    })?;
     let accepted = sources
         .request()
         .reserve_startup(source_role, bytes)
@@ -189,7 +212,7 @@ fn controls(
         size_of::<eredu_runtime::replicated_session::ReplicatedTextControlOrigin>(),
         size_of::<AutoregressiveSource>(),
         size_of::<AutoregressivePass>(),
-        size_of::<WorkingMemoryPool>(),
+        size_of::<MemoryLedger>(),
         size_of::<Error>(),
         6 * size_of::<usize>(),
     ];

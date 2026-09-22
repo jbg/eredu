@@ -3,7 +3,11 @@ use eredu_nn::{NeuralBackend, RotaryOperator, RotaryPosition, RotarySpec, Tensor
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16_384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -77,17 +81,17 @@ fn rotary_host_vectors_are_separate_from_native_frequency_copies() {
                 assert_eq!(report.host_workspace_bytes, Some(host));
                 assert_eq!(
                     report.total_bytes,
-                    report
-                        .tensor_buffers
-                        .total_bytes
-                        .map(|tensor| tensor + host)
+                    report.tensor_buffers.total_bytes.map(|tensor| tensor
+                        + host
+                        + crate::backend::nn::workspace::test_backing_controls(
+                            &selected(),
+                            &report
+                        ))
                 );
-                assert!(
-                    report
-                        .assumptions
-                        .iter()
-                        .any(|a| a.contains("host payload"))
-                );
+                assert!(report
+                    .assumptions
+                    .iter()
+                    .any(|a| a.contains("host payload")));
                 // Caller-provided embeddings do not undo frequency storage
                 // already allocated when the rotary operator was constructed.
                 context.begin_span();
@@ -193,10 +197,10 @@ fn attention_host_masks_follow_native_row_threshold_and_completed_key_tiles() {
 fn dense_and_affine_hybrid_spans_have_independent_tensor_and_host_bounds() {
     use eredu_architectures::qwen::hybrid;
     use eredu_core::OutputDemand;
-    use eredu_runtime::RuntimeStateComponents;
     use eredu_runtime::working_memory::{
-        InferenceWorkspaceSpan, WorkspaceResidentStateFactory, quote_inference_workspace,
+        quote_inference_workspace, InferenceWorkspaceSpan, WorkspaceResidentStateFactory,
     };
+    use eredu_runtime::RuntimeStateComponents;
     use eredu_runtime::{
         ArchitectureStateFactory, ExpertPass, LayerRuntimeState, LayerwiseRuntime, NoopObserver,
         ResidentExpertProvider, ResidentUnitWindow, RuntimeLayerState,
@@ -298,7 +302,14 @@ fn dense_and_affine_hybrid_spans_have_independent_tensor_and_host_bounds() {
                         assert!(gaps.is_empty(), "hybrid packed={packed} gaps: {gaps:?}");
                         assert_eq!(report.host_workspace_bytes, Some(0));
                         assert!(report.total_bytes.unwrap() >= report.retained_bytes.unwrap());
-                        assert_eq!(report.total_bytes, report.tensor_buffers.total_bytes);
+                        assert_eq!(
+                            report.total_bytes,
+                            report.tensor_buffers.total_bytes.map(|n| n
+                                + crate::backend::nn::workspace::test_backing_controls(
+                                    &selected(),
+                                    &report
+                                ))
+                        );
                         completed_spans += 1;
                         report
                     };
@@ -313,7 +324,9 @@ fn dense_and_affine_hybrid_spans_have_independent_tensor_and_host_bounds() {
                     };
                     let request = quote_inference_workspace(geometry, |span| {
                         let report = match span {
-                            InferenceWorkspaceSpan::Sampling(_) => panic!("model scheduler emitted a sampling phase"),
+                            InferenceWorkspaceSpan::Sampling(_) => {
+                                panic!("model scheduler emitted a sampling phase")
+                            }
                             InferenceWorkspaceSpan::Prefill(chunk) => inspect(
                                 chunk.position as usize,
                                 (chunk.input.end - chunk.input.start) as usize,

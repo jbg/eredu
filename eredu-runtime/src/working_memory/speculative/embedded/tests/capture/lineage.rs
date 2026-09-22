@@ -8,29 +8,29 @@ fn early_capture_lineage_is_exact_nonrefunding_and_reused_by_model_roles() {
     let workspace = EmbeddedInvocationWorkspace::target(invocation).unwrap();
     let report = report(workspace.geometry());
     let capacity = 1 << 26;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let source = capture_source(&pool);
-    let source_bytes = pool.used_bytes().unwrap();
+    let source_bytes = pool.payload_used_bytes().unwrap();
     let request = OriginalSpeculativeRequest::prepare_embedded(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
     )
     .unwrap();
     let other = OriginalSpeculativeRequest::prepare_embedded(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
     let lineage = request.prepare_embedded_capture_lineage(&source).unwrap();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.payload_used_bytes().unwrap();
     let alias = request.prepare_embedded_capture_lineage(&source).unwrap();
     assert!(lineage.ledger().same_storage(alias.ledger()));
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.payload_used_bytes().unwrap(), used);
     assert_eq!(
         request
             .inspect_embedded_capture_lineage_usage(&source, &alias)
@@ -97,7 +97,7 @@ fn early_capture_lineage_is_exact_nonrefunding_and_reused_by_model_roles() {
         legacy_peak - host.initialization_peak_bytes(),
         crate::working_memory::CaptureRunLedger::control_bytes().unwrap()
     );
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     let rejected = request
         .reserve_embedded_role_with_capture(
             cursor.claim(invocation).unwrap(),
@@ -110,7 +110,7 @@ fn early_capture_lineage_is_exact_nonrefunding_and_reused_by_model_roles() {
         rejected.cause(),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let (role, pending) = request
         .reserve_embedded_role_with_capture(
             cursor.claim(invocation).unwrap(),
@@ -143,9 +143,9 @@ fn early_capture_lineage_is_exact_nonrefunding_and_reused_by_model_roles() {
     drop((request, other, foreign, role, backend, owner));
     assert_eq!(alias.ledger().inspect_usage().unwrap(), used);
     drop((alias, lineage));
-    assert!(pool.used_bytes().unwrap() > source_bytes);
+    assert!(pool.payload_used_bytes().unwrap() > source_bytes);
     drop(frame);
-    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source_bytes);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

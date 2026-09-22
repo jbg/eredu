@@ -134,8 +134,8 @@ impl NativeOpeningSourceBinding {
     /// Measured fixed controls/construction moves only. Rc allocator overhead,
     /// all inventory map/vector/source-store allocations, existing builder
     /// temporaries, visitor controls and enclosing owners remain separate.
-    pub(in crate::composition::mlx::replicated_text) fn active_fixed_control_peak_bytes(
-    ) -> Option<u64> {
+    pub(in crate::composition::mlx::replicated_text) fn active_fixed_control_peak_bytes()
+    -> Option<u64> {
         std::mem::size_of::<OpeningSourceSlot>()
             .checked_add(std::mem::size_of::<NativeOpeningSourceGuard>())?
             .checked_add(std::mem::size_of::<NativeOpeningSourceInventory>())?

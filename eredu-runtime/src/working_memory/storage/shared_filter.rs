@@ -1,18 +1,26 @@
 //! Read-only source authentication; no source adoption, registration or pin birth.
 use super::*;
-use eredu_core::{SharedStorageAttachmentError, SharedStorageIdentity, SharedTokenFilter, SharedControllerSource};
-impl WorkingMemoryPool {
+use eredu_core::{
+    SharedControllerSource, SharedStorageAttachmentError, SharedStorageIdentity, SharedTokenFilter,
+};
+impl MemoryLedger {
     /// Named borrowed registration/attachment query transports; no allocation.
     pub fn shared_controller_source_validation_control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};
-        let parts = [size_of::<SharedControllerSource<'_>>(),
+        let parts = [
+            size_of::<SharedControllerSource<'_>>(),
             size_of::<(&Self, SharedControllerSource<'_>)>(),
             size_of::<std::sync::MutexGuard<'_, super::super::Usage>>(),
             size_of::<Result<bool, SharedStorageAttachmentError<std::convert::Infallible>>>(),
-            size_of::<Result<(), WorkingMemoryError>>(), size_of::<TypeId>(),
+            size_of::<Result<(), WorkingMemoryError>>(),
+            size_of::<TypeId>(),
             size_of::<Option<&Registry<SharedStorageIdentity>>>(),
-            size_of::<Option<(EntryLocator, &Entry)>>(), size_of::<(u64, bool)>()];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+            size_of::<Option<(EntryLocator, &Entry)>>(),
+            size_of::<(u64, bool)>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Verifies this borrowed immutable filter has its own retained accounting
@@ -28,8 +36,10 @@ impl WorkingMemoryPool {
     /// Verifies the actual immutable source's attachment and exact registration.
     /// This is the same worker for filters, recipe bytes and declarations; it
     /// neither creates custody nor discounts independently paid source storage.
-    pub fn validate_shared_controller_source(&self, source: SharedControllerSource<'_>)
-        -> Result<(), WorkingMemoryError> {
+    pub fn validate_shared_controller_source(
+        &self,
+        source: SharedControllerSource<'_>,
+    ) -> Result<(), WorkingMemoryError> {
         let bytes = source
             .capacity_bytes()
             .ok_or(WorkingMemoryError::Overflow)?;
@@ -37,7 +47,7 @@ impl WorkingMemoryPool {
             return Ok(());
         }
         let attached = source
-            .has_accounting_custody(self.shared_storage_domain())
+            .has_accounting_custody(self.shared_storage_accounting_id())
             .map_err(|error| match error {
                 SharedStorageAttachmentError::Poisoned => WorkingMemoryError::Poisoned,
                 _ => WorkingMemoryError::IdentityMismatch,
@@ -71,12 +81,27 @@ mod tests {
     use eredu_core::TokenFilter;
     #[test]
     fn attached_filter_source_requires_exact_pool_owner_and_registration() {
-        let pool = WorkingMemoryPool::new(4096, 0).unwrap();
-        let other = WorkingMemoryPool::new(4096, 0).unwrap();
+        let constructor = MemoryLedger::storage_metadata_control_bytes().unwrap()
+            + StoragePublicationLayout::<SharedStorageIdentity>::new(1)
+                .unwrap()
+                .requested_bytes();
+        let source = crate::working_memory::controller::controller_publication_layout()
+            .unwrap()
+            .requested_bytes()
+            + MemoryLedger::storage_metadata_control_bytes().unwrap();
+        let capacity = source
+            .checked_add(constructor)
+            .unwrap()
+            .checked_add(MemoryLedger::unquoted_owner_control_bytes().unwrap())
+            .unwrap()
+            .checked_add(6)
+            .unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
+        let other = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
         let source = pool
             .prepare_shared_token_filter(|| TokenFilter::allowed(vec![true, false, true]).unwrap())
             .unwrap();
-        let before = pool.used_bytes().unwrap();
+        let before = pool.payload_used_bytes().unwrap();
         pool.validate_shared_token_filter_source(&source).unwrap();
         pool.validate_shared_token_filter_source(&source.clone())
             .unwrap();
@@ -86,7 +111,7 @@ mod tests {
         ));
         let same_contents = SharedTokenFilter::new(source.as_ref().clone());
         let registration = pool
-            .register_storage([(
+            .register_host_storage([(
                 same_contents.identity().clone(),
                 same_contents.capacity_bytes().unwrap(),
             )])
@@ -97,10 +122,10 @@ mod tests {
             Err(WorkingMemoryError::IdentityMismatch)
         ));
         drop(registration);
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.payload_used_bytes().unwrap(), before);
         pool.validate_shared_token_filter_source(&SharedTokenFilter::new(TokenFilter::All))
             .unwrap();
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

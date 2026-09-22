@@ -2,9 +2,10 @@
 use super::*;
 
 // FrequencyScaledRope::new: one Arange, fifteen binary workers (two casts,
-// two broadcasts, one result each), one reciprocal (cast + result), and two
-// where workers (three casts, three broadcasts, result). Twelve eager scalar
-// descriptors are distinct. InputProducts adds the retained reciprocal.
+// two broadcasts, one result each), one reciprocal (ordinary Divide), and two
+// where workers (three casts, three broadcasts, result). Twelve explicit scalar
+// sources plus reciprocal's numerator are distinct. InputProducts adds another
+// reciprocal and its eager numerator.
 fn frequency_ancestors(
     algorithm: eredu_nn::RotaryAlgorithm,
     inverse: bool,
@@ -12,22 +13,22 @@ fn frequency_ancestors(
     use eredu_nn::RotaryAlgorithm as A;
     match algorithm {
         A::Llama3 { .. } => (
-            1 + 15 * 5 + 2 + 2 * 7 + 2 * usize::from(inverse),
-            15 * 6 + 2 + 2 * 9 + 2 * usize::from(inverse),
-            12,
+            1 + 15 * 5 + 5 + 2 * 7 + 5 * usize::from(inverse),
+            15 * 6 + 6 + 2 * 9 + 6 * usize::from(inverse),
+            13 + usize::from(inverse),
             0,
         ),
         // The same constructor uploads one denominator leaf, then keeps its
         // reciprocal lazy. Include that first-use eager descriptor as well as
         // the external-leaf traversal alternative.
-        A::Proportional { .. } if inverse => (2, 2, 1, 1),
+        A::Proportional { .. } if inverse => (5, 6, 2, 1),
         _ => (0, 0, 0, 1),
     }
 }
 
 pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
-    use WorkspaceOperationKindView as K;
     use eredu_nn::{RotaryAlgorithm as A, RotaryArithmetic};
+    use WorkspaceOperationKindView as K;
     let shape = operation.inputs.get(0)?.shape();
     let mut hidden_leaves = 0;
     let mut prefix = (0usize, 0usize, 0usize);
@@ -35,9 +36,7 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
     match operation.kind {
         K::TensorRotary(..) | K::RotaryFrequencies(..) => {}
         K::Rotary(_, None) => {
-            if operation.inputs.len() != 3 || operation.outputs.len() != 1
-                || shape.len() != 4
-            {
+            if operation.inputs.len() != 3 || operation.outputs.len() != 1 || shape.len() != 4 {
                 return None;
             }
             crate::backend::nn::attention::apply_rotary_embeddings_control_bytes()?;
@@ -45,8 +44,8 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
             // two dtype casts, four static index calls (Slice + Reshape),
             // negative-half Multiply and two further products plus Add
             // (four binary workers), then two-input concatenate (3/4).
-            let mut value = Lowering::plain(2 + 2 + 4 * 2 + 4 * 5 + 3,
-                2 + 2 + 4 * 2 + 4 * 6 + 4, 1);
+            let mut value =
+                Lowering::plain(2 + 2 + 4 * 2 + 4 * 5 + 3, 2 + 2 + 4 * 2 + 4 * 6 + 4, 1);
             value.intermediate_rank = 4;
             return Some(value);
         }

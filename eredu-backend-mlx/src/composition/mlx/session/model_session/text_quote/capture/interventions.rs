@@ -1,11 +1,11 @@
 //! The exact admitted edit source joins the existing cumulative host schedule.
 use super::*;
 use crate::composition::mlx::session::{
-    intervention::NativeInterventionEstimator, OriginalInterventionDeclaration,
+    OriginalInterventionDeclaration, intervention::NativeInterventionEstimator,
 };
 use eredu_core::{
-    intervention::{PreparedInterventionPlanCopy, SharedInterventionPlan},
     HostPreparationAuthority,
+    intervention::{PreparedInterventionPlanCopy, SharedInterventionPlan},
 };
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::{
@@ -21,9 +21,9 @@ impl<'a> CaptureAdmission<'a> {
     pub(in crate::composition::mlx::session::model_session::text_quote) fn with_intervention_source(
         mut self,
         source: &SharedInterventionPlan,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, Error> {
-        let pool = &self.session.payload.memory_pool;
+        let pool = &self.session.payload.memory_ledger;
         let funding = pool
             .prepare_workspace_metadata(
                 self.session
@@ -106,10 +106,15 @@ pub(super) fn validate_saved_source(
     source: Option<&OriginalInterventionSource>,
     metadata: eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
 ) -> Result<(), Error> {
-    let Some(source) = source else { return Ok(()); };
+    let Some(source) = source else {
+        return Ok(());
+    };
     let parts = [
-        size_of::<(&MlxModelSession, Option<&OriginalInterventionSource>,
-            eredu_runtime::working_memory::WorkspaceReportMetadata<'_>)>(),
+        size_of::<(
+            &MlxModelSession,
+            Option<&OriginalInterventionSource>,
+            eredu_runtime::working_memory::WorkspaceReportMetadata<'_>,
+        )>(),
         size_of::<Option<HostMetadataFunding>>(),
         size_of::<HostMetadataFunding>(),
         size_of::<Option<OriginalInterventionDeclaration>>(),
@@ -119,12 +124,20 @@ pub(super) fn validate_saved_source(
         OriginalInterventionSource::validation_control_bytes().ok_or_else(unknown)?,
         OriginalInterventionDeclaration::validation_control_bytes().ok_or_else(unknown)?,
     ];
-    metadata.charge(parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or_else(unknown)?).map_err(|cause| Error::Neural(metadata.error(cause)))?;
-    source.validate_pool(&session.payload.memory_pool).map_err(|cause|
-        Error::Neural(metadata.source(cause)))?;
+    metadata
+        .charge(
+            parts
+                .into_iter()
+                .try_fold(size_of_val(&parts), usize::checked_add)
+                .ok_or_else(unknown)?,
+        )
+        .map_err(|cause| Error::Neural(metadata.error(cause)))?;
+    source
+        .validate_pool(&session.payload.memory_ledger)
+        .map_err(|cause| Error::Neural(metadata.source(cause)))?;
     let funding = metadata.funding().ok_or_else(unknown)?;
-    let declaration = session.original_intervention_declaration(&funding)?
+    let declaration = session
+        .original_intervention_declaration(&funding)?
         .ok_or_else(|| Error::Neural(metadata.source(WorkingMemoryError::UnknownBound)))?;
     declaration.validate(source.plan().admission())
 }

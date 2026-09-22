@@ -1,7 +1,7 @@
 //! Shared metadata-only identity and geometry for one admitted host snapshot.
 use super::*;
 use eredu_core::WorkspaceBound;
-use eredu_runtime::{ExecutionUnitLayout, working_memory::completed_layerwise_window_bytes};
+use eredu_runtime::{working_memory::completed_layerwise_window_bytes, ExecutionUnitLayout};
 use std::{alloc::Layout, num::NonZeroUsize};
 
 pub(crate) type HostSourceIdentities =

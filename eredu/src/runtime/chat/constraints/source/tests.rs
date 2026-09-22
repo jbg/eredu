@@ -1,12 +1,13 @@
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use eredu_core::HostMetadataAccount;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use eredu_text::tokenizer_storage::TokenizerPlan;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
-use tokenizers::{AddedToken, decoders::byte_level::ByteLevel, models::bpe::BPE};
+use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
 
 #[derive(Debug)]
 struct Account {
@@ -62,7 +63,7 @@ fn tokenizer() -> tokenizers::Tokenizer {
         .unwrap();
     tokenizer
 }
-fn source(pool: &WorkingMemoryPool, raw: &tokenizers::Tokenizer) -> OriginalTokenizer {
+fn source(pool: &MemoryLedger, raw: &tokenizers::Tokenizer) -> OriginalTokenizer {
     let json = raw.to_string(false).unwrap();
     pool.compile_tokenizer(TokenizerPlan::prepare_json(json.as_bytes()).unwrap())
         .unwrap()
@@ -75,7 +76,7 @@ fn original_compiler_preserves_sparse_vocabulary_special_metadata_and_exact_eos(
         raw.token_to_id("<eos>").unwrap(),
         raw.token_to_id("<|end|>").unwrap(),
     ];
-    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
     let (funding, _, retired) = funding();
     let compiler =
         ConstraintCompiler::from_original_tokenizer(source(&pool, &raw), &eos, &funding).unwrap();
@@ -102,13 +103,13 @@ fn original_compiler_preserves_sparse_vocabulary_special_metadata_and_exact_eos(
     assert!(!retired.load(Ordering::SeqCst));
     drop(grammar);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn empty_configured_eos_does_not_reclassify_id_zero_or_detected_specials() {
     let raw = tokenizer();
-    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
     let (funding, _, _) = funding();
     let compiler =
         ConstraintCompiler::from_original_tokenizer(source(&pool, &raw), &[], &funding).unwrap();
@@ -130,9 +131,9 @@ fn empty_configured_eos_does_not_reclassify_id_zero_or_detected_specials() {
 #[test]
 fn rejected_metadata_and_unmapped_eos_retain_original_source_and_payer() {
     for refuse_metadata in [false, true] {
-        let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+        let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
         let source = source(&pool, &tokenizer());
-        let original_bytes = pool.used_bytes().unwrap();
+        let original_bytes = pool.live_charge_bytes().unwrap();
         let (funding, refuse, retired) = funding();
         refuse.store(refuse_metadata, Ordering::SeqCst);
         let error = ConstraintCompiler::from_original_tokenizer(source, &[u32::MAX], &funding)
@@ -148,17 +149,17 @@ fn rejected_metadata_and_unmapped_eos_retain_original_source_and_payer() {
         }
         drop(funding);
         assert!(!retired.load(Ordering::SeqCst));
-        assert_eq!(pool.used_bytes().unwrap(), original_bytes);
+        assert_eq!(pool.live_charge_bytes().unwrap(), original_bytes);
         drop(error);
         assert!(retired.load(Ordering::SeqCst));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn declaration_shell_refusal_preserves_compiler_funding_after_source_retirement() {
     let raw = tokenizer();
-    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
     let (funding, refuse, retired) = funding();
     let compiler =
         ConstraintCompiler::from_original_tokenizer(source(&pool, &raw), &[], &funding).unwrap();
@@ -177,7 +178,7 @@ fn declaration_shell_refusal_preserves_compiler_funding_after_source_retirement(
     .unwrap();
     drop((compiler, funding));
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     let mut found = false;
     while let Some(error) = cause {
@@ -190,5 +191,5 @@ fn declaration_shell_refusal_preserves_compiler_funding_after_source_retirement(
     assert!(found);
     drop(error);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

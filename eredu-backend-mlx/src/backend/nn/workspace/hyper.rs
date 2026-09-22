@@ -8,7 +8,7 @@ use super::{
     *,
 };
 
-use super::facts::{self, Emitter, FactResult, Output, add, mul};
+use super::facts::{self, add, mul, Emitter, FactResult, Output};
 
 fn invalid() -> MlxWorkspaceFactError {
     MlxWorkspaceFactError::descriptor("invalid Metal multi-stream workspace descriptor")
@@ -85,8 +85,8 @@ fn finish(
     detail: &'static str,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
-    // The old collection computed EVERY output capacity before summing them.
-    // Preserve that error order without a dynamic metadata destination.
+    // Validate every output capacity before summing so failures have a
+    // deterministic order without a dynamic metadata destination.
     for output in op.outputs.iter() {
         capacity(a, output.elements()?)?;
     }
@@ -216,6 +216,12 @@ pub(super) fn emit(
     let Some(geometry) = geometry(op)? else {
         return Ok(None);
     };
+    // The same equation counter visits actual ScalarF32, mean-divisor,
+    // empty Matmul and zero-fill constructors, including checked loop counts.
+    let sources = structure::inspect(op)?.ok_or_else(invalid)?.seeds;
+    if sources != 0 {
+        sink.default_scratch(mul(u64::try_from(sources)?, capacity(a, 1)?)?, sources)?;
+    }
     let op = &op;
     match geometry {
         Geometry::Collapse {
@@ -322,6 +328,11 @@ pub(super) fn emit(
 }
 
 mod structure;
+pub(super) fn ordinary_call_controls(
+    operation: WorkspaceOperationView<'_>,
+) -> FactResult<Option<OrdinaryCallControls>> {
+    structure::ordinary_call_controls(operation)
+}
 pub(super) use structure::inspect as structure;
 
 #[cfg(test)]

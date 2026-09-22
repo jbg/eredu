@@ -90,6 +90,7 @@ pub(super) fn emit(
     let output_bytes = capacity_fixed(allocation, output.elements()?)?;
     let mut total = sum_cost_fixed(allocation, input.elements()?, output.elements()?, extent)?;
     if name == "mean" {
+        sink.default_scratch(capacity_fixed(allocation, 1)?, 1)?;
         // MLX mean is sum / number_of_elements. Count the scalar and both
         // possible division input casts plus the division result.
         total = add(

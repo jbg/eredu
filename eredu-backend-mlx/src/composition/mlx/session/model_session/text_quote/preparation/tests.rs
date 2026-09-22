@@ -1,6 +1,8 @@
 use super::super::sequence::fixture::tests as fixture;
 use super::super::sequence::fixture::{Mode, Probe};
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     GenerationSequenceRequest, TextGeneration, TextGenerationBackend, TextGenerationInput,
     TextPreparationOptions, TokenFilter,
@@ -64,9 +66,10 @@ fn admitted(
     sampling.temperature = temperature;
     let config = TextGenerationConfig::new(sampling)
         .with_seed(19)
-        .with_inference_policy(base.inference_policy());
+        .with_inference_policy(base.inference_policy().clone());
     let options = capture.map(|source| TextPreparationOptions {
-        interventions: None, capture: Some(source.clone()),
+        interventions: None,
+        capture: Some(source.clone()),
     });
     let result = TextGeneration::from_input_with_sequence(
         runtime,
@@ -131,7 +134,7 @@ fn original_pair_retries_the_same_input_sampler_work_and_node_then_spends_once()
     let stream = fixture::stream();
     for capture in [false, true] {
         for temperature in [0.0, 0.65] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
             let source = capture.then(|| fixture::source(&runtime));
             let (probe, preparation) = admitted(&mut runtime, source.as_ref(), temperature);
@@ -146,7 +149,7 @@ fn original_pair_retries_the_same_input_sampler_work_and_node_then_spends_once()
                 );
                 let same = prompt_state(scopes);
                 assert_eq!(same.0, first_ptr);
-                let used = pool.used_bytes().unwrap();
+                let used = pool.fixture_host_charge().unwrap();
                 for _ in 0..3 {
                     busy(
                         MlxBackend::prepare_text_prompt_admitted(
@@ -157,7 +160,7 @@ fn original_pair_retries_the_same_input_sampler_work_and_node_then_spends_once()
                         .unwrap_err(),
                     );
                     assert_eq!(prompt_state(scopes), same);
-                    assert_eq!(pool.used_bytes().unwrap(), used);
+                    assert_eq!(pool.fixture_host_charge().unwrap(), used);
                 }
                 assert!(matches!(
                     MlxBackend::prepare_text_prompt_admitted(
@@ -206,7 +209,7 @@ fn original_pair_retries_the_same_input_sampler_work_and_node_then_spends_once()
                     .unwrap(),
                 );
                 let same = sampling_state(scopes);
-                let used = pool.used_bytes().unwrap();
+                let used = pool.fixture_host_charge().unwrap();
                 for _ in 0..3 {
                     busy(
                         MlxBackend::start_text_generation_admitted(
@@ -218,7 +221,7 @@ fn original_pair_retries_the_same_input_sampler_work_and_node_then_spends_once()
                         .unwrap(),
                     );
                     assert_eq!(sampling_state(scopes), same);
-                    assert_eq!(pool.used_bytes().unwrap(), used);
+                    assert_eq!(pool.fixture_host_charge().unwrap(), used);
                 }
             });
             let state = MlxBackend::start_text_generation_admitted(
@@ -246,7 +249,7 @@ fn original_pair_retries_the_same_input_sampler_work_and_node_then_spends_once()
 #[test]
 fn original_scope_capsules_outlive_quiescence_probe_drop_and_native_child_retirement() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let (probe, preparation) = admitted(&mut runtime, None, 0.0);
     let held = probe.facts().held;
@@ -287,24 +290,24 @@ fn original_scope_capsules_outlive_quiescence_probe_drop_and_native_child_retire
     // Retiring model owners may span several guarded queue batches. Drain to
     // the exact original capsule charge before testing parent/child deletion.
     fixture::settle(&pool, held);
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(parent);
     safemlx::reclaim_allocation_owners();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         held,
         "live child retains its native parent allocation"
     );
     drop(child);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         held,
         "post-delete owner nodes still await ordinary unlocked reclamation"
     );
     let copy = pool.clone();
     std::thread::spawn(move || {
         safemlx::reclaim_allocation_owners();
-        assert_eq!(copy.used_bytes().unwrap(), 0);
+        assert_eq!(copy.fixture_host_charge().unwrap(), 0);
     })
     .join()
     .unwrap();
@@ -313,7 +316,7 @@ fn original_scope_capsules_outlive_quiescence_probe_drop_and_native_child_retire
 #[test]
 fn same_original_pair_rejects_reentry_and_unwind_cannot_refill_the_role() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let (probe, preparation) = admitted(&mut runtime, None, 0.0);
     let quote = preparation.quote.as_ref().unwrap();

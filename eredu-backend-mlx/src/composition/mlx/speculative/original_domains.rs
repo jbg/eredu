@@ -90,6 +90,9 @@ pub(crate) fn prepare_domains(
     root_capacity: usize,
 ) -> Result<(OriginalSpeculativeDomains, OriginalSpeculativeRoots), OriginalSpeculativeDomainError>
 {
+    if environment.buffer_placement()?.as_ref() != custody.placement() {
+        return Err(OriginalBufferCause::ForeignDomain.into());
+    }
     let graph = PreparedSubmissionGraphQuota::try_new(graph_capacity, custody.clone())
         .map_err(|e| e.into_parts().0)?
         .try_allocate()

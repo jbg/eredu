@@ -359,7 +359,8 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
         buffer: safemlx_sys::mlx_host_transfer_buffer,
     ) -> Result<(), PreparedAllocationOwnerError<Self>> {
         self.attach_with(|outcome, node, payload| unsafe {
-            // SAFETY: only called by a borrowed immutable host-buffer owner.
+            // SAFETY: a borrowed immutable owner or fresh exclusive writer
+            // retains this exact buffer throughout the nonallocating handoff.
             safemlx_sys::mlx_host_transfer_buffer_attach_prepared_allocation_owner(
                 outcome,
                 buffer,
@@ -368,6 +369,27 @@ impl<T: Send + 'static> PreparedAllocationOwner<T> {
                 Some(retirement::retire::<T>),
             )
         })
+    }
+    pub(crate) fn host_attachment_control_bytes() -> Option<usize> {
+        let native = unsafe {
+            // SAFETY: linked sizeof-only query; no native object or allocation.
+            safemlx_sys::mlx_host_transfer_buffer_prepared_owner_control_bytes()
+        };
+        let frames = [
+            native,
+            mem::size_of::<Self>(),
+            mem::size_of::<Result<(), PreparedAllocationOwnerError<Self>>>(),
+            mem::size_of::<PreparedAllocationOwnerCause>(),
+            mem::size_of::<safemlx_sys::mlx_host_transfer_buffer>(),
+            mem::size_of::<Option<runtime_lock::RuntimeLockGuard>>(),
+            mem::size_of::<(i32, *mut i32, *mut c_void, *mut c_void)>(),
+            mem::size_of::<Result<(), Exception>>(),
+            mem::size_of::<Option<NativeNode>>(),
+            mem::size_of::<Option<Box<OwnedNode<T>>>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(mem::size_of_val(&frames), usize::checked_add)
     }
     // Both closed witnesses use this exact node move. No initialized exception
     // handler is entered: all producer refusals are fixed, allocation-free statuses.

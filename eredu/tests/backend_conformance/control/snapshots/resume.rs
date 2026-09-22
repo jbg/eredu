@@ -72,11 +72,12 @@ fn admit<C: eredu_core::TokenFilterController>(
     };
     let capacity = config
         .inference_policy()
-        .managed_memory_capacity_bytes
-        .ok_or_else(|| map(WorkingMemoryError::UnknownBound.into()))?;
+        .memory_limits
+        .resolve(env.pool.topology())
+        .map_err(|error| map(WorkingMemoryError::from(error).into()))?;
     let funding = env
         .pool
-        .prepare_workspace_metadata(&env.execution, capacity)?;
+        .prepare_workspace_metadata(&env.execution, capacity.clone())?;
     funding.reserve_metadata(
         size_of::<ResumePreparation>()
             + size_of::<Result<ResumePreparation, eredu_core::BackendFailure>>()
@@ -94,7 +95,7 @@ fn admit<C: eredu_core::TokenFilterController>(
         .map_err(|e| admitted_text::funded_error(e, &funding))?;
     let original = admitted_text::Preparation::resumed(
         env,
-        config,
+        config.clone(),
         controller,
         context,
         geometry,
@@ -151,7 +152,6 @@ fn revise_capture(
         let copy = eredu_core::capture::PreparedCapturePlanCopy::inspect_limit_revision(
             saved.source(),
             limits.clone(),
-            &runtime.session().capture_discovery.support.capture,
         )
         .map_err(|e| admitted_text::funded_error(e, funding))?;
         let declaration = pool
@@ -312,7 +312,7 @@ impl TextResumeBackend for MockBackend {
         }
         prepared.source.validate(runtime)?;
         let original = prepared.original.as_ref().unwrap();
-        let stage = original.request.claim_sampling(prepared.config)?;
+        let stage = original.request.claim_sampling(prepared.config.clone())?;
         let mut state = observed_mock::State {
             sampling: prepared.source.sampling.sampling.clone(),
             ..Default::default()

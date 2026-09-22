@@ -5,7 +5,7 @@ use crate::backend::runtime::checkpoint::store::{
     MaterializationPayloadShape, PreparedEncodedInputPlan,
 };
 use crate::backend::submission_recovery::native_role::{NativeRoleCapacity, NativeRoleContext};
-use eredu_runtime::working_memory::{SharedNativeInitializationFailure, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, SharedNativeInitializationFailure};
 use safemlx::{
     CpuAffineQuantizeSubmissionLayout, ImmutableHostTransferBuffer, PreparedInputRuntime,
 };
@@ -92,7 +92,9 @@ impl<I: 'static> TileError<I> {
             Self::Admission(cause) => BackendFailure::from_error(
                 cause.retire_output_and_map_error(std::convert::identity),
             ),
-            Self::Invocation(cause) => cause.retire_and_map_error(ConstructionError::into_backend_failure),
+            Self::Invocation(cause) => {
+                cause.retire_and_map_error(ConstructionError::into_backend_failure)
+            }
         }
     }
 }
@@ -101,7 +103,7 @@ impl<I: 'static> TileError<I> {
 /// and native shape remain alive until the synchronous input constructor returns;
 /// native aliases then retain their own input accounts through completion.
 pub(super) struct Tile<'a> {
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     runtime: &'a PreparedInputRuntime,
     target: &'a BoundedQuantizationTarget,
     quantization: eredu_checkpoint::AffineQuantization,
@@ -117,7 +119,7 @@ pub(super) struct Tile<'a> {
 }
 impl<'a> Tile<'a> {
     pub(super) fn prepare<I: 'static>(
-        pool: &'a WorkingMemoryPool,
+        pool: &'a MemoryLedger,
         runtime: &'a PreparedInputRuntime,
         source: &eredu_checkpoint::store::RetainedCheckpointSource,
         recipe: &DerivedWeightRecipe,
@@ -272,7 +274,7 @@ impl<'a> Tile<'a> {
 /// birth, cold declarations and final destinations belong to preparation; the
 /// shared driver admits its queue and cache controls.
 pub(super) struct CpuEncodedAffineProducer<'a> {
-    pub(super) pool: &'a WorkingMemoryPool,
+    pub(super) pool: &'a MemoryLedger,
     pub(super) resources: &'a cpu_resources::CpuTileResources,
 }
 impl TileProducer for CpuEncodedAffineProducer<'_> {

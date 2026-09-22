@@ -118,10 +118,13 @@ pub(super) fn release_pins<'a>(
         } else {
             state.lifecycle.release(id)
         };
-        debug_assert!(released.is_ok(), "source pin remains canonical until retirement");
+        debug_assert!(
+            released.is_ok(),
+            "source pin remains canonical until retirement"
+        );
         let retired = if released.is_ok() {
             // This does not create a discard request. Only a previously
-            // completed original scan can have installed that exact request.
+            // completed scan can have installed that exact request.
             super::super::original_discard::take_pending(&mut state, id).0
         } else {
             None
@@ -134,7 +137,7 @@ pub(super) fn release_pins<'a>(
 fn fixed_bytes() -> Option<usize> {
     let parts = [
         size_of::<PinnedCacheSource>(),
-        CacheResidencyManager::original_discard_control_bytes()?,
+        CacheResidencyManager::discard_retirement_control_bytes()?,
         size_of::<Result<PinnedCacheSource, CacheSourceFailure>>(),
         size_of::<Vec<CacheBlockId>>(),
         size_of::<CacheBlockId>(),

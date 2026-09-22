@@ -91,7 +91,7 @@ impl PrefillTargets {
 pub(in crate::working_memory) struct OwnedPrefillTensor {
     // Actual payload always retires before the final original-H custody.
     pub shape: Vec<usize>,
-    pub data: Vec<f32>,
+    pub data: CaptureTensorData,
     pub covered: usize,
     pub custody: CaptureTensorCustody,
 }
@@ -106,16 +106,16 @@ impl OwnedPrefillTensor {
     // partition adapter supplies its authenticated local geometry, while the
     // ordinary entry above retains the original global geometry.
     pub(in crate::working_memory) fn allocate_geometry(
-        geometry: &CaptureTensorGeometry<'_>, custody: CaptureTensorCustody,
+        geometry: &CaptureTensorGeometry<'_>,
+        custody: CaptureTensorCustody,
     ) -> Result<Self, WorkingMemoryError> {
         custody.validate()?;
         let mut shape = Vec::with_capacity(geometry.shape().len());
         for &n in geometry.shape() {
             shape.push(n);
         }
-        let mut data = Vec::with_capacity(geometry.elements());
         // One exact initialized destination; these placeholders prove no coverage.
-        data.resize(geometry.elements(), 0.0);
+        let data = CaptureTensorData::allocate(geometry, true);
         custody.validate()?;
         Ok(Self {
             shape,

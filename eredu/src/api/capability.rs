@@ -1,9 +1,8 @@
 //! Facade composition of portable capability policy and backend observations.
 
 use eredu_core::{
-    apply_admission_policy, AdmissionRequest, AdmissionResult, AvailableMemory, CapabilityError,
-    InputTokenCount, ModelCapabilities, ModelCapabilityBackend, RuntimeStateEstimate,
-    StaticMemoryReport,
+    apply_admission_policy, AdmissionRequest, AdmissionResult, CapabilityError, InputTokenCount,
+    ModelCapabilities, ModelCapabilityBackend, RuntimeStateEstimate, StaticMemoryReport,
 };
 
 use super::LoadedModel;
@@ -67,18 +66,14 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
         B::static_memory(&self.runtime)
     }
 
-    /// Applies portable context and memory policy without allocating a model cache.
-    pub fn admit(
-        &self,
-        request: AdmissionRequest,
-        available: Option<&AvailableMemory>,
-    ) -> Result<AdmissionResult, CapabilityError> {
+    /// Checks context and completeness, retaining physical limits for ledger admission.
+    pub fn admit(&self, request: AdmissionRequest) -> Result<AdmissionResult, CapabilityError> {
         let capabilities = self.capabilities()?;
         let state = self.estimate_runtime_state(
             request.input,
             request.max_output_tokens,
             request.batch_size,
         )?;
-        apply_admission_policy(&capabilities, request, state, available)
+        apply_admission_policy(&capabilities, request, state)
     }
 }

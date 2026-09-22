@@ -25,7 +25,6 @@ pub(super) fn plan(descriptor: &ArchitectureDescriptor) -> AdmittedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::RoutedUnits],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let selections = descriptor
@@ -76,7 +75,6 @@ pub(super) fn plan(descriptor: &ArchitectureDescriptor) -> AdmittedCapturePlan {
                 encoded_bytes: 4_000_000_000,
                 ..usage
             },
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }

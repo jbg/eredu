@@ -1,5 +1,5 @@
 use super::*;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -64,8 +64,8 @@ fn emitted_tokens_retire_parents(
 ) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for temperature in [0.0, 0.7] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+        let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
         let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
         let model = eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
             .unwrap();
@@ -199,7 +199,7 @@ fn emitted_tokens_retire_parents(
         await_retirement(&token_retirement);
         crate::backend::submission_recovery::wait_for_retirement(|| {
             reclaim();
-            pool.unquoted_owner_count().unwrap() == 0 && pool.used_bytes().unwrap() == 0
+            pool.unquoted_owner_count().unwrap() == 0 && pool.fixture_host_charge().unwrap() == 0
         });
     }
 }
@@ -224,3 +224,7 @@ fn metal_emitted_greedy_and_stochastic_tokens_fit_individual_backing_bounds() {
         allocation.buffer_capacity(16).unwrap(),
     );
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -1,8 +1,11 @@
-//! Real native SessionPrefill row composition. Gateway/readiness stays disabled.
+//! Native prefill rows retain original host controls and ordinary physical
+//! publication. Collector populations come from actual opening storage and
+//! the same equation trace used to admit the work.
 use super::*;
 use crate::backend::runtime::residency::storage::StorageIdentity as Key;
 use crate::composition::mlx::replicated_text::{NativeOpeningRows, NativeOpeningRowsOwner};
 use crate::composition::mlx::session::model_session::text_error;
+use crate::memory_fixture::LedgerFixture;
 use eredu_runtime::layered::PreparedCaptureSelection;
 use std::{collections::BTreeMap, mem::size_of};
 
@@ -26,7 +29,7 @@ struct Joined {
     reservation: WorkingMemoryReservation,
     run: WorkingMemoryFundingRun,
     sources: RetainedStoragePublication,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     tokens: Arc<[i32]>,
     exact: u64,
     // Streamed weights reopen this test-owned artifact during actual execution.
@@ -67,29 +70,45 @@ fn build(kind: usize, chunk: u64, install: bool) -> Joined {
 }
 fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined, Option<Error>) {
     let stream = stream();
-    let bootstrap = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let bootstrap = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let bootstrap_owner = NativeMemoryOwner::acquire(&bootstrap).unwrap();
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let session =
         PrefillRetentionFixture::load_with_options(artifact.path(), &stream, options(kind))
             .unwrap();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let initial = session.inventory().unwrap();
-    let initial_bytes = initial.byte_bound().unwrap().unwrap();
+    let initial_payload = initial.byte_bound().unwrap().unwrap();
+    let opening_publication_rows = initial.generic_publication_rows(&pool).unwrap();
     let owner = NativeMemoryOwner::acquire(&pool).unwrap();
     // Original C is deliberately absent. Only real loaded owners are registered.
     let sources = initial.publish_unquoted(&owner).unwrap();
     drop((owner, bootstrap_owner));
-    assert_eq!(pool.used_bytes().unwrap(), initial_bytes);
+    let initial_bytes = pool.fixture_host_charge().unwrap();
+    assert!(
+        initial_bytes >= initial_payload,
+        "native backing controls accompany the payload"
+    );
     let g = geometry(chunk);
     let tokens: Arc<[i32]> = Arc::from([1, 2, 3, 4, 5]);
     let source = session.opening_source(g);
     let selected = session.opening_selection(&source).unwrap();
     let bound = selected.bind_geometry(g).unwrap();
     let proposal = session.opening_rows_proposal(bound).unwrap();
+    let mut ordinary = None;
     let q = session
-        .opening_rows_quote(&pool, g, &source, &tokens)
+        .opening_rows_quote(&pool, g, &source, &tokens, |equations| {
+            let plan = OrdinaryPublicationPlan::for_closing_population(
+                opening_publication_rows,
+                equations.maximum_closing_storage_allocations(),
+                1,
+            )?;
+            let bytes = plan.additional_bytes();
+            ordinary = Some(plan);
+            Ok(bytes)
+        })
         .unwrap();
+    let ordinary = ordinary.expect("actual opening and traced closing storage population");
     let c = PreparedCapturePlanPublication::prepare(
         &pool,
         q.span_workspace().plan(),
@@ -117,7 +136,14 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
         // A fresh actual equation report has equal numeric facts but a distinct
         // unpromoted SpanPlan. It must not borrow the accepted plan's attachment.
         let other_quote = session
-            .opening_rows_quote(&pool, g, &source, &tokens)
+            .opening_rows_quote(&pool, g, &source, &tokens, |equations| {
+                OrdinaryPublicationPlan::for_closing_population(
+                    opening_publication_rows,
+                    equations.maximum_closing_storage_allocations(),
+                    1,
+                )
+                .map(|plan| plan.additional_bytes())
+            })
             .unwrap();
         let other_c = PreparedCapturePlanPublication::prepare(
             &pool,
@@ -143,32 +169,34 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
                 other_c,
             )
             .unwrap();
-        assert_eq!(other_quote.incremental_bytes(), q.incremental_bytes());
+        assert_eq!(
+            other_quote.incremental_bytes().unwrap(),
+            q.incremental_bytes().unwrap()
+        );
         drop(other_quote);
         Some(other)
     } else {
         None
     };
-    let exact = initial_bytes.checked_add(q.incremental_bytes()).unwrap();
     let request = AdmissionRequest {
         input: InputTokenCount::text(5),
         max_output_tokens: 1,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(0),
+        memory_limits: Default::default(),
     };
     // First prove this exact quote passes core policy. The domain-capacity
     // probe below must then reject it through the original residual binding,
     // including registered preparation/source credit on bounded weight routes.
-    let incremental =
-        WorkspaceBound::bounded(q.incremental_bytes(), "actual complete original quote");
+    let incremental = WorkspaceBound::bounded(
+        q.incremental_bytes().unwrap(),
+        "actual complete original quote",
+    );
     let admission = match eredu_core::apply_admission_policy_with_incremental(
         session.capabilities(),
         request.clone(),
         q.state().clone(),
         &incremental,
-        None,
     )
     .unwrap()
     {
@@ -176,6 +204,19 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
         other => panic!("actual joined quote: {other:?}"),
     };
     assert_eq!(admission.incremental_required_bytes, q.incremental_bytes());
+    let required = q
+        .reservation_requirements(&admission)
+        .unwrap()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let before = pool.snapshot().unwrap();
+    let exact = pool
+        .fixture_host_current()
+        .unwrap()
+        .checked_add(required)
+        .unwrap();
     let mut candidates = Vec::new();
     let rejection = plan_prefill_incremental_with_capacity(
         session.identity(),
@@ -183,7 +224,7 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
         session.capabilities(),
         request.clone(),
         g,
-        exact - 1,
+        crate::memory_fixture::physical_host_limits(&pool, exact - 1),
         |candidate| {
             candidates.push(candidate);
             if candidate == g {
@@ -196,7 +237,7 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
                     candidate.prefill_chunk_positions + 1,
                     g.prefill_chunk_positions
                 );
-                assert_eq!(pool.used_bytes().unwrap(), initial_bytes);
+                assert_eq!(pool.snapshot().unwrap(), before);
                 Err(WorkingMemoryError::PreparedSourceUnavailable.into())
             }
         },
@@ -205,9 +246,7 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
         assert_eq!(candidates, [g]);
         assert!(matches!(
             rejection,
-            Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded {
-                required_bytes, available_bytes,
-            })) if required_bytes == q.incremental_bytes() && available_bytes + 1 == required_bytes
+            Err(PrefillPlanningError::Reservation(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))) if required_bytes == required && (limit_bytes - existing_bytes) + 1 == required_bytes
         ));
     } else {
         assert_eq!(candidates.len(), 2);
@@ -219,14 +258,14 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
             ))
         ));
     }
-    assert_eq!(pool.used_bytes().unwrap(), initial_bytes);
+    assert_eq!(pool.snapshot().unwrap(), before);
     let (reservation, accepted) = plan_prefill_incremental_with_capacity(
         session.identity(),
         &pool,
         session.capabilities(),
         request,
         g,
-        exact,
+        crate::memory_fixture::physical_host_limits(&pool, exact),
         |candidate| {
             assert_eq!(candidate, g, "the original candidate fits exactly");
             Ok(q.clone())
@@ -270,10 +309,21 @@ fn build_probe(kind: usize, chunk: u64, install: bool, foreign: bool) -> (Joined
         .unwrap()
         .into_capture_session()
         .unwrap();
-    let work =
-        FundedWork::new_with_opening_rows(scope, Some(owned.control_guard()), Some(rows.clone()))
-            .unwrap();
-    assert_eq!(pool.effective_capacity().unwrap(), exact);
+    let work = FundedWork::new_with_publication(
+        scope,
+        Some(owned.control_guard()),
+        Some(rows.clone()),
+        None,
+        None,
+        None,
+        None,
+        Some(ordinary),
+    )
+    .unwrap();
+    assert_eq!(
+        pool.snapshot().unwrap().domains[0].effective_limit,
+        MemoryLimit::Finite(exact)
+    );
     (
         Joined {
             session,
@@ -307,7 +357,7 @@ fn unique(entries: Vec<(Key, u64)>) -> BTreeMap<Key, u64> {
 struct NativeRows<'a> {
     work: &'a FundedWork,
     rows: &'a NativeOpeningRows,
-    pool: &'a WorkingMemoryPool,
+    pool: &'a MemoryLedger,
     stream: &'a Stream,
     cancel: GenerationCancellationToken,
     cut: Cut,
@@ -330,7 +380,14 @@ impl ScheduledCaptureBackend for NativeRows<'_> {
         for (key, bytes) in unique(opening) {
             // In later chunks these include the new KV published by the prior
             // end hook. Initial loaded owners are existing-only as well.
-            assert!(self.pool.pin_registered_storage([(key, bytes)]).is_ok());
+            assert_eq!(
+                self.pool
+                    .registered_allocation(&key)
+                    .unwrap()
+                    .unwrap()
+                    .capacity_bytes(),
+                bytes
+            );
         }
         self.chunks.push(context.chunk().input.clone());
         self.work
@@ -349,12 +406,16 @@ impl ScheduledCaptureBackend for NativeRows<'_> {
             "same-session end callback precedes observer retirement"
         );
         let opening = unique(opening);
-        for (key, bytes) in unique(end) {
-            if matches!(&key, Key::Native(_)) && !opening.contains_key(&key) {
-                assert!(
-                    self.pool.pin_registered_storage([(key, bytes)]).is_err(),
-                    "new end backing has no early registry publication"
-                );
+        let end = unique(end);
+        for (key, bytes) in &end {
+            if matches!(key, Key::Native(_)) && !opening.contains_key(key) {
+                // A backing can already have birth or prior-owner publication.
+                // Otherwise the original allowance still covers it. Neither
+                // state retires the current capture's source pins.
+                if let Some(allocation) = self.pool.registered_allocation(key).unwrap() {
+                    assert_eq!(allocation.capacity_bytes(), *bytes);
+                }
+                assert!(self.work.capture_state_for_test().unwrap().is_some());
                 self.new_native += 1;
             }
         }
@@ -368,6 +429,17 @@ impl ScheduledCaptureBackend for NativeRows<'_> {
         self.work
             .retire_capture_chunk(ticket)
             .map_err(FundedCaptureError::Backend)?;
+        for (key, bytes) in end {
+            assert_eq!(
+                self.pool
+                    .registered_allocation(&key)
+                    .unwrap()
+                    .unwrap()
+                    .capacity_bytes(),
+                bytes,
+                "completed handoff publishes every retained end backing"
+            );
+        }
         assert!(self.work.capture_state_for_test().unwrap().is_none());
         assert_eq!(self.rows.snapshot_for_test().1, None);
         self.completed.push(chunk.clone());
@@ -476,7 +548,8 @@ fn execute(f: &mut Joined, cut: Cut, initially_cancelled: bool) -> Observed {
     }
 }
 fn finish(f: &Joined, result: &PrefillFixtureResult) {
-    let mut inventory = f.session.inventory().unwrap();
+    let mut inventory = f.work.prepare_inventory().unwrap();
+    f.session.collect_inventory(&mut inventory).unwrap();
     if let Some(scores) = &result.scores {
         scores.evaluated().unwrap();
         inventory.include_array(scores).unwrap();
@@ -484,8 +557,11 @@ fn finish(f: &Joined, result: &PrefillFixtureResult) {
     f.work.publish(inventory).unwrap();
     f.work.certify().unwrap();
     assert!(f.work.scope.borrow().is_none());
-    assert_eq!(f.pool.effective_capacity().unwrap(), f.exact);
-    assert!(f.pool.peak_bytes().unwrap() <= f.exact);
+    assert_eq!(
+        f.pool.snapshot().unwrap().domains[0].effective_limit,
+        MemoryLimit::Finite(f.exact)
+    );
+    assert!(f.pool.snapshot().unwrap().domains[0].historical_peak_bytes <= f.exact);
 }
 fn close_numeric(a: &[(Vec<i32>, Vec<f32>)], b: &[(Vec<i32>, Vec<f32>)]) {
     assert_eq!(a.len(), b.len());
@@ -604,7 +680,14 @@ fn failed(cut: Cut, phase: &str) {
     assert!(!end.is_empty());
     if phase != "end" {
         for (key, n) in unique(end) {
-            assert!(f.pool.pin_registered_storage([(key, n)]).is_ok());
+            assert_eq!(
+                f.pool
+                    .registered_allocation(&key)
+                    .unwrap()
+                    .unwrap()
+                    .capacity_bytes(),
+                n
+            );
         }
     }
     assert!(
@@ -612,14 +695,19 @@ fn failed(cut: Cut, phase: &str) {
         "old canonical marker survives failed handoff"
     );
     assert!(f.work.certify().is_err());
-    f.work.publish(f.session.inventory().unwrap()).unwrap();
+    let mut inventory = f.work.prepare_inventory().unwrap();
+    f.session.collect_inventory(&mut inventory).unwrap();
+    f.work.publish(inventory).unwrap();
     assert!(!f.work.published.get());
     assert!(f.work.certify().is_err());
     assert_eq!(
         f.bank.take_shared_step().unwrap().unwrap().outcome(),
         CaptureStepOutcome::Aborted
     );
-    assert_eq!(f.pool.effective_capacity().unwrap(), f.exact);
+    assert_eq!(
+        f.pool.snapshot().unwrap().domains[0].effective_limit,
+        MemoryLimit::Finite(f.exact)
+    );
     let error = observed.result.err().expect("actual retained row failure");
     assert!(matches!(error, Error::OriginalControl(_)));
     assert!(!error.model_state_preserved());
@@ -653,7 +741,7 @@ fn late_handoff_busy_preserves_published_prefix_and_original_marker() {
 #[test]
 fn equal_model_foreign_session_cannot_install_original_rows() {
     let f = joined(0, 2);
-    let bootstrap = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let bootstrap = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let owner = NativeMemoryOwner::acquire(&bootstrap).unwrap();
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", false);
     let other = PrefillRetentionFixture::load(artifact.path(), &stream()).unwrap();
@@ -726,7 +814,7 @@ fn mutable_parameter_access_and_same_source_rebind_cannot_freshen_original_rows(
 #[test]
 fn inactive_prefill_selection_cannot_construct_an_orphan_native_row_bank() {
     let f = build(0, 2, false);
-    let before = f.pool.used_bytes().unwrap();
+    let before = f.pool.fixture_host_charge().unwrap();
     for mode in 0..3 {
         let source = f.session.inactive_opening_source(geometry(2), mode);
         let selected = f.session.opening_selection(&source).unwrap();
@@ -734,7 +822,7 @@ fn inactive_prefill_selection_cannot_construct_an_orphan_native_row_bank() {
             .session
             .opening_rows_proposal(selected.bind_geometry(geometry(2)).unwrap())
             .is_err());
-        assert_eq!(f.pool.used_bytes().unwrap(), before);
+        assert_eq!(f.pool.fixture_host_charge().unwrap(), before);
     }
     assert_eq!(f.rows.snapshot_for_test().0, 0);
     assert!(f.work.capture_state_for_test().unwrap().is_none());
@@ -755,7 +843,10 @@ fn escaped_actual_kv_alias_retains_exact_original_controls_after_terminal_trim()
     let alias = aliases.pop().expect("actual nonzero KV owner");
     drop(aliases);
     let fact = alias.try_allocation_info().unwrap().unwrap();
-    let bytes = fact.bytes() as u64;
+    let bytes = u64::try_from(fact.bytes())
+        .unwrap()
+        .checked_add(u64::try_from(fact.host_control_bytes()).unwrap())
+        .unwrap();
     let values = alias.evaluated().unwrap().try_to_vec::<f32>().unwrap();
     assert!(values.iter().any(|v| *v != 0.));
     let protected = f.owned.protected_host_bytes();
@@ -891,3 +982,7 @@ fn original_envelope_preserves_native_witness_source_and_core_outer_retirement()
         drop(replay);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

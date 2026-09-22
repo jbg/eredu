@@ -108,7 +108,6 @@ fn verify_capture_failures(device: safemlx::DeviceType) {
                     limits: CaptureLimits {
                         per_step: budget,
                         cumulative: budget,
-                        physical_native_bytes: None,
                         on_limit: CaptureLimitPolicy::Fail,
                     },
                 }

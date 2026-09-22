@@ -2,35 +2,48 @@
 use super::span_install::quoted;
 use super::*;
 use crate::composition::mlx::session::model_session::text_funding::FundedWorkOwner;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{ControlledTextGeneration, TextPreparationOptions};
 
 // Deferred model/native owners can retire while the control alias remains live.
 // Check the actual protected lower bound on every cleanup pass, not a snapshot
 // of unrelated bytes taken before those owners had a chance to retire.
-fn settle_with_controls(pool: &WorkingMemoryPool, protected_and_source: u64) {
+fn settle_with_controls(pool: &MemoryLedger, protected_and_source: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
-        assert!(pool.used_bytes().unwrap() >= protected_and_source);
+        assert!(pool.fixture_host_charge().unwrap() >= protected_and_source);
         safemlx::transforms::async_eval_with_event(std::iter::empty::<&Array>())
             .unwrap()
             .synchronize()
             .unwrap();
         disk::reclaim();
-        assert!(pool.used_bytes().unwrap() >= protected_and_source);
+        assert!(pool.fixture_host_charge().unwrap() >= protected_and_source);
         pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
 #[test]
 fn named_native_controls_are_bound_once_to_the_actual_candidate_on_all_routes() {
-    let stream = stream();
+    if !crate::tests::support::native_process::enter("named capture controls") {
+        return;
+    }
+    let fixture =
+        crate::composition::mlx::session::model_session::text_quote::PreparedResidencyFixture::new(
+        );
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-        let (runtime, _artifact) = load(&stream, &pool, route);
+        let pool = fixture.pool.clone();
+        let (runtime, _artifact, terminal_baseline) = fixture.load(route, Some(128));
         let source = source(&runtime, 0);
         let ids = vec![2, 5, 7];
         let controller = disk::Controller::default();
-        let baseline = pool.used_bytes().unwrap();
-        let capture = CaptureAdmission::new(runtime.session(), geometry(), &source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
+        let capture = CaptureAdmission::new(
+            runtime.session(),
+            geometry(),
+            &source,
+            eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+        )
+        .unwrap();
         let quote = quoted(&runtime, &source, &ids, &controller);
         let controls = quote.span_workspace().text_controls().unwrap();
         assert!(controls.plan().same_plan(quote.span_workspace().plan()));
@@ -74,25 +87,46 @@ fn named_native_controls_are_bound_once_to_the_actual_candidate_on_all_routes() 
             Some(CaptureAdmission::control_peak_bytes().unwrap() + pair_delta + prediction_delta)
         );
         assert_eq!(controls.facts().work_bytes(), Some(crate::composition::mlx::session::model_session::text_funding::text_work_control_bytes(4).unwrap()));
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        let required = quote.incremental_bytes();
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+        let g = quote.geometry();
+        let admission = eredu_core::Admission {
+            requested_positions: g
+                .cached_positions
+                .checked_add(g.input_positions)
+                .and_then(|positions| positions.checked_add(g.max_output_tokens))
+                .unwrap(),
+            state: quote.state().clone(),
+            incremental_required_bytes: quote.incremental_bytes(),
+            memory_limits: config(u64::MAX).inference_policy().memory_limits.clone(),
+            additional_headroom: Default::default(),
+        };
+        let required = quote
+            .reservation_requirements(&admission)
+            .unwrap()
+            .get(pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
+        let current = pool.fixture_host_current().unwrap();
+        let exact = current.checked_add(required).unwrap();
         drop(quote);
         drop(capture);
+        let released_quote_current = pool.fixture_host_current().unwrap();
         let short = admit(
             &runtime,
             &source,
             &ids,
             &controller,
-            baseline + required - 1,
+            exact.checked_sub(1).unwrap(),
         )
         .unwrap_err();
         assert!(matches!(
             cause::<WorkingMemoryError>(&short),
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ));
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        let (preparation, quote) =
-            admit(&runtime, &source, &ids, &controller, baseline + required).unwrap();
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_current().unwrap(), released_quote_current);
+        let (preparation, quote) = admit(&runtime, &source, &ids, &controller, exact).unwrap();
         let installed = quote
             .take_capture_installation(runtime.session(), &source)
             .unwrap();
@@ -101,19 +135,26 @@ fn named_native_controls_are_bound_once_to_the_actual_candidate_on_all_routes() 
             p + q + publication
         );
         assert_eq!(
-            preparation.request().memory_reservation().unwrap().bytes(),
+            preparation
+                .request()
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
             required
         );
         drop((installed, quote, preparation, source));
-        finish_runtime(runtime, &stream);
-        settle_terminal(&pool, 0);
+        finish_runtime(runtime, fixture.stream());
+        settle_terminal(&pool, terminal_baseline);
     }
 }
 
 #[test]
 fn historical_quote_retains_controls_after_pending_installation_and_run_retire() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let c = source.capacity_bytes().unwrap();
@@ -136,7 +177,7 @@ fn historical_quote_retains_controls_after_pending_installation_and_run_retire()
     // The pending slot is empty and no plan payload is retained by this quote.
     assert!(quote.capture.as_ref().unwrap().pending.borrow().is_none());
     finish_runtime(runtime, &stream);
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     assert!(held >= protected + c);
     let alias = quote.clone();
     drop(quote);
@@ -152,7 +193,7 @@ fn historical_quote_retains_controls_after_pending_installation_and_run_retire()
 #[test]
 fn original_work_keeps_aggregate_custody_after_certification_and_last_quote_drop() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let c = source.capacity_bytes().unwrap();
@@ -170,12 +211,12 @@ fn original_work_keeps_aggregate_custody_after_certification_and_last_quote_drop
     let protected = installed.span_workspace().protected_host_bytes();
     // Same original factory as Prompt/Sampling, with no submitted native work.
     let work = quote.preparation_work().unwrap();
-    work.publish(RetainedStorage::default()).unwrap();
+    work.publish(work.prepare_inventory().unwrap()).unwrap();
     work.certify().unwrap();
     let alias = work.clone();
     drop((installed, quote, preparation));
     finish_runtime(runtime, &stream);
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     assert!(held >= protected + c);
     work.certify().unwrap(); // Repeated certification cannot release Q.
     drop(work);
@@ -191,7 +232,7 @@ fn original_work_keeps_aggregate_custody_after_certification_and_last_quote_drop
 #[test]
 fn original_control_guard_rejects_another_account_without_touching_either_scope() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let ids = vec![2, 5, 7];
@@ -216,17 +257,23 @@ fn original_control_guard_rejects_another_account_without_touching_either_scope(
     )
     .unwrap();
     let scope = other_quote.funding_scope().unwrap();
-    let before = (pool.used_bytes().unwrap(), path_instrumentation::snapshot());
+    let before = (
+        pool.fixture_host_charge().unwrap(),
+        path_instrumentation::snapshot(),
+    );
     assert!(matches!(
         guard.validate_native_scope(&scope),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     assert!(matches!(
-        guard.validate_reservation(other_preparation.request().memory_reservation().unwrap()),
+        guard.validate_reservation(other_preparation.request().memory_reservation()),
         Err(WorkingMemoryError::IdentityMismatch)
     ));
     assert_eq!(
-        (pool.used_bytes().unwrap(), path_instrumentation::snapshot()),
+        (
+            pool.fixture_host_charge().unwrap(),
+            path_instrumentation::snapshot()
+        ),
         before
     );
     scope.certify().unwrap();
@@ -246,7 +293,7 @@ fn original_control_guard_rejects_another_account_without_touching_either_scope(
 #[test]
 fn actual_controlled_inference_work_alias_keeps_controls_after_native_and_frame_retirement() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let c = source.capacity_bytes().unwrap();
@@ -270,7 +317,8 @@ fn actual_controlled_inference_work_alias_keeps_controls_after_native_and_frame_
         config(u64::MAX),
         controller.clone(),
         TextPreparationOptions {
-            interventions: None, capture: Some(source.clone()),
+            interventions: None,
+            capture: Some(source.clone()),
         },
     )
     .unwrap();
@@ -296,7 +344,7 @@ fn actual_controlled_inference_work_alias_keeps_controls_after_native_and_frame_
     // ordinary closed certification, and must not take the retained guard.
     work.certify().unwrap();
     finish_runtime(runtime, &stream);
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     assert!(held >= protected + c);
     let alias = work.clone();
     drop(work);
@@ -312,7 +360,7 @@ fn actual_controlled_inference_work_alias_keeps_controls_after_native_and_frame_
 #[test]
 fn closed_quote_and_work_aliases_keep_original_custody_through_unwind_without_source_alias() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let c = source.capacity_bytes().unwrap();
@@ -340,7 +388,7 @@ fn closed_quote_and_work_aliases_keep_original_custody_through_unwind_without_so
         .unwrap();
     let protected = installed.span_workspace().protected_host_bytes();
     let work = quote.preparation_work().unwrap();
-    work.publish(RetainedStorage::default()).unwrap();
+    work.publish(work.prepare_inventory().unwrap()).unwrap();
     work.certify().unwrap();
     let quote_alias = quote.clone();
     assert!(quote.same_owner(&quote_alias));
@@ -386,13 +434,13 @@ fn closed_quote_and_work_aliases_keep_original_custody_through_unwind_without_so
 // The actual original admission supplies the same work/custody subsequently
 // installed in the concrete submission owner. No fabricated byte guard enters.
 fn original_submission_resources() -> (
-    WorkingMemoryPool,
+    MemoryLedger,
     crate::composition::mlx::session::model_session::SubmissionResourcesOwner,
     eredu_core::SessionAuthority,
     u64,
 ) {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let c = source.capacity_bytes().unwrap();
@@ -418,7 +466,7 @@ fn original_submission_resources() -> (
         .unwrap();
     let expected = installed.span_workspace().protected_host_bytes() + c + paths;
     let work = quote.preparation_work().unwrap();
-    work.publish(RetainedStorage::default()).unwrap();
+    work.publish(work.prepare_inventory().unwrap()).unwrap();
     work.certify().unwrap();
     let mut authority = eredu_core::SessionAuthority::new();
     let resources = crate::composition::mlx::session::model_session::SubmissionResources::new(
@@ -438,8 +486,10 @@ fn closed_submission_token_aliases_retain_original_controls_after_owner_unwind()
     use eredu_core::TokenOutput as _;
     let (pool, resources, authority, expected) = original_submission_resources();
     let stream = stream();
+    // The retained Work is already certified. This fixture supplies a genuine
+    // completed caller-owned token before opening its observation-only recovery.
+    let value = Array::try_from_slice(&[7_u32], &[1]).unwrap();
     let mut recovery = resources.recovery().unwrap();
-    let value = Array::from_slice(&[7_u32], &[1]);
     safemlx::transforms::eval([&value]).unwrap();
     recovery.seal();
     let status = recovery.finish().unwrap();
@@ -505,10 +555,10 @@ fn closed_submission_original_custody_survives_unwind_in_real_descendant_quarant
         &marker
     ));
     assert!(authority.require_idle().is_err());
-    assert_eq!(pool.used_bytes().unwrap(), expected);
+    assert_eq!(pool.fixture_host_charge().unwrap(), expected);
     crate::backend::submission_recovery::reap();
     assert!(authority.require_idle().is_err());
-    assert_eq!(pool.used_bytes().unwrap(), expected);
+    assert_eq!(pool.fixture_host_charge().unwrap(), expected);
     drop(child);
     crate::backend::submission_recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     settle_terminal(&pool, 0);

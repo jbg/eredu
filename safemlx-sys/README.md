@@ -177,3 +177,32 @@ depending on `safemlx-sys` directly.
 
 The Rust crate is MIT licensed. Vendored components retain their stated
 licenses and attribution files.
+
+Physical allocation facts include the backing mechanism's placement alongside
+its non-recycled identity and full capacity. CPU and Metal shared buffers report
+host storage. CUDA buffers retain their actual fixed-device, pinned-host, or
+managed allocation mechanism; managed facts name host memory and the finite set
+of registered accelerators captured at allocation. Device topology queries use
+native hardware sharing facts, including Metal's unified-memory property.
+
+The physical-memory placement and access patches ship in `safemlx-sys` and apply
+during the published native build. Array descriptors, immutable host sources,
+prepared inputs, and original-buffer witnesses preserve placement through
+aliases. Native compare-and-attach rejects a changed placement. CUDA command
+encoding checks managed candidate membership before native work, and backing
+with an attached accounting owner refuses implicit physical relocation; an
+explicit admitted transfer must own any new destination and staging storage.
+These facts and conservative allowances do not measure current residency.
+
+Prospective CUDA GPU allocation facts include the allocator's fixed-device,
+managed or pinned scalar-pool, and cross-device cache alternatives. Cold plans
+reserve the full allowance in the finite set of candidate physical domains.
+The completed backing witness identifies the mechanism actually selected;
+publication validates it against the admitted candidates.
+
+Original-buffer budgets distinguish native producers from retained backing.
+Scopes, records, and captured allocation bindings retain producer custody. Once
+all producers retire, a callback reports the remaining occupied capacity; later
+callbacks follow completed physical frees. This evidence releases unused and
+completed staging allowances independently of surviving destinations. It grants
+no new allocation permission and does not treat a polling error as completion.

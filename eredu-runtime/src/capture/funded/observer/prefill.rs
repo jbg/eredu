@@ -167,7 +167,7 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         }
         progress.expected_epoch = Some(context.epoch());
         let policy = CaptureObservationStep::new(&self.session.plan, CapturePhase::Prefill, 0)?;
-        if !policy.has_selected_prefill_hook() {
+        if matches!(self.frame, Frame::Empty) && !policy.has_selected_prefill_hook() {
             return Ok(None);
         }
         let bootstrap = match &self.frame {
@@ -176,6 +176,24 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
             _ => return Err(CaptureProtocolError::Transaction.into()),
         }
         .map_err(CaptureRunHostError::from)?;
+        let evidence = bootstrap.intervention_source().is_some_and(|source| {
+            source
+                .plan()
+                .admission()
+                .plan()
+                .operations
+                .iter()
+                .zip(source.plan().admission().points())
+                .any(|(operation, point)| {
+                    operation.schedule.includes(CapturePhase::Prefill, 0)
+                        && crate::intervention::InterventionPrefillWindow::row_axis(point)
+                        && operation.evidence
+                            != eredu_core::intervention::InterventionEvidence::None
+                })
+        });
+        if !policy.has_selected_prefill_hook() && !evidence {
+            return Ok(None);
+        }
         self.backend
             .prepare_prefill_chunk_retention(bootstrap, context)
     }

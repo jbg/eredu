@@ -91,7 +91,7 @@ impl OriginalParallelControlProjection {
                 let plan=Rc::new(encoding);
                 let output=run_native_role_with_pipeline(plan.clone(),plan.capacity,
                     Some(safemlx::PreparedPipelineCachePlan::new(plan.recipe.kernels)),
-                    &owner.owner().bank,&owner.owner().controls,&self.custody,
+                    &owner.owner().native,&self.custody,
                     |plan,observer|Ok(plan.run(observer)))
                     .map_err(|cause|Error::with_original_control_source(cause,false))??;
                 // Completed Recovery no longer owns its plan. A surviving

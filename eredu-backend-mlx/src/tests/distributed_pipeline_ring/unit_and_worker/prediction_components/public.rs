@@ -107,7 +107,6 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
                         captures: maximum,
                         ..per_step.checked_mul(8).unwrap()
                     },
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             },

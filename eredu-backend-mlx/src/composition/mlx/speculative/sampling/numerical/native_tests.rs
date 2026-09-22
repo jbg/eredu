@@ -1,41 +1,43 @@
 //! Real admitted model sources and the production numerical compiler. No test
 //! account, raw numerical-value constructor or test-sized native arena is used.
 use super::*;
-use crate::composition::mlx::speculative::autoregressive::AutoregressiveSourcePair;
 use crate::backend::{
     MlxAcceleratorFamily, MlxBackend, MlxDeviceIdentity,
     managed_memory::gpu_stream::PreparedExecutionStreams,
     nn::shared::MlxNeuralBackend,
     random::{RandomState, split_key_at},
 };
+use crate::composition::mlx::speculative::autoregressive::AutoregressiveSourcePair;
 use crate::composition::mlx::{
     loading::{MlxModelConfig, MlxPreparationMechanisms},
     session::MlxModelSession,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExternalDraftArtifact,
     ModelLoadingBackend, SpeculativeConfig, SpeculativeDraftRandomPosition,
     SpeculativeSchedulerOptions, TokenizerCompatibilityProof,
 };
 use eredu_runtime::{
-    speculative::autoregressive::AutoregressiveSchedulePlan, working_memory::WorkingMemoryPool,
+    speculative::autoregressive::AutoregressiveSchedulePlan, working_memory::MemoryLedger,
 };
 use std::num::{NonZeroU64, NonZeroUsize};
 
-mod token_input;
-mod cpu_normalize;
-mod cpu_greedy;
-mod cpu_token_filter;
-mod cpu_sampling_filters;
 mod cpu_capture;
+mod cpu_categorical;
+mod cpu_difference;
+mod cpu_greedy;
+mod cpu_key;
+mod cpu_normalize;
 mod cpu_probability;
 mod cpu_row;
-mod cpu_key;
+mod cpu_sampling_filters;
 mod cpu_split;
+mod cpu_token_filter;
 mod cpu_uniform;
-mod cpu_difference;
-mod cpu_categorical;
 mod registered_range;
+mod token_input;
 
 const SEED: u64 = 0x1234_5678_9abc_def0;
 // This ceiling is compared by the existing account. Each phase derives its
@@ -44,17 +46,20 @@ pub(in crate::composition::mlx::speculative) const REQUEST_CEILING: u64 = 1 << 3
 
 fn reclaim() {
     MlxNeuralBackend::reclaim_retired_resources();
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
 }
-pub(in crate::composition::mlx::speculative) fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+pub(in crate::composition::mlx::speculative) fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
-pub(in crate::composition::mlx::speculative) fn admitted_backend(pool: &WorkingMemoryPool) -> MlxBackend<'static> {
+pub(in crate::composition::mlx::speculative) fn admitted_backend(
+    pool: &MemoryLedger,
+) -> MlxBackend<'static> {
     let streams = PreparedExecutionStreams::for_factory(pool)
         .unwrap()
         .unwrap();
@@ -65,7 +70,10 @@ pub(in crate::composition::mlx::speculative) fn admitted_backend(pool: &WorkingM
     .unwrap();
     MlxBackend::for_prepared_execution_plan(streams, identity)
 }
-pub(in crate::composition::mlx::speculative) fn load(backend: &MlxBackend<'_>, config: &MlxModelConfig) -> MlxModelSession {
+pub(in crate::composition::mlx::speculative) fn load(
+    backend: &MlxBackend<'_>,
+    config: &MlxModelConfig,
+) -> MlxModelSession {
     let prepared = backend.prepare_model_borrowed(config).unwrap();
     let session = MlxModelSession::from_model(
         prepared.into_inner(),
@@ -74,7 +82,7 @@ pub(in crate::composition::mlx::speculative) fn load(backend: &MlxBackend<'_>, c
     .unwrap();
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        backend.memory_pool().unquoted_owner_count().unwrap() == 0
+        backend.memory_ledger().unquoted_owner_count().unwrap() == 0
     });
     session
 }
@@ -100,6 +108,18 @@ pub(in crate::composition::mlx::speculative) fn source_configs(
     MlxModelConfig,
     eredu_runtime::SelectedSpeculativeRealization,
 ) {
+    source_configs_with_capacity(backend, path, 1, "gpu:0")
+}
+pub(in crate::composition::mlx::speculative) fn source_configs_with_capacity(
+    backend: &MlxBackend<'_>,
+    path: &std::path::Path,
+    capacity: usize,
+    device: &str,
+) -> (
+    MlxModelConfig,
+    MlxModelConfig,
+    eredu_runtime::SelectedSpeculativeRealization,
+) {
     let target_inspection =
         eredu_core::inspect_artifact(path, backend.configuration_resolver()).unwrap();
     let target_config = eredu_core::prepare_inspected_model_config(
@@ -108,11 +128,11 @@ pub(in crate::composition::mlx::speculative) fn source_configs(
         crate::MlxLoadRequest::default(),
     )
     .unwrap();
-    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "gpu:0").unwrap())
+    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", device).unwrap())
         .with_drafting(DraftingPlan::External {
             model: path.display().to_string(),
             placement: DraftPlacementPlan::Target,
-            max_draft_tokens: 1,
+            max_draft_tokens: capacity,
             lookahead: false,
             adaptive_lookahead: false,
         });
@@ -157,15 +177,18 @@ pub(in crate::composition::mlx::speculative) fn source_configs(
 #[test]
 #[ignore = "requires native Metal execution"]
 fn original_numerical_seed_split_position_and_uniform_use_real_sources() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let backend = admitted_backend(&pool);
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
-    let loaded = pool.used_bytes().unwrap();
+    let loaded = pool.fixture_host_charge().unwrap();
     assert!(loaded > initial);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let config = SpeculativeConfig {
@@ -189,12 +212,26 @@ fn original_numerical_seed_split_position_and_uniform_use_real_sources() {
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let environment = backend.original_copy_environment().unwrap();
-        pair.request().validate_execution(target.original_model_source().unwrap().erased().inference_execution_identity()).unwrap();
-        assert!(pair.request().validate_execution(&eredu_runtime::working_memory::InferenceExecutionIdentity::default()).is_err());
+        pair.request()
+            .validate_execution(
+                target
+                    .original_model_source()
+                    .unwrap()
+                    .erased()
+                    .inference_execution_identity(),
+            )
+            .unwrap();
+        assert!(
+            pair.request()
+                .validate_execution(
+                    &eredu_runtime::working_memory::InferenceExecutionIdentity::default()
+                )
+                .is_err()
+        );
         // The common numerical source retains the actual AR-tagged request, but
         // no AR model occurrence is installed. Embedded will use this same
         // numerical binding with its own exact tagged request and role driver.
@@ -223,11 +260,37 @@ fn original_numerical_seed_split_position_and_uniform_use_real_sources() {
         let returned_split = key_words(&next);
         assert_ne!(after_split, returned_split);
         eprintln!("original numerical: positional key");
-        let copied_root=copy_key_to(&root,SamplingPlacement::Target,SamplingPlacement::Draft,context).unwrap();
-        assert_eq!(key_words(&copied_root),initial_key);
-        assert_ne!(root.value().value().array.try_allocation_info().unwrap().unwrap().identity(),
-            copied_root.value().value().array.try_allocation_info().unwrap().unwrap().identity());
-        let at = key_at(&copied_root, SpeculativeDraftRandomPosition::new(3), context).unwrap();
+        let copied_root = copy_key_to(
+            &root,
+            SamplingPlacement::Target,
+            SamplingPlacement::Draft,
+            context,
+        )
+        .unwrap();
+        assert_eq!(key_words(&copied_root), initial_key);
+        assert_ne!(
+            root.value()
+                .value()
+                .array
+                .try_allocation_info()
+                .unwrap()
+                .unwrap()
+                .identity(),
+            copied_root
+                .value()
+                .value()
+                .array
+                .try_allocation_info()
+                .unwrap()
+                .unwrap()
+                .identity()
+        );
+        let at = key_at(
+            &copied_root,
+            SpeculativeDraftRandomPosition::new(3),
+            context,
+        )
+        .unwrap();
         drop(copied_root);
         let positional = key_words(&at);
         assert_eq!(key_words(&root), initial_key);
@@ -253,13 +316,13 @@ fn original_numerical_seed_split_position_and_uniform_use_real_sources() {
         let error = next_key(&mut state, context).unwrap_err();
         assert_eq!(key_words(&state), before_failure);
         drop(error);
-        let charged = pool.used_bytes().unwrap();
+        let charged = pool.fixture_host_charge().unwrap();
         drop((zero, root, next, at));
         reclaim();
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
         // Retired native values release their actual accounts. Closing issuance
         // remains monotone and cannot be undone by reclaiming those owners.
-        assert!(pool.used_bytes().unwrap() < charged);
+        assert!(pool.fixture_host_charge().unwrap() < charged);
         let retired_key = key_words(&state);
         let refused = next_key(&mut state, context).unwrap_err();
         assert_eq!(key_words(&state), retired_key);
@@ -268,7 +331,7 @@ fn original_numerical_seed_split_position_and_uniform_use_real_sources() {
         reclaim();
         // An escaped completed key retains its own accepted account, even when
         // the source-pair wrapper and the other phases have been dropped.
-        assert!(pool.used_bytes().unwrap() > loaded);
+        assert!(pool.fixture_host_charge().unwrap() > loaded);
         drop(state);
         (observed, draws)
     };

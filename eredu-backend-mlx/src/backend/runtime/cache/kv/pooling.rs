@@ -2,8 +2,8 @@
 
 use super::*;
 
-mod prepared_copy;
 mod mask;
+mod prepared_copy;
 pub(crate) use prepared_copy::PreparedPoolingCopy;
 
 /// Append-only compressed-token cache with an incomplete pooling window.
@@ -121,15 +121,22 @@ impl PoolingCache {
         state: PoolingCacheState,
         processed_tokens: i32,
     ) -> Result<(), Exception> {
+        self.restore_state_with(state, processed_tokens, Exception::custom)
+    }
+
+    pub(crate) fn restore_state_with<E>(
+        &mut self,
+        state: PoolingCacheState,
+        processed_tokens: i32,
+        mut error: impl FnMut(&'static str) -> E,
+    ) -> Result<(), E> {
         if processed_tokens < 0 {
-            return Err(Exception::custom(
-                "restored pooling source offset must be non-negative",
-            ));
+            return Err(error("restored pooling source offset must be non-negative"));
         }
         if state.pending_values.is_some() != state.pending_gates.is_some()
             || state.overlap_values.is_some() != state.overlap_gates.is_some()
         {
-            return Err(Exception::custom(
+            return Err(error(
                 "restored pooling value/gate components are incomplete",
             ));
         }
@@ -142,7 +149,7 @@ impl PoolingCache {
             || state.pooled.as_ref().map_or(0, |array| array.dim(1))
                 != processed_tokens / self.ratio
         {
-            return Err(Exception::custom(
+            return Err(error(
                 "restored pooling state does not match its source-token frontier",
             ));
         }
@@ -254,7 +261,13 @@ impl PoolingCache {
         offset: i32,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        mask::make(query_tokens, self.pooled_tokens(), offset, self.ratio, stream)
+        mask::make(
+            query_tokens,
+            self.pooled_tokens(),
+            offset,
+            self.ratio,
+            stream,
+        )
     }
 
     /// Fixed controls of the selected integer mask constructor and its errors.

@@ -41,7 +41,8 @@ type PairBank = OriginalNativeStorageBank<PairMechanism>;
 struct PairMechanism {
     runtime: Rc<PreparedInputRuntime>,
     selection: NativeStorageSelection,
-    initial_publication: Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>,
+    initial_publication:
+        Option<crate::backend::runtime::residency::storage::RetainedStoragePublication>,
 }
 enum PairObservation<'a> {
     Origin(OriginalBufferWitness<'a>),
@@ -84,6 +85,9 @@ impl OriginalNativeStorageMechanism for PairMechanism {
     fn selection(&self) -> &NativeStorageSelection {
         &self.selection
     }
+    fn uniform_budget_placement(&self) -> Option<std::sync::Arc<eredu_core::MemoryPlacement>> {
+        Some(crate::backend::managed_memory::ledger().host_placement_handle())
+    }
     fn key_clone_storage_bytes(&self) -> Option<u64> {
         // This concrete key is scalar namespace + nonrepeating generation. The
         // broad StorageIdentity/source/Weak routes remain unknown in production.
@@ -94,14 +98,18 @@ impl OriginalNativeStorageMechanism for PairMechanism {
         custody: OriginalNativeBudgetCustody,
     ) -> Result<Self::Budget, PairCause> {
         let capacity = usize::try_from(custody.capacity_bytes()).unwrap();
-        let prepared = PreparedOriginalBufferBudget::try_new(&self.runtime, capacity, custody)
-            .map_err(|error| {
-                let (cause, owner) = error.into_parts();
-                PairCause::Budget(cause, owner)
-            })?;
-        prepared.try_allocate().map_err(|error| {
+        let prepared = PreparedOriginalBufferBudget::try_new(
+            &self.runtime,
+            capacity,
+            NativeBudgetOwner(custody),
+        )
+        .map_err(|error| {
             let (cause, owner) = error.into_parts();
-            PairCause::Budget(cause, owner.into_owner())
+            PairCause::Budget(cause, owner.0)
+        })?;
+        prepared.try_allocate_observed().map_err(|error| {
+            let (cause, owner) = error.into_parts();
+            PairCause::Budget(cause, owner.into_owner().0)
         })
     }
     fn observe<'a, 'root: 'a>(
@@ -118,10 +126,24 @@ impl OriginalNativeStorageMechanism for PairMechanism {
                 .ok_or(PairCause::Fixed(OriginalBufferCause::UncertifiedBacking)),
             Err(cause) => Err(PairCause::Fixed(cause)),
             Ok(None) => match root.inspect_ordinary_buffer().map_err(PairCause::Fixed)? {
-                OrdinaryBufferInspection::Allocation(witness) => Ok(PairObservation::Ordinary(witness)),
+                OrdinaryBufferInspection::Allocation(witness) => {
+                    Ok(PairObservation::Ordinary(witness))
+                }
                 _ => Err(PairCause::Fixed(OriginalBufferCause::UncertifiedBacking)),
             },
         }
+    }
+    fn placement(
+        _: &Self::Observation<'_>,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<
+        std::sync::Arc<eredu_core::MemoryPlacement>,
+        eredu_runtime::working_memory::WorkingMemoryError,
+    > {
+        Ok(std::sync::Arc::new(eredu_core::MemoryPlacement::fixed(
+            topology,
+            topology.host_domain(),
+        )?))
     }
     fn describe(
         observation: &Self::Observation<'_>,
@@ -141,7 +163,12 @@ impl OriginalNativeStorageMechanism for PairMechanism {
             }
         }
     }
-    fn has_retained_attachment(&self, previous: &Self::Observation<'_>, observation: &Self::Observation<'_>, pool: &WorkingMemoryPool) -> bool {
+    fn has_retained_attachment(
+        &self,
+        previous: &Self::Observation<'_>,
+        observation: &Self::Observation<'_>,
+        pool: &MemoryLedger,
+    ) -> bool {
         let facts = |observation: &Self::Observation<'_>| match observation {
             PairObservation::Origin(witness) => witness.allocation(),
             PairObservation::Existing(witness) => witness.allocation(),
@@ -149,9 +176,15 @@ impl OriginalNativeStorageMechanism for PairMechanism {
         };
         let current = facts(observation);
         if std::mem::discriminant(previous) != std::mem::discriminant(observation)
-            || facts(previous) != current { return false; }
-        self.initial_publication.as_ref().is_some_and(|publication|
-            publication.has_native_attachment(pool.shared_storage_domain(), current))
+            || facts(previous) != current
+        {
+            return false;
+        }
+        self.initial_publication
+            .as_ref()
+            .is_some_and(|publication| {
+                publication.has_native_attachment(pool.shared_storage_accounting_id(), current)
+            })
     }
     fn prepare_attachment(&self, owner: PairRegistration) -> Result<PairAttachment, PairCause> {
         PreparedAllocationOwner::try_new(owner).map_err(|error| {
@@ -187,11 +220,9 @@ impl PairMechanism {
         }
     }
     fn provider_controls(&self, capacity: usize, attempts: usize, rows: usize) -> Option<u64> {
-        let budget = PreparedOriginalBufferBudget::<OriginalNativeBudgetCustody>::layout(
-            &self.runtime,
-            capacity,
-        )
-        .ok()?;
+        let budget =
+            PreparedOriginalBufferBudget::<NativeBudgetOwner>::layout(&self.runtime, capacity)
+                .ok()?;
         let sidecar = PreparedAllocationOwner::<PairRegistration>::layout();
         let one = [
             sidecar.allocation_bytes()?,
@@ -247,9 +278,8 @@ fn request() -> AdmissionRequest {
         input: InputTokenCount::text(1),
         max_output_tokens: 1,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(0),
+        memory_limits: Default::default(),
     }
 }
 fn capabilities() -> ModelCapabilities {
@@ -263,7 +293,7 @@ fn capabilities() -> ModelCapabilities {
     }
 }
 fn component_quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     mechanism: &PairMechanism,
     attempts: usize,
 ) -> Result<IncrementalInferenceQuote, ResidualQuoteError> {
@@ -305,7 +335,8 @@ fn component_quote(
             "empty residual component; fixed producer has separate P and Q",
         )
     };
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: geometry(),
         activations: zero(),
         attention: zero(),
@@ -319,13 +350,13 @@ fn component_quote(
             facts.backing_bytes() as u64,
             "one fixed mutable U32 pair physical backing, once outside Q",
         ),
-    };
+    });
     let quote = ResidualInferenceQuote::compose(&report, state, outside, &storage)
         .unwrap()
         .into_incremental();
     assert_eq!(
         quote.incremental_bytes(),
-        facts.backing_bytes() as u64,
+        Some(facts.backing_bytes() as u64),
         "the original producer reservation contains P exactly once before Q"
     );
     assert!((0..quote.span_workspace().plan().records().len())
@@ -378,18 +409,37 @@ struct Accepted {
     reservation: WorkingMemoryReservation,
     run: WorkingMemoryFundingRun,
 }
+fn complete_requirements(
+    quote: &IncrementalInferenceQuote,
+) -> eredu_core::DomainMemoryRequirements {
+    quote
+        .reservation_requirements(&eredu_core::Admission {
+            requested_positions: 2,
+            state: quote.state().clone(),
+            incremental_required_bytes: quote.incremental_bytes(),
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+        })
+        .unwrap()
+}
 fn shared_capacity(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     mechanism: &PairMechanism,
     attempts: [usize; 2],
 ) -> Option<u64> {
-    let mut capacity = pool.used_bytes().unwrap();
+    let mut capacity = pool.fixture_host_current().unwrap();
     // Both live requests must accept the same aggregate ceiling. Compute their
     // actual control requirements before admitting A; its retained origin must
     // not impose a smaller ceiling that excludes all of B's future controls.
     for count in attempts {
         match component_quote(pool, mechanism, count) {
-            Ok(quote) => capacity = capacity.checked_add(quote.incremental_bytes()).unwrap(),
+            Ok(quote) => {
+                capacity = capacity
+                    .checked_add(crate::memory_fixture::host_total(&complete_requirements(
+                        &quote,
+                    )))
+                    .unwrap()
+            }
             Err(ResidualQuoteError::Storage(WorkingMemoryError::UnknownBound)) => {
                 require_qualified_or_report_unknown("rust-managed");
                 return None;
@@ -400,22 +450,26 @@ fn shared_capacity(
     Some(capacity)
 }
 fn accept(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     mechanism: &PairMechanism,
     attempts: usize,
     capacity: u64,
 ) -> Option<Accepted> {
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_current().unwrap();
     let quote = match component_quote(pool, mechanism, attempts) {
         Ok(quote) => quote,
         Err(ResidualQuoteError::Storage(WorkingMemoryError::UnknownBound)) => {
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.fixture_host_current().unwrap(), before);
             require_qualified_or_report_unknown("rust-managed");
             return None;
         }
         Err(cause) => panic!("unexpected fixed component quote failure: {cause}"),
     };
-    let exact = before.checked_add(quote.incremental_bytes()).unwrap();
+    let exact = before
+        .checked_add(crate::memory_fixture::host_total(&complete_requirements(
+            &quote,
+        )))
+        .unwrap();
     assert!(matches!(
         plan_prefill_incremental_with_capacity(
             &InferenceExecutionIdentity::default(),
@@ -423,29 +477,29 @@ fn accept(
             &capabilities(),
             request(),
             geometry(),
-            exact - 1,
+            crate::memory_fixture::physical_host_limits(pool, exact - 1),
             |_| Ok(quote.clone())
         ),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_current().unwrap(), before);
     let (exact_reservation, _) = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &capabilities(),
         request(),
         geometry(),
-        exact,
+        crate::memory_fixture::physical_host_limits(pool, exact),
         |_| Ok(quote.clone()),
     )
     .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), exact);
+    assert_eq!(pool.fixture_host_current().unwrap(), exact);
     // No construction or submission has started. Release this exact-capacity
     // admission probe before accepting the shared ceiling used by A and B.
     drop(exact_reservation);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_current().unwrap(), before);
     assert!(
         capacity >= exact,
         "both quoted components fit the shared ceiling"
@@ -456,7 +510,7 @@ fn accept(
         &capabilities(),
         request(),
         geometry(),
-        capacity,
+        crate::memory_fixture::physical_host_limits(pool, capacity),
         |_| Ok(quote.clone()),
     )
     .unwrap();
@@ -533,7 +587,7 @@ fn mutable_component_accepts_exact_controls_and_preserves_a_origin_under_b_witho
         return;
     };
     let initial = baseline(&runtime);
-    let pool = WorkingMemoryPool::new(u64::MAX, initial).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, initial).unwrap();
     let a_mechanism = PairMechanism::new(&runtime);
     let Some(capacity) = shared_capacity(&pool, &a_mechanism, [1, 1]) else {
         return;
@@ -551,11 +605,11 @@ fn mutable_component_accepts_exact_controls_and_preserves_a_origin_under_b_witho
         .facts()
         .backing_bytes() as u64;
     let mut a_scope = a.run.scope().unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let mut a_publication = a.bank.claim_publication(&mut a_scope).unwrap();
     a_publication.publish(&a_scope, [&root], &[]).unwrap();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         before,
         "original birth already belongs to prepaid P"
     );
@@ -566,16 +620,16 @@ fn mutable_component_accepts_exact_controls_and_preserves_a_origin_under_b_witho
     // Bank/publication/registration custody retains the required shared origin.
     drop((a_mechanism, a));
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), initial + a_host + p);
+    assert_eq!(pool.fixture_host_charge().unwrap(), initial + a_host + p);
 
     let b_mechanism = PairMechanism::new(&runtime);
     let mut b = accept(&pool, &b_mechanism, 1, capacity).expect("same qualified component");
     let mut b_scope = b.run.scope().unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let mut b_publication = b.bank.claim_publication(&mut b_scope).unwrap();
     b_publication.publish(&b_scope, [&root], &[]).unwrap();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         before,
         "B validates its scope but cannot charge A's birth again"
     );
@@ -584,13 +638,13 @@ fn mutable_component_accepts_exact_controls_and_preserves_a_origin_under_b_witho
     drop((b_mechanism, b_publication, b));
     safemlx::reclaim_allocation_owners();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         initial + a_host + b_host + p,
         "B metadata sidecar survives, but only A's physical partition remains"
     );
     drop(root);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), initial);
+    assert_eq!(pool.fixture_host_charge().unwrap(), initial);
 }
 
 #[test]
@@ -599,7 +653,7 @@ fn mutable_component_foreign_unpublished_birth_refuses_and_retains_actual_prepar
         return;
     };
     let initial = baseline(&runtime);
-    let pool = WorkingMemoryPool::new(u64::MAX, initial).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, initial).unwrap();
     let a_mechanism = PairMechanism::new(&runtime);
     let Some(capacity) = shared_capacity(&pool, &a_mechanism, [0, 1]) else {
         return;
@@ -611,7 +665,7 @@ fn mutable_component_foreign_unpublished_birth_refuses_and_retains_actual_prepar
     let b_mechanism = PairMechanism::new(&runtime);
     let mut b = accept(&pool, &b_mechanism, 1, capacity).expect("same qualified component");
     let mut b_scope = b.run.scope().unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let mut refused = b.bank.claim_publication(&mut b_scope).unwrap();
     assert!(matches!(
         refused.publish(&b_scope, [&root], &[]),
@@ -619,39 +673,45 @@ fn mutable_component_foreign_unpublished_birth_refuses_and_retains_actual_prepar
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     b_scope.certify().unwrap();
     drop((a_mechanism, b_mechanism, a, b, root));
     safemlx::reclaim_allocation_owners();
     assert!(
-        pool.used_bytes().unwrap() > initial,
+        pool.fixture_host_charge().unwrap() > initial,
         "failed prepared registration keeps actual B metadata"
     );
     drop(refused);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), initial);
+    assert_eq!(pool.fixture_host_charge().unwrap(), initial);
 }
 
 #[test]
 fn completed_source_receipt_retires_repeated_request_controls_but_preserves_new_output_custody() {
-    let Some(runtime) = component_runtime() else { return };
+    let Some(runtime) = component_runtime() else {
+        return;
+    };
     let initial = baseline(&runtime);
-    let pool = WorkingMemoryPool::new(u64::MAX, initial).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, initial).unwrap();
     let owner = crate::backend::managed_memory::NativeMemoryOwner::acquire(&pool).unwrap();
     let source = Array::from_slice(&[37u32, 41], &[2]);
-    let source_bytes = source.allocation_info().unwrap().unwrap().bytes() as u64;
-    let mut source_inventory = crate::backend::runtime::residency::storage::RetainedStorage::default();
+    let source_facts = source.allocation_info().unwrap().unwrap();
+    let source_bytes = (source_facts.bytes() + source_facts.host_control_bytes()) as u64;
+    let mut source_inventory =
+        crate::backend::runtime::residency::storage::RetainedStorage::default();
     source_inventory.include_array(&source).unwrap();
     let receipt = source_inventory.publish_unquoted(&owner).unwrap();
     drop(owner);
     let baseline = initial + source_bytes;
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     let mechanism = || {
         let mut value = PairMechanism::new(&runtime);
         value.initial_publication = Some(receipt.clone());
         value
     };
-    let Some(capacity) = shared_capacity(&pool, &mechanism(), [1, 1]) else { return };
+    let Some(capacity) = shared_capacity(&pool, &mechanism(), [1, 1]) else {
+        return;
+    };
     for _ in 0..3 {
         let mechanism = mechanism();
         let mut accepted = accept(&pool, &mechanism, 1, capacity).unwrap();
@@ -662,8 +722,11 @@ fn completed_source_receipt_retires_repeated_request_controls_but_preserves_new_
         drop((publication, accepted, mechanism));
         safemlx::reclaim_allocation_owners();
         crate::backend::ordinary_retirement::reclaim_all();
-        assert_eq!(pool.used_bytes().unwrap(), baseline,
-            "completed source already owns its attachment; no new request Q may remain on it");
+        assert_eq!(
+            pool.fixture_host_charge().unwrap(),
+            baseline,
+            "completed source already owns its attachment; no new request Q may remain on it"
+        );
     }
     // A newly born output has no initial receipt. Its actual original P and Q
     // remain with an escaped alias after its publishing request is dropped.
@@ -679,13 +742,24 @@ fn completed_source_receipt_retires_repeated_request_controls_but_preserves_new_
     let output_bytes = output.allocation_info().unwrap().unwrap().bytes() as u64;
     drop((publication, accepted, output, mechanism));
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), baseline + output_host + output_bytes);
+    assert_eq!(
+        pool.fixture_host_charge().unwrap(),
+        baseline + output_host + output_bytes
+    );
     assert_eq!(alias.evaluated().unwrap().as_slice::<u32>(), &[43, 47]);
     drop(alias);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     drop(source);
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), initial,
-        "retained initial receipt must not pin the original physical source");
+    assert_eq!(
+        pool.fixture_host_charge().unwrap(),
+        initial,
+        "retained initial receipt must not pin the original physical source after cache eviction"
+    );
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

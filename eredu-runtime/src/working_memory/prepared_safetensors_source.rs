@@ -1,7 +1,8 @@
 //! Retained SafeTensors metadata/provenance views over an originally admitted leaf.
 use super::{
-    DependencyMemoryPolicy, OriginalRetainedSourceError, OriginalSafetensorsSourceError,
-    WorkingMemoryError, WorkingMemoryPool, gguf_source::SourceAccount, qualified_storage,
+    DependencyMemoryPolicy, MemoryLedger, OriginalRetainedSourceError,
+    OriginalSafetensorsSourceError, WorkingMemoryError, gguf_source::SourceAccount,
+    qualified_storage,
 };
 use eredu_checkpoint::{
     safetensors::SafetensorsShards,
@@ -94,7 +95,7 @@ fn outer_bytes(request: Option<SourceErasureStorageRequest>) -> Result<u64, Work
         .ok_or(WorkingMemoryError::Overflow)
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Input-derived metadata/provenance/contract-map estimate plus the actual
     /// outer wrapper and custody requests. Maps and transient copies use the
     /// configurable estimate; this is not an allocator or process-wide ceiling.

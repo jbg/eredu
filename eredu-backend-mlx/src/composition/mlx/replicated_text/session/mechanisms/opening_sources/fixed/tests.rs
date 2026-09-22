@@ -1,6 +1,6 @@
 use super::*;
 use eredu_checkpoint::store::SourceStorageRef;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 thread_local! { static CALLS: Cell<usize> = const { Cell::new(0) }; }
 fn housekeep() {

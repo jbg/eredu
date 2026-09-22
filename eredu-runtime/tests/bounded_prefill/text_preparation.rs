@@ -32,12 +32,12 @@ fn preparation_claims_once_before_running_the_shared_prefill_driver() {
     for budgeted in [false, true] {
         let id = InferenceExecutionIdentity::default();
         let g = geometry(3, OutputDemand::LastPosition);
-        let pool = WorkingMemoryPool::new(4096, 0).unwrap();
-        let request = if budgeted {
-            pool.reserve(&id, &admission(g)).unwrap().into()
+        let pool = if budgeted {
+            memory::host_ledger(65536, 0).unwrap()
         } else {
-            InferenceRequest::without_memory_budget(&id, g).unwrap()
+            memory::unlimited_ledger(0)
         };
+        let request: InferenceRequest = pool.reserve(&id, &admission(g)).unwrap().into();
         assert!(matches!(
             request.prepare_text(&InferenceExecutionIdentity::default(), g, config()),
             Err(WorkingMemoryError::IdentityMismatch)
@@ -109,7 +109,7 @@ fn preparation_claims_once_before_running_the_shared_prefill_driver() {
         assert!(scores.iter().any(|score| *score != 0.));
         assert_eq!(executor.submitted.len(), 3);
         drop((driver, executor, preparation, clone, request));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.funded_used_bytes().unwrap(), 0);
     }
 }
 
@@ -117,12 +117,12 @@ fn preparation_claims_once_before_running_the_shared_prefill_driver() {
 fn failed_preparation_never_refunds_startup_and_stage_tickets_retain_the_charge() {
     let id = InferenceExecutionIdentity::default();
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let request: InferenceRequest = pool.reserve(&id, &admission(g)).unwrap().into();
     let preparation = request.prepare_text(&id, g, config()).unwrap();
     preparation.bind_prompt().unwrap(); // Existing prepared native input.
     let failed = preparation.claim_sampling(config()).unwrap();
-    let bytes = pool.used_bytes().unwrap();
+    let bytes = pool.funded_used_bytes().unwrap();
     drop(failed);
     assert!(matches!(
         preparation.claim_sampling(config()),
@@ -133,31 +133,36 @@ fn failed_preparation_never_refunds_startup_and_stage_tickets_retain_the_charge(
         Err(WorkingMemoryError::PreparationNotReady)
     ));
     assert!(request.prepare_text(&id, g, config()).is_err());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.funded_used_bytes().unwrap(), bytes);
     drop((preparation, request));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 
     let request: InferenceRequest = pool.reserve(&id, &admission(g)).unwrap().into();
     let preparation = request.prepare_text(&id, g, config()).unwrap();
     let outstanding = preparation.claim_prompt().unwrap();
     drop((preparation, request));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.funded_used_bytes().unwrap(),
         bytes,
         "move-only stage retains its resource authority"
     );
     drop(outstanding);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_peak_bytes().unwrap(), bytes);
 }
 
 #[test]
 fn independent_reservation_wrappers_share_one_concurrent_preparation_claim() {
     let id = InferenceExecutionIdentity::default();
     let g = geometry(3, OutputDemand::LastPosition);
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = memory::host_ledger(65536, 0).unwrap();
     let reservation = pool.reserve(&id, &admission(g)).unwrap();
-    let bytes = reservation.bytes();
+    let bytes = reservation
+        .requirements()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(8));
     let workers = (0..8)
         .map(|_| {
@@ -179,13 +184,13 @@ fn independent_reservation_wrappers_share_one_concurrent_preparation_claim() {
         }
     }
     assert_eq!(winners.len(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.funded_used_bytes().unwrap(), bytes);
     let winner = winners.pop().unwrap();
     winner.bind_prompt().unwrap();
     winner.claim_sampling(config()).unwrap().finish().unwrap();
     drop(start(winner.request(), &id).unwrap());
     drop((winner, reservation));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.funded_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -193,7 +198,7 @@ fn preparation_and_direct_prefill_cannot_both_win_the_same_start() {
     let g = geometry(3, OutputDemand::LastPosition);
     for _ in 0..16 {
         let id = InferenceExecutionIdentity::default();
-        let request = InferenceRequest::without_memory_budget(&id, g).unwrap();
+        let request = unlimited_request(&id, g).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let handles = [false, true].map(|prepare| {
             let request = request.clone();

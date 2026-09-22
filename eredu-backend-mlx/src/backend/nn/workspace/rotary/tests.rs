@@ -3,7 +3,11 @@ use eredu_nn::{NeuralBackend, RotaryOperator, RotaryPosition, RotarySpec};
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -85,6 +89,21 @@ fn rotary_quotes_native_batches_explicit_products_and_first_use_frequency_graphs
                                 .unwrap()
                     );
                     assert!(report.tensor_buffers.transient_bytes.unwrap() > 0);
+                    if arithmetic == RotaryArithmetic::InputProducts {
+                        let operation = WorkspaceOperation {
+                            kind: WorkspaceOperationKind::Rotary(
+                                spec(algorithm, arithmetic, traditional, dimensions),
+                                Some(29),
+                            ),
+                            inputs: vec![input.layout().clone()],
+                            outputs: vec![input.layout().clone()],
+                        };
+                        let callers = mechanisms()
+                            .ordinary_call_controls(operation.as_view())
+                            .unwrap()
+                            .expect("explicit products retain their actual safe caller source");
+                        assert!(callers.metadata_bytes > 0);
+                    }
                 }
             }
         }
@@ -208,19 +227,35 @@ mod native {
                                 .unwrap(),
                             );
                             for traditional in [false, true] {
-                                let actual = source.rope_with_frequencies(
-                                    dimensions, traditional, 7, &frequencies, &stream,
-                                ).unwrap();
+                                let actual = source
+                                    .rope_with_frequencies(
+                                        dimensions,
+                                        traditional,
+                                        7,
+                                        &frequencies,
+                                        &stream,
+                                    )
+                                    .unwrap();
                                 actual.as_array().evaluated().unwrap();
                                 assert_eq!(actual.as_array().dtype(), dtype);
                                 let context = WorkspaceContext::new(mechanism);
-                                let mut projection = ExistingArrayProjection::with_source_count(&context, 3).unwrap();
-                                let symbolic_source = projection.project(source.as_array()).unwrap();
-                                let symbolic_frequencies = projection.project(frequencies.as_array()).unwrap();
+                                let mut projection =
+                                    ExistingArrayProjection::with_source_count(&context, 3)
+                                        .unwrap();
+                                let symbolic_source =
+                                    projection.project(source.as_array()).unwrap();
+                                let symbolic_frequencies =
+                                    projection.project(frequencies.as_array()).unwrap();
                                 let native = projection.project(actual.as_array()).unwrap();
-                                let symbolic = symbolic_source.rope_with_frequencies(
-                                    dimensions, traditional, 7, &symbolic_frequencies, &context,
-                                ).unwrap();
+                                let symbolic = symbolic_source
+                                    .rope_with_frequencies(
+                                        dimensions,
+                                        traditional,
+                                        7,
+                                        &symbolic_frequencies,
+                                        &context,
+                                    )
+                                    .unwrap();
                                 assert_eq!(symbolic.shape(), actual.shape());
                                 assert_eq!(
                                     symbolic.layout().representation().unwrap().dtype(),
@@ -228,16 +263,29 @@ mod native {
                                 );
                                 let zero = symbolic.zeros_like(&context).unwrap();
                                 assert_eq!(zero.shape(), symbolic.shape());
-                                assert_eq!(zero.layout().representation().unwrap().dtype(),
-                                    native.layout().representation().unwrap().dtype());
-                                let reference = expected(&values, &shape, spec(
-                                    RotaryAlgorithm::Default, RotaryArithmetic::Native,
-                                    traditional, dimensions,
-                                ), 7, true);
+                                assert_eq!(
+                                    zero.layout().representation().unwrap().dtype(),
+                                    native.layout().representation().unwrap().dtype()
+                                );
+                                let reference = expected(
+                                    &values,
+                                    &shape,
+                                    spec(
+                                        RotaryAlgorithm::Default,
+                                        RotaryArithmetic::Native,
+                                        traditional,
+                                        dimensions,
+                                    ),
+                                    7,
+                                    true,
+                                );
                                 let output = actual.to_f32_vec(&stream).unwrap();
                                 assert_eq!(output.len(), reference.len());
                                 for (actual, expected) in output.iter().zip(reference) {
-                                    assert!((*actual as f64 - expected).abs() <= 0.006 + expected.abs() * 0.04);
+                                    assert!(
+                                        (*actual as f64 - expected).abs()
+                                            <= 0.006 + expected.abs() * 0.04
+                                    );
                                 }
                             }
                         }
@@ -248,10 +296,14 @@ mod native {
         // Frequency precision cannot supply a missing input scalar fact.
         let context = WorkspaceContext::new(mechanism);
         let unknown = WorkspaceTensor::existing(
-            context.layout(&[1, 0, 8], WorkspaceDtype::Float32).unwrap(), &context,
-        ).unwrap();
+            context.layout(&[1, 0, 8], WorkspaceDtype::Float32).unwrap(),
+            &context,
+        )
+        .unwrap();
         let frequencies = WorkspaceTensor::full_f32(1., &[4], &context).unwrap();
-        let result = unknown.rope_with_frequencies(8, true, 0, &frequencies, &context).unwrap();
+        let result = unknown
+            .rope_with_frequencies(8, true, 0, &frequencies, &context)
+            .unwrap();
         assert!(result.layout().representation().is_none());
         assert!(result.zeros_like(&context).is_err());
     }

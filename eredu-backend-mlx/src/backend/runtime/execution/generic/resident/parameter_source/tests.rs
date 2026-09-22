@@ -181,9 +181,14 @@ fn loaded_resident_loan_preserves_selection_source_and_recovery() {
     policy.unit_ids[0] = original;
     let replacement = MlxTensor::from_array(Array::from_slice(&[41_i32, 43], &[2]));
     replacement.as_array().evaluated().unwrap();
-    assert!(policy
-        .publish_parameter_replacements(&BTreeMap::from([("weight".into(), replacement)]), false)
-        .unwrap());
+    let (context, funding) = crate::memory_fixture::parameter_context();
+    crate::memory_fixture::publish_parameters(
+        [("weight".into(), replacement)],
+        false,
+        &context,
+        funding,
+        |visitor| policy.visit_parameter_publication(visitor),
+    );
     let source = policy.parameter_sources().unwrap();
     assert_eq!(
         source

@@ -20,6 +20,50 @@ use eredu_runtime::{
 };
 use safemlx::{Device, DeviceType};
 
+fn with_prompt_cache_funding<T>(
+    executable: &mut crate::composition::mlx::model::Executable,
+    operation: impl FnOnce(
+        &mut dyn ErasedReplicatedTextExecutable,
+        &eredu_runtime::cache::PromptCachePersistenceFunding,
+    ) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let ledger = crate::backend::managed_memory::try_ledger()?;
+    let funding = executable.prepare_prompt_cache_persistence(&ledger)?;
+    operation(executable.erased_mut(), &funding)
+}
+
+fn with_prompt_cache_materialization<T>(
+    executable: &mut crate::composition::mlx::model::Executable,
+    operation: impl FnOnce(
+        &mut dyn ErasedReplicatedTextExecutable,
+        &eredu_runtime::cache::PromptCachePersistenceFunding,
+        &crate::backend::runtime::cache::residency::PromptCacheMaterialization,
+    ) -> Result<T, Error>,
+) -> Result<T, Error> {
+    with_prompt_cache_funding(executable, |generic, funding| {
+        use eredu_nn::workspace::WorkspaceMetadataAllocation;
+        funding
+            .context()
+            .charge_metadata(
+                safemlx::InitializedInputAllocator::borrow_control_bytes()
+                    .ok_or(Error::PrefillScopeUnavailable)?,
+            )
+            .map_err(|cause| Error::Neural(cause.into()))?;
+        let ledger = crate::backend::managed_memory::try_ledger()?;
+        let runtime = crate::backend::managed_memory::input_allocator::borrow_admitted(&ledger)
+            .map_err(Error::PrefillControl)?;
+        let materialization =
+            crate::backend::runtime::cache::residency::PromptCacheMaterialization::new(
+                &ledger,
+                generic.inference_execution_identity(),
+                runtime,
+                funding.context(),
+            )
+            .map_err(Error::Neural)?;
+        operation(generic, funding, &materialization)
+    })
+}
+
 fn prediction_cache_manager() -> CacheResidencyManager {
     CacheResidencyManager::new(
         PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
@@ -87,7 +131,8 @@ fn materialize_model_plan(
         plan.policy(),
         selected.session_capabilities(),
     )?;
-    let (sources, _rank_context) = super::super::loading::prepare_selected_sources(plan, selected, None)?;
+    let (sources, _rank_context) =
+        super::super::loading::prepare_selected_sources(plan, selected, None)?;
     super::super::loading::materialize_model_plan(sources, None, stream, weights_stream)
 }
 

@@ -1,8 +1,8 @@
 //! Representation tests only; no original execution authority is constructed.
 use super::*;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering as A},
     Mutex, Weak,
+    atomic::{AtomicBool, AtomicUsize, Ordering as A},
 };
 #[derive(Debug)]
 struct Key {
@@ -54,8 +54,13 @@ fn key(
         registry: Arc::downgrade(registry),
     }
 }
+fn install(registry: &Arc<Mutex<Registry<Key>>>, key: RegistryKey<Key>, entry: Entry) {
+    let mut batch = RegistryBatch::prepare_source_registration(1);
+    batch.entries[0] = Some((key, entry));
+    registry.lock().unwrap().link(batch);
+}
 #[test]
-fn fixed_and_legacy_entries_use_one_namespace_and_last_node_drops_outside_lock() {
+fn prepared_batches_use_one_namespace_and_last_node_drops_outside_lock() {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let panic = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));
@@ -64,11 +69,18 @@ fn fixed_and_legacy_entries_use_one_namespace_and_last_node_drops_outside_lock()
     let old = make(1);
     let new = make(2);
     let zero = make(3);
-    registry.lock().unwrap().insert(
+    install(
+        &registry,
         RegistryKey::Owned(make(1)),
         Entry {
             reset_layout_id: None,
             prepaid: None,
+            placement: crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0)
+                .unwrap()
+                .host_placement_handle(),
+            native_retired: false,
+            pending_allocation: false,
+            funding_allowance_bytes: 0,
             bytes: 9,
             owners: 1,
             funding: None,
@@ -82,6 +94,12 @@ fn fixed_and_legacy_entries_use_one_namespace_and_last_node_drops_outside_lock()
                     Entry {
                         reset_layout_id: None,
                         prepaid: None,
+                        placement: crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0)
+                            .unwrap()
+                            .host_placement_handle(),
+                        native_retired: false,
+                        pending_allocation: false,
+                        funding_allowance_bytes: 0,
                         bytes: 7,
                         owners: 2,
                         funding: Some(4),
@@ -92,6 +110,12 @@ fn fixed_and_legacy_entries_use_one_namespace_and_last_node_drops_outside_lock()
                     Entry {
                         reset_layout_id: None,
                         prepaid: None,
+                        placement: crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0)
+                            .unwrap()
+                            .host_placement_handle(),
+                        native_retired: false,
+                        pending_allocation: false,
+                        funding_allowance_bytes: 0,
                         bytes: 0,
                         owners: 1,
                         funding: Some(4),
@@ -138,11 +162,18 @@ fn integer_locator_commit_performs_no_provider_comparison_and_lookup_panic_is_at
     let locked = Arc::new(AtomicBool::new(false));
     let make = |id| key(id, &registry, &panic, &drops, &locked);
     let probe = make(1);
-    registry.lock().unwrap().insert(
+    install(
+        &registry,
         RegistryKey::Owned(make(1)),
         Entry {
             reset_layout_id: None,
             prepaid: None,
+            placement: crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0)
+                .unwrap()
+                .host_placement_handle(),
+            native_retired: false,
+            pending_allocation: false,
+            funding_allowance_bytes: 0,
             bytes: 9,
             owners: 1,
             funding: None,

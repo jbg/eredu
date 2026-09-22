@@ -98,6 +98,7 @@ impl StateReport<'_> {
             .ok_or(WorkingMemoryError::Overflow)?;
         self.sliding_windows.validate()?;
         Ok(AdmissionStateRequirements {
+            physical_domains: true,
             requested_state_bytes,
             batch_size: g.batch_size,
             requested_positions,
@@ -156,7 +157,7 @@ impl StateReport<'_> {
             size_of::<Result<eredu_core::RuntimeStateFacts<'_>, AdmissionPolicyError>>(),
             size_of::<funding::AccountNode>(),
             arc::<Reservation>()?,
-            arc::<RequestAuthority>()?,
+            arc::<WorkingMemoryReservation>()?,
             arc::<text_preparation::TextPreparationAuthority>()?,
             text_preparation::synchronization_control_bytes()
                 .ok_or(WorkingMemoryError::UnknownBound)?,
@@ -176,7 +177,7 @@ impl StateReport<'_> {
             >(),
             size_of::<Reservation>(),
             size_of::<ReservationOwner>(),
-            size_of::<RequestAuthority>(),
+            size_of::<WorkingMemoryReservation>(),
             size_of::<RequestOwner>(),
             size_of::<InferenceRequest>(),
             size_of::<InferenceTextPreparation>(),
@@ -302,10 +303,18 @@ impl Storage {
         report: StateReport<'_>,
         requirements: AdmissionStateRequirements,
     ) -> RuntimeStateEstimate {
-        let [selected, activations, attention, vocabulary, state_update, materialization, retained] =
-            self.descriptions;
+        let [
+            selected,
+            activations,
+            attention,
+            vocabulary,
+            state_update,
+            materialization,
+            retained,
+        ] = self.descriptions;
         let [a, b, c, d, e, f] = report.components;
         RuntimeStateEstimate {
+            physical_domains: None,
             fixed_state_bytes: report.fixed_state_bytes,
             bytes_per_position_per_batch: report.bytes_per_position_per_batch,
             context_state_bytes: report.context_state_bytes,
@@ -317,6 +326,7 @@ impl Storage {
             media_execution_workspace_bytes: report.media_execution_workspace_bytes,
             requested_state_bytes: requirements.requested_state_bytes,
             execution_workspace: Some(ExecutionWorkspaceEstimate {
+                physical_domains: None,
                 geometry: report.geometry,
                 activations: WorkspaceBound::bounded(a, activations),
                 attention: WorkspaceBound::bounded(b, attention),
@@ -347,7 +357,7 @@ pub(super) fn construct<S>(
     report: StateReport<'_>,
     requirements: AdmissionStateRequirements,
     decision: AdmissionPolicyDecision,
-    capacity: Option<u64>,
+    capacity: Option<eredu_core::MemoryLimits>,
 ) -> Result<
     (
         S,
@@ -378,7 +388,7 @@ fn construct_inner<S>(
     report: StateReport<'_>,
     requirements: AdmissionStateRequirements,
     decision: AdmissionPolicyDecision,
-    capacity: Option<u64>,
+    capacity: Option<eredu_core::MemoryLimits>,
     fail: Option<usize>,
 ) -> Result<
     (
@@ -433,19 +443,28 @@ fn construct_inner<S>(
         ticket,
     } = construction;
     let report_storage = storage.report.take();
-    let admission = Admission {
-        requested_positions: decision.requested_positions,
-        state: storage.into_state(report, requirements),
-        incremental_required_bytes: decision.incremental_required_bytes,
-        available_memory_bytes: decision.available_memory_bytes,
-    };
+    let admission = crate::working_memory::memory_fixture::attribute_host_admission(
+        ticket.pool(),
+        Admission {
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+            requested_positions: decision.requested_positions,
+            state: storage.into_state(report, requirements),
+            incremental_required_bytes: decision.incremental_required_bytes,
+        },
+    );
     let value = Reservation {
         account_id: ticket.id(),
         pool: ticket.pool().clone(),
         execution: execution.clone(),
         admission,
         geometry: report.geometry,
-        bytes: decision.incremental_required_bytes,
+        requirements: crate::working_memory::memory_fixture::host_requirements(
+            ticket.pool(),
+            decision
+                .incremental_required_bytes
+                .expect("host fixture requirement"),
+        ),
         capacity,
         funding: None,
         borrowed_storage: None,
@@ -514,7 +533,7 @@ pub(super) fn set_after_fill_for_test(action: AfterFill) {
     AFTER_FILL.with(|value| assert!(value.replace(Some(action)).is_none()));
 }
 #[cfg(test)]
-fn after_fill_for_test(pool: &WorkingMemoryPool) {
+fn after_fill_for_test(pool: &MemoryLedger) {
     match AFTER_FILL.with(|value| value.take()) {
         Some(AfterFill::Unwind) => panic!("diagnostic filled before reservation publication"),
         Some(AfterFill::Poison) => {

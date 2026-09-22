@@ -101,7 +101,7 @@ fn unsupported() -> BackendFailure {
 /// fn overlap<B: SessionResetPreparationBackend>(runtime: &mut ModelRuntime<B>) {
 ///     let ready = runtime.prepare_reset_ordinary().unwrap();
 ///     let _ = runtime.session_mut();
-///     ready.reset_admitted(SessionResetLimits::new(1024)).unwrap();
+///     ready.reset_admitted(SessionResetLimits::default()).unwrap();
 /// }
 /// ```
 ///
@@ -111,8 +111,8 @@ fn unsupported() -> BackendFailure {
 /// use eredu_core::{ModelRuntime, SessionResetPreparationBackend, SessionResetLimits};
 /// fn twice<B: SessionResetPreparationBackend>(runtime: &mut ModelRuntime<B>) {
 ///     let ready = runtime.prepare_reset_ordinary().unwrap();
-///     let _ = ready.reset_admitted(SessionResetLimits::new(1024));
-///     let _ = ready.reset_admitted(SessionResetLimits::new(1024));
+///     let _ = ready.reset_admitted(SessionResetLimits::default());
+///     let _ = ready.reset_admitted(SessionResetLimits::default());
 /// }
 /// ```
 #[must_use = "preparation is consumed by one reset or dropped without resetting"]

@@ -11,7 +11,7 @@ use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, OffloadUnit, WeightBinding,
 };
 use safemlx::{Device, DeviceType, Stream};
-use safetensors::tensor::{TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, TensorView};
 use std::{collections::BTreeMap, sync::Arc};
 
 fn source(
@@ -94,15 +94,24 @@ fn source_with_constructors(
         std::collections::BTreeSet::new()
     };
     let mut owner = BTreeMap::from([(
-        "shared.weight".to_owned(), context.layout(&[2, 2], WorkspaceDtype::Float32).unwrap(),
+        "shared.weight".to_owned(),
+        context.layout(&[2, 2], WorkspaceDtype::Float32).unwrap(),
     )]);
     if independent {
-        owner.insert("independent.bank".to_owned(),
-            context.layout(&[2, 2, 2], WorkspaceDtype::Float32).unwrap());
+        owner.insert(
+            "independent.bank".to_owned(),
+            context.layout(&[2, 2, 2], WorkspaceDtype::Float32).unwrap(),
+        );
     }
     let alias = BTreeMap::from([
-        ("shared".to_owned(), context.layout(&[2, 2], WorkspaceDtype::Float32).unwrap()),
-        ("local".to_owned(), context.layout(&[4], WorkspaceDtype::Float32).unwrap()),
+        (
+            "shared".to_owned(),
+            context.layout(&[2, 2], WorkspaceDtype::Float32).unwrap(),
+        ),
+        (
+            "local".to_owned(),
+            context.layout(&[4], WorkspaceDtype::Float32).unwrap(),
+        ),
     ]);
     let constructors = [
         ParameterConstructors::from_layouts(&owner).unwrap(),
@@ -126,7 +135,12 @@ fn source_with_constructors(
     .unwrap()
     .expect("genuine prepared Host source on the selected destination");
     let populator = MlxSelectiveUnitPopulator::from_prepared(
-        manager.original_parameter_exclusions().unwrap().for_selection(&exclusions).unwrap());
+        manager
+            .original_parameter_exclusions()
+            .unwrap()
+            .for_selection(&exclusions)
+            .unwrap(),
+    );
     let policy = MlxLayerwisePolicy::<(), _>::new(
         manager,
         store,
@@ -176,15 +190,20 @@ fn context(mechanism: ResidentExecutionMechanisms) -> WorkspaceContext {
         ResidentExecutionMechanisms::Metal(facts) => WorkspaceContext::new(facts),
         ResidentExecutionMechanisms::Cpu { cpu, .. } => WorkspaceContext::new(cpu),
     };
-    context.set_borrowed_storage(
-        eredu_nn::workspace::WorkspaceBorrowedStorage::new(&context, []).unwrap(),
-    ).unwrap();
+    context
+        .set_borrowed_storage(
+            eredu_nn::workspace::WorkspaceBorrowedStorage::new(&context, []).unwrap(),
+        )
+        .unwrap();
     context
 }
 fn trace(context: &WorkspaceContext, slots: usize) -> WorkspaceTraceReport {
     trace_shapes(context, std::iter::repeat_n(&[2, 2][..], slots))
 }
-fn trace_shapes<'a>(context: &WorkspaceContext, shapes: impl IntoIterator<Item = &'a [i32]>) -> WorkspaceTraceReport {
+fn trace_shapes<'a>(
+    context: &WorkspaceContext,
+    shapes: impl IntoIterator<Item = &'a [i32]>,
+) -> WorkspaceTraceReport {
     context.begin_state_span([]).unwrap();
     for shape in shapes {
         drop(WorkspaceTensor::unloaded_f32(shape, context).unwrap());
@@ -206,32 +225,50 @@ fn trace_shapes<'a>(context: &WorkspaceContext, shapes: impl IntoIterator<Item =
 
 #[test]
 fn layerwise_constructor_sources_include_independent_slots_and_refuse_missing_declarations() {
+    if !crate::tests::support::native_process::enter("qualified-recipe") {
+        return;
+    }
     for device in [DeviceType::Cpu, DeviceType::Gpu] {
         let mechanism = selected_mechanism(device);
         let context = context(mechanism);
-        let (_dir, incomplete) = source_with_constructors(device, &context, mechanism.allocation(), true, false);
-        assert!(constructor_source(&incomplete, None).is_err(),
-            "excluded lease rows cannot certify the complete unloaded module");
-        let (_dir, complete) = source_with_constructors(device, &context, mechanism.allocation(), true, true);
+        let (_dir, incomplete) =
+            source_with_constructors(device, &context, mechanism.allocation(), true, false);
+        assert!(
+            constructor_source(&incomplete, None).is_err(),
+            "excluded lease rows cannot certify the complete unloaded module"
+        );
+        let (_dir, complete) =
+            source_with_constructors(device, &context, mechanism.allocation(), true, true);
         let counted = complete.parameter_source().count().unwrap();
-        assert_eq!(counted.counts().rows, 3, "independent slot is not a lease payload");
+        assert_eq!(
+            counted.counts().rows,
+            3,
+            "independent slot is not a lease payload"
+        );
         drop(counted);
         let (constructors, query) = constructor_source(&complete, None).unwrap();
         assert_eq!(constructors.slots, 4);
         assert_eq!(constructors.scalar_bytes, 16);
-        assert_eq!(constructors.rank, 3, "bank placeholder shape still needs descriptor storage");
+        assert_eq!(
+            constructors.rank, 3,
+            "bank placeholder shape still needs descriptor storage"
+        );
         let (native, _) = constructors.native_source(query).unwrap();
         assert_eq!(native.primitives(), 12);
         assert_eq!(native.seeds(), 4);
         assert_eq!(native.maximum_rank(), 3);
         let report = trace_shapes(&context, [&[2, 2][..], &[2, 2, 2], &[2, 2], &[4]]);
         let mut recorder = mechanism.recorder(geometry(), &context).unwrap();
-        recorder.bind_layerwise_constructor_source(&complete).unwrap();
+        recorder
+            .bind_layerwise_constructor_source(&complete)
+            .unwrap();
         record(&mut recorder, &report).unwrap();
         assert_eq!(recorder.records[0].first_missing_operation, None);
         let missing = trace(&context, 3);
         let mut recorder = mechanism.recorder(geometry(), &context).unwrap();
-        recorder.bind_layerwise_constructor_source(&complete).unwrap();
+        recorder
+            .bind_layerwise_constructor_source(&complete)
+            .unwrap();
         assert!(record(&mut recorder, &missing).is_err());
     }
 }
@@ -256,6 +293,9 @@ fn record(
 
 #[test]
 fn layerwise_constructor_sources_preserve_alias_slots_and_selected_device() {
+    if !crate::tests::support::native_process::enter("qualified-recipe") {
+        return;
+    }
     for device in [DeviceType::Cpu, DeviceType::Gpu] {
         let mechanism = selected_mechanism(device);
         let context = context(mechanism);
@@ -283,11 +323,16 @@ fn layerwise_constructor_sources_preserve_alias_slots_and_selected_device() {
         assert!(report.inference_transient_bytes().unwrap() > 0);
         assert!(report.residual.as_ref().unwrap().total_bytes.unwrap() > 0);
         if device == DeviceType::Cpu {
-            let uncertified = mechanism.recorder(geometry(), &context).unwrap()
-                .reduce_trace(&report, None, 0, 1).unwrap();
+            let uncertified = mechanism
+                .recorder(geometry(), &context)
+                .unwrap()
+                .reduce_trace(&report, None, 0, 1)
+                .unwrap();
             assert_eq!(uncertified.first_missing_operation, Some(0));
-            assert!(uncertified.graph.is_none(),
-                "descriptive completeness cannot substitute for retained constructor source");
+            assert!(
+                uncertified.graph.is_none(),
+                "descriptive completeness cannot substitute for retained constructor source"
+            );
         }
         let mut recorder = mechanism.recorder(geometry(), &context).unwrap();
         recorder.bind_layerwise_constructor_source(&source).unwrap();
@@ -336,12 +381,10 @@ fn layerwise_constructor_sources_preserve_alias_slots_and_selected_device() {
         )
         .unwrap();
         assert_eq!(recorder.sampling.len(), 2);
-        assert!(
-            recorder
-                .sampling
-                .iter()
-                .all(|row| row.first_missing_operation.is_none() && row.mutable_storage.is_some())
-        );
+        assert!(recorder
+            .sampling
+            .iter()
+            .all(|row| row.first_missing_operation.is_none() && row.mutable_storage.is_some()));
 
         let opposite = selected_mechanism(if device == DeviceType::Cpu {
             DeviceType::Gpu
@@ -359,6 +402,9 @@ fn layerwise_constructor_sources_preserve_alias_slots_and_selected_device() {
 
 #[test]
 fn layerwise_constructor_inventory_refuses_changed_normal_and_owned_child_traces() {
+    if !crate::tests::support::native_process::enter("qualified-recipe") {
+        return;
+    }
     for device in [DeviceType::Cpu, DeviceType::Gpu] {
         let mechanism = selected_mechanism(device);
         let context = context(mechanism);
@@ -407,5 +453,62 @@ fn layerwise_constructor_inventory_refuses_changed_normal_and_owned_child_traces
                 "owned child must authenticate the same inventory: device {device:?}, change {change}"
             );
         }
+    }
+}
+
+#[test]
+fn layerwise_constructor_census_tracks_each_acquired_span_and_keeps_the_full_native_envelope() {
+    if !crate::tests::support::native_process::enter("qualified-recipe") {
+        return;
+    }
+    use eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters as _;
+    for device in [DeviceType::Cpu, DeviceType::Gpu] {
+        let mechanism = selected_mechanism(device);
+        let context = context(mechanism);
+        let (_dir, source) =
+            source_with_constructors(device, &context, mechanism.allocation(), true, true);
+        let first = trace_shapes(&context, [&[2, 2][..], &[2, 2, 2][..]]);
+        let second = trace_shapes(&context, [&[2, 2][..], &[4][..]]);
+        let mut recorder = mechanism.recorder(geometry(), &context).unwrap();
+        recorder
+            .bind_layerwise_span_constructor_source(&source)
+            .unwrap();
+        assert_eq!(recorder.layerwise_constructors.unwrap().slots, 4);
+        let mut overlapping = mechanism.recorder(geometry(), &context).unwrap();
+        assert!(overlapping
+            .bind_layerwise_span_constructor_source(&source)
+            .is_err());
+        source
+            .observe_acquire(0, source.execution_address(0).unwrap(), &context)
+            .unwrap();
+        record(&mut recorder, &first).unwrap();
+        assert_eq!(recorder.records[0].layerwise_ordinals(), Some(&[0][..]));
+        assert!(
+            record(&mut recorder, &second).is_err(),
+            "a new span needs its own acquired source evidence"
+        );
+        assert!(source
+            .observe_acquire(1, source.execution_address(0).unwrap(), &context)
+            .is_err());
+        source
+            .observe_acquire(1, source.execution_address(1).unwrap(), &context)
+            .unwrap();
+        record(&mut recorder, &second).unwrap();
+        assert_eq!(recorder.records.len(), 2);
+        assert_eq!(recorder.records[1].layerwise_ordinals(), Some(&[1][..]));
+        drop(recorder);
+        let mut next_candidate = mechanism.recorder(geometry(), &context).unwrap();
+        next_candidate
+            .bind_layerwise_span_constructor_source(&source)
+            .unwrap();
+        source
+            .observe_acquire(1, source.execution_address(1).unwrap(), &context)
+            .unwrap();
+        record(&mut next_candidate, &second).unwrap();
+        assert_eq!(next_candidate.layerwise_constructors.unwrap().slots, 4);
+        assert_eq!(
+            next_candidate.records[0].layerwise_ordinals(),
+            Some(&[1][..])
+        );
     }
 }

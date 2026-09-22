@@ -30,17 +30,17 @@ fn qualified() -> bool {
         assert!(plan.is_ok(), "{plan:?}");
     }
     match plan {
-        Ok(plan) => match WorkingMemoryPool::shared_native_initialization_required_bytes(&plan) {
+        Ok(plan) => match MemoryLedger::shared_native_initialization_required_bytes(&plan) {
             Ok(_) => true,
             Err(WorkingMemoryError::UnknownBound) => {
                 assert!(!required, "positive source-account qualification required");
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                 let error = pool.initialize_shared_native(plan).unwrap_err();
                 assert!(matches!(
                     error.accounting_failure(),
                     Some(WorkingMemoryError::UnknownBound)
                 ));
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.fixture_host_charge().unwrap(), 0);
                 false
             }
             Err(error) => panic!("unexpected source-account qualification: {error}"),
@@ -58,22 +58,23 @@ fn scheduler_exact_and_one_short_admission_preserve_permanent_source_owner() {
                 return;
             }
             let plan = Initializer::prepare().unwrap();
-            let bytes =
-                WorkingMemoryPool::shared_native_initialization_required_bytes(&plan).unwrap();
-            let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+            let bytes = MemoryLedger::shared_native_initialization_required_bytes(&plan).unwrap();
+            let short = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
             let error = short.initialize_shared_native(plan).unwrap_err();
             assert!(matches!(
                 error.accounting_failure(),
-                Some(WorkingMemoryError::BudgetExceeded { .. })
+                Some(WorkingMemoryError::Domain(
+                    eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                ))
             ));
             assert!(error.rejected_plan().is_some());
             assert!(error.constructor_failure().is_none());
-            assert_eq!(short.used_bytes().unwrap(), 0);
+            assert_eq!(short.fixture_host_charge().unwrap(), 0);
             drop(error);
-            let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+            let exact = crate::memory_fixture::ledger(bytes, 0).unwrap();
             let owner = exact.initialize_shared_native(plan).unwrap();
             assert_eq!(owner.original_bytes(), bytes);
-            assert_eq!(exact.used_bytes().unwrap(), bytes);
+            assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
             owner.validate_pool(&exact).unwrap();
             owner.output().try_borrow().unwrap();
             assert!(matches!(
@@ -81,7 +82,7 @@ fn scheduler_exact_and_one_short_admission_preserve_permanent_source_owner() {
                 Err(WorkingMemoryError::IdentityMismatch)
             ));
             drop(owner);
-            assert_eq!(exact.used_bytes().unwrap(), bytes); // actual permanent native raw custody
+            assert_eq!(exact.fixture_host_charge().unwrap(), bytes); // actual permanent native raw custody
         },
     );
 }
@@ -94,11 +95,11 @@ fn ordinary_scheduler_predecessor_refuses_chain_and_keeps_admitted_device_prefix
             if !qualified() {
                 return;
             }
-            let pool = super::super::domain();
+            let pool = super::super::ledger();
             // Establish the genuine Device prefix first, so the intended next
             // refusal is the ordinary Scheduler and never an ordinary Device fallback.
             super::super::metal_device::prepare_admitted(&pool).unwrap();
-            let before = pool.used_bytes().unwrap();
+            let before = pool.fixture_host_charge().unwrap();
             let device = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);
             let stream = safemlx::Stream::new_with_device(&device);
             let runtime =
@@ -118,12 +119,16 @@ fn ordinary_scheduler_predecessor_refuses_chain_and_keeps_admitted_device_prefix
             };
             assert_eq!(native.cause(), SchedulerCause::OrdinaryPredecessor);
             assert!(INITIALIZED.get().is_none());
-            assert!(pool.used_bytes().unwrap() > before); // intact failed Scheduler node/account
+            assert!(pool.fixture_host_charge().unwrap() > before); // intact failed Scheduler node/account
             drop(error);
-            assert_eq!(pool.used_bytes().unwrap(), before); // Device prefix is still owned
+            assert_eq!(pool.fixture_host_charge().unwrap(), before); // Device prefix is still owned
             super::super::metal_device::prepare_admitted(&pool).unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before);
             drop((runtime, stream, device));
         },
     );
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

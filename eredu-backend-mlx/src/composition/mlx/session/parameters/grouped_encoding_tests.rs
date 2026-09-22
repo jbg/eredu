@@ -142,15 +142,14 @@ fn verify_grouped(stream: &Stream, affine: bool) {
         starts: vec![1, 2, 3],
         shape: vec![1, 1, 2],
     };
-    apply_effective_update(
-        &mut effective,
+    effective = numerical::update_for_test(
+        &effective,
         &edit,
         &ParameterUpdate::Add {
             values: vec![0.375, -0.625],
         },
         stream,
     )
-    .unwrap()
     .unwrap();
     let mut changed = expected.clone();
     changed[(ROWS + 2) * WIDTH + 3] += 0.375;
@@ -302,15 +301,14 @@ fn verify_native_bank(
         starts: vec![(groups - 1) as u64, 2, 3],
         shape: vec![1, 1, 2],
     };
-    apply_effective_update(
-        &mut effective,
+    effective = numerical::update_for_test(
+        &effective,
         &edit,
         &ParameterUpdate::Add {
             values: vec![0.375, -0.625],
         },
         stream,
     )
-    .unwrap()
     .unwrap();
     let mut changed = expected.clone();
     changed[((groups - 1) * rows + 2) * width + 3] += 0.375;

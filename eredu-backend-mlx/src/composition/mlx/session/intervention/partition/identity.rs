@@ -5,7 +5,20 @@ pub(super) fn identity(
     owner: &PreparedPartitionModelIntervention,
 ) -> std::result::Result<[u8; 32], Failure> {
     let mut hash = Sha256::new();
-    hash.update(b"eredu-original-partition-native-intervention-v1\0");
+    if let Some(physical) = owner.invocation {
+        hash.update(b"eredu-original-partition-model-native-intervention-v1\0");
+        vector(&mut hash, &[physical.batch, physical.sequence]);
+        hash.update([u8::from(physical.context.is_some())]);
+        if let Some(context) = physical.context {
+            hash.update(context.to_le_bytes());
+        }
+        hash.update([u8::from(owner.invocation_window.is_some())]);
+        if let Some(window) = owner.invocation_window {
+            vector(&mut hash, &[window.logical_sequence, window.start]);
+        }
+    } else {
+        hash.update(b"eredu-original-partition-native-intervention-v1\0");
+    }
     hash.update(owner.projection.geometry_identity());
     hash.update(
         owner

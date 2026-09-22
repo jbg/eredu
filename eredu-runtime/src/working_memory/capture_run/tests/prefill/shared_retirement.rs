@@ -4,7 +4,7 @@ use super::*;
 fn original_preview_escapes_frame_and_concurrent_final_aliases_keep_same_h() {
     let source = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (reservation, run) = fresh(&pool, h);
     let mut bank = run
         .prepare_capture_run(&reservation, plan(&source))
@@ -35,9 +35,9 @@ fn original_preview_escapes_frame_and_concurrent_final_aliases_keep_same_h() {
         .unwrap();
     let frame_alias = delivered.clone();
     drop((bank, source, reservation, run, delivered));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(frame_alias);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
     let threads: Vec<_> = (0..8)
@@ -53,11 +53,11 @@ fn original_preview_escapes_frame_and_concurrent_final_aliases_keep_same_h() {
         })
         .collect();
     drop(preview);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     barrier.wait();
     for thread in threads {
         thread.join().unwrap();
     }
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
 }

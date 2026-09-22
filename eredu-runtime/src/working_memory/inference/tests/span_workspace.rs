@@ -56,7 +56,10 @@ fn actual_schedule_retains_new_state_and_nonzero_operations_without_opening_cred
     assert_eq!(plan.geometry(), g);
     assert_eq!(plan.generation_forward_count(), Some(5));
     assert_eq!(
-        plan.generation_records().unwrap().map(|record| record.span()).collect::<Vec<_>>(),
+        plan.generation_records()
+            .unwrap()
+            .map(|record| record.span())
+            .collect::<Vec<_>>(),
         actual[..5].iter().collect::<Vec<_>>(),
     );
     assert_eq!(
@@ -111,16 +114,21 @@ fn actual_schedule_retains_new_state_and_nonzero_operations_without_opening_cred
 fn missing_host_or_state_remains_unknown_in_span_diagnostics() {
     let unknown_host =
         quote_inference_workspace(geometry(), |_| Ok::<_, Error>(trace(8, None, true))).unwrap();
-    assert!(unknown_host
-        .span_workspace_plan()
-        .records()
-        .iter()
-        .all(|r| r.new_allocation_bytes().is_none()));
-    assert!(unknown_host
-        .span_workspace_plan()
-        .records()
-        .iter()
-        .all(|r| r.new_tensor_allocation_bytes() == Some(8) && r.host_workspace_bytes().is_none()));
+    assert!(
+        unknown_host
+            .span_workspace_plan()
+            .records()
+            .iter()
+            .all(|r| r.new_allocation_bytes().is_none())
+    );
+    assert!(
+        unknown_host
+            .span_workspace_plan()
+            .records()
+            .iter()
+            .all(|r| r.new_tensor_allocation_bytes() == Some(8)
+                && r.host_workspace_bytes().is_none())
+    );
     let no_state = quote_inference_workspace(geometry(), |_| {
         let context = WorkspaceContext::new(SpanFacts);
         context.begin_span();
@@ -130,18 +138,16 @@ fn missing_host_or_state_remains_unknown_in_span_diagnostics() {
         Ok::<_, Error>(report)
     })
     .unwrap();
-    assert!(no_state
-        .span_workspace_plan()
-        .records()
-        .iter()
-        .all(|r| r.new_allocation_bytes().is_none()));
-    assert!(no_state
-        .span_workspace_plan()
-        .records()
-        .iter()
-        .all(
-            |r| r.new_tensor_allocation_bytes() == Some(23) && r.host_workspace_bytes() == Some(7)
-        ));
+    assert!(
+        no_state
+            .span_workspace_plan()
+            .records()
+            .iter()
+            .all(|r| r.new_allocation_bytes().is_none())
+    );
+    assert!(no_state.span_workspace_plan().records().iter().all(
+        |r| r.new_tensor_allocation_bytes() == Some(23) && r.host_workspace_bytes() == Some(7)
+    ));
 }
 
 #[test]
@@ -179,4 +185,47 @@ fn plan_identity_and_actual_spare_capacity_are_preserved_without_deep_clone() {
         plan.capacity_bytes().unwrap()
             >= (plan.records().len() * std::mem::size_of::<InferenceSpanWorkspaceRecord>()) as u64
     );
+}
+
+#[test]
+fn closing_storage_population_preserves_backing_union_and_unknown_capacity() {
+    for capacity in [Some(64), None] {
+        let context = WorkspaceContext::new(SpanFacts);
+        let storage = WorkspaceExistingStorage::new(capacity, &context);
+        let first = WorkspaceTensor::existing_with_storage(
+            WorkspaceLayout::new(&[1], WorkspaceDtype::Float32).unwrap(),
+            &storage,
+            &context,
+        )
+        .unwrap();
+        let view = WorkspaceTensor::existing_with_storage(
+            WorkspaceLayout::new(&[2], WorkspaceDtype::Float32).unwrap(),
+            &storage,
+            &context,
+        )
+        .unwrap();
+        let report = quote_inference_workspace(geometry(), |_| {
+            context.begin_state_span([&first, &view])?;
+            let independent = WorkspaceTensor::full_f32(2.0, &[1], &context)?;
+            context.report(&[
+                first.clone(),
+                view.clone(),
+                independent.clone(),
+                independent,
+            ])
+        })
+        .unwrap();
+        assert_eq!(report.maximum_closing_storage_allocations(), 2);
+        for record in report.span_workspace_plan().records() {
+            assert_eq!(
+                record.closing_storage().maximum_allocations,
+                2,
+                "views share the original backing; independent output has its own charge"
+            );
+            assert_eq!(
+                record.closing_storage().bytes,
+                capacity.map(|bytes| bytes + 4)
+            );
+        }
+    }
 }

@@ -10,7 +10,9 @@ pub(super) fn uses_source(operation: WorkspaceOperationView<'_>) -> bool {
 
 /// Complete actual parameter roles, including mixed affine/MXFP4 banks.
 pub(super) fn packed_sources(operation: WorkspaceOperationView<'_>) -> Option<usize> {
-    if !uses_source(operation) { return None; }
+    if !uses_source(operation) {
+        return None;
+    }
     Some(super::sources::counts(operation)?[0])
 }
 
@@ -162,31 +164,51 @@ mod tests {
         let mut module = WorkspaceBackend::grouped_gated_product(spec(), &context).unwrap();
         let input = WorkspaceTensor::unloaded_f32(&[1, 2, 32], &context).unwrap();
         let ids = WorkspaceTensor::existing(
-            WorkspaceLayout::new(&[2, 2], WorkspaceDtype::Uint32).unwrap(), &context,
-        ).unwrap();
+            WorkspaceLayout::new(&[2, 2], WorkspaceDtype::Uint32).unwrap(),
+            &context,
+        )
+        .unwrap();
         let coefficients = WorkspaceTensor::unloaded_f32(&[2, 2], &context).unwrap();
         let selection = GroupSelection::new(ids, coefficients.clone(), coefficients);
         context.begin_span();
-        let (value, bias) = module.forward_grouped_tensor_parallel(&input, &selection, 2, &context)
-            .unwrap().into_parts();
+        let (value, bias) = module
+            .forward_grouped_tensor_parallel(&input, &selection, 2, &context)
+            .unwrap()
+            .into_parts();
         let report = context.report(&[value, bias.unwrap()]).unwrap();
-        let operation = report.operations.iter().find(|op|
-            matches!(op.kind, WorkspaceOperationKind::Grouped { .. })).unwrap();
+        let operation = report
+            .operations
+            .iter()
+            .find(|op| matches!(op.kind, WorkspaceOperationKind::Grouped { .. }))
+            .unwrap();
         let mut inputs = operation.inputs.clone();
         for input in &mut inputs {
             if input.dtype() == WorkspaceDtype::Float32 {
-                *input = input.clone().with_representation(Some(WorkspaceRepresentation::new(
-                    WorkspaceFloatingType::Float32, false)));
+                *input = input
+                    .clone()
+                    .with_representation(Some(WorkspaceRepresentation::new(
+                        WorkspaceFloatingType::Float32,
+                        false,
+                    )));
             }
         }
-        fn scalar(operation: WorkspaceOperationView<'_>, inputs: &[WorkspaceLayout], output: usize)
-            -> Option<WorkspaceRepresentation>
-        {
-            crate::backend::nn::workspace::representation::output(WorkspaceOperationView {
-                inputs: WorkspaceLayoutList::Owned(inputs), ..operation
-            }, output)
+        fn scalar(
+            operation: WorkspaceOperationView<'_>,
+            inputs: &[WorkspaceLayout],
+            output: usize,
+        ) -> Option<WorkspaceRepresentation> {
+            crate::backend::nn::workspace::representation::output(
+                WorkspaceOperationView {
+                    inputs: WorkspaceLayoutList::Owned(inputs),
+                    ..operation
+                },
+                output,
+            )
         }
-        let expected = Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false));
+        let expected = Some(WorkspaceRepresentation::new(
+            WorkspaceFloatingType::Float32,
+            false,
+        ));
         assert_eq!(operation.outputs.len(), 2);
         for output in 0..2 {
             assert_eq!(scalar(operation.as_view(), &inputs, output), expected);
@@ -200,7 +222,8 @@ mod tests {
             for dtype in [None, Some(WorkspaceFloatingType::Float16)] {
                 let mut changed = inputs.clone();
                 changed[slot] = changed[slot].clone().with_representation(
-                    dtype.map(|dtype| WorkspaceRepresentation::new(dtype, false)));
+                    dtype.map(|dtype| WorkspaceRepresentation::new(dtype, false)),
+                );
                 assert_eq!(scalar(operation.as_view(), &changed, 0), None);
                 assert_eq!(scalar(operation.as_view(), &changed, 1), None);
             }
@@ -210,5 +233,4 @@ mod tests {
         assert_eq!(scalar(operation.as_view(), &changed, 0), None);
         assert_eq!(scalar(operation.as_view(), &changed, 1), None);
     }
-
 }

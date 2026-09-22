@@ -7,20 +7,37 @@ impl ResidentRecipeRecorder {
     /// The paid immutable row outlives the temporary observer cells and remains
     /// attached to this exact report, including non-exporting receiver hooks.
     pub(crate) fn record_capture_scalars(
-        &mut self, scalars: &[std::cell::Cell<Option<eredu_nn::workspace::WorkspaceFloatingType>>],
+        &mut self,
+        scalars: &[std::cell::Cell<Option<eredu_nn::workspace::WorkspaceFloatingType>>],
     ) -> Result<(), Error> {
-        let context = self.context.as_ref().ok_or_else(|| self.metadata_error("capture scalar row requires its planning account"))?;
-        context.charge_metadata(size_of::<(&mut Self,
+        let context = self.context.as_ref().ok_or_else(|| {
+            self.metadata_error("capture scalar row requires its planning account")
+        })?;
+        context.charge_metadata(size_of::<(
+            &mut Self,
             &[std::cell::Cell<Option<eredu_nn::workspace::WorkspaceFloatingType>>],
-            Vec<Option<eredu_nn::workspace::WorkspaceFloatingType>>, Result<(), Error>,
-            std::slice::Iter<'_, std::cell::Cell<Option<eredu_nn::workspace::WorkspaceFloatingType>>>,
+            Vec<Option<eredu_nn::workspace::WorkspaceFloatingType>>,
+            Result<(), Error>,
+            std::slice::Iter<
+                '_,
+                std::cell::Cell<Option<eredu_nn::workspace::WorkspaceFloatingType>>,
+            >,
         )>())?;
-        if self.records.last().is_none_or(|row| row.capture_scalars.is_some()) {
+        if self
+            .records
+            .last()
+            .is_none_or(|row| row.capture_scalars.is_some())
+        {
             return Err(self.metadata_error("capture scalar row has no unique recorded span"));
         }
         let mut values = context.metadata_vec(scalars.len())?;
-        for scalar in scalars { values.push(scalar.get()); }
-        self.records.last_mut().expect("checked span").capture_scalars = Some(values);
+        for scalar in scalars {
+            values.push(scalar.get());
+        }
+        self.records
+            .last_mut()
+            .expect("checked span")
+            .capture_scalars = Some(values);
         Ok(())
     }
     /// Called immediately after the actual observed equation report. The
@@ -35,9 +52,11 @@ impl ResidentRecipeRecorder {
                 Some(context) => {
                     context.metadata_error(format_args!("capture population overflow"))
                 }
-                None => Error::backend_retained_source(crate::backend::error::Error::PrefillControl(
-                    eredu_runtime::working_memory::WorkingMemoryError::Overflow,
-                )),
+                None => {
+                    Error::backend_retained_source(crate::backend::error::Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+                    ))
+                }
             })?;
         self.record_capture_population(population)
     }
@@ -96,18 +115,18 @@ impl ResidentRecipeRecorder {
         // retained aliases are independent closing roots. Include each possible
         // alias in the same final Synchronizer and its native worker census.
         let frontier = capture_frontier(row, population.retained_roots);
-        let completion =
-            frontier.map(|(traversal, _, _)| traversal)
-                .zip(row.graph)
-                .map(|(traversal, graph)| ResidentCompletionRecipe {
-                    validation_roots: row.validation_roots,
-                    grouped_outputs: row.grouped_outputs,
-                    traversal,
-                    graph,
-                    dispatch: frontier.map(|(_, dispatch, _)| dispatch),
-                    nested_completions: nested,
-                    nested_root_capacity: 3,
-                });
+        let completion = frontier
+            .map(|(traversal, _, _)| traversal)
+            .zip(row.graph)
+            .map(|(traversal, graph)| ResidentCompletionRecipe {
+                validation_roots: row.validation_roots,
+                grouped_outputs: row.grouped_outputs,
+                traversal,
+                graph,
+                dispatch: frontier.map(|(_, dispatch, _)| dispatch),
+                nested_completions: nested,
+                nested_root_capacity: 3,
+            });
         // Re-query the same source-derived DAG/frontier workers. No whole-DAG
         // multiplier or hand-written native event count replaces their facts.
         let joined = completion.and_then(|completion| {
@@ -150,18 +169,26 @@ impl ResidentRecipeRecorder {
 fn capture_frontier(
     row: &ResidentSpanRecipe,
     roots: usize,
-) -> Option<(safemlx::OperationEvalTraversalLayout, ResidentDispatchPopulation, usize)> {
-    extend_frontier(row.traversal?,row.graph?,row.dispatch?,roots)
+) -> Option<(
+    safemlx::OperationEvalTraversalLayout,
+    ResidentDispatchPopulation,
+    usize,
+)> {
+    extend_frontier(row.traversal?, row.graph?, row.dispatch?, roots)
 }
 
 /// The same submitted-root extension serves model and numerical capture.
 /// Inputs are their actual reduced DAG and dispatch; this grants no new span.
 pub(super) fn extend_frontier(
-    traversal:safemlx::OperationEvalTraversalLayout,
-    graph:safemlx::ResidentGraphLayout,
-    mut dispatch:ResidentDispatchPopulation,
-    roots:usize,
-) -> Option<(safemlx::OperationEvalTraversalLayout,ResidentDispatchPopulation,usize)> {
+    traversal: safemlx::OperationEvalTraversalLayout,
+    graph: safemlx::ResidentGraphLayout,
+    mut dispatch: ResidentDispatchPopulation,
+    roots: usize,
+) -> Option<(
+    safemlx::OperationEvalTraversalLayout,
+    ResidentDispatchPopulation,
+    usize,
+)> {
     if roots == 0 {
         return Some((traversal, dispatch, 0));
     }
@@ -173,10 +200,21 @@ pub(super) fn extend_frontier(
     if dispatch.cpu_model.is_some() {
         dispatch.cpu_input_edges = dispatch.cpu_input_edges.checked_add(roots)?;
         let source = safemlx::OperationEvent::cpu_completion_layout(limits.roots)?;
-        let controls = [size_of::<ResidentDispatchPopulation>(),size_of::<safemlx::OperationEvalTraversalLimits>(),
-            size_of::<safemlx::CpuCopyEvalLayout>(),size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
-            source.control_bytes()?,traversal.query_control_bytes()?];
-        return Some((traversal, dispatch, controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)?));
+        let controls = [
+            size_of::<ResidentDispatchPopulation>(),
+            size_of::<safemlx::OperationEvalTraversalLimits>(),
+            size_of::<safemlx::CpuCopyEvalLayout>(),
+            size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
+            source.control_bytes()?,
+            traversal.query_control_bytes()?,
+        ];
+        return Some((
+            traversal,
+            dispatch,
+            controls
+                .into_iter()
+                .try_fold(size_of_val(&controls), usize::checked_add)?,
+        ));
     }
     dispatch.gpu_input_edges = dispatch.gpu_input_edges.checked_add(roots)?;
     let worker = safemlx::OperationEvent::resident_gpu_worker_layout_with_router(
@@ -188,19 +226,29 @@ pub(super) fn extend_frontier(
         dispatch.worker_rank,
         graph.maximum_operands(),
         dispatch.additional_sort_kernels,
-        dispatch.cpu_entries.checked_sub(dispatch.parallel_entries)?,
+        dispatch
+            .cpu_entries
+            .checked_sub(dispatch.parallel_entries)?,
     )?;
-    dispatch.worker_graph_extents =
-        worker.allocation_extents().checked_add(dispatch.copy_rank_extents)?.checked_add(dispatch.parallel_graph_extents)?;
+    dispatch.worker_graph_extents = worker
+        .allocation_extents()
+        .checked_add(dispatch.copy_rank_extents)?
+        .checked_add(dispatch.parallel_graph_extents)?;
     dispatch.kernel_attempts = worker.kernel_attempts();
     let controls = [
-        size_of::<(safemlx::OperationEvalTraversalLayout, ResidentDispatchPopulation, usize)>(),
+        size_of::<(
+            safemlx::OperationEvalTraversalLayout,
+            ResidentDispatchPopulation,
+            usize,
+        )>(),
         size_of::<safemlx::OperationEvalTraversalLimits>(),
         size_of::<usize>(),
         traversal.query_control_bytes()?,
         worker.control_bytes()?,
     ];
-    let controls = controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)?;
+    let controls = controls
+        .into_iter()
+        .try_fold(size_of_val(&controls), usize::checked_add)?;
     Some((traversal, dispatch, controls))
 }
 
@@ -314,12 +362,17 @@ mod tests {
         let retained = row.capture_roots();
         let after_limits = row.traversal.unwrap().limits();
         assert_eq!(after_limits.roots, before_limits.roots + retained);
-        assert_eq!(after_limits.input_edges, before_limits.input_edges + retained);
+        assert_eq!(
+            after_limits.input_edges,
+            before_limits.input_edges + retained
+        );
         assert_eq!(after_limits.arrays, before_limits.arrays + retained);
         assert_eq!(after_limits.tape_entries, before_limits.tape_entries);
         assert_eq!(after_limits.output_slots, before_limits.output_slots);
-        assert_eq!(row.dispatch.unwrap().gpu_input_edges,
-            execution.dispatch.unwrap().gpu_input_edges + retained);
+        assert_eq!(
+            row.dispatch.unwrap().gpu_input_edges,
+            execution.dispatch.unwrap().gpu_input_edges + retained
+        );
         let after = capacities(row);
         assert!(after.0 > before.0 && after.1 > before.1);
         assert!(row.query_controls.unwrap() > controls);
@@ -473,40 +526,69 @@ impl ResidentNativeRecipe {
     /// immutable selection ordinal. A reached hook retains its actual scalar
     /// even when capture quota skips its transform; absent hooks remain absent.
     pub(crate) fn capture_scalars_for_step(
-        &self, step: &eredu_runtime::working_memory::InferenceTextStep, count: usize,
+        &self,
+        step: &eredu_runtime::working_memory::InferenceTextStep,
+        count: usize,
         metadata: &eredu_nn::workspace::HostMetadataFunding,
-    ) -> Result<Vec<Option<eredu_nn::workspace::WorkspaceFloatingType>>, crate::backend::error::Error> {
+    ) -> Result<Vec<Option<eredu_nn::workspace::WorkspaceFloatingType>>, crate::backend::error::Error>
+    {
         use crate::backend::error::Error as NativeError;
         use eredu_runtime::working_memory::WorkingMemoryError;
         type Scalars = Vec<Option<eredu_nn::workspace::WorkspaceFloatingType>>;
-        metadata.reserve_metadata(size_of::<(&Self,
-            &eredu_runtime::working_memory::InferenceTextStep, usize, Scalars,
-            Result<Scalars, NativeError>, WorkingMemoryError,
-            std::slice::Iter<'_, ResidentSpanRecipe>,
-            std::iter::Zip<std::slice::IterMut<'_, Option<eredu_nn::workspace::WorkspaceFloatingType>>,
-                std::slice::Iter<'_, Option<eredu_nn::workspace::WorkspaceFloatingType>>>,
-        )>()).map_err(NativeError::WorkspacePlanning)?;
+        metadata
+            .reserve_metadata(size_of::<(
+                &Self,
+                &eredu_runtime::working_memory::InferenceTextStep,
+                usize,
+                Scalars,
+                Result<Scalars, NativeError>,
+                WorkingMemoryError,
+                std::slice::Iter<'_, ResidentSpanRecipe>,
+                std::iter::Zip<
+                    std::slice::IterMut<'_, Option<eredu_nn::workspace::WorkspaceFloatingType>>,
+                    std::slice::Iter<'_, Option<eredu_nn::workspace::WorkspaceFloatingType>>,
+                >,
+            )>())
+            .map_err(NativeError::WorkspacePlanning)?;
         if step.request().geometry() != self.plan.geometry() {
-            return Err(NativeError::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            return Err(NativeError::PrefillControl(
+                WorkingMemoryError::IdentityMismatch,
+            ));
         }
         let mut scalars = metadata.metadata_vec(count).map_err(NativeError::Neural)?;
         scalars.resize(count, None);
         for row in &self.records {
             let selected = match &row.span {
-                InferenceWorkspaceSpan::Sampling(_) => return Err(NativeError::PrefillControl(WorkingMemoryError::IdentityMismatch)),
+                InferenceWorkspaceSpan::Sampling(_) => {
+                    return Err(NativeError::PrefillControl(
+                        WorkingMemoryError::IdentityMismatch,
+                    ))
+                }
                 InferenceWorkspaceSpan::Prefill(_) => step.attempt() == 0,
-                InferenceWorkspaceSpan::Decode { index, .. } => index.checked_add(1) == Some(step.attempt()),
+                InferenceWorkspaceSpan::Decode { index, .. } => {
+                    index.checked_add(1) == Some(step.attempt())
+                }
             };
-            if !selected { continue; }
-            let actual = row.capture_scalars.as_deref()
-                .ok_or(NativeError::PrefillControl(WorkingMemoryError::UnknownBound))?;
+            if !selected {
+                continue;
+            }
+            let actual = row
+                .capture_scalars
+                .as_deref()
+                .ok_or(NativeError::PrefillControl(
+                    WorkingMemoryError::UnknownBound,
+                ))?;
             if actual.len() != scalars.len() {
-                return Err(NativeError::PrefillControl(WorkingMemoryError::IdentityMismatch));
+                return Err(NativeError::PrefillControl(
+                    WorkingMemoryError::IdentityMismatch,
+                ));
             }
             for (scalar, actual) in scalars.iter_mut().zip(actual) {
                 if let Some(actual) = actual {
                     if scalar.is_some_and(|prior| prior != *actual) {
-                        return Err(NativeError::PrefillControl(WorkingMemoryError::IdentityMismatch));
+                        return Err(NativeError::PrefillControl(
+                            WorkingMemoryError::IdentityMismatch,
+                        ));
                     }
                     *scalar = Some(*actual);
                 }

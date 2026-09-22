@@ -2,7 +2,7 @@ use super::*;
 use eredu_core::{capture::*, *};
 use std::{
     cell::Cell,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
 };
 
 thread_local! {
@@ -77,7 +77,6 @@ fn admitted(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -92,7 +91,6 @@ fn admitted(
                 CaptureTransformKind::Summary,
             ],
             max_histogram_bins: 0,
-            physical_native_limit: false,
             conditions: vec![],
         },
         CaptureRequestShape {
@@ -108,6 +106,16 @@ fn plan(source: &AdmittedCapturePlan) -> CaptureTensorHostPlan<'_> {
         CaptureTensorGeometry::prepare(source, 0, CapturePhase::Prefill, 0, None).unwrap(),
     )
     .unwrap()
+}
+fn required_charge(source: &AdmittedCapturePlan) -> u64 {
+    let ledger = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    ledger
+        .capture_tensor_requirements(&plan(source), &CaptureTensorLimits::default())
+        .unwrap()
+        .get(ledger.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap()
 }
 fn ordinary() -> AdmittedCapturePlan {
     admitted(
@@ -126,62 +134,68 @@ fn fill(mut builder: PreparedCaptureTensor<'_>) -> SharedTensorObservation {
 #[test]
 fn exact_and_one_short_reject_before_buffers_and_preserve_all_counters() {
     let source = ordinary();
-    let required = plan(&source).initialization_peak_bytes();
-    for application in [false, true] {
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
-        let limits = CaptureTensorLimits {
-            capacity_bytes: if application { required } else { required - 1 },
-            application_memory_budget_bytes: application.then_some(required - 1),
-        };
-        let before = (
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap(),
-            ALLOCATIONS.get(),
-        );
-        let error = pool
-            .prepare_capture_tensor(plan(&source), limits)
-            .unwrap_err();
-        if application {
-            assert!(
-                matches!(error, CaptureTensorConstructionError::ApplicationBudgetExceeded { required_bytes, budget_bytes } if required_bytes == required && budget_bytes == required - 1)
-            );
-        } else {
-            assert!(
-                matches!(error, CaptureTensorConstructionError::Memory(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if required_bytes == required && available_bytes == required - 1)
-            );
-        }
-        assert_eq!(
-            (
-                pool.used_bytes().unwrap(),
-                pool.peak_bytes().unwrap(),
-                ALLOCATIONS.get()
-            ),
-            before
-        );
-        let value = fill(
-            pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(required))
-                .unwrap(),
-        );
-        assert_eq!(pool.used_bytes().unwrap(), required);
-        drop(value);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-    }
+    let payload = plan(&source).initialization_peak_bytes();
+    let required = required_charge(&source);
+    let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
+    let limits = CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(
+        required - 1,
+    ));
+    let before = (
+        pool.payload_used_bytes().unwrap(),
+        pool.payload_peak_bytes().unwrap(),
+        ALLOCATIONS.get(),
+    );
+    let error = pool
+        .prepare_capture_tensor(plan(&source), limits.clone())
+        .unwrap_err();
+    assert!(
+        matches!(error, CaptureTensorConstructionError::Memory(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes, limit_bytes, existing_bytes, .. })) if requested_bytes == required && limit_bytes - existing_bytes == required - 1)
+    );
+    assert_eq!(
+        (
+            pool.payload_used_bytes().unwrap(),
+            pool.payload_peak_bytes().unwrap(),
+            ALLOCATIONS.get()
+        ),
+        before
+    );
+    let value = fill(
+        pool.prepare_capture_tensor(
+            plan(&source),
+            CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(required)),
+        )
+        .unwrap(),
+    );
+    assert_eq!(pool.payload_used_bytes().unwrap(), payload);
+    drop(value);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn actual_nonzero_payload_aliases_outlive_source_and_keep_exact_host_account() {
     let source = ordinary();
     let retained = plan(&source).retained_payload_bytes();
-    let required = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(2 * required, 0).unwrap();
+    let payload = plan(&source).initialization_peak_bytes();
+    let required = required_charge(&source);
+    let pool = crate::working_memory::memory_fixture::host_ledger(2 * required, 0).unwrap();
     let value = fill(
-        pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(2 * required))
-            .unwrap(),
+        pool.prepare_capture_tensor(
+            plan(&source),
+            CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(
+                2 * required,
+            )),
+        )
+        .unwrap(),
     );
     let alias = value.clone();
     let independent = fill(
-        pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(2 * required))
-            .unwrap(),
+        pool.prepare_capture_tensor(
+            plan(&source),
+            CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(
+                2 * required,
+            )),
+        )
+        .unwrap(),
     );
     assert_eq!(value, independent);
     assert!(!value.same_storage(&independent));
@@ -201,28 +215,32 @@ fn actual_nonzero_payload_aliases_outlive_source_and_keep_exact_host_account() {
     assert_eq!(&raw, value.as_observation());
     assert_eq!(serde_json::to_value(&raw).unwrap(), wire);
     drop((source, raw, value, independent));
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), payload);
     assert!(matches!(
         pool.acquire_unquoted(),
         Err(WorkingMemoryError::ReservedWorkActive)
     ));
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
 }
 
 #[test]
 fn partial_finish_full_push_and_unwind_keep_the_same_buffers_and_custody() {
     let source = ordinary();
-    let required = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(required, 0).unwrap();
+    let payload = plan(&source).initialization_peak_bytes();
+    let required = required_charge(&source);
+    let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
     let mut builder = pool
-        .prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(required))
+        .prepare_capture_tensor(
+            plan(&source),
+            CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(required)),
+        )
         .unwrap();
     let pointer = builder.data.as_ptr();
     builder.push_f32(7.0).unwrap();
     let error = builder.finish().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), payload);
     let mut builder = error.into_builder().unwrap();
     assert_eq!(builder.data.as_ptr(), pointer);
     for _ in 1..builder.len() {
@@ -239,29 +257,34 @@ fn partial_finish_full_push_and_unwind_keep_the_same_buffers_and_custody() {
         _ => unreachable!(),
     }
     drop(value);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     for before_buffers in [true, false] {
         PANIC_BEFORE_BUFFERS.set(before_buffers);
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut partial = pool
-                .prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(required))
+                .prepare_capture_tensor(
+                    plan(&source),
+                    CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(
+                        required,
+                    )),
+                )
                 .unwrap();
             partial.push_f32(5.0).unwrap();
             panic!("partial destination failure");
         }));
         assert!(result.is_err());
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        drop(pool.acquire_unquoted().unwrap());
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     }
 }
 
 #[test]
 fn unknown_overflow_and_rank_limit_never_create_an_account() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let before = (
         ALLOCATIONS.get(),
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
+        pool.payload_peak_bytes().unwrap(),
     );
     let unknown = admitted(
         vec![SymbolicDimension::Unknown],
@@ -298,8 +321,8 @@ fn unknown_overflow_and_rank_limit_never_create_an_account() {
     assert_eq!(
         (
             ALLOCATIONS.get(),
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap()
+            pool.payload_used_bytes().unwrap(),
+            pool.payload_peak_bytes().unwrap()
         ),
         before
     );
@@ -307,7 +330,7 @@ fn unknown_overflow_and_rank_limit_never_create_an_account() {
 
 #[test]
 fn zero_scalar_preview_and_strided_slice_preserve_existing_wire_shape() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let cases = [
         (
             admitted(
@@ -346,8 +369,13 @@ fn zero_scalar_preview_and_strided_slice_preserve_existing_wire_shape() {
     for (source, shape) in cases {
         let retained = plan(&source).retained_payload_bytes();
         let output = fill(
-            pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(u64::MAX))
-                .unwrap(),
+            pool.prepare_capture_tensor(
+                plan(&source),
+                CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(
+                    u64::MAX,
+                )),
+            )
+            .unwrap(),
         );
         assert_eq!(output.shape(), shape);
         assert_eq!(output.retained_payload_bytes(), Some(retained));
@@ -355,19 +383,23 @@ fn zero_scalar_preview_and_strided_slice_preserve_existing_wire_shape() {
         assert_eq!(wire["shape"], serde_json::to_value(shape).unwrap());
         assert_eq!(wire["data"]["dtype"], "f32");
         drop(output);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn loading_exclusion_and_other_host_accounts_remain_effective() {
     let source = ordinary();
-    let required = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(required * 2 - 1, 0).unwrap();
+    let payload = plan(&source).initialization_peak_bytes();
+    let required = required_charge(&source);
+    let pool = crate::working_memory::memory_fixture::host_ledger(required * 2 - 1, 0).unwrap();
     let loading = pool.acquire_unquoted().unwrap();
     let before = ALLOCATIONS.get();
     assert!(matches!(
-        pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(u64::MAX)),
+        pool.prepare_capture_tensor(
+            plan(&source),
+            CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(u64::MAX))
+        ),
         Err(CaptureTensorConstructionError::Memory(
             WorkingMemoryError::UnknownBound
         ))
@@ -375,33 +407,36 @@ fn loading_exclusion_and_other_host_accounts_remain_effective() {
     assert_eq!(ALLOCATIONS.get(), before);
     drop(loading);
     let first = pool
-        .prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(u64::MAX))
+        .prepare_capture_tensor(
+            plan(&source),
+            CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(u64::MAX)),
+        )
         .unwrap();
     {
         let usage = pool.0.usage.lock().unwrap();
         let state = usage.funding.values().next().unwrap();
-        assert_eq!(state.host_held, required);
+        assert_eq!(state.host_held, payload + state.control_floor);
         assert_eq!(state.remaining, required);
         assert_eq!(state.scopes, 1);
     }
     let before = (
         ALLOCATIONS.get(),
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
+        pool.payload_peak_bytes().unwrap(),
     );
     assert!(
-        matches!(pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(u64::MAX)), Err(CaptureTensorConstructionError::Memory(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })) if required_bytes == required && available_bytes == required - 1)
+        matches!(pool.prepare_capture_tensor(plan(&source), CaptureTensorLimits::new(crate::working_memory::memory_fixture::host_limits(u64::MAX))), Err(CaptureTensorConstructionError::Memory(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))) if required_bytes == required && limit_bytes - existing_bytes == required - 1)
     );
     assert_eq!(
         (
             ALLOCATIONS.get(),
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap()
+            pool.payload_used_bytes().unwrap(),
+            pool.payload_peak_bytes().unwrap()
         ),
         before
     );
     drop(first);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]

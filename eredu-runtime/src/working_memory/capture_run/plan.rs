@@ -25,7 +25,7 @@ fn extent(count: usize, width: usize) -> Result<u64, WorkingMemoryError> {
 /// text origin and context growth are resolved through the admitted geometry.
 /// Unknown active geometry is rejected. Native transforms, the source plan's
 /// existing physical storage and facade delivery envelopes are not priced here.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CaptureRunHostPlan<'a> {
     pub(super) source: &'a SharedCapturePlan,
     pub(super) interventions: Option<super::super::OriginalInterventionSource>,
@@ -69,7 +69,14 @@ impl<'a> CaptureRunHostPlan<'a> {
         end_prediction: u64,
         continuation: bool,
     ) -> Result<Self, CaptureRunHostError> {
-        Self::prepare_sequence(source, first_prediction, end_prediction, continuation, None, false)
+        Self::prepare_sequence(
+            source,
+            first_prediction,
+            end_prediction,
+            continuation,
+            None,
+            false,
+        )
     }
 
     /// Price one exact independent invocation using the same finite frame and
@@ -128,33 +135,51 @@ impl<'a> CaptureRunHostPlan<'a> {
         mut self,
         source: &super::super::OriginalInterventionSource,
     ) -> Result<Self, CaptureRunHostError> {
-        if self.interventions.is_some() || self.invocation.is_some()
+        if self.interventions.is_some()
+            || self.invocation.is_some()
             || source.plan().admission().request() != self.source.admission().request()
             || source.plan().admission().text_origin() != self.source.admission().text_origin()
             || source.plan().admission().invocation_bounds().is_some()
             || self.source.admission().invocation_bounds().is_some()
-            || source.plan().admission().points().len() != source.plan().admission().plan().operations.len()
+            || source.plan().admission().points().len()
+                != source.plan().admission().plan().operations.len()
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         // An empty capture plan alone has no frames. Intervention records still
         // belong to every logical prediction, using the same frame constructors.
-        if self.predictions == self.first_prediction && self.end_prediction > self.first_prediction as u64 {
-            self = Self::prepare_sequence(self.source, self.first_prediction as u64,
-                self.end_prediction, self.continuation, None, true)?;
+        if self.predictions == self.first_prediction
+            && self.end_prediction > self.first_prediction as u64
+        {
+            self = Self::prepare_sequence(
+                self.source,
+                self.first_prediction as u64,
+                self.end_prediction,
+                self.continuation,
+                None,
+                true,
+            )?;
         }
         let mut extra = 0u64;
         for prediction in self.first_prediction..self.predictions {
             let step = super::interventions::StepPlan::prepare(
-                self.source, source, self.phase(prediction), prediction as u64,
+                self.source,
+                source,
+                self.phase(prediction),
+                prediction as u64,
             )?;
             extra = add(extra, step.peak())?;
         }
         self.peak = add(self.peak, extra)?;
-        let additional_slots = self.predictions.checked_sub(self.first_prediction)
+        let additional_slots = self
+            .predictions
+            .checked_sub(self.first_prediction)
             .and_then(|count| count.checked_mul(source.plan().admission().points().len()))
             .ok_or(WorkingMemoryError::Overflow)?;
-        self.slots = self.slots.checked_add(additional_slots).ok_or(WorkingMemoryError::Overflow)?;
+        self.slots = self
+            .slots
+            .checked_add(additional_slots)
+            .ok_or(WorkingMemoryError::Overflow)?;
         self.interventions = Some(source.clone());
         Ok(self)
     }
@@ -429,44 +454,38 @@ impl<'a> CaptureRunHostPlan<'a> {
 
 /// Same actual target box and worker controls for a parent or original evidence
 /// frame. Numeric destinations remain in their existing tensor/summary source.
-pub(in crate::working_memory) fn prefill_target_bytes(selections:usize)->Result<u64,WorkingMemoryError> {
+pub(in crate::working_memory) fn prefill_target_bytes(
+    selections: usize,
+) -> Result<u64, WorkingMemoryError> {
     let partial = extent(selections, size_of::<capture_tensor::prefill::TargetSlot>())?;
     let moves = size_of::<capture_tensor::prefill::PrefillTargets>()
         .checked_add(size_of::<Vec<capture_tensor::prefill::TargetSlot>>())
         .and_then(|n| n.checked_add(size_of::<capture_tensor::prefill::TargetSlot>()))
-        .and_then(|n| {
-            n.checked_add(size_of::<capture_tensor::prefill::OwnedPrefillTensor>())
-        })
+        .and_then(|n| n.checked_add(size_of::<capture_tensor::prefill::OwnedPrefillTensor>()))
         // The shared allocator now borrows either the original
         // whole geometry or an authenticated receipt projection.
-        .and_then(|n| n.checked_add(size_of::<(&CaptureTensorGeometry<'_>, CaptureTensorCustody)>()))
-        .and_then(|n| n.checked_add(size_of::<Result<capture_tensor::prefill::OwnedPrefillTensor, WorkingMemoryError>>()))
         .and_then(|n| {
-            n.checked_add(size_of::<CapturePrefillFragmentClaim<'_, '_, '_, '_>>())
+            n.checked_add(size_of::<(&CaptureTensorGeometry<'_>, CaptureTensorCustody)>())
         })
         .and_then(|n| {
-            n.checked_add(size_of::<CapturePrefillFragmentWriter<'_, '_, '_, '_>>())
+            n.checked_add(size_of::<
+                Result<capture_tensor::prefill::OwnedPrefillTensor, WorkingMemoryError>,
+            >())
         })
+        .and_then(|n| n.checked_add(size_of::<CapturePrefillFragmentClaim<'_, '_, '_, '_>>()))
+        .and_then(|n| n.checked_add(size_of::<CapturePrefillFragmentWriter<'_, '_, '_, '_>>()))
         .and_then(|n| {
             n.checked_add(size_of::<
                 CapturePrefillFragmentTransfer<'_, '_, '_, '_, '_, u8>,
             >())
         })
-        .and_then(|n| {
-            n.checked_add(
-                super::super::funding::capture_source_rollback_control_bytes(),
-            )
-        })
+        .and_then(|n| n.checked_add(super::super::funding::capture_source_rollback_control_bytes()))
         .and_then(|n| n.checked_add(size_of::<CapturePrefillHostError>()))
         .and_then(|n| n.checked_add(size_of::<CaptureRunHostError>()))
         .and_then(|n| {
-            n.checked_add(
-                size_of::<crate::capture::CapturePrefillObservationPolicy<'_>>(),
-            )
+            n.checked_add(size_of::<crate::capture::CapturePrefillObservationPolicy<'_>>())
         })
-        .and_then(|n| {
-            n.checked_add(size_of::<crate::capture::CapturePrefillObservationRow<'_>>())
-        })
+        .and_then(|n| n.checked_add(size_of::<crate::capture::CapturePrefillObservationRow<'_>>()))
         .and_then(|n| n.checked_add(size_of::<CapturePrefillRowAssembly<'_>>()))
         .and_then(|n| n.checked_add(size_of::<CapturePrefillFragment<'_, '_>>()))
         .and_then(|n| n.checked_add(size_of::<CapturePrefillElement>()))

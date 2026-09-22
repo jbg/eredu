@@ -1,9 +1,11 @@
 //! Three-prefix public parameter-edit consumer, checked against the independent oracle.
-use anyhow::{Context, ensure};
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
+use anyhow::{ensure, Context};
 use eredu::{api::*, runtime::chat::ChatTemplateRequest};
 use eredu_core::{
-    ArchitectureDescriptor, GenerationConfigOverrides, capture::*, component::ComponentReadRole,
-    parameters::*,
+    capture::*, component::ComponentReadRole, parameters::*, ArchitectureDescriptor,
+    GenerationConfigOverrides,
 };
 use std::{collections::BTreeMap, ops::ControlFlow};
 
@@ -56,7 +58,12 @@ pub fn run<B: ParameterBackend + eredu_runtime::working_memory::OriginalChatBack
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .prepare_chat(
+            &source,
+            &policy,
+            &physical_memory::finite_each(CAPACITY)?,
+            &cancellation,
+        )?
         .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -65,7 +72,10 @@ pub fn run<B: ParameterBackend + eredu_runtime::working_memory::OriginalChatBack
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 17,
@@ -147,11 +157,10 @@ pub fn run<B: ParameterBackend + eredu_runtime::working_memory::OriginalChatBack
                 limits: CaptureLimits {
                     per_step: usage,
                     cumulative: usage,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             };
-            let mut request = PreparedChatRequest::new(&chat, settings);
+            let mut request = PreparedChatRequest::new(&chat, settings.clone());
             request.input = PreparedChatPrompt::TokenIds(&prefix);
             request.output_mode = PreparedChatOutputMode::Text;
             request.capture = Some(&capture);

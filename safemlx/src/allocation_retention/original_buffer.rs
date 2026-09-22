@@ -1,8 +1,8 @@
 //! Fixed native budget custody and borrowed birth authentication.
 //! This mechanism does not issue a neutral reservation or certify producer fit.
-use super::{destroy, retire, take_owner, OwnedNode, PreparedAllocationOwner, RetiredOwner};
+use super::{OwnedNode, PreparedAllocationOwner, RetiredOwner, destroy, retire, take_owner};
 use crate::{
-    utils::runtime_lock, AllocationInfo, Array, OriginalNativeControlError, PreparedInputRuntime,
+    AllocationInfo, Array, OriginalNativeControlError, PreparedInputRuntime, utils::runtime_lock,
 };
 use std::{alloc::Layout, ffi::c_void, fmt, marker::PhantomData, mem::size_of, ptr, rc::Rc};
 
@@ -174,6 +174,123 @@ pub struct OriginalBufferBudget {
     raw: safemlx_sys::mlx_original_buffer_budget,
     _thread: PhantomData<Rc<()>>,
 }
+
+/// Retains exact budget identity for completed-source inspection without keeping
+/// an allocation producer alive. This handle cannot be bound to a native Scope.
+pub struct OriginalBufferInspection {
+    raw: safemlx_sys::mlx_original_buffer_budget,
+    _thread: PhantomData<Rc<()>>,
+}
+impl fmt::Debug for OriginalBufferInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OriginalBufferInspection")
+            .finish_non_exhaustive()
+    }
+}
+impl Clone for OriginalBufferInspection {
+    fn clone(&self) -> Self {
+        // SAFETY: this existing alias pins the native owner; retaining only its
+        // backing count cannot reopen a closed producer or permit another debit.
+        unsafe { safemlx_sys::mlx_original_buffer_inspection_retain(self.raw) };
+        Self {
+            raw: self.raw,
+            _thread: PhantomData,
+        }
+    }
+}
+impl Drop for OriginalBufferInspection {
+    fn drop(&mut self) {
+        // SAFETY: consumes one non-producing reference. Final owner destruction
+        // uses the same existing unlocked retirement queue as a producing alias.
+        unsafe { safemlx_sys::mlx_original_buffer_inspection_release(self.raw) };
+    }
+}
+impl OriginalBufferInspection {
+    /// Move this non-producing reference into a shareable inspection owner.
+    /// This does not retain a Scope, reopen a producer, or allocate a new owner.
+    pub fn into_shared(self) -> SharedOriginalBufferInspection {
+        let this = std::mem::ManuallyDrop::new(self);
+        SharedOriginalBufferInspection { raw: this.raw }
+    }
+    /// Exact native budget identity, independent of equal capacities.
+    pub fn same_budget(&self, other: &Self) -> bool {
+        self.raw.ctx == other.raw.ctx
+    }
+    /// Current physical occupancy, without granting credit or completion.
+    pub fn occupied_bytes(&self) -> usize {
+        // SAFETY: the retained native owner contains this atomic counter.
+        unsafe { safemlx_sys::mlx_original_buffer_budget_occupied(self.raw) }
+    }
+    /// Fixed controls of the shared budget-authenticated inspection worker.
+    pub fn inspection_control_bytes() -> Option<usize> {
+        OriginalBufferBudget::inspection_control_bytes()
+    }
+    /// Authenticate one completed birth using the same exact-budget native
+    /// kernel. The witness borrows both this alias and the actual array.
+    pub fn inspect_array<'a>(
+        &'a self,
+        array: &'a Array,
+    ) -> Result<Option<OriginalBufferWitness<'a>>, OriginalBufferCause> {
+        inspect_budget_array(self.raw, array)
+    }
+}
+
+/// Shareable identity of a native budget, with no allocation or Scope authority.
+/// It retains only the atomic backing reference. Array inspection still requires
+/// the serialized runtime loan, and its witness borrows this owner and the array.
+pub struct SharedOriginalBufferInspection {
+    raw: safemlx_sys::mlx_original_buffer_budget,
+}
+// SAFETY: the native backing reference count and occupancy are atomic. Final
+// release deletes only the budget and queues its Send owner for unlocked Rust
+// retirement; observer callbacks require Send + Sync. No allocator, producer or
+// Scope operation is exposed. Descriptor reads take the shared runtime lock.
+unsafe impl Send for SharedOriginalBufferInspection {}
+// SAFETY: shared methods only read immutable identity/atomic occupancy, retain
+// an atomic reference, or inspect an Array under the serialized runtime lock.
+unsafe impl Sync for SharedOriginalBufferInspection {}
+impl fmt::Debug for SharedOriginalBufferInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedOriginalBufferInspection")
+            .finish_non_exhaustive()
+    }
+}
+impl Clone for SharedOriginalBufferInspection {
+    fn clone(&self) -> Self {
+        // SAFETY: this live backing reference pins the atomic native owner.
+        unsafe { safemlx_sys::mlx_original_buffer_inspection_retain(self.raw) };
+        Self { raw: self.raw }
+    }
+}
+impl Drop for SharedOriginalBufferInspection {
+    fn drop(&mut self) {
+        // SAFETY: release exactly this non-producing reference. The native
+        // finalizer queues arbitrary Send custody rather than dropping it here.
+        unsafe { safemlx_sys::mlx_original_buffer_inspection_release(self.raw) };
+    }
+}
+impl SharedOriginalBufferInspection {
+    /// Exact native budget identity, independent of equal capacities.
+    pub fn same_budget(&self, other: &Self) -> bool {
+        self.raw.ctx == other.raw.ctx
+    }
+    /// Current atomic physical occupancy, without credit or completion authority.
+    pub fn occupied_bytes(&self) -> usize {
+        // SAFETY: this retained reference pins the native atomic counter.
+        unsafe { safemlx_sys::mlx_original_buffer_budget_occupied(self.raw) }
+    }
+    /// Fixed controls of the same budget-authenticated inspection worker.
+    pub fn inspection_control_bytes() -> Option<usize> {
+        OriginalBufferBudget::inspection_control_bytes()
+    }
+    /// Authenticate the actual settled Array under the shared runtime lock.
+    pub fn inspect_array<'a>(
+        &'a self,
+        array: &'a Array,
+    ) -> Result<Option<OriginalBufferWitness<'a>>, OriginalBufferCause> {
+        inspect_budget_array(self.raw, array)
+    }
+}
 impl fmt::Debug for OriginalBufferBudget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OriginalBufferBudget")
@@ -198,27 +315,61 @@ impl Drop for OriginalBufferBudget {
     }
 }
 impl OriginalBufferBudget {
+    /// Consume this producing reference while retaining inspection identity.
+    /// Other Scopes, Records and bindings still prevent closed-occupancy credit
+    /// until their genuine producer references retire.
+    pub fn into_inspection(self) -> OriginalBufferInspection {
+        let raw = self.raw;
+        // SAFETY: establish the non-producing reference before relinquishing
+        // this live producer. No allocation, runtime entry or new grant occurs.
+        unsafe { safemlx_sys::mlx_original_buffer_inspection_retain(raw) };
+        drop(self);
+        OriginalBufferInspection {
+            raw,
+            _thread: PhantomData,
+        }
+    }
     /// Exact one-birth capacity from the retained allocator's existing physical
     /// worker. CPU's header (also for zero bytes) and Metal's empty/rounded
     /// allocation remain distinct. No allocation or authority is issued.
-    pub fn request_layout(runtime:&PreparedInputRuntime,requested_bytes:usize)
-        ->Result<OriginalBufferPopulationLayout,OriginalBufferCause> {
-        let mut raw=safemlx_sys::mlx_original_buffer_population_layout{capacity:0,control_bytes:0};
+    pub fn request_layout(
+        runtime: &PreparedInputRuntime,
+        requested_bytes: usize,
+    ) -> Result<OriginalBufferPopulationLayout, OriginalBufferCause> {
+        let mut raw = safemlx_sys::mlx_original_buffer_population_layout {
+            capacity: 0,
+            control_bytes: 0,
+        };
         // SAFETY: closed runtime retains its actual immutable allocator facts.
-        OriginalBufferCause::check(unsafe{safemlx_sys::mlx_original_buffer_request_layout_for(
-            &mut raw,runtime.raw(),requested_bytes)})?;
-        Ok(OriginalBufferPopulationLayout{capacity:raw.capacity,
-            control_bytes:Self::request_layout_control_bytes().ok_or(OriginalBufferCause::InvalidLayout)?})
+        OriginalBufferCause::check(unsafe {
+            safemlx_sys::mlx_original_buffer_request_layout_for(
+                &mut raw,
+                runtime.raw(),
+                requested_bytes,
+            )
+        })?;
+        Ok(OriginalBufferPopulationLayout {
+            capacity: raw.capacity,
+            control_bytes: Self::request_layout_control_bytes()
+                .ok_or(OriginalBufferCause::InvalidLayout)?,
+        })
     }
     /// Fixed complete query transports, available before request_layout.
-    pub fn request_layout_control_bytes()->Option<usize> {
+    pub fn request_layout_control_bytes() -> Option<usize> {
         // SAFETY: only fixed native layouts; no runtime/source query or work.
-        let native=unsafe{safemlx_sys::mlx_original_buffer_request_control_bytes()};
-        let frames=[size_of::<safemlx_sys::mlx_original_buffer_population_layout>(),
+        let native = unsafe { safemlx_sys::mlx_original_buffer_request_control_bytes() };
+        let frames = [
+            size_of::<safemlx_sys::mlx_original_buffer_population_layout>(),
             size_of::<OriginalBufferPopulationLayout>(),
-            size_of::<Result<OriginalBufferPopulationLayout,OriginalBufferCause>>(),
-            size_of::<&PreparedInputRuntime>(),size_of::<usize>()*3,size_of::<u32>()];
-        frames.into_iter().try_fold(native.checked_add(size_of::<[usize;6]>())?,usize::checked_add)
+            size_of::<Result<OriginalBufferPopulationLayout, OriginalBufferCause>>(),
+            size_of::<&PreparedInputRuntime>(),
+            size_of::<usize>() * 3,
+            size_of::<u32>(),
+        ];
+        frames.into_iter().try_fold(
+            native.checked_add(size_of::<[usize; 6]>())?,
+            usize::checked_add,
+        )
     }
     /// Bound original CPU or Metal backing from total requested payload bytes
     /// and the maximum number of allocation attempts, retaining every birth.
@@ -295,7 +446,9 @@ impl OriginalBufferBudget {
     pub fn inspection_control_bytes() -> Option<usize> {
         OriginalBufferAliasWitness::inspection_control_bytes()?
             .checked_add(size_of::<OriginalBufferWitness<'_>>())?
-            .checked_add(size_of::<Result<Option<OriginalBufferWitness<'_>>, OriginalBufferCause>>())?
+            .checked_add(size_of::<
+                Result<Option<OriginalBufferWitness<'_>>, OriginalBufferCause>,
+            >())?
             .checked_add(size_of::<&OriginalBufferBudget>())
     }
     /// Authenticate this budget's actual completed mutable birth. Unknown and
@@ -305,24 +458,36 @@ impl OriginalBufferBudget {
         &'a self,
         array: &'a Array,
     ) -> Result<Option<OriginalBufferWitness<'a>>, OriginalBufferCause> {
-        let _loan =
-            runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
-        let mut facts = safemlx_sys::mlx_original_buffer_info {
-            known: false,
-            identity: 0,
-            charged_bytes: 0,
-        };
-        // SAFETY: both closed handles remain live through the same immediate
-        // runtime loan. The fixed C kernel neither allocates nor mutates Data.
-        OriginalBufferCause::check(unsafe {
-            safemlx_sys::mlx_original_buffer_array_info(&mut facts, array.as_ptr(), self.raw)
-        })?;
-        Ok(facts.known.then(|| OriginalBufferWitness {
-            facts,
-            _array: array,
-            _budget: self,
-        }))
+        inspect_budget_array(self.raw, array)
     }
+}
+
+fn inspect_budget_array<'a>(
+    budget: safemlx_sys::mlx_original_buffer_budget,
+    array: &'a Array,
+) -> Result<Option<OriginalBufferWitness<'a>>, OriginalBufferCause> {
+    let _loan = runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
+    let mut facts = safemlx_sys::mlx_original_buffer_info {
+        host_control_bytes: 0,
+        known: false,
+        identity: 0,
+        charged_bytes: 0,
+        placement: safemlx_sys::mlx_memory_placement {
+            kind: 0,
+            device: -1,
+            device_count: 0,
+        },
+    };
+    // SAFETY: both closed handles remain live through the same immediate
+    // runtime loan. The fixed C kernel neither allocates nor mutates Data.
+    OriginalBufferCause::check(unsafe {
+        safemlx_sys::mlx_original_buffer_array_info(&mut facts, array.as_ptr(), budget)
+    })?;
+    Ok(facts.known.then(|| OriginalBufferWitness {
+        facts,
+        _array: array,
+        _budget: budget,
+    }))
 }
 
 /// Borrowed authenticated facts, not a durable backing owner or registration.
@@ -331,7 +496,9 @@ impl OriginalBufferBudget {
 pub struct OriginalBufferWitness<'a> {
     facts: safemlx_sys::mlx_original_buffer_info,
     _array: &'a Array,
-    _budget: &'a OriginalBufferBudget,
+    // Both public constructors bind 'a to their retained budget owner, whether
+    // it is producing or inspection-only. This pointer never escapes the witness.
+    _budget: safemlx_sys::mlx_original_buffer_budget,
 }
 impl fmt::Debug for OriginalBufferWitness<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -343,7 +510,34 @@ impl fmt::Debug for OriginalBufferWitness<'_> {
 impl OriginalBufferWitness<'_> {
     /// Existing opaque allocation equality key and full charged capacity.
     pub fn allocation(&self) -> AllocationInfo {
-        AllocationInfo::from_native(self.facts.identity, self.facts.charged_bytes, false)
+        AllocationInfo::from_native(
+            self.facts.identity,
+            self.facts.charged_bytes,
+            self.facts.placement,
+        )
+        .with_host_controls(self.facts.host_control_bytes)
+    }
+    /// Revalidate the captured completed birth against its originating budget.
+    /// This borrows the same native inspection kernel without attaching an
+    /// owner, evaluating the value, or changing its backing lifetime.
+    pub fn validate_current(&self) -> Result<(), OriginalBufferCause> {
+        let current = inspect_budget_array(self._budget, self._array)?
+            .ok_or(OriginalBufferCause::UncertifiedBacking)?;
+        if current.allocation() != self.allocation() {
+            return Err(OriginalBufferCause::BirthChanged);
+        }
+        Ok(())
+    }
+    /// Fixed inspection and comparison transports for `validate_current`.
+    pub fn validation_control_bytes() -> Option<usize> {
+        OriginalBufferBudget::inspection_control_bytes()?.checked_add(size_of::<(
+            &Self,
+            Self,
+            Result<Self, OriginalBufferCause>,
+            AllocationInfo,
+            AllocationInfo,
+            Result<(), OriginalBufferCause>,
+        )>())
     }
     /// Attach this prepared owner only if the same birth and originating budget
     /// still match in one immediate runtime/native observation. No rollback of
@@ -352,7 +546,7 @@ impl OriginalBufferWitness<'_> {
         self,
         owner: PreparedAllocationOwner<T>,
     ) -> Result<(), OriginalBufferError<PreparedAllocationOwner<T>>> {
-        owner.attach_original(self._array, self.facts, Some(self._budget.raw))
+        owner.attach_original(self._array, self.facts, Some(self._budget))
     }
 }
 
@@ -374,7 +568,12 @@ impl fmt::Debug for OriginalBufferAliasWitness<'_> {
 impl OriginalBufferAliasWitness<'_> {
     /// Opaque existing allocation key and full charged capacity, no budget handle.
     pub fn allocation(&self) -> AllocationInfo {
-        AllocationInfo::from_native(self.facts.identity, self.facts.charged_bytes, false)
+        AllocationInfo::from_native(
+            self.facts.identity,
+            self.facts.charged_bytes,
+            self.facts.placement,
+        )
+        .with_host_controls(self.facts.host_control_bytes)
     }
     /// Named fixed inspection transports. No owner, backing, allocator charge or
     /// complete request fit is included; attachment uses the actual owner's layout.
@@ -413,9 +612,15 @@ impl Array {
         let _loan =
             runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
         let mut facts = safemlx_sys::mlx_original_buffer_info {
+            host_control_bytes: 0,
             known: false,
             identity: 0,
             charged_bytes: 0,
+            placement: safemlx_sys::mlx_memory_placement {
+                kind: 0,
+                device: -1,
+                device_count: 0,
+            },
         };
         // SAFETY: the actual Array stays borrowed under one runtime loan; C
         // returns only checked immutable birth facts and no native owner.
@@ -459,7 +664,12 @@ impl fmt::Debug for OrdinaryBufferWitness<'_> {
 impl OrdinaryBufferWitness<'_> {
     /// Actual opaque ordinary allocation key and existing full-capacity semantics.
     pub fn allocation(&self) -> AllocationInfo {
-        AllocationInfo::from_native(self.facts.identity, self.facts.charged_bytes, false)
+        AllocationInfo::from_native(
+            self.facts.identity,
+            self.facts.charged_bytes,
+            self.facts.placement,
+        )
+        .with_host_controls(self.facts.host_control_bytes)
     }
     /// Append only if the same positive ordinary kind, generation and capacity
     /// still match. Refusal preserves the exact original preparation and owner.
@@ -499,9 +709,15 @@ impl Array {
             runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
         let mut kind = safemlx_sys::MLX_ORDINARY_BUFFER_UNKNOWN;
         let mut facts = safemlx_sys::mlx_original_buffer_info {
+            host_control_bytes: 0,
             known: false,
             identity: 0,
             charged_bytes: 0,
+            placement: safemlx_sys::mlx_memory_placement {
+                kind: 0,
+                device: -1,
+                device_count: 0,
+            },
         };
         // SAFETY: the borrowed Array remains live under this same immediate
         // runtime loan; the shared descriptor kernel returns only fixed facts.
@@ -557,7 +773,12 @@ impl fmt::Debug for ImmutableSourceWitness<'_> {
 impl ImmutableSourceWitness<'_> {
     /// Opaque actual allocation identity/capacity, without accounting authority.
     pub fn allocation(&self) -> AllocationInfo {
-        AllocationInfo::from_native(self.facts.identity, self.facts.charged_bytes, false)
+        AllocationInfo::from_native(
+            self.facts.identity,
+            self.facts.charged_bytes,
+            self.facts.placement,
+        )
+        .with_host_controls(self.facts.host_control_bytes)
     }
     /// Compare source kind, generation and whole capacity in the same immediate
     /// native observation as append. Refusal retains both prepared nodes.
@@ -597,9 +818,15 @@ impl Array {
             runtime_lock::try_enter_for_recovery().ok_or(OriginalBufferCause::RuntimeBusy)?;
         let mut kind = safemlx_sys::MLX_ORDINARY_BUFFER_UNKNOWN;
         let mut facts = safemlx_sys::mlx_original_buffer_info {
+            host_control_bytes: 0,
             known: false,
             identity: 0,
             charged_bytes: 0,
+            placement: safemlx_sys::mlx_memory_placement {
+                kind: 0,
+                device: -1,
+                device_count: 0,
+            },
         };
         // SAFETY: exact borrowed Array under one runtime loan. Only fixed
         // descriptive facts return; no payload/callback is consumed here.
@@ -625,6 +852,26 @@ impl Array {
             _ => Err(OriginalBufferCause::InvalidStatus(kind)),
         }
     }
+}
+
+/// Observes a budget only after all native allocation producers have retired.
+/// Callbacks run after physical frees and may arrive concurrently or out of order.
+/// Each value is a conservative upper bound for the remaining live backing.
+/// Implementations must not panic, invoke native work, or retain native objects.
+pub trait OriginalBufferLifetimeObserver: Send + Sync + 'static {
+    /// No future allocation can consume this budget. Retain at least this bound,
+    /// or a smaller bound already reported by another callback.
+    fn closed_occupancy(&self, bytes: usize);
+}
+
+unsafe extern "C" fn observe_closed_occupancy<T: OriginalBufferLifetimeObserver>(
+    payload: *mut c_void,
+    bytes: usize,
+) {
+    // SAFETY: the native intrusive owner pins the initialized node throughout
+    // this callback. Sync permits concurrent observations through shared borrows.
+    let owner = unsafe { &(*payload.cast::<OwnedNode<T>>()).owner };
+    owner.closed_occupancy(bytes);
 }
 
 /// Prepared payload-free custody for the actual allocator selected by runtime.
@@ -687,6 +934,7 @@ impl<'a, T: Send + 'static> PreparedOriginalBufferBudget<'a, T> {
             size_of::<super::RetirementBatch>(),
             size_of::<*mut RetiredOwner>(),
             size_of::<unsafe fn(*mut RetiredOwner)>(),
+            size_of::<Option<unsafe extern "C" fn(*mut c_void, usize)>>(),
         ];
         let control_bytes = parts
             .into_iter()
@@ -749,7 +997,21 @@ impl<'a, T: Send + 'static> PreparedOriginalBufferBudget<'a, T> {
     /// Construct once using the actual prepared allocator. Busy/refusal returns
     /// this same node. This ordinary setup may lock the prepared native allocator;
     /// it must precede the original role's operation and is not a worker entry.
-    pub fn try_allocate(mut self) -> Result<OriginalBufferBudget, OriginalBufferError<Self>> {
+    pub fn try_allocate(self) -> Result<OriginalBufferBudget, OriginalBufferError<Self>> {
+        self.try_allocate_with_observer(None)
+    }
+    /// Construct with producer-completion and physical-free observations. The
+    /// observer is descriptive evidence; it cannot grant allocation authority.
+    pub fn try_allocate_observed(self) -> Result<OriginalBufferBudget, OriginalBufferError<Self>>
+    where
+        T: OriginalBufferLifetimeObserver,
+    {
+        self.try_allocate_with_observer(Some(observe_closed_occupancy::<T>))
+    }
+    fn try_allocate_with_observer(
+        mut self,
+        observer: Option<unsafe extern "C" fn(*mut c_void, usize)>,
+    ) -> Result<OriginalBufferBudget, OriginalBufferError<Self>> {
         let mut controls = Construction {
             raw: safemlx_sys::mlx_original_buffer_budget {
                 ctx: ptr::null_mut(),
@@ -775,6 +1037,7 @@ impl<'a, T: Send + 'static> PreparedOriginalBufferBudget<'a, T> {
                     self.layout.capacity,
                     payload,
                     Some(retire),
+                    observer,
                 )
             };
             if controls.status == 0 {

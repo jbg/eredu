@@ -76,7 +76,7 @@ impl PendingSavedTextAdmission {
             .prepare_catalogs(recipe.plan(), context)
             .map_err(|cause| Error::Neural(context.metadata_source(cause)))?;
         source
-            .prepare_host_program(runtime.backend().memory_pool(), context)
+            .prepare_host_program(runtime.backend().memory_ledger(), context)
             .map_err(|cause| Error::Neural(context.metadata_source(cause)))?;
         let actual_facts = source
             .host_source_facts()

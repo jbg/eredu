@@ -14,7 +14,7 @@ const METADATA: DependencyMemoryPolicy = DependencyMemoryPolicy {
 };
 const JSON: &[u8] = br#"{"weight":{"dtype":"U8","shape":[2],"data_offsets":[0,2]}}"#;
 fn qualified() -> bool {
-    let result = WorkingMemoryPool::safetensors_header_policy_required_bytes(1);
+    let result = MemoryLedger::safetensors_header_policy_required_bytes(1);
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_MEMORY_TENSOR_SOURCE").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -78,7 +78,7 @@ fn exact_and_short_admission_keep_headroom_separate_and_refusals_funded() {
     }
     let dir = fixture(JSON);
     let request = request(&dir, JSON);
-    let quote = WorkingMemoryPool::safetensors_header_quote(request, METADATA).unwrap();
+    let quote = MemoryLedger::safetensors_header_quote(request, METADATA).unwrap();
     assert_eq!(quote.encoded_buffer_bytes(), JSON.len() as u64 + 8);
     assert_eq!(
         quote.metadata_estimate_bytes(),
@@ -92,7 +92,7 @@ fn exact_and_short_admission_keep_headroom_separate_and_refusals_funded() {
             + quote.metadata_estimate_bytes()
             + quote.reservation_control_bytes()
     );
-    let higher = WorkingMemoryPool::safetensors_header_quote(
+    let higher = MemoryLedger::safetensors_header_quote(
         request,
         DependencyMemoryPolicy {
             fixed_bytes: METADATA.fixed_bytes + 77,
@@ -101,28 +101,34 @@ fn exact_and_short_admission_keep_headroom_separate_and_refusals_funded() {
     )
     .unwrap();
     assert_eq!(higher.total_bytes(), quote.total_bytes() + 77);
-    let controls = WorkingMemoryPool::safetensors_header_policy_required_bytes(1).unwrap();
-    let short = WorkingMemoryPool::new(controls - 1, 0).unwrap();
+    let controls = MemoryLedger::safetensors_header_policy_required_bytes(1).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(controls - 1, 0).unwrap();
     assert!(matches!(
         short.safetensors_header_admission(1, METADATA),
-        Err(WorkingMemoryError::BudgetExceeded { .. })
+        Err(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let short = WorkingMemoryPool::new(controls + quote.total_bytes() - 1, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let short =
+        crate::working_memory::memory_fixture::host_ledger(controls + quote.total_bytes() - 1, 0)
+            .unwrap();
     let policy = short.safetensors_header_admission(1, METADATA).unwrap();
     let store = open(&dir, policy.clone());
-    assert_eq!(short.used_bytes().unwrap(), controls);
+    assert_eq!(short.payload_used_bytes().unwrap(), controls);
     let error = WeightStore::metadata(&store, "weight").unwrap_err();
     assert!(
-        matches!(memory(&error), WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }
-        if *required_bytes == quote.total_bytes() && *available_bytes == quote.total_bytes()-1)
+        matches!(memory(&error), WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })
+        if *required_bytes == quote.total_bytes() && (limit_bytes - existing_bytes) == quote.total_bytes()-1)
     );
     drop(store);
     drop(policy);
-    assert_eq!(short.used_bytes().unwrap(), controls);
+    assert_eq!(short.payload_used_bytes().unwrap(), controls);
     drop(error);
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(controls + quote.total_bytes(), 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool =
+        crate::working_memory::memory_fixture::host_ledger(controls + quote.total_bytes(), 0)
+            .unwrap();
     let policy = pool.safetensors_header_admission(1, METADATA).unwrap();
     let store = open(&dir, policy.clone());
     let lease = store
@@ -132,15 +138,18 @@ fn exact_and_short_admission_keep_headroom_separate_and_refusals_funded() {
             policy: ReadPolicy::RequireBounded,
         })
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), controls + quote.total_bytes());
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        controls + quote.total_bytes()
+    );
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(store);
     drop(policy);
-    assert!(pool.used_bytes().unwrap() >= quote.total_bytes());
+    assert!(pool.payload_used_bytes().unwrap() >= quote.total_bytes());
     assert_eq!(lease.encoded_bytes().unwrap(), [11, 19]);
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn active_parsing_blocks_unquoted_work_and_completion_retains_bytes() {
@@ -165,9 +174,11 @@ fn active_parsing_blocks_unquoted_work_and_completion_retains_bytes() {
         }
     }
     let dir = fixture(JSON);
-    let controls = WorkingMemoryPool::safetensors_header_policy_required_bytes(1).unwrap();
-    let quote = WorkingMemoryPool::safetensors_header_quote(request(&dir, JSON), METADATA).unwrap();
-    let pool = WorkingMemoryPool::new(controls + quote.total_bytes(), 0).unwrap();
+    let controls = MemoryLedger::safetensors_header_policy_required_bytes(1).unwrap();
+    let quote = MemoryLedger::safetensors_header_quote(request(&dir, JSON), METADATA).unwrap();
+    let pool =
+        crate::working_memory::memory_fixture::host_ledger(controls + quote.total_bytes(), 0)
+            .unwrap();
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let policy = Arc::new(Gate {
@@ -189,10 +200,13 @@ fn active_parsing_blocks_unquoted_work_and_completion_retains_bytes() {
     ));
     assert_eq!(join.join().unwrap().logical_shape, [2]);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    drop(pool.acquire_unquoted().unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), controls + quote.total_bytes());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        controls + quote.total_bytes()
+    );
     drop(store);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn concurrent_malformed_header_finishes_once_and_keeps_charge_through_error_aliases() {
@@ -200,10 +214,12 @@ fn concurrent_malformed_header_finishes_once_and_keeps_charge_through_error_alia
         return;
     }
     let dir = fixture(b"xxxxxxxx");
-    let controls = WorkingMemoryPool::safetensors_header_policy_required_bytes(1).unwrap();
+    let controls = MemoryLedger::safetensors_header_policy_required_bytes(1).unwrap();
     let quote =
-        WorkingMemoryPool::safetensors_header_quote(request(&dir, b"xxxxxxxx"), METADATA).unwrap();
-    let pool = WorkingMemoryPool::new(controls + quote.total_bytes(), 0).unwrap();
+        MemoryLedger::safetensors_header_quote(request(&dir, b"xxxxxxxx"), METADATA).unwrap();
+    let pool =
+        crate::working_memory::memory_fixture::host_ledger(controls + quote.total_bytes(), 0)
+            .unwrap();
     let policy = pool.safetensors_header_admission(1, METADATA).unwrap();
     let store = Arc::new(open(&dir, policy.clone()));
     let barrier = Arc::new(Barrier::new(8));
@@ -228,24 +244,27 @@ fn concurrent_malformed_header_finishes_once_and_keeps_charge_through_error_alia
         assert!(Arc::ptr_eq(first, other));
     }
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    assert_eq!(pool.used_bytes().unwrap(), controls + quote.total_bytes());
-    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        controls + quote.total_bytes()
+    );
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(store);
     drop(policy);
     let last = errors.pop().unwrap();
     drop(errors);
-    assert_eq!(pool.used_bytes().unwrap(), quote.total_bytes());
+    assert_eq!(pool.payload_used_bytes().unwrap(), quote.total_bytes());
     assert!(last.to_string().contains("malformed safetensors shard"));
     drop(last);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn exhausted_policy_reuses_prepaid_failure_and_cannot_keep_pool_alive() {
     if !qualified() {
         return;
     }
-    let controls = WorkingMemoryPool::safetensors_header_policy_required_bytes(0).unwrap();
-    let pool = WorkingMemoryPool::new(controls, 0).unwrap();
+    let controls = MemoryLedger::safetensors_header_policy_required_bytes(0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(controls, 0).unwrap();
     let policy = pool.safetensors_header_admission(0, METADATA).unwrap();
     let request = SafetensorsHeaderRequest {
         json_bytes: 0,
@@ -263,7 +282,7 @@ fn exhausted_policy_reuses_prepaid_failure_and_cannot_keep_pool_alive() {
     assert_eq!(cause.maximum_headers(), Some(0));
     drop(policy);
     drop(second);
-    assert_eq!(pool.used_bytes().unwrap(), controls);
+    assert_eq!(pool.payload_used_bytes().unwrap(), controls);
     let weak = Arc::downgrade(&pool.0);
     drop(pool);
     assert!(weak.upgrade().is_none());
@@ -274,8 +293,8 @@ fn invalid_request_and_overflow_refusals_are_typed_and_keep_policy_custody() {
     if !qualified() {
         return;
     }
-    let controls = WorkingMemoryPool::safetensors_header_policy_required_bytes(2).unwrap();
-    let pool = WorkingMemoryPool::new(controls, 0).unwrap();
+    let controls = MemoryLedger::safetensors_header_policy_required_bytes(2).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(controls, 0).unwrap();
     let policy = pool.safetensors_header_admission(2, METADATA).unwrap();
     let invalid = policy
         .reserve(SafetensorsHeaderRequest {
@@ -301,7 +320,7 @@ fn invalid_request_and_overflow_refusals_are_typed_and_keep_policy_custody() {
     ));
     drop(policy);
     drop(invalid);
-    assert_eq!(pool.used_bytes().unwrap(), controls);
+    assert_eq!(pool.payload_used_bytes().unwrap(), controls);
     drop(overflow);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

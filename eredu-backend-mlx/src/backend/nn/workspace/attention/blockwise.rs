@@ -5,59 +5,118 @@
 use super::*;
 use crate::backend::nn::attention::INPUT_SCORE_KEY_TILE;
 
-pub(super) fn input_score_cost(
+/// Complete phase alternatives before the enclosing operation selects a peak.
+/// Each row records total bytes including retained output, default bytes and births.
+pub(super) struct InputScoreBranches {
+    rows: [(u64, u64, usize); 5],
+    length: usize,
+}
+impl InputScoreBranches {
+    pub(super) fn alternatives(&self) -> &[(u64, u64, usize)] {
+        &self.rows[..self.length]
+    }
+}
+
+pub(super) fn input_score_branches(
     geometry: Geometry,
     mask: Mask,
     sinks: bool,
     cap: bool,
     allocation: NativeAllocationFacts,
-) -> FactResult<u64> {
+) -> FactResult<InputScoreBranches> {
     // This native path uses one query at a time when a complete key row is
     // larger than the input-score budget. The caller validates positive shapes.
     let query = Geometry { q: 1, ..geometry };
-    let full = Geometry {
-        k: INPUT_SCORE_KEY_TILE.min(geometry.k),
-        ..query
-    };
-    let mut step = block_cost(full, mask, sinks, cap, allocation)?;
-    let tail = geometry.k % INPUT_SCORE_KEY_TILE;
-    if tail != 0 {
-        step = step.max(block_cost(
-            Geometry { k: tail, ..query },
-            mask,
-            sinks,
-            cap,
-            allocation,
-        )?);
-    }
     let output = capacity(allocation, query.output()?)?;
     // One query cast, the previous normalization pair and value accumulator
     // coexist with the next step's newly allocated buffers. Previously finished
     // queries may retain both their F32 accumulator and output dtype conversion.
-    let during_blocks = add(
+    // Their completed step graphs no longer retain the eager scalar/page inputs.
+    let retained = add(
         add(
             capacity(allocation, query.query()?)?,
             add(mul(2, capacity(allocation, query.rows()?)?)?, output)?,
         )?,
-        add(step, mul(mul(2, geometry.q as u64 - 1)?, output)?)?,
+        mul(mul(2, geometry.q as u64 - 1)?, output)?,
     )?;
+    let mut result = InputScoreBranches {
+        rows: [(0, 0, 0); 5],
+        length: 0,
+    };
+    let full = INPUT_SCORE_KEY_TILE.min(geometry.k);
+    let tail = geometry.k % INPUT_SCORE_KEY_TILE;
+    for keys in [Some(full), (tail != 0 && tail != full).then_some(tail)]
+        .into_iter()
+        .flatten()
+    {
+        let g = Geometry { k: keys, ..query };
+        let (common, normalization, values) =
+            block_costs(g, mask, sinks, cap, allocation, true, None, false)?;
+        for (value_pass, phase) in [(false, normalization), (true, values)] {
+            let (default_bytes, default_births) =
+                block_defaults(g, mask, cap, allocation, true, None, value_pass)?;
+            result.rows[result.length] = (
+                add(retained, add(common, phase)?)?,
+                default_bytes,
+                default_births,
+            );
+            result.length += 1;
+        }
+    }
     // The final casts/concatenation run after all block scopes have settled.
-    let during_concat = add(
-        mul(mul(2, geometry.q as u64)?, output)?,
-        capacity(allocation, geometry.output()?)?,
-    )?;
-    Ok(during_blocks.max(during_concat))
+    result.rows[result.length] = (
+        add(
+            mul(mul(2, geometry.q as u64)?, output)?,
+            capacity(allocation, geometry.output()?)?,
+        )?,
+        0,
+        0,
+    );
+    result.length += 1;
+    Ok(result)
 }
 
-fn block_cost(
+/// Eager default allocations in the same selected native recurrence step.
+/// These are already included in `block_costs`; casts and graph outputs remain
+/// in that step's execution allocation population.
+fn block_defaults(
     g: Geometry,
     mask: Mask,
-    sinks: bool,
     cap: bool,
     a: NativeAllocationFacts,
-) -> FactResult<u64> {
-    let (common, normalization, values) = block_costs(g, mask, sinks, cap, a, true, None, false)?;
-    add(common, normalization.max(values))
+    input_scores: bool,
+    absolute: Option<eredu_nn::operation_geometry::AbsoluteAttentionMaskGeometry>,
+    value_pass: bool,
+) -> FactResult<(u64, usize)> {
+    // Scale, finite-min where, optional cap/reciprocal and native isneginf seed.
+    let mut scalars = 2 + 2 * usize::from(cap) + usize::from(matches!(mask, Mask::Additive(_)));
+    scalars += if value_pass {
+        2
+    } else {
+        usize::from(input_scores)
+    };
+    let (mask_bytes, mask_births) = match absolute {
+        Some(geometry) => {
+            // The aranges are stream-produced; only window/prefix operands are
+            // eager scalar constructors in the actual integer-mask worker.
+            let seeds = usize::from(geometry.window().is_some())
+                + usize::from(geometry.window().is_some() && geometry.prefix() > 0);
+            (mul(capacity(a, 1)?, seeds as u64)?, seeds)
+        }
+        None if a.original_storage => (capacity(a, 1)?, 1),
+        None => (
+            // The ordinary noncausal worker copies the actual Bool page; the
+            // original worker above constructs full(true) on the active stream.
+            facts::buffer_capacity(a, mul(g.q as u64, g.k as u64)?)?,
+            1,
+        ),
+    };
+    Ok((
+        add(mul(capacity(a, 1)?, scalars as u64)?, mask_bytes)?,
+        scalars
+            .checked_add(mask_births)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+    ))
 }
 
 fn block_costs(

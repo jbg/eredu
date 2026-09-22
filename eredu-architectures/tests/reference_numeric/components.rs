@@ -585,10 +585,7 @@ fn shared_invocation_parameter_slots_carry_the_discovered_aliases() {
         fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, _: &'a NumericTensor) {
             self.0.insert(
                 metadata.id().to_string(),
-                metadata
-                    .alias_of()
-                    .unwrap_or(metadata.id())
-                    .to_string(),
+                metadata.alias_of().unwrap_or(metadata.id()).to_string(),
             );
         }
     }
@@ -947,7 +944,8 @@ fn lfm2_component_observers_preserve_routed_provider_events() {
         assert_eq!(capture.paths.len(), 2);
         for layer in [1, 2] {
             let points = args
-                .routed_observation_points(&format!("model.layers.{layer}"), layer, None).unwrap()
+                .routed_observation_points(&format!("model.layers.{layer}"), layer, None)
+                .unwrap()
                 .unwrap();
             let path = points
                 .bank(eredu_runtime::RoutedBankId::new(0))
@@ -1355,7 +1353,11 @@ fn nemotron_mixed_writes_reconstruct_residual_and_preserve_routing_interventions
 fn populate_mixed_component_unit<U: Parameterized<NumericTensor>>(unit: &mut U) {
     struct Populate;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             // Standalone recurrent parameters are intentionally unloaded by the
             // neutral constructor. Supply nonzero fixture values on every rebuild.
             let id = metadata.id().as_str();
@@ -2145,7 +2147,10 @@ fn prepared_qwen_moe_attention_and_complete_expert_writes_cross_partitions_and_r
     };
     let architecture =
         qwen::RoutedLayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
+    let parameters = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .into_owned();
     let inputs = [
         NumericTensor::token_ids(&[1, 2, 5]),
         NumericTensor::token_ids(&[3]),
@@ -2175,7 +2180,11 @@ fn prepared_qwen_moe_attention_and_complete_expert_writes_cross_partitions_and_r
     .collect::<Vec<_>>();
     struct Populate<'a>(&'a prepared_adapter::ParameterBits);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             let (shape, bits) = &self.0[metadata.id().as_str()];
             assert_eq!(&value.shape, shape);
             value.data = bits.iter().map(|bits| f32::from_bits(*bits)).collect();
@@ -2338,9 +2347,10 @@ fn gpt_oss_sink_attention_and_biased_expert_terms_reconstruct_scores() {
         .any(|(a, b)| (a - b).abs() > 1e-5));
     let mut ordinary = ResidentRuntime::new(model(), &context).unwrap();
     let new_state = || {
-        DeviceState::<NumericBackend, _>::create(model().state_layout(None).unwrap(), |_, policy| {
-            Ok::<_, Error>(NumericHybridLayerState::new(policy))
-        })
+        DeviceState::<NumericBackend, _>::create(
+            model().state_layout(None).unwrap(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
         .unwrap()
     };
     let mut ordinary_state = new_state();
@@ -2540,10 +2550,15 @@ fn verify_prepared_lfm2_components_with_kernel(routed: bool, kernel: i32) {
     let parameters = lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     struct Populate<'a>(&'a prepared_adapter::ParameterBits);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             let (shape, bits) = &self.0[metadata.id().as_str()];
             assert_eq!(&value.shape, shape);
             value.data = bits.iter().map(|bits| f32::from_bits(*bits)).collect();
@@ -2793,7 +2808,6 @@ fn component_partition_capture_plan(
     let capabilities = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::Slice],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let mut selections = descriptor
@@ -2913,7 +2927,6 @@ fn component_partition_capture_plan(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -3405,6 +3418,7 @@ fn component_producer_receipts(
                 plan.clone(),
                 PartitionCaptureContext {
                     invocation: None,
+                invocation_window: None,
                     artifact_identity: "pinned-numeric-source".into(),
                     execution_identity: "retained-partition-selection".into(),
                     run_identity: "numerical-forward".into(),
@@ -3463,7 +3477,6 @@ fn verify_component_producer_limits(
         capture: CaptureCapabilities {
             transformations: vec![CaptureTransformKind::Slice],
             max_histogram_bins: 0,
-            physical_native_limit: false,
             conditions: vec![],
         },
         points: plan
@@ -3510,7 +3523,8 @@ fn prepared_nemotron_mixed_whole_writes_have_exact_partition_owners() {
     )
     .unwrap()
     .parameter_description(&context)
-    .unwrap().into_owned();
+    .unwrap()
+    .into_owned();
     for (tp, pp, ep) in [
         (2, 1, 1),
         (1, 2, 1),
@@ -3609,7 +3623,8 @@ fn prepared_nemotron_components_and_complete_writes_cross_all_partitions_and_res
     let parameters = nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let inputs = [
         NumericTensor::token_ids(&[1, 2, 5]),
         NumericTensor::token_ids(&[3]),
@@ -3662,7 +3677,11 @@ fn prepared_nemotron_components_and_complete_writes_cross_all_partitions_and_res
     .collect::<Vec<_>>();
     struct Populate<'a>(&'a prepared_adapter::ParameterBits);
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Populate<'_> {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             let canonical = metadata.id().as_str();
             let source = if let Some(rest) = canonical.strip_prefix("model.layers.") {
                 let (layer, rest) = rest.split_once('.').unwrap();

@@ -1,9 +1,10 @@
+use crate::memory_fixture::LedgerFixture;
 use std::{collections::BTreeMap, sync::Arc};
 
 use eredu_checkpoint::store::{CheckpointSource, SafetensorsWeightStore, TensorSelection};
 use eredu_core::residency::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy};
 use safemlx::{Device, DeviceType, HostTransferBuffer, Stream};
-use safetensors::tensor::{TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, TensorView};
 
 use super::*;
 use crate::backend::runtime::residency::manager::ResidentHostBuffers;
@@ -259,20 +260,18 @@ fn missing_or_inflight_sources_reject_without_materializing_or_settling() {
         })
     ));
     assert_eq!(host_pin_counts(&manager, &[id("owner")]), before_pins);
-    assert!(
-        manager
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .control
-            .ledger()
-            .copy_status(&id("owner"), MemoryTier::Device)
-            .unwrap()
-            .unwrap()
-            .in_flight()
-            .is_some()
-    );
+    assert!(manager
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .control
+        .ledger()
+        .copy_status(&id("owner"), MemoryTier::Device)
+        .unwrap()
+        .unwrap()
+        .in_flight()
+        .is_some());
     assert_eq!(store.source_diagnostics().unwrap(), before);
     transfer.synchronize().unwrap();
     manager
@@ -560,16 +559,23 @@ fn source_guard_rejects_missing_and_replaced_units_before_any_pin() {
     // The snapshot already authenticated this exact immutable owner. Its
     // removal is a changed source identity, not an unproved initial source.
     let missing = snapshot.pin_sources(&manager);
+    assert!(
+        matches!(
+            missing,
+            Err(HostCopyWorkspaceError::Unproved {
+                source: WorkingMemoryError::IdentityMismatch,
+                ..
+            })
+        ),
+        "{missing:?}"
+    );
     assert!(matches!(
-        missing,
+        snapshot.validate_sources(&manager),
         Err(HostCopyWorkspaceError::Unproved {
             source: WorkingMemoryError::IdentityMismatch,
             ..
         })
-    ), "{missing:?}");
-    assert!(matches!(snapshot.validate_sources(&manager), Err(HostCopyWorkspaceError::Unproved {
-        source: WorkingMemoryError::IdentityMismatch, ..
-    })));
+    ));
     assert_eq!(host_pin_counts(&manager, &ids), before_pins);
     assert_eq!(store.source_diagnostics().unwrap(), before_reads);
 
@@ -728,9 +734,11 @@ fn paid_cpu_host_and_disk_sources_retain_the_selected_copy_destination() {
     let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("layers")], "layers").unwrap();
     let layout = ExecutionUnitLayout::new(&graph, [1]).unwrap();
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
-    let baseline = pool.used_bytes().unwrap();
+    safemlx::memory::clear_cache().unwrap();
+    safemlx::reclaim_allocation_owners();
+    let baseline = pool.fixture_host_charge().unwrap();
     for tier in [MemoryTier::Host, MemoryTier::Disk] {
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         let plan = OffloadPlan::new(
             OffloadConfig::new(None, None, 1).unwrap(),
             [OffloadUnitSpec::new(ids[0].clone(), 16, ResidencyPolicy::Cacheable, tier).unwrap()],
@@ -760,7 +768,7 @@ fn paid_cpu_host_and_disk_sources_retain_the_selected_copy_destination() {
         .expect("CPU must retain the genuine paid source manager");
         assert!(manager.original_source_custody().is_some());
         assert!(
-            pool.used_bytes().unwrap() > baseline,
+            pool.fixture_host_charge().unwrap() > baseline,
             "this manager must retain its actual source charge"
         );
         if tier == MemoryTier::Host {
@@ -794,8 +802,10 @@ fn paid_cpu_host_and_disk_sources_retain_the_selected_copy_destination() {
         drop(manager);
         crate::backend::submission_recovery::wait_for_retirement(|| {
             crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
-            pool.used_bytes().unwrap() == baseline
+            safemlx::memory::clear_cache().unwrap();
+            safemlx::reclaim_allocation_owners();
+            pool.fixture_host_charge().unwrap() == baseline
         });
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     }
 }

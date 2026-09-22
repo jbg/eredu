@@ -8,8 +8,8 @@ fn roles(g: InferenceGeometry) -> TextPrefillScopeFacts {
 }
 #[test]
 fn prefill_original_exact_and_short_admission_preserve_single_hold_and_residual_ceiling() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let original = replacement_quote(&pool, geometry(), 0).into_incremental();
     let plain = prepared(&source, &original)
@@ -43,11 +43,11 @@ fn prefill_original_exact_and_short_admission_preserve_single_hold_and_residual_
         .with_span_workspace_and_text_controls(controls)
         .unwrap();
     let p = quote.span_workspace().retention_peak_bytes().unwrap();
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
     assert!(
-        matches!(sealed_plan(&pool,&quote,exact-1),Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==available_bytes+1)
+        matches!(sealed_plan(&pool,&quote,exact-1),Err(PrefillPlanningError::Reservation(capacity_error)) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes==available_bytes+1))
     );
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
     let (mut span, _) = accepted
@@ -61,14 +61,14 @@ fn prefill_original_exact_and_short_admission_preserve_single_hold_and_residual_
     let hold = span.protected_host_bytes();
     assert_eq!(hold, p + q);
     drop((span, reservation, run, root, source, plain, quote));
-    assert_eq!(pool.used_bytes().unwrap(), hold);
+    assert_eq!(pool.payload_used_bytes().unwrap(), hold);
     drop(bank);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn prefill_unknown_geometry_and_graph_population_never_produce_partial_authority() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let original = replacement_quote(&pool, geometry(), 0).into_incremental();
     let plain = prepared(&source, &original);
@@ -119,13 +119,13 @@ fn prefill_unknown_geometry_and_graph_population_never_produce_partial_authority
         TextPrefillScopeFacts::new(geometry(), [Some(u64::MAX); 7], Some(1), 1, 1),
         Err(WorkingMemoryError::Overflow)
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop((root, source, plain));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         64,
         "the original quote pins its source"
     );
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

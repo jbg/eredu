@@ -316,6 +316,11 @@ pub fn concatenate_axis(
 /// caller separately retains and funds its Rust input slice's owning storage.
 /// This pure query neither allocates a vector nor grants submission authority.
 pub fn concatenate_axis_control_bytes() -> Option<usize> {
+    concatenate_axis_wrapper_control_bytes()?.checked_add(crate::OriginalScopeObserver::control_bytes()?)
+}
+
+// Same C vector and safe call frames without an original observation owner.
+pub(crate) fn concatenate_axis_wrapper_control_bytes() -> Option<usize> {
     let native = unsafe { safemlx_sys::mlx_vector_array_control_bytes() };
     if native == 0 {
         return None;
@@ -332,7 +337,6 @@ pub fn concatenate_axis_control_bytes() -> Option<usize> {
         std::mem::size_of::<Result<Array>>(),
         std::mem::size_of::<i32>(),
         std::mem::size_of::<usize>(),
-        crate::OriginalScopeObserver::control_bytes()?,
     ]
     .into_iter()
     .try_fold(native, usize::checked_add)

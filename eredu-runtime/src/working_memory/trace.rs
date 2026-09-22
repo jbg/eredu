@@ -21,10 +21,46 @@ use eredu_nn::workspace::WorkspaceTraceReport;
 /// until completion; callers pricing several safely separated spans take their
 /// peak rather than summing their graphs.
 pub fn with_equation_workspace(
-    state: RuntimeStateEstimate,
-    outside_trace: ExecutionWorkspaceEstimate,
+    mut state: RuntimeStateEstimate,
+    mut outside_trace: ExecutionWorkspaceEstimate,
     trace: &WorkspaceTraceReport,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
+    let metadata = super::WorkspaceReportMetadata::ordinary();
+    if let Some(domains) = &trace.physical_domains {
+        if let (Some(transient), Some(retained)) =
+            (&domains.state_transient, &domains.retained_state)
+        {
+            if let Some(outside) = &mut outside_trace.physical_domains {
+                outside.activations = metadata
+                    .combine_domain_requirements(&outside.activations, transient, true)
+                    .map_err(super::WorkspaceReportError::into_capability)?;
+            }
+            if let Some(existing) = &mut state.physical_domains {
+                existing.decoder_state = metadata
+                    .clone_domain_requirements(retained)
+                    .map_err(super::WorkspaceReportError::into_capability)?;
+            } else if state.multimodal_embedding_bytes == 0
+                && state.media_execution_workspace_bytes == 0
+            {
+                state.physical_domains = Some(eredu_core::DomainRuntimeStateEstimate {
+                    geometry: outside_trace.geometry,
+                    decoder_state: metadata
+                        .clone_domain_requirements(retained)
+                        .map_err(super::WorkspaceReportError::into_capability)?,
+                    media_embeddings: metadata
+                        .empty_domain_requirements(retained)
+                        .map_err(super::WorkspaceReportError::into_capability)?,
+                    media_workspace: metadata
+                        .empty_domain_requirements(retained)
+                        .map_err(super::WorkspaceReportError::into_capability)?,
+                });
+            }
+        } else {
+            outside_trace.physical_domains = None;
+        }
+    } else {
+        outside_trace.physical_domains = None;
+    }
     let transient = match trace.inference_transient_bytes() {
         Some(bytes) => WorkspaceBound::bounded(
             bytes,
@@ -33,6 +69,10 @@ pub fn with_equation_workspace(
                 trace.assumptions.join("; ")
             ),
         ),
+        None if trace.physical_domains.is_some() => WorkspaceBound::PerDomain {
+            assumptions: "complete physical-domain equation demand has no aggregate u64 diagnostic"
+                .into(),
+        },
         None => WorkspaceBound::Unknown {
             reason: format!(
                 "equation trace has no complete transient/state-overlap bound; opening state supplied: {}; unpriced tensor-buffer operation indices: {:?}; unpriced managed-host operation indices: {:?}",
@@ -73,7 +113,8 @@ pub(super) fn with_transient_workspace_metadata(
     retained_bytes: Option<u64>,
     metadata: super::WorkspaceReportMetadata<'_>,
 ) -> Result<RuntimeStateEstimate, super::WorkspaceReportError> {
-    if retained_bytes.is_some_and(|bytes| bytes > state.requested_state_bytes) {
+    let attributed = state.physical_domains.is_some() && outside_trace.physical_domains.is_some();
+    if !attributed && retained_bytes.is_some_and(|bytes| bytes > state.requested_state_bytes) {
         return Err(eredu_core::AdmissionPolicyError::InvalidConfiguration {
             field: "equation_workspace",
             detail: "traced retained storage exceeds the persistent-state estimate",
@@ -82,6 +123,9 @@ pub(super) fn with_transient_workspace_metadata(
     }
     let transient = match retained_bytes {
         Some(_) => transient,
+        None if attributed => metadata.per_domain(format_args!(
+            "complete per-domain retained-state backing has no aggregate u64 diagnostic"
+        ))?,
         None => metadata.unknown(format_args!(
             "equation trace has no complete retained-state backing bound"
         ))?,
@@ -94,15 +138,22 @@ pub(super) fn with_transient_workspace_metadata(
                 assumptions: trace_assumptions,
             },
         ) => {
-            let bytes = bytes.checked_add(traced).ok_or(
-                eredu_core::AdmissionPolicyError::ArithmeticOverflow {
+            let bytes = bytes.checked_add(traced);
+            if attributed && bytes.is_none() {
+                metadata.per_domain(format_args!(
+                    "aggregate diagnostic exceeds u64; physical-domain requirements remain complete"
+                ))?
+            } else {
+                let bytes = bytes.ok_or(eredu_core::AdmissionPolicyError::ArithmeticOverflow {
                     operation: "equation and external workspace",
-                },
-            )?;
-            metadata.bounded(bytes, format_args!("{assumptions}; {trace_assumptions}"))?
+                })?;
+                metadata.bounded(bytes, format_args!("{assumptions}; {trace_assumptions}"))?
+            }
         }
         (bound @ WorkspaceBound::Unknown { .. }, _) => bound,
         (_, unknown @ WorkspaceBound::Unknown { .. }) => unknown,
+        (bound @ WorkspaceBound::PerDomain { .. }, _)
+        | (_, bound @ WorkspaceBound::PerDomain { .. }) => bound,
     };
     metadata.admit::<RuntimeStateEstimate>()?;
     Ok(state.with_execution_workspace_fixed(outside_trace)?)

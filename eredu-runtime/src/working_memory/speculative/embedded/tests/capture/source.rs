@@ -10,15 +10,22 @@ fn original_outer_source_preserves_scope_occurrence_and_shared_role_delivery() {
     let workspace = EmbeddedInvocationWorkspace::target(invocation).unwrap();
     let report = report(workspace.geometry());
     let capacity = 1 << 26;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let source = capture_source(&pool);
     let funding = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
-    let request =
-        OriginalSpeculativeRequest::prepare_embedded(&pool, &execution, &schedule, capacity)
-            .unwrap();
+    let request = OriginalSpeculativeRequest::prepare_embedded(
+        &pool,
+        &execution,
+        &schedule,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
     let mut cursor = schedule.into_cursor();
     let origin = SpeculativeActivationOrigin {
         request: SpeculativeRequestId::new(71),
@@ -35,8 +42,40 @@ fn original_outer_source_preserves_scope_occurrence_and_shared_role_delivery() {
         funding.clone(),
     )
     .unwrap();
+    assert!(outer.preview().is_none());
     outer.set_origin(Some(origin));
+    let preview = outer.preview().unwrap();
+    assert!(
+        preview
+            .prepare_invocation(Phase::TargetPrefill, 0, None, 0)
+            .is_err()
+    );
+    assert!(
+        preview
+            .prepare_invocation(Phase::TargetPrefill, 3, None, u64::MAX)
+            .is_err()
+    );
+    let prospective = preview
+        .prepare_invocation(Phase::TargetPrefill, 3, None, 0)
+        .unwrap();
+    let future_draft = preview
+        .prepare_invocation(Phase::PredictionPrefill, 3, None, 1)
+        .unwrap();
+    assert!(prospective.invocation().source().same_source(&source));
+    assert_eq!(prospective.invocation().selected(), &[true]);
+    assert_eq!(future_draft.invocation().selected(), &[false]);
+    assert_eq!(future_draft.invocation().invocation(), 1);
+    assert!(outer.invocation().is_none());
+    assert!(outer.take().is_none());
+    // Cold prospect construction neither begins nor spends this occurrence.
     outer.begin(Phase::TargetPrefill, 3).unwrap();
+    assert!(outer.preview().is_none());
+    assert_eq!(
+        outer.invocation().unwrap().invocation(),
+        prospective.invocation().invocation()
+    );
+    drop(future_draft);
+    drop(prospective);
     let descriptor = outer.invocation().unwrap();
     assert!(descriptor.source().same_source(&source));
     assert_eq!(descriptor.selected(), &[true]);
@@ -116,7 +155,7 @@ fn original_outer_source_preserves_scope_occurrence_and_shared_role_delivery() {
     drop(role);
     drop(request);
     drop(alias);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     let CapturePayload::SharedTensor(value) = delivered.captures.as_step().records[0]
         .payload
         .as_ref()
@@ -129,7 +168,7 @@ fn original_outer_source_preserves_scope_occurrence_and_shared_role_delivery() {
     };
     assert_eq!(values, &[0.5, -1.0, 2.25, 3.5, -4.0, 5.75]);
     drop(delivered);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -188,7 +227,7 @@ fn window_aggregate(checkpoints: bool) {
         .map(|i| schedule.prefill_invocations(i).unwrap().0)
         .collect();
     let capacity = 1 << 27;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let source = capture_source_with_transform(
         &pool,
@@ -197,11 +236,18 @@ fn window_aggregate(checkpoints: bool) {
         u64::MAX,
     );
     let funding = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
         .unwrap();
-    let request =
-        OriginalSpeculativeRequest::prepare_embedded(&pool, &execution, &schedule, capacity)
-            .unwrap();
+    let request = OriginalSpeculativeRequest::prepare_embedded(
+        &pool,
+        &execution,
+        &schedule,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
     let lineage = request.prepare_embedded_capture_lineage(&source).unwrap();
     let mut cursor = schedule.into_cursor();
     let origin = SpeculativeActivationOrigin {
@@ -225,12 +271,23 @@ fn window_aggregate(checkpoints: bool) {
         assert!(outer.control_storage_bytes().unwrap() > 0);
         let saved = outer.save_control().unwrap();
         let mut foreign = OriginalSpeculativeCapture::prepare(
-            source.clone(), &[SpeculativeCaptureScope::Target], "actual-window-source",
-            origin.request, funding.clone(),
-        ).unwrap().with_lineage(lineage.clone()).unwrap();
-        assert!(foreign.prepare_control(&saved).is_err(), "same C and ledger do not substitute the collector");
+            source.clone(),
+            &[SpeculativeCaptureScope::Target],
+            "actual-window-source",
+            origin.request,
+            funding.clone(),
+        )
+        .unwrap()
+        .with_lineage(lineage.clone())
+        .unwrap();
+        assert!(
+            foreign.prepare_control(&saved).is_err(),
+            "same C and ledger do not substitute the collector"
+        );
         Some(saved)
-    } else { None };
+    } else {
+        None
+    };
     outer.set_origin(Some(origin));
     outer.set_prefill_reduction_geometry(
         eredu_core::speculative::SpeculativePrefillReductionGeometry {
@@ -245,7 +302,9 @@ fn window_aggregate(checkpoints: bool) {
         outer
             .begin(Phase::TargetPrefill, invocation.positions())
             .unwrap();
-        if checkpoints { assert!(outer.save_control().is_err()); }
+        if checkpoints {
+            assert!(outer.save_control().is_err());
+        }
         let descriptor = outer.invocation().unwrap();
         let inherited = request
             .inspect_embedded_capture_lineage_usage(&source, &lineage)
@@ -369,37 +428,64 @@ fn window_aggregate(checkpoints: bool) {
             .iter()
             .all(|frame| frame.prefill_reductions.is_none())
     );
-    if checkpoints { assert!(outer.save_control().is_err(), "held aggregate is not drained"); }
+    if checkpoints {
+        assert!(
+            outer.save_control().is_err(),
+            "held aggregate is not drained"
+        );
+    }
     outer.complete_prefill_reductions().unwrap();
     outer.finish_prefill_reductions(true);
-    if checkpoints { assert!(outer.save_control().is_err(), "delivery is still queued"); }
+    if checkpoints {
+        assert!(outer.save_control().is_err(), "delivery is still queued");
+    }
     let final_frame = outer.take().unwrap();
     if let Some(saved) = &saved {
-        assert_eq!(outer.control_usage().unwrap(), spent, "control reads the current request lineage");
+        assert_eq!(
+            outer.control_usage().unwrap(),
+            spent,
+            "control reads the current request lineage"
+        );
         {
             let active = lineage.ledger().borrow().unwrap();
-            assert!(outer.control_usage().is_err(), "an active ledger cannot supply settled readmission usage");
+            assert!(
+                outer.control_usage().is_err(),
+                "an active ledger cannot supply settled readmission usage"
+            );
             drop(active);
         }
         drop(outer.prepare_control(saved).unwrap());
         outer.prepare_control(saved).unwrap().commit();
-        assert_eq!(request.inspect_embedded_capture_lineage_usage(&source, &lineage).unwrap(), spent);
+        assert_eq!(
+            request
+                .inspect_embedded_capture_lineage_usage(&source, &lineage)
+                .unwrap(),
+            spent
+        );
         let post = outer.save_control().unwrap();
         outer.prepare_control(&post).unwrap().commit();
         outer.set_prefill_span(None);
         outer.begin(Phase::Verification, 1).unwrap();
-        assert_eq!(outer.invocation().unwrap().invocation(), 3, "restore cannot recycle physical IDs");
+        assert_eq!(
+            outer.invocation().unwrap().invocation(),
+            3,
+            "restore cannot recycle physical IDs"
+        );
         outer.finish(false);
         assert!(outer.save_control().is_err());
-        assert!(outer.prepare_control(saved).is_err(), "failed callback cannot become checkpoint-ready by restore");
-        assert!(outer.control_usage().is_err(), "failed callbacks cannot supply readmission usage");
-        spent = request.inspect_embedded_capture_lineage_usage(&source, &lineage).unwrap();
+        assert!(
+            outer.prepare_control(saved).is_err(),
+            "failed callback cannot become checkpoint-ready by restore"
+        );
+        assert!(
+            outer.control_usage().is_err(),
+            "failed callbacks cannot supply readmission usage"
+        );
+        spent = request
+            .inspect_embedded_capture_lineage_usage(&source, &lineage)
+            .unwrap();
     }
-    let report = final_frame
-        .prefill_reductions
-        .as_ref()
-        .unwrap()
-        .clone();
+    let report = final_frame.prefill_reductions.as_ref().unwrap().clone();
     let entry = &report.as_reductions().records[0];
     assert_eq!(
         entry.status,
@@ -432,10 +518,15 @@ fn window_aggregate(checkpoints: bool) {
     drop(source);
     drop(lineage);
     drop(request);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     assert_eq!(report.as_reductions().records[0].covered_sequence, 7);
     drop(report);
-    if saved.is_some() { assert!(pool.used_bytes().unwrap() > 0, "escaped checkpoint retains actual C and host accounts"); }
+    if saved.is_some() {
+        assert!(
+            pool.payload_used_bytes().unwrap() > 0,
+            "escaped checkpoint retains actual C and host accounts"
+        );
+    }
     drop(saved);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

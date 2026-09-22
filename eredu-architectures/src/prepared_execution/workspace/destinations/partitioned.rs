@@ -75,6 +75,17 @@ pub fn project_partitioned_text_binding_destinations(
     sources: &PreparedModelSources,
     context: &WorkspaceContext,
 ) -> Result<PartitionedTextBindingDestinations, PreparedExecutionError<Error>> {
+    project_partitioned_text_binding_destinations_for(
+        sources,
+        context,
+        ConstructionPurpose::BindingDestinations,
+    )
+}
+pub(in crate::prepared_execution::workspace) fn project_partitioned_text_binding_destinations_for(
+    sources: &PreparedModelSources,
+    context: &WorkspaceContext,
+    purpose: ConstructionPurpose,
+) -> Result<PartitionedTextBindingDestinations, PreparedExecutionError<Error>> {
     let manifest = sources
         .selected()
         .communication_manifest()
@@ -120,7 +131,7 @@ pub fn project_partitioned_text_binding_destinations(
                 .state()
                 .floating_dtype(),
         },
-        ConstructionPurpose::BindingDestinations,
+        purpose,
     )
 }
 struct PartitionDestinationVisitor<'a>(&'a WorkspaceContext);

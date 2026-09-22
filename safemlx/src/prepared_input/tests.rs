@@ -131,48 +131,85 @@ fn prepared_source_native_retirement_queue_can_be_reclaimed_on_another_rust_thre
 
 #[test]
 fn scalar_sources_preserve_rank_values_and_custody_without_entry_housekeeping() {
-    let runtime=PreparedInputRuntime::prepare().unwrap();
-    assert!(matches!(runtime.f32(&[],&[]),Err(PreparedInputCause::Invalid)));
-    assert!(matches!(runtime.f32(&[1.0,2.0],&[]),Err(PreparedInputCause::Invalid)));
-    assert!(matches!(runtime.u32(&[37],&[0]),Err(PreparedInputCause::Invalid)));
-    let floating=[-2.25_f32];let token=[37_u32];
-    let f=runtime.f32(&floating,&[]).unwrap();
-    let u=runtime.u32(&token,&[]).unwrap();
-    let array=PreparedInputLeaf::array_layout().unwrap();
-    let metadata=f.metadata_bytes()+u.metadata_bytes()+2*array.metadata_bytes();
-    let count=Arc::new(AtomicUsize::new(0));
-    let arena=PreparedInputArena::try_allocate(
-        PreparedSubmissionGraphQuota::try_new(metadata,Owner(count.clone())).unwrap()).unwrap();
-    crate::register_thread_runtime_housekeeping(hook);HOOKS.set(0);
-    let f=f.construct(&arena).unwrap();let u=u.construct(&arena).unwrap();
-    let f_id=f.allocation_info().unwrap();let u_id=u.allocation_info().unwrap();
-    let f_alias=f.try_source_array().unwrap();let u_alias=u.try_source_array().unwrap();
-    assert_eq!(HOOKS.get(),0);
+    let runtime = PreparedInputRuntime::prepare().unwrap();
+    assert!(matches!(
+        runtime.f32(&[], &[]),
+        Err(PreparedInputCause::Invalid)
+    ));
+    assert!(matches!(
+        runtime.f32(&[1.0, 2.0], &[]),
+        Err(PreparedInputCause::Invalid)
+    ));
+    assert!(matches!(
+        runtime.u32(&[37], &[0]),
+        Err(PreparedInputCause::Invalid)
+    ));
+    let floating = [-2.25_f32];
+    let token = [37_u32];
+    let f = runtime.f32(&floating, &[]).unwrap();
+    let u = runtime.u32(&token, &[]).unwrap();
+    let array = PreparedInputLeaf::array_layout().unwrap();
+    let metadata = f.metadata_bytes() + u.metadata_bytes() + 2 * array.metadata_bytes();
+    let count = Arc::new(AtomicUsize::new(0));
+    let arena = PreparedInputArena::try_allocate(
+        PreparedSubmissionGraphQuota::try_new(metadata, Owner(count.clone())).unwrap(),
+    )
+    .unwrap();
+    crate::register_thread_runtime_housekeeping(hook);
+    HOOKS.set(0);
+    let f = f.construct(&arena).unwrap();
+    let u = u.construct(&arena).unwrap();
+    let f_id = f.allocation_info().unwrap();
+    let u_id = u.allocation_info().unwrap();
+    let f_alias = f.try_source_array().unwrap();
+    let u_alias = u.try_source_array().unwrap();
+    assert_eq!(HOOKS.get(), 0);
     crate::unregister_thread_runtime_housekeeping(hook);
-    assert_ne!(f_id,u_id);
-    assert!(f_alias.shape().is_empty());assert!(u_alias.shape().is_empty());
-    assert_eq!(f_alias.size(),1);assert_eq!(u_alias.size(),1);
-    drop((f,u,arena,runtime));crate::reclaim_allocation_owners();
-    assert_eq!(count.load(Ordering::SeqCst),0);
-    assert_eq!(f_alias.evaluated().unwrap().try_as_slice::<f32>().unwrap(),&floating);
-    assert_eq!(u_alias.evaluated().unwrap().try_as_slice::<u32>().unwrap(),&token);
-    assert_eq!(f_alias.allocation_info().unwrap(),Some(f_id));
-    assert_eq!(u_alias.allocation_info().unwrap(),Some(u_id));
-    drop(f_alias);crate::reclaim_allocation_owners();assert_eq!(count.load(Ordering::SeqCst),0);
-    drop(u_alias);crate::reclaim_allocation_owners();assert_eq!(count.load(Ordering::SeqCst),1);
+    assert_ne!(f_id, u_id);
+    assert!(f_alias.shape().is_empty());
+    assert!(u_alias.shape().is_empty());
+    assert_eq!(f_alias.size(), 1);
+    assert_eq!(u_alias.size(), 1);
+    drop((f, u, arena, runtime));
+    crate::reclaim_allocation_owners();
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f_alias.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+        &floating
+    );
+    assert_eq!(
+        u_alias.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+        &token
+    );
+    assert_eq!(f_alias.allocation_info().unwrap(), Some(f_id));
+    assert_eq!(u_alias.allocation_info().unwrap(), Some(u_id));
+    drop(f_alias);
+    crate::reclaim_allocation_owners();
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    drop(u_alias);
+    crate::reclaim_allocation_owners();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn boolean_prepared_mask_has_exact_dtype_and_survives_source_handle_retirement() {
     let runtime = PreparedInputRuntime::prepare().unwrap();
     let flags = [true, false, true, true, false, false];
-    assert!(matches!(runtime.boolean(&flags, &[1,5]), Err(PreparedInputCause::Invalid)));
-    let plan = runtime.boolean(&flags, &[2,3]).unwrap();
+    assert!(matches!(
+        runtime.boolean(&flags, &[1, 5]),
+        Err(PreparedInputCause::Invalid)
+    ));
+    let plan = runtime.boolean(&flags, &[2, 3]).unwrap();
     let wrapper = PreparedInputLeaf::array_layout().unwrap();
-    let metadata = plan.metadata_bytes().checked_add(wrapper.metadata_bytes()).unwrap();
+    let metadata = plan
+        .metadata_bytes()
+        .checked_add(wrapper.metadata_bytes())
+        .unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let arena = PreparedInputArena::try_allocate(
-        PreparedSubmissionGraphQuota::try_new(metadata, Owner(count.clone())).unwrap()).unwrap();
+        PreparedSubmissionGraphQuota::try_new(metadata, Owner(count.clone())).unwrap(),
+    )
+    .unwrap();
     crate::register_thread_runtime_housekeeping(hook);
     HOOKS.set(0);
     let leaf = plan.construct(&arena).unwrap();
@@ -184,10 +221,49 @@ fn boolean_prepared_mask_has_exact_dtype_and_survives_source_handle_retirement()
     crate::reclaim_allocation_owners();
     assert_eq!(count.load(Ordering::SeqCst), 0);
     assert_eq!(value.dtype(), crate::Dtype::Bool);
-    assert_eq!(value.shape(), &[2,3]);
+    assert_eq!(value.shape(), &[2, 3]);
     assert_eq!(value.allocation_info().unwrap(), Some(id));
-    assert_eq!(value.evaluated().unwrap().try_as_slice::<bool>().unwrap(), &flags);
+    assert_eq!(
+        value.evaluated().unwrap().try_as_slice::<bool>().unwrap(),
+        &flags
+    );
     drop(value);
     crate::reclaim_allocation_owners();
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn copied_u32_layout_matches_real_values_without_housekeeping_or_a_leaf() {
+    let runtime = PreparedInputRuntime::prepare().unwrap();
+    crate::register_thread_runtime_housekeeping(hook);
+    HOOKS.set(0);
+    for shape in [&[][..], &[1][..], &[2, 3][..], &[1, 2, 3][..]] {
+        let count = shape.iter().product::<usize>();
+        let values = (0..count).map(|n| n as u32 + 7).collect::<Vec<_>>();
+        let facts = runtime.u32_layout(shape).unwrap();
+        let plan = runtime.u32(&values, shape).unwrap();
+        assert_eq!(facts, plan.layout());
+        assert!(facts.metadata_bytes() > 0);
+        assert!(facts.backing_bytes() >= count * 4);
+        assert!(facts.control_bytes() > 0);
+    }
+    for shape in [&[0][..], &[usize::MAX][..], &[usize::MAX, 2][..]] {
+        assert_eq!(runtime.u32_layout(shape), Err(PreparedInputCause::Invalid));
+    }
+    assert_eq!(HOOKS.get(), 0);
+    crate::unregister_thread_runtime_housekeeping(hook);
+    // Construction still requires the real borrowed values and a paid arena.
+    let values = [11u32, 37, 101];
+    let plan = runtime.u32(&values, &[3]).unwrap();
+    let metadata = plan
+        .metadata_bytes()
+        .checked_add(PreparedInputLeaf::array_layout().unwrap().metadata_bytes())
+        .unwrap();
+    let arena = PreparedInputArena::try_allocate(
+        PreparedSubmissionGraphQuota::try_new(metadata, ()).unwrap(),
+    )
+    .unwrap();
+    let leaf = plan.construct(&arena).unwrap();
+    let array = leaf.try_source_array().unwrap();
+    assert_eq!(array.evaluated().unwrap().as_slice::<u32>(), &values);
 }

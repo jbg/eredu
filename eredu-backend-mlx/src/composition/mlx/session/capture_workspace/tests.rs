@@ -1,10 +1,10 @@
-mod invocation;
 mod checkpoint;
 mod generated;
 mod histogram;
+mod invocation;
 use super::*;
 use eredu_core::*;
-use eredu_nn::{Tensor, workspace::*};
+use eredu_nn::{workspace::*, Tensor};
 use std::cell::Cell;
 fn admitted_limited(
     axes: Vec<SymbolicDimension>,
@@ -71,7 +71,6 @@ fn admitted_limited(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: limit,
         },
     }
@@ -87,7 +86,6 @@ fn admitted_limited(
                 CaptureTransformKind::Histogram,
             ],
             max_histogram_bins: 2,
-            physical_native_limit: false,
             conditions: vec![],
         },
         CaptureRequestShape {
@@ -113,9 +111,7 @@ struct Facts {
 impl WorkspaceMechanisms for Facts {
     fn operation_bound(&self, op: &WorkspaceOperation) -> Result<Option<WorkspaceOperationBound>> {
         let storage = match &op.kind {
-            WorkspaceOperationKind::StaticSlice { .. } => {
-                WorkspaceOutputStorage::AliasInput(0)
-            }
+            WorkspaceOperationKind::StaticSlice { .. } => WorkspaceOutputStorage::AliasInput(0),
             WorkspaceOperationKind::View("reshape") => {
                 WorkspaceOutputStorage::AllocateOrAliasInputs {
                     bytes: op.outputs[0].bytes()?,
@@ -191,9 +187,7 @@ impl WorkspaceFactMechanisms for Facts {
         destination.validate(facts.layout).unwrap();
         destination.assumptions.copy_from_slice(FACT_ASSUMPTIONS);
         destination.outputs[0] = match op.kind {
-            WorkspaceOperationKindView::StaticSlice { .. } => {
-                WorkspaceOutputEffect::AliasInput(0)
-            }
+            WorkspaceOperationKindView::StaticSlice { .. } => WorkspaceOutputEffect::AliasInput(0),
             WorkspaceOperationKindView::View("reshape") => {
                 destination.aliases[0] = 0;
                 WorkspaceOutputEffect::AllocateOrAliasInputs {
@@ -310,16 +304,14 @@ fn decode(p: u64) -> InferenceWorkspaceSpan {
 }
 fn begin(o: &mut CaptureWorkspaceObserver<'_>, context: &WorkspaceContext) {
     assert!(!o.requires_sequence_readout());
-    assert!(
-        !o.begin_span(geometry(), &prefill(0, 2), 0, context)
-            .unwrap()
-    );
+    assert!(!o
+        .begin_span(geometry(), &prefill(0, 2), 0, context)
+        .unwrap());
     let metadata = o.ledger.total();
     assert!(metadata.host_bytes > 0);
-    assert!(
-        !o.begin_span(geometry(), &prefill(2, 3), 0, context)
-            .unwrap()
-    );
+    assert!(!o
+        .begin_span(geometry(), &prefill(2, 3), 0, context)
+        .unwrap());
     assert_eq!(
         o.ledger.total(),
         metadata,
@@ -403,14 +395,12 @@ fn closed_future_capture_keeps_imported_backing_and_roots_through_whole_span() {
             usize::from(expected.iter().product::<i32>() != 0)
         );
         assert!(report.state.as_ref().unwrap().retained_bytes.unwrap() >= 4096);
-        assert!(
-            report
-                .residual
-                .as_ref()
-                .unwrap()
-                .borrowed_storage
-                .same_identity(&borrowed)
-        );
+        assert!(report
+            .residual
+            .as_ref()
+            .unwrap()
+            .borrowed_storage
+            .same_identity(&borrowed));
         drop(roots);
         observer.end_span(&decode(1), &context).unwrap();
         assert!(observer.roots.is_empty());
@@ -457,16 +447,12 @@ fn actual_source_context_shape_and_dtype_reject_before_quota_or_trace() {
     wrong.cached_positions = 1;
     assert!(CaptureWorkspaceObserver::new(&source, wrong, &context).is_err());
     let (mut observer, _) = CaptureWorkspaceObserver::new(&source, geometry(), &context).unwrap();
-    assert!(
-        observer
-            .begin_span(geometry(), &decode(1), 1, &context)
-            .is_err()
-    );
-    assert!(
-        observer
-            .begin_span(geometry(), &prefill(1, 3), 0, &context)
-            .is_err()
-    );
+    assert!(observer
+        .begin_span(geometry(), &decode(1), 1, &context)
+        .is_err());
+    assert!(observer
+        .begin_span(geometry(), &prefill(1, 3), 0, &context)
+        .is_err());
 }
 
 #[test]
@@ -514,20 +500,16 @@ fn selected_generated_source_is_typed_unfinished_and_unselected_factory_stays_la
         creation_bytes: 24,
         source_dtype: Some(eredu_core::checkpoint::TensorDtype::F32),
     };
-    assert!(
-        !observer
-            .begin_span(geometry(), &prefill(0, 2), 0, &context)
-            .unwrap()
-    );
+    assert!(!observer
+        .begin_span(geometry(), &prefill(0, 2), 0, &context)
+        .unwrap());
     observer
         .observe_generated("block.output", &value, &generated, &mut factory)
         .unwrap();
     assert_eq!(calls.get(), 0, "scheduled-off selected factory stays lazy");
-    assert!(
-        !observer
-            .begin_span(geometry(), &prefill(2, 3), 0, &context)
-            .unwrap()
-    );
+    assert!(!observer
+        .begin_span(geometry(), &prefill(2, 3), 0, &context)
+        .unwrap());
     observer
         .begin_span(geometry(), &decode(1), 1, &context)
         .unwrap();

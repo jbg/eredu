@@ -1,29 +1,35 @@
 //! Native scope and completion for one already admitted Embedded equation.
 //! The caller authenticates current state and parameter sources before admission.
 use super::original_domains::{
-    prepare_domains, OriginalSpeculativeDomainError, OriginalSpeculativeDomains,
-    OriginalSpeculativeRoots,
+    OriginalSpeculativeDomainError, OriginalSpeculativeDomains, OriginalSpeculativeRoots,
+    prepare_domains,
 };
+use crate::backend::runtime::residency::manager::OriginalMaterializedLoan;
 use crate::backend::{
+    OriginalCopyEnvironment,
     error::Error,
     nn::{
         tensor::{TokenValidationIngress, TokenValidationScope},
         workspace::{EmbeddedEquationRecipe, ResidentCompletionRecipe},
     },
     submission_recovery::{PreparedRecovery, Retention, Status},
-    OriginalCopyEnvironment,
 };
 use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{
     OriginalEmbeddedSpeculativeRole, OriginalSpeculativeBudgetCustody,
 };
 use safemlx::{
-    error::Exception, Array, OriginalBufferBudget, OriginalScopeObserver, PrefillRootsRuntime,
-    PreparedPipelineCachePlan, Stream, SubmissionScope,
+    Array, OriginalBufferBudget, OriginalScopeObserver, PrefillRootsRuntime,
+    PreparedPipelineCachePlan, Stream, SubmissionScope, error::Exception,
 };
+mod parallel;
 mod role;
-pub(crate) use role::{ExternalEquationRecipe, ModelEquation, ModelRole};
+use crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeModelControlQuote;
+use eredu_runtime::working_memory::OriginalSpeculativeRequest;
+pub(crate) use parallel::EmbeddedParallelInvocation;
+use parallel::{EmbeddedRootOwner, EmbeddedRootSource};
 use role::EquationIdentity;
+pub(crate) use role::{ExternalEquationRecipe, ModelEquation, ModelRole};
 use std::{
     cell::{Cell, RefCell},
     mem::{size_of, size_of_val},
@@ -87,6 +93,7 @@ pub(crate) struct EmbeddedNativeLayout {
     graph_bytes: u64,
     record_bytes: u64,
     native_controls: u64,
+    model_control: Option<SpeculativeModelControlQuote>,
 }
 impl EmbeddedNativeLayout {
     pub(crate) fn inspect<E: ModelEquation>(
@@ -95,9 +102,24 @@ impl EmbeddedNativeLayout {
         preparation_graph_bytes: usize,
         preparation_mutable_bytes: usize,
     ) -> Result<Self, EmbeddedNativeCause> {
-        let (completion, graph_capacity, record_capacity, kernels, query_controls) =
-            recipe.equation_domains(preparation_graph_bytes)
-                .map_err(|cause| cause.at_speculative_stage("embedded equation native domains"))?;
+        Self::inspect_with_model_control(
+            recipe,
+            environment,
+            preparation_graph_bytes,
+            preparation_mutable_bytes,
+            None,
+        )
+    }
+    pub(crate) fn inspect_with_model_control<E: ModelEquation>(
+        recipe: &E,
+        environment: &OriginalCopyEnvironment<'_>,
+        preparation_graph_bytes: usize,
+        preparation_mutable_bytes: usize,
+        model_control: Option<SpeculativeModelControlQuote>,
+    ) -> Result<Self, EmbeddedNativeCause> {
+        let (completion, graph_capacity, record_capacity, kernels, query_controls) = recipe
+            .equation_domains(preparation_graph_bytes)
+            .map_err(|cause| cause.at_speculative_stage("embedded equation native domains"))?;
         let runtime = environment
             .input_runtime()
             .map_err(OriginalSpeculativeDomainError::from)?;
@@ -127,6 +149,13 @@ impl EmbeddedNativeLayout {
                 .map_err(|_| EmbeddedNativeCause::Overflow)?,
             )
             .checked_add(preparation_mutable_bytes)
+            .and_then(|n| {
+                n.checked_add(
+                    model_control
+                        .as_ref()
+                        .map_or(0, |quote| quote.backing_bytes()),
+                )
+            })
             .ok_or(EmbeddedNativeCause::Overflow)?;
         let graph =
             safemlx::PreparedSubmissionGraphQuota::<OriginalSpeculativeBudgetCustody>::layout(
@@ -143,6 +172,7 @@ impl EmbeddedNativeLayout {
             .map_err(OriginalSpeculativeDomainError::from)?;
         let parts = [
             size_of::<Self>(),
+            parallel::control_bytes().ok_or(EmbeddedNativeCause::Overflow)?,
             size_of::<u64>(),
             size_of::<Result<Self, EmbeddedNativeCause>>(),
             size_of::<OriginalSpeculativeDomains>(),
@@ -152,9 +182,12 @@ impl EmbeddedNativeLayout {
             roots.host_bytes().ok_or(EmbeddedNativeCause::Overflow)?,
             rc_bytes::<RefCell<safemlx::PrefillRoots>>().ok_or(EmbeddedNativeCause::Overflow)?,
             population.control_bytes(),
-            usize::try_from(recipe.validation_control_bytes()
-                .map_err(|cause| cause.at_speculative_stage("embedded validation controls"))?)
-                .map_err(|_| EmbeddedNativeCause::Overflow)?,
+            usize::try_from(
+                recipe
+                    .validation_control_bytes()
+                    .map_err(|cause| cause.at_speculative_stage("embedded validation controls"))?,
+            )
+            .map_err(|_| EmbeddedNativeCause::Overflow)?,
             safemlx::PreparedOriginalBufferBudget::<OriginalSpeculativeBudgetCustody>::layout(
                 &runtime,
                 physical_capacity,
@@ -174,7 +207,8 @@ impl EmbeddedNativeLayout {
             safemlx::OriginalNativeControlLayout::inspect()?.fixed_control_bytes,
             safemlx::original_scoped_evaluation_control_bytes()
                 .ok_or(EmbeddedNativeCause::Missing("scoped evaluation controls"))?,
-            OriginalCopyEnvironment::control_bytes().ok_or(EmbeddedNativeCause::Missing("copy environment controls"))?,
+            OriginalCopyEnvironment::control_bytes()
+                .ok_or(EmbeddedNativeCause::Missing("copy environment controls"))?,
             completion
                 .graph
                 .control_bytes()
@@ -188,7 +222,8 @@ impl EmbeddedNativeLayout {
             .try_fold(size_of_val(&parts), usize::checked_add)
             .and_then(|n| u64::try_from(n).ok())
             .ok_or(EmbeddedNativeCause::Overflow)?;
-        let host_workspace = trace.host_workspace_bytes()
+        let host_workspace = trace
+            .host_workspace_bytes()
             .ok_or(EmbeddedNativeCause::Missing("equation host workspace"))?;
         let native_controls = controls
             .checked_add(query_controls)
@@ -207,6 +242,7 @@ impl EmbeddedNativeLayout {
             record_bytes: u64::try_from(record.total_bytes().ok_or(EmbeddedNativeCause::Overflow)?)
                 .map_err(|_| EmbeddedNativeCause::Overflow)?,
             native_controls,
+            model_control,
         })
     }
     pub(crate) fn physical_bytes(&self) -> Option<u64> {
@@ -221,10 +257,18 @@ impl EmbeddedNativeLayout {
     /// Actual caller closures and result representations are included before
     /// role admission. Payload allocations and source/transfer banks are quoted
     /// by their producers; this accounts for their outer retained value.
-    pub(crate) fn control_bytes<Q: 'static, W, T, B, F, G, H>(&self, handlers: &(F, G, H)) -> Option<u64> {
-        self.control_bytes_for_role::<OriginalEmbeddedSpeculativeRole, Q, W, T, B, F, G, H>(handlers)
+    pub(crate) fn control_bytes<Q: 'static, W, T, B, F, G, H>(
+        &self,
+        handlers: &(F, G, H),
+    ) -> Option<u64> {
+        self.control_bytes_for_role::<OriginalEmbeddedSpeculativeRole, Q, W, T, B, F, G, H>(
+            handlers,
+        )
     }
-    pub(crate) fn control_bytes_for_role<R: ModelRole, Q: 'static, W, T, B, F, G, H>(&self, _: &(F, G, H)) -> Option<u64> {
+    pub(crate) fn control_bytes_for_role<R: ModelRole, Q: 'static, W, T, B, F, G, H>(
+        &self,
+        _: &(F, G, H),
+    ) -> Option<u64> {
         let parts = [
             size_of::<R>(),
             size_of::<Retained<Q>>(),
@@ -242,7 +286,7 @@ impl EmbeddedNativeLayout {
                 &PrefillRootsRuntime,
             )>(),
             size_of::<(F, G, H)>(),
-            size_of::<(&mut W, &Q, &SubmissionScope)>(),
+            size_of::<(&mut W, &Q, &SubmissionScope, OriginalMaterializedLoan<'_>)>(),
             size_of::<(&mut W, &Q, &ActiveEmbeddedNativeInvocation<'_, R>)>(),
             size_of::<EmbeddedNativeCause>(),
             size_of::<Failure>(),
@@ -280,6 +324,7 @@ impl EmbeddedNativeLayout {
         recipe: &R::Equation,
         environment: &OriginalCopyEnvironment<'_>,
         roots_runtime: &PrefillRootsRuntime,
+        request: &OriginalSpeculativeRequest,
         role: R,
         payload: Q,
         funding: HostMetadataFunding,
@@ -287,7 +332,7 @@ impl EmbeddedNativeLayout {
         handlers: (F, G, H),
     ) -> Result<T, Error>
     where
-        F: FnOnce(&mut W, &Q, &SubmissionScope) -> Result<B, Error>,
+        F: FnOnce(&mut W, &Q, &SubmissionScope, OriginalMaterializedLoan<'_>) -> Result<B, Error>,
         G: FnOnce(&mut W, &Q, &ActiveEmbeddedNativeInvocation<'_, R>) -> Result<T, Error>,
         H: FnOnce(
             &mut W,
@@ -299,7 +344,8 @@ impl EmbeddedNativeLayout {
         if !self.plan.same_plan(recipe.plan()) || self.workspace != recipe.identity() {
             return Err(failure(EmbeddedNativeCause::Source, &role));
         }
-        role.validate_equation(recipe).map_err(|cause| failure(cause.into(), &role))?;
+        role.validate_equation(recipe)
+            .map_err(|cause| failure(cause.into(), &role))?;
         if self.physical_bytes() != Some(role.physical_bytes())
             || self.graph_bytes != role.graph_bytes()
             || self.record_bytes != role.record_bytes()
@@ -317,7 +363,8 @@ impl EmbeddedNativeLayout {
             self.completion.traversal.roots(),
         )
         .map_err(|cause| failure(cause.into(), &role))?;
-        let ingress = role.prepare_validations(recipe)
+        let ingress = role
+            .prepare_validations(recipe)
             .map_err(|cause| failure(cause.into(), &role))?;
         let graph = domains.graph.clone();
         let record = domains.record.clone();
@@ -328,6 +375,7 @@ impl EmbeddedNativeLayout {
             payload,
             funding,
             custody: role.budget_custody(),
+            source: None,
         };
         let mut recovery = PreparedRecovery::new(retained, role.budget_custody())
             .map_err(|error| failure(error.cause.into(), &role))?
@@ -341,31 +389,74 @@ impl EmbeddedNativeLayout {
                     .enable_scoped_observation()
                     .map_err(EmbeddedNativeCause::Observation)?;
                 scope.require_original_native_controls()?;
-                roots.0.borrow_mut().bind_scope(scope).map_err(OriginalSpeculativeDomainError::from)?;
+                roots
+                    .0
+                    .borrow_mut()
+                    .bind_scope(scope)
+                    .map_err(OriginalSpeculativeDomainError::from)?;
                 scope.enable_original_native_controls()?;
-                scope.bind_original_buffer_budget(&buffer).map_err(OriginalSpeculativeDomainError::from)?;
+                scope
+                    .bind_original_buffer_budget(&buffer)
+                    .map_err(OriginalSpeculativeDomainError::from)?;
                 Ok(())
             })
             .map_err(|cause| failure(cause, &role))?;
         let observer = OriginalScopeObserver::require_current()
             .map_err(|cause| failure(cause.into(), &role))?;
+        let parallel = recipe
+            .record()
+            .parallel()
+            .map(|source| source.try_clone_for_retention())
+            .transpose()?;
+        if parallel.is_some() != self.model_control.is_some() {
+            return Err(failure(EmbeddedNativeCause::Source, &role));
+        }
+        let model_role = role.model_role();
+        let control = self
+            .model_control
+            .as_ref()
+            .map(|quote| {
+                quote.activate_role(
+                    request,
+                    &model_role,
+                    &buffer,
+                    &observer,
+                    quote.metadata_funding(),
+                )
+            })
+            .transpose()?;
+        let source = EmbeddedRootOwner::new(
+            roots.clone(),
+            observer.clone(),
+            self.completion,
+            parallel,
+            control,
+            model_role,
+            safemlx::StreamCopyPlan::capture(environment.stream())
+                .map_err(|_| failure(EmbeddedNativeCause::Source, &role))?,
+            recovery.retention().funding.clone(),
+        );
+        recovery.retention_mut().source = Some(source.clone());
         let active = ActiveEmbeddedNativeInvocation {
-            roots: &roots,
-            observer: &observer,
+            source: source.inner(),
             buffer: &buffer,
             role: &role,
-            completion: self.completion,
             stream: environment.stream(),
             ingress: RefCell::new(ingress),
             validations: RefCell::new(None),
-            graph: RefCell::new(None),
-            started: Cell::new(false),
-            completed: Cell::new(false),
         };
         let (bind, execute, publish) = handlers;
         let result = recovery.configure_scope_with_retention(|scope, retained| {
-            let bank = bind(work, &retained.payload, scope)
-                .map_err(|cause| failure(cause.into(), &role))?;
+            let bank = bind(
+                work,
+                &retained.payload,
+                scope,
+                OriginalMaterializedLoan {
+                    budget: &buffer,
+                    funding: &retained.funding,
+                },
+            )
+            .map_err(|cause| failure(cause.into(), &role))?;
             let construction = Construction(&active);
             let result = execute(work, &retained.payload, &active)
                 .map_err(|cause| failure(cause.into(), &role));
@@ -379,7 +470,9 @@ impl EmbeddedNativeLayout {
         });
         recovery.seal();
         let output = result?;
-        let status = recovery.finish().map_err(|cause| failure(cause.into_error().into(), &role))?;
+        let status = recovery
+            .finish()
+            .map_err(|cause| failure(cause.into_error().into(), &role))?;
         if !status.settled || status.failed || status.blocked {
             return Err(failure(EmbeddedNativeCause::Completion, &role));
         }
@@ -391,7 +484,8 @@ impl EmbeddedNativeLayout {
         ) {
             return Err(failure(EmbeddedNativeCause::Completion, &role));
         }
-        publish(work, &output, &buffer, &role.budget_custody()).map_err(|cause| failure(cause.into(), &role))?;
+        publish(work, &output, &buffer, &role.budget_custody())
+            .map_err(|cause| failure(cause.into(), &role))?;
         Ok(output)
     }
 }
@@ -401,28 +495,40 @@ struct Retained<Q: 'static> {
     payload: Q,
     funding: HostMetadataFunding,
     custody: OriginalSpeculativeBudgetCustody,
+    source: Option<EmbeddedRootOwner>,
 }
 impl<Q: 'static> Retention for Retained<Q> {
     fn observe(&self, _: Status) {}
 }
 
 /// Lexically borrowed from its actual scope, so it cannot outlive recovery.
-pub(crate) struct ActiveEmbeddedNativeInvocation<'a, R: ModelRole = OriginalEmbeddedSpeculativeRole> {
-    roots: &'a OriginalSpeculativeRoots,
-    observer: &'a OriginalScopeObserver,
+pub(crate) struct ActiveEmbeddedNativeInvocation<'a, R: ModelRole = OriginalEmbeddedSpeculativeRole>
+{
+    source: &'a std::rc::Rc<EmbeddedRootSource>,
     buffer: &'a OriginalBufferBudget,
     role: &'a R,
-    completion: ResidentCompletionRecipe,
     stream: &'a Stream,
     ingress: RefCell<TokenValidationIngress>,
     validations: RefCell<Option<TokenValidationScope>>,
-    graph: RefCell<Option<safemlx::PreparedResidentGraph>>,
-    started: Cell<bool>,
-    completed: Cell<bool>,
+}
+impl<R: ModelRole> std::ops::Deref for ActiveEmbeddedNativeInvocation<'_, R> {
+    type Target = EmbeddedRootSource;
+    fn deref(&self) -> &Self::Target {
+        self.source
+    }
 }
 impl<R: ModelRole> ActiveEmbeddedNativeInvocation<'_, R> {
     pub(crate) fn observer(&self) -> &OriginalScopeObserver {
-        self.observer
+        &self.observer
+    }
+    pub(crate) fn parallel_projection(&self) -> EmbeddedParallelInvocation {
+        EmbeddedParallelInvocation::new(self.source)
+    }
+    pub(super) fn bind_initialized(
+        &self,
+        bank: Option<eredu_runtime::working_memory::OriginalHostSourceBank>,
+    ) -> Result<(), Error> {
+        self.source.bind_initialized(bank)
     }
     pub(crate) fn budget(&self) -> &OriginalBufferBudget {
         self.buffer
@@ -431,22 +537,28 @@ impl<R: ModelRole> ActiveEmbeddedNativeInvocation<'_, R> {
         self.role
     }
     fn authenticate(&self) -> Result<(), EmbeddedNativeCause> {
-        if !self
-            .observer
-            .same_scope(&OriginalScopeObserver::require_current()?)
-        {
-            return Err(EmbeddedNativeCause::Source);
-        }
-        Ok(())
+        self.source
+            .authenticate(false)
+            .map_err(EmbeddedNativeCause::Backend)
     }
     /// Reuses only this invocation's already installed prepared validation
     /// collector. An equal stream alone cannot admit an ordinary collector.
     pub(crate) fn validate_equation_scope(&self, stream: &Stream) -> Result<(), Error> {
         let result = (|| -> Result<(), EmbeddedNativeCause> {
             self.authenticate()?;
-            if stream != self.stream || !self.started.get() || self.completed.get()
-                || self.validations.try_borrow().map_err(|_| EmbeddedNativeCause::Source)?.is_none()
-                || self.graph.try_borrow().map_err(|_| EmbeddedNativeCause::Source)?.is_none()
+            if stream != self.stream
+                || !self.started.get()
+                || self.completed.get()
+                || self
+                    .validations
+                    .try_borrow()
+                    .map_err(|_| EmbeddedNativeCause::Source)?
+                    .is_none()
+                || self
+                    .graph
+                    .try_borrow()
+                    .map_err(|_| EmbeddedNativeCause::Source)?
+                    .is_none()
             {
                 return Err(EmbeddedNativeCause::Source);
             }
@@ -464,7 +576,7 @@ impl<R: ModelRole> ActiveEmbeddedNativeInvocation<'_, R> {
             *self.validations.borrow_mut() = Some(self.ingress.borrow_mut().begin()?);
             let mut graph = safemlx::OperationEvent::prepare_resident_graph(
                 self.completion.graph,
-                self.observer,
+                &self.observer,
             )?;
             if self.completion.nested_completions != 0 {
                 graph.configure_nested_completions(
@@ -491,12 +603,7 @@ impl<R: ModelRole> ActiveEmbeddedNativeInvocation<'_, R> {
             if self.completed.get() || !self.started.get() {
                 return Err(EmbeddedNativeCause::Source);
             }
-            drop(
-                self.graph
-                    .borrow_mut()
-                    .take()
-                    .ok_or(EmbeddedNativeCause::Source)?,
-            );
+            self.source.finish_graph()?;
             let mut roots = self.roots.0.borrow_mut();
             let mut appended = Ok(());
             visit(&mut |value| {
@@ -505,22 +612,25 @@ impl<R: ModelRole> ActiveEmbeddedNativeInvocation<'_, R> {
                 }
             })?;
             appended.map_err(OriginalSpeculativeDomainError::from)?;
-            crate::backend::nn::tensor::append_active_token_validation_roots(&mut roots).map_err(OriginalSpeculativeDomainError::from)?;
+            crate::backend::nn::tensor::append_active_token_validation_roots(&mut roots)
+                .map_err(OriginalSpeculativeDomainError::from)?;
             roots.complete_current_scope_on_stream_prepared(
                 self.stream,
                 &self.completion.traversal,
             )?;
-            crate::backend::nn::tensor::validate_active_original_token_validations(self.observer)?;
+            crate::backend::nn::tensor::validate_active_original_token_validations(&self.observer)?;
             self.completed.set(true);
             Ok(())
         })();
         result.map_err(|cause| failure(cause, self.role))
     }
 }
-struct Construction<'a, R: ModelRole = OriginalEmbeddedSpeculativeRole>(&'a ActiveEmbeddedNativeInvocation<'a, R>);
+struct Construction<'a, R: ModelRole = OriginalEmbeddedSpeculativeRole>(
+    &'a ActiveEmbeddedNativeInvocation<'a, R>,
+);
 impl<R: ModelRole> Drop for Construction<'_, R> {
     fn drop(&mut self) {
-        drop(self.0.graph.borrow_mut().take());
+        self.0.source.close();
         drop(self.0.validations.borrow_mut().take());
     }
 }

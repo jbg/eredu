@@ -332,6 +332,6 @@ pub(crate) use provider::{AddressableRequestOwner,AddressableExecutionRow};
 pub(crate) mod request_sources;
 
 mod speculative;
-pub(crate) use speculative::{SpeculativeAddressableSources,SpeculativeAddressableSpan};
+pub(crate) use speculative::{SpeculativeAddressableSources,SpeculativeAddressableSpan,prepare_wrapper_funding};
 
 use eredu_nn::workspace::WorkspaceMetadataAllocation;

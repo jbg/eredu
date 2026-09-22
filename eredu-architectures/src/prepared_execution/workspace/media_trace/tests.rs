@@ -1,6 +1,6 @@
 use super::*;
-use eredu_nn::{Tensor, workspace::*};
-use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use eredu_nn::{workspace::*, Tensor};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 use std::convert::Infallible;
 
 #[derive(Debug)]
@@ -46,10 +46,10 @@ impl WorkspaceFactMechanisms for MissingFacts {
 #[test]
 fn checked_cut_keeps_later_operations_and_report_alias_keeps_planning_custody() {
     let capacity = 1 << 24;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let funding = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(&execution, crate::memory_fixture::limits(&pool, capacity))
         .unwrap();
     let context = WorkspaceContext::new_with_metadata_funding(MissingFacts, funding).unwrap();
     let geometry = InferenceGeometry {
@@ -78,20 +78,18 @@ fn checked_cut_keeps_later_operations_and_report_alias_keeps_planning_custody() 
     assert_eq!(report.completed_spans(), 3);
     assert_eq!(intervals.len(), 3);
     assert!(report.first_gap().is_some(), "missing facts became a bound");
-    assert!(
-        intervals
-            .iter()
-            .all(|interval| interval.operations.len() == 2)
-    );
-    let charged = pool.used_bytes().unwrap();
+    assert!(intervals
+        .iter()
+        .all(|interval| interval.operations.len() == 2));
+    let charged = crate::memory_fixture::used(&pool).unwrap();
     assert!(charged > 0);
     drop(context);
     drop(report);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
     let last = intervals[0].clone();
     drop(intervals);
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), charged);
     assert_eq!(last.operations.len(), 2);
     drop(last);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }

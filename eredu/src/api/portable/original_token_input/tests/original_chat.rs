@@ -1,5 +1,6 @@
 use super::super::chat::compile_original_chat_file;
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use crate::runtime::chat::ChatTemplateRequest;
 use eredu_core::generation::SemanticEvent;
 use eredu_runtime::working_memory::OriginalTextSourceBudget;
@@ -27,13 +28,13 @@ impl<M: Clone + 'static> OriginalChatBackend for Backend<M> {
         runtime: &ModelRuntime<Self>,
         template: &OriginalChatTemplate,
         tokenizer: &OriginalTokenizer,
-        capacity: u64,
+        capacity: &MemoryLimitDeclarations,
     ) -> Result<OriginalChatProfilePreparation, OriginalChatProfileError> {
         OriginalChatProfilePreparation::new(
             template,
             tokenizer,
             &runtime.backend().execution,
-            capacity,
+            capacity.resolve(runtime.backend().pool.topology()).unwrap(),
         )
     }
 
@@ -163,7 +164,10 @@ fn chat_settings() -> crate::api::PreparedChatGenerationSettings {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(u64::MAX),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(u64::MAX),
+            )]),
             ..Default::default()
         },
         ..Default::default()
@@ -192,7 +196,7 @@ fn public_chat_file_render_encode_and_shared_cursor_preserve_cached_outputs() {
             ModelKind::Llama,
             &cancellation,
         );
-        let cold = pool.used_bytes().unwrap();
+        let cold = pool.live_charge_bytes().unwrap();
         let reference = tokenizers::Tokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap();
         let mut ordinary = ChatTokenizer::from_tokenizer(reference.clone());
         let selected = eredu_text::tokenizer::load_model_chat_template_from_str(CHAT_CONFIG)
@@ -216,7 +220,12 @@ fn public_chat_file_render_encode_and_shared_cursor_preserve_cached_outputs() {
                 .unwrap();
             let expected_ids = reference.encode(expected.as_str(), false).unwrap();
             let prepared = model
-                .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &chat,
+                    &crate::memory_fixture::limits(u64::MAX),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(prepared.rendered_prompt(), expected);
@@ -249,22 +258,22 @@ fn public_chat_file_render_encode_and_shared_cursor_preserve_cached_outputs() {
             drop(output);
             drop(prepared);
             assert_eq!(retained_render.prompt(generation), expected);
-            let with_alias = pool.used_bytes().unwrap();
+            let with_alias = pool.live_charge_bytes().unwrap();
             drop(retained_render);
             assert!(
-                pool.used_bytes().unwrap() < with_alias,
+                pool.live_charge_bytes().unwrap() < with_alias,
                 "render and execution token ownership retire independently"
             );
-            assert!(pool.used_bytes().unwrap() > cold);
+            assert!(pool.live_charge_bytes().unwrap() > cold);
             if let Some(previous) = previous.replace(ids) {
                 assert_eq!(previous.as_ref(), &[0, 8, 0]);
             }
         }
         drop((source, tokenizer, model));
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.live_charge_bytes().unwrap() > 0);
         assert_eq!(previous.as_ref().unwrap().as_ref(), &[0, 8, 0]);
         drop(previous);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -286,7 +295,12 @@ fn literal_chat_preserves_special_spellings_and_caller_stop_output() {
                     &cancellation,
                 );
                 let prepared = model
-                    .prepare_chat(&source, &request(), u64::MAX, &cancellation)
+                    .prepare_chat(
+                        &source,
+                        &request(),
+                        &crate::memory_fixture::limits(u64::MAX),
+                        &cancellation,
+                    )
                     .unwrap()
                     .unwrap();
                 let stops = ["hi".to_owned()];
@@ -338,7 +352,7 @@ fn literal_chat_preserves_special_spellings_and_caller_stop_output() {
                 assert_eq!(output.finish_reason, reason);
                 assert_eq!(finishes, [reason]);
                 drop((output, prepared, source, tokenizer, model));
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.live_charge_bytes().unwrap(), 0);
             }
         }
     }
@@ -349,19 +363,17 @@ fn public_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes
     let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
     let cancelled = GenerationCancellationToken::new();
     cancelled.cancel();
-    assert!(
-        compile_original_chat_file(
-            &runtime,
-            tempfile::tempfile().unwrap(),
-            "smol",
-            false,
-            &cancelled
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(compile_original_chat_file(
+        &runtime,
+        tempfile::tempfile().unwrap(),
+        "smol",
+        false,
+        &cancelled
+    )
+    .unwrap()
+    .is_none());
     assert_eq!(facts.borrow().chat_sources, 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     drop(runtime);
     for phase in ["render", "stop", "encode", "short", "changed_capacity"] {
         let (runtime, facts, pool) = bare_runtime_with_capacity(u64::MAX);
@@ -375,22 +387,27 @@ fn public_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes
             ModelKind::Llama,
             &cancellation,
         );
-        let cold = pool.used_bytes().unwrap();
+        let cold = pool.live_charge_bytes().unwrap();
         if phase == "render" {
             facts.borrow_mut().cancel_after_render = Some(cancellation.clone());
         }
         let prepared = model
-            .prepare_chat(&source, &request(), u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &request(),
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap();
         if phase == "render" {
             assert!(prepared.is_none());
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.live_charge_bytes().unwrap(), cold);
             assert_eq!(facts.borrow().stops, 0);
             assert_eq!(facts.borrow().encodes, 0);
             continue;
         }
         let prepared = prepared.unwrap();
-        let prepared_bytes = pool.used_bytes().unwrap();
+        let prepared_bytes = pool.live_charge_bytes().unwrap();
         if phase == "stop" {
             facts.borrow_mut().cancel_after_stops = Some(cancellation.clone());
         }
@@ -402,7 +419,10 @@ fn public_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes
         }
         let mut settings = chat_settings();
         if phase == "changed_capacity" {
-            settings.inference.managed_memory_capacity_bytes = Some(u64::MAX - 1);
+            settings.inference.memory_limits = eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(u64::MAX - 1),
+            )]);
         }
         let stops = ["hi".to_owned()];
         let mut invocation = literal_request(&prepared, settings);
@@ -413,7 +433,7 @@ fn public_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes
                 assert!(result.unwrap().is_none());
                 assert_eq!(facts.borrow().stops, 1);
                 assert_eq!(facts.borrow().encodes, usize::from(phase == "encode"));
-                assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+                assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
             }
             "short" | "changed_capacity" => {
                 let error = match result {
@@ -427,22 +447,22 @@ fn public_chat_cancellation_and_late_startup_failures_keep_exact_owner_lifetimes
                     );
                     assert_eq!(facts.borrow().stops, 0);
                     assert_eq!(facts.borrow().encodes, 0);
-                    assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+                    assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
                 } else {
                     assert_eq!(facts.borrow().stops, 1);
                     assert_eq!(facts.borrow().encodes, 1);
-                    assert!(pool.used_bytes().unwrap() > prepared_bytes);
+                    assert!(pool.live_charge_bytes().unwrap() > prepared_bytes);
                 }
                 assert!(!facts.borrow().order.contains(&"submit"));
                 drop(error);
-                assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+                assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
             }
             _ => unreachable!(),
         }
         drop(prepared);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.live_charge_bytes().unwrap(), cold);
         drop((source, tokenizer, model));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
@@ -459,9 +479,14 @@ fn invalid_chat_eos_refuses_before_native_submission() {
         ModelKind::Llama,
         &cancellation,
     );
-    let cold = pool.used_bytes().unwrap();
+    let cold = pool.live_charge_bytes().unwrap();
     model.eos_token_ids = vec![u32::MAX];
-    match model.prepare_chat(&source, &request(), u64::MAX, &cancellation) {
+    match model.prepare_chat(
+        &source,
+        &request(),
+        &crate::memory_fixture::limits(u64::MAX),
+        &cancellation,
+    ) {
         Err(error) => drop(error),
         Ok(Some(prepared)) => {
             let error = match model
@@ -475,9 +500,9 @@ fn invalid_chat_eos_refuses_before_native_submission() {
         Ok(None) => panic!("request was not cancelled"),
     }
     assert!(!facts.borrow().order.contains(&"submit"));
-    assert_eq!(pool.used_bytes().unwrap(), cold);
+    assert_eq!(pool.live_charge_bytes().unwrap(), cold);
     drop((source, tokenizer, model));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -492,33 +517,36 @@ fn chat_caller_ceiling_precedes_render_and_survives_preparation_failure() {
         ModelKind::Llama,
         &cancellation,
     );
-    let cold = pool.used_bytes().unwrap();
+    let cold = pool.live_charge_bytes().unwrap();
     for capacity in [1, cold + source_budget_bytes()] {
         let error = model
-            .prepare_chat(&source, &request(), capacity, &cancellation)
+            .prepare_chat(
+                &source,
+                &request(),
+                &crate::memory_fixture::limits(capacity),
+                &cancellation,
+            )
             .unwrap_err();
         assert_eq!(facts.borrow().chat_renders, 0);
         assert_eq!(facts.borrow().stops, 0);
         assert_eq!(facts.borrow().encodes, 0);
         assert!(facts.borrow().order.is_empty());
         if capacity != 1 {
-            assert_eq!(pool.used_bytes().unwrap(), capacity);
-            assert!(
-                Backend::prepare_original_text_source_budget(
-                    &model.runtime,
-                    tokenizer.original(),
-                    u64::MAX
-                )
-                .is_err()
-            );
+            assert_eq!(pool.live_charge_bytes().unwrap(), capacity);
+            assert!(Backend::prepare_original_text_source_budget(
+                &model.runtime,
+                tokenizer.original(),
+                &crate::memory_fixture::limits(u64::MAX)
+            )
+            .is_err());
         } else {
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.live_charge_bytes().unwrap(), cold);
         }
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.live_charge_bytes().unwrap(), cold);
     }
     drop((source, tokenizer, model));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -533,7 +561,7 @@ fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_executio
         ModelKind::Llama,
         &cancellation,
     );
-    let cold = pool.used_bytes().unwrap();
+    let cold = pool.live_charge_bytes().unwrap();
     for case in [0, 1, 2, 6, 7] {
         let mut input = request();
         match case {
@@ -554,7 +582,12 @@ fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_executio
         let renders = facts.borrow().chat_renders;
         if matches!(case, 0 | 1) {
             let prepared = model
-                .prepare_chat(&source, &input, u64::MAX, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &input,
+                    &crate::memory_fixture::limits(u64::MAX),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap();
             assert!(!prepared.text_generation_support().is_supported());
@@ -572,11 +605,16 @@ fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_executio
             assert_eq!(facts.borrow().encodes, 0);
             assert!(!facts.borrow().order.contains(&"submit"));
             drop((error, prepared));
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.live_charge_bytes().unwrap(), cold);
             continue;
         }
         let error = model
-            .prepare_chat(&source, &input, u64::MAX, &cancellation)
+            .prepare_chat(
+                &source,
+                &input,
+                &crate::memory_fixture::limits(u64::MAX),
+                &cancellation,
+            )
             .unwrap_err();
         if case != 2 {
             assert_eq!(facts.borrow().chat_renders, renders);
@@ -585,10 +623,15 @@ fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_executio
         assert_eq!(facts.borrow().encodes, 0);
         assert!(!facts.borrow().order.contains(&"submit"));
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), cold, "case {case}");
+        assert_eq!(pool.live_charge_bytes().unwrap(), cold, "case {case}");
     }
     let prepared = model
-        .prepare_chat(&source, &request(), u64::MAX, &cancellation)
+        .prepare_chat(
+            &source,
+            &request(),
+            &crate::memory_fixture::limits(u64::MAX),
+            &cancellation,
+        )
         .unwrap()
         .unwrap();
     let (other_runtime, other_facts, other_pool) = bare_runtime_with_capacity(u64::MAX);
@@ -600,7 +643,7 @@ fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_executio
         ModelKind::Llama,
         &cancellation,
     );
-    let other_cold = other_pool.used_bytes().unwrap();
+    let other_cold = other_pool.live_charge_bytes().unwrap();
     let error = match other
         .start_prepared_chat(literal_request(&prepared, chat_settings()), &cancellation)
     {
@@ -615,11 +658,11 @@ fn invalid_chat_request_and_equal_content_foreign_sources_reject_before_executio
     assert_eq!(other_facts.borrow().encodes, 0);
     assert!(other_facts.borrow().order.is_empty());
     drop(error);
-    assert_eq!(other_pool.used_bytes().unwrap(), other_cold);
+    assert_eq!(other_pool.live_charge_bytes().unwrap(), other_cold);
     drop((other_source, other_tokenizer, other));
-    assert_eq!(other_pool.used_bytes().unwrap(), 0);
+    assert_eq!(other_pool.live_charge_bytes().unwrap(), 0);
     drop((prepared, source, tokenizer, model));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -668,7 +711,7 @@ fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
         ModelKind::Llama,
         &cancellation,
     );
-    let cold = pool.used_bytes().unwrap();
+    let cold = pool.live_charge_bytes().unwrap();
     let a = source.original().token_id("a").unwrap();
     let b = source.original().token_id("b").unwrap();
     assert!(!source.original().is_special("a") && !source.original().is_special("b"));
@@ -723,7 +766,12 @@ fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
                     let expected_ids = reference.encode(expected.as_str(), false).unwrap();
                     request.add_generation_prompt = generation;
                     let prepared = model
-                        .prepare_chat(&template, &request, u64::MAX, &cancellation)
+                        .prepare_chat(
+                            &template,
+                            &request,
+                            &crate::memory_fixture::limits(u64::MAX),
+                            &cancellation,
+                        )
                         .unwrap()
                         .unwrap();
                     assert_eq!(prepared.rendered_prompt(), expected);
@@ -732,7 +780,7 @@ fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
                         "<|im_start|>assistant\n"
                     );
                     facts.borrow_mut().ids.clear();
-                    let prepared_used = pool.used_bytes().unwrap();
+                    let prepared_used = pool.live_charge_bytes().unwrap();
                     let prior_actions = facts.borrow().order.len();
                     let mut invocation = literal_request(&prepared, chat_settings());
                     invocation.skip_special_tokens = skip;
@@ -747,12 +795,12 @@ fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
                             error.input_rejection(),
                             Some(TokenInputRejection::Empty)
                         ));
-                        assert!(pool.used_bytes().unwrap() > prepared_used);
+                        assert!(pool.live_charge_bytes().unwrap() > prepared_used);
                         assert_eq!(facts.borrow().order.len(), prior_actions);
                         drop(error);
-                        assert_eq!(pool.used_bytes().unwrap(), prepared_used);
+                        assert_eq!(pool.live_charge_bytes().unwrap(), prepared_used);
                         drop(prepared);
-                        assert_eq!(pool.used_bytes().unwrap(), cold);
+                        assert_eq!(pool.live_charge_bytes().unwrap(), cold);
                         last_ids = Some(Vec::new());
                         rows.push(serde_json::json!({"case":case,"manual":manual,"generation_prompt":generation,"skip_special":skip,"prompt_bytes":0,"input_ids":0,"outcome":"typed_empty_before_I"}));
                         continue;
@@ -778,14 +826,14 @@ fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
                     assert_eq!(output.token_ids.as_ref(), &[a, b, a]);
                     assert_eq!(visible, reference.decode(&[a, b, a], skip).unwrap());
                     let ids = output.token_ids.clone();
-                    let retained = pool.used_bytes().unwrap();
+                    let retained = pool.live_charge_bytes().unwrap();
                     drop(output);
-                    assert_eq!(pool.used_bytes().unwrap(), retained);
+                    assert_eq!(pool.live_charge_bytes().unwrap(), retained);
                     drop(prepared);
-                    assert!(pool.used_bytes().unwrap() > cold);
+                    assert!(pool.live_charge_bytes().unwrap() > cold);
                     assert_eq!(ids.as_ref(), &[a, b, a]);
                     drop(ids);
-                    assert_eq!(pool.used_bytes().unwrap(), cold);
+                    assert_eq!(pool.live_charge_bytes().unwrap(), cold);
                     last_ids = Some(expected_ids.get_ids().to_vec());
                     rows.push(serde_json::json!({"case":case,"manual":manual,"generation_prompt":generation,"skip_special":skip,"prompt_bytes":expected.len(),"input_ids":expected_ids.get_ids().len(),"output_ids":3}));
                 }
@@ -804,7 +852,7 @@ fn released_complete_config_and_tokenizer_use_public_prepared_chat_request() {
     assert_eq!(facts.borrow().encodes, 48);
     assert_eq!(facts.borrow().stops, 48);
     drop((template, source, model));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     println!(
         "ORIGINAL_CHAT_ORACLE_JSON={}",
         serde_json::json!({"scope":"complete pinned config/tokenizer original public prepared chat","config_sha256":inputs.config.sha256,"tokenizer_sha256":inputs.tokenizer.sha256,"public_requests":48,"completed_requests":44,"empty_rejections":4,"rows":rows})

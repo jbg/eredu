@@ -1,5 +1,5 @@
 //! Actual original J/C operations beneath the shared behavioral recognizer.
-use super::{Operations, Probe, ifm, inkling, records};
+use super::{ifm, inkling, records, Operations, Probe};
 use crate::api::request::ChatTemplateRequest;
 use eredu_core::{HostPreparationAuthority, ModelRuntime, TokenInputRejection};
 use eredu_runtime::working_memory::{
@@ -9,8 +9,8 @@ use eredu_runtime::working_memory::{
 };
 use eredu_text::chat_storage::{ChatMessageError, ChatMessages, ChatRenderContext};
 use eredu_text::tokenizer::structural::{
-    StructuralTokenFailure, StructuralTokenSource, resolve_structural_with,
-    structural_control_bytes,
+    resolve_structural_with, structural_control_bytes, StructuralTokenFailure,
+    StructuralTokenSource,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -116,10 +116,10 @@ impl<'a, B: OriginalChatBackend> Original<'a, B> {
         template: &'a OriginalChatTemplate,
         tokenizer: &'a OriginalTokenizer,
         defaults: Option<&'a serde_json::Map<String, serde_json::Value>>,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<Self, Failure> {
         B::validate_original_chat_sources(runtime, template, tokenizer).map_err(Failure::before)?;
-        let preparation = B::prepare_original_chat_profile(runtime, template, tokenizer, capacity)
+        let preparation = B::prepare_original_chat_profile(runtime, template, tokenizer, limits)
             .map_err(Failure::before)?;
         if !preparation.has_sources(template, tokenizer) {
             return Err(Failure::before(TokenInputRejection::IdentityMismatch));

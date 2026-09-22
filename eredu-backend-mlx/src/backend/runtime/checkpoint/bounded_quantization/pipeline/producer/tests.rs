@@ -3,7 +3,7 @@ use crate::backend::runtime::checkpoint::store::{
     ColdMaterializationSlot, MaterializationPayloadShape,
 };
 use eredu_checkpoint::{recipe::EncodedRecipeRead, AffineQuantization};
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
 use safemlx::{Device, DeviceType, PrefillRootsRuntime, PreparedInputRuntime};
 use std::{cell::Cell, rc::Rc};
 
@@ -21,7 +21,7 @@ use encoded_affine::TileError;
 // prerequisites. The pool funds metadata, keys, compiled reads, native work,
 // input, completion slots and queue; this is not full producer admission.
 struct FundedProducer<'a> {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     runtime: &'a PreparedInputRuntime,
     streams: [&'a Stream; 2],
     slots: Vec<usize>,
@@ -48,7 +48,7 @@ impl TileProducer for FundedProducer<'_> {
         if self.fail_at == Some(self.slots.len() - 1) {
             return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound).into());
         }
-        let before_host = self.pool.used_bytes().unwrap();
+        let before_host = self.pool.fixture_host_charge().unwrap();
         let tile = encoded_affine::Tile::prepare::<Invocation>(
             &self.pool,
             self.runtime,
@@ -57,7 +57,7 @@ impl TileProducer for FundedProducer<'_> {
             target,
             quantization,
         )?;
-        let host_bytes = self.pool.used_bytes().unwrap() - before_host;
+        let host_bytes = self.pool.fixture_host_charge().unwrap() - before_host;
         let source_bytes = tile.source_bytes();
         let payload = MaterializationPayloadShape {
             inputs: 1,
@@ -91,7 +91,7 @@ impl TileProducer for FundedProducer<'_> {
             drop(uncalled);
             TileError::Admission(failure)
         })?;
-        peak_used.set(peak_used.get().max(pool.used_bytes().unwrap()));
+        peak_used.set(peak_used.get().max(pool.fixture_host_charge().unwrap()));
         submitted
             .into_result()
             .map(|completion| (completion, source_bytes))
@@ -102,7 +102,7 @@ impl TileProducer for FundedProducer<'_> {
 fn drain(producer: &FundedProducer<'_>) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::reclaim_allocation_owners();
-        producer.pool.used_bytes() == Ok(0)
+        producer.pool.fixture_host_charge() == Ok(0)
     });
     assert_eq!(producer.live.get(), 0);
 }
@@ -161,14 +161,13 @@ fn exercise(
         }),
     )
     .unwrap();
-    let ordinary =
-        QuantizedCheckpoint::create(source.clone(), plan.clone(), &streams[0]).unwrap();
+    let ordinary = QuantizedCheckpoint::create(source.clone(), plan.clone(), &streams[0]).unwrap();
     let prepared = ColdQuantization::prepare(source.into(), plan)
         .unwrap()
         .allocate_ordinary(&streams[0])
         .unwrap();
     let mut producer = FundedProducer {
-        pool: WorkingMemoryPool::new(1 << 20, 0).unwrap(),
+        pool: crate::memory_fixture::ledger(1 << 20, 0).unwrap(),
         runtime: &runtime,
         streams: streams.each_ref(),
         slots: Vec::new(),
@@ -272,7 +271,7 @@ fn producer_failure_retires_the_already_queued_cold_submission() {
         .allocate_ordinary(&streams[0])
         .unwrap();
     let mut producer = FundedProducer {
-        pool: WorkingMemoryPool::new(1 << 20, 0).unwrap(),
+        pool: crate::memory_fixture::ledger(1 << 20, 0).unwrap(),
         runtime: &runtime,
         streams: streams.each_ref(),
         slots: Vec::new(),
@@ -341,7 +340,7 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
         .allocate_ordinary(&streams[0])
         .unwrap();
     let mut producer = FundedProducer {
-        pool: WorkingMemoryPool::new(1 << 20, 0).unwrap(),
+        pool: crate::memory_fixture::ledger(1 << 20, 0).unwrap(),
         runtime: &runtime,
         streams: streams.each_ref(),
         slots: Vec::new(),
@@ -368,15 +367,17 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
     // The first tile retires independently. Mapping the failed second tile
     // retires local native wrappers while keeping its typed input diagnostic.
     assert_eq!(producer.live.get(), 1);
-    assert!(producer.pool.used_bytes().unwrap() > 0);
-    let PipelineAdmissionError::Producer(error) = error else { unreachable!() };
+    assert!(producer.pool.fixture_host_charge().unwrap() > 0);
+    let PipelineAdmissionError::Producer(error) = error else {
+        unreachable!()
+    };
     let diagnostic = error.into_backend_failure();
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::reclaim_allocation_owners();
         producer.live.get() == 0
     });
     assert_eq!(producer.live.get(), 0);
-    assert!(producer.pool.used_bytes().unwrap() > 0);
+    assert!(producer.pool.fixture_host_charge().unwrap() > 0);
     std::thread::spawn(move || {
         let mut cause: &(dyn std::error::Error + 'static) = &diagnostic;
         let input_error = loop {
@@ -438,7 +439,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
             .unwrap()
     };
     let mut producer = FundedProducer {
-        pool: WorkingMemoryPool::new(0, 0).unwrap(),
+        pool: crate::memory_fixture::ledger(0, 0).unwrap(),
         runtime: &runtime,
         streams: streams.each_ref(),
         slots: Vec::new(),
@@ -455,7 +456,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     assert!(matches!(&error, PipelineAdmissionError::Admission(_)));
     assert!(producer.slots.is_empty());
     assert_eq!(producer.live.get(), 0);
-    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+    assert_eq!(producer.pool.fixture_host_charge().unwrap(), 0);
     drop(error);
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
@@ -463,19 +464,22 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let TileError::Metadata(failure) = error else {
         panic!("metadata admission must refuse before inference")
     };
-    let Some(WorkingMemoryError::BudgetExceeded {
-        required_bytes,
-        available_bytes: 0,
-    }) = failure.accounting_failure()
+    let Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded {
+        requested_bytes: required_bytes,
+        limit_bytes,
+        existing_bytes,
+        ..
+    })) = failure.accounting_failure()
     else {
         panic!("exact metadata comparison")
     };
+    assert_eq!(limit_bytes, existing_bytes);
     let metadata_bytes = *required_bytes;
     assert!(failure.constructor_failure().is_none());
     assert_eq!(producer.live.get(), 0);
-    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+    assert_eq!(producer.pool.fixture_host_charge().unwrap(), 0);
     drop(failure);
-    producer.pool = WorkingMemoryPool::new(metadata_bytes, 0).unwrap();
+    producer.pool = crate::memory_fixture::ledger(metadata_bytes, 0).unwrap();
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
@@ -486,17 +490,20 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     };
     assert!(matches!(
         failure.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded {
-            available_bytes: 0,
-            ..
-        })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded {
+                limit_bytes,
+                existing_bytes,
+                ..
+            }
+        ))
     ));
     drop(failure);
-    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+    assert_eq!(producer.pool.fixture_host_charge().unwrap(), 0);
 
     // Construct the actual host prerequisites in a separate sizing run. The
     // retained quote excludes scratch that has already retired after compilation.
-    let sizing = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let sizing = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let target = &plan.targets[0];
     let root: eredu_checkpoint::store::RetainedCheckpointSource = source.clone().into();
     let tile = encoded_affine::Tile::prepare::<Invocation>(
@@ -508,17 +515,17 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         plan.quantization,
     )
     .unwrap();
-    let prerequisites = sizing.used_bytes().unwrap();
-    let construction_peak = sizing.peak_bytes().unwrap();
+    let prerequisites = sizing.fixture_host_charge().unwrap();
+    let construction_peak = sizing.fixture_host_peak().unwrap();
     let role = tile
         .plan(Invocation(Rc::new(Cell::new(1))), &streams[0])
         .unwrap();
     let role_bytes = role.required_bytes().unwrap();
     drop(role);
     drop(tile);
-    assert_eq!(sizing.used_bytes().unwrap(), 0);
+    assert_eq!(sizing.fixture_host_charge().unwrap(), 0);
     assert!(prerequisites + role_bytes - 1 >= construction_peak);
-    producer.pool = WorkingMemoryPool::new(prerequisites + role_bytes - 1, 0).unwrap();
+    producer.pool = crate::memory_fixture::ledger(prerequisites + role_bytes - 1, 0).unwrap();
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
@@ -526,10 +533,10 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         panic!("role comparison must precede native callback")
     };
     assert!(
-        matches!(failure.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == role_bytes && *available_bytes == role_bytes - 1)
+        matches!(failure.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == role_bytes && limit_bytes.checked_sub(*existing_bytes).unwrap() == role_bytes - 1)
     );
     assert_eq!(producer.live.get(), 0);
-    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+    assert_eq!(producer.pool.fixture_host_charge().unwrap(), 0);
     drop(failure);
     let slot_bytes = ColdMaterializationSlot::required_bytes(MaterializationPayloadShape {
         inputs: 1,
@@ -537,7 +544,8 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         pending_sources: 0,
     })
     .unwrap();
-    producer.pool = WorkingMemoryPool::new(prerequisites + role_bytes + slot_bytes - 1, 0).unwrap();
+    producer.pool =
+        crate::memory_fixture::ledger(prerequisites + role_bytes + slot_bytes - 1, 0).unwrap();
     producer.slots.clear();
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
@@ -551,12 +559,12 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         cause = cause.source().expect("typed slot admission cause");
     };
     assert!(
-        matches!(refusal, WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }
-        if *required_bytes == slot_bytes && *available_bytes == slot_bytes - 1)
+        matches!(refusal, WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })
+        if *required_bytes == slot_bytes && limit_bytes.checked_sub(*existing_bytes).unwrap() == slot_bytes - 1)
     );
     assert_eq!(producer.slots, [0]);
     assert_eq!(producer.live.get(), 1);
-    assert_eq!(producer.pool.used_bytes().unwrap(), role_bytes);
+    assert_eq!(producer.pool.fixture_host_charge().unwrap(), role_bytes);
     drop(error);
     drain(&producer);
 }
@@ -586,17 +594,17 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("ADMITTED_CPU_TILES_OK"));
         return;
     }
-    let pool = crate::backend::managed_memory::domain();
-    let baseline = pool.used_bytes().unwrap();
+    let pool = crate::backend::managed_memory::ledger();
+    let baseline = pool.fixture_host_charge().unwrap();
     let resources = cpu_resources::CpuTileResources::prepare(&pool).unwrap();
     resources.validate_pool(&pool).unwrap();
     let controls = resources.original_control_bytes();
-    let persistent = pool.used_bytes().unwrap();
+    let persistent = pool.fixture_host_charge().unwrap();
     assert!(persistent > baseline + controls);
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     assert!(resources.validate_pool(&foreign).is_err());
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), persistent);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent);
     check_cold_metadata_refusals(&pool, &resources, persistent);
     assert_ne!(
         resources.streams()[0].get_index().unwrap(),
@@ -640,21 +648,31 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                 )
                 .unwrap();
                 let source = source.into();
-                let metadata_policy = eredu_runtime::working_memory::DependencyMemoryPolicy::default();
+                let metadata_policy =
+                    eredu_runtime::working_memory::DependencyMemoryPolicy::default();
                 let conversion = admission::ColdConversion {
                     destinations: None,
-                    source: &source, plan: &plan, pool: &pool, resources: &resources, metadata_policy,
+                    source: &source,
+                    plan: &plan,
+                    pool: &pool,
+                    resources: &resources,
+                    metadata_policy,
                 };
-                let metadata_bytes = WorkingMemoryPool::shared_native_initialization_required_bytes(&conversion).unwrap();
+                let metadata_bytes =
+                    MemoryLedger::shared_native_initialization_required_bytes(&conversion).unwrap();
                 let companion_bytes = 16 * plan.targets()[0].affine_companion_bytes();
                 let output_bytes: u64 = [
                     ("weight", [8, 8], 256),
                     ("scales", [8, 2], companion_bytes),
                     ("biases", [8, 2], companion_bytes),
-                ].into_iter().map(|(name, shape, bytes)| {
-                    WorkingMemoryPool::memory_tensor_buffer_quote(name, &shape, bytes, metadata_policy)
-                        .unwrap().total_bytes()
-                }).sum();
+                ]
+                .into_iter()
+                .map(|(name, shape, bytes)| {
+                    MemoryLedger::memory_tensor_buffer_quote(name, &shape, bytes, metadata_policy)
+                        .unwrap()
+                        .total_bytes()
+                })
+                .sum();
                 let with_outputs = persistent + metadata_bytes + output_bytes;
                 // Original source/header birth remains a fixture prerequisite.
                 // The initializer admits cold clones, inference/provenance metadata,
@@ -689,37 +707,58 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                 );
                 crate::backend::submission_recovery::wait_for_retirement(|| {
                     safemlx::reclaim_allocation_owners();
-                    pool.used_bytes() == Ok(with_outputs)
+                    pool.fixture_host_charge() == Ok(with_outputs)
                 });
-                assert_eq!(pool.used_bytes().unwrap(), with_outputs);
+                assert_eq!(pool.fixture_host_charge().unwrap(), with_outputs);
                 let identity = source.identity();
-                let catalog = source.source_keys().into_iter().map(|key| {
-                    let row = eredu_checkpoint::store::PreparedTensorSource {
-                        metadata: source.source_metadata(&key).unwrap(),
-                        provenance: source.source_provenance(&key).unwrap(),
-                    };
-                    (key, row)
-                }).collect();
-                let source = Arc::new(eredu_checkpoint::store::PreparedCheckpointSource::new(
-                    source, catalog,
-                ).unwrap()).into();
+                let catalog = source
+                    .source_keys()
+                    .into_iter()
+                    .map(|key| {
+                        let row = eredu_checkpoint::store::PreparedTensorSource {
+                            metadata: source.source_metadata(&key).unwrap(),
+                            provenance: source.source_provenance(&key).unwrap(),
+                        };
+                        (key, row)
+                    })
+                    .collect();
+                let source = Arc::new(
+                    eredu_checkpoint::store::PreparedCheckpointSource::new(source, catalog)
+                        .unwrap(),
+                )
+                .into();
                 let keys = [String::from("weight")];
-                let read = eredu_checkpoint::store::MemoryEncodedReadPlan::from_source(&source, &keys)
-                    .unwrap().unwrap().construct(()).unwrap();
-                let selected_output_bytes = WorkingMemoryPool::memory_tensor_buffer_quote(
-                    "weight", &[8, 8], 256, metadata_policy,
-                ).unwrap().total_bytes();
+                let read =
+                    eredu_checkpoint::store::MemoryEncodedReadPlan::from_source(&source, &keys)
+                        .unwrap()
+                        .unwrap()
+                        .construct(())
+                        .unwrap();
+                let selected_output_bytes = MemoryLedger::memory_tensor_buffer_quote(
+                    "weight",
+                    &[8, 8],
+                    256,
+                    metadata_policy,
+                )
+                .unwrap()
+                .total_bytes();
                 drop(source);
-                assert_eq!(pool.used_bytes().unwrap(), persistent + metadata_bytes + selected_output_bytes);
+                assert_eq!(
+                    pool.fixture_host_charge().unwrap(),
+                    persistent + metadata_bytes + selected_output_bytes
+                );
                 drop(identity);
-                assert_eq!(pool.used_bytes().unwrap(), persistent + selected_output_bytes);
+                assert_eq!(
+                    pool.fixture_host_charge().unwrap(),
+                    persistent + selected_output_bytes
+                );
                 let mut output = vec![0; expected_words.len()];
                 read.read_into(&mut output).unwrap();
                 assert_eq!(output, expected_words);
-                assert!(pool.used_bytes().unwrap() > persistent);
+                assert!(pool.fixture_host_charge().unwrap() > persistent);
                 drop(read);
                 safemlx::reclaim_allocation_owners();
-                assert_eq!(pool.used_bytes().unwrap(), persistent);
+                assert_eq!(pool.fixture_host_charge().unwrap(), persistent);
             }
         }
     }
@@ -727,76 +766,126 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
     safemlx::reclaim_allocation_owners();
     // The native scheduler, allocator, stream registrations and worker threads
     // really survive these wrappers. Only the composing controls retire here.
-    assert_eq!(pool.used_bytes().unwrap(), persistent - controls);
-    assert!(pool.used_bytes().unwrap() > baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent - controls);
+    assert!(pool.fixture_host_charge().unwrap() > baseline);
     println!("ADMITTED_CPU_TILES_OK");
 }
 
 fn check_cold_metadata_refusals(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     resources: &cpu_resources::CpuTileResources,
     persistent: u64,
 ) {
     use eredu_runtime::working_memory::{DependencyMemoryPolicy, SharedNativeInitializer};
-    let source = Arc::new(MemoryWeightStore::from_safetensors([
-        ("weight".into(), SafeDtype::F32, vec![1, 32], vec![0; 128]),
-        ("scales".into(), SafeDtype::U8, vec![1], vec![7]),
-    ]).unwrap()).into();
+    let source = Arc::new(
+        MemoryWeightStore::from_safetensors([
+            ("weight".into(), SafeDtype::F32, vec![1, 32], vec![0; 128]),
+            ("scales".into(), SafeDtype::U8, vec![1], vec![7]),
+        ])
+        .unwrap(),
+    )
+    .into();
     let plan = BoundedQuantizationPlan::new(
-        AffineQuantization::new(32, 4).unwrap(), 320,
+        AffineQuantization::new(32, 4).unwrap(),
+        320,
         [BoundedQuantizationTarget::direct("weight", "scales", Some("biases")).unwrap()],
-    ).unwrap();
+    )
+    .unwrap();
     let metadata_policy = DependencyMemoryPolicy::default();
-    let conversion = || admission::ColdConversion { destinations: None, source: &source, plan: &plan, pool, resources, metadata_policy };
-    let required = WorkingMemoryPool::shared_native_initialization_required_bytes(&conversion()).unwrap();
-    let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
-    let refusal = admission::ColdConversion { pool: &short, ..conversion() }.prepare().unwrap_err();
-    assert!(matches!(refusal.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+    let conversion = || admission::ColdConversion {
+        destinations: None,
+        source: &source,
+        plan: &plan,
+        pool,
+        resources,
+        metadata_policy,
+    };
+    let required =
+        MemoryLedger::shared_native_initialization_required_bytes(&conversion()).unwrap();
+    let short = crate::memory_fixture::ledger(required - 1, 0).unwrap();
+    let refusal = admission::ColdConversion {
+        pool: &short,
+        ..conversion()
+    }
+    .prepare()
+    .unwrap_err();
+    assert!(matches!(
+        refusal.accounting_failure(),
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
+    ));
     assert!(refusal.constructor_failure().is_none());
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.fixture_host_charge().unwrap(), 0);
     drop(refusal);
 
     let overflow = admission::ColdConversion {
-        metadata_policy: DependencyMemoryPolicy { fixed_bytes: usize::MAX, bytes_per_input_byte: 1 },
+        metadata_policy: DependencyMemoryPolicy {
+            fixed_bytes: usize::MAX,
+            bytes_per_input_byte: 1,
+        },
         ..conversion()
-    }.prepare().unwrap_err();
-    assert!(matches!(overflow.accounting_failure(), Some(WorkingMemoryError::Overflow)));
-    assert_eq!(pool.used_bytes().unwrap(), persistent);
+    }
+    .prepare()
+    .unwrap_err();
+    assert!(matches!(
+        overflow.accounting_failure(),
+        Some(WorkingMemoryError::Overflow)
+    ));
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent);
     drop(overflow);
 
     let enlarged = admission::ColdConversion {
-        metadata_policy: DependencyMemoryPolicy { fixed_bytes: metadata_policy.fixed_bytes + 123, ..metadata_policy },
+        metadata_policy: DependencyMemoryPolicy {
+            fixed_bytes: metadata_policy.fixed_bytes + 123,
+            ..metadata_policy
+        },
         ..conversion()
     };
-    assert_eq!(enlarged.required_storage_bytes().unwrap() - conversion().required_storage_bytes().unwrap(), 123);
+    assert_eq!(
+        enlarged.required_storage_bytes().unwrap() - conversion().required_storage_bytes().unwrap(),
+        123
+    );
     // Known metadata permits admission, then ordinary cold collision checking
     // fails. Its formatted cause keeps the original account until error drop.
     let failure = conversion().prepare().unwrap_err();
     let cause = std::error::Error::source(failure.constructor_failure().unwrap()).unwrap();
-    assert!(matches!(cause.downcast_ref::<Error>(), Some(Error::Quantization(_))));
+    assert!(matches!(
+        cause.downcast_ref::<Error>(),
+        Some(Error::Quantization(_))
+    ));
     fn transferable<T: Send + Sync>(_: &T) {}
     transferable(&failure);
-    assert_eq!(pool.used_bytes().unwrap(), persistent + required);
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent + required);
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), persistent);
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent);
 
     // Exact native destinations are checked after metadata admission but before
     // output allocation or the first payload read.
-    let clean = Arc::new(MemoryWeightStore::from_safetensors([
-        ("weight".into(), SafeDtype::F32, vec![1, 32], vec![0; 128]),
-    ]).unwrap()).into();
+    let clean = Arc::new(
+        MemoryWeightStore::from_safetensors([(
+            "weight".into(),
+            SafeDtype::F32,
+            vec![1, 32],
+            vec![0; 128],
+        )])
+        .unwrap(),
+    )
+    .into();
     let destinations = std::collections::BTreeMap::new();
     let invalid = admission::ColdConversion {
-        source: &clean, destinations: Some(&destinations), ..conversion()
+        source: &clean,
+        destinations: Some(&destinations),
+        ..conversion()
     };
-    let required = WorkingMemoryPool::shared_native_initialization_required_bytes(&invalid).unwrap();
+    let required = MemoryLedger::shared_native_initialization_required_bytes(&invalid).unwrap();
     let error = invalid.prepare().unwrap_err();
     assert!(error.to_string().contains("destination"), "{error}");
-    assert_eq!(pool.used_bytes().unwrap(), persistent + required);
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent + required);
     assert_eq!(clean.source_diagnostics().unwrap().physical_reads, 0);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), persistent);
+    assert_eq!(pool.fixture_host_charge().unwrap(), persistent);
 }
 
 #[test]
@@ -833,22 +922,22 @@ fn cpu_resource_admission_rejects_foreign_and_unquoted_domains_before_runtime_bi
             cause = cause.source().expect("original policy cause");
         }
     }
-    let pool = crate::backend::managed_memory::domain();
-    let before = pool.used_bytes().unwrap();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::backend::managed_memory::ledger();
+    let before = pool.fixture_host_charge().unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let error = cpu_resources::CpuTileResources::prepare(&foreign).unwrap_err();
     assert!(matches!(
         policy(&error),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert!(crate::backend::managed_memory::input_allocator::admitted_initializer(&pool).is_err());
     drop(error);
     let ordinary = pool.acquire_unquoted().unwrap();
     let error = cpu_resources::CpuTileResources::prepare(&pool).unwrap_err();
     assert!(matches!(policy(&error), WorkingMemoryError::UnknownBound));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert!(crate::backend::managed_memory::input_allocator::admitted_initializer(&pool).is_err());
     drop(error);
     drop(ordinary);
@@ -856,3 +945,7 @@ fn cpu_resource_admission_rejects_foreign_and_unquoted_domains_before_runtime_bi
     resources.validate_pool(&pool).unwrap();
     println!("CPU_TILE_RESOURCE_REFUSALS_OK");
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

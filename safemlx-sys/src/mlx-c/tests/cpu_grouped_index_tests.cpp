@@ -49,7 +49,7 @@ TEST_CASE("CPU grouped I32 ArgSort authenticates rows and preserves stable origi
     mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
     struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
     unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-        [](void*p){++*static_cast<unsigned*>(p);})==0);
+        [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
     std::optional<array> escaped;
     {
       Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);
@@ -117,7 +117,7 @@ void scatter_rows(Dtype dtype,const Shape& shape,Stream stream) {
   mlx_prepared_input_runtime runtime{};REQUIRE(mlx_prepared_input_runtime_prepare(&runtime)==0);
   struct Budget{mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}}budget;
   unsigned retired=0;REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,1<<20,&retired,
-      [](void*p){++*static_cast<unsigned*>(p);})==0);
+      [](void*p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::optional<array> escaped;
   {
     Role role;REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()},budget.value)==0);

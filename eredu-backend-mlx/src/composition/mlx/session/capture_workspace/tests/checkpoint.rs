@@ -3,7 +3,7 @@ use eredu_runtime::{
     capture::{FundedCaptureError, ScheduledCaptureBackend},
     working_memory::{
         CaptureRunHostPlan, CaptureTensorClaim, ClaimedCaptureTensor, InferenceExecutionIdentity,
-        WorkingMemoryPool,
+        MemoryLedger,
     },
 };
 
@@ -49,7 +49,7 @@ fn saved_decode_origin_prices_first_native_prefill_and_keeps_capture_quota() {
     ));
     let plan = CaptureRunHostPlan::prepare(&source).unwrap();
     let bytes = plan.initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let layout = StateMemoryLayout::new(
         LayerSchedule::new(1, vec![cache::LayerCachePolicy::NoState]).unwrap(),
         vec![0],
@@ -67,26 +67,30 @@ fn saved_decode_origin_prices_first_native_prefill_and_keeps_capture_quota() {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry: geometry(),
-        activations: bound(bytes),
-        attention: bound(0),
-        vocabulary: bound(0),
-        state_update: bound(0),
-        materialization: bound(0),
-        retained: bound(0),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry: geometry(),
+            activations: bound(bytes),
+            attention: bound(0),
+            vocabulary: bound(0),
+            state_update: bound(0),
+            materialization: bound(0),
+            retained: bound(0),
+        },
+    ))
     .unwrap();
     let (reservation, funding) = pool
         .reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
-            &Admission {
+            &crate::memory_fixture::admission(Admission {
+                additional_headroom: Default::default(),
+                memory_limits: Default::default(),
                 state,
                 requested_positions: 7,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
-            },
-            bytes,
+                incremental_required_bytes: Some(bytes),
+            }),
+            crate::memory_fixture::resolved_limits(bytes),
         )
         .unwrap()
         .into_funding()
@@ -125,19 +129,17 @@ fn saved_decode_origin_prices_first_native_prefill_and_keeps_capture_quota() {
     };
     let context = WorkspaceContext::new(Facts::default());
     let counter = Cell::new(CaptureNativePopulation::default());
-    assert!(
-        CaptureWorkspaceObserver::with_checkpoint_transfers(
-            &checkpoint,
-            InferenceGeometry {
-                cached_positions: 4,
-                ..geometry
-            },
-            None,
-            &context,
-            &counter,
-        )
-        .is_err()
-    );
+    assert!(CaptureWorkspaceObserver::with_checkpoint_transfers(
+        &checkpoint,
+        InferenceGeometry {
+            cached_positions: 4,
+            ..geometry
+        },
+        None,
+        &context,
+        &counter,
+    )
+    .is_err());
     let (mut observer, _) = CaptureWorkspaceObserver::with_checkpoint_transfers(
         &checkpoint,
         geometry,

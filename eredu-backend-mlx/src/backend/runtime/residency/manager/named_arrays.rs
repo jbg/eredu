@@ -1,7 +1,7 @@
 //! Final named value destinations prepared from the actual retained controller.
 //! Names are shared once per request; canonical cells are shared by alias rows.
 //! No shared owner contains a thread-affine native observer.
-use super::{ManagerOwner, ManagerWeak, ResidencyManager, ResidentArrays};
+use super::{ManagerOwner, ManagerWeak, ResidencyControlCustody, ResidencyManager, ResidentArrays};
 use eredu_core::residency::OffloadUnitId;
 use eredu_runtime::{
     residency::{OffloadUnit, ResidencyClosureSlot},
@@ -10,9 +10,9 @@ use eredu_runtime::{
 use safemlx::Array;
 use std::{
     alloc::Layout,
-    collections::{btree_map, BTreeMap, TryReserveError},
+    collections::{BTreeMap, TryReserveError, btree_map},
     ops::{Deref, Index, Range},
-    sync::{atomic::AtomicUsize, Arc, OnceLock, TryLockError, Weak},
+    sync::{Arc, OnceLock, TryLockError, Weak, atomic::AtomicUsize},
 };
 
 /// Fixed failures of a source-bound prepared named-array destination.
@@ -186,7 +186,7 @@ struct NameCatalog {
 #[derive(Clone)]
 pub(crate) struct NameCatalogOwner {
     value: Arc<NameCatalog>,
-    custody: OriginalOperationMetadataCustody,
+    custody: ResidencyControlCustody,
 }
 
 pub(crate) enum NamePreparationCause {
@@ -242,6 +242,14 @@ impl ResidencyManager {
         roots: &[OffloadUnitId],
         scratch: &mut [ResidencyClosureSlot],
         custody: OriginalOperationMetadataCustody,
+    ) -> Result<NameCatalogOwner, NamePreparationError> {
+        self.prepare_name_catalog_with_custody(roots, scratch, custody.into())
+    }
+    pub(super) fn prepare_name_catalog_with_custody(
+        &self,
+        roots: &[OffloadUnitId],
+        scratch: &mut [ResidencyClosureSlot],
+        custody: ResidencyControlCustody,
     ) -> Result<NameCatalogOwner, NamePreparationError> {
         let mut prefix = NameCatalogOwner {
             value: Arc::new(NameCatalog {
@@ -340,6 +348,21 @@ impl ResidencyManager {
 }
 
 impl NameCatalogOwner {
+    pub(crate) fn custody_transport_bytes() -> Option<usize> {
+        let frames = [
+            size_of::<ResidencyControlCustody>(),
+            size_of::<(
+                &ResidencyManager,
+                &[OffloadUnitId],
+                &mut [ResidencyClosureSlot],
+                ResidencyControlCustody,
+            )>(),
+            size_of::<Result<NameCatalogOwner, NamePreparationError>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
     fn coordinate(&self, unit: &OffloadUnitId, name: &str) -> Result<usize, NamedArrayError> {
         let unit = &self.value.units[self.unit_index(unit)?];
         let index = self.value.names[unit.names.clone()]
@@ -445,6 +468,7 @@ impl NameCatalogOwner {
                             publication: OnceLock::new(),
                             value: OnceLock::new(),
                             host_source: OnceLock::new(),
+                            numerical_source: OnceLock::new(),
                             coordinate: table.catalog.value.units[index].names.start + offset,
                             catalog: self.clone(),
                         }),
@@ -581,6 +605,11 @@ pub(crate) struct CanonicalArray {
     // not in Host-tier cache state. Canonical aliases inherit this same cell.
     // Array retirement precedes host source/custody retirement.
     host_source: OnceLock<super::RetainedHostBuffer>,
+    // A selected inspection may populate the reusable manager cache. Its exact
+    // completed budget stays with those physical cells after the query ends.
+    numerical_source: OnceLock<
+        crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource,
+    >,
     coordinate: usize,
     catalog: NameCatalogOwner,
 }
@@ -589,7 +618,7 @@ pub(crate) struct CanonicalArray {
 #[derive(Clone)]
 pub(crate) struct CanonicalArrayOwner {
     cell: Arc<CanonicalArray>,
-    custody: OriginalOperationMetadataCustody,
+    custody: ResidencyControlCustody,
 }
 impl CanonicalArrayOwner {
     pub(crate) fn publication_control_bytes() -> Option<usize> {
@@ -603,8 +632,12 @@ impl CanonicalArrayOwner {
             iterator_bytes(NamedArrays::retained_values),
             size_of::<&Self>(),
             size_of::<Self>(),
+            size_of::<Option<&crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource>>(),
+            safemlx::OriginalBufferInspection::inspection_control_bytes()?,
             size_of::<Arc<CanonicalArray>>(),
             size_of::<OriginalOperationMetadataCustody>(),
+            size_of::<ResidencyControlCustody>(),
+            size_of::<Option<&OriginalOperationMetadataCustody>>(),
             size_of::<Option<PublishedAllocation>>(),
             size_of::<PublishedAllocation>(),
             size_of::<&OnceLock<PublishedAllocation>>(),
@@ -626,11 +659,43 @@ impl CanonicalArrayOwner {
             .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
     }
 
+    pub(crate) fn completed_numerical_source(
+        &self,
+    ) -> Option<&crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource>
+    {
+        self.numerical_source.get()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_host_source(&self) -> Option<&super::RetainedHostBuffer> {
+        self.host_source.get()
+    }
+    pub(crate) fn retain_completed_numerical_source(
+        &self,
+        source:&crate::backend::submission_recovery::native_role::physical::CompletedNumericalSource,
+    ) -> Result<(), safemlx::OriginalBufferCause> {
+        match source.budget().inspect_array(self.array()) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(safemlx::OriginalBufferCause::ForeignDomain) => return Ok(()),
+            Err(cause) => return Err(cause),
+        }
+        match self.numerical_source.set(source.clone()) {
+            Ok(()) => Ok(()),
+            Err(source)
+                if self.numerical_source.get().is_some_and(|old| {
+                    old.account().same_account(source.account())
+                        && old.budget().same_budget(source.budget())
+                }) =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(safemlx::OriginalBufferCause::UncertifiedBacking),
+        }
+    }
     pub(crate) fn array(&self) -> &Array {
         self.value.get().expect("published canonical value")
     }
-    pub(crate) fn custody(&self) -> &OriginalOperationMetadataCustody {
-        &self.custody
+    pub(crate) fn custody(&self) -> Option<&OriginalOperationMetadataCustody> {
+        self.custody.original()
     }
     pub(crate) fn proof(&self) -> Option<super::super::storage::PublishedAllocation> {
         self.publication.get().copied()
@@ -780,7 +845,7 @@ impl NamedArrays {
                     | NamedSlot::Alias(Some(AliasArray::Canonical(cell))) => Some(cell),
                     _ => None,
                 };
-                if let Some(cell) = cell {
+                if let Some(cell) = cell.filter(|cell| cell.custody().is_some()) {
                     return super::super::storage::RetainedStorageRef::CanonicalArray(cell);
                 }
             }
@@ -1057,7 +1122,7 @@ impl<'a> Iterator for NamedHostIter<'a> {
 #[derive(Clone)]
 pub struct ResidentArraysOwner {
     arrays: Arc<ResidentArrays>,
-    custody: Option<OriginalOperationMetadataCustody>,
+    custody: Option<ResidencyControlCustody>,
     source_custody: super::ManagerCustody,
 }
 impl Deref for ResidentArraysOwner {
@@ -1088,8 +1153,8 @@ impl ResidentArraysOwner {
             source_custody: custody,
         }
     }
-    pub(super) fn source_storage_bytes(
-    ) -> Result<u64, eredu_runtime::working_memory::WorkingMemoryError> {
+    pub(super) fn source_storage_bytes()
+    -> Result<u64, eredu_runtime::working_memory::WorkingMemoryError> {
         eredu_runtime::working_memory::OriginalHostMetadataCustody::shared_storage_bytes(
             Layout::new::<ResidentArrays>(),
         )

@@ -5,12 +5,77 @@ use eredu_core::{
 };
 use std::error::Error as _;
 
+#[test]
+fn full_request_gap_identifies_the_required_component_without_reserving_storage() {
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let g = geometry();
+    let before = pool.snapshot().unwrap();
+    for (index, label) in [
+        "full request activations",
+        "full request attention",
+        "full request vocabulary",
+        "full request state update",
+        "full request materialization",
+        "full request retained storage",
+        "full request physical-domain attribution",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut workspace = outside(g, 0);
+        if index == 6 {
+            workspace.physical_domains = None;
+            workspace.activations = WorkspaceBound::PerDomain {
+                assumptions: "missing attribution fixture".into(),
+            };
+        } else {
+            let bounds = [
+                &mut workspace.activations,
+                &mut workspace.attention,
+                &mut workspace.vocabulary,
+                &mut workspace.state_update,
+                &mut workspace.materialization,
+                &mut workspace.retained,
+            ];
+            *bounds.into_iter().nth(index).unwrap() = WorkspaceBound::Unknown {
+                reason: "selected numerical source has no bound".into(),
+            };
+        }
+        let mut selected = state(g);
+        selected.execution_workspace = Some(workspace);
+        let error = full_requirement(&selected, g, &pool).unwrap_err();
+        let ResidualQuoteError::IncompleteWorkspace(error) = error else {
+            panic!("expected a typed numerical gap: {error:?}");
+        };
+        assert_eq!(error.component(), label);
+        assert_eq!(error.geometry(), g);
+        assert_eq!(pool.snapshot().unwrap(), before);
+    }
+}
+
 #[derive(Debug)]
 struct ExtentFacts {
     complete_through: u64,
 }
 
 impl WorkspaceMechanisms for ExtentFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     fn operation_bound(
         &self,
         operation: &WorkspaceOperation,
@@ -68,12 +133,12 @@ fn candidate_geometry() -> InferenceGeometry {
 }
 
 fn equations(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     g: InferenceGeometry,
     complete_through: u64,
 ) -> (InferenceWorkspaceReport, RegisteredWorkspaceStorage<u32>) {
     let context = WorkspaceContext::new(ExtentFacts { complete_through });
-    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let root = placed_root(Some(64), &context);
     let registered =
         RegisteredWorkspaceStorage::bind(pool, &context, [(1u32, root.clone())]).unwrap();
     let old = view(&context, &root, 2);
@@ -93,7 +158,7 @@ fn equations(
     (report, registered)
 }
 
-fn enclosing(pool: &WorkingMemoryPool, g: InferenceGeometry) -> ControllerWorkspaceEstimate {
+fn enclosing(pool: &MemoryLedger, g: InferenceGeometry) -> ControllerWorkspaceEstimate {
     let contract = ControllerStorageContract::inspect(&RunController).unwrap();
     ControllerWorkspaceContribution::new(
         g,
@@ -111,7 +176,7 @@ fn enclosing(pool: &WorkingMemoryPool, g: InferenceGeometry) -> ControllerWorksp
 }
 
 fn candidate(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     g: InferenceGeometry,
     complete_through: u64,
     decoder_credit: bool,
@@ -137,24 +202,24 @@ fn candidate(
 }
 
 fn candidate_plan(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     capacity: u64,
     quote: impl FnMut(InferenceGeometry) -> Result<IncrementalInferenceQuote, PrefillPlanningError>,
-) -> Result<
-    (
-        WorkingMemoryReservation,
-        IncrementalInferenceQuote,
-    ),
-    PrefillPlanningError,
-> {
+) -> Result<(WorkingMemoryReservation, IncrementalInferenceQuote), PrefillPlanningError> {
     let g = candidate_geometry();
+    let capacity = if pool.pin_registered_storage([(1u32, 64)]).is_ok() {
+        let probe = candidate(pool, g, u64::MAX / 4, true).expect("complete metadata probe");
+        payload_capacity_with_quote(pool, &probe, &request(g), capacity)
+    } else {
+        capacity
+    };
     plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &capabilities(),
         request(g),
         g,
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
         quote,
     )
 }
@@ -163,14 +228,14 @@ fn candidate_plan(
 fn incomplete_larger_equations_retry_for_full_and_registered_decoder_quotes() {
     for decoder_credit in [false, true] {
         let capacity = if decoder_credit { 76 } else { 140 };
-        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
-        let original = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let original = pool.register_host_storage([(1u32, 64)]).unwrap();
         let mut attempted = Vec::new();
         let (reservation, quote) = candidate_plan(&pool, capacity, |g| {
             attempted.push(g.prefill_chunk_positions);
             assert_eq!(
-                used(&pool),
-                (64, 64),
+                pool.payload_used_bytes().unwrap(),
+                64,
                 "cold retries must not reserve a candidate"
             );
             candidate(&pool, g, 2, decoder_credit)
@@ -189,36 +254,39 @@ fn incomplete_larger_equations_retry_for_full_and_registered_decoder_quotes() {
                 .unwrap(),
             Some(12)
         );
-        assert_eq!(reservation.admission().incremental_required_bytes, capacity - 64);
-        assert_eq!(used(&pool), (capacity, capacity));
+        assert_eq!(
+            reservation.admission().incremental_required_bytes,
+            Some(capacity - 64)
+        );
+        assert_eq!(pool.payload_used_bytes().unwrap(), capacity);
         drop((reservation, quote, original));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn numerical_gaps_and_capacity_rejections_keep_descending_candidate_order() {
-    let pool = WorkingMemoryPool::new(76, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let mut attempted = Vec::new();
     let (reservation, accepted) = candidate_plan(&pool, 76, |g| {
         attempted.push(g.prefill_chunk_positions);
-        assert_eq!(used(&pool), (64, 64));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 64);
         // Four is unpriced; three is complete but needs sixteen new bytes;
         // two has a complete twelve-byte requirement and fits exactly.
         candidate(&pool, g, 3, true)
     })
     .unwrap();
     assert_eq!(attempted, [4, 3, 2]);
-    assert_eq!(accepted.incremental_bytes(), 12);
+    assert_eq!(accepted.incremental_bytes().unwrap(), 12);
     drop((reservation, accepted, original));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn all_incomplete_candidates_preserve_final_typed_cause_without_pinning_storage() {
-    let pool = WorkingMemoryPool::new(128, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let mut attempted = Vec::new();
     let error = candidate_plan(&pool, 128, |g| {
         attempted.push(g.prefill_chunk_positions);
@@ -226,7 +294,7 @@ fn all_incomplete_candidates_preserve_final_typed_cause_without_pinning_storage(
     })
     .unwrap_err();
     assert_eq!(attempted, [4, 3, 2, 1]);
-    assert_eq!(used(&pool), (64, 64));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     let PrefillPlanningError::IncompleteWorkspace(incomplete) = error else {
         panic!("missing numerical cause")
     };
@@ -241,7 +309,7 @@ fn all_incomplete_candidates_preserve_final_typed_cause_without_pinning_storage(
     ));
     drop(original);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         0,
         "retained error must not pin numerical registrations"
     );
@@ -251,8 +319,8 @@ fn all_incomplete_candidates_preserve_final_typed_cause_without_pinning_storage(
 #[test]
 fn final_candidate_preserves_budget_or_incomplete_rejection_in_mixed_sequences() {
     for final_incomplete in [false, true] {
-        let pool = WorkingMemoryPool::new(64, 0).unwrap();
-        let original = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let original = pool.register_host_storage([(1u32, 64)]).unwrap();
         let mut attempted = Vec::new();
         let error = candidate_plan(&pool, 64, |g| {
             attempted.push(g.prefill_chunk_positions);
@@ -269,25 +337,21 @@ fn final_candidate_preserves_budget_or_incomplete_rejection_in_mixed_sequences()
         } else {
             assert!(matches!(
                 error,
-                PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded {
-                    required_bytes: 8,
-                    available_bytes: 0
-                })
-            ));
+                PrefillPlanningError::Reservation(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((required, available)) if required == available + 8)));
         }
-        assert_eq!(used(&pool), (64, 64));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 64);
         drop(original);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn foreign_or_wrong_geometry_incomplete_markers_are_fatal_before_retry() {
     for wrong_geometry in [false, true] {
-        let pool = WorkingMemoryPool::new(128, 0).unwrap();
-        let foreign = WorkingMemoryPool::new(128, 0).unwrap();
-        let original = pool.register_storage([(1u32, 64)]).unwrap();
-        let other = foreign.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let original = pool.register_host_storage([(1u32, 64)]).unwrap();
+        let other = foreign.register_host_storage([(1u32, 64)]).unwrap();
         let calls = Cell::new(0);
         let error = candidate_plan(&pool, 128, |mut g| {
             calls.set(calls.get() + 1);
@@ -302,15 +366,15 @@ fn foreign_or_wrong_geometry_incomplete_markers_are_fatal_before_retry() {
             error,
             PrefillPlanningError::Reservation(WorkingMemoryError::IdentityMismatch)
         ));
-        assert_eq!(used(&pool), (64, 64));
-        assert_eq!(used(&foreign), (64, 64));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 64);
+        assert_eq!(foreign.payload_used_bytes().unwrap(), 64);
         drop((original, other));
     }
 }
 
 #[test]
 fn arbitrary_unknown_and_typed_fatal_estimates_do_not_retry() {
-    let pool = WorkingMemoryPool::new(128, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     for numerical_word_in_error in [false, true] {
         let calls = Cell::new(0);
         let error = candidate_plan(&pool, 128, |_| {
@@ -337,19 +401,19 @@ fn arbitrary_unknown_and_typed_fatal_estimates_do_not_retry() {
                 PrefillPlanningError::Reservation(WorkingMemoryError::UnknownBound)
             ));
         }
-        assert_eq!(used(&pool), (0, 0));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn foreign_complete_quote_is_rejected_before_retryable_application_budget_policy() {
-    let pool = WorkingMemoryPool::new(128, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(128, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
-    let other = foreign.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let other = foreign.register_host_storage([(1u32, 64)]).unwrap();
     let g = candidate_geometry();
     let mut request = request(g);
-    request.application_memory_budget_bytes = Some(12);
+    request.memory_limits = crate::working_memory::memory_fixture::host_limits(12);
     let calls = Cell::new(0);
     let error = plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
@@ -357,7 +421,7 @@ fn foreign_complete_quote_is_rejected_before_retryable_application_budget_policy
         &capabilities(),
         request,
         g,
-        128,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 128),
         |g| {
             calls.set(calls.get() + 1);
             // The foreign first candidate needs twenty bytes, above the
@@ -372,15 +436,15 @@ fn foreign_complete_quote_is_rejected_before_retryable_application_budget_policy
         error,
         PrefillPlanningError::Reservation(WorkingMemoryError::IdentityMismatch)
     ));
-    assert_eq!(used(&pool), (64, 64));
-    assert_eq!(used(&foreign), (64, 64));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 64);
     drop((original, other));
 }
 
 #[test]
 fn structural_geometry_identity_and_overflow_errors_dominate_numerical_gaps() {
-    let pool = WorkingMemoryPool::new(128, 0).unwrap();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
     let g = candidate_geometry();
     let (report, registered) = equations(&pool, g, 0);
     let (_, different_identity) = equations(&pool, g, 0);
@@ -414,18 +478,18 @@ fn structural_geometry_identity_and_overflow_errors_dominate_numerical_gaps() {
             CapabilityError::ArithmeticOverflow { .. }
         ))
     ));
-    assert_eq!(used(&pool), (64, 64));
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop((registered, different_identity, original));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn missing_state_span_and_lost_borrowed_association_remain_fatal_unknowns() {
     for missing_state in [false, true] {
-        let pool = WorkingMemoryPool::new(128, 0).unwrap();
-        let original = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let original = pool.register_host_storage([(1u32, 64)]).unwrap();
         let a = WorkspaceContext::new(Facts::default());
-        let root = WorkspaceExistingStorage::new(Some(64), &a);
+        let root = placed_root(Some(64), &a);
         let registered =
             RegisteredWorkspaceStorage::bind(&pool, &a, [(1u32, root.clone())]).unwrap();
         let old = view(&a, &root, 2);
@@ -467,8 +531,8 @@ fn missing_state_span_and_lost_borrowed_association_remain_fatal_unknowns() {
                 ))
             ));
         }
-        assert_eq!(used(&pool), (64, 64));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 64);
         drop((registered, original));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

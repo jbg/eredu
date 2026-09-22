@@ -2,7 +2,7 @@ use super::*;
 use eredu_core::checkpoint::TensorDtype;
 use eredu_core::{
     InputModality, InputPartDescriptor, InputPayloadKind, InputTensorIdentity, OutputDemand,
-    PreparedInputIdentity, SharedStorageDomain,
+    PreparedInputIdentity, SharedStorageAccountingId,
 };
 use eredu_nn::workspace::WorkspaceTensor;
 use std::{
@@ -65,7 +65,7 @@ fn text_and_composite_prefill_retain_the_same_shared_identity_and_custody() {
     .with_shared_cache_identity(shared.clone());
     let retired = Arc::new(AtomicUsize::new(0));
     shared
-        .try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+        .try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
             Ok(Box::new(Retired(retired.clone())))
         })
         .unwrap();

@@ -1,7 +1,8 @@
 //! Actual mask refusal and copied-destination custody through scoped frames.
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use eredu_core::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug)]
@@ -48,7 +49,7 @@ fn account() -> (HostMetadataFunding, Counts) {
 #[test]
 fn scoped_mask_refusals_keep_exact_destination_payer_and_failed_prefix() {
     let (tokenizer, eos) = tokenizer();
-    let pool = WorkingMemoryPool::new(1 << 28, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 28, 0).unwrap();
     let (plan, receipt) = original_plan(
         &pool,
         &tokenizer,
@@ -96,9 +97,9 @@ fn scoped_mask_refusals_keep_exact_destination_payer_and_failed_prefix() {
             {
                 break;
             }
-            cause = cause
-                .source()
-                .unwrap_or_else(|| panic!("cut {cut}: missing typed funding leaf at {cause:?}: {failure}"));
+            cause = cause.source().unwrap_or_else(|| {
+                panic!("cut {cut}: missing typed funding leaf at {cause:?}: {failure}")
+            });
         }
         assert_eq!(source_counts.calls.load(Ordering::SeqCst), historical_calls);
         drop(destination);
@@ -122,5 +123,5 @@ fn scoped_mask_refusals_keep_exact_destination_payer_and_failed_prefix() {
     assert!(counts.retired.load(Ordering::SeqCst));
     assert!(source_counts.retired.load(Ordering::SeqCst));
     drop((plan, receipt, tokenizer));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

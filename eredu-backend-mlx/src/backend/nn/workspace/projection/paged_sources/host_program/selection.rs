@@ -4,6 +4,34 @@ use eredu_runtime::working_memory::{
     InferenceSpanWorkspacePlan, InferenceSpanWorkspaceRecord, InferenceWorkspaceSpan,
 };
 
+/// Descriptive access to the actual retained append row. Implementations lend
+/// existing publication IDs; neither an ordinal nor a range issues a source.
+pub(in super::super) trait HostAppendSource {
+    fn source_index(&self) -> usize;
+    fn ordinal(&self) -> usize;
+    fn scan_coordinates(&self) -> Option<(i64, i64)>;
+    fn publication(&self, range: &std::ops::Range<i64>) -> Option<&CacheBlockId>;
+}
+impl HostAppendSource for super::super::programs::PagedAppendProgram {
+    fn source_index(&self) -> usize {
+        self.source
+    }
+    fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+    fn scan_coordinates(&self) -> Option<(i64, i64)> {
+        self.scan
+            .as_ref()
+            .map(|scan| (scan.query_start, scan.context_end))
+    }
+    fn publication(&self, range: &std::ops::Range<i64>) -> Option<&CacheBlockId> {
+        self.publications
+            .iter()
+            .find(|row| row.id.start == range.start && row.id.end == range.end)
+            .map(|row| &row.id)
+    }
+}
+
 fn coordinates(record: &InferenceSpanWorkspaceRecord) -> Option<(i64, i64)> {
     let (start, length) = match record.span() {
         InferenceWorkspaceSpan::Sampling(_) => return None,
@@ -70,35 +98,30 @@ pub(super) fn submitted(
     }
     Ok(false)
 }
-pub(super) fn program<'a>(
+pub(in super::super) fn program<'a, P: HostAppendSource>(
     source: usize,
     invocation: (i64, i64),
-    programs: &'a [Option<super::super::programs::PagedAppendProgram>],
+    programs: &'a [Option<P>],
     plan: &InferenceSpanWorkspacePlan,
     context: &WorkspaceContext,
-) -> Result<Option<&'a super::super::programs::PagedAppendProgram>, CacheSourceFailure> {
+) -> Result<Option<&'a P>, CacheSourceFailure> {
     let fail = |cause| CacheSourceFailure::source(cause, context);
     context
         .charge_metadata(size_of::<(
             usize,
             (i64, i64),
-            &[Option<super::super::programs::PagedAppendProgram>],
+            &[Option<P>],
             &InferenceSpanWorkspacePlan,
             &WorkspaceContext,
-            std::slice::Iter<'_, Option<super::super::programs::PagedAppendProgram>>,
-            Result<Option<&super::super::programs::PagedAppendProgram>, CacheSourceFailure>,
+            std::slice::Iter<'_, Option<P>>,
+            Result<Option<&P>, CacheSourceFailure>,
         )>())
         .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
     if !submitted(plan, invocation, context)? {
         return Ok(None);
     }
     for program in programs.iter().flatten() {
-        if program.source == source
-            && program
-                .scan
-                .as_ref()
-                .is_some_and(|scan| (scan.query_start, scan.context_end) == invocation)
-        {
+        if program.source_index() == source && program.scan_coordinates() == Some(invocation) {
             return Ok(Some(program));
         }
     }
@@ -151,12 +174,27 @@ mod tests {
                     let actual = coordinates(record).unwrap();
                     assert!(submitted(plan, actual, &context).unwrap());
                     // A selected span still needs its actual native program.
-                    assert!(program(0, actual, &[], plan, &context).is_err());
+                    assert!(
+                        program::<super::super::super::programs::PagedAppendProgram>(
+                            0,
+                            actual,
+                            &[],
+                            plan,
+                            &context
+                        )
+                        .is_err()
+                    );
                 }
                 assert!(
-                    program(0, (final_start, final_start + 1), &[], plan, &context)
-                        .unwrap()
-                        .is_none()
+                    program::<super::super::super::programs::PagedAppendProgram>(
+                        0,
+                        (final_start, final_start + 1),
+                        &[],
+                        plan,
+                        &context
+                    )
+                    .unwrap()
+                    .is_none()
                 );
                 assert!(submitted(plan, (final_start + 1, final_start + 2), &context).is_err());
             }

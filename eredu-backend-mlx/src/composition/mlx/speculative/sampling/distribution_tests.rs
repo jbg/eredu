@@ -1,7 +1,7 @@
 use super::*;
 use eredu_core::capture::*;
 use eredu_runtime::{
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool},
+    working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError},
     GenerationSampler, SamplingBackend,
 };
 use std::{
@@ -28,8 +28,8 @@ enum Failure {
 
 #[derive(Clone)]
 struct Probe {
-    pool: WorkingMemoryPool,
-    sample_pool: Option<WorkingMemoryPool>,
+    pool: MemoryLedger,
+    sample_pool: Option<MemoryLedger>,
     calls: Rc<Calls>,
     failure: Failure,
     retain_sample: bool,
@@ -37,7 +37,7 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(pool: &WorkingMemoryPool) -> Self {
+    fn new(pool: &MemoryLedger) -> Self {
         Self {
             pool: pool.clone(),
             sample_pool: None,
@@ -117,6 +117,16 @@ impl SpeculativeSampler<MlxSamplingBackend> for Probe {
     }
 }
 
+fn reserved_ledger() -> MemoryLedger {
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let controls = crate::memory_fixture::host_total(
+        &probe
+            .reservation_requirements(&zero_admission(), None)
+            .unwrap(),
+    );
+    crate::memory_fixture::ledger(controls, 0).unwrap()
+}
+
 fn zero_admission() -> eredu_core::Admission {
     use eredu_core::{
         cache::LayerCachePolicy, EstimationCompleteness, ExecutionWorkspaceEstimate,
@@ -148,29 +158,33 @@ fn zero_admission() -> eredu_core::Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    eredu_core::Admission {
+    crate::memory_fixture::admission(eredu_core::Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
 fn stream() -> Stream {
     Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0))
 }
 
-fn settle(pool: &WorkingMemoryPool, expected: usize) {
+fn settle(pool: &MemoryLedger, expected: usize) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
@@ -178,7 +192,7 @@ fn settle(pool: &WorkingMemoryPool, expected: usize) {
     });
 }
 
-fn blocked(pool: &WorkingMemoryPool) {
+fn blocked(pool: &MemoryLedger) {
     settle(pool, 1);
     assert!(matches!(
         pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
@@ -314,7 +328,6 @@ fn capture_plan() -> AdmittedCapturePlan {
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -334,7 +347,7 @@ fn capture_plan() -> AdmittedCapturePlan {
 #[test]
 fn reserved_distribution_processing_precedes_policy_callbacks_and_capture_ledger_mutation() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = reserved_ledger();
     let mut sampler = Sampling::new(Probe::new(&pool));
     sampler.enable_control_capture(capture_plan()).unwrap();
     let before = sampler
@@ -347,7 +360,8 @@ fn reserved_distribution_processing_precedes_policy_callbacks_and_capture_ledger
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let reserved_snapshot = pool.snapshot().unwrap();
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     assert_reserved(
         &sampler
             .process_logits(
@@ -372,8 +386,7 @@ fn reserved_distribution_processing_precedes_policy_callbacks_and_capture_ledger
     );
     assert!(sampler.take_control_captures().is_empty());
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 0);
+    assert_eq!(pool.snapshot().unwrap(), reserved_snapshot);
     drop(reservation);
     let distribution = distribution(&mut sampler, &[0.2, 0.3, 0.5], context);
     assert_eq!(sampler.inner().calls.process.get(), 1);
@@ -397,12 +410,12 @@ fn reserved_distribution_processing_precedes_policy_callbacks_and_capture_ledger
 fn foreign_distribution_cannot_enter_reserved_domain_or_invoke_sample_and_commit_callbacks() {
     let target = stream();
     let draft = stream();
-    let pool_a = WorkingMemoryPool::new(0, 0).unwrap();
-    let pool_b = WorkingMemoryPool::new(0, 0).unwrap();
-    let context_a = SpeculativeExecutionStreams::single(&target).with_memory_pool(&pool_a);
+    let pool_a = reserved_ledger();
+    let pool_b = reserved_ledger();
+    let context_a = SpeculativeExecutionStreams::single(&target).with_memory_ledger(&pool_a);
     let context_b = SpeculativeExecutionStreams::for_test(&target, &draft)
         .unwrap()
-        .with_memory_pool(&pool_b);
+        .with_memory_ledger(&pool_b);
     let mut sampler = Sampling::new(Probe::new(&pool_a));
     let mut distribution = distribution(&mut sampler, &[0.2, 0.3, 0.5], context_a);
     let before = distribution
@@ -415,6 +428,7 @@ fn foreign_distribution_cannot_enter_reserved_domain_or_invoke_sample_and_commit
     let reservation = pool_b
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
+    let reserved_snapshot = pool_b.snapshot().unwrap();
     assert_reserved(
         &sampler
             .probability_at(&distribution, 1, SamplingPlacement::Target, context_b)
@@ -461,7 +475,7 @@ fn foreign_distribution_cannot_enter_reserved_domain_or_invoke_sample_and_commit
         .prepare_verification(
             &mut [&mut distribution],
             1.0,
-            SpeculativeExecutionStreams::single(&target).with_memory_pool(&pool_b),
+            SpeculativeExecutionStreams::single(&target).with_memory_ledger(&pool_b),
         )
         .unwrap();
     assert_eq!(sampler.inner().calls.sample.get(), 0);
@@ -480,8 +494,7 @@ fn foreign_distribution_cannot_enter_reserved_domain_or_invoke_sample_and_commit
     );
     assert_probabilities(&sampler, &distribution, &[0.2, 0.3, 0.5], context_a);
     assert_eq!(pool_b.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool_b.used_bytes().unwrap(), 0);
-    assert_eq!(pool_b.peak_bytes().unwrap(), 0);
+    assert_eq!(pool_b.snapshot().unwrap(), reserved_snapshot);
     drop((reservation, distribution, sampler));
     settle(&pool_a, 0);
 }
@@ -489,8 +502,8 @@ fn foreign_distribution_cannot_enter_reserved_domain_or_invoke_sample_and_commit
 #[test]
 fn lazy_distribution_clone_keeps_authority_after_source_and_sampler_teardown() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
-    let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+    let pool = reserved_ledger();
+    let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
     let mut sampler = Sampling::new(Probe::new(&pool));
     let raw = logits(&[0.2, 0.3, 0.5])
         .add(&Array::from_f32(0.25), &stream)
@@ -516,13 +529,13 @@ fn lazy_distribution_clone_keeps_authority_after_source_and_sampler_teardown() {
 }
 
 #[test]
-fn repeated_same_domain_distribution_operations_reuse_one_authority_and_preserve_numerics() {
+fn repeated_same_ledger_distribution_operations_reuse_one_authority_and_preserve_numerics() {
     let target = stream();
     let draft = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = reserved_ledger();
     let context = SpeculativeExecutionStreams::for_test(&target, &draft)
         .unwrap()
-        .with_memory_pool(&pool);
+        .with_memory_ledger(&pool);
     let mut sampler = Sampling::new(Probe::new(&pool));
     let left = distribution(&mut sampler, &[0.6, 0.3, 0.1], context);
     let mut right = distribution(&mut sampler, &[0.2, 0.2, 0.6], context);
@@ -572,14 +585,14 @@ fn cross_domain_residual_and_verification_keep_all_source_and_destination_author
         }
         let draft = stream();
         let target = Stream::new_with_device(&safemlx::Device::new(device, 0));
-        let pool_a = WorkingMemoryPool::new(0, 0).unwrap();
-        let pool_b = WorkingMemoryPool::new(0, 0).unwrap();
-        let pool_c = WorkingMemoryPool::new(0, 0).unwrap();
-        let context_a = SpeculativeExecutionStreams::single(&draft).with_memory_pool(&pool_a);
-        let context_b = SpeculativeExecutionStreams::single(&draft).with_memory_pool(&pool_b);
+        let pool_a = reserved_ledger();
+        let pool_b = reserved_ledger();
+        let pool_c = reserved_ledger();
+        let context_a = SpeculativeExecutionStreams::single(&draft).with_memory_ledger(&pool_a);
+        let context_b = SpeculativeExecutionStreams::single(&draft).with_memory_ledger(&pool_b);
         let context_c = SpeculativeExecutionStreams::for_test(&target, &draft)
             .unwrap()
-            .with_memory_pool(&pool_c);
+            .with_memory_ledger(&pool_c);
         let mut sampler_a = Sampling::new(Probe::new(&pool_a));
         let mut sampler_b = Sampling::new(Probe::new(&pool_b));
         let left = distribution(&mut sampler_a, &[0.6, 0.3, 0.1], context_a);
@@ -618,8 +631,8 @@ fn cross_domain_residual_and_verification_keep_all_source_and_destination_author
 fn callback_errors_and_unwinds_keep_authority_through_native_recovery() {
     let stream = stream();
     for failure in [Failure::Error, Failure::Panic] {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
-        let context = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool);
+        let pool = reserved_ledger();
+        let context = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool);
         let mut probe = Probe::new(&pool);
         probe.failure = failure;
         let calls = probe.calls.clone();
@@ -651,10 +664,10 @@ fn callback_errors_and_unwinds_keep_authority_through_native_recovery() {
 #[test]
 fn earlier_sampler_clone_retains_cross_domain_arrays_stored_by_shared_sampling_callback() {
     let stream = stream();
-    let pool_a = WorkingMemoryPool::new(0, 0).unwrap();
-    let pool_b = WorkingMemoryPool::new(0, 0).unwrap();
-    let context_a = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool_a);
-    let context_b = SpeculativeExecutionStreams::single(&stream).with_memory_pool(&pool_b);
+    let pool_a = reserved_ledger();
+    let pool_b = reserved_ledger();
+    let context_a = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool_a);
+    let context_b = SpeculativeExecutionStreams::single(&stream).with_memory_ledger(&pool_b);
     let mut probe = Probe::new(&pool_a);
     probe.sample_pool = Some(pool_b.clone());
     probe.retain_sample = true;
@@ -696,3 +709,7 @@ fn earlier_sampler_clone_retains_cross_domain_arrays_stored_by_shared_sampling_c
     settle(&pool_a, 0);
     settle(&pool_b, 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

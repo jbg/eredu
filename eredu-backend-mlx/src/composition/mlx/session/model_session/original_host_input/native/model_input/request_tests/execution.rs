@@ -1,5 +1,7 @@
 //! The admitted route must execute, not merely accept an unadvanced prompt.
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 #[path = "execution/gemma.rs"]
 mod gemma;
 use crate::tests::support::media_completion;
@@ -121,7 +123,7 @@ fn numeric_state(runtime: &mut ModelRuntime<MlxBackend<'_>>, ids: Vec<u32>) -> R
 fn snapshot_resumes(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
     prompt: MlxModelInput,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     chunk: &mut u64,
     pending_media: bool,
     input_positions: u64,
@@ -210,12 +212,12 @@ fn snapshot_resumes(
             .unwrap();
             let host = pool.prepare_generation_snapshot_host_copy::<
                 RetainedGenerationSequence, TextSnapshotError<Error>, MlxBackend<'_>, AllowAll,
-            >(&sequence, u64::MAX, bytes).unwrap();
+            >(&sequence, crate::memory_fixture::resolved_limits(u64::MAX), bytes).unwrap();
             TextContinuationSnapshot::capture_original_host(
                 &mut boundary,
                 &budget,
                 host,
-                WorkspaceCopyLimits::new(u64::MAX),
+                WorkspaceCopyLimits::new(crate::memory_fixture::limits(u64::MAX)),
             )
             .unwrap()
         };
@@ -236,22 +238,29 @@ fn snapshot_resumes(
     let expected = numeric_state(runtime, ids[prefix..].to_vec());
     let mut sampling = config().sampling();
     sampling.max_new_tokens = Some(3 - prefix);
-    let resumed_config =
-        TextGenerationConfig::new(sampling).with_inference_policy(config().inference_policy());
+    let resumed_config = TextGenerationConfig::new(sampling)
+        .with_inference_policy(config().inference_policy().clone());
     let initial_copies = budget.usage().cumulative_copy_bytes;
     for branch in [false, true] {
         let previous_copies = budget.usage().cumulative_copy_bytes;
         let bytes = saved
-            .original_resume_preparation_bytes(runtime, resumed_config, &eredu_core::OriginalTextResumeOptions::new(
-                if branch { eredu_core::OriginalTextResumeKind::Branch } else { eredu_core::OriginalTextResumeKind::Restore }))
+            .original_resume_preparation_bytes(
+                runtime,
+                resumed_config.clone(),
+                &eredu_core::OriginalTextResumeOptions::new(if branch {
+                    eredu_core::OriginalTextResumeKind::Branch
+                } else {
+                    eredu_core::OriginalTextResumeKind::Restore
+                }),
+            )
             .unwrap();
         let host = pool.prepare_generation_resume_host_copy::<
             RetainedGenerationSequence, TextSnapshotError<Error>, MlxBackend<'_>, AllowAll,
-        >(&saved_sequence, u64::MAX, bytes).unwrap();
+        >(&saved_sequence, crate::memory_fixture::resolved_limits(u64::MAX), bytes).unwrap();
         let (mut generation, mut sequence) = if branch {
-            saved.fork_original_host(runtime, resumed_config, host, &cancellation)
+            saved.fork_original_host(runtime, resumed_config.clone(), host, &cancellation)
         } else {
-            saved.restore_original_host(runtime, resumed_config, host, &cancellation)
+            saved.restore_original_host(runtime, resumed_config.clone(), host, &cancellation)
         }
         .unwrap()
         .unwrap();
@@ -259,7 +268,10 @@ fn snapshot_resumes(
         let geometry = generation.preparation_report().unwrap().geometry;
         assert_eq!(
             (geometry.cached_positions, geometry.input_positions),
-            (saved_frontier, if pending_media { input_positions } else { 1 })
+            (
+                saved_frontier,
+                if pending_media { input_positions } else { 1 }
+            )
         );
         assert_eq!(geometry.max_output_tokens, (3 - prefix) as u64);
         if pending_media {
@@ -302,7 +314,7 @@ fn snapshot_resumes(
 }
 
 fn run(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     path: &std::path::Path,
     conditional: bool,
     mode: usize,
@@ -313,18 +325,23 @@ fn run(
     })
 }
 fn run_original(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     path: &std::path::Path,
     mode: usize,
     route: usize,
     input_positions: u64,
     vocabulary: u32,
-    source: impl FnOnce(&WorkingMemoryPool) -> OriginalPreparedHostInput,
+    source: impl FnOnce(&MemoryLedger) -> OriginalPreparedHostInput,
 ) -> ResultRow {
     // The process registry retains admitted stream/source-worker birth accounts
     // after the backend drops. Establish those owners before the request baseline.
     let backend = original_request_backend(pool);
-    let baseline = pool.used_bytes().unwrap();
+    backend.stream().synchronize().unwrap();
+    safemlx::memory::clear_cache();
+    crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+    safemlx::reclaim_allocation_owners();
+    crate::backend::ordinary_retirement::reclaim_all();
+    let baseline = pool.fixture_host_charge().unwrap();
     let baseline_owners = pool.unquoted_owner_count().unwrap();
     let host = source(pool);
     let selected = admitted_media_config(&backend, path, mode);
@@ -365,10 +382,15 @@ fn run_original(
     let (ids, roots) = media_completion::observe(None, || {
         if route == 0 {
             // Same original B and ordinary equations, one complete prefill span.
-            TextGeneration::from_prompt(
+            TextGeneration::from_input_with_sequence(
                 &mut runtime,
-                prompt.with_prefill_chunk_positions(input_positions.try_into().unwrap()),
+                TextGenerationInput::OriginalPrepared(
+                    prompt.with_prefill_chunk_positions(input_positions.try_into().unwrap()),
+                ),
                 TextGenerationConfig::new(config().sampling()),
+                TokenFilter::All,
+                None,
+                GenerationSequenceRequest::new(3, &[]),
             )
             .unwrap()
             .map(|next| next.unwrap().token_id().unwrap())
@@ -394,7 +416,14 @@ fn run_original(
                 .map(|next| next.unwrap().token_id().unwrap())
                 .collect()
         } else if route == 3 || route == 4 {
-            snapshot_resumes(&mut runtime, prompt, pool, &mut chunk, route == 4, input_positions)
+            snapshot_resumes(
+                &mut runtime,
+                prompt,
+                pool,
+                &mut chunk,
+                route == 4,
+                input_positions,
+            )
         } else {
             let mut generation = ControlledTextGeneration::from_input_with_sequence(
                 &mut runtime,
@@ -486,19 +515,33 @@ fn run_original(
         "nonzero actual decoder state"
     );
     let result = ResultRow { ids, arrays, fixed };
-    drop((source_hold, runtime, selected, host));
+    drop((
+        source_hold,
+        runtime,
+        selected,
+        host,
+        expected_identity,
+        before,
+        after,
+    ));
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        safemlx::memory::clear_cache();
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == baseline
+
+        pool.fixture_host_charge().unwrap() == baseline
             && pool.unquoted_owner_count().unwrap() == baseline_owners
     });
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     result
 }
 
 #[test]
 fn admitted_original_media_runs_bounded_prefill_and_cached_decode_with_controlled_parity() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     assert!(safemlx::metal::is_available().unwrap());
     for conditional in [false, true] {
@@ -525,6 +568,10 @@ fn admitted_original_media_runs_bounded_prefill_and_cached_decode_with_controlle
 
 #[test]
 fn admitted_original_media_postcommit_restore_and_fork_preserve_decoder_and_input() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     assert!(safemlx::metal::is_available().unwrap());
     let root = tempfile::tempdir().unwrap();
@@ -539,6 +586,10 @@ fn admitted_original_media_postcommit_restore_and_fork_preserve_decoder_and_inpu
 
 #[test]
 fn admitted_original_media_pending_restore_and_fork_preserve_source_and_decode() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     assert!(safemlx::metal::is_available().unwrap());
     let root = tempfile::tempdir().unwrap();

@@ -1,13 +1,13 @@
 //! Original-account installation only. Execution dispatch and shared delivery
 //! remain in the shared text driver; this module issues no native operation.
 use super::*;
-use eredu_core::{TextStepContext, capture::SharedCapturePlan};
+use eredu_core::{capture::SharedCapturePlan, TextStepContext};
 use eredu_runtime::{
     capture::FundedCaptureSession,
     layered::{BoundCaptureSelection, PreparedCaptureSelection},
     working_memory::{
-        OwnedTextSpanWorkspace, PreparedCaptureRun, RegisteredInferenceSourceWitness,
-        WorkingMemoryError, WorkingMemoryPool,
+        MemoryLedger, OwnedTextSpanWorkspace, PreparedCaptureRun, RegisteredInferenceSourceWitness,
+        WorkingMemoryError,
     },
 };
 
@@ -296,7 +296,7 @@ impl InstalledCapture {
     /// after the reservation. This does not retrofit pins into existing scopes.
     pub(in crate::composition::mlx::session) fn validate_sources(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), Error> {
         self.witness.validate(pool).map_err(memory)
     }
@@ -371,15 +371,12 @@ fn take_installation(
         .validate_initial_ready_context(context)
         .map_err(memory)?;
     quote.validate(runtime, request.request())?;
-    let reservation = request
-        .request()
-        .memory_reservation()
-        .ok_or_else(mismatch)?;
+    let reservation = request.request().memory_reservation();
     reservation
-        .validate_domain(&session.payload.memory_pool)
+        .validate_ledger(&session.payload.memory_ledger)
         .map_err(memory)?;
     reservation
-        .validate_domain(runtime.backend().memory_pool())
+        .validate_ledger(runtime.backend().memory_ledger())
         .map_err(memory)?;
     state
         .funding

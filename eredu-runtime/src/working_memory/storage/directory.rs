@@ -1,6 +1,6 @@
 //! Outer type directory only; each value remains the one canonical Registry<K>.
 use super::{Registry, WorkingMemoryError};
-use crate::working_memory::{funding::RawSpanHostOwner, OriginalHostMetadataCustody};
+use crate::working_memory::{OriginalHostMetadataCustody, funding::RawSpanHostOwner};
 use std::{
     any::{Any, TypeId},
     mem::size_of,
@@ -39,13 +39,18 @@ impl Drop for MetadataCustody {
     }
 }
 impl PreparedNamespace {
-    pub(super) fn prepare<K: Ord + Send + Sync + 'static>(raw: Option<RawSpanHostOwner>) -> Self {
+    pub(super) fn prepare<K: Ord + Send + 'static>(raw: Option<RawSpanHostOwner>) -> Self {
         // Both allocations occur before the caller borrows Usage. The local
         // hold covers partial construction; no provider key exists yet.
         Self::prepare_source::<K>(raw.map(Into::into))
     }
-    pub(super) fn prepare_source<K: Ord + Send + Sync + 'static>(raw: Option<OriginalHostMetadataCustody>) -> Self {
-        let custody = MetadataCustody { raw, _preparation: None };
+    pub(super) fn prepare_source<K: Ord + Send + 'static>(
+        raw: Option<OriginalHostMetadataCustody>,
+    ) -> Self {
+        let custody = MetadataCustody {
+            raw,
+            _preparation: None,
+        };
         let value: Value = Box::new(Registry::<K>::new());
         let node = Box::new(Node {
             kind: TypeId::of::<K>(),
@@ -57,7 +62,7 @@ impl PreparedNamespace {
             _custody: custody,
         }
     }
-    pub(super) fn prepare_copy<K: Ord + Send + Sync + 'static>(
+    pub(super) fn prepare_copy<K: Ord + Send + 'static>(
         host: &eredu_core::HostPreparationAuthority,
     ) -> Self {
         let custody = MetadataCustody {
@@ -75,13 +80,21 @@ impl PreparedNamespace {
             _custody: custody,
         }
     }
-    pub(super) fn registry<K: Ord + Send + Sync + 'static>(&self) -> &Registry<K> {
+    pub(super) fn cold_control_bytes<K: Ord + Send + 'static>() -> Result<u64, WorkingMemoryError> {
+        u64::try_from(
+            size_of::<Node>()
+                .checked_add(size_of::<Registry<K>>())
+                .ok_or(WorkingMemoryError::Overflow)?,
+        )
+        .map_err(|_| WorkingMemoryError::Overflow)
+    }
+    pub(super) fn registry<K: Ord + Send + 'static>(&self) -> &Registry<K> {
         self.node
             .value
             .downcast_ref()
             .expect("prepared typed namespace")
     }
-    pub(super) fn requested_control_bytes<K: Ord + Send + Sync + 'static>()
+    pub(super) fn requested_control_bytes<K: Ord + Send + 'static>()
     -> Result<u64, WorkingMemoryError> {
         // Actual Box payloads, owning wrapper and simultaneously representable
         // construction/retirement transports. Box adds no managed heap header
@@ -137,12 +150,6 @@ impl Directory {
     pub(in crate::working_memory) fn is_empty(&self) -> bool {
         self.head.is_none()
     }
-    pub(super) fn entry(&mut self, kind: TypeId) -> OrdinaryEntry<'_> {
-        OrdinaryEntry {
-            directory: self,
-            kind,
-        }
-    }
     pub(super) fn install(&mut self, mut prepared: PreparedNamespace) {
         // Callers already validated absence under this same Usage loan. This
         // uses only scalar identity and pointer moves; no allocation/callback.
@@ -171,32 +178,5 @@ impl Drop for Directory {
             self.head = current.node.next.head.take();
             drop(current);
         }
-    }
-}
-pub(super) struct OrdinaryEntry<'a> {
-    directory: &'a mut Directory,
-    kind: TypeId,
-}
-impl<'a> OrdinaryEntry<'a> {
-    pub(super) fn or_insert_with(self, create: impl FnOnce() -> Value) -> &'a mut Value {
-        if self.directory.get(&self.kind).is_none() {
-            // Existing ordinary paths keep their ordinary allocation behavior.
-            // Only prepared publication uses a precharged candidate instead.
-            let node = Box::new(Node {
-                kind: self.kind,
-                value: create(),
-                next: Directory::default(),
-            });
-            self.directory.install(PreparedNamespace {
-                node,
-                _custody: MetadataCustody {
-                    raw: None,
-                    _preparation: None,
-                },
-            });
-        }
-        self.directory
-            .get_mut(&self.kind)
-            .expect("installed namespace")
     }
 }

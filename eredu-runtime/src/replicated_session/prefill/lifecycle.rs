@@ -21,6 +21,9 @@ where
     }
     fn geometry(&self, source: &P) -> InferenceGeometry;
     fn cache_identity(&self, source: &P) -> Option<SharedPreparedInputCacheIdentity>;
+    fn validate_speculative_admission(&self, _source: &P) -> Result<(), WorkingMemoryError> {
+        Err(WorkingMemoryError::UnknownBound)
+    }
     // Checked before the existing reservation vote, while source and state are unchanged.
     fn validate_admission(
         &self,
@@ -93,6 +96,13 @@ where
     }
     fn cache_identity(&self, source: &P) -> Option<SharedPreparedInputCacheIdentity> {
         source.shared_cache_identity()
+    }
+    fn validate_speculative_admission(&self, _source: &P) -> Result<(), WorkingMemoryError> {
+        if self.0.has_speculative_span_authority() {
+            Ok(())
+        } else {
+            Err(WorkingMemoryError::UnknownBound)
+        }
     }
     fn prepare(
         &mut self,

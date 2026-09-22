@@ -30,11 +30,11 @@ impl MlxPreparedInputMaterializer {
 }
 impl MlxPreparedTextInputPlan<'_> {
     pub(crate) fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::prepared_native_input_required_bytes(&self.0)
+        MemoryLedger::prepared_native_input_required_bytes(&self.0)
     }
     pub(crate) fn materialize(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<MlxOriginalPreparedTextInput, MlxPreparedModelInputError> {
         pool.compile_prepared_native_input(self.0)
             .map(MlxOriginalPreparedTextInput)
@@ -53,7 +53,6 @@ impl MlxOriginalPreparedTextInput {
                 packet,
             ),
             controlled_attribution: None,
-            prepared_capture: None,
             original_media: None,
             placement_semantics: None,
             cache_identity: self.0.storage().cache().cloned(),
@@ -78,7 +77,7 @@ impl std::fmt::Debug for CompletedOriginalTextInput {
 impl CompletedOriginalTextInput {
     pub(in crate::composition::mlx::session::model_session) fn prediction_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         parts: &[input::InputPart],
         cache: &eredu_runtime::SharedPreparedInputCacheIdentity,
     ) -> Result<&eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>, WorkingMemoryError>

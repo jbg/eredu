@@ -68,7 +68,6 @@ fn admitted() -> AdmittedCapturePlan {
     let capabilities = CaptureCapabilities {
         transformations: transforms.iter().map(CaptureTransform::kind).collect(),
         max_histogram_bins: 4,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = ObservationSupportReport {
@@ -120,7 +119,6 @@ fn admitted() -> AdmittedCapturePlan {
         limits: CaptureLimits {
             per_step: all,
             cumulative: all,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -153,9 +151,16 @@ fn admitted() -> AdmittedCapturePlan {
 
 // Host-only transfer fixture: no model, native operation or compiler peak claim.
 fn funding(
-    pool: &WorkingMemoryPool,
-    bytes: u64,
+    pool: &MemoryLedger,
+    payload: u64,
+    publication_rows: &[usize],
 ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
+    let bytes = publication_rows
+        .iter()
+        .try_fold(payload, |bytes, rows| {
+            bytes.checked_add(crate::memory_fixture::publication_control_bytes(*rows))
+        })
+        .unwrap();
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -182,25 +187,50 @@ fn funding(
         NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: WorkspaceBound::bounded(bytes, "exact retained capture plan publication credit"),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: WorkspaceBound::bounded(
+                bytes,
+                "exact retained capture plan publication credit",
+            ),
+        },
+    ))
     .unwrap();
+    let admission = crate::memory_fixture::host_admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
+        requested_positions: 1,
+        state,
+        incremental_required_bytes: Some(bytes),
+    });
+    let requirements = pool
+        .reservation_requirements(
+            &admission,
+            Some(&crate::memory_fixture::host_requirements(bytes)),
+        )
+        .unwrap();
+    let physical_limit = pool
+        .fixture_host_current()
+        .unwrap()
+        .checked_add(
+            requirements
+                .get(pool.topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
+        )
+        .unwrap();
     pool.reserve_with_capacity(
         &InferenceExecutionIdentity::default(),
-        &Admission {
-            requested_positions: 1,
-            state,
-            incremental_required_bytes: bytes,
-            available_memory_bytes: None,
-        },
-        bytes,
+        &admission,
+        crate::memory_fixture::physical_host_limits(pool, physical_limit),
     )
     .unwrap()
     .into_funding()
@@ -217,9 +247,9 @@ fn inventory(plans: impl IntoIterator<Item = SharedCapturePlan>) -> RetainedStor
     }
     result
 }
-fn reclaim(pool: &WorkingMemoryPool, expected: u64) {
+fn reclaim(pool: &MemoryLedger, expected: u64) {
     crate::backend::ordinary_retirement::reclaim_all();
-    assert_eq!(pool.used_bytes().unwrap(), expected);
+    assert_eq!(pool.fixture_host_charge().unwrap(), expected);
 }
 fn cause<'a, T: std::error::Error + 'static>(
     mut error: &'a (dyn std::error::Error + 'static),
@@ -260,7 +290,7 @@ impl Drop for Hook {
 
 #[test]
 fn capture_plan_inventory_preserves_nested_spare_capacity_and_is_cold() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let source = plan();
     let alias = source.clone();
@@ -305,7 +335,7 @@ fn capture_plan_inventory_preserves_nested_spare_capacity_and_is_cold() {
         .publish_unquoted(&loading)
         .unwrap();
     let pinned = inventory([source.clone()]).pin_registered(&pool).unwrap();
-    assert_eq!(pinned.bytes(), bytes);
+    assert_eq!(pinned.bytes(), Some(bytes));
     assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
     drop(hook);
     drop((registered, pinned, repeated, source, loading));
@@ -322,8 +352,8 @@ fn capture_plan_inventory_preserves_nested_spare_capacity_and_is_cold() {
 
 #[test]
 fn capture_plan_attachments_retain_earlier_aliases_once_in_each_domain() {
-    let a = WorkingMemoryPool::new(1 << 20, 0).unwrap();
-    let b = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let a = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
+    let b = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading_a = NativeMemoryOwner::acquire(&a).unwrap();
     let loading_b = NativeMemoryOwner::acquire(&b).unwrap();
     let source = plan();
@@ -341,7 +371,7 @@ fn capture_plan_attachments_retain_earlier_aliases_once_in_each_domain() {
         .unwrap();
     assert!(!source
         .try_attach(
-            a.shared_storage_domain(),
+            a.shared_storage_accounting_id(),
             || -> Result<Box<dyn Send + Sync>, WorkingMemoryError> {
                 panic!("published domain must not acquire twice")
             }
@@ -356,34 +386,59 @@ fn capture_plan_attachments_retain_earlier_aliases_once_in_each_domain() {
     drop(alias);
     reclaim(&a, 0);
     reclaim(&b, 0);
-    assert_eq!(a.peak_bytes().unwrap(), bytes);
-    assert_eq!(b.peak_bytes().unwrap(), bytes);
+    assert_eq!(
+        a.fixture_host_peak().unwrap(),
+        bytes
+            + 2 * crate::memory_fixture::publication_control_bytes(1)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
+    assert_eq!(
+        b.fixture_host_peak().unwrap(),
+        bytes
+            + crate::memory_fixture::publication_control_bytes(1)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
     drop(key);
 }
 
 #[test]
 fn capture_plan_exact_registration_rejects_one_short_and_unknown_before_accounting() {
-    let source_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let source_authority = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let source = plan();
     let bytes = source.capacity_bytes().unwrap();
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let controls = crate::memory_fixture::publication_control_bytes(1);
+    let short = crate::memory_fixture::ledger(
+        bytes + controls - 1 + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
+    let exact = crate::memory_fixture::ledger(
+        bytes
+            + crate::memory_fixture::publication_control_bytes(1)
+            + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let short_owner = NativeMemoryOwner::acquire(&short).unwrap();
     let exact_owner = NativeMemoryOwner::acquire(&exact).unwrap();
     let error = inventory([source.clone()])
         .publish_unquoted(&short_owner)
         .unwrap_err();
     assert_eq!(
-        cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::BudgetExceeded {
-            required_bytes: bytes,
-            available_bytes: bytes - 1,
-        })
+        cause::<WorkingMemoryError>(&error)
+            .and_then(crate::tests::support::memory_error::host_budget_numbers),
+        Some((bytes, bytes - 1))
     );
     assert_eq!(
-        (short.used_bytes().unwrap(), short.peak_bytes().unwrap()),
-        (0, 0)
+        (
+            short.fixture_host_charge().unwrap(),
+            short.fixture_host_peak().unwrap()
+        ),
+        (
+            0,
+            controls + crate::memory_fixture::native_owner_control_bytes()
+        )
     );
     let mut unknown = inventory([source.clone()]);
     unknown.mark_incomplete();
@@ -396,13 +451,16 @@ fn capture_plan_exact_registration_rejects_one_short_and_unknown_before_accounti
         Some(&WorkingMemoryError::UnknownBound)
     );
     assert_eq!(
-        (exact.used_bytes().unwrap(), exact.peak_bytes().unwrap()),
-        (0, 0)
+        (
+            exact.fixture_host_charge().unwrap(),
+            exact.fixture_host_peak().unwrap()
+        ),
+        (0, 0 + crate::memory_fixture::native_owner_control_bytes())
     );
     let publication = inventory([source.clone()])
         .publish_unquoted(&exact_owner)
         .unwrap();
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
     assert_payload(&source);
     drop((
         publication,
@@ -417,22 +475,26 @@ fn capture_plan_exact_registration_rejects_one_short_and_unknown_before_accounti
 
 #[test]
 fn funded_capture_plan_exact_credit_follows_aliases_after_request_retirement() {
-    let source_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let source = plan();
     let bytes = source.capacity_bytes().unwrap();
     let alias = source.clone();
     let key = source.storage_identity().clone();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let (reservation, run) = funding(&pool, bytes);
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let (reservation, run) = funding(&pool, bytes, &[1, 1]);
+    let accepted_peak = pool.fixture_host_peak().unwrap();
     let scope = run.scope().unwrap();
     let publication = inventory([source.clone()]).publish_funded(&scope).unwrap();
     let duplicate = inventory([alias.clone()]).publish_funded(&scope).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     assert_eq!(
-        scope.adopt_storage_individually([(37_u32, 1)]).unwrap_err(),
-        WorkingMemoryError::BudgetExceeded {
-            required_bytes: 1,
+        scope
+            .adopt_host_storage_individually([(37_u32, 1)])
+            .unwrap_err(),
+        WorkingMemoryError::DomainAllowanceExceeded {
+            domain: pool.topology().host_domain(),
+            required_bytes: MemoryLedger::storage_metadata_control_bytes().unwrap(),
             available_bytes: 0
         }
     );
@@ -443,38 +505,45 @@ fn funded_capture_plan_exact_credit_follows_aliases_after_request_retirement() {
     assert_eq!(alias.storage_identity(), &key);
     drop(alias);
     reclaim(&pool, 0);
-    assert_eq!(pool.peak_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_peak().unwrap(), accepted_peak);
     drop(key);
 }
 
 #[test]
 fn funded_capture_plan_short_credit_rejects_without_attachment_or_lost_funding() {
-    let source_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let source = plan();
     let bytes = source.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
-    let (reservation, run) = funding(&pool, bytes - 1);
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let (reservation, run) = funding(&pool, bytes - 1, &[1]);
     let scope = run.scope().unwrap();
     let error = inventory([source.clone()])
         .publish_funded(&scope)
         .unwrap_err();
     assert_eq!(
         cause::<WorkingMemoryError>(&error),
-        Some(&WorkingMemoryError::BudgetExceeded {
+        Some(&WorkingMemoryError::DomainAllowanceExceeded {
+            domain: pool.topology().host_domain(),
             required_bytes: bytes,
             available_bytes: bytes - 1,
         })
     );
     // Atomic rejection leaves all credit usable. There is no submitted native work.
     let credit = scope
-        .adopt_storage_individually([(37_u32, bytes - 1)])
+        .adopt_host_storage_individually([(37_u32, bytes - 1)])
         .unwrap();
     assert_payload(&source);
     scope.certify().unwrap();
     drop((credit, reservation, run));
     reclaim(&pool, 0);
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let exact = crate::memory_fixture::ledger(
+        bytes
+            + crate::memory_fixture::publication_control_bytes(1)
+            + crate::memory_fixture::native_owner_control_bytes(),
+        0,
+    )
+    .unwrap();
     let owner = NativeMemoryOwner::acquire(&exact).unwrap();
     let publication = inventory([source.clone()])
         .publish_unquoted(&owner)
@@ -495,7 +564,7 @@ fn ordered_plans() -> (SharedCapturePlan, SharedCapturePlan) {
 fn poison(source: &SharedCapturePlan) {
     assert!(catch_unwind(AssertUnwindSafe(|| {
         let _ = source.try_attach(
-            &eredu_core::SharedStorageDomain::default(),
+            &eredu_core::SharedStorageAccountingId::default(),
             || -> Result<Box<dyn Send + Sync>, WorkingMemoryError> {
                 panic!("test custody failure")
             },
@@ -506,7 +575,7 @@ fn poison(source: &SharedCapturePlan) {
 
 #[test]
 fn later_capture_plan_attachment_failure_preserves_first_charge_and_typed_cause() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let (first, failed) = ordered_plans();
     let first_bytes = first.capacity_bytes().unwrap();
@@ -520,7 +589,12 @@ fn later_capture_plan_attachment_failure_preserves_first_charge_and_typed_cause(
         Some(SharedStorageAttachmentError::Poisoned)
     ));
     reclaim(&pool, first_bytes);
-    assert_eq!(pool.peak_bytes().unwrap(), total);
+    assert_eq!(
+        pool.fixture_host_peak().unwrap(),
+        total
+            + crate::memory_fixture::publication_control_bytes(2)
+            + crate::memory_fixture::native_owner_control_bytes()
+    );
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     assert_payload(&first);
     assert_payload(&failed);
@@ -532,12 +606,14 @@ fn later_capture_plan_attachment_failure_preserves_first_charge_and_typed_cause(
 
 #[test]
 fn failed_funded_capture_plan_attachment_retains_uncertified_envelope() {
-    let source_pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let source_pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&source_pool).unwrap();
     let (first, failed) = ordered_plans();
     let total = first.capacity_bytes().unwrap() + failed.capacity_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(total, 0).unwrap();
-    let (reservation, run) = funding(&pool, total);
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let (reservation, run) = funding(&pool, total, &[2]);
+    let accepted_peak = pool.fixture_host_peak().unwrap();
+    let accepted_charge = pool.fixture_host_current().unwrap();
     let scope = run.scope().unwrap();
     poison(&failed);
     let error = inventory([first.clone(), failed.clone()])
@@ -547,20 +623,22 @@ fn failed_funded_capture_plan_attachment_retains_uncertified_envelope() {
         cause::<SharedStorageAttachmentError<WorkingMemoryError>>(&error),
         Some(SharedStorageAttachmentError::Poisoned)
     ));
-    reclaim(&pool, total);
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.fixture_host_current().unwrap(), accepted_charge);
     assert_payload(&first);
     assert_payload(&failed);
     // No certification after partial attachment and no refund at final retirement.
     drop(scope);
     drop((error, run, reservation, first, failed, loading));
-    reclaim(&pool, total);
-    assert_eq!(pool.peak_bytes().unwrap(), total);
+    crate::backend::ordinary_retirement::reclaim_all();
+    assert_eq!(pool.fixture_host_current().unwrap(), accepted_charge);
+    assert_eq!(pool.fixture_host_peak().unwrap(), accepted_peak);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
 
 #[test]
 fn capture_none_still_publishes_its_actual_retained_admission_payload() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 20, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let capabilities = CaptureCapabilities::default();
     let admitted = CapturePlan::none()
@@ -596,3 +674,11 @@ fn capture_none_still_publishes_its_actual_retained_admission_payload() {
     reclaim(&pool, 0);
     drop(publication);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

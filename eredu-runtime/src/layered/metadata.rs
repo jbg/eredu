@@ -17,6 +17,17 @@ impl<E> LayeredMetadata<E> {
             context: context.clone(),
         }
     }
+
+    pub(crate) fn require_funding<T>(&self) -> Result<(), E> {
+        if self.context.metadata_funding().is_none() {
+            return Err((self.error)(
+                eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+            ));
+        }
+        self.context
+            .charge_metadata(std::mem::size_of::<(Self, T, Result<(), E>)>())
+            .map_err(|cause| (self.error)(cause.into()))
+    }
 }
 
 pub(super) struct Destination<E>(pub Option<LayeredMetadata<E>>);
@@ -41,7 +52,9 @@ impl<E> Destination<E> {
     }
     pub fn text(&self, args: std::fmt::Arguments<'_>) -> Result<String, E> {
         match self.context() {
-            Some(context) => context.metadata_string(args).map_err(|cause| self.map(cause)),
+            Some(context) => context
+                .metadata_string(args)
+                .map_err(|cause| self.map(cause)),
             None => Ok(args.to_string()),
         }
     }

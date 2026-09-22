@@ -24,17 +24,21 @@ mod routed_partition;
 mod routed_session;
 mod workspace;
 pub(crate) use workspace::layerwise::WorkspaceLayerwisePolicy;
-pub(crate) use workspace::parallel::{PreparedDirectPartitionSource, PreparedCompositeModelSource, PreparedFamilyPartitionModelSource};
+pub(crate) use workspace::parallel::{
+    PreparedCompositeModelSource, PreparedDirectPartitionSource, PreparedFamilyPartitionModelSource,
+};
 
 pub use workspace::{
-    BorrowedTextSamplingWorkspace, EmbeddedTargetWorkspaceObservation, InferenceEquationTraceObserver, MediaEquationInterval,
+    AddressableBindingDestinations, BorrowedTextSamplingWorkspace,
+    EmbeddedPredictionWorkspaceObservation, EmbeddedTargetWorkspaceObservation,
+    InferenceEquationTraceObserver, InvocationWorkspaceObservation, MediaEquationInterval,
     OriginalMediaWorkspaceInput, OriginalMediaWorkspaceInputError, OriginalMediaWorkspaceReport,
     OriginalMediaWorkspaceTraceError, OriginalMediaWorkspaceTraceFailure,
-    PreparedInferenceBlueprint, PreparedMediaWorkspaceTensor, PreparedTextGenerationWorkspace,
-    ReplicatedTextBindingDestinations, WorkspaceLayerwiseParameters, WorkspacePredictionEquationTails, EmbeddedPredictionWorkspaceObservation,
+    PartitionedTextBindingDestinations, PreparedInferenceBlueprint, PreparedMediaWorkspaceTensor,
+    PreparedTextGenerationWorkspace, ReplicatedTextBindingDestinations,
+    WorkspaceLayerwiseParameters, WorkspacePredictionEquationTails,
+    project_addressable_binding_destinations, project_partitioned_text_binding_destinations,
     project_replicated_text_binding_destinations,
-    PartitionedTextBindingDestinations, project_partitioned_text_binding_destinations,
-    AddressableBindingDestinations, project_addressable_binding_destinations,
 };
 
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
@@ -68,7 +72,7 @@ pub enum PreparedExecutionError<E> {
     Metadata(eredu_nn::Error),
     /// A native materialization, communication, or publication mechanism failed.
     #[error("prepared execution mechanism failed: {0}")]
-    Backend(E),
+    Backend(#[source] E),
     /// A partitioned selection has no realized communication.
     #[error("partitioned construction has no realized communication")]
     MissingCommunication,
@@ -416,7 +420,13 @@ where
     PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, A::Executable, A::Error>,
     PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, A::Executable, A::Error>,
 {
-    construct_prepared_execution_impl(sources, communication, routes, assembler, ConstructionPurpose::Executable)
+    construct_prepared_execution_impl(
+        sources,
+        communication,
+        routes,
+        assembler,
+        ConstructionPurpose::Executable,
+    )
 }
 
 // These private metadata consumers share selection and typed construction.
@@ -488,21 +498,23 @@ where
             if target_equations {
                 None
             } else {
-            Some(PreparedPredictionSelection {
-                placement: Arc::clone(&graph.prediction_placement),
-                publish_placement: purpose == ConstructionPurpose::Executable,
-                extension: extension.clone(),
-                source: source.clone(),
-                realization: realization.clone(),
-                capability: crate::prediction_extension::prediction_extension_capability(extension)
+                Some(PreparedPredictionSelection {
+                    placement: Arc::clone(&graph.prediction_placement),
+                    publish_placement: purpose == ConstructionPurpose::Executable,
+                    extension: extension.clone(),
+                    source: source.clone(),
+                    realization: realization.clone(),
+                    capability: crate::prediction_extension::prediction_extension_capability(
+                        extension,
+                    )
                     .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
-                topology,
-                residency: selected.text_realization().residency(),
-                tasks: selected
-                    .text_realization()
-                    .auxiliary_materialization_tasks()
-                    .to_vec(),
-            })
+                    topology,
+                    residency: selected.text_realization().residency(),
+                    tasks: selected
+                        .text_realization()
+                        .auxiliary_materialization_tasks()
+                        .to_vec(),
+                })
             }
         }
         (None, None, None, None) => None,
@@ -547,7 +559,10 @@ where
     let extension_sources = if target_equations {
         BTreeSet::new()
     } else {
-        graph.extension().map(|source| source.source_keys().into_iter().collect()).unwrap_or_default()
+        graph
+            .extension()
+            .map(|source| source.source_keys().into_iter().collect())
+            .unwrap_or_default()
     };
     let context = BranchContext {
         inspection: PreparedConstructionInspection { sources },
@@ -724,5 +739,30 @@ fn composite_partitioned_error<E>(
     match error {
         Visitor(error) => PreparedExecutionError::Backend(error),
         Architecture(error) => PreparedExecutionError::Architecture(error),
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::PreparedExecutionError;
+    use std::error::Error as _;
+
+    #[test]
+    fn construction_preserves_the_mechanism_source_chain() {
+        let cause = eredu_nn::Error::backend_retained_source(std::io::Error::from(
+            std::io::ErrorKind::OutOfMemory,
+        ));
+        let failure = PreparedExecutionError::Backend(cause);
+        let neural = failure.source().unwrap();
+        assert!(neural.downcast_ref::<eredu_nn::Error>().is_some());
+        assert_eq!(
+            neural
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::OutOfMemory,
+        );
     }
 }

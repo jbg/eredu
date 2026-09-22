@@ -35,7 +35,8 @@ fn original_prediction_bank_accepts_real_started_decode_and_independent_retireme
             });
             let source = capture.then(capture_source);
             let options = source.as_ref().map(|s| TextPreparationOptions {
-                interventions: None, capture: Some(s.clone()),
+                interventions: None,
+                capture: Some(s.clone()),
             });
             let tokens = if controlled {
                 ControlledTextGeneration::from_input_with_sequence(
@@ -80,15 +81,15 @@ fn original_prediction_bank_accepts_real_started_decode_and_independent_retireme
             }
             let (pool, held) = retire_request(&state);
             drop((tokens, rt, state, source));
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(native);
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.payload_used_bytes().unwrap(),
                 held,
                 "independent Rust Recovery custody still owns original Q"
             );
             drop(recovery);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -176,10 +177,10 @@ fn original_prediction_bank_rejects_foreign_preparation_and_abandoned_active_ste
     ));
     let (other_pool, _) = retire_request(&other_state);
     drop((other_rt, other_state));
-    assert_eq!(other_pool.used_bytes().unwrap(), 0);
+    assert_eq!(other_pool.payload_used_bytes().unwrap(), 0);
     let (pool, _) = retire_request(&state);
     drop((rt, state));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -207,7 +208,7 @@ fn zero_output_and_initial_cancellation_never_issue_prediction_roles() {
         drop(run);
         let (pool, _) = retire_request(&state);
         drop((rt, state));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -241,5 +242,8 @@ fn original_prediction_bank_checks_registered_source_health_before_issuing_any_r
     let source_envelope = state.borrow().source_envelope;
     let (pool, _) = retire_request(&state);
     drop((rt, state));
-    assert_eq!(pool.used_bytes().unwrap(), source_envelope + 64);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        source_envelope + publication_controls() + 64
+    );
 }

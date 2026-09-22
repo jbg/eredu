@@ -7,8 +7,8 @@ fn overlapping_added_token_retains_paid_capacity_without_extending_logical_domai
     let input = INPUT.replace("\"Ġ\":3", "\"Ġ\":3,\"<S>\":4");
     let plan = generation(&input);
     assert_eq!(plan.generation_domain_extent(), Some(6));
-    let bytes = WorkingMemoryPool::tokenizer_required_bytes(&plan).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::tokenizer_required_bytes(&plan).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let source = pool.compile_tokenizer(plan).unwrap();
     let Some(TokenFilter::Allowed(mask)) = source.generation_domain() else {
         panic!("original mask")
@@ -20,19 +20,19 @@ fn overlapping_added_token_retains_paid_capacity_without_extending_logical_domai
         "logical canonicalization does not refund storage"
     );
     assert_eq!(source.original_bytes(), bytes);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn generation_domain_is_originally_admitted_and_all_strong_exits_retain_its_full_c() {
-    let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(INPUT)).unwrap();
-    let plain = WorkingMemoryPool::tokenizer_required_bytes(&plan(INPUT)).unwrap();
+    let bytes = MemoryLedger::tokenizer_required_bytes(&generation(INPUT)).unwrap();
+    let plain = MemoryLedger::tokenizer_required_bytes(&plan(INPUT)).unwrap();
     // The dense vocabulary adds five mask entries and its source-operation
     // controls. Admission/retirement below use the complete published quote;
     // later encode errors do not determine source-compiler storage.
     assert!(bytes >= plain + 5);
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(bytes - 1, 0).unwrap();
     let error = short
         .compile_tokenizer_inner(
             generation(INPUT),
@@ -42,11 +42,11 @@ fn generation_domain_is_originally_admitted_and_all_strong_exits_retain_its_full
         )
         .unwrap_err();
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let source = pool
         .compile_tokenizer_with(generation(INPUT), || {
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
             assert!(matches!(
                 pool.acquire_unquoted(),
                 Err(WorkingMemoryError::ReservedWorkActive)
@@ -57,23 +57,23 @@ fn generation_domain_is_originally_admitted_and_all_strong_exits_retain_its_full
         source.generation_domain(),
         Some(&TokenFilter::Allowed(vec![true; 5]))
     );
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     let alias = source.clone();
     let object = source.generation_domain().unwrap() as *const TokenFilter;
     assert!(std::ptr::eq(alias.generation_domain().unwrap(), object));
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     let peer = alias.clone();
     std::thread::scope(|scope| {
         scope.spawn(move || drop(alias));
         scope.spawn(move || drop(peer));
     });
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn actual_domain_reserve_failure_retains_completed_compiler_until_error_retirement() {
-    let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(INPUT)).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::tokenizer_required_bytes(&generation(INPUT)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let error = pool
         .compile_tokenizer_inner(generation(INPUT), || {}, true, None)
         .unwrap_err();
@@ -82,9 +82,9 @@ fn actual_domain_reserve_failure_retains_completed_compiler_until_error_retireme
     assert!(error._completed.is_some());
     assert!(error._completed.as_ref().unwrap().spelling(2).is_some());
     assert_eq!(error.retained_bytes(), bytes);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     let error = BackendFailure::new(eredu_core::BackendFailureKind::ResourceExhausted, error);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     assert!(
         error
             .source()
@@ -94,14 +94,14 @@ fn actual_domain_reserve_failure_retains_completed_compiler_until_error_retireme
             .is::<TryReserveError>()
     );
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn sparse_domain_and_declared_added_ids_use_actual_fresh_assignment() {
     for declared in [0, 1, 4, u32::MAX] {
         let input = INPUT.replace("\"id\":4", &format!("\"id\":{declared}"));
-        let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(&input)).unwrap();
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let bytes = MemoryLedger::tokenizer_required_bytes(&generation(&input)).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
         let source = pool.compile_tokenizer(generation(&input)).unwrap();
         assert_eq!(source.token_id("<S>"), Some(4));
         assert_eq!(
@@ -109,11 +109,11 @@ fn sparse_domain_and_declared_added_ids_use_actual_fresh_assignment() {
             Some(&TokenFilter::Allowed(vec![true; 5]))
         );
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     let input = INPUT.replace("\"Ġ\":3", "\"Ġ\":100");
-    let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(&input)).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::tokenizer_required_bytes(&generation(&input)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let source = pool.compile_tokenizer(generation(&input)).unwrap();
     let TokenFilter::Allowed(mask) = source.generation_domain().unwrap() else {
         panic!()
@@ -125,10 +125,10 @@ fn sparse_domain_and_declared_added_ids_use_actual_fresh_assignment() {
     }
     assert!(!mask[3]);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let largest = INPUT.replace("\"Ġ\":3", "\"Ġ\":4294967295");
-    let base = WorkingMemoryPool::tokenizer_required_bytes(&plan(&largest)).unwrap();
-    let pool = WorkingMemoryPool::new(base, 0).unwrap();
+    let base = MemoryLedger::tokenizer_required_bytes(&plan(&largest)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(base, 0).unwrap();
     let decoder_only = pool.compile_tokenizer(plan(&largest)).unwrap();
     assert!(decoder_only.generation_domain().is_none());
     assert_eq!(decoder_only.spelling(u32::MAX), Some("Ġ"));
@@ -146,21 +146,21 @@ fn sparse_domain_and_declared_added_ids_use_actual_fresh_assignment() {
     } else {
         assert!(selected.is_err());
     }
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn generation_domain_construction_unwind_retires_only_after_actual_compiler_scope() {
-    let bytes = WorkingMemoryPool::tokenizer_required_bytes(&generation(INPUT)).unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let bytes = MemoryLedger::tokenizer_required_bytes(&generation(INPUT)).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = pool.compile_tokenizer_with(generation(INPUT), || {
-            assert_eq!(pool.used_bytes().unwrap(), bytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
             panic!("after actual admission");
         });
     }));
     assert!(panic.is_err());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    drop(pool.acquire_unquoted().unwrap());
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
 }
 
 #[test]
@@ -172,8 +172,8 @@ fn original_text_error_wrappers_retain_actual_stop_reserve_prefix_and_late_encod
             .unwrap()
             .fail_reservation(stage);
         let packed = plan.requirements().buffer_bytes();
-        let bytes = WorkingMemoryPool::stop_source_required_bytes(&plan).unwrap();
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let bytes = MemoryLedger::stop_source_required_bytes(&plan).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(bytes, 0).unwrap();
         let error = OriginalTextSourceError::from(pool.compile_stop_source(plan).unwrap_err());
         let OriginalTextSourceError::Stop(cause) = &error else {
             panic!()
@@ -195,9 +195,9 @@ fn original_text_error_wrappers_retain_actual_stop_reserve_prefix_and_late_encod
             at = e.source();
         }
         assert!(allocation);
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     // INPUT also tests a construction-only Digits profile; use the supported
     // identity encoding path to reach the real late missing-unknown failure.
@@ -210,10 +210,10 @@ fn original_text_error_wrappers_retain_actual_stop_reserve_prefix_and_late_encod
             "\"merges\":[[\"h\",\"i\"]]",
             "\"merges\":[[\"h\",\"i\"]],\"unk_token\":\"missing\"",
         );
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     let source = pool.compile_tokenizer(generation(&json)).unwrap();
     let c = source.original_bytes();
-    let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&source, "<S>hz", false).unwrap();
+    let e = MemoryLedger::tokenizer_encode_required_bytes(&source, "<S>hz", false).unwrap();
     let error = OriginalTextSourceError::from(
         pool.encode_tokenizer_ids(&source, "<S>hz", false)
             .unwrap_err(),
@@ -228,7 +228,7 @@ fn original_text_error_wrappers_retain_actual_stop_reserve_prefix_and_late_encod
         EncodeIdsError::Upstream(_)
     ));
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), c + e);
+    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

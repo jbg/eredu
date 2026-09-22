@@ -2,7 +2,7 @@
 use super::*;
 use eredu_nn::{
     Error,
-    workspace::{WorkspaceContext, HostMetadataFunding},
+    workspace::{HostMetadataFunding, WorkspaceContext},
 };
 use eredu_runtime::CacheBlockSelection;
 use std::{
@@ -10,9 +10,27 @@ use std::{
     sync::TryLockError,
 };
 
+#[path = "source/prompt_cache.rs"]
+mod prompt_cache;
+pub(crate) use prompt_cache::{PromptCacheSourceRow, PromptCacheSourceRows};
+
+fn initialized_mutex_control_bytes<T>() -> Option<usize> {
+    usize::try_from(
+        eredu_runtime::working_memory::OriginalHostMetadataCustody::initialized_mutex_bytes()
+            .ok()?,
+    )
+    .ok()?
+    .checked_add(size_of::<MutexGuard<'_, T>>())?
+    .checked_add(size_of::<
+        Result<MutexGuard<'_, T>, std::sync::PoisonError<MutexGuard<'_, T>>>,
+    >())
+}
+
 /// Fixed source rejection, preserved by the caller's metadata owner.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CacheSourceError {
+    #[error(transparent)]
+    TransferSource(#[from] CacheTransferStreamError),
     #[error("cache source manager is busy")]
     Busy,
     #[error("cache source manager is poisoned")]
@@ -58,6 +76,10 @@ pub(crate) enum CacheSourceError {
     #[error(transparent)]
     DeviceRetirementAttachment(safemlx::OriginalBufferCause),
     #[error(transparent)]
+    OrdinaryHostOwner(safemlx::PreparedAllocationOwnerCause),
+    #[error(transparent)]
+    OrdinaryHostWriter(safemlx::OrdinaryHostWriterError),
+    #[error(transparent)]
     HostPublication(host_demotion::HostPublicationError),
     #[error(transparent)]
     Lifecycle(#[from] CacheLifecycleError),
@@ -70,7 +92,7 @@ pub(crate) enum CacheSourceError {
     #[error(transparent)]
     DiskReservation(eredu_runtime::cache::CachePoolReservationPreparationFailure),
     #[error(transparent)]
-    DiskAdmission(eredu_runtime::cache::CachePoolReservationAdmissionFailure),
+    ReservationAdmission(eredu_runtime::cache::CachePoolReservationAdmissionFailure),
     #[error("original paged append window removal is not yet qualified")]
     AppendWindow,
     #[error("original paged relative-bias source is not yet qualified")]
@@ -97,6 +119,16 @@ pub(crate) struct CacheSourceFailure {
     _funding: Option<HostMetadataFunding>,
 }
 impl CacheSourceFailure {
+    /// Retains the actual payer after a prepared source has left its context.
+    pub(super) fn retained_source(
+        cause: CacheSourceError,
+        funding: Option<HostMetadataFunding>,
+    ) -> Self {
+        Self {
+            cause: CacheSourceFailureCause::Source(cause),
+            _funding: funding,
+        }
+    }
     pub(crate) fn source(cause: CacheSourceError, context: &WorkspaceContext) -> Self {
         Self {
             cause: CacheSourceFailureCause::Source(cause),
@@ -158,6 +190,9 @@ impl<'a> CacheDiskSource<'a> {
     }
     /// Actual live-file retirement owner. A path or digest alone is not this
     /// source; persistent prompt shards retain their separate artifact owner.
+    pub(crate) fn file_source(self) -> Option<CacheFileSource> {
+        self.location.file_source()
+    }
     pub(crate) fn live_file(self) -> Option<&'a LiveCacheBlockSource> {
         self.location.live_source.as_ref()
     }
@@ -280,7 +315,9 @@ impl<'a> CacheBlockSourceLoan<'a> {
     }
     /// Fixed controls of this actual manager publication worker; no future
     /// block/row allowance is inferred from the retained scalar.
-    pub(crate) fn publication_control_bytes(&self) -> usize { self.publication_controls }
+    pub(crate) fn publication_control_bytes(&self) -> usize {
+        self.publication_controls
+    }
     pub(crate) fn catalog_population(&self) -> (usize, usize) {
         self.lifecycle.catalog_population()
     }
@@ -475,11 +512,17 @@ pub(crate) use registered_copy::{PagedArrayCopyLayout, PreparedPagedArrayCopy};
 
 #[path = "source/host_promotion.rs"]
 mod host_promotion;
-pub(crate) use host_promotion::{PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots};
+pub(crate) use host_promotion::{
+    PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots, PreparedHostPromotion,
+    PreparedHostReturn, PreparedOrdinaryCacheHostPromotion,
+};
 
 #[path = "source/host_demotion.rs"]
 mod host_demotion;
-pub(crate) use host_demotion::{PreparedCacheHostDemotion, StoredCacheHostSource};
+pub(crate) use host_demotion::{
+    PreparedCacheHostDemotion, PreparedHostEviction, PreparedOrdinaryCacheHostDemotion,
+    StoredCacheHostSource,
+};
 
 #[path = "source/disk_write.rs"]
 mod disk_write;
@@ -495,7 +538,8 @@ pub(crate) use disk_read::{
     DiskReadOperationFailure, PreparedDiskRead, PreparedDiskReadOutput, PreparedDiskReadSource,
 };
 
-pub(crate) use disk_write::PreparedDiskWriteDestination;
+pub(crate) use disk_write::{OrdinaryWrittenCacheHostSource, PreparedDiskWriteHostRetirement};
+pub(crate) use disk_write::{PreparedCacheDiskWriteSource, PreparedDiskWriteDestination};
 
 pub(crate) use disk_write::{InstalledDiskWorker, PreparedDiskWorker};
 
@@ -508,3 +552,5 @@ mod disk_backing;
 
 #[path = "source/device_retirement.rs"]
 mod device_retirement;
+
+pub(crate) use disk_read::{OrdinaryDiskReadSource, OrdinaryReadCacheHostSource};

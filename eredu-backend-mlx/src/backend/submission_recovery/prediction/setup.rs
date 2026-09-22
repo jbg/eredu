@@ -95,6 +95,11 @@ pub(super) fn begin_original_with_model<T: PredictionRetention>(
             drop(pending);
             Error::PredictionScope(cause)
         })?;
+        // The role owns host controls only. Bind the exact operation's
+        // ordinary Work before callbacks can borrow its indexed/cache sources.
+        active.configure_scope_with_retention(|scope, retention| {
+            retention.configure_ordinary_scope(scope)
+        }).map_err(Error::from)?;
         if let Some((registration, request)) = operations {
             let node = active.node.as_mut().expect("accepted host prediction node").node_mut();
             node.registration = registration.register_for_retirement(

@@ -1,0 +1,48 @@
+diff --git a/mlx/record_quota.h b/mlx/record_quota.h
+--- a/mlx/record_quota.h
++++ b/mlx/record_quota.h
+@@ -24,7 +24,7 @@
+   unbound_record = 4,
+ };
+ 
+-enum class RecordCapacity : uint8_t { arena, streams, outputs, captures };
++enum class RecordCapacity : uint8_t { arena, streams, outputs, captures, traversal_items, input_edges };
+ 
+ class MLX_API RecordQuotaError final : public std::exception {
+  public:
+diff --git a/mlx/record_quota.cpp b/mlx/record_quota.cpp
+--- a/mlx/record_quota.cpp
++++ b/mlx/record_quota.cpp
+@@ -61,6 +61,8 @@
+         case RecordCapacity::streams: return "submission tracking stream capacity exhausted";
+         case RecordCapacity::outputs: return "submission tracking output capacity exhausted";
+         case RecordCapacity::captures: return "submission tracking capture capacity exhausted";
++        case RecordCapacity::traversal_items: return "submission tracking traversal item capacity exhausted";
++        case RecordCapacity::input_edges: return "submission tracking input edge capacity exhausted";
+       }
+       return "submission tracking capacity exhausted";
+     case QuotaFailure::invalid_layout: return "invalid submission tracking layout";
+diff --git a/mlx/eval_storage.h b/mlx/eval_storage.h
+--- a/mlx/eval_storage.h
++++ b/mlx/eval_storage.h
+@@ -16,7 +16,7 @@
+ 
+   void room() const {
+     if (values_.size() == limit_)
+-      throw submission::RecordQuotaError(submission::QuotaFailure::exhausted);
++      throw submission::RecordQuotaError(submission::QuotaFailure::exhausted, submission::RecordCapacity::traversal_items);
+   }
+ 
+  public:
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -523,7 +523,7 @@
+         // Add an input, and continue
+         if constexpr (Fixed) {
+           if (visited_edges == limits->input_edges)
+-            throw submission::RecordQuotaError(submission::QuotaFailure::exhausted);
++            throw submission::RecordQuotaError(submission::QuotaFailure::exhausted, submission::RecordCapacity::input_edges);
+           ++visited_edges;
+         }
+         auto& in = a.inputs()[idx++];

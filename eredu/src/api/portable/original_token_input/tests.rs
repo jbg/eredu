@@ -2,6 +2,7 @@
 //! The tiny backend has no native allocation or model equations; numerical
 //! residency parity is covered by the native fixture in this same package.
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use eredu_core::run_preparation::{
     TextPreparationOutcome as Outcome, TextPreparationStage as Stage,
     TextPreparationStatus as Status,
@@ -16,7 +17,7 @@ struct Facts {
     order: Vec<&'static str>,
     preparation_control_enabled: bool,
     preparation_control_failed: bool,
-    preparation_control_calls: Vec<(Stage,Status)>,
+    preparation_control_calls: Vec<(Stage, Status)>,
     preparation_control_drops: usize,
     total_agreements: usize,
     speculative_prompts: Vec<Vec<u32>>,
@@ -47,7 +48,9 @@ struct Facts {
 }
 struct PreparationControl(Rc<RefCell<Facts>>);
 impl Drop for PreparationControl {
-    fn drop(&mut self){self.0.borrow_mut().preparation_control_drops+=1;}
+    fn drop(&mut self) {
+        self.0.borrow_mut().preparation_control_drops += 1;
+    }
 }
 #[derive(Clone)]
 struct Ordinary;
@@ -55,7 +58,7 @@ struct Ordinary;
 #[derive(Clone)]
 struct Backend<M: Clone + 'static = Ordinary> {
     mode: std::marker::PhantomData<M>,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     facts: Rc<RefCell<Facts>>,
     execution: InferenceExecutionIdentity,
 }
@@ -84,7 +87,10 @@ impl<M: Clone + 'static> eredu_runtime::prefill::PrefillExecutor for NoTensorPre
             output: (chunk.output != OutputDemand::StateOnly).then(|| {
                 let mut facts = self.0.facts.borrow_mut();
                 facts.next_prediction = 1;
-                facts.prediction_sequence.first().copied()
+                facts
+                    .prediction_sequence
+                    .first()
+                    .copied()
                     .unwrap_or_else(|| facts.prediction_ids.map_or(0, |ids| ids[0]))
             }),
             completion: Done,
@@ -153,7 +159,11 @@ impl<M: Clone + 'static> BackendSession<Backend<M>> for Session {
     ) -> Result<Submission<Token, Done>, WorkingMemoryError> {
         unreachable!("permitted shared driver only")
     }
-    fn observe_output(&self, _: &Backend<M>, _: &Token) -> Result<ObservationSet, WorkingMemoryError> {
+    fn observe_output(
+        &self,
+        _: &Backend<M>,
+        _: &Token,
+    ) -> Result<ObservationSet, WorkingMemoryError> {
         Ok(ObservationSet::default())
     }
 }
@@ -168,6 +178,9 @@ struct Preparation {
 #[derive(Debug)]
 struct NoOperations;
 impl WorkspaceMechanisms for NoOperations {
+    fn memory_topology(&self) -> Option<&MemoryTopology> {
+        Some(crate::memory_fixture::topology_ref())
+    }
     fn operation_bound(
         &self,
         _: &WorkspaceOperation,
@@ -178,11 +191,7 @@ impl WorkspaceMechanisms for NoOperations {
 fn memory(e: impl std::error::Error + Send + Sync + 'static) -> BackendFailure {
     BackendFailure::from_error(e)
 }
-fn quote(
-    pool: &WorkingMemoryPool,
-    g: InferenceGeometry,
-    mask_bytes: u64,
-) -> IncrementalInferenceQuote {
+fn quote(pool: &MemoryLedger, g: InferenceGeometry, mask_bytes: u64) -> IncrementalInferenceQuote {
     let context = WorkspaceContext::new(NoOperations);
     let storage = RegisteredWorkspaceStorage::bind(
         pool,
@@ -203,16 +212,25 @@ fn quote(
         EstimationCompleteness::Complete,
     )
     .unwrap();
-    let state = estimate_runtime_state(
-        &layout,
-        InputTokenCount::text(g.input_positions),
-        g.max_output_tokens,
-        1,
-        NonZeroU8::new(4).unwrap(),
-    )
-    .unwrap();
+    let mut state = crate::memory_fixture::state(
+        estimate_runtime_state(
+            &layout,
+            InputTokenCount::text(g.input_positions),
+            g.max_output_tokens,
+            1,
+            NonZeroU8::new(4).unwrap(),
+        )
+        .unwrap(),
+    );
+    state.physical_domains = Some(DomainRuntimeStateEstimate {
+        geometry: g,
+        decoder_state: crate::memory_fixture::requirements(state.requested_state_bytes),
+        media_embeddings: crate::memory_fixture::requirements(0),
+        media_workspace: crate::memory_fixture::requirements(0),
+    });
     let zero = || WorkspaceBound::bounded(0, "neutral fixture has no backend payload");
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry: g,
         activations: zero(),
         attention: zero(),
@@ -223,29 +241,49 @@ fn quote(
         state_update: zero(),
         materialization: zero(),
         retained: zero(),
-    };
+    });
     ResidualInferenceQuote::compose(&report, state, outside, &storage)
         .unwrap()
         .into_incremental()
 }
 impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
-    fn text_execution_control_support(_: &ModelRuntime<Self>) -> eredu_core::execution_control::ControlSupport<&'static str> {
+    fn text_execution_control_support(
+        _: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport<&'static str> {
         // This fixture executes the actual completed-token ordinary machine;
         // there are no native submissions or asynchronous pending tensors.
         eredu_core::execution_control::ControlSupport::Supported
     }
 
-    fn prepare_shared_token_filter(runtime: &ModelRuntime<Self>, factory: impl FnOnce() -> TokenFilter)
-        -> Result<SharedTokenFilter, BackendFailure> {
-        runtime.backend().pool.prepare_shared_token_filter(factory).map_err(memory)
+    fn prepare_shared_token_filter(
+        runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> TokenFilter,
+    ) -> Result<SharedTokenFilter, BackendFailure> {
+        runtime
+            .backend()
+            .pool
+            .prepare_shared_token_filter(factory)
+            .map_err(memory)
     }
-    fn prepare_shared_controller_bytes(runtime: &ModelRuntime<Self>, factory: impl FnOnce() -> Vec<u8>)
-        -> Result<SharedControllerBytes, BackendFailure> {
-        runtime.backend().pool.prepare_shared_controller_bytes(factory).map_err(memory)
+    fn prepare_shared_controller_bytes(
+        runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Vec<u8>,
+    ) -> Result<SharedControllerBytes, BackendFailure> {
+        runtime
+            .backend()
+            .pool
+            .prepare_shared_controller_bytes(factory)
+            .map_err(memory)
     }
-    fn prepare_shared_controller_declaration<T: ControllerDeclarationData>(runtime: &ModelRuntime<Self>,
-        factory: impl FnOnce() -> Result<T, BackendFailure>) -> Result<SharedControllerDeclaration, BackendFailure> {
-        runtime.backend().pool.prepare_shared_controller_declaration(factory).map_err(memory)
+    fn prepare_shared_controller_declaration<T: ControllerDeclarationData>(
+        runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Result<T, BackendFailure>,
+    ) -> Result<SharedControllerDeclaration, BackendFailure> {
+        runtime
+            .backend()
+            .pool
+            .prepare_shared_controller_declaration(factory)
+            .map_err(memory)
     }
     type TextPreparation = Rc<Preparation>;
     type TextPreparationControl = Rc<PreparationControl>;
@@ -284,7 +322,11 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
             if options.capture.is_some() || options.interventions.is_some() {
                 return Err(memory(WorkingMemoryError::UnknownBound));
             }
-            runtime.backend().facts.borrow_mut().empty_preparation_options += 1;
+            runtime
+                .backend()
+                .facts
+                .borrow_mut()
+                .empty_preparation_options += 1;
         }
         let TextPreparationInput::OriginalTokenIds(plan) = input else {
             panic!("exact borrowed input required")
@@ -292,9 +334,10 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
         assert!(std::ptr::eq(*plan, claim.request().token_input().unwrap()));
         let b = runtime.backend();
         b.facts.borrow_mut().order.push("admit");
-        b.facts.borrow_mut().at_admission = b.pool.used_bytes().unwrap();
-        let controller = if let Some(workspace) = controller_input
-            .inference_workspace(claim.request().max_new_tokens() as u64) {
+        b.facts.borrow_mut().at_admission = b.pool.live_charge_bytes().unwrap();
+        let controller = if let Some(workspace) =
+            controller_input.inference_workspace(claim.request().max_new_tokens() as u64)
+        {
             let storage = ControllerStorageContract::inspect_original_sequence(
                 controller_input,
                 workspace,
@@ -320,10 +363,12 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
             prefill_chunk_positions: 1,
             output: OutputDemand::LastPosition,
         };
-        let mask_bytes = controller
-            .as_ref()
-            .map_or(0, |(_, contract)| contract.filter_capacity_bytes()
-                .checked_add(contract.additional_host_bytes()).expect("finite fixture controller workspace"));
+        let mask_bytes = controller.as_ref().map_or(0, |(_, contract)| {
+            contract
+                .filter_capacity_bytes()
+                .checked_add(contract.additional_host_bytes())
+                .expect("finite fixture controller workspace")
+        });
         let original = quote(&b.pool, g, mask_bytes);
         let controls = PreparedTextControlWorkspace::prepare_sequence(
             claim,
@@ -343,7 +388,31 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
         let quote = original
             .with_span_workspace_and_text_controls(controls)
             .unwrap();
-        let exact = b.pool.used_bytes().unwrap() + quote.incremental_bytes();
+        let quote_admission = Admission {
+            requested_positions: g
+                .cached_positions
+                .checked_add(g.input_positions)
+                .unwrap()
+                .checked_add(g.max_output_tokens)
+                .unwrap(),
+            state: quote.state().clone(),
+            incremental_required_bytes: quote.incremental_bytes(),
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+        };
+        let increment = quote
+            .reservation_requirements(&quote_admission)
+            .unwrap()
+            .get(b.pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
+        let exact = b
+            .pool
+            .live_charge_bytes()
+            .unwrap()
+            .checked_add(increment)
+            .unwrap();
         let capacity = {
             let facts = b.facts.borrow();
             if facts.short {
@@ -365,9 +434,8 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
             input: InputTokenCount::text(g.input_positions),
             max_output_tokens: g.max_output_tokens,
             batch_size: 1,
-            safety_reserve_bytes: 0,
-            application_memory_budget_bytes: None,
-            require_complete_estimate: true,
+            additional_headroom: Default::default(),
+            memory_limits: Default::default(),
         };
         let execution = b.execution.clone();
         let (reservation, accepted) = plan_prefill_incremental_with_capacity(
@@ -376,7 +444,7 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
             &caps,
             admission,
             g,
-            capacity,
+            crate::memory_fixture::resolved_limits(capacity),
             |_| Ok(quote.clone()),
         )
         .map_err(memory)?;
@@ -468,27 +536,37 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
         p.request.claim_sampling(c)?.finish()
     }
     fn prepare_text_preparation_control(
-        runtime:&ModelRuntime<Self>,input:&TextPreparationInput<'_,Self::Prompt>,
-        _:TextGenerationConfig,claim:&GenerationSequencePreparation<'_, '_>,
-    )->Result<Option<Self::TextPreparationControl>,BackendFailure> {
-        let facts=&runtime.backend().facts;
+        runtime: &ModelRuntime<Self>,
+        input: &TextPreparationInput<'_, Self::Prompt>,
+        _: TextGenerationConfig,
+        claim: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Option<Self::TextPreparationControl>, BackendFailure> {
+        let facts = &runtime.backend().facts;
         if facts.borrow().preparation_control_failed {
             return Err(TokenInputRejection::Unsupported.into_backend_failure());
         }
-        if !facts.borrow().preparation_control_enabled {return Ok(None);}
-        assert!(matches!(input,TextPreparationInput::OriginalTokenIds(_)));
+        if !facts.borrow().preparation_control_enabled {
+            return Ok(None);
+        }
+        assert!(matches!(input, TextPreparationInput::OriginalTokenIds(_)));
         assert!(claim.request().token_input().is_some());
         Ok(Some(Rc::new(PreparationControl(facts.clone()))))
     }
     fn agree_text_preparation_with_control(
-        runtime:&ModelRuntime<Self>,control:Option<&Self::TextPreparationControl>,
-        stage:Stage,status:Status,
-    )->Result<Outcome,BackendFailure> {
-        if let Some(control)=control {
-            assert!(Rc::ptr_eq(&control.0,&runtime.backend().facts));
-            control.0.borrow_mut().preparation_control_calls.push((stage,status));
+        runtime: &ModelRuntime<Self>,
+        control: Option<&Self::TextPreparationControl>,
+        stage: Stage,
+        status: Status,
+    ) -> Result<Outcome, BackendFailure> {
+        if let Some(control) = control {
+            assert!(Rc::ptr_eq(&control.0, &runtime.backend().facts));
+            control
+                .0
+                .borrow_mut()
+                .preparation_control_calls
+                .push((stage, status));
         }
-        Self::agree_text_preparation(runtime,stage,status)
+        Self::agree_text_preparation(runtime, stage, status)
     }
     fn agree_text_preparation(
         runtime: &ModelRuntime<Self>,
@@ -496,7 +574,7 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
         status: Status,
     ) -> Result<Outcome, BackendFailure> {
         let mut facts = runtime.backend().facts.borrow_mut();
-        facts.total_agreements+=1;
+        facts.total_agreements += 1;
         if stage == Stage::Delivery {
             facts.order.push("delivery");
         }
@@ -560,14 +638,18 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
             .run_final(&mut NoTensorPrefill(runtime.backend()))
             .expect("the synchronous no-tensor fixture completes every admitted chunk");
         Ok(output.map(|id| {
-            assert!(decision.filter().allows(id), "scripted prefill token {id} must satisfy the actual controller mask");
+            assert!(
+                decision.filter().allows(id),
+                "scripted prefill token {id} must satisfy the actual controller mask"
+            );
             Submission {
-            output: Token {
-                id,
-                receipt: step.receipt(),
-            },
-            completion: Done,
-        }}))
+                output: Token {
+                    id,
+                    receipt: step.receipt(),
+                },
+                completion: Done,
+            }
+        }))
     }
     fn submit_text_decode_permitted(
         runtime: &mut ModelRuntime<Self>,
@@ -586,11 +668,18 @@ impl<M: Clone + 'static> TextGenerationBackend for Backend<M> {
                     if !facts.prediction_sequence.is_empty() {
                         let id = facts.prediction_sequence[facts.next_prediction];
                         facts.next_prediction += 1;
-                        assert!(decision.filter().allows(id), "scripted decode token {id} must satisfy the actual controller mask");
+                        assert!(
+                            decision.filter().allows(id),
+                            "scripted decode token {id} must satisfy the actual controller mask"
+                        );
                         id
                     } else {
                         let ids = facts.prediction_ids.unwrap_or([0, 8, 0]);
-                        if token.id == ids[0] { ids[1] } else { ids[2] }
+                        if token.id == ids[0] {
+                            ids[1]
+                        } else {
+                            ids[2]
+                        }
                     }
                 },
                 receipt: step.receipt(),
@@ -644,18 +733,18 @@ impl<M: Clone + 'static> OriginalStopSourceBackend for Backend<M> {
         result
     }
 }
-fn bare_runtime() -> (ModelRuntime<Backend>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
+fn bare_runtime() -> (ModelRuntime<Backend>, Rc<RefCell<Facts>>, MemoryLedger) {
     bare_runtime_with_capacity(10_000_000)
 }
 fn bare_runtime_with_capacity(
     capacity: u64,
-) -> (ModelRuntime<Backend>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
+) -> (ModelRuntime<Backend>, Rc<RefCell<Facts>>, MemoryLedger) {
     bare_runtime_with_capacity_for::<Ordinary>(capacity)
 }
 fn bare_runtime_with_capacity_for<M: Clone + 'static>(
     capacity: u64,
-) -> (ModelRuntime<Backend<M>>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+) -> (ModelRuntime<Backend<M>>, Rc<RefCell<Facts>>, MemoryLedger) {
+    let pool = crate::memory_fixture::host_ledger(capacity, 0).unwrap();
     let facts = Rc::new(RefCell::new(Facts::default()));
     let runtime = ModelRuntime::prepare(
         Backend {
@@ -699,7 +788,7 @@ impl OriginalStep {
     fn validate_decision(
         &self,
         decision: &TokenSamplingDecision<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         if let Some((storage, contract)) = &self.controller {
             storage
@@ -710,34 +799,64 @@ impl OriginalStep {
     }
 }
 impl<M: Clone + 'static> OriginalTokenizerBackend for Backend<M> {
-    fn validate_semantic_source(runtime: &ModelRuntime<Self>, source: &PreparedSemanticSource)
-        -> Result<(), TokenInputRejection> {
-        source.validate(&runtime.backend().pool, &runtime.backend().execution)
+    fn validate_semantic_source(
+        runtime: &ModelRuntime<Self>,
+        source: &PreparedSemanticSource,
+    ) -> Result<(), TokenInputRejection> {
+        source
+            .validate(&runtime.backend().pool, &runtime.backend().execution)
             .map_err(|_| TokenInputRejection::IdentityMismatch)
     }
-    fn prepare_semantic_source(runtime: &ModelRuntime<Self>, source: &OriginalTokenizer,
-        capacity: u64) -> Result<PreparedSemanticSource, SpeculativeOutputError> {
-        source.validate_pool(&runtime.backend().pool).map_err(|_| SpeculativeOutputError::Storage("foreign fixture source"))?;
+    fn prepare_semantic_source(
+        runtime: &ModelRuntime<Self>,
+        source: &OriginalTokenizer,
+        capacity: &MemoryLimitDeclarations,
+    ) -> Result<PreparedSemanticSource, SpeculativeOutputError> {
+        source
+            .validate_pool(&runtime.backend().pool)
+            .map_err(|_| SpeculativeOutputError::Storage("foreign fixture source"))?;
         runtime.backend().facts.borrow_mut().speculative_sources += 1;
-        PreparedSemanticSource::new(source, &runtime.backend().execution, capacity)
+        PreparedSemanticSource::new(
+            source,
+            &runtime.backend().execution,
+            capacity.resolve(runtime.backend().pool.topology()).unwrap(),
+        )
     }
-    fn prepare_semantic_prompt(runtime: &ModelRuntime<Self>, preparation: &PreparedSemanticSource,
-        input: &eredu_core::TokenIdsInputPlan<'_>, _: Option<std::num::NonZeroU64>) -> Result<(), BackendFailure> {
-        preparation.validate(&runtime.backend().pool, &runtime.backend().execution).map_err(memory)?;
-        assert!(input.tokens().iter().all(|&id| preparation.tokenizer().generation_domain().unwrap().allows(id)));
-        runtime.backend().facts.borrow_mut().speculative_prompts.push(input.tokens().to_vec());
+    fn prepare_semantic_prompt(
+        runtime: &ModelRuntime<Self>,
+        preparation: &PreparedSemanticSource,
+        input: &eredu_core::TokenIdsInputPlan<'_>,
+        _: Option<std::num::NonZeroU64>,
+    ) -> Result<(), BackendFailure> {
+        preparation
+            .validate(&runtime.backend().pool, &runtime.backend().execution)
+            .map_err(memory)?;
+        assert!(input.tokens().iter().all(|&id| preparation
+            .tokenizer()
+            .generation_domain()
+            .unwrap()
+            .allows(id)));
+        runtime
+            .backend()
+            .facts
+            .borrow_mut()
+            .speculative_prompts
+            .push(input.tokens().to_vec());
         Ok(()) // This neutral fixture has no tensor payload or native input work.
     }
     fn prepare_original_text_source_budget(
         runtime: &ModelRuntime<Self>,
         source: &OriginalTokenizer,
-        capacity: u64,
+        capacity: &MemoryLimitDeclarations,
     ) -> Result<OriginalTextSourceBudget, OriginalTextSourceError> {
         source
             .validate_pool(&runtime.backend().pool)
             .map_err(|_| TokenInputRejection::IdentityMismatch)?;
         source
-            .prepare_text_source_budget(&runtime.backend().execution, capacity)
+            .prepare_text_source_budget(
+                &runtime.backend().execution,
+                capacity.resolve(runtime.backend().pool.topology()).unwrap(),
+            )
             .map_err(Into::into)
     }
     fn validate_original_tokenizer_source(
@@ -824,5 +943,5 @@ impl<M: Clone + 'static> OriginalTokenizerBackend for Backend<M> {
     }
 }
 
-mod speculative_batch;
 mod prepared_semantic;
+mod speculative_batch;

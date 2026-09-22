@@ -7,12 +7,33 @@ impl WorkspaceContext {
     pub fn complete_values(&self, values: &[&WorkspaceTensor]) -> Result<(), Error> {
         self.record_values(WorkspaceOperationKind::ValueCompletion, values)
     }
+    /// Records the ordinary communication driver's local dependency worker.
+    /// Native caller and completion facts remain separate from these roots.
+    pub fn complete_communication_dependencies(
+        &self,
+        values: &[&WorkspaceTensor],
+    ) -> Result<(), Error> {
+        self.record_values(WorkspaceOperationKind::CommunicationDependencies, values)
+    }
+    /// Records the actual two-root paged publication completion worker.
+    /// Canonical source identity and prepared publication custody stay separate.
+    pub fn complete_cache_publication(&self, values: &[&WorkspaceTensor; 2]) -> Result<(), Error> {
+        self.record_values(WorkspaceOperationKind::CachePublicationCompletion, values)
+    }
+    /// Records the final scan result while its cache source leases remain live.
+    pub fn complete_cache_scan(&self, value: &WorkspaceTensor) -> Result<(), Error> {
+        self.record_values(WorkspaceOperationKind::CacheScanCompletion, &[value])
+    }
     /// Records actual roots kept until the enclosing model completion. This
     /// grants no source or submission authority and performs no completion.
     pub fn retain_values(&self, values: &[&WorkspaceTensor]) -> Result<(), Error> {
         self.record_values(WorkspaceOperationKind::ValueRetention, values)
     }
-    fn record_values(&self, kind: WorkspaceOperationKind, values: &[&WorkspaceTensor]) -> Result<(), Error> {
+    fn record_values(
+        &self,
+        kind: WorkspaceOperationKind,
+        values: &[&WorkspaceTensor],
+    ) -> Result<(), Error> {
         if values.is_empty() {
             return Err(WorkspaceMetadataError::Unqualified.into());
         }

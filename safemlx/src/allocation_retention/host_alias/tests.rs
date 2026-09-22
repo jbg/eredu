@@ -1,11 +1,11 @@
 use super::*;
 use crate::{
-    Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy, Stream,
-    ops::indexing::TryIndexOp,
+    ops::indexing::TryIndexOp, Device, DeviceType, Dtype, HostTransferBuffer, HostTransferPolicy,
+    Stream,
 };
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 #[derive(Debug)]
@@ -100,8 +100,9 @@ fn host_view_attachment_rejects_stale_generation_and_retires_before_immutable_so
         AllocationInfo::from_native(
             first_facts.backing.identity,
             first_facts.backing.charged_bytes,
-            true
+            first_facts.backing.placement
         )
+        .with_host_controls(first_facts.backing.host_control_bytes)
     );
     assert_eq!(independent.evaluated().unwrap().as_slice::<f32>(), &values);
 }

@@ -110,7 +110,7 @@ fn run(mode: &str, residency: Residency) -> serde_json::Value {
             })
             .unwrap();
         let mut options = settings(0.0);
-        options.inference.managed_memory_capacity_bytes = None;
+        options.inference.memory_limits = eredu_core::MemoryLimitDeclarations::unlimited();
         options.inference.prefill_chunk_positions = None;
         let prepared_prefix = vec![0, 1, 2, 3, 4];
         let prepared_capture = capture_plan(&paths);
@@ -307,12 +307,10 @@ fn verify_residency(case: &str, residency: Residency) {
                     panic!("float rows");
                 };
                 assert_eq!(actual.len(), expected.len());
-                assert!(
-                    actual
-                        .iter()
-                        .zip(expected)
-                        .all(|(a, b)| (a - b).abs() < 5e-5)
-                );
+                assert!(actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| (a - b).abs() < 5e-5));
             }
         }
     }

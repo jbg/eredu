@@ -12,14 +12,44 @@ use eredu_core::{
 struct PhaseValidation<'a> {
     descriptor: &'a eredu_core::ArchitectureDescriptor,
     context: eredu_runtime::inspection::ObservationExecutionContext,
+    partition: Option<&'a eredu_core::capture::CaptureDiscovery>,
 }
 impl PhaseValidation<'_> {
+    fn partition_status(
+        &self,
+        point: &eredu_core::ObservationPoint,
+        phase: CapturePhase,
+    ) -> Option<&eredu_core::ObservationSupportStatus> {
+        let discovery = self.partition?;
+        let mut rows = discovery
+            .support
+            .points
+            .iter()
+            .filter(|row| row.path == point.path);
+        let row = rows.next()?;
+        if rows.next().is_some() {
+            return None;
+        }
+        Some(match phase {
+            CapturePhase::Prefill => &row.prefill,
+            CapturePhase::Decode => &row.decode,
+        })
+    }
     fn allows(&self, point: &eredu_core::ObservationPoint, phase: CapturePhase) -> bool {
         let Ok(scope) =
             SpeculativeActivationExecution::retained_scope(self.descriptor, &point.node_id)
         else {
             return false;
         };
+        if let Some(discovery) = self.partition {
+            return self.partition_status(point, phase).is_some_and(|status| {
+                matches!(
+                    status,
+                    eredu_core::ObservationSupportStatus::Supported
+                        | eredu_core::ObservationSupportStatus::Conditional(_)
+                )
+            }) && discovery.catalog.get(&point.path) == Some(point);
+        }
         eredu_runtime::inspection::observation_phase_is_admissible(
             point,
             phase,
@@ -30,6 +60,25 @@ impl PhaseValidation<'_> {
 }
 
 impl PreparedModelDiscovery {
+    pub(super) fn activation_declarations(
+        &self,
+        execution: &SpeculativeActivationExecution,
+    ) -> Option<(
+        &eredu_core::ArchitectureDescriptor,
+        &[eredu_core::intervention::InterventionPoint],
+    )> {
+        if execution.is_autoregressive() {
+            Some((&self.descriptor, &self.intervention_points))
+        } else {
+            self.prediction.as_ref().map(|prediction| {
+                (
+                    &prediction.descriptor,
+                    prediction.intervention_points.as_slice(),
+                )
+            })
+        }
+    }
+
     /// Revalidate an immutable internal capture admission against the actual
     /// retained catalog, invocation hooks and selected collector facts. Identity
     /// must already have been resolved by ordinary discovery/admission. This
@@ -46,7 +95,7 @@ impl PreparedModelDiscovery {
         session: &str,
         overlay: Option<&str>,
     ) -> Result<(), E> {
-        self.validate_original_activations(admitted, execution, session, overlay, None, None)
+        self.validate_original_activations(admitted, execution, session, overlay, None, None, None)
     }
     /// Same loaded revalidation with actual static native mechanism facts. The
     /// source contains no execution authority; exact trace/claim binding follows.
@@ -58,18 +107,81 @@ impl PreparedModelDiscovery {
         overlay: Option<&str>,
         facts: eredu_core::intervention::InterventionMechanismFacts<'_>,
     ) -> Result<(), E> {
-        self.validate_original_activations(admitted, execution, session, overlay, Some(facts), None)
+        self.validate_original_activations(
+            admitted,
+            execution,
+            session,
+            overlay,
+            Some(facts),
+            None,
+            None,
+        )
     }
     /// The same retained declarations with the actual original sparse worker's
     /// operation/dtype profile. These facts are descriptive; exact selected row
     /// counts, source loans and execution funding are checked at the native hook.
     pub fn validate_original_speculative_activations_with_routed_interventions(
-        &self, admitted: &AdmittedSpeculativeActivations,
-        execution: &SpeculativeActivationExecution, session: &str, overlay: Option<&str>,
+        &self,
+        admitted: &AdmittedSpeculativeActivations,
+        execution: &SpeculativeActivationExecution,
+        session: &str,
+        overlay: Option<&str>,
         facts: eredu_core::intervention::InterventionMechanismFacts<'_>,
         routed: eredu_core::intervention::InterventionMechanismFacts<'_>,
     ) -> Result<(), E> {
-        self.validate_original_activations(admitted, execution, session, overlay, Some(facts), Some(routed))
+        self.validate_original_activations(
+            admitted,
+            execution,
+            session,
+            overlay,
+            Some(facts),
+            Some(routed),
+            None,
+        )
+    }
+    /// Revalidate the same independent target traversal against its actual loaded
+    /// partition catalog, collector report and architecture layout source. The
+    /// borrowed publication supplies descriptive facts only; role admission and
+    /// native producer custody remain separate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_original_partitioned_autoregressive_activations(
+        &self,
+        admitted: &AdmittedSpeculativeActivations,
+        execution: &SpeculativeActivationExecution,
+        session: &str,
+        overlay: Option<&str>,
+        facts: eredu_core::intervention::InterventionMechanismFacts<'_>,
+        routed: eredu_core::intervention::InterventionMechanismFacts<'_>,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        discovery: &eredu_core::capture::CaptureDiscovery,
+        source_execution: &str,
+    ) -> Result<(), E> {
+        if !execution.is_autoregressive()
+            || !self.observation_context.partitioned
+            || source_execution != self.execution_identity()
+            || self
+                .partition_selection
+                .as_ref()
+                .and_then(|selected| selected.parallel_topology())
+                .map(|rank| rank.topology())
+                != Some(layouts.topology())
+            || discovery.catalog != self.descriptor.observations
+            || discovery.support.schema_version != self.support.schema_version
+            || self.resolved_artifact_identity().is_none_or(|identity| {
+                identity.encoded().as_slice() != discovery.artifact_identity.as_bytes()
+            })
+        {
+            return Err(E::Identity);
+        }
+        self.validate_original_activations(
+            admitted,
+            execution,
+            session,
+            overlay,
+            Some(facts),
+            Some(routed),
+            Some(discovery),
+        )
     }
     fn validate_original_activations(
         &self,
@@ -79,22 +191,24 @@ impl PreparedModelDiscovery {
         overlay: Option<&str>,
         facts: Option<eredu_core::intervention::InterventionMechanismFacts<'_>>,
         routed: Option<eredu_core::intervention::InterventionMechanismFacts<'_>>,
+        partition: Option<&eredu_core::capture::CaptureDiscovery>,
     ) -> Result<(), E> {
-        if self.partition_selection.is_some()
-            || self.observation_context.partitioned
+        if (partition.is_none()
+            && (self.partition_selection.is_some() || self.observation_context.partitioned))
             || !self.identity.is_resolved()
         {
             return Err(E::Identity);
         }
         let identity = self.identity.resolve().map_err(|_| E::Identity)?;
         admitted.validate_source_identity(identity, self.execution_identity(), overlay, session)?;
-        let prediction = self.prediction.as_ref().ok_or(E::Declaration)?;
-        let descriptor = &prediction.descriptor;
+        let (descriptor, intervention_points) = self
+            .activation_declarations(execution)
+            .ok_or(E::Declaration)?;
         // Ordinary speculative discovery checks every retained point's declared
         // invocation, even points not selected by the requested capture plan.
         for point in &descriptor.observations.points {
             let scope = SpeculativeActivationExecution::retained_scope(descriptor, &point.node_id)?;
-            if !execution.supports_scope(scope) {
+            if !execution.is_autoregressive() && !execution.supports_scope(scope) {
                 return Err(E::Declaration);
             }
         }
@@ -126,6 +240,7 @@ impl PreparedModelDiscovery {
         let phase_validation = PhaseValidation {
             descriptor,
             context,
+            partition,
         };
         if let Some(facts) = facts {
             use eredu_core::intervention::{InterventionEvidence, InterventionStage};
@@ -145,20 +260,32 @@ impl PreparedModelDiscovery {
                 if point.stage != InterventionStage::Activation
                     || point.routing.is_some()
                     || operation.action.dtype().is_none()
-                    || !matches!(operation.evidence, InterventionEvidence::None | InterventionEvidence::Preview { .. } | InterventionEvidence::Summary)
+                    || !matches!(
+                        operation.evidence,
+                        InterventionEvidence::None
+                            | InterventionEvidence::Preview { .. }
+                            | InterventionEvidence::Summary
+                    )
                 {
                     return Err(E::UnqualifiedIntervention);
                 }
-                if point.routed_units.is_some() && (operation.evidence != InterventionEvidence::None
-                    || routed.is_none_or(|profile| !profile.routed_units
-                        || !profile.operations.contains(&operation.action.kind())
-                        || operation.action.dtype().is_none_or(|dtype| !profile.dtypes.contains(&dtype)))) {
+                if point.routed_units.is_some()
+                    && (operation.evidence != InterventionEvidence::None
+                        || routed.is_none_or(|profile| {
+                            !profile.routed_units
+                                || !profile.operations.contains(&operation.action.kind())
+                                || operation
+                                    .action
+                                    .dtype()
+                                    .is_none_or(|dtype| !profile.dtypes.contains(&dtype))
+                        }))
+                {
                     return Err(E::UnqualifiedIntervention);
                 }
             }
             eredu_runtime::inspection::validate_activation_intervention_declarations_with_phases(
                 admitted.interventions(),
-                &prediction.intervention_points,
+                intervention_points,
                 facts,
                 |actual, expected| {
                     let mut points = descriptor.observations.points.iter().filter(|point| {
@@ -178,6 +305,13 @@ impl PreparedModelDiscovery {
                     [CapturePhase::Prefill, CapturePhase::Decode]
                         .into_iter()
                         .all(|phase| {
+                            if partition.is_some() {
+                                return phase_validation.partition_status(point, phase)
+                                    == Some(match phase {
+                                        CapturePhase::Prefill => &expected.prefill,
+                                        CapturePhase::Decode => &expected.decode,
+                                    });
+                            }
                             eredu_runtime::inspection::observation_phase_matches(
                                 point,
                                 phase,
@@ -192,6 +326,17 @@ impl PreparedModelDiscovery {
                 },
             )
             .map_err(|_| E::Declaration)?;
+        }
+        if let Some(discovery) = partition {
+            admitted
+                .captures()
+                .revalidate_borrowed_declarations(
+                    &descriptor.observations,
+                    discovery.support.schema_version,
+                    &discovery.support.capture,
+                    |point, phase| phase_validation.allows(point, phase),
+                )
+                .map_err(|_| E::Declaration)?;
         }
         admitted
             .captures()
@@ -224,8 +369,8 @@ impl PreparedModelDiscovery {
                 >,
             >(),
             size_of::<(
-                &super::PreparedPredictionDiscovery,
                 &eredu_core::ArchitectureDescriptor,
+                &[eredu_core::intervention::InterventionPoint],
             )>(),
             size_of::<std::slice::Iter<'static, eredu_core::ObservationPoint>>(),
             size_of::<
@@ -237,6 +382,12 @@ impl PreparedModelDiscovery {
             size_of::<(&eredu_core::ObservationPoint, &SpeculativeCaptureScope)>(),
             size_of::<eredu_runtime::inspection::ObservationExecutionContext>(),
             // Actual phase closure captures one borrow of these fixed controls.
+            size_of::<Option<&eredu_core::capture::CaptureDiscovery>>(),
+            size_of::<(
+                &crate::component_partition::ComponentPartitionLayouts,
+                &eredu_core::capture::CaptureDiscovery,
+                &str,
+            )>(),
             size_of::<PhaseValidation<'static>>(),
             size_of::<&PhaseValidation<'static>>(),
             size_of::<(&eredu_core::ObservationPoint, CapturePhase)>(),
@@ -259,7 +410,10 @@ impl PreparedModelDiscovery {
             .into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)?
             .checked_add(AdmittedSpeculativeActivations::source_validation_control_bytes()?)?
-            .checked_add(AdmittedCapturePlan::borrowed_declaration_validation_control_bytes()?)?
+            .checked_add(
+                AdmittedCapturePlan::borrowed_declaration_validation_control_bytes()?
+                    .checked_mul(2)?,
+            )?
             .checked_add(SpeculativeActivationExecution::scope_validation_control_bytes()?)?
             .checked_add(eredu_runtime::inspection::observation_phase_validation_control_bytes()?)
     }

@@ -5,9 +5,7 @@ use eredu_core::{
     ExecutionWorkspaceEstimate, InferenceGeometry, InputTokenCount, InspectableBackendSession as _,
     LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound,
 };
-use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError};
 
 fn zero_admission() -> Admission {
     let geometry = InferenceGeometry {
@@ -35,25 +33,41 @@ fn zero_admission() -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
 }
 
-fn assert_unquoted(pool: &WorkingMemoryPool) {
+fn zero_payload_ledger() -> MemoryLedger {
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let controls = probe
+        .reservation_requirements(&zero_admission(), None)
+        .unwrap()
+        .get(probe.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    crate::memory_fixture::ledger(controls, 0).unwrap()
+}
+
+fn assert_unquoted(pool: &MemoryLedger) {
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
     assert!(matches!(
         pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
@@ -61,24 +75,28 @@ fn assert_unquoted(pool: &WorkingMemoryPool) {
     ));
 }
 
-fn assert_retired(pool: &WorkingMemoryPool) {
+fn assert_retired(pool: &MemoryLedger) {
     submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
+        let _ = safemlx::try_retire_completed_submissions();
+        crate::backend::ordinary_retirement::reclaim_all();
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
-        pool.unquoted_owner_count().unwrap() == 0 && pool.used_bytes().unwrap() == 0
+        pool.unquoted_owner_count().unwrap() == 0 && pool.fixture_host_charge().unwrap() == 0
     });
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     drop(reservation);
 }
 
 #[test]
 fn quoted_zero_byte_reservation_rejects_before_communication_and_materialization() {
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = zero_payload_ledger();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let backend =
-        MlxBackend::new(execution.stream(), execution.stream()).with_memory_pool(pool.clone());
+        MlxBackend::new(execution.stream(), execution.stream()).with_memory_ledger(pool.clone());
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
@@ -115,47 +133,50 @@ fn quoted_zero_byte_reservation_rejects_before_communication_and_materialization
     );
     assert_eq!(path_instrumentation::snapshot(), Default::default());
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     drop(reservation);
     assert_retired(&pool);
 }
 
 #[test]
 fn prepared_model_exclusion_transitions_to_idle_storage_then_operation_ownership() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let other_pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let other_pool = zero_payload_ledger();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let another = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let backend =
-        MlxBackend::new(execution.stream(), execution.stream()).with_memory_pool(pool.clone());
-    let peer = MlxBackend::new(another.stream(), another.stream()).with_memory_pool(pool.clone());
+        MlxBackend::new(execution.stream(), execution.stream()).with_memory_ledger(pool.clone());
+    let peer = MlxBackend::new(another.stream(), another.stream()).with_memory_ledger(pool.clone());
     let independent = MlxBackend::new(execution.stream(), execution.stream())
-        .with_memory_pool(other_pool.clone());
+        .with_memory_ledger(other_pool.clone());
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model =
         eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default()).unwrap();
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.fixture_host_charge().unwrap() > 0,
         "loaded storage is published"
     );
-    assert_unquoted(backend.memory_pool());
-    assert_unquoted(peer.memory_pool());
+    assert_unquoted(backend.memory_ledger());
+    assert_unquoted(peer.memory_ledger());
     let unrelated_reservation = independent
-        .memory_pool()
+        .memory_ledger()
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
     let mut session = peer.create_session(model).unwrap();
     drop(backend);
     submission_recovery::wait_for_retirement(|| {
-        peer.memory_pool().unquoted_owner_count().unwrap() == 0
+        peer.memory_ledger().unquoted_owner_count().unwrap() == 0
     });
-    let existing_bytes = peer.memory_pool().used_bytes().unwrap();
+    let existing_bytes = peer.memory_ledger().fixture_host_charge().unwrap();
     assert!(existing_bytes > 0, "idle storage remains registered");
     let idle_reservation = peer
-        .memory_pool()
+        .memory_ledger()
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    assert_eq!(peer.memory_pool().used_bytes().unwrap(), existing_bytes);
+    assert_eq!(
+        peer.memory_ledger().fixture_host_charge().unwrap(),
+        existing_bytes
+    );
     drop(idle_reservation);
     session
         .submit_token_decode(&peer, 1)
@@ -172,10 +193,10 @@ fn prepared_model_exclusion_transitions_to_idle_storage_then_operation_ownership
 
 #[test]
 fn extracted_executable_preserves_loaded_model_memory_ownership() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let backend =
-        MlxBackend::new(execution.stream(), execution.stream()).with_memory_pool(pool.clone());
+        MlxBackend::new(execution.stream(), execution.stream()).with_memory_ledger(pool.clone());
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model =
         eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default()).unwrap();
@@ -191,10 +212,10 @@ fn escaped_ordinary_and_inspected_logits_retain_domain_until_the_last_native_ali
     use safemlx::ops::indexing::TryIndexOp;
 
     for inspect in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let backend =
-            MlxBackend::new(execution.stream(), execution.stream()).with_memory_pool(pool.clone());
+        let backend = MlxBackend::new(execution.stream(), execution.stream())
+            .with_memory_ledger(pool.clone());
         let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
         let model = eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
             .unwrap();
@@ -258,10 +279,10 @@ fn escaped_ordinary_and_inspected_logits_retain_domain_until_the_last_native_ali
 #[test]
 fn failing_materialization_and_unwind_hold_domain_ownership_inside_native_work() {
     for unwind in [false, true] {
-        let pool = WorkingMemoryPool::new(0, 0).unwrap();
+        let pool = zero_payload_ledger();
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let backend =
-            MlxBackend::new(execution.stream(), execution.stream()).with_memory_pool(pool.clone());
+        let backend = MlxBackend::new(execution.stream(), execution.stream())
+            .with_memory_ledger(pool.clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             backend.materialize_after_communication(
                 eredu_core::SessionCapabilities::default(),
@@ -292,3 +313,7 @@ fn failing_materialization_and_unwind_hold_domain_ownership_inside_native_work()
         assert_retired(&pool);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -3,7 +3,11 @@ use eredu_nn::{F32InitializationPlan, Tensor};
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16_384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -26,10 +30,9 @@ fn generated_f32_prices_fixed_host_buffer_and_native_copy_in_separate_domains() 
         assert!(report.tensor_buffers.total_bytes.unwrap() >= 2 * bytes);
         assert_eq!(
             report.total_bytes,
-            report
-                .tensor_buffers
-                .total_bytes
-                .map(|native| native + 2 * bytes)
+            report.tensor_buffers.total_bytes.map(|native| native
+                + 2 * bytes
+                + crate::backend::nn::workspace::test_backing_controls(&selected(), &report))
         );
         assert_eq!(report.operations.len(), 2);
         for operation in report.operations {
@@ -40,13 +43,39 @@ fn generated_f32_prices_fixed_host_buffer_and_native_copy_in_separate_domains() 
             assert!(operation.inputs.is_empty());
             assert_eq!(operation.outputs.len(), 1);
             let bound = selected().operation_bound(&operation).unwrap().unwrap();
-            // The same native seed/copy envelope as existing F32 from_slice;
-            // its separately-owned source buffer is the new host fact.
+            // Generated values use the ordinary typed upload/copy alias.
+            // Their generated host vector remains a separately priced owner.
             let mut borrowed = operation.clone();
-            borrowed.kind = WorkspaceOperationKind::Initialize;
+            borrowed.kind = WorkspaceOperationKind::Elementwise("from_f32_slice");
             let previous = selected().operation_bound(&borrowed).unwrap().unwrap();
             assert_eq!(bound.outputs, previous.outputs);
             assert_eq!(bound.scratch_bytes, previous.scratch_bytes);
+            assert_eq!(bound.scratch_bytes, 0);
+            let cpu = MlxCpuWorkspaceMechanisms::new(
+                selected().allocation(),
+                MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles)
+                    .unwrap(),
+            );
+            let cpu_generated = WorkspaceMechanisms::operation_bound(&cpu, &operation)
+                .unwrap()
+                .unwrap();
+            let cpu_borrowed = WorkspaceMechanisms::operation_bound(&cpu, &borrowed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cpu_generated.outputs, cpu_borrowed.outputs);
+            assert_eq!(cpu_generated.scratch_bytes, 0);
+            assert_eq!(
+                WorkspaceMechanisms::host_workspace_bound(&cpu, &operation)
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                bytes
+            );
+            assert!(
+                cpu.ordinary_call_controls(operation.as_view())
+                    .unwrap()
+                    .is_some()
+            );
             assert_eq!(
                 selected()
                     .host_workspace_bound(&borrowed)
@@ -117,4 +146,78 @@ fn native_generated_f32_default_worker_preserves_nonzero_values_and_shape() {
             .unwrap(),
         [-3.5, -1.75, 0.0, 1.75, 3.5, 5.25]
     );
+}
+
+#[test]
+fn geometry_only_initializers_keep_numeric_bounds_without_physical_source() {
+    let _ledger = crate::backend::managed_memory::try_ledger().unwrap();
+    assert!(crate::backend::managed_memory::cold_topology().is_some());
+    for original_storage in [false, true] {
+        let native = MlxMetalWorkspaceMechanisms {
+            allocation: NativeAllocationFacts {
+                original_storage,
+                ..selected().allocation()
+            },
+            ..selected()
+        };
+        let cpu = MlxCpuWorkspaceMechanisms::new(
+            native.allocation(),
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap(),
+        );
+        if !original_storage {
+            let upload = WorkspaceOperation {
+                kind: WorkspaceOperationKind::Elementwise("from_f32_slice"),
+                inputs: vec![],
+                outputs: vec![WorkspaceLayout::new(&[2, 3], WorkspaceDtype::Float32).unwrap()],
+            };
+            let view = upload.as_view();
+            assert!(WorkspaceMechanisms::output_placement(&native, view, 0).is_some());
+            assert!(WorkspaceFactMechanisms::output_placement(&native, view, 0).is_some());
+            assert!(WorkspaceMechanisms::output_placement(&cpu, view, 0).is_some());
+            assert!(WorkspaceFactMechanisms::output_placement(&cpu, view, 0).is_some());
+            assert!(WorkspaceMechanisms::scratch_placement(&native, view).is_some());
+            assert!(WorkspaceMechanisms::scratch_placement(&cpu, view).is_some());
+        }
+        for kind in [
+            WorkspaceOperationKind::Initialize,
+            WorkspaceOperationKind::InitializeFloating(WorkspaceFloatingType::Float16),
+        ] {
+            let operation = WorkspaceOperation {
+                kind: kind.clone(),
+                inputs: vec![],
+                outputs: vec![WorkspaceLayout::new(&[2, 3], WorkspaceDtype::Float32).unwrap()],
+            };
+            let view = operation.as_view();
+            assert!(WorkspaceMechanisms::output_placement(&native, view, 0).is_none());
+            assert!(WorkspaceMechanisms::scratch_placement(&native, view).is_none());
+            assert!(WorkspaceFactMechanisms::output_placement(&native, view, 0).is_none());
+            assert!(WorkspaceFactMechanisms::scratch_placement(&native, view).is_none());
+            assert!(WorkspaceMechanisms::output_placement(&cpu, view, 0).is_none());
+            assert!(WorkspaceMechanisms::scratch_placement(&cpu, view).is_none());
+            assert!(WorkspaceFactMechanisms::output_placement(&cpu, view, 0).is_none());
+            assert!(WorkspaceFactMechanisms::scratch_placement(&cpu, view).is_none());
+            assert!(
+                WorkspaceMechanisms::operation_bound(&native, &operation)
+                    .unwrap()
+                    .is_some()
+            );
+            for recording in [false, true] {
+                let context = if recording {
+                    WorkspaceContext::new_recording_facts(native)
+                } else {
+                    WorkspaceContext::new(native)
+                };
+                let outputs = context
+                    .execute(
+                        kind.clone(),
+                        &[],
+                        vec![context.layout(&[2, 3], WorkspaceDtype::Float32).unwrap()],
+                    )
+                    .unwrap();
+                let report = context.finish_report(&outputs).unwrap();
+                assert!(report.tensor_buffers.total_bytes.is_some());
+                assert!(report.physical_domains.is_none());
+            }
+        }
+    }
 }

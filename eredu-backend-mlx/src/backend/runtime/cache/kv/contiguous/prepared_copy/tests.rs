@@ -295,10 +295,12 @@ fn retained_copy_uses_padded_slots_and_keeps_independent_outputs_until_collector
         drop(operands);
         drop((copied, source));
         stream.synchronize().unwrap();
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         assert_eq!(retired.load(Ordering::SeqCst), 0);
         drop(roots);
         crate::backend::submission_recovery::wait_for_retirement(|| {
+            safemlx::memory::clear_cache().unwrap();
             safemlx::reclaim_allocation_owners();
             retired.load(Ordering::SeqCst) == count
         });

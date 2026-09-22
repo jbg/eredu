@@ -131,3 +131,6 @@ impl TokenValidationScope {
         frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -8,7 +8,8 @@ fn prepare_destinations(
     quantization: WeightQuantization,
     tasks: &[&ReplicatedTextMaterializationTask],
 ) -> Result<ColdQuantization, Error> {
-    let (plan, destinations) = plan_exact_quantization_from_destinations(&store, modules, layout, quantization, tasks)?;
+    let (plan, destinations) =
+        plan_exact_quantization_from_destinations(&store, modules, layout, quantization, tasks)?;
     let cold = ColdQuantization::prepare(store, plan)?;
     cold.validate_destinations(&destinations)?;
     Ok(cold)
@@ -254,14 +255,7 @@ fn cold_plans_use_real_projection_slots_and_preserve_source_precision_without_re
                     expected_mx
                 }
             );
-            prepare_destinations(
-                source.into(),
-                &[&slots],
-                None,
-                quantization,
-                &[&task],
-            )
-            .unwrap();
+            prepare_destinations(source.into(), &[&slots], None, quantization, &[&task]).unwrap();
         }
     }
 }
@@ -306,14 +300,7 @@ fn cold_plan_checks_rank_local_geometry_and_complete_target_consumption() {
             .shape(),
         [2, 64]
     );
-    prepare_destinations(
-        source.clone(),
-        &[&slots],
-        Some(&layout),
-        affine(),
-        &[&task],
-    )
-    .unwrap();
+    prepare_destinations(source.clone(), &[&slots], Some(&layout), affine(), &[&task]).unwrap();
     let error = cold_failure(prepare_destinations(
         source.clone(),
         &[&slots],
@@ -437,7 +424,7 @@ fn check_values(source: &dyn CheckpointSource, values: &[f32]) {
 
 #[test]
 fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_checks() {
-    use eredu_runtime::working_memory::{DependencyMemoryPolicy, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{DependencyMemoryPolicy, MemoryLedger};
     let values = (0..128)
         .map(|index| (index % 64) as f32 / 4.0 - (index / 64) as f32 * 3.0)
         .collect::<Vec<_>>();
@@ -456,15 +443,8 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
     .into();
     let task = task(2, StoredDtype::F32, affine());
     let slots = destinations(2, affine());
-    let cold = prepare_destinations(
-        source.clone(),
-        &[&slots],
-        None,
-        affine(),
-        &[&task],
-    )
-    .unwrap();
-    let pool = WorkingMemoryPool::new(1024 * 1024, 0).unwrap();
+    let cold = prepare_destinations(source.clone(), &[&slots], None, affine(), &[&task]).unwrap();
+    let pool = crate::memory_fixture::ledger(1024 * 1024, 0).unwrap();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let prepared = cold
         .allocate_original(
@@ -557,7 +537,11 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
         context,
         native_owner,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 mod handoff;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -93,6 +93,8 @@ pub(super) fn finish<T>(
 /// error-memory certificate or permission to activate native capture.
 pub(super) fn control_peak_bytes() -> Option<u64> {
     let parts = [
+        size_of::<(Error, &'static str)>(),
+        size_of::<Error>(),
         size_of::<OriginalErrorAllowance>(),
         size_of::<Option<OriginalErrorAllowance>>(),
         size_of::<OriginalFailureSource>(),

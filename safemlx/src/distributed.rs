@@ -816,3 +816,5 @@ pub use exchange_storage::{GroupCpuExchangeStorage,GroupCpuExchangeLayoutStorage
 
 mod variable_storage;
 pub use variable_storage::GroupCpuVariableEnvelope;
+mod ordinary;
+pub use ordinary::OrdinaryGroupControls;

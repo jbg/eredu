@@ -3,7 +3,7 @@ use super::*;
 use eredu_checkpoint::artifact::{
     ArtifactFileReadError, ArtifactFileReadFailure, PreparedArtifactFileRead,
 };
-use eredu_nn::workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding};
+use eredu_nn::workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError};
 use std::mem::{size_of, size_of_val};
 
 /// Paid move-only read from an exact published cache source. Opening the supplied
@@ -152,6 +152,37 @@ impl LiveCacheBlockSource {
     }
 }
 impl PreparedLiveCacheRead {
+    /// Streams the exact retained source into a caller-owned provisional file.
+    /// Its fixed byte buffer and callback frames are paid before the first read.
+    pub fn copy_to(self, destination: &mut File) -> Result<(), LiveCacheReadFailure> {
+        let Self {
+            read,
+            source,
+            funding,
+        } = self;
+        let controls = PreparedArtifactFileRead::copy_to_control_bytes::<fn(usize, &[u8])>()
+            .and_then(|n| n.checked_add(size_of::<Result<(), LiveCacheReadFailure>>()));
+        let refused = controls
+            .ok_or(WorkspaceMetadataError::Overflow)
+            .and_then(|bytes| {
+                funding
+                    .reserve_metadata(bytes)
+                    .map_err(WorkspaceMetadataError::from)
+            });
+        if let Err(cause) = refused {
+            return Err(LiveCacheReadFailure {
+                cause: Cause::Metadata(cause),
+                source,
+                funding: Some(funding),
+            });
+        }
+        read.copy_to_with(destination, (|_, _| {}) as fn(usize, &[u8]))
+            .map_err(|cause| LiveCacheReadFailure {
+                cause: Cause::Transfer(cause),
+                source,
+                funding: Some(funding),
+            })
+    }
     /// Actual sealed source length required by the separately admitted output.
     pub fn byte_len(&self) -> usize {
         self.read.byte_len()

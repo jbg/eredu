@@ -1,10 +1,13 @@
 //! Shared Inkling input semantics with caller-owned diagnostic destinations.
+use super::gemma::view::{Input, SourceDestination};
 use super::*;
 use std::fmt;
 
 pub(in crate::media_plan) trait Destination: Copy {
     type Error;
-    fn controls<T>(self) -> Result<(), Self::Error> { Ok(()) }
+    fn controls<T>(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn unsupported(self, architecture: &str, reason: impl fmt::Display) -> Self::Error;
     fn configuration(self, field: &'static str, detail: fmt::Arguments<'_>) -> Self::Error;
     fn overflow(self, operation: &'static str) -> Self::Error;
@@ -75,7 +78,9 @@ impl Destination for Ordinary {
 }
 impl Destination for Metadata<'_> {
     type Error = Error;
-    fn controls<T>(self) -> Result<(), Error> { Metadata::controls::<T>(self) }
+    fn controls<T>(self) -> Result<(), Error> {
+        Metadata::controls::<T>(self)
+    }
     fn unsupported(self, architecture: &str, reason: impl fmt::Display) -> Error {
         let result = (|| {
             self.controls::<(
@@ -129,7 +134,12 @@ pub(crate) fn admit<T, I: PreparedInputInspector<T>>(
         &PreparedModelInput<T>,
         &I,
         &WorkspaceContext,
-        (&crate::inkling::ModelArgs, &I, &WorkspaceContext, Metadata<'_>),
+        (
+            &crate::inkling::ModelArgs,
+            &I,
+            &WorkspaceContext,
+            Metadata<'_>,
+        ),
         AdmittedCompositeInput<InklingInputPartPlan>,
         Result<AdmittedCompositeInput<InklingInputPartPlan>, Error>,
     )>()?;
@@ -168,7 +178,14 @@ pub(in crate::media_plan) fn media<D: Destination>(
     input: &MediaAdmissionInput,
     destination: D,
 ) -> Result<MediaShapePlan, D::Error> {
-    match input.modality() {
+    media_view(args, Input::legacy(input), destination)
+}
+fn media_view<D: Destination>(
+    args: &crate::inkling::ModelArgs,
+    input: Input<'_>,
+    destination: D,
+) -> Result<MediaShapePlan, D::Error> {
+    match input.modality {
         InputModality::Image => {
             let config = args.vision_config.as_ref().ok_or_else(|| {
                 destination.unsupported(
@@ -176,16 +193,21 @@ pub(in crate::media_plan) fn media<D: Destination>(
                     "loaded Inkling model has no vision configuration",
                 )
             })?;
-            if input.payload_shape.len() != 5 || input.payload_shape[1..] != [2, 40, 40, 3] {
+            if input.shape.len() != 5
+                || ![2, 40, 40, 3]
+                    .into_iter()
+                    .enumerate()
+                    .all(|(i, n)| input.shape.at(i + 1) == n)
+            {
                 return Err(destination.unsupported(
                     &args.model_type,
                     format_args!(
                         "Inkling image patches must be [patches, 2, 40, 40, 3], got {:?}",
-                        input.payload_shape
+                        input.shape
                     ),
                 ));
             }
-            let patches = input.payload_shape[0];
+            let patches = input.shape.at(0);
             let text_hidden =
                 destination.positive(config.text_hidden_size, "Inkling vision output size")?;
             let layer_outputs = [
@@ -233,16 +255,16 @@ pub(in crate::media_plan) fn media<D: Destination>(
                     "loaded Inkling model has no audio configuration",
                 )
             })?;
-            let [1, padded_frames, payload_codebooks] = input.payload_shape.as_slice() else {
+            if input.shape.len() != 3 || input.shape.at(0) != 1 {
                 return Err(destination.unsupported(
                     &args.model_type,
                     format_args!(
                         "Inkling audio tokens must be [1, frames, codebooks], got {:?}",
-                        input.payload_shape
+                        input.shape
                     ),
                 ));
             };
-            let (padded_frames, payload_codebooks) = (*padded_frames, *payload_codebooks);
+            let (padded_frames, payload_codebooks) = (input.shape.at(1), input.shape.at(2));
             let codebooks =
                 destination.positive(config.num_codebooks, "Inkling audio codebooks")?;
             if payload_codebooks != codebooks {
@@ -254,7 +276,7 @@ pub(in crate::media_plan) fn media<D: Destination>(
                 ));
             }
             let frames = if let Some(mask) = &input.audio_mask {
-                if mask.shape != [1, padded_frames]
+                if !mask.shape.matches(&[1, padded_frames])
                     || u64::try_from(mask.values.len()).ok() != Some(padded_frames)
                 {
                     return Err(destination.unsupported(
@@ -316,35 +338,47 @@ pub(in crate::media_plan) fn media<D: Destination>(
 
 pub(in crate::media_plan) fn part<D: Destination>(
     args: &crate::inkling::ModelArgs,
-    inspected: &MediaAdmissionInput,
+    input: &MediaAdmissionInput,
     destination: D,
 ) -> Result<InklingInputPartPlan, D::Error> {
-    let descriptor = &inspected.descriptor;
-    let modality = descriptor.modality();
-    let payload = descriptor.payload_kind();
-    let shape = &inspected.payload_shape;
+    part_view(args, Input::legacy(input), destination)
+}
+pub(in crate::media_plan) fn original_part(
+    args: &crate::inkling::ModelArgs,
+    part: &eredu_runtime::input::host::PreparedHostPart<'_>,
+) -> Result<InklingInputPartPlan, crate::media_plan::MediaSemanticError> {
+    part_view(args, Input::original(part)?, SourceDestination)
+}
+fn part_view<D: Destination>(
+    args: &crate::inkling::ModelArgs,
+    inspected: Input<'_>,
+    destination: D,
+) -> Result<InklingInputPartPlan, D::Error> {
+    let modality = inspected.modality;
+    let payload = inspected.kind;
+    let shape = inspected.shape;
     match (modality, payload) {
         (InputModality::Text, InputPayloadKind::TokenIds) => Ok(InklingInputPartPlan::TextTokens {
-            positions: destination.batch_one_sequence(
-                &shape,
+            positions: shape.batch_one(
                 2,
                 "Inkling text token IDs",
                 &args.model_type,
+                destination,
             )?,
         }),
         (
             modality @ (InputModality::Image | InputModality::Audio),
             InputPayloadKind::Embeddings,
         ) => {
-            let positions = destination.batch_one_sequence(
-                &shape,
+            let positions = shape.batch_one(
                 3,
                 format_args!("Inkling {} embeddings", modality.as_str()),
                 &args.model_type,
+                destination,
             )?;
             let hidden =
                 destination.positive(args.text_config.hidden_size, "Inkling text hidden size")?;
-            if shape[2] != hidden {
+            if shape.at(2) != hidden {
                 return Err(destination.unsupported(
                     &args.model_type,
                     format_args!(
@@ -369,7 +403,7 @@ pub(in crate::media_plan) fn part<D: Destination>(
             })
         }
         (modality @ (InputModality::Image | InputModality::Audio), InputPayloadKind::Tensor) => {
-            let shape = media(args, inspected, destination)?;
+            let shape = media_view(args, inspected, destination)?;
             let ingress = InklingIngressPlan {
                 placeholder_token_id: if modality == InputModality::Image {
                     args.image_token_id

@@ -1,5 +1,5 @@
 //! One original cold compiler charge, separate from every generation request.
-use super::{WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError};
 use eredu_core::BackendFailure;
 use eredu_text::decoder_storage::{DecodeCompileFailure, DecodeCompilePlan, PreparedDecodeSource};
 use std::{
@@ -17,7 +17,7 @@ enum Phase {
 }
 #[derive(Debug)]
 pub(super) struct Allowance {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     bytes: u64,
     phase: Phase,
 }
@@ -48,7 +48,7 @@ impl Allowance {
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
     }
-    pub(super) fn pool(&self) -> &WorkingMemoryPool {
+    pub(super) fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
 
@@ -127,8 +127,8 @@ impl LoadedDecodeSource {
         )
     }
     /// Checks the original domain without minting a request or another hold.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.payload().allowance.pool.same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.payload().allowance.pool.same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -209,7 +209,7 @@ impl std::error::Error for LoadedDecodeSourceError {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Actual source-derived compiler plus closed owner/error control requirements.
     /// This query grants no budget and takes no ownership of the borrowed plan.
     pub fn decode_source_required_bytes(
@@ -269,13 +269,7 @@ impl WorkingMemoryPool {
         if usage.unquoted_owners != 0 {
             return Err(WorkingMemoryError::UnknownBound);
         }
-        let available = self.0.available(&usage, None)?;
-        if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
-                required_bytes: bytes,
-                available_bytes: available,
-            });
-        }
+        self.0.check_host_increment(&usage, bytes)?;
         let reservations = usage
             .reservations
             .checked_add(usize::from(starting))

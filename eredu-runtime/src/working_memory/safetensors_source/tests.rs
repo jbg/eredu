@@ -21,7 +21,7 @@ fn fixture(index: Option<&[u8]>) -> tempfile::TempDir {
     dir
 }
 fn qualified(path: &Path) -> bool {
-    let result = WorkingMemoryPool::safetensors_source_initial_bytes(path, POLICY);
+    let result = MemoryLedger::safetensors_source_initial_bytes(path, POLICY);
     if std::env::var_os("EREDU_REQUIRE_QUALIFIED_MEMORY_TENSOR_SOURCE").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -32,7 +32,7 @@ fn qualified(path: &Path) -> bool {
     }
 }
 fn open(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     path: &Path,
 ) -> Result<SafetensorsWeightStore, OriginalSafetensorsSourceError> {
     pool.open_safetensors_source(path, 1, SafetensorsDiscoveryLimits::default(), POLICY)
@@ -46,8 +46,8 @@ fn memory<'a>(mut error: &'a (dyn Error + 'static)) -> &'a WorkingMemoryError {
     }
 }
 fn indexed_parts(dir: &tempfile::TempDir) -> (u64, u64, u64, u64, u64) {
-    let initial = WorkingMemoryPool::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
-    let index = WorkingMemoryPool::safetensors_source_index_bytes(
+    let initial = MemoryLedger::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
+    let index = MemoryLedger::safetensors_source_index_bytes(
         SafetensorsIndexRequest {
             encoded_bytes: INDEX.len(),
             path_bytes: dir.path().canonicalize().unwrap().as_os_str().len()
@@ -60,7 +60,7 @@ fn indexed_parts(dir: &tempfile::TempDir) -> (u64, u64, u64, u64, u64) {
         POLICY,
     )
     .unwrap();
-    let header_controls = WorkingMemoryPool::safetensors_header_policy_required_bytes(1).unwrap();
+    let header_controls = MemoryLedger::safetensors_header_policy_required_bytes(1).unwrap();
     let path_bytes = dir
         .path()
         .join("weights.safetensors")
@@ -69,7 +69,7 @@ fn indexed_parts(dir: &tempfile::TempDir) -> (u64, u64, u64, u64, u64) {
         .as_os_str()
         .len();
     let store = POLICY.estimate("weight".len() + 2 * path_bytes).unwrap() as u64;
-    let header = WorkingMemoryPool::safetensors_header_quote(
+    let header = MemoryLedger::safetensors_header_quote(
         SafetensorsHeaderRequest {
             json_bytes: HEADER.len(),
             buffer_bytes: HEADER.len() + 8,
@@ -89,20 +89,20 @@ fn exact_source_budget_is_incremental_and_preserves_lazy_headers() {
     }
     let (initial, index, headers, store, header) = indexed_parts(&dir);
     let total = initial + index + headers + store;
-    let pool = WorkingMemoryPool::new(total - 1, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(total - 1, 0).unwrap();
     let error = open(&pool, dir.path()).unwrap_err();
     assert!(
-        matches!(memory(&error), WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }
-        if *required_bytes == store && *available_bytes == store-1)
+        matches!(memory(&error), WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })
+        if *required_bytes == store && (limit_bytes - existing_bytes) == store-1)
     );
-    assert_eq!(pool.used_bytes().unwrap(), initial + index);
+    assert_eq!(pool.payload_used_bytes().unwrap(), initial + index);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(total + header, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(total + header, 0).unwrap();
     let source = open(&pool, dir.path()).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), total);
+    assert_eq!(pool.payload_used_bytes().unwrap(), total);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
     assert_eq!(
         WeightStore::metadata(&source, "weight")
@@ -110,18 +110,18 @@ fn exact_source_budget_is_incremental_and_preserves_lazy_headers() {
             .logical_shape,
         [2]
     );
-    assert_eq!(pool.used_bytes().unwrap(), total + header);
+    assert_eq!(pool.payload_used_bytes().unwrap(), total + header);
     let batch = source
         .prepare_encoded_read(&["weight".into()])
         .unwrap()
         .unwrap();
     drop(source);
     // File identities and diagnostic owners keep source funding after the store.
-    assert!(pool.used_bytes().unwrap() >= initial + index + store);
+    assert!(pool.payload_used_bytes().unwrap() >= initial + index + store);
     let mut bytes = [0; 2];
     batch.read_into(&mut bytes).unwrap();
     assert_eq!(bytes, [11, 19]);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn initial_and_index_refusals_precede_filesystem_or_json_work() {
@@ -130,39 +130,38 @@ fn initial_and_index_refusals_precede_filesystem_or_json_work() {
         return;
     }
     let missing = dir.path().join("missing.safetensors");
-    let initial = WorkingMemoryPool::safetensors_source_initial_bytes(&missing, POLICY).unwrap();
-    let pool = WorkingMemoryPool::new(initial - 1, 0).unwrap();
+    let initial = MemoryLedger::safetensors_source_initial_bytes(&missing, POLICY).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(initial - 1, 0).unwrap();
     let error = open(&pool, &missing).unwrap_err();
     assert!(matches!(
         error.memory_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert!(error.construction_failure().is_none());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    let initial = WorkingMemoryPool::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
-    let pool = WorkingMemoryPool::new(initial, 0).unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    let initial = MemoryLedger::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(initial, 0).unwrap();
     let error = open(&pool, dir.path()).unwrap_err();
     assert!(matches!(
         memory(&error),
-        WorkingMemoryError::BudgetExceeded {
-            available_bytes: 0,
-            ..
-        }
-    ));
+        WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { limit_bytes, existing_bytes, .. })
+     if limit_bytes - existing_bytes == 0));
     assert!(matches!(
         error.construction_failure(),
         Some(StoreError::SafetensorsSourceAdmission(_))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), initial);
+    assert_eq!(pool.payload_used_bytes().unwrap(), initial);
     let alias = error.construction_failure().unwrap().clone();
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), initial);
+    assert_eq!(pool.payload_used_bytes().unwrap(), initial);
     assert!(matches!(
         memory(&alias),
-        WorkingMemoryError::BudgetExceeded { .. }
+        WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
     ));
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn malformed_index_retains_accepted_storage_and_finishes_construction() {
@@ -170,7 +169,7 @@ fn malformed_index_retains_accepted_storage_and_finishes_construction() {
     if !qualified(dir.path()) {
         return;
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let error = open(&pool, dir.path()).unwrap_err();
     assert!(matches!(
         error.construction_failure(),
@@ -178,14 +177,12 @@ fn malformed_index_retains_accepted_storage_and_finishes_construction() {
             eredu_checkpoint::safetensors::SafetensorsShardError::MalformedIndex { .. }
         ))
     ));
-    let retained = pool.used_bytes().unwrap();
-    assert!(
-        retained > WorkingMemoryPool::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap()
-    );
+    let retained = pool.payload_used_bytes().unwrap();
+    assert!(retained > MemoryLedger::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap());
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn direct_source_keeps_pool_weak_and_allows_later_unquoted_work() {
@@ -194,7 +191,7 @@ fn direct_source_keeps_pool_weak_and_allows_later_unquoted_work() {
     if !qualified(&path) {
         return;
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let unquoted = pool.acquire_unquoted().unwrap();
     assert!(matches!(
         open(&pool, &path).unwrap_err().memory_failure(),
@@ -208,7 +205,7 @@ fn direct_source_keeps_pool_weak_and_allows_later_unquoted_work() {
             .encoded_byte_len,
         2
     );
-    drop(pool.acquire_unquoted().unwrap());
+    crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     let weak = Arc::downgrade(&pool.0);
     drop(pool);
     assert!(weak.upgrade().is_none());
@@ -229,7 +226,7 @@ fn concurrent_source_opening_and_retirement_preserve_shared_pool_totals() {
     }
     let (initial, index, headers, store, _) = indexed_parts(&dir);
     let total = initial + index + headers + store;
-    let pool = WorkingMemoryPool::new(total * 8, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(total * 8, 0).unwrap();
     let gate = Arc::new(std::sync::Barrier::new(8));
     let joins: Vec<_> = (0..8)
         .map(|_| {
@@ -246,11 +243,14 @@ fn concurrent_source_opening_and_retirement_preserve_shared_pool_totals() {
         .into_iter()
         .map(|thread| thread.join().unwrap())
         .collect();
-    assert_eq!(pool.used_bytes().unwrap(), total * 8);
+    assert_eq!(pool.payload_used_bytes().unwrap(), total * 8);
     assert_eq!(pool.0.usage.lock().unwrap().reservations, 0);
     while let Some(source) = sources.pop() {
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), total * sources.len() as u64);
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            total * sources.len() as u64
+        );
     }
 }
 

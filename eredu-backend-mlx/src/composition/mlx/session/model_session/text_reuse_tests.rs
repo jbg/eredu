@@ -2,14 +2,14 @@
 
 use super::*;
 use crate::backend::runtime::residency::storage::RetainedStorage;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     ControlledTextGeneration, TextGeneration, TextGenerationDriver, TextGenerationInput,
     TokenFilterController,
 };
-use eredu_runtime::working_memory::{
-    InferenceStateRevision, WorkingMemoryError, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{InferenceStateRevision, MemoryLedger, WorkingMemoryError};
 
 #[derive(Clone, Default)]
 struct Controller(Rc<Cell<(usize, usize, usize)>>);
@@ -69,7 +69,15 @@ fn config(managed: bool) -> TextGenerationConfig {
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(1),
-        managed_memory_capacity_bytes: managed.then_some(u64::MAX),
+        memory_limits: (managed.then_some(u64::MAX)).map_or_else(
+            eredu_core::MemoryLimitDeclarations::unlimited,
+            |bytes| {
+                eredu_core::MemoryLimitDeclarations::new([(
+                    "host".into(),
+                    eredu_core::MemoryLimit::Finite(bytes),
+                )])
+            },
+        ),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -77,10 +85,10 @@ fn config(managed: bool) -> TextGenerationConfig {
 
 fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
@@ -90,7 +98,7 @@ fn runtime(
         pool.unquoted_owner_count().unwrap() == 0
     });
     assert!(runtime.session().payload.model.has_published_idle_storage());
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     (runtime, artifact)
 }
 
@@ -99,10 +107,10 @@ fn reclaim() {
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -218,7 +226,7 @@ fn assert_frontier(runtime: &ModelRuntime<MlxBackend<'_>>, position: u64) {
 }
 
 fn reference(stream: &Stream, prompt: Vec<u32>, controlled: bool) -> Vec<u32> {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(stream, &pool);
     let outputs = generate(&mut runtime, prompt, false, controlled);
     let ids = token_ids(&outputs);
@@ -231,7 +239,7 @@ fn reference(stream: &Stream, prompt: Vec<u32>, controlled: bool) -> Vec<u32> {
 #[test]
 fn funded_request_identity_cannot_replace_the_private_preparation_scope() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = runtime(&stream, &pool);
     let before = Unchanged::capture(&runtime, &pool);
     let controller = Controller::default();
@@ -282,9 +290,9 @@ fn funded_request_identity_cannot_replace_the_private_preparation_scope() {
 fn quoted_prefix_reuse_matches_fresh_generation_and_preserves_escaped_old_charges() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = runtime(&stream, &pool);
-        let published_bytes = pool.used_bytes().unwrap();
+        let published_bytes = pool.fixture_host_charge().unwrap();
         let prompt_a = vec![1, 2, 3, 4, 5];
         let outputs_a = generate(&mut runtime, prompt_a.clone(), true, controlled);
         let ids_a = token_ids(&outputs_a);
@@ -303,7 +311,13 @@ fn quoted_prefix_reuse_matches_fresh_generation_and_preserves_escaped_old_charge
             assert_eq!(admission.request().geometry().cached_positions, 0);
             (admission.request().clone(), retained.revision().clone())
         };
-        let charge_a = request_a.memory_reservation().unwrap().bytes();
+        let charge_a = request_a
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         assert!(charge_a > 0);
         let live_a = live_storage_bytes(Some(&runtime), &[&outputs_a]);
         settle(&pool, live_a);
@@ -360,7 +374,13 @@ fn quoted_prefix_reuse_matches_fresh_generation_and_preserves_escaped_old_charge
                         .any(|held| held.validate_same_request(request).is_ok()));
                 }
             }
-            request_b.memory_reservation().unwrap().bytes()
+            request_b
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap()
         };
         assert!(charge_b > 0);
         let current_decoder = runtime
@@ -455,7 +475,7 @@ struct Unchanged {
 }
 
 impl Unchanged {
-    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) -> Self {
+    fn capture(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) -> Self {
         Self {
             paths: paths::snapshot(),
             inputs: paths::session_input_creation_attempts(),
@@ -470,15 +490,15 @@ impl Unchanged {
                 .unwrap()
                 .revision()
                 .clone(),
-            bytes: pool.used_bytes().unwrap(),
-            peak: pool.peak_bytes().unwrap(),
+            bytes: pool.fixture_host_charge().unwrap(),
+            peak: pool.fixture_host_peak().unwrap(),
         }
     }
 
     fn assert_no_work(
         &self,
         runtime: &ModelRuntime<MlxBackend<'_>>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         controller: &Controller,
     ) {
         assert_eq!(controller.0.get(), (0, 0, 0));
@@ -500,8 +520,8 @@ impl Unchanged {
                 .revision(),
             &self.revision
         );
-        assert_eq!(pool.used_bytes().unwrap(), self.bytes);
-        assert_eq!(pool.peak_bytes().unwrap(), self.peak);
+        assert_eq!(pool.fixture_host_charge().unwrap(), self.bytes);
+        assert_eq!(pool.fixture_host_peak().unwrap(), self.peak);
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     }
 }
@@ -509,7 +529,7 @@ impl Unchanged {
 #[test]
 fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_native_work() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let outputs_a = generate(&mut runtime, vec![1, 2, 3, 4, 5], true, false);
     let ids_a = token_ids(&outputs_a);
@@ -537,7 +557,7 @@ fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_nativ
     assert_eq!(controller_first.0.get(), (0, 0, 0));
     assert_eq!(controller_stale.0.get(), (0, 0, 0));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert!(pool.used_bytes().unwrap() > before_preparation.bytes);
+    assert!(pool.fixture_host_charge().unwrap() > before_preparation.bytes);
     assert_eq!(
         driver
             .runtime()
@@ -552,7 +572,10 @@ fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_nativ
     );
 
     let mut outputs_b = vec![driver.advance(&mut first).unwrap().unwrap().into_output()];
-    assert!(driver.take_completed_delivery(&mut first).unwrap().is_none());
+    assert!(driver
+        .take_completed_delivery(&mut first)
+        .unwrap()
+        .is_none());
     assert_frontier(driver.runtime(), 10);
     assert_eq!(controller_first.0.get().0, 1);
     assert_eq!(controller_first.0.get().1, 1);
@@ -576,7 +599,10 @@ fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_nativ
     // that actually advanced this native session.
     for _ in 0..2 {
         outputs_b.push(driver.advance(&mut first).unwrap().unwrap().into_output());
-        assert!(driver.take_completed_delivery(&mut first).unwrap().is_none());
+        assert!(driver
+            .take_completed_delivery(&mut first)
+            .unwrap()
+            .is_none());
     }
     assert!(driver.advance(&mut first).unwrap().is_none());
     assert_frontier(driver.runtime(), 12);
@@ -600,9 +626,9 @@ fn advancing_one_admitted_reuse_invalidates_the_other_before_controller_or_nativ
 #[test]
 fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacity() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
-    let published_bytes = pool.used_bytes().unwrap();
+    let published_bytes = pool.fixture_host_charge().unwrap();
     let outputs_a = generate(&mut runtime, vec![1, 2, 3, 4, 5], true, true);
     let ids_a = token_ids(&outputs_a);
     assert_frontier(&runtime, 7);
@@ -619,8 +645,11 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
             .unwrap()
             .request()
             .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
             .unwrap()
-            .bytes()
+            .total()
+            .unwrap()
     };
     let live_a = live_storage_bytes(Some(&runtime), &[&outputs_a]);
     settle(&pool, live_a);
@@ -643,7 +672,13 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
     assert_eq!(request_b.geometry().cached_positions, 7);
     assert_eq!(request_b.geometry().input_positions, 3);
     assert_eq!(request_b.geometry().prefill_chunk_positions, 1);
-    let charge_b = request_b.memory_reservation().unwrap().bytes();
+    let charge_b = request_b
+        .memory_reservation()
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
     assert!(charge_b > 0);
     let before_full_quote = Unchanged::capture(&runtime, &pool);
     let (full_quote, _) = super::text_quote::quote(
@@ -672,7 +707,7 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
     );
     before_full_quote.assert_no_work(&runtime, &pool, &controller);
     let exact_capacity = before_probe.bytes.checked_add(charge_b).unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), exact_capacity);
+    assert_eq!(pool.fixture_host_charge().unwrap(), exact_capacity);
     drop(probe);
     settle(&pool, before_probe.bytes);
     assert_eq!(controller.0.get(), (0, 0, 0));
@@ -698,7 +733,7 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
         &before_probe.revision
     );
     assert_eq!(
-        pool.peak_bytes().unwrap(),
+        pool.fixture_host_peak().unwrap(),
         before_probe.peak.max(exact_capacity)
     );
 
@@ -706,7 +741,10 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
         config(true).with_inference_policy(eredu_core::TextInferencePolicy {
             // A larger chunk could shrink and legitimately fit a lower limit.
             prefill_chunk_positions: std::num::NonZeroU64::new(1),
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(capacity),
+            )]),
             submission_tracking_capacity_bytes: None,
             graph_metadata_capacity_bytes: None,
         })
@@ -725,11 +763,9 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
         .err()
         .unwrap();
         assert_eq!(
-            cause::<WorkingMemoryError>(&error),
-            Some(&WorkingMemoryError::BudgetExceeded {
-                required_bytes: charge_b,
-                available_bytes: charge_b - 1,
-            }),
+            cause::<WorkingMemoryError>(&error)
+                .and_then(crate::tests::support::memory_error::host_budget_numbers),
+            Some((charge_b, charge_b - 1)),
             "one-byte-short rejection must include actual retained physical storage: {error}"
         );
         assert!(TEST_SAMPLING_FAILURE.with(|slot| slot.borrow().is_some()));
@@ -743,7 +779,7 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
         controller.clone(),
     )
     .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), exact_capacity);
+    assert_eq!(pool.fixture_host_charge().unwrap(), exact_capacity);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let outputs_b = generation
         .map(|token| token.unwrap().into_output())
@@ -760,7 +796,7 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
         live_b.checked_sub(published_bytes).unwrap() < charge_a.checked_add(charge_b).unwrap() / 2
     );
     assert_eq!(
-        pool.peak_bytes().unwrap(),
+        pool.fixture_host_peak().unwrap(),
         before_probe.peak.max(exact_capacity)
     );
     let mut full_prompt = vec![1, 2, 3, 4, 5];
@@ -785,8 +821,8 @@ fn cached_reuse_rejects_one_byte_short_and_runs_at_the_exact_live_domain_capacit
 #[test]
 fn original_recipe_binds_empty_initial_state_and_rejects_foreign_populated_roots() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let foreign = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = runtime(&stream, &pool);
     let geometry = eredu_core::InferenceGeometry {
         batch_size: 1,
@@ -805,7 +841,7 @@ fn original_recipe_binds_empty_initial_state_and_rejects_foreign_populated_roots
         .unwrap()
         .admission()
         .is_none());
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let paths_before = paths::snapshot();
     let (quote, roots, recipe) = runtime
         .session()
@@ -819,15 +855,15 @@ fn original_recipe_binds_empty_initial_state_and_rejects_foreign_populated_roots
         )
         .unwrap();
     assert!(roots.borrowed_storage().roots().is_empty());
-    assert_eq!(roots.borrowed_storage().total_bytes(), 0);
-    assert!(roots.pool().same_domain(&pool));
+    assert_eq!(roots.borrowed_storage().total_bytes(), Some(0));
+    assert!(roots.pool().same_ledger(&pool));
     assert!(recipe
         .plan()
         .same_plan(quote.equations.span_workspace_plan()));
     assert!(!recipe.records().is_empty());
     assert_eq!(recipe.sampling_records().len(), 4);
     assert_eq!(paths::snapshot(), paths_before);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     drop((quote, roots, recipe));
 
     // Populate the actual nonzero decoder through the shared ordinary driver.
@@ -838,7 +874,7 @@ fn original_recipe_binds_empty_initial_state_and_rejects_foreign_populated_roots
         input_positions: 1,
         ..geometry
     };
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let paths_before = paths::snapshot();
     let error = runtime
         .session()
@@ -854,8 +890,8 @@ fn original_recipe_binds_empty_initial_state_and_rejects_foreign_populated_roots
         .expect("nonempty decoder roots require their canonical pool");
     assert!(matches!(error, Error::Other(ref cause)
         if cause.downcast_ref::<WorkingMemoryError>() == Some(&WorkingMemoryError::IdentityMismatch)));
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(foreign.fixture_host_charge().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert_eq!(paths::snapshot(), paths_before);
     // Ordinary unquoted execution does not publish canonical decoder rows,
     // even when its live arrays are associated with this same runtime pool.
@@ -873,7 +909,7 @@ fn original_recipe_binds_empty_initial_state_and_rejects_foreign_populated_roots
         .expect("pool identity alone cannot certify unregistered decoder roots");
     assert!(matches!(error, Error::Other(ref cause)
         if cause.downcast_ref::<WorkingMemoryError>() == Some(&WorkingMemoryError::IdentityMismatch)));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     assert_eq!(paths::snapshot(), paths_before);
     drop((outputs, runtime));
     settle(&pool, 0);

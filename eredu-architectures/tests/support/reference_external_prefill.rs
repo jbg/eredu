@@ -99,6 +99,8 @@ struct ReferenceExternalSpan<'a, A> {
         ReferenceTensor,
         Error,
     > + 'a),
+    original: ReferenceExternalSpanSource<'a>,
+    origin: eredu_core::speculative::SpeculativeActivationOrigin,
     _architecture: std::marker::PhantomData<fn() -> A>,
 }
 impl<A, P, O>
@@ -120,6 +122,16 @@ where
     >,
     O: eredu_runtime::ActivationObserver<ReferenceTensor, Error> + ?Sized,
 {
+    fn has_speculative_span_authority(&self) -> bool {
+        self.original
+            .issuer
+            .validate_pool(&self.original.pool)
+            .is_ok()
+    }
+    fn score_layout(&self) -> eredu_runtime::replicated_session::PrefillScoreLayout {
+        eredu_runtime::replicated_session::PrefillScoreLayout::SelectedPositions
+    }
+
     fn execute<'s>(
         &mut self,
         session: &mut ReplicatedTextSession<
@@ -155,8 +167,13 @@ where
             Error,
         >,
     > {
+        let role = self
+            .original
+            .reserve(chunk, self.origin)
+            .map_err(eredu_runtime::ReplicatedTextSessionError::Mechanism)?;
+        let _role = ReferenceSpanRoleScope::enter(role);
         let preparation = (|| {
-        self.receiver.prepare(chunk)?;
+            self.receiver.prepare(chunk)?;
             let paths = A::external_prediction_capture_paths(self.request)?
                 .ok_or_else(|| Error::backend("reference assistant capture selection differs"))?;
             Ok(ExactReferenceCaptureObserver::new(paths))
@@ -279,7 +296,7 @@ fn materialized_external_assistants_use_shared_spans_and_preserve_lazy_context()
                     .any(|(name, _)| name.ends_with("lm_head.weight")));
                 if dflash {
                     clear_reference_trace();
-                let mut long = ReferenceExternalCase::new(None, false);
+                    let mut long = ReferenceExternalCase::new(None, false);
                     long.prompt_positions = 513;
                     let result =
                         run_reference_external_spans(&config, artifact.path(), Some(long.clone()))
@@ -377,4 +394,142 @@ fn external_span_completion_failure_retires_roots_before_any_sampling_publicatio
         .unwrap()
         .join()
         .unwrap();
+}
+
+// This shape-only backend has no native tensor allocation. Its descriptive
+// report and occurrence records use the actual funded host metadata worker.
+#[derive(Debug)]
+struct ReferenceShapeOnlyFacts;
+impl eredu_nn::workspace::WorkspaceMechanisms for ReferenceShapeOnlyFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn operation_bound(
+        &self,
+        _: &eredu_nn::workspace::WorkspaceOperation,
+    ) -> Result<Option<eredu_nn::workspace::WorkspaceOperationBound>, Error> {
+        Ok(None)
+    }
+}
+impl eredu_nn::workspace::WorkspaceFactMechanisms for ReferenceShapeOnlyFacts {
+    type Error = std::convert::Infallible;
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::memory_fixture::topology())
+    }
+    fn operation_facts(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Result<Option<eredu_nn::workspace::WorkspaceOperationFacts>, Self::Error> {
+        Ok(None)
+    }
+    fn write_operation_facts(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: eredu_nn::workspace::WorkspaceEffectDestination<'_>,
+    ) -> Result<Option<eredu_nn::workspace::WorkspaceOperationFacts>, Self::Error> {
+        Ok(None)
+    }
+    fn host_facts(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Result<Option<eredu_nn::workspace::WorkspaceHostFacts>, Self::Error> {
+        Ok(None)
+    }
+    fn write_host_facts(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: eredu_nn::workspace::WorkspaceHostDestination<'_>,
+    ) -> Result<Option<eredu_nn::workspace::WorkspaceHostFacts>, Self::Error> {
+        Ok(None)
+    }
+}
+struct ReferenceExternalSpanSource<'a> {
+    pool: eredu_runtime::working_memory::MemoryLedger,
+    issuer: eredu_runtime::working_memory::OriginalSpeculativeRequest,
+    cursor: eredu_runtime::speculative::external_occurrence::ExternalOccurrenceCursor<'a>,
+    metadata: eredu_nn::workspace::WorkspaceContext,
+    placement: std::sync::Arc<eredu_core::MemoryPlacement>,
+}
+impl ReferenceExternalSpanSource<'_> {
+    fn reserve(
+        &mut self,
+        chunk: &eredu_runtime::prefill::PrefillChunk,
+        origin: eredu_core::speculative::SpeculativeActivationOrigin,
+    ) -> Result<eredu_runtime::working_memory::OriginalExternalSpeculativeRole, Error> {
+        use eredu_runtime::{
+            speculative::external_occurrence::ExternalInvocationKind, working_memory::*,
+        };
+        let width = chunk.input.end - chunk.input.start;
+        let geometry = eredu_core::InferenceGeometry {
+            batch_size: 1,
+            cached_positions: chunk.position,
+            input_positions: width,
+            max_output_tokens: 0,
+            prefill_chunk_positions: width,
+            output: chunk.output,
+        };
+        let span = eredu_core::speculative::SpeculativePrefillSpan {
+            prompt_tokens: self.cursor.plan().prefill_geometry().input_positions,
+            input_start: chunk.input.start,
+            input_end: chunk.input.end,
+            position: chunk.position,
+            hidden_start: chunk.input.start,
+            token_start: chunk.input.start,
+            sequence: width,
+            seed_start: chunk.position,
+        };
+        let invocation = self
+            .cursor
+            .plan()
+            .invocation(
+                ExternalInvocationKind::TargetPrefill,
+                geometry,
+                Some(span),
+                origin,
+            )
+            .map_err(Error::backend)?;
+        let claim = self.cursor.claim(invocation).map_err(Error::backend)?;
+        let report = quote_inference_workspace_with_context(geometry, &self.metadata, |_| {
+            self.metadata.begin_state_span([])?;
+            self.metadata.finish_report(&[])
+        })
+        .map_err(Error::backend)?;
+        let requirements = SpeculativeInvocationRequirements::new(
+            report.span_workspace_plan(),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(
+                u64::try_from(
+                    std::mem::size_of::<ReferenceExternalCompletion>()
+                        + std::mem::size_of::<ReferenceSpanRoleScope>(),
+                )
+                .map_err(Error::backend)?,
+            ),
+            self.placement.clone(),
+        )
+        .map_err(Error::backend)?;
+        self.issuer
+            .reserve_external_role(claim, requirements)
+            .map_err(Error::backend)
+    }
+}
+
+thread_local! {
+    static REFERENCE_SPAN_ROLE: RefCell<Option<eredu_runtime::working_memory::OriginalExternalSpeculativeRole>> = const { RefCell::new(None) };
+}
+struct ReferenceSpanRoleScope(
+    Option<eredu_runtime::working_memory::OriginalExternalSpeculativeRole>,
+);
+impl ReferenceSpanRoleScope {
+    fn enter(role: eredu_runtime::working_memory::OriginalExternalSpeculativeRole) -> Self {
+        Self(REFERENCE_SPAN_ROLE.with(|slot| slot.replace(Some(role))))
+    }
+}
+impl Drop for ReferenceSpanRoleScope {
+    fn drop(&mut self) {
+        REFERENCE_SPAN_ROLE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
 }

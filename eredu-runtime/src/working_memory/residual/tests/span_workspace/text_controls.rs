@@ -4,11 +4,11 @@ use crate::working_memory::{
     TextHostControlFacts, WorkingMemoryFundingRun,
 };
 use eredu_core::{
-    capture::*, DescriptionCompleteness, ObservationCatalog, ObservationDtype, ObservationPoint,
+    DescriptionCompleteness, ObservationCatalog, ObservationDtype, ObservationPoint,
     ObservationPosition, ObservationRequirement, ObservationSupport, ObservationSupportReport,
-    ObservationSupportStatus, ObservationValueType, SymbolicDimension, TensorAxis,
+    ObservationSupportStatus, ObservationValueType, SymbolicDimension, TensorAxis, capture::*,
 };
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn capture_source() -> SharedCapturePlan {
     capture_source_for_geometry(geometry())
@@ -55,7 +55,6 @@ fn capture_source_for_geometry(g: InferenceGeometry) -> SharedCapturePlan {
     let caps = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::FullTensor],
         max_histogram_bins: 0,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let mut raw = CapturePlan::none();
@@ -101,13 +100,20 @@ fn prepared(
     PreparedTextControlWorkspace::prepare(source, q.geometry(), q.span_workspace().plan(), facts())
         .unwrap()
 }
-fn quote(pool: &WorkingMemoryPool, source: &SharedCapturePlan) -> IncrementalInferenceQuote {
-    let q = replacement_quote(pool, geometry(), 0).into_incremental();
+fn quote(pool: &MemoryLedger, source: &SharedCapturePlan) -> IncrementalInferenceQuote {
+    quote_with_extra(pool, source, 0)
+}
+fn quote_with_extra(
+    pool: &MemoryLedger,
+    source: &SharedCapturePlan,
+    extra: u64,
+) -> IncrementalInferenceQuote {
+    let q = replacement_quote(pool, geometry(), extra).into_incremental();
     let c = prepared(source, &q);
     q.with_span_workspace_and_text_controls(c).unwrap()
 }
 fn accept(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     q: IncrementalInferenceQuote,
 ) -> (
     WorkingMemoryReservation,
@@ -118,26 +124,32 @@ fn accept(
     let (r, run) = r.into_funding().unwrap();
     (r, run, q)
 }
-fn account(pool: &WorkingMemoryPool, r: &WorkingMemoryReservation) -> (u64, u64, usize) {
+// Payload balances exclude the separately retained reservation control floor.
+// Physical snapshot assertions below continue to include that floor.
+fn account(pool: &MemoryLedger, r: &WorkingMemoryReservation) -> (u64, u64, usize) {
     let usage = pool.0.usage.lock().unwrap();
     let a = &usage.funding[&r.0.funding.unwrap()];
-    (a.remaining, a.host_held, a.scopes)
+    (
+        a.remaining.checked_sub(a.control_floor).unwrap(),
+        a.host_held.checked_sub(a.control_floor).unwrap(),
+        a.scopes,
+    )
 }
 #[test]
 fn text_seal_adds_named_q_and_actual_p_once_with_exact_original_capacity() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let original = replacement_quote(&pool, geometry(), 0).into_incremental();
     let c = prepared(&source, &original);
     let earlier = c.clone();
     assert_eq!(c.facts(), facts());
     assert_eq!(c.source_identity(), Some(source.storage_identity()));
-    let before = original.incremental_bytes();
+    let before = original.incremental_bytes().unwrap();
     let q = original.with_span_workspace_and_text_controls(c).unwrap();
     let p = q.span_workspace().retention_peak_bytes().unwrap();
-    assert_eq!(q.incremental_bytes(), before + p + 51);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(q.incremental_bytes().unwrap(), before + p + 51);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     assert!(matches!(
         q.clone().with_span_workspace(),
         Err(ResidualQuoteError::Storage(
@@ -151,13 +163,12 @@ fn text_seal_adds_named_q_and_actual_p_once_with_exact_original_capacity() {
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    let exact = 64 + q.incremental_bytes();
+    let exact = exact_capacity(&pool, &q);
     assert!(matches!(
         sealed_plan(&pool, &q, exact - 1),
         Err(PrefillPlanningError::Reservation(
-            WorkingMemoryError::BudgetExceeded { .. }
-        ))
-    ));
+            capacity_error
+        )) if matches!(capacity_numbers(&capacity_error), Some((_, _)))));
     let (r, accepted) = sealed_plan(&pool, &q, exact).unwrap();
     let (r, run) = r.into_funding().unwrap();
     let (owner, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
@@ -165,12 +176,12 @@ fn text_seal_adds_named_q_and_actual_p_once_with_exact_original_capacity() {
     assert_eq!(account(&pool, &r).1, p + 51);
     assert!(owner.workspace().plan().same_plan(earlier.plan()));
     drop((owner, r, run, q, earlier, source, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn text_facts_bind_original_plan_geometry_source_and_preserve_unknown_overflow() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = replacement_quote(&pool, geometry(), 0).into_incremental();
     let other = replacement_quote(&pool, geometry(), 0).into_incremental();
@@ -231,25 +242,30 @@ fn text_facts_bind_original_plan_geometry_source_and_preserve_unknown_overflow()
         q.clone().with_span_workspace_and_text_controls(c),
         Err(ResidualQuoteError::Storage(WorkingMemoryError::Overflow))
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop((q, other, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn aggregate_hold_excludes_every_q_byte_and_coexists_with_original_h() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let h = CaptureRunHostPlan::prepare(&source)
         .unwrap()
         .initialization_peak_bytes();
     let context = WorkspaceContext::new(Facts::default());
-    let root_view = WorkspaceExistingStorage::new(Some(64), &context);
+    let root_view = placed_root(Some(64), &context);
     let storage =
         RegisteredWorkspaceStorage::bind(&pool, &context, [(1u32, root_view.clone())]).unwrap();
     let report = replacement_report(&context, &root_view, geometry());
     let mut enclosing = outside(geometry(), 0);
     enclosing.retained = WorkspaceBound::bounded(h, "actual closed cumulative capture host plan");
+    enclosing.physical_domains.as_mut().unwrap().retained = fixture_requirements(h);
+    enclosing.activations =
+        WorkspaceBound::bounded(publication_controls(), "funded publication metadata");
+    enclosing.physical_domains.as_mut().unwrap().activations =
+        fixture_requirements(publication_controls());
     let original = ResidualInferenceQuote::compose(&report, state(geometry()), enclosing, &storage)
         .unwrap()
         .into_incremental();
@@ -263,11 +279,13 @@ fn aggregate_hold_excludes_every_q_byte_and_coexists_with_original_h() {
         .prepare_capture_run(&r, CaptureRunHostPlan::prepare(&source).unwrap())
         .unwrap();
     assert_eq!(account(&pool, &r).1, pq + h);
-    let n = r.bytes() - pq - h;
+    let n = reservation_payload_bytes(&r) - pq - h;
     assert!(
-        matches!(native.adopt_storage_individually([(20u32,n+1)]),Err(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if required_bytes==n+1 && available_bytes==n)
+        matches!(native.adopt_host_storage_individually([(20u32,n+1)]),Err(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes > available_bytes && available_bytes <= n))
     );
-    let payload = native.adopt_storage_individually([(20u32, n)]).unwrap();
+    let payload = native
+        .adopt_host_storage_individually([(20u32, n - publication_controls())])
+        .unwrap();
     assert_eq!(account(&pool, &r).0 - account(&pool, &r).1, 0);
     owner
         .control_guard()
@@ -277,27 +295,30 @@ fn aggregate_hold_excludes_every_q_byte_and_coexists_with_original_h() {
     native.certify().unwrap();
     drop((bank, owner, r, run, storage, root));
     // The original report is an earlier alias of the same retained span plan.
-    assert!(pool.used_bytes().unwrap() >= pq);
+    assert!(pool.payload_used_bytes().unwrap() >= pq);
     drop(report);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn failed_pq_promotion_preserves_quote_and_alias_then_exact_retry_succeeds() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
-    let q = quote(&pool, &source);
+    let q = quote_with_extra(&pool, &source, publication_controls());
     let (r, run, q) = accept(&pool, q);
     let alias = q.span_workspace().plan().clone();
     let pq = q.span_workspace().retention_peak_bytes().unwrap() + 51;
     let native = run.scope().unwrap();
     let pressure = native
-        .adopt_storage_individually([(21u32, r.bytes() - pq + 1)])
+        .adopt_host_storage_individually([(
+            21u32,
+            reservation_payload_bytes(&r) - pq - publication_controls() + 1,
+        )])
         .unwrap();
     let before = account(&pool, &r);
     let error = q.into_funded_text_span_workspace(&run, &r).unwrap_err();
     assert!(
-        matches!(error.cause(),WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes} if *required_bytes==pq && *available_bytes+1==pq)
+        matches!(error.cause(),capacity_error if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes==pq && available_bytes+1==pq))
     );
     assert_eq!(account(&pool, &r), before);
     let (q, _) = error.into_parts();
@@ -307,21 +328,24 @@ fn failed_pq_promotion_preserves_quote_and_alias_then_exact_retry_succeeds() {
     assert_eq!(account(&pool, &r).1, pq);
     native.certify().unwrap();
     drop((owner, alias, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn compact_control_guard_is_last_custody_owner_without_retaining_plan_records() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
-    let q = quote(&pool, &source);
+    let q = quote_with_extra(&pool, &source, publication_controls());
     let (r, run, q) = accept(&pool, q);
     let (owner, _) = q.into_funded_text_span_workspace(&run, &r).unwrap();
     let pq = owner.protected_host_bytes();
     let guard = owner.control_guard();
     let native = run.scope().unwrap();
     let rest = native
-        .adopt_storage_individually([(22u32, r.bytes() - pq)])
+        .adopt_host_storage_individually([(
+            22u32,
+            reservation_payload_bytes(&r) - pq - publication_controls(),
+        )])
         .unwrap();
     native.certify().unwrap();
     assert_eq!(
@@ -329,18 +353,18 @@ fn compact_control_guard_is_last_custody_owner_without_retaining_plan_records() 
         2,
         "workspace and retained diagnostic field share plan; guard has no plan"
     );
-    let used = pool.used_bytes().unwrap();
+    let used = pool.payload_used_bytes().unwrap();
     drop((owner, run, r, root));
-    assert_eq!(pool.used_bytes().unwrap(), used - 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), used - 64);
     drop(guard);
-    assert_eq!(pool.used_bytes().unwrap(), used - 64 - pq);
+    assert_eq!(pool.payload_used_bytes().unwrap(), used - 64 - pq);
     drop(rest);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn early_diagnostic_alias_keeps_pq_through_owner_unwind_without_native_grant() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let original = replacement_quote(&pool, geometry(), 0).into_incremental();
     let controls = prepared(&source, &original);
@@ -358,14 +382,14 @@ fn early_diagnostic_alias_keeps_pq_through_owner_unwind_without_native_grant() {
     assert_eq!(account(&pool, &r).1, pq);
     assert_eq!(alias.plan().records().len(), 3);
     drop((r, run, root));
-    assert!(pool.used_bytes().unwrap() >= pq);
+    assert!(pool.payload_used_bytes().unwrap() >= pq);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn foreign_accounts_and_concurrent_duplicate_promotions_cannot_replace_custody() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = quote(&pool, &source);
     let (r, run, q) = accept(&pool, q);
@@ -406,20 +430,20 @@ fn foreign_accounts_and_concurrent_duplicate_promotions_cannot_replace_custody()
     ));
     other_scope.certify().unwrap();
     drop((owner, error, guard, oq, other, other_run, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn p_only_and_wrong_control_receipts_reject_under_the_existing_usage_lock() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = quote(&pool, &source);
     let (r, run, q) = accept(&pool, q);
     let (owner, _) = q.into_funded_text_span_workspace(&run, &r).unwrap();
     let guard = owner.control_guard();
     let base = replacement_quote(&pool, geometry(), 0).into_incremental();
-    let extra = r.bytes()
-        - base.incremental_bytes()
+    let extra = reservation_payload_bytes(&r)
+        - base.incremental_bytes().unwrap()
         - base.span_workspace().retention_peak_bytes().unwrap();
     drop(base);
     let plain = replacement_quote(&pool, geometry(), extra)
@@ -428,8 +452,8 @@ fn p_only_and_wrong_control_receipts_reject_under_the_existing_usage_lock() {
         .unwrap();
     let (pr, prun, plain) = accept(&pool, plain);
     assert_eq!(
-        pr.bytes(),
-        r.bytes(),
+        reservation_payload_bytes(&pr),
+        reservation_payload_bytes(&r),
         "equal bytes cannot substitute P-only authority"
     );
     let e = plain
@@ -478,21 +502,22 @@ fn p_only_and_wrong_control_receipts_reject_under_the_existing_usage_lock() {
         run,
         root,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn every_explicit_zero_and_nonzero_source_is_checked_before_and_after_attachment() {
     for bytes in [0, 24] {
         for phase in 0..3 {
-            let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-            let root = pool.register_storage([(1u32, 64)]).unwrap();
+            let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+            let root = pool.register_host_storage([(1u32, 64)]).unwrap();
             let source = capture_source();
-            let origin = replacement_quote(&pool, geometry(), 0).into_incremental();
+            let origin =
+                replacement_quote(&pool, geometry(), publication_controls()).into_incremental();
             let (sr, srun, _) = accept(&pool, origin);
             let source_scope = srun.scope().unwrap();
             let registration = source_scope
-                .adopt_storage_individually([(30u32, bytes)])
+                .adopt_host_storage_individually([(30u32, bytes)])
                 .unwrap()
                 .into_values()
                 .next()
@@ -549,7 +574,7 @@ fn every_explicit_zero_and_nonzero_source_is_checked_before_and_after_attachment
             }
             drop((alias, r, run, sr, srun, registration, root));
             assert!(
-                pool.used_bytes().unwrap() > 0,
+                pool.payload_used_bytes().unwrap() > 0,
                 "quarantined source keeps its original envelope"
             );
         }
@@ -557,15 +582,15 @@ fn every_explicit_zero_and_nonzero_source_is_checked_before_and_after_attachment
 }
 #[test]
 fn foreign_pool_closed_run_and_poisoned_usage_cannot_validate_or_release_live_controls() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let q = quote(&pool, &source);
     let (r, run, q) = accept(&pool, q);
     let (owner, _) = q.into_funded_text_span_workspace(&run, &r).unwrap();
     let guard = owner.control_guard();
-    let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let froot = foreign.register_storage([(1u32, 64)]).unwrap();
+    let foreign = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let froot = foreign.register_host_storage([(1u32, 64)]).unwrap();
     let fq = quote(&foreign, &source);
     let (fr, frun, fq) = accept(&foreign, fq);
     let fs = frun.scope().unwrap();
@@ -575,7 +600,7 @@ fn foreign_pool_closed_run_and_poisoned_usage_cannot_validate_or_release_live_co
     ));
     fs.certify().unwrap();
     drop((fq, fr, frun, froot));
-    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(foreign.payload_used_bytes().unwrap(), 0);
     drop(run);
     assert!(matches!(
         guard.validate_reservation(&r),
@@ -594,7 +619,14 @@ fn foreign_pool_closed_run_and_poisoned_usage_cannot_validate_or_release_live_co
     {
         let usage = pool.0.usage.lock().unwrap_err().into_inner();
         let s = &usage.funding[&r.0.funding.unwrap()];
-        assert_eq!((s.remaining, s.host_held, s.scopes), before);
+        assert_eq!(
+            (
+                s.remaining - s.control_floor,
+                s.host_held - s.control_floor,
+                s.scopes
+            ),
+            before
+        );
     }
     let account_id = r.0.funding.unwrap();
     drop((owner, guard, r, root));
@@ -607,9 +639,12 @@ fn foreign_pool_closed_run_and_poisoned_usage_cannot_validate_or_release_live_co
         account.validate_registered_copy_origin(),
         Err(WorkingMemoryError::ExecutionFenced)
     ));
-    assert_eq!((account.host_held, account.scopes), (0, 0));
-    assert_eq!(account.remaining, before.0);
-    assert_eq!(usage.reserved, before.0);
+    assert_eq!(
+        (account.host_held - account.control_floor, account.scopes),
+        (0, 0)
+    );
+    assert_eq!(account.remaining - account.control_floor, before.0);
+    assert_eq!(usage.reserved - account.control_floor, before.0);
     assert_eq!(usage.registered, 0);
 }
 

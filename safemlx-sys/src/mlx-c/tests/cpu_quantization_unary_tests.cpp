@@ -98,7 +98,7 @@ TEST_CASE("CPU original quantization unary workers preserve values and escaped c
         REQUIRE(mlx_original_buffer_request_layout_for(&physical, runtime,
             std::size(sequence) * dtype.size()) == 0);
         REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, physical.capacity,
-            &retired, [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+            &retired, [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
         std::optional<array> escaped;
         {
           Role role;
@@ -162,7 +162,7 @@ TEST_CASE("CPU quantization unary refuses a short physical budget and retires it
         ~Budget() { mlx_original_buffer_budget_release(value); }
       } budget;
       REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value, runtime, physical.capacity - 1,
-          &retired, [](void* p) { ++*static_cast<unsigned*>(p); }) == 0);
+          &retired, [](void* p) { ++*static_cast<unsigned*>(p); }, nullptr) == 0);
       {
         Role role;
         REQUIRE(mlx_original_buffer_budget_bind({role.scope.get()}, budget.value) == 0);

@@ -111,9 +111,8 @@ fn request(geometry: InferenceGeometry) -> AdmissionRequest {
         input: InputTokenCount::text(geometry.input_positions),
         max_output_tokens: geometry.max_output_tokens,
         batch_size: geometry.batch_size,
-        safety_reserve_bytes: 11,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(11),
+        memory_limits: Default::default(),
     }
 }
 
@@ -129,7 +128,7 @@ fn capabilities() -> ModelCapabilities {
 }
 
 fn candidate(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     geometry: InferenceGeometry,
     controller: &Controller,
     maximum_rows: i32,
@@ -141,7 +140,9 @@ fn candidate(
         // enters that protocol; unknown operation facts remain in the trace.
         context.begin_state_span(std::iter::empty::<&WorkspaceTensor>())?;
         let rows = match span {
-            InferenceWorkspaceSpan::Sampling(_) => panic!("model scheduler emitted a sampling phase"),
+            InferenceWorkspaceSpan::Sampling(_) => {
+                panic!("model scheduler emitted a sampling phase")
+            }
             InferenceWorkspaceSpan::Prefill(chunk) => chunk.input.end - chunk.input.start,
             InferenceWorkspaceSpan::Decode { .. } => 1,
         };
@@ -178,7 +179,8 @@ fn candidate(
             "no separate fixture allocation outside the traced operators",
         )
     };
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry,
         activations: absent(),
         attention: absent(),
@@ -186,7 +188,7 @@ fn candidate(
         state_update: absent(),
         materialization: absent(),
         retained: absent(),
-    };
+    });
     let storage = ControllerStorageContract::inspect(controller).unwrap();
     let contribution = ControllerWorkspaceContribution::new(
         geometry,
@@ -211,6 +213,8 @@ fn candidate(
         paged_sources: None,
         native_recipe: None,
         prepared_source: None,
+        execution_metadata: None,
+        ordinary_publication: None,
         planning_metadata: None,
         quote,
         output_width,
@@ -251,8 +255,8 @@ impl Cold {
 
 #[test]
 fn first_incomplete_candidate_retries_until_a_real_smaller_quote_is_reserved() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
-    let original = pool.register_storage([(1_u32, 64)]).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
+    let original = pool.register_host_storage([(1_u32, 64)]).unwrap();
     let controller = Controller::new(16);
     let cold = Cold::new();
     let mut accepted_geometry = geometry();
@@ -260,7 +264,10 @@ fn first_incomplete_candidate_retries_until_a_real_smaller_quote_is_reserved() {
     let expected = candidate(&pool, accepted_geometry, &controller, 2, 8)
         .quote
         .unwrap();
-    let expected_bytes = expected.incremental_bytes() + request(geometry()).safety_reserve_bytes;
+    let expected_bytes = expected
+        .incremental_bytes()
+        .expect("finite fixture diagnostic")
+        + 11;
     let mut attempts = Vec::new();
     let (reservation, contract) = plan_candidates(
         &InferenceExecutionIdentity::default(),
@@ -268,34 +275,42 @@ fn first_incomplete_candidate_retries_until_a_real_smaller_quote_is_reserved() {
         &capabilities(),
         request(geometry()),
         geometry(),
-        64 + expected_bytes,
+        crate::memory_fixture::resolved_limits(64 + expected_bytes),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
-            assert_eq!(pool.used_bytes().unwrap(), 64);
-            assert_eq!(pool.peak_bytes().unwrap(), 64);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 64);
+            assert_eq!(pool.fixture_host_peak().unwrap(), 64);
             Ok(candidate(&pool, geometry, &controller, 2, 8))
         },
     )
     .unwrap();
     assert_eq!(attempts, [4, 3, 2]);
     assert_eq!(reservation.geometry(), accepted_geometry);
-    assert_eq!(reservation.bytes(), expected_bytes);
+    assert_eq!(
+        reservation
+            .requirements()
+            .get(pool.topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap(),
+        expected_bytes
+    );
     assert_eq!(&reservation.admission().state, expected.state());
     assert_eq!(Some(&contract), expected.controller_contract());
     assert!(reservation.requires_funding_scope());
-    assert_eq!(pool.used_bytes().unwrap(), 64 + expected_bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 64 + expected_bytes);
     cold.unchanged();
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 64);
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
 fn all_incomplete_candidates_preserve_typed_last_gap_without_mutating_pool() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
-    let _original = pool.register_storage([(1_u32, 64)]).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
+    let _original = pool.register_host_storage([(1_u32, 64)]).unwrap();
     let controller = Controller::new(16);
     let cold = Cold::new();
     let mut attempts = Vec::new();
@@ -305,7 +320,7 @@ fn all_incomplete_candidates_preserve_typed_last_gap_without_mutating_pool() {
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
@@ -327,7 +342,10 @@ fn all_incomplete_candidates_preserve_typed_last_gap_without_mutating_pool() {
         Some(PrefillPlanningError::IncompleteWorkspace(_))
     ));
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         (64, 64)
     );
     cold.unchanged();
@@ -335,7 +353,7 @@ fn all_incomplete_candidates_preserve_typed_last_gap_without_mutating_pool() {
 
 #[test]
 fn diagnostic_output_width_is_bound_even_when_both_candidates_are_incomplete() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let controller = Controller::new(16);
     let cold = Cold::new();
     let mut attempts = Vec::new();
@@ -345,7 +363,7 @@ fn diagnostic_output_width_is_bound_even_when_both_candidates_are_incomplete() {
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
@@ -365,7 +383,10 @@ fn diagnostic_output_width_is_bound_even_when_both_candidates_are_incomplete() {
         Some(&WorkingMemoryError::IdentityMismatch)
     );
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         (0, 0)
     );
     cold.unchanged();
@@ -373,7 +394,7 @@ fn diagnostic_output_width_is_bound_even_when_both_candidates_are_incomplete() {
 
 #[test]
 fn complete_candidate_with_changed_controller_contract_rejects_before_reservation() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let controller = Controller::new(16);
     let changed = Controller::new(24);
     let cold = Cold::new();
@@ -384,7 +405,7 @@ fn complete_candidate_with_changed_controller_contract_rejects_before_reservatio
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
@@ -404,7 +425,10 @@ fn complete_candidate_with_changed_controller_contract_rejects_before_reservatio
         Some(&WorkingMemoryError::IdentityMismatch)
     );
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         (0, 0)
     );
     cold.unchanged();
@@ -416,7 +440,7 @@ struct NativeCause(Arc<()>);
 
 #[test]
 fn fatal_native_error_after_incomplete_candidate_keeps_original_source_and_stops() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let controller = Controller::new(16);
     let identity = Arc::new(());
     // Exception construction is host metadata; no native array is allocated.
@@ -433,7 +457,7 @@ fn fatal_native_error_after_incomplete_candidate_keeps_original_source_and_stops
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
@@ -456,7 +480,10 @@ fn fatal_native_error_after_incomplete_candidate_keeps_original_source_and_stops
     ));
     assert!(cause::<PrefillPlanningError>(&error).is_none());
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         (0, 0)
     );
     cold.unchanged();
@@ -464,7 +491,7 @@ fn fatal_native_error_after_incomplete_candidate_keeps_original_source_and_stops
 
 #[test]
 fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() {
-    let pool = WorkingMemoryPool::new(4096, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(4096, 0).unwrap();
     let controller = Controller::new(16);
     let cold = Cold::new();
     let mut attempts = Vec::new();
@@ -474,11 +501,11 @@ fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() 
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
             if geometry.prefill_chunk_positions > 2 {
                 return Err(Error::PrefillControl(
                     WorkingMemoryError::SubmissionTrackingCapacity {
@@ -493,9 +520,9 @@ fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() 
     .unwrap();
     assert_eq!(attempts, [4, 3, 2]);
     assert_eq!(reservation.geometry().prefill_chunk_positions, 2);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 
     // A decode/other constructor can impose a floor that no prefill chunk
     // removes. The last real refusal keeps its exact fields, without replacing
@@ -507,7 +534,7 @@ fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() 
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
@@ -529,7 +556,7 @@ fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() 
             configured_bytes: 1024,
         })
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 
     // The new quote-stage exception must not make arbitrary accounting/native
     // failures retryable; such a retry could hide a source/identity defect.
@@ -540,7 +567,7 @@ fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() 
         &capabilities(),
         request(geometry()),
         geometry(),
-        4096,
+        crate::memory_fixture::resolved_limits(4096),
         controller.inference_workspace(2).unwrap(),
         |geometry| {
             attempts.push(geometry.prefill_chunk_positions);
@@ -554,6 +581,14 @@ fn tracking_capacity_retries_smaller_quotes_and_preserves_final_typed_refusal() 
         cause::<WorkingMemoryError>(&error),
         Some(&WorkingMemoryError::IdentityMismatch)
     );
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     cold.unchanged();
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

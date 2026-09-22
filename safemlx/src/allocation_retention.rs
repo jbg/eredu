@@ -312,8 +312,9 @@ pub use host_alias::{HostTransferArrayAliasWitness, HostTransferArrayViewWitness
 pub use original_buffer::{
     ImmutableSourceInspection, ImmutableSourceWitness, OrdinaryBufferInspection,
     OrdinaryBufferWitness, OriginalBufferAliasWitness, OriginalBufferBudget,
-    OriginalBufferBudgetLayout, OriginalBufferCause, OriginalBufferError,
-    OriginalBufferPopulationLayout, OriginalBufferWitness, PreparedOriginalBufferBudget,
+    OriginalBufferBudgetLayout, OriginalBufferCause, OriginalBufferError, OriginalBufferInspection,
+    OriginalBufferLifetimeObserver, OriginalBufferPopulationLayout, OriginalBufferWitness,
+    PreparedOriginalBufferBudget, SharedOriginalBufferInspection,
 };
 
 mod prefill_failure;
@@ -358,4 +359,98 @@ pub use pipeline_cache::{
 };
 
 mod host_writer;
-pub use host_writer::PreparedHostTransferWriter;
+pub use host_writer::{OrdinaryHostWriterError, PreparedHostTransferWriter};
+
+/// A prepaid, payload-free owner handed to one physical backing observer.
+/// Retirement uses the same deferred queue as tensor allocation attachments.
+#[derive(Debug)]
+pub struct PhysicalBackingCustody {
+    node: *mut c_void,
+    publish: safemlx_sys::mlx_physical_backing_publish,
+}
+// SAFETY: construction requires a Send + Sync payload, and the node is move-only.
+unsafe impl Send for PhysicalBackingCustody {}
+unsafe impl Sync for PhysicalBackingCustody {}
+impl PhysicalBackingCustody {
+    /// Exact Rust allocation for the retained owner. Reserve before `new`.
+    pub const fn control_bytes<T: Send + Sync + 'static>() -> usize {
+        std::mem::size_of::<OwnedNode<T>>()
+    }
+    /// Retain a previously funded owner without entering native execution.
+    pub fn new<T: Send + Sync + 'static>(owner: T) -> Self {
+        let node = Box::new(OwnedNode {
+            retired: RetiredOwner {
+                next: ptr::null_mut(),
+                destroy: destroy::<T>,
+            },
+            owner,
+        });
+        Self {
+            node: Box::into_raw(node).cast(),
+            publish: None,
+        }
+    }
+    /// Retains a prepaid allocation-only grant that must be published after
+    /// native allocation. The callback never grants numerical execution.
+    pub fn new_pending<T: PhysicalBackingPublication>(owner: T) -> Self {
+        let mut custody = Self::new(owner);
+        custody.publish = Some(publish_backing::<T>);
+        custody
+    }
+    pub(crate) fn into_raw(self) -> (*mut c_void, safemlx_sys::mlx_physical_backing_publish) {
+        let result = (self.node, self.publish);
+        std::mem::forget(self);
+        result
+    }
+    pub(crate) unsafe extern "C" fn release(payload: *mut c_void) {
+        // SAFETY: native ownership is transferred once and retired once.
+        unsafe { retire(payload) };
+    }
+    pub(crate) unsafe fn borrowed_owner<'a, T: Send + Sync + 'static>(
+        payload: *mut c_void,
+    ) -> &'a T {
+        // SAFETY: the caller authenticates the concrete constructor type and
+        // retains native ownership of this node through the returned borrow.
+        &unsafe { &*payload.cast::<OwnedNode<T>>() }.owner
+    }
+    pub(crate) unsafe fn borrowed_error(payload: *mut c_void) -> std::sync::Arc<Exception> {
+        // SAFETY: only a failed physical observer creates this exact node type;
+        // the currently caught native exception retains it through this clone.
+        unsafe { &*payload.cast::<OwnedNode<std::sync::Arc<Exception>>>() }
+            .owner
+            .clone()
+    }
+}
+impl Drop for PhysicalBackingCustody {
+    fn drop(&mut self) {
+        // SAFETY: this exclusive unpublished node has not crossed native ownership.
+        unsafe { retire(self.node) };
+    }
+}
+
+/// Producer-owned reservation conversion after actual backing allocation.
+pub trait PhysicalBackingPublication: Send + Sync + 'static {
+    /// Publish already accepted physical capacity without allocating or native work.
+    fn publish(&mut self) -> Result<(), Exception>;
+}
+unsafe extern "C" fn publish_backing<T: PhysicalBackingPublication>(
+    payload: *mut c_void,
+    failure: *mut *mut c_void,
+    release: *mut Option<unsafe extern "C" fn(*mut c_void)>,
+) -> bool {
+    // SAFETY: the observer transferred this exact exclusive node; native calls
+    // publication once before exposing any tensor or cache reference.
+    let owner = unsafe { &mut (*payload.cast::<OwnedNode<T>>()).owner };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.publish()));
+    let error = match result {
+        Ok(Ok(())) => return true,
+        Ok(Err(error)) => error,
+        Err(_) => Exception::custom("physical backing publication unwound"),
+    };
+    let custody = PhysicalBackingCustody::new(std::sync::Arc::new(error));
+    unsafe {
+        *failure = custody.into_raw().0;
+        *release = Some(PhysicalBackingCustody::release);
+    }
+    false
+}

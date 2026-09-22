@@ -43,69 +43,53 @@ pub struct InferenceTextStepReceipt {
 }
 
 #[derive(Debug, Clone)]
-enum ReceiptAuthority {
-    // Canonical identity only, retaining the existing pool but no request or
-    // preparation allocation. A retired account ID can never be issued again.
-    Reserved {
-        pool: super::super::WorkingMemoryPool,
-        id: u64,
-    },
-    Ordinary(Arc<TextPreparationAuthority>),
+struct ReceiptAuthority {
+    // Canonical identity retains the ledger without retaining the request.
+    // A retired account identifier is never reissued.
+    pool: super::super::MemoryLedger,
+    id: u64,
 }
 impl ReceiptAuthority {
     fn new(request: &InferenceRequest) -> Self {
-        match request.memory_reservation() {
-            Some(reservation) => Self::Reserved {
-                pool: reservation.0.pool.clone(),
-                id: reservation.0.account_id,
-            },
-            None => Self::Ordinary(Arc::clone(
-                request.preparation.as_ref().expect("preparation owner"),
-            )),
+        let reservation = request.memory_reservation();
+        Self {
+            pool: reservation.0.pool.clone(),
+            id: reservation.0.account_id,
         }
     }
     fn matches_request(&self, request: &InferenceRequest) -> Result<bool, WorkingMemoryError> {
         let Some(actual) = request.preparation.as_ref() else {
             return Ok(false);
         };
-        match self {
-            Self::Ordinary(authority) => {
-                Ok(request.memory_reservation().is_none() && Arc::ptr_eq(actual, authority))
-            }
-            Self::Reserved { pool, id } => {
-                let Some(reservation) = request.memory_reservation() else {
-                    return Ok(false);
-                };
-                if reservation.0.account_id != *id || !pool.same_domain(&reservation.0.pool) {
-                    return Ok(false);
-                }
-                {
-                    let usage = pool
-                        .0
-                        .usage
-                        .lock()
-                        .map_err(|_| WorkingMemoryError::Poisoned)?;
-                    usage
-                        .funding
-                        .validate_metadata(*id, &reservation.0.execution)?;
-                }
-                // Exact authority remains in the canonical reservation after
-                // prefill starts; a same-account replaced preparation is not valid.
-                let start = reservation
-                    .0
-                    .start
-                    .lock()
-                    .map_err(|_| WorkingMemoryError::Poisoned)?;
-                Ok(match &*start {
-                    RequestStart::Preparing(expected) | RequestStart::Started(Some(expected)) => {
-                        Arc::ptr_eq(actual, expected)
-                    }
-                    RequestStart::Fresh | RequestStart::Started(None) => false,
-                })
-            }
+        let reservation = request.memory_reservation();
+        if reservation.0.account_id != self.id || !self.pool.same_ledger(&reservation.0.pool) {
+            return Ok(false);
         }
+        {
+            let usage = self
+                .pool
+                .0
+                .usage
+                .lock()
+                .map_err(|_| WorkingMemoryError::Poisoned)?;
+            usage
+                .funding
+                .validate_metadata(self.id, &reservation.0.execution)?;
+        }
+        let start = reservation
+            .0
+            .start
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        Ok(match &*start {
+            RequestStart::Preparing(expected) | RequestStart::Started(Some(expected)) => {
+                Arc::ptr_eq(actual, expected)
+            }
+            RequestStart::Fresh | RequestStart::Started(None) => false,
+        })
     }
 }
+
 fn receipt_identity(
     request: &InferenceRequest,
     input: &PendingTextInput<(), &InferenceTextStepReceipt>,
@@ -287,8 +271,8 @@ impl InferenceTextPreparation {
     }
 }
 
-mod control;
 mod branch;
+mod control;
 pub use branch::PendingTextBranchExchange;
 mod sampling;
 pub use sampling::PendingSamplingExtension;
@@ -309,10 +293,7 @@ impl InferenceTextStep {
         &self,
         reservation: &WorkingMemoryReservation,
     ) -> Result<(Arc<TextPreparationAuthority>, u64), WorkingMemoryError> {
-        let actual_reservation = self
-            .request
-            .memory_reservation()
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let actual_reservation = self.request.memory_reservation();
         if !actual_reservation.0.same(&reservation.0) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }

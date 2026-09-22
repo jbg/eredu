@@ -1,6 +1,6 @@
 //! Stock tokenizer-trie construction with retained source identity and admission.
 use super::{
-    OriginalTokenizer, WorkingMemoryError, WorkingMemoryPool, original_declaration_source::Account,
+    MemoryLedger, OriginalTokenizer, WorkingMemoryError, original_declaration_source::Account,
 };
 use eredu_text::token_trie_storage::{
     PreparedTokenTrie, TokRxInfo, TokTrie, TokenTrieConstructionFailure, TokenTrieMemoryPolicy,
@@ -43,7 +43,7 @@ impl OriginalTokenTrieSource {
     pub fn validate_grammar_source(
         &self,
         source: eredu_core::speculative::PreparedGrammarSource<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         let supplied = source
             .tokenizer()
@@ -70,7 +70,7 @@ impl OriginalTokenTrieSource {
         recipe: &eredu_core::SharedControllerBytes,
         declaration: &eredu_core::SharedControllerDeclaration,
         compilation: &super::OriginalControllerCompilation,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.payload().account.validate(pool)?;
         self.payload().tokenizer.validate_pool(pool)?;
@@ -83,13 +83,13 @@ impl OriginalTokenTrieSource {
     pub fn grammar_validation_control_bytes() -> Option<usize> {
         let parts = [
             Self::validation_control_bytes()?,
-            WorkingMemoryPool::shared_controller_source_validation_control_bytes()?,
+            MemoryLedger::shared_controller_source_validation_control_bytes()?,
             super::OriginalControllerCompilation::validation_control_bytes()?,
             eredu_core::speculative::PreparedGrammarSource::control_bytes()?,
             size_of::<(
                 &Self,
                 eredu_core::speculative::PreparedGrammarSource<'_>,
-                &WorkingMemoryPool,
+                &MemoryLedger,
             )>(),
             size_of::<(
                 &Self,
@@ -97,7 +97,7 @@ impl OriginalTokenTrieSource {
                 &eredu_core::SharedControllerBytes,
                 &eredu_core::SharedControllerDeclaration,
                 &super::OriginalControllerCompilation,
-                &WorkingMemoryPool,
+                &MemoryLedger,
             )>(),
             size_of::<Option<&Self>>(),
             size_of::<Option<&super::OriginalControllerCompilation>>(),
@@ -156,7 +156,7 @@ impl OriginalTokenTrieSource {
     /// deep clone, reconstruction or funding operation occurs during validation.
     pub fn validate(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         tokenizer: &OriginalTokenizer,
         info: &TokRxInfo,
         eos: &[u32],
@@ -185,13 +185,7 @@ impl OriginalTokenTrieSource {
             size_of::<[&OriginalTokenizer; 2]>(),
             size_of::<Option<&OriginalTokenizer>>(),
             size_of::<bool>(),
-            size_of::<(
-                &Self,
-                &WorkingMemoryPool,
-                &OriginalTokenizer,
-                &TokRxInfo,
-                &[u32],
-            )>(),
+            size_of::<(&Self, &MemoryLedger, &OriginalTokenizer, &TokRxInfo, &[u32])>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<TokRxInfo>(),
             size_of::<std::slice::Iter<'_, u32>>(),
@@ -273,7 +267,7 @@ fn required(plan: &TokenTriePlan<'_>) -> Result<u64, WorkingMemoryError> {
         size_of::<Result<TokenTriePlan<'_>, TokenTrieSourceError>>(),
         size_of::<Result<OriginalTokenTrieSource, Cause>>(),
         size_of::<Result<Account, WorkingMemoryError>>(),
-        size_of::<(&WorkingMemoryPool, &OriginalTokenizer, &TokRxInfo, &[u32])>(),
+        size_of::<(&MemoryLedger, &OriginalTokenizer, &TokRxInfo, &[u32])>(),
         size_of::<Result<(), WorkingMemoryError>>(),
         size_of::<Option<OriginalTokenTrieSource>>(),
         size_of::<Arc<Payload>>(),
@@ -289,7 +283,7 @@ fn required(plan: &TokenTriePlan<'_>) -> Result<u64, WorkingMemoryError> {
         .and_then(|n| u64::try_from(n).ok())
         .ok_or(WorkingMemoryError::Overflow)
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// First-party destination sizing and default upstream headroom; deriving
     /// this estimate neither constructs a trie nor admits an account.
     pub fn token_trie_source_required_bytes(

@@ -1,4 +1,5 @@
 //! Price the actual native callback and work types before role admission.
+use crate::backend::runtime::residency::manager::OriginalMaterializedLoan;
 use crate::backend::error::Error;
 use crate::composition::mlx::speculative::embedded_native::{
     ActiveEmbeddedNativeInvocation, EmbeddedNativeLayout,
@@ -12,7 +13,7 @@ pub(super) fn handler_controls<Q: 'static, W, T, B, F, G, H>(
     handlers: &(F, G, H),
 ) -> Option<u64>
 where
-    F: FnOnce(&mut W, &Q, &SubmissionScope) -> Result<B, Error>,
+    F: FnOnce(&mut W, &Q, &SubmissionScope, OriginalMaterializedLoan<'_>) -> Result<B, Error>,
     G: FnOnce(&mut W, &Q, &ActiveEmbeddedNativeInvocation<'_>) -> Result<T, Error>,
     H: FnOnce(
         &mut W,

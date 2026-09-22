@@ -273,22 +273,19 @@ fn selective_control_artifacts(
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
     let capture = model
-        .prepare_speculative_capture(settings, capture)
+        .prepare_speculative_capture(settings.clone(), capture)
         .unwrap();
     let edits = if experiment {
         use eredu_core::intervention::*;
         let discovery = model.speculative_intervention_discovery().unwrap();
-        assert!(
-            discovery
-                .points
-                .iter()
-                .all(|p| p.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
-        );
+        assert!(discovery
+            .points
+            .iter()
+            .all(|p| p.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH));
         [
             (SpeculativeCaptureRole::Target, 12),
             (SpeculativeCaptureRole::Draft, 11),
@@ -345,7 +342,7 @@ fn selective_control_artifacts(
             PreparedChatPrompt::Rendered
         },
         drafting: drafting.as_speculative_draft().unwrap(),
-        settings: chat_settings(&chat, settings),
+        settings: chat_settings(&chat, settings.clone()),
         options: generation_options,
         caller_stop_sequences: &[],
         cancellation: Default::default(),
@@ -403,11 +400,9 @@ fn selective_control_artifacts(
                 reseed: Some(123),
             })?;
             session.intervene(edits.clone())?;
-            assert!(
-                session
-                    .intervene(vec![edits[0].clone(), edits[0].clone()])
-                    .is_err()
-            );
+            assert!(session
+                .intervene(vec![edits[0].clone(), edits[0].clone()])
+                .is_err());
             session.force_next_token(10)?;
             let changed = session.snapshot()?;
             let mut child_replays = Vec::new();
@@ -445,11 +440,10 @@ fn selective_control_artifacts(
             let mut unedited = Vec::new();
             while let Some(step) = session.step()? {
                 unedited.extend(step.committed_token_ids);
-                assert!(
-                    step.captures
-                        .iter()
-                        .all(|c| c.capture.as_step().interventions.is_empty())
-                );
+                assert!(step
+                    .captures
+                    .iter()
+                    .all(|c| c.capture.as_step().interventions.is_empty()));
                 captures.extend(step.captures.iter().cloned());
             }
             assert_eq!(unedited, replays[0]);
@@ -497,16 +491,12 @@ fn selective_control_artifacts(
         assert!(compare && temperature == 0.0 && output.token_ids().len() == 1);
         return;
     }
-    assert!(
-        captures
-            .iter()
-            .any(|c| c.role == SpeculativeCaptureRole::Draft)
-    );
-    assert!(
-        captures
-            .iter()
-            .any(|c| c.role == SpeculativeCaptureRole::Target && c.position > 0)
-    );
+    assert!(captures
+        .iter()
+        .any(|c| c.role == SpeculativeCaptureRole::Draft));
+    assert!(captures
+        .iter()
+        .any(|c| c.role == SpeculativeCaptureRole::Target && c.position > 0));
     assert!(captures.iter().all(|c| {
         c.capture
             .as_step()
@@ -534,12 +524,10 @@ fn selective_control_artifacts(
             }));
         }
     }
-    assert!(
-        captures
-            .windows(2)
-            .all(|pair| pair[0].capture.as_step().cumulative_usage.captures
-                < pair[1].capture.as_step().cumulative_usage.captures)
-    );
+    assert!(captures
+        .windows(2)
+        .all(|pair| pair[0].capture.as_step().cumulative_usage.captures
+            < pair[1].capture.as_step().cumulative_usage.captures));
 }
 
 #[test]

@@ -99,9 +99,15 @@ fn actual_dense_declarations_join_readout_before_exact_candidate_binding() {
         ("readout.embedding", Stage::BeforeReadout),
         ("model.layers.1.output", Stage::BeforeReadout),
         ("model.layers.0.feed_forward.units", Stage::BeforeReadout),
-        ("model.layers.0.feed_forward.units.effective", Stage::BeforeReadout),
+        (
+            "model.layers.0.feed_forward.units.effective",
+            Stage::BeforeReadout,
+        ),
         ("model.layers.0.feed_forward.write", Stage::BeforeReadout),
-        ("model.layers.0.feed_forward.write.effective", Stage::BeforeReadout),
+        (
+            "model.layers.0.feed_forward.write.effective",
+            Stage::BeforeReadout,
+        ),
         ("readout.residual", Stage::ReadoutInput),
         ("readout.normalized.effective", Stage::ReadoutInput),
         ("readout.projection_input", Stage::ReadoutInput),
@@ -234,34 +240,42 @@ fn selected_sources_reject_equal_independent_owners_and_changed_candidate_coordi
 }
 
 #[test]
-fn undeclared_internal_hooks_fail_only_when_selected_and_catalog_checks_remain_required() {
+fn supported_dense_causal_hooks_bind_only_when_prefill_is_selected() {
     let (_artifact, _sources, discovery, paths) = fixture();
     let catalog = discovery.capture().unwrap();
-    let point =
-        catalog
-            .catalog
-            .points
-            .iter()
-            .find(|p| {
-                p.prefill
-                    && p.axes.as_ref().is_some_and(|axes| axes.len() == 3)
-                    && paths.prefill_observation(&p.path).is_none()
-                    && catalog.support.points.iter().any(|s| {
-                        s.path == p.path && s.prefill == ObservationSupportStatus::Supported
-                    })
-            })
+    let points = catalog
+        .catalog
+        .points
+        .iter()
+        .filter(|point| {
+            point.prefill
+                && point.axes.as_ref().is_some_and(|axes| axes.len() == 3)
+                && catalog.support.points.iter().any(|support| {
+                    support.path == point.path
+                        && support.prefill == ObservationSupportStatus::Supported
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(!points.is_empty());
+    for point in points {
+        let declaration = paths.prefill_observation(&point.path).unwrap_or_else(|| {
+            panic!(
+                "supported causal hook lacks row declaration: {}",
+                point.path
+            )
+        });
+        let active = admission(&discovery, &[&point.path], false, true);
+        let selected = discovery
+            .prepare_capture_selection(&active, &paths)
             .unwrap();
-    let active = admission(&discovery, &[&point.path], false, true);
-    assert!(matches!(
-        discovery.prepare_capture_selection(&active, &paths),
-        Err(SelectionError::Undeclared { index: 0 })
-    ));
-    let inactive = admission(&discovery, &[&point.path], false, false);
-    let selected = discovery
-        .prepare_capture_selection(&inactive, &paths)
-        .unwrap();
-    assert!(selected.declaration(0).unwrap().is_none());
-    selected.bind_geometry(request(4)).unwrap();
+        assert_eq!(selected.declaration(0).unwrap(), Some(declaration));
+        let inactive = admission(&discovery, &[&point.path], false, false);
+        let selected = discovery
+            .prepare_capture_selection(&inactive, &paths)
+            .unwrap();
+        assert!(selected.declaration(0).unwrap().is_none());
+        selected.bind_geometry(request(4)).unwrap();
+    }
 }
 
 #[test]

@@ -179,9 +179,9 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
                 .transpose()
                 .map_err(|cause| RecordConstructionError::retain(cause, &funding))?;
             if prepare.0.artifact_identity.is_none()
-                && session.capture_source().is_some_and(|capture| {
-                    !capture.admission().plan().selections.is_empty()
-                })
+                && session
+                    .capture_source()
+                    .is_some_and(|capture| !capture.admission().plan().selections.is_empty())
             {
                 return Err(ControlledGenerationError::Rejected(
                     "capture source has no retained artifact identity",
@@ -237,7 +237,7 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
             tokenizer_identity,
             config.sampling(),
             config.seed(),
-            config.inference_policy(),
+            config.inference_policy().clone(),
             semantic_identity,
             chat.eos_token_ids(),
             stops,
@@ -269,8 +269,8 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
             failure,
             tokenizer_identity,
             snapshot_budget: None,
-            snapshot_host_capacity: 0,
-            native_copy_limits: eredu_runtime::working_memory::WorkspaceCopyLimits::new(0),
+            snapshot_host_capacity: eredu_core::MemoryLimitDeclarations::unlimited(),
+            native_copy_limits: eredu_runtime::working_memory::WorkspaceCopyLimits::default(),
             capabilities: prepare.1,
             delivery,
             journal_destination: None,

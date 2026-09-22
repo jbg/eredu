@@ -52,6 +52,11 @@ use eredu_runtime::{
     safe_prompt_cache_shard_path,
 };
 
+mod ordinary_completion;
+pub(crate) use ordinary_completion::{
+    evaluate_cache_arrays, ordinary_cache_evaluation_call_controls,
+};
+
 /// Maximum number of cache blocks scheduled ahead by paged-cache prefetch.
 pub const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -334,7 +339,11 @@ impl HostCacheBlock {
             let bytes = buffer
                 .nbytes()
                 .map_err(|source| transfer_error("inspect host cache byte length", source))?;
-            Ok(total.saturating_add(bytes as u64))
+            let overflow = || CachePoolError::AccountingOverflow {
+                operation: "host cache byte length",
+            };
+            let bytes = u64::try_from(bytes).map_err(|_| overflow())?;
+            total.checked_add(bytes).ok_or_else(|| overflow().into())
         })
     }
 
@@ -343,14 +352,11 @@ impl HostCacheBlock {
             let capacity = buffer
                 .capacity()
                 .map_err(|source| transfer_error("inspect host cache capacity", source))?;
-            let capacity = u64::try_from(capacity).map_err(|_| {
-                CacheResidencyError::Runtime(
-                    "host cache capacity exceeds the u64 accounting range".into(),
-                )
-            })?;
-            total.checked_add(capacity).ok_or_else(|| {
-                CacheResidencyError::Runtime("host cache capacity total overflowed".into())
-            })
+            let overflow = || CachePoolError::AccountingOverflow {
+                operation: "host cache capacity",
+            };
+            let capacity = u64::try_from(capacity).map_err(|_| overflow())?;
+            total.checked_add(capacity).ok_or_else(|| overflow().into())
         })
     }
 
@@ -598,18 +604,39 @@ fn transfer_error(
     operation: &'static str,
     source: safemlx::error::Exception,
 ) -> CacheResidencyError {
-    CacheResidencyError::Runtime(format!("{operation}: {source}"))
+    CacheResidencyError::Transfer { operation, source }
 }
 
 mod io;
 pub use io::{
     CacheBlockLease, CacheBlockPrefetch, CacheResidencyManager, LoadedPromptCacheStateTensor,
-    PromptCacheStateArray, load_prompt_cache_state_tensors, open_prompt_cache,
+    PromptCacheStateArray,
 };
+pub(crate) use io::{CacheHistoryOwner, PreparedCacheHistory, PromptCacheTail};
+pub(crate) use io::{CacheTransferStreamError, PreparedCacheTransferStream};
 
 /// Structured cache residency and persistence failures.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheResidencyError {
+    /// Paid source or metadata preparation failed, retaining its original cause
+    /// and construction account through the neutral neural error transport.
+    #[error(transparent)]
+    Preparation(#[from] eredu_nn::Error),
+    /// Admitted native stream construction or source ownership failed.
+    #[error(transparent)]
+    TransferOwnership(eredu_core::BackendFailure),
+    /// Native transfer failure with its original cause and static operation.
+    #[error("{operation}: {source}")]
+    Transfer {
+        /// Transfer operation whose native call failed.
+        operation: &'static str,
+        /// Original native failure, including its retained completion custody.
+        #[source]
+        source: safemlx::error::Exception,
+    },
+    /// Original native evaluation cause with any admitted ordinary host custody.
+    #[error(transparent)]
+    NativeEvaluation(#[from] safemlx::error::Exception),
     /// Backend-neutral cache identity, geometry, or state policy is invalid.
     #[error(transparent)]
     Policy(#[from] CachePolicyError),
@@ -643,6 +670,9 @@ pub enum CacheResidencyError {
     /// Actual live-file version/read failure with retained publication custody.
     #[error(transparent)]
     LiveRead(#[from] eredu_runtime::cache::LiveCacheReadFailure),
+    /// Authenticated persistent-file version, layout or digest refusal.
+    #[error(transparent)]
+    PersistentRead(#[from] eredu_runtime::cache::PersistentCacheReadFailure),
     /// Paged options were contradictory or unbounded.
     #[error("invalid paged cache options: {0}")]
     InvalidOptions(String),
@@ -716,6 +746,8 @@ pub enum CacheResidencyError {
     },
 }
 
+pub(crate) use io::CacheFileSource;
+
 pub(crate) use io::{
     CacheBlockSource, CacheBlockSourceLoan, CacheDiskSource, CacheSourceError, CacheSourceFailure,
     CacheSourceFailureCause, IndependentCacheManagerPlan, PinnedCacheBlock, PinnedCacheBlockLease,
@@ -723,24 +755,42 @@ pub(crate) use io::{
 };
 
 pub(crate) use io::{
-    CacheBlockMetadata, CatalogInstallFailure, InstalledManagerCatalog,
+    CacheBlockMetadata, CatalogInstallFailure, InstalledManagerCatalog, PreparedCacheDiscard,
     PreparedFloatingBlockMetadata, PreparedManagerCatalog,
 };
 
 pub(crate) use io::{PagedArrayCopyLayout, PreparedPagedArrayCopy};
 
-pub(crate) use io::{PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots};
+pub(crate) use io::{
+    PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots, PreparedHostPromotion,
+    PreparedHostReturn, PreparedOrdinaryCacheHostPromotion,
+};
 
-pub(crate) use io::{PreparedCacheHostDemotion, StoredCacheHostSource};
+pub(crate) use io::{
+    PreparedCacheHostDemotion, PreparedCacheTransferSource, PreparedHostEviction,
+    PreparedOrdinaryCacheHostDemotion, StoredCacheHostSource,
+};
 
 pub(crate) use io::PreparedDiskWrite;
 
-pub(crate) use io::PreparedDiskWriteDestination;
+pub(crate) use io::{OrdinaryWrittenCacheHostSource, PreparedDiskWriteHostRetirement};
+pub(crate) use io::{PreparedCacheDiskWriteSource, PreparedDiskWriteDestination};
 
-pub(crate) use io::{DiskWriteOperation, InstalledDiskWorker, PreparedDiskWorker};
+pub(crate) use io::{
+    DiskWriteOperation, DiskWriteOperationFailure, InstalledDiskWorker, PreparedDiskWorker,
+};
 
 pub(crate) use io::{DiskReadBinding, PreparedDiskReadDestination, disk_read_source_facts};
 
-pub(crate) use io::{DiskReadOperation, PreparedDiskReadSource};
+pub(crate) use io::{
+    DiskReadFinishFailure, DiskReadOperation, DiskReadOperationFailure, PreparedDiskReadSource,
+};
 
 pub(crate) use io::PreparedInitialDiskReturn;
+
+pub(crate) use io::{OrdinaryDiskReadSource, OrdinaryReadCacheHostSource};
+
+#[cfg(test)]
+pub use io::{load_prompt_cache_state_tensors, open_prompt_cache};
+
+pub(crate) use io::{PromptCacheMaterialization, load_prompt_cache_state_tensors_funded};

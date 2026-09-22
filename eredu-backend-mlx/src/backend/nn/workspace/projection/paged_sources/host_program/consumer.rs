@@ -84,7 +84,7 @@ impl PreparedPagedHostProgram {
         &self,
         source: &ProjectedPagedSource,
         id: &CacheBlockId,
-        file: &eredu_runtime::cache::LiveCacheBlockSource,
+        file: &crate::backend::runtime::cache::residency::CacheFileSource,
         bank: &PagedSourceBank,
     ) -> bool {
         self.stores.iter().any(|store| {
@@ -99,7 +99,7 @@ impl PreparedPagedHostProgram {
                         .write
                         .as_ref()
                         .and_then(|write| write.committed_file())
-                        .is_some_and(|held| held.same_source(file)))
+                        .is_some_and(|held| file.same_live_source(held)))
         })
     }
     pub(in super::super) fn retained_file_control_bytes() -> usize {
@@ -107,10 +107,10 @@ impl PreparedPagedHostProgram {
             &Self,
             &ProjectedPagedSource,
             &CacheBlockId,
-            &eredu_runtime::cache::LiveCacheBlockSource,
+            &crate::backend::runtime::cache::residency::CacheFileSource,
             &PagedSourceBank,
             std::slice::Iter<'static, StoreSlot>,
-            Option<&'static eredu_runtime::cache::LiveCacheBlockSource>,
+            Option<&'static crate::backend::runtime::cache::residency::CacheFileSource>,
             bool,
         )>() + crate::backend::runtime::cache::residency::DiskWriteOperation::committed_file_control_bytes()
     }
@@ -221,8 +221,8 @@ impl PreparedPagedHostProgram {
             size_of::<Result<(usize, bool), CacheSourceError>>(),
             size_of::<(usize, bool)>(),
             size_of::<std::slice::Iter<'_, StoreSlot>>(),
-        size_of::<std::slice::IterMut<'_, StoreSlot>>(),
-        size_of::<std::slice::IterMut<'_, LoadSlot>>(),
+            size_of::<std::slice::IterMut<'_, StoreSlot>>(),
+            size_of::<std::slice::IterMut<'_, LoadSlot>>(),
             size_of::<std::slice::Iter<'_, LoadSlot>>(),
             size_of::<std::slice::Iter<'_, ProjectedPagedSource>>(),
             size_of::<std::slice::Iter<'_, super::super::scan_program::ScanSourceRow>>(),
@@ -329,10 +329,14 @@ impl PreparedPagedHostProgram {
             // A previous completed demotion may have retained an escaped numerical
             // alias until this boundary. Drain only these exact native-dead owners.
             for store in &mut self.stores {
-                if let Some(mover) = &mut store.mover { mover.reclaim_replaced_device(); }
+                if let Some(mover) = &mut store.mover {
+                    mover.reclaim_replaced_device();
+                }
             }
             for load in &mut self.loads {
-                if let Some(promotion) = &mut load.promotion { promotion.reclaim_replaced_device(); }
+                if let Some(promotion) = &mut load.promotion {
+                    promotion.reclaim_replaced_device();
+                }
             }
             let Some(id) = proof.manager().original_host_victim(
                 proof,

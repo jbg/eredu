@@ -80,6 +80,11 @@ impl<K: Ord + Send + 'static> PreparedCaptureTensorTransfer<'_, '_, K> {
         self.validate()?;
         self.builder.push_f32(value)
     }
+    /// Copies one unsigned scalar into the same fixed, source-bound destination.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), WorkingMemoryError> {
+        self.validate()?;
+        self.builder.push_u64(value)
+    }
 }
 impl<'a, 's, K: Ord + Send + 'static> PreparedCaptureTensorTransfer<'a, 's, K> {
     /// Finish host custody only; temporary source witness retires independently

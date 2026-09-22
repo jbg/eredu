@@ -42,6 +42,8 @@ typedef struct mlx_original_buffer_info {
   bool known;
   uint64_t identity;
   size_t charged_bytes;
+  mlx_memory_placement placement;
+  size_t host_control_bytes;
 } mlx_original_buffer_info;
 
 // Positive storage classifications; UNKNOWN never authorizes ordinary fallback.
@@ -116,9 +118,12 @@ unsigned mlx_original_buffer_request_layout_for(
 // Ordinary construction using an already prepared, actual allocator. Success
 // alone consumes owner. Its callback must enqueue rather than destroy payload.
 unsigned mlx_original_buffer_budget_new_retaining(mlx_original_buffer_budget*,
-    mlx_prepared_input_runtime, size_t, void*, void (*)(void*));
+    mlx_prepared_input_runtime, size_t, void*, void (*)(void*), void (*)(void*, size_t));
 void mlx_original_buffer_budget_retain(mlx_original_buffer_budget);
 void mlx_original_buffer_budget_release(mlx_original_buffer_budget);
+// Inspection aliases retain the owner without permitting future allocation.
+void mlx_original_buffer_inspection_retain(mlx_original_buffer_budget);
+void mlx_original_buffer_inspection_release(mlx_original_buffer_budget);
 size_t mlx_original_buffer_budget_capacity(mlx_original_buffer_budget);
 size_t mlx_original_buffer_budget_occupied(mlx_original_buffer_budget);
 // Explicit only, on the current empty role after original-control enablement.

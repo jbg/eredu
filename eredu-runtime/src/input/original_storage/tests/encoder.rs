@@ -78,6 +78,17 @@ impl PreparedNativeInputCompiler for EncoderPlan<'_> {
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         Ok(self.recipe().required_storage_bytes())
     }
+    fn required_storage_requirements(
+        &self,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero(topology);
+        requirements.add_allocation(
+            self.required_storage_bytes()? as u64,
+            &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())?,
+        )?;
+        Ok(requirements)
+    }
     fn compile(self, owner: OriginalPreparedInputCustody) -> Result<Output, (Output, Self::Error)> {
         self.counts.calls.fetch_add(1, Ordering::SeqCst);
         let layout = layout(self.source);
@@ -108,12 +119,12 @@ impl PreparedNativeInputCompiler for EncoderPlan<'_> {
 }
 #[test]
 fn original_encoder_full_recipe_compares_once_before_both_buffers_and_survives_final_view() {
-    use crate::working_memory::WorkingMemoryPool;
-    let seed = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    use crate::working_memory::MemoryLedger;
+    let seed = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&seed);
     let counts = Counts::default();
     let bytes =
-        WorkingMemoryPool::prepared_native_input_required_bytes(&counts.plan(&i, false)).unwrap();
+        MemoryLedger::prepared_native_input_required_bytes(&counts.plan(&i, false)).unwrap();
     let ibytes = i.original_bytes();
     let old_bytes = SourcePlan::new(&i).unwrap().required_storage_bytes();
     let table = layout(&i);
@@ -121,7 +132,11 @@ fn original_encoder_full_recipe_compares_once_before_both_buffers_and_survives_f
     drop(i);
     drop(seed);
     for short in [true, false] {
-        let pool = WorkingMemoryPool::new(ibytes + bytes - u64::from(short), 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(
+            ibytes + bytes - u64::from(short),
+            0,
+        )
+        .unwrap();
         let i = source(&pool);
         let counts = Counts::default();
         let result = pool.compile_prepared_native_input(counts.plan(&i, false));
@@ -130,16 +145,15 @@ fn original_encoder_full_recipe_compares_once_before_both_buffers_and_survives_f
             assert_eq!(counts.calls.load(Ordering::SeqCst), 0);
             assert_eq!(counts.fills.load(Ordering::SeqCst), 0);
             assert_eq!(counts.lowers.load(Ordering::SeqCst), 0);
-            assert_eq!(error.retained_bytes(), 0);
+            assert_eq!(error.retained_bytes(), Some(0));
             assert!(
-                matches!(error.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded {
-                required_bytes, available_bytes }) if *required_bytes == bytes && *available_bytes == bytes-1)
+                matches!(error.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == bytes && (limit_bytes - existing_bytes) == bytes-1)
             );
             drop(error);
             drop(i);
         } else {
             let output = result.unwrap();
-            assert_eq!(output.original_bytes(), bytes);
+            assert_eq!(output.original_bytes(), Some(bytes));
             assert_eq!(counts.calls.load(Ordering::SeqCst), 1);
             assert_eq!(counts.fills.load(Ordering::SeqCst), 1);
             assert_eq!(counts.lowers.load(Ordering::SeqCst), 3);
@@ -161,7 +175,7 @@ fn original_encoder_full_recipe_compares_once_before_both_buffers_and_survives_f
             drop(output);
             drop(i);
             drop(view);
-            assert_eq!(pool.used_bytes().unwrap(), ibytes + bytes);
+            assert_eq!(pool.payload_used_bytes().unwrap(), ibytes + bytes);
             assert_eq!(
                 alias
                     .original_encoder_tables()
@@ -172,14 +186,14 @@ fn original_encoder_full_recipe_compares_once_before_both_buffers_and_survives_f
             );
             drop(alias);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn original_encoder_each_real_reserve_and_filled_error_retain_complete_prefix_until_error_drop() {
-    use crate::working_memory::WorkingMemoryPool;
+    use crate::working_memory::MemoryLedger;
     for failure in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
         let i = source(&pool);
         let counts = Counts::default();
         let table = layout(&i);
@@ -219,20 +233,20 @@ fn original_encoder_each_real_reserve_and_filled_error_retain_complete_prefix_un
             counts.prefixes[1].load(Ordering::SeqCst),
             if failure == 2 { table.float_count() } else { 0 }
         );
-        let b = error.retained_bytes();
+        let b = error.retained_bytes().unwrap();
         assert!(b > 0);
         let total = i.original_bytes() + b;
         drop(i);
-        assert_eq!(pool.used_bytes().unwrap(), total);
+        assert_eq!(pool.payload_used_bytes().unwrap(), total);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn original_encoder_erased_and_typed_aliases_share_real_buffers_and_final_custody() {
-    use crate::working_memory::WorkingMemoryPool;
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    use crate::working_memory::MemoryLedger;
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let i = source(&pool);
     let equal = source(&pool);
     assert_eq!(i.content_digest(), equal.content_digest());
@@ -276,7 +290,7 @@ fn original_encoder_erased_and_typed_aliases_share_real_buffers_and_final_custod
     drop(plain);
     drop(ordinary);
     drop(equal);
-    let held = pool.used_bytes().unwrap();
+    let held = pool.payload_used_bytes().unwrap();
     let mut owners = Vec::new();
     for _ in 0..4 {
         owners.push((typed.clone(), erased.clone()));
@@ -299,8 +313,8 @@ fn original_encoder_erased_and_typed_aliases_share_real_buffers_and_final_custod
     for worker in workers {
         worker.join().unwrap();
     }
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held);
     assert_eq!(erased.tables().full_chunks(), [4]);
     drop(erased);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

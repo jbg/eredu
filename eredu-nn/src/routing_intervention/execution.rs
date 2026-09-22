@@ -97,7 +97,7 @@ pub enum RoutingExecutionError<E: std::error::Error + 'static> {
     Invalid(#[from] Error),
     /// Native primitive failure.
     #[error("native routing operation failed: {0}")]
-    Native(E),
+    Native(#[source] E),
 }
 
 /// A fixed semantic refusal from the shared routing driver.
@@ -128,7 +128,7 @@ pub enum FixedRoutingExecutionError<E: std::error::Error + 'static> {
     Invalid(#[from] RoutingInvalidCause),
     /// The concrete mechanism's original failure.
     #[error("native routing operation failed: {0}")]
-    Native(E),
+    Native(#[source] E),
 }
 
 /// Authoritative action/stage sequence with ordinary sorted validation workspace.

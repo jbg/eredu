@@ -35,7 +35,11 @@ struct Bind<'a> {
     bias: &'a MlxTensor,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         *value = match metadata.id().as_str() {
             "matrix.weight" => self.weight,
             "matrix.scales" => self.scales,
@@ -410,7 +414,6 @@ fn original_grouped_block_fp8_projection_matches_ordinary_with_derived_receipt()
     fixture.finish();
 }
 
-
 #[test]
 fn original_packed_fp8_independent_rows_and_chunk_tail_match_ordinary() {
     use eredu_nn::{
@@ -560,7 +563,6 @@ fn original_packed_fp8_independent_rows_and_chunk_tail_match_ordinary() {
     drop(stream);
     fixture.finish();
 }
-
 
 struct ProbeUnits<'a, T: Tensor> {
     context: &'a T::Context,

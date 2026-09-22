@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::managed_memory::NativeMemoryOwner;
-use eredu_runtime::working_memory::WorkingMemoryPool;
+use eredu_runtime::working_memory::MemoryLedger;
 fn exception<'a>(
     mut error: &'a (dyn std::error::Error + 'static),
 ) -> &'a safemlx::error::Exception {
@@ -14,7 +14,7 @@ fn exception<'a>(
 #[test]
 fn native_capture_and_escaped_neural_aliases_preserve_actual_unquoted_source_and_state_fact() {
     for preserved in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let owner = NativeMemoryOwner::acquire(&pool).unwrap();
         let host = HostPreparationAuthority::retain(owner.unquoted_lease().unwrap());
         let cause = Error::Exception(safemlx::error::Exception::custom(

@@ -67,7 +67,7 @@ impl PartitionCaptureRoutedHooks {
             size_of::<FundedCaptureError<E>>(),size_of::<Result<Self,PartitionCaptureProgramError>>()];
         parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
-    fn table_control_bytes()->Option<usize> {
+    pub(super) fn table_control_bytes()->Option<usize> {
         let parts=[size_of::<Self>()*2,size_of::<Slot>()*2,size_of::<Vec<Slot>>(),size_of::<Option<Vec<Slot>>>(),
             size_of::<Failure>(),eredu_core::BackendFailure::source_retention_peak_bytes::<Failure>()?,
             size_of::<PartitionCaptureProgramError>(),size_of::<Result<Self,PartitionCaptureProgramError>>(),

@@ -7,6 +7,7 @@ use crate::backend::runtime::residency::manager::{
 use eredu_nn::Parameterized;
 use eredu_runtime::ArchitectureParameters;
 use eredu_runtime::{
+    LayerwisePolicy, LayerwiseRuntime, ResidentRuntime,
     layered::{BoundCaptureSelection, PreparedLayeredObservationPaths},
     parameter_operations::LayeredParameterOwner,
     working_memory::{
@@ -14,7 +15,6 @@ use eredu_runtime::{
         OwnedTextSpanWorkspace, PreparedCapturePlanPublication, PreparedPrefillStoragePinPlan,
         PreparedTextControlWorkspace, ResidualQuoteError, TextHostControlFacts,
     },
-    LayerwisePolicy, LayerwiseRuntime, ResidentRuntime,
 };
 use std::mem::size_of;
 

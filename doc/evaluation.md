@@ -20,7 +20,10 @@ backend object names. Host materialization is always explicit:
   decision-logit, and final-output seams, while runtime prepublication converts
   completed tokens and diagnostics to the portable output frame; and
 - `eredu-nn::Tensor::to_f32_vec` and `to_i32_vec` are the neutral host-transfer
-  operations used by codec and architecture-level tools.
+  operations used by codec and architecture-level tools. They return
+  `HostTensorBuffer`, whose accounting custody remains live until its backing
+  allocation or consuming iterator retires. Evaluation records copy these values
+  into their own independent observation storage.
 
 Ordinary inference does not enable these paths and therefore does not acquire
 host-transfer or instrumentation overhead. The same records can be consumed by

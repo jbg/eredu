@@ -17,6 +17,7 @@
 #include "mlx/c/distributed_group.h"
 #include "mlx/c/error.h"
 #include "mlx/c/event.h"
+#include "mlx/c/ordinary_control.h"
 #include "mlx/c/host_transfer.h"
 #include "mlx/c/export.h"
 #include "mlx/c/fast.h"

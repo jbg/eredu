@@ -1,8 +1,8 @@
 //! Actual internal forward tensors retain physical span and tentative provenance.
 use super::*;
 use eredu_core::speculative::{
-    SPECULATIVE_ACTIVATION_SCHEMA_VERSION, SpeculativeActivationCapture,
-    SpeculativeActivationPhase, SpeculativeActivationPlan, SpeculativeCaptureScope,
+    SpeculativeActivationCapture, SpeculativeActivationPhase, SpeculativeActivationPlan,
+    SpeculativeCaptureScope, SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
 };
 use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
 
@@ -34,27 +34,19 @@ fn rows(
     aggregates: bool,
 ) -> serde_json::Value {
     assert!(!records.is_empty());
-    assert!(
-        records
-            .iter()
-            .any(|r| matches!(r.phase, SpeculativeActivationPhase::Proposal { depth: 0 }))
-    );
-    assert!(
-        records
-            .iter()
-            .any(|r| r.phase == SpeculativeActivationPhase::Verification)
-    );
-    assert!(
-        records
-            .windows(2)
-            .all(|r| r[0].invocation < r[1].invocation)
-    );
-    assert!(
-        records
-            .windows(2)
-            .all(|r| r[0].captures.as_step().cumulative_usage.captures
-                <= r[1].captures.as_step().cumulative_usage.captures)
-    );
+    assert!(records
+        .iter()
+        .any(|r| matches!(r.phase, SpeculativeActivationPhase::Proposal { depth: 0 })));
+    assert!(records
+        .iter()
+        .any(|r| r.phase == SpeculativeActivationPhase::Verification));
+    assert!(records
+        .windows(2)
+        .all(|r| r[0].invocation < r[1].invocation));
+    assert!(records
+        .windows(2)
+        .all(|r| r[0].captures.as_step().cumulative_usage.captures
+            <= r[1].captures.as_step().cumulative_usage.captures));
     for (phase, selection, widths) in [
         (
             SpeculativeActivationPhase::TargetPrefill,
@@ -98,12 +90,10 @@ fn rows(
             record.completed,
             "failed forward evidence cannot substitute for completion"
         );
-        assert!(
-            record
-                .admission_identity
-                .as_deref()
-                .is_some_and(|id| !id.is_empty())
-        );
+        assert!(record
+            .admission_identity
+            .as_deref()
+            .is_some_and(|id| !id.is_empty()));
         if !aggregates {
             assert!(
                 record.prefill_reductions.is_none(),
@@ -278,7 +268,6 @@ fn run_configured(mode: &str, aggregates: bool, evidence: bool) -> serde_json::V
                 limits: CaptureLimits {
                     per_step: usage,
                     cumulative: usage,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             },
@@ -354,7 +343,7 @@ fn run_plan(
                     output_mode: eredu::api::PreparedChatOutputMode::Text,
                     skip_special_tokens: true,
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings: chat_settings(&chat, settings),
+                    settings: chat_settings(&chat, settings.clone()),
                     options,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),

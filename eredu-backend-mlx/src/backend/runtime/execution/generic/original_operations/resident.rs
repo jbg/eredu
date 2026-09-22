@@ -1,8 +1,8 @@
 //! Resident graph boundaries share the finite neural producer and scope registry.
 //! No unit loading, transfer, source-copy allowance or native child is inferred.
 use super::neural::OrderedNeuralCompletion;
-use super::*;
 use super::neural::PreparedNeuralSubmission;
+use super::*;
 use eredu_runtime::SubmissionBackend;
 
 #[derive(Clone)]
@@ -22,7 +22,11 @@ impl Projection {
             Self::Text(value) => match value.value.upgrade() {
                 Some(bank) => {
                     bank.registry.require_idle()?;
-                    drop(bank.prepared.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?);
+                    drop(
+                        bank.prepared
+                            .try_borrow_mut()
+                            .map_err(|_| Error::PrefillScopeReentrant)?,
+                    );
                     Ok(())
                 }
                 None => Ok(()),
@@ -39,11 +43,11 @@ impl Projection {
         }
     }
 }
-mod speculative;
 mod realtime;
-pub(crate) use realtime::{RealtimeNeuralPlan,QualifiedRealtimeNeuralPlan,RealtimeNeuralOwner};
-pub(crate) use speculative::SpeculativeNeuralOwner;
+mod speculative;
+pub(crate) use realtime::{QualifiedRealtimeNeuralPlan, RealtimeNeuralOwner, RealtimeNeuralPlan};
 pub(super) use speculative::SelectedResidencyProjection;
+pub(crate) use speculative::SpeculativeNeuralOwner;
 pub(crate) struct ResidentNeuralSlot<U: 'static>(InstallSlot<U>);
 impl<U: 'static> Clone for ResidentNeuralSlot<U> {
     fn clone(&self) -> Self {
@@ -53,15 +57,25 @@ impl<U: 'static> Clone for ResidentNeuralSlot<U> {
 impl<U: 'static> ResidentNeuralSlot<U> {
     /// Explicit installed-slot loan for addressable acquisition. No current
     /// observer is used to choose or reconstruct the model's source owner.
-    pub(crate) fn selected_residency_access(&self,stream:&Stream)->Result<OriginalSelectedResidencyAccess,Error> {
+    pub(crate) fn selected_residency_access(
+        &self,
+        stream: &Stream,
+    ) -> Result<OriginalSelectedResidencyAccess, Error> {
         match self.projection().ok_or_else(identity)? {
-            Projection::Text(source)=>{
-                let bank=source.value.upgrade().ok_or_else(identity)?;
-                if !bank.selected_stream.matches_source(stream){return Err(identity());}
-                OriginalSelectedResidencyAccess::registered(Rc::clone(&bank.registry),OperationControls::Text(source.controls))
-            },
-            Projection::Speculative(source)=>OriginalSelectedResidencyAccess::resident(source.selected_residency(stream)?),
-            Projection::Realtime(_)=>Err(identity()),
+            Projection::Text(source) => {
+                let bank = source.value.upgrade().ok_or_else(identity)?;
+                if !bank.selected_stream.matches_source(stream) {
+                    return Err(identity());
+                }
+                OriginalSelectedResidencyAccess::registered(
+                    Rc::clone(&bank.registry),
+                    OperationControls::Text(source.controls),
+                )
+            }
+            Projection::Speculative(source) => {
+                OriginalSelectedResidencyAccess::resident(source.selected_residency(stream)?)
+            }
+            Projection::Realtime(_) => Err(identity()),
         }
     }
 
@@ -162,7 +176,13 @@ impl<U: 'static> ResidentNeuralSlot<U> {
                 .map_err(|_| Error::PrefillScopeReentrant)?
                 .checkout()
                 .map_err(|_| Error::PrefillScopeUnavailable)?;
-            neural::submit_prepared(prepared, observer, value, stream, &OperationControls::Text(projection.controls.clone()))
+            neural::submit_prepared(
+                prepared,
+                observer,
+                value,
+                stream,
+                &OperationControls::Text(projection.controls.clone()),
+            )
         })();
         result.map_err(|cause| neural::boundary_error(cause, &projection.controls))
     }
@@ -188,6 +208,11 @@ impl<U: 'static> ResidentNeuralPlan<U> {
         &self,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
     ) -> Result<(), Error> {
+        recipe.bind_ordinary_neural_calls(
+            self.geometry,
+            self.neural.per_forward,
+            self.neural.shape.consumers(),
+        )?;
         if self.neural.submissions == 0 {
             return Ok(());
         }
@@ -204,8 +229,12 @@ impl<U: 'static> ResidentNeuralPlan<U> {
         // A sequential graph can have no neural boundaries and still execute
         // addressable cache acquisitions. They require the same registered
         // request/stream owner, with an exactly empty neural submission bank.
-        self.addressable = recipe.is_some_and(|recipe| recipe.records().iter()
-            .any(|row| row.addressable().is_some()));
+        self.addressable = recipe.is_some_and(|recipe| {
+            recipe
+                .records()
+                .iter()
+                .any(|row| row.addressable().is_some())
+        });
         if self.neural.submissions == 0 {
             return Ok(self);
         }
@@ -225,8 +254,8 @@ impl<U: 'static> ResidentNeuralPlan<U> {
         if self.neural.submissions == 0 && !self.addressable {
             // This branch does not enter the neural bank's measured layout,
             // but its population source still passed the selected mechanism.
-            return selected_plan_control_bytes::<U>()?.checked_add(u64::try_from(
-                NeuralPopulation::group_source_control_bytes()?).ok()?);
+            return selected_plan_control_bytes::<U>()?
+                .checked_add(u64::try_from(NeuralPopulation::group_source_control_bytes()?).ok()?);
         }
         let scopes = Layout::array::<safemlx::OriginalScopeObserver>(self.scopes)
             .ok()?
@@ -255,9 +284,12 @@ impl<U: 'static> ResidentNeuralPlan<U> {
             size_of::<Result<(), TryReserveError>>(),
             size_of::<PreparationFailure>(),
             size_of::<(PreparedNeuralSubmission, safemlx::OriginalScopeObserver)>(),
-            size_of::<&ResidentBank>(), size_of::<&OwnedResidentBank<U>>(),
-            size_of::<Option<Rc<ResidentBank>>>(), size_of::<TextProjection>(),
-            size_of::<Option<&Projection>>(), size_of::<Result<(), Error>>(),
+            size_of::<&ResidentBank>(),
+            size_of::<&OwnedResidentBank<U>>(),
+            size_of::<Option<Rc<ResidentBank>>>(),
+            size_of::<TextProjection>(),
+            size_of::<Option<&Projection>>(),
+            size_of::<Result<(), Error>>(),
             OriginalOperationActivation::control_bytes()?,
         ]
         .into_iter()
@@ -274,8 +306,11 @@ impl<U: 'static> ResidentNeuralPlan<U> {
                 u64::try_from(self.selected_stream?.source_comparison_control_bytes()?).ok()?,
             )?
             .checked_add(selected_plan_control_bytes::<U>()?)?
-            .checked_add(if self.neural.submissions == 0 { 0 }
-                else { self.fit.additional_control_bytes()? })?
+            .checked_add(if self.neural.submissions == 0 {
+                0
+            } else {
+                self.fit.additional_control_bytes()?
+            })?
             .checked_add(u64::try_from(fixed.checked_add(allocations)?).ok()?)
     }
     pub(crate) fn prepare_install(
@@ -288,7 +323,7 @@ impl<U: 'static> ResidentNeuralPlan<U> {
     ) -> Result<Option<OriginalOperationBankOwner>, Error> {
         original.validate_request(step.request()).map_err(memory)?;
         controls
-            .validate_reservation(step.request().memory_reservation().ok_or_else(identity)?)
+            .validate_reservation(step.request().memory_reservation())
             .map_err(memory)?;
         if original.facts().plan().geometry() != self.geometry
             || original.facts().operation_control_bytes()
@@ -312,6 +347,7 @@ impl<U: 'static> ResidentNeuralPlan<U> {
             .map_err(|cause| reserve_error(cause, &controls))?;
         let prepared = neural::prepare(self.neural, &controls)?;
         let registry = Rc::new(Registry {
+            materialized_recipe: RefCell::new(None),
             request: step.request().clone().into(),
             scopes: RefCell::new(scopes),
             scope_limit: self.scopes,
@@ -357,18 +393,37 @@ struct OwnedResidentBank<U: 'static> {
 }
 impl<U: 'static> ErasedOwner for OwnedResidentBank<U> {
     fn activate(&self, controls: &OperationControls) -> Result<OriginalOperationActivation, Error> {
-        let OperationControls::Text(controls) = controls else { return Err(identity()); };
-        controls.validate_reservation(self.bank.registry.request.memory_reservation().ok_or_else(identity)?)
+        let OperationControls::Text(controls) = controls else {
+            return Err(identity());
+        };
+        controls
+            .validate_reservation(
+                self.bank
+                    .registry
+                    .request
+                    .memory_reservation()
+                    .ok_or_else(identity)?,
+            )
             .map_err(memory)?;
         self.bank.registry.require_idle()?;
-        drop(self.bank.prepared.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?);
+        drop(
+            self.bank
+                .prepared
+                .try_borrow_mut()
+                .map_err(|_| Error::PrefillScopeReentrant)?,
+        );
         let previous = self.slot.0.resident.take();
         let idle = previous.as_ref().map_or(Ok(()), Projection::require_idle);
         self.slot.0.resident.set(previous);
         idle?;
-        let previous = self.slot.0.resident.replace(Some(Projection::Text(TextProjection {
-            value: Rc::downgrade(&self.bank), controls: controls.clone(),
-        })));
+        let previous = self
+            .slot
+            .0
+            .resident
+            .replace(Some(Projection::Text(TextProjection {
+                value: Rc::downgrade(&self.bank),
+                controls: controls.clone(),
+            })));
         let guard = self.bank.registry.enter();
         drop(previous);
         Ok(guard)

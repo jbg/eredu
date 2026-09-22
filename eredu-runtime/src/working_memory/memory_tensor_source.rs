@@ -1,8 +1,9 @@
 //! Original encoded payload construction with separately estimated host metadata.
 
 use super::{
+    DependencyMemoryPolicy, MemoryLedger, WorkingMemoryError,
     gguf_source::{SourceAccount, SourcePayloadCustody},
-    qualified_storage, DependencyMemoryPolicy, WorkingMemoryError, WorkingMemoryPool,
+    qualified_storage,
 };
 use eredu_checkpoint::store::{MemoryTensorBuffer, MemoryTensorBufferError};
 use safetensors::tensor::Dtype;
@@ -92,7 +93,7 @@ impl std::error::Error for OriginalMemoryTensorError {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Prices a fresh payload before construction. Metadata headroom covers
     /// standard-library container/sharing internals and catalog publication as an
     /// explicit estimate. The caller separately limits inputs and funds later

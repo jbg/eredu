@@ -1,15 +1,18 @@
 //! One actual resident state source and its authenticated constructor tables.
 use super::*;
-use crate::backend::runtime::cache::state::{MlxHybridState, MlxKeyValueState};
+use crate::backend::runtime::cache::state::{
+    MlxHybridState, MlxKeyValueState, MlxPoolingAttentionState,
+};
 use crate::composition::mlx::replicated_text::ResidentResetProfile;
 use eredu_runtime::working_memory::{
-    OriginalResidentResetSource, OriginalTextControlGuard, ResidentTableResetState,
-    ResidentResetSource, WorkingMemoryFundingScope,
+    OriginalResidentResetSource, OriginalTextControlGuard, ResidentResetSource,
+    ResidentTableResetState, WorkingMemoryFundingScope,
 };
 
 enum Source<'a> {
     KeyValue(ResidentResetSource<'a, MlxKeyValueState>),
     Hybrid(ResidentResetSource<'a, MlxHybridState>),
+    Pooling(ResidentResetSource<'a, MlxPoolingAttentionState>),
 }
 impl<'a> Source<'a> {
     fn current(session: &'a MlxModelSession) -> Result<Option<Self>, WorkingMemoryError> {
@@ -22,6 +25,10 @@ impl<'a> Source<'a> {
                 .resident_hybrid_reset_source()
                 .map(Self::Hybrid)
                 .map(Some),
+            Some(ResidentResetProfile::Pooling) => model
+                .resident_pooling_reset_source()
+                .map(Self::Pooling)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -29,12 +36,14 @@ impl<'a> Source<'a> {
         match self {
             Self::KeyValue(source) => source.state().resident_reset_layers().metadata(),
             Self::Hybrid(source) => source.state().resident_reset_layers().metadata(),
+            Self::Pooling(source) => source.state().resident_reset_layers().metadata(),
         }
     }
     fn same_source(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::KeyValue(left), Self::KeyValue(right)) => left.same_source(right),
             (Self::Hybrid(left), Self::Hybrid(right)) => left.same_source(right),
+            (Self::Pooling(left), Self::Pooling(right)) => left.same_source(right),
             _ => false,
         }
     }
@@ -56,7 +65,7 @@ impl<'a> Plan<'a> {
         let table = source.metadata();
         let kind = session
             .payload
-            .memory_pool
+            .memory_ledger
             .classify_host_slot_source(table)
             .map_err(memory)?;
         let Some(original) = kind.into_original() else {
@@ -80,11 +89,11 @@ impl<'a> Plan<'a> {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
         controls
-            .validate_reservation(request.memory_reservation().ok_or_else(unknown)?)
+            .validate_reservation(request.memory_reservation())
             .map_err(memory)?;
         session
             .payload
-            .memory_pool
+            .memory_ledger
             .pin_original_reset_slots(self.original.metadata())
             .map_err(memory)?;
         Ok(Owned {
@@ -124,6 +133,7 @@ pub(super) fn admission_controls() -> Option<u64> {
         size_of::<Result<Option<Source<'static>>, WorkingMemoryError>>(),
         size_of::<Result<ResidentResetSource<'static, MlxKeyValueState>, WorkingMemoryError>>(),
         size_of::<Result<ResidentResetSource<'static, MlxHybridState>, WorkingMemoryError>>(),
+        size_of::<Result<ResidentResetSource<'static, MlxPoolingAttentionState>, WorkingMemoryError>>(),
         size_of::<Plan<'static>>(),
         size_of::<Option<Plan<'static>>>(),
         size_of::<Result<Option<Plan<'static>>, Error>>(),
@@ -145,8 +155,8 @@ pub(super) fn work_controls() -> Option<u64> {
         size_of::<Result<OriginalResidentResetSource, Error>>(),
         size_of::<Result<Option<OriginalResidentResetSource>, Error>>(),
         size_of::<Result<OriginalResidentResetSource, WorkingMemoryError>>(),
-        size_of::<WorkingMemoryPool>(),
-        size_of::<Result<WorkingMemoryPool, Error>>(),
+        size_of::<MemoryLedger>(),
+        size_of::<Result<MemoryLedger, Error>>(),
         size_of::<Result<(), Error>>(),
         size_of::<Option<super::super::text_funding::FundedWorkOwner>>(),
         size_of::<Option<super::super::SessionPayloadOwner>>(),

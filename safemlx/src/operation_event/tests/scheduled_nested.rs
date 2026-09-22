@@ -105,7 +105,7 @@ fn cpu_scheduled_host_roots_settle_before_bank_restore() {
 
 #[test]
 fn cpu_integer_host_copy_preserves_signed_and_unsigned_bits() {
-    for rank in 1..=4 {
+    for rank in 1..=5 {
         for store in [false, true] {
             for tracer in [false, true] {
                 let signed =

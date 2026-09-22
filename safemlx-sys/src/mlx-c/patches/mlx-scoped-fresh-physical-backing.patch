@@ -1,0 +1,80 @@
+diff --git a/mlx/backend/common/buffer_cache.h b/mlx/backend/common/buffer_cache.h
+--- a/mlx/backend/common/buffer_cache.h
++++ b/mlx/backend/common/buffer_cache.h
+@@ -6,6 +6,7 @@
+ #include <climits>
+ #include <functional>
+ #include "mlx/allocator.h"
++#include "mlx/physical_funding.h"
+ 
+ namespace mlx::core {
+ // The backing's intrusive links eliminate allocation in destructor/cache paths.
+@@ -18,6 +19,10 @@
+   BufferCache(const BufferCache&) = delete;
+   BufferCache& operator=(const BufferCache&) = delete;
+   template <class Accept> allocator::Buffer reuse_from_cache(size_t size, Accept accept) {
++    // Bounded ordinary work creates its own roots; older cache owners and
++    // their physical charges remain untouched until their actual eviction.
++    if (!submission::current_physical_observer().reuse_cached_backing)
++      return allocator::Buffer{nullptr};
+     allocator::PhysicalBacking* selected = nullptr;
+     size_t best = 0;
+     const size_t slack = std::min(size, page_size_ > SIZE_MAX / 2 ? SIZE_MAX : 2 * page_size_);
+diff --git a/mlx/physical_funding.h b/mlx/physical_funding.h
+--- a/mlx/physical_funding.h
++++ b/mlx/physical_funding.h
+@@ -24,6 +24,7 @@
+   void* context{nullptr};
+   allocator::PhysicalBackingObserver callback{nullptr};
+   bool retain_in_cache{true};
++  bool reuse_cached_backing{true};
+ };
+ MLX_API PhysicalFundingObserver current_physical_observer() noexcept;
+ class MLX_API PhysicalFundingWorkerGuard final {
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -104,7 +104,7 @@
+ 
+   // Configure once on the empty current ordinary scope. Owner release follows
+   // destruction of the native Scope, and precedes its enclosing retirement.
+-  bool bind_physical_observer(void*, allocator::PhysicalBackingObserver, void (*)(void*), bool = true) noexcept;
++  bool bind_physical_observer(void*, allocator::PhysicalBackingObserver, void (*)(void*), bool = true, bool = true) noexcept;
+   PhysicalFundingObserver physical_observer() const noexcept;
+   uint64_t identity() const noexcept { return identity_; }
+   ScopedProgress progress_scoped() noexcept;
+@@ -166,6 +166,7 @@
+   void* physical_context_{nullptr};
+   allocator::PhysicalBackingObserver physical_callback_{nullptr};
+   bool physical_retain_in_cache_{true};
++  bool physical_reuse_cached_backing_{true};
+   void (*physical_release_)(void*){nullptr};
+   void* retained_owner_{nullptr};
+   void (*retire_owner_)(void*){nullptr};
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -252,7 +252,7 @@
+ }
+ 
+ bool Scope::bind_physical_observer(void* context, allocator::PhysicalBackingObserver callback,
+-    void (*release)(void*), bool retain_in_cache) noexcept {
++    void (*release)(void*), bool retain_in_cache, bool reuse_cached_backing) noexcept {
+   if (!context || !callback || !release || active_scope != this || !active_ ||
+       !on_owner_thread() || original_required_ || physical_callback_ ||
+       native_construction_started_ || activity_.load(std::memory_order_acquire) ||
+@@ -260,12 +260,13 @@
+   physical_context_ = context;
+   physical_callback_ = callback;
+   physical_retain_in_cache_ = retain_in_cache;
++  physical_reuse_cached_backing_ = reuse_cached_backing;
+   physical_release_ = release;
+   return true;
+ }
+ PhysicalFundingObserver Scope::physical_observer() const noexcept {
+   for (auto* scope = this; scope; scope = scope->parent_) {
+-    if (scope->physical_callback_) return {scope->physical_context_, scope->physical_callback_, scope->physical_retain_in_cache_};
++    if (scope->physical_callback_) return {scope->physical_context_, scope->physical_callback_, scope->physical_retain_in_cache_, scope->physical_reuse_cached_backing_};
+   }
+   return {};
+ }

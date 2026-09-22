@@ -1,6 +1,6 @@
 use super::super::tests::{
     funded::{admit, finish_native, metal, publish_source, sampler, settle},
-    values,
+    operands, values,
 };
 use super::*;
 use crate::backend::{
@@ -11,6 +11,7 @@ use crate::backend::{
         state::{MlxKeyValueLayerState, MlxKeyValueState},
     },
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     workspace::{
@@ -20,7 +21,7 @@ use eredu_nn::{
     AttentionCache, Tensor,
 };
 use eredu_runtime::{
-    working_memory::WorkingMemoryPool, RuntimeLayerState, RuntimeState, RuntimeStateComponents,
+    working_memory::MemoryLedger, RuntimeLayerState, RuntimeState, RuntimeStateComponents,
     StateLayout,
 };
 use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
@@ -160,6 +161,14 @@ fn large_aliased_source_projects_independent_bounded_destinations_without_native
     let old_facts = native_facts(&source);
     assert_eq!(old_facts.len(), 1);
     let source_bytes = *old_facts.values().next().unwrap();
+    let source_controls = u64::try_from(
+        operands(&plan)[0]
+            .allocation_info()
+            .unwrap()
+            .unwrap()
+            .host_control_bytes(),
+    )
+    .unwrap();
     assert!(source_bytes >= 65536);
     let context = new_context();
     let guard = ColdGuard::new();
@@ -210,7 +219,13 @@ fn large_aliased_source_projects_independent_bounded_destinations_without_native
     );
     assert_eq!(
         projected.copy.state.as_ref().unwrap().retained_bytes,
-        Some(source_bytes + future_bytes)
+        Some(
+            source_bytes
+                .checked_add(future_bytes)
+                .unwrap()
+                .checked_add(source_controls)
+                .unwrap()
+        )
     );
     guard.assert_cold();
     drop(guard);
@@ -417,12 +432,12 @@ fn invalid_geometry_and_lazy_or_unpriced_sources_do_not_become_complete_copies()
 #[test]
 fn funded_saved_source_projects_after_original_request_and_live_table_retire() {
     let stream = metal();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let source = aliased_source(&stream);
     publish_source(&source, &loading);
     drop(loading);
-    settle(&pool, pool.used_bytes().unwrap());
+    settle(&pool, pool.fixture_funded_charge().unwrap());
     let (sampler, preparation, run) = sampler(&pool);
     let plan = source.prepare_resident_copy().unwrap();
     let expected = values(&plan);
@@ -434,10 +449,26 @@ fn funded_saved_source_projects_after_original_request_and_live_table_retire() {
     drop((source, sampler, preparation, run));
     settle(
         &pool,
-        custody.bytes() + saved.shared_layout().capacity_bytes().unwrap(),
+        custody
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap()
+            .checked_sub(crate::memory_fixture::publication_control_bytes(
+                operands(&saved.prepare_copy().unwrap())
+                    .len()
+                    .checked_mul(2)
+                    .unwrap(),
+            ))
+            .unwrap()
+            + saved.shared_layout().capacity_bytes().unwrap(),
     );
     let context = new_context();
-    let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+    let before = (
+        pool.fixture_funded_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
+    );
     let guard = ColdGuard::new();
     let projected = saved
         .prepare_copy()
@@ -452,7 +483,10 @@ fn funded_saved_source_projects_after_original_request_and_live_table_retire() {
     );
     assert!(projected.copy.total_bytes.is_some());
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_funded_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         before
     );
     guard.assert_cold();
@@ -471,7 +505,7 @@ fn funded_saved_source_projects_after_original_request_and_live_table_retire() {
     drop((saved, copied_sampler, custody));
     // Inspection witnesses and the shared layout still own the old physical
     // source; no new allocation or funding account was created by projection.
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_funded_charge().unwrap() > 0);
     drop(projected);
     settle(&pool, 0);
 }

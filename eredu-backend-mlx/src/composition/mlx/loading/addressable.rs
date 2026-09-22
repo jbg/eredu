@@ -9,10 +9,13 @@ use eredu_nn::workspace::{
 
 pub(crate) fn prepare_addressable_source(
     sources: &PreparedModelSources,
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
     source_stream: &Stream,
     execution_stream: &Stream,
-) -> Result<Option<crate::backend::runtime::residency::parameter_bank::PreparedAddressableSource>, Error> {
+) -> Result<
+    Option<crate::backend::runtime::residency::parameter_bank::PreparedAddressableSource>,
+    Error,
+> {
     let context = WorkspaceContext::new(DestinationFacts);
     let Some(projected) =
         eredu_architectures::prepared_execution::project_addressable_binding_destinations(

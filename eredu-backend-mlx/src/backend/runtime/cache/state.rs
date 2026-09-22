@@ -78,6 +78,7 @@ pub(crate) fn retained_state_storage<'a>(
     Ok(storage)
 }
 
+pub(crate) mod ordinary_checkpoint;
 mod slot_bounds;
 pub(crate) mod snapshot_estimate;
 pub(crate) use slot_bounds::NativeStateSlotCounts;

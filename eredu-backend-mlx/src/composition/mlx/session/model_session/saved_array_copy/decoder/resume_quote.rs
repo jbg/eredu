@@ -6,12 +6,12 @@
 //! the destination session and parameter epoch under its actual account commit.
 
 use super::*;
-mod media;
 mod child;
+mod media;
 pub(in crate::composition::mlx::session) use child::ResumeCapture;
 mod parallel;
-mod preparation;
 mod phases;
+mod preparation;
 use crate::composition::mlx::session::model_session::pending_prompt::PreparedPendingPrompt;
 use eredu_architectures::prepared_execution::{
     BorrowedTextSamplingWorkspace, PreparedTextGenerationWorkspace,
@@ -21,14 +21,14 @@ use eredu_core::{
     RuntimeStateEstimate, TextControllerContract, TextControllerWorkspace, WorkspaceBound,
 };
 use eredu_nn::workspace::{
-    WorkspaceBackend, HostMetadataFunding, HostMetadataFundingError, WorkspaceTensor,
+    HostMetadataFunding, HostMetadataFundingError, WorkspaceBackend, WorkspaceTensor,
     WorkspaceTraceReport,
 };
 use eredu_runtime::{
-    CacheResidencyPolicy, DeviceState, LayerWeightResidency,
     working_memory::{
         WorkspaceReportMetadata, WorkspaceResidentLayerState, WorkspaceSamplingRandomState,
     },
+    DeviceState, LayerWeightResidency,
 };
 pub(super) use preparation::ResumeSourceCause;
 use std::num::NonZeroU32;
@@ -55,22 +55,23 @@ pub(in crate::composition::mlx::session) struct PreparedSavedTextResumeQuote<'a>
     // Exact source/parameter proof. The legacy quote consumes only its existing
     // identity after pinning, without cloning or extending snapshot ownership.
     layerwise: Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-    decoder_copy: WorkspaceTraceReport,
-    sampling_copy: WorkspaceTraceReport,
-    decoder_host_peak: u64,
-    sampler_host_peak: u64,
-    pending_host: WorkspaceBound,
+    // Keep traced metadata and its input roots alive until the quote retires.
+    _decoder_copy: WorkspaceTraceReport,
+    _sampling_copy: WorkspaceTraceReport,
+    _pending_host: WorkspaceBound,
     // Actual prepared source aliases and page pins, separate from copied roots.
     source_native: Option<crate::backend::nn::workspace::ProjectedNativeStorage>,
     // These are portable metadata roots, not installable native values.
-    copied_state: DeviceState<WorkspaceBackend, WorkspaceResidentLayerState>,
-    copied_key: Option<WorkspaceTensor>,
-    copied_input: Option<WorkspaceTensor>,
+    _copied_state: DeviceState<WorkspaceBackend, WorkspaceResidentLayerState>,
+    _copied_key: Option<WorkspaceTensor>,
+    _copied_input: Option<WorkspaceTensor>,
     // Exact completed B mapping, separate from the copied decoder/key proof.
     media_storage:
         Option<eredu_runtime::working_memory::RegisteredPreparedWorkspaceStorage<StorageIdentity>>,
     // Existing-only pins add no charge or authority; source values remain above.
     _registered_source: WorkingMemoryStorage<StorageIdentity>,
+    _parameter_storage:
+        Option<eredu_runtime::working_memory::RegisteredWorkspaceStorage<StorageIdentity>>,
     // Existing funded Context for this exact adapter's continuation constructors.
     // It supplies no completed-B source or old request authority.
     continuation_metadata: Option<WorkspaceContext>,
@@ -79,35 +80,45 @@ pub(in crate::composition::mlx::session) struct PreparedSavedTextResumeQuote<'a>
     paged_source_metadata: Option<WorkspaceContext>,
     paged_host_facts: Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
     // Exact attempted row/source owners from this fresh cold continuation.
-    text_interventions: Option<crate::composition::mlx::session::intervention::PreparedTextInterventions>,
+    text_interventions:
+        Option<crate::composition::mlx::session::intervention::PreparedTextInterventions>,
     // Independent cumulative metadata account, after every funded result field.
     planning_metadata: Option<HostMetadataFunding>,
 }
 
 impl<'a> PreparedSavedTextResumeQuote<'a> {
     pub(in crate::composition::mlx::session) fn validate_resume_options(
-        source: &CopiedTextComponents, config: TextGenerationConfig,
+        source: &CopiedTextComponents,
+        config: TextGenerationConfig,
         options: &eredu_core::OriginalTextResumeOptions<'_>,
     ) -> Result<(), WorkingMemoryError> {
         if options.terminal != (config.sampling().max_new_tokens == Some(0))
             || (options.capture_limits.is_some() && source.capture_checkpoint().is_none())
             || options.session_id.is_some_and(str::is_empty)
             || (options.kind != eredu_core::OriginalTextResumeKind::Branch
-                && (options.capture_limits.is_some() || options.intervention.is_some() || options.sampling.is_some())) {
+                && (options.capture_limits.is_some()
+                    || options.intervention.is_some()
+                    || options.sampling.is_some()))
+        {
             return Err(WorkingMemoryError::PreparationConfigurationMismatch);
         }
         if let Some(request) = options.sampling {
             eredu_runtime::execution_control::validate_sampling_override::<Error>(
-                source.sampling.sampling_state_facts(), request)
-                .map_err(|_| WorkingMemoryError::PreparationConfigurationMismatch)?;
+                source.sampling.sampling_state_facts(),
+                request,
+            )
+            .map_err(|_| WorkingMemoryError::PreparationConfigurationMismatch)?;
         }
         Ok(())
     }
-    pub(in crate::composition::mlx::session) fn take_child_capture(&mut self) -> Option<ResumeCapture> {
+    pub(in crate::composition::mlx::session) fn take_child_capture(
+        &mut self,
+    ) -> Option<ResumeCapture> {
         self.child_capture.take()
     }
-    pub(in crate::composition::mlx::session) fn take_text_interventions(&mut self)
-        -> Option<crate::composition::mlx::session::intervention::PreparedTextInterventions> {
+    pub(in crate::composition::mlx::session) fn take_text_interventions(
+        &mut self,
+    ) -> Option<crate::composition::mlx::session::intervention::PreparedTextInterventions> {
         self.text_interventions.take()
     }
 
@@ -122,8 +133,11 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
             .map_err(|cause| cause.into_memory())?;
         let owner = DecoderCopyOwner::Saved(source.decoder.clone());
         let prepared = source.decoder.native.prepare_copy_fixed()?;
-        let pending_plan = if source.sampling.arrays.pending_metadata.is_none() { None }
-            else { source.sampling.prepare_pending_tokens()? };
+        let pending_plan = if source.sampling.arrays.pending_metadata.is_none() {
+            None
+        } else {
+            source.sampling.prepare_pending_tokens()?
+        };
         let pending = pending_plan
             .as_ref()
             .map(|pending| pending.numerical().source());
@@ -139,7 +153,7 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
             &prepared,
             binding.key(),
             pending,
-            runtime.backend().memory_pool(),
+            runtime.backend().memory_ledger(),
             mechanisms,
         )?;
         let dense_result = source
@@ -194,13 +208,6 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
             .ok_or_else(|| WorkingMemoryError::Overflow.into())
     }
 
-    #[cfg(test)]
-    pub(in crate::composition::mlx::session) fn layerwise_workspace(
-        &self,
-    ) -> Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace> {
-        self.layerwise.as_ref()
-    }
-
     pub(in crate::composition::mlx::session) fn take_layerwise_workspace(
         &mut self,
     ) -> Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace> {
@@ -226,13 +233,12 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
     ) -> Result<Self, Error> {
         let capacity = config
             .inference_policy()
-            .managed_memory_capacity_bytes
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Unavailable,
-            ))?;
+            .memory_limits
+            .resolve(runtime.backend().memory_ledger().topology())
+            .map_err(|cause| memory(cause.into()))?;
         let funding = runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .prepare_workspace_metadata(
                 runtime
                     .session()
@@ -243,9 +249,8 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
                 capacity,
             )
             .map_err(Error::WorkspacePlanning)?;
-        let controls = Self::planning_control_bytes().ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        let controls = Self::planning_control_bytes()
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         funding
             .reserve_metadata(controls)
             .map_err(Error::WorkspacePlanning)?;
@@ -267,20 +272,49 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
     }
 
     fn prepare_impl(
-        runtime: &ModelRuntime<MlxBackend<'_>>, source: &'a CopiedTextComponents,
-        config: TextGenerationConfig, controller: TextControllerWorkspace<'_>,
+        runtime: &ModelRuntime<MlxBackend<'_>>,
+        source: &'a CopiedTextComponents,
+        config: TextGenerationConfig,
+        controller: TextControllerWorkspace<'_>,
         host: Option<&eredu_core::HostPreparationAuthority>,
         planning_metadata: Option<&HostMetadataFunding>,
         options: Option<&eredu_core::OriginalTextResumeOptions<'_>>,
     ) -> Result<Self, Error> {
         // Retire completed preparation frames before reconstructing a composite
         // model; final report composition starts only after its trace returns.
-        let child_capture = options.map(|options| child::ResumeCapture::prepare(runtime, source, options,
-            planning_metadata.ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?)).transpose()?.flatten();
-        let view = child::Source { saved: source, capture: child_capture.as_ref() };
-        let inputs=phases::prepare(runtime,&view,config,controller,host,planning_metadata)?;
-        let traced=phases::trace(runtime,&view,controller,inputs,planning_metadata)?;
-        let mut quote = phases::finish(runtime,&view,config,controller,traced,planning_metadata)?;
+        let child_capture = options
+            .map(|options| {
+                child::ResumeCapture::prepare(
+                    runtime,
+                    source,
+                    options,
+                    planning_metadata
+                        .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let view = child::Source {
+            saved: source,
+            capture: child_capture.as_ref(),
+        };
+        let inputs = phases::prepare(
+            runtime,
+            &view,
+            config.clone(),
+            controller,
+            host,
+            planning_metadata,
+        )?;
+        let traced = phases::trace(runtime, &view, controller, inputs, planning_metadata)?;
+        let mut quote = phases::finish(
+            runtime,
+            &view,
+            config,
+            controller,
+            traced,
+            planning_metadata,
+        )?;
         quote.child_capture = child_capture;
         Ok(quote)
     }
@@ -289,7 +323,7 @@ impl<'a> PreparedSavedTextResumeQuote<'a> {
         self.state_input
     }
 
-    pub(in crate::composition::mlx::session) fn prepared_media_source(
+    pub(in crate::composition::mlx::session::model_session) fn prepared_media_source(
         &self,
     ) -> Result<
         Option<super::super::super::text_quote::original_prepared::PreparedMediaQuoteSource>,
@@ -462,26 +496,35 @@ impl CopiedTextComponents {
     }
 }
 
-#[cfg(test)]
-fn resume_geometry(
-    source: &CopiedTextComponents,
-    config: TextGenerationConfig,
-) -> Result<InferenceGeometry, Error> {
-    resume_geometry_impl(&child::Source { saved: source, capture: None }, config, None)
-}
-
 /// The retained capture selection fixes physical readout for both quotation
 /// and the later source-bound prompt constructor. Ordinary saved text retains
 /// its existing final-position demand. This grants no capture/source authority.
 fn resume_output_demand(source: &child::Source<'_, '_>) -> OutputDemand {
-    let demand = source.capture_selection().map_or(OutputDemand::LastPosition,
-        |selection| selection.physical_output(OutputDemand::LastPosition));
-    let first=source.sampling.next_prediction;
-    let phase=if first==0{eredu_core::capture::CapturePhase::Prefill}else{eredu_core::capture::CapturePhase::Decode};
-    if source.capture_checkpoint().and_then(|checkpoint|checkpoint.intervention_source())
-        .is_some_and(|source|source.plan().admission().requires_sequence_scores(phase,first)) {
+    let demand = source
+        .capture_selection()
+        .map_or(OutputDemand::LastPosition, |selection| {
+            selection.physical_output(OutputDemand::LastPosition)
+        });
+    let first = source.sampling.next_prediction;
+    let phase = if first == 0 {
+        eredu_core::capture::CapturePhase::Prefill
+    } else {
+        eredu_core::capture::CapturePhase::Decode
+    };
+    if source
+        .capture_checkpoint()
+        .and_then(|checkpoint| checkpoint.intervention_source())
+        .is_some_and(|source| {
+            source
+                .plan()
+                .admission()
+                .requires_sequence_scores(phase, first)
+        })
+    {
         OutputDemand::Sequence
-    } else { demand }
+    } else {
+        demand
+    }
 }
 
 fn resume_geometry_impl(
@@ -494,9 +537,14 @@ fn resume_geometry_impl(
     let outputs = u64::try_from(config.sampling().max_new_tokens.ok_or_else(unknown)?)
         .map_err(|_| memory(WorkingMemoryError::Overflow))?;
     if outputs == 0 {
-        return Ok(InferenceGeometry { batch_size: 1, cached_positions: source.sampling.frontier(),
-            input_positions: 0, max_output_tokens: 0, prefill_chunk_positions: 0,
-            output: OutputDemand::StateOnly });
+        return Ok(InferenceGeometry {
+            batch_size: 1,
+            cached_positions: source.sampling.frontier(),
+            input_positions: 0,
+            max_output_tokens: 0,
+            prefill_chunk_positions: 0,
+            output: OutputDemand::StateOnly,
+        });
     }
     source
         .sampling
@@ -581,11 +629,3 @@ fn planned_error(
 fn other(error: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::Other(Box::new(error))
 }
-
-#[cfg(all(
-    test,
-    target_vendor = "apple",
-    feature = "metal",
-    not(feature = "cuda")
-))]
-mod tests;

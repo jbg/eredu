@@ -1,6 +1,6 @@
 //! Original controller compilation and immutable-source provenance.
 use super::OriginalChatProfilePreparation;
-use crate::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use crate::working_memory::{MemoryLedger, WorkingMemoryError};
 use eredu_core::{
     HostMetadataFunding, HostMetadataFundingError, SharedControllerBytes,
     SharedControllerDeclaration, SharedStorageIdentity,
@@ -108,7 +108,7 @@ impl OriginalControllerCompilation {
     pub fn validate_sources(
         &self,
         sources: ControllerCompilationSources<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         self.receipt()
             .preparation

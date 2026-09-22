@@ -18,6 +18,10 @@ pub struct RuntimeStaticBaseline {
     pub error_once_static_bytes: usize,
     /// The safe retirement queue's static head, not queued owners.
     pub retirement_head_static_bytes: usize,
+    /// Fixed cold snapshot of the actual prepared allocator placement.
+    pub prepared_placement_static_bytes: usize,
+    /// Native physical-root registry and immutable observer bridge.
+    pub physical_backing_static_bytes: usize,
     /// The actual shared input allocator slot/scalar snapshot and CPU static
     /// object. The Metal heap object belongs to its separate admitted owner.
     pub input_allocator_static_bytes: usize,
@@ -64,6 +68,8 @@ impl RuntimeStaticBaseline {
             self.runtime_lock_static_bytes,
             self.error_once_static_bytes,
             self.retirement_head_static_bytes,
+            self.prepared_placement_static_bytes,
+            self.physical_backing_static_bytes,
             self.input_allocator_static_bytes,
             self.metal_device_static_bytes,
             self.scheduler_static_bytes,
@@ -110,6 +116,9 @@ pub fn runtime_static_baseline() -> RuntimeStaticBaseline {
         runtime_lock_static_bytes: crate::utils::runtime_lock::static_storage_bytes(),
         error_once_static_bytes: crate::error::static_storage_bytes(),
         retirement_head_static_bytes: crate::allocation_retention::static_storage_bytes(),
+        prepared_placement_static_bytes: crate::prepared_input::placement_static_storage_bytes(),
+        // SAFETY: pure native static layout query.
+        physical_backing_static_bytes: unsafe { safemlx_sys::mlx_physical_backing_static_bytes() },
         input_allocator_static_bytes: allocator.static_bytes,
         input_allocator_constant_storage: allocator.qualified == 1,
         metal_device_static_bytes: device.bytes,

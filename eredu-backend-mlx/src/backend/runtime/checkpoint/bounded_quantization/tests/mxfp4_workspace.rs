@@ -76,8 +76,8 @@ fn cpu_mxfp4_minimum_is_checked_before_output_allocation_or_source_reads() {
         let source = fixture(dtype, &[8, 64]);
         for budget in [minimum - 1, minimum] {
             let allocations = Cell::new(0);
-            let result = ColdQuantization::prepare(source.clone().into(), plan(budget))
-                .and_then(|cold| {
+            let result =
+                ColdQuantization::prepare(source.clone().into(), plan(budget)).and_then(|cold| {
                     cold.allocate(context.stream(), |layout| {
                         allocations.set(allocations.get() + 1);
                         MemoryTensorBuffer::allocate(
@@ -108,19 +108,22 @@ fn cpu_mxfp4_minimum_is_checked_before_output_allocation_or_source_reads() {
 
 #[test]
 fn cpu_mxfp4_public_allocators_qualify_before_original_pool_admission() {
-    use eredu_runtime::working_memory::{DependencyMemoryPolicy, WorkingMemoryError, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{DependencyMemoryPolicy, MemoryLedger, WorkingMemoryError};
     let context = cpu_context();
     let policy = DependencyMemoryPolicy {
         fixed_bytes: 1024,
         bytes_per_input_byte: 8,
     };
-    let output_quote = [("model.proj.weight", [8, 8], 256), ("model.proj.scales", [8, 2], 16)]
-        .into_iter()
-        .map(|(name, shape, bytes)| {
-            WorkingMemoryPool::memory_tensor_buffer_quote(name, &shape, bytes, policy)
-                .map(|quote| quote.total_bytes())
-        })
-        .collect::<Result<Vec<_>, _>>();
+    let output_quote = [
+        ("model.proj.weight", [8, 8], 256),
+        ("model.proj.scales", [8, 2], 16),
+    ]
+    .into_iter()
+    .map(|(name, shape, bytes)| {
+        MemoryLedger::memory_tensor_buffer_quote(name, &shape, bytes, policy)
+            .map(|quote| quote.total_bytes())
+    })
+    .collect::<Result<Vec<_>, _>>();
     let output_quote = match output_quote {
         Ok(quotes) => quotes.into_iter().sum(),
         Err(WorkingMemoryError::UnknownBound)
@@ -140,7 +143,7 @@ fn cpu_mxfp4_public_allocators_qualify_before_original_pool_admission() {
             for budget in [minimum - 1, minimum] {
                 // A destination constructor would fail admission at zero. The
                 // workspace refusal must win before any such constructor runs.
-                let pool = WorkingMemoryPool::new(
+                let pool = crate::memory_fixture::ledger(
                     if budget < minimum { 0 } else { output_quote },
                     0,
                 )
@@ -160,10 +163,13 @@ fn cpu_mxfp4_public_allocators_qualify_before_original_pool_admission() {
                         .contains(&format!("requires at least {minimum} working-set bytes")));
                 } else {
                     let prepared = result.unwrap();
-                    assert_eq!(pool.used_bytes().unwrap(), if original { output_quote } else { 0 });
+                    assert_eq!(
+                        pool.fixture_host_charge().unwrap(),
+                        if original { output_quote } else { 0 }
+                    );
                     drop(prepared);
                 }
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.fixture_host_charge().unwrap(), 0);
                 assert_eq!(source.reads.load(Ordering::SeqCst), 0);
             }
         }
@@ -184,7 +190,10 @@ fn later_cpu_mxfp4_target_is_qualified_before_any_destination_allocation() {
     let plan = BoundedQuantizationPlan::new(
         WeightQuantization::MxFp4,
         5070,
-        [direct_test_target("a.weight"), direct_test_target("b.weight")],
+        [
+            direct_test_target("a.weight"),
+            direct_test_target("b.weight"),
+        ],
     )
     .unwrap();
     let allocations = Cell::new(0);
@@ -199,7 +208,9 @@ fn later_cpu_mxfp4_target_is_qualified_before_any_destination_allocation() {
         panic!("second target must exceed the CPU workspace")
     };
     assert!(error.to_string().contains("b.weight"));
-    assert!(error.to_string().contains("requires at least 9988 working-set bytes"));
+    assert!(error
+        .to_string()
+        .contains("requires at least 9988 working-set bytes"));
     assert_eq!(allocations.get(), 0);
     assert_eq!(source.reads.load(Ordering::SeqCst), 0);
 }
@@ -214,12 +225,9 @@ fn cpu_mxfp4_tiled_payloads_preserve_the_independent_codebook() {
     ] {
         for (shape, minimum, rows) in [(vec![8, 64], one_row, 8), (vec![8, 2, 64], two_rows, 16)] {
             let source = fixture(dtype, &shape);
-            let converted = QuantizedCheckpoint::create(
-                source.clone(),
-                plan(2 * minimum),
-                context.stream(),
-            )
-            .unwrap();
+            let converted =
+                QuantizedCheckpoint::create(source.clone(), plan(2 * minimum), context.stream())
+                    .unwrap();
             assert_eq!(converted.report().source_tiles, 8);
             assert_eq!(converted.report().peak_in_flight_tiles, 2);
             assert_eq!(
@@ -241,7 +249,8 @@ fn cpu_mxfp4_tiled_payloads_preserve_the_independent_codebook() {
                 ),
                 ("model.proj.scales", vec![127; rows * 2]),
             ] {
-                let lease = converted.source()
+                let lease = converted
+                    .source()
                     .acquire_lease(TensorReadRequest {
                         key: key.into(),
                         selection: TensorSelection::Full,
@@ -279,3 +288,7 @@ fn stream_profile_cannot_borrow_direct_quantizer_geometry_for_cpu_fallback() {
     assert!(cpu.payload(&RecipeDtype::F32, 0).is_err());
     assert!(cpu.payload(&RecipeDtype::F32, usize::MAX - 31).is_err());
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

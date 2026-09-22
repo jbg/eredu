@@ -82,8 +82,8 @@ pub(super) fn is_adaptive_step(report: &WorkspaceTraceReport) -> bool {
 mod tests {
     use super::*;
     use eredu_runtime::working_memory::{
-        SamplingWorkspaceObserver, SamplingWorkspacePhase, WorkspaceSamplingRandomState,
-        quote_sampling_workspace_with_observer,
+        quote_sampling_workspace_with_observer, SamplingWorkspaceObserver, SamplingWorkspacePhase,
+        WorkspaceSamplingRandomState,
     };
 
     struct Observer(ResidentRecipeRecorder);
@@ -99,6 +99,9 @@ mod tests {
 
     #[test]
     fn mirostat_retains_one_graph_and_two_real_scalar_frontiers() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let qualified = safemlx::PreparedPipelineCachePlan::new(0)
             .layout::<()>()
@@ -159,6 +162,88 @@ mod tests {
                 assert!(row.query_controls.unwrap() > 0);
                 assert!(completion.dispatch.unwrap().kernel_attempts > 0);
             }
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+mod cpu_tests {
+    use super::*;
+    use eredu_runtime::working_memory::{
+        quote_sampling_workspace_with_observer, SamplingWorkspaceObserver, SamplingWorkspacePhase,
+        WorkspaceSamplingRandomState,
+    };
+    struct Observer(ResidentRecipeRecorder);
+    impl SamplingWorkspaceObserver for Observer {
+        fn observe(
+            &mut self,
+            phase: SamplingWorkspacePhase,
+            report: &WorkspaceTraceReport,
+        ) -> Result<(), Error> {
+            self.0.observe_sampling(phase, report)
+        }
+    }
+    #[test]
+    fn cpu_adaptive_sampler_retains_both_scalar_completion_frontiers() {
+        if !crate::tests::support::native_process::enter("cpu-adaptive-recipe") {
+            return;
+        }
+        let _pool = crate::tests::support::test_utils::initialize_original_sources();
+        let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let choice =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), choice);
+        let context = WorkspaceContext::new(cpu);
+        let geometry = InferenceGeometry {
+            batch_size: 1,
+            cached_positions: 0,
+            input_positions: 2,
+            max_output_tokens: 3,
+            prefill_chunk_positions: 2,
+            output: eredu_core::OutputDemand::Sequence,
+        };
+        let layout = context
+            .layout(&[1, 64], WorkspaceDtype::Float32)
+            .unwrap()
+            .with_representation(Some(WorkspaceRepresentation::new(
+                WorkspaceFloatingType::Float32,
+                true,
+            )));
+        let random = WorkspaceSamplingRandomState::from_seed(&context).unwrap();
+        let sampler = eredu_runtime::ConfiguredTextSampler::MirostatV2(
+            eredu_runtime::MirostatV2Sampler::default(),
+        );
+        let mut observer = Observer(
+            ResidentRecipeRecorder::with_cpu_context(geometry, ordinary, cpu, &context).unwrap(),
+        );
+        let report = quote_sampling_workspace_with_observer(
+            &sampler,
+            0.8,
+            Some(&random),
+            &layout,
+            &eredu_core::TokenFilter::All,
+            3,
+            &context,
+            Some(&mut observer),
+        )
+        .unwrap();
+        assert_eq!(report.first_gap, None);
+        for row in &observer.0.sampling[1..] {
+            assert_eq!(
+                row.first_missing_operation(),
+                None,
+                "{:?}",
+                row.missing_operation_detail
+            );
+            let completion = row.completion().unwrap();
+            assert_eq!(completion.nested_completions, 1);
+            assert!(completion.nested_traversal().unwrap().roots() >= 2);
+            assert!(completion.dispatch.unwrap().cpu_model.is_some());
         }
     }
 }

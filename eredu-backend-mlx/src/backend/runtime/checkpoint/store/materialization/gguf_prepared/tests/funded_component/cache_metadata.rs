@@ -65,28 +65,28 @@ fn prepared_cache_custody_survives_strong_group_or_stale_weak_row_without_double
                 );
                 let context = fixture.context.clone();
                 assert_eq!(context.converted_groups.lock().unwrap().len(), 1);
-                let before_clone = pool.used_bytes().unwrap();
+                let before_clone = pool.fixture_host_charge().unwrap();
                 let second = context.clone();
-                assert_eq!(pool.used_bytes().unwrap(), before_clone);
+                assert_eq!(pool.fixture_host_charge().unwrap(), before_clone);
                 drop(second);
                 OriginalGgufMissFixture::finish(pending);
                 (group, weak, context, pool.clone())
             },
         );
         drop((plan, fixture));
-        let held = pool.used_bytes().unwrap();
+        let held = pool.fixture_host_charge().unwrap();
         assert!(held > existing);
         if keep_group {
             drop((context, weak));
             safemlx::reclaim_allocation_owners();
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.fixture_host_charge().unwrap(), held);
             drop(group);
         } else {
             drop(group);
             safemlx::reclaim_allocation_owners();
             assert!(weak.upgrade().is_none());
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 held,
                 "stale row and external Weak retain metadata"
             );
@@ -99,7 +99,7 @@ fn prepared_cache_custody_survives_strong_group_or_stale_weak_row_without_double
             assert!(context.converted_groups.try_lock().is_ok());
             drop((retired, context));
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 held,
                 "external Weak still pins the Arc shell"
             );
@@ -193,7 +193,7 @@ fn prepared_cache_prefix_refusal_keeps_same_source_and_never_reads_or_falls_back
         );
         drop((plan, fixture));
         assert!(source.upgrade().is_some());
-        assert!(pool.used_bytes().unwrap() > existing);
+        assert!(pool.fixture_host_charge().unwrap() > existing);
         drop(error);
         assert!(source.upgrade().is_none());
         drop(source);
@@ -358,15 +358,15 @@ fn prepared_cache_live_row_refusal_retains_converted_group_and_key_until_recover
                 fixture.expected["bank.weight"]
             );
             let weak = refused.downgrade();
-            let held = pool.used_bytes().unwrap();
+            let held = pool.fixture_host_charge().unwrap();
             drop(first_group);
             OriginalGgufMissFixture::finish(first);
             assert!(weak.upgrade().is_some());
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.fixture_host_charge().unwrap(), held);
             OriginalGgufMissFixture::finish(pending);
             assert!(weak.upgrade().is_none());
             assert_eq!(
-                pool.used_bytes().unwrap(),
+                pool.fixture_host_charge().unwrap(),
                 held,
                 "failure/remaining raw aliases cannot return credit early"
             );
@@ -374,7 +374,7 @@ fn prepared_cache_live_row_refusal_retains_converted_group_and_key_until_recover
         },
     );
     drop((plan, fixture));
-    assert!(pool.used_bytes().unwrap() > existing);
+    assert!(pool.fixture_host_charge().unwrap() > existing);
     drop(error);
     settle_pool_at(&pool, existing);
 }
@@ -415,9 +415,9 @@ fn funded_cache_capsule_and_stale_supplied_row_keep_separate_accounts() {
         |_| cache_bytes,
         cache_bytes,
         |controls, observer, pool, bank| {
-            let before = pool.used_bytes().unwrap();
+            let before = pool.fixture_host_charge().unwrap();
             let cache = CacheHandle::prepare(pool).unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), before + cache_bytes);
+            assert_eq!(pool.fixture_host_charge().unwrap(), before + cache_bytes);
             let context = MlxParameterMaterializationContext::with_cache(
                 source_stream,
                 execution_stream,
@@ -448,12 +448,16 @@ fn funded_cache_capsule_and_stale_supplied_row_keep_separate_accounts() {
     safemlx::reclaim_allocation_owners();
     assert!(weak.upgrade().is_none());
     assert_eq!(cache.try_lock().unwrap().len(), 1);
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     assert!(held > existing + cache_bytes);
     // The stale supplied row is destroyed with the fixed capsule. An external
     // weak group still pins only the independent supplied metadata account H.
     drop(cache);
-    assert_eq!(pool.used_bytes().unwrap(), held - cache_bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held - cache_bytes);
     drop(weak);
     settle_pool_at(&pool, existing);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

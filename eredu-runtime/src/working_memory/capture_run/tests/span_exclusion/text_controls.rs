@@ -3,11 +3,114 @@
 use super::*;
 
 #[test]
+fn original_capture_source_pin_uses_paid_controls_and_rejects_foreign_custody() {
+    fn accepted(
+        pool: &MemoryLedger,
+        source: &SharedCapturePlan,
+    ) -> (
+        InferenceRequest,
+        WorkingMemoryFundingRun,
+        OwnedTextSpanWorkspace,
+    ) {
+        let q = quote(pool, plan(source).initialization_peak_bytes());
+        let controls = PreparedTextControlWorkspace::prepare(
+            source,
+            geometry(),
+            q.span_workspace().plan(),
+            TextHostControlFacts::new(
+                Some(MemoryLedger::capture_source_pin_control_bytes::<u32>().unwrap()),
+                Some(17),
+                Some(23),
+            ),
+        )
+        .unwrap();
+        let (r, run, q) = reserve_sealed(
+            pool,
+            q.with_span_workspace_and_text_controls(controls).unwrap(),
+        );
+        let (owner, _) = q
+            .into_funded_text_span_workspace(&run, r.memory_reservation())
+            .unwrap();
+        (r, run, owner)
+    }
+    for foreign in [false, true] {
+        let pool = capture_test_ledger(4_000_000, 0).unwrap();
+        let other = capture_test_ledger(4_000_000, 0).unwrap();
+        let source = source();
+        let roots = pool.register_host_storage([(73u32, 8), (74, 12)]).unwrap();
+        let (r, run, owner) = accepted(&pool, &source);
+        let (other_r, other_run, other_owner) = accepted(&other, &source);
+        let custody = if foreign {
+            other_owner.control_guard()
+        } else {
+            owner.control_guard()
+        }
+        .metadata_custody();
+        let mut bank = bank(&run, &r, &source);
+        let mut native = run.scope().unwrap();
+        let mut frame = bank
+            .begin_step(CapturePhase::Prefill, 0)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let claim = frame.take_tensor(0).unwrap();
+        let elements = claim.geometry().elements();
+        let before = pool.snapshot().unwrap();
+        let result = claim.prepare_with_original_source(
+            &mut native,
+            &custody,
+            [Some((73u32, 8)), Some((74, 12))],
+        );
+        if foreign {
+            assert!(matches!(
+                result,
+                Err(CaptureRunHostError::Memory(
+                    WorkingMemoryError::IdentityMismatch
+                ))
+            ));
+        } else {
+            let mut transfer = result.unwrap();
+            for index in 0..elements {
+                transfer.push_f32(index as f32 + 0.5).unwrap();
+            }
+            let captured = transfer.finish().unwrap();
+            assert_eq!(
+                captured.observation().data(),
+                &TensorObservationData::F32(
+                    (0..elements).map(|index| index as f32 + 0.5).collect()
+                )
+            );
+            drop(captured);
+        }
+        assert_eq!(
+            pool.snapshot().unwrap(),
+            before,
+            "prepaid source controls do not reserve another host allowance"
+        );
+        drop(frame);
+        native.certify().unwrap();
+        drop((
+            bank,
+            custody,
+            owner,
+            r,
+            run,
+            roots,
+            other_owner,
+            other_r,
+            other_run,
+        ));
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(other.payload_used_bytes().unwrap(), 0);
+    }
+}
+
+#[test]
 fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
     for short in [false, true] {
-        let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
+        let pool = capture_test_ledger(4_000_000, 0).unwrap();
         let source = source();
-        let opening_root = pool.register_storage([(73u32, 8)]).unwrap();
+        let opening_root = pool.register_host_storage([(73u32, 8)]).unwrap();
         let original = quote(&pool, plan(&source).initialization_peak_bytes());
         let pins =
             PreparedPrefillStoragePinPlan::<u32>::prepare(original.span_workspace().plan(), |_| {
@@ -30,7 +133,7 @@ fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
                 .unwrap(),
         );
         let (mut owner, _) = q
-            .into_funded_text_span_workspace(&run, r.memory_reservation().unwrap())
+            .into_funded_text_span_workspace(&run, r.memory_reservation())
             .unwrap();
         let mut pins = owner.take_prefill_storage_pins::<u32>().unwrap();
         let bank = bank(&run, &r, &source);
@@ -59,7 +162,7 @@ fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
         let mut attempt = pins.begin(&cx, &native, &segment).unwrap();
         attempt.push_owned(73u32, 8).unwrap();
         let mut opening = Some(attempt.pin_registered(&native, &segment).unwrap());
-        assert_eq!(opening.as_ref().unwrap().bytes(), 8);
+        assert_eq!(opening.as_ref().unwrap().bytes(), Some(8));
         segment
             .install_opening_group(&mut native, &cx, &mut opening)
             .unwrap();
@@ -77,12 +180,12 @@ fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
             owner.protected_host_bytes() + plan(&source).initialization_peak_bytes();
         {
             let usage = pool.0.usage.lock().unwrap();
-            let account = &usage.funding[&r.memory_reservation().unwrap().0.funding.unwrap()];
-            assert_eq!(account.host_held, expected_host);
+            let account = &usage.funding[&r.memory_reservation().0.funding.unwrap()];
+            assert_eq!(account.host_held - account.control_floor, expected_host);
         }
         let pressure = headroom(&pool, &r) - n + u64::from(short);
         let mut storage = native
-            .adopt_storage_individually([(71u32, pressure)])
+            .adopt_capture_host_storage([(71u32, pressure)])
             .unwrap();
         let root = storage.remove(&71).unwrap();
         let alias = root.clone();
@@ -91,17 +194,20 @@ fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
         if short {
             assert!(matches!(
                 result,
-                Err(WorkingMemoryError::BudgetExceeded {
+                Err(WorkingMemoryError::DomainAllowanceExceeded {
                     required_bytes: 16,
-                    available_bytes: 15
+                    available_bytes: 15,
+                    ..
                 })
             ));
             assert_eq!(ledger(&pool), before);
             drop(root);
             assert_eq!(headroom(&pool, &r), 15);
-            assert!(segment
-                .activate_reserved_text_span(&mut native, &receipt, &cx)
-                .is_err());
+            assert!(
+                segment
+                    .activate_reserved_text_span(&mut native, &receipt, &cx)
+                    .is_err()
+            );
             drop(alias);
             segment
                 .activate_reserved_text_span(&mut native, &receipt, &cx)
@@ -116,7 +222,7 @@ fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
             .validate_native_scope(&native)
             .unwrap();
         fenced(run.scope());
-        let payload = native.adopt_storage_individually([(72u32, n)]).unwrap();
+        let payload = native.adopt_capture_host_storage([(72u32, n)]).unwrap();
         let settled = ticket(reg, &cx);
         let parcel = segment.take_settled_sources(&mut native, &settled).unwrap();
         run.scope().unwrap().certify().unwrap();
@@ -125,13 +231,13 @@ fn text_activation_uses_matching_pq_custody_and_exact_original_headroom() {
         drop((parcel, settled, segment, receipt, storage));
         native.certify().unwrap();
         drop((bank, pins, owner, r, run, source, opening_root));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn joined_text_without_original_pin_layout_cannot_bypass_required_opening_group() {
-    let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
+    let pool = capture_test_ledger(4_000_000, 0).unwrap();
     let source = source();
     let original = quote(&pool, plan(&source).initialization_peak_bytes());
     let controls = PreparedTextControlWorkspace::prepare(
@@ -148,7 +254,7 @@ fn joined_text_without_original_pin_layout_cannot_bypass_required_opening_group(
             .unwrap(),
     );
     let (owner, _) = q
-        .into_funded_text_span_workspace(&run, r.memory_reservation().unwrap())
+        .into_funded_text_span_workspace(&run, r.memory_reservation())
         .unwrap();
     let bank = bank(&run, &r, &source);
     let mut native = run.scope().unwrap();
@@ -173,17 +279,17 @@ fn joined_text_without_original_pin_layout_cannot_bypass_required_opening_group(
     native.certify().unwrap();
     drop(receipt);
     drop((t, segment, bank, owner, r, run, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn opening_physical_origins_are_rechecked_in_same_text_activation_transaction() {
     for bytes in [0, 8] {
-        let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
+        let pool = capture_test_ledger(4_000_000, 0).unwrap();
         let source = source();
         let (origin_r, origin_run) = fresh(&pool, 8);
         let origin = origin_run.scope().unwrap();
-        let roots = origin.adopt_storage_individually([(71u32, bytes)]).unwrap();
+        let roots = origin.adopt_capture_host_storage([(71u32, bytes)]).unwrap();
         let original = quote(&pool, plan(&source).initialization_peak_bytes());
         let pins =
             PreparedPrefillStoragePinPlan::<u32>::prepare(original.span_workspace().plan(), |_| {
@@ -206,7 +312,7 @@ fn opening_physical_origins_are_rechecked_in_same_text_activation_transaction() 
                 .unwrap(),
         );
         let (mut owner, _) = q
-            .into_funded_text_span_workspace(&run, r.memory_reservation().unwrap())
+            .into_funded_text_span_workspace(&run, r.memory_reservation())
             .unwrap();
         let mut pins = owner.take_prefill_storage_pins::<u32>().unwrap();
         let bank = bank(&run, &r, &source);
@@ -240,7 +346,7 @@ fn opening_physical_origins_are_rechecked_in_same_text_activation_transaction() 
         drop((
             reg, segment, bank, pins, owner, r, run, roots, origin_r, origin_run, source,
         ));
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.payload_used_bytes().unwrap() > 0);
     }
 }
 
@@ -255,8 +361,8 @@ fn original_text_metadata_keeps_fixed_slot_and_raw_custody_until_final_alias() {
     use std::{
         mem::size_of,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
     };
     if !qualified_storage::qualified() {
@@ -267,7 +373,7 @@ fn original_text_metadata_keeps_fixed_slot_and_raw_custody_until_final_alias() {
         return;
     }
     struct Probe {
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         retired: Arc<AtomicBool>,
     }
     impl Drop for Probe {
@@ -277,7 +383,7 @@ fn original_text_metadata_keeps_fixed_slot_and_raw_custody_until_final_alias() {
                 "boxed provider retires outside Usage"
             );
             assert!(
-                self.pool.used_bytes().unwrap() > 0,
+                self.pool.payload_used_bytes().unwrap() > 0,
                 "raw custody outlives Box payload and storage"
             );
             self.retired.store(true, Ordering::SeqCst);
@@ -291,7 +397,7 @@ fn original_text_metadata_keeps_fixed_slot_and_raw_custody_until_final_alias() {
         + crate::working_memory::fixed_baseline::pal_mutex_bytes().unwrap()
         + control as u64
         + size_of::<Probe>() as u64;
-    let pool = WorkingMemoryPool::new(4_000_000, 0).unwrap();
+    let pool = capture_test_ledger(4_000_000, 0).unwrap();
     let source = source();
     let original = quote(&pool, plan(&source).initialization_peak_bytes());
     let controls = PreparedTextControlWorkspace::prepare(
@@ -308,7 +414,7 @@ fn original_text_metadata_keeps_fixed_slot_and_raw_custody_until_final_alias() {
             .unwrap(),
     );
     let (owner, _) = q
-        .into_funded_text_span_workspace(&run, r.memory_reservation().unwrap())
+        .into_funded_text_span_workspace(&run, r.memory_reservation())
         .unwrap();
     let identity = plan_identity
         .bind(&[7, 13, 29])
@@ -316,32 +422,39 @@ fn original_text_metadata_keeps_fixed_slot_and_raw_custody_until_final_alias() {
         .construct_original(owner.control_guard().metadata_custody())
         .unwrap();
     let alias = identity.clone();
-    let domain = pool.shared_storage_domain();
+    let domain = pool.shared_storage_accounting_id();
     let retired = Arc::new(AtomicBool::new(false));
-    assert!(identity
-        .try_attach(domain, || Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(
-            Box::new(Probe {
-                pool: pool.clone(),
-                retired: retired.clone()
-            })
-        ))
-        .unwrap());
-    assert!(!alias
-        .try_attach::<WorkingMemoryError>(domain, || panic!(
-            "same-domain alias must reuse exact slot"
-        ))
-        .unwrap());
-    assert!(alias
-        .try_attach::<WorkingMemoryError>(&eredu_core::SharedStorageDomain::default(), || panic!(
-            "foreign domain must refuse before allocation/provider"
-        ))
-        .is_err());
-    let before = pool.used_bytes().unwrap();
+    assert!(
+        identity
+            .try_attach(domain, || Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(
+                Box::new(Probe {
+                    pool: pool.clone(),
+                    retired: retired.clone()
+                })
+            ))
+            .unwrap()
+    );
+    assert!(
+        !alias
+            .try_attach::<WorkingMemoryError>(domain, || panic!(
+                "same-ledger alias must reuse exact slot"
+            ))
+            .unwrap()
+    );
+    assert!(
+        alias
+            .try_attach::<WorkingMemoryError>(
+                &eredu_core::SharedStorageAccountingId::default(),
+                || panic!("foreign ledger must refuse before allocation/provider")
+            )
+            .is_err()
+    );
+    let before = pool.payload_used_bytes().unwrap();
     drop((identity, owner, r, run, source));
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
-    assert!(pool.used_bytes().unwrap() <= before);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() <= before);
     drop(alias);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

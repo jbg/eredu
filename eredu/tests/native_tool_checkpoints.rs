@@ -5,8 +5,8 @@
 
 use eredu::{
     api::{
-        ChatSourceInput, LoadedModel, LocalDevice, PreparedChatGenerationSettings,
-        PreparedChatRequest, TokenizerSourceInput, local_device_plan,
+        local_device_plan, ChatSourceInput, LoadedModel, LocalDevice,
+        PreparedChatGenerationSettings, PreparedChatRequest, TokenizerSourceInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
 };
@@ -95,7 +95,7 @@ fn smoke_with_tool(
                 add_generation_prompt: true,
                 ..Default::default()
             },
-            CAPACITY,
+            &native_limits(CAPACITY),
             &cancellation,
         )
         .unwrap()
@@ -113,7 +113,7 @@ fn smoke_with_tool(
             enable_thinking: Some(false),
             add_generation_prompt: true,
             ..ChatTemplateRequest::default()
-        }, CAPACITY, &cancellation)
+        }, &native_limits(CAPACITY), &cancellation)
         .unwrap_or_else(|error| panic!("failed to prepare {environment}={path:?}: {error}"))
         .unwrap();
 
@@ -143,14 +143,20 @@ fn smoke_with_tool(
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 0,
         ..Default::default()
     };
     let session = model
-        .start_prepared_chat(PreparedChatRequest::new(&prepared, settings), &cancellation)
+        .start_prepared_chat(
+            PreparedChatRequest::new(&prepared, settings.clone()),
+            &cancellation,
+        )
         .unwrap_or_else(|error| {
             panic!("failed to start {environment}={path:?} ({profile_identity}): {error}")
         })
@@ -383,7 +389,10 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 0,
@@ -445,7 +454,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                                 add_generation_prompt: true,
                                 ..Default::default()
                             },
-                            CAPACITY,
+                            &native_limits(CAPACITY),
                             &cancellation,
                         )
                         .unwrap()
@@ -466,7 +475,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                         };
                         let mut session = model
                             .start_controlled_chat(
-                                PreparedChatRequest::new(&prepared, settings),
+                                PreparedChatRequest::new(&prepared, settings.clone()),
                                 TraceLimits {
                                     per_record_bytes: 65536,
                                     total_bytes: 4 << 20,
@@ -481,7 +490,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                     } else {
                         model
                             .start_prepared_chat(
-                                PreparedChatRequest::new(&prepared, settings),
+                                PreparedChatRequest::new(&prepared, settings.clone()),
                                 &cancellation,
                             )
                             .unwrap()
@@ -561,15 +570,22 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                             })
                             .collect::<String>();
                         assert_eq!(text.trim(), "cobalt", "{events:?}");
-                        assert!(
-                            !events
-                                .iter()
-                                .any(|e| matches!(e, SemanticEvent::ToolCallEnd))
-                        );
+                        assert!(!events
+                            .iter()
+                            .any(|e| matches!(e, SemanticEvent::ToolCallEnd)));
                     }
                 }
                 assert_eq!(executions, 1);
             }
         }
     }
+}
+
+fn native_limits(bytes: u64) -> eredu_core::MemoryLimitDeclarations {
+    eredu_core::MemoryLimitDeclarations::new(
+        eredu_backend_mlx::memory_topology()
+            .unwrap()
+            .domains()
+            .map(|(_, domain)| (domain.name.clone(), eredu_core::MemoryLimit::Finite(bytes))),
+    )
 }

@@ -37,7 +37,6 @@ fn histogram_source_with_sequence(sequence: bool) -> SharedCapturePlan {
     let caps = CaptureCapabilities {
         transformations: vec![CaptureTransformKind::Histogram],
         max_histogram_bins: 2,
-        physical_native_limit: false,
         conditions: vec![],
     };
     SharedCapturePlan::new(
@@ -89,7 +88,7 @@ fn partition_histogram_receipt_preserves_edges_counts_and_failed_payload_custody
     ] {
         let source = histogram_source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (reservation, run) = fresh(&pool, h);
         let mut bank = run
             .prepare_capture_run(&reservation, plan(&source))
@@ -161,7 +160,7 @@ fn partition_histogram_receipt_preserves_edges_counts_and_failed_payload_custody
             assert!(!retired.load(Ordering::SeqCst));
             drop(error);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         assert!(retired.load(Ordering::SeqCst));
     }
 }
@@ -171,8 +170,8 @@ fn remote_histogram_prefill_keeps_one_paid_destination_through_all_chunks() {
     use crate::capture::CapturePrefillHookDecision;
     let source = histogram_source_with_sequence(true);
     let h = plan(&source).initialization_peak_bytes();
-    let pp = WorkingMemoryPool::new(h, 0).unwrap();
-    let rp = WorkingMemoryPool::new(h, 0).unwrap();
+    let pp = capture_test_ledger(h, 0).unwrap();
+    let rp = capture_test_ledger(h, 0).unwrap();
     let (pr, p_run) = fresh(&pp, h);
     let (rr, r_run) = fresh(&rp, h);
     let mut pb = p_run.prepare_capture_run(&pr, plan(&source)).unwrap();
@@ -213,10 +212,12 @@ fn remote_histogram_prefill_keeps_one_paid_destination_through_all_chunks() {
         ] {
             let decision = frame.begin_prefill_hook(0, &chunk, "block.output").unwrap();
             if decision == CapturePrefillHookDecision::First {
-                assert!(frame
-                    .reserve_prefill_hook(0, quota, TensorDtype::F16, native_usage())
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    frame
+                        .reserve_prefill_hook(0, quota, TensorDtype::F16, native_usage())
+                        .unwrap()
+                        .is_none()
+                );
                 if remote {
                     frame.mark_remote_prefill_target(0).unwrap();
                 }
@@ -278,13 +279,13 @@ fn remote_histogram_prefill_keeps_one_paid_destination_through_all_chunks() {
     drop(pb);
     drop(p_run);
     drop(pr);
-    assert_eq!(pp.used_bytes().unwrap(), 0);
+    assert_eq!(pp.payload_used_bytes().unwrap(), 0);
     drop(rb);
     drop(r_run);
     drop(rr);
-    assert_eq!(rp.used_bytes().unwrap(), h);
+    assert_eq!(rp.payload_used_bytes().unwrap(), h);
     drop(escaped);
-    assert_eq!(rp.used_bytes().unwrap(), 0);
+    assert_eq!(rp.payload_used_bytes().unwrap(), 0);
     drop(encoded);
     drop(funding);
     assert!(retired.load(Ordering::SeqCst));

@@ -2,7 +2,7 @@ use super::*;
 use crate::working_memory::{LoadedDecodeSource, LoadedGenerationDecoderInput};
 use eredu_text::decoder_storage::DecodeCompilePlan;
 
-pub(super) fn loaded(pool: &WorkingMemoryPool) -> LoadedDecodeSource {
+pub(super) fn loaded(pool: &MemoryLedger) -> LoadedDecodeSource {
     let tokenizer = Tokenizer::from_bytes(r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":7,"content":"<stop>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"é":1,"":2,"<stop>":7,"[UNK]":8},"unk_token":"[UNK]"}}"#.as_bytes()).unwrap();
     pool.compile_decode_source(DecodeCompilePlan::prepare(&tokenizer.snapshot()).unwrap())
         .unwrap()
@@ -56,22 +56,22 @@ fn two_successive_original_requests_share_one_source_and_freeze_only_request_sto
             previous_r = Some(r);
             let (_, held) = retire_request(&state);
             drop((input, foreign_header, opposite));
-            assert_eq!(pool.used_bytes().unwrap(), cold + held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
             let tokens = sequence.into_token_ids();
             assert_eq!(tokens.as_ptr(), ptr);
             assert_eq!(tokens.as_ref(), [0, 1, 99, 2, 7]);
-            assert_eq!(pool.used_bytes().unwrap(), cold + held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
             drop(tokens);
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold);
             if run == 0 {
-                state.borrow_mut().root = Some(pool.register_storage([(1u32, 64)]).unwrap());
+                state.borrow_mut().root = Some(pool.register_host_storage([(1u32, 64)]).unwrap());
             }
         }
         assert_eq!(state.borrow().decoder_takes, 2);
         drop(runtime);
-        assert_eq!(pool.used_bytes().unwrap(), cold);
+        assert_eq!(pool.payload_used_bytes().unwrap(), cold);
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
@@ -103,18 +103,18 @@ fn shared_preflight_foreign_pool_wrong_n_replay_and_one_short_preserve_cold_owne
     assert_eq!(state.borrow().decoder_takes, 0);
     state.borrow_mut().mode.short = true;
     assert!(extract_decoder(&mut runtime, 0, 3, &input, &consumer(), None).is_err());
-    assert_eq!(pool.used_bytes().unwrap(), cold + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + 64);
     state.borrow_mut().mode.short = false;
     let failures: Vec<_> = (0..32)
         .map(|_| extract_decoder(&mut runtime, 0, 3, &input, &consumer(), None).unwrap_err())
         .collect();
-    assert!(failures.iter().all(|error| error
-        .source()
-        .unwrap()
-        .downcast_ref::<eredu_core::GenerationSequenceBankRejection>(
-    ) == Some(
-        &eredu_core::GenerationSequenceBankRejection::Unavailable
-    )));
+    assert!(failures.iter().all(|error| {
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<eredu_core::GenerationSequenceBankRejection>()
+            == Some(&eredu_core::GenerationSequenceBankRejection::Unavailable)
+    }));
     assert_eq!(state.borrow().decoder_takes, 1);
     let next = LoadedGenerationDecoderInput::new(&source, 3, true).unwrap();
     let sequence = extract_decoder(&mut runtime, 1, 3, &next, &consumer(), None).unwrap();
@@ -122,7 +122,7 @@ fn shared_preflight_foreign_pool_wrong_n_replay_and_one_short_preserve_cold_owne
     retire_request(&state);
     retire_request(&foreign_state);
     drop((runtime, foreign, input, next, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     drop(failures);
 }
 #[test]
@@ -148,17 +148,17 @@ fn shared_source_survives_model_and_consuming_provider_failure_without_repricing
     let (_, held) = retire_request(&state);
     drop((runtime, input, source));
     let failure = sequence.prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), cold + held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held + 64);
     assert!(failure.cause().source().unwrap().is::<WorkingMemoryError>());
     let sequence = failure.into_sequence();
     let failure = sequence.prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), cold + held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held + 64);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn two_concurrent_genuine_claims_take_one_atomic_header_lease() {
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     let source = loaded(&pool);
     let input = LoadedGenerationDecoderInput::new(&source, 3, true).unwrap();
     let cold = source.original_bytes();
@@ -194,7 +194,7 @@ fn two_concurrent_genuine_claims_take_one_atomic_header_lease() {
             .collect::<Vec<_>>()
     });
     assert_eq!(outcomes.iter().filter(|x| **x).count(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), cold);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold);
     drop((input, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

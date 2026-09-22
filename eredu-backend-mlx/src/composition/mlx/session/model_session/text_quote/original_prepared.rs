@@ -10,11 +10,10 @@ pub(super) fn preflight(
     _capture: Option<&eredu_core::capture::SharedCapturePlan>,
     claim: Option<&eredu_core::GenerationSequencePreparation<'_, '_>>,
 ) -> R {
-    match validate(runtime, prompt, config, claim) {
+    match validate(runtime, prompt, config.clone(), claim) {
         Err(error) => error,
         // Ordinary preinstalled collectors are not original capture authority.
         // The supplied immutable plan enters the common authenticated bank below.
-        Ok(_) if prompt.prepared_capture.is_some() => R::MissingCapture,
         // Fixed source inspection precedes the funded equation/recipe adapter.
         // No controller callback, diagnostic trace or native operation has run.
         Ok(source) => match source.inspect(config) {
@@ -51,7 +50,7 @@ pub(super) fn quote_candidate(
     workspace: TextControllerWorkspace<'_>,
     storage: &ControllerStorageContract,
     claim: &eredu_core::GenerationSequencePreparation<'_, '_>,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     original_table: bool,
     retained_sources: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
     capture: Option<&CaptureAdmission<'_>>,
@@ -59,10 +58,12 @@ pub(super) fn quote_candidate(
     let mut recipe = prompt.quote_original_media_recipe_funded(
         runtime,
         geometry,
-        config,
+        config.clone(),
         workspace.filter,
         capacity,
-        capture.map(|capture| capture.bind_geometry(geometry)).transpose()?,
+        capture
+            .map(|capture| capture.bind_geometry(geometry))
+            .transpose()?,
         capture.and_then(CaptureAdmission::intervention_quote),
     )?;
     if recipe.has_missing_operation() {
@@ -70,7 +71,7 @@ pub(super) fn quote_candidate(
     }
     recipe.quote_complete(
         runtime,
-        config,
+        config.clone(),
         workspace,
         storage,
         claim,
@@ -94,7 +95,7 @@ fn validate<'s>(
         return Err(R::RequestMismatch);
     }
     let session = runtime.session();
-    let pool = runtime.backend().memory_pool();
+    let pool = runtime.backend().memory_ledger();
     let input::OriginalMediaPacket::Original(source) =
         prompt.original_media.as_ref().ok_or(R::SourceUnavailable)?
     else {
@@ -111,7 +112,7 @@ fn validate<'s>(
     }
     let cache = prompt.cache_identity.as_ref().ok_or(R::SourceUnavailable)?;
     let accepted = source.validate_request_source(pool, &prompt.parts, cache)?;
-    if !session.payload.memory_pool.same_domain(pool)
+    if !session.payload.memory_ledger.same_ledger(pool)
         || !runtime
             .backend()
             .matches_prepared_target(&session.payload.target)
@@ -143,13 +144,6 @@ fn validate<'s>(
     }
     let output = u64::try_from(claim.request().max_new_tokens()).map_err(|_| R::Overflow)?;
     shape[1].checked_add(output).ok_or(R::Overflow)?;
-    if config
-        .inference_policy()
-        .managed_memory_capacity_bytes
-        .is_none()
-    {
-        return Err(R::RequestMismatch);
-    }
     let model = &session.payload.model;
     Ok(AuthenticatedPreparedSource {
         prompt,
@@ -366,14 +360,13 @@ impl TextExecutionQuoteOwner {
             return Err(mismatch());
         };
         let geometry = self.request().geometry();
-        if !source.source.pool().same_domain(backend.memory_pool())
+        if !source.source.pool().same_ledger(backend.memory_ledger())
             || !packet.matches_workspace_source(&source.source)
             || packet.shape() != [geometry.batch_size, geometry.input_positions]
             || geometry.cached_positions != 0
             || prompt.quote.is_some()
             || prompt.inference_request.is_some()
             || prompt.memory_owner.is_some()
-            || prompt.prepared_capture.is_some()
             || !matches!(
                 prompt.parts,
                 super::super::pending_prompt::ModelInputParts::Original(_)
@@ -383,7 +376,7 @@ impl TextExecutionQuoteOwner {
         }
         let cache = prompt.cache_identity.as_ref().ok_or_else(mismatch)?;
         packet
-            .validate_request_source(backend.memory_pool(), &prompt.parts, cache)
+            .validate_request_source(backend.memory_ledger(), &prompt.parts, cache)
             .map_err(|_| mismatch())?;
         // The existing preparation explicitly permits already constructed inputs.
         // Publish READY exactly once, before attaching any accepted owner alias.

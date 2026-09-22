@@ -11,7 +11,7 @@ fn exact_stream_pair_admission_and_second_refusal_preserve_real_prefix() {
         Err(PreparedMaterializationStreamError(Failure::Accounting(
             WorkingMemoryError::UnknownBound,
         ))) => {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
             let error =
                 PreparedMaterializationStreams::prepare(&pool, &stream, &stream).unwrap_err();
             let PreparedMaterializationStreamError(Failure::Initialization(error)) = error else {
@@ -22,34 +22,34 @@ fn exact_stream_pair_admission_and_second_refusal_preserve_real_prefix() {
                 Some(WorkingMemoryError::UnknownBound)
             ));
             assert!(error.rejected_plan().is_some());
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
             return;
         }
         Err(error) => panic!("{error:?}"),
     };
-    let first_bytes = WorkingMemoryPool::shared_native_initialization_required_bytes(&Initializer(
+    let first_bytes = MemoryLedger::shared_native_initialization_required_bytes(&Initializer(
         StreamCopyPlan::capture(&stream).unwrap(),
     ))
     .unwrap();
     assert_eq!(bytes, first_bytes * 2);
-    let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let short = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
     let error = PreparedMaterializationStreams::prepare(&short, &stream, &stream).unwrap_err();
     let PreparedMaterializationStreamError(Failure::Initialization(ref failure)) = error else {
         panic!("{error:?}")
     };
     assert!(
-        matches!(failure.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == first_bytes && *available_bytes == first_bytes - 1)
+        matches!(failure.accounting_failure(), Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes == first_bytes && limit_bytes.checked_sub(*existing_bytes).unwrap() == first_bytes - 1)
     );
     assert!(failure.rejected_plan().is_some());
     assert!(failure.constructor_failure().is_none());
-    assert_eq!(short.used_bytes().unwrap(), first_bytes); // actual unused first copy is queued
+    assert_eq!(short.fixture_host_charge().unwrap(), first_bytes); // actual unused first copy is queued
     drop(error);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(short.used_bytes().unwrap(), 0);
-    let exact = WorkingMemoryPool::new(bytes, 0).unwrap();
+    assert_eq!(short.fixture_host_charge().unwrap(), 0);
+    let exact = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let pair = PreparedMaterializationStreams::prepare(&exact, &stream, &stream).unwrap();
     let alias = pair.clone();
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
     assert!(pair.source.same(&alias.source) && pair.execution.same(&alias.execution));
     assert!(!pair.source.same(&pair.execution));
     assert!(matches!(
@@ -58,9 +58,13 @@ fn exact_stream_pair_admission_and_second_refusal_preserve_real_prefix() {
     ));
     drop(pair);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(exact.used_bytes().unwrap(), bytes);
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes);
     drop(alias);
-    assert_eq!(exact.used_bytes().unwrap(), bytes); // queue still owns each raw account
+    assert_eq!(exact.fixture_host_charge().unwrap(), bytes); // queue still owns each raw account
     safemlx::reclaim_allocation_owners();
-    assert_eq!(exact.used_bytes().unwrap(), 0);
+    assert_eq!(exact.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

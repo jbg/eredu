@@ -27,7 +27,9 @@ impl<'s, 'f, 'p, 'a> PreparedCaptureFragment<'s, 'f, 'p, 'a> {
         // Only this actual-source constructor can specialize erased precision.
         // Empty output retains the same selection/Preview operations and has no
         // F32 read or conversion, as in the existing whole-value leaf.
-        program.cast_f32 = fragment.output_elements() != 0 && observed.dtype() != Dtype::Float32;
+        program.cast_f32 = !program.read_unsigned
+            && fragment.output_elements() != 0
+            && observed.dtype() != Dtype::Float32;
         Ok(Self {
             source,
             observed,
@@ -50,6 +52,10 @@ impl<'s, 'f, 'p, 'a> PreparedCaptureFragment<'s, 'f, 'p, 'a> {
             dtype,
             fragment.source_shape(),
         )?;
+        PreparedCaptureTensor::validate_declared_dtype(
+            dtype,
+            fragment.assembly().logical_geometry().value_dtype(),
+        )?;
         Ok(dtype)
     }
 
@@ -66,6 +72,10 @@ impl<'s, 'f, 'p, 'a> PreparedCaptureFragment<'s, 'f, 'p, 'a> {
             observed.shape(),
             observed.dtype(),
             fragment.source_shape(),
+        )?;
+        PreparedCaptureTensor::validate_declared_dtype(
+            observed.dtype(),
+            fragment.assembly().logical_geometry().value_dtype(),
         )?;
         Ok(observed)
     }
@@ -114,6 +124,7 @@ impl<'s, 'f, 'p, 'a> PreparedCaptureFragment<'s, 'f, 'p, 'a> {
             stream,
             roots,
             CaptureCompletion::Ordinary,
+            None,
         )
     }
     pub(crate) fn transfer_with_completion<'t>(
@@ -124,6 +135,7 @@ impl<'s, 'f, 'p, 'a> PreparedCaptureFragment<'s, 'f, 'p, 'a> {
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
         completion: CaptureCompletion<'_>,
+        original: Option<&OriginalTextMetadataCustody>,
     ) -> Result<(), CaptureTensorNativeError> {
         if !std::ptr::eq(self.fragment, claim.fragment()) {
             return Err(CaptureTensorNativeError::ClaimMismatch);
@@ -132,14 +144,24 @@ impl<'s, 'f, 'p, 'a> PreparedCaptureFragment<'s, 'f, 'p, 'a> {
         segment.validate_native_scope(native)?;
         PreparedCaptureTensor::validate_stream(stream)?;
         self.validate()?;
-        let source_pin = PreparedCaptureTensor::prepare_registered_source_with_completion(
-            &self.observed,
-            native.pool(),
-            roots,
-            self.recovery_descriptors(),
-            completion,
-        )?;
-        let mut destination = claim.prepare_with_segment_source(native, segment, source_pin)?;
+        let mut destination = match (completion, original) {
+            (CaptureCompletion::Original(_), Some(custody)) => {
+                let rows = PreparedCaptureTensor::source_rows(&self.observed)?;
+                completion.reserve_roots(roots, self.recovery_descriptors())?;
+                claim.prepare_with_original_source(native, segment, custody, rows)
+            }
+            (CaptureCompletion::Ordinary, None) => {
+                let source_pin = PreparedCaptureTensor::prepare_registered_source_with_completion(
+                    &self.observed,
+                    native,
+                    roots,
+                    self.recovery_descriptors(),
+                    completion,
+                )?;
+                claim.prepare_with_segment_source(native, segment, source_pin)
+            }
+            _ => return Err(CaptureTensorNativeError::ClaimMismatch),
+        }?;
         execute_selected(
             self.source,
             &self.program,
@@ -161,5 +183,8 @@ impl TransferDestination for CapturePrefillFragmentTransfer<'_, '_, '_, '_, '_, 
     }
     fn push_f32(&mut self, value: f32) -> Result<(), Self::Error> {
         CapturePrefillFragmentTransfer::push_f32(self, value)
+    }
+    fn push_u64(&mut self, value: u64) -> Result<(), Self::Error> {
+        CapturePrefillFragmentTransfer::push_u64(self, value)
     }
 }

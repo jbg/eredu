@@ -5,8 +5,8 @@ use crate::backend::runtime::checkpoint::store::{
     PreparedMaterializationSourceStream, PreparedMaterializationSourceWorker,
 };
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use safemlx::{PreparedInputRuntime, Stream};
 use std::mem::{size_of, size_of_val};
@@ -46,7 +46,7 @@ struct ConstructionError {
 }
 
 #[derive(Debug)]
-struct Initializer(WorkingMemoryPool);
+struct Initializer(MemoryLedger);
 impl SharedNativeInitializer for Initializer {
     type Output = Resources;
     type Error = ConstructionError;
@@ -134,7 +134,11 @@ impl ResourceError {
             Failure::Worker(cause) => cause.into_backend_failure(),
             Failure::Initialization(error) => BackendFailure::from_error(
                 error.into_parts().1.retire_output_and_map_error(|error| {
-                    let ConstructionError { cause, _prefix, _custody } = error;
+                    let ConstructionError {
+                        cause,
+                        _prefix,
+                        _custody,
+                    } = error;
                     drop(_prefix);
                     drop(_custody);
                     match cause {
@@ -170,8 +174,8 @@ impl From<MaterializationSourceWorkerError> for ResourceError {
 #[derive(Debug)]
 pub(crate) struct CpuTileResources(InitializedSharedNative<Resources>);
 impl CpuTileResources {
-    pub(crate) fn prepare(pool: &WorkingMemoryPool) -> Result<Self, ResourceError> {
-        if !pool.same_domain(&managed_memory::domain()) {
+    pub(crate) fn prepare(pool: &MemoryLedger) -> Result<Self, ResourceError> {
+        if !pool.same_ledger(&managed_memory::ledger()) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         pool.initialize_shared_native(Initializer(pool.clone()))
@@ -191,7 +195,7 @@ impl CpuTileResources {
             .map(PreparedMaterializationSourceStream::as_stream)
     }
 
-    pub(super) fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), ResourceError> {
+    pub(super) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), ResourceError> {
         self.0.validate_pool(pool)?;
         // Revalidate the actual admitted singleton; this cannot initialize or
         // promote an ordinary predecessor and allocates no runtime wrapper.

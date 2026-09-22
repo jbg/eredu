@@ -5,19 +5,19 @@ use crate::backend::nn::workspace::{
 };
 use crate::backend::runtime::residency::storage::StorageIdentity;
 use crate::composition::mlx::model::{retain_planning_error, retain_planning_error_with_kind};
+use crate::composition::mlx::session::intervention::TextInterventionQuote;
+use crate::composition::mlx::session::model_session::text_quote::CaptureAdmission;
 use eredu_core::{
     BackendFailureKind, InferenceGeometry, PreparedRequestRejection, TextFilterWorkspace,
     TextGenerationConfig,
 };
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
+use eredu_runtime::layered::{BoundCaptureSelection, PreparedCaptureSelection};
+use eredu_runtime::working_memory::OriginalInterventionSource;
 use eredu_runtime::working_memory::{
     RegisteredPreparedWorkspaceStorage, RegisteredWorkspaceStorageLayout,
 };
 use std::mem::{size_of, size_of_val};
-use crate::composition::mlx::session::model_session::text_quote::CaptureAdmission;
-use eredu_runtime::layered::{BoundCaptureSelection, PreparedCaptureSelection};
-use crate::composition::mlx::session::intervention::TextInterventionQuote;
-use eredu_runtime::working_memory::OriginalInterventionSource;
 
 /// No Q is issued here. The existing packet and complete metadata source remain
 /// borrowed/owned until the later quote consumes their genuinely observed facts.
@@ -125,8 +125,10 @@ impl OriginalMediaRecipe {
         use eredu_runtime::working_memory::ControllerStorageContract;
         let result = (|| {
             let session = runtime.session();
-            if self.recipe.is_none() || self.projected.is_none()
-                || !session.parameter_epoch_matches(self.parameter_epoch) {
+            if self.recipe.is_none()
+                || self.projected.is_none()
+                || !session.parameter_epoch_matches(self.parameter_epoch)
+            {
                 return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
             }
             self.context.charge_metadata(size_of::<(
@@ -168,8 +170,9 @@ impl OriginalMediaRecipe {
                         return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
                     }
                     admission.validate_intervention_source(self.intervention_source.as_ref())?;
-                    admission.validate_media_trace(traced)
-                        .map_err(|cause| source_failure("capture source association", cause, &self.funding))?;
+                    admission.validate_media_trace(traced).map_err(|cause| {
+                        source_failure("capture source association", cause, &self.funding)
+                    })?;
                 }
                 (None, None) if self.intervention_source.is_none() => {}
                 _ => return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)),
@@ -178,9 +181,12 @@ impl OriginalMediaRecipe {
                 .report
                 .sampling()
                 .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?;
-            let mut projected = self.projected.take()
+            let mut projected = self
+                .projected
+                .take()
                 .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-            let mut paged_sources = projected.storage
+            let mut paged_sources = projected
+                .storage
                 .take_paged_sources(&self.context)
                 .map_err(|cause| source_failure("paged source handoff", cause, &self.funding))?;
             // The canonical source owns its pins. As in the token and saved
@@ -195,7 +201,7 @@ impl OriginalMediaRecipe {
                         source_failure("paged catalog preparation", cause, &self.funding)
                     })?;
                 source
-                    .prepare_host_program(&session.payload.memory_pool, &self.context)
+                    .prepare_host_program(&session.payload.memory_ledger, &self.context)
                     .map_err(|cause| source_failure("paged Host program", cause, &self.funding))?;
             }
             let quote =
@@ -230,6 +236,8 @@ impl OriginalMediaRecipe {
             Ok(crate::composition::mlx::session::model_session::text_quote::TextWorkspaceCandidate {
                 quote,
                 paged_sources,
+                execution_metadata: None,
+                ordinary_publication: None,
                 output_width: sampling.output_width,
                 native_recipe: self.recipe.take(),
                 prepared_source: Some(crate::composition::mlx::session::model_session::text_quote::original_prepared::PreparedMediaQuoteSource::new(self.storage.prepared_source().clone(), self.context.clone())),
@@ -264,7 +272,7 @@ impl OriginalMediaRecipe {
                 PreparedRequestRejection::MissingNumericalWorkspace,
                 self.context.metadata_string(format_args!(
                     "original media native recipe is missing span {span} operation {operation}: {:?}",
-                    self.report.intervals().get(span).and_then(|interval| interval.operation(operation)).map(|operation| &operation.kind),
+                    self.report.intervals().get(span).and_then(|interval| interval.operation(operation)),
                 )),
             ),
             None => match self.recipe.as_ref().and_then(|recipe| {
@@ -310,7 +318,7 @@ impl CompletedOriginalModelInput {
     pub(in crate::composition::mlx::session) fn project_workspace(
         &self,
         context: &WorkspaceContext,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<OriginalMediaWorkspaceInput, OriginalMediaWorkspaceInputError> {
         self.project_workspace_with_semantics(&self.semantics, context, pool)
     }
@@ -318,7 +326,7 @@ impl CompletedOriginalModelInput {
         &self,
         semantics: &eredu_architectures::media_plan::BoundPreparedMediaSemantics,
         context: &WorkspaceContext,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<OriginalMediaWorkspaceInput, OriginalMediaWorkspaceInputError> {
         OriginalMediaWorkspaceInput::project_with_metadata(
             self.body.prepared().expect("complete B prepared"),
@@ -339,11 +347,11 @@ impl MlxModelInput {
         geometry: InferenceGeometry,
         config: TextGenerationConfig,
         filter: TextFilterWorkspace<'a>,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         capture: Option<BoundCaptureSelection<'_>>,
         interventions: Option<TextInterventionQuote<'_>>,
     ) -> Result<OriginalMediaRecipe, Error> {
-        let pool = runtime.backend().memory_pool();
+        let pool = runtime.backend().memory_ledger();
         let session = runtime.session();
         let executable = &session.payload.model;
         let funding = pool
@@ -375,16 +383,17 @@ impl MlxModelInput {
         let bytes = controls
             .into_iter()
             .try_fold(size_of_val(&controls), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         funding
             .reserve_metadata(bytes)
             .map_err(Error::WorkspacePlanning)?;
         let result = (|| {
             if interventions.is_some() && capture.is_none() {
-                return Err(source_failure("intervention source association",
-                    WorkingMemoryError::IdentityMismatch, &funding));
+                return Err(source_failure(
+                    "intervention source association",
+                    WorkingMemoryError::IdentityMismatch,
+                    &funding,
+                ));
             }
             let Some(input::OriginalMediaPacket::Original(packet)) = self.original_media.as_ref()
             else {
@@ -443,14 +452,20 @@ impl MlxModelInput {
             let parameter_epoch = epoch.ok_or_else(|| {
                 retain_planning_error(WorkingMemoryError::IdentityMismatch, funding.clone())
             })?;
-            let addressable=executable.prepare_addressable_workspace_sources(facts,pool,&funding)?;
+            let addressable =
+                executable.prepare_addressable_workspace_sources(facts, pool, &funding)?;
             let parallel_source = session.original_workspace_parallel_source(&funding)?;
             let workspace = crate::composition::mlx::model::RecipeWorkspace::prepare(
-                facts,addressable.as_ref(),parallel_source,&funding)?;
-            let context=workspace.context();
-            executable
-                .erased()
-                .install_workspace_parameter_representations(&context)
+                facts,
+                addressable.as_ref(),
+                None,
+                parallel_source,
+                &funding,
+            )?;
+            let context = workspace.context();
+            let layerwise = executable.prepared_layerwise_workspace(context)?;
+            let parameter_backings = executable
+                .install_parameter_source(&context, layerwise.as_ref())
                 .map_err(|cause| {
                     source_failure("parameter representation projection", cause, &funding)
                 })?;
@@ -479,12 +494,22 @@ impl MlxModelInput {
                 .storage
                 .iter()
                 .filter(|(_, bytes, _)| *bytes != 0)
-                .count();
-            let layout =
-                RegisteredWorkspaceStorageLayout::<StorageIdentity>::new_with_prepared_source(
-                    count,
-                    input.source_storage(),
-                )
+                .count()
+                .checked_add(parameter_backings.len())
+                .ok_or_else(|| {
+                    source_failure(
+                        "parameter backing population",
+                        WorkingMemoryError::Overflow,
+                        &funding,
+                    )
+                })?;
+            let completed = parameter_backings
+                .completed_source(&context)
+                .map_err(|cause| source_failure("completed parameter backing", cause, &funding))?;
+            let layout = match &completed {
+                Some(source) => RegisteredWorkspaceStorageLayout::<StorageIdentity>::new_with_prepared_and_completed_sources(count, input.source_storage(), source),
+                None => RegisteredWorkspaceStorageLayout::<StorageIdentity>::new_with_prepared_source(count, input.source_storage()),
+            }
                 .map_err(|cause| {
                     source_failure(
                         if input.source_storage().borrowed_storage().is_none() {
@@ -499,28 +524,56 @@ impl MlxModelInput {
             context
                 .charge_metadata(layout.requested_bytes())
                 .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
-            let storage = layout
-                .construct_with_prepared_source(
+            let roots = || {
+                projected
+                    .storage
+                    .iter()
+                    .filter(|(_, bytes, _)| *bytes != 0)
+                    .map(|(identity, _, root)| {
+                        crate::backend::nn::workspace::registered_storage_row(identity, root)
+                    })
+                    .chain(parameter_backings.roots())
+            };
+            let storage = match completed {
+                Some(source) => layout.construct_with_prepared_and_completed_sources(
                     pool,
                     &context,
-                    projected
-                        .storage
-                        .iter()
-                        .filter(|(_, bytes, _)| *bytes != 0)
-                        .map(|(identity, _, root)| {
-                            (StorageIdentity::Native(identity), root.clone())
-                        }),
+                    roots(),
                     input.source_storage().clone(),
-                )
-                .map_err(|cause| source_failure("source binding", cause, &funding))?;
-            // Match original token quotation: this trace owns numerical equations.
-            // The common quote composer separately binds the selected layerwise
-            // source, unloaded-slot constructors, materialization and transfers.
-            let capture_selection = capture.map(|bound| (bound.selection().clone(), bound.geometry()));
+                    source,
+                ),
+                None => layout.construct_with_prepared_source(
+                    pool,
+                    &context,
+                    roots(),
+                    input.source_storage().clone(),
+                ),
+            }
+            .map_err(|cause| source_failure("source binding", cause, &funding))?;
+            context
+                .charge_metadata(size_of::<(
+                    Option<crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+                    Option<crate::composition::mlx::model::NativeLayerwiseParameters<'_>>,
+                    Option<
+                        &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters,
+                    >,
+                )>())
+                .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+            let parameters = layerwise
+                .as_ref()
+                .map(crate::composition::mlx::model::NativeLayerwiseParameters);
+            let parameters = parameters.as_ref().map(|value| {
+                value as &dyn eredu_architectures::prepared_execution::WorkspaceLayerwiseParameters
+            });
+            let capture_selection =
+                capture.map(|bound| (bound.selection().clone(), bound.geometry()));
             let loaded_capture = if capture.is_some() && workspace.parallel().is_some() {
-                Some(session.partition_capture_source().ok_or_else(||
-                    retain_planning_error(WorkingMemoryError::UnknownBound,funding.clone()))?)
-            } else { None };
+                Some(session.partition_capture_source().ok_or_else(|| {
+                    retain_planning_error(WorkingMemoryError::UnknownBound, funding.clone())
+                })?)
+            } else {
+                None
+            };
             let mut quote = |recorder:&mut dyn crate::composition::mlx::model::CaptureRecorder,
                 communication:Option<&eredu_runtime::RetainedCommunicationSource>| {
                 if let Some(capture)=capture {
@@ -529,28 +582,50 @@ impl MlxModelInput {
                         (communication,(loaded.layouts(),communication.manifest().rank()),None)
                     });
                     executable.quote_original_media_capture(input,&current,geometry,&projected.state,context,
-                        config,filter,capture,interventions,recorder,parallel)
+                        config,filter,capture,interventions,recorder,parallel,parameters)
                         .map_err(|cause|source_failure("observed equation and sampling trace",cause,&funding))
                 } else {
                     blueprint.quote_original_media_with_sampling_and_trace(input,&current,geometry,
-                        &projected.state,context,None,config,filter,recorder,communication)
+                        &projected.state,context,parameters,config,filter,recorder,communication)
                         .map_err(|cause|source_failure("equation and sampling trace",cause.into_failure(),&funding))
                 }
             };
-            context.charge_metadata(size_of_val(&quote)).map_err(|cause|retain_planning_error(cause,funding.clone()))?;
-            let (report,recipe)=if let Some(parallel)=workspace.parallel() {
-                let mut recorder=parallel.recorder(geometry).map_err(|cause|retain_planning_error(cause,funding.clone()))?;
-                let report=quote(&mut recorder,Some(parallel.declaration_source()))?;
-                let recipe=recorder.finish(report.equations().span_workspace_plan())
-                    .map_err(|cause|source_failure("recipe reduction",cause,&funding))?;
-                (report,recipe)
+            context
+                .charge_metadata(size_of_val(&quote))
+                .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+            let (report, recipe) = if let Some(parallel) = workspace.parallel() {
+                let mut recorder = parallel
+                    .recorder(geometry)
+                    .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                if let Some(source) = layerwise.as_ref() {
+                    recorder
+                        .bind_layerwise_span_constructor_source(source)
+                        .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                }
+                let report = quote(&mut recorder, Some(parallel.declaration_source()))?;
+                let recipe = recorder
+                    .finish(report.equations().span_workspace_plan())
+                    .map_err(|cause| source_failure("recipe reduction", cause, &funding))?;
+                (report, recipe)
             } else {
-                let mut recorder=facts.recorder(geometry,context).map_err(|cause|retain_planning_error(cause,funding.clone()))?;
-                if let Some(source)=addressable {recorder.bind_addressable_sources(source).map_err(|cause|retain_planning_error(cause,funding.clone()))?;}
-                let report=quote(&mut recorder,None)?;
-                let recipe=recorder.finish(report.equations().span_workspace_plan())
-                    .map_err(|cause|source_failure("recipe reduction",cause,&funding))?;
-                (report,recipe)
+                let mut recorder = facts
+                    .recorder(geometry, context)
+                    .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                if let Some(source) = layerwise.as_ref() {
+                    recorder
+                        .bind_layerwise_span_constructor_source(source)
+                        .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                }
+                if let Some(source) = addressable {
+                    recorder
+                        .bind_addressable_sources(source)
+                        .map_err(|cause| retain_planning_error(cause, funding.clone()))?;
+                }
+                let report = quote(&mut recorder, None)?;
+                let recipe = recorder
+                    .finish(report.equations().span_workspace_plan())
+                    .map_err(|cause| source_failure("recipe reduction", cause, &funding))?;
+                (report, recipe)
             };
             if !session.parameter_epoch_matches(parameter_epoch) {
                 return Err(retain_planning_error(

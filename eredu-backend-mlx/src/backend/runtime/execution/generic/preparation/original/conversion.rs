@@ -16,7 +16,7 @@ pub(super) fn prepare(
     source: &RetainedCheckpointSource,
     modules: &[&BTreeMap<String, eredu_nn::workspace::WorkspaceLayout>],
     tasks: &[ReplicatedTextMaterializationTask],
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     execution_stream: &Stream,
 ) -> Result<Option<(RetainedCheckpointSource, Vec<ConvertedQuantization>)>, Error> {
     let groups = eredu_runtime::group_replicated_text_transform_tasks(tasks)
@@ -31,7 +31,7 @@ pub(super) fn prepare(
         || groups
             .iter()
             .any(|group| !matches!(group.quantization(), WeightQuantization::Affine(_)))
-        || !pool.same_domain(&crate::backend::managed_memory::domain())
+        || !pool.same_ledger(&crate::backend::managed_memory::ledger())
         || source.materialization_input_bytes().is_none()
     {
         return Ok(None);

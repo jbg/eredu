@@ -1,12 +1,12 @@
 //! The existing convolution worker with an exact original source/control profile.
 use crate::MlxTensor;
 use eredu_nn::Error;
-use safemlx::{Array, Dtype, OriginalScopeObserver, Stream, error::Exception};
+use safemlx::{error::Exception, Array, Dtype, OriginalScopeObserver, Stream};
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
 enum SourceRefusal {
-    #[error("original convolution requires the selected GPU stream")]
+    #[error("original convolution stream has no finite selected worker")]
     Stream,
     #[error("original convolution requires F32, F16 or BF16 source scalars")]
     Dtype,
@@ -39,13 +39,29 @@ fn validate(
     let Some(observer) = OriginalScopeObserver::try_current().map_err(error)? else {
         return Ok(());
     };
-    let refusal = if stream.device_type().map_err(error)? != safemlx::DeviceType::Gpu {
-        Some(SourceRefusal::Stream)
-    } else if [input.dtype(), weight.dtype()]
+    let device = stream.device_type().map_err(error)?;
+    let refusal = if [input.dtype(), weight.dtype()]
         .iter()
         .any(|dtype| !matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16))
     {
         Some(SourceRefusal::Dtype)
+    } else if device == safemlx::DeviceType::Cpu {
+        if cpu_depthwise_geometry(
+            input.shape(),
+            weight.shape(),
+            stride,
+            padding,
+            dilation,
+            groups,
+        )
+        .is_some()
+            && safemlx::OperationEvent::cpu_depthwise_convolution_layout(input.dtype(), false)
+                .is_some()
+        {
+            None
+        } else {
+            Some(SourceRefusal::Stream)
+        }
     } else if safemlx::ops::OriginalConvolutionLayout::inspect(
         input.shape(),
         weight.shape(),
@@ -67,6 +83,38 @@ fn validate(
             _custody: observer.invalid_input_error(),
         })),
     }
+}
+
+/// The selected CPU scalar worker's complete nontransposed source geometry.
+pub(crate) fn cpu_depthwise_geometry(
+    input: &[i32],
+    weight: &[i32],
+    stride: &[i32],
+    padding: &[i32],
+    dilation: &[i32],
+    groups: i32,
+) -> Option<[i32; 3]> {
+    if input.len() != 3
+        || weight.len() != 3
+        || stride != [1]
+        || padding != [0]
+        || dilation != [1]
+        || input.iter().chain(weight).any(|&n| n <= 0)
+        || weight[2] != 1
+        || input[2] != groups
+        || weight[0] != groups
+        || input[1] < weight[1]
+    {
+        return None;
+    }
+    for shape in [input, weight] {
+        shape.iter().try_fold(1i32, |n, &d| n.checked_mul(d))?;
+    }
+    Some([
+        input[0],
+        input[1].checked_sub(weight[1])?.checked_add(1)?,
+        input[2],
+    ])
 }
 pub(crate) fn conv1d(
     input: &MlxTensor,
@@ -168,8 +216,29 @@ pub(crate) fn conv2d(
     .map_err(error)
 }
 pub(crate) fn control_bytes(layout: safemlx::ops::OriginalConvolutionLayout) -> Option<usize> {
+    caller_control_bytes(layout.control_bytes()?)
+}
+
+pub(crate) fn cpu_control_bytes() -> Option<usize> {
     let frames = [
-        layout.control_bytes()?,
+        size_of::<Option<[i32; 3]>>(),
+        size_of::<[i32; 3]>(),
+        size_of::<[&[i32]; 2]>(),
+        size_of::<std::slice::Iter<'_, i32>>() * 2,
+        size_of::<safemlx::CpuCopyEvalLayout>(),
+        size_of::<Option<safemlx::CpuCopyEvalLayout>>(),
+        size_of::<Option<i32>>(),
+        size_of::<i32>() * 4,
+    ];
+    let native = frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)?;
+    caller_control_bytes(native)
+}
+
+fn caller_control_bytes(native: usize) -> Option<usize> {
+    let frames = [
+        native,
         size_of::<[(&MlxTensor, &MlxTensor, &Stream); 2]>(),
         size_of::<[&Array; 2]>(),
         size_of::<[&[i32]; 3]>(),

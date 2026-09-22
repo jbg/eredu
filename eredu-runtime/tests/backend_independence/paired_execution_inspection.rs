@@ -89,8 +89,10 @@ fn paired_inspection_borrows_actual_owners_across_both_residencies_and_cached_st
         let path_source = session.shared_observation_paths().unwrap().clone();
         session.decode(&FakeTensor(vec![3]), &()).unwrap();
         session.decode(&FakeTensor(vec![4]), &()).unwrap();
-        session.validate_prepared_observation_paths(&path_source).unwrap();
-        session.publish_parameter_replacements(&Default::default(), false).unwrap();
+        session
+            .validate_prepared_observation_paths(&path_source)
+            .unwrap();
+        session.invalidate_parameter_observations();
         let before = counters.snapshot();
         session
             .inspect_runtime_execution(|_, s, e| {

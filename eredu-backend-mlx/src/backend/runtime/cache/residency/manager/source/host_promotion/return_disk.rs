@@ -33,7 +33,9 @@ impl PreparedCacheHostPromotion {
             &self.id,
             backing,
             arrays,
-            self.reservation.as_mut().expect("completed promotion reservation"),
+            self.reservation
+                .as_mut()
+                .expect("completed promotion reservation"),
             proof,
         )?;
         self.disk_replaced = Some(device);
@@ -50,57 +52,83 @@ pub(super) fn return_device(
     proof: &OriginalPagedHostReturn<'_, '_>,
 ) -> Result<CacheBlockArrays, Exception> {
     let source = proof.source();
-    if proof.id() != id {
-        return Err(source.error(CacheSourceError::Identity));
-    }
-    let file = backing
-        .live_source
-        .as_ref()
-        .ok_or_else(|| source.error(CacheSourceError::Identity))?;
     for array in arrays {
         source.observer().validate_completed_array(array)?;
     }
     let permission = proof.bind(arrays);
+    return_device_prepared(manager, id, backing, reservation, &permission)
+}
+
+/// One canonical return worker for authenticated completed Device owners.
+/// The proof supplies the actual arrays and pin inventory, independently of
+/// whether their selected execution uses an ordinary or original scope.
+pub(super) fn return_device_prepared<P: super::super::host_demotion::PreparedHostEviction>(
+    manager: &CacheResidencyManager,
+    id: &CacheBlockId,
+    backing: &DiskLocation,
+    reservation: &mut CachePoolReservation,
+    proof: &P,
+) -> Result<CacheBlockArrays, Exception> {
+    let fail = |cause: CacheSourceError| proof.error(cause.into());
+    let arrays = proof.arrays();
+    if proof.id() != id {
+        return Err(fail(CacheSourceError::Identity));
+    }
+    let file = backing
+        .file_source()
+        .ok_or_else(|| fail(CacheSourceError::Identity))?;
     let mut state = manager.inner.state.try_lock().map_err(|cause| {
-        source.error(match cause {
+        fail(match cause {
             TryLockError::WouldBlock => CacheSourceError::Busy,
             TryLockError::Poisoned(_) => CacheSourceError::Poisoned,
         })
     })?;
-    source.validate_manager(manager, state.generation)?;
+    proof.validate_manager(manager, state.generation)?;
     if !manager.borrowed_storage_complete(&state) {
-        return Err(source.error(CacheSourceError::PendingStorage));
+        return Err(fail(CacheSourceError::PendingStorage));
     }
-    permission.validate_pin_counts(&state.lifecycle)?;
+    proof.validate_pin_counts(&state.lifecycle)?;
     let record = state
         .blocks
         .get(id)
-        .ok_or_else(|| source.error(CacheSourceError::Identity))?;
+        .ok_or_else(|| fail(CacheSourceError::Identity))?;
     if record.physical.phase() != CacheStoragePhase::Device
         || record
             .disk()
-            .and_then(|value| value.live_source.as_ref())
-            .is_none_or(|value| !value.same_source(file))
+            .and_then(DiskLocation::file_source)
+            .is_none_or(|value| !value.same_source(&file))
     {
-        return Err(source.error(CacheSourceError::Identity));
+        return Err(fail(CacheSourceError::Identity));
     }
     let actual = record
         .physical
         .device_resource()
-        .ok_or_else(|| source.error(CacheSourceError::Identity))?
+        .ok_or_else(|| fail(CacheSourceError::Identity))?
         .arrays();
     for (actual, expected) in actual.into_iter().zip(arrays) {
         let a = actual
             .try_allocation_info()
-            .map_err(|cause| source.error(CacheSourceError::ArrayMetadata(cause)))?;
+            .map_err(|cause| fail(CacheSourceError::ArrayMetadata(cause)))?;
         let b = expected
             .try_allocation_info()
-            .map_err(|cause| source.error(CacheSourceError::ArrayMetadata(cause)))?;
+            .map_err(|cause| fail(CacheSourceError::ArrayMetadata(cause)))?;
         if a.is_none() || a != b {
-            return Err(source.error(CacheSourceError::Identity));
+            return Err(fail(CacheSourceError::Identity));
         }
     }
-    reporting::update_report_totals_prepared(&mut state).map_err(|cause| source.error(cause))?;
+    reporting::update_report_totals_prepared(&mut state)
+        .map_err(|cause| proof.error(cause.into()))?;
+    let disk_demotions = state
+        .telemetry
+        .report
+        .disk_demotions
+        .checked_add(1)
+        .ok_or_else(|| fail(CacheSourceError::Overflow))?;
+    let layer_demotions = state
+        .layer_activity_mut(id.global_layer)
+        .disk_demotions
+        .checked_add(1)
+        .ok_or_else(|| fail(CacheSourceError::Overflow))?;
     let device = state
         .blocks
         .get_mut(id)
@@ -120,17 +148,41 @@ pub(super) fn return_device(
         let _ = reporting::update_report_totals_prepared(&mut state);
         drop(state);
         drop(previous);
-        return Err(source.error(cause));
+        return Err(proof.error(cause.into()));
     }
-    state.telemetry.report.disk_demotions += 1;
-    state.layer_activity_mut(id.global_layer).disk_demotions += 1;
+    state.telemetry.report.disk_demotions = disk_demotions;
+    state.layer_activity_mut(id.global_layer).disk_demotions = layer_demotions;
     drop(state);
     Ok(device)
 }
 
 pub(super) fn control_bytes() -> Option<usize> {
-    let frames = [
+    let caller = [
         crate::backend::nn::workspace::OriginalPagedHostEviction::control_bytes()?,
+        size_of::<(
+            &mut PreparedCacheHostPromotion,
+            &OriginalPagedHostReturn<'_, '_>,
+        )>(),
+        size_of::<(
+            &CacheResidencyManager,
+            &CacheBlockId,
+            &DiskLocation,
+            [&Array; 2],
+            &mut CachePoolReservation,
+            &OriginalPagedHostReturn<'_, '_>,
+        )>(),
+    ];
+    prepared_control_bytes::<crate::backend::nn::workspace::OriginalPagedHostEviction<'_, '_>>()?
+        .checked_add(
+            caller
+                .into_iter()
+                .try_fold(size_of_val(&caller), usize::checked_add)?,
+        )
+}
+
+/// Canonical return transports for the actual selected source proof.
+pub(super) fn prepared_control_bytes<P>() -> Option<usize> {
+    let frames = [
         reporting::report_query_control_bytes()?,
         size_of::<MutexGuard<'_, CacheManagerState>>(),
         size_of::<
@@ -141,24 +193,23 @@ pub(super) fn control_bytes() -> Option<usize> {
         >(),
         size_of::<eredu_runtime::cache::CacheRecordTableIter<'_, CacheBlockId, CacheBlockRecord>>(),
         size_of::<Result<Option<safemlx::ArrayAllocationInfo>, safemlx::ArrayMetadataError>>(),
-        size_of::<(
-            &mut PreparedCacheHostPromotion,
-            &OriginalPagedHostReturn<'_, '_>,
-        )>(),
         size_of::<Option<CacheBlockArrays>>(),
         size_of::<(
             &CacheResidencyManager,
             &CacheBlockId,
             &DiskLocation,
-            [&Array; 2],
             &mut CachePoolReservation,
-            &OriginalPagedHostReturn<'_, '_>,
+            &P,
+            [&Array; 2],
+            u64,
+            u64,
         )>(),
         size_of::<Result<CacheBlockArrays, Exception>>(),
         size_of::<CacheBlockArrays>(),
         size_of::<MlxCacheBlockStorage>(),
         size_of::<Option<DiskLocation>>(),
-        size_of::<(&DiskLocation, &LiveCacheBlockSource)>(),
+        size_of::<(&DiskLocation, CacheFileSource)>(),
+        size_of::<Option<CacheFileSource>>(),
         size_of::<Result<(), Exception>>(),
         size_of::<[&Array; 2]>(),
         size_of::<std::iter::Zip<std::array::IntoIter<&Array, 2>, std::array::IntoIter<&Array, 2>>>(

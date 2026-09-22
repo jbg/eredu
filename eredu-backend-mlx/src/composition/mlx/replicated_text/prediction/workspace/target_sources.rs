@@ -2,7 +2,10 @@
 use crate::{
     backend::{
         error::Error,
-        nn::{shared::MlxNeuralBackend, workspace::{ProjectedResidentState, ResidentExecutionMechanisms}},
+        nn::{
+            shared::MlxNeuralBackend,
+            workspace::{ProjectedResidentState, ResidentExecutionMechanisms},
+        },
         runtime::execution::generic::LayerwiseWorkspace,
         OriginalCopyEnvironment,
     },
@@ -16,7 +19,7 @@ use crate::{
     MlxTensor,
 };
 use eredu_nn::{
-    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
+    workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError},
     Parameterized,
 };
 use eredu_runtime::{
@@ -41,6 +44,7 @@ pub(super) struct ProjectedTargetEquationSources {
     pub batch: NonZeroU32,
     pub mechanism: ResidentExecutionMechanisms,
     pub addressable: Option<crate::backend::nn::workspace::AddressableSources>,
+    pub parallel: Option<crate::backend::nn::workspace::MlxParallelWorkspace>,
 }
 impl ProjectedTargetEquationSources {
     pub(super) fn inspect<A, S, D>(
@@ -90,6 +94,13 @@ impl ProjectedTargetEquationSources {
             size_of::<(&D, bool)>(),
             size_of::<Result<Self, Error>>(),
             size_of::<WorkspaceContext>(),
+            size_of::<Option<crate::backend::nn::workspace::MlxParallelWorkspace>>(),
+            size_of::<
+                Result<
+                    Option<crate::backend::nn::workspace::MlxParallelWorkspace>,
+                    eredu_nn::Error,
+                >,
+            >(),
             size_of::<ResidentExecutionMechanisms>(),
             size_of::<Result<ResidentExecutionMechanisms, eredu_nn::Error>>(),
             size_of::<Result<WorkspaceContext, WorkspaceMetadataError>>(),
@@ -140,28 +151,52 @@ impl ProjectedTargetEquationSources {
         let (_, ordinary) = sources.numerical_prerequisites();
         // Carry the same descriptive choice to every consumer. The retained
         // environment remains borrowed; no stream or mechanism is selected here.
-        let mechanism = ResidentExecutionMechanisms::from_stream(ordinary, environment.stream(), funding)
-            .map_err(|cause| sources.retain_startup_error(cause))?;
-        let addressable=sources.target_addressable_sources(mechanism,environment,funding)?;
+        let mechanism =
+            ResidentExecutionMechanisms::from_stream(ordinary, environment.stream(), funding)
+                .map_err(|cause| sources.retain_startup_error(cause))?;
+        let addressable = sources.target_addressable_sources(mechanism, environment, funding)?;
         if !session.execution_strategy().uses_ordinary_unit_equations() && addressable.is_none() {
             return Err(sources.retain_startup_error(WorkingMemoryError::UnknownBound));
         }
-        let context = match &addressable {
-            Some(source)=>WorkspaceContext::new_with_metadata_funding(
-                crate::backend::nn::workspace::MlxAddressableWorkspaceMechanisms::new(mechanism,source.clone()),funding.clone()),
-            None=>mechanism.context(funding.clone()),
-        }.map_err(|cause| sources.retain_startup_error(cause))?;
+        let parallel = sources
+            .workspace_parallel_source()
+            .map(|source| {
+                crate::backend::nn::workspace::MlxParallelWorkspaceMechanisms::new(
+                    mechanism,
+                    source.clone(),
+                )
+                .prepare_workspace_with_metadata_funding(funding.clone(), addressable.clone())
+            })
+            .transpose()
+            .map_err(|cause| sources.retain_startup_error(cause))?;
+        let context = match (&parallel, &addressable) {
+            (Some(parallel), _) => Ok(parallel.context().clone()),
+            (None, Some(source)) => WorkspaceContext::new_with_metadata_funding(
+                crate::backend::nn::workspace::MlxAddressableWorkspaceMechanisms::new(
+                    mechanism,
+                    source.clone(),
+                ),
+                funding.clone(),
+            ),
+            (None, None) => mechanism.context(funding.clone()),
+        }
+        .map_err(|cause| sources.retain_startup_error(cause))?;
         let selected = D::resident_policy(runtime)
             .or_else(|| D::bounded_policy(runtime))
             .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
         let modules = D::static_modules_ref(runtime)
             .ok_or_else(|| sources.retain_startup_error(WorkingMemoryError::UnknownBound))?;
-        selected
+        let mut parameter_backings = selected
             .install_workspace_parameter_representations(modules, &context)
             .map_err(|cause| sources.retain_startup_error(cause))?;
         // The selected policy also supplies resident parameter facts. Only the
         // retained host/disk realization needs a separate materialization plan.
-        let layerwise = match sources.target_blueprint().selected().text_realization().residency() {
+        let layerwise = match sources
+            .target_blueprint()
+            .selected()
+            .text_realization()
+            .residency()
+        {
             eredu_runtime::LayerWeightResidency::FullyResident => None,
             eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
             | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => Some(
@@ -171,6 +206,12 @@ impl ProjectedTargetEquationSources {
             ),
             _ => return Err(sources.retain_startup_error(WorkingMemoryError::UnknownBound)),
         };
+        if let Some(layerwise) = layerwise.as_ref() {
+            layerwise
+                .install_replacement_parameter_representations(&context, &mut parameter_backings)
+                .map_err(|cause| sources.retain_startup_error(cause))?;
+        }
+
         let batch = u32::try_from(geometry.batch_size)
             .ok()
             .and_then(NonZeroU32::new)
@@ -188,6 +229,7 @@ impl ProjectedTargetEquationSources {
             batch,
             mechanism,
             addressable,
+            parallel,
         })
     }
 }

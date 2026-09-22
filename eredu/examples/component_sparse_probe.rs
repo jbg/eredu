@@ -2,15 +2,17 @@
 //! Pair with eredu-evaluation/scripts/component_sparse_reference.py.
 mod component_sparse_analysis;
 mod component_sparse_scores;
-use anyhow::{Context, ensure};
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
+use anyhow::{ensure, Context};
 use eredu::api::*;
 use eredu::runtime::chat::ChatTemplateRequest;
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
-    ArchitectureDescriptor, ExecutionPlan, GenerationConfigOverrides, capture::*, component::*,
-    execution_control::SnapshotLimits, intervention::*, parameters::*,
+    capture::*, component::*, execution_control::SnapshotLimits, intervention::*, parameters::*,
+    ArchitectureDescriptor, ExecutionPlan, GenerationConfigOverrides,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{collections::BTreeMap, ops::ControlFlow};
 
 fn dense_group<'a>(
@@ -643,7 +645,6 @@ fn main() -> anyhow::Result<()> {
         limits: CaptureLimits {
             per_step: budget,
             cumulative: budget.checked_mul(16)?,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -680,7 +681,12 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let chat = model
-        .prepare_chat(&source, &policy, CAPACITY, &cancellation)?
+        .prepare_chat(
+            &source,
+            &policy,
+            &physical_memory::finite_each(CAPACITY)?,
+            &cancellation,
+        )?
         .context("cancelled before chat preparation")?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
@@ -689,7 +695,10 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: eredu_core::TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(CAPACITY),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(CAPACITY),
+            )]),
             ..Default::default()
         },
         seed: 17,
@@ -789,7 +798,7 @@ fn main() -> anyhow::Result<()> {
             schema_version: INTERVENTION_SCHEMA_VERSION,
             operations,
         };
-        let mut request = PreparedChatRequest::new(&chat, settings);
+        let mut request = PreparedChatRequest::new(&chat, settings.clone());
         request.input = PreparedChatPrompt::TokenIds(&prefix);
         request.output_mode = PreparedChatOutputMode::Text;
         request.capture = Some(&capture);
@@ -857,7 +866,7 @@ fn main() -> anyhow::Result<()> {
         )?;
         if args.iter().skip(3).any(|arg| arg == "controlled") {
             model.reset()?;
-            let mut request = PreparedChatRequest::new(&chat, settings);
+            let mut request = PreparedChatRequest::new(&chat, settings.clone());
             request.input = PreparedChatPrompt::TokenIds(&prefix);
             request.output_mode = PreparedChatOutputMode::Text;
             request.capture = Some(&capture);
@@ -887,8 +896,10 @@ fn main() -> anyhow::Result<()> {
                     retained_bytes: snapshot_retention,
                     cumulative_copy_bytes: 4 << 30,
                 },
-                CAPACITY,
-                eredu_runtime::working_memory::WorkspaceCopyLimits::new(CAPACITY),
+                physical_memory::finite_each(CAPACITY)?,
+                eredu_runtime::working_memory::WorkspaceCopyLimits::new(
+                    physical_memory::finite_each(CAPACITY)?,
+                ),
             )?;
             let initial = run
                 .snapshot(|_| ControlFlow::Continue(()))

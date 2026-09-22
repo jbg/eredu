@@ -7,13 +7,22 @@ use eredu_core::cache::{
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
+};
+
+mod funded;
+pub use funded::{
+    DEFAULT_PROMPT_CACHE_MANIFEST_BYTE_LIMIT, PROMPT_CACHE_DEPENDENCY_BASIS,
+    PROMPT_CACHE_DEPENDENCY_SOURCE, PreparedPromptCachePublication,
+    PreparedReversiblePromptCachePublication, PromptCachePersistenceFailure,
+    PromptCachePersistenceFunding, hash_prompt_cache_shard_payload_from_funded,
+    inspect_prompt_cache_funded, read_shard_metadata_from_funded,
 };
 
 static NEXT_LIVE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -32,24 +41,29 @@ pub const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
 /// Replicated cache state remains at `root`; distributed state is isolated by
 /// all three semantic rank coordinates, using `x` for inactive axes.
 pub fn prompt_cache_rank_path(root: &Path, topology: &PromptCacheTopology) -> PathBuf {
-    let coordinate = |axis: Option<(usize, usize)>| {
-        axis.map_or_else(|| "x".to_owned(), |(_, rank)| rank.to_string())
-    };
-    if topology.cache_rank_identity().is_none() {
-        root.to_path_buf()
-    } else {
-        root.join(format!(
-            "rank-p{}-t{}-e{}",
-            coordinate(topology.stage()),
-            coordinate(topology.shard()),
-            coordinate(topology.addressable())
-        ))
-    }
+    funded::rank_path(root, topology, None).expect("prompt cache rank path fits address space")
 }
 
 /// Filesystem, catalog, and publication failures for a reusable prompt cache.
 #[derive(Debug, thiserror::Error)]
 pub enum PromptCachePersistenceError {
+    /// Exact controlled metadata construction could not be funded.
+    #[error(transparent)]
+    Metadata(#[from] eredu_nn::workspace::WorkspaceMetadataError),
+    /// The separately admitted dependency estimate was exhausted.
+    #[error("prompt-cache dependency allowance: {0}")]
+    Dependency(#[source] eredu_core::HostMetadataFundingError),
+    /// An opened metadata file exceeds its admitted input extent.
+    #[error("prompt-cache metadata input {bytes} exceeds limit {limit}")]
+    MetadataInputLimit {
+        /// Actual opened file length.
+        bytes: usize,
+        /// Selected metadata input limit.
+        limit: usize,
+    },
+    /// Metadata grew after its exact opened-handle extent was admitted.
+    #[error("prompt-cache metadata changed while reading its admitted extent")]
+    MetadataChanged,
     /// Backend-neutral manifest geometry or identity is invalid.
     #[error(transparent)]
     PromptCache(#[from] PromptCacheError),
@@ -334,18 +348,23 @@ impl PromptCachePublication {
         destination: impl AsRef<Path>,
         replace_existing: bool,
     ) -> Result<Self, PromptCachePersistenceError> {
-        let destination = destination.as_ref().to_path_buf();
-        let parent = destination
-            .parent()
-            .ok_or_else(|| {
-                PromptCachePersistenceError::InvalidPromptCachePath(destination.clone())
-            })?
-            .to_path_buf();
-        fs::create_dir_all(&parent).map_err(|source| PromptCachePersistenceError::Io {
-            action: "create prompt cache parent",
-            path: parent.clone(),
-            source,
-        })?;
+        Self::begin_with_funding(destination.as_ref(), replace_existing, None)
+    }
+    fn begin_with_funding(
+        destination: &Path,
+        replace_existing: bool,
+        funding: Option<&funded::PersistenceAccounts>,
+    ) -> Result<Self, PromptCachePersistenceError> {
+        if let Some(funding) = funding {
+            funding.path(destination)?;
+        }
+        let destination = funded::path_copy(destination, funding)?;
+        let parent = funded::path_copy(
+            destination
+                .parent()
+                .ok_or_else(|| funded::invalid_path(&destination, funding))?,
+            funding,
+        )?;
         let replacing = destination.exists();
         if replacing && !replace_existing {
             return Err(PromptCachePersistenceError::PromptCacheExists(destination));
@@ -358,57 +377,68 @@ impl PromptCachePublication {
         let file_name = destination
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                PromptCachePersistenceError::InvalidPromptCachePath(destination.clone())
-            })?;
+            .ok_or_else(|| funded::invalid_path(&destination, funding))?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let generation_name = format!("generation-{nonce}");
-        let (generations, staging, publication_root) = if replacing {
-            let generations = destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
-            fs::create_dir_all(&generations).map_err(|source| PromptCachePersistenceError::Io {
-                action: "create prompt cache generation directory",
-                path: generations.clone(),
-                source,
-            })?;
-            let staging = generations.join(format!(".tmp-{nonce}"));
-            fs::create_dir(&staging).map_err(|source| PromptCachePersistenceError::Io {
-                action: "create temporary prompt cache",
-                path: staging.clone(),
-                source,
-            })?;
-            (generations, staging, None)
+        let generation_name = funded::text(format_args!("generation-{nonce}"), funding)?;
+        // All path constructors finish before the first filesystem mutation.
+        let publication_root = if replacing {
+            None
         } else {
-            let publication_root = parent.join(format!(".{file_name}.tmp-{nonce}"));
-            fs::create_dir(&publication_root).map_err(|source| {
-                PromptCachePersistenceError::Io {
-                    action: "create temporary prompt cache root",
-                    path: publication_root.clone(),
-                    source,
-                }
-            })?;
-            let generations = publication_root.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
-            if let Err(source) = fs::create_dir(&generations) {
-                let _ = fs::remove_dir_all(&publication_root);
-                return Err(PromptCachePersistenceError::Io {
-                    action: "create prompt cache generation directory",
-                    path: generations,
-                    source,
-                });
-            }
-            let staging = generations.join(&generation_name);
-            if let Err(source) = fs::create_dir(&staging) {
-                let _ = fs::remove_dir_all(&publication_root);
-                return Err(PromptCachePersistenceError::Io {
-                    action: "create temporary prompt cache",
-                    path: staging,
-                    source,
-                });
-            }
-            (generations, staging, Some(publication_root))
+            Some(funded::path_join(
+                &parent,
+                funded::text(format_args!(".{file_name}.tmp-{nonce}"), funding)?,
+                funding,
+            )?)
         };
+        let root = publication_root.as_deref().unwrap_or(&destination);
+        let generations = funded::path_join(root, PROMPT_CACHE_GENERATIONS_DIRECTORY, funding)?;
+        let staging = if replacing {
+            funded::path_join(
+                &generations,
+                funded::text(format_args!(".tmp-{nonce}"), funding)?,
+                funding,
+            )?
+        } else {
+            funded::path_join(&generations, &generation_name, funding)?
+        };
+        fs::create_dir_all(&parent).map_err(|source| {
+            funded::io_error("create prompt cache parent", &parent, source, funding)
+        })?;
+        if let Some(root) = &publication_root {
+            fs::create_dir(root).map_err(|source| {
+                funded::io_error("create temporary prompt cache root", root, source, funding)
+            })?;
+        }
+        let generations_result = if replacing {
+            fs::create_dir_all(&generations)
+        } else {
+            fs::create_dir(&generations)
+        };
+        if let Err(source) = generations_result {
+            if let Some(root) = &publication_root {
+                let _ = fs::remove_dir_all(root);
+            }
+            return Err(funded::io_error(
+                "create prompt cache generation directory",
+                &generations,
+                source,
+                funding,
+            ));
+        }
+        if let Err(source) = fs::create_dir(&staging) {
+            if let Some(root) = &publication_root {
+                let _ = fs::remove_dir_all(root);
+            }
+            return Err(funded::io_error(
+                "create temporary prompt cache",
+                &staging,
+                source,
+                funding,
+            ));
+        }
         Ok(Self {
             destination,
             parent,
@@ -428,40 +458,53 @@ impl PromptCachePublication {
     }
 
     /// Writes the manifest, validates every shard, and atomically publishes the cache.
-    pub fn commit(
+    pub fn commit(self, manifest: &PromptCacheManifest) -> Result<(), PromptCachePersistenceError> {
+        self.commit_with_funding(manifest, None)
+    }
+    fn commit_with_funding(
         mut self,
         manifest: &PromptCacheManifest,
+        funding: Option<&funded::PersistenceAccounts>,
     ) -> Result<(), PromptCachePersistenceError> {
-        let manifest_path = self.staging.join("manifest.json");
-        let file =
-            File::create(&manifest_path).map_err(|source| PromptCachePersistenceError::Io {
-                action: "create prompt cache manifest",
-                path: manifest_path.clone(),
+        if let Some(funding) = funding {
+            funding.path(&self.staging)?;
+            funding.estimate(funded::source_bytes(manifest)?)?;
+            funding.buffer(8192)?;
+        }
+        let manifest_path = funded::path_join(&self.staging, "manifest.json", funding)?;
+        let file = File::create(&manifest_path).map_err(|source| {
+            funded::io_error(
+                "create prompt cache manifest",
+                &manifest_path,
                 source,
-            })?;
-        let mut writer = BufWriter::new(file);
+                funding,
+            )
+        })?;
+        let mut writer = BufWriter::with_capacity(8192, file);
         serde_json::to_writer_pretty(&mut writer, manifest)
             .map_err(PromptCachePersistenceError::ManifestJson)?;
-        writer
-            .write_all(b"\n")
-            .map_err(|source| PromptCachePersistenceError::Io {
-                action: "write prompt cache manifest",
-                path: manifest_path.clone(),
+        writer.write_all(b"\n").map_err(|source| {
+            funded::io_error(
+                "write prompt cache manifest",
+                &manifest_path,
                 source,
-            })?;
-        writer
-            .flush()
-            .map_err(|source| PromptCachePersistenceError::Io {
-                action: "flush prompt cache manifest",
-                path: manifest_path.clone(),
+                funding,
+            )
+        })?;
+        writer.flush().map_err(|source| {
+            funded::io_error(
+                "flush prompt cache manifest",
+                &manifest_path,
                 source,
-            })?;
-        sync_file(&manifest_path)?;
-        validate_prompt_cache_manifest(&self.staging, manifest)?;
-        sync_directory(&self.staging)?;
+                funding,
+            )
+        })?;
+        sync_file_with_funding(&manifest_path, funding)?;
+        validate_prompt_cache_manifest_with_funding(&self.staging, manifest, funding)?;
+        sync_directory_with_funding(&self.staging, funding)?;
 
         if self.replacing {
-            let generation = self.generations.join(&self.generation_name);
+            let generation = funded::path_join(&self.generations, &self.generation_name, funding)?;
             durable_rename(&self.staging, &generation, false).map_err(|source| {
                 PromptCachePersistenceError::Io {
                     action: "publish prompt cache generation",
@@ -469,24 +512,32 @@ impl PromptCachePublication {
                     source,
                 }
             })?;
-            sync_directory(&self.generations)?;
-            publish_generation_pointer(&self.destination, &self.generation_name, self.nonce)?;
+            sync_directory_with_funding(&self.generations, funding)?;
+            publish_generation_pointer(
+                &self.destination,
+                &self.generation_name,
+                self.nonce,
+                funding,
+            )?;
+            sync_directory_with_funding(&self.destination, funding)?;
         } else {
-            sync_directory(&self.generations)?;
+            sync_directory_with_funding(&self.generations, funding)?;
             let publication_root = self
                 .publication_root
                 .as_ref()
                 .expect("new prompt-cache publication owns a staging root");
-            publish_generation_pointer(publication_root, &self.generation_name, self.nonce)?;
+            publish_generation_pointer(
+                publication_root,
+                &self.generation_name,
+                self.nonce,
+                funding,
+            )?;
+            sync_directory_with_funding(publication_root, funding)?;
             durable_rename(publication_root, &self.destination, false).map_err(|source| {
-                PromptCachePersistenceError::Io {
-                    action: "publish prompt cache",
-                    path: self.destination.clone(),
-                    source,
-                }
+                funded::io_error("publish prompt cache", &self.destination, source, funding)
             })?;
         }
-        sync_directory(&self.parent)?;
+        sync_directory_with_funding(&self.parent, funding)?;
         self.committed = true;
         Ok(())
     }
@@ -520,6 +571,8 @@ pub struct ReversiblePromptCachePublication {
     published: bool,
     committed: bool,
     nonce: u128,
+    funding: Option<funded::PersistenceAccounts>,
+    rollback_funding: Option<funded::PersistenceAccounts>,
 }
 
 impl ReversiblePromptCachePublication {
@@ -528,18 +581,23 @@ impl ReversiblePromptCachePublication {
         destination: impl AsRef<Path>,
         replace_existing: bool,
     ) -> Result<Self, PromptCachePersistenceError> {
-        let destination = destination.as_ref().to_path_buf();
-        let parent = destination
-            .parent()
-            .ok_or_else(|| {
-                PromptCachePersistenceError::InvalidPromptCachePath(destination.clone())
-            })?
-            .to_path_buf();
-        fs::create_dir_all(&parent).map_err(|source| PromptCachePersistenceError::Io {
-            action: "create reversible prompt cache parent",
-            path: parent.clone(),
-            source,
-        })?;
+        Self::begin_with_funding(destination.as_ref(), replace_existing, None)
+    }
+    fn begin_with_funding(
+        destination: &Path,
+        replace_existing: bool,
+        funding: Option<&funded::PersistenceAccounts>,
+    ) -> Result<Self, PromptCachePersistenceError> {
+        if let Some(funding) = funding {
+            funding.path(destination)?;
+        }
+        let destination = funded::path_copy(destination, funding)?;
+        let parent = funded::path_copy(
+            destination
+                .parent()
+                .ok_or_else(|| funded::invalid_path(&destination, funding))?,
+            funding,
+        )?;
         if destination.exists() && !replace_existing {
             return Err(PromptCachePersistenceError::PromptCacheExists(destination));
         }
@@ -551,22 +609,40 @@ impl ReversiblePromptCachePublication {
         let file_name = destination
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                PromptCachePersistenceError::InvalidPromptCachePath(destination.clone())
-            })?;
+            .ok_or_else(|| funded::invalid_path(&destination, funding))?;
         let publication_id = NEXT_REVERSIBLE_CACHE_PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
             ^ u128::from(publication_id);
-        let staging = parent.join(format!(
-            ".{file_name}.transaction-p{:08x}-{nonce:032x}",
-            std::process::id()
-        ));
+        let staging = funded::path_join(
+            &parent,
+            funded::text(
+                format_args!(
+                    ".{file_name}.transaction-p{:08x}-{nonce:032x}",
+                    std::process::id()
+                ),
+                funding,
+            )?,
+            funding,
+        )?;
         if staging.exists() {
             return Err(PromptCachePersistenceError::InvalidPromptCachePath(staging));
         }
+        let rollback_funding = funding
+            .map(|funding| {
+                funding.prepare_rollback(&destination, &parent, &staging, false, None, nonce)
+            })
+            .transpose()?;
+        fs::create_dir_all(&parent).map_err(|source| {
+            funded::io_error(
+                "create reversible prompt cache parent",
+                &parent,
+                source,
+                funding,
+            )
+        })?;
         Ok(Self {
             destination,
             parent,
@@ -577,6 +653,8 @@ impl ReversiblePromptCachePublication {
             published: false,
             committed: false,
             nonce,
+            funding: funding.cloned(),
+            rollback_funding,
         })
     }
 
@@ -587,72 +665,123 @@ impl ReversiblePromptCachePublication {
 
     /// Makes the prepared cache visible while retaining an exact rollback path.
     pub fn publish(&mut self) -> Result<(), PromptCachePersistenceError> {
+        self.publish_with_funding(None)
+    }
+    fn publish_with_funding(
+        &mut self,
+        funding: Option<&funded::PersistenceAccounts>,
+    ) -> Result<(), PromptCachePersistenceError> {
+        if let Some(funding) = funding {
+            funding.path(&self.destination)?;
+        }
         if self.published || self.moved_generation.is_some() {
             return Err(PromptCachePersistenceError::InvalidReversiblePublication(
                 "publication was already attempted",
             ));
         }
-        inspect_prompt_cache(&self.staging)?;
+        inspect_prompt_cache_with_funding(&self.staging, funding)?;
         if !self.destination.exists() {
+            self.rollback_funding = funding
+                .map(|funding| {
+                    funding.prepare_rollback(
+                        &self.destination,
+                        &self.parent,
+                        &self.staging,
+                        false,
+                        None,
+                        self.nonce,
+                    )
+                })
+                .transpose()?;
             durable_rename(&self.staging, &self.destination, false).map_err(|source| {
-                PromptCachePersistenceError::Io {
-                    action: "publish prepared prompt cache",
-                    path: self.destination.clone(),
+                funded::io_error(
+                    "publish prepared prompt cache",
+                    &self.destination,
                     source,
-                }
+                    funding,
+                )
             })?;
-            sync_directory(&self.parent)?;
             self.published = true;
+            sync_directory_with_funding(&self.parent, funding)?;
             return Ok(());
         }
         if !self.replace_existing {
             return Err(PromptCachePersistenceError::PromptCacheExists(
-                self.destination.clone(),
+                funded::path_copy(&self.destination, funding)?,
             ));
         }
 
-        let previous = resolve_prompt_cache_root(&self.destination)?;
+        let previous = resolve_prompt_cache_root_with_funding(&self.destination, funding)?;
         let previous_generation = previous
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
-                PromptCachePersistenceError::MalformedStorage(
-                    "active prompt-cache generation has no safe name".into(),
+                funded::storage_error(
+                    format_args!("active prompt-cache generation has no safe name"),
+                    funding,
                 )
-            })?
-            .to_owned();
-        let staged = resolve_prompt_cache_root(&self.staging)?;
+            })?;
+        let previous_generation = funded::text(format_args!("{previous_generation}"), funding)?;
+        let staged = resolve_prompt_cache_root_with_funding(&self.staging, funding)?;
         let generation_name = staged
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
-                PromptCachePersistenceError::MalformedStorage(
-                    "prepared prompt-cache generation has no safe name".into(),
+                funded::storage_error(
+                    format_args!("prepared prompt-cache generation has no safe name"),
+                    funding,
                 )
-            })?
-            .to_owned();
-        let generations = self.destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
-        let target = generations.join(&generation_name);
+            })?;
+        let generation_name = funded::text(format_args!("{generation_name}"), funding)?;
+        let generations = funded::path_join(
+            &self.destination,
+            PROMPT_CACHE_GENERATIONS_DIRECTORY,
+            funding,
+        )?;
+        let target = funded::path_join(&generations, &generation_name, funding)?;
         if target.exists() {
             return Err(PromptCachePersistenceError::InvalidPromptCachePath(target));
         }
+        self.rollback_funding = funding
+            .map(|funding| {
+                funding.prepare_rollback(
+                    &self.destination,
+                    &self.parent,
+                    &self.staging,
+                    true,
+                    Some(&target),
+                    self.nonce,
+                )
+            })
+            .transpose()?;
         durable_rename(&staged, &target, false).map_err(|source| {
-            PromptCachePersistenceError::Io {
-                action: "install prepared prompt cache generation",
-                path: target.clone(),
+            funded::io_error(
+                "install prepared prompt cache generation",
+                &target,
                 source,
-            }
+                funding,
+            )
         })?;
         self.previous_generation = Some(previous_generation);
         self.moved_generation = Some(target);
-        sync_directory(&generations)?;
-        publish_generation_pointer(&self.destination, &generation_name, self.nonce)?;
+        sync_directory_with_funding(&generations, funding)?;
+        publish_generation_pointer(&self.destination, &generation_name, self.nonce, funding)?;
         self.published = true;
+        sync_directory_with_funding(&self.destination, funding)?;
         Ok(())
     }
 
     /// Accepts the visible cache and releases rollback metadata.
     pub fn commit(mut self) -> Result<(), PromptCachePersistenceError> {
+        let retained = self
+            .rollback_funding
+            .as_ref()
+            .or(self.funding.as_ref())
+            .cloned();
+        let funding = retained.as_ref();
+        if let Some(funding) = funding {
+            funding.path(&self.staging)?;
+        }
         if !self.published {
             return Err(PromptCachePersistenceError::InvalidReversiblePublication(
                 "an unpublished cache cannot commit",
@@ -660,11 +789,12 @@ impl ReversiblePromptCachePublication {
         }
         if self.staging.exists() {
             fs::remove_dir_all(&self.staging).map_err(|source| {
-                PromptCachePersistenceError::Io {
-                    action: "remove committed prompt cache staging directory",
-                    path: self.staging.clone(),
+                funded::io_error(
+                    "remove committed prompt cache staging directory",
+                    &self.staging,
                     source,
-                }
+                    funding,
+                )
             })?;
         }
         self.committed = true;
@@ -679,20 +809,36 @@ impl ReversiblePromptCachePublication {
     }
 
     fn rollback_inner(&mut self) -> Result<(), PromptCachePersistenceError> {
+        let retained = self
+            .rollback_funding
+            .as_ref()
+            .or(self.funding.as_ref())
+            .cloned();
+        let funding = retained.as_ref();
+        if let Some(funding) = funding {
+            funding.path(&self.destination)?;
+        }
         if self.published {
             match self.previous_generation.as_deref() {
                 Some(previous) => {
-                    publish_generation_pointer(&self.destination, previous, self.nonce ^ 1)?;
+                    publish_generation_pointer(
+                        &self.destination,
+                        previous,
+                        self.nonce ^ 1,
+                        funding,
+                    )?;
+                    sync_directory_with_funding(&self.destination, funding)?;
                 }
                 None if self.destination.exists() => {
                     fs::remove_dir_all(&self.destination).map_err(|source| {
-                        PromptCachePersistenceError::Io {
-                            action: "remove rolled-back prompt cache",
-                            path: self.destination.clone(),
+                        funded::io_error(
+                            "remove rolled-back prompt cache",
+                            &self.destination,
                             source,
-                        }
+                            funding,
+                        )
                     })?;
-                    sync_directory(&self.parent)?;
+                    sync_directory_with_funding(&self.parent, funding)?;
                 }
                 None => {}
             }
@@ -700,24 +846,26 @@ impl ReversiblePromptCachePublication {
         if let Some(generation) = self.moved_generation.take() {
             if generation.exists() {
                 fs::remove_dir_all(&generation).map_err(|source| {
-                    PromptCachePersistenceError::Io {
-                        action: "remove rolled-back prompt cache generation",
-                        path: generation.clone(),
+                    funded::io_error(
+                        "remove rolled-back prompt cache generation",
+                        &generation,
                         source,
-                    }
+                        funding,
+                    )
                 })?;
                 if let Some(parent) = generation.parent() {
-                    sync_directory(parent)?;
+                    sync_directory_with_funding(parent, funding)?;
                 }
             }
         }
         if self.staging.exists() {
             fs::remove_dir_all(&self.staging).map_err(|source| {
-                PromptCachePersistenceError::Io {
-                    action: "remove rolled-back prompt cache staging directory",
-                    path: self.staging.clone(),
+                funded::io_error(
+                    "remove rolled-back prompt cache staging directory",
+                    &self.staging,
                     source,
-                }
+                    funding,
+                )
             })?;
         }
         Ok(())
@@ -736,63 +884,80 @@ impl Drop for ReversiblePromptCachePublication {
 pub fn inspect_prompt_cache(
     directory: impl AsRef<Path>,
 ) -> Result<PromptCacheManifest, PromptCachePersistenceError> {
-    let directory = resolve_prompt_cache_root(directory.as_ref())?;
-    let manifest_path = directory.join("manifest.json");
-    let reader = BufReader::new(File::open(&manifest_path).map_err(|source| {
-        PromptCachePersistenceError::Io {
-            action: "open prompt cache manifest",
-            path: manifest_path.clone(),
-            source,
-        }
-    })?);
+    inspect_prompt_cache_with_funding(directory.as_ref(), None)
+}
+fn inspect_prompt_cache_with_funding(
+    directory: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<PromptCacheManifest, PromptCachePersistenceError> {
+    let directory = resolve_prompt_cache_root_with_funding(directory, funding)?;
+    if let Some(funding) = funding {
+        funding.path(&directory)?;
+    }
+    let manifest_path = funded::path_join(&directory, "manifest.json", funding)?;
+    let input = funded::read_bounded(&manifest_path, funding.map(|f| f.manifest_limit), funding)?;
     let value: serde_json::Value =
-        serde_json::from_reader(reader).map_err(PromptCachePersistenceError::ManifestJson)?;
+        serde_json::from_slice(&input).map_err(PromptCachePersistenceError::ManifestJson)?;
     let schema_version = value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
         .ok_or_else(|| {
-            PromptCachePersistenceError::PromptCache(PromptCacheError::Malformed(
-                "prompt-cache schema_version is missing or is not a u32".into(),
-            ))
+            match funded::text(
+                format_args!("prompt-cache schema_version is missing or is not a u32"),
+                funding,
+            ) {
+                Ok(message) => {
+                    PromptCachePersistenceError::PromptCache(PromptCacheError::Malformed(message))
+                }
+                Err(error) => error,
+            }
         })?;
     if schema_version != PROMPT_CACHE_SCHEMA_VERSION {
         return Err(PromptCacheError::UnsupportedSchema(schema_version).into());
     }
     let manifest =
         serde_json::from_value(value).map_err(PromptCachePersistenceError::ManifestJson)?;
-    validate_prompt_cache_manifest(&directory, &manifest)?;
+    validate_prompt_cache_manifest_with_funding(&directory, &manifest, funding)?;
     Ok(manifest)
 }
 
 /// Resolves the active immutable generation selected by the durable pointer.
 pub fn resolve_prompt_cache_root(directory: &Path) -> Result<PathBuf, PromptCachePersistenceError> {
-    let current_path = directory.join(PROMPT_CACHE_CURRENT_FILE);
-    let metadata = current_path.metadata().map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            PromptCachePersistenceError::MalformedStorage(
-                "prompt-cache generation pointer CURRENT is missing".into(),
-            )
-        } else {
-            PromptCachePersistenceError::Io {
-                action: "stat prompt cache generation pointer",
-                path: current_path.clone(),
-                source,
+    resolve_prompt_cache_root_with_funding(directory, None)
+}
+fn resolve_prompt_cache_root_with_funding(
+    directory: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<PathBuf, PromptCachePersistenceError> {
+    if let Some(funding) = funding {
+        funding.path(directory)?;
+    }
+    let current_path = funded::path_join(&directory, PROMPT_CACHE_CURRENT_FILE, funding)?;
+    let bytes =
+        funded::read_bounded(&current_path, Some(256), funding).map_err(|error| match error {
+            PromptCachePersistenceError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                funded::storage_error(
+                    format_args!("prompt-cache generation pointer CURRENT is missing"),
+                    funding,
+                )
             }
-        }
-    })?;
-    let length = metadata.len();
-    if length == 0 || length > 256 {
-        return Err(PromptCachePersistenceError::MalformedStorage(
-            "prompt-cache generation pointer has an invalid length".into(),
+            other => other,
+        })?;
+    if bytes.is_empty() {
+        return Err(funded::storage_error(
+            format_args!("prompt-cache generation pointer has an invalid length"),
+            funding,
         ));
     }
-    let generation =
-        fs::read_to_string(&current_path).map_err(|source| PromptCachePersistenceError::Io {
-            action: "read prompt cache generation pointer",
-            path: current_path.clone(),
-            source,
-        })?;
+    let generation = std::str::from_utf8(&bytes).map_err(|_| {
+        funded::storage_error(
+            format_args!("prompt-cache generation pointer is not UTF-8"),
+            funding,
+        )
+    })?;
     let generation = generation.trim();
     let generation_path = Path::new(generation);
     if generation.is_empty()
@@ -801,17 +966,21 @@ pub fn resolve_prompt_cache_root(directory: &Path) -> Result<PathBuf, PromptCach
             .any(|component| !matches!(component, Component::Normal(_)))
         || generation_path.components().count() != 1
     {
-        return Err(PromptCachePersistenceError::MalformedStorage(
-            "prompt-cache generation pointer is unsafe".into(),
+        return Err(funded::storage_error(
+            format_args!("prompt-cache generation pointer is unsafe"),
+            funding,
         ));
     }
-    let root = directory
-        .join(PROMPT_CACHE_GENERATIONS_DIRECTORY)
-        .join(generation_path);
+    let root = funded::path_join(
+        &funded::path_join(directory, PROMPT_CACHE_GENERATIONS_DIRECTORY, funding)?,
+        generation_path,
+        funding,
+    )?;
     if !root.is_dir() {
-        return Err(PromptCachePersistenceError::MalformedStorage(format!(
-            "prompt-cache generation {generation:?} is missing"
-        )));
+        return Err(funded::storage_error(
+            format_args!("prompt-cache generation {generation:?} is missing"),
+            funding,
+        ));
     }
     Ok(root)
 }
@@ -821,20 +990,38 @@ pub fn validate_prompt_cache_manifest(
     directory: &Path,
     manifest: &PromptCacheManifest,
 ) -> Result<(), PromptCachePersistenceError> {
+    validate_prompt_cache_manifest_with_funding(directory, manifest, None)
+}
+fn validate_prompt_cache_manifest_with_funding(
+    directory: &Path,
+    manifest: &PromptCacheManifest,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<(), PromptCachePersistenceError> {
+    if let Some(funding) = funding {
+        funding.estimate(funded::source_bytes(manifest)?)?;
+    }
     manifest.validate()?;
     for block in &manifest.blocks {
-        let shard = safe_prompt_cache_shard_path(directory, &block.shard)?;
+        if let Some(funding) = funding {
+            funding.path(directory)?;
+            funding.estimate(block.shard.len())?;
+        }
+        let shard = safe_prompt_cache_shard_path_with_funding(directory, &block.shard, funding)?;
         if !shard.is_file() {
             return Err(PromptCachePersistenceError::MissingShard(shard));
         }
-        validate_block_shard(&shard, block)?;
+        validate_block_shard(&shard, block, funding)?;
     }
     for state in &manifest.state_tensors {
-        let shard = safe_prompt_cache_shard_path(directory, &state.shard)?;
+        if let Some(funding) = funding {
+            funding.path(directory)?;
+            funding.estimate(state.shard.len())?;
+        }
+        let shard = safe_prompt_cache_shard_path_with_funding(directory, &state.shard, funding)?;
         if !shard.is_file() {
             return Err(PromptCachePersistenceError::MissingShard(shard));
         }
-        validate_state_shard(&shard, state)?;
+        validate_state_shard(&shard, state, funding)?;
     }
     Ok(())
 }
@@ -844,34 +1031,46 @@ pub fn safe_prompt_cache_shard_path(
     directory: &Path,
     relative: &str,
 ) -> Result<PathBuf, PromptCachePersistenceError> {
+    safe_prompt_cache_shard_path_with_funding(directory, relative, None)
+}
+fn safe_prompt_cache_shard_path_with_funding(
+    directory: &Path,
+    relative: &str,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<PathBuf, PromptCachePersistenceError> {
     let path = Path::new(relative);
     if path.is_absolute()
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err(PromptCachePersistenceError::UnsafeShardPath(
-            relative.into(),
-        ));
+        return Err(PromptCachePersistenceError::UnsafeShardPath(funded::text(
+            format_args!("{relative}"),
+            funding,
+        )?));
     }
-    let joined = directory.join(path);
+    let joined = funded::path_join(directory, path, funding)?;
     if joined.exists() {
-        let root =
-            fs::canonicalize(directory).map_err(|source| PromptCachePersistenceError::Io {
-                action: "canonicalize prompt cache directory",
-                path: directory.to_path_buf(),
+        if let Some(funding) = funding {
+            funding.path(directory)?;
+            funding.path(&joined)?;
+        }
+        let root = fs::canonicalize(directory).map_err(|source| {
+            funded::io_error(
+                "canonicalize prompt cache directory",
+                &directory,
                 source,
-            })?;
-        let canonical =
-            fs::canonicalize(&joined).map_err(|source| PromptCachePersistenceError::Io {
-                action: "canonicalize prompt cache shard",
-                path: joined.clone(),
-                source,
-            })?;
+                funding,
+            )
+        })?;
+        let canonical = fs::canonicalize(&joined).map_err(|source| {
+            funded::io_error("canonicalize prompt cache shard", &joined, source, funding)
+        })?;
         if !canonical.starts_with(&root) {
-            return Err(PromptCachePersistenceError::UnsafeShardPath(
-                relative.into(),
-            ));
+            return Err(PromptCachePersistenceError::UnsafeShardPath(funded::text(
+                format_args!("{relative}"),
+                funding,
+            )?));
         }
     }
     Ok(joined)
@@ -885,28 +1084,37 @@ pub fn finalize_prompt_cache_shard(path: &Path) -> Result<String, PromptCachePer
 
 /// Hashes the safetensors payload bytes, excluding its bounded metadata header.
 pub fn hash_prompt_cache_shard_payload(path: &Path) -> Result<String, PromptCachePersistenceError> {
-    let (_, _, data_start) = read_shard_metadata(path)?;
-    let mut file = File::open(path).map_err(|source| PromptCachePersistenceError::Io {
-        action: "open prompt cache shard payload",
-        path: path.to_path_buf(),
-        source,
+    hash_prompt_cache_shard_payload_with_funding(path, None)
+}
+fn hash_prompt_cache_shard_payload_with_funding(
+    path: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<String, PromptCachePersistenceError> {
+    let (_, _, data_start) = read_shard_metadata_with_funding(path, funding)?;
+    let mut file = File::open(path).map_err(|source| {
+        funded::io_error("open prompt cache shard payload", &path, source, funding)
     })?;
-    file.seek(SeekFrom::Start(data_start))
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "seek prompt cache shard payload",
-            path: path.to_path_buf(),
-            source,
-        })?;
+    hash_shard_payload_from(&mut file, path, data_start, funding)
+}
+fn hash_shard_payload_from(
+    file: &mut File,
+    path: &Path,
+    data_start: u64,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<String, PromptCachePersistenceError> {
+    if let Some(funding) = funding {
+        funding.buffer(64 * 1024)?;
+        funding.buffer(64)?;
+    }
+    file.seek(SeekFrom::Start(data_start)).map_err(|source| {
+        funded::io_error("seek prompt cache shard payload", &path, source, funding)
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| PromptCachePersistenceError::Io {
-                action: "hash prompt cache shard payload",
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let read = file.read(&mut buffer).map_err(|source| {
+            funded::io_error("hash prompt cache shard payload", &path, source, funding)
+        })?;
         if read == 0 {
             break;
         }
@@ -918,13 +1126,15 @@ pub fn hash_prompt_cache_shard_payload(path: &Path) -> Result<String, PromptCach
 fn validate_block_shard(
     path: &Path,
     block: &PromptCacheBlock,
+    funding: Option<&funded::PersistenceAccounts>,
 ) -> Result<(), PromptCachePersistenceError> {
-    let (metadata, file_len, data_start) = read_shard_metadata(path)?;
+    let (metadata, file_len, data_start) = read_shard_metadata_with_funding(path, funding)?;
     let entries = metadata.tensors();
     if entries.len() != 2 {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            format!("expected two arrays, found {}", entries.len()),
+            format_args!("expected two arrays, found {}", entries.len()),
+            funding,
         ));
     }
     let mut logical_bytes = 0u64;
@@ -938,69 +1148,95 @@ fn validate_block_shard(
     ] {
         let tensor = metadata
             .info(name)
-            .ok_or_else(|| malformed(path, format!("missing array {name}")))?;
-        let shape = tensor
-            .shape
-            .iter()
-            .map(|dimension| i32::try_from(*dimension))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| malformed(path, "array dimension exceeds runtime range"))?;
-        if &shape != expected_shape || stored_dtype_name(tensor.dtype) != *expected_dtype {
-            return Err(malformed(
+            .ok_or_else(|| malformed_funded(path, format_args!("missing array {name}"), funding))?;
+        let shape_matches = tensor.shape.len() == expected_shape.len()
+            && tensor
+                .shape
+                .iter()
+                .zip(expected_shape)
+                .all(|(actual, expected)| i32::try_from(*actual).ok() == Some(*expected));
+        if !shape_matches || !stored_dtype_matches(tensor.dtype, expected_dtype) {
+            return Err(malformed_funded(
                 path,
-                format!("array {name} shape or dtype does not match the manifest"),
+                format_args!("array {name} shape or dtype does not match the manifest"),
+                funding,
             ));
         }
-        logical_bytes = logical_bytes.saturating_add(
-            u64::try_from(tensor.data_offsets.1.saturating_sub(tensor.data_offsets.0))
-                .unwrap_or(u64::MAX),
-        );
+        let bytes = tensor
+            .data_offsets
+            .1
+            .checked_sub(tensor.data_offsets.0)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| {
+                malformed_funded(path, format_args!("array byte span overflow"), funding)
+            })?;
+        logical_bytes = logical_bytes.checked_add(bytes).ok_or_else(|| {
+            malformed_funded(path, format_args!("logical byte count overflow"), funding)
+        })?;
     }
     if logical_bytes != block.logical_bytes {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            format!(
+            format_args!(
                 "logical byte count {logical_bytes} does not match manifest value {}",
                 block.logical_bytes
             ),
+            funding,
         ));
     }
-    validate_file_boundary(path, &metadata, file_len, data_start)
+    validate_file_boundary(path, &metadata, file_len, data_start, funding)
 }
 
 fn validate_state_shard(
     path: &Path,
     state: &PromptCacheStateTensor,
+    funding: Option<&funded::PersistenceAccounts>,
 ) -> Result<(), PromptCachePersistenceError> {
-    let (metadata, file_len, data_start) = read_shard_metadata(path)?;
+    let (metadata, file_len, data_start) = read_shard_metadata_with_funding(path, funding)?;
     let entries = metadata.tensors();
     if entries.len() != 1 {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            format!("expected one state array, found {}", entries.len()),
+            format_args!("expected one state array, found {}", entries.len()),
+            funding,
         ));
     }
-    let tensor = metadata
-        .info(&state.array)
-        .ok_or_else(|| malformed(path, format!("missing state array {}", state.array)))?;
-    let shape = tensor
-        .shape
-        .iter()
-        .map(|dimension| i32::try_from(*dimension))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| malformed(path, "state array dimension exceeds runtime range"))?;
-    let logical_bytes = u64::try_from(tensor.data_offsets.1.saturating_sub(tensor.data_offsets.0))
-        .unwrap_or(u64::MAX);
-    if shape != state.shape
-        || stored_dtype_name(tensor.dtype) != state.dtype
+    let tensor = metadata.info(&state.array).ok_or_else(|| {
+        malformed_funded(
+            path,
+            format_args!("missing state array {}", state.array),
+            funding,
+        )
+    })?;
+    let shape_matches = tensor.shape.len() == state.shape.len()
+        && tensor
+            .shape
+            .iter()
+            .zip(&state.shape)
+            .all(|(actual, expected)| i32::try_from(*actual).ok() == Some(*expected));
+    let logical_bytes = tensor
+        .data_offsets
+        .1
+        .checked_sub(tensor.data_offsets.0)
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| {
+            malformed_funded(
+                path,
+                format_args!("state array byte span overflow"),
+                funding,
+            )
+        })?;
+    if !shape_matches
+        || !stored_dtype_matches(tensor.dtype, &state.dtype)
         || logical_bytes != state.logical_bytes
     {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            "state array shape, dtype, or byte count does not match the manifest",
+            format_args!("state array shape, dtype, or byte count does not match the manifest"),
+            funding,
         ));
     }
-    validate_file_boundary(path, &metadata, file_len, data_start)
+    validate_file_boundary(path, &metadata, file_len, data_start, funding)
 }
 
 fn validate_file_boundary(
@@ -1008,16 +1244,30 @@ fn validate_file_boundary(
     metadata: &safetensors::tensor::Metadata,
     file_len: u64,
     data_start: u64,
+    funding: Option<&funded::PersistenceAccounts>,
 ) -> Result<(), PromptCachePersistenceError> {
     let expected_file_len = data_start
-        .checked_add(metadata.data_len() as u64)
-        .ok_or_else(|| malformed(path, "safetensors file length overflow"))?;
+        .checked_add(u64::try_from(metadata.data_len()).map_err(|_| {
+            malformed_funded(
+                path,
+                format_args!("safetensors data length overflow"),
+                funding,
+            )
+        })?)
+        .ok_or_else(|| {
+            malformed_funded(
+                path,
+                format_args!("safetensors file length overflow"),
+                funding,
+            )
+        })?;
     if expected_file_len != file_len {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            format!(
+            format_args!(
                 "safetensors payload boundary {expected_file_len} does not match file length {file_len}"
             ),
+            funding,
         ));
     }
     Ok(())
@@ -1026,64 +1276,127 @@ fn validate_file_boundary(
 fn read_shard_metadata(
     path: &Path,
 ) -> Result<(safetensors::tensor::Metadata, u64, u64), PromptCachePersistenceError> {
-    let mut file = File::open(path).map_err(|source| PromptCachePersistenceError::Io {
-        action: "open prompt cache shard metadata",
-        path: path.to_path_buf(),
-        source,
+    read_shard_metadata_with_funding(path, None)
+}
+fn read_shard_metadata_with_funding(
+    path: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<(safetensors::tensor::Metadata, u64, u64), PromptCachePersistenceError> {
+    if let Some(funding) = funding {
+        funding.path(path)?;
+    }
+    let mut file = File::open(path).map_err(|source| {
+        funded::io_error("open prompt cache shard metadata", &path, source, funding)
+    })?;
+    let (metadata, header, file_len) = read_shard_metadata_from(&mut file, path, funding)?;
+    Ok((
+        metadata,
+        u64::try_from(file_len).map_err(|_| {
+            PromptCachePersistenceError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Overflow,
+            )
+        })?,
+        u64::try_from(header.len()).map_err(|_| {
+            PromptCachePersistenceError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Overflow,
+            )
+        })?,
+    ))
+}
+fn read_shard_metadata_from(
+    file: &mut File,
+    path: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<(safetensors::tensor::Metadata, Vec<u8>, usize), PromptCachePersistenceError> {
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        funded::io_error("seek prompt cache shard metadata", path, source, funding)
     })?;
     let file_len = file
         .metadata()
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "stat prompt cache shard",
-            path: path.to_path_buf(),
-            source,
-        })?
+        .map_err(|source| funded::io_error("stat prompt cache shard", &path, source, funding))?
         .len();
     let mut length_bytes = [0u8; 8];
-    file.read_exact(&mut length_bytes)
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "read prompt cache shard header length",
-            path: path.to_path_buf(),
+    file.read_exact(&mut length_bytes).map_err(|source| {
+        funded::io_error(
+            "read prompt cache shard header length",
+            &path,
             source,
-        })?;
+            funding,
+        )
+    })?;
     let header_len = u64::from_le_bytes(length_bytes);
     if header_len == 0 || header_len > MAX_PROMPT_CACHE_SHARD_HEADER_BYTES {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            format!("safetensors header length {header_len} exceeds the prompt-cache bound"),
+            format_args!("safetensors header length {header_len} exceeds the prompt-cache bound"),
+            funding,
         ));
     }
-    let data_start = 8u64
-        .checked_add(header_len)
-        .ok_or_else(|| malformed(path, "safetensors header length overflow"))?;
+    let data_start = 8u64.checked_add(header_len).ok_or_else(|| {
+        malformed_funded(
+            path,
+            format_args!("safetensors header length overflow"),
+            funding,
+        )
+    })?;
     if data_start > file_len {
-        return Err(malformed(
+        return Err(malformed_funded(
             path,
-            "safetensors header extends beyond the file",
+            format_args!("safetensors header extends beyond the file"),
+            funding,
         ));
     }
-    let mut header = vec![0u8; header_len as usize];
-    file.read_exact(&mut header)
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "read prompt cache shard header",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let metadata =
-        serde_json::from_slice(&header).map_err(|error| malformed(path, error.to_string()))?;
-    Ok((metadata, file_len, data_start))
-}
-
-fn malformed(path: &Path, reason: impl Into<String>) -> PromptCachePersistenceError {
-    PromptCachePersistenceError::MalformedShard {
-        path: path.to_path_buf(),
-        reason: reason.into(),
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        PromptCachePersistenceError::Metadata(eredu_nn::workspace::WorkspaceMetadataError::Overflow)
+    })?;
+    if let Some(funding) = funding {
+        funding.buffer(header_len.checked_add(8).ok_or(
+            PromptCachePersistenceError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Overflow,
+            ),
+        )?)?;
+        funding.estimate(header_len)?;
     }
+    let total_header = header_len
+        .checked_add(8)
+        .ok_or(PromptCachePersistenceError::Metadata(
+            eredu_nn::workspace::WorkspaceMetadataError::Overflow,
+        ))?;
+    let mut header = vec![0u8; total_header];
+    header[..8].copy_from_slice(&length_bytes);
+    file.read_exact(&mut header[8..]).map_err(|source| {
+        funded::io_error("read prompt cache shard header", &path, source, funding)
+    })?;
+    let metadata = serde_json::from_slice(&header[8..])
+        .map_err(|error| malformed_funded(path, format_args!("{error}"), funding))?;
+    Ok((
+        metadata,
+        header,
+        usize::try_from(file_len).map_err(|_| {
+            PromptCachePersistenceError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Overflow,
+            )
+        })?,
+    ))
 }
 
-fn stored_dtype_name(dtype: safetensors::Dtype) -> String {
+fn malformed_funded(
+    path: &Path,
+    reason: std::fmt::Arguments<'_>,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> PromptCachePersistenceError {
+    let result = (|| {
+        Ok::<_, PromptCachePersistenceError>(PromptCachePersistenceError::MalformedShard {
+            path: funded::path_copy(path, funding)?,
+            reason: funded::text(reason, funding)?,
+        })
+    })();
+    result.unwrap_or_else(|error| error)
+}
+
+pub(super) fn stored_dtype_matches(dtype: safetensors::Dtype, expected: &str) -> bool {
     use safetensors::Dtype as Stored;
-    match dtype {
+    let name = match dtype {
         Stored::BOOL => "Bool",
         Stored::U8 => "Uint8",
         Stored::U16 => "Uint16",
@@ -1097,34 +1410,61 @@ fn stored_dtype_name(dtype: safetensors::Dtype) -> String {
         Stored::BF16 => "Bfloat16",
         Stored::F32 => "Float32",
         Stored::F64 => "Float64",
-        dtype => return format!("{dtype:?}"),
-    }
-    .into()
+        dtype => {
+            use std::fmt::Write as _;
+            struct Equal<'a>(&'a str);
+            impl std::fmt::Write for Equal<'_> {
+                fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                    self.0 = self.0.strip_prefix(value).ok_or(std::fmt::Error)?;
+                    Ok(())
+                }
+            }
+            let mut compared = Equal(expected);
+            return write!(&mut compared, "{dtype:?}").is_ok() && compared.0.is_empty();
+        }
+    };
+    name == expected
 }
 
 fn publish_generation_pointer(
     destination: &Path,
     generation_name: &str,
     nonce: u128,
+    funding: Option<&funded::PersistenceAccounts>,
 ) -> Result<(), PromptCachePersistenceError> {
-    let temporary = destination.join(format!(".{PROMPT_CACHE_CURRENT_FILE}.tmp-{nonce}"));
-    let current = destination.join(PROMPT_CACHE_CURRENT_FILE);
-    let mut file = File::create(&temporary).map_err(|source| PromptCachePersistenceError::Io {
-        action: "create prompt cache generation pointer",
-        path: temporary.clone(),
-        source,
-    })?;
-    writeln!(file, "{generation_name}").map_err(|source| PromptCachePersistenceError::Io {
-        action: "write prompt cache generation pointer",
-        path: temporary.clone(),
-        source,
-    })?;
-    file.sync_all()
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "sync prompt cache generation pointer",
-            path: temporary.clone(),
+    let temporary = funded::path_join(
+        destination,
+        funded::text(
+            format_args!(".{PROMPT_CACHE_CURRENT_FILE}.tmp-{nonce}"),
+            funding,
+        )?,
+        funding,
+    )?;
+    let current = funded::path_join(&destination, PROMPT_CACHE_CURRENT_FILE, funding)?;
+    let mut file = File::create(&temporary).map_err(|source| {
+        funded::io_error(
+            "create prompt cache generation pointer",
+            &temporary,
             source,
-        })?;
+            funding,
+        )
+    })?;
+    writeln!(file, "{generation_name}").map_err(|source| {
+        funded::io_error(
+            "write prompt cache generation pointer",
+            &temporary,
+            source,
+            funding,
+        )
+    })?;
+    file.sync_all().map_err(|source| {
+        funded::io_error(
+            "sync prompt cache generation pointer",
+            &temporary,
+            source,
+            funding,
+        )
+    })?;
     durable_rename(&temporary, &current, true).map_err(|source| {
         PromptCachePersistenceError::Io {
             action: "switch prompt cache generation",
@@ -1132,59 +1472,47 @@ fn publish_generation_pointer(
             source,
         }
     })?;
-    sync_directory(destination)
+    Ok(())
 }
 
 fn sync_file(path: &Path) -> Result<(), PromptCachePersistenceError> {
+    sync_file_with_funding(path, None)
+}
+fn sync_file_with_funding(
+    path: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<(), PromptCachePersistenceError> {
     File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "synchronize cache file",
-            path: path.to_path_buf(),
-            source,
-        })
+        .map_err(|source| funded::io_error("synchronize cache file", path, source, funding))
 }
 
+fn sync_directory(path: &Path) -> Result<(), PromptCachePersistenceError> {
+    sync_directory_with_funding(path, None)
+}
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), PromptCachePersistenceError> {
+fn sync_directory_with_funding(
+    path: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<(), PromptCachePersistenceError> {
     File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "synchronize cache directory",
-            path: path.to_path_buf(),
-            source,
-        })
+        .map_err(|source| funded::io_error("synchronize cache directory", path, source, funding))
 }
-
-#[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<(), PromptCachePersistenceError> {
+#[cfg(not(unix))]
+fn sync_directory_with_funding(
+    path: &Path,
+    funding: Option<&funded::PersistenceAccounts>,
+) -> Result<(), PromptCachePersistenceError> {
     if path.is_dir() {
         Ok(())
     } else {
-        Err(PromptCachePersistenceError::Io {
-            action: "validate cache directory before durable publication",
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "cache publication path is not a directory",
-            ),
-        })
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_directory(path: &Path) -> Result<(), PromptCachePersistenceError> {
-    if path.is_dir() {
-        Ok(())
-    } else {
-        Err(PromptCachePersistenceError::Io {
-            action: "validate cache directory before publication",
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "cache publication path is not a directory",
-            ),
-        })
+        Err(funded::io_error(
+            "validate cache directory before publication",
+            path,
+            std::io::ErrorKind::NotADirectory.into(),
+            funding,
+        ))
     }
 }
 
@@ -1220,7 +1548,7 @@ mod tests {
     use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     use std::collections::HashMap;
 
-    fn manifest(shard: &Path) -> PromptCacheManifest {
+    pub(super) fn manifest(shard: &Path) -> PromptCacheManifest {
         let bytes = [0u8; 16];
         let tensor = TensorView::new(Dtype::F32, vec![1, 1, 2, 2], &bytes).unwrap();
         serialize_to_file(
@@ -1504,4 +1832,11 @@ mod shard;
 pub use shard::{
     CacheShardError, CacheShardLayout, CacheShardMetadata, CacheShardTensor,
     cache_shard_tensor_names,
+};
+
+#[path = "persistence/persistent.rs"]
+mod persistent;
+pub use persistent::{
+    PersistentCacheBlockSource, PersistentCacheReadFailure, PersistentCacheStateTensor,
+    PreparedPersistentCacheRead,
 };

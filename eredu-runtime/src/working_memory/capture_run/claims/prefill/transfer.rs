@@ -3,6 +3,25 @@ use super::*;
 use crate::working_memory::CaptureSourceSegment;
 
 impl<'t, 'f, 'p, 'a> CapturePrefillFragmentClaim<'t, 'f, 'p, 'a> {
+    /// Consumes this fragment claim to construct its one prepaid source pin.
+    /// The canonical chunk, capture account and original host custody must all
+    /// match before the bounded source-control constructor can allocate.
+    pub fn prepare_with_original_source<'s, K: Clone + Ord + Send + Sync + 'static>(
+        self,
+        native: &'s mut WorkingMemoryFundingScope,
+        segment: &'s mut CaptureSourceSegment,
+        custody: &crate::working_memory::OriginalTextMetadataCustody,
+        source: [Option<(K, u64)>; 2],
+    ) -> Result<CapturePrefillFragmentTransfer<'t, 'f, 'p, 'a, 's, K>, CaptureRunHostError> {
+        self.validate_native_scope(native)?;
+        segment.validate_prefill_fragment(self.fragment())?;
+        segment.validate_native_scope(native)?;
+        let pin = native
+            .pool()
+            .pin_original_capture_source(native, custody, source)?;
+        self.prepare_with_segment_source(native, segment, pin)
+    }
+
     /// Bind this actual fragment to its canonical announced chunk, then borrow
     /// the existing target under the original schedule and exact native scope.
     /// An unstamped foundation segment cannot construct a transfer here.
@@ -36,10 +55,15 @@ impl<'t, 'f, 'p, 'a> CapturePrefillFragmentClaim<'t, 'f, 'p, 'a> {
         // All prior origins plus this source and the original schedule/scope
         // are revalidated atomically. Key-owned staging/drop occurs outside Usage.
         let rollback = if self.partition {
-            self.custody.bind_projected_segment_source(native, segment, &complete_source,
-                self.fragment().assembly().logical_geometry().admission())?
+            self.custody.bind_projected_segment_source(
+                native,
+                segment,
+                &complete_source,
+                self.fragment().assembly().logical_geometry().admission(),
+            )?
         } else {
-            self.custody.bind_segment_source(native, segment, &complete_source)?
+            self.custody
+                .bind_segment_source(native, segment, &complete_source)?
         };
         #[cfg(test)]
         crate::working_memory::capture_run::tests::before_transfer_allocation();
@@ -105,6 +129,14 @@ impl<'t, 'f, 'p, 'a, K: Ord + Send + 'static>
             return Err(error);
         }
         self.writer.push_f32(value)
+    }
+    /// Copies one unsigned scalar into the same fixed, source-bound destination.
+    pub fn push_u64(&mut self, value: u64) -> Result<(), CaptureRunHostError> {
+        if let Err(error) = self.validate() {
+            self.writer.slot.state = TargetState::Failed;
+            return Err(error);
+        }
+        self.writer.push_u64(value)
     }
     /// Complete one host fragment only. Typed failure drops the short loan and
     /// poisons the target, whose data remains in the frame/aborted sidecar. All

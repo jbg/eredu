@@ -152,7 +152,6 @@ mod tests {
                         host_bytes: 2000,
                         encoded_bytes: u64::MAX,
                     },
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             }
@@ -170,7 +169,6 @@ mod tests {
                 &CaptureCapabilities {
                     transformations: Vec::new(),
                     max_histogram_bins: 0,
-                    physical_native_limit: false,
                     conditions: Vec::new(),
                 },
                 CaptureInvocationBounds {

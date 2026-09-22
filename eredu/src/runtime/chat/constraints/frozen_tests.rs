@@ -1,12 +1,13 @@
 //! Source-owned compiler and controller conformance, with direct dependency
 //! parser oracles for token masks and fixed expected activation boundaries.
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use crate::runtime::chat::dialect::{
-    DECLARATIVE_DIALECT, DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope,
-    GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
+    DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope, GenerationPromptBehavior,
+    JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
 };
 use std::sync::atomic::AtomicUsize;
-use tokenizers::{AddedToken, decoders::byte_level::ByteLevel, models::bpe::BPE};
+use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
 
 const FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
     envelope: ExactEnvelope {
@@ -105,7 +106,7 @@ fn plan(
 /// contract as public preparation. Draft selection is explicit in these fixtures;
 /// public default-draft behavior has its own conformance cases.
 fn original_plan(
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
     tokenizer: &ChatTokenizer,
     eos: &[u32; 2],
     tools: &[Value],
@@ -184,7 +185,7 @@ fn original_plan(
         &template,
         &source,
         &InferenceExecutionIdentity::default(),
-        pool.effective_capacity().unwrap(),
+        crate::memory_fixture::resolved_limits(pool.payload_effective_capacity().unwrap()),
     )
     .unwrap();
     let mut tools = tools.to_vec();
@@ -241,26 +242,22 @@ fn authority(drops: &Arc<AtomicUsize>) -> HostPreparationAuthority {
 
 #[test]
 fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
-    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
-    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
+    let pool = crate::memory_fixture::host_ledger(1 << 30, 0).unwrap();
     let (tokenizer, eos) = tokenizer();
     let (prepared, compilation) =
         original_plan(&pool, &tokenizer, &eos, &ordinary_tools(), ToolChoice::Auto);
     let copied = prepared.clone();
     assert_eq!(prepared, copied);
-    assert!(
-        prepared
-            .generation_constraint()
-            .inner
-            .fixture_matcher
-            .is_none()
-    );
+    assert!(prepared
+        .generation_constraint()
+        .inner
+        .fixture_matcher
+        .is_none());
     let recipe = &copied.generation_constraint().inner.recipe;
-    assert!(
-        recipe
-            .source()
-            .same_storage(prepared.generation_constraint().inner.recipe.source())
-    );
+    assert!(recipe
+        .source()
+        .same_storage(prepared.generation_constraint().inner.recipe.source()));
     assert_eq!(copied.tool_call_trigger(), Some(r#"{"calls":"#));
     assert_eq!(
         copied
@@ -274,7 +271,10 @@ fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
     assert_eq!(recipe.trie_info(), Some(*trie.trie().info()));
     assert_eq!(trie.trie().eos_tokens(), eos);
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 30),
+        )
         .unwrap();
     let state = copied
         .generation_constraint()
@@ -301,7 +301,7 @@ fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
     fork = fork.compute_mask().unwrap();
     assert_eq!(state.token_mask(), fork.token_mask());
     drop((copied, compilation, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     state = commit_text(state, "17}}]}");
     fork = commit_text(fork, "23}}]}");
     let (next, complete) = state.is_complete().unwrap();
@@ -323,15 +323,15 @@ fn source_plan_clones_and_paid_parser_forks_retain_exact_declarations() {
     let (fork, terminal) = fork.is_terminal().unwrap();
     assert!(terminal);
     drop(state);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(fork);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn source_retains_decoder_even_when_current_spelling_map_matches() {
-    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
-    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
+    let pool = crate::memory_fixture::host_ledger(1 << 30, 0).unwrap();
     let (original, eos) = tokenizer();
     let tools = vec![tool(
         json!({"type":"object", "properties":{"value":{"const":"two words"}},
@@ -354,7 +354,10 @@ fn source_retains_decoder_even_when_current_spelling_map_matches() {
     assert_eq!(other_environment.tok_trie().token(space), "Ġ".as_bytes());
     drop((original, other_environment, other));
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 30),
+        )
         .unwrap();
     let state = prepared
         .generation_constraint()
@@ -380,7 +383,7 @@ fn source_retains_decoder_even_when_current_spelling_map_matches() {
 
 #[test]
 fn selected_fallback_grammar_keeps_original_rejecting_schema() {
-    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
     let (tokenizer, eos) = tokenizer();
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
     let original_tools = vec![tool(json!(false))];
@@ -403,7 +406,7 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
         compiler.compile_matcher(strict.grammar).is_err(),
         "fixture must select the fallback"
     );
-    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 30, 0).unwrap();
     let (prepared, compilation) = original_plan(
         &pool,
         &tokenizer,
@@ -436,7 +439,10 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
     let fingerprint = prepared.generation_constraint().fingerprint;
     drop((compiler, tokenizer));
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 30),
+        )
         .unwrap();
     let grammar = prepared
         .generation_constraint()
@@ -455,11 +461,9 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
         .unwrap();
     let error = semantic.push(output).unwrap_err();
     assert!(error.contains("do not match its schema"), "{error}");
-    assert!(
-        !semantic
-            .events()
-            .contains(&eredu_core::generation::SemanticEvent::ToolCallEnd)
-    );
+    assert!(!semantic
+        .events()
+        .contains(&eredu_core::generation::SemanticEvent::ToolCallEnd));
     assert_eq!(prepared.generation_constraint().fingerprint, fingerprint);
     drop((prepared, grammar, destination));
     assert_eq!(destination_drops.load(Ordering::SeqCst), 0);
@@ -469,8 +473,8 @@ fn selected_fallback_grammar_keeps_original_rejecting_schema() {
 
 #[test]
 fn missing_source_refusal_keeps_the_valid_recipe_unchanged() {
-    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
-    let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger};
+    let pool = crate::memory_fixture::host_ledger(1 << 30, 0).unwrap();
     let (tokenizer, eos) = tokenizer();
     let (prepared, compilation) = original_plan(
         &pool,
@@ -487,7 +491,10 @@ fn missing_source_refusal_keeps_the_valid_recipe_unchanged() {
         declaration: None,
     };
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 30)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 30),
+        )
         .unwrap();
     let error = invalid
         .original_grammar_state(&compilation, &funding)
@@ -511,7 +518,7 @@ fn missing_source_refusal_keeps_the_valid_recipe_unchanged() {
 #[test]
 fn original_forbidden_startup_uses_retained_tokenizer_and_shared_branch_selection() {
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     #[derive(Debug)]
     struct Account(Arc<AtomicUsize>);
     impl HostMetadataAccount for Account {
@@ -521,7 +528,7 @@ fn original_forbidden_startup_uses_retained_tokenizer_and_shared_branch_selectio
         }
     }
     let (mut tokenizer, eos) = tokenizer();
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let tokenizer_json = tokenizer.to_string(false).unwrap();
     let original_tokenizer = pool
         .compile_tokenizer(
@@ -614,11 +621,9 @@ fn original_forbidden_startup_uses_retained_tokenizer_and_shared_branch_selectio
         )
         .err()
         .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("separately qualified grammar source")
-        );
+        assert!(error
+            .to_string()
+            .contains("separately qualified grammar source"));
     }
     drop((
         original,
@@ -629,10 +634,10 @@ fn original_forbidden_startup_uses_retained_tokenizer_and_shared_branch_selectio
         original_tokenizer,
         funding,
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     assert_eq!(escaped.token_bytes(space as usize), Some(b" ".as_slice()));
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -640,7 +645,7 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
     use crate::runtime::generation::streaming::prepared_channels::PreparedChannelParser;
     use eredu_core::generation::{FinishReason, SemanticEvent};
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     use std::sync::atomic::AtomicBool;
     static CHANNELS: DeclarativeDialectSpec = DeclarativeDialectSpec {
         output: ExactEnvelope {
@@ -692,7 +697,7 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
             true,
         )
         .unwrap();
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let original = pool
         .compile_tokenizer(
             eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(
@@ -773,7 +778,7 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
         failed, failure, prefix, source, original, prepared, tokenizer, funding,
     ));
     assert!(bytes.load(Ordering::SeqCst) > 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     assert!(!retired.load(Ordering::SeqCst));
     let SemanticEvent::ReasoningDelta(reasoning) = escaped.as_ref().unwrap() else {
         unreachable!()
@@ -787,7 +792,7 @@ fn paid_channel_destinations_share_split_transitions_copies_and_escaped_reasonin
 #[test]
 fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all_owners() {
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
     struct Account {
@@ -819,7 +824,7 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     tokenizer.set_encode_special_tokens(true);
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
     let oracle = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
-    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
     let (prepared, compilation) = original_plan(
         &pool,
         &tokenizer,
@@ -878,12 +883,10 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     );
     assert_eq!(declared.parametric(), actual.parametric());
     assert!(!source.matches_plan(&other));
-    assert!(
-        historical
-            .template(&prepared.generation_constraint().inner.recipe)
-            .unwrap()
-            .matches_source(source.trie_source())
-    );
+    assert!(historical
+        .template(&prepared.generation_constraint().inner.recipe)
+        .unwrap()
+        .matches_source(source.trie_source()));
     assert_eq!(source.trie_source().trie().info(), &info);
     assert_eq!(source.trie_source().trie().eos_tokens(), eos);
     for id in 0..info.vocab_size {
@@ -972,13 +975,11 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     .unwrap();
     let copied = state.try_copy(&copy_funding).unwrap();
     assert_eq!(copied.parser().parser().final_bytes(), output);
-    assert!(
-        copied
-            .parser()
-            .vocabulary()
-            .trie_source()
-            .same_source(state.parser().vocabulary().trie_source())
-    );
+    assert!(copied
+        .parser()
+        .vocabulary()
+        .trie_source()
+        .same_source(state.parser().vocabulary().trie_source()));
     // Copied execution uses its destination account after the original payer refuses.
     refused.store(true, Ordering::SeqCst);
     let copied = copied.compute_mask().unwrap();
@@ -1026,7 +1027,7 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
         ordinary,
     ));
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     assert_eq!(
         state
             .parser()
@@ -1046,17 +1047,17 @@ fn original_grammar_vocabulary_uses_normalized_historical_source_and_retires_all
     drop(failed_operation);
     assert!(!retired.load(Ordering::SeqCst));
     assert!(!failed_copy_retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(failed_copy);
     assert!(failed_copy_retired.load(Ordering::SeqCst));
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_declaration_uses_compiled_exact_recipe_and_keeps_source_on_inspection_refusal() {
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
     struct Account {
@@ -1084,7 +1085,7 @@ fn original_declaration_uses_compiled_exact_recipe_and_keeps_source_on_inspectio
         }
     }
     let (tokenizer, eos) = tokenizer();
-    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
     let (prepared, compilation) = original_plan(
         &pool,
         &tokenizer,
@@ -1168,20 +1169,20 @@ fn original_declaration_uses_compiled_exact_recipe_and_keeps_source_on_inspectio
         declaration,
         funding,
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     assert!(!retired.load(Ordering::SeqCst));
     drop(destination);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     assert!(!retired.load(Ordering::SeqCst));
     drop(failed);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custody() {
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-    use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
     struct Account {
@@ -1208,7 +1209,7 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     let (tokenizer, eos) = tokenizer();
     let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
     let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Required);
-    let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 26, 0).unwrap();
     let validity = pool
         .prepare_shared_token_filter(|| eredu_core::TokenFilter::All)
         .unwrap();
@@ -1241,7 +1242,7 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         terminal: &C,
         first: u32,
         disallowed: u32,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) {
         use eredu_core::speculative::PreparedGrammarController;
         use eredu_runtime::generation::{
@@ -1267,7 +1268,7 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             .downcast_ref::<eredu_runtime::working_memory::OriginalTokenTrieSource>()
             .unwrap();
         trie.validate_grammar_source(original_source, pool).unwrap();
-        let foreign = WorkingMemoryPool::new(1 << 30, 0).unwrap();
+        let foreign = crate::memory_fixture::host_ledger(1 << 30, 0).unwrap();
         assert!(matches!(
             trie.validate_grammar_source(original_source, &foreign),
             Err(WorkingMemoryError::IdentityMismatch)
@@ -1360,15 +1361,13 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
                 .history(),
             &[first]
         );
-        assert!(
-            snapshot
-                .controller()
-                .prepared_grammar()
-                .unwrap()
-                .prepared_grammar_source()
-                .history()
-                .is_empty()
-        );
+        assert!(snapshot
+            .controller()
+            .prepared_grammar()
+            .unwrap()
+            .prepared_grammar_source()
+            .history()
+            .is_empty());
         assert_eq!(
             <S<C> as SpeculativeSampler<B>>::control_pending_forced(&committed),
             None
@@ -1382,11 +1381,9 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         let ended = S::new(DefaultSampler, terminal.clone());
         let ended_plan =
             <S<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&ended).unwrap();
-        assert!(
-            ended_plan
-                .prefix_is_complete(ended_plan.controller_source().unwrap().history(), &funding)
-                .unwrap()
-        );
+        assert!(ended_plan
+            .prefix_is_complete(ended_plan.controller_source().unwrap().history(), &funding)
+            .unwrap());
         type A<C> = ConstrainedSampler<MirostatV2Sampler, C>;
         let adaptive = A::new(MirostatV2Sampler::new(3.5, 0.2).unwrap(), source.clone());
         let invalid = <A<C> as SpeculativeSampler<B>>::prepared_grammar_controller(&adaptive)
@@ -1471,11 +1468,9 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             }
         }
         let required = grammar.prepared_grammar_copy_bytes(capacity).unwrap();
-        assert!(
-            grammar
-                .prepared_grammar_copy_bytes(grammar.prepared_grammar_source().history().len() - 1)
-                .is_none()
-        );
+        assert!(grammar
+            .prepared_grammar_copy_bytes(grammar.prepared_grammar_source().history().len() - 1)
+            .is_none());
         for shortage in [0, 1] {
             let spent = Arc::new(AtomicUsize::new(0));
             let limit = Arc::new(AtomicUsize::new(usize::MAX));
@@ -1519,7 +1514,7 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
         ordinary: &Matcher,
         branch_retired: Arc<AtomicBool>,
         branch_funding: HostMetadataFunding,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) {
         use eredu_core::speculative::PreparedGrammarController;
         use eredu_runtime::execution_control::{PreparedGrammarBranch, PreparedGrammarBranchCause};
@@ -1538,19 +1533,15 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             branch.controller().prepared_grammar_source().history(),
             tokens
         );
-        assert!(
-            branch
-                .controller()
-                .prepared_grammar_source()
-                .funding()
-                .same_account(&decision_funding)
-        );
-        assert!(
-            grammar
-                .prepared_grammar_source()
-                .tokenizer()
-                .same_borrowed_source(branch.controller().prepared_grammar_source().tokenizer())
-        );
+        assert!(branch
+            .controller()
+            .prepared_grammar_source()
+            .funding()
+            .same_account(&decision_funding));
+        assert!(grammar
+            .prepared_grammar_source()
+            .tokenizer()
+            .same_borrowed_source(branch.controller().prepared_grammar_source().tokenizer()));
         let mut expected = ordinary.deep_clone();
         for &token in tokens {
             expected.consume_token(token).unwrap();
@@ -1733,14 +1724,12 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
             plan.fill(&mut only_forced).unwrap();
             assert_eq!(only_forced.iter().filter(|&&invalid| !invalid).count(), 2);
             assert!(!only_forced[forced as usize]);
-            assert!(
-                eredu_runtime::generation::TokenMaskPlan::packed(
-                    packed,
-                    &shape,
-                    Some(width as u32)
-                )
-                .is_err()
-            );
+            assert!(eredu_runtime::generation::TokenMaskPlan::packed(
+                packed,
+                &shape,
+                Some(width as u32)
+            )
+            .is_err());
         }
         let token = original
             .parser()
@@ -1817,20 +1806,20 @@ fn original_active_grammar_shares_commit_eos_completion_and_failed_source_custod
     ));
     assert!(!retired.load(Ordering::SeqCst));
     assert!(!startup_retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(failure);
     assert!(retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(startup_failure);
     assert!(startup_retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_auto_grammar_matches_split_and_atomic_activation_masks_and_paid_copy() {
     use eredu_core::speculative::PreparedGrammarController;
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
     struct Account {
@@ -1911,7 +1900,7 @@ fn original_auto_grammar_matches_split_and_atomic_activation_masks_and_paid_copy
         }
         let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos).unwrap();
         let prepared = plan(&compiler, &ordinary_tools(), ToolChoice::Auto);
-        let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+        let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
         let (source_plan, compilation) =
             original_plan(&pool, &tokenizer, &eos, &ordinary_tools(), ToolChoice::Auto);
         let blueprint = source_plan.generation_constraint().inner.clone();
@@ -1989,7 +1978,7 @@ fn original_tool_schema_callback_binds_compilation_receipt_and_keeps_argument_fa
     use eredu_core::speculative::PreparedGrammarController;
     use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
     use eredu_runtime::working_memory::{
-        OriginalSemanticControllerSource, WorkingMemoryError, WorkingMemoryPool,
+        MemoryLedger, OriginalSemanticControllerSource, WorkingMemoryError,
     };
     use std::sync::atomic::AtomicBool;
     #[derive(Debug)]
@@ -2020,8 +2009,8 @@ fn original_tool_schema_callback_binds_compilation_receipt_and_keeps_argument_fa
         serde_json::json!({"type":"object", "properties":{"value":{"type":"integer"}}, "required":["value"], "additionalProperties":false}),
     )];
     let prepared = plan(&compiler, &tools, ToolChoice::Required);
-    let pool = WorkingMemoryPool::new(1 << 27, 0).unwrap();
-    let foreign = WorkingMemoryPool::new(1 << 27, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
+    let foreign = crate::memory_fixture::host_ledger(1 << 27, 0).unwrap();
     let validity = pool
         .prepare_shared_token_filter(|| TokenFilter::All)
         .unwrap();
@@ -2108,10 +2097,10 @@ fn original_tool_schema_callback_binds_compilation_receipt_and_keeps_argument_fa
         mismatch,
     ));
     assert!(!retired.load(Ordering::SeqCst));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     drop(failure);
     assert!(retired.load(Ordering::SeqCst));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }
 
 #[path = "scoped_frame_tests.rs"]

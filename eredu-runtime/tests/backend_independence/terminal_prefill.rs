@@ -107,9 +107,9 @@ impl
         check_inference_scope();
         self.calls.set(self.calls.get() + 1);
         if self.fail {
-            Err(Error::backend_retained_source(InputCause(INPUT_CAUSE.with(
-                |slot| slot.borrow_mut().take().expect("test cause"),
-            ))))
+            Err(Error::backend_retained_source(InputCause(
+                INPUT_CAUSE.with(|slot| slot.borrow_mut().take().expect("test cause")),
+            )))
         } else {
             Ok(FakeTensor(vec![1, 7]))
         }
@@ -140,7 +140,9 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
         opening: &eredu_runtime::inspection::PrefillOpeningState<'_, FakeTensor>,
     ) -> Result<Option<eredu_runtime::inspection::PreparedPrefillChunkRetention>, Error> {
         check_inference_scope();
-        opening.visit(&mut |_| {}).map_err(Error::backend_retained_source)?;
+        opening
+            .visit(&mut |_| {})
+            .map_err(Error::backend_retained_source)?;
         std::panic::panic_any(self.opening_panic.take().expect("opening panic fixture"))
     }
     fn transactional(&self) -> bool {
@@ -228,7 +230,7 @@ fn every_failed_guard_entry_stops_before_the_next_vote_or_native_callback() {
                 commits: Default::default(),
             }),
         );
-        let pool = WorkingMemoryPool::new(384, 0).unwrap();
+        let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
         let request: InferenceRequest = pool
             .reserve(
                 session.inference_execution_identity(),
@@ -294,11 +296,15 @@ fn every_failed_guard_entry_stops_before_the_next_vote_or_native_callback() {
         drop((session, request));
         let quarantined = INFERENCE_SCOPE_TRACE.with(|t| !t.borrow().quarantine.is_empty());
         assert_eq!(
-            pool.used_bytes().unwrap(),
-            if quarantined { 384 } else { 0 }
+            pool.live_charge_bytes().unwrap(),
+            if quarantined {
+                mock_reservation_bytes()
+            } else {
+                0
+            }
         );
         reset(); // Separate scalar completion evidence, never deadline-as-completion.
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -314,7 +320,7 @@ fn earlier_prepared_input_error_survives_nested_begin_failure_and_abandons_outer
             commits: Default::default(),
         }),
     );
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -358,9 +364,9 @@ fn earlier_prepared_input_error_survives_nested_begin_failure_and_abandons_outer
         "failed entry does not fabricate Aborted"
     );
     drop((session, request));
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.live_charge_bytes().unwrap(), mock_reservation_bytes());
     reset();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 fn deadline_phase(
@@ -400,7 +406,7 @@ fn pair(
                         coordinator,
                     }),
                 );
-                let pool = WorkingMemoryPool::new(384, 0).unwrap();
+                let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
                 let request: InferenceRequest = pool
                     .reserve(
                         session.inference_execution_identity(),
@@ -474,11 +480,15 @@ fn pair(
                 }
                 drop((session, request));
                 assert_eq!(
-                    pool.used_bytes().unwrap(),
-                    if abandoned > 0 { 384 } else { 0 }
+                    pool.live_charge_bytes().unwrap(),
+                    if abandoned > 0 {
+                        mock_reservation_bytes()
+                    } else {
+                        0
+                    }
                 );
                 reset();
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
                 (finished, abandoned)
             })
         })
@@ -512,7 +522,7 @@ fn observer_unwind_keeps_exact_payload_and_abandons_both_scopes_before_fenced_re
             commits: Default::default(),
         }),
     );
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -558,9 +568,9 @@ fn observer_unwind_keeps_exact_payload_and_abandons_both_scopes_before_fenced_re
     assert_eq!(counters.snapshot().forward_calls, before);
     assert!(session.report().unwrap().distributed_commit().is_none());
     drop((session, request));
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.live_charge_bytes().unwrap(), mock_reservation_bytes());
     reset();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -585,9 +595,23 @@ fn agreed_source_rejection_preserves_before_state_mutation_and_ordinary_retry() 
     });
     let cancellation = GenerationCancellationToken::new();
     let mut observer = Observer::default();
+    let request: InferenceRequest = crate::memory::unlimited_ledger(0)
+        .reserve(
+            session.inference_execution_identity(),
+            &mock_inference_admission(InferenceGeometry {
+                batch_size: 1,
+                cached_positions: 0,
+                input_positions: 1,
+                max_output_tokens: 1,
+                prefill_chunk_positions: 1,
+                output: OutputDemand::LastPosition,
+            }),
+        )
+        .unwrap()
+        .into();
     let error = session
         .try_prefill_source_cancellable::<Source, _>(
-            None,
+            Some(&request),
             Some([1, 1]),
             None,
             |_| {
@@ -618,9 +642,16 @@ fn agreed_source_rejection_preserves_before_state_mutation_and_ordinary_retry() 
     });
     assert_eq!(TERMINAL_SUBMISSION_MARKS.with(Cell::get), 0);
     assert!(observer.finished.is_empty());
+    let request: InferenceRequest = crate::memory::unlimited_ledger(0)
+        .reserve(
+            session.inference_execution_identity(),
+            &mock_inference_admission(request.geometry()),
+        )
+        .unwrap()
+        .into();
     let output = session
         .try_prefill_source_cancellable(
-            None,
+            Some(&request),
             Some([1, 1]),
             None,
             |geometry| {
@@ -661,7 +692,7 @@ fn source_factory_unwind_abandons_before_vote_and_fences_ordinary_gateway() {
             ..Default::default()
         }
     });
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -701,9 +732,9 @@ fn source_factory_unwind_abandons_before_vote_and_fences_ordinary_gateway() {
         assert_eq!((t.active, t.finished, t.abandoned), (0, 0, 1));
     });
     drop((session, request));
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.live_charge_bytes().unwrap(), mock_reservation_bytes());
     reset();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -718,7 +749,7 @@ fn direct_session_opening_view_unwind_ends_state_loan_before_terminal_cleanup() 
             commits: Default::default(),
         }),
     );
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let execution = session.inference_execution_identity().clone();
     let request: InferenceRequest = pool
         .reserve(&execution, &mock_inference_admission(geometry()))
@@ -772,9 +803,9 @@ fn direct_session_opening_view_unwind_ends_state_loan_before_terminal_cleanup() 
         assert_eq!((t.active, t.finished, t.abandoned), (0, 1, 1));
     });
     drop((session, request));
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.live_charge_bytes().unwrap(), mock_reservation_bytes());
     reset();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -842,9 +873,25 @@ fn state_only_pair(cancel_after_first: bool, fail_completion: bool) {
                 }
                 let calls = Rc::new(Cell::new(0));
                 let mut observer = Observer::default();
-                let outcome = session.try_prefill_unbudgeted_state_source_cancellable(
+                let request: InferenceRequest = crate::memory::unlimited_ledger(0)
+                    .reserve(
+                        session.inference_execution_identity(),
+                        &mock_inference_admission(InferenceGeometry {
+                            batch_size: 1,
+                            cached_positions: 0,
+                            input_positions: 3,
+                            max_output_tokens: 0,
+                            prefill_chunk_positions: 1,
+                            output: OutputDemand::StateOnly,
+                        }),
+                    )
+                    .unwrap()
+                    .into();
+                let outcome = session.try_prefill_admitted_source_with_operation(
+                    &request,
                     Some([1, 3]),
                     std::num::NonZeroU64::new(1),
+                    OutputDemand::StateOnly,
                     |geometry| {
                         Ok(Some(StateSource {
                             inner: Source {
@@ -859,6 +906,7 @@ fn state_only_pair(cancel_after_first: bool, fail_completion: bool) {
                     &cancel,
                     &(),
                     &mut observer,
+                    eredu_runtime::replicated_session::OrdinaryPrefillSpan,
                 );
                 if fail_completion {
                     let error = outcome
@@ -871,13 +919,16 @@ fn state_only_pair(cancel_after_first: bool, fail_completion: bool) {
                     assert_eq!(calls.get(), 1);
                     assert_eq!(observer.finished, vec![false]);
                     assert!(session
-                        .try_prefill_unbudgeted_state_source_cancellable::<Source, _>(
+                        .try_prefill_admitted_source_with_operation::<Source, _, _>(
+                            &request,
                             Some([1, 1]),
                             None,
+                            OutputDemand::StateOnly,
                             |_| panic!("fenced retry entered source factory"),
                             &cancel,
                             &(),
-                            &mut Observer::default()
+                            &mut Observer::default(),
+                            eredu_runtime::replicated_session::OrdinaryPrefillSpan,
                         )
                         .is_err());
                     reset();
@@ -899,7 +950,7 @@ fn state_only_pair(cancel_after_first: bool, fail_completion: bool) {
                     assert!(matches!(outcome, PrefillSourceOutcome::Cancelled));
                     assert!(cancel.is_cancelled());
                 } else {
-                    assert!(matches!(outcome, PrefillSourceOutcome::Complete(())));
+                    assert!(matches!(outcome, PrefillSourceOutcome::Complete(None)));
                 }
                 reset();
             })
@@ -1008,7 +1059,7 @@ fn coordination_routes_every_role_and_direct_input_with_one_low_level_attempt() 
                 commits: commits.clone(),
             }),
         );
-        let pool = WorkingMemoryPool::new(384, 0).unwrap();
+        let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
         let request: InferenceRequest = pool
             .reserve(
                 session.inference_execution_identity(),
@@ -1126,7 +1177,7 @@ fn coordination_routes_every_role_and_direct_input_with_one_low_level_attempt() 
         });
         drop(session);
         drop(request);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         reset();
     }
 }
@@ -1151,7 +1202,7 @@ fn cancellation_during_coordination_is_voted_before_the_next_source_or_native_ch
             input_positions: 3,
             ..geometry()
         };
-        let pool = WorkingMemoryPool::new(384, 0).unwrap();
+        let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
         let request: InferenceRequest = pool
             .reserve(
                 session.inference_execution_identity(),
@@ -1241,7 +1292,7 @@ fn cancellation_during_coordination_is_voted_before_the_next_source_or_native_ch
         });
         drop(session);
         drop(request);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         reset();
     }
 }
@@ -1265,7 +1316,7 @@ fn second_span_begin_failure_keeps_committed_prefix_and_stops_without_false_vote
         input_positions: 3,
         ..geometry()
     };
-    let pool = WorkingMemoryPool::new(384, 0).unwrap();
+    let pool = crate::memory::host_ledger(mock_reservation_bytes(), 0).unwrap();
     let request: InferenceRequest = pool
         .reserve(
             session.inference_execution_identity(),
@@ -1360,9 +1411,9 @@ fn second_span_begin_failure_keeps_committed_prefix_and_stops_without_false_vote
             (8, 7, 7, 0, 0)
         );
     });
-    assert_eq!(pool.used_bytes().unwrap(), 384);
+    assert_eq!(pool.live_charge_bytes().unwrap(), mock_reservation_bytes());
     drop(session);
     drop(request);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     reset();
 }

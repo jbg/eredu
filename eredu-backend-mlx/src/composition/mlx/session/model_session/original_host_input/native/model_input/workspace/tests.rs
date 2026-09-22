@@ -1,9 +1,14 @@
-use super::super::super::super::tests::{cold_config, settle, source};
+use super::super::super::super::tests::{admitted, cold_config, settle, source};
 use super::*;
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{Completion, OutputDemand};
 use eredu_nn::workspace::WorkspaceMechanisms;
 
 fn family(conditional: bool) {
+    if !crate::tests::support::native_process::enter("original-media-workspace") {
+        return;
+    }
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     assert!(
         safemlx::metal::is_available().unwrap(),
         "explicit native Metal diagnostic prerequisite"
@@ -24,15 +29,16 @@ fn family(conditional: bool) {
         64
     };
     for mode in 0..4 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let backend = admitted::backend(&pool);
+        backend.stream().synchronize().unwrap();
+        safemlx::memory::clear_cache();
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        let baseline = pool.fixture_host_charge().unwrap();
         let i = source(&pool, hidden);
         let equal = source(&pool, hidden);
         assert_eq!(i.content_digest(), equal.content_digest());
         assert!(!i.same_source(&equal));
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-        let weights_stream =
-            Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let backend = MlxBackend::new(&stream, &weights_stream).with_memory_pool(pool.clone());
+        let stream = backend.stream().clone();
         let config = workspace_config(&backend, artifact.path(), mode);
         let a = config
             .prepared_sources()
@@ -109,39 +115,6 @@ fn family(conditional: bool) {
         let before = runtime.session().payload.model.erased().state_snapshot();
         crate::tensor::reset_prepared_rotary_calls();
         crate::tensor::reset_workspace_slot_projections();
-        if mode == 3 {
-            // The ordinary background-prefetch strategy still lacks a complete
-            // workspace bound. Keep its actual strict rejection and error owner.
-            let failure = prompt
-                .quote_original_media_workspace(&runtime, geometry)
-                .unwrap_err();
-            assert!(matches!(&failure.cause, Cause::Native(_)));
-            let mut cause: &(dyn std::error::Error + 'static) = &failure;
-            loop {
-                if let Some(boundary) = cause.downcast_ref::<WorkingMemoryError>() {
-                    assert!(matches!(boundary, WorkingMemoryError::UnknownBound));
-                    break;
-                }
-                cause = cause
-                    .source()
-                    .expect("background workspace rejection lost its actual cause");
-            }
-            assert_eq!(crate::tensor::workspace_slot_projections(), i.slot_count());
-            assert_eq!(crate::tensor::prepared_rotary_calls(), 0);
-            assert_eq!(
-                runtime.session().payload.model.erased().state_snapshot(),
-                before
-            );
-            drop(prompt);
-            drop(i);
-            drop(runtime);
-            drop(config);
-            stream.synchronize().unwrap();
-            settle(&pool, 1, 0);
-            drop(failure);
-            settle(&pool, 0, 0);
-            continue;
-        }
         let report = prompt
             .quote_original_media_workspace(&runtime, geometry)
             .unwrap_or_else(|error| panic!("workspace mode {mode}: {error:?}"));
@@ -209,53 +182,62 @@ fn family(conditional: bool) {
         if mode == 0 {
             missing_fact_and_error_custody(&prompt, &runtime, geometry, &pool);
         }
-        // C1 uses the same shared media driver and independently retained
-        // completion collector; the source still owns the full first interval.
-        let roots = crate::backend::submission_recovery::prefill::test_trace::Trace::new();
-        let first = runtime.prefill(prompt.clone()).unwrap();
-        first.completion.wait().unwrap();
-        drop(first);
-        use crate::backend::submission_recovery::prefill::test_trace::Event;
-        let events = roots.events();
-        let completed = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Completed { roots, original } => Some((*roots, *original)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let future = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Media { future } => Some(*future),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        // The cold report retains its ordinary source exclusion. It must retire
+        // before the same complete source can enter bounded execution.
+        assert!(pool.unquoted_owner_count().unwrap() > 0);
+        drop(report);
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            safemlx::reclaim_allocation_owners();
+            pool.unquoted_owner_count().unwrap() == 0
+        });
+        let (_, roots) = crate::tests::support::media_completion::observe(None, || {
+            admitted::collect(&mut runtime, prompt.clone(), 1, true)
+        });
         assert_eq!(
-            completed.len(),
-            5,
-            "actual nine decoder positions in 2/2/2/2/1"
+            roots.len(),
+            10,
+            "five actual decoder spans each complete their retained media roots"
         );
-        assert_eq!(future.len(), 5);
-        assert!(future[0] > 0, "first interval omitted future media roots");
-        assert!(completed
-            .iter()
-            .zip(&future)
-            .all(|((roots, original), future)| !original && *roots >= *future));
+        let first = &roots[1];
         assert!(
-            !events.iter().any(|e| matches!(e, Event::Prepared { .. })),
-            "ordinary B3 consumption manufactured C admission"
+            first.after && !first.backing.is_empty(),
+            "first interval omitted future media roots"
         );
-        drop(roots);
-        let before = runtime.session().payload.model.erased().state_snapshot();
+        assert!(first.backing.iter().all(Option::is_some));
+        for pair in roots.chunks_exact(2) {
+            assert!(!pair[0].after && pair[1].after);
+            assert_eq!(pair[0].shapes, pair[1].shapes);
+            assert_eq!(
+                pair[1].backing, first.backing,
+                "one completed encoder backing is retained across all decoder spans"
+            );
+            assert!(pair[1].ready.iter().all(|ready| *ready));
+        }
         crate::tensor::reset_workspace_slot_projections();
-        let stale = prompt
+        let busy = prompt
             .quote_original_media_workspace(&runtime, geometry)
             .unwrap_err();
         assert!(matches!(
-            stale.cause,
-            Cause::Boundary(WorkingMemoryError::IdentityMismatch)
+            busy.cause,
+            Cause::Boundary(WorkingMemoryError::ReservedWorkActive)
         ));
+        assert_eq!(crate::tensor::workspace_slot_projections(), 0);
+        drop(busy);
+        runtime.reset().unwrap();
+        let before = runtime.session().payload.model.erased().state_snapshot();
+        let stale = prompt
+            .quote_original_media_workspace(&runtime, geometry)
+            .unwrap_err();
+        assert!(
+            matches!(
+                stale.cause,
+                // The retained input still owns the completed encoder's original
+                // bank after reset. Ordinary diagnostic exclusion precedes source
+                // revision validation and must reject without projecting any slot.
+                Cause::Boundary(WorkingMemoryError::ReservedWorkActive)
+            ),
+            "stale source quote: {stale:?}"
+        );
         assert_eq!(crate::tensor::workspace_slot_projections(), 0);
         assert_eq!(
             runtime.session().payload.model.erased().state_snapshot(),
@@ -267,18 +249,11 @@ fn family(conditional: bool) {
         drop(runtime);
         drop(config);
         stream.synchronize().unwrap();
-        assert!(
-            pool.unquoted_owner_count().unwrap() > 0,
-            "report lost its ordinary preparation owner"
-        );
-        drop(report);
-        settle(&pool, 0, 0);
+        settle(&pool, 0, baseline);
     }
 }
-// The positive disk case selects the same direct foreground strategy as the
-// existing managed disk workspace fixture. Keep the ordinary background profile
-// from cold_config as a separate strict-negative case; other B3 tests keep using
-// that ordinary profile for their resident/host/background numerical matrix.
+// Exercise direct foreground and ordinary background disk strategies through
+// their actual selected source, allocation facts and canonical numerical path.
 fn workspace_config(
     backend: &MlxBackend<'_>,
     path: &std::path::Path,
@@ -321,6 +296,42 @@ struct IncompleteFacts {
     fail: bool,
 }
 impl eredu_nn::workspace::WorkspaceMechanisms for IncompleteFacts {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        self.actual.memory_topology()
+    }
+    fn output_placement(
+        &self,
+        operation: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        output: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        self.actual.output_placement(operation, output)
+    }
+    fn scratch_placement(
+        &self,
+        operation: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        self.actual.scratch_placement(operation)
+    }
+    fn allocation_host_control_bytes(
+        &self,
+        operation: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        output: usize,
+    ) -> Option<u64> {
+        self.actual.allocation_host_control_bytes(operation, output)
+    }
+    fn scratch_host_control_bytes(
+        &self,
+        operation: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Result<Option<u64>, eredu_nn::Error> {
+        self.actual.scratch_host_control_bytes(operation)
+    }
+    fn output_representation(
+        &self,
+        operation: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        output: usize,
+    ) -> Option<eredu_nn::workspace::WorkspaceRepresentation> {
+        self.actual.output_representation(operation, output)
+    }
     fn operation_bound(
         &self,
         operation: &eredu_nn::workspace::WorkspaceOperation,
@@ -362,7 +373,7 @@ fn missing_fact_and_error_custody(
     prompt: &MlxModelInput,
     runtime: &ModelRuntime<MlxBackend<'_>>,
     geometry: eredu_core::InferenceGeometry,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) {
     let baseline = pool.unquoted_owner_count().unwrap();
     let trace = |fail| {
@@ -372,6 +383,10 @@ fn missing_fact_and_error_custody(
             actual: executable.workspace_mechanisms().unwrap(),
             fail,
         });
+        executable
+            .erased()
+            .install_workspace_parameter_representations(&context)
+            .unwrap();
         let Some(input::OriginalMediaPacket::Original(packet)) = prompt.original_media.as_ref()
         else {
             panic!("actual original packet")

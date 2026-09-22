@@ -21,9 +21,7 @@ pub(super) fn buffer<T>(
                 Result<SpeculativeBuffer<T>, Error>,
             )>())
         })
-        .ok_or(Error::WorkspacePlanning(
-            HostMetadataFundingError::Overflow,
-        ))?;
+        .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
     funding
         .reserve_metadata(bytes)
         .map_err(Error::WorkspacePlanning)?;
@@ -49,7 +47,7 @@ pub(super) fn inspect<C: SpeculativeTokenFilterController>(
         .map_err(Error::PrefillControl)?;
     preparation
         .validate(
-            backend.memory_pool(),
+            backend.memory_ledger(),
             model.erased().inference_execution_identity(),
         )
         .map_err(Error::PrefillControl)?;
@@ -67,13 +65,11 @@ pub(super) fn inspect<C: SpeculativeTokenFilterController>(
             frames
                 .into_iter()
                 .try_fold(size_of_val(&frames), usize::checked_add)
-                .ok_or(Error::WorkspacePlanning(
-                    HostMetadataFundingError::Overflow,
-                ))?,
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         )
         .map_err(Error::WorkspacePlanning)?;
     semantic
-        .validate_pool(backend.memory_pool())
+        .validate_pool(backend.memory_ledger())
         .map_err(Error::PrefillControl)?;
     preparation
         .validate_configuration(lane.configuration())
@@ -84,30 +80,54 @@ pub(super) fn inspect<C: SpeculativeTokenFilterController>(
     let prompt = lane.prompt();
     // Authenticate the complete actual owner before reading either text or
     // media geometry. Publicly replaceable descriptors cannot select a lane.
-    prompt.original_prediction_source(backend.memory_pool()).map_err(Error::PrefillControl)?;
+    prompt
+        .original_prediction_source(backend.memory_ledger())
+        .map_err(Error::PrefillControl)?;
     prompt.with_borrowed(|input| -> Result<(), Error> {
-    if let Some(crate::backend::runtime::media::input::OriginalMediaPacket::Original(packet)) = input.original_media() {
-        preparation.metadata_funding().reserve_metadata(size_of::<(
-            eredu_runtime::working_memory::MediaSessionBinding,
-            Result<eredu_runtime::working_memory::MediaSessionBinding,
-                eredu_runtime::replicated_session::MediaSemanticBindingError<Error>>,
-        )>()).map_err(Error::WorkspacePlanning)?;
-        let current = model.erased().current_media_semantic_binding()
-            .map_err(|cause| crate::composition::mlx::model::retain_planning_error(cause, preparation.metadata_funding().clone()))?;
-        if !packet.borrowed_semantics().binding().matches(&current) {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        if let Some(crate::backend::runtime::media::input::OriginalMediaPacket::Original(packet)) =
+            input.original_media()
+        {
+            preparation
+                .metadata_funding()
+                .reserve_metadata(size_of::<(
+                    eredu_runtime::working_memory::MediaSessionBinding,
+                    Result<
+                        eredu_runtime::working_memory::MediaSessionBinding,
+                        eredu_runtime::replicated_session::MediaSemanticBindingError<Error>,
+                    >,
+                )>())
+                .map_err(Error::WorkspacePlanning)?;
+            let current = model
+                .erased()
+                .current_media_semantic_binding()
+                .map_err(|cause| {
+                    crate::composition::mlx::model::retain_planning_error(
+                        cause,
+                        preparation.metadata_funding().clone(),
+                    )
+                })?;
+            if !packet.borrowed_semantics().binding().matches(&current) {
+                return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            }
         }
-    }
         Ok(())
     })?;
-    let [batch, positions] = prompt.with_borrowed(|input| match input.original_media() {
-        Some(packet) => Some(packet.shape()),
-        None => prompt.plain_token_array().and_then(|tokens| match tokens.shape() {
-            [batch, positions] => Some([u64::try_from(*batch).ok()?, u64::try_from(*positions).ok()?]),
-            _ => None,
-        }),
-    }).ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
-    if batch != 1 { return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch)); }
+    let [batch, positions] = prompt
+        .with_borrowed(|input| match input.original_media() {
+            Some(packet) => Some(packet.shape()),
+            None => prompt
+                .plain_token_array()
+                .and_then(|tokens| match tokens.shape() {
+                    [batch, positions] => {
+                        Some([u64::try_from(*batch).ok()?, u64::try_from(*positions).ok()?])
+                    }
+                    _ => None,
+                }),
+        })
+        .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
+    if batch != 1 {
+        return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+    }
     let positions = NonZeroU64::new(positions)
         .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
     Ok((preparation.clone(), positions))

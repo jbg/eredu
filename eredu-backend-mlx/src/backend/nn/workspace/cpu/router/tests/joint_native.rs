@@ -1,11 +1,11 @@
 //! Joint routing's actual CPU graph, quoted by the same cold operation source.
 use super::*;
 use crate::{
-    MlxTensor,
     backend::{
-        MlxBackend, MlxDeviceIdentity, managed_memory::gpu_stream::PreparedExecutionStreams,
-        nn::shared::MlxNeuralBackend,
+        managed_memory::gpu_stream::PreparedExecutionStreams, nn::shared::MlxNeuralBackend,
+        MlxBackend, MlxDeviceIdentity,
     },
+    MlxTensor,
 };
 use eredu_nn::{JointGroupSelection, JointGroupSelectionInput, JointGroupSelectionSpec};
 use safemlx::{
@@ -15,8 +15,8 @@ use safemlx::{
     SubmissionScope,
 };
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 #[derive(Debug)]

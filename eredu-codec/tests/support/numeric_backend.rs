@@ -333,13 +333,16 @@ impl Tensor for NumericTensor {
         })
     }
 
-    fn to_f32_vec(&self, _: &Context) -> Result<Vec<f32>, Error> {
-        Ok(self.dense_f32())
+    fn to_f32_vec(&self, _: &Context) -> Result<eredu_nn::HostTensorBuffer<f32>, Error> {
+        Ok(eredu_nn::HostTensorBuffer::new(self.dense_f32(), ()))
     }
-    fn to_i32_vec(&self, _: &Context) -> Result<Vec<i32>, Error> {
-        Ok((0..elements(&self.shape))
-            .map(|i| self.get_i32(i))
-            .collect())
+    fn to_i32_vec(&self, _: &Context) -> Result<eredu_nn::HostTensorBuffer<i32>, Error> {
+        Ok(eredu_nn::HostTensorBuffer::new(
+            (0..elements(&self.shape))
+                .map(|i| self.get_i32(i))
+                .collect(),
+            (),
+        ))
     }
     fn full_f32(value: f32, shape: &[i32], _: &Context) -> Result<Self, Error> {
         Ok(Self::f32(vec![value; elements(shape)], shape))
@@ -919,15 +922,17 @@ impl Tensor for NumericTensor {
 #[derive(Clone, Debug, Default)]
 pub struct NullOperator;
 impl Parameterized<NumericTensor> for NullOperator {
-    fn visit_parameter_sources<'a, V>(&'a self, _: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
+    fn visit_parameter_sources<'a, V>(
+        &'a self,
+        _: &mut V,
+    ) -> Result<(), eredu_nn::ParameterSourceError>
     where
         V: eredu_nn::ParameterSourceVisitor<'a, NumericTensor>,
     {
- let mut __source_result = Ok(());
+        let mut __source_result = Ok(());
 
-
- __source_result
-}
+        __source_result
+    }
     fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
     where
         V: ParameterVisitorMut<'a, NumericTensor>,
@@ -967,6 +972,7 @@ impl RotaryOperator<NumericTensor> for NullOperator {
 #[derive(Clone, Copy, Debug)]
 pub struct ReferenceBackend;
 impl NeuralBackend for ReferenceBackend {
+    type ParameterPreparation<'a> = ();
     type Tensor = NumericTensor;
     type Linear = NullOperator;
     type Embedding = NullOperator;

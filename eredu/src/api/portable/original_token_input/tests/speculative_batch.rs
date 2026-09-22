@@ -4,6 +4,7 @@ use crate::api::{
     ManagedPlainTextRequest, ManagedPlainTextSpeculativeBatchLane,
     ManagedPlainTextSpeculativeBatchRequest, PreparedChatGenerationSettings,
 };
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use std::{io::Write, num::NonZeroUsize};
 
 #[derive(Clone)]
@@ -47,16 +48,12 @@ impl SpeculativeGenerationBackend for Backend {
             !sources[0].same_preparation(sources[1]),
             "each lane retains its own source header"
         );
-        assert!(
-            sources[0]
-                .validate_configuration(lanes[1].configuration())
-                .is_err()
-        );
-        assert!(
-            sources[0]
-                .validate_callback(lanes[1].event_callback())
-                .is_err()
-        );
+        assert!(sources[0]
+            .validate_configuration(lanes[1].configuration())
+            .is_err());
+        assert!(sources[0]
+            .validate_callback(lanes[1].event_callback())
+            .is_err());
         assert_eq!(
             (lanes[0].config().max_tokens, lanes[1].config().max_tokens),
             (3, 4)
@@ -79,7 +76,7 @@ impl SpeculativeGenerationBackend for Backend {
 // original_plain, rather than reconstructing its finite regex profile here.
 const CAPACITY: u64 = 128 << 20;
 const JSON: &str = super::original_plain::JSON;
-fn fixture() -> (LoadedModel<Backend>, Rc<RefCell<Facts>>, WorkingMemoryPool) {
+fn fixture() -> (LoadedModel<Backend>, Rc<RefCell<Facts>>, MemoryLedger) {
     let (runtime, facts, pool) = bare_runtime_with_capacity_for::<Speculative>(CAPACITY);
     let model = LoadedModel::from_runtime(
         runtime,
@@ -115,7 +112,15 @@ fn lane(
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: managed.then_some(CAPACITY),
+            memory_limits: (managed.then_some(CAPACITY)).map_or_else(
+                eredu_core::MemoryLimitDeclarations::unlimited,
+                |bytes| {
+                    eredu_core::MemoryLimitDeclarations::new([(
+                        "host".into(),
+                        eredu_core::MemoryLimit::Finite(bytes),
+                    )])
+                },
+            ),
             ..Default::default()
         },
         ..Default::default()
@@ -132,7 +137,7 @@ fn original_speculative_batch_qualifies_distinct_sources_and_rejects_late_policy
     for invalid in [false, true] {
         let (mut model, facts, pool) = fixture();
         let source = source(&model);
-        let cold = pool.used_bytes().unwrap();
+        let cold = pool.live_charge_bytes().unwrap();
         let error = model
             .generate_managed_plain_text_speculative_batch(
                 &source,
@@ -155,7 +160,7 @@ fn original_speculative_batch_qualifies_distinct_sources_and_rejects_late_policy
             assert_eq!(facts.borrow().speculative_sources, 0);
             assert!(facts.borrow().speculative_prompts.is_empty());
             assert!(facts.borrow().speculative_seeds.is_empty());
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.live_charge_bytes().unwrap(), cold);
         } else {
             assert!(error.backend_failure().is_some());
             assert_eq!(facts.borrow().speculative_sources, 2);
@@ -167,24 +172,22 @@ fn original_speculative_batch_qualifies_distinct_sources_and_rejects_late_policy
             assert_eq!(facts.borrow().speculative_prompts, expected);
             assert_eq!(facts.borrow().speculative_seeds, [17, 29]);
             assert!(
-                pool.used_bytes().unwrap() > cold,
+                pool.live_charge_bytes().unwrap() > cold,
                 "escaped batch error retains its paid source prefix"
             );
         }
         drop((source, model));
         if !invalid {
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.live_charge_bytes().unwrap() > 0);
         }
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn prepared_chat_speculative_batch_uses_the_same_paid_lanes_and_host_vote() {
-    use crate::api::{
-        PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
-    };
+    use crate::api::{PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest};
     use crate::runtime::chat::ChatTemplateRequest;
     for invalid in [false, true] {
         let (mut model, facts, pool) = fixture();
@@ -205,13 +208,13 @@ fn prepared_chat_speculative_batch_uses_the_same_paid_lanes_and_host_vote() {
                         messages: vec![serde_json::json!({"role":"user", "content":text})],
                         ..Default::default()
                     },
-                    CAPACITY,
+                    &crate::memory_fixture::limits(CAPACITY),
                     &cancellation,
                 )
                 .unwrap()
                 .unwrap()
         });
-        let cold = pool.used_bytes().unwrap();
+        let cold = pool.live_charge_bytes().unwrap();
         let make = |index: usize, seed, maximum, draft, funded| {
             let text = lane("", seed, maximum, draft, funded);
             PreparedChatSpeculativeBatchLane {
@@ -227,13 +230,11 @@ fn prepared_chat_speculative_batch_uses_the_same_paid_lanes_and_host_vote() {
             }
         };
         let error = model
-            .generate_prepared_chat_speculative_batch(
-                PreparedChatSpeculativeBatchRequest {
-                    drafting: SpeculativeDraft::Embedded,
-                    lanes: vec![make(0, 17, 3, 1, true), make(1, 29, 4, 2, !invalid)],
-                    scheduler: Default::default(),
-                },
-            )
+            .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                drafting: SpeculativeDraft::Embedded,
+                lanes: vec![make(0, 17, 3, 1, true), make(1, 29, 4, 2, !invalid)],
+                scheduler: Default::default(),
+            })
             .err()
             .expect("neutral dispatch sentinel or failed policy");
         if invalid {
@@ -244,19 +245,19 @@ fn prepared_chat_speculative_batch_uses_the_same_paid_lanes_and_host_vote() {
             assert_eq!(facts.borrow().speculative_sources, 0);
             assert!(facts.borrow().speculative_prompts.is_empty());
             assert!(facts.borrow().speculative_seeds.is_empty());
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.live_charge_bytes().unwrap(), cold);
         } else {
             assert!(error.backend_failure().is_some());
             assert_eq!(facts.borrow().speculative_sources, 2);
             assert_eq!(facts.borrow().speculative_prompts, [vec![2], vec![2, 8, 4]]);
             assert_eq!(facts.borrow().speculative_seeds, [17, 29]);
-            assert!(pool.used_bytes().unwrap() > cold);
+            assert!(pool.live_charge_bytes().unwrap() > cold);
         }
         drop((chats, source, tokenizer, model));
         if !invalid {
-            assert!(pool.used_bytes().unwrap() > 0);
+            assert!(pool.live_charge_bytes().unwrap() > 0);
         }
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.live_charge_bytes().unwrap(), 0);
     }
 }

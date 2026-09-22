@@ -54,11 +54,9 @@ fn companion_collisions_use_only_the_catalog_and_preserve_target_order() {
         let error = super::super::preflight::preflight_source_collisions(&CatalogOnly(keys), &plan)
             .unwrap_err();
         assert!(error.to_string().contains(target), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("implicit transcoding is unsupported")
-        );
+        assert!(error
+            .to_string()
+            .contains("implicit transcoding is unsupported"));
     }
 }
 
@@ -196,7 +194,8 @@ fn conversion_fills_the_original_destinations_and_readers_retain_their_custody()
     let transformed = prepared.materialize(context.stream()).unwrap();
     assert_eq!(transformed.report().transformed_weights, 1);
     assert_eq!(transformed.report().output_bytes, 320);
-    let lease = transformed.source()
+    let lease = transformed
+        .source()
         .acquire_lease(TensorReadRequest {
             key: "model.proj.weight".into(),
             selection: TensorSelection::Full,
@@ -261,7 +260,7 @@ const ORIGINAL_METADATA_POLICY: eredu_runtime::working_memory::DependencyMemoryP
     };
 
 fn original_output_quotes() -> Option<[u64; 3]> {
-    use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+    use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
     let mut quotes = [0; 3];
     for (index, (name, shape, bytes)) in [
         ("model.proj.weight", [8, 8], 256),
@@ -271,7 +270,7 @@ fn original_output_quotes() -> Option<[u64; 3]> {
     .into_iter()
     .enumerate()
     {
-        match WorkingMemoryPool::memory_tensor_buffer_quote(
+        match MemoryLedger::memory_tensor_buffer_quote(
             name,
             &shape,
             bytes,
@@ -291,13 +290,17 @@ fn original_output_quotes() -> Option<[u64; 3]> {
 
 #[test]
 fn conversion_preserves_the_pools_original_payload_inventory() {
-    use eredu_runtime::working_memory::WorkingMemoryPool;
+    use eredu_runtime::working_memory::MemoryLedger;
     let Some(quotes) = original_output_quotes() else {
         return;
     };
     let (_directory, source, _) = direct_fixture();
     let reads = source.source_diagnostics().unwrap().physical_reads;
-    let pool = WorkingMemoryPool::new(quotes.iter().sum(), 0).unwrap();
+    let pool = crate::memory_fixture::ledger(
+        quotes.iter().sum::<u64>() + MemoryLedger::unquoted_owner_control_bytes().unwrap(),
+        0,
+    )
+    .unwrap();
     let plan = BoundedQuantizationPlan::new(
         AffineQuantization::default(),
         320,
@@ -308,13 +311,17 @@ fn conversion_preserves_the_pools_original_payload_inventory() {
         .unwrap()
         .allocate_original(&pool, ORIGINAL_METADATA_POLICY, cpu_context().stream())
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), quotes.iter().sum::<u64>());
+    assert_eq!(
+        pool.fixture_host_charge().unwrap(),
+        quotes.iter().sum::<u64>()
+    );
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, reads);
     let owner = pool.acquire_unquoted().unwrap();
     let context = cpu_context();
     let transformed = prepared.materialize(context.stream()).unwrap();
     let mut inventories = Vec::new();
-    assert!(transformed.source()
+    assert!(transformed
+        .source()
         .visit_source_storage(&mut |row| {
             inventories.push((row.identity(), row.bytes()));
         })
@@ -330,7 +337,8 @@ fn conversion_preserves_the_pools_original_payload_inventory() {
         pool.validate_original_source_inventory(identity, *bytes)
             .unwrap();
     }
-    let lease = transformed.source()
+    let lease = transformed
+        .source()
         .acquire_lease(TensorReadRequest {
             key: "model.proj.weight".into(),
             selection: TensorSelection::Full,
@@ -339,22 +347,22 @@ fn conversion_preserves_the_pools_original_payload_inventory() {
         .unwrap();
     assert!(lease.encoded_bytes().unwrap().iter().any(|&byte| byte != 0));
     drop((inventories, transformed, context, owner));
-    assert_eq!(pool.used_bytes().unwrap(), quotes[0]);
+    assert_eq!(pool.fixture_host_charge().unwrap(), quotes[0]);
     drop(lease);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
 fn original_output_admission_failure_retires_the_allocated_prefix_without_reads() {
     use eredu_runtime::working_memory::{
-        OriginalMemoryTensorError, WorkingMemoryError, WorkingMemoryPool,
+        MemoryLedger, OriginalMemoryTensorError, WorkingMemoryError,
     };
     let Some(quotes) = original_output_quotes() else {
         return;
     };
     let (_directory, source, _) = direct_fixture();
     let reads = source.source_diagnostics().unwrap().physical_reads;
-    let pool = WorkingMemoryPool::new(quotes.iter().sum::<u64>() - 1, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(quotes.iter().sum::<u64>() - 1, 0).unwrap();
     let plan = BoundedQuantizationPlan::new(
         AffineQuantization::default(),
         320,
@@ -369,8 +377,12 @@ fn original_output_admission_failure_retires_the_allocated_prefix_without_reads(
     };
     let error = error.downcast_ref::<OriginalMemoryTensorError>().unwrap();
     assert!(matches!(error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
-        if *required_bytes == quotes[2] && *available_bytes == quotes[2] - 1));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+        Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))
+        if *required_bytes == quotes[2] && limit_bytes.checked_sub(*existing_bytes).unwrap() == quotes[2] - 1));
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, reads);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

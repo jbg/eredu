@@ -21,6 +21,7 @@ where
         demand: eredu_core::OutputDemand,
         stream: &Stream,
         mut completion: Option<&mut dyn AutoregressiveSequenceCompletion>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
     ) -> Result<Option<Array>, Error> {
         let metadata = completion.as_ref().map(|value| value.metadata_context());
         let funding = metadata
@@ -66,54 +67,17 @@ where
             None => PreparedCompositeInput::new(&prepared, &admitted)
                 .map_err(Error::ArchitectureModel)?,
         };
-        let output = external_state::with_state_and_metadata(
+        let output = super::super::autoregressive_transaction::run(
             &mut self.session,
             cache,
+            paired,
+            prefill,
+            demand,
             stream,
+            completion,
+            checkpoint,
             funding.as_ref(),
-            |session, _prior| {
-                let result = match completion {
-                    Some(completion) if prefill => session
-                        .prefill_span_with_checkpoint_and_completion(
-                            paired,
-                            demand,
-                            stream,
-                            checkpoint.expect("original completion retains checkpoint"),
-                            funding
-                                .as_ref()
-                                .expect("original completion retains funding"),
-                            |output, state, stream| {
-                                completion.complete(output.map(MlxTensor::as_array), state, stream)
-                            },
-                        ),
-                    Some(completion) => session
-                        .sequence_logits_with_checkpoint_and_completion(
-                            paired,
-                            eredu_runtime::ExpertPass::Decode,
-                            stream,
-                            checkpoint.expect("original completion retains checkpoint"),
-                            |output, state, stream| {
-                                completion.complete(Some(output.as_array()), state, stream)
-                            },
-                        )
-                        .map(Some),
-                    None => session
-                        .sequence_logits(
-                            paired,
-                            if prefill {
-                                eredu_runtime::ExpertPass::Prefill
-                            } else {
-                                eredu_runtime::ExpertPass::Decode
-                            },
-                            stream,
-                        )
-                        .map(Some),
-                };
-                result.map_err(|cause| match funding.as_ref() {
-                    Some(funding) => Error::Neural(funding.metadata_source(cause)),
-                    None => Error::Other(Box::new(cause)),
-                })
-            },
+            observer,
         )?;
         Ok(self.published(output.map(MlxTensor::into_array)))
     }
@@ -128,7 +92,7 @@ pub(super) fn prepare_media_semantics<A, D, P>(
     source: &eredu_runtime::working_memory::OriginalPreparedHostInput,
     cache: &mut MlxPredictionTargetState,
     blueprint: &eredu_architectures::prepared_execution::PreparedInferenceBlueprint,
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
     funding: &eredu_nn::workspace::HostMetadataFunding,
     stream: &Stream,
 ) -> Result<eredu_architectures::media_plan::BoundPreparedMediaSemantics, Error>

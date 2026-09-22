@@ -39,7 +39,11 @@ impl<'a> PreparedPagedKvCopy<'a> {
             matches!(self.source, KvCopySource::Live(_)), nested
         )?;
         slots
-            .checked_add(self.storage.host_preparation_bytes(self.controls).ok_or(E::Overflow)?)
+            .checked_add(
+                self.storage
+                    .host_preparation_bytes(self.controls)
+                    .ok_or(E::Overflow)?,
+            )
             .ok_or(E::Overflow)
     }
     pub(crate) fn construct_dense(
@@ -47,7 +51,7 @@ impl<'a> PreparedPagedKvCopy<'a> {
         stage: InferencePreparationStage,
         funding: &WorkingMemoryFundingRun,
         complete: WorkingMemoryStorage<StorageIdentity>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         host: &HostPreparationAuthority,
     ) -> Result<(InitializedPagedDenseCopy<'a>, WorkingMemoryFundingScope), Error> {
         let PreparedPagedKvHostCopy { slots, work } = self.host_copy(pool, host)?;

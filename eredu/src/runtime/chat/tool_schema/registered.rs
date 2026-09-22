@@ -10,7 +10,7 @@ use eredu_core::{
 };
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError, WorkspaceContext};
 use eredu_runtime::working_memory::{
-    OriginalSemanticControllerSource, OriginalToolValidation, WorkingMemoryError, WorkingMemoryPool,
+    MemoryLedger, OriginalSemanticControllerSource, OriginalToolValidation, WorkingMemoryError,
 };
 use std::{
     alloc::Layout,
@@ -209,7 +209,7 @@ impl Historical {
                 size_of::<Result<&Data, PreparationCause>>(),
                 size_of::<Option<&Data>>(),
                 size_of::<(&Self, &ConstraintRecipe, &HostMetadataFunding)>(),
-                size_of::<(OriginalSemanticControllerSource<'_>, &WorkingMemoryPool)>(),
+                size_of::<(OriginalSemanticControllerSource<'_>, &MemoryLedger)>(),
                 size_of::<Result<(), WorkingMemoryError>>(),
             ];
             funding.reserve_metadata(
@@ -360,7 +360,7 @@ impl OriginalToolValidation for Callback {
     fn validate_source(
         &self,
         controller: OriginalSemanticControllerSource<'_>,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<(), WorkingMemoryError> {
         let OriginalSemanticControllerSource::Grammar(grammar) = controller else {
             return Err(WorkingMemoryError::IdentityMismatch);

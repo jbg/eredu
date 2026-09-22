@@ -184,10 +184,12 @@ fn affine_submission_validates_geometry_before_resource_creation() {
         (Dtype::Float32, Dtype::Float16, 2, usize::MAX, 64, 32, 4),
         (Dtype::Float32, Dtype::Float16, 2, 1, usize::MAX, 32, 4),
     ] {
-        assert!(OperationEvent::cpu_affine_quantize_submission_layout(
-            dtype, companion, rank, rows, columns, group, bits
-        )
-        .is_none());
+        assert!(
+            OperationEvent::cpu_affine_quantize_submission_layout(
+                dtype, companion, rank, rows, columns, group, bits
+            )
+            .is_none()
+        );
     }
 }
 #[test]
@@ -427,8 +429,8 @@ fn affine_submission_companion_refusals_retire_accepted_buffers() {
 #[test]
 fn affine_submission_outputs_keep_physical_custody_after_scope_and_budget_drop() {
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     if !qualified() {
         return;

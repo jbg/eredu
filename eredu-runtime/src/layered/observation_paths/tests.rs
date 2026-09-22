@@ -106,7 +106,7 @@ impl Drop for Charge {
     fn drop(&mut self) {
         assert!(self.retired.load(Ordering::SeqCst));
         self.other
-            .try_attach(&SharedStorageDomain::default(), || {
+            .try_attach(&SharedStorageAccountingId::default(), || {
                 Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(()))
             })
             .unwrap();
@@ -129,8 +129,8 @@ fn aliases_share_physical_strings_and_all_domains_retire_after_payload() {
         owner.unit_paths(0, 0).unwrap().0.as_ptr(),
         alias.unit_paths(0, 0).unwrap().0.as_ptr()
     );
-    let domain = SharedStorageDomain::default();
-    for domain in [&domain, &SharedStorageDomain::default()] {
+    let domain = SharedStorageAccountingId::default();
+    for domain in [&domain, &SharedStorageAccountingId::default()] {
         assert!(owner
             .try_attach(domain, || Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(
                 Charge {
@@ -165,7 +165,7 @@ fn provider_failure_is_retryable_and_poison_preserves_earlier_custody() {
     let retired = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));
     Arc::get_mut(&mut owner.0).unwrap().retired = Some(PayloadRetired(retired.clone()));
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     assert!(matches!(
         owner.try_attach(&domain, || Err(AttachmentFailure)),
         Err(SharedStorageAttachmentError::Provider(AttachmentFailure))
@@ -181,13 +181,13 @@ fn provider_failure_is_retryable_and_poison_preserves_earlier_custody() {
         .unwrap());
     let alias = owner.clone();
     assert!(catch_unwind(AssertUnwindSafe(|| {
-        let _ = owner.try_attach::<Infallible>(&SharedStorageDomain::default(), || {
+        let _ = owner.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || {
             panic!("provider unwind")
         });
     }))
     .is_err());
     assert!(matches!(
-        owner.try_attach::<Infallible>(&SharedStorageDomain::default(), || panic!(
+        owner.try_attach::<Infallible>(&SharedStorageAccountingId::default(), || panic!(
             "poison cannot acquire"
         )),
         Err(SharedStorageAttachmentError::Poisoned)
@@ -203,8 +203,12 @@ fn runtime_stamp_invalidation_never_mutates_the_shared_source() {
     let source = source();
     let mut first = ObservationBinding::new();
     let second = ObservationBinding::new();
-    let prepared = first.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
-    let rebound = second.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+    let prepared = first
+        .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+        .unwrap();
+    let rebound = second
+        .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+        .unwrap();
     first.validate::<Infallible>(&prepared).unwrap();
     assert!(matches!(
         second.validate::<Infallible>(&prepared),
@@ -217,7 +221,9 @@ fn runtime_stamp_invalidation_never_mutates_the_shared_source() {
         first.validate::<Infallible>(&prepared),
         Err(PreparedLayeredObservationError::BindingMismatch)
     ));
-    let fresh = first.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+    let fresh = first
+        .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+        .unwrap();
     first.validate::<Infallible>(&fresh).unwrap();
     second.validate::<Infallible>(&rebound).unwrap();
     assert!(fresh.source().same_storage(prepared.source()));
@@ -336,22 +342,30 @@ mod fragments;
 fn original_fingerprint_rejects_foreign_runtime_and_same_source_rebinding() {
     let source = source();
     let mut original = ObservationBinding::new();
-    let token = original.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+    let token = original
+        .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+        .unwrap();
     let fingerprint = token.binding_identity();
     assert!(fingerprint.matches(&token));
     for _ in 0..4 {
-        let same = original.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+        let same = original
+            .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+            .unwrap();
         original.validate::<Infallible>(&same).unwrap();
         assert!(fingerprint.matches(&same));
     }
     let foreign = ObservationBinding::new();
-    let foreign_token = foreign.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+    let foreign_token = foreign
+        .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+        .unwrap();
     foreign.validate::<Infallible>(&foreign_token).unwrap();
     assert!(foreign_token.source().same_storage(token.source()));
     assert!(!fingerprint.matches(&foreign_token));
     original.invalidate();
     assert!(original.validate::<Infallible>(&token).is_err());
-    let rebound = original.prepare(source, &metadata::Destination::<Infallible>(None)).unwrap();
+    let rebound = original
+        .prepare(source, &metadata::Destination::<Infallible>(None))
+        .unwrap();
     original.validate::<Infallible>(&rebound).unwrap();
     assert!(!fingerprint.matches(&rebound));
 }
@@ -360,13 +374,17 @@ fn original_fingerprint_rejects_foreign_runtime_and_same_source_rebinding() {
 fn fingerprint_keeps_only_original_control_block_not_prepared_runtime_alive() {
     let source = source();
     let mut original = ObservationBinding::new();
-    let token = original.prepare(source.clone(), &metadata::Destination::<Infallible>(None)).unwrap();
+    let token = original
+        .prepare(source.clone(), &metadata::Destination::<Infallible>(None))
+        .unwrap();
     let fingerprint = token.binding_identity();
     assert_eq!(fingerprint.runtime.strong_count(), 2);
     original.invalidate();
     drop(token);
     assert_eq!(fingerprint.runtime.strong_count(), 0);
-    let rebound = original.prepare(source, &metadata::Destination::<Infallible>(None)).unwrap();
+    let rebound = original
+        .prepare(source, &metadata::Destination::<Infallible>(None))
+        .unwrap();
     assert!(!fingerprint.matches(&rebound));
 }
 

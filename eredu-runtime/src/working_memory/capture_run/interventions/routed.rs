@@ -1,5 +1,6 @@
 //! One spent original claim spans every actual routed provider chunk.
 use super::*;
+use crate::intervention::InterventionPrefillWindow;
 use crate::intervention::PreparedRoutedIntervention;
 use crate::intervention::routed::progress;
 
@@ -11,12 +12,14 @@ pub struct RoutedInterventionCursor<'a> {
     progress: RoutedUnitInterventionReceipt,
     pending: bool,
     charged: Option<CaptureUsage>,
+    prefill: Option<eredu_core::InferenceGeometry>,
 }
 /// Short exclusive native batch loan; it cannot reset or clone its cursor.
 #[derive(Debug)]
 pub struct RoutedInterventionBatch<'c, 'a> {
     cursor: &'c mut RoutedInterventionCursor<'a>,
     range: [u64; 2],
+    prefill: Option<InterventionPrefillWindow>,
 }
 fn failed() -> CaptureRunHostError {
     CaptureRunHostError::ReceiptMismatch
@@ -32,6 +35,7 @@ impl<'a> RoutedInterventionCursor<'a> {
             },
             pending: false,
             charged: None,
+            prefill: None,
         }
     }
     /// Borrow the same spent claim for native source and model/numerical checks.
@@ -67,6 +71,52 @@ impl<'a> RoutedInterventionCursor<'a> {
         &mut self,
         range: [u64; 2],
     ) -> Result<RoutedInterventionBatch<'_, 'a>, CaptureRunHostError> {
+        if self.prefill.is_some() {
+            return Err(failed());
+        }
+        self.begin_batch_inner(range, None)
+    }
+    /// Loan the next actual provider batch within a checked ordinary prompt
+    /// chunk. Native row coordinates stay local; cursor progress is logical.
+    pub fn begin_prefill_batch(
+        &mut self,
+        window: InterventionPrefillWindow,
+        range: [u64; 2],
+    ) -> Result<RoutedInterventionBatch<'_, 'a>, CaptureRunHostError> {
+        self.validate_prefill(window)?;
+        let [start, end] = window.range();
+        if range[0] >= range[1] || range[1] > end - start {
+            return Err(failed());
+        }
+        let global = [start.checked_add(range[0]), start.checked_add(range[1])];
+        self.begin_batch_inner(
+            [
+                global[0].ok_or(WorkingMemoryError::Overflow)?,
+                global[1].ok_or(WorkingMemoryError::Overflow)?,
+            ],
+            Some(window),
+        )
+    }
+    fn validate_prefill(
+        &self,
+        window: InterventionPrefillWindow,
+    ) -> Result<(), CaptureRunHostError> {
+        self.claim.identity.custody.validate()?;
+        window
+            .validate(self.claim.admission())
+            .map_err(|_| failed())?;
+        if self.prefill != Some(window.inference())
+            || self.progress.source_tokens != window.logical_positions()
+        {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn begin_batch_inner(
+        &mut self,
+        range: [u64; 2],
+        prefill: Option<InterventionPrefillWindow>,
+    ) -> Result<RoutedInterventionBatch<'_, 'a>, CaptureRunHostError> {
         self.claim.identity.custody.validate()?;
         if self.pending || self.charged.is_none() {
             return Err(failed());
@@ -77,6 +127,7 @@ impl<'a> RoutedInterventionCursor<'a> {
         Ok(RoutedInterventionBatch {
             cursor: self,
             range,
+            prefill,
         })
     }
     /// Provisional frame receipt only; the numerical owner still must complete
@@ -92,6 +143,10 @@ impl<'a> RoutedInterventionCursor<'a> {
     }
 }
 impl<'a> RoutedInterventionBatch<'_, 'a> {
+    /// Actual ordinary chunk source, when this batch belongs to scheduled prefill.
+    pub fn prefill_window(&self) -> Option<InterventionPrefillWindow> {
+        self.prefill
+    }
     /// Same claim identity and source; no fresh native authority is introduced.
     pub fn claim(&self) -> &CaptureInterventionClaim<'a> {
         &self.cursor.claim
@@ -121,6 +176,72 @@ impl<'a> RoutedInterventionBatch<'_, 'a> {
 }
 
 impl<'a> ScheduledCaptureStep<'a> {
+    /// Borrow the same original sparse claim across canonical prompt chunks.
+    /// The caller still supplies actual native source and completion evidence.
+    pub fn take_prefill_routed_intervention_cursor(
+        &mut self,
+        index: usize,
+        window: InterventionPrefillWindow,
+    ) -> Result<RoutedInterventionCursor<'a>, CaptureRunHostError> {
+        let plan = self.intervention_admission().ok_or_else(failed)?;
+        window.validate(plan).map_err(|_| failed())?;
+        InterventionPrefillWindow::validate_operation(plan, index).map_err(|_| failed())?;
+        if self.claim.invocation.is_some()
+            || self.claim.phase != CapturePhase::Prefill
+            || self.claim.prediction != 0
+            || plan
+                .plan()
+                .operations
+                .get(index)
+                .is_none_or(|operation| operation.evidence != InterventionEvidence::None)
+        {
+            return Err(failed());
+        }
+        let mut cursor = self.take_routed_intervention_cursor(index, window.logical_positions())?;
+        if cursor.prefill.is_none()
+            && cursor.progress.completed_tokens == 0
+            && window.range()[0] == 0
+        {
+            cursor.prefill = Some(window.inference());
+        }
+        cursor.validate_prefill(window)?;
+        if cursor.progress.completed_tokens < window.range()[0]
+            || cursor.progress.completed_tokens >= window.range()[1]
+        {
+            return Err(failed());
+        }
+        Ok(cursor)
+    }
+    /// Require every actual provider range in this chunk before advancing the
+    /// ordinary traversal. Only its final chunk closes the original operation.
+    pub fn finish_prefill_routed_intervention_chunk(
+        &mut self,
+        index: usize,
+        window: InterventionPrefillWindow,
+    ) -> Result<(), CaptureRunHostError> {
+        self.validate_prefill_routed_intervention_chunk(index, window)?;
+        if window.is_final() {
+            self.finish_routed_intervention(index)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_prefill_routed_intervention_chunk(
+        &self,
+        index: usize,
+        window: InterventionPrefillWindow,
+    ) -> Result<(), CaptureRunHostError> {
+        let cursor = self
+            .claim
+            .routed_interventions
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or_else(failed)?;
+        cursor.validate_prefill(window)?;
+        if cursor.pending || cursor.progress.completed_tokens != window.range()[1] {
+            return Err(failed());
+        }
+        Ok(())
+    }
     /// Move the one cursor out for a synchronous callback. A spent empty slot
     /// cannot create a replacement cursor after abandonment or failure.
     pub fn take_routed_intervention_cursor(
@@ -129,8 +250,12 @@ impl<'a> ScheduledCaptureStep<'a> {
         source_tokens: u64,
     ) -> Result<RoutedInterventionCursor<'a>, CaptureRunHostError> {
         self.claim.custody.validate()?;
-        if self.frame.interventions().get(index).is_none_or(|record|record.outcome!=InterventionOutcome::Missing
-            || record.routed_units.is_some_and(|receipt|receipt.source_tokens!=source_tokens)) {
+        if self.frame.interventions().get(index).is_none_or(|record| {
+            record.outcome != InterventionOutcome::Missing
+                || record
+                    .routed_units
+                    .is_some_and(|receipt| receipt.source_tokens != source_tokens)
+        }) {
             return Err(failed());
         }
         let slot = self
@@ -167,9 +292,19 @@ impl<'a> ScheduledCaptureStep<'a> {
         {
             return Err(failed());
         }
-        if self.frame.interventions().get(identity.index).is_none_or(|record|
-            record.outcome!=InterventionOutcome::Missing || record.routed_units.is_none_or(|initial|
-                initial.source_tokens!=cursor.progress.source_tokens || initial.completed_tokens!=0 || initial.affected_values!=0)) {
+        if self
+            .frame
+            .interventions()
+            .get(identity.index)
+            .is_none_or(|record| {
+                record.outcome != InterventionOutcome::Missing
+                    || record.routed_units.is_none_or(|initial| {
+                        initial.source_tokens != cursor.progress.source_tokens
+                            || initial.completed_tokens != 0
+                            || initial.affected_values != 0
+                    })
+            })
+        {
             return Err(failed());
         }
         let slot = self

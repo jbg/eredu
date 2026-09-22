@@ -12,7 +12,7 @@ fn converted(error: &(dyn std::error::Error + 'static)) {
 }
 #[test]
 fn generated_token_public_observation_uses_provider_hook() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
     let (mut model, _, _) = fixture(&pool, true);
     let config = model
         .resolve_generation_config(GenerationConfigOverrides {
@@ -41,12 +41,17 @@ fn generated_token_public_observation_uses_provider_hook() {
 #[test]
 fn controlled_and_uninterrupted_facade_errors_use_provider_hook() {
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
         let (mut model, calls, _) = fixture(&pool, true);
         let cancel = eredu_core::GenerationCancellationToken::new();
         let source = model.chat_source(false, &cancel).unwrap().unwrap();
         let chat = model
-            .prepare_chat(&source, &request(), original_sources::CAPACITY, &cancel)
+            .prepare_chat(
+                &source,
+                &request(),
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancel,
+            )
             .unwrap()
             .unwrap();
         calls.borrow_mut().reject_submission = true;
@@ -75,12 +80,17 @@ fn controlled_and_uninterrupted_facade_errors_use_provider_hook() {
 
 #[test]
 fn prepared_chat_startup_preserves_provider_classification_and_source() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory::host_ledger(u64::MAX, 0).unwrap();
     let (mut model, calls, _) = fixture(&pool, true);
     let cancel = eredu_core::GenerationCancellationToken::new();
     let source = model.chat_source(false, &cancel).unwrap().unwrap();
     let chat = model
-        .prepare_chat(&source, &request(), original_sources::CAPACITY, &cancel)
+        .prepare_chat(
+            &source,
+            &request(),
+            &crate::memory::limits(original_sources::CAPACITY),
+            &cancel,
+        )
         .unwrap()
         .unwrap();
     calls.borrow_mut().reject_sampling = true;

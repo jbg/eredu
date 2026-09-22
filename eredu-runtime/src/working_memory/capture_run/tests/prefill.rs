@@ -1,7 +1,7 @@
 use super::*;
 
-mod progression;
 mod partition;
+mod progression;
 mod transfer;
 
 fn rows(preview: u64) -> SharedCapturePlan {
@@ -107,14 +107,14 @@ fn exact_original_h_covers_all_target_controls_and_rejects_one_short_before_allo
         planned.control_peak_bytes() >= 2 * size_of::<capture_tensor::prefill::TargetSlot>() as u64
     );
     for bytes in [h - 1, h] {
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, bytes);
         let before = ledger(&pool);
         let allocations = CLAIM_ALLOCATIONS.get();
         let result = run.prepare_capture_run(&r, plan(&source));
         if bytes < h {
             assert!(
-                matches!(result,Err(CaptureRunHostError::Memory(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==h&&available_bytes==bytes)
+                matches!(result,Err(CaptureRunHostError::Memory(WorkingMemoryError::DomainAllowanceExceeded{required_bytes,available_bytes, .. })) if required_bytes==h&&available_bytes==bytes)
             );
             assert_eq!(ledger(&pool), before);
             assert_eq!(CLAIM_ALLOCATIONS.get(), allocations);
@@ -135,13 +135,13 @@ fn exact_original_h_covers_all_target_controls_and_rejects_one_short_before_allo
             write_fragment(&mut step, 0, &a, 0);
             write_fragment(&mut step, 1, &b, 0);
             assert_eq!(ledger(&pool), hold);
-            assert_eq!(pool.used_bytes().unwrap(), h);
+            assert_eq!(pool.payload_used_bytes().unwrap(), h);
             drop(step);
             drop(bank);
         }
         drop(r);
         drop(run);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -149,7 +149,7 @@ fn exact_original_h_covers_all_target_controls_and_rejects_one_short_before_allo
 fn interleaved_targets_scatter_into_one_buffer_and_final_aliases_keep_original_h() {
     let source = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -185,7 +185,9 @@ fn interleaved_targets_scatter_into_one_buffer_and_final_aliases_keep_original_h
     let preview = tensor(&step.records()[1]);
     assert_eq!(
         values(full),
-        &[0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121.]
+        &[
+            0., 1., 10., 11., 20., 21., 100., 101., 110., 111., 120., 121.
+        ]
     );
     assert_eq!(values(preview), &[0., 1., 10., 11., 20.]);
     assert_eq!(values(full).as_ptr(), first.0);
@@ -199,10 +201,10 @@ fn interleaved_targets_scatter_into_one_buffer_and_final_aliases_keep_original_h
     drop(r);
     drop(run);
     drop(delivered);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     assert_eq!(values(&alias)[6], 100.);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -210,7 +212,7 @@ fn identity_order_duplicate_and_missing_target_reject_without_partial_row_advanc
     let source = rows(5);
     let foreign = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -222,9 +224,10 @@ fn identity_order_duplicate_and_missing_target_reject_without_partial_row_advanc
     let b = CapturePrefillRowAssembly::prepare(source.admission(), 1, geometry()).unwrap();
     step.begin_prefill_target(0, TensorDtype::F32, charge())
         .unwrap();
-    assert!(step
-        .begin_prefill_target(0, TensorDtype::F32, charge())
-        .is_err());
+    assert!(
+        step.begin_prefill_target(0, TensorDtype::F32, charge())
+            .is_err()
+    );
     assert!(step.take_tensor(0).is_err());
     let wrong = CapturePrefillRowAssembly::prepare(foreign.admission(), 0, geometry()).unwrap();
     let wrong_fragment = wrong.fragment(0).unwrap();
@@ -260,7 +263,7 @@ fn identity_order_duplicate_and_missing_target_reject_without_partial_row_advanc
 fn incomplete_initialized_data_cannot_seal_and_abort_keeps_same_partial_payload() {
     let source = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -302,23 +305,25 @@ fn incomplete_initialized_data_cannot_seal_and_abort_keeps_same_partial_payload(
     drop(source);
     let delivered = pending.finish().unwrap();
     assert_eq!(delivered.as_ref().outcome, CaptureStepOutcome::Aborted);
-    assert!(delivered
-        .as_ref()
-        .records
-        .iter()
-        .all(|r| r.payload.is_none()));
+    assert!(
+        delivered
+            .as_ref()
+            .records
+            .iter()
+            .all(|r| r.payload.is_none())
+    );
     drop(r);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(delivered);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn parent_close_and_unwind_retain_partial_payload_without_refilling_or_certifying() {
     let source = rows(5);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -330,16 +335,18 @@ fn parent_close_and_unwind_retain_partial_payload_without_refilling_or_certifyin
         .unwrap();
     let assembly = CapturePrefillRowAssembly::prepare(source.admission(), 0, geometry()).unwrap();
     let fragment = assembly.fragment(0).unwrap();
-    assert!(catch_unwind(AssertUnwindSafe(|| {
-        let mut writer = step
-            .take_prefill_fragment(0, &fragment)
-            .unwrap()
-            .prepare()
-            .unwrap();
-        writer.push_f32(3.).unwrap();
-        panic!("host caller unwind");
-    }))
-    .is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut writer = step
+                .take_prefill_fragment(0, &fragment)
+                .unwrap()
+                .prepare()
+                .unwrap();
+            writer.push_f32(3.).unwrap();
+            panic!("host caller unwind");
+        }))
+        .is_err()
+    );
     let partial = step.prefill_storage(0).unwrap();
     let usage = charged(&step);
     let pending = step.into_aborted_pending(usage, usage, 0.);
@@ -353,16 +360,16 @@ fn parent_close_and_unwind_retain_partial_payload_without_refilling_or_certifyin
     let pending = error.into_pending();
     assert_eq!(pending.prefill_storage(0), Some(partial));
     drop(r);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(pending);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn global_preview_zero_needs_real_empty_claim_but_skips_all_fragment_values() {
     let source = rows(0);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -403,31 +410,32 @@ fn global_preview_zero_needs_real_empty_claim_but_skips_all_fragment_values() {
     drop(r);
     drop(run);
     drop(delivered);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn wrong_geometry_and_unsupported_axis_spend_only_the_original_frame_claim() {
     for (index, source) in [rows(5), source()].into_iter().enumerate() {
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
         let mut geometry = geometry();
         if index == 0 {
             geometry.cached_positions = 99;
         }
-        assert!(bank
-            .begin_step(CapturePhase::Prefill, 0)
-            .unwrap()
-            .prepare_prefill(geometry)
-            .is_err());
+        assert!(
+            bank.begin_step(CapturePhase::Prefill, 0)
+                .unwrap()
+                .prepare_prefill(geometry)
+                .is_err()
+        );
         assert_eq!(bank.spent_steps(), 1);
         assert!(bank.begin_step(CapturePhase::Prefill, 0).is_err());
         drop(bank);
         drop(r);
         drop(run);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -436,7 +444,7 @@ fn closure_or_quarantine_during_fill_poison_target_and_preserve_original_buffer(
     for quarantine in [false, true] {
         let source = rows(5);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
         let mut step = bank
@@ -475,9 +483,12 @@ fn closure_or_quarantine_during_fill_poison_target_and_preserve_original_buffer(
         drop(r);
         let pending = pending.finish().unwrap_err().into_pending();
         assert_eq!(pending.prefill_storage(0), Some(partial));
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         drop(pending);
-        assert_eq!(pool.used_bytes().unwrap(), if quarantine { h } else { 0 });
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            if quarantine { h } else { 0 }
+        );
     }
 }
 
@@ -498,7 +509,7 @@ fn zero_full_shape_has_zero_coverage_but_still_requires_initial_claim_and_all_ch
     raw.selections.truncate(1);
     let source = admit(raw, point, 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -531,7 +542,7 @@ fn zero_full_shape_has_zero_coverage_but_still_requires_initial_claim_and_all_ch
     drop(r);
     drop(run);
     drop(delivered);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -556,7 +567,6 @@ fn inactive_prefill_row_checks_full_inference_frontier_before_construction() {
         let caps = CaptureCapabilities {
             transformations: vec![CaptureTransformKind::FullTensor],
             max_histogram_bins: 0,
-            physical_native_limit: false,
             conditions: vec![],
         };
         let mut raw = raw();
@@ -585,16 +595,18 @@ fn inactive_prefill_row_checks_full_inference_frontier_before_construction() {
         inference.max_output_tokens = 1;
         assert_eq!(inference.validate().is_err(), overflows);
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (reservation, run) = fresh(&pool, h);
         let mut bank = run
             .prepare_capture_run(&reservation, plan(&source))
             .unwrap();
         let before = ledger(&pool);
         let claim = bank.begin_step(CapturePhase::Prefill, 0).unwrap();
-        assert!(claim.row[1..]
-            .iter()
-            .all(|state| *state == ClaimState::Unavailable));
+        assert!(
+            claim.row[1..]
+                .iter()
+                .all(|state| *state == ClaimState::Unavailable)
+        );
         let result = claim.prepare_prefill(inference);
         if overflows {
             assert!(matches!(
@@ -623,7 +635,7 @@ fn inactive_prefill_row_checks_full_inference_frontier_before_construction() {
         drop(bank);
         drop(reservation);
         drop(run);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 

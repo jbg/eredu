@@ -35,7 +35,7 @@ fn fill(step: &mut ScheduledCaptureStep<'_>, encoded_bytes: u64) -> usize {
 fn detached_aborted_payload_is_owned_and_retains_custody_until_retirement() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -50,16 +50,16 @@ fn detached_aborted_payload_is_owned_and_retains_custody_until_retirement() {
     drop((bank, source));
     let erased: Box<dyn Send + Sync> = Box::new(pending);
     drop(erased);
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop((r, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn recovered_aborted_delivery_preserves_nonzero_payload_identity_and_schedule_records() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -100,9 +100,9 @@ fn recovered_aborted_delivery_preserves_nonzero_payload_identity_and_schedule_re
     assert_eq!(frame.cumulative_usage, usage);
     assert_eq!(frame.capture_seconds, 1.25);
     drop((delivered, r, run));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn detach_never_validates_a_closed_or_quarantined_parent_and_error_keeps_custody
     for quarantine in [false, true] {
         let source = source();
         let h = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(h, 0).unwrap();
+        let pool = capture_test_ledger(h, 0).unwrap();
         let (r, run) = fresh(&pool, h);
         let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
         let step = bank
@@ -135,9 +135,12 @@ fn detach_never_validates_a_closed_or_quarantined_parent_and_error_keeps_custody
         let error = error.into_pending().finish().unwrap_err();
         drop((bank, r, source));
         let erased: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
-        assert_eq!(pool.used_bytes().unwrap(), h);
+        assert_eq!(pool.payload_used_bytes().unwrap(), h);
         drop(erased);
-        assert_eq!(pool.used_bytes().unwrap(), if quarantine { h } else { 0 });
+        assert_eq!(
+            pool.payload_used_bytes().unwrap(),
+            if quarantine { h } else { 0 }
+        );
     }
 }
 
@@ -145,7 +148,7 @@ fn detach_never_validates_a_closed_or_quarantined_parent_and_error_keeps_custody
 fn invalid_completion_metadata_stays_rejected_without_losing_payload_or_refunding_claim() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -162,9 +165,9 @@ fn invalid_completion_metadata_stays_rejected_without_losing_payload_or_refundin
     let error = error.into_pending().finish().unwrap_err();
     assert!(matches!(error.error(), CaptureStepError::InvalidCompletion));
     drop((bank, r, run, source));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -176,7 +179,7 @@ fn encoded_failure_can_only_recover_same_aborted_frame_with_original_usage() {
     }]);
     let source = admit(raw(), declaration, 4, false);
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -208,9 +211,9 @@ fn encoded_failure_can_only_recover_same_aborted_frame_with_original_usage() {
     assert_eq!(delivered.step_usage(), usage);
     assert_eq!(delivered.cumulative_usage(), usage);
     drop((bank, r, run, source));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(delivered);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -229,7 +232,7 @@ fn observer_unwind_can_detach_frame_in_drop_and_preserves_spent_row_and_nonzero_
     }
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (r, run) = fresh(&pool, h);
     let mut bank = run.prepare_capture_run(&r, plan(&source)).unwrap();
     let mut step = bank
@@ -245,15 +248,17 @@ fn observer_unwind_can_detach_frame_in_drop_and_preserves_spent_row_and_nonzero_
         CLAIM_ALLOCATIONS.get(),
         TRANSFER_ALLOCATIONS.get(),
     );
-    assert!(catch_unwind(AssertUnwindSafe(|| {
-        let _guard = AbortOnDrop {
-            frame: Some(step),
-            output: &mut pending,
-            usage,
-        };
-        panic!("observer unwind after successful capture");
-    }))
-    .is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _guard = AbortOnDrop {
+                frame: Some(step),
+                output: &mut pending,
+                usage,
+            };
+            panic!("observer unwind after successful capture");
+        }))
+        .is_err()
+    );
     assert_eq!(
         (
             ledger(&pool),
@@ -273,16 +278,16 @@ fn observer_unwind_can_detach_frame_in_drop_and_preserves_spent_row_and_nonzero_
     };
     assert_eq!(values.as_ptr() as usize, pointer);
     drop((bank, r, run, source));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
     drop(frame);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn one_byte_short_rejects_entire_abort_owner_program_before_claim_or_frame_allocation() {
     let source = source();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h - 1, 0).unwrap();
+    let pool = capture_test_ledger(h - 1, 0).unwrap();
     let (r, run) = fresh(&pool, h - 1);
     let before = (
         ledger(&pool),
@@ -299,5 +304,5 @@ fn one_byte_short_rejects_entire_abort_owner_program_before_claim_or_frame_alloc
         before
     );
     drop((r, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

@@ -140,14 +140,14 @@ impl ProjectedPagedSources {
     }
 }
 
-struct CatalogWork<'a> {
-    sources: &'a [ProjectedPagedSource],
-    first: &'a ProjectedPagedSource,
-    plan: &'a InferenceSpanWorkspacePlan,
-    context: &'a WorkspaceContext,
+pub(super) struct CatalogWork<'a> {
+    pub(super) sources: &'a [ProjectedPagedSource],
+    pub(super) first: &'a ProjectedPagedSource,
+    pub(super) plan: &'a InferenceSpanWorkspacePlan,
+    pub(super) context: &'a WorkspaceContext,
 }
 impl CatalogWork<'_> {
-    fn prepare(
+    pub(super) fn prepare(
         self,
         mut loan: CacheBlockSourceLoan<'_>,
     ) -> Result<PreparedManagerCatalog, CacheSourceFailure> {

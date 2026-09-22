@@ -398,7 +398,9 @@ where
     .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
-pub(crate) fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<ParameterBindingTarget> {
+pub(crate) fn mlx_parameter_binding_target(
+    parameter: &crate::MlxTensor,
+) -> Option<ParameterBindingTarget> {
     let shape = parameter
         .as_array()
         .shape()
@@ -486,7 +488,8 @@ where
     F: Fn(&str) -> bool,
 {
     populate_module_from_lease_values(module, lease, excluded, |lease, name| {
-        match crate::backend::runtime::residency::manager::clone_original_source_value(lease, name)? {
+        match crate::backend::runtime::residency::manager::clone_original_source_value(lease, name)?
+        {
             Some(value) => Ok(value),
             None => Ok(lease.device_value(name)?.clone()),
         }
@@ -503,9 +506,12 @@ pub(crate) fn populate_module_from_ordinary_lease<M>(
 where
     M: Parameterized<crate::MlxTensor>,
 {
-    populate_module_from_lease_values(module, lease, |_| false, |lease, name| {
-        Ok(lease.device_value(name)?.clone())
-    })
+    populate_module_from_lease_values(
+        module,
+        lease,
+        |_| false,
+        |lease, name| Ok(lease.device_value(name)?.clone()),
+    )
 }
 
 fn populate_module_from_lease_values<M, F, V>(
@@ -548,6 +554,24 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
+    populate_module_from_original_lease_replacing(module, lease, limit, excluded, None)
+}
+
+/// Uses the same funded row population and one fallible native handle per row.
+/// Completed replacements keep their independent original backing owners.
+pub(crate) fn populate_module_from_original_lease_replacing<M, F>(
+    module: &mut M,
+    lease: &ResidentUnitLease,
+    limit: usize,
+    excluded: F,
+    replacements: Option<
+        &eredu_runtime::parameter_operations::ParameterReplacementValues<crate::MlxTensor>,
+    >,
+) -> Result<(), ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+    F: Fn(&str) -> bool,
+{
     let count = lease.binding_names().count();
     if count > limit {
         return Err(ModuleBindingError::PreparedBindingCapacity);
@@ -559,10 +583,11 @@ where
         if rows.len() == count {
             return Err(ModuleBindingError::PreparedBindingCapacity);
         }
-        let value = lease
-            .device_value(name)?
-            .try_clone_handle()
-            .map_err(ModuleBindingError::PreparedBindingNative)?;
+        let value = match replacements.and_then(|values| values.get(name)) {
+            Some(value) => value.as_array().try_clone_handle(),
+            None => lease.device_value(name)?.try_clone_handle(),
+        }
+        .map_err(ModuleBindingError::PreparedBindingNative)?;
         rows.push(eredu_runtime::PreparedParameterBinding::new(
             name,
             crate::MlxTensor::from_array(value),
@@ -595,6 +620,8 @@ pub(crate) fn original_parameter_binding_control_bytes(rows: usize) -> Option<us
         .checked_add(size_of::<&str>())?
         .checked_add(size_of::<[usize;3]>())?
         .checked_add(size_of::<&dyn Fn(&str)->bool>())?
+        .checked_add(size_of::<Option<&eredu_runtime::parameter_operations::ParameterReplacementValues<crate::MlxTensor>>>())?
+        .checked_add(size_of::<Option<&crate::MlxTensor>>())?
         .checked_add(size_of::<<crate::backend::runtime::residency::manager::ResidentLeaseStorage
             as eredu_runtime::ResidencyLeaseStorage>::BindingNames<'static>>())
 }
@@ -701,34 +728,37 @@ mod tests {
         }
 
         impl Parameterized<crate::MlxTensor> for Module {
-            fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), eredu_nn::ParameterSourceError>
+            fn visit_parameter_sources<'a, V>(
+                &'a self,
+                visitor: &mut V,
+            ) -> Result<(), eredu_nn::ParameterSourceError>
             where
                 V: eredu_nn::ParameterSourceVisitor<'a, crate::MlxTensor>,
             {
- let mut __source_result = Ok(());
+                let mut __source_result = Ok(());
 
                 visitor.parameter(
-                    eredu_nn::ParameterMetadataView::from_spec(&self.weight_spec,true),
+                    eredu_nn::ParameterMetadataView::from_spec(&self.weight_spec, true),
                     &self.weight,
                 );
                 visitor.parameter(
-                    eredu_nn::ParameterMetadataView::from_spec(&self.scales_spec,true),
+                    eredu_nn::ParameterMetadataView::from_spec(&self.scales_spec, true),
                     &self.scales,
                 );
 
- __source_result
-}
+                __source_result
+            }
 
             fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
             where
                 V: ParameterVisitorMut<'a, crate::MlxTensor>,
             {
                 visitor.visit_mut(
-                    eredu_nn::ParameterMetadataView::from_spec(&self.weight_spec,true),
+                    eredu_nn::ParameterMetadataView::from_spec(&self.weight_spec, true),
                     &mut self.weight,
                 );
                 visitor.visit_mut(
-                    eredu_nn::ParameterMetadataView::from_spec(&self.scales_spec,true),
+                    eredu_nn::ParameterMetadataView::from_spec(&self.scales_spec, true),
                     &mut self.scales,
                 );
             }

@@ -4,10 +4,10 @@ use eredu_core::{
     GenerationDecoderInput, GenerationDecoderOutput, GenerationSequenceBankRejection,
 };
 use eredu_text::stop_storage::StopCompilePlan;
-fn decoder(pool: &WorkingMemoryPool) -> LoadedDecodeSource {
+fn decoder(pool: &MemoryLedger) -> LoadedDecodeSource {
     super::loaded::loaded(pool)
 }
-fn stops(pool: &WorkingMemoryPool, strings: &[&str]) -> OriginalStopSource {
+fn stops(pool: &MemoryLedger, strings: &[&str]) -> OriginalStopSource {
     pool.compile_stop_source(StopCompilePlan::prepare_refs(strings).unwrap())
         .unwrap()
 }
@@ -43,7 +43,8 @@ fn two_plain_requests_share_exact_sources_across_three_real_routes_and_capture()
                     LoadedGenerationDecoderInput::new_plain_text(&decoder, &stops, 5, false)
                         .unwrap();
                 let options = capture.then(|| eredu_core::TextPreparationOptions {
-                    interventions: None, capture: Some(capture_source_for_geometry(InferenceGeometry {
+                    interventions: None,
+                    capture: Some(capture_source_for_geometry(InferenceGeometry {
                         max_output_tokens: 5,
                         ..geometry()
                     })),
@@ -89,21 +90,22 @@ fn two_plain_requests_share_exact_sources_across_three_real_routes_and_capture()
                 previous_r = Some(r);
                 let (_, held) = retire_request(&state);
                 drop((input, foreign, changed_skip));
-                assert_eq!(pool.used_bytes().unwrap(), cold + held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
                 let tokens = sequence.into_token_ids();
                 assert_eq!(tokens.as_ptr(), address);
                 assert_eq!(tokens.as_ref(), [0, 1]);
                 drop(tokens);
-                assert_eq!(pool.used_bytes().unwrap(), cold);
+                assert_eq!(pool.payload_used_bytes().unwrap(), cold);
                 if run == 0 {
-                    state.borrow_mut().root = Some(pool.register_storage([(1u32, 64)]).unwrap());
+                    state.borrow_mut().root =
+                        Some(pool.register_host_storage([(1u32, 64)]).unwrap());
                 }
             }
             assert_eq!(state.borrow().decoder_takes, 2);
             drop(runtime);
-            assert_eq!(pool.used_bytes().unwrap(), cold);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold);
             drop((decoder, stops));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -128,7 +130,7 @@ fn shared_stop_request_prices_destinations_without_copying_original_source_bytes
         drop(sequence);
         retire_request(&state);
         drop((runtime, input, decoder, stops));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
     assert_eq!(results[0].0, results[1].0);
     assert!(results[1].1 > results[0].1);
@@ -142,7 +144,7 @@ fn both_original_pools_preflight_and_one_claim_reject_foreign_replay_and_short_a
     let decoder = decoder(&pool);
     let stops = stops(&pool, &[" é"]);
     let cold = decoder.original_bytes() + stops.original_bytes();
-    let foreign_pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let foreign_pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
     let foreign_stops = self::stops(&foreign_pool, &[" é"]);
     for _ in 0..32 {
         assert!(matches!(
@@ -150,7 +152,7 @@ fn both_original_pools_preflight_and_one_claim_reject_foreign_replay_and_short_a
             Err(WorkingMemoryError::IdentityMismatch)
         ));
     }
-    assert_eq!(pool.used_bytes().unwrap(), cold + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + 64);
     let input = LoadedGenerationDecoderInput::new_plain_text(&decoder, &stops, 3, true).unwrap();
     attach(&state, &input);
     assert!(extract_decoder(&mut runtime, 0, 3, &input, &consumer(), None).is_err());
@@ -169,16 +171,18 @@ fn both_original_pools_preflight_and_one_claim_reject_foreign_replay_and_short_a
     state.borrow_mut().mode.short = true;
     assert!(extract_decoder(&mut runtime, 0, 3, &input, &plain(), None).is_err());
     assert_eq!(state.borrow().order, ["admit"]);
-    assert_eq!(pool.used_bytes().unwrap(), cold + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + 64);
     state.borrow_mut().mode.short = false;
     let replays: Vec<_> = (0..32)
         .map(|_| extract_decoder(&mut runtime, 0, 3, &input, &plain(), None).unwrap_err())
         .collect();
-    assert!(replays.iter().all(|error| error
-        .source()
-        .unwrap()
-        .downcast_ref::<GenerationSequenceBankRejection>()
-        == Some(&GenerationSequenceBankRejection::Unavailable)));
+    assert!(replays.iter().all(|error| {
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<GenerationSequenceBankRejection>()
+            == Some(&GenerationSequenceBankRejection::Unavailable)
+    }));
     assert_eq!(state.borrow().decoder_takes, 1);
     let fresh = LoadedGenerationDecoderInput::new_plain_text(&decoder, &stops, 3, true).unwrap();
     let sequence = extract_decoder(&mut runtime, 1, 3, &fresh, &plain(), None).unwrap();
@@ -194,8 +198,8 @@ fn both_original_pools_preflight_and_one_claim_reject_foreign_replay_and_short_a
         stops,
         foreign_stops,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.payload_used_bytes().unwrap(), 0);
     drop(replays);
 }
 #[test]
@@ -228,11 +232,11 @@ fn explicit_empty_plain_owner_and_dormant_cancel_preserve_sources_until_freeze()
             let cold = decoder.original_bytes() + stops.original_bytes();
             let (_, held) = retire_request(&state);
             drop((runtime, input, decoder, stops));
-            assert_eq!(pool.used_bytes().unwrap(), cold + held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), cold + held);
             let tokens = sequence.into_token_ids();
-            assert_eq!(pool.used_bytes().unwrap(), held);
+            assert_eq!(pool.payload_used_bytes().unwrap(), held);
             drop(tokens);
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -261,15 +265,15 @@ fn consuming_plain_provider_failure_keeps_both_sources_after_model_and_header_dr
     drop((runtime, input, decoder, stops));
     let failure = sequence.prepare_storage().unwrap_err();
     assert!(failure.cause().source().unwrap().is::<WorkingMemoryError>());
-    assert_eq!(pool.used_bytes().unwrap(), cold + held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held + 64);
     let failure = failure.into_sequence().prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), cold + held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold + held + 64);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn concurrent_genuine_claims_take_the_entire_plain_pair_once() {
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
     let decoder = decoder(&pool);
     let stops = stops(&pool, &[" é"]);
     let input = LoadedGenerationDecoderInput::new_plain_text(&decoder, &stops, 3, true).unwrap();
@@ -306,9 +310,9 @@ fn concurrent_genuine_claims_take_the_entire_plain_pair_once() {
             .collect::<Vec<_>>()
     });
     assert_eq!(outcomes.iter().filter(|x| **x).count(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), cold);
+    assert_eq!(pool.payload_used_bytes().unwrap(), cold);
     drop((input, decoder, stops));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -347,9 +351,9 @@ fn foreign_combined_bank_preserves_its_original_pair_and_rejects_equal_new_sourc
     let (_, held) = retire_request(&old);
     retire_request(&new);
     drop((first, second, a, b, a_decoder, a_stops, b_decoder, b_stops));
-    assert_eq!(new_pool.used_bytes().unwrap(), 0);
-    assert_eq!(old_pool.used_bytes().unwrap(), old_cold + held + 64);
+    assert_eq!(new_pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(old_pool.payload_used_bytes().unwrap(), old_cold + held + 64);
     drop(error);
-    assert_eq!(old_pool.used_bytes().unwrap(), 0);
+    assert_eq!(old_pool.payload_used_bytes().unwrap(), 0);
     drop(initial);
 }

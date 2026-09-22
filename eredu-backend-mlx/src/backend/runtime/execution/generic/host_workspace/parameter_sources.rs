@@ -40,7 +40,10 @@ fn dtype(value: safemlx::Dtype, unit: usize, row: usize) -> Result<WorkspaceDtyp
 }
 impl LayerwiseWorkspace {
     /// Same retained source manager; descriptive matching creates no operation grant.
-    pub(crate) fn parameter_source_matches_manager(&self, manager: &crate::backend::runtime::residency::manager::ResidencyManager) -> bool {
+    pub(crate) fn parameter_source_matches_manager(
+        &self,
+        manager: &crate::backend::runtime::residency::manager::ResidencyManager,
+    ) -> bool {
         manager.same_source_manager(&self.manager)
     }
 
@@ -52,6 +55,19 @@ impl LayerwiseWorkspace {
 }
 
 impl Rows for LayerwiseWorkspace {
+    fn retained_parameter(&self, unit: usize, row: usize) -> bool {
+        self.row(unit, row)
+            .ok()
+            .is_some_and(|value| self.replacement_row(value.binding.name()).is_some())
+    }
+    fn placement(&self, unit: usize, row: usize) -> Option<&eredu_core::MemoryPlacement> {
+        if let Ok(value) = self.row(unit, row) {
+            if let Some(replacement) = self.replacement_row(value.binding.name()) {
+                return Some(replacement.placement);
+            }
+        }
+        self.materialization_placement()
+    }
     fn excludes_parameter(&self, name: &str) -> bool {
         LayerwiseWorkspace::excludes_parameter(self, name)
     }
@@ -99,7 +115,7 @@ impl Rows for LayerwiseWorkspace {
         }
     }
     fn row(&self, unit: usize, row: usize) -> Result<Row<'_>, Failure> {
-        match &self.copies {
+        let declared: Result<Row<'_>, Failure> = match &self.copies {
             LayerwiseCopies::Host(copies) => {
                 let copy = copies
                     .units()
@@ -171,7 +187,22 @@ impl Rows for LayerwiseWorkspace {
                     },
                 })
             }
+        };
+        let mut value = declared?;
+        if let Some(replacement) = self.replacement_row(value.binding.name()) {
+            value.shape = &replacement.shape;
+            value.dtype = replacement.dtype;
+            value.representation = replacement.representation;
+            value.physical_bytes = replacement.logical_bytes;
+            value.capacity_bytes =
+                u64::try_from(replacement.allocation.bytes()).map_err(|_| Failure::Overflow)?;
+            value.owner = Owner {
+                unit,
+                row,
+                lifetime: Lifetime::Trace,
+            };
         }
+        Ok(value)
     }
     fn requested_unit(&self, ordinal: usize) -> Result<usize, Failure> {
         self.layout()

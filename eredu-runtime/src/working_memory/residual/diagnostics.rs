@@ -1,11 +1,11 @@
 //! One paid diagnostic report shared by aliases of the same numerical quote.
 use crate::working_memory::{WorkspaceReportError, WorkspaceReportMetadata};
 use eredu_core::{HostMetadataFunding, RuntimeStateEstimate};
-use eredu_nn::{workspace::WorkspaceMetadataError, Error};
+use eredu_nn::{Error, workspace::WorkspaceMetadataError};
 use std::{
     alloc::Layout,
     ops::Deref,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 #[derive(Debug)]

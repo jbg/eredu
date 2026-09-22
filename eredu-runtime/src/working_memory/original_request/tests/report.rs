@@ -100,7 +100,7 @@ pub(super) fn observe(
 fn original_report_source_destinations_fail_at_actual_reserves_under_same_q() {
     for site in 8..11 {
         let (mut runtime, f) = setup(false, None);
-        let baseline = f.pool.used_bytes().unwrap();
+        let baseline = f.pool.payload_used_bytes().unwrap();
         let q = probe_q(false);
         diagnostics::fail_destination_for_test(site);
         let error = TextGeneration::from_input_with_sequence(
@@ -127,7 +127,7 @@ fn original_report_source_destinations_fail_at_actual_reserves_under_same_q() {
             cause = e.source();
         }
         assert!(reserve);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
         assert!(f.pool.0.usage.lock().unwrap().pending_original.is_none());
         assert_eq!(f.facts.lock().unwrap().report_count, 0);
         assert_eq!(f.facts.lock().unwrap().prepared, 0);
@@ -142,17 +142,17 @@ fn original_report_source_destinations_fail_at_actual_reserves_under_same_q() {
             GenerationSequenceRequest::new(OUTPUTS, &EOS),
         )
         .unwrap();
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + 2 * q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + 2 * q);
         drop(fresh);
         drop(error);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     }
 }
 
 #[test]
 fn original_report_aliases_preserve_source_identity_and_retire_payload_before_q() {
     let (mut runtime, f) = setup(false, None);
-    let baseline = f.pool.used_bytes().unwrap();
+    let baseline = f.pool.payload_used_bytes().unwrap();
     let q = probe_q(false);
     let mut run = TextGeneration::from_input_with_sequence(
         &mut runtime,
@@ -193,7 +193,7 @@ fn original_report_aliases_preserve_source_identity_and_retire_payload_before_q(
     let source_bytes = f.sources.input.original_bytes() + f.sources.selected_model.original_bytes();
     drop(runtime);
     drop(f);
-    assert_eq!(pool.used_bytes().unwrap(), baseline + q);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline + q);
     let barrier = std::sync::Barrier::new(8);
     std::thread::scope(|scope| {
         for alias in aliases {
@@ -202,18 +202,18 @@ fn original_report_aliases_preserve_source_identity_and_retire_payload_before_q(
             scope.spawn(move || {
                 barrier.wait();
                 assert_eq!(alias.bytes(), retained);
-                assert_eq!(pool.used_bytes().unwrap(), baseline + q);
+                assert_eq!(pool.payload_used_bytes().unwrap(), baseline + q);
                 drop(alias);
             });
         }
     });
-    assert_eq!(pool.used_bytes().unwrap(), baseline - source_bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), baseline - source_bytes);
 }
 
 #[test]
 fn original_report_reduction_errors_retain_same_q_and_reuse_exact_destinations() {
     let (mut runtime, f) = setup(false, None);
-    let baseline = f.pool.used_bytes().unwrap();
+    let baseline = f.pool.payload_used_bytes().unwrap();
     let q = probe_q(false);
     let mut run = TextGeneration::from_input_with_sequence(
         &mut runtime,
@@ -257,7 +257,7 @@ fn original_report_reduction_errors_retain_same_q_and_reuse_exact_destinations()
         WorkingMemoryError::Overflow
     );
     assert_eq!(owner.bytes(), retained);
-    assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
     let malformed = [WorkspaceReportNode {
         alias_count: 1,
         ..nodes[0]
@@ -283,14 +283,14 @@ fn original_report_reduction_errors_retain_same_q_and_reuse_exact_destinations()
     assert_eq!(owner.bytes(), retained);
     drop(token);
     drop(run);
-    assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+    assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
 }
 
 #[test]
 fn original_report_nonblocking_busy_and_poison_errors_retain_buffers_and_q() {
     for poison in [false, true] {
         let (mut runtime, f) = setup(false, None);
-        let baseline = f.pool.used_bytes().unwrap();
+        let baseline = f.pool.payload_used_bytes().unwrap();
         let q = probe_q(false);
         let mut run = TextGeneration::from_input_with_sequence(
             &mut runtime,
@@ -349,7 +349,7 @@ fn original_report_nonblocking_busy_and_poison_errors_retain_buffers_and_q() {
         drop(token);
         drop(run);
         drop(owner);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline + q);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline + q);
         let mut chain: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         let mut cause_found = false;
         while let Some(cause) = chain {
@@ -358,6 +358,6 @@ fn original_report_nonblocking_busy_and_poison_errors_retain_buffers_and_q() {
         }
         assert!(cause_found);
         drop(error);
-        assert_eq!(f.pool.used_bytes().unwrap(), baseline);
+        assert_eq!(f.pool.payload_used_bytes().unwrap(), baseline);
     }
 }

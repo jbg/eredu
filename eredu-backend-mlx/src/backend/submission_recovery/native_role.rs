@@ -12,8 +12,9 @@ use safemlx::{
 };
 use std::mem::{size_of, size_of_val};
 
-pub(crate) mod realtime;
 pub(crate) mod cold;
+pub(crate) mod physical;
+pub(crate) mod realtime;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeRoleCapacity {
@@ -24,8 +25,11 @@ pub(crate) struct NativeRoleCapacity {
 fn overflow() -> Error {
     Error::WorkspacePlanning(HostMetadataFundingError::Overflow)
 }
-fn sum_controls(parts:&[usize])->Option<usize> {
-    parts.iter().copied().try_fold(size_of_val(parts),usize::checked_add)
+fn sum_controls(parts: &[usize]) -> Option<usize> {
+    parts
+        .iter()
+        .copied()
+        .try_fold(size_of_val(parts), usize::checked_add)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +60,9 @@ enum RoleCause {
         "original control backing requires {required} bytes but the admitted bank has {available}"
     )]
     BackingCapacity { required: usize, available: usize },
-    #[error("original control callback did not establish exact terminal completion ({phase}): {status:?}")]
+    #[error(
+        "original control callback did not establish exact terminal completion ({phase}): {status:?}"
+    )]
     Incomplete { phase: &'static str, status: Status },
 }
 #[derive(Debug, thiserror::Error)]
@@ -103,145 +109,225 @@ impl<I: 'static, C: Send + 'static> Retention for Retained<I, C> {
     fn observe(&self, _: Status) {}
 }
 
-/// Created only after this worker binds its actual child Scope to the retained
-/// parent. The borrowed relation supplies no quota or request authority.
+/// Created after this worker binds its actual child Scope to the retained
+/// parent. The budget loan comes from that same accepted role; borrowing it
+/// creates no additional allowance or request authority.
 pub(crate) struct NativeRoleContext<'a> {
     observer: &'a OriginalScopeObserver,
     parent: Option<&'a OriginalScopeObserver>,
+    budget: &'a OriginalBufferBudget,
 }
 impl NativeRoleContext<'_> {
-    pub(crate) fn observer(&self)->&OriginalScopeObserver {self.observer}
-    pub(crate) fn has_parent(&self,parent:&OriginalScopeObserver)->bool {
-        self.parent.is_some_and(|actual|actual.same_scope(parent))
+    pub(crate) fn observer(&self) -> &OriginalScopeObserver {
+        self.observer
+    }
+    pub(crate) fn budget(&self) -> &OriginalBufferBudget {
+        self.budget
+    }
+    pub(crate) fn has_parent(&self, parent: &OriginalScopeObserver) -> bool {
+        self.parent.is_some_and(|actual| actual.same_scope(parent))
     }
 }
 
 /// The shared worker's pure native-layout refusal. Runtime maps each variant
 /// back to its existing custody-retaining RoleFailure source.
-#[derive(Debug,thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeRoleControlError {
-    #[error(transparent)] Graph(safemlx::SubmissionGraphQuotaCause),
-    #[error(transparent)] Buffer(safemlx::OriginalBufferCause),
-    #[error(transparent)] Record(safemlx::SubmissionRecordQuotaCause),
-    #[error(transparent)] Failure(safemlx::PrefillFailureCause),
-    #[error(transparent)] Pipeline(safemlx::PipelineCacheCause),
-    #[error(transparent)] Control(safemlx::OriginalNativeControlError),
-    #[error("original native role control layout overflows")] Overflow,
+    #[error(transparent)]
+    Graph(safemlx::SubmissionGraphQuotaCause),
+    #[error(transparent)]
+    Buffer(safemlx::OriginalBufferCause),
+    #[error(transparent)]
+    Record(safemlx::SubmissionRecordQuotaCause),
+    #[error(transparent)]
+    Failure(safemlx::PrefillFailureCause),
+    #[error(transparent)]
+    Pipeline(safemlx::PipelineCacheCause),
+    #[error(transparent)]
+    Control(safemlx::OriginalNativeControlError),
+    #[error("original native role control layout overflows")]
+    Overflow,
 }
 impl From<NativeRoleControlError> for RoleCause {
-    fn from(cause:NativeRoleControlError)->Self {match cause {
-        NativeRoleControlError::Graph(e)=>Self::Graph(e),
-        NativeRoleControlError::Buffer(e)=>Self::Buffer(e),
-        NativeRoleControlError::Record(e)=>Self::Record(e),
-        NativeRoleControlError::Failure(e)=>Self::Failure(e),
-        NativeRoleControlError::Pipeline(e)=>Self::Pipeline(e),
-        NativeRoleControlError::Control(e)=>Self::Control(e),
-        NativeRoleControlError::Overflow=>Self::Backend(overflow()),
-    }}
+    fn from(cause: NativeRoleControlError) -> Self {
+        match cause {
+            NativeRoleControlError::Graph(e) => Self::Graph(e),
+            NativeRoleControlError::Buffer(e) => Self::Buffer(e),
+            NativeRoleControlError::Record(e) => Self::Record(e),
+            NativeRoleControlError::Failure(e) => Self::Failure(e),
+            NativeRoleControlError::Pipeline(e) => Self::Pipeline(e),
+            NativeRoleControlError::Control(e) => Self::Control(e),
+            NativeRoleControlError::Overflow => Self::Backend(overflow()),
+        }
+    }
 }
 /// Concrete callback storage is separate from the retained native wrapper.
 /// Cold adapters supply their actual closure size; runtime supplies size_of<F>.
 /// This is descriptive accounting and creates no submission authority.
-pub(crate) fn callback_control_bytes<T,E>(callback_bytes:usize)->Option<usize> {
-    sum_controls(&[callback_bytes,size_of::<T>(),size_of::<E>(),size_of::<Result<T,E>>(),
-        size_of::<Result<Result<T,E>,eredu_core::BackendFailure>>()])
+pub(crate) fn callback_control_bytes<T, E>(callback_bytes: usize) -> Option<usize> {
+    sum_controls(&[
+        callback_bytes,
+        size_of::<T>(),
+        size_of::<E>(),
+        size_of::<Result<T, E>>(),
+        size_of::<Result<Result<T, E>, eredu_core::BackendFailure>>(),
+    ])
 }
 /// Each variant supplies an already accepted native backing owner. The
 /// prepared variant additionally carries its exact current enclosing scope.
 enum RoleBudget<'a> {
-    Text(&'a BankOwner,&'a OriginalTextControlGuard),
-    Prepared(&'a OriginalBufferBudget,&'a OriginalScopeObserver),
+    Text(&'a BankOwner, &'a OriginalTextControlGuard),
+    Prepared(&'a OriginalBufferBudget, &'a OriginalScopeObserver),
     // Constructed only by realtime::run from its consumed accepted frame claim.
     Realtime(OriginalBufferBudget),
     // Constructed only after cold::Plan's actual source-account comparison.
     Cold(OriginalBufferBudget),
 }
 impl RoleBudget<'_> {
-    fn borrow(&self)->Result<OriginalBufferBudget,Error> {
+    fn borrow(&self) -> Result<OriginalBufferBudget, Error> {
         match self {
-            Self::Text(bank,controls)=>{
-                let bank=bank.try_borrow().map_err(|_|Error::PrefillScopeReentrant)?;
-                bank.budget_for_controls(controls).cloned().map_err(Error::PrefillControl)
+            Self::Text(bank, controls) => {
+                let bank = bank
+                    .try_borrow()
+                    .map_err(|_| Error::PrefillScopeReentrant)?;
+                bank.budget_for_controls(controls)
+                    .cloned()
+                    .map_err(Error::PrefillControl)
             }
-            Self::Realtime(budget)|Self::Cold(budget)=>Ok(budget.clone()),
-            Self::Prepared(budget,parent)=>{
-                if !parent.same_scope(&OriginalScopeObserver::require_current()?) {
-                    return Err(parent.domain_error().into());
-                }
+            Self::Realtime(budget) | Self::Cold(budget) => Ok(budget.clone()),
+            Self::Prepared(budget, parent) => {
+                // The retained producing root is mandatory. A current child
+                // is accepted only through its explicit collector ancestry.
+                crate::backend::nn::tensor::TokenValidationScope::capture_observer_for(parent)?;
                 Ok((*budget).clone())
             }
         }
     }
 }
-fn fixed_control_bytes<I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static>()->Option<usize> {
-    sum_controls(&[error_bytes::<C>()?,
-        size_of::<NativeRoleContext<'_>>(),size_of::<Retained<I,C>>(),
-        size_of::<PendingRole<I,C>>(),size_of::<PendingRole<I,C>>(),
-        size_of::<Result<PendingRole<I,C>,eredu_core::BackendFailure>>(),
-        size_of::<C>(),size_of::<Option<std::time::Duration>>(),size_of::<&HostMetadataFunding>(),
-        size_of::<(RoleBudget<'_>,&C,&Stream)>(),
-        size_of::<(&RoleBudget<'_>,Result<OriginalBufferBudget,Error>)>(),
-        size_of::<Result<OriginalBufferBudget,Error>>(),size_of::<Option<OriginalScopeObserver>>(),
-        size_of::<Status>(),size_of::<Result<(),Error>>(),
+fn fixed_control_bytes<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static>()
+-> Option<usize> {
+    sum_controls(&[
+        error_bytes::<C>()?,
+        size_of::<NativeRoleContext<'_>>(),
+        crate::backend::nn::tensor::TokenValidationScope::capture_observer_control_bytes()?,
+        size_of::<Retained<I, C>>(),
+        size_of::<PendingRole<I, C>>(),
+        size_of::<PendingRole<I, C>>(),
+        size_of::<Result<PendingRole<I, C>, eredu_core::BackendFailure>>(),
+        size_of::<C>(),
+        size_of::<Option<std::time::Duration>>(),
+        size_of::<&HostMetadataFunding>(),
+        size_of::<(RoleBudget<'_>, &C, &Stream)>(),
+        size_of::<(&RoleBudget<'_>, Result<OriginalBufferBudget, Error>)>(),
+        size_of::<Result<OriginalBufferBudget, Error>>(),
+        size_of::<Option<OriginalScopeObserver>>(),
+        size_of::<Status>(),
+        size_of::<Result<(), Error>>(),
         size_of::<Option<safemlx::error::Exception>>(),
         size_of::<(Status, &'static str, &OriginalScopeObserver)>(),
-        size_of::<std::time::Instant>(),size_of::<Option<std::time::Instant>>(),
+        size_of::<std::time::Instant>(),
+        size_of::<Option<std::time::Instant>>(),
         size_of::<std::time::Duration>(),
         size_of::<std::time::Duration>(),
-        size_of::<(safemlx::ScopedSubmissionProgress,safemlx::SubmissionStatus)>(),
-        size_of::<Result<(safemlx::ScopedSubmissionProgress,safemlx::SubmissionStatus),safemlx::error::Exception>>(),
+        size_of::<(safemlx::ScopedSubmissionProgress, safemlx::SubmissionStatus)>(),
+        size_of::<
+            Result<
+                (safemlx::ScopedSubmissionProgress, safemlx::SubmissionStatus),
+                safemlx::error::Exception,
+            >,
+        >(),
         size_of::<Option<safemlx::PreparedPipelineCachePlan>>(),
         size_of::<Option<safemlx::PreparedPipelineCache<C>>>(),
-        size_of::<Result<Option<safemlx::PreparedPipelineCache<C>>,eredu_core::BackendFailure>>(),
-        size_of::<NativeRoleCapacity>(),size_of::<NativeRoleControlError>(),
-        size_of::<Result<usize,NativeRoleControlError>>(),size_of::<Option<usize>>(),
-        size_of::<(NativeRoleCapacity,Option<safemlx::PreparedPipelineCachePlan>)>(),
-        size_of::<(&[usize],usize)>(),
+        size_of::<Result<Option<safemlx::PreparedPipelineCache<C>>, eredu_core::BackendFailure>>(),
+        size_of::<NativeRoleCapacity>(),
+        size_of::<NativeRoleControlError>(),
+        size_of::<Result<usize, NativeRoleControlError>>(),
+        size_of::<Option<usize>>(),
+        size_of::<(
+            NativeRoleCapacity,
+            Option<safemlx::PreparedPipelineCachePlan>,
+        )>(),
+        size_of::<(&[usize], usize)>(),
     ])
 }
 /// All native inspections used by both cold accounting and the actual worker.
 /// These layout queries create no device, stream, allocator or native owner.
-fn inspected_control_bytes<I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static>(
-    capacity:NativeRoleCapacity,pipeline:Option<safemlx::PreparedPipelineCachePlan>,
-)->Result<usize,NativeRoleControlError> {
-    let graph=PreparedSubmissionGraphQuota::<C>::layout(capacity.graph)
+fn inspected_control_bytes<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static>(
+    capacity: NativeRoleCapacity,
+    pipeline: Option<safemlx::PreparedPipelineCachePlan>,
+) -> Result<usize, NativeRoleControlError> {
+    let graph = PreparedSubmissionGraphQuota::<C>::layout(capacity.graph)
         .map_err(NativeRoleControlError::Graph)?;
-    let record=PreparedSubmissionRecordQuota::<C>::layout(capacity.records)
+    let record = PreparedSubmissionRecordQuota::<C>::layout(capacity.records)
         .map_err(NativeRoleControlError::Record)?;
-    let failure=PreparedPrefillFailure::<C>::layout().map_err(NativeRoleControlError::Failure)?;
-    let pipeline=match pipeline {
-        Some(plan)=>plan.layout::<C>().map_err(NativeRoleControlError::Pipeline)?
-            .required_bytes().ok_or(NativeRoleControlError::Overflow)?,
-        None=>0,
+    let failure = PreparedPrefillFailure::<C>::layout().map_err(NativeRoleControlError::Failure)?;
+    let pipeline = match pipeline {
+        Some(plan) => plan
+            .layout::<C>()
+            .map_err(NativeRoleControlError::Pipeline)?
+            .required_bytes()
+            .ok_or(NativeRoleControlError::Overflow)?,
+        None => 0,
     };
-    let native=safemlx::OriginalNativeControlLayout::inspect().map_err(NativeRoleControlError::Control)?;
-    let counts=[graph.total_bytes(),record.total_bytes(),failure.total_bytes(),
-        PreparedRecovery::<Retained<I,C>,C>::control_bytes().and_then(|n|usize::try_from(n).ok()),
+    let native =
+        safemlx::OriginalNativeControlLayout::inspect().map_err(NativeRoleControlError::Control)?;
+    let counts = [
+        graph.total_bytes(),
+        record.total_bytes(),
+        failure.total_bytes(),
+        PreparedRecovery::<Retained<I, C>, C>::control_bytes()
+            .and_then(|n| usize::try_from(n).ok()),
         safemlx::PreparedThreadRuntimeHousekeeping::<C>::control_bytes(),
-        OriginalScopeObserver::control_bytes().and_then(|n|n.checked_mul(2)),
-        Some(native.fixed_control_bytes),Some(size_of::<OriginalBufferBudget>()),Some(pipeline)];
-    counts.into_iter().try_fold(size_of_val(&counts),|sum,value|sum.checked_add(value?))
+        OriginalScopeObserver::control_bytes().and_then(|n| n.checked_mul(2)),
+        Some(native.fixed_control_bytes),
+        Some(size_of::<OriginalBufferBudget>()),
+        Some(pipeline),
+    ];
+    counts
+        .into_iter()
+        .try_fold(size_of_val(&counts), |sum, value| sum.checked_add(value?))
         .ok_or(NativeRoleControlError::Overflow)
 }
 /// Exact reusable wrapper metadata for this actual capacity and optional
 /// retained pipeline plan. Add callback_control_bytes for the concrete caller.
 /// Invocation I can hold Rc owners; only native custody requires Send + Sync.
-pub(crate) fn control_bytes<I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static>(
-    capacity:NativeRoleCapacity,pipeline:Option<safemlx::PreparedPipelineCachePlan>,
-)->Result<usize,NativeRoleControlError> {
-    let fixed=fixed_control_bytes::<I,C>().ok_or(NativeRoleControlError::Overflow)?;
-    fixed.checked_add(inspected_control_bytes::<I,C>(capacity,pipeline)?)
+pub(crate) fn control_bytes<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static>(
+    capacity: NativeRoleCapacity,
+    pipeline: Option<safemlx::PreparedPipelineCachePlan>,
+) -> Result<usize, NativeRoleControlError> {
+    let fixed = fixed_control_bytes::<I, C>().ok_or(NativeRoleControlError::Overflow)?;
+    fixed
+        .checked_add(inspected_control_bytes::<I, C>(capacity, pipeline)?)
         .ok_or(NativeRoleControlError::Overflow)
 }
 
-pub(crate) fn run<I,T,E,F,C>(invocation:I,capacity:NativeRoleCapacity,
-    pipeline:Option<safemlx::PreparedPipelineCachePlan>,bank:&BankOwner,
-    controls:&OriginalTextControlGuard,custody:&C,funding:&HostMetadataFunding,
-    timeout:std::time::Duration,run:F)->Result<Result<T,E>,eredu_core::BackendFailure>
-where I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static,
-    F:FnOnce(&I,&OriginalScopeObserver)->Result<Result<T,E>,Error> {
-    run_with_context(invocation,capacity,pipeline,bank,controls,custody,funding,Some(timeout),
-        |invocation,context|run(invocation,context.observer()))
+pub(crate) fn run<I, T, E, F, C>(
+    invocation: I,
+    capacity: NativeRoleCapacity,
+    pipeline: Option<safemlx::PreparedPipelineCachePlan>,
+    bank: &BankOwner,
+    controls: &OriginalTextControlGuard,
+    custody: &C,
+    funding: &HostMetadataFunding,
+    timeout: std::time::Duration,
+    run: F,
+) -> Result<Result<T, E>, eredu_core::BackendFailure>
+where
+    I: 'static,
+    C: Clone + std::fmt::Debug + Send + Sync + 'static,
+    F: FnOnce(&I, &OriginalScopeObserver) -> Result<Result<T, E>, Error>,
+{
+    run_with_context(
+        invocation,
+        capacity,
+        pipeline,
+        bank,
+        controls,
+        custody,
+        funding,
+        Some(timeout),
+        |invocation, context| run(invocation, context.observer()),
+    )
 }
 
 pub(crate) fn run_with_context<I, T, E, F, C>(
@@ -260,30 +346,54 @@ where
     C: Clone + std::fmt::Debug + Send + Sync + 'static,
     F: FnOnce(&I, &NativeRoleContext<'_>) -> Result<Result<T, E>, Error>,
 {
-    run_with_budget_source(invocation,capacity,pipeline,RoleBudget::Text(bank,controls),
-        custody,funding,timeout,run)
+    run_with_budget_source(
+        invocation,
+        capacity,
+        pipeline,
+        RoleBudget::Text(bank, controls),
+        custody,
+        funding,
+        timeout,
+        run,
+    )
 }
 
 /// Uses a source-authenticated enclosing operation's accepted buffer owner.
 /// The caller retains that operation and its exact metadata custody; this
 /// worker creates no backing grant and never reconstructs a text request.
-pub(crate) fn run_with_prepared_budget<I,T,E,F,C>(
-    invocation:I,capacity:NativeRoleCapacity,pipeline:Option<safemlx::PreparedPipelineCachePlan>,
-    budget:&OriginalBufferBudget,parent:&OriginalScopeObserver,custody:&C,
-    funding:&HostMetadataFunding,timeout:Option<std::time::Duration>,run:F,
-)->Result<Result<T,E>,eredu_core::BackendFailure>
-where I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static,
-    F:FnOnce(&I,&NativeRoleContext<'_>)->Result<Result<T,E>,Error>,
+pub(crate) fn run_with_prepared_budget<I, T, E, F, C>(
+    invocation: I,
+    capacity: NativeRoleCapacity,
+    pipeline: Option<safemlx::PreparedPipelineCachePlan>,
+    budget: &OriginalBufferBudget,
+    parent: &OriginalScopeObserver,
+    custody: &C,
+    funding: &HostMetadataFunding,
+    timeout: Option<std::time::Duration>,
+    run: F,
+) -> Result<Result<T, E>, eredu_core::BackendFailure>
+where
+    I: 'static,
+    C: Clone + std::fmt::Debug + Send + Sync + 'static,
+    F: FnOnce(&I, &NativeRoleContext<'_>) -> Result<Result<T, E>, Error>,
 {
-    run_with_budget_source(invocation,capacity,pipeline,RoleBudget::Prepared(budget,parent),
-        custody,funding,timeout,run)
+    run_with_budget_source(
+        invocation,
+        capacity,
+        pipeline,
+        RoleBudget::Prepared(budget, parent),
+        custody,
+        funding,
+        timeout,
+        run,
+    )
 }
 
 fn run_with_budget_source<I, T, E, F, C>(
     invocation: I,
     capacity: NativeRoleCapacity,
     pipeline: Option<safemlx::PreparedPipelineCachePlan>,
-    budget_source:RoleBudget<'_>,
+    budget_source: RoleBudget<'_>,
     custody: &C,
     funding: &HostMetadataFunding,
     timeout: Option<std::time::Duration>,
@@ -295,7 +405,14 @@ where
     F: FnOnce(&I, &NativeRoleContext<'_>) -> Result<Result<T, E>, Error>,
 {
     let (result, pending) = start_with_budget_source(
-        invocation, capacity, pipeline, budget_source, custody, funding, timeout, run,
+        invocation,
+        capacity,
+        pipeline,
+        budget_source,
+        custody,
+        funding,
+        timeout,
+        run,
     )?;
     if result.is_ok() {
         pending.finish()?;
@@ -307,7 +424,7 @@ fn start_with_budget_source<I, T, E, F, C>(
     invocation: I,
     capacity: NativeRoleCapacity,
     pipeline: Option<safemlx::PreparedPipelineCachePlan>,
-    budget_source:RoleBudget<'_>,
+    budget_source: RoleBudget<'_>,
     custody: &C,
     funding: &HostMetadataFunding,
     timeout: Option<std::time::Duration>,
@@ -320,17 +437,21 @@ where
 {
     // The same cold census is split only to fund a source-preserving failure
     // before any fallible native query. No native owner is constructed here.
-    let initial=fixed_control_bytes::<I,C>().and_then(|fixed|
-        fixed.checked_add(callback_control_bytes::<T,E>(size_of::<F>())?))
-        .ok_or_else(||overflow().into_backend_failure())?;
-    funding.reserve_metadata(initial)
-        .map_err(|cause|Error::WorkspacePlanning(cause).into_backend_failure())?;
+    let initial = fixed_control_bytes::<I, C>()
+        .and_then(|fixed| fixed.checked_add(callback_control_bytes::<T, E>(size_of::<F>())?))
+        .ok_or_else(|| overflow().into_backend_failure())?;
+    funding
+        .reserve_metadata(initial)
+        .map_err(|cause| Error::WorkspacePlanning(cause).into_backend_failure())?;
     let fail = |cause| role_failure(cause, custody);
-    let total=inspected_control_bytes::<I,C>(capacity,pipeline)
-        .map_err(|cause|fail(cause.into()))?;
-    funding.reserve_metadata(total)
-        .map_err(|cause|Error::WorkspacePlanning(cause).into_backend_failure())?;
-    let budget=budget_source.borrow().map_err(|cause|fail(RoleCause::Backend(cause)))?;
+    let total =
+        inspected_control_bytes::<I, C>(capacity, pipeline).map_err(|cause| fail(cause.into()))?;
+    funding
+        .reserve_metadata(total)
+        .map_err(|cause| Error::WorkspacePlanning(cause).into_backend_failure())?;
+    let budget = budget_source
+        .borrow()
+        .map_err(|cause| fail(RoleCause::Backend(cause)))?;
     if capacity.backing > budget.capacity() {
         return Err(fail(RoleCause::BackingCapacity {
             required: capacity.backing,
@@ -432,8 +553,13 @@ where
     // Communication supplies its selected relative deadline. Local numerical
     // execution inherits its ordinary synchronous completion policy; it does
     // not acquire a new timeout merely by sharing this native ownership worker.
-    let deadline = timeout.map(|timeout| std::time::Instant::now()
-        .checked_add(timeout).ok_or_else(|| fail(RoleCause::Backend(overflow())))).transpose()?;
+    let deadline = timeout
+        .map(|timeout| {
+            std::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| fail(RoleCause::Backend(overflow())))
+        })
+        .transpose()?;
     let mut observer = None;
     let result = recovery.configure_scope_with_retention(|scope, retained| {
         scope
@@ -455,11 +581,27 @@ where
         let active = OriginalScopeObserver::require_current()
             .map_err(|cause| fail(RoleCause::Native(cause)))?;
         observer = Some(active.clone());
-        run(&retained.invocation, &NativeRoleContext{observer:&active,parent:parent.as_ref()}).map_err(Error::into_backend_failure)
+        run(
+            &retained.invocation,
+            &NativeRoleContext {
+                observer: &active,
+                parent: parent.as_ref(),
+                budget: &retained.budget,
+            },
+        )
+        .map_err(Error::into_backend_failure)
     });
     recovery.seal();
     let result = result?;
-    Ok((result, PendingRole { recovery, observer, custody: custody.clone(), deadline }))
+    Ok((
+        result,
+        PendingRole {
+            recovery,
+            observer,
+            custody: custody.clone(),
+            deadline,
+        },
+    ))
 }
 
 /// One sealed invocation. Dropping it transfers unresolved resources to the
@@ -472,7 +614,12 @@ struct PendingRole<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'stati
 }
 impl<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static> PendingRole<I, C> {
     fn finish(self) -> Result<(), eredu_core::BackendFailure> {
-        let Self { recovery, observer, custody, deadline } = self;
+        let Self {
+            recovery,
+            observer,
+            custody,
+            deadline,
+        } = self;
         let fail = |cause| role_failure(cause, &custody);
         // Only this invocation's observer establishes native completion. A polling
         // refusal cannot release its resources or settle another queued invocation.
@@ -501,7 +648,7 @@ impl<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static> PendingRole
                 | safemlx::ScopedSubmissionProgress::Busy => {}
                 other => return Err(fail(RoleCause::Observation(other))),
             }
-            if deadline.is_some_and(|deadline|std::time::Instant::now() >= deadline) {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 // Recovery still owns every native resource and its neutral lease.
                 return Err(fail(RoleCause::Incomplete {
                     phase: "selected native role deadline",
@@ -515,7 +662,9 @@ impl<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static> PendingRole
             .expect("successful scope binding")
             .retire_completed_records()
             .map_err(|cause| fail(RoleCause::Native(cause)))?;
-        let status = recovery.finish().map_err(|cause| fail(RoleCause::Backend(cause.into_error())))?;
+        let status = recovery
+            .finish()
+            .map_err(|cause| fail(RoleCause::Backend(cause.into_error())))?;
         if !status.settled || status.failed || status.blocked {
             if let Some(cause) = observer
                 .as_ref()

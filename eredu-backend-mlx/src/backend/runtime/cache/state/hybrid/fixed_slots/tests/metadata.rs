@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::SharedStorageDomain;
+use eredu_core::SharedStorageAccountingId;
 use eredu_runtime::{HostMetadataIdentity, HostSlotAttachmentError, HostSlotMetadata};
 use std::{
     convert::Infallible,
@@ -22,7 +22,7 @@ impl Drop for Charge {
 
 fn attach(
     metadata: &HostSlotMetadata,
-    domain: &SharedStorageDomain,
+    domain: &SharedStorageAccountingId,
     used: &Arc<AtomicU64>,
 ) -> bool {
     let bytes = metadata.capacity_bytes().unwrap();
@@ -43,7 +43,7 @@ fn attach(
 fn slot_extent_reuse_keeps_custody_and_independent_clones_get_fresh_owners() {
     let stream = stream();
     let used = Arc::new(AtomicU64::new(0));
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let mut source = FixedStateSlots::from_policy(&policy(&[RECURRENT, CONV])).unwrap();
     *source.get_mut(&CONV).unwrap() = Some(tensor([1., 3., 5., 7.]));
     let mut destination = FixedStateSlots::from_policy(&policy(&[PREFIX, CONV])).unwrap();
@@ -131,8 +131,8 @@ fn escaped_fixed_metadata_retains_custody_without_retaining_native_slot_payload(
     let capacity = source.fixed_slot_payload_bytes().unwrap();
     assert_eq!(metadata.capacity_bytes(), Some(capacity));
     let used = Arc::new(AtomicU64::new(0));
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     assert!(attach(&metadata, &first, &used));
     assert!(!earlier
         .try_attach::<Infallible>(&first, || panic!("earlier token sees attachment"))
@@ -141,11 +141,12 @@ fn escaped_fixed_metadata_retains_custody_without_retaining_native_slot_payload(
     assert_eq!(used.load(Ordering::SeqCst), capacity * 2);
     drop(source);
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache();
         safemlx::reclaim_allocation_owners();
         native_retired.load(Ordering::SeqCst) == 1
     });
     assert_eq!(used.load(Ordering::SeqCst), capacity * 2);
-    for domain in [&first, &SharedStorageDomain::default()] {
+    for domain in [&first, &SharedStorageAccountingId::default()] {
         assert!(matches!(
             metadata.try_attach::<Infallible>(domain, || panic!(
                 "retired table cannot reacquire custody"

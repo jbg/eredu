@@ -38,10 +38,7 @@ pub(super) fn report(
         retained_bytes: persistent,
         transient_bytes: total.zip(persistent).map(|(total, state)| total - state),
     };
-    let host_workspace_bytes = trace
-        .missing_host
-        .is_empty()
-        .then_some(trace.host_workspace);
+    let host_workspace_bytes = (!trace.host_staging_incomplete).then_some(trace.host_workspace);
     let total = add_bound(total, host_workspace_bytes)?;
     let transient = total.zip(persistent).map(|(total, state)| total - state);
     let mut opening_storage = None;
@@ -80,6 +77,7 @@ pub(super) fn report(
         })
         .transpose()?;
     Ok(WorkspaceTraceReport {
+        physical_domains: None,
         opening_storage,
         closing_storage: WorkspaceStoragePopulation {
             bytes: retained_state,
@@ -168,16 +166,20 @@ fn residual_report(
         total = None;
         transient = None;
     }
-    let host = trace
-        .missing_host
-        .is_empty()
-        .then_some(trace.host_workspace);
+    let host = (!trace.host_staging_incomplete).then_some(trace.host_workspace);
     let population = |roots: &BTreeMap<*const Storage, Rc<Storage>>| {
         let mut result = WorkspaceStoragePopulation::EMPTY;
         for (identity, storage) in roots {
-            if excluded.contains(identity) { continue; }
-            result.bytes = result.bytes.zip(storage.bytes).and_then(|(a,b)| a.checked_add(b));
-            result.maximum_allocations = result.maximum_allocations.checked_add(storage.maximum_allocations)
+            if excluded.contains(identity) {
+                continue;
+            }
+            result.bytes = result
+                .bytes
+                .zip(storage.bytes)
+                .and_then(|(a, b)| a.checked_add(b));
+            result.maximum_allocations = result
+                .maximum_allocations
+                .checked_add(storage.maximum_allocations)
                 .ok_or_else(|| workspace_overflow("residual population overflow"))?;
         }
         Ok::<_, Error>(result)

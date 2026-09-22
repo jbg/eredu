@@ -4,12 +4,42 @@ use crate::working_memory::{qualified_storage, storage::finite_pin};
 use eredu_nn::workspace::WorkspaceBorrowedStorageError;
 use std::{alloc::Layout, marker::PhantomData, mem::size_of};
 
+/// Authenticated payload identity and optional separate host control identity
+/// for one backing root. Both registered allocations remain pinned together.
+#[derive(Debug)]
+pub struct RegisteredWorkspaceStorageRow<K> {
+    key: K,
+    root: WorkspaceExistingStorage,
+    controls: Option<K>,
+}
+impl<K> RegisteredWorkspaceStorageRow<K> {
+    /// Pairs one payload identity with its original workspace root.
+    pub fn new(key: K, root: WorkspaceExistingStorage) -> Self {
+        Self {
+            key,
+            root,
+            controls: None,
+        }
+    }
+    /// Identifies the separately registered host allocation carrying this root's
+    /// control bytes. Its capacity is authenticated against the root's facts.
+    pub fn with_host_controls(mut self, key: K) -> Self {
+        self.controls = Some(key);
+        self
+    }
+}
+impl<K> From<(K, WorkspaceExistingStorage)> for RegisteredWorkspaceStorageRow<K> {
+    fn from((key, root): (K, WorkspaceExistingStorage)) -> Self {
+        Self::new(key, root)
+    }
+}
+
 /// Exact borrowed metadata roots paired with an existing-only storage pin.
 /// Clones preserve the same metadata and accounting owner; no work is authorized.
 #[derive(Debug, Clone)]
 pub struct RegisteredWorkspaceStorage<K: Ord + Send + 'static> {
     pub(super) borrowed: WorkspaceBorrowedStorage,
-    pub(super) pool: WorkingMemoryPool,
+    pub(super) pool: MemoryLedger,
     pub(super) _registration: WorkingMemoryStorage<K>,
 }
 
@@ -61,7 +91,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredPreparedWorkspaceStorage<
         )
         .map(ResidualInferenceQuote::into_incremental)
     }
-    pub(super) fn pool(&self) -> &WorkingMemoryPool {
+    pub(super) fn pool(&self) -> &MemoryLedger {
         &self.registered.pool
     }
 
@@ -115,6 +145,154 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
             .ok_or(WorkingMemoryError::UnknownBound)?;
         Self::new_with_source_roots(slots, roots.roots().len())
     }
+    /// Includes completed native roots charged by their actual source accounts.
+    pub fn new_with_completed_source(
+        slots: usize,
+        source: &crate::working_memory::OriginalCompletedWorkspaceSource,
+    ) -> Result<Self, WorkingMemoryError> {
+        let mut layout =
+            Self::new_with_source_roots(slots, source.borrowed_storage().roots().len())?;
+        layout.bytes = layout
+            .bytes
+            .checked_add(size_of::<
+                crate::working_memory::OriginalCompletedWorkspaceSource,
+            >())
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<Result<WorkingMemoryStorage<K>, WorkingMemoryError>>())
+            })
+            .ok_or(WorkingMemoryError::Overflow)?;
+        Ok(layout)
+    }
+    /// Retains the genuine completed allocation accounts through the ordinary
+    /// source pin. Their capacity is neither registered nor reserved again.
+    pub fn construct_with_completed_source(
+        self,
+        pool: &MemoryLedger,
+        context: &WorkspaceContext,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
+        source: crate::working_memory::OriginalCompletedWorkspaceSource,
+    ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
+        self.construct_completed(pool, context, storage, source, true)
+    }
+    /// Same accounting custody, leaving the context's one source selection to
+    /// the caller that composes a larger finite union.
+    pub fn construct_unselected_with_completed_source(
+        self,
+        pool: &MemoryLedger,
+        context: &WorkspaceContext,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
+        source: crate::working_memory::OriginalCompletedWorkspaceSource,
+    ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
+        self.construct_completed(pool, context, storage, source, false)
+    }
+    fn construct_completed(
+        self,
+        pool: &MemoryLedger,
+        context: &WorkspaceContext,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
+        source: crate::working_memory::OriginalCompletedWorkspaceSource,
+        select: bool,
+    ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
+        if !source.custody.matches_pool(pool) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        {
+            let usage = pool
+                .0
+                .usage
+                .lock()
+                .map_err(|_| WorkingMemoryError::Poisoned)?;
+            source.custody.validate(pool, &usage)?;
+        }
+        // Select only after the complete accounting-only source has validated.
+        let mut result =
+            self.construct_with_completed_roots(pool, context, storage, &source.roots, false)?;
+        result._registration = result
+            ._registration
+            .with_completed_source(source.custody, source.roots.total_bytes())?;
+        if select {
+            context
+                .set_borrowed_storage_checked(result.borrowed.clone())
+                .map_err(binding_error)?;
+        }
+        Ok(result)
+    }
+    /// Prices one checked union retaining prepared input and completed native
+    /// sources alongside ordinary registered storage.
+    pub fn new_with_prepared_and_completed_sources(
+        slots: usize,
+        prepared: &crate::input::OriginalPreparedWorkspaceSource,
+        completed: &crate::working_memory::OriginalCompletedWorkspaceSource,
+    ) -> Result<Self, WorkingMemoryError> {
+        let roots = prepared
+            .borrowed_storage()
+            .ok_or(WorkingMemoryError::UnknownBound)?;
+        let total = roots
+            .roots()
+            .len()
+            .checked_add(completed.roots.roots().len())
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let mut layout = Self::new_with_source_roots(slots, total)?;
+        layout.bytes = layout
+            .bytes
+            .checked_add(
+                WorkspaceBorrowedStorage::construction_bytes(total)
+                    .ok_or(WorkingMemoryError::Overflow)?,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<
+                    crate::working_memory::OriginalCompletedWorkspaceSource,
+                >())
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<Result<WorkingMemoryStorage<K>, WorkingMemoryError>>())
+            })
+            .ok_or(WorkingMemoryError::Overflow)?;
+        Ok(layout)
+    }
+    /// Both source accounts remain bound to the same source selection. This
+    /// grants no new preparation, native allocation, or numerical role.
+    pub fn construct_with_prepared_and_completed_sources(
+        self,
+        pool: &MemoryLedger,
+        context: &WorkspaceContext,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
+        prepared: crate::input::OriginalPreparedWorkspaceSource,
+        completed: crate::working_memory::OriginalCompletedWorkspaceSource,
+    ) -> Result<RegisteredPreparedWorkspaceStorage<K>, WorkingMemoryError> {
+        if !prepared.pool().same_ledger(pool) || !completed.custody.matches_pool(pool) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        {
+            let usage = pool
+                .0
+                .usage
+                .lock()
+                .map_err(|_| WorkingMemoryError::Poisoned)?;
+            completed.custody.validate(pool, &usage)?;
+        }
+        let prepared_roots = prepared
+            .borrowed_storage()
+            .ok_or(WorkingMemoryError::UnknownBound)?;
+        let roots = WorkspaceBorrowedStorage::new_finite(
+            context,
+            prepared_roots.roots().iter().chain(completed.roots.roots()),
+            self.prepared_roots,
+        )
+        .map_err(binding_error)?;
+        let mut registered =
+            self.construct_with_completed_roots(pool, context, storage, &roots, false)?;
+        registered._registration = registered
+            ._registration
+            .with_completed_source(completed.custody, completed.roots.total_bytes())?;
+        context
+            .set_borrowed_storage_checked(registered.borrowed.clone())
+            .map_err(binding_error)?;
+        Ok(RegisteredPreparedWorkspaceStorage {
+            registered,
+            source: prepared,
+        })
+    }
     fn new_with_source_roots(
         slots: usize,
         prepared_roots: usize,
@@ -122,18 +300,22 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
         if !qualified_storage::qualified() {
             return Err(WorkingMemoryError::UnknownBound);
         }
-        let input = Layout::array::<(K, WorkspaceExistingStorage)>(slots)
+        let input = Layout::array::<RegisteredWorkspaceStorageRow<K>>(slots)
             .map_err(|_| WorkingMemoryError::Overflow)?
             .size();
-        let pins = Layout::array::<(K, u64)>(slots)
-            .map_err(|_| WorkingMemoryError::Overflow)?
-            .size();
+        let pins = Layout::array::<(K, crate::working_memory::StorageAllocation)>(
+            slots.checked_mul(2).ok_or(WorkingMemoryError::Overflow)?,
+        )
+        .map_err(|_| WorkingMemoryError::Overflow)?
+        .size();
         let total_roots = slots
             .checked_add(prepared_roots)
             .ok_or(WorkingMemoryError::Overflow)?;
         let root = WorkspaceBorrowedStorage::construction_bytes(total_roots)
             .ok_or(WorkingMemoryError::Overflow)?;
-        let pin = finite_pin::construction_bytes::<K>(slots)?;
+        let pin = finite_pin::construction_bytes::<K>(
+            slots.checked_mul(2).ok_or(WorkingMemoryError::Overflow)?,
+        )?;
         let frames = [
             size_of::<Self>(),
             size_of::<RegisteredWorkspaceStorage<K>>(),
@@ -150,27 +332,29 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
             >(),
             size_of::<(Option<&WorkspaceBorrowedStorage>, usize)>(),
             size_of::<Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError>>(),
-            size_of::<Vec<(K, WorkspaceExistingStorage)>>(),
-            size_of::<Vec<(K, u64)>>(),
-            size_of::<std::vec::IntoIter<(K, WorkspaceExistingStorage)>>(),
-            size_of::<std::slice::Iter<'static, (K, WorkspaceExistingStorage)>>(),
-            size_of::<std::vec::IntoIter<(K, u64)>>(),
+            size_of::<Vec<RegisteredWorkspaceStorageRow<K>>>(),
+            size_of::<Vec<(K, crate::working_memory::StorageAllocation)>>(),
+            size_of::<std::vec::IntoIter<RegisteredWorkspaceStorageRow<K>>>(),
+            size_of::<std::slice::Iter<'static, RegisteredWorkspaceStorageRow<K>>>(),
+            size_of::<std::vec::IntoIter<(K, crate::working_memory::StorageAllocation)>>(),
             size_of::<WorkspaceBorrowedStorageError>(),
             size_of::<Option<crate::input::OriginalPreparedWorkspaceSource>>(),
             size_of::<Result<Option<&WorkspaceBorrowedStorage>, WorkingMemoryError>>(),
             size_of::<WorkingMemoryError>(),
-            size_of::<(&WorkingMemoryPool, &WorkspaceContext, usize, usize, bool, bool)>(),
+            size_of::<(&MemoryLedger, &WorkspaceContext, usize, usize, bool, bool)>(),
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
         .ok_or(WorkingMemoryError::Overflow)?;
-        let vector = usize::try_from(qualified_storage::vector_control_bytes::<(
+        let vector = usize::try_from(qualified_storage::vector_control_bytes::<
+            RegisteredWorkspaceStorageRow<K>,
+        >()?)
+        .map_err(|_| WorkingMemoryError::Overflow)?;
+        let pin_vector = usize::try_from(qualified_storage::vector_control_bytes::<(
             K,
-            WorkspaceExistingStorage,
+            crate::working_memory::StorageAllocation,
         )>()?)
         .map_err(|_| WorkingMemoryError::Overflow)?;
-        let pin_vector = usize::try_from(qualified_storage::vector_control_bytes::<(K, u64)>()?)
-            .map_err(|_| WorkingMemoryError::Overflow)?;
         let bytes = [input, pins, root, pin, frames, vector, pin_vector]
             .into_iter()
             .try_fold(0usize, usize::checked_add)
@@ -190,9 +374,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
     }
     pub(in crate::working_memory) fn construct_with_completed_roots(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
         roots: &WorkspaceBorrowedStorage,
         select: bool,
     ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
@@ -204,7 +388,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
             if rows.len() == self.slots {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            rows.push(row);
+            rows.push(row.into());
         }
         bind_rows(pool, context, rows, true, Some(roots), select)
     }
@@ -221,9 +405,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
     /// registers new physical bytes nor changes the source context selection.
     pub fn construct(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
     ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
         self.construct_with_source(pool, context, storage, None, true)
             .map(|(registered, _)| registered)
@@ -233,9 +417,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
     /// installing one exact union before tracing; no native permission is added.
     pub fn construct_unselected(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
     ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
         self.construct_with_source(pool, context, storage, None, false)
             .map(|(registered, _)| registered)
@@ -244,9 +428,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
     /// metadata separate from its closed account-only reservation pin.
     pub fn construct_with_prepared_source(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
         source: crate::input::OriginalPreparedWorkspaceSource,
     ) -> Result<RegisteredPreparedWorkspaceStorage<K>, WorkingMemoryError> {
         self.construct_with_source(pool, context, storage, Some(source), true)
@@ -258,20 +442,23 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
     /// Retains the same genuine prepared-input account without changing the
     /// context selection. A caller can then select its complete source union.
     pub fn construct_unselected_with_prepared_source(
-        self, pool: &WorkingMemoryPool, context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        self,
+        pool: &MemoryLedger,
+        context: &WorkspaceContext,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
         source: crate::input::OriginalPreparedWorkspaceSource,
     ) -> Result<RegisteredPreparedWorkspaceStorage<K>, WorkingMemoryError> {
         self.construct_with_source(pool, context, storage, Some(source), false)
             .map(|(registered, source)| RegisteredPreparedWorkspaceStorage {
-                registered, source: source.expect("supplied original source"),
+                registered,
+                source: source.expect("supplied original source"),
             })
     }
     fn construct_with_source(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
         source: Option<crate::input::OriginalPreparedWorkspaceSource>,
         select: bool,
     ) -> Result<
@@ -297,11 +484,11 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorageLayout<K>
             if rows.len() == self.slots {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            rows.push(row);
+            rows.push(row.into());
         }
         if source
             .as_ref()
-            .is_some_and(|source| !source.pool().same_domain(pool))
+            .is_some_and(|source| !source.pool().same_ledger(pool))
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
@@ -315,19 +502,26 @@ impl<K: Clone + Ord + Send + Sync + 'static> RegisteredWorkspaceStorage<K> {
     /// before accounting mutation. Ordinary collection uses the same validator,
     /// sorted root order, finite root construction and existing-only pin commit.
     pub fn bind(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        storage: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        storage: impl IntoIterator<Item = impl Into<RegisteredWorkspaceStorageRow<K>>>,
     ) -> Result<Self, WorkingMemoryError> {
-        bind_rows(pool, context, storage.into_iter().collect(), false, None, true)
+        bind_rows(
+            pool,
+            context,
+            storage.into_iter().map(Into::into).collect(),
+            false,
+            None,
+            true,
+        )
     }
     /// Exact immutable roots for this binding. Unselected bindings require the
     /// caller to install their complete union before equation tracing.
     pub fn borrowed_storage(&self) -> &WorkspaceBorrowedStorage {
         &self.borrowed
     }
-    /// Domain whose already-registered physical charges cover these roots.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    /// Ledger whose registered storage and retained accounts cover these roots.
+    pub fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
     pub(in crate::working_memory) fn registration(&self) -> &WorkingMemoryStorage<K> {
@@ -343,27 +537,47 @@ fn binding_error(error: WorkspaceBorrowedStorageError) -> WorkingMemoryError {
     }
 }
 fn bind_rows<K: Ord + Send + 'static>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     context: &WorkspaceContext,
-    mut rows: Vec<(K, WorkspaceExistingStorage)>,
+    mut rows: Vec<RegisteredWorkspaceStorageRow<K>>,
     exact: bool,
     prepared_roots: Option<&WorkspaceBorrowedStorage>,
     select: bool,
 ) -> Result<RegisteredWorkspaceStorage<K>, WorkingMemoryError> {
     // Preserve input-order first failure, before sorting or dropping duplicates.
-    for (i, (key, root)) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
+        let (key, root) = (&row.key, &row.root);
+        let controls = root
+            .host_control_bytes()
+            .ok_or(WorkingMemoryError::UnknownBound)?;
+        if (controls != 0) != row.controls.is_some() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        if row.controls.as_ref().is_some_and(|control| control == key) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         if root.capacity_bytes().is_none() {
             return Err(WorkingMemoryError::UnknownBound);
         }
-        for (prior_key, prior_root) in &rows[..i] {
+        for prior in &rows[..i] {
+            let (prior_key, prior_root) = (&prior.key, &prior.root);
             let same_key = prior_key.cmp(key).is_eq();
-            if same_key != prior_root.same_storage(root) {
+            if same_key != prior_root.same_storage(root)
+                || (same_key && row.controls != prior.controls)
+                || row.controls.as_ref().is_some_and(|key| key == prior_key)
+                || prior.controls.as_ref().is_some_and(|prior| prior == key)
+                || (!same_key
+                    && row
+                        .controls
+                        .as_ref()
+                        .is_some_and(|key| Some(key) == prior.controls.as_ref()))
+            {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
         }
     }
-    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    rows.dedup_by(|a, b| a.0.cmp(&b.0).is_eq());
+    rows.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    rows.dedup_by(|a, b| a.key.cmp(&b.key).is_eq());
     let root_count = rows
         .len()
         .checked_add(prepared_roots.map_or(0, |roots| roots.roots().len()))
@@ -371,16 +585,66 @@ fn bind_rows<K: Ord + Send + 'static>(
     let borrowed = WorkspaceBorrowedStorage::new_finite(
         context,
         rows.iter()
-            .map(|(_, root)| root)
+            .map(|row| &row.root)
             .chain(prepared_roots.into_iter().flat_map(|roots| roots.roots())),
         root_count,
     )
     .map_err(binding_error)?;
-    let mut pins = qualified_storage::vector(rows.len(), exact)?;
-    for (key, root) in rows {
-        pins.push((key, root.capacity_bytes().expect("validated root")));
+    let pin_slots = rows
+        .len()
+        .checked_mul(2)
+        .ok_or(WorkingMemoryError::Overflow)?;
+    let mut pins = qualified_storage::vector(pin_slots, exact)?;
+    for RegisteredWorkspaceStorageRow {
+        key,
+        root,
+        controls,
+    } in rows
+    {
+        let placement = root.placement().ok_or(WorkingMemoryError::UnknownBound)?;
+        placement
+            .validate(pool.topology())
+            .map_err(|_| WorkingMemoryError::IdentityMismatch)?;
+        let descriptor_bytes = qualified_storage::shared_bytes::<eredu_core::MemoryPlacement>()?
+            .checked_add(
+                placement
+                    .backing_bytes()
+                    .map_err(|_| WorkingMemoryError::Overflow)?,
+            )
+            .ok_or(WorkingMemoryError::Overflow)?;
+        context
+            .charge_metadata(
+                usize::try_from(descriptor_bytes).map_err(|_| WorkingMemoryError::Overflow)?,
+            )
+            .map_err(|cause| {
+                context.metadata_funding().as_ref().map_or(
+                    WorkingMemoryError::UnknownBound,
+                    |funding| {
+                        crate::working_memory::reservation_metadata::neural_error(
+                            cause.into(),
+                            funding,
+                        )
+                    },
+                )
+            })?;
+        pins.push((
+            key,
+            crate::working_memory::StorageAllocation::new(
+                root.capacity_bytes().expect("validated root"),
+                Arc::new(placement.clone()),
+            ),
+        ));
+        if let Some(key) = controls {
+            pins.push((
+                key,
+                crate::working_memory::StorageAllocation::new(
+                    root.host_control_bytes().expect("validated controls"),
+                    pool.host_placement_handle(),
+                ),
+            ));
+        }
     }
-    let registration = pool.pin_registered_storage_owned(pins, exact)?;
+    let registration = pool.pin_registered_storage_placed_owned(pins, exact)?;
     if select {
         context
             .set_borrowed_storage_checked(borrowed.clone())

@@ -1,22 +1,19 @@
-//! Exact immutable own-writer metadata; no file open or execution authority.
+//! Exact authenticated file metadata; no file open or execution authority.
 use super::*;
 
 impl CacheBlockSource<'_> {
-    /// Validates the actual retained writer layout and its independently owned
-    /// Disk reservation. A persistent path or unowned file is not this source.
+    /// Validates the retained Live writer or authenticated persistent import.
+    /// Path labels and legacy buffered files do not supply either source.
     pub(crate) fn retained_disk_types(self) -> Result<Option<[Dtype; 2]>, CacheSourceError> {
         let Some(disk) = self.disk() else {
             return Ok(None);
         };
         let source = disk
-            .live_file()
+            .file_source()
             .ok_or(CacheSourceError::PromotionRequired)?;
-        let layout = source
-            .writer_layout()
-            .ok_or(CacheSourceError::PromotionRequired)?;
-        if disk.persistent()
-            || disk.buffered().is_some()
-            || !source.owns_disk_reservation()
+        let layout = source.layout().ok_or(CacheSourceError::PromotionRequired)?;
+        if disk.buffered().is_some()
+            || !source.owns_declared_backing()
             || disk.path() != source.path()
             || disk.names() != layout.names()
             || source.file_bytes() != Some(layout.file_bytes())
@@ -70,7 +67,7 @@ impl CacheBlockSource<'_> {
         size_of::<(
             Self,
             Option<CacheDiskSource<'static>>,
-            Option<&'static LiveCacheBlockSource>,
+            Option<CacheFileSource>,
             Option<&'static eredu_runtime::cache::CacheShardLayout>,
             [(&'static [usize], safetensors::tensor::Dtype, usize); 2],
             [Dtype; 2],

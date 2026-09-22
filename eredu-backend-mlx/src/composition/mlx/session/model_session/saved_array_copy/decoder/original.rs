@@ -1,16 +1,16 @@
 //! Cold native/publication requirements consumed by the existing copy driver.
 use super::*;
 use crate::backend::{
-    OriginalCopyEnvironment,
     array_copy::{
         OriginalCopyCause, OriginalCopyLayoutBuilder, OriginalCopyPlan, SavedHostCopyPlan,
     },
     runtime::cache::state::{SnapshotArraySources, SnapshotOperand},
+    OriginalCopyEnvironment,
 };
 use std::mem::{size_of, size_of_val};
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum CopyPreparationCause {
+pub(in crate::composition::mlx::session) enum CopyPreparationCause {
     #[error(transparent)]
     Source(#[from] crate::backend::runtime::cache::state::SnapshotProjectionCause),
     #[error(transparent)]
@@ -34,6 +34,7 @@ pub(super) struct CopyRequirements {
 struct NativeRequirements {
     controls: usize,
     physical: usize,
+    domain: eredu_core::MemoryDomainId,
     host_destinations: usize,
 }
 impl NativeRequirements {
@@ -43,6 +44,9 @@ impl NativeRequirements {
                 .control_bytes::<ScopeRetention>()
                 .ok_or(WorkingMemoryError::Overflow)?,
             physical: plan.physical_bytes(),
+            domain: plan
+                .physical_domain()
+                .map_err(|_| WorkingMemoryError::UnknownBound)?,
             host_destinations: plan.host_destination_roots(),
         })
     }
@@ -70,8 +74,7 @@ impl CopyRequirements {
         let roots = operands
             .checked_add(host_rows)
             .ok_or(WorkingMemoryError::Overflow)?;
-        let publication =
-            text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, 0)?;
+        let publication = text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, 0)?;
         let parts = [
             native.map_or(0, |value| value.controls),
             publication.control_bytes(),
@@ -132,10 +135,24 @@ impl CopyRequirements {
     pub(super) fn has_native(self) -> bool {
         self.native.is_some()
     }
-    pub(super) fn physical_extra(self, numerical_bytes: u64) -> Result<u64, WorkingMemoryError> {
-        let native = self.native.map_or(0, |value| value.physical);
-        let native = u64::try_from(native).map_err(|_| WorkingMemoryError::Overflow)?;
-        Ok(native.saturating_sub(numerical_bytes))
+    pub(super) fn physical_extra(
+        self,
+        numerical: &eredu_core::DomainMemoryRequirements,
+    ) -> Result<Option<(eredu_core::MemoryDomainId, u64)>, WorkingMemoryError> {
+        let Some(native) = self.native else {
+            return Ok(None);
+        };
+        let native_bytes =
+            u64::try_from(native.physical).map_err(|_| WorkingMemoryError::Overflow)?;
+        let numerical_bytes = numerical.get(native.domain)?.total()?;
+        let extra = if native_bytes > numerical_bytes {
+            native_bytes
+                .checked_sub(numerical_bytes)
+                .ok_or(WorkingMemoryError::Overflow)?
+        } else {
+            0
+        };
+        Ok(Some((native.domain, extra)))
     }
     pub(super) fn validate_native(
         self,
@@ -155,8 +172,7 @@ impl CopyRequirements {
             .operands
             .checked_add(host_rows)
             .ok_or(WorkingMemoryError::Overflow)?;
-        let plan =
-            text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, 0)?;
+        let plan = text_funding::SnapshotPublicationPlan::with_host(roots, host_rows, 0)?;
         if plan.control_bytes() != self.publication_controls {
             return Err(WorkingMemoryError::IdentityMismatch);
         }

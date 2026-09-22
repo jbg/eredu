@@ -20,7 +20,10 @@ pub(super) fn emit(
     use WorkspaceOperationKindView as Kind;
     if !matches!(
         operation.kind,
-        Kind::SliceUpdate { .. } | Kind::StaticSliceUpdate { .. } | Kind::Contiguous | Kind::DeepCopy
+        Kind::SliceUpdate { .. }
+            | Kind::StaticSliceUpdate { .. }
+            | Kind::Contiguous
+            | Kind::DeepCopy
     ) {
         return Ok(None);
     }
@@ -64,14 +67,36 @@ pub(super) fn emit(
                 "full destination copy, two possible update reshape copies and update cast; empty/full replacement may alias",
             )
         }
-        Kind::StaticSliceUpdate { starts, ends, strides } => {
-            let Some([_, update]) = operation.inputs.array() else { return invalid(); };
-            if starts.len()!=source.shape().len() || ends.len()!=starts.len()
-                || strides.len()!=starts.len() || update.shape().len()!=starts.len()
-                || update.dtype()!=source.dtype()
-                || starts.iter().zip(*ends).zip(*strides).zip(source.shape()).zip(update.shape())
-                    .any(|((((&a,&b),&step),&n),&width)| a<0 || b<=a || b>n || step<=0
-                        || b.checked_sub(a).and_then(|d|d.checked_add(step-1)).map(|d|d/step)!=Some(width)) {
+        Kind::StaticSliceUpdate {
+            starts,
+            ends,
+            strides,
+        } => {
+            let Some([_, update]) = operation.inputs.array() else {
+                return invalid();
+            };
+            if starts.len() != source.shape().len()
+                || ends.len() != starts.len()
+                || strides.len() != starts.len()
+                || update.shape().len() != starts.len()
+                || update.dtype() != source.dtype()
+                || starts
+                    .iter()
+                    .zip(*ends)
+                    .zip(*strides)
+                    .zip(source.shape())
+                    .zip(update.shape())
+                    .any(|((((&a, &b), &step), &n), &width)| {
+                        a < 0
+                            || b <= a
+                            || b > n
+                            || step <= 0
+                            || b.checked_sub(a)
+                                .and_then(|d| d.checked_add(step - 1))
+                                .map(|d| d / step)
+                                != Some(width)
+                    })
+            {
                 return invalid();
             }
             (Output::AllocateOrAliasInputs { bytes, inputs:Aliases::Slice(&[0,1]) },

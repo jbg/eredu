@@ -109,12 +109,16 @@ fn flat_index(coordinates: &[usize], shape: &[usize]) -> usize {
 
 struct ParameterCapture<'a> {
     stream: &'a safemlx::Stream,
-    direct: Option<Vec<f32>>,
-    transposed: Option<Vec<f32>>,
+    direct: Option<eredu_core::HostTensorBuffer<f32>>,
+    transposed: Option<eredu_core::HostTensorBuffer<f32>>,
 }
 
 impl<'value> ParameterVisitor<'value, MlxTensor> for ParameterCapture<'_> {
-    fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'value MlxTensor) {
+    fn visit(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        parameter: &'value MlxTensor,
+    ) {
         let destination = match metadata.id().as_str() {
             "encoder.init_conv1d.bias" => &mut self.direct,
             "encoder.init_conv1d.weight" => &mut self.transposed,

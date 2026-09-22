@@ -1,5 +1,5 @@
 use super::*;
-use crate::working_memory::WorkingMemoryPool;
+use crate::working_memory::MemoryLedger;
 
 #[test]
 fn empty_retention_ignores_revision_identity_across_clone_and_restore() {
@@ -16,14 +16,14 @@ fn empty_retention_ignores_revision_identity_across_clone_and_restore() {
 
 #[test]
 fn zero_byte_request_is_retained_authority_even_without_an_admission() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = zero_request_ledger();
     let execution = InferenceExecutionIdentity::default();
-    let request = InferenceRequest::from(pool.reserve(&execution, &zero_admission()).unwrap());
+    let request = InferenceRequest::from(pool.reserve(&execution, &zero_admission(&pool)).unwrap());
     let mut retained = InferenceRetention::new();
     retained.retain(&request);
     assert!(retained.admission().is_none());
     assert!(!retained.is_empty());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     let mut restored = InferenceRetention::new();
     restored.restore_admission(&retained);
     assert!(!restored.is_empty());
@@ -37,7 +37,7 @@ fn zero_byte_request_is_retained_authority_even_without_an_admission() {
 
 #[test]
 fn unquoted_lease_remains_nonempty_through_original_owner_retirement() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = zero_request_ledger();
     let lease = pool.acquire_unquoted().unwrap();
     let mut retained = InferenceRetention::new();
     retained.retain_unquoted(&lease);
@@ -54,9 +54,9 @@ fn unquoted_lease_remains_nonempty_through_original_owner_retirement() {
 
 #[test]
 fn admission_presence_is_checked_independently_of_retained_handle_vectors() {
-    let pool = WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = zero_request_ledger();
     let execution = InferenceExecutionIdentity::default();
-    let request = InferenceRequest::from(pool.reserve(&execution, &zero_admission()).unwrap());
+    let request = InferenceRequest::from(pool.reserve(&execution, &zero_admission(&pool)).unwrap());
     // Private representation case: public admit also records the request, but
     // emptiness must include the admission field in its own right.
     let mut retained = InferenceRetention::new();

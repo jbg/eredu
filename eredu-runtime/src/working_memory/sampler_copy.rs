@@ -1,10 +1,10 @@
 //! Concrete sampler payload ownership and independent destination-copy funding.
 
 use super::{
-    funding::FundingSource, InferenceExecutionIdentity, WorkingMemoryError,
-    WorkingMemoryFundingRun, WorkingMemoryPool, WorkingMemorySamplerScope,
+    InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError, WorkingMemoryFundingRun,
+    WorkingMemorySamplerScope, funding::FundingSource,
 };
-use crate::{generation::SamplerCopyError, ConfiguredTextSampler, Sampler, SamplingBackend};
+use crate::{ConfiguredTextSampler, Sampler, SamplingBackend, generation::SamplerCopyError};
 use eredu_core::TextGenerationConfig;
 
 mod resume;
@@ -12,24 +12,20 @@ pub use resume::SamplerResumePlan;
 
 /// Limits for one independent sampler copy, separate from logical snapshot
 /// counts and from any future native or sampling execution allowance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SamplerCopyLimits {
-    /// Ceiling on the complete shared domain, including the source and all
-    /// other live accounts. A tighter existing ceiling remains in force.
-    pub capacity_bytes: u64,
-    /// Optional limit on this copy's managed payload plus safety reserve.
-    pub application_memory_budget_bytes: Option<u64>,
-    /// Additional conservative charge retained until this copy retires.
-    pub safety_reserve_bytes: u64,
+    /// Total live-charge limits in every physical domain.
+    pub memory_limits: eredu_core::MemoryLimitDeclarations,
+    /// Additional domain-attributed charge retained until this copy retires.
+    pub additional_headroom: eredu_core::MemoryHeadroomDeclarations,
 }
 
 impl SamplerCopyLimits {
-    /// Selects a domain ceiling with no additional application limit or reserve.
-    pub const fn new(capacity_bytes: u64) -> Self {
+    /// Selects domain limits without additional headroom.
+    pub const fn new(memory_limits: eredu_core::MemoryLimitDeclarations) -> Self {
         Self {
-            capacity_bytes,
-            application_memory_budget_bytes: None,
-            safety_reserve_bytes: 0,
+            memory_limits,
+            additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
         }
     }
 }
@@ -43,14 +39,6 @@ pub enum SamplerCopyAdmissionError {
     /// Source custody or shared-domain accounting rejected the copy.
     #[error("{0}")]
     Memory(#[from] WorkingMemoryError),
-    /// This copy exceeds its explicit incremental application allowance.
-    #[error("sampler copy needs {required_bytes} bytes; application limit is {budget_bytes}")]
-    ApplicationBudgetExceeded {
-        /// Managed inline sampler, boxed payload and safety reserve.
-        required_bytes: u64,
-        /// Explicit per-copy application allowance.
-        budget_bytes: u64,
-    },
 }
 
 /// One configured sampler constructed by its original admitted sampling stage.
@@ -268,13 +256,35 @@ impl FundedSamplerCopy {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
+    /// Quotes the complete independent copy, including protected account controls.
+    /// The source remains borrowed; this does not reserve or copy its payload.
+    pub fn sampler_copy_requirements(
+        &self,
+        source: &BorrowedFundedSampler<'_>,
+        limits: &SamplerCopyLimits,
+    ) -> Result<eredu_core::DomainMemoryRequirements, SamplerCopyAdmissionError> {
+        if !self.same_ledger(source.source.pool()) {
+            return Err(WorkingMemoryError::IdentityMismatch.into());
+        }
+        let plan = source.sampler.prepare_copy()?;
+        let mut projection = super::transaction_buffers::RequirementProjection {
+            parts: &[],
+            headroom: &limits.additional_headroom,
+            host_bytes: plan.retained_bytes(),
+        };
+        projection.host_bytes = projection
+            .host_bytes
+            .checked_add(sampler_controls(self, &projection)?)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        Ok(projection.materialize(self.topology())?)
+    }
     /// Admits and performs one concrete sampler copy against the same pool as
     /// its authenticated source. Source, baseline, registered storage and all
     /// other accounts remain charged throughout. No unquoted owner is removed.
     ///
-    /// Only the managed inline sampler and exact history box are priced, plus
-    /// the requested reserve. Native RNG/input/state, allocator metadata and
+    /// The managed sampler, exact history box and account controls are charged
+    /// in the host domain, plus domain-attributed headroom. Native RNG/input/state, allocator metadata and
     /// full snapshots are outside this component contract.
     pub fn copy_sampler(
         &self,
@@ -282,25 +292,29 @@ impl WorkingMemoryPool {
         limits: SamplerCopyLimits,
     ) -> Result<FundedSamplerCopy, SamplerCopyAdmissionError> {
         let plan = source.sampler.prepare_copy()?;
-        let bytes = plan
-            .retained_bytes()
-            .checked_add(limits.safety_reserve_bytes)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        if let Some(budget_bytes) = limits.application_memory_budget_bytes {
-            if bytes > budget_bytes {
-                return Err(SamplerCopyAdmissionError::ApplicationBudgetExceeded {
-                    required_bytes: bytes,
-                    budget_bytes,
-                });
-            }
-        }
-        let execution = source.execution.clone();
-        let (funding, scope) = self.open_sampler_copy_account(
-            source.source,
-            &execution,
-            bytes,
-            limits.capacity_bytes,
+        let projection = super::transaction_buffers::RequirementProjection {
+            parts: &[],
+            headroom: &limits.additional_headroom,
+            host_bytes: plan.retained_bytes(),
+        };
+        let controls = sampler_controls(self, &projection)?;
+        let accepted = super::funding::PreparedCopyAccount::accept(
+            self,
+            source.execution,
+            projection,
+            &limits.memory_limits,
+            controls,
+            super::funding::CopyHostHolds::None,
+            |usage| {
+                if !self.same_ledger(source.source.pool()) {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                source.source.validate(usage, source.execution)
+            },
         )?;
+        let bytes = plan.retained_bytes();
+        let execution = source.execution.clone();
+        let (_, funding, scope) = accepted.workspace(&execution, None)?;
         #[cfg(test)]
         tests::before_copy();
         let sampler = plan.copy();
@@ -315,6 +329,18 @@ impl WorkingMemoryPool {
         scope.certify()?;
         Ok(copied)
     }
+}
+
+fn sampler_controls(
+    pool: &MemoryLedger,
+    projection: &super::transaction_buffers::RequirementProjection<'_>,
+) -> Result<u64, WorkingMemoryError> {
+    super::funding::copy_domain_controls(pool, projection)?
+        .checked_add(
+            u64::try_from(super::funding::copy_account_control_bytes(false, 0, false)?)
+                .map_err(|_| WorkingMemoryError::Overflow)?,
+        )
+        .ok_or(WorkingMemoryError::Overflow)
 }
 
 #[cfg(test)]

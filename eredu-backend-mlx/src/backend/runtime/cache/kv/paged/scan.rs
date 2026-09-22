@@ -1,10 +1,12 @@
 //! Actual manager leases and the existing native blockwise numerical worker.
 use super::*;
+mod ordinary;
 mod original;
-pub(super) use original::run as original_scan;
-pub(super) use original::control_bytes as original_control_bytes;
 use crate::backend::runtime::cache::residency::{CacheBlockLease, CacheBlockPrefetch};
 use eredu_runtime::cache::{PagedScanMechanisms, PagedScanPlan};
+pub(super) use ordinary::{control_bytes as ordinary_control_bytes, run as ordinary_scan};
+pub(super) use original::control_bytes as original_control_bytes;
+pub(super) use original::run as original_scan;
 
 pub(super) struct NativeScan<'a> {
     pub cache: &'a mut PagedKeyValueCache,
@@ -19,7 +21,15 @@ pub(super) struct NativeScan<'a> {
 }
 impl NativeScan<'_> {
     fn accumulate(&mut self, block: KeyValueAttentionBlock, bytes: u64) -> Result<(), Exception> {
-        account_block(self.queries, block.start, block.end, bytes, &mut self.scanned_blocks, &mut self.scanned_bytes, &mut self.scratch);
+        account_block(
+            self.queries,
+            block.start,
+            block.end,
+            bytes,
+            &mut self.scanned_blocks,
+            &mut self.scanned_bytes,
+            &mut self.scratch,
+        );
         let bias = self
             .relative
             .map(|kernel| kernel.bias(block.start, block.end, self.stream))
@@ -99,7 +109,7 @@ impl PagedScanMechanisms for NativeScan<'_> {
             .take()
             .expect("one shared scan finish")
             .finish(self.stream)?;
-        crate::backend::runtime::cache::complete_values([&output], self.stream)?;
+        crate::backend::runtime::cache::residency::evaluate_cache_arrays([&output])?;
         // Earlier queries in this span must consume their visible keys before
         // the final query's window is allowed to discard any source block.
         self.cache.discard_sliding_history()?;
@@ -132,8 +142,22 @@ pub(super) fn plan(
     .map_err(|cause| Exception::custom(cause.to_string()))
 }
 
-fn account_block(queries: &Array, start: i64, end: i64, bytes: u64, blocks: &mut u64, scanned: &mut u64, scratch: &mut u64) {
-    *scratch = (*scratch).max(queries.dim(0) as u64 * queries.dim(1) as u64 * queries.dim(-2) as u64 * (end - start) as u64 * 4);
+fn account_block(
+    queries: &Array,
+    start: i64,
+    end: i64,
+    bytes: u64,
+    blocks: &mut u64,
+    scanned: &mut u64,
+    scratch: &mut u64,
+) {
+    *scratch = (*scratch).max(
+        queries.dim(0) as u64
+            * queries.dim(1) as u64
+            * queries.dim(-2) as u64
+            * (end - start) as u64
+            * 4,
+    );
     *blocks += 1;
     *scanned += bytes;
 }

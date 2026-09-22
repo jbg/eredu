@@ -14,10 +14,10 @@ use eredu_nn::workspace::{
 };
 use eredu_runtime::working_memory::{
     plan_prefill_incremental_with_capacity, quote_inference_workspace, HostDestinationCause,
-    HostDestinationFacts, HostSourceConstructionFacts, InferenceExecutionIdentity,
+    HostDestinationFacts, HostSourceConstructionFacts, InferenceExecutionIdentity, MemoryLedger,
     OriginalHostDestinationBank, OriginalHostSourceBank, OriginalHostSourceReceipt,
     PrefillPlanningError, PreparedTextControlWorkspace, RegisteredWorkspaceStorage,
-    ResidualInferenceQuote, TextHostControlFacts, WorkingMemoryError, WorkingMemoryPool,
+    ResidualInferenceQuote, TextHostControlFacts, WorkingMemoryError,
 };
 use safemlx::{
     OwnedHostCopyPlan, PreparedPrefillFailure, PreparedSubmissionGraphQuota,
@@ -31,8 +31,11 @@ use std::{
 };
 
 #[derive(Debug)]
-struct EmptyWorkspace;
+struct EmptyWorkspace(std::sync::Arc<eredu_core::MemoryTopology>);
 impl WorkspaceMechanisms for EmptyWorkspace {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(&self.0)
+    }
     fn operation_bound(
         &self,
         _: &WorkspaceOperation,
@@ -131,7 +134,7 @@ fn component_destinations<T>(
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
@@ -150,11 +153,11 @@ fn component_destinations_with_ceiling<T>(
     attempts: usize,
     partitions: usize,
     destinations: Option<(u64, usize, usize)>,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
@@ -175,11 +178,11 @@ fn component_destinations_with_baseline<T>(
     partitions: usize,
     destinations: Option<(u64, usize, usize)>,
     existing: u64,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
@@ -204,12 +207,12 @@ fn component_destinations_with_retained_account<T>(
     partitions: usize,
     destinations: Option<(u64, usize, usize)>,
     existing: u64,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
     retained_account: u64,
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
@@ -232,13 +235,13 @@ fn component_destinations_with_retained_account_and_controls<T>(
     partitions: usize,
     destinations: Option<(u64, usize, usize)>,
     existing: u64,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
     retained_account: u64,
     additional_controls: u64,
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
@@ -262,14 +265,14 @@ fn component_destinations_with_native_budget<T>(
     partitions: usize,
     destinations: Option<(u64, usize, usize)>,
     existing: u64,
-    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    additional_ceiling: impl FnOnce(&MemoryLedger) -> u64,
     retained_account: u64,
     additional_controls: u64,
     native_budget: Option<&safemlx::OriginalBufferBudget>,
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
@@ -295,8 +298,8 @@ fn component_destinations_with_native_budget<T>(
         prefill_chunk_positions: 1,
         output: OutputDemand::StateOnly,
     };
-    let pool = WorkingMemoryPool::new(u64::MAX, existing).unwrap();
-    let context = WorkspaceContext::new(EmptyWorkspace);
+    let pool = crate::memory_fixture::ledger(u64::MAX, existing).unwrap();
+    let context = WorkspaceContext::new(EmptyWorkspace(crate::memory_fixture::topology()));
     let storage = RegisteredWorkspaceStorage::bind(
         &pool,
         &context,
@@ -315,9 +318,8 @@ fn component_destinations_with_native_budget<T>(
         input: InputTokenCount::text(1),
         max_output_tokens: 1,
         batch_size: 1,
-        safety_reserve_bytes: 0,
-        application_memory_budget_bytes: None,
-        require_complete_estimate: true,
+        additional_headroom: crate::memory_fixture::headroom(0),
+        memory_limits: Default::default(),
     };
     let layout = StateMemoryLayout::new(
         LayerSchedule::empty(),
@@ -337,7 +339,8 @@ fn component_destinations_with_native_budget<T>(
     .unwrap();
     let empty =
         || WorkspaceBound::bounded(0, "component emits no inference tensor/state operation");
-    let outside = ExecutionWorkspaceEstimate {
+    let outside = crate::memory_fixture::workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry,
         activations: empty(),
         attention: empty(),
@@ -345,7 +348,7 @@ fn component_destinations_with_native_budget<T>(
         state_update: empty(),
         materialization: empty(),
         retained: empty(),
-    };
+    });
     let quote = ResidualInferenceQuote::compose(&report, state, outside, &storage)
         .unwrap()
         .into_incremental();
@@ -365,10 +368,26 @@ fn component_destinations_with_native_budget<T>(
     let quote = quote
         .with_span_workspace_and_text_controls(controls)
         .unwrap();
-    let capacity = existing.checked_add(quote.incremental_bytes()).unwrap();
-    // A later accepted alias publication is quoted against this same pool
-    // before A's retained raw host custody installs its capacity constraint.
-    let common_ceiling = capacity.checked_add(additional_ceiling(&pool)).unwrap();
+    let admission = eredu_core::Admission {
+        requested_positions: geometry
+            .input_positions
+            .checked_add(geometry.max_output_tokens)
+            .unwrap(),
+        state: quote.state().clone(),
+        incremental_required_bytes: quote.incremental_bytes(),
+        memory_limits: Default::default(),
+        additional_headroom: Default::default(),
+    };
+    let increment =
+        crate::memory_fixture::host_total(&quote.reservation_requirements(&admission).unwrap());
+    // Prepare later source descriptors before fixing either request's ceiling.
+    let additional = additional_ceiling(&pool);
+    let capacity = pool
+        .fixture_host_current()
+        .unwrap()
+        .checked_add(increment)
+        .unwrap();
+    let common_ceiling = capacity.checked_add(additional).unwrap();
     let capabilities = ModelCapabilities {
         effective_model_type: "bounded source-arena component only".into(),
         native_max_context: Observed::exact(2, "empty component"),
@@ -382,35 +401,35 @@ fn component_destinations_with_native_budget<T>(
         &execution,
         &pool,
         &capabilities,
-        request,
+        request.clone(),
         geometry,
-        capacity - 1,
+        crate::memory_fixture::physical_host_limits(&pool, capacity - 1),
         |_| Ok(quote.clone())
-    ), Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })) if required_bytes == available_bytes + 1));
+    ), Err(PrefillPlanningError::Reservation(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))) if required_bytes == limit_bytes.checked_sub(existing_bytes).unwrap() + 1));
     if common_ceiling != capacity {
         // Probe A's own exact bound without retaining its smaller constraint
         // across the later B request. No source/native work starts here.
-        let before = pool.used_bytes().unwrap();
+        let before = pool.fixture_host_charge().unwrap();
         let exact = plan_prefill_incremental_with_capacity(
             &execution,
             &pool,
             &capabilities,
-            request,
+            request.clone(),
             geometry,
-            capacity,
+            crate::memory_fixture::physical_host_limits(&pool, capacity),
             |_| Ok(quote.clone()),
         )
         .unwrap();
         drop(exact);
-        assert_eq!(pool.used_bytes().unwrap(), before);
+        assert_eq!(pool.fixture_host_charge().unwrap(), before);
     }
     let (reservation, accepted) = plan_prefill_incremental_with_capacity(
         &execution,
         &pool,
         &capabilities,
-        request,
+        request.clone(),
         geometry,
-        common_ceiling,
+        crate::memory_fixture::physical_host_limits(&pool, common_ceiling),
         |_| Ok(quote.clone()),
     )
     .unwrap();
@@ -491,21 +510,21 @@ fn component_destinations_with_native_budget<T>(
         context,
     ));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         existing + protected + retained_account,
         "actual result retains exactly the host hold, baseline and separate shared account"
     );
     result
 }
 
-fn settle_pool(pool: &WorkingMemoryPool) {
+fn settle_pool(pool: &MemoryLedger) {
     settle_pool_at(pool, 0);
 }
-fn settle_pool_at(pool: &WorkingMemoryPool, existing: u64) {
+fn settle_pool_at(pool: &MemoryLedger, existing: u64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         safemlx::reclaim_allocation_owners();
-        if pool.used_bytes().unwrap() == existing {
+        if pool.fixture_host_charge().unwrap() == existing {
             return;
         }
         assert!(
@@ -542,7 +561,7 @@ fn source_arena_component_executes_funded_nonzero_all_format_cache_lifetimes() {
             },
         );
         drop(fixture);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         std::thread::spawn(move || drop(array)).join().unwrap();
         settle_pool(&pool);
     }
@@ -566,7 +585,7 @@ fn source_arena_component_refuses_short_dense_and_second_affine_before_allocatio
             )
         });
         drop(fixture);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         drop(error);
         settle_pool(&pool);
     }
@@ -579,7 +598,7 @@ fn component<T>(
     operation: impl FnOnce(
         &OriginalTextControlGuard,
         &OriginalScopeObserver,
-        &WorkingMemoryPool,
+        &MemoryLedger,
         OriginalHostSourceBank,
     ) -> T,
 ) -> T {
@@ -667,7 +686,7 @@ fn paired_host_source_component_retains_affine_prefix_on_later_arena_refusal() {
             },
         );
         drop(fixture);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!(pool.fixture_host_charge().unwrap() > 0);
         drop(error);
         settle_pool(&pool);
     }
@@ -717,7 +736,7 @@ fn immutable_source_component_rejects_control_only_credit_before_backing_and_are
         if *required == combined && *remaining == controls_only)
     );
     drop(fixture);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(error);
     settle_pool(&pool);
 }
@@ -755,11 +774,11 @@ fn immutable_source_component_keeps_same_birth_and_hold_through_final_alias() {
         },
     );
     drop((plan, fixture));
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     assert!(held > 0);
     drop(array);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     let alias_info = alias.try_allocation_info().unwrap().unwrap();
     assert_eq!(alias_info.identity(), allocation.identity());
     assert_eq!(alias_info.bytes(), allocation.bytes());
@@ -840,7 +859,8 @@ fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_
                     first.include_array(&distinct),
                     Err(ResidencyError::OriginalInventory(
                         WorkingMemoryError::CollectorCapacity {
-                            kind: eredu_runtime::working_memory::CollectorCapacityKind::InventoryRows,
+                            kind:
+                                eredu_runtime::working_memory::CollectorCapacityKind::InventoryRows,
                             used: 1,
                             capacity: 1,
                         }
@@ -862,7 +882,7 @@ fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_
             (first, last, pool.clone())
         },
     );
-    let held = pool.used_bytes().unwrap();
+    let held = pool.fixture_host_charge().unwrap();
     assert!(held > 0);
     // Original bare extraction returns the actual inventory intact. It cannot
     // yield a prepared Array shell after discarding the shell's raw custody.
@@ -874,10 +894,10 @@ fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_
         Ok(_) => panic!("original clone shell escaped its inventory"),
     };
     assert_eq!(first.original_clone_progress(), Some((1, 0, 1)));
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     drop(first);
     safemlx::reclaim_allocation_owners();
-    assert_eq!(pool.used_bytes().unwrap(), held);
+    assert_eq!(pool.fixture_host_charge().unwrap(), held);
     assert_eq!(last.byte_bound().unwrap(), Some(facts.bytes() as u64));
     drop(last);
     settle_pool(&pool);
@@ -888,3 +908,7 @@ mod affine_tile;
 
 #[path = "funded_component/encoded_input_affine.rs"]
 mod encoded_input_affine;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

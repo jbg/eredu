@@ -236,7 +236,6 @@ fn verify_bounded_hybrid_capture(
         limits: CaptureLimits {
             per_step: budget,
             cumulative: budget,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -884,7 +883,11 @@ fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
         arrays: &'a mut Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
-        fn visit(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, parameter: &'tensor MlxTensor) {
+        fn visit(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            parameter: &'tensor MlxTensor,
+        ) {
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id().to_string(),
@@ -901,7 +904,8 @@ fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
         crate::backend::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
-    .visit_parameters(&mut collector);
+    .visit_parameters(&mut collector)
+    .unwrap();
     let graph = <Architecture as eredu_runtime::LayeredArchitecture<
         crate::backend::nn::shared::MlxNeuralBackend,
         State,
@@ -919,7 +923,8 @@ fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
-            .visit_parameters(&mut collector);
+            .visit_parameters(&mut collector)
+            .unwrap();
         }
     }
     Array::save_safetensors(

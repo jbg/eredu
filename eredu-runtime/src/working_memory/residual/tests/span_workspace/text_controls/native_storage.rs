@@ -65,14 +65,14 @@ struct Observation<'a> {
 #[derive(Clone)]
 struct Mechanism {
     selection: NativeStorageSelection,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     calls: Rc<Cell<usize>>,
     fail_install: Rc<Cell<bool>>,
     reuse_attachments: Rc<Cell<bool>>,
     nested_key_bytes: Option<u64>,
 }
 impl Mechanism {
-    fn new(pool: &WorkingMemoryPool) -> Self {
+    fn new(pool: &MemoryLedger) -> Self {
         Self {
             selection: NativeStorageSelection::default(),
             pool: pool.clone(),
@@ -91,7 +91,7 @@ impl Mechanism {
                 .try_lock()
                 .expect("provider callback outside Usage"),
         );
-        assert!(self.pool.used_bytes().unwrap() > 0);
+        assert!(self.pool.payload_used_bytes().unwrap() > 0);
         self.calls.set(self.calls.get() + 1);
     }
 }
@@ -104,6 +104,9 @@ impl OriginalNativeStorageMechanism for Mechanism {
     type Observation<'a> = Observation<'a>;
     fn selection(&self) -> &NativeStorageSelection {
         &self.selection
+    }
+    fn uniform_budget_placement(&self) -> Option<Arc<eredu_core::MemoryPlacement>> {
+        Some(self.pool.host_placement_handle())
     }
     fn key_clone_storage_bytes(&self) -> Option<u64> {
         self.nested_key_bytes
@@ -134,7 +137,23 @@ impl OriginalNativeStorageMechanism for Mechanism {
             // still name the old physical generation.
             root.generation.set(generation + 1);
         }
-        Ok(Observation { root, kind, generation })
+        Ok(Observation {
+            root,
+            kind,
+            generation,
+        })
+    }
+    fn placement(
+        _: &Self::Observation<'_>,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<
+        std::sync::Arc<eredu_core::MemoryPlacement>,
+        crate::working_memory::WorkingMemoryError,
+    > {
+        Ok(std::sync::Arc::new(eredu_core::MemoryPlacement::fixed(
+            topology,
+            topology.host_domain(),
+        )?))
     }
     fn describe(observed: &Observation<'_>) -> NativeStorageObservation<u32> {
         let r = observed.root;
@@ -148,9 +167,17 @@ impl OriginalNativeStorageMechanism for Mechanism {
         self.callback();
         Ok(owner)
     }
-    fn has_retained_attachment(&self, previous: &Observation<'_>, current: &Observation<'_>, pool: &WorkingMemoryPool) -> bool {
+    fn has_retained_attachment(
+        &self,
+        previous: &Observation<'_>,
+        current: &Observation<'_>,
+        pool: &MemoryLedger,
+    ) -> bool {
         self.reuse_attachments.get()
-            && self.pool.shared_storage_domain().same_identity(pool.shared_storage_domain())
+            && self
+                .pool
+                .shared_storage_accounting_id()
+                .same_identity(pool.shared_storage_accounting_id())
             && previous.kind == current.kind
             && previous.generation == current.generation
             && current.generation == 0
@@ -178,7 +205,7 @@ impl OriginalNativeStorageMechanism for Mechanism {
 }
 
 fn selected(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     mechanism: &Mechanism,
     cap: u64,
     attempts: usize,
@@ -197,7 +224,8 @@ fn selected(
         Some(4096),
         Some(4096),
     )
-    .unwrap();
+    .unwrap()
+    .with_uniform_placement(pool.host_placement_handle());
     let controls = PreparedTextControlWorkspace::prepare_controls(
         geometry(),
         q.span_workspace().plan(),
@@ -217,7 +245,7 @@ fn selected(
     q
 }
 fn setup(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     cap: u64,
     attempts: usize,
     rows: usize,
@@ -238,17 +266,17 @@ fn setup(
     bank.install(mechanism.clone()).unwrap();
     (r, run, span, bank, mechanism)
 }
-fn balances(pool: &WorkingMemoryPool) -> (u64, u64) {
+fn balances(pool: &MemoryLedger) -> (u64, u64) {
     let usage = pool.0.usage.lock().unwrap();
     (usage.reserved, usage.registered)
 }
 
 #[test]
 fn attached_registration_compares_its_exact_metadata_origin_without_retaining_or_reissuing() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let foreign_pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
-    let foreign_namespace = foreign_pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let foreign_pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let foreign_namespace = foreign_pool.register_host_storage([(1u32, 64)]).unwrap();
     let (ar, a_run, a_span, mut a, mechanism) = setup(&pool, 32, 1, 1);
     let (br, b_run, b_span, b, _) = setup(&pool, 32, 1, 1);
     let (fr, f_run, f_span, f, _) = setup(&foreign_pool, 32, 1, 1);
@@ -283,23 +311,39 @@ fn attached_registration_compares_its_exact_metadata_origin_without_retaining_or
     {
         let owners = root.owners.borrow();
         let registration = owners.iter().flatten().next().unwrap();
-        assert!(registration.has_metadata_origin(&a_origin), "closed retained account remains the same origin");
+        assert!(
+            registration.has_metadata_origin(&a_origin),
+            "closed retained account remains the same origin"
+        );
         a_origin.validate_retained_origin(&pool).unwrap();
     }
-    drop((root, a_origin, b_origin, foreign_origin, b, b_span, br, b_run, f, f_span, fr, f_run));
+    drop((
+        root,
+        a_origin,
+        b_origin,
+        foreign_origin,
+        b,
+        b_span,
+        br,
+        b_run,
+        f,
+        f_span,
+        fr,
+        f_run,
+    ));
     drop((namespace, foreign_namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn selected_plan_keeps_unknowns_and_checks_actual_coverage_cardinality_before_any_native_work() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let mechanism = Mechanism::new(&pool);
     let q = replacement_quote(&pool, geometry(), 0).into_incremental();
     let n = q.span_workspace().plan().records().len();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     for coverage in [vec![Some(0); n - 1], vec![Some(0); n + 1]] {
         assert!(matches!(
             PreparedNativeStoragePlan::<Mechanism>::prepare(
@@ -334,7 +378,7 @@ fn selected_plan_keeps_unknowns_and_checks_actual_coverage_cardinality_before_an
     .with_native_storage(unknown)
     .unwrap();
     assert!(q.with_span_workspace_and_text_controls(controls).is_err());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     assert_eq!(mechanism.calls.get(), 0);
     drop(namespace);
 }
@@ -342,8 +386,8 @@ fn selected_plan_keeps_unknowns_and_checks_actual_coverage_cardinality_before_an
 #[test]
 fn accepted_selection_is_once_only_even_for_zero_and_failed_installation() {
     for cap in [0, 32] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
         let mechanism = Mechanism::new(&pool);
         let (r, run, accepted) = accept(&pool, selected(&pool, &mechanism, cap, 1, 1));
         let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
@@ -368,14 +412,14 @@ fn accepted_selection_is_once_only_even_for_zero_and_failed_installation() {
         ));
         assert_eq!(mechanism.calls.get(), 1);
         drop((bank, span, r, run, namespace));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn same_account_other_work_refuses_before_observation_but_same_scope_moves_and_claims_succeed() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let (r, run, span, mut bank, mechanism) = setup(&pool, 32, 3, 2);
     let mut a = run.scope().unwrap();
     let b = run.scope().unwrap();
@@ -403,14 +447,14 @@ fn same_account_other_work_refuses_before_observation_but_same_scope_moves_and_c
     moved.certify().unwrap();
     b.certify().unwrap();
     drop((first, second, wrong, root, bank, span, r, run, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn selected_native_and_ordinary_rows_share_registry_without_double_charge_and_keep_a_under_b() {
     for birth_first in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
         let (ar, a_run, a_span, mut a, _) = setup(&pool, 32, 1, 3);
         let (br, b_run, b_span, mut b, _) = setup(&pool, 32, 1, 3);
         let protected = a_span.protected_host_bytes();
@@ -428,10 +472,10 @@ fn selected_native_and_ordinary_rows_share_registry_without_double_charge_and_ke
             1,
             "duplicate inventory adds one sidecar"
         );
-        assert_eq!(balances(&pool), (before.0 - 7, before.1 + 7));
+        assert_eq!(balances(&pool), (before.0 - 23, before.1 + 23));
         let mut bp = b.claim_publication(&mut bscope).unwrap();
         bp.publish(&bscope, [&native], &[]).unwrap();
-        assert_eq!(balances(&pool), (before.0 - 7, before.1 + 7));
+        assert_eq!(balances(&pool), (before.0 - 23, before.1 + 23));
         assert_eq!(native.values, [1.25, -3.5]);
         ascope.certify().unwrap();
         bscope.certify().unwrap();
@@ -439,7 +483,7 @@ fn selected_native_and_ordinary_rows_share_registry_without_double_charge_and_ke
         // Both A-native sidecars carry A raw metadata. B's bank/control never
         // becomes the canonical donor and can retire completely here.
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             64 + protected + b_protected + 32
         );
         if birth_first {
@@ -452,20 +496,20 @@ fn selected_native_and_ordinary_rows_share_registry_without_double_charge_and_ke
                 .for_each(|owner| drop(owner.take()));
         }
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             64 + protected + 32 + if birth_first { b_protected } else { 0 }
         );
         drop(native);
         drop(namespace);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn later_attachment_refusal_keeps_successful_prefix_failed_preparation_and_origin_until_retirement()
 {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let (r, run, span, mut bank, mechanism) = setup(&pool, 32, 1, 2);
     let protected = span.protected_host_bytes();
     let mut scope = run.scope().unwrap();
@@ -480,7 +524,7 @@ fn later_attachment_refusal_keeps_successful_prefix_failed_preparation_and_origi
         )))
     ));
     assert_eq!((first.attachments(), second.attachments()), (1, 0));
-    assert_eq!(balances(&pool), before);
+    assert_eq!(balances(&pool), (before.0 - 32, before.1 + 32));
     assert!(
         mechanism.calls.get() >= 5,
         "actual observations and preparations reentered the pool"
@@ -497,15 +541,15 @@ fn later_attachment_refusal_keeps_successful_prefix_failed_preparation_and_origi
     drop((first, second));
     scope.certify().unwrap();
     drop((bank, span, r, run, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), protected + 32);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected + 32);
     drop(attempt);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn late_publication_preserves_sources_and_rejects_missing_foreign_birth_without_spending_credit() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let (ar, a_run, a_span, a, _) = setup(&pool, 32, 1, 1);
     let (br, b_run, b_span, mut b, _) = setup(&pool, 32, 1, 1);
     let ascope = a_run.scope().unwrap();
@@ -526,13 +570,13 @@ fn late_publication_preserves_sources_and_rejects_missing_foreign_birth_without_
     ascope.certify().unwrap();
     bscope.certify().unwrap();
     drop((attempt, a, b, ar, br, a_run, a_span, b_span, namespace));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn excess_actual_root_iterator_and_wrong_selection_are_refused_without_native_callbacks() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
     let (r, run, span, mut bank, mechanism) = setup(&pool, 32, 1, 1);
     let mut scope = run.scope().unwrap();
     let root = Root::native(7, 16, bank.budget_for_scope(&scope).unwrap());
@@ -577,7 +621,7 @@ fn excess_actual_root_iterator_and_wrong_selection_are_refused_without_native_ca
     drop((
         attempt, root, bank, span, r, run, span2, r2, run2, namespace,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod qualified_controls;
@@ -587,8 +631,8 @@ mod sampling_extension;
 #[test]
 fn retained_attachment_revalidates_descriptor_at_commit_without_an_extra_sidecar() {
     for changed in [false, true] {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let namespace = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let namespace = pool.register_host_storage([(1u32, 64)]).unwrap();
         let (r, run, span, mut bank, mechanism) = setup(&pool, 32, 2, 1);
         let mut scope = run.scope().unwrap();
         let root = Root::native(7, 16, bank.budget_for_scope(&scope).unwrap());
@@ -601,17 +645,26 @@ fn retained_attachment_revalidates_descriptor_at_commit_without_an_extra_sidecar
         let before = balances(&pool);
         let result = repeated.publish(&scope, [&root], &[]);
         if changed {
-            assert!(matches!(result, Err(NativeStorageError::Memory(WorkingMemoryError::IdentityMismatch))));
+            assert!(matches!(
+                result,
+                Err(NativeStorageError::Memory(
+                    WorkingMemoryError::IdentityMismatch
+                ))
+            ));
             assert!(!repeated.is_published());
         } else {
             result.unwrap();
             assert!(repeated.is_published());
         }
-        assert_eq!(root.attachments(), 1, "existing attachment is never duplicated");
+        assert_eq!(
+            root.attachments(),
+            1,
+            "existing attachment is never duplicated"
+        );
         assert_eq!(balances(&pool), before);
         drop(root); // explicit actual fixture settlement before scope certification
         scope.certify().unwrap();
         drop((first, repeated, bank, span, r, run, namespace));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }

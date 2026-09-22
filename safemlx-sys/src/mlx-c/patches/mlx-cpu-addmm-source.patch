@@ -1,0 +1,138 @@
+diff --git a/mlx/backend/cpu/matmul_storage.cpp b/mlx/backend/cpu/matmul_storage.cpp
+--- a/mlx/backend/cpu/matmul_storage.cpp
++++ b/mlx/backend/cpu/matmul_storage.cpp
+@@ -1,5 +1,6 @@
+ #include "mlx/backend/cpu/matmul_storage.h"
+ #include "mlx/backend/cpu/encoder.h"
++#include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/simd/simd.h"
+ #include "mlx/primitives.h"
+ #include "mlx/submission.h"
+@@ -200,6 +201,59 @@
+ bool tiled_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   return matmul_eval_storage(output,true,out);
+ }
++// AddMM uses the same selected matrix worker after one real copy of C into
++// the sole output backing. No Matmul input-copy fallback is admitted here.
++bool tiled_addmm_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
++  CopyEvalStorage matrix;
++  if(!tiled_matmul_eval_layout(rank,m,n,k,batches,tracer,matrix))return false;
++  CpuCopyDispatchStorage copy;
++  EvalDispatchStorage dispatch;
++  SingleOutputEvalStorage common;
++  if(!contiguous_copy_dispatch_storage(rank,copy))return false;
++  dispatch={copy.task_bytes,copy.task_alignment,copy.worker_graph_extent_bound,copy.controls};
++  if(!single_output_eval_layout(rank,3,tracer,&dispatch,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  // copy_cpu and matmul_dispatch submit separate existing CPU tasks. The
++  // matrix worker's actual temporary batch is published even when empty.
++  value.request_bytes[6]=std::max(value.request_bytes[6],matrix.request_bytes[6]);
++  value.request_alignments[6]=std::max(value.request_alignments[6],matrix.request_alignments[6]);
++  if(!add(value.request_counts[6],matrix.request_counts[6]))return false;
++  value.request_bytes[9]=matrix.request_bytes[9];
++  value.request_alignments[9]=matrix.request_alignments[9];
++  value.request_counts[9]=matrix.request_counts[9];
++  const size_t controls=sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+
++      sizeof(tracer)+sizeof(out)+sizeof(matrix)+sizeof(copy)+sizeof(dispatch)+sizeof(common)+
++      sizeof(value)+sizeof(CopyType)+sizeof(const array*)*4+sizeof(AddMM*)+sizeof(size_t)*5;
++  if(!add(value.worker_graph_extents,matrix.worker_graph_extents)||
++      !add(value.named_control_bytes,matrix.named_control_bytes)||
++      !add(value.named_control_bytes,controls)||
++      !submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++bool is_tiled_addmm_eval_primitive(const array& out) noexcept {
++  if(!out.has_primitive()||out.primitive().stream().device!=Device::cpu||
++      typeid(out.primitive())!=typeid(AddMM)||out.dtype()!=float32)return false;
++  const auto kernel=static_cast<const AddMM&>(out.primitive()).cpu_matmul();
++  return kernel==CpuMatmulKernel::Float32Tiles||kernel==CpuMatmulKernel::Float32AndFloat16Tiles;
++}
++bool tiled_addmm_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_tiled_addmm_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=3)return false;
++  const auto& a=output.inputs()[0];const auto& b=output.inputs()[1];const auto& c=output.inputs()[2];
++  size_t batches=0;bool copy_a=false,copy_b=false;
++  if(!matmul_shape(a,b,output,float32,batches)||!matrix_source(a,output.ndim(),float32,copy_a)||
++      !matrix_source(b,output.ndim(),float32,copy_b)||copy_a||copy_b||c.dtype()!=float32||
++      c.itemsize()!=sizeof(float)||c.shape()!=output.shape()||c.strides().size()!=output.ndim())return false;
++  size_t span=1,extent=0;
++  for(size_t i=0;i!=output.ndim();++i)
++    if(c.strides()[i]<0||!product(size_t(c.shape(i)-1),size_t(c.strides()[i]),extent)||!add(span,extent))return false;
++  // Vector copy preserves data_size, so it may only allocate the quoted
++  // output extent. Broadcast/general and scalar copies allocate output.nbytes.
++  if(span>c.data_size()||(c.data_size()!=1&&c.flags().row_contiguous&&c.data_size()!=c.size()))return false;
++  return tiled_addmm_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),
++      batches,output.is_tracer(),out);
++}
++
+ }
+ namespace mlx::core::submission {
+ GraphFailure GraphConstruction::create_cpu_bf16_matmul_eval(const FixedEvalPrologueGuard& guard,
+@@ -211,6 +265,15 @@
+   if(!cpu::bf16_matmul_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
+   return create_layout(*graph,context.scope,&record,actual,out,true);
+ }
++GraphFailure GraphConstruction::create_cpu_tiled_addmm_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::tiled_addmm_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
+ GraphFailure GraphConstruction::create_cpu_tiled_matmul_eval(const FixedEvalPrologueGuard& guard,
+     GraphConstruction*& out) noexcept {
+   auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
+diff --git a/mlx/backend/cpu/matmul_storage.h b/mlx/backend/cpu/matmul_storage.h
+--- a/mlx/backend/cpu/matmul_storage.h
++++ b/mlx/backend/cpu/matmul_storage.h
+@@ -14,6 +14,10 @@
+     size_t batches,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool tiled_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,size_t copies,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool tiled_addmm_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_tiled_addmm_eval_primitive(const array&) noexcept;
++MLX_API bool tiled_addmm_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ MLX_API bool is_tiled_matmul_eval_primitive(const array&) noexcept;
+ MLX_API bool tiled_matmul_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ MLX_API bool bf16_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -75,11 +75,12 @@
+   const bool fixed_alias = fixed && cpu::is_alias_eval_primitive(arr);
+   const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
+   const bool fixed_tiled_gather_mm = fixed && cpu::is_tiled_gather_mm_eval_primitive(arr);
++  const bool fixed_tiled_addmm = fixed && cpu::is_tiled_addmm_eval_primitive(arr);
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+   const bool fixed_affine_quantized = fixed && cpu::is_affine_quantized_eval_primitive(arr);
+-  const bool extended = fixed_affine_quantized || fixed_tiled_gather_mm || fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_affine_quantized || fixed_tiled_gather_mm || fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_addmm || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -115,6 +116,8 @@
+         ? submission::GraphConstruction::create_cpu_gather_eval(*extended_prologue, extended_bank.value)
+         : fixed_alias
+         ? submission::GraphConstruction::create_cpu_alias_eval(*extended_prologue, extended_bank.value)
++        : fixed_tiled_addmm
++        ? submission::GraphConstruction::create_cpu_tiled_addmm_eval(*extended_prologue, extended_bank.value)
+         : fixed_tiled_matmul
+         ? submission::GraphConstruction::create_cpu_tiled_matmul_eval(*extended_prologue, extended_bank.value)
+         : fixed_matmul
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -182,6 +182,8 @@
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_tiled_gather_mm_eval(const FixedEvalPrologueGuard&,
++      GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_tiled_addmm_eval(const FixedEvalPrologueGuard&,
+       GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_tiled_matmul_eval(const FixedEvalPrologueGuard&,
+       GraphConstruction*&) noexcept;

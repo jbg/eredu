@@ -39,6 +39,14 @@
 //! # Ok::<(), eredu_core::MemoryContractError>(())
 //! ```
 
+mod domain;
+pub use domain::{
+    DomainMemoryCharge, DomainMemoryRequirements, DomainOverheadEstimate, MemoryDeviceId,
+    MemoryDomainDescription, MemoryDomainError, MemoryDomainId, MemoryHeadroomDeclarations,
+    MemoryLimit, MemoryLimitDeclarations, MemoryLimits, MemoryLocation, MemoryPlacement,
+    MemoryPlacementKind, MemoryTopology, PlacementAllowance,
+};
+
 /// Treatment of required overhead without a finite estimate.
 ///
 /// The runtime contract requires consumers to inherit this policy from their

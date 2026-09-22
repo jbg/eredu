@@ -29,6 +29,7 @@ pub(in crate::composition::mlx::replicated_text::session::composite) type Run<A,
         &OriginalSpeculativePrefillSpan,
         &Stream,
         &mut dyn AutoregressiveSequenceCompletion,
+        &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
     ) -> Result<Option<MlxTensor>, Error>;
 
 pub(super) fn prepare<A, D>(
@@ -62,11 +63,16 @@ where
     let source = session
         .prepare_speculative_media_prefill(plan, role, metadata)
         .map_err(|cause| Error::Neural(metadata.metadata_source(cause)))?;
-    OriginalAutoregressiveMediaPrefill::new(source, |source, visitor| {
-        source.downcast_ref::<Source<A>>()
-            .expect("visitor installed with the typed media source")
-            .visit_retained_roots(&mut |tensor| visitor(tensor.as_array()));
-    }, metadata)
+    OriginalAutoregressiveMediaPrefill::new(
+        source,
+        |source, visitor| {
+            source
+                .downcast_ref::<Source<A>>()
+                .expect("visitor installed with the typed media source")
+                .visit_retained_roots(&mut |tensor| visitor(tensor.as_array()));
+        },
+        metadata,
+    )
 }
 
 pub(super) fn run<A, D>(
@@ -75,6 +81,7 @@ pub(super) fn run<A, D>(
     span: &OriginalSpeculativePrefillSpan,
     stream: &Stream,
     completion: &mut dyn AutoregressiveSequenceCompletion,
+    observer: &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
 ) -> Result<Option<MlxTensor>, Error>
 where
     A: CompositeMediaIngressArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -114,7 +121,7 @@ where
         checkpoint.take_state::<MlxHybridState>()?,
     );
     session
-        .prefill_media_span_with_checkpoint_and_completion(
+        .prefill_media_span_with_checkpoint_completion_and_observer(
             source,
             span,
             stream,
@@ -127,6 +134,7 @@ where
                     stream,
                 )
             },
+            observer,
         )
         .map_err(|cause| Error::Neural(funding.metadata_source(cause)))
 }

@@ -4,6 +4,8 @@ use super::*;
 use crate::composition::mlx::session::model_session::{
     disk_layerwise_tests as disk, host_layerwise_tests as host,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     TextGenerationBackend, TextGenerationDriver, TextGenerationInput, TextPreparationOptions,
@@ -23,7 +25,7 @@ enum Mode {
 fn stream() -> Stream {
     Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))
 }
-fn load(stream: &Stream, pool: &WorkingMemoryPool, route: usize) -> (Runtime, tempfile::TempDir) {
+fn load(stream: &Stream, pool: &MemoryLedger, route: usize) -> (Runtime, tempfile::TempDir) {
     match route {
         0 => host::runtime(stream, pool, None),
         1 => host::runtime(stream, pool, Some(1)),
@@ -98,14 +100,14 @@ fn finish_runtime(runtime: Runtime, stream: &Stream) {
         .synchronize()
         .unwrap();
 }
-fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::transforms::async_eval_with_event(std::iter::empty::<&Array>())
             .unwrap()
             .synchronize()
             .unwrap();
         disk::reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 fn values(frame: &SharedCapturedStep) -> &[f32] {
@@ -129,13 +131,18 @@ fn quoted(runtime: &Runtime, source: &SharedCapturePlan, controller: &disk::Cont
         prefill_chunk_positions: 1,
         output: OutputDemand::LastPosition,
     };
-    let capture = CaptureAdmission::new(runtime.session(), geometry, source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
-        .unwrap()
-        .with_opening_rows();
+    let capture = CaptureAdmission::new(
+        runtime.session(),
+        geometry,
+        source,
+        eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+    )
+    .unwrap()
+    .with_opening_rows();
     geometry.output = capture.physical_output(geometry.output);
     let storage = ControllerStorageContract::inspect(controller).unwrap();
     let registered = storage
-        .pin_registered(controller, runtime.backend().memory_pool())
+        .pin_registered(controller, runtime.backend().memory_ledger())
         .unwrap();
     let ids = vec![2_u32, 5, 7];
     let quote = quote_incremental(
@@ -146,21 +153,20 @@ fn quoted(runtime: &Runtime, source: &SharedCapturePlan, controller: &disk::Cont
         controller.inference_workspace(4).unwrap(),
         &storage,
         Some(&registered),
-        false,
         Some(&capture),
     )
     .unwrap()
     .quote
     .unwrap();
     assert_eq!(quote.geometry(), geometry);
-    quote.incremental_bytes()
+    quote.incremental_bytes().unwrap()
 }
 
 /// Real entry/install path; vectors copied here are test result comparisons,
 /// never original admitted native/source inventories or replacement accounts.
 fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Vec<Vec<f32>>) {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, route);
     let source = source(&runtime, mode);
     let alias = source.clone();
@@ -173,12 +179,12 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
     let probe = CaptureFundingProbe::new(&source);
     let capacity = if exact_check {
         assert_eq!(chunk, 1);
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
         let native = paths::snapshot();
         let inputs = paths::session_input_creation_attempts();
         let frontier = runtime.session().payload.model.erased().state_snapshot();
         let required = quoted(&runtime, &source, &controller);
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         assert_eq!(paths::snapshot(), native);
         assert_eq!(paths::session_input_creation_attempts(), inputs);
         let exact = baseline.checked_add(required).unwrap();
@@ -189,14 +195,15 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
                 disk::config(0.0, chunk, exact - 1),
                 controller.clone(),
                 TextPreparationOptions {
-                    interventions: None, capture: Some(source.clone()),
+                    interventions: None,
+                    capture: Some(source.clone()),
                 },
             )
             .err()
             .expect("one byte short must fail before prompt/controller work");
         assert!(matches!(
             cause::<WorkingMemoryError>(&error),
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ));
         assert_eq!(controller.0.get(), (0, 0));
         assert_eq!(paths::snapshot(), native);
@@ -211,7 +218,7 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
                 .state_snapshot(),
             frontier
         );
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         assert!(probe.is_empty());
         assert!(selector.0.quote.borrow().is_none());
         assert_eq!(selector.0.calls.get(), 1);
@@ -226,7 +233,8 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
             disk::config(0.0, chunk, capacity),
             controller.clone(),
             TextPreparationOptions {
-                interventions: None, capture: Some(source.clone()),
+                interventions: None,
+                capture: Some(source.clone()),
             },
         )
         .unwrap();
@@ -235,7 +243,14 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
     assert_eq!(selector.0.calls.get(), 1 + usize::from(exact_check));
     assert_eq!(
         original.reservation,
-        quote.request().memory_reservation().unwrap().bytes()
+        quote
+            .request()
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap()
     );
     assert_eq!(original.capture, h);
     assert_eq!(original.source, c);
@@ -280,7 +295,7 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
         installed
             .span_workspace()
             .control_guard()
-            .validate_reservation(quote.request().memory_reservation().unwrap())
+            .validate_reservation(quote.request().memory_reservation())
             .unwrap();
         assert_eq!(
             installed.span_workspace().protected_host_bytes(),
@@ -394,7 +409,7 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
     assert_eq!(controller.0.get(), (4, 4));
     assert_eq!(selector.0.calls.get(), 1 + usize::from(exact_check));
     if exact_check {
-        assert!(pool.peak_bytes().unwrap() <= capacity);
+        assert!(pool.fixture_host_peak().unwrap() <= capacity);
     }
     drop((continuation, driver, rows, quote, probe, selector));
     finish_runtime(runtime, &stream);
@@ -410,7 +425,7 @@ fn run(route: usize, chunk: u64, mode: Mode, exact_check: bool) -> (Vec<u32>, Ve
     drop(frames);
     settle(&pool, original.source_tail());
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), original.source_tail());
+    assert_eq!(pool.fixture_host_charge().unwrap(), original.source_tail());
     assert_eq!(alias.capacity_bytes(), Some(c));
     drop(alias);
     settle(&pool, 0);
@@ -450,15 +465,15 @@ fn private_entry_empty_decode_only_and_skipped_prefill_install_without_an_openin
 #[test]
 fn private_entry_selection_is_exact_source_and_session_scoped_and_resets_on_unwind() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
-    let other_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let other_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (other, _other_artifact) = load(&stream, &other_pool, 0);
     let source = source(&runtime, Mode::Active);
     let equal_source = self::source(&runtime, Mode::Active);
     let controller = disk::Controller::default();
     let native = paths::snapshot();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let input = disk::evidence(&vec![2, 5, 7]);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _selection = Selection::new(&runtime, &source);
@@ -489,7 +504,7 @@ fn private_entry_selection_is_exact_source_and_session_scoped_and_resets_on_unwi
     assert!(selected(&runtime, &source).is_none());
     assert_eq!(controller.0.get(), (0, 0));
     assert_eq!(paths::snapshot(), native);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     drop(Selection::new(&runtime, &source));
     drop((source, equal_source));
     finish_runtime(runtime, &stream);

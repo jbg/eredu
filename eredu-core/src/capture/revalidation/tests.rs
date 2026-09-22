@@ -228,12 +228,10 @@ fn ordinary_cached_and_independent_geometry_proofs_are_preserved() {
 }
 
 #[test]
-fn empty_admissions_still_validate_schema_and_physical_capability() {
+fn empty_admissions_still_validate_schema() {
     let (original, mut discovery) = fixture();
     let mut raw = original.plan().clone();
     raw.selections.clear();
-    raw.limits.physical_native_bytes = Some(100);
-    discovery.support.capture.physical_native_limit = true;
     let plan = raw
         .admit(
             &discovery.catalog,
@@ -246,12 +244,6 @@ fn empty_admissions_still_validate_schema_and_physical_capability() {
     discovery.catalog.points.clear();
     discovery.support.points.clear();
     plan.revalidate(&discovery).unwrap();
-    discovery.support.capture.physical_native_limit = false;
-    assert!(matches!(
-        plan.revalidate(&discovery),
-        Err(CaptureError::Unsupported(_))
-    ));
-    discovery.support.capture.physical_native_limit = true;
     discovery.catalog.schema_version += 1;
     assert!(matches!(
         plan.revalidate(&discovery),
@@ -316,7 +308,6 @@ fn fixture() -> (AdmittedCapturePlan, CaptureDiscovery) {
     let capabilities = CaptureCapabilities {
         transformations: transforms.iter().map(CaptureTransform::kind).collect(),
         max_histogram_bins: 4,
-        physical_native_limit: false,
         conditions: vec![],
     };
     let support = ObservationSupportReport {
@@ -368,7 +359,6 @@ fn fixture() -> (AdmittedCapturePlan, CaptureDiscovery) {
         limits: CaptureLimits {
             per_step: all,
             cumulative: all,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     }
@@ -436,25 +426,42 @@ fn fixed_borrowed_revalidation_shares_transform_limits_and_enabled_phases() {
     let (plan, discovery) = fixture();
     let validate = |current: &CaptureDiscovery| {
         plan.revalidate_borrowed_declarations(
-            &current.catalog, current.support.schema_version, &current.support.capture,
+            &current.catalog,
+            current.support.schema_version,
+            &current.support.capture,
             |point, phase| {
-                let Some(row) = current.support.points.iter().find(|row|row.path==point.path)
-                    else { return false; };
-                let status = match phase {CapturePhase::Prefill=>&row.prefill,CapturePhase::Decode=>&row.decode};
-                matches!(status,ObservationSupportStatus::Supported|ObservationSupportStatus::Conditional(_))
+                let Some(row) = current
+                    .support
+                    .points
+                    .iter()
+                    .find(|row| row.path == point.path)
+                else {
+                    return false;
+                };
+                let status = match phase {
+                    CapturePhase::Prefill => &row.prefill,
+                    CapturePhase::Decode => &row.decode,
+                };
+                matches!(
+                    status,
+                    ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_)
+                )
             },
         )
     };
-    assert_eq!(validate(&discovery),Ok(()));
+    assert_eq!(validate(&discovery), Ok(()));
     for mutation in 0..5 {
-        let mut current=discovery.clone();
+        let mut current = discovery.clone();
         match mutation {
-            0=>current.support.capture.transformations.clear(),
-            1=>current.support.capture.max_histogram_bins=0,
-            2=>current.catalog.points[0].meaning.push_str(" stale"),
-            3=>current.support.points[0].decode=ObservationSupportStatus::Unverified("unavailable".into()),
-            4=>current.support.schema_version=0,
-            _=>unreachable!(),
+            0 => current.support.capture.transformations.clear(),
+            1 => current.support.capture.max_histogram_bins = 0,
+            2 => current.catalog.points[0].meaning.push_str(" stale"),
+            3 => {
+                current.support.points[0].decode =
+                    ObservationSupportStatus::Unverified("unavailable".into())
+            }
+            4 => current.support.schema_version = 0,
+            _ => unreachable!(),
         }
         assert!(validate(&current).is_err());
         assert!(plan.revalidate(&current).is_err());
@@ -471,17 +478,40 @@ impl crate::HostMetadataAccount for AdmissionAccount {
         use std::sync::atomic::Ordering::SeqCst;
         let index = self.calls.fetch_add(1, SeqCst);
         if index == self.refuse {
-            Err(crate::HostMetadataFundingError::Capacity { required: bytes as u64, available: 0 })
-        } else { Ok(()) }
+            Err(crate::HostMetadataFundingError::Capacity {
+                required: bytes as u64,
+                available: 0,
+            })
+        } else {
+            Ok(())
+        }
     }
 }
-fn paid_admission(raw: &CapturePlan, discovery: &CaptureDiscovery, request: CaptureRequestShape,
-    refuse: usize) -> (Result<AdmittedCapturePlan, CaptureError>, usize) {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering::SeqCst}};
+fn paid_admission(
+    raw: &CapturePlan,
+    discovery: &CaptureDiscovery,
+    request: CaptureRequestShape,
+    refuse: usize,
+) -> (Result<AdmittedCapturePlan, CaptureError>, usize) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc,
+    };
     let calls = Arc::new(AtomicUsize::new(0));
-    let funding = crate::HostMetadataFunding::new(AdmissionAccount { calls: calls.clone(), refuse }).unwrap();
-    let result = raw.copy_with_funding(&funding).and_then(|plan| plan.admit_with_funding(
-        &discovery.catalog, &discovery.support, &discovery.support.capture, request, &funding));
+    let funding = crate::HostMetadataFunding::new(AdmissionAccount {
+        calls: calls.clone(),
+        refuse,
+    })
+    .unwrap();
+    let result = raw.copy_with_funding(&funding).and_then(|plan| {
+        plan.admit_with_funding(
+            &discovery.catalog,
+            &discovery.support,
+            &discovery.support.capture,
+            request,
+            &funding,
+        )
+    });
     (result, calls.load(SeqCst))
 }
 
@@ -493,14 +523,26 @@ fn funded_admission_preserves_all_transforms_and_refuses_each_reached_producer()
     assert_eq!(paid.identity(), ordinary.identity());
     assert_eq!(paid.plan(), ordinary.plan());
     assert_eq!(paid.points(), ordinary.points());
-    assert_ne!(paid.plan().selections.as_ptr(), ordinary.plan().selections.as_ptr());
+    assert_ne!(
+        paid.plan().selections.as_ptr(),
+        ordinary.plan().selections.as_ptr()
+    );
     assert!(calls > 20);
     // Index zero constructs the test account, before the compiler invocation.
     for refusal in 1..calls {
-        let (result, reached) = paid_admission(ordinary.plan(), &discovery, ordinary.request(), refusal);
-        assert!(matches!(result, Err(CaptureError::AdmissionStorage(
-            CaptureAdmissionStorageError::Funding(crate::HostMetadataFundingError::Capacity { available: 0, .. })))),
-            "producer {refusal}: {result:?}");
+        let (result, reached) =
+            paid_admission(ordinary.plan(), &discovery, ordinary.request(), refusal);
+        assert!(
+            matches!(
+                result,
+                Err(CaptureError::AdmissionStorage(
+                    CaptureAdmissionStorageError::Funding(
+                        crate::HostMetadataFundingError::Capacity { available: 0, .. }
+                    )
+                ))
+            ),
+            "producer {refusal}: {result:?}"
+        );
         assert_eq!(reached, refusal + 1, "producer after first refusal");
     }
 }
@@ -509,21 +551,48 @@ fn funded_admission_preserves_all_transforms_and_refuses_each_reached_producer()
 fn funded_diagnostics_keep_first_source_error_and_refuse_before_formatting() {
     let (ordinary, discovery) = fixture();
     let mut cases = Vec::new();
-    let mut raw = ordinary.plan().clone(); raw.schema_version += 1; cases.push(raw);
-    let mut raw = ordinary.plan().clone(); raw.selections[0].path = "missing target".into(); cases.push(raw);
-    let mut raw = ordinary.plan().clone(); raw.selections[1].id = raw.selections[0].id.clone();
-    raw.selections[2].path = "later missing target".into(); cases.push(raw);
-    let mut raw = ordinary.plan().clone(); let duplicate = raw.selections[1].slices[0].clone(); raw.selections[1].slices.push(duplicate); cases.push(raw);
-    let mut raw = ordinary.plan().clone(); raw.selections[6].transform = CaptureTransform::TokenScores { token_ids: vec![3, 3] }; cases.push(raw);
+    let mut raw = ordinary.plan().clone();
+    raw.schema_version += 1;
+    cases.push(raw);
+    let mut raw = ordinary.plan().clone();
+    raw.selections[0].path = "missing target".into();
+    cases.push(raw);
+    let mut raw = ordinary.plan().clone();
+    raw.selections[1].id = raw.selections[0].id.clone();
+    raw.selections[2].path = "later missing target".into();
+    cases.push(raw);
+    let mut raw = ordinary.plan().clone();
+    let duplicate = raw.selections[1].slices[0].clone();
+    raw.selections[1].slices.push(duplicate);
+    cases.push(raw);
+    let mut raw = ordinary.plan().clone();
+    raw.selections[6].transform = CaptureTransform::TokenScores {
+        token_ids: vec![3, 3],
+    };
+    cases.push(raw);
     for raw in cases {
-        let ordinary_error = raw.clone().admit(&discovery.catalog, &discovery.support,
-            &discovery.support.capture, ordinary.request()).unwrap_err();
+        let ordinary_error = raw
+            .clone()
+            .admit(
+                &discovery.catalog,
+                &discovery.support,
+                &discovery.support.capture,
+                ordinary.request(),
+            )
+            .unwrap_err();
         let (result, calls) = paid_admission(&raw, &discovery, ordinary.request(), usize::MAX);
         assert_eq!(result.unwrap_err().to_string(), ordinary_error.to_string());
         for refusal in 1..calls {
             let (result, reached) = paid_admission(&raw, &discovery, ordinary.request(), refusal);
-            assert!(matches!(result, Err(CaptureError::AdmissionStorage(CaptureAdmissionStorageError::Funding(_)))),
-                "producer {refusal}: {result:?}");
+            assert!(
+                matches!(
+                    result,
+                    Err(CaptureError::AdmissionStorage(
+                        CaptureAdmissionStorageError::Funding(_)
+                    ))
+                ),
+                "producer {refusal}: {result:?}"
+            );
             assert_eq!(reached, refusal + 1);
         }
     }

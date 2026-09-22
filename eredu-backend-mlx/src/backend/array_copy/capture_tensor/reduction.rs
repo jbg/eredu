@@ -44,6 +44,7 @@ impl Selection {
             preview: None,
             cast_f32: false,
             read_f32: false,
+            read_unsigned: false,
         };
         for axis in 0..rank {
             selection.source_shape[axis] = i32::try_from(source_shape[axis])

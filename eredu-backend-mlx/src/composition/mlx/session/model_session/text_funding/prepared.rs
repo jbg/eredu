@@ -17,13 +17,6 @@ pub(in crate::composition::mlx::session::model_session) struct PreparedWorkReten
 }
 
 impl PreparedFundedWork {
-    pub(in crate::composition::mlx::session::model_session) fn new(
-        scope: PreparedWorkingMemoryFundingScope,
-        controls: OriginalTextControlGuard,
-        rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
-    ) -> Result<Self, Error> {
-        Self::new_with_native(scope, controls, rows, None, None)
-    }
     pub(in crate::composition::mlx::session::model_session) fn new_with_native(
         scope: PreparedWorkingMemoryFundingScope,
         controls: OriginalTextControlGuard,
@@ -37,7 +30,16 @@ impl PreparedFundedWork {
         // unused cancellation runs before Work/rows/full-custody destruction.
         let prepared = Self {
             scope: Some(scope),
-            work: FundedWork::allocate(None, Some(controls), rows, None, None, prepared_source, native_storage, None),
+            work: FundedWork::allocate(
+                None,
+                Some(controls),
+                rows,
+                None,
+                None,
+                prepared_source,
+                native_storage,
+                None,
+            ),
         };
         let scope = prepared.scope.as_ref().expect("prepared funding scope");
         prepared
@@ -49,7 +51,10 @@ impl PreparedFundedWork {
             .map_err(|e| Error::Other(Box::new(e)))?;
         if let Some(source) = &prepared.work.prepared_source {
             let controls = prepared.work._controls.as_ref().expect("original controls");
-            if !controls.metadata_custody().matches_domain(source.pool().shared_storage_domain()) {
+            if !controls
+                .metadata_custody()
+                .matches_accounting_owner(source.pool().shared_storage_accounting_id())
+            {
                 return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
             }
         }

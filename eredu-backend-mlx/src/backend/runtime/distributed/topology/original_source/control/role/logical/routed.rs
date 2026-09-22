@@ -51,7 +51,7 @@ where F: FnOnce(Array, &OriginalScopeObserver) -> Result<T, Error> {
             let pair = Pair { input: previous, round: 0, quote: source.source.clone(),
                 claim: match first.take() { Some(first) => first, None => claim(owner.owner(), c)? },
                 owner: OriginalParallelControlOwner(owner.0.clone()), custody: c.clone() };
-            let outputs = run_native_role(pair, capacity, &owner.owner().bank, &owner.owner().controls, c,
+            let outputs = run_native_role(pair, capacity, &owner.owner().native, c,
                 |pair, observer| Ok(pair.run(observer)))
                 .map_err(|cause| Error::with_original_control_source(cause, false))??;
             run_arithmetic(owner, source.source.clone(), ArithmeticStage::Peer, outputs, stream, c)

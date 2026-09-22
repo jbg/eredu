@@ -117,6 +117,7 @@ fn verify(device: DeviceType) {
         phase: CapturePhase::Prefill,
         prediction: 0,
         forward_epoch: 1,
+        invocation_window: None,
     };
     let tags = (0..34).chain(0..34).collect::<Vec<_>>();
     let origins = eredu_runtime::RoutedUnitOrigins::new(&[34, 34], &tags, 2).unwrap();

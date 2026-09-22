@@ -1,11 +1,11 @@
 //! Typed prepared-input ingress for replicated composite architectures.
 
-mod media_prefill;
-pub(crate) mod graph;
 mod description;
+pub(crate) mod graph;
+mod media_prefill;
 pub(crate) mod prediction_tokens;
-pub use prediction_tokens::PredictionTokenPart;
 pub use media_prefill::CompositeMediaIngressArchitecture;
+pub use prediction_tokens::PredictionTokenPart;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_core::AttentionPolicy;
@@ -77,7 +77,9 @@ impl<T> ExternalPredictionTargetCapture<T> {
                 }
             }
             Self::MuseGlimmerDFlash { target_states } => {
-                for value in target_states { visitor(value); }
+                for value in target_states {
+                    visitor(value);
+                }
             }
         }
     }
@@ -95,14 +97,19 @@ impl ExternalPredictionCaptureRequest {
                 paths.push(metadata.text(format_args!("{final_hidden_path}"))?);
                 Ok(paths)
             }
-            Self::MuseGlimmerDFlash { target_layers, target_paths } => {
+            Self::MuseGlimmerDFlash {
+                target_layers,
+                target_paths,
+            } => {
                 if target_layers.is_empty() || target_paths.len() != target_layers.len() {
                     return Err(metadata.error(format_args!(
                         "Muse-Glimmer DFlash capture paths differ from its nonempty target layers"
                     )));
                 }
                 let mut paths = metadata.vector(target_paths.len())?;
-                for path in target_paths { paths.push(metadata.text(format_args!("{path}"))?); }
+                for path in target_paths {
+                    paths.push(metadata.text(format_args!("{path}"))?);
+                }
                 Ok(paths)
             }
         }
@@ -119,9 +126,11 @@ pub enum ExternalPredictionTargetOperation<'a, T> {
     ProjectLogits(&'a T),
 }
 
-impl<T> Copy for ExternalPredictionTargetOperation<'_,T> {}
-impl<T> Clone for ExternalPredictionTargetOperation<'_,T> {
-    fn clone(&self)->Self { *self }
+impl<T> Copy for ExternalPredictionTargetOperation<'_, T> {}
+impl<T> Clone for ExternalPredictionTargetOperation<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl CompositeTensorCollective {
@@ -136,25 +145,39 @@ impl CompositeTensorCollective {
 /// Embedding sums for independently looked-up token segments. Media positions
 /// are supplied by their own ingress and must not enlarge these native waves.
 pub(crate) fn segmented_token_ingress_collectives(
-    positions: impl IntoIterator<Item = u64>, hidden_width: i32, tensor_partitions: usize,
+    positions: impl IntoIterator<Item = u64>,
+    hidden_width: i32,
+    tensor_partitions: usize,
 ) -> Result<Option<Vec<CompositeTensorCollective>>, String> {
-    segmented_token_ingress_collectives_in(positions, hidden_width, tensor_partitions,
-        graph::Destination(None)).map_err(|cause| cause.to_string())
+    segmented_token_ingress_collectives_in(
+        positions,
+        hidden_width,
+        tensor_partitions,
+        graph::Destination(None),
+    )
+    .map_err(|cause| cause.to_string())
 }
 
 pub(crate) fn segmented_token_ingress_collectives_in(
-    positions: impl IntoIterator<Item = u64>, hidden_width: i32, tensor_partitions: usize,
+    positions: impl IntoIterator<Item = u64>,
+    hidden_width: i32,
+    tensor_partitions: usize,
     destination: graph::Destination<'_>,
 ) -> Result<Option<Vec<CompositeTensorCollective>>, eredu_nn::Error> {
     destination.controls::<(Option<Vec<CompositeTensorCollective>>, i32, usize)>()?;
-    if tensor_partitions <= 1 { return Ok(None); }
-    destination.try_collect(positions.into_iter().map(|positions| {
-        let positions = i32::try_from(positions).map_err(|_| destination.error(format_args!(
-            "composite token ingress positions exceed i32")))?;
-        Ok(CompositeTensorCollective::Sum {
-            shape: destination.collect([1, positions, hidden_width])?,
-        })
-    })).map(Some)
+    if tensor_partitions <= 1 {
+        return Ok(None);
+    }
+    destination
+        .try_collect(positions.into_iter().map(|positions| {
+            let positions = i32::try_from(positions).map_err(|_| {
+                destination.error(format_args!("composite token ingress positions exceed i32"))
+            })?;
+            Ok(CompositeTensorCollective::Sum {
+                shape: destination.collect([1, positions, hidden_width])?,
+            })
+        }))
+        .map(Some)
 }
 
 /// Exact prepared tensors paired with their architecture-owned admission proof.
@@ -259,7 +282,9 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
         diagnostic: impl FnOnce(&'static str) -> E,
     ) -> Result<Self, E> {
         if prepared.len() != original.records().len() {
-            return Err(diagnostic("compiled prepared input part count differs from original source"));
+            return Err(diagnostic(
+                "compiled prepared input part count differs from original source",
+            ));
         }
         Ok(Self {
             prepared,
@@ -343,28 +368,47 @@ impl<'a, P> CompositeAdmissionRef<'a, P> {
 impl<'a> CompositeAdmissionRef<'a, crate::media_plan::Gemma4InputPartPlan> {
     /// Fixed ordinary plans or equivalent scalar projections from the exact
     /// original source. No metadata Vec, native read or admission is repeated.
-    pub(crate) fn gemma_parts(self) -> impl ExactSizeIterator<Item = crate::media_plan::Gemma4InputPartPlan> + Clone + 'a {
+    pub(crate) fn gemma_parts(
+        self,
+    ) -> impl ExactSizeIterator<Item = crate::media_plan::Gemma4InputPartPlan> + Clone + 'a {
         (0..self.len()).map(move |index| match self.ordinary {
             Some(value) => value.parts()[index].clone(),
-            None => self.original.expect("closed Gemma admission").gemma_part(index),
+            None => self
+                .original
+                .expect("closed Gemma admission")
+                .gemma_part(index),
         })
     }
 }
 
-/// Builds only semantic token parts from an exact admission. The architecture
-/// supplies placeholder identities; media tensors are neither copied nor encoded.
-pub(crate) fn prepared_token_parts<T: Tensor, P>(
-    input: PreparedCompositeInput<'_, T, P>,
-    context: &T::Context,
-    placeholder: impl Fn(&P) -> Option<(u32, u64)>,
-) -> Result<Vec<T>, eredu_nn::Error> {
-    let metadata = crate::decoder::identity::Metadata::new(input.metadata());
-    let mut parts = metadata.vector(input.prepared().len())?;
-    prediction_tokens::visit(input, placeholder, &mut |part| {
-        parts.push(prediction_tokens::materialize(part, context, metadata)?);
-        Ok(())
-    })?;
-    Ok(parts)
+impl<'a> CompositeAdmissionRef<'a, crate::media_plan::InklingInputPartPlan> {
+    pub(crate) fn inkling_parts(
+        self,
+    ) -> impl ExactSizeIterator<Item = crate::media_plan::InklingInputPartPlan> + Clone + 'a {
+        (0..self.len()).map(move |index| match self.ordinary {
+            Some(value) => value.parts()[index].clone(),
+            None => self
+                .original
+                .expect("closed Inkling admission")
+                .inkling_part(index),
+        })
+    }
+}
+impl<'a> CompositeAdmissionRef<'a, crate::media_plan::MuseGlimmerInputPartPlan> {
+    pub(crate) fn muse_parts(
+        self,
+    ) -> impl ExactSizeIterator<Item = crate::media_plan::original::MuseInputPartRef<'a>> + Clone + 'a
+    {
+        (0..self.len()).map(move |index| match self.ordinary {
+            Some(value) => {
+                crate::media_plan::original::MuseInputPartRef::ordinary(&value.parts()[index])
+            }
+            None => self
+                .original
+                .expect("closed Muse admission")
+                .muse_part(index),
+        })
+    }
 }
 
 /// Architecture-owned interpretation of admitted prepared input.
@@ -396,8 +440,10 @@ where
     /// Borrows the target facts directly from retained admission configuration.
     /// Missing fixed source support stays unavailable to original startup.
     fn external_assistant_target_profile_ref(
-        _config:&Self::AdmissionConfig,
-    )->Option<crate::external_assistant::ExternalAssistantTargetProfileRef<'_>> { None }
+        _config: &Self::AdmissionConfig,
+    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfileRef<'_>> {
+        None
+    }
 
     /// Publishes the target facts required to prove external-assistant compatibility.
     fn external_assistant_target_profile(
@@ -578,9 +624,14 @@ where
         _pipeline_stages: usize,
         metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, eredu_nn::Error> {
-        graph::Destination(metadata).controls::<(&Self,
-            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>, usize, usize, usize,
-            Option<Vec<Vec<CompositeTensorCollective>>>)>()?;
+        graph::Destination(metadata).controls::<(
+            &Self,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+            usize,
+            usize,
+            usize,
+            Option<Vec<Vec<CompositeTensorCollective>>>,
+        )>()?;
         Ok(None)
     }
 
@@ -593,9 +644,12 @@ where
         _tensor_partitions: usize,
         metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<Option<Vec<CompositeTensorCollective>>, eredu_nn::Error> {
-        graph::Destination(metadata).controls::<(&Self,
-            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>, usize,
-            Option<Vec<CompositeTensorCollective>>)>()?;
+        graph::Destination(metadata).controls::<(
+            &Self,
+            PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+            usize,
+            Option<Vec<CompositeTensorCollective>>,
+        )>()?;
         Ok(None)
     }
 
@@ -662,7 +716,6 @@ where
     ) -> Result<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>, Self::Error> {
         Ok(None)
     }
-
 
     /// Installs a typed continuation or dependency before its destination begins.
     fn accept_partition_boundary(
@@ -822,18 +875,15 @@ where
 {
     type DefinitionError = A::DefinitionError;
 
-
     fn state_layout(
         &self,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::StateLayout, Self::DefinitionError> {
-match context { Some(context) => {
-        self.inner.state_layout(Some(context))
-    }, None => {
-        self.inner.state_layout(None)
-    } }
-}
-
+        match context {
+            Some(context) => self.inner.state_layout(Some(context)),
+            None => self.inner.state_layout(None),
+        }
+    }
 
     fn state_identity(
         &self,
@@ -841,17 +891,19 @@ match context { Some(context) => {
         topology: eredu_core::cache::PromptCacheTopology,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-match context { Some(context) => {
-        self.inner.state_identity(state, topology, Some(context))
-    }, None => {
-        self.inner.state_identity(state, topology, None)
-    } }
-}
-
+        match context {
+            Some(context) => self.inner.state_identity(state, topology, Some(context)),
+            None => self.inner.state_identity(state, topology, None),
+        }
+    }
 
     fn parameter_description(
-        &self, context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>,
+        Self::DefinitionError,
+    > {
         match &self.construction_parameters {
             Some(source) => Ok(std::borrow::Cow::Borrowed(&**source)),
             None => self.inner.parameter_description(context),
@@ -914,13 +966,19 @@ where
     type Error = A::Error;
 
     fn prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        self.inner.prefill_observation_declarations(metadata_context)
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        self.inner
+            .prefill_observation_declarations(metadata_context)
     }
 
     fn media_prefill_observation_declarations(
-        &self, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
-        self.inner.media_prefill_observation_declarations(metadata_context)
+        &self,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        self.inner
+            .media_prefill_observation_declarations(metadata_context)
     }
 
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
@@ -968,37 +1026,49 @@ where
         self.inner.state_partition_plan(layout)
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+    fn execution_graph(
+        &self,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
         self.inner.execution_graph()
     }
 
-    fn group_unit_count(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<usize, Self::Error> {
-
+    fn group_unit_count(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Self::Error> {
         self.inner.group_unit_count(group, metadata_context)
     }
 
-
-
-    fn unit_path(&self, group: usize, index: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<String, Self::Error> {
-
+    fn unit_path(
+        &self,
+        group: usize,
+        index: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<String, Self::Error> {
         self.inner.unit_path(group, index, metadata_context)
     }
-
-
-
 
     fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
         self.inner.observes_unit_boundaries(group, index)
     }
 
-    fn group_input_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
-
-        self.inner.group_input_observation_path(group, metadata_context)
+    fn group_input_observation_path(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
+        self.inner
+            .group_input_observation_path(group, metadata_context)
     }
 
-    fn group_output_observation_path(&self, group: usize, metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Option<String>, Self::Error> {
-
-        self.inner.group_output_observation_path(group, metadata_context)
+    fn group_output_observation_path(
+        &self,
+        group: usize,
+        metadata_context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Option<String>, Self::Error> {
+        self.inner
+            .group_output_observation_path(group, metadata_context)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -1138,7 +1208,11 @@ where
         visitor: &mut dyn FnMut(&'a B::Tensor),
     ) {
         <A as LayeredArchitecture<B, S>>::visit_retained_context_values(
-            &self.inner, forward, group, index, visitor,
+            &self.inner,
+            forward,
+            group,
+            index,
+            visitor,
         );
     }
 
@@ -1372,7 +1446,10 @@ where
         self.inner.partition_observation_hooks(tensor_parallel)
     }
 
-    fn boundary_schema(&self, metadata: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<Self::Boundary, Self::Error> {
+    fn boundary_schema(
+        &self,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self::Boundary, Self::Error> {
         self.inner.boundary_schema(metadata)
     }
 
@@ -1597,8 +1674,14 @@ impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenHybridInputPart
 }
 
 impl<A, B> crate::routed_text::RoutedConstructionParameters<B> for PreparedCompositeArchitecture<A>
-where B: NeuralBackend, A: ArchitectureParameters<B, DefinitionError = eredu_nn::Error> {
-    fn install_construction_parameters(&mut self, source: crate::routed_text::RetainedRoutedDescription) {
+where
+    B: NeuralBackend,
+    A: ArchitectureParameters<B, DefinitionError = eredu_nn::Error>,
+{
+    fn install_construction_parameters(
+        &mut self,
+        source: crate::routed_text::RetainedRoutedDescription,
+    ) {
         self.construction_parameters = Some(source);
     }
 }

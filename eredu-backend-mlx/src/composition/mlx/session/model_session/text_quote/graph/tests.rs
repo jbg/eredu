@@ -2,6 +2,8 @@ use super::super::sequence::fixture::{Probe, tests as fixture};
 use super::*;
 use crate::backend::submission_recovery::prediction::test_counts::Calls;
 use crate::composition::mlx::session::model_session::disk_layerwise_tests as disk;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
     ControlledTextGeneration, GenerationSequenceRequest, TextGeneration, TextGenerationInput,
     TextPreparationOptions, TokenOutput,
@@ -11,11 +13,11 @@ use eredu_core::{
 const GRAPH: u64 = 4 << 20;
 fn config(total: u64, graph_metadata: u64) -> TextGenerationConfig {
     let config = fixture::config(4, total);
-    let mut policy = config.inference_policy();
+    let mut policy = config.inference_policy().clone();
     policy.graph_metadata_capacity_bytes = NonZeroU64::new(graph_metadata);
     // Original prefill scopes require the same admitted Record arena.
     policy.submission_tracking_capacity_bytes = NonZeroU64::new(1 << 20);
-    config.with_inference_policy(policy)
+    config.with_inference_policy(policy.clone())
 }
 fn cause<'a, T: std::error::Error + 'static>(
     mut error: &'a (dyn std::error::Error + 'static),
@@ -39,11 +41,12 @@ fn one_original_arena_follows_real_ordinary_controlled_capture_sequence_and_open
                 continue;
             }
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
                 let (mut runtime, _artifact) = fixture::load(&stream, &pool, residency);
                 let source = matches!(mode, 2 | 4 | 5).then(|| fixture::source(&runtime));
                 let options = TextPreparationOptions {
-                    interventions: None, capture: source.clone(),
+                    interventions: None,
+                    capture: source.clone(),
                 };
                 let probe = (mode != 0).then(|| Probe::new(&runtime, source.as_ref(), mode == 5));
                 let calls = Calls::new();
@@ -179,15 +182,22 @@ fn one_original_arena_follows_real_ordinary_controlled_capture_sequence_and_open
 fn ordinary_graph_metadata_capacity_is_in_the_first_quote_exact_and_minus_one_before_work() {
     let stream = fixture::stream();
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (runtime, _artifact) = fixture::load(&stream, &pool, route);
         let ids = vec![2, 5, 7];
         let input = disk::evidence(&ids);
         let controller = disk::Controller::default();
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
         let (preparation, quote) =
             super::super::admit(&runtime, &input, config(u64::MAX, GRAPH), &controller).unwrap();
-        let required = preparation.request().memory_reservation().unwrap().bytes();
+        let required = preparation
+            .request()
+            .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
+            .unwrap()
+            .total()
+            .unwrap();
         assert!(required > GRAPH);
         let arena = quote.graph_quota.as_ref().unwrap();
         assert_eq!(
@@ -212,9 +222,9 @@ fn ordinary_graph_metadata_capacity_is_in_the_first_quote_exact_and_minus_one_be
         .unwrap_err();
         assert!(matches!(
             cause::<WorkingMemoryError>(&short),
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ));
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
         assert_eq!(
             runtime.session().payload.model.erased().state_snapshot(),
             state
@@ -227,7 +237,14 @@ fn ordinary_graph_metadata_capacity_is_in_the_first_quote_exact_and_minus_one_be
         )
         .unwrap();
         assert_eq!(
-            preparation.request().memory_reservation().unwrap().bytes(),
+            preparation
+                .request()
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
             required
         );
         assert!(quote.graph_quota.is_some());
@@ -240,7 +257,7 @@ fn ordinary_graph_metadata_capacity_is_in_the_first_quote_exact_and_minus_one_be
 #[test]
 fn ordinary_exhaustion_preserves_typed_source_and_original_arena_without_refill() {
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     // The minimum valid actual object layout can be insufficient for its graph.
@@ -300,7 +317,7 @@ fn original_graph_metadata_prompt_busy_preserves_the_same_input_work_node_and_ar
         time::{Duration, Instant},
     };
     let stream = fixture::stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = fixture::load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::Defer);
@@ -362,7 +379,7 @@ fn original_graph_metadata_prompt_busy_preserves_the_same_input_work_node_and_ar
     ));
     let identities = scopes.pending_prompt_identities().unwrap();
     assert_eq!(identities.0, pointer);
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     for _ in 0..3 {
         let error = MlxBackend::prepare_text_prompt_admitted(
             runtime.backend(),
@@ -376,7 +393,7 @@ fn original_graph_metadata_prompt_busy_preserves_the_same_input_work_node_and_ar
         ));
         assert_eq!(scopes.pending_prompt_identities(), Some(identities));
         assert!(arena.same_arena(quote.graph_quota.as_ref().unwrap()));
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
         assert_eq!(arena.occupied_bytes(), 0, "Busy has constructed no graph");
     }
     release.0.take().unwrap().send(()).unwrap();

@@ -104,10 +104,15 @@ impl ForegroundDiskSourceCapacity {
     ) -> Result<(), WorkingMemoryError> {
         self.validate_account(Some(reservation))
     }
-    pub(crate) fn validate_account(&self, reservation: Option<&WorkingMemoryReservation>) -> Result<(), WorkingMemoryError> {
+    pub(crate) fn validate_account(
+        &self,
+        reservation: Option<&WorkingMemoryReservation>,
+    ) -> Result<(), WorkingMemoryError> {
         self.custody.validate_account(reservation)
     }
-    pub(crate) fn custody(&self) -> &eredu_runtime::working_memory::OriginalHostSourceCustody { &self.custody }
+    pub(crate) fn custody(&self) -> &eredu_runtime::working_memory::OriginalHostSourceCustody {
+        &self.custody
+    }
     pub(crate) fn try_acquire(
         &self,
         bytes: usize,

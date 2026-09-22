@@ -1,8 +1,8 @@
 use super::*;
 use eredu_nn::workspace::HostMetadataAccount;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
 };
 
 #[derive(Debug, Default)]
@@ -92,18 +92,36 @@ fn prepared_session_error_keeps_original_budget_after_funding_exhaustion() {
     let prepared = prepare_session_funding::<Error>(&funding, Some(0)).unwrap();
     state.last.store(0, Ordering::SeqCst);
     state.remaining.store(0, Ordering::SeqCst);
-    let cause = Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::BudgetExceeded {
-        required_bytes: 179_957_231, available_bytes: 2_236_875,
-    });
+    let cause = Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Domain(
+        eredu_core::MemoryDomainError::BudgetExceeded {
+            domain: crate::memory_topology().unwrap().host_domain(),
+            requested_bytes: 179_957_231,
+            limit_bytes: 2_236_875,
+            existing_bytes: 0,
+        },
+    ));
     let error = prepared.retain(cause);
-    assert_eq!(state.last.load(Ordering::SeqCst), 0,
-        "converting the actual session error makes no new metadata request");
+    assert_eq!(
+        state.last.load(Ordering::SeqCst),
+        0,
+        "converting the actual session error makes no new metadata request"
+    );
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     let mut found = false;
     while let Some(cause) = source {
-        if let Some(eredu_runtime::working_memory::WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) =
-            cause.downcast_ref::<eredu_runtime::working_memory::WorkingMemoryError>() {
-            assert_eq!((*required_bytes, *available_bytes), (179_957_231, 2_236_875));
+        if let Some(eredu_runtime::working_memory::WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded {
+                requested_bytes: required_bytes,
+                limit_bytes,
+                existing_bytes,
+                ..
+            },
+        )) = cause.downcast_ref::<eredu_runtime::working_memory::WorkingMemoryError>()
+        {
+            assert_eq!(
+                (*required_bytes, (*limit_bytes - *existing_bytes)),
+                (179_957_231, 2_236_875)
+            );
             found = true;
         }
         source = cause.source();
@@ -116,8 +134,10 @@ fn prepared_session_error_keeps_original_budget_after_funding_exhaustion() {
 
     let (state, funding) = self::funding();
     state.remaining.store(0, Ordering::SeqCst);
-    assert!(matches!(prepare_session_funding::<Error>(&funding, Some(0)),
-        Err(HostMetadataFundingError::Capacity { available: 0, .. })));
+    assert!(matches!(
+        prepare_session_funding::<Error>(&funding, Some(0)),
+        Err(HostMetadataFundingError::Capacity { available: 0, .. })
+    ));
     // A refused preparation returns before there is an operation/cause to lose.
     drop(funding);
     assert!(state.retired.load(Ordering::SeqCst));

@@ -1,8 +1,6 @@
 //! Shared controller payload custody independent of a generation run.
 
-use super::{
-    WorkingMemoryError, WorkingMemoryFundingScope, WorkingMemoryPool, WorkingMemoryStorage,
-};
+use super::{MemoryLedger, WorkingMemoryError, WorkingMemoryFundingScope, WorkingMemoryStorage};
 use eredu_core::{
     ControllerDeclarationData, SharedControllerBytes, SharedControllerDeclaration,
     SharedControllerSource, SharedStorageAttachmentError, SharedStorageIdentity, SharedTokenFilter,
@@ -14,11 +12,11 @@ use std::collections::BTreeMap;
 mod contribution;
 mod original;
 mod prepared;
-pub use prepared::{PreparedControllerBinding, PreparedControllerBindingError};
 use super::residual::OriginalTokenDomainBinding;
 pub use contribution::{
     ControllerWorkspaceContribution, ControllerWorkspaceEstimate, ControllerWorkspaceMetadataError,
 };
+pub use prepared::{PreparedControllerBinding, PreparedControllerBindingError};
 
 /// A controller cannot prove the complete lifetime of its numerical payload.
 #[derive(Debug, thiserror::Error)]
@@ -92,7 +90,7 @@ pub struct ControllerStorageContract {
 #[derive(Debug, Clone)]
 pub struct RegisteredControllerStorage {
     contract: ControllerStorageContract,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     registration: WorkingMemoryStorage<SharedStorageIdentity>,
 }
 
@@ -112,8 +110,8 @@ struct SourceEvidence {
 type Inventory<'a> = BTreeMap<SharedStorageIdentity, (SourceEvidence, SharedControllerSource<'a>)>;
 
 impl RegisteredControllerStorage {
-    /// Exact managed domain whose existing source charges are pinned.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    /// Ledger retaining the existing source charges.
+    pub fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
 
@@ -124,8 +122,8 @@ impl RegisteredControllerStorage {
     }
 }
 
-impl WorkingMemoryPool {
-    /// Constructs a shared host filter under unquoted domain ownership and
+impl MemoryLedger {
+    /// Constructs a shared host filter under unquoted ledger ownership and
     /// publishes its exact allocation before releasing that ownership. This
     /// covers loading-time masks even if their model is never used for inference.
     ///
@@ -143,7 +141,7 @@ impl WorkingMemoryPool {
         Ok(filter)
     }
 
-    /// Constructs immutable controller bytes under unquoted domain ownership,
+    /// Constructs immutable controller bytes under unquoted ledger ownership,
     /// then attaches their exact allocation capacity before publishing the owner.
     /// A live reservation rejects before the factory runs, including a zero-byte
     /// reservation. Existing aliases share subsequent accounting custody.
@@ -156,7 +154,10 @@ impl WorkingMemoryPool {
         factory: impl FnOnce() -> Vec<u8>,
     ) -> Result<SharedControllerBytes, ControllerStorageError> {
         let ownership = self.acquire_unquoted()?;
-        let bytes = SharedControllerBytes::new(factory(), eredu_core::HostPreparationAuthority::unmanaged());
+        let bytes = SharedControllerBytes::new(
+            factory(),
+            eredu_core::HostPreparationAuthority::unmanaged(),
+        );
         self.attach_prepared_source(SharedControllerSource::Bytes(&bytes))?;
         drop(ownership);
         Ok(bytes)
@@ -179,7 +180,10 @@ impl WorkingMemoryPool {
                 });
             }
         };
-        let declaration = SharedControllerDeclaration::new(value, eredu_core::HostPreparationAuthority::unmanaged());
+        let declaration = SharedControllerDeclaration::new(
+            value,
+            eredu_core::HostPreparationAuthority::unmanaged(),
+        );
         self.attach_prepared_source(SharedControllerSource::Declaration(&declaration))?;
         drop(ownership);
         Ok(declaration)
@@ -194,13 +198,64 @@ impl WorkingMemoryPool {
             .ok_or(WorkingMemoryError::UnknownBound)?;
         if bytes != 0 {
             let identity = source.identity().clone();
-            source.try_attach(&self.0.storage_domain, || {
-                let charge = self.register_storage([(identity, bytes)])?;
-                Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(Box::new(charge))
-            })?;
+            let owner =
+                source.try_attach_owned_prepared(&self.0.storage_accounting_id, |attachment| {
+                    let prepared =
+                        prepared_controller_publication_layout(attachment)?.fund(self)?;
+                    let charge = prepared.register_host_storage([(identity, bytes)])?;
+                    Ok::<_, WorkingMemoryError>(eredu_core::SharedStorageOwner::new(
+                        ControllerSourceCharge {
+                            _registration: charge,
+                        },
+                    ))
+                })?;
+            drop(owner);
         }
         Ok(())
     }
+}
+
+/// Payload-free accounting sidecar. Every alias frees its Arc allocation before
+/// its concrete registration can refund the paid attachment and owner controls.
+struct ControllerSourceCharge {
+    _registration: WorkingMemoryStorage<SharedStorageIdentity>,
+}
+impl eredu_core::SharedStorageRetirement for ControllerSourceCharge {
+    fn retire(self: std::sync::Arc<Self>) {
+        drop(std::sync::Arc::into_inner(self));
+    }
+}
+
+fn controller_attachment_controls() -> Result<usize, WorkingMemoryError> {
+    SharedControllerSource::owned_attachment_control_bytes::<
+        ControllerSourceCharge,
+        WorkingMemoryError,
+    >()
+    .ok_or(WorkingMemoryError::Overflow)
+}
+pub(in crate::working_memory) fn controller_publication_layout()
+-> Result<super::StoragePublicationLayout<SharedStorageIdentity>, WorkingMemoryError> {
+    let controls = super::qualified_storage::shared_bytes::<ControllerSourceCharge>()?
+        .checked_add(
+            u64::try_from(controller_attachment_controls()?)
+                .map_err(|_| WorkingMemoryError::Overflow)?,
+        )
+        .and_then(|n| {
+            n.checked_add(u64::try_from(std::mem::size_of::<ControllerSourceCharge>()).ok()?)
+        })
+        .ok_or(WorkingMemoryError::Overflow)?;
+    super::StoragePublicationLayout::new(1)?.with_additional_host_metadata(controls)
+}
+fn prepared_controller_publication_layout(
+    attachment: eredu_core::SharedStorageAttachmentLayout,
+) -> Result<super::StoragePublicationLayout<SharedStorageIdentity>, WorkingMemoryError> {
+    // The cold quote includes the ordered map's finite maximum insertion path.
+    // Authenticate the reached constructor against that same allowance before
+    // allocating its node or concrete owner.
+    if attachment.requested_bytes() > controller_attachment_controls()? {
+        return Err(WorkingMemoryError::UnknownBound);
+    }
+    controller_publication_layout()
 }
 
 impl ControllerStorageContract {
@@ -224,6 +279,26 @@ impl ControllerStorageContract {
             original: None,
             semantic: None,
         })
+    }
+
+    /// Host constructors retained by ordinary controller source attachments.
+    /// Original source producers already retain their separately funded controls.
+    pub fn publication_control_bytes(&self) -> Result<u64, WorkingMemoryError> {
+        if self.original.is_some() {
+            return Ok(0);
+        }
+        let count = u64::try_from(
+            self.shared
+                .values()
+                .filter(|source| source.bytes != 0)
+                .count(),
+        )
+        .map_err(|_| WorkingMemoryError::Overflow)?;
+        let one = controller_publication_layout()?
+            .requested_bytes()
+            .checked_add(MemoryLedger::storage_metadata_control_bytes()?)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        one.checked_mul(count).ok_or(WorkingMemoryError::Overflow)
     }
 
     /// Ensures shared sources are priced beyond the final emitted filter, whose
@@ -276,10 +351,11 @@ impl ControllerStorageContract {
     pub fn pin_registered<C: TokenFilterController>(
         &self,
         controller: &C,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<RegisteredControllerStorage, ControllerStorageError> {
         let sources = self.validated_inventory(controller)?;
-        let registration = pool.pin_registered_storage(sources.into_iter().filter_map(
+        let prepared = super::StoragePublicationLayout::new(sources.len())?.fund(pool)?;
+        let registration = prepared.pin_registered_storage(sources.into_iter().filter_map(
             |(identity, (evidence, _))| (evidence.bytes != 0).then_some((identity, evidence.bytes)),
         ))?;
         Ok(RegisteredControllerStorage {
@@ -311,17 +387,30 @@ impl ControllerStorageContract {
             if bytes == 0 {
                 continue;
             }
-            source.try_attach(&pool.0.storage_domain, || {
-                let mut registered =
-                    scope.adopt_storage_individually([(identity.clone(), bytes)])?;
-                let charge = registered
-                    .remove(&identity)
-                    .expect("single registered controller source");
-                // The key contains only identity metadata, never the payload.
-                // This closed provider cannot invoke controller callbacks or
-                // acquire another shared-owner lock while accounting is held.
-                Ok::<Box<dyn Send + Sync>, WorkingMemoryError>(Box::new(charge))
-            })?;
+            let owner =
+                source.try_attach_owned_prepared(&pool.0.storage_accounting_id, |attachment| {
+                    let mut registered = prepared_controller_publication_layout(attachment)?
+                        .fund_from(scope)?
+                        .adopt_storage_individually(
+                            scope,
+                            [(
+                                identity,
+                                super::StorageAllocation::new(bytes, pool.host_placement_handle()),
+                            )],
+                        )?;
+                    let charge = registered
+                        .remove(&identity)
+                        .expect("single registered controller source");
+                    // The key contains only identity metadata, never the payload.
+                    // This closed provider cannot invoke controller callbacks or
+                    // acquire another shared-owner lock while accounting is held.
+                    Ok::<_, WorkingMemoryError>(eredu_core::SharedStorageOwner::new(
+                        ControllerSourceCharge {
+                            _registration: charge,
+                        },
+                    ))
+                })?;
+            drop(owner);
         }
         Ok(())
     }

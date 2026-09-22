@@ -9,12 +9,12 @@ impl Drop for DropProbe {
     }
 }
 
-fn wait_for_source_retirement(pool: &WorkingMemoryPool) {
+fn wait_for_source_retirement(pool: &MemoryLedger) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         // Recovery can release native owners under its no-hooks runtime guard.
         // Their account-only Rust destructors run on the ordinary host afterward.
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes() == Ok(0)
+        pool.fixture_host_charge() == Ok(0)
     });
 }
 
@@ -52,16 +52,16 @@ fn admission_rejects_before_invocation_and_preserves_the_plan() {
         },
     );
     let bytes = plan.required_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(bytes - 1, 0).unwrap();
     let error = plan.submit(&pool).unwrap_err();
     assert!(matches!(error.accounting_failure(),
-        Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
-        if *required_bytes == bytes && *available_bytes == bytes - 1));
+        Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }))
+        if *required_bytes == bytes && limit_bytes.checked_sub(*existing_bytes).unwrap() == bytes - 1));
     assert!(error.rejected_plan().is_some());
     assert!(error.constructor_failure().is_none());
     assert!(!called.get());
     assert!(!dropped.get());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     drop(error);
     assert!(dropped.get());
 }
@@ -87,12 +87,12 @@ fn exact_admission_runs_once_and_retires_invocation() {
             Ok(Ok::<_, ()>(42))
         },
     );
-    let pool = WorkingMemoryPool::new(plan.required_bytes().unwrap(), 0).unwrap();
+    let pool = crate::memory_fixture::ledger(plan.required_bytes().unwrap(), 0).unwrap();
     assert_eq!(plan.submit(&pool).unwrap().finish().unwrap().unwrap(), 42);
     assert_eq!(called.get(), 1);
     wait_for_source_retirement(&pool);
     assert!(dropped.get());
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -109,16 +109,16 @@ fn callback_failure_retains_source_account_until_error_and_recovery_retire() {
         |_, _| Err::<Result<(), ()>, _>(Error::PrefillScopeReentrant),
     );
     let bytes = plan.required_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(bytes, 0).unwrap();
     let error = plan.submit(&pool).unwrap_err();
     assert!(error.rejected_plan().is_none());
     assert!(error.accounting_failure().is_none());
     assert!(error.constructor_failure().is_some());
     crate::backend::submission_recovery::wait_for_retirement(|| dropped.get());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     drop(error);
     wait_for_source_retirement(&pool);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn cold_root_refuses_an_active_original_parent_before_callback() {
         Ok(Ok::<_, ()>(()))
     });
     let inner_bytes = inner.required_bytes().unwrap();
-    let pool_cell = std::cell::OnceCell::<WorkingMemoryPool>::new();
+    let pool_cell = std::cell::OnceCell::<MemoryLedger>::new();
     let outer_bytes = Cell::new(0);
     let outer = Plan::new(&runtime, capacity(&runtime), None, (), |_, context| {
         let pool = pool_cell.get().unwrap();
@@ -140,22 +140,25 @@ fn cold_root_refuses_an_active_original_parent_before_callback() {
         assert!(!called.get());
         assert!(error.accounting_failure().is_none());
         assert!(error.constructor_failure().is_some());
-        assert_eq!(pool.used_bytes().unwrap(), outer_bytes.get() + inner_bytes);
+        assert_eq!(
+            pool.fixture_host_charge().unwrap(),
+            outer_bytes.get() + inner_bytes
+        );
         assert!(context
             .observer()
             .same_scope(&OriginalScopeObserver::require_current().unwrap()));
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), outer_bytes.get());
+        assert_eq!(pool.fixture_host_charge().unwrap(), outer_bytes.get());
         Ok(Ok::<_, ()>(()))
     });
     outer_bytes.set(outer.required_bytes().unwrap());
     pool_cell
-        .set(WorkingMemoryPool::new(outer_bytes.get() + inner_bytes, 0).unwrap())
+        .set(crate::memory_fixture::ledger(outer_bytes.get() + inner_bytes, 0).unwrap())
         .unwrap();
     let pool = pool_cell.get().unwrap();
     outer.submit(pool).unwrap().finish().unwrap().unwrap();
     wait_for_source_retirement(pool);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -178,7 +181,7 @@ fn submitted_invocations_keep_independent_scopes_and_retirement() {
     let second = make(second_dropped.clone());
     let first_bytes = first.required_bytes().unwrap();
     let second_bytes = second.required_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(first_bytes + second_bytes, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(first_bytes + second_bytes, 0).unwrap();
     let first = first.submit(&pool).unwrap();
     assert!(OriginalScopeObserver::try_current().unwrap().is_none());
     let second = second.submit(&pool).unwrap();
@@ -189,11 +192,14 @@ fn submitted_invocations_keep_independent_scopes_and_retirement() {
         .unwrap()
         .same_scope(second.result().as_ref().unwrap()));
     assert!(!first_dropped.get() && !second_dropped.get());
-    assert_eq!(pool.used_bytes().unwrap(), first_bytes + second_bytes);
+    assert_eq!(
+        pool.fixture_host_charge().unwrap(),
+        first_bytes + second_bytes
+    );
     drop(first.finish().unwrap().unwrap());
     crate::backend::submission_recovery::wait_for_retirement(|| {
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes() == Ok(second_bytes)
+        pool.fixture_host_charge() == Ok(second_bytes)
     });
     assert!(first_dropped.get());
     assert!(!second_dropped.get());
@@ -203,3 +209,7 @@ fn submitted_invocations_keep_independent_scopes_and_retirement() {
     wait_for_source_retirement(&pool);
     assert!(second_dropped.get());
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

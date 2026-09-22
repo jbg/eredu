@@ -1,6 +1,8 @@
 //! Serial branches reuse the same ordinary machine and semantic host state.
 use super::*;
-use eredu_runtime::execution_control::{PreparedTextHostJournal, TextSnapshotBackend, TextSnapshotError};
+use eredu_runtime::execution_control::{
+    PreparedTextHostJournal, TextSnapshotBackend, TextSnapshotError,
+};
 
 pub(super) struct PreparedChatHost {
     pub(super) semantic: SemanticStateOwner,
@@ -22,37 +24,88 @@ pub struct PreparedChatBranch<B: TextSnapshotBackend> {
     host: PreparedChatHost,
 }
 impl<B: TextSnapshotBackend> PreparedChatBranch<B> {
-    pub(crate) fn resume_facts(&self) -> eredu_core::TextResumeFacts<'_> where B: eredu_core::TextResumeBackend {
+    pub(crate) fn resume_facts(&self) -> eredu_core::TextResumeFacts<'_>
+    where
+        B: eredu_core::TextResumeBackend,
+    {
         self.machine.resume_facts()
     }
     /// Exact committed prefix, excluding any pending token restriction.
-    pub fn token_ids(&self) -> &[u32] { self.host.cursor.token_ids() }
+    pub fn token_ids(&self) -> &[u32] {
+        self.host.cursor.token_ids()
+    }
     /// Saved completed-token lifecycle.
-    pub fn status(&self) -> eredu_core::execution_control::GenerationStatus { self.host.lifecycle.status() }
+    pub fn status(&self) -> eredu_core::execution_control::GenerationStatus {
+        self.host.lifecycle.status()
+    }
     /// Absolute next prediction, without resetting inherited budgets.
-    pub fn next_prediction(&self) -> u64 { self.host.lifecycle.next_prediction() }
+    pub fn next_prediction(&self) -> u64 {
+        self.host.lifecycle.next_prediction()
+    }
     /// Prospective canonical token restriction inherited by the branch.
-    pub fn pending_forced_token(&self) -> Option<u32> { self.machine.controller().pending_forced() }
-    pub(crate) fn effective_config(&self) -> TextGenerationConfig { self.host.effective_config }
+    pub fn pending_forced_token(&self) -> Option<u32> {
+        self.machine.controller().pending_forced()
+    }
+    pub(crate) fn effective_config(&self) -> TextGenerationConfig {
+        self.host.effective_config.clone()
+    }
 }
 impl<'a, B: TextGenerationBackend> PreparedChatSession<'a, B> {
-    pub(super) fn from_host(generator: ControlledTextGeneration<'a, B, ChatController>, host: PreparedChatHost) -> Self {
-        let PreparedChatHost { semantic, effective_config, active, cursor, lifecycle,
-            attribution, time_to_first_token, input_funding, preparation } = host;
-        Self { source: BackendGenerationTokenSource { generator, on_token: None, delivery_failure: None,
-            generation_started: Instant::now(), time_to_first_token }, semantic, effective_config,
-            active, cursor, lifecycle, attribution, input_funding, preparation }
+    pub(super) fn from_host(
+        generator: ControlledTextGeneration<'a, B, ChatController>,
+        host: PreparedChatHost,
+    ) -> Self {
+        let PreparedChatHost {
+            semantic,
+            effective_config,
+            active,
+            cursor,
+            lifecycle,
+            attribution,
+            time_to_first_token,
+            input_funding,
+            preparation,
+        } = host;
+        Self {
+            source: BackendGenerationTokenSource {
+                generator,
+                on_token: None,
+                delivery_failure: None,
+                generation_started: Instant::now(),
+                time_to_first_token,
+            },
+            semantic,
+            effective_config,
+            active,
+            cursor,
+            lifecycle,
+            attribution,
+            input_funding,
+            preparation,
+        }
     }
     fn exchange_host(&mut self, host: &mut PreparedChatHost) {
-        let Self { source, semantic, effective_config, active, cursor, lifecycle,
-            attribution, input_funding, preparation } = self;
+        let Self {
+            source,
+            semantic,
+            effective_config,
+            active,
+            cursor,
+            lifecycle,
+            attribution,
+            input_funding,
+            preparation,
+        } = self;
         std::mem::swap(semantic, &mut host.semantic);
         std::mem::swap(effective_config, &mut host.effective_config);
         std::mem::swap(active, &mut host.active);
         std::mem::swap(cursor, &mut host.cursor);
         std::mem::swap(lifecycle, &mut host.lifecycle);
         std::mem::swap(attribution, &mut host.attribution);
-        std::mem::swap(&mut source.time_to_first_token, &mut host.time_to_first_token);
+        std::mem::swap(
+            &mut source.time_to_first_token,
+            &mut host.time_to_first_token,
+        );
         std::mem::swap(input_funding, &mut host.input_funding);
         std::mem::swap(preparation, &mut host.preparation);
     }
@@ -66,20 +119,20 @@ where B: OriginalChatBackend + TextSnapshotBackend + eredu_core::TextResumeBacke
     /// original copy transaction. Observer attachments remain on this session.
     pub fn restore_snapshot(
         &mut self, snapshot: &PreparedChatSnapshot<B>, settings: PreparedChatResumeSettings,
-        capacity: u64, cancellation: &GenerationCancellationToken,
+        capacity: eredu_core::MemoryLimitDeclarations, cancellation: &GenerationCancellationToken,
     ) -> Result<bool, PreparedChatSessionError> {
         self.restore_with_host(snapshot, settings, capacity, cancellation, ()).map(|result| result.is_some())
     }
     /// Creates an inactive serial child without advancing or replacing the parent.
     pub fn fork_snapshot(
         &mut self, snapshot: &PreparedChatSnapshot<B>, settings: PreparedChatResumeSettings,
-        capacity: u64, cancellation: &GenerationCancellationToken,
+        capacity: eredu_core::MemoryLimitDeclarations, cancellation: &GenerationCancellationToken,
     ) -> Result<Option<PreparedChatBranch<B>>, PreparedChatSessionError> {
         self.fork_with_host(snapshot, settings, eredu_core::OriginalTextResumeOptions::new(eredu_core::OriginalTextResumeKind::Branch), capacity, cancellation, ()).map(|result| result.map(|(branch, ())| branch))
     }
     pub(crate) fn restore_with_host<J: PreparedTextHostJournal>(
         &mut self, snapshot: &PreparedChatSnapshot<B>, settings: PreparedChatResumeSettings,
-        capacity: u64, cancellation: &GenerationCancellationToken, journal: J,
+        capacity: eredu_core::MemoryLimitDeclarations, cancellation: &GenerationCancellationToken, journal: J,
     ) -> Result<Option<J::Copied>, PreparedChatSessionError> {
         if self.source.generator.driver_identity() != snapshot.driver {
             return Err(self.control_failure(Cause::Snapshot(TextSnapshotError::IncompatibleRun)));
@@ -108,7 +161,7 @@ where B: OriginalChatBackend + TextSnapshotBackend + eredu_core::TextResumeBacke
     }
     pub(crate) fn fork_with_host<J: PreparedTextHostJournal>(
         &mut self, snapshot: &PreparedChatSnapshot<B>, settings: PreparedChatResumeSettings,
-        mut options: eredu_core::OriginalTextResumeOptions<'_>, capacity: u64, cancellation: &GenerationCancellationToken, journal: J,
+        mut options: eredu_core::OriginalTextResumeOptions<'_>, capacity: eredu_core::MemoryLimitDeclarations, cancellation: &GenerationCancellationToken, journal: J,
     ) -> Result<Option<(PreparedChatBranch<B>, J::Copied)>, PreparedChatSessionError> {
         if self.source.generator.driver_identity() != snapshot.driver {
             return Err(self.control_failure(Cause::Snapshot(TextSnapshotError::IncompatibleRun)));
@@ -133,11 +186,26 @@ where B: OriginalChatBackend + TextSnapshotBackend + eredu_core::TextResumeBacke
 impl<B: TextSnapshotBackend> PreparedChatSession<'_, B> {
     /// Exchanges native and host state together without advancing either branch.
     /// Borrowed capture observers remain attached to this active delivery surface.
-    pub fn exchange(&mut self, branch: &mut PreparedChatBranch<B>) -> Result<(), PreparedChatSessionError> {
-        self.lifecycle.validate_placement().map_err(|cause| self.control_failure(cause.into()))?;
-        branch.host.lifecycle.validate_placement().map_err(|cause| self.control_failure(cause.into()))?;
-        self.source.generator.exchange_branch(&mut branch.machine).map_err(|cause|
-            self.control_failure(Cause::Boundary(crate::api::control::map_continuation_failure(cause, B::into_backend_failure))))?;
+    pub fn exchange(
+        &mut self,
+        branch: &mut PreparedChatBranch<B>,
+    ) -> Result<(), PreparedChatSessionError> {
+        self.lifecycle
+            .validate_placement()
+            .map_err(|cause| self.control_failure(cause.into()))?;
+        branch
+            .host
+            .lifecycle
+            .validate_placement()
+            .map_err(|cause| self.control_failure(cause.into()))?;
+        self.source
+            .generator
+            .exchange_branch(&mut branch.machine)
+            .map_err(|cause| {
+                self.control_failure(Cause::Boundary(
+                    crate::api::control::map_continuation_failure(cause, B::into_backend_failure),
+                ))
+            })?;
         self.exchange_host(&mut branch.host);
         Ok(())
     }

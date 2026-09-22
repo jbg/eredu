@@ -3,9 +3,9 @@
 use super::*;
 use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::{
+    working_memory::{MemoryLedger, OriginalHostSourceCustody, WorkingMemoryReservation},
     BackgroundPrefetchFailure, BackgroundPrefetchPanic, PrefetchStoragePreparationError,
     PreparedPrefetchStorage,
-    working_memory::{OriginalHostSourceCustody, WorkingMemoryPool, WorkingMemoryReservation},
 };
 use std::{
     alloc::Layout,
@@ -182,7 +182,7 @@ impl PreparedBackgroundHostReads {
             size_of::<(
                 &ForegroundDiskWindowPlan,
                 &ResidencyManager,
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 &OriginalHostSourceCustody,
                 Option<&WorkingMemoryReservation>,
                 &ForegroundDiskSourceCapacity,
@@ -210,7 +210,7 @@ impl PreparedBackgroundHostReads {
     pub(crate) fn prepare(
         plan: &ForegroundDiskWindowPlan,
         manager: &ResidencyManager,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         custody: OriginalHostSourceCustody,
         reservation: Option<&WorkingMemoryReservation>,
         capacity: &ForegroundDiskSourceCapacity,
@@ -254,11 +254,14 @@ impl PreparedBackgroundHostReads {
             .map_err(|cause| fail(cause.into()))?;
         ready.resize_with(ids.len(), || None);
         let mut slots = Vec::new();
-        slots.try_reserve_exact(ids.len())
+        slots
+            .try_reserve_exact(ids.len())
             .map_err(|cause| fail(cause.into()))?;
         slots.resize(ids.len(), Slot::Unread);
         let mut active = Vec::new();
-        active.try_reserve_exact(ids.len()).map_err(|cause| fail(cause.into()))?;
+        active
+            .try_reserve_exact(ids.len())
+            .map_err(|cause| fail(cause.into()))?;
         active.resize(ids.len(), false);
         let storage = PreparedPrefetchStorage::prepare(&ids, queue_capacity, funding.clone())?;
         let reads = BackgroundHostReadOwner(Some(Arc::new(Data {
@@ -323,18 +326,28 @@ impl BackgroundHostReadOwner {
         self.data().admission.close();
     }
     pub(crate) fn attempt(&self) -> Result<BackgroundSourceAttempt<'_>, BackgroundHostReadFailure> {
-        self.data().admission.attempt().map_err(|_| self.fail(Cause::Identity))
+        self.data()
+            .admission
+            .attempt()
+            .map_err(|_| self.fail(Cause::Identity))
     }
     /// Native allocation runs on the caller before publishing this source job
     /// to the worker queue. Repeated selected submissions reuse its same actual
     /// pending/read payload; failed admission closes all future source attempts.
-    pub(crate) fn prepare_submission(&self, id: &OffloadUnitId) -> Result<(), BackgroundHostReadFailure> {
+    pub(crate) fn prepare_submission(
+        &self,
+        id: &OffloadUnitId,
+    ) -> Result<(), BackgroundHostReadFailure> {
         let attempt = self.attempt()?;
         let ordinal = self.ordinal(id)?;
         let read = {
             let mut state = self.lock()?;
-            if !state.active[ordinal] { return Err(self.fail(Cause::Identity)); }
-            self.data().admission.submit(state.slots[ordinal])
+            if !state.active[ordinal] {
+                return Err(self.fail(Cause::Identity));
+            }
+            self.data()
+                .admission
+                .submit(state.slots[ordinal])
                 .map_err(|_| self.fail(Cause::Identity))?;
             if state.slots[ordinal] != Slot::Unread {
                 // Reading may be queued or currently held by the sole worker.
@@ -346,10 +359,17 @@ impl BackgroundHostReadOwner {
                 attempt.succeed();
                 return Ok(());
             }
-            if state.ready[ordinal].is_some() { return Err(self.fail(Cause::Identity)); }
-            self.data().admission.begin(&mut state.slots[ordinal])
+            if state.ready[ordinal].is_some() {
+                return Err(self.fail(Cause::Identity));
+            }
+            self.data()
+                .admission
+                .begin(&mut state.slots[ordinal])
                 .map_err(|_| self.fail(Cause::Identity))?;
-            state.attempts.checkout(id).map_err(|cause| self.fail(cause.into()))?
+            state
+                .attempts
+                .checkout(id)
+                .map_err(|cause| self.fail(cause.into()))?
                 .ok_or_else(|| self.fail(Cause::Identity))?
         };
         // No mailbox loan spans a native allocation. The service submits to
@@ -367,27 +387,44 @@ impl BackgroundHostReadOwner {
     }
     pub(crate) fn window_control_bytes() -> Option<usize> {
         let fixed = [
-            size_of::<(&Self, &[OffloadUnitId])>(), size_of::<std::slice::Iter<'_, OffloadUnitId>>(),
-            size_of::<std::ops::Range<usize>>(), size_of::<Option<PreparedForegroundDiskIo>>(),
-            size_of::<Result<(), BackgroundHostReadFailure>>(), size_of::<BackgroundSourceAttempt<'_>>(),
+            size_of::<(&Self, &[OffloadUnitId])>(),
+            size_of::<std::slice::Iter<'_, OffloadUnitId>>(),
+            size_of::<std::ops::Range<usize>>(),
+            size_of::<Option<PreparedForegroundDiskIo>>(),
+            size_of::<Result<(), BackgroundHostReadFailure>>(),
+            size_of::<BackgroundSourceAttempt<'_>>(),
             size_of::<MutexGuard<'_, ReadState>>(),
-            size_of::<Result<MutexGuard<'_, ReadState>, std::sync::PoisonError<MutexGuard<'_, ReadState>>>>(),
+            size_of::<
+                Result<
+                    MutexGuard<'_, ReadState>,
+                    std::sync::PoisonError<MutexGuard<'_, ReadState>>,
+                >,
+            >(),
         ];
-        fixed.into_iter().try_fold(size_of_val(&fixed), usize::checked_add)
+        fixed
+            .into_iter()
+            .try_fold(size_of_val(&fixed), usize::checked_add)
     }
     /// The service must have observed the actual worker idle boundary first.
     /// Retire every completed result outside the next exact canonical Host set
     /// before admitting new reads. Payload destruction occurs outside the
     /// mailbox lock, and never resets source construction or failure spending.
-    pub(crate) fn advance_window(&self, active: &[OffloadUnitId]) -> Result<(), BackgroundHostReadFailure> {
+    pub(crate) fn advance_window(
+        &self,
+        active: &[OffloadUnitId],
+    ) -> Result<(), BackgroundHostReadFailure> {
         let attempt = self.attempt()?;
         for (index, id) in active.iter().enumerate() {
-            if active[..index].contains(id) { return Err(self.fail(Cause::Identity)); }
+            if active[..index].contains(id) {
+                return Err(self.fail(Cause::Identity));
+            }
             self.ordinal(id)?;
         }
         {
             let state = self.lock()?;
-            if state.slots.iter().any(|slot| *slot == Slot::Reading) { return Err(self.fail(Cause::Identity)); }
+            if state.slots.iter().any(|slot| *slot == Slot::Reading) {
+                return Err(self.fail(Cause::Identity));
+            }
         }
         for ordinal in 0..self.data().ids.len() {
             let retained = active.contains(&self.data().ids[ordinal]);
@@ -398,13 +435,20 @@ impl BackgroundHostReadOwner {
                 // consumed occurrence. Each future read still checks out its
                 // own finite per-unit slot and the same live native capacity.
                 if retained && self.data().window_rearm {
-                    self.data().admission.rearm_window(&mut state.slots[ordinal])
+                    self.data()
+                        .admission
+                        .rearm_window(&mut state.slots[ordinal])
                         .map_err(|_| self.fail(Cause::Identity))?;
                 }
                 if !retained && state.slots[ordinal] == Slot::Ready {
-                    self.data().admission.take(&mut state.slots[ordinal]).map_err(|_| self.fail(Cause::Identity))?;
+                    self.data()
+                        .admission
+                        .take(&mut state.slots[ordinal])
+                        .map_err(|_| self.fail(Cause::Identity))?;
                     state.ready[ordinal].take()
-                } else { None }
+                } else {
+                    None
+                }
             };
             drop(retired);
         }
@@ -419,15 +463,23 @@ impl BackgroundHostReadOwner {
         let ordinal = self.ordinal(id)?;
         let io = {
             let mut state = self.lock()?;
-            if !state.active[ordinal] { return Err(self.fail(Cause::Identity)); }
+            if !state.active[ordinal] {
+                return Err(self.fail(Cause::Identity));
+            }
             if state.slots[ordinal] == Slot::Ready {
-                if state.ready[ordinal].is_none() { return Err(self.fail(Cause::Identity)); }
+                if state.ready[ordinal].is_none() {
+                    return Err(self.fail(Cause::Identity));
+                }
                 drop(state);
                 attempt.succeed();
                 return Ok(());
             }
-            if state.slots[ordinal] != Slot::Reading { return Err(self.fail(Cause::Identity)); }
-            state.ready[ordinal].take().ok_or_else(|| self.fail(Cause::Identity))?
+            if state.slots[ordinal] != Slot::Reading {
+                return Err(self.fail(Cause::Identity));
+            }
+            state.ready[ordinal]
+                .take()
+                .ok_or_else(|| self.fail(Cause::Identity))?
         };
         // Error/unwind closes admission. The native writer queues its paid
         // owner for host retirement, including a partially filled allocation.
@@ -437,7 +489,9 @@ impl BackgroundHostReadOwner {
             drop(state);
             return Err(self.fail(Cause::Identity));
         }
-        self.data().admission.complete(&mut state.slots[ordinal])
+        self.data()
+            .admission
+            .complete(&mut state.slots[ordinal])
             .map_err(|_| self.fail(Cause::Identity))?;
         state.ready[ordinal] = Some(io);
         drop(state);
@@ -453,7 +507,10 @@ impl BackgroundHostReadOwner {
         let attempt = self.attempt()?;
         let ordinal = self.ordinal(id)?;
         let mut state = self.lock()?;
-        let ready = self.data().admission.take(&mut state.slots[ordinal])
+        let ready = self
+            .data()
+            .admission
+            .take(&mut state.slots[ordinal])
             .map_err(|_| self.fail(Cause::Identity))?;
         let value = state.ready[ordinal].take();
         if ready != value.is_some() {
@@ -463,7 +520,9 @@ impl BackgroundHostReadOwner {
         drop(state);
         // Actual registration/publication resumes only on the allocating
         // caller, after the service has observed this worker's completion.
-        let value = value.map(PreparedForegroundDiskIo::finish).transpose()
+        let value = value
+            .map(PreparedForegroundDiskIo::finish)
+            .transpose()
             .map_err(|cause| self.fail(cause.into()))?;
         attempt.succeed();
         Ok(value)

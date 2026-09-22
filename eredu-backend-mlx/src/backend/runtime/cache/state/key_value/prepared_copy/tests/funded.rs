@@ -4,6 +4,7 @@ use crate::backend::{
     nn::workspace::{ExistingArrayProjection, MlxMetalWorkspaceMechanisms},
     runtime::residency::storage::RetainedStorage,
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::{
     Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
     InputTokenCount, OutputDemand, StateMemoryLayout, TextGenerationConfig, WorkspaceBound,
@@ -22,11 +23,22 @@ use eredu_runtime::{
 pub(in super::super) fn metal() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Gpu, 0))
 }
-pub(in super::super) fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+pub(in super::super) fn settle(pool: &MemoryLedger, bytes: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9);
+    let mut reported = false;
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::ordinary_retirement::reclaim_all();
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        if !reported && std::time::Instant::now() >= deadline {
+            eprintln!(
+                "retirement expected funded={bytes}, actual={}, snapshot={:?}",
+                pool.fixture_funded_charge().unwrap(),
+                pool.snapshot().unwrap()
+            );
+            reported = true;
+        }
+        pool.fixture_funded_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 pub(in super::super) fn publish_source(source: &MlxKeyValueState, owner: &NativeMemoryOwner) {
@@ -49,7 +61,7 @@ pub(in super::super) fn publish_source(source: &MlxKeyValueState, owner: &Native
 // 1024-byte source envelope covers only a scalar sampler's host construction.
 // Native decoder copying below uses the selected Metal facts, never this number.
 pub(in super::super) fn sampler(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (
     RunOwnedTextSampler,
     InferenceTextPreparation,
@@ -83,6 +95,7 @@ pub(in super::super) fn sampler(
     let bound = |bytes| WorkspaceBound::bounded(bytes, "portable scalar sampler host fixture");
     let state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry,
             activations: bound(1024),
             attention: bound(0),
@@ -95,13 +108,14 @@ pub(in super::super) fn sampler(
     let reservation = pool
         .reserve_with_capacity(
             &execution,
-            &Admission {
+            &crate::memory_fixture::host_admission(Admission {
                 requested_positions: 3,
                 state,
-                incremental_required_bytes: 1024,
-                available_memory_bytes: None,
-            },
-            u64::MAX,
+                incremental_required_bytes: Some(1024),
+                memory_limits: Default::default(),
+                additional_headroom: Default::default(),
+            }),
+            crate::memory_fixture::resolved_limits(u64::MAX),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
@@ -116,7 +130,7 @@ pub(in super::super) fn sampler(
         .unwrap(),
     );
     let preparation = InferenceRequest::from(reservation)
-        .prepare_text(&execution, geometry, config)
+        .prepare_text(&execution, geometry, config.clone())
         .unwrap();
     let (sampler, completion) = preparation
         .claim_sampling(config)
@@ -130,7 +144,7 @@ pub(in super::super) fn sampler(
 pub(in super::super) fn admit(
     plan: &PreparedResidentKvCopy<'_>,
     sampler: BorrowedFundedSampler<'_>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (
     FundedSamplerCopy,
     InitializedDecoderSlots<MlxKeyValueLayerState>,
@@ -149,7 +163,7 @@ pub(in super::super) fn admit(
         &context,
         native
             .iter()
-            .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+            .map(|(id, _, root)| crate::backend::nn::workspace::registered_storage_row(id, root)),
     )
     .unwrap();
     let program =
@@ -172,8 +186,11 @@ pub(in super::super) fn admit(
         .unwrap()
         .with_decoder_slots(plan.host_copy(pool).unwrap(), complete)
         .unwrap();
-    pool.copy_text_components(joined, WorkspaceCopyLimits::new(u64::MAX))
-        .unwrap()
+    pool.copy_text_components(
+        joined,
+        crate::memory_fixture::publication_copy_limits(pool, inputs.len(), u64::MAX),
+    )
+    .unwrap()
 }
 
 pub(in super::super) fn finish_native(
@@ -197,7 +214,7 @@ pub(in super::super) fn finish_native(
 #[test]
 fn funded_resident_copy_preserves_controls_and_aliases_without_runnable_state() {
     for aliases in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let loading = NativeMemoryOwner::acquire(&pool).unwrap();
         let stream = metal();
         let mut source = state(&stream);
@@ -207,7 +224,7 @@ fn funded_resident_copy_preserves_controls_and_aliases_without_runnable_state() 
         }
         publish_source(&source, &loading);
         drop(loading);
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.fixture_funded_charge().unwrap();
         settle(&pool, baseline);
         let (sampler, preparation, run) = sampler(&pool);
         let plan = source.prepare_resident_copy().unwrap();
@@ -269,7 +286,7 @@ fn funded_resident_copy_preserves_controls_and_aliases_without_runnable_state() 
 
 #[test]
 fn funded_builder_mismatch_rejects_before_copy_and_late_failure_retains_partial_roots() {
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let loading = NativeMemoryOwner::acquire(&pool).unwrap();
     let stream = metal();
     let source = state(&stream);
@@ -277,7 +294,7 @@ fn funded_builder_mismatch_rejects_before_copy_and_late_failure_retains_partial_
     publish_source(&source, &loading);
     publish_source(&other, &loading);
     drop(loading);
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_funded_charge().unwrap();
     settle(&pool, baseline);
     let (sampler, preparation, run) = sampler(&pool);
     let expected = values(&source.prepare_resident_copy().unwrap());
@@ -336,3 +353,7 @@ fn funded_builder_mismatch_rejects_before_copy_and_late_failure_retains_partial_
     drop((copied_sampler, custody));
     settle(&pool, 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

@@ -12,9 +12,9 @@ use eredu_runtime::{
 };
 use std::mem::{size_of, take};
 mod candidates;
-mod routed;
 mod generated;
 mod histogram;
+mod routed;
 mod summary;
 mod token_scores;
 
@@ -57,9 +57,14 @@ pub(in crate::composition::mlx::session::model_session::text_funding) struct Cap
     Option<Box<CaptureCarrier>>,
 );
 impl CaptureCarrierOwner {
-    fn prepared(source: &eredu_core::capture::SharedCapturePlan,
-        interventions: Option<&eredu_runtime::working_memory::OriginalInterventionSource>) -> Result<Self, Error> {
-        Ok(Self(Some(Box::new(CaptureCarrier::prepared(source, interventions)?))))
+    fn prepared(
+        source: &eredu_core::capture::SharedCapturePlan,
+        interventions: Option<&eredu_runtime::working_memory::OriginalInterventionSource>,
+    ) -> Result<Self, Error> {
+        Ok(Self(Some(Box::new(CaptureCarrier::prepared(
+            source,
+            interventions,
+        )?))))
     }
 }
 impl std::ops::Deref for CaptureCarrierOwner {
@@ -88,8 +93,10 @@ impl Drop for CaptureCarrierOwner {
 }
 
 impl CaptureCarrier {
-    fn prepared(source: &eredu_core::capture::SharedCapturePlan,
-        interventions: Option<&eredu_runtime::working_memory::OriginalInterventionSource>) -> Result<Self, Error> {
+    fn prepared(
+        source: &eredu_core::capture::SharedCapturePlan,
+        interventions: Option<&eredu_runtime::working_memory::OriginalInterventionSource>,
+    ) -> Result<Self, Error> {
         let requirements = collector_requirements(source, interventions)?;
         let (descriptors, publications) = (requirements.descriptors, requirements.publications);
         let mut roots = Vec::new();
@@ -208,8 +215,8 @@ fn retire_capture_records(ancestor: Option<&safemlx::OriginalScopeObserver>) -> 
 
 /// Introduced common representation only. The original quote composers include
 /// this for each work owner; it is not a reservation or retained payload grant.
-pub(in crate::composition::mlx::session::model_session) fn common_control_bytes()
--> Result<u64, Error> {
+pub(in crate::composition::mlx::session::model_session) fn common_control_bytes(
+) -> Result<u64, Error> {
     size_of::<RefCell<Option<CaptureCarrierOwner>>>()
         .checked_add(size_of::<
             Option<eredu_runtime::working_memory::OriginalTextControlGuard>,
@@ -391,16 +398,24 @@ struct CollectorRequirements {
 impl CollectorRequirements {
     fn include(&mut self, source: &eredu_core::capture::SharedCapturePlan) -> Result<(), Error> {
         let (descriptors, publications) = collector_counts(source)?;
-        self.descriptors = self.descriptors.checked_add(descriptors)
+        self.descriptors = self
+            .descriptors
+            .checked_add(descriptors)
             .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
-        self.publications = self.publications.checked_add(publications)
+        self.publications = self
+            .publications
+            .checked_add(publications)
             .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
         // These source-inspection frames are reused serially. Roots and
         // publication slots, in contrast, stay live together through retirement.
-        self.summary_controls = self.summary_controls.max(summary_collector_control_bytes(source)
-            .ok_or_else(|| error(WorkingMemoryError::Overflow))?);
-        self.histogram_controls = self.histogram_controls.max(histogram_collector_control_bytes(source)
-            .ok_or_else(|| error(WorkingMemoryError::Overflow))?);
+        self.summary_controls = self.summary_controls.max(
+            summary_collector_control_bytes(source)
+                .ok_or_else(|| error(WorkingMemoryError::Overflow))?,
+        );
+        self.histogram_controls = self.histogram_controls.max(
+            histogram_collector_control_bytes(source)
+                .ok_or_else(|| error(WorkingMemoryError::Overflow))?,
+        );
         Ok(())
     }
 }
@@ -423,13 +438,17 @@ fn collector_requirement_control_bytes() -> Option<usize> {
     let frames = [
         size_of::<CollectorRequirements>() * 3,
         size_of::<Result<CollectorRequirements, Error>>(),
-        size_of::<(&eredu_core::capture::SharedCapturePlan,
-            Option<&eredu_runtime::working_memory::OriginalInterventionSource>)>() * 3,
+        size_of::<(
+            &eredu_core::capture::SharedCapturePlan,
+            Option<&eredu_runtime::working_memory::OriginalInterventionSource>,
+        )>() * 3,
         size_of::<Option<&eredu_core::capture::InterventionEvidenceCompanion>>(),
         size_of::<std::ops::Range<usize>>(),
         size_of::<(usize, usize)>(),
     ];
-    frames.into_iter().try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    frames
+        .into_iter()
+        .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
 }
 fn collector_counts(
     source: &eredu_core::capture::SharedCapturePlan,
@@ -445,28 +464,50 @@ fn collector_counts(
         .zip(source.admission().points())
         .enumerate()
     {
-        if matches!(selection.transform, eredu_core::capture::CaptureTransform::RoutedUnits) {
+        if matches!(
+            selection.transform,
+            eredu_core::capture::CaptureTransform::RoutedUnits
+        ) {
             let prefill = point.prefill && selection.schedule.includes(CapturePhase::Prefill, 0);
-            let decode = point.decode && selection.schedule.count_and_last(
-                CapturePhase::Decode, source.admission().request().max_predictions)
-                .map_err(error)?.is_some();
-            if !prefill && !decode { continue; }
+            let decode = point.decode
+                && selection
+                    .schedule
+                    .count_and_last(
+                        CapturePhase::Decode,
+                        source.admission().request().max_predictions,
+                    )
+                    .map_err(error)?
+                    .is_some();
+            if !prefill && !decode {
+                continue;
+            }
             // The shared sparse progression requires disjoint nonempty provider
             // ranges. Thus at most one batch per logical token can reach this
             // selection in a physical chunk. Cold native populations count
             // actual callbacks separately; these are only fixed collector slots.
-            let positions = source.admission().invocation_bounds()
-                .map_or(if prefill { source.admission().request().prompt_tokens } else { 1 },
-                    |bounds| bounds.max_sequence);
-            let tokens = source.admission().request().batch
+            let positions = source.admission().invocation_bounds().map_or(
+                if prefill {
+                    source.admission().request().prompt_tokens
+                } else {
+                    1
+                },
+                |bounds| bounds.max_sequence,
+            );
+            let tokens = source
+                .admission()
+                .request()
+                .batch
                 .checked_mul(positions)
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
-            let slots = tokens.checked_mul(5)
+            let slots = tokens
+                .checked_mul(5)
                 .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
-            descriptors = descriptors.checked_add(slots)
+            descriptors = descriptors
+                .checked_add(slots)
                 .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
-            publications = publications.checked_add(slots)
+            publications = publications
+                .checked_add(slots)
                 .ok_or_else(|| error(WorkingMemoryError::Overflow))?;
             continue;
         }
@@ -612,7 +653,10 @@ impl FundedWork {
             .ok_or_else(|| error(WorkingMemoryError::ExecutionFenced))?;
         // Allocate measured control before bootstrap can install the native slot.
         // A failed/partial bootstrap leaves this carrier in original recovery.
-        *capture = Some(CaptureCarrierOwner::prepared(bootstrap.source(), bootstrap.intervention_source())?);
+        *capture = Some(CaptureCarrierOwner::prepared(
+            bootstrap.source(),
+            bootstrap.intervention_source(),
+        )?);
         self.published.set(false);
         let (segment, registration) = bootstrap.begin_segment(scope, context).map_err(error)?;
         let capture: &mut CaptureCarrier = capture.as_mut().expect("installed carrier");
@@ -773,7 +817,15 @@ impl FundedWork {
         };
         let prepared = PreparedCaptureFragment::new(source, claim.fragment()).map_err(error)?;
         prepared
-            .transfer_with_completion(claim, scope, segment, stream, &capture.roots, completion)
+            .transfer_with_completion(
+                claim,
+                scope,
+                segment,
+                stream,
+                &capture.roots,
+                completion,
+                self.original_metadata_custody().as_ref(),
+            )
             .map_err(error)?;
         attempt.complete();
         Ok(())
@@ -836,8 +888,12 @@ impl FundedWork {
             .ok_or_else(|| error(WorkingMemoryError::UnknownBound))?;
         let bytes =
             u64::try_from(allocation.bytes()).map_err(|_| error(WorkingMemoryError::Overflow))?;
-        let source_pin = scope
-            .pool()
+        let prepared =
+            crate::backend::runtime::residency::storage::prepare_funded_storage_publication(
+                scope, 1,
+            )
+            .map_err(error)?;
+        let source_pin = prepared
             .pin_registered_storage([(StorageIdentity::Native(allocation.identity()), bytes)])
             .map_err(error)?;
         let attempt = CaptureAttempt::new(&capture.progress)?;
@@ -873,8 +929,12 @@ thread_local! { static FORCE_RETIREMENT_BUSY: Cell<bool> = const { Cell::new(fal
 #[cfg(test)]
 impl FundedWork {
     /// Failure-only test seam. Successful paths always call actual native B.
-    pub(in crate::composition::mlx::session::model_session::text_funding) fn force_capture_retirement_busy_for_test()
-     {
+    pub(in crate::composition::mlx::session::model_session::text_funding) fn force_capture_retirement_busy_for_test(
+    ) {
         FORCE_RETIREMENT_BUSY.set(true);
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

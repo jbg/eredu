@@ -28,7 +28,7 @@ sha2.workspace = true
 safetensors = "0.8"
 thiserror.workspace = true
 
-# The qualified Darwin pool owns one actual std PAL pthread mutex allocation.
+# The qualified Darwin ledger owns std PAL pthread mutex and condvar allocations.
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
 libc = "=0.2.189"
 

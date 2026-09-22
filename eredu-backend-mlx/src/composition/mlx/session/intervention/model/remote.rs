@@ -17,7 +17,7 @@ pub(super) struct Source {
 }
 
 impl PreparedModelInterventions {
-    pub(in super::super) fn trace_remote_output(
+    pub(in crate::composition::mlx::session) fn trace_remote_output(
         &mut self,
         layouts: &ComponentPartitionLayouts,
         rank: usize,
@@ -50,11 +50,18 @@ impl PreparedModelInterventions {
                 }
                 Row::PartitionAbsent => InterventionOutcome::Inactive,
                 Row::Routed(_) => InterventionOutcome::Missing,
+                Row::Routing(edit) => {
+                    if edit.complete {
+                        InterventionOutcome::Applied
+                    } else {
+                        InterventionOutcome::Missing
+                    }
+                }
             };
             match activation_hook(operation, point, &outcome, path) {
                 ActivationHook::Unrelated => continue,
                 ActivationHook::Repeated => {
-                    return Err(context.metadata_source(CaptureProtocolError::Transaction))
+                    return Err(context.metadata_source(CaptureProtocolError::Transaction));
                 }
                 ActivationHook::Active => (),
             }

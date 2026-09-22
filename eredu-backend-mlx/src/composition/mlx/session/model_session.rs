@@ -14,10 +14,11 @@ pub use original_host_input::{
 
 mod completion_roots;
 pub(super) use completion_roots::{CompletionRootsOwner, ObservationRoots};
+mod cache_control;
 mod idle_storage;
 mod original_operation;
-mod partition_capture;
 mod parallel_workspace;
+pub(in crate::composition::mlx) mod partition_capture;
 mod payload_owner;
 mod prediction_startup;
 mod resident_reset;
@@ -28,10 +29,12 @@ pub(super) mod text_capture;
 mod text_error;
 mod text_execution;
 pub(super) mod text_funding;
-pub(super) mod text_quote;
+pub(in crate::composition::mlx) mod text_quote;
 mod text_step;
 pub(super) use payload_owner::SessionPayloadOwner;
-pub(in crate::composition::mlx) use speculative_capture::SpeculativePartitionBinding;
+pub(in crate::composition::mlx) use speculative_capture::{
+    OriginalModelPartitionPreparation, OriginalModelPartitionSource, SpeculativePartitionBinding,
+};
 pub(super) use submission_owner::SubmissionResourcesOwner;
 pub use text_step::MlxTextStepPermit;
 #[cfg(all(
@@ -76,8 +79,6 @@ mod loaded_helper_tests;
 mod managed_admission_tests;
 #[cfg(test)]
 mod observation_paths_tests;
-#[cfg(test)]
-mod operation_exchange_tests;
 #[cfg(test)]
 mod operation_memory_tests;
 #[cfg(test)]
@@ -127,7 +128,7 @@ pub(super) struct SessionPayload {
     // The selected model's domain remains identifiable independently of its
     // loading authority. Operations may also be invoked through another native
     // context, whose allocation authority must be acquired before entry.
-    memory_pool: eredu_runtime::working_memory::WorkingMemoryPool,
+    memory_ledger: eredu_runtime::working_memory::MemoryLedger,
     // Mutating operations can leave caches, parameter replacements or other
     // payloads installed after their submission completes. Retain their domain
     // authority with the payload, including on failure.
@@ -309,34 +310,70 @@ impl SubmissionResources {
             funding.retain(output);
             return Ok(());
         }
-        let memory = self.allocation_memory();
-        let reservations: Vec<_> = self
-            .inference_retention
-            .borrow()
-            .requests()
-            .filter_map(|request| request.memory_reservation().cloned())
-            .collect();
-        if reservations.is_empty() {
-            return memory.retain_array(output);
-        }
         if output
             .allocation_info()?
             .is_some_and(|info| info.bytes() == 0)
         {
             return Ok(());
         }
-        // Only neutral charge handles reach the backing: full request or
-        // submission owners could unnecessarily retain preparation/session
-        // state. Neither these reservations nor native memory authority retain
-        // tensors, so the allocation cannot acquire a cycle through this owner.
-        // The submission independently retains the same authorities through
-        // failure recovery if completed-backing attachment is unavailable.
-        output
-            .retain_allocation_owner((memory, reservations))
-            .map_err(|failure| {
-                let (error, _unattached) = failure.into_parts();
-                Error::from(error)
+        let retention = self.memory_retention.borrow();
+        let owner = self.memory_owner.borrow();
+        let requests = self.inference_retention.borrow();
+        let owner_count = retention
+            .owners()
+            .len()
+            .checked_add(usize::from(owner.is_some()))
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+            ))?;
+        let request_count = requests.requests().count();
+        if owner_count == 0 && request_count == 0 {
+            return Ok(());
+        }
+        let pool = self
+            .payload
+            .borrow()
+            .as_ref()
+            .map(|payload| payload.memory_ledger.clone())
+            .or_else(|| owner.as_ref().map(|owner| owner.pool().clone()))
+            .or_else(|| retention.owners().first().map(|owner| owner.pool().clone()))
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            ))?;
+        for request in requests.requests() {
+            request
+                .memory_reservation()
+                .validate_ledger(&pool)
+                .map_err(Error::PrefillControl)?;
+        }
+        let bytes = owner_count
+            .checked_mul(std::mem::size_of::<NativeMemoryOwner>())
+            .and_then(|n| {
+                request_count
+                    .checked_mul(std::mem::size_of::<
+                        eredu_runtime::working_memory::WorkingMemoryReservation,
+                    >())
+                    .and_then(|b| n.checked_add(b))
             })
+            .ok_or(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+            ))?;
+        let prepared = crate::backend::managed_memory::OrdinaryArrayAttachment::<(
+            NativeMemoryRetention,
+            Vec<eredu_runtime::working_memory::WorkingMemoryReservation>,
+        )>::prepare(&pool, bytes)?;
+        // Constructor permission precedes both exact-capacity ownership vectors.
+        let mut owners = Vec::with_capacity(owner_count);
+        owners.extend(retention.owners().iter().cloned());
+        owners.extend(owner.iter().cloned());
+        let memory = NativeMemoryRetention::from_prepared_owners(owners);
+        let mut reservations = Vec::with_capacity(request_count);
+        reservations.extend(
+            requests
+                .requests()
+                .map(|request| request.memory_reservation().clone()),
+        );
+        prepared.attach(output, (memory, reservations))
     }
 
     pub(super) fn retain_inference(
@@ -423,10 +460,6 @@ impl SubmissionResources {
                             }
                             Ok::<_, Error>(())
                         })();
-                        #[cfg(test)]
-                        if let Err(error) = &publication {
-                            eprintln!("funded model publication: {error}");
-                        }
                         if let Err(cause) = publication {
                             funding.retain_callback_failure(cause);
                         }
@@ -441,11 +474,16 @@ impl SubmissionResources {
             // Replacement sampling has its own publication account, but the
             // same actual completion cut governs both accounts. It publishes
             // only its token/RNG roots, never the model or capture inventory.
-            if !self.poison.get() && self.funding_retired.get() && !self.sampling_finalized.replace(true) {
+            if !self.poison.get()
+                && self.funding_retired.get()
+                && !self.sampling_finalized.replace(true)
+            {
                 if let Some(funding) = self.sampling_funding.borrow().as_ref() {
-                    if let Err(cause) = funding.prepare_inventory()
+                    if let Err(cause) = funding
+                        .prepare_inventory()
                         .and_then(|inventory| funding.publish(inventory))
-                        .and_then(|()| funding.certify()) {
+                        .and_then(|()| funding.certify())
+                    {
                         funding.retain_callback_failure(cause);
                     }
                 }
@@ -491,8 +529,12 @@ impl SubmissionResources {
             .borrow()
             .as_ref()
             .and_then(|funding| funding.take_collection_failure())
-            .or_else(|| self.sampling_funding.borrow().as_ref()
-                .and_then(|funding| funding.take_collection_failure()));
+            .or_else(|| {
+                self.sampling_funding
+                    .borrow()
+                    .as_ref()
+                    .and_then(|funding| funding.take_collection_failure())
+            });
         if let Some(cause) = failure {
             return Err(cause);
         }
@@ -516,8 +558,15 @@ impl Drop for ReleaseSubmission {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ScopeFunding {
+    Model,
+    Sampling,
+}
+
 pub(super) struct ScopeRetention {
     owner: SubmissionResourcesOwner,
+    funding: ScopeFunding,
     paged: Option<crate::backend::nn::workspace::PagedScopeRetention>,
     // Last: closed Recovery allocation custody, independent of native Scope.
     _original: Option<eredu_runtime::working_memory::OriginalPredictionRecoveryCustody>,
@@ -557,6 +606,12 @@ impl crate::backend::submission_recovery::prediction::PredictionRetention for Ob
 }
 
 impl Retention for ObservationRetention {
+    fn configure_ordinary_scope(
+        &self,
+        scope: &mut safemlx::SubmissionScope,
+    ) -> Result<(), safemlx::error::Exception> {
+        self.ticket.configure_ordinary_scope(scope)
+    }
     fn observe(&self, status: Status) {
         self.ticket.observe(status);
     }
@@ -572,6 +627,23 @@ impl Drop for ObservationUnwind<'_> {
 }
 
 impl Retention for ScopeRetention {
+    fn configure_ordinary_scope(
+        &self,
+        scope: &mut safemlx::SubmissionScope,
+    ) -> Result<(), safemlx::error::Exception> {
+        let sampling = self.owner.sampling_funding.borrow();
+        let model = self.owner.funding.borrow();
+        let work = match self.funding {
+            ScopeFunding::Model => model.as_ref(),
+            // Initial sampling shares its model Work; an admitted revision
+            // retains its separate sampling Work through the same owner.
+            ScopeFunding::Sampling => sampling.as_ref().or(model.as_ref()),
+        };
+        if let Some(work) = work {
+            work.configure_ordinary_scope(scope)?;
+        }
+        Ok(())
+    }
     fn observe(&self, status: Status) {
         if let Some(paged) = &self.paged {
             paged.observe(status);
@@ -724,7 +796,10 @@ pub(super) fn complete_model_operation<T, P: Probe>(
     recovery: Recovery<ScopeRetention, P>,
 ) -> Result<T, Error> {
     owner.request_release();
-    let status = recovery.finish().map_err(|cause| { owner.reject_unresolved(); cause.into_error() })?;
+    let status = recovery.finish().map_err(|cause| {
+        owner.reject_unresolved();
+        cause.into_error()
+    })?;
     if !status.settled || status.failed || status.blocked {
         owner.reject_unresolved();
         return Err(owner.completion_failure(
@@ -855,8 +930,6 @@ impl<P: Probe> Drop for SessionOperation<'_, P> {
 }
 
 mod pending_prompt;
-mod prepared_control;
-pub use prepared_control::MlxControlInput;
 
 /// MLX-owned prefill input.
 ///
@@ -867,8 +940,6 @@ pub use prepared_control::MlxControlInput;
 pub struct MlxModelInput {
     parts: pending_prompt::ModelInputParts,
     controlled_attribution: Option<eredu_core::SharedPromptAttribution>,
-    // Exact ordinary capture source carried by this immutable pending input.
-    prepared_capture: Option<eredu_runtime::capture::OrdinaryPrefillCapture>,
     original_media: Option<input::OriginalMediaPacket>,
     placement_semantics: Option<eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
     cache_identity: Option<eredu_runtime::SharedPreparedInputCacheIdentity>,
@@ -885,7 +956,6 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
         Self {
             parts: pending_prompt::ModelInputParts::Owned(input.parts.to_vec()),
             controlled_attribution: None,
-            prepared_capture: None,
             // Public ModelInput exposes a replaceable parts slice. Rebuilding
             // from that view never transfers the private completed-upload proof.
             original_media: None,
@@ -940,13 +1010,7 @@ impl MlxModelInput {
             .controlled_attribution
             .as_ref()
             .map_or(Some(0), |v| v.logical_storage_bytes())?;
-        let replacement = if self.prepared_capture.is_some() {
-            eredu_runtime::working_memory::InferenceRequest::unbudgeted_control_bytes()?
-                .checked_add(prepared_control::rebind_error_bytes())?
-        } else {
-            0
-        };
-        cache.checked_add(attribution)?.checked_add(replacement)
+        cache.checked_add(attribution)
     }
 
     /// Only the ordinary per-slot copy worker supplies these reconstructed
@@ -960,7 +1024,6 @@ impl MlxModelInput {
         Self {
             parts: pending_prompt::ModelInputParts::Owned(parts),
             controlled_attribution: source.controlled_attribution.clone(),
-            prepared_capture: source.prepared_capture.clone(),
             // Independent copies use their actual new slots through ordinary admission.
             original_media: None,
             placement_semantics: None,
@@ -979,10 +1042,7 @@ impl MlxModelInput {
                 .as_ref()
                 .is_some_and(|identity| identity.original_source().is_some())
             || self.quote.is_some()
-            || self
-                .inference_request
-                .as_ref()
-                .is_some_and(|r| r.memory_reservation().is_some())
+            || self.inference_request.as_ref().is_some()
     }
 
     pub(super) fn with_memory_owner(mut self, owner: NativeMemoryOwner) -> Self {
@@ -1010,7 +1070,6 @@ impl MlxModelInput {
         self.prefill_chunk_positions = source.prefill_chunk_positions;
         self.inference_request = source.inference_request.clone();
         self.controlled_attribution = source.controlled_attribution.clone();
-        self.prepared_capture = source.prepared_capture.clone();
         self.original_media = None;
         self.placement_semantics = None;
         self.quote = None;
@@ -1051,11 +1110,7 @@ impl MlxModelInput {
         mut self,
         fingerprint: impl Into<String>,
     ) -> Result<Self, Error> {
-        if self
-            .inference_request
-            .as_ref()
-            .is_some_and(|request| request.memory_reservation().is_some())
-        {
+        if self.inference_request.as_ref().is_some() {
             // Replacing a funded identity needs a new construction plan. Losing
             // quote provenance alone cannot authorize unpriced host allocation.
             return Err(Error::Other(Box::new(
@@ -1064,7 +1119,6 @@ impl MlxModelInput {
         }
         self.quote = None;
         self.controlled_attribution = None;
-        self.prepared_capture = None;
         self.original_media = None;
         self.placement_semantics = None;
         let prepared = eredu_runtime::PreparedModelInput::new(self.parts.to_vec(), |array| {
@@ -1113,11 +1167,11 @@ impl MlxModelInput {
             Some(metadata) => input.with_original_media_metadata(metadata),
             None => input,
         };
-        let input = match self.placement_semantics.as_ref().or_else(|| self
-            .quote
-            .as_ref()
-            .and_then(|quote| quote.copied_media_semantics()))
-        {
+        let input = match self.placement_semantics.as_ref().or_else(|| {
+            self.quote
+                .as_ref()
+                .and_then(|quote| quote.copied_media_semantics())
+        }) {
             Some(semantics) => input.with_copied_media_semantics(semantics),
             None => input,
         };
@@ -1146,10 +1200,17 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
         use eredu_core::execution_control::ControlSupport;
         let session = runtime.session();
         if session.poison.get() {
-            return ControlSupport::Unsupported { reason: "native session is fenced by unresolved or failed work" };
+            return ControlSupport::Unsupported {
+                reason: "native session is fenced by unresolved or failed work",
+            };
         }
-        if !runtime.backend().matches_prepared_target(&session.payload.target) {
-            return ControlSupport::Unsupported { reason: "prepared execution and supplied context use different native targets" };
+        if !runtime
+            .backend()
+            .matches_prepared_target(&session.payload.target)
+        {
+            return ControlSupport::Unsupported {
+                reason: "prepared execution and supplied context use different native targets",
+            };
         }
         session.payload.model.erased().native_control_support()
     }
@@ -1189,33 +1250,6 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
         }))
     }
 
-    fn capture_native_text_state(
-        runtime: &mut ModelRuntime<Self>,
-    ) -> Result<MlxNativeTextState, Error> {
-        let estimate = Self::estimate_native_text_state(runtime, None)?;
-        if estimate.is_none() {
-            return Err(Error::ArchitectureModel(
-                "native text snapshot estimate is unavailable".into(),
-            ));
-        }
-        // The inner Result is deliberate: the copy never changes installed
-        // state. Settle its native work before returning a recoverable copy
-        // error; a failed/unobservable scope still fences the shared engine.
-        let memory = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
-        super::recovery::detached_retained(memory.clone(), || {
-            let state = runtime.session_mut().with_model_operation(|model| {
-                Ok(model.erased_mut().capture_native_control_state())
-            })??;
-            let memory_retention = NativeMemoryRetention::from_owner(&memory);
-            Ok(MlxNativeTextState {
-                state,
-                memory_retention,
-                host_preparation: None,
-                displaced_placement: None,
-            })
-        })
-    }
-
     fn estimate_native_text_growth(
         runtime: &ModelRuntime<Self>,
         saved: &MlxNativeTextState,
@@ -1228,33 +1262,6 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
             .model
             .erased()
             .estimate_native_control_growth(saved.state.as_ref(), additional)
-    }
-
-    fn copy_native_text_state(
-        runtime: &mut ModelRuntime<Self>,
-        saved: &MlxNativeTextState,
-    ) -> Result<MlxNativeTextState, Error> {
-        Self::validate_native_text_state(runtime, saved)?;
-        if Self::estimate_native_text_state(runtime, Some(saved))?.is_none() {
-            return Err(Error::ArchitectureModel(
-                "native text snapshot estimate is unavailable".into(),
-            ));
-        }
-        let memory = NativeMemoryOwner::acquire(runtime.backend().memory_pool())?;
-        super::recovery::detached_retained(memory.clone(), || {
-            let state = runtime.session_mut().with_model_operation(|model| {
-                Ok(model
-                    .erased_mut()
-                    .copy_native_control_state(saved.state.as_ref()))
-            })??;
-            let memory_retention = NativeMemoryRetention::from_owner(&memory);
-            Ok(MlxNativeTextState {
-                state,
-                memory_retention,
-                host_preparation: None,
-                displaced_placement: None,
-            })
-        })
     }
 
     fn validate_native_text_state(
@@ -1344,12 +1351,65 @@ pub struct MlxModelSession {
     capture_discovery:
         Option<std::sync::Arc<eredu_architectures::prepared_sources::PreparedModelDiscovery>>,
     speculative_capture_layouts: speculative_capture::LayoutsCell,
-    partition_capture: RefCell<Option<partition_capture::Publication<partition_capture::PartitionCaptureData>>>,
+    partition_capture:
+        RefCell<Option<partition_capture::Publication<partition_capture::PartitionCaptureData>>>,
     intervention_session_identity: String,
     state_residency: CacheResidencyPolicy,
 }
 
 impl MlxModelSession {
+    #[cfg(test)]
+    pub(in crate::composition::mlx) fn fixture_device_unit_window(
+        &self,
+        units: usize,
+    ) -> Option<usize> {
+        Some(
+            self.payload
+                .model
+                .inference_blueprint()?
+                .selected()
+                .text_realization()
+                .residency()
+                .device_depth(units),
+        )
+    }
+    #[cfg(test)]
+    pub(in crate::composition::mlx) fn fixture_selected_parameter(
+        &self,
+        name: &str,
+    ) -> Option<&eredu_runtime::SelectedParameterRealization> {
+        self.payload
+            .model
+            .inference_blueprint()?
+            .selected()
+            .text_realization()
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name() == name)
+    }
+
+    #[cfg(test)]
+    pub(in crate::composition::mlx) fn fixture_detached_payload_read_bytes(&self) -> Option<u64> {
+        let workspace = self.payload.model.layerwise_workspace().ok()??;
+        let mut bytes = workspace.detached_physical_read_bytes(0)?;
+        let mut ordinal = 1;
+        while let Some(read) = workspace.detached_physical_read_bytes(ordinal) {
+            bytes = bytes.checked_add(read)?;
+            ordinal = ordinal.checked_add(1)?;
+        }
+        Some(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_execution_identity(
+        &self,
+    ) -> eredu_runtime::working_memory::InferenceExecutionIdentity {
+        self.payload
+            .model
+            .erased()
+            .inference_execution_identity()
+            .clone()
+    }
     #[cfg(test)]
     pub(super) fn test_state_presence(
         &self,
@@ -1410,10 +1470,10 @@ impl MlxModelSession {
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let floating_state_dtype_bytes = model.floating_state_dtype_bytes();
         let memory_owner = model.memory_owner().cloned();
-        let memory_pool = memory_owner
+        let memory_ledger = memory_owner
             .as_ref()
             .map(|owner| owner.pool().clone())
-            .unwrap_or_else(crate::backend::managed_memory::domain);
+            .unwrap_or_else(crate::backend::managed_memory::ledger);
         let state_residency = model.state_residency().clone();
         #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
@@ -1446,7 +1506,7 @@ impl MlxModelSession {
                 _retirement_probe: None,
                 _memory_owner: memory_owner,
                 state_memory: Default::default(),
-                memory_pool,
+                memory_ledger,
                 operation_memory: Default::default(),
                 nonstate_publication: Default::default(),
             }),
@@ -1476,12 +1536,12 @@ impl MlxModelSession {
             })
     }
 
-    fn begin_submission(
-        &mut self,
-        backend: &MlxBackend<'_>,
-    ) -> Result<SessionOperation<'_>, Error> {
+    fn reject_unadmitted_text<T>(&self, backend: &MlxBackend<'_>) -> Result<T, Error> {
         self.validate_backend(backend)?;
-        self.begin_operation_in(Some(backend.memory_pool()))
+        self.ensure_no_submission_in_flight()?;
+        Err(Error::before_model_mutation(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))
     }
 
     /// A quoted operation enters only with the move-only evidence returned by
@@ -1493,13 +1553,19 @@ impl MlxModelSession {
         operation: Option<text_step::TextOperation<'_>>,
     ) -> Result<SessionOperation<'_>, Error> {
         let Some(operation) = operation else {
-            return self.begin_submission(backend);
+            return self.reject_unadmitted_text(backend);
         };
-        operation.validate(self, backend)?;
+        operation
+            .validate(self, backend)
+            .map_err(|error| error.at_original_stage("text submission operation validation"))?;
 
-        let token_validations = operation.token_validation_ingress()?;
+        let token_validations = operation
+            .token_validation_ingress()
+            .map_err(|error| error.at_original_stage("text submission token ingress"))?;
 
-        let completion_output = operation.completion_output_ingress()?;
+        let completion_output = operation
+            .completion_output_ingress()
+            .map_err(|error| error.at_original_stage("text submission completion ingress"))?;
 
         self.ensure_no_submission_in_flight()?;
 
@@ -1516,18 +1582,30 @@ impl MlxModelSession {
         drop(previous);
         owner.retain_request(operation.request());
         owner.retain_inference(&inference);
-        operation.handoff(self, &inference)?;
+        operation
+            .handoff(self, &inference)
+            .map_err(|error| error.at_original_stage("text submission inference handoff"))?;
 
         let scope = operation.take_funding();
         if let Some(scope) = scope {
-            owner.funding.replace(Some(operation.funded_work(scope)?));
+            owner
+                .funding
+                .replace(Some(operation.funded_work(scope).map_err(|error| {
+                    error.at_original_stage("text submission work construction")
+                })?));
         }
 
-        let roles = operation.prediction_scopes()?;
+        let roles = operation
+            .prediction_scopes()
+            .map_err(|error| error.at_original_stage("text submission prediction scopes"))?;
         *owner.prediction_scopes.borrow_mut() = roles;
-        *owner.sampling_funding.borrow_mut() = operation.sampling_work()?;
+        *owner.sampling_funding.borrow_mut() = operation
+            .sampling_work()
+            .map_err(|error| error.at_original_stage("text submission sampling work"))?;
 
-        let prefill = operation.prefill_scopes(self)?;
+        let prefill = operation
+            .prefill_scopes(self)
+            .map_err(|error| error.at_original_stage("text submission prefill scopes"))?;
         let projection = prefill.map(|(bank, projection)| {
             *owner.prefill_scopes.borrow_mut() = Some(bank);
             projection
@@ -1535,7 +1613,9 @@ impl MlxModelSession {
 
         // The quote owns the finite bank across branch exchanges. This actual
         // submission alone activates its weak policy view, before native roles.
-        *owner.operation_bank.borrow_mut() = operation.activate_operation_bank()?;
+        *owner.operation_bank.borrow_mut() = operation
+            .activate_operation_bank()
+            .map_err(|error| error.at_original_stage("text submission residency activation"))?;
 
         let model_preparation = operation.model_execution_preparation(self)?;
 
@@ -1577,7 +1657,9 @@ impl MlxModelSession {
         *owner.parallel_control.borrow_mut() = installation;
         // Retain the exact source before lending an observer or running model
         // work. Construction refusal still follows this operation's Recovery.
-        *owner.partition_capture.borrow_mut() = operation.partition_capture_frame(self)?;
+        *owner.partition_capture.borrow_mut() = operation
+            .partition_capture_frame(self)
+            .map_err(|error| error.at_original_stage("text submission partition capture"))?;
 
         let submission = SessionOperation {
             session: self,
@@ -1588,31 +1670,32 @@ impl MlxModelSession {
         };
         // Activation can fail, so establish ordinary recovery ownership first.
         // No input conversion, constructor or model work precedes this guard.
-        submission
-            .owner
-            .direct_route
-            .replace(operation.activate_disk_route()?);
+        submission.owner.direct_route.replace(
+            operation.activate_disk_route().map_err(|error| {
+                error.at_original_stage("text submission disk route activation")
+            })?,
+        );
 
         Ok(submission)
     }
 
-    /// A residency handle alone never grants permission in a different domain.
+    /// A residency handle alone never grants permission in a different ledger.
     /// All retained owners here are immutable unquoted authorities: no inventory
     /// publication can revoke the lease shared by an existing descendant.
     fn operation_memory(
         &self,
-        context_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        context_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
     ) -> Result<NativeMemoryRetention, Error> {
         let mut memory = self.payload.operation_memory.borrow().clone();
         if let Some(owner) = self.payload._memory_owner.as_ref() {
             memory.retain(owner);
         }
-        for pool in std::iter::once(&self.payload.memory_pool).chain(context_pool) {
+        for pool in std::iter::once(&self.payload.memory_ledger).chain(context_pool) {
             if !memory.covers_pool(pool) {
                 memory.retain(&NativeMemoryOwner::acquire(pool)?);
             }
         }
-        // Do not publish partial acquisition if a later domain rejects. Once
+        // Do not publish partial acquisition if a later ledger rejects. Once
         // entry is authorized, preserve it before any fallible native work.
         self.payload
             .operation_memory
@@ -1627,7 +1710,7 @@ impl MlxModelSession {
 
     fn begin_operation_in(
         &mut self,
-        context_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        context_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
     ) -> Result<SessionOperation<'_>, Error> {
         self.ensure_no_submission_in_flight()?;
         self.payload.model.erased().install_parallel_control(None)?;
@@ -1662,7 +1745,7 @@ impl MlxModelSession {
 
     fn with_model_operation_in<T>(
         &mut self,
-        context_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        context_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
         operation: impl FnOnce(&mut Executable) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let mut guard = self.begin_operation_in(context_pool)?;
@@ -1673,7 +1756,7 @@ impl MlxModelSession {
 
     fn with_shared_operation<T>(
         &self,
-        context_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        context_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         self.ensure_no_submission_in_flight()?;
@@ -1698,7 +1781,10 @@ impl MlxModelSession {
         // Successful host reads can leave completion bookkeeping pending. Wait
         // for that work before reusing the session; errors remain nonblocking.
         let status = if result.is_ok() {
-            recovery.finish().map_err(|cause| { owner.reject_unresolved(); cause.into_error() })?
+            recovery.finish().map_err(|cause| {
+                owner.reject_unresolved();
+                cause.into_error()
+            })?
         } else {
             recovery.progress()
         };
@@ -1825,16 +1911,18 @@ impl MlxModelSession {
         let prepared = self.capture_discovery.as_ref().ok_or_else(|| {
             CaptureError::Unsupported("session has no retained activation catalog".into())
         })?;
-        let execution = self
+        let Some(execution) = self
             .payload
             .model
             .erased()
             .speculative_activation_execution()
-            .ok_or_else(|| {
-                CaptureError::Unsupported(
-                    "selected prediction executor has no complete internal activation path".into(),
-                )
-            })?;
+        else {
+            return prepared.autoregressive_activations(
+                &super::intervention::mechanisms(),
+                &self.intervention_session_identity,
+                self.payload.parameter_state.active.as_deref(),
+            );
+        };
         prepared.speculative_activations(
             &execution,
             &super::intervention::mechanisms(),
@@ -2004,7 +2092,7 @@ impl MlxModelSession {
 
     fn reset_in(
         &mut self,
-        context_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        context_pool: Option<&eredu_runtime::working_memory::MemoryLedger>,
     ) -> Result<(), Error> {
         let policy = self.state_residency.clone();
         self.with_model_operation_in(context_pool, |model| {
@@ -2154,29 +2242,37 @@ impl MlxModelSession {
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Error> {
+    ) -> Result<eredu_core::cache::SharedPromptCacheManifest, Error> {
         self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
-        self.with_model_operation_in(Some(backend.memory_pool()), |model| {
+        let funding = self.prepare_cache_persistence()?;
+        let control = self.prepare_cache_control(
+            eredu_runtime::replicated_session::SessionCacheControlOperation::Save,
+            funding.context(),
+        )?;
+        let host = funding
+            .context()
+            .metadata_funding()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        self.with_model_operation_funded(host, |model| {
             if model.has_neutral_partitioned_control() {
                 model
-                    .save_prompt_cache_distributed(root, descriptor, prefix_token_ids, options)?
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "this partition rank owns no prompt-cache state".into(),
-                        )
-                    })
-            } else {
-                model
-                    .save_prompt_cache(
+                    .save_prompt_cache_distributed(
+                        &funding,
+                        control.as_ref(),
                         root,
                         descriptor,
                         prefix_token_ids,
                         options,
-                        backend.stream(),
-                    )
+                    )?
+                    .ok_or_else(|| {
+                        Error::PromptCache(eredu_core::cache::PromptCacheError::RankHasNoState)
+                    })
+            } else {
+                model
+                    .save_prompt_cache(&funding, root, descriptor, prefix_token_ids, options)
                     .map_err(Into::into)
             }
         })
@@ -2189,33 +2285,47 @@ impl MlxModelSession {
         root: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-    ) -> Result<PromptCacheManifest, Error> {
+    ) -> Result<eredu_core::cache::SharedPromptCacheManifest, Error> {
         self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
-        let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
-            return Err(Error::ArchitectureModel(
-                "prompt-cache loading requires paged state selected during preparation".into(),
+        let CacheResidencyPolicy::Paged(_) = &self.state_residency else {
+            return Err(Error::PromptCache(
+                eredu_core::cache::PromptCacheError::PagedStateRequired,
             ));
         };
-        let options = options.clone();
-        self.with_model_operation_in(Some(backend.memory_pool()), |model| {
+        let funding = self.prepare_cache_persistence()?;
+        let materialization = self.prepare_cache_materialization(backend, &funding)?;
+        let control = self.prepare_cache_control(
+            eredu_runtime::replicated_session::SessionCacheControlOperation::Load,
+            funding.context(),
+        )?;
+        let host = funding
+            .context()
+            .metadata_funding()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        self.with_model_operation_funded(host, |model| {
             let manifest = if model.has_neutral_partitioned_control() {
                 model
-                    .load_prompt_cache_distributed(root, expected, prefix_token_ids)?
+                    .load_prompt_cache_distributed(
+                        &funding,
+                        &materialization,
+                        control.as_ref(),
+                        root,
+                        expected,
+                        prefix_token_ids,
+                    )?
                     .ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "this partition rank owns no prompt-cache state".into(),
-                        )
+                        Error::PromptCache(eredu_core::cache::PromptCacheError::RankHasNoState)
                     })?
             } else {
                 model.load_prompt_cache(
+                    &funding,
+                    &materialization,
                     root,
                     expected,
                     prefix_token_ids,
-                    options,
-                    backend.stream(),
                 )?
             };
             Ok(manifest)
@@ -2230,45 +2340,53 @@ impl MlxModelSession {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input: &MlxModelInput,
-    ) -> Result<PromptCacheManifest, Error> {
+    ) -> Result<eredu_core::cache::SharedPromptCacheManifest, Error> {
         self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let identity = input.cache_identity.clone().ok_or_else(|| {
-            Error::ArchitectureModel(
-                "prompt-cache loading requires prepared-input semantic identity".into(),
-            )
+            Error::PromptCache(eredu_core::cache::PromptCacheError::PreparedInputIdentityRequired)
         })?;
-        let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
-            return Err(Error::ArchitectureModel(
-                "prompt-cache loading requires paged state selected during preparation".into(),
+        let CacheResidencyPolicy::Paged(_) = &self.state_residency else {
+            return Err(Error::PromptCache(
+                eredu_core::cache::PromptCacheError::PagedStateRequired,
             ));
         };
         let root = root.as_ref();
-        let options = options.clone();
-        self.with_model_operation_in(Some(backend.memory_pool()), |model| {
+        let funding = self.prepare_cache_persistence()?;
+        let materialization = self.prepare_cache_materialization(backend, &funding)?;
+        let control = self.prepare_cache_control(
+            eredu_runtime::replicated_session::SessionCacheControlOperation::Load,
+            funding.context(),
+        )?;
+        let host = funding
+            .context()
+            .metadata_funding()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        self.with_model_operation_funded(host, |model| {
             if model.has_neutral_partitioned_control() {
                 model
                     .load_prompt_cache_for_input_distributed(
+                        &funding,
+                        &materialization,
+                        control.as_ref(),
                         root,
                         expected,
                         prefix_token_ids,
                         identity,
                     )?
                     .ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "this partition rank owns no prompt-cache state".into(),
-                        )
+                        Error::PromptCache(eredu_core::cache::PromptCacheError::RankHasNoState)
                     })
             } else {
                 model
                     .load_prompt_cache_for_input(
+                        &funding,
+                        &materialization,
                         root,
                         expected,
                         prefix_token_ids,
                         identity,
-                        options.clone(),
-                        backend.stream(),
                     )
                     .map_err(Into::into)
             }
@@ -2575,33 +2693,10 @@ impl MlxModelSession {
     fn submit_decode_with_observer(
         &mut self,
         backend: &MlxBackend<'_>,
-        input: impl FnOnce() -> Result<Array, Error>,
-        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
+        _input: impl FnOnce() -> Result<Array, Error>,
+        _observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
     ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
-        let mut operation = self.begin_submission(backend)?;
-        let allocation_authority = Some(operation.owner.observer_allocation_authority());
-        let token_validation_scope = operation.begin_token_validation()?;
-        let input = input();
-        let input = match input {
-            Ok(ref input) => Ok(input),
-            Err(error) => Err(error),
-        };
-        let output = operation.model().erased_mut().decode_result_with_observer(
-            input,
-            backend.stream(),
-            &mut ArrayObserverAdapter {
-                inner: observer,
-                routed_path: None,
-                routed_invocation_active: false,
-                allocation_authority,
-            },
-        );
-        let output = output.and_then(|output| {
-            observer.finish()?;
-            Ok(output)
-        });
-        let (output, owner, recovery) = operation.finish_execution(output)?;
-        model_array_submission(output, token_validation_scope.finish(), owner, recovery)
+        self.reject_unadmitted_text(backend)
     }
 }
 
@@ -2618,22 +2713,9 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
     fn prefill(
         &mut self,
         backend: &MlxBackend<'a>,
-        input: Self::PrefillInput,
+        _input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let mut operation = self.begin_submission(backend)?;
-        operation.owner.retain_input(&input);
-        let token_validation_scope = operation.begin_token_validation()?;
-        let output =
-            input.with_borrowed(|input| prefill_model(operation.model(), input, backend.stream()));
-        let public_output = operation.model().erased().partition_public_output();
-        let (output, owner, recovery) = operation.finish_execution(output)?;
-        owned_model_submission(
-            output,
-            token_validation_scope.finish(),
-            public_output,
-            owner,
-            recovery,
-        )
+        self.reject_unadmitted_text(backend)
     }
 
     fn prefill_cancellable(
@@ -2675,13 +2757,18 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         output: &Self::Output,
     ) -> Result<ObservationSet, Error> {
         self.validate_backend(backend)?;
-        self.with_shared_operation(Some(backend.memory_pool()), || {
+        self.with_shared_operation(Some(backend.memory_ledger()), || {
             let mut observations = ObservationSet::new();
             if let Some(logits) = output.logits() {
                 observations
                     .insert(
                         eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-                        ObservationValue::Tensor(observe_tensor(logits, backend.stream())?),
+                        ObservationValue::Tensor(
+                            super::observation::readback::observe_tensor_retained(
+                                logits,
+                                backend.stream(),
+                            )?,
+                        ),
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             }
@@ -2705,7 +2792,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         } else {
             MlxModelOutput::new(None)
         };
-        let observations = self.with_shared_operation(Some(backend.memory_pool()), || {
+        let observations = self.with_shared_operation(Some(backend.memory_ledger()), || {
             collector.materialize(backend.stream())
         })?;
         Ok(InspectedOutput {
@@ -2728,7 +2815,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         } else {
             MlxModelOutput::new(None)
         };
-        let observations = self.with_shared_operation(Some(backend.memory_pool()), || {
+        let observations = self.with_shared_operation(Some(backend.memory_ledger()), || {
             collector.materialize(backend.stream())
         })?;
         Ok(InspectedOutput {
@@ -2743,6 +2830,15 @@ struct TextPreparationRetention {
     funding: Option<text_funding::FundedWorkOwner>,
 }
 impl super::recovery::Retention for TextPreparationRetention {
+    fn configure_ordinary_scope(
+        &self,
+        scope: &mut safemlx::SubmissionScope,
+    ) -> Result<(), safemlx::error::Exception> {
+        if let Some(work) = &self.funding {
+            work.configure_ordinary_scope(scope)?;
+        }
+        Ok(())
+    }
     fn observe(&self, status: super::recovery::Status) {
         if let Some(funding) = &self.funding {
             funding.observe_preparation(status);
@@ -2759,12 +2855,7 @@ pub struct MlxTextPreparation {
 }
 
 fn validate_preparation_funding(preparation: &MlxTextPreparation) -> Result<(), Error> {
-    if preparation.quote.is_none()
-        && preparation
-            .request
-            .as_ref()
-            .is_some_and(|request| request.request().requires_funding_scope())
-    {
+    if preparation.quote.is_none() || preparation.request.is_none() {
         return Err(Error::Other(Box::new(
             eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
         )));
@@ -2784,7 +2875,7 @@ impl eredu_runtime::working_memory::LoadedDecodeSourceBackend for MlxBackend<'_>
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_decode_source(plan)
             .map_err(|error| {
                 // The actual partial compiler/source owner enters the closed core
@@ -2810,16 +2901,24 @@ impl eredu_runtime::input::OriginalModelInputBackend for MlxBackend<'_> {
         input: &Self::Prompt,
     ) -> Option<&eredu_runtime::working_memory::BoundCompositeSemanticStorage> {
         match input.original_media.as_ref()? {
-            input::OriginalMediaPacket::Original(completed) => Some(completed.borrowed_semantics().storage()),
+            input::OriginalMediaPacket::Original(completed) => {
+                Some(completed.borrowed_semantics().storage())
+            }
             input::OriginalMediaPacket::Ordinary(_) => None,
         }
     }
     fn prepare_original_model_input(
         runtime: &ModelRuntime<Self>,
         plan: eredu_runtime::input::host::PreparedHostInputPlan<'_>,
-        capacity: u64,
-    ) -> Result<eredu_runtime::input::OriginalModelInput<Self::Prompt>, eredu_core::BackendFailure> {
-        original_host_input::prepare_model_input(runtime, plan, capacity)
+        limits: &eredu_core::MemoryLimitDeclarations,
+    ) -> Result<eredu_runtime::input::OriginalModelInput<Self::Prompt>, eredu_core::BackendFailure>
+    {
+        let limits = limits
+            .resolve(runtime.backend().memory_ledger().topology())
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        text_quote::prepare_parameter_observation_paths(runtime.session(), &limits)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        original_host_input::prepare_model_input(runtime, plan, limits)
     }
 }
 
@@ -2831,9 +2930,15 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
         if !runtime.session().matches_healthy_backend(runtime.backend()) {
             return Err(eredu_core::TokenInputRejection::IdentityMismatch);
         }
-        let model = runtime.session().original_model_source()
+        let model = runtime
+            .session()
+            .original_model_source()
             .map_err(|_| eredu_core::TokenInputRejection::Busy)?;
-        preparation.validate(runtime.backend().memory_pool(), model.erased().inference_execution_identity())
+        preparation
+            .validate(
+                runtime.backend().memory_ledger(),
+                model.erased().inference_execution_identity(),
+            )
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)
     }
 
@@ -2857,7 +2962,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
     fn prepare_semantic_source(
         runtime: &ModelRuntime<Self>,
         source: &eredu_runtime::working_memory::OriginalTokenizer,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<
         eredu_runtime::working_memory::PreparedSemanticSource,
         eredu_core::SpeculativeOutputError,
@@ -2868,7 +2973,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
             ));
         }
         source
-            .validate_pool(runtime.backend().memory_pool())
+            .validate_pool(runtime.backend().memory_ledger())
             .map_err(|_| {
                 eredu_core::SpeculativeOutputError::Storage(
                     "speculative semantic source pool mismatch",
@@ -2882,14 +2987,14 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
                 .model
                 .erased()
                 .inference_execution_identity(),
-            capacity,
+            limits.resolve(runtime.backend().memory_ledger().topology())?,
         )
     }
 
     fn prepare_original_text_source_budget(
         runtime: &ModelRuntime<Self>,
         source: &eredu_runtime::working_memory::OriginalTokenizer,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<
         eredu_runtime::working_memory::OriginalTextSourceBudget,
         eredu_runtime::working_memory::OriginalTextSourceError,
@@ -2899,7 +3004,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
             .validate_backend(runtime.backend())
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)?;
         source
-            .validate_pool(runtime.backend().memory_pool())
+            .validate_pool(runtime.backend().memory_ledger())
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)?;
         source
             .prepare_text_source_budget(
@@ -2909,7 +3014,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
                     .model
                     .erased()
                     .inference_execution_identity(),
-                capacity,
+                limits.resolve(runtime.backend().memory_ledger().topology())?,
             )
             .map_err(Into::into)
     }
@@ -2925,7 +3030,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
                 eredu_core::GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure()
             })?;
         source
-            .validate_pool(runtime.backend().memory_pool())
+            .validate_pool(runtime.backend().memory_ledger())
             .map_err(|_| {
                 eredu_core::GenerationSequenceBankRejection::IdentityMismatch.into_backend_failure()
             })
@@ -2946,7 +3051,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
         }
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_stop_source(plan)
             .map_err(Into::into)
     }
@@ -2968,7 +3073,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
         }
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .encode_tokenizer_ids(source, input, add_special_tokens)
             .map_err(Into::into)
     }
@@ -2989,7 +3094,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
             })?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_tokenizer_source_for_generation(input)
             .map_err(eredu_runtime::working_memory::OriginalTokenizerSourceError::from)
     }
@@ -3007,7 +3112,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .encode_tokenizer_ids(source, input, add_special_tokens)
             .map_err(
                 eredu_runtime::working_memory::OriginalTokenizerEncodeError::into_backend_failure,
@@ -3023,7 +3128,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_tokenizer_file(read)
             .map_err(
                 eredu_runtime::working_memory::OriginalTokenizerInputError::into_backend_failure,
@@ -3039,7 +3144,7 @@ impl eredu_runtime::working_memory::OriginalTokenizerBackend for MlxBackend<'_> 
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_tokenizer(plan)
             .map_err(eredu_runtime::working_memory::OriginalTokenizerError::into_backend_failure)
     }
@@ -3057,7 +3162,7 @@ impl eredu_runtime::working_memory::OriginalStopSourceBackend for MlxBackend<'_>
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_stop_source(plan)
             .map_err(|error| {
                 // The actual partial compiler/source owner enters the closed core
@@ -3085,7 +3190,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         preparation: &Self::TextPreparation,
     ) -> Option<eredu_core::TextPreparationReport<'_>> {
         let request = preparation.request.as_ref()?.request();
-        let reservation = request.memory_reservation()?;
+        let reservation = request.memory_reservation();
         Some(eredu_core::TextPreparationReport {
             geometry: request.geometry(),
             admission: reservation.admission(),
@@ -3101,7 +3206,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .map_err(eredu_core::BackendFailure::from_error)?;
         let lease = runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .acquire_unquoted()
             .map_err(eredu_core::BackendFailure::from_error)?;
         Ok(eredu_core::HostPreparationAuthority::retain(lease))
@@ -3117,7 +3222,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .prepare_shared_token_filter(factory)
             .map_err(eredu_core::BackendFailure::from_error)
     }
@@ -3132,7 +3237,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .prepare_shared_controller_bytes(factory)
             .map_err(eredu_core::BackendFailure::from_error)
     }
@@ -3147,7 +3252,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .map_err(eredu_core::BackendFailure::from_error)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .prepare_shared_controller_declaration(factory)
             .map_err(eredu_core::BackendFailure::from_error)
     }
@@ -3277,115 +3382,16 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         policy
             .validate(config.sampling().max_new_tokens)
             .map_err(eredu_core::BackendFailure::from_error)?;
-        if policy.managed_memory_capacity_bytes.is_some() {
-            let (request, quote) = text_quote::admit(runtime, input, config, controller)?;
-            let chunk =
-                std::num::NonZeroU64::new(request.request().geometry().prefill_chunk_positions);
-            let preparation = MlxTextPreparation {
-                request: Some(request),
-                chunk,
-                quote: Some(quote),
-            };
-            #[cfg(test)]
-            text_quote::record_tracking_admission(&preparation);
-            return Ok(preparation);
-        }
-        let request = match input {
-            eredu_core::TextPreparationInput::TokenIds { .. } => None,
-            eredu_core::TextPreparationInput::OriginalPrepared(_) => {
-                return Err(
-                    eredu_core::PreparedRequestRejection::MissingSequence.into_backend_failure()
-                );
-            }
-            eredu_core::TextPreparationInput::OriginalTokenIds(_) => {
-                return Err(eredu_core::TokenInputRejection::Unsupported.into_backend_failure());
-            }
-            eredu_core::TextPreparationInput::Prepared(prompt)
-                if prompt.prepared_capture.is_some() =>
-            {
-                // This ordinary finite request belongs to the pending source and
-                // is consumed by the shared PrefillDriver. It is not an original
-                // text run/grant. Keeping it out of the outer text preparation
-                // permits a genuine copied prompt to get one fresh ordinary
-                // driver request before restore/fork publication.
-                let binding = prompt.prepared_capture.as_ref().expect("checked binding");
-                let geometry = binding.geometry();
-                if prompt.has_original_input_custody()
-                    || config
-                        .sampling()
-                        .max_new_tokens
-                        .and_then(|n| u64::try_from(n).ok())
-                        != Some(geometry.max_output_tokens)
-                    || policy.prefill_chunk_positions.is_some_and(|n| {
-                        n.get().min(geometry.input_positions) != geometry.prefill_chunk_positions
-                    })
-                    || prompt
-                        .inference_request
-                        .as_ref()
-                        .is_none_or(|r| r.geometry() != geometry)
-                {
-                    return Err(eredu_core::PreparedControlInputError::SourceMismatch
-                        .into_backend_failure());
-                }
-                let model = runtime.session().payload.model.erased();
-                let request = prompt
-                    .inference_request
-                    .as_ref()
-                    .expect("validated request");
-                request
-                    .validate(model.inference_execution_identity(), geometry)
-                    .map_err(BackendFailure::from_error)?;
-                model
-                    .validate_text_frontier(geometry.cached_positions)
-                    .map_err(BackendFailure::from_error)?;
-                let paths = model.shared_observation_paths().ok_or_else(|| {
-                    eredu_core::PreparedControlInputError::SourceMismatch.into_backend_failure()
-                })?;
-                model
-                    .validate_prepared_observation_paths(paths, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary())
-                    .map_err(BackendFailure::from_error)?;
-                binding
-                    .validate(binding.source(), paths, geometry)
-                    .map_err(BackendFailure::from_error)?;
-                None
-            }
-            eredu_core::TextPreparationInput::Prepared(prompt) => prompt.inference_request.as_ref(),
+        let (request, quote) = text_quote::admit(runtime, input, config, controller)?;
+        let chunk = std::num::NonZeroU64::new(request.request().geometry().prefill_chunk_positions);
+        let preparation = MlxTextPreparation {
+            request: Some(request),
+            chunk,
+            quote: Some(quote),
         };
-        let request = request
-            .map(|request| {
-                let mut geometry = request.geometry();
-                if let eredu_core::TextPreparationInput::Prepared(prompt) = input {
-                    if let Some(chunk) = prompt.prefill_chunk_positions {
-                        geometry.prefill_chunk_positions = chunk.get();
-                    }
-                }
-                if policy
-                    .prefill_chunk_positions
-                    .is_some_and(|chunk| geometry.prefill_chunk_positions > chunk.get())
-                {
-                    return Err(eredu_core::BackendFailure::from_error(
-                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-                    ));
-                }
-                request
-                    .prepare_text(
-                        runtime
-                            .session()
-                            .payload
-                            .model
-                            .erased()
-                            .inference_execution_identity(),
-                        geometry,
-                        config,
-                    )
-                    .map_err(eredu_core::BackendFailure::from_error)
-            })
-            .transpose()?;
-        Ok(MlxTextPreparation {
-            request,
-            chunk: policy.prefill_chunk_positions,
-            quote: None,
-        })
+        #[cfg(test)]
+        text_quote::record_tracking_admission(&preparation);
+        Ok(preparation)
     }
 
     fn admit_text_preparation_with_options<C: eredu_core::TokenFilterController>(
@@ -3397,7 +3403,8 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     ) -> Result<Self::TextPreparation, BackendFailure> {
         if options.interventions.is_some() {
             return Err(eredu_core::BackendFailure::from_error(
-                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound));
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            ));
         }
         let Some(source) = &options.capture else {
             return Self::admit_text_preparation(runtime, input, config, controller);
@@ -3406,7 +3413,11 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         // and cumulative H before the shared driver prepares prompt or sampler.
         #[cfg(test)]
         if let Some(result) = text_quote::opening_rows_fixture::admit_if_selected(
-            runtime, input, config, controller, source,
+            runtime,
+            input,
+            config.clone(),
+            controller,
+            source,
         ) {
             let (request, quote) = result?;
             let chunk =
@@ -3542,6 +3553,10 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     ) -> Result<(), BackendFailure> {
         text_capture::install(runtime, state, preparation, source, context)?;
         #[cfg(test)]
+        if let Some(cause) = TEST_INSTRUMENTATION_FAILURE.with(|slot| slot.borrow_mut().take()) {
+            return Err(BackendFailure::from_error(cause));
+        }
+        #[cfg(test)]
         text_quote::record_sequence_installation(runtime, state, preparation, source);
         Ok(())
     }
@@ -3575,12 +3590,15 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         request
             .request()
             .memory_reservation()
-            .ok_or_else(|| R::IdentityMismatch.into_backend_failure())?
-            .validate_domain(backend.memory_pool())
+            .validate_ledger(backend.memory_ledger())
             .map_err(|_| R::IdentityMismatch.into_backend_failure())?;
         quote
             .validate_original_prompt_preflight(backend, request)
             .map_err(R::into_backend_failure)?;
+        #[cfg(test)]
+        if let Some(error) = TEST_PROMPT_FAILURE.with(|slot| slot.borrow_mut().take()) {
+            return Err(BackendFailure::from_error(error));
+        }
         let input = quote
             .original_token_input()
             .ok_or_else(|| R::Unavailable.into_backend_failure())?;
@@ -3623,18 +3641,13 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             quote
                 .request()
                 .memory_reservation()
-                .ok_or_else(|| {
-                    Error::Other(Box::new(
-                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-                    ))
-                })?
-                .validate_domain(backend.memory_pool())
+                .validate_ledger(backend.memory_ledger())
                 .map_err(|error| Error::Other(Box::new(error)))?;
         }
         match &preparation.request {
             Some(preparation) => {
                 let mut prompt = if let Some(scopes) =
-                    quote.as_ref().and_then(|q| q.preparation_scopes.as_ref())
+                    quote.as_ref().and_then(|q| q.native_preparation_scopes())
                 {
                     scopes.prompt(
                         quote.as_ref().expect("joined original quote"),
@@ -3657,18 +3670,13 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                         },
                         || {
                             let request = preparation.request();
-                            if request.memory_reservation().is_some() {
-                                prepare_text_prompt(
-                                    backend,
-                                    ids,
-                                    None,
-                                    Some(request),
-                                    funding.as_deref(),
-                                )
-                            } else {
-                                Self::prepare_text_prompt(backend, ids)
-                                    .map(|prompt| prompt.with_inference_request(request.clone()))
-                            }
+                            prepare_text_prompt(
+                                backend,
+                                ids,
+                                None,
+                                Some(request),
+                                funding.as_deref(),
+                            )
                         },
                     )?;
                     stage
@@ -3729,105 +3737,62 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         preparation: &Self::TextPreparation,
     ) -> Result<Self::TextGenerationState, Error> {
         validate_preparation_funding(preparation)?;
-        #[cfg(test)]
-        let original_preparation = preparation;
-        let quote = preparation.quote.clone();
-        if let Some(quote) = &quote {
-            if quote.config() != config {
-                return Err(Error::Other(Box::new(
-                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-                )));
-            }
-            quote
-                .request()
-                .memory_reservation()
-                .ok_or_else(|| {
-                    Error::Other(Box::new(
-                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-                    ))
-                })?
-                .validate_domain(backend.memory_pool())
-                .map_err(|error| Error::Other(Box::new(error)))?;
+        let quote = preparation
+            .quote
+            .as_ref()
+            .expect("validated complete preparation");
+        let request = preparation
+            .request
+            .as_ref()
+            .expect("validated complete preparation");
+        if quote.config() != config {
+            return Err(Error::Other(Box::new(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            )));
         }
-        match &preparation.request {
-            Some(preparation) => {
-                let mut state = if let Some(scopes) =
-                    quote.as_ref().and_then(|q| q.preparation_scopes.as_ref())
-                {
-                    scopes.sampling(
-                        quote.as_ref().expect("joined original quote"),
+        quote
+            .request()
+            .memory_reservation()
+            .validate_ledger(backend.memory_ledger())
+            .map_err(|cause| Error::Other(Box::new(cause)))?;
+        let mut state = if let Some(scopes) = quote.native_preparation_scopes() {
+            scopes.sampling(quote, config, request)?
+        } else {
+            let stage = request
+                .claim_sampling(config.clone())
+                .map_err(|cause| Error::Other(Box::new(cause)))?;
+            let (sampler, completion) = stage
+                .construct_sampler(quote.sampler_scope()?)
+                .map_err(|cause| Error::Other(Box::new(cause)))?;
+            let funding = quote.preparation_work()?;
+            let mut state = super::recovery::detached_retained(
+                TextPreparationRetention {
+                    _request: request.request().clone(),
+                    funding: Some(funding.clone()),
+                },
+                || {
+                    let state = start_text_generation_with_sampler(
                         config,
-                        preparation,
-                    )?
-                } else {
-                    let stage = preparation
-                        .claim_sampling(config)
-                        .map_err(|error| Error::Other(Box::new(error)))?;
-                    let (sampler, stage) = match &quote {
-                        Some(quote) => {
-                            // Host history custody is independent of the native
-                            // PRNG construction/recovery scope below. Consume the
-                            // one-time stage before creating the sampler owner.
-                            let (sampler, completion) = stage
-                                .construct_sampler(quote.sampler_scope()?)
-                                .map_err(|error| Error::Other(Box::new(error)))?;
-                            (
-                                Some(super::generation::MlxOrdinarySampler::Funded(sampler)),
-                                SamplingConstructionFinish::Funded(completion),
-                            )
-                        }
-                        None => (None, SamplingConstructionFinish::Legacy(stage)),
-                    };
-                    let funding = quote
-                        .as_ref()
-                        .map(|quote| quote.preparation_work())
-                        .transpose()?;
-                    let mut state = super::recovery::detached_retained(
-                        TextPreparationRetention {
-                            _request: preparation.request().clone(),
-                            funding: funding.clone(),
-                        },
-                        || {
-                            if preparation.request().memory_reservation().is_some() {
-                                let state = start_text_generation_with_sampler(config, sampler)?;
-                                if let (Some(funding), Some(random)) =
-                                    (&funding, &state.sampling.prng)
-                                {
-                                    funding.retain(random.as_array());
-                                }
-                                Ok(state)
-                            } else {
-                                Self::start_text_generation(backend, config)
-                            }
-                        },
+                        Some(super::generation::MlxOrdinarySampler::Funded(sampler)),
                     )?;
-                    state
-                        .sampling
-                        .inference_retention
-                        .retain(preparation.request());
-                    stage
-                        .finish()
-                        .map_err(|error| Error::Other(Box::new(error)))?;
-                    state
-                };
-                // Keep funding with preparation through every fallible stage.
-                // Core owns prompt/controller retirement if setup rejects.
-                state.funding = quote
-                    .as_ref()
-                    .map(|quote| quote.take_funding_run())
-                    .transpose()?;
-                // A pending branch already belongs to the immutable parameter
-                // version authenticated during quotation. Bind it before the
-                // first prediction so pending snapshots and their copies keep
-                // the same strict version check as completed branches.
-                state.sampling.parameter_epoch = quote.as_ref().map(|quote| quote.parameter_epoch());
-                state.sampling.quote = quote;
-                #[cfg(test)]
-                let state = text_quote::intercept_sequence_sampling(original_preparation, state)?;
-                Ok(state)
-            }
-            None => Self::start_text_generation(backend, config),
-        }
+                    if let Some(random) = &state.sampling.prng {
+                        funding.retain(random.as_array());
+                    }
+                    Ok(state)
+                },
+            )?;
+            state.sampling.inference_retention.retain(request.request());
+            completion
+                .finish()
+                .map_err(|cause| Error::Other(Box::new(cause)))?;
+            state
+        };
+        state.funding = Some(quote.take_funding_run()?);
+        state.sampling.parameter_epoch = Some(quote.parameter_epoch());
+        state.sampling.quote = Some(quote.clone());
+        #[cfg(test)]
+        let state = text_quote::intercept_sequence_sampling(preparation, state)?;
+        Ok(state)
     }
     fn requires_original_preparation_control(runtime: &ModelRuntime<Self>) -> bool {
         runtime.session().payload.distributed.is_some()
@@ -3873,15 +3838,29 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         session
             .validate_backend(backend)
             .map_err(|error| BackendFailure::new(BackendFailureKind::InvalidSession, error))?;
-        claim.validate_session(session).map_err(BackendFailure::from_error)?;
+        claim
+            .validate_session(session)
+            .map_err(BackendFailure::from_error)?;
         let quoted = session.payload._memory_owner.is_none()
-            && session.payload.operation_memory.borrow().owners().is_empty()
+            && session
+                .payload
+                .operation_memory
+                .borrow()
+                .owners()
+                .is_empty()
             && session.payload.state_memory.owners().is_empty();
-        if quoted && session.payload.model.erased().resident_reset_profile().is_some() {
-            session.publish_prepared_resident_reset(backend.memory_pool(), claim)
+        if quoted
+            && session
+                .payload
+                .model
+                .erased()
+                .resident_reset_profile()
+                .is_some()
+        {
+            session.publish_prepared_resident_reset(backend.memory_ledger(), claim)
         } else {
             session
-                .reset_in(Some(backend.memory_pool()))
+                .reset_in(Some(backend.memory_ledger()))
                 .map_err(|error| session.lifecycle_failure(error))
         }
     }
@@ -4028,8 +4007,14 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         Ok(())
     }
 
-    fn prepared_artifact_identity(runtime: &ModelRuntime<Self>) -> Option<eredu_core::artifact::ArtifactIdentity> {
-        runtime.session().capture_discovery.as_ref()?.resolved_artifact_identity()
+    fn prepared_artifact_identity(
+        runtime: &ModelRuntime<Self>,
+    ) -> Option<eredu_core::artifact::ArtifactIdentity> {
+        runtime
+            .session()
+            .capture_discovery
+            .as_ref()?
+            .resolved_artifact_identity()
     }
 
     fn capture_discovery(
@@ -4048,15 +4033,6 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 )
             })?
             .capture()
-    }
-
-    fn configure_text_prepared_capture(
-        runtime: &ModelRuntime<Self>,
-        state: &mut Self::TextGenerationState,
-        prompt: &Self::Prompt,
-        source: eredu_core::capture::SharedCapturePlan,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        prepared_control::install_capture(runtime, state, prompt, source)
     }
 
     fn configure_text_capture(
@@ -4115,9 +4091,10 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 .take_shared_step()
                 .map_err(|error| Error::Other(Box::new(error)));
         }
-        Ok(state.capture.as_mut().and_then(|capture| {
-            capture.take_shared_step()
-        }))
+        Ok(state
+            .capture
+            .as_mut()
+            .and_then(|capture| capture.take_shared_step()))
     }
 
     fn text_capture_pending(state: &Self::TextGenerationState) -> bool {
@@ -4135,7 +4112,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         backend: &Self,
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Error> {
-        let memory = NativeMemoryOwner::acquire(backend.memory_pool())?;
+        let memory = NativeMemoryOwner::acquire(backend.memory_ledger())?;
         super::recovery::detached_retained(memory.clone(), || {
             let mut state = start_text_generation(config)?;
             state.sampling.memory_retention = NativeMemoryRetention::from_owner(&memory);
@@ -4147,7 +4124,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         backend: &Self,
         prompt_token_ids: Vec<u32>,
     ) -> Result<Self::Prompt, Error> {
-        let memory = NativeMemoryOwner::acquire(backend.memory_pool())?;
+        let memory = NativeMemoryOwner::acquire(backend.memory_ledger())?;
         super::recovery::detached_retained(memory.clone(), || {
             prepare_text_prompt(backend, prompt_token_ids, Some(memory), None, None)
         })
@@ -4224,6 +4201,50 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
 #[cfg(test)]
 std::thread_local! {
     static TEST_SAMPLING_FAILURE: std::cell::RefCell<Option<Error>> = const { std::cell::RefCell::new(None) };
+    static TEST_PROMPT_FAILURE: std::cell::RefCell<Option<Error>> = const { std::cell::RefCell::new(None) };
+    static TEST_INSTRUMENTATION_FAILURE: std::cell::RefCell<Option<eredu_core::capture::CaptureError>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct TestInstrumentationFailure;
+#[cfg(test)]
+impl Drop for TestInstrumentationFailure {
+    fn drop(&mut self) {
+        TEST_INSTRUMENTATION_FAILURE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+#[cfg(test)]
+impl MlxBackend<'_> {
+    pub(crate) fn fail_next_instrumentation_for_test(
+        error: eredu_core::capture::CaptureError,
+    ) -> TestInstrumentationFailure {
+        TEST_INSTRUMENTATION_FAILURE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(error);
+        });
+        TestInstrumentationFailure
+    }
+}
+#[cfg(test)]
+pub(crate) struct TestPromptFailure;
+#[cfg(test)]
+impl Drop for TestPromptFailure {
+    fn drop(&mut self) {
+        TEST_PROMPT_FAILURE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+#[cfg(test)]
+impl MlxBackend<'_> {
+    pub(crate) fn fail_next_prompt_for_test(error: Error) -> TestPromptFailure {
+        TEST_PROMPT_FAILURE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(error);
+        });
+        TestPromptFailure
+    }
 }
 #[cfg(test)]
 pub(crate) struct TestSamplingFailure;
@@ -4324,20 +4345,6 @@ pub(super) fn model_submission(
 /// Allocation worker shared by admitted and independently guarded preparation.
 fn start_text_generation(config: TextGenerationConfig) -> Result<MlxTextGenerationState, Error> {
     start_text_generation_with_sampler(config, None)
-}
-
-enum SamplingConstructionFinish {
-    Legacy(eredu_runtime::working_memory::InferencePreparationStage),
-    Funded(eredu_runtime::working_memory::InferenceSamplerCompletion),
-}
-
-impl SamplingConstructionFinish {
-    fn finish(self) -> Result<(), eredu_runtime::working_memory::WorkingMemoryError> {
-        match self {
-            Self::Legacy(stage) => stage.finish(),
-            Self::Funded(stage) => stage.finish(),
-        }
-    }
 }
 
 fn start_text_generation_with_sampler(
@@ -4444,17 +4451,19 @@ fn prepare_text_prompt_slice(
         memory.retain_array(&tokens)?;
     }
     if let Some(reservation) = request
-        .and_then(|request| request.memory_reservation())
+        .map(|request| request.memory_reservation())
         .filter(|_| funding.is_none())
     {
         // Request authority contains no native roots. Escaped prompt backing
         // retains the charge even before the separate prompt-bind stage.
-        tokens
-            .retain_allocation_owner(reservation.clone())
-            .map_err(|failure| {
-                let (error, _unattached) = failure.into_parts();
-                Error::from(error)
-            })?;
+        reservation
+            .validate_ledger(_backend.memory_ledger())
+            .map_err(Error::PrefillControl)?;
+        crate::backend::managed_memory::OrdinaryArrayAttachment::prepare(
+            _backend.memory_ledger(),
+            0,
+        )?
+        .attach(&tokens, reservation.clone())?;
     }
     let part = input::input_part(
         InputModality::Text,
@@ -4471,12 +4480,12 @@ fn prepare_text_prompt_slice(
         funding.retain_metadata(eredu_runtime::SharedHostMetadata::Input(identity.clone()));
     } else if let Some(memory) = &memory {
         memory.retain_metadata(&eredu_runtime::SharedHostMetadata::Input(identity.clone()))?;
-    } else if let Some(reservation) = request.and_then(|request| request.memory_reservation()) {
+    } else if let Some(reservation) = request.map(|request| request.memory_reservation()) {
         // Legacy whole-request reservations remain authoritative independently
         // of native input aliases. Use a separate namespace from exact physical
         // source registration: the two kinds of custody are not interchangeable.
         identity
-            .try_attach(&eredu_core::SharedStorageDomain::default(), || {
+            .try_attach(&eredu_core::SharedStorageAccountingId::default(), || {
                 Ok::<Box<dyn Send + Sync>, std::convert::Infallible>(Box::new(reservation.clone()))
             })
             .map_err(|error| Error::Other(Box::new(error)))?;
@@ -4486,7 +4495,6 @@ fn prepare_text_prompt_slice(
     let mut prompt = MlxModelInput {
         parts: pending_prompt::ModelInputParts::Owned(vec![part]),
         controlled_attribution: None,
-        prepared_capture: None,
         original_media: None,
         placement_semantics: None,
         cache_identity: Some(identity),
@@ -4528,30 +4536,57 @@ fn text_prompt_input_control_bytes() -> Option<usize> {
 
 impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
     fn compile_original_capture_declaration(
-        runtime: &ModelRuntime<Self>, plan: &eredu_core::capture::CapturePlan,
-        request: eredu_core::capture::CaptureRequestShape, funding: &eredu_core::HostMetadataFunding,
-    ) -> Result<eredu_runtime::working_memory::OriginalCaptureSource, eredu_runtime::working_memory::OriginalCaptureSourceError> {
-        use eredu_runtime::working_memory::{OriginalCaptureSourceError as Failure, WorkingMemoryError};
+        runtime: &ModelRuntime<Self>,
+        plan: &eredu_core::capture::CapturePlan,
+        request: eredu_core::capture::CaptureRequestShape,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<
+        eredu_runtime::working_memory::OriginalCaptureSource,
+        eredu_runtime::working_memory::OriginalCaptureSourceError,
+    > {
+        use eredu_runtime::working_memory::{
+            OriginalCaptureSourceError as Failure, WorkingMemoryError,
+        };
         let controls = std::mem::size_of::<Result<(), Error>>()
-            .checked_add(eredu_core::BackendFailure::source_retention_peak_bytes::<Error>()
-                .ok_or_else(|| Failure::rejected(WorkingMemoryError::Overflow))?)
+            .checked_add(
+                eredu_core::BackendFailure::source_retention_peak_bytes::<Error>()
+                    .ok_or_else(|| Failure::rejected(WorkingMemoryError::Overflow))?,
+            )
             .ok_or_else(|| Failure::rejected(WorkingMemoryError::Overflow))?;
-        funding.reserve_metadata(controls).map_err(|error| Failure::backend(error.into_backend_failure(), funding))?;
+        funding
+            .reserve_metadata(controls)
+            .map_err(|error| Failure::backend(error.into_backend_failure(), funding))?;
         let fail = |error: Error| Failure::backend(error.into_backend_failure(), funding);
         let session = runtime.session();
         session.validate_backend(runtime.backend()).map_err(fail)?;
-        let opening = session.payload.model.erased().retained_inference_authority().map_err(fail)?;
+        let opening = session
+            .payload
+            .model
+            .erased()
+            .retained_inference_authority()
+            .map_err(fail)?;
         let origin = eredu_core::capture::CaptureTextOrigin {
-            cached_positions: opening.admission().map_or(0, |admission| admission.position()),
+            cached_positions: text_quote::actual_frontier(
+                session.payload.model.erased(),
+                &opening,
+                funding,
+            )
+            .map_err(fail)?,
         };
         let partition = session.original_partition_capture(funding).map_err(fail)?;
         let (catalog, support) = if let Some(partition) = &partition {
             (&partition.discovery.catalog, &partition.discovery.support)
         } else {
-            session.capture_discovery.as_ref()
-                .ok_or_else(|| Failure::rejected(WorkingMemoryError::UnknownBound))?.capture_parts()
+            session
+                .capture_discovery
+                .as_ref()
+                .ok_or_else(|| Failure::rejected(WorkingMemoryError::UnknownBound))?
+                .capture_parts()
         };
-        runtime.backend().memory_pool().compile_capture_declaration(plan, catalog, support, request, origin, funding)
+        runtime
+            .backend()
+            .memory_ledger()
+            .compile_capture_declaration(plan, catalog, support, request, origin, funding)
     }
 
     fn compile_original_intervention_declaration(
@@ -4560,12 +4595,24 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
         capture: &eredu_core::capture::SharedCapturePlan,
         session_id: &str,
         funding: &eredu_core::HostMetadataFunding,
-    ) -> Result<eredu_runtime::working_memory::OriginalInterventionSource, eredu_core::BackendFailure> {
-        runtime.session().validate_backend(runtime.backend()).map_err(Error::into_backend_failure)?;
-        let declaration = runtime.session().original_intervention_declaration(funding)
+    ) -> Result<eredu_runtime::working_memory::OriginalInterventionSource, eredu_core::BackendFailure>
+    {
+        runtime
+            .session()
+            .validate_backend(runtime.backend())
+            .map_err(Error::into_backend_failure)?;
+        let declaration = runtime
+            .session()
+            .original_intervention_declaration(funding)
             .map_err(Error::into_backend_failure)?
             .ok_or_else(|| eredu_core::TokenInputRejection::Unsupported.into_backend_failure())?;
-        declaration.compile_source(plan, capture.admission(), session_id, runtime.backend().memory_pool())
+        declaration
+            .compile_source(
+                plan,
+                capture.admission(),
+                session_id,
+                runtime.backend().memory_ledger(),
+            )
             .map_err(Error::into_backend_failure)
     }
 
@@ -4586,7 +4633,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
             })?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_forbidden_source(plan)
     }
 
@@ -4608,7 +4655,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
             })?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_forbidden_tokenizer_source(tokenizer, trigger)
     }
 
@@ -4616,7 +4663,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
         runtime: &ModelRuntime<Self>,
         template: &eredu_runtime::working_memory::OriginalChatTemplate,
         tokenizer: &eredu_runtime::working_memory::OriginalTokenizer,
-        capacity: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<
         eredu_runtime::working_memory::OriginalChatProfilePreparation,
         eredu_runtime::working_memory::OriginalChatProfileError,
@@ -4631,7 +4678,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
                 .model
                 .erased()
                 .inference_execution_identity(),
-            capacity,
+            limits.resolve(runtime.backend().memory_ledger().topology())?,
         )
     }
 
@@ -4644,7 +4691,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
             .session()
             .validate_backend(runtime.backend())
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)?;
-        let pool = runtime.backend().memory_pool();
+        let pool = runtime.backend().memory_ledger();
         template
             .validate_pool(pool)
             .and_then(|()| tokenizer.validate_pool(pool))
@@ -4659,7 +4706,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
             .validate_backend(runtime.backend())
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)?;
         render
-            .validate_pool(runtime.backend().memory_pool())
+            .validate_pool(runtime.backend().memory_ledger())
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)
     }
     fn compile_original_chat_template(
@@ -4675,7 +4722,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_chat_template(plan)
             .map_err(Into::into)
     }
@@ -4694,7 +4741,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
             .map_err(|_| eredu_core::TokenInputRejection::IdentityMismatch)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .compile_chat_template_file(read, model_id, has_tools)
             .map_err(Into::into)
     }
@@ -4710,7 +4757,7 @@ impl eredu_runtime::working_memory::OriginalChatBackend for MlxBackend<'_> {
         <Self as eredu_runtime::working_memory::OriginalChatBackend>::validate_original_chat_sources(runtime,template,tokenizer)?;
         runtime
             .backend()
-            .memory_pool()
+            .memory_ledger()
             .render_original_chat(template, tokenizer, context)
             .map_err(Into::into)
     }

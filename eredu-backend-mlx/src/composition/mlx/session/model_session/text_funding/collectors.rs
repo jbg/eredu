@@ -19,23 +19,29 @@ impl FundedWork {
         Some(self._controls.as_ref()?.metadata_custody())
     }
     pub(super) fn prepare_collectors(&self) -> Result<(), Error> {
-        let Some(bank) = &self.native_storage else {
-            return Ok(());
-        };
+        if self.native_storage.is_none() && self.ordinary.borrow().is_none() {
+            return Err(Error::OriginalSourceContract {
+                stage: "prepared work publication collectors",
+                cause: WorkingMemoryError::UnknownBound,
+            });
+        }
         if self.collectors_prepared.replace(true) {
             return Err(Error::PrefillControl(WorkingMemoryError::AlreadyStarted));
         }
         if !qualified() {
-            return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
+            return Err(Error::OriginalSourceContract {
+                stage: "publication borrowed-owner allocation layout",
+                cause: WorkingMemoryError::UnknownBound,
+            });
         }
-        let rows = {
+        let rows = if let Some(bank) = &self.native_storage {
             bank.try_borrow()
                 .map_err(|_| Error::PrefillScopeReentrant)?
                 .collector_rows()
+        } else {
+            self.ordinary.borrow().as_ref().expect("ordinary plan").0
         };
-        let custody = self
-            .original_metadata_custody()
-            .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
+        let custody = self.original_metadata_custody();
         // Prepare final destinations before any original native worker. A failed
         // prefix remains inside this Work until its original scope is cancelled.
         reserve(&mut self.roots.borrow_mut(), rows)?;
@@ -55,7 +61,18 @@ impl FundedWork {
             self.root_clones.borrow_mut().push(clone);
         }
         for _ in 0..2 {
-            let inventory = RetainedStorage::prepare_original(rows, custody.clone())?;
+            let inventory = if let Some(custody) = &custody {
+                RetainedStorage::prepare_original(rows, custody.clone())?
+            } else {
+                let ordinary = self.ordinary.borrow();
+                let (_, host) = ordinary.as_ref().expect("ordinary plan");
+                let scope = self.scope.borrow();
+                RetainedStorage::prepare_ordinary(
+                    rows,
+                    scope.as_ref().expect("active scope").pool(),
+                    host,
+                )?
+            };
             self.inventories.borrow_mut().push(inventory);
         }
         Ok(())
@@ -65,8 +82,14 @@ impl FundedWork {
     pub(in crate::composition::mlx::session::model_session) fn prepare_inventory(
         &self,
     ) -> Result<RetainedStorage, Error> {
-        if self.native_storage.is_none() && self.snapshot.is_none() {
-            return Ok(RetainedStorage::default());
+        if self.native_storage.is_none()
+            && self.snapshot.is_none()
+            && self.ordinary.borrow().is_none()
+        {
+            return Err(Error::OriginalSourceContract {
+                stage: "prepared work publication inventory",
+                cause: WorkingMemoryError::UnknownBound,
+            });
         }
         if let Some(cause) = self.take_collection_failure() {
             return Err(cause);
@@ -77,11 +100,13 @@ impl FundedWork {
         let inventory = inventories.pop();
         drop(inventories);
         inventory.ok_or_else(|| {
-            self.fail_collection(Error::PrefillControl(WorkingMemoryError::CollectorCapacity {
-                kind: CollectorCapacityKind::WorkInventories,
-                used,
-                capacity,
-            }))
+            self.fail_collection(Error::PrefillControl(
+                WorkingMemoryError::CollectorCapacity {
+                    kind: CollectorCapacityKind::WorkInventories,
+                    used,
+                    capacity,
+                },
+            ))
         })
     }
 }
@@ -128,6 +153,9 @@ fn work_bytes(rows: usize) -> Option<usize> {
     fixed
         .into_iter()
         .try_fold(std::mem::size_of_val(&fixed), usize::checked_add)
+}
+pub(super) fn work_control_bytes(rows: usize) -> Option<u64> {
+    u64::try_from(work_bytes(rows)?).ok()
 }
 
 pub(super) fn control_bytes(

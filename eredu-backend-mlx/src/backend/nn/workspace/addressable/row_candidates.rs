@@ -1,8 +1,8 @@
 //! Finite receive-row classes for the existing indexed and grouped workers.
-use eredu_nn::Error;
 use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceExpertKernel, WorkspaceMetadataAllocation, WorkspaceMetadataError,
 };
+use eredu_nn::Error;
 use std::mem::{size_of, size_of_val};
 
 #[derive(Clone, Copy)]

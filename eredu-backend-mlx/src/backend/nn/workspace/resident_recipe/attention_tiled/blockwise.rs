@@ -19,7 +19,7 @@ fn common(g: Geometry<'_>) -> Option<Plan> {
         plan.views(6)?;
     }
     plan.views(2)?; // F32 K/V casts
-    // QK product, swapped key, output/F32/scale/output rounding.
+                    // QK product, swapped key, output/F32/scale/output rounding.
     plan.append(Lowering::product(8, 9, 0, 1), 0)?;
     plan.views(if g.arithmetic == AttentionArithmetic::InputScores {
         4
@@ -165,7 +165,12 @@ fn block_controls() -> Option<usize> {
         size_of::<Result<(), safemlx::error::Exception>>(),
         // Completed-recurrence wrapper surrounds the unchanged exact native
         // settlement worker; both argument/result frames coexist.
-        size_of::<(&mut BlockwiseAttentionAccumulator, &KeyValueAttentionBlock, Option<&Array>, &safemlx::Stream)>(),
+        size_of::<(
+            &mut BlockwiseAttentionAccumulator,
+            &KeyValueAttentionBlock,
+            Option<&Array>,
+            &safemlx::Stream,
+        )>(),
         size_of::<Result<(), safemlx::error::Exception>>(),
         size_of::<bool>(),
         size_of::<Option<safemlx::OriginalScopeObserver>>(),

@@ -40,7 +40,7 @@ impl Deref for ModelInputParts {
 /// Fixed pregrant constructor causes; ordinary callers wrap these only after
 /// their own admission boundary. Native/source layout facts remain borrowed.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum PendingPromptPreparationCause {
+pub(in crate::composition::mlx::session) enum PendingPromptPreparationCause {
     #[error(transparent)]
     Source(#[from] PendingTokenSourceCause),
     #[error(transparent)]
@@ -214,7 +214,6 @@ impl<'a> PreparedPendingPrompt<'a> {
         Ok((
             MlxModelInput {
                 controlled_attribution: None,
-                prepared_capture: None,
                 original_media: None,
                 placement_semantics: None,
                 parts: ModelInputParts::Pending(parts),

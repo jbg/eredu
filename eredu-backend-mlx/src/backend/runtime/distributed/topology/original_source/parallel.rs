@@ -1,13 +1,15 @@
 //! Explicit one-use model collectives, lent through the existing Group context.
 use super::*;
-mod boundary;
 mod borrowed;
-mod logical;
+mod boundary;
 mod expert_region;
-pub(crate) use expert_region::{RetainedExpertRegion,RetainedExpertTransfer,RetainedExpertCount,RetainedExpertVote};
-pub(crate) use logical::RetainedLogicalCollective;
-pub(crate) use boundary::{OriginalBoundaryCall,RetainedPipelineBoundary};
+mod logical;
+pub(crate) use boundary::{OriginalBoundaryCall, RetainedPipelineBoundary};
 use eredu_nn::workspace::{WorkspaceCollective, WorkspaceOperation, WorkspaceOperationKind};
+pub(crate) use expert_region::{
+    RetainedExpertCount, RetainedExpertRegion, RetainedExpertTransfer, RetainedExpertVote,
+};
+pub(crate) use logical::RetainedLogicalCollective;
 use safemlx::{
     Array, OriginalScopeObserver, Stream, StreamCopyPlan, distributed::OwnedGroupCpuLayoutStorage,
 };
@@ -30,15 +32,33 @@ pub(crate) enum ParallelInvocationCause {
     #[error("parallel invocation did not consume every quoted collective occurrence")]
     Incomplete,
 }
-enum InvocationOperation { Broadcast{group:CollectiveGroupId,root:usize}, Sum, Gather{axis:usize,widths:Vec<usize>} }
-#[derive(Clone,Copy)]
-enum InvocationOperationView<'a> { Sum, Gather{axis:usize,widths:&'a [usize]} }
+enum InvocationOperation {
+    Broadcast {
+        group: CollectiveGroupId,
+        root: usize,
+    },
+    Sum,
+    Gather {
+        axis: usize,
+        widths: Vec<usize>,
+    },
+}
+#[derive(Clone, Copy)]
+enum InvocationOperationView<'a> {
+    Sum,
+    Gather { axis: usize, widths: &'a [usize] },
+}
 impl InvocationOperation {
-    fn matches(&self,actual:InvocationOperationView<'_>)->bool { match(self,actual) {
-        (Self::Sum,InvocationOperationView::Sum)=>true,
-        (Self::Gather{axis,widths},InvocationOperationView::Gather{axis:a,widths:w})=>*axis==a&&widths==w,
-        _=>false,
-    }}
+    fn matches(&self, actual: InvocationOperationView<'_>) -> bool {
+        match (self, actual) {
+            (Self::Sum, InvocationOperationView::Sum) => true,
+            (
+                Self::Gather { axis, widths },
+                InvocationOperationView::Gather { axis: a, widths: w },
+            ) => *axis == a && widths == w,
+            _ => false,
+        }
+    }
 }
 struct Occurrence {
     ordinal: usize,
@@ -48,10 +68,13 @@ struct Occurrence {
     backing: ParallelBacking,
 }
 struct BoundaryOccurrence {
-    ordinal:usize,
-    quote:RetainedPipelineBoundary,
+    ordinal: usize,
+    quote: RetainedPipelineBoundary,
 }
-struct ExpertOccurrence { ordinal: usize, quote: RetainedExpertRegion }
+struct ExpertOccurrence {
+    ordinal: usize,
+    quote: RetainedExpertRegion,
+}
 struct Bound {
     observer: OriginalScopeObserver,
     stream: StreamCopyPlan<()>,
@@ -71,16 +94,18 @@ struct State {
     expert_transport_pending: Cell<bool>,
     expert_count_taken: Cell<bool>,
     expert_count_complete: Cell<bool>,
-    expert_vote_next:Cell<usize>,
-    expert_vote_pending:Cell<bool>,
+    expert_vote_next: Cell<usize>,
+    expert_vote_pending: Cell<bool>,
     bound: OnceCell<Bound>,
     next: Cell<usize>,
     calling: Cell<bool>,
     closed: Cell<bool>,
-    forward_done:Cell<bool>,
-    publication_started:Cell<bool>,
-    model_roots:RefCell<Option<crate::backend::submission_recovery::prefill::TransientRootsProjection>>,
-    publication_roots:RefCell<Option<crate::backend::submission_recovery::prefill::TransientRootsProjection>>,
+    forward_done: Cell<bool>,
+    publication_started: Cell<bool>,
+    model_roots:
+        RefCell<Option<crate::backend::submission_recovery::prefill::TransientRootsProjection>>,
+    publication_roots:
+        RefCell<Option<crate::backend::submission_recovery::prefill::TransientRootsProjection>>,
     authority: PartitionCommunicationAuthority,
     source: RetainedCommunicationSource,
     funding: HostMetadataFunding,
@@ -184,22 +209,40 @@ impl OriginalParallelInvocation {
     /// Alias the same one-shot invocation for its actual enclosing Recovery.
     /// Counters, observer binding and source identity remain shared; this cannot
     /// create a second attempt or refund a consumed occurrence.
-    pub(crate) fn try_clone_for_retention(&self)->Result<Self,Error> {
-        reserve(&self.funding,&[
-            size_of::<Self>(),size_of::<Result<Self,Error>>(),size_of::<Option<Rc<State>>>(),
-            self.context.retention_copy_bytes().ok_or_else(overflow)?,
-            failure_control_bytes().ok_or_else(overflow)?,
-        ])?;
-        let context=self.context.try_copy_for_retention()
-            .map_err(|_|failure(Cause::Resource,&self.state().source,&self.funding))?;
-        Ok(Self{context,state:self.state.clone(),funding:self.funding.clone()})
+    pub(crate) fn try_clone_for_retention(&self) -> Result<Self, Error> {
+        reserve(
+            &self.funding,
+            &[
+                size_of::<Self>(),
+                size_of::<Result<Self, Error>>(),
+                size_of::<Option<Rc<State>>>(),
+                self.context.retention_copy_bytes().ok_or_else(overflow)?,
+                failure_control_bytes().ok_or_else(overflow)?,
+            ],
+        )?;
+        let context = self
+            .context
+            .try_copy_for_retention()
+            .map_err(|_| failure(Cause::Resource, &self.state().source, &self.funding))?;
+        Ok(Self {
+            context,
+            state: self.state.clone(),
+            funding: self.funding.clone(),
+        })
     }
-    pub(crate) fn prepare_lending<F,T>(&self)->Result<(),Error> {
-        reserve(&self.funding,&[size_of::<F>(),size_of::<T>(),size_of::<Result<T,Error>>(),
-            size_of::<Option<&Self>>(),size_of::<Option<(&Self,&OriginalScopeObserver)>>(),
-            OriginalScopeObserver::control_bytes().ok_or_else(overflow)?,
-            failure_control_bytes().ok_or_else(overflow)?,
-        ])
+    pub(crate) fn prepare_lending<F, T>(&self) -> Result<(), Error> {
+        reserve(
+            &self.funding,
+            &[
+                size_of::<F>(),
+                size_of::<T>(),
+                size_of::<Result<T, Error>>(),
+                size_of::<Option<&Self>>(),
+                size_of::<Option<(&Self, &OriginalScopeObserver)>>(),
+                OriginalScopeObserver::control_bytes().ok_or_else(overflow)?,
+                failure_control_bytes().ok_or_else(overflow)?,
+            ],
+        )
     }
     fn state(&self) -> &State {
         self.state.as_deref().expect("live invocation owner")
@@ -210,13 +253,11 @@ impl OriginalParallelInvocation {
         &self.context
     }
     /// Exact trace ordinal/source pairs for the common model recipe reducer.
-    pub(crate) fn occurrences(
-        &self,
-    ) -> impl Iterator<Item = (usize, &OwnedGroupCpuLayoutStorage)> {
+    pub(crate) fn occurrences(&self) -> impl Iterator<Item = (usize, &OwnedGroupCpuLayoutStorage)> {
         self.state()
             .occurrences
             .iter()
-            .filter_map(|row| row.native.as_ref().map(|native|(row.ordinal,native)))
+            .filter_map(|row| row.native.as_ref().map(|native| (row.ordinal, native)))
     }
     /// Lend this context only after the enclosing original role has been
     /// admitted. No native stream is created or selected by this binding.
@@ -226,7 +267,8 @@ impl OriginalParallelInvocation {
         stream: &Stream,
     ) -> Result<&Group, Error> {
         let state = self.state();
-        self.funding.reserve_metadata(Self::bind_control_bytes().ok_or_else(overflow)?)
+        self.funding
+            .reserve_metadata(Self::bind_control_bytes().ok_or_else(overflow)?)
             .map_err(Error::WorkspacePlanning)?;
         if state.bound.get().is_some()
             || state.closed.get()
@@ -260,121 +302,317 @@ impl OriginalParallelInvocation {
             .occurrences
             .iter()
             .find(|row| row.ordinal == ordinal)
-            .and_then(|row|row.native.as_ref().map(|native|(native,row.backing)))
+            .and_then(|row| row.native.as_ref().map(|native| (native, row.backing)))
     }
-    pub(crate) fn logical_occurrence(&self,ordinal:usize)->Option<&crate::backend::nn::workspace::LogicalCollectiveQuote>{
-        self.state().occurrences.iter().find(|row|row.ordinal==ordinal)?.logical.as_ref().map(RetainedLogicalCollective::value)
+    pub(crate) fn logical_occurrence(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::backend::nn::workspace::LogicalCollectiveQuote> {
+        self.state()
+            .occurrences
+            .iter()
+            .find(|row| row.ordinal == ordinal)?
+            .logical
+            .as_ref()
+            .map(RetainedLogicalCollective::value)
     }
-    pub(crate) fn boundary_occurrence(&self,ordinal:usize)
-        ->Option<&crate::backend::nn::workspace::PipelineBoundaryQuote>{
-        self.state().boundaries.iter().find(|row|row.ordinal==ordinal).map(|row|row.quote.value())
+    pub(crate) fn ordinary_collective_completion_controls(
+        &self,
+        ordinal: usize,
+    ) -> Option<crate::backend::nn::workspace::OrdinaryCallControls> {
+        use crate::backend::runtime::distributed::completion::MlxCommunicationCompletion;
+        let row = self
+            .state()
+            .occurrences
+            .iter()
+            .find(|row| row.ordinal == ordinal)?;
+        match &row.operation {
+            InvocationOperation::Sum => {
+                MlxCommunicationCompletion::ordinary_collective_completion_call_controls(
+                    &self.state().group,
+                    &[],
+                )
+            }
+            InvocationOperation::Gather { widths, .. } => {
+                MlxCommunicationCompletion::ordinary_collective_completion_call_controls(
+                    &self.state().group,
+                    &[widths.len()],
+                )
+            }
+            InvocationOperation::Broadcast { group, root } => {
+                let (selected, publication, selected_root) =
+                    self.state().quote_source.publication()?;
+                if *group != publication.group || *root != selected_root || row.native.is_none() {
+                    return None;
+                }
+                crate::backend::nn::shared::MlxNeuralBackend::ordinary_broadcast_call_controls(
+                    selected, *root,
+                )
+            }
+        }
+    }
+    pub(crate) fn boundary_occurrence(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::backend::nn::workspace::PipelineBoundaryQuote> {
+        self.state()
+            .boundaries
+            .iter()
+            .find(|row| row.ordinal == ordinal)
+            .map(|row| row.quote.value())
     }
     /// Invocation input settles before child entry. Five-source publications
     /// Initialized integer sources in this exact retained expert itinerary.
     /// Local routes, metadata columns, and movement indices are all born through
     /// the same source publisher; the optional empty Slice is a separate graph.
-    pub(crate) fn expert_input_source_facts(&self)
-        ->Result<(u64,usize),Error> {
-        let source=self.source();
-        reserve(source.funding(),&[size_of::<(&Self,u64,usize)>(),size_of::<[usize;3]>(),
-            size_of::<Result<(u64,usize),Error>>()])?;
-        let mut bytes=0u64;let mut attempts=0usize;
+    pub(crate) fn expert_input_source_facts(&self) -> Result<(u64, usize), Error> {
+        let source = self.source();
+        reserve(
+            source.funding(),
+            &[
+                size_of::<(&Self, u64, usize)>(),
+                size_of::<[usize; 3]>(),
+                size_of::<Result<(u64, usize), Error>>(),
+            ],
+        )?;
+        let mut bytes = 0u64;
+        let mut attempts = 0usize;
         for row in &self.state().expert_regions {
-            let (maximum_rows,count)=if let Some(local)=row.quote.local() {
-                let view=local.declaration.as_view();
-                let maximum_rows=local.maximum_rows.max(view.selected_rows().ok_or_else(overflow)?)
+            let (maximum_rows, count) = if let Some(local) = row.quote.local() {
+                let view = local.declaration.as_view();
+                let maximum_rows = local
+                    .maximum_rows
+                    .max(view.selected_rows().ok_or_else(overflow)?)
                     .max(view.source_rows);
-                let count=local.aggregate.as_ref().ok_or_else(||failure(Cause::Identity,
-                    &self.state().source,&self.funding))?.empty_slices;
-                (maximum_rows,count)
-            }else if let Some(inactive)=row.quote.inactive(){
-                (inactive.declaration.selected_rows.checked_mul(inactive.declaration.peers)
-                    .ok_or_else(overflow)?,inactive.aggregate.empty_slices)
-            }else{continue};
-            let facts=source.expert_input_source_facts(maximum_rows,count)?;
-            bytes=bytes.checked_add(facts.capacity_bytes()).ok_or_else(overflow)?;
-            attempts=attempts.checked_add(facts.maximum_attempts()).ok_or_else(overflow)?;
+                let count = local
+                    .aggregate
+                    .as_ref()
+                    .ok_or_else(|| failure(Cause::Identity, &self.state().source, &self.funding))?
+                    .empty_slices;
+                (maximum_rows, count)
+            } else if let Some(inactive) = row.quote.inactive() {
+                (
+                    inactive
+                        .declaration
+                        .selected_rows
+                        .checked_mul(inactive.declaration.peers)
+                        .ok_or_else(overflow)?,
+                    inactive.aggregate.empty_slices,
+                )
+            } else {
+                continue;
+            };
+            let facts = source.expert_input_source_facts(maximum_rows, count)?;
+            bytes = bytes
+                .checked_add(facts.capacity_bytes())
+                .ok_or_else(overflow)?;
+            attempts = attempts
+                .checked_add(facts.maximum_attempts())
+                .ok_or_else(overflow)?;
         }
-        Ok((bytes,attempts))
+        Ok((bytes, attempts))
     }
     /// stay in Work; their batch frontiers/controls stay in the numerical child.
-    pub(crate) fn expert_capture_population(&self)->Option<crate::backend::array_copy::CaptureNativePopulation>{
-        self.state().expert_regions.iter().filter_map(|row|row.quote.local())
-            .try_fold(Default::default(),|sum:crate::backend::array_copy::CaptureNativePopulation,quote|
-                sum.checked_add(quote.parent_capture_population()))
+    pub(crate) fn expert_capture_population(
+        &self,
+    ) -> Option<crate::backend::array_copy::CaptureNativePopulation> {
+        self.state()
+            .expert_regions
+            .iter()
+            .filter_map(|row| row.quote.local())
+            .try_fold(
+                Default::default(),
+                |sum: crate::backend::array_copy::CaptureNativePopulation, quote| {
+                    sum.checked_add(quote.parent_capture_population())
+                },
+            )
     }
-    pub(crate) fn expert_occurrence(&self,ordinal:usize)->Option<&crate::backend::nn::workspace::ExpertLocalQuote>{
-        self.state().expert_regions.iter().find(|row|row.ordinal==ordinal).and_then(|row|row.quote.local())
+    pub(crate) fn expert_occurrence(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::backend::nn::workspace::ExpertLocalQuote> {
+        self.state()
+            .expert_regions
+            .iter()
+            .find(|row| row.ordinal == ordinal)
+            .and_then(|row| row.quote.local())
     }
-    pub(crate) fn expert_aggregate(&self,ordinal:usize)->Option<&crate::backend::nn::workspace::ExpertRegionAggregate>{
-        self.state().expert_regions.iter().find(|row|row.ordinal==ordinal).and_then(|row|row.quote.aggregate())
+    pub(crate) fn expert_aggregate(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::backend::nn::workspace::ExpertRegionAggregate> {
+        self.state()
+            .expert_regions
+            .iter()
+            .find(|row| row.ordinal == ordinal)
+            .and_then(|row| row.quote.aggregate())
     }
-    pub(crate) fn expert_provider_wave_occurrence(&self,ordinal:usize)
-        ->Option<&crate::backend::nn::workspace::ExpertProviderWaveQuote>{
-        self.state().expert_regions.iter().find(|row|row.ordinal==ordinal).and_then(|row|row.quote.wave())
+    pub(crate) fn expert_provider_wave_occurrence(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::backend::nn::workspace::ExpertProviderWaveQuote> {
+        self.state()
+            .expert_regions
+            .iter()
+            .find(|row| row.ordinal == ordinal)
+            .and_then(|row| row.quote.wave())
     }
-    pub(crate) fn boundary_binding(&self)->Result<OriginalParallelBinding,Error>{
-        reserve(&self.funding,&[size_of::<OriginalParallelBinding>(),size_of::<Result<OriginalParallelBinding,Error>>(),
-            failure_control_bytes().ok_or_else(overflow)?])?;
-        self.context.original_parallel_binding().cloned()
-            .ok_or_else(||failure(Cause::Identity,&self.state().source,&self.funding))
+    pub(crate) fn expert_inactive_wave_occurrence(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::backend::nn::workspace::ExpertInactiveWaveQuote> {
+        self.state()
+            .expert_regions
+            .iter()
+            .find(|row| row.ordinal == ordinal)
+            .and_then(|row| row.quote.inactive())
+    }
+    pub(crate) fn boundary_binding(&self) -> Result<OriginalParallelBinding, Error> {
+        reserve(
+            &self.funding,
+            &[
+                size_of::<OriginalParallelBinding>(),
+                size_of::<Result<OriginalParallelBinding, Error>>(),
+                failure_control_bytes().ok_or_else(overflow)?,
+            ],
+        )?;
+        self.context
+            .original_parallel_binding()
+            .cloned()
+            .ok_or_else(|| failure(Cause::Identity, &self.state().source, &self.funding))
     }
 
     /// Stop new construction after successful consumption. This makes no
     /// completion claim and retains the observer/source for enclosing Recovery.
     pub(crate) fn finish_construction(&self) -> Result<(), Error> {
         let state = self.state();
-        self.funding.reserve_metadata(Self::finish_control_bytes().ok_or_else(overflow)?)
+        self.funding
+            .reserve_metadata(Self::finish_control_bytes().ok_or_else(overflow)?)
             .map_err(Error::WorkspacePlanning)?;
         if state.bound.get().is_none()
             || state.forward_done.get()
             || state.calling.get()
             || state.expert_active.get().is_some()
-            || state.next_expert.get()!=state.expert_regions.len()
-            || state.next_boundary.get()!=state.boundaries.len()
-            || state.next.get() != state.occurrences.iter().take_while(|row| !matches!(row.operation,InvocationOperation::Broadcast{..})).count()
+            || state.next_expert.get() != state.expert_regions.len()
+            || state.next_boundary.get() != state.boundaries.len()
+            || state.next.get()
+                != state
+                    .occurrences
+                    .iter()
+                    .take_while(|row| {
+                        !matches!(row.operation, InvocationOperation::Broadcast { .. })
+                    })
+                    .count()
         {
-            return Err(failure(Cause::Invocation(ParallelInvocationCause::Incomplete),&state.source,&state.funding));
+            return Err(failure(
+                Cause::Invocation(ParallelInvocationCause::Incomplete),
+                &state.source,
+                &state.funding,
+            ));
         }
         state.forward_done.set(true);
-        if state.next.get()==state.occurrences.len(){state.closed.set(true);}
+        if state.next.get() == state.occurrences.len() {
+            state.closed.set(true);
+        }
         Ok(())
     }
 }
 struct ControlSourceLoan(Option<Rc<State>>);
 impl Drop for ControlSourceLoan {
-    fn drop(&mut self){if let Some(state)=self.0.take(){drop(Rc::into_inner(state));}}
+    fn drop(&mut self) {
+        if let Some(state) = self.0.take() {
+            drop(Rc::into_inner(state));
+        }
+    }
 }
 impl OriginalParallelBinding {
-    pub(crate) fn validate_control_source(&self,context:&Group,source:&OriginalParallelSource)->Result<(),Error>{
-        reserve(&self.funding,&[size_of::<ControlSourceLoan>(),size_of::<Option<Rc<State>>>(),
-            size_of::<(&Self,&Group,&OriginalParallelSource)>(),size_of::<Result<(),Error>>(),
-            failure_control_bytes().ok_or_else(overflow)?])?;
-        let state=self.state.upgrade().ok_or_else(||failure(Cause::Invocation(ParallelInvocationCause::Closed),&self.source,&self.funding))?;
-        let loan=ControlSourceLoan(Some(state));
-        let state=loan.0.as_deref().expect("live model control source loan");
-        if state.closed.get() || state.bound.get().is_none() || state.calling.get()
+    pub(crate) fn control_source_validation_control_bytes() -> Option<usize> {
+        let frames = [
+            size_of::<ControlSourceLoan>(),
+            size_of::<Option<Rc<State>>>(),
+            size_of::<(&Self, &Group, &OriginalParallelSource)>(),
+            size_of::<(&Self, &Group, &OriginalParallelSource, &HostMetadataFunding)>(),
+            size_of::<Result<(), Error>>(),
+            size_of::<Result<(), Error>>(),
+            failure_control_bytes()?,
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
+    pub(crate) fn validate_control_source(
+        &self,
+        context: &Group,
+        source: &OriginalParallelSource,
+    ) -> Result<(), Error> {
+        self.validate_control_source_with_funding(context, source, &self.funding)
+    }
+    pub(crate) fn validate_control_source_with_funding(
+        &self,
+        context: &Group,
+        source: &OriginalParallelSource,
+        funding: &HostMetadataFunding,
+    ) -> Result<(), Error> {
+        funding.reserve_metadata(
+            Self::control_source_validation_control_bytes().ok_or_else(overflow)?,
+        )?;
+        let state = self.state.upgrade().ok_or_else(|| {
+            failure(
+                Cause::Invocation(ParallelInvocationCause::Closed),
+                &self.source,
+                funding,
+            )
+        })?;
+        let loan = ControlSourceLoan(Some(state));
+        let state = loan.0.as_deref().expect("live model control source loan");
+        if state.closed.get()
+            || state.bound.get().is_none()
+            || state.calling.get()
             || !state.quote_source.same_source(source)
             || !self.funding.same_account(source.funding())
-            || !context.native_group().shares_native_handle(state.group.native_group())
-            || !context.retained_source().is_some_and(|actual|actual.same_source(&state.source))
-            || state.authority.ensure_active().is_err() {
-            return Err(failure(Cause::Identity,&self.source,&self.funding));
+            || !context
+                .native_group()
+                .shares_native_handle(state.group.native_group())
+            || !context
+                .retained_source()
+                .is_some_and(|actual| actual.same_source(&state.source))
+            || state.authority.ensure_active().is_err()
+        {
+            return Err(failure(Cause::Identity, &self.source, funding));
         }
         Ok(())
     }
-    pub(crate) fn funding(&self)->&HostMetadataFunding {&self.funding}
-    pub(crate) fn error(&self,cause:Cause)->eredu_nn::Error {
-        match neural_failure_controls().and_then(|n|self.funding.reserve_metadata(n).ok()) {
-            Some(())=>neural_failure(cause,&self.source,&self.funding),
-            None=>self.fallback.clone(),
+    pub(crate) fn funding(&self) -> &HostMetadataFunding {
+        &self.funding
+    }
+    pub(crate) fn error(&self, cause: Cause) -> eredu_nn::Error {
+        match neural_failure_controls().and_then(|n| self.funding.reserve_metadata(n).ok()) {
+            Some(()) => neural_failure(cause, &self.source, &self.funding),
+            None => self.fallback.clone(),
         }
     }
-    pub(crate) fn sum(&self,context:&Group,input:&Array,stream:&Stream)->Result<Array,eredu_nn::Error> {
-        self.execute(context,input,stream,InvocationOperationView::Sum)
+    pub(crate) fn sum(
+        &self,
+        context: &Group,
+        input: &Array,
+        stream: &Stream,
+    ) -> Result<Array, eredu_nn::Error> {
+        self.execute(context, input, stream, InvocationOperationView::Sum)
     }
-    pub(crate) fn gather(&self,context:&Group,input:&Array,stream:&Stream,axis:usize,widths:&[usize])->Result<Array,eredu_nn::Error> {
-        self.execute(context,input,stream,InvocationOperationView::Gather{axis,widths})
+    pub(crate) fn gather(
+        &self,
+        context: &Group,
+        input: &Array,
+        stream: &Stream,
+        axis: usize,
+        widths: &[usize],
+    ) -> Result<Array, eredu_nn::Error> {
+        self.execute(
+            context,
+            input,
+            stream,
+            InvocationOperationView::Gather { axis, widths },
+        )
     }
     fn execute(
         &self,
@@ -399,8 +637,10 @@ impl OriginalParallelBinding {
                 &self.funding,
             ));
         };
-        let loan=ControlSourceLoan(Some(state));
-        loan.0.as_deref().expect("live parallel invocation")
+        let loan = ControlSourceLoan(Some(state));
+        loan.0
+            .as_deref()
+            .expect("live parallel invocation")
             .execute(context, input, stream, operation)
             .map_err(|cause| retain_neural(cause, &self.source, &self.funding))
     }
@@ -412,7 +652,13 @@ impl Drop for Calling<'_> {
     }
 }
 impl State {
-    fn execute(&self, context: &Group, input: &Array, stream: &Stream,operation:InvocationOperationView<'_>) -> Result<Array, Error> {
+    fn execute(
+        &self,
+        context: &Group,
+        input: &Array,
+        stream: &Stream,
+        operation: InvocationOperationView<'_>,
+    ) -> Result<Array, Error> {
         reserve(
             &self.funding,
             &[
@@ -421,7 +667,8 @@ impl State {
                 size_of::<Result<Array, Error>>(),
                 size_of::<Result<(), eredu_runtime::PartitionExecutionError>>(),
                 size_of::<Option<&Occurrence>>(),
-                size_of::<InvocationOperationView<'_>>(),size_of::<InvocationOperation>(),
+                size_of::<InvocationOperationView<'_>>(),
+                size_of::<InvocationOperation>(),
                 size_of::<usize>(),
                 size_of::<bool>(),
                 failure_control_bytes().ok_or_else(overflow)?,
@@ -448,7 +695,7 @@ impl State {
                 .source_comparison_control_bytes()
                 .ok_or_else(overflow)?],
         )?;
-        if context.is_logical()!=self.group.is_logical()
+        if context.is_logical() != self.group.is_logical()
             || !context
                 .native_group()
                 .shares_native_handle(self.group.native_group())
@@ -470,22 +717,38 @@ impl State {
             .get(index)
             .ok_or_else(|| fail(Cause::Invocation(ParallelInvocationCause::Exhausted)))?;
         if self.expert_active.get().is_some()
-            || self.expert_regions.get(self.next_expert.get()).is_some_and(|region| region.ordinal < row.ordinal)
-            || self.boundaries.get(self.next_boundary.get()).is_some_and(|boundary|boundary.ordinal<row.ordinal)
-            || !row.operation.matches(operation){return Err(fail(Cause::Identity));}
-        if let Some(quote)=&row.logical {
+            || self
+                .expert_regions
+                .get(self.next_expert.get())
+                .is_some_and(|region| region.ordinal < row.ordinal)
+            || self
+                .boundaries
+                .get(self.next_boundary.get())
+                .is_some_and(|boundary| boundary.ordinal < row.ordinal)
+            || !row.operation.matches(operation)
+        {
+            return Err(fail(Cause::Identity));
+        }
+        if let Some(quote) = &row.logical {
             // Spend the exact invocation occurrence before input completion or
             // any child role. Its source alias contains no State/Q backedge.
             self.next.set(index.checked_add(1).ok_or_else(overflow)?);
-            return self.execute_logical(context,input,stream,quote);
+            return self.execute_logical(context, input, stream, quote);
         }
-        if context.is_logical(){return Err(fail(Cause::Identity));}
-        let native=row.native.as_ref().ok_or_else(||fail(Cause::Identity))?;
+        if context.is_logical() {
+            return Err(fail(Cause::Identity));
+        }
+        let native = row.native.as_ref().ok_or_else(|| fail(Cause::Identity))?;
         reserve(
             &self.funding,
             &[
                 native.binding_control_bytes().ok_or_else(overflow)?,
-                size_of::<(&RetainedCommunicationSource,&HostMetadataFunding,usize,&Occurrence)>(),
+                size_of::<(
+                    &RetainedCommunicationSource,
+                    &HostMetadataFunding,
+                    usize,
+                    &Occurrence,
+                )>(),
                 size_of::<
                     Result<
                         safemlx::distributed::GroupCpuOperationStorage<'_>,
@@ -494,9 +757,13 @@ impl State {
                 >(),
             ],
         )?;
-        let actual = native
-            .bind_actual(input)
-            .map_err(|cause| fail(Cause::NativeBinding { index:Some(index),ordinal:Some(row.ordinal),cause }))?;
+        let actual = native.bind_actual(input).map_err(|cause| {
+            fail(Cause::NativeBinding {
+                index: Some(index),
+                ordinal: Some(row.ordinal),
+                cause,
+            })
+        })?;
         reserve(
             &self.funding,
             &[actual.control_bytes().ok_or_else(overflow)?],
@@ -507,14 +774,26 @@ impl State {
         let output = actual
             .construct_original(&bound.observer, self.quote_source.transport())
             .map_err(|cause| fail(Cause::Native(cause)))?;
-        let shape_matches=match operation {
-            InvocationOperationView::Sum=>output.shape()==input.shape(),
-            InvocationOperationView::Gather{widths,..}=>output.shape().len()==input.shape().len()
-                && output.shape().first().copied()==input.shape().first().copied()
-                    .and_then(|n|i32::try_from(widths.len()).ok().and_then(|peers|n.checked_mul(peers)))
-                && output.shape().iter().skip(1).eq(input.shape().iter().skip(1)),
+        let shape_matches = match operation {
+            InvocationOperationView::Sum => output.shape() == input.shape(),
+            InvocationOperationView::Gather { widths, .. } => {
+                output.shape().len() == input.shape().len()
+                    && output.shape().first().copied()
+                        == input.shape().first().copied().and_then(|n| {
+                            i32::try_from(widths.len())
+                                .ok()
+                                .and_then(|peers| n.checked_mul(peers))
+                        })
+                    && output
+                        .shape()
+                        .iter()
+                        .skip(1)
+                        .eq(input.shape().iter().skip(1))
+            }
         };
-        if !shape_matches || output.dtype() != input.dtype() {return Err(fail(Cause::Output));}
+        if !shape_matches || output.dtype() != input.dtype() {
+            return Err(fail(Cause::Output));
+        }
         Ok(output)
     }
 }

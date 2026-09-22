@@ -221,8 +221,10 @@ fn verify_edits(device: LocalDevice) {
                             limits,
                         )
                         .unwrap();
-                    for ((a, b), value) in
-                        before.iter().zip(edit.update.values()).zip(actual.values)
+                    for ((a, b), value) in before
+                        .iter()
+                        .zip(edit.update.values())
+                        .zip(actual.values.iter().copied())
                     {
                         assert_eq!(*a + *b, value);
                     }

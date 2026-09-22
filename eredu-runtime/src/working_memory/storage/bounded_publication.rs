@@ -1,9 +1,9 @@
 //! Fixed new-key publication through one original, already established C namespace.
 use super::*;
 use crate::working_memory::{
-    funding::{CapturePinIdentity, RawSpanHostOwner},
     CaptureSourceSegment, InferenceSpanWorkspacePlan, InferenceWorkspaceSpan,
     OriginalTextControlGuard,
+    funding::{CapturePinIdentity, RawSpanHostOwner},
 };
 use crate::{inspection::PrefillChunkRetentionContext, prefill::PrefillChunk};
 use std::{marker::PhantomData, mem::size_of, sync::TryLockError};
@@ -113,7 +113,7 @@ impl<K: CapturePlanStorageKey> PreparedPrefillStoragePublicationPlan<K> {
 fn row_peak<K: CapturePlanStorageKey>(slots: usize) -> Result<usize, WorkingMemoryError> {
     // Actual fixed vectors, per-unique provider key Arc, singleton registration
     // Vec+Arc, output handle, and fixed node slots. Vec->Box peak is included.
-    let per = size_of::<(K, u64)>()
+    let per = size_of::<(K, u64, Arc<eredu_core::MemoryPlacement>)>()
         .checked_add(size_of::<StagedAllocation<K>>())
         .and_then(|n| n.checked_add(2 * size_of::<Option<(RegistryKey<K>, Entry)>>()))
         .and_then(|n| n.checked_add(2 * size_of::<K>() + 2 * size_of::<usize>()))
@@ -242,17 +242,19 @@ struct StagedAllocation<K: CapturePlanStorageKey> {
     first_input: usize,
     key: Option<Arc<K>>,
     bytes: u64,
+    placement: Arc<eredu_core::MemoryPlacement>,
+    funding_allowance_bytes: u64,
     locator: Option<EntryLocator>,
     registry_key: Option<RegistryKey<K>>,
     output: Option<BoundedPublishedAllocation<K>>,
-    activation_pool: Option<WorkingMemoryPool>,
+    activation_pool: Option<MemoryLedger>,
 }
 /// Caller-owned terminal attempt: publish borrows it, so typed failure and
 /// provider unwind leave all original/staged keys and original custody here.
 /// There is no retry, replacement row, raw registration or byte-based grant.
 #[must_use]
 pub struct BoundedPublicationAttempt<K: CapturePlanStorageKey> {
-    inputs: Vec<(K, u64)>,
+    inputs: Vec<(K, u64, Arc<eredu_core::MemoryPlacement>)>,
     staged: Vec<StagedAllocation<K>>,
     node: Option<Box<RegistryBatch<K>>>,
     identity: CapturePinIdentity,
@@ -273,11 +275,16 @@ impl<K: CapturePlanStorageKey> std::fmt::Debug for BoundedPublicationAttempt<K> 
 }
 impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
     /// Move a descriptor into a preallocated slot, returning rejected ownership.
-    pub fn push_owned(&mut self, key: K, bytes: u64) -> Result<(), K> {
+    pub fn push_owned(
+        &mut self,
+        key: K,
+        bytes: u64,
+        placement: Arc<eredu_core::MemoryPlacement>,
+    ) -> Result<(), K> {
         if self.terminal || self.inputs.len() == self.slots {
             return Err(key);
         }
-        self.inputs.push((key, bytes));
+        self.inputs.push((key, bytes, placement));
         Ok(())
     }
     /// Number of retained inputs, including aliases and rejected-batch prefixes.
@@ -298,13 +305,19 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
         }
         self.terminal = true;
         // Keep every original input throughout provider comparison/clone panic.
-        for (first_input, (key, bytes)) in self.inputs.iter().enumerate() {
+        for (first_input, (key, bytes, placement)) in self.inputs.iter().enumerate() {
+            placement
+                .validate(native.pool().topology())
+                .map_err(WorkingMemoryError::from)?;
             if let Some(prior) = self
                 .staged
                 .iter()
                 .find(|s| s.key.as_ref().expect("staged key").as_ref().cmp(key) == Ordering::Equal)
             {
                 same_capacity(prior.bytes, *bytes)?;
+                if prior.placement != *placement {
+                    return Err(WorkingMemoryError::IdentityMismatch.into());
+                }
                 continue;
             }
             let key = Arc::new(key.clone());
@@ -317,6 +330,8 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
                 registry_key: Some(RegistryKey::Shared(key.clone())),
                 key: Some(key),
                 bytes: *bytes,
+                placement: Arc::clone(placement),
+                funding_allowance_bytes: 0,
                 locator: None,
                 output: Some(output),
                 activation_pool: Some(native.pool().clone()),
@@ -348,13 +363,15 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
             .get(&TypeId::of::<K>())
             .and_then(|r| r.downcast_ref::<Registry<K>>())
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        let mut incremental = 0u64;
         let mut allocations = 0usize;
         for staged in &mut self.staged {
             if let Some((locator, entry)) =
                 registry.locate(staged.key.as_ref().expect("staged key").as_ref())
             {
                 same_capacity(entry.bytes, staged.bytes)?;
+                if entry.placement != staged.placement {
+                    return Err(WorkingMemoryError::IdentityMismatch.into());
+                }
                 validate_entry_origin(entry, &usage)?;
                 entry
                     .owners
@@ -362,9 +379,6 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
                     .ok_or(WorkingMemoryError::Overflow)?;
                 staged.locator = Some(locator);
             } else {
-                incremental = incremental
-                    .checked_add(staged.bytes)
-                    .ok_or(WorkingMemoryError::Overflow)?;
                 allocations = allocations
                     .checked_add(1)
                     .ok_or(WorkingMemoryError::Overflow)?;
@@ -377,24 +391,90 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
                 return Err(WorkingMemoryError::IdentityMismatch.into());
             }
         }
-        native.pool().0.available(&usage, None)?;
+        native.pool().0.check_host_increment(&usage, 0)?;
         let state = usage
             .funding
             .get(&native.id)
             .ok_or(WorkingMemoryError::ExecutionFenced)?;
         state.validate_span_spend(Some(native))?;
-        let available = state.spendable_remaining()?;
-        if incremental > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
-                required_bytes: incremental,
-                available_bytes: available,
+        for (slot, (domain, _)) in native.pool().topology().domains().enumerate() {
+            let incremental = self
+                .staged
+                .iter()
+                .filter(|row| row.locator.is_none() && row.placement.domains().contains(&domain))
+                .try_fold(0u64, |sum, row| {
+                    sum.checked_add(row.bytes)
+                        .ok_or(WorkingMemoryError::Overflow)
+                })?;
+            let available = if slot == native.pool().0.host_slot {
+                state.spendable_remaining()?
+            } else {
+                state.domains[slot]
+                    .remaining
+                    .checked_sub(state.domains[slot].native_held.unwrap_or(0))
+                    .ok_or(WorkingMemoryError::Poisoned)?
+            };
+            if incremental > available {
+                return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                    domain,
+                    required_bytes: incremental,
+                    available_bytes: available,
+                }
+                .into());
             }
-            .into());
+            state.domains[slot]
+                .remaining
+                .checked_sub(incremental)
+                .ok_or(WorkingMemoryError::Poisoned)?;
+            let placement_allowance = self
+                .staged
+                .iter()
+                .filter(|row| {
+                    row.locator.is_none()
+                        && row.placement.domains().contains(&domain)
+                        && matches!(
+                            row.placement.kind(),
+                            eredu_core::MemoryPlacementKind::Possible { .. }
+                        )
+                })
+                .map(|row| row.bytes)
+                .sum::<u64>();
+            let fixed_bytes = incremental
+                .checked_sub(placement_allowance)
+                .ok_or(WorkingMemoryError::Overflow)?;
+            let converted =
+                state.allocation_allowance(slot, fixed_bytes, placement_allowance, 0)?;
+            state.domains[slot]
+                .remaining_charge
+                .placement_allowance_bytes
+                .checked_sub(placement_allowance)
+                .and_then(|bytes| bytes.checked_sub(converted))
+                .ok_or(WorkingMemoryError::IdentityMismatch)?;
+            usage.domains[slot]
+                .placement_allowances
+                .checked_sub(converted)
+                .ok_or(WorkingMemoryError::Poisoned)?;
+            let mut remaining_conversion = converted;
+            for row in self.staged.iter_mut().filter(|row| {
+                row.locator.is_none()
+                    && row.placement.domains().contains(&domain)
+                    && matches!(
+                        row.placement.kind(),
+                        eredu_core::MemoryPlacementKind::Fixed(_)
+                    )
+            }) {
+                row.funding_allowance_bytes = row.bytes.min(remaining_conversion);
+                remaining_conversion -= row.funding_allowance_bytes;
+            }
+            usage.domains[slot]
+                .reserved
+                .checked_sub(incremental)
+                .ok_or(WorkingMemoryError::Poisoned)?;
+            usage.domains[slot]
+                .registered
+                .checked_add(incremental)
+                .ok_or(WorkingMemoryError::Overflow)?;
         }
-        let remaining = state
-            .remaining
-            .checked_sub(incremental)
-            .ok_or(WorkingMemoryError::Poisoned)?;
         let count = state
             .allocations
             .checked_add(allocations)
@@ -402,14 +482,6 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
         let registrations = state
             .registrations
             .checked_add(self.staged.len())
-            .ok_or(WorkingMemoryError::Overflow)?;
-        let reserved = usage
-            .reserved
-            .checked_sub(incremental)
-            .ok_or(WorkingMemoryError::Poisoned)?;
-        let registered = usage
-            .registered
-            .checked_add(incremental)
             .ok_or(WorkingMemoryError::Overflow)?;
         let node = self
             .node
@@ -430,8 +502,12 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
                     staged.registry_key.take().expect("prepared key"),
                     Entry {
                         reset_layout_id: None,
+                        funding_allowance_bytes: staged.funding_allowance_bytes,
+                        native_retired: false,
+                        pending_allocation: false,
                         prepaid: None,
                         bytes: staged.bytes,
+                        placement: Arc::clone(&staged.placement),
                         owners: 1,
                         funding: Some(native.id),
                     },
@@ -445,11 +521,45 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
             .funding
             .get_mut(&native.id)
             .expect("validated account");
-        state.remaining = remaining;
         state.allocations = count;
         state.registrations = registrations;
-        usage.reserved = reserved;
-        usage.registered = registered;
+        for (slot, (domain, _)) in native.pool().topology().domains().enumerate() {
+            let incremental = self
+                .staged
+                .iter()
+                .filter(|row| row.locator.is_none() && row.placement.domains().contains(&domain))
+                .map(|row| row.bytes)
+                .sum::<u64>();
+            let placement_allowance = self
+                .staged
+                .iter()
+                .filter(|row| {
+                    row.locator.is_none()
+                        && row.placement.domains().contains(&domain)
+                        && matches!(
+                            row.placement.kind(),
+                            eredu_core::MemoryPlacementKind::Possible { .. }
+                        )
+                })
+                .map(|row| row.bytes)
+                .sum::<u64>();
+            let converted = self
+                .staged
+                .iter()
+                .filter(|row| row.locator.is_none() && row.placement.domains().contains(&domain))
+                .map(|row| row.funding_allowance_bytes)
+                .sum::<u64>();
+            let balance = &mut usage
+                .funding
+                .get_mut(&native.id)
+                .expect("validated account")
+                .domains[slot];
+            balance.remaining -= incremental;
+            balance.remaining_charge.placement_allowance_bytes -= placement_allowance + converted;
+            usage.domains[slot].placement_allowances -= converted;
+            usage.domains[slot].reserved -= incremental;
+            usage.domains[slot].registered += incremental;
+        }
         for staged in &mut self.staged {
             let registration =
                 Arc::get_mut(&mut staged.output.as_mut().expect("private output").storage.0)
@@ -488,11 +598,7 @@ impl<K: CapturePlanStorageKey> BoundedPublicationAttempt<K> {
 
     /// Unique successful allocation count, including aliases and zero-byte keys.
     pub fn published_count(&self) -> usize {
-        if self.published {
-            self.staged.len()
-        } else {
-            0
-        }
+        if self.published { self.staged.len() } else { 0 }
     }
 }
 /// One canonical allocation registration plus its actual original host custody.
@@ -520,11 +626,11 @@ impl<K: CapturePlanStorageKey> std::fmt::Debug for BoundedPublishedAllocation<K>
 }
 impl<K: CapturePlanStorageKey> BoundedPublishedAllocation<K> {
     /// Full physical capacity of this unique key, not a new execution allowance.
-    pub fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> Option<u64> {
         self.storage.bytes()
     }
     /// Same-pool canonical origin and original raw-custody health, under one lock.
-    pub fn validate_source(&self, pool: &WorkingMemoryPool) -> Result<(), BoundedPublicationError> {
+    pub fn validate_source(&self, pool: &MemoryLedger) -> Result<(), BoundedPublicationError> {
         let usage = pool.0.usage.try_lock().map_err(lock_error)?;
         self.raw.validate_origin_locked(pool, &usage)?;
         self.storage.validate_copy_source(pool, &usage)?;
@@ -533,7 +639,7 @@ impl<K: CapturePlanStorageKey> BoundedPublishedAllocation<K> {
 }
 
 pub(in crate::working_memory) fn validate_original_namespace<K: CapturePlanStorageKey>(
-    _pool: &WorkingMemoryPool,
+    _pool: &MemoryLedger,
     usage: &crate::working_memory::Usage,
     original: &capture_publication::PublicationLayout,
 ) -> Result<(), WorkingMemoryError> {

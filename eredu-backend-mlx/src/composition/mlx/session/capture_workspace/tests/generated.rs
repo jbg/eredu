@@ -131,7 +131,6 @@ fn two_hooks(width: usize, preview: usize) -> SharedCapturePlan {
             &CaptureCapabilities {
                 transformations: vec![CaptureTransformKind::Preview],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             },
             CaptureRequestShape {
@@ -269,61 +268,100 @@ fn independent_generated_capture_counts_one_factory_and_every_selected_transfer(
     let support = ObservationSupportReport {
         schema_version: 1,
         capture: Default::default(),
-        points: ordinary.admission().points().iter().map(|point| ObservationSupport {
-            path: point.path.clone(),
-            prefill: ObservationSupportStatus::Supported,
-            decode: ObservationSupportStatus::Supported,
-            floating_to_f32: true,
-        }).collect(),
+        points: ordinary
+            .admission()
+            .points()
+            .iter()
+            .map(|point| ObservationSupport {
+                path: point.path.clone(),
+                prefill: ObservationSupportStatus::Supported,
+                decode: ObservationSupportStatus::Supported,
+                floating_to_f32: true,
+            })
+            .collect(),
     };
-    let source = SharedCapturePlan::new(raw.admit_invocations(
-        &ObservationCatalog {
-            schema_version: 1,
-            points: ordinary.admission().points().to_vec(),
-            completeness: DescriptionCompleteness::Complete,
-        },
-        &support,
-        &CaptureCapabilities {
-            transformations: vec![CaptureTransformKind::Preview],
-            max_histogram_bins: 0,
-            physical_native_limit: false,
-            conditions: vec![],
-        },
-        CaptureInvocationBounds { batch: 1, max_sequence: 3, max_context: None, max_predictions: 8 },
-    ).unwrap());
+    let source = SharedCapturePlan::new(
+        raw.admit_invocations(
+            &ObservationCatalog {
+                schema_version: 1,
+                points: ordinary.admission().points().to_vec(),
+                completeness: DescriptionCompleteness::Complete,
+            },
+            &support,
+            &CaptureCapabilities {
+                transformations: vec![CaptureTransformKind::Preview],
+                max_histogram_bins: 0,
+                conditions: vec![],
+            },
+            CaptureInvocationBounds {
+                batch: 1,
+                max_sequence: 3,
+                max_context: None,
+                max_predictions: 8,
+            },
+        )
+        .unwrap(),
+    );
     for selected in [[true, true], [true, false], [false, false]] {
         let context = WorkspaceContext::new(GeneratedFacts { missing: false });
         let transfers = Cell::new(CaptureNativePopulation::default());
-        let shape = CaptureInvocationShape { batch: 1, sequence: 1, context: None };
+        let shape = CaptureInvocationShape {
+            batch: 1,
+            sequence: 1,
+            context: None,
+        };
         let geometry = InferenceGeometry {
-            batch_size: 1, cached_positions: 7, input_positions: 1,
-            max_output_tokens: 0, prefill_chunk_positions: 1,
+            batch_size: 1,
+            cached_positions: 7,
+            input_positions: 1,
+            max_output_tokens: 0,
+            prefill_chunk_positions: 1,
             output: OutputDemand::LastPosition,
         };
         // Every embedded equation is a single physical input span, independently
         // of its logical Decode capture phase and scheduler coordinate.
         let span = InferenceWorkspaceSpan::Prefill(eredu_runtime::prefill::PrefillChunk {
-            input: 0..1, position: 7, output: OutputDemand::LastPosition,
+            input: 0..1,
+            position: 7,
+            output: OutputDemand::LastPosition,
         });
         let (mut observer, _) = CaptureWorkspaceObserver::with_invocation(
-            &source, geometry, &context, &transfers,
-            CapturePhase::Decode, 2, shape, &selected,
-        ).unwrap();
+            &source,
+            geometry,
+            &context,
+            &transfers,
+            CapturePhase::Decode,
+            2,
+            shape,
+            &selected,
+        )
+        .unwrap();
         assert!(observer.begin_span(geometry, &span, 2, &context).unwrap());
         let input = WorkspaceTensor::existing(
-            WorkspaceLayout::new(&[2, 259], WorkspaceDtype::Float32).unwrap(), &context,
-        ).unwrap();
+            WorkspaceLayout::new(&[2, 259], WorkspaceDtype::Float32).unwrap(),
+            &context,
+        )
+        .unwrap();
         context.begin_state_span([&input]).unwrap();
         let mut layer = linear(&context, 259);
-        let output = layer.forward_with_input_observer(
-            &input, &context,
-            Some(&mut Projection { capture: &mut observer, path: "first.input" }),
-        ).unwrap();
+        let output = layer
+            .forward_with_input_observer(
+                &input,
+                &context,
+                Some(&mut Projection {
+                    capture: &mut observer,
+                    path: "first.input",
+                }),
+            )
+            .unwrap();
         let count = selected.into_iter().filter(|selected| *selected).count();
         let population = transfers.get();
         assert_eq!(population.publications, 0);
         assert_eq!(population.completions, count);
-        assert_eq!(population.retained_roots, if count == 0 { 0 } else { 9 + 5 * count });
+        assert_eq!(
+            population.retained_roots,
+            if count == 0 { 0 } else { 9 + 5 * count }
+        );
         let mut roots = vec![output];
         observer.visit_retained(&mut |value| roots.push(value.clone()));
         let report = context.report(&roots).unwrap();
@@ -332,9 +370,16 @@ fn independent_generated_capture_counts_one_factory_and_every_selected_transfer(
         if count != 0 {
             // Both rows use the exact same generated value; compact operands and
             // all seven intermediates survive until the enclosing phase ends.
-            assert!(observer.roots.iter().any(|root| root.shape() == [2, 259] && root.layout().dtype() == WorkspaceDtype::Uint8));
+            assert!(observer
+                .roots
+                .iter()
+                .any(|root| root.shape() == [2, 259]
+                    && root.layout().dtype() == WorkspaceDtype::Uint8));
             assert!(observer.roots.iter().any(|root| root.shape() == [2, 3]));
-            assert!(population.controls > CaptureNativePopulation::within_raw().unwrap().controls * count);
+            assert!(
+                population.controls
+                    > CaptureNativePopulation::within_raw().unwrap().controls * count
+            );
         }
         observer.end_span(&span, &context).unwrap();
         assert!(observer.roots.is_empty());

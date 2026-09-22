@@ -1,18 +1,23 @@
 //! Transfers a reserved envelope to independently retiring physical storage.
 
 use super::{
-    InferenceExecutionIdentity, PreparedAccountCommit, Usage, WorkingMemoryError,
-    WorkingMemoryPool, WorkingMemoryReservation, WorkingMemoryStorage,
-    residual::RegisteredStoragePin, text_preparation::RequestStart,
+    InferenceExecutionIdentity, MemoryLedger, PreparedAccountCommit, Usage, WorkingMemoryError,
+    WorkingMemoryReservation, WorkingMemoryStorage, residual::RegisteredStoragePin,
+    text_preparation::RequestStart,
 };
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Weak},
-};
+use eredu_core::DomainMemoryCharge;
+use eredu_core::{MemoryDomainId, MemoryLimit, MemoryLimits};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::sync::{Arc, Weak};
+
+mod allocation;
+pub use allocation::WorkingMemoryAllocationFunding;
 
 mod accounts;
 pub(super) use accounts::{
     AccountLedger, AccountNode, AccountTicket, PendingAccount, PendingOriginal, RetiringAccount,
+    drain as drain_accounts,
 };
 mod capture_source;
 use capture_source::{ActiveCaptureSpan, CaptureSourceSlot};
@@ -31,6 +36,7 @@ pub(super) fn capture_source_rollback_control_bytes() -> usize {
 
 mod capture_tensor;
 pub(super) use capture_tensor::CaptureTensorCustody;
+pub(in crate::working_memory) use capture_tensor::capture_controls;
 
 mod capacity_handoff;
 pub(in crate::working_memory) mod native_partition;
@@ -52,15 +58,79 @@ pub(super) use span_workspace::{after_span_attachment, quarantine_source_after_n
 pub(in crate::working_memory) mod tests;
 
 #[derive(Debug)]
-pub(super) struct FundingState {
+pub(super) struct DomainFundingBalance {
     pub(super) remaining: u64,
+    pub(super) native_held: Option<u64>,
+    pub(super) native_registered: u64,
+    pub(super) native_held_allowance: u64,
+    pub(super) remaining_charge: eredu_core::DomainMemoryCharge,
+}
+
+pub(super) fn domain_balance_bytes(
+    topology: &eredu_core::MemoryTopology,
+) -> Result<u64, WorkingMemoryError> {
+    topology
+        .len()
+        .checked_mul(std::mem::size_of::<DomainFundingBalance>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(WorkingMemoryError::Overflow)
+}
+
+impl DomainFundingBalance {
+    /// Source categories spent by a fixed backing. Prospective placement
+    /// allowances can become accounted storage once the backing is observed.
+    pub(super) fn fixed_allocation_allowance(
+        &self,
+        bytes: u64,
+        protected_fixed: u64,
+        protected_allowance: u64,
+    ) -> Result<u64, WorkingMemoryError> {
+        let categories = self
+            .remaining_charge
+            .placement_allowance_bytes
+            .checked_add(self.remaining_charge.estimated_overhead_bytes)
+            .and_then(|n| n.checked_add(self.remaining_charge.headroom_bytes))
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let accounted = self
+            .remaining
+            .checked_sub(categories)
+            .and_then(|n| n.checked_sub(protected_fixed))
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let allowance = if bytes > accounted {
+            bytes - accounted
+        } else {
+            0
+        };
+        if allowance
+            > self
+                .remaining_charge
+                .placement_allowance_bytes
+                .checked_sub(protected_allowance)
+                .ok_or(WorkingMemoryError::IdentityMismatch)?
+        {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        Ok(allowance)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct FundingState {
+    // Closed cold metadata and the shared constructor's authenticated fixed
+    // owner retain their charges after construction stops excluding new work.
+    reservation_exclusion: ReservationExclusion,
+    pub(super) domains: Vec<DomainFundingBalance>,
+    host_slot: usize,
     // Protected subset of host_held, released only after the canonical node shell.
-    control_floor: u64,
+    pub(super) control_floor: u64,
+    // The quoted standalone reservation/report controls within control_floor.
+    // A closed original host account protects its complete payload in the
+    // floor; that payload is not reservation bookkeeping in diagnostics.
+    pub(super) report_control_bytes: u64,
     // A subset of remaining retained for closed host payloads and their
     // construction/replacement overlap. Native publication cannot spend it.
     pub(super) host_held: u64,
     // One protected request-wide partition; Some(0) remains a live owner.
-    native_held: Option<u64>,
     native_issued: bool,
     // Weak identity only: never a new owner of the stamp, custody or pool.
     // An expired marker remains closed until exact canonical removal.
@@ -71,9 +141,9 @@ pub(super) struct FundingState {
     // Only scopes that can submit native work retain transient headroom.
     pub(super) native_scopes: usize,
     run_open: bool,
-    quarantined: bool,
+    pub(super) quarantined: bool,
     metadata_live: bool,
-    capacity: Option<u64>,
+    capacity: Option<eredu_core::MemoryLimits>,
     execution: Weak<()>,
     // Every uncertified scope contributes its complete borrowed inventory.
     // Scopes can add distinct source pins beyond the original run's bundle.
@@ -86,6 +156,22 @@ pub(super) struct FundingState {
     preparation: Option<eredu_core::HostPreparationAuthority>,
 }
 
+#[derive(Debug)]
+enum ReservationExclusion {
+    Request,
+    SharedConstructor { fixed_live: bool, active: bool },
+    SealedPlanning,
+}
+impl ReservationExclusion {
+    fn active(&self) -> bool {
+        match self {
+            Self::Request => true,
+            Self::SharedConstructor { active, .. } => *active,
+            Self::SealedPlanning => false,
+        }
+    }
+}
+
 // A node is prepared before taking the usage lock. Linking only moves owners:
 // no provider clone, pin destruction, or allocation occurs under that lock.
 #[derive(Debug)]
@@ -94,16 +180,129 @@ struct QuarantinedStoragePins {
     next: Option<Box<Self>>,
 }
 
+impl std::ops::Deref for FundingState {
+    type Target = DomainFundingBalance;
+    fn deref(&self) -> &Self::Target {
+        &self.domains[self.host_slot]
+    }
+}
+
+impl std::ops::DerefMut for FundingState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.domains[self.host_slot]
+    }
+}
+
 impl FundingState {
-    pub(in crate::working_memory) fn accepted_capacity(&self) -> Option<u64> {
-        self.capacity
+    pub(super) fn storage_metadata_balance(
+        &self,
+        bytes: u64,
+        first: bool,
+    ) -> Result<(u64, usize), WorkingMemoryError> {
+        if self.quarantined || !self.retains_workspace() || self.scopes == 0 {
+            return Err(WorkingMemoryError::ExecutionFenced);
+        }
+        self.validate_span_spend(None)?;
+        let available = self.spendable_remaining()?;
+        if bytes > available {
+            return Ok((available, self.allocations));
+        }
+        // Host descriptors require fixed host allowance. Native placement
+        // estimates and application headroom remain protected categories.
+        self.allocation_allowance(self.host_slot, bytes, 0, 0)
+            .and_then(|converted| {
+                if converted != 0 {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                Ok((
+                    available,
+                    self.allocations
+                        .checked_add(usize::from(first))
+                        .ok_or(WorkingMemoryError::Overflow)?,
+                ))
+            })
+    }
+    /// Fixed storage may consume only unprotected categories. Metadata floors
+    /// and the unspent native partition retain their original allocation class.
+    pub(super) fn allocation_allowance(
+        &self,
+        slot: usize,
+        fixed: u64,
+        possible: u64,
+        native_spend: u64,
+    ) -> Result<u64, WorkingMemoryError> {
+        let balance = &self.domains[slot];
+        let held = balance.native_held.unwrap_or(0);
+        let held_fixed = held
+            .checked_sub(balance.native_held_allowance)
+            .ok_or(WorkingMemoryError::Poisoned)?;
+        let native_fixed_spend = held_fixed.min(native_spend);
+        let native_allowance_spend = native_spend
+            .checked_sub(native_fixed_spend)
+            .ok_or(WorkingMemoryError::Poisoned)?;
+        let protected_fixed = held_fixed
+            .checked_sub(native_fixed_spend)
+            .and_then(|n| {
+                n.checked_add(if slot == self.host_slot {
+                    self.host_held
+                } else {
+                    0
+                })
+            })
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let protected_allowance = balance
+            .native_held_allowance
+            .checked_sub(native_allowance_spend)
+            .and_then(|n| n.checked_add(possible))
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        balance.fixed_allocation_allowance(fixed, protected_fixed, protected_allowance)
+    }
+    pub(super) fn host(
+        topology: &eredu_core::MemoryTopology,
+        bytes: u64,
+        capacity: Option<MemoryLimits>,
+        execution: &InferenceExecutionIdentity,
+        metadata_live: bool,
+        scopes: usize,
+        native_scopes: usize,
+    ) -> Result<Self, WorkingMemoryError> {
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero(topology);
+        requirements.add_allocation(
+            bytes,
+            &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())?,
+        )?;
+        Self::new(
+            topology,
+            &requirements,
+            capacity,
+            execution,
+            metadata_live,
+            scopes,
+            native_scopes,
+        )
+    }
+    pub(in crate::working_memory) fn accepted_capacity(&self) -> Option<&MemoryLimits> {
+        self.capacity.as_ref()
+    }
+    pub(in crate::working_memory) fn limit(
+        &self,
+        domain: MemoryDomainId,
+    ) -> Result<MemoryLimit, WorkingMemoryError> {
+        Ok(self
+            .capacity
+            .as_ref()
+            .map(|c| c.get(domain))
+            .transpose()?
+            .unwrap_or(MemoryLimit::Unlimited))
     }
     fn empty() -> Self {
         Self {
-            remaining: 0,
+            reservation_exclusion: ReservationExclusion::Request,
+            domains: Vec::new(),
+            host_slot: 0,
             control_floor: 0,
+            report_control_bytes: 0,
             host_held: 0,
-            native_held: None,
             native_issued: false,
             active_span: None,
             allocations: 0,
@@ -121,18 +320,59 @@ impl FundingState {
     }
 
     pub(super) fn new(
-        remaining: u64,
-        capacity: Option<u64>,
+        topology: &eredu_core::MemoryTopology,
+        requirements: &eredu_core::DomainMemoryRequirements,
+        capacity: Option<eredu_core::MemoryLimits>,
         execution: &InferenceExecutionIdentity,
         metadata_live: bool,
         scopes: usize,
         native_scopes: usize,
-    ) -> Self {
-        Self {
-            remaining,
+    ) -> Result<Self, WorkingMemoryError> {
+        requirements.validate(topology)?;
+        Self::from_charges(
+            topology,
+            requirements.iter().map(|(_, charge)| charge),
+            capacity,
+            execution,
+            metadata_live,
+            scopes,
+            native_scopes,
+        )
+    }
+
+    pub(super) fn from_charges(
+        topology: &eredu_core::MemoryTopology,
+        charges: impl ExactSizeIterator<Item = DomainMemoryCharge>,
+        capacity: Option<eredu_core::MemoryLimits>,
+        execution: &InferenceExecutionIdentity,
+        metadata_live: bool,
+        scopes: usize,
+        native_scopes: usize,
+    ) -> Result<Self, WorkingMemoryError> {
+        if charges.len() != topology.len() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        if let Some(capacity) = &capacity {
+            capacity.validate(topology)?;
+        }
+        let domains = charges
+            .map(|charge| {
+                Ok(DomainFundingBalance {
+                    remaining: charge.total()?,
+                    native_held: None,
+                    native_registered: 0,
+                    native_held_allowance: 0,
+                    remaining_charge: charge,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkingMemoryError>>()?;
+        Ok(Self {
+            reservation_exclusion: ReservationExclusion::Request,
+            domains,
+            host_slot: topology.slot(topology.host_domain())?,
             control_floor: 0,
+            report_control_bytes: 0,
             host_held: 0,
-            native_held: None,
             native_issued: false,
             active_span: None,
             allocations: 0,
@@ -148,13 +388,50 @@ impl FundingState {
             // Closed authority Clone is allocation-free and cannot run payload
             // callbacks under Usage. Every retirement happens after unlock.
             preparation: execution.1.clone(),
-        }
+        })
     }
 
     pub(super) fn protected_remaining(&self) -> Result<u64, WorkingMemoryError> {
         self.host_held
             .checked_add(self.native_held.unwrap_or(0))
             .ok_or(WorkingMemoryError::Poisoned)
+    }
+
+    pub(super) fn validate_shared_constructor_fixed(&self) -> Result<(), WorkingMemoryError> {
+        if matches!(self.reservation_exclusion, ReservationExclusion::Request)
+            && self.allocations == 0
+            && self.registrations == 0
+            && self.scopes == 1
+            && self.native_scopes == 1
+            && self.run_open
+            && !self.metadata_live
+            && !self.quarantined
+            && self
+                .domains
+                .iter()
+                .all(|domain| domain.native_held.is_none())
+        {
+            Ok(())
+        } else {
+            Err(WorkingMemoryError::IdentityMismatch)
+        }
+    }
+
+    pub(super) fn install_shared_constructor_fixed(&mut self) {
+        self.reservation_exclusion = ReservationExclusion::SharedConstructor {
+            fixed_live: true,
+            active: true,
+        };
+    }
+
+    pub(super) fn retire_shared_constructor_fixed(&mut self) {
+        let ReservationExclusion::SharedConstructor { fixed_live, .. } =
+            &mut self.reservation_exclusion
+        else {
+            panic!("authenticated constructor fixed metadata");
+        };
+        assert!(*fixed_live, "one fixed metadata retirement");
+        *fixed_live = false;
     }
 
     pub(super) fn spendable_remaining(&self) -> Result<u64, WorkingMemoryError> {
@@ -224,6 +501,20 @@ impl FundingState {
             return Err(WorkingMemoryError::ExecutionFenced);
         }
         self.validate_span_spend(Some(scope))
+    }
+
+    /// Existing active-span custody may publish newly allocated recovery roots
+    /// after a sibling fails. Quarantine never authorizes an ordinary alias.
+    pub(super) fn validate_storage_publication(
+        &self,
+        scope: &WorkingMemoryFundingScope,
+    ) -> Result<bool, WorkingMemoryError> {
+        scope.validate_native_purpose()?;
+        if self.native_scopes == 0 || (self.quarantined && self.active_span.is_none()) {
+            return Err(WorkingMemoryError::ExecutionFenced);
+        }
+        self.validate_span_spend(Some(scope))?;
+        Ok(self.quarantined)
     }
 
     pub(super) fn validate_registered_copy_origin(&self) -> Result<(), WorkingMemoryError> {
@@ -310,10 +601,10 @@ impl FundingSource<'_> {
             FundingSource::HostScope(scope) | FundingSource::NativeScope(scope) => scope.id,
             FundingSource::CopyRun(run) => run.id,
         };
-        self.pool().same_domain(other.pool()) && id(*self) == id(other)
+        self.pool().same_ledger(other.pool()) && id(*self) == id(other)
     }
 
-    pub(super) fn pool(&self) -> &WorkingMemoryPool {
+    pub(super) fn pool(&self) -> &MemoryLedger {
         match self {
             Self::HostScope(scope) | Self::NativeScope(scope) => &scope.pool,
             Self::CopyRun(run) => &run.pool,
@@ -350,37 +641,39 @@ impl FundingSource<'_> {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     // The sole caller derives `bytes` from the actual sealed sampler source.
     // Create a normal funding account directly: no fabricated inference
     // geometry, request metadata, or second accounting ledger is involved.
+    #[cfg(test)]
     pub(super) fn open_sampler_copy_account(
         &self,
         source: FundingSource<'_>,
         execution: &InferenceExecutionIdentity,
-        bytes: u64,
-        capacity: u64,
+        requirements: &eredu_core::DomainMemoryRequirements,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<(WorkingMemoryFundingRun, WorkingMemoryFundingScope), WorkingMemoryError> {
-        if !self.same_domain(source.pool()) {
+        if !self.same_ledger(source.pool()) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let mut node = Some(AccountNode::empty());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        source.validate(&usage, execution)?;
-        let id = commit_copy_account(
+        let declarations = capacity.named(self.topology())?;
+        let accepted = PreparedCopyAccount::accept(
             self,
-            &mut usage,
-            &mut node,
             execution,
-            bytes,
-            capacity,
+            crate::working_memory::transaction_buffers::RequirementProjection {
+                parts: &[requirements],
+                headroom: &eredu_core::MemoryHeadroomDeclarations::none(),
+                host_bytes: 0,
+            },
+            &declarations,
+            0,
             CopyHostHolds::None,
+            |usage| {
+                source.validate(usage, execution)?;
+                Ok(())
+            },
         )?;
-        drop(usage);
+        let (_, id, _) = accepted.finish(execution)?;
         Ok((
             WorkingMemoryFundingRun {
                 pool: self.clone(),
@@ -397,6 +690,7 @@ impl WorkingMemoryPool {
                 borrowed_storage: None,
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }
@@ -404,60 +698,46 @@ impl WorkingMemoryPool {
     // Only the sealed workspace-copy route supplies this byte requirement and
     // its matching existing-only pin. Source validation and numeric admission
     // share one lock, including quarantine changes after cold preparation.
+    #[cfg(test)]
     pub(super) fn open_workspace_copy_account<K: Ord + Send + 'static>(
         &self,
         source: &WorkingMemoryStorage<K>,
         pin: RegisteredStoragePin,
         execution: &InferenceExecutionIdentity,
-        bytes: u64,
-        capacity: u64,
+        requirements: &eredu_core::DomainMemoryRequirements,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<(WorkingMemoryFundingRun, WorkingMemoryFundingScope), WorkingMemoryError> {
-        self.open_workspace_copy_validated(pin, execution, bytes, capacity, |usage| {
+        self.open_workspace_copy_validated(pin, execution, requirements, capacity, |usage| {
             source.validate_copy_source(self, usage)
         })
     }
-    pub(super) fn open_completed_workspace_copy_account<K: Ord + Send + 'static>(
-        &self,
-        source: &super::workspace_copy::completed::CompletedSourceCustody,
-        registered: Option<&WorkingMemoryStorage<K>>,
-        pin: RegisteredStoragePin,
-        execution: &InferenceExecutionIdentity,
-        bytes: u64,
-        capacity: u64,
-    ) -> Result<(WorkingMemoryFundingRun, WorkingMemoryFundingScope), WorkingMemoryError> {
-        self.open_workspace_copy_validated(pin, execution, bytes, capacity, |usage| {
-            source.validate(self, usage)?;
-            if let Some(registered) = registered {
-                registered.validate_copy_source(self, usage)?;
-            }
-            Ok(())
-        })
-    }
+    #[cfg(test)]
     fn open_workspace_copy_validated(
         &self,
         pin: RegisteredStoragePin,
         execution: &InferenceExecutionIdentity,
-        bytes: u64,
-        capacity: u64,
+        requirements: &eredu_core::DomainMemoryRequirements,
+        capacity: eredu_core::MemoryLimits,
         validate: impl FnOnce(&Usage) -> Result<(), WorkingMemoryError>,
     ) -> Result<(WorkingMemoryFundingRun, WorkingMemoryFundingScope), WorkingMemoryError> {
-        let mut node = Some(AccountNode::empty());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        validate(&usage)?;
-        let id = commit_copy_account(
+        let declarations = capacity.named(self.topology())?;
+        let accepted = PreparedCopyAccount::accept(
             self,
-            &mut usage,
-            &mut node,
             execution,
-            bytes,
-            capacity,
+            crate::working_memory::transaction_buffers::RequirementProjection {
+                parts: &[requirements],
+                headroom: &eredu_core::MemoryHeadroomDeclarations::none(),
+                host_bytes: 0,
+            },
+            &declarations,
+            0,
             CopyHostHolds::None,
+            |usage| {
+                validate(usage)?;
+                Ok(())
+            },
         )?;
-        drop(usage);
+        let (_, id, _) = accepted.finish(execution)?;
         Ok((
             WorkingMemoryFundingRun {
                 pool: self.clone(),
@@ -474,11 +754,13 @@ impl WorkingMemoryPool {
                 borrowed_storage: Some(pin),
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }
     // The sealed aggregate derives host_bytes from its borrowed sampler plan.
     // Every supplied source proof is checked under the same lock as this one commit.
+    #[cfg(test)]
     pub(super) fn open_sampling_copy_account<K: Ord + Send + 'static>(
         &self,
         sampler: FundingSource<'_>,
@@ -487,9 +769,9 @@ impl WorkingMemoryPool {
         complete_source: Option<&WorkingMemoryStorage<K>>,
         pin: RegisteredStoragePin,
         destination: &InferenceExecutionIdentity,
-        bytes: u64,
+        requirements: &eredu_core::DomainMemoryRequirements,
         host_bytes: u64,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<
         (
             WorkingMemoryFundingRun,
@@ -498,30 +780,31 @@ impl WorkingMemoryPool {
         ),
         WorkingMemoryError,
     > {
-        if !self.same_domain(sampler.pool()) {
+        if !self.same_ledger(sampler.pool()) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let mut node = Some(AccountNode::empty());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        sampler.validate(&usage, sampler_execution)?;
-        arrays.validate_copy_source(self, &usage)?;
-        if let Some(source) = complete_source {
-            source.validate_copy_source(self, &usage)?;
-        }
-        let id = commit_copy_account(
+        let declarations = capacity.named(self.topology())?;
+        let accepted = PreparedCopyAccount::accept(
             self,
-            &mut usage,
-            &mut node,
             destination,
-            bytes,
-            capacity,
+            crate::working_memory::transaction_buffers::RequirementProjection {
+                parts: &[requirements],
+                headroom: &eredu_core::MemoryHeadroomDeclarations::none(),
+                host_bytes: 0,
+            },
+            &declarations,
+            0,
             CopyHostHolds::Sampler(host_bytes),
+            |usage| {
+                sampler.validate(usage, sampler_execution)?;
+                arrays.validate_copy_source(self, usage)?;
+                if let Some(source) = complete_source {
+                    source.validate_copy_source(self, usage)?;
+                }
+                Ok(())
+            },
         )?;
-        drop(usage);
+        let (_, id, _) = accepted.finish(destination)?;
         Ok((
             WorkingMemoryFundingRun {
                 pool: self.clone(),
@@ -539,6 +822,7 @@ impl WorkingMemoryPool {
                     borrowed_storage: None,
                     capture_source: None,
                     native_publication_identity: None,
+                    allocation_funding: None,
                 }),
                 // The matching ledger hold was installed atomically above.
                 held: host_bytes,
@@ -551,6 +835,7 @@ impl WorkingMemoryPool {
                 borrowed_storage: Some(pin),
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }
@@ -558,7 +843,7 @@ impl WorkingMemoryPool {
 
 // The concrete routes, not byte callers, select the exact initial custody.
 // Zero-byte host payloads still have one independent host scope.
-enum CopyHostHolds {
+pub(in crate::working_memory) enum CopyHostHolds {
     None,
     // A closed fresh host destination has no native scope or public run.
     HostOnly(u64),
@@ -611,7 +896,11 @@ pub(super) enum DecoderCopySource<'a, K: Ord + Send + 'static> {
 }
 
 impl<K: Ord + Send + 'static> DecoderCopySource<'_, K> {
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    pub(in crate::working_memory) fn validate(
+        &self,
+        pool: &MemoryLedger,
+        usage: &Usage,
+    ) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Registered(source) => source.validate_copy_source(pool, usage),
             Self::Funded { scope, execution } => scope.validate(pool, usage, execution),
@@ -619,9 +908,10 @@ impl<K: Ord + Send + 'static> DecoderCopySource<'_, K> {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     // All inputs come from the sealed sampler/slot/copy programs. The complete
     // source pin bundle is staged outside the lock and enters native custody only.
+    #[cfg(test)]
     pub(super) fn open_text_components_copy_account<K: Ord + Send + 'static>(
         &self,
         sampler: FundingSource<'_>,
@@ -631,10 +921,10 @@ impl WorkingMemoryPool {
         complete_source: &WorkingMemoryStorage<K>,
         pin: RegisteredStoragePin,
         destination: &InferenceExecutionIdentity,
-        bytes: u64,
+        requirements: &eredu_core::DomainMemoryRequirements,
         sampler_hold: u64,
         decoder_hold: u64,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<
         (
             WorkingMemoryFundingRun,
@@ -644,32 +934,33 @@ impl WorkingMemoryPool {
         ),
         WorkingMemoryError,
     > {
-        if !self.same_domain(sampler.pool()) {
+        if !self.same_ledger(sampler.pool()) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let mut node = Some(AccountNode::empty());
-        let mut usage = self
-            .0
-            .usage
-            .lock()
-            .map_err(|_| WorkingMemoryError::Poisoned)?;
-        sampler.validate(&usage, sampler_execution)?;
-        decoder.validate(self, &usage)?;
-        operands.validate_copy_source(self, &usage)?;
-        complete_source.validate_copy_source(self, &usage)?;
-        let id = commit_copy_account(
+        let declarations = capacity.named(self.topology())?;
+        let accepted = PreparedCopyAccount::accept(
             self,
-            &mut usage,
-            &mut node,
             destination,
-            bytes,
-            capacity,
+            crate::working_memory::transaction_buffers::RequirementProjection {
+                parts: &[requirements],
+                headroom: &eredu_core::MemoryHeadroomDeclarations::none(),
+                host_bytes: 0,
+            },
+            &declarations,
+            0,
             CopyHostHolds::Paired {
                 sampler: sampler_hold,
                 decoder: decoder_hold,
             },
+            |usage| {
+                sampler.validate(usage, sampler_execution)?;
+                decoder.validate(self, usage)?;
+                operands.validate_copy_source(self, usage)?;
+                complete_source.validate_copy_source(self, usage)?;
+                Ok(())
+            },
         )?;
-        drop(usage);
+        let (_, id, _) = accepted.finish(destination)?;
         Ok((
             WorkingMemoryFundingRun {
                 pool: self.clone(),
@@ -687,6 +978,7 @@ impl WorkingMemoryPool {
                     borrowed_storage: None,
                     capture_source: None,
                     native_publication_identity: None,
+                    allocation_funding: None,
                 }),
                 held: sampler_hold,
             },
@@ -699,6 +991,7 @@ impl WorkingMemoryPool {
                     borrowed_storage: None,
                     capture_source: None,
                     native_publication_identity: None,
+                    allocation_funding: None,
                 }),
                 held: decoder_hold,
             },
@@ -710,47 +1003,10 @@ impl WorkingMemoryPool {
                 borrowed_storage: Some(pin),
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }
-}
-
-// Concrete copy routes validate their own authenticated sources before
-// reaching this private numeric commit. No public scalar admission is added.
-fn commit_copy_account(
-    pool: &WorkingMemoryPool,
-    usage: &mut Usage,
-    node: &mut Option<Box<AccountNode>>,
-    execution: &InferenceExecutionIdentity,
-    bytes: u64,
-    capacity: u64,
-    host_holds: CopyHostHolds,
-) -> Result<u64, WorkingMemoryError> {
-    let native_scopes = usize::from(!matches!(host_holds, CopyHostHolds::HostOnly(_)));
-    let (held, scopes) = host_holds.total_and_scopes()?;
-    if held > bytes {
-        return Err(WorkingMemoryError::IdentityMismatch);
-    }
-    let commit =
-        PreparedAccountCommit::prepare(pool, execution, usage, bytes, Some(capacity), &[])?;
-    let id = usage.next_funding;
-    let next = id.checked_add(1).ok_or(WorkingMemoryError::Overflow)?;
-    let mut state = FundingState::new(
-        bytes,
-        Some(capacity),
-        execution,
-        false,
-        scopes,
-        native_scopes,
-    );
-    state.host_held = held;
-    // All source, capacity and counter checks precede this one commit.
-    commit.commit(usage);
-    usage
-        .funding
-        .publish(node.take().expect("prepared copy node"), id, state, true);
-    usage.next_funding = next;
-    Ok(id)
 }
 
 /// Move-only authority for a converted reservation's future native work.
@@ -760,11 +1016,11 @@ fn commit_copy_account(
 #[derive(Debug)]
 #[must_use = "retain the run through all quoted payloads and future native work"]
 pub struct WorkingMemoryFundingRun {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     id: u64,
     open: bool,
     handoff_taken: bool,
-    // Drop after the run's locked accounting transition, never under that lock.
+    // Retire before closing the run, while its constructor funding remains live.
     borrowed_storage: Option<RegisteredStoragePin>,
 }
 
@@ -787,7 +1043,7 @@ impl WorkingMemoryFundingRun {
         ),
         WorkingMemoryError,
     > {
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         // Retain any original residual exclusion as well as the actual decoder
@@ -826,7 +1082,8 @@ impl WorkingMemoryFundingRun {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: self.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -851,6 +1108,7 @@ impl WorkingMemoryFundingRun {
                     borrowed_storage: None,
                     capture_source: None,
                     native_publication_identity: None,
+                    allocation_funding: None,
                 }),
                 held: bytes,
             },
@@ -862,6 +1120,7 @@ impl WorkingMemoryFundingRun {
                 borrowed_storage: Some(pins),
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             },
         ))
     }
@@ -873,7 +1132,7 @@ impl WorkingMemoryFundingRun {
         reservation: &WorkingMemoryReservation,
         bytes: u64,
     ) -> Result<WorkingMemoryDecoderHostScope, WorkingMemoryError> {
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let mut usage = self
@@ -893,7 +1152,8 @@ impl WorkingMemoryFundingRun {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: self.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -918,6 +1178,7 @@ impl WorkingMemoryFundingRun {
                 borrowed_storage: None,
                 capture_source: None,
                 native_publication_identity: None,
+                allocation_funding: None,
             }),
             held: bytes,
         })
@@ -968,6 +1229,7 @@ impl WorkingMemoryFundingRun {
             borrowed_storage: self.borrowed_storage.clone(),
             capture_source: None,
             native_publication_identity: None,
+            allocation_funding: None,
         })
     }
 
@@ -985,7 +1247,7 @@ impl WorkingMemoryFundingRun {
         &self,
         reservation: &WorkingMemoryReservation,
     ) -> Result<(), WorkingMemoryError> {
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let usage = self
@@ -1006,7 +1268,7 @@ impl WorkingMemoryFundingRun {
     }
 
     /// The exact managed domain covered by this run.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    pub fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
 
@@ -1015,6 +1277,7 @@ impl WorkingMemoryFundingRun {
     /// unquoted-work exclusion even after unused workspace is released. The
     /// ceiling changes only through explicitly delegated successor policy.
     pub fn close(mut self) -> Result<(), WorkingMemoryError> {
+        drop(self.borrowed_storage.take());
         let mut usage = self
             .pool
             .0
@@ -1093,7 +1356,7 @@ impl WorkingMemorySamplerScope {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let scope = self.scope.as_ref().expect("live sampler custody");
-        if source.is_some_and(|(source, _)| !scope.pool.same_domain(source.pool())) {
+        if source.is_some_and(|(source, _)| !scope.pool.same_ledger(source.pool())) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let mut usage = scope
@@ -1115,7 +1378,8 @@ impl WorkingMemorySamplerScope {
         state.validate_span_spend(None)?;
         let available = state.spendable_remaining()?;
         if bytes > available {
-            return Err(WorkingMemoryError::BudgetExceeded {
+            return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                domain: scope.pool.topology().host_domain(),
                 required_bytes: bytes,
                 available_bytes: available,
             });
@@ -1157,8 +1421,26 @@ pub(super) struct WorkingMemoryDecoderHostScope {
 }
 
 impl WorkingMemoryDecoderHostScope {
-    pub(super) fn pool(&self) -> &WorkingMemoryPool {
+    pub(super) fn pool(&self) -> &MemoryLedger {
         &self.scope.as_ref().expect("live decoder host custody").pool
+    }
+
+    pub(super) fn storage_metadata_scope(
+        &self,
+        execution: &InferenceExecutionIdentity,
+    ) -> Result<&WorkingMemoryFundingScope, WorkingMemoryError> {
+        let scope = self
+            .scope
+            .as_ref()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let usage = scope
+            .pool
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        self.validate(&scope.pool, &usage, execution)?;
+        Ok(scope)
     }
 
     // The split pending-input worker rechecks this immediately before filling.
@@ -1173,7 +1455,7 @@ impl WorkingMemoryDecoderHostScope {
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
         if reservation.0.funding != Some(scope.id)
-            || !scope.pool.same_domain(&reservation.0.pool)
+            || !scope.pool.same_ledger(&reservation.0.pool)
             || self.held != expected
         {
             return Err(WorkingMemoryError::IdentityMismatch);
@@ -1217,7 +1499,7 @@ impl WorkingMemoryDecoderHostScope {
 
     fn validate(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
         execution: &InferenceExecutionIdentity,
     ) -> Result<(), WorkingMemoryError> {
@@ -1225,7 +1507,7 @@ impl WorkingMemoryDecoderHostScope {
             .scope
             .as_ref()
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        if !pool.same_domain(&scope.pool) {
+        if !pool.same_ledger(&scope.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         FundingSource::HostScope(scope).validate(usage, execution)?;
@@ -1260,6 +1542,7 @@ impl Drop for WorkingMemoryDecoderHostScope {
 
 impl Drop for WorkingMemoryFundingRun {
     fn drop(&mut self) {
+        drop(self.borrowed_storage.take());
         if self.open {
             let mut usage = lock_for_retirement(&self.pool);
             usage
@@ -1286,7 +1569,8 @@ enum ScopePurpose {
 #[must_use = "certify only after settlement and complete retained-storage publication"]
 pub struct WorkingMemoryFundingScope {
     purpose: ScopePurpose,
-    pool: WorkingMemoryPool,
+    allocation_funding: Option<WorkingMemoryAllocationFunding>,
+    pool: MemoryLedger,
     pub(super) id: u64,
     active: bool,
     // Independent lifetime for excluded registered storage. Every uncertified
@@ -1330,7 +1614,7 @@ impl WorkingMemoryFundingScope {
         &self,
         reservation: &WorkingMemoryReservation,
     ) -> Result<InferenceExecutionIdentity, WorkingMemoryError> {
-        if reservation.0.funding != Some(self.id) || !self.pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(self.id) || !self.pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let usage = self
@@ -1343,14 +1627,14 @@ impl WorkingMemoryFundingScope {
         Ok(reservation.0.execution.clone())
     }
 
-    /// The exact managed domain covered by this scope.
-    pub fn pool(&self) -> &WorkingMemoryPool {
+    /// The ledger coordinating this scope's physical-domain allowances.
+    pub fn pool(&self) -> &MemoryLedger {
         &self.pool
     }
 
     /// Checks domain identity without submitting work or changing accounting.
-    pub fn validate_domain(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.pool.same_domain(pool) {
+    pub fn validate_ledger(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.pool.same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -1360,10 +1644,11 @@ impl WorkingMemoryFundingScope {
     /// Publishes exact backing identities from this scope's reserved envelope.
     /// This has the same physical-lifetime contract as pool storage registration.
     /// Returned map keys that pin storage must retire before their handles.
-    pub fn adopt_storage_individually<K: Clone + Ord + Send + 'static>(
+    #[cfg(test)]
+    pub(crate) fn adopt_storage_individually<K: Clone + Ord + Send + 'static>(
         &self,
-        storage: impl IntoIterator<Item = (K, u64)>,
-    ) -> Result<BTreeMap<K, WorkingMemoryStorage<K>>, WorkingMemoryError> {
+        storage: impl IntoIterator<Item = (K, super::storage::StorageAllocation)>,
+    ) -> Result<super::StorageRegistrations<K>, WorkingMemoryError> {
         self.pool.adopt_storage_individually(self, storage)
     }
 
@@ -1390,6 +1675,22 @@ impl WorkingMemoryFundingScope {
             // cannot replace the canonical ticket/parcel transition.
             return Err(WorkingMemoryError::ExecutionFenced);
         }
+        if let Some(funding) = &self.allocation_funding {
+            funding.close_locked();
+        }
+        drop(usage);
+        // Completion releases source custody while this scope still retains its
+        // account and constructor floor. Pin destructors may reacquire the ledger.
+        drop(self.borrowed_storage.take());
+        drop(self.capture_source.take());
+        drop(self.native_publication_identity.take());
+        let mut usage = self
+            .pool
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        let state = usage.funding.get_mut(&self.id).expect("live funding scope");
         state.close_scope(self.purpose);
         self.active = false;
         settle(&mut usage, self.id);
@@ -1402,6 +1703,10 @@ impl WorkingMemoryFundingScope {
 impl Drop for WorkingMemoryFundingScope {
     fn drop(&mut self) {
         if self.active {
+            if let Some(funding) = &self.allocation_funding {
+                let _usage = lock_for_retirement(&self.pool);
+                funding.close_locked();
+            }
             // Allocation and ownership preparation precede the lock, including
             // poisoned-account cleanup. Successful certification takes no node.
             let capture = self.capture_source.take().map(|slot| (*slot).into_pin());
@@ -1439,22 +1744,148 @@ pub(super) fn retire_metadata(usage: &mut Usage, id: u64) {
 }
 
 pub(super) fn retire_allocation(usage: &mut Usage, id: u64, bytes: u64) {
-    let state = usage.funding.get_mut(&id).expect("live funded allocation");
-    state.allocations -= 1;
-    usage.registered -= bytes;
+    let slot = usage.host_slot;
+    let Usage {
+        domains, funding, ..
+    } = usage;
+    let state = funding.get_mut(&id).expect("live funded allocation");
+    state.allocations = state
+        .allocations
+        .checked_sub(1)
+        .expect("live allocation population");
+    domains[slot].registered = domains[slot]
+        .registered
+        .checked_sub(bytes)
+        .expect("registered backing");
     if state.retains_workspace() {
-        state.remaining += bytes;
-        usage.reserved += bytes;
+        state.domains[slot].remaining = state.domains[slot]
+            .remaining
+            .checked_add(bytes)
+            .expect("retained funding allowance");
+        domains[slot].reserved = domains[slot]
+            .reserved
+            .checked_add(bytes)
+            .expect("retained reserved allowance");
     }
     settle(usage, id);
 }
 
+pub(super) fn retire_placed_allocation(
+    usage: &mut Usage,
+    origin: Option<u64>,
+    bytes: u64,
+    placement: &eredu_core::MemoryPlacement,
+    converted_allowance: u64,
+) {
+    retire_placed_allocation_mode(usage, origin, bytes, placement, converted_allowance, false);
+}
+
+pub(super) fn retire_placed_allocation_mode(
+    usage: &mut Usage,
+    origin: Option<u64>,
+    bytes: u64,
+    placement: &eredu_core::MemoryPlacement,
+    converted_allowance: u64,
+    pending: bool,
+) {
+    let active = origin.is_some_and(|id| {
+        usage
+            .funding
+            .get(&id)
+            .expect("live allocation origin")
+            .retains_workspace()
+    });
+    let allowance = matches!(
+        placement.kind(),
+        eredu_core::MemoryPlacementKind::Possible { .. }
+    );
+    let restored_allowance = if allowance {
+        bytes
+    } else {
+        converted_allowance
+    };
+    for domain in placement.domains() {
+        let slot = usage
+            .domain_slot(*domain)
+            .expect("canonical placement topology");
+        let current = &usage.domains[slot];
+        let reserved = if pending {
+            current
+                .reserved
+                .checked_sub(bytes)
+                .expect("pending backing allowance")
+        } else {
+            assert!(current.registered >= bytes, "registered backing charge");
+            current.reserved
+        };
+        if active {
+            reserved
+                .checked_add(bytes)
+                .expect("retained allocation allowance");
+            let balance = &usage.funding.get(&origin.unwrap()).unwrap().domains[slot];
+            balance
+                .remaining
+                .checked_add(bytes)
+                .expect("original account allowance");
+            balance
+                .remaining_charge
+                .placement_allowance_bytes
+                .checked_add(restored_allowance)
+                .expect("original placement allowance");
+            current
+                .placement_allowances
+                .checked_add(converted_allowance)
+                .expect("converted allowance refund");
+        } else if allowance {
+            assert!(
+                current.placement_allowances >= bytes,
+                "live placement allowance"
+            );
+        }
+    }
+    if let Some(id) = origin {
+        let state = usage
+            .funding
+            .get_mut(&id)
+            .expect("canonical allocation origin");
+        state.allocations = state
+            .allocations
+            .checked_sub(1)
+            .expect("live allocation population");
+    }
+    for domain in placement.domains() {
+        let slot = usage
+            .domain_slot(*domain)
+            .expect("canonical placement topology");
+        if pending {
+            usage.domains[slot].reserved -= bytes;
+        } else {
+            usage.domains[slot].registered -= bytes;
+        }
+        if active {
+            usage.domains[slot].reserved += bytes;
+            let balance = &mut usage.funding.get_mut(&origin.unwrap()).unwrap().domains[slot];
+            balance.remaining += bytes;
+            balance.remaining_charge.placement_allowance_bytes += restored_allowance;
+            usage.domains[slot].placement_allowances += converted_allowance;
+        } else if allowance {
+            usage.domains[slot].placement_allowances -= bytes;
+        }
+    }
+    if let Some(id) = origin {
+        settle(usage, id);
+    }
+}
+
 pub(super) fn retire_registration(usage: &mut Usage, id: u64) {
-    usage
+    let state = usage
         .funding
         .get_mut(&id)
-        .expect("live funded registration")
-        .registrations -= 1;
+        .expect("live funded registration");
+    state.registrations = state
+        .registrations
+        .checked_sub(1)
+        .expect("live registration count");
     settle(usage, id);
 }
 
@@ -1462,39 +1893,107 @@ pub(super) fn retire_registration(usage: &mut Usage, id: u64) {
 // derive reusable transient headroom from that possibly inconsistent ledger.
 // Mark existing accounts before any host decrement, retirement or settlement;
 // this neither creates custody nor clears the mutex poison.
-pub(super) fn lock_for_retirement(pool: &WorkingMemoryPool) -> accounts::RetirementGuard<'_> {
+pub(super) fn lock_for_retirement(pool: &MemoryLedger) -> accounts::RetirementGuard<'_> {
     accounts::lock(pool)
 }
 
 fn settle(usage: &mut Usage, id: u64) {
-    let state = usage.funding.get_mut(&id).expect("live funding account");
+    let Usage {
+        domains,
+        funding,
+        reservations,
+        ..
+    } = usage;
+    let state = funding.get_mut(&id).expect("live funding account");
     if !state.retains_workspace() {
-        // Host and native partitions retain their exact protected holds.
-        // Recognized native rows never add a second registered byte charge.
-        if let Some(reserved) = state
-            .spendable_remaining()
-            .ok()
-            .and_then(|released| usage.reserved.checked_sub(released))
-        {
-            usage.reserved = reserved;
-            state.remaining = state
-                .protected_remaining()
-                .expect("validated protected hold");
-        } else {
-            // Never fabricate credit after an accounting invariant failure.
+        // Validate every retirement before releasing any domain. Corruption
+        // quarantines the complete account and preserves every charge.
+        let valid = state.domains.iter().enumerate().all(|(slot, balance)| {
+            let host = if slot == state.host_slot {
+                state.host_held
+            } else {
+                0
+            };
+            let kept_allowance = balance
+                .remaining_charge
+                .placement_allowance_bytes
+                .min(balance.native_held.unwrap_or(0));
+            host.checked_add(balance.native_held.unwrap_or(0))
+                .and_then(|protected| balance.remaining.checked_sub(protected))
+                .is_some_and(|released| {
+                    domains[slot].reserved >= released
+                        && domains[slot].placement_allowances
+                            >= balance.remaining_charge.placement_allowance_bytes - kept_allowance
+                        && domains[slot].estimates
+                            >= balance.remaining_charge.estimated_overhead_bytes
+                        && domains[slot].headroom >= balance.remaining_charge.headroom_bytes
+                })
+        });
+        if !valid {
             state.quarantined = true;
+            return;
+        }
+        for (slot, balance) in state.domains.iter_mut().enumerate() {
+            let host = if slot == state.host_slot {
+                state.host_held
+            } else {
+                0
+            };
+            let protected = host + balance.native_held.unwrap_or(0);
+            let released = balance.remaining - protected;
+            domains[slot].reserved -= released;
+            balance.remaining = protected;
+            // Host control custody is accounted storage. A surviving native
+            // partition retains its admitted conservative placement allowance;
+            // unused estimates and headroom retire when execution closes.
+            let kept_allowance = balance
+                .remaining_charge
+                .placement_allowance_bytes
+                .min(balance.native_held.unwrap_or(0));
+            domains[slot].placement_allowances -=
+                balance.remaining_charge.placement_allowance_bytes - kept_allowance;
+            domains[slot].estimates -= balance.remaining_charge.estimated_overhead_bytes;
+            domains[slot].headroom -= balance.remaining_charge.headroom_bytes;
+            balance.remaining_charge = eredu_core::DomainMemoryCharge {
+                accounted_bytes: protected - kept_allowance,
+                placement_allowance_bytes: kept_allowance,
+                ..Default::default()
+            };
         }
     }
-    if !state.metadata_live
+    let completed_host = !state.metadata_live
         && !state.retains_workspace()
         && state.scopes == 0
-        && state.native_held.is_none()
-        && state.remaining == state.control_floor
-        && state.host_held == state.control_floor
-        && state.allocations == 0
-        && state.registrations == 0
-    {
-        usage.funding.mark_terminal(id);
+        && state.native_scopes == 0
+        && state.active_span.is_none()
+        && state.domains.iter().enumerate().all(|(slot, balance)| {
+            balance.native_held.is_none()
+                && balance.native_registered == 0
+                && balance.remaining
+                    == if slot == state.host_slot {
+                        state.control_floor
+                    } else {
+                        0
+                    }
+        })
+        && state.host_held == state.control_floor;
+    if completed_host && state.allocations == 1 && state.registrations == 0 {
+        if let ReservationExclusion::SharedConstructor {
+            fixed_live: true,
+            active,
+        } = &mut state.reservation_exclusion
+        {
+            if *active {
+                *reservations = reservations
+                    .checked_sub(1)
+                    .expect("live constructor reservation exclusion");
+                *active = false;
+            }
+        }
+    }
+    let terminal = completed_host && state.allocations == 0 && state.registrations == 0;
+    if terminal {
+        funding.mark_terminal(id);
     }
 }
 
@@ -1510,5 +2009,7 @@ pub(in crate::working_memory) use generation_copy::{
     GenerationCopyAdmission, GenerationCopyCustody, GenerationCopySource,
 };
 
+mod copy_construction;
 mod copy_controls;
+pub(in crate::working_memory) use copy_construction::{PreparedCopyAccount, copy_domain_controls};
 pub(in crate::working_memory) use copy_controls::copy_account_control_bytes;

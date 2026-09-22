@@ -6,7 +6,7 @@ use super::{
     *,
 };
 
-use super::facts::{self, add, mul, Aliases, Emitter, FactResult, Output};
+use super::facts::{self, Aliases, Emitter, FactResult, Output, add, mul};
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
@@ -23,13 +23,19 @@ pub(super) fn emit(
     use eredu_nn::NormalizationScale;
     let (name, groups) = match &operation.kind {
         WorkspaceOperationKindView::Normalization(name, groups)
-            if matches!(*name, "rms" | "l2" | "gated_group_rms_norm" | "silu_gated_group_rms_norm") => (*name, *groups),
+            if matches!(
+                *name,
+                "rms" | "l2" | "gated_group_rms_norm" | "silu_gated_group_rms_norm"
+            ) =>
+        {
+            (*name, *groups)
+        }
         WorkspaceOperationKindView::LayerNorm { weight, bias } => {
             if operation.inputs.len() != 1 + usize::from(*weight) + usize::from(*bias) {
                 return invalid();
             }
             ("layer_norm", None)
-        },
+        }
         WorkspaceOperationKindView::ConstructedNormalization(spec) => {
             spec.validate_fixed()?;
             ("constructed_rms", spec.groups)
@@ -109,7 +115,11 @@ pub(super) fn emit(
     // Matching F16/BF16 learned RMS widens, performs custom weightless RMS,
     // casts down, then multiplies. Other type pairs use fast RMS: input and
     // weight casts plus an output (which can itself be the contiguous copy).
-    let learned = add(mul(7, full)?, scalar)?.max(add(mul(2, full)?, vector)?);
+    let learned_custom = add(mul(7, full)?, scalar)?;
+    let learned_fast = add(mul(2, full)?, vector)?;
+    let learned = learned_custom.max(learned_fast);
+    let mut default_births = 0usize;
+    let mut default_alternatives = None;
     let total = match name {
         "layer_norm" => {
             if weights.len() > 2 || groups.is_some() {
@@ -118,6 +128,9 @@ pub(super) fn emit(
             // Native Metal fast LayerNorm uses one output/contiguous copy,
             // input cast, each present parameter cast and absent-parameter
             // scalar placeholders. Its reductions stay in threadgroup memory.
+            // fast.cpp constructs only the absent weight/bias placeholders
+            // through array(value, dtype); its epsilon is a kernel argument.
+            default_births = 2 - weights.len();
             add(
                 add(mul(2, full)?, mul(weights.len() as u64, vector)?)?,
                 mul((2 - weights.len()) as u64, scalar)?,
@@ -128,8 +141,22 @@ pub(super) fn emit(
                 return invalid();
             }
             if weights.is_empty() {
+                if elements == 0 {
+                    default_births = 2;
+                } else {
+                    default_alternatives = Some([
+                        (custom_weightless, scalar, 1),
+                        (fallback_weightless, mul(2, scalar)?, 2),
+                    ]);
+                }
                 weightless
             } else {
+                if elements != 0 {
+                    default_alternatives = Some([
+                        (add(learned_custom, full)?, scalar, 1),
+                        (add(learned_fast, full)?, 0, 0),
+                    ]);
+                }
                 add(learned, full)?
             }
         }
@@ -137,10 +164,15 @@ pub(super) fn emit(
             if groups.is_some() || !weights.is_empty() {
                 return invalid();
             }
+            // The actual epsilon is eager; sum has no host scalar seed.
+            default_births = 1;
             // square + sum + epsilon add + rsqrt + input multiply.
             add(add(mul(4, full)?, mul(5, row)?)?, add(reduction, scalar)?)?
         }
         "gated_group_rms_norm" | "silu_gated_group_rms_norm" => {
+            // mean's number_of_elements and the explicit epsilon are eager.
+            // Native Sigmoid is a primitive, with no scalar constructor.
+            default_births = 2;
             // Both supported orders contain input/gate widening, sigmoid and
             // gate multiplication, two reshapes, square/mean/add/rsqrt,
             // normalization and scale/gate products, and final conversion.
@@ -158,7 +190,8 @@ pub(super) fn emit(
             if spec.dimensions != width || weights.len() != usize::from(weighted) {
                 return invalid();
             }
-            let offset = if matches!(spec.scale, NormalizationScale::LearnedOffset { .. }) {
+            let has_offset = matches!(spec.scale, NormalizationScale::LearnedOffset { .. });
+            let offset = if has_offset {
                 add(mul(3, vector)?, scalar)?
             } else {
                 0
@@ -167,10 +200,13 @@ pub(super) fn emit(
                 // Grouped construction widens before reshaping, so nonempty
                 // inputs definitely use the custom F32 weightless kernel.
                 let norm = if elements != 0 {
+                    default_births = 1;
                     custom_weightless
                 } else {
+                    default_births = 2;
                     weightless
                 };
+                default_births += usize::from(has_offset);
                 let base = add(mul(4, full)?, norm)?; // widen, two reshapes, final cast
                 if weighted {
                     add(base, add(add(vector, offset)?, mul(3, full)?)?)?
@@ -178,13 +214,46 @@ pub(super) fn emit(
                     base
                 }
             } else if weighted {
+                if has_offset {
+                    // The F32 offset promotes the scale to F32, excluding the
+                    // matching-half custom branch. Keep its existing finite
+                    // buffer envelope, with only the actual offset seed.
+                    default_births = 1;
+                } else if elements != 0 {
+                    default_alternatives =
+                        Some([(learned_custom, scalar, 1), (learned_fast, 0, 0)]);
+                }
                 add(learned, offset)?
             } else {
+                if elements == 0 {
+                    default_births = 2;
+                } else {
+                    default_alternatives = Some([
+                        (custom_weightless, scalar, 1),
+                        (fallback_weightless, mul(2, scalar)?, 2),
+                    ]);
+                }
                 weightless
             }
         }
         _ => unreachable!(),
     };
+    // Custom RMS owns one copied epsilon input; the arithmetic fallback owns
+    // both mean's count and epsilon. Keep their whole raw scratch envelopes
+    // separate before the source reducer takes any per-domain maximum.
+    if let Some(mut alternatives) = default_alternatives {
+        for row in &mut alternatives {
+            row.0 = row
+                .0
+                .checked_sub(full)
+                .ok_or(MlxWorkspaceFactError::descriptor(
+                    "normalization branch omits its result",
+                ))?;
+        }
+        sink.default_scratch_alternatives(&alternatives)?;
+    } else if default_births != 0 {
+        sink.default_scratch(mul(default_births as u64, scalar)?, default_births)?;
+    }
     sink.output(Output::AllocateOrAliasInputs {
         bytes: full,
         inputs: Aliases::Range {

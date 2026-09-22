@@ -17,11 +17,11 @@ fn json() -> String {
 fn ordered_normalization_matches_ordinary_and_refuses_before_source_and_operation_work() {
     let input = json();
     let ordinary = eredu_text::tokenizer::Tokenizer::from_bytes(input.as_bytes()).unwrap();
-    let measure = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let measure = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let original = source(&measure, &input);
     assert!(original.matches_configuration(&ordinary));
     let c = original.original_bytes();
-    let short = WorkingMemoryPool::new(c - 1, 0).unwrap();
+    let short = crate::working_memory::memory_fixture::host_ledger(c - 1, 0).unwrap();
     let error = short
         .compile_tokenizer_with(
             TokenizerPlan::prepare_json(input.as_bytes()).unwrap(),
@@ -29,12 +29,14 @@ fn ordered_normalization_matches_ordinary_and_refuses_before_source_and_operatio
         )
         .unwrap_err();
     assert_eq!(error.retained_bytes(), 0);
-    assert_eq!(short.used_bytes().unwrap(), 0);
+    assert_eq!(short.payload_used_bytes().unwrap(), 0);
     for text in ["", "A E\u{301}<R>A", "É", "İΣẞ", "\u{301}\u{300}A"] {
-        let e = WorkingMemoryPool::tokenizer_encode_required_bytes(&original, text, false).unwrap();
+        let e = MemoryLedger::tokenizer_encode_required_bytes(&original, text, false).unwrap();
         let expected = ordinary.encode(text, false).unwrap();
         for short in [true, false] {
-            let pool = WorkingMemoryPool::new(c + e - u64::from(short), 0).unwrap();
+            let pool =
+                crate::working_memory::memory_fixture::host_ledger(c + e - u64::from(short), 0)
+                    .unwrap();
             let source = source(&pool, &input);
             let result = pool.encode_tokenizer_ids_with(
                 &source,
@@ -43,7 +45,7 @@ fn ordered_normalization_matches_ordinary_and_refuses_before_source_and_operatio
                 |p| p,
                 || {
                     assert!(!short);
-                    assert_eq!(pool.used_bytes().unwrap(), c + e);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                 },
                 || {},
             );
@@ -51,30 +53,32 @@ fn ordered_normalization_matches_ordinary_and_refuses_before_source_and_operatio
                 let error = result.unwrap_err();
                 assert!(matches!(
                     error.accounting_failure(),
-                    Some(WorkingMemoryError::BudgetExceeded { .. })
+                    Some(WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    ))
                 ));
                 assert_eq!(error.retained_bytes(), 0);
                 drop(source);
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             } else {
                 let output = result.unwrap();
                 assert_eq!(output.ids(), expected.get_ids(), "{text:?}");
                 assert!(output.matches_source(&source));
                 drop(source);
-                assert_eq!(pool.used_bytes().unwrap(), c + e);
+                assert_eq!(pool.payload_used_bytes().unwrap(), c + e);
                 drop(output);
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     }
     drop(original);
-    assert_eq!(measure.used_bytes().unwrap(), 0);
+    assert_eq!(measure.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn ordered_normalization_prefix_derivative_refreshes_actual_added_patterns() {
     let input = json();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let original = source(&pool, &input);
     let derived = original.input_prefix_normalized_source().unwrap();
     assert!(!derived.same_source(&original));
@@ -97,7 +101,7 @@ fn ordered_normalization_prefix_derivative_refreshes_actual_added_patterns() {
     }
     let bytes = original.original_bytes() + derived.original_bytes();
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
     drop(derived);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

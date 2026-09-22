@@ -17,7 +17,7 @@ impl<B: ParameterBackend> LoadedModel<B> {
         parameter: &str,
         region: ParameterRegion,
         limits: CaptureUsage,
-    ) -> Result<ParameterValues, ParameterError> {
+    ) -> Result<SharedParameterValues, ParameterError> {
         B::query_parameter(&mut self.runtime, identity, parameter, region, limits)
     }
     /// Admits an immutable multi-parameter edit against current loaded facts.
@@ -35,7 +35,7 @@ impl<B: ParameterBackend> LoadedModel<B> {
         parameter: &str,
         projection: ParameterProjection,
         limits: CaptureUsage,
-    ) -> Result<ParameterProjectionValues, ParameterError> {
+    ) -> Result<SharedParameterProjectionValues, ParameterError> {
         B::project_parameter(&mut self.runtime, identity, parameter, projection, limits)
     }
     /// Atomically installs prepared replacements and clears incompatible model state.

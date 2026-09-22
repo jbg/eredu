@@ -11,6 +11,23 @@ pub struct CaptureRoutedUnitsGeometry<'a> {
     bank: RoutedUnitGeometry,
 }
 impl<'a> CaptureRoutedUnitsGeometry<'a> {
+    /// Exact interval retained with the original sparse selection.
+    pub fn invocation_window(&self) -> Option<PartitionCaptureInvocationWindow> {
+        self.inner.invocation_window()
+    }
+
+    /// Retain exact logical origin and physical axes before sparse spatial projection.
+    pub fn prepare_receipt(
+        source: &'a AdmittedCapturePlan,
+        context: &PartitionCaptureContext,
+    ) -> Result<Self, CaptureTensorGeometryError> {
+        Self::from_inner(CaptureTensorGeometry::prepare_receipt_kind(
+            source,
+            context,
+            GeometryTransform::RoutedUnits,
+        )?)
+    }
+
     /// Resolve an active sparse selection through the shared invocation geometry.
     pub fn prepare(
         source: &'a AdmittedCapturePlan,
@@ -78,60 +95,148 @@ impl<'a> CaptureRoutedUnitsGeometry<'a> {
     /// Exact global coordinates of one original sparse unit fragment. The four
     /// fixed rows are starts, ends, strides and shape. Ordinary and paid workers
     /// use this same mapping; it creates no owning slice or native source.
-    pub fn fragment_axes(projection: &CaptureSlicePartition, fragment: usize)
-        -> Result<[[u64; 3]; 4], RoutedUnitValidationError> {
+    pub fn fragment_axes(
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+    ) -> Result<[[u64; 3]; 4], RoutedUnitValidationError> {
         use RoutedUnitValidationError as E;
         let selected = projection.global_slice();
-        let destination = projection.fragments().get(fragment).ok_or(E::Selection)?.destination();
-        if [selected.starts.len(), selected.strides.len(), destination.starts.len(),
-            destination.strides.len(), destination.shape.len()].iter().any(|n| *n != 3) {
+        let destination = projection
+            .fragments()
+            .get(fragment)
+            .ok_or(E::Selection)?
+            .destination();
+        if [
+            selected.starts.len(),
+            selected.strides.len(),
+            destination.starts.len(),
+            destination.strides.len(),
+            destination.shape.len(),
+        ]
+        .iter()
+        .any(|n| *n != 3)
+        {
             return Err(E::SliceExtent);
         }
         let mut axes = [[0; 3]; 4];
         for axis in 0..3 {
-            let start = destination.starts[axis].checked_mul(selected.strides[axis])
-                .and_then(|n| selected.starts[axis].checked_add(n)).ok_or(E::Overflow)?;
-            let stride = destination.strides[axis].checked_mul(selected.strides[axis]).ok_or(E::Overflow)?;
+            let start = destination.starts[axis]
+                .checked_mul(selected.strides[axis])
+                .and_then(|n| selected.starts[axis].checked_add(n))
+                .ok_or(E::Overflow)?;
+            let stride = destination.strides[axis]
+                .checked_mul(selected.strides[axis])
+                .ok_or(E::Overflow)?;
             let count = destination.shape[axis];
-            let end = if count == 0 { start } else {
-                (count - 1).checked_mul(stride).and_then(|n| start.checked_add(n))
-                    .and_then(|n| n.checked_add(1)).ok_or(E::Overflow)?
+            let end = if count == 0 {
+                start
+            } else {
+                (count - 1)
+                    .checked_mul(stride)
+                    .and_then(|n| start.checked_add(n))
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(E::Overflow)?
             };
-            axes[0][axis] = start; axes[1][axis] = end;
-            axes[2][axis] = stride; axes[3][axis] = count;
+            axes[0][axis] = start;
+            axes[1][axis] = end;
+            axes[2][axis] = stride;
+            axes[3][axis] = count;
         }
         Ok(axes)
     }
     /// Borrow one receipt fragment while preserving the original global bank
     /// and token/route identities. Local native columns remain a separate source.
-    pub fn prepare_partition(source: &'a AdmittedCapturePlan, selection: usize,
-        phase: CapturePhase, prediction: u64, invocation: Option<CaptureInvocationShape>,
-        projection: &CaptureSlicePartition, fragment: usize) -> Result<Self, CaptureTensorGeometryError> {
-        if projection.axis() != 2 { return Err(CaptureTensorGeometryError::Partition); }
-        let mut inner = CaptureTensorGeometry::prepare_kind(source, selection, phase,
-            prediction, invocation, GeometryTransform::RoutedUnits)?;
+    pub fn prepare_partition(
+        source: &'a AdmittedCapturePlan,
+        selection: usize,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+    ) -> Result<Self, CaptureTensorGeometryError> {
+        if projection.axis() != 2 {
+            return Err(CaptureTensorGeometryError::Partition);
+        }
+        let mut inner = CaptureTensorGeometry::prepare_kind(
+            source,
+            selection,
+            phase,
+            prediction,
+            invocation,
+            GeometryTransform::RoutedUnits,
+        )?;
+        Self::partition_inner(inner, projection, fragment)
+    }
+    /// Apply a retained producer to the receipt's exact logical row interval.
+    pub fn prepare_receipt_partition(
+        source: &'a AdmittedCapturePlan,
+        context: &PartitionCaptureContext,
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+    ) -> Result<Self, CaptureTensorGeometryError> {
+        let inner = CaptureTensorGeometry::prepare_receipt_kind(
+            source,
+            context,
+            GeometryTransform::RoutedUnits,
+        )?;
+        Self::partition_inner(inner, projection, fragment)
+    }
+    fn partition_inner(
+        mut inner: CaptureTensorGeometry<'a>,
+        projection: &CaptureSlicePartition,
+        fragment: usize,
+    ) -> Result<Self, CaptureTensorGeometryError> {
+        if projection.axis() != 2 {
+            return Err(CaptureTensorGeometryError::Partition);
+        }
         // Authenticate the exact global selection and local projection using the
         // existing geometry worker before translating its selected coordinates.
-        inner.clone().apply_partition(projection, fragment, PartitionCaptureCombination::Disjoint)?;
+        inner.clone().apply_partition(
+            projection,
+            fragment,
+            PartitionCaptureCombination::Disjoint,
+        )?;
         let axes = Self::fragment_axes(projection, fragment)?;
         inner.elements = 1;
         for axis in 0..3 {
-            inner.starts[axis] = axes[0][axis]; inner.ends[axis] = axes[1][axis];
+            inner.starts[axis] = axes[0][axis];
+            inner.ends[axis] = axes[1][axis];
             inner.strides[axis] = axes[2][axis];
-            inner.shape[axis] = usize::try_from(axes[3][axis]).map_err(|_| CaptureTensorGeometryError::Overflow)?;
-            inner.elements = inner.elements.checked_mul(inner.shape[axis]).ok_or(CaptureTensorGeometryError::Overflow)?;
+            inner.shape[axis] =
+                usize::try_from(axes[3][axis]).map_err(|_| CaptureTensorGeometryError::Overflow)?;
+            inner.elements = inner
+                .elements
+                .checked_mul(inner.shape[axis])
+                .ok_or(CaptureTensorGeometryError::Overflow)?;
         }
         Self::from_inner(inner)
     }
     /// Fixed fragment mapping/projection frames, excluding all caller buffers.
     pub fn partition_control_bytes() -> Option<usize> {
         use std::mem::{size_of, size_of_val};
-        let parts = [Self::preparation_control_bytes()?, CaptureTensorGeometry::partition_preparation_control_bytes()?,
-            size_of::<[[u64; 3]; 4]>() * 2, size_of::<Result<[[u64; 3]; 4], RoutedUnitValidationError>>(),
-            size_of::<Self>() * 2, size_of::<Result<Self, CaptureTensorGeometryError>>(),
-            size_of::<(&AdmittedCapturePlan, usize, CapturePhase, u64, Option<CaptureInvocationShape>, &CaptureSlicePartition, usize)>(),
-            size_of::<(&CaptureSlicePartition, usize)>(), size_of::<(usize, u64, u64, u64, u64)>()];
-        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
+        let parts = [
+            Self::preparation_control_bytes()?,
+            CaptureTensorGeometry::partition_preparation_control_bytes()?,
+            size_of::<[[u64; 3]; 4]>() * 2,
+            size_of::<Result<[[u64; 3]; 4], RoutedUnitValidationError>>(),
+            size_of::<Self>() * 2,
+            size_of::<Result<Self, CaptureTensorGeometryError>>(),
+            size_of::<(
+                &AdmittedCapturePlan,
+                usize,
+                CapturePhase,
+                u64,
+                Option<CaptureInvocationShape>,
+                &CaptureSlicePartition,
+                usize,
+            )>(),
+            size_of::<(&CaptureSlicePartition, usize)>(),
+            size_of::<(usize, u64, u64, u64, u64)>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// Fixed constructor and validation control, excluding callers' owned storage.
@@ -303,7 +408,6 @@ mod tests {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -371,23 +475,44 @@ mod tests {
 mod prefill_tests {
     use super::*;
     #[test]
-    fn sparse_prefill_maps_uneven_batched_tokens_without_inventing_source_coverage(){
-        let source=super::tests::admission(7);
-        let inference=crate::InferenceGeometry {batch_size:2,cached_positions:0,input_positions:5,
-            max_output_tokens:3,prefill_chunk_positions:2,output:crate::OutputDemand::LastPosition};
-        let plan=CaptureRoutedPrefillPlan::prepare(&source,0,inference).unwrap();
-        let expected=[vec![0,1,5,6],vec![2,3,7,8],vec![4,9]];
-        let mut selected=Vec::new();let mut ranges=Vec::new();
-        for (index,tokens) in expected.iter().enumerate(){
-            let fragment=plan.fragment(index as u64).unwrap();
-            assert_eq!((0..fragment.source_tokens()).map(|i|fragment.logical_token(i).unwrap()).collect::<Vec<_>>(),*tokens);
-            assert_eq!(fragment.logical_token(fragment.source_tokens()),None);
-            for i in 0..fragment.source_tokens(){if fragment.selects(i,0){selected.push(fragment.logical_token(i).unwrap());}}
-            ranges.extend(fragment.source_ranges(0,fragment.source_tokens()).unwrap());
-            assert!(fragment.source_ranges(0,fragment.source_tokens()+1).is_none());
+    fn sparse_prefill_maps_uneven_batched_tokens_without_inventing_source_coverage() {
+        let source = super::tests::admission(7);
+        let inference = crate::InferenceGeometry {
+            batch_size: 2,
+            cached_positions: 0,
+            input_positions: 5,
+            max_output_tokens: 3,
+            prefill_chunk_positions: 2,
+            output: crate::OutputDemand::LastPosition,
+        };
+        let plan = CaptureRoutedPrefillPlan::prepare(&source, 0, inference).unwrap();
+        let expected = [vec![0, 1, 5, 6], vec![2, 3, 7, 8], vec![4, 9]];
+        let mut selected = Vec::new();
+        let mut ranges = Vec::new();
+        for (index, tokens) in expected.iter().enumerate() {
+            let fragment = plan.fragment(index as u64).unwrap();
+            assert_eq!(
+                (0..fragment.source_tokens())
+                    .map(|i| fragment.logical_token(i).unwrap())
+                    .collect::<Vec<_>>(),
+                *tokens
+            );
+            assert_eq!(fragment.logical_token(fragment.source_tokens()), None);
+            for i in 0..fragment.source_tokens() {
+                if fragment.selects(i, 0) {
+                    selected.push(fragment.logical_token(i).unwrap());
+                }
+            }
+            ranges.extend(fragment.source_ranges(0, fragment.source_tokens()).unwrap());
+            assert!(
+                fragment
+                    .source_ranges(0, fragment.source_tokens() + 1)
+                    .is_none()
+            );
         }
-        assert_eq!(ranges,[[0,2],[5,7],[2,4],[7,9],[4,5],[9,10]]);
-        selected.sort_unstable();assert_eq!(selected,[1,4,7]);
+        assert_eq!(ranges, [[0, 2], [5, 7], [2, 4], [7, 9], [4, 5], [9, 10]]);
+        selected.sort_unstable();
+        assert_eq!(selected, [1, 4, 7]);
         assert!(plan.fragment(3).is_err());
     }
 }

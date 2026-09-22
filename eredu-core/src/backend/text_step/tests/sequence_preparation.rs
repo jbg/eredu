@@ -320,16 +320,29 @@ fn sequence_mismatched_or_unbounded_original_allowance_rejects_before_quote() {
             Err(ControlledTextGenerationError::Preparation(e)) => e,
             _ => panic!("expected original mismatch"),
         };
-        assert_eq!(
-            std::error::Error::source(&error)
-                .unwrap()
-                .downcast_ref::<GenerationSequenceAdmissionError>(),
-            Some(&GenerationSequenceAdmissionError::RequestMismatch)
-        );
-        assert_eq!(
-            facts.borrow().sequence.votes,
-            [(Stage::Admission, Status::Failed)]
-        );
+        let source = std::error::Error::source(&error).unwrap();
+        if limit.is_some() {
+            assert_eq!(
+                source.downcast_ref::<GenerationSequenceAdmissionError>(),
+                Some(&GenerationSequenceAdmissionError::RequestMismatch)
+            );
+            assert_eq!(
+                facts.borrow().sequence.votes,
+                [(Stage::Admission, Status::Failed)]
+            );
+        } else {
+            assert!(matches!(
+                source.downcast_ref::<crate::CapabilityError>(),
+                Some(crate::CapabilityError::InvalidConfiguration {
+                    field: "text_inference_policy",
+                    ..
+                })
+            ));
+            assert_eq!(
+                facts.borrow().sequence.votes,
+                [(Stage::Admission, Status::Failed)]
+            );
+        }
         assert!(facts.borrow().preparation_events.is_empty());
         assert!(facts.borrow().events.is_empty());
         assert_eq!(probe.alive.load(Ordering::SeqCst), 0);

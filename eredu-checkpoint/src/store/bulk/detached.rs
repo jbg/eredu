@@ -1,13 +1,13 @@
 //! Exact admitted metadata detached from ordinary source/cache owners.
 use super::*;
-use crate::recipe::{EncodedRecipeRead, RecipeDtype, RecipeMetadata};
+use crate::recipe::{EncodedRecipeRead, EncodedRecipeReadView, RecipeDtype, RecipeMetadata};
 use std::{alloc::Layout, collections::TryReserveError, mem::size_of, sync::atomic::AtomicBool};
 
 /// A pure constructor over exact existing admitted reads. Neither inspection nor
 /// construction reads payloads, admits headers or selects another source.
 pub struct DetachedEncodedReadPlan<'a, I>
 where
-    I: Iterator<Item = &'a EncodedRecipeRead> + Clone + ExactSizeIterator,
+    I: Iterator<Item = EncodedRecipeReadView<'a>> + Clone + ExactSizeIterator,
 {
     reads: I,
     count: usize,
@@ -15,7 +15,7 @@ where
 }
 impl<'a, I> DetachedEncodedReadPlan<'a, I>
 where
-    I: Iterator<Item = &'a EncodedRecipeRead> + Clone + ExactSizeIterator,
+    I: Iterator<Item = EncodedRecipeReadView<'a>> + Clone + ExactSizeIterator,
 {
     pub(crate) fn inspect(reads: I) -> Option<Self> {
         let count = reads.len();
@@ -106,6 +106,8 @@ where
             size_of::<Vec<&SafetensorsReadTelemetry>>(),
             size_of::<TensorMetadata>(),
             size_of::<RecipeMetadata>(),
+            size_of::<EncodedRecipeReadView<'a>>(),
+            size_of::<Option<EncodedRecipeReadView<'a>>>(),
             size_of::<PathBuf>(),
             size_of::<String>(),
             size_of::<Vec<usize>>(),
@@ -118,7 +120,7 @@ where
     /// Same per-call read scratch derived before detachment. The actual source
     /// request and its C-owned error envelopes remain separate from this worker.
     pub fn read_layout<C>(&self) -> Option<EncodedReadLayout> {
-        EncodedRecipeRead::borrowed_read_layout(self.reads.clone())?.with_extra_controls(
+        EncodedRecipeReadView::borrowed_read_layout(self.reads.clone())?.with_extra_controls(
             DetachedEncodedReads::<C>::read_controls()?
                 .checked_add(size_of::<DetachedViews<'_, C>>().checked_mul(2)?)?,
         )
@@ -316,7 +318,12 @@ impl<C> DetachedEncodedReads<C> {
     /// Independent admissions of unchanged files may match. This comparison
     /// neither merges nor changes the detached source-local diagnostic groups,
     /// and does not replace the file-version checks performed by payload reads.
-    pub fn matches_read(&self, index: usize, other: &EncodedRecipeRead) -> bool {
+    pub fn matches_read<R>(&self, index: usize, other: &EncodedRecipeRead<R>) -> bool {
+        self.matches_read_view(index, other.borrowed())
+    }
+    /// The same authenticated identity comparison through a custody-preserving
+    /// loan. No source, metadata or funding owner is cloned.
+    pub fn matches_read_view(&self, index: usize, other: EncodedRecipeReadView<'_>) -> bool {
         let Some(read) = self.reads.get(index) else {
             return false;
         };
@@ -453,18 +460,25 @@ impl<C> DetachedEncodedReadSlice<'_, C> {
         };
         for (index, source) in self.owner.sources.iter().enumerate() {
             if !self.owner.reads[self.range.clone()]
-                .iter().any(|read| read.source == Some(index))
+                .iter()
+                .any(|read| read.source == Some(index))
             {
                 continue;
             }
             report.backend = WeightStoreBackend::Safetensors;
-            report.physical_reads = report.physical_reads.saturating_add(
-                source.telemetry.physical_reads.load(Ordering::Relaxed));
-            report.physical_read_bytes = report.physical_read_bytes.saturating_add(
-                source.telemetry.physical_read_bytes.load(Ordering::Relaxed));
-            report.payload_shard_paths.extend(source.paths.iter()
-                .filter(|(_, used)| used.load(Ordering::Relaxed))
-                .map(|(path, _)| path.clone()));
+            report.physical_reads = report
+                .physical_reads
+                .saturating_add(source.telemetry.physical_reads.load(Ordering::Relaxed));
+            report.physical_read_bytes = report
+                .physical_read_bytes
+                .saturating_add(source.telemetry.physical_read_bytes.load(Ordering::Relaxed));
+            report.payload_shard_paths.extend(
+                source
+                    .paths
+                    .iter()
+                    .filter(|(_, used)| used.load(Ordering::Relaxed))
+                    .map(|(path, _)| path.clone()),
+            );
         }
         report.payload_shard_paths.sort_unstable();
         report.payload_shard_paths.dedup();

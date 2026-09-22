@@ -61,7 +61,11 @@ where
         self.observer.observes_activations()
     }
     fn retained_media_cut(&mut self, visit: &mut dyn FnMut(&mut dyn FnMut(&T))) -> Result<(), X> {
-        result(&mut self.failure, &mut self.to_execution, self.observer.retained_media_cut(visit))
+        result(
+            &mut self.failure,
+            &mut self.to_execution,
+            self.observer.retained_media_cut(visit),
+        )
     }
     fn requires_prepared_traversal(&self) -> bool {
         self.observer.requires_prepared_traversal()
@@ -75,8 +79,22 @@ where
     fn requires_sequence_readout(&self) -> bool {
         self.observer.requires_sequence_readout()
     }
-    fn original_speculative_capture(&self) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> { self.observer.original_speculative_capture() }
-    fn retain_original_speculative_capture(&mut self, capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), crate::capture::CaptureProtocolError> { self.observer.retain_original_speculative_capture(capture) }
+    fn original_speculative_capture(
+        &self,
+    ) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> {
+        self.observer.original_speculative_capture()
+    }
+    fn original_speculative_capture_preview(
+        &self,
+    ) -> Option<crate::capture::OriginalSpeculativeCapturePreview<'_>> {
+        self.observer.original_speculative_capture_preview()
+    }
+    fn retain_original_speculative_capture(
+        &mut self,
+        capture: eredu_core::speculative::SpeculativeActivationCapture,
+    ) -> Result<(), crate::capture::CaptureProtocolError> {
+        self.observer.retain_original_speculative_capture(capture)
+    }
     fn admitted_prefill_capture(
         &self,
     ) -> Option<&crate::working_memory::AdmittedPrefillCapture<'_>> {
@@ -265,13 +283,20 @@ mod tests {
             identity: Rc<()>,
         }
         impl ActivationObserver<i32, Rc<()>> for CutOnly {
-            fn observes_activations(&self) -> bool { false }
+            fn observes_activations(&self) -> bool {
+                false
+            }
             fn observe(&mut self, _: &str, _: &i32) -> Result<(), Rc<()>> {
                 panic!("activation-only callback is absent")
             }
-            fn retained_media_cut(&mut self, visit: &mut dyn FnMut(&mut dyn FnMut(&i32)))
-                -> Result<(), Rc<()>> {
-                visit(&mut |value| { assert_eq!(*value, 7); self.cuts += 1; });
+            fn retained_media_cut(
+                &mut self,
+                visit: &mut dyn FnMut(&mut dyn FnMut(&i32)),
+            ) -> Result<(), Rc<()>> {
+                visit(&mut |value| {
+                    assert_eq!(*value, 7);
+                    self.cuts += 1;
+                });
                 Err(self.identity.clone())
             }
             fn finish_prefill(&mut self, committed: bool) {
@@ -280,8 +305,13 @@ mod tests {
             }
         }
         let identity = Rc::new(());
-        let mut observer = CutOnly { cuts: 0, finishes: 0, identity: identity.clone() };
-        let mut bridge = ObserverErrorBridge::new(&mut observer, |_: ()| Rc::new(()), |_: &Rc<()>| ());
+        let mut observer = CutOnly {
+            cuts: 0,
+            finishes: 0,
+            identity: identity.clone(),
+        };
+        let mut bridge =
+            ObserverErrorBridge::new(&mut observer, |_: ()| Rc::new(()), |_: &Rc<()>| ());
         {
             let mut borrowed = crate::BorrowedActivationObserver(&mut bridge);
             assert!(!borrowed.observes_activations());
@@ -292,7 +322,8 @@ mod tests {
         assert_eq!(observer.cuts, 1);
         // The absent activation fact does not alter the observer's ordinary
         // lifecycle dispatch; this callback is still forwarded by the bridge.
-        let mut bridge = ObserverErrorBridge::new(&mut observer, |_: ()| Rc::new(()), |_: &Rc<()>| ());
+        let mut bridge =
+            ObserverErrorBridge::new(&mut observer, |_: ()| Rc::new(()), |_: &Rc<()>| ());
         bridge.finish_prefill(true);
         drop(bridge);
         assert_eq!(observer.finishes, 1);
@@ -441,11 +472,13 @@ mod tests {
             .prepare_transaction(epoch, crate::ExpertPass::Prefill)
             .unwrap();
         bridge.coordinate_transaction(epoch).unwrap();
-        assert!(bridge
-            .routed_unit_observer("expert")
-            .unwrap()
-            .unwrap()
-            .invocation_active());
+        assert!(
+            bridge
+                .routed_unit_observer("expert")
+                .unwrap()
+                .unwrap()
+                .invocation_active()
+        );
         bridge.observe_replica("replica", &0).unwrap();
         let source = eredu_core::capture::GeneratedCaptureSource {
             creation_bytes: 16,

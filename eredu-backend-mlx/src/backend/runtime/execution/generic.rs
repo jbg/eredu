@@ -53,14 +53,18 @@ mod submission;
 pub use submission::MlxUnitLease;
 pub(crate) use submission::PreparedUnit;
 mod original_operations;
+#[cfg(test)]
+pub(crate) use original_operations::OriginalOperationScopeCountProbe;
 pub(crate) use original_operations::{
-    RealtimeNeuralPlan,QualifiedRealtimeNeuralPlan,RealtimeNeuralOwner,
-    RealtimeLayerwisePlan,QualifiedRealtimeLayerwisePlan,
-    gguf_host_typed, ActivePredictionModuleBank, OriginalOperationActivation, OriginalOperationBankOwner, OriginalOperationPlan,
-    OriginalOperationAccess, OriginalResidencyAttempt, OriginalSelectedResidencyAttempt, OriginalSelectedResidencyAccess, PreparedSelectedResidencyAccess,
-    OriginalOperationRegistration, PredictionModuleCall, PredictionModulePlan,
-    PredictionModuleProjection, PreparedPredictionModuleBank, RegisteredOriginalScope, RegisteredScopeRetirementFailure, RegisteredScopeRetirementCause,
-    ResidentNeuralPlan, SelectedOriginalOperationPlan, SpeculativeNeuralOwner, SpeculativeSourcePartition,
+    gguf_host_typed, ActivePredictionModuleBank, OriginalOperationAccess,
+    OriginalOperationActivation, OriginalOperationBankOwner, OriginalOperationPlan,
+    OriginalOperationRegistration, OriginalResidencyAttempt, OriginalSelectedResidencyAccess,
+    OriginalSelectedResidencyAttempt, PredictionModuleCall, PredictionModulePlan,
+    PredictionModuleProjection, PreparedPredictionModuleBank, PreparedSelectedResidencyAccess,
+    QualifiedRealtimeLayerwisePlan, QualifiedRealtimeNeuralPlan, RealtimeLayerwisePlan,
+    RealtimeNeuralOwner, RealtimeNeuralPlan, RegisteredOriginalScope,
+    RegisteredScopeRetirementCause, RegisteredScopeRetirementFailure, ResidentNeuralPlan,
+    SelectedOriginalOperationPlan, SpeculativeNeuralOwner, SpeculativeSourcePartition,
 };
 
 /// Inspects one retained source transfer under the ordinary completion owner.
@@ -178,21 +182,32 @@ mod exclusions;
 pub use exclusions::MlxParameterExclusions;
 mod host_workspace;
 mod parameter_constructors;
-pub(crate) use parameter_constructors::ParameterConstructors;
 pub(crate) use host_workspace::{
-    DiskLayerwiseReceipt, LayerwiseWorkspace, LayerwiseWorkspaceIdentity,
+    DiskLayerwiseReceipt, LayerwiseConstructorTrace, LayerwiseWorkspace, LayerwiseWorkspaceIdentity,
 };
+pub(crate) use parameter_constructors::ParameterConstructors;
 
 /// Statically dispatched parameter population used by the MLX policy.
 pub trait MlxUnitPopulator<U> {
+    /// Actual completed replacement owners used by this same future loader.
+    /// The cold source separately snapshots their descriptors and backing facts.
+    fn prepared_parameter_replacements(
+        &self,
+    ) -> Option<&eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>> {
+        None
+    }
     /// Immutable selection shared with cold binding; absent rows are never an
     /// exclusion certificate. Retaining this Arc performs no allocation.
-    fn prepared_parameter_exclusions(&self) -> Option<&MlxParameterExclusions> { None }
+    fn prepared_parameter_exclusions(&self) -> Option<&MlxParameterExclusions> {
+        None
+    }
 
-    /// Whether the selected populator imports the prepared lease unchanged.
-    /// This is a source declaration, not proof of residency or native readiness.
-    /// Custom overrides remain unqualified until they describe their own source.
-    fn preserves_prepared_parameter_source(&self) -> bool { false }
+    /// Whether every populated row comes from the prepared lease or an exact
+    /// retained replacement owner exposed above. This declaration grants no
+    /// residency or native readiness. Custom sources require their own facts.
+    fn preserves_prepared_parameter_source(&self) -> bool {
+        false
+    }
 
     /// Stable count for this actual immutable override topology. Unknown custom
     /// populators remain unknown even when their current visitor is complete.
@@ -205,11 +220,10 @@ pub trait MlxUnitPopulator<U> {
     /// treat its numerical-value inventory as complete.
     fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool;
 
-    /// Replaces the complete immutable override set used after ordinary population.
-    fn publish_parameter_replacements(
+    /// Lends retained future-loader sources without allocating a handle.
+    fn visit_parameter_publication(
         &mut self,
-        _values: &std::collections::BTreeMap<String, MlxTensor>,
-        _active: bool,
+        _visitor: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
     ) -> bool {
         false
     }
@@ -247,7 +261,9 @@ pub trait MlxUnitPopulator<U> {
 }
 
 impl<U> MlxUnitPopulator<U> for () {
-    fn preserves_prepared_parameter_source(&self) -> bool { true }
+    fn preserves_prepared_parameter_source(&self) -> bool {
+        true
+    }
 
     fn populate_original(
         &mut self,
@@ -275,28 +291,35 @@ impl<U> MlxUnitPopulator<U> for () {
 #[derive(Clone)]
 pub struct MlxSelectiveUnitPopulator {
     excluded: MlxParameterExclusions,
-    replacements: Arc<std::collections::BTreeMap<String, MlxTensor>>,
+    replacements: eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
 }
 
 impl MlxSelectiveUnitPopulator {
     pub(crate) fn from_prepared(excluded: MlxParameterExclusions) -> Self {
-        Self { excluded, replacements: Arc::new(std::collections::BTreeMap::new()) }
+        Self {
+            excluded,
+            replacements: Default::default(),
+        }
     }
 
     /// Creates one generic logical-parameter exclusion set.
     pub fn new(excluded: BTreeSet<String>) -> Self {
         Self {
             excluded: MlxParameterExclusions::ordinary(excluded),
-            replacements: Arc::new(std::collections::BTreeMap::new()),
+            replacements: Default::default(),
         }
     }
 }
 
 pub(super) struct ParameterPublisher<'a>(
-    pub(super) &'a std::collections::BTreeMap<String, MlxTensor>,
+    pub(super) &'a eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
 );
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for ParameterPublisher<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         if let Some(replacement) = self.0.get(metadata.id().as_str()) {
             *value = replacement.clone();
         }
@@ -304,16 +327,19 @@ impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for ParameterPublisher<'_>
 }
 
 impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
+    fn prepared_parameter_replacements(
+        &self,
+    ) -> Option<&eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>> {
+        Some(&self.replacements)
+    }
     fn prepared_parameter_exclusions(&self) -> Option<&MlxParameterExclusions> {
         Some(&self.excluded)
     }
 
     fn preserves_prepared_parameter_source(&self) -> bool {
-        // Exclusions remove independently owned parameters from both the exact
-        // prepared bindings and populate_original's lease visitor. Every value
-        // this policy imports still comes unchanged from that prepared lease.
-        // Replacements introduce another producer and need their own source.
-        self.replacements.is_empty()
+        // Lease rows and retained replacement rows have explicit sources. The
+        // workspace snapshots actual replacement descriptors before admission.
+        true
     }
 
     fn populate_original(
@@ -325,16 +351,14 @@ impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
     where
         U: Parameterized<MlxTensor>,
     {
-        // Replacement handles are a distinct producer from lease imports.
-        // The selected prepared host source currently carries no overrides.
-        if !self.replacements.is_empty() || !self.excluded.is_source_funded() {
+        if !self.excluded.is_source_funded() {
             return Err(Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             ));
         }
-        populate_module_from_original_lease_excluding(unit, lease, row_limit, |name| {
+        crate::backend::runtime::checkpoint::binding::populate_module_from_original_lease_replacing(unit, lease, row_limit, |name| {
             self.excluded.contains(name)
-        })?;
+        }, Some(&self.replacements))?;
         Ok(())
     }
 
@@ -348,16 +372,11 @@ impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
         }
         true
     }
-    fn publish_parameter_replacements(
+    fn visit_parameter_publication(
         &mut self,
-        values: &std::collections::BTreeMap<String, MlxTensor>,
-        active: bool,
+        visitor: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<MlxTensor>,
     ) -> bool {
-        self.replacements = Arc::new(if active {
-            values.clone()
-        } else {
-            Default::default()
-        });
+        visitor.replacement_source(&mut self.replacements);
         true
     }
 
@@ -585,7 +604,8 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
                 std::num::NonZeroUsize::new(self.window_depth).expect("validated window depth"),
             )
             .expect("validated window ordinal");
-        self.residency.trim_device_units(&self.unit_ids, &self.unit_ids[range])?;
+        self.residency
+            .trim_device_units(&self.unit_ids, &self.unit_ids[range])?;
         Ok(())
     }
 
@@ -842,7 +862,8 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::Other(Box::new(error)))?.into_owned();
+        .map_err(|error| Error::Other(Box::new(error)))?
+        .into_owned();
     let counts = (0..graph.groups().len())
         .map(|group| {
             architecture
@@ -856,9 +877,9 @@ where
 /// Cold preparation for bounded and resident policies.
 mod preparation;
 pub(crate) use preparation::{
-    prepare_foreground_layerwise_manager, prepare_layerwise_manager, prepare_manager_from_declarations,
-    prepare_layerwise_declarations,
-    prepare_layerwise_policy_with_prepared_manager, PreparedLayerwiseManager,
+    prepare_foreground_layerwise_manager, prepare_layerwise_declarations,
+    prepare_layerwise_manager, prepare_layerwise_policy_with_prepared_manager,
+    prepare_manager_from_declarations, PreparedLayerwiseManager,
 };
 pub use preparation::{
     prepare_layerwise_policy, prepare_layerwise_policy_from_bindings,
@@ -874,3 +895,6 @@ mod bounded;
     not(feature = "cuda")
 ))]
 mod managed_disk_tests;
+
+mod parameter_inspection;
+pub use parameter_inspection::MlxParameterPreparation;

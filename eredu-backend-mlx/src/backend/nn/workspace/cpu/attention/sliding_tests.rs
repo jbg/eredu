@@ -3,6 +3,9 @@ use eredu_nn::{AttentionRequest, NeuralBackend, Tensor};
 
 #[test]
 fn sliding_cpu_attention_composes_masks_tiles_strides_and_prepared_output_tables() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     let _pool = crate::tests::support::test_utils::initialize_original_sources();
     let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
     let selected =

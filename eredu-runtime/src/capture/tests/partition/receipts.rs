@@ -1,3 +1,4 @@
+mod coordinate_source;
 mod exchange;
 mod preview;
 mod routed;
@@ -17,6 +18,7 @@ fn context(plan: &AdmittedCapturePlan) -> PartitionCaptureContext {
         phase: CapturePhase::Prefill,
         prediction: 0,
         forward_epoch: 19,
+        invocation_window: None,
     }
 }
 
@@ -132,7 +134,8 @@ fn producer_receipts_roundtrip_exact_values_and_retain_execution_context() {
         assert_eq!(result.context(), &context(&plan));
         assert_eq!(result.producers(), [0, 1, 2]);
         assert_eq!(result.capture().contributions().len(), 2);
-        let mut ordinary = CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
+        let mut ordinary =
+            CaptureSession::new(eredu_core::capture::SharedCapturePlan::new(plan.clone()));
         ordinary.begin_step(CapturePhase::Prefill, 0).unwrap();
         ordinary
             .observe(&mut Backend::default(), "block.output", &global)
@@ -404,9 +407,11 @@ fn decoding_limits_are_reserved_before_parsing_and_never_refunded() {
     ));
     assert_eq!(ledger.total(), CaptureUsage::default());
     let mut ledger = CaptureLedger::new(&plan);
-    assert!(delivery
-        .receive(0, &vec![b' '; 16_385], &mut ledger)
-        .is_err());
+    assert!(
+        delivery
+            .receive(0, &vec![b' '; 16_385], &mut ledger)
+            .is_err()
+    );
     assert_eq!(ledger.total(), CaptureUsage::default());
     assert!(delivery.receive(0, b"{invalid", &mut ledger).is_err());
     assert!(ledger.total().host_bytes > 0);

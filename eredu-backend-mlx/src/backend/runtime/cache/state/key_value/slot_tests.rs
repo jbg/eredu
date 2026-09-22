@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::{AttentionPolicy, LayerSchedule, SharedStorageDomain};
+use eredu_core::{AttentionPolicy, LayerSchedule, SharedStorageAccountingId};
 use eredu_runtime::{HostMetadataIdentity, HostSlotAttachmentError, HostSlotMetadata};
 use safemlx::{Device, DeviceType};
 use std::{
@@ -48,7 +48,7 @@ impl Drop for Charge {
     }
 }
 
-fn attach(metadata: &HostSlotMetadata, domain: &SharedStorageDomain, used: &Arc<AtomicU64>) {
+fn attach(metadata: &HostSlotMetadata, domain: &SharedStorageAccountingId, used: &Arc<AtomicU64>) {
     let bytes = metadata.capacity_bytes().unwrap();
     let identity = metadata.identity().clone();
     assert!(metadata
@@ -63,7 +63,7 @@ fn attach(metadata: &HostSlotMetadata, domain: &SharedStorageDomain, used: &Arc<
         .unwrap());
 }
 
-fn assert_retired(metadata: &HostSlotMetadata, domain: &SharedStorageDomain) {
+fn assert_retired(metadata: &HostSlotMetadata, domain: &SharedStorageAccountingId) {
     assert!(matches!(
         metadata.try_attach::<Infallible>(domain, || panic!("retired table must not acquire")),
         Err(HostSlotAttachmentError::Retired)
@@ -98,7 +98,7 @@ fn model_clone_and_clone_from_replace_table_identity_with_preserved_state() {
     assert_eq!(keys(&clone, &stream), [1., 3., 5., 7.]);
     drop(clone);
 
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicU64::new(0));
     let mut destination = MlxKeyValueState::device(layout(2)).unwrap();
     append(&mut destination, [11., 13., 17., 19.], &stream);
@@ -140,7 +140,7 @@ fn transaction_commit_moves_branch_table_and_checkpoint_restore_reuses_current_t
     let mut canonical = MlxKeyValueState::device_with_global_layer_start(layout(2), 23).unwrap();
     append(&mut canonical, [2., 4., 6., 8.], &stream);
     let original_token = canonical.layer_slot_metadata().clone();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicU64::new(0));
     attach(&original_token, &domain, &used);
     let mut branch = canonical.branch().unwrap();
@@ -197,7 +197,7 @@ fn escaped_layer_metadata_keeps_charge_without_retaining_native_payload() {
     let token = state.layer_slot_metadata().clone();
     let earlier = token.clone();
     let identity = token.identity().clone();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicU64::new(0));
     let capacity = token.capacity_bytes().unwrap();
     attach(&token, &domain, &used);
@@ -206,12 +206,13 @@ fn escaped_layer_metadata_keeps_charge_without_retaining_native_payload() {
         .unwrap());
     drop(state);
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         native_retired.load(Ordering::SeqCst) == 1
     });
     assert_eq!(used.load(Ordering::SeqCst), capacity);
     assert_retired(&token, &domain);
-    assert_retired(&token, &SharedStorageDomain::default());
+    assert_retired(&token, &SharedStorageAccountingId::default());
     drop(token);
     assert_eq!(used.load(Ordering::SeqCst), capacity);
     drop(earlier);

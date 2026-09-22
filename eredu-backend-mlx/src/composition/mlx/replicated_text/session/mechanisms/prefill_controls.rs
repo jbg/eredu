@@ -1,25 +1,46 @@
 //! Existing shared prefill completion, with closed borrowed root filling.
-use eredu_runtime::{speculative::external_occurrence::ExternalInvocation, working_memory::OriginalExternalSpeculativeRole};
 use super::*;
 use crate::backend::submission_recovery::prefill::nested::NestedCompletionProjection;
+use eredu_runtime::{
+    speculative::external_occurrence::ExternalInvocation,
+    working_memory::OriginalExternalSpeculativeRole,
+};
 impl<A, S> MlxReplicatedTextMechanisms<A, S>
 where
     S: MlxStateMechanisms,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
 {
-    pub(super) fn active_nested_completion(&self) -> Result<Option<NestedCompletionProjection>, Error> {
-        let slot=self.nested_completion.try_borrow().map_err(|_|Error::PrefillScopeReentrant)?;
-        Ok(slot.as_ref().filter(|projection|projection.is_active()).cloned())
+    pub(super) fn active_nested_completion(
+        &self,
+    ) -> Result<Option<NestedCompletionProjection>, Error> {
+        let slot = self
+            .nested_completion
+            .try_borrow()
+            .map_err(|_| Error::PrefillScopeReentrant)?;
+        Ok(slot
+            .as_ref()
+            .filter(|projection| projection.is_active())
+            .cloned())
     }
-    pub(super) fn complete_nested_roots(&self, roots:&NestedCompletionProjection,
-        output:Option<&MlxTensor>,state:&S,
-        future:Option<&eredu_runtime::media_prefill::RetainedMediaRoots<'_,MlxTensor>>,
-        stream:&Stream)->Result<(),Error> {
+    pub(super) fn complete_nested_roots(
+        &self,
+        roots: &NestedCompletionProjection,
+        output: Option<&MlxTensor>,
+        state: &S,
+        future: Option<&eredu_runtime::media_prefill::RetainedMediaRoots<'_, MlxTensor>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
         use eredu_runtime::RuntimeState;
         roots.complete(stream, |visitor| {
-            if let Some(output)=output { visitor(output); }
-            state.visit_all_retained_values(visitor).map_err(Error::PrefillState)?;
-            if let Some(future)=future { future.visit(visitor); }
+            if let Some(output) = output {
+                visitor(output);
+            }
+            state
+                .visit_all_retained_values(visitor)
+                .map_err(Error::PrefillState)?;
+            if let Some(future) = future {
+                future.visit(visitor);
+            }
             Ok(())
         })
     }
@@ -130,37 +151,51 @@ where
     /// Install one exact active target invocation without replacing outer
     /// prefill guards. Its separately owned guard deactivates even on unwind.
     pub(crate) fn install_session_nested_completion<D>(
-        session:&ReplicatedTextSession<A,MlxNeuralBackend,Self,D>,
-        projection:NestedCompletionProjection,
-    )->Result<(),Error>
-    where D:eredu_runtime::ReplicatedTextExecutionStrategy<A,MlxNeuralBackend,S,
-        MlxArchitectureLayerwisePolicy<A,S>,MlxArchitectureLayerwisePolicy<A,S>>,
+        session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
+        projection: NestedCompletionProjection,
+    ) -> Result<(), Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        let previous=session.inspect_runtime_execution_fixed(|mechanisms,_,_| {
-            let mut slot=mechanisms.nested_completion.try_borrow_mut().map_err(|_|Error::PrefillScopeReentrant)?;
-            if slot.as_ref().is_some_and(|projection|projection.is_active()) {
-                return Err(Error::PrefillScopeReentrant);
-            }
-            Ok(slot.replace(projection))
-        }).map_err(Error::RuntimeInspection)??;
+        let previous = session
+            .inspect_runtime_execution_fixed(|mechanisms, _, _| {
+                let mut slot = mechanisms
+                    .nested_completion
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillScopeReentrant)?;
+                if slot
+                    .as_ref()
+                    .is_some_and(|projection| projection.is_active())
+                {
+                    return Err(Error::PrefillScopeReentrant);
+                }
+                Ok(slot.replace(projection))
+            })
+            .map_err(Error::RuntimeInspection)??;
         drop(previous);
         Ok(())
     }
 
     pub(crate) fn bind_session_neural_recipe<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
         funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         let plan = session
             .inspect_runtime_execution_fixed(|mechanisms, _, runtime| {
@@ -168,7 +203,11 @@ where
                     .or_else(|| D::bounded_policy(runtime))
                     .map(|policy| {
                         policy
-                            .original_operation_plan(recipe.plan().geometry(), None, D::group_submission_mechanism(runtime))?
+                            .original_operation_plan(
+                                recipe.plan().geometry(),
+                                None,
+                                D::group_submission_mechanism(runtime),
+                            )?
                             .with_selected_stream(&mechanisms.stream)
                     })
                     .transpose()
@@ -177,39 +216,81 @@ where
         // Allocator/source queries execute after the native inspector and policy
         // loans end. The retained plan authenticates their immutable owners.
         if let Some(plan) = plan {
-            plan.with_preparation_funding(funding).with_foreground_disk_reads(pool)?
+            plan.with_preparation_funding(funding)
+                .with_foreground_disk_reads(pool)?
                 .bind_neural_recipe(recipe)?;
         }
         Ok(())
+    }
+
+    fn speculative_parallel_plan_frame_bytes() -> usize {
+        std::mem::size_of::<(
+            Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
+            Option<&crate::backend::runtime::distributed::topology::original_source::parallel::OriginalParallelSource>,
+            bool,
+        )>()
+    }
+    fn speculative_parallel_plan_control_bytes(
+        recipe: &crate::backend::nn::workspace::ResidentNativeRecipe,
+    ) -> Option<usize> {
+        let scan = recipe.parallel_control_source_control_bytes()?;
+        if scan == 0 {
+            Some(0)
+        } else {
+            scan.checked_add(Self::speculative_parallel_plan_frame_bytes())
+        }
     }
 
     fn session_speculative_neural_plan<'source, D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         geometry: eredu_core::InferenceGeometry,
         source: Option<&'source crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-    ) -> Result<crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan<'source, A::Unit>, Error>
+        native_recipe: Option<&crate::backend::nn::workspace::ResidentNativeRecipe>,
+    ) -> Result<
+        crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan<
+            'source,
+            A::Unit,
+        >,
+        Error,
+    >
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
+        // The local unit bank and retained communication recipe remain distinct.
+        // Every equation must borrow the same genuine parallel source; execution
+        // authenticates that source against its actual group and active scope.
+        let parallel_source = native_recipe
+            .map(|recipe| recipe.parallel_control_source())
+            .transpose()?
+            .flatten();
+        if let Some(parallel) = parallel_source {
+            parallel
+                .funding()
+                .reserve_metadata(Self::speculative_parallel_plan_frame_bytes())?;
+        }
         session
             .inspect_runtime_execution_fixed(|mechanisms, _, runtime| {
-                // This exact native bank has one selected execution stream and
-                // local cancellation. Distributed agreement/transport must be
-                // supplied by its own selected producer before it can join.
-                if D::PARTITIONED_SESSION || D::DISTRIBUTED_PHASE_AGREEMENT
-                    || mechanisms.parallel_layout.is_some()
+                if (D::PARTITIONED_SESSION
+                    || D::DISTRIBUTED_PHASE_AGREEMENT
+                    || mechanisms.parallel_layout.is_some())
+                    && parallel_source.is_none()
                 {
                     return Err(Error::PrefillScopeUnavailable);
                 }
-                D::resident_policy(runtime).or_else(|| D::bounded_policy(runtime))
+                D::resident_policy(runtime)
+                    .or_else(|| D::bounded_policy(runtime))
                     .ok_or(Error::PrefillScopeUnavailable)?
-                    .original_operation_plan(geometry, source, D::group_submission_mechanism(runtime))?
+                    .original_operation_plan(
+                        geometry,
+                        source,
+                        D::group_submission_mechanism(runtime),
+                    )?
                     .with_selected_stream(&mechanisms.stream)
             })
             .map_err(Error::RuntimeInspection)?
@@ -217,27 +298,53 @@ where
     pub(crate) fn bind_session_speculative_neural_recipe<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         funding: &eredu_nn::workspace::HostMetadataFunding,
         recipe: &mut crate::backend::nn::workspace::AutoregressiveEquationRecipe,
-    ) -> Result<(u64, Option<eredu_runtime::working_memory::HostSourceConstructionFacts>), Error>
+    ) -> Result<
+        (
+            u64,
+            Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+        ),
+        Error,
+    >
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        let plan = Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source)
-            .map_err(|cause| cause.at_speculative_stage("selected operation source"))?
-            .prepare_speculative_source(pool, funding)
-            .map_err(|cause| cause.at_speculative_stage("selected foreground source plan"))?;
+        let plan = Self::session_speculative_neural_plan(
+            session,
+            recipe.plan().geometry(),
+            source,
+            Some(recipe.native_recipe()),
+        )
+        .map_err(|cause| cause.at_speculative_stage("selected operation source"))?
+        .prepare_speculative_source(pool, funding)
+        .map_err(|cause| cause.at_speculative_stage("selected foreground source plan"))?;
         plan.bind_speculative_recipe(recipe)
             .map_err(|cause| cause.at_speculative_stage("selected operation recipe binding"))?;
         let source = plan.speculative_source_facts()?;
-        plan.speculative_control_bytes(recipe).map(|controls| (controls, source))
+        // Binding has already paid its actual source scan. Each future native
+        // row prepares its own local unit bank and repeats that same scan.
+        let source_controls = Self::speculative_parallel_plan_control_bytes(recipe.native_recipe())
+            .and_then(|bytes| bytes.checked_mul(recipe.records().len()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(Error::WorkspacePlanning(
+                eredu_nn::workspace::HostMetadataFundingError::Overflow,
+            ))?;
+        plan.speculative_control_bytes(recipe).and_then(|controls| {
+            controls
+                .checked_add(source_controls)
+                .map(|controls| (controls, source))
+                .ok_or(Error::WorkspacePlanning(
+                    eredu_nn::workspace::HostMetadataFundingError::Overflow,
+                ))
+        })
     }
 
     pub(crate) fn prepare_session_speculative_neural_bank<D>(
@@ -246,69 +353,122 @@ where
         recipe: &crate::backend::nn::workspace::AutoregressiveEquationRecipe,
         role: eredu_runtime::working_memory::OriginalSpeculativeRole,
         scope: &safemlx::SubmissionScope,
-        partition:Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>,
+        partition: Option<
+            crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>,
+        >,
+        materialized: Option<
+            crate::backend::runtime::residency::manager::OriginalMaterializedLoan<'_>,
+        >,
     ) -> Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source)?
-            .prepare_speculative(recipe, role, scope,partition)
+        Self::session_speculative_neural_plan(
+            session,
+            recipe.plan().geometry(),
+            source,
+            Some(recipe.native_recipe()),
+        )?
+        .prepare_speculative(recipe, role, scope, partition, materialized)
     }
 
     /// Exact one-equation Embedded entry; the selected source plan and both
     /// residency bank workers are shared with ordinary/AR traversal.
     pub(crate) fn bind_session_embedded_neural_recipe<D>(
-        session:&ReplicatedTextSession<A,MlxNeuralBackend,Self,D>,
-        source:Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-        pool:&eredu_runtime::working_memory::WorkingMemoryPool,
-        funding:&eredu_nn::workspace::HostMetadataFunding,
-        recipe:&mut crate::backend::nn::workspace::EmbeddedEquationRecipe,
-    )->Result<(u64,Option<eredu_runtime::working_memory::HostSourceConstructionFacts>),Error>
-    where D:eredu_runtime::ReplicatedTextExecutionStrategy<A,MlxNeuralBackend,S,
-        MlxArchitectureLayerwisePolicy<A,S>,MlxArchitectureLayerwisePolicy<A,S>>,
+        session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
+        source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        recipe: &mut crate::backend::nn::workspace::EmbeddedEquationRecipe,
+    ) -> Result<
+        (
+            u64,
+            Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+        ),
+        Error,
+    >
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        let plan=Self::session_speculative_neural_plan(session,recipe.workspace().geometry(),source)?
-            .prepare_speculative_source(pool,funding)?;
+        let plan = Self::session_speculative_neural_plan(
+            session,
+            recipe.workspace().geometry(),
+            source,
+            None,
+        )?
+        .prepare_speculative_source(pool, funding)?;
         plan.bind_embedded_recipe(recipe)?;
-        let source=plan.speculative_source_facts()?;
-        plan.embedded_control_bytes(recipe).map(|controls|(controls,source))
+        let source = plan.speculative_source_facts()?;
+        plan.embedded_control_bytes(recipe)
+            .map(|controls| (controls, source))
     }
     pub(crate) fn prepare_session_embedded_neural_bank<D>(
-        session:&ReplicatedTextSession<A,MlxNeuralBackend,Self,D>,
-        source:Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-        recipe:&crate::backend::nn::workspace::EmbeddedEquationRecipe,
-        role:eredu_runtime::working_memory::OriginalEmbeddedSpeculativeRole,
-        scope:&safemlx::SubmissionScope,
-        partition:Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>,
-    )->Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>,Error>
-    where D:eredu_runtime::ReplicatedTextExecutionStrategy<A,MlxNeuralBackend,S,
-        MlxArchitectureLayerwisePolicy<A,S>,MlxArchitectureLayerwisePolicy<A,S>>,
+        session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
+        source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
+        recipe: &crate::backend::nn::workspace::EmbeddedEquationRecipe,
+        role: eredu_runtime::working_memory::OriginalEmbeddedSpeculativeRole,
+        scope: &safemlx::SubmissionScope,
+        partition: Option<
+            crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>,
+        >,
+        materialized: Option<
+            crate::backend::runtime::residency::manager::OriginalMaterializedLoan<'_>,
+        >,
+    ) -> Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        Self::session_speculative_neural_plan(session,recipe.workspace().geometry(),source)?
-            .prepare_embedded(recipe,role,scope,partition)
+        Self::session_speculative_neural_plan(session, recipe.workspace().geometry(), source, None)?
+            .prepare_embedded(recipe, role, scope, partition, materialized)
     }
 
     pub(crate) fn bind_session_external_neural_recipe<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         source: Option<&crate::backend::runtime::execution::generic::LayerwiseWorkspace>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         funding: &eredu_nn::workspace::HostMetadataFunding,
         recipe: &mut crate::backend::nn::workspace::ResidentNativeRecipe,
-    ) -> Result<(u64, Option<eredu_runtime::working_memory::HostSourceConstructionFacts>), Error>
-    where D: eredu_runtime::ReplicatedTextExecutionStrategy<A, MlxNeuralBackend, S,
-        MlxArchitectureLayerwisePolicy<A, S>, MlxArchitectureLayerwisePolicy<A, S>>,
+    ) -> Result<
+        (
+            u64,
+            Option<eredu_runtime::working_memory::HostSourceConstructionFacts>,
+        ),
+        Error,
+    >
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        let plan = Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source)?
-            .prepare_speculative_source(pool, funding)?;
+        let plan =
+            Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source, None)?
+                .prepare_speculative_source(pool, funding)?;
         plan.bind_external_recipe(recipe)?;
         let source = plan.speculative_source_facts()?;
-        plan.external_control_bytes(recipe).map(|controls| (controls, source))
+        plan.external_control_bytes(recipe)
+            .map(|controls| (controls, source))
     }
     pub(crate) fn prepare_session_external_neural_bank<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
@@ -317,13 +477,24 @@ where
         invocation: ExternalInvocation,
         role: OriginalExternalSpeculativeRole,
         scope: &safemlx::SubmissionScope,
-        partition:Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>,
+        partition: Option<
+            crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>,
+        >,
+        materialized: Option<
+            crate::backend::runtime::residency::manager::OriginalMaterializedLoan<'_>,
+        >,
     ) -> Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>, Error>
-    where D: eredu_runtime::ReplicatedTextExecutionStrategy<A, MlxNeuralBackend, S,
-        MlxArchitectureLayerwisePolicy<A, S>, MlxArchitectureLayerwisePolicy<A, S>>,
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source)?
-            .prepare_external(recipe, invocation, role, scope,partition)
+        Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source, None)?
+            .prepare_external(recipe, invocation, role, scope, partition, materialized)
     }
 
     pub(crate) fn prepare_session_speculative_span_neural_bank<D>(
@@ -332,20 +503,34 @@ where
         recipe: &crate::backend::nn::workspace::AutoregressiveEquationRecipe,
         span: &eredu_runtime::working_memory::OriginalSpeculativePrefillSpan,
         scope: &safemlx::SubmissionScope,
-        partition:Option<crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>>,
+        partition: Option<
+            crate::backend::runtime::execution::generic::SpeculativeSourcePartition<'_>,
+        >,
+        materialized: Option<
+            crate::backend::runtime::residency::manager::OriginalMaterializedLoan<'_>,
+        >,
     ) -> Result<Option<crate::backend::runtime::execution::generic::SpeculativeNeuralOwner>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A, MlxNeuralBackend, S, MlxArchitectureLayerwisePolicy<A, S>, MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        Self::session_speculative_neural_plan(session, recipe.plan().geometry(), source)?
-            .prepare_speculative_span(recipe, span, scope,partition)
+        Self::session_speculative_neural_plan(
+            session,
+            recipe.plan().geometry(),
+            source,
+            Some(recipe.native_recipe()),
+        )?
+        .prepare_speculative_span(recipe, span, scope, partition, materialized)
     }
 
     pub(crate) fn session_prefill_control_facts<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         geometry: eredu_core::InferenceGeometry,
         graph_capacity: std::num::NonZeroU64,
         native_root_capacity: Option<u64>,
@@ -355,16 +540,19 @@ where
     ) -> Result<Option<eredu_runtime::working_memory::TextPrefillScopeFacts>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         // Native parallel completion/control facts are supplied by the exact
         // retained per-equation recipe, not by the presence of a topology.
-        let parallel_source=native_recipe.map(|recipe|recipe.parallel_control_source()).transpose()?.flatten();
+        let parallel_source = native_recipe
+            .map(|recipe| recipe.parallel_control_source())
+            .transpose()?
+            .flatten();
         let selected = session
             .inspect_runtime_execution_fixed(|mechanisms, state, runtime| {
                 if mechanisms.parallel_layout.is_some() && parallel_source.is_none() {
@@ -419,7 +607,14 @@ where
                     .or_else(|| D::bounded_policy(runtime))
                     .map(|policy| {
                         policy
-                            .original_operation_plan(geometry, retained_sources, D::group_submission_mechanism(runtime))?
+                            .original_operation_plan(
+                                geometry,
+                                retained_sources,
+                                D::group_submission_mechanism(runtime),
+                            )
+                            .map_err(|cause| {
+                                cause.at_original_stage("text residency operation plan")
+                            })?
                             .with_selected_stream(&mechanisms.stream)
                     })
                     .transpose()?;
@@ -439,12 +634,24 @@ where
         };
         let operations = operations
             .map(|plan| {
-                plan.with_preparation_funding(funding).with_foreground_disk_reads(pool)?
-                    .with_neural_recipe(native_recipe)?
-                    .with_gguf_host_runtime(&gguf_host_runtime)?
+                plan.with_preparation_funding(funding)
+                    .with_foreground_disk_reads(pool)
+                    .map_err(|cause| cause.at_original_stage("text foreground read plan"))?
+                    .with_neural_recipe(native_recipe)
+                    .map_err(|cause| cause.at_original_stage("text residency neural source"))?
+                    .with_gguf_host_runtime(&gguf_host_runtime)
+                    .map_err(|cause| cause.at_original_stage("text residency GGUF source"))?
                     .with_source_arena_plan()
+                    .map_err(|cause| cause.at_original_stage("text residency source arena"))
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|error| match error {
+                Error::PrefillControl(cause) => Error::OriginalSourceContract {
+                    stage: "text operation producer preparation",
+                    cause,
+                },
+                other => other,
+            })?;
         let bytes = operations
             .as_ref()
             .map_or(Some(0), |plan| plan.control_bytes());
@@ -468,7 +675,7 @@ where
     }
     pub(crate) fn prepare_session_original_operations<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         original: &eredu_runtime::working_memory::OriginalTextPrefillScopeSet,
         step: &eredu_runtime::working_memory::InferenceTextStep,
         registration: crate::backend::runtime::execution::generic::OriginalOperationRegistration,
@@ -483,19 +690,25 @@ where
     >
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
-        original
-            .validate_request(step.request())
-            .map_err(Error::PrefillControl)?;
+        original.validate_request(step.request()).map_err(|cause| {
+            Error::OriginalSourceContract {
+                stage: "text operation request source",
+                cause,
+            }
+        })?;
         original
             .validate_execution(session.inference_execution_identity())
-            .map_err(Error::PrefillControl)?;
+            .map_err(|cause| Error::OriginalSourceContract {
+                stage: "text operation execution source",
+                cause,
+            })?;
         let geometry = original.facts().plan().geometry();
         let (plan, gguf_host_runtime) = session
             .inspect_runtime_execution_fixed(|mechanisms, _, runtime| {
@@ -504,7 +717,11 @@ where
                     .or_else(|| D::bounded_policy(runtime))
                     .map(|policy| {
                         policy
-                            .original_operation_plan(geometry, retained_sources, D::group_submission_mechanism(runtime))?
+                            .original_operation_plan(
+                                geometry,
+                                retained_sources,
+                                D::group_submission_mechanism(runtime),
+                            )?
                             .with_selected_stream(&mechanisms.stream)
                     })
                     .transpose()?;
@@ -521,24 +738,26 @@ where
         // The native inspector, policy and state loans have all ended.
         let plan = plan
             .map(|plan| {
-                plan.with_preparation_funding(funding).with_foreground_disk_reads(pool)?
+                plan.with_preparation_funding(funding)
+                    .with_foreground_disk_reads(pool)?
                     .with_neural_recipe(native_recipe)?
                     .with_gguf_host_runtime(&gguf_host_runtime)?
                     .with_source_arena_plan()
             })
             .transpose()?;
         match plan {
-            Some(plan) => {
-                plan.prepare_install(original, step, registration, controls, host_destinations)
-            }
+            Some(plan) => plan
+                .prepare_install(original, step, registration, controls, host_destinations)
+                .map_err(|cause| cause.at_original_stage("text residency bank installation")),
             None if original.facts().operation_control_bytes() == Some(0)
                 && host_destinations.is_none() =>
             {
                 Ok(None)
             }
-            None => Err(Error::PrefillControl(
-                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
-            )),
+            None => Err(Error::OriginalSourceContract {
+                stage: "text operation selected producer",
+                cause: eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            }),
         }
     }
     pub(crate) fn session_native_storage<D>(
@@ -546,12 +765,12 @@ where
     ) -> Result<crate::backend::runtime::residency::storage::native_storage::MlxNativeStorage, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session.inspect_runtime_execution_fixed(|mechanisms, _, _| {
             Ok(crate::backend::runtime::residency::storage::native_storage::MlxNativeStorage::new(
@@ -564,12 +783,12 @@ where
     ) -> Result<safemlx::PrefillRootsRuntime, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         // Clone only the completed ordinary initialization witness. No runtime
         // entry, handler initialization or allocation occurs under the inspector.
@@ -579,17 +798,64 @@ where
             })
             .map_err(Error::RuntimeInspection)?
     }
+    pub(crate) fn install_session_speculative_parallel_controls<D>(
+        session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
+        controls:Vec<crate::backend::runtime::distributed::topology::original_source::control::speculative::SpeculativeControlProjection>,
+    ) -> Result<(), Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
+    {
+        for control in &controls {
+            control.validate_execution(session.inference_execution_identity())?;
+        }
+        let previous = session
+            .inspect_runtime_execution_fixed(|mechanisms, _, _| {
+                let mut slot = mechanisms
+                    .speculative_controls
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillScopeReentrant)?;
+                let active = mechanisms
+                    .active_speculative_control
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillScopeReentrant)?
+                    .take();
+                Ok::<_, Error>((std::mem::replace(&mut *slot, controls), active))
+            })
+            .map_err(Error::RuntimeInspection)??;
+        drop(previous);
+        Ok(())
+    }
     pub(crate) fn install_session_parallel_control<D>(
-        session:&ReplicatedTextSession<A,MlxNeuralBackend,Self,D>,
+        session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         control:Option<crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection>,
-    )->Result<(),Error>
-    where D:eredu_runtime::ReplicatedTextExecutionStrategy<A,MlxNeuralBackend,S,
-        MlxArchitectureLayerwisePolicy<A,S>,MlxArchitectureLayerwisePolicy<A,S>>, {
-        if let Some(control)=&control{control.validate_execution(session.inference_execution_identity())?;}
-        let previous=session.inspect_runtime_execution_fixed(|mechanisms,_,_|{
-            let mut slot=mechanisms.parallel_control.try_borrow_mut().map_err(|_|Error::PrefillScopeReentrant)?;
-            Ok::<_,Error>(std::mem::replace(&mut *slot,control))
-        }).map_err(Error::RuntimeInspection)??;
+    ) -> Result<(), Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
+    {
+        if let Some(control) = &control {
+            control.validate_execution(session.inference_execution_identity())?;
+        }
+        let previous = session
+            .inspect_runtime_execution_fixed(|mechanisms, _, _| {
+                let mut slot = mechanisms
+                    .parallel_control
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillScopeReentrant)?;
+                Ok::<_, Error>(std::mem::replace(&mut *slot, control))
+            })
+            .map_err(Error::RuntimeInspection)??;
         drop(previous);
         Ok(())
     }
@@ -600,12 +866,12 @@ where
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         if let Some(controls) = &controls {
             controls.validate_execution(session.inference_execution_identity())?;
@@ -628,12 +894,12 @@ where
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         let expired = session
             .inspect_runtime_execution_fixed(|mechanisms, _, _| {
@@ -668,16 +934,16 @@ where
     pub(crate) fn inspection_adapters_for_test<D>(
         session: &ReplicatedTextSession<A, MlxNeuralBackend, Self, D>,
         geometry: eredu_core::InferenceGeometry,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<(), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime_execution_fixed(|_, _, runtime| {
@@ -688,10 +954,12 @@ where
             })
             .map_err(Error::RuntimeInspection)??;
         let graph = std::num::NonZeroU64::new(4 << 20).unwrap();
-        assert!(Self::session_prefill_control_facts(
-            session, pool, geometry, graph, None, None, None, None
-        )?
-        .is_some());
+        assert!(
+            Self::session_prefill_control_facts(
+                session, pool, geometry, graph, None, None, None, None
+            )?
+            .is_some()
+        );
         let overflow = Self::session_prefill_control_facts(
             session,
             pool,
@@ -711,9 +979,11 @@ where
             overflow,
             Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow)
         ));
-        assert!(std::error::Error::source(&overflow)
-            .unwrap()
-            .is::<eredu_runtime::working_memory::WorkingMemoryError>());
+        assert!(
+            std::error::Error::source(&overflow)
+                .unwrap()
+                .is::<eredu_runtime::working_memory::WorkingMemoryError>()
+        );
         let invalid = Self::session_prefill_control_facts(
             session,
             pool,
@@ -766,12 +1036,12 @@ where
     ) -> Result<(bool, bool), Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            A,
-            MlxNeuralBackend,
-            S,
-            MlxArchitectureLayerwisePolicy<A, S>,
-            MlxArchitectureLayerwisePolicy<A, S>,
-        >,
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            >,
     {
         session
             .inspect_runtime_execution_fixed(|mechanisms, _, _| {

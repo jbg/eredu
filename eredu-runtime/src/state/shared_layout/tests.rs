@@ -1,8 +1,8 @@
 use super::*;
 use crate::state::{DeviceState, RuntimeLayerState, RuntimeState, StateSegmentLifetime};
 use eredu_core::{
-    AttentionPolicy, LayerSchedule,
     cache::{MutableStateResidency, StateTensorDtype, StateTensorRole},
+    AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::workspace::{WorkspaceBackend, WorkspaceTensor};
 use std::{
@@ -156,7 +156,7 @@ impl Drop for RetireCharge {
         // The prior owner's custody must not retain any mutex while invoking
         // the provider destructor. Reentry into an independent owner is valid.
         self.reenter
-            .try_attach(&SharedStorageDomain::default(), || {
+            .try_attach(&SharedStorageAccountingId::default(), || {
                 Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(()))
             })
             .unwrap();
@@ -172,26 +172,22 @@ fn earlier_aliases_retain_all_domains_until_payload_retires_before_custody() {
     Arc::get_mut(&mut shared.0).unwrap().payload_retired = Some(PayloadRetired(retired.clone()));
     let alias = shared.clone();
     let identity = shared.identity().clone();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let other = SharedStateLayout::new(spare_layout());
-    for domain in [&domain, &SharedStorageDomain::default()] {
-        assert!(
-            shared
-                .try_attach(domain, || {
-                    Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(RetireCharge {
-                        payload_retired: retired.clone(),
-                        drops: drops.clone(),
-                        reenter: other.clone(),
-                    }))
-                })
-                .unwrap()
-        );
+    for domain in [&domain, &SharedStorageAccountingId::default()] {
+        assert!(shared
+            .try_attach(domain, || {
+                Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(RetireCharge {
+                    payload_retired: retired.clone(),
+                    drops: drops.clone(),
+                    reenter: other.clone(),
+                }))
+            })
+            .unwrap());
     }
-    assert!(
-        !alias
-            .try_attach::<Infallible>(&domain, || panic!("already attached domain"))
-            .unwrap()
-    );
+    assert!(!alias
+        .try_attach::<Infallible>(&domain, || panic!("already attached domain"))
+        .unwrap());
     drop(shared);
     assert!(!retired.load(Ordering::SeqCst));
     assert_eq!(drops.load(Ordering::SeqCst), 0);

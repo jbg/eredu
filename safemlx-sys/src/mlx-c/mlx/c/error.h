@@ -36,6 +36,7 @@ void mlx_set_error_handler(
  *  Does not query/progress native submission or establish terminal status. */
 unsigned mlx_error_submission_tracking_failure(void);
 unsigned mlx_error_graph_metadata_failure(void);
+void* mlx_error_physical_backing_failure(void);
 void _mlx_error(const char* file, const int line, const char* fmt, ...);
 
 /**

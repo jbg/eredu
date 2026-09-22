@@ -1,5 +1,9 @@
 //! Mechanisms-only reference backend proof through production architecture construction.
 
+#[path = "../src/memory_fixture.rs"]
+#[allow(dead_code)]
+mod memory_fixture;
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,

@@ -11,3 +11,11 @@ pub(crate) mod provider_failure;
 pub(crate) mod media_completion;
 
 pub(crate) mod native_process;
+
+pub(crate) mod original_input;
+
+pub(crate) mod original_snapshot;
+
+pub(crate) mod plain_controller;
+
+pub(crate) mod memory_error;

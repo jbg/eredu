@@ -14,12 +14,12 @@ use eredu_core::{
 use safemlx::{Device, DeviceType, Stream};
 
 use super::{
-    MlxBackend, MlxLoadRequest, capability::available_memory, inspection::MlxInspectionOptions,
-    realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter,
+    capability::available_memory, inspection::MlxInspectionOptions,
+    realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter, MlxBackend, MlxLoadRequest,
 };
 use crate::{
     backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
-    backend::{MlxAcceleratorFamily, MlxDeviceIdentity, error::Error},
+    backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
 };
 use eredu_runtime::selected_text_bounded_requirement;
 
@@ -98,8 +98,8 @@ pub fn create_realtime_execution(
         MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)?;
     #[cfg(test)]
     crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
-    let backend = realize_backend(device)
-        .map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
+    let backend =
+        realize_backend(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
     let context = MlxRealtimeExecutionContext::from_backend(backend);
     let execution = context.materialize_realtime_execution(selected)?;
     Ok((context, execution))
@@ -240,15 +240,21 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Drafter = MlxDrafter;
 
     fn inspect_loading_artifact<R: eredu_core::ModelConfigurationResolver>(
-        &self, path: &Path, resolver: &R,
+        &self,
+        path: &Path,
+        resolver: &R,
     ) -> Result<eredu_core::ArtifactInspection<R::ArtifactPlan>, AutomaticPlanningError>
-    where R::ArtifactPlan: Send + Sync + 'static,
+    where
+        R::ArtifactPlan: Send + Sync + 'static,
     {
-        crate::backend::managed_memory::domain().inspect_artifact_for_loading(
-            path, resolver,
-            eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
-            eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
-        ).map_err(|error| AutomaticPlanningError::backend("inspect_loading_artifact", error))
+        crate::backend::managed_memory::ledger()
+            .inspect_artifact_for_loading(
+                path,
+                resolver,
+                eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
+                eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+            )
+            .map_err(|error| AutomaticPlanningError::backend("inspect_loading_artifact", error))
     }
 
     fn select_target(
@@ -333,12 +339,13 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 let drafter = match placement {
                     DraftPlacementPlan::Target => MlxDrafter::materialize_with_source_pool(
                         artifact.preparation,
-                        target.backend().memory_pool(),
+                        target.backend().memory_ledger(),
                         target.backend().stream(),
                         target.backend().weights_stream(),
                     ),
                     DraftPlacementPlan::Device { device } => MlxDrafter::materialize_with_backend(
-                        artifact.preparation, realize_backend(device)?,
+                        artifact.preparation,
+                        realize_backend(device)?,
                     ),
                     _ => {
                         return Err(AutomaticPlanningError::Invalid(
@@ -375,7 +382,7 @@ fn realize_backend(device: &DevicePlan) -> Result<MlxBackend<'static>, Automatic
         .get_index()
         .map_err(|error| planning_backend_error("execution_device_index", error))?;
     if index == 0 {
-        let pool = crate::backend::managed_memory::domain();
+        let pool = crate::backend::managed_memory::ledger();
         let streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(&pool, kind)
             .map_err(|error| planning_backend_error("create_admitted_execution_stream", error.into_backend_failure()))?;
         if let Some(streams) = streams {

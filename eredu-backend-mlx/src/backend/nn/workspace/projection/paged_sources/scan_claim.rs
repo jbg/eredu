@@ -1,7 +1,7 @@
 //! Exact accepted source and one-use scan after its append has completed.
 use super::*;
 use super::{
-    append_claim::{Checkout, CurrentRole, PagedMutationCause, current_role, failure},
+    append_claim::{current_role, failure, Checkout, CurrentRole, PagedMutationCause},
     scan_program::PreparedPagedScan,
 };
 use crate::backend::runtime::cache::{
@@ -14,7 +14,7 @@ use crate::backend::runtime::cache::{
 use crate::backend::submission_recovery::prefill::TransientRootsProjection;
 use eredu_core::cache::CacheRankIdentity;
 use eredu_nn::BlockwiseAttentionOptions;
-use safemlx::{Array, Dtype, OriginalScopeObserver, error::Exception};
+use safemlx::{error::Exception, Array, Dtype, OriginalScopeObserver};
 
 /// Actual current cache/query facts, never source or execution authority.
 pub(crate) struct PagedScanInput<'a> {
@@ -902,7 +902,7 @@ impl OriginalPagedScanClaim<'_> {
             ids: self.discard_ids(),
             frontier: self.discard_frontier()?,
         };
-        self.proof.manager().discard_original(&discard)
+        self.proof.manager().discard_prepared(&discard)
     }
     pub(crate) fn discard_frontier(&self) -> Result<Option<(i64, i64)>, Exception> {
         if !self.scan.completed

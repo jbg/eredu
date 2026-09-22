@@ -28,7 +28,7 @@ fn chunk(index: u64) -> PrefillChunk {
 fn epoch(n: u64) -> DistributedCommitEpoch {
     DistributedCommitEpoch::new(n).unwrap()
 }
-fn original(pool: &WorkingMemoryPool, bytes: u64) -> (InferenceRequest, WorkingMemoryFundingRun) {
+fn original_admission(pool: &MemoryLedger, bytes: u64) -> Admission {
     let geometry = geometry();
     let layout = StateMemoryLayout::new(
         LayerSchedule::empty(),
@@ -48,6 +48,7 @@ fn original(pool: &WorkingMemoryPool, bytes: u64) -> (InferenceRequest, WorkingM
     )
     .unwrap()
     .with_execution_workspace(ExecutionWorkspaceEstimate {
+        physical_domains: None,
         geometry,
         activations: bound(bytes),
         attention: bound(0),
@@ -57,16 +58,30 @@ fn original(pool: &WorkingMemoryPool, bytes: u64) -> (InferenceRequest, WorkingM
         retained: bound(0),
     })
     .unwrap();
+    crate::working_memory::memory_fixture::attribute_host_admission(
+        pool,
+        Admission {
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+            state,
+            requested_positions: 9,
+            incremental_required_bytes: Some(bytes),
+        },
+    )
+}
+pub(super) fn constructor_bytes() -> u64 {
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
+    crate::working_memory::memory_fixture::reservation_bytes(&pool, &original_admission(&pool, 0))
+}
+fn original(pool: &MemoryLedger, bytes: u64) -> (InferenceRequest, WorkingMemoryFundingRun) {
     let (r, run) = pool
         .reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
-            &Admission {
-                state,
-                requested_positions: 9,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
-            },
-            pool.effective_capacity().unwrap(),
+            &original_admission(pool, bytes),
+            crate::working_memory::memory_fixture::resolved_host_limits(
+                &pool,
+                pool.payload_effective_capacity().unwrap(),
+            ),
         )
         .unwrap()
         .into_funding()
@@ -78,7 +93,7 @@ fn bank(
     run: &WorkingMemoryFundingRun,
     source: &SharedCapturePlan,
 ) -> PreparedCaptureRun {
-    run.prepare_capture_run(request.memory_reservation().unwrap(), plan(source))
+    run.prepare_capture_run(request.memory_reservation(), plan(source))
         .unwrap()
 }
 fn context<'a>(
@@ -93,16 +108,16 @@ fn bootstrap_before_claim_uses_exact_h_without_another_hold_and_short_h_rejects(
     let source = selected();
     let h = plan(&source).initialization_peak_bytes();
     for bytes in [h - 1, h] {
-        let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+        let pool = capture_test_ledger(bytes, 0).unwrap();
         let (request, run) = original(&pool, bytes);
         let mut native = run.scope().unwrap();
         let before = ledger(&pool);
         let allocations = CLAIM_ALLOCATIONS.get();
         if bytes < h {
             assert!(matches!(
-                run.prepare_capture_run(request.memory_reservation().unwrap(), plan(&source)),
+                run.prepare_capture_run(request.memory_reservation(), plan(&source)),
                 Err(CaptureRunHostError::Memory(
-                    WorkingMemoryError::BudgetExceeded { .. }
+                    WorkingMemoryError::DomainAllowanceExceeded { .. }
                 ))
             ));
             assert_eq!(ledger(&pool), before);
@@ -135,15 +150,15 @@ fn bootstrap_before_claim_uses_exact_h_without_another_hold_and_short_h_rejects(
         }
         native.certify().unwrap();
         drop((request, run));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 #[test]
 fn bootstrap_rejects_foreign_request_pool_and_wrong_fixed_chunk_before_allocation() {
     let source = selected();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(2 * h, 0).unwrap();
-    let other_pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(2 * h, 0).unwrap();
+    let other_pool = capture_test_ledger(h, 0).unwrap();
     let (request, run) = original(&pool, h);
     let (other, other_run) = original(&pool, h);
     let (foreign_request, foreign_run) = original(&other_pool, h);
@@ -153,16 +168,18 @@ fn bootstrap_rejects_foreign_request_pool_and_wrong_fixed_chunk_before_allocatio
     let before = ledger(&pool);
     let allocations = CLAIM_ALLOCATIONS.get();
     let span = chunk(0);
-    assert!(bank
-        .prefill_source_bootstrap()
-        .unwrap()
-        .begin_segment(&mut native, &context(&other, &span, 3))
-        .is_err());
-    assert!(bank
-        .prefill_source_bootstrap()
-        .unwrap()
-        .begin_segment(&mut foreign, &context(&request, &span, 3))
-        .is_err());
+    assert!(
+        bank.prefill_source_bootstrap()
+            .unwrap()
+            .begin_segment(&mut native, &context(&other, &span, 3))
+            .is_err()
+    );
+    assert!(
+        bank.prefill_source_bootstrap()
+            .unwrap()
+            .begin_segment(&mut foreign, &context(&request, &span, 3))
+            .is_err()
+    );
     for bad in [
         PrefillChunk {
             input: 0..2,
@@ -177,20 +194,21 @@ fn bootstrap_rejects_foreign_request_pool_and_wrong_fixed_chunk_before_allocatio
             ..span.clone()
         },
     ] {
-        assert!(bank
-            .prefill_source_bootstrap()
-            .unwrap()
-            .begin_segment(&mut native, &context(&request, &bad, 3))
-            .is_err());
+        assert!(
+            bank.prefill_source_bootstrap()
+                .unwrap()
+                .begin_segment(&mut native, &context(&request, &bad, 3))
+                .is_err()
+        );
     }
-    let unbudgeted =
-        InferenceRequest::without_memory_budget(&InferenceExecutionIdentity::default(), geometry())
-            .unwrap();
-    assert!(bank
-        .prefill_source_bootstrap()
-        .unwrap()
-        .begin_segment(&mut native, &context(&unbudgeted, &span, 3))
-        .is_err());
+    let foreign_ledger = capture_test_ledger(u64::MAX, 0).unwrap();
+    let (unrelated_request, _unrelated_run) = original(&foreign_ledger, 1 << 20);
+    assert!(
+        bank.prefill_source_bootstrap()
+            .unwrap()
+            .begin_segment(&mut native, &context(&unrelated_request, &span, 3))
+            .is_err()
+    );
     assert_eq!(ledger(&pool), before);
     assert_eq!(CLAIM_ALLOCATIONS.get(), allocations);
     assert_eq!(bank.spent_steps(), 0);
@@ -200,7 +218,7 @@ fn bootstrap_rejects_foreign_request_pool_and_wrong_fixed_chunk_before_allocatio
         .begin_segment(&mut native, &context(&request, &span, 3))
         .unwrap();
     let foreign_bank = foreign_run
-        .prepare_capture_run(foreign_request.memory_reservation().unwrap(), plan(&source))
+        .prepare_capture_run(foreign_request.memory_reservation(), plan(&source))
         .unwrap();
     let foreign_accepted = foreign_bank
         .prefill_source_bootstrap()
@@ -219,15 +237,15 @@ fn bootstrap_rejects_foreign_request_pool_and_wrong_fixed_chunk_before_allocatio
         foreign_request,
         foreign_run,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(other_pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(other_pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn actual_source_chunk_epoch_and_slot_cannot_be_replaced_by_equal_geometry() {
     let source = selected();
     let equal = selected();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(2 * h, 0).unwrap();
+    let pool = capture_test_ledger(2 * h, 0).unwrap();
     let (request, run) = original(&pool, 2 * h);
     let mut a = bank(&request, &run, &source);
     let b = bank(&request, &run, &equal);
@@ -251,16 +269,22 @@ fn actual_source_chunk_epoch_and_slot_cannot_be_replaced_by_equal_geometry() {
     segment
         .validate_prefill_fragment(&assembly.fragment(0).unwrap())
         .unwrap();
-    assert!(segment
-        .validate_prefill_fragment(&assembly.fragment(1).unwrap())
-        .is_err());
-    assert!(segment
-        .validate_prefill_fragment(&equal_assembly.fragment(0).unwrap())
-        .is_err());
+    assert!(
+        segment
+            .validate_prefill_fragment(&assembly.fragment(1).unwrap())
+            .is_err()
+    );
+    assert!(
+        segment
+            .validate_prefill_fragment(&equal_assembly.fragment(0).unwrap())
+            .is_err()
+    );
     assert!(segment.validate_native_scope(&sibling).is_err());
-    assert!(registration
-        .validate_context(&context(&request, &span, 6))
-        .is_err());
+    assert!(
+        registration
+            .validate_context(&context(&request, &span, 6))
+            .is_err()
+    );
     for outcome in [
         None,
         Some(DistributedCommitOutcome::Committed(epoch(6))),
@@ -276,19 +300,23 @@ fn actual_source_chunk_epoch_and_slot_cannot_be_replaced_by_equal_geometry() {
     let ticket = registration.into_settled();
     let other_ticket = other_registration.into_settled();
     segment.validate_settled_ticket(&native, &ticket).unwrap();
-    assert!(segment
-        .validate_settled_ticket(&native, &other_ticket)
-        .is_err());
+    assert!(
+        segment
+            .validate_settled_ticket(&native, &other_ticket)
+            .is_err()
+    );
     let frame = a
         .begin_step(CapturePhase::Prefill, 0)
         .unwrap()
         .prepare()
         .unwrap();
-    assert!(frame
-        .prefill_source_bootstrap()
-        .unwrap()
-        .begin_segment(&mut native, &context(&request, &chunk(1), 6))
-        .is_err());
+    assert!(
+        frame
+            .prefill_source_bootstrap()
+            .unwrap()
+            .begin_segment(&mut native, &context(&request, &chunk(1), 6))
+            .is_err()
+    );
     // The existing private foundation retirement is used only for this scalar
     // no-native fixture. Canonical A exposes no release operation.
     segment.retire_after_settled_boundary(&mut native).unwrap();
@@ -314,14 +342,14 @@ fn actual_source_chunk_epoch_and_slot_cannot_be_replaced_by_equal_geometry() {
     native.certify().unwrap();
     sibling.certify().unwrap();
     drop((request, run));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn escaped_registration_retains_original_h_and_channel_drop_quarantines_every_origin() {
     let source = selected();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h + 11, 0).unwrap();
-    let values = pool.register_storage([(1u32, 11), (2u32, 0)]).unwrap();
+    let pool = capture_test_ledger(h + 11, 0).unwrap();
+    let values = pool.register_host_storage([(1u32, 11), (2u32, 0)]).unwrap();
     let (request, run) = original(&pool, h);
     let mut native = run.scope().unwrap();
     let mut bank = bank(&request, &run, &source);
@@ -347,13 +375,13 @@ fn escaped_registration_retains_original_h_and_channel_drop_quarantines_every_or
     drop(step);
     drop((bank, segment));
     assert_eq!(
-        ledger(&pool).2,
+        ledger(&pool).1,
         h,
         "registration and unresolved native source slot retain scheduled H"
     );
     drop(native);
     drop((registration, request, run));
-    assert_eq!(pool.used_bytes().unwrap(), h + 11);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h + 11);
     assert!(
         pool.pin_registered_storage([(1u32, 11), (2u32, 0)]).is_ok(),
         "unfunded source roots remain physically pinned, including the zero-byte key"
@@ -363,7 +391,7 @@ fn escaped_registration_retains_original_h_and_channel_drop_quarantines_every_or
 fn source_health_is_rechecked_before_bootstrap_and_after_committed_association() {
     let source = selected();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (request, run) = original(&pool, h);
     let bank = bank(&request, &run, &source);
     let mut native = run.scope().unwrap();
@@ -380,14 +408,14 @@ fn source_health_is_rechecked_before_bootstrap_and_after_committed_association()
     assert!(registration.validate_context(&cx).is_err());
     assert!(segment.validate_native_scope(&native).is_err());
     drop((segment, registration, bank, native, request, run));
-    assert_eq!(pool.used_bytes().unwrap(), h);
+    assert_eq!(pool.payload_used_bytes().unwrap(), h);
 }
 
 #[test]
 fn last_registration_retains_original_h_after_certified_scope_teardown() {
     let source = selected();
     let h = plan(&source).initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+    let pool = capture_test_ledger(h, 0).unwrap();
     let (request, run) = original(&pool, h);
     let mut native = run.scope().unwrap();
     let bank = bank(&request, &run, &source);
@@ -405,18 +433,18 @@ fn last_registration_retains_original_h_after_certified_scope_teardown() {
     let retained = ledger(&pool);
     assert_eq!(retained.0, h);
     assert_eq!(
-        retained.2, h,
+        retained.1, h,
         "the escaped registration is the last scheduled-H owner"
     );
     assert_eq!(
-        retained.3, 1,
+        retained.2, 1,
         "only the original scheduled host scope remains"
     );
     drop(registration);
     let released = ledger(&pool);
     assert_eq!(released.0, 0);
+    assert_eq!(released.1, 0);
     assert_eq!(released.2, 0);
     assert_eq!(released.3, 0);
     assert_eq!(released.4, 0);
-    assert_eq!(released.5, 0);
 }

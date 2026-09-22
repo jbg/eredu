@@ -5,9 +5,9 @@ use crate::working_memory::{
 };
 use crate::{ConfiguredTextSampler, DenseHostSlotInitialization, HostSlotTable};
 use eredu_core::{
-    cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
-    InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig,
-    StateMemoryLayout, TextGenerationConfig, WorkspaceBound,
+    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
+    InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig, StateMemoryLayout,
+    TextGenerationConfig, WorkspaceBound, cache::LayerCachePolicy,
 };
 use eredu_nn::workspace::{
     WorkspaceContext, WorkspaceDtype, WorkspaceExistingStorage, WorkspaceHostBound,
@@ -18,7 +18,7 @@ use std::{cell::Cell, mem::size_of, num::NonZeroU8};
 
 #[path = "../fixtures.rs"]
 mod fixtures;
-use fixtures::{grow, history, source, Facts};
+use fixtures::{Facts, grow, history, source};
 
 const CAPACITY: u64 = 1_048_576;
 const NATIVE: u64 = 48;
@@ -42,23 +42,28 @@ impl HostSlotStorageKey for Key {
 fn key<T>(table: &HostSlotTable<T>) -> Key {
     Key::Host(table.metadata().identity().registry_key().clone())
 }
-fn empty(pool: &WorkingMemoryPool) -> WorkingMemoryStorage<Key> {
+fn empty(pool: &MemoryLedger) -> WorkingMemoryStorage<Key> {
     pool.pin_registered_storage(std::iter::empty::<(Key, u64)>())
         .unwrap()
 }
-fn usage(pool: &WorkingMemoryPool) -> (u64, u64, u64, usize, u64) {
+fn usage(pool: &MemoryLedger) -> (u64, u64, u64, usize, u64) {
     let u = pool.0.usage.lock().unwrap();
     (
         u.reserved,
-        u.registered,
+        u.registered - u.registry_metadata,
         u.peak,
         u.funding.values().map(|s| s.scopes).sum(),
-        u.funding.values().map(|s| s.host_held).sum(),
+        u.funding
+            .values()
+            .map(|s| s.host_held.checked_sub(s.control_floor).unwrap())
+            .sum(),
     )
 }
-fn array_plan(pool: &WorkingMemoryPool) -> RegisteredWorkspaceCopy<Key> {
-    let ctx = WorkspaceContext::new(Facts::default());
-    let root = WorkspaceExistingStorage::new(Some(64), &ctx);
+fn array_plan(pool: &MemoryLedger) -> RegisteredWorkspaceCopy<Key> {
+    let ctx = WorkspaceContext::new(Facts::default().with_pool(&pool));
+    let root =
+        WorkspaceExistingStorage::try_new_placed(Some(64), &pool.host_placement_handle(), &ctx)
+            .unwrap();
     let source =
         RegisteredWorkspaceStorage::bind(pool, &ctx, [(Key::Array(1), root.clone())]).unwrap();
     let a = WorkspaceTensor::existing_with_storage(
@@ -105,11 +110,8 @@ fn live() -> HostSlotTable<Live> {
         .into_boxed_slice(),
     )
 }
-fn register_tree(
-    pool: &WorkingMemoryPool,
-    tree: &HostSlotTable<Live>,
-) -> WorkingMemoryStorage<Key> {
-    pool.register_storage(
+fn register_tree(pool: &MemoryLedger, tree: &HostSlotTable<Live>) -> WorkingMemoryStorage<Key> {
+    pool.register_host_storage(
         std::iter::once((key(tree), tree.metadata().capacity_bytes().unwrap())).chain(
             tree.slots()
                 .iter()
@@ -119,7 +121,7 @@ fn register_tree(
     .unwrap()
 }
 fn frozen_plan<'a>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     tree: &'a HostSlotTable<Live>,
 ) -> RegisteredDecoderTableGroup<'a, Live, Saved, Option<u32>, Option<u64>, Key> {
     let outer =
@@ -144,7 +146,7 @@ fn frozen_plan<'a>(
     RegisteredDecoderTableGroup::new(outer, children).unwrap()
 }
 fn dense_plan<'a>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     tree: &'a HostSlotTable<Live>,
 ) -> RegisteredDenseDecoderTableGroup<'a, Live, Fresh, Option<u32>, Option<u64>, Key> {
     let outer =
@@ -169,7 +171,7 @@ fn dense_plan<'a>(
     RegisteredDenseDecoderTableGroup::new(outer, children).unwrap()
 }
 fn joint<'a>(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     sampler: BorrowedFundedSampler<'a>,
     tree: &'a HostSlotTable<Live>,
     complete: WorkingMemoryStorage<Key>,
@@ -221,7 +223,7 @@ fn fill_frozen(
 }
 
 fn fresh(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
 ) -> (
     InferenceTextPreparation,
@@ -254,9 +256,12 @@ fn fresh(
     )
     .unwrap();
     let bound = |bytes| WorkspaceBound::bounded(bytes, "closed scalar host preparation fixture");
-    let state = state
+    let mut state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
             geometry,
+            physical_domains: Some(crate::working_memory::memory_fixture::host_workspace(
+                pool, geometry, bytes,
+            )),
             activations: bound(bytes),
             attention: bound(0),
             vocabulary: bound(0),
@@ -265,16 +270,20 @@ fn fresh(
             retained: bound(0),
         })
         .unwrap();
+    state.physical_domains = Some(crate::working_memory::memory_fixture::empty_state(
+        pool, geometry,
+    ));
     let reservation = pool
         .reserve_with_capacity(
             &execution,
             &Admission {
                 requested_positions: 1,
                 state,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
+                incremental_required_bytes: Some(bytes),
+                additional_headroom: eredu_core::MemoryHeadroomDeclarations::none(),
+                memory_limits: eredu_core::MemoryLimitDeclarations::unlimited(),
             },
-            CAPACITY,
+            crate::working_memory::memory_fixture::resolved_host_limits(pool, CAPACITY),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
@@ -292,10 +301,21 @@ fn fresh(
         max_new_tokens: Some(0),
     });
     (
-        request.prepare_text(&execution, geometry, config).unwrap(),
+        request
+            .prepare_text(&execution, geometry, config.clone())
+            .unwrap(),
         run,
         config,
     )
+}
+fn dense_controls<OS, OD, CS, CD>(children: usize) -> u64 {
+    let outer =
+        crate::working_memory::storage::ordinary_dense_preparation_bytes::<OS, OD, Key>().unwrap();
+    let child =
+        crate::working_memory::storage::ordinary_dense_preparation_bytes::<CS, CD, Key>().unwrap();
+    outer
+        .checked_add(child.checked_mul(children as u64).unwrap())
+        .unwrap()
 }
 fn sampler(
     preparation: &InferenceTextPreparation,
@@ -303,7 +323,7 @@ fn sampler(
     config: TextGenerationConfig,
 ) -> RunOwnedTextSampler {
     let (sampler, complete) = preparation
-        .claim_sampling(config)
+        .claim_sampling(config.clone())
         .unwrap()
         .construct_sampler(run.sampler_scope().unwrap())
         .unwrap();
@@ -313,16 +333,17 @@ fn sampler(
 
 #[test]
 fn grouped_frozen_exact_and_one_short_include_absent_roles_and_all_sources() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let tree = live();
     let tables = register_tree(&pool, &tree);
     let arrays = pool
-        .register_storage([(Key::Array(1), 64), (Key::Array(2), 80)])
+        .register_host_storage([(Key::Array(1), 64), (Key::Array(2), 80)])
         .unwrap();
     let (mut source_sampler, source_prep, source_run) = source(&pool, CAPACITY, 8, true);
     grow(&mut source_sampler, &[3, 11, 7, 19]);
-    let required =
-        joint(&pool, source_sampler.borrow_funded(), &tree, arrays.clone()).required_bytes();
+    let required = joint(&pool, source_sampler.borrow_funded(), &tree, arrays.clone())
+        .required_bytes()
+        .unwrap();
     let p = frozen_plan(&pool, &tree).initialization_peak_bytes();
     assert_eq!(
         required,
@@ -333,39 +354,35 @@ fn grouped_frozen_exact_and_one_short_include_absent_roles_and_all_sources() {
                 .unwrap()
                 .retained_bytes()
     );
-    for app in [true, false] {
-        let before = (usage(&pool), INITIALIZATIONS.get());
-        let mut limits = WorkspaceCopyLimits::new(if app {
-            CAPACITY
-        } else {
-            pool.used_bytes().unwrap() + required - 1
-        });
-        limits.application_memory_budget_bytes = app.then_some(required - 1);
-        let error = pool
-            .copy_text_components_group(
-                joint(&pool, source_sampler.borrow_funded(), &tree, arrays.clone()),
-                limits,
-            )
-            .err()
-            .unwrap();
-        if app {
-            assert!(
-                matches!(error, DecoderCopyAdmissionError::ApplicationBudgetExceeded { required_bytes, budget_bytes }
-                if required_bytes == required && budget_bytes == required - 1)
-            );
-        } else {
-            assert!(
-                matches!(error, DecoderCopyAdmissionError::Memory(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
-                if required_bytes == required && available_bytes == required - 1)
-            );
-        }
-        assert_eq!((usage(&pool), INITIALIZATIONS.get()), before);
-    }
+    let rejected = joint(&pool, source_sampler.borrow_funded(), &tree, arrays.clone());
+    let full = pool
+        .text_components_group_copy_requirements(&rejected, &WorkspaceCopyLimits::default())
+        .unwrap()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    let snapshot = pool.snapshot().unwrap();
+    let domain = &snapshot.domains[0];
+    let initial = domain.current_charge_bytes - domain.fixed_baseline.total().unwrap();
+    let before = (usage(&pool), INITIALIZATIONS.get());
+    let limits = WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+        initial + full - 1,
+    ));
+    let error = pool
+        .copy_text_components_group(rejected, limits)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecoderCopyAdmissionError::Memory(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes, limit_bytes, existing_bytes, .. })) if requested_bytes == full && limit_bytes - existing_bytes == full - 1)
+    );
+    assert_eq!((usage(&pool), INITIALIZATIONS.get()), before);
     let before = usage(&pool);
     let (saved_sampler, slots, native) = pool
         .copy_text_components_group(
             joint(&pool, source_sampler.borrow_funded(), &tree, arrays.clone()),
-            WorkspaceCopyLimits::new(pool.used_bytes().unwrap() + required),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                initial + full,
+            )),
         )
         .unwrap();
     assert_eq!(
@@ -394,29 +411,38 @@ fn grouped_frozen_exact_and_one_short_include_absent_roles_and_all_sources() {
         tables,
         tree,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn dense_group_claim_waits_for_every_child_publication_and_original_input_binding() {
     for short in [true, false] {
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
         let tree = live();
         let tables = register_tree(&pool, &tree);
         let plan = dense_plan(&pool, &tree);
         let p = plan.initialization_peak_bytes();
         let d = plan.retained_bytes();
         let h = size_of::<ConfiguredTextSampler>() as u64;
-        let (prep, run, config) = fresh(&pool, h + p - u64::from(short));
+        let (prep, run, config) = fresh(
+            &pool,
+            if short {
+                h + p - 1
+            } else {
+                h + p + dense_controls::<Live, Fresh, Option<u32>, Option<u64>>(plan.len())
+            },
+        );
         let sampler = sampler(&prep, &run, config);
+        let complete = empty(&pool);
         let before = (usage(&pool), INITIALIZATIONS.get());
-        let result =
-            prep.claim_prompt()
-                .unwrap()
-                .construct_dense_decoder_group(plan, &run, empty(&pool));
+        let result = prep.claim_prompt().unwrap().construct_dense_decoder_group(
+            plan,
+            &run,
+            complete.clone(),
+        );
         if short {
             assert!(
-                matches!(result,Err(DecoderCopyAdmissionError::Memory(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==p&&available_bytes==p-1)
+                matches!(result,Err(DecoderCopyAdmissionError::Memory(WorkingMemoryError::DomainAllowanceExceeded { required_bytes, available_bytes, .. })) if required_bytes==p&&available_bytes==p-1)
             );
             assert_eq!((usage(&pool), INITIALIZATIONS.get()), before);
             assert!(matches!(
@@ -424,15 +450,16 @@ fn dense_group_claim_waits_for_every_child_publication_and_original_input_bindin
                 Err(WorkingMemoryError::PreparationAlreadyStarted)
             ));
             drop((sampler, prep, run, tables, tree));
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             continue;
         }
         let (mut group, native) = result.unwrap();
-        assert_eq!(usage(&pool).3, before.0 .3 + 5);
+        assert_eq!(usage(&pool).3, before.0.3 + 5);
         assert_eq!(usage(&pool).4, h + p);
         assert!(matches!(
-            native.adopt_storage_individually([(Key::Array(99), 1)]),
-            Err(WorkingMemoryError::BudgetExceeded {
+            native.publish_host_storage_fixture([(Key::Array(99), 1)]),
+            Err(WorkingMemoryError::DomainAllowanceExceeded {
+                required_bytes: 1,
                 available_bytes: 0,
                 ..
             })
@@ -540,7 +567,7 @@ fn dense_group_claim_waits_for_every_child_publication_and_original_input_bindin
         assert_eq!(table.slots()[2].tag, 47);
         completion.finish().unwrap();
         let request = prep.request();
-        let execution = &request.memory_reservation().unwrap().0.execution;
+        let execution = &request.memory_reservation().0.execution;
         assert!(matches!(
             request.begin_prefill(execution, request.geometry()),
             Err(WorkingMemoryError::PreparationNotReady)
@@ -556,24 +583,27 @@ fn dense_group_claim_waits_for_every_child_publication_and_original_input_bindin
         native.certify().unwrap();
         drop((sampler, prep, run, tables, tree, table));
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.payload_used_bytes().unwrap(),
             d,
             "escaped metadata retains actual registered group payload charges"
         );
         drop((tokens, outer_token));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn published_child_and_partial_parent_retire_independently_without_early_refund() {
     for child_first in [true, false] {
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
         let tree = live();
         let tables = register_tree(&pool, &tree);
         let plan = dense_plan(&pool, &tree);
         let p = plan.initialization_peak_bytes();
-        let (prep, run, _) = fresh(&pool, p);
+        let (prep, run, _) = fresh(
+            &pool,
+            p + dense_controls::<Live, Fresh, Option<u32>, Option<u64>>(plan.len()),
+        );
         let (mut group, native) = prep
             .claim_prompt()
             .unwrap()
@@ -606,48 +636,52 @@ fn published_child_and_partial_parent_retire_independently_without_early_refund(
         drop(missing);
         native.certify().unwrap();
         drop((prep, run, tables, tree));
-        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        assert_eq!(pool.payload_used_bytes().unwrap(), bytes);
         assert!(matches!(
-            token.try_attach(pool.shared_storage_domain(), || Ok::<
+            token.try_attach(pool.shared_storage_accounting_id(), || Ok::<
                 Box<dyn Send + Sync>,
                 WorkingMemoryError,
-            >(Box::new(()))),
+            >(
+                Box::new(())
+            )),
             Err(crate::HostSlotAttachmentError::Retired)
         ));
         drop(token);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn native_scope_alone_retains_complete_uncopied_roots_after_host_results_retire() {
     for certify in [true, false] {
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
         let tree = live();
         let tables = register_tree(&pool, &tree);
         let arrays = pool
-            .register_storage([(Key::Array(1), 64), (Key::Array(2), 80)])
+            .register_host_storage([(Key::Array(1), 64), (Key::Array(2), 80)])
             .unwrap();
-        let source_bytes = tables.bytes() + arrays.bytes();
+        let source_bytes = tables.bytes().unwrap() + arrays.bytes().unwrap();
         let (sampler, prep, run) = source(&pool, CAPACITY, 4, false);
         let (copy, group, native) = pool
             .copy_text_components_group(
                 joint(&pool, sampler.borrow_funded(), &tree, arrays.clone()),
-                WorkspaceCopyLimits::new(CAPACITY),
+                WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(
+                    CAPACITY,
+                )),
             )
             .unwrap();
         let (custody, scope) = native.into_parts();
         drop((
             copy, group, sampler, prep, run, arrays, tables, tree, custody,
         ));
-        assert!(pool.used_bytes().unwrap() >= source_bytes);
+        assert!(pool.payload_used_bytes().unwrap() >= source_bytes);
         assert!(pool.pin_registered_storage([(Key::Array(2), 80)]).is_ok());
         if certify {
             scope.certify().unwrap();
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         } else {
             drop(scope);
-            assert!(pool.used_bytes().unwrap() >= source_bytes);
+            assert!(pool.payload_used_bytes().unwrap() >= source_bytes);
             assert!(matches!(
                 pool.acquire_unquoted(),
                 Err(WorkingMemoryError::ReservedWorkActive)
@@ -657,7 +691,7 @@ fn native_scope_alone_retains_complete_uncopied_roots_after_host_results_retire(
 }
 
 fn saved_fixture(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (
     FundedSamplerCopy,
     FundedDecoderSlots<Saved>,
@@ -667,13 +701,13 @@ fn saved_fixture(
     let tree = live();
     let tables = register_tree(pool, &tree);
     let arrays = pool
-        .register_storage([(Key::Array(1), 64), (Key::Array(2), 80)])
+        .register_host_storage([(Key::Array(1), 64), (Key::Array(2), 80)])
         .unwrap();
     let (sampler, prep, run) = source(pool, CAPACITY, 4, false);
     let (copied, group, native) = pool
         .copy_text_components_group(
             joint(pool, sampler.borrow_funded(), &tree, arrays.clone()),
-            WorkspaceCopyLimits::new(CAPACITY),
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(CAPACITY)),
         )
         .unwrap();
     let saved = fill_frozen(group, &tree);
@@ -704,13 +738,16 @@ fn saved_dense_plan(
 
 #[test]
 fn actual_funded_saved_children_support_typechanging_fresh_without_original_registrations() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (sampler, saved, old_custody, old_scope) = saved_fixture(&pool);
     old_scope.certify().unwrap();
     drop(old_custody);
     let plan = saved_dense_plan(&saved);
     let p = plan.initialization_peak_bytes();
-    let (prep, run, _) = fresh(&pool, p);
+    let (prep, run, _) = fresh(
+        &pool,
+        p + dense_controls::<Saved, Fresh, Option<u64>, Option<u64>>(plan.len()),
+    );
     let (mut group, native) = prep
         .claim_prompt()
         .unwrap()
@@ -764,14 +801,14 @@ fn actual_funded_saved_children_support_typechanging_fresh_without_original_regi
             .iter()
             .map(|r| r.fixed.metadata().capacity_bytes().unwrap())
             .sum::<u64>();
-    assert_eq!(pool.used_bytes().unwrap(), d);
+    assert_eq!(pool.payload_used_bytes().unwrap(), d);
     drop(fresh_table);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn quarantined_saved_child_origin_and_foreign_registered_child_reject_before_any_initializer() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (sampler, saved, old_custody, old_scope) = saved_fixture(&pool);
     let plan = saved_dense_plan(&saved);
     let p = plan.initialization_peak_bytes();
@@ -779,11 +816,12 @@ fn quarantined_saved_child_origin_and_foreign_registered_child_reject_before_any
     // The source plan was sound when prepared. Its actual origin changes before
     // construction; the same-lock group check must reject the entire operation.
     drop(old_scope);
+    let complete = empty(&pool);
     let before = (usage(&pool), INITIALIZATIONS.get());
     assert!(matches!(
         prep.claim_prompt()
             .unwrap()
-            .construct_dense_decoder_group(plan, &run, empty(&pool)),
+            .construct_dense_decoder_group(plan, &run, complete),
         Err(DecoderCopyAdmissionError::Memory(
             WorkingMemoryError::ExecutionFenced
         ))
@@ -791,13 +829,13 @@ fn quarantined_saved_child_origin_and_foreign_registered_child_reject_before_any
     assert_eq!((usage(&pool), INITIALIZATIONS.get()), before);
     drop((sampler, saved, old_custody, prep, run));
 
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
-    let foreign_pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
+    let foreign_pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let tree = live();
     let tables = register_tree(&pool, &tree);
     let foreign = HostSlotTable::new(Box::new([None::<u32>]));
     let foreign_charge = foreign_pool
-        .register_storage([(key(&foreign), foreign.metadata().capacity_bytes().unwrap())])
+        .register_host_storage([(key(&foreign), foreign.metadata().capacity_bytes().unwrap())])
         .unwrap();
     let outer =
         RegisteredDecoderHostCopy::bind(&pool, tree.prepare_copy_slots().unwrap(), key(&tree))
@@ -823,11 +861,12 @@ fn quarantined_saved_child_origin_and_foreign_registered_child_reject_before_any
     let group = RegisteredDenseDecoderTableGroup::new(outer, children).unwrap();
     let p = group.initialization_peak_bytes();
     let (prep, run, _) = fresh(&pool, p);
+    let complete = empty(&pool);
     let before = (usage(&pool), usage(&foreign_pool), INITIALIZATIONS.get());
     assert!(matches!(
         prep.claim_prompt()
             .unwrap()
-            .construct_dense_decoder_group(group, &run, empty(&pool)),
+            .construct_dense_decoder_group(group, &run, complete.clone()),
         Err(DecoderCopyAdmissionError::Memory(
             WorkingMemoryError::IdentityMismatch
         ))
@@ -837,13 +876,13 @@ fn quarantined_saved_child_origin_and_foreign_registered_child_reject_before_any
         before
     );
     drop((prep, run, tables, tree, foreign_charge, foreign));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(foreign_pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+    assert_eq!(foreign_pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn exact_group_count_zero_outer_and_checked_typechanging_overflow_preserve_legacy_path() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let tree = live();
     let tables = register_tree(&pool, &tree);
     let outer =
@@ -861,7 +900,7 @@ fn exact_group_count_zero_outer_and_checked_typechanging_overflow_preserve_legac
         ))
     ));
     let enormous = HostSlotTable::new(vec![(); isize::MAX as usize / 2].into_boxed_slice());
-    let charge = pool.register_storage([(key(&enormous), 0)]).unwrap();
+    let charge = pool.register_host_storage([(key(&enormous), 0)]).unwrap();
     let source = RegisteredDecoderHostCopy::bind(
         &pool,
         enormous.prepare_copy_slots().unwrap(),
@@ -894,7 +933,10 @@ fn exact_group_count_zero_outer_and_checked_typechanging_overflow_preserve_legac
         (group.retained_bytes(), group.initialization_peak_bytes()),
         (0, 0)
     );
-    let (prep, run, _) = fresh(&pool, 0);
+    let (prep, run, _) = fresh(
+        &pool,
+        dense_controls::<Live, Fresh, Option<u32>, Option<u64>>(0),
+    );
     let (group, native) = prep
         .claim_prompt()
         .unwrap()
@@ -907,11 +949,11 @@ fn exact_group_count_zero_outer_and_checked_typechanging_overflow_preserve_legac
     completion.finish().unwrap();
     native.certify().unwrap();
     drop((table, prep, run, empty_charge, empty_outer, tables, tree));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
-fn empty_array_plan(pool: &WorkingMemoryPool) -> RegisteredWorkspaceCopy<Key> {
-    let context = WorkspaceContext::new(Facts::default());
+fn empty_array_plan(pool: &MemoryLedger) -> RegisteredWorkspaceCopy<Key> {
+    let context = WorkspaceContext::new(Facts::default().with_pool(&pool));
     let registration = RegisteredWorkspaceStorage::bind(
         pool,
         &context,
@@ -926,7 +968,7 @@ fn empty_array_plan(pool: &WorkingMemoryPool) -> RegisteredWorkspaceCopy<Key> {
 
 #[test]
 fn saved_to_saved_group_reuses_actual_held_origins_without_option_nesting_or_old_registry() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let (sampler, saved, custody, scope) = saved_fixture(&pool);
     scope.certify().unwrap();
     drop(custody);
@@ -960,7 +1002,10 @@ fn saved_to_saved_group_reuses_actual_held_origins_without_option_nesting_or_old
         .with_decoder_group(group, empty(&pool))
         .unwrap();
     let (new_sampler, mut group, native) = pool
-        .copy_text_components_group(joined, WorkspaceCopyLimits::new(CAPACITY))
+        .copy_text_components_group(
+            joined,
+            WorkspaceCopyLimits::new(crate::working_memory::memory_fixture::host_limits(CAPACITY)),
+        )
         .unwrap();
     group
         .validate_source(
@@ -1000,18 +1045,18 @@ fn saved_to_saved_group_reuses_actual_held_origins_without_option_nesting_or_old
     assert_eq!(*copied.get(1).unwrap().fixed.get(0).unwrap(), None);
     assert_eq!(*copied.get(2).unwrap().fixed.get(0).unwrap(), Some(7));
     drop((copied, new_sampler));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn unrelated_complete_source_quarantine_is_checked_with_all_fresh_group_holds() {
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(CAPACITY, 0).unwrap();
     let tree = live();
     let tables = register_tree(&pool, &tree);
     let (old_prep, old_run, _) = fresh(&pool, 16);
     let old_scope = old_run.scope().unwrap();
     let extra = old_scope
-        .adopt_storage_individually([(Key::Array(500), 16)])
+        .publish_host_storage_fixture([(Key::Array(500), 16)])
         .unwrap()
         .into_values()
         .next()

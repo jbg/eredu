@@ -97,12 +97,15 @@ fn reference(
 
 #[test]
 fn explicit_cpu_attention_matches_independent_scores_and_retires_resources() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     use crate::{
-        MlxTensor,
         backend::{
-            MlxBackend, MlxDeviceIdentity, managed_memory::gpu_stream::PreparedExecutionStreams,
-            nn::shared::MlxNeuralBackend,
+            managed_memory::gpu_stream::PreparedExecutionStreams, nn::shared::MlxNeuralBackend,
+            MlxBackend, MlxDeviceIdentity,
         },
+        MlxTensor,
     };
     use safemlx::{
         Device, DeviceType, OriginalBufferBudget, OriginalScopeObserver, PrefillRoots,
@@ -111,8 +114,8 @@ fn explicit_cpu_attention_matches_independent_scores_and_retires_resources() {
         SubmissionScope,
     };
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
     #[derive(Debug)]
     struct Lifetime(Arc<AtomicBool>);
@@ -125,7 +128,8 @@ fn explicit_cpu_attention_matches_independent_scores_and_retires_resources() {
     let pool = crate::tests::support::test_utils::initialize_original_sources();
     let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
     let selected =
-        MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32AndFloat16Tiles).unwrap();
+        MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32AndFloat16Tiles)
+            .unwrap();
     let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), selected);
     let streams = PreparedExecutionStreams::for_cpu_factory_with_matmul(&pool, selected)
         .unwrap()

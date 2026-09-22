@@ -9,6 +9,8 @@ use crate::composition::mlx::speculative::sampling::numerical::native_tests::{
     admitted_backend, load, settle, source_configs, REQUEST_CEILING,
 };
 use crate::composition::mlx::MlxPreparedInputMaterializer;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{SpeculativeConfig, SpeculativeSchedulerOptions};
 use eredu_runtime::input::host::{
     HostInputPart, HostTensorValues, HostTensorView, PreparedHostInputPlan,
@@ -19,6 +21,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 #[test]
 #[ignore = "requires managed native allocator and source-qualified CPU execution"]
 fn original_cpu_capture_concatenation_joins_shifted_views_and_retires_escaped_sources() {
+    if !crate::tests::support::native_process::enter("original-speculative-source") {
+        return;
+    }
     let artifact = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_fixture(artifact.path());
     let pool = crate::tests::support::test_utils::initialize_original_sources();
@@ -33,11 +38,11 @@ fn original_cpu_capture_concatenation_joins_shifted_views_and_retires_escaped_so
         )
         .unwrap(),
     );
-    let initial = pool.used_bytes().unwrap();
+    let initial = pool.fixture_host_charge().unwrap();
     let (target_config, draft_config, selected) = source_configs(&backend, artifact.path());
     let target = load(&backend, &target_config);
     let draft = load(&backend, &draft_config);
-    let loaded = pool.used_bytes().unwrap();
+    let loaded = pool.fixture_host_charge().unwrap();
     let config = SpeculativeConfig {
         max_tokens: 2,
         max_draft_tokens: 1,
@@ -69,7 +74,7 @@ fn original_cpu_capture_concatenation_joins_shifted_views_and_retires_escaped_so
             draft.original_model_source().unwrap(),
             &schedule,
             &pool,
-            REQUEST_CEILING,
+            crate::memory_fixture::resolved_limits(REQUEST_CEILING),
         )
         .unwrap();
         let environment = cpu.original_copy_environment().unwrap();
@@ -97,7 +102,7 @@ fn original_cpu_capture_concatenation_joins_shifted_views_and_retires_escaped_so
                     roots,
                     mechanisms,
                     sources.metadata_funding(),
-                    REQUEST_CEILING,
+                    &crate::memory_fixture::resolved_limits(REQUEST_CEILING),
                 )
                 .unwrap()
         });
@@ -188,8 +193,10 @@ fn original_cpu_capture_concatenation_joins_shifted_views_and_retires_escaped_so
             Err(error) => error,
             Ok(_) => panic!("a mismatched second-source position count must be refused"),
         };
-        assert!(super::super::native::is_program_source_failure(&error),
-            "the exact second-source refusal survives: {error:?}");
+        assert!(
+            super::super::native::is_program_source_failure(&error),
+            "the exact second-source refusal survives: {error:?}"
+        );
         let output = invoke(
             program::SpeculativeNumericalKind::TensorConcatenate { right_positions: 2 },
             &carry,
@@ -238,7 +245,7 @@ fn original_cpu_capture_concatenation_joins_shifted_views_and_retires_escaped_so
         drop((carry, prefix, narrow, source));
         escaped.push((output, error));
     }
-    assert!(pool.used_bytes().unwrap() > loaded);
+    assert!(pool.fixture_host_charge().unwrap() > loaded);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     drop((target, draft));
     for (output, _) in &escaped {

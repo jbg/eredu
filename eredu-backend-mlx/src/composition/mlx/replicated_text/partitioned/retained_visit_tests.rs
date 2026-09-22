@@ -131,9 +131,14 @@ fn fixture(resident: bool) -> (Selected, Stream, ExecutionUnitLayout) {
                 )
             })
             .collect();
-        assert!(policy
-            .publish_parameter_replacements(&replacements, true)
-            .unwrap());
+        let (context, funding) = crate::memory_fixture::parameter_context();
+        crate::memory_fixture::publish_parameters(
+            replacements,
+            true,
+            &context,
+            funding,
+            |visitor| policy.visit_parameter_publication(visitor),
+        );
         Selected::bounded(policy, &layout, &addresses).unwrap()
     };
     (selected, stream, layout)

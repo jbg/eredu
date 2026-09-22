@@ -104,7 +104,6 @@ fn admitted_slice(
     plan.limits = CaptureLimits {
         per_step: usage,
         cumulative: usage,
-        physical_native_bytes: None,
         on_limit: limit,
     };
     SharedCapturePlan::new(
@@ -147,7 +146,7 @@ fn fresh(
     source: &SharedCapturePlan,
     shortage: u64,
 ) -> (
-    WorkingMemoryPool,
+    MemoryLedger,
     WorkingMemoryReservation,
     WorkingMemoryFundingRun,
 ) {
@@ -156,8 +155,15 @@ fn fresh(
         .initialization_peak_bytes();
     fresh_capacity(h, shortage)
 }
-fn fresh_capacity(h: u64, shortage: u64) -> (WorkingMemoryPool,WorkingMemoryReservation,WorkingMemoryFundingRun) {
-    let pool = WorkingMemoryPool::new(h, 0).unwrap();
+fn fresh_capacity(
+    h: u64,
+    shortage: u64,
+) -> (
+    MemoryLedger,
+    WorkingMemoryReservation,
+    WorkingMemoryFundingRun,
+) {
+    let pool = crate::working_memory::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let layout = StateMemoryLayout::new(
         LayerSchedule::new(1, vec![cache::LayerCachePolicy::NoState]).unwrap(),
         vec![0],
@@ -177,6 +183,7 @@ fn fresh_capacity(h: u64, shortage: u64) -> (WorkingMemoryPool,WorkingMemoryRese
     let bound = |n| WorkspaceBound::bounded(n, "finite host-only fragment observer fixture");
     let state = state
         .with_execution_workspace(ExecutionWorkspaceEstimate {
+            physical_domains: None,
             geometry: geometry(),
             activations: bound(h - shortage),
             attention: bound(0),
@@ -186,16 +193,23 @@ fn fresh_capacity(h: u64, shortage: u64) -> (WorkingMemoryPool,WorkingMemoryRese
             retained: bound(0),
         })
         .unwrap();
+    let admission = crate::working_memory::memory_fixture::attribute_host_admission(
+        &pool,
+        Admission {
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
+            state,
+            requested_positions: 13,
+            incremental_required_bytes: Some(h - shortage),
+        },
+    );
+    let total = crate::working_memory::memory_fixture::reservation_bytes(&pool, &admission);
+    let pool = crate::working_memory::memory_fixture::host_ledger(total + shortage, 0).unwrap();
     let (r, run) = pool
         .reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
-            &Admission {
-                state,
-                requested_positions: 13,
-                incremental_required_bytes: h - shortage,
-                available_memory_bytes: None,
-            },
-            pool.effective_capacity().unwrap(),
+            &admission,
+            pool.configured_limits().clone(),
         )
         .unwrap()
         .into_funding()
@@ -255,64 +269,106 @@ impl ScheduledCaptureBackend for Backend {
     type Tensor = Value;
     type Error = Native;
     fn validate_routed_prefill_source(
-        &self, source: &RoutedUnitCaptureSource<'_, Value>, fragment: &CaptureRoutedPrefillFragment<'_, '_>,
+        &self,
+        source: &RoutedUnitCaptureSource<'_, Value>,
+        fragment: &CaptureRoutedPrefillFragment<'_, '_>,
     ) -> Result<TensorDtype, FundedCaptureError<Native>> {
-        if source.values.shape != [3, 5] || source.source_groups.shape != [fragment.source_tokens() as i32, 3] {
+        if source.values.shape != [3, 5]
+            || source.source_groups.shape != [fragment.source_tokens() as i32, 3]
+        {
             return Err(FundedCaptureError::Backend(Native::Shape));
         }
         Ok(TensorDtype::F32)
     }
-    fn estimate_routed_prefill(&self, geometry: &CaptureRoutedUnitsGeometry<'_>) -> Result<CaptureUsage, CaptureError> {
-        Ok(CaptureUsage { captures: 1, retained_bytes: 65536, host_bytes: 65536,
-            encoded_bytes: 65536 + geometry.elements() as u64 })
+    fn estimate_routed_prefill(
+        &self,
+        geometry: &CaptureRoutedUnitsGeometry<'_>,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Ok(CaptureUsage {
+            captures: 1,
+            retained_bytes: 65536,
+            host_bytes: 65536,
+            encoded_bytes: 65536 + geometry.elements() as u64,
+        })
     }
     fn transform_routed_prefill(
-        &mut self, source: &RoutedUnitCaptureSource<'_, Value>,
+        &mut self,
+        source: &RoutedUnitCaptureSource<'_, Value>,
         mut writer: CaptureRoutedPrefillWriter<'_, '_, '_, '_>,
     ) -> Result<(), FundedCaptureError<Native>> {
         self.transforms += 1;
         for slot in 0..3 {
-            if !writer.fragment().selects(source.token_offset, slot) { continue; }
-            let expert = source.source_groups.values[source.token_offset as usize * 3 + slot as usize] as u64;
-            writer.begin_row(source.token_offset, slot, expert, source.coefficients.values[slot as usize])
+            if !writer.fragment().selects(source.token_offset, slot) {
+                continue;
+            }
+            let expert = source.source_groups.values
+                [source.token_offset as usize * 3 + slot as usize] as u64;
+            writer
+                .begin_row(
+                    source.token_offset,
+                    slot,
+                    expert,
+                    source.coefficients.values[slot as usize],
+                )
                 .map_err(CaptureRunHostError::from)?;
-            for unit in [1,3] {
-                writer.push_f32(source.values.values[slot as usize*5+unit])
+            for unit in [1, 3] {
+                writer
+                    .push_f32(source.values.values[slot as usize * 5 + unit])
                     .map_err(CaptureRunHostError::from)?;
             }
             writer.finish_row().map_err(CaptureRunHostError::from)?;
         }
-        writer.source_chunk(source.token_offset, source.token_offset + 1).map_err(CaptureRunHostError::from)?;
+        writer
+            .source_chunk(source.token_offset, source.token_offset + 1)
+            .map_err(CaptureRunHostError::from)?;
         writer.finish().map_err(CaptureRunHostError::from)?;
         Ok(())
     }
     fn validate_routed_invocation_source(
-        &self, source: &RoutedUnitCaptureSource<'_, Value>, geometry: &CaptureRoutedUnitsGeometry<'_>,
+        &self,
+        source: &RoutedUnitCaptureSource<'_, Value>,
+        geometry: &CaptureRoutedUnitsGeometry<'_>,
     ) -> Result<TensorDtype, FundedCaptureError<Native>> {
         if source.values.shape != [3, 5]
-            || source.source_groups.shape != [geometry.source_shape()[0] as i32, 3] {
+            || source.source_groups.shape != [geometry.source_shape()[0] as i32, 3]
+        {
             return Err(FundedCaptureError::Backend(Native::Shape));
         }
         Ok(TensorDtype::F32)
     }
     fn transform_routed_batch(
-        &mut self, source: &RoutedUnitCaptureSource<'_, Value>,
+        &mut self,
+        source: &RoutedUnitCaptureSource<'_, Value>,
         mut writer: CaptureRoutedBatchWriter<'_, '_>,
     ) -> Result<(), FundedCaptureError<Native>> {
-        writer.validate_native_scope(&self.scope).map_err(CaptureRunHostError::from)?;
+        writer
+            .validate_native_scope(&self.scope)
+            .map_err(CaptureRunHostError::from)?;
         self.transforms += 1;
         for slot in 0..3 {
-            if !writer.selects(source.token_offset, slot) { continue; }
-            let expert = source.source_groups.values[source.token_offset as usize * 3 + slot as usize] as u64;
-            writer.begin_row(source.token_offset, slot, expert, source.coefficients.values[slot as usize])
+            if !writer.selects(source.token_offset, slot) {
+                continue;
+            }
+            let expert = source.source_groups.values
+                [source.token_offset as usize * 3 + slot as usize] as u64;
+            writer
+                .begin_row(
+                    source.token_offset,
+                    slot,
+                    expert,
+                    source.coefficients.values[slot as usize],
+                )
                 .map_err(CaptureRunHostError::from)?;
             for unit in [1, 3] {
-                writer.push_f32(source.values.values[slot as usize * 5 + unit])
+                writer
+                    .push_f32(source.values.values[slot as usize * 5 + unit])
                     .map_err(CaptureRunHostError::from)?;
             }
             writer.finish_row().map_err(CaptureRunHostError::from)?;
         }
-        writer.source_chunk(source.token_offset, source.token_offset + 1).map_err(CaptureRunHostError::from)?;
+        writer
+            .source_chunk(source.token_offset, source.token_offset + 1)
+            .map_err(CaptureRunHostError::from)?;
         writer.finish().map_err(CaptureRunHostError::from)?;
         Ok(())
     }
@@ -478,7 +534,7 @@ fn bound_fragments_keep_one_frame_full_quota_and_batch_scatter_then_decode() {
     let (pool, r, run) = fresh(&source, 0);
     let mut bank = bank(&source, &r, &run);
     let mut native = backend(&run);
-    let used = pool.used_bytes().unwrap();
+    let used = pool.payload_used_bytes().unwrap();
     bank.with_prefill_observer(&mut native, bound, &Error::Capture, |o| {
         assert!(!o.requires_sequence_readout());
         for k in 0..2 {
@@ -491,7 +547,7 @@ fn bound_fragments_keep_one_frame_full_quota_and_batch_scatter_then_decode() {
     })
     .unwrap();
     assert_eq!(bank.spent_steps(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.payload_used_bytes().unwrap(), used);
     assert_eq!(bank.usage().captures, 2);
     let frame = bank.take_shared_step().unwrap().unwrap();
     assert_eq!(frame.outcome(), CaptureStepOutcome::Committed);
@@ -514,7 +570,7 @@ fn bound_fragments_keep_one_frame_full_quota_and_batch_scatter_then_decode() {
     drop((frame, bank, r));
     native.scope.certify().unwrap();
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -550,7 +606,7 @@ fn missing_and_duplicate_zero_hooks_abort_without_refunding_full_row() {
         drop((bank, r));
         native.scope.certify().unwrap();
         drop(run);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -825,10 +881,10 @@ fn final_outer_abort_keeps_completed_shared_buffer_and_logical_charge() {
     drop((frame, bank, r));
     native.scope.certify().unwrap();
     drop(run);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     assert_eq!(values(&alias.records()[0]).as_ptr(), pointer);
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -836,21 +892,21 @@ fn enlarged_observer_controls_fit_exact_original_h_and_reject_one_short() {
     let source = admitted(5, 100, CaptureLimitPolicy::Fail);
     for shortage in [0, 1] {
         let (pool, r, run) = fresh(&source, shortage);
-        let before = pool.used_bytes().unwrap();
+        let before = pool.payload_used_bytes().unwrap();
         let result = run.prepare_capture_run(&r, CaptureRunHostPlan::prepare(&source).unwrap());
         if shortage == 1 {
             assert!(matches!(
                 result,
                 Err(CaptureRunHostError::Memory(
-                    WorkingMemoryError::BudgetExceeded { .. }
+                    WorkingMemoryError::DomainAllowanceExceeded { .. }
                 ))
             ));
-            assert_eq!(pool.used_bytes().unwrap(), before);
+            assert_eq!(pool.payload_used_bytes().unwrap(), before);
         } else {
             drop(result.unwrap());
         }
         drop((r, run));
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 

@@ -17,7 +17,7 @@ pub(crate) struct LeaseReturnFixture {
     _directory: tempfile::TempDir,
 }
 impl LeaseReturnFixture {
-    pub(crate) fn new(pool: &eredu_runtime::working_memory::WorkingMemoryPool) -> Self {
+    pub(crate) fn new(pool: &eredu_runtime::working_memory::MemoryLedger) -> Self {
         let (directory, source) = fixture_store();
         let ids = [id("first"), id("second")];
         let graph = eredu_runtime::ExecutionGraph::new(
@@ -113,8 +113,12 @@ impl LeaseReturnFixture {
             Ok::<_, std::convert::Infallible>(ready)
         })
         .unwrap();
-        let mut observations = bank(0, || PreparedTransferObservation::new(controls.metadata_custody().into()));
-        let mut host = bank(0, || PreparedHostMaterialization::new(controls.metadata_custody().into()));
+        let mut observations = bank(0, || {
+            PreparedTransferObservation::new(controls.metadata_custody().into())
+        });
+        let mut host = bank(0, || {
+            PreparedHostMaterialization::new(controls.metadata_custody().into())
+        });
         let mut pending = bank(0, || PreparedPendingWeight::new(controls.clone()));
         let mut weights = bank(0, || PreparedWeightMaterialization::new(controls.clone()));
         let mut consumers = bank(0, || {
@@ -159,7 +163,8 @@ impl LeaseReturnFixture {
             &requests,
             MemoryTier::Device,
             &mut OriginalResidencySlots {
-            background_host: None,
+                materialized_recipe: None,
+                background_host: None,
                 controller: &mut controller,
                 closure_ids: &mut closure_ids,
                 closure: &mut scratch,
@@ -483,8 +488,7 @@ fn copy_bank(
     // binding can clone one native handle. The same admitted Graph/Record
     // quotas cover the copy frontiers and the final alias-expanded aggregate.
     let layout =
-        OperationEvent::resident_graph_layout_with_shells(copies, copies, 1, 4, bindings)
-            .unwrap();
+        OperationEvent::resident_graph_layout_with_shells(copies, copies, 1, 4, bindings).unwrap();
     let roots = bindings.max(2);
     let traversal = OperationEvent::eval_traversal_layout(OperationEvalTraversalLimits {
         roots,
@@ -518,7 +522,7 @@ struct AliasClosureFixture {
 impl AliasClosureFixture {
     fn new(
         source: Arc<SafetensorsWeightStore>,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Self {
         let graph = eredu_runtime::ExecutionGraph::new(
             vec![eredu_runtime::ExecutionGroupSpec::root("only")],
@@ -585,7 +589,11 @@ impl AliasClosureFixture {
                 .expect("admitted immutable host sources for the alias closure")
             } else {
                 let manager = ResidencyManager::new(
-                    source.clone(), plan, units, source_stream, device_stream,
+                    source.clone(),
+                    plan,
+                    units,
+                    source_stream,
+                    device_stream,
                 )
                 .unwrap();
                 manager.initialize().unwrap();
@@ -689,8 +697,12 @@ impl AliasClosureFixture {
                 Ok::<_, std::convert::Infallible>(ready)
             })
             .unwrap();
-            let mut observations = bank(0, || PreparedTransferObservation::new(controls.metadata_custody().into()));
-            let mut host = bank(0, || PreparedHostMaterialization::new(controls.metadata_custody().into()));
+            let mut observations = bank(0, || {
+                PreparedTransferObservation::new(controls.metadata_custody().into())
+            });
+            let mut host = bank(0, || {
+                PreparedHostMaterialization::new(controls.metadata_custody().into())
+            });
             let mut pending = bank(0, || PreparedPendingWeight::new(controls.clone()));
             let mut weights = bank(0, || PreparedWeightMaterialization::new(controls.clone()));
             let mut consumers = bank(0, || {
@@ -719,14 +731,19 @@ impl AliasClosureFixture {
                 .manager
                 .prepare_source_acquisitions(&roots, &mut scratch, controls.clone())
                 .unwrap();
-            let _graph = copy_bank(observer, self.window.physical_bindings, self.window.bindings);
+            let _graph = copy_bank(
+                observer,
+                self.window.physical_bindings,
+                self.window.bindings,
+            );
             let mut transfer = self
                 .manager
                 .acquire_many_with_original_transfer(
                     &[(id("first"), 1)],
                     MemoryTier::Device,
                     &mut OriginalResidencySlots {
-            background_host: None,
+                        materialized_recipe: None,
+                        background_host: None,
                         controller: &mut controller,
                         closure_ids: &mut closure_ids,
                         closure: &mut scratch,

@@ -4,6 +4,8 @@ use crate::backend::runtime::residency::storage::RetainedStorage;
 use crate::composition::mlx::session::model_session::{
     disk_layerwise_tests as disk, host_layerwise_tests as host,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation;
 use eredu_core::{TextGenerationBackend, capture::*};
 use eredu_runtime::PreparedSessionObservationError;
@@ -13,7 +15,7 @@ type Runtime = ModelRuntime<MlxBackend<'static>>;
 fn stream() -> Stream {
     Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0))
 }
-fn load(stream: &Stream, pool: &WorkingMemoryPool, route: usize) -> (Runtime, tempfile::TempDir) {
+fn load(stream: &Stream, pool: &MemoryLedger, route: usize) -> (Runtime, tempfile::TempDir) {
     match route {
         0 => host::runtime(stream, pool, None),
         1 => host::runtime(stream, pool, Some(1)),
@@ -77,7 +79,13 @@ fn candidate(
     ids: &Vec<u32>,
     controller: &disk::Controller,
 ) -> (u64, u64, u64) {
-    let capture = CaptureAdmission::new(runtime.session(), geometry(), source, eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary()).unwrap();
+    let capture = CaptureAdmission::new(
+        runtime.session(),
+        geometry(),
+        source,
+        eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),
+    )
+    .unwrap();
     let h = capture.host.initialization_peak_bytes();
     let c = capture.new_source_bytes;
     let (_, _, mut outside) = super::super::enclosing_components(
@@ -91,7 +99,7 @@ fn candidate(
     assert_eq!(outside.retained.bytes().unwrap(), before + h);
     let storage = ControllerStorageContract::inspect(controller).unwrap();
     let registered = storage
-        .pin_registered(controller, runtime.backend().memory_pool())
+        .pin_registered(controller, runtime.backend().memory_ledger())
         .unwrap();
     let candidate = super::super::quote_incremental(
         runtime.session(),
@@ -101,7 +109,6 @@ fn candidate(
         controller.inference_workspace(4).unwrap(),
         &storage,
         Some(&registered),
-        false,
         Some(&capture),
     )
     .unwrap();
@@ -117,7 +124,7 @@ fn candidate(
             .unwrap()
             .is_some()
     );
-    (quote.incremental_bytes(), h, c)
+    (quote.incremental_bytes().unwrap(), h, c)
 }
 fn admit(
     runtime: &Runtime,
@@ -167,7 +174,7 @@ fn finish_runtime(runtime: Runtime, stream: &Stream) {
         .unwrap();
 }
 
-fn settle_terminal(pool: &WorkingMemoryPool, bytes: u64) {
+fn settle_terminal(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         // Native graph retirement visits a bounded batch. Every retired record
         // still requires its own terminal proof; this empty completion submits
@@ -177,7 +184,7 @@ fn settle_terminal(pool: &WorkingMemoryPool, bytes: u64) {
             .synchronize()
             .unwrap();
         disk::reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -185,14 +192,14 @@ fn settle_terminal(pool: &WorkingMemoryPool, bytes: u64) {
 fn original_capture_admission_prices_new_source_once_on_resident_host_and_disk() {
     let stream = stream();
     for route in 0..3 {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (runtime, _artifact) = load(&stream, &pool, route);
         let ids = vec![2, 5, 7];
         let source = source(&runtime, 0);
         let early_alias = source.clone();
         let controller = disk::Controller::default();
-        let baseline = pool.used_bytes().unwrap();
-        let peak = pool.peak_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
+        let peak = pool.fixture_host_peak().unwrap();
         let native = path_instrumentation::snapshot();
         let inputs = path_instrumentation::session_input_creation_attempts();
         let resets = path_instrumentation::session_reset_attempts();
@@ -202,16 +209,16 @@ fn original_capture_admission_prices_new_source_once_on_resident_host_and_disk()
         assert!(h > 0 && c > 0);
         assert_eq!(c, source.capacity_bytes().unwrap());
         assert!(required >= h + c);
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        assert_eq!(pool.peak_bytes().unwrap(), peak);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_peak().unwrap(), peak);
         let exact = baseline.checked_add(required).unwrap();
         let short = admit(&runtime, &source, &ids, &controller, exact - 1).unwrap_err();
         assert!(matches!(
             cause::<WorkingMemoryError>(&short),
-            WorkingMemoryError::BudgetExceeded { .. }
+            WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
         ));
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        assert_eq!(pool.peak_bytes().unwrap(), peak);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_peak().unwrap(), peak);
         assert!(matches!(
             pool.pin_registered_storage([(
                 StorageIdentity::CapturePlan(source.storage_identity().clone()),
@@ -221,10 +228,17 @@ fn original_capture_admission_prices_new_source_once_on_resident_host_and_disk()
         ));
         let (preparation, quote) = admit(&runtime, &source, &ids, &controller, exact).unwrap();
         assert_eq!(
-            preparation.request().memory_reservation().unwrap().bytes(),
+            preparation
+                .request()
+                .memory_reservation()
+                .requirements()
+                .get(crate::memory_fixture::topology().host_domain())
+                .unwrap()
+                .total()
+                .unwrap(),
             required
         );
-        assert_eq!(pool.used_bytes().unwrap(), exact);
+        assert_eq!(pool.fixture_host_charge().unwrap(), exact);
         pending(&quote, &source, h);
         let bank = quote
             .capture
@@ -314,14 +328,17 @@ fn original_capture_admission_prices_new_source_once_on_resident_host_and_disk()
         // the session retains its actual handoff, but live original host
         // custody makes that predecessor ineligible for a ceiling increase.
         let next_exact = baseline + terminal_tail + existing_required;
-        assert_eq!(pool.used_bytes().unwrap() + existing_required, next_exact);
+        assert_eq!(
+            pool.fixture_host_charge().unwrap() + existing_required,
+            next_exact
+        );
         assert!(next_exact > exact);
-        assert_eq!(pool.effective_capacity().unwrap(), exact);
+        assert_eq!(pool.fixture_host_limit().unwrap(), exact);
         let at_original = admit(&runtime, &source, &ids, &controller, exact).unwrap_err();
         assert!(
             matches!(
                 cause::<WorkingMemoryError>(&at_original),
-                WorkingMemoryError::BudgetExceeded { .. }
+                WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { .. })
             ),
             "route {route}, original ceiling: {at_original:?}"
         );
@@ -333,7 +350,7 @@ fn original_capture_admission_prices_new_source_once_on_resident_host_and_disk()
             ),
             "route {route}, retained host custody: {rejected:?}"
         );
-        assert_eq!(pool.effective_capacity().unwrap(), exact);
+        assert_eq!(pool.fixture_host_limit().unwrap(), exact);
         disk::settle(&pool, baseline + terminal_tail);
         assert_eq!(path_instrumentation::snapshot(), native);
         assert_eq!(controller.0.get(), (0, 0));
@@ -351,7 +368,7 @@ fn original_capture_admission_prices_new_source_once_on_resident_host_and_disk()
 #[test]
 fn original_capture_bank_rejects_wrong_source_and_coordinates_then_moves_once() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let equal_independent = self::source(&runtime, 0);
@@ -363,17 +380,17 @@ fn original_capture_bank_rejects_wrong_source_and_coordinates_then_moves_once() 
     let wrong_origin = self::source(&runtime, 1);
     let ids = vec![2, 5, 7];
     let controller = disk::Controller::default();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.fixture_host_charge().unwrap();
     let rejected = admit(&runtime, &wrong_origin, &ids, &controller, u64::MAX).unwrap_err();
     assert!(matches!(
         cause::<WorkingMemoryError>(&rejected),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.fixture_host_charge().unwrap(), before);
     let (_, h, c) = candidate(&runtime, &source, &ids, &controller);
     let (preparation, quote) = admit(&runtime, &source, &ids, &controller, u64::MAX).unwrap();
     let ptr = pending(&quote, &source, h);
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let capture = quote.capture.as_ref().unwrap();
     let error = capture
         .take_pending(runtime.session(), &equal_independent, geometry())
@@ -393,7 +410,7 @@ fn original_capture_bank_rejects_wrong_source_and_coordinates_then_moves_once() 
         WorkingMemoryError::IdentityMismatch
     ));
     assert_eq!(pending(&quote, &source, h), ptr);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     let bank = capture
         .take_pending(runtime.session(), &source, geometry())
         .unwrap();
@@ -419,7 +436,7 @@ fn original_capture_bank_rejects_wrong_source_and_coordinates_then_moves_once() 
 #[test]
 fn original_capture_bank_checks_actual_current_path_token_before_consumption() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let ids = vec![2, 5, 7];
@@ -432,15 +449,9 @@ fn original_capture_bank_checks_actual_current_path_token_before_consumption() {
         runtime.session().payload.active_owner_count() == 1
     });
     let payload = runtime.session_mut().payload.get_mut().unwrap();
-    assert!(
-        payload
-            .model
-            .erased_mut()
-            .publish_parameter_replacements(&Default::default(), false)
-            .unwrap()
-    );
+    payload.model.erased_mut().finalize_parameter_publication();
     let before = path_instrumentation::snapshot();
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let error = quote
         .capture
         .as_ref()
@@ -453,7 +464,7 @@ fn original_capture_bank_checks_actual_current_path_token_before_consumption() {
     );
     assert_eq!(pending(&quote, &source, h), ptr);
     assert_eq!(path_instrumentation::snapshot(), before);
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     assert_eq!(controller.0.get(), (0, 0));
     drop((quote, preparation, source));
     finish_runtime(runtime, &stream);
@@ -463,7 +474,7 @@ fn original_capture_bank_checks_actual_current_path_token_before_consumption() {
 #[test]
 fn late_source_quarantine_rejects_install_witness_and_preserves_original_pending_bank() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, _artifact) = load(&stream, &pool, 0);
     let source = source(&runtime, 0);
     let alias = source.clone();
@@ -489,12 +500,12 @@ fn late_source_quarantine_rejects_install_witness_and_preserves_original_pending
         .validate(&pool)
         .unwrap();
     drop(abandoned);
-    let used = pool.used_bytes().unwrap();
+    let used = pool.fixture_host_charge().unwrap();
     let before = path_instrumentation::snapshot();
     assert!(matches!(
         capture
             .control_guard()
-            .validate_reservation(preparation.request().memory_reservation().unwrap()),
+            .validate_reservation(preparation.request().memory_reservation()),
         Err(WorkingMemoryError::ExecutionFenced)
     ));
     for _ in 0..2 {
@@ -506,7 +517,7 @@ fn late_source_quarantine_rejects_install_witness_and_preserves_original_pending
             WorkingMemoryError::ExecutionFenced
         ));
         assert_eq!(pending(&quote, &source, h), ptr);
-        assert_eq!(pool.used_bytes().unwrap(), used);
+        assert_eq!(pool.fixture_host_charge().unwrap(), used);
     }
     // The same inherited origin must also reject a later admission; no new H
     // bank or partial source publication can disguise the quarantined account.
@@ -515,7 +526,7 @@ fn late_source_quarantine_rejects_install_witness_and_preserves_original_pending
         cause::<WorkingMemoryError>(&rejected),
         WorkingMemoryError::ExecutionFenced
     ));
-    assert_eq!(pool.used_bytes().unwrap(), used);
+    assert_eq!(pool.fixture_host_charge().unwrap(), used);
     assert_eq!(path_instrumentation::snapshot(), before);
     assert_eq!(controller.0.get(), (0, 0));
     {
@@ -532,7 +543,7 @@ fn late_source_quarantine_rejects_install_witness_and_preserves_original_pending
     ));
     finish_runtime(runtime, &stream);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.fixture_host_charge().unwrap() > 0,
         "abandonment must not refund the old source envelope"
     );
 }
@@ -540,3 +551,7 @@ fn late_source_quarantine_rejects_install_witness_and_preserves_original_pending
 mod span_install;
 
 mod controls;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

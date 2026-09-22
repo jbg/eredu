@@ -25,7 +25,7 @@ impl<'a> BorrowedFundedSampler<'a> {
         self,
         config: TextGenerationConfig,
     ) -> Result<SamplerResumePlan<'a>, WorkingMemoryError> {
-        if !self.sampler.matches_config_policy(config) {
+        if !self.sampler.matches_config_policy(config.clone()) {
             return Err(WorkingMemoryError::PreparationConfigurationMismatch);
         }
         let maximum = config

@@ -1,9 +1,9 @@
 //! Independent key copies through the existing registered-copy worker.
 use super::*;
 use crate::backend::{
-    OriginalCopyEnvironment, RetainedOriginalCopyEnvironment,
     array_copy::{IsolatedArrayCopy, OriginalCopyLayoutBuilder},
     nn::workspace::MlxMetalWorkspaceMechanisms,
+    OriginalCopyEnvironment, RetainedOriginalCopyEnvironment,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
 use eredu_runtime::working_memory::{OriginalSpeculativeSourceIdentity, WorkingMemoryError};
@@ -17,7 +17,7 @@ pub(in crate::composition::mlx::speculative::sampling) struct SnapshotContext {
     identity: OriginalSpeculativeSourceIdentity,
     roots: safemlx::PrefillRootsRuntime,
     mechanisms: MlxMetalWorkspaceMechanisms,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
@@ -33,22 +33,41 @@ impl SnapshotContext {
     pub(in crate::composition::mlx::speculative::sampling) fn controls() -> Option<usize> {
         // Exactly one concrete prepared wrapper is lent by the key's owned
         // stream. Price both real generic instantiations without a raw loan.
-        let stream_loan = size_of::<(&Self,&safemlx::PreparedStreamCopy<OriginalSpeculativeNumericalBudgetCustody>)>()
-            .max(size_of::<(&Self,&safemlx::PreparedStreamCopy<model::StreamOwner>)>());
-        let parts = [size_of::<usize>(),
+        let stream_loan = size_of::<(
+            &Self,
+            &safemlx::PreparedStreamCopy<OriginalSpeculativeNumericalBudgetCustody>,
+        )>()
+        .max(size_of::<(
+            &Self,
+            &safemlx::PreparedStreamCopy<model::StreamOwner>,
+        )>());
+        let parts = [
+            size_of::<usize>(),
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Result<Self, Error>>(),
             size_of::<OriginalSpeculativeSourceIdentity>(),
-            size_of::<RetainedOriginalCopyEnvironment>(),size_of::<(&Self,&Value)>(),
-            size_of::<Result<OriginalCopyEnvironment<'_>,crate::backend::OriginalCopyEnvironmentError>>(),
+            size_of::<RetainedOriginalCopyEnvironment>(),
+            size_of::<(&Self, &Value)>(),
+            size_of::<
+                Result<OriginalCopyEnvironment<'_>, crate::backend::OriginalCopyEnvironmentError>,
+            >(),
             size_of::<Option<RetainedOriginalCopyEnvironment>>(),
-            size_of::<Result<Self,Error>>(),
-            stream_loan,stream_loan,
-            size_of::<Result<OriginalCopyEnvironment<'_>,crate::backend::OriginalCopyEnvironmentError>>(),
+            size_of::<Result<Self, Error>>(),
+            stream_loan,
+            stream_loan,
+            size_of::<
+                Result<OriginalCopyEnvironment<'_>, crate::backend::OriginalCopyEnvironmentError>,
+            >(),
             size_of::<SpeculativeExecutionStreams<'_>>(),
-            size_of::<(&OriginalSpeculativeNumericalSources,&OriginalCopyEnvironment<'_>,&OriginalCopyEnvironment<'_>)>(),
-            size_of::<Result<OriginalCopyEnvironment<'_>,crate::backend::OriginalCopyEnvironmentError>>(),
+            size_of::<(
+                &OriginalSpeculativeNumericalSources,
+                &OriginalCopyEnvironment<'_>,
+                &OriginalCopyEnvironment<'_>,
+            )>(),
+            size_of::<
+                Result<OriginalCopyEnvironment<'_>, crate::backend::OriginalCopyEnvironmentError>,
+            >(),
             OriginalCopyEnvironment::control_bytes()?,
             size_of::<safemlx::StreamCopyPlan<()>>(),
             size_of::<Result<safemlx::StreamCopyPlan<()>, safemlx::StreamCopyCause>>(),
@@ -85,25 +104,42 @@ impl SnapshotContext {
         sources: &OriginalSpeculativeNumericalSources,
         environment: &OriginalCopyEnvironment<'_>,
     ) -> Result<Self, Error> {
-        Self::prepare_environments(sources,environment,environment)
+        Self::prepare_environments(sources, environment, environment)
     }
     pub(in crate::composition::mlx::speculative::sampling) fn prepare_for_context(
-        context:SpeculativeExecutionStreams<'_>,
-    )->Result<Self,Error>{
-        let (sources,target)=context.original_numerical_for(SamplingPlacement::Target).ok_or_else(missing)?;
-        let (other,draft)=context.original_numerical_for(SamplingPlacement::Draft).ok_or_else(missing)?;
-        if !std::ptr::eq(sources,other) || !target.pool().same_domain(draft.pool()){return Err(missing());}
-        Self::prepare_environments(sources,target,draft)
+        context: SpeculativeExecutionStreams<'_>,
+    ) -> Result<Self, Error> {
+        let (sources, target) = context
+            .original_numerical_for(SamplingPlacement::Target)
+            .ok_or_else(missing)?;
+        let (other, draft) = context
+            .original_numerical_for(SamplingPlacement::Draft)
+            .ok_or_else(missing)?;
+        if !std::ptr::eq(sources, other) || !target.pool().same_ledger(draft.pool()) {
+            return Err(missing());
+        }
+        Self::prepare_environments(sources, target, draft)
     }
-    fn prepare_environments(sources:&OriginalSpeculativeNumericalSources,
-        environment:&OriginalCopyEnvironment<'_>,draft:&OriginalCopyEnvironment<'_>,
-    )->Result<Self,Error>{
+    fn prepare_environments(
+        sources: &OriginalSpeculativeNumericalSources,
+        environment: &OriginalCopyEnvironment<'_>,
+        draft: &OriginalCopyEnvironment<'_>,
+    ) -> Result<Self, Error> {
         sources.validate_environment(environment)?;
         sources.validate_environment(draft)?;
-        let draft_environment=if std::ptr::eq(environment,draft){None}else{
-            let retained=draft.retain_prerequisites().map_err(|cause|sources.retain_startup_error(cause))?;
-            sources.metadata_funding().reserve_metadata(retained.control_bytes()
-                .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?)
+        let draft_environment = if std::ptr::eq(environment, draft) {
+            None
+        } else {
+            let retained = draft
+                .retain_prerequisites()
+                .map_err(|cause| sources.retain_startup_error(cause))?;
+            sources
+                .metadata_funding()
+                .reserve_metadata(
+                    retained
+                        .control_bytes()
+                        .ok_or(Error::PrefillControl(WorkingMemoryError::UnknownBound))?,
+                )
                 .map_err(Error::WorkspacePlanning)?;
             Some(retained)
         };
@@ -128,7 +164,7 @@ impl SnapshotContext {
             identity: sources.request().source_identity(),
             roots: roots.clone(),
             mechanisms,
-            capacity: sources.request().capacity_bytes(),
+            capacity: sources.request().limits().clone(),
         })
     }
     fn validate<'a>(&self, key: &'a OriginalNumericalKey) -> Result<&'a Value, Error> {
@@ -150,25 +186,29 @@ impl SnapshotContext {
         self.try_environment(value)
             .map_err(|cause| retain_planning_error(cause, value.funding.clone()))
     }
-    fn try_environment<'a>(&'a self,value:&'a Value)
-        ->Result<OriginalCopyEnvironment<'a>,crate::backend::OriginalCopyEnvironmentError>{
+    fn try_environment<'a>(
+        &'a self,
+        value: &'a Value,
+    ) -> Result<OriginalCopyEnvironment<'a>, crate::backend::OriginalCopyEnvironmentError> {
         match &value.stream {
-            ValueStream::Numerical(stream)=>self.loan_stream(stream),
-            ValueStream::Embedded(stream)=>self.loan_stream(stream),
-            ValueStream::Model(_)=>Err(WorkingMemoryError::IdentityMismatch.into()),
+            ValueStream::Numerical(stream) => self.loan_stream(stream),
+            ValueStream::Embedded(stream) => self.loan_stream(stream),
+            ValueStream::Model(_) => Err(WorkingMemoryError::IdentityMismatch.into()),
         }
     }
-    fn loan_stream<'a,C:Send+Sync+'static>(&'a self,stream:&'a safemlx::PreparedStreamCopy<C>)
-        ->Result<OriginalCopyEnvironment<'a>,crate::backend::OriginalCopyEnvironmentError>{
+    fn loan_stream<'a, C: Send + Sync + 'static>(
+        &'a self,
+        stream: &'a safemlx::PreparedStreamCopy<C>,
+    ) -> Result<OriginalCopyEnvironment<'a>, crate::backend::OriginalCopyEnvironmentError> {
         // Both markers came from the actual bound context. The key owns the
         // native stream throughout this loan; a scalar descriptor cannot create
         // or replace its stream, allocator, pool or completed source.
-        self.environment.loan(stream,self.identity.pool()).or_else(|cause|{
-            match &self.draft_environment {
-                Some(draft)=>draft.loan(stream,self.identity.pool()),
-                None=>Err(cause),
-            }
-        })
+        self.environment
+            .loan(stream, self.identity.pool())
+            .or_else(|cause| match &self.draft_environment {
+                Some(draft) => draft.loan(stream, self.identity.pool()),
+                None => Err(cause),
+            })
     }
     /// Retained snapshot size uses the actual isolated-copy population, including
     /// the complete backing of a source view. It is not another native grant.
@@ -212,7 +252,7 @@ impl SnapshotContext {
             &self.roots,
             self.mechanisms,
             &value.funding,
-            self.capacity,
+            &self.capacity,
         )?;
         let (array, custody) = copied.into_parts();
         // The caller paid the Value Rc and all returned key controls before this

@@ -1,5 +1,5 @@
-use super::*;
 use super::operation_component_tests::exercise_component;
+use super::*;
 use crate::{
     MlxTensor,
     backend::nn::{

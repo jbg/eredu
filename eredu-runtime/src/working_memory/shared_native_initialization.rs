@@ -1,34 +1,45 @@
 //! One shared native constructor through the existing cold source allowance.
-use super::{original_prepared_native_input::Account, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError, original_prepared_native_input::Account};
 use std::{
     fmt,
     mem::{size_of, size_of_val},
 };
 
-mod recipe_keys;
-mod read_catalog;
-mod memory_read;
+mod allocations;
 mod file_read;
-mod recipe_inference;
-mod recipe_mapping;
-mod selection_ranges;
+mod memory_read;
+mod read_catalog;
 mod read_projection;
 mod recipe_compilation;
+mod recipe_inference;
+mod recipe_keys;
+mod recipe_mapping;
 mod recipe_read;
 mod recipe_source;
-pub use recipe_source::EncodedRecipeSourceError;
-pub use recipe_read::{CompiledRecipeCustody, EncodedRecipeReadPreparationError};
+mod selection_ranges;
 pub use recipe_compilation::{AdmittedRecipeConstruction, EncodedRecipeConstructionError};
+pub use recipe_read::{CompiledRecipeCustody, EncodedRecipeReadPreparationError};
+pub use recipe_source::EncodedRecipeSourceError;
 
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public
 /// clone, amount constructor, request authority or physical publication proof.
 #[derive(Debug)]
-pub struct SharedNativeInitializationCustody(Account);
+pub struct SharedNativeInitializationCustody(Account, Option<super::WorkingMemoryFundingScope>);
 impl SharedNativeInitializationCustody {
+    /// Takes the constructor's admitted temporary allocation scope once. Its
+    /// allowance belongs to the same transaction as the final shared resource.
+    /// The producer must retain it through native completion and certify only
+    /// after every surviving allocation has independent registered custody.
+    /// A constructor without temporary requirements has no such scope.
+    pub fn take_allocation_scope(
+        &mut self,
+    ) -> Result<super::WorkingMemoryFundingScope, WorkingMemoryError> {
+        self.1.take().ok_or(WorkingMemoryError::AlreadyStarted)
+    }
     /// Read-only original pool identity. This grants no new constructor,
     /// amount, alias or reservation authority.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         if self.0.matches_pool(pool) {
             Ok(())
         } else {
@@ -63,6 +74,14 @@ pub trait SharedNativeInitializer: Sized {
     /// documented configurable input-derived estimate. Neither an estimate nor
     /// this constructor qualifies preexisting source/native owners.
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError>;
+    /// Native allocations and their host bookkeeping created during this
+    /// constructor, separately from its fixed host storage above. These facts
+    /// are prepared and funded by the source owner before admission. Supplying
+    /// them selects the ordinary allocation-account lifecycle; finite and
+    /// unlimited limits use the same transaction and completion requirements.
+    fn temporary_allocation_requirements(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        None
+    }
     /// Exactly one constructor attempt. No fallback, polling or second grant.
     fn initialize(
         self,
@@ -85,7 +104,7 @@ impl<T> InitializedSharedNative<T> {
         &self.output
     }
     /// Preserve the original accounting domain across later borrowers.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         if self.account.matches_pool(pool) {
             Ok(())
         } else {
@@ -99,7 +118,9 @@ impl<T> InitializedSharedNative<T> {
 }
 
 impl<T> std::borrow::Borrow<T> for InitializedSharedNative<T> {
-    fn borrow(&self) -> &T { &self.output }
+    fn borrow(&self) -> &T {
+        &self.output
+    }
 }
 
 /// Constructor failure and its actual output/prefix custody, independent of
@@ -120,7 +141,12 @@ impl<T, E> SharedNativeInitializationFailure<T, E> {
         self,
         map: impl FnOnce(E) -> F,
     ) -> SharedNativeInitializationFailure<(), F> {
-        let SharedNativeInitializationFailure { accounting, construction, output, account } = self;
+        let SharedNativeInitializationFailure {
+            accounting,
+            construction,
+            output,
+            account,
+        } = self;
         drop(output);
         SharedNativeInitializationFailure {
             accounting,
@@ -247,9 +273,11 @@ where
     }
 }
 
-impl WorkingMemoryPool {
-    /// Complete checked producer contribution plus actual cold-account and
-    /// constructor/result controls; no allocation or admission occurs here.
+impl MemoryLedger {
+    /// Fixed host contribution plus its cold-account and constructor/result
+    /// controls. Temporary domain requirements are separate; the complete
+    /// description is `shared_native_initialization_requirements`.
+    /// No allocation or admission occurs here.
     pub fn shared_native_initialization_required_bytes<P: SharedNativeInitializer>(
         plan: &P,
     ) -> Result<u64, WorkingMemoryError> {
@@ -284,14 +312,25 @@ impl WorkingMemoryPool {
             Ok(bytes) => bytes,
             Err(error) => return Err(SharedNativeInitializationError::rejected(plan, error)),
         };
-        let allowance = match self.admit_source_compiler(bytes) {
-            Ok(allowance) => allowance,
-            Err(error) => return Err(SharedNativeInitializationError::rejected(plan, error)),
+        let (account, allocations) = match plan.temporary_allocation_requirements() {
+            Some(requirements) => match self.admit_shared_native_allocations(bytes, requirements) {
+                Ok((account, scope)) => (account, Some(scope)),
+                Err(error) => return Err(SharedNativeInitializationError::rejected(plan, error)),
+            },
+            None => {
+                let allowance = match self.admit_source_compiler(bytes) {
+                    Ok(allowance) => allowance,
+                    Err(error) => {
+                        return Err(SharedNativeInitializationError::rejected(plan, error));
+                    }
+                };
+                (allowance.into_prepared_native_account(), None)
+            }
         };
-        // The old allowance stays armed through creation of the account. Its
-        // existing handoff disarms only after the new shared owner exists.
-        let account = allowance.into_prepared_native_account();
-        let result = plan.initialize(SharedNativeInitializationCustody(account.share()));
+        let result = plan.initialize(SharedNativeInitializationCustody(
+            account.share(),
+            allocations,
+        ));
         let accounting = account.finish().err();
         match result {
             Ok(output) if accounting.is_none() => Ok(InitializedSharedNative { output, account }),

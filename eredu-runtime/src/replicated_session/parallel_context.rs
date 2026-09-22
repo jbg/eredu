@@ -55,52 +55,106 @@ impl<S, C> Drop for Restore<'_, S, C> {
         }
     }
 }
-pub(super) fn with_runtime<R,C,T,F>(
-    runtime:&mut R,context:C,funding:&HostMetadataFunding,
-    replace:fn(&mut R,C)->Result<C,C>,run:F,
-)->Result<T,PreparedParallelContextFailure<C>>
-where F:FnOnce(&mut R)->T {
-    let controls=[size_of::<Restore<'_,R,C>>(),size_of::<C>(),size_of::<Option<C>>(),
-        size_of::<Result<C,C>>(),size_of::<PreparedParallelContextFailure<C>>(),
-        size_of::<Result<T,PreparedParallelContextFailure<C>>>(),size_of::<F>(),size_of::<T>(),
-        size_of::<(&mut R,&HostMetadataFunding,fn(&mut R,C)->Result<C,C>)>()];
-    if let Err(cause)=controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
-        .ok_or(HostMetadataFundingError::Overflow).and_then(|n|funding.reserve_metadata(n)) {
-        return Err(PreparedParallelContextFailure {cause:cause.into(),context});
+pub(super) fn with_runtime<R, C, T, F>(
+    runtime: &mut R,
+    context: C,
+    funding: &HostMetadataFunding,
+    replace: fn(&mut R, C) -> Result<C, C>,
+    run: F,
+) -> Result<T, PreparedParallelContextFailure<C>>
+where
+    F: FnOnce(&mut R) -> T,
+{
+    let controls = [
+        size_of::<Restore<'_, R, C>>(),
+        size_of::<C>(),
+        size_of::<Option<C>>(),
+        size_of::<Result<C, C>>(),
+        size_of::<PreparedParallelContextFailure<C>>(),
+        size_of::<Result<T, PreparedParallelContextFailure<C>>>(),
+        size_of::<F>(),
+        size_of::<T>(),
+        size_of::<(&mut R, &HostMetadataFunding, fn(&mut R, C) -> Result<C, C>)>(),
+    ];
+    if let Err(cause) = controls
+        .into_iter()
+        .try_fold(size_of_val(&controls), usize::checked_add)
+        .ok_or(HostMetadataFundingError::Overflow)
+        .and_then(|n| funding.reserve_metadata(n))
+    {
+        return Err(PreparedParallelContextFailure {
+            cause: cause.into(),
+            context,
+        });
     }
-    let previous=match replace(runtime,context) {
-        Ok(previous)=>previous,
-        Err(context)=>return Err(PreparedParallelContextFailure{cause:PreparedParallelContextCause::Unsupported,context}),
+    let previous = match replace(runtime, context) {
+        Ok(previous) => previous,
+        Err(context) => {
+            return Err(PreparedParallelContextFailure {
+                cause: PreparedParallelContextCause::Unsupported,
+                context,
+            });
+        }
     };
-    let guard=Restore{session:runtime,previous:Some(previous),replace};
+    let guard = Restore {
+        session: runtime,
+        previous: Some(previous),
+        replace,
+    };
     Ok(run(&mut *guard.session))
 }
 
-struct RestoreBorrowed<'a,R,C:?Sized> {
-    runtime:&'a mut R,
-    context:&'a mut C,
-    exchange:fn(&mut R,&mut C)->bool,
+struct RestoreBorrowed<'a, R, C: ?Sized> {
+    runtime: &'a mut R,
+    context: &'a mut C,
+    exchange: fn(&mut R, &mut C) -> bool,
 }
-impl<R,C:?Sized> Drop for RestoreBorrowed<'_,R,C> {
+impl<R, C: ?Sized> Drop for RestoreBorrowed<'_, R, C> {
     fn drop(&mut self) {
-        assert!((self.exchange)(self.runtime,self.context),
-            "installed parallel context lost its restoration mechanism");
+        assert!(
+            (self.exchange)(self.runtime, self.context),
+            "installed parallel context lost its restoration mechanism"
+        );
     }
 }
 
-pub(super) fn with_borrowed_runtime<R,C:?Sized,T,F>(
-    runtime:&mut R,context:&mut C,funding:&HostMetadataFunding,
-    exchange:fn(&mut R,&mut C)->bool,run:F,
-)->Result<T,PreparedParallelContextCause>
-where F:FnOnce(&mut R)->T {
-    let controls=[size_of::<RestoreBorrowed<'_,R,C>>(),size_of::<Result<T,PreparedParallelContextCause>>(),
-        size_of::<F>(),size_of::<T>(),size_of::<PreparedParallelContextCause>(),size_of::<bool>(),
-        size_of::<(&mut R,&mut C,&HostMetadataFunding,fn(&mut R,&mut C)->bool)>()];
-    let bytes=controls.into_iter().try_fold(size_of_val(&controls),usize::checked_add)
+pub(super) fn with_borrowed_runtime<R, C: ?Sized, T, F>(
+    runtime: &mut R,
+    context: &mut C,
+    funding: &HostMetadataFunding,
+    exchange: fn(&mut R, &mut C) -> bool,
+    run: F,
+) -> Result<T, PreparedParallelContextCause>
+where
+    F: FnOnce(&mut R) -> T,
+{
+    let controls = [
+        size_of::<RestoreBorrowed<'_, R, C>>(),
+        size_of::<Result<T, PreparedParallelContextCause>>(),
+        size_of::<F>(),
+        size_of::<T>(),
+        size_of::<PreparedParallelContextCause>(),
+        size_of::<bool>(),
+        size_of::<(
+            &mut R,
+            &mut C,
+            &HostMetadataFunding,
+            fn(&mut R, &mut C) -> bool,
+        )>(),
+    ];
+    let bytes = controls
+        .into_iter()
+        .try_fold(size_of_val(&controls), usize::checked_add)
         .ok_or(HostMetadataFundingError::Overflow)?;
     funding.reserve_metadata(bytes)?;
-    if !exchange(runtime,context){return Err(PreparedParallelContextCause::Unsupported);}
-    let guard=RestoreBorrowed{runtime,context,exchange};
+    if !exchange(runtime, context) {
+        return Err(PreparedParallelContextCause::Unsupported);
+    }
+    let guard = RestoreBorrowed {
+        runtime,
+        context,
+        exchange,
+    };
     Ok(run(&mut *guard.runtime))
 }
 
@@ -132,7 +186,9 @@ where
             size_of::<B::ParallelContext>(),
             size_of::<PreparedParallelContextFailure<B::ParallelContext>>(),
             size_of::<Result<T, PreparedParallelContextFailure<B::ParallelContext>>>(),
-            size_of::<F>(), size_of::<T>(), size_of::<PreparedParallelContextCause>(),
+            size_of::<F>(),
+            size_of::<T>(),
+            size_of::<PreparedParallelContextCause>(),
             size_of::<(&mut Self, &HostMetadataFunding)>(),
             size_of::<Result<Result<(), std::convert::Infallible>, RuntimeInspectionBoundary>>(),
         ];
@@ -155,7 +211,12 @@ where
                 context,
             });
         }
-        with_runtime(self,context,funding,|session,context|
-            D::replace_parallel_context(&mut session.execution,context),run)
+        with_runtime(
+            self,
+            context,
+            funding,
+            |session, context| D::replace_parallel_context(&mut session.execution, context),
+            run,
+        )
     }
 }

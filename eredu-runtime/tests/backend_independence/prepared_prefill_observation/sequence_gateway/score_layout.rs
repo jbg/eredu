@@ -76,13 +76,13 @@ impl ActivationObserver<FakeTensor, Error> for SpanObserver {
 fn run<K>(operation: K, preserve: bool, cancel_after: Option<u64>)
 where
     K: PrefillSpanOperation<
-            Rows,
-            FakeBackend,
-            ReferenceTextMechanisms,
-            eredu_runtime::DirectReplicatedTextExecution,
-            Input,
-            SpanObserver,
-        >,
+        Rows,
+        FakeBackend,
+        ReferenceTextMechanisms,
+        eredu_runtime::DirectReplicatedTextExecution,
+        Input,
+        SpanObserver,
+    >,
 {
     // This fixture already has two cached nonzero positions (sum17, sentinel29).
     // Install the trace after that setup so only this continuation is counted.
@@ -91,8 +91,24 @@ where
     let cancellation = GenerationCancellationToken::new();
     let mut observer = SpanObserver(trace.observer(&cancellation, cancel_after, true));
     let events = Rc::new(RefCell::new(Events::default()));
+    let request: eredu_runtime::working_memory::InferenceRequest =
+        crate::memory::unlimited_ledger(0)
+            .reserve(
+                session.inference_execution_identity(),
+                &mock_inference_admission(InferenceGeometry {
+                    batch_size: 1,
+                    cached_positions: 2,
+                    input_positions: 5,
+                    max_output_tokens: 0,
+                    prefill_chunk_positions: 3,
+                    output: OutputDemand::Sequence,
+                }),
+            )
+            .unwrap()
+            .into();
     let progress = session
-        .try_prefill_unbudgeted_source_with_operation(
+        .try_prefill_admitted_source_with_operation(
+            &request,
             Some([1, 5]),
             std::num::NonZeroU64::new(3),
             OutputDemand::Sequence,

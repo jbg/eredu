@@ -464,6 +464,7 @@ fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
         payload_sha256: Some(manifest.blocks[0].payload_sha256.clone()),
         payload_verification: Arc::new(OnceLock::new()),
         live_source: None,
+        persistent_source: None,
     });
     let error = verify_disk_payload(&location).unwrap_err();
     assert!(error.to_string().contains("payload SHA-256 mismatch"));

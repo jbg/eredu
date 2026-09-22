@@ -1,18 +1,24 @@
-#[path="interventions/evidence.rs"]
+#[path = "interventions/evidence.rs"]
 mod evidence;
 use super::*;
 use eredu_core::intervention::*;
 
-fn edit_source(
-    pool: &WorkingMemoryPool,
+fn edit_source(pool: &MemoryLedger, capture: &OriginalCaptureSource) -> OriginalInterventionSource {
+    edit_source_window(pool, capture, false)
+}
+fn edit_source_window(
+    pool: &MemoryLedger,
     capture: &OriginalCaptureSource,
+    no_overlap: bool,
 ) -> OriginalInterventionSource {
-    edit_source_window(pool,capture,false)
+    edit_source_evidence(pool, capture, no_overlap, false)
 }
-fn edit_source_window(pool:&WorkingMemoryPool,capture:&OriginalCaptureSource,no_overlap:bool)->OriginalInterventionSource {
-    edit_source_evidence(pool,capture,no_overlap,false)
-}
-fn edit_source_evidence(pool:&WorkingMemoryPool,capture:&OriginalCaptureSource,no_overlap:bool,evidence:bool)->OriginalInterventionSource {
+fn edit_source_evidence(
+    pool: &MemoryLedger,
+    capture: &OriginalCaptureSource,
+    no_overlap: bool,
+    evidence: bool,
+) -> OriginalInterventionSource {
     let axes = capture.plan().admission().points()[0].axes.clone().unwrap();
     let points = ["late", "early", "disabled"].map(|path| InterventionPoint {
         path: path.into(),
@@ -46,12 +52,27 @@ fn edit_source_evidence(pool:&WorkingMemoryPool,capture:&OriginalCaptureSource,n
         id: index.to_string(),
         target: target.into(),
         schedule: Default::default(),
-        slices: if no_overlap && index==0 { vec![CaptureSlice { axis:"sequence".into(), start:3, end:5, stride:1 }] } else {vec![]},
+        slices: if no_overlap && index == 0 {
+            vec![CaptureSlice {
+                axis: "sequence".into(),
+                start: 3,
+                end: 5,
+                stride: 1,
+            }]
+        } else {
+            vec![]
+        },
         action: InterventionAction::Scale {
             dtype: InterventionDtype::Float32,
             factor,
         },
-        evidence: if !evidence {InterventionEvidence::None} else if index==1 {InterventionEvidence::Summary} else {InterventionEvidence::Preview {max_elements:3}},
+        evidence: if !evidence {
+            InterventionEvidence::None
+        } else if index == 1 {
+            InterventionEvidence::Summary
+        } else {
+            InterventionEvidence::Preview { max_elements: 3 }
+        },
     })
     .collect();
     let plan = InterventionPlan {
@@ -121,48 +142,121 @@ impl ScheduledCaptureBackend for EditBackend {
                 context: None
             })
         );
-        assert_eq!(claim.invocation_window(),self.window);
-        if self.window.is_some() && claim.index()==0 {return Ok(CaptureUsage::default());}
+        assert_eq!(claim.invocation_window(), self.window);
+        if self.window.is_some() && claim.index() == 0 {
+            return Ok(CaptureUsage::default());
+        }
         Ok(CaptureUsage {
             retained_bytes: 24,
             host_bytes: 24,
             ..Default::default()
         })
     }
-    fn intervention_projection_usage(&self,value:&Self::Tensor,claim:&CaptureInterventionClaim<'_>)->Result<[CaptureUsage;2],FundedCaptureError<Failure>> {
-        self.intervention_usage(value,claim)?;
-        let Some(window)=self.window else {return Ok([CaptureUsage::default();2]);};
-        let index=claim.index(); let plan=claim.admission();
-        let operation=&plan.plan().operations[index]; let point=&plan.points()[index];
-        let physical=claim.invocation().unwrap();
-        let mut global=[0;2];
-        let (logical,axis)=window.source_axes_into(physical,Some(&point.axes),&[3,2],&mut global).unwrap();
-        let buffer=||ResolvedCaptureSlice {starts:vec![0;2],ends:vec![0;2],strides:vec![0;2],shape:vec![0;2]};
-        let mut selected=buffer();let mut local=buffer();let mut destination=buffer();
-        plan.resolve_prepared_invocation_at(index,CapturePhase::Prefill,0,logical,&global,InterventionDtype::Float32,&mut selected).unwrap();
-        let overlap=CaptureSlicePartition::contiguous_fragment_into(&global,&selected,axis,window.start..window.start+physical.sequence,&mut local,&mut destination).unwrap();
-        assert_eq!(overlap,index!=0);
-        let mut cost=crate::intervention::PartitionInterventionProjectionCost::new(plan,2)?;
-        if overlap {cost.include(&operation.action,&local.shape)?;}
-        Ok([crate::intervention::intervention_window_metadata(operation,point)?,cost.usage()])
-    }
-    fn apply_intervention_projected(&mut self,value:&Self::Tensor,claim:CaptureInterventionClaim<'_>,charged:CaptureUsage,projection:[CaptureUsage;2])->Result<(Option<Self::Tensor>,ClaimedIntervention),FundedCaptureError<Failure>> {
-        if self.window.is_none() {return self.apply_intervention(value,claim,charged).map(|(value,receipt)|(Some(value),receipt));}
-        assert_eq!(self.intervention_projection_usage(value,&claim)?,projection);
-        let total=charged.checked_add(projection[0])?.checked_add(projection[1])?;
-        if claim.index()==0 {
-            assert_eq!(charged,CaptureUsage::default());self.acknowledged+=1;
-            return Ok((None,claim.finish(total)?));
+    fn intervention_projection_usage(
+        &self,
+        value: &Self::Tensor,
+        claim: &CaptureInterventionClaim<'_>,
+    ) -> Result<[CaptureUsage; 2], FundedCaptureError<Failure>> {
+        self.intervention_usage(value, claim)?;
+        let Some(window) = self.window else {
+            return Ok([CaptureUsage::default(); 2]);
+        };
+        let index = claim.index();
+        let plan = claim.admission();
+        let operation = &plan.plan().operations[index];
+        let point = &plan.points()[index];
+        let physical = claim.invocation().unwrap();
+        let mut global = [0; 2];
+        let (logical, axis) = window
+            .source_axes_into(physical, Some(&point.axes), &[3, 2], &mut global)
+            .unwrap();
+        let buffer = || ResolvedCaptureSlice {
+            starts: vec![0; 2],
+            ends: vec![0; 2],
+            strides: vec![0; 2],
+            shape: vec![0; 2],
+        };
+        let mut selected = buffer();
+        let mut local = buffer();
+        let mut destination = buffer();
+        plan.resolve_prepared_invocation_at(
+            index,
+            CapturePhase::Prefill,
+            0,
+            logical,
+            &global,
+            InterventionDtype::Float32,
+            &mut selected,
+        )
+        .unwrap();
+        let overlap = CaptureSlicePartition::contiguous_fragment_into(
+            &global,
+            &selected,
+            axis,
+            window.start..window.start + physical.sequence,
+            &mut local,
+            &mut destination,
+        )
+        .unwrap();
+        assert_eq!(overlap, index != 0);
+        let mut cost = crate::intervention::PartitionInterventionProjectionCost::new(plan, 2)?;
+        if overlap {
+            cost.include(&operation.action, &local.shape)?;
         }
-        let InterventionAction::Scale {factor,..}=&claim.admission().plan().operations[claim.index()].action else {panic!("scale")};
+        Ok([
+            crate::intervention::intervention_window_metadata(operation, point)?,
+            cost.usage(),
+        ])
+    }
+    fn apply_intervention_projected(
+        &mut self,
+        value: &Self::Tensor,
+        claim: CaptureInterventionClaim<'_>,
+        charged: CaptureUsage,
+        projection: [CaptureUsage; 2],
+    ) -> Result<(Option<Self::Tensor>, ClaimedIntervention), FundedCaptureError<Failure>> {
+        if self.window.is_none() {
+            return self
+                .apply_intervention(value, claim, charged)
+                .map(|(value, receipt)| (Some(value), receipt));
+        }
+        assert_eq!(
+            self.intervention_projection_usage(value, &claim)?,
+            projection
+        );
+        let total = charged
+            .checked_add(projection[0])?
+            .checked_add(projection[1])?;
+        if claim.index() == 0 {
+            assert_eq!(charged, CaptureUsage::default());
+            self.acknowledged += 1;
+            return Ok((None, claim.finish(total)?));
+        }
+        let InterventionAction::Scale { factor, .. } =
+            &claim.admission().plan().operations[claim.index()].action
+        else {
+            panic!("scale")
+        };
         self.order.push(claim.index());
-        Ok((Some(value.map(|value|value* *factor)),claim.finish(total)?))
+        Ok((
+            Some(value.map(|value| value * *factor)),
+            claim.finish(total)?,
+        ))
     }
-    fn intervention_evidence_usage(&self,value:&Self::Tensor,claim:&CaptureInterventionEvidenceClaim<'_, '_>)->Result<(eredu_core::checkpoint::TensorDtype,CaptureUsage),FundedCaptureError<Failure>> {
-        evidence::usage(self,value,claim)
+    fn intervention_evidence_usage(
+        &self,
+        value: &Self::Tensor,
+        claim: &CaptureInterventionEvidenceClaim<'_, '_>,
+    ) -> Result<(eredu_core::checkpoint::TensorDtype, CaptureUsage), FundedCaptureError<Failure>>
+    {
+        evidence::usage(self, value, claim)
     }
-    fn capture_intervention_evidence<'a>(&mut self,value:&Self::Tensor,claim:CaptureInterventionEvidenceClaim<'a,'_>)->Result<ClaimedInterventionEvidence<'a>,FundedCaptureError<Failure>> {
-        evidence::capture(self,value,claim)
+    fn capture_intervention_evidence<'a>(
+        &mut self,
+        value: &Self::Tensor,
+        claim: CaptureInterventionEvidenceClaim<'a, '_>,
+    ) -> Result<ClaimedInterventionEvidence<'a>, FundedCaptureError<Failure>> {
+        evidence::capture(self, value, claim)
     }
     fn apply_intervention(
         &mut self,
@@ -190,25 +284,35 @@ fn model_intervention_claims_keep_hook_order_scope_exact_custody_and_escaped_out
 fn model_window_interventions_charge_projection_and_acknowledge_no_overlap_without_tensor() {
     run(true);
 }
-fn run(window:bool) {run_mode(window,false);}
-fn run_mode(window:bool,evidence:bool) {
-    let window=window.then_some(CaptureInvocationWindow {logical_sequence:5,start:0});
+fn run(window: bool) {
+    run_mode(window, false);
+}
+fn run_mode(window: bool, evidence: bool) {
+    let window = window.then_some(CaptureInvocationWindow {
+        logical_sequence: 5,
+        start: 0,
+    });
     let selected = selected(SpeculativeStrategyClass::EmbeddedSequential);
     let schedule = plan(&selected, 3, true);
     let (invocation, _) = schedule.prefill_invocations(0).unwrap();
     let workspace = EmbeddedInvocationWorkspace::target(invocation).unwrap();
     let report = report(workspace.geometry());
     let capacity = 1 << 26;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
-    let source = capture_source_with_transform(&pool,if window.is_some() {5} else {3},CaptureTransform::FullTensor,if evidence {5} else {1});
-    let edits = edit_source_evidence(&pool, &source,window.is_some(),evidence);
-    let foreign_source = edit_source_evidence(&pool, &source,window.is_some(),evidence);
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
+    let source = capture_source_with_transform(
+        &pool,
+        if window.is_some() { 5 } else { 3 },
+        CaptureTransform::FullTensor,
+        if evidence { 5 } else { 1 },
+    );
+    let edits = edit_source_evidence(&pool, &source, window.is_some(), evidence);
+    let foreign_source = edit_source_evidence(&pool, &source, window.is_some(), evidence);
     assert!(!edits.same_source(&foreign_source));
     let request = OriginalSpeculativeRequest::prepare_embedded(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
@@ -249,12 +353,37 @@ fn run_mode(window:bool,evidence:bool) {
     )
     .unwrap();
     let without_edits = host.initialization_peak_bytes();
-    let mut evidence_skips: [[Option<CaptureSkipReason>;2];4]=std::array::from_fn(|_|[None,None]);
-    evidence_skips[0][0]=Some(CaptureSkipReason::Limit {budget:CaptureBudget::Captures,cumulative:true});
+    let mut evidence_skips: [[Option<CaptureSkipReason>; 2]; 4] =
+        std::array::from_fn(|_| [None, None]);
+    evidence_skips[0][0] = Some(CaptureSkipReason::Limit {
+        budget: CaptureBudget::Captures,
+        cumulative: true,
+    });
     let host = if evidence {
-        assert!(EmbeddedCaptureHostPlan::prepare(&source,CaptureRunHostPlan::prepare_invocation_window(source.plan(),CapturePhase::Prefill,0,shape,&selected_captures,window).unwrap(),workspace,origin).unwrap().with_intervention_evidence(&edits,&selected_edits,Some(&evidence_skips[..3])).is_err());
-        host.with_intervention_evidence(&edits,&selected_edits,Some(&evidence_skips)).unwrap()
-    } else {host.with_interventions(&edits,&selected_edits).unwrap()};
+        assert!(
+            EmbeddedCaptureHostPlan::prepare(
+                &source,
+                CaptureRunHostPlan::prepare_invocation_window(
+                    source.plan(),
+                    CapturePhase::Prefill,
+                    0,
+                    shape,
+                    &selected_captures,
+                    window
+                )
+                .unwrap(),
+                workspace,
+                origin
+            )
+            .unwrap()
+            .with_intervention_evidence(&edits, &selected_edits, Some(&evidence_skips[..3]))
+            .is_err()
+        );
+        host.with_intervention_evidence(&edits, &selected_edits, Some(&evidence_skips))
+            .unwrap()
+    } else {
+        host.with_interventions(&edits, &selected_edits).unwrap()
+    };
     assert!(host.initialization_peak_bytes() > without_edits);
     let (role, pending) = request
         .reserve_embedded_role_with_capture(
@@ -275,7 +404,7 @@ fn run_mode(window:bool,evidence:bool) {
         foreign_role: foreign_role.budget_custody(),
         order: vec![],
         window,
-        acknowledged:0,
+        acknowledged: 0,
     };
     let input = [0.5, -1.0, 2.25, 3.5, -4.0, 5.75];
     let epoch = eredu_core::DistributedCommitEpoch::new(33).unwrap();
@@ -288,10 +417,13 @@ fn run_mode(window:bool,evidence:bool) {
             // Graph order differs from declaration order across distinct hooks.
             let early = guard.observer.intervene("early", &input)?.unwrap();
             let late = guard.observer.intervene("late", &early)?;
-            assert_eq!(late.is_none(),window.is_some());
-            let output=late.as_ref().unwrap_or(&early);
+            assert_eq!(late.is_none(), window.is_some());
+            let output = late.as_ref().unwrap_or(&early);
             assert!(guard.observer.intervene("disabled", output)?.is_none());
-            assert_eq!(*output, input.map(|v| v * if window.is_some() {-3.0} else {-6.0}));
+            assert_eq!(
+                *output,
+                input.map(|v| v * if window.is_some() { -3.0 } else { -6.0 })
+            );
             guard.observer.observe("block.output", output)?;
             guard.observer.complete_transaction(epoch)?;
             guard.finish(true);
@@ -299,8 +431,15 @@ fn run_mode(window:bool,evidence:bool) {
         })
         .unwrap()
         .unwrap();
-    assert_eq!(backend.order,if window.is_some() {vec![1,2]} else {vec![1,2,0]});
-    assert_eq!(backend.acknowledged,usize::from(window.is_some()));
+    assert_eq!(
+        backend.order,
+        if window.is_some() {
+            vec![1, 2]
+        } else {
+            vec![1, 2, 0]
+        }
+    );
+    assert_eq!(backend.acknowledged, usize::from(window.is_some()));
     let frame = owner.take_shared_step().unwrap().unwrap();
     assert_eq!(
         frame
@@ -317,16 +456,29 @@ fn run_mode(window:bool,evidence:bool) {
         ]
     );
     if window.is_some() {
-        let plan=edits.plan().admission();
-        let operation=&plan.plan().operations[0];let point=&plan.points()[0];
-        let initial=crate::intervention::intervention_metadata(operation,point,plan.identity()).unwrap();
-        let metadata=crate::intervention::intervention_window_metadata(operation,point).unwrap();
-        let projection=crate::intervention::PartitionInterventionProjectionCost::new(plan,2).unwrap().usage();
-        assert!(metadata.encoded_bytes>0);
-        assert_eq!(frame.as_ref().interventions[0].charged,initial.checked_add(metadata).unwrap().checked_add(projection).unwrap());
+        let plan = edits.plan().admission();
+        let operation = &plan.plan().operations[0];
+        let point = &plan.points()[0];
+        let initial =
+            crate::intervention::intervention_metadata(operation, point, plan.identity()).unwrap();
+        let metadata = crate::intervention::intervention_window_metadata(operation, point).unwrap();
+        let projection = crate::intervention::PartitionInterventionProjectionCost::new(plan, 2)
+            .unwrap()
+            .usage();
+        assert!(metadata.encoded_bytes > 0);
+        assert_eq!(
+            frame.as_ref().interventions[0].charged,
+            initial
+                .checked_add(metadata)
+                .unwrap()
+                .checked_add(projection)
+                .unwrap()
+        );
     }
-    assert_eq!(owner.usage().captures, if evidence {5} else {1});
-    if evidence {evidence::check(&frame,&input);}
+    assert_eq!(owner.usage().captures, if evidence { 5 } else { 1 });
+    if evidence {
+        evidence::check(&frame, &input);
+    }
     let used = owner.usage();
     assert!(
         owner
@@ -341,7 +493,7 @@ fn run_mode(window:bool,evidence:bool) {
     assert_eq!(owner.usage(), used);
     request.close().unwrap();
     drop((owner, backend, role, foreign_role, request));
-    let retained = pool.used_bytes().unwrap();
+    let retained = pool.payload_used_bytes().unwrap();
     let tensor = frame.records()[0]
         .payload
         .as_ref()
@@ -352,7 +504,7 @@ fn run_mode(window:bool,evidence:bool) {
         matches!(tensor.data(),TensorObservationData::F32(values) if values.as_slice()==input.map(|v|v * if window.is_some() {-3.0} else {-6.0}).as_slice())
     );
     drop(frame);
-    assert!(pool.used_bytes().unwrap() < retained);
+    assert!(pool.payload_used_bytes().unwrap() < retained);
     drop((edits, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

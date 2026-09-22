@@ -1,16 +1,18 @@
 //! Selected request-wide native capacity and authenticated canonical publication.
 use super::*;
 use crate::working_memory::{
+    WorkingMemoryStorage,
     funding::native_partition::{NativePartition, NativePublicationScopeIdentity},
     storage::native_publication::PreparedNativePublication,
-    WorkingMemoryStorage,
 };
 use std::{any::TypeId, marker::PhantomData, sync::OnceLock};
 
 pub(super) mod plan;
 pub use plan::{NativeStorageCarryoverReport, PreparedNativeStoragePlan};
 mod prefill_envelope;
-pub use prefill_envelope::{NativeEquationStorage, NativePrefillEnvelope, NativePrefillEnvelopeBuilder};
+pub use prefill_envelope::{
+    NativeEquationStorage, NativePrefillEnvelope, NativePrefillEnvelopeBuilder,
+};
 
 /// Payload-free identity of the selected native mechanism. Equal capacities do
 /// not identify a selection. Constructing this identity creates no authority.
@@ -41,6 +43,15 @@ pub enum NativeStorageObservation<K> {
     /// preserves that row's full ordinary, copy-funded or prepaid coverage.
     /// It cannot create a row, supply an origin or claim a new native birth.
     ExistingPhysical(K, u64),
+    /// Full backing authenticated against the supplied completed standalone
+    /// numerical account. Retains that account without a new canonical row or
+    /// another payload charge. The backend must prove this exact allocation's
+    /// budget identity, capacity and placement before returning this variant.
+    CompletedNumerical(
+        K,
+        u64,
+        crate::working_memory::OriginalNumericalBudgetCustody,
+    ),
     /// Positively authenticated ordinary backing, retaining ordinary charging.
     Ordinary(K, u64),
     /// Positively authenticated absence of physical backing, not logical zero.
@@ -59,7 +70,9 @@ pub trait OriginalNativeStorageMechanism: Clone + 'static {
     /// Borrowed actual native root; ownership stays with the publication caller.
     /// A mechanism may distinguish tensor and immutable source owners without
     /// constructing a tensor or cloning either owner. Copy duplicates only the loan.
-    type Root<'a>: Copy where Self: 'a;
+    type Root<'a>: Copy
+    where
+        Self: 'a;
     /// Prepared native attachment, retaining its unchanged registration on error.
     type Attachment: 'static;
     /// Actual fixed/native failure. Failed native construction must retain every
@@ -72,6 +85,13 @@ pub trait OriginalNativeStorageMechanism: Clone + 'static {
 
     /// Return the same cold identity used by the sealed selected plan.
     fn selection(&self) -> &NativeStorageSelection;
+    /// One physical placement shared by every allocation from this native
+    /// counter. Heterogeneous mechanisms must provide a domain-resolved budget
+    /// instead of collapsing their allocation peaks into this uniform fact.
+    fn uniform_budget_placement(&self) -> Option<Arc<eredu_core::MemoryPlacement>> {
+        None
+    }
+
     /// Maximum additional managed storage retained by each cloned key from this
     /// selection, including a partially failed clone. This bound is immutable
     /// for the same selection and applies to every described/source key used by
@@ -116,6 +136,17 @@ pub trait OriginalNativeStorageMechanism: Clone + 'static {
     /// Describe only facts authenticated by the supplied observation. Cloning a
     /// key must preserve its identity, capacity and actual payload custody.
     fn describe(observation: &Self::Observation<'_>) -> NativeStorageObservation<Self::Key>;
+    /// Descriptive source category when an existing observation has no matching
+    /// publication. This label carries no identity or allocation authority.
+    fn missing_existing_source_label(_observation: &Self::Observation<'_>) -> &'static str {
+        "registry physical alias missing"
+    }
+    /// Physical placement authenticated by the same backing observation. Missing
+    /// placement is an attribution error under finite and unlimited limits.
+    fn placement(
+        observation: &Self::Observation<'_>,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<Arc<eredu_core::MemoryPlacement>, WorkingMemoryError>;
     /// Positive proof that this exact completed backing already owns an
     /// independent attachment in this pool. The mechanism must retain the
     /// complete successful attachment receipt, validate domain, non-reused
@@ -131,8 +162,10 @@ pub trait OriginalNativeStorageMechanism: Clone + 'static {
         &self,
         _previous: &Self::Observation<'_>,
         _observation: &Self::Observation<'_>,
-        _pool: &WorkingMemoryPool,
-    ) -> bool { false }
+        _pool: &MemoryLedger,
+    ) -> bool {
+        false
+    }
     /// Prepare the existing native sidecar using this exact neutral payload.
     /// Failure retains the payload as part of the actual typed failed owner.
     fn prepare_attachment(
@@ -157,6 +190,13 @@ pub struct OriginalNativeBudgetCustody {
     partition: NativePartition,
 }
 impl OriginalNativeBudgetCustody {
+    /// Apply native evidence after all allocation producers have retired and
+    /// the reported backing frees have completed. A polling failure or logical
+    /// eviction is not evidence for this callback. Concurrent stale upper bounds
+    /// are accepted; custody and metadata remain alive through every alias.
+    pub fn retire_completed_occupancy(&self, bytes: u64) {
+        self.partition.retire_completed_occupancy(bytes);
+    }
     /// Exact immutable request-wide physical capacity, shared by all roles.
     pub fn capacity_bytes(&self) -> u64 {
         self.partition.capacity()
@@ -168,10 +208,65 @@ impl OriginalNativeBudgetCustody {
 /// registration retires before its already charged host metadata custody.
 pub struct NativeStorageRegistration<K: Ord + Send + 'static> {
     pub(in crate::working_memory) registration: OnceLock<WorkingMemoryStorage<K>>,
+    pub(in crate::working_memory) native_attached: std::sync::atomic::AtomicBool,
     pub(in crate::working_memory) _raw: crate::working_memory::OriginalHostMetadataCustody,
 }
 
+impl<K: Ord + Send + 'static> Drop for NativeStorageRegistration<K> {
+    fn drop(&mut self) {
+        if self
+            .native_attached
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if std::thread::panicking() {
+                self._raw.quarantine();
+            } else if let Some(registration) = self.registration.get() {
+                registration.retire_native_backing();
+            }
+        }
+    }
+}
+
 impl<K: Ord + Send + 'static> NativeStorageRegistration<K> {
+    /// Confirms an already published completed backing whose native owner
+    /// retains this exact numerical account. The backend must reauthenticate
+    /// that owner before calling this method. Its existing lifetime observer
+    /// owns physical retirement; this transient publication must neither add
+    /// another backing attachment nor signal physical retirement when dropped.
+    /// The caller destroys its prepared owner after this method unlocks.
+    pub fn confirm_completed_numerical_custody(
+        &self,
+        account: &crate::working_memory::OriginalNumericalBudgetCustody,
+    ) -> Result<(), WorkingMemoryError> {
+        self.registration
+            .get()
+            .ok_or(WorkingMemoryError::IdentityMismatch)?
+            .validate_completed_numerical_custody(account)?;
+        self.native_attached
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Fixed frames for completed-account identity and health validation.
+    pub fn completed_numerical_custody_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<(
+                &Self,
+                &crate::working_memory::OriginalNumericalBudgetCustody,
+            )>(),
+            size_of::<(
+                &WorkingMemoryStorage<K>,
+                &crate::working_memory::OriginalNumericalBudgetCustody,
+            )>(),
+            size_of::<std::sync::MutexGuard<'_, crate::working_memory::Usage>>(),
+            size_of::<Result<(), WorkingMemoryError>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
     /// Compare the actual sidecar metadata payer with an already retained
     /// operation account. This borrowed equality grants no publication or
     /// allocation authority; a receipt still requires successful native attach.
@@ -187,7 +282,10 @@ impl<K: Ord + Send + 'static> NativeStorageRegistration<K> {
     /// Fixed transports of the borrowed account comparison, with no new owner.
     pub fn metadata_origin_control_bytes() -> Option<usize> {
         crate::working_memory::OriginalOperationMetadataCustody::host_account_control_bytes()?
-            .checked_add(std::mem::size_of::<(&Self, &crate::working_memory::OriginalOperationMetadataCustody)>())?
+            .checked_add(std::mem::size_of::<(
+                &Self,
+                &crate::working_memory::OriginalOperationMetadataCustody,
+            )>())?
             .checked_add(std::mem::size_of::<bool>())
     }
 }
@@ -442,7 +540,7 @@ impl<M: OriginalNativeStorageMechanism> OriginalNativePublication<M> {
         &mut self,
         scope: &WorkingMemoryFundingScope,
         roots: impl IntoIterator<Item = M::Root<'a>>,
-        source_inputs: &[(M::Key, u64)],
+        source_inputs: &[(M::Key, crate::working_memory::StorageAllocation)],
     ) -> Result<(), NativeStorageError<M::Error>> {
         self.failure_site = "native publication terminal attempt";
         if self.terminal {
@@ -504,19 +602,25 @@ impl<M: OriginalNativeStorageMechanism> OriginalNativePublication<M> {
             if matches!(description, NativeStorageObservation::Empty) {
                 self.root_inputs.push(RootPublicationInput::Empty);
                 self.attachments.push(None);
-            } else if self.mechanism.has_retained_attachment(&observed, &observed, scope.pool()) {
+            } else if self
+                .mechanism
+                .has_retained_attachment(&observed, &observed, scope.pool())
+            {
                 self.root_inputs.push(RootPublicationInput::Retained);
                 self.attachments.push(None);
             } else {
+                let placement = M::placement(&observed, scope.pool().topology())
+                    .map_err(NativeStorageError::Memory)?;
                 let input = self
                     .registry
-                    .push_observation(description)
+                    .push_placed_observation(description, placement)
                     .map_err(NativeStorageError::Memory)?;
                 self.root_inputs.push(RootPublicationInput::Registry(input));
                 let prepared = self
                     .mechanism
                     .prepare_attachment(NativeStorageRegistration {
                         registration: OnceLock::new(),
+                        native_attached: std::sync::atomic::AtomicBool::new(false),
                         _raw: self.controls.custody.raw().clone().into(),
                     })
                     .map_err(NativeStorageError::Native)?;
@@ -539,26 +643,39 @@ impl<M: OriginalNativeStorageMechanism> OriginalNativePublication<M> {
             observations.push(Some(observed));
         }
         self.failure_site = "native publication source inventory";
-        for (key, bytes) in source_inputs {
+        for (key, allocation) in source_inputs {
             self.mechanism
                 .validate_source_key(key)
                 .map_err(NativeStorageError::Memory)?;
             self.source_inputs.push(
                 self.registry
-                    .push_source(
+                    .push_placed_source(
                         key,
-                        *bytes,
-                        self.mechanism.checkpoint_source_identity(key),
+                        allocation.capacity_bytes(),
+                        |key| self.mechanism.checkpoint_source_identity(key),
                         scope.pool(),
+                        allocation.placement_handle(),
                     )
                     .map_err(NativeStorageError::Memory)?,
             );
             self.attached_sources.push(false);
         }
         self.failure_site = "native publication registry";
-        self.registry
-            .publish_original(scope, &self.controls, &self.scope_identity)
-            .map_err(NativeStorageError::Memory)?;
+        if let Err(cause) =
+            self.registry
+                .publish_original(scope, &self.controls, &self.scope_identity)
+        {
+            if let Some(missing) = self.registry.missing_existing_input() {
+                if let Some(index) = self.root_inputs.iter().position(|input| {
+                    matches!(input, RootPublicationInput::Registry(input) if *input == missing)
+                }) {
+                    if let Some(observation) = observations[index].as_ref() {
+                        self.failure_site = M::missing_existing_source_label(observation);
+                    }
+                }
+            }
+            return Err(NativeStorageError::Memory(cause));
+        }
         self.failure_site = "native publication attachment commit";
         for (index, input) in self.root_inputs.iter().enumerate() {
             let RootPublicationInput::Registry(input) = input else {
@@ -567,14 +684,21 @@ impl<M: OriginalNativeStorageMechanism> OriginalNativePublication<M> {
                 // backing is still empty or already has its independent native
                 // attachment. The native inspection performs its checked read
                 // under the same runtime lock used by actual attachment.
-                let current = self.mechanism
+                let current = self
+                    .mechanism
                     .observe(&self.budget, roots[index])
                     .map_err(NativeStorageError::Native)?;
                 let unchanged = match input {
-                    RootPublicationInput::Empty => matches!(M::describe(&current), NativeStorageObservation::Empty),
+                    RootPublicationInput::Empty => {
+                        matches!(M::describe(&current), NativeStorageObservation::Empty)
+                    }
                     RootPublicationInput::Retained => self.mechanism.has_retained_attachment(
-                        observations[index].as_ref().expect("original borrowed observation"),
-                        &current, scope.pool()),
+                        observations[index]
+                            .as_ref()
+                            .expect("original borrowed observation"),
+                        &current,
+                        scope.pool(),
+                    ),
                     RootPublicationInput::Registry(_) => unreachable!("handled above"),
                 };
                 if !unchanged {
@@ -604,7 +728,13 @@ impl<M: OriginalNativeStorageMechanism> OriginalNativePublication<M> {
             let observation = observations[index]
                 .take()
                 .expect("same borrowed observation");
+            M::registration(&preparation)
+                .native_attached
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Err((cause, preparation)) = M::attach(observation, preparation) {
+                M::registration(&preparation)
+                    .native_attached
+                    .store(false, std::sync::atomic::Ordering::Release);
                 self.attachments[index] = Some(preparation);
                 return Err(NativeStorageError::Native(cause));
             }

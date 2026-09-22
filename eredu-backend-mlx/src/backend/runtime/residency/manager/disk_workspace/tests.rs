@@ -19,6 +19,8 @@ pub(super) fn fixture(
     Arc<SafetensorsWeightStore>,
     ResidencyManager,
 ) {
+    // Shared native suites use the genuine paid initializer before ordinary streams.
+    crate::tests::support::test_utils::initialize_original_sources();
     let dir = tempfile::tempdir().unwrap();
     let a = [1_i32, 2]
         .into_iter()
@@ -294,10 +296,14 @@ fn warm_device_snapshot_is_cold_and_does_not_retain_evicted_numerical_storage() 
     crate::backend::ordinary_retirement::reclaim();
     drop(lease);
     assert!(manager.evict(&id("alias"), MemoryTier::Device).unwrap());
+    // Logical eviction releases the manager's owner; the physical cache keeps
+    // the same backing and its custody until explicit allocator eviction.
+    safemlx::memory::clear_cache().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while retired.load(Ordering::SeqCst) == 0 {
         crate::backend::submission_recovery::reap();
         crate::backend::ordinary_retirement::reclaim();
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         assert!(
             std::time::Instant::now() < deadline,

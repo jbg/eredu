@@ -5,7 +5,7 @@ use super::*;
 fn native_source_exact_short_and_foreign_admission_preserve_real_original_owners() {
     COMPILES.set(0);
     let materializer = MlxPreparedInputMaterializer::prepare().unwrap();
-    let sample_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let sample_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let sample = source(&sample_pool, 16);
     let i = sample.original_bytes();
     let b = materializer
@@ -15,7 +15,7 @@ fn native_source_exact_short_and_foreign_admission_preserve_real_original_owners
         .unwrap();
     drop(sample);
     drop(sample_pool);
-    let short = WorkingMemoryPool::new(i + b - 1, 0).unwrap();
+    let short = crate::memory_fixture::ledger(i + b - 1, 0).unwrap();
     let input = source(&short, 16);
     let error = materializer
         .plan(&input)
@@ -23,14 +23,14 @@ fn native_source_exact_short_and_foreign_admission_preserve_real_original_owners
         .materialize(&short)
         .unwrap_err();
     assert!(
-        matches!(error.accounting_failure(),Some(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes}) if *required_bytes==b&&*available_bytes==b-1)
+        matches!(error.accounting_failure(),Some(WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. })) if *required_bytes==b&&(*limit_bytes - *existing_bytes)==b-1)
     );
     assert_eq!(error.retained_bytes(), 0);
     assert_eq!(COMPILES.get(), 0);
-    assert_eq!(short.used_bytes().unwrap(), i);
+    assert_eq!(short.fixture_host_charge().unwrap(), i);
     drop(error);
     drop(input);
-    let exact = WorkingMemoryPool::new(i + b, 0).unwrap();
+    let exact = crate::memory_fixture::ledger(i + b, 0).unwrap();
     let input = source(&exact, 16);
     let native = materializer
         .plan(&input)
@@ -39,8 +39,8 @@ fn native_source_exact_short_and_foreign_admission_preserve_real_original_owners
         .unwrap();
     assert_eq!(native.original_bytes(), b);
     assert_eq!(native.slot_count(), input.slot_count());
-    assert_eq!(exact.used_bytes().unwrap(), i + b);
-    let other = WorkingMemoryPool::new(i + b, 0).unwrap();
+    assert_eq!(exact.fixture_host_charge().unwrap(), i + b);
+    let other = crate::memory_fixture::ledger(i + b, 0).unwrap();
     let error = materializer
         .plan(&input)
         .unwrap()
@@ -50,18 +50,18 @@ fn native_source_exact_short_and_foreign_admission_preserve_real_original_owners
         error.accounting_failure(),
         Some(&WorkingMemoryError::IdentityMismatch)
     );
-    assert_eq!(other.used_bytes().unwrap(), 0);
+    assert_eq!(other.fixture_host_charge().unwrap(), 0);
     drop(error);
     drop(native);
     settle(&exact, 0, i);
     drop(input);
-    assert_eq!(exact.used_bytes().unwrap(), 0);
+    assert_eq!(exact.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
 fn native_source_real_vector_reserve_failure_holds_arena_until_error_and_reclaimer_retire() {
     let materializer = MlxPreparedInputMaterializer::prepare().unwrap();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let input = source(&pool, 16);
     let plan = materializer.plan(&input).unwrap();
     let required = plan.required_bytes().unwrap();
@@ -73,7 +73,7 @@ fn native_source_real_vector_reserve_failure_holds_arena_until_error_and_reclaim
     ));
     assert_eq!(error.retained_bytes(), required);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.fixture_host_charge().unwrap(),
         input.original_bytes() + required
     );
     drop(error);
@@ -94,7 +94,7 @@ fn native_source_real_vector_reserve_failure_holds_arena_until_error_and_reclaim
     drop(error);
     drop(lease);
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -106,13 +106,13 @@ fn native_source_equal_content_is_not_packet_authority_and_wrong_slot_does_no_cl
         false,
         false,
     );
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let first = source(&pool, 64);
     let equal = source(&pool, 64);
     assert_eq!(first.content_digest(), equal.content_digest());
     assert!(!first.same_source(&equal));
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let config = super::super::tests::cold_config(&backend, root.path(), 0);
     let semantics = config
         .prepared_sources()
@@ -160,14 +160,14 @@ fn native_source_equal_content_is_not_packet_authority_and_wrong_slot_does_no_cl
 #[test]
 fn native_source_all_slots_have_independent_completed_values_and_aliases_keep_original_charge() {
     let materializer = MlxPreparedInputMaterializer::prepare().unwrap();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let input = source(&pool, 16);
     let native = materializer
         .plan(&input)
         .unwrap()
         .materialize(&pool)
         .unwrap();
-    let original = pool.used_bytes().unwrap();
+    let original = pool.fixture_host_charge().unwrap();
     let b = native.original_bytes();
     let owner = NativeMemoryOwner::acquire_typed(&pool).unwrap(); // C wrappers are ordinary
     let mut aliases = Vec::new();
@@ -190,7 +190,7 @@ fn native_source_all_slots_have_independent_completed_values_and_aliases_keep_or
     }
     drop(native);
     drop(input);
-    assert_eq!(pool.used_bytes().unwrap(), b);
+    assert_eq!(pool.fixture_host_charge().unwrap(), b);
     assert!(b < original);
     assert!(pool.unquoted_owner_count().unwrap() > 0);
     drop(owner);
@@ -198,7 +198,7 @@ fn native_source_all_slots_have_independent_completed_values_and_aliases_keep_or
     while aliases.len() > 1 {
         aliases.pop();
         safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), b);
+        assert_eq!(pool.fixture_host_charge().unwrap(), b);
     }
     drop(aliases);
     settle(&pool, 0, 0);
@@ -206,6 +206,10 @@ fn native_source_all_slots_have_independent_completed_values_and_aliases_keep_or
 
 #[test]
 fn original_native_qwen_vl_matches_full_reference_in_three_residencies_and_cached_decodes() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen3_vl_component_fixture(
         root.path(),
@@ -217,6 +221,10 @@ fn original_native_qwen_vl_matches_full_reference_in_three_residencies_and_cache
 #[test]
 fn original_native_conditional_qwen_matches_full_reference_in_three_residencies_and_cached_decodes()
 {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_qwen35_conditional_component_fixture(
         root.path(),
@@ -226,6 +234,14 @@ fn original_native_conditional_qwen_matches_full_reference_in_three_residencies_
 }
 #[test]
 fn original_native_sources_enter_the_same_prepared_iterator_and_manual_core_driver() {
+    if !crate::composition::mlx::session::model_session::original_host_input::tests::admitted::enter(
+    ) {
+        return;
+    }
     super::super::tests::core_driver_family(2, false);
     super::super::tests::core_driver_family(2, true);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

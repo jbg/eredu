@@ -98,7 +98,7 @@ fn copy_error(error: CapturePlanCopyError) -> CaptureError {
         CapturePlanCopyError::Overflow => CaptureError::Overflow,
         CapturePlanCopyError::Allocation(_) => CaptureAdmissionStorageError::Allocation.into(),
         CapturePlanCopyError::Capacity => CaptureAdmissionStorageError::Capacity.into(),
-        CapturePlanCopyError::Capability | CapturePlanCopyError::Identity => {
+        CapturePlanCopyError::Identity => {
             unreachable!("point copy has no admission or identity worker")
         }
     }

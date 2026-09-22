@@ -21,8 +21,8 @@ pub(super) fn control_bytes() -> usize {
         + std::mem::size_of::<Sha256>()
         + std::mem::size_of::<serde_json::Serializer<&mut DigestWriter>>()
         + std::mem::size_of::<std::io::Result<usize>>()
-        + std::mem::size_of::<Result<[u8;32], serde_json::Error>>()
-        + std::mem::size_of::<[u8;32]>()
+        + std::mem::size_of::<Result<[u8; 32], serde_json::Error>>()
+        + std::mem::size_of::<[u8; 32]>()
 }
 
 pub(super) fn digest(value: &impl Serialize) -> Result<[u8; 32], serde_json::Error> {
@@ -49,7 +49,15 @@ mod tests {
                     u64::MAX,
                     TextInferencePolicy {
                         prefill_chunk_positions: std::num::NonZeroU64::new(3),
-                        managed_memory_capacity_bytes: capacity,
+                        memory_limits: (capacity).map_or_else(
+                            eredu_core::MemoryLimitDeclarations::unlimited,
+                            |bytes| {
+                                eredu_core::MemoryLimitDeclarations::new([(
+                                    "host".into(),
+                                    eredu_core::MemoryLimit::Finite(bytes),
+                                )])
+                            },
+                        ),
                         ..Default::default()
                     },
                     Some(("profile", "constraint", "auto", ["", "\0", "é🙂"])),

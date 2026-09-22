@@ -1,23 +1,39 @@
 //! A model invocation lends the same funded observer and shares request usage.
 use super::*;
-use crate::working_memory::{OriginalCaptureSource, OriginalEmbeddedSpeculativeRole};
+use crate::working_memory::{
+    OriginalCaptureSource, OriginalEmbeddedSpeculativeRole, OriginalSpeculativeRole,
+};
 use eredu_core::speculative::SpeculativeActivationOrigin;
 
 /// One explicit model role's capture bank. It owns the same source and request
 /// lineage after the quote borrow ends; native scope/completion remain external.
 #[derive(Debug)]
-pub struct FundedEmbeddedCaptureInvocation {
+pub struct FundedModelCaptureInvocation<R> {
     session: FundedCaptureSession,
     source: OriginalCaptureSource,
     origin: SpeculativeActivationOrigin,
-    role: OriginalEmbeddedSpeculativeRole,
+    role: R,
+    partition_metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
+    partition_fragments: Option<Vec<crate::working_memory::PreparedPartitionFragmentHostFunding>>,
+    partition_evidence: Option<
+        Vec<(
+            usize,
+            [crate::working_memory::PreparedPartitionFragmentHostFunding; 2],
+        )>,
+    >,
 }
-impl FundedEmbeddedCaptureInvocation {
+/// Funded observer for one genuine Embedded occurrence.
+pub type FundedEmbeddedCaptureInvocation =
+    FundedModelCaptureInvocation<OriginalEmbeddedSpeculativeRole>;
+/// Funded observer for one genuine independent-model occurrence or prefill span.
+pub type FundedAutoregressiveCaptureInvocation =
+    FundedModelCaptureInvocation<OriginalSpeculativeRole>;
+impl<R> FundedModelCaptureInvocation<R> {
     pub(crate) fn from_run(
         run: PreparedCaptureRun,
         lineage: crate::working_memory::CaptureRunLedger,
         source: OriginalCaptureSource,
-        role: OriginalEmbeddedSpeculativeRole,
+        role: R,
         origin: SpeculativeActivationOrigin,
     ) -> Self {
         // Internal model hooks participate in the same observation transaction
@@ -29,7 +45,58 @@ impl FundedEmbeddedCaptureInvocation {
             source,
             origin,
             role,
+            partition_metadata: None,
+            partition_fragments: None,
+            partition_evidence: None,
         }
+    }
+    pub(crate) fn install_partition_metadata(
+        &mut self,
+        funding: eredu_nn::workspace::HostMetadataFunding,
+    ) {
+        debug_assert!(self.partition_metadata.is_none());
+        self.partition_metadata = Some(funding);
+    }
+    /// Take this frame's already admitted protocol metadata partition once.
+    /// It supplies host custody only, never model or native execution authority.
+    pub fn take_partition_metadata(&mut self) -> Option<eredu_nn::workspace::HostMetadataFunding> {
+        self.partition_metadata.take()
+    }
+    pub(crate) fn install_partition_fragments(
+        &mut self,
+        fragments: Vec<crate::working_memory::PreparedPartitionFragmentHostFunding>,
+    ) {
+        debug_assert!(self.partition_fragments.is_none());
+        self.partition_fragments = Some(fragments);
+    }
+    /// Take the actual source-bound Host destinations once. These retain the
+    /// same admitted model account after their frame or request is retired.
+    pub fn take_partition_fragments(
+        &mut self,
+    ) -> Option<Vec<crate::working_memory::PreparedPartitionFragmentHostFunding>> {
+        self.partition_fragments.take()
+    }
+    pub(crate) fn install_partition_evidence_fragments(
+        &mut self,
+        fragments: Vec<(
+            usize,
+            [crate::working_memory::PreparedPartitionFragmentHostFunding; 2],
+        )>,
+    ) {
+        debug_assert!(self.partition_evidence.is_none());
+        self.partition_evidence = Some(fragments);
+    }
+    /// Take each admitted edit's exact before/after Host tokens once. The
+    /// returned indices identify already authenticated companion sources.
+    pub fn take_partition_evidence_fragments(
+        &mut self,
+    ) -> Option<
+        Vec<(
+            usize,
+            [crate::working_memory::PreparedPartitionFragmentHostFunding; 2],
+        )>,
+    > {
+        self.partition_evidence.take()
     }
     /// Bind the shared outer envelope policy before claiming this single-use
     /// frame. Only the exact source/origin/physical invocation may attach it;
@@ -48,9 +115,10 @@ impl FundedEmbeddedCaptureInvocation {
                 .session
                 .run
                 .matches_intervention_source(invocation.interventions())
-            || !self.session.run.matches_intervention_evidence_skips(
-                invocation.intervention_evidence_skips(),
-            )
+            || !self
+                .session
+                .run
+                .matches_intervention_evidence_skips(invocation.intervention_evidence_skips())
             || self.origin != invocation.origin()
             || phase != invocation.capture_phase()
             || shape.sequence != invocation.sequence()
@@ -79,9 +147,25 @@ impl FundedEmbeddedCaptureInvocation {
         );
         Ok(())
     }
+    /// Bind the same loaded partition run identity in this role's existing session.
+    /// The backend authenticates the transport and loaded labels independently.
+    pub fn prepare_partition_run_identity(
+        &mut self,
+        artifact: &str,
+        execution: &str,
+        setup: crate::CommunicationSessionIdentity,
+        overlay: Option<&str>,
+        metadata: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<
+        crate::capture::partition::PreparedPartitionCaptureRunIdentity,
+        crate::capture::partition::PartitionCaptureProgramError,
+    > {
+        self.session
+            .prepare_partition_run_identity(artifact, execution, setup, overlay, metadata)
+    }
     /// Actual consumed model occurrence. The native producer must compare it
     /// with the active equation and its original allocator/completion owners.
-    pub fn role(&self) -> &OriginalEmbeddedSpeculativeRole {
+    pub fn role(&self) -> &R {
         &self.role
     }
     /// Exact immutable C source, independent of model role or host capacity.
@@ -95,12 +179,12 @@ impl FundedEmbeddedCaptureInvocation {
     /// Lend the existing observer under its cumulative ledger and fixed claims.
     /// The caller must preserve the same execution/transaction closure, supply a
     /// qualified original native backend, and retire work before draining output.
-    pub fn with_observer<T, E, N, R>(
+    pub fn with_observer<T, E, N, O>(
         &mut self,
         backend: &mut dyn ScheduledCaptureBackend<Tensor = T, Error = E>,
         map_error: &dyn Fn(FundedCaptureError<E>) -> N,
-        operation: impl FnOnce(&mut dyn crate::ActivationObserver<T, N>) -> R,
-    ) -> Result<R, CaptureProtocolError>
+        operation: impl FnOnce(&mut dyn crate::ActivationObserver<T, N>) -> O,
+    ) -> Result<O, CaptureProtocolError>
     where
         E: std::error::Error + Send + Sync + 'static,
     {

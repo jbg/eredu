@@ -51,10 +51,12 @@ and overflow checks. Two readiness cases use backend optimization level 0 and
 selected neutral dependencies at level 2. Native development guards are enabled.
 The 64 MiB test stack is explicit; default 2 MiB debug-stack behavior is unqualified.
 
-Public media tests use 8 GiB. Distributed CLI cases use 64 GiB and a 120-second
-per-case deadline. Recorded Mova Resident/Host/Disk process times are
-65.01/64.26/63.49 seconds; the three Dense cases together take 41.03 seconds.
-These are functional timings, not isolated performance benchmarks.
+Public media tests use 8 GiB. The distributed CLI matrix uses a finite 16 TiB
+shared-domain allowance and a 240-second per-case deadline. Its conservative
+native graph and control allowances are distinct from actual memory residency.
+Current ledger results and outstanding CLI validation are recorded in
+[physical memory validation](physical-memory-validation.md). These cases test
+functional behavior rather than isolated performance.
 
 ## Numerical, performance and memory scope
 
@@ -72,8 +74,9 @@ establish tokenization throughput or a process-memory ceiling.
 The four released text/image tool runs use 3.13–3.19 GB peak RSS and
 5.61–5.68 GB peak process footprint. Framework capacity, retained buffer bounds,
 native allocation counters, RSS and process footprint are different quantities.
-Application buffers, allocator caches and unrelated process memory require
-their own accounting.
+Registered allocator backings remain charged while a cache retains them.
+Application buffers and unrelated process memory require their own accounting;
+these framework charges do not establish a process-memory ceiling.
 
 CUDA/NCCL and unlisted hardware, fresh funded file opening outside Unix, arbitrary
 custom callback bounds and downstream application memory/cache policy are not

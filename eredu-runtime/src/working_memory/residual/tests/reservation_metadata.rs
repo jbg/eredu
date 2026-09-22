@@ -1,5 +1,5 @@
 use super::*;
-use crate::working_memory::{quote_inference_workspace_with_context, WorkspaceReportMetadata};
+use crate::working_memory::{WorkspaceReportMetadata, quote_inference_workspace_with_context};
 use std::convert::Infallible;
 
 // This fixture retains a real 64-byte source and adds a 128-byte complete
@@ -7,6 +7,23 @@ use std::convert::Infallible;
 #[derive(Debug)]
 struct UnchangedSource;
 impl WorkspaceMechanisms for UnchangedSource {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     fn operation_bound(
         &self,
         _: &WorkspaceOperation,
@@ -15,6 +32,23 @@ impl WorkspaceMechanisms for UnchangedSource {
     }
 }
 impl WorkspaceFactMechanisms for UnchangedSource {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+
     type Error = Infallible;
     fn operation_facts(
         &self,
@@ -45,14 +79,18 @@ impl WorkspaceFactMechanisms for UnchangedSource {
 }
 
 fn funded_quote(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     funding: &HostMetadataFunding,
     g: InferenceGeometry,
 ) -> IncrementalInferenceQuote {
     let context =
-        WorkspaceContext::new_with_metadata_funding(UnchangedSource, funding.clone())
-            .unwrap();
-    let root = WorkspaceExistingStorage::try_new(Some(64), &context).unwrap();
+        WorkspaceContext::new_with_metadata_funding(UnchangedSource, funding.clone()).unwrap();
+    let root = WorkspaceExistingStorage::try_new_placed(
+        Some(64),
+        crate::working_memory::memory_fixture::host_placement(),
+        &context,
+    )
+    .unwrap();
     let layout = RegisteredWorkspaceStorageLayout::<u32>::new(1).unwrap();
     context.charge_metadata(layout.requested_bytes()).unwrap();
     let registered = layout
@@ -72,7 +110,7 @@ fn funded_quote(
     ResidualInferenceQuote::compose_metadata(
         &equations,
         state(g),
-        outside(g, 128),
+        outside(g, 128 + publication_controls()),
         &registered,
         WorkspaceReportMetadata::new(&context),
     )
@@ -83,80 +121,158 @@ fn funded_quote(
 #[test]
 fn quote_aliases_share_paid_diagnostics_and_sealing_copies_only_shared_reports() {
     let capacity = 1 << 22;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
-    let funding = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
     let quote = funded_quote(&pool, &funding, geometry());
-    let before = pool.used_bytes().unwrap();
+    let before = (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool));
     let alias = quote.clone();
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        before
+    );
     assert!(std::ptr::eq(quote.state(), alias.state()));
-    let original_retained = quote.state().execution_workspace.as_ref().unwrap().retained.bytes().unwrap();
+    let original_retained = quote
+        .state()
+        .execution_workspace
+        .as_ref()
+        .unwrap()
+        .retained
+        .bytes()
+        .unwrap();
 
     let sealed = alias.with_span_workspace().unwrap();
     assert!(!std::ptr::eq(quote.state(), sealed.state()));
-    assert_eq!(quote.state().execution_workspace.as_ref().unwrap().retained.bytes(), Some(original_retained));
-    assert!(sealed.state().execution_workspace.as_ref().unwrap().retained.bytes().unwrap() > original_retained);
-    let before = pool.used_bytes().unwrap();
+    assert_eq!(
+        quote
+            .state()
+            .execution_workspace
+            .as_ref()
+            .unwrap()
+            .retained
+            .bytes(),
+        Some(original_retained)
+    );
+    assert!(
+        sealed
+            .state()
+            .execution_workspace
+            .as_ref()
+            .unwrap()
+            .retained
+            .bytes()
+            .unwrap()
+            > original_retained
+    );
+    let before = (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool));
     let sealed_alias = sealed.clone();
     assert!(std::ptr::eq(sealed.state(), sealed_alias.state()));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        before
+    );
     drop((quote, sealed, funding));
-    assert!(pool.used_bytes().unwrap() > 64);
+    assert!((pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)) > 64);
     assert!(sealed_alias.state().execution_workspace.is_some());
     drop(sealed_alias);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        64
+    );
 
     // A unique candidate can add the same diagnostics without replacing its
     // report shell or copying any existing string/window backing.
-    let funding = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
     let quote = funded_quote(&pool, &funding, geometry());
     let address = quote.state() as *const RuntimeStateEstimate;
     let sealed = quote.with_span_workspace().unwrap();
     assert_eq!(address, sealed.state() as *const RuntimeStateEstimate);
     drop((sealed, funding));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        64
+    );
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        0
+    );
 }
 
 #[test]
 fn shared_quote_report_refusal_preserves_original_diagnostics_and_custody() {
     let capacity = 1 << 22;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
-    let funding = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
     let quote = funded_quote(&pool, &funding, geometry());
     let mut alias = quote.clone();
-    let blocker = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
-    blocker.reserve_metadata((capacity - pool.used_bytes().unwrap()) as usize).unwrap();
-    let before = pool.used_bytes().unwrap();
+    let blocker = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
+    blocker
+        .reserve_metadata((capacity - physical_used(&pool)) as usize)
+        .unwrap();
+    let before = (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool));
     let failure = alias.state.make_mut().unwrap_err();
-    assert!(matches!(failure, crate::working_memory::WorkspaceReportError::Metadata(_)));
+    assert!(matches!(
+        failure,
+        crate::working_memory::WorkspaceReportError::Metadata(_)
+    ));
     assert!(std::ptr::eq(quote.state(), alias.state()));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        before
+    );
     drop((blocker, failure, quote, funding));
-    assert!(pool.used_bytes().unwrap() > 64);
+    assert!((pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)) > 64);
     // The surviving alias can still fund its unique mutation after the blocker
     // and earlier callers retire. This never refunds the retained report early.
     alias.state.make_mut().unwrap();
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        64
+    );
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        0
+    );
 }
 
 #[test]
 fn planned_reservation_refuses_before_q_publication_and_retains_final_metadata_or_node() {
     for keep_allocation in [false, true] {
         let capacity = 1 << 20;
-        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
         let execution = InferenceExecutionIdentity::default();
-        let original = pool.register_storage([(1u32, 64)]).unwrap();
+        let original = pool.register_host_storage([(1u32, 64)]).unwrap();
         let funding = pool
-            .prepare_workspace_metadata(&execution, capacity)
+            .prepare_workspace_metadata(
+                &execution,
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+            )
             .unwrap();
         let g = geometry();
         let quote = funded_quote(&pool, &funding, g);
@@ -164,25 +280,29 @@ fn planned_reservation_refuses_before_q_publication_and_retains_final_metadata_o
             requested_positions: g.cached_positions + g.input_positions + g.max_output_tokens,
             state: quote.state().clone(),
             incremental_required_bytes: quote.incremental_bytes(),
-            available_memory_bytes: None,
+            memory_limits: Default::default(),
+            additional_headroom: Default::default(),
         };
-        assert!(admission.incremental_required_bytes >= 32);
+        assert!(admission.incremental_required_bytes >= Some(32));
 
         // Another real planning account leaves one byte. The new reservation's
         // first constructor must refuse before a Q node or numeric commit exists.
         let blocker = pool
-            .prepare_workspace_metadata(&execution, capacity)
+            .prepare_workspace_metadata(
+                &execution,
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+            )
             .unwrap();
         blocker
-            .reserve_metadata((capacity - pool.used_bytes().unwrap() - 1) as usize)
+            .reserve_metadata((capacity - physical_used(&pool) - 1) as usize)
             .unwrap();
         let before = {
             let usage = pool.0.usage.lock().unwrap();
             (usage.reserved, usage.reservations, usage.next_funding)
         };
         assert!(
-            matches!(quote.reserve(&pool, &execution, &admission, capacity, &[]),
-            Err(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes: 1 }) if required_bytes > 1)
+            matches!(quote.reserve(&pool, &execution, &admission, crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity), &[]),
+            Err(capacity_error) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, 1)) if required_bytes > 1))
         );
         {
             let usage = pool.0.usage.lock().unwrap();
@@ -194,17 +314,24 @@ fn planned_reservation_refuses_before_q_publication_and_retains_final_metadata_o
         drop(blocker);
 
         let reservation = quote
-            .reserve(&pool, &execution, &admission, capacity, &[])
+            .reserve(
+                &pool,
+                &execution,
+                &admission,
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+                &[],
+            )
             .unwrap();
         assert_eq!(reservation.admission(), &admission);
-        let q = reservation.bytes();
-        let planning = pool.used_bytes().unwrap() - 64 - q;
+        let q = reservation_payload_bytes(&reservation);
+        let planning =
+            (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)) - 64 - q;
         assert!(planning > 0);
         let (metadata, run) = reservation.into_funding().unwrap();
         let allocation = if keep_allocation {
             let scope = run.scope().unwrap();
             let allocation = scope
-                .adopt_storage_individually([(2u32, 32)])
+                .adopt_host_storage_individually([(2u32, 32)])
                 .unwrap()
                 .remove(&2)
                 .unwrap();
@@ -222,84 +349,162 @@ fn planned_reservation_refuses_before_q_publication_and_retains_final_metadata_o
             drop(metadata);
             // Only the real Q allocation remains: it keeps the Q node, which
             // must independently retain the planning account that built it.
-            assert_eq!(pool.used_bytes().unwrap(), 64 + 32 + planning);
+            assert_eq!(
+                (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+                64 + 32 + planning
+            );
             drop(allocation);
         } else {
             // Run closure refunds Q, while the historical Admission copy stays
             // charged until the last reservation metadata owner retires.
-            assert_eq!(pool.used_bytes().unwrap(), 64 + planning);
-            assert_eq!(metadata.admission().incremental_required_bytes, q);
+            assert_eq!(
+                (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+                64 + planning
+            );
+            assert_eq!(metadata.admission().incremental_required_bytes, Some(q));
             drop(metadata);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 64);
+        assert_eq!(
+            (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+            64
+        );
         drop(original);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(
+            (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+            0
+        );
     }
 }
 
 #[test]
 fn incremental_candidate_pays_diagnostics_before_reservation_and_retains_them() {
     let capacity = 1 << 20;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let original = pool.register_storage([(1u32, 64)]).unwrap();
-    let funding = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
+    let original = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
     let g = geometry();
     let quote = funded_quote(&pool, &funding, g);
-    let blocker = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
-    blocker.reserve_metadata((capacity - pool.used_bytes().unwrap() - 1) as usize).unwrap();
+    let blocker = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
+    blocker
+        .reserve_metadata((capacity - physical_used(&pool) - 1) as usize)
+        .unwrap();
     let before = {
         let usage = pool.0.usage.lock().unwrap();
         (usage.reserved, usage.reservations, usage.next_funding)
     };
     let mut quote = Some(quote);
     let error = plan_prefill_incremental_with_capacity(
-        &execution, &pool, &capabilities(), request(g), g, capacity,
-        |_| Ok(quote.take().expect("one-position candidate is attempted once")),
-    ).unwrap_err();
+        &execution,
+        &pool,
+        &capabilities(),
+        request(g),
+        g,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        |_| {
+            Ok(quote
+                .take()
+                .expect("one-position candidate is attempted once"))
+        },
+    )
+    .unwrap_err();
     assert!(matches!(error, PrefillPlanningError::Reservation(
-        WorkingMemoryError::BudgetExceeded { available_bytes: 1, .. }
-    )));
+        capacity_error
+    ) if matches!(capacity_numbers(&capacity_error), Some((_, 1)))));
     {
         let usage = pool.0.usage.lock().unwrap();
-        assert_eq!((usage.reserved, usage.reservations, usage.next_funding), before);
+        assert_eq!(
+            (usage.reserved, usage.reservations, usage.next_funding),
+            before
+        );
     }
     drop(blocker);
     let mut quote = Some(funded_quote(&pool, &funding, g));
     let (reservation, quote) = plan_prefill_incremental_with_capacity(
-        &execution, &pool, &capabilities(), request(g), g, capacity,
-        |_| Ok(quote.take().expect("one-position candidate is attempted once")),
-    ).unwrap();
+        &execution,
+        &pool,
+        &capabilities(),
+        request(g),
+        g,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        |_| {
+            Ok(quote
+                .take()
+                .expect("one-position candidate is attempted once"))
+        },
+    )
+    .unwrap();
     assert_eq!(&reservation.admission().state, quote.state());
     drop(quote);
     drop(funding);
-    assert!(pool.used_bytes().unwrap() > 64 + reservation.bytes());
+    assert!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool))
+            > 64 + reservation_payload_bytes(&reservation)
+    );
     drop(reservation);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        64
+    );
     drop(original);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(
+        (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+        0
+    );
 }
 
 #[test]
 fn retained_policy_diagnostic_preserves_retry_classification_and_account() {
-    let pool = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 20, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     for retryable in [false, true] {
-        let funding = pool.prepare_workspace_metadata(&execution, 1 << 20).unwrap();
+        let funding = pool
+            .prepare_workspace_metadata(
+                &execution,
+                crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 20),
+            )
+            .unwrap();
         let metadata = WorkspaceReportMetadata::with_funding(&funding);
-        let reason = metadata.text(format_args!("exact selected mechanism has no bound")).unwrap();
+        let reason = metadata
+            .text(format_args!("exact selected mechanism has no bound"))
+            .unwrap();
         let rejection = if retryable {
             AdmissionRejection::EstimationUnsupported { reason }
         } else {
-            AdmissionRejection::AvailableMemoryUnavailable { reason }
+            {
+                drop(reason);
+                AdmissionRejection::PromptExceedsContext {
+                    prompt_positions: 2,
+                    maximum_positions: 1,
+                }
+            }
         };
-        let error: PrefillPlanningError = crate::working_memory::reservation_metadata::neural_error(
-            metadata.source(PrefillPlanningError::Admission(rejection)), &funding,
-        ).into();
-        assert_eq!(crate::working_memory::candidate_can_shrink(&error), retryable);
+        let error: PrefillPlanningError =
+            crate::working_memory::reservation_metadata::neural_error(
+                metadata.source(PrefillPlanningError::Admission(rejection)),
+                &funding,
+            )
+            .into();
+        assert_eq!(
+            crate::working_memory::candidate_can_shrink(&error),
+            retryable
+        );
         drop(funding);
-        assert!(pool.used_bytes().unwrap() > 0);
+        assert!((pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)) > 0);
         drop(error);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(
+            (pool.payload_used_bytes().unwrap() + reservation_controls_used(&pool)),
+            0
+        );
     }
 }

@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::CheckpointSource,
 };
 use eredu_runtime::working_memory::{
-    InitializedSharedNative, SharedNativeInitializationCustody, SharedNativeInitializationError,
-    SharedNativeInitializer, WorkingMemoryError, WorkingMemoryPool,
+    InitializedSharedNative, MemoryLedger, SharedNativeInitializationCustody,
+    SharedNativeInitializationError, SharedNativeInitializer, WorkingMemoryError,
 };
 use std::{
     alloc::Layout,
@@ -29,11 +29,11 @@ impl<'a> MetadataPlan<'a> {
             .ok_or(WorkingMemoryError::UnknownBound)
     }
     pub(super) fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::shared_native_initialization_required_bytes(self)
+        MemoryLedger::shared_native_initialization_required_bytes(self)
     }
     pub(super) fn prepare(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<InitializedSharedNative<Metadata>, SharedNativeInitializationError<Self>> {
         pool.initialize_shared_native(self)
     }
@@ -80,6 +80,9 @@ impl SharedNativeInitializer for MetadataPlan<'_> {
         let layout = self.0.layout();
         let controls = [
             layout.required_bytes(),
+            safemlx::EvaluatedArray::completed_readback_control_bytes::<safemlx::complex64>()
+                .ok_or(WorkingMemoryError::UnknownBound)?,
+            size_of::<Result<(), safemlx::error::NativeBytesCopyError>>(),
             Layout::array::<i32>(layout.shape_capacity())
                 .map_err(|_| WorkingMemoryError::Overflow)?
                 .size(),

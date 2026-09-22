@@ -4,9 +4,10 @@ use eredu_nn::GroupSelection;
 
 pub(crate) struct AddressableChildSource {
     pub(crate) report: WorkspaceTraceReport,
+    pub(crate) compact_host_bytes: u64,
     pub(crate) output_layouts: Vec<WorkspaceLayout>,
-    pub(crate) capture:crate::backend::array_copy::CaptureNativePopulation,
-    pub(crate) unit_representation:Option<WorkspaceRepresentation>,
+    pub(crate) capture: crate::backend::array_copy::CaptureNativePopulation,
+    pub(crate) unit_representation: Option<WorkspaceRepresentation>,
 }
 impl AddressableChildSource {
     /// Parameter rows are member-major, in the exact physical binder order
@@ -20,13 +21,46 @@ impl AddressableChildSource {
         mechanism: ResidentExecutionMechanisms,
         funding: &HostMetadataFunding,
     ) -> Result<Self, Error> {
-        Self::prepare_with_observation(source,inputs,members,parameters,mechanism,funding,None,None)
+        Self::prepare_with_observation(
+            source, inputs, members, parameters, mechanism, funding, None, None,
+        )
     }
     pub(crate) fn prepare_with_observation(
-        source:WorkspaceAddressableRegionView<'_>,inputs:&[WorkspaceLayout],members:usize,
-        parameters:&[WorkspaceLayout],mechanism:ResidentExecutionMechanisms,funding:&HostMetadataFunding,
-        observation:Option<WorkspaceAddressableObservationSource>,source_groups:Option<&WorkspaceLayout>,
-    )->Result<Self,Error>{
+        source: WorkspaceAddressableRegionView<'_>,
+        inputs: &[WorkspaceLayout],
+        members: usize,
+        parameters: &[WorkspaceLayout],
+        mechanism: ResidentExecutionMechanisms,
+        funding: &HostMetadataFunding,
+        observation: Option<WorkspaceAddressableObservationSource>,
+        source_groups: Option<&WorkspaceLayout>,
+    ) -> Result<Self, Error> {
+        Self::prepare_with_compact_host(
+            source,
+            inputs,
+            members,
+            parameters,
+            mechanism,
+            funding,
+            observation,
+            source_groups,
+            &mut |_| Ok(0),
+        )
+    }
+    pub(crate) fn prepare_with_compact_host<F>(
+        source: WorkspaceAddressableRegionView<'_>,
+        inputs: &[WorkspaceLayout],
+        members: usize,
+        parameters: &[WorkspaceLayout],
+        mechanism: ResidentExecutionMechanisms,
+        funding: &HostMetadataFunding,
+        observation: Option<WorkspaceAddressableObservationSource>,
+        source_groups: Option<&WorkspaceLayout>,
+        compact_host: &mut F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(&WorkspaceGroupedBank) -> Result<u64, Error>,
+    {
         let context = WorkspaceContext::new_with_metadata_funding(mechanism, funding.clone())?;
         context.charge_metadata(size_of::<(
             Self,
@@ -38,6 +72,7 @@ impl AddressableChildSource {
             GroupSelection<WorkspaceTensor>,
             Result<Self, Error>,
             [usize; 4],
+            &mut F,
         )>())?;
         source.validate()?;
         let invalid = || {
@@ -72,6 +107,7 @@ impl AddressableChildSource {
         let bank = source
             .kernel
             .compact(i32::try_from(members).map_err(|_| invalid())?, &context)?;
+        let compact_host_bytes = compact_host(&bank)?;
         let fields = parameters.len() / members;
         let mut values = context.metadata_vec(4)?;
         for layout in inputs {
@@ -110,17 +146,39 @@ impl AddressableChildSource {
         borrowed.extend(compact.iter());
         let selection =
             GroupSelection::new(values[1].clone(), values[2].clone(), values[3].clone());
-        let mut observed=observation.map(|descriptor|{
-            let retained=super::super::parallel::ExpertLocalObservationSource::from_addressable(descriptor)
-                .ok_or_else(invalid)?;
-            let mut observer=super::super::parallel::GroupedSourceObserver::new(retained,&values[0],&context)?;
-            let groups=source_groups.ok_or_else(invalid)?;
-            if groups.shape()!=[i32::try_from(source.chunks.rows).map_err(|_|invalid())?,routes]
-                || !matches!(groups.dtype(),WorkspaceDtype::Int32|WorkspaceDtype::Uint32){return Err(invalid());}
-            let groups=WorkspaceTensor::existing(context.layout(groups.shape(),groups.dtype())?
-                .with_representation(groups.representation()),&context)?;
-            observer.bind_source_groups(&groups)?;Ok::<_,Error>(observer)
-        }).transpose()?;
+        let mut observed = observation
+            .map(|descriptor| {
+                let retained =
+                    super::super::parallel::ExpertLocalObservationSource::from_addressable(
+                        descriptor,
+                    )
+                    .ok_or_else(invalid)?;
+                let mut observer = super::super::parallel::GroupedSourceObserver::new(
+                    retained, &values[0], &context,
+                )?;
+                let groups = source_groups.ok_or_else(invalid)?;
+                if groups.shape()
+                    != [
+                        i32::try_from(source.chunks.rows).map_err(|_| invalid())?,
+                        routes,
+                    ]
+                    || !matches!(
+                        groups.dtype(),
+                        WorkspaceDtype::Int32 | WorkspaceDtype::Uint32
+                    )
+                {
+                    return Err(invalid());
+                }
+                let groups = WorkspaceTensor::existing(
+                    context
+                        .layout(groups.shape(), groups.dtype())?
+                        .with_representation(groups.representation()),
+                    &context,
+                )?;
+                observer.bind_source_groups(&groups)?;
+                Ok::<_, Error>(observer)
+            })
+            .transpose()?;
         let (output, bias) = bank
             .trace_with_parameters(
                 &borrowed,
@@ -128,7 +186,9 @@ impl AddressableChildSource {
                 &selection,
                 source.tensor_partitions,
                 &context,
-                observed.as_mut().map(|v|v as &mut dyn eredu_nn::GroupedUnitObserver<WorkspaceTensor>),
+                observed
+                    .as_mut()
+                    .map(|v| v as &mut dyn eredu_nn::GroupedUnitObserver<WorkspaceTensor>),
             )?
             .into_parts();
         let mut outputs = context.metadata_vec(1 + usize::from(bias.is_some()))?;
@@ -142,14 +202,20 @@ impl AddressableChildSource {
                     .with_representation(value.layout().representation()),
             );
         }
-        let unit_representation=observed.as_ref().and_then(|v|v.representation());
-        let (report,capture)=match observed {
-            Some(observed)=>observed.finish_report(&outputs)?,
-            None=>(context.finish_report(&outputs)?,crate::backend::array_copy::CaptureNativePopulation::default()),
+        let unit_representation = observed.as_ref().and_then(|v| v.representation());
+        let (report, capture) = match observed {
+            Some(observed) => observed.finish_report(&outputs)?,
+            None => (
+                context.finish_report(&outputs)?,
+                crate::backend::array_copy::CaptureNativePopulation::default(),
+            ),
         };
         Ok(Self {
             report,
-            output_layouts,capture,unit_representation,
+            compact_host_bytes,
+            output_layouts,
+            capture,
+            unit_representation,
         })
     }
 }

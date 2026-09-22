@@ -5,33 +5,27 @@ use super::*;
 use crate::working_memory::InferenceRequest;
 
 fn sealed_plan(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     quote: &IncrementalInferenceQuote,
     capacity: u64,
-) -> Result<
-    (
-        WorkingMemoryReservation,
-        IncrementalInferenceQuote,
-    ),
-    PrefillPlanningError,
-> {
+) -> Result<(WorkingMemoryReservation, IncrementalInferenceQuote), PrefillPlanningError> {
     plan_prefill_incremental_with_capacity(
         &InferenceExecutionIdentity::default(),
         pool,
         &capabilities(),
         request(quote.geometry()),
         quote.geometry(),
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
         |_| Ok(quote.clone()),
     )
 }
 #[test]
 fn opt_in_prices_host_once_preserves_full_source_charges_and_exact_admission_boundary() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let source = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let source = pool.register_host_storage([(1u32, 64)]).unwrap();
     let escaped = source.clone();
     let original = replacement_quote(&pool, geometry(), 11).into_incremental();
-    let before = original.incremental_bytes();
+    let before = original.incremental_bytes().unwrap();
     let host = original.span_workspace().retention_peak_bytes().unwrap();
     assert_eq!(
         original.span_workspace().source_preparation_bytes(),
@@ -44,7 +38,7 @@ fn opt_in_prices_host_once_preserves_full_source_charges_and_exact_admission_bou
         vec![Some(11), Some(27), Some(91)]
     );
     let quote = original.clone().with_span_workspace().unwrap();
-    assert_eq!(quote.incremental_bytes(), before + host);
+    assert_eq!(quote.incremental_bytes().unwrap(), before + host);
     assert_eq!(
         quote
             .state()
@@ -66,7 +60,7 @@ fn opt_in_prices_host_once_preserves_full_source_charges_and_exact_admission_bou
         )
     );
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         64,
         "cold opt-in neither registers nor reserves"
     );
@@ -76,19 +70,25 @@ fn opt_in_prices_host_once_preserves_full_source_charges_and_exact_admission_bou
             WorkingMemoryError::IdentityMismatch
         ))
     ));
-    let exact = 64 + quote.incremental_bytes();
+    let exact = exact_capacity(&pool, &quote);
+    let rejected = sealed_plan(&pool, &quote, exact - 1).unwrap_err();
     assert!(
-        matches!(sealed_plan(&pool,&quote,exact-1),Err(PrefillPlanningError::Reservation(WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes})) if required_bytes==quote.incremental_bytes() && available_bytes+1==required_bytes)
+        matches!(Err::<(), _>(rejected),Err(PrefillPlanningError::Reservation(capacity_error)) if matches!(capacity_numbers(&capacity_error), Some((required_bytes, available_bytes)) if required_bytes==quote_reservation_bytes(&quote) && available_bytes+1==required_bytes))
     );
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     let (reservation, accepted) = sealed_plan(&pool, &quote, exact).unwrap();
     assert_eq!(reservation.admission().state, *quote.state());
-    assert_eq!(pool.used_bytes().unwrap(), exact);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        64 + quote.incremental_bytes().unwrap()
+    );
     let association = accepted.reserved_span_workspace(&reservation).unwrap();
-    assert!(association
-        .workspace()
-        .plan()
-        .same_plan(original.span_workspace().plan()));
+    assert!(
+        association
+            .workspace()
+            .plan()
+            .same_plan(original.span_workspace().plan())
+    );
     assert_eq!(
         association.span_bytes(&InferenceWorkspaceSpan::Decode {
             index: 1,
@@ -100,24 +100,25 @@ fn opt_in_prices_host_once_preserves_full_source_charges_and_exact_admission_bou
     assert!(original.reserved_span_workspace(&reservation).is_err());
     drop(association);
     drop((reservation, accepted, quote, original, source));
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn equal_independent_seals_and_unsealed_reservations_cannot_rebind_candidate_identity() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let source = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let source = pool.register_host_storage([(1u32, 64)]).unwrap();
     let original = replacement_quote(&pool, geometry(), 0).into_incremental();
     let a = original.clone().with_span_workspace().unwrap();
     let b = original.clone().with_span_workspace().unwrap();
     assert_eq!(a.state(), b.state());
     let (reservation, accepted) = sealed_plan(&pool, &a, 1_000_000).unwrap();
     assert!(b.reserved_span_workspace(&reservation).is_err());
-    assert!(a
-        .clone()
-        .reserved_span_workspace(&reservation.clone())
-        .is_ok());
+    assert!(
+        a.clone()
+            .reserved_span_workspace(&reservation.clone())
+            .is_ok()
+    );
     let request = InferenceRequest::from(&reservation);
     accepted
         .reserved_span_workspace(&reservation)
@@ -125,11 +126,13 @@ fn equal_independent_seals_and_unsealed_reservations_cannot_rebind_candidate_ide
         .validate_request(&request)
         .unwrap();
     let (other, _) = sealed_plan(&pool, &b, 1_000_000).unwrap();
-    assert!(accepted
-        .reserved_span_workspace(&reservation)
-        .unwrap()
-        .validate_request(&InferenceRequest::from(&other))
-        .is_err());
+    assert!(
+        accepted
+            .reserved_span_workspace(&reservation)
+            .unwrap()
+            .validate_request(&InferenceRequest::from(&other))
+            .is_err()
+    );
     let (raw, _) = sealed_plan(&pool, &original, 1_000_000).unwrap();
     assert!(a.reserved_span_workspace(&raw).is_err());
     drop((
@@ -143,14 +146,14 @@ fn equal_independent_seals_and_unsealed_reservations_cannot_rebind_candidate_ide
         original,
         source,
     ));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn mechanism_terms_are_original_full_contributions_and_unknown_or_overflow_never_becomes_a_plan() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let source = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let source = pool.register_host_storage([(1u32, 64)]).unwrap();
     let context = WorkspaceContext::new(Facts::default());
-    let root = WorkspaceExistingStorage::new(Some(64), &context);
+    let root = placed_root(Some(64), &context);
     let registered =
         RegisteredWorkspaceStorage::bind(&pool, &context, [(1u32, root.clone())]).unwrap();
     let report = replacement_report(&context, &root, geometry());
@@ -162,10 +165,12 @@ fn mechanism_terms_are_original_full_contributions_and_unknown_or_overflow_never
         ResidualInferenceQuote::compose(&report, state(geometry()), full.clone(), &registered)
             .unwrap()
             .into_incremental();
-    assert!(quote
-        .span_workspace()
-        .plan()
-        .same_plan(report.span_workspace_plan()));
+    assert!(
+        quote
+            .span_workspace()
+            .plan()
+            .same_plan(report.span_workspace_plan())
+    );
     assert_eq!(quote.span_workspace().source_preparation_bytes(), Some(30));
     assert_eq!(quote.span_workspace().materialization_bytes(), Some(19));
     assert_eq!(
@@ -187,13 +192,13 @@ fn mechanism_terms_are_original_full_contributions_and_unknown_or_overflow_never
         Err(CapabilityError::ArithmeticOverflow { .. })
     ));
     drop((quote, registered, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
-fn reservation_keeps_only_identity_after_diagnostics_retire_and_funding_conversion_preserves_binding(
-) {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let source = pool.register_storage([(1u32, 64)]).unwrap();
+fn reservation_keeps_only_identity_after_diagnostics_retire_and_funding_conversion_preserves_binding()
+ {
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let source = pool.register_host_storage([(1u32, 64)]).unwrap();
     let quote = replacement_quote(&pool, geometry(), 0)
         .into_incremental()
         .with_span_workspace()
@@ -212,7 +217,7 @@ fn reservation_keeps_only_identity_after_diagnostics_retire_and_funding_conversi
     assert_eq!(diagnostic.strong_owner_count(), 1);
     drop(diagnostic);
     drop(run);
-    assert_eq!(pool.used_bytes().unwrap(), 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 64);
     drop((reservation, source));
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

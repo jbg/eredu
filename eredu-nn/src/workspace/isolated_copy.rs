@@ -1,7 +1,7 @@
 //! Sealed metadata preparation for the fixed isolated-copy program.
 
 use super::*;
-use crate::{IsolatedCopyMechanism, isolated_copy};
+use crate::{isolated_copy, IsolatedCopyMechanism};
 mod finite;
 pub use finite::{
     WorkspaceCopyPreparationError, WorkspaceCopyPreparationLayout,
@@ -220,6 +220,11 @@ impl WorkspaceIsolatedCopyPlan {
     /// Immutable diagnostics produced by the private fixed-program trace.
     pub fn report(&self) -> &WorkspaceTraceReport {
         &self.report
+    }
+    /// Incremental placement requirements from the exact source-excluded graph.
+    /// Missing allocation provenance remains incomplete under unlimited limits.
+    pub fn incremental_requirements(&self) -> Option<&eredu_core::DomainMemoryRequirements> {
+        self.report.physical_domains.as_ref()?.residual.as_ref()
     }
 
     /// Root-aware demand excluding only the exact original source identities.

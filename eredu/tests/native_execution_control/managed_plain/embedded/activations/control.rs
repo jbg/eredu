@@ -1,12 +1,12 @@
 //! Same-request internal authority replay keeps captures spent and caches isolated.
 use super::*;
 use eredu_core::{
-    TensorObservationData,
     execution_control::SnapshotLimits,
     intervention::{
-        INTERVENTION_SCHEMA_VERSION, InterventionEvidence, InterventionOutcome, InterventionPlan,
+        InterventionEvidence, InterventionOutcome, InterventionPlan, INTERVENTION_SCHEMA_VERSION,
     },
     speculative::{SpeculativeActivationDiscovery, SpeculativeControlError},
+    TensorObservationData,
 };
 
 const CASE: &str = "managed_plain::embedded::activations::control::native_original_qwen_internal_capture_control_preserves_authority_and_spending";
@@ -38,7 +38,6 @@ fn capture_plan(discovery: &SpeculativeActivationDiscovery) -> SpeculativeActiva
                     captures: CAPTURES,
                     ..usage
                 },
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Skip,
             },
         },
@@ -299,7 +298,7 @@ fn run(mode: &str) -> serde_json::Value {
                     output_mode: eredu::api::PreparedChatOutputMode::Text,
                     skip_special_tokens: true,
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings: chat_settings(&chat, settings),
+                    settings: chat_settings(&chat, settings.clone()),
                     options,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),

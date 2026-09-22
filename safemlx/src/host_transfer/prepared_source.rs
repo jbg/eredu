@@ -3,7 +3,7 @@ use super::{
     HostTransferBuffer, HostTransferMetadataSnapshot, HostTransferPolicy, HostTransferStorageKind,
 };
 use crate::{
-    Dtype, PreparedInputArena, PreparedInputCause, PreparedInputRuntime, utils::runtime_lock,
+    utils::runtime_lock, Dtype, PreparedInputArena, PreparedInputCause, PreparedInputRuntime,
 };
 use safemlx_sys::{
     mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CPU as CPU_STORAGE,
@@ -62,6 +62,12 @@ impl<'a> PreparedHostTransferPlan<'a> {
         let storage_kind = match runtime.raw().storage_kind {
             CPU_STORAGE => HostTransferStorageKind::Cpu,
             METAL_STORAGE => HostTransferStorageKind::MetalShared,
+            safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_PINNED => {
+                HostTransferStorageKind::CudaPinned
+            }
+            safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED => {
+                HostTransferStorageKind::CudaManaged
+            }
             _ => return Err(PreparedInputCause::Unsupported),
         };
         Ok(Self {
@@ -174,7 +180,12 @@ impl<'a> PreparedHostTransferPlan<'a> {
             allocation: crate::AllocationInfo::from_native(
                 identity,
                 self.layout.backing_bytes,
-                true,
+                // Prepared host source runtimes certify CPU, Metal shared, or pinned host backing.
+                safemlx_sys::mlx_memory_placement {
+                    kind: 1,
+                    device: -1,
+                    device_count: 0,
+                },
             ),
             policy: HostTransferPolicy::Transfer,
             storage_kind: self.storage_kind,

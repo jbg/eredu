@@ -108,30 +108,17 @@ pub trait PreparedTextHostJournal {
 }
 impl PreparedTextHostJournal for () {
     type Copied = ();
-    fn storage_bytes(&self) -> Option<u64> { Some(0) }
-    fn preparation_bytes(&self) -> Option<usize> { Some(0) }
-    fn copy(self, _: u64, _: &eredu_core::HostPreparationAuthority) -> Result<(), TextHostCopyError> {
-        Ok(())
-    }
-}
-
-/// Compatibility callbacks keep their existing caller-owned estimate and scope.
-/// New concrete providers bind their actual borrowed source in their own plan.
-pub(super) struct CallbackHostCopy<F> {
-    bytes: Option<u64>,
-    copy: F,
-}
-impl<F> CallbackHostCopy<F> {
-    pub(super) fn new(bytes: Option<u64>, copy: F) -> Self {
-        Self { bytes, copy }
-    }
-}
-impl<T, F: FnOnce(u64) -> Result<T, String>> PreparedTextHostCopy for CallbackHostCopy<F> {
-    type Copied = T;
     fn storage_bytes(&self) -> Option<u64> {
-        self.bytes
+        Some(0)
     }
-    fn copy(self, retained_bytes: u64) -> Result<T, TextHostCopyError> {
-        (self.copy)(retained_bytes).map_err(TextHostCopyError::Message)
+    fn preparation_bytes(&self) -> Option<usize> {
+        Some(0)
+    }
+    fn copy(
+        self,
+        _: u64,
+        _: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), TextHostCopyError> {
+        Ok(())
     }
 }

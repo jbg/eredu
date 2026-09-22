@@ -177,7 +177,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     pub fn enable_snapshots(
         &mut self,
         limits: SnapshotLimits,
-        host_capacity: u64,
+        host_capacity: eredu_core::MemoryLimitDeclarations,
         native: WorkspaceCopyLimits,
     ) -> Result<(), ControlledGenerationError>
     where
@@ -193,7 +193,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
                 "snapshot limits are already configured",
             ));
         }
-        self.active_mut()?.snapshot_estimate(host_capacity)?;
+        self.active_mut()?
+            .snapshot_estimate(host_capacity.clone())?;
         let budget = SnapshotBudget::prepare(limits, &self.delivery.funding).map_err(|cause| {
             RecordConstructionError::retain(cause.into(), &self.delivery.funding)
         })?;
@@ -244,8 +245,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         );
         let (snapshot, mut journal) = session.snapshot_with_host(
             &budget,
-            self.snapshot_host_capacity,
-            self.native_copy_limits,
+            self.snapshot_host_capacity.clone(),
+            self.native_copy_limits.clone(),
             journal,
         )?;
         journal.metadata.retain_destination(
@@ -321,7 +322,7 @@ where
             })
         })()?;
         let cancellation = self.delivery.control.cancellation().clone();
-        let capacity = self.snapshot_host_capacity;
+        let capacity = self.snapshot_host_capacity.clone();
         let Some(copied) = self.active_mut()?.restore_with_host(
             &snapshot.snapshot,
             PreparedChatResumeSettings::default(),

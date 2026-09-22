@@ -57,7 +57,6 @@ fn capture_source_with_transform(transform: CaptureTransform) -> SharedCapturePl
             CaptureTransform::Histogram { edges } => edges.len().saturating_sub(1) as u64,
             _ => 0,
         },
-        physical_native_limit: false,
         conditions: vec![],
     };
     let mut plan = CapturePlan::none();
@@ -81,7 +80,6 @@ fn capture_source_with_transform(transform: CaptureTransform) -> SharedCapturePl
             host_bytes: u64::MAX,
             encoded_bytes: u64::MAX,
         },
-        physical_native_bytes: None,
         on_limit: CaptureLimitPolicy::Skip,
     };
     SharedCapturePlan::new(
@@ -118,10 +116,17 @@ fn host<'a>(source: &'a SharedCapturePlan, prediction: u64) -> SpeculativeCaptur
 fn numerical(source: &SharedCapturePlan, prediction: u64) -> SpeculativeNumericalRequirements {
     // The default zero-temperature worker is identity. This portable destination
     // fixture performs no native tensor, Graph, Record or Scope construction.
-    SpeculativeNumericalRequirements::new(program(prediction), Some(0), Some(0), Some(0), Some(0))
-        .unwrap()
-        .with_capture_destination(&host(source, prediction))
-        .unwrap()
+    SpeculativeNumericalRequirements::new(
+        program(prediction),
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(0),
+        std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+    )
+    .unwrap()
+    .with_capture_destination(&host(source, prediction))
+    .unwrap()
 }
 #[derive(Default)]
 struct HostBackend {
@@ -208,9 +213,15 @@ fn numerical_capture_replay_keeps_live_usage_and_escaped_shared_frame_custody() 
             .unwrap(),
     );
     let capacity = 1 << 24;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request = OriginalSpeculativeRequest::prepare(&pool, &execution, &plan, capacity).unwrap();
+    let request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &plan,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
     let mut cursor = plan.into_cursor();
     let role = request
         .reserve_role(
@@ -253,7 +264,7 @@ fn numerical_capture_replay_keeps_live_usage_and_escaped_shared_frame_custody() 
     );
     assert_eq!(backend.calls, 2);
     let foreign = SharedCapturePlan::new(source.admission().clone());
-    let charged = pool.used_bytes().unwrap();
+    let charged = pool.payload_used_bytes().unwrap();
     assert!(matches!(
         request
             .reserve_numerical(
@@ -264,7 +275,7 @@ fn numerical_capture_replay_keeps_live_usage_and_escaped_shared_frame_custody() 
             .cause(),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), charged);
+    assert_eq!(pool.payload_used_bytes().unwrap(), charged);
     // Exact-plan refusal consumes the accepted occurrence and retains its charge.
     let phase = request
         .reserve_numerical(
@@ -293,25 +304,25 @@ fn numerical_capture_replay_keeps_live_usage_and_escaped_shared_frame_custody() 
         request,
         source,
     ));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(escaped);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "shared frame alias still owns its original H"
     );
     drop(snapshot_alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn original_capture_source_copies_before_birth_and_shared_alias_retains_its_charge() {
     let caller = capture_source();
     let plan = PreparedCapturePlanCopy::inspect(caller.admission()).unwrap();
-    let required = WorkingMemoryPool::capture_source_required_bytes(&plan).unwrap();
-    let too_small = WorkingMemoryPool::new(required - 1, 0).unwrap();
+    let required = MemoryLedger::capture_source_required_bytes(&plan).unwrap();
+    let too_small = crate::working_memory::memory_fixture::host_ledger(required - 1, 0).unwrap();
     assert!(too_small.compile_capture_source(plan).is_err());
-    assert_eq!(too_small.used_bytes().unwrap(), 0);
-    let pool = WorkingMemoryPool::new(required, 0).unwrap();
+    assert_eq!(too_small.payload_used_bytes().unwrap(), 0);
+    let pool = crate::working_memory::memory_fixture::host_ledger(required, 0).unwrap();
     let source = pool
         .compile_capture_source(PreparedCapturePlanCopy::inspect(caller.admission()).unwrap())
         .unwrap();
@@ -326,13 +337,13 @@ fn original_capture_source_copies_before_birth_and_shared_alias_retains_its_char
         caller.admission().points()
     );
     assert!(source.validate_pool(&too_small).is_err());
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     let escaped = source.plan().clone();
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), required);
+    assert_eq!(pool.payload_used_bytes().unwrap(), required);
     assert_eq!(escaped.admission().plan().selections[0].id, "row");
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -357,12 +368,12 @@ fn numerical_capture_failure_evidence_preserves_abort_spending_and_escaped_custo
         plan.workspace_geometry(2, pass, NonZeroU64::new(1).unwrap())
             .unwrap(),
     );
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let request = OriginalSpeculativeRequest::prepare(
         &pool,
         &InferenceExecutionIdentity::default(),
         &plan,
-        1 << 24,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
     )
     .unwrap();
     let mut cursor = plan.into_cursor();
@@ -379,11 +390,9 @@ fn numerical_capture_failure_evidence_preserves_abort_spending_and_escaped_custo
         calls: 0,
         refuse: true,
     };
-    assert!(
-        invocation
-            .observe(&mut backend, &[0.5, -1.0, 2.0, 0.0])
-            .is_err()
-    );
+    assert!(invocation
+        .observe(&mut backend, &[0.5, -1.0, 2.0, 0.0])
+        .is_err());
     assert_eq!(backend.calls, 1);
     let frame = invocation.take_failed_evidence().unwrap().unwrap();
     assert_eq!(frame.as_ref().outcome, CaptureStepOutcome::Aborted);
@@ -391,9 +400,9 @@ fn numerical_capture_failure_evidence_preserves_abort_spending_and_escaped_custo
     assert!(invocation.take_failed_evidence().unwrap().is_none());
     request.close().unwrap();
     drop((invocation, budget, model, role, request, source));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(frame);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod readouts;

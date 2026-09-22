@@ -1,4 +1,4 @@
-//! Exact accepted request and existing native role retain canonical page pins.
+//! Exact accepted text or speculative role retains canonical page pins.
 use super::*;
 use crate::backend::{
     error::Error as NativeError,
@@ -12,6 +12,7 @@ use eredu_runtime::{
     prefill::{PrefillControlRole, PrefillSpanControlPhase},
     working_memory::{
         InferenceRequest, InferenceSpanWorkspacePlan, InferenceWorkspaceSpan,
+        OriginalHostSourceCustody, OriginalSpeculativePrefillSpan, OriginalSpeculativeRole,
         OriginalTextControlGuard, OriginalTextPrefillScopeSet, WorkingMemoryError,
     },
 };
@@ -35,7 +36,7 @@ impl RoleState {
         if self.failed || active.ordinal != ordinal || !active.observer.same_scope(observer) {
             return Err(CacheSourceError::Identity);
         }
-        Ok(binding.controls.clone().into())
+        Ok(binding.custody())
     }
     pub(super) fn new() -> Self {
         Self {
@@ -46,10 +47,21 @@ impl RoleState {
         }
     }
 }
-struct Binding {
-    request: InferenceRequest,
-    registration: OriginalOperationRegistration,
-    controls: OriginalTextControlGuard,
+enum Binding {
+    Text {
+        request: InferenceRequest,
+        registration: OriginalOperationRegistration,
+        controls: OriginalTextControlGuard,
+    },
+    Speculative(OriginalSpeculativeRole),
+}
+impl Binding {
+    fn custody(&self) -> OriginalHostSourceCustody {
+        match self {
+            Self::Text { controls, .. } => controls.clone().into(),
+            Self::Speculative(role) => role.budget_custody().into(),
+        }
+    }
 }
 pub(super) struct Active {
     pub(super) roots: crate::backend::submission_recovery::prefill::TransientRootsProjection,
@@ -79,11 +91,36 @@ impl ProjectedPagedSources {
             .validate_request(request)
             .map_err(NativeError::PrefillControl)?;
         controls
-            .validate_reservation(request.memory_reservation().ok_or_else(identity)?)
+            .validate_reservation(request.memory_reservation())
             .map_err(NativeError::PrefillControl)?;
         if request.geometry() != plan.geometry() || !self.catalogs_match(plan) {
             return Err(identity());
         }
+        self.bind(Binding::Text {
+            request: request.clone(),
+            registration,
+            controls,
+        })
+    }
+    /// The admitted invocation supplies its own account and exact source plan;
+    /// no text request or independently fitted capacity can substitute for it.
+    pub(crate) fn bind_speculative(
+        &self,
+        role: &OriginalSpeculativeRole,
+        plan: &InferenceSpanWorkspacePlan,
+    ) -> Result<(), NativeError> {
+        role.validate_plan(plan)
+            .map_err(NativeError::PrefillControl)?;
+        let custody: OriginalHostSourceCustody = role.budget_custody().into();
+        custody
+            .validate_account(None)
+            .map_err(NativeError::PrefillControl)?;
+        if !self.catalogs_match(plan) {
+            return Err(identity());
+        }
+        self.bind(Binding::Speculative(role.clone()))
+    }
+    fn bind(&self, binding: Binding) -> Result<(), NativeError> {
         {
             let state = self.inner.roles.try_borrow().map_err(|_| busy())?;
             if state.failed || state.binding.is_some() || state.active.is_some() {
@@ -110,11 +147,10 @@ impl ProjectedPagedSources {
             ));
         }
         let mut state = self.inner.roles.try_borrow_mut().map_err(|_| busy())?;
-        state.binding = Some(Binding {
-            request: request.clone(),
-            registration,
-            controls,
-        });
+        if state.failed || state.binding.is_some() || state.active.is_some() {
+            return Err(identity());
+        }
+        state.binding = Some(binding);
         Ok(())
     }
     fn install_catalogs(&self) -> Result<(), CacheSourceFailure> {
@@ -192,14 +228,19 @@ impl ProjectedPagedSources {
             if state.failed || state.active.is_some() {
                 return Err(identity());
             }
-            let binding = state.binding.as_ref().ok_or_else(identity)?;
-            binding
-                .request
+            let Some(Binding::Text {
+                request: bound_request,
+                registration,
+                controls,
+            }) = state.binding.as_ref()
+            else {
+                return Err(identity());
+            };
+            bound_request
                 .validate_same_request(request)
                 .map_err(NativeError::PrefillControl)?;
-            binding
-                .controls
-                .validate_reservation(request.memory_reservation().ok_or_else(identity)?)
+            controls
+                .validate_reservation(request.memory_reservation())
                 .map_err(NativeError::PrefillControl)?;
             let catalogs = self.inner.catalogs.try_borrow().map_err(|_| busy())?;
             let span = catalogs
@@ -213,9 +254,74 @@ impl ProjectedPagedSources {
             if !matches(span.span()) {
                 return Err(identity());
             }
-            (binding.registration.clone(), state.next)
+            (registration.clone(), state.next)
         };
         let observer = registration.authenticate_scope(request, scope, &roots)?;
+        self.activate(ordinal, observer, roots)
+    }
+    pub(crate) fn enter_speculative(
+        &self,
+        role: &OriginalSpeculativeRole,
+        span: Option<&OriginalSpeculativePrefillSpan>,
+        scope: &SubmissionScope,
+        roots: crate::backend::submission_recovery::prefill::TransientRootsProjection,
+    ) -> Result<PagedScopeRetention, NativeError> {
+        let custody: OriginalHostSourceCustody = role.budget_custody().into();
+        custody
+            .validate_account(None)
+            .map_err(NativeError::PrefillControl)?;
+        let ordinal = {
+            let state = self.inner.roles.try_borrow().map_err(|_| busy())?;
+            if state.failed || state.active.is_some() {
+                return Err(identity());
+            }
+            let Some(Binding::Speculative(bound)) = state.binding.as_ref() else {
+                return Err(identity());
+            };
+            if !bound.same_role(role) {
+                return Err(identity());
+            }
+            let catalogs = self.inner.catalogs.try_borrow().map_err(|_| busy())?;
+            let plan = &catalogs.as_ref().ok_or_else(identity)?.plan;
+            role.validate_plan(plan)
+                .map_err(NativeError::PrefillControl)?;
+            let record = plan
+                .generation_records()
+                .ok_or_else(identity)?
+                .nth(state.next)
+                .ok_or_else(identity)?;
+            match (role.invocation().execution_pass(), span) {
+                (eredu_runtime::ExpertPass::Prefill, Some(span)) => {
+                    span.validate_plan(plan)
+                        .map_err(NativeError::PrefillControl)?;
+                    if !span.role().same_role(role)
+                        || span.ordinal() != state.next
+                        || span.record().span() != record.span()
+                    {
+                        return Err(identity());
+                    }
+                }
+                (eredu_runtime::ExpertPass::Decode, None) => {
+                    // An independent decode invocation has one equation record,
+                    // represented by its exact input chunk rather than a text
+                    // generation Decode row. Its native bank is one-use too.
+                    if state.next != 0 || plan.records().len() != 1 {
+                        return Err(identity());
+                    }
+                }
+                _ => return Err(identity()),
+            }
+            state.next
+        };
+        let observer = roots.authenticate_source(scope, &custody)?;
+        self.activate(ordinal, observer, roots)
+    }
+    fn activate(
+        &self,
+        ordinal: usize,
+        observer: OriginalScopeObserver,
+        roots: crate::backend::submission_recovery::prefill::TransientRootsProjection,
+    ) -> Result<PagedScopeRetention, NativeError> {
         let mut state = self.inner.roles.try_borrow_mut().map_err(|_| busy())?;
         if state.failed || state.active.is_some() || state.next != ordinal {
             return Err(identity());
@@ -230,7 +336,7 @@ impl ProjectedPagedSources {
             ordinal,
         });
         drop(state);
-        // Only a weak equality lookup is installed; actual request/role/source
+        // Only a weak equality lookup is installed; actual role/source
         // custody remains in the accepted Recovery, never in thread storage.
         super::append_claim::publish_current(self);
         Ok(PagedScopeRetention {
@@ -362,6 +468,14 @@ pub(super) fn control_bytes(forwards: usize) -> Option<usize> {
         size_of::<(&ProjectedPagedSources, &InferenceRequest, &SubmissionScope)>(),
         size_of::<PrefillControlRole>(),
         size_of::<u64>(),
+        size_of::<(&ProjectedPagedSources, &OriginalSpeculativeRole,
+            Option<&OriginalSpeculativePrefillSpan>, &SubmissionScope)>(),
+        size_of::<(&ProjectedPagedSources, usize, OriginalScopeObserver,
+            crate::backend::submission_recovery::prefill::TransientRootsProjection)>(),
+        size_of::<OriginalHostSourceCustody>(),
+        size_of::<Option<&OriginalSpeculativePrefillSpan>>(),
+        size_of::<Result<(), WorkingMemoryError>>(),
+        crate::backend::submission_recovery::prefill::TransientRootsProjection::authenticate_source_control_bytes()?,
     ];
     let per_role = role_frames
         .into_iter()
@@ -374,6 +488,13 @@ pub(super) fn control_bytes(forwards: usize) -> Option<usize> {
         ),
         size_of::<Binding>(),
         size_of::<Option<Binding>>(),
+        size_of::<(&ProjectedPagedSources, Binding)>(),
+        size_of::<(
+            &ProjectedPagedSources,
+            &OriginalSpeculativeRole,
+            &InferenceSpanWorkspacePlan,
+        )>(),
+        size_of::<Result<(), WorkingMemoryError>>(),
         size_of::<Result<(), NativeError>>(),
         size_of::<Result<(), CacheSourceFailure>>(),
         WorkspaceContext::metadata_source_bytes::<CacheSourceFailure>()?,

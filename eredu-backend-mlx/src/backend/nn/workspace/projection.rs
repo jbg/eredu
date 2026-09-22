@@ -11,10 +11,12 @@ pub(crate) use owned::OwnedArrayProjection;
 mod paged_sources;
 mod roots;
 pub(crate) use paged_sources::{
-    OriginalPagedAppendClaim, OriginalPagedVisibleClaim, OriginalPagedAttentionBlock, OriginalPagedBlockSource,
-    OriginalPagedDiskWriteSource, OriginalPagedHostEviction, OriginalPagedHostReturn,
-    OriginalPagedDiscard, OriginalPagedScanClaim, OriginalPagedScanSource, PagedAppendInput, PagedHostStoreDeclaration,
-    PagedScanInput, PagedScopeRetention, ProjectedPagedSources,
+    OrdinaryPagedProgram, OrdinaryPagedWork, PreparedOrdinaryPagedScan, OrdinaryPagedAppend, OrdinaryPagedCause, OrdinaryPagedHostScan, PagedMutationCause,
+    OriginalPagedAppendClaim, OriginalPagedAttentionBlock, OriginalPagedBlockSource,
+    OriginalPagedDiscard, OriginalPagedDiskWriteSource, OriginalPagedHostEviction,
+    OriginalPagedHostReturn, OriginalPagedScanClaim, OriginalPagedScanSource,
+    OriginalPagedVisibleClaim, PagedAppendInput, PagedHostStoreDeclaration, PagedScanInput,
+    PagedScopeRetention, ProjectedPagedSources,
 };
 use preparation::projected_dtype;
 pub use preparation::{ProjectionSourceError, ProjectionSourceLayout};
@@ -449,7 +451,7 @@ pub fn project_existing_arrays<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safemlx::{Device, DeviceType, Stream, ops::indexing::TryIndexOp};
+    use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType, Stream};
 
     #[derive(Debug)]
     struct NoOperations;
@@ -475,8 +477,10 @@ mod tests {
         let column = projection.project(&view).unwrap();
         assert!(row.layout().representation().unwrap().row_contiguous());
         assert!(!column.layout().representation().unwrap().row_contiguous());
-        assert_eq!(row.layout().representation().unwrap().dtype(),
-            eredu_nn::workspace::WorkspaceFloatingType::Float32);
+        assert_eq!(
+            row.layout().representation().unwrap().dtype(),
+            eredu_nn::workspace::WorkspaceFloatingType::Float32
+        );
         assert_eq!(column.layout().shape(), &[3, 2]);
         let column_rep = column.layout().representation().unwrap();
         assert!(!column_rep.last_axis_contiguous());
@@ -488,7 +492,10 @@ mod tests {
         assert_eq!(context.report(&[row, column]).unwrap().operations.len(), 0);
 
         // Repeated extents cannot identify a permutation; actual strides do.
-        let cache = Array::from_slice(&(0..32).map(|n| n as f32).collect::<Vec<_>>(), &[1, 2, 2, 8]);
+        let cache = Array::from_slice(
+            &(0..32).map(|n| n as f32).collect::<Vec<_>>(),
+            &[1, 2, 2, 8],
+        );
         let permuted = cache.transpose_axes(&[0, 2, 1, 3], &stream).unwrap();
         let sparse = cache.try_index_device((.., .., 1.., ..), &stream).unwrap();
         permuted.evaluated().unwrap();
@@ -501,19 +508,42 @@ mod tests {
         let rep = retained.layout().representation().unwrap();
         assert!(!rep.row_contiguous());
         assert!(rep.last_axis_contiguous());
-        assert_eq!((0..4).map(|position| rep.dense_axis_at(4, position)).collect::<Vec<_>>(),
-            vec![Some(0), Some(2), Some(1), Some(3)]);
+        assert_eq!(
+            (0..4)
+                .map(|position| rep.dense_axis_at(4, position))
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(2), Some(1), Some(3)]
+        );
         let sparse_rep = sparse.layout().representation().unwrap();
         assert!(!sparse_rep.row_contiguous());
         assert!(sparse_rep.last_axis_contiguous());
-        assert_eq!(sparse_rep.dense_axis_at(4, 0), None, "strided slice is not dense");
-        assert_eq!((0..4).map(|axis| sparse_rep.element_stride_at(4, axis)).collect::<Vec<_>>(),
-            vec![Some(1), Some(16), Some(1), Some(1)]);
+        assert_eq!(
+            sparse_rep.dense_axis_at(4, 0),
+            None,
+            "strided slice is not dense"
+        );
+        assert_eq!(
+            (0..4)
+                .map(|axis| sparse_rep.element_stride_at(4, axis))
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(16), Some(1), Some(1)]
+        );
 
         let storage = projection.into_storage();
         assert!(storage.is_complete());
-        assert_eq!(storage.iter().len(), 1, "all views retain the original backing");
-        assert_eq!(context.report(&[root, retained, sparse]).unwrap().operations.len(), 0);
+        assert_eq!(
+            storage.iter().len(),
+            1,
+            "all views retain the original backing"
+        );
+        assert_eq!(
+            context
+                .report(&[root, retained, sparse])
+                .unwrap()
+                .operations
+                .len(),
+            0
+        );
 
         let root = Array::from_slice(&(0..12).map(|n| n as f32).collect::<Vec<_>>(), &[12]);
         for (strides, offset, expected) in [
@@ -521,15 +551,22 @@ mod tests {
             ([6, -2], 4, [None, None]),
             ([0, 1], 0, [None, None]),
         ] {
-            let view = root.as_strided(&[2, 3][..], &strides[..], offset, &stream).unwrap();
+            let view = root
+                .as_strided(&[2, 3][..], &strides[..], offset, &stream)
+                .unwrap();
             view.evaluated().unwrap();
             let context = WorkspaceContext::new(NoOperations);
             let mut projection = ExistingArrayProjection::new(&context);
             let value = projection.project(&view).unwrap();
             let representation = value.layout().representation().unwrap();
             assert!(!representation.row_contiguous());
-            assert_eq!([representation.element_stride_at(2, 0),
-                representation.element_stride_at(2, 1)], expected);
+            assert_eq!(
+                [
+                    representation.element_stride_at(2, 0),
+                    representation.element_stride_at(2, 1)
+                ],
+                expected
+            );
             assert_eq!(projection.into_storage().iter().len(), 1);
             assert!(context.report(&[value]).unwrap().operations.is_empty());
         }
@@ -559,7 +596,7 @@ mod tests {
         let borrowed =
             WorkspaceBorrowedStorage::new(&context, storage.iter().map(|(_, _, root)| root))
                 .unwrap();
-        assert_eq!(borrowed.total_bytes(), bytes);
+        assert_eq!(borrowed.total_bytes(), Some(bytes));
         assert!(borrowed.roots()[0].same_storage(portable));
         assert_eq!(
             storage
@@ -633,8 +670,8 @@ mod tests {
     #[ignore = "requires native CPU execution"]
     fn native_projection_witnesses_retire_without_retaining_backing_in_metadata() {
         use std::sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         };
         #[derive(Debug)]
         struct Retired(Arc<AtomicBool>);
@@ -672,7 +709,7 @@ mod tests {
         drop(storage);
         safemlx::reclaim_allocation_owners();
         assert!(retired.load(Ordering::SeqCst));
-        assert_eq!(borrowed.total_bytes(), info.bytes() as u64);
+        assert_eq!(borrowed.total_bytes(), Some(info.bytes() as u64));
         context.begin_state_span([&metadata]).unwrap();
         assert_eq!(
             context

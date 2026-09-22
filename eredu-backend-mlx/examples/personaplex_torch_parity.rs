@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     let mut actual = ObservationSet::new();
     actual.insert(
         "generation.sampled",
-        ObservationValue::Tensor(trace.combined_sampled_tokens(1)?),
+        ObservationValue::Tensor((trace.combined_sampled_tokens(1)?).into()),
     )?;
     actual.insert(
         "generation.output_audio",
@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     actual.insert(
         "generation.emitted_steps",
-        ObservationValue::Tensor(trace.emitted_frame_indices()?),
+        ObservationValue::Tensor((trace.emitted_frame_indices()?).into()),
     )?;
     let mut reference = ObservationSet::new();
     insert_tokens(
@@ -142,7 +142,7 @@ fn insert_tokens(
     let value = MlxTensor::from_array(value.clone());
     observations.insert(
         path,
-        ObservationValue::Tensor(observe_i32_tensor(&value, stream)?),
+        ObservationValue::Tensor((observe_i32_tensor(&value, stream)?).into()),
     )?;
     Ok(())
 }

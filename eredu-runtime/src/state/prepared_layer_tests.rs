@@ -3,8 +3,8 @@ use eredu_nn::workspace::WorkspaceBackend;
 use std::{
     convert::Infallible,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -39,7 +39,7 @@ fn prepared_layers_move_actual_buffer_and_retire_payload_before_metadata_charge(
     let pointer = table.slots().as_ptr();
     let token = table.metadata().clone();
     token
-        .try_attach(&eredu_core::SharedStorageDomain::default(), || {
+        .try_attach(&eredu_core::SharedStorageAccountingId::default(), || {
             Ok::<_, Infallible>(Box::new(Charge(charges.clone())))
         })
         .unwrap();

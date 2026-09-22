@@ -125,6 +125,28 @@ impl ParameterOwnerCounts {
         Ok(())
     }
 
+    pub(crate) fn observe_replacements(
+        &mut self,
+        role: ParameterOwnerRole,
+        module: Option<usize>,
+        values: &eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
+        guard: &mut RuntimeCallGuard,
+    ) -> Result<(), ParameterOwnerSourceError> {
+        let mut counter = ParameterSourceCounter::new(guard);
+        counter.counts = self.roles[role.index()].parameters;
+        for value in values.values() {
+            counter.observe_auxiliary(value).map_err(|source| {
+                ParameterOwnerSourceError::Observation {
+                    role,
+                    module,
+                    source,
+                }
+            })?;
+        }
+        self.roles[role.index()].parameters = counter.counts;
+        Ok(())
+    }
+
     pub(crate) fn prediction_module(
         &mut self,
         id: bool,

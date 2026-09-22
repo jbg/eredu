@@ -1,7 +1,7 @@
 //! Consumed finite metadata components of the shared saved-copy preparation.
 use super::*;
 use crate::backend::nn::workspace::{
-    MlxMetalWorkspaceMechanisms, MlxWorkspaceFactError, ProjectedNativeStorage,
+    MlxMetalWorkspaceMechanisms, MlxWorkspacePreparationError, ProjectedNativeStorage,
     ProjectionSourceLayout,
 };
 use eredu_core::{BackendFailure, HostPreparationAuthority};
@@ -12,7 +12,7 @@ use eredu_nn::workspace::{
 use eredu_runtime::working_memory::RegisteredWorkspaceStorageLayout;
 use std::mem::{size_of, size_of_val};
 
-type CopyError = WorkspaceCopyPreparationError<MlxWorkspaceFactError>;
+type CopyError = WorkspaceCopyPreparationError<MlxWorkspacePreparationError>;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum FinitePreparationCause {
@@ -40,7 +40,7 @@ pub(super) struct SnapshotFinitePreparation<'a> {
     projection: preparation::SnapshotProjectionPlan<'a>,
     registration: RegisteredWorkspaceStorageLayout<StorageIdentity>,
     copy: WorkspaceCopyPreparationLayout,
-    pool: &'a eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &'a eredu_runtime::working_memory::MemoryLedger,
     mechanisms: MlxMetalWorkspaceMechanisms,
     bytes: usize,
     copy_requirements: original::CopyRequirements,
@@ -75,7 +75,7 @@ impl<'a> SnapshotFinitePreparation<'a> {
         decoder: &'a PreparedResidentDecoderCopy<'a>,
         key: Option<&'a Array>,
         pending: Option<&'a Array>,
-        pool: &'a eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &'a eredu_runtime::working_memory::MemoryLedger,
         mechanisms: MlxMetalWorkspaceMechanisms,
         backend: &MlxBackend<'_>,
     ) -> Result<Self, FinitePreparationCause> {
@@ -115,7 +115,7 @@ impl<'a> SnapshotFinitePreparation<'a> {
         // Aliased operands remain separate destination requests. Distinct roots
         // can only reduce this bound; no source identity is inferred from count.
         let copy = builder.finish(projection.operand_count())?;
-        if !pool.same_domain(backend.memory_pool()) {
+        if !pool.same_ledger(backend.memory_ledger()) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
         let copy_requirements = original::CopyRequirements::inspect(
@@ -126,6 +126,27 @@ impl<'a> SnapshotFinitePreparation<'a> {
             projection.operand_count(),
         )?;
         let parts = [
+            usize::try_from(
+                eredu_core::DomainMemoryRequirements::construction_backing_bytes(
+                    pool.topology(),
+                    0,
+                )
+                .map_err(WorkingMemoryError::from)?,
+            )
+            .map_err(|_| FinitePreparationCause::Overflow)?
+            .checked_mul(2)
+            .ok_or(FinitePreparationCause::Overflow)?,
+            size_of::<eredu_core::DomainMemoryRequirements>()
+                .checked_mul(2)
+                .ok_or(FinitePreparationCause::Overflow)?,
+            std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+                .extend(std::alloc::Layout::new::<
+                    eredu_core::DomainMemoryRequirements,
+                >())
+                .map_err(|_| FinitePreparationCause::Overflow)?
+                .0
+                .pad_to_align()
+                .size(),
             storage.known_control_bytes(),
             host_layout_controls.ok_or(FinitePreparationCause::Overflow)?,
             projection.requested_bytes(),
@@ -153,7 +174,7 @@ impl<'a> SnapshotFinitePreparation<'a> {
             size_of::<WorkspaceIsolatedCopyPreparation<'_, MlxMetalWorkspaceMechanisms>>(),
             size_of::<MlxMetalWorkspaceMechanisms>(),
             size_of::<(
-                &mut WorkspaceCopyPreparationLayoutBuilder<MlxWorkspaceFactError>,
+                &mut WorkspaceCopyPreparationLayoutBuilder<MlxWorkspacePreparationError>,
                 &MlxMetalWorkspaceMechanisms,
             )>(),
             size_of::<(
@@ -204,10 +225,9 @@ impl<'a> SnapshotFinitePreparation<'a> {
                 .construct(
                     self.pool,
                     &projected.context,
-                    projected
-                        .native
-                        .iter()
-                        .map(|(id, _, root)| (StorageIdentity::Native(id), root.clone())),
+                    projected.native.iter().map(|(id, _, root)| {
+                        crate::backend::nn::workspace::registered_storage_row(id, root)
+                    }),
                 )
                 .map_err(memory)?;
             let program = WorkspaceIsolatedCopyPlan::prepare_finite_with_layout(

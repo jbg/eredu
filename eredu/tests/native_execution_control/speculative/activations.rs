@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::{TensorObservationData, component::ComponentActivation, intervention::*};
+use eredu_core::{component::ComponentActivation, intervention::*, TensorObservationData};
 
 fn public_internal_activations(device: LocalDevice, pooling: bool) {
     public_internal_activations_profile(device, pooling, false);
@@ -75,7 +75,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             output_mode: eredu::api::PreparedChatOutputMode::Text,
             skip_special_tokens: true,
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: chat_settings(&chat, settings),
+            settings: chat_settings(&chat, settings.clone()),
             options: generation.clone(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -115,7 +115,6 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                         limits: CaptureLimits {
                             per_step,
                             cumulative: per_step.checked_mul(8).unwrap(),
-                            physical_native_bytes: None,
                             on_limit: CaptureLimitPolicy::Fail,
                         },
                     },
@@ -193,11 +192,9 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                 )
                 .unwrap();
             assert_eq!(output.token_ids(), baseline.token_ids());
-            assert!(
-                continuous
-                    .iter()
-                    .any(|r| r.phase == SpeculativeActivationPhase::Verification)
-            );
+            assert!(continuous
+                .iter()
+                .any(|r| r.phase == SpeculativeActivationPhase::Verification));
             assert_eq!(
                 continuous[0]
                     .captures
@@ -208,11 +205,9 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                 3
             );
             if fused {
-                assert!(
-                    continuous
-                        .iter()
-                        .any(|record| record.phase == SpeculativeActivationPhase::FusedProposal)
-                );
+                assert!(continuous
+                    .iter()
+                    .any(|record| record.phase == SpeculativeActivationPhase::FusedProposal));
                 assert!(continuous
                     .iter()
                     .any(|record| record.phase == SpeculativeActivationPhase::PredictionPrefill));
@@ -256,11 +251,9 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                         ..Default::default()
                     },
                     |session| {
-                        assert!(
-                            session
-                                .readmit_activation_interventions(stale.clone())
-                                .is_err()
-                        );
+                        assert!(session
+                            .readmit_activation_interventions(stale.clone())
+                            .is_err());
                         controlled.extend(session.step()?.unwrap().activations.iter().cloned());
                         assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                         let saved = session.snapshot()?;
@@ -322,13 +315,11 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                                     == Some(alternate.identity()))
                         );
                         if mask {
-                            assert!(
-                                child_records.iter().all(|r| r
-                                    .captures
-                                    .as_step()
-                                    .interventions
-                                    .is_empty())
-                            );
+                            assert!(child_records.iter().all(|r| r
+                                .captures
+                                .as_step()
+                                .interventions
+                                .is_empty()));
                             for record in &child_records {
                                 let payload = |path: &str| {
                                     record
@@ -401,9 +392,12 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                         assert_eq!(session.token_ids(), expected_tokens);
                         session.exchange(&right)?;
                         while let Some(step) = session.step()? {
-                            assert!(step.activations.iter().all(
-                                |r| r.admission_identity.as_deref() == Some(identity.as_str())
-                            ));
+                            assert!(step
+                                .activations
+                                .iter()
+                                .all(
+                                    |r| r.admission_identity.as_deref() == Some(identity.as_str())
+                                ));
                         }
                         assert_eq!(session.token_ids(), expected_tokens);
                         session.exchange(&right)?;

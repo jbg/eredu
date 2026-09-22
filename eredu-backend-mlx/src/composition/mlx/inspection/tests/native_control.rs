@@ -1,37 +1,54 @@
 use super::*;
-use eredu_core::{
-    execution_control::{
-        ControlSupport, NativeTextStateBackend, SnapshotLimits, SnapshotResourceKind,
-    },
-    Completion, ModelRuntime, TextGenerationBackend,
-};
-use eredu_runtime::execution_control::{SnapshotBudget, SnapshotReservation};
-use safemlx::{Array, Stream};
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod family_residency;
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod paired_copy;
+use eredu_core::{ModelRuntime, TextGenerationBackend};
 
 type Backend = crate::backend::MlxBackend<'static>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct SnapshotController {
-    history: Vec<u32>,
+    history: [u32; 20],
+    committed: usize,
 }
 impl eredu_runtime::execution_control::SnapshotTokenController for SnapshotController {
     fn snapshot_storage_bytes(&self) -> Option<u64> {
-        (std::mem::size_of::<Self>() as u64).checked_add(4 * self.history.len() as u64)
+        Some(std::mem::size_of::<Self>() as u64)
     }
     fn fork_snapshot(&self) -> Result<Self, String> {
         Ok(self.clone())
     }
+    fn original_snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_storage_bytes()
+    }
+    fn fork_original_snapshot(&self) -> Option<Self> {
+        Some(self.clone())
+    }
 }
 impl eredu_core::TokenFilterController for SnapshotController {
     type Error = std::convert::Infallible;
+    fn inference_workspace_is_run_owned(&self) -> bool {
+        true
+    }
+    fn inference_workspace(&self, _: u64) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+        Some(eredu_core::TextControllerWorkspace {
+            filter: eredu_core::TextFilterWorkspace::OptionalMask {
+                max_mask_positions: 64,
+                mask_capacity_bytes: 64,
+            },
+            additional_host_bytes: 0,
+        })
+    }
     fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
         // A changing canonical allow mask makes lost controller state observable.
         let mut allowed = vec![true; 64];
-        allowed[self.history.len() % 64] = false;
+        allowed[self.committed % 64] = false;
         Ok(eredu_core::TokenFilter::allowed(allowed).unwrap())
     }
     fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
-        self.history.push(token);
+        self.history[self.committed] = token;
+        self.committed += 1;
         Ok(())
     }
     fn is_complete(&mut self) -> Result<bool, Self::Error> {
@@ -95,19 +112,28 @@ fn fixture_value(key: &str, index: usize) -> f32 {
 }
 
 fn sampled_conformance(root: &Path, routed: bool) {
+    if !crate::tests::support::native_process::enter("prepared-native-continuation") {
+        return;
+    }
+    sampled_conformance_using(routed, || load(root), |_| {});
+}
+
+fn sampled_conformance_using(
+    routed: bool,
+    load: impl Fn() -> ModelRuntime<Backend>,
+    inspect: impl Fn(&ModelRuntime<Backend>),
+) {
     use eredu_core::{
         capture::*, intervention::*, GenerationConfigOverrides, TextGenerationConfig,
-        TextGenerationDriver,
     };
     use eredu_evaluation::execution_control::{
         continuation_conformance, forced_choice_conformance, sampling_override_conformance,
         ContinuationFixtureLimits,
     };
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for adaptive in [false, true] {
         // Ordinary, capture-only, intervention-only and combined shared owners.
         for mode in 0..4 {
-            let mut runtime = load(root, &stream);
+            let mut runtime = load();
             let discovery = Backend::capture_discovery(&runtime).unwrap();
             let intervention_discovery = Backend::intervention_discovery(&runtime).unwrap();
             let usage = CaptureUsage {
@@ -137,7 +163,6 @@ fn sampled_conformance(root: &Path, routed: bool) {
                 limits: CaptureLimits {
                     per_step: usage,
                     cumulative: usage,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 },
             }
@@ -169,11 +194,33 @@ fn sampled_conformance(root: &Path, routed: bool) {
                 vec![]
             };
             if routed && mode & 2 != 0 {
-                let point = intervention_discovery
+                let (point, action) = match intervention_discovery
                     .points
                     .iter()
                     .find(|p| p.routing.is_some())
-                    .expect("fixture must expose real routing");
+                {
+                    Some(point) => (
+                        point,
+                        InterventionAction::ForceExperts {
+                            shape: [1, 1],
+                            expert_ids: vec![1],
+                        },
+                    ),
+                    None => {
+                        let point = intervention_discovery
+                            .points
+                            .iter()
+                            .find(|p| p.routed_units.is_some())
+                            .expect("routed fixture must expose an actual expert intervention");
+                        (
+                            point,
+                            InterventionAction::Scale {
+                                dtype: InterventionDtype::Float32,
+                                factor: 0.7,
+                            },
+                        )
+                    }
+                };
                 operations.push(InterventionOperation {
                     id: "future-route".into(),
                     target: point.path.clone(),
@@ -184,11 +231,14 @@ fn sampled_conformance(root: &Path, routed: bool) {
                         ..Default::default()
                     },
                     slices: vec![],
-                    action: InterventionAction::ForceExperts {
-                        shape: [1, 1],
-                        expert_ids: vec![1],
+                    action,
+                    evidence: if point.routed_units.is_some() {
+                        // Sparse unit evidence belongs to an attributed RoutedUnits
+                        // capture; this intervention retains its application outcome.
+                        InterventionEvidence::None
+                    } else {
+                        InterventionEvidence::Preview { max_elements: 2 }
                     },
-                    evidence: InterventionEvidence::Preview { max_elements: 2 },
                 });
             }
             let intervention = InterventionPlan {
@@ -220,22 +270,57 @@ fn sampled_conformance(root: &Path, routed: bool) {
             } else {
                 config
             };
-            let prompt = Backend::prepare_text_prompt(runtime.backend(), vec![1, 2]).unwrap();
-            let mut driver = TextGenerationDriver::new(&mut runtime);
-            let mut state = driver
-                .start(
-                    prompt,
-                    config,
-                    eredu_runtime::execution_control::TokenChoiceController::new(
-                        SnapshotController::default(),
-                        eredu_runtime::TokenDomain::new(64),
-                    ),
-                )
+            let pool = runtime.backend().memory_ledger().clone();
+            let options = eredu_core::TextPreparationOptions {
+                capture: Some(SharedCapturePlan::new(capture)),
+                interventions: Some(
+                    pool.compile_intervention_source(
+                        PreparedInterventionPlanCopy::inspect(&intervention).unwrap(),
+                    )
+                    .unwrap()
+                    .plan()
+                    .clone(),
+                ),
+            };
+            let (controller, semantic) = crate::tests::support::plain_controller::new(
+                &pool,
+                &runtime.session().fixture_execution_identity(),
+                20,
+            );
+            let consumer = eredu_core::GenerationSequenceConsumerLayout::for_driver_types::<
+                crate::tests::support::original_snapshot::NativeSnapshotProvider,
+                crate::backend::error::Error,
+                crate::backend::error::Error,
+            >()
+            .unwrap();
+            let mut state = eredu_core::ControlledTextGeneration::from_token_ids_with_sequence(
+                &mut runtime,
+                eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
+                config.clone(),
+                eredu_runtime::execution_control::TokenChoiceController::new(
+                    SnapshotController::default(),
+                    eredu_runtime::TokenDomain::new(64),
+                ),
+                Some(eredu_core::TextPreparationOptions {
+                    capture: options.capture.clone(),
+                    interventions: options.interventions.clone(),
+                }),
+                eredu_core::GenerationSequenceRequest::new(20, &[]).with_consumer(&consumer),
+            )
+            .unwrap_or_else(|cause| {
+                panic!("canonical snapshot startup mode={mode} config={config:?}: {cause:?}")
+            });
+            let sequence = state
+                .take_prepared_sequence()
+                .unwrap()
+                .prepare_storage()
                 .unwrap();
-            driver
-                .enable_interventions(&mut state, capture, intervention)
-                .unwrap();
-            let mut state = eredu_runtime::execution_control::ManagedTextContinuation::root(state);
+            let mut provider =
+                crate::tests::support::original_snapshot::NativeSnapshotProvider::new(
+                    sequence,
+                    config.clone(),
+                    pool.clone(),
+                );
             let limits = ContinuationFixtureLimits {
                 host_bytes: 4096,
                 // The fixture stays within its current 256-token KV allocation;
@@ -245,7 +330,6 @@ fn sampled_conformance(root: &Path, routed: bool) {
                 capture: Some(CaptureLimits {
                     per_step: usage,
                     cumulative: usage,
-                    physical_native_bytes: None,
                     on_limit: CaptureLimitPolicy::Fail,
                 }),
             };
@@ -255,165 +339,63 @@ fn sampled_conformance(root: &Path, routed: bool) {
                     crate::tests::support::path_instrumentation::session_reset_attempts(),
                 )
             };
-            forced_choice_conformance(&mut driver, &mut state, &limits, 64, probe);
-            sampling_override_conformance(&mut driver, &mut state, &limits, probe);
-            continuation_conformance(&mut driver, state, limits, probe);
+            sampling_override_conformance(&mut state, &mut provider, &limits, probe);
+            let retirement = continuation_conformance(
+                state,
+                provider,
+                ContinuationFixtureLimits {
+                    host_bytes: limits.host_bytes,
+                    growth_bytes: limits.growth_bytes,
+                    max_predictions: limits.max_predictions,
+                    capture: limits.capture.clone(),
+                },
+                probe,
+            );
+            runtime.reset().unwrap_or_else(|cause| {
+                panic!(
+                    "settled continuation reset: {cause:?}; {:?}",
+                    pool.snapshot().unwrap()
+                )
+            });
+            retirement.finish();
+            let consumer = eredu_core::GenerationSequenceConsumerLayout::for_driver_types::<
+                crate::tests::support::original_snapshot::NativeSemanticSnapshotProvider,
+                crate::backend::error::Error,
+                crate::backend::error::Error,
+            >()
+            .unwrap();
+            let mut forced = eredu_core::ControlledTextGeneration::from_token_ids_with_sequence(
+                &mut runtime,
+                eredu_core::TokenIdsInputPlan::new(&[1, 2]).unwrap(),
+                config.clone(),
+                eredu_runtime::execution_control::TokenChoiceController::new(
+                    controller,
+                    eredu_runtime::TokenDomain::new(64),
+                ),
+                Some(options),
+                eredu_core::GenerationSequenceRequest::new(20, &[])
+                    .with_consumer(&consumer)
+                    .with_semantic_state(&semantic),
+            )
+            .unwrap();
+            let sequence = forced
+                .take_prepared_sequence()
+                .unwrap()
+                .prepare_storage()
+                .unwrap();
+            let mut provider =
+                crate::tests::support::original_snapshot::NativeSemanticSnapshotProvider::new(
+                    sequence, semantic, config, pool,
+                );
+            forced_choice_conformance(&mut forced, &mut provider, &limits, 64, probe);
+            drop((forced, provider));
+            inspect(&runtime);
         }
     }
 }
 
-struct SavedState {
-    state: crate::native::MlxNativeTextState,
-    _reservation: SnapshotReservation,
-}
-
-fn capture(runtime: &mut ModelRuntime<Backend>, budget: &SnapshotBudget) -> SavedState {
-    let estimate = Backend::estimate_native_text_state(runtime, None).unwrap();
-    let reservation = budget
-        .reserve(SnapshotResourceKind::Snapshot, estimate)
-        .unwrap();
-    SavedState {
-        state: Backend::capture_native_text_state(runtime).unwrap(),
-        _reservation: reservation,
-    }
-}
-
-fn copy(
-    runtime: &mut ModelRuntime<Backend>,
-    budget: &SnapshotBudget,
-    saved: &SavedState,
-) -> SavedState {
-    let estimate = Backend::estimate_native_text_state(runtime, Some(&saved.state)).unwrap();
-    let reservation = budget
-        .reserve(SnapshotResourceKind::Branch, estimate)
-        .unwrap();
-    SavedState {
-        state: Backend::copy_native_text_state(runtime, &saved.state).unwrap(),
-        _reservation: reservation,
-    }
-}
-
-fn decode(runtime: &mut ModelRuntime<Backend>, token: u32) -> Vec<f32> {
-    let submission = runtime
-        .decode(Array::from_slice(&[token], &[1, 1]))
-        .unwrap();
-    submission.completion.wait().unwrap();
-    submission
-        .output
-        .into_logits()
-        .unwrap()
-        .into_array()
-        .evaluated()
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec()
-}
-
-fn load(root: &Path, stream: &Stream) -> ModelRuntime<Backend> {
-    let backend = crate::native::backend(stream, stream);
+fn load(root: &Path) -> ModelRuntime<Backend> {
+    let backend = prepared_backend();
     let model = eredu_core::load_model(&backend, root, MlxLoadRequest::default()).unwrap();
     ModelRuntime::from_prepared(backend, model).unwrap()
-}
-
-#[test]
-fn native_control_loaded_dense_restores_and_exchanges_without_replay() {
-    let root = tempfile::tempdir().unwrap();
-    write_safetensors_fixture_with_values(root.path(), |key, index| {
-        if key.contains("norm") {
-            return 1.0;
-        }
-        let salt = key.bytes().fold(17u32, |n, byte| {
-            n.wrapping_mul(31).wrapping_add(u32::from(byte))
-        });
-        let value = salt
-            .wrapping_add(index as u32)
-            .wrapping_mul(1664525)
-            .wrapping_add(1013904223);
-        ((value >> 8) as f32 / 16777216.0 - 0.5) * 0.3
-    });
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let mut runtime = load(root.path(), &stream);
-    let mut foreign = load(root.path(), &stream);
-    let budget = SnapshotBudget::new(SnapshotLimits {
-        max_snapshots: 4,
-        max_branches: 4,
-        retained_bytes: 32_000_000,
-        cumulative_copy_bytes: 128_000_000,
-    });
-    assert_eq!(
-        Backend::native_text_state_support(&runtime),
-        ControlSupport::Supported
-    );
-    let initial = capture(&mut runtime, &budget);
-    let prompt = Backend::prepare_text_prompt(runtime.backend(), vec![1, 2]).unwrap();
-    let submission = runtime.prefill(prompt).unwrap();
-    // A returned host handle is not completion evidence. Rejection is read-only.
-    assert!(Backend::capture_native_text_state(&mut runtime).is_err());
-    submission.completion.wait().unwrap();
-    let boundary = capture(&mut runtime, &budget);
-
-    let before = crate::tests::support::path_instrumentation::snapshot();
-    let resets = crate::tests::support::path_instrumentation::session_reset_attempts();
-    let mut sibling = copy(&mut runtime, &budget, &boundary);
-    let mut reusable = copy(&mut runtime, &budget, &boundary);
-    assert_eq!(
-        crate::tests::support::path_instrumentation::snapshot(),
-        before
-    );
-    assert!(Backend::exchange_native_text_state(&mut foreign, &mut sibling.state).is_err());
-    assert!(Backend::validate_native_text_state(&foreign, &boundary.state).is_err());
-    // An incompatible-state error does not poison either correctly paired run.
-    let foreign_prompt = Backend::prepare_text_prompt(foreign.backend(), vec![5, 6]).unwrap();
-    foreign
-        .prefill(foreign_prompt)
-        .unwrap()
-        .completion
-        .wait()
-        .unwrap();
-
-    let baseline = [3, 4, 5].map(|token| decode(&mut runtime, token));
-    let before_switch = crate::tests::support::path_instrumentation::snapshot();
-    Backend::exchange_native_text_state(&mut runtime, &mut sibling.state).unwrap();
-    assert_eq!(
-        crate::tests::support::path_instrumentation::snapshot(),
-        before_switch
-    );
-    assert_eq!(decode(&mut runtime, 3), baseline[0]);
-    // Interleave the advanced parent and child. Each slot carries cache positions.
-    Backend::exchange_native_text_state(&mut runtime, &mut sibling.state).unwrap();
-    let parent_next = decode(&mut runtime, 6);
-    Backend::exchange_native_text_state(&mut runtime, &mut sibling.state).unwrap();
-    assert_eq!(decode(&mut runtime, 4), baseline[1]);
-    assert_eq!(decode(&mut runtime, 5), baseline[2]);
-    assert_eq!(decode(&mut runtime, 6), parent_next);
-
-    Backend::exchange_native_text_state(&mut runtime, &mut reusable.state).unwrap();
-    let changed = decode(&mut runtime, 19);
-    assert_ne!(
-        changed, baseline[0],
-        "fixture must distinguish alternative model inputs"
-    );
-    let mut again = copy(&mut runtime, &budget, &boundary);
-    Backend::exchange_native_text_state(&mut runtime, &mut again.state).unwrap();
-    assert_eq!(decode(&mut runtime, 3), baseline[0]);
-    assert_eq!(
-        crate::tests::support::path_instrumentation::session_reset_attempts(),
-        resets
-    );
-    let after = crate::tests::support::path_instrumentation::snapshot();
-    assert_eq!(after.materializations, before.materializations);
-    assert_eq!(after.payload_opens, before.payload_opens);
-    assert_eq!(
-        after.architecture_constructions,
-        before.architecture_constructions
-    );
-    // Exactly the explicit foreign prefill and ten decode submissions above.
-    assert_eq!(after.forwards - before.forwards, 11);
-
-    drop((sibling, reusable, again));
-    let mut fresh = copy(&mut runtime, &budget, &initial);
-    Backend::exchange_native_text_state(&mut runtime, &mut fresh.state).unwrap();
-    let prompt = Backend::prepare_text_prompt(runtime.backend(), vec![1, 2]).unwrap();
-    runtime.prefill(prompt).unwrap().completion.wait().unwrap();
-    assert_eq!(decode(&mut runtime, 3), baseline[0]);
 }

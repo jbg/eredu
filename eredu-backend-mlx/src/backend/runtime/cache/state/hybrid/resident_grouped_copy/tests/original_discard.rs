@@ -1,16 +1,15 @@
 //! A real completed leaf followed by a host refusal must not quarantine Q.
 use super::*;
 use crate::backend::{
-    MlxAcceleratorFamily, MlxBackend, MlxDeviceIdentity,
     managed_memory::gpu_stream::PreparedExecutionStreams,
     runtime::cache::state::resident_copy::{
-        OriginalResidentState, PreparedResidentDecoderCopy, copy_original_resident_state,
+        copy_original_resident_state, OriginalResidentState, PreparedResidentDecoderCopy,
     },
+    MlxAcceleratorFamily, MlxBackend, MlxDeviceIdentity,
 };
+use crate::memory_fixture::LedgerFixture;
 use eredu_core::HostPreparationAuthority;
-use eredu_nn::workspace::{
-    HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError,
-};
+use eredu_nn::workspace::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
 
 thread_local! {
     static ARM: Cell<bool> = const { Cell::new(false) };
@@ -49,11 +48,12 @@ impl HostMetadataAccount for RefuseOnce {
         self.0.reserve_metadata(bytes)
     }
 }
-fn attempt_funding(
-    pool: &WorkingMemoryPool,
-) -> (HostMetadataFunding, HostPreparationAuthority) {
+fn attempt_funding(pool: &MemoryLedger) -> (HostMetadataFunding, HostPreparationAuthority) {
     let real = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), u64::MAX)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(u64::MAX),
+        )
         .unwrap();
     let funding = HostMetadataFunding::new(RefuseOnce(real)).unwrap();
     funding
@@ -118,11 +118,20 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
     publish(&source, &loading);
     drop(loading);
     backend.synchronize().unwrap();
-    settle(&pool, pool.used_bytes().unwrap());
     let original = values(&PreparedHybridGroupedCopy::prepare_fixed(&source).unwrap());
     let original_controls = controls(&PreparedHybridGroupedCopy::prepare_fixed(&source).unwrap());
     let original_ids = identities(&source);
-    let baseline = pool.used_bytes().unwrap();
+    backend.synchronize().unwrap();
+    let mut previous = None;
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache().unwrap();
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        let current = pool.snapshot().unwrap();
+        let stable = previous.as_ref() == Some(&current);
+        previous = Some(current);
+        stable && pool.unquoted_owner_count().unwrap() == 0
+    });
+    let baseline = pool.fixture_host_charge().unwrap();
 
     let (funding, host) = attempt_funding(&pool);
     ARM.set(true);
@@ -133,7 +142,7 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
         mechanisms,
         &funding,
         &host,
-        u64::MAX,
+        &crate::memory_fixture::resolved_limits(u64::MAX),
     ) {
         Err(error) => error,
         Ok(_) => panic!("child table must refuse after a completed attention copy"),
@@ -168,7 +177,7 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
     );
     drop((failure, host, funding));
     settle(&pool, baseline);
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
 
     // The failed attempt's host and numerical accounts are gone. A genuinely
     // fresh planning account pays the retry; rollback refunds no earlier work.
@@ -180,7 +189,7 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
         mechanisms,
         &funding,
         &host,
-        u64::MAX,
+        &crate::memory_fixture::resolved_limits(u64::MAX),
     )
     .unwrap();
     let OriginalResidentState::Hybrid(copied) = copied else {
@@ -189,16 +198,14 @@ fn late_host_refusal_retires_completed_copy_and_fresh_attempt_retries() {
     let copied_plan = PreparedHybridGroupedCopy::prepare_fixed(&copied).unwrap();
     assert_eq!(values(&copied_plan), original);
     assert_eq!(controls(&copied_plan), original_controls);
-    assert!(
-        identities(&copied)
-            .iter()
-            .all(|id| !original_ids.contains(id))
-    );
+    assert!(identities(&copied)
+        .iter()
+        .all(|id| !original_ids.contains(id)));
     assert_eq!(identities(&source), original_ids);
     drop(copied_plan);
-    assert!(pool.used_bytes().unwrap() > baseline);
+    assert!(pool.fixture_host_charge().unwrap() > baseline);
     drop((copied, host, funding));
     settle(&pool, baseline);
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     println!("ORIGINAL_COPY_DISCARD_OK");
 }

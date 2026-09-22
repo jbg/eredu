@@ -13,7 +13,7 @@ where F:FnOnce(Array,&OriginalScopeObserver)->Result<T,Error>{
     let capacity=AgreementCapacity{graph:selected.world.graph_capacity(),records:selected.world.record_capacity(),backing:selected.world.backing_capacity()};
     let world=World{input:packed,quote:quote.clone(),claim:claim(owner.owner(),c)?,
         owner:OriginalParallelControlOwner(owner.0.clone()),custody:c.clone()};
-    let output=run_native_role(world,capacity,&owner.owner().bank,&owner.owner().controls,c,
+    let output=run_native_role(world,capacity,&owner.owner().native,c,
         |world,observer|Ok(world.run(observer,world_observer)))
         .map_err(|cause|Error::with_original_control_source(cause,false))??;
     // Unary stages use the existing pair-worker frame with two paid aliases.

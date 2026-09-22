@@ -13,7 +13,7 @@ fn original_preview_controls_reject_one_short_and_zero_result_keeps_exact_hold()
         let payload_bytes = plan(&source).retained_payload_bytes();
         let required = plan(&source).initialization_peak_bytes();
         for bytes in [required - 1, required] {
-            let pool = WorkingMemoryPool::new(required, 0).unwrap();
+            let pool = capture_test_ledger(required, 0).unwrap();
             let (reservation, run) = fresh(&pool, bytes);
             let before = ledger(&pool);
             let allocations = ALLOCATIONS.get();
@@ -21,7 +21,7 @@ fn original_preview_controls_reject_one_short_and_zero_result_keeps_exact_hold()
             if bytes < required {
                 assert!(matches!(result,
                     Err(CaptureTensorConstructionError::Memory(
-                        WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }
+                        WorkingMemoryError::DomainAllowanceExceeded { required_bytes, available_bytes, .. }
                     )) if required_bytes == required && available_bytes == bytes
                 ));
                 assert_eq!(ledger(&pool), before);
@@ -36,10 +36,10 @@ fn original_preview_controls_reject_one_short_and_zero_result_keeps_exact_hold()
                     output.as_observation().retained_payload_bytes(),
                     Some(payload_bytes)
                 );
-                assert_eq!(ledger(&pool).2, required);
+                assert_eq!(ledger(&pool).1, required);
                 let alias = output.clone();
                 drop((output, run, reservation));
-                assert_eq!(pool.used_bytes().unwrap(), required);
+                assert_eq!(pool.payload_used_bytes().unwrap(), required);
                 let TensorObservationData::F32(values) = alias.data() else {
                     unreachable!()
                 };
@@ -51,7 +51,7 @@ fn original_preview_controls_reject_one_short_and_zero_result_keeps_exact_hold()
                 );
                 drop(alias);
             }
-            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -65,7 +65,7 @@ fn incomplete_and_rejected_preview_keep_original_controls_until_error_retirement
             vec![],
         );
         let required = plan(&source).initialization_peak_bytes();
-        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        let pool = capture_test_ledger(required, 0).unwrap();
         let (reservation, run) = fresh(&pool, required);
         let mut run = Some(run);
         let mut builder = run
@@ -79,25 +79,27 @@ fn incomplete_and_rejected_preview_keep_original_controls_until_error_retirement
             drop(run.take());
         }
         let error = builder.finish().unwrap_err();
-        assert_eq!(pool.used_bytes().unwrap(), required);
+        assert_eq!(pool.payload_used_bytes().unwrap(), required);
         if close_parent {
-            assert!(std::error::Error::source(&error)
-                .unwrap()
-                .downcast_ref::<WorkingMemoryError>()
-                .is_some_and(|e| matches!(e, WorkingMemoryError::ExecutionFenced)));
+            assert!(
+                std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<WorkingMemoryError>()
+                    .is_some_and(|e| matches!(e, WorkingMemoryError::ExecutionFenced))
+            );
             drop((run, reservation));
-            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_eq!(pool.payload_used_bytes().unwrap(), required);
             drop(error);
         } else {
             let builder = error.into_builder().unwrap();
             assert_eq!(builder.data.as_ptr(), pointer);
             assert_eq!(builder.initialized_count(), 1);
-            assert_eq!(builder.data, [7.5]);
+            assert!(matches!(&builder.data, CaptureTensorData::F32(values) if values == &[7.5]));
             drop((run, reservation));
-            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_eq!(pool.payload_used_bytes().unwrap(), required);
             drop(builder);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
-        drop(pool.acquire_unquoted().unwrap());
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+        crate::working_memory::memory_fixture::assert_unquoted_idle(&pool);
     }
 }

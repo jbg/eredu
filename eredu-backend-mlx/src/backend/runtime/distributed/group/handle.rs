@@ -31,13 +31,13 @@ pub(crate) fn contracted_collective_submissions() -> usize {
 // Only the exact retained model Sum/Gather producer records this category.
 // Scheduler/control-world word exchanges cannot satisfy model-work evidence.
 #[cfg(test)]
-pub(crate) fn original_model_collective_submissions()->usize {
+pub(crate) fn original_model_collective_submissions() -> usize {
     ORIGINAL_MODEL_COLLECTIVE_SUBMISSIONS.with(Cell::get)
 }
 #[cfg(test)]
-fn record_original_model_collective_submission(group:&Group) {
+fn record_original_model_collective_submission(group: &Group) {
     record_native_collective_submission(group);
-    ORIGINAL_MODEL_COLLECTIVE_SUBMISSIONS.with(|count|count.set(count.get()+1));
+    ORIGINAL_MODEL_COLLECTIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
 }
 
 pub(super) fn record_native_collective_submission(_group: &Group) {
@@ -68,9 +68,12 @@ pub struct Group {
     pub(super) contract: Option<ManifestGroupContract>,
     pub(super) completion: Option<CommunicationCompletionPolicy>,
     source: Option<eredu_runtime::RetainedCommunicationSource>,
-    original_parallel: Option<super::super::topology::original_source::parallel::OriginalParallelBinding>,
-    original_control: Option<super::super::topology::original_source::control::OriginalControlBinding>,
-    original_control_request: Option<super::super::topology::original_source::control::OriginalParallelControlProjection>,
+    original_parallel:
+        Option<super::super::topology::original_source::parallel::OriginalParallelBinding>,
+    original_control:
+        Option<super::super::topology::original_source::control::OriginalControlBinding>,
+    original_control_request:
+        Option<super::super::topology::original_source::control::OriginalParallelControlProjection>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +101,10 @@ impl Group {
     pub fn uncontracted(group: &native::Group) -> Self {
         Self {
             native: group.clone(),
-            retained_buffer: group.persistent_storage().ok().and_then(|source|source.retain_buffer().ok()),
+            retained_buffer: group
+                .persistent_storage()
+                .ok()
+                .and_then(|source| source.retain_buffer().ok()),
             transport_stream: Rc::new(OnceCell::new()),
             logical: None,
             contract: None,
@@ -110,7 +116,9 @@ impl Group {
         }
     }
 
-    pub(crate) fn retained_buffer(&self)->Option<&native::RetainedGroupBuffer>{self.retained_buffer.as_ref()}
+    pub(crate) fn retained_buffer(&self) -> Option<&native::RetainedGroupBuffer> {
+        self.retained_buffer.as_ref()
+    }
 
     /// Cold payload inventory of this actual idle group. Runtime invocation
     /// bindings may retain model/output roots, so a buffer-only census cannot
@@ -119,57 +127,105 @@ impl Group {
     /// payload is represented by the independently retained setup buffer.
     pub(crate) fn collect_idle_retained_storage(
         &self,
-        storage:&mut crate::backend::runtime::residency::storage::RetainedStorage,
-    )->std::result::Result<(),crate::backend::runtime::residency::manager::ResidencyError>{
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> std::result::Result<(), crate::backend::runtime::residency::manager::ResidencyError> {
         // Exhaustive field classification makes a new group owner require an
         // explicit decision before it can release loading authority.
-        let Self{native:_,retained_buffer,transport_stream:_,logical:_,contract:_,
-            completion:_,source:_,original_parallel,original_control,original_control_request}=self;
-        if original_parallel.is_some() || original_control.is_some() || original_control_request.is_some(){
+        let Self {
+            native: _,
+            retained_buffer,
+            transport_stream: _,
+            logical: _,
+            contract: _,
+            completion: _,
+            source: _,
+            original_parallel,
+            original_control,
+            original_control_request,
+        } = self;
+        if original_parallel.is_some()
+            || original_control.is_some()
+            || original_control_request.is_some()
+        {
             storage.mark_incomplete();
         }
         storage.include_group_buffer(retained_buffer.as_ref())
     }
 
-    pub(crate) fn with_retained_source(mut self, source: eredu_runtime::RetainedCommunicationSource) -> Self {
+    pub(crate) fn with_retained_source(
+        mut self,
+        source: eredu_runtime::RetainedCommunicationSource,
+    ) -> Self {
         self.source = Some(source);
         self
     }
     pub(crate) fn retained_source(&self) -> Option<&eredu_runtime::RetainedCommunicationSource> {
         self.source.as_ref()
     }
-    pub(crate) fn matches_retained_world(&self, source: &eredu_runtime::RetainedCommunicationSource) -> bool {
-        self.source.as_ref().is_some_and(|actual| actual.same_source(source))
-            && self.logical.is_none() && self.contract.is_none()
+    pub(crate) fn matches_retained_world(
+        &self,
+        source: &eredu_runtime::RetainedCommunicationSource,
+    ) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|actual| actual.same_source(source))
+            && self.logical.is_none()
+            && self.contract.is_none()
             && self.completion == source.manifest().completion_policy()
     }
     /// Borrow-only comparison against the actual selected group declaration.
     /// Native operation availability and finite work admission remain separate.
-    pub(crate) fn matches_retained_group(&self, source: &eredu_runtime::RetainedCommunicationSource,
-        descriptor: &CommunicationGroupDescriptor, world_wave: bool) -> bool {
-        self.source.as_ref().is_some_and(|actual| actual.same_source(source))
+    pub(crate) fn matches_retained_group(
+        &self,
+        source: &eredu_runtime::RetainedCommunicationSource,
+        descriptor: &CommunicationGroupDescriptor,
+        world_wave: bool,
+    ) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|actual| actual.same_source(source))
             && self.completion == source.manifest().completion_policy()
-            && self.contract.as_ref().is_some_and(|contract|
-                contract.id == descriptor.id() && &contract.requirements == descriptor.requirements())
+            && self.contract.as_ref().is_some_and(|contract| {
+                contract.id == descriptor.id()
+                    && &contract.requirements == descriptor.requirements()
+            })
             && match &self.logical {
-                Some(logical) => logical.global_ranks.as_slice() == descriptor.members()
-                    && Some(logical.rank) == descriptor.local_index()
-                    && logical.world_collective_wave == world_wave && logical.routes.is_none(),
-                None => descriptor.members().len() == source.manifest().world_size()
-                    && descriptor.members().iter().copied().eq(0..source.manifest().world_size())
-                    && descriptor.local_index() == Some(source.manifest().rank()),
+                Some(logical) => {
+                    logical.global_ranks.as_slice() == descriptor.members()
+                        && Some(logical.rank) == descriptor.local_index()
+                        && logical.world_collective_wave == world_wave
+                        && logical.routes.is_none()
+                }
+                None => {
+                    descriptor.members().len() == source.manifest().world_size()
+                        && descriptor
+                            .members()
+                            .iter()
+                            .copied()
+                            .eq(0..source.manifest().world_size())
+                        && descriptor.local_index() == Some(source.manifest().rank())
+                }
             }
     }
 
-    pub(crate) fn matches_retained_route(&self, source: &eredu_runtime::RetainedCommunicationSource,
-        descriptor: &eredu_runtime::CommunicationRouteDescriptor, world_wave: bool) -> bool {
-        self.source.as_ref().is_some_and(|actual| actual.same_source(source))
+    pub(crate) fn matches_retained_route(
+        &self,
+        source: &eredu_runtime::RetainedCommunicationSource,
+        descriptor: &eredu_runtime::CommunicationRouteDescriptor,
+        world_wave: bool,
+    ) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|actual| actual.same_source(source))
             && self.completion == source.manifest().completion_policy()
             && self.contract.is_none()
-            && self.logical.as_ref().is_some_and(|logical|
+            && self.logical.as_ref().is_some_and(|logical| {
                 logical.global_ranks.as_slice() == [descriptor.source(), descriptor.destination()]
-                    && logical.rank == usize::from(source.manifest().rank() == descriptor.destination())
-                    && logical.world_collective_wave == world_wave && logical.routes.is_none())
+                    && logical.rank
+                        == usize::from(source.manifest().rank() == descriptor.destination())
+                    && logical.world_collective_wave == world_wave
+                    && logical.routes.is_none()
+            })
     }
 
     pub(crate) fn shares_native_world(&self, other: &Self) -> bool {
@@ -205,9 +261,16 @@ impl Group {
             // ordinary setup, before original construction can borrow it.
             let runtime = safemlx::PrefillRootsRuntime::prepare_for_stream(&stream, &stream)
                 .map_err(Exception::from_source)?;
-            let _ = self.transport_stream.set(PreparedTransportStream { stream, _runtime: runtime });
+            let _ = self.transport_stream.set(PreparedTransportStream {
+                stream,
+                _runtime: runtime,
+            });
         }
-        Ok(&self.transport_stream.get().expect("transport stream initialized").stream)
+        Ok(&self
+            .transport_stream
+            .get()
+            .expect("transport stream initialized")
+            .stream)
     }
 
     pub(crate) fn retained_transport_stream(&self) -> Option<&Stream> {
@@ -306,10 +369,14 @@ impl Group {
                 "backend-native splitting of a logical subgroup is unsupported",
             ));
         }
-        let native=self.native.split(color,key)?;
-        let retained_buffer=native.persistent_storage().ok().and_then(|source|source.retain_buffer().ok());
+        let native = self.native.split(color, key)?;
+        let retained_buffer = native
+            .persistent_storage()
+            .ok()
+            .and_then(|source| source.retain_buffer().ok());
         Ok(Self {
-            native,retained_buffer,
+            native,
+            retained_buffer,
             transport_stream: Rc::new(OnceCell::new()),
             logical: None,
             contract: None,
@@ -488,14 +555,23 @@ impl Group {
             Exception::custom(format!("operation {operation:?} has no tensor limits"))
         })?;
         let dtype = tensor_dtype(value.dtype());
-        requirement.validate_tensor_metadata(&dtype,value.ndim(),Some(value.size()),completed)
+        requirement
+            .validate_tensor_metadata(&dtype, value.ndim(), Some(value.size()), completed)
             .map_err(|error| match error {
-                eredu_runtime::CommunicationTensorContractError::Dtype=>Exception::custom(format!(
-                    "opaque group contract for {operation:?} does not admit dtype {dtype:?}")),
-                eredu_runtime::CommunicationTensorContractError::MissingLimits=>Exception::custom(format!(
-                    "operation {operation:?} has no tensor limits")),
-                eredu_runtime::CommunicationTensorContractError::Limits=>Exception::custom(format!(
-                    "opaque group contract for {operation:?} rejects tensor shape {:?}",value.shape())),
+                eredu_runtime::CommunicationTensorContractError::Dtype => {
+                    Exception::custom(format!(
+                        "opaque group contract for {operation:?} does not admit dtype {dtype:?}"
+                    ))
+                }
+                eredu_runtime::CommunicationTensorContractError::MissingLimits => {
+                    Exception::custom(format!("operation {operation:?} has no tensor limits"))
+                }
+                eredu_runtime::CommunicationTensorContractError::Limits => {
+                    Exception::custom(format!(
+                        "opaque group contract for {operation:?} rejects tensor shape {:?}",
+                        value.shape()
+                    ))
+                }
             })
     }
 
@@ -580,135 +656,239 @@ mod terminal_tests;
 mod retention_copy;
 
 impl Group {
-    pub(crate) fn original_control_request(&self)->Option<&super::super::topology::original_source::control::OriginalParallelControlProjection> {
+    pub(crate) fn original_control_request(
+        &self,
+    ) -> Option<&super::super::topology::original_source::control::OriginalParallelControlProjection>
+    {
         self.original_control_request.as_ref()
     }
-    pub(crate) fn validate_control_model_source(&self,source:&super::super::topology::original_source::parallel::OriginalParallelSource)
-        ->std::result::Result<(),crate::backend::error::Error> {
+    pub(crate) fn validate_control_model_source(
+        &self,
+        source: &super::super::topology::original_source::parallel::OriginalParallelSource,
+    ) -> std::result::Result<(), crate::backend::error::Error> {
         match &self.original_parallel {
-            Some(binding)=>binding.validate_control_source(self,source),
-            None=>Err(crate::backend::error::Error::Neural(source.neural_error(
-                crate::backend::error::Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)))),
+            Some(binding) => binding.validate_control_source(self, source),
+            None => Err(crate::backend::error::Error::Neural(source.neural_error(
+                crate::backend::error::Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                ),
+            ))),
+        }
+    }
+    pub(crate) fn validate_control_model_source_with_funding(
+        &self,
+        source: &super::super::topology::original_source::parallel::OriginalParallelSource,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> std::result::Result<(), crate::backend::error::Error> {
+        match &self.original_parallel {
+            Some(binding) => binding.validate_control_source_with_funding(self, source, funding),
+            None => Err(crate::backend::error::Error::Neural(source.neural_error(
+                crate::backend::error::Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                ),
+            ))),
         }
     }
     /// Only the paid model-context loan attaches its authenticated request view.
-    pub(crate) fn bind_original_control_request(&mut self,
-        projection:super::super::topology::original_source::control::OriginalParallelControlProjection) {
-        self.original_control_request=Some(projection);
+    pub(crate) fn bind_original_control_request(
+        &mut self,
+        projection:super::super::topology::original_source::control::OriginalParallelControlProjection,
+    ) {
+        self.original_control_request = Some(projection);
     }
     /// The prepared publication group is an alias of the exact Q invocation.
-    pub(crate) fn with_prepared_publication_group<T,E,F>(&self,ordinary:&Group,
-        funding:&eredu_nn::workspace::HostMetadataFunding,stream:&Stream,run:F)
-        ->std::result::Result<std::result::Result<T,E>,crate::backend::error::Error>
-    where F:FnOnce(Option<&Group>)->std::result::Result<T,E> {
+    pub(crate) fn with_prepared_publication_group<T, E, F>(
+        &self,
+        ordinary: &Group,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+        stream: &Stream,
+        run: F,
+    ) -> std::result::Result<std::result::Result<T, E>, crate::backend::error::Error>
+    where
+        F: FnOnce(Option<&Group>) -> std::result::Result<T, E>,
+    {
         match &self.original_parallel {
-            Some(binding)=>binding.with_publication_group(ordinary,self,funding,stream,run),
-            None=>Ok(run(None)),
+            Some(binding) => binding.with_publication_group(ordinary, self, funding, stream, run),
+            None => Ok(run(None)),
         }
     }
-    pub(crate) fn publish_original(&self,input:&Array,root:usize,stream:&Stream)
-        ->Option<std::result::Result<(Array,super::super::completion::OriginalCommunicationCompletion),crate::backend::error::Error>> {
-        self.original_parallel.as_ref().map(|binding|binding.publish(self,input,root,stream).map(|(value,completion)| {
-            let (value,source,funding)=value.into_parts();
-            // Completion owns the same accepted source/H, while Q retains the
-            // invocation through final model completion or failed recovery.
-            // The native Array retains its actual Graph/backing allocations.
-            drop((source,funding));
-            (value,completion)
-        }))
+    pub(crate) fn publish_original(
+        &self,
+        input: &Array,
+        root: usize,
+        stream: &Stream,
+    ) -> Option<
+        std::result::Result<
+            (
+                Array,
+                super::super::completion::OriginalCommunicationCompletion,
+            ),
+            crate::backend::error::Error,
+        >,
+    > {
+        self.original_parallel.as_ref().map(|binding| {
+            binding
+                .publish(self, input, root, stream)
+                .map(|(value, completion)| {
+                    let (value, source, funding) = value.into_parts();
+                    // Completion owns the same accepted source/H, while Q retains the
+                    // invocation through final model completion or failed recovery.
+                    // The native Array retains its actual Graph/backing allocations.
+                    drop((source, funding));
+                    (value, completion)
+                })
+        })
     }
-    pub(crate) fn original_parallel_binding(&self)
-        ->Option<&super::super::topology::original_source::parallel::OriginalParallelBinding>{
+    pub(crate) fn original_parallel_binding(
+        &self,
+    ) -> Option<&super::super::topology::original_source::parallel::OriginalParallelBinding> {
         self.original_parallel.as_ref()
     }
-    pub(crate) fn has_original_parallel(&self)->bool {self.original_parallel.is_some()}
-    pub(crate) fn with_original_parallel(mut self,binding:super::super::topology::original_source::parallel::OriginalParallelBinding)->Self {
-        self.original_parallel=Some(binding);self
+    pub(crate) fn has_original_parallel(&self) -> bool {
+        self.original_parallel.is_some()
     }
-    pub(crate) fn model_funding(&self)->Option<&eredu_nn::workspace::HostMetadataFunding> {
-        self.original_parallel.as_ref().map(|binding|binding.funding())
+    pub(crate) fn with_original_parallel(
+        mut self,
+        binding: super::super::topology::original_source::parallel::OriginalParallelBinding,
+    ) -> Self {
+        self.original_parallel = Some(binding);
+        self
     }
-    pub(crate) fn model_gather_error(&self,cause:eredu_nn::ParallelGatherError)->eredu_nn::Error {
+    pub(crate) fn model_funding(&self) -> Option<&eredu_nn::workspace::HostMetadataFunding> {
+        self.original_parallel
+            .as_ref()
+            .map(|binding| binding.funding())
+    }
+    pub(crate) fn model_gather_error(
+        &self,
+        cause: eredu_nn::ParallelGatherError,
+    ) -> eredu_nn::Error {
         match &self.original_parallel {
-            Some(binding)=>binding.error(super::super::topology::original_source::Cause::Gather(cause)),
-            None=>eredu_nn::Error::backend_retained_source(cause),
+            Some(binding) => binding.error(super::super::topology::original_source::Cause::Gather(
+                cause,
+            )),
+            None => eredu_nn::Error::backend_retained_source(cause),
         }
     }
-    pub(crate) fn model_embedding_error(&self,cause:eredu_nn::EmbeddingValidationError)->eredu_nn::Error {
+    pub(crate) fn model_embedding_error(
+        &self,
+        cause: eredu_nn::EmbeddingValidationError,
+    ) -> eredu_nn::Error {
         match &self.original_parallel {
-            Some(binding)=>binding.error(super::super::topology::original_source::Cause::Embedding(cause)),
-            None=>eredu_nn::Error::backend(cause),
+            Some(binding) => binding.error(
+                super::super::topology::original_source::Cause::Embedding(cause),
+            ),
+            None => eredu_nn::Error::backend(cause),
         }
     }
-    pub(crate) fn model_source_missing(&self)->eredu_nn::Error {
+    pub(crate) fn model_source_missing(&self) -> eredu_nn::Error {
         match &self.original_parallel {
-            Some(binding)=>binding.error(super::super::topology::original_source::Cause::Resource),
-            None=>eredu_nn::Error::backend("embedding has no vocabulary ownership"),
+            Some(binding) => {
+                binding.error(super::super::topology::original_source::Cause::Resource)
+            }
+            None => eredu_nn::Error::backend("embedding has no vocabulary ownership"),
         }
     }
-    pub(crate) fn model_vocabulary_error(&self,cause:eredu_nn::VocabularyRangeError)->eredu_nn::Error {
+    pub(crate) fn model_vocabulary_error(
+        &self,
+        cause: eredu_nn::VocabularyRangeError,
+    ) -> eredu_nn::Error {
         match &self.original_parallel {
-            Some(binding)=>binding.error(super::super::topology::original_source::Cause::Vocabulary(cause)),
-            None=>eredu_nn::Error::backend_retained_source(cause),
+            Some(binding) => binding.error(
+                super::super::topology::original_source::Cause::Vocabulary(cause),
+            ),
+            None => eredu_nn::Error::backend_retained_source(cause),
         }
     }
-    pub(crate) fn model_native_error(&self,cause:Exception)->eredu_nn::Error {
+    pub(crate) fn model_native_error(&self, cause: Exception) -> eredu_nn::Error {
         match &self.original_parallel {
-            Some(binding)=>binding.error(super::super::topology::original_source::Cause::Native(cause)),
-            None=>eredu_nn::Error::backend_retained_source(cause),
+            Some(binding) => binding.error(super::super::topology::original_source::Cause::Native(
+                cause,
+            )),
+            None => eredu_nn::Error::backend_retained_source(cause),
         }
     }
-    pub(crate) fn gather_model_first(&self,input:&Array,stream:&Stream,axis:usize,widths:&[usize])->std::result::Result<Array,eredu_nn::Error> {
+    pub(crate) fn gather_model_first(
+        &self,
+        input: &Array,
+        stream: &Stream,
+        axis: usize,
+        widths: &[usize],
+    ) -> std::result::Result<Array, eredu_nn::Error> {
         match &self.original_parallel {
-            Some(binding)=>{
-                let output=binding.gather(self,input,stream,axis,widths)?;
+            Some(binding) => {
+                let output = binding.gather(self, input, stream, axis, widths)?;
                 #[cfg(test)]
                 record_original_model_collective_submission(self);
                 Ok(output)
-            },
-            None=>super::all_gather_unchecked(input,self,stream).map_err(eredu_nn::Error::backend_retained_source),
+            }
+            None => super::all_gather_unchecked(input, self, stream)
+                .map_err(eredu_nn::Error::backend_retained_source),
         }
     }
     /// Ordinary model Sum or the explicitly bound occurrence in this exact
     /// parallel context. This does not create an intermediate completion.
-    pub(crate) fn sum_model(&self,input:&Array,stream:&Stream)->std::result::Result<Array,eredu_nn::Error> {
+    pub(crate) fn sum_model(
+        &self,
+        input: &Array,
+        stream: &Stream,
+    ) -> std::result::Result<Array, eredu_nn::Error> {
         match &self.original_parallel {
-            Some(binding)=>{
-                let output=binding.sum(self,input,stream)?;
+            Some(binding) => {
+                let output = binding.sum(self, input, stream)?;
                 #[cfg(test)]
                 record_original_model_collective_submission(self);
                 Ok(output)
-            },
-            None=>super::all_sum(input,self,stream).map_err(eredu_nn::Error::backend_retained_source),
+            }
+            None => super::all_sum(input, self, stream)
+                .map_err(eredu_nn::Error::backend_retained_source),
         }
     }
 }
 
 impl Group {
-    pub(crate) fn has_original_control(&self)->bool {self.original_control.is_some()}
-    pub(crate) fn original_control(&self)->Option<&super::super::topology::original_source::control::OriginalControlBinding> {
+    pub(crate) fn has_original_control(&self) -> bool {
+        self.original_control.is_some()
+    }
+    pub(crate) fn original_control(
+        &self,
+    ) -> Option<&super::super::topology::original_source::control::OriginalControlBinding> {
         self.original_control.as_ref()
     }
-    pub(crate) fn with_original_control(mut self,binding:super::super::topology::original_source::control::OriginalControlBinding)->Self {
-        self.original_control=Some(binding);self
+    pub(crate) fn with_original_control(
+        mut self,
+        binding: super::super::topology::original_source::control::OriginalControlBinding,
+    ) -> Self {
+        self.original_control = Some(binding);
+        self
     }
 }
-
 
 impl Group {
     /// Authenticate the ordinary opaque handle against this exact model source.
     /// Execution still consumes the retained occurrence and validates its scope.
-    pub(crate) fn validate_model_collective_group(&self, ordinary:&Group)
-        ->std::result::Result<(),eredu_nn::Error>{
-        let fail=||self.model_source_missing();
-        let source=self.retained_source().ok_or_else(fail)?;
-        let id=self.contract.as_ref().ok_or_else(fail)?.id;
-        let descriptor=source.manifest().groups().iter().find(|entry|entry.id()==id).ok_or_else(fail)?;
-        let wave=source.realization().group_world_wave(descriptor.creation_order()).ok_or_else(fail)?;
+    pub(crate) fn validate_model_collective_group(
+        &self,
+        ordinary: &Group,
+    ) -> std::result::Result<(), eredu_nn::Error> {
+        let fail = || self.model_source_missing();
+        let source = self.retained_source().ok_or_else(fail)?;
+        let id = self.contract.as_ref().ok_or_else(fail)?.id;
+        let descriptor = source
+            .manifest()
+            .groups()
+            .iter()
+            .find(|entry| entry.id() == id)
+            .ok_or_else(fail)?;
+        let wave = source
+            .realization()
+            .group_world_wave(descriptor.creation_order())
+            .ok_or_else(fail)?;
         if !self.has_original_parallel()
             || !self.native.shares_native_handle(&ordinary.native)
-            || !self.matches_retained_group(source,descriptor,wave)
-            || !ordinary.matches_retained_group(source,descriptor,wave) {
+            || !self.matches_retained_group(source, descriptor, wave)
+            || !ordinary.matches_retained_group(source, descriptor, wave)
+        {
             return Err(fail());
         }
         Ok(())

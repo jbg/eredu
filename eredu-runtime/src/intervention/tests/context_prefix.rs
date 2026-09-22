@@ -1,5 +1,5 @@
 use super::*;
-use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+use crate::working_memory::{InferenceExecutionIdentity, MemoryLedger};
 
 fn fixed(rank: usize) -> ResolvedCaptureSlice {
     ResolvedCaptureSlice {
@@ -62,9 +62,12 @@ fn context_prefix_projection_shares_original_payload_and_rejects_wrong_reached_a
         max_output_tokens: 1,
         output: OutputDemand::Sequence,
     };
-    let pool = WorkingMemoryPool::new(1 << 22, 17).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 22, 17).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 21)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 21),
+        )
         .unwrap();
     let mut owners = Vec::new();
     for context_start in [1, 7] {
@@ -209,9 +212,9 @@ fn context_prefix_projection_shares_original_payload_and_rejects_wrong_reached_a
             }
         }
     }
-    let paid = pool.used_bytes().unwrap();
+    let paid = pool.payload_used_bytes().unwrap();
     drop(funding);
-    assert_eq!(pool.used_bytes().unwrap(), paid);
+    assert_eq!(pool.payload_used_bytes().unwrap(), paid);
     drop(owners);
-    assert_eq!(pool.used_bytes().unwrap(), 17);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 17);
 }

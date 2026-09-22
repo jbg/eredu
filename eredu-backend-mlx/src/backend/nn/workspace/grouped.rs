@@ -25,6 +25,8 @@ struct Cost {
     a: NativeAllocationFacts,
     tensor: u64,
     host: u64,
+    default_bytes: u64,
+    default_births: usize,
 }
 impl Cost {
     fn new(a: NativeAllocationFacts) -> Self {
@@ -32,10 +34,21 @@ impl Cost {
             a,
             tensor: 0,
             host: 0,
+            default_bytes: 0,
+            default_births: 0,
         }
     }
     fn charge(&mut self, bytes: u64) -> FactResult<()> {
         self.tensor = add(self.tensor, bytes)?;
+        Ok(())
+    }
+    /// Attribute already-priced eager constructors; promotions remain execution scratch.
+    fn default_scalars(&mut self, count: usize) -> FactResult<()> {
+        self.default_bytes = add(self.default_bytes, mul(capacity(self.a, 1)?, count as u64)?)?;
+        self.default_births = self
+            .default_births
+            .checked_add(count)
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
         Ok(())
     }
     fn buffers(&mut self, n: u64, count: u64) -> FactResult<()> {
@@ -54,9 +67,20 @@ impl Cost {
     fn append(&mut self, other: Self, count: u64) -> FactResult<()> {
         self.charge(mul(other.tensor, count)?)?;
         self.host = self.host.max(other.host);
+        self.default_bytes = add(self.default_bytes, mul(other.default_bytes, count)?)?;
+        self.default_births = self
+            .default_births
+            .checked_add(
+                other
+                    .default_births
+                    .checked_mul(usize::try_from(count)?)
+                    .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+            )
+            .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
         Ok(())
     }
     fn plan(&mut self, routes: u64) -> FactResult<()> {
+        self.default_scalars(1)?; // group_by_id: eager top-k divisor
         self.buffers(routes, 2)?; // flatten and I32 group IDs
         self.charge(sort(self.a, routes, 1, routes)?)?;
         self.buffers(routes, 2)?; // sorted IDs and signed original-slot indices
@@ -73,6 +97,7 @@ impl Cost {
         let full = mul(routes, width)?;
         self.buffers(routes, 2)?; // coefficient flatten and gather
         self.pointwise(full, 2)?; // weighted source rows
+        self.default_scalars(1)?; // zeros_dtype: empty result or scatter destination
         if tokens == 0 {
             return self.buffers(1, 2);
         }
@@ -82,6 +107,7 @@ impl Cost {
         if reduction == GroupReduction::Sum {
             return self.sum(full, mul(tokens, width)?, k);
         }
+        self.default_scalars(2)?; // zero group IDs and sequential accumulator
         self.buffers(routes, 4)?; // zero IDs, update reshape, scatter, [tokens,k] reshape
         self.buffers(1, 2)?;
         self.charge(sort(self.a, routes, tokens, k)?)?;
@@ -190,10 +216,16 @@ impl<'a> Bank<'a> {
                 // Shared SiLU may use a custom F32 kernel or the scalar/native
                 // fallback: sigmoid (negate/exp/add/reciprocal), multiply and
                 // all possible input promotions/broadcast materializations.
+                // The shared Metal F32 custom kernel accepts every nonempty
+                // row after widening. Only its empty fallback constructs one.
+                if n == 0 {
+                    cost.default_scalars(1)?;
+                }
                 cost.buffers(n, 11)?;
                 cost.buffers(1, 1)?;
             }
             Activation::Relu2 => {
+                cost.default_scalars(1)?; // explicit maximum zero, not square promotion
                 cost.pointwise(n, 1)?;
                 cost.pointwise(n, 1)?;
             }
@@ -212,6 +244,19 @@ impl<'a> Bank<'a> {
                     return Ok(None);
                 };
                 cost.charge(bound.scratch_bytes)?;
+                if let Some(source) = sink.default_scratch_sources() {
+                    let [row] = source.alternatives() else {
+                        return Err(invalid());
+                    };
+                    if row
+                        .scratch_bytes
+                        .is_some_and(|bytes| bytes != bound.scratch_bytes)
+                    {
+                        return Err(invalid());
+                    }
+                    cost.default_bytes = row.default_bytes;
+                    cost.default_births = row.default_births;
+                }
                 match sink.first_output() {
                     Some(
                         WorkspaceOutputEffect::Allocate(bytes)
@@ -263,11 +308,68 @@ pub(super) fn ordinary_error(op: &WorkspaceOperation, error: MlxWorkspaceFactErr
     error.ordinary()
 }
 
+struct GroupedCost {
+    total: Cost,
+    retained: [u64; 4],
+    outputs: usize,
+}
+
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
     a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<(WorkspaceOperationFacts, u64)>> {
+    // A retained first/down bank each has at most three actual workers:
+    // packed storage, native dense overlay, and custom BF16 dense overlay.
+    // Keep their choice through every chunk before taking the operation peak.
+    let mut alternatives = [(0u64, 0u64, 0usize); 9];
+    let mut length = 0;
+    let mut peak = 0;
+    let mut host = 0;
+    let mut output = None;
+    for first in 0..3 {
+        for down in 0..3 {
+            let Some(cost) = source_cost(op, a, [first, down])? else {
+                continue;
+            };
+            let descriptor = (cost.retained, cost.outputs);
+            if output.is_some_and(|old| old != descriptor) {
+                return Err(invalid());
+            }
+            output = Some(descriptor);
+            let retained = cost.retained[..cost.outputs]
+                .iter()
+                .try_fold(0, |sum, &bytes| add(sum, bytes))?;
+            let scratch = cost
+                .total
+                .tensor
+                .checked_sub(retained)
+                .ok_or_else(invalid)?;
+            alternatives[length] = (scratch, cost.total.default_bytes, cost.total.default_births);
+            length += 1;
+            peak = peak.max(scratch);
+            host = host.max(cost.total.host);
+        }
+    }
+    let Some((outputs, count)) = output else {
+        return Ok(None);
+    };
+    sink.default_scratch_alternatives(&alternatives[..length])?;
+    for bytes in &outputs[..count] {
+        sink.output(Output::Allocate(*bytes))?;
+    }
+    use super::super::grouped::{
+        GROUPED_PROJECTION_CHUNK_THRESHOLD as THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS as CHUNK,
+    };
+    let tensor = sink.finish(peak, format_args!("MLX Metal packed expert equations: exact native grouped projection and physical companions, full selection sorting/gather, activated units, native weighted reduction and optional TP bias correction; actual gated-bank chunk thresholds {THRESHOLD}/{CHUNK} with every lazy child retained through completion; affine group-16 selected packed-weight replicas included; separately rounded per-chunk output ownership; page={} with bounded oversized reuse",a.page_size()))?;
+    Ok(Some((tensor, host)))
+}
+
+fn source_cost(
+    op: WorkspaceOperationView<'_>,
+    a: NativeAllocationFacts,
+    source: [usize; 2],
+) -> FactResult<Option<GroupedCost>> {
     let WorkspaceOperationKindView::Grouped {
         bank,
         phase,
@@ -353,6 +455,9 @@ pub(super) fn emit(
     };
     let units = *phase == WorkspaceGroupedPhase::Units;
     let finish = *phase == WorkspaceGroupedPhase::Finish;
+    if finish && source[0] != 0 || (units || down.is_none()) && source[1] != 0 {
+        return Ok(None);
+    }
     if op.inputs.len() != slot + if finish { 4 } else { 0 } {
         return Err(invalid());
     }
@@ -424,6 +529,18 @@ pub(super) fn emit(
                 eredu_nn::EmbeddingLookupPolicy::Strict,
                 a,
             )?)?;
+            // Linear uses domain validation ordinarily and safe IDs under the
+            // original scope. Gated banks validate only in the original scope.
+            if routes != 0 {
+                let seeds = if a.original_storage {
+                    3
+                } else if matches!(bank.activation, Activation::Linear(_)) {
+                    2
+                } else {
+                    0
+                };
+                total.default_scalars(seeds)?;
+            }
         }
     }
     let mut retained_storage = [0; 4];
@@ -434,7 +551,10 @@ pub(super) fn emit(
         if !finish {
             cost.plan(n)?;
             cost.buffers(mul(n, bank.input as u64)?, 1)?; // selected hidden rows
-            cost.append(first.cost(n, a)?, 1)?;
+            let Some(projection) = first.cost(n, a, source[0])? else {
+                return Ok(None);
+            };
+            cost.append(projection, 1)?;
             let Some(activation) = bank.activate(n, a)? else {
                 return Ok(None);
             };
@@ -456,7 +576,10 @@ pub(super) fn emit(
             )));
         }
         if let Some(down) = &down {
-            cost.append(down.cost(n, a)?, 1)?;
+            let Some(projection) = down.cost(n, a, source[1])? else {
+                return Ok(None);
+            };
+            cost.append(projection, 1)?;
         }
         cost.weighted_sum(tokens, k as u64, bank.output as u64, bank.reduction)?;
         Ok(Some((cost, None)))
@@ -502,13 +625,11 @@ pub(super) fn emit(
             total.charge(*retained)?; // final adapter reshape may copy each result
         }
     }
-    let output_bytes = retained.iter().try_fold(0, |sum, &bytes| add(sum, bytes))?;
-    let scratch = total.tensor.checked_sub(output_bytes).ok_or_else(invalid)?;
-    for &bytes in retained.iter() {
-        sink.output(Output::Allocate(bytes))?;
-    }
-    let tensor = sink.finish(scratch, format_args!("MLX Metal packed expert equations: exact native grouped projection and physical companions, full selection sorting/gather, activated units, native weighted reduction and optional TP bias correction; actual gated-bank chunk thresholds {THRESHOLD}/{CHUNK} with every lazy child retained through completion; affine group-16 selected packed-weight replicas included; separately rounded per-chunk output ownership; page={} with bounded oversized reuse",a.page_size()))?;
-    Ok(Some((tensor, total.host)))
+    Ok(Some(GroupedCost {
+        total,
+        retained: retained_storage,
+        outputs: output_count,
+    }))
 }
 
 #[cfg(test)]
@@ -528,43 +649,60 @@ mod tests;
 /// No parameter format/worker qualification follows from these candidates:
 /// every candidate still traverses the same exact native recipe inspector.
 pub(super) fn expert_row_candidates(
-    kernel: eredu_nn::workspace::WorkspaceExpertKernel<'_>, maximum: usize,
+    kernel: eredu_nn::workspace::WorkspaceExpertKernel<'_>,
+    maximum: usize,
 ) -> impl Iterator<Item = usize> {
     use crate::backend::nn::grouped::{
-        GROUPED_PROJECTION_CHUNK_THRESHOLD as THRESHOLD,
-        GROUPED_PROJECTION_CHUNK_TOKENS as CHUNK,
+        GROUPED_PROJECTION_CHUNK_THRESHOLD as THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS as CHUNK,
     };
     let chunked = matches!(kernel, eredu_nn::workspace::WorkspaceExpertKernel::Gated(_));
     let threshold = THRESHOLD as usize;
     let chunk = CHUNK as usize;
     // Zero belongs to the separately retained actual empty-provider recipe.
-    let unchunked = if chunked { maximum.min(threshold) } else { maximum };
-    [1, unchunked].into_iter()
+    let unchunked = if chunked {
+        maximum.min(threshold)
+    } else {
+        maximum
+    };
+    [1, unchunked]
+        .into_iter()
         .filter(move |rows| *rows != 0 && *rows <= maximum)
-        .chain((0..if chunked && maximum > threshold { chunk } else { 0 })
-            .filter_map(move |remainder| {
-                let distance = (maximum % chunk + chunk - remainder) % chunk;
-                maximum.checked_sub(distance).filter(|rows| *rows > threshold)
-            }))
+        .chain(
+            (0..if chunked && maximum > threshold {
+                chunk
+            } else {
+                0
+            })
+                .filter_map(move |remainder| {
+                    let distance = (maximum % chunk + chunk - remainder) % chunk;
+                    maximum
+                        .checked_sub(distance)
+                        .filter(|rows| *rows > threshold)
+                }),
+        )
 }
 
 /// Both native devices execute the same packed-bank chunk/callback schedule.
-pub(super) fn observation_schedule(bank: &WorkspaceGroupedBank, tokens: u32)
-    -> Result<Option<WorkspaceGroupedObservationSchedule>, Error> {
-        use super::super::grouped::{GROUPED_PROJECTION_CHUNK_THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS};
-        if let WorkspaceGroupedBank::GatedProduct(spec) = bank {
-            if !matches!(
-                spec.layout(),
-                eredu_nn::GatedProductGroupLayout::Packed { .. }
-            ) {
-                return Ok(None);
-            }
-            if tokens > GROUPED_PROJECTION_CHUNK_THRESHOLD as u32 {
-                return Ok(Some(WorkspaceGroupedObservationSchedule::TokenChunks(
-                    std::num::NonZeroU32::new(GROUPED_PROJECTION_CHUNK_TOKENS as u32)
-                        .expect("native grouped chunk size is positive"),
-                )));
-            }
+pub(super) fn observation_schedule(
+    bank: &WorkspaceGroupedBank,
+    tokens: u32,
+) -> Result<Option<WorkspaceGroupedObservationSchedule>, Error> {
+    use super::super::grouped::{
+        GROUPED_PROJECTION_CHUNK_THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS,
+    };
+    if let WorkspaceGroupedBank::GatedProduct(spec) = bank {
+        if !matches!(
+            spec.layout(),
+            eredu_nn::GatedProductGroupLayout::Packed { .. }
+        ) {
+            return Ok(None);
         }
-        Ok(Some(WorkspaceGroupedObservationSchedule::WholeBatch))
+        if tokens > GROUPED_PROJECTION_CHUNK_THRESHOLD as u32 {
+            return Ok(Some(WorkspaceGroupedObservationSchedule::TokenChunks(
+                std::num::NonZeroU32::new(GROUPED_PROJECTION_CHUNK_TOKENS as u32)
+                    .expect("native grouped chunk size is positive"),
+            )));
+        }
+    }
+    Ok(Some(WorkspaceGroupedObservationSchedule::WholeBatch))
 }

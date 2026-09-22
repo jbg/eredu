@@ -1,7 +1,7 @@
 //! Fixed borrowed-owner retention. A failed prefix stays in its caller's capsule.
-use crate::backend::runtime::residency::storage::RetainedArray;
 use super::capacity::OpeningSlots;
 use super::*;
+use crate::backend::runtime::residency::storage::RetainedArray;
 use crate::backend::runtime::residency::storage::{
     RetainedStorageInspectionError, RetainedStorageRef,
 };
@@ -263,7 +263,10 @@ impl FixedOpeningOwners {
     }
     pub(super) fn buffer_bytes(n: OpeningSlots) -> Result<u64, OpeningError> {
         let terms = [
-            (n.arrays, size_of::<Slot<RetainedArray, ArrayAllocationInfo>>()),
+            (
+                n.arrays,
+                size_of::<Slot<RetainedArray, ArrayAllocationInfo>>(),
+            ),
             (
                 n.hosts,
                 size_of::<
@@ -282,7 +285,12 @@ impl FixedOpeningOwners {
             sum.checked_add(n.checked_mul(size).ok_or(OpeningError::Overflow)?)
                 .ok_or(OpeningError::Overflow)
         })?;
-        u64::try_from(total.checked_add(RetainedArray::control_bytes().ok_or(OpeningError::Overflow)?).ok_or(OpeningError::Overflow)?).map_err(|_| OpeningError::Overflow)
+        u64::try_from(
+            total
+                .checked_add(RetainedArray::control_bytes().ok_or(OpeningError::Overflow)?)
+                .ok_or(OpeningError::Overflow)?,
+        )
+        .map_err(|_| OpeningError::Overflow)
     }
     pub(super) fn empty(n: OpeningSlots) -> Self {
         Self {
@@ -331,7 +339,7 @@ impl FixedOpeningOwners {
                 self.arrays.available()?;
                 self.arrays.install(RetainedArray::from_canonical(cell));
                 Ok(())
-            },
+            }
             RetainedStorageRef::Host(value) => {
                 self.hosts.available()?;
                 self.hosts.install(Arc::clone(value).into());

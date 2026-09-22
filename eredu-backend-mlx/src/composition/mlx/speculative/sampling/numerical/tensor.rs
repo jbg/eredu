@@ -193,6 +193,7 @@ fn borrow_tensor(
             let provenance=match account {
                 CompletedWorkspaceSourceAccount::Model(account)=>Provenance::Model(account.clone()),
                 CompletedWorkspaceSourceAccount::Numerical(account)=>Provenance::Numerical(account.clone()),
+                CompletedWorkspaceSourceAccount::Standalone(_)=>return Err(invalid()),
             };
             (stream,provenance,Some(budget.clone()))
         }

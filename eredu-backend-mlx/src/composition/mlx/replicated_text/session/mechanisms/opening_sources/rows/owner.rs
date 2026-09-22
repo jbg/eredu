@@ -4,7 +4,7 @@ use crate::backend::error::Error;
 use std::{
     alloc::Layout,
     cell::{Cell, RefCell},
-    mem::{size_of, ManuallyDrop},
+    mem::{ManuallyDrop, size_of},
     ops::Deref,
     rc::{Rc, Weak},
 };

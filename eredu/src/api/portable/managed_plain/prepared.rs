@@ -14,12 +14,27 @@ pub struct ManagedPreparedInputRequest<'a, P> {
 }
 impl<P> ManagedPreparedInputRequest<'_, P> {
     pub fn new(input: P, settings: PreparedChatGenerationSettings) -> Self {
-        Self { input, settings, stop_sequences: &[], skip_special_tokens: true, preparation: None }
+        Self {
+            input,
+            settings,
+            stop_sequences: &[],
+            skip_special_tokens: true,
+            preparation: None,
+        }
     }
     /// Uses the exact source and preparation account returned by the loaded model.
-    pub fn from_original(input: eredu_runtime::input::OriginalModelInput<P>, settings: PreparedChatGenerationSettings) -> Self {
+    pub fn from_original(
+        input: eredu_runtime::input::OriginalModelInput<P>,
+        settings: PreparedChatGenerationSettings,
+    ) -> Self {
         let (input, preparation) = input.into_parts();
-        Self { input, settings, stop_sequences: &[], skip_special_tokens: true, preparation: Some(preparation) }
+        Self {
+            input,
+            settings,
+            stop_sequences: &[],
+            skip_special_tokens: true,
+            preparation: Some(preparation),
+        }
     }
 }
 
@@ -43,28 +58,49 @@ impl<B: OriginalTokenizerBackend> LoadedModel<B> {
         cancellation: &GenerationCancellationToken,
         options: Option<eredu_core::TextPreparationOptions>,
     ) -> Result<Option<ManagedPlainTextSession<'a, B>>, ManagedPlainTextError> {
-        if cancellation.is_cancelled() { return Ok(None); }
-        let capacity = request.settings.inference.managed_memory_capacity_bytes
-            .ok_or_else(|| ManagedPlainTextError::new(Cause::Input(TokenInputRejection::Unsupported)))?;
-        if !source.0.matches_configuration(&self.tokenizer) {
-            return Err(ManagedPlainTextError::new(Cause::Input(TokenInputRejection::IdentityMismatch)));
+        if cancellation.is_cancelled() {
+            return Ok(None);
         }
-        let (config, _) = self.resolve_text_generation_settings(request.settings)
+        let limits = request.settings.inference.memory_limits.clone();
+        if !source.0.matches_configuration(&self.tokenizer) {
+            return Err(ManagedPlainTextError::new(Cause::Input(
+                TokenInputRejection::IdentityMismatch,
+            )));
+        }
+        let (config, _) = self
+            .resolve_text_generation_settings(request.settings)
             .map_err(|error| ManagedPlainTextError::new(Cause::Generation(error)))?;
-        let source_budget = B::prepare_original_text_source_budget(&self.runtime, &source.0, capacity)
-            .map_err(|error| ManagedPlainTextError::new(Cause::Source(error)))?;
+        let source_budget =
+            B::prepare_original_text_source_budget(&self.runtime, &source.0, &limits)
+                .map_err(|error| ManagedPlainTextError::new(Cause::Source(error)))?;
         let mut input_custody = request.preparation;
-        start_original_prepared_input_with_options_for::<B, (
-            ManagedPreparedInputRequest<'_, B::Prompt>, Option<B::Prompt>,
-            ManagedPlainTextError, OriginalPlainStartError<B::Error>,
-            Option<eredu_core::TextPreparationOptions>,
-        )>(
-            &mut self.runtime, &source.0, request.input, config, &self.eos_token_ids,
-            request.stop_sequences, request.skip_special_tokens, cancellation, options,
-        ).map(|session| session.map(|mut session| {
-            session.retain_input_custody(input_custody.take());
-            ManagedPlainTextSession(session)
-        })).map_err(|error| {
+        start_original_prepared_input_with_options_for::<
+            B,
+            (
+                ManagedPreparedInputRequest<'_, B::Prompt>,
+                Option<B::Prompt>,
+                ManagedPlainTextError,
+                OriginalPlainStartError<B::Error>,
+                Option<eredu_core::TextPreparationOptions>,
+            ),
+        >(
+            &mut self.runtime,
+            &source.0,
+            request.input,
+            config,
+            &self.eos_token_ids,
+            request.stop_sequences,
+            request.skip_special_tokens,
+            cancellation,
+            options,
+        )
+        .map(|session| {
+            session.map(|mut session| {
+                session.retain_input_custody(input_custody.take());
+                ManagedPlainTextSession(session)
+            })
+        })
+        .map_err(|error| {
             let mut error = ManagedPlainTextError::startup::<B>(error);
             error.source_budget = Some(source_budget);
             error.input_preparation = input_custody;
@@ -102,9 +138,9 @@ impl<B: eredu_runtime::input::OriginalModelInputBackend> LoadedModel<B> {
     pub fn prepare_managed_model_input(
         &self,
         parts: &[eredu_runtime::input::host::HostInputPart<'_>],
-        capacity_bytes: u64,
+        limits: &eredu_core::MemoryLimitDeclarations,
     ) -> Result<eredu_runtime::input::OriginalModelInput<B::Prompt>, ManagedModelInputError> {
         let plan = eredu_runtime::input::host::PreparedHostInputPlan::prepare(parts)?;
-        B::prepare_original_model_input(&self.runtime, plan, capacity_bytes).map_err(Into::into)
+        B::prepare_original_model_input(&self.runtime, plan, limits).map_err(Into::into)
     }
 }

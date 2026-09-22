@@ -80,7 +80,7 @@ impl CaptureSourceSegment {
         self.custody
             .validate_scheduled_native_locked(native, &usage)?;
         let reservation = receipt.reservation();
-        if reservation.0.funding != Some(native.id) || !pool.same_domain(&reservation.0.pool) {
+        if reservation.0.funding != Some(native.id) || !pool.same_ledger(&reservation.0.pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         FundingSource::NativeScope(native).validate(&usage, &reservation.0.execution)?;
@@ -96,37 +96,62 @@ impl CaptureSourceSegment {
         } else {
             slot.validate(&pool, &usage)?;
         }
-        let required_bytes = receipt
-            .span_bytes(&InferenceWorkspaceSpan::Prefill(context.chunk().clone()))
-            .ok_or(WorkingMemoryError::UnknownBound)?;
+        let span = InferenceWorkspaceSpan::Prefill(context.chunk().clone());
+        let index = receipt
+            .workspace()
+            .plan()
+            .records()
+            .iter()
+            .position(|record| record.span() == &span)
+            .ok_or(WorkingMemoryError::IdentityMismatch)?;
         let state = usage
             .funding
             .get_mut(&native.id)
             .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        // Even the matching scope cannot install a second active identity or
-        // silently revalidate/replace a previously activated span.
+        // Even the matching scope cannot replace an already active identity.
         if state.active_span.is_some() {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        // The sealed selected decomposition recognizes only the native portion
-        // already protected by this exact account's immutable request cap. All
-        // other workspace remains required; no whole-cap/headroom discount.
-        let required_bytes = match receipt.workspace().control_binding() {
-            Some(binding) => binding
-                .native_span_remainder(
-                    receipt.workspace(),
-                    &InferenceWorkspaceSpan::Prefill(context.chunk().clone()),
-                    state.native_held,
-                )?
-                .unwrap_or(required_bytes),
-            None => required_bytes,
-        };
-        let available_bytes = state.spendable_remaining()?;
-        if required_bytes > available_bytes {
-            return Err(WorkingMemoryError::BudgetExceeded {
-                required_bytes,
-                available_bytes,
-            });
+        // Every slot is checked before publishing the single active marker.
+        // The selected native partition covers only its declared domain charges;
+        // host metadata and unrelated domains retain their protected balances.
+        for (slot, (domain, _)) in pool.topology().domains().enumerate() {
+            let balance = &state.domains[slot];
+            let required = receipt
+                .workspace()
+                .span_domain_bytes(index, domain)?
+                .ok_or(WorkingMemoryError::UnknownBound)?;
+            let required = match receipt.workspace().control_binding() {
+                Some(binding) => binding
+                    .native_span_domain_remainder(
+                        receipt.workspace(),
+                        index,
+                        domain,
+                        balance.native_held,
+                        balance.native_registered,
+                    )?
+                    .unwrap_or(required),
+                None => required,
+            };
+            let host = if domain == pool.topology().host_domain() {
+                state.host_held
+            } else {
+                0
+            };
+            let protected = host
+                .checked_add(balance.native_held.unwrap_or(0))
+                .ok_or(WorkingMemoryError::Poisoned)?;
+            let available = balance
+                .remaining
+                .checked_sub(protected)
+                .ok_or(WorkingMemoryError::Poisoned)?;
+            if required > available {
+                return Err(WorkingMemoryError::DomainAllowanceExceeded {
+                    domain: domain,
+                    required_bytes: required,
+                    available_bytes: available,
+                });
+            }
         }
         state.active_span = Some(ActiveCaptureSpan(Arc::downgrade(&self.identity)));
         Ok(())
@@ -144,14 +169,20 @@ mod tests {
         assert_eq!(Arc::strong_count(&identity), 1);
         drop(identity);
         assert!(marker.0.upgrade().is_none());
-        let mut state = FundingState::new(
+        let mut state = FundingState::host(
+            &crate::working_memory::memory_fixture::host_topology(),
             31,
-            Some(31),
+            Some(
+                crate::working_memory::memory_fixture::host_limits(31)
+                    .resolve(&crate::working_memory::memory_fixture::host_topology())
+                    .unwrap(),
+            ),
             &InferenceExecutionIdentity::default(),
             true,
             0,
             0,
-        );
+        )
+        .unwrap();
         state.active_span = Some(marker);
         state.run_open = false;
         assert!(

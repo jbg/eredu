@@ -58,6 +58,12 @@ impl Drop for FundedWorkOwner {
 /// storage, not allocator usable size/RSS. Reaudit on a toolchain layout change.
 /// No separately owned payload buffer or arbitrary alias population is added.
 pub(super) fn control_bytes() -> Option<u64> {
+    type OrdinaryConstructor = (
+        usize,
+        eredu_core::HostPreparationAuthority,
+        safemlx::ScopedPhysicalBackingObserver,
+        crate::backend::nn::shared::OrdinaryExecutionRegistration,
+    );
     let header = Layout::new::<[Cell<usize>; 2]>()
         .align_to(2)
         .ok()?
@@ -69,7 +75,19 @@ pub(super) fn control_bytes() -> Option<u64> {
         .pad_to_align()
         .size();
     let bytes = block
-        .checked_add(size_of::<[Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>; 4]>())?
+        .checked_add(size_of::<Option<super::OrdinaryPublicationPlan>>())?
+        .checked_add(size_of::<super::OrdinaryPublicationPlan>())?
+        .checked_add(size_of::<Option<OrdinaryConstructor>>())?
+        .checked_add(size_of::<
+            Result<OrdinaryConstructor, crate::backend::error::Error>,
+        >())?
+        .checked_add(size_of::<
+            Result<Option<OrdinaryConstructor>, crate::backend::error::Error>,
+        >())?
+        .checked_add(size_of::<
+            [Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>;
+                4],
+        >())?
         .checked_add(super::publication_scope::control_bytes()?)?
         // Caller aggregate, owner constructor parameter, Rc::new parameter.
         .checked_add(size_of::<FundedWork>())?

@@ -1,6 +1,6 @@
 use super::*;
-use eredu_nn::Tensor;
 use eredu_nn::workspace::{WorkspaceLayoutView, WorkspaceRepresentation};
+use eredu_nn::Tensor;
 
 pub(super) fn floating(dtype: InterventionDtype) -> F {
     match dtype {
@@ -66,9 +66,15 @@ impl Kernel for Count {
     fn emit(&mut self, op: Op<'_, Value>) -> Result<Value, Failure> {
         self.roots = self.roots.checked_add(1).ok_or(Failure::GeometryOverflow)?;
         Ok(match op {
-            Op::Indices(indices) => Value::new(&[i32::try_from(indices.len()).map_err(|_| Failure::GeometryOverflow)?], None)?,
+            Op::Indices(indices) => Value::new(
+                &[i32::try_from(indices.len()).map_err(|_| Failure::GeometryOverflow)?],
+                None,
+            )?,
             Op::Reshape(source, shape) => Value::new(shape, source.dtype)?,
-            Op::IndexedSelect(source, indices) => Value { shape: indices.shape, dtype: source.dtype },
+            Op::IndexedSelect(source, indices) => Value {
+                shape: indices.shape,
+                dtype: source.dtype,
+            },
             Op::IndexedUpdate(source, _, _) => *source,
             Op::Select(source, slice) => Value {
                 shape: Shape::new(&slice.shape)?,
@@ -161,12 +167,31 @@ impl Kernel for Trace<'_> {
     }
     fn emit(&mut self, op: Op<'_, TracedValue>) -> Result<TracedValue, Failure> {
         let (tensor, dtype) = match op {
-            Op::Indices(indices) => (WorkspaceTensor::initialized(&[i32::try_from(indices.len()).map_err(|_| Failure::GeometryOverflow)?], D::Int32, self.context)?, None),
-            Op::Reshape(source, shape) => (source.tensor.reshape(shape, self.context)?, source.dtype),
+            Op::Indices(indices) => (
+                crate::backend::nn::workspace::host_array::trace(
+                    &[i32::try_from(indices.len()).map_err(|_| Failure::GeometryOverflow)?],
+                    Dtype::Int32,
+                    self.context,
+                )?,
+                None,
+            ),
+            Op::Reshape(source, shape) => {
+                (source.tensor.reshape(shape, self.context)?, source.dtype)
+            }
             Op::IndexedSelect(source, indices) => (
-                source.tensor.select_elements_with_indices(&indices.tensor, self.context)?, source.dtype),
+                source
+                    .tensor
+                    .select_elements_with_indices(&indices.tensor, self.context)?,
+                source.dtype,
+            ),
             Op::IndexedUpdate(source, indices, update) => (
-                source.tensor.update_elements_with_indices(&indices.tensor, &update.tensor, self.context)?, source.dtype),
+                source.tensor.update_elements_with_indices(
+                    &indices.tensor,
+                    &update.tensor,
+                    self.context,
+                )?,
+                source.dtype,
+            ),
             Op::Select(source, slice) => (
                 source.tensor.static_slice(
                     Shape::new(&slice.starts)?.slice(),
@@ -189,8 +214,12 @@ impl Kernel for Trace<'_> {
             Op::Zero(shape, dtype) => (
                 WorkspaceTensor::zeros_from_prototype(
                     Shape::new(shape)?.slice(),
-                    WorkspaceLayoutView::new(&[], D::Float32).map_err(eredu_nn::Error::from)?
-                        .with_representation(Some(WorkspaceRepresentation::new(floating(dtype), true))),
+                    WorkspaceLayoutView::new(&[], D::Float32)
+                        .map_err(eredu_nn::Error::from)?
+                        .with_representation(Some(WorkspaceRepresentation::new(
+                            floating(dtype),
+                            true,
+                        ))),
                     self.context,
                 )?,
                 Some(dtype),
@@ -213,17 +242,25 @@ impl Kernel for Trace<'_> {
                 value.dtype,
             ),
             Op::Mask(_, value) => (
-                WorkspaceTensor::initialized(value.tensor.shape(), D::Bool, self.context)?,
+                crate::backend::nn::workspace::host_array::trace(
+                    value.tensor.shape(),
+                    Dtype::Bool,
+                    self.context,
+                )?,
                 None,
             ),
             Op::Columns(_, _, width) => (
-                WorkspaceTensor::initialized(&[width], D::Bool, self.context)?,
+                crate::backend::nn::workspace::host_array::trace(
+                    &[width],
+                    Dtype::Bool,
+                    self.context,
+                )?,
                 None,
             ),
             Op::Tensor(tensor) => (
-                WorkspaceTensor::initialized_floating(
+                crate::backend::nn::workspace::host_array::trace(
                     Shape::new(&tensor.shape)?.slice(),
-                    floating(tensor.values.dtype()),
+                    native_dtype(tensor.values.dtype()),
                     self.context,
                 )?,
                 Some(tensor.values.dtype()),

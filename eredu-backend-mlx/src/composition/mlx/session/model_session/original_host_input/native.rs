@@ -14,12 +14,14 @@ use safemlx::{
 use std::{alloc::Layout, collections::TryReserveError, mem::size_of};
 
 mod model_input;
-pub(in crate::composition::mlx::session::model_session) use model_input::{RetiredMlxPreparedModelInputError, RetiredMlxPreparedModelInputBindError};
 pub(crate) use model_input::CompletedOriginalModelInput;
 pub(in crate::composition::mlx::session::model_session) use model_input::CompletedOriginalTextInput;
 pub use model_input::{
     MlxOriginalPreparedModelInput, MlxPreparedModelInputBindError, MlxPreparedModelInputError,
     MlxPreparedModelInputPlan,
+};
+pub(in crate::composition::mlx::session::model_session) use model_input::{
+    RetiredMlxPreparedModelInputBindError, RetiredMlxPreparedModelInputError,
 };
 
 /// Explicit ordinary initialization of the actual native allocator and thread
@@ -35,7 +37,7 @@ impl MlxPreparedInputMaterializer {
     /// ordinary predecessor is promoted. Worker/stream/context ownership and
     /// complete execution fit remain separate prerequisites.
     pub fn prepare_admitted(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<Self, MlxInputAllocatorInitializationError> {
         crate::backend::managed_memory::input_allocator::prepare_admitted(pool)
             .map(|(runtime, coverage)| Self(runtime, coverage))
@@ -128,7 +130,7 @@ pub struct MlxPreparedNativeInputPlan<'a> {
 impl MlxPreparedNativeInputPlan<'_> {
     /// Full original B1 charge including actual generic accounting controls.
     pub fn required_bytes(&self) -> Result<u64, WorkingMemoryError> {
-        WorkingMemoryPool::prepared_native_input_required_bytes(&Compiler {
+        MemoryLedger::prepared_native_input_required_bytes(&Compiler {
             plan: self.borrowed(),
         })
     }
@@ -144,7 +146,7 @@ impl MlxPreparedNativeInputPlan<'_> {
     /// registration, evaluation, native submission or ordinary owner acquisition.
     pub fn materialize(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<MlxOriginalPreparedNativeInput, MlxPreparedNativeInputError> {
         pool.compile_prepared_native_input(Compiler { plan: self })
             .map(MlxOriginalPreparedNativeInput)
@@ -199,6 +201,21 @@ impl PreparedNativeInputCompiler for Compiler<'_> {
     }
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
         Ok(self.plan.required)
+    }
+    fn required_storage_requirements(
+        &self,
+        topology: &eredu_core::MemoryTopology,
+    ) -> Result<eredu_core::DomainMemoryRequirements, WorkingMemoryError> {
+        if self.plan.runtime.allocation_placement() != safemlx::AllocationPlacement::Host {
+            return Err(WorkingMemoryError::UnknownBound);
+        }
+        let mut requirements = eredu_core::DomainMemoryRequirements::zero(topology);
+        requirements.add_allocation(
+            u64::try_from(self.required_storage_bytes()?)
+                .map_err(|_| WorkingMemoryError::Overflow)?,
+            &eredu_core::MemoryPlacement::fixed(topology, topology.host_domain())?,
+        )?;
+        Ok(requirements)
     }
     fn compile(
         self,
@@ -262,13 +279,15 @@ impl MlxOriginalPreparedNativeInput {
     }
     /// Full original B1 charge, retained independently of source I.
     pub fn original_bytes(&self) -> u64 {
-        self.0.original_bytes()
+        self.0
+            .original_bytes()
+            .expect("prepared mechanism has one fixed host domain")
     }
     /// Number of actual completed canonical leaves.
     pub fn slot_count(&self) -> usize {
         self.0.storage().leaves.len()
     }
-    pub(super) fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub(super) fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.0.validate_pool(pool)
     }
     /// Only the ordinary lowerer calls this after authenticating each actual
@@ -318,7 +337,9 @@ impl MlxPreparedNativeInputError {
     }
     /// Original retained B1 bytes; zero for a pre-work rejection.
     pub fn retained_bytes(&self) -> u64 {
-        self.0.retained_bytes()
+        self.0
+            .retained_bytes()
+            .expect("prepared mechanism has one fixed host domain")
     }
 }
 impl std::fmt::Display for MlxPreparedNativeInputError {

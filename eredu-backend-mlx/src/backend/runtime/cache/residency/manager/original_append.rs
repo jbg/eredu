@@ -1,13 +1,14 @@
-//! Actual prepared device publication under an exact model-role append claim.
+//! Canonical publication shared by authentic Original and ordinary source loans.
+use super::prepared_append::PreparedAppend;
 use super::*;
-use crate::backend::nn::workspace::OriginalPagedAppendClaim;
+use crate::backend::nn::workspace::{OrdinaryPagedAppend, OriginalPagedAppendClaim};
 use safemlx::error::Exception;
 use std::{mem::size_of, sync::TryLockError};
 
 impl CacheResidencyManager {
-    fn original_append_lock<'a>(
+    fn prepared_append_lock<'a, C: PreparedAppend>(
         &'a self,
-        claim: &OriginalPagedAppendClaim<'_>,
+        claim: &C,
     ) -> Result<MutexGuard<'a, CacheManagerState>, Exception> {
         let state = self.inner.state.try_lock().map_err(|cause| {
             claim.error(match cause {
@@ -26,9 +27,7 @@ impl CacheResidencyManager {
                 claim.validate_retained_storage(
                     id,
                     record.physical.phase(),
-                    record
-                        .disk()
-                        .and_then(|location| location.live_source.as_ref()),
+                    record.disk().and_then(DiskLocation::file_source).as_ref(),
                 )?;
             }
         }
@@ -53,9 +52,9 @@ impl CacheResidencyManager {
     }
     /// No native work occurs under this guard. Source/role authentication
     /// precedes the same actual manager transfer-device and tail agreement.
-    pub(crate) fn begin_original_append(
+    pub(crate) fn begin_prepared_append<C: PreparedAppend>(
         &self,
-        claim: &OriginalPagedAppendClaim<'_>,
+        claim: &C,
         tail_bytes: u64,
         stream: &Stream,
     ) -> Result<(), Exception> {
@@ -65,7 +64,7 @@ impl CacheResidencyManager {
             device_type: snapshot.device_type(),
             index: snapshot.device_index(),
         };
-        let mut state = self.original_append_lock(claim)?;
+        let mut state = self.prepared_append_lock(claim)?;
         if state.transfer_device.is_some_and(|bound| bound != device) {
             return Err(claim.error(CacheSourceError::Identity));
         }
@@ -79,16 +78,16 @@ impl CacheResidencyManager {
         state.transfer_device = Some(device);
         Ok(())
     }
-    pub(crate) fn publish_original_tail(
+    pub(crate) fn publish_prepared_tail<C: PreparedAppend>(
         &self,
-        claim: &mut OriginalPagedAppendClaim<'_>,
+        claim: &mut C,
         bytes: u64,
         end: i64,
         clearing: bool,
         restoring: bool,
     ) -> Result<(), Exception> {
         claim.validate_tail_update(bytes, end, clearing, restoring)?;
-        let mut state = self.original_append_lock(claim)?;
+        let mut state = self.prepared_append_lock(claim)?;
         let previous = state
             .lifecycle
             .set_tail_prepared(claim.layer(), MutableCacheTail { bytes, end })
@@ -116,9 +115,9 @@ impl CacheResidencyManager {
     }
     /// Exact arrays settle outside all manager/source loans before a native
     /// record enters the same canonical logical/physical insertion worker.
-    pub(crate) fn seal_original_block(
+    pub(crate) fn seal_prepared_block<C: PreparedAppend>(
         &self,
-        claim: &mut OriginalPagedAppendClaim<'_>,
+        claim: &mut C,
         id: CacheBlockId,
         arrays: CacheBlockArrays,
         stream: &Stream,
@@ -130,9 +129,9 @@ impl CacheResidencyManager {
             .ok_or_else(|| claim.error(CacheSourceError::Overflow))?;
         claim.rebalance_host(bytes, None, Some(&id), stream)?;
         let (metadata, protected) = claim.take_publication(&id, &arrays)?;
-        crate::backend::runtime::cache::complete_values(arrays.arrays(), stream)?;
+        claim.complete(arrays.arrays(), stream)?;
         let record = metadata.into_record(id.clone(), arrays, false);
-        let mut state = match self.original_append_lock(claim) {
+        let mut state = match self.prepared_append_lock(claim) {
             Ok(state) => state,
             Err(cause) => {
                 drop(record);
@@ -171,14 +170,14 @@ impl CacheResidencyManager {
         drop(state);
         claim.published(&id)
     }
-    pub(crate) fn rollback_original_append(
+    pub(crate) fn rollback_prepared_append<C: PreparedAppend>(
         &self,
-        claim: &OriginalPagedAppendClaim<'_>,
+        claim: &C,
         tail_bytes: u64,
         offset: i64,
     ) -> Result<(), Exception> {
         claim.validate_rollback_tail(tail_bytes, offset)?;
-        let mut state = self.original_append_lock(claim)?;
+        let mut state = self.prepared_append_lock(claim)?;
         // Check all leases before any removal. IDs come only from this exact
         // consumed publication program; existing source blocks are untouched.
         for index in 0..claim.published_count() {
@@ -207,7 +206,7 @@ impl CacheResidencyManager {
             .ok_or_else(|| claim.error(CacheSourceError::Overflow))?;
         // Remove outside each guard so native arrays/account metadata never
         // retire beneath the manager mutex. The source role is already fenced
-        // if any original operation fails, and no worker exists on this path.
+        // if an operation fails, and no worker exists on this path.
         for index in (0..claim.published_count()).rev() {
             let id = claim
                 .publication_id(index)
@@ -216,7 +215,7 @@ impl CacheResidencyManager {
                 .map_err(|cause| claim.error(cause))?;
             drop(state);
             drop(removed);
-            state = self.original_append_lock(claim)?;
+            state = self.prepared_append_lock(claim)?;
         }
         state
             .lifecycle
@@ -231,15 +230,21 @@ impl CacheResidencyManager {
         state.generation = generation;
         reporting::update_report_totals_prepared(&mut state).map_err(|cause| claim.error(cause))
     }
-    pub(crate) fn original_append_rollback_error(
+    pub(crate) fn prepared_append_rollback_error(
         primary: Exception,
         rollback: Exception,
     ) -> Exception {
         rollback_error(primary, rollback)
     }
     pub(crate) fn original_append_control_bytes() -> Option<usize> {
+        Self::prepared_append_control_bytes::<OriginalPagedAppendClaim<'_>>()
+    }
+    pub(crate) fn ordinary_append_control_bytes() -> Option<usize> {
+        Self::prepared_append_control_bytes::<OrdinaryPagedAppend>()
+    }
+    fn prepared_append_control_bytes<C: PreparedAppend>() -> Option<usize> {
         let frames = [
-            size_of::<(&Self, &OriginalPagedAppendClaim<'_>, &Stream)>(),
+            size_of::<(&Self, &C, &Stream)>(),
             size_of::<MutexGuard<'_, CacheManagerState>>(),
             size_of::<
                 Result<
@@ -253,7 +258,8 @@ impl CacheResidencyManager {
             size_of::<CacheBlockId>(),
             size_of::<CacheBlockArrays>(),
             size_of::<CacheBlockRecord>(),
-            size_of::<Option<&LiveCacheBlockSource>>(),
+            size_of::<Option<CacheFileSource>>(),
+            size_of::<Option<&CacheFileSource>>(),
             size_of::<Option<CacheBlockRecord>>(),
             size_of::<Option<MutableCacheTail>>(),
             size_of::<Result<(), Exception>>(),
@@ -269,9 +275,9 @@ impl CacheResidencyManager {
     }
 }
 
-/// Same local/pool boundary as ordinary rebalance. This selected original
-/// worker has no tier-transition authority; over-budget candidates roll back.
-fn device_fit(
+/// Same local/pool boundary as ordinary rebalance. Source-specific transfer
+/// preparation precedes this common publication check; failures roll back.
+pub(super) fn device_fit(
     state: &mut CacheManagerState,
     options: &PagedCacheOptions,
     required: Option<&CacheBlockId>,
@@ -324,7 +330,7 @@ fn device_fit(
     }
 }
 #[derive(Debug, thiserror::Error)]
-#[error("{primary}; additionally failed to restore original paged append: {rollback}")]
+#[error("{primary}; additionally failed to restore paged append: {rollback}")]
 struct RollbackFailure {
     #[source]
     primary: Exception,
@@ -332,4 +338,8 @@ struct RollbackFailure {
 }
 pub(super) fn rollback_error(primary: Exception, rollback: Exception) -> Exception {
     Exception::from_retained_source(RollbackFailure { primary, rollback })
+}
+
+pub(super) fn rollback_control_bytes() -> Option<usize> {
+    Exception::retained_source_control_bytes::<RollbackFailure>()
 }

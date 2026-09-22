@@ -6,7 +6,10 @@ pub(super) fn inspect(
     operation: WorkspaceOperationView<'_>,
     mechanism: MlxCpuWorkspaceMechanisms,
 ) -> facts::FactResult<Option<OperationPlan>> {
-    let scalar=matches!(operation.kind,WorkspaceOperationKindView::Elementwise("multiply_scalar"));
+    let scalar = matches!(
+        operation.kind,
+        WorkspaceOperationKindView::Elementwise("multiply_scalar")
+    );
     let (binary, unary) = match operation.kind {
         WorkspaceOperationKindView::Elementwise("add") => (Some(CpuBinaryOperation::Add), None),
         WorkspaceOperationKindView::Elementwise("subtract") => {
@@ -22,12 +25,14 @@ pub(super) fn inspect(
             (None, Some(CpuUnaryOperation::Square))
         }
         WorkspaceOperationKindView::Elementwise("tanh") => (None, Some(CpuUnaryOperation::Tanh)),
-        WorkspaceOperationKindView::Elementwise("exp") => (None, Some(CpuUnaryOperation::Exponential)),
+        WorkspaceOperationKindView::Elementwise("exp") => {
+            (None, Some(CpuUnaryOperation::Exponential))
+        }
         WorkspaceOperationKindView::Elementwise("log") => (None, Some(CpuUnaryOperation::Log)),
         _ => return Ok(None),
     };
     if operation.outputs.len() != 1
-        || operation.inputs.len() != if binary.is_some()&&!scalar { 2 } else { 1 }
+        || operation.inputs.len() != if binary.is_some() && !scalar { 2 } else { 1 }
     {
         return Err(MlxWorkspaceFactError::descriptor(
             "CPU pointwise source input/output population differs",
@@ -41,12 +46,21 @@ pub(super) fn inspect(
     // multiply_scalar's ordinary eager F32 scalar promotes either half input
     // to F32. Quote the real input cast; do not relabel the half source or round
     // the F32 result back to its input representation.
-    let right_dtype=match operation.inputs.get(1) {
-        Some(right)=>{let Some(representation)=right.representation() else{return Ok(None)};Some(representation.dtype())},
-        None=>None,
+    let right_dtype = match operation.inputs.get(1) {
+        Some(right) => {
+            let Some(representation) = right.representation() else {
+                return Ok(None);
+            };
+            Some(representation.dtype())
+        }
+        None => None,
     };
-    let dtype=if scalar {WorkspaceFloatingType::Float32}else{
-        right_dtype.map_or(input_dtype,|right|super::super::representation::promote(input_dtype,right))
+    let dtype = if scalar {
+        WorkspaceFloatingType::Float32
+    } else {
+        right_dtype.map_or(input_dtype, |right| {
+            super::super::representation::promote(input_dtype, right)
+        })
     };
     let native_input = match input_dtype {
         WorkspaceFloatingType::Float32 => safemlx::Dtype::Float32,
@@ -69,22 +83,18 @@ pub(super) fn inspect(
     if elements > i32::MAX as usize {
         return Ok(None);
     }
-    // The ordinary binary General branch handles row gaps without an input
-    // copy. A complete eager scalar and a last-axis-contiguous F32 rectangle
-    // select that same bounded rank worker and one dense output allocation.
-    // The native descriptor independently validates the actual strides/backing.
-    let scalar_rows = binary.is_some() && !scalar && dtype==WorkspaceFloatingType::Float32
-        && first.shape()==output.shape() && (2..=4).contains(&rank)
-        && output.shape()[rank-1]>1
-        && operation.inputs.get(1).is_some_and(|right|right.elements().ok()==Some(1));
-    for (index,input) in operation.inputs.iter().enumerate() {
+    // Binary General dispatch already quotes rank-bounded collapse and
+    // iterator controls for strided operands, including the eager scalar path.
+    // Complete F32 rows may have gaps in either operand; promotion casts use
+    // the same General-copy source and the consumer validates actual spans.
+    let strided_rows = binary.is_some() && dtype == WorkspaceFloatingType::Float32;
+    for input in operation.inputs.iter() {
         if input.dtype() != WorkspaceDtype::Float32
             || input.shape().len() > rank
             || input.shape().iter().any(|&n| n <= 0)
             || !input
                 .representation()
-                .is_some_and(|r| r.row_contiguous()
-                    || (scalar_rows && index==0 && r.last_axis_contiguous()))
+                .is_some_and(|r| r.row_contiguous() || (strided_rows && r.last_axis_contiguous()))
         {
             return Ok(None);
         }
@@ -103,32 +113,57 @@ pub(super) fn inspect(
         ));
     }
     let mut population = CpuPopulation::default();
-    let mut cast_births=0usize;let mut cast_bytes=0u64;
+    let mut cast_births = 0usize;
+    let mut cast_bytes = 0u64;
     let source = (|| {
         if scalar {
-            population.copy(OperationEvent::cpu_cast_layout(native_input,native_dtype,rank,elements,false)?,1)?;
-            population.copy(OperationEvent::cpu_cast_layout(native_dtype,native_dtype,0,1,false)?,1)?;
-            population.copy(OperationEvent::cpu_broadcast_alias_layout(rank,rank,false)?,1)?;
-            population.copy(OperationEvent::cpu_broadcast_alias_layout(0,rank,false)?,1)?;
+            population.copy(
+                OperationEvent::cpu_cast_layout(native_input, native_dtype, rank, elements, false)?,
+                1,
+            )?;
+            population.copy(
+                OperationEvent::cpu_cast_layout(native_dtype, native_dtype, 0, 1, false)?,
+                1,
+            )?;
+            population.copy(
+                OperationEvent::cpu_broadcast_alias_layout(rank, rank, false)?,
+                1,
+            )?;
+            population.copy(
+                OperationEvent::cpu_broadcast_alias_layout(0, rank, false)?,
+                1,
+            )?;
         }
         for input in operation.inputs.iter() {
-            let source_dtype=input.representation()?.dtype();
-            if !scalar&&source_dtype!=dtype {
+            let source_dtype = input.representation()?.dtype();
+            if !scalar && source_dtype != dtype {
                 // Native binary promotion casts before broadcast. A stored
                 // scalar converts one element, not an output-sized replica;
                 // a differing full operand owns its own complete cast backing.
-                let from=match source_dtype {
-                    WorkspaceFloatingType::Float32=>safemlx::Dtype::Float32,
-                    WorkspaceFloatingType::Float16=>safemlx::Dtype::Float16,
-                    WorkspaceFloatingType::Bfloat16=>safemlx::Dtype::Bfloat16,
+                let from = match source_dtype {
+                    WorkspaceFloatingType::Float32 => safemlx::Dtype::Float32,
+                    WorkspaceFloatingType::Float16 => safemlx::Dtype::Float16,
+                    WorkspaceFloatingType::Bfloat16 => safemlx::Dtype::Bfloat16,
                 };
-                let count=usize::try_from(input.elements().ok()?).ok()?;
-                let cast=OperationEvent::cpu_cast_layout(from,native_dtype,input.shape().len(),count,false)?;
-                if dtype!=WorkspaceFloatingType::Float32||cast.backing_births()!=1{return None;}
-                cast_births=cast_births.checked_add(1)?;
-                cast_bytes=cast_bytes.checked_add(mechanism.allocation.fixed_buffer_capacity(
-                    u64::try_from(count).ok()?.checked_mul(4)?).ok()?)?;
-                population.copy(cast,1)?;
+                let count = usize::try_from(input.elements().ok()?).ok()?;
+                let cast = OperationEvent::cpu_cast_layout(
+                    from,
+                    native_dtype,
+                    input.shape().len(),
+                    count,
+                    false,
+                )?;
+                if dtype != WorkspaceFloatingType::Float32 || cast.backing_births() != 1 {
+                    return None;
+                }
+                cast_births = cast_births.checked_add(1)?;
+                cast_bytes = cast_bytes.checked_add(
+                    mechanism
+                        .allocation
+                        .fixed_buffer_capacity(u64::try_from(count).ok()?.checked_mul(4)?)
+                        .ok()?,
+                )?;
+                population.copy(cast, 1)?;
             }
             if input.shape() != output.shape() {
                 population.copy(
@@ -155,7 +190,7 @@ pub(super) fn inspect(
         }
         Some(())
     })();
-    if source.is_none() || population.births != if scalar {3} else {1+cast_births} {
+    if source.is_none() || population.births != if scalar { 3 } else { 1 + cast_births } {
         return Ok(None);
     }
     let frames = [
@@ -165,11 +200,12 @@ pub(super) fn inspect(
         size_of::<WorkspaceOperationView<'_>>(),
         size_of::<WorkspaceLayoutView<'_>>() * 3,
         size_of::<MlxCpuWorkspaceMechanisms>(),
-        size_of::<WorkspaceFloatingType>()*3,
+        size_of::<WorkspaceFloatingType>() * 3,
         size_of::<Option<WorkspaceFloatingType>>(),
-        size_of::<safemlx::Dtype>()*3,
-        size_of::<WorkspaceRepresentation>(),size_of::<Option<WorkspaceRepresentation>>(),
-        size_of::<Result<u64,MlxWorkspaceFactError>>(),
+        size_of::<safemlx::Dtype>() * 3,
+        size_of::<WorkspaceRepresentation>(),
+        size_of::<Option<WorkspaceRepresentation>>(),
+        size_of::<Result<u64, MlxWorkspaceFactError>>(),
         size_of::<WorkspaceBroadcastShape<'_>>(),
         size_of::<Option<CpuBinaryOperation>>(),
         size_of::<Option<CpuUnaryOperation>>(),
@@ -181,11 +217,12 @@ pub(super) fn inspect(
         size_of::<Option<safemlx::CpuUnaryEvalLayout>>(),
         size_of::<Option<()>>(),
         size_of::<usize>() * 6,
-        size_of::<u64>()*3,
-        size_of::<bool>()*2,
+        size_of::<u64>() * 3,
+        size_of::<bool>() * 2,
         size_of::<Option<WorkspaceLayoutView<'_>>>(),
-        size_of::<Result<u64,eredu_nn::workspace::WorkspaceLayoutError>>(),
-        size_of::<Option<u64>>(),size_of::<std::ops::RangeInclusive<usize>>(),
+        size_of::<Result<u64, eredu_nn::workspace::WorkspaceLayoutError>>(),
+        size_of::<Option<u64>>(),
+        size_of::<std::ops::RangeInclusive<usize>>(),
         size_of::<std::iter::Enumerate<eredu_nn::workspace::WorkspaceLayoutIter<'_>>>(),
         size_of::<std::slice::Iter<i32>>(),
     ];
@@ -199,9 +236,12 @@ pub(super) fn inspect(
                 .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)
         },
     )?;
-    let output_bytes=mechanism.allocation.fixed_buffer_capacity(facts::mul(output.elements()?,4)?)?;
-    let scalar_bytes=mechanism.allocation.fixed_buffer_capacity(4)?;
-    Ok(Some(OperationPlan { alias_input: None,
+    let output_bytes = mechanism
+        .allocation
+        .fixed_buffer_capacity(facts::mul(output.elements()?, 4)?)?;
+    let scalar_bytes = mechanism.allocation.fixed_buffer_capacity(4)?;
+    Ok(Some(OperationPlan {
+        alias_input: None,
         seeds: usize::from(scalar),
         validations: 0,
         dtype,
@@ -210,25 +250,91 @@ pub(super) fn inspect(
         parameter_shells: 0,
         // Identity casts may alias; half input casts really widen to F32.
         // Both use the full-input F32 copy envelope, scalar copy and real seed.
-        scratch_bytes: facts::add(cast_bytes,if scalar {facts::add(output_bytes,facts::mul(scalar_bytes,2)?)?}else{0})?,
+        scratch_bytes: facts::add(
+            cast_bytes,
+            if scalar {
+                facts::add(output_bytes, facts::mul(scalar_bytes, 2)?)?
+            } else {
+                0
+            },
+        )?,
         output_bytes,
     }))
 }
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
+mod strided_tests;
+
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod tests {
     use super::*;
     use eredu_nn::Tensor;
     #[test]
-    fn cpu_same_f16_pointwise_keeps_half_rounding_source_without_promoted_copies() {
+    fn cpu_strided_binary_rows_have_a_complete_same_worker_plan() {
         let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        let selected = MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let selected =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
         let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), selected);
         let context = WorkspaceContext::new(cpu);
-        let known = Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float16, true));
-        let value = |shape: &[i32]| WorkspaceTensor::existing(context.layout(shape, WorkspaceDtype::Float32).unwrap()
-            .with_representation(known), &context).unwrap();
-        let input = value(&[2,19]); let gain = value(&[19]);
+        let representation = WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false)
+            .with_last_axis_contiguous(true)
+            .with_element_strides(&[1, 48, 1])
+            .unwrap();
+        let value = || {
+            WorkspaceTensor::existing(
+                context
+                    .layout(&[1, 2, 16], WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(Some(representation)),
+                &context,
+            )
+            .unwrap()
+        };
+        let left = value();
+        let right = value();
+        context.begin_span();
+        let output = left.multiply(&right, &context).unwrap();
+        let report = context.report(&[output]).unwrap();
+        let plan = cpu.plan(report.operations[0].as_view()).unwrap().unwrap();
+        assert_eq!(plan.population.births, 1);
+        assert_eq!(plan.scratch_bytes, 0);
+        SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context)
+            .unwrap();
+    }
+
+    #[test]
+    fn cpu_same_f16_pointwise_keeps_half_rounding_source_without_promoted_copies() {
+        let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let selected =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), selected);
+        let context = WorkspaceContext::new(cpu);
+        let known = Some(WorkspaceRepresentation::new(
+            WorkspaceFloatingType::Float16,
+            true,
+        ));
+        let value = |shape: &[i32]| {
+            WorkspaceTensor::existing(
+                context
+                    .layout(shape, WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(known),
+                &context,
+            )
+            .unwrap()
+        };
+        let input = value(&[2, 19]);
+        let gain = value(&[19]);
         context.begin_span();
         let product = input.multiply(&gain, &context).unwrap();
         let square = product.square(&context).unwrap();
@@ -241,10 +347,14 @@ mod tests {
             let plan = cpu.plan(operation.as_view()).unwrap().unwrap();
             assert_eq!(plan.dtype, WorkspaceFloatingType::Float16);
             assert_eq!(plan.population.births, 1);
-            assert_eq!(plan.population.primitives, if index==0 { 2 } else { 1 });
-            assert_eq!(plan.scratch_bytes, 0, "same precision needs no promotion copy");
+            assert_eq!(plan.population.primitives, if index == 0 { 2 } else { 1 });
+            assert_eq!(
+                plan.scratch_bytes, 0,
+                "same precision needs no promotion copy"
+            );
         }
-        SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context).unwrap();
+        SpeculativeNumericalRecipe::inspect_cpu_equations(&report, ordinary, cpu, &context)
+            .unwrap();
         let mut missing = report.operations[0].clone();
         missing.inputs[0] = missing.inputs[0].clone().with_representation(None);
         assert!(cpu.plan(missing.as_view()).unwrap().is_none());

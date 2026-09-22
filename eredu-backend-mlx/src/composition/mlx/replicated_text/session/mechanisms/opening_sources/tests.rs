@@ -3,11 +3,11 @@
 use super::*;
 use crate::backend::runtime::cache::kv::KeyValueCache;
 use eredu_core::{
-    cache::LayerCachePolicy, AttentionPolicy, InferenceGeometry, LayerSchedule, OutputDemand,
+    AttentionPolicy, InferenceGeometry, LayerSchedule, OutputDemand, cache::LayerCachePolicy,
 };
-use eredu_runtime::{working_memory::InferenceExecutionIdentity, StateLayout};
+use eredu_runtime::{StateLayout, working_memory::InferenceExecutionIdentity};
 use safemlx::{Device, DeviceType};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -108,9 +108,10 @@ fn actual_nonzero_state_host_and_execution_domains_preserve_aliases_cold() {
     );
     assert_eq!(parts.execution.array_allocation_facts(), expected);
     let host = parts.host.as_ref().unwrap();
-    assert!(host
-        .slot_metadata_sources()
-        .any(|token| token.same_storage(state.layer_slot_metadata())));
+    assert!(
+        host.slot_metadata_sources()
+            .any(|token| token.same_storage(state.layer_slot_metadata()))
+    );
     assert_eq!(host.metadata_sources().count(), 1);
     assert!(host.byte_bound().unwrap().unwrap() > 0);
     assert_eq!(MlxStateMechanisms::offset(&state), 1);
@@ -150,16 +151,18 @@ fn lazy_execution_owner_stays_unknown_after_later_external_evaluation() {
     let value = tensor();
     let lazy = MlxTensor::from_array(value.as_array().square(&stream).unwrap());
     let mut parts = OpeningSourceParts::default();
-    assert!(parts
-        .collect(
-            &state,
-            || parameters(&value),
-            |visitor| {
-                visitor(&lazy);
-                true
-            }
-        )
-        .is_err());
+    assert!(
+        parts
+            .collect(
+                &state,
+                || parameters(&value),
+                |visitor| {
+                    visitor(&lazy);
+                    true
+                }
+            )
+            .is_err()
+    );
     assert_eq!(parts.execution.unknown_arrays().len(), 1);
     assert_eq!(parts.execution.byte_bound().unwrap(), None);
     let _ = lazy.as_array().evaluated().unwrap();
@@ -200,18 +203,20 @@ fn visitor_unwind_retains_actual_array_prefix_until_owner_moves_outside_loan() {
     // Real source collection behind the same RefCell ownership pattern; this
     // does not manufacture a canonical coordinate or test the runtime hook.
     let owner = RefCell::new(OpeningSourceParts::default());
-    assert!(catch_unwind(AssertUnwindSafe(|| {
-        let mut parts = owner.borrow_mut();
-        let _ = parts.collect(
-            &state,
-            || parameters(&value),
-            |visitor| {
-                visitor(&value);
-                panic!("after real source prefix");
-            },
-        );
-    }))
-    .is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut parts = owner.borrow_mut();
+            let _ = parts.collect(
+                &state,
+                || parameters(&value),
+                |visitor| {
+                    visitor(&value);
+                    panic!("after real source prefix");
+                },
+            );
+        }))
+        .is_err()
+    );
     let parts = owner.into_inner();
     assert!(!parts.complete);
     assert_eq!(parts.execution.array_allocation_facts().len(), 1);
@@ -230,7 +235,7 @@ fn visitor_unwind_retains_actual_array_prefix_until_owner_moves_outside_loan() {
 }
 
 fn request() -> InferenceRequest {
-    InferenceRequest::without_memory_budget(
+    crate::memory_fixture::empty_admitted_request(
         &InferenceExecutionIdentity::default(),
         InferenceGeometry {
             batch_size: 1,

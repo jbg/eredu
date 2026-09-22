@@ -74,7 +74,7 @@ void exercise(Stream stream,Dtype dtype,int rank,int group,int bits,bool copy,in
   unsigned retired=0;
   struct Budget {mlx_original_buffer_budget value{};~Budget(){mlx_original_buffer_budget_release(value);}} budget;
   REQUIRE(mlx_original_buffer_budget_new_retaining(&budget.value,runtime,capacity,&retired,
-      [](void* p){++*static_cast<unsigned*>(p);})==0);
+      [](void* p){++*static_cast<unsigned*>(p);}, nullptr)==0);
   std::array<std::optional<array>,3> escaped;
   std::array<uint64_t,3> identities{};
   {

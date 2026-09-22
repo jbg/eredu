@@ -35,9 +35,13 @@ pub(super) fn control_bytes(recipe: &ResidentNativeRecipe) -> Result<Option<u64>
     control_bytes_for_attempts(recipe.kernel_attempts())
 }
 pub(super) fn control_bytes_for_attempts(attempts: Option<usize>) -> Result<Option<u64>, Error> {
-    let Some(attempts) = attempts else { return Ok(None); };
+    let Some(attempts) = attempts else {
+        return Ok(None);
+    };
     // A certified empty GPU population has no pipeline cache to construct.
-    if attempts == 0 { return Ok(Some(0)); }
+    if attempts == 0 {
+        return Ok(Some(0));
+    }
     let plan = PreparedPipelineCachePlan::new(attempts);
     let layout = match plan.layout::<OriginalTextMetadataCustody>() {
         Ok(layout) => layout,
@@ -79,14 +83,20 @@ pub(super) fn install(
     controls: &OriginalTextControlGuard,
     graph: &SubmissionGraphQuota,
 ) -> Result<(), Error> {
-    install_for_attempts(recipe.kernel_attempts().ok_or_else(unknown)?, controls, graph)
+    install_for_attempts(
+        recipe.kernel_attempts().ok_or_else(unknown)?,
+        controls,
+        graph,
+    )
 }
 pub(super) fn install_for_attempts(
     attempts: usize,
     controls: &OriginalTextControlGuard,
     graph: &SubmissionGraphQuota,
 ) -> Result<(), Error> {
-    if attempts == 0 { return Ok(()); }
+    if attempts == 0 {
+        return Ok(());
+    }
     let cache = PreparedPipelineCachePlan::new(attempts)
         .realize(controls.metadata_custody())
         .map_err(|error| {

@@ -202,7 +202,7 @@ pub(in crate::composition::mlx) struct Relu2RoutedBindingVisitor<'a> {
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
 }
 
 impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
@@ -230,8 +230,8 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
     {
         let mut mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
             MlxReplicatedTextMechanisms::new(store.clone(), self.stream, self.weights_stream)?;
-        mechanisms.set_prepared_layerwise_manager(
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+        mechanisms.set_prepared_construction_sources(
+            self.construction_sources.and_then(std::cell::Cell::take),
         );
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
@@ -262,7 +262,7 @@ pub(in crate::composition::mlx) struct RoutedBindingVisitor<'a> {
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -270,7 +270,7 @@ pub(in crate::composition::mlx) struct PoolingRoutedBindingVisitor<'a> {
     pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
-    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub(in crate::composition::mlx) construction_sources: Option<&'a NativeConstructionSlot>,
 }
 
 pub(super) fn bind_prepared_routed<A, S>(
@@ -278,7 +278,7 @@ pub(super) fn bind_prepared_routed<A, S>(
     store: eredu_checkpoint::store::RetainedCheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    construction_sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -291,7 +291,7 @@ where
 {
     let mut mechanisms: MlxReplicatedTextMechanisms<A, S> =
         MlxReplicatedTextMechanisms::new(store.clone(), stream, weights_stream)?;
-    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
+    mechanisms.set_prepared_construction_sources(construction_sources);
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
     eredu_architectures::prepared_execution::construct_selected_routed_session(
@@ -323,7 +323,7 @@ pub(super) fn bind_prepared_routed_prediction<A, S, P>(
     store: eredu_checkpoint::store::RetainedCheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
-    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    construction_sources: Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>,
     addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -341,7 +341,7 @@ where
 {
     let mut mechanisms =
         MlxReplicatedTextMechanisms::<A, S>::new(store.clone(), stream, weights_stream)?;
-    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
+    mechanisms.set_prepared_construction_sources(construction_sources);
     let mut prediction = SelectedPrediction {
         extension,
         selected,
@@ -415,7 +415,7 @@ where
             store,
             self.stream,
             self.weights_stream,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
             self.addressable_manager,
         )
     }
@@ -448,7 +448,7 @@ impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxPoo
         A::Error: std::fmt::Display,
     {
         bind_prepared_routed(prepared, store, self.stream, self.weights_stream,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
             self.addressable_manager,
         )
     }
@@ -478,7 +478,7 @@ impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHyb
         A::Error: std::fmt::Display,
     {
         bind_prepared_routed(prepared, store, self.stream, self.weights_stream,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
             self.addressable_manager,
         )
     }

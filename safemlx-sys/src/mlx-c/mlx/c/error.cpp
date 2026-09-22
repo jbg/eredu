@@ -2,6 +2,7 @@
 
 #include "mlx/c/error.h"
 #include "mlx/record_quota.h"
+#include "mlx/allocator.h"
 #include "mlx/graph_quota.h"
 #include "mlx/submission.h"
 #include <exception>
@@ -44,7 +45,9 @@ extern "C" void mlx_set_error_handler(
 namespace {
 thread_local unsigned submission_tracking_failure = 0;
 thread_local unsigned graph_metadata_failure = 0;
+thread_local void* physical_backing_failure = nullptr;
 }
+extern "C" void* mlx_error_physical_backing_failure(void) { return physical_backing_failure; }
 extern "C" unsigned mlx_error_submission_tracking_failure(void) {
   return submission_tracking_failure;
 }
@@ -66,12 +69,15 @@ _mlx_error(const char* file, const int line, const char* fmt, ...) {
   }
   submission_tracking_failure = 0;
   graph_metadata_failure = 0;
+  physical_backing_failure = nullptr;
   if (auto current = std::current_exception()) {
     try { std::rethrow_exception(current); }
     catch (const mlx::core::submission::RecordQuotaError& error) {
       submission_tracking_failure = static_cast<unsigned>(error.cause());
     } catch (const mlx::core::submission::GraphQuotaError& error) {
       graph_metadata_failure = static_cast<unsigned>(error.cause());
+    } catch (const mlx::core::allocator::PhysicalBackingAdmissionError& error) {
+      physical_backing_failure = error.cause.get();
     } catch (...) {}
   }
   va_list args, args_copy;

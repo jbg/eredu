@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::{
     MlxTensor,
     backend::nn::{
@@ -45,7 +47,11 @@ pub(super) fn exercise_component(
     let completion = plan.completion;
     assert_eq!(completion.nested_completions, 0);
     let stream = prepared.stream.clone();
-    let baseline = prepared.pool.used_bytes().unwrap();
+    // The caller's completed reference output is gone. Drain its cached native
+    // backing before measuring the live inputs retained through this operation.
+    stream.synchronize().unwrap();
+    disk::reclaim();
+    let baseline = prepared.pool.fixture_host_charge().unwrap();
     let unquoted = prepared.pool.unquoted_owner_count().unwrap();
     let output = with_prepared_original_operation_controls(
         None,
@@ -117,13 +123,13 @@ pub(super) fn exercise_component(
     );
     drop((quote, controls_reset));
     assert!(
-        prepared.pool.used_bytes().unwrap() > baseline,
+        prepared.pool.fixture_host_charge().unwrap() > baseline,
         "escaped output retains its admitted account"
     );
     drop(output);
     crate::backend::submission_recovery::wait_for_retirement(|| {
         disk::reclaim();
-        prepared.pool.used_bytes().unwrap() == baseline
+        prepared.pool.fixture_host_charge().unwrap() == baseline
             && prepared.pool.unquoted_owner_count().unwrap() == unquoted
     });
 }
@@ -213,7 +219,11 @@ struct Bind<'a> {
     bias: &'a MlxTensor,
 }
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
-    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
+    fn visit_mut(
+        &mut self,
+        metadata: eredu_nn::ParameterMetadataView<'_>,
+        value: &'a mut MlxTensor,
+    ) {
         *value = match metadata.id().as_str() {
             "matrix.weight" => self.weight,
             "matrix.scales" => self.scales,

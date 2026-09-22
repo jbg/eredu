@@ -69,10 +69,11 @@ pub(super) fn copy_profile(op: WorkspaceOperationView<'_>) -> Option<copy_rank::
     Some(copy_rank::Profile {
         worker_rank: 4,
         extra_extents: copies.allocation_extents(),
-        controls: copies.control_bytes()?.checked_add(geometry_controls)?.checked_add(
-            crate::backend::nn::relative_attention::control_bytes(
+        controls: copies
+            .control_bytes()?
+            .checked_add(geometry_controls)?
+            .checked_add(crate::backend::nn::relative_attention::control_bytes(
                 g.repeated, g.scaled, g.windowed,
-            )?,
-        )?,
+            )?)?,
     })
 }

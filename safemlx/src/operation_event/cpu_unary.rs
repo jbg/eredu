@@ -44,36 +44,67 @@ pub enum CpuUnaryOperation {
     Absolute = 16,
     /// Existing floating round-to-nearest-even worker.
     Round = 17,
+    /// Existing E4M3 byte-to-F32 conversion worker.
+    FromFp8 = 18,
 }
 /// CPU unary host and worker population, separate from physical allocator,
 /// completion event, role, and source authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CpuUnaryEvalLayout { native: safemlx_sys::mlx_cpu_unary_eval_layout }
+pub struct CpuUnaryEvalLayout {
+    native: safemlx_sys::mlx_cpu_unary_eval_layout,
+}
 impl CpuUnaryEvalLayout {
     /// Empty destinations for the real task, aliases, output and cleanup.
-    pub fn graph_allocation_extents(self) -> usize { self.native.graph_extents }
+    pub fn graph_allocation_extents(self) -> usize {
+        self.native.graph_extents
+    }
     /// Actual higher-rank strided iterator scratch bound under the same Graph.
-    pub fn worker_graph_allocation_extents(self) -> usize { self.native.worker_graph_extents }
+    pub fn worker_graph_allocation_extents(self) -> usize {
+        self.native.worker_graph_extents
+    }
     /// Output backing attempts before donation; native allocator rounding is separate.
-    pub fn backing_births(self) -> usize { self.native.backing_births }
+    pub fn backing_births(self) -> usize {
+        self.native.backing_births
+    }
     /// Native producer and Rust query/result controls.
     pub fn control_bytes(self) -> Option<usize> {
-        let parts = [size_of::<Self>(), size_of::<Option<Self>>(),
+        let parts = [
+            size_of::<Self>(),
+            size_of::<Option<Self>>(),
             size_of::<safemlx_sys::mlx_cpu_unary_eval_layout>(),
             size_of::<*mut safemlx_sys::mlx_cpu_unary_eval_layout>(),
-            size_of::<(CpuUnaryOperation,Dtype,usize,bool)>(), size_of::<bool>()];
-        parts.into_iter().try_fold(self.native.named_control_bytes.checked_add(size_of_val(&parts))?, usize::checked_add)
+            size_of::<(CpuUnaryOperation, Dtype, usize, bool)>(),
+            size_of::<bool>(),
+        ];
+        parts.into_iter().try_fold(
+            self.native
+                .named_control_bytes
+                .checked_add(size_of_val(&parts))?,
+            usize::checked_add,
+        )
     }
 }
 impl OperationEvent {
     /// Query the shared CPU unary producer without creating native arrays or jobs.
     /// Unsupported dtype/function combinations and checked overflow return None.
-    pub fn cpu_unary_layout(operation: CpuUnaryOperation, dtype: Dtype, rank: usize,
-        tracer: bool) -> Option<CpuUnaryEvalLayout> {
+    pub fn cpu_unary_layout(
+        operation: CpuUnaryOperation,
+        dtype: Dtype,
+        rank: usize,
+        tracer: bool,
+    ) -> Option<CpuUnaryEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_unary_eval_layout::default();
         // SAFETY: scalar pure query changes the initialized output only on success.
-        unsafe { safemlx_sys::mlx_operation_event_cpu_unary_eval_layout(&mut native,
-            operation as u32, dtype.into(), rank, tracer) }.then_some(CpuUnaryEvalLayout {native})
+        unsafe {
+            safemlx_sys::mlx_operation_event_cpu_unary_eval_layout(
+                &mut native,
+                operation as u32,
+                dtype.into(),
+                rank,
+                tracer,
+            )
+        }
+        .then_some(CpuUnaryEvalLayout { native })
     }
 }
 
@@ -82,20 +113,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fp8_decode_layout_keeps_the_actual_output_dtype() {
+        let qualified = OperationEvent::cpu_unary_layout(
+            CpuUnaryOperation::Exponential,
+            Dtype::Float32,
+            2,
+            false,
+        )
+        .is_some();
+        let layout =
+            OperationEvent::cpu_unary_layout(CpuUnaryOperation::FromFp8, Dtype::Float32, 3, false);
+        assert_eq!(layout.is_some(), qualified);
+        if let Some(layout) = layout {
+            assert_eq!(layout.backing_births(), 1);
+            assert!(layout.graph_allocation_extents() > 0);
+        }
+        for dtype in [Dtype::Uint8, Dtype::Float16, Dtype::Bfloat16] {
+            assert!(
+                OperationEvent::cpu_unary_layout(CpuUnaryOperation::FromFp8, dtype, 3, false,)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn quantization_unary_layouts_use_the_existing_cpu_source() {
         // Native layout qualification is platform-specific. Compare with the
         // same producer's existing floating task before requiring availability.
         let qualified = OperationEvent::cpu_unary_layout(
-            CpuUnaryOperation::Exponential, Dtype::Float32, 2, false,
-        ).is_some();
+            CpuUnaryOperation::Exponential,
+            Dtype::Float32,
+            2,
+            false,
+        )
+        .is_some();
         for operation in [CpuUnaryOperation::Absolute, CpuUnaryOperation::Round] {
             for dtype in [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32] {
                 let layout = OperationEvent::cpu_unary_layout(operation, dtype, 2, false);
                 assert_eq!(layout.is_some(), qualified);
                 if let Some(layout) = layout {
                     assert!(layout.graph_allocation_extents() > 0);
-                    let high = OperationEvent::cpu_unary_layout(operation, dtype, 14, false).unwrap();
-                    assert!(high.worker_graph_allocation_extents() > layout.worker_graph_allocation_extents());
+                    let high =
+                        OperationEvent::cpu_unary_layout(operation, dtype, 14, false).unwrap();
+                    assert!(
+                        high.worker_graph_allocation_extents()
+                            > layout.worker_graph_allocation_extents()
+                    );
                     assert_eq!(layout.backing_births(), 1);
                     assert!(layout.control_bytes().unwrap() > 0);
                 }
@@ -103,9 +166,10 @@ mod tests {
             for dtype in [Dtype::Bool, Dtype::Uint32] {
                 assert!(OperationEvent::cpu_unary_layout(operation, dtype, 2, false).is_none());
             }
-            assert!(OperationEvent::cpu_unary_layout(
-                operation, Dtype::Float32, usize::MAX, false,
-            ).is_none());
+            assert!(
+                OperationEvent::cpu_unary_layout(operation, Dtype::Float32, usize::MAX, false,)
+                    .is_none()
+            );
         }
     }
 }

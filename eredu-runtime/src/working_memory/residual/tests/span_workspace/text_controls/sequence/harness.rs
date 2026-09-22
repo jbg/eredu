@@ -38,13 +38,14 @@ pub(super) struct Mode {
 }
 pub(super) struct State {
     pub mode: Mode,
-    pub pool: WorkingMemoryPool,
+    pub pool: MemoryLedger,
     pub root: Option<WorkingMemoryStorage<u32>>,
     pub active: Option<Rc<Preparation>>,
     pub source_scope: Option<WorkingMemoryFundingScope>,
     pub source_run: Option<WorkingMemoryFundingRun>,
     pub source_reservation: Option<WorkingMemoryReservation>,
     pub source_envelope: u64,
+    pub diagnostic_pins: Vec<crate::working_memory::PreparedStoragePublication<u32>>,
     pub pending_bank: Option<crate::working_memory::OriginalGenerationSequenceBank>,
     pub foreign: Option<Rc<Preparation>>,
     pub order: Vec<&'static str>,
@@ -177,11 +178,10 @@ impl TextGenerationBackend for Backend {
         claim: &GenerationSequencePreparation<'_, '_>,
     ) -> Result<Rc<Preparation>, BackendFailure> {
         // Actual source take precedes all candidate estimates and admission.
-        let mut decoder =
-            crate::working_memory::OriginalGenerationDecoderSource::take_original(
-                claim,
-                &runtime.backend().0.borrow().pool,
-            )?;
+        let mut decoder = crate::working_memory::OriginalGenerationDecoderSource::take_original(
+            claim,
+            &runtime.backend().0.borrow().pool,
+        )?;
         let mut state = runtime.backend().0.borrow_mut();
         state.order.push("admit");
         if decoder.is_some() {
@@ -189,12 +189,11 @@ impl TextGenerationBackend for Backend {
         }
         if state.mode.audit_decoder {
             for _ in 0..32 {
-                let error =
-                    crate::working_memory::OriginalGenerationDecoderSource::take_original(
-                        claim,
-                        &state.pool,
-                    )
-                    .unwrap_err();
+                let error = crate::working_memory::OriginalGenerationDecoderSource::take_original(
+                    claim,
+                    &state.pool,
+                )
+                .unwrap_err();
                 assert_eq!(
                     error
                         .source()
@@ -232,18 +231,19 @@ impl TextGenerationBackend for Backend {
         };
         let mut original = replacement_quote(&state.pool, g, 0).into_incremental();
         if state.mode.source {
-            let q = replacement_quote(&state.pool, g, 0).into_incremental();
+            let q = replacement_quote(&state.pool, g, publication_controls()).into_incremental();
             let (reservation, _) = sealed_plan(&state.pool, &q, 1_000_000).unwrap();
             let (reservation, run) = reservation.into_funding().unwrap();
             let scope = run.scope().unwrap();
             let source = scope
-                .adopt_storage_individually([(30u32, 24)])
+                .adopt_host_storage_individually([(30u32, 24)])
                 .unwrap()
                 .into_values()
                 .next()
                 .unwrap();
             original = original.with_registered_sources(source).unwrap();
-            state.source_envelope = reservation.bytes();
+            state.source_envelope =
+                reservation_payload_bytes(&reservation) - publication_controls();
             state.source_scope = Some(scope);
             state.source_run = Some(run);
             state.source_reservation = Some(reservation);
@@ -278,7 +278,10 @@ impl TextGenerationBackend for Backend {
         assert_eq!(controls.source_identity().is_some(), state.mode.capture);
         assert!(controls.clone().with_generation_sequence(claim).is_err());
         if !state.mode.source {
-            assert_eq!(state.pool.used_bytes().unwrap(), 64 + state.loaded_bytes);
+            assert_eq!(
+                state.pool.payload_used_bytes().unwrap(),
+                64 + state.loaded_bytes
+            );
         }
         if state.mode.audit {
             let foreign = replacement_quote(&state.pool, g, 0).into_incremental();
@@ -382,13 +385,25 @@ impl TextGenerationBackend for Backend {
         };
         let q = controls.facts().total_bytes().unwrap().unwrap();
         let r = controls.sequence_storage_bytes();
-        let before = original.incremental_bytes();
+        let before = original.incremental_bytes().unwrap();
         let quote = original
             .with_span_workspace_and_text_controls(controls)
             .unwrap();
         let p = quote.span_workspace().retention_peak_bytes().unwrap();
-        assert_eq!(quote.incremental_bytes(), before + p + q + r + input_bytes);
-        let exact = state.pool.used_bytes().unwrap() + quote.incremental_bytes();
+        assert_eq!(
+            quote.incremental_bytes().unwrap(),
+            before + p + q + r + input_bytes
+        );
+        if state.mode.explicit_source && state.diagnostic_pins.is_empty() {
+            for _ in 0..3 {
+                let pin = crate::working_memory::StoragePublicationLayout::<u32>::new(1)
+                    .unwrap()
+                    .fund(&state.pool)
+                    .unwrap();
+                state.diagnostic_pins.push(pin);
+            }
+        }
+        let exact = physical_used(&state.pool) + quote_reservation_bytes(&quote);
         let capacity = if state.mode.short {
             exact - 1
         } else {
@@ -407,11 +422,14 @@ impl TextGenerationBackend for Backend {
                 &capabilities(),
                 request(g),
                 g,
-                exact + 100_000,
+                crate::working_memory::memory_fixture::resolved_host_limits(
+                    &state.pool,
+                    exact + 100_000,
+                ),
                 |candidate| {
                     state.input_candidates += 1;
                     assert_eq!(state.input_builds, 0);
-                    assert_eq!(pool.used_bytes().unwrap(), 64 + state.loaded_bytes);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), 64 + state.loaded_bytes);
                     let extra = if candidate.prefill_chunk_positions == g.prefill_chunk_positions {
                         1_000_000
                     } else {
@@ -436,7 +454,7 @@ impl TextGenerationBackend for Backend {
                 &capabilities(),
                 request(g),
                 g,
-                capacity,
+                crate::working_memory::memory_fixture::resolved_host_limits(&state.pool, capacity),
                 |_| Ok(quote.clone()),
             )
         }
@@ -836,7 +854,7 @@ impl TextGenerationBackend for Backend {
         step.validate_input(PendingTextInput::Prefill(()))?;
         let request = step.request();
         request.begin_prefill(
-            &request.memory_reservation().unwrap().0.execution,
+            &request.memory_reservation().0.execution,
             request.geometry(),
         )?;
         Ok(Some(Submission {
@@ -895,13 +913,16 @@ pub(super) fn config(maximum: usize) -> TextGenerationConfig {
     TextGenerationConfig::new(sampling)
 }
 pub(super) fn runtime(mode: Mode) -> (ModelRuntime<Backend>, Rc<RefCell<State>>) {
-    runtime_with_pool(mode, WorkingMemoryPool::new(1_000_000, 0).unwrap())
+    runtime_with_pool(
+        mode,
+        crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap(),
+    )
 }
 pub(super) fn runtime_with_pool(
     mode: Mode,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
 ) -> (ModelRuntime<Backend>, Rc<RefCell<State>>) {
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let state = Rc::new(RefCell::new(State {
         mode,
         pool,
@@ -911,6 +932,7 @@ pub(super) fn runtime_with_pool(
         source_run: None,
         source_reservation: None,
         source_envelope: 0,
+        diagnostic_pins: Vec::new(),
         pending_bank: None,
         foreign: None,
         order: vec![],
@@ -935,4 +957,14 @@ pub(super) fn runtime_with_pool(
         ModelRuntime::prepare(Backend(Rc::clone(&state)), ()).unwrap(),
         state,
     )
+}
+
+pub(super) fn diagnostic_pin(
+    state: &Rc<RefCell<State>>,
+    pool: &MemoryLedger,
+) -> Result<WorkingMemoryStorage<u32>, WorkingMemoryError> {
+    let Some(pin) = state.borrow_mut().diagnostic_pins.pop() else {
+        return pool.pin_registered_storage([(1u32, 64)]);
+    };
+    pin.pin_registered_storage([(1u32, 64)])
 }

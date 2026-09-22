@@ -8,15 +8,20 @@ use crate::speculative::autoregressive::{
 use funding::{AccountNode, AccountTicket, PendingAccount, PendingOriginal};
 use std::mem::{size_of, size_of_val};
 
+mod autoregressive_capture;
 mod embedded;
 mod external;
 use crate::speculative::external_occurrence::ExternalScheduleIdentity;
-pub use external::{OriginalExternalSpeculativeRole, OriginalExternalSpeculativeSource, OriginalExternalSpeculativeStartup};
+pub use external::{
+    OriginalExternalSpeculativeRole, OriginalExternalSpeculativeSource,
+    OriginalExternalSpeculativeStartup, SpeculativePrefillScheduleAuthority,
+};
 mod numerical;
 use crate::speculative::embedded_occurrence::EmbeddedScheduleIdentity;
 pub use embedded::{
-    OriginalEmbeddedCaptureLineage, OriginalEmbeddedSpeculativeRole, OriginalEmbeddedSpeculativeSource,
-    OriginalEmbeddedSpeculativeStartup,
+    OriginalEmbeddedCaptureLineage, OriginalEmbeddedSpeculativeRole,
+    OriginalEmbeddedSpeculativeSource, OriginalEmbeddedSpeculativeStartup,
+    OriginalModelCaptureLineage,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScheduleIdentity {
@@ -29,6 +34,7 @@ mod continuation;
 pub use continuation::SpeculativeContinuationError;
 mod registered;
 mod source_identity;
+mod source_spans;
 pub use numerical::{
     OriginalSpeculativeNumericalBudgetCustody, OriginalSpeculativeNumericalPhase,
     SpeculativeNumericalAdmissionError, SpeculativeNumericalRequirements,
@@ -36,6 +42,7 @@ pub use numerical::{
 };
 pub use registered::OriginalSpeculativeRegisteredSource;
 pub use source_identity::OriginalSpeculativeSourceIdentity;
+pub use source_spans::SpeculativeHostSourceSpans;
 
 /// Descriptive source populations are either identical at every forward or
 /// retained in exact equation order. Both feed the same accepted bank issuer.
@@ -43,10 +50,15 @@ pub use source_identity::OriginalSpeculativeSourceIdentity;
 enum SpeculativeSourceFacts {
     Uniform(HostSourceConstructionFacts),
     Spans(Vec<Option<HostSourceConstructionFacts>>),
+    FundedSpans(SpeculativeHostSourceSpans),
 }
 impl SpeculativeSourceFacts {
-    fn at(&self,ordinal:usize)->Option<HostSourceConstructionFacts> {
-        match self {Self::Uniform(facts)=>Some(*facts),Self::Spans(facts)=>facts.get(ordinal).copied().flatten()}
+    fn at(&self, ordinal: usize) -> Option<HostSourceConstructionFacts> {
+        match self {
+            Self::Uniform(facts) => Some(*facts),
+            Self::Spans(facts) => facts.get(ordinal).copied().flatten(),
+            Self::FundedSpans(facts) => facts.as_slice().get(ordinal).copied().flatten(),
+        }
     }
 }
 
@@ -56,6 +68,7 @@ impl SpeculativeSourceFacts {
 pub struct SpeculativeInvocationRequirements {
     plan: InferenceSpanWorkspacePlan,
     physical: u64,
+    placement: Arc<eredu_core::MemoryPlacement>,
     graph: u64,
     record: u64,
     controls: u64,
@@ -77,6 +90,7 @@ impl SpeculativeInvocationRequirements {
         graph: Option<u64>,
         record: Option<u64>,
         controls: Option<u64>,
+        placement: Arc<eredu_core::MemoryPlacement>,
     ) -> Result<Self, WorkingMemoryError> {
         if plan.records().is_empty()
             || plan
@@ -89,12 +103,13 @@ impl SpeculativeInvocationRequirements {
         let result = Self {
             plan: plan.clone(),
             physical: physical.ok_or(WorkingMemoryError::UnknownBound)?,
+            placement,
             graph: graph.ok_or(WorkingMemoryError::UnknownBound)?,
             record: record.ok_or(WorkingMemoryError::UnknownBound)?,
             controls: controls.ok_or(WorkingMemoryError::UnknownBound)?,
             source: None,
         };
-        result.bytes()?;
+        result.host_bytes()?;
         Ok(result)
     }
     /// Price the actual immutable source constructor bank for every recorded
@@ -118,7 +133,7 @@ impl SpeculativeInvocationRequirements {
             .checked_add(bytes)
             .ok_or(WorkingMemoryError::Overflow)?;
         self.source = Some(SpeculativeSourceFacts::Uniform(facts));
-        self.bytes()?;
+        self.host_bytes()?;
         Ok(self)
     }
     /// Retain each actual span's source program in the same order as the
@@ -127,25 +142,63 @@ impl SpeculativeInvocationRequirements {
     /// The caller supplies its already constructed descriptive table. This does
     /// not issue a bank or substitute scalar equality for source identity.
     pub fn with_host_source_spans(
-        mut self,
+        self,
         facts: Vec<Option<HostSourceConstructionFacts>>,
     ) -> Result<Self, WorkingMemoryError> {
-        if self.source.is_some(){return Err(WorkingMemoryError::AlreadyStarted);}
-        if facts.len()!=self.plan.records().len() || facts.iter().all(Option::is_none) {
+        if self.source.is_some() {
+            return Err(WorkingMemoryError::AlreadyStarted);
+        }
+        if facts.len() != self.plan.records().len() || facts.iter().all(Option::is_none) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let table=facts.capacity().checked_mul(size_of::<Option<HostSourceConstructionFacts>>())
-            .and_then(|n|u64::try_from(n).ok()).ok_or(WorkingMemoryError::Overflow)?;
-        let bytes=facts.iter().try_fold(table,|sum,facts|
-            sum.checked_add(facts.map_or(0,|facts|facts.protected_bytes())))
+        let table = facts
+            .capacity()
+            .checked_mul(size_of::<Option<HostSourceConstructionFacts>>())
+            .and_then(|n| u64::try_from(n).ok())
             .ok_or(WorkingMemoryError::Overflow)?;
-        self.controls=self.controls.checked_add(bytes).ok_or(WorkingMemoryError::Overflow)?;
-        self.source=Some(SpeculativeSourceFacts::Spans(facts));
-        self.bytes()?;
+        self.with_span_sources(SpeculativeSourceFacts::Spans(facts), table)
+    }
+    /// Retain a table built by the actual funded producer. Its original payer
+    /// follows the table into the role; only the additional immutable-source
+    /// construction allowance is reserved by this invocation.
+    pub fn with_funded_host_source_spans(
+        self,
+        facts: SpeculativeHostSourceSpans,
+    ) -> Result<Self, WorkingMemoryError> {
+        self.with_span_sources(SpeculativeSourceFacts::FundedSpans(facts), 0)
+    }
+    fn with_span_sources(
+        mut self,
+        source: SpeculativeSourceFacts,
+        table: u64,
+    ) -> Result<Self, WorkingMemoryError> {
+        if self.source.is_some() {
+            return Err(WorkingMemoryError::AlreadyStarted);
+        }
+        let facts = match &source {
+            SpeculativeSourceFacts::Spans(facts) => facts.as_slice(),
+            SpeculativeSourceFacts::FundedSpans(facts) => facts.as_slice(),
+            SpeculativeSourceFacts::Uniform(_) => unreachable!("span table source"),
+        };
+        if facts.len() != self.plan.records().len() || facts.iter().all(Option::is_none) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let bytes = facts
+            .iter()
+            .try_fold(table, |sum, facts| {
+                sum.checked_add(facts.map_or(0, |facts| facts.protected_bytes()))
+            })
+            .ok_or(WorkingMemoryError::Overflow)?;
+        self.controls = self
+            .controls
+            .checked_add(bytes)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        self.source = Some(source);
+        self.host_bytes()?;
         Ok(self)
     }
-    fn bytes(&self) -> Result<u64, WorkingMemoryError> {
-        [self.physical, self.graph, self.record, self.controls]
+    fn host_bytes(&self) -> Result<u64, WorkingMemoryError> {
+        [self.graph, self.record, self.controls]
             .into_iter()
             .try_fold(0u64, u64::checked_add)
             .ok_or(WorkingMemoryError::Overflow)
@@ -202,18 +255,41 @@ pub struct OriginalSpeculativeRequest {
     slots: Mutex<RoleSlots>,
     identity: ScheduleIdentity,
     execution: InferenceExecutionIdentity,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     // Issuance controls and capture ledgers retire before their header account.
-    ticket: AccountTicket,
+    ticket: SpeculativeRequestTicket,
+}
+
+/// Shared scheduling custody. The Arc shell retires before the final account
+/// ticket can refund its host control floor; no weak owner escapes.
+#[derive(Debug)]
+struct SpeculativeRequestTicket(Option<Arc<AccountTicket>>);
+impl Clone for SpeculativeRequestTicket {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl std::ops::Deref for SpeculativeRequestTicket {
+    type Target = AccountTicket;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("live scheduling ticket")
+    }
+}
+impl Drop for SpeculativeRequestTicket {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.0.take().and_then(Arc::into_inner) {
+            drop(ticket);
+        }
+    }
 }
 impl OriginalSpeculativeRequest {
     /// Reserves fixed issuance controls using the existing atomic account worker.
     /// No per-attempt owner table, text span or text scope is constructed.
     pub fn prepare(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
         schedule: &AutoregressiveSchedulePlan<'_>,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, SpeculativeRequestError> {
         let count = schedule
             .domains()
@@ -227,7 +303,7 @@ impl OriginalSpeculativeRequest {
             capacity,
             count,
             size_of::<(
-                &WorkingMemoryPool,
+                &MemoryLedger,
                 &InferenceExecutionIdentity,
                 &AutoregressiveSchedulePlan<'_>,
                 u64,
@@ -235,15 +311,15 @@ impl OriginalSpeculativeRequest {
         )
     }
     fn prepare_slots(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         execution: &InferenceExecutionIdentity,
         identity: ScheduleIdentity,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
         count: usize,
         caller_controls: usize,
     ) -> Result<Self, SpeculativeRequestError> {
         let bytes = request_control_bytes(caller_controls)?;
-        let ticket = accept(pool, execution, capacity, bytes, bytes)?;
+        let ticket = accept(pool, execution, capacity.clone(), bytes, bytes)?;
         if let Err(cause) = ticket.status() {
             return Err(SpeculativeRequestError {
                 cause,
@@ -263,7 +339,7 @@ impl OriginalSpeculativeRequest {
             identity,
             execution: execution.clone(),
             capacity,
-            ticket,
+            ticket: SpeculativeRequestTicket(Some(Arc::new(ticket))),
         })
     }
 
@@ -332,7 +408,7 @@ impl OriginalSpeculativeRequest {
         let ticket = accept(
             self.ticket.pool(),
             &self.execution,
-            self.capacity,
+            self.capacity.clone(),
             bytes,
             bytes,
         )?;
@@ -359,41 +435,8 @@ impl OriginalSpeculativeRequest {
         claim: AutoregressiveOccurrenceClaim<'_>,
         requirements: SpeculativeInvocationRequirements,
     ) -> Result<OriginalSpeculativeRole, SpeculativeRequestError> {
-        let ScheduleIdentity::Autoregressive(identity) = self.identity else {
-            return Err(WorkingMemoryError::IdentityMismatch.into());
-        };
-        let mut slots = self
-            .slots
-            .try_lock()
-            .map_err(|_| WorkingMemoryError::AccountConstructionBusy)?;
-        if slots.closed
-            || !claim.belongs_to(identity)
-            || claim.ordinal() < slots.next
-            || claim.ordinal() >= slots.limit
-        {
-            return Err(WorkingMemoryError::IdentityMismatch.into());
-        }
-        let ordinal = claim.ordinal();
-        slots.next = ordinal.checked_add(1).ok_or(WorkingMemoryError::Overflow)?;
-        let geometry = requirements.plan.geometry();
-        let chunk = std::num::NonZeroU64::new(geometry.prefill_chunk_positions)
-            .ok_or(WorkingMemoryError::IdentityMismatch)?;
-        let expected = claim
-            .schedule()
-            .workspace_geometry(claim.frontier(), claim.invocation(), chunk)
-            .map_err(|_| WorkingMemoryError::IdentityMismatch)?;
-        if geometry != expected {
-            return Err(WorkingMemoryError::IdentityMismatch.into());
-        }
-        let (plan, account) =
-            self.accept_role_account(ordinal, requirements, role_control_bytes()?)?;
-        let role = OriginalSpeculativeRole {
-            plan,
-            invocation: claim.invocation(),
-            frontier: claim.frontier(),
-            account,
-        };
-        Ok(role)
+        self.reserve_role_inner(claim, requirements, None)
+            .map(|(role, _)| role)
     }
 
     fn accept_role_account(
@@ -405,15 +448,24 @@ impl OriginalSpeculativeRequest {
         let controls = owner_bytes
             .checked_add(requirements.controls)
             .ok_or(WorkingMemoryError::Overflow)?;
-        let bytes = requirements
-            .bytes()?
-            .checked_add(owner_bytes)
-            .ok_or(WorkingMemoryError::Overflow)?;
-        let ticket = accept(
+        let mut domains = eredu_core::DomainMemoryRequirements::zero(self.ticket.pool().topology());
+        domains
+            .add_allocation(requirements.physical, &requirements.placement)
+            .map_err(WorkingMemoryError::from)?;
+        domains
+            .add_allocation(
+                requirements
+                    .host_bytes()?
+                    .checked_add(owner_bytes)
+                    .ok_or(WorkingMemoryError::Overflow)?,
+                &self.ticket.pool().0.host_placement,
+            )
+            .map_err(WorkingMemoryError::from)?;
+        let ticket = accept_domains(
             self.ticket.pool(),
             &self.execution,
-            self.capacity,
-            bytes,
+            self.capacity.clone(),
+            domains,
             controls,
         )?;
         if let Err(cause) = ticket.status() {
@@ -425,6 +477,7 @@ impl OriginalSpeculativeRequest {
         let SpeculativeInvocationRequirements {
             plan,
             physical,
+            placement,
             graph,
             record,
             controls: _,
@@ -436,9 +489,9 @@ impl OriginalSpeculativeRequest {
             request_account: self.ticket.id(),
             ordinal,
             physical,
+            placement,
             graph,
             record,
-            bytes,
             controls,
             neural_issued: std::sync::atomic::AtomicBool::new(false),
             prefill_started: std::sync::atomic::AtomicBool::new(false),
@@ -459,17 +512,49 @@ impl OriginalSpeculativeRequest {
     }
     /// Existing complete-domain ceiling, also applied to independently admitted
     /// state copies. Reading it grants no request role or copy permission.
-    pub const fn capacity_bytes(&self) -> u64 {
-        self.capacity
+    pub fn limits(&self) -> &eredu_core::MemoryLimits {
+        &self.capacity
     }
 
     /// A same-capacity foreign pool cannot supply this request's native owners.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.ticket.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.ticket.pool().same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
         }
+    }
+
+    /// Authenticate a retained model role before lending a request-owned source.
+    /// Equal execution, schedule geometry or capacity cannot replace the actual
+    /// issuance account. This read consumes no occurrence or native allowance.
+    pub fn validate_model_role(
+        &self,
+        role: &OriginalSpeculativeRole,
+    ) -> Result<(), WorkingMemoryError> {
+        self.validate_model_custody(&role.budget_custody())
+    }
+
+    /// Authenticate the actual account retained by any admitted model equation.
+    /// The custody is issued only by the closed model role producers.
+    pub fn validate_model_custody(
+        &self,
+        custody: &OriginalSpeculativeBudgetCustody,
+    ) -> Result<(), WorkingMemoryError> {
+        let account = custody.account.value();
+        if account.request != self.identity
+            || account.request_account != self.ticket.id()
+            || !account.ticket.pool().same_ledger(self.ticket.pool())
+            || !account.execution.same_execution(&self.execution)
+            || self
+                .slots
+                .try_lock()
+                .map_err(|_| WorkingMemoryError::AccountConstructionBusy)?
+                .closed
+        {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.ticket.status()
     }
 
     /// Stops issuance without claiming completion or releasing accepted charges.
@@ -537,7 +622,7 @@ impl StartupAccount {
         let value = self.value();
         value.request == request.identity
             && value.request_account == request.ticket.id()
-            && value.ticket.pool().same_domain(request.ticket.pool())
+            && value.ticket.pool().same_ledger(request.ticket.pool())
     }
 }
 /// Accepted target/draft constructor custody. No native invocation permission.
@@ -548,7 +633,9 @@ impl OriginalSpeculativeStartup {
     pub fn source(&self) -> AutoregressiveSource {
         match self.0.value().source {
             StartupSource::Autoregressive(source) => source,
-            StartupSource::Embedded(_) | StartupSource::External(_) => unreachable!("typed AR startup constructor"),
+            StartupSource::Embedded(_) | StartupSource::External(_) => {
+                unreachable!("typed AR startup constructor")
+            }
         }
     }
     /// Exact schedule, original issuance account and pool; no equal-byte proof.
@@ -563,9 +650,9 @@ struct RoleCharge {
     request_account: u64,
     ordinal: usize,
     physical: u64,
+    placement: Arc<eredu_core::MemoryPlacement>,
     graph: u64,
     record: u64,
-    bytes: u64,
     controls: u64,
     neural_issued: std::sync::atomic::AtomicBool,
     prefill_started: std::sync::atomic::AtomicBool,
@@ -636,7 +723,9 @@ impl RoleAccount {
                 std::sync::atomic::Ordering::Acquire,
             )
             .map_err(|_| WorkingMemoryError::IdentityMismatch)?;
-        let Some(facts)=source.at(ordinal) else {return Ok(None);};
+        let Some(facts) = source.at(ordinal) else {
+            return Ok(None);
+        };
         Ok(Some(OriginalHostSourceBank::new_with_custody(
             facts,
             None,
@@ -672,13 +761,22 @@ pub struct OriginalSpeculativeRole {
 impl OriginalSpeculativeRole {
     /// Checks the exact accepted prefill geometry without starting or claiming
     /// a span. Source constructors use this before retaining ingress metadata.
-    pub(crate) fn validate_prefill_geometry(&self, geometry: eredu_core::InferenceGeometry)
-        -> Result<(), WorkingMemoryError> {
+    pub(crate) fn validate_prefill_geometry(
+        &self,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<(), WorkingMemoryError> {
         if self.invocation.execution_pass() != crate::ExpertPass::Prefill
             || self.plan.geometry() != geometry
-            || self.plan.records().iter().any(|row| !matches!(row.span(), InferenceWorkspaceSpan::Prefill(_))) {
+            || self
+                .plan
+                .records()
+                .iter()
+                .any(|row| !matches!(row.span(), InferenceWorkspaceSpan::Prefill(_)))
+        {
             Err(WorkingMemoryError::IdentityMismatch)
-        } else { Ok(()) }
+        } else {
+            Ok(())
+        }
     }
     pub(crate) fn begin_prefill(
         &self,
@@ -829,6 +927,10 @@ impl OriginalSpeculativeRole {
     pub fn physical_bytes(&self) -> u64 {
         self.account.value().physical
     }
+    /// Physical domains assigned to this admitted native allowance.
+    pub fn placement(&self) -> &eredu_core::MemoryPlacement {
+        &self.account.value().placement
+    }
     /// Accepted host Graph arena extent.
     pub fn graph_bytes(&self) -> u64 {
         self.account.value().graph
@@ -878,7 +980,9 @@ impl OriginalSpeculativePrefillSpan {
     pub fn chunk(&self) -> &crate::prefill::PrefillChunk {
         match self.record().span() {
             InferenceWorkspaceSpan::Prefill(chunk) => chunk,
-            InferenceWorkspaceSpan::Decode { .. } | InferenceWorkspaceSpan::Sampling(_) => unreachable!("only prefill rows are claimed"),
+            InferenceWorkspaceSpan::Decode { .. } | InferenceWorkspaceSpan::Sampling(_) => {
+                unreachable!("only prefill rows are claimed")
+            }
         }
     }
     /// Same retained equation record, without constructing a competing plan.
@@ -913,7 +1017,11 @@ impl OriginalSpeculativeBudgetCustody {
     pub fn physical_bytes(&self) -> u64 {
         self.account.value().physical
     }
-    pub(in crate::working_memory) fn pool(&self) -> &WorkingMemoryPool {
+    /// Physical domains assigned to this admitted native allowance.
+    pub fn placement(&self) -> &eredu_core::MemoryPlacement {
+        &self.account.value().placement
+    }
+    pub(in crate::working_memory) fn pool(&self) -> &MemoryLedger {
         self.account.value().ticket.pool()
     }
     pub(in crate::working_memory) fn same_account(&self, other: &Self) -> bool {
@@ -921,10 +1029,10 @@ impl OriginalSpeculativeBudgetCustody {
     }
     pub(in crate::working_memory) fn validate_copy_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
-        if !self.pool().same_domain(pool) {
+        if !self.pool().same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         self.account.value().ticket.validate_in(usage)
@@ -940,32 +1048,79 @@ impl OriginalSpeculativeBudgetCustody {
 }
 
 fn accept(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     execution: &InferenceExecutionIdentity,
-    capacity: u64,
+    capacity: eredu_core::MemoryLimits,
     bytes: u64,
     controls: u64,
 ) -> Result<AccountTicket, WorkingMemoryError> {
+    let mut requirements = eredu_core::DomainMemoryRequirements::zero(pool.topology());
+    requirements
+        .add_allocation(bytes, &pool.0.host_placement)
+        .map_err(WorkingMemoryError::from)?;
+    accept_domains(pool, execution, capacity, requirements, controls)
+}
+
+fn accept_domains(
+    pool: &MemoryLedger,
+    execution: &InferenceExecutionIdentity,
+    capacity: eredu_core::MemoryLimits,
+    mut requirements: eredu_core::DomainMemoryRequirements,
+    controls: u64,
+) -> Result<AccountTicket, WorkingMemoryError> {
+    requirements.validate(pool.topology())?;
+    capacity.validate(pool.topology())?;
+    let metadata = requirements
+        .backing_bytes()?
+        .checked_mul(2)
+        .and_then(|n| {
+            capacity
+                .backing_bytes()
+                .ok()?
+                .checked_mul(2)?
+                .checked_add(n)
+        })
+        .and_then(|n| {
+            funding::domain_balance_bytes(pool.topology())
+                .ok()?
+                .checked_add(n)
+        })
+        .ok_or(WorkingMemoryError::Overflow)?;
+    requirements
+        .add_allocation(metadata, &pool.0.host_placement)
+        .map_err(WorkingMemoryError::from)?;
+    let controls = controls
+        .checked_add(metadata)
+        .ok_or(WorkingMemoryError::Overflow)?;
+    let retained_capacity = capacity.clone();
+    let retained_requirements = requirements.clone();
     let pending = {
         let mut usage = pool
             .0
             .usage
             .lock()
             .map_err(|_| WorkingMemoryError::Poisoned)?;
-        let commit =
-            PreparedAccountCommit::prepare(pool, execution, &usage, bytes, Some(capacity), &[])?;
-        PendingAccount::accept(
+        let commit = PreparedAccountCommit::prepare_domains(
+            pool,
+            execution,
+            &usage,
+            &requirements,
+            Some(&capacity),
+            &[],
+        )?;
+        PendingAccount::accept_domains(
             pool,
             execution,
             &mut usage,
             commit,
-            bytes,
-            Some(capacity),
+            retained_requirements,
+            Some(retained_capacity),
             controls,
         )?
     };
     Ok(pending.publish())
 }
+
 fn account_control_bytes() -> Result<u64, WorkingMemoryError> {
     let parts = [
         size_of::<AccountNode>(),
@@ -984,11 +1139,12 @@ fn account_control_bytes() -> Result<u64, WorkingMemoryError> {
         .ok_or(WorkingMemoryError::Overflow)
 }
 fn request_control_bytes(caller_controls: usize) -> Result<u64, WorkingMemoryError> {
+    let shared_ticket = qualified_storage::shared_bytes::<AccountTicket>()?;
     let parts = [
         size_of::<OriginalSpeculativeRequest>(),
         size_of::<RoleSlots>(),
         size_of::<(
-            &WorkingMemoryPool,
+            &MemoryLedger,
             &InferenceExecutionIdentity,
             ScheduleIdentity,
             u64,
@@ -1010,10 +1166,22 @@ fn request_control_bytes(caller_controls: usize) -> Result<u64, WorkingMemoryErr
         .ok_or(WorkingMemoryError::Overflow)?;
     account_control_bytes()?
         .checked_add(fixed)
+        .and_then(|bytes| bytes.checked_add(shared_ticket))
         .ok_or(WorkingMemoryError::Overflow)
 }
 fn role_control_bytes() -> Result<u64, WorkingMemoryError> {
     let parts = [
+        size_of::<Option<super::AutoregressiveCaptureHostPlan<'_>>>(),
+        size_of::<Option<super::PreparedAutoregressiveCapture<'_>>>(),
+        size_of::<
+            Result<
+                (
+                    OriginalSpeculativeRole,
+                    Option<super::PreparedAutoregressiveCapture<'_>>,
+                ),
+                SpeculativeRequestError,
+            >,
+        >(),
         size_of::<OriginalSpeculativeRole>(),
         size_of::<OriginalSpeculativePrefillSpan>(),
         size_of::<Result<OriginalSpeculativePrefillSpan, WorkingMemoryError>>(),

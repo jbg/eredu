@@ -480,6 +480,32 @@ pub fn all_to_all_v(
 }
 
 struct LocalVariable<'a> { group: &'a Group, stream: &'a Stream }
+/// Caller storage of the selected local itinerary. Numerical constructors,
+/// native pair completion, count readout and tensor backing have separate
+/// source quotations. All route alternatives share these finite vector bounds.
+pub(crate) fn ordinary_local_variable_control_bytes(peers:usize, exchanges:usize)->Option<usize>{
+    use std::{alloc::Layout, mem::{size_of,size_of_val}};
+    if peers==0{return None;}
+    let exchange_frames=[
+        size_of::<(&LocalVariable<'_>,LogicalExchangePlan<'_>,&Array,&Array)>(),
+        size_of::<(&mut LocalVariable<'_>,usize,usize,LogicalExchangePlan<'_>,Array)>(),
+        size_of::<[Array;6]>(),size_of::<[&Array;2]>(),size_of::<[i32;1]>(),
+        size_of::<Vec<i32>>(),Layout::array::<i32>(2).ok()?.size(),
+        size_of::<Result<Array>>(),size_of::<Result<()>>(),size_of::<i32>(),
+    ];
+    let each=exchange_frames.into_iter().try_fold(size_of_val(&exchange_frames),usize::checked_add)?;
+    let frames=[
+        size_of::<LocalVariable<'_>>(),size_of::<Vec<(usize,Array)>>(),size_of::<Vec<&Array>>(),
+        size_of::<(&mut LocalVariable<'_>,&Array,&[usize],usize)>(),size_of::<[i32;2]>(),
+        size_of::<std::ops::Range<i32>>(),size_of::<std::slice::Iter<'_,(usize,Array)>>(),
+        size_of::<Result<Array>>(),
+    ];
+    frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)?
+        .checked_add(logical_collective::variable::controls::<LocalVariable<'_>>()?)?
+        .checked_add(Layout::array::<(usize,Array)>(peers).ok()?.size())?
+        .checked_add(Layout::array::<&Array>(peers).ok()?.size())?
+        .checked_add(each.checked_mul(exchanges)?)
+}
 impl LocalVariable<'_> {
     fn complete_pair(&self, exchange: LogicalExchangePlan<'_>, sent: &Array, received: &Array)
         -> Result<()> {
@@ -512,7 +538,7 @@ impl logical_collective::variable::LocalVariableOperations for LocalVariable<'_>
         let sent_count = native_send(&count, destination, group, stream)?;
         let received_count = native_recv_like(&count, source, group, stream)?;
         self.complete_pair(exchange, &sent_count, &received_count)?;
-        let incoming_rows = received_count.evaluated()?.as_slice::<i32>()[0];
+        let incoming_rows = crate::backend::runtime::distributed::completion::ordinary_completed_i32_scalar(&received_count)?;
         if incoming_rows < 0 { return Err(self.invalid()); }
         let mut shape = routed.shape().to_vec(); shape[0] = incoming_rows;
         let empty = zeros_dtype(&shape, routed.dtype(), stream)?;

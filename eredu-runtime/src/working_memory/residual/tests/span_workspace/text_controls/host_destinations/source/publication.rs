@@ -1,11 +1,11 @@
 //! Neutral accounting oracle only; native birth truth is tested by the actual
 //! GGUF/native component. This private fixture cannot issue production origins.
 use super::*;
-use crate::working_memory::{funding, storage::native_publication::PreparedNativePublication};
 use crate::working_memory::{
     NativeStorageObservation, NativeStorageRegistration, OriginalHostSourceConstruction,
     OriginalHostSourceFailureCause, OriginalHostSourceReceipt, OriginalTextControlGuard,
 };
+use crate::working_memory::{funding, storage::native_publication::PreparedNativePublication};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -17,7 +17,7 @@ struct Completed {
     key: u32,
     bytes: u64,
     fail_attach: bool,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     // Test payload/canonical registration retire before the actual host receipt.
     _receipt: OriginalHostSourceReceipt,
 }
@@ -31,7 +31,7 @@ impl Drop for Completed {
 }
 struct Producer {
     controls: OriginalTextControlGuard,
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     calls: Rc<Cell<usize>>,
     total: u64,
     key: u32,
@@ -94,7 +94,7 @@ impl OriginalHostSourceConstruction for Producer {
 }
 fn producer(
     controls: &OriginalTextControlGuard,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     calls: &Rc<Cell<usize>>,
     key: u32,
     fail_attach: bool,
@@ -116,7 +116,7 @@ fn qualification_unknown() {
         "the selected validation environment must exercise positive immutable-source qualification"
     );
 }
-fn qualified_request(pool: &WorkingMemoryPool, bytes: u64) -> Option<IncrementalInferenceQuote> {
+fn qualified_request(pool: &MemoryLedger, bytes: u64) -> Option<IncrementalInferenceQuote> {
     let request = source_request(pool, bytes, 1, 0);
     if request.is_none() {
         qualification_unknown();
@@ -135,7 +135,7 @@ fn total() -> Option<u64> {
         Err(cause) => panic!("unexpected source layout: {cause}"),
     }
 }
-fn balances(pool: &WorkingMemoryPool) -> (u64, u64) {
+fn balances(pool: &MemoryLedger) -> (u64, u64) {
     let usage = pool.0.usage.lock().unwrap();
     (usage.reserved, usage.registered)
 }
@@ -146,8 +146,8 @@ fn source_publication_preserves_prepaid_a_origin_through_b_existing_alias() {
         return;
     };
     for drop_birth_first in [false, true] {
-        let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let Some(quote) = qualified_request(&pool, total) else {
             return;
         };
@@ -170,7 +170,7 @@ fn source_publication_preserves_prepaid_a_origin_through_b_existing_alias() {
         );
         assert_eq!((bank.remaining_bytes(), bank.remaining_attempts()), (0, 0));
         drop((bank, host, controls, span, r, run, root));
-        assert_eq!(pool.used_bytes().unwrap(), protected);
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected);
         let (b, br) = funding::tests::reservation(&pool, 200, 10_000_000)
             .into_funding()
             .unwrap();
@@ -179,9 +179,14 @@ fn source_publication_preserves_prepaid_a_origin_through_b_existing_alias() {
             .unwrap();
         let bs = br.scope().unwrap();
         let mut key_only = PreparedNativePublication::prepare_slots(bp.clone(), 1);
-        key_only.push_source(&2u32, 16, None, &pool).unwrap();
+        key_only
+            .push_placed_source(&2u32, 16, |_| None, &pool, pool.host_placement_handle())
+            .unwrap();
         let before = balances(&pool);
-        assert_eq!(key_only.publish(&bs), Err(WorkingMemoryError::IdentityMismatch));
+        assert_eq!(
+            key_only.publish(&bs),
+            Err(WorkingMemoryError::IdentityMismatch)
+        );
         assert_eq!(balances(&pool), before);
         assert!(key_only.take_input(0).is_none());
         drop(key_only);
@@ -217,68 +222,97 @@ fn source_publication_preserves_prepaid_a_origin_through_b_existing_alias() {
         let alias = publication.take_input(0).unwrap();
         bs.certify().unwrap();
         drop((publication, bp, b, br));
-        assert_eq!(pool.used_bytes().unwrap(), protected);
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected);
         if drop_birth_first {
             drop(output);
-            assert_eq!(pool.used_bytes().unwrap(), protected);
+            assert_eq!(pool.payload_used_bytes().unwrap(), protected);
             drop(alias);
         } else {
             drop(alias);
-            assert_eq!(pool.used_bytes().unwrap(), protected);
+            assert_eq!(pool.payload_used_bytes().unwrap(), protected);
             drop(output);
         }
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
-
 #[test]
 fn immutable_existing_alias_refuses_foreign_pool_and_quarantined_donor_without_credit() {
-    let Some(total) = total() else { return; };
+    let Some(total) = total() else {
+        return;
+    };
     for quarantine in [false, true] {
-        let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
-        let Some(quote) = qualified_request(&pool, total) else { return; };
+        let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+        let Some(quote) = qualified_request(&pool, total) else {
+            return;
+        };
         let (r, run, accepted) = accept(&pool, quote);
         let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
         let controls = span.control_guard();
         let mut host = span.take_host_destinations().unwrap().unwrap();
         let mut bank = host.take_source_constructions().unwrap();
         let calls = Rc::new(Cell::new(0));
-        let output = bank.construct(producer(&controls, &pool, &calls, 2, false)).unwrap();
-        assert_eq!((calls.get(), bank.remaining_bytes(), bank.remaining_attempts()), (1, 0, 0));
+        let output = bank
+            .construct(producer(&controls, &pool, &calls, 2, false))
+            .unwrap();
+        assert_eq!(
+            (
+                calls.get(),
+                bank.remaining_bytes(),
+                bank.remaining_attempts()
+            ),
+            (1, 0, 0)
+        );
         if quarantine {
             // Real unfinished native custody fences A; no private account mutation.
             drop(run.scope().unwrap());
         }
         drop((bank, host, controls, span, r, run, root));
-        let donor = pool.used_bytes().unwrap();
-        let target = if quarantine { pool.clone() } else {
-            WorkingMemoryPool::new(10_000_000, 0).unwrap()
+        let donor = pool.payload_used_bytes().unwrap();
+        let target = if quarantine {
+            pool.clone()
+        } else {
+            crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap()
         };
-        let (b, br) = funding::tests::reservation(&target, 200, 10_000_000).into_funding().unwrap();
-        let bp = br.take_native_partition(funding::native_partition::test_receipt(&br, 100)).unwrap();
+        let (b, br) = funding::tests::reservation(&target, 200, 10_000_000)
+            .into_funding()
+            .unwrap();
+        let bp = br
+            .take_native_partition(funding::native_partition::test_receipt(&br, 100))
+            .unwrap();
         let bs = br.scope().unwrap();
         let mut attempt = PreparedNativePublication::prepare_slots(bp.clone(), 1);
-        attempt.push_observation(NativeStorageObservation::ExistingImmutable(2u32, 16)).unwrap();
+        attempt
+            .push_observation(NativeStorageObservation::ExistingImmutable(2u32, 16))
+            .unwrap();
         let before = balances(&target);
-        assert_eq!(attempt.publish(&bs), Err(if quarantine {
-            WorkingMemoryError::ExecutionFenced
-        } else {
-            WorkingMemoryError::IdentityMismatch
-        }));
+        assert_eq!(
+            attempt.publish(&bs),
+            Err(if quarantine {
+                WorkingMemoryError::ExecutionFenced
+            } else {
+                WorkingMemoryError::IdentityMismatch
+            })
+        );
         assert_eq!(balances(&target), before);
         assert!(attempt.take_input(0).is_none());
-        assert_eq!(attempt.publish(&bs), Err(WorkingMemoryError::PreparationAlreadyStarted));
+        assert_eq!(
+            attempt.publish(&bs),
+            Err(WorkingMemoryError::PreparationAlreadyStarted)
+        );
         bs.certify().unwrap();
         drop((attempt, bp, b, br));
-        assert_eq!(pool.used_bytes().unwrap(), donor);
+        assert_eq!(pool.payload_used_bytes().unwrap(), donor);
         drop(output);
         if quarantine {
-            assert!(pool.used_bytes().unwrap() > 0, "failed source cannot refund its account");
+            assert!(
+                pool.payload_used_bytes().unwrap() > 0,
+                "failed source cannot refund its account"
+            );
         } else {
-            assert_eq!(pool.used_bytes().unwrap(), 0);
-            assert_eq!(target.used_bytes().unwrap(), 0);
+            assert_eq!(pool.payload_used_bytes().unwrap(), 0);
+            assert_eq!(target.payload_used_bytes().unwrap(), 0);
         }
     }
 }
@@ -288,8 +322,8 @@ fn source_publication_short_debit_never_enters_producer_and_keeps_refused_receip
     let Some(total) = total() else {
         return;
     };
-    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let Some(quote) = qualified_request(&pool, total - 1) else {
         return;
     };
@@ -313,9 +347,9 @@ fn source_publication_short_debit_never_enters_producer_and_keeps_refused_receip
     );
     assert!(pool.pin_registered_storage([(2u32, 16)]).is_err());
     drop((unstarted, bank, host, controls, span, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(retained);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -324,8 +358,8 @@ fn source_publication_conflicting_row_and_post_commit_failure_retain_truthful_pr
         return;
     };
     for (key, fail_attach, committed) in [(1u32, false, false), (2, true, true)] {
-        let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let Some(quote) = qualified_request(&pool, total) else {
             return;
         };
@@ -365,51 +399,113 @@ fn source_publication_conflicting_row_and_post_commit_failure_retain_truthful_pr
             ));
         }
         drop((bank, host, controls, span, r, run, root));
-        assert_eq!(pool.used_bytes().unwrap(), protected);
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected);
         drop(retained);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
 #[test]
 fn immutable_output_sources_publish_independently_and_do_not_refund_host_banks() {
-    let Some(total)=total() else { return; };
-    let pool=WorkingMemoryPool::new(10_000_000,0).unwrap();
-    let root=pool.register_storage([(1u32,64)]).unwrap();
-    let output_facts=HostSourceConstructionFacts::new(total*2,2,0).unwrap();
-    let host_facts=HostDestinationFacts::new(4,1).unwrap()
-        .with_source_constructions(HostSourceConstructionFacts::new(total,1,0).unwrap()).unwrap();
-    let quote=replacement_quote(&pool,geometry(),0).into_incremental();
-    let controls=PreparedTextControlWorkspace::prepare_controls(geometry(),quote.span_workspace().plan(),super::super::facts()).unwrap()
-        .with_host_destinations(host_facts).unwrap().with_output_source_constructions(output_facts).unwrap();
-    assert!(matches!(controls.clone().with_output_source_constructions(output_facts),Err(WorkingMemoryError::AlreadyStarted)));
-    let quote=quote.with_span_workspace_and_text_controls(controls).unwrap();
-    let (r,run,accepted)=accept(&pool,quote);
-    let (mut span,_)=accepted.into_funded_text_span_workspace(&run,&r).unwrap();
-    let protected=span.protected_host_bytes();let controls=span.control_guard();
-    let mut outputs=span.take_output_source_constructions().unwrap().unwrap();
-    assert!(matches!(span.take_output_source_constructions(),Err(WorkingMemoryError::AlreadyStarted)));
-    let mut host=span.take_host_destinations().unwrap().unwrap();
-    let mut cache=host.take_source_constructions().unwrap();let calls=Rc::new(Cell::new(0));
-    let before=balances(&pool);
-    let output=outputs.construct(producer(&controls,&pool,&calls,2,false)).unwrap();
-    assert_eq!(balances(&pool),before);
-    assert_eq!((outputs.remaining_bytes(),outputs.remaining_attempts()),(total,1));
-    assert_eq!((cache.remaining_bytes(),cache.remaining_attempts()),(total,1));
-    let cached=cache.construct(producer(&controls,&pool,&calls,3,false)).unwrap();
-    let mut vector=host.try_vec::<u32>(1).unwrap();vector.try_fill(1,[0x12345678]).unwrap();
-    assert_eq!(calls.get(),2);assert_eq!(vector.as_slice(),&[0x12345678]);
-    let (b,br)=funding::tests::reservation(&pool,200,10_000_000).into_funding().unwrap();
-    let bp=br.take_native_partition(funding::native_partition::test_receipt(&br,100)).unwrap();
-    let bs=br.scope().unwrap();let mut published=PreparedNativePublication::prepare_slots(bp.clone(),1);
-    published.push_observation(NativeStorageObservation::ExistingImmutable(2u32,16)).unwrap();
-    let before=balances(&pool);published.publish(&bs).unwrap();assert_eq!(balances(&pool),before);
+    let Some(total) = total() else {
+        return;
+    };
+    let pool = crate::working_memory::memory_fixture::host_ledger(10_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
+    let output_facts = HostSourceConstructionFacts::new(total * 2, 2, 0).unwrap();
+    let host_facts = HostDestinationFacts::new(4, 1)
+        .unwrap()
+        .with_source_constructions(HostSourceConstructionFacts::new(total, 1, 0).unwrap())
+        .unwrap();
+    let quote = replacement_quote(&pool, geometry(), 0).into_incremental();
+    let controls = PreparedTextControlWorkspace::prepare_controls(
+        geometry(),
+        quote.span_workspace().plan(),
+        super::super::facts(),
+    )
+    .unwrap()
+    .with_host_destinations(host_facts)
+    .unwrap()
+    .with_output_source_constructions(output_facts)
+    .unwrap();
+    assert!(matches!(
+        controls
+            .clone()
+            .with_output_source_constructions(output_facts),
+        Err(WorkingMemoryError::AlreadyStarted)
+    ));
+    let quote = quote
+        .with_span_workspace_and_text_controls(controls)
+        .unwrap();
+    let (r, run, accepted) = accept(&pool, quote);
+    let (mut span, _) = accepted.into_funded_text_span_workspace(&run, &r).unwrap();
+    let protected = span.protected_host_bytes();
+    let controls = span.control_guard();
+    let mut outputs = span.take_output_source_constructions().unwrap().unwrap();
+    assert!(matches!(
+        span.take_output_source_constructions(),
+        Err(WorkingMemoryError::AlreadyStarted)
+    ));
+    let mut host = span.take_host_destinations().unwrap().unwrap();
+    let mut cache = host.take_source_constructions().unwrap();
+    let calls = Rc::new(Cell::new(0));
+    let before = balances(&pool);
+    let output = outputs
+        .construct(producer(&controls, &pool, &calls, 2, false))
+        .unwrap();
+    assert_eq!(balances(&pool), before);
+    assert_eq!(
+        (outputs.remaining_bytes(), outputs.remaining_attempts()),
+        (total, 1)
+    );
+    assert_eq!(
+        (cache.remaining_bytes(), cache.remaining_attempts()),
+        (total, 1)
+    );
+    let cached = cache
+        .construct(producer(&controls, &pool, &calls, 3, false))
+        .unwrap();
+    let mut vector = host.try_vec::<u32>(1).unwrap();
+    vector.try_fill(1, [0x12345678]).unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(vector.as_slice(), &[0x12345678]);
+    let (b, br) = funding::tests::reservation(&pool, 200, 10_000_000)
+        .into_funding()
+        .unwrap();
+    let bp = br
+        .take_native_partition(funding::native_partition::test_receipt(&br, 100))
+        .unwrap();
+    let bs = br.scope().unwrap();
+    let mut published = PreparedNativePublication::prepare_slots(bp.clone(), 1);
+    published
+        .push_observation(NativeStorageObservation::ExistingImmutable(2u32, 16))
+        .unwrap();
+    let before = balances(&pool);
+    published.publish(&bs).unwrap();
+    assert_eq!(balances(&pool), before);
     bs.certify().unwrap();
-    drop(output);assert_eq!((outputs.remaining_bytes(),outputs.remaining_attempts()),(total,1));
-    let second=outputs.construct(producer(&controls,&pool,&calls,4,false)).unwrap();
-    assert_eq!((outputs.remaining_bytes(),outputs.remaining_attempts()),(0,0));
-    assert!(outputs.construct(producer(&controls,&pool,&calls,5,false)).is_err());assert_eq!(calls.get(),3);
-    drop((published,bp,b,br,cached,vector,cache,host,outputs,controls,span,r,run,root));
-    assert_eq!(pool.used_bytes().unwrap(),protected);
-    drop(second);assert_eq!(pool.used_bytes().unwrap(),0);
+    drop(output);
+    assert_eq!(
+        (outputs.remaining_bytes(), outputs.remaining_attempts()),
+        (total, 1)
+    );
+    let second = outputs
+        .construct(producer(&controls, &pool, &calls, 4, false))
+        .unwrap();
+    assert_eq!(
+        (outputs.remaining_bytes(), outputs.remaining_attempts()),
+        (0, 0)
+    );
+    assert!(
+        outputs
+            .construct(producer(&controls, &pool, &calls, 5, false))
+            .is_err()
+    );
+    assert_eq!(calls.get(), 3);
+    drop((
+        published, bp, b, br, cached, vector, cache, host, outputs, controls, span, r, run, root,
+    ));
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
+    drop(second);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

@@ -6,9 +6,9 @@
 
 use super::*;
 use crate::workspace::{
-    metadata_funding, validate_workspace_host_assumptions, validate_workspace_output_storage,
-    validate_workspace_tensor_declaration, Error, WorkspaceEffectError, WorkspaceHostBound,
-    WorkspaceMechanisms, HostMetadataFunding, HostMetadataFundingError,
+    Error, HostMetadataFunding, HostMetadataFundingError, WorkspaceEffectError, WorkspaceHostBound,
+    WorkspaceMechanisms, metadata_funding, validate_workspace_host_assumptions,
+    validate_workspace_output_storage, validate_workspace_tensor_declaration,
 };
 use std::{
     alloc::Layout,
@@ -51,6 +51,11 @@ pub(in crate::workspace) struct OwnedOperationFacts {
     pub(in crate::workspace) outputs: Vec<WorkspaceOutputEffect>,
     pub(in crate::workspace) aliases: Vec<usize>,
     pub(in crate::workspace) scratch_bytes: u64,
+    pub(in crate::workspace) output_sources:
+        Vec<Option<super::super::WorkspaceAllocationPopulation>>,
+    pub(in crate::workspace) scratch_source: Option<super::super::WorkspaceAllocationPopulation>,
+    pub(in crate::workspace) scratch_allocations:
+        Option<Vec<super::super::WorkspaceScratchAllocation>>,
     pub(in crate::workspace) assumptions: String,
 }
 
@@ -79,6 +84,8 @@ pub(in crate::workspace) struct WorkspaceFactPreparation<E> {
     tensor: Option<WorkspaceOperationFacts>,
     host: Option<WorkspaceHostFacts>,
     buffer_bytes: usize,
+    scratch_layout: Option<(usize, usize)>,
+    output_source_count: usize,
     charged_bytes: usize,
     error: PhantomData<fn() -> E>,
 }
@@ -115,6 +122,34 @@ impl<E: std::error::Error + Send + Sync + 'static> WorkspaceFactPreparation<E> {
         if let Some(host) = host {
             buffer_bytes = add(buffer_bytes, array_bytes::<u8, E>(host.assumption_bytes)?)?;
         }
+        let mut output_source_count = 0usize;
+        for index in 0..operation.outputs.len() {
+            if let Some(source) = mechanism
+                .output_allocations(operation, index)
+                .map_err(FactPreparationError::Mechanism)?
+            {
+                if tensor.is_none() || source.domain_population().is_some() {
+                    return Err(FactPreparationError::Changed);
+                }
+                output_source_count = add(output_source_count, 1)?;
+            }
+        }
+        if output_source_count != 0 {
+            buffer_bytes = add(
+                buffer_bytes,
+                array_bytes::<Option<super::super::WorkspaceAllocationPopulation>, E>(
+                    operation.outputs.len(),
+                )?,
+            )?;
+        }
+        let scratch_layout = mechanism
+            .scratch_allocations(operation)
+            .map_err(FactPreparationError::Mechanism)?
+            .map(|rows| scratch_layout::<E>(rows, tensor.map(|value| value.scratch_bytes)))
+            .transpose()?;
+        if let Some((_, bytes)) = scratch_layout {
+            buffer_bytes = add(buffer_bytes, bytes)?;
+        }
         let charged_bytes = add(
             control_bytes::<E>().ok_or(FactPreparationError::Overflow)?,
             buffer_bytes,
@@ -123,6 +158,8 @@ impl<E: std::error::Error + Send + Sync + 'static> WorkspaceFactPreparation<E> {
             tensor,
             host,
             buffer_bytes,
+            scratch_layout,
+            output_source_count,
             charged_bytes,
             error: PhantomData,
         })
@@ -185,10 +222,63 @@ impl<E: std::error::Error + Send + Sync + 'static> WorkspaceFactPreparation<E> {
                         operation.inputs.len(),
                     )?;
                 }
+                let population = mechanism
+                    .scratch_allocations(operation)
+                    .map_err(FactPreparationError::Mechanism)?;
+                let layout = population
+                    .map(|rows| scratch_layout::<E>(rows, Some(facts.scratch_bytes)))
+                    .transpose()?;
+                if layout != self.scratch_layout {
+                    return Err(FactPreparationError::Changed);
+                }
+                let scratch_allocations = population
+                    .map(|rows| {
+                        let rows = rows.allocations();
+                        let mut owned = Vec::new();
+                        owned.try_reserve_exact(rows.len())?;
+                        owned.extend(rows.iter().cloned());
+                        Ok::<_, FactPreparationError<E>>(owned)
+                    })
+                    .transpose()?;
+                let mut output_sources = Vec::new();
+                if self.output_source_count != 0 {
+                    output_sources.try_reserve_exact(operation.outputs.len())?;
+                }
+                let mut count = 0usize;
+                for index in 0..operation.outputs.len() {
+                    let source = mechanism
+                        .output_allocations(operation, index)
+                        .map_err(FactPreparationError::Mechanism)?;
+                    if let Some(source) = source {
+                        let bytes = match outputs[index].as_view(&aliases) {
+                            Some(WorkspaceOutputStorageView::Allocate(bytes))
+                            | Some(WorkspaceOutputStorageView::AllocateOrAliasInputs {
+                                bytes,
+                                ..
+                            }) => bytes,
+                            _ => return Err(FactPreparationError::Changed),
+                        };
+                        if source.domain_population().is_some()
+                            || source.backing_bytes() != Some(bytes)
+                        {
+                            return Err(FactPreparationError::Changed);
+                        }
+                        count = add(count, 1)?;
+                    }
+                    if self.output_source_count != 0 {
+                        output_sources.push(source.cloned());
+                    }
+                }
+                if count != self.output_source_count {
+                    return Err(FactPreparationError::Changed);
+                }
                 Some(OwnedOperationFacts {
                     outputs,
                     aliases,
                     scratch_bytes: facts.scratch_bytes,
+                    scratch_allocations,
+                    scratch_source: population.cloned(),
+                    output_sources,
                     assumptions,
                 })
             }
@@ -234,6 +324,7 @@ pub(in crate::workspace) trait FiniteWorkspaceFacts: std::fmt::Debug {
         operation: WorkspaceOperationView<'_>,
         remaining_bytes: &mut usize,
         funding: Option<&HostMetadataFunding>,
+        context: &super::super::WorkspaceContext,
     ) -> Result<EmittedWorkspaceFacts, FactEmissionFailure>;
 }
 
@@ -251,17 +342,21 @@ where
         operation: WorkspaceOperationView<'_>,
         remaining_bytes: &mut usize,
         funding: Option<&HostMetadataFunding>,
+        context: &super::super::WorkspaceContext,
     ) -> Result<EmittedWorkspaceFacts, FactEmissionFailure> {
         let controls = control_bytes::<M::Error>().ok_or(FactEmissionFailure::Overflow)?;
         debit(remaining_bytes, controls, funding)?;
         // The exact canonical source owner is paid before mechanism dispatch;
         // error erasure does not format or copy its diagnostic.
-        self.with_prepared_facts(operation, funding, |mechanism| {
+        self.with_prepared_facts_context(operation, context, |mechanism| {
             let prepared = WorkspaceFactPreparation::inspect(operation, mechanism)
                 .map_err(retain::<M::Error>)?;
             debit(remaining_bytes, prepared.buffer_bytes, funding)?;
-            prepared.construct(operation, mechanism).map_err(retain::<M::Error>)
-        }).map_err(|cause| retain::<M::Error>(FactPreparationError::Mechanism(cause)))?
+            prepared
+                .construct(operation, mechanism)
+                .map_err(retain::<M::Error>)
+        })
+        .map_err(|cause| retain::<M::Error>(FactPreparationError::Mechanism(cause)))?
     }
 }
 
@@ -318,7 +413,11 @@ fn control_bytes<E: std::error::Error + Send + Sync + 'static>() -> Option<usize
         size_of::<Option<WorkspaceHostFacts>>(),
         size_of::<WorkspaceOperationView<'_>>(),
         size_of::<&dyn WorkspaceFactMechanisms<Error = E>>(),
-        size_of::<(&mut usize, Option<&HostMetadataFunding>)>(),
+        size_of::<(
+            &mut usize,
+            Option<&HostMetadataFunding>,
+            &super::super::WorkspaceContext,
+        )>(),
         size_of::<Result<Result<EmittedWorkspaceFacts, FactEmissionFailure>, E>>(),
         size_of::<WorkspaceEffectDestination<'_>>(),
         size_of::<WorkspaceHostDestination<'_>>(),
@@ -326,6 +425,9 @@ fn control_bytes<E: std::error::Error + Send + Sync + 'static>() -> Option<usize
         size_of::<Vec<usize>>(),
         size_of::<Vec<u8>>() * 2,
         size_of::<String>() * 2,
+        size_of::<Option<Vec<super::super::WorkspaceScratchAllocation>>>(),
+        size_of::<super::super::WorkspaceScratchAllocation>() * 2,
+        size_of::<Option<&[super::super::WorkspaceScratchAllocation]>>(),
         size_of::<OwnedOperationFacts>(),
         size_of::<Option<OwnedOperationFacts>>(),
         size_of::<WorkspaceHostBound>(),
@@ -350,4 +452,29 @@ fn control_bytes<E: std::error::Error + Send + Sync + 'static>() -> Option<usize
     parts
         .into_iter()
         .try_fold(size_of_val(&parts), usize::checked_add)
+}
+
+fn scratch_layout<E>(
+    population: &super::super::WorkspaceAllocationPopulation,
+    expected: Option<u64>,
+) -> Result<(usize, usize), FactPreparationError<E>> {
+    let rows = population.allocations();
+    let mut bytes = array_bytes::<super::super::WorkspaceScratchAllocation, E>(rows.len())?;
+    for row in rows {
+        if let Some(placement) = &row.placement {
+            bytes = add(
+                bytes,
+                usize::try_from(
+                    placement
+                        .backing_bytes()
+                        .map_err(|_| FactPreparationError::Changed)?,
+                )
+                .map_err(|_| FactPreparationError::Overflow)?,
+            )?;
+        }
+    }
+    if expected != population.backing_bytes() {
+        return Err(FactPreparationError::Changed);
+    }
+    Ok((rows.len(), bytes))
 }

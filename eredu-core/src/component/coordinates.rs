@@ -202,6 +202,24 @@ impl ComponentCoordinateMap {
             .try_fold(size_of_val(&parts), usize::checked_add)
     }
 
+    /// Prospective clone storage from this actual representation. Explicit
+    /// indices retain their exact vector and node populations; insertion frames
+    /// use the ordered worker's finite maximum for each real node.
+    pub fn clone_metadata_bytes(&self) -> Option<usize> {
+        let mut bytes = Self::copy_control_bytes()?;
+        if let Selection::Indices { indices } = &self.selection {
+            bytes = bytes.checked_add(
+                std::alloc::Layout::array::<usize>(indices.len())
+                    .ok()?
+                    .size(),
+            )?;
+        }
+        let node = Map::<usize, usize>::node_allocation_layout()
+            .size()
+            .checked_add(Map::<usize, usize>::maximum_insertion_control_bytes()?)?;
+        bytes.checked_add(node.checked_mul(self.inverse.len())?)
+    }
+
     /// Copies through the same source representation used by ordinary `Clone`.
     /// The enclosing caller retains `funding` with every escaping source/error.
     pub fn try_clone_with_funding(
@@ -438,10 +456,12 @@ mod tests {
             serde_json::from_str::<ComponentCoordinateMap>(&wire).unwrap(),
             map
         );
-        assert!(serde_json::from_str::<ComponentCoordinateMap>(
-            r#"{"global_count":12,"selection":{"kind":"indices","indices":[2,2]}}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ComponentCoordinateMap>(
+                r#"{"global_count":12,"selection":{"kind":"indices","indices":[2,2]}}"#
+            )
+            .is_err()
+        );
         assert!(ComponentCoordinateMap::range(12, 8..13).is_err());
         assert!(ComponentCoordinateMap::partition_units(13, 3, 0..1).is_err());
         assert!(ComponentCoordinateMap::partition_units(12, 3, 2..4).is_err());
@@ -455,18 +475,19 @@ mod funding_tests {
     use super::*;
     use crate::HostMetadataAccount;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     #[derive(Debug)]
     struct State {
         calls: AtomicUsize,
         stop: AtomicUsize,
+        bytes: AtomicUsize,
     }
     #[derive(Debug)]
     struct Account(Arc<State>);
     impl HostMetadataAccount for Account {
-        fn reserve_metadata(&self, _: usize) -> Result<(), HostMetadataFundingError> {
+        fn reserve_metadata(&self, bytes: usize) -> Result<(), HostMetadataFundingError> {
             let call = self.0.calls.fetch_add(1, Ordering::SeqCst);
             assert!(
                 call <= self.0.stop.load(Ordering::SeqCst),
@@ -475,6 +496,7 @@ mod funding_tests {
             if call == self.0.stop.load(Ordering::SeqCst) {
                 Err(HostMetadataFundingError::Unavailable)
             } else {
+                self.0.bytes.fetch_add(bytes, Ordering::SeqCst);
                 Ok(())
             }
         }
@@ -483,9 +505,11 @@ mod funding_tests {
         let state = Arc::new(State {
             calls: AtomicUsize::new(0),
             stop: AtomicUsize::new(usize::MAX),
+            bytes: AtomicUsize::new(0),
         });
         let funding = HostMetadataFunding::new(Account(state.clone())).unwrap();
         state.calls.store(0, Ordering::SeqCst);
+        state.bytes.store(0, Ordering::SeqCst);
         state.stop.store(stop, Ordering::SeqCst);
         (funding, state)
     }
@@ -535,6 +559,7 @@ mod funding_tests {
             let copied = source.try_clone_with_funding(&funding).unwrap();
             assert_eq!(original_wire, serde_json::to_string(&copied).unwrap());
             assert_eq!(source, copied);
+            assert!(state.bytes.load(Ordering::SeqCst) <= source.clone_metadata_bytes().unwrap());
             for stop in 0..state.calls.load(Ordering::SeqCst) {
                 let (funding, state) = account(stop);
                 let error = source.try_clone_with_funding(&funding).unwrap_err();
@@ -544,9 +569,11 @@ mod funding_tests {
                         HostMetadataFundingError::Unavailable
                     )
                 ));
-                assert!(std::error::Error::source(&error)
-                    .unwrap()
-                    .is::<HostMetadataFundingError>());
+                assert!(
+                    std::error::Error::source(&error)
+                        .unwrap()
+                        .is::<HostMetadataFundingError>()
+                );
                 assert_eq!(state.calls.load(Ordering::SeqCst), stop + 1);
                 assert_eq!(original_wire, serde_json::to_string(&source).unwrap());
             }

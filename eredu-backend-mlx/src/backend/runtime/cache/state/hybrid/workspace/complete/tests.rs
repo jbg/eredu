@@ -1,13 +1,13 @@
 use super::*;
 use crate::backend::runtime::cache::residency::CacheResidencyError;
 use eredu_core::{
-    AttentionPolicy, LayerSchedule,
     cache::{MutableStateResidency, StateTensorDtype, StateTensorPolicy},
+    AttentionPolicy, LayerSchedule,
 };
-use eredu_nn::{Error, Tensor, workspace::*};
+use eredu_nn::{workspace::*, Error, Tensor};
 use eredu_runtime::{
+    working_memory::{InferenceExecutionIdentity, MemoryLedger},
     CacheLifecycleError, PagedCacheOptions,
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryPool},
 };
 use safemlx::{Device, DeviceType};
 use std::{cell::Cell, collections::BTreeMap};
@@ -166,9 +166,12 @@ fn hybrid_paged_projection_preserves_fixed_aliases_integer_roles_and_compressed_
     }
     let expected = native.retained_storage().unwrap().array_allocation_facts();
     let capacity = 1 << 25;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(capacity),
+        )
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(NoEquations, funding.clone()).unwrap();
@@ -186,13 +189,11 @@ fn hybrid_paged_projection_preserves_fixed_aliases_integer_roles_and_compressed_
         expected
     );
     assert_eq!(projected.storage.paged_sources().len(), 1);
-    assert!(
-        projected
-            .state
-            .as_ref()
-            .iter()
-            .all(|layer| layer.position() == 5)
-    );
+    assert!(projected
+        .state
+        .as_ref()
+        .iter()
+        .all(|layer| layer.position() == 5));
     assert!(matches!(
         projected.state.as_ref()[0],
         WorkspaceResidentLayerState::Paged(_)
@@ -234,7 +235,7 @@ fn hybrid_paged_projection_preserves_fixed_aliases_integer_roles_and_compressed_
     };
     assert_eq!(failure.retained_storage().unwrap().paged_sources().len(), 1);
     drop((native, input, context, funding));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(projected);
     assert!(matches!(
         manager.remove_block(&id),
@@ -245,5 +246,9 @@ fn hybrid_paged_projection_preserves_fixed_aliases_integer_roles_and_compressed_
     drop(failure);
     manager.remove_block(&id).unwrap();
     drop(manager);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

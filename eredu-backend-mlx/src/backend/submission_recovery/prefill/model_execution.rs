@@ -1,6 +1,6 @@
 //! Decode reservation and roots borrow the already configured ModelExecution.
 //! No child Scope, carrier replacement, or early outer-retirement claim exists.
-use super::{Error, RootsOwner, RootsProjection, memory};
+use super::{memory, Error, RootsOwner, RootsProjection};
 use eredu_runtime::working_memory::{
     InferenceExecutionIdentity, InferenceRequest, OriginalTextControlGuard, TextPrefillScopeFacts,
     WorkingMemoryError,
@@ -36,11 +36,7 @@ impl ModelExecutionPreparation {
             return Err(memory(WorkingMemoryError::IdentityMismatch));
         }
         controls
-            .validate_reservation(
-                request
-                    .memory_reservation()
-                    .ok_or_else(|| memory(WorkingMemoryError::IdentityMismatch))?,
-            )
+            .validate_reservation(request.memory_reservation())
             .map_err(memory)?;
         Ok(Self {
             request: request.clone(),
@@ -59,12 +55,22 @@ impl ModelExecutionPreparation {
         owner: Option<&crate::backend::submission_recovery::addressable::AddressableRequestOwner>,
         step: &eredu_runtime::working_memory::InferenceTextStep,
     ) -> Result<Self, Error> {
-        self.request.validate_same_request(step.request()).map_err(memory)?;
-        if let Some(owner) = owner { owner.validate_request(step.request())?; }
-        self.addressable = recipe.map(|recipe| recipe.addressable_for_step(step))
-            .transpose()?.flatten()
-            .map(|(row, invocation)| owner.ok_or(Error::PrefillScopeUnavailable)?
-                .row(row, 0, invocation)).transpose()?;
+        self.request
+            .validate_same_request(step.request())
+            .map_err(memory)?;
+        if let Some(owner) = owner {
+            owner.validate_request(step.request())?;
+        }
+        self.addressable = recipe
+            .map(|recipe| recipe.addressable_for_step(step))
+            .transpose()?
+            .flatten()
+            .map(|(row, invocation)| {
+                owner
+                    .ok_or(Error::PrefillScopeUnavailable)?
+                    .row(row, 0, invocation)
+            })
+            .transpose()?;
         Ok(self)
     }
     pub(crate) fn with_resident_recipe(
@@ -78,7 +84,10 @@ impl ModelExecutionPreparation {
         self.traversal = recipe
             .map(|recipe| recipe.completion_for_step(step))
             .transpose()?;
-        self.parallel=recipe.map(|recipe|recipe.parallel_for_step(step)).transpose()?.flatten();
+        self.parallel = recipe
+            .map(|recipe| recipe.parallel_for_step(step))
+            .transpose()?
+            .flatten();
         Ok(self)
     }
 }
@@ -127,7 +136,9 @@ impl ModelExecutionOwner {
             failure,
             preparation.controls.clone(),
         )?;
-        let roots = roots.with_traversal(preparation.traversal)?.with_parallel(preparation.parallel)?
+        let roots = roots
+            .with_traversal(preparation.traversal)?
+            .with_parallel(preparation.parallel)?
             .with_addressable(preparation.addressable)?;
         Ok(Self {
             value: Some(Rc::new(ModelExecution {
@@ -176,8 +187,9 @@ impl ModelExecutionOwner {
     }
     /// Capture borrows this already bound model role and its finite nested bank.
     pub(crate) fn capture_observer(&self) -> Result<OriginalScopeObserver, Error> {
-        let parent=self.retirement_observer()?;
-        crate::backend::nn::tensor::TokenValidationScope::capture_observer_for(&parent).map_err(Into::into)
+        let parent = self.retirement_observer()?;
+        crate::backend::nn::tensor::TokenValidationScope::capture_observer_for(&parent)
+            .map_err(Into::into)
     }
     pub(crate) fn projection(&self) -> ModelExecutionProjection {
         ModelExecutionProjection {

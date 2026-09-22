@@ -115,6 +115,9 @@ fn trace_shape(
 
 #[test]
 fn cpu_router_sources_cover_scores_normalization_bias_scale_and_supplied_ids() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     let _sources = crate::tests::support::test_utils::initialize_original_sources();
     let (ordinary, cpu) = mechanisms();
     for scoring in [
@@ -227,6 +230,9 @@ fn extended_spec(scoring: GroupScoring) -> TopKGroupSelectorSpec {
 
 #[test]
 fn cpu_router_optional_transforms_and_joint_views_keep_exact_source_storage() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     let _sources = crate::tests::support::test_utils::initialize_original_sources();
     let (ordinary, cpu) = mechanisms();
     for scoring in [
@@ -346,4 +352,84 @@ fn cpu_router_optional_transforms_and_joint_views_keep_exact_source_storage() {
                 .unwrap();
         assert_eq!(recipe.kernels, 0);
     }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[test]
+fn metal_supplied_routing_casts_qualify_unknown_input_precision_without_changing_cpu_facts() {
+    let (_, cpu) = mechanisms();
+    let spec = spec(GroupScoring::SqrtSoftplus, 1, true, 1.0).with_arithmetic(RoutingArithmetic {
+        projection: RoutingPrecision::Float32,
+        scores: RoutingPrecision::Float32,
+        coefficients: RoutingPrecision::Float32,
+    });
+    let (_, report) = trace(spec, 2, true, WorkspaceDtype::Int32, cpu);
+    let mut operation = report
+        .operations
+        .into_iter()
+        .find(|op| matches!(op.kind, WorkspaceOperationKind::GroupSelection { .. }))
+        .unwrap();
+    for layout in &mut operation.inputs {
+        if layout.dtype() == WorkspaceDtype::Float32 {
+            *layout = layout.clone().with_representation(None);
+        }
+    }
+    assert!(cpu.plan(operation.as_view()).unwrap().is_none());
+    let quoted = ordinary_metal_call_controls(operation.as_view())
+        .unwrap()
+        .unwrap();
+    assert!(quoted.metadata_bytes > 0);
+    for layout in &operation.inputs {
+        assert!(layout.representation().is_none());
+    }
+    let WorkspaceOperationKind::GroupSelection { spec, .. } = &mut operation.kind else {
+        unreachable!()
+    };
+    **spec = (**spec).clone().with_arithmetic(RoutingArithmetic {
+        projection: RoutingPrecision::Input,
+        scores: RoutingPrecision::Float32,
+        coefficients: RoutingPrecision::Float32,
+    });
+    assert!(
+        ordinary_metal_call_controls(operation.as_view())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[test]
+fn ordinary_metal_routing_prices_the_real_cutoff_predicate_and_cpu_alternative() {
+    let (_, cpu) = mechanisms();
+    let spec = spec(GroupScoring::SqrtSoftplus, 1, true, 1.0).with_arithmetic(RoutingArithmetic {
+        projection: RoutingPrecision::Float32,
+        scores: RoutingPrecision::Float32,
+        coefficients: RoutingPrecision::Float32,
+    });
+    let (_, report) = trace(spec.clone(), 2, false, WorkspaceDtype::Int32, cpu);
+    let operation = report
+        .operations
+        .iter()
+        .find(|op| matches!(op.kind, WorkspaceOperationKind::GroupSelection { .. }))
+        .unwrap();
+    let ordinary_cpu = ordinary_call_controls(operation.as_view())
+        .unwrap()
+        .unwrap();
+    let ordinary_gpu = ordinary_metal_call_controls(operation.as_view())
+        .unwrap()
+        .unwrap();
+    assert!(ordinary_gpu.metadata_bytes > ordinary_cpu.metadata_bytes);
+    let (_, supplied) = trace(spec, 2, true, WorkspaceDtype::Int32, cpu);
+    let supplied = supplied
+        .operations
+        .iter()
+        .find(|op| matches!(op.kind, WorkspaceOperationKind::GroupSelection { .. }))
+        .unwrap();
+    let without_predicate = ordinary_metal_call_controls(supplied.as_view())
+        .unwrap()
+        .unwrap();
+    assert!(ordinary_gpu.metadata_bytes > without_predicate.metadata_bytes);
+    assert!(
+        crate::backend::nn::grouped::TopKGroupSelector::ordinary_tie_control_bytes().unwrap() > 0
+    );
 }

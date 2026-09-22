@@ -3,7 +3,11 @@ use eredu_nn::Tensor;
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16_384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -59,7 +63,10 @@ fn unloaded_seed_fact_is_dtype_sized_and_has_no_disjoint_host_staging() {
     assert_eq!(report.operations.len(), 2);
     assert_eq!(
         report.total_bytes,
-        Some(2 * mechanisms.allocation.buffer_capacity(4).unwrap())
+        Some(
+            2 * (mechanisms.allocation.buffer_capacity(4).unwrap()
+                + mechanisms.allocation.host_control_bytes().unwrap())
+        )
     );
     assert_eq!(report.host_workspace_bytes, Some(0));
 }
@@ -75,31 +82,49 @@ fn cpu_unloaded_scalars_complete_tensor_host_and_residual_reports_without_native
         WorkspaceDtype::Bool,
     ] {
         let context = WorkspaceContext::new(cpu);
-        context.set_borrowed_storage(
-            eredu_nn::workspace::WorkspaceBorrowedStorage::new(&context, []).unwrap(),
-        ).unwrap();
+        context
+            .set_borrowed_storage(
+                eredu_nn::workspace::WorkspaceBorrowedStorage::new(&context, []).unwrap(),
+            )
+            .unwrap();
         context.begin_state_span([]).unwrap();
-        drop(context.execute(
-            WorkspaceOperationKind::ParameterPlaceholder,
-            &[],
-            vec![WorkspaceLayout::new(&[], dtype).unwrap()],
-        ).unwrap());
+        drop(
+            context
+                .execute(
+                    WorkspaceOperationKind::ParameterPlaceholder,
+                    &[],
+                    vec![WorkspaceLayout::new(&[], dtype).unwrap()],
+                )
+                .unwrap(),
+        );
         let report = context.report(&[]).unwrap();
-        let scalar = mechanisms().allocation.buffer_capacity(dtype.bytes()).unwrap();
+        let scalar = mechanisms()
+            .allocation
+            .buffer_capacity(dtype.bytes())
+            .unwrap();
         assert_eq!(report.operations.len(), 1);
         assert!(report.unpriced_operations.is_empty());
         assert!(report.unpriced_host_operations.is_empty());
         assert_eq!(report.tensor_buffers.total_bytes, Some(scalar));
         assert_eq!(report.host_workspace_bytes, Some(0));
-        assert_eq!(report.total_bytes, Some(scalar));
-        assert_eq!(report.transient_bytes, Some(scalar));
-        assert_eq!(report.inference_transient_bytes(), Some(scalar));
+        let complete = scalar
+            + WorkspaceMechanisms::allocation_host_control_bytes(
+                &cpu,
+                report.operations[0].as_view(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(report.total_bytes, Some(complete));
+        assert_eq!(report.transient_bytes, Some(complete));
+        assert_eq!(report.inference_transient_bytes(), Some(complete));
         let residual = report.residual.as_ref().unwrap();
-        assert_eq!(residual.total_bytes, Some(scalar));
-        assert_eq!(residual.transient_bytes, Some(scalar));
+        assert_eq!(residual.total_bytes, Some(complete));
+        assert_eq!(residual.transient_bytes, Some(complete));
         assert_eq!(residual.retained_bytes, Some(0));
-        assert!(cpu.plan(report.operations[0].as_view()).unwrap().is_none(),
-            "descriptive scalar facts do not certify the lazy native constructor");
+        assert!(
+            cpu.plan(report.operations[0].as_view()).unwrap().is_none(),
+            "descriptive scalar facts do not certify the lazy native constructor"
+        );
 
         let geometry = eredu_core::InferenceGeometry {
             batch_size: 1,
@@ -121,12 +146,16 @@ fn cpu_unloaded_scalars_complete_tensor_host_and_residual_reports_without_native
                 )?);
                 context.report(&[])
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(quoted.completed_spans(), 2);
         assert!(quoted.first_gap().is_none());
         assert_eq!(quoted.tensor_transient_peak_bytes(), Some(scalar));
         assert_eq!(quoted.host_peak_bytes(), Some(0));
-        assert_eq!(quoted.residual_workspace().unwrap().peak_bytes(), Some(scalar));
+        assert_eq!(
+            quoted.residual_workspace().unwrap().peak_bytes(),
+            Some(complete)
+        );
     }
 }
 

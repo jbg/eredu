@@ -50,15 +50,23 @@ fn exact_source_constructor_uses_reset_comparison_and_retains_escaped_partial_cu
     let (mut runtime, data, source, required) = fixture(None, 3);
     let pool = data.borrow().pool.clone();
     let error = runtime
-        .reset_admitted(SessionResetLimits::new(source + required - 1))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(
+                source + required - 1 + registry_controls(&pool),
+            ),
+        ))
         .unwrap_err();
     assert!(OWNER.with_borrow(Option::is_none));
     assert_eq!(FILLS.get(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), source);
+    assert_eq!(pool.payload_used_bytes().unwrap(), source);
     drop(error);
     FAIL_AT.set(Some(1));
     let error = runtime
-        .reset_admitted(SessionResetLimits::new(source + required))
+        .reset_admitted(SessionResetLimits::new(
+            crate::working_memory::memory_fixture::host_limits(
+                source + required + registry_controls(&pool),
+            ),
+        ))
         .unwrap_err();
     let typed = std::error::Error::source(&error)
         .unwrap()
@@ -77,8 +85,8 @@ fn exact_source_constructor_uses_reset_comparison_and_retains_escaped_partial_cu
     drop(runtime);
     drop(data);
     drop(error);
-    assert!(pool.used_bytes().unwrap() >= required);
+    assert!(pool.payload_used_bytes().unwrap() >= required);
     OWNER.with_borrow(|owner| assert_eq!(owner.as_ref().unwrap().values, vec![17; PAYLOAD]));
     OWNER.with_borrow_mut(|owner| *owner = None);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

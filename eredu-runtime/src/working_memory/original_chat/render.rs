@@ -58,8 +58,8 @@ impl OriginalRenderedChat {
             && self.payload().tokenizer.same_source(tokenizer)
     }
     /// Validate the genuine H/J/C pool before downstream source operations.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if !self.payload().allowance.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if !self.payload().allowance.pool().same_ledger(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         self.payload().template.validate_pool(pool)?;
@@ -224,7 +224,7 @@ fn required(plan: &ChatRenderPlan<'_>) -> Result<u64, WorkingMemoryError> {
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(WorkingMemoryError::Overflow)
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     fn chat_render_plan<'a>(
         &self,
         template: &'a OriginalChatTemplate,

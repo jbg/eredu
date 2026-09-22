@@ -15,12 +15,12 @@ struct Charge {
     bytes: usize,
     // Real registry keys retain identity metadata, not the filter owner.
     _identity: SharedStorageIdentity,
-    _domain: SharedStorageDomain,
+    _domain: SharedStorageAccountingId,
 }
 impl Charge {
     fn acquire(
         filter: &SharedTokenFilter,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         used: &Arc<AtomicUsize>,
     ) -> Box<dyn Send + Sync> {
         let bytes = filter.capacity_bytes().unwrap() as usize;
@@ -79,8 +79,8 @@ fn identity_and_domain_keys_outlive_payload_without_retaining_custody() {
     let filter = filter();
     let weak = Arc::downgrade(&filter.0);
     let identity = filter.identity().clone();
-    let domain = SharedStorageDomain::default();
-    let other_domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
+    let other_domain = SharedStorageAccountingId::default();
     assert!(domain.same_identity(&domain.clone()));
     assert!(!domain.same_identity(&other_domain));
     let used = Arc::new(AtomicUsize::new(0));
@@ -117,8 +117,8 @@ fn identity_and_domain_keys_outlive_payload_without_retaining_custody() {
 fn preexisting_aliases_retain_each_domain_charge_until_final_retirement() {
     let filter = filter();
     let before_attachment = filter.clone();
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     let bytes = filter.capacity_bytes().unwrap() as usize;
     assert!(filter
@@ -172,8 +172,8 @@ impl Drop for Rejected {
 #[test]
 fn provider_rejection_preserves_prior_charge_and_releases_error_after_unlock() {
     let filter = filter();
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     let bytes = filter.capacity_bytes().unwrap() as usize;
     filter
@@ -196,7 +196,8 @@ fn provider_rejection_preserves_prior_charge_and_releases_error_after_unlock() {
         "fixture capacity rejected"
     );
     assert_eq!(used.load(Ordering::SeqCst), bytes);
-    assert_eq!(filter.0.custody.attachments.lock().unwrap().len(), 1);
+    assert!(filter.0.custody.has_accounting_custody(&first).unwrap());
+    assert!(!filter.0.custody.has_accounting_custody(&second).unwrap());
     drop(error);
     assert!(retired.load(Ordering::SeqCst));
     assert!(filter
@@ -213,8 +214,8 @@ fn provider_rejection_preserves_prior_charge_and_releases_error_after_unlock() {
 fn acquisition_unwind_poison_preserves_existing_custody_until_last_alias() {
     let filter = filter();
     let alias = filter.clone();
-    let first = SharedStorageDomain::default();
-    let second = SharedStorageDomain::default();
+    let first = SharedStorageAccountingId::default();
+    let second = SharedStorageAccountingId::default();
     let used = Arc::new(AtomicUsize::new(0));
     let bytes = filter.capacity_bytes().unwrap() as usize;
     filter
@@ -246,9 +247,9 @@ fn simultaneous_alias_attachments_acquire_one_shared_domain_charge() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<SharedTokenFilter>();
     send_sync::<SharedStorageIdentity>();
-    send_sync::<SharedStorageDomain>();
+    send_sync::<SharedStorageAccountingId>();
     let filter = filter();
-    let domain = SharedStorageDomain::default();
+    let domain = SharedStorageAccountingId::default();
     let barrier = Arc::new(Barrier::new(8));
     let used = Arc::new(AtomicUsize::new(0));
     let acquisitions = Arc::new(AtomicUsize::new(0));

@@ -2,6 +2,52 @@
 use super::{CaptureUsage, ParameterError};
 use serde::{Deserialize, Serialize};
 
+/// A typed coordination cause and the host account paying for its owned boxes.
+/// The cause retires before its final accounting owner.
+#[derive(Debug)]
+pub struct ParameterCoordinationFailure {
+    cause: Option<Box<ParameterCoordinationError>>,
+    funding: Option<crate::HostMetadataFunding>,
+}
+impl ParameterCoordinationFailure {
+    pub(super) fn new(cause: ParameterCoordinationError) -> Self {
+        Self {
+            cause: Some(Box::new(cause)),
+            funding: None,
+        }
+    }
+    /// Retains the account whose caller has prepaid this protocol's error
+    /// representations. This attachment grants no execution or source authority.
+    pub fn retain_prepaid_metadata(&mut self, funding: &crate::HostMetadataFunding) {
+        if self.funding.is_none() {
+            self.funding = Some(funding.clone());
+        }
+    }
+}
+impl std::ops::Deref for ParameterCoordinationFailure {
+    type Target = ParameterCoordinationError;
+    fn deref(&self) -> &Self::Target {
+        self.cause.as_deref().expect("live coordination cause")
+    }
+}
+impl std::fmt::Display for ParameterCoordinationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&**self, f)
+    }
+}
+impl std::error::Error for ParameterCoordinationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&**self)
+    }
+}
+impl Drop for ParameterCoordinationFailure {
+    fn drop(&mut self) {
+        if let Some(cause) = self.cause.take() {
+            drop(*cause);
+        }
+    }
+}
+
 /// Monotone reservations for mandatory session-control exchanges. Parameter
 /// tensors, payload exchange and result storage have separate caller limits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

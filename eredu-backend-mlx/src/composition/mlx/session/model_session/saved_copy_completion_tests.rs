@@ -26,7 +26,12 @@ fn saved_copy_completion_failure_keeps_pending_source_and_submission_authority()
             blocked: !failed,
         }));
         let recovery = Recovery::with_probe(owner.ticket(), CompletionProbe(status.clone()));
-        let result = complete_model_operation((), owner, recovery);
+        // Inspection carries its callback refusal as a value until completion.
+        // That value must never mask a failed or unobservable native scope.
+        let callback: Result<(), Error> = Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        ));
+        let result = complete_model_operation(callback, owner, recovery);
         assert!(matches!(
             result,
             Err(Error::SavedCopyCompletion {

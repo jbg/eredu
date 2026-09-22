@@ -61,6 +61,22 @@ fn selected() -> SelectedSpeculativeRealization {
 #[derive(Debug)]
 struct ScalarSquare;
 impl WorkspaceMechanisms for ScalarSquare {
+    fn memory_topology(&self) -> Option<&eredu_core::MemoryTopology> {
+        Some(crate::working_memory::memory_fixture::host_topology_ref())
+    }
+    fn output_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+        _: usize,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
+    fn scratch_placement(
+        &self,
+        _: eredu_nn::workspace::WorkspaceOperationView<'_>,
+    ) -> Option<&eredu_core::MemoryPlacement> {
+        Some(crate::working_memory::memory_fixture::host_placement())
+    }
     fn operation_bound(
         &self,
         operation: &WorkspaceOperation,
@@ -89,7 +105,11 @@ fn report(geometry: eredu_core::InferenceGeometry) -> InferenceWorkspaceReport {
     quote_inference_workspace(geometry, |_| {
         let context = WorkspaceContext::new(ScalarSquare);
         let layout = WorkspaceLayout::new(&[1], WorkspaceDtype::Float32)?;
-        let source = WorkspaceExistingStorage::new(Some(layout.bytes()?), &context);
+        let source = WorkspaceExistingStorage::try_new_placed(
+            Some(layout.bytes()?),
+            crate::working_memory::memory_fixture::host_placement(),
+            &context,
+        )?;
         let input = WorkspaceTensor::existing_with_storage(layout, &source, &context)?;
         // The report must cover opening state as well as the actual operation.
         // begin_span alone intentionally leaves inference state unqualified.
@@ -106,7 +126,15 @@ fn requirements(plan: &InferenceSpanWorkspacePlan) -> SpeculativeInvocationRequi
     // This portable fixture creates no native Graph, Record, Scope or worker.
     // Account controls are priced by reserve_role itself; the real traced
     // scalar output provides its nonzero physical obligation.
-    SpeculativeInvocationRequirements::new(plan, physical, Some(0), Some(0), Some(0)).unwrap()
+    SpeculativeInvocationRequirements::new(
+        plan,
+        physical,
+        Some(0),
+        Some(0),
+        Some(0),
+        std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+    )
+    .unwrap()
 }
 #[test]
 fn speculative_role_claims_survive_rollback_and_retain_charge_through_raw_output_alias() {
@@ -132,9 +160,15 @@ fn speculative_role_claims_survive_rollback_and_retain_charge_through_raw_output
         .unwrap();
     let first = report(geometry);
     let equivalent = report(geometry);
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request = OriginalSpeculativeRequest::prepare(&pool, &execution, &plan, 1 << 24).unwrap();
+    let request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &plan,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
+    )
+    .unwrap();
     let mut cursor = plan.into_cursor();
     let role = request
         .reserve_role(
@@ -150,7 +184,7 @@ fn speculative_role_claims_survive_rollback_and_retain_charge_through_raw_output
     role.validate_plan(first.span_workspace_plan()).unwrap();
     role.claim_neural_bank(0).unwrap();
     assert!(role.clone().claim_neural_bank(0).is_err());
-    let after_first = pool.used_bytes().unwrap();
+    let after_first = pool.payload_used_bytes().unwrap();
     // A restored cache has the same frontier. Its new native attempt still
     // consumes the next occurrence and cannot recycle the old bank or charge.
     let replay = request
@@ -160,7 +194,7 @@ fn speculative_role_claims_survive_rollback_and_retain_charge_through_raw_output
         )
         .unwrap();
     assert!(!role.same_role(&replay));
-    assert!(pool.used_bytes().unwrap() > after_first);
+    assert!(pool.payload_used_bytes().unwrap() > after_first);
     assert!(matches!(
         cursor.claim(2, draft),
         Err(AutoregressiveOccurrenceError::Exhausted)
@@ -171,16 +205,22 @@ fn speculative_role_claims_survive_rollback_and_retain_charge_through_raw_output
     assert!(!raw_output_account.belongs_to(&replay));
     request.close().unwrap();
     drop(replay);
-    assert_eq!(pool.used_bytes().unwrap(), after_first,
-        "retired replay has no request-held workspace owner");
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        after_first,
+        "retired replay has no request-held workspace owner"
+    );
     drop(role);
-    assert_eq!(pool.used_bytes().unwrap(), after_first,
-        "raw output still owns the first operation");
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        after_first,
+        "raw output still owns the first operation"
+    );
     assert_eq!(cursor.attempted(), 2, "retirement cannot refund attempts");
     drop(request);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(raw_output_account);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
@@ -249,9 +289,15 @@ fn original_prefill_uses_shared_chunks_without_refunding_cancelled_claims() {
         .workspace_geometry(0, invocation, NonZeroU64::new(2).unwrap())
         .unwrap();
     let report = report(geometry);
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request = OriginalSpeculativeRequest::prepare(&pool, &execution, &plan, 1 << 24).unwrap();
+    let request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &plan,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
+    )
+    .unwrap();
     let mut cursor = plan.into_cursor();
     let role = request
         .reserve_role(
@@ -267,7 +313,7 @@ fn original_prefill_uses_shared_chunks_without_refunding_cancelled_claims() {
         cancellation.clone(),
     )
     .unwrap();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     let mut executor = Executor {
         cancellation: cancellation.clone(),
         claimed: None,
@@ -282,7 +328,7 @@ fn original_prefill_uses_shared_chunks_without_refunding_cancelled_claims() {
         PrefillProgress::Cancelled
     ));
     drop(executor.claimed.take());
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     assert!(matches!(
         PrefillDriver::<(), Done, _>::new_original_speculative(
             &execution,
@@ -301,11 +347,12 @@ fn original_prefill_uses_shared_chunks_without_refunding_cancelled_claims() {
     drop(executor);
     drop(role);
     drop(request);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
-fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_accepting_foreign_sources() {
+fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_accepting_foreign_sources()
+{
     use crate::speculative::numerical::{SpeculativeNumericalKind, SpeculativeNumericalProgram};
     let selected = selected();
     let config = SpeculativeConfig {
@@ -328,12 +375,24 @@ fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_acceptin
             .unwrap(),
     );
     let capacity = 1 << 24;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request = OriginalSpeculativeRequest::prepare(&pool, &execution, &plan, capacity).unwrap();
+    let request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &plan,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
     // Two requests may borrow one schedule. Only the original header's source
     // accounts are valid numerical inputs; a schedule equality is insufficient.
-    let other = OriginalSpeculativeRequest::prepare(&pool, &execution, &plan, capacity).unwrap();
+    let other = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &plan,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
     let mut cursor = plan.into_cursor();
     let role = request
         .reserve_role(
@@ -351,10 +410,17 @@ fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_acceptin
         .unwrap();
     assert!(bytes > 0);
     let required = |bytes| {
-        SpeculativeNumericalRequirements::new(program, Some(bytes), Some(0), Some(0), Some(0))
-            .unwrap()
+        SpeculativeNumericalRequirements::new(
+            program,
+            Some(bytes),
+            Some(0),
+            Some(0),
+            Some(0),
+            std::sync::Arc::new(crate::working_memory::memory_fixture::host_placement().clone()),
+        )
+        .unwrap()
     };
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert!(matches!(
         other
             .reserve_numerical(
@@ -365,7 +431,7 @@ fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_acceptin
             .cause(),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let first = request
         .reserve_numerical(
             required(bytes),
@@ -374,7 +440,7 @@ fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_acceptin
         .unwrap();
     assert_eq!(first.ordinal(), 0);
     let first = first.begin();
-    let accepted = pool.used_bytes().unwrap();
+    let accepted = pool.payload_used_bytes().unwrap();
     assert!(accepted > before);
     let second = request
         .reserve_numerical(
@@ -384,129 +450,219 @@ fn numerical_phases_retire_unused_custody_without_refunding_attempts_or_acceptin
         .unwrap();
     assert_eq!(second.ordinal(), 1);
     let last_alias = second.begin();
-    let cumulative = pool.used_bytes().unwrap();
+    let cumulative = pool.payload_used_bytes().unwrap();
     assert!(cumulative > accepted);
     drop(first);
-    let live = pool.used_bytes().unwrap();
-    assert!(live < cumulative, "retired numerical source releases its own charge");
+    let live = pool.payload_used_bytes().unwrap();
+    assert!(
+        live < cumulative,
+        "retired numerical source releases its own charge"
+    );
     assert!(live > before, "the escaped second result remains charged");
-    assert!(
-        request
-            .reserve_numerical(
-                required(capacity),
-                &[SpeculativeNumericalSource::Numerical(&last_alias)]
-            )
-            .is_err()
+    assert!(request
+        .reserve_numerical(
+            required(capacity),
+            &[SpeculativeNumericalSource::Numerical(&last_alias)]
+        )
+        .is_err());
+    assert_eq!(pool.payload_used_bytes().unwrap(), live);
+    let after_refusal = request
+        .reserve_numerical(
+            required(bytes),
+            &[SpeculativeNumericalSource::Numerical(&last_alias)],
+        )
+        .unwrap();
+    assert_eq!(
+        after_refusal.ordinal(),
+        3,
+        "failed admission does not rewind attempts"
     );
-    assert_eq!(pool.used_bytes().unwrap(), live);
-    let after_refusal = request.reserve_numerical(required(bytes),
-        &[SpeculativeNumericalSource::Numerical(&last_alias)]).unwrap();
-    assert_eq!(after_refusal.ordinal(), 3, "failed admission does not rewind attempts");
     drop(after_refusal);
-    assert_eq!(pool.used_bytes().unwrap(), live, "unused permission retires, spent ordinal does not");
-    request.close().unwrap();
-    assert!(
-        request
-            .reserve_numerical(
-                required(bytes),
-                &[SpeculativeNumericalSource::Numerical(&last_alias)]
-            )
-            .is_err()
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        live,
+        "unused permission retires, spent ordinal does not"
     );
+    request.close().unwrap();
+    assert!(request
+        .reserve_numerical(
+            required(bytes),
+            &[SpeculativeNumericalSource::Numerical(&last_alias)]
+        )
+        .is_err());
     drop(source);
     drop(role);
     drop(other);
     drop(request);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        pool.payload_used_bytes().unwrap() > 0,
         "escaped numerical backing keeps only its accepted account"
     );
     drop(last_alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn restored_occurrences_extend_paid_storage_without_recycling_spent_roles() {
     use eredu_core::generation::SpeculativeRequestStatus as Status;
     let selected = selected();
-    let config = SpeculativeConfig { max_tokens: 3, max_draft_tokens: 1, ..Default::default() };
-    let plan = AutoregressiveSchedulePlan::new(&selected, NonZeroUsize::new(1).unwrap(),
-        NonZeroU64::new(2).unwrap(), NonZeroU64::new(16).unwrap(), &config,
-        SpeculativeSchedulerOptions::default()).unwrap();
+    let config = SpeculativeConfig {
+        max_tokens: 3,
+        max_draft_tokens: 1,
+        ..Default::default()
+    };
+    let plan = AutoregressiveSchedulePlan::new(
+        &selected,
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroU64::new(2).unwrap(),
+        NonZeroU64::new(16).unwrap(),
+        &config,
+        SpeculativeSchedulerOptions::default(),
+    )
+    .unwrap();
     let invocation = AutoregressiveInvocation::decode(AutoregressivePass::DraftCommit, 1).unwrap();
-    let report = report(plan.workspace_geometry(2, invocation, NonZeroU64::new(1).unwrap()).unwrap());
+    let report = report(
+        plan.workspace_geometry(2, invocation, NonZeroU64::new(1).unwrap())
+            .unwrap(),
+    );
     let capacity = 1 << 24;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
-    let request = OriginalSpeculativeRequest::prepare(&pool, &execution, &plan, capacity).unwrap();
-    let funding = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
+    let request = OriginalSpeculativeRequest::prepare(
+        &pool,
+        &execution,
+        &plan,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+    )
+    .unwrap();
+    let funding = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
     let mut cursor = plan.into_cursor();
     cursor.begin_cache().unwrap();
     for _ in 0..2 {
-        request.reserve_role(cursor.claim(2, invocation).unwrap(), requirements(report.span_workspace_plan())).unwrap();
+        request
+            .reserve_role(
+                cursor.claim(2, invocation).unwrap(),
+                requirements(report.span_workspace_plan()),
+            )
+            .unwrap();
     }
-    assert!(matches!(cursor.claim(2, invocation), Err(AutoregressiveOccurrenceError::Exhausted)));
+    assert!(matches!(
+        cursor.claim(2, invocation),
+        Err(AutoregressiveOccurrenceError::Exhausted)
+    ));
     let spent = cursor.attempted();
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     assert!(cursor.continuation(0, Status::ReadyToDraft).is_err());
-    assert!(cursor.continuation(1, Status::TargetVerificationInFlight).is_err());
+    assert!(cursor
+        .continuation(1, Status::TargetVerificationInFlight)
+        .is_err());
     assert!(cursor.continuation(1, Status::Cancelled).is_err());
     let terminal = cursor.continuation(1, Status::Completed).unwrap();
-    assert_eq!(terminal.previous_slots(), terminal.next_slots(), "early EOS cannot restore work");
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(
+        terminal.previous_slots(),
+        terminal.next_slots(),
+        "early EOS cannot restore work"
+    );
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     let continuation = cursor.continuation(1, Status::ReadyToDraft).unwrap();
-    assert_eq!(continuation.next_slots() - continuation.previous_slots(), 10);
+    assert_eq!(
+        continuation.next_slots() - continuation.previous_slots(),
+        10
+    );
     // A competing real host destination leaves no capacity for the extension.
     // Its later retirement makes a retry possible without refunding this request.
-    let competitor = pool.prepare_workspace_metadata(&execution, capacity).unwrap();
-    let remaining = usize::try_from(capacity - pool.used_bytes().unwrap()).unwrap();
+    let competitor = pool
+        .prepare_workspace_metadata(
+            &execution,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
+        )
+        .unwrap();
+    let remaining = usize::try_from(capacity - pool.payload_used_bytes().unwrap()).unwrap();
     competitor.reserve_metadata(remaining).unwrap();
     let competing_destination = vec![0u8; remaining];
-    assert!(matches!(request.prepare_continuation(&continuation, &funding),
-        Err(SpeculativeContinuationError::Metadata(eredu_nn::workspace::HostMetadataFundingError::Capacity { .. }))));
-    assert_eq!(pool.used_bytes().unwrap(), capacity);
+    assert!(matches!(
+        request.prepare_continuation(&continuation, &funding),
+        Err(SpeculativeContinuationError::Metadata(
+            eredu_nn::workspace::HostMetadataFundingError::Domain(
+                eredu_core::MemoryDomainError::BudgetExceeded { .. }
+            )
+        ))
+    ));
+    assert_eq!(pool.payload_used_bytes().unwrap(), capacity);
     assert_eq!(cursor.attempted(), spent);
-    assert!(matches!(cursor.claim(2, invocation), Err(AutoregressiveOccurrenceError::Exhausted)));
+    assert!(matches!(
+        cursor.claim(2, invocation),
+        Err(AutoregressiveOccurrenceError::Exhausted)
+    ));
     drop(competing_destination);
     drop(competitor);
-    assert_eq!(pool.used_bytes().unwrap(), before);
-    request.prepare_continuation(&continuation, &funding).unwrap();
-    let extended = pool.used_bytes().unwrap();
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
+    request
+        .prepare_continuation(&continuation, &funding)
+        .unwrap();
+    let extended = pool.payload_used_bytes().unwrap();
     assert!(extended > before);
     // A duplicate extension refuses before another destination or debit. The
     // same plan cannot replay the old limits into an already extended bank.
-    assert!(matches!(request.prepare_continuation(&continuation, &funding),
-        Err(SpeculativeContinuationError::Request(WorkingMemoryError::IdentityMismatch))));
-    assert_eq!(pool.used_bytes().unwrap(), extended);
+    assert!(matches!(
+        request.prepare_continuation(&continuation, &funding),
+        Err(SpeculativeContinuationError::Request(
+            WorkingMemoryError::IdentityMismatch
+        ))
+    ));
+    assert_eq!(pool.payload_used_bytes().unwrap(), extended);
     cursor.install_continuation(continuation);
     assert_eq!(cursor.attempted(), spent);
     let claim = cursor.claim(2, invocation).unwrap();
     assert_eq!(claim.ordinal(), spent);
     assert_eq!(claim.pass_ordinal(), 2);
-    request.reserve_role(claim, requirements(report.span_workspace_plan())).unwrap();
-    request.reserve_role(cursor.claim(2, invocation).unwrap(), requirements(report.span_workspace_plan())).unwrap();
-    assert!(matches!(cursor.claim(2, invocation), Err(AutoregressiveOccurrenceError::Exhausted)));
+    request
+        .reserve_role(claim, requirements(report.span_workspace_plan()))
+        .unwrap();
+    request
+        .reserve_role(
+            cursor.claim(2, invocation).unwrap(),
+            requirements(report.span_workspace_plan()),
+        )
+        .unwrap();
+    assert!(matches!(
+        cursor.claim(2, invocation),
+        Err(AutoregressiveOccurrenceError::Exhausted)
+    ));
     assert_eq!(cursor.attempted(), spent + 2);
     let again = cursor.continuation(2, Status::ReadyToDraft).unwrap();
     assert_eq!(again.next_slots() - again.previous_slots(), 5);
-    let prior = pool.used_bytes().unwrap();
+    let prior = pool.payload_used_bytes().unwrap();
     request.prepare_continuation(&again, &funding).unwrap();
-    assert!(pool.used_bytes().unwrap() > prior);
+    assert!(pool.payload_used_bytes().unwrap() > prior);
     cursor.install_continuation(again);
     let claim = cursor.claim(2, invocation).unwrap();
     assert_eq!(claim.ordinal(), spent + 2);
     assert_eq!(claim.pass_ordinal(), 4);
-    let role = request.reserve_role(claim, requirements(report.span_workspace_plan())).unwrap();
+    let role = request
+        .reserve_role(claim, requirements(report.span_workspace_plan()))
+        .unwrap();
     let alias = role.budget_custody();
-    assert!(matches!(cursor.claim(2, invocation), Err(AutoregressiveOccurrenceError::Exhausted)));
-    assert!(pool.used_bytes().unwrap() > extended);
+    assert!(matches!(
+        cursor.claim(2, invocation),
+        Err(AutoregressiveOccurrenceError::Exhausted)
+    ));
+    assert!(pool.payload_used_bytes().unwrap() > extended);
     drop(role);
     drop(request);
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.payload_used_bytes().unwrap() > 0);
     drop(funding);
-    assert!(pool.used_bytes().unwrap() > 0, "escaped actual role retains its own account");
+    assert!(
+        pool.payload_used_bytes().unwrap() > 0,
+        "escaped actual role retains its own account"
+    );
     drop(alias);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 mod source_publication;
@@ -523,54 +679,107 @@ mod batch_cursors;
 fn media_ingress_origin_rejects_equal_geometry_foreign_roles_and_spent_ordinals() {
     use crate::media_prefill::MediaPrefillOrigin;
     let selected = selected();
-    let config = SpeculativeConfig { max_tokens: 1, max_draft_tokens: 1, ..Default::default() };
+    let config = SpeculativeConfig {
+        max_tokens: 1,
+        max_draft_tokens: 1,
+        ..Default::default()
+    };
     let fixture = || {
         let plan = AutoregressiveSchedulePlan::new(
-            &selected, NonZeroUsize::new(1).unwrap(), NonZeroU64::new(3).unwrap(),
-            NonZeroU64::new(16).unwrap(), &config, SpeculativeSchedulerOptions::default(),
-        ).unwrap();
-        let invocation=AutoregressiveInvocation::prefill(AutoregressivePass::TargetPrefill,3).unwrap();
-        let geometry=plan.workspace_geometry(0,invocation,NonZeroU64::new(2).unwrap()).unwrap();
-        let report=report(geometry);
-        let pool=WorkingMemoryPool::new(1<<24,0).unwrap();
-        let execution=InferenceExecutionIdentity::default();
-        let request=OriginalSpeculativeRequest::prepare(&pool,&execution,&plan,1<<24).unwrap();
-        let mut cursor=plan.into_cursor();
-        let role=request.reserve_role(cursor.claim(0,invocation).unwrap(),requirements(report.span_workspace_plan())).unwrap();
-        (pool,execution,request,role,geometry,report)
+            &selected,
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(3).unwrap(),
+            NonZeroU64::new(16).unwrap(),
+            &config,
+            SpeculativeSchedulerOptions::default(),
+        )
+        .unwrap();
+        let invocation =
+            AutoregressiveInvocation::prefill(AutoregressivePass::TargetPrefill, 3).unwrap();
+        let geometry = plan
+            .workspace_geometry(0, invocation, NonZeroU64::new(2).unwrap())
+            .unwrap();
+        let report = report(geometry);
+        let pool = crate::working_memory::memory_fixture::host_ledger(1 << 24, 0).unwrap();
+        let execution = InferenceExecutionIdentity::default();
+        let request = OriginalSpeculativeRequest::prepare(
+            &pool,
+            &execution,
+            &plan,
+            crate::working_memory::memory_fixture::resolved_host_limits(&pool, 1 << 24),
+        )
+        .unwrap();
+        let mut cursor = plan.into_cursor();
+        let role = request
+            .reserve_role(
+                cursor.claim(0, invocation).unwrap(),
+                requirements(report.span_workspace_plan()),
+            )
+            .unwrap();
+        (pool, execution, request, role, geometry, report)
     };
-    let (pool,execution,request,role,geometry,report)=fixture();
-    let (other_pool,other_execution,other_request,other,other_geometry,other_report)=fixture();
-    assert_eq!(geometry,other_geometry);
-    let mut wrong=geometry; wrong.prefill_chunk_positions=1;
-    assert!(MediaPrefillOrigin::speculative(role.clone(),wrong).is_err());
-    let mut source=MediaPrefillOrigin::speculative(role.clone(),geometry).unwrap();
-    assert!(source.request().is_err(), "a media role is not an ordinary inference request");
-    role.begin_prefill(&execution,geometry).unwrap();
-    other.begin_prefill(&other_execution,other_geometry).unwrap();
-    let chunk=|report:&InferenceWorkspaceReport,index:usize| match report.span_workspace_plan().records()[index].span() {
-        InferenceWorkspaceSpan::Prefill(chunk)=>chunk.clone(), _=>panic!("actual prefill row"),
+    let (pool, execution, request, role, geometry, report) = fixture();
+    let (other_pool, other_execution, other_request, other, other_geometry, other_report) =
+        fixture();
+    assert_eq!(geometry, other_geometry);
+    let mut wrong = geometry;
+    wrong.prefill_chunk_positions = 1;
+    assert!(MediaPrefillOrigin::speculative(role.clone(), wrong).is_err());
+    let mut source = MediaPrefillOrigin::speculative(role.clone(), geometry).unwrap();
+    assert!(
+        source.request().is_err(),
+        "a media role is not an ordinary inference request"
+    );
+    role.begin_prefill(&execution, geometry).unwrap();
+    other
+        .begin_prefill(&other_execution, other_geometry)
+        .unwrap();
+    let chunk = |report: &InferenceWorkspaceReport, index: usize| match report
+        .span_workspace_plan()
+        .records()[index]
+        .span()
+    {
+        InferenceWorkspaceSpan::Prefill(chunk) => chunk.clone(),
+        _ => panic!("actual prefill row"),
     };
-    let first=role.claim_prefill_span(&chunk(&report,0)).unwrap();
-    let second=role.claim_prefill_span(&chunk(&report,1)).unwrap();
-    let foreign=other.claim_prefill_span(&chunk(&other_report,0)).unwrap();
+    let first = role.claim_prefill_span(&chunk(&report, 0)).unwrap();
+    let second = role.claim_prefill_span(&chunk(&report, 1)).unwrap();
+    let foreign = other.claim_prefill_span(&chunk(&other_report, 0)).unwrap();
     let equation = MediaPrefillOrigin::Equation;
-    assert!(equation.request().is_err(), "workspace traversal has no ordinary request");
-    assert!(equation.validate_span(&first).is_err(), "workspace traversal cannot consume a native media role");
+    assert!(
+        equation.request().is_err(),
+        "workspace traversal has no ordinary request"
+    );
+    assert!(
+        equation.validate_span(&first).is_err(),
+        "workspace traversal cannot consume a native media role"
+    );
     assert!(source.validate_span(&foreign).is_err());
-    assert!(source.validate_span(&second).is_err(), "an already claimed future span cannot skip ingress");
+    assert!(
+        source.validate_span(&second).is_err(),
+        "an already claimed future span cannot skip ingress"
+    );
     source.validate_span(&first).unwrap();
-    let spent=pool.used_bytes().unwrap();
+    let spent = pool.payload_used_bytes().unwrap();
     source.committed().unwrap();
-    assert!(source.validate_span(&first).is_err(), "commit cannot replay encoder ingress");
+    assert!(
+        source.validate_span(&first).is_err(),
+        "commit cannot replay encoder ingress"
+    );
     source.validate_span(&second).unwrap();
     source.committed().unwrap();
     assert!(source.validate_span(&second).is_err());
-    assert_eq!(pool.used_bytes().unwrap(),spent);
-    request.close().unwrap(); other_request.close().unwrap();
-    drop((first,second,foreign,role,other,request,other_request));
-    assert!(pool.used_bytes().unwrap()>0, "retained ingress keeps its exact occurrence account");
-    assert_eq!(other_pool.used_bytes().unwrap(),0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), spent);
+    request.close().unwrap();
+    other_request.close().unwrap();
+    drop((first, second, foreign, role, other, request, other_request));
+    assert!(
+        pool.payload_used_bytes().unwrap() > 0,
+        "retained ingress keeps its exact occurrence account"
+    );
+    assert_eq!(other_pool.payload_used_bytes().unwrap(), 0);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(),0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
+
+mod model_capture;

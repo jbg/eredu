@@ -1,15 +1,15 @@
 //! Native composition of retained architecture layouts with the shared collector.
 use super::*;
-use eredu_core::{capture::*, ObservationSupportStatus};
-use eredu_runtime::capture::{partition::*, CaptureSession};
+use eredu_core::{ObservationSupportStatus, capture::*};
+use eredu_runtime::capture::{CaptureSession, partition::*};
 mod owner;
 pub(super) use owner::Publication;
 
 /// All aliases are closed: the final shared allocation retires before its
 /// payload and the account that funded its original construction.
 #[derive(Clone)]
-pub(super) struct LoadedPartitionCapture(Publication<PartitionCaptureData>);
-pub(super) struct PartitionCaptureData {
+pub(in crate::composition::mlx) struct LoadedPartitionCapture(Publication<PartitionCaptureData>);
+pub(in crate::composition::mlx) struct PartitionCaptureData {
     pub(super) discovery: CaptureDiscovery,
     execution: String,
     setup: eredu_runtime::CommunicationSessionIdentity,
@@ -22,12 +22,12 @@ impl std::ops::Deref for LoadedPartitionCapture {
     }
 }
 impl LoadedPartitionCapture {
-    pub(super) fn layouts(
+    pub(in crate::composition::mlx) fn layouts(
         &self,
     ) -> &eredu_architectures::component_partition::ComponentPartitionLayouts {
         self.layouts.layouts()
     }
-    pub(super) fn source_labels(
+    pub(in crate::composition::mlx) fn source_labels(
         &self,
     ) -> (&str, &str, eredu_runtime::CommunicationSessionIdentity) {
         (
@@ -82,10 +82,7 @@ impl MlxModelSession {
     /// Ring fixtures exercise this exact source producer with their loaded pool
     /// and transport, then continue their ordinary native capture oracle.
     #[cfg(test)]
-    pub(crate) fn verify_original_partition_capture_publication(
-        &self,
-        prompt_tokens: u64,
-    ) {
+    pub(crate) fn verify_original_partition_capture_publication(&self, prompt_tokens: u64) {
         assert!(self.payload.distributed.is_some());
         self.loaded_partition_capture().unwrap().unwrap();
         let ordinary = self
@@ -112,7 +109,6 @@ impl MlxModelSession {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage.checked_mul(3).unwrap(),
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -120,32 +116,43 @@ impl MlxModelSession {
             &ordinary.discovery.catalog,
             &ordinary.discovery.support,
             &ordinary.discovery.support.capture,
-            CaptureRequestShape { batch: 1, prompt_tokens, max_predictions: 3 },
+            CaptureRequestShape {
+                batch: 1,
+                prompt_tokens,
+                max_predictions: 3,
+            },
         )
         .unwrap();
         precompiled.revalidate(&ordinary.discovery).unwrap();
-        let pool = &self.payload.memory_pool;
-        assert_eq!(pool.unquoted_owner_count().unwrap(), 0,
-            "cold source fixture must run before ordinary parameter or state mutation");
-        let baseline = pool.used_bytes().unwrap();
+        let pool = &self.payload.memory_ledger;
+        assert_eq!(
+            pool.unquoted_owner_count().unwrap(),
+            0,
+            "cold source fixture must run before ordinary parameter or state mutation"
+        );
+        let baseline = pool.fixture_host_charge().unwrap();
         let capacity = baseline.checked_add(256 << 20).unwrap();
 
         // The real pool refuses before constructing or publishing a cold source.
         assert!(matches!(
-            self.prepare_original_partition_capture(baseline),
+            self.prepare_original_partition_capture(crate::memory_fixture::resolved_limits(
+                baseline
+            )),
             Err(Error::WorkspacePlanning(_))
         ));
         assert!(self.partition_capture.borrow().is_none());
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
-        self.prepare_original_partition_capture(capacity).unwrap();
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+        self.prepare_original_partition_capture(crate::memory_fixture::resolved_limits(capacity))
+            .unwrap();
         let cold = self.partition_capture_source().unwrap();
         assert!(cold.0.is_funded());
         precompiled.revalidate(&cold.discovery).unwrap();
-        let retained = pool.used_bytes().unwrap();
+        let retained = pool.fixture_host_charge().unwrap();
         assert!(retained > baseline);
-        self.prepare_original_partition_capture(capacity).unwrap();
+        self.prepare_original_partition_capture(crate::memory_fixture::resolved_limits(capacity))
+            .unwrap();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             retained,
             "funded lookup creates no account"
         );
@@ -154,23 +161,26 @@ impl MlxModelSession {
         drop(cached);
         self.partition_capture.borrow_mut().take();
         assert_eq!(
-            pool.used_bytes().unwrap(),
+            pool.fixture_host_charge().unwrap(),
             retained,
             "escaping source retains its account"
         );
         drop(cold);
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
 
         // Keep the actual old publication alive across refusal and replacement.
         *self.partition_capture.borrow_mut() = Some(ordinary.clone());
         assert!(matches!(
-            self.prepare_original_partition_capture(baseline),
+            self.prepare_original_partition_capture(crate::memory_fixture::resolved_limits(
+                baseline
+            )),
             Err(Error::WorkspacePlanning(_))
         ));
         let unchanged = self.partition_capture_source().unwrap();
         assert!(std::ptr::eq(&*ordinary, &*unchanged));
         drop(unchanged);
-        self.prepare_original_partition_capture(capacity).unwrap();
+        self.prepare_original_partition_capture(crate::memory_fixture::resolved_limits(capacity))
+            .unwrap();
         let original = self.partition_capture_source().unwrap();
         assert!(original.0.is_funded());
         assert!(!std::ptr::eq(&*ordinary, &*original));
@@ -184,9 +194,11 @@ impl MlxModelSession {
         // unquoted load, preserving the original discovery for the oracle.
         let retired = self.partition_capture.borrow_mut().replace(ordinary);
         drop(retired);
-        assert_eq!(pool.used_bytes().unwrap(), baseline);
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     }
-    pub(super) fn partition_capture_source(&self) -> Option<LoadedPartitionCapture> {
+    pub(in crate::composition::mlx) fn partition_capture_source(
+        &self,
+    ) -> Option<LoadedPartitionCapture> {
         self.partition_capture
             .borrow()
             .as_ref()
@@ -195,7 +207,10 @@ impl MlxModelSession {
     /// All original capture inputs, including already compiled declarations,
     /// qualify the retained source before cold semantic revalidation. Raw
     /// declaration compilation may already have constructed that same source.
-    pub(super) fn prepare_original_partition_capture(&self, capacity: u64) -> Result<(), Error> {
+    pub(super) fn prepare_original_partition_capture(
+        &self,
+        capacity: eredu_core::MemoryLimits,
+    ) -> Result<(), Error> {
         if self.payload.distributed.is_none()
             || self
                 .partition_capture
@@ -207,7 +222,7 @@ impl MlxModelSession {
         }
         let funding = self
             .payload
-            .memory_pool
+            .memory_ledger
             .prepare_workspace_metadata(
                 self.payload.model.erased().inference_execution_identity(),
                 capacity,
@@ -488,3 +503,7 @@ pub(super) fn with_observer<R>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

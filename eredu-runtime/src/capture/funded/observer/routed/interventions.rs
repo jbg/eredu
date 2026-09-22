@@ -1,5 +1,6 @@
 //! Existing sparse operation order with one spent cursor over actual batches.
 use super::*;
+use crate::intervention::InterventionPrefillWindow;
 use eredu_core::intervention::InterventionOutcome;
 fn same_edit(
     plan: &eredu_core::intervention::AdmittedInterventionPlan,
@@ -26,18 +27,19 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         let Some(first) = self.routed_intervention_selection else {
             return Ok(None);
         };
-        if !self.routed_active
-            || batch.origins.is_some()
-            || batch.unit_coordinates.is_some()
-            || self.prefill.is_some()
-        {
+        if !self.routed_active || batch.origins.is_some() || batch.unit_coordinates.is_some() {
             return Err(CaptureProtocolError::Transaction.into());
         }
-        let (_, shape) = self.invocation.ok_or(CaptureProtocolError::Transaction)?;
-        let source_tokens = shape
-            .batch
-            .checked_mul(shape.sequence)
-            .ok_or(CaptureError::Overflow)?;
+        let prefill = if self.prefill.is_some() {
+            Some((
+                self.bound
+                    .ok_or(CaptureProtocolError::PrefillAttribution)?
+                    .geometry(),
+                self.current_fragment_chunk()?,
+            ))
+        } else {
+            None
+        };
         let source = batch.capture_source()?;
         let Frame::Active(frame) = &mut self.frame else {
             return Err(CaptureProtocolError::Transaction.into());
@@ -45,6 +47,30 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         let plan = frame
             .intervention_admission()
             .ok_or(CaptureProtocolError::Transaction)?;
+        let window = prefill
+            .as_ref()
+            .map(|(geometry, chunk)| {
+                InterventionPrefillWindow::new(plan, *geometry, chunk)
+                    .map_err(|_| CaptureProtocolError::PrefillAttribution)
+            })
+            .transpose()?;
+        let source_tokens = if let Some(window) = window {
+            window.logical_positions()
+        } else if let Some((_, shape)) = self.invocation {
+            shape
+                .batch
+                .checked_mul(shape.sequence)
+                .ok_or(CaptureError::Overflow)?
+        } else {
+            plan.request()
+                .batch
+                .checked_mul(if self.prediction == 0 {
+                    plan.request().prompt_tokens
+                } else {
+                    1
+                })
+                .ok_or(CaptureError::Overflow)?
+        };
         let mut effective = None;
         for index in 0..plan.plan().operations.len() {
             if !same_edit(plan, first, index) {
@@ -61,7 +87,11 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
                 _ => return Err(CaptureProtocolError::Transaction.into()),
             }
             let started = std::time::Instant::now();
-            let mut cursor = frame.take_routed_intervention_cursor(index, source_tokens)?;
+            let mut cursor = if let Some(window) = window {
+                frame.take_prefill_routed_intervention_cursor(index, window)?
+            } else {
+                frame.take_routed_intervention_cursor(index, source_tokens)?
+            };
             let result = (|| {
                 let input = effective.as_ref().unwrap_or(source.values);
                 let source = RoutedUnitCaptureSource {
@@ -73,20 +103,38 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
                     token_offset: source.token_offset,
                     global_groups: source.global_groups,
                 };
-                let range = self
-                    .backend
-                    .routed_intervention_range(&source, cursor.claim())?;
+                let range = if let Some(window) = window {
+                    self.backend.prefill_routed_intervention_range(
+                        &source,
+                        cursor.claim(),
+                        window,
+                    )?
+                } else {
+                    self.backend
+                        .routed_intervention_range(&source, cursor.claim())?
+                };
                 if !cursor.is_charged() {
-                    let usage = self
-                        .backend
-                        .routed_intervention_usage(&source, cursor.claim())?;
+                    let usage = if let Some(window) = window {
+                        self.backend.prefill_routed_intervention_usage(
+                            &source,
+                            cursor.claim(),
+                            window,
+                        )?
+                    } else {
+                        self.backend
+                            .routed_intervention_usage(&source, cursor.claim())?
+                    };
                     if usage.captures != 0 || usage.encoded_bytes != 0 {
                         return Err(CaptureProtocolError::Transaction.into());
                     }
                     crate::intervention::reserve_envelope(&mut self.session.ledger, usage)?;
                     cursor.charge(usage)?;
                 }
-                let batch = cursor.begin_batch(range)?;
+                let batch = if let Some(window) = window {
+                    cursor.begin_prefill_batch(window, range)?
+                } else {
+                    cursor.begin_batch(range)?
+                };
                 self.backend.apply_routed_intervention(&source, batch)
             })();
             self.session.capture_seconds += started.elapsed().as_secs_f64();
@@ -119,12 +167,29 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
         if !success {
             return Ok(());
         }
+        let prefill = if self.prefill.is_some() {
+            Some((
+                self.bound
+                    .ok_or(CaptureProtocolError::PrefillAttribution)?
+                    .geometry(),
+                self.current_fragment_chunk()?,
+            ))
+        } else {
+            None
+        };
         let Frame::Active(frame) = &mut self.frame else {
             return Err(CaptureProtocolError::Transaction.into());
         };
         let plan = frame
             .intervention_admission()
             .ok_or(CaptureProtocolError::Transaction)?;
+        let window = prefill
+            .as_ref()
+            .map(|(geometry, chunk)| {
+                InterventionPrefillWindow::new(plan, *geometry, chunk)
+                    .map_err(|_| CaptureProtocolError::PrefillAttribution)
+            })
+            .transpose()?;
         for index in 0..plan.plan().operations.len() {
             if !same_edit(plan, first, index) {
                 continue;
@@ -138,7 +203,11 @@ impl<T, E: std::error::Error + Send + Sync + 'static, N> FundedCaptureObserver<'
             {
                 continue;
             }
-            frame.finish_routed_intervention(index)?;
+            if let Some(window) = window {
+                frame.finish_prefill_routed_intervention_chunk(index, window)?;
+            } else {
+                frame.finish_routed_intervention(index)?;
+            }
         }
         Ok(())
     }

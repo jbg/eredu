@@ -153,7 +153,7 @@ fn ordinary_and_controlled_facades_share_admission_order_and_output() {
     for controlled in [false, true] {
         let (mut model, chat, settings) = setup();
         let _guard = probe(Fault::None);
-        outputs.push(run(&mut model, &chat, settings, controlled).unwrap());
+        outputs.push(run(&mut model, &chat, settings.clone(), controlled).unwrap());
         let seen = snapshot();
         assert_eq!(seen.admissions.len(), 1);
         assert_eq!(seen.inference_settings, [(settings.inference, Some(2))]);
@@ -199,14 +199,17 @@ fn facade_inference_policy_reaches_shared_admission_with_exact_output_allowance(
                 settings.overrides.max_new_tokens = explicit_allowance.then_some(2);
                 settings.inference = TextInferencePolicy {
                     prefill_chunk_positions: std::num::NonZeroU64::new(3),
-                    managed_memory_capacity_bytes: budget,
+                    memory_limits: (budget)
+                        .map_or_else(eredu_core::MemoryLimitDeclarations::unlimited, |bytes| {
+                            crate::memory::limits(bytes)
+                        }),
                     submission_tracking_capacity_bytes: None,
                     graph_metadata_capacity_bytes: None,
                 };
                 // Fail at admission so the test exercises preparation without
                 // asking this neutral fixture to execute an unbounded output.
                 let _guard = probe(Fault::Local(Stage::Admission));
-                let error = run(&mut model, &chat, settings, controlled).unwrap_err();
+                let error = run(&mut model, &chat, settings.clone(), controlled).unwrap_err();
                 let seen = snapshot();
                 if budget.is_some_and(|bytes| bytes != original_sources::CAPACITY) {
                     let error = error
@@ -219,7 +222,7 @@ fn facade_inference_policy_reaches_shared_admission_with_exact_output_allowance(
                     assert_eq!(
                         seen.inference_settings,
                         [(
-                            original_sources::settings(settings).inference,
+                            original_sources::settings(settings.clone()).inference,
                             Some(if explicit_allowance { 2 } else { 256 }),
                         )]
                     );
@@ -237,7 +240,7 @@ fn enforced_unbounded_core_requests_reject_before_backend_or_controller() {
         eredu_core::resolve_generation_config(None, Default::default()).unwrap(),
     )
     .with_inference_policy(eredu_core::TextInferencePolicy {
-        managed_memory_capacity_bytes: Some(16 << 20),
+        memory_limits: crate::memory::limits(16 << 20),
         ..Default::default()
     });
     assert_eq!(config.sampling().max_new_tokens, None);
@@ -253,15 +256,20 @@ fn enforced_unbounded_core_requests_reject_before_backend_or_controller() {
                 } else {
                     TextGenerationInput::TokenIds(vec![11, 7, 3])
                 };
-                ControlledTextGeneration::from_input(&mut runtime, input, config, controller)
-                    .err()
-                    .expect("missing output bound must reject")
-                    .into()
+                ControlledTextGeneration::from_input(
+                    &mut runtime,
+                    input,
+                    config.clone(),
+                    controller,
+                )
+                .err()
+                .expect("missing output bound must reject")
+                .into()
             } else {
                 let result = if prepared {
-                    TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3].into(), config)
+                    TextGeneration::from_prompt(&mut runtime, vec![11, 7, 3].into(), config.clone())
                 } else {
-                    TextGeneration::new(&mut runtime, vec![11, 7, 3], config)
+                    TextGeneration::new(&mut runtime, vec![11, 7, 3], config.clone())
                 };
                 result
                     .err()

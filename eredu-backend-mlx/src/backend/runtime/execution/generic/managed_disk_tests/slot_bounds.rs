@@ -17,11 +17,19 @@ fn idle_override_ceiling_follows_actual_replacement_owner_and_excludes_unloaded_
     let mut f = fixture(false, 1);
     let original = MlxTensor::from_array(Array::from_slice(&[7_i32, 11], &[2]));
     let replacements = BTreeMap::from([("weight".to_owned(), original.clone())]);
-    assert!(MlxUnitPopulator::<Unit>::publish_parameter_replacements(
-        &mut f.policy.populator,
-        &replacements,
-        true
-    ));
+    let (context, funding) = crate::memory_fixture::parameter_context();
+    crate::memory_fixture::publish_parameters(
+        replacements,
+        true,
+        &context,
+        funding.clone(),
+        |visitor| {
+            Ok(MlxUnitPopulator::<Unit>::visit_parameter_publication(
+                &mut f.policy.populator,
+                visitor,
+            ))
+        },
+    );
     assert_eq!(f.policy.retained_value_slot_bound(), Some(1));
     let mut values = 0;
     assert!(f.policy.visit_retained_values(&mut |value| {
@@ -32,10 +40,11 @@ fn idle_override_ceiling_follows_actual_replacement_owner_and_excludes_unloaded_
         values += 1;
     }));
     assert_eq!(values, 1);
-    assert!(MlxUnitPopulator::<Unit>::publish_parameter_replacements(
-        &mut f.policy.populator,
-        &replacements,
-        false
-    ));
+    crate::memory_fixture::publish_parameters([], false, &context, funding, |visitor| {
+        Ok(MlxUnitPopulator::<Unit>::visit_parameter_publication(
+            &mut f.policy.populator,
+            visitor,
+        ))
+    });
     assert_eq!(f.policy.retained_value_slot_bound(), Some(0));
 }

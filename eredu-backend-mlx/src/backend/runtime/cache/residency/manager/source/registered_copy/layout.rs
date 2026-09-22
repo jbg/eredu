@@ -48,7 +48,7 @@ impl CacheBlockSourceLoan<'_> {
             if block.device().is_some() || block.host().is_some() {
                 operands = operands.checked_add(2).ok_or(CacheSourceError::Overflow)?;
             }
-            if let Some(file) = block.disk().and_then(|disk| disk.live_file()) {
+            if let Some(file) = block.disk().and_then(|disk| disk.file_source()) {
                 retained_file_bytes = retained_file_bytes
                     .checked_add(
                         u64::try_from(file.file_bytes().ok_or(CacheSourceError::Identity)?)

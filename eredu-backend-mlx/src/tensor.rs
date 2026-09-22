@@ -1,13 +1,16 @@
-mod rotary;
-pub(crate) mod narrow;
 pub(crate) mod clip;
+pub(crate) mod narrow;
+mod readback;
+mod rotary;
 pub(crate) use rotary::PreparedRotaryProfile;
 mod masked_readout;
 pub(crate) use masked_readout::control_bytes as masked_readout_control_bytes;
 mod workspace_input;
 #[cfg(test)]
 pub(crate) use rotary::{
-    prepared_calls as prepared_rotary_calls, reset_prepared_calls as reset_prepared_rotary_calls,
+    prepared_calls as prepared_rotary_calls,
+    prepared_two_axis_calls as prepared_two_axis_rotary_calls,
+    reset_prepared_calls as reset_prepared_rotary_calls,
 };
 #[cfg(test)]
 pub(crate) use workspace_input::{reset_workspace_slot_projections, workspace_slot_projections};
@@ -148,32 +151,20 @@ impl Tensor for MlxTensor {
         )
     }
 
-    fn to_f32_vec(&self, context: &Self::Context) -> Result<Vec<f32>, Error> {
-        let array = if self.0.dtype() == Dtype::Float32 {
-            self.0.clone()
-        } else {
-            backend(self.0.as_dtype(Dtype::Float32, context))?
-        };
-        let array = backend(array.contiguous(false, context))?;
-        if array.size() == 0 {
-            return Ok(Vec::new());
-        }
-        backend(array.evaluated())?
-            .try_to_vec::<f32>()
-            .map_err(Error::backend_retained_source)
+    fn to_f32_vec(
+        &self,
+        _context: &Self::Context,
+    ) -> Result<eredu_core::HostTensorBuffer<f32>, Error> {
+        let completed = backend(self.0.evaluated())?;
+        readback::export_f32(&completed)
     }
 
-    fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
-        let array = if self.0.dtype() == Dtype::Int32 {
-            self.0.clone()
-        } else {
-            backend(self.0.as_dtype(Dtype::Int32, context))?
-        };
-        let evaluated = backend(array.evaluated())?;
-        if array.size() == 0 {
-            return Ok(Vec::new());
-        }
-        evaluated.try_to_vec::<i32>().map_err(Error::backend_retained_source)
+    fn to_i32_vec(
+        &self,
+        _context: &Self::Context,
+    ) -> Result<eredu_core::HostTensorBuffer<i32>, Error> {
+        let completed = backend(self.0.evaluated())?;
+        readback::export_i32(&completed)
     }
 
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
@@ -303,8 +294,14 @@ impl Tensor for MlxTensor {
         )
     }
 
-    fn narrow_axis(&self, axis: usize, start: i32, end: i32, context: &Self::Context) -> Result<Self, Error> {
-        narrow::execute(self,axis,start,end,context)
+    fn narrow_axis(
+        &self,
+        axis: usize,
+        start: i32,
+        end: i32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        narrow::execute(self, axis, start, end, context)
     }
 
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error> {

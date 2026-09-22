@@ -9,10 +9,15 @@ use std::{
     rc::Rc,
 };
 
+use crate::backend::{
+    error::Error,
+    runtime::execution::generic::{
+        RegisteredScopeRetirementCause, RegisteredScopeRetirementFailure,
+    },
+};
 use safemlx::{error::Exception, SubmissionScope, SubmissionScopeBeginError};
-use crate::backend::{error::Error, runtime::execution::generic::{RegisteredScopeRetirementFailure, RegisteredScopeRetirementCause}};
-pub(crate) mod observed;
 pub(crate) mod native_role;
+pub(crate) mod observed;
 pub(crate) mod prediction;
 pub(crate) mod prefill;
 mod prepared;
@@ -67,12 +72,19 @@ impl Probe for SubmissionScope {
 }
 
 pub(crate) trait Retention: 'static {
+    /// Bind an already funded ordinary allocator owner before any native work.
+    /// Original sources retain their separate existing prepared allocator path.
+    fn configure_ordinary_scope(&self, _: &mut SubmissionScope) -> Result<(), Exception> {
+        Ok(())
+    }
     fn observe(&self, status: Status);
 
     /// Retire ordinary typed storage exactly as before. The observed wrapper
     /// overrides this private engine seam to keep its SAME empty node alive
     /// through a separately deferred payload's actual destruction.
-    fn retire_node<P: Probe>(node: Box<Node<Self, P>>) -> Result<(), RegisteredScopeRetirementFailure>
+    fn retire_node<P: Probe>(
+        node: Box<Node<Self, P>>,
+    ) -> Result<(), RegisteredScopeRetirementFailure>
     where
         Self: Sized,
     {
@@ -91,6 +103,9 @@ pub(crate) trait Retention: 'static {
 }
 
 impl<T: Retention> Retention for Rc<T> {
+    fn configure_ordinary_scope(&self, scope: &mut SubmissionScope) -> Result<(), Exception> {
+        (**self).configure_ordinary_scope(scope)
+    }
     fn observe(&self, status: Status) {
         (**self).observe(status);
     }
@@ -292,7 +307,10 @@ fn retire_typed_node<T, P>(node: Box<Node<T, P>>) -> Result<(), RegisteredScopeR
     let registration = node.registration.take();
     let status = node.last_status.get();
     drop(node);
-    match registration { Some(registration) => registration.finish_after_payload(status), None => Ok(()) }
+    match registration {
+        Some(registration) => registration.finish_after_payload(status),
+        None => Ok(()),
+    }
 }
 
 fn unbox_node<T, P>(node: Box<Node<T, P>>) -> Node<T, P> {
@@ -539,7 +557,10 @@ impl<T: Retention> Recovery<T> {
         configure: impl FnOnce(&mut SubmissionScope, &T) -> Result<R, E>,
     ) -> Result<R, E> {
         let node = self.node.as_mut().expect("live recovery").node_mut();
-        configure(node.probe.as_mut().expect("accepted scope"), &node.retention)
+        configure(
+            node.probe.as_mut().expect("accepted scope"),
+            &node.retention,
+        )
     }
 
     /// Try once without housekeeping registration, reaping or native progress.
@@ -558,7 +579,9 @@ impl<T: Retention> Recovery<T> {
         // Retirement itself neither registers hooks nor grows a container.
         safemlx::register_thread_runtime_housekeeping(reap);
         reap();
-        Ok(Self::with_probe(retention, SubmissionScope::begin()?))
+        let mut scope = SubmissionScope::begin()?;
+        retention.configure_ordinary_scope(&mut scope)?;
+        Ok(Self::with_probe(retention, scope))
     }
 }
 
@@ -675,7 +698,8 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
             size_of::<Option<Status>>(),
             size_of::<&mut Option<PendingOwner>>(), // guarded-retire capture
             size_of::<&Node<T, P>>(),               // guarded-progress capture
-            size_of::<Option<crate::backend::runtime::execution::generic::RegisteredOriginalScope>>(),
+            size_of::<Option<crate::backend::runtime::execution::generic::RegisteredOriginalScope>>(
+            ),
             size_of::<Result<Status, Error>>(),
             size_of::<Result<Status, RegisteredScopeRetirementCause>>(),
             size_of::<Result<(), RegisteredScopeRetirementFailure>>(),
@@ -717,17 +741,20 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
                             .take()
                             .expect("live recovery scope")
                             .into_pending()
-                            .retire().map_err(RegisteredScopeRetirementFailure::into_cause)?;
+                            .retire()
+                            .map_err(RegisteredScopeRetirementFailure::into_cause)?;
                     } else {
                         status.settled = false;
                     }
                 }
                 Ok::<Status, RegisteredScopeRetirementCause>(status)
             })
-            .unwrap_or_else(|| Ok(Status {
-                settled: false,
-                ..self.progress()
-            }))?;
+            .unwrap_or_else(|| {
+                Ok(Status {
+                    settled: false,
+                    ..self.progress()
+                })
+            })?;
             if status.settled || status.failed || status.blocked {
                 return Ok(status);
             }

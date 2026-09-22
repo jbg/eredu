@@ -2,13 +2,13 @@
 use super::*;
 use crate::backend::runtime::residency::storage::StorageIdentity;
 use eredu_runtime::{
+    SharedLayeredObservationPaths,
     inspection::PrefillChunkRetentionContext,
     working_memory::{
         BoundedPinAttempt, BoundedPinError, BoundedRegisteredStorage, CaptureSourceSegment,
         FailedBoundedPinAttempt, InferenceRequest, OriginalPrefillStoragePinSlots,
         OriginalTextControlGuard, WorkingMemoryFundingScope,
     },
-    SharedLayeredObservationPaths,
 };
 
 pub(super) type Key = StorageIdentity;
@@ -229,14 +229,14 @@ impl PreparedOpeningPins {
     pub(in crate::composition::mlx::replicated_text) fn registered_bytes(&self) -> Option<u64> {
         self.registered
             .as_ref()
-            .and_then(|registered| registered.bytes().checked_add(self.original_bytes))
+            .and_then(|registered| registered.bytes()?.checked_add(self.original_bytes))
     }
 }
 
 // FixedOpeningOwners retains the actual metadata token through every attempted
 // prefix. Classification adds only prepriced inline result/borrow controls.
 fn storage_entry_in(
-    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: &eredu_runtime::working_memory::MemoryLedger,
     entry: OpeningEntry<'_>,
 ) -> Result<Option<(Key, u64)>, OpeningError> {
     if let OpeningEntry::Table(owner, bytes) = entry {

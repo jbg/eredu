@@ -2,7 +2,7 @@
 //! by the native submission. Metal reads strided source rows directly: neither
 //! operation copies or widens the complete source table.
 
-use super::facts::{self, add, buffer_capacity, mul, Emitter, FactResult, Output};
+use super::facts::{self, Emitter, FactResult, Output, add, buffer_capacity, mul};
 use super::{
     reduction::{capacity_fixed as capacity, sum_cost_fixed as sum_cost},
     *,
@@ -109,6 +109,9 @@ fn gather(
             )?,
         )?
     };
+    if count != 0 {
+        sink.default_scratch(mul(3, capacity(allocation, 1)?)?, 3)?;
+    }
     sink.output(Output::Allocate(buffer_capacity(
         allocation,
         output.bytes()?.max(4),
@@ -152,8 +155,43 @@ fn embedding(
     let result = capacity(allocation, output.elements()?)?;
     let scratch =
         embedding_validation_cost_fixed(ids.elements()?, output.elements()?, policy, allocation)?;
+    let (bytes, births) = embedding_default_scratch(ids.elements()?, policy, allocation)?;
+    sink.default_scratch(bytes, births)?;
     sink.output(Output::Allocate(result))?;
     sink.finish(scratch, format_args!("MLX dense embedding: I32 normalization, retained token-domain reduction, safe-index masking, direct strided table gather and optional zero-sentinel output; no full-table copy/cast; page={} with bounded oversized reuse; active tensor buffers only", allocation.page_size()))
+}
+
+/// Eager I32 range/sentinel constructors in the shared domain validator. Empty
+/// inputs return before constructing any scalar; cast outputs remain execution
+/// allocations even when they happen to have one element.
+pub(super) fn token_validation_default_scratch(
+    count: u64,
+    policy: EmbeddingLookupPolicy,
+    allocation: NativeAllocationFacts,
+) -> FactResult<(u64, usize)> {
+    policy.validate_fixed()?;
+    let births = if count == 0 {
+        0
+    } else {
+        2 + usize::from(matches!(policy, EmbeddingLookupPolicy::ZeroSentinel(_)))
+    };
+    Ok((mul(births as u64, capacity(allocation, 1)?)?, births))
+}
+
+/// The ordinary embedding wrapper repeats two range constructors and creates
+/// the zeros_like seed. Sentinel output adds its comparison and zeros_like
+/// seeds, separately from the sentinel accepted by the domain validator.
+pub(super) fn embedding_default_scratch(
+    count: u64,
+    policy: EmbeddingLookupPolicy,
+    allocation: NativeAllocationFacts,
+) -> FactResult<(u64, usize)> {
+    let (bytes, births) = token_validation_default_scratch(count, policy, allocation)?;
+    let extra = 3 + 2 * usize::from(matches!(policy, EmbeddingLookupPolicy::ZeroSentinel(_)));
+    Ok((
+        add(bytes, mul(extra as u64, capacity(allocation, 1)?)?)?,
+        births + extra,
+    ))
 }
 
 /// Shared token validation and optional sentinel-zeroing cost. Physical row

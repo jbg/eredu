@@ -1,6 +1,7 @@
 #include "mlx/c/prepared_input.h"
 #include "mlx/c/original_buffer.h"
 #include "mlx/c/error.h"
+#include "mlx/c/private/memory_placement.h"
 #include "mlx/c/private/array.h"
 #include "mlx/prepared_input.h"
 #include "mlx/input_allocator.h"
@@ -11,7 +12,7 @@ using namespace mlx::core;
 namespace {
 allocator::PreparedInputFacts facts(mlx_prepared_input_runtime runtime) noexcept {
   return {runtime.page_size, runtime.maximum,
-      static_cast<allocator::HostTransferStorageKind>(runtime.storage_kind), runtime.controls};
+      static_cast<allocator::HostTransferStorageKind>(runtime.storage_kind), runtime.controls, {runtime.placement.kind, runtime.placement.device, runtime.placement.device_count}};
 }
 PreparedInputSource source(mlx_prepared_input_source value) noexcept {
   return {value.data, value.shape, value.rank, value.elements, value.kind};
@@ -23,7 +24,7 @@ extern "C" int mlx_prepared_input_runtime_prepare(mlx_prepared_input_runtime* ou
     auto& runtime = allocator::allocator();
     allocator::PreparedInputFacts prepared;
     if (!runtime.prepare_input_runtime(prepared)) return 1;
-    *out = {&runtime, prepared.page_size, prepared.maximum, static_cast<unsigned>(prepared.kind), prepared.controls};
+    *out = {&runtime, prepared.page_size, prepared.maximum, static_cast<unsigned>(prepared.kind), prepared.controls, mlx_placement_to_c(prepared.placement)};
     return 0;
   } catch (const std::exception& error) { mlx_error(error.what()); return 2; }
 }
@@ -152,7 +153,7 @@ extern "C" unsigned mlx_input_allocator_initialize(mlx_prepared_input_runtime* o
   if (status == Cause::success) {
     const auto& facts = initialized.facts;
     *out = {initialized.allocator, facts.page_size, facts.maximum,
-        unsigned(facts.kind), facts.controls};
+        unsigned(facts.kind), facts.controls, mlx_placement_to_c(facts.placement)};
     *identity = initialized.identity;
   }
   return unsigned(status);
@@ -184,7 +185,7 @@ extern "C" unsigned mlx_input_allocator_borrow(mlx_prepared_input_runtime* out,
   if (status == Cause::success) {
     const auto& facts = initialized.facts;
     *out = {initialized.allocator, facts.page_size, facts.maximum,
-        unsigned(facts.kind), facts.controls};
+        unsigned(facts.kind), facts.controls, mlx_placement_to_c(facts.placement)};
   }
   return unsigned(status);
 }
@@ -220,4 +221,13 @@ extern "C" unsigned mlx_original_prediction_input_new(
   const auto status = construct_original_prediction_input(input, elements, value);
   if (status == Status::success) *out = mlx_array{&value->value(), value};
   return unsigned(status);
+}
+
+#include "mlx/c/private/memory_placement.h"
+extern "C" int mlx_prepared_input_leaf_placement(mlx_memory_placement* out, mlx_prepared_input_leaf value) {
+  if (!out || !value.ctx) return 1;
+  const auto& data = static_cast<mlx::core::PreparedInputLeaf*>(value.ctx)->value().data_shared_ptr();
+  if (!data || !data->original_input || !data->allocation_generation) return 1;
+  *out = mlx_placement_to_c(mlx::core::allocator::memory_placement(data->buffer));
+  return out->kind ? 0 : 1;
 }

@@ -4,6 +4,8 @@ use super::*;
 
 mod prepared;
 pub(crate) use prepared::PreparedAddressableSource;
+mod ordinary_host;
+pub(crate) use ordinary_host::{compact_transport_control_bytes, OrdinaryBankHostSource};
 
 fn prepared_parameter_members(
     entries: &[ParameterBankEntry],
@@ -49,7 +51,8 @@ fn prepared_parameter_members(
 pub struct AddressableParameterBank {
     pub(super) parameter_members:
         Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
-    pub(super) parameter_replacements: BTreeMap<String, MlxTensor>,
+    pub(super) parameter_replacements:
+        eredu_runtime::parameter_operations::ParameterReplacementValues<MlxTensor>,
     pub(super) parameter_revision: u64,
     pub(super) effective_member_bytes: BTreeMap<ParameterBankKey, u64>,
     pub(super) pool_id: u64,
@@ -230,8 +233,17 @@ impl AddressableParameterBank {
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, AddressableParameterBankError>
-    where O: Into<ParameterBankOptions> {
-        Self::new_selected_shared_with_manager(store, selected, options, source_stream, device_stream, None)
+    where
+        O: Into<ParameterBankOptions>,
+    {
+        Self::new_selected_shared_with_manager(
+            store,
+            selected,
+            options,
+            source_stream,
+            device_stream,
+            None,
+        )
     }
 
     /// Prepares the actual selected catalog and its original manager before
@@ -243,9 +255,16 @@ impl AddressableParameterBank {
         options: impl Into<ParameterBankOptions>,
         source_stream: &Stream,
         device_stream: &Stream,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
     ) -> Result<Option<PreparedAddressableSource>, AddressableParameterBankError> {
-        PreparedAddressableSource::prepare(store, selected, options.into(), source_stream, device_stream, pool)
+        PreparedAddressableSource::prepare(
+            store,
+            selected,
+            options.into(),
+            source_stream,
+            device_stream,
+            pool,
+        )
     }
 
     /// Consumes a matching prepared catalog, or runs the same ordinary resolver.
@@ -257,12 +276,17 @@ impl AddressableParameterBank {
         device_stream: Stream,
         prepared: Option<PreparedAddressableSource>,
     ) -> Result<Self, AddressableParameterBankError>
-    where O: Into<ParameterBankOptions> {
+    where
+        O: Into<ParameterBankOptions>,
+    {
         let store = store.into();
         let options = options.into();
         let (resolved, manager) = match prepared {
             Some(prepared) => prepared.into_selected(&store, &selected, options)?,
-            None => (prepared::resolve_selected(store, selected, options, &source_stream)?, None),
+            None => (
+                prepared::resolve_selected(store, selected, options, &source_stream)?,
+                None,
+            ),
         };
         resolved.into_bank(options, source_stream, device_stream, manager)
     }
@@ -308,8 +332,19 @@ impl AddressableParameterBank {
         placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
         materialization: Option<WeightMaterializationReport>,
     ) -> Result<Self, AddressableParameterBankError> {
-        Self::new_shared_with_prepared_policy(store, entries, options, policy, initial_tier,
-            source_stream, device_stream, weight_quantizations, placements, materialization, None)
+        Self::new_shared_with_prepared_policy(
+            store,
+            entries,
+            options,
+            policy,
+            initial_tier,
+            source_stream,
+            device_stream,
+            weight_quantizations,
+            placements,
+            materialization,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -368,20 +403,32 @@ impl AddressableParameterBank {
         let manager = match prepared_manager {
             Some(manager) => {
                 manager.validate_original_layerwise_preparation(
-                    &store, &BTreeMap::new(), &plan, &definitions, &source_stream, &device_stream)?;
+                    &store,
+                    &BTreeMap::new(),
+                    &plan,
+                    &definitions,
+                    &source_stream,
+                    &device_stream,
+                )?;
                 manager
             }
             None => {
-                let manager = ResidencyManager::new_shared(store, plan, definitions, source_stream, device_stream)?;
+                let manager = ResidencyManager::new_shared(
+                    store,
+                    plan,
+                    definitions,
+                    source_stream,
+                    device_stream,
+                )?;
                 manager.initialize()?;
                 manager
             }
         };
-        let statistics=ParameterBankStatisticsTable::new(&catalog);
+        let statistics = ParameterBankStatisticsTable::new(&catalog);
         static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
             parameter_members: Vec::new(),
-            parameter_replacements: BTreeMap::new(),
+            parameter_replacements: Default::default(),
             parameter_revision: 0,
             effective_member_bytes: catalog.clone(),
             pool_id: NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -505,22 +552,25 @@ impl AddressableParameterBank {
         }
 
         let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        self.acquire_demand(demand, compact_ids, grouped_ids.len() as u64, pass, stream)
+        self.acquire_demand(demand.into_iter().collect(), compact_ids,
+            u64::try_from(grouped_ids.len()).map_err(|_| AddressableParameterBankError::ByteOverflow)?,
+            pass, stream, None)
     }
 
     fn acquire_demand(
         &self,
-        demand: BTreeMap<ParameterBankKey, u64>,
+        demand: Vec<(ParameterBankKey, u64)>,
         compact_ids: Vec<ParameterBankKey>,
         selection_count: u64,
         pass: BankAccessClass,
         stream: &Stream,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
     ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
         let bank = compact_ids.first().map(|key| key.bank());
         if compact_ids.iter().any(|key| Some(key.bank()) != bank) {
             return Err(AddressableParameterBankError::MixedBanks);
         }
-        let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
+        let scratch_bytes = demand.iter().try_fold(0u64, |total, (identity, _)| {
             total
                 .checked_add(self.effective_member_bytes[identity])
                 .ok_or(AddressableParameterBankError::ByteOverflow)
@@ -532,17 +582,16 @@ impl AddressableParameterBank {
                 distinct_entries: demand.len(),
             });
         }
-        let before = self.resident_snapshot()?;
+        let before = self.resident_snapshot(funding)?;
         let started = Instant::now();
         let mut host_hits = 0u64;
         let mut host_misses = 0u64;
         let mut device_hits = 0u64;
         let mut device_misses = 0u64;
-        let mut requests = Vec::with_capacity(compact_ids.len());
-        let mut host_requests = Vec::new();
-        for identity in &compact_ids {
-            let unit = identity.unit_id();
-            let selection_demand = demand[identity];
+        let mut requests = ordinary_host::vector(compact_ids.len(), funding)?;
+        let mut host_requests = ordinary_host::vector(compact_ids.len(), funding)?;
+        for &(identity, selection_demand) in &demand {
+            let unit = ordinary_host::unit_id(identity, funding)?;
             let host_hit = self.manager.is_resident(&unit, MemoryTier::Host)?;
             let device_hit = self.manager.is_resident(&unit, MemoryTier::Device)?;
             if host_hit {
@@ -556,16 +605,18 @@ impl AddressableParameterBank {
                 device_misses = device_misses.saturating_add(1);
             }
             if host_hit || (!device_hit && self.host_budget != Some(0)) {
-                host_requests.push((unit.clone(), selection_demand));
+                host_requests.push((ordinary_host::clone_unit_id(&unit, funding)?, selection_demand));
             }
             requests.push((unit, selection_demand));
         }
         if !host_requests.is_empty() {
-            match self
-                .manager
-                .acquire_many_with_demand(&host_requests, MemoryTier::Host)
-            {
-                Ok(host) => drop(host),
+            let host = match funding {
+                Some(funding) => self.manager.acquire_many_with_host_transfer(
+                    &host_requests, MemoryTier::Host, funding).and_then(|mut transfer| transfer.synchronize()),
+                None => self.manager.acquire_many_with_demand(&host_requests, MemoryTier::Host).map(drop),
+            };
+            match host {
+                Ok(()) => {},
                 Err(ResidencyError::Ledger(ResidencyLedgerError::BudgetExhausted {
                     tier: MemoryTier::Host,
                     ..
@@ -573,12 +624,13 @@ impl AddressableParameterBank {
                 Err(error) => return Err(error.into()),
             }
         }
-        let transfer = self
-            .manager
-            .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
+        let transfer = match funding {
+            Some(funding) => self.manager.acquire_many_with_host_transfer(&requests, MemoryTier::Device, funding)?,
+            None => self.manager.acquire_many_with_transfer(&requests, MemoryTier::Device)?,
+        };
         transfer.order_after(stream)?;
         let wait = started.elapsed();
-        let after = self.resident_snapshot()?;
+        let after = self.resident_snapshot(funding)?;
         let (host_evictions, host_eviction_bytes) = before.evicted(&after, MemoryTier::Host);
         let (device_evictions, device_eviction_bytes) = before.evicted(&after, MemoryTier::Device);
 
@@ -612,27 +664,29 @@ impl AddressableParameterBank {
                 .eviction_bytes
                 .saturating_add(device_eviction_bytes);
         }
-        let mut occupancy = BTreeMap::<usize, (u64, u64)>::new();
-        for (id, bytes) in &after.host {
-            occupancy.entry(self.unit_banks[id]).or_default().0 += bytes;
-        }
-        for (id, bytes) in &after.device {
-            occupancy.entry(self.unit_banks[id]).or_default().1 += bytes;
-        }
-        for (bank, (host, device)) in occupancy {
-            let stats = statistics.get_mut(bank)?;
+        // Each actual catalog bank has one fixed statistics row. The borrowed
+        // residency snapshot supplies occupancy without another dynamic map.
+        for (&bank, stats) in statistics.iter_mut() {
+            let (host, device) = after.rows.iter().filter(|(id, _, _)| self.unit_banks[*id] == bank)
+                .try_fold((0u64, 0u64), |(host, device), (_, h, d)| {
+                    Some((host.checked_add(h.unwrap_or(0))?, device.checked_add(d.unwrap_or(0))?))
+                }).ok_or(AddressableParameterBankError::ByteOverflow)?;
             stats.peak_host_bytes = stats.peak_host_bytes.max(host);
             stats.peak_device_bytes = stats.peak_device_bytes.max(device);
         }
         drop(statistics);
 
+        let mut counts = ordinary_host::vector(demand.len(), funding)?;
+        counts.extend(demand.into_iter().map(|(_, count)| count));
         Ok(AcquiredParameterGroups {
             identities: compact_ids,
-            demand: demand.into_values().collect(),
+            demand: counts,
             scratch_bytes,
             pass,
             transfer,
             original: None,
+            ordinary: None,
+            ordinary_chunk: None,
         })
     }
 
@@ -643,10 +697,21 @@ impl AddressableParameterBank {
         pass: BankAccessClass,
         stream: &Stream,
     ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+        self.acquire_entry_demand_with_host(entries, pass, stream, None)
+    }
+
+    fn acquire_entry_demand_with_host(
+        &self,
+        entries: &[(ParameterBankKey, u64)],
+        pass: BankAccessClass,
+        stream: &Stream,
+        funding: Option<&eredu_nn::workspace::HostMetadataFunding>,
+    ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+        ordinary_host::fund_acquisition(funding)?;
         if entries.is_empty() {
             return Err(AddressableParameterBankError::EmptyDemand);
         }
-        let mut demand = BTreeMap::new();
+        let mut demand = ordinary_host::vector(entries.len(), funding)?;
         let mut selection_count = 0u64;
         for &(identity, count) in entries {
             if count == 0 {
@@ -655,15 +720,18 @@ impl AddressableParameterBank {
             if !self.catalog.contains_key(&identity) {
                 return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
             }
-            if demand.insert(identity, count).is_some() {
-                return Err(AddressableParameterBankError::DuplicateDemand { identity });
-            }
+            demand.push((identity, count));
             selection_count = selection_count
                 .checked_add(count)
                 .ok_or(AddressableParameterBankError::ByteOverflow)?;
         }
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        self.acquire_demand(demand, compact_ids, selection_count, pass, stream)
+        demand.sort_unstable_by_key(|(identity, _)| *identity);
+        if let Some(pair) = demand.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(AddressableParameterBankError::DuplicateDemand { identity: pair[0].0 });
+        }
+        let mut compact_ids = ordinary_host::vector(demand.len(), funding)?;
+        compact_ids.extend(demand.iter().map(|(key, _)| *key));
+        self.acquire_demand(demand, compact_ids, selection_count, pass, stream, funding)
     }
 
     /// Records a completed compact-bank construction.
@@ -792,43 +860,33 @@ impl AddressableParameterBank {
         })
     }
 
-    fn resident_snapshot(&self) -> Result<ResidentSnapshot, AddressableParameterBankError> {
-        let report = self.manager.report()?;
-        Ok(ResidentSnapshot {
-            host: report
-                .units()
-                .iter()
-                .filter(|unit| unit.host_resident())
-                .map(|unit| (unit.id().clone(), unit.host_allocated_bytes()))
-                .collect(),
-            device: report
-                .units()
-                .iter()
-                .filter(|unit| unit.device_resident())
-                .map(|unit| (unit.id().clone(), unit.device_allocated_bytes()))
-                .collect(),
-        })
+    fn resident_snapshot(&self, funding: Option<&eredu_nn::workspace::HostMetadataFunding>)
+        -> Result<ResidentSnapshot<'_>, AddressableParameterBankError> {
+        let mut rows = ordinary_host::vector(self.unit_banks.len(), funding)?;
+        rows.extend(self.unit_banks.keys().map(|id| (id, None, None)));
+        self.manager.fill_resident_capacities(&mut rows)?;
+        Ok(ResidentSnapshot { rows })
     }
 }
 
-struct ResidentSnapshot {
-    pub(super) host: BTreeMap<OffloadUnitId, u64>,
-    pub(super) device: BTreeMap<OffloadUnitId, u64>,
+struct ResidentSnapshot<'a> {
+    rows: Vec<(&'a OffloadUnitId, Option<u64>, Option<u64>)>,
 }
 
-impl ResidentSnapshot {
+impl ResidentSnapshot<'_> {
     fn evicted(&self, after: &Self, tier: MemoryTier) -> (u64, u64) {
-        let (before, after) = match tier {
-            MemoryTier::Host => (&self.host, &after.host),
-            MemoryTier::Device => (&self.device, &after.device),
-            MemoryTier::Disk => return (0, 0),
-        };
-        before
-            .iter()
-            .filter(|(id, _)| !after.contains_key(*id))
-            .fold((0u64, 0u64), |(count, bytes), (_, size)| {
-                (count.saturating_add(1), bytes.saturating_add(*size))
-            })
+        self.rows.iter().zip(&after.rows).fold((0u64, 0u64), |(count, bytes), (before, after)| {
+            debug_assert!(std::ptr::eq(before.0, after.0));
+            let (before, after) = match tier {
+                MemoryTier::Host => (before.1, after.1),
+                MemoryTier::Device => (before.2, after.2),
+                MemoryTier::Disk => return (count, bytes),
+            };
+            match before.filter(|_| after.is_none()) {
+                Some(size) => (count.saturating_add(1), bytes.saturating_add(size)),
+                None => (count, bytes),
+            }
+        })
     }
 }
 
@@ -841,6 +899,8 @@ pub struct AcquiredParameterGroups {
     pub(super) transfer: ResidentTransfer,
     // Transfer/payloads retire before their issuing demand and source custody.
     pub(super) original: Option<super::movement::OriginalIndexedChunkSource>,
+    pub(super) ordinary: Option<OrdinaryBankHostSource>,
+    pub(super) ordinary_chunk: Option<super::movement::OrdinaryIndexedChunkSource>,
 }
 
 impl AcquiredParameterGroups {

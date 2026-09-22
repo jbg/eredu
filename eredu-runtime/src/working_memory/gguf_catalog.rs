@@ -1,7 +1,6 @@
 //! One source-owned immutable GGUF catalog through the existing cold account.
 use super::{
-    original_prepared_native_input::Account, qualified_storage, WorkingMemoryError,
-    WorkingMemoryPool,
+    MemoryLedger, WorkingMemoryError, original_prepared_native_input::Account, qualified_storage,
 };
 use eredu_checkpoint::{
     gguf_store::{GgufCatalogCompileFailure, GgufCatalogPlan, PreparedGgufCatalog},
@@ -33,7 +32,7 @@ impl OriginalGgufCatalog {
         catalog
     }
     /// Validate actual original accounting, without manufacturing a new hold.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         self.catalog
             .catalog_control_owner::<CatalogCustody>()
             .ok_or(WorkingMemoryError::UnknownBound)?
@@ -120,7 +119,7 @@ impl std::error::Error for OriginalGgufCatalogError {
         }
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     pub(super) fn validate_prepared_gguf_catalog(
         &self,
         catalog: &PreparedGgufCatalog,
@@ -218,7 +217,7 @@ impl WorkingMemoryPool {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Recognize only a catalog born through this module's fixed compiler and
     /// validate its original pool. Ordinary/arbitrary generic custody is unknown.
     pub fn validate_gguf_catalog_source(
@@ -244,7 +243,7 @@ impl super::WorkingMemoryReservation {
             size_of::<&eredu_checkpoint::gguf_store::GgufConversionPlan>(),
             size_of::<Option<&CatalogCustody>>(),
             size_of::<&CatalogCustody>(),
-            size_of::<&WorkingMemoryPool>(),
+            size_of::<&MemoryLedger>(),
             size_of::<Result<(), WorkingMemoryError>>(),
             size_of::<WorkingMemoryError>(),
             size_of::<bool>(),

@@ -8,13 +8,13 @@ fn model_capture_quote_rejects_stale_cumulative_usage_without_role_spend() {
     let workspace = EmbeddedInvocationWorkspace::target(invocation).unwrap();
     let report = report(workspace.geometry());
     let capacity = 1 << 26;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(capacity, 0).unwrap();
     let source = capture_source(&pool);
     let request = OriginalSpeculativeRequest::prepare_embedded(
         &pool,
         &InferenceExecutionIdentity::default(),
         &schedule,
-        capacity,
+        crate::working_memory::memory_fixture::resolved_host_limits(&pool, capacity),
     )
     .unwrap();
     let mut cursor = schedule.into_cursor();
@@ -68,7 +68,7 @@ fn model_capture_quote_rejects_stale_cumulative_usage_without_role_spend() {
     let current = request.inspect_embedded_capture_usage(&source).unwrap();
     assert_eq!(current, owner.usage());
     assert_eq!(current.captures, 1);
-    let before = pool.used_bytes().unwrap();
+    let before = pool.payload_used_bytes().unwrap();
     let refused = request
         .reserve_embedded_role_with_capture(
             cursor.claim(invocation).unwrap(),
@@ -81,7 +81,7 @@ fn model_capture_quote_rejects_stale_cumulative_usage_without_role_spend() {
         refused.cause(),
         WorkingMemoryError::IdentityMismatch
     ));
-    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert_eq!(pool.payload_used_bytes().unwrap(), before);
     assert_eq!(
         request.inspect_embedded_capture_usage(&source).unwrap(),
         current

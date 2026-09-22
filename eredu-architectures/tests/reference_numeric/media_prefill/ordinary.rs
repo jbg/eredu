@@ -36,6 +36,7 @@ struct Visitor<'a> {
     started: bool,
     external_source: bool,
     prediction_source: bool,
+    sources: &'a eredu_architectures::prepared_sources::PreparedModelSources,
 }
 impl CompositeTextArchitectureVisitor<NumericBackend, State> for Visitor<'_> {
     type Output = Run;
@@ -109,6 +110,7 @@ impl CompositeTextArchitectureVisitor<NumericBackend, State> for Visitor<'_> {
                 &capability,
                 self.input,
                 self.context,
+                self.sources,
             )
             .map_err(|e| e.to_string())?;
             return Ok(Run {
@@ -118,9 +120,15 @@ impl CompositeTextArchitectureVisitor<NumericBackend, State> for Visitor<'_> {
             });
         }
         if let Some(schedule) = self.schedule {
-            let report =
-                scheduled::<A, _>(&mut session, &admission, self.input, self.context, schedule)
-                    .map_err(|e| e.to_string())?;
+            let report = scheduled::<A, _>(
+                &mut session,
+                &admission,
+                self.input,
+                self.context,
+                schedule,
+                self.sources,
+            )
+            .map_err(|e| e.to_string())?;
             let mut outputs = report.output.clone().into_iter().collect::<Vec<_>>();
             outputs.extend(report.cached.iter().cloned());
             let state = report.final_state.clone();
@@ -144,7 +152,7 @@ impl CompositeTextArchitectureVisitor<NumericBackend, State> for Visitor<'_> {
                     batch_size,
                     input_positions,
                     cached_positions: 0,
-                    max_output_tokens: 0,
+                    max_output_tokens: 3,
                     prefill_chunk_positions: input_positions,
                     output: self.demand,
                 };
@@ -217,7 +225,7 @@ impl CompositeTextArchitectureVisitor<NumericBackend, State> for Visitor<'_> {
                     batch_size,
                     input_positions,
                     cached_positions: 0,
-                    max_output_tokens: 0,
+                    max_output_tokens: 3,
                     prefill_chunk_positions: input_positions,
                     output: self.demand,
                 };
@@ -330,6 +338,7 @@ fn negatives<A, D>(
     capability: &eredu_architectures::capability::CapabilityEstimate,
     input: &Input,
     context: &NumericContext,
+    sources: &eredu_architectures::prepared_sources::PreparedModelSources,
 ) -> Result<(), Error>
 where
     A: CompositeMediaIngressArchitecture<NumericBackend, State, Error = Error> + 'static,
@@ -352,9 +361,7 @@ where
     };
     let make_plan =
         || A::prepare_ingress_plan(admission, input.clone(), &NumericInputInspector, geometry);
-    let mut source = session
-        .prepare_media_prefill_unbudgeted(make_plan()?)
-        .map_err(|e| Error::backend(e.to_string()))?;
+    let mut source = source::prepare::<A, D>(session, admission, input, sources, geometry)?;
     let before = snapshot::<A, D>(session)?;
     let projections = context.projections.lock().unwrap().clone();
     let mechanisms = context.mechanism_trace();
@@ -362,16 +369,16 @@ where
     // This is the genuine existing scalar text admission, deliberately not a
     // media quote. Both forms must reject before preparing or executing media.
     for converted in [false, true] {
-        use eredu_runtime::working_memory::{
-            InferenceRequest, WorkingMemoryError, WorkingMemoryPool,
-        };
-        let pool = WorkingMemoryPool::new(1 << 30, 0).unwrap();
-        let reservation = pool
-            .reserve(
-                session.inference_execution_identity(),
-                &super::super::bounded_readout::scalar_session_admission(capability, geometry),
-            )
-            .unwrap();
+        use eredu_runtime::working_memory::{InferenceRequest, MemoryLedger, WorkingMemoryError};
+        let pool = crate::memory_fixture::ledger(1 << 30, 0).unwrap();
+        let reservation = crate::memory_fixture::request_in(
+            &pool,
+            session.inference_execution_identity(),
+            geometry,
+        )
+        .unwrap()
+        .memory_reservation()
+        .clone();
         let (reservation, run) = if converted {
             let (reservation, run) = reservation.into_funding().unwrap();
             (reservation, Some(run))
@@ -379,11 +386,11 @@ where
             (reservation, None)
         };
         let request: InferenceRequest = reservation.into();
-        assert!(request.memory_reservation().is_some());
+        request.memory_reservation();
         assert_eq!(request.requires_funding_scope(), converted);
         let mut called = false;
         let mut observer = Observer(Rc::new(RefCell::new(Trace::default())));
-        let rejected = session.try_prefill_media_source_cancellable(
+        let rejected = session.try_prefill_media_source_with_metadata(
             Some(&request),
             Some([1, 7]),
             None,
@@ -392,6 +399,7 @@ where
                 called = true;
                 make_plan()
             },
+            &source::unfunded_metadata(),
             &eredu_core::GenerationCancellationToken::new(),
             context,
             &mut observer,
@@ -416,7 +424,10 @@ where
         drop((request, run));
     }
     {
-        let request = source.request().expect("ordinary source retains its inference request").clone();
+        let request = source
+            .request()
+            .expect("ordinary source retains its inference request")
+            .clone();
         let execution = session.inference_execution_identity().clone();
         let cancellation = eredu_core::GenerationCancellationToken::new();
         cancellation.cancel();
@@ -465,10 +476,11 @@ where
     assert_eq!(context.mechanism_trace(), mechanisms);
     assert_eq!(*context.media_completions.lock().unwrap(), roots);
     drop(source);
-    let mut source = session
-        .prepare_media_prefill_unbudgeted(make_plan()?)
-        .map_err(|e| Error::backend(e.to_string()))?;
-    let request = source.request().expect("ordinary source retains its inference request").clone();
+    let mut source = source::prepare::<A, D>(session, admission, input, sources, geometry)?;
+    let request = source
+        .request()
+        .expect("ordinary source retains its inference request")
+        .clone();
     let execution = session.inference_execution_identity().clone();
     let mut observer = Observer(Rc::new(RefCell::new(Trace::default())));
     let mut executor = SessionPrefill::new_media(session, &mut source, context, &mut observer)
@@ -614,6 +626,7 @@ fn run_input(
         bind_checkpoint_values: true,
         ..Default::default()
     };
+    let retained_sources = sources.clone();
     let routes =
         PreparedExecutionRoutes::new().with_composite(
             CompositeRoute::<NumericBackend, State, _>::new(
@@ -628,6 +641,7 @@ fn run_input(
                     started: false,
                     external_source,
                     prediction_source,
+                    sources: &retained_sources,
                 },
             ),
         );
@@ -975,7 +989,7 @@ fn pending_encoder_assembly_preserves_multirow_image_video_and_projected_order()
 
 // Same shared driver for both genuine whole-input adapters; ordinary reference
 // forward remains above and never passes through this helper.
-fn run_whole_source<A, D, Source>(
+pub(super) fn run_whole_source<A, D, Source>(
     session: &mut Session<A, D>,
     source: Source,
     geometry: eredu_core::InferenceGeometry,
@@ -999,10 +1013,8 @@ where
     >,
 {
     let execution = session.inference_execution_identity().clone();
-    let request = eredu_runtime::working_memory::InferenceRequest::without_memory_budget(
-        &execution, geometry,
-    )
-    .map_err(|e| e.to_string())?;
+    let request =
+        crate::memory_fixture::request(&execution, geometry).map_err(|e| e.to_string())?;
     let mut executor = SessionPrefill::new(session, source, &request, context, observer)
         .map_err(|e| e.to_string())?;
     let mut driver = PrefillDriver::new(

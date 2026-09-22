@@ -55,4 +55,4 @@ pub use selection::{TopKGroupScoring, TopKGroupSelector, TopKGroupSelectorConfig
 mod tests;
 
 mod joint;
-pub(crate) use joint::{joint_selection, joint_selection_control_bytes};
+pub(crate) use joint::{joint_selection, joint_selection_control_bytes, joint_selection_ordinary_frame_bytes};

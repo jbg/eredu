@@ -1,7 +1,7 @@
 use super::*;
 use eredu_checkpoint::store::{CheckpointSource, SafetensorsWeightStore, TensorSelection};
 use eredu_core::residency::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy};
-use safemlx::{Device, DeviceType, ops::indexing::TryIndexOp};
+use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType};
 use std::sync::atomic::AtomicUsize;
 
 fn id(name: &str) -> OffloadUnitId {
@@ -98,11 +98,9 @@ fn active_route_rejects_unpriced_windows_host_and_background_before_reads() {
             .err()
             .unwrap(),
     );
-    assert!(
-        manager
-            .set_admitted_disk_window(&[id("u0"), id("u1"), id("u2")])
-            .is_err()
-    );
+    assert!(manager
+        .set_admitted_disk_window(&[id("u0"), id("u1"), id("u2")])
+        .is_err());
     manager
         .set_admitted_disk_window(&[id("u0"), id("u1")])
         .unwrap();
@@ -154,15 +152,13 @@ fn own_pending_plan_provenance_allows_window_overlap_but_old_cache_must_retire()
             .device_disk_route
             .clone();
         state.storage.get_mut(&id("u0")).unwrap().device_disk_route = Weak::new();
-        assert!(
-            validate_disk_acquisition(
-                &state,
-                &manager.inner.sources,
-                &[id("u0")],
-                MemoryTier::Device
-            )
-            .is_err()
-        );
+        assert!(validate_disk_acquisition(
+            &state,
+            &manager.inner.sources,
+            &[id("u0")],
+            MemoryTier::Device
+        )
+        .is_err());
         state.storage.get_mut(&id("u0")).unwrap().device_disk_route = provenance;
     }
     let before_setter = source.source_diagnostics().unwrap();

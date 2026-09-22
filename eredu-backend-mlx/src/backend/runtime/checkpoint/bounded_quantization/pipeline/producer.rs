@@ -86,10 +86,10 @@ impl TileProducer for OrdinaryTileProducer {
     }
 }
 
+mod admission;
 mod cpu_resources;
 mod encoded_affine;
 mod metadata;
-mod admission;
 
 #[cfg(test)]
 mod tests;
@@ -103,7 +103,7 @@ impl super::super::preparation::PreparedQuantization {
     /// construction remain separately owned prerequisites of this prepared value.
     fn materialize_cpu_encoded(
         self,
-        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: &eredu_runtime::working_memory::MemoryLedger,
         resources: &cpu_resources::CpuTileResources,
     ) -> Result<
         (QuantizedCheckpoint, BoundedQuantizationPlan),

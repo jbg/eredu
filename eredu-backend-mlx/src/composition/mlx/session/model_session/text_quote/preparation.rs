@@ -284,7 +284,11 @@ impl PreparationScopes {
         let mut pending = match pending {
             Some(pending) => pending,
             None => {
-                let claimed = { self.bank.borrow_mut().claim_sampling(preparation, config) };
+                let claimed = {
+                    self.bank
+                        .borrow_mut()
+                        .claim_sampling(preparation, config.clone())
+                };
                 let (stage, custody) = claimed.map_err(memory)?;
                 let (sampler, stage) = stage
                     .construct_sampler(quote.sampler_scope()?)
@@ -407,33 +411,64 @@ pub(super) fn reseed(
     let custody = extension.claim_reseed().map_err(memory)?;
     let controls = extension.control_guard();
     let work = PreparedFundedWork::new_with_native(
-        extension.funding().prepare_scope().map_err(memory)?, controls.clone(), None, None, Some(bank.clone()))?;
-    let native = NativePreparation::Unallocated(PreparedTextPreparationRetention {
-        _request: request.clone(), funding: work.retention(),
-    }, custody);
-    let mut recovery = native.begin_with_arenas(Some(quota), Some(graph))
-        .map_err(|(cause, pending)| { drop(pending); Error::PreparationScope(cause) })?;
+        extension.funding().prepare_scope().map_err(memory)?,
+        controls.clone(),
+        None,
+        None,
+        Some(bank.clone()),
+    )?;
+    let native = NativePreparation::Unallocated(
+        PreparedTextPreparationRetention {
+            _request: request.clone(),
+            funding: work.retention(),
+        },
+        custody,
+    );
+    let mut recovery =
+        native
+            .begin_with_arenas(Some(quota), Some(graph))
+            .map_err(|(cause, pending)| {
+                drop(pending);
+                Error::PreparationScope(cause)
+            })?;
     recovery.configure_scope(|scope| bank.configure_preparation_scope(scope, &controls))?;
     let work = work.activate();
-    let random = submission_recovery::detached_with_recovery(recovery, || {
-        let layout = program.preparation_graph().flatten().ok_or_else(unknown)?;
-        let observer = safemlx::OriginalScopeObserver::require_current()?;
-        let _graph = safemlx::OperationEvent::prepare_resident_graph(layout, &observer)?;
-        let random = RandomState::with_seed(seed)?;
-        work.retain(random.as_array());
-        Ok(random)
-    }, |cause| cause)?;
-    if let Some(cause) = work.take_collection_failure() { return Err(cause); }
+    let random = submission_recovery::detached_with_recovery(
+        recovery,
+        || {
+            let layout = program.preparation_graph().flatten().ok_or_else(unknown)?;
+            let observer = safemlx::OriginalScopeObserver::require_current()?;
+            let _graph = safemlx::OperationEvent::prepare_resident_graph(layout, &observer)?;
+            let random = RandomState::with_seed(seed)?;
+            work.retain(random.as_array());
+            Ok(random)
+        },
+        |cause| cause,
+    )?;
+    if let Some(cause) = work.take_collection_failure() {
+        return Err(cause);
+    }
     Ok(random)
 }
 pub(super) fn reseed_control_bytes() -> Result<u64, Error> {
-    let controls = [size_of::<RandomState>(), size_of::<Result<RandomState, Error>>(),
-        size_of::<Option<safemlx::PreparedResidentGraph>>(), size_of::<safemlx::ResidentGraphLayout>(),
-        size_of::<safemlx::OriginalScopeObserver>(), size_of::<PreparedFundedWork>(),
-        size_of::<OriginalPreparationScopeCustody>(), size_of::<u64>()];
-    let local = controls.into_iter().try_fold(std::mem::size_of_val(&controls), usize::checked_add)
-        .and_then(|n| u64::try_from(n).ok()).ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-    common_control_bytes()?.checked_add(local).ok_or_else(|| memory(WorkingMemoryError::Overflow))
+    let controls = [
+        size_of::<RandomState>(),
+        size_of::<Result<RandomState, Error>>(),
+        size_of::<Option<safemlx::PreparedResidentGraph>>(),
+        size_of::<safemlx::ResidentGraphLayout>(),
+        size_of::<safemlx::OriginalScopeObserver>(),
+        size_of::<PreparedFundedWork>(),
+        size_of::<OriginalPreparationScopeCustody>(),
+        size_of::<u64>(),
+    ];
+    let local = controls
+        .into_iter()
+        .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
+    common_control_bytes()?
+        .checked_add(local)
+        .ok_or_else(|| memory(WorkingMemoryError::Overflow))
 }
 
 /// Exactly Prompt + Sampling, independent of output count. Final stored fields

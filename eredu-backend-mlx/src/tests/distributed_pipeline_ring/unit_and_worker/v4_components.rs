@@ -26,7 +26,7 @@ mod v4_components {
         readout: &eredu_core::component::ComponentReadoutEquation,
         gain: &[f32],
         weight: &[f32],
-        score_weights: &[Vec<f32>],
+        score_weights: &[&[f32]],
         rows: usize,
     ) {
         let mixing = readout.stream_residual.as_ref().unwrap();
@@ -313,18 +313,17 @@ mod v4_components {
                 limits,
             )
             .unwrap_or_else(|error| panic!("partitioned readout query {id}: {error}"))
-            .values
         })
         .collect();
-        let hidden = parameters[0].len();
+        let hidden = parameters[0].values.len();
         for step in steps {
             let rows = tensor(step, &readout.residual).len() / hidden;
             reconstruct_readout(
                 step,
                 readout,
-                &parameters[0],
-                &parameters[1],
-                &parameters[2..],
+                &parameters[0].values,
+                &parameters[1].values,
+                &parameters[2..].iter().map(|value| value.values.as_slice()).collect::<Vec<_>>(),
                 rows,
             );
         }
@@ -434,7 +433,7 @@ mod v4_components {
         if !crate::tests::support::native_process::enter("capture") { return; }
         #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
         let _streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(
-            &crate::backend::managed_memory::domain(), device,
+            &crate::backend::managed_memory::ledger(), device,
         ).unwrap().expect("qualified native stream factory");
         for residency in [
             WeightResidency::default(),
@@ -587,13 +586,12 @@ mod v4_components {
                     },
                     usage,
                 )
-                .unwrap()
-                .values,
+                .unwrap(),
             );
         }
         assert!(matrices
             .iter()
-            .all(|m| m.iter().any(|v| *v < 0.0) && m.iter().any(|v| *v > 0.0)));
+            .all(|m| m.values.iter().any(|v| *v < 0.0) && m.values.iter().any(|v| *v > 0.0)));
         let column = group
             .write_column(
                 &eredu_core::component::ComponentId {
@@ -613,9 +611,9 @@ mod v4_components {
             )
             .unwrap();
             let matrix = if selection.parameter.id == group.write_weight {
-                &matrices[1]
+                &matrices[1].values
             } else {
-                &matrices[0]
+                &matrices[0].values
             };
             let stride = selection.parameter.shape[1] as usize;
             let starts = &selection.region.starts;
@@ -645,8 +643,7 @@ mod v4_components {
                     },
                     usage,
                 )
-                .unwrap()
-                .values,
+                .unwrap(),
             );
         }
         let capture = CapturePlan {
@@ -664,7 +661,6 @@ mod v4_components {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage.checked_mul(32).unwrap(),
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -763,8 +759,8 @@ mod v4_components {
                                 assert_eq!(value, input[(g * tokens + t) * per_group + c]);
                                 for r in 0..factor.rank {
                                     sum += value as f64
-                                        * matrices[0][(g * factor.rank + r) * per_group + c] as f64
-                                        * matrices[1][out * latent + g * factor.rank + r] as f64;
+                                        * matrices[0].values[(g * factor.rank + r) * per_group + c] as f64
+                                        * matrices[1].values[out * latent + g * factor.rank + r] as f64;
                                 }
                             }
                         }
@@ -777,8 +773,8 @@ mod v4_components {
                 reconstruct_readout(
                     &step,
                     readout,
-                    &readout_parameters[0],
-                    &readout_parameters[1],
+                    &readout_parameters[0].values,
+                    &readout_parameters[1].values,
                     &[],
                     tokens,
                 );

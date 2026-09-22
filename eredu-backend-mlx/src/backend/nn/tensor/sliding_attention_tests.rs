@@ -5,21 +5,24 @@ use crate::backend::nn::workspace::{
     SpeculativeNumericalRecipe,
 };
 use eredu_nn::{
-    AttentionArithmetic, AttentionRequest, NeuralBackend, Tensor,
     workspace::{
         WorkspaceBackend, WorkspaceContext, WorkspaceDtype, WorkspaceFloatingType,
         WorkspaceRepresentation, WorkspaceTensor,
     },
+    AttentionArithmetic, AttentionRequest, NeuralBackend, Tensor,
 };
 use safemlx::OperationEvent;
 #[test]
 fn sliding_cpu_attention_multiple_tiles_match_independent_arithmetic_and_retire() {
+    if !crate::tests::support::native_process::enter("qualified-native-source") {
+        return;
+    }
     use crate::{
-        MlxTensor,
         backend::{
-            MlxBackend, MlxDeviceIdentity, managed_memory::gpu_stream::PreparedExecutionStreams,
-            nn::shared::MlxNeuralBackend,
+            managed_memory::gpu_stream::PreparedExecutionStreams, nn::shared::MlxNeuralBackend,
+            MlxBackend, MlxDeviceIdentity,
         },
+        MlxTensor,
     };
     use safemlx::{
         Device, DeviceType, OriginalBufferBudget, OriginalScopeObserver, PrefillRoots,
@@ -28,8 +31,8 @@ fn sliding_cpu_attention_multiple_tiles_match_independent_arithmetic_and_retire(
         SubmissionScope,
     };
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
     #[derive(Debug)]
     struct Lifetime(Arc<AtomicBool>);

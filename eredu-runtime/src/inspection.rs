@@ -12,9 +12,16 @@ pub(crate) use prefill_retention::{RuntimeOpeningExecution, RuntimeOpeningState}
 mod error_bridge;
 pub use error_bridge::ObserverErrorBridge;
 mod intervention_projection;
-pub use intervention_projection::{validate_static_intervention_declarations,validate_static_intervention_declarations_with_phases,validate_activation_intervention_declarations_with_phases,static_intervention_validation_control_bytes};
-pub use intervention_projection::{prepare_intervention_discovery, intervention_discovery_preparation_bytes,
-    FundedInterventionDiscovery, InterventionDiscoveryPreparationError};
+pub use intervention_projection::{
+    FundedInterventionDiscovery, InterventionDiscoveryPreparationError,
+    intervention_discovery_preparation_bytes, prepare_intervention_discovery,
+};
+pub use intervention_projection::{
+    static_intervention_validation_control_bytes,
+    validate_activation_intervention_declarations_with_phases,
+    validate_prepared_intervention_declarations, validate_static_intervention_declarations,
+    validate_static_intervention_declarations_with_phases,
+};
 mod speculative;
 pub use speculative::{SpeculativeActivationObserver, with_speculative_activation};
 
@@ -97,8 +104,8 @@ pub fn intervention_support(
 ) -> eredu_core::intervention::InterventionDiscovery {
     use eredu_core::intervention::*;
     for point in &mut points {
-        let support=intervention_projection::support_for(point, &capture.support.points);
-        intervention_projection::apply(point,support,mechanisms.borrowed());
+        let support = intervention_projection::support_for(point, &capture.support.points);
+        intervention_projection::apply(point, support, mechanisms.borrowed());
     }
     InterventionDiscovery {
         schema_version: INTERVENTION_SCHEMA_VERSION,
@@ -146,9 +153,13 @@ pub fn observation_support_with_partition(
     context: ObservationExecutionContext,
     mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
 ) -> eredu_core::ObservationSupportReport {
-    observation_support_with_partition_source(catalog, context,
+    observation_support_with_partition_source(
+        catalog,
+        context,
         eredu_core::capture::CaptureSourceConstruction::new(None),
-        |point, _| Ok(partition(point))).expect("ordinary support source construction")
+        |point, _| Ok(partition(point)),
+    )
+    .expect("ordinary support source construction")
 }
 
 /// Same selected support worker with prospective source destinations. The
@@ -158,15 +169,28 @@ pub fn observation_support_with_partition_source(
     catalog: &eredu_core::ObservationCatalog,
     context: ObservationExecutionContext,
     construction: eredu_core::capture::CaptureSourceConstruction<'_>,
-    mut partition: impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
-        -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+    mut partition: impl FnMut(
+        &eredu_core::ObservationPoint,
+        eredu_core::capture::CaptureSourceConstruction<'_>,
+    ) -> Result<
+        eredu_core::ObservationSupportStatus,
+        eredu_core::capture::CaptureError,
+    >,
 ) -> Result<eredu_core::ObservationSupportReport, eredu_core::capture::CaptureError> {
     use eredu_core::{ObservationSupport, ObservationSupportReport};
-    construction.controls(observation_phase_validation_control_bytes()
-        .and_then(|n| n.checked_add(std::mem::size_of::<(ObservationSupportReport, ObservationSupport,
-            &eredu_core::ObservationCatalog, ObservationExecutionContext)>() ))
-        .and_then(|n| n.checked_add(std::mem::size_of_val(&partition)))
-        .ok_or(eredu_core::capture::CaptureError::Overflow)?)?;
+    construction.controls(
+        observation_phase_validation_control_bytes()
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<(
+                    ObservationSupportReport,
+                    ObservationSupport,
+                    &eredu_core::ObservationCatalog,
+                    ObservationExecutionContext,
+                )>())
+            })
+            .and_then(|n| n.checked_add(std::mem::size_of_val(&partition)))
+            .ok_or(eredu_core::capture::CaptureError::Overflow)?,
+    )?;
     let mut points = construction.vector(catalog.points.len())?;
     for point in &catalog.points {
         points.push(ObservationSupport {
@@ -176,8 +200,11 @@ pub fn observation_support_with_partition_source(
             floating_to_f32: context.mechanisms.floating_to_f32,
         });
     }
-    Ok(ObservationSupportReport { schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
-        capture: Default::default(), points })
+    Ok(ObservationSupportReport {
+        schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
+        capture: Default::default(),
+        points,
+    })
 }
 
 fn point_support(
@@ -185,8 +212,13 @@ fn point_support(
     phase_available: bool,
     context: ObservationExecutionContext,
     construction: eredu_core::capture::CaptureSourceConstruction<'_>,
-    partition: &mut impl FnMut(&eredu_core::ObservationPoint, eredu_core::capture::CaptureSourceConstruction<'_>)
-        -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError>,
+    partition: &mut impl FnMut(
+        &eredu_core::ObservationPoint,
+        eredu_core::capture::CaptureSourceConstruction<'_>,
+    ) -> Result<
+        eredu_core::ObservationSupportStatus,
+        eredu_core::capture::CaptureError,
+    >,
 ) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
     if let Some(status) = point_support_before_partition(point, phase_available, context, false) {
         return status.owned(construction);
@@ -208,7 +240,10 @@ enum BorrowedPointSupport {
     Unverified(&'static str),
 }
 impl BorrowedPointSupport {
-    fn owned(self, construction: eredu_core::capture::CaptureSourceConstruction<'_>) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
+    fn owned(
+        self,
+        construction: eredu_core::capture::CaptureSourceConstruction<'_>,
+    ) -> Result<eredu_core::ObservationSupportStatus, eredu_core::capture::CaptureError> {
         use eredu_core::ObservationSupportStatus as S;
         Ok(match self {
             Self::Supported => S::Supported,
@@ -227,8 +262,8 @@ fn point_support_before_partition(
     context: ObservationExecutionContext,
     prediction_requirement_discharged: bool,
 ) -> Option<BorrowedPointSupport> {
-    use eredu_core::ObservationRequirement as R;
     use BorrowedPointSupport as S;
+    use eredu_core::ObservationRequirement as R;
     let status = if !phase_available {
         S::Unsupported("The architecture does not emit this point in this phase")
     } else if !context.selected {
@@ -238,14 +273,22 @@ fn point_support_before_partition(
     } else if !context.mechanisms.activation_tensors {
         S::Unsupported("Backend has not declared tensor capture support")
     } else if !prediction_requirement_discharged
-        && point.requirements.contains(&R::PredictionExecution) && !context.prediction_inspection {
+        && point.requirements.contains(&R::PredictionExecution)
+        && !context.prediction_inspection
+    {
         S::Unsupported("Selected call path does not supply prediction activation hooks")
-    } else if matches!(point.value_type, eredu_core::ObservationValueType::RoutedUnits { .. })
-        && !context.mechanisms.routed_unit_tensors {
+    } else if matches!(
+        point.value_type,
+        eredu_core::ObservationValueType::RoutedUnits { .. }
+    ) && !context.mechanisms.routed_unit_tensors
+    {
         S::Unsupported("Backend does not collect bounded routed-unit values")
-    } else if point.requirements.contains(&R::RoutingEvents) && !context.mechanisms.routing_tensors {
+    } else if point.requirements.contains(&R::RoutingEvents) && !context.mechanisms.routing_tensors
+    {
         S::Unsupported("Backend does not collect normalized routing events")
-    } else { return None; };
+    } else {
+        return None;
+    };
     Some(status)
 }
 fn point_support_after_partition(
@@ -255,9 +298,13 @@ fn point_support_after_partition(
     use eredu_core::ObservationRequirement as R;
     if point.requirements.contains(&R::MediaInput) {
         BorrowedPointSupport::Conditional("Requires the corresponding media input during prefill")
-    } else if !prediction_requirement_discharged && point.requirements.contains(&R::PredictionExecution) {
+    } else if !prediction_requirement_discharged
+        && point.requirements.contains(&R::PredictionExecution)
+    {
         BorrowedPointSupport::Conditional("Requires the corresponding prediction execution group")
-    } else { BorrowedPointSupport::Supported }
+    } else {
+        BorrowedPointSupport::Supported
+    }
 }
 
 /// Borrowed selected-hook predicate using the same phase/collector requirements
@@ -275,24 +322,52 @@ pub fn observation_phase_is_admissible(
         eredu_core::capture::CapturePhase::Prefill => point.prefill,
         eredu_core::capture::CapturePhase::Decode => point.decode,
     };
-    if let Some(status) = point_support_before_partition(point, available, context, prediction_requirement_discharged) {
+    if let Some(status) =
+        point_support_before_partition(point, available, context, prediction_requirement_discharged)
+    {
         return status.admissible();
     }
-    !context.partitioned && point_support_after_partition(point, prediction_requirement_discharged).admissible()
+    !context.partitioned
+        && point_support_after_partition(point, prediction_requirement_discharged).admissible()
 }
 /// Exact nonallocating status comparison using the same selected ordinary hook
 /// projection. The architecture supplies its real prediction requirement proof.
-pub fn observation_phase_matches(point:&eredu_core::ObservationPoint,phase:eredu_core::capture::CapturePhase,context:ObservationExecutionContext,prediction_requirement_discharged:bool,expected:&eredu_core::ObservationSupportStatus)->bool {
-    if context.partitioned {return false;}
-    let available=match phase {eredu_core::capture::CapturePhase::Prefill=>point.prefill,eredu_core::capture::CapturePhase::Decode=>point.decode};
-    let actual=point_support_before_partition(point,available,context,prediction_requirement_discharged)
-        .unwrap_or_else(||point_support_after_partition(point,prediction_requirement_discharged));
-    match (actual,expected) {
-        (BorrowedPointSupport::Supported,eredu_core::ObservationSupportStatus::Supported)=>true,
-        (BorrowedPointSupport::Conditional(a),eredu_core::ObservationSupportStatus::Conditional(b))
-        |(BorrowedPointSupport::Unsupported(a),eredu_core::ObservationSupportStatus::Unsupported(b))
-        |(BorrowedPointSupport::Unverified(a),eredu_core::ObservationSupportStatus::Unverified(b))=>a==b,
-        _=>false,
+pub fn observation_phase_matches(
+    point: &eredu_core::ObservationPoint,
+    phase: eredu_core::capture::CapturePhase,
+    context: ObservationExecutionContext,
+    prediction_requirement_discharged: bool,
+    expected: &eredu_core::ObservationSupportStatus,
+) -> bool {
+    if context.partitioned {
+        return false;
+    }
+    let available = match phase {
+        eredu_core::capture::CapturePhase::Prefill => point.prefill,
+        eredu_core::capture::CapturePhase::Decode => point.decode,
+    };
+    let actual = point_support_before_partition(
+        point,
+        available,
+        context,
+        prediction_requirement_discharged,
+    )
+    .unwrap_or_else(|| point_support_after_partition(point, prediction_requirement_discharged));
+    match (actual, expected) {
+        (BorrowedPointSupport::Supported, eredu_core::ObservationSupportStatus::Supported) => true,
+        (
+            BorrowedPointSupport::Conditional(a),
+            eredu_core::ObservationSupportStatus::Conditional(b),
+        )
+        | (
+            BorrowedPointSupport::Unsupported(a),
+            eredu_core::ObservationSupportStatus::Unsupported(b),
+        )
+        | (
+            BorrowedPointSupport::Unverified(a),
+            eredu_core::ObservationSupportStatus::Unverified(b),
+        ) => a == b,
+        _ => false,
     }
 }
 /// Fixed controls for the borrowed predicate, including the actual support
@@ -300,17 +375,35 @@ pub fn observation_phase_matches(point:&eredu_core::ObservationPoint,phase:eredu
 pub fn observation_phase_validation_control_bytes() -> Option<usize> {
     use std::mem::{size_of, size_of_val};
     let frames = [
-        size_of::<(&eredu_core::ObservationPoint, eredu_core::capture::CapturePhase, ObservationExecutionContext, bool)>(),
-        size_of::<(&eredu_core::ObservationPoint, eredu_core::capture::CapturePhase, ObservationExecutionContext, bool, &eredu_core::ObservationSupportStatus)>(),
+        size_of::<(
+            &eredu_core::ObservationPoint,
+            eredu_core::capture::CapturePhase,
+            ObservationExecutionContext,
+            bool,
+        )>(),
+        size_of::<(
+            &eredu_core::ObservationPoint,
+            eredu_core::capture::CapturePhase,
+            ObservationExecutionContext,
+            bool,
+            &eredu_core::ObservationSupportStatus,
+        )>(),
         size_of::<(&eredu_core::ObservationPoint, bool)>(),
-        size_of::<(&eredu_core::ObservationPoint, bool, ObservationExecutionContext, bool)>(),
+        size_of::<(
+            &eredu_core::ObservationPoint,
+            bool,
+            ObservationExecutionContext,
+            bool,
+        )>(),
         size_of::<(&eredu_core::ObservationPoint, bool)>(),
         size_of::<Option<BorrowedPointSupport>>(),
         size_of::<BorrowedPointSupport>(),
         size_of::<bool>(),
         size_of::<std::slice::Iter<'static, eredu_core::ObservationRequirement>>(),
     ];
-    frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
 }
 
 /// One ordinary block output selected for a target/draft consumer.
@@ -534,11 +627,26 @@ pub trait ActivationObserver<T, E> {
     /// Source-only internal capture declaration for this exact outer invocation.
     /// The native adapter must quote its actual source/shape/scope and substitute
     /// the local funded observer before callbacks. This is not native authority.
-    fn original_speculative_capture(&self) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> { None }
+    fn original_speculative_capture(
+        &self,
+    ) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> {
+        None
+    }
+
+    /// Read-only cold source at a drained boundary. Prospective descriptions
+    /// grant no invocation, native role, capture destination or completion.
+    fn original_speculative_capture_preview(
+        &self,
+    ) -> Option<crate::capture::OriginalSpeculativeCapturePreview<'_>> {
+        None
+    }
 
     /// Receives a model phase's already paid shared frame after exact retirement.
     /// Unknown observers refuse; this handoff performs no capture/native work.
-    fn retain_original_speculative_capture(&mut self, _capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), crate::capture::CaptureProtocolError> {
+    fn retain_original_speculative_capture(
+        &mut self,
+        _capture: eredu_core::speculative::SpeculativeActivationCapture,
+    ) -> Result<(), crate::capture::CaptureProtocolError> {
         Err(crate::capture::CaptureProtocolError::Invocation)
     }
 
@@ -783,8 +891,22 @@ impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
         self.0.admitted_capture_continuation()
     }
 
-    fn original_speculative_capture(&self) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> { self.0.original_speculative_capture() }
-    fn retain_original_speculative_capture(&mut self, capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), crate::capture::CaptureProtocolError> { self.0.retain_original_speculative_capture(capture) }
+    fn original_speculative_capture(
+        &self,
+    ) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> {
+        self.0.original_speculative_capture()
+    }
+    fn original_speculative_capture_preview(
+        &self,
+    ) -> Option<crate::capture::OriginalSpeculativeCapturePreview<'_>> {
+        self.0.original_speculative_capture_preview()
+    }
+    fn retain_original_speculative_capture(
+        &mut self,
+        capture: eredu_core::speculative::SpeculativeActivationCapture,
+    ) -> Result<(), crate::capture::CaptureProtocolError> {
+        self.0.retain_original_speculative_capture(capture)
+    }
 
     fn routed_unit_observer(
         &mut self,
@@ -1229,8 +1351,10 @@ mod tests {
         let sparse = ObservationHookSupport::default().with_routed_units(true);
         assert!(sparse.supports(ObservationHookSite::RoutedUnits));
         assert!(!sparse.supports(ObservationHookSite::Unit));
-        assert!(!ObservationHookSupport::internal(true, true, true)
-            .supports(ObservationHookSite::RoutedUnits));
+        assert!(
+            !ObservationHookSupport::internal(true, true, true)
+                .supports(ObservationHookSite::RoutedUnits)
+        );
         let catalog = ObservationCatalog {
             schema_version: 1,
             completeness: DescriptionCompleteness::Complete,

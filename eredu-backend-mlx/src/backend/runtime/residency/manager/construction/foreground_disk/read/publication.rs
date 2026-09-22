@@ -42,8 +42,6 @@ pub(super) fn begin<'a>(
 ) -> Result<Pending, SourceError> {
     filled_host::begin(bank, plan, Peak { capacity, permit }, controls)
 }
-pub(super) fn finish(
-    pending: Pending,
-) -> Result<PublishedHostSource, SourceError> {
+pub(super) fn finish(pending: Pending) -> Result<PublishedHostSource, SourceError> {
     filled_host::finish(pending)
 }

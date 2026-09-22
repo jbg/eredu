@@ -63,13 +63,18 @@ where
     pub(super) fn bind_observation_paths(
         &self,
         source: &SharedLayeredObservationPaths,
-        metadata: Option<crate::layered::LayeredMetadata<A::Error>>) -> Result<
+        metadata: Option<crate::layered::LayeredMetadata<A::Error>>,
+    ) -> Result<
         PreparedLayeredObservationPaths,
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     > {
         let result = match &self.kind {
-            ReplicatedTextRuntimeKind::Resident(runtime) => runtime.bind_observation_paths(source, metadata),
-            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.bind_observation_paths(source, metadata),
+            ReplicatedTextRuntimeKind::Resident(runtime) => {
+                runtime.bind_observation_paths(source, metadata)
+            }
+            ReplicatedTextRuntimeKind::Bounded(runtime) => {
+                runtime.bind_observation_paths(source, metadata)
+            }
         };
         result.map_err(|error| map_prepared(error, ReplicatedTextSessionError::Architecture))
     }
@@ -186,7 +191,7 @@ where
     /// executor. Strategies without that producer retain None; transport and
     /// global point ownership remain separately validated.
     pub fn prepared_observation_paths(&self) -> Option<&PreparedLayeredObservationPaths> {
-        self.observation_paths.as_ref()
+        self.observation_paths.get()
     }
 
     /// Exact immutable source for cold metadata-runtime binding and publication.
@@ -194,9 +199,7 @@ where
     /// runtime binding nor capture/operation authority. Publication must occur
     /// under the original owner before finite work can borrow its source charge.
     pub fn shared_observation_paths(&self) -> Option<&SharedLayeredObservationPaths> {
-        self.observation_paths
-            .as_ref()
-            .map(PreparedLayeredObservationPaths::source)
+        self.observation_source.as_ref()
     }
 
     /// Validates the actual stored runtime token against the
@@ -215,17 +218,63 @@ where
         M::Error: std::fmt::Display,
     {
         self.inspect_runtime(|_, _| Ok(()))?;
-        let current = self.observation_paths.as_ref().ok_or(
-            ReplicatedTextSessionError::PreparedObservation(
-                PreparedSessionObservationError::Unavailable,
-            ),
-        )?;
+        let current =
+            self.observation_paths
+                .get()
+                .ok_or(ReplicatedTextSessionError::PreparedObservation(
+                    if self.observation_source.is_some() {
+                        PreparedSessionObservationError::BindingMismatch
+                    } else {
+                        PreparedSessionObservationError::Unavailable
+                    },
+                ))?;
         if !current.source().same_storage(expected) {
             return Err(ReplicatedTextSessionError::PreparedObservation(
                 PreparedSessionObservationError::BindingMismatch,
             ));
         }
         D::validate_observation_paths(&self.execution, current).map_err(widen_infallible)
+    }
+
+    /// Whether a finalized parameter publication is awaiting its explicit cold
+    /// binding. Raw mutable invalidation leaves its stale token populated.
+    pub fn parameter_observation_binding_pending(&self) -> bool {
+        self.observation_source.is_some() && self.observation_paths.get().is_none()
+    }
+
+    /// Rebinds only the empty token left by finalized parameter publication.
+    /// The actual strategy revalidates its retained source and funds the new
+    /// identity before construction. Refusal leaves no valid session token.
+    pub fn prepare_parameter_observation_paths(
+        &self,
+        metadata: crate::layered::LayeredMetadata<A::Error>,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        M::Error: std::fmt::Display,
+    {
+        self.inspect_runtime(|_, _| Ok(()))?;
+        let source = self.observation_source.as_ref().ok_or(
+            ReplicatedTextSessionError::PreparedObservation(
+                PreparedSessionObservationError::Unavailable,
+            ),
+        )?;
+        if self.observation_paths.get().is_none() {
+            metadata
+                .require_funding::<(
+                    &Self,
+                    &SharedLayeredObservationPaths,
+                    std::sync::OnceLock<PreparedLayeredObservationPaths>,
+                    Result<PreparedLayeredObservationPaths, PreparedLayeredObservationPaths>,
+                    Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+                )>()
+                .map_err(ReplicatedTextSessionError::Architecture)?;
+            let rebound = D::bind_observation_paths(&self.execution, source, Some(metadata))
+                .map_err(widen_infallible)?;
+            // Concurrent cold callers share the first actual runtime binding.
+            // A losing fully paid token retires outside publication locks.
+            let _ = self.observation_paths.set(rebound);
+        }
+        self.validate_prepared_observation_paths(source)
     }
 
     /// Coldly rebind the original retained path source after parameter/executor
@@ -239,14 +288,14 @@ where
     where
         M::Error: std::fmt::Display,
     {
-        let current = self.observation_paths.as_ref().ok_or(
+        let source = self.observation_source.as_ref().ok_or(
             ReplicatedTextSessionError::PreparedObservation(
                 PreparedSessionObservationError::Unavailable,
             ),
         )?;
-        let rebound = D::bind_observation_paths(&self.execution, current.source(), None)
-            .map_err(widen_infallible)?;
-        self.observation_paths = Some(rebound);
+        let rebound =
+            D::bind_observation_paths(&self.execution, source, None).map_err(widen_infallible)?;
+        self.observation_paths = std::sync::OnceLock::from(rebound);
         Ok(())
     }
 }

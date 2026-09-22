@@ -1,5 +1,7 @@
 use super::*;
 use crate::composition::mlx::session::model_session::text_quote::preparation::tests::with_foreign_runtime;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{TokenIdsInputPlan, TokenInputRejection};
 use safemlx::SubmissionScopeOwnerCause;
 
@@ -127,7 +129,7 @@ fn run_inputs(
         submission_tracking_capacity_bytes: graph
             .as_ref()
             .and_then(|_| std::num::NonZeroU64::new(1 << 20)),
-        ..config(4, u64::MAX).inference_policy()
+        ..config(4, u64::MAX).inference_policy().clone()
     });
     let request = GenerationSequenceRequest::new(4, &[]);
     let mut output = Vec::new();
@@ -307,10 +309,16 @@ fn logical_kv(runtime: &Runtime, positions: usize) -> Vec<(Vec<i32>, Vec<f32>)> 
 #[test]
 fn original_token_input_matches_actual_legacy_predictions_all_routes_and_residencies_after_caller_mutation()
  {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     compare_predictions(false);
 }
 #[test]
 fn original_token_input_and_graph_share_real_cached_execution_and_retire_each_original_arena() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     compare_predictions(true);
 }
 fn compare_predictions(with_graph: bool) {
@@ -319,7 +327,7 @@ fn compare_predictions(with_graph: bool) {
         for route in 0..3 {
             let mut reference = None;
             for original in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::tests::support::test_utils::initialize_original_sources();
                 let (mut runtime, _artifact) = load(&stream, &pool, residency);
                 let mut snapshots = Vec::new();
                 let mut arenas = Vec::new();
@@ -402,15 +410,18 @@ fn compare_predictions(with_graph: bool) {
 }
 #[test]
 fn original_token_input_exact_and_one_short_precede_native_upload_for_optional_capture_rows() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     for (capture, rows) in [(false, false), (true, false), (true, true)] {
         let mut required = None;
         for pass in 0..3 {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+            let pool = crate::tests::support::test_utils::initialize_original_sources();
             let (mut runtime, _artifact) = load(&stream, &pool, 0);
             let source = capture.then(|| source(&runtime));
             let probe = Probe::new(&runtime, source.as_ref(), rows);
-            let baseline = pool.used_bytes().unwrap();
+            let baseline = pool.fixture_host_charge().unwrap();
             let before = paths::session_input_creation_attempts();
             let observed = paths::snapshot();
             let capacity = required.map_or(u64::MAX, |n| baseline + n - u64::from(pass == 1));
@@ -420,7 +431,8 @@ fn original_token_input_exact_and_one_short_precede_native_upload_for_optional_c
                 config(4, capacity),
                 eredu_core::TokenFilter::All,
                 source.as_ref().map(|s| TextPreparationOptions {
-                    interventions: None, capture: Some(s.clone()),
+                    interventions: None,
+                    capture: Some(s.clone()),
                 }),
                 GenerationSequenceRequest::new(4, &[]),
             );
@@ -428,12 +440,14 @@ fn original_token_input_exact_and_one_short_precede_native_upload_for_optional_c
                 let error = result.err().unwrap();
                 assert!(matches!(
                     cause::<WorkingMemoryError>(&error),
-                    WorkingMemoryError::BudgetExceeded { .. }
+                    WorkingMemoryError::Domain(
+                        eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                    )
                 ));
                 assert!(probe.0.admitted.borrow().is_none());
                 assert_eq!(paths::session_input_creation_attempts(), before);
                 assert_eq!(paths::snapshot(), observed);
-                assert_eq!(pool.used_bytes().unwrap(), baseline);
+                assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
             } else {
                 let mut generation = result.unwrap();
                 let sequence = generation.take_prepared_sequence().unwrap();
@@ -472,8 +486,11 @@ fn original_token_input_exact_and_one_short_precede_native_upload_for_optional_c
 }
 #[test]
 fn original_input_busy_retry_preserves_actual_pointer_work_and_node_without_recopy() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::DeferOriginalPrompt);
@@ -544,8 +561,11 @@ fn original_input_busy_retry_preserves_actual_pointer_work_and_node_without_reco
 
 #[test]
 fn foreign_equal_value_claim_is_rejected_before_i_or_r_take_and_current_bank_remains_usable() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     let old_ids = [2, 5, 7, 3, 11];
@@ -622,6 +642,9 @@ fn foreign_equal_value_claim_is_rejected_before_i_or_r_take_and_current_bank_rem
 
 #[test]
 fn original_encoding_lends_real_native_input_with_same_predictions_and_logical_kv() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     use eredu_runtime::working_memory::OriginalTokenizerBackend;
     use eredu_text::tokenizer_storage::TokenizerPlan;
     let json = r#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"added_tokens":[],"model":{"type":"BPE","vocab":{"a":2,"b":5,"c":7,"d":3,"e":11},"merges":[]}}"#;
@@ -630,7 +653,7 @@ fn original_encoding_lends_real_native_input_with_same_predictions_and_logical_k
         for route in 0..3 {
             let mut reference: Option<Vec<(Vec<u32>, Vec<(Vec<i32>, Vec<f32>)>)>> = None;
             for encoded_route in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+                let pool = crate::tests::support::test_utils::initialize_original_sources();
                 let (mut runtime, _artifact) = load(&stream, &pool, residency);
                 let source = encoded_route.then(|| {
                     MlxBackend::compile_original_tokenizer(
@@ -657,10 +680,10 @@ fn original_encoding_lends_real_native_input_with_same_predictions_and_logical_k
                     if let Some(ids) = ids {
                         assert!(ids.matches_source(source.as_ref().unwrap()));
                         assert_eq!(ids.ids(), [2, 5, 7, 3, 11]);
-                        let before = pool.used_bytes().unwrap();
+                        let before = pool.fixture_host_charge().unwrap();
                         let e = ids.original_bytes();
                         drop(ids);
-                        assert_eq!(pool.used_bytes().unwrap(), before - e);
+                        assert_eq!(pool.fixture_host_charge().unwrap(), before - e);
                     }
                 }
                 if let Some(reference) = &reference {
@@ -693,9 +716,12 @@ fn original_encoding_lends_real_native_input_with_same_predictions_and_logical_k
 
 #[test]
 fn prepared_media_rebind_leaves_genuine_original_token_prompt_authority_untouched() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     use eredu_runtime::execution_control::TextSnapshotBackend;
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut runtime, _artifact) = load(&stream, &pool, 0);
     let probe = Probe::new(&runtime, None, false);
     probe.mode(Mode::DeferOriginalPrompt);
@@ -716,7 +742,6 @@ fn prepared_media_rebind_leaves_genuine_original_token_prompt_authority_untouche
     let prompt =
         MlxBackend::prepare_original_text_prompt_admitted(runtime.backend(), &preparation).unwrap();
     assert!(prompt.has_original_input_custody());
-    assert!(prompt.prepared_capture.is_none());
     let quote = prompt.quote.as_ref().unwrap().clone();
     let before = quote
         .original_token_input()
@@ -753,9 +778,12 @@ pub(in crate::composition::mlx::session::model_session::text_quote) mod original
 
 #[test]
 fn host_only_sequence_keeps_shared_predictions_and_host_custody_without_native_arenas() {
+    if !crate::tests::support::native_process::enter("native-sequence-source") {
+        return;
+    }
     let stream = stream();
     let input = [2, 5, 7, 3, 11];
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::tests::support::test_utils::initialize_original_sources();
     let (mut ordinary, _artifact) = load(&stream, &pool, 0);
     let ordinary_config = TextGenerationConfig::new(config(4, u64::MAX).sampling())
         .with_seed(19)
@@ -776,7 +804,7 @@ fn host_only_sequence_keeps_shared_predictions_and_host_custody_without_native_a
     // Existing uninterrupted and controlled sequence drivers both request H
     // without native Graph/Record arenas. Neither may silently gain those arenas.
     for route in [0, 1] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let pool = crate::tests::support::test_utils::initialize_original_sources();
         let (mut runtime, _artifact) = load(&stream, &pool, 0);
         let probe = Probe::new(&runtime, None, false);
         let calls = crate::backend::submission_recovery::prediction::test_counts::Calls::new();

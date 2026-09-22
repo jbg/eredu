@@ -22,6 +22,7 @@ impl Drop for Owner {
 fn settle(count: &AtomicUsize, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        crate::memory::clear_cache().unwrap();
         reclaim_allocation_owners();
         let actual = count.load(Ordering::SeqCst);
         if actual == expected {
@@ -294,7 +295,9 @@ fn original_population_covers_independently_rounded_sources() {
             .capacity(),
         0
     );
-    let empty = OriginalBufferBudget::request_layout(&runtime, 0).unwrap().capacity();
+    let empty = OriginalBufferBudget::request_layout(&runtime, 0)
+        .unwrap()
+        .capacity();
     let empty_population = OriginalBufferBudget::population_layout(&runtime, 0, 8).unwrap();
     assert!(empty_population.capacity() >= 8 * empty);
     if empty == 0 {
@@ -314,17 +317,30 @@ fn original_population_covers_independently_rounded_sources() {
         vec![1, 0, page - header, page - header + 1],
         vec![page - 1, page, page + 1, 2 * page + 1],
     ] {
-        let actual: usize = requests.iter().map(|&bytes| {
-            OriginalBufferBudget::request_layout(&runtime, bytes).unwrap().capacity()
-        }).sum();
+        let actual: usize = requests
+            .iter()
+            .map(|&bytes| {
+                OriginalBufferBudget::request_layout(&runtime, bytes)
+                    .unwrap()
+                    .capacity()
+            })
+            .sum();
         let bound = OriginalBufferBudget::population_layout(
-            &runtime, requests.iter().sum(), requests.len()
-        ).unwrap().capacity();
+            &runtime,
+            requests.iter().sum(),
+            requests.len(),
+        )
+        .unwrap()
+        .capacity();
         assert!(bound >= actual, "requests={requests:?}: {bound} < {actual}");
         assert!(bound < actual + requests.len() * page);
         let larger_population = OriginalBufferBudget::population_layout(
-            &runtime, requests.iter().sum(), requests.len() + 3
-        ).unwrap().capacity();
+            &runtime,
+            requests.iter().sum(),
+            requests.len() + 3,
+        )
+        .unwrap()
+        .capacity();
         assert!(larger_population >= bound);
     }
     assert_eq!(
@@ -339,4 +355,30 @@ fn original_population_covers_independently_rounded_sources() {
         OriginalBufferBudget::population_layout(&runtime, 1, usize::MAX),
         Err(OriginalBufferCause::InvalidLayout)
     );
+}
+
+#[test]
+fn ordinary_attachment_rejects_conflicting_placement_before_consuming_owner() {
+    let guard = runtime_lock::enter();
+    let source = Array::from_slice(&[2.0f32, -3.0, 5.0], &[3]);
+    let OrdinaryBufferInspection::Allocation(mut witness) =
+        source.inspect_ordinary_buffer().unwrap()
+    else {
+        panic!("ordinary allocation must be certified");
+    };
+    assert_ne!(
+        witness.allocation().placement(),
+        crate::AllocationPlacement::Unknown
+    );
+    witness.facts.placement.kind = 0;
+    let count = Arc::new(AtomicUsize::new(0));
+    let prepared = PreparedAllocationOwner::try_new(Owner(count.clone())).unwrap();
+    let rejected = witness.try_attach(prepared).unwrap_err();
+    assert_eq!(rejected.cause(), OriginalBufferCause::BirthChanged);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    drop(guard);
+    drop(rejected);
+    // Failed attachment never arms native retirement: the still-owned payload
+    // is reclaimed by the Rust preparation owner immediately outside its loan.
+    settle(&count, 1);
 }

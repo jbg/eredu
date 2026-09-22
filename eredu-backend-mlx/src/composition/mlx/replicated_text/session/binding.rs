@@ -19,15 +19,14 @@ pub(in crate::composition::mlx) use routed::{
 /// A stack-only once-moved source handoff shared by mutually exclusive routes.
 /// The architecture dispatcher selects the consumer; cloning a visitor cannot
 /// duplicate this manager, its original source account, or its native owners.
-pub(crate) type LayerwiseManagerSlot = std::cell::Cell<
-    Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
->;
+pub(crate) type NativeConstructionSlot =
+    std::cell::Cell<Option<crate::composition::mlx::loading::PreparedNativeConstructionSources>>;
 
 /// Family-agnostic MLX visitor that binds neutral parameter topology.
 pub(crate) struct BindingVisitor<'a> {
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
-    pub layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub construction_sources: Option<&'a NativeConstructionSlot>,
 }
 
 pub(crate) type AddressableManagerSlot = std::cell::Cell<
@@ -38,7 +37,7 @@ pub(crate) struct PredictionBindingVisitor<'a> {
     pub addressable_manager: Option<&'a AddressableManagerSlot>,
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
-    pub layerwise_manager: Option<&'a LayerwiseManagerSlot>,
+    pub construction_sources: Option<&'a NativeConstructionSlot>,
     pub selected: eredu_runtime::SelectedSpeculativeRealization,
     pub capability: eredu_architectures::capability::CapabilityEstimate,
 }
@@ -184,13 +183,13 @@ where
         };
         let residency =
             super::super::prediction::parameters::residency::<A, _>(&mut prediction.extension)?;
-        CompletedReplicatedText::new_with_prepared_layerwise(
+        CompletedReplicatedText::new_with_construction_sources(
             prepared,
             store,
             self.stream,
             self.weights_stream,
             residency,
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
         )?
         .with_prediction(prediction, self.capability)
         .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
@@ -254,13 +253,13 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for B
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        CompletedReplicatedText::new_with_prepared_layerwise(
+        CompletedReplicatedText::new_with_construction_sources(
             prepared,
             store,
             self.stream,
             self.weights_stream,
             Default::default(),
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
         )
         .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
@@ -286,13 +285,13 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState> for Bin
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        CompletedReplicatedText::new_with_prepared_layerwise(
+        CompletedReplicatedText::new_with_construction_sources(
             prepared,
             store,
             self.stream,
             self.weights_stream,
             Default::default(),
-            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.construction_sources.and_then(std::cell::Cell::take),
         )
         .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }

@@ -1,8 +1,8 @@
 use super::*;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_runtime::{
+    working_memory::{InferenceExecutionIdentity, MemoryLedger},
     PagedCacheOptions,
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryPool},
 };
 use safemlx::{Array, Device, DeviceType, Stream};
 
@@ -37,9 +37,12 @@ fn populated_reset_source_builds_independent_empty_manager_and_preserves_old_bac
     let prior = manager.report().unwrap();
     let (plan, bytes) = source.original_reset_plan().unwrap();
     assert!(bytes > 0);
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 24)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 24),
+        )
         .unwrap();
     let mut context = source
         .prepare_original_reset(&plan, Some(&funding))
@@ -64,9 +67,9 @@ fn populated_reset_source_builds_independent_empty_manager_and_preserves_old_bac
         MlxKeyValueState::paged_with_global_layer_start(layout, other_manager, None, 7).unwrap();
     assert!(other.prepare_original_reset(&plan, Some(&funding)).is_err());
     drop((context, funding, source, manager, other));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(empty);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
 
 #[test]
@@ -133,9 +136,12 @@ fn host_reset_preserves_actual_sources_without_promotion_or_copy_authority() {
     assert!(prior.host_demotions > 0);
     let (plan, bytes) = source.original_reset_plan().unwrap();
     assert!(bytes > 0);
-    let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(1 << 24, 0).unwrap();
     let funding = pool
-        .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 24)
+        .prepare_workspace_metadata(
+            &InferenceExecutionIdentity::default(),
+            crate::memory_fixture::resolved_limits(1 << 24),
+        )
         .unwrap();
     // Cold copy inspection describes the same two Host/Device pages. It
     // allocates no destination, promotes nothing and grants no numerical copy.
@@ -165,7 +171,11 @@ fn host_reset_preserves_actual_sources_without_promotion_or_copy_authority() {
     assert_eq!(KeyValueCache::offset(&source.layers.slots()[0]), 5);
     assert_eq!(manager.report().unwrap(), prior);
     drop((context, funding, source, manager, other));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     drop(empty);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -40,8 +40,9 @@ impl std::fmt::Debug for DiskWorkerInstallFailure {
     }
 }
 impl CacheBlockSourceLoan<'_> {
-    /// Uses the configured worker's exact queue capacity. Both authoritative
-    /// registries and the manager's ordinary write-reservation table are reused.
+    /// Uses the configured worker's exact queue capacity for selected live
+    /// writes or authenticated retained reads. Both authoritative registries
+    /// and the manager's ordinary write-reservation table are reused.
     pub(crate) fn prepare_disk_worker(
         &self,
         maximum: usize,
@@ -51,11 +52,28 @@ impl CacheBlockSourceLoan<'_> {
         let funding = context.metadata_funding().ok_or_else(|| {
             CacheSourceFailure::metadata(WorkspaceMetadataError::Unqualified.into(), context)
         })?;
+        context
+            .charge_metadata(
+                PreparedDiskWorker::fixed_controls()
+                    .ok_or_else(|| fail(CacheSourceError::Overflow))?,
+            )
+            .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
         if !matches!(
             self.manager.inner.options.live_disk_policy(),
             LiveCacheDiskPolicy::Enabled { .. }
         ) {
-            return Err(fail(CacheSourceError::PromotionRequired));
+            // The queue also serves authenticated imported reads. A live-write
+            // policy cannot authorize those files, and disabling writes does
+            // not remove the actual canonical file source from this manager.
+            let mut retained_read = false;
+            for block in self.all_blocks() {
+                if block.disk().is_some() {
+                    retained_read |= block.retained_disk_types().map_err(fail)?.is_some();
+                }
+            }
+            if !retained_read {
+                return Err(fail(CacheSourceError::PromotionRequired));
+            }
         }
         let worker = self
             .manager
@@ -63,12 +81,6 @@ impl CacheBlockSourceLoan<'_> {
             .disk_worker
             .as_ref()
             .ok_or_else(|| fail(CacheSourceError::Identity))?;
-        context
-            .charge_metadata(
-                PreparedDiskWorker::fixed_controls()
-                    .ok_or_else(|| fail(CacheSourceError::Overflow))?,
-            )
-            .map_err(|cause| CacheSourceFailure::metadata(cause.into(), context))?;
         let registry = worker
             .inner
             .prepare_registry(maximum, context)
@@ -112,6 +124,7 @@ impl PreparedDiskWorker {
             size_of::<Self>(),
             size_of::<InstalledDiskWorker>(),
             size_of::<DiskWorkerInstallFailure>(),
+            initialized_mutex_control_bytes::<PreparedDiskWorker>()?,
             size_of::<Result<Self, CacheSourceFailure>>(),
             size_of::<Result<InstalledDiskWorker, DiskWorkerInstallFailure>>(),
             size_of::<Result<(), CacheSourceFailure>>(),
@@ -126,6 +139,11 @@ impl PreparedDiskWorker {
             size_of::<Option<RetiredCacheIoQueue<DiskTask, DiskResult>>>(),
             size_of::<Option<Writes>>(),
             Writes::mutation_control_bytes()?,
+            CacheBlockSource::retained_disk_control_bytes(),
+            size_of::<bool>(),
+            size_of::<CacheBlockSource<'_>>(),
+            size_of::<eredu_runtime::cache::CacheRecordTableIter<'_, CacheBlockId, CacheBlockRecord>>(
+            ),
         ];
         frames
             .into_iter()
@@ -188,10 +206,11 @@ impl PreparedDiskWorker {
             Ok(())
         })();
         match result {
-            Err(cause) => Err(DiskWorkerInstallFailure {
-                cause,
-                retained: Mutex::new(self),
-            }),
+            Err(cause) => {
+                let retained = Mutex::new(self);
+                drop(retained.lock().expect("new unshared retained-worker mutex"));
+                Err(DiskWorkerInstallFailure { cause, retained })
+            }
             Ok(()) => {
                 // All manager and worker borrows have ended before old metadata
                 // or its account can retire.

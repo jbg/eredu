@@ -5,9 +5,7 @@ use eredu_core::{
     InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout,
     WorkspaceBound,
 };
-use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -15,16 +13,16 @@ use std::sync::{
 
 fn runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
-    let backend = MlxBackend::new(stream, stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, stream).with_memory_ledger(pool.clone());
     let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model = eredu_core::load_model(&backend, artifact.path(), crate::MlxLoadRequest::default())
         .unwrap();
     let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
     settle(pool, 0, None);
     assert!(runtime.session().payload.model.has_published_idle_storage());
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.fixture_host_charge().unwrap() > 0);
     (runtime, artifact)
 }
 
@@ -33,15 +31,16 @@ fn stream() -> Stream {
 }
 
 fn reclaim() {
+    safemlx::memory::clear_cache();
     crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
 }
 
-fn settle(pool: &WorkingMemoryPool, owners: usize, bytes: Option<u64>) {
+fn settle(pool: &MemoryLedger, owners: usize, bytes: Option<u64>) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
         pool.unquoted_owner_count().unwrap() == owners
-            && bytes.is_none_or(|bytes| pool.used_bytes().unwrap() == bytes)
+            && bytes.is_none_or(|bytes| pool.fixture_host_charge().unwrap() == bytes)
     });
 }
 
@@ -74,22 +73,43 @@ fn zero_admission() -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
+}
+
+fn exact_empty_reservation_limits(pool: &MemoryLedger) -> eredu_core::MemoryLimits {
+    let constructor = pool
+        .reservation_requirements(&zero_admission(), None)
+        .unwrap()
+        .get(pool.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    crate::memory_fixture::physical_host_limits(
+        pool,
+        pool.fixture_host_current()
+            .unwrap()
+            .checked_add(constructor)
+            .unwrap(),
+    )
 }
 
 fn cause<'a, T: std::error::Error + 'static>(
@@ -103,7 +123,7 @@ fn cause<'a, T: std::error::Error + 'static>(
     }
 }
 
-fn excluded(pool: &WorkingMemoryPool) {
+fn excluded(pool: &MemoryLedger) {
     assert!(matches!(
         pool.reserve(&InferenceExecutionIdentity::default(), &zero_admission()),
         Err(WorkingMemoryError::UnknownBound)
@@ -113,20 +133,20 @@ fn excluded(pool: &WorkingMemoryPool) {
 #[test]
 fn zero_finite_reservation_rejects_host_preparation_without_work_or_accounting_change() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, artifact) = runtime(&stream, &pool);
-    let bytes = pool.used_bytes().unwrap();
+    let bytes = pool.fixture_host_charge().unwrap();
     let reservation = pool
         .reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
             &zero_admission(),
-            bytes,
+            exact_empty_reservation_limits(&pool),
         )
         .unwrap();
     let before = (
-        pool.used_bytes().unwrap(),
-        pool.peak_bytes().unwrap(),
-        pool.effective_capacity().unwrap(),
+        pool.fixture_host_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
+        pool.fixture_host_limit().unwrap(),
     );
     let native_paths = paths::snapshot();
     let inputs = paths::session_input_creation_attempts();
@@ -147,9 +167,9 @@ fn zero_finite_reservation_rejects_host_preparation_without_work_or_accounting_c
     );
     assert_eq!(
         (
-            pool.used_bytes().unwrap(),
-            pool.peak_bytes().unwrap(),
-            pool.effective_capacity().unwrap()
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap(),
+            pool.fixture_host_limit().unwrap()
         ),
         before
     );
@@ -171,7 +191,7 @@ fn zero_finite_reservation_rejects_host_preparation_without_work_or_accounting_c
     drop(reservation);
     let authority = MlxBackend::acquire_host_preparation(&runtime).unwrap();
     assert_eq!(pool.unquoted_owner_count().unwrap(), 1);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     drop(authority);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     drop((runtime, artifact));
@@ -181,15 +201,15 @@ fn zero_finite_reservation_rejects_host_preparation_without_work_or_accounting_c
 #[test]
 fn independent_runtime_pool_remains_available_while_another_pool_is_reserved() {
     let stream = stream();
-    let blocked = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let available = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let blocked = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let available = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (first, first_artifact) = runtime(&stream, &blocked);
     let (second, second_artifact) = runtime(&stream, &available);
     let reservation = blocked
         .reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
             &zero_admission(),
-            blocked.used_bytes().unwrap(),
+            exact_empty_reservation_limits(&blocked),
         )
         .unwrap();
     let error = MlxBackend::acquire_host_preparation(&first).unwrap_err();
@@ -211,7 +231,7 @@ fn independent_runtime_pool_remains_available_while_another_pool_is_reserved() {
 #[test]
 fn authority_aliases_outlive_runtime_and_source_without_retaining_model_payload() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, artifact) = runtime(&stream, &pool);
     let retired = runtime.session().test_payload_retirement_probe();
     let authority = MlxBackend::acquire_host_preparation(&runtime).unwrap();
@@ -228,14 +248,18 @@ fn authority_aliases_outlive_runtime_and_source_without_retaining_model_payload(
     drop(last);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     let reservation = pool
-        .reserve_with_capacity(&InferenceExecutionIdentity::default(), &zero_admission(), 0)
+        .reserve_with_capacity(
+            &InferenceExecutionIdentity::default(),
+            &zero_admission(),
+            exact_empty_reservation_limits(&pool),
+        )
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.fixture_host_charge().unwrap(), 0);
     drop(reservation);
 }
 
 struct ReentrantAuthority {
-    pool: WorkingMemoryPool,
+    pool: MemoryLedger,
     observed: Arc<AtomicBool>,
     // Metadata-only authority drops after the reentrant destructor has run.
     _authority: HostPreparationAuthority,
@@ -252,7 +276,7 @@ impl Drop for ReentrantAuthority {
 #[test]
 fn erased_authority_destructor_can_reenter_pool_while_exclusion_is_still_live() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
     let (runtime, artifact) = runtime(&stream, &pool);
     let authority = MlxBackend::acquire_host_preparation(&runtime).unwrap();
     let observed = Arc::new(AtomicBool::new(false));
@@ -269,3 +293,7 @@ fn erased_authority_destructor_can_reenter_pool_while_exclusion_is_still_live() 
     assert!(observed.load(Ordering::SeqCst));
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

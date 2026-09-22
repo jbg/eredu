@@ -1,6 +1,6 @@
 //! Finite original member/window transcript; no native result is synthesized.
-use super::*;
 use super::super::funded_coordination::HashWriter;
+use super::*;
 /// One actual architecture member and its retained post-window native program.
 /// All usages remain descriptive until the original ledger prepays this table.
 pub struct PartitionInterventionMemberSource<'a> {
@@ -27,6 +27,7 @@ pub struct PreparedPartitionInterventionSource {
     pub(super) phase: CapturePhase,
     pub(super) prediction: u64,
     pub(super) world: usize,
+    pub(super) model: Option<ModelInvocation>,
     pub(super) invocations: Vec<Invocation>,
     pub(super) members: Vec<usize>,
     pub(super) descriptor: [u8; 32],
@@ -42,6 +43,54 @@ impl PreparedPartitionInterventionSource {
         prediction: u64,
         world: usize,
         invocations: &[PartitionInterventionInvocationSource<'_>],
+        metadata: &HostMetadataFunding,
+    ) -> Result<Self, PartitionInterventionSourceError> {
+        Self::new_inner(
+            source,
+            operation,
+            phase,
+            prediction,
+            world,
+            invocations,
+            None,
+            metadata,
+        )
+    }
+    /// One actual model invocation. Physical rows and their logical window are
+    /// descriptive source coordinates, not a claim or execution authority.
+    pub fn new_invocation(
+        source: &OriginalInterventionSource,
+        operation: usize,
+        phase: CapturePhase,
+        prediction: u64,
+        world: usize,
+        physical: CaptureInvocationShape,
+        window: Option<CaptureInvocationWindow>,
+        members: &[PartitionInterventionMemberSource<'_>],
+        metadata: &HostMetadataFunding,
+    ) -> Result<Self, PartitionInterventionSourceError> {
+        Self::new_inner(
+            source,
+            operation,
+            phase,
+            prediction,
+            world,
+            &[PartitionInterventionInvocationSource {
+                window: None,
+                members,
+            }],
+            Some((physical, window)),
+            metadata,
+        )
+    }
+    fn new_inner(
+        source: &OriginalInterventionSource,
+        operation: usize,
+        phase: CapturePhase,
+        prediction: u64,
+        world: usize,
+        invocations: &[PartitionInterventionInvocationSource<'_>],
+        model: Option<ModelInvocation>,
         metadata: &HostMetadataFunding,
     ) -> Result<Self, PartitionInterventionSourceError> {
         let result = (|| -> Result<Self, Cause> {
@@ -68,8 +117,19 @@ impl PreparedPartitionInterventionSource {
             {
                 return Err(Cause::Source("dense source schedule or world differs"));
             }
-            let windowed =
-                phase == CapturePhase::Prefill && InterventionPrefillWindow::row_axis(point);
+            if model.is_some() != plan.invocation_bounds().is_some() {
+                return Err(Cause::Source(
+                    "model invocation source differs from admission",
+                ));
+            }
+            let logical = logical_invocation(model)?;
+            if let Some((physical, _)) = model {
+                plan.geometry_at(phase, prediction, Some(physical))?;
+                plan.geometry_at(phase, prediction, logical)?;
+            }
+            let windowed = model.is_none()
+                && phase == CapturePhase::Prefill
+                && InterventionPrefillWindow::row_axis(point);
             if !windowed && (invocations.len() != 1 || invocations[0].window.is_some()) {
                 return Err(Cause::Source(
                     "terminal operation requires one original callback",
@@ -106,7 +166,7 @@ impl PreparedPartitionInterventionSource {
                 }
                 for member in row.members {
                     if !member.projection.source().same_source(source)
-                        || member.projection.coordinate() != (operation, phase, prediction, None)
+                        || member.projection.coordinate() != (operation, phase, prediction, logical)
                         || member.shape.len() != member.projection.local_shape().len()
                     {
                         return Err(Cause::Source(
@@ -141,12 +201,22 @@ impl PreparedPartitionInterventionSource {
             }));
             let mut rows = vector(metadata, invocations.len(), &mut bytes)?;
             let mut digest = Sha256::new();
-            digest.update(b"eredu-original-partition-intervention-v1\0");
+            digest.update(if model.is_some() {
+                &b"eredu-original-partition-model-intervention-v1\0"[..]
+            } else {
+                &b"eredu-original-partition-intervention-v1\0"[..]
+            });
             digest.update(plan.intent_identity().as_bytes());
             digest.update((operation as u64).to_le_bytes());
             digest.update((world as u64).to_le_bytes());
             serde_json::to_writer(&mut HashWriter(&mut digest), &(phase, prediction))
                 .expect("closed source coordinate and infallible digest writer");
+            // Model coordinates belong to the same source digest as the exact
+            // component projection and actual member execution identities.
+            if let Some(model) = model {
+                serde_json::to_writer(&mut HashWriter(&mut digest), &model)
+                    .expect("closed model coordinate and infallible digest writer");
+            }
             digest.update((invocations.len() as u64).to_le_bytes());
             for row in invocations {
                 digest.update([u8::from(row.window.is_some())]);
@@ -211,6 +281,7 @@ impl PreparedPartitionInterventionSource {
                 phase,
                 prediction,
                 world,
+                model,
                 invocations: rows,
                 members,
                 descriptor: digest.finalize().into(),
@@ -225,6 +296,60 @@ impl PreparedPartitionInterventionSource {
             _metadata: metadata.clone(),
         })
     }
+    /// Prospective metadata for the same descriptor-copy worker. This only
+    /// describes allocation/control sizes and grants no invocation or quota.
+    pub fn preparation_metadata_bytes(
+        world: usize,
+        invocations: &[PartitionInterventionInvocationSource<'_>],
+    ) -> Option<usize> {
+        let members = (0..world)
+            .filter(|rank| {
+                invocations
+                    .iter()
+                    .any(|row| row.members.iter().any(|member| member.rank == *rank))
+            })
+            .count();
+        let mut bytes = Self::control_bytes()?
+            .checked_add(WorkspaceContext::metadata_vec_bytes::<usize>(members)?)?
+            .checked_add(WorkspaceContext::metadata_vec_bytes::<Invocation>(
+                invocations.len(),
+            )?)?
+            .checked_add(WorkspaceContext::metadata_arc_bytes::<Identity>()?)?;
+        for row in invocations {
+            bytes = bytes
+                .checked_add(WorkspaceContext::metadata_vec_bytes::<usize>(
+                    row.members.len(),
+                )?)?
+                .checked_add(WorkspaceContext::metadata_vec_bytes::<Option<Member>>(
+                    row.members.len(),
+                )?)?;
+            for member in row.members {
+                bytes = bytes.checked_add(WorkspaceContext::metadata_vec_bytes::<u64>(
+                    member.shape.len(),
+                )?)?;
+            }
+        }
+        Some(bytes)
+    }
+    /// The operation owner's actual world callbacks: one source activation
+    /// and one final fixed receipt. Per-invocation member votes are separate.
+    pub fn world_transport_demands() -> [super::super::super::PartitionCaptureTransportDemand; 2] {
+        use super::super::super::{
+            PartitionCaptureFrameKind, PartitionCaptureTransportDemand as D,
+        };
+        [
+            D::Active,
+            D::Gather {
+                kind: PartitionCaptureFrameKind::InterventionReceipt,
+                maximum_words: PartitionInterventionReceipt::WORDS,
+            },
+        ]
+    }
+    /// Fixed existing source preparation/hook/outcome controls. Protocol buffers
+    /// and actual transport callbacks retain their own prospective queries.
+    pub fn execution_control_bytes<T: PartitionCaptureTransport>() -> Option<usize> {
+        runtime_controls::<T>()
+    }
     pub fn original(&self) -> &OriginalInterventionSource {
         &self.source
     }
@@ -233,6 +358,12 @@ impl PreparedPartitionInterventionSource {
     }
     pub fn coordinate(&self) -> (CapturePhase, u64) {
         (self.phase, self.prediction)
+    }
+    /// Actual model axes/window; None retains the original text schedule.
+    pub fn model_invocation(
+        &self,
+    ) -> Option<(CaptureInvocationShape, Option<CaptureInvocationWindow>)> {
+        self.model
     }
     pub fn invocation_count(&self) -> usize {
         self.invocations.len()
@@ -394,6 +525,19 @@ impl PreparedPartitionInterventionSource {
             size_of::<PartitionInterventionMemberSource<'_>>(),
             size_of::<[CaptureUsage; 4]>(),
             size_of::<Option<InterventionPrefillWindow>>(),
+            size_of::<Option<ModelInvocation>>() * 3,
+            size_of::<Option<CaptureInvocationShape>>() * 2,
+            size_of::<(
+                &OriginalInterventionSource,
+                usize,
+                CapturePhase,
+                u64,
+                usize,
+                CaptureInvocationShape,
+                Option<CaptureInvocationWindow>,
+                &[PartitionInterventionMemberSource<'_>],
+                &HostMetadataFunding,
+            )>(),
             size_of::<std::ops::Range<usize>>(),
             size_of::<std::slice::Iter<'_, PartitionInterventionInvocationSource<'_>>>(),
             size_of::<std::slice::Iter<'_, PartitionInterventionMemberSource<'_>>>(),

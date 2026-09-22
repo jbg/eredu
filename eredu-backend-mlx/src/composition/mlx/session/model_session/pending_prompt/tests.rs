@@ -2,18 +2,20 @@ use super::*;
 use crate::backend::{
     nn::workspace::MlxMetalWorkspaceMechanisms, runtime::residency::storage::RetainedStorage,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use eredu_core::{
-    Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
-    InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig, StateMemoryLayout,
-    TextGenerationConfig, WorkspaceBound, cache::LayerCachePolicy,
+    cache::LayerCachePolicy, Admission, EstimationCompleteness, ExecutionWorkspaceEstimate,
+    InferenceGeometry, InputTokenCount, LayerSchedule, OutputDemand, ResolvedGenerationConfig,
+    StateMemoryLayout, TextGenerationConfig, WorkspaceBound,
 };
 use eredu_nn::workspace::WorkspaceContext;
 use eredu_runtime::working_memory::{
     HostSlotStorageKey, InferenceExecutionIdentity, InferenceRequest, InferenceTextPreparation,
-    RegisteredDecoderHostCopy, WorkingMemoryError, WorkingMemoryPool,
+    MemoryLedger, RegisteredDecoderHostCopy, WorkingMemoryError,
 };
 use eredu_runtime::{HostMetadataKey, HostSlotTable};
-use safemlx::{Device, DeviceType, Dtype, ops::indexing::TryIndexOp};
+use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType, Dtype};
 use std::{cell::Cell, num::NonZeroU8};
 const CAPACITY: u64 = 1048576;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,11 +45,11 @@ impl Drop for Cold {
         safemlx::unregister_thread_runtime_housekeeping(housekeeping);
     }
 }
-fn reclaim(pool: &WorkingMemoryPool, expected: u64) {
+fn reclaim(pool: &MemoryLedger, expected: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
-        pool.used_bytes().unwrap() == expected
+        pool.fixture_host_charge().unwrap() == expected
     });
 }
 fn source(stream: &Stream, signed: bool) -> Array {
@@ -61,7 +63,7 @@ fn source(stream: &Stream, signed: bool) -> Array {
     source
 }
 fn fresh(
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     bytes: u64,
 ) -> (
     InferenceTextPreparation,
@@ -95,26 +97,30 @@ fn fresh(
     .unwrap();
     let bound = |bytes| WorkspaceBound::bounded(bytes, "closed scalar host preparation fixture");
     let state = state
-        .with_execution_workspace(ExecutionWorkspaceEstimate {
-            geometry,
-            activations: bound(bytes),
-            attention: bound(0),
-            vocabulary: bound(0),
-            state_update: bound(0),
-            materialization: bound(0),
-            retained: bound(0),
-        })
+        .with_execution_workspace(crate::memory_fixture::workspace(
+            ExecutionWorkspaceEstimate {
+                physical_domains: None,
+                geometry,
+                activations: bound(bytes),
+                attention: bound(0),
+                vocabulary: bound(0),
+                state_update: bound(0),
+                materialization: bound(0),
+                retained: bound(0),
+            },
+        ))
         .unwrap();
     let reservation = pool
         .reserve_with_capacity(
             &execution,
-            &Admission {
+            &crate::memory_fixture::admission(Admission {
+                memory_limits: Default::default(),
+                additional_headroom: Default::default(),
                 requested_positions: 1,
                 state,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
-            },
-            CAPACITY,
+                incremental_required_bytes: Some(bytes),
+            }),
+            crate::memory_fixture::resolved_limits(CAPACITY),
         )
         .unwrap();
     let (reservation, run) = reservation.into_funding().unwrap();
@@ -132,7 +138,9 @@ fn fresh(
         max_new_tokens: Some(0),
     });
     (
-        request.prepare_text(&execution, geometry, config).unwrap(),
+        request
+            .prepare_text(&execution, geometry, config.clone())
+            .unwrap(),
         run,
         config,
     )
@@ -143,7 +151,10 @@ fn completion(
 ) -> InferencePromptCompletion {
     let source = HostSlotTable::new(Vec::<u8>::new().into_boxed_slice());
     let key = Key(source.metadata().identity().registry_key().clone());
-    let charge = run.pool().register_storage([(key.clone(), 0)]).unwrap();
+    let charge = run
+        .pool()
+        .register_host_storage([(key.clone(), 0)])
+        .unwrap();
     let plan =
         RegisteredDecoderHostCopy::bind(run.pool(), source.prepare_copy_slots().unwrap(), key)
             .unwrap()
@@ -187,11 +198,11 @@ fn exact_host_and_native_pending_plan_share_one_part_and_preserve_incremental_id
         cold.check();
         drop(cold);
         drop(projection);
-        let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+        let pool = crate::memory_fixture::ledger(CAPACITY, 0).unwrap();
         let mut source_inventory = RetainedStorage::default();
         source_inventory.include_array(&source).unwrap();
         let source_storage = source_inventory.register(&pool).unwrap();
-        let source_bytes = source_storage.bytes();
+        let source_bytes = source_storage.bytes().unwrap();
         let total = host_bytes.checked_add(native_bytes).unwrap();
         // This low-level zero-output request prices only the actual component
         // workers; it makes no model-forward or resumed-run claim.
@@ -243,7 +254,10 @@ fn exact_host_and_native_pending_plan_share_one_part_and_preserve_incremental_id
         drop((preparation, roots));
         run.close().unwrap();
         drop(prompt);
-        assert!(pool.used_bytes().unwrap() >= source_bytes + host_bytes + actual.bytes() as u64);
+        assert!(
+            pool.fixture_host_charge().unwrap()
+                >= source_bytes + host_bytes + actual.bytes() as u64
+        );
         assert!(matches!(
             pool.acquire_unquoted(),
             Err(WorkingMemoryError::ReservedWorkActive)
@@ -264,19 +278,25 @@ fn short_host_hold_rejects_before_pending_numerical_construction() {
     let original = source.try_metadata_snapshot().unwrap();
     let plan = PreparedPendingPrompt::new(&source).unwrap();
     let h = plan.host_plan().initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(CAPACITY, 0).unwrap();
     let mut inventory = RetainedStorage::default();
     inventory.include_array(&source).unwrap();
     let retained = inventory.register(&pool).unwrap();
     let (preparation, run, _) = fresh(&pool, h - 1);
     let complete = completion(&preparation, &run);
-    let before = (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap());
+    let before = (
+        pool.fixture_host_charge().unwrap(),
+        pool.fixture_host_peak().unwrap(),
+    );
     let cold = Cold::new();
     let error = plan.prepare_host(complete, &run).unwrap_err();
     assert!(std::error::Error::source(&error).unwrap().downcast_ref::<WorkingMemoryError>().is_some_and(|error|
-        matches!(error,WorkingMemoryError::BudgetExceeded{required_bytes,available_bytes} if *required_bytes==h && *available_bytes==h-1)));
+        matches!(error,WorkingMemoryError::Domain(eredu_core::MemoryDomainError::BudgetExceeded { requested_bytes: required_bytes, limit_bytes, existing_bytes, .. }) if *required_bytes==h && (*limit_bytes - *existing_bytes)==h-1)));
     assert_eq!(
-        (pool.used_bytes().unwrap(), pool.peak_bytes().unwrap()),
+        (
+            pool.fixture_host_charge().unwrap(),
+            pool.fixture_host_peak().unwrap()
+        ),
         before
     );
     assert_eq!(source.try_metadata_snapshot().unwrap(), original);
@@ -284,7 +304,7 @@ fn short_host_hold_rejects_before_pending_numerical_construction() {
     drop(cold);
     drop((plan, preparation));
     run.close().unwrap();
-    reclaim(&pool, retained.bytes());
+    reclaim(&pool, retained.bytes().unwrap());
     drop((retained, source));
     reclaim(&pool, 0);
 }
@@ -296,7 +316,7 @@ fn closed_run_rejects_prepared_host_before_any_native_root_is_created() {
     let original = source.try_metadata_snapshot().unwrap();
     let plan = PreparedPendingPrompt::new(&source).unwrap();
     let h = plan.host_plan().initialization_peak_bytes();
-    let pool = WorkingMemoryPool::new(CAPACITY, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(CAPACITY, 0).unwrap();
     let (preparation, run, _) = fresh(&pool, h);
     let complete = completion(&preparation, &run);
     let host = plan.prepare_host(complete, &run).unwrap();
@@ -304,12 +324,10 @@ fn closed_run_rejects_prepared_host_before_any_native_root_is_created() {
     let roots = RefCell::new(Vec::new());
     let cold = Cold::new();
     let error = plan.copy_into_prompt(host, &stream, &roots).unwrap_err();
-    assert!(
-        std::error::Error::source(&error)
-            .unwrap()
-            .downcast_ref::<WorkingMemoryError>()
-            .is_some_and(|error| matches!(error, WorkingMemoryError::ExecutionFenced))
-    );
+    assert!(std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<WorkingMemoryError>()
+        .is_some_and(|error| matches!(error, WorkingMemoryError::ExecutionFenced)));
     assert!(roots.borrow().is_empty());
     assert_eq!(source.try_metadata_snapshot().unwrap(), original);
     cold.check();
@@ -317,3 +335,7 @@ fn closed_run_rejects_prepared_host_before_any_native_root_is_created() {
     drop(preparation);
     reclaim(&pool, 0);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

@@ -2,6 +2,8 @@ use super::*;
 use crate::composition::mlx::replicated_text::tests::{
     routed_deepseek_v4_config, tiny_heterogeneous_artifact,
 };
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 
 fn v4_artifact() -> tempfile::TempDir {
     let mut config = routed_deepseek_v4_config();
@@ -15,10 +17,10 @@ fn v4_artifact() -> tempfile::TempDir {
 
 fn disk_runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let root = v4_artifact();
     let options = crate::MlxLoadRequest::from_normalized(
         eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
@@ -52,11 +54,11 @@ fn disk_runtime(
 
 fn cold_quote_and_short_rejection(
     runtime: &mut ModelRuntime<MlxBackend<'_>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
 ) -> u64 {
     let controller = Controller::default();
-    let baseline = pool.used_bytes().unwrap();
-    let peak = pool.peak_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
+    let peak = pool.fixture_host_peak().unwrap();
     let before_paths = paths::snapshot();
     let before_inputs = paths::session_input_creation_attempts();
     let before_resets = paths::session_reset_attempts();
@@ -90,10 +92,10 @@ fn cold_quote_and_short_rejection(
             .unwrap()
             > 0
     );
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
-    assert_eq!(pool.peak_bytes().unwrap(), peak);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_peak().unwrap(), peak);
     let capacity = exact_capacity(runtime, pool, 0.7);
-    let before_rejection_peak = pool.peak_bytes().unwrap();
+    let before_rejection_peak = pool.fixture_host_peak().unwrap();
     let error = ControlledTextGeneration::from_input(
         runtime,
         TextGenerationInput::TokenIds(tokens()),
@@ -104,7 +106,9 @@ fn cold_quote_and_short_rejection(
     .expect("one-position chunk cannot shrink below exact capacity");
     assert!(matches!(
         cause::<WorkingMemoryError>(&error),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert_eq!(controller.0.get(), (0, 0));
     assert_eq!(paths::snapshot(), before_paths);
@@ -118,15 +122,17 @@ fn cold_quote_and_short_rejection(
         runtime.session().payload.model.erased().state_snapshot(),
         before_state
     );
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
-    assert_eq!(pool.peak_bytes().unwrap(), before_rejection_peak);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_peak().unwrap(), before_rejection_peak);
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
     capacity
 }
 
 #[test]
 fn v4_fixed_rotary_host_construction_is_bounded_for_both_host_windows_and_drivers() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     let mut reference = None;
@@ -160,7 +166,7 @@ fn v4_fixed_rotary_host_construction_is_bounded_for_both_host_windows_and_driver
                 assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
             }
             assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-            assert!(pool.peak_bytes().unwrap() <= capacity);
+            assert!(pool.fixture_host_peak().unwrap() <= capacity);
             drop((output, runtime, root));
             settle(&pool, native_baseline);
         }
@@ -169,7 +175,9 @@ fn v4_fixed_rotary_host_construction_is_bounded_for_both_host_windows_and_driver
 
 #[test]
 fn v4_fixed_rotary_direct_disk_construction_matches_resident_with_exact_admission() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     let reference = {
@@ -205,7 +213,7 @@ fn v4_fixed_rotary_direct_disk_construction_matches_resident_with_exact_admissio
         assert!(units.iter().all(|unit| !unit.host_resident()));
         assert!(units.iter().filter(|unit| unit.device_resident()).count() <= 1);
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-        assert!(pool.peak_bytes().unwrap() <= capacity);
+        assert!(pool.fixture_host_peak().unwrap() <= capacity);
         drop((output, runtime, root));
         settle(&pool, native_baseline);
     }

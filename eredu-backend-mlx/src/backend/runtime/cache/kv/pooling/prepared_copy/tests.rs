@@ -1,11 +1,11 @@
 use super::*;
 use crate::backend::runtime::cache::kv::PoolingCacheState;
-use safemlx::{ops::indexing::TryIndexOp, Device, DeviceType};
+use safemlx::{Device, DeviceType, ops::indexing::TryIndexOp};
 use std::{
     cell::Cell,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -254,6 +254,7 @@ fn aliased_five_slot_sources_produce_independent_destinations_retained_by_the_co
             .unwrap();
     }
     drop((copy, source, backing));
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     for root in roots.borrow().iter() {
@@ -261,6 +262,7 @@ fn aliased_five_slot_sources_produce_independent_destinations_retained_by_the_co
     }
     roots.borrow_mut().clear();
     crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         retired.load(Ordering::SeqCst) == 5
     });
@@ -286,8 +288,9 @@ fn present_zero_length_slots_remain_present_in_the_copy() {
     let copy = source.prepare_isolated_copy().copy(&stream).unwrap();
     assert_eq!(copy.ratio(), 4);
     assert_eq!(copy.processed_tokens(), 0);
-    assert!(copy
-        .state_arrays()
-        .into_iter()
-        .all(|slot| { slot.is_some_and(|array| array.shape() == [2, 0, 3]) }));
+    assert!(
+        copy.state_arrays()
+            .into_iter()
+            .all(|slot| { slot.is_some_and(|array| array.shape() == [2, 0, 3]) })
+    );
 }

@@ -97,7 +97,7 @@ impl OriginalParallelControlProjection {
                 drop(completion.take());
                 let invocation=Exchange{quote:quote.clone(),input,order,round,claim,capacity,
                     owner:OriginalParallelControlOwner(owner.0.clone()),custody:c.clone()};
-                let (received,settled)=run_native_role(invocation,capacity,&owner.owner().bank,&owner.owner().controls,c,
+                let (received,settled)=run_native_role(invocation,capacity,&owner.owner().native,c,
                     |value,observer|Ok(value.run(observer))).map_err(|cause|Error::with_original_control_source(cause,false))??;
                 input=received;completion=Some(settled);
             }

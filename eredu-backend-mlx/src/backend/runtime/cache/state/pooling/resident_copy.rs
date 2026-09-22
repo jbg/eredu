@@ -1,15 +1,15 @@
 //! Resident Pooling decoder copying into closed, non-runnable funded slots.
 
-use super::{MlxPoolingAttentionCache, MlxPoolingAttentionState};
+use super::{MlxPoolingAttentionCache, MlxPoolingAttentionState, MlxPoolingAttentionStateFactory};
 use crate::backend::runtime::{cache::kv::LiveKeyValueCache, residency::storage::StorageIdentity};
 use eredu_runtime::{
-    HostSlotInitialization, HostSlotInitializationError, RuntimeState, SharedStateLayout,
     working_memory::{
-        DecoderCopyAdmissionError, FundedDecoderSlots, InitializedDecoderSlots,
-        RegisteredDecoderHostCopy, WorkingMemoryError, WorkingMemoryPool,
+        DecoderCopyAdmissionError, FundedDecoderSlots, InitializedDecoderSlots, MemoryLedger,
+        RegisteredDecoderHostCopy, WorkingMemoryError,
     },
+    HostSlotInitialization, HostSlotInitializationError, RuntimeState, SharedStateLayout,
 };
-use safemlx::{Array, Stream, error::Exception};
+use safemlx::{error::Exception, Array, Stream};
 use std::cell::RefCell;
 
 #[derive(Debug, thiserror::Error)]
@@ -233,7 +233,7 @@ impl<'a> PreparedResidentPoolingCopy<'a> {
 
     pub(crate) fn host_copy(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<
         RegisteredDecoderHostCopy<'a, MlxPoolingAttentionCache, StorageIdentity>,
         ResidentPoolingCopyError,
@@ -243,7 +243,7 @@ impl<'a> PreparedResidentPoolingCopy<'a> {
 
     pub(crate) fn host_copy_with_preparation(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         preparation: Option<&eredu_core::HostPreparationAuthority>,
     ) -> Result<
         RegisteredDecoderHostCopy<'a, MlxPoolingAttentionCache, StorageIdentity>,
@@ -306,6 +306,16 @@ pub(crate) struct SavedResidentPoolingCopy {
     layout: SharedStateLayout,
 }
 impl SavedResidentPoolingCopy {
+    pub(crate) fn continuation_bounds(&self, additional: u64) -> Option<(u64, u64)> {
+        Some((
+            MlxPoolingAttentionStateFactory::layer_capacity_bound(self.layers.iter(), additional)?,
+            MlxPoolingAttentionStateFactory::layer_auxiliary_growth(
+                self.layers.iter(),
+                additional,
+            )?,
+        ))
+    }
+
     pub(crate) fn prepare_copy(
         &self,
     ) -> Result<PreparedResidentPoolingCopy<'_>, ResidentPoolingCopyError> {

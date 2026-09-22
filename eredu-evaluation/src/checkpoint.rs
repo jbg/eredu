@@ -105,17 +105,15 @@ fn read_checkpoint_observations(path: &Path) -> Result<ObservationSet, Checkpoin
     let mut observations = ObservationSet::new();
     observations.insert(
         "input.token_ids",
-        ObservationValue::Tensor(TensorObservation::new(
-            vec![input.len()],
-            TensorObservationData::I64(input),
-        )?),
+        ObservationValue::Tensor(
+            (TensorObservation::new(vec![input.len()], TensorObservationData::I64(input))?).into(),
+        ),
     )?;
     observations.insert(
         "output.fed_token_ids",
-        ObservationValue::Tensor(TensorObservation::new(
-            vec![fed.len()],
-            TensorObservationData::I64(fed),
-        )?),
+        ObservationValue::Tensor(
+            (TensorObservation::new(vec![fed.len()], TensorObservationData::I64(fed))?).into(),
+        ),
     )?;
     for name in LOGIT_TENSORS {
         let tensor = tensors.tensor(name)?;
@@ -138,10 +136,13 @@ fn read_checkpoint_observations(path: &Path) -> Result<ObservationSet, Checkpoin
             .collect();
         observations.insert(
             format!("logits.{name}"),
-            ObservationValue::Tensor(TensorObservation::new(
-                tensor.shape().to_vec(),
-                TensorObservationData::F32(values),
-            )?),
+            ObservationValue::Tensor(
+                (TensorObservation::new(
+                    tensor.shape().to_vec(),
+                    TensorObservationData::F32(values),
+                )?)
+                .into(),
+            ),
         )?;
     }
     Ok(observations)

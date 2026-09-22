@@ -157,31 +157,38 @@ fn routed_deepseek_v4_pooling_state_uses_shared_checkpoint_and_prompt_cache_cont
     .unwrap();
     let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
     let mut executable = model.into_executable();
-    let generic = executable.erased_mut();
     let prefix = [1_u32, 2, 3, 4, 5];
     let prompt = Array::from_slice(&prefix, &[1, 5]);
     let parts = [input::token_ids_part(&prompt).unwrap()];
-    generic
+    executable
+        .erased_mut()
         .prefill(input::ModelInput::new(&parts), &stream)
         .unwrap()
         .evaluated()
         .unwrap();
-    let before = generic.state_snapshot();
-    let before_numeric = generic.fixed_numeric_state_snapshot().unwrap();
+    let before = executable.erased_mut().state_snapshot();
+    let before_numeric = executable
+        .erased_mut()
+        .fixed_numeric_state_snapshot()
+        .unwrap();
     assert!(before
         .iter()
         .any(|(_, components)| { components.iter().any(|(_, present)| *present) }));
     assert!(!before_numeric.is_empty());
 
     let continuation = Array::from_slice(&[6_u32], &[1, 1]);
-    let probe = generic
+    let probe = executable
+        .erased_mut()
         .checkpoint_restore_probe(&continuation, &stream)
         .unwrap();
     assert_eq!(probe.0, probe.2);
     assert_eq!(probe.3, probe.5);
 
     let descriptor = PromptCacheDescriptor::from_model_identity(
-        generic.prompt_cache_model_identity().clone(),
+        executable
+            .erased_mut()
+            .prompt_cache_model_identity()
+            .clone(),
         "deepseek-v4-checkpoint",
         "tokens:1,2,3,4,5",
         1,
@@ -189,27 +196,46 @@ fn routed_deepseek_v4_pooling_state_uses_shared_checkpoint_and_prompt_cache_cont
     .unwrap();
     let cache_root = tempfile::tempdir().unwrap();
     let destination = cache_root.path().join("cache");
-    generic
-        .save_prompt_cache(
+    with_prompt_cache_funding(&mut executable, |generic, funding| {
+        generic.save_prompt_cache(
+            funding,
+            None,
             &destination,
             descriptor.clone(),
             &prefix,
             &PromptCacheOptions::default(),
         )
-        .unwrap();
-    generic.reset_cache().unwrap();
-    assert!(generic.state_snapshot().iter().all(|(offset, components)| {
-        *offset == 0 && components.iter().all(|(_, present)| !present)
-    }));
-    generic
-        .load_prompt_cache(&destination, &descriptor, &prefix)
-        .unwrap();
-    assert_eq!(generic.state_snapshot(), before);
+    })
+    .unwrap();
+    executable.erased_mut().reset_cache().unwrap();
+    assert!(executable
+        .erased_mut()
+        .state_snapshot()
+        .iter()
+        .all(|(offset, components)| {
+            *offset == 0 && components.iter().all(|(_, present)| !present)
+        }));
+    with_prompt_cache_materialization(&mut executable, |generic, funding, materialization| {
+        generic.load_prompt_cache(
+            funding,
+            materialization,
+            None,
+            &destination,
+            &descriptor,
+            &prefix,
+        )
+    })
+    .unwrap();
+    assert_eq!(executable.erased_mut().state_snapshot(), before);
     assert_eq!(
-        generic.fixed_numeric_state_snapshot().unwrap(),
+        executable
+            .erased_mut()
+            .fixed_numeric_state_snapshot()
+            .unwrap(),
         before_numeric
     );
-    let restored = generic
+    let restored = executable
+        .erased_mut()
         .decode(&continuation, &stream)
         .unwrap()
         .evaluated()
@@ -319,23 +345,24 @@ fn routed_only_default_observation_intervenes_on_provider_output() {
     .unwrap();
     let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
     let mut executable = model.into_executable();
-    let generic = executable.erased_mut();
     let tokens = Array::from_slice(&[3_u32], &[1, 1]);
-    let baseline = generic
+    let baseline = executable
+        .erased_mut()
         .decode(&tokens, &stream)
         .unwrap()
         .evaluated()
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
-    generic.reset_cache().unwrap();
+    executable.erased_mut().reset_cache().unwrap();
     let mut observer = Observer {
         routing_path: None,
         routed_only: false,
         intervened: false,
         stream: stream.clone(),
     };
-    let changed = generic
+    let changed = executable
+        .erased_mut()
         .forward_with_observer(&tokens, None, &stream, &mut observer)
         .unwrap()
         .evaluated()
@@ -408,23 +435,24 @@ fn routed_session_observation_reports_shared_combination_and_intervenes_causally
         .unwrap();
         let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
         let tokens = Array::from_slice(&[3_u32], &[1, 1]);
-        let baseline = generic
+        let baseline = executable
+            .erased_mut()
             .decode(&tokens, &stream)
             .unwrap()
             .evaluated()
             .unwrap()
             .as_slice::<f32>()
             .to_vec();
-        generic.reset_cache().unwrap();
+        executable.erased_mut().reset_cache().unwrap();
         let mut observer = Observer {
             routing_path: None,
             semantic_outputs: false,
             intervened: false,
             stream: stream.clone(),
         };
-        let changed = generic
+        let changed = executable
+            .erased_mut()
             .forward_with_observer(&tokens, None, &stream, &mut observer)
             .unwrap()
             .evaluated()
@@ -617,8 +645,8 @@ fn gpt_oss_load_time_transform_preserves_native_experts_in_both_residencies() {
             "addressable={addressable}"
         );
         let mut complete = model.into_executable();
-        let generic = complete.erased_mut();
-        generic
+        complete
+            .erased_mut()
             .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
             .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"))
             .evaluated()
@@ -783,8 +811,8 @@ fn routed_qwen_gguf_executes_resident_and_addressable_through_generic_compositio
         let model = materialize_model_plan(plan, options, &stream, &weights_stream)
             .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
         let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
-        let logits = generic
+        let logits = executable
+            .erased_mut()
             .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 64]);

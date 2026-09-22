@@ -23,10 +23,11 @@ use eredu_nn::{
 };
 use eredu_runtime::working_memory::{
     CaptureRunHostError, CaptureTensorClaim, CaptureTensorConstructionError, CaptureTensorHostPlan,
-    CaptureTensorTransferFinishError, ClaimedCaptureTensor, PreparedCaptureTensorTransfer,
-    ScheduledCaptureTensorTransfer, ScheduledCaptureTensorTransferFinishError, WorkingMemoryError,
-    WorkingMemoryFundingRun, WorkingMemoryFundingScope, WorkingMemoryPool,
-    WorkingMemoryReservation, WorkingMemoryStorage,
+    CaptureTensorTransferFinishError, ClaimedCaptureTensor, MemoryLedger,
+    OriginalTextMetadataCustody, PreparedCaptureTensorTransfer, ScheduledCaptureTensorTransfer,
+    ScheduledCaptureTensorTransferFinishError, StoragePublicationLayout, WorkingMemoryError,
+    WorkingMemoryFundingRun, WorkingMemoryFundingScope, WorkingMemoryReservation,
+    WorkingMemoryStorage,
 };
 pub(crate) use fragment::PreparedCaptureFragment;
 pub(crate) use original::{
@@ -37,9 +38,10 @@ pub(crate) use original::{
 use safemlx::{Array, ArrayMetadataError, ArrayMetadataSnapshot, Dtype, Stream, error::Exception};
 pub(crate) use speculative::{
     candidate_control_bytes as speculative_candidate_control_bytes,
-    control_bytes as speculative_capture_control_bytes, execute as execute_speculative_capture, execute_cpu as execute_speculative_capture_cpu,
+    control_bytes as speculative_capture_control_bytes, execute as execute_speculative_capture,
     execute_candidates as execute_speculative_candidates,
     execute_candidates_cpu as execute_speculative_candidates_cpu,
+    execute_cpu as execute_speculative_capture_cpu,
     execute_histogram as execute_speculative_histogram,
     execute_histogram_cpu as execute_speculative_histogram_cpu,
     execute_summary as execute_speculative_summary,
@@ -58,7 +60,7 @@ pub(crate) enum CaptureTensorNativeError {
     UnsupportedMechanism,
     #[error("capture stream is unavailable in this build: {0:?}")]
     UnsupportedStream(safemlx::DeviceType),
-    #[error("selected capture requires F32, F16 or BF16 source, got {0:?}")]
+    #[error("capture source dtype is unsupported by the selected transform: {0:?}")]
     UnsupportedDtype(Dtype),
     #[error("capture source does not match admitted source geometry")]
     ShapeMismatch,
@@ -68,7 +70,7 @@ pub(crate) enum CaptureTensorNativeError {
     ClaimMismatch,
     #[error(transparent)]
     Claim(#[from] CaptureRunHostError),
-    #[error("capture workspace source must use floating metadata, got {0:?}")]
+    #[error("capture workspace source dtype does not match the selected transform: {0:?}")]
     UnsupportedWorkspaceDtype(WorkspaceDtype),
     #[error("capture source backing is not settled and certified")]
     UnsettledSource,
@@ -104,6 +106,8 @@ pub(crate) enum CaptureTensorNativeError {
     HistogramFinish(#[from] eredu_runtime::working_memory::CaptureHistogramFailure),
     #[error("activation policy: {0}")]
     ActivationPolicy(#[source] eredu_core::capture::CaptureError),
+    #[error(transparent)]
+    PartitionIntervention(eredu_runtime::capture::partition::PartitionInterventionSourceError),
     #[error("capture recovery collector is borrowed")]
     CollectorBusy,
     #[error("capture recovery collector capacity: {0}")]
@@ -137,6 +141,7 @@ pub(crate) struct Selection {
     preview: Option<(i32, i32)>,
     cast_f32: bool,
     read_f32: bool,
+    read_unsigned: bool,
 }
 impl<'a> PreparedCaptureTensor<'a> {
     pub(crate) fn new(
@@ -148,14 +153,8 @@ impl<'a> PreparedCaptureTensor<'a> {
         if observed.allocation().is_none() {
             return Err(CaptureTensorNativeError::UnsettledSource);
         }
-        let program = Selection::with_conversion(
-            geometry,
-            if observed.dtype() == Dtype::Float32 {
-                ConversionMode::ActualF32
-            } else {
-                ConversionMode::ActualHalf
-            },
-        )?;
+        let program =
+            Selection::with_conversion(geometry, ConversionMode::actual(observed.dtype()))?;
         Ok(Self {
             source,
             observed,
@@ -178,6 +177,7 @@ impl<'a> PreparedCaptureTensor<'a> {
         }
         let observed = source.try_metadata_snapshot()?;
         Self::validate_source_axes(observed.shape(), observed.dtype(), geometry.source_shape())?;
+        Self::validate_declared_dtype(observed.dtype(), geometry.value_dtype())?;
         Ok(observed)
     }
 
@@ -189,31 +189,64 @@ impl<'a> PreparedCaptureTensor<'a> {
         source: &Array,
         geometry: &CaptureTensorGeometry<'_>,
     ) -> Result<Dtype, CaptureTensorNativeError> {
-        Self::validate_borrowed_shape(source,geometry.source_shape())
+        let dtype = Self::validate_borrowed_shape(source, geometry.source_shape())?;
+        Self::validate_declared_dtype(dtype, geometry.value_dtype())?;
+        Ok(dtype)
     }
     /// Same borrowed descriptor worker for a real local source with no selected
     /// destination. The owning runtime plan supplies the exact physical axes.
-    pub(crate) fn validate_borrowed_shape(source:&Array,shape:&[usize])->Result<Dtype,CaptureTensorNativeError> {
+    pub(crate) fn validate_borrowed_shape(
+        source: &Array,
+        shape: &[usize],
+    ) -> Result<Dtype, CaptureTensorNativeError> {
         Self::validate_mechanism()?;
-        let dtype=source.dtype();Self::validate_source_axes(source.shape(),dtype,shape)?;Ok(dtype)
+        let dtype = source.dtype();
+        Self::validate_source_axes(source.shape(), dtype, shape)?;
+        Ok(dtype)
     }
 
     fn validate_mechanism() -> Result<(), CaptureTensorNativeError> {
-        if !cfg!(all(
-            target_vendor = "apple",
-            not(feature = "cuda")
-        )) {
+        if !cfg!(all(target_vendor = "apple", not(feature = "cuda"))) {
             return Err(CaptureTensorNativeError::UnsupportedMechanism);
         }
         Ok(())
     }
 
+    fn validate_declared_dtype(
+        dtype: Dtype,
+        expected: eredu_core::ObservationDtype,
+    ) -> Result<(), CaptureTensorNativeError> {
+        let valid = match expected {
+            eredu_core::ObservationDtype::Floating => {
+                matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
+            }
+            eredu_core::ObservationDtype::Integer => matches!(
+                dtype,
+                Dtype::Uint8 | Dtype::Uint16 | Dtype::Uint32 | Dtype::Uint64
+            ),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(CaptureTensorNativeError::UnsupportedDtype(dtype))
+        }
+    }
     fn validate_source_axes(
         shape: &[i32],
         dtype: Dtype,
         source_shape: &[usize],
     ) -> Result<(), CaptureTensorNativeError> {
-        if !matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16) {
+        if !matches!(
+            dtype,
+            Dtype::Float32
+                | Dtype::Float16
+                | Dtype::Bfloat16
+                | Dtype::Uint8
+                | Dtype::Uint16
+                | Dtype::Uint32
+                | Dtype::Uint64
+        ) {
             return Err(CaptureTensorNativeError::UnsupportedDtype(dtype));
         }
         if shape.len() != source_shape.len()
@@ -275,7 +308,7 @@ impl<'a> PreparedCaptureTensor<'a> {
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<SharedTensorObservation, CaptureTensorExecutionError<'a, 's>> {
-        let source_pin = self.prepare_transfer(run.pool(), stream, roots)?;
+        let source_pin = self.prepare_transfer(native, stream, roots)?;
         let mut destination = run
             .prepare_capture_tensor_with_source(reservation, native, self.host, source_pin)
             .map_err(CaptureTensorNativeError::Host)?;
@@ -310,6 +343,7 @@ impl<'a> PreparedCaptureTensor<'a> {
             stream,
             roots,
             CaptureCompletion::Ordinary,
+            None,
         )
     }
 
@@ -320,20 +354,30 @@ impl<'a> PreparedCaptureTensor<'a> {
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
         completion: CaptureCompletion<'_>,
+        original: Option<&OriginalTextMetadataCustody>,
     ) -> Result<ClaimedCaptureTensor, ScheduledCaptureTensorExecutionError<'g, 'c, 's>> {
         self.validate_claim(claim.geometry())?;
         Self::validate_stream(stream)?;
         self.validate()?;
-        let source_pin = Self::prepare_registered_source_with_completion(
-            &self.observed,
-            native.pool(),
-            roots,
-            self.recovery_descriptors(),
-            completion,
-        )?;
-        let mut destination = claim
-            .prepare_with_source(native, source_pin)
-            .map_err(CaptureTensorNativeError::Claim)?;
+        let mut destination = match (completion, original) {
+            (CaptureCompletion::Original(_), Some(custody)) => {
+                let rows = Self::source_rows(&self.observed)?;
+                completion.reserve_roots(roots, self.recovery_descriptors())?;
+                claim.prepare_with_original_source(native, custody, rows)
+            }
+            (CaptureCompletion::Ordinary, None) => {
+                let source_pin = Self::prepare_registered_source_with_completion(
+                    &self.observed,
+                    native,
+                    roots,
+                    self.recovery_descriptors(),
+                    completion,
+                )?;
+                claim.prepare_with_source(native, source_pin)
+            }
+            _ => return Err(CaptureTensorNativeError::ClaimMismatch.into()),
+        }
+        .map_err(CaptureTensorNativeError::Claim)?;
         execute_selected(
             self.source,
             &self.program,
@@ -367,24 +411,24 @@ impl<'a> PreparedCaptureTensor<'a> {
 
     fn prepare_transfer(
         &self,
-        pool: &WorkingMemoryPool,
+        native: &WorkingMemoryFundingScope,
         stream: &Stream,
         roots: &RefCell<Vec<Array>>,
     ) -> Result<WorkingMemoryStorage<StorageIdentity>, CaptureTensorNativeError> {
         Self::validate_stream(stream)?;
         self.validate()?;
-        Self::prepare_registered_source(&self.observed, pool, roots, self.recovery_descriptors())
+        Self::prepare_registered_source(&self.observed, native, roots, self.recovery_descriptors())
     }
 
     fn prepare_registered_source(
         observed: &ArrayMetadataSnapshot,
-        pool: &WorkingMemoryPool,
+        native: &WorkingMemoryFundingScope,
         roots: &RefCell<Vec<Array>>,
         descriptors: usize,
     ) -> Result<WorkingMemoryStorage<StorageIdentity>, CaptureTensorNativeError> {
         Self::prepare_registered_source_with_completion(
             observed,
-            pool,
+            native,
             roots,
             descriptors,
             CaptureCompletion::Ordinary,
@@ -393,25 +437,36 @@ impl<'a> PreparedCaptureTensor<'a> {
 
     fn prepare_registered_source_with_completion(
         observed: &ArrayMetadataSnapshot,
-        pool: &WorkingMemoryPool,
+        native: &WorkingMemoryFundingScope,
         roots: &RefCell<Vec<Array>>,
         descriptors: usize,
         completion: CaptureCompletion<'_>,
     ) -> Result<WorkingMemoryStorage<StorageIdentity>, CaptureTensorNativeError> {
+        let rows = Self::source_rows(observed)?;
+        let source_pin = StoragePublicationLayout::new(2)
+            .and_then(|layout| layout.fund_from(native))
+            .and_then(|prepared| prepared.pin_registered_storage(rows.into_iter().flatten()))
+            .map_err(CaptureTensorNativeError::Memory)?;
+        completion.reserve_roots(roots, descriptors)?;
+        Ok(source_pin)
+    }
+    fn source_rows(
+        observed: &ArrayMetadataSnapshot,
+    ) -> Result<[Option<(StorageIdentity, u64)>; 2], CaptureTensorNativeError> {
         let allocation = observed
             .allocation()
             .ok_or(CaptureTensorNativeError::UnsettledSource)?;
         let bytes = u64::try_from(allocation.bytes())
             .map_err(|_| CaptureTensorNativeError::GeometryOverflow)?;
-        let source_pin = pool
-            .pin_registered_storage(
-                [(StorageIdentity::Native(allocation.identity()), bytes)]
-                    .into_iter()
-                    .filter(|(_, bytes)| *bytes != 0),
-            )
-            .map_err(CaptureTensorNativeError::Memory)?;
-        completion.reserve_roots(roots, descriptors)?;
-        Ok(source_pin)
+        let controls = u64::try_from(allocation.host_control_bytes())
+            .map_err(|_| CaptureTensorNativeError::GeometryOverflow)?;
+        Ok([
+            (bytes != 0).then_some((StorageIdentity::Native(allocation.identity()), bytes)),
+            (controls != 0).then_some((
+                StorageIdentity::NativeControl(allocation.identity()),
+                controls,
+            )),
+        ])
     }
 }
 
@@ -422,6 +477,7 @@ trait TransferDestination {
     type Error: Into<CaptureTensorNativeError>;
     fn validate(&self) -> Result<(), Self::Error>;
     fn push_f32(&mut self, value: f32) -> Result<(), Self::Error>;
+    fn push_u64(&mut self, value: u64) -> Result<(), Self::Error>;
 }
 impl TransferDestination for PreparedCaptureTensorTransfer<'_, '_, StorageIdentity> {
     type Error = WorkingMemoryError;
@@ -431,6 +487,9 @@ impl TransferDestination for PreparedCaptureTensorTransfer<'_, '_, StorageIdenti
     fn push_f32(&mut self, value: f32) -> Result<(), Self::Error> {
         PreparedCaptureTensorTransfer::push_f32(self, value)
     }
+    fn push_u64(&mut self, value: u64) -> Result<(), Self::Error> {
+        PreparedCaptureTensorTransfer::push_u64(self, value)
+    }
 }
 impl TransferDestination for ScheduledCaptureTensorTransfer<'_, '_, '_, StorageIdentity> {
     type Error = WorkingMemoryError;
@@ -439,6 +498,9 @@ impl TransferDestination for ScheduledCaptureTensorTransfer<'_, '_, '_, StorageI
     }
     fn push_f32(&mut self, value: f32) -> Result<(), Self::Error> {
         ScheduledCaptureTensorTransfer::push_f32(self, value)
+    }
+    fn push_u64(&mut self, value: u64) -> Result<(), Self::Error> {
+        ScheduledCaptureTensorTransfer::push_u64(self, value)
     }
 }
 fn execute_selected(
@@ -474,7 +536,8 @@ fn execute_selected(
         // Recovery also retains its intermediate Slice/reshape/AsType outputs.
         // Publish those same completed matching descriptors before later pure
         // inventory queries. This is no new Eval, wait, root or native grant.
-        let retained = roots.try_borrow()
+        let retained = roots
+            .try_borrow()
             .map_err(|_| CaptureTensorNativeError::CollectorBusy)?;
         for value in &retained[first_retained..] {
             observer.validate_completed_array(value)?;
@@ -495,6 +558,27 @@ fn execute_selected(
                 .map_err(Into::<CaptureTensorNativeError>::into)?;
         }
     }
+    if program.read_unsigned {
+        macro_rules! copy_unsigned {
+            ($t:ty) => {
+                for value in evaluated
+                    .try_iter::<$t>()
+                    .map_err(CaptureTensorNativeError::HostRead)?
+                {
+                    destination
+                        .push_u64(u64::from(value))
+                        .map_err(Into::<CaptureTensorNativeError>::into)?;
+                }
+            };
+        }
+        match output.dtype() {
+            Dtype::Uint8 => copy_unsigned!(u8),
+            Dtype::Uint16 => copy_unsigned!(u16),
+            Dtype::Uint32 => copy_unsigned!(u32),
+            Dtype::Uint64 => copy_unsigned!(u64),
+            other => return Err(CaptureTensorNativeError::UnsupportedDtype(other)),
+        }
+    }
     #[cfg(test)]
     tests::before_finish();
     Ok(())
@@ -507,6 +591,16 @@ enum ConversionMode {
     ActualF32,
     ActualHalf,
     MayRequireF32,
+    Unsigned,
+}
+impl ConversionMode {
+    fn actual(dtype: Dtype) -> Self {
+        match dtype {
+            Dtype::Float32 => Self::ActualF32,
+            Dtype::Uint8 | Dtype::Uint16 | Dtype::Uint32 | Dtype::Uint64 => Self::Unsigned,
+            _ => Self::ActualHalf,
+        }
+    }
 }
 impl Selection {
     /// Prepare a future floating source. Its concrete precision is unknown, so
@@ -515,7 +609,14 @@ impl Selection {
     pub(crate) fn from_geometry(
         geometry: &CaptureTensorGeometry<'_>,
     ) -> Result<Self, CaptureTensorNativeError> {
-        Self::with_conversion(geometry, ConversionMode::MayRequireF32)
+        Self::with_conversion(
+            geometry,
+            if geometry.value_dtype() == eredu_core::ObservationDtype::Integer {
+                ConversionMode::Unsigned
+            } else {
+                ConversionMode::MayRequireF32
+            },
+        )
     }
 
     /// Prepare the same future selection program from a closed physical chunk
@@ -538,8 +639,14 @@ impl Selection {
             selected_shape: [0; 32],
             rank,
             preview: None,
-            cast_f32: fragment.output_elements() != 0,
-            read_f32: fragment.output_elements() != 0,
+            cast_f32: fragment.output_elements() != 0
+                && fragment.assembly().logical_geometry().value_dtype()
+                    != eredu_core::ObservationDtype::Integer,
+            read_f32: fragment.output_elements() != 0
+                && fragment.assembly().logical_geometry().value_dtype()
+                    != eredu_core::ObservationDtype::Integer,
+            read_unsigned: fragment.assembly().logical_geometry().value_dtype()
+                == eredu_core::ObservationDtype::Integer,
         };
         let convert = |n| i32::try_from(n).map_err(|_| CaptureTensorNativeError::GeometryOverflow);
         for axis in 0..rank {
@@ -587,11 +694,16 @@ impl Selection {
             selected_shape: [0; 32],
             rank,
             preview: None,
-            cast_f32: !matches!(conversion, ConversionMode::ActualF32) && geometry.elements() != 0,
+            cast_f32: matches!(
+                conversion,
+                ConversionMode::ActualHalf | ConversionMode::MayRequireF32
+            ) && geometry.elements() != 0,
             // Identity Slice can retain an anomalous empty input descriptor.
             // observe_tensor already returns empty before native conversion;
             // do the same, including Preview whose final prefix is empty.
-            read_f32: matches!(conversion, ConversionMode::ActualF32) || geometry.elements() != 0,
+            read_f32: !matches!(conversion, ConversionMode::Unsigned)
+                && (matches!(conversion, ConversionMode::ActualF32) || geometry.elements() != 0),
+            read_unsigned: matches!(conversion, ConversionMode::Unsigned),
         };
         let convert = |n| i32::try_from(n).map_err(|_| CaptureTensorNativeError::GeometryOverflow);
         let mut elements = 1usize;
@@ -677,7 +789,14 @@ impl Selection {
         context: &WorkspaceContext,
     ) -> Result<(), CaptureTensorNativeError> {
         context.validate_values([source])?;
-        if source.layout().dtype() != WorkspaceDtype::Float32 {
+        if !(if self.read_unsigned {
+            matches!(
+                source.layout().dtype(),
+                WorkspaceDtype::Uint8 | WorkspaceDtype::Uint32
+            )
+        } else {
+            source.layout().dtype() == WorkspaceDtype::Float32
+        }) {
             return Err(CaptureTensorNativeError::UnsupportedWorkspaceDtype(
                 source.layout().dtype(),
             ));
@@ -757,8 +876,10 @@ impl Mechanism for Trace<'_> {
         strides: &[i32],
         shape: &[i32],
     ) -> Result<WorkspaceTensor, CaptureTensorNativeError> {
-        let value=source.static_slice(starts,ends,strides,self.context)?;
-        if value.shape()!=shape {return Err(CaptureTensorNativeError::ShapeMismatch);}
+        let value = source.static_slice(starts, ends, strides, self.context)?;
+        if value.shape() != shape {
+            return Err(CaptureTensorNativeError::ShapeMismatch);
+        }
         self.retain(value)
     }
     fn reshape(
@@ -898,3 +1019,7 @@ mod tests;
 
 #[cfg(test)]
 mod workspace_tests;
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::{FundingFixture as _, StorageFixture as _};

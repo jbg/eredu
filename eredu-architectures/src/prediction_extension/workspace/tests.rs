@@ -5,7 +5,7 @@ use crate::preparation_selection::{
 };
 use eredu_nn::{workspace::*, ParameterMetadata, ParameterMetadataView, ParameterVisitor};
 use eredu_runtime::{
-    working_memory::{InferenceExecutionIdentity, WorkingMemoryPool},
+    working_memory::{InferenceExecutionIdentity, MemoryLedger},
     NormalizedLoadRequest,
 };
 use std::{cell::Cell, convert::Infallible, num::NonZeroU32};
@@ -71,14 +71,7 @@ impl WorkspacePredictionParameterSource for ProjectedFixtureParameters {
             error: Option<Error>,
         }
         impl<'v> ParameterVisitor<'v, WorkspaceTensor> for Values<'_> {
-
-
-
-            fn visit(
-                &mut self,
-                metadata: ParameterMetadataView<'_>,
-                value: &'v WorkspaceTensor,
-            ) {
+            fn visit(&mut self, metadata: ParameterMetadataView<'_>, value: &'v WorkspaceTensor) {
                 if self.error.is_some() {
                     return;
                 }
@@ -155,10 +148,10 @@ fn selected_prediction_materializer_preserves_current_backing_and_refuses_foreig
     let selected =
         select_preparation(&inspection, &request, &BoundedIndependentAdapter::default()).unwrap();
     let capacity = 1 << 27;
-    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(capacity, 0).unwrap();
     let execution = InferenceExecutionIdentity::default();
     let funding = pool
-        .prepare_workspace_metadata(&execution, capacity)
+        .prepare_workspace_metadata(&execution, crate::memory_fixture::limits(&pool, capacity))
         .unwrap();
     let context =
         WorkspaceContext::new_with_metadata_funding(MissingFacts, funding.clone()).unwrap();
@@ -226,13 +219,19 @@ fn selected_prediction_materializer_preserves_current_backing_and_refuses_foreig
     let copied = lane[0].retained_values().collect::<Vec<_>>();
     assert_eq!(prior.len(), copied.len());
     for (a, b) in prior.iter().zip(&copied) {
-        let single = context.report_scalars(std::slice::from_ref(*a)).unwrap().closing_storage;
-        let paired = context.report_scalars(&[(*a).clone(), (*b).clone()]).unwrap().closing_storage;
+        let single = context
+            .report_scalars(std::slice::from_ref(*a))
+            .unwrap()
+            .closing_storage;
+        let paired = context
+            .report_scalars(&[(*a).clone(), (*b).clone()])
+            .unwrap()
+            .closing_storage;
         assert_eq!(single, paired);
     }
     drop(copied);
     drop(prior);
-    let before = pool.used_bytes().unwrap();
+    let before = crate::memory_fixture::used(&pool).unwrap();
     lane[0]
         .append(
             CompressedAttentionState {
@@ -246,16 +245,16 @@ fn selected_prediction_materializer_preserves_current_backing_and_refuses_foreig
         .unwrap();
     assert_eq!(lane[0].offset(), 5);
     assert_eq!(source[0].offset(), 3);
-    assert!(pool.used_bytes().unwrap() > before);
+    assert!(crate::memory_fixture::used(&pool).unwrap() > before);
     drop(lane);
     drop(executor);
     drop(current);
     drop(context);
     drop(foreign);
     assert!(
-        pool.used_bytes().unwrap() > 0,
+        crate::memory_fixture::used(&pool).unwrap() > 0,
         "escaped source failure lost its metadata custody"
     );
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(crate::memory_fixture::used(&pool).unwrap(), 0);
 }

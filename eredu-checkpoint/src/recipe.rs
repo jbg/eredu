@@ -10,19 +10,26 @@ use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection
 use crate::StoredDtype;
 
 mod encoded_projection;
-pub use encoded_projection::{EncodedRecipeMapping, EncodedRecipeMappingPlan, EncodedRecipeConstruction, EncodedRecipeChildren, EncodedRecipeChildrenPlan};
+pub use encoded_projection::{
+    EncodedRecipeChildren, EncodedRecipeChildrenPlan, EncodedRecipeConstruction,
+    EncodedRecipeMapping, EncodedRecipeMappingPlan,
+};
 mod read_catalog;
+mod read_view;
+pub use read_view::EncodedRecipeReadView;
 mod read_keys;
-pub use read_keys::{EncodedRecipeKeysBuildError, EncodedRecipeKeysPlan, PreparedEncodedRecipeKeys};
 pub use read_catalog::{ReadBatchCatalog, ReadBatchCatalogBuildError, ReadBatchCatalogPlan};
+pub use read_keys::{
+    EncodedRecipeKeysBuildError, EncodedRecipeKeysPlan, PreparedEncodedRecipeKeys,
+};
 mod finite_inference;
 use finite_inference::infer_read_metadata;
 mod uncached_catalog;
-pub use uncached_catalog::UncachedRecipeCatalog;
 pub use finite_inference::{
     infer_recipe_bytes, RecipeInferenceError, RecipeInferenceInput, RecipeInferenceLayout,
     RecipeInferencePlan,
 };
+pub use uncached_catalog::UncachedRecipeCatalog;
 
 /// Metadata-only catalog used to validate a derived-weight recipe.
 pub trait RecipeCatalog {
@@ -331,12 +338,17 @@ impl<C> EncodedRecipeRead<C> {
     /// Assemble already constructed output metadata and read records without
     /// copying either. A byte-length mismatch retains both owners and custody.
     pub fn from_prepared(
-        output: RecipeMetadata, read: crate::store::PreparedEncodedRead<C>,
+        output: RecipeMetadata,
+        read: crate::store::PreparedEncodedRead<C>,
     ) -> Result<Self, EncodedRecipeReadAssemblyError<C>> {
         if u64::try_from(read.byte_len()).ok() != Some(output.byte_len()) {
             return Err(EncodedRecipeReadAssemblyError { output, read });
         }
-        Ok(Self { output, batch: read.batch, _custody: read._custody })
+        Ok(Self {
+            output,
+            batch: read.batch,
+            _custody: read._custody,
+        })
     }
 
     pub(crate) fn admitted_batch(&self) -> &crate::store::EncodedReadBatch {
@@ -356,7 +368,10 @@ impl<C> EncodedRecipeRead<C> {
     /// Finite synchronous-read scratch over these exact immutable read plans.
     pub fn borrowed_read_layout<'a>(
         reads: impl IntoIterator<Item = &'a Self>,
-    ) -> Option<crate::store::EncodedReadLayout> where C: 'a {
+    ) -> Option<crate::store::EncodedReadLayout>
+    where
+        C: 'a,
+    {
         crate::store::EncodedReadLayout::inspect(reads.into_iter().map(|read| &read.batch))
     }
 
@@ -386,11 +401,18 @@ impl<C> EncodedRecipeRead<C> {
 impl EncodedRecipeRead {
     /// Plans a detached finite source from these exact admitted recipe reads.
     /// Construction copies metadata only, after the caller supplies source custody.
-    pub fn prepare_detached<'a, I>(reads: I) -> Option<crate::store::DetachedEncodedReadPlan<'a, I>>
+    pub fn prepare_detached<'a, I>(
+        reads: I,
+    ) -> Option<
+        crate::store::DetachedEncodedReadPlan<
+            'a,
+            impl Iterator<Item = EncodedRecipeReadView<'a>> + Clone + ExactSizeIterator,
+        >,
+    >
     where
         I: Iterator<Item = &'a Self> + Clone + ExactSizeIterator,
     {
-        crate::store::DetachedEncodedReadPlan::inspect(reads)
+        EncodedRecipeReadView::prepare_detached(reads.map(Self::borrowed))
     }
 
     /// Requested backing for one immutable metadata clone. The inline value,
@@ -426,7 +448,6 @@ impl EncodedRecipeRead {
             outputs,
         )
     }
-
 }
 
 /// Byte-length disagreement retains actual output metadata and the read owner.
@@ -437,7 +458,12 @@ pub struct EncodedRecipeReadAssemblyError<C> {
 }
 impl<C> std::fmt::Display for EncodedRecipeReadAssemblyError<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "recipe output has {} bytes but its read has {}", self.output.byte_len(), self.read.byte_len())
+        write!(
+            f,
+            "recipe output has {} bytes but its read has {}",
+            self.output.byte_len(),
+            self.read.byte_len()
+        )
     }
 }
 impl<C: std::fmt::Debug> std::error::Error for EncodedRecipeReadAssemblyError<C> {}
@@ -1059,10 +1085,8 @@ impl DerivedWeightRecipe {
                 }
                 DerivedWeightRecipe::Reshape { input, .. }
                 | DerivedWeightRecipe::View { input, .. } => preserves_bytes(input, catalog),
-                DerivedWeightRecipe::Cast { input, dtype } => {
-                    Ok(preserves_bytes(input, catalog)?
-                        && infer_read_metadata(input, catalog)?.dtype == *dtype)
-                }
+                DerivedWeightRecipe::Cast { input, dtype } => Ok(preserves_bytes(input, catalog)?
+                    && infer_read_metadata(input, catalog)?.dtype == *dtype),
                 DerivedWeightRecipe::Transpose { input, axes } => {
                     if !preserves_bytes(input, catalog)? {
                         return Ok(false);
@@ -1117,7 +1141,11 @@ impl DerivedWeightRecipe {
             // as bytes. Leave those transformations to the ordinary path.
             return Ok(None);
         }
-        Ok(Some(EncodedRecipeRead { output, batch, _custody: () }))
+        Ok(Some(EncodedRecipeRead {
+            output,
+            batch,
+            _custody: (),
+        }))
     }
 
     /// Creates a recipe reading one selected checkpoint tensor.

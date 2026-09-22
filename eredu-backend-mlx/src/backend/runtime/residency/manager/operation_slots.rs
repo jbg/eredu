@@ -9,7 +9,8 @@ use crate::backend::submission_recovery::observed::bank::PreparedOperationBank;
 mod foreground_disk;
 pub(crate) use foreground_disk::{
     ForegroundDiskPopulation, ForegroundDiskSlotError, ForegroundDiskSourceCapacity,
-    ForegroundDiskWindowPlan, ForegroundDiskSubsetCeiling, ForegroundDiskSourceSeries, PreparedForegroundDiskSlots,
+    ForegroundDiskSourceSeries, ForegroundDiskSubsetCeiling, ForegroundDiskWindowPlan,
+    PreparedForegroundDiskSlots,
 };
 
 /// Stack-only loan of the actual read service and its once-only final host rows.
@@ -27,6 +28,15 @@ impl OriginalHostPublicationSlots<'_> {
     }
 }
 
+/// Borrowed backing and metadata of the authenticated enclosing native role.
+/// The descriptor still supplies its exact source program and the caller's
+/// validation slots. This loan creates no reservation or observer authority.
+#[derive(Clone, Copy)]
+pub(crate) struct OriginalMaterializedLoan<'a> {
+    pub(crate) budget: &'a safemlx::OriginalBufferBudget,
+    pub(crate) funding: &'a eredu_nn::workspace::HostMetadataFunding,
+}
+
 /// The closed request-bound projection authenticates the current registered
 /// role before issuing this loan. Holding these references grants no native
 /// producer permission; every operation still validates its exact current role.
@@ -42,6 +52,7 @@ pub(crate) struct OriginalResidencySlots<'a> {
     pub(crate) reservation: Option<&'a eredu_runtime::working_memory::WorkingMemoryReservation>,
     pub(crate) foreground_disk: &'a mut PreparedForegroundDiskSlots,
     pub(crate) materialization: OriginalMaterializationSlots<'a>,
+    pub(crate) materialized_recipe: Option<OriginalMaterializedLoan<'a>>,
     pub(crate) background_host: Option<OriginalHostPublicationSlots<'a>>,
 }
 impl OriginalResidencySlots<'_> {
@@ -56,6 +67,7 @@ impl OriginalResidencySlots<'_> {
             reservation: self.reservation,
             foreground_disk: self.foreground_disk,
             materialization: self.materialization.reborrow(),
+            materialized_recipe: self.materialized_recipe,
             background_host: self
                 .background_host
                 .as_mut()

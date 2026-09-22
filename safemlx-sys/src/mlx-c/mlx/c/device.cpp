@@ -3,6 +3,8 @@
 #include <cstring>
 
 #include "mlx/c/device.h"
+#include "mlx/c/private/memory_placement.h"
+#include "mlx/allocator.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
 
@@ -229,4 +231,65 @@ extern "C" int mlx_device_info_get_keys(
     mlx_error(e.what());
     return 1;
   }
+}
+
+extern "C" int mlx_memory_device_count(int* count) {
+  try {
+    if (!count) return 1;
+    *count = mlx::core::allocator::physical_memory_device_count();
+    return 0;
+  } catch (std::exception& error) { mlx_error(error.what()); return 1; }
+}
+
+extern "C" int mlx_memory_device_shares_host(bool* shared, int device) {
+  try {
+    if (!shared || device < 0 || device >= mlx::core::allocator::physical_memory_device_count())
+      throw std::invalid_argument("Unregistered GPU memory location.");
+    *shared = mlx::core::allocator::memory_device_shares_host(device);
+    return 0;
+  } catch (std::exception& e) { mlx_error(e.what()); return 1; }
+}
+
+extern "C" int mlx_default_memory_placement(mlx_memory_placement* out) {
+  try { if (!out) return 1; *out = mlx_placement_to_c(mlx::core::allocator::default_memory_placement()); return out->kind ? 0 : 1; }
+  catch (std::exception& error) { mlx_error(error.what()); return 1; }
+}
+
+extern "C" int mlx_gpu_allocation_placement(mlx_memory_placement* out) {
+  try {
+    *out = mlx_placement_to_c(mlx::core::allocator::gpu_memory_placement());
+    return 0;
+  } catch (std::exception& e) { mlx_error(e.what()); return 1; }
+}
+
+namespace {
+struct BackingObserverBridge {
+  void* context{nullptr};
+  mlx_physical_backing_observer callback{nullptr};
+};
+BackingObserverBridge backing_observer;
+bool observe_backing(void* opaque, uint64_t identity, size_t capacity, size_t controls,
+    mlx::core::allocator::MemoryPlacement placement, void** owner, void (**release)(void*),
+    mlx::core::allocator::PhysicalBackingPublish* publish) {
+  auto* bridge = static_cast<BackingObserverBridge*>(opaque);
+  return bridge->callback(bridge->context, identity, capacity, controls,
+                         mlx_placement_to_c(placement), owner, release, publish);
+}
+}
+extern "C" size_t mlx_physical_backing_static_bytes(void) {
+  return mlx::core::allocator::physical_backing_static_bytes() + sizeof(backing_observer);
+}
+extern "C" size_t mlx_physical_backing_control_bytes(void) {
+  return mlx::core::allocator::ordinary_allocation_control_bytes();
+}
+extern "C" int mlx_observe_physical_backings(void* context, mlx_physical_backing_observer callback) {
+  try {
+    if (!context || !callback) throw std::invalid_argument("Invalid physical backing observer.");
+    if (backing_observer.callback && (backing_observer.callback != callback || backing_observer.context != context))
+      throw std::invalid_argument("Physical backing observer is immutable.");
+    backing_observer = {context, callback};
+    if (!mlx::core::allocator::observe_physical_backings(&backing_observer, observe_backing))
+      throw std::runtime_error("Existing physical backing admission refused.");
+    return 0;
+  } catch (std::exception& error) { mlx_error(error.what()); return 1; }
 }

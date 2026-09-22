@@ -91,7 +91,9 @@ impl ResidentNativeRecipe {
                 return Err(identity());
             }
             for (_, quote) in row.occurrences() {
-                let native = quote.native_capacity().graph
+                let native = quote
+                    .native_capacity()
+                    .graph
                     .checked_add(quote.native_capacity().records)
                     .ok_or_else(overflow)?;
                 arenas = arenas

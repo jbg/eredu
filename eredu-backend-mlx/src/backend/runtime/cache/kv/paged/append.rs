@@ -1,6 +1,6 @@
 //! Native tensor/account adapter for the common paged append traversal.
 use super::*;
-use crate::backend::nn::workspace::OriginalPagedAppendClaim;
+use crate::backend::nn::workspace::{OrdinaryPagedAppend, OriginalPagedAppendClaim};
 use eredu_runtime::cache::PagedAppendMechanisms;
 
 pub(super) struct NativeAppend<'a, 'source> {
@@ -9,6 +9,7 @@ pub(super) struct NativeAppend<'a, 'source> {
     pub(super) values: Array,
     pub(super) stream: &'a Stream,
     pub(super) original: Option<&'a mut OriginalPagedAppendClaim<'source>>,
+    pub(super) ordinary: Option<&'a mut OrdinaryPagedAppend>,
 }
 impl PagedAppendMechanisms for NativeAppend<'_, '_> {
     type Pair = [Array; 2];
@@ -58,7 +59,13 @@ impl PagedAppendMechanisms for NativeAppend<'_, '_> {
             claim.rebalance_host(0, Some(bytes), None, self.stream)?;
             self.cache
                 .manager
-                .publish_original_tail(claim, bytes, end, false, false)?;
+                .publish_prepared_tail(claim, bytes, end, false, false)?;
+        } else if let Some(claim) = self.ordinary.as_deref_mut() {
+            claim.prepare_tail([&keys, &values])?;
+            claim.rebalance_host(0, Some(bytes), None, self.stream)?;
+            self.cache
+                .manager
+                .publish_prepared_tail(claim, bytes, end, false, false)?;
         } else {
             self.cache
                 .manager
@@ -73,7 +80,10 @@ impl PagedAppendMechanisms for NativeAppend<'_, '_> {
     fn seal_tail(&mut self) -> Result<(), Exception> {
         match self.original.as_deref_mut() {
             Some(claim) => self.cache.seal_tail_original(claim, self.stream),
-            None => self.cache.seal_tail(),
+            None => match self.ordinary.as_deref_mut() {
+                Some(claim) => self.cache.seal_tail_ordinary(claim, self.stream),
+                None => self.cache.seal_tail(),
+            },
         }
     }
     fn finish(&mut self, end: i64, retain_for_attention: bool) -> Result<(), Exception> {

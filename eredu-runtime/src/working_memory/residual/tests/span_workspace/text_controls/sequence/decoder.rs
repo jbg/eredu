@@ -80,7 +80,8 @@ fn actual_original_decoder_source_joins_all_core_routes_and_optional_capture_onc
                 let opposite_policy = decoder(5, !skip);
                 let layout = consumer();
                 let options = capture.then(|| TextPreparationOptions {
-                    interventions: None, capture: Some(capture_source_for_geometry(InferenceGeometry {
+                    interventions: None,
+                    capture: Some(capture_source_for_geometry(InferenceGeometry {
                         max_output_tokens: 5,
                         ..geometry()
                     })),
@@ -124,21 +125,21 @@ fn actual_original_decoder_source_joins_all_core_routes_and_optional_capture_onc
                 assert_eq!(sequence.tokens(), [0, 1, 99, 2, 7]);
                 let (pool, held) = retire_request(&state);
                 drop(runtime);
-                assert_eq!(pool.used_bytes().unwrap(), held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), held);
                 // The taken input is now a nonowning immutable header; the two
                 // rejected comparison inputs still own their separate cold
                 // sources. None owns the provider's transferred source.
                 drop((source, foreign, opposite_policy));
-                assert_eq!(pool.used_bytes().unwrap(), held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), held);
                 let tokens = sequence.into_token_ids();
                 assert_eq!(tokens.as_ptr(), address);
-                assert_eq!(pool.used_bytes().unwrap(), held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), held);
                 let mut iter = tokens.clone().into_iter();
                 drop(tokens);
                 assert_eq!(iter.next(), Some(0));
-                assert_eq!(pool.used_bytes().unwrap(), held);
+                assert_eq!(pool.payload_used_bytes().unwrap(), held);
                 drop(iter);
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     }
@@ -155,7 +156,7 @@ fn exact_minus_one_source_replay_and_mismatched_n_do_not_prepare_destinations() 
     assert_eq!(state.borrow().decoder_takes, 1);
     assert_eq!(state.borrow().order, ["admit"]);
     assert_eq!(state.borrow().votes, [(Stage::Admission, Status::Failed)]);
-    assert_eq!(state.borrow().pool.used_bytes().unwrap(), 64);
+    assert_eq!(state.borrow().pool.payload_used_bytes().unwrap(), 64);
     drop(failure);
     state.borrow_mut().mode.short = false;
     for _ in 0..16 {
@@ -169,7 +170,7 @@ fn exact_minus_one_source_replay_and_mismatched_n_do_not_prepare_destinations() 
         );
     }
     assert_eq!(state.borrow().decoder_takes, 1);
-    assert_eq!(state.borrow().pool.used_bytes().unwrap(), 64);
+    assert_eq!(state.borrow().pool.payload_used_bytes().unwrap(), 64);
     let wrong_n = decoder(4, false);
     assert!(extract_decoder(&mut runtime, 0, 5, &wrong_n, &layout, None).is_err());
     // Wrong N rejects before the take; its actual matching request still works.
@@ -177,7 +178,7 @@ fn exact_minus_one_source_replay_and_mismatched_n_do_not_prepare_destinations() 
     drop(sequence);
     let (pool, _) = retire_request(&state);
     drop(runtime);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn fenced_decoder_preparation_error_retains_actual_source_and_original_registered_roots() {
@@ -201,13 +202,13 @@ fn fenced_decoder_preparation_error_retains_actual_source_and_original_registere
     drop(runtime);
     drop(source);
     let failure = sequence.prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     assert!(failure.cause().source().unwrap().is::<WorkingMemoryError>());
     let sequence = failure.into_sequence();
     let failure = sequence.prepare_storage().unwrap_err();
-    assert_eq!(pool.used_bytes().unwrap(), held + 64);
+    assert_eq!(pool.payload_used_bytes().unwrap(), held + 64);
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 #[test]
 fn dormant_zero_and_cancelled_decoder_sources_freeze_without_destinations() {
@@ -224,12 +225,12 @@ fn dormant_zero_and_cancelled_decoder_sources_freeze_without_destinations() {
         let (pool, held) = retire_request(&state);
         drop(runtime);
         drop(source);
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         let tokens = sequence.into_token_ids();
         assert!(tokens.is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), held);
+        assert_eq!(pool.payload_used_bytes().unwrap(), held);
         drop(tokens);
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -273,17 +274,18 @@ fn foreign_genuine_decoder_claim_keeps_the_original_source_and_bank_in_one_error
         let (new_pool, _) = retire_request(&new);
         drop(second);
         drop((a, b));
-        assert_eq!(new_pool.used_bytes().unwrap(), 0);
-        assert_eq!(old_pool.used_bytes().unwrap(), held + 64);
+        assert_eq!(new_pool.payload_used_bytes().unwrap(), 0);
+        assert_eq!(old_pool.payload_used_bytes().unwrap(), held + 64);
         let replays = std::array::from_fn::<_, 64, _>(|_| {
             eredu_core::GenerationSequenceBankRejection::Unavailable.into_backend_failure()
         });
         drop(error);
-        assert_eq!(old_pool.used_bytes().unwrap(), 0);
-        assert!(replays.iter().all(|e| e
-            .source()
-            .unwrap()
-            .is::<eredu_core::GenerationSequenceBankRejection>()));
+        assert_eq!(old_pool.payload_used_bytes().unwrap(), 0);
+        assert!(replays.iter().all(|e| {
+            e.source()
+                .unwrap()
+                .is::<eredu_core::GenerationSequenceBankRejection>()
+        }));
         drop((replays, initial));
     }
 }

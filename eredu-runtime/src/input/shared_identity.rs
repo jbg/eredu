@@ -1,6 +1,6 @@
 use super::PreparedInputCacheIdentity;
 use crate::host_metadata::{HostMetadataIdentity, MetadataCustody};
-use eredu_core::{PreparedInputIdentity, SharedStorageAttachmentError, SharedStorageDomain};
+use eredu_core::{PreparedInputIdentity, SharedStorageAccountingId, SharedStorageAttachmentError};
 use std::{fmt, sync::Arc};
 
 /// Shared immutable prepared-input/cache description with exact payload custody.
@@ -104,7 +104,8 @@ impl SharedPreparedInputCacheIdentity {
         self.inner().custody.original_prepared_source()
     }
     pub(crate) fn matches_original_account(
-        &self, expected: &crate::working_memory::PreparedInputHostCustody,
+        &self,
+        expected: &crate::working_memory::PreparedInputHostCustody,
     ) -> bool {
         self.inner().custody.original_prepared_matches(expected)
     }
@@ -112,15 +113,15 @@ impl SharedPreparedInputCacheIdentity {
     /// None denotes an ordinary cache; foreign original sources are errors.
     pub fn original_residence(
         &self,
-        pool: &crate::working_memory::WorkingMemoryPool,
+        pool: &crate::working_memory::MemoryLedger,
     ) -> Option<Result<(), crate::working_memory::WorkingMemoryError>> {
         self.inner().custody.original_prepared_residence(pool)
     }
     /// Fixed controls for lending a publication witness from this identity.
     /// The worker only shares existing closed accounts and allocates no storage.
     pub fn original_publication_source_control_bytes() -> Option<usize> {
-        use crate::working_memory::{PreparedInputHostCustody, WorkingMemoryError};
         use super::OriginalPreparedWorkspaceSource;
+        use crate::working_memory::{PreparedInputHostCustody, WorkingMemoryError};
         [
             std::mem::size_of::<OriginalPreparedWorkspaceSource>(),
             std::mem::size_of::<PreparedInputHostCustody>(),
@@ -135,17 +136,20 @@ impl SharedPreparedInputCacheIdentity {
     /// or authorize media execution. Ordinary identities return None.
     pub fn original_publication_source(
         &self,
-        pool: &crate::working_memory::WorkingMemoryPool,
-    ) -> Option<Result<super::OriginalPreparedWorkspaceSource, crate::working_memory::WorkingMemoryError>> {
+        pool: &crate::working_memory::MemoryLedger,
+    ) -> Option<
+        Result<super::OriginalPreparedWorkspaceSource, crate::working_memory::WorkingMemoryError>,
+    > {
         let residence = self.original_residence(pool)?;
         let custody = self.inner().custody.original_prepared_account()?;
-        Some(residence.map(|()| {
-            super::OriginalPreparedWorkspaceSource::cache_residence(custody.share())
-        }))
+        Some(
+            residence
+                .map(|()| super::OriginalPreparedWorkspaceSource::cache_residence(custody.share())),
+        )
     }
     /// Exact attachment-domain check for an existing original source witness.
     /// This cannot create an attachment or permit an original request.
-    pub fn original_domain_matches(&self, domain: &SharedStorageDomain) -> Option<bool> {
+    pub fn original_domain_matches(&self, domain: &SharedStorageAccountingId) -> Option<bool> {
         self.inner().custody.original_prepared_domain(domain)
     }
     /// Opaque process-local storage identity, independent of the payload lifetime.
@@ -188,14 +192,27 @@ impl SharedPreparedInputCacheIdentity {
     /// provider does not publish an attachment or change the retained payload.
     pub(crate) fn original_attachment_ready(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
     ) -> Result<(), crate::working_memory::WorkingMemoryError> {
         self.inner().custody.original_attachment_ready(domain)
     }
 
+    /// Funds the new attachment node and closed owner before construction.
+    pub(crate) fn try_attach_owned_prepared<T: eredu_core::SharedStorageRetirement, E>(
+        &self,
+        owner: &SharedStorageAccountingId,
+        acquire: impl FnOnce(
+            eredu_core::SharedStorageAttachmentLayout,
+        ) -> Result<eredu_core::SharedStorageOwner<T>, E>,
+    ) -> Result<bool, SharedStorageAttachmentError<E>> {
+        self.inner()
+            .custody
+            .try_attach_owned_prepared(owner, acquire)
+    }
+
     pub fn try_attach<E>(
         &self,
-        domain: &SharedStorageDomain,
+        domain: &SharedStorageAccountingId,
         acquire: impl FnOnce() -> Result<Box<dyn Send + Sync>, E>,
     ) -> Result<bool, SharedStorageAttachmentError<E>> {
         self.inner().custody.try_attach(domain, acquire)

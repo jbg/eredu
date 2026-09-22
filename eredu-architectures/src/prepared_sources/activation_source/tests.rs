@@ -118,7 +118,6 @@ fn fixture() -> (
             limits: CaptureLimits {
                 per_step: allowance,
                 cumulative: allowance.checked_mul(8).unwrap(),
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         },
@@ -150,6 +149,60 @@ fn admit(
         .unwrap();
     plan.admit(&discovery).unwrap()
 }
+#[test]
+fn independent_target_capture_uses_ordinary_declarations_without_prediction_catalog() {
+    let (mut source, _, mut plan) = fixture();
+    source.prediction = None;
+    let execution = SpeculativeActivationExecution::ordinary_target();
+    let discovery = source
+        .autoregressive_activations(
+            &InterventionMechanisms::default(),
+            "session",
+            Some("overlay"),
+        )
+        .unwrap();
+    assert!(!discovery.captures.catalog.points.is_empty());
+    assert!(
+        discovery
+            .bindings
+            .iter()
+            .all(|binding| binding.scope == SpeculativeCaptureScope::Target)
+    );
+    assert!(
+        plan.clone().admit(&discovery).is_err(),
+        "prediction hooks require their selected executor"
+    );
+    plan.captures.selections.truncate(1);
+    let admitted = plan.admit(&discovery).unwrap();
+    source
+        .validate_original_speculative_activations(
+            &admitted,
+            &execution,
+            "session",
+            Some("overlay"),
+        )
+        .unwrap();
+    let path = &admitted.captures().points()[0].path;
+    source
+        .descriptor
+        .observations
+        .points
+        .iter_mut()
+        .find(|point| point.path == *path)
+        .unwrap()
+        .meaning
+        .push_str(" stale");
+    assert_eq!(
+        source.validate_original_speculative_activations(
+            &admitted,
+            &execution,
+            "session",
+            Some("overlay"),
+        ),
+        Err(E::Declaration)
+    );
+}
+
 #[test]
 fn original_activation_validation_borrows_exact_ordinary_catalog_and_scopes() {
     let (source, execution, plan) = fixture();
@@ -283,10 +336,10 @@ fn original_internal_edits_require_the_exact_static_producer() {
 }
 #[test]
 fn original_internal_preview_summary_keep_exact_static_source_phase_and_scope_checks() {
-    validate_internal_edit_evidence(InterventionEvidence::Preview {max_elements:3});
+    validate_internal_edit_evidence(InterventionEvidence::Preview { max_elements: 3 });
     validate_internal_edit_evidence(InterventionEvidence::Summary);
 }
-fn validate_internal_edit_evidence(evidence:InterventionEvidence) {
+fn validate_internal_edit_evidence(evidence: InterventionEvidence) {
     let (source, execution, mut plan) = fixture();
     let mechanisms = InterventionMechanisms {
         operations: vec![InterventionKind::Scale],
@@ -384,36 +437,99 @@ fn validate_internal_edit_evidence(evidence:InterventionEvidence) {
 fn original_sparse_internal_source_requires_exact_producer_facts_and_retained_geometry() {
     let (source, execution, mut plan) = fixture();
     let mechanisms = InterventionMechanisms {
-        routed_units: true, operations: vec![InterventionKind::Scale],
-        dtypes: vec![InterventionDtype::Float32], ..Default::default()
+        routed_units: true,
+        operations: vec![InterventionKind::Scale],
+        dtypes: vec![InterventionDtype::Float32],
+        ..Default::default()
     };
-    let discovery = source.speculative_activations(&execution, &mechanisms, "session", Some("overlay")).unwrap();
-    let point = discovery.interventions.points.iter().find(|point| {
-        point.routed_units.is_some() && point.operations.contains(&InterventionKind::Scale)
-            && point.dtypes.contains(&InterventionDtype::Float32)
-            && matches!(point.prefill, ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_))
-            && matches!(point.decode, ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_))
-    }).unwrap();
+    let discovery = source
+        .speculative_activations(&execution, &mechanisms, "session", Some("overlay"))
+        .unwrap();
+    let point = discovery
+        .interventions
+        .points
+        .iter()
+        .find(|point| {
+            point.routed_units.is_some()
+                && point.operations.contains(&InterventionKind::Scale)
+                && point.dtypes.contains(&InterventionDtype::Float32)
+                && matches!(
+                    point.prefill,
+                    ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_)
+                )
+                && matches!(
+                    point.decode,
+                    ObservationSupportStatus::Supported | ObservationSupportStatus::Conditional(_)
+                )
+        })
+        .unwrap();
     plan.interventions.operations.push(InterventionOperation {
-        id: "sparse-edit".into(), target: point.path.clone(), schedule: Default::default(), slices: vec![],
-        action: InterventionAction::Scale {dtype: InterventionDtype::Float32, factor: -0.5},
+        id: "sparse-edit".into(),
+        target: point.path.clone(),
+        schedule: Default::default(),
+        slices: vec![],
+        action: InterventionAction::Scale {
+            dtype: InterventionDtype::Float32,
+            factor: -0.5,
+        },
         evidence: InterventionEvidence::None,
     });
     let admitted = plan.admit(&discovery).unwrap();
-    assert_eq!(source.validate_original_speculative_activations_with_interventions(
-        &admitted, &execution, "session", Some("overlay"), mechanisms.borrowed()), Err(E::UnqualifiedIntervention));
-    let validate=|actual:&PreparedModelDiscovery, facts|actual.validate_original_speculative_activations_with_routed_interventions(
-        &admitted,&execution,"session",Some("overlay"),mechanisms.borrowed(),facts);
-    let points=admitted.interventions().points().as_ptr();
+    assert_eq!(
+        source.validate_original_speculative_activations_with_interventions(
+            &admitted,
+            &execution,
+            "session",
+            Some("overlay"),
+            mechanisms.borrowed()
+        ),
+        Err(E::UnqualifiedIntervention)
+    );
+    let validate = |actual: &PreparedModelDiscovery, facts| {
+        actual.validate_original_speculative_activations_with_routed_interventions(
+            &admitted,
+            &execution,
+            "session",
+            Some("overlay"),
+            mechanisms.borrowed(),
+            facts,
+        )
+    };
+    let points = admitted.interventions().points().as_ptr();
     validate(&source, mechanisms.borrowed()).unwrap();
-    assert_eq!(points,admitted.interventions().points().as_ptr());
-    let wrong_dtype=InterventionMechanisms {dtypes:vec![InterventionDtype::Float16],..mechanisms.clone()};
-    assert_eq!(validate(&source,wrong_dtype.borrowed()),Err(E::UnqualifiedIntervention));
-    let wrong_action=InterventionMechanisms {operations:vec![InterventionKind::Zero],..mechanisms.clone()};
-    assert_eq!(validate(&source,wrong_action.borrowed()),Err(E::UnqualifiedIntervention));
-    let mut changed=source.clone();
-    changed.prediction.as_mut().unwrap().intervention_points.iter_mut()
-        .find(|point|point.path==admitted.interventions().points()[0].path).unwrap()
-        .routed_units.as_mut().unwrap().geometry.units_per_expert+=1;
-    assert_eq!(validate(&changed,mechanisms.borrowed()),Err(E::Declaration));
+    assert_eq!(points, admitted.interventions().points().as_ptr());
+    let wrong_dtype = InterventionMechanisms {
+        dtypes: vec![InterventionDtype::Float16],
+        ..mechanisms.clone()
+    };
+    assert_eq!(
+        validate(&source, wrong_dtype.borrowed()),
+        Err(E::UnqualifiedIntervention)
+    );
+    let wrong_action = InterventionMechanisms {
+        operations: vec![InterventionKind::Zero],
+        ..mechanisms.clone()
+    };
+    assert_eq!(
+        validate(&source, wrong_action.borrowed()),
+        Err(E::UnqualifiedIntervention)
+    );
+    let mut changed = source.clone();
+    changed
+        .prediction
+        .as_mut()
+        .unwrap()
+        .intervention_points
+        .iter_mut()
+        .find(|point| point.path == admitted.interventions().points()[0].path)
+        .unwrap()
+        .routed_units
+        .as_mut()
+        .unwrap()
+        .geometry
+        .units_per_expert += 1;
+    assert_eq!(
+        validate(&changed, mechanisms.borrowed()),
+        Err(E::Declaration)
+    );
 }

@@ -3,10 +3,10 @@
 use super::*;
 mod blockwise;
 use crate::backend::nn::attention::{
-    INPUT_SCORE_ROW_BUDGET, SLIDING_QUERY_TILE, input_score_query_step,
+    input_score_query_step, INPUT_SCORE_ROW_BUDGET, SLIDING_QUERY_TILE,
 };
 use eredu_nn::{
-    AttentionArithmetic, operation_geometry::SlidingAttentionGeometry, workspace::WorkspaceDtype,
+    operation_geometry::SlidingAttentionGeometry, workspace::WorkspaceDtype, AttentionArithmetic,
 };
 use safemlx::Array;
 
@@ -356,14 +356,20 @@ fn frame_controls() -> usize {
         + size_of::<&'static safemlx::Stream>()
 }
 pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering> {
-    if matches!(operation.kind, WorkspaceOperationKindView::BlockwiseAttention { .. }) {
+    if matches!(
+        operation.kind,
+        WorkspaceOperationKindView::BlockwiseAttention { .. }
+    ) {
         return blockwise::stage_plan(operation).map(|plan| plan.lowering);
     }
 
     Some(plan(operation)?.lowering)
 }
 pub(super) fn control_bytes(operation: WorkspaceOperationView<'_>) -> Option<usize> {
-    if matches!(operation.kind, WorkspaceOperationKindView::BlockwiseAttention { .. }) {
+    if matches!(
+        operation.kind,
+        WorkspaceOperationKindView::BlockwiseAttention { .. }
+    ) {
         return blockwise::stage_plan(operation).map(|plan| plan.controls);
     }
 
@@ -439,7 +445,7 @@ mod tests {
             let storage = GroupedOutputStorage {
                 calls: actual.lowering.grouped_output_calls,
                 chunks: actual.lowering.grouped_output_chunks,
-                        ..GroupedOutputStorage::default()
+                ..GroupedOutputStorage::default()
             };
             assert!(storage.control_bytes().unwrap() > 0);
         }
@@ -459,27 +465,56 @@ mod tests {
             // execution, but the earlier constructor still needs its own quote.
             let mask = WorkspaceBackend::causal_mask(2, offset, None, &context).unwrap();
             let output = WorkspaceBackend::sliding_window_attention_with_sinks(
-                AttentionRequest { queries:q, keys:k, values:v, scale:0.25,
-                    mask:Some(&mask), sinks:Some(&sinks), softcap:None,
-                    arithmetic:AttentionArithmetic::Fused }, 3, offset, &context).unwrap();
-            assert_eq!(output.shape(), [1,2,64]);
+                AttentionRequest {
+                    queries: q,
+                    keys: k,
+                    values: v,
+                    scale: 0.25,
+                    mask: Some(&mask),
+                    sinks: Some(&sinks),
+                    softcap: None,
+                    arithmetic: AttentionArithmetic::Fused,
+                },
+                3,
+                offset,
+                &context,
+            )
+            .unwrap();
+            assert_eq!(output.shape(), [1, 2, 64]);
             let report = context.report(&[output]).unwrap();
-            assert!(report.operations.iter().any(|op|matches!(op.kind,WorkspaceOperationKind::CausalMask(_))));
-            let op=report.operations.iter().find(|op|matches!(op.kind,WorkspaceOperationKind::Attention{..})).unwrap();
-            assert_eq!(op.inputs.len(),4, "Q/K/V and the real sink source");
-            assert_eq!(op.inputs[3].shape(),[2]);
-            let native=plan(op.as_view()).expect("actual sliding worker source");
-            assert_eq!(native.lowering.grouped_output_calls,usize::from(offset!=0));
-            assert!(native.controls>0);
-            let recorder=ResidentRecipeRecorder::new(InferenceGeometry{
-                batch_size:1,cached_positions:offset as u64,input_positions:2,max_output_tokens:1,
-                prefill_chunk_positions:2,output:eredu_core::OutputDemand::Sequence},mechanism);
-            let complete=recorder.reduce_trace(&report,None,0,1).unwrap();
-            assert_eq!(complete.first_missing_operation,None);
+            assert!(report
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, WorkspaceOperationKind::CausalMask(_))));
+            let op = report
+                .operations
+                .iter()
+                .find(|op| matches!(op.kind, WorkspaceOperationKind::Attention { .. }))
+                .unwrap();
+            assert_eq!(op.inputs.len(), 4, "Q/K/V and the real sink source");
+            assert_eq!(op.inputs[3].shape(), [2]);
+            let native = plan(op.as_view()).expect("actual sliding worker source");
+            assert_eq!(
+                native.lowering.grouped_output_calls,
+                usize::from(offset != 0)
+            );
+            assert!(native.controls > 0);
+            let recorder = ResidentRecipeRecorder::new(
+                InferenceGeometry {
+                    batch_size: 1,
+                    cached_positions: offset as u64,
+                    input_positions: 2,
+                    max_output_tokens: 1,
+                    prefill_chunk_positions: 2,
+                    output: eredu_core::OutputDemand::Sequence,
+                },
+                mechanism,
+            );
+            let complete = recorder.reduce_trace(&report, None, 0, 1).unwrap();
+            assert_eq!(complete.first_missing_operation, None);
             assert!(complete.mutable_storage.is_some());
             assert!(complete.graph.is_some());
             assert!(complete.dispatch.is_some());
         }
     }
-
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::PreparedChatGenerationSettings;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 
 pub(super) fn run_case(
     template: &str,
@@ -40,7 +41,7 @@ pub(super) fn run_case(
         .compile_managed_chat_source(&tokenizer, template_file, false, &cancellation)
         .unwrap()
         .unwrap();
-    let cold = pool.used_bytes().unwrap();
+    let cold = pool.live_charge_bytes().unwrap();
     let mut oracle = ChatTokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap();
     let prompt = oracle
         .apply_chat_template_json(
@@ -66,28 +67,37 @@ pub(super) fn run_case(
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(u64::MAX),
+            memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+                "host".into(),
+                eredu_core::MemoryLimit::Finite(u64::MAX),
+            )]),
             ..Default::default()
         },
         ..Default::default()
     };
     let prepared = model
-        .prepare_chat(&source, &chat, u64::MAX, &cancellation)
+        .prepare_chat(
+            &source,
+            &chat,
+            &crate::memory_fixture::limits(u64::MAX),
+            &cancellation,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(prepared.rendered_prompt(), prompt);
-    let prepared_bytes = pool.used_bytes().unwrap();
+    let prepared_bytes = pool.live_charge_bytes().unwrap();
     // A refusal after rendering must retain the actual J/C/H; retries
     // use the same source and leave no previous render allowance alive.
     facts.borrow_mut().short = true;
-    let error = match model.start_prepared_chat(literal_request(&prepared, settings), &cancellation)
+    let error = match model
+        .start_prepared_chat(literal_request(&prepared, settings.clone()), &cancellation)
     {
         Err(error) => error,
         Ok(_) => panic!("exact short admission must refuse"),
     };
-    assert!(pool.used_bytes().unwrap() > cold);
+    assert!(pool.live_charge_bytes().unwrap() > cold);
     drop(error);
-    assert_eq!(pool.used_bytes().unwrap(), prepared_bytes);
+    assert_eq!(pool.live_charge_bytes().unwrap(), prepared_bytes);
     facts.borrow_mut().short = false;
     facts.borrow_mut().ids.clear();
     let mut visible = String::new();
@@ -96,7 +106,7 @@ pub(super) fn run_case(
             visible.push_str(&value);
         }
     };
-    let request = literal_request(&prepared, settings);
+    let request = literal_request(&prepared, settings.clone());
     let output = if manual {
         let mut session = model
             .start_prepared_chat(request, &cancellation)
@@ -122,8 +132,8 @@ pub(super) fn run_case(
     assert_eq!(facts.borrow().chat_sources, 1);
     let escaped = output.token_ids.clone();
     drop((output, prepared, chat, source, tokenizer, model));
-    assert!(pool.used_bytes().unwrap() > 0);
+    assert!(pool.live_charge_bytes().unwrap() > 0);
     assert_eq!(escaped.as_ref(), &[0, 8, 0]);
     drop(escaped);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

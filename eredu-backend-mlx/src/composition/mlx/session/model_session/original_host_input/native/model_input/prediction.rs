@@ -4,7 +4,7 @@ use super::*;
 impl MlxModelInput {
     pub(crate) fn original_prediction_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
     ) -> Result<&eredu_runtime::input::PreparedModelInputOwner<crate::MlxTensor>, WorkingMemoryError>
     {
         let cache = self

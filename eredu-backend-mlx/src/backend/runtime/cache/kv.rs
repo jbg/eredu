@@ -15,7 +15,9 @@ use eredu_nn::{
 
 use crate::{
     backend::nn::shared::MlxNeuralBackend,
-    backend::runtime::cache::residency::{CacheBlockArrays, CacheResidencyManager},
+    backend::runtime::cache::residency::{
+        CacheBlockArrays, CacheResidencyError, CacheResidencyManager,
+    },
 };
 use eredu_core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation};
 use eredu_runtime::{CacheResidencyReport, PagedCacheOptions};
@@ -113,10 +115,15 @@ pub use compressed::CompressedLatentCache;
 pub(crate) use compressed::{InvalidResidentCopy, PreparedCompressedCopy};
 
 mod paged;
-pub(crate) use paged::{PagedWorkspaceProjectionFailure, ProjectedPagedCacheSource, ProjectedPagedSource, PagedCacheArrayGeometry, PagedCacheBlockGeometry, PagedCacheSourceGeometry, PagedKeyValueSource};
 pub use paged::{
     LiveKeyValueCache, PagedKeyValueCache, PagedKeyValueTransactionCheckpoint,
     PagedLatentAttentionBlock,
+};
+pub(crate) use paged::{
+    PreparedPagedCheckpoint, OrdinaryPagedCheckpoint,
+    PagedCacheArrayGeometry, PagedCacheBlockGeometry, PagedCacheSourceGeometry,
+    PagedKeyValueSource, PagedWorkspaceProjectionFailure, ProjectedPagedCacheSource,
+    ProjectedPagedSource,
 };
 
 mod attention;
@@ -124,8 +131,12 @@ mod attention;
 use attention::absolute_attention_mask;
 pub use attention::{BlockwiseAttentionAccumulator, KeyValueAttentionBlock};
 
-fn cache_residency_exception(error: impl std::fmt::Display) -> Exception {
-    Exception::custom(error.to_string())
+fn cache_residency_exception(error: CacheResidencyError) -> Exception {
+    match error {
+        CacheResidencyError::NativeEvaluation(cause)
+        | CacheResidencyError::Transfer { source: cause, .. } => cause,
+        other => Exception::custom(other.to_string()),
+    }
 }
 
 mod contiguous;

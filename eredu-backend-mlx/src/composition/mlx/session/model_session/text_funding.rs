@@ -11,13 +11,16 @@ use eredu_runtime::working_memory::{
 // permits validation of repeated publication without reopening or refilling it.
 struct ModelTable {
     source: OriginalResidentResetSource,
-    pool: eredu_runtime::working_memory::WorkingMemoryPool,
+    pool: eredu_runtime::working_memory::MemoryLedger,
 }
 
 mod capture;
+pub(super) use capture::ordinary_publication_control_bytes as ordinary_capture_publication_control_bytes;
 mod collectors;
 mod native_publication;
+mod ordinary;
 mod owner;
+pub(super) use ordinary::Plan as OrdinaryPublicationPlan;
 mod prepared;
 mod snapshot;
 pub(super) use snapshot::SnapshotPublicationPlan;
@@ -27,7 +30,9 @@ mod publication_tests;
 pub(super) use owner::FundedWorkOwner;
 pub(super) use prepared::{PreparedFundedWork, PreparedWorkRetention};
 
-pub(in crate::composition::mlx::session) fn capture_replica_control_bytes() -> Option<usize> { capture::replica_control_bytes() }
+pub(in crate::composition::mlx::session) fn capture_replica_control_bytes() -> Option<usize> {
+    capture::replica_control_bytes()
+}
 pub(super) fn observer_error_control_bytes() -> Option<usize> {
     capture::observer_error_control_bytes()
 }
@@ -52,7 +57,8 @@ pub(super) struct FundedWork {
     publishing: Cell<bool>,
     capture: RefCell<Option<capture::CaptureCarrierOwner>>,
     opening_rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
-    text_interventions: Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>,
+    text_interventions:
+        Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>,
     original_table: Option<ModelTable>,
     // Closed account/portable-root profile from the accepted candidate. It has
     // no native payload backedge and stays through publication/recovery.
@@ -61,9 +67,79 @@ pub(super) struct FundedWork {
     // scope, including quarantine. certify() never takes this guard.
     _controls: Option<OriginalTextControlGuard>,
     snapshot: Option<snapshot::SnapshotWork>,
+    // Last: finite ordinary destinations retain their actual host constructor.
+    ordinary_observer: RefCell<Option<safemlx::ScopedPhysicalBackingObserver>>,
+    ordinary: RefCell<Option<(usize, eredu_core::HostPreparationAuthority)>>,
+    ordinary_indexed: RefCell<
+        Option<crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestOwner>,
+    >,
+    ordinary_execution: RefCell<Option<crate::backend::nn::shared::OrdinaryExecutionRegistration>>,
 }
 
 impl FundedWork {
+    /// Installs the exact ordinary cache step loan before any native mutation.
+    /// Registration and these fixed frames are prepaid by the Work host owner.
+    pub(super) fn install_ordinary_paged(
+        &self,
+        paged: crate::backend::nn::workspace::OrdinaryPagedWork,
+    ) -> Result<(), Error> {
+        if self.native_storage.is_some()
+            || self.ordinary_observer.borrow().is_none()
+            || self.published.get()
+        {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
+        self.ordinary_execution
+            .try_borrow()
+            .map_err(|_| Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            .as_ref()
+            .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            .bind_paged(paged)?;
+        Ok(())
+    }
+
+    /// Host metadata is converted from this admitted ordinary scope. The
+    /// provider shares its physical observer and creates no native scope.
+    pub(super) fn install_ordinary_indexed(
+        &self,
+        program: std::rc::Rc<
+            dyn crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestProgram,
+        >,
+    ) -> Result<(), Error> {
+        if self.native_storage.is_some()
+            || self.ordinary_observer.borrow().is_none()
+            || self.ordinary_indexed.borrow().is_some()
+            || self.published.get()
+        {
+            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+        }
+        let metadata = self
+            .scope
+            .try_borrow_mut()
+            .map_err(|_| Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            .as_mut()
+            .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            .prepare_storage_metadata()
+            .map_err(Error::WorkspacePlanning)?;
+        metadata
+            .funding()
+            .reserve_metadata(ordinary_indexed_install_frames())
+            .map_err(Error::WorkspacePlanning)?;
+        let owner =
+            crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestOwner::new(
+                program,
+                metadata.funding(),
+            )?;
+        self.ordinary_execution
+            .try_borrow()
+            .map_err(|_| Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            .as_ref()
+            .ok_or(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?
+            .bind_indexed(owner.local_source())?;
+        *self.ordinary_indexed.borrow_mut() = Some(owner);
+        Ok(())
+    }
+
     pub(super) fn bind_snapshot_host_copy(
         &self,
         copy: &crate::backend::array_copy::PreparedSavedHostCopy,
@@ -84,59 +160,74 @@ impl FundedWork {
         self.scope.try_borrow_mut().unwrap().is_none()
     }
 
-    pub(super) fn new(scope: WorkingMemoryFundingScope) -> FundedWorkOwner {
-        Self::allocate(Some(scope), None, None, None, None, None, None, None)
-    }
-
-    pub(super) fn new_with_controls(
-        scope: WorkingMemoryFundingScope,
-        controls: Option<OriginalTextControlGuard>,
-    ) -> Result<FundedWorkOwner, Error> {
-        Self::new_with_opening_rows(scope, controls, None)
-    }
-
-    pub(super) fn new_with_opening_rows(
-        scope: WorkingMemoryFundingScope,
-        controls: Option<OriginalTextControlGuard>,
-        rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
-    ) -> Result<FundedWorkOwner, Error> {
-        Self::new_model(scope, controls, rows, None)
-    }
-
-    pub(super) fn new_model(
-        scope: WorkingMemoryFundingScope,
-        controls: Option<OriginalTextControlGuard>,
-        rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
-        original_table: Option<OriginalResidentResetSource>,
-    ) -> Result<FundedWorkOwner, Error> {
-        Self::new_model_with_native(scope, controls, rows, None, original_table, None, None)
-    }
-
     pub(super) fn new_model_with_native(
         scope: WorkingMemoryFundingScope,
         controls: Option<OriginalTextControlGuard>,
         rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
-        text_interventions: Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>,
+        text_interventions: Option<
+            crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner,
+        >,
         original_table: Option<OriginalResidentResetSource>,
         prepared_source: Option<eredu_runtime::input::OriginalPreparedWorkspaceSource>,
         native_storage: Option<
             crate::backend::runtime::residency::storage::native_storage::BankOwner,
         >,
     ) -> Result<FundedWorkOwner, Error> {
+        Self::new_with_publication(
+            scope,
+            controls,
+            rows,
+            text_interventions,
+            original_table,
+            prepared_source,
+            native_storage,
+            None,
+        )
+    }
+
+    pub(super) fn new_with_publication(
+        mut scope: WorkingMemoryFundingScope,
+        controls: Option<OriginalTextControlGuard>,
+        rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
+        text_interventions: Option<
+            crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner,
+        >,
+        original_table: Option<OriginalResidentResetSource>,
+        prepared_source: Option<eredu_runtime::input::OriginalPreparedWorkspaceSource>,
+        native_storage: Option<
+            crate::backend::runtime::residency::storage::native_storage::BankOwner,
+        >,
+        ordinary: Option<OrdinaryPublicationPlan>,
+    ) -> Result<FundedWorkOwner, Error> {
+        if native_storage.is_some() && ordinary.is_some() {
+            return Err(Error::OriginalSourceContract {
+                stage: "conflicting native and ordinary publication plans",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
+        }
         if prepared_source
             .as_ref()
-            .is_some_and(|source| controls.is_none() || !source.pool().same_domain(scope.pool()))
+            .is_some_and(|source| controls.is_none() || !source.pool().same_ledger(scope.pool()))
         {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            return Err(Error::OriginalSourceContract {
+                stage: "prepared workspace publication account",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         if native_storage.is_some() && controls.is_none() {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            return Err(Error::OriginalSourceContract {
+                stage: "native publication control custody",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         if let Some(edits) = &text_interventions {
             if controls.is_none() {
                 return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
             }
-            edits.source().validate_pool(scope.pool()).map_err(Error::PrefillControl)?;
+            edits
+                .source()
+                .validate_pool(scope.pool())
+                .map_err(Error::PrefillControl)?;
         }
         if let Some(source) = &original_table {
             if controls.is_none() {
@@ -157,6 +248,9 @@ impl FundedWork {
                 .validate_native_scope(&scope)
                 .map_err(|error| Error::Other(Box::new(error)))?;
         }
+        let ordinary = ordinary
+            .map(|plan| ordinary::prepare(&mut scope, plan))
+            .transpose()?;
         // Validation and original custody precede the Rc and later collectors.
         let original_table = original_table.map(|source| ModelTable {
             source,
@@ -172,6 +266,11 @@ impl FundedWork {
             native_storage,
             None,
         );
+        if let Some((rows, host, observer, execution)) = ordinary {
+            *work.ordinary_observer.borrow_mut() = Some(observer);
+            *work.ordinary.borrow_mut() = Some((rows, host));
+            *work.ordinary_execution.borrow_mut() = Some(execution);
+        }
         work.prepare_collectors()?;
         #[cfg(all(
             test,
@@ -189,7 +288,9 @@ impl FundedWork {
         scope: Option<WorkingMemoryFundingScope>,
         controls: Option<OriginalTextControlGuard>,
         opening_rows: Option<crate::composition::mlx::replicated_text::NativeOpeningRowsOwner>,
-        text_interventions: Option<crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner>,
+        text_interventions: Option<
+            crate::composition::mlx::session::intervention::PreparedTextInterventionsOwner,
+        >,
         original_table: Option<ModelTable>,
         prepared_source: Option<eredu_runtime::input::OriginalPreparedWorkspaceSource>,
         native_storage: Option<
@@ -218,6 +319,10 @@ impl FundedWork {
             prepared_source,
             _controls: controls,
             snapshot,
+            ordinary_observer: RefCell::new(None),
+            ordinary: RefCell::new(None),
+            ordinary_indexed: RefCell::new(None),
+            ordinary_execution: RefCell::new(None),
         })
     }
 
@@ -255,7 +360,10 @@ impl FundedWork {
     }
 
     pub(super) fn retain(&self, array: &Array) {
-        if self.native_storage.is_none() && self.snapshot.is_none() {
+        if self.native_storage.is_none()
+            && self.snapshot.is_none()
+            && self.ordinary.borrow().is_none()
+        {
             self.roots.borrow_mut().push(array.clone());
             self.published.set(false);
             return;
@@ -307,7 +415,9 @@ impl FundedWork {
             return;
         }
         let mut metadata = self.metadata.borrow_mut();
-        if (self.native_storage.is_some() || self.snapshot.is_some())
+        if (self.native_storage.is_some()
+            || self.snapshot.is_some()
+            || self.ordinary.borrow().is_some())
             && metadata.len() == metadata.capacity()
         {
             let cause = Error::PrefillControl(WorkingMemoryError::CollectorCapacity {
@@ -355,9 +465,15 @@ impl FundedWork {
                     .as_ref()
                     .is_some_and(|s| !s.is_original_collector()))
         {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            return Err(Error::OriginalSourceContract {
+                stage: "original publication collector provenance",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
-        if self.native_storage.is_some() || self.snapshot.is_some() {
+        if self.native_storage.is_some()
+            || self.snapshot.is_some()
+            || self.ordinary.borrow().is_some()
+        {
             let publications = self.publications.borrow();
             if publications.len() == publications.capacity() {
                 let cause = Error::PrefillControl(WorkingMemoryError::CollectorCapacity {
@@ -370,7 +486,10 @@ impl FundedWork {
             }
         }
         if self.snapshot.is_some() && nonstate.is_some() {
-            return Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch));
+            return Err(Error::OriginalSourceContract {
+                stage: "snapshot publication model inventory",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         // Even an idempotent call must not accept a replaced/missing source.
         // The inline pool is the original scope's exact domain, not new authority.
@@ -398,6 +517,17 @@ impl FundedWork {
         }
         if self.published.get() && !self.capture_is_active()? {
             return Ok(None);
+        }
+        if self.ordinary.borrow().is_some()
+            && (!storage.is_original_collector()
+                || nonstate
+                    .as_ref()
+                    .is_some_and(|s| !s.is_original_collector()))
+        {
+            return Err(Error::OriginalSourceContract {
+                stage: "ordinary publication collector provenance",
+                cause: WorkingMemoryError::IdentityMismatch,
+            });
         }
         self.include_capture_roots(&mut storage)?;
         for root in self.roots.borrow().iter() {
@@ -513,6 +643,20 @@ impl FundedWork {
         }
         self.require_no_capture_carrier()?;
         if self.published.get() {
+            {
+                let mut indexed = self
+                    .ordinary_indexed
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillControl(WorkingMemoryError::IdentityMismatch))?;
+                if let Some(owner) = indexed.as_mut() {
+                    owner.finish()?;
+                }
+            }
+            // Drop channel/source custody after releasing the mutable borrow.
+            let indexed = self.ordinary_indexed.borrow_mut().take();
+            drop(indexed);
+            let execution = self.ordinary_execution.borrow_mut().take();
+            drop(execution);
             let scope = self.scope.borrow_mut().take();
             if let Some(scope) = scope {
                 scope
@@ -534,6 +678,43 @@ impl FundedWork {
             }
         }
     }
+}
+
+fn ordinary_paged_install_frames() -> usize {
+    size_of::<(
+        &FundedWork,
+        crate::backend::nn::workspace::OrdinaryPagedWork,
+        std::cell::Ref<'static, Option<crate::backend::nn::shared::OrdinaryExecutionRegistration>>,
+        std::cell::BorrowError,
+        Result<(), Error>,
+    )>()
+}
+
+fn ordinary_indexed_install_frames() -> usize {
+    use crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestProgram;
+    size_of::<(
+        &FundedWork,
+        std::rc::Rc<dyn OrdinaryIndexedRequestProgram>,
+        eredu_runtime::working_memory::StorageMetadataFunding,
+        Result<
+            eredu_runtime::working_memory::StorageMetadataFunding,
+            eredu_nn::workspace::HostMetadataFundingError,
+        >,
+        Result<(), Error>,
+    )>()
+}
+pub(super) fn ordinary_indexed_control_bytes(
+    program: &dyn crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestProgram,
+) -> Option<u64> {
+    use crate::backend::runtime::residency::parameter_bank::OrdinaryIndexedRequestOwner;
+    u64::try_from(
+        OrdinaryIndexedRequestOwner::runtime_control_bytes(program)?
+            .checked_add(ordinary_indexed_install_frames())?,
+    )
+    .ok()?
+    .checked_add(
+        eredu_runtime::working_memory::MemoryLedger::storage_metadata_control_bytes().ok()?,
+    )
 }
 
 /// This field is placed after a completion's native roots. Its destruction does
@@ -630,8 +811,8 @@ pub(super) fn capture_carrier_control_bytes(
 pub(super) fn copy_limits_with_work_controls(
     mut limits: eredu_runtime::working_memory::WorkspaceCopyLimits,
 ) -> Result<eredu_runtime::working_memory::WorkspaceCopyLimits, Error> {
-    limits.safety_reserve_bytes = limits
-        .safety_reserve_bytes
+    limits.additional_host_metadata_bytes = limits
+        .additional_host_metadata_bytes
         .checked_add(work_control_bytes()?)
         .ok_or_else(|| {
             Error::Other(Box::new(

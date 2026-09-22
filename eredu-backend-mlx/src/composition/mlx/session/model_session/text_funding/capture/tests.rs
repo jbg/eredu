@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use std::cell::Cell;
 thread_local! {
     static EVALUATIONS: Cell<usize> = const { Cell::new(0) };
@@ -108,7 +110,6 @@ mod metal {
             limits: CaptureLimits {
                 per_step: usage,
                 cumulative: usage,
-                physical_native_bytes: None,
                 on_limit: CaptureLimitPolicy::Fail,
             },
         }
@@ -123,7 +124,6 @@ mod metal {
                     CaptureTransformKind::Summary,
                 ],
                 max_histogram_bins: 0,
-                physical_native_limit: false,
                 conditions: vec![],
             },
             CaptureRequestShape {
@@ -135,7 +135,7 @@ mod metal {
         .unwrap()
     }
     fn fresh(
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         bytes: u64,
     ) -> (WorkingMemoryReservation, WorkingMemoryFundingRun) {
         let geometry = InferenceGeometry {
@@ -164,25 +164,29 @@ mod metal {
         .unwrap();
         let bound = |bytes| WorkspaceBound::bounded(bytes, "portable parent-account fixture");
         let state = state
-            .with_execution_workspace(ExecutionWorkspaceEstimate {
-                geometry,
-                activations: bound(bytes),
-                attention: bound(0),
-                vocabulary: bound(0),
-                state_update: bound(0),
-                materialization: bound(0),
-                retained: bound(0),
-            })
+            .with_execution_workspace(crate::memory_fixture::workspace(
+                ExecutionWorkspaceEstimate {
+                    physical_domains: None,
+                    geometry,
+                    activations: bound(bytes),
+                    attention: bound(0),
+                    vocabulary: bound(0),
+                    state_update: bound(0),
+                    materialization: bound(0),
+                    retained: bound(0),
+                },
+            ))
             .unwrap();
         pool.reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
-            &Admission {
+            &crate::memory_fixture::admission(Admission {
+                memory_limits: Default::default(),
+                additional_headroom: Default::default(),
                 state,
                 requested_positions: 7,
-                incremental_required_bytes: bytes,
-                available_memory_bytes: None,
-            },
-            pool.effective_capacity().unwrap(),
+                incremental_required_bytes: Some(bytes),
+            }),
+            crate::memory_fixture::resolved_limits(pool.fixture_host_limit().unwrap()),
         )
         .unwrap()
         .into_funding()
@@ -199,7 +203,7 @@ mod metal {
             vec![],
         ))
     }
-    fn quote(input: &Array, plan: &SharedCapturePlan) -> u64 {
+    fn quote(input: &Array, plan: &SharedCapturePlan) -> (u64, usize) {
         let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
         let mut projection = ExistingArrayProjection::new(&context);
         let input = projection.project(input).unwrap();
@@ -218,10 +222,22 @@ mod metal {
         let report = context.report(&[input, source, other, selected]).unwrap();
         assert!(report.unpriced_operations.is_empty());
         assert!(report.unpriced_host_operations.is_empty());
-        report.state.unwrap().transient_bytes.unwrap() + report.host_workspace_bytes.unwrap()
+        (
+            report.state.unwrap().transient_bytes.unwrap() + report.host_workspace_bytes.unwrap(),
+            report.closing_storage.maximum_allocations,
+        )
+    }
+    // One observed source is published and pinned, then the complete finite
+    // root inventory is published at completion. Each constructor keeps its own
+    // host account until its last attached backing retires.
+    fn capture_publication_allowance(captures: usize) -> u64 {
+        ordinary_publication_control_bytes()
+            .unwrap()
+            .checked_mul(u64::try_from(captures).unwrap())
+            .unwrap()
     }
     struct Fixture {
-        pool: WorkingMemoryPool,
+        pool: MemoryLedger,
         input: Array,
         plan: SharedCapturePlan,
         reservation: WorkingMemoryReservation,
@@ -238,11 +254,19 @@ mod metal {
     fn fixture_in_pool(
         dtype: Dtype,
         plan: SharedCapturePlan,
-        existing_pool: Option<WorkingMemoryPool>,
+        existing_pool: Option<MemoryLedger>,
     ) -> Fixture {
-        // Bootstrap owns input/source construction. The target pool is created at
-        // the exact initial-storage + closed host program + inspected span bound.
-        let bootstrap = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        fixture_with_publication_allowance(dtype, plan, existing_pool, 0)
+    }
+    fn fixture_with_publication_allowance(
+        dtype: Dtype,
+        plan: SharedCapturePlan,
+        existing_pool: Option<MemoryLedger>,
+        opening_publication_rows: usize,
+    ) -> Fixture {
+        // Bootstrap owns input/source construction. The request includes its
+        // closed host program, inspected span and finite publication population.
+        let bootstrap = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let bootstrap_owner = NativeMemoryOwner::acquire(&bootstrap).unwrap();
         let stream = stream();
         let input = Array::from_slice(&[1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0], &[8])
@@ -251,19 +275,32 @@ mod metal {
         input.evaluated().unwrap();
         let host = CaptureRunHostPlan::prepare(&plan).unwrap();
         let h = host.initialization_peak_bytes();
-        let n = quote(&input, &plan);
+        let (native, closing) = quote(&input, &plan);
+        let (ordinary, ordinary_controls) = OrdinaryPublicationPlan::fixture(
+            closing
+                .checked_mul(2)
+                .unwrap()
+                .checked_add(1)
+                .unwrap()
+                .checked_add(opening_publication_rows)
+                .unwrap(),
+        );
+        let n = native
+            .checked_add(ordinary_controls)
+            .unwrap()
+            .checked_add(capture_publication_allowance(1))
+            .unwrap();
         let mut initial = RetainedStorage::default();
         initial.include_array(&input).unwrap();
         initial.include_capture_plan(plan.clone()).unwrap();
-        let initial_bytes = initial.byte_bound().unwrap().unwrap();
-        let pool = existing_pool
-            .unwrap_or_else(|| WorkingMemoryPool::new(initial_bytes + h + n, 0).unwrap());
+        let pool =
+            existing_pool.unwrap_or_else(|| crate::memory_fixture::ledger(u64::MAX, 0).unwrap());
         let owner = NativeMemoryOwner::acquire(&pool).unwrap();
         let sources = initial.publish_unquoted(&owner).unwrap();
         drop((owner, bootstrap_owner));
         let (reservation, run) = fresh(&pool, h + n);
         let bank = run.prepare_capture_run(&reservation, host).unwrap();
-        let work = FundedWork::new(run.scope().unwrap());
+        let work = FundedWork::new_ordinary(run.scope().unwrap(), ordinary).unwrap();
         Fixture {
             pool,
             input,
@@ -281,16 +318,20 @@ mod metal {
         for root in work.roots.borrow().iter() {
             root.evaluated().unwrap();
         }
-        work.publish(RetainedStorage::default()).unwrap();
+        if !work.published.get() {
+            work.publish(work.prepare_inventory().unwrap()).unwrap();
+        }
         work.certify().unwrap();
         assert!(work.scope.borrow().is_none());
     }
-    fn reclaim(pool: &WorkingMemoryPool) -> u64 {
+    fn reclaim(pool: &MemoryLedger) -> u64 {
+        // Cached native backing remains physical storage until cache eviction.
+        safemlx::memory::clear_cache().unwrap();
         safemlx::reclaim_allocation_owners();
         crate::backend::ordinary_retirement::reclaim_all();
-        pool.used_bytes().unwrap()
+        pool.fixture_host_charge().unwrap()
     }
-    fn settled_bytes(pool: &WorkingMemoryPool, expected: u64) {
+    fn settled_bytes(pool: &MemoryLedger, expected: u64) {
         // Native allocation owners may queue their ordinary-host destruction
         // after the final graph handle drops. Observe retirement through the
         // same bounded helper as the other native session fixtures.
@@ -331,11 +372,18 @@ mod metal {
                 .prepare()
                 .unwrap();
             let before = EVALUATIONS.get();
+            let collectors = (
+                f.work.roots.borrow().capacity(),
+                f.work.publications.borrow().capacity(),
+                f.work.publications.borrow().len(),
+            );
             let tensor = f
                 .work
                 .capture_tensor(&source, step.take_tensor(0).unwrap(), &stream)
                 .unwrap();
             assert_eq!(EVALUATIONS.get(), before + 1);
+            assert_eq!((f.work.roots.borrow().capacity(), f.work.publications.borrow().capacity(), f.work.publications.borrow().len()), collectors,
+                "ordinary capture uses its paid lexical source collector without growing Work destinations");
             assert_eq!(
                 tensor.observation().data(),
                 &TensorObservationData::F32(vec![1., 4., 9., 16., 25., 36., 49., 64.])
@@ -365,7 +413,7 @@ mod metal {
             .unwrap();
             drop(step);
             retire_native(&f.work);
-            assert!(f.pool.peak_bytes().unwrap() <= f.pool.effective_capacity().unwrap());
+            assert!(f.pool.fixture_host_peak().unwrap() <= f.pool.fixture_host_limit().unwrap());
             let pool = f.pool.clone();
             let protected = f.h;
             drop((source, unrelated));

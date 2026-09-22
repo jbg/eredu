@@ -71,9 +71,40 @@ impl From<RawException> for IoError {
     }
 }
 
+/// A synchronous copy from completed native storage into caller-owned host storage.
+#[derive(Debug, PartialEq, Error)]
+pub enum CompletedReadbackError {
+    /// The cold descriptor query could not establish the retained source facts.
+    #[error(transparent)]
+    Descriptor(#[from] crate::ArrayDescriptorError),
+    /// The caller supplied a different number of logical elements.
+    #[error("completed readback destination has {found} elements, expected {expected}")]
+    DestinationLength {
+        /// Required logical element count.
+        expected: usize,
+        /// Supplied destination element count.
+        found: usize,
+    },
+    /// The completed backing or its declared layout is unavailable.
+    #[error(transparent)]
+    Source(#[from] AsSliceError),
+    /// Native serialization is held by another thread; no copy started.
+    #[error("completed readback runtime is busy")]
+    Busy,
+    /// The authenticated native backing or extent failed validation.
+    #[error("completed readback storage attribution is unavailable")]
+    Attribution,
+    /// The synchronous CUDA worker failed; its exact runtime status is retained.
+    #[error("completed CUDA readback failed with runtime status {0}")]
+    CudaStatus(i32),
+}
+
 /// A failed copy of evaluated values into caller-owned native-endian bytes.
 #[derive(Debug, PartialEq, Error)]
 pub enum NativeBytesCopyError {
+    /// A synchronous native copy failed after completion-safe return.
+    #[error(transparent)]
+    Readback(#[from] CompletedReadbackError),
     /// The destination must hold exactly the logical array's bytes.
     #[error("native byte destination has {found} bytes, expected {expected}")]
     DestinationLength {
@@ -445,6 +476,16 @@ impl Exception {
 impl From<RawException> for Exception {
     #[track_caller]
     fn from(e: RawException) -> Self {
+        if let Some(source) = PHYSICAL_BACKING_ERROR.with(|error| error.borrow_mut().take()) {
+            return Self {
+                what: e.what,
+                location: Location::caller(),
+                source: Some(ExceptionSource::Ordinary(source)),
+                tracking: e.tracking,
+                graph: e.graph,
+                scoped: None,
+            };
+        }
         Self {
             what: e.what,
             location: Location::caller(),
@@ -489,6 +530,7 @@ impl From<Exception> for String {
 }
 
 thread_local! {
+    static PHYSICAL_BACKING_ERROR: RefCell<Option<std::sync::Arc<Exception>>> = const { RefCell::new(None) };
     static CLOSURE_ERROR: Cell<Option<Exception>> = const { Cell::new(None) };
     static LAST_MLX_ERROR: RefCell<Option<RawException>> = const { RefCell::new(None) };
 }
@@ -512,6 +554,15 @@ extern "C" fn default_mlx_error_handler(msg: *const c_char, _data: *mut std::ffi
     // Same synchronous caught-exception classification, independent of Record.
     let graph = GraphMetadataFailure::from_native(unsafe {
         safemlx_sys::mlx_error_graph_metadata_failure()
+    });
+    // SAFETY: the active native catch retains this exact failed-observer node.
+    let backing = unsafe { safemlx_sys::mlx_error_physical_backing_failure() };
+    PHYSICAL_BACKING_ERROR.with(|error| {
+        error.replace(if backing.is_null() {
+            None
+        } else {
+            Some(unsafe { crate::PhysicalBackingCustody::borrowed_error(backing) })
+        })
     });
     LAST_MLX_ERROR.with(|last_error| {
         last_error.replace(Some(RawException {

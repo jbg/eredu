@@ -9,7 +9,7 @@ use eredu_nn::workspace::HostMetadataFundingError;
 use eredu_runtime::working_memory::WorkingMemoryError;
 use std::mem::{size_of, size_of_val};
 
-pub(super) fn observer(
+pub(crate) fn observer(
     plan: &AdmittedSpeculativeActivations,
     request: eredu_core::SpeculativeRequestId,
     context: SpeculativeExecutionStreams<'_>,
@@ -42,9 +42,9 @@ pub(super) fn observer(
                     Option<
                         Box<
                             dyn eredu_runtime::inspection::SpeculativeActivationObserver<
-                                MlxTensor,
-                                Error,
-                            >,
+                                    MlxTensor,
+                                    Error,
+                                >,
                         >,
                     >,
                     Error,
@@ -58,24 +58,20 @@ pub(super) fn observer(
                     eredu_runtime::working_memory::OriginalInterventionSourceError,
                 >,
             >(),
-            PreparedInterventionPlanCopy::inspection_control_bytes().ok_or(
-                Error::WorkspacePlanning(HostMetadataFundingError::Overflow),
-            )?,
-            PreparedCapturePlanCopy::inspection_control_bytes().ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?,
+            PreparedInterventionPlanCopy::inspection_control_bytes()
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
+            PreparedCapturePlanCopy::inspection_control_bytes()
+                .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?,
         ];
         let bytes = frames
             .into_iter()
             .try_fold(size_of_val(&frames), usize::checked_add)
-            .ok_or(Error::WorkspacePlanning(
-                HostMetadataFundingError::Overflow,
-            ))?;
+            .ok_or(Error::WorkspacePlanning(HostMetadataFundingError::Overflow))?;
         sources
             .metadata_funding()
             .reserve_metadata(bytes)
             .map_err(Error::WorkspacePlanning)?;
-        if context.original_embedded().is_none() {
+        if context.original_embedded().is_none() && context.original_execution().is_none() {
             return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound));
         }
         sources.validate_activations(plan)?;

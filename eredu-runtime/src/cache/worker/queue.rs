@@ -1,8 +1,8 @@
 //! One explicit finite physical FIFO for ordinary and paid worker sources.
 use super::*;
 use eredu_nn::{
+    workspace::{HostMetadataFunding, WorkspaceContext, WorkspaceMetadataError},
     Error,
-    workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding},
 };
 use std::{
     collections::VecDeque,
@@ -275,8 +275,11 @@ impl<Task, Output> PreparedCacheIoQueue<Task, Output> {
                 .sender
                 .shared
                 .state
-                .try_lock()
-                .map_err(lock_refusal)?;
+                // The idle receiver also takes this private FIFO lock before
+                // sleeping. Its critical section performs no execution or
+                // payload destruction and does not acquire either lock above.
+                .lock()
+                .map_err(|_| CacheIoRegistryRefusal::Poisoned)?;
             if !execution.is_empty()
                 || !completions.is_empty()
                 || worker.shared.active_payload.load(Ordering::Acquire)

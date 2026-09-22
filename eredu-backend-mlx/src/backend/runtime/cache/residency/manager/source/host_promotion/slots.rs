@@ -18,6 +18,7 @@ pub(crate) struct PreparedCacheHostPromotionSlots {
     capacity: u64,
     id: CacheBlockId,
     stored: bool,
+    disk_read: bool,
     manager: CacheResidencyManager,
     generation: u64,
     context: WorkspaceContext,
@@ -27,6 +28,7 @@ impl CacheBlockSourceLoan<'_> {
     pub(crate) fn prepare_declared_host_promotion(
         &self,
         declaration: &PagedHostStoreDeclaration<'_>,
+        read_layout: Option<&eredu_runtime::cache::CacheShardLayout>,
         runtime: &PreparedInputRuntime,
         additional_reservations: usize,
         context: &WorkspaceContext,
@@ -38,6 +40,7 @@ impl CacheBlockSourceLoan<'_> {
             size_of::<(
                 &Self,
                 &PagedHostStoreDeclaration<'_>,
+                Option<&eredu_runtime::cache::CacheShardLayout>,
                 &PreparedInputRuntime,
                 usize,
                 &WorkspaceContext,
@@ -54,10 +57,10 @@ impl CacheBlockSourceLoan<'_> {
                 Option<StoredCacheHostSource>,
                 Option<ReadCacheHostSource>,
             )>(),
-            if matches!(
-                self.manager().options().live_disk_policy(),
-                eredu_runtime::LiveCacheDiskPolicy::Enabled { .. }
-            ) {
+            // The actual retained file or prepared writer supplies this same
+            // read layout to the disk destination. Live-write policy does not
+            // determine whether this load needs a completed-read handoff.
+            if read_layout.is_some() {
                 DiskReadOperation::promotion_control_bytes()
                     .ok_or_else(|| fail(CacheSourceError::Overflow))?
             } else {
@@ -111,7 +114,7 @@ impl CacheBlockSourceLoan<'_> {
                                 row.phase(),
                                 CacheStoragePhase::DiskReady | CacheStoragePhase::Device
                             )
-                            && row.disk().and_then(|disk| disk.live_file()).is_some()
+                            && row.disk().and_then(|disk| disk.file_source()).is_some()
                     })
                 {
                     return Err(fail(CacheSourceError::Identity));
@@ -142,7 +145,8 @@ impl CacheBlockSourceLoan<'_> {
             .map_err(|cause| {
                 CacheSourceFailure::metadata(context.metadata_source(cause), context)
             })?;
-        let device_retirement = super::super::device_retirement::DeviceRetirement::prepare(context)?;
+        let device_retirement =
+            super::super::device_retirement::DeviceRetirement::prepare(context)?;
         Ok(PreparedCacheHostPromotionSlots {
             aliases,
             device_retirement,
@@ -154,6 +158,7 @@ impl CacheBlockSourceLoan<'_> {
             capacity,
             id: declaration.id().clone(),
             stored: declaration.requires_store(),
+            disk_read: read_layout.is_some(),
             manager: self.manager().clone(),
             generation: self.generation(),
             context: context.clone(),
@@ -192,6 +197,7 @@ impl PreparedCacheHostPromotionSlots {
             || loan.generation() != self.generation
             || (read.is_none() && self.stored != stored.is_some())
             || (read.is_some() && stored.is_some())
+            || (read.is_some() && !self.disk_read)
             || !self.context.shares_trace(proof.context())
         {
             return Err(fail(CacheSourceError::Identity));

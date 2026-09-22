@@ -6,8 +6,8 @@ use eredu_core::{SharedStorageOwner, SharedStorageRetirement};
 
 #[test]
 fn actual_published_c_mixed_typed_witness_and_source_owners_retire_concurrently() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let c = source.capacity_bytes().unwrap();
     let (r, run, q) = accept(&pool, publication_quote(&pool, &source, None));
@@ -20,7 +20,7 @@ fn actual_published_c_mixed_typed_witness_and_source_owners_retire_concurrently(
     let protected = owner.protected_host_bytes();
     let typed = source
         .try_attach_owned_nonblocking::<PublishedCaptureStorage<Key>, WorkingMemoryError>(
-            pool.shared_storage_domain(),
+            pool.shared_storage_accounting_id(),
             || panic!("actual published owner exists"),
         )
         .unwrap();
@@ -28,7 +28,7 @@ fn actual_published_c_mixed_typed_witness_and_source_owners_retire_concurrently(
     witness.validate(&pool).unwrap();
     native.certify().unwrap();
     drop((owner, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected + c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected + c);
     std::thread::scope(|scope| {
         let pool_ref = &pool;
         let a = scope.spawn(move || {
@@ -45,7 +45,7 @@ fn actual_published_c_mixed_typed_witness_and_source_owners_retire_concurrently(
         d.join().unwrap();
     });
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         protected + c,
         "escaped erased owner remains"
     );
@@ -54,14 +54,14 @@ fn actual_published_c_mixed_typed_witness_and_source_owners_retire_concurrently(
         erased.validate(&pool, &usage).unwrap();
     }
     drop(erased);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn actual_c_final_typed_and_erased_exit_race_has_one_original_retirement() {
     for _ in 0..4 {
-        let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-        let root = pool.register_storage([(1u32, 64)]).unwrap();
+        let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+        let root = pool.register_host_storage([(1u32, 64)]).unwrap();
         let source = capture_source();
         let c = source.capacity_bytes().unwrap();
         let (r, run, q) = accept(&pool, publication_quote(&pool, &source, None));
@@ -74,13 +74,13 @@ fn actual_c_final_typed_and_erased_exit_race_has_one_original_retirement() {
         let protected = owner.protected_host_bytes();
         let typed = source
             .try_attach_owned_nonblocking::<PublishedCaptureStorage<Key>, WorkingMemoryError>(
-                pool.shared_storage_domain(),
+                pool.shared_storage_accounting_id(),
                 || panic!("existing C"),
             )
             .unwrap();
         native.certify().unwrap();
         drop((owner, r, run, source, root));
-        assert_eq!(pool.used_bytes().unwrap(), protected + c);
+        assert_eq!(pool.payload_used_bytes().unwrap(), protected + c);
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
             let a = scope.spawn(|| {
@@ -95,7 +95,7 @@ fn actual_c_final_typed_and_erased_exit_race_has_one_original_retirement() {
             a.join().unwrap();
             b.join().unwrap();
         });
-        assert_eq!(pool.used_bytes().unwrap(), 0);
+        assert_eq!(pool.payload_used_bytes().unwrap(), 0);
     }
 }
 
@@ -107,12 +107,12 @@ impl SharedStorageRetirement for ForeignOwned {
 }
 #[test]
 fn actual_original_publication_rejects_wrong_owned_type_without_partial_debit() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let c = source.capacity_bytes().unwrap();
     source
-        .try_attach_owned_nonblocking(pool.shared_storage_domain(), || {
+        .try_attach_owned_nonblocking(pool.shared_storage_accounting_id(), || {
             Ok::<_, WorkingMemoryError>(SharedStorageOwner::new(ForeignOwned))
         })
         .unwrap();
@@ -132,18 +132,18 @@ fn actual_original_publication_rejects_wrong_owned_type_without_partial_debit() 
     native.certify().unwrap();
     drop((source, r, run, root));
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         before.1 + 64,
         "failed pending retains its original registered root"
     );
     drop(failure);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn actual_owned_c_rejects_raw_lookup_without_opening_an_ordinary_arc_exit() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let c = source.capacity_bytes().unwrap();
     let (r, run, q) = accept(&pool, publication_quote(&pool, &source, None));
@@ -156,34 +156,38 @@ fn actual_owned_c_rejects_raw_lookup_without_opening_an_ordinary_arc_exit() {
     let protected = owner.protected_host_bytes();
     assert!(matches!(
         source.try_attach_typed_nonblocking::<PublishedCaptureStorage<Key>, WorkingMemoryError>(
-            pool.shared_storage_domain(),
+            pool.shared_storage_accounting_id(),
             || panic!("owned type cannot become raw")
         ),
         Err(eredu_core::SharedStorageAttachmentError::AttachmentMismatch)
     ));
-    assert!(!source
-        .try_attach::<WorkingMemoryError>(pool.shared_storage_domain(), || panic!(
-            "legacy provider remains lazy"
-        ))
-        .unwrap());
+    assert!(
+        !source
+            .try_attach::<WorkingMemoryError>(pool.shared_storage_accounting_id(), || panic!(
+                "legacy provider remains lazy"
+            ))
+            .unwrap()
+    );
     native.certify().unwrap();
     drop((owner, witness, r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected + c);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected + c);
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }
 
 #[test]
 fn actual_post_c_source_failure_preserves_published_prefix_and_earlier_source_alias() {
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = capture_source();
     let earlier = source.clone();
     let c = source.capacity_bytes().unwrap();
     let (old_r, old_run, old_q) = accept(&pool, quote(&pool, &source));
-    let original_source_envelope = old_r.bytes();
+    let original_source_envelope = reservation_payload_bytes(&old_r);
     let abandoned = old_run.scope().unwrap();
-    let mut retained = abandoned.adopt_storage_individually([(51u32, 7)]).unwrap();
+    let mut retained = abandoned
+        .adopt_host_storage_individually([(51u32, 7)])
+        .unwrap();
     let pin = retained.remove(&51).unwrap();
     let q = publication_quote(&pool, &source, None)
         .with_registered_sources(pin.clone())
@@ -207,24 +211,27 @@ fn actual_post_c_source_failure_preserves_published_prefix_and_earlier_source_al
     native.certify().unwrap();
     drop((r, run, old_r, old_run, old_q, root, pin, retained, source));
     assert_eq!(
-        pool.used_bytes().unwrap(),
-        original_source_envelope + 64 + before.1 + c
+        pool.payload_used_bytes().unwrap(),
+        original_source_envelope - publication_controls() + 64 + before.1 + c
     );
     drop(failed);
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.payload_used_bytes().unwrap(),
         original_source_envelope + 64 + before.1 + c
     );
     assert_eq!(earlier.capacity_bytes(), Some(c));
     drop(earlier);
-    assert_eq!(pool.used_bytes().unwrap(), original_source_envelope + 64);
+    assert_eq!(
+        pool.payload_used_bytes().unwrap(),
+        original_source_envelope + 64
+    );
 }
 
 #[test]
 fn actual_c_key_clone_unwind_retires_constructed_prefix_outside_both_locks() {
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     struct Probe {
         pool: Weak<crate::working_memory::Pool>,
@@ -294,7 +301,7 @@ fn actual_c_key_clone_unwind_retires_constructed_prefix_outside_both_locks() {
             if let Some(source) = self.probe.source.upgrade() {
                 if matches!(
                     source.try_attach_nonblocking::<WorkingMemoryError>(
-                        &SharedStorageDomain::default(),
+                        &SharedStorageAccountingId::default(),
                         || Ok(Box::new(()))
                     ),
                     Err(eredu_core::SharedStorageAttachmentError::Busy)
@@ -304,8 +311,8 @@ fn actual_c_key_clone_unwind_retires_constructed_prefix_outside_both_locks() {
             }
         }
     }
-    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
-    let root = pool.register_storage([(1u32, 64)]).unwrap();
+    let pool = crate::working_memory::memory_fixture::host_ledger(1_000_000, 0).unwrap();
+    let root = pool.register_host_storage([(1u32, 64)]).unwrap();
     let source = Arc::new(capture_source());
     let probe = Arc::new(Probe {
         pool: Arc::downgrade(&pool.0),
@@ -350,9 +357,9 @@ fn actual_c_key_clone_unwind_retires_constructed_prefix_outside_both_locks() {
     assert_eq!(account(&pool, &r).1, protected);
     native.certify().unwrap();
     drop((r, run, root));
-    assert_eq!(pool.used_bytes().unwrap(), protected);
+    assert_eq!(pool.payload_used_bytes().unwrap(), protected);
     drop(alias);
     assert!(!probe.locked.load(Ordering::SeqCst));
     drop(source);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.payload_used_bytes().unwrap(), 0);
 }

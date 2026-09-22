@@ -13,7 +13,7 @@ fn settings(index: usize, original: bool) -> PreparedChatGenerationSettings {
     value.overrides.max_new_tokens = Some(OUTPUTS[index]);
     value.seed = SEEDS[index];
     if !original {
-        value.inference.managed_memory_capacity_bytes = None;
+        value.inference.memory_limits = eredu_core::MemoryLimitDeclarations::unlimited();
     }
     value
 }

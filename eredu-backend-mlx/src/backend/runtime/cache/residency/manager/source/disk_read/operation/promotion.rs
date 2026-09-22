@@ -11,7 +11,7 @@ use safemlx::{HostTransferDescriptor, error::Exception};
 pub(crate) struct ReadCacheHostSource {
     host: HostCacheBlock,
     completed: Finished,
-    file: LiveCacheBlockSource,
+    file: CacheFileSource,
     descriptors: [HostTransferDescriptor<4>; 2],
     id: CacheBlockId,
     manager: CacheResidencyManager,
@@ -185,7 +185,7 @@ impl DiskReadOperation {
                 if row.phase() != CacheStoragePhase::HostBacked
                     || row
                         .disk()
-                        .and_then(|disk| disk.live_file())
+                        .and_then(|disk| disk.file_source())
                         .is_none_or(|file| !file.same_source(&source.file))
                 {
                     return Err(fail(CacheSourceError::Identity));

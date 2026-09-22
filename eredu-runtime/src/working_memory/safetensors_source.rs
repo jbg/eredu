@@ -1,6 +1,6 @@
 //! Original SafeTensors source opening under one retained pool contribution.
 use super::{
-    DependencyMemoryPolicy, WorkingMemoryError, WorkingMemoryPool, gguf_source::SourceAccount,
+    DependencyMemoryPolicy, MemoryLedger, WorkingMemoryError, gguf_source::SourceAccount,
     qualified_storage,
 };
 use eredu_checkpoint::{
@@ -28,7 +28,7 @@ impl SafetensorsSourceAdmission for SourcePolicy {
         &self,
         request: SafetensorsIndexRequest,
     ) -> Result<(), Arc<dyn Error + Send + Sync>> {
-        WorkingMemoryPool::safetensors_source_index_bytes(request, self.metadata)
+        MemoryLedger::safetensors_source_index_bytes(request, self.metadata)
             .and_then(|bytes| self.account.reserve_more(bytes))
             .map_err(|error| self.refusal(error))
     }
@@ -39,9 +39,7 @@ impl SafetensorsSourceAdmission for SourcePolicy {
         self.pool
             .upgrade()
             .ok_or(WorkingMemoryError::IdentityMismatch)
-            .and_then(|pool| {
-                WorkingMemoryPool(pool).safetensors_header_admission(count, self.metadata)
-            })
+            .and_then(|pool| MemoryLedger(pool).safetensors_header_admission(count, self.metadata))
             .map_err(|error| self.refusal(error))
     }
     fn reserve_store(
@@ -152,7 +150,7 @@ impl<P: fmt::Debug> Error for OriginalArtifactInspectionError<P> {
     }
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Loading entry that installs source admission before inspection when the
     /// pool can establish it. Unknown admission before any construction retains
     /// ordinary inspection behavior. Once any contribution is accepted, every

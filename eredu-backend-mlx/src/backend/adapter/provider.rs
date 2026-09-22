@@ -2,8 +2,8 @@ use super::*;
 
 mod original_copy;
 pub(crate) use original_copy::{
-    OriginalCopyEnvironment, OriginalCopyEnvironmentError, RetainedOriginalCopyEnvironment,
-    PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError,
+    OriginalCopyEnvironment, OriginalCopyEnvironmentError, PreparedOriginalCopyEnvironment,
+    PreparedOriginalCopyEnvironmentError, RetainedOriginalCopyEnvironment,
 };
 
 /// MLX backend selected for a complete model/session.
@@ -11,7 +11,7 @@ pub struct MlxBackend<'a> {
     streams: BackendStreams,
     realized_device: Option<MlxDeviceIdentity>,
     world: Option<&'a safemlx::distributed::Group>,
-    memory_pool: eredu_runtime::working_memory::WorkingMemoryPool,
+    memory_ledger: eredu_runtime::working_memory::MemoryLedger,
 }
 
 enum BackendStreams {
@@ -28,7 +28,7 @@ impl MlxBackend<'static> {
             streams: BackendStreams::Prepared(streams),
             realized_device: Some(realized_device),
             world: None,
-            memory_pool: crate::backend::managed_memory::domain(),
+            memory_ledger: crate::backend::managed_memory::ledger(),
         }
     }
 
@@ -40,7 +40,7 @@ impl MlxBackend<'static> {
             },
             realized_device: None,
             world: None,
-            memory_pool: crate::backend::managed_memory::domain(),
+            memory_ledger: crate::backend::managed_memory::ledger(),
         }
     }
 
@@ -56,7 +56,7 @@ impl MlxBackend<'static> {
             },
             realized_device: Some(realized_device),
             world: None,
-            memory_pool: crate::backend::managed_memory::domain(),
+            memory_ledger: crate::backend::managed_memory::ledger(),
         }
     }
 }
@@ -70,7 +70,7 @@ impl<'a> MlxBackend<'a> {
             streams: BackendStreams::Prepared(streams),
             realized_device: None,
             world: Some(world),
-            memory_pool: crate::backend::managed_memory::domain(),
+            memory_ledger: crate::backend::managed_memory::ledger(),
         }
     }
 
@@ -86,7 +86,7 @@ impl<'a> MlxBackend<'a> {
             },
             realized_device: None,
             world: Some(world),
-            memory_pool: crate::backend::managed_memory::domain(),
+            memory_ledger: crate::backend::managed_memory::ledger(),
         }
     }
     #[cfg(test)]
@@ -111,7 +111,7 @@ impl<'a> MlxBackend<'a> {
     pub(crate) fn validate_original_stream_owners(&self) -> Result<(), Error> {
         match &self.streams {
             BackendStreams::Prepared(streams) => streams
-                .validate_pool(&self.memory_pool)
+                .validate_pool(&self.memory_ledger)
                 .map_err(Error::GpuStreamOwnership),
             BackendStreams::Ordinary { .. } => Err(Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
@@ -124,23 +124,23 @@ impl<'a> MlxBackend<'a> {
     ) -> Result<(), crate::backend::managed_memory::gpu_stream::MlxStreamOwnershipError> {
         use crate::backend::managed_memory::gpu_stream::MlxStreamOwnershipError;
         match &self.streams {
-            BackendStreams::Prepared(streams) => streams.observe_idle(&self.memory_pool),
+            BackendStreams::Prepared(streams) => streams.observe_idle(&self.memory_ledger),
             BackendStreams::Ordinary { .. } => Err(MlxStreamOwnershipError::Accounting(
                 eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
             )),
         }
     }
 
-    pub(crate) fn memory_pool(&self) -> &eredu_runtime::working_memory::WorkingMemoryPool {
-        &self.memory_pool
+    pub(crate) fn memory_ledger(&self) -> &eredu_runtime::working_memory::MemoryLedger {
+        &self.memory_ledger
     }
 
     #[cfg(test)]
-    pub(crate) fn with_memory_pool(
+    pub(crate) fn with_memory_ledger(
         mut self,
-        pool: eredu_runtime::working_memory::WorkingMemoryPool,
+        pool: eredu_runtime::working_memory::MemoryLedger,
     ) -> Self {
-        self.memory_pool = pool;
+        self.memory_ledger = pool;
         self
     }
 
@@ -192,7 +192,7 @@ impl<'a> MlxBackend<'a> {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         crate::backend::runtime::execution::generic::prepare_layerwise_manager(
             sources,
-            self.memory_pool(),
+            self.memory_ledger(),
             self.weights_stream(),
             self.stream(),
         )
@@ -210,7 +210,7 @@ impl<'a> MlxBackend<'a> {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         crate::backend::runtime::execution::generic::prepare_foreground_layerwise_manager(
             sources,
-            self.memory_pool(),
+            self.memory_ledger(),
             self.weights_stream(),
             self.stream(),
         )
@@ -228,7 +228,7 @@ impl<'a> MlxBackend<'a> {
         // keeping its weights until the replacement session is constructed.
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         let memory =
-            crate::backend::managed_memory::NativeMemoryOwner::acquire(self.memory_pool())?;
+            crate::backend::managed_memory::NativeMemoryOwner::acquire(self.memory_ledger())?;
         crate::backend::submission_recovery::detached_retained(memory.clone(), || {
             let distributed = self.realize_selected_communication(manifest, rank)?;
             materialize(distributed)
@@ -246,21 +246,32 @@ impl<'a> MlxBackend<'a> {
         config: &crate::composition::mlx::loading::MlxModelConfig,
     ) -> Result<PreparedModel<MlxModel>, Error> {
         let layerwise_manager = self.prepare_layerwise_source(&config.sources)?;
+        let construction_sources =
+            crate::composition::mlx::loading::PreparedNativeConstructionSources::prepare(
+                config.sources.selected().text_realization().state(),
+                layerwise_manager,
+                self.memory_ledger(),
+                self.stream(),
+            )?;
         let addressable_manager = crate::composition::mlx::loading::prepare_addressable_source(
-            &config.sources, self.memory_pool(), self.weights_stream(), self.stream())?;
+            &config.sources,
+            self.memory_ledger(),
+            self.weights_stream(),
+            self.stream(),
+        )?;
         self.materialize_after_communication(
             config.sources.selected().session_capabilities(),
             config.sources.selected().communication_manifest(),
             config.rank_context,
             |distributed| {
-                crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
+                crate::composition::mlx::loading::materialize_model_plan_with_construction_sources(
                     config.sources.clone(),
                     distributed,
                     self.stream(),
                     self.weights_stream(),
-                    layerwise_manager,
-            addressable_manager,
-        )
+                    Some(construction_sources),
+                    addressable_manager,
+                )
             },
         )
     }
@@ -305,20 +316,31 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
         let layerwise_manager = self.prepare_layerwise_source(&config.sources)?;
+        let construction_sources =
+            crate::composition::mlx::loading::PreparedNativeConstructionSources::prepare(
+                config.sources.selected().text_realization().state(),
+                layerwise_manager,
+                self.memory_ledger(),
+                self.stream(),
+            )?;
         let addressable_manager = crate::composition::mlx::loading::prepare_addressable_source(
-            &config.sources, self.memory_pool(), self.weights_stream(), self.stream())?;
+            &config.sources,
+            self.memory_ledger(),
+            self.weights_stream(),
+            self.stream(),
+        )?;
         let capabilities = config.sources.selected().session_capabilities();
         let rank = config.rank_context;
         let manifest = config.sources.selected().communication_manifest().cloned();
         self.materialize_after_communication(capabilities, manifest.as_ref(), rank, |distributed| {
-            crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
+            crate::composition::mlx::loading::materialize_model_plan_with_construction_sources(
                 config.sources,
                 distributed,
                 self.stream(),
                 self.weights_stream(),
-                layerwise_manager,
-            addressable_manager,
-        )
+                Some(construction_sources),
+                addressable_manager,
+            )
         })
     }
 
@@ -328,7 +350,23 @@ impl<'a> BackendProvider for MlxBackend<'a> {
     ) -> Result<Self::Session, Self::Error> {
         self.validate_prepared_target(model.native_target())?;
         let admitted = model.capabilities();
-        MlxModelSession::from_model(model.into_inner(), admitted)
+        let session = MlxModelSession::from_model(model.into_inner(), admitted)?;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if self
+            .memory_ledger
+            .same_ledger(&crate::backend::managed_memory::ledger())
+            && self.stream().device_type()? == safemlx::DeviceType::Gpu
+        {
+            // These shared source families are part of the initialized backend,
+            // before any request can reserve execution storage. Their exact paid
+            // owners outlive sessions; no lazy unquoted source is born mid-run.
+            crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+            crate::backend::managed_memory::input_allocator::prepare_kernel_families(
+                &self.memory_ledger,
+            )
+            .map_err(|cause| Error::Other(Box::new(cause)))?;
+        }
+        Ok(session)
     }
 
     fn session_capability_mismatch(
@@ -351,13 +389,22 @@ impl ModelLoadingBackend for MlxBackend<'_> {
     }
 
     fn inspect_model_artifact(
-        &self, path: &std::path::Path,
-    ) -> Result<eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>, eredu_core::ModelLoadError<Self::Error>> {
-        self.memory_pool().inspect_artifact_for_loading(
-            path, self.configuration_resolver(),
-            eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
-            eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
-        ).map_err(|error| eredu_core::ModelLoadError::Backend(Error::ArtifactInspection(error)))
+        &self,
+        path: &std::path::Path,
+    ) -> Result<
+        eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        eredu_core::ModelLoadError<Self::Error>,
+    > {
+        self.memory_ledger()
+            .inspect_artifact_for_loading(
+                path,
+                self.configuration_resolver(),
+                eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
+                eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+            )
+            .map_err(|error| eredu_core::ModelLoadError::Backend(Error::ArtifactInspection(error)))
     }
 
     fn select_preparation(
@@ -381,6 +428,6 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         &self,
         selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        crate::composition::mlx::loading::MlxModelConfig::new(selected, self.memory_pool())
+        crate::composition::mlx::loading::MlxModelConfig::new(selected, self.memory_ledger())
     }
 }

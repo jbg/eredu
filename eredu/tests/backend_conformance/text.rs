@@ -53,7 +53,7 @@ fn generate<F: FnMut(SemanticEvent)>(
     Ok(match method {
         0 => {
             let mut settings = settings;
-            settings.inference.managed_memory_capacity_bytes = Some(original_sources::CAPACITY);
+            settings.inference.memory_limits = crate::memory::limits(original_sources::CAPACITY);
             let mut request = PreparedChatRequest::new(chat, settings);
             request.input = input;
             request.output_mode = PreparedChatOutputMode::Text;
@@ -149,7 +149,12 @@ fn output_model(
             .unwrap()
             .unwrap();
         probe
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };
@@ -209,7 +214,7 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                             .prepare_chat(
                                 &source,
                                 &request,
-                                original_sources::CAPACITY,
+                                &crate::memory::limits(original_sources::CAPACITY),
                                 &cancellation,
                             )
                             .unwrap()
@@ -299,7 +304,12 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
                         .unwrap()
                         .unwrap();
                     model
-                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                        .prepare_chat(
+                            &source,
+                            &request,
+                            &crate::memory::limits(original_sources::CAPACITY),
+                            &cancellation,
+                        )
                         .unwrap()
                         .unwrap()
                 };
@@ -347,7 +357,12 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         };
@@ -388,7 +403,12 @@ fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() 
                         .unwrap()
                         .unwrap();
                     model
-                        .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                        .prepare_chat(
+                            &source,
+                            &request,
+                            &crate::memory::limits(original_sources::CAPACITY),
+                            &cancellation,
+                        )
                         .unwrap()
                         .unwrap()
                 };
@@ -414,23 +434,21 @@ fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() 
                 .prepare_chat(
                     &source,
                     &requested,
-                    original_sources::CAPACITY,
+                    &crate::memory::limits(original_sources::CAPACITY),
                     &cancellation,
                 )
                 .map(|prepared| prepared.expect("uncancelled preparation"));
             match required {
-                Ok(required) => assert!(
-                    generate(
-                        method,
-                        &mut model,
-                        &required,
-                        PreparedChatPrompt::Rendered,
-                        &[],
-                        Default::default(),
-                        |_| panic!("required call admitted")
-                    )
-                    .is_err()
-                ),
+                Ok(required) => assert!(generate(
+                    method,
+                    &mut model,
+                    &required,
+                    PreparedChatPrompt::Rendered,
+                    &[],
+                    Default::default(),
+                    |_| panic!("required call admitted")
+                )
+                .is_err()),
                 Err(error) => assert!(error.to_string().contains("no tools were supplied")),
             }
         }
@@ -441,16 +459,14 @@ fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() 
         };
         let cancellation = eredu_core::GenerationCancellationToken::new();
         let source = model.chat_source(false, &cancellation).unwrap().unwrap();
-        assert!(
-            model
-                .prepare_chat(
-                    &source,
-                    &requested,
-                    original_sources::CAPACITY,
-                    &cancellation
-                )
-                .is_err()
-        );
+        assert!(model
+            .prepare_chat(
+                &source,
+                &requested,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation
+            )
+            .is_err());
         let chat = {
             let request = ChatTemplateRequest {
                 enable_thinking: Some(true),
@@ -463,22 +479,25 @@ fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() 
                 .unwrap()
                 .unwrap();
             model
-                .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+                .prepare_chat(
+                    &source,
+                    &request,
+                    &crate::memory::limits(original_sources::CAPACITY),
+                    &cancellation,
+                )
                 .unwrap()
                 .unwrap()
         };
-        assert!(
-            generate(
-                method,
-                &mut model,
-                &chat,
-                PreparedChatPrompt::Rendered,
-                &[],
-                Default::default(),
-                |_| {}
-            )
-            .is_ok()
-        );
+        assert!(generate(
+            method,
+            &mut model,
+            &chat,
+            PreparedChatPrompt::Rendered,
+            &[],
+            Default::default(),
+            |_| {}
+        )
+        .is_ok());
     }
 }
 
@@ -493,7 +512,12 @@ fn unrecognized_templates_still_require_explicit_text_generation() {
             .unwrap()
             .unwrap();
         model
-            .prepare_chat(&source, &request, original_sources::CAPACITY, &cancellation)
+            .prepare_chat(
+                &source,
+                &request,
+                &crate::memory::limits(original_sources::CAPACITY),
+                &cancellation,
+            )
             .unwrap()
             .unwrap()
     };

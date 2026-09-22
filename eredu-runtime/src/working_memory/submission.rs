@@ -5,8 +5,8 @@
 use crate::SubmissionBackend;
 use eredu_core::{BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion};
 use eredu_nn::{
-    workspace::{WorkspaceBackend, WorkspaceContext, WorkspaceTensor},
     Error,
+    workspace::{WorkspaceBackend, WorkspaceContext, WorkspaceTensor},
 };
 
 /// Completion of synchronous metadata recording, tied to its exact trace.
@@ -20,8 +20,14 @@ pub struct WorkspaceCompletion {
 
 impl WorkspaceCompletion {
     pub(super) fn recorded(context: &WorkspaceContext) -> Result<Self, Error> {
-        context.charge_metadata(std::mem::size_of::<(Self, Result<Self, Error>, &WorkspaceContext)>())?;
-        Ok(Self { context: context.clone() })
+        context.charge_metadata(std::mem::size_of::<(
+            Self,
+            Result<Self, Error>,
+            &WorkspaceContext,
+        )>())?;
+        Ok(Self {
+            context: context.clone(),
+        })
     }
 }
 
@@ -51,10 +57,13 @@ impl SubmissionBackend for WorkspaceBackend {
         count: usize,
     ) -> Result<Vec<WorkspaceContext>, Error> {
         executor.charge_metadata(std::mem::size_of::<(
-            &WorkspaceContext, usize, Vec<WorkspaceContext>, Result<Vec<WorkspaceContext>,Error>,
+            &WorkspaceContext,
+            usize,
+            Vec<WorkspaceContext>,
+            Result<Vec<WorkspaceContext>, Error>,
         )>())?;
-        let mut values=executor.metadata_vec(count)?;
-        values.resize_with(count,||executor.clone());
+        let mut values = executor.metadata_vec(count)?;
+        values.resize_with(count, || executor.clone());
         Ok(values)
     }
 
@@ -96,7 +105,7 @@ impl SubmissionBackend for WorkspaceBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_nn::{workspace::*, Tensor};
+    use eredu_nn::{Tensor, workspace::*};
 
     // Submission tests begin with resident input storage. Their spans cover
     // the issued equations and completion, not parameter construction.

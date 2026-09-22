@@ -1,6 +1,14 @@
 #[test]
 fn retained_prediction_storage_covers_family_owners_and_unloaded_replacements() {
+    use eredu_core::{
+        capture::CaptureUsage,
+        parameters::{ParameterBackend, ParameterRegion},
+    };
     use eredu_runtime::parameter_operations::PreparedParameterLocation;
+    if !crate::tests::support::native_process::enter("prepared prediction parameter storage") {
+        return;
+    }
+    let physical = crate::tests::support::test_utils::initialize_original_sources();
 
     fn write_nonzero_inkling(path: &Path) {
         write_inkling_mtp_fixture(path);
@@ -48,33 +56,52 @@ fn retained_prediction_storage_covers_family_owners_and_unloaded_replacements() 
         }),
         ("nemotron", write_nemotron_mtp_fixture),
     ];
-    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let backend = crate::native::backend(&stream, &stream);
-    let host = eredu_runtime::LayerwiseLoadOptions::new(
-        eredu_core::residency::OffloadConfig::new(Some(1 << 26), Some(1 << 26), 1).unwrap(),
-    );
     for (family, write) in fixtures {
-        for residency in [
-            eredu_runtime::WeightResidency::fully_resident(),
-            eredu_runtime::WeightResidency::layerwise_host(host),
-            eredu_runtime::WeightResidency::dense_disk_stream(Default::default()),
-        ] {
-            let label = format!("{family} {residency:?}");
+        for residency in 0..3 {
+            let label = format!("{family} residency={residency}");
             eprintln!("checking {label}");
             let root = tempfile::tempdir().unwrap();
             let checkpoint = root.path().join("checkpoint");
             std::fs::create_dir(&checkpoint).unwrap();
             write(&checkpoint);
-            let request = MlxLoadRequest::from_normalized(
-                eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(residency),
-            );
-            let model = load_model(&backend, &checkpoint, request)
-                .unwrap_or_else(|error| panic!("{label}: {error}"))
-                .into_inner();
-            let mut executable = model.into_executable();
-            let target = executable.erased_mut();
+            let placement = match residency {
+                0 => eredu_core::ResidencyPlan::FullyResident,
+                1 => eredu_core::ResidencyPlan::LayerwiseHost {
+                    device_layer_window: 1,
+                    device_budget_bytes: Some(1 << 30),
+                    host_budget_bytes: Some(1 << 30),
+                },
+                2 => eredu_core::ResidencyPlan::DenseDiskStream {
+                    device_budget_bytes: 1 << 30,
+                    host_budget_bytes: 0,
+                    host_lookahead: 0,
+                    background_queue: 0,
+                },
+                _ => unreachable!(),
+            };
+            let plan = eredu_core::ExecutionPlan::fully_resident(
+                eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap(),
+            )
+            .with_residency(placement)
+            .with_drafting(eredu_core::DraftingPlan::Embedded {
+                max_draft_tokens: 1,
+                lookahead: false,
+                adaptive_lookahead: false,
+            });
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact_with_prepared_gguf_headers(
+                    &checkpoint,
+                )
+                .unwrap();
+            let factory = crate::MlxBackendFactory::default();
+            let selected =
+                eredu_core::select_execution_plan_target(&factory, &plan, inspection).unwrap();
+            let target =
+                eredu_core::realize_execution_plan_target(&factory, &plan, selected).unwrap();
+            let mut runtime = target.into_runtime().unwrap();
+            let target = runtime.session().original_model_source().unwrap().erased();
             assert!(target.has_embedded_prediction(), "{label}");
-            let slot = target
+            let key = target
                 .prepared_parameter_slots()
                 .iter()
                 .find(|slot| {
@@ -82,197 +109,252 @@ fn retained_prediction_storage_covers_family_owners_and_unloaded_replacements() 
                         && slot.parameter.id.as_str().ends_with("weight")
                         && !slot.parameter.id.as_str().contains("norm")
                 })
-                .expect("prediction projection parameter");
-            let key = slot.parameter.id.as_str().to_owned();
-            let location = slot.location.clone();
-            struct Read<'a> {
-                key: &'a str,
-                value: Option<MlxTensor>,
-            }
-            impl eredu_nn::ParameterSlotVisitor<MlxTensor> for Read<'_> {
-                fn visit_slot(
-                    &mut self,
-                    metadata: eredu_nn::ParameterMetadataView<'_>,
-                    value: &MlxTensor,
-                ) {
-                    if metadata.id().as_str() == self.key {
-                        self.value = Some(value.clone());
-                    }
-                }
-            }
-            let mut read = Read {
-                key: &key,
-                value: None,
+                .expect("prediction projection parameter")
+                .parameter
+                .id
+                .as_str()
+                .to_owned();
+            let discovery = MlxBackend::parameter_discovery(&mut runtime).unwrap();
+            let row = discovery
+                .parameters
+                .iter()
+                .find(|row| row.id == key)
+                .unwrap();
+            let region = ParameterRegion {
+                starts: vec![0; row.shape.len()],
+                shape: row.shape.clone(),
             };
-            assert!(target
-                .with_parameter_slots(
-                    &location,
-                    &std::collections::BTreeSet::from([key.clone()]),
-                    &mut |visit| {
-                        visit(&mut read);
-                        Ok(())
-                    },
-                    &stream,
-                )
-                .unwrap());
-            let original = read.value.unwrap();
-            assert!(
-                original
-                    .as_array()
-                    .evaluated()
-                    .unwrap()
-                    .as_slice::<f32>()
-                    .iter()
-                    .any(|v| *v != 0.),
-                "{label}: loan must bind nonzero checkpoint parameter {key}"
-            );
-            let replacement = MlxTensor::from_array(Array::from_slice(
-                &vec![1.25f32; original.as_array().size()],
-                original.as_array().shape(),
-            ));
-            let replacement_bytes = replacement
-                .as_array()
-                .allocation_info()
-                .unwrap()
-                .unwrap()
-                .bytes() as u64;
-            let reads = target
-                .residency_report()
-                .unwrap()
-                .unwrap()
-                .weight_store()
-                .physical_reads;
-            std::fs::rename(&checkpoint, root.path().join("moved")).unwrap();
-            let before = target.retained_prediction_storage().unwrap();
-            let bytes = before
-                .byte_bound()
-                .unwrap()
-                .unwrap_or_else(|| panic!("{label}: {before:?}"));
-            assert!(bytes > 0, "{label}");
-            let mut combined = target.retained_target_storage().unwrap();
-            combined
-                .merge(target.retained_prediction_storage().unwrap())
-                .unwrap();
-            let combined_bytes = combined
-                .byte_bound()
-                .unwrap()
-                .unwrap_or_else(|| panic!("{label}: {combined:?}"));
-            combined
-                .merge(target.retained_prediction_storage().unwrap())
-                .unwrap();
-            assert_eq!(
-                combined.byte_bound().unwrap(),
-                Some(combined_bytes),
-                "{label}: aliases count once"
-            );
-            let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(
-                combined_bytes + replacement_bytes,
-                0,
+            let limits = CaptureUsage {
+                captures: u64::MAX,
+                retained_bytes: u64::MAX,
+                host_bytes: u64::MAX,
+                encoded_bytes: u64::MAX,
+            };
+            let queried = MlxBackend::query_parameter(
+                &mut runtime,
+                &discovery.identity,
+                &key,
+                region,
+                limits,
             )
-            .unwrap();
-            let target_charge = target
-                .retained_target_storage()
-                .unwrap()
-                .register(&pool)
+            .unwrap_or_else(|cause| panic!("{label} {key}: {cause:#?}"));
+            assert!(
+                queried.values.iter().any(|&value| value != 0.),
+                "{label}: nonzero source loan"
+            );
+            let alias = queried.clone();
+            let shape = queried
+                .region
+                .shape
+                .iter()
+                .map(|&n| i32::try_from(n).unwrap())
+                .collect::<Vec<_>>();
+            let original = MlxTensor::from_array(Array::from_slice(&queried.values, &shape));
+            drop(queried);
+            assert!(alias.values.iter().any(|&value| value != 0.));
+            let (backend, session) = runtime.parts_mut();
+            let stream = backend.stream();
+            let funding = physical
+                .prepare_workspace_metadata(
+                    session
+                        .original_model_source()
+                        .unwrap()
+                        .erased()
+                        .inference_execution_identity(),
+                    physical.configured_limits().clone(),
+                )
                 .unwrap();
-            let prediction_charge = target
-                .retained_prediction_storage()
-                .unwrap()
-                .register(&pool)
-                .unwrap();
-            assert_eq!(
-                pool.used_bytes().unwrap(),
+            let (
+                after,
+                combined,
+                unknown,
+                lazy,
+                replacement,
+                replacement_charge,
+                prediction_charge,
+                target_charge,
+                pool,
+                bytes,
                 combined_bytes,
-                "{label}: separate target and prediction registrations share physical charges"
-            );
-            assert!(target
-                .publish_parameter_replacements(
-                    &std::collections::BTreeMap::from([(key.clone(), replacement.clone())]),
-                    true,
-                )
-                .unwrap());
-            let mut combined_after = target.retained_target_storage().unwrap();
-            combined_after
-                .merge(target.retained_prediction_storage().unwrap())
+                replacement_bytes,
+                combined_physical,
+                replacement_physical,
+            ) = session
+                .with_model_operation_funded(funding, |executable| {
+                    let target = executable.erased_mut();
+                    let replacement = MlxTensor::from_array(Array::from_slice(
+                        &vec![1.25f32; original.as_array().size()],
+                        original.as_array().shape(),
+                    ));
+                    let replacement_facts =
+                        replacement.as_array().allocation_info().unwrap().unwrap();
+                    let replacement_bytes = u64::try_from(replacement_facts.bytes()).unwrap();
+                    let replacement_physical = replacement_bytes
+                        .checked_add(u64::try_from(replacement_facts.host_control_bytes()).unwrap())
+                        .unwrap();
+                    let reads = target
+                        .residency_report()
+                        .unwrap()
+                        .unwrap()
+                        .weight_store()
+                        .physical_reads;
+                    std::fs::rename(&checkpoint, root.path().join("moved")).unwrap();
+                    let before = target.retained_prediction_storage().unwrap();
+                    let bytes = before
+                        .byte_bound()
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("{label}: {before:?}"));
+                    assert!(bytes > 0, "{label}");
+                    let mut combined = target.retained_target_storage().unwrap();
+                    combined
+                        .merge(target.retained_prediction_storage().unwrap())
+                        .unwrap();
+                    let combined_bytes = combined
+                        .byte_bound()
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("{label}: {combined:?}"));
+                    combined
+                        .merge(target.retained_prediction_storage().unwrap())
+                        .unwrap();
+                    assert_eq!(
+                        combined.byte_bound().unwrap(),
+                        Some(combined_bytes),
+                        "{label}: aliases count once"
+                    );
+                    // This ownership fixture includes publication and native
+                    // controls in a finite physical ceiling. Exact-fit refusal
+                    // is covered by the domain admission conformance matrix.
+                    let pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+                    let target_charge = target
+                        .retained_target_storage()
+                        .unwrap()
+                        .register(&pool)
+                        .unwrap();
+                    let prediction_charge = target
+                        .retained_prediction_storage()
+                        .unwrap()
+                        .register(&pool)
+                        .unwrap();
+                    let separate_charge = pool.fixture_host_charge().unwrap();
+                    let mut union = target.retained_target_storage().unwrap();
+                    union
+                        .merge(target.retained_prediction_storage().unwrap())
+                        .unwrap();
+                    let union = union.register(&pool).unwrap();
+                    let combined_physical = union.bytes().unwrap();
+                    assert_eq!(
+                        separate_charge, combined_physical,
+                        "{label}: separate inventories share backing and native controls"
+                    );
+                    assert_eq!(
+                        pool.fixture_host_charge().unwrap(),
+                        combined_physical,
+                        "{label}: registering the complete union adds no physical charge"
+                    );
+                    assert!(combined_physical >= combined_bytes);
+                    drop(union);
+                    crate::backend::ordinary_retirement::reclaim_all();
+                    crate::memory_fixture::publish_model_parameters(
+                        target,
+                        [(key.clone(), replacement.clone())],
+                        true,
+                    );
+                    let mut combined_after = target.retained_target_storage().unwrap();
+                    combined_after
+                        .merge(target.retained_prediction_storage().unwrap())
+                        .unwrap();
+                    assert_eq!(
+                        combined_after.byte_bound().unwrap(),
+                        Some(combined_bytes + replacement_bytes),
+                        "{label}: target and prediction share the replacement owner"
+                    );
+                    let replacement_charge = combined_after.register(&pool).unwrap();
+                    assert_eq!(
+                        pool.fixture_host_charge().unwrap(),
+                        combined_physical + replacement_physical
+                    );
+                    let mut after = target.retained_prediction_storage().unwrap();
+                    assert_eq!(
+                        after.byte_bound().unwrap(),
+                        Some(bytes + replacement_bytes),
+                        "{label}: unloaded replacement retained"
+                    );
+                    after.include_array(replacement.as_array()).unwrap();
+                    assert_eq!(
+                        after.byte_bound().unwrap(),
+                        Some(bytes + replacement_bytes),
+                        "{label}: replacement alias"
+                    );
+                    let lazy = replacement.as_array().square(&stream).unwrap();
+                    crate::memory_fixture::publish_model_parameters(
+                        target,
+                        [(key.clone(), MlxTensor::from_array(lazy.clone()))],
+                        true,
+                    );
+                    let unknown = target.retained_prediction_storage().unwrap();
+                    assert!(target
+                        .retained_prediction_storage()
+                        .unwrap()
+                        .register(&pool)
+                        .is_err());
+                    assert_eq!(
+                        pool.fixture_host_charge().unwrap(),
+                        combined_physical + replacement_physical
+                    );
+                    assert_eq!(
+                        unknown.byte_bound().unwrap(),
+                        None,
+                        "{label}: unevaluated override is unknown"
+                    );
+                    assert_eq!(
+                        lazy.allocation_info().unwrap(),
+                        None,
+                        "{label}: inspection cannot evaluate"
+                    );
+                    crate::memory_fixture::publish_model_parameters(
+                        target,
+                        [(key, original)],
+                        false,
+                    );
+                    assert_eq!(
+                        target
+                            .retained_prediction_storage()
+                            .unwrap()
+                            .byte_bound()
+                            .unwrap(),
+                        Some(bytes),
+                        "{label}: original owners restored"
+                    );
+                    assert_eq!(
+                        target
+                            .residency_report()
+                            .unwrap()
+                            .unwrap()
+                            .weight_store()
+                            .physical_reads,
+                        reads,
+                        "{label}: no hidden checkpoint reads"
+                    );
+                    drop(before);
+                    Ok((
+                        after,
+                        combined,
+                        unknown,
+                        lazy,
+                        replacement,
+                        replacement_charge,
+                        prediction_charge,
+                        target_charge,
+                        pool,
+                        bytes,
+                        combined_bytes,
+                        replacement_bytes,
+                        combined_physical,
+                        replacement_physical,
+                    ))
+                })
                 .unwrap();
-            assert_eq!(
-                combined_after.byte_bound().unwrap(),
-                Some(combined_bytes + replacement_bytes),
-                "{label}: target and prediction share the replacement owner"
-            );
-            let replacement_charge = combined_after.register(&pool).unwrap();
-            assert_eq!(
-                pool.used_bytes().unwrap(),
-                combined_bytes + replacement_bytes
-            );
-            let mut after = target.retained_prediction_storage().unwrap();
-            assert_eq!(
-                after.byte_bound().unwrap(),
-                Some(bytes + replacement_bytes),
-                "{label}: unloaded replacement retained"
-            );
-            after.include_array(replacement.as_array()).unwrap();
-            assert_eq!(
-                after.byte_bound().unwrap(),
-                Some(bytes + replacement_bytes),
-                "{label}: replacement alias"
-            );
-            let lazy = replacement.as_array().square(&stream).unwrap();
-            assert!(target
-                .publish_parameter_replacements(
-                    &std::collections::BTreeMap::from([(
-                        key.clone(),
-                        MlxTensor::from_array(lazy.clone())
-                    )]),
-                    true,
-                )
-                .unwrap());
-            let unknown = target.retained_prediction_storage().unwrap();
-            assert!(target
-                .retained_prediction_storage()
-                .unwrap()
-                .register(&pool)
-                .is_err());
-            assert_eq!(
-                pool.used_bytes().unwrap(),
-                combined_bytes + replacement_bytes
-            );
-            assert_eq!(
-                unknown.byte_bound().unwrap(),
-                None,
-                "{label}: unevaluated override is unknown"
-            );
-            assert_eq!(
-                lazy.allocation_info().unwrap(),
-                None,
-                "{label}: inspection cannot evaluate"
-            );
-            assert!(target
-                .publish_parameter_replacements(
-                    &std::collections::BTreeMap::from([(key, original)]),
-                    false,
-                )
-                .unwrap());
-            assert_eq!(
-                target
-                    .retained_prediction_storage()
-                    .unwrap()
-                    .byte_bound()
-                    .unwrap(),
-                Some(bytes),
-                "{label}: original owners restored"
-            );
-            assert_eq!(
-                target
-                    .residency_report()
-                    .unwrap()
-                    .unwrap()
-                    .weight_store()
-                    .physical_reads,
-                reads,
-                "{label}: no hidden checkpoint reads"
-            );
-            drop(executable);
+            drop(runtime);
             drop(replacement);
             assert_eq!(
                 after.byte_bound().unwrap(),
@@ -280,22 +362,31 @@ fn retained_prediction_storage_covers_family_owners_and_unloaded_replacements() 
                 "{label}: snapshot retains physical owners"
             );
             assert_eq!(unknown.byte_bound().unwrap(), None);
-            drop((before, after, combined, unknown, lazy));
-            assert_eq!(pool.used_bytes().unwrap(), combined_bytes + replacement_bytes,
+            drop((after, combined, unknown, lazy));
+            assert_eq!(pool.fixture_host_charge().unwrap(), combined_physical + replacement_physical,
                 "{label}: registrations retain their physical inventories after executable destruction");
+            let peak = pool.fixture_host_peak().unwrap();
+            assert!(
+                peak > combined_physical + replacement_physical,
+                "{label}: historical peak includes publication bookkeeping"
+            );
             drop(replacement_charge);
             crate::backend::ordinary_retirement::reclaim_all();
-            assert_eq!(pool.used_bytes().unwrap(), combined_bytes);
+            assert_eq!(pool.fixture_host_charge().unwrap(), combined_physical);
             drop(prediction_charge);
             crate::backend::ordinary_retirement::reclaim_all();
-            assert_eq!(pool.used_bytes().unwrap(), target_charge.bytes());
+            assert_eq!(
+                pool.fixture_host_charge().unwrap(),
+                target_charge.bytes().unwrap()
+            );
             drop(target_charge);
             crate::backend::ordinary_retirement::reclaim_all();
-            assert_eq!(pool.used_bytes().unwrap(), 0);
-            assert_eq!(
-                pool.peak_bytes().unwrap(),
-                combined_bytes + replacement_bytes
-            );
+            assert_eq!(pool.fixture_host_charge().unwrap(), 0);
+            assert_eq!(pool.fixture_host_peak().unwrap(), peak);
         }
     }
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

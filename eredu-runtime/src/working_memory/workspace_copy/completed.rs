@@ -1,7 +1,7 @@
-//! Completed original allocation sources for the existing isolated-copy worker.
+//! Completed original allocation sources for workspace bindings and copies.
 use super::super::{
-    OriginalSpeculativeBudgetCustody, OriginalSpeculativeNumericalBudgetCustody, Usage,
-    qualified_storage,
+    OriginalNumericalBudgetCustody, OriginalSpeculativeBudgetCustody,
+    OriginalSpeculativeNumericalBudgetCustody, Usage, qualified_storage,
 };
 use super::*;
 use eredu_core::HostPreparationAuthority;
@@ -12,18 +12,25 @@ use std::{
 };
 
 /// One actual completed allocation account. The tag preserves the original
-/// model invocation or numerical phase; neither can impersonate the other.
+/// model invocation, numerical phase, or standalone operation. None can
+/// impersonate another source role.
 #[derive(Debug, Clone)]
 pub enum CompletedWorkspaceSourceAccount {
     /// Exact completed model-role allocation custody.
     Model(OriginalSpeculativeBudgetCustody),
     /// Exact completed numerical-phase allocation custody.
     Numerical(OriginalSpeculativeNumericalBudgetCustody),
+    /// Completed standalone numerical work; this carries no speculative role.
+    Standalone(OriginalNumericalBudgetCustody),
 }
 impl CompletedWorkspaceSourceAccount {
-    /// Borrow the existing request-bound provenance, without issuing a role.
+    /// Borrow original provenance without issuing a role. Standalone sources
+    /// never belong to a speculative request.
     pub fn source(&self) -> crate::working_memory::SpeculativeNumericalSource<'_> {
         match self {
+            Self::Standalone(value) => {
+                crate::working_memory::SpeculativeNumericalSource::Standalone(value)
+            }
             Self::Model(value) => crate::working_memory::SpeculativeNumericalSource::Model(value),
             Self::Numerical(value) => {
                 crate::working_memory::SpeculativeNumericalSource::Numerical(value)
@@ -33,29 +40,40 @@ impl CompletedWorkspaceSourceAccount {
     /// Exact account equality; sharing a request or pool is insufficient.
     pub fn same_account(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Standalone(a), Self::Standalone(b)) => a.same_account(b),
             (Self::Model(a), Self::Model(b)) => a.same_account(b),
             (Self::Numerical(a), Self::Numerical(b)) => a.same_account(b),
             _ => false,
         }
     }
-    fn pool(&self) -> &WorkingMemoryPool {
+    fn pool(&self) -> &MemoryLedger {
         match self {
+            Self::Standalone(a) => a.pool(),
             Self::Model(a) => a.pool(),
             Self::Numerical(a) => a.pool(),
         }
     }
-    fn physical_bytes(&self) -> u64 {
+    fn validate_roots<'a>(
+        &self,
+        roots: impl Iterator<Item = &'a WorkspaceExistingStorage> + Clone,
+    ) -> Result<(), WorkingMemoryError> {
         match self {
-            Self::Model(a) => a.physical_bytes(),
-            Self::Numerical(a) => a.physical_bytes(),
+            Self::Standalone(account) => account.validate_completed_roots(roots),
+            Self::Model(account) => {
+                validate_capacity(roots, account.physical_bytes(), account.placement())
+            }
+            Self::Numerical(account) => {
+                validate_capacity(roots, account.physical_bytes(), account.placement())
+            }
         }
     }
     fn validate_copy_source(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         match self {
+            Self::Standalone(a) => a.validate_copy_source(pool, usage),
             Self::Model(a) => a.validate_copy_source(pool, usage),
             Self::Numerical(a) => a.validate_copy_source(pool, usage),
         }
@@ -67,31 +85,61 @@ impl From<OriginalSpeculativeBudgetCustody> for CompletedWorkspaceSourceAccount 
     }
 }
 trait AccountInput: Into<CompletedWorkspaceSourceAccount> {
-    fn pool(&self) -> &WorkingMemoryPool;
+    fn pool(&self) -> &MemoryLedger;
     fn same_account(&self, other: &Self) -> bool;
-    fn physical_bytes(&self) -> u64;
+    fn validate_roots<'a>(
+        &self,
+        roots: impl Iterator<Item = &'a WorkspaceExistingStorage> + Clone,
+    ) -> Result<(), WorkingMemoryError>;
 }
 impl AccountInput for OriginalSpeculativeBudgetCustody {
-    fn pool(&self) -> &WorkingMemoryPool {
+    fn pool(&self) -> &MemoryLedger {
         self.pool()
     }
     fn same_account(&self, other: &Self) -> bool {
         self.same_account(other)
     }
-    fn physical_bytes(&self) -> u64 {
-        self.physical_bytes()
+    fn validate_roots<'a>(
+        &self,
+        roots: impl Iterator<Item = &'a WorkspaceExistingStorage> + Clone,
+    ) -> Result<(), WorkingMemoryError> {
+        validate_capacity(roots, self.physical_bytes(), self.placement())
     }
 }
 impl AccountInput for CompletedWorkspaceSourceAccount {
-    fn pool(&self) -> &WorkingMemoryPool {
+    fn pool(&self) -> &MemoryLedger {
         self.pool()
     }
     fn same_account(&self, other: &Self) -> bool {
         self.same_account(other)
     }
-    fn physical_bytes(&self) -> u64 {
-        self.physical_bytes()
+    fn validate_roots<'a>(
+        &self,
+        roots: impl Iterator<Item = &'a WorkspaceExistingStorage> + Clone,
+    ) -> Result<(), WorkingMemoryError> {
+        self.validate_roots(roots)
     }
+}
+
+fn validate_capacity<'a>(
+    mut roots: impl Iterator<Item = &'a WorkspaceExistingStorage>,
+    capacity: u64,
+    placement: &eredu_core::MemoryPlacement,
+) -> Result<(), WorkingMemoryError> {
+    let total = roots.try_fold(0u64, |sum, root| {
+        if root.placement() != Some(placement) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        sum.checked_add(
+            root.capacity_bytes()
+                .ok_or(WorkingMemoryError::UnknownBound)?,
+        )
+        .ok_or(WorkingMemoryError::Overflow)
+    })?;
+    if total > capacity {
+        return Err(WorkingMemoryError::IdentityMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -103,10 +151,12 @@ struct AccountSources {
 // Erasing its concrete Arc stops account/pool/pin auto-trait expansion at the
 // closed custody boundary. The compiler checks the concrete Send + Sync proof
 // where that same Arc is unsized after all source checks have passed.
-pub(in crate::working_memory) trait CompletedAccountCustody: std::fmt::Debug + Send + Sync {
+pub(in crate::working_memory) trait CompletedAccountCustody:
+    std::fmt::Debug + Send + Sync
+{
     fn host(&self) -> &HostPreparationAuthority;
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError>;
-    fn matches_pool(&self, pool: &WorkingMemoryPool) -> bool;
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError>;
+    fn matches_pool(&self, pool: &MemoryLedger) -> bool;
     // Recover the concrete Arc before retirement so its shell dies before the
     // vector, account aliases and host authority that paid their storage.
     fn retire(self: Arc<Self>);
@@ -115,14 +165,16 @@ impl CompletedAccountCustody for AccountSources {
     fn host(&self) -> &HostPreparationAuthority {
         &self.host
     }
-    fn validate(&self, pool: &WorkingMemoryPool, usage: &Usage) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger, usage: &Usage) -> Result<(), WorkingMemoryError> {
         for account in &self.accounts {
             account.validate_copy_source(pool, usage)?;
         }
         Ok(())
     }
-    fn matches_pool(&self, pool: &WorkingMemoryPool) -> bool {
-        self.accounts.iter().all(|account| account.pool().same_domain(pool))
+    fn matches_pool(&self, pool: &MemoryLedger) -> bool {
+        self.accounts
+            .iter()
+            .all(|account| account.pool().same_ledger(pool))
     }
     fn retire(self: Arc<Self>) {
         drop(Arc::into_inner(self));
@@ -165,7 +217,7 @@ impl CompletedSourceCustody {
     }
     pub(in crate::working_memory) fn validate(
         &self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         usage: &Usage,
     ) -> Result<(), WorkingMemoryError> {
         match self {
@@ -176,9 +228,9 @@ impl CompletedSourceCustody {
                 .validate(pool, usage),
         }
     }
-    fn matches_pool(&self, pool: &WorkingMemoryPool) -> bool {
+    pub(in crate::working_memory) fn matches_pool(&self, pool: &MemoryLedger) -> bool {
         match self {
-            Self::Numerical { account, .. } => account.pool().same_domain(pool),
+            Self::Numerical { account, .. } => account.pool().same_ledger(pool),
             Self::Accounts(owner) => owner
                 .as_deref()
                 .expect("live completed sources")
@@ -192,8 +244,8 @@ impl CompletedSourceCustody {
 /// budget after successful completion. This creates no registry row or grant.
 #[derive(Debug)]
 pub struct OriginalCompletedWorkspaceSource {
-    roots: WorkspaceBorrowedStorage,
-    custody: CompletedSourceCustody,
+    pub(in crate::working_memory) roots: WorkspaceBorrowedStorage,
+    pub(in crate::working_memory) custody: CompletedSourceCustody,
 }
 impl OriginalCompletedWorkspaceSource {
     pub(super) fn numerical(
@@ -201,12 +253,14 @@ impl OriginalCompletedWorkspaceSource {
         account: OriginalSpeculativeNumericalBudgetCustody,
         host: HostPreparationAuthority,
     ) -> Result<Self, WorkingMemoryError> {
-        if host.is_unmanaged()
-            || roots.roots().is_empty()
-            || roots.total_bytes() > account.physical_bytes()
-        {
+        if host.is_unmanaged() || roots.roots().is_empty() {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
+        validate_capacity(
+            roots.roots().iter(),
+            account.physical_bytes(),
+            account.placement(),
+        )?;
         Ok(Self {
             roots: roots.clone(),
             custody: CompletedSourceCustody::Numerical { account, host },
@@ -256,8 +310,8 @@ impl CompletedWorkspaceSourceLayout {
             size_of::<Arc<dyn CompletedAccountCustody>>(),
             size_of::<Option<Arc<dyn CompletedAccountCustody>>>(),
             size_of::<&dyn CompletedAccountCustody>(),
-            size_of::<(&dyn CompletedAccountCustody, &WorkingMemoryPool, &Usage)>(),
-            size_of::<(&dyn CompletedAccountCustody, &WorkingMemoryPool)>(),
+            size_of::<(&dyn CompletedAccountCustody, &MemoryLedger, &Usage)>(),
+            size_of::<(&dyn CompletedAccountCustody, &MemoryLedger)>(),
             size_of::<&HostPreparationAuthority>(),
             size_of::<std::slice::Iter<'_, CompletedWorkspaceSourceAccount>>(),
             size_of::<Result<(), WorkingMemoryError>>(),
@@ -265,26 +319,31 @@ impl CompletedWorkspaceSourceLayout {
             size_of::<OriginalCompletedWorkspaceSource>(),
             size_of::<Result<OriginalCompletedWorkspaceSource, WorkingMemoryError>>(),
             size_of::<Vec<(WorkspaceExistingStorage, A)>>(),
-            size_of::<
-                std::vec::IntoIter<(WorkspaceExistingStorage, A)>,
-            >(),
+            size_of::<std::vec::IntoIter<(WorkspaceExistingStorage, A)>>(),
             size_of::<(usize, usize, u64)>(),
-            size_of::<A>(), size_of::<CompletedWorkspaceSourceAccount>(),
+            size_of::<A>(),
+            size_of::<CompletedWorkspaceSourceAccount>(),
             size_of::<(&A, &A)>(),
-            size_of::<(&CompletedWorkspaceSourceAccount, &CompletedWorkspaceSourceAccount)>(),
+            size_of::<(
+                &CompletedWorkspaceSourceAccount,
+                &CompletedWorkspaceSourceAccount,
+            )>(),
             size_of::<bool>(),
             size_of::<HostPreparationAuthority>(),
             size_of::<Result<Self, WorkingMemoryError>>(),
             size_of::<(&WorkspaceContext, &HostPreparationAuthority)>(),
-            size_of::<
-                std::slice::Iter<'_, (WorkspaceExistingStorage, A)>,
-            >(),
+            size_of::<std::slice::Iter<'_, (WorkspaceExistingStorage, A)>>(),
             size_of::<Result<u64, WorkingMemoryError>>(),
         ];
-        let bytes = parts.into_iter()
-        .try_fold(size_of_val(&parts), usize::checked_add)
-        .ok_or(WorkingMemoryError::Overflow)?;
-        Ok(Self { slots, bytes, tagged })
+        let bytes = parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        Ok(Self {
+            slots,
+            bytes,
+            tagged,
+        })
     }
     /// Host bytes which must be reserved before construction.
     pub fn requested_bytes(&self) -> usize {
@@ -299,21 +358,28 @@ impl CompletedWorkspaceSourceLayout {
         entries: Vec<(WorkspaceExistingStorage, OriginalSpeculativeBudgetCustody)>,
         host: &HostPreparationAuthority,
     ) -> Result<OriginalCompletedWorkspaceSource, WorkingMemoryError> {
-        if self.tagged { return Err(WorkingMemoryError::IdentityMismatch); }
+        if self.tagged {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         self.construct_entries(context, entries, host)
     }
     /// Consumes provider-authenticated tagged rows through the same full-root
     /// uniqueness, capacity, pool and later admission checks as model rows.
     pub fn construct_accounts(
-        self, context: &WorkspaceContext,
+        self,
+        context: &WorkspaceContext,
         entries: Vec<(WorkspaceExistingStorage, CompletedWorkspaceSourceAccount)>,
         host: &HostPreparationAuthority,
     ) -> Result<OriginalCompletedWorkspaceSource, WorkingMemoryError> {
-        if !self.tagged { return Err(WorkingMemoryError::IdentityMismatch); }
+        if !self.tagged {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
         self.construct_entries(context, entries, host)
     }
     fn construct_entries<A: AccountInput>(
-        self, context: &WorkspaceContext, entries: Vec<(WorkspaceExistingStorage, A)>,
+        self,
+        context: &WorkspaceContext,
+        entries: Vec<(WorkspaceExistingStorage, A)>,
         host: &HostPreparationAuthority,
     ) -> Result<OriginalCompletedWorkspaceSource, WorkingMemoryError> {
         if host.is_unmanaged() || entries.len() > self.slots || entries.is_empty() {
@@ -326,22 +392,15 @@ impl CompletedWorkspaceSourceLayout {
             {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            if !account.pool().same_domain(entries[0].1.pool()) {
+            if !account.pool().same_ledger(entries[0].1.pool()) {
                 return Err(WorkingMemoryError::IdentityMismatch);
             }
-            let total = entries
-                .iter()
-                .filter(|(_, a)| a.same_account(account))
-                .try_fold(0u64, |sum, (root, _)| {
-                    sum.checked_add(
-                        root.capacity_bytes()
-                            .ok_or(WorkingMemoryError::UnknownBound)?,
-                    )
-                    .ok_or(WorkingMemoryError::Overflow)
-                })?;
-            if total > account.physical_bytes() {
-                return Err(WorkingMemoryError::IdentityMismatch);
-            }
+            account.validate_roots(
+                entries
+                    .iter()
+                    .filter(|(_, a)| a.same_account(account))
+                    .map(|(root, _)| root),
+            )?;
         }
         let roots = WorkspaceBorrowedStorage::new_finite(
             context,
@@ -407,8 +466,14 @@ impl<K: Clone + Ord + Send + Sync + 'static> CompletedWorkspaceStorageLayout<K> 
         let frames = [
             self.layout.requested_bytes(),
             size_of::<Self>(),
-            size_of::<(Self, &WorkingMemoryPool, &WorkspaceContext,
-                OriginalCompletedWorkspaceSource, &mut super::super::RetainedOriginalStorageSources, bool)>(),
+            size_of::<(
+                Self,
+                &MemoryLedger,
+                &WorkspaceContext,
+                OriginalCompletedWorkspaceSource,
+                &mut super::super::RetainedOriginalStorageSources,
+                bool,
+            )>(),
             size_of::<Result<CompletedWorkspaceStorage<K>, WorkingMemoryError>>(),
             size_of::<CompletedWorkspaceStorage<K>>(),
             size_of::<Result<CompletedWorkspaceStorage<K>, WorkingMemoryError>>(),
@@ -425,9 +490,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> CompletedWorkspaceStorageLayout<K> 
     /// worker. Every additional root remains bound to the supplied closed source.
     pub fn construct(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        registered: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        registered: impl IntoIterator<Item = impl Into<super::super::RegisteredWorkspaceStorageRow<K>>>,
         source: OriginalCompletedWorkspaceSource,
         carrier: &mut super::super::RetainedOriginalStorageSources,
     ) -> Result<CompletedWorkspaceStorage<K>, WorkingMemoryError>
@@ -441,9 +506,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> CompletedWorkspaceStorageLayout<K> 
     /// single finite union. The one-time context guard is unchanged.
     pub fn construct_unselected(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        registered: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        registered: impl IntoIterator<Item = impl Into<super::super::RegisteredWorkspaceStorageRow<K>>>,
         source: OriginalCompletedWorkspaceSource,
         carrier: &mut super::super::RetainedOriginalStorageSources,
     ) -> Result<CompletedWorkspaceStorage<K>, WorkingMemoryError>
@@ -454,9 +519,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> CompletedWorkspaceStorageLayout<K> 
     }
     fn construct_inner(
         self,
-        pool: &WorkingMemoryPool,
+        pool: &MemoryLedger,
         context: &WorkspaceContext,
-        registered: impl IntoIterator<Item = (K, WorkspaceExistingStorage)>,
+        registered: impl IntoIterator<Item = impl Into<super::super::RegisteredWorkspaceStorageRow<K>>>,
         source: OriginalCompletedWorkspaceSource,
         carrier: &mut super::super::RetainedOriginalStorageSources,
         select: bool,
@@ -467,9 +532,13 @@ impl<K: Clone + Ord + Send + Sync + 'static> CompletedWorkspaceStorageLayout<K> 
         if !source.custody.matches_pool(pool) {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
-        let registered =
-            self.layout
-                .construct_with_completed_roots(pool, context, registered, &source.roots, select)?;
+        let registered = self.layout.construct_with_completed_roots(
+            pool,
+            context,
+            registered,
+            &source.roots,
+            select,
+        )?;
         // This adds H to the existing-only pin; it supplies no source bytes.
         let registered = registered.with_retained_original_sources(carrier)?;
         Ok(CompletedWorkspaceStorage { registered, source })
@@ -496,7 +565,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> OriginalCompletedWorkspaceCopy<K> {
         {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        plan.incremental_bytes()
+        plan.incremental_requirements()
             .ok_or(WorkingMemoryError::UnknownBound)?;
         Ok(Self {
             plan,
@@ -511,7 +580,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> OriginalCompletedWorkspaceCopy<K> {
         if !plan.source_storage().same_identity(&source.roots) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        plan.incremental_bytes()
+        plan.incremental_requirements()
             .ok_or(WorkingMemoryError::UnknownBound)?;
         Ok(Self {
             plan,
@@ -530,9 +599,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> OriginalCompletedWorkspaceCopy<K> {
             size_of::<RegisteredStoragePin>(),
             size_of::<HostPreparationAuthority>(),
             size_of::<Result<(), WorkingMemoryError>>(),
-            size_of::<(&WorkingMemoryPool, WorkspaceCopyLimits)>(),
+            size_of::<(&MemoryLedger, WorkspaceCopyLimits)>(),
             size_of::<Option<&super::super::WorkingMemoryStorage<K>>>(),
-            size_of::<(&CompletedSourceCustody, &WorkingMemoryPool)>(),
+            size_of::<(&CompletedSourceCustody, &MemoryLedger)>(),
             size_of::<std::slice::Iter<'_, OriginalSpeculativeBudgetCustody>>(),
         ];
         frames
@@ -541,7 +610,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> OriginalCompletedWorkspaceCopy<K> {
             .ok_or(WorkingMemoryError::Overflow)
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Same independently admitted copy account and capacity comparison as the
     /// registered/numerical routes; all source tickets validate under its lock.
     pub fn admit_completed_workspace_copy<K: Clone + Ord + Send + Sync + 'static>(
@@ -552,11 +621,23 @@ impl WorkingMemoryPool {
         if !copy.source.custody.matches_pool(self) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }
-        let bytes = copy_requirement(
+        let accepted = super::prepare_copy_account(
+            self,
+            &self.construction_identity(),
             copy.plan
-                .incremental_bytes()
+                .incremental_requirements()
                 .ok_or(WorkingMemoryError::UnknownBound)?,
-            limits,
+            0,
+            &limits,
+            0,
+            super::super::funding::CopyHostHolds::None,
+            |usage| {
+                copy.source.custody.validate(self, usage)?;
+                if let Some(source) = &copy.registered {
+                    source.registration().validate_copy_source(self, usage)?;
+                }
+                Ok(())
+            },
         )?;
         let execution =
             WorkspaceCopyAccountLayout::workspace()?.execution(copy.source.custody.host());
@@ -568,16 +649,12 @@ impl WorkingMemoryPool {
             ),
             None => completed,
         };
-        let (funding, scope) = self.open_completed_workspace_copy_account(
-            &copy.source.custody,
-            copy.registered.as_ref().map(|s| s.registration()),
-            pin,
-            &execution,
-            bytes,
-            limits.capacity_bytes,
-        )?;
+        let (requirements, funding, scope) = accepted.workspace(&execution, Some(pin))?;
         Ok(AdmittedWorkspaceCopy::from_account(
-            execution, bytes, funding, scope,
+            execution,
+            requirements,
+            funding,
+            scope,
         ))
     }
 }

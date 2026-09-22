@@ -1,5 +1,5 @@
 use super::*;
-use crate::{error::Exception, OriginalScopeObserver};
+use crate::{error::Exception, OriginalScopeObserver, SubmissionGraphQuota};
 use std::{mem::size_of, ptr};
 
 /// Final native handle storage for one future clone of an existing array.
@@ -11,6 +11,7 @@ use std::{mem::size_of, ptr};
 #[derive(Debug)]
 pub struct PreparedArrayClone {
     storage: *mut c_void,
+    arena: Option<SubmissionGraphQuota>,
 }
 
 /// Fixed preparation/borrow refusal; no native formatted diagnostic is needed.
@@ -19,6 +20,9 @@ pub enum PreparedArrayCloneCause {
     /// Exact handle storage allocation was refused.
     #[error("native clone handle allocation failed")]
     Allocation,
+    /// The existing metadata arena has insufficient unoccupied capacity.
+    #[error("native clone handle metadata capacity is exhausted")]
+    Capacity,
     /// Slot is absent or was already consumed.
     #[error("native clone handle is unavailable or already consumed")]
     InvalidStorage,
@@ -33,6 +37,7 @@ impl PreparedArrayClone {
     pub fn try_prepare_for_inspection() -> Result<Self, PreparedArrayCloneCause> {
         let mut slot = Self {
             storage: ptr::null_mut(),
+            arena: None,
         };
         // SAFETY: unique initially-null pointer; no descriptor exists yet.
         let status = unsafe { safemlx_sys::mlx_array_clone_storage_new_fixed(&mut slot.storage) };
@@ -40,6 +45,69 @@ impl PreparedArrayClone {
             0 => Ok(slot),
             6 => Err(PreparedArrayCloneCause::Allocation),
             _ => Err(PreparedArrayCloneCause::InvalidStorage),
+        }
+    }
+
+    /// Exact fresh metadata arena capacity for this producer's one final handle.
+    /// The caller also pays the existing arena's layout and its retained owner.
+    pub fn arena_capacity() -> Option<usize> {
+        let mut capacity = 0;
+        // SAFETY: checked pure layout query writes only this scalar.
+        (unsafe { safemlx_sys::mlx_array_clone_storage_arena_capacity(&mut capacity) } == 0)
+            .then_some(capacity)
+    }
+
+    /// Preallocate one handle in an existing paid metadata arena. Filling and
+    /// dropping use the same closed prepared-handle owner as native inputs;
+    /// the source backing never retains this handle's metadata payer.
+    /// This method creates no submission or execution authority.
+    pub fn try_prepare_in(arena: &SubmissionGraphQuota) -> Result<Self, PreparedArrayCloneCause> {
+        let mut slot = Self {
+            storage: ptr::null_mut(),
+            arena: Some(arena.clone()),
+        };
+        // SAFETY: live retained arena, exclusive initially empty destination.
+        match unsafe { safemlx_sys::mlx_array_clone_storage_new_in(&mut slot.storage, arena.raw()) }
+        {
+            0 => Ok(slot),
+            2 => Err(PreparedArrayCloneCause::Capacity),
+            _ => Err(PreparedArrayCloneCause::InvalidStorage),
+        }
+    }
+
+    /// Named controls for the paid-arena form, in addition to that arena's layout.
+    pub fn arena_control_bytes() -> Option<usize> {
+        Self::control_bytes()?
+            .checked_add(unsafe {
+                // SAFETY: sizeof inventory only, without native initialization.
+                safemlx_sys::mlx_array_clone_storage_arena_control_bytes()
+            })?
+            .checked_add(size_of::<SubmissionGraphQuota>())?
+            .checked_add(size_of::<Option<SubmissionGraphQuota>>())?
+            .checked_add(size_of::<usize>())
+    }
+
+    unsafe fn fill_raw(&mut self, output: &mut mlx_array, source: &Array) -> u32 {
+        if let Some(arena) = &self.arena {
+            // SAFETY: caller holds the inspection/original runtime loan and
+            // this slot's arena owns the exclusive uninitialized block.
+            unsafe {
+                safemlx_sys::mlx_array_clone_storage_fill_in(
+                    output,
+                    &mut self.storage,
+                    source.as_ptr(),
+                    arena.raw(),
+                )
+            }
+        } else {
+            // SAFETY: same unique slot and retained source, ordinary allocation.
+            unsafe {
+                safemlx_sys::mlx_array_clone_storage_fill(
+                    output,
+                    &mut self.storage,
+                    source.as_ptr(),
+                )
+            }
         }
     }
 
@@ -57,13 +125,7 @@ impl PreparedArrayClone {
             };
             // SAFETY: unique slot, valid source and empty result under runtime
             // serialization. Native copy construction is statically noexcept.
-            let status = unsafe {
-                safemlx_sys::mlx_array_clone_storage_fill(
-                    &mut output,
-                    &mut self.storage,
-                    source.as_ptr(),
-                )
-            };
+            let status = unsafe { self.fill_raw(&mut output, source) };
             if status != 0 {
                 return Err(PreparedArrayCloneCause::InvalidStorage);
             }
@@ -77,6 +139,7 @@ impl PreparedArrayClone {
     pub fn try_new() -> Result<Self, Exception> {
         let mut slot = Self {
             storage: ptr::null_mut(),
+            arena: None,
         };
         <() as Guarded>::try_from_op(|_| {
             // SAFETY: output is initially null and uniquely owned by this slot.
@@ -136,13 +199,7 @@ impl PreparedArrayClone {
         // SAFETY: unique slot, live source, empty destination, exact current
         // original owner and no-hooks native serialization. On success the
         // constructor transfers the sole wrapper ownership into output.
-        let status = unsafe {
-            safemlx_sys::mlx_array_clone_storage_fill(
-                &mut output,
-                &mut self.storage,
-                source.as_ptr(),
-            )
-        };
+        let status = unsafe { self.fill_raw(&mut output, source) };
         if status != 0 {
             return Err(observer.error(status));
         }
@@ -152,9 +209,15 @@ impl PreparedArrayClone {
 
 impl Drop for PreparedArrayClone {
     fn drop(&mut self) {
-        // SAFETY: only unfilled operator-new storage can remain. There is no
-        // array/descriptor/callback to destroy and no runtime entry is needed.
-        unsafe { safemlx_sys::mlx_array_clone_storage_free(self.storage) };
+        // Only unfilled storage can remain. There is no array or descriptor to
+        // destroy; an arena returns its block through the existing paid owner.
+        if let Some(arena) = &self.arena {
+            // SAFETY: the retained arena owns this possibly unfilled block.
+            // A successful fill transferred it to the returned Array.
+            unsafe { safemlx_sys::mlx_array_clone_storage_free_in(self.storage, arena.raw()) };
+        } else {
+            unsafe { safemlx_sys::mlx_array_clone_storage_free(self.storage) };
+        }
     }
 }
 
@@ -190,7 +253,95 @@ mod tests {
         assert_eq!(HOOKS.with(Cell::get), 0);
         drop(guard);
         drop(source);
-        assert_eq!(retained.evaluated().unwrap().as_slice::<u32>(), &[7, 13, 29]);
+        assert_eq!(
+            retained.evaluated().unwrap().as_slice::<u32>(),
+            &[7, 13, 29]
+        );
         assert_eq!(retained.try_allocation_info().unwrap(), Some(before));
+    }
+
+    #[test]
+    fn arena_clone_failure_fill_and_drop_retire_independently_of_source_aliases() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Retired(Arc<AtomicUsize>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let source = Array::from_slice(&[7u32, 13, 29], &[1, 3]);
+        let source_alias = source.clone();
+        let before = source.try_allocation_info().unwrap().unwrap();
+        let arena = crate::PreparedSubmissionGraphQuota::try_new(
+            PreparedArrayClone::arena_capacity().unwrap(),
+            Retired(dropped.clone()),
+        )
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+        let mut slot = PreparedArrayClone::try_prepare_in(&arena).unwrap();
+        let occupied = arena.occupied_bytes();
+        assert!(occupied > 0);
+        let invalid = Array {
+            c_array: mlx_array {
+                ctx: ptr::null_mut(),
+                prepared_owner: ptr::null_mut(),
+            },
+        };
+        assert!(matches!(
+            slot.fill_for_inspection(&invalid),
+            Err(PreparedArrayCloneCause::InvalidStorage)
+        ));
+        assert_eq!(arena.occupied_bytes(), occupied);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        runtime_lock::register_housekeeping_hook(hook);
+        let guard = RemoveHook;
+        HOOKS.with(|n| n.set(0));
+        let retained = slot.fill_for_inspection(&source).unwrap();
+        assert_eq!(HOOKS.with(Cell::get), 0);
+        assert_eq!(retained.try_allocation_info().unwrap(), Some(before));
+        assert!(matches!(
+            slot.fill_for_inspection(&source),
+            Err(PreparedArrayCloneCause::InvalidStorage)
+        ));
+        drop(guard);
+        drop(slot);
+        drop(arena);
+        crate::reclaim_allocation_owners();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        // An ordinary descriptor alias has its own handle; it must not keep the
+        // discarded prepared handle's payer while sharing its source backing.
+        let retained_alias = retained.clone();
+        drop(retained);
+        crate::reclaim_allocation_owners();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            source_alias.evaluated().unwrap().as_slice::<u32>(),
+            &[7, 13, 29]
+        );
+        assert_eq!(
+            retained_alias.evaluated().unwrap().as_slice::<u32>(),
+            &[7, 13, 29]
+        );
+        assert_eq!(source.try_allocation_info().unwrap(), Some(before));
+
+        let arena = crate::PreparedSubmissionGraphQuota::try_new(
+            PreparedArrayClone::arena_capacity().unwrap(),
+            Retired(dropped.clone()),
+        )
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+        let unfilled = PreparedArrayClone::try_prepare_in(&arena).unwrap();
+        drop(arena);
+        crate::reclaim_allocation_owners();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(unfilled);
+        crate::reclaim_allocation_owners();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 }

@@ -119,7 +119,8 @@ fn retained_array_inspection_and_handle_retention_never_run_housekeeping() {
             .values()
             .next()
             .unwrap()
-            .owned().unwrap()
+            .owned()
+            .unwrap()
             .1
             .evaluated()
             .unwrap()
@@ -188,6 +189,7 @@ fn retained_array_inspection_does_not_reclaim_unrelated_queued_owners() {
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
     drop(hook);
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     assert!(storage.byte_bound().unwrap().unwrap() > 0);
@@ -286,6 +288,7 @@ fn retained_host_inspection_does_not_reclaim_unrelated_queued_owners() {
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert_eq!(HOUSEKEEPING.with(Cell::get), 0);
     drop(hook);
+    safemlx::memory::clear_cache().unwrap();
     safemlx::reclaim_allocation_owners();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }

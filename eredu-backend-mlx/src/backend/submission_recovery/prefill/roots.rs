@@ -1,7 +1,7 @@
 //! Closed completion payload, borrowed through a separately retained projection.
 use crate::backend::error::Error;
 use eredu_runtime::working_memory::{
-    OriginalPrefillRootCustody, OriginalPrefillRootProjectionCustody,
+    OriginalHostSourceCustody, OriginalPrefillRootCustody, OriginalPrefillRootProjectionCustody,
 };
 use safemlx::{
     Array, PrefillRoots, PrefillRootsRuntime, PreparedPrefillFailure, SubmissionGraphQuota,
@@ -82,8 +82,8 @@ impl CaptureProjection {
         }
         Ok(observer)
     }
-    pub(super) fn observer(&self)->Result<safemlx::OriginalScopeObserver,Error>{
-        let observer=self.retained_observer()?;
+    pub(super) fn observer(&self) -> Result<safemlx::OriginalScopeObserver, Error> {
+        let observer = self.retained_observer()?;
         let current = safemlx::OriginalScopeObserver::require_current()?;
         if !observer.same_scope(&current) {
             return Err(Error::PrefillControl(
@@ -92,62 +92,208 @@ impl CaptureProjection {
         }
         Ok(observer)
     }
-    pub(super) fn capture_observer(&self)->Result<safemlx::OriginalScopeObserver,Error>{
-        let parent=self.retained_observer()?;
-        crate::backend::nn::tensor::TokenValidationScope::capture_observer_for(&parent).map_err(Into::into)
+    pub(super) fn capture_observer(&self) -> Result<safemlx::OriginalScopeObserver, Error> {
+        let parent = self.retained_observer()?;
+        crate::backend::nn::tensor::TokenValidationScope::capture_observer_for(&parent)
+            .map_err(Into::into)
     }
-
 }
-/// Weak append-only view of this actual original model completion owner.
-/// It cannot create or submit a root owner and carries no replacement capacity.
+/// Native completion sources lend their actual root collector without creating
+/// a different execution role. Composition retains the concrete source and its
+/// recovery owner; this interface only authenticates and borrows that owner.
+pub(crate) trait InvocationRootSource {
+    fn metadata_funding(&self) -> &eredu_nn::workspace::HostMetadataFunding;
+    /// Accounting identity of this actual invocation, when it can lend a paged
+    /// source. An unqualified completion projection supplies no such identity.
+    fn source_custody(&self) -> Option<OriginalHostSourceCustody> {
+        None
+    }
+    /// Source installation can precede graph construction. Implementations
+    /// still authenticate the actual current scope and reject failed owners.
+    fn scope_observer(&self) -> Result<safemlx::OriginalScopeObserver, Error> {
+        self.observer()
+    }
+    fn observer(&self) -> Result<safemlx::OriginalScopeObserver, Error>;
+    fn completion_recipe(
+        &self,
+    ) -> Result<crate::backend::nn::workspace::ResidentCompletionRecipe, Error>;
+    fn append(&self, value: &Array) -> Result<(), Error>;
+    fn retire_completed(&self, value: &Array) -> Result<(), Error>;
+    fn close_construction(&self) -> Result<(), Error>;
+}
 #[derive(Clone)]
-pub(crate) struct TransientRootsProjection(CaptureProjection);
+enum RootSource {
+    Prefill(CaptureProjection),
+    Invocation {
+        source: Weak<dyn InvocationRootSource>,
+        _funding: eredu_nn::workspace::HostMetadataFunding,
+        _custody: Option<OriginalHostSourceCustody>,
+    },
+}
+enum RootLoan {
+    Prefill(RootsOwner),
+    Invocation(Rc<dyn InvocationRootSource>),
+}
+impl RootLoan {
+    fn observer(&self) -> Result<safemlx::OriginalScopeObserver, Error> {
+        match self {
+            Self::Prefill(owner) => owner.capture_projection().observer(),
+            Self::Invocation(source) => source.observer(),
+        }
+    }
+    fn recipe(&self) -> Result<crate::backend::nn::workspace::ResidentCompletionRecipe, Error> {
+        match self {
+            Self::Prefill(owner) => owner
+                .0
+                .as_ref()
+                .expect("closed root owner")
+                .traversal
+                .get()
+                .ok_or(Error::PrefillScopeUnavailable),
+            Self::Invocation(source) => source.completion_recipe(),
+        }
+    }
+    fn append(&self, value: &Array) -> Result<(), Error> {
+        match self {
+            Self::Prefill(owner) => owner
+                .0
+                .as_ref()
+                .expect("closed root owner")
+                .value
+                .try_borrow_mut()
+                .map_err(|_| Error::PrefillScopeReentrant)?
+                .as_mut()
+                .ok_or(Error::PrefillScopeUnavailable)?
+                .append(value)
+                .map_err(|cause| Error::PrefillRoots(cause.into())),
+            Self::Invocation(source) => source.append(value),
+        }
+    }
+    fn retire_completed(&self, value: &Array) -> Result<(), Error> {
+        match self {
+            Self::Prefill(owner) => owner
+                .0
+                .as_ref()
+                .expect("closed root owner")
+                .value
+                .try_borrow_mut()
+                .map_err(|_| Error::PrefillScopeReentrant)?
+                .as_mut()
+                .ok_or(Error::PrefillScopeUnavailable)?
+                .retire_completed_current(value)
+                .map_err(Error::PrefillRoots),
+            Self::Invocation(source) => source.retire_completed(value),
+        }
+    }
+    fn close_construction(&self) -> Result<(), Error> {
+        match self {
+            Self::Prefill(owner) => {
+                let construction = owner
+                    .0
+                    .as_ref()
+                    .expect("closed root owner")
+                    .host_construction
+                    .try_borrow_mut()
+                    .map_err(|_| Error::PrefillScopeReentrant)?
+                    .take();
+                drop(construction);
+                Ok(())
+            }
+            Self::Invocation(source) => source.close_construction(),
+        }
+    }
+}
+/// Weak append-only view of the actual model completion owner. The projection
+/// cannot create a root bank, reserve capacity, or grant execution authority.
+#[derive(Clone)]
+pub(crate) struct TransientRootsProjection(RootSource);
 impl TransientRootsProjection {
-    /// Detach only a leaf whose existing original event is already complete.
-    /// No graph is evaluated and no nested attempt is reserved by this handoff.
-    pub(crate) fn validate_boundary_leaf(&self,value:&Array)->Result<(),Error>{
-        let observer=self.0.observer()?;
-        safemlx::OperationEvent::validate_traversal_leaf(value,&observer)?;
+    pub(crate) fn from_invocation<T: InvocationRootSource + 'static>(source: &Rc<T>) -> Self {
+        let erased: Rc<dyn InvocationRootSource> = source.clone();
+        Self(RootSource::Invocation {
+            source: Rc::downgrade(&erased),
+            _funding: source.metadata_funding().clone(),
+            _custody: source.source_custody(),
+        })
+    }
+    fn owner(&self) -> Result<RootLoan, Error> {
+        match &self.0 {
+            RootSource::Prefill(source) => Ok(RootLoan::Prefill(RootsOwner(Some(
+                source.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?,
+            )))),
+            RootSource::Invocation { source, .. } => source
+                .upgrade()
+                .map(RootLoan::Invocation)
+                .ok_or(Error::PrefillScopeUnavailable),
+        }
+    }
+    pub(crate) fn validate_boundary_leaf(&self, value: &Array) -> Result<(), Error> {
+        let observer = self.owner()?.observer()?;
+        safemlx::OperationEvent::validate_traversal_leaf(value, &observer)?;
         Ok(())
     }
-
-    /// Borrow the actual enclosing model recipe, preserving its admitted DAG
-    /// and nested root capacity. An unquoted boundary remains a typed refusal.
-    pub(crate) fn boundary_traversal(&self, roots:usize, funding:&eredu_nn::workspace::HostMetadataFunding)
-        ->Result<(safemlx::OriginalScopeObserver,safemlx::OperationEvalTraversalLayout),Error>{
-        let observer=self.0.observer()?;
-        let owner=RootsOwner(Some(self.0.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?));
-        let recipe=owner.0.as_ref().expect("closed boundary root owner").traversal.get()
+    pub(crate) fn boundary_traversal(
+        &self,
+        roots: usize,
+        funding: &eredu_nn::workspace::HostMetadataFunding,
+    ) -> Result<
+        (
+            safemlx::OriginalScopeObserver,
+            safemlx::OperationEvalTraversalLayout,
+        ),
+        Error,
+    > {
+        let owner = self.owner()?;
+        let observer = owner.observer()?;
+        let recipe = owner.recipe()?;
+        let query = recipe
+            .traversal
+            .query_control_bytes()
+            .and_then(|n| n.checked_mul(2))
             .ok_or(Error::PrefillScopeUnavailable)?;
-        let query=recipe.traversal.query_control_bytes().and_then(|n|n.checked_mul(2))
+        funding
+            .reserve_metadata(query)
+            .map_err(Error::WorkspacePlanning)?;
+        let admitted = recipe
+            .nested_traversal()
             .ok_or(Error::PrefillScopeUnavailable)?;
-        funding.reserve_metadata(query).map_err(Error::WorkspacePlanning)?;
-        let admitted=recipe.nested_traversal().ok_or(Error::PrefillScopeUnavailable)?;
-        if roots==0 || roots>admitted.roots(){return Err(Error::PrefillScopeUnavailable);}
-        // This read-only check authenticates the live native bank and remaining
-        // attempt. It neither creates a bank nor refunds a consumed frontier.
+        if roots == 0 || roots > admitted.roots() {
+            return Err(Error::PrefillScopeUnavailable);
+        }
         safemlx::OperationEvent::validate_nested_completion(roots)?;
-        let mut limits=admitted.limits();limits.roots=roots;
-        let exact=safemlx::OperationEvent::eval_traversal_layout(limits)
+        let mut limits = admitted.limits();
+        limits.roots = roots;
+        let exact = safemlx::OperationEvent::eval_traversal_layout(limits)
             .ok_or(Error::PrefillScopeUnavailable)?;
-        Ok((observer,exact))
+        Ok((observer, exact))
     }
-    pub(crate) fn boundary_traversal_control_bytes()->Option<usize>{
-        let frames=[size_of::<(&Self,usize,&eredu_nn::workspace::HostMetadataFunding)>(),size_of::<RootsOwner>(),
+    pub(crate) fn boundary_traversal_control_bytes() -> Option<usize> {
+        let frames = [
+            size_of::<(&Self, usize, &eredu_nn::workspace::HostMetadataFunding)>(),
+            size_of::<RootLoan>(),
             size_of::<crate::backend::nn::workspace::ResidentCompletionRecipe>(),
             size_of::<safemlx::OperationEvalTraversalLayout>(),
             size_of::<safemlx::OperationEvalTraversalLimits>(),
-            size_of::<Result<(safemlx::OriginalScopeObserver,safemlx::OperationEvalTraversalLayout),Error>>(),
-            safemlx::OperationEvent::nested_completion_control_bytes::<0>()?];
-        frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
+            size_of::<
+                Result<
+                    (
+                        safemlx::OriginalScopeObserver,
+                        safemlx::OperationEvalTraversalLayout,
+                    ),
+                    Error,
+                >,
+            >(),
+            safemlx::OperationEvent::nested_completion_control_bytes::<0>()?,
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
     }
-    /// Authenticate the existing original model owner, including its retained
-    /// failure and current scope. This weak projection cannot create a role.
     pub(crate) fn authenticate_scope(
         &self,
         scope: &SubmissionScope,
     ) -> Result<safemlx::OriginalScopeObserver, Error> {
-        let observer = self.0.observer()?;
+        let observer = self.owner()?.observer()?;
         if !observer.belongs_to(scope) {
             return Err(Error::PrefillControl(
                 eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
@@ -155,90 +301,114 @@ impl TransientRootsProjection {
         }
         Ok(observer)
     }
-    pub(crate) fn append(&self, value: &Array) -> Result<(), Error> {
-        self.0.observer()?;
-        let owner = RootsOwner(Some(
-            self.0.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?,
-        ));
-        let payload = owner.0.as_ref().expect("closed transient root payload");
-        let mut roots = payload
-            .value
-            .try_borrow_mut()
-            .map_err(|_| Error::PrefillScopeReentrant)?;
-        roots
-            .as_mut()
-            .ok_or(Error::PrefillScopeUnavailable)?
-            .append(value)
-            .map_err(|cause| Error::PrefillRoots(cause.into()))
+    /// Authenticate the actual invocation account as well as its native scope.
+    /// A weak projection or an equal plan alone cannot lend a paged source.
+    pub(crate) fn authenticate_source(
+        &self,
+        scope: &SubmissionScope,
+        custody: &OriginalHostSourceCustody,
+    ) -> Result<safemlx::OriginalScopeObserver, Error> {
+        let owner = self.owner()?;
+        let RootLoan::Invocation(source) = &owner else {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        };
+        if !source
+            .source_custody()
+            .is_some_and(|actual| actual.same_source(custody))
+        {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        let observer = source.scope_observer()?;
+        if !observer.belongs_to(scope) {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        Ok(observer)
     }
-    /// Retire only an exact completed transfer root; native keeps its cumulative
-    /// append debit and validates the same current original scope before release.
-    pub(crate) fn retire_completed(&self, value: &Array) -> Result<(), Error> {
-        self.0.observer()?;
-        let owner = RootsOwner(Some(self.0.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?));
-        let payload = owner.0.as_ref().expect("closed transient root payload");
-        let mut roots = payload.value.try_borrow_mut().map_err(|_| Error::PrefillScopeReentrant)?;
-        roots.as_mut().ok_or(Error::PrefillScopeUnavailable)?
-            .retire_completed_current(value).map_err(Error::PrefillRoots)
-    }
-    pub(crate) fn publication_settlement_control_bytes()->Option<usize> {
-        let frames=[std::mem::size_of::<(&Self,&Array,&safemlx::Stream)>(),
-            std::mem::size_of::<RootsOwner>(),std::mem::size_of::<Result<(),Error>>(),
-            std::mem::size_of::<Option<safemlx::PreparedResidentGraph>>(),
-            std::mem::size_of::<std::cell::RefMut<'_,Option<safemlx::PreparedResidentGraph>>>(),
-            safemlx::OperationEvent::nested_completion_control_bytes::<1>()?,
-            safemlx::OperationEvent::traversal_leaf_control_bytes()?,
-            std::mem::size_of::<safemlx::OriginalScopeObserver>()];
-        frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
-    }
-    /// The publication contribution needs an intermediate settled leaf. Use
-    /// the already quoted nested worker while the real resident bank is live;
-    /// preserve the outer one-shot root collector for shared session completion.
-    pub(crate) fn settle_publication(&self,value:&Array,stream:&safemlx::Stream)->Result<(),Error> {
-        let observer=self.0.observer()?;
-        let owner=RootsOwner(Some(self.0.0.upgrade().ok_or(Error::PrefillScopeUnavailable)?));
-        let payload=owner.0.as_ref().expect("closed publication root owner");
-        // The fixed root borrow stays local to the synchronous native worker.
-        // On failure that worker restores its bank and Q retains all recovery
-        // state. No collector attempt or native source is reset/refunded.
-        safemlx::OperationEvent::complete_nested([value],stream)?;
-        // Waiting retires the completion record, but its root may still carry
-        // the completed event. The existing exact-scope validator publishes
-        // `available` and detaches that event without evaluating a new graph.
-        // Do this while the model owner is still live, before the following
-        // read-only distributed source requires a detached settled leaf.
-        safemlx::OperationEvent::validate_traversal_leaf(value,&observer)?;
-        let construction=payload.host_construction.try_borrow_mut()
-            .map_err(|_|Error::PrefillScopeReentrant)?.take();
-        // Model/contribution constructors are now finished. The accepted CPU
-        // publication owns its separate exact source bank; final completion
-        // will consume the still-filling outer PrefillRoots exactly once.
-        drop(construction);
-        Ok(())
-    }
-    pub(crate) fn control_bytes() -> Option<usize> {
-        use std::mem::size_of;
+    pub(crate) fn authenticate_source_control_bytes() -> Option<usize> {
         let frames = [
-            size_of::<Self>(),
-            size_of::<RootsOwner>(),
-            size_of::<Option<RootsOwner>>(),
-            size_of::<(&Self, &Array)>(),
+            size_of::<(&Self, &SubmissionScope, &OriginalHostSourceCustody)>(),
+            size_of::<RootLoan>(),
+            size_of::<Result<RootLoan, Error>>(),
+            size_of::<OriginalHostSourceCustody>(),
+            size_of::<Option<OriginalHostSourceCustody>>(),
             size_of::<safemlx::OriginalScopeObserver>(),
-            size_of::<std::cell::RefMut<'_, Option<PrefillRoots>>>(),
-            size_of::<Result<(), Error>>(),
-            size_of::<(&Self, &SubmissionScope)>(),
             size_of::<Result<safemlx::OriginalScopeObserver, Error>>(),
         ];
         frames
             .into_iter()
             .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
     }
+    pub(crate) fn append(&self, value: &Array) -> Result<(), Error> {
+        let owner = self.owner()?;
+        owner.observer()?;
+        owner.append(value)
+    }
+    pub(crate) fn retire_completed(&self, value: &Array) -> Result<(), Error> {
+        let owner = self.owner()?;
+        owner.observer()?;
+        owner.retire_completed(value)
+    }
+    pub(crate) fn publication_settlement_control_bytes() -> Option<usize> {
+        let frames = [
+            size_of::<(&Self, &Array, &safemlx::Stream)>(),
+            size_of::<RootLoan>(),
+            size_of::<Result<(), Error>>(),
+            size_of::<Option<safemlx::PreparedResidentGraph>>(),
+            size_of::<std::cell::RefMut<'_, Option<safemlx::PreparedResidentGraph>>>(),
+            safemlx::OperationEvent::nested_completion_control_bytes::<1>()?,
+            safemlx::OperationEvent::traversal_leaf_control_bytes()?,
+            size_of::<safemlx::OriginalScopeObserver>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
+    /// Settle the intermediate publication leaf with this owner's admitted
+    /// nested worker. The outer root collector remains a one-use completion.
+    pub(crate) fn settle_publication(
+        &self,
+        value: &Array,
+        stream: &safemlx::Stream,
+    ) -> Result<(), Error> {
+        let owner = self.owner()?;
+        let observer = owner.observer()?;
+        safemlx::OperationEvent::complete_nested([value], stream)?;
+        safemlx::OperationEvent::validate_traversal_leaf(value, &observer)?;
+        owner.close_construction()
+    }
+    pub(crate) fn control_bytes() -> Option<usize> {
+        let frames = [
+            size_of::<Self>(),
+            size_of::<RootLoan>(),
+            size_of::<Option<RootLoan>>(),
+            size_of::<(&Self, &Array)>(),
+            size_of::<safemlx::OriginalScopeObserver>(),
+            size_of::<std::cell::RefMut<'_, Option<PrefillRoots>>>(),
+            size_of::<std::cell::RefMut<'_, PrefillRoots>>(),
+            size_of::<Result<(), Error>>(),
+            size_of::<(&Self, &SubmissionScope)>(),
+            size_of::<Result<safemlx::OriginalScopeObserver, Error>>(),
+            size_of::<Rc<dyn InvocationRootSource>>(),
+            size_of::<Weak<dyn InvocationRootSource>>(),
+            size_of::<Result<RootLoan, Error>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
 }
+
 impl RootsOwner {
     pub(super) fn transient_projection(&self) -> Result<TransientRootsProjection, Error> {
         let projection = self.capture_projection();
         projection.observer()?;
-        Ok(TransientRootsProjection(projection))
+        Ok(TransientRootsProjection(RootSource::Prefill(projection)))
     }
     pub(super) fn capture_projection(&self) -> CaptureProjection {
         CaptureProjection(Rc::downgrade(self.0.as_ref().expect("closed root payload")))
@@ -352,7 +522,10 @@ impl RootsOwner {
             if !payload.original || payload.host_construction.borrow().is_some() {
                 return Err(Error::PrefillScopeUnavailable);
             }
-            payload.addressable.set(row).map_err(|_| Error::PrefillScopeUnavailable)?;
+            payload
+                .addressable
+                .set(row)
+                .map_err(|_| Error::PrefillScopeUnavailable)?;
         }
         Ok(self)
     }
@@ -404,7 +577,9 @@ impl RootsProjection {
     /// Activate this exact request row around the shared ordinary forward.
     /// A lexical request-channel installation cannot outlive its root owner.
     pub(crate) fn with_addressable<T, E, F>(&self, run: F) -> Result<Result<T, E>, Error>
-    where F: FnOnce() -> Result<Result<T, E>, Error> {
+    where
+        F: FnOnce() -> Result<Result<T, E>, Error>,
+    {
         let owner = self.owner()?;
         let payload = owner.0.as_ref().expect("closed upgraded root payload");
         match payload.addressable.get() {
@@ -425,7 +600,7 @@ impl RootsProjection {
     }
     /// The shared forward lends this weak original root view beside its control
     /// context. This never changes the optional neural parallel context.
-    pub(crate) fn transient_roots(&self)->Result<TransientRootsProjection,Error>{
+    pub(crate) fn transient_roots(&self) -> Result<TransientRootsProjection, Error> {
         self.owner()?.transient_projection()
     }
     /// Loans the source of this exact active root owner after releasing every
@@ -444,14 +619,27 @@ impl RootsProjection {
 
     /// Reborrow this exact original invocation for the selected publication.
     /// The extra weak root view stays inside its Q-owned invocation.
-    pub(crate) fn with_parallel_publication<T,E,F>(&self,stream:&safemlx::Stream,run:F)->Result<Result<T,E>,Error>
-    where F:FnOnce(Option<(&crate::backend::runtime::distributed::Group,&eredu_nn::workspace::HostMetadataFunding)>)->Result<T,E> {
-        let owner=self.owner()?;
-        let payload=owner.0.as_ref().expect("closed publication root owner");
-        let Some(parallel)=payload.parallel.get() else{return Ok(run(None))};
-        parallel.prepare_lending::<F,Result<T,E>>()?;
-        let observer=owner.capture_projection().observer()?;
-        parallel.with_publication_context(&observer,stream,owner.transient_projection()?,run)
+    pub(crate) fn with_parallel_publication<T, E, F>(
+        &self,
+        stream: &safemlx::Stream,
+        run: F,
+    ) -> Result<Result<T, E>, Error>
+    where
+        F: FnOnce(
+            Option<(
+                &crate::backend::runtime::distributed::Group,
+                &eredu_nn::workspace::HostMetadataFunding,
+            )>,
+        ) -> Result<T, E>,
+    {
+        let owner = self.owner()?;
+        let payload = owner.0.as_ref().expect("closed publication root owner");
+        let Some(parallel) = payload.parallel.get() else {
+            return Ok(run(None));
+        };
+        parallel.prepare_lending::<F, Result<T, E>>()?;
+        let observer = owner.capture_projection().observer()?;
+        parallel.with_publication_context(&observer, stream, owner.transient_projection()?, run)
     }
 
     /// Only the request-wide ModelExecution guard can retain another weak view.
@@ -539,66 +727,69 @@ impl RootsProjection {
         self.complete_with_stream(Some(stream))
     }
     fn complete_with_stream(&self, selected: Option<&safemlx::Stream>) -> Result<(), Error> {
-        complete_roots_owner(self.owner()?,selected)
+        complete_roots_owner(self.owner()?, selected)
     }
 }
-fn complete_roots_owner(owner:RootsOwner, selected:Option<&safemlx::Stream>)->Result<(),Error> {
-        let payload = owner.0.as_ref().expect("closed live root payload");
-        if selected.is_some() && !payload.original {
-            return Err(Error::PrefillScopeUnavailable);
-        }
-        if payload.original {
-            crate::backend::nn::workspace::ProjectedPagedSources::validate_current_append_completion()?;
-        }
-        let construction = payload
-            .host_construction
-            .try_borrow_mut()
-            .map_err(|_| Error::PrefillScopeReentrant)?
-            .take();
-        // Host construction ends before Eval reserves its own Graph prologues.
-        // Consumed descriptor/primitive blocks remain with their real births.
-        drop(construction);
-        let value = payload
-            .value
-            .try_borrow_mut()
-            .map_err(|_| Error::PrefillScopeReentrant)?
-            .take()
-            .ok_or(Error::PrefillScopeReentrant)?;
-        let mut active = Active {
-            value: Some(value),
-            destination: &payload.value,
-        };
-        let roots = active.value.as_mut().expect("lexical native root owner");
-        if payload.original {
-            if let Some(stream) = selected {
-                if let Some(layout) = payload.traversal.get() {
-                    roots.complete_current_scope_on_stream_prepared(stream, &layout.traversal)?;
-                } else {
-                    roots.complete_current_scope_on_stream(stream)?;
-                }
+fn complete_roots_owner(
+    owner: RootsOwner,
+    selected: Option<&safemlx::Stream>,
+) -> Result<(), Error> {
+    let payload = owner.0.as_ref().expect("closed live root payload");
+    if selected.is_some() && !payload.original {
+        return Err(Error::PrefillScopeUnavailable);
+    }
+    if payload.original {
+        crate::backend::nn::workspace::ProjectedPagedSources::validate_current_append_completion()?;
+    }
+    let construction = payload
+        .host_construction
+        .try_borrow_mut()
+        .map_err(|_| Error::PrefillScopeReentrant)?
+        .take();
+    // Host construction ends before Eval reserves its own Graph prologues.
+    // Consumed descriptor/primitive blocks remain with their real births.
+    drop(construction);
+    let value = payload
+        .value
+        .try_borrow_mut()
+        .map_err(|_| Error::PrefillScopeReentrant)?
+        .take()
+        .ok_or(Error::PrefillScopeReentrant)?;
+    let mut active = Active {
+        value: Some(value),
+        destination: &payload.value,
+    };
+    let roots = active.value.as_mut().expect("lexical native root owner");
+    if payload.original {
+        if let Some(stream) = selected {
+            if let Some(layout) = payload.traversal.get() {
+                roots.complete_current_scope_on_stream_prepared(stream, &layout.traversal)?;
             } else {
-                if payload.traversal.get().is_some() {
-                    return Err(Error::PrefillScopeUnavailable);
-                }
-                roots.complete_current_scope()?;
+                roots.complete_current_scope_on_stream(stream)?;
             }
         } else {
-            roots.submit()?;
-            roots.wait()?;
-            roots.validate()?;
+            if payload.traversal.get().is_some() {
+                return Err(Error::PrefillScopeUnavailable);
+            }
+            roots.complete_current_scope()?;
         }
-        #[cfg(test)]
-        super::test_trace::record(if selected.is_some() {
-            super::test_trace::Event::ModelCompleted { roots: roots.len() }
-        } else {
-            super::test_trace::Event::Completed {
-                roots: roots.len(),
-                original: payload.original,
-            }
-        });
-        // This is root validation, not all-Scope terminal callback evidence.
-        // Recovery retains its strong owner until its independent probe settles.
-        Ok(())
+    } else {
+        roots.submit()?;
+        roots.wait()?;
+        roots.validate()?;
+    }
+    #[cfg(test)]
+    super::test_trace::record(if selected.is_some() {
+        super::test_trace::Event::ModelCompleted { roots: roots.len() }
+    } else {
+        super::test_trace::Event::Completed {
+            roots: roots.len(),
+            original: payload.original,
+        }
+    });
+    // This is root validation, not all-Scope terminal callback evidence.
+    // Recovery retains its strong owner until its independent probe settles.
+    Ok(())
 }
 struct Active<'a> {
     value: Option<PrefillRoots>,

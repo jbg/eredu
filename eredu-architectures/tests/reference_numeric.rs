@@ -1,5 +1,9 @@
 //! Multi-family numerical reference tests using a deterministic scalar backend.
 
+#[path = "../src/memory_fixture.rs"]
+#[allow(dead_code)]
+mod memory_fixture;
+
 #[path = "reference_numeric/bounded_readout.rs"]
 mod bounded_readout;
 
@@ -44,6 +48,8 @@ mod components;
 mod discovery;
 #[path = "reference_numeric/parameter_access.rs"]
 mod parameter_access;
+#[path = "reference_numeric/parameter_publication.rs"]
+mod parameter_publication;
 #[path = "reference_numeric/payload.rs"]
 mod payload;
 #[path = "reference_numeric/prepared_adapter.rs"]
@@ -3151,7 +3157,8 @@ fn gemma4_tp2_ordered_vision_audio_text_matches_replicated_multimodal_graph() {
         gemma4::LayeredModel::<NumericBackend>::new(family.clone(), &context).unwrap();
     let groups = architecture
         .parameter_description(&context)
-        .unwrap().into_owned()
+        .unwrap()
+        .into_owned()
         .groups()
         .iter()
         .map(|owned| owned.group().clone())
@@ -4086,11 +4093,11 @@ fn deepseek_v3_dense_tp2_matches_replicated_with_uneven_vocabulary() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let mut expected_state =
-        DeviceState::<NumericBackend, _>::create(architecture.state_layout(None).unwrap(), |_, _| {
-            Ok::<_, Error>(NumericCompressedCache::resident())
-        })
-        .unwrap();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.state_layout(None).unwrap(),
+        |_, _| Ok::<_, Error>(NumericCompressedCache::resident()),
+    )
+    .unwrap();
     let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
     let tokens = NumericTensor::token_ids(&[0, 4, 6]);
     let expected = expected_runtime
@@ -4267,11 +4274,11 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
         DeviceState<NumericBackend, NumericPoolingCache>,
     >>::build_unit(&architecture, 0, 0, &context)
     .unwrap();
-    let mut expected_state =
-        DeviceState::<NumericBackend, _>::create(architecture.state_layout(None).unwrap(), |_, _| {
-            Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[]))
-        })
-        .unwrap();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.state_layout(None).unwrap(),
+        |_, _| Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[])),
+    )
+    .unwrap();
     let mut expected_runtime =
         LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit]));
     let tokens = NumericTensor::token_ids(&[0, 4, 6]);
@@ -4916,7 +4923,9 @@ fn qwen3_vl_tp2_runs_full_vision_and_text_lifecycle() {
                 vec![4, 8],
                 vec![1, 16],
                 vec![1, 3, 16],
-                vec![3, 16],
+                // Dense gate/up/down projections preserve batch and sequence
+                // axes through the row-parallel down-projection reduction.
+                vec![1, 3, 16],
             ]
         );
         assert!(trace[..6]
@@ -4960,7 +4969,8 @@ fn qwen_hybrid_constructed_graph_owns_embedded_prediction_depth() {
     assert_eq!(architecture.unit_layout().unwrap().group_count(), 3);
     let description = architecture
         .parameter_description(&NumericContext::default())
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     for target in [
         "mtp.pre_fc_norm_hidden.weight",
         "mtp.pre_fc_norm_embedding.weight",
@@ -6331,7 +6341,11 @@ fn partial_rotary_preserves_non_rotary_head_dimensions() {
 fn hyper_connection_sinkhorn_and_head_match_reference_semantics() {
     struct ZeroParameters;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for ZeroParameters {
-        fn visit_mut(&mut self, _: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            _: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             value.data.fill(0.0);
         }
     }
@@ -6904,7 +6918,11 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
 
     struct Loader;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             value.data = match metadata.id().as_str() {
                 "low_rank.first.weight" => vec![1.0, 0.0, 0.0, 1.0],
                 "low_rank.norm.weight" => vec![1.0, 1.0],
@@ -6941,7 +6959,11 @@ fn causal_depthwise_convolution_matches_prefill_and_incremental_reference() {
 
     struct Loader;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             value.data = match metadata.id().as_str() {
                 "conv.weight" => vec![1.0, 2.0, 1.0, 1.0, 0.0, -1.0],
                 "conv.bias" => vec![0.5, -0.5],
@@ -7016,7 +7038,11 @@ fn gated_short_convolution_matches_chunked_state_continuation() {
 
     struct Loader;
     impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
-        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut NumericTensor) {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadataView<'_>,
+            value: &'a mut NumericTensor,
+        ) {
             value.data = match metadata.id().as_str() {
                 // B=x, C swaps the two channels, and the final projection is identity.
                 "short.in.weight" => {
@@ -7159,7 +7185,10 @@ fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(
     let args = lfm2::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let architecture = lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let description = architecture.parameter_description(&context).unwrap().into_owned();
+    let description = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .into_owned();
     let mut groups = lfm2::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
     for layer in 0..2 {
         let unit = <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -7422,7 +7451,8 @@ fn routed_lfm2_partitioned_pure_pp_uses_ordinary_provider_path() {
         lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
     let description = reference_architecture
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let reference_units = (0..2)
         .map(|index| {
             <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -7649,7 +7679,8 @@ fn dense_lfm2_partitioned_tp2_pp2_matches_replicated_prefill_and_decode() {
         lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -7909,7 +7940,8 @@ fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decod
         kimi_linear::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -8269,7 +8301,8 @@ fn dense_nemotron_h_partitioned_tp2_pp2_matches_prefill_and_repeated_decode() {
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -8588,7 +8621,8 @@ fn routed_nemotron_h_partitioned_relu2_tp2_matches_replicated_prefill_and_decode
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
     let description = reference_architecture
         .parameter_description(&reference_context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let reference_units = (0..4)
         .map(|layer| {
             <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -9265,7 +9299,7 @@ impl<U> std::ops::DerefMut for NumericReplicatedLease<U> {
 struct NumericReplicatedPolicy<U> {
     resident: Option<std::rc::Rc<std::cell::RefCell<Vec<Option<U>>>>>,
     bounded_binding: Option<payload::BoundedBinding>,
-    parameter_overrides: BTreeMap<String, NumericTensor>,
+    parameter_overrides: eredu_runtime::parameter_operations::ParameterReplacementValues<NumericTensor>,
 }
 
 impl<U> Clone for NumericReplicatedPolicy<U> {
@@ -9285,7 +9319,7 @@ impl<U> NumericReplicatedPolicy<U> {
                 units.into_iter().map(Some).collect(),
             ))),
             bounded_binding: None,
-            parameter_overrides: BTreeMap::new(),
+            parameter_overrides: Default::default(),
         }
     }
 
@@ -9293,7 +9327,7 @@ impl<U> NumericReplicatedPolicy<U> {
         Self {
             resident: None,
             bounded_binding: None,
-            parameter_overrides: BTreeMap::new(),
+            parameter_overrides: Default::default(),
         }
     }
 }
@@ -9346,6 +9380,8 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
         build: F,
         operation: V,
         context: &NumericContext,
+
+        _preparation: Option<&()>,
     ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
     where
         F: FnOnce(&NumericContext) -> Result<U, E>,
@@ -9361,27 +9397,21 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
         Ok(true)
     }
 
-    fn publish_parameter_replacements(
+    fn visit_parameter_publication(
         &mut self,
-        values: &BTreeMap<String, NumericTensor>,
-        active: bool,
+        publication: &mut dyn eredu_runtime::parameter_operations::ParameterPublication<NumericTensor>,
     ) -> Result<bool, Self::Error> {
         if let Some(units) = &self.resident {
-            let mut units = units
-                .try_borrow_mut()
+            let mut units = units.try_borrow_mut()
                 .map_err(|_| Error::backend("numeric parameter owner is busy"))?;
             if units.iter().any(Option::is_none) {
                 return Err(Error::backend("numeric parameter unit is leased"));
             }
-            for unit in units.iter_mut() {
-                replace_numeric_parameters(unit.as_mut().unwrap(), values);
+            for unit in units.iter_mut().flatten() {
+                unit.visit_parameters_mut(&mut eredu_runtime::parameter_operations::ParameterPublicationVisitor(publication));
             }
         }
-        self.parameter_overrides = if active {
-            values.clone()
-        } else {
-            BTreeMap::new()
-        };
+        publication.replacement_source(&mut self.parameter_overrides);
         Ok(true)
     }
 
@@ -9436,7 +9466,12 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
             .map(|binding| binding.acquire(ordinal, &mut unit, context))
             .transpose()
             .map_err(LayerwiseAcquireError::Policy)?;
-        replace_numeric_parameters(&mut unit, &self.parameter_overrides);
+        if let Err(cause) = parameter_publication::apply_retained(&mut unit, &self.parameter_overrides) {
+            if let Some(units) = &self.resident {
+                units.borrow_mut()[ordinal] = Some(unit);
+            }
+            return Err(LayerwiseAcquireError::Policy(cause));
+        }
         Ok(NumericReplicatedLease {
             ordinal,
             unit,
@@ -9481,25 +9516,6 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
     }
 }
 
-fn replace_numeric_parameters<U: Parameterized<NumericTensor>>(
-    unit: &mut U,
-    replacements: &BTreeMap<String, NumericTensor>,
-) {
-    struct Replace<'a>(&'a BTreeMap<String, NumericTensor>);
-    impl<'a> ParameterVisitorMut<'a, NumericTensor> for Replace<'_> {
-        fn visit_mut(
-            &mut self,
-            metadata: eredu_nn::ParameterMetadataView<'_>,
-            value: &'a mut NumericTensor,
-        ) {
-            if let Some(replacement) = self.0.get(metadata.id().as_str()) {
-                *value = replacement.clone();
-            }
-        }
-    }
-    unit.visit_parameters_mut(&mut Replace(replacements));
-}
-
 fn numeric_text_output(output: NumericTensor) -> Result<NumericTensor, Error> {
     if output.shape.len() != 3 || output.shape[1] <= 0 {
         return Err(Error::backend(
@@ -9518,6 +9534,21 @@ where
         Error = Error,
     >,
 {
+    fn original_prefill_state_frontier(
+        &self,
+        state: &Self::State,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        state
+            .as_ref()
+            .first()
+            .map(|layer| {
+                u64::try_from(
+                    eredu_runtime::RuntimeStateComponents::<NumericBackend>::position(layer),
+                )
+                .map_err(|_| eredu_runtime::working_memory::WorkingMemoryError::Overflow)
+            })
+            .transpose()
+    }
     fn prefill_state_frontier(&self, state: &Self::State) -> Result<Option<u64>, Self::Error> {
         state
             .as_ref()
@@ -9545,6 +9576,7 @@ where
         Ok(())
     }
 
+    type PromptCacheManifest = eredu_core::cache::PromptCacheManifest;
     type State = DeviceState<NumericBackend, NumericHybridLayerState>;
     type PolicyError = Error;
     type ResidentPolicy = NumericReplicatedPolicy<A::Unit>;
@@ -9728,6 +9760,7 @@ where
 
     fn load_prompt_cache(
         &mut self,
+        _: &Self::State,
         directory: &std::path::Path,
         _: &eredu_core::cache::PromptCacheDescriptor,
         _: &eredu_core::cache::PromptCacheModelIdentity,
@@ -10217,6 +10250,7 @@ type NumericCompositePartitionObservedForward = dyn FnMut(
 
 struct NumericCompositePartitionExecutable {
     media_prefill: Option<Box<media_prefill::PartitionMedia>>,
+    restart_after_cancel: Box<dyn FnMut(usize, u64) -> Result<NumericTensor, Error>>,
     prefill_boundary: Box<
         dyn FnMut(
             &eredu_runtime::PreparedModelInput<NumericTensor>,
@@ -10289,6 +10323,7 @@ impl NumericCompositePartitionExecutable {
 }
 
 struct NumericCompositePartitionVisitor {
+    sources: eredu_architectures::prepared_sources::PreparedModelSources,
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
     checkpoint: RetainedCheckpointSource,
@@ -10449,7 +10484,10 @@ macro_rules! construct_numeric_composite_partition {
         )
         .map_err(|error| Error::backend(error.to_string()))?;
         let session = std::rc::Rc::new(RefCell::new(session));
-        let media_prefill = ($attach)(&session, &admission, &this.context);
+        let media_prefill = ($attach)(&session, &admission, &this.context, &this.sources);
+        let restart_session = std::rc::Rc::clone(&session);
+        let restart_admission = admission.clone();
+        let restart_context = this.context.clone();
         let boundary_session = std::rc::Rc::clone(&session);
         let boundary_context = this.context.clone();
         let boundary_admission = admission.clone();
@@ -10468,6 +10506,15 @@ macro_rules! construct_numeric_composite_partition {
         let observed_world = Arc::clone(&invocation_world);
         Ok(NumericCompositePartitionExecutable {
             media_prefill,
+            restart_after_cancel: Box::new(move |token, frontier| {
+                media_prefill::restart_with_token::<$A, _>(
+                    &mut *restart_session.borrow_mut(),
+                    &restart_admission,
+                    token,
+                    frontier,
+                    &restart_context,
+                )
+            }),
             prefill_boundary: Box::new(move |input, stepped, cancel_after_first| {
                 bounded_readout::parallel_boundary::scheduled::<$A, _>(
                     &mut *boundary_session.borrow_mut(),
@@ -10602,7 +10649,7 @@ impl
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
     {
-        construct_numeric_composite_partition!(A, self, prepared, |_, _, _| None)
+        construct_numeric_composite_partition!(A, self, prepared, |_, _, _, _| None)
     }
 
     fn visit_media<A, G, W>(
@@ -10625,9 +10672,16 @@ impl
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
     {
-        construct_numeric_composite_partition!(A, self, prepared, |session, admission, context| {
-            Some(media_prefill::attach::<A, _>(session, admission, context))
-        })
+        construct_numeric_composite_partition!(
+            A,
+            self,
+            prepared,
+            |session, admission, context, sources| {
+                Some(media_prefill::attach::<A, _>(
+                    session, admission, context, sources,
+                ))
+            }
+        )
     }
 }
 
@@ -10978,6 +11032,7 @@ where
                     }
                 },
                 context,
+                None,
             )
             .map_err(|error| match error {
                 LayerwiseAcquireError::Architecture(error)
@@ -10993,7 +11048,12 @@ where
         values: &BTreeMap<String, NumericTensor>,
         active: bool,
     ) -> Result<bool, Error> {
-        self.publish_parameter_replacements(values, active)
+        let execution = self.inference_execution_identity().clone();
+        parameter_publication::publish(values, active, &execution, |visitor| {
+            self.visit_parameter_publication(visitor)
+        })?;
+        self.finalize_parameter_publication();
+        Ok(true)
     }
     fn numeric_prefill(
         self,
@@ -12070,7 +12130,8 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
             llama::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
         let description = reference_architecture
             .parameter_description(&reference_context)
-            .unwrap().into_owned();
+            .unwrap()
+            .into_owned();
         let units = (0..4)
             .map(|layer| {
                 <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -12778,11 +12839,13 @@ fn routed_tp_pp_ep_collective_wave_schedule_is_exact_for_qwen_and_gpt_oss() {
         qwen::RoutedLayeredModel::<NumericBackend>::new(qwen_args.clone(), &context)
             .unwrap()
             .parameter_description(&context)
-            .unwrap().into_owned();
+            .unwrap()
+            .into_owned();
     let gpt_description = gpt_oss::LayeredModel::<NumericBackend>::new(gpt_args.clone(), &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let qwen_operations = [
         Operation::CountConsensus,
         Operation::ForwardGlobalExpertIds,
@@ -13392,7 +13455,8 @@ fn authoritative_qwen_routed_numeric_sessions_match_partitioned_reference() {
     let description = qwen::RoutedLayeredModel::<NumericBackend>::new(args, &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     assert_authoritative_routed_numeric_sessions(
         "qwen3-moe",
         config,
@@ -13442,12 +13506,14 @@ pub(crate) fn prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_sta
     let v3_description = deepseek::v3::Model::<NumericBackend>::new(v3_args, &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let v4_args = deepseek::parse_v4_config(&v4).unwrap();
     let v4_description = deepseek::v4::Model::<NumericBackend>::new(v4_args, &context)
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned();
+        .unwrap()
+        .into_owned();
     let topologies = [
         ParallelTopology::new(2, 1, 1, 1).unwrap(),
         ParallelTopology::new(1, 2, 1, 1).unwrap(),
@@ -14624,7 +14690,10 @@ fn execute_numeric_routed_visitor_with_policy(
     )
     .unwrap();
     prepared_adapter::routed(sources, context, tokens).unwrap_or_else(|error| {
-        panic!("{} addressable={addressable}: {error}", config["model_type"])
+        panic!(
+            "{} addressable={addressable}: {error}",
+            config["model_type"]
+        )
     })
 }
 
@@ -16297,7 +16366,10 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
         macro_rules! reference_case {
             ($architecture:expr, |$step_tokens:ident| $input:expr) => {{
                 let architecture = $architecture;
-                let description = architecture.parameter_description(&context).unwrap().into_owned();
+                let description = architecture
+                    .parameter_description(&context)
+                    .unwrap()
+                    .into_owned();
                 let parameters = description
                     .groups()
                     .iter()
@@ -17340,7 +17412,10 @@ fn nemotron_tp2_target_mtp_matches_replicated_and_rolls_back_draft_state() {
     let context = NumericContext::default();
     let architecture =
         nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let parameter_description = architecture.parameter_description(&context).unwrap().into_owned();
+    let parameter_description = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .into_owned();
     let groups = parameter_description
         .groups()
         .iter()
@@ -19198,7 +19273,10 @@ fn gemma4_composite_partition_preserves_tasks_boundary_values_and_prepared_ident
         text_transport.merge_destination,
         eredu_runtime::ArchitectureMergeDestination::LastOwner
     );
-    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
+    let parameters = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -19471,7 +19549,8 @@ fn numeric_composite_parameter_description(
             gemma4::LayeredModel::<NumericBackend>::new(family, &context)
                 .unwrap()
                 .parameter_description(&context)
-                .unwrap().into_owned()
+                .unwrap()
+                .into_owned()
         }
         "muse_glimmer" => muse_glimmer::LayeredModel::<NumericBackend>::new(
             muse_glimmer::DecoderConfig::from_hf_value(config).unwrap(),
@@ -19479,28 +19558,32 @@ fn numeric_composite_parameter_description(
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned(),
+        .unwrap()
+        .into_owned(),
         "inkling_mm_model" => inkling::LayeredModel::<NumericBackend>::new(
             inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config).unwrap()).unwrap(),
             &context,
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned(),
+        .unwrap()
+        .into_owned(),
         "qwen3_5" | "qwen3_5_moe" => qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(
             qwen::hybrid::model_args_from_config_value(config).unwrap(),
             &context,
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned(),
+        .unwrap()
+        .into_owned(),
         "qwen3_vl" | "qwen3_vl_moe" => qwen::vl::LayeredModel::<NumericBackend>::new(
             qwen::vl::model_args_from_config_value(config).unwrap(),
             &context,
         )
         .unwrap()
         .parameter_description(&context)
-        .unwrap().into_owned(),
+        .unwrap()
+        .into_owned(),
         other => panic!("unsupported numeric composite partition fixture {other}"),
     }
 }
@@ -20458,7 +20541,10 @@ fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
         vision_transport.merge_destination,
         eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner
     );
-    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
+    let parameters = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -20608,7 +20694,11 @@ fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
         |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
     )
     .unwrap();
-    let admitted = eredu_architectures::media_plan::admit_qwen_vl_input(&args, &original, &NumericInputInspector)
+    let admitted = eredu_architectures::media_plan::admit_qwen_vl_input(
+        &args,
+        &original,
+        &NumericInputInspector,
+    )
     .unwrap();
     let prepared =
         eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
@@ -20642,7 +20732,11 @@ fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
         eredu_architectures::composite_execution::PreparedCompositeInput::new(&changed, &admitted,)
             .is_err()
     );
-    let changed_admitted = eredu_architectures::media_plan::admit_qwen_vl_input(&args, &changed, &NumericInputInspector)
+    let changed_admitted = eredu_architectures::media_plan::admit_qwen_vl_input(
+        &args,
+        &changed,
+        &NumericInputInspector,
+    )
     .unwrap();
     let inactive = numeric_composite_optional_activity_at_begin(
         qwen::vl::LayeredModel::<NumericBackend>::new_parallel(
@@ -20888,7 +20982,10 @@ fn conditional_qwen_dense_partition_preserves_deepstack_state_targets_and_identi
     let architecture =
         qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed.clone(), &context)
             .unwrap();
-    let parameters = architecture.parameter_description(&context).unwrap().into_owned();
+    let parameters = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .into_owned();
     let groups = parameters
         .groups()
         .iter()
@@ -21023,7 +21120,11 @@ fn conditional_qwen_dense_partition_preserves_deepstack_state_targets_and_identi
         |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
     )
     .unwrap();
-    let admitted = eredu_architectures::media_plan::admit_qwen_hybrid_input(&parsed, &original, &NumericInputInspector)
+    let admitted = eredu_architectures::media_plan::admit_qwen_hybrid_input(
+        &parsed,
+        &original,
+        &NumericInputInspector,
+    )
     .unwrap();
     eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
         .unwrap();

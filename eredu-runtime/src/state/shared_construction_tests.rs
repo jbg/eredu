@@ -1,11 +1,11 @@
 use super::*;
-use eredu_core::{AttentionPolicy, LayerSchedule, SharedStorageDomain};
+use eredu_core::{AttentionPolicy, LayerSchedule, SharedStorageAccountingId};
 use eredu_nn::workspace::WorkspaceBackend;
 use std::{
     convert::Infallible,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -36,7 +36,7 @@ fn shared_layout_construction_preserves_published_owner_and_independent_layers()
     let owner = original.layout.as_ref().unwrap().clone();
     let retired = Arc::new(AtomicUsize::new(0));
     owner
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<_, Infallible>(Box::new(Retired(retired.clone())))
         })
         .unwrap();
@@ -72,7 +72,7 @@ fn failed_shared_layout_construction_keeps_existing_owner_and_typed_failure() {
     );
     let retired = Arc::new(AtomicUsize::new(0));
     layout
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<_, Infallible>(Box::new(Retired(retired.clone())))
         })
         .unwrap();
@@ -125,10 +125,12 @@ fn device_layer_tables_keep_independent_identity_and_reuse_only_the_same_extent(
     assert!(!copied_token.same_storage(copy.layer_slot_metadata().unwrap()));
     assert_eq!(copy.as_ref(), [21, 22, 23]);
     assert!(matches!(
-        copied_token.try_attach(&SharedStorageDomain::default(), || Ok::<
+        copied_token.try_attach(&SharedStorageAccountingId::default(), || Ok::<
             Box<dyn Send + Sync>,
             Infallible,
-        >(Box::new(()))),
+        >(
+            Box::new(())
+        )),
         Err(crate::HostSlotAttachmentError::Retired)
     ));
     const EMPTY: DeviceState<WorkspaceBackend, u32> = DeviceState::stateless();
@@ -167,7 +169,7 @@ fn device_layer_token_retains_only_custody_after_actual_elements_retire() {
     .unwrap();
     let token = state.layer_slot_metadata().unwrap().clone();
     token
-        .try_attach(&SharedStorageDomain::default(), || {
+        .try_attach(&SharedStorageAccountingId::default(), || {
             Ok::<Box<dyn Send + Sync>, Infallible>(Box::new(Charge {
                 payload: payload.clone(),
                 retired: retired.clone(),
@@ -178,10 +180,12 @@ fn device_layer_token_retains_only_custody_after_actual_elements_retire() {
     assert_eq!(payload.load(Ordering::SeqCst), 2);
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        token.try_attach(&SharedStorageDomain::default(), || Ok::<
+        token.try_attach(&SharedStorageAccountingId::default(), || Ok::<
             Box<dyn Send + Sync>,
             Infallible,
-        >(Box::new(()))),
+        >(
+            Box::new(())
+        )),
         Err(crate::HostSlotAttachmentError::Retired)
     ));
     drop(token);
@@ -199,10 +203,9 @@ fn layer_copy_plan_borrows_actual_owner_and_preserves_stateless_absence() {
     })
     .unwrap();
     let plan = state.prepare_layer_copy_slots().unwrap().unwrap();
-    assert!(
-        plan.source_metadata()
-            .same_storage(state.layer_slot_metadata().unwrap())
-    );
+    assert!(plan
+        .source_metadata()
+        .same_storage(state.layer_slot_metadata().unwrap()));
     assert_eq!(plan.len(), 2);
     for index in 0..2 {
         assert!(std::ptr::eq(

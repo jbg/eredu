@@ -1,10 +1,13 @@
 //! Ordinary generation consumes the shared prepared semantic source and cursor.
-mod snapshot;
 mod branch;
-pub use branch::PreparedChatBranch;
+mod snapshot;
 use super::*;
-use crate::api::{ConstraintError, request::{BackendGenerationTokenSource, ScopedBackendGenerationTokenSource}};
+use crate::api::{
+    request::{BackendGenerationTokenSource, ScopedBackendGenerationTokenSource},
+    ConstraintError,
+};
 use crate::runtime::generation::streaming::RetainedConsumerCursor;
+pub use branch::PreparedChatBranch;
 use eredu_core::{
     BackendFailure, ControlledTextGeneration, ControlledTextGenerationError,
     GenerationSequenceRequest, GenerationTiming, GenerationTokenIds, ModelRuntime,
@@ -120,11 +123,18 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
             skip_special_tokens,
             output_mode,
             input,
-            options, capture, intervention,
+            options,
+            capture,
+            intervention,
         } = request;
         let invocation = self.prepare_chat_invocation(
-            chat, input, settings, std::num::NonZeroUsize::MIN,
-            stop_sequences, skip_special_tokens, output_mode,
+            chat,
+            input,
+            settings,
+            std::num::NonZeroUsize::MIN,
+            stop_sequences,
+            skip_special_tokens,
+            output_mode,
         )?;
         PreparedChatSession::start(
             &mut self.runtime,
@@ -132,7 +142,12 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
             invocation.input,
             invocation.config,
             chat.eos_token_ids(),
-            Instrumentation { options, capture, intervention, session_id: &self.session_identity },
+            Instrumentation {
+                options,
+                capture,
+                intervention,
+                session_id: &self.session_identity,
+            },
             cancellation,
         )
     }
@@ -153,7 +168,7 @@ impl<B: OriginalChatBackend + eredu_runtime::input::OriginalModelInputBackend> L
             return Ok(None);
         }
         self.validate_prepared_chat(chat)?;
-        let preparation = self.prepare_semantic_source(chat.tokenizer_source(), chat.capacity())?;
+        let preparation = self.prepare_semantic_source(chat.tokenizer_source(), chat.limits())?;
         let funding = preparation.metadata_funding().clone();
         let result = (|| -> Result<_, Cause> {
             let controls = [size_of::<(&Self, &crate::runtime::chat::PreparedChat,
@@ -187,19 +202,30 @@ impl<B: OriginalChatBackend + eredu_runtime::input::OriginalModelInputBackend> L
     }
 }
 
-fn startup_failure<B:TextGenerationBackend>(error:ControlledTextGenerationError<B::Error,ChatControllerError>)->Cause {
+fn startup_failure<B: TextGenerationBackend>(
+    error: ControlledTextGenerationError<B::Error, ChatControllerError>,
+) -> Cause {
     match error {
-        ControlledTextGenerationError::Backend(error)=>Cause::Backend(B::into_backend_failure(error)),
-        ControlledTextGenerationError::Preparation(error)=>Cause::Backend(error),
-        ControlledTextGenerationError::Controller(error)=>Cause::Choice(error),
+        ControlledTextGenerationError::Backend(error) => {
+            Cause::Backend(B::into_backend_failure(error))
+        }
+        ControlledTextGenerationError::Preparation(error) => Cause::Backend(error),
+        ControlledTextGenerationError::Controller(error) => Cause::Choice(error),
     }
 }
 
-type ChatController = eredu_runtime::execution_control::TokenChoiceController<crate::runtime::chat::constraints::ConstraintController>;
-pub(super) type ChatControllerError = eredu_runtime::execution_control::TokenChoiceError<ConstraintError>;
+type ChatController = eredu_runtime::execution_control::TokenChoiceController<
+    crate::runtime::chat::constraints::ConstraintController,
+>;
+pub(super) type ChatControllerError =
+    eredu_runtime::execution_control::TokenChoiceError<ConstraintError>;
 type SourceError = ControlledTextGenerationError<BackendFailure, ChatControllerError>;
 type Cursor = RetainedConsumerCursor<SourceError, SpeculativeOutputError, true>;
-pub(super) type CursorFailure = crate::runtime::generation::streaming::RetainedCursorFailure<SourceError, SpeculativeOutputError, true>;
+pub(super) type CursorFailure = crate::runtime::generation::streaming::RetainedCursorFailure<
+    SourceError,
+    SpeculativeOutputError,
+    true,
+>;
 
 /// The prompt mechanism changes; controller, decoder and commitment do not.
 pub(crate) enum PreparedSemanticInput<'a, B: TextGenerationBackend> {
@@ -219,34 +245,58 @@ pub(crate) struct Instrumentation<'a> {
     session_id: &'a str,
 }
 impl Instrumentation<'_> {
-    fn has_declarations(&self) -> bool { self.capture.is_some() || self.intervention.is_some() }
-    fn compile<B: OriginalChatBackend>(self, runtime: &ModelRuntime<B>, positions: usize,
-        maximum: usize, funding: &HostMetadataFunding)
-        -> Result<Option<eredu_core::TextPreparationOptions>, Cause> {
-        if !self.has_declarations() { return Ok(self.options); }
-        reserve(funding, sum(&[size_of::<Self>(), size_of::<eredu_core::TextPreparationOptions>(),
-            size_of::<eredu_core::capture::CapturePlan>(),
-            size_of::<eredu_runtime::working_memory::OriginalCaptureSource>(),
-            size_of::<eredu_runtime::working_memory::OriginalCaptureSourceError>(),
-            size_of::<eredu_runtime::working_memory::OriginalInterventionSource>(),
-            size_of::<eredu_core::BackendFailure>()]))?;
+    fn has_declarations(&self) -> bool {
+        self.capture.is_some() || self.intervention.is_some()
+    }
+    fn compile<B: OriginalChatBackend>(
+        self,
+        runtime: &ModelRuntime<B>,
+        positions: usize,
+        maximum: usize,
+        funding: &HostMetadataFunding,
+    ) -> Result<Option<eredu_core::TextPreparationOptions>, Cause> {
+        if !self.has_declarations() {
+            return Ok(self.options);
+        }
+        reserve(
+            funding,
+            sum(&[
+                size_of::<Self>(),
+                size_of::<eredu_core::TextPreparationOptions>(),
+                size_of::<eredu_core::capture::CapturePlan>(),
+                size_of::<eredu_runtime::working_memory::OriginalCaptureSource>(),
+                size_of::<eredu_runtime::working_memory::OriginalCaptureSourceError>(),
+                size_of::<eredu_runtime::working_memory::OriginalInterventionSource>(),
+                size_of::<eredu_core::BackendFailure>(),
+            ]),
+        )?;
         let mut options = self.options.unwrap_or_default();
         if (self.capture.is_some() && options.capture.is_some())
-            || (self.intervention.is_some() && options.interventions.is_some()) {
+            || (self.intervention.is_some() && options.interventions.is_some())
+        {
             return Err(TokenInputRejection::IdentityMismatch.into());
         }
         if self.capture.is_some() || options.capture.is_none() {
             let empty = eredu_core::capture::CapturePlan::none();
             let raw = self.capture.unwrap_or(&empty);
-            let request = eredu_core::capture::CaptureRequestShape { batch: 1,
-                prompt_tokens: u64::try_from(positions).map_err(|_| TokenInputRejection::Overflow)?,
-                max_predictions: u64::try_from(maximum).map_err(|_| TokenInputRejection::Overflow)? };
+            let request = eredu_core::capture::CaptureRequestShape {
+                batch: 1,
+                prompt_tokens: u64::try_from(positions)
+                    .map_err(|_| TokenInputRejection::Overflow)?,
+                max_predictions: u64::try_from(maximum)
+                    .map_err(|_| TokenInputRejection::Overflow)?,
+            };
             let source = B::compile_original_capture_declaration(runtime, raw, request, funding)?;
             options.capture = Some(source.plan().clone());
         }
         if let Some(raw) = self.intervention {
-            let source = B::compile_original_intervention_declaration(runtime, raw,
-                options.capture.as_ref().expect("compiled capture geometry"), self.session_id, funding)?;
+            let source = B::compile_original_intervention_declaration(
+                runtime,
+                raw,
+                options.capture.as_ref().expect("compiled capture geometry"),
+                self.session_id,
+                funding,
+            )?;
             options.interventions = Some(source.plan().clone());
         }
         Ok(Some(options))
@@ -311,19 +361,24 @@ impl<'a, B: OriginalChatBackend> PreparedChatSession<'a, B> {
                     size_of::<eredu_core::TextSamplingBoundary<'_, B>>(),
                     size_of::<eredu_core::execution_control::SamplingOverride>(),
                     size_of::<eredu_core::execution_control::SamplingStateFacts>(),
-                    size_of::<(TextGenerationConfig, eredu_core::ResolvedGenerationConfig, u64, eredu_core::TextInferencePolicy)>(),
-                    size_of::<Result<eredu_core::execution_control::SamplingStateFacts,
-                        eredu_core::execution_control::SamplingOverrideError<B::Error>>>(),
+                    size_of::<(
+                        TextGenerationConfig,
+                        eredu_core::ResolvedGenerationConfig,
+                        u64,
+                        eredu_core::TextInferencePolicy,
+                    )>(),
+                    size_of::<
+                        Result<
+                            eredu_core::execution_control::SamplingStateFacts,
+                            eredu_core::execution_control::SamplingOverrideError<B::Error>,
+                        >,
+                    >(),
                     size_of::<PreparedSemanticInput<'_, B>>(),
-                size_of::<ControlledTextGenerationError<B::Error,ChatControllerError>>(),
+                    size_of::<ControlledTextGenerationError<B::Error, ChatControllerError>>(),
                     size_of::<Result<Option<Self>, PreparedChatSessionError>>(),
                     size_of::<
                         Result<
-                            ControlledTextGeneration<
-                                '_,
-                                B,
-                                ChatController,
-                            >,
+                            ControlledTextGeneration<'_, B, ChatController>,
                             ControlledTextGenerationError<B::Error, ChatControllerError>,
                         >,
                     >(),
@@ -345,10 +400,14 @@ impl<'a, B: OriginalChatBackend> PreparedChatSession<'a, B> {
                     n.checked_add(BackendFailure::source_retention_peak_bytes::<SourceError>()?)
                 }),
             )?;
-            let domain = preparation.tokenizer().generation_domain()
+            let domain = preparation
+                .tokenizer()
+                .generation_domain()
                 .and_then(eredu_core::TokenFilter::allowed_mask)
-                .ok_or(TokenInputRejection::IdentityMismatch)?.len();
-            let controller = ChatController::new(controller, eredu_runtime::TokenDomain::new(domain));
+                .ok_or(TokenInputRejection::IdentityMismatch)?
+                .len();
+            let controller =
+                ChatController::new(controller, eredu_runtime::TokenDomain::new(domain));
             let request = GenerationSequenceRequest::new(maximum, eos)
                 .with_consumer(&layout)
                 .with_semantic_state(&semantic);
@@ -356,10 +415,29 @@ impl<'a, B: OriginalChatBackend> PreparedChatSession<'a, B> {
             let generator = match input {
                 PreparedSemanticInput::TokenIds(ids) => {
                     let ids = TokenIdsInputPlan::new(ids)?;
-                    attribution = Some(crate::api::control::records::PromptRecord::from_tokens(ids.tokens(), &funding)?.prepared().clone());
-                    let options = instrumentation.compile::<B>(runtime, ids.tokens().len(), maximum, &funding)?;
-                    ControlledTextGeneration::from_token_ids_with_sequence(runtime, ids,
-                        config, controller, options, request).map_err(startup_failure::<B>)?
+                    attribution = Some(
+                        crate::api::control::records::PromptRecord::from_tokens(
+                            ids.tokens(),
+                            &funding,
+                        )?
+                        .prepared()
+                        .clone(),
+                    );
+                    let options = instrumentation.compile::<B>(
+                        runtime,
+                        ids.tokens().len(),
+                        maximum,
+                        &funding,
+                    )?;
+                    ControlledTextGeneration::from_token_ids_with_sequence(
+                        runtime,
+                        ids,
+                        config.clone(),
+                        controller,
+                        options,
+                        request,
+                    )
+                    .map_err(startup_failure::<B>)?
                 }
                 PreparedSemanticInput::Text(text) => {
                     let encoded =
@@ -370,11 +448,28 @@ impl<'a, B: OriginalChatBackend> PreparedChatSession<'a, B> {
                     if cancellation.is_cancelled() {
                         return Ok(None);
                     }
-                    attribution = Some(crate::api::control::records::PromptRecord::from_tokens(encoded.ids(), &funding)?.prepared().clone());
+                    attribution = Some(
+                        crate::api::control::records::PromptRecord::from_tokens(
+                            encoded.ids(),
+                            &funding,
+                        )?
+                        .prepared()
+                        .clone(),
+                    );
                     let ids = TokenIdsInputPlan::new(encoded.ids())?;
-                    let options = instrumentation.compile::<B>(runtime, ids.tokens().len(), maximum, &funding)?;
+                    let options = instrumentation.compile::<B>(
+                        runtime,
+                        ids.tokens().len(),
+                        maximum,
+                        &funding,
+                    )?;
                     let generator = ControlledTextGeneration::from_token_ids_with_sequence(
-                        runtime, ids, config, controller, options, request,
+                        runtime,
+                        ids,
+                        config.clone(),
+                        controller,
+                        options,
+                        request,
                     )
                     .map_err(startup_failure::<B>)?;
                     generator
@@ -391,13 +486,30 @@ impl<'a, B: OriginalChatBackend> PreparedChatSession<'a, B> {
                         input_funding = Some(retained);
                         return Err(TokenInputRejection::IdentityMismatch.into());
                     }
-                    if let Some(binding) = input.chat_binding().filter(|binding| binding.semantics().is_some()) {
-                        attribution = Some(crate::api::control::records::PromptRecord::from_media(binding, &funding)?.prepared().clone());
+                    if let Some(binding) = input
+                        .chat_binding()
+                        .filter(|binding| binding.semantics().is_some())
+                    {
+                        attribution = Some(
+                            crate::api::control::records::PromptRecord::from_media(
+                                binding, &funding,
+                            )?
+                            .prepared()
+                            .clone(),
+                        );
                     }
                     let positions = if instrumentation.has_declarations() {
-                        Some(input.chat_binding().and_then(|binding| binding.semantics())
-                            .ok_or(TokenInputRejection::Unsupported)?.layout().positions())
-                    } else { None };
+                        Some(
+                            input
+                                .chat_binding()
+                                .and_then(|binding| binding.semantics())
+                                .ok_or(TokenInputRejection::Unsupported)?
+                                .layout()
+                                .positions(),
+                        )
+                    } else {
+                        None
+                    };
                     let (prompt, retained) = input.into_parts();
                     input_funding = Some(retained);
                     B::validate_original_prepared_input_domain(
@@ -405,11 +517,16 @@ impl<'a, B: OriginalChatBackend> PreparedChatSession<'a, B> {
                         &prompt,
                         preparation.tokenizer(),
                     )?;
-                    let options = instrumentation.compile::<B>(runtime, positions.unwrap_or(0), maximum, &funding)?;
+                    let options = instrumentation.compile::<B>(
+                        runtime,
+                        positions.unwrap_or(0),
+                        maximum,
+                        &funding,
+                    )?;
                     let generator = ControlledTextGeneration::from_input_with_sequence(
                         runtime,
                         TextGenerationInput::OriginalPrepared(prompt),
-                        config,
+                        config.clone(),
                         controller,
                         options,
                         request,
@@ -473,29 +590,45 @@ impl<'a, B: TextGenerationBackend> PreparedChatSession<'a, B> {
 
 impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
     pub(crate) fn semantic_snapshot_bytes(&self) -> Option<u64> {
-        let prepared = self.semantic.prepared_source()?.downcast_ref::<eredu_runtime::working_memory::PreparedSemanticState>()?;
+        let prepared = self
+            .semantic
+            .prepared_source()?
+            .downcast_ref::<eredu_runtime::working_memory::PreparedSemanticState>()?;
         u64::try_from(prepared.copy_bytes()?).ok()
     }
-    pub(crate) fn sampling_control_support(&self) -> eredu_core::execution_control::ControlSupport<&'static str> {
+    pub(crate) fn sampling_control_support(
+        &self,
+    ) -> eredu_core::execution_control::ControlSupport<&'static str> {
         B::text_sampling_control_support(self.source.generator.runtime())
     }
-    pub(crate) fn prepared_artifact_identity(&self) -> Option<eredu_core::artifact::ArtifactIdentity> {
+    pub(crate) fn prepared_artifact_identity(
+        &self,
+    ) -> Option<eredu_core::artifact::ArtifactIdentity> {
         B::prepared_artifact_identity(self.source.generator.runtime())
     }
     pub(crate) fn metadata_funding(&self) -> &HostMetadataFunding {
         self.preparation.metadata_funding()
     }
-    pub(crate) fn effective_config(&self) -> TextGenerationConfig { self.effective_config }
+    pub(crate) fn effective_config(&self) -> TextGenerationConfig {
+        self.effective_config.clone()
+    }
     pub(crate) fn last_committed_was_forced(&self) -> bool {
-        self.source.generator.controller().last_committed_was_forced()
+        self.source
+            .generator
+            .controller()
+            .last_committed_was_forced()
     }
     /// Records outside advancement use the same retained readiness source and
     /// exact cancellation vote; a local failure is never replaced by agreement.
     pub(crate) fn finish_record_delivery<T, E>(
-        &self, local: Result<Option<T>, E>, map_backend: impl FnOnce(BackendFailure) -> E,
+        &self,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
     ) -> Result<Option<T>, E> {
         self.source.generator.finish_text_preparation_cancellable(
-            eredu_core::run_preparation::TextPreparationStage::Delivery, local, map_backend,
+            eredu_core::run_preparation::TextPreparationStage::Delivery,
+            local,
+            map_backend,
         )
     }
     /// Borrows the selected request geometry and its historical admission.
@@ -536,19 +669,34 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
     /// A later explicit advancement resumes this same state.
     pub fn pause(&mut self) -> Result<(), PreparedChatSessionError> {
         self.control_boundary()?;
-        self.lifecycle.pause().map_err(|cause| self.control_failure(cause.into()))
+        self.lifecycle
+            .pause()
+            .map_err(|cause| self.control_failure(cause.into()))
     }
 
-    fn control_boundary(&mut self) -> Result<eredu_core::TextTokenChoiceBoundary<'_, ChatController>, PreparedChatSessionError> {
+    fn control_boundary(
+        &mut self,
+    ) -> Result<eredu_core::TextTokenChoiceBoundary<'_, ChatController>, PreparedChatSessionError>
+    {
         if self.finish_reason().is_some() {
-            return Err(self.control_failure(Cause::Boundary(eredu_core::TextContinuationError::Failed)));
+            return Err(
+                self.control_failure(Cause::Boundary(eredu_core::TextContinuationError::Failed))
+            );
         }
         let funding = Some(self.preparation.metadata_funding().clone());
         let input_funding = self.input_funding.clone();
-        self.source.generator.token_choice_boundary().map_err(|error| {
-            let error = crate::api::control::map_continuation_failure(error, B::into_backend_failure);
-            PreparedChatSessionError { cause: Cause::Boundary(error), funding, input_funding }
-        })
+        self.source
+            .generator
+            .token_choice_boundary()
+            .map_err(|error| {
+                let error =
+                    crate::api::control::map_continuation_failure(error, B::into_backend_failure);
+                PreparedChatSessionError {
+                    cause: Cause::Boundary(error),
+                    funding,
+                    input_funding,
+                }
+            })
     }
 
     fn control_failure(&self, cause: Cause) -> PreparedChatSessionError {
@@ -603,7 +751,13 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
     pub(crate) fn advance_with_delivery(
         self,
         cancellation: &GenerationCancellationToken,
-        mut observer: Option<&mut dyn FnMut(Option<u32>, Option<eredu_core::capture::SharedCapturedStep>, crate::api::request::TokenDeliveryFacts)>,
+        mut observer: Option<
+            &mut dyn FnMut(
+                Option<u32>,
+                Option<eredu_core::capture::SharedCapturedStep>,
+                crate::api::request::TokenDeliveryFacts,
+            ),
+        >,
         delivery_failure: Option<&dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
         emit: &mut impl FnMut(SemanticEvent),
     ) -> Result<Self, PreparedChatSessionError> {
@@ -622,11 +776,13 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
             preparation,
         } = self;
         let committed_before = cursor.token_ids().len();
-        lifecycle.begin_prediction().map_err(|cause| PreparedChatSessionError {
-            cause: cause.into(),
-            funding: Some(preparation.metadata_funding().clone()),
-            input_funding: input_funding.clone(),
-        })?;
+        lifecycle
+            .begin_prediction()
+            .map_err(|cause| PreparedChatSessionError {
+                cause: cause.into(),
+                funding: Some(preparation.metadata_funding().clone()),
+                input_funding: input_funding.clone(),
+            })?;
         let started = Instant::now();
         source.generation_started = started
             .checked_sub(active)
@@ -634,25 +790,36 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
         let has_observer = observer.is_some();
         let mut delivery = |token, capture, step_seconds, timing, controller: &ChatController| {
             if let Some(callback) = observer.as_deref_mut() {
-                callback(token, capture, crate::api::request::TokenDeliveryFacts {
-                    step_seconds, timing,
-                    forced: token.is_some() && controller.last_committed_was_forced(),
-                });
+                callback(
+                    token,
+                    capture,
+                    crate::api::request::TokenDeliveryFacts {
+                        step_seconds,
+                        timing,
+                        forced: token.is_some() && controller.last_committed_was_forced(),
+                    },
+                );
             }
         };
         let result = cursor.advance_semantic(
             &mut source.scoped(has_observer.then_some(&mut delivery), delivery_failure),
-            &mut semantic, cancellation, emit,
+            &mut semantic,
+            cancellation,
+            emit,
         );
         match result {
             Ok(cursor) => {
                 let transition = if cursor.token_ids().len() == committed_before {
                     match cursor.finish_reason() {
-                        Some(reason) => lifecycle.finish_without_prediction(reason).map_err(Cause::from),
+                        Some(reason) => lifecycle
+                            .finish_without_prediction(reason)
+                            .map_err(Cause::from),
                         None => Err(Cause::MissingProgress),
                     }
                 } else {
-                    lifecycle.complete_prediction(cursor.finish_reason()).map_err(Cause::from)
+                    lifecycle
+                        .complete_prediction(cursor.finish_reason())
+                        .map_err(Cause::from)
                 };
                 transition.map_err(|cause| PreparedChatSessionError {
                     cause: cause.into(),
@@ -660,26 +827,34 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
                     input_funding: input_funding.clone(),
                 })?;
                 Ok(Self {
-                source,
-                semantic,
-                effective_config,
-                active: active + started.elapsed(),
-                cursor,
-                lifecycle,
-                attribution,
-                input_funding,
-                preparation,
-            })},
+                    source,
+                    semantic,
+                    effective_config,
+                    active: active + started.elapsed(),
+                    cursor,
+                    lifecycle,
+                    attribution,
+                    input_funding,
+                    preparation,
+                })
+            }
             Err(failure) => {
                 let funding = preparation.metadata_funding().clone();
-                let (kind,operation) = match failure.cause() {
+                let (kind, operation) = match failure.cause() {
                     crate::runtime::generation::streaming::CommittedGenerationError::Source(
-                        ControlledTextGenerationError::Preparation(error)|ControlledTextGenerationError::Backend(error),
-                    ) => (error.kind(),error.operation()),
-                    _ => (eredu_core::BackendFailureKind::Other,"prepared chat advancement"),
+                        ControlledTextGenerationError::Preparation(error)
+                        | ControlledTextGenerationError::Backend(error),
+                    ) => (error.kind(), error.operation()),
+                    _ => (
+                        eredu_core::BackendFailureKind::Other,
+                        "prepared chat advancement",
+                    ),
                 };
                 drop(source);
-                let cause = failure.into_backend_failure(kind).with_operation(operation).into();
+                let cause = failure
+                    .into_backend_failure(kind)
+                    .with_operation(operation)
+                    .into();
                 Err(PreparedChatSessionError {
                     cause,
                     funding: Some(funding),
@@ -748,19 +923,29 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
 }
 
 impl<B: eredu_core::execution_control::TextSamplingControlBackend> PreparedChatSession<'_, B> {
-    fn sampling_boundary(&mut self) -> Result<eredu_core::TextSamplingBoundary<'_, B>, PreparedChatSessionError> {
+    fn sampling_boundary(
+        &mut self,
+    ) -> Result<eredu_core::TextSamplingBoundary<'_, B>, PreparedChatSessionError> {
         let funding = Some(self.preparation.metadata_funding().clone());
         let input_funding = self.input_funding.clone();
-        self.source.generator.sampling_boundary().map_err(|error| PreparedChatSessionError {
-            cause: Cause::Boundary(crate::api::control::map_continuation_failure(error, B::into_backend_failure)),
-            funding,
-            input_funding,
-        })
+        self.source
+            .generator
+            .sampling_boundary()
+            .map_err(|error| PreparedChatSessionError {
+                cause: Cause::Boundary(crate::api::control::map_continuation_failure(
+                    error,
+                    B::into_backend_failure,
+                )),
+                funding,
+                input_funding,
+            })
     }
 
     /// Reads the existing sampler's compatibility facts at a completed boundary,
     /// including terminal state. The same source-health and delivery checks apply.
-    pub fn sampling_state(&mut self) -> Result<eredu_core::execution_control::SamplingStateFacts, PreparedChatSessionError> {
+    pub fn sampling_state(
+        &mut self,
+    ) -> Result<eredu_core::execution_control::SamplingStateFacts, PreparedChatSessionError> {
         Ok(self.sampling_boundary()?.facts())
     }
 
@@ -772,20 +957,24 @@ impl<B: eredu_core::execution_control::TextSamplingControlBackend> PreparedChatS
         request: eredu_core::execution_control::SamplingOverride,
     ) -> Result<eredu_core::execution_control::SamplingStateFacts, PreparedChatSessionError> {
         if self.finish_reason().is_some() {
-            return Err(self.control_failure(Cause::Boundary(eredu_core::TextContinuationError::Failed)));
+            return Err(
+                self.control_failure(Cause::Boundary(eredu_core::TextContinuationError::Failed))
+            );
         }
         let facts = self.sampling_boundary()?.apply(request).map_err(|error| {
             self.control_failure(Cause::Sampling(crate::api::control::map_sampling_failure(
-                error, B::into_backend_failure,
+                error,
+                B::into_backend_failure,
             )))
         })?;
         let mut sampling = self.effective_config.sampling();
         sampling.temperature = facts.temperature;
         sampling.do_sample = facts.temperature > 0.0;
         self.effective_config = saved_configuration(
-            self.effective_config, sampling,
+            self.effective_config.clone(),
+            sampling,
             request.reseed.unwrap_or(self.effective_config.seed()),
-            self.effective_config.inference_policy(),
+            self.effective_config.inference_policy().clone(),
         );
         Ok(facts)
     }
@@ -799,7 +988,9 @@ fn saved_configuration(
     seed: u64,
     inference: eredu_core::TextInferencePolicy,
 ) -> TextGenerationConfig {
-    let config = TextGenerationConfig::new(sampling).with_seed(seed).with_inference_policy(inference);
+    let config = TextGenerationConfig::new(sampling)
+        .with_seed(seed)
+        .with_inference_policy(inference);
     match saved.strategy() {
         eredu_core::TextSamplingStrategy::Standard => config,
         eredu_core::TextSamplingStrategy::MirostatV2 { tau, eta } => config

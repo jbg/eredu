@@ -47,7 +47,7 @@ fn unsealed_owner_rejects_queries_and_publishes_a_changed_empty_boundary_once() 
 fn unquoted_retention_cannot_seal_and_rejection_keeps_owner_pending() {
     let before = InferenceRetention::new();
     let seal = OpeningSeal::pending(&before);
-    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(100, 0).unwrap();
+    let pool = crate::memory_fixture::ledger(100, 0).unwrap();
     let lease = pool.acquire_unquoted().unwrap();
     let mut retained = InferenceRetention::new();
     retained.retain_unquoted(&lease);

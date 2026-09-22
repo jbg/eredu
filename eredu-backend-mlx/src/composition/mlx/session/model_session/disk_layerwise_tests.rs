@@ -3,13 +3,15 @@
 use super::*;
 use crate::backend::nn::shared::MlxNeuralBackend;
 use crate::backend::runtime::residency::storage::RetainedStorage;
+#[cfg(test)]
+use crate::memory_fixture::LedgerFixture as _;
 use crate::tests::support::path_instrumentation as paths;
 use eredu_core::{
     residency::{MemoryTier, ResidencyPolicy},
     ControlledTextGeneration, InferenceGeometry, OutputDemand, TextGeneration, TextGenerationInput,
     TextPreparationInput, TokenFilterController,
 };
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, WorkingMemoryError};
 
 const LAYERS: usize = 3;
 const DEVICE_BUDGET: u64 = 1 << 30;
@@ -67,7 +69,10 @@ pub(super) fn config(temperature: f32, chunk: u64, capacity: u64) -> TextGenerat
     .with_seed(19)
     .with_inference_policy(eredu_core::TextInferencePolicy {
         prefill_chunk_positions: std::num::NonZeroU64::new(chunk),
-        managed_memory_capacity_bytes: Some(capacity),
+        memory_limits: eredu_core::MemoryLimitDeclarations::new([(
+            "host".into(),
+            eredu_core::MemoryLimit::Finite(capacity),
+        )]),
         submission_tracking_capacity_bytes: None,
         graph_metadata_capacity_bytes: None,
     })
@@ -122,7 +127,7 @@ pub(super) fn artifact_with_layers(layers: usize, tied: bool) -> tempfile::TempD
 
 pub(super) fn load_runtime(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     disk: bool,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     load_runtime_from_artifact(stream, pool, disk, artifact())
@@ -130,7 +135,7 @@ pub(super) fn load_runtime(
 
 pub(super) fn load_runtime_with_context(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     disk: bool,
     maximum_positions: usize,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
@@ -145,12 +150,12 @@ pub(super) fn load_runtime_with_context(
 
 fn load_runtime_from_artifact(
     stream: &Stream,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     disk: bool,
     artifact: tempfile::TempDir,
 ) -> (ModelRuntime<MlxBackend<'static>>, tempfile::TempDir) {
     let source = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let backend = MlxBackend::new(stream, &source).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(stream, &source).with_memory_ledger(pool.clone());
     let residency = if disk {
         eredu_runtime::WeightResidency::dense_disk_stream(
             eredu_runtime::DenseDiskStreamLoadOptions::new(DEVICE_BUDGET, 0, 0, 0).unwrap(),
@@ -251,14 +256,15 @@ pub(super) fn assert_disk_window(runtime: &ModelRuntime<MlxBackend<'_>>) {
 }
 
 pub(super) fn reclaim() {
+    safemlx::memory::clear_cache();
     MlxNeuralBackend::reclaim_retired_resources();
     safemlx::reclaim_allocation_owners();
 }
 
-pub(super) fn settle(pool: &WorkingMemoryPool, bytes: u64) {
+pub(super) fn settle(pool: &MemoryLedger, bytes: u64) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         reclaim();
-        pool.used_bytes().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
+        pool.fixture_host_charge().unwrap() == bytes && pool.unquoted_owner_count().unwrap() == 0
     });
 }
 
@@ -288,12 +294,12 @@ pub(super) fn live_bytes(runtime: Option<&ModelRuntime<MlxBackend<'_>>>, arrays:
 
 pub(super) fn exact_capacity(
     runtime: &ModelRuntime<MlxBackend<'_>>,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     ids: &Vec<u32>,
     temperature: f32,
     chunk: u64,
 ) -> (u64, u64) {
-    let baseline = pool.used_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
     let preparation = MlxBackend::admit_text_preparation(
         runtime,
         &evidence(ids),
@@ -307,10 +313,13 @@ pub(super) fn exact_capacity(
         .unwrap()
         .request()
         .memory_reservation()
+        .requirements()
+        .get(crate::memory_fixture::topology().host_domain())
         .unwrap()
-        .bytes();
+        .total()
+        .unwrap();
     assert!(bytes > 0);
-    let capacity = pool.used_bytes().unwrap();
+    let capacity = pool.fixture_host_charge().unwrap();
     assert_eq!(capacity, baseline + bytes);
     drop(preparation);
     settle(pool, baseline);
@@ -325,11 +334,13 @@ pub(super) fn outputs(
 ) -> Vec<MlxTextToken> {
     let controller = Controller::default();
     let outputs = if controlled {
-        let outputs = ControlledTextGeneration::from_input(
+        let outputs = ControlledTextGeneration::from_token_ids_with_sequence(
             runtime,
-            TextGenerationInput::TokenIds(ids),
+            eredu_core::TokenIdsInputPlan::new(&ids).unwrap(),
             generation,
             controller.clone(),
+            None,
+            eredu_core::GenerationSequenceRequest::new(4, &[]),
         )
         .unwrap()
         .map(|token| token.unwrap().into_output())
@@ -337,10 +348,17 @@ pub(super) fn outputs(
         assert_eq!(controller.0.get(), (4, 4));
         outputs
     } else {
-        TextGeneration::new(runtime, ids, generation)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>()
+        TextGeneration::from_token_ids_with_sequence(
+            runtime,
+            eredu_core::TokenIdsInputPlan::new(&ids).unwrap(),
+            generation,
+            TokenFilter::All,
+            None,
+            eredu_core::GenerationSequenceRequest::new(4, &[]),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
     };
     assert_eq!(outputs.len(), 4);
     for (attempt, token) in outputs.iter().enumerate() {
@@ -369,7 +387,9 @@ pub(super) fn cause<'a, T: std::error::Error + 'static>(
 
 #[test]
 fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     let (mut runtime, artifact) = load_runtime(&stream, &pool, true);
@@ -378,8 +398,8 @@ fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks
     let paths_before = paths::snapshot();
     let inputs = paths::session_input_creation_attempts();
     let resets = paths::session_reset_attempts();
-    let baseline = pool.used_bytes().unwrap();
-    let peak = pool.peak_bytes().unwrap();
+    let baseline = pool.fixture_host_charge().unwrap();
+    let peak = pool.fixture_host_peak().unwrap();
     let geometry = InferenceGeometry {
         batch_size: 1,
         cached_positions: 0,
@@ -414,8 +434,8 @@ fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks
         }
         previous = Some(quote);
     }
-    assert_eq!(pool.peak_bytes().unwrap(), peak);
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_peak().unwrap(), peak);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     assert_eq!(report(&runtime), before);
     assert_eq!(paths::snapshot(), paths_before);
     let (capacity, _) = exact_capacity(&runtime, &pool, &tokens(), 0.7, 1);
@@ -432,7 +452,9 @@ fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks
     .expect("minimum chunk cannot shrink to fit one byte less");
     assert!(matches!(
         cause::<WorkingMemoryError>(&error),
-        Some(WorkingMemoryError::BudgetExceeded { .. })
+        Some(WorkingMemoryError::Domain(
+            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+        ))
     ));
     assert!(TEST_SAMPLING_FAILURE.with(|slot| slot.borrow().is_some()));
     assert_eq!(controller.0.get(), (0, 0));
@@ -440,18 +462,20 @@ fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks
     assert_eq!(paths::session_input_creation_attempts(), inputs);
     assert_eq!(paths::session_reset_attempts(), resets);
     assert_eq!(report(&runtime), before);
-    assert_eq!(pool.used_bytes().unwrap(), baseline);
+    assert_eq!(pool.fixture_host_charge().unwrap(), baseline);
     drop((error, failure));
     let outputs = outputs(&mut runtime, tokens(), config(0.7, 1, capacity), true);
     assert_disk_window(&runtime);
-    assert!(pool.peak_bytes().unwrap() <= capacity);
+    assert!(pool.fixture_host_peak().unwrap() <= capacity);
     drop((outputs, runtime, artifact));
     settle(&pool, native_baseline);
 }
 
 #[test]
 fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drivers() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     for temperature in [0.0, 0.7] {
@@ -460,7 +484,7 @@ fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drive
             for controlled in [false, true] {
                 let (mut runtime, artifact) = load_runtime(&stream, &pool, disk);
                 let (capacity, _) = exact_capacity(&runtime, &pool, &tokens(), temperature, 2);
-                let previous_peak = pool.peak_bytes().unwrap();
+                let previous_peak = pool.fixture_host_peak().unwrap();
                 let acquisitions = paths::bounded_unit_acquisitions();
                 let before = disk.then(|| report(&runtime));
                 let output = outputs(
@@ -495,7 +519,7 @@ fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drive
                             > before.offload().tier_evictions(MemoryTier::Device).count()
                     );
                 }
-                assert!(pool.peak_bytes().unwrap() <= previous_peak.max(capacity));
+                assert!(pool.fixture_host_peak().unwrap() <= previous_peak.max(capacity));
                 drop((output, runtime, artifact));
                 settle(&pool, native_baseline);
             }
@@ -505,12 +529,18 @@ fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drive
 
 #[test]
 fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_physical_roots() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     for controlled in [false, true] {
         let (mut runtime, artifact) = load_runtime(&stream, &pool, true);
-        let retained_overhead = pool.used_bytes().unwrap().checked_sub(live_bytes(Some(&runtime), &[])).unwrap();
+        let retained_overhead = pool
+            .fixture_host_charge()
+            .unwrap()
+            .checked_sub(live_bytes(Some(&runtime), &[]))
+            .unwrap();
         let (cold_capacity, _) = exact_capacity(&runtime, &pool, &tokens(), 0.0, 2);
         // Exercise reuse within one finite ceiling. The separate capacity
         // handoff tests cover an explicitly larger successor policy.
@@ -534,14 +564,17 @@ fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_ph
             .iter()
             .map(|token| &token.value)
             .collect::<Vec<_>>();
-        settle(&pool, retained_overhead + live_bytes(Some(&runtime), &old_arrays));
+        settle(
+            &pool,
+            retained_overhead + live_bytes(Some(&runtime), &old_arrays),
+        );
         drop(old_arrays);
-        assert_eq!(pool.effective_capacity().unwrap(), capacity);
+        assert_eq!(pool.fixture_host_limit().unwrap(), capacity);
 
         // A's final token was emitted but not decoded. Reuse appends it once.
         let continuation = vec![ids_a[3], 6, 7];
         let before = report(&runtime);
-        let baseline = pool.used_bytes().unwrap();
+        let baseline = pool.fixture_host_charge().unwrap();
         let preparation = MlxBackend::admit_text_preparation(
             &runtime,
             &evidence(&continuation),
@@ -555,11 +588,14 @@ fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_ph
             .unwrap()
             .request()
             .memory_reservation()
+            .requirements()
+            .get(crate::memory_fixture::topology().host_domain())
             .unwrap()
-            .bytes();
-        assert_eq!(pool.used_bytes().unwrap(), baseline + charge_b);
+            .total()
+            .unwrap();
+        assert_eq!(pool.fixture_host_charge().unwrap(), baseline + charge_b);
         assert!(baseline + charge_b <= capacity);
-        assert_eq!(pool.effective_capacity().unwrap(), capacity);
+        assert_eq!(pool.fixture_host_limit().unwrap(), capacity);
         drop(preparation);
         settle(&pool, baseline);
         let output_b = outputs(
@@ -581,10 +617,10 @@ fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_ph
             report(&runtime).weight_store().physical_reads > before.weight_store().physical_reads
         );
         assert_eq!(token_ids(&output_a), ids_a);
-        assert!(pool.peak_bytes().unwrap() <= capacity);
-        assert_eq!(pool.effective_capacity().unwrap(), capacity);
+        assert!(pool.fixture_host_peak().unwrap() <= capacity);
+        assert_eq!(pool.fixture_host_limit().unwrap(), capacity);
 
-        let reference_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let reference_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
         let (mut resident, resident_artifact) = load_runtime(&stream, &reference_pool, false);
         let mut full = tokens();
         full.extend_from_slice(&ids_a);
@@ -611,17 +647,19 @@ fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_ph
         assert!(token_bytes > 0);
         drop((output_a, output_b, old_owner, runtime, artifact));
         settle(&pool, native_baseline + token_bytes);
-        assert_eq!(pool.effective_capacity().unwrap(), capacity);
+        assert_eq!(pool.fixture_host_limit().unwrap(), capacity);
         assert_eq!(alias.evaluated().unwrap().item::<u32>(), ids_a[0]);
         drop(alias);
         settle(&pool, native_baseline);
-        assert_eq!(pool.effective_capacity().unwrap(), u64::MAX);
+        assert_eq!(pool.fixture_host_limit().unwrap(), u64::MAX);
     }
 }
 
 #[test]
 fn disk_payload_release_waits_for_recovery_ticket_but_not_completed_owner_aliases() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     let (runtime, artifact) = load_runtime(&stream, &pool, true);
@@ -632,8 +670,10 @@ fn disk_payload_release_waits_for_recovery_ticket_but_not_completed_owner_aliase
         Rc::new(Cell::new(false)),
         SubmissionPurpose::OriginalModel,
     );
-    owner.payload.replace(Some(runtime.session().payload.clone()));
-    let bytes = pool.used_bytes().unwrap();
+    owner
+        .payload
+        .replace(Some(runtime.session().payload.clone()));
+    let bytes = pool.fixture_host_charge().unwrap();
     assert!(bytes > native_baseline);
     let ticket = owner.ticket();
     let escaped_owner = owner.clone();
@@ -644,7 +684,7 @@ fn disk_payload_release_waits_for_recovery_ticket_but_not_completed_owner_aliase
     drop((owner, runtime, artifact));
     reclaim();
     assert!(!retired());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.fixture_host_charge().unwrap(), bytes);
     drop(ticket);
     authority.require_idle().unwrap();
     assert!(escaped_owner.payload.borrow().is_none());
@@ -661,7 +701,9 @@ fn disk_payload_release_waits_for_recovery_ticket_but_not_completed_owner_aliase
 
 #[test]
 fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding() {
-    if !crate::tests::support::native_process::enter("main") { return; }
+    if !crate::tests::support::native_process::enter("main") {
+        return;
+    }
     let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
     let stream = streams.execution();
     let (mut runtime, artifact) = load_runtime(&stream, &pool, true);
@@ -692,7 +734,9 @@ fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding
         matches!(
             cause::<eredu_checkpoint::store::EncodedReadFailure>(&error),
             Some(eredu_checkpoint::store::EncodedReadFailure {
-                batch: Some(0), shard: Some(0), completed_shards: 0,
+                batch: Some(0),
+                shard: Some(0),
+                completed_shards: 0,
                 cause: eredu_checkpoint::store::EncodedReadFailureCause::Changed,
             })
         ),
@@ -700,11 +744,11 @@ fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding
     );
     assert_eq!(controller.0.get().1, 1, "failed work commits no token");
     assert!(run.next().is_none());
-    assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
+    assert!(pool.fixture_host_charge().unwrap() >= native_baseline + charge);
     assert_eq!(first.token_id().unwrap(), first_id);
     drop((run, error, first));
-    let retained = pool.used_bytes().unwrap();
-    let peak = pool.peak_bytes().unwrap();
+    let retained = pool.fixture_host_charge().unwrap();
+    let peak = pool.fixture_host_peak().unwrap();
     let before = report(&runtime);
     let paths_before = paths::snapshot();
     let inputs = paths::session_input_creation_attempts();
@@ -723,9 +767,9 @@ fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding
         ) || matches!(cause::<Error>(&next), Some(Error::ArchitectureModel(_))),
         "failed native work must reject the successor before any capacity handoff: {next:?}"
     );
-    assert_eq!(pool.effective_capacity().unwrap(), capacity);
-    assert_eq!(pool.used_bytes().unwrap(), retained);
-    assert_eq!(pool.peak_bytes().unwrap(), peak);
+    assert_eq!(pool.fixture_host_limit().unwrap(), capacity);
+    assert_eq!(pool.fixture_host_charge().unwrap(), retained);
+    assert_eq!(pool.fixture_host_peak().unwrap(), peak);
     assert_eq!(report(&runtime), before);
     assert_eq!(paths::snapshot(), paths_before);
     assert_eq!(paths::session_input_creation_attempts(), inputs);
@@ -741,5 +785,5 @@ fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding
     reclaim();
     // Source failure leaves this operation's complete physical inventory
     // uncertified. Recovery and request teardown cannot refund that envelope.
-    assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
+    assert!(pool.fixture_host_charge().unwrap() >= native_baseline + charge);
 }

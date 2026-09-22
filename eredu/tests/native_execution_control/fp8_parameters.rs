@@ -1,6 +1,6 @@
 //! Loaded FP8 arithmetic and reversible edits through public portable APIs.
 use super::*;
-use eredu_core::{ArchitectureDescriptor, ResidencyPlan, intervention::*, parameters::*};
+use eredu_core::{intervention::*, parameters::*, ArchitectureDescriptor, ResidencyPlan};
 use std::collections::BTreeMap;
 #[path = "../../examples/component_reference_analysis.rs"]
 pub(super) mod analysis;
@@ -16,15 +16,20 @@ fn decode(code: u8) -> f32 {
     } else {
         (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
     };
-    if code & 128 == 0 { v } else { -v }
+    if code & 128 == 0 {
+        v
+    } else {
+        -v
+    }
 }
 fn fp8_fixture() -> (Fixture, serde_json::Value, Tensors, Tensors) {
     fp8_fixture_dimensions(false)
 }
 fn fp8_fixture_dimensions(partial_blocks: bool) -> (Fixture, serde_json::Value, Tensors, Tensors) {
     let root = fixture(false);
-    let source: serde_json::Value = serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
-    .unwrap();
+    let source: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::fixtures::k2_horizon::NUMERICAL_REFERENCE_JSON)
+            .unwrap();
     let mut config = source["dense"]["config"].clone();
     for (key, value) in [
         ("hidden_size", if partial_blocks { 130 } else { 32 }),
@@ -130,7 +135,7 @@ pub(super) fn capture<
     architecture: &ArchitectureDescriptor,
     masked: bool,
     controlled: bool,
-) -> BTreeMap<String, Vec<f32>> {
+) -> BTreeMap<String, Vec<f32>>{
     capture_with_precision(
         model,
         architecture,
@@ -156,7 +161,7 @@ fn capture_with_precision<
 ) -> (
     BTreeMap<String, Vec<f32>>,
     BTreeMap<String, eredu_core::checkpoint::TensorDtype>,
-) {
+){
     capture_with_precision_and_selection(model, architecture, masked, controlled, false)
 }
 
@@ -177,7 +182,7 @@ fn capture_with_precision_and_selection<
 ) -> (
     BTreeMap<String, Vec<f32>>,
     BTreeMap<String, eredu_core::checkpoint::TensorDtype>,
-) {
+){
     model.reset().unwrap();
     let chat = model
         .source_chat(ChatTemplateRequest {
@@ -262,7 +267,6 @@ fn capture_with_precision_and_selection<
         limits: CaptureLimits {
             per_step: usage,
             cumulative: usage,
-            physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },
     };
@@ -330,7 +334,7 @@ fn capture_with_precision_and_selection<
                 retained_bytes: 64 << 20,
                 cumulative_copy_bytes: 256 << 20,
             },
-            ORIGINAL_CAPACITY,
+            native_limits(ORIGINAL_CAPACITY),
             copy_limits(),
         )
         .unwrap();
@@ -537,12 +541,10 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
                     .as_ref(),
             )
         {
-            assert!(
-                !intervention_points
-                    .points
-                    .iter()
-                    .any(|point| &point.path == path)
-            );
+            assert!(!intervention_points
+                .points
+                .iter()
+                .any(|point| &point.path == path));
         }
         for p in facts.parameters.iter().filter(|p| p.supported) {
             let expected = &dense[&p.id];
@@ -632,12 +634,10 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
             packed.insert(edit.parameter.clone(), dense[&edit.parameter].clone());
             packed.remove(&format!("{}_scale_inv", edit.parameter));
         }
-        config["quantization_config"]["ignored_layers"] = serde_json::json!(
-            edits
-                .iter()
-                .map(|e| e.parameter.trim_end_matches(".weight"))
-                .collect::<Vec<_>>()
-        );
+        config["quantization_config"]["ignored_layers"] = serde_json::json!(edits
+            .iter()
+            .map(|e| e.parameter.trim_end_matches(".weight"))
+            .collect::<Vec<_>>());
         let reference = fixture(false);
         std::fs::write(
             reference.0.join("config.json"),
@@ -663,13 +663,11 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
         assert_eq!(model.parameter_discovery().unwrap().usage, before);
         model.activate_parameter_overlay(&overlay, limits).unwrap();
         let active = model.parameter_discovery().unwrap();
-        assert!(
-            active
-                .parameters
-                .iter()
-                .filter(|p| p.supported)
-                .all(|p| p.input_transform == ProjectionInputTransform::Identity)
-        );
+        assert!(active
+            .parameters
+            .iter()
+            .filter(|p| p.supported)
+            .all(|p| p.input_transform == ProjectionInputTransform::Identity));
         let changed = capture(&mut model, &architecture, false, true);
         assert_ne!(changed["model.logits"], baseline["model.logits"]);
         check_evidence(&mut model, &architecture, &changed, false);
@@ -925,9 +923,8 @@ fn verify_fp8_bfloat16_overlay_precision(device: LocalDevice) {
                 },
                 analysis::parameter_limits(),
             )
-            .unwrap()
-            .values;
-        assert!(norm_values.iter().all(|v| v.to_bits() & 65535 == 0));
+            .unwrap();
+        assert!(norm_values.values.iter().all(|v| v.to_bits() & 65535 == 0));
         let baseline = super::parameters::parameter_logits(&mut model, &[1, 2, 5, 7]).0;
         assert!(
             baseline.iter().all(|v| v.to_bits() & 65535 == 0),
@@ -1004,12 +1001,10 @@ fn verify_fp8_bfloat16_overlay_precision(device: LocalDevice) {
                 reference_tensors.remove(&format!("{}_scale_inv", edit.parameter));
             }
             let mut reference_config = config.clone();
-            reference_config["quantization_config"]["ignored_layers"] = serde_json::json!(
-                edits
-                    .iter()
-                    .map(|e| e.parameter.trim_end_matches(".weight"))
-                    .collect::<Vec<_>>()
-            );
+            reference_config["quantization_config"]["ignored_layers"] = serde_json::json!(edits
+                .iter()
+                .map(|e| e.parameter.trim_end_matches(".weight"))
+                .collect::<Vec<_>>());
             let reference = fixture(false);
             std::fs::write(
                 reference.0.join("config.json"),

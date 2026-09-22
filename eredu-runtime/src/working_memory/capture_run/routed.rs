@@ -3,11 +3,13 @@ use super::*;
 mod partition;
 pub use partition::*;
 mod invocation;
-pub use invocation::{CaptureRoutedBatchWriter, CaptureRoutedBatchTransfer, CaptureRoutedModelTransfer};
 pub(in crate::working_memory) use invocation::RoutedInvocationTarget;
+pub use invocation::{
+    CaptureRoutedBatchTransfer, CaptureRoutedBatchWriter, CaptureRoutedModelTransfer,
+};
 mod prefill;
-pub use prefill::*;
 use eredu_core::{TensorObservation, TensorObservationData};
+pub use prefill::*;
 
 /// Allocation-free cause from the fixed sparse row producer.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -36,8 +38,10 @@ impl<'a> CaptureRoutedHostPlan<'a> {
         let source_rows = geometry.source_shape()[0];
         Self::prepare_source_rows(geometry, source_rows)
     }
-    fn prepare_source_rows(geometry: CaptureRoutedUnitsGeometry<'a>, source_rows: usize)
-        -> Result<Self, WorkingMemoryError> {
+    fn prepare_source_rows(
+        geometry: CaptureRoutedUnitsGeometry<'a>,
+        source_rows: usize,
+    ) -> Result<Self, WorkingMemoryError> {
         let rows = geometry.rows();
         let units = geometry.shape()[2];
         let row_values = units
@@ -52,9 +56,7 @@ impl<'a> CaptureRoutedHostPlan<'a> {
             .ok_or(WorkingMemoryError::Overflow)?;
         let payload = rows
             .checked_mul(per_row)
-            .and_then(|n| {
-                n.checked_add(source_rows.checked_mul(size_of::<[u64; 2]>())?)
-            })
+            .and_then(|n| n.checked_add(source_rows.checked_mul(size_of::<[u64; 2]>())?))
             .and_then(|n| n.checked_add(12 * size_of::<u64>()))
             .filter(|n| *n <= isize::MAX as usize)
             .ok_or(WorkingMemoryError::Overflow)?;
@@ -68,12 +70,36 @@ impl<'a> CaptureRoutedHostPlan<'a> {
             size_of::<Result<CaptureRoutedModelTransfer<'a, 'a, 'a>, WorkingMemoryError>>(),
             size_of::<ScheduledCaptureRoutedUnits<'a, 'a>>(),
             size_of::<ScheduledCaptureRoutedTransfer<'a, 'a, 'a, u8>>(),
-            size_of::<ClaimedCaptureRoutedUnits>(),size_of::<ClaimedAssembledRoutedUnits>(),
-            size_of::<Result<ClaimedAssembledRoutedUnits,CaptureRoutedFailure>>(),
-            size_of::<(&mut ScheduledCaptureRoutedUnits<'a,'a>,&RoutedUnitCaptureRow,&mut [bool])>(),
-            size_of::<(&mut ScheduledCaptureRoutedUnits<'a,'a>,&RoutedUnitCaptureRow,&ResolvedCaptureSlice,&mut [bool])>(),
-            size_of::<(&mut ScheduledCaptureStep<'a>,ClaimedAssembledRoutedUnits,TensorDtype,CaptureUsage)>(),
-            size_of::<(&mut PreparedCaptureStep<'a>,usize,TensorDtype,RoutedUnitCapture,&ResolvedCaptureSlice,&mut [RoutedUnitRowIdentity],CaptureUsage,bool)>(),
+            size_of::<ClaimedCaptureRoutedUnits>(),
+            size_of::<ClaimedAssembledRoutedUnits>(),
+            size_of::<Result<ClaimedAssembledRoutedUnits, CaptureRoutedFailure>>(),
+            size_of::<(
+                &mut ScheduledCaptureRoutedUnits<'a, 'a>,
+                &RoutedUnitCaptureRow,
+                &mut [bool],
+            )>(),
+            size_of::<(
+                &mut ScheduledCaptureRoutedUnits<'a, 'a>,
+                &RoutedUnitCaptureRow,
+                &ResolvedCaptureSlice,
+                &mut [bool],
+            )>(),
+            size_of::<(
+                &mut ScheduledCaptureStep<'a>,
+                ClaimedAssembledRoutedUnits,
+                TensorDtype,
+                CaptureUsage,
+            )>(),
+            size_of::<(
+                &mut PreparedCaptureStep<'a>,
+                usize,
+                TensorDtype,
+                RoutedUnitCapture,
+                &ResolvedCaptureSlice,
+                &mut [RoutedUnitRowIdentity],
+                CaptureUsage,
+                bool,
+            )>(),
             size_of::<CaptureRoutedFailure>(),
             size_of::<RoutedDestination>(),
             size_of::<OwnedCaptureRoutedUnits>(),
@@ -81,7 +107,9 @@ impl<'a> CaptureRoutedHostPlan<'a> {
             size_of::<CaptureRoutedPrefillFragment<'_, '_>>(),
             size_of::<CaptureRoutedPrefillWriter<'_, '_, '_, '_>>(),
             size_of::<Option<CaptureRoutedPrefillPlan<'_>>>(),
-            size_of::<std::ops::RangeInclusive<u64>>() + 6 * size_of::<u64>() + size_of::<&CaptureRoutedPrefillFragment<'_, '_>>(),
+            size_of::<std::ops::RangeInclusive<u64>>()
+                + 6 * size_of::<u64>()
+                + size_of::<&CaptureRoutedPrefillFragment<'_, '_>>(),
             size_of::<RowBuffer>(),
             size_of::<TensorObservation>(),
             size_of::<RoutedUnitCaptureRow>(),
@@ -95,7 +123,11 @@ impl<'a> CaptureRoutedHostPlan<'a> {
             .and_then(|n| n.checked_add(payload))
             .and_then(|n| u64::try_from(n).ok())
             .ok_or(WorkingMemoryError::Overflow)?;
-        Ok(Self { geometry, peak, source_rows })
+        Ok(Self {
+            geometry,
+            peak,
+            source_rows,
+        })
     }
     /// Borrow immutable sparse source geometry without native or allocation authority.
     pub fn geometry(&self) -> &CaptureRoutedUnitsGeometry<'a> {
@@ -135,10 +167,19 @@ pub struct CaptureRoutedClaim<'a, 'c> {
     exclusive: PhantomData<&'c mut ()>,
 }
 impl<'a, 'c> CaptureRoutedClaim<'a, 'c> {
-    pub(in crate::working_memory) fn from_partition_plan(plan:CaptureRoutedHostPlan<'a>,identity:claims::ReceiptIdentity)->Self {
-        Self{plan,identity,exclusive:PhantomData}
+    pub(in crate::working_memory) fn from_partition_plan(
+        plan: CaptureRoutedHostPlan<'a>,
+        identity: claims::ReceiptIdentity,
+    ) -> Self {
+        Self {
+            plan,
+            identity,
+            exclusive: PhantomData,
+        }
     }
-    pub(in crate::working_memory) fn partition_identity(&self)->&claims::ReceiptIdentity{&self.identity}
+    pub(in crate::working_memory) fn partition_identity(&self) -> &claims::ReceiptIdentity {
+        &self.identity
+    }
 
     /// Exact source and selected coordinates.
     pub fn geometry(&self) -> &CaptureRoutedUnitsGeometry<'a> {
@@ -154,7 +195,10 @@ impl<'a, 'c> CaptureRoutedClaim<'a, 'c> {
     /// Allocate only the already priced destination after original custody validates.
     pub fn prepare(self) -> Result<ScheduledCaptureRoutedUnits<'a, 'c>, CaptureRunHostError> {
         let owner = OwnedCaptureRoutedUnits::allocate(&self.plan, self.identity)?;
-        Ok(ScheduledCaptureRoutedUnits { owner, exclusive: PhantomData })
+        Ok(ScheduledCaptureRoutedUnits {
+            owner,
+            exclusive: PhantomData,
+        })
     }
     /// Attach exact existing source backing before lending the paid destination.
     pub fn prepare_with_source<'s, K: Clone + Ord + Send + Sync + 'static>(
@@ -191,8 +235,10 @@ pub(in crate::working_memory) struct OwnedCaptureRoutedUnits {
     identity: claims::ReceiptIdentity,
 }
 impl OwnedCaptureRoutedUnits {
-    pub(super) fn allocate(plan: &CaptureRoutedHostPlan<'_>, identity: claims::ReceiptIdentity)
-        -> Result<Self, CaptureRunHostError> {
+    pub(super) fn allocate(
+        plan: &CaptureRoutedHostPlan<'_>,
+        identity: claims::ReceiptIdentity,
+    ) -> Result<Self, CaptureRunHostError> {
         identity.custody.validate()?;
         let g = plan.geometry();
         let mut unused = Vec::with_capacity(g.rows());
@@ -218,8 +264,12 @@ impl OwnedCaptureRoutedUnits {
                 shape: g.shape().iter().map(|n| *n as u64).collect(),
             },
         };
-        Ok(Self { data, failure: None,
-            source_tokens: plan.source_rows as u64, identity })
+        Ok(Self {
+            data,
+            failure: None,
+            source_tokens: plan.source_rows as u64,
+            identity,
+        })
     }
     fn check(&self) -> Result<(), CaptureRoutedHostError> {
         if let Some(error) = &self.failure {
@@ -329,7 +379,9 @@ impl OwnedCaptureRoutedUnits {
             if start >= end
                 || end > self.source_tokens
                 || ranges.len() >= self.source_tokens as usize
-                || ranges.iter().any(|range| start < range[1] && range[0] < end)
+                || ranges
+                    .iter()
+                    .any(|range| start < range[1] && range[0] < end)
             {
                 return Err(RoutedUnitValidationError::Chunks.into());
             }
@@ -347,7 +399,9 @@ impl OwnedCaptureRoutedUnits {
         }
     }
     /// Validate exact ordinary coverage and duplicate identities using the paid scratch.
-    pub(in crate::working_memory) fn finish(mut self) -> Result<ClaimedCaptureRoutedUnits, CaptureRoutedFailure> {
+    pub(in crate::working_memory) fn finish(
+        mut self,
+    ) -> Result<ClaimedCaptureRoutedUnits, CaptureRoutedFailure> {
         let result = (|| {
             self.check()?;
             if self.data.active.is_some() {
@@ -374,38 +428,106 @@ impl OwnedCaptureRoutedUnits {
 /// Complete original-account distributed rows. Construction is restricted to
 /// the shared final assembler; contribution provenance remains a separate owner.
 #[derive(Debug)]
-pub struct ClaimedAssembledRoutedUnits {value:ClaimedCaptureRoutedUnits}
+pub struct ClaimedAssembledRoutedUnits {
+    value: ClaimedCaptureRoutedUnits,
+}
 impl ClaimedAssembledRoutedUnits {
-    pub(in crate::working_memory) fn identity(&self)->&claims::ReceiptIdentity{&self.value.identity}
+    pub(in crate::working_memory) fn identity(&self) -> &claims::ReceiptIdentity {
+        &self.value.identity
+    }
 }
 impl ScheduledCaptureRoutedUnits<'_, '_> {
-    pub(in crate::working_memory) fn begin_assembled_row(&mut self,row:&RoutedUnitCaptureRow,seen:&mut [bool])
-        ->Result<(),CaptureRoutedHostError> {
-        self.owner.begin_row(row.source_peer,row.token,row.slot,row.expert,row.coefficient)?;
-        let (_,buffer)=self.owner.data.active.as_mut().ok_or(RoutedUnitValidationError::Row)?;
-        if seen.len()!=buffer.shape[0]||buffer.values.capacity()<seen.len(){return Err(RoutedUnitValidationError::Scratch.into());}
-        seen.fill(false);buffer.values.resize(seen.len(),0.0);Ok(())
+    pub(in crate::working_memory) fn begin_assembled_row(
+        &mut self,
+        row: &RoutedUnitCaptureRow,
+        seen: &mut [bool],
+    ) -> Result<(), CaptureRoutedHostError> {
+        self.owner.begin_row(
+            row.source_peer,
+            row.token,
+            row.slot,
+            row.expert,
+            row.coefficient,
+        )?;
+        let (_, buffer) = self
+            .owner
+            .data
+            .active
+            .as_mut()
+            .ok_or(RoutedUnitValidationError::Row)?;
+        if seen.len() != buffer.shape[0] || buffer.values.capacity() < seen.len() {
+            return Err(RoutedUnitValidationError::Scratch.into());
+        }
+        seen.fill(false);
+        buffer.values.resize(seen.len(), 0.0);
+        Ok(())
     }
-    pub(in crate::working_memory) fn merge_assembled_row(&mut self,row:&RoutedUnitCaptureRow,destination:&ResolvedCaptureSlice,seen:&mut [bool])
-        ->Result<u64,CaptureRoutedHostError> {
+    pub(in crate::working_memory) fn merge_assembled_row(
+        &mut self,
+        row: &RoutedUnitCaptureRow,
+        destination: &ResolvedCaptureSlice,
+        seen: &mut [bool],
+    ) -> Result<u64, CaptureRoutedHostError> {
         self.owner.check()?;
-        let (coordinates,buffer)=self.owner.data.active.as_mut().ok_or(RoutedUnitValidationError::Row)?;
-        if (coordinates.peer,coordinates.token,coordinates.slot)!=(row.source_peer,row.token,row.slot){return Err(RoutedUnitValidationError::Row.into());}
-        row.merge_partition_values(coordinates.expert,coordinates.coefficient,destination,&mut buffer.values,seen).map_err(Into::into)
+        let (coordinates, buffer) = self
+            .owner
+            .data
+            .active
+            .as_mut()
+            .ok_or(RoutedUnitValidationError::Row)?;
+        if (coordinates.peer, coordinates.token, coordinates.slot)
+            != (row.source_peer, row.token, row.slot)
+        {
+            return Err(RoutedUnitValidationError::Row.into());
+        }
+        row.merge_partition_values(
+            coordinates.expert,
+            coordinates.coefficient,
+            destination,
+            &mut buffer.values,
+            seen,
+        )
+        .map_err(Into::into)
     }
-    pub(in crate::working_memory) fn finish_partition(mut self)->Result<ClaimedAssembledRoutedUnits,CaptureRoutedFailure> {
-        let result=(||{self.owner.check()?;
-            if self.owner.data.active.is_some(){return Err(CaptureRoutedHostError::Geometry(RoutedUnitValidationError::Incomplete));}
-            self.owner.data.value.finish_partition_with_scratch(&self.owner.data.slice,&mut self.owner.data.scratch)?;Ok(())})();
-        if let Err(cause)=result{return Err(self.owner.fail(cause));}
-        Ok(ClaimedAssembledRoutedUnits{value:ClaimedCaptureRoutedUnits{value:self.owner.data.value,
-            scratch:self.owner.data.scratch,slice:self.owner.data.slice,identity:self.owner.identity}})
+    pub(in crate::working_memory) fn finish_partition(
+        mut self,
+    ) -> Result<ClaimedAssembledRoutedUnits, CaptureRoutedFailure> {
+        let result = (|| {
+            self.owner.check()?;
+            if self.owner.data.active.is_some() {
+                return Err(CaptureRoutedHostError::Geometry(
+                    RoutedUnitValidationError::Incomplete,
+                ));
+            }
+            self.owner.data.value.finish_partition_with_scratch(
+                &self.owner.data.slice,
+                &mut self.owner.data.scratch,
+            )?;
+            Ok(())
+        })();
+        if let Err(cause) = result {
+            return Err(self.owner.fail(cause));
+        }
+        Ok(ClaimedAssembledRoutedUnits {
+            value: ClaimedCaptureRoutedUnits {
+                value: self.owner.data.value,
+                scratch: self.owner.data.scratch,
+                slice: self.owner.data.slice,
+                identity: self.owner.identity,
+            },
+        })
     }
 }
 impl ScheduledCaptureRoutedUnits<'_, '_> {
     /// Begin one selected original route in the fixed destination.
-    pub fn begin_row(&mut self, peer: Option<u64>, token: u64, slot: u64,
-        expert: u64, coefficient: f32) -> Result<(), CaptureRoutedHostError> {
+    pub fn begin_row(
+        &mut self,
+        peer: Option<u64>,
+        token: u64,
+        slot: u64,
+        expert: u64,
+        coefficient: f32,
+    ) -> Result<(), CaptureRoutedHostError> {
         self.owner.begin_row(peer, token, slot, expert, coefficient)
     }
     /// Append to the current preallocated scalar row.
@@ -579,12 +701,29 @@ impl<'a> ScheduledCaptureStep<'a> {
             exclusive: PhantomData,
         })
     }
-    pub(in crate::working_memory) fn record_assembled_routed_units(&mut self,receipt:ClaimedAssembledRoutedUnits,dtype:TensorDtype,usage:CaptureUsage)
-        ->Result<(),CaptureRunHostError> {
-        self.claim.custody.validate()?;let mut receipt=receipt.value;
-        if !self.claim.custody.same_schedule(&receipt.identity.custody)||self.claim.phase!=receipt.identity.phase
-            ||self.claim.prediction!=receipt.identity.prediction{return Err(CaptureRunHostError::ReceiptMismatch);}
-        self.frame.record_partition_routed_units(receipt.identity.index,dtype,receipt.value,&receipt.slice,&mut receipt.scratch,usage)?;Ok(())
+    pub(in crate::working_memory) fn record_assembled_routed_units(
+        &mut self,
+        receipt: ClaimedAssembledRoutedUnits,
+        dtype: TensorDtype,
+        usage: CaptureUsage,
+    ) -> Result<(), CaptureRunHostError> {
+        self.claim.custody.validate()?;
+        let mut receipt = receipt.value;
+        if !self.claim.custody.same_schedule(&receipt.identity.custody)
+            || self.claim.phase != receipt.identity.phase
+            || self.claim.prediction != receipt.identity.prediction
+        {
+            return Err(CaptureRunHostError::ReceiptMismatch);
+        }
+        self.frame.record_partition_routed_units(
+            receipt.identity.index,
+            dtype,
+            receipt.value,
+            &receipt.slice,
+            &mut receipt.scratch,
+            usage,
+        )?;
+        Ok(())
     }
     /// Move only a complete receipt belonging to this exact source and prediction.
     pub fn record_routed_units(

@@ -28,98 +28,31 @@ pub(super) type NativeMediaCaptureValidation<A> = fn(
 
 type SessionError = eredu_runtime::ReplicatedTextSessionError<eredu_nn::Error, Error, Error>;
 
-// Private monomorphized function pointer: no environment, allocation or authority.
-pub(super) type NativeMediaPrefillEntry<A, D> = fn(
-    &mut NativeSession<A, D>,
-    &<A as CompositeArchitecture<MlxNeuralBackend, MlxHybridState>>::AdmissionConfig,
-    PreparedInput<A>,
-    Option<&eredu_runtime::working_memory::InferenceRequest>,
-    Option<std::num::NonZeroU64>,
-    &eredu_core::GenerationCancellationToken,
-    &Stream,
-    &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
-) -> Result<
-    eredu_runtime::replicated_session::PrefillSourceProgress<MlxTensor>,
-    SessionError,
->;
-
 impl<A, D, P> CompletedComposite<A, D, P>
 where
     A: CompositeMediaIngressArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
         + 'static,
     A::InputPartPlan: 'static,
-    A::IngressPlan: 'static, A::Ingress: 'static,
+    A::IngressPlan: 'static,
+    A::Ingress: 'static,
     D: MediaTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
-            MlxNeuralBackend,
-            MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        >,
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+    >,
 {
     pub(in crate::composition::mlx::replicated_text::session) fn with_media_prefill(
         mut self,
     ) -> Self {
-        self.speculative_media_prepare = Some(speculative::prepare::<A,D>);
-        self.speculative_media_run = Some(speculative::run::<A,D>);
-        self.media_prefill = Some(run::<A, D>);
+        self.speculative_media_prepare = Some(speculative::prepare::<A, D>);
+        self.speculative_media_run = Some(speculative::run::<A, D>);
         self.bind_original_media = Some(A::bind_original_media_semantics);
         self.original_media_prefill = Some(run_original::<A, D>);
         self.media_capture_validation = Some(validate::<A>);
         self
     }
-}
-
-fn run<A, D>(
-    session: &mut NativeSession<A, D>,
-    admission: &A::AdmissionConfig,
-    prepared: PreparedInput<A>,
-    request: Option<&eredu_runtime::working_memory::InferenceRequest>,
-    chunk: Option<std::num::NonZeroU64>,
-    cancellation: &eredu_core::GenerationCancellationToken,
-    stream: &Stream,
-    observer: &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
-) -> Result<eredu_runtime::replicated_session::PrefillSourceProgress<MlxTensor>, SessionError>
-where
-    A: CompositeMediaIngressArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-        + 'static,
-    A::InputPartPlan: 'static,
-    D: MediaTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
-            MlxNeuralBackend,
-            MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        >,
-{
-    let shape = prepared
-        .as_ref()
-        .ok()
-        .map(|(_, admitted, _)| admitted.decoder_shape());
-    let identity = prepared
-        .as_ref()
-        .ok()
-        .and_then(|(_, _, identity)| identity.clone());
-    run_plan::<A, D>(
-        session,
-        request,
-        shape,
-        identity,
-        chunk,
-        |geometry| {
-            let (input, admitted, _) = prepared.map_err(eredu_nn::Error::backend_retained_source)?;
-            A::prepare_ingress_plan_admitted(
-                admission,
-                input,
-                admitted,
-                &input::MlxTensorInputInspector,
-                geometry,
-            )
-        },
-        cancellation,
-        stream,
-        observer,
-    )
 }
 
 fn validate<A>(
@@ -184,32 +117,27 @@ where
         + 'static,
     A::InputPartPlan: 'static,
     D: MediaTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
-            MlxNeuralBackend,
-            MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        >,
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+    >,
 {
-    let make_plan = |geometry| match metadata {
-        Some(metadata) => A::prepare_bound_original_ingress_plan_with_metadata(
+    let metadata = metadata.ok_or(SessionError::WorkingMemory(
+        eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+    ))?;
+    let make_plan = |geometry| {
+        A::prepare_bound_original_ingress_plan_with_metadata(
             packet.clone_lowered(),
             copied_semantics
                 .cloned()
                 .unwrap_or_else(|| packet.semantics()),
             geometry,
             metadata,
-        ),
-        None => A::prepare_bound_original_ingress_plan(
-            packet.clone_lowered(),
-            copied_semantics
-                .cloned()
-                .unwrap_or_else(|| packet.semantics()),
-            geometry,
         )
-        .map_err(eredu_nn::Error::backend_retained_source),
     };
-    if let Some(metadata) = metadata {
+    {
         // Pay the error's closed transport before constructing a source or plan.
         let funding = metadata
             .metadata_funding()
@@ -267,53 +195,7 @@ where
                     cause => retained(cause),
                 }
             })
-    } else {
-        run_plan::<A, D>(
-            session,
-            request,
-            Some(packet.shape()),
-            identity,
-            chunk,
-            make_plan,
-            cancellation,
-            stream,
-            observer,
-        )
     }
-}
-fn run_plan<A, D>(
-    session: &mut NativeSession<A, D>,
-    request: Option<&eredu_runtime::working_memory::InferenceRequest>,
-    shape: Option<[u64; 2]>,
-    identity: Option<eredu_runtime::SharedPreparedInputCacheIdentity>,
-    chunk: Option<std::num::NonZeroU64>,
-    make_plan: impl FnOnce(eredu_core::InferenceGeometry) -> Result<A::IngressPlan, eredu_nn::Error>,
-    cancellation: &eredu_core::GenerationCancellationToken,
-    stream: &Stream,
-    observer: &mut dyn eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>,
-) -> Result<eredu_runtime::replicated_session::PrefillSourceProgress<MlxTensor>, SessionError>
-where
-    A: CompositeMediaIngressArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-        + 'static,
-    A::InputPartPlan: 'static,
-    D: MediaTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
-            MlxNeuralBackend,
-            MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        >,
-{
-    session.try_prefill_media_source_cancellable(
-        request,
-        shape,
-        identity,
-        chunk,
-        make_plan,
-        cancellation,
-        stream,
-        observer,
-    )
 }
 
 #[derive(Debug, thiserror::Error)]

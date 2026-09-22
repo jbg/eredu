@@ -39,34 +39,77 @@ pub enum CpuBinaryOperation {
     LessEqual = 14,
     /// Existing Float32 log-add-exp floating task.
     LogAddExp = 15,
+    /// Existing integer or floating remainder task.
+    Remainder = 16,
+    /// Existing U32/I8 integer bitwise conjunction task.
+    BitwiseAnd = 17,
+    /// Existing U32/I8 integer bitwise disjunction task.
+    BitwiseOr = 18,
+    /// Existing U32/I8 integer bitwise exclusive-disjunction task.
+    BitwiseXor = 19,
+    /// Existing U32/I8 integer left-shift task.
+    LeftShift = 20,
+    /// Existing U32/I8 integer right-shift task.
+    RightShift = 21,
 }
 /// Exact task/alias/cleanup and strided-worker storage source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CpuBinaryEvalLayout { native: safemlx_sys::mlx_cpu_binary_eval_layout }
+pub struct CpuBinaryEvalLayout {
+    native: safemlx_sys::mlx_cpu_binary_eval_layout,
+}
 impl CpuBinaryEvalLayout {
     /// Host destinations for the actual binary task and Eval prologue.
-    pub fn graph_allocation_extents(self) -> usize { self.native.graph_extents }
+    pub fn graph_allocation_extents(self) -> usize {
+        self.native.graph_extents
+    }
     /// Shared collapse and contiguous-iterator storage upper bound.
-    pub fn worker_graph_allocation_extents(self) -> usize { self.native.worker_graph_extents }
+    pub fn worker_graph_allocation_extents(self) -> usize {
+        self.native.worker_graph_extents
+    }
     /// Actual possible output allocation attempts, before donation.
-    pub fn backing_births(self) -> usize { self.native.backing_births }
+    pub fn backing_births(self) -> usize {
+        self.native.backing_births
+    }
     /// Native producer and Rust query/result control storage.
     pub fn control_bytes(self) -> Option<usize> {
-        let parts = [size_of::<Self>(), size_of::<Option<Self>>(),
+        let parts = [
+            size_of::<Self>(),
+            size_of::<Option<Self>>(),
             size_of::<safemlx_sys::mlx_cpu_binary_eval_layout>(),
             size_of::<*mut safemlx_sys::mlx_cpu_binary_eval_layout>(),
-            size_of::<(CpuBinaryOperation,Dtype,usize,usize,bool)>(), size_of::<bool>()];
-        parts.into_iter().try_fold(self.native.named_control_bytes.checked_add(size_of_val(&parts))?, usize::checked_add)
+            size_of::<(CpuBinaryOperation, Dtype, usize, usize, bool)>(),
+            size_of::<bool>(),
+        ];
+        parts.into_iter().try_fold(
+            self.native
+                .named_control_bytes
+                .checked_add(size_of_val(&parts))?,
+            usize::checked_add,
+        )
     }
 }
 impl OperationEvent {
     /// Query the actual CPU binary worker's selected input dtype and geometry.
     /// The unchanged worker's int-sized loops require elements <= i32::MAX.
-    pub fn cpu_binary_layout(operation: CpuBinaryOperation, dtype: Dtype,
-        rank: usize, elements: usize, tracer: bool) -> Option<CpuBinaryEvalLayout> {
+    pub fn cpu_binary_layout(
+        operation: CpuBinaryOperation,
+        dtype: Dtype,
+        rank: usize,
+        elements: usize,
+        tracer: bool,
+    ) -> Option<CpuBinaryEvalLayout> {
         let mut native = safemlx_sys::mlx_cpu_binary_eval_layout::default();
         // SAFETY: scalar pure query writes the initialized result only on success.
-        unsafe { safemlx_sys::mlx_operation_event_cpu_binary_eval_layout(&mut native,
-            operation as u32, dtype.into(), rank, elements, tracer) }.then_some(CpuBinaryEvalLayout {native})
+        unsafe {
+            safemlx_sys::mlx_operation_event_cpu_binary_eval_layout(
+                &mut native,
+                operation as u32,
+                dtype.into(),
+                rank,
+                elements,
+                tracer,
+            )
+        }
+        .then_some(CpuBinaryEvalLayout { native })
     }
 }

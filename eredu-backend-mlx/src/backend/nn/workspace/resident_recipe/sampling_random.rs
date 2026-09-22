@@ -22,7 +22,8 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
                 && operation.inputs.get(0)?.shape() == [2]
                 && output.dtype() == WorkspaceDtype::Uint32
                 && output.shape().len() == 2
-                && output.shape()[0] > 0 && output.shape()[1] == 2 =>
+                && output.shape()[0] > 0
+                && output.shape()[1] == 2 =>
         {
             // random::split(key,n) is one RandomBits. The real metadata trace
             // separately records each static index/squeeze view of its result.
@@ -30,19 +31,31 @@ pub(super) fn lowering(operation: WorkspaceOperationView<'_>) -> Option<Lowering
         }
         S::SelectRandomKey { index } if operation.inputs.len() == 1 => {
             let input = operation.inputs.get(0)?;
-            if input.dtype() != WorkspaceDtype::Uint32 || input.shape().len() != 2
-                || input.shape()[0] <= 0 || input.shape()[1] != 2
+            if input.dtype() != WorkspaceDtype::Uint32
+                || input.shape().len() != 2
+                || input.shape()[0] <= 0
+                || input.shape()[1] != 2
                 || u64::from(*index) >= input.shape()[0] as u64
-                || output.dtype() != WorkspaceDtype::Uint32 || output.shape() != [2] { return None; }
+                || output.dtype() != WorkspaceDtype::Uint32
+                || output.shape() != [2]
+            {
+                return None;
+            }
             // A one-row split table omits the identical full Slice; Reshape
             // still removes its leading unit axis. No seed or backing is born.
-            Lowering::plain(1 + usize::from(input.shape()[0] != 1),
-                1 + usize::from(input.shape()[0] != 1), 0)
+            Lowering::plain(
+                1 + usize::from(input.shape()[0] != 1),
+                1 + usize::from(input.shape()[0] != 1),
+                0,
+            )
         }
-        S::UniformUnitInterval if operation.inputs.len() == 1
-            && operation.inputs.get(0)?.dtype() == WorkspaceDtype::Uint32
-            && operation.inputs.get(0)?.shape() == [2]
-            && output.dtype() == WorkspaceDtype::Float32 && output.shape() == [1] => {
+        S::UniformUnitInterval
+            if operation.inputs.len() == 1
+                && operation.inputs.get(0)?.dtype() == WorkspaceDtype::Uint32
+                && operation.inputs.get(0)?.shape() == [2]
+                && output.dtype() == WorkspaceDtype::Float32
+                && output.shape() == [1] =>
+        {
             // Actual random.cpp uniform: two initial casts, five binary
             // workers (5P/6E each), RandomBits and one restoration cast.
             // Four eager F32 sources are low, high, upper and maxval. Split
@@ -120,10 +133,11 @@ pub(super) fn eager_preparation(
     else {
         return Ok(None);
     };
-    let Some(controls) = graph
-        .control_bytes()
-        .and_then(|n| n.checked_add(crate::backend::random::standard_sampling_control_bytes(safemlx::DeviceType::Cpu)?))
-    else {
+    let Some(controls) = graph.control_bytes().and_then(|n| {
+        n.checked_add(crate::backend::random::standard_sampling_control_bytes(
+            safemlx::DeviceType::Cpu,
+        )?)
+    }) else {
         return Ok(None);
     };
     let bytes = allocation
@@ -148,8 +162,8 @@ pub(super) fn eager_preparation(
 mod tests {
     use super::*;
     use eredu_runtime::working_memory::{
-        SamplingWorkspaceObserver, SamplingWorkspacePhase, WorkspaceSamplingRandomState,
-        quote_sampling_workspace_with_observer,
+        quote_sampling_workspace_with_observer, SamplingWorkspaceObserver, SamplingWorkspacePhase,
+        WorkspaceSamplingRandomState,
     };
     struct Observer(ResidentRecipeRecorder);
     impl SamplingWorkspaceObserver for Observer {
@@ -163,6 +177,9 @@ mod tests {
     }
     #[test]
     fn standard_seeded_sampling_retains_eager_key_and_complete_step_recipes() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let qualified = safemlx::PreparedPipelineCachePlan::new(0)
             .layout::<()>()
@@ -227,17 +244,25 @@ mod tests {
     }
     #[test]
     fn sequential_uniform_recipe_covers_draw_and_advanced_key() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
         let context = WorkspaceContext::new(mechanism);
         let key = WorkspaceTensor::existing(
-            context.layout(&[2], WorkspaceDtype::Uint32).unwrap(), &context).unwrap();
+            context.layout(&[2], WorkspaceDtype::Uint32).unwrap(),
+            &context,
+        )
+        .unwrap();
         let mut random = WorkspaceSamplingRandomState::from_key(key).unwrap();
         context.begin_span();
         let draw = random.uniform_unit_interval(&context).unwrap();
         let report = context.finish_report(&[draw, random.into_key()]).unwrap();
         let recipe = super::super::numerical::SpeculativeNumericalRecipe::inspect(
-            &report, 2, mechanism, &context).unwrap();
+            &report, 2, mechanism, &context,
+        )
+        .unwrap();
         assert_eq!(recipe.completion.traversal.roots(), 2);
         assert!(recipe.completion.dispatch.is_some());
         assert!(recipe.storage.maximum_births() >= 33);
@@ -247,52 +272,106 @@ mod tests {
         primitive.outputs[0] = WorkspaceLayout::new(&[2], WorkspaceDtype::Float32).unwrap();
         assert!(lowering(primitive.as_view()).is_none());
     }
-
 }
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(
+    test,
+    target_vendor = "apple",
+    feature = "metal",
+    not(feature = "cuda")
+))]
 mod cpu_state_tests {
     use super::*;
     use crate::backend::nn::workspace::resident_recipe::ResidentRecipeRecorder;
-    use eredu_core::InferenceGeometry;
     use eredu_architectures::prepared_execution::InferenceEquationTraceObserver;
-    use eredu_runtime::working_memory::{SamplingWorkspaceObserver, SamplingWorkspacePhase,
-        WorkspaceSamplingRandomState, quote_sampling_workspace_with_observer};
+    use eredu_core::InferenceGeometry;
+    use eredu_runtime::working_memory::{
+        quote_sampling_workspace_with_observer, SamplingWorkspaceObserver, SamplingWorkspacePhase,
+        WorkspaceSamplingRandomState,
+    };
     struct Observer(ResidentRecipeRecorder);
     impl SamplingWorkspaceObserver for Observer {
-        fn observe(&mut self, phase: SamplingWorkspacePhase, report: &WorkspaceTraceReport) -> Result<(), Error> {
+        fn observe(
+            &mut self,
+            phase: SamplingWorkspacePhase,
+            report: &WorkspaceTraceReport,
+        ) -> Result<(), Error> {
             self.0.observe_sampling(phase, report)
         }
     }
     #[test]
     fn cpu_resident_sampler_joins_filter_state_views_and_final_token_completion() {
+        if !crate::tests::support::native_process::enter("qualified-recipe") {
+            return;
+        }
         let _sources = crate::tests::support::test_utils::initialize_original_sources();
         let metal = MlxMetalWorkspaceMechanisms::current_host().unwrap();
-        let choice = MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let choice =
+            MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
         let cpu = MlxCpuWorkspaceMechanisms::new(metal.allocation(), choice);
-        for temperature in [0.0, 0.8] { for shape in [&[1, 64][..], &[1, 1, 2049][..]] {
-            let context = WorkspaceContext::new(cpu);
-            let geometry = InferenceGeometry { batch_size: 1, cached_positions: 0, input_positions: 3,
-                max_output_tokens: 3, prefill_chunk_positions: 2, output: eredu_core::OutputDemand::Sequence };
-            let layout = context.layout(shape, WorkspaceDtype::Float32).unwrap()
-                .with_representation(Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true)));
-            let random = if temperature != 0.0 { Some(WorkspaceSamplingRandomState::from_seed(&context).unwrap()) } else { None };
-            let mut observer = Observer(ResidentRecipeRecorder::with_cpu_context(geometry, metal, cpu, &context).unwrap());
-            let sampler = eredu_runtime::ConfiguredTextSampler::Standard(eredu_runtime::GenerationSampler::default());
-            let report = quote_sampling_workspace_with_observer(&sampler, temperature, random.as_ref(), &layout,
-                &eredu_core::TokenFilter::All, 3, &context, Some(&mut observer)).unwrap();
-            assert!(report.peak.bytes().is_some()); assert_eq!(report.first_gap, None);
-            let rows = &observer.0.sampling; assert_eq!(rows.len(), 4);
-            assert_eq!(rows[0].phase(), SamplingWorkspacePhase::Preparation);
-            assert!(rows[0].completion().is_none()); assert!(rows[0].mutable_storage().is_some());
-            for row in &rows[1..] {
-                assert_eq!(row.first_missing_operation(), None);
-                let completion = row.completion().expect("actual final ReadToken owns completion");
-                assert_eq!(completion.traversal.roots(), if temperature == 0.0 { 1 } else { 2 });
-                assert_eq!(completion.nested_completions, 0);
-                let dispatch = completion.dispatch.unwrap(); assert_eq!(dispatch.gpu_entries, 0);
-                assert!(dispatch.cpu_model.unwrap().primitives > 0);
+        for temperature in [0.0, 0.8] {
+            for shape in [&[1, 64][..], &[1, 1, 2049][..]] {
+                let context = WorkspaceContext::new(cpu);
+                let geometry = InferenceGeometry {
+                    batch_size: 1,
+                    cached_positions: 0,
+                    input_positions: 3,
+                    max_output_tokens: 3,
+                    prefill_chunk_positions: 2,
+                    output: eredu_core::OutputDemand::Sequence,
+                };
+                let layout = context
+                    .layout(shape, WorkspaceDtype::Float32)
+                    .unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(
+                        WorkspaceFloatingType::Float32,
+                        true,
+                    )));
+                let random = if temperature != 0.0 {
+                    Some(WorkspaceSamplingRandomState::from_seed(&context).unwrap())
+                } else {
+                    None
+                };
+                let mut observer = Observer(
+                    ResidentRecipeRecorder::with_cpu_context(geometry, metal, cpu, &context)
+                        .unwrap(),
+                );
+                let sampler = eredu_runtime::ConfiguredTextSampler::Standard(
+                    eredu_runtime::GenerationSampler::default(),
+                );
+                let report = quote_sampling_workspace_with_observer(
+                    &sampler,
+                    temperature,
+                    random.as_ref(),
+                    &layout,
+                    &eredu_core::TokenFilter::All,
+                    3,
+                    &context,
+                    Some(&mut observer),
+                )
+                .unwrap();
+                assert!(report.peak.bytes().is_some());
+                assert_eq!(report.first_gap, None);
+                let rows = &observer.0.sampling;
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0].phase(), SamplingWorkspacePhase::Preparation);
+                assert!(rows[0].completion().is_none());
+                assert!(rows[0].mutable_storage().is_some());
+                for row in &rows[1..] {
+                    assert_eq!(row.first_missing_operation(), None);
+                    let completion = row
+                        .completion()
+                        .expect("actual final ReadToken owns completion");
+                    assert_eq!(
+                        completion.traversal.roots(),
+                        if temperature == 0.0 { 1 } else { 2 }
+                    );
+                    assert_eq!(completion.nested_completions, 0);
+                    let dispatch = completion.dispatch.unwrap();
+                    assert_eq!(dispatch.gpu_entries, 0);
+                    assert!(dispatch.cpu_model.unwrap().primitives > 0);
+                }
             }
-        }}
+        }
     }
 }

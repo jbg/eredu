@@ -154,8 +154,12 @@ mod tests {
 
     #[test]
     fn arithmetic_refuses_before_a_destination_can_be_selected() {
-        assert!(WorkRows::default().equation(true, usize::MAX, 0, 0, 0, 0).is_none());
+        assert!(WorkRows::default()
+            .equation(true, usize::MAX, 0, 0, 0, 0)
+            .is_none());
         assert!(WorkRows::default().sampling(usize::MAX, 0).is_none());
-        assert!(WorkRows::default().finish(usize::MAX, 0, 0, 0, false).is_none());
+        assert!(WorkRows::default()
+            .finish(usize::MAX, 0, 0, 0, false)
+            .is_none());
     }
 }

@@ -8,7 +8,8 @@ use crate::backend::runtime::checkpoint::recipe::{
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
 pub(crate) use foreground_disk::ForegroundDiskMaterializationError;
 pub(super) use foreground_disk::{
-    control_bytes as foreground_disk_control_bytes, prepare_background_disk_into, prepare_foreground_disk_into,
+    control_bytes as foreground_disk_control_bytes, prepare_background_disk_into,
+    prepare_foreground_disk_into,
 };
 use safemlx::OperationEvent as Event;
 
@@ -311,7 +312,9 @@ pub(super) fn materialize_host_buffers<'context>(
             .expect("completed host buffer");
         validate_host_buffer_bytes(id, binding, &buffer)?;
         buffers.insert(binding.name().to_owned(), Arc::new(buffer.freeze()).into());
-        let status = retained.finish().map_err(ResidencyError::OriginalRetirement)?;
+        let status = retained
+            .finish()
+            .map_err(ResidencyError::OriginalRetirement)?;
         if status.failed || status.blocked {
             return Err(ResidencyError::Mlx {
                 id: id.clone(),
@@ -768,6 +771,9 @@ pub(super) fn prepare_copy_to_device_into(
             .buffers
             .get(name)
             .ok_or(ResidencyError::StatePoisoned)?;
+        if arrays.is_prepared() {
+            arrays.retain_host_source(name, buffer)?;
+        }
         let submitted = match original {
             Some(observer) => buffer
                 .copy_to_array_in_original_scope(device_stream, observer)

@@ -91,7 +91,11 @@ fn equation<B: NeuralBackend>(
 }
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -140,6 +144,99 @@ fn all_normalization_policies_produce_cold_bounds_including_empty_rows() {
 }
 
 #[test]
+fn ordinary_metal_rms_preserves_finite_caller_alternatives_without_precision_evidence() {
+    let layout = |shape: &[i32], dtype: Option<WorkspaceFloatingType>| {
+        WorkspaceLayout::new(shape, WorkspaceDtype::Float32)
+            .unwrap()
+            .with_representation(dtype.map(|dtype| WorkspaceRepresentation::new(dtype, true)))
+    };
+    let make = |rows, groups, scale, input, gain| {
+        let mut inputs = vec![layout(&[rows, 16], input)];
+        if scale != 0 {
+            inputs.push(layout(&[16], gain));
+        }
+        WorkspaceOperation {
+            kind: WorkspaceOperationKind::ConstructedNormalization(NormalizationConstructionSpec {
+                dimensions: 16,
+                epsilon: 1e-6,
+                groups,
+                scale: match scale {
+                    0 => NormalizationScale::Unit,
+                    1 => NormalizationScale::Learned(
+                        ParameterSpec::trainable("norm.weight").unwrap(),
+                    ),
+                    _ => NormalizationScale::LearnedOffset {
+                        weight: ParameterSpec::trainable("norm.weight").unwrap(),
+                        offset: 1.0,
+                    },
+                },
+            }),
+            inputs,
+            outputs: vec![layout(&[rows, 16], None)],
+        }
+    };
+    for rows in [0, 2] {
+        for groups in [None, Some(1), Some(2), Some(16)] {
+            if rows == 0 && groups.is_none() {
+                continue;
+            }
+            for scale in 0..3 {
+                let unknown = make(rows, groups, scale, None, None);
+                let bound = mechanisms()
+                    .ordinary_call_controls(unknown.as_view())
+                    .unwrap()
+                    .unwrap();
+                for input in [
+                    WorkspaceFloatingType::Float32,
+                    WorkspaceFloatingType::Float16,
+                    WorkspaceFloatingType::Bfloat16,
+                ] {
+                    for gain in [
+                        WorkspaceFloatingType::Float32,
+                        WorkspaceFloatingType::Float16,
+                        WorkspaceFloatingType::Bfloat16,
+                    ] {
+                        let known = make(rows, groups, scale, Some(input), Some(gain));
+                        let selected = mechanisms()
+                            .ordinary_call_controls(known.as_view())
+                            .unwrap()
+                            .unwrap();
+                        assert!(selected.metadata_bytes <= bound.metadata_bytes);
+                        assert!(
+                            selected.observed.observed_host_bytes
+                                <= bound.observed.observed_host_bytes
+                        );
+                        assert!(
+                            selected.observed.control_allocations
+                                <= bound.observed.control_allocations
+                        );
+                    }
+                }
+                assert!(
+                    unknown
+                        .inputs
+                        .iter()
+                        .all(|input| input.representation().is_none())
+                );
+            }
+        }
+    }
+    let mut invalid = make(2, Some(2), 1, None, None);
+    invalid.inputs[1] = layout(&[15], None);
+    assert!(
+        mechanisms()
+            .ordinary_call_controls(invalid.as_view())
+            .is_err()
+    );
+    let invalid = make(2, Some(3), 1, None, None);
+    assert!(
+        mechanisms()
+            .ordinary_call_controls(invalid.as_view())
+            .is_err()
+    );
+}
+
+#[test]
 fn invalid_group_or_scale_geometry_cannot_acquire_normalization_authority() {
     let input = WorkspaceLayout::new(&[3, 32], WorkspaceDtype::Float32).unwrap();
     let mut operation = WorkspaceOperation {
@@ -164,7 +261,7 @@ fn invalid_group_or_scale_geometry_cannot_acquire_normalization_authority() {
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 #[ignore = "requires exclusive Metal allocator measurement; run with --test-threads=1"]
 fn metal_normalization_peaks_fit_bounds_for_all_selected_policies() {
-    use crate::{backend::nn::shared::MlxNeuralBackend, MlxTensor};
+    use crate::{MlxTensor, backend::nn::shared::MlxNeuralBackend};
     use safemlx::{Array, Device, DeviceType, Dtype, Stream};
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let selected = MlxMetalWorkspaceMechanisms::current_host().unwrap();
@@ -226,12 +323,16 @@ fn metal_normalization_peaks_fit_bounds_for_all_selected_policies() {
                     observed <= allowed,
                     "{case:?}: native peak {observed} exceeds {allowed}"
                 );
-                assert!(output
-                    .to_f32_vec(&stream)
-                    .unwrap()
-                    .iter()
-                    .all(|n| n.is_finite()));
-                eprintln!("normalization dtype={dtype:?}/{weight_dtype:?} shape={shape:?} case={case:?} observed={observed} bound={allowed}");
+                assert!(
+                    output
+                        .to_f32_vec(&stream)
+                        .unwrap()
+                        .iter()
+                        .all(|n| n.is_finite())
+                );
+                eprintln!(
+                    "normalization dtype={dtype:?}/{weight_dtype:?} shape={shape:?} case={case:?} observed={observed} bound={allowed}"
+                );
             }
         }
     }

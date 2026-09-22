@@ -91,7 +91,7 @@ fn run_selected(residency: Residency, mode: &str) -> serde_json::Value {
                 output_mode: eredu::api::PreparedChatOutputMode::Text,
                 skip_special_tokens: true,
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings: chat_settings(&chat, settings),
+                settings: chat_settings(&chat, settings.clone()),
                 options,
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),

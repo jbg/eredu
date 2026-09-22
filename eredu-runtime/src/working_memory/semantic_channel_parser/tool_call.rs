@@ -3,8 +3,8 @@ use super::super::{OriginalJsonObject, OriginalJsonObjectError, OriginalSemantic
 use eredu_core::{HostPreparationAuthority, SemanticEvent, SemanticText, SpeculativeBuffer};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_text::json_fragments::{
-    generated_call_id_control_bytes, write_generated_call_id, JsonFieldError, JsonFieldRole,
-    GENERATED_CALL_ID_BYTES,
+    GENERATED_CALL_ID_BYTES, JsonFieldError, JsonFieldRole, generated_call_id_control_bytes,
+    write_generated_call_id,
 };
 use std::{
     fmt,
@@ -308,25 +308,52 @@ impl Call {
         &self,
         funding: &HostMetadataFunding,
     ) -> Result<Self, Failure> {
-        let bytes = self.copy_bytes().ok_or_else(|| self.empty_copy(funding).failure(Cause::Overflow))?;
-        funding.reserve_metadata(bytes).map_err(|cause| self.empty_copy(funding).failure(cause.into()))?;
+        let bytes = self
+            .copy_bytes()
+            .ok_or_else(|| self.empty_copy(funding).failure(Cause::Overflow))?;
+        funding
+            .reserve_metadata(bytes)
+            .map_err(|cause| self.empty_copy(funding).failure(cause.into()))?;
         self.copy_prepaid(HostPreparationAuthority::retain(funding.clone()), funding)
     }
     fn empty_copy(&self, funding: &HostMetadataFunding) -> Self {
-        Self { object: None, failed: None, name: self.name.clone(), id: self.id.clone(),
-            emitted: self.emitted, index: self.index, started: self.started, complete: self.complete,
-            source: self.source.clone(), funding: funding.clone() }
+        Self {
+            object: None,
+            failed: None,
+            name: self.name.clone(),
+            id: self.id.clone(),
+            emitted: self.emitted,
+            index: self.index,
+            started: self.started,
+            complete: self.complete,
+            source: self.source.clone(),
+            funding: funding.clone(),
+        }
     }
     pub(super) fn rebind_funding(&mut self, funding: &HostMetadataFunding) {
         self.funding = funding.clone();
-        if let Some(object) = &mut self.object { object.rebind_funding(funding); }
+        if let Some(object) = &mut self.object {
+            object.rebind_funding(funding);
+        }
     }
-    pub(super) fn copy_prepaid(&self, host: HostPreparationAuthority, funding: &HostMetadataFunding) -> Result<Self, Failure> {
+    pub(super) fn copy_prepaid(
+        &self,
+        host: HostPreparationAuthority,
+        funding: &HostMetadataFunding,
+    ) -> Result<Self, Failure> {
         let mut copy = self.empty_copy(funding);
-        let Some(object) = self.object.as_ref() else { return Err(copy.failure(Cause::Source)); };
+        let Some(object) = self.object.as_ref() else {
+            return Err(copy.failure(Cause::Source));
+        };
         match object.copy_prepaid(host, funding) {
-            Ok(object) => { copy.object = Some(object); Ok(copy) },
-            Err(failure) => { copy.failed = Some(failure); Err(copy.failure(Cause::Object)) }
+            Ok(object) => {
+                copy.object = Some(object);
+                Ok(copy)
+            }
+            Err(failure) => {
+                copy.failed = Some(failure);
+                Err(copy.failure(Cause::Object))
+            }
         }
     }
     /// The loan must be the original full-schema producer. This method only

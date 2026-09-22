@@ -1,8 +1,11 @@
 //! Original outer source ownership, independent of its nested reader/catalog.
-use super::{gguf_source::SourceAccount, qualified_storage, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError, gguf_source::SourceAccount, qualified_storage};
 use eredu_checkpoint::{
     gguf_store::GgufWeightStore,
-    store::{CompositeCheckpointSource, RetainedCheckpointSource, SafetensorsWeightStore, SourceErasureStorageRequest},
+    store::{
+        CompositeCheckpointSource, RetainedCheckpointSource, SafetensorsWeightStore,
+        SourceErasureStorageRequest,
+    },
 };
 use std::{
     fmt,
@@ -18,7 +21,7 @@ enum Input {
     Composite(CompositeCheckpointSource),
 }
 impl Input {
-    fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
+    fn validate(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
         match self {
             Self::Safetensors(source) => pool.validate_safetensors_source_controls(source),
             Self::Gguf(source) => pool.validate_gguf_source_controls(source),
@@ -27,14 +30,16 @@ impl Input {
     }
     fn requested(&self) -> Result<u64, WorkingMemoryError> {
         match self {
-            Self::Safetensors(_) => WorkingMemoryPool::safetensors_source_erasure_required_bytes(),
-            Self::Gguf(_) => WorkingMemoryPool::gguf_source_erasure_required_bytes(),
-            Self::Composite(_) => WorkingMemoryPool::gguf_composite_erasure_required_bytes(),
+            Self::Safetensors(_) => MemoryLedger::safetensors_source_erasure_required_bytes(),
+            Self::Gguf(_) => MemoryLedger::gguf_source_erasure_required_bytes(),
+            Self::Composite(_) => MemoryLedger::gguf_composite_erasure_required_bytes(),
         }
     }
     fn retain(self, custody: ErasureCustody) -> RetainedCheckpointSource {
         match self {
-            Self::Safetensors(source) => RetainedCheckpointSource::from_safetensors_with_custody(source, custody),
+            Self::Safetensors(source) => {
+                RetainedCheckpointSource::from_safetensors_with_custody(source, custody)
+            }
             Self::Gguf(source) => RetainedCheckpointSource::from_gguf_with_custody(source, custody),
             Self::Composite(source) => {
                 RetainedCheckpointSource::from_composite_with_custody(source, custody)
@@ -117,7 +122,7 @@ fn required(request: Option<SourceErasureStorageRequest>) -> Result<u64, Working
         size_of::<Result<u64, WorkingMemoryError>>(),
         size_of::<u64>(),
         size_of::<Option<u64>>(),
-        size_of::<&WorkingMemoryPool>(),
+        size_of::<&MemoryLedger>(),
         size_of::<&Input>(),
     ];
     let controls = controls
@@ -136,11 +141,13 @@ fn required(request: Option<SourceErasureStorageRequest>) -> Result<u64, Working
         .ok_or(WorkingMemoryError::Overflow)
 }
 
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Concrete SafeTensors outer allocation, custody/account shells and fixed
     /// transports. Its discovery and header contributions remain independent.
     pub fn safetensors_source_erasure_required_bytes() -> Result<u64, WorkingMemoryError> {
-        required(RetainedCheckpointSource::safetensors_storage_request::<ErasureCustody>())
+        required(RetainedCheckpointSource::safetensors_storage_request::<
+            ErasureCustody,
+        >())
     }
     /// Admit closed outer ownership of this pool's original SafeTensors source.
     /// Ordinary/custom-policy and foreign-pool sources are retained on refusal.

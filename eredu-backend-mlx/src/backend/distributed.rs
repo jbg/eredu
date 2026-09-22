@@ -31,9 +31,10 @@ mod session;
 
 pub use axis::{all_gather_axis, all_gather_uneven_axis, all_to_all_v_axis};
 pub use consensus::MlxRealtimeConsensusTransport;
-pub use session::{MlxDistributedSession,MlxTextPreparationControl};
+pub use session::{MlxDistributedSession, MlxTextPreparationControl};
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use session::PreparedRealtimeConsensusTransport;
+pub(crate) use session::PreparedConsensusTransport;
+pub(crate) use session::PreparedParameterTransport;

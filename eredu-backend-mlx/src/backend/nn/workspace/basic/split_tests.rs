@@ -222,13 +222,12 @@ fn metal_duplicate_interior_split_unary_and_cast_fit_actual_cold_bound() {
                 pieces[2].try_metadata_snapshot().unwrap().allocation(),
                 Some(source_info)
             );
-            assert!(
-                cast.evaluated()
-                    .unwrap()
-                    .try_to_vec::<f32>()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(cast
+                .evaluated()
+                .unwrap()
+                .try_to_vec::<f32>()
+                .unwrap()
+                .is_empty());
         }
     }
 }

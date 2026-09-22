@@ -9,7 +9,11 @@ use eredu_nn::{
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -134,10 +138,9 @@ where
                     )
                     .unwrap()
                 } else {
-                    return vec![
-                        m.forward_grouped_with_unit_observer(input, routes, c, observer)
-                            .unwrap(),
-                    ];
+                    return vec![m
+                        .forward_grouped_with_unit_observer(input, routes, c, observer)
+                        .unwrap()];
                 }
             }
             Self::Relu2(m) => {
@@ -147,10 +150,9 @@ where
                     )
                     .unwrap()
                 } else {
-                    return vec![
-                        m.forward_grouped_with_unit_observer(input, routes, c, observer)
-                            .unwrap(),
-                    ];
+                    return vec![m
+                        .forward_grouped_with_unit_observer(input, routes, c, observer)
+                        .unwrap()];
                 }
             }
         };
@@ -303,20 +305,18 @@ fn grouped_workspace_composes_packed_formats_chunks_bias_partials_and_unit_bound
                 let spec = specification(kind, 4, 256, 256, encoding, true);
                 let parallel = !matches!(kind, Kind::Linear(_));
                 let report = quote(&spec, &[tokens, 256], 2, parallel, false);
-                assert!(
-                    report.total_bytes.is_some(),
-                    "{kind:?} {encoding:?} tokens={tokens} {:?}",
-                    report.unpriced_operations
+                crate::backend::nn::workspace::test_backing_control_completeness(
+                    &selected(),
+                    &report,
                 );
                 let expected = 0;
                 assert_eq!(report.host_workspace_bytes, Some(expected));
                 cases += 1;
                 if parallel {
                     let report = quote(&spec, &[tokens, 256], 2, true, true);
-                    assert!(
-                        report.total_bytes.is_some(),
-                        "units {kind:?} {encoding:?} {tokens}: {:?}",
-                        report.unpriced_operations
+                    crate::backend::nn::workspace::test_backing_control_completeness(
+                        &selected(),
+                        &report,
                     );
                     assert!(report.operations.iter().any(|op| matches!(
                         op.kind,
@@ -358,17 +358,15 @@ fn grouped_workspace_prices_chunked_observers_and_preserves_independent_provider
         ),
     )
     .unwrap();
-    assert!(
-        quote(
-            &WorkspaceGroupedBank::GatedProduct(independent),
-            &[1, 32],
-            2,
-            false,
-            false
-        )
-        .total_bytes
-        .is_none()
-    );
+    assert!(quote(
+        &WorkspaceGroupedBank::GatedProduct(independent),
+        &[1, 32],
+        2,
+        false,
+        false
+    )
+    .total_bytes
+    .is_none());
 }
 
 #[test]

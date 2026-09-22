@@ -3,7 +3,11 @@ use eredu_nn::{NeuralBackend, Tensor};
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
+        allocation: NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: false,
+            original_storage: false,
+        },
         sdpa_blocks: None,
     }
 }
@@ -232,14 +236,18 @@ fn pooled_workspace_rejects_invalid_descriptors_and_preserves_unknown_dtypes() {
         if !matches!(case, Case::Gather) {
             let mut unsupported = op.clone();
             unsupported.inputs[0] = layout(op.inputs[0].shape(), WorkspaceDtype::Int32);
-            assert!(mechanisms()
-                .operation_bound(&unsupported)
-                .unwrap()
-                .is_none());
-            assert!(mechanisms()
-                .host_workspace_bound(&unsupported)
-                .unwrap()
-                .is_none());
+            assert!(
+                mechanisms()
+                    .operation_bound(&unsupported)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                mechanisms()
+                    .host_workspace_bound(&unsupported)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
     let mut op = operation(Case::Pooled, [2, 3, 5, 7, 13, 5, 3], 3);
@@ -263,10 +271,10 @@ fn pooled_workspace_rejects_invalid_descriptors_and_preserves_unknown_dtypes() {
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 mod native {
     use super::*;
-    use crate::{backend::nn::shared::MlxNeuralBackend, MlxTensor};
+    use crate::{MlxTensor, backend::nn::shared::MlxNeuralBackend};
     use safemlx::{
-        ops::indexing::{IntoStrideBy, TryIndexOp},
         Array, Device, DeviceType, Dtype, Stream,
+        ops::indexing::{IntoStrideBy, TryIndexOp},
     };
 
     fn fixtures(
@@ -342,7 +350,10 @@ mod native {
             values[index] as f64
         }
     }
-    fn attention_reference(op: &WorkspaceOperation, x: &[Vec<f32>]) -> Vec<f64> {
+    fn attention_reference(
+        op: &WorkspaceOperation,
+        x: &[eredu_core::HostTensorBuffer<f32>],
+    ) -> Vec<f64> {
         let (indexed, scale, lm, pm, sinks) = match op.kind {
             WorkspaceOperationKind::PooledAttention {
                 scale,
@@ -440,7 +451,11 @@ mod native {
         }
         output
     }
-    fn check_positions(op: &WorkspaceOperation, x: &[Vec<f32>], actual: &[f32]) {
+    fn check_positions(
+        op: &WorkspaceOperation,
+        x: &[eredu_core::HostTensorBuffer<f32>],
+        actual: &[f32],
+    ) {
         let WorkspaceOperationKind::PooledPositions {
             top_k,
             scale,
@@ -529,6 +544,14 @@ mod native {
                         for strided in [false, true] {
                             let op = operation(case, dims, masks);
                             let bound = selected.operation_bound(&op).unwrap().unwrap();
+                            if matches!(case, Case::Pooled) {
+                                assert!(
+                                    selected
+                                        .ordinary_call_controls(op.as_view())
+                                        .unwrap()
+                                        .is_some()
+                                );
+                            }
                             assert_eq!(
                                 selected.host_workspace_bound(&op).unwrap().unwrap().bytes,
                                 0
@@ -557,7 +580,10 @@ mod native {
                                 .unwrap()
                                 .saturating_sub(before)
                                 as u64;
-                            assert!(observed<=allowed,"{case:?} {dims:?} masks={masks} {dtype:?} strided={strided}: {observed} > {allowed}");
+                            assert!(
+                                observed <= allowed,
+                                "{case:?} {dims:?} masks={masks} {dtype:?} strided={strided}: {observed} > {allowed}"
+                            );
                             assert_eq!(out.shape(), op.outputs[0].shape());
                             if matches!(case, Case::Positions) && dims[4] > 0 {
                                 let backing = out.as_array().allocation_info().unwrap().unwrap();
@@ -582,7 +608,10 @@ mod native {
                                         (4e-3, 0.05)
                                     };
                                     for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
-                                        assert!((*a as f64-e).abs()<=atol+rtol*e.abs(),"{case:?} {dims:?} masks={masks} {dtype:?} strided={strided} element {i}: {a} != {e}");
+                                        assert!(
+                                            (*a as f64 - e).abs() <= atol + rtol * e.abs(),
+                                            "{case:?} {dims:?} masks={masks} {dtype:?} strided={strided} element {i}: {a} != {e}"
+                                        );
                                     }
                                 }
                                 Case::Positions => check_positions(&op, &values, &actual),
@@ -604,5 +633,67 @@ mod native {
             }
         }
         eprintln!("POOLED_WORKSPACE_NATIVE_CASES={checked}");
+    }
+}
+
+#[test]
+fn ordinary_metal_pooled_positions_preserves_mask_empty_and_precision_sources() {
+    use eredu_nn::workspace::{WorkspaceFloatingType, WorkspaceRepresentation};
+    let mechanism = mechanisms();
+    for pooled in [0, 7, 4097] {
+        for masked in [false, true] {
+            let mut unknown = operation(
+                Case::Positions,
+                [2, 3, 5, 7, pooled, 8, 2],
+                if masked { 2 } else { 0 },
+            );
+            for value in &mut unknown.inputs[..3] {
+                *value = value.clone().with_representation(None);
+            }
+            let quoted = mechanism
+                .ordinary_call_controls(unknown.as_view())
+                .unwrap()
+                .unwrap();
+            assert!(quoted.metadata_bytes > 0);
+            for dtype in [
+                WorkspaceFloatingType::Float32,
+                WorkspaceFloatingType::Float16,
+                WorkspaceFloatingType::Bfloat16,
+            ] {
+                let mut known = unknown.clone();
+                for value in &mut known.inputs[..3] {
+                    *value = value
+                        .clone()
+                        .with_representation(Some(WorkspaceRepresentation::new(dtype, false)));
+                }
+                assert_eq!(
+                    mechanism.ordinary_call_controls(known.as_view()).unwrap(),
+                    Some(quoted)
+                );
+            }
+            assert!(
+                unknown.inputs[..3]
+                    .iter()
+                    .all(|value| value.representation().is_none())
+            );
+            let mut changed = unknown.clone();
+            changed.inputs[0] = layout(unknown.inputs[0].shape(), WorkspaceDtype::Int32);
+            assert!(
+                mechanism
+                    .ordinary_call_controls(changed.as_view())
+                    .unwrap()
+                    .is_none()
+            );
+            if masked {
+                changed = unknown;
+                changed.inputs[3] = layout(changed.inputs[3].shape(), WorkspaceDtype::Float32);
+                assert!(
+                    mechanism
+                        .ordinary_call_controls(changed.as_view())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 }

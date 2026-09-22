@@ -1,12 +1,12 @@
 //! Original host-input residence, separate from numerical execution and requests.
-use super::{loaded_decode_source::Allowance, WorkingMemoryError, WorkingMemoryPool};
+use super::{MemoryLedger, WorkingMemoryError, loaded_decode_source::Allowance};
 use crate::input::host::{CompileFailure, PreparedHostInputPlan, PreparedHostPart, Storage};
 use eredu_core::BackendFailure;
 use std::{
     alloc::Layout,
     fmt,
     mem::size_of,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 #[derive(Debug)]
 struct Payload {
@@ -32,6 +32,9 @@ struct Payload {
 /// ```
 pub struct OriginalPreparedHostInput(Option<Arc<Payload>>);
 impl OriginalPreparedHostInput {
+    pub(crate) fn memory_ledger(&self) -> &MemoryLedger {
+        self.payload().allowance.pool()
+    }
     fn payload(&self) -> &Payload {
         self.0.as_deref().expect("live original host input")
     }
@@ -73,11 +76,11 @@ impl OriginalPreparedHostInput {
         &self,
         lease: &super::WorkingMemoryUnquotedLease,
     ) -> Result<(), WorkingMemoryError> {
-        self.validate_pool(&lease.0.pool)
+        self.validate_pool(&lease.inner().pool)
     }
     /// Rejects a foreign original domain without allocation or native work.
-    pub fn validate_pool(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
-        if self.payload().allowance.pool().same_domain(pool) {
+    pub fn validate_pool(&self, pool: &MemoryLedger) -> Result<(), WorkingMemoryError> {
+        if self.payload().allowance.pool().same_ledger(pool) {
             Ok(())
         } else {
             Err(WorkingMemoryError::IdentityMismatch)
@@ -179,7 +182,7 @@ impl std::error::Error for OriginalPreparedHostInputError {
         }
     }
 }
-impl WorkingMemoryPool {
+impl MemoryLedger {
     /// Concrete source-derived requested buffers and closed owner/error controls.
     /// This scalar query allocates nothing and grants no construction authority.
     pub fn prepared_host_input_required_bytes(

@@ -57,6 +57,23 @@ impl CompressedLatentCache {
         Self::default()
     }
 
+    /// The resident empty constructor preserves this allocation mechanism and
+    /// its growth step without allocating a native array or paging owner.
+    pub(crate) fn matches_resident_reset_policy(&self) -> bool {
+        self.paged.is_none() && self.step == COMPRESSED_LATENT_CACHE_STEP
+    }
+
+    pub(crate) fn resident_fork_is_empty(&self) -> bool {
+        self.matches_resident_reset_policy()
+            && self.latent_storage.is_none()
+            && self.rotary_key_storage.is_none()
+            && self.latent.is_none()
+            && self.rotary_key.is_none()
+            && self.offset == 0
+            && self.length == 0
+            && self.capacity == 0
+    }
+
     /// Bounds retained token storage after an admitted continuation, including
     /// resident allocation chunks and the paged tail's full input span.
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
@@ -192,6 +209,76 @@ impl CompressedLatentCache {
         self.paged
             .as_deref()
             .and_then(PagedCompressedLatentCache::tail_block)
+    }
+
+    pub(crate) fn prompt_cache_import(
+        &self,
+        manager: CacheResidencyManager,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, super::super::residency::CacheResidencyError> {
+        use super::super::residency::{CacheResidencyError, CacheSourceError};
+        let old = self.paged.as_ref().ok_or_else(|| {
+            CacheResidencyError::Preparation(context.metadata_source(CacheSourceError::Identity))
+        })?;
+        context
+            .charge_metadata(std::mem::size_of::<(
+                Self,
+                PagedCompressedLatentCache,
+                Result<Self, CacheResidencyError>,
+            )>())
+            .map_err(|cause| CacheResidencyError::Preparation(cause.into()))?;
+        let offset = manager.layer_end(
+            old.global_layer,
+            CacheRepresentation::CompressedLatentRotary,
+        )?;
+        let paged = Box::new(PagedCompressedLatentCache {
+            manager,
+            global_layer: old.global_layer,
+            rank: old.rank,
+            tail_latent: None,
+            tail_rotary: None,
+            tail_start: offset,
+            offset,
+        });
+        Ok(Self {
+            latent_storage: None,
+            rotary_key_storage: None,
+            latent: None,
+            rotary_key: None,
+            offset: 0,
+            length: 0,
+            capacity: 0,
+            step: self.step,
+            paged: Some(paged),
+        })
+    }
+
+    pub(crate) fn prompt_cache_tail(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<
+        Option<super::super::residency::PromptCacheTail<'_>>,
+        super::super::residency::CacheSourceFailure,
+    > {
+        let paged = self.paged.as_ref().ok_or_else(|| {
+            super::super::residency::CacheSourceFailure::source(
+                super::super::residency::CacheSourceError::Identity,
+                context,
+            )
+        })?;
+        super::super::residency::PromptCacheTail::from_source(
+            &paged.manager,
+            CacheBlockId {
+                session_id: paged.manager.session_id(),
+                global_layer: paged.global_layer,
+                representation: CacheRepresentation::CompressedLatentRotary,
+                start: paged.tail_start,
+                end: paged.offset,
+                rank: paged.rank,
+            },
+            [paged.tail_latent.as_ref(), paged.tail_rotary.as_ref()],
+            context,
+        )
     }
 
     /// Seals a partial compressed tail for safe persistence.
@@ -522,7 +609,9 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
             .paged
             .as_deref_mut()
             .ok_or_else(|| ComputeError::backend("compressed block scan requires paged state"))?;
-        let block_ids = paged.block_ids().map_err(ComputeError::backend_retained_source)?;
+        let block_ids = paged
+            .block_ids()
+            .map_err(ComputeError::backend_retained_source)?;
         let manager = paged.manager.clone();
         let global_layer = paged.global_layer;
         let tail = paged.tail_block();
@@ -530,7 +619,10 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
         let mut blocks = manager
             .prefetch_blocks(block_ids, context)
             .map_err(ComputeError::backend_retained_source)?;
-        while let Some(lease) = blocks.next_block().map_err(ComputeError::backend_retained_source)? {
+        while let Some(lease) = blocks
+            .next_block()
+            .map_err(ComputeError::backend_retained_source)?
+        {
             let id = lease.id();
             let state = match lease.arrays() {
                 CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {

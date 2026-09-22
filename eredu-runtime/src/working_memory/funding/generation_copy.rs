@@ -8,7 +8,7 @@ pub(in crate::working_memory) enum GenerationCopySource<'a> {
     Copied(&'a GenerationCopyCustody),
 }
 impl GenerationCopySource<'_> {
-    fn pool(&self) -> &WorkingMemoryPool {
+    fn pool(&self) -> &MemoryLedger {
         match self {
             Self::Original(c, _) => c.custody.raw().pool(),
             Self::Copied(c) => c.inner().ticket.pool(),
@@ -78,7 +78,7 @@ impl GenerationCopyCustody {
     pub(in crate::working_memory) fn validate(&self) -> Result<(), WorkingMemoryError> {
         self.inner().ticket.status()
     }
-    pub(in crate::working_memory) fn pool(&self) -> &WorkingMemoryPool {
+    pub(in crate::working_memory) fn pool(&self) -> &MemoryLedger {
         self.inner().ticket.pool()
     }
     pub(in crate::working_memory) fn control_bytes() -> Option<usize> {
@@ -114,7 +114,7 @@ impl GenerationCopyCustody {
     pub(in crate::working_memory) fn admit(
         source: GenerationCopySource<'_>,
         bytes: u64,
-        capacity: u64,
+        capacity: eredu_core::MemoryLimits,
     ) -> Result<Self, GenerationCopyAdmission> {
         let rejected = |cause| GenerationCopyAdmission {
             cause,
@@ -122,6 +122,7 @@ impl GenerationCopyCustody {
         };
         let pool = source.pool();
         let execution = source.execution();
+        let retained_capacity = capacity.clone();
         let pending = {
             let mut usage = pool
                 .0
@@ -129,16 +130,22 @@ impl GenerationCopyCustody {
                 .lock()
                 .map_err(|_| rejected(WorkingMemoryError::Poisoned))?;
             source.validate(&usage).map_err(rejected)?;
-            let commit =
-                PreparedAccountCommit::prepare(pool, execution, &usage, bytes, Some(capacity), &[])
-                    .map_err(rejected)?;
+            let commit = PreparedAccountCommit::prepare(
+                pool,
+                execution,
+                &usage,
+                bytes,
+                Some(&capacity),
+                &[],
+            )
+            .map_err(rejected)?;
             PendingAccount::accept(
                 pool,
                 execution,
                 &mut usage,
                 commit,
                 bytes,
-                Some(capacity),
+                Some(retained_capacity),
                 bytes,
             )
             .map_err(rejected)?

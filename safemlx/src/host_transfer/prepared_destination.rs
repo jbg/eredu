@@ -47,6 +47,14 @@ impl PreparedHostCopyDestination {
             failed: false,
         }
     }
+    /// Return an exclusive prepared writer to its creating thread and use its
+    /// same paid backing as the native store destination. A wrong-thread call
+    /// returns the unchanged writer; no native work or new source is created.
+    pub fn from_writer(
+        writer: crate::PreparedHostTransferWriter,
+    ) -> Result<Self, crate::PreparedHostTransferWriter> {
+        writer.try_return().map(Self::new)
+    }
     /// Fixed Rust controls; Host backing, source-arena and native graph/record
     /// populations are separately returned by their actual producers.
     pub fn control_bytes() -> Option<usize> {
@@ -54,6 +62,9 @@ impl PreparedHostCopyDestination {
             size_of::<Self>(),
             size_of::<Option<Self>>(),
             size_of::<Result<Self, crate::PreparedInputCause>>(),
+            size_of::<crate::PreparedHostTransferWriter>(),
+            size_of::<Result<Self, crate::PreparedHostTransferWriter>>(),
+            size_of::<Result<HostTransferBuffer, crate::PreparedHostTransferWriter>>(),
             size_of::<ScopedOperation>(),
             size_of::<Option<ScopedOperation>>(),
             size_of::<safemlx_sys::mlx_array>(),

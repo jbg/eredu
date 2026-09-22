@@ -715,6 +715,7 @@ impl eredu_nn::HyperNeuralBackend for ReferenceBackend {
 }
 
 impl NeuralBackend for ReferenceBackend {
+    type ParameterPreparation<'a> = ();
     const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
         eredu_architectures::operator_requirements::KIMI_LINEAR
             .union(eredu_architectures::operator_requirements::INKLING)

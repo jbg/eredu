@@ -2,8 +2,14 @@
 use super::*;
 use std::{alloc::Layout, collections::TryReserveError};
 
+mod domains;
 mod reduce;
 mod source;
+pub use domains::{
+    WorkspaceDomainReport, WorkspaceDomainReportEntry, WorkspaceDomainReportInputs,
+    WorkspaceDomainResidualReport, WorkspaceDomainStateReport, WorkspaceDomainStoragePopulation,
+    WorkspaceDomainTensorBufferReport, WorkspaceReportPlacements,
+};
 use reduce::{Frame, Node, Scratch};
 use source::{Graph, Ordinary};
 
@@ -19,6 +25,12 @@ pub enum WorkspaceReportError {
     /// An exact supplied destination is too short; no growth was attempted.
     #[error("workspace report destination is too short")]
     Capacity,
+    /// Physical placement or complete allocation capacity is unavailable.
+    #[error("workspace allocation placement or capacity is incomplete")]
+    IncompletePlacement,
+    /// A physical-domain descriptor belongs to another topology or overflows.
+    #[error(transparent)]
+    Domain(#[from] eredu_core::MemoryDomainError),
 }
 
 /// Original flat graph node. Indices belong only to the borrowed graph view.
@@ -368,7 +380,10 @@ impl WorkspaceContext {
         let storage = Rc::new(Storage {
             maximum_allocations: usize::from(bytes != Some(0)),
             bytes,
+            placement: None,
+            host_control_bytes: Some(0),
             possible_aliases,
+            population: None,
         });
         self.tracing_started.record(storage.possible_aliases.len());
         storage
@@ -388,6 +403,10 @@ impl WorkspaceContext {
         &self,
         retained: &[WorkspaceTensor],
     ) -> Result<WorkspaceTraceReport, Error> {
+        let physical_domains = self.complete_domain_report(retained)?;
+        if self.trace.borrow().scratch_overflow && physical_domains.is_none() {
+            return Err(legacy(WorkspaceReportError::Overflow));
+        }
         if self.facts.is_some() {
             return Err(WorkspaceMetadataError::ReportClone.into());
         }
@@ -401,7 +420,9 @@ impl WorkspaceContext {
                 drop(prefix);
                 return Err(match cause {
                     ConstructionCause::Layout(e) => legacy(e),
-                    ConstructionCause::Reserve { source, .. } => Error::backend_retained_source(source),
+                    ConstructionCause::Reserve { source, .. } => {
+                        Error::backend_retained_source(source)
+                    }
                 });
             }
         };
@@ -414,11 +435,12 @@ impl WorkspaceContext {
                 retained,
                 borrowed: borrowed.as_ref(),
             };
-            let v = scratch.report(&source)?;
+            let v = scratch.report_with_diagnostics(&source, physical_domains.is_some())?;
             Ok(WorkspaceTraceReport {
+                physical_domains,
                 residual: v.residual.map(|r| WorkspaceResidualReport {
-                opening_storage: r.opening_storage,
-                closing_storage: r.closing_storage,
+                    opening_storage: r.opening_storage,
+                    closing_storage: r.closing_storage,
                     borrowed_storage: borrowed
                         .as_ref()
                         .expect("residual has an installed selection")
@@ -496,6 +518,17 @@ impl WorkspaceContext {
         &self,
         retained: &[WorkspaceTensor],
     ) -> Result<WorkspaceReportScalars, Error> {
+        let attributed = self.complete_domain_report(retained)?.is_some();
+        self.report_scalars_inner(retained, attributed)
+    }
+    fn report_scalars_inner(
+        &self,
+        retained: &[WorkspaceTensor],
+        domain_diagnostics: bool,
+    ) -> Result<WorkspaceReportScalars, Error> {
+        if self.trace.borrow().scratch_overflow && !domain_diagnostics {
+            return Err(WorkspaceMetadataError::Report(WorkspaceReportError::Overflow).into());
+        }
         if self.trace.borrow().report_finished {
             return Err(WorkspaceMetadataError::ReportFinished.into());
         }
@@ -525,11 +558,14 @@ impl WorkspaceContext {
         let trace = self.trace.borrow();
         let borrowed = self.borrowed.borrow();
         scratch
-            .report(&Ordinary {
-                trace: &trace,
-                retained,
-                borrowed: borrowed.as_ref(),
-            })
+            .report_with_diagnostics(
+                &Ordinary {
+                    trace: &trace,
+                    retained,
+                    borrowed: borrowed.as_ref(),
+                },
+                domain_diagnostics,
+            )
             .map_err(|cause| {
                 if self.facts.is_some() {
                     WorkspaceMetadataError::Report(cause).into()
@@ -550,10 +586,12 @@ impl WorkspaceContext {
         if self.facts.is_none() {
             return self.fixed_report(retained);
         }
-        let v = self.report_scalars(retained)?;
+        let physical_domains = self.complete_domain_report(retained)?;
+        let v = self.report_scalars_inner(retained, physical_domains.is_some())?;
         let mut trace = self.trace.borrow_mut();
         let borrowed = self.borrowed.borrow();
         let report = WorkspaceTraceReport {
+            physical_domains,
             residual: v.residual.map(|r| WorkspaceResidualReport {
                 opening_storage: r.opening_storage,
                 closing_storage: r.closing_storage,

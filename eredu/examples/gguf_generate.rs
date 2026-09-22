@@ -1,11 +1,13 @@
+#[path = "support/physical_memory.rs"]
+mod physical_memory;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use eredu::{
     api::{
-        ChatSourceInput, LoadedModel, ManagedPlainTextRequest, PreparedChatGenerationSettings,
-        PreparedChatOutputMode, PreparedChatRequest, TokenizerSourceInput, default_local_device,
-        local_device_plan,
+        default_local_device, local_device_plan, ChatSourceInput, LoadedModel,
+        ManagedPlainTextRequest, PreparedChatGenerationSettings, PreparedChatOutputMode,
+        PreparedChatRequest, TokenizerSourceInput,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -18,7 +20,7 @@ fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let gguf_file = args.first().map(PathBuf::from).ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: cargo run -p eredu --example gguf_generate -- <model.gguf> [prompt] [max-tokens] [temperature] [capacity-bytes]"
+            "usage: cargo run -p eredu --example gguf_generate -- <model.gguf> [prompt] [max-tokens] [temperature] [domain=bytes|unlimited]"
         )
     })?;
     let prompt = args
@@ -36,12 +38,8 @@ fn main() -> anyhow::Result<()> {
         .transpose()?
         .unwrap_or(0.0);
 
-    let capacity = args
-        .get(4)
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .unwrap_or(1024 * 1024 * 1024);
-    anyhow::ensure!(capacity > 0, "capacity must be positive");
+    let capacity =
+        physical_memory::parse(args.get(4).map(String::as_str).unwrap_or("host=unlimited"))?;
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
@@ -64,7 +62,7 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         inference: TextInferencePolicy {
-            managed_memory_capacity_bytes: Some(capacity),
+            memory_limits: capacity.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -86,11 +84,11 @@ fn main() -> anyhow::Result<()> {
                     add_generation_prompt: true,
                     ..Default::default()
                 },
-                capacity,
+                &capacity,
                 &cancellation,
             )?
             .context("cancelled before chat preparation")?;
-        let mut request = PreparedChatRequest::new(&chat, settings);
+        let mut request = PreparedChatRequest::new(&chat, settings.clone());
         request.output_mode = PreparedChatOutputMode::Text;
         let session = model
             .start_prepared_chat(request, &cancellation)?

@@ -1,6 +1,6 @@
 use super::*;
 use eredu_core::{BackendFailureKind, SharedBackendFailure};
-use eredu_runtime::working_memory::{OriginalTextControlGuard, WorkingMemoryPool};
+use eredu_runtime::working_memory::{MemoryLedger, OriginalTextControlGuard};
 use std::{
     error::Error as _,
     sync::{
@@ -13,7 +13,7 @@ use std::{
 struct Cause {
     drops: Arc<AtomicUsize>,
     held_at_drop: Arc<AtomicBool>,
-    pool: Option<WorkingMemoryPool>,
+    pool: Option<MemoryLedger>,
     // Last: concrete payload and enclosing source allocation retire before Q.
     _controls: Option<OriginalTextControlGuard>,
 }
@@ -27,7 +27,7 @@ impl Drop for Cause {
     fn drop(&mut self) {
         if let Some(pool) = &self.pool {
             self.held_at_drop
-                .store(pool.used_bytes().unwrap() > 0, Ordering::SeqCst);
+                .store(pool.fixture_host_charge().unwrap() > 0, Ordering::SeqCst);
         }
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
@@ -35,7 +35,7 @@ impl Drop for Cause {
 fn pair(
     state_preserved: bool,
     controls: Option<OriginalTextControlGuard>,
-    pool: Option<WorkingMemoryPool>,
+    pool: Option<MemoryLedger>,
 ) -> (
     Error,
     SpeculativeControlError,
@@ -84,7 +84,7 @@ fn pair(
 
 pub(in crate::composition::mlx) fn fixture_pair(
     controls: &OriginalTextControlGuard,
-    pool: &WorkingMemoryPool,
+    pool: &MemoryLedger,
     state_preserved: bool,
 ) -> (
     Error,
@@ -151,3 +151,7 @@ fn retained_capture_transport_returns_admission_and_other_backend_owners_unchang
     drop(error);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

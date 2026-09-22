@@ -2,8 +2,8 @@
 use super::*;
 mod units;
 use crate::decoder::{
-    ModuleMetadata,
     construction_specs::{copy_embedding, copy_linear, copy_normalization},
+    ModuleMetadata,
 };
 use crate::replicated_text::SharedCompositeConfig;
 pub(super) use units::PreparedUnits;
@@ -34,6 +34,9 @@ impl RetainedModelSource {
             units: None,
             modules: SharedCompositeConfig::new(modules, B::construction_metadata(context))?,
         })
+    }
+    pub(crate) fn matches_admission(&self, admission: &ModelArgs) -> bool {
+        std::ptr::eq(&*self.args, admission)
     }
     pub(crate) fn has_units(&self) -> bool {
         self.units.is_some()

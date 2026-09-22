@@ -82,7 +82,7 @@ fn actual_metadata_and_auxiliary_descriptors_match_ordinary_static_rows() {
         shape: 0,
         frozen: true,
     };
-    source.visit_parameters(&mut ordinary);
+    source.visit_parameters(&mut ordinary).unwrap();
     let mut guard = safemlx::RuntimeCallDeadline::new(Duration::from_secs(5))
         .unwrap()
         .enter()

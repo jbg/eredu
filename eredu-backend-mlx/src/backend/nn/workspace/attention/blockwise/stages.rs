@@ -92,6 +92,16 @@ pub(in crate::backend::nn::workspace::attention) fn emit(
                 Some(absolute),
                 bias.is_some(),
             )?;
+            let (default_bytes, default_births) = block_defaults(
+                g,
+                mask,
+                policy.options.softcap.is_some(),
+                allocation,
+                policy.options.arithmetic == AttentionArithmetic::InputScores,
+                Some(absolute),
+                value_pass,
+            )?;
+            sink.default_scratch(default_bytes, default_births)?;
             let row = capacity(allocation, g.rows()?)?;
             let output = capacity(allocation, g.output()?)?;
             if !value_pass {
@@ -124,6 +134,7 @@ pub(in crate::backend::nn::workspace::attention) fn emit(
                 sink.output(Output::Allocate(output))?;
                 // Safe denominator comparison/where, two scalars and FP32
                 // division before a possible final narrower native cast.
+                sink.default_scratch(mul(2, capacity(allocation, 1)?)?, 2)?;
                 add(
                     add(
                         mul(3, capacity(allocation, rows)?)?,

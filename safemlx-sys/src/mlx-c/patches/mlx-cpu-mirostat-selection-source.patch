@@ -1,0 +1,61 @@
+diff --git a/mlx/backend/cpu/scatter_storage.cpp b/mlx/backend/cpu/scatter_storage.cpp
+index 00e0b1e..8bc7d9d 100644
+--- a/mlx/backend/cpu/scatter_storage.cpp
++++ b/mlx/backend/cpu/scatter_storage.cpp
+@@ -144,6 +144,9 @@ static bool scatter_axis_worker_layout(Dtype index,size_t rank,size_t output_ele
+   if(!submission::GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
+ }
++// F32 and Bool overwrite use the same type-erased ScatterAxisTask and copy
++// publication. Payload capacity remains dtype-specific; the fixed worker and
++// iterator layouts are shared. The F32 extent check also bounds Bool extents.
+ bool scatter_axis_eval_layout(Dtype index,size_t rank,size_t output_elements,
+     size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
+   return scatter_axis_worker_layout(index,rank,output_elements,update_elements,tracer,false,out);
+@@ -177,9 +180,10 @@ bool scatter_axis_eval_storage(const array& output,CopyEvalStorage& out) noexcep
+   const bool row_sum=state.first==ScatterAxis::Sum&&state.second==0&&rank==2;
+   if(rank<1||rank>4||output.ndim()!=rank||index.ndim()!=rank||updates.ndim()!=rank||
+       (!row_sum&&(state.first!=ScatterAxis::None||state.second!=int(rank)-1))||
+-      source.dtype()!=float32||source.itemsize()!=sizeof(float)||
+-      updates.dtype()!=float32||updates.itemsize()!=sizeof(float)||
+-      output.dtype()!=float32||output.itemsize()!=sizeof(float)||
++      !((source.dtype()==float32&&source.itemsize()==sizeof(float))||
++        (!row_sum&&source.dtype()==bool_&&source.itemsize()==sizeof(bool)))||
++      updates.dtype()!=source.dtype()||updates.itemsize()!=source.itemsize()||
++      output.dtype()!=source.dtype()||output.itemsize()!=source.itemsize()||
+       source.shape()!=output.shape()||updates.shape()!=index.shape()||
+       !alias_input_geometry(source,source_elements)||
+       !(row_sum?scatter_input_geometry(index,index_elements):alias_input_geometry(index,index_elements))||
+diff --git a/mlx/backend/cpu/select.cpp b/mlx/backend/cpu/select.cpp
+index 714f1e7..fbb883b 100644
+--- a/mlx/backend/cpu/select.cpp
++++ b/mlx/backend/cpu/select.cpp
+@@ -148,6 +148,7 @@ bool select_broadcast_dispatch_storage(size_t rank,EvalDispatchStorage& out) noe
+ bool typed_select_broadcast_dispatch_storage(Dtype dtype,size_t rank,EvalDispatchStorage& out) noexcept {
+   if(!((dtype==float32&&dtype.size()==sizeof(float))||
+        (dtype==int32&&dtype.size()==sizeof(int32_t))||
++       (dtype==bool_&&dtype.size()==sizeof(bool))||
+        (dtype==float16&&dtype.size()==sizeof(float16_t))||
+        (dtype==bfloat16&&dtype.size()==sizeof(bfloat16_t))))return false;
+   return select_task_storage(dtype,rank,true,out);
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+index c32145e..8021922 100644
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -141,7 +141,7 @@ static bool row_selection_eval_storage(const array& output,CopyEvalStorage& out)
+   return full?scalar_full_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out):
+       select_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);
+ }
+-// An additive source for the existing F32/F16/BF16/I32 Select over stored or broadcast
++// An additive source for the existing F32/F16/BF16/I32/Bool Select over stored or broadcast
+ // operands. Rank five is the actual GQA mask expansion; the legacy row source
+ // and scalar Full contracts remain unchanged.
+ bool typed_select_broadcast_eval_layout(Dtype dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+@@ -167,6 +167,7 @@ static bool broadcast_selection_source(const array& output,CopyEvalStorage& out)
+       !output.siblings().empty()||output.inputs().size()!=3||
+       !((output.dtype()==float32&&output.itemsize()==sizeof(float))||
+         (output.dtype()==int32&&output.itemsize()==sizeof(int32_t))||
++        (output.dtype()==bool_&&output.itemsize()==sizeof(bool))||
+         (output.dtype()==float16&&output.itemsize()==sizeof(float16_t))||
+         (output.dtype()==bfloat16&&output.itemsize()==sizeof(bfloat16_t))))return false;
+   size_t elements=0;if(!shape(output,elements,5)||output.ndim()==0)return false;

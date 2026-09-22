@@ -4,9 +4,7 @@ use eredu_core::{
     Admission, EstimationCompleteness, ExecutionWorkspaceEstimate, InferenceGeometry,
     InputTokenCount, LayerSchedule, OutputDemand, StateMemoryLayout, WorkspaceBound,
 };
-use eredu_runtime::working_memory::{
-    InferenceExecutionIdentity, WorkingMemoryError, WorkingMemoryPool,
-};
+use eredu_runtime::working_memory::{InferenceExecutionIdentity, MemoryLedger, WorkingMemoryError};
 
 fn zero_admission() -> Admission {
     let geometry = InferenceGeometry {
@@ -34,22 +32,38 @@ fn zero_admission() -> Admission {
         std::num::NonZeroU8::new(4).unwrap(),
     )
     .unwrap()
-    .with_execution_workspace(ExecutionWorkspaceEstimate {
-        geometry,
-        activations: zero(),
-        attention: zero(),
-        vocabulary: zero(),
-        state_update: zero(),
-        materialization: zero(),
-        retained: zero(),
-    })
+    .with_execution_workspace(crate::memory_fixture::workspace(
+        ExecutionWorkspaceEstimate {
+            physical_domains: None,
+            geometry,
+            activations: zero(),
+            attention: zero(),
+            vocabulary: zero(),
+            state_update: zero(),
+            materialization: zero(),
+            retained: zero(),
+        },
+    ))
     .unwrap();
-    Admission {
+    crate::memory_fixture::admission(Admission {
+        additional_headroom: Default::default(),
+        memory_limits: Default::default(),
         requested_positions: 1,
         state,
-        incremental_required_bytes: 0,
-        available_memory_bytes: None,
-    }
+        incremental_required_bytes: Some(0),
+    })
+}
+
+fn zero_payload_ledger() -> MemoryLedger {
+    let probe = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let controls = probe
+        .reservation_requirements(&zero_admission(), None)
+        .unwrap()
+        .get(probe.topology().host_domain())
+        .unwrap()
+        .total()
+        .unwrap();
+    crate::memory_fixture::ledger(controls, 0).unwrap()
 }
 
 fn stream() -> Stream {
@@ -58,7 +72,7 @@ fn stream() -> Stream {
 
 fn fixture(
     stream: &Stream,
-    operation_pool: &WorkingMemoryPool,
+    operation_pool: &MemoryLedger,
 ) -> (
     ModelRuntime<MlxBackend<'static>>,
     MlxBackend<'static>,
@@ -66,12 +80,12 @@ fn fixture(
 ) {
     // Keep all existing model/input payloads in their original domain. Only
     // admission of the new ordinary operation belongs to the reserved pool.
-    let model_pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
-    let source = MlxBackend::new(stream, stream).with_memory_pool(model_pool);
+    let model_pool = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let source = MlxBackend::new(stream, stream).with_memory_ledger(model_pool);
     let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
     let model =
         eredu_core::load_model(&source, root.path(), crate::MlxLoadRequest::default()).unwrap();
-    let backend = MlxBackend::new(stream, stream).with_memory_pool(operation_pool.clone());
+    let backend = MlxBackend::new(stream, stream).with_memory_ledger(operation_pool.clone());
     (
         ModelRuntime::from_prepared(backend, model).unwrap(),
         source,
@@ -95,10 +109,16 @@ fn populate(runtime: &mut ModelRuntime<MlxBackend<'_>>, stream: &Stream) -> MlxM
 }
 
 fn assert_reserved(error: &(dyn std::error::Error + 'static)) {
+    assert_memory(error, WorkingMemoryError::ReservedWorkActive);
+}
+fn assert_missing_admission(error: &(dyn std::error::Error + 'static)) {
+    assert_memory(error, WorkingMemoryError::UnknownBound);
+}
+fn assert_memory(error: &(dyn std::error::Error + 'static), expected: WorkingMemoryError) {
     let mut current = error;
     loop {
         if let Some(memory) = current.downcast_ref::<WorkingMemoryError>() {
-            assert_eq!(*memory, WorkingMemoryError::ReservedWorkActive);
+            assert_eq!(*memory, expected);
             return;
         }
         current = current
@@ -107,7 +127,7 @@ fn assert_reserved(error: &(dyn std::error::Error + 'static)) {
     }
 }
 
-fn settle(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) {
+fn settle(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &MemoryLedger) {
     crate::backend::submission_recovery::wait_for_retirement(|| {
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         safemlx::reclaim_allocation_owners();
@@ -116,11 +136,15 @@ fn settle(runtime: &ModelRuntime<MlxBackend<'_>>, pool: &WorkingMemoryPool) {
     });
 }
 
-fn unchanged(pool: &WorkingMemoryPool, before: paths::Counts) {
-    assert_eq!(paths::snapshot(), before);
-    assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
-    assert_eq!(pool.peak_bytes().unwrap(), 0);
+fn unchanged(
+    pool: &MemoryLedger,
+    before: (
+        paths::Counts,
+        eredu_runtime::working_memory::MemoryLedgerSnapshot,
+    ),
+) {
+    assert_eq!(paths::snapshot(), before.0);
+    assert_eq!(pool.snapshot().unwrap(), before.1);
 }
 
 #[derive(Default)]
@@ -159,7 +183,7 @@ fn observation_request() -> ObservationRequest {
 #[test]
 fn ordinary_reset_rejects_reserved_backend_domain_without_clearing_populated_state() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = zero_payload_ledger();
     let (mut runtime, _source, _root) = fixture(&stream, &pool);
     let output = populate(&mut runtime, &stream);
     settle(&runtime, &pool);
@@ -168,7 +192,7 @@ fn ordinary_reset_rejects_reserved_backend_domain_without_clearing_populated_sta
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let before = paths::snapshot();
+    let before = (paths::snapshot(), pool.snapshot().unwrap());
     let resets = paths::session_reset_attempts();
     assert_reserved(&runtime.reset().unwrap_err());
     assert_eq!(
@@ -184,19 +208,19 @@ fn ordinary_reset_rejects_reserved_backend_domain_without_clearing_populated_sta
 #[test]
 fn ordinary_prefill_variants_reject_before_forward_and_observer_callbacks() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = zero_payload_ledger();
     let (mut runtime, source, _root) = fixture(&stream, &pool);
     let output = populate(&mut runtime, &stream);
     let prompt = MlxBackend::prepare_text_prompt(&source, vec![2, 3, 4]).unwrap();
     settle(&runtime, &pool);
     let state = runtime.session().payload.model.erased().state_snapshot();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let before = paths::snapshot();
-    assert_reserved(&runtime.prefill(prompt.clone()).err().unwrap());
-    assert_reserved(
+    let before = (paths::snapshot(), pool.snapshot().unwrap());
+    assert_missing_admission(&runtime.prefill(prompt.clone()).err().unwrap());
+    assert_missing_admission(
         &runtime
             .prefill_cancellable(
                 prompt.clone(),
@@ -206,14 +230,14 @@ fn ordinary_prefill_variants_reject_before_forward_and_observer_callbacks() {
             .unwrap(),
     );
     let mut observer = Observer::default();
-    assert_reserved(
+    assert_missing_admission(
         &runtime
             .session_mut()
             .submit_prefill_with_observer(&backend, prompt.clone(), &mut observer)
             .err()
             .unwrap(),
     );
-    assert_reserved(
+    assert_missing_admission(
         &runtime
             .inspect_prefill(prompt, &observation_request())
             .err()
@@ -232,20 +256,20 @@ fn ordinary_prefill_variants_reject_before_forward_and_observer_callbacks() {
 #[test]
 fn ordinary_decode_variants_reject_before_input_construction_forward_and_observation() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = zero_payload_ledger();
     let (mut runtime, _source, _root) = fixture(&stream, &pool);
     let output = populate(&mut runtime, &stream);
     let input = Array::from_slice(&[2_u32], &[1, 1]);
     settle(&runtime, &pool);
     let state = runtime.session().payload.model.erased().state_snapshot();
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
+    let backend = MlxBackend::new(&stream, &stream).with_memory_ledger(pool.clone());
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let before = paths::snapshot();
+    let before = (paths::snapshot(), pool.snapshot().unwrap());
     let inputs = paths::session_input_creation_attempts();
-    assert_reserved(&runtime.decode(input.clone()).err().unwrap());
-    assert_reserved(
+    assert_missing_admission(&runtime.decode(input.clone()).err().unwrap());
+    assert_missing_admission(
         &runtime
             .session_mut()
             .submit_token_decode(&backend, 2)
@@ -254,7 +278,7 @@ fn ordinary_decode_variants_reject_before_input_construction_forward_and_observa
     );
     let mut observer = Observer::default();
     let mut input_calls = 0;
-    assert_reserved(
+    assert_missing_admission(
         &runtime
             .session_mut()
             .submit_decode_with_observer(
@@ -268,7 +292,7 @@ fn ordinary_decode_variants_reject_before_input_construction_forward_and_observa
             .err()
             .unwrap(),
     );
-    assert_reserved(
+    assert_missing_admission(
         &runtime
             .inspect_decode(input, &observation_request())
             .err()
@@ -289,7 +313,7 @@ fn ordinary_decode_variants_reject_before_input_construction_forward_and_observa
 #[test]
 fn completed_output_observation_rejects_reserved_backend_domain_without_touching_output() {
     let stream = stream();
-    let pool = WorkingMemoryPool::new(0, 0).unwrap();
+    let pool = zero_payload_ledger();
     let (mut runtime, _source, _root) = fixture(&stream, &pool);
     let output = populate(&mut runtime, &stream);
     settle(&runtime, &pool);
@@ -300,7 +324,7 @@ fn completed_output_observation_rejects_reserved_backend_domain_without_touching
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    let before = paths::snapshot();
+    let before = (paths::snapshot(), pool.snapshot().unwrap());
     assert_reserved(&runtime.observe_output(&output).unwrap_err());
     assert_eq!(array.allocation_info().unwrap(), allocation);
     assert_eq!(array.evaluated().unwrap().as_slice::<f32>(), values);
@@ -314,3 +338,7 @@ fn completed_output_observation_rejects_reserved_backend_domain_without_touching
     let observed = runtime.observe_output(&output).unwrap();
     assert!(!observed.is_empty());
 }
+
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::memory_fixture::LedgerFixture;

@@ -9,7 +9,7 @@ use eredu_checkpoint::{
 use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 
 fn required<P: SharedNativeInitializer>(plan: &P) -> Option<u64> {
-    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(plan);
+    let result = MemoryLedger::shared_native_initialization_required_bytes(plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -19,7 +19,7 @@ fn required<P: SharedNativeInitializer>(plan: &P) -> Option<u64> {
         Err(error) => panic!("{error}"),
     }
 }
-fn mapping(pool: &WorkingMemoryPool) -> InitializedSharedNative<EncodedRecipeMapping> {
+fn mapping(pool: &MemoryLedger) -> InitializedSharedNative<EncodedRecipeMapping> {
     let full = pool
         .initialize_shared_native(EncodedRecipeMappingPlan::source(0..8).unwrap())
         .unwrap();
@@ -74,7 +74,8 @@ macro_rules! sequence {
                 };
                 // Derive the exact typed projection quote from an independently
                 // admitted fixture and retire it before the exact-budget run.
-                let sizing = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+                let sizing =
+                    crate::working_memory::memory_fixture::host_ledger(1 << 20, 0).unwrap();
                 let mapped = mapping(&sizing);
                 let map_bytes = mapped.original_bytes();
                 let base_bytes =
@@ -87,38 +88,48 @@ macro_rules! sequence {
                 let projection_bytes = required(&plan).unwrap();
                 drop(plan);
                 drop(mapped);
-                assert_eq!(sizing.used_bytes().unwrap(), 0);
+                assert_eq!(sizing.payload_used_bytes().unwrap(), 0);
                 let total = batch_bytes + map_bytes + projection_bytes;
                 assert!(total - 1 >= base_bytes + map_bytes);
-                let pool = WorkingMemoryPool::new(total - u64::from(short), 0).unwrap();
+                let pool =
+                    crate::working_memory::memory_fixture::host_ledger(total - u64::from(short), 0)
+                        .unwrap();
                 let mapped = mapping(&pool);
                 let batch = pool
                     .initialize_shared_native($read_plan::new(&source, &keys).unwrap())
                     .unwrap();
-                assert_eq!(pool.used_bytes().unwrap(), batch_bytes + map_bytes);
+                assert_eq!(pool.payload_used_bytes().unwrap(), batch_bytes + map_bytes);
                 let batch = batch.into_owned_read();
-                assert_eq!(pool.used_bytes().unwrap(), batch_bytes + map_bytes);
+                assert_eq!(pool.payload_used_bytes().unwrap(), batch_bytes + map_bytes);
                 let result = pool.initialize_shared_native(batch.project(mapped.output()).unwrap());
                 drop((source, keys));
                 if short {
                     let failure = result.unwrap_err();
                     assert!(matches!(
                         failure.accounting_failure(),
-                        Some(WorkingMemoryError::BudgetExceeded { .. })
+                        Some(WorkingMemoryError::Domain(
+                            eredu_core::MemoryDomainError::BudgetExceeded { .. }
+                        ))
                     ));
                     assert!(failure.rejected_plan().is_some());
                     assert!(failure.constructor_failure().is_none());
-                    assert_eq!(pool.used_bytes().unwrap(), batch_bytes + map_bytes);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), batch_bytes + map_bytes);
                     drop(failure);
-                    assert_eq!(pool.used_bytes().unwrap(), map_bytes);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), map_bytes);
                     drop(mapped);
                 } else {
                     let projected = result.unwrap();
-                    assert_eq!(pool.used_bytes().unwrap(), total);
+                    assert_eq!(pool.payload_used_bytes().unwrap(), total);
                     drop(mapped);
-                    assert_eq!(pool.used_bytes().unwrap(), batch_bytes + projection_bytes);
+                    assert_eq!(
+                        pool.payload_used_bytes().unwrap(),
+                        batch_bytes + projection_bytes
+                    );
                     let read = projected.into_owned_read();
-                    assert_eq!(pool.used_bytes().unwrap(), batch_bytes + projection_bytes);
+                    assert_eq!(
+                        pool.payload_used_bytes().unwrap(),
+                        batch_bytes + projection_bytes
+                    );
                     assert_eq!(read.tensors().len(), 2);
                     assert_eq!(read.byte_len(), 6);
                     let mut output = [0; 6];
@@ -129,7 +140,7 @@ macro_rules! sequence {
                     assert_eq!(short_output, [99; 5]);
                     drop(read);
                 }
-                assert_eq!(pool.used_bytes().unwrap(), 0);
+                assert_eq!(pool.payload_used_bytes().unwrap(), 0);
             }
         }
     };

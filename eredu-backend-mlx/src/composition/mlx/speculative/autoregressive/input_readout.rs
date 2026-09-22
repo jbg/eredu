@@ -1,7 +1,7 @@
 //! Admitted input and output views for the existing independent decoder call.
 use super::workspace::ActiveSpeculativeInvocation;
 use super::*;
-use crate::backend::nn::workspace::{AutoregressiveReadoutRecipe, MlxMetalWorkspaceMechanisms};
+use crate::backend::nn::workspace::{AutoregressiveReadoutRecipe, ResidentExecutionMechanisms};
 use crate::composition::mlx::replicated_text::{
     AutoregressiveSequenceCompletion, AutoregressiveStateRoots,
 };
@@ -35,7 +35,7 @@ impl AutoregressiveIoPlan {
         runtime: &PreparedInputRuntime,
         invocation: AutoregressiveInvocation,
         vocabulary: usize,
-        mechanism: MlxMetalWorkspaceMechanisms,
+        mechanism: ResidentExecutionMechanisms,
         context: &WorkspaceContext,
     ) -> Result<Self, eredu_nn::Error> {
         let invalid = || {
@@ -65,7 +65,7 @@ impl AutoregressiveIoPlan {
             let funding = context
                 .metadata_funding()
                 .ok_or(WorkspaceMetadataError::Unqualified)?;
-            let readout_context = WorkspaceContext::new_with_metadata_funding(mechanism, funding)?;
+            let readout_context = mechanism.context(funding)?;
             let source = WorkspaceTensor::existing(
                 readout_context.layout(&[1, positions, width], WorkspaceDtype::Float32)?,
                 &readout_context,
@@ -231,6 +231,9 @@ impl PreparedAutoregressiveIo {
                 return Err(observer.invalid_input_error().into());
             }
         }
+        if !self.rows.is_empty() {
+            invocation.begin_readout_construction()?;
+        }
         for (position, slot) in self.rows.iter_mut().enumerate() {
             *slot = Some(logits.try_index_device((.., position as i32, ..), stream)?);
         }
@@ -269,7 +272,12 @@ pub(super) struct SequenceCompletion<'a> {
     invocation: &'a ActiveSpeculativeInvocation,
 }
 impl AutoregressiveSequenceCompletion for SequenceCompletion<'_> {
-    fn metadata_context(&self) -> WorkspaceContext { self.invocation.metadata_context() }
+    fn active_invocation(&self) -> ActiveSpeculativeInvocation {
+        self.invocation.clone()
+    }
+    fn metadata_context(&self) -> WorkspaceContext {
+        self.invocation.metadata_context()
+    }
 
     fn role(&self) -> &OriginalSpeculativeRole {
         self.invocation.role()

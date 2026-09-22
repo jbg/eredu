@@ -1,13 +1,13 @@
 //! Optional released-source grammar funding probe; no model/device execution.
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use crate::runtime::chat::dialect::DECLARATIVE_DIALECT;
 use eredu_core::{HostMetadataAccount, HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::{
     ControllerCompilationOutput, ControllerCompilationSources, InferenceExecutionIdentity,
-    OriginalChatProfilePreparation, OriginalControllerCompiler, OriginalTokenizer,
-    WorkingMemoryPool,
+    MemoryLedger, OriginalChatProfilePreparation, OriginalControllerCompiler, OriginalTokenizer,
 };
-use std::sync::{Mutex, atomic::AtomicU64};
+use std::sync::{atomic::AtomicU64, Mutex};
 
 #[derive(Debug, Default)]
 struct Counts {
@@ -120,7 +120,7 @@ fn run(full: bool) {
     let tokenizer =
         ChatTokenizer::from_tokenizer(tokenizers::Tokenizer::from_bytes(&source).unwrap());
     let eos = [tokenizer.token_to_id("<|im_end|>").unwrap()];
-    let pool = WorkingMemoryPool::new(2 << 30, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(2 << 30, 0).unwrap();
     let validity = pool
         .prepare_shared_token_filter(|| eredu_core::TokenFilter::All)
         .unwrap();
@@ -138,7 +138,7 @@ fn run(full: bool) {
         &template,
         &original,
         &InferenceExecutionIdentity::default(),
-        2 << 30,
+        crate::memory_fixture::resolved_limits(2 << 30),
     )
     .unwrap();
     let tools = [
@@ -151,7 +151,10 @@ fn run(full: bool) {
             tools: &tools,
         })
         .unwrap();
-    eprintln!("GRAMMAR_FUNDING source_pool={}", pool.used_bytes().unwrap());
+    eprintln!(
+        "GRAMMAR_FUNDING source_pool={}",
+        pool.live_charge_bytes().unwrap()
+    );
     let counts = Arc::new(Counts {
         max_calls: 200_000,
         max_bytes: if full { 2 << 30 } else { 32 << 30 },
@@ -188,7 +191,10 @@ fn run(full: bool) {
                 filter.allows(token),
                 "Required grammar must preserve legal prose prefixes"
             );
-            assert!(!filter.allows(eos[0]), "Required cannot stop before a tool call");
+            assert!(
+                !filter.allows(eos[0]),
+                "Required cannot stop before a tool call"
+            );
             report(&format!("mask{index}"), &counts);
             controller.commit_token(token).unwrap();
             report("commit", &counts);

@@ -5,7 +5,7 @@ use super::super::{
 };
 use super::*;
 use eredu_runtime::cache::{PagedVisibleError, PagedVisiblePlan};
-use safemlx::{Stream, ops::indexing::TryIndexOp};
+use safemlx::{ops::indexing::TryIndexOp, Stream};
 
 pub(crate) struct OriginalPagedVisibleClaim<'a, 'source> {
     proof: OriginalPagedScanSource<'source>,
@@ -143,7 +143,7 @@ impl OriginalPagedAppendClaim<'_> {
             ids: &scan.discard_ids,
             frontier: Some(((end - i64::from(window)).max(prefix), prefix)),
         };
-        proof.manager().discard_original(&discard)
+        proof.manager().discard_prepared(&discard)
     }
     pub(crate) fn visible_completed(&self) -> bool {
         self.program
@@ -184,7 +184,9 @@ impl OriginalPagedVisibleClaim<'_, '_> {
         } else {
             if row.pin.is_none() {
                 if self.proof.source.has_host_promotion(&row.id) {
-                    self.proof.source.promote_host(&row.id, &self.proof, &self.roots, stream)?;
+                    self.proof
+                        .source
+                        .promote_host(&row.id, &self.proof, &self.roots, stream)?;
                 }
                 let mut source = OriginalPagedBlockSource::new(
                     &self.proof,

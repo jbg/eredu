@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory_fixture::{LedgerFixture as _, StorageFixture as _};
 use std::io::Write as _;
 #[test]
 fn private_file_regex_c_and_original_e_share_real_backend_pool_and_decoder_source() {
@@ -68,7 +69,7 @@ fn file_profile(profile: u8) {
     } else {
         json
     };
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let pool = crate::memory_fixture::host_ledger(u64::MAX, 0).unwrap();
     let compiles = Rc::new(Cell::new(0));
     let runtime = ModelRuntime::prepare(
         Backend {
@@ -83,7 +84,7 @@ fn file_profile(profile: u8) {
     let source = crate::api::tokenizer::compile_original_tokenizer_file(&runtime, file).unwrap();
     let c = source.original_bytes();
     assert_eq!(
-        pool.used_bytes().unwrap(),
+        pool.live_charge_bytes().unwrap(),
         c,
         "I retires after fresh C construction"
     );
@@ -105,8 +106,7 @@ fn file_profile(profile: u8) {
             &[true][..]
         } {
             let special = *special;
-            let e =
-                WorkingMemoryPool::tokenizer_encode_required_bytes(&source, text, special).unwrap();
+            let e = MemoryLedger::tokenizer_encode_required_bytes(&source, text, special).unwrap();
             let ids = crate::api::tokenizer::encode_original_tokenizer_ids(
                 &runtime, &source, text, special,
             )
@@ -145,9 +145,9 @@ fn file_profile(profile: u8) {
             .unwrap();
     assert!(decoder.source().same_source(&source));
     drop((runtime, source));
-    assert_eq!(pool.used_bytes().unwrap(), total);
+    assert_eq!(pool.live_charge_bytes().unwrap(), total);
     drop(held);
-    assert_eq!(pool.used_bytes().unwrap(), c);
+    assert_eq!(pool.live_charge_bytes().unwrap(), c);
     drop(decoder);
-    assert_eq!(pool.used_bytes().unwrap(), 0);
+    assert_eq!(pool.live_charge_bytes().unwrap(), 0);
 }

@@ -1,19 +1,28 @@
 //! Native loaded-slot operations. Architecture names and geometry come from traversal.
 use super::*;
-use crate::backend::nn::shared::visit_parameter_map;
 use crate::backend::runtime::residency::storage::RetainedStorage;
 use crate::composition::mlx::replicated_text::{
     ParameterOwnerCounts, ParameterOwnerRole, ParameterOwnerSourceError,
 };
 use eredu_core::{capture::*, intervention::InterventionDtype, parameters::*};
 use eredu_nn::{ParameterMetadata, ParameterSlotVisitor};
-use safemlx::ops::indexing::{ArrayIndex, ArrayIndexOp, TryIndexMutOp};
+use eredu_runtime::parameter_operations::ParameterReplacementValues;
+use safemlx::ops::indexing::{ArrayIndex, ArrayIndexOp};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "parameters/completed.rs"]
+mod completed;
 #[path = "parameters/encoding.rs"]
 mod encoding;
+#[path = "parameters/numerical.rs"]
+mod numerical;
 #[path = "parameters/partition.rs"]
 mod partition;
+#[path = "parameters/publication.rs"]
+mod publication;
+#[path = "parameters/result.rs"]
+mod result;
+use crate::backend::nn::workspace::CompletedParameterSources;
 use encoding::EffectiveLayout;
 #[cfg(test)]
 #[path = "parameters/partition_owner_tests.rs"]
@@ -28,9 +37,12 @@ pub(super) struct NativeParameterState {
     pub(super) active: Option<String>,
     /// Conservative state precision after native promotion by edited parameters.
     pub(super) floating_state_dtype_bytes: Option<std::num::NonZeroU8>,
-    originals: BTreeMap<String, MlxTensor>,
-    published: BTreeMap<String, MlxTensor>,
-    baseline_transforms: BTreeMap<String, ProjectionInputTransform>,
+    originals: ParameterReplacementValues<MlxTensor>,
+    published: ParameterReplacementValues<MlxTensor>,
+    original_sources: CompletedParameterSources,
+    published_sources: CompletedParameterSources,
+    baseline_transforms: Vec<(String, ProjectionInputTransform)>,
+    metadata: Option<eredu_nn::workspace::HostMetadataFunding>,
     reset_estimate: Option<eredu_core::execution_control::SnapshotEstimate>,
     #[cfg(test)]
     reject_publication: bool,
@@ -69,7 +81,9 @@ impl NativeParameterState {
         storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
     ) -> Result<(), Error> {
         for values in [&self.originals, &self.published] {
-            visit_parameter_map(values, |_, value| storage.include_array(value.as_array()))?;
+            for value in values.values() {
+                storage.include_array(value.as_array())?;
+            }
         }
         Ok(())
     }
@@ -88,13 +102,13 @@ impl<'source> DisplacedParameterSource<'source> {
         guard: &mut safemlx::RuntimeCallGuard,
     ) -> Result<CountedDisplacedParameterSource<'source>, ParameterOwnerSourceError> {
         let mut counts = ParameterOwnerCounts::default();
-        counts.observe_map(
+        counts.observe_replacements(
             ParameterOwnerRole::DisplacedOriginal,
             None,
             &self.state.originals,
             guard,
         )?;
-        counts.observe_map(
+        counts.observe_replacements(
             ParameterOwnerRole::PublishedOverlay,
             None,
             &self.state.published,
@@ -153,6 +167,9 @@ impl CaptureReservation for NativeParameterBudget {
 fn failure(error: Error) -> ParameterError {
     BackendFailure::new(BackendFailureKind::Other, error).into()
 }
+fn environment_failure(cause: crate::backend::OriginalCopyEnvironmentError) -> ParameterError {
+    BackendFailure::new(BackendFailureKind::Other, cause).into()
+}
 fn dtype(value: Dtype) -> Option<InterventionDtype> {
     match value {
         Dtype::Float32 => Some(InterventionDtype::Float32),
@@ -170,37 +187,6 @@ fn native_indices(region: &ParameterRegion) -> Vec<ArrayIndexOp<'static>> {
         .collect()
 }
 
-fn apply_effective_update(
-    result: &mut Array,
-    region: &ParameterRegion,
-    update: &ParameterUpdate,
-    stream: &Stream,
-) -> Result<Result<(), ParameterError>, Error> {
-    let shape: Vec<_> = region.shape.iter().map(|n| *n as i32).collect();
-    let indices = native_indices(region);
-    let values = Array::from_slice(update.values(), &shape);
-    let effective = match update {
-        ParameterUpdate::Replace { .. } => values,
-        ParameterUpdate::Add { .. } => result
-            .try_index_device(indices.as_slice(), stream)?
-            .as_dtype(Dtype::Float32, stream)?
-            .add(values, stream)?,
-    }
-    .as_dtype(result.dtype(), stream)?;
-    if !effective
-        .is_finite(stream)?
-        .all(false, stream)?
-        .evaluated()?
-        .as_slice::<bool>()[0]
-    {
-        return Ok(Err(ParameterError::Invalid(
-            "parameter edit overflows target dtype".into(),
-        )));
-    }
-    result.try_index_mut_device(indices.as_slice(), &effective, stream)?;
-    result.evaluated()?;
-    Ok(Ok(()))
-}
 struct Catalog {
     layouts: BTreeMap<String, EffectiveLayout>,
     companions: BTreeSet<String>,
@@ -264,7 +250,10 @@ impl Catalog {
         });
         self.physical.insert(id, (actual_dtype, actual_shape));
     }
-    fn finish(&mut self, originals: &BTreeMap<String, MlxTensor>) -> Result<(), ParameterError> {
+    fn finish(
+        &mut self,
+        originals: &ParameterReplacementValues<MlxTensor>,
+    ) -> Result<(), ParameterError> {
         for slot in &mut self.slots {
             let layout = &self.layouts[&slot.id];
             let (physical_dtype, shape) = &self.physical[&slot.id];
@@ -301,83 +290,6 @@ impl Catalog {
         }
         Ok(())
     }
-}
-struct Select<'a> {
-    ids: &'a BTreeSet<String>,
-    values: BTreeMap<String, MlxTensor>,
-}
-impl ParameterSlotVisitor<MlxTensor> for Select<'_> {
-    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &MlxTensor) {
-        if self.ids.contains(metadata.id().as_str()) {
-            self.values
-                .insert(metadata.id().as_str().into(), value.clone());
-        }
-    }
-}
-
-fn with_selected_parameter_values<T>(
-    model: &mut dyn crate::composition::mlx::replicated_text::ErasedReplicatedTextExecutable,
-    ids: &BTreeSet<String>,
-    stream: &Stream,
-    operation: impl FnOnce(&BTreeMap<String, MlxTensor>) -> Result<T, Error>,
-) -> Result<T, Error> {
-    use eredu_runtime::parameter_operations::PreparedParameterLocation;
-    let prepared = model.prepared_parameter_slots();
-    let mut owner = None;
-    for id in ids {
-        let slot = prepared
-            .iter()
-            .find(|slot| slot.parameter.id.as_str() == id)
-            .ok_or_else(|| {
-                Error::ArchitectureModel(format!("selected parameter {id} has no prepared owner"))
-            })?;
-        if let Some(previous) = &owner {
-            let compatible = match (previous, &slot.location) {
-                (
-                    PreparedParameterLocation::Static { .. },
-                    PreparedParameterLocation::Static { .. },
-                ) => true,
-                (left, right) => left == right,
-            };
-            if !compatible {
-                return Err(Error::ArchitectureModel(
-                    "one parameter operation spans unrelated residency units".into(),
-                ));
-            }
-        }
-        owner = Some(slot.location.clone());
-    }
-    let owner =
-        owner.ok_or_else(|| Error::ArchitectureModel("empty parameter operation".into()))?;
-    let mut operation = Some(operation);
-    let mut output = None;
-    let available = model.with_parameter_slots(
-        &owner,
-        ids,
-        &mut |visit| {
-            let mut selected = Select {
-                ids,
-                values: BTreeMap::new(),
-            };
-            visit(&mut selected);
-            if selected.values.len() != ids.len() {
-                return Err(Error::ArchitectureModel(
-                    "prepared parameter topology changed".into(),
-                ));
-            }
-            output = Some(operation.take().expect("one parameter loan")(
-                &selected.values,
-            )?);
-            Ok(())
-        },
-        stream,
-    )?;
-    if !available {
-        return Err(Error::ArchitectureModel(
-            "selected parameter loan is unavailable".into(),
-        ));
-    }
-    output.ok_or_else(|| Error::ArchitectureModel("parameter loan did not run".into()))
 }
 
 impl MlxModelSession {
@@ -566,11 +478,19 @@ impl ParameterBackend for MlxBackend<'_> {
         parameter: &str,
         region: ParameterRegion,
         limits: CaptureUsage,
-    ) -> Result<ParameterValues, ParameterError> {
-        let stream = runtime.backend().stream().clone();
-        let session = runtime.session_mut();
+    ) -> Result<SharedParameterValues, ParameterError> {
+        let (backend, session) = runtime.parts_mut();
         if session.payload.distributed.is_some() {
-            return session.query_partition_parameter(identity, parameter, region, limits, &stream);
+            let environment = backend
+                .original_copy_environment()
+                .map_err(environment_failure)?;
+            return session.query_partition_parameter(
+                identity,
+                parameter,
+                region,
+                limits,
+                &environment,
+            );
         }
         let (discovery, layouts) = session.parameter_facts_and_layouts()?;
         if identity != discovery.identity {
@@ -617,22 +537,45 @@ impl ParameterBackend for MlxBackend<'_> {
             },
             limits,
         )?;
-        let mut ids = BTreeSet::from([parameter.to_string()]);
-        layout.extend_dependencies(&mut ids);
-        let values = session
-            .with_model_operation(|model| {
-                with_selected_parameter_values(model.erased_mut(), &ids, &stream, |selected| {
-                    let tensor = layout.effective(parameter, selected, &stream)?;
-                    encoding::read_effective(&tensor, &region, &stream)
-                })
-            })
-            .map_err(failure)?;
+        let result = result::PreparedResult::query(
+            &session.payload.memory_ledger,
+            identity,
+            parameter,
+            &region,
+        )?;
+        let completed =
+            session.query_completed_parameter(parameter, &region, result.host_authority())?;
+        let resident = if completed.is_some() {
+            completed
+        } else {
+            match backend.original_copy_environment() {
+                Ok(environment) => session
+                    .read_resident_effective_parameter(
+                        parameter,
+                        layout,
+                        numerical::Request::Read(&region),
+                        &environment,
+                    )
+                    .map_err(failure)?,
+                Err(cause) => {
+                    return Err(completed::environment_failure(
+                        cause,
+                        result.host_authority(),
+                    ))
+                }
+            }
+        };
+        let values = resident.ok_or_else(|| {
+            failure(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            ))
+        })?;
         if values.iter().any(|value| !value.is_finite()) {
             return Err(ParameterError::Invalid(
                 "non-finite effective parameter".into(),
             ));
         }
-        Ok(ParameterValues {
+        result.finish_query(ParameterValues {
             identity: identity.into(),
             parameter: parameter.into(),
             dtype: descriptor.dtype.expect("supported floating dtype"),
@@ -648,12 +591,19 @@ impl ParameterBackend for MlxBackend<'_> {
         parameter: &str,
         projection: ParameterProjection,
         limits: CaptureUsage,
-    ) -> Result<ParameterProjectionValues, ParameterError> {
-        let stream = runtime.backend().stream().clone();
-        let session = runtime.session_mut();
+    ) -> Result<SharedParameterProjectionValues, ParameterError> {
+        let (backend, session) = runtime.parts_mut();
         if session.payload.distributed.is_some() {
-            return session
-                .project_partition_parameter(identity, parameter, projection, limits, &stream);
+            let environment = backend
+                .original_copy_environment()
+                .map_err(environment_failure)?;
+            return session.project_partition_parameter(
+                identity,
+                parameter,
+                projection,
+                limits,
+                &environment,
+            );
         }
         let (discovery, layouts) = session.parameter_facts_and_layouts()?;
         if identity != discovery.identity {
@@ -712,22 +662,51 @@ impl ParameterBackend for MlxBackend<'_> {
             },
             limits,
         )?;
-        let mut ids = BTreeSet::from([parameter.to_string()]);
-        layout.extend_dependencies(&mut ids);
-        let values = session
-            .with_model_operation(|model| {
-                with_selected_parameter_values(model.erased_mut(), &ids, &stream, |selected| {
-                    let tensor = layout.effective(parameter, selected, &stream)?;
-                    encoding::project_effective(&tensor, &projection, &stream)
-                })
-            })
-            .map_err(failure)?;
+        let result = result::PreparedResult::projection(
+            &session.payload.memory_ledger,
+            identity,
+            parameter,
+            &shape,
+            shape.capacity(),
+        )?;
+        let resident = match backend.original_copy_environment() {
+            Ok(environment) => match session
+                .project_resident_parameter(parameter, &projection, &environment)
+                .map_err(failure)?
+            {
+                Some(values) => Some(values),
+                None => session
+                    .read_resident_effective_parameter(
+                        parameter,
+                        layout,
+                        numerical::Request::Project(&projection),
+                        &environment,
+                    )
+                    .map_err(failure)?,
+            },
+            // Ordinary sources keep their existing exclusion until their
+            // selected materialization producer supplies complete native facts.
+            Err(crate::backend::OriginalCopyEnvironmentError::Memory(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            )) => None,
+            Err(cause) => {
+                return Err(completed::environment_failure(
+                    cause,
+                    result.host_authority(),
+                ))
+            }
+        };
+        let values = resident.ok_or_else(|| {
+            failure(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            ))
+        })?;
         if values.iter().any(|value| !value.is_finite()) {
             return Err(ParameterError::Invalid(
                 "non-finite effective parameter projection".into(),
             ));
         }
-        Ok(ParameterProjectionValues {
+        result.finish_projection(ParameterProjectionValues {
             identity: identity.into(),
             parameter: parameter.into(),
             source_dtype: descriptor.dtype.expect("supported floating dtype"),
@@ -742,10 +721,12 @@ impl ParameterBackend for MlxBackend<'_> {
         overlay: &AdmittedParameterOverlay,
         limits: CaptureUsage,
     ) -> Result<ParameterDiscovery, ParameterError> {
-        let stream = runtime.backend().stream().clone();
-        let session = runtime.session_mut();
+        let (backend, session) = runtime.parts_mut();
+        let environment = backend
+            .original_copy_environment()
+            .map_err(environment_failure)?;
         if session.payload.distributed.is_some() {
-            return session.activate_partition_parameter_overlay(overlay, limits, &stream);
+            return session.activate_partition_parameter_overlay(overlay, limits, &environment);
         }
         let (mut discovery, layouts) = session.parameter_facts_and_layouts()?;
         overlay.validate(&discovery)?;
@@ -812,69 +793,78 @@ impl ParameterBackend for MlxBackend<'_> {
             )?;
         }
         session.reserve_parameters(cost, limits)?;
-        let originals = session
-            .with_model_operation(|model| {
-                let mut originals = BTreeMap::new();
-                let mut replacements = BTreeMap::new();
-                for target in &targets {
-                    let mut ids = BTreeSet::from([target.id.clone()]);
-                    layouts[&target.id].extend_dependencies(&mut ids);
-                    let candidate = with_selected_parameter_values(
-                        model.erased_mut(),
-                        &ids,
-                        &stream,
-                        |selected| {
-                            let original = &selected[&target.id];
-                            original.as_array().evaluated()?;
-                            let mut result =
-                                layouts[&target.id].effective(&target.id, selected, &stream)?;
-                            for (edit, shared) in
-                                overlay.plan().edits.iter().zip(overlay.shared_targets())
-                            {
-                                if shared != &target.shared_id {
-                                    continue;
-                                }
-                                if let Err(error) = apply_effective_update(
-                                    &mut result,
-                                    &edit.region,
-                                    &edit.update,
-                                    &stream,
-                                )? {
-                                    return Ok(Err(error));
-                                }
-                            }
-                            Ok(Ok((original.clone(), MlxTensor::from_array(result))))
-                        },
-                    )?;
-                    let (original, replacement) = match candidate {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    originals.insert(target.id.clone(), original);
-                    replacements.insert(target.id.clone(), replacement);
+        let prepared = numerical::PreparedOperation::new(session, &environment).map_err(failure)?;
+        let context = &prepared.context;
+        let mut originals = context
+            .metadata_vec(targets.len())
+            .map_err(|cause| failure(Error::Neural(cause)))?;
+        let mut replacements = context
+            .metadata_vec(targets.len())
+            .map_err(|cause| failure(Error::Neural(cause)))?;
+        for target in &targets {
+            let mut edits = context
+                .metadata_vec(overlay.plan().edits.len())
+                .map_err(|cause| failure(Error::Neural(cause)))?;
+            for (edit, shared) in overlay.plan().edits.iter().zip(overlay.shared_targets()) {
+                if shared == &target.shared_id {
+                    edits.push((&edit.region, &edit.update));
                 }
-                // Every fallible native replacement is ready before clearing incompatible state.
-                model.erased_mut().reset_cache()?;
-                // Slot publication performs only handle moves/clones; no native work can fail.
-                if !model
-                    .erased_mut()
-                    .publish_parameter_replacements(&replacements, true)?
-                {
-                    return Err(Error::ArchitectureModel(
-                        "selected parameter publication is unavailable".into(),
-                    ));
-                }
-                model.erased_mut().invalidate_parameter_snapshots();
-                Ok(Ok(originals))
-            })
-            .map_err(failure)??;
+            }
+            let (original, replacement) = session
+                .prepare_parameter_update(&target.id, &layouts[&target.id], &edits, &prepared)
+                .map_err(failure)?;
+            context
+                .charge_metadata(
+                    target
+                        .id
+                        .len()
+                        .checked_mul(2)
+                        .ok_or(ParameterError::Overflow)?,
+                )
+                .map_err(|cause| failure(Error::Neural(cause.into())))?;
+            originals.push((target.id.clone(), original));
+            replacements.push((target.id.clone(), replacement));
+        }
+        let originals = parameter_rows(originals, &prepared)?;
+        let replacements = parameter_rows(replacements, &prepared)?;
+        let sources = CompletedParameterSources::from_prepared(
+            prepared.take_sources(),
+            context,
+            prepared.funding.clone(),
+        )
+        .map_err(failure)?;
+        let original_sources = sources
+            .select(&originals, context, prepared.funding.clone())
+            .map_err(failure)?;
+        let published_sources = sources
+            .select(&replacements, context, prepared.funding.clone())
+            .map_err(failure)?;
+        context
+            .charge_metadata(overlay.identity().len())
+            .map_err(|cause| failure(Error::Neural(cause.into())))?;
+        let active = overlay.identity().to_owned();
+        let (mut publication, mut reset) = session
+            .prepare_parameter_publication(
+                replacements.clone(),
+                published_sources.clone(),
+                true,
+                &prepared,
+            )
+            .map_err(failure)?;
+        session
+            .commit_parameter_publication(&mut publication, &mut reset)
+            .map_err(failure)?;
         let state = &mut session
             .payload
             .get_mut()
             .expect("completed parameter transaction")
             .parameter_state;
         state.originals = originals;
-        state.active = Some(overlay.identity().into());
+        state.published = replacements;
+        state.original_sources = original_sources;
+        state.published_sources = published_sources;
+        state.metadata = Some(prepared.funding.clone());
+        state.active = Some(active);
         // Dense replacements preserve their effective dtype; packed replacements
         // are F32. Their outputs can promote later KV/recurrent state. The backend
         // uses an upper bound without reconstructing family execution branches.
@@ -907,9 +897,12 @@ impl ParameterBackend for MlxBackend<'_> {
         runtime: &mut ModelRuntime<Self>,
         identity: &str,
     ) -> Result<ParameterDiscovery, ParameterError> {
-        let session = runtime.session_mut();
+        let (backend, session) = runtime.parts_mut();
+        let environment = backend
+            .original_copy_environment()
+            .map_err(environment_failure)?;
         if session.payload.distributed.is_some() {
-            return session.remove_partition_parameter_overlay(identity);
+            return session.remove_partition_parameter_overlay(identity, &environment);
         }
         let (mut discovery, layouts) = session.parameter_facts_and_layouts()?;
         if discovery.identity != identity || discovery.overlay_identity.is_none() {
@@ -921,22 +914,14 @@ impl ParameterBackend for MlxBackend<'_> {
             .epoch
             .checked_add(1)
             .ok_or(ParameterError::Overflow)?;
-        // Cloned handles retain existing reservation; removal performs no parameter copies.
+        let prepared = numerical::PreparedOperation::new(session, &environment).map_err(failure)?;
         let originals = session.payload.parameter_state.originals.clone();
+        let original_sources = session.payload.parameter_state.original_sources.clone();
+        let (mut publication, mut reset) = session
+            .prepare_parameter_publication(originals.clone(), original_sources, false, &prepared)
+            .map_err(failure)?;
         session
-            .with_model_operation(|model| {
-                model.erased_mut().reset_cache()?;
-                if !model
-                    .erased_mut()
-                    .publish_parameter_replacements(&originals, false)?
-                {
-                    return Err(Error::ArchitectureModel(
-                        "selected parameter restoration is unavailable".into(),
-                    ));
-                }
-                model.erased_mut().invalidate_parameter_snapshots();
-                Ok(())
-            })
+            .commit_parameter_publication(&mut publication, &mut reset)
             .map_err(failure)?;
         let state = &mut session
             .payload
@@ -949,7 +934,10 @@ impl ParameterBackend for MlxBackend<'_> {
                     layouts[&parameter.id].input_transform(original.as_array().dtype());
             }
         }
-        state.originals.clear();
+        state.originals = Default::default();
+        state.published = Default::default();
+        state.original_sources = Default::default();
+        state.published_sources = Default::default();
         state.active = None;
         state.floating_state_dtype_bytes = None;
         state.epoch = epoch;
@@ -966,3 +954,132 @@ impl ParameterBackend for MlxBackend<'_> {
 #[cfg(test)]
 #[path = "parameters/owner_source_tests.rs"]
 mod owner_source_tests;
+
+struct PreparedParameterReset {
+    native: Box<dyn std::any::Any>,
+    covered_publication: bool,
+    sources: CompletedParameterSources,
+}
+fn parameter_rows(
+    rows: Vec<(String, MlxTensor)>,
+    prepared: &numerical::PreparedOperation<'_>,
+) -> Result<ParameterReplacementValues<MlxTensor>, ParameterError> {
+    ParameterReplacementValues::from_prepared_rows(
+        rows,
+        prepared.funding.clone(),
+        &prepared.context,
+    )
+    .map_err(|cause| failure(Error::Neural(prepared.context.metadata_source(cause))))
+}
+impl MlxModelSession {
+    /// The session inventory retains both installed and displaced parameter roots.
+    pub(super) fn native_storage_mechanism(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::storage::native_storage::MlxNativeStorage>,
+        Error,
+    > {
+        Ok(self
+            .payload
+            .model
+            .native_storage_mechanism()?
+            .map(|mechanism| {
+                mechanism.with_displaced_parameter_sources(
+                    self.payload.parameter_state.original_sources.clone(),
+                )
+            }))
+    }
+
+    fn prepare_parameter_publication(
+        &mut self,
+        values: ParameterReplacementValues<MlxTensor>,
+        sources: CompletedParameterSources,
+        active: bool,
+        prepared: &numerical::PreparedOperation<'_>,
+    ) -> Result<
+        (
+            publication::PreparedNativeParameterPublication,
+            PreparedParameterReset,
+        ),
+        Error,
+    > {
+        self.original_model_source()
+            .map_err(Error::PrefillControl)?;
+        let payload = self.payload.get_mut().ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::ReservedWorkActive,
+        ))?;
+        prepared.context.charge_metadata(std::mem::size_of::<PreparedParameterReset>().checked_add(
+            crate::backend::runtime::residency::storage::RetainedStoragePublication::coverage_control_bytes()
+                .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?)
+            .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?)
+            .map_err(|cause|Error::Neural(cause.into()))?;
+        let covered_publication = payload
+            .nonstate_publication
+            .get_mut()
+            .as_ref()
+            .is_some_and(|value| payload.model.covers_nonstate_publication(value));
+        let preparation = prepared.preparation(&[]);
+        let publication = publication::PreparedNativeParameterPublication::prepare(
+            payload.model.erased_mut(),
+            values,
+            active,
+            &preparation,
+        )?;
+        let reset = payload
+            .model
+            .erased_mut()
+            .prepare_parameter_reset_state(&preparation)?;
+        Ok((
+            publication,
+            PreparedParameterReset {
+                native: reset,
+                covered_publication,
+                sources,
+            },
+        ))
+    }
+    fn commit_parameter_publication(
+        &mut self,
+        publication: &mut publication::PreparedNativeParameterPublication,
+        reset: &mut PreparedParameterReset,
+    ) -> Result<(), Error> {
+        self.original_model_source()
+            .map_err(Error::PrefillControl)?;
+        let payload = self.payload.get_mut().ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::ReservedWorkActive,
+        ))?;
+        publication.exchange_reset(payload.model.erased_mut(), reset.native.as_mut())?;
+        crate::composition::mlx::replicated_text::exchange_parameter_reset_memory(
+            reset.native.as_mut(),
+            &mut payload.state_memory,
+            payload.nonstate_publication.get_mut(),
+            reset.covered_publication,
+        )
+        .expect("reset type validated by the same prepared publication");
+        payload.model.exchange_parameter_sources(&mut reset.sources);
+        payload.model.erased_mut().finalize_parameter_publication();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn fixture_rows<const N: usize>(
+    values: [(&str, MlxTensor); N],
+) -> ParameterReplacementValues<MlxTensor> {
+    let ledger = crate::memory_fixture::ledger(u64::MAX, 0).unwrap();
+    let execution = eredu_runtime::working_memory::InferenceExecutionIdentity::default();
+    let funding = ledger
+        .prepare_workspace_metadata(&execution, ledger.configured_limits().clone())
+        .unwrap();
+    let context = eredu_nn::workspace::WorkspaceContext::new_with_metadata_funding(
+        crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms::current_host().unwrap(),
+        funding.clone(),
+    )
+    .unwrap();
+    let mut rows = context.metadata_vec(N).unwrap();
+    for (name, value) in values {
+        context.charge_metadata(name.len()).unwrap();
+        rows.push((name.to_owned(), value));
+    }
+    ParameterReplacementValues::from_prepared_rows(rows, funding, &context).unwrap()
+}
